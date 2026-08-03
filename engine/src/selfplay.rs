@@ -10,6 +10,13 @@
 //! Chance nodes are resolved from the true bag and convolve the belief with
 //! each config's own draw distribution.
 //!
+//! ReBeL decisions walk the solved subgame: a `Solver` is built once at a
+//! subgame root, the game then descends through its tree taking an action at
+//! every decision on the way (the reference's `sample_state_to_leaf`), and a
+//! new solver is built only when the walk reaches a leaf of the tree — a draw,
+//! a terminal state, or the depth limit. The value target is taken once per
+//! subgame, at its root, exactly as in the reference (`RlRunner::step`).
+//!
 //! Training data comes in two flavours:
 //!   * `Collect::Mc` — the greedy warm start. Value targets blend the realised
 //!     game outcome with a squashed handcrafted public-information evaluation.
@@ -316,6 +323,34 @@ pub struct GameCfg {
     pub eval_mix: f32,
 }
 
+/// A live ReBeL walk: the solver for the current subgame, the checkpoint
+/// slot it was built with, the tree node the game is currently at, and the
+/// (state, belief) snapshot of the subgame root — the state the value target
+/// belongs to.
+struct Walk<'a> {
+    sv: Solver<'a>,
+    slot: usize,
+    node: usize,
+    root_s: State,
+    root_bel: [Belief; 2],
+}
+
+/// End a walk: run the solver out to its full iteration count (the partial
+/// run happened at build time), then take the value target off the root of
+/// the subgame — the state the walk started at.
+fn finish_walk<'a>(w: Walk<'a>, gc: &GameCfg, ctx: &Ctx, data: &mut Data) {
+    let Walk {
+        mut sv,
+        root_s,
+        root_bel,
+        ..
+    } = w;
+    sv.complete();
+    if gc.collect == Collect::Rebel && sv.solved() {
+        data.push_value(&root_s, ctx, &root_bel, [sv.root_values(0), sv.root_values(1)]);
+    }
+}
+
 /// Play one game to the end. Returns the result from White's point of view.
 pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) -> f32 {
     let mut s = make_game(rng, gc.random_draft);
@@ -325,10 +360,20 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
         Belief::point(Config::default()),
     ];
     let from_row = data.nv;
+    // The live ReBeL walk, if the game is inside a solved subgame. Rebuilt
+    // only when the previous walk ended at a leaf of its tree.
+    let mut walk: Option<Walk> = None;
 
     while !s.is_terminal() {
         let player = s.to_act();
         if s.is_chance() {
+            // A draw is a leaf of every subgame; a walk cannot span one. The
+            // walk cannot actually be alive here (it is ended when it steps
+            // into a leaf), but finish defensively: a pending subgame is
+            // solved and its target collected either way.
+            if let Some(w) = walk.take() {
+                finish_walk(w, gc, &ctx, data);
+            }
             let res = reserve(&s, player, &ctx);
             let fu = faceup_counts(&s, player, &ctx);
             bel[player as usize] = belief_after_draw(&bel[player as usize], &res, &fu);
@@ -347,34 +392,83 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
         data.configs += cfgs.len();
 
         let np = match gc.agents[player as usize] {
-            Agent::Greedy { temp } => greedy_policy(&s, &ctx, player, &cfgs, temp),
-            Agent::Uniform => uniform_policy(&s, &ctx, player, &cfgs),
-            Agent::Rebel { cfg, slot } => {
-                let mut sv = Solver::new(&s, &ctx, &nets[slot], cfg, bel.clone());
-                let stop = if gc.eval {
-                    cfg.iters
-                } else {
-                    rng.below(cfg.iters + 1)
-                };
-                for i in 0..stop {
-                    sv.step(i % 2);
+            Agent::Greedy { temp } => {
+                // A non-ReBeL decision is not in the walk's tree: end any
+                // pending walk (its subgame is still solved, its target
+                // still collected).
+                if let Some(w) = walk.take() {
+                    finish_walk(w, gc, &ctx, data);
                 }
-                let mut np = NodePolicy::frame(&s, &ctx, player, &cfgs);
-                let na = np.acts.len();
+                greedy_policy(&s, &ctx, player, &cfgs, temp)
+            }
+            Agent::Uniform => {
+                if let Some(w) = walk.take() {
+                    finish_walk(w, gc, &ctx, data);
+                }
+                uniform_policy(&s, &ctx, player, &cfgs)
+            }
+            Agent::Rebel { cfg, slot } => {
+                // A walk belongs to the checkpoint that built it. Playing a
+                // decision on another slot's solver would make that player
+                // act with the wrong network — `final_vs_init` pairs slot 0
+                // against slot 1 — so end a walk built by a different slot
+                // before starting a new one.
+                if walk.as_ref().is_some_and(|w| w.slot != slot) {
+                    finish_walk(walk.take().unwrap(), gc, &ctx, data);
+                }
+                if walk.is_none() {
+                    // Start a new subgame at this decision: build the tree,
+                    // run the partial CFR solve up to a uniformly random
+                    // iterate, and snapshot the root for the value target.
+                    // Acting on a random iterate keeps the targets unbiased
+                    // (Theorem 3); in eval mode the full solve runs up front
+                    // and the walk acts on the average strategy instead.
+                    let mut sv = Solver::new(&s, &ctx, &nets[slot], cfg, bel.clone());
+                    let stop = if gc.eval {
+                        cfg.iters
+                    } else {
+                        rng.below(cfg.iters + 1)
+                    };
+                    for i in 0..stop {
+                        sv.step(i % 2);
+                    }
+                    walk = Some(Walk {
+                        sv,
+                        slot,
+                        node: 0,
+                        root_s: s.clone(),
+                        root_bel: bel.clone(),
+                    });
+                }
+                let w = walk.as_mut().unwrap();
+                let nid = w.node;
+                let n = &w.sv.nodes[nid];
+                // The tree was built from the belief at the subgame root and
+                // advanced in lockstep with the Bayes filter: the acting
+                // player's config support must be the same list *in order*,
+                // because the strategy rows are indexed by it. A silent
+                // desync would read the wrong row for the true config and
+                // corrupt every target from here on, so fail loudly.
+                assert!(
+                    n.player == player
+                        && n.cfgs[player as usize] == bel[player as usize].cfg,
+                    "walk desync: subgame tree no longer matches the game belief"
+                );
+                let na = n.na();
+                let mut np = NodePolicy {
+                    acts: n.acts.clone(),
+                    aslot: n.aslot.clone(),
+                    fdown: n.fdown.clone(),
+                    legal: n.legal.clone(),
+                    probs: vec![0.0; cfgs.len() * na],
+                };
                 for ci in 0..cfgs.len() {
                     let row = if gc.eval {
-                        sv.average_strategy(0, ci)
+                        w.sv.average_strategy(nid, ci)
                     } else {
-                        sv.sampling_strategy(0, ci)
+                        w.sv.sampling_strategy(nid, ci)
                     };
                     np.probs[ci * na..(ci + 1) * na].copy_from_slice(row);
-                }
-                // Finish the solve, then read the value target off the root.
-                for i in stop..cfg.iters {
-                    sv.step(i % 2);
-                }
-                if gc.collect == Collect::Rebel && sv.solved() {
-                    data.push_value(&s, &ctx, &bel, [sv.root_values(0), sv.root_values(1)]);
                 }
                 np
             }
@@ -417,6 +511,24 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
         }
         bel[player as usize] = Belief::from_pairs(pairs);
         s.apply_inplace(np.acts[chosen]);
+
+        // Advance the walk along the solved tree. The public observation of
+        // the chosen action selects the child; if that child is a leaf
+        // (depth exhausted, terminal, or a draw), the walk ends and the
+        // subgame gets its full solve and its value target now.
+        let mut walk_ended = false;
+        if let Some(w) = walk.as_mut() {
+            let nid = w.node;
+            let child = w.sv.nodes[nid].child[w.sv.nodes[nid].obs_child[chosen]];
+            if w.sv.nodes[child].leaf {
+                walk_ended = true;
+            } else {
+                w.node = child;
+            }
+        }
+        if walk_ended {
+            finish_walk(walk.take().unwrap(), gc, &ctx, data);
+        }
     }
 
     let z = s.utility(WHITE as usize);

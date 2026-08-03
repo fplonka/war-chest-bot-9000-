@@ -621,6 +621,19 @@ impl<'a> Solver<'a> {
         }
     }
 
+    /// Run the remaining CFR iterations up to the configured total
+    /// (`self.cfg.iters`), preserving the alternating-traverser schedule of
+    /// `step(i % 2)`. Used to finish a solve whose first `stop` steps were
+    /// run when the subgame was built, after the walk acted on the
+    /// strategies at that iterate.
+    pub fn complete(&mut self) {
+        let iters = self.cfg.iters;
+        let done = self.steps[0] + self.steps[1];
+        for i in done..iters {
+            self.step(i % 2);
+        }
+    }
+
     pub fn solved(&self) -> bool {
         self.steps[0] > 0 && self.steps[1] > 0
     }
