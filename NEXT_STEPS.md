@@ -223,24 +223,8 @@ sample size and cap-0 scoring), the `infer` parity hook, `test_parity.py`, and
 
 **Queued, still not applied:**
 
-- **D5 — chance nodes are leaves the network is never trained on.** 8.8% of a
-  MainPlay node's public children are `Draw` nodes, but `play_game` skips chance
-  nodes without calling `push_value`, so the `pending_kind == Draw` one-hot
-  column is never 1 in any training row and its weights never move from
-  initialisation. Worse, at a Draw node both hands are empty, so the belief
-  collapses to a point mass on `hand_index == 0` and the per-hand head
-  degenerates to a single number — exactly at the round boundary, where
-  face-down composition determines the next hand. The fix is better than adding
-  chance-node targets: a draw's *public* projection is deterministic (hand +1,
-  bag −1, no public branching), so walk straight through it with
-  `belief_after_draw` and no tree branching. Removes the out-of-distribution
-  leaves *and* lets depth-2 subgames span a round boundary. **Not a small
-  patch:** the draw's config transition is a stochastic matrix (each parent
-  config draws each coin type with its own bag probability), so the chance
-  probability must enter reach propagation per `(parent_config,
-  child_config)` and stay separate from both players' strategy factors — and
-  the tabular-CFR oracle (`micro_position` in `rebel_solver.rs`) explicitly
-  skips chance nodes, so a chance-aware oracle has to come first.
+- **D5 — chance nodes are leaves the network is never trained on.** **DONE —
+  see §4f.**
 
 - **Trajectory reuse (act along the solved subgame instead of re-solving every
   ply).** `selfplay.rs` builds a fresh `Solver` per decision and takes one
@@ -323,6 +307,54 @@ E still plateaus, data starvation is not the explanation, and the next suspects
 are D5 (§4b), trajectory reuse (§4b), and the contracting `tgt_std` (0.451 →
 0.271 over run D — the value targets are losing spread).
 
+## 4e. Trajectory reuse: act along the solved subgame
+
+A `Solver` is now built once at a subgame root and serves every decision
+inside its tree (the reference's `sample_state_to_leaf`): the game descends
+through the tree taking an action per decision, and a new solver is built only
+at a leaf — terminal, depth limit, or (before §4f) a draw. The value target is
+taken once per solve, at its root, exactly as in `RlRunner::step`.
+
+- Self-play acts on a uniformly random CFR iterate (Theorem 3); eval acts on
+  the average strategy. A hard assertion keeps the tree's config support in
+  lockstep with the Bayes-filtered belief (a silent desync would index the
+  wrong strategy rows and corrupt every target).
+- The walk is **slot-scoped**: a walk built by one checkpoint is ended before
+  another slot acts, so `final_vs_init` can never play with the wrong network.
+- Measured ~1.7× games/s at depth 2 in an A/B on the same machine. **It does
+  not fix data starvation** — one target per solve either way.
+- Run diagW (10 min, depth 2, iters 8): gate 0.808 → 0.855, `final_vs_init`
+  0.733, `final_vs_greedy` 0.892 (run D: 0.548 / 0.79).
+
+## 4f. D5 done: draws are walked through, not rated
+
+Chance nodes (`Cont::Draw`) are no longer leaves. The draw's outcome is
+private, so the public tree does not branch: exactly one child, built at the
+same depth (a draw is not a decision — this is what lets depth-2 subgames span
+a round boundary). The drawing player's configs transition through a
+per-`(parent_config, child_config)` chance matrix (`draw_transition` in
+`rebel.rs`), kept separate from both players' strategies: it enters the
+drawing player's reach as a transition (`precompute_reaches`), the traverser's
+values as a matrix multiply (`update_regrets`), and the idle player's reach
+and values pass through untouched. The self-play walk advances through draws
+with a hard support-lockstep assertion.
+
+This removes the out-of-distribution leaves (the network is never asked to
+rate a state class it has no training rows for) and lets the search look past
+the round boundary — the hand-off the network used to have to guess.
+
+**Validation** (all green): the existing chance-free oracle tests still pass;
+a new structural test builds real positions whose subgame spans a draw and
+checks one child per chance node, child support == `belief_after_draw` support
+in order, chance rows summing to 1, idle-support passthrough, hand +1, and
+zero-sum root values (errors ≤ 1e-4). The chance transition itself was already
+brute-force-verified in `rebel_pbs.rs`.
+
+Run diagW2 (10 min, depth 2, iters 8, with the walk): gate 0.922,
+`final_vs_init` **0.800**, `final_vs_greedy` **0.920**. Generation is slower
+(≈1.2 games/s — subgames are bigger now that they span round boundaries), but
+the targets are worth more.
+
 ## 5. Immediate plan
 
 ### 5.1 Horizon payoff: settled, `--cap-value 0`
@@ -375,21 +407,19 @@ it move is the cheapest early warning we have.
 ### 5.3 Order of work
 
 1. ~~Cavalry / Light Cavalry duplicate actions, zero-legal-action crash~~ — done.
-2. ~~Diagnostic C at `depth: 2`~~ — done; found the buffer-contamination bug:
-   the warm phase had filled 800k of 800k rows, so 93% of every ReBeL batch
-   was greedy imitation data and `final_vs_init` came out at 0.478. Fixed with
-   `buf.clear()` at the transition (and it retroactively explains why run A
-   worked at depth 1: it generated 875k rows, *exceeding* the cap, so warm data
-   got evicted by sheer volume — luck, not design).
+2. ~~Diagnostic C at `depth: 2`~~ — done; found the buffer-contamination bug
+   (§4c): the warm phase had filled 800k of 800k rows. Fixed with
+   `buf.clear()` at the transition.
 3. ~~Run D, depth 2, clean buffer~~ — done; plateaus (§4d).
-4. **Run E** — 20 min at the new defaults (`--depth 2 --iters 8 --gate-every
-   240 --gate-games 300`). Tests the leading hypothesis for the plateau: data
-   starvation. If E still plateaus, the next suspects are D5, trajectory reuse,
-   and the contracting `tgt_std`.
-5. D5 (chance walk-through — chance-aware oracle first, §4b).
-6. Trace tooling (§5.2) and trajectory reuse.
-7. The 30-minute run at `depth: 2`, with the gate curve as the evidence and
-   `final_vs_init` as the headline.
+4. ~~Run E (data-starvation test)~~ — superseded: `--iters 8` + trajectory
+   reuse (§4e) + the draw walk-through (§4f) together lifted `final_vs_init`
+   from 0.548 to 0.800 and `final_vs_greedy` from 0.79 to 0.920 in 10-minute
+   runs, with a gate curve that climbs (0.922).
+5. ~~D5 (draw walk-through)~~ — done (§4f). ~~Trajectory reuse~~ — done (§4e).
+6. Trace tooling (§5.2) — still not started.
+7. The 30-minute run at `depth: 2` with gates every 20 min
+   (`--gate-every 1200`), `final_vs_init` as the headline; the final eval now
+   reports only `final_vs_greedy` and `final_vs_init`.
 
 ---
 

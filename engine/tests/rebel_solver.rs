@@ -19,7 +19,8 @@ use warchest::rebel::*;
 use warchest::rng::Rng;
 use warchest::search::{node_actions, Cfg, Nets, Solver};
 use warchest::selfplay::make_game;
-use warchest::state::{State, MAX_MAIN_PLAYS};
+use warchest::state::{State, MAX_MAIN_PLAYS, Z_BAG, Z_FACEDOWN, Z_HAND};
+use warchest::units::N_UNITS;
 
 /// A real position `plies` coin plays from the horizon, reached by random play
 /// so it is a state the engine actually produces.
@@ -313,4 +314,169 @@ fn cfr_iteration_count_bias() {
         );
     }
     assert!(rows >= 4);
+}
+
+/// A real position a few plies from the horizon, reached by random play, whose
+/// remaining game spans a round boundary: small hands, so both players empty
+/// them within the remaining main plays and the draws happen inside the
+/// subgame.
+fn draw_position(seed: u64, warmup: usize, plies: u16) -> Option<State> {
+    let mut rng = Rng::new(seed);
+    let mut s = make_game(&mut rng, false);
+    for _ in 0..warmup {
+        if s.is_terminal() {
+            return None;
+        }
+        let acts = s.legal_actions();
+        s.apply_inplace(acts[rng.below(acts.len())]);
+    }
+    if s.is_terminal() || !matches!(s.pending(), warchest::state::Cont::MainPlay) {
+        return None;
+    }
+    // A real board reached by actual play; force the hands to one coin each
+    // so both players empty them — and the round boundary with its draws —
+    // inside the remaining `plies` main plays. Everything else stays in the
+    // bag, so the config space is tiny.
+    let ctx = Ctx::new(&s);
+    for p in 0..2u8 {
+        for u in 0..warchest::units::N_UNITS {
+            let c = s.zones[p as usize][Z_HAND][u];
+            s.zones[p as usize][Z_BAG][u] += c;
+            s.zones[p as usize][Z_HAND][u] = 0;
+            let c = s.zones[p as usize][Z_FACEDOWN][u];
+            s.zones[p as usize][Z_BAG][u] += c;
+            s.zones[p as usize][Z_FACEDOWN][u] = 0;
+        }
+        let mut cfg = Config::default();
+        cfg.hand[0] = 1;
+        set_config(&mut s, p, &ctx, &cfg);
+    }
+    s.main_plays = MAX_MAIN_PLAYS - plies;
+    Some(s)
+}
+
+/// The draw pass-through, checked structurally on real positions: a chance
+/// node must have exactly one public child, the child's config support must be
+/// exactly `belief_after_draw`'s support (same list, same order — the
+/// invariant the self-play walk asserts at runtime), the idle player's support
+/// must pass through untouched, the chance-matrix rows must be proper
+/// distributions, and the solved root values must stay zero-sum with draws
+/// inside the tree. The chance transition itself is already verified against
+/// brute-force enumeration in `rebel_pbs.rs`.
+#[test]
+fn draw_pass_through_consistency() {
+    let nets = Nets::default();
+    let mut checked = 0;
+    let mut cnt = [0usize; 5]; // 0 rejected, 1 built, 2 toolarge, 3 nochance, 4 solved
+    for seed in 0..4000u64 {
+        let Some(s) = draw_position(seed, 60 + (seed as usize % 120), 4) else {
+            cnt[0] += 1;
+            continue;
+        };
+        let ctx = Ctx::new(&s);
+        let bel = [
+            uniform_belief(&s, &ctx, 0),
+            uniform_belief(&s, &ctx, 1),
+        ];
+        if bel[0].len() * bel[1].len() > 1000 {
+            cnt[0] += 1;
+            continue;
+        }
+        // Bound the build: positions whose root decision branches widely
+        // produce subgames too big to build, let alone solve.
+        let (acts, _, _) = node_actions(&s, s.to_act(), &ctx, &bel[s.to_act() as usize].cfg);
+        if acts.len() > 14 {
+            cnt[0] += 1;
+            continue;
+        }
+        let mut sv = Solver::new(
+            &s,
+            &ctx,
+            &nets,
+            Cfg {
+                depth: 5,
+                iters: 80,
+            },
+            bel.clone(),
+        );
+        if sv.nodes.len() > 20_000 {
+            cnt[2] += 1;
+            continue;
+        }
+        if !sv.nodes.iter().any(|n| n.chance) {
+            cnt[3] += 1;
+            continue;
+        }
+        cnt[1] += 1;
+        for i in 0..sv.nodes.len() {
+            if !sv.nodes[i].chance {
+                continue;
+            }
+            let n = &sv.nodes[i];
+            assert_eq!(n.child.len(), 1, "a draw must have exactly one public child");
+            let me = n.player as usize;
+            let ch = n.child[0];
+            assert_eq!(
+                sv.nodes[ch].cfgs[1 - me],
+                n.cfgs[1 - me],
+                "idle player's support must pass through the draw untouched"
+            );
+            let res = reserve(&n.s, n.player, &ctx);
+            let fu = faceup_counts(&n.s, n.player, &ctx);
+            let b = Belief {
+                cfg: n.cfgs[me].clone(),
+                p: vec![1.0; n.cfgs[me].len()],
+            };
+            let after = belief_after_draw(&b, &res, &fu);
+            assert_eq!(
+                sv.nodes[ch].cfgs[me],
+                after.cfg,
+                "post-draw support must equal belief_after_draw's, in order"
+            );
+            for (ci, row) in n.draw_p.iter().enumerate() {
+                let sum: f32 = row.iter().sum();
+                assert!(
+                    (sum - 1.0).abs() < 1e-5,
+                    "draw row {} sums to {}",
+                    ci,
+                    sum
+                );
+            }
+            assert_eq!(
+                sv.nodes[ch].s.hand_size(n.player),
+                n.s.hand_size(n.player) + 1,
+                "a draw adds exactly one coin to the hand"
+            );
+        }
+        sv.multistep(80);
+        let v0: f64 = (0..bel[0].len())
+            .map(|c| bel[0].p[c] as f64 * sv.root_values(0)[c] as f64)
+            .sum();
+        let v1: f64 = (0..bel[1].len())
+            .map(|c| bel[1].p[c] as f64 * sv.root_values(1)[c] as f64)
+            .sum();
+        assert!(
+            (v0 + v1).abs() < 0.05,
+            "seed {}: root values not zero-sum with draws in the tree: {:.4} + {:.4}",
+            seed,
+            v0,
+            v1
+        );
+        checked += 1;
+        cnt[4] += 1;
+        eprintln!(
+            "  seed {:4}: zero-sum {:+.4} ({} nodes)",
+            seed,
+            v0 + v1,
+            sv.nodes.len()
+        );
+        if checked >= 6 {
+            break;
+        }
+    }
+    eprintln!(
+        "draw pass-through: rejected={} built={} toolarge={} nochance={} solved={}",
+        cnt[0], cnt[1], cnt[2], cnt[3], cnt[4]
+    );
+    assert!(checked >= 4, "only {} draw positions exercised", checked);
 }

@@ -367,17 +367,34 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
     while !s.is_terminal() {
         let player = s.to_act();
         if s.is_chance() {
-            // A draw is a leaf of every subgame; a walk cannot span one. The
-            // walk cannot actually be alive here (it is ended when it steps
-            // into a leaf), but finish defensively: a pending subgame is
-            // solved and its target collected either way.
-            if let Some(w) = walk.take() {
-                finish_walk(w, gc, &ctx, data);
-            }
             let res = reserve(&s, player, &ctx);
             let fu = faceup_counts(&s, player, &ctx);
             bel[player as usize] = belief_after_draw(&bel[player as usize], &res, &fu);
             resolve_chance(&mut s, player, rng);
+            // The walk spans draws now: a draw is an internal node of the
+            // subgame with one public child, so advance through it. The
+            // post-draw belief must equal the tree's post-draw config support
+            // (same list, same order) or every strategy row read from here on
+            // is wrong.
+            let mut walk_ended = false;
+            if let Some(w) = walk.as_mut() {
+                let nid = w.node;
+                let n = &w.sv.nodes[nid];
+                assert!(n.chance && n.player == player, "walk not at the draw");
+                let child = n.child[0];
+                assert!(
+                    w.sv.nodes[child].cfgs[player as usize] == bel[player as usize].cfg,
+                    "walk desync: post-draw support does not match the game belief"
+                );
+                if w.sv.nodes[child].leaf {
+                    walk_ended = true;
+                } else {
+                    w.node = child;
+                }
+            }
+            if walk_ended {
+                finish_walk(walk.take().unwrap(), gc, &ctx, data);
+            }
             continue;
         }
 

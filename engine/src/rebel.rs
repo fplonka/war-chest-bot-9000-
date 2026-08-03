@@ -413,6 +413,47 @@ pub fn belief_after_draw(b: &Belief, reserve: &[u8; NSLOT], faceup: &[u8; NSLOT]
     Belief::from_pairs(pairs)
 }
 
+/// The chance transition of a draw, as a matrix: for each config in `b`, which
+/// configs it can become (one per drawable coin type, reshuffling first if its
+/// bag is empty) and with what probability. Returns the sorted-deduped child
+/// support and a `[parent][child]` probability matrix — the per-config chance
+/// factor the subgame tree's reach accounting needs, kept separate from both
+/// players' strategies.
+pub fn draw_transition(
+    b: &Belief,
+    reserve: &[u8; NSLOT],
+    faceup: &[u8; NSLOT],
+) -> (Vec<Config>, Vec<Vec<f32>>) {
+    let mut rows: Vec<(usize, Config, f32)> = Vec::new();
+    for (ci, c) in b.cfg.iter().enumerate() {
+        let (src, base) = draw_source(c, reserve, faceup);
+        let total: u32 = src.iter().map(|&x| x as u32).sum();
+        if total == 0 {
+            rows.push((ci, *c, 1.0));
+            continue;
+        }
+        for k in 0..NSLOT {
+            if src[k] == 0 {
+                continue;
+            }
+            let mut n = base;
+            n.hand[k] += 1;
+            if n.hand_size() as usize <= HAND_CAP {
+                rows.push((ci, n, src[k] as f32 / total as f32));
+            }
+        }
+    }
+    let mut support: Vec<Config> = rows.iter().map(|r| r.1).collect();
+    support.sort_unstable();
+    support.dedup();
+    let mut mat = vec![vec![0.0f32; support.len()]; b.len()];
+    for (ci, c, p) in rows {
+        let t = support.binary_search(&c).expect("child config in support");
+        mat[ci][t] += p;
+    }
+    (support, mat)
+}
+
 /// What a config draws from, and what it looks like after any reshuffle:
 /// normally the bag, but when the bag is empty the whole discard pile is
 /// shuffled in and the face-down component is forgotten.

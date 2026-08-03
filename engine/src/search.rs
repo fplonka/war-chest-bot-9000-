@@ -2,9 +2,11 @@
 //! (Brown, Bakhtin, Lerer & Gong 2020), specialised to War Chest.
 //!
 //! The subgame rooted at a PBS is unrolled over **public observations**. A node
-//! is a leaf when it is terminal, when it is a chance node (a draw: the outcome
-//! is private, so clamping there keeps the subgame chance-free), or when the
-//! depth limit is reached. Leaf values come from the value network.
+//! is a leaf when it is terminal or when the depth limit is reached. A round-
+//! start draw is *walked through*: its outcome is private, so the public tree
+//! does not branch — the one child is the post-draw state, and the drawing
+//! player's configs are convolved through the draw distribution. Leaf values
+//! come from the value network.
 //!
 //! Conventions follow the reference implementation (`csrc/liars_dice` of
 //! `facebookresearch/rebel`):
@@ -156,6 +158,13 @@ pub struct TNode {
     pub s: State,
     pub player: u8,
     pub leaf: bool,
+    /// Draw pass-through node: the public tree does not branch, there is one
+    /// public child, and the drawing player's configs transition through the
+    /// `draw_p` chance matrix.
+    pub chance: bool,
+    /// `[parent_config][child_config]` draw probabilities, for the drawing
+    /// player. Empty for decision nodes.
+    pub draw_p: Vec<Vec<f32>>,
     pub acts: Vec<Action>,
     pub aslot: Vec<i8>,
     pub fdown: Vec<bool>,
@@ -280,12 +289,18 @@ impl<'a> Solver<'a> {
 
     fn build(&mut self, s: State, depth: usize, cfgs: [Vec<Config>; 2]) -> usize {
         let player = s.to_act();
-        let leaf = s.is_terminal() || s.is_chance() || depth == 0;
+        // A plain round-start draw is walked through (one public child, no
+        // depth cost). Other chance nodes (Warrior Priest draws — excluded
+        // from every draft) stay leaves, as do depth-0 nodes and terminals.
+        let draw_pass = matches!(s.pending(), Cont::Draw { .. });
+        let leaf = s.is_terminal() || (!draw_pass && (depth == 0 || s.is_chance()));
         let id = self.nodes.len();
         self.nodes.push(TNode {
             s: s.clone(),
             player,
             leaf,
+            chance: false,
+            draw_p: Vec::new(),
             acts: Vec::new(),
             aslot: Vec::new(),
             fdown: Vec::new(),
@@ -296,6 +311,39 @@ impl<'a> Solver<'a> {
             trans: Vec::new(),
         });
         if leaf {
+            return id;
+        }
+
+        if draw_pass {
+            // The draw's outcome is private, so the public tree does not
+            // branch: there is exactly one child, the state after the draw.
+            // Which coin is drawn changes nothing public, so any legal
+            // DrawCoin produces the same child. The drawing player's configs
+            // are convolved through the draw distribution — the chance
+            // factor stays separate from both players' strategies: it enters
+            // the drawing player's reach as a transition, and the idle
+            // player's reach passes through untouched. The depth is not
+            // consumed: a draw is not a decision, and spending depth here is
+            // what stops subgames from spanning a round boundary.
+            let acts = s.legal_actions();
+            debug_assert!(matches!(acts.first(), Some(Action::DrawCoin { .. })));
+            let mut cs = s.clone();
+            cs.apply_inplace(acts[0]);
+            let me = player as usize;
+            let res = reserve(&s, player, self.ctx);
+            let fu = faceup_counts(&s, player, self.ctx);
+            let bel = Belief {
+                cfg: cfgs[me].clone(),
+                p: vec![1.0; cfgs[me].len()],
+            };
+            let (child_cfgs, draw_p) = draw_transition(&bel, &res, &fu);
+            let mut cc = cfgs.clone();
+            cc[me] = child_cfgs;
+            let ch = self.build(cs, depth, cc);
+            let n = &mut self.nodes[id];
+            n.chance = true;
+            n.child = vec![ch];
+            n.draw_p = draw_p;
             return id;
         }
 
@@ -407,6 +455,28 @@ impl<'a> Solver<'a> {
             let op = 1 - me;
             let src_op = self.reach[i][op].clone();
             let src_me = self.reach[i][me].clone();
+            if self.nodes[i].chance {
+                // Draw: one public child. The idle player's reach passes
+                // through unchanged; the drawing player's configs transition
+                // through the chance matrix, so the chance factor lives in
+                // the drawing player's reach and is discarded with it when
+                // the leaf values take the counterfactual convention.
+                let c = self.nodes[i].child[0];
+                self.reach[c][op].copy_from_slice(&src_op);
+                let child_nc = self.nodes[c].nc(me);
+                for ci in 0..src_me.len() {
+                    if src_me[ci] == 0.0 {
+                        continue;
+                    }
+                    for t in 0..child_nc {
+                        let p = self.nodes[i].draw_p[ci][t];
+                        if p > 0.0 {
+                            self.reach[c][me][t] += src_me[ci] * p;
+                        }
+                    }
+                }
+                continue;
+            }
             for ch in 0..self.nodes[i].child.len() {
                 let c = self.nodes[i].child[ch];
                 // The idle player's information state is untouched, and the
@@ -503,6 +573,31 @@ impl<'a> Solver<'a> {
             }
             let (na, me) = (self.nodes[i].na(), self.nodes[i].player as usize);
             let nc = self.nodes[i].nc(traverser);
+            if self.nodes[i].chance {
+                // Draw pass-through: no regrets, no strategy. If the traverser
+                // is the one drawing, their per-config values are pushed
+                // through the chance matrix (the probability is a real factor
+                // of the value, unlike the traverser's own strategy, which the
+                // counterfactual convention discards). If the idle player
+                // draws, the traverser's configs are untouched and the
+                // opponent's chance factor is already in their reach, which
+                // the leaf values carry.
+                let ch = self.nodes[i].child[0];
+                if me == traverser {
+                    let ch_nc = self.nodes[ch].nc(traverser);
+                    for c in 0..nc {
+                        let mut v = 0.0;
+                        for t in 0..ch_nc {
+                            v += self.nodes[i].draw_p[c][t] * self.vals[ch][t];
+                        }
+                        self.vals[i][c] = v;
+                    }
+                } else {
+                    let v = self.vals[ch][..nc].to_vec();
+                    self.vals[i][..nc].copy_from_slice(&v);
+                }
+                continue;
+            }
             for c in 0..nc {
                 self.vals[i][c] = 0.0;
             }
@@ -555,7 +650,8 @@ impl<'a> Solver<'a> {
         let m = self.steps[traverser] as f32 + 1.0;
         let disc = m / (m + 1.0);
         for i in 0..self.nodes.len() {
-            if self.nodes[i].leaf || self.nodes[i].player as usize != traverser {
+            if self.nodes[i].leaf || self.nodes[i].chance || self.nodes[i].player as usize != traverser
+            {
                 continue;
             }
             let (na, nc) = (self.nodes[i].na(), self.nodes[i].nc(traverser));
@@ -585,7 +681,8 @@ impl<'a> Solver<'a> {
         // under the strategy just computed.
         self.precompute_reaches();
         for i in 0..self.nodes.len() {
-            if self.nodes[i].leaf || self.nodes[i].player as usize != traverser {
+            if self.nodes[i].leaf || self.nodes[i].chance || self.nodes[i].player as usize != traverser
+            {
                 continue;
             }
             let (na, nc) = (self.nodes[i].na(), self.nodes[i].nc(traverser));

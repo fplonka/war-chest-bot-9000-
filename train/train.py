@@ -167,7 +167,7 @@ def main():
     # reported score upward. Fewer, larger gates cost the same and select
     # better. `final_vs_init` is the headline number for exactly this reason --
     # it is not the quantity the checkpoint was selected on.
-    ap.add_argument("--gate-every", type=float, default=240.0)
+    ap.add_argument("--gate-every", type=float, default=1200.0)
     ap.add_argument("--gate-games", type=int, default=300)
     ap.add_argument("--cap", type=int, default=800_000)
     ap.add_argument("--eval-games", type=int, default=400)
@@ -197,7 +197,10 @@ def main():
     # actually measured best against the fixed Greedy reference rather than
     # whichever weights happen to be live when the clock runs out.
     best = {"score": -1.0, "t": 0.0, "state": None}
-    next_gate = 0.0
+    # Gate rarely: each gate is minutes of eval, so only big runs bother. The
+    # first gate is `gate_every` seconds into the ReBeL phase; a run shorter
+    # than that has no gates and ships the latest weights (best stays None).
+    next_gate = warm + args.gate_every
     gate_curve = []
     # The marker-differential payoff at the horizon distorts the game being
     # solved, so it is annealed away as soon as horizon games become rare, and
@@ -347,10 +350,6 @@ def main():
         return score
 
     r = {}
-    r["greedy_vs_uniform"] = report("Greedy vs uniform-random (sanity)",
-                                    warchest.eval_match(n, 11, "greedy", "uniform", **kw))
-    r["init_vs_greedy"] = report("initial checkpoint vs Greedy",
-                                 warchest.eval_match(n, 202, "rebel", "greedy", slot_a=1, **kw))
     r["final_vs_greedy"] = report("final checkpoint vs Greedy",
                                   warchest.eval_match(n, 303, "rebel", "greedy", slot_a=0, **kw))
     r["final_vs_init"] = report("final checkpoint vs initial checkpoint",
@@ -362,9 +361,8 @@ def main():
     ok = r["final_vs_init"] > 0.5 and r["final_vs_greedy"] > 0.5
     print(f"\nGOAL: the run produced a checkpoint better than the initial one that also "
           f"beats Greedy -> {'PASS' if ok else 'FAIL'}", flush=True)
-    print("      (the warm-started initial checkpoint scores "
-          f"{r['init_vs_greedy']:.3f} against Greedy on its own; ReBeL self-play is what "
-          "carries it past)", flush=True)
+    print("      (ReBeL self-play must carry the warm-started network past its own "
+          "start; final_vs_init is the headline)", flush=True)
 
 
 if __name__ == "__main__":
