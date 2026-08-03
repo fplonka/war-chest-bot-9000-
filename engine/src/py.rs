@@ -480,9 +480,231 @@ impl Game {
     }
 }
 
+// --------------------------------------------------------------- ReBeL API
+//
+// The training loop lives in Python (PyTorch), but every game, every subgame
+// solve and every network evaluation runs here: Python only ships weights down
+// and pulls tensors back once per epoch.
+
+use crate::net::Mlp;
+use crate::search::{Cfg, Nets};
+use crate::selfplay::{eval_match as rs_eval_match, run_games, Agent, Collect, Data, GameCfg};
+use numpy::{IntoPyArray, PyReadonlyArray1};
+use std::sync::{OnceLock, RwLock};
+
+/// Two independent weight slots, so a match can pit one checkpoint against
+/// another (the final network against the initial one, say).
+pub const N_SLOTS: usize = 2;
+
+fn nets() -> &'static RwLock<Vec<Nets>> {
+    static NETS: OnceLock<RwLock<Vec<Nets>>> = OnceLock::new();
+    NETS.get_or_init(|| RwLock::new(vec![Nets::default(); N_SLOTS]))
+}
+
+fn split_mlp(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> PyResult<Mlp> {
+    let mut mlp = Mlp {
+        dims: dims.to_vec(),
+        w: Vec::new(),
+        b: Vec::new(),
+        ln_w: Vec::new(),
+        ln_b: Vec::new(),
+    };
+    let (mut wi, mut bi) = (0usize, 0usize);
+    for l in 0..dims.len() - 1 {
+        let (i, o) = (dims[l], dims[l + 1]);
+        if wi + i * o > w.len() || bi + o > b.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "weight buffer too short for the given dims",
+            ));
+        }
+        mlp.w.push(w[wi..wi + i * o].to_vec());
+        mlp.b.push(b[bi..bi + o].to_vec());
+        wi += i * o;
+        bi += o;
+    }
+    // LayerNorm parameters for the hidden layers, weight then bias per layer.
+    // An empty buffer means the network has no norm.
+    if !ln.is_empty() {
+        let hidden = dims.len() - 2;
+        let need: usize = 2 * dims[1..dims.len() - 1].iter().sum::<usize>();
+        if ln.len() != need {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "layernorm buffer is {} floats, expected {}",
+                ln.len(),
+                need
+            )));
+        }
+        let mut li = 0usize;
+        for l in 0..hidden {
+            let o = dims[l + 1];
+            mlp.ln_w.push(ln[li..li + o].to_vec());
+            li += o;
+            mlp.ln_b.push(ln[li..li + o].to_vec());
+            li += o;
+        }
+    }
+    Ok(mlp)
+}
+
+/// Install value-network weights. `w` holds every layer's `[in, out]` matrix
+/// concatenated row-major (torch's `weight.t()`), `b` every bias.
+#[pyfunction]
+#[pyo3(signature = (dims, w, b, slot=0, ln=None))]
+fn set_weights(
+    dims: Vec<usize>,
+    w: PyReadonlyArray1<f32>,
+    b: PyReadonlyArray1<f32>,
+    slot: usize,
+    ln: Option<PyReadonlyArray1<f32>>,
+) -> PyResult<()> {
+    if slot >= N_SLOTS {
+        return Err(pyo3::exceptions::PyValueError::new_err("slot out of range"));
+    }
+    let empty: [f32; 0] = [];
+    let ln_slice = match &ln {
+        Some(a) => a.as_slice()?,
+        None => &empty,
+    };
+    let mlp = split_mlp(&dims, w.as_slice()?, b.as_slice()?, ln_slice)?;
+    nets().write().unwrap()[slot].value = mlp;
+    Ok(())
+}
+
+fn agent_of(name: &str, cfg: Cfg, temp: f32, slot: usize) -> PyResult<Agent> {
+    Ok(match name {
+        "greedy" => Agent::Greedy { temp },
+        "uniform" => Agent::Uniform,
+        "rebel" => Agent::Rebel { cfg, slot },
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown agent '{}'",
+                other
+            )))
+        }
+    })
+}
+
+fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
+    let out = PyDict::new_bound(py);
+    out.set_item("nv", d.nv)?;
+    out.set_item("games", d.games)?;
+    out.set_item("decisions", d.decisions)?;
+    out.set_item("white_wins", d.wins[0])?;
+    out.set_item("black_wins", d.wins[1])?;
+    out.set_item("draws", d.draws)?;
+    out.set_item("cap_hits", d.cap_hits)?;
+    out.set_item("configs", d.configs)?;
+    out.set_item("vx", d.vx.into_pyarray_bound(py))?;
+    out.set_item("vy", d.vy.into_pyarray_bound(py))?;
+    out.set_item("vm", d.vm.into_pyarray_bound(py))?;
+    Ok(out.into())
+}
+
+/// Run `games` self-play games across all cores and return the training data.
+/// `mode` is "greedy" (Monte-Carlo warm start) or "rebel".
+#[pyfunction]
+#[pyo3(signature = (games, seed, mode, depth=1, iters=16, explore=0.25, temp=2.0, random_draft=false, eval_mix=0.5))]
+#[allow(clippy::too_many_arguments)]
+fn gen_data(
+    py: Python<'_>,
+    games: usize,
+    seed: u64,
+    mode: &str,
+    depth: usize,
+    iters: usize,
+    explore: f32,
+    temp: f32,
+    random_draft: bool,
+    eval_mix: f32,
+) -> PyResult<PyObject> {
+    let cfg = Cfg { depth, iters };
+    let (agent, collect) = match mode {
+        "greedy" => (Agent::Greedy { temp }, Collect::Mc),
+        "rebel" => (Agent::Rebel { cfg, slot: 0 }, Collect::Rebel),
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown mode '{}'",
+                other
+            )))
+        }
+    };
+    let gc = GameCfg {
+        agents: [agent, agent],
+        collect,
+        explore,
+        eval: false,
+        random_draft,
+        eval_mix,
+    };
+    let d = py.allow_threads(|| {
+        let n = nets().read().unwrap();
+        run_games(games, seed, &n, &gc)
+    });
+    data_to_dict(py, d)
+}
+
+/// Head-to-head evaluation with alternating colours and paired drafts.
+#[pyfunction]
+#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=false))]
+#[allow(clippy::too_many_arguments)]
+fn eval_match(
+    py: Python<'_>,
+    games: usize,
+    seed: u64,
+    a: &str,
+    b: &str,
+    depth: usize,
+    iters: usize,
+    temp: f32,
+    slot_a: usize,
+    slot_b: usize,
+    random_draft: bool,
+) -> PyResult<(usize, usize, usize)> {
+    let cfg = Cfg { depth, iters };
+    let (aa, bb) = (agent_of(a, cfg, temp, slot_a)?, agent_of(b, cfg, temp, slot_b)?);
+    Ok(py.allow_threads(|| {
+        let n = nets().read().unwrap();
+        rs_eval_match(games, seed, &n, aa, bb, random_draft)
+    }))
+}
+
+/// Set the horizon payoff per marker of lead. The trainer anneals it to 0.
+#[pyfunction]
+fn set_cap_value(v: f32) {
+    crate::state::set_cap_marker_value(v);
+}
+
+/// Run the Rust value network forward on `x` (`rows * FEAT`, row-major) and
+/// return `rows * 2*NHAND` outputs. Exists so the Python side can assert that
+/// the inference path used to generate targets is numerically the same network
+/// that PyTorch trains -- a silent divergence there would corrupt every target
+/// while every other test kept passing.
+#[pyfunction]
+#[pyo3(signature = (x, rows, slot=0))]
+fn infer(x: PyReadonlyArray1<f32>, rows: usize, slot: usize) -> PyResult<Vec<f32>> {
+    if slot >= N_SLOTS {
+        return Err(pyo3::exceptions::PyValueError::new_err("slot out of range"));
+    }
+    let guard = nets().read().unwrap();
+    let mlp = &guard[slot].value;
+    if mlp.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err("no weights in slot"));
+    }
+    let (mut scratch, mut out) = (Vec::new(), Vec::new());
+    mlp.forward(x.as_slice()?, rows, &mut scratch, &mut out);
+    Ok(out)
+}
+
 #[pymodule]
 fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Game>()?;
     m.add("MAX_MAIN_PLAYS", crate::state::MAX_MAIN_PLAYS)?;
+    m.add("FEAT", crate::rebel::FEAT)?;
+    m.add("NHAND", crate::rebel::NHAND)?;
+    m.add_function(wrap_pyfunction!(set_weights, m)?)?;
+    m.add_function(wrap_pyfunction!(set_cap_value, m)?)?;
+    m.add_function(wrap_pyfunction!(gen_data, m)?)?;
+    m.add_function(wrap_pyfunction!(eval_match, m)?)?;
+    m.add_function(wrap_pyfunction!(infer, m)?)?;
     Ok(())
 }

@@ -700,14 +700,37 @@ impl State {
                 }
             }
             Tactic::Cavalry => {
-                // move one step to empty; the follow-up attack is a later node.
+                // Move one step to empty; the follow-up attack is a later node.
+                //
+                // The destination must have an attackable enemy. The FAQ
+                // (rules PDF p.17, LANCER) requires a legally attackable target
+                // to exist at the moment the tactic is chosen, and the Cavalry
+                // card has the same move-then-attack shape. Without this the
+                // tactic degenerates into a plain Move whenever no target
+                // follows -- `advance` silently drops the queued CavalryAttack
+                // -- producing an action byte-identical to `Move{from,to}` and
+                // corrupting every uniform-over-actions distribution in the
+                // search and self-play loop.
+                //
+                // Evaluated on the pre-move board, which is exact here: the
+                // move only vacates `hex` (our own unit, never an enemy target)
+                // and fills `to` (empty, likewise never a target).
+                let h = self.hex_height[hex];
                 let mut tos = Vec::new();
                 self.adj_empty(hex, &mut tos);
                 for to in tos {
-                    out.push(Action::TacCavalryMove {
-                        from: hex as u8,
-                        to,
+                    let has_target = (0..6).any(|d| {
+                        let n = b.neighbors[to as usize][d];
+                        n != NONE
+                            && is_enemy_unit(self, n as usize, me)
+                            && attack_allowed_h(self, n as usize, h)
                     });
+                    if has_target {
+                        out.push(Action::TacCavalryMove {
+                            from: hex as u8,
+                            to,
+                        });
+                    }
                 }
             }
             Tactic::Crossbowman => {
@@ -798,6 +821,14 @@ impl State {
                     for d2 in 0..6 {
                         let to = b.neighbors[m as usize][d2];
                         if to == NONE || to as usize == hex || occupied(self, to as usize) {
+                            continue;
+                        }
+                        // Two axial steps with a 120-degree turn land adjacent
+                        // to the start, where the plain Move produces an
+                        // identical successor state. Legal, but redundant, and
+                        // duplicate actions skew every uniform distribution
+                        // over the action set.
+                        if b.dist[hex][to as usize] != 2 {
                             continue;
                         }
                         out.push(Action::TacLightCav {

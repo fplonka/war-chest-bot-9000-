@@ -1,8 +1,7 @@
 # warchest-engine
 
 A verified rules engine for War Chest (2-player ranked configuration), in Rust,
-with optional pyo3 bindings. This is the clean core extracted from an earlier
-project — engine only, no training code.
+with pyo3 bindings — plus a ReBeL agent trained on top of it.
 
 ## Layout
 
@@ -10,13 +9,30 @@ project — engine only, no training code.
 engine/          Rust crate, lib name `warchest`
   RULES.md       rules spec (source of truth)
   src/           actions, board, rng, rules, state, units, py (bindings)
-  tests/         36 scenario tests + random-playout invariants
+  src/           rebel, search, selfplay, net  (the ReBeL agent)
+  tests/         36 scenario tests, playout invariants, PBS correctness tests
   examples/      coords.rs (hex coordinate dump)
   src/bin/       bench.rs (applies/sec, playouts/sec)
+train/           train.py (PyTorch training loop)
 docs/
   ENGINE_FIXES.md  rule corrections found by replaying 1,112 real games
+  REBEL.md         the ReBeL agent: PBS design, CFR solver, deviations
 papers/          War Chest rulebook, ReBeL, TurboReBeL
 ```
+
+## Training
+
+```bash
+uv venv --python 3.12 .venv && VIRTUAL_ENV=.venv uv pip install torch numpy maturin
+cd engine && maturin develop --release && cd ..
+.venv/bin/python train/train.py --minutes 30 --out runs/mine
+```
+
+War Chest turns out to be an unusually good fit for ReBeL. A player's private
+state is exactly `(hand, face-down discards)` — the bag is derived from a public
+reserve — and the reachable set has median 8 and p99 385 members, so CFR
+enumerates information states exactly instead of approximating them with
+particles. See `docs/REBEL.md`.
 
 ## Design
 

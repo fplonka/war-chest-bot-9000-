@@ -12,10 +12,12 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pyo3 = { version = "0.21", features = ["abi3-py39", "extension-module"], optional = true }
+numpy = { version = "0.21", optional = true }
+rayon = "1.10"
 
 [features]
 default = []
-python = ["pyo3"]
+python = ["pyo3", "numpy"]
 
 [[bin]]
 name = "bench"

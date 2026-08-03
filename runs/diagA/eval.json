@@ -1,0 +1,6 @@
+{
+ "greedy_vs_uniform": 0.8616666666666667,
+ "init_vs_greedy": 0.6883333333333334,
+ "final_vs_greedy": 0.8066666666666666,
+ "final_vs_init": 0.7866666666666666
+}

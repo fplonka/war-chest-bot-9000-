@@ -6,7 +6,9 @@ pub struct Rng(pub u64);
 
 impl Rng {
     pub fn new(seed: u64) -> Rng {
-        Rng(seed ^ 0x9E3779B97F4A7C15)
+        // xorshift64* is stuck at zero, so never start there.
+        let s = seed ^ 0x9E3779B97F4A7C15;
+        Rng(if s == 0 { 0xDEADBEEFCAFEF00D } else { s })
     }
     #[inline]
     pub fn next_u64(&mut self) -> u64 {

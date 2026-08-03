@@ -7,10 +7,40 @@ pub const N_PLAYERS: usize = 2;
 pub const HAND_MAX: u8 = 3;
 pub const MARKERS_TOTAL: u8 = 6;
 pub const WIN_MARKERS: u8 = 6;
-/// The training/evaluation game is finite. A normal coin play that reaches
-/// this count is allowed to resolve completely, then the game is adjudicated
-/// as a draw before another top-level coin play begins.
+/// The training/evaluation game is finite (ReBeL's theory needs that). A coin
+/// play that reaches this count resolves completely, then the game is
+/// adjudicated before another top-level coin play begins.
 pub const MAX_MAIN_PLAYS: u16 = 256;
+/// Default value of one control marker of lead when the horizon is reached.
+///
+/// A flat zero at the horizon is a trap: under early, near-random play almost
+/// no game ends by placing all six markers, so every target is zero and `V = 0`
+/// becomes a self-consistent fixed point with no gradient toward winning.
+/// Scoring the marker differential instead keeps the payoff zero-sum and
+/// strictly inside +/-1, and induces a curriculum (take locations -> deny
+/// locations -> race to six).
+///
+/// It is a change to the terminal payoff of the game being solved, so it is
+/// annealed to zero as soon as horizon games become rare — see
+/// `set_cap_marker_value`. At zero the payoff is the real game's: a timeout is
+/// a draw. Evaluation always runs at zero.
+pub const CAP_MARKER_VALUE_DEFAULT: f32 = 0.15;
+
+/// 0.15f32 in IEEE-754 bits (`AtomicU32` cannot be initialised from a float).
+static CAP_MARKER_VALUE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0x3E19_999A);
+
+/// The current horizon payoff per marker of lead.
+#[inline]
+pub fn cap_marker_value() -> f32 {
+    f32::from_bits(CAP_MARKER_VALUE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Set the horizon payoff. The trainer anneals this toward 0 once the fraction
+/// of games reaching the horizon falls, so the distortion is temporary.
+pub fn set_cap_marker_value(v: f32) {
+    CAP_MARKER_VALUE.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
 
 // Zones (indices into State::zones[player][zone][unit]).
 pub const Z_BAG: usize = 0;
@@ -190,6 +220,18 @@ impl State {
         let need_first = cap_draws(self, first);
         let need_other = cap_draws(self, other);
 
+        // Neither player can draw and neither holds a coin: every coin is on
+        // the board, so no play is possible and the game cannot continue. Left
+        // alone this produces a non-terminal state with zero legal actions --
+        // reachable in a long game with heavy bolstering, and a panic rather
+        // than a hang, because it is `begin_main_turn` that guards the ply cap
+        // and this path bypasses it.
+        if need_first == 0 && need_other == 0 && self.hand_size(first) == 0 && self.hand_size(other) == 0
+        {
+            self.adjudicated_draw = true;
+            return;
+        }
+
         let mut seq: Vec<Cont> = Vec::new();
         for _ in 0..need_first {
             seq.push(Cont::Draw { player: first });
@@ -263,7 +305,12 @@ impl State {
         match self.winner() {
             Some(winner) if winner as usize == player => 1.0,
             Some(_) => -1.0,
-            None => 0.0,
+            // Horizon: score the marker differential (see cap_marker_value).
+            None => {
+                let me = self.markers_on_board(player as u8) as f32;
+                let them = self.markers_on_board(1 - player as u8) as f32;
+                cap_marker_value() * (me - them)
+            }
         }
     }
 

@@ -80,6 +80,12 @@ fn check_invariants(s: &State, init: &[[u16; N_UNITS]; 2]) {
     if let Some(w) = s.winner() {
         assert_eq!(s.markers_on_board(w), 6, "winner must have 6 markers");
     }
+    // 5. the horizon payoff is zero-sum and strictly inside +/-1.
+    if s.is_terminal() && s.winner().is_none() {
+        let (a, b) = (s.utility(0), s.utility(1));
+        assert!((a + b).abs() < 1e-6, "utility must be zero-sum");
+        assert!(a.abs() < 1.0, "horizon payoff must stay inside +/-1");
+    }
 }
 
 #[test]
