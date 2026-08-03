@@ -217,7 +217,11 @@ the gate call.
   playouts never reach it; a long game with heavy bolstering does. Now sets
   `adjudicated_draw`.
 
-**Queued, not yet applied:**
+**Applied since (see §4c):** S2 (LayerNorm + normaliser divisors), S4 (gate
+sample size and cap-0 scoring), the `infer` parity hook, `test_parity.py`, and
+`buf.clear()` at the warm→ReBeL transition.
+
+**Queued, still not applied:**
 
 - **D5 — chance nodes are leaves the network is never trained on.** 8.8% of a
   MainPlay node's public children are `Draw` nodes, but `play_game` skips chance
@@ -230,17 +234,33 @@ the gate call.
   chance-node targets: a draw's *public* projection is deterministic (hand +1,
   bag −1, no public branching), so walk straight through it with
   `belief_after_draw` and no tree branching. Removes the out-of-distribution
-  leaves *and* lets depth-2 subgames span a round boundary.
+  leaves *and* lets depth-2 subgames span a round boundary. **Not a small
+  patch:** the draw's config transition is a stochastic matrix (each parent
+  config draws each coin type with its own bag probability), so the chance
+  probability must enter reach propagation per `(parent_config,
+  child_config)` and stay separate from both players' strategy factors — and
+  the tabular-CFR oracle (`micro_position` in `rebel_solver.rs`) explicitly
+  skips chance nodes, so a chance-aware oracle has to come first.
 
-- **S2 — LayerNorm.** The reference uses `use_layer_norm: true` with GELU
-  (`conf/c02_selfplay/liars_sp.yaml`, `cfvpy/models.py`); ours is plain ReLU.
-  Two feature normalisers also saturate: `bag_size` is divided by 12 but reaches
-  18, the face-down count divided by 10 but reaches 14.
+- **Trajectory reuse (act along the solved subgame instead of re-solving every
+  ply).** `selfplay.rs` builds a fresh `Solver` per decision and takes one
+  action; the reference solves once, walks down the tree taking every action,
+  and only re-solves at a leaf. **Does not fix data starvation** — targets are
+  taken once per subgame root, so halving solves halves targets too; the target
+  rate is `1/solve_cost` either way. Real benefits: ~2× games/s and less
+  correlated buffer contents. Deferred because the tree's config list must
+  match the externally tracked belief *in order*, and a silent desync corrupts
+  every target — needs a hard assertion and a test.
 
-- **S4 — gating is under-powered.** At 120 games the standard error is ≈0.046,
-  so a selected peak ~2σ above trend is likely noise; and reporting
-  `final_vs_greedy` on the same quantity used for selection biases it upward.
-  Raising `--gate-games`, and `final_vs_init` becomes the headline number.
+- **Board symmetry (assessed, verified, not implemented).** `(x,y) → (6−x, 6−y)`
+  leaves the radius-3 hexagon invariant and maps white's starts exactly onto
+  black's (`(4,0)↔(2,6)`, `(6,1)↔(0,5)`, neutrals `(2,1)↔(4,5)`, `(3,2)↔(3,4)`,
+  `(5,3)↔(1,3)`); rotation + colour swap is an exact automorphism, rotation
+  alone is not. But it also swaps the unit sets, so under the fixed starter
+  draft the augmented sample belongs to the *mirrored* draft — a distribution
+  we never evaluate on. Only a clean 2× under `--random-draft`; transforming
+  the 812-dim features plus the 2×56 target is a lot of surface area for no
+  benefit in the default configuration.
 
 **Deferred:** D6 (pending-continuation parameters are not encoded, so e.g.
 `FootmanManeuver{hexes:[10]}` and `{hexes:[20]}` differ in 0 of 812 features
@@ -256,6 +276,52 @@ counterfactual leaf convention `net[hand] × Σ opponent_reach` matches; and the
 belief independence factorisation is *exactly* valid here, because bag size is
 public, so reshuffle timing is public and identical across every config in the
 support.
+
+## 4c. Applied since §4b: LayerNorm, parity, buffer fix
+
+- **LayerNorm (S2).** `Mlp` in `net.rs` gained per-hidden-layer `ln_w`/`ln_b`
+  (empty = off, so old checkpoints still load), matching the reference's
+  `use_layer_norm: true` with GELU. `set_weights` takes an optional `ln`
+  buffer; `split_mlp` validates its length.
+- **`infer` and `test_parity.py`.** `py.rs` gained `infer(x, rows, slot)`
+  exposing the Rust forward, which was previously untestable from Python.
+  `train/test_parity.py` asserts the two forwards agree to < 2e-4 with every
+  parameter moved off its initialisation first (LayerNorm ships as identity, so
+  a naive test passes for the wrong reason). Measured after the change:
+  max |torch − rust| = 1.07e-6 ad hoc, 1.19e-6 in the test. All Rust suites
+  green (`cargo test --release`, 43 tests incl. both oracles).
+- **Feature normalisers.** `MAX_COINS = 21` (4 drafted types at supply 5 plus
+  one Royal Coin) replaces the /12 and /10 divisors for `bag_size` and
+  face-down counts, which reach 18 and 14 and were clipped in exactly the
+  late-game states that matter.
+- **Buffer and step accounting.** `buf.clear()` at the warm→ReBeL transition;
+  `--steps` replaced by `--train-gen-ratio 4.0` (step count tracks rows
+  actually generated, so the ratio stops swinging ~18× between depths).
+- **Gate (S4).** Defaults raised to `--gate-games 300`; the gate saves and
+  restores the generator's cap value and always scores at `cap_value = 0`, so
+  scores are comparable across the run and checkpoint selection is not biased
+  by the anneal. `final_vs_init` is the headline number.
+
+## 4d. Run D — the depth-2 plateau
+
+First clean run at `depth: 2` (20 min, `--cap-value 0`, buffer cleared at the
+warm→ReBeL transition, `iters=16`, gating 300 games):
+
+```
+gate:   327s 0.792 → 598s 0.815 → 869s 0.805 → 1162s 0.787
+final_vs_init: 0.548   (parity 0.5)
+14 rebel epochs, ~400 gradient steps
+```
+
+It jumps from the warm start (0.70) to ~0.79 immediately, then goes flat and
+slightly declines — while run A at depth 1 climbed 0.69 → 0.86 with ~4,000
+gradient steps. Leading hypothesis: **data starvation** — depth 2 generates
+~10× fewer rows per second (1.77 vs 33.1 games/s), so the ReBeL phase gets
+~400 updates instead of ~4,000. That is what the new `--iters 8` default
+tests: half the CFR iterations per solve, ~2× decisions/s, ~2× epochs. If run
+E still plateaus, data starvation is not the explanation, and the next suspects
+are D5 (§4b), trajectory reuse (§4b), and the contracting `tgt_std` (0.451 →
+0.271 over run D — the value targets are losing spread).
 
 ## 5. Immediate plan
 
@@ -309,17 +375,20 @@ it move is the cheapest early warning we have.
 ### 5.3 Order of work
 
 1. ~~Cavalry / Light Cavalry duplicate actions, zero-legal-action crash~~ — done.
-2. **Diagnostic C at `depth: 2`** — running. 12 min, `--cap-value 0`,
-   `--steps 48` (holding the reference's ~4:1 train:generation ratio despite
-   ~18× fewer rows per epoch), gating 200 games every 120 s. The question is
-   whether real CFR at 1/18th the data beats 1-ply value iteration at full data
-   within a fixed wall-clock budget. If it does not, the honest options are
-   D5 (which makes depth-2 subgames span round boundaries and removes the
-   out-of-distribution chance leaves) and a larger `--rebel-games` per epoch,
-   not a retreat to depth 1.
-3. D5, then S2 (LayerNorm), then S4 (gate sample size).
-4. Trace tooling (§5.2).
-5. The 30-minute run at `depth: 2`, with the gate curve as the evidence and
+2. ~~Diagnostic C at `depth: 2`~~ — done; found the buffer-contamination bug:
+   the warm phase had filled 800k of 800k rows, so 93% of every ReBeL batch
+   was greedy imitation data and `final_vs_init` came out at 0.478. Fixed with
+   `buf.clear()` at the transition (and it retroactively explains why run A
+   worked at depth 1: it generated 875k rows, *exceeding* the cap, so warm data
+   got evicted by sheer volume — luck, not design).
+3. ~~Run D, depth 2, clean buffer~~ — done; plateaus (§4d).
+4. **Run E** — 20 min at the new defaults (`--depth 2 --iters 8 --gate-every
+   240 --gate-games 300`). Tests the leading hypothesis for the plateau: data
+   starvation. If E still plateaus, the next suspects are D5, trajectory reuse,
+   and the contracting `tgt_std`.
+5. D5 (chance walk-through — chance-aware oracle first, §4b).
+6. Trace tooling (§5.2) and trajectory reuse.
+7. The 30-minute run at `depth: 2`, with the gate curve as the evidence and
    `final_vs_init` as the headline.
 
 ---
@@ -335,5 +404,8 @@ it move is the cheapest early warning we have.
 ## 7. Measured throughput (8-core M1)
 
 - ~900 games/s during the greedy warm start.
-- ~11 games/s with a full CFR solve at every decision (~2000 solved
-  decisions/s), ~25 configs per decision.
+- Depth 1: 33.1 games/s, 8310 decisions/s.
+- Depth 2, `iters=16`: 1.77 games/s, 445 decisions/s (subgames 385 nodes,
+  17.3 opponent decision nodes, 2.2 ms/solve).
+- `eval_match` at depth 2: 8.2 games/s — much cheaper than generation because
+  it does not collect PBS data, so gating is affordable.
