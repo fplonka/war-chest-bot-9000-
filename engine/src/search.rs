@@ -257,6 +257,9 @@ pub struct Solver<'a> {
     ob: Vec<f32>,
     sb: Vec<f32>,
     batch_ready: bool,
+    /// Working memory for the chance transitions, reused across the tree.
+    draw_scratch: DrawScratch,
+    dm: [DrawMap; 3],
 }
 
 impl<'a> Solver<'a> {
@@ -295,6 +298,8 @@ impl<'a> Solver<'a> {
             ob: Vec::new(),
             sb: Vec::new(),
             batch_ready: false,
+            draw_scratch: DrawScratch::default(),
+            dm: Default::default(),
         };
         {
             let _t = timed!(BUILD);
@@ -427,21 +432,28 @@ impl<'a> Solver<'a> {
             let td = timed!(BDRAW);
             let me = player as usize;
             let mut cs = s;
-            let mut support: Rc<[Config]> = cfgs[me].clone();
-            let mut draw = DrawMap::default();
+            let mut cur: Vec<Config> = cfgs[me].to_vec();
+            let mut next: Vec<Config> = Vec::new();
+            let (mut draw, mut step, mut acc) = (
+                std::mem::take(&mut self.dm[0]),
+                std::mem::take(&mut self.dm[1]),
+                std::mem::take(&mut self.dm[2]),
+            );
             let mut steps = 0u8;
             loop {
                 let acts = cs.legal_actions();
                 debug_assert!(matches!(acts.first(), Some(Action::DrawCoin { .. })));
                 let res = reserve(&cs, player, self.ctx);
                 let fu = faceup_counts(&cs, player, self.ctx);
-                let (next, step) = draw_transition(&support, &res, &fu);
-                draw = if steps == 0 {
-                    step
+                self.draw_scratch
+                    .transition(&cur, &res, &fu, &mut next, &mut step);
+                if steps == 0 {
+                    std::mem::swap(&mut draw, &mut step);
                 } else {
-                    draw.then(&step, next.len())
-                };
-                support = next.into();
+                    self.draw_scratch.compose(&draw, &step, next.len(), &mut acc);
+                    std::mem::swap(&mut draw, &mut acc);
+                }
+                std::mem::swap(&mut cur, &mut next);
                 cs.apply_inplace(acts[0]);
                 steps += 1;
                 if !(matches!(cs.pending(), Cont::Draw { .. }) && cs.to_act() == player) {
@@ -450,13 +462,16 @@ impl<'a> Solver<'a> {
             }
             drop(td);
             let mut cc = cfgs;
-            cc[me] = support;
+            cc[me] = cur.as_slice().into();
             let ch = self.build(cs, depth, cc);
             let n = &mut self.nodes[id];
             n.chance = true;
             n.child = vec![ch];
+            // The node keeps its own map; the other two buffers go back to the
+            // scratch set for the next chance node.
             n.draw = draw;
             n.draw_steps = steps;
+            self.dm = [DrawMap::default(), step, acc];
             return id;
         }
 

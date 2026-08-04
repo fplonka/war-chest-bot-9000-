@@ -164,6 +164,24 @@ impl Config {
     pub fn hand_index(&self) -> usize {
         hand_index(&self.hand)
     }
+    /// A single integer that orders configs exactly as `Ord` does: hand
+    /// lexicographically, then face-down. Sorting and deduping child supports
+    /// is the hot part of building a subgame, and comparing one `u64` beats
+    /// walking two five-byte arrays — but only if the key is computed once per
+    /// element rather than once per comparison, which is why this is a method
+    /// and not an `Ord` impl.
+    #[inline]
+    pub fn key(&self) -> u64 {
+        let mut k = 0u64;
+        for i in 0..NSLOT {
+            debug_assert!(self.hand[i] < 32 && self.fd[i] < 32);
+            k = (k << 5) | self.hand[i] as u64;
+        }
+        for i in 0..NSLOT {
+            k = (k << 5) | self.fd[i] as u64;
+        }
+        k
+    }
 }
 
 /// `reserve[k] = bag[k] + hand[k] + facedown[k]` — public, and invariant to how
@@ -428,58 +446,6 @@ pub struct DrawMap {
 }
 
 impl DrawMap {
-    /// The transition that changes nothing — the seed for composing a run of
-    /// draws into one.
-    pub fn identity(n: usize) -> DrawMap {
-        DrawMap {
-            start: (0..=n as u32).collect(),
-            to: (0..n as u32).collect(),
-            p: vec![1.0; n],
-        }
-    }
-
-    /// `self` then `next`, as one transition. A round start queues up to three
-    /// consecutive draws for the same player and none of them branches the
-    /// public tree, so composing them collapses six nodes into two — and with
-    /// them their states, reach vectors and value vectors, which is over half
-    /// of every subgame.
-    pub fn then(&self, next: &DrawMap, n_child: usize) -> DrawMap {
-        let rows = self.rows();
-        let mut out = DrawMap {
-            start: vec![0u32; rows + 1],
-            to: Vec::with_capacity(self.to.len()),
-            p: Vec::with_capacity(self.p.len()),
-        };
-        let mut acc = vec![0.0f32; n_child];
-        let mut hit = vec![false; n_child];
-        let mut touched: Vec<u32> = Vec::new();
-        for i in 0..rows {
-            touched.clear();
-            let (mid, pm) = self.row(i);
-            for k in 0..mid.len() {
-                let (to, pt) = next.row(mid[k] as usize);
-                for j in 0..to.len() {
-                    let t = to[j] as usize;
-                    if !hit[t] {
-                        hit[t] = true;
-                        touched.push(to[j]);
-                    }
-                    acc[t] += pm[k] * pt[j];
-                }
-            }
-            // Kept sorted so the child's rows stay in support order.
-            touched.sort_unstable();
-            for &t in &touched {
-                out.to.push(t);
-                out.p.push(acc[t as usize]);
-                acc[t as usize] = 0.0;
-                hit[t as usize] = false;
-            }
-            out.start[i + 1] = out.to.len() as u32;
-        }
-        out
-    }
-
     #[inline]
     pub fn row(&self, ci: usize) -> (&[u32], &[f32]) {
         let (a, b) = (self.start[ci] as usize, self.start[ci + 1] as usize);
@@ -490,58 +456,135 @@ impl DrawMap {
     }
 }
 
-/// The chance transition of a draw: for each config in `cfg`, which configs it
-/// can become (one per drawable coin type, reshuffling first if its bag is
-/// empty) and with what probability. Returns the sorted-deduped child support
-/// and the transition — the per-config chance factor the subgame tree's reach
-/// accounting needs, kept separate from both players' strategies.
+/// Reusable working memory for building draw transitions.
+///
+/// A subgame builds one transition per draw and composes it over the run, and
+/// the buffers involved are all small — which is exactly why the allocator
+/// traffic mattered more than the arithmetic. One scratch lives on the solver
+/// and is reused for the whole tree.
+#[derive(Default)]
+pub struct DrawScratch {
+    kid: Vec<Config>,
+    prob: Vec<f32>,
+    /// `(key, index into kid)`, sorted by key to build the child support.
+    order: Vec<(u64, u32)>,
+    acc: Vec<f32>,
+    hit: Vec<bool>,
+    touched: Vec<u32>,
+}
+
+impl DrawScratch {
+    /// The chance transition of one draw: for each config in `cfg`, which
+    /// configs it can become (one per drawable coin type, reshuffling first if
+    /// its bag is empty) and with what probability. Writes the sorted-deduped
+    /// child support and the transition — the per-config chance factor the
+    /// subgame tree's reach accounting needs, kept separate from both players'
+    /// strategies.
+    pub fn transition(
+        &mut self,
+        cfg: &[Config],
+        reserve: &[u8; NSLOT],
+        faceup: &[u8; NSLOT],
+        support: &mut Vec<Config>,
+        map: &mut DrawMap,
+    ) {
+        self.kid.clear();
+        self.prob.clear();
+        map.start.clear();
+        map.start.push(0);
+        for c in cfg.iter() {
+            let (src, base) = draw_source(c, reserve, faceup);
+            let total: u32 = src.iter().map(|&x| x as u32).sum();
+            if total == 0 {
+                self.kid.push(*c);
+                self.prob.push(1.0);
+            } else {
+                let inv = 1.0 / total as f32;
+                for k in 0..NSLOT {
+                    if src[k] == 0 {
+                        continue;
+                    }
+                    let mut n = base;
+                    n.hand[k] += 1;
+                    if n.hand_size() as usize <= HAND_CAP {
+                        self.kid.push(n);
+                        self.prob.push(src[k] as f32 * inv);
+                    }
+                }
+            }
+            map.start.push(self.kid.len() as u32);
+        }
+        // Sort once by integer key, then read the support and the child index
+        // of every row off that single ordering — no per-row binary search.
+        self.order.clear();
+        self.order
+            .extend(self.kid.iter().enumerate().map(|(i, c)| (c.key(), i as u32)));
+        self.order.sort_unstable();
+        support.clear();
+        map.to.clear();
+        map.to.resize(self.kid.len(), 0);
+        map.p.clear();
+        map.p.extend_from_slice(&self.prob);
+        let mut prev = u64::MAX;
+        for &(k, i) in self.order.iter() {
+            if k != prev {
+                prev = k;
+                support.push(self.kid[i as usize]);
+            }
+            map.to[i as usize] = (support.len() - 1) as u32;
+        }
+    }
+
+    /// `a` then `b`, as one transition into `out`. A round start queues up to
+    /// three consecutive draws for the same player and none of them branches
+    /// the public tree, so composing them collapses the run into one node —
+    /// and with it the states, reach vectors and value vectors of the rest.
+    pub fn compose(&mut self, a: &DrawMap, b: &DrawMap, n_child: usize, out: &mut DrawMap) {
+        if self.acc.len() < n_child {
+            self.acc.resize(n_child, 0.0);
+            self.hit.resize(n_child, false);
+        }
+        let rows = a.rows();
+        out.start.clear();
+        out.start.push(0);
+        out.to.clear();
+        out.p.clear();
+        for i in 0..rows {
+            self.touched.clear();
+            let (mid, pm) = a.row(i);
+            for k in 0..mid.len() {
+                let (to, pt) = b.row(mid[k] as usize);
+                for j in 0..to.len() {
+                    let t = to[j] as usize;
+                    if !self.hit[t] {
+                        self.hit[t] = true;
+                        self.touched.push(to[j]);
+                    }
+                    self.acc[t] += pm[k] * pt[j];
+                }
+            }
+            // Kept sorted so the child's rows stay in support order.
+            self.touched.sort_unstable();
+            for &t in &self.touched {
+                out.to.push(t);
+                out.p.push(self.acc[t as usize]);
+                self.acc[t as usize] = 0.0;
+                self.hit[t as usize] = false;
+            }
+            out.start.push(out.to.len() as u32);
+        }
+    }
+}
+
+/// One draw's transition, allocating. For tests and one-off callers; the
+/// subgame builder goes through `DrawScratch` so it can reuse its buffers.
 pub fn draw_transition(
     cfg: &[Config],
     reserve: &[u8; NSLOT],
     faceup: &[u8; NSLOT],
 ) -> (Vec<Config>, DrawMap) {
-    let mut rows: Vec<(usize, Config, f32)> = Vec::with_capacity(cfg.len() * NSLOT);
-    for (ci, c) in cfg.iter().enumerate() {
-        let (src, base) = draw_source(c, reserve, faceup);
-        let total: u32 = src.iter().map(|&x| x as u32).sum();
-        if total == 0 {
-            rows.push((ci, *c, 1.0));
-            continue;
-        }
-        for k in 0..NSLOT {
-            if src[k] == 0 {
-                continue;
-            }
-            let mut n = base;
-            n.hand[k] += 1;
-            if n.hand_size() as usize <= HAND_CAP {
-                rows.push((ci, n, src[k] as f32 / total as f32));
-            }
-        }
-    }
-    let mut support: Vec<Config> = rows.iter().map(|r| r.1).collect();
-    support.sort_unstable();
-    support.dedup();
-    // `rows` is already grouped by parent, so counting gives the CSR offsets.
-    let mut map = DrawMap {
-        start: vec![0u32; cfg.len() + 1],
-        to: vec![0u32; rows.len()],
-        p: vec![0.0f32; rows.len()],
-    };
-    for (ci, _, _) in &rows {
-        map.start[ci + 1] += 1;
-    }
-    for ci in 0..cfg.len() {
-        map.start[ci + 1] += map.start[ci];
-    }
-    let mut fill = map.start.clone();
-    for (ci, c, p) in rows {
-        let t = support.binary_search(&c).expect("child config in support");
-        let at = fill[ci] as usize;
-        map.to[at] = t as u32;
-        map.p[at] = p;
-        fill[ci] += 1;
-    }
+    let (mut support, mut map) = (Vec::new(), DrawMap::default());
+    DrawScratch::default().transition(cfg, reserve, faceup, &mut support, &mut map);
     (support, map)
 }
 
