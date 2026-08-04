@@ -11,11 +11,17 @@
 //! each config's own draw distribution.
 //!
 //! ReBeL decisions walk the solved subgame: a `Solver` is built once at a
-//! subgame root, the game then descends through its tree taking an action at
-//! every decision on the way (the reference's `sample_state_to_leaf`), and a
-//! new solver is built only when the walk reaches a leaf of the tree — a draw,
-//! a terminal state, or the depth limit. The value target is taken once per
-//! subgame, at its root, exactly as in the reference (`RlRunner::step`).
+//! subgame root and runs its full CFR solve there; the game then descends
+//! through the tree taking an action at every decision on the way, acting on
+//! the CFR *average* strategy (TurboReBeL's reference), and a new solver is
+//! built only when the walk reaches a leaf of the tree — a draw, a terminal
+//! state, or the depth limit.
+//!
+//! Each level yields T+1 training rows, TurboReBeL's single-sample
+//! multi-iteration generation: the beliefs at the next root under this
+//! solve's per-iterate average strategies (carried in `carried_beliefs`),
+//! each valued by one fixed-policy pass under the reference strategy
+//! (`Solver::value_under`). The first level carries just the live belief.
 //!
 //! Training data comes in two flavours:
 //!   * `Collect::Mc` — the greedy warm start. Value targets blend the realised
@@ -332,10 +338,6 @@ pub struct GameCfg {
     /// Probability that a uniformly sampled player plays a uniformly random
     /// action (ReBeL's `random_action_prob`), redrawn each decision.
     pub explore: f32,
-    /// Evaluation mode: solve fully and act on the CFR *average* strategy.
-    /// Self-play instead stops at a uniformly random iterate and acts on that,
-    /// which is what makes ReBeL's value targets sound (Theorem 3).
-    pub eval: bool,
     /// Randomise the draft instead of using the fixed starter matchup.
     pub random_draft: bool,
     /// Warm start only: how much of the value target comes from the squashed
@@ -354,33 +356,26 @@ pub struct GameCfg {
 }
 
 /// A live ReBeL walk: the solver for the current subgame, the checkpoint
-/// slot it was built with, the tree node the game is currently at, and the
-/// (state, belief) snapshot of the subgame root — the state the value target
-/// belongs to.
+/// slot it was built with, and the tree node the game is currently at.
 struct Walk<'a> {
     sv: Solver<'a>,
     slot: usize,
     node: usize,
     /// Draws taken so far inside the current collapsed chance node.
     drawn: u8,
-    root_s: State,
-    root_bel: [Belief; 2],
 }
 
-/// End a walk: run the solver out to its full iteration count (the partial
-/// run happened at build time), then take the value target off the root of
-/// the subgame — the state the walk started at.
-fn finish_walk<'a>(w: Walk<'a>, gc: &GameCfg, ctx: &Ctx, data: &mut Data) {
-    let Walk {
-        mut sv,
-        root_s,
-        root_bel,
-        ..
-    } = w;
-    sv.complete();
-    if gc.collect == Collect::Rebel && sv.solved() {
-        data.push_value(&root_s, ctx, &root_bel, [sv.root_values(0), sv.root_values(1)]);
-    }
+/// End a walk: take TurboReBeL's intermediate PBSs off the solver — the
+/// beliefs at the walk's current node under each per-iterate average strategy
+/// (t = 0..T-1), from the subgame's root belief. The caller appends the live
+/// belief as the t = T member; the next subgame's Phase 2 values the whole
+/// set. Rows are *not* taken here: they were pushed at the solve site, which
+/// is where the reference strategy lives.
+fn finish_walk<'a>(w: Walk<'a>, bel: &[Belief; 2]) -> Vec<[Vec<f32>; 2]> {
+    let Walk { mut sv, node, .. } = w;
+    let mut out = sv.carried_beliefs(node);
+    out.push([bel[0].p.clone(), bel[1].p.clone()]);
+    out
 }
 
 /// Play one game to the end. Returns the result from White's point of view.
@@ -395,6 +390,12 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
     // The live ReBeL walk, if the game is inside a solved subgame. Rebuilt
     // only when the previous walk ended at a leaf of its tree.
     let mut walk: Option<Walk> = None;
+    // TurboReBeL's carried beliefs: the T+1 probability vectors at the next
+    // subgame's root under the previous solve's per-iterate average strategies
+    // (plus the live belief), which Phase 2 values once the next solve is
+    // done. Empty means the first level: Phase 2 then values just the live
+    // belief.
+    let mut carried: Vec<[Vec<f32>; 2]> = Vec::new();
 
     while !s.is_terminal() {
         let player = s.to_act();
@@ -423,15 +424,14 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
                         *w.sv.nodes[child].cfgs[player as usize] == bel[player as usize].cfg[..],
                         "walk desync: post-draw support does not match the game belief"
                     );
+                    w.node = child;
                     if w.sv.nodes[child].leaf {
                         walk_ended = true;
-                    } else {
-                        w.node = child;
                     }
                 }
             }
             if walk_ended {
-                finish_walk(walk.take().unwrap(), gc, &ctx, data);
+                carried = finish_walk(walk.take().unwrap(), &bel);
             }
             continue;
         }
@@ -449,17 +449,19 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
         let np = match gc.agents[player as usize] {
             Agent::Greedy { temp } => {
                 // A non-ReBeL decision is not in the walk's tree: end any
-                // pending walk (its subgame is still solved, its target
-                // still collected).
-                if let Some(w) = walk.take() {
-                    finish_walk(w, gc, &ctx, data);
-                }
+                // pending walk. Its rows were pushed at the solve site, and
+                // any carried beliefs are meaningless here — the tree is not
+                // in lockstep with a game the other player has been steering
+                // outside it, and a pending set belongs to the state the walk
+                // ended at, which the game has now left — so the next solve
+                // starts from just the live belief.
+                walk.take();
+                carried.clear();
                 greedy_policy(&s, &ctx, player, &cfgs, temp)
             }
             Agent::Random => {
-                if let Some(w) = walk.take() {
-                    finish_walk(w, gc, &ctx, data);
-                }
+                walk.take();
+                carried.clear();
                 random_policy(&s, &ctx, player, &cfgs)
             }
             Agent::Rebel { cfg, slot } => {
@@ -469,37 +471,63 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
                 // against slot 1 — so end a walk built by a different slot
                 // before starting a new one.
                 if walk.as_ref().is_some_and(|w| w.slot != slot) {
-                    finish_walk(walk.take().unwrap(), gc, &ctx, data);
+                    // A walk belongs to the checkpoint that built it; the
+                    // carried beliefs are not transferable either.
+                    walk.take();
+                    carried.clear();
                 }
                 if walk.is_none() {
-                    // Start a new subgame at this decision: build the tree,
-                    // run the partial CFR solve up to a uniformly random
-                    // iterate, and snapshot the root for the value target.
-                    // Acting on a random iterate keeps the targets unbiased
-                    // (Theorem 3); in eval mode the full solve runs up front
-                    // and the walk acts on the average strategy instead.
-                    // The average strategy is only read in evaluation mode;
-                    // maintaining it during generation is pure overhead.
+                    // Start a new subgame at this decision: build the tree
+                    // and run the full solve (Phase 1). TurboReBeL's Phase 2
+                    // then values every carried belief — the T+1 rows of this
+                    // level — under the reference strategy (the CFR average),
+                    // and the walk acts on that same average.
                     let scfg = Cfg {
-                        average: gc.eval,
+                        snapshots: true,
                         ..cfg
                     };
                     let mut sv = Solver::new(&s, &ctx, &nets[slot], scfg, bel.clone());
-                    let stop = if gc.eval {
-                        cfg.iters
-                    } else {
-                        rng.below(cfg.iters + 1)
-                    };
-                    for i in 0..stop {
-                        sv.step(i % 2);
+                    sv.multistep(cfg.iters);
+                    if gc.collect == Collect::Rebel {
+                        // Phase 2: one fixed-policy value pass per carried
+                        // belief. The first level carries nothing yet, so it
+                        // values just the live belief — the same single row
+                        // the old loop took per solve.
+                        let roots: Vec<[Vec<f32>; 2]> = if carried.is_empty() {
+                            vec![[bel[0].p.clone(), bel[1].p.clone()]]
+                        } else {
+                            std::mem::take(&mut carried)
+                        };
+                        for r in &roots {
+                            assert_eq!(r[0].len(), bel[0].cfg.len(),
+                                       "carried belief does not match the root support: {} vs {} at dec {}",
+                                       r[0].len(), bel[0].cfg.len(), data.decisions);
+                            assert_eq!(r[1].len(), bel[1].cfg.len(),
+                                       "carried belief does not match the root support: {} vs {} at dec {}",
+                                       r[1].len(), bel[1].cfg.len(), data.decisions);
+                        }
+                        let vals = sv.value_under(&roots);
+                        for (r, v) in roots.iter().zip(vals.iter()) {
+                            assert_eq!(r[0].len(), bel[0].cfg.len(),
+                                       "carried belief does not match the root support");
+                            assert_eq!(r[1].len(), bel[1].cfg.len(),
+                                       "carried belief does not match the root support");
+                            data.push_value(
+                                &s,
+                                &ctx,
+                                &[
+                                    Belief { cfg: bel[0].cfg.clone(), p: r[0].clone() },
+                                    Belief { cfg: bel[1].cfg.clone(), p: r[1].clone() },
+                                ],
+                                [&v[0], &v[1]],
+                            );
+                        }
                     }
                     walk = Some(Walk {
                         sv,
                         slot,
                         node: 0,
                         drawn: 0,
-                        root_s: s.clone(),
-                        root_bel: bel.clone(),
                     });
                 }
                 let w = walk.as_mut().unwrap();
@@ -525,11 +553,9 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
                     probs: vec![0.0; cfgs.len() * na],
                 };
                 for ci in 0..cfgs.len() {
-                    let row = if gc.eval {
-                        w.sv.average_strategy(nid, ci)
-                    } else {
-                        w.sv.sampling_strategy(nid, ci)
-                    };
+                    // Act on the CFR average — the reference strategy of the
+                    // solve. Evaluation and generation are the same walk now.
+                    let row = w.sv.average_strategy(nid, ci);
                     np.probs[ci * na..(ci + 1) * na].copy_from_slice(row);
                 }
                 np
@@ -577,19 +603,20 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
         // Advance the walk along the solved tree. The public observation of
         // the chosen action selects the child; if that child is a leaf
         // (depth exhausted, terminal, or a draw), the walk ends and the
-        // subgame gets its full solve and its value target now.
+        // next subgame takes over — with this solve's carried beliefs.
         let mut walk_ended = false;
         if let Some(w) = walk.as_mut() {
             let nid = w.node;
             let child = w.sv.nodes[nid].child[w.sv.nodes[nid].obs_child[chosen]];
+            // Advance regardless: if the child is a leaf, the walk ends *at*
+            // it, and the carried beliefs must be read off that node's reach.
+            w.node = child;
             if w.sv.nodes[child].leaf {
                 walk_ended = true;
-            } else {
-                w.node = child;
             }
         }
         if walk_ended {
-            finish_walk(walk.take().unwrap(), gc, &ctx, data);
+            carried = finish_walk(walk.take().unwrap(), &bel);
         }
     }
 
@@ -711,7 +738,6 @@ pub fn eval_match(
                 agents: if swap { [b, a] } else { [a, b] },
                 collect: Collect::None,
                 explore: 0.0,
-                eval: true,
                 random_draft,
                 eval_mix: 0.0,
                 mc_mix: 0.0,

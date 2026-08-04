@@ -1,10 +1,10 @@
 //! How wrong is the CFR value target at the iteration count self-play uses?
 //!
-//! Generation runs `T = 8` alternating linear-CFR iterations per subgame. The
-//! only evidence that this is enough came from micro-endgames solved against
-//! exact values, where mean |error| was 0.0035 — but a micro-endgame converges
-//! almost immediately, so that number says very little about the ~540-node
-//! depth-2 subgames self-play actually solves.
+//! Generation runs `T` alternating linear-CFR iterations per subgame. The
+//! only evidence that any particular T is enough came from micro-endgames
+//! solved against exact values, where mean |error| was 0.0035 at T=8 — but a
+//! micro-endgame converges almost immediately, so that number says very
+//! little about the ~540-node depth-2 subgames self-play actually solves.
 //!
 //! This matters in a way the offline loss work cannot see. An under-converged
 //! solve does not produce *noisy* targets — the same position gives the same
@@ -14,10 +14,10 @@
 //! curve or a held-out fit would ever show it.
 //!
 //! So: take real mid-game positions, solve each once to `TMAX`, and read the
-//! running-mean root value off at every intermediate `T`. `root_values` is the
-//! exact quantity training uses as its target, so the difference between the
-//! reading at `T` and at `TMAX` *is* the target error at that `T`. No training
-//! run, no noise.
+//! fixed-policy root value under the average strategy off at every
+//! intermediate `T` (`value_under` — the exact quantity TurboReBeL's Phase 2
+//! uses as its target). The difference between the reading at `T` and at
+//! `TMAX` *is* the target error at that `T`. No training run, no noise.
 //!
 //! Beliefs here are uniform over the configs consistent with the public counts
 //! rather than the true Bayes posterior. That keeps the harness small, and what
@@ -141,21 +141,24 @@ fn main() {
         }
         let ctx = Ctx::new(&s);
         let bel = [open_belief(&s, &ctx, 0), open_belief(&s, &ctx, 1)];
-        let cfg = Cfg { depth, iters: TMAX, average: false };
-        let mut sv = Solver::new(&s, &ctx, &nets, cfg, bel);
+        let cfg = Cfg { depth, iters: TMAX, snapshots: true };
+        let mut sv = Solver::new(&s, &ctx, &nets, cfg, bel.clone());
 
-        // One solve, read off at each rung: `root_values` is the running mean
-        // over the iterations run so far, which is exactly the target the
-        // trainer would receive had it stopped there.
+        // One solve, read off at each rung: `value_under` is the fixed-policy
+        // root value under the average strategy run so far — exactly the
+        // target TurboReBeL's Phase 2 would have taken had the solve stopped
+        // there.
         let mut snap: Vec<Vec<f32>> = Vec::new();
         let mut done = 0usize;
         for t in LADDER {
             sv.multistep(t - done);
             done = t;
-            snap.push(sv.root_values(0).to_vec());
+            let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
+            snap.push(vals[0][0].clone());
         }
         sv.multistep(TMAX - done);
-        let reference = sv.root_values(0).to_vec();
+        let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
+        let reference = vals[0][0].clone();
 
         for (i, v) in snap.iter().enumerate() {
             let mut pos = 0usize;

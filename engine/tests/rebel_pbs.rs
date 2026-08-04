@@ -482,7 +482,7 @@ fn position_with_ambiguous_facedown(seed: u64) -> Option<(State, Ctx, [Belief; 2
 fn a_solve_reads_only_the_beliefs() {
     let mut nets = Nets::default();
     nets.value = random_net(0xA11CE, 64, 16);
-    let cfg = Cfg { depth: 2, iters: 8, average: true };
+    let cfg = Cfg { depth: 2, iters: 8, snapshots: true };
     let mut checked = 0usize;
     for seed in 1..80u64 {
         let Some((s, ctx, bel)) = position_with_ambiguous_facedown(seed) else {
@@ -499,11 +499,12 @@ fn a_solve_reads_only_the_beliefs() {
                 set_config(&mut w, p as u8, &ctx, &c);
             }
             let mut sv = Solver::new(&w, &ctx, &nets, cfg, bel.clone());
-            sv.complete();
+            sv.multistep(cfg.iters);
+            let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
             let strat: Vec<f32> = (0..bel[w.to_act() as usize].cfg.len())
                 .flat_map(|c| sv.average_strategy(0, c).to_vec())
                 .collect();
-            runs.push((sv.root_values(0).to_vec(), sv.root_values(1).to_vec(), strat));
+            runs.push((vals[0][0].clone(), vals[0][1].clone(), strat));
         }
         assert_eq!(runs[0].0, runs[1].0, "player 0 root values moved with the true world");
         assert_eq!(runs[0].1, runs[1].1, "player 1 root values moved with the true world");
@@ -525,7 +526,7 @@ fn a_solve_reads_only_the_beliefs() {
 fn the_value_function_separates_configs_sharing_a_hand() {
     let mut nets = Nets::default();
     nets.value = random_net(0xBEEF, 64, 16);
-    let cfg = Cfg { depth: 2, iters: 8, average: true };
+    let cfg = Cfg { depth: 2, iters: 8, snapshots: true };
     let (mut positions, mut val_differs, mut strat_differs) = (0usize, 0usize, 0usize);
     for seed in 1..80u64 {
         let Some((s, ctx, bel)) = position_with_ambiguous_facedown(seed) else {
@@ -533,8 +534,9 @@ fn the_value_function_separates_configs_sharing_a_hand() {
         };
         let me = s.to_act() as usize;
         let mut sv = Solver::new(&s, &ctx, &nets, cfg, bel.clone());
-        sv.complete();
-        let v = sv.root_values(me);
+        sv.multistep(cfg.iters);
+        let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
+        let v = &vals[0][me];
         for i in 0..bel[me].cfg.len() {
             for j in 0..i {
                 if bel[me].cfg[i].hand != bel[me].cfg[j].hand {

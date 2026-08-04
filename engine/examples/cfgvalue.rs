@@ -186,7 +186,7 @@ fn main() {
         // its own bag even though it knows it. Under the hand-keyed value
         // function that held everywhere except at a round-start draw.
         {
-            let cfg = Cfg { depth: 2, iters, average: true };
+            let cfg = Cfg { depth: 2, iters, snapshots: true };
             let mut sv = Solver::new(&s, &ctx, &nets, cfg, bel.clone());
             sv.multistep(iters);
             let mut worst = 0.0f64;
@@ -214,11 +214,12 @@ fn main() {
 
         // ---- value residual at each depth.
         for (di, &d) in DEPTHS.iter().enumerate() {
-            let cfg = Cfg { depth: d, iters, average: false };
+            let cfg = Cfg { depth: d, iters, snapshots: true };
             let mut sv = Solver::new(&s, &ctx, &nets, cfg, bel.clone());
             sv.multistep(iters);
+            let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
             for p in 0..2 {
-                let v = sv.root_values(p);
+                let v = &vals[0][p];
                 let (r, _) = within_hand(&bel[p].cfg, &bel[p].p, v);
                 vres[di] += r;
                 n_all[di] += 1;

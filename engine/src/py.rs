@@ -596,7 +596,7 @@ fn gen_data(
     let cfg = Cfg {
         depth,
         iters,
-        average: true,
+        snapshots: true,
     };
     let (agent, collect) = match mode {
         "greedy" => (Agent::Greedy { temp }, Collect::Mc),
@@ -612,7 +612,6 @@ fn gen_data(
         agents: [agent, agent],
         collect,
         explore,
-        eval: false,
         random_draft,
         eval_mix,
         mc_mix,
@@ -644,7 +643,7 @@ fn eval_match(
     let cfg = Cfg {
         depth,
         iters,
-        average: true,
+        snapshots: false,
     };
     let (aa, bb) = (agent_of(a, cfg, temp, slot_a)?, agent_of(b, cfg, temp, slot_b)?);
     Ok(py.allow_threads(|| {

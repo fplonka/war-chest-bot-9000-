@@ -38,14 +38,13 @@ fn main() {
     let cfg = Cfg {
         depth,
         iters,
-        average: true,
+        snapshots: true,
     };
     let agent = Agent::Rebel { cfg, slot: 0 };
     let gc = GameCfg {
         agents: [agent, agent],
         collect: Collect::Rebel,
         explore: 0.25,
-        eval: false,
         random_draft: false,
         eval_mix: 0.5,
         mc_mix: 0.0,
