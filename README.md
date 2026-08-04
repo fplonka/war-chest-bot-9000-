@@ -11,9 +11,13 @@ engine/          Rust crate, lib name `warchest`
   src/           actions, board, rng, rules, state, units, py (bindings)
   src/           rebel, search, selfplay, net  (the ReBeL agent)
   tests/         36 scenario tests, playout invariants, PBS correctness tests
-  examples/      coords.rs (hex coordinate dump)
+  examples/      coords.rs (hex dump), featstats.rs (feature ranges),
+                 solvererr.rs (CFR target error vs iteration count)
   src/bin/       bench.rs (applies/sec, playouts/sec)
-train/           train.py (PyTorch training loop)
+train/           train.py    PyTorch training loop
+  offline.py     fit architectures to a frozen replay dump (noise-free A/B)
+  diagnose.py    model-free check on how learnable a dump's targets are
+  mirror.py      the board's 180-degree symmetry, as a data augmentation
 docs/
   ENGINE_FIXES.md  rule corrections found by replaying 1,112 real games
   REBEL.md         the ReBeL agent: PBS design, CFR solver, deviations
@@ -57,7 +61,7 @@ that way has a scenario test — see `docs/ENGINE_FIXES.md`.
 
 ```bash
 cd engine
-cargo test                          # 50 tests (the solver oracle takes ~85s)
+cargo test                          # 51 tests (the solver oracle takes ~85s)
 cargo run --release --bin bench     # engine throughput, ~2.8M applies/sec/core
 cargo run --release --bin rebelbench -- weights.bin   # generation throughput
 maturin develop --release           # python module `warchest` (Game)

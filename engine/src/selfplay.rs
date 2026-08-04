@@ -51,7 +51,7 @@ pub fn make_game(rng: &mut Rng, random: bool) -> State {
     if !random {
         return State::from_draft(&STARTER_WHITE, &STARTER_BLACK, first);
     }
-    let mut pick = |rng: &mut Rng| -> Vec<u16> {
+    let pick = |rng: &mut Rng| -> Vec<u16> {
         let mut c: Vec<u16> = Vec::new();
         while c.len() < 4 {
             let id = DRAFT_POOL[rng.below(DRAFT_POOL.len())];
@@ -321,6 +321,10 @@ pub struct GameCfg {
     /// every ReBeL-phase target comes from real solves and real outcomes, so
     /// the bias washes out.
     pub eval_mix: f32,
+    /// ReBeL phase only: how much of the value target comes from the realised
+    /// game outcome instead of the pure CFR bootstrap (MuZero-style n-step /
+    /// TD(λ) anchor). 0.0 is plain ReBeL: pure bootstrap targets.
+    pub mc_mix: f32,
 }
 
 /// A live ReBeL walk: the solver for the current subgame, the checkpoint
@@ -577,6 +581,18 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
             }
         }
     }
+    if gc.collect == Collect::Rebel && gc.mc_mix > 0.0 {
+        // Anchor the pure bootstrap target to the realised outcome
+        // (TD(lambda)-style), blended in once per game.
+        let m = gc.mc_mix.clamp(0.0, 1.0);
+        for r in from_row..data.nv {
+            let base = r * 2 * NHAND;
+            for h in 0..NHAND {
+                data.vy[base + h] = (1.0 - m) * data.vy[base + h] + m * z;
+                data.vy[base + NHAND + h] = (1.0 - m) * data.vy[base + NHAND + h] - m * z;
+            }
+        }
+    }
     data.games += 1;
     if s.main_plays >= crate::state::MAX_MAIN_PLAYS {
         data.cap_hits += 1;
@@ -670,6 +686,7 @@ pub fn eval_match(
                 eval: true,
                 random_draft,
                 eval_mix: 0.0,
+                mc_mix: 0.0,
             };
             let mut d = Data::default();
             let z = play_game(&mut rng, nets, &gc, &mut d);

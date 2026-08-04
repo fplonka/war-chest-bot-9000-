@@ -3,3 +3,6 @@ target/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Replay-buffer dumps: ~1 GB each, and regenerable with `--dump-buffer`.
+*.npz

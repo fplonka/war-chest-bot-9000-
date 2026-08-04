@@ -32,6 +32,7 @@ fn walk_serves_multiple_decisions_per_solve() {
                 eval: false,
                 random_draft: false,
                 eval_mix: 0.0,
+                mc_mix: 0.0,
             };
             let z = play_game(&mut rng, &nets, &gc, &mut d);
             assert!(z.is_finite());
@@ -67,6 +68,7 @@ fn walk_in_eval_mode() {
         eval: true,
         random_draft: false,
         eval_mix: 0.0,
+        mc_mix: 0.0,
     };
     let z = play_game(&mut rng, &nets, &gc, &mut d);
     assert!(z.is_finite());
@@ -90,6 +92,7 @@ fn walk_interrupted_by_non_rebel_agent() {
         eval: false,
         random_draft: false,
         eval_mix: 0.0,
+        mc_mix: 0.0,
     };
     let z = play_game(&mut rng, &nets, &gc, &mut d);
     assert!(z.is_finite());
@@ -124,6 +127,7 @@ fn walk_never_crosses_slots() {
             eval: false,
             random_draft: false,
             eval_mix: 0.0,
+            mc_mix: 0.0,
         };
         let z = play_game(&mut rng, &nets, &gc, &mut d);
         assert!(z.is_finite());
@@ -164,6 +168,7 @@ fn walk_with_random_drafts() {
             eval: false,
             random_draft: true,
             eval_mix: 0.0,
+            mc_mix: 0.0,
         };
         let z = play_game(&mut rng, &nets, &gc, &mut d);
         assert!(z.is_finite());

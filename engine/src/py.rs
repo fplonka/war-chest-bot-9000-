@@ -492,9 +492,15 @@ use crate::selfplay::{eval_match as rs_eval_match, run_games, Agent, Collect, Da
 use numpy::{IntoPyArray, PyReadonlyArray1};
 use std::sync::{OnceLock, RwLock};
 
-/// Two independent weight slots, so a match can pit one checkpoint against
-/// another (the final network against the initial one, say).
-pub const N_SLOTS: usize = 2;
+/// Independent weight slots, so a match can pit one checkpoint against
+/// another. Slot 0 is the live network, slot 1 the initial checkpoint (the
+/// headline `final_vs_init` yardstick), slot 2 the reigning champion that
+/// gating promotes against.
+///
+/// A *moving* reference is the point of slot 2. Both fixed references saturate
+/// — the initial checkpoint is already beaten ~0.94 inside ten minutes — so on
+/// a long run, selecting checkpoints on either of them is selecting on noise.
+pub const N_SLOTS: usize = 3;
 
 fn nets() -> &'static RwLock<Vec<Nets>> {
     static NETS: OnceLock<RwLock<Vec<Nets>>> = OnceLock::new();
@@ -616,7 +622,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
 /// Run `games` self-play games across all cores and return the training data.
 /// `mode` is "greedy" (Monte-Carlo warm start) or "rebel".
 #[pyfunction]
-#[pyo3(signature = (games, seed, mode, depth=1, iters=16, explore=0.25, temp=2.0, random_draft=false, eval_mix=0.5))]
+#[pyo3(signature = (games, seed, mode, depth=1, iters=16, explore=0.25, temp=2.0, random_draft=false, eval_mix=0.5, mc_mix=0.0))]
 #[allow(clippy::too_many_arguments)]
 fn gen_data(
     py: Python<'_>,
@@ -629,6 +635,7 @@ fn gen_data(
     temp: f32,
     random_draft: bool,
     eval_mix: f32,
+    mc_mix: f32,
 ) -> PyResult<PyObject> {
     let cfg = Cfg {
         depth,
@@ -652,6 +659,7 @@ fn gen_data(
         eval: false,
         random_draft,
         eval_mix,
+        mc_mix,
     };
     let d = py.allow_threads(|| {
         let n = nets().read().unwrap();
@@ -716,13 +724,80 @@ fn infer(x: PyReadonlyArray1<f32>, rows: usize, slot: usize) -> PyResult<Vec<f32
     Ok(out)
 }
 
+/// The gather a convolutional trunk needs: `N_HEXES * 7` indices, each hex
+/// followed by its six axial neighbours in a fixed direction order.
+///
+/// Off-board neighbours are `N_HEXES` itself, which indexes a zero row in a
+/// feature map padded to `N_HEXES + 1` — so an edge hex reads zeros in the
+/// missing directions instead of needing a mask. Direction order is preserved,
+/// which is what lets a stack of these express the straight-line and
+/// exactly-two-away relations the unit cards are full of.
+#[pyfunction]
+fn hex_neighborhood() -> Vec<u32> {
+    let bd = crate::board::board();
+    let n = crate::board::N_HEXES;
+    let mut out = Vec::with_capacity(n * 7);
+    for h in 0..n {
+        out.push(h as u32);
+        for d in 0..6 {
+            let x = bd.neighbors[h][d];
+            out.push(if x == crate::board::NONE { n as u32 } else { x as u32 });
+        }
+    }
+    out
+}
+
+/// `N_HEXES` indices: where each hex lands under a 180-degree rotation of the
+/// board, `(x, y) -> (6 - x, 6 - y)` in axial coordinates.
+///
+/// That rotation maps white's two starting locations exactly onto black's and
+/// permutes the six neutral ones, so rotating the board and swapping the two
+/// players is an exact symmetry of the game. It is the basis of the training
+/// augmentation: every position can be presented a second way, for free.
+#[pyfunction]
+fn hex_mirror() -> Vec<u32> {
+    let bd = crate::board::board();
+    let n = crate::board::N_HEXES;
+    (0..n)
+        .map(|h| {
+            let (x, y) = bd.coord[h];
+            let t = (6 - x, 6 - y);
+            let m = (0..n).find(|&k| bd.coord[k] == t).expect("rotation stays on the board");
+            m as u32
+        })
+        .collect()
+}
+
 #[pymodule]
 fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(hex_mirror, m)?)?;
     m.add_class::<Game>()?;
     m.add("MAX_MAIN_PLAYS", crate::state::MAX_MAIN_PLAYS)?;
     m.add("FEAT", crate::rebel::FEAT)?;
     m.add("BELIEF_SPLIT", 2 * crate::rebel::BELIEF_DIM)?;
     m.add("NHAND", crate::rebel::NHAND)?;
+    m.add("N_HEXES", crate::board::N_HEXES)?;
+    m.add("N_UNITS", crate::units::N_UNITS)?;
+    m.add("NSLOT", crate::rebel::NSLOT)?;
+    m.add("CARD_FEATS", crate::units::CARD_FEATS)?;
+    m.add("BELIEF_DIM", crate::rebel::BELIEF_DIM)?;
+    // Block offsets in the public half of the encoding. Exported so the
+    // training side can build the mirror permutation from one source of truth
+    // rather than restating the layout.
+    m.add("HEX_CH", crate::rebel::HEX_CH)?;
+    m.add("HEX_BLOCK", crate::rebel::HEX_BLOCK)?;
+    m.add("ZONE_FEATS", crate::rebel::ZONE_FEATS)?;
+    m.add("PLAYER_SCALARS", crate::rebel::PLAYER_SCALARS)?;
+    m.add("GLOBAL_SCALARS", crate::rebel::GLOBAL_SCALARS)?;
+    m.add("PEND_KINDS", crate::rebel::PEND_KINDS)?;
+    m.add("PEND_SLOT", crate::rebel::PEND_SLOT)?;
+    m.add("OFF_ZONES", crate::rebel::OFF_ZONES)?;
+    m.add("OFF_IDENT", crate::rebel::OFF_IDENT)?;
+    m.add("OFF_CARDS", crate::rebel::OFF_CARDS)?;
+    m.add("OFF_PLAYER", crate::rebel::OFF_PLAYER)?;
+    m.add("OFF_GLOBAL", crate::rebel::OFF_GLOBAL)?;
+    m.add("OFF_BELIEF", crate::rebel::OFF_BELIEF)?;
+    m.add_function(wrap_pyfunction!(hex_neighborhood, m)?)?;
     m.add_function(wrap_pyfunction!(set_weights, m)?)?;
     m.add_function(wrap_pyfunction!(set_cap_value, m)?)?;
     m.add_function(wrap_pyfunction!(gen_data, m)?)?;

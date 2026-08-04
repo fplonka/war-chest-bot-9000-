@@ -1,0 +1,54 @@
+[data] 341890 rows, FEAT=1178, holding out the newest 34189 (10%) by recency
+[data] held-out target spread: std 0.3905 mean +0.0004
+  -- mlp
+    mlp        step   1000  test_huber 0.009677  test_rms 0.09898  (12s)
+    mlp        step   2000  test_huber 0.009655  test_rms 0.09883  (23s)
+    mlp        step   3000  test_huber 0.009049  test_rms 0.09568  (35s)
+    mlp        step   4000  test_huber 0.008659  test_rms 0.09357  (46s)
+    mlp        step   5000  test_huber 0.008568  test_rms 0.09310  (57s)
+    mlp        step   6000  test_huber 0.008647  test_rms 0.09351  (68s)
+    mlp        step   7000  test_huber 0.008583  test_rms 0.09319  (79s)
+    mlp        step   8000  test_huber 0.008571  test_rms 0.09313  (91s)
+  -- mlp512
+    mlp512     step   1000  test_huber 0.009800  test_rms 0.09961  (15s)
+    mlp512     step   2000  test_huber 0.009578  test_rms 0.09846  (29s)
+    mlp512     step   3000  test_huber 0.008937  test_rms 0.09502  (44s)
+    mlp512     step   4000  test_huber 0.008400  test_rms 0.09216  (58s)
+    mlp512     step   5000  test_huber 0.008433  test_rms 0.09230  (73s)
+    mlp512     step   6000  test_huber 0.008464  test_rms 0.09245  (88s)
+    mlp512     step   7000  test_huber 0.008415  test_rms 0.09217  (102s)
+    mlp512     step   8000  test_huber 0.008399  test_rms 0.09209  (117s)
+  -- conv2x16
+    conv2x16   step   1000  test_huber 0.010752  test_rms 0.10432  (31s)
+    conv2x16   step   2000  test_huber 0.010329  test_rms 0.10218  (64s)
+    conv2x16   step   3000  test_huber 0.009922  test_rms 0.10009  (97s)
+    conv2x16   step   4000  test_huber 0.009670  test_rms 0.09877  (131s)
+    conv2x16   step   5000  test_huber 0.009343  test_rms 0.09710  (166s)
+    conv2x16   step   6000  test_huber 0.009383  test_rms 0.09729  (210s)
+    conv2x16   step   7000  test_huber 0.009384  test_rms 0.09731  (245s)
+    conv2x16   step   8000  test_huber 0.009354  test_rms 0.09715  (281s)
+  -- conv2x32
+    conv2x32   step   1000  test_huber 0.010891  test_rms 0.10497  (52s)
+    conv2x32   step   2000  test_huber 0.009603  test_rms 0.09850  (105s)
+    conv2x32   step   3000  test_huber 0.009282  test_rms 0.09685  (159s)
+    conv2x32   step   4000  test_huber 0.009034  test_rms 0.09547  (214s)
+    conv2x32   step   5000  test_huber 0.008865  test_rms 0.09457  (274s)
+    conv2x32   step   6000  test_huber 0.008727  test_rms 0.09381  (327s)
+    conv2x32   step   7000  test_huber 0.008716  test_rms 0.09376  (378s)
+    conv2x32   step   8000  test_huber 0.008730  test_rms 0.09384  (428s)
+  -- conv3x32
+    conv3x32   step   1000  test_huber 0.010662  test_rms 0.10388  (69s)
+    conv3x32   step   2000  test_huber 0.010154  test_rms 0.10133  (138s)
+    conv3x32   step   3000  test_huber 0.009284  test_rms 0.09683  (209s)
+    conv3x32   step   4000  test_huber 0.009025  test_rms 0.09540  (277s)
+    conv3x32   step   5000  test_huber 0.008841  test_rms 0.09439  (346s)
+    conv3x32   step   6000  test_huber 0.008864  test_rms 0.09447  (416s)
+    conv3x32   step   7000  test_huber 0.008767  test_rms 0.09397  (486s)
+    conv3x32   step   8000  test_huber 0.008766  test_rms 0.09396  (563s)
+
+arch            params  trunkMAC  test_huber  test_rms  var expl    sec
+mlp512          925808    797696    0.008399   0.09209    0.9444  117.4
+mlp             645232    549120    0.008571   0.09313    0.9431   90.7
+conv2x32        911472   1186112    0.008730   0.09384    0.9422  428.4
+conv3x32        918736   1451328    0.008766   0.09396    0.9421  563.4
+conv2x16        677104    701856    0.009354   0.09715    0.9381  281.8

@@ -226,15 +226,68 @@ solve at every decision (~1400 solved decisions/s), ~24 configs per decision.
 That is 9-10x what this took before `docs/PERF.md`'s work, which is what turns a
 10-minute budget from 7 ReBeL epochs into ~120.
 
-### The Monte-Carlo anchor
+### The Monte-Carlo anchor, and why it is off
 
 ReBeL's value target is purely bootstrapped. With depth-1 subgames that is
-TD(0), and over a 250-ply game with a 150k replay buffer it reliably finds a
-self-consistent but *wrong* value function: in a first 30-minute run the training
-loss fell to 0.004 while the agent's score against Greedy collapsed to 0.007.
-`--mc-mix` blends the realised return into the target (TD(λ); MuZero's n-step
-bootstrap); at 0.3 the collapse disappears and the gate climbs monotonically in
-expectation. `--mc-mix 0` recovers plain ReBeL, and reproduces the collapse.
+TD(0), and over a 250-ply game with a 150k replay buffer an early build
+reliably found a self-consistent but *wrong* value function: in a first
+30-minute run the training loss fell to 0.004 while the agent's score against
+Greedy collapsed to 0.007. `--mc-mix` blends the realised return into the target
+(TD(λ); MuZero's n-step bootstrap), and at 0.3 that collapse disappeared.
+
+**That finding does not survive the current generation loop, and the default is
+now 0.** Re-measured at matched wall-clock on the post-`PERF.md` code, mc-mix
+0.3 is clearly *worse*: 0.837 against the initial checkpoint versus 0.937 for
+pure bootstrap, 0.933 versus 0.978 against Greedy, and a training loss floor six
+times higher (0.043 versus 0.007) because a realised return is a high-variance
+label the network cannot fit. The original collapse was measured when a
+10-minute budget bought 7 ReBeL epochs; it now buys over a hundred, and the
+bootstrap has enough iterations to stay anchored on its own.
+
+The mechanism that made the anchor necessary has not been proven gone, only
+outrun — a run long enough to drift could still need it, so `--mc-mix` stays.
+
+### What the value network is actually short of
+
+Held-out error sat at RMS ~0.092 against a target spread of 0.39 and would not
+move. Because a target is a deterministic function of the network's own input —
+the CFR root value of the subgame at `(state, ctx, beliefs)`, which is exactly
+what `write_features` encodes — a dumped replay buffer is a noise-free
+supervised dataset, and the question can be settled offline in minutes instead
+of by training runs whose headline score wanders by ±0.05 (`train/offline.py`).
+
+Three explanations were tested and two died:
+
+* **Capacity.** No. Five architectures spanning 2.6x in trunk cost — the current
+  MLP, a 512-wide MLP, and hex convolutions at 2 and 3 layers, 16 and 32
+  channels — all landed within 4% of each other.
+* **A bug in the targets.** No. `train/diagnose.py` finds rows whose inputs are
+  byte-identical and compares their targets: rows recorded close together agree
+  *exactly*. The encoding-to-target map is clean.
+* **Target drift.** Real but small. The same duplicate analysis shows
+  disagreement rising monotonically with how far apart two rows were recorded
+  (0.0000 under 1k rows apart, 0.0234 beyond 50k), for 0.0145 RMS overall —
+  2.5% of the variance of a 0.092 floor.
+
+The answer was **data**. Training error sat at 2.7x below held-out error and
+kept falling while held-out error stayed flat: the network was memorising. The
+data-scaling curve confirms it and does not saturate — 40k rows give 0.0122,
+80k 0.0103, 160k 0.0086, 284k 0.0082 — and at full data with augmentation the
+train/test gap closes to zero.
+
+Two consequences. Replay capacity is an algorithmic knob, not a memory setting.
+And the 180-degree board symmetry is worth exploiting: rotating the board maps
+white's starting locations exactly onto black's, so every position can be
+presented a second way with the seats swapped, for free (`train/mirror.py`,
+applied per batch so the buffer does not double). Measured: held-out loss
+0.008446 → 0.008161 with the overfitting gap down 38%.
+
+A note on the convolution, since it was the obvious thing to reach for. It does
+match the MLP once augmentation removes the overfitting that was penalising its
+extra parameters — but it is then *equalled by widening the MLP at 65% of the
+cost*, 2.25x trunk compute for 1.5% of loss. On a spatial game with adjacency
+rules that is a genuinely surprising result, and it is why the Rust kernel was
+never written.
 
 ## 6. Tests
 
@@ -253,9 +306,41 @@ expectation. `--mc-mix 0` recovers plain ReBeL, and reproduces the collapse.
 
 ## 7. Known gaps
 
-* **T = 8 CFR iterations**, against the paper's 256/1024. Measured against exact
-  values on micro-endgames, mean |error| is 0.0035 at T=8 beside a target spread
-  of ~0.3, and target rate is the binding constraint at depth 2.
+* **T = 16 CFR iterations**, against the paper's 256/1024. The earlier default
+  of 8 rested on micro-endgames solved against exact values (mean |error|
+  0.0035), which converge almost immediately and understate the error on the
+  ~540-node subgames self-play actually solves. Measured on real mid-game
+  positions against a converged T=512 reference (`examples/solvererr.rs`), the
+  root-value error is 0.0098 at T=8, 0.0036 at T=16 and 0.0016 at T=32 —
+  8%, 3% and 1.3% of the spread of the values themselves, and stable across
+  belief supports from 3 to 136 configs.
+
+  **16 is where the systematic component of that error disappears, which is why
+  it is the setting and why 32 and 64 are not.** What decides this is the
+  *signed* mean error, not the absolute one. Zero-mean error behaves like noise:
+  the network averages it away over millions of rows and it adds in quadrature
+  with the network's own 23%-of-spread error, where a further 3% → 1.3% is
+  invisible. A signed error is a bias that compounds every time the operator is
+  applied and displaces the fixed point by roughly bias/(1 − γ), with γ near 1
+  on an undiscounted 256-ply horizon. Measured:
+
+  | T | mean \|err\| | signed mean | positions erring one way |
+  |---|---|---|---|
+  | 8 | 0.00952 | **+0.00149** | 50% |
+  | 16 | 0.00355 | −0.00038 | 46% |
+  | 32 | 0.00161 | −0.00042 | 48% |
+  | 64 | 0.00079 | −0.00024 | 53% |
+
+  T=8 carries a real one-directional component. By T=16 it is a tenth of the
+  absolute error, has changed sign, and then stops moving — T=32 and T=64 sit at
+  the same value, so what they remove is noise. The share of positions whose
+  configs err in a consistent direction is ~50% at every T, exactly chance,
+  which is what a noise term looks like. T=16 costs 36% of the target rate;
+  T=32 costs 63% to buy nothing that survives averaging.
+
+  Note that a training loss curve cannot be used to choose T: changing T changes
+  the target function, so a lower loss at higher T may only mean the targets
+  became easier to fit. Comparing those curves across T would mislead.
 * **No policy network.** The paper treats it as optional (value net alone
   converges); it would be worth adding for CFR warm starting and for fast play.
 * **The subgame is chance-free except for round-start draws**, which are walked

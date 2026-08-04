@@ -41,6 +41,72 @@ pub enum Tactic {
     RoyalGuard,
 }
 
+/// Number of `Tactic` variants; the width of the tactic one-hot in the value
+/// network's card-property block.
+pub const N_TACTICS: usize = 10;
+
+impl Tactic {
+    /// Dense index for the one-hot. Written out rather than derived so that
+    /// adding a variant is a compile error here instead of a silent feature
+    /// collision.
+    #[inline]
+    pub fn index(self) -> usize {
+        match self {
+            Tactic::None => 0,
+            Tactic::Archer => 1,
+            Tactic::Cavalry => 2,
+            Tactic::Crossbowman => 3,
+            Tactic::Ensign => 4,
+            Tactic::Footman => 5,
+            Tactic::Lancer => 6,
+            Tactic::LightCavalry => 7,
+            Tactic::Marshal => 8,
+            Tactic::RoyalGuard => 9,
+        }
+    }
+}
+
+/// Width of one unit's card-property block: the tactic one-hot, the twelve
+/// attribute flags, the two action restrictions, and the coin count.
+pub const CARD_FEATS: usize = N_TACTICS + 12 + 2 + 1;
+
+/// Write unit `u`'s card as features: what its tactic is, which attributes it
+/// has, and how many coins of it exist.
+///
+/// These are constants of the printed card, fixed by the draft and known to
+/// both players, so they are public by construction. They exist so the network
+/// reads a unit's *rules* rather than having to infer them from an arbitrary
+/// identity code — which is what makes a draft it has never seen encodable at
+/// all, and is a prerequisite for `--random-draft`.
+pub fn write_card_features(u: u8, out: &mut [f32]) {
+    debug_assert_eq!(out.len(), CARD_FEATS);
+    let d = def(u);
+    out.fill(0.0);
+    out[d.tactic.index()] = 1.0;
+    let flags = [
+        d.berserker_v1,
+        d.berserker_v2,
+        d.knight,
+        d.mercenary,
+        d.pikeman,
+        d.royal_guard,
+        d.scout,
+        d.swordsman,
+        d.warrior_priest,
+        d.warrior_priest_v2,
+        d.footman_v2,
+        d.two_footmen,
+    ];
+    for (i, f) in flags.iter().enumerate() {
+        out[N_TACTICS + i] = *f as u8 as f32;
+    }
+    out[N_TACTICS + 12] = d.no_normal_attack as u8 as f32;
+    out[N_TACTICS + 13] = d.is_royal_coin as u8 as f32;
+    // Divisor is the largest coin count on any card (5); the Royal Coin's 1
+    // lands at 0.2.
+    out[N_TACTICS + 14] = d.coins as f32 / 5.0;
+}
+
 pub struct UnitDef {
     pub id: u16, // canonical site unitTypeId (Royal Coin uses 13)
     pub name: &'static str,

@@ -1146,11 +1146,6 @@ impl State {
         // Mercenary has no Tactic; a free maneuver is move/control/attack only.
         let _ = (hex, out);
     }
-    fn list_footman_tactics(&self, hex: usize, out: &mut Vec<Action>) {
-        // Footman has no separate Tactic beyond the maneuver it is granting;
-        // its per-unit maneuver is move/control/attack (handled by the caller).
-        let _ = (hex, out);
-    }
 }
 
 // ------------------------------------------------------------------ apply

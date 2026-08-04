@@ -88,12 +88,15 @@ fn draw_weights(s: &State, p: u8, acts: &[Action]) -> Vec<f64> {
         .collect()
 }
 
-#[test]
-fn features_do_not_leak_private_information() {
+/// Swapping a player's hidden config for any other consistent with the same
+/// public counts must not move a single feature. Run over both drafts: the
+/// starter matchup never produces a Footman, Mercenary or Royal Guard trigger,
+/// so it would not exercise the pending-maneuver mask at all.
+fn leak_check(random_draft: bool) -> (usize, usize) {
     let mut rng = Rng::new(99);
-    let mut checked = 0;
+    let (mut checked, mut pending_seen) = (0, 0);
     for g in 0..12u64 {
-        let mut s = make_game(&mut Rng::new(g + 1), false);
+        let mut s = make_game(&mut Rng::new(g + 1), random_draft);
         let ctx = Ctx::new(&s);
         let bel = [
             Belief::point(Config::default()),
@@ -123,6 +126,13 @@ fn features_do_not_leak_private_information() {
                     "features changed when only player {}'s hidden config changed",
                     p
                 );
+                // The pending-maneuver mask is channel `6 + NSLOT` of the
+                // hex-major block.
+                if (0..warchest::board::N_HEXES)
+                    .any(|h| a[h * HEX_CH + 6 + NSLOT] != 0.0)
+                {
+                    pending_seen += 1;
+                }
                 checked += 1;
             }
             let acts = s.legal_actions();
@@ -132,7 +142,26 @@ fn features_do_not_leak_private_information() {
             s.apply_inplace(acts[rng.below(acts.len())]);
         }
     }
+    (checked, pending_seen)
+}
+
+#[test]
+fn features_do_not_leak_private_information() {
+    let (checked, _) = leak_check(false);
     assert!(checked > 500, "not enough positions exercised: {}", checked);
+}
+
+#[test]
+fn features_do_not_leak_private_information_random_draft() {
+    let (checked, pending) = leak_check(true);
+    assert!(checked > 500, "not enough positions exercised: {}", checked);
+    // A feature block that never fires is dead weight the encoding is paying
+    // for; assert the pending-maneuver mask is actually reached.
+    assert!(
+        pending > 0,
+        "the pending-maneuver mask never fired over {} positions",
+        checked
+    );
 }
 
 #[test]

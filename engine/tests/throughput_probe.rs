@@ -28,6 +28,7 @@ fn throughput_probe() {
                 eval: false,
                 random_draft: false,
                 eval_mix: 0.0,
+                mc_mix: 0.0,
             };
             play_game(&mut rng, &nets, &gc, &mut d);
             games += 1;
@@ -62,6 +63,7 @@ fn throughput_probe() {
                 eval: true,
                 random_draft: false,
                 eval_mix: 0.0,
+                mc_mix: 0.0,
             };
             play_game(&mut rng, &nets, &gc, &mut d);
             games += 1;

@@ -1,0 +1,112 @@
+{
+ "args": {
+  "dump": "runs/feat02/buf.npz",
+  "arch": [
+   "mlp",
+   "mlp512",
+   "conv2x32"
+  ],
+  "steps": 8000,
+  "batch": 1024,
+  "lr": 0.001,
+  "eval_every": 4000,
+  "test_frac": 0.1,
+  "fresh": 0,
+  "train_window": 0,
+  "augment": true,
+  "device": "cpu",
+  "out": "runs/feat02/offline_aug.json"
+ },
+ "results": [
+  {
+   "arch": "mlp",
+   "params": 616816,
+   "trunk_macs": 520704,
+   "final_test_huber": 0.008107,
+   "final_test_rms": 0.09046,
+   "final_train_huber": 0.00777,
+   "final_train_rms": 0.08823,
+   "best_test_huber": 0.008107,
+   "best_step": 8000,
+   "seconds": 104.2,
+   "curve": [
+    {
+     "step": 4000,
+     "test_huber": 0.008363,
+     "test_rms": 0.09188,
+     "train_huber": 0.006113,
+     "train_rms": 0.07853
+    },
+    {
+     "step": 8000,
+     "test_huber": 0.008107,
+     "test_rms": 0.09046,
+     "train_huber": 0.004794,
+     "train_rms": 0.06944
+    }
+   ],
+   "target_std": 0.3856,
+   "explained": 0.945
+  },
+  {
+   "arch": "mlp512",
+   "params": 887920,
+   "trunk_macs": 759808,
+   "final_test_huber": 0.007981,
+   "final_test_rms": 0.08973,
+   "final_train_huber": 0.007088,
+   "final_train_rms": 0.08423,
+   "best_test_huber": 0.007981,
+   "best_step": 8000,
+   "seconds": 131.3,
+   "curve": [
+    {
+     "step": 4000,
+     "test_huber": 0.008564,
+     "test_rms": 0.09296,
+     "train_huber": 0.006118,
+     "train_rms": 0.07855
+    },
+    {
+     "step": 8000,
+     "test_huber": 0.007981,
+     "test_rms": 0.08973,
+     "train_huber": 0.004287,
+     "train_rms": 0.06566
+    }
+   ],
+   "target_std": 0.3856,
+   "explained": 0.9459
+  },
+  {
+   "arch": "conv2x32",
+   "params": 911024,
+   "trunk_macs": 1169536,
+   "final_test_huber": 0.007988,
+   "final_test_rms": 0.08953,
+   "final_train_huber": 0.007726,
+   "final_train_rms": 0.08794,
+   "best_test_huber": 0.007988,
+   "best_step": 8000,
+   "seconds": 377.0,
+   "curve": [
+    {
+     "step": 4000,
+     "test_huber": 0.008509,
+     "test_rms": 0.09246,
+     "train_huber": 0.006343,
+     "train_rms": 0.07979
+    },
+    {
+     "step": 8000,
+     "test_huber": 0.007988,
+     "test_rms": 0.08953,
+     "train_huber": 0.004407,
+     "train_rms": 0.06644
+    }
+   ],
+   "target_std": 0.3856,
+   "explained": 0.9461
+  }
+ ]
+}

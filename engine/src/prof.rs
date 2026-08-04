@@ -52,10 +52,16 @@ macro_rules! timed {
         #[cfg(feature = "prof")]
         let t = $crate::prof::Timer::new(&$crate::prof::$c);
         #[cfg(not(feature = "prof"))]
-        let t = ();
+        let t = $crate::prof::NoTimer;
         t
     }};
 }
+
+/// Stand-in for a `Timer` when the `prof` feature is off. A plain `()` would
+/// make every `drop(t)` that ends a timed region a no-op on a `Copy` value,
+/// which the compiler rightly warns about six times over.
+#[cfg(not(feature = "prof"))]
+pub struct NoTimer;
 
 // -------------------------------------------------------------- tree shape
 

@@ -32,7 +32,7 @@
 use crate::actions::Action;
 use crate::board::{board, NONE, N_HEXES};
 use crate::state::{Cont, State, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP, Z_HAND, Z_SUPPLY};
-use crate::units::N_UNITS;
+use crate::units::{write_card_features, CARD_FEATS, N_UNITS};
 use std::sync::OnceLock;
 
 /// Distinct coin types a player can own: 4 drafted units + the Royal Coin.
@@ -679,17 +679,58 @@ pub fn obs_key(a: &Action) -> u32 {
 /// divisor for those features rather than an estimate.
 const MAX_COINS: f32 = 4.0 * 5.0 + 1.0;
 
-const PEND_KINDS: usize = 12;
+pub const PEND_KINDS: usize = 12;
 /// Belief block per player: hand-key distribution plus bag and face-down
 /// composition marginals.
 pub const BELIEF_DIM: usize = NHAND + 2 * NSLOT;
-/// 37 hexes x 11, 2 x 20 public zone counts, 2 x 5 x 20 slot identities,
-/// 2 x 8 player scalars, 17 global, 2 belief blocks.
-pub const FEAT: usize = N_HEXES * 11 + 2 * 20 + 2 * NSLOT * 20 + 2 * 8 + 17 + 2 * BELIEF_DIM;
-/// Offset of the `to_act == white` flag.
-pub const OFF_TO_ACT: usize = N_HEXES * 11 + 2 * 20 + 2 * NSLOT * 20 + 2 * 8 + 4;
-/// Offset of the two belief blocks.
-pub const OFF_BELIEF: usize = FEAT - 2 * BELIEF_DIM;
+
+/// Channels in the per-hex block: owner (2), stack height, the owner's slot
+/// one-hot (`NSLOT`), the location marker's owner (2), is-location, and the
+/// pending-maneuver mask.
+///
+/// The block is laid out hex-major and comes first in the encoding, so a
+/// convolutional trunk can read it as a `[N_HEXES, HEX_CH]` image directly.
+///
+/// Every channel here is a raw fact about the position. A precomputed
+/// distance-to-nearest-unit map was tried and removed: it is a *derived*
+/// summary — the same quantity `eval_static`'s coverage term uses — so it
+/// imports the handcrafted bot's opinion into the encoding, and it exists only
+/// to paper over the limited reach of a shallow convolution. If the network
+/// needs board-wide context, the honest fix is in the architecture (pooling),
+/// not a hand-built feature.
+pub const HEX_CH: usize = 2 + 1 + NSLOT + 2 + 1 + 1;
+/// Size of the per-hex block.
+pub const HEX_BLOCK: usize = N_HEXES * HEX_CH;
+/// Per player: reserve, face-up, supply and eliminated counts per coin slot.
+pub const ZONE_FEATS: usize = 4 * NSLOT;
+pub const PLAYER_SCALARS: usize = 8;
+pub const GLOBAL_SCALARS: usize = 5;
+/// Slot one-hot for the coin a Footman-V2 instant deploy is holding. Public:
+/// a Recruit reveals which unit was taken.
+pub const PEND_SLOT: usize = NSLOT;
+
+/// Offset of the per-player zone counts (just past the hex block).
+pub const OFF_ZONES: usize = HEX_BLOCK;
+/// Offset of the per-slot unit identity one-hots.
+pub const OFF_IDENT: usize = OFF_ZONES + 2 * ZONE_FEATS;
+/// Offset of the per-slot card-property blocks.
+pub const OFF_CARDS: usize = OFF_IDENT + 2 * NSLOT * N_UNITS;
+/// Offset of the per-player scalars.
+pub const OFF_PLAYER: usize = OFF_CARDS + 2 * NSLOT * CARD_FEATS;
+/// Offset of the global scalars.
+pub const OFF_GLOBAL: usize = OFF_PLAYER + 2 * PLAYER_SCALARS;
+
+/// Everything before the belief blocks.
+pub const OFF_BELIEF: usize =
+    OFF_GLOBAL + GLOBAL_SCALARS + PEND_KINDS + PEND_SLOT;
+pub const FEAT: usize = OFF_BELIEF + 2 * BELIEF_DIM;
+
+/// Round divisor. Measured on the starter draft (`examples/featstats.rs`):
+/// rounds reach 81 under random play and 121 under one-ply greedy, because a
+/// drained reserve makes rounds short in coin plays and therefore numerous.
+/// The previous divisor of 40 left this feature pinned at 1.0 for most of
+/// essentially every game.
+const MAX_ROUND: f32 = 128.0;
 
 fn pending_kind(s: &State) -> usize {
     match s.pending() {
@@ -790,24 +831,62 @@ pub fn write_public_features(s: &State, ctx: &Ctx, out: &mut [f32]) {
     debug_assert_eq!(out.len(), OFF_BELIEF);
     out.fill(0.0);
     let bd = board();
-    let mut i = 0;
 
+    // Which board unit, if any, still owes a maneuver at this decision node.
+    // `pending_kind` below says *what kind* of trigger is open; without this it
+    // does not say *whose*, and the Footman tactic can owe two at once.
+    //
+    // Only the hex-valued payloads are encoded. `WarriorPriestPlay { coin }`
+    // carries a coin drawn privately, so encoding it would leak — which is the
+    // same reason `docs/REBEL.md` keeps the Warrior Priest out of the draft
+    // pool. `FootmanInstantDeploy`'s coin is public (a Recruit reveals the unit
+    // taken) and is encoded with the globals instead.
+    let mut pending_hexes = crate::state::HexSet(0);
+    let mark = |h: u8, set: &mut crate::state::HexSet| {
+        if (h as usize) < N_HEXES {
+            set.insert(h);
+        }
+    };
+    match *s.pending() {
+        Cont::SwordsmanMove { hex }
+        | Cont::BerserkerChain { hex, .. }
+        | Cont::CavalryAttack { hex }
+        | Cont::MercenaryManeuver { hex } => mark(hex, &mut pending_hexes),
+        Cont::FootmanManeuver { hexes } => {
+            for h in hexes.iter() {
+                mark(h, &mut pending_hexes);
+            }
+        }
+        Cont::RoyalGuardChoice { rg_hex, .. } | Cont::WarriorPriestDraw { rg_hex, .. } => {
+            mark(rg_hex, &mut pending_hexes)
+        }
+        Cont::_AttackPost { atk_hex } => mark(atk_hex, &mut pending_hexes),
+        _ => {}
+    }
+
+    let mut i = 0;
     for h in 0..N_HEXES {
         let owner = s.hex_owner[h];
         if owner != NONE {
             out[i + owner as usize] = 1.0;
-            out[i + 2] = s.hex_height[h] as f32 / 3.0;
+            // Divisor is the largest coin count on any card. Bolstering has no
+            // height limit (RULES.md section 5) and heights of 4 and 5 are
+            // ~20% of occupied-hex observations under random play, so the
+            // previous /3 collapsed them onto the same value.
+            out[i + 2] = s.hex_height[h] as f32 / 5.0;
             let k = ctx.slot_of[owner as usize][s.hex_type[h] as usize];
             if k >= 0 {
                 out[i + 3 + k as usize] = 1.0;
             }
         }
         if s.loc_marker[h] != NONE {
-            out[i + 8 + s.loc_marker[h] as usize] = 1.0;
+            out[i + 3 + NSLOT + s.loc_marker[h] as usize] = 1.0;
         }
-        out[i + 10] = bd.is_location[h] as u8 as f32;
-        i += 11;
+        out[i + 5 + NSLOT] = bd.is_location[h] as u8 as f32;
+        out[i + 6 + NSLOT] = ((pending_hexes.0 >> h) & 1) as f32;
+        i += HEX_CH;
     }
+    debug_assert_eq!(i, OFF_ZONES);
 
     for p in 0..2usize {
         let res = reserve(s, p as u8, ctx);
@@ -818,15 +897,29 @@ pub fn write_public_features(s: &State, ctx: &Ctx, out: &mut [f32]) {
             out[i + 2 * NSLOT + k] = s.zones[p][Z_SUPPLY][u] as f32 / 5.0;
             out[i + 3 * NSLOT + k] = s.zones[p][Z_ELIM][u] as f32 / 5.0;
         }
-        i += 4 * NSLOT;
+        i += ZONE_FEATS;
     }
+    debug_assert_eq!(i, OFF_IDENT);
 
     for p in 0..2usize {
         for k in 0..NSLOT {
             out[i + ctx.slots[p][k] as usize] = 1.0;
-            i += 20;
+            i += N_UNITS;
         }
     }
+    debug_assert_eq!(i, OFF_CARDS);
+
+    // What each drafted card actually does. Under a fixed draft these are
+    // constant across games and carry no information, but they are what lets a
+    // draft the network has never seen be encoded at all, so they are the
+    // prerequisite for `--random-draft`.
+    for p in 0..2usize {
+        for k in 0..NSLOT {
+            write_card_features(ctx.slots[p][k], &mut out[i..i + CARD_FEATS]);
+            i += CARD_FEATS;
+        }
+    }
+    debug_assert_eq!(i, OFF_PLAYER);
 
     for p in 0..2usize {
         let fd: u8 = s.zones[p][Z_FACEDOWN].iter().sum();
@@ -843,18 +936,28 @@ pub fn write_public_features(s: &State, ctx: &Ctx, out: &mut [f32]) {
         out[i + 5] = s.turns_taken[p] as f32 / 3.0;
         out[i + 6] = (s.initiative == p as u8) as u8 as f32;
         out[i + 7] = (s.first_player == p as u8) as u8 as f32;
-        i += 8;
+        i += PLAYER_SCALARS;
     }
+    debug_assert_eq!(i, OFF_GLOBAL);
 
-    out[i] = (s.round as f32 / 40.0).min(1.0);
+    out[i] = (s.round as f32 / MAX_ROUND).min(1.0);
     // plies_remaining: PBS values near the horizon are not well defined without it.
     let cap = crate::state::MAX_MAIN_PLAYS;
     out[i + 1] = (cap - s.main_plays.min(cap)) as f32 / cap as f32;
     out[i + 2] = s.initiative_moved as u8 as f32;
     out[i + 3] = (s.active == 0) as u8 as f32;
     out[i + 4] = (s.to_act() == 0) as u8 as f32;
-    i += 5;
+    i += GLOBAL_SCALARS;
     out[i + pending_kind(s)] = 1.0;
     i += PEND_KINDS;
+    // The coin a Footman-V2 instant deploy is holding. Public, unlike the
+    // Warrior Priest's drawn coin (see the pending-mask note above).
+    if let Cont::FootmanInstantDeploy { coin } = *s.pending() {
+        let k = ctx.slot_of[s.to_act() as usize][coin as usize];
+        if k >= 0 {
+            out[i + k as usize] = 1.0;
+        }
+    }
+    i += PEND_SLOT;
     debug_assert_eq!(i, OFF_BELIEF);
 }

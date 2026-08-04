@@ -14,63 +14,6 @@ use warchest::net::Mlp;
 use warchest::search::{Cfg, Nets};
 use warchest::selfplay::{run_games, Agent, Collect, GameCfg};
 
-fn read_u32(b: &[u8], at: &mut usize) -> usize {
-    let v = u32::from_le_bytes(b[*at..*at + 4].try_into().unwrap()) as usize;
-    *at += 4;
-    v
-}
-
-fn read_f32s(b: &[u8], at: &mut usize) -> Vec<f32> {
-    let n = read_u32(b, at);
-    let mut v = Vec::with_capacity(n);
-    for i in 0..n {
-        let o = *at + i * 4;
-        v.push(f32::from_le_bytes(b[o..o + 4].try_into().unwrap()));
-    }
-    *at += n * 4;
-    v
-}
-
-fn load(path: &str) -> Mlp {
-    let raw = std::fs::read(path).expect("weights file");
-    let mut at = 0usize;
-    let nd = read_u32(&raw, &mut at);
-    let dims: Vec<usize> = (0..nd).map(|_| read_u32(&raw, &mut at)).collect();
-    let split = read_u32(&raw, &mut at);
-    let (w, b, ln) = (
-        read_f32s(&raw, &mut at),
-        read_f32s(&raw, &mut at),
-        read_f32s(&raw, &mut at),
-    );
-    let mut mlp = Mlp {
-        dims: dims.clone(),
-        w: Vec::new(),
-        b: Vec::new(),
-        ln_w: Vec::new(),
-        ln_b: Vec::new(),
-        split,
-        wb: Vec::new(),
-    };
-    let (mut wi, mut bi) = (0usize, 0usize);
-    for l in 0..dims.len() - 1 {
-        let (i, o) = (dims[l], dims[l + 1]);
-        mlp.w.push(w[wi..wi + i * o].to_vec());
-        mlp.b.push(b[bi..bi + o].to_vec());
-        wi += i * o;
-        bi += o;
-    }
-    mlp.wb = w[wi..wi + split * dims[1]].to_vec();
-    let mut li = 0usize;
-    for l in 0..dims.len() - 2 {
-        let o = dims[l + 1];
-        mlp.ln_w.push(ln[li..li + o].to_vec());
-        li += o;
-        mlp.ln_b.push(ln[li..li + o].to_vec());
-        li += o;
-    }
-    mlp
-}
-
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let path = a.get(1).cloned().unwrap_or_else(|| "weights.bin".into());
@@ -86,7 +29,7 @@ fn main() {
     }
 
     let mut nets = vec![Nets::default(), Nets::default()];
-    let mlp = load(&path);
+    let mlp = Mlp::load_bin(&path).expect("weights file");
     println!("dims {:?}", mlp.dims);
     nets[0].value = mlp.clone();
     nets[1].value = mlp;
@@ -105,6 +48,7 @@ fn main() {
         eval: false,
         random_draft: false,
         eval_mix: 0.5,
+        mc_mix: 0.0,
     };
 
     // Warm the allocator / caches, then measure.

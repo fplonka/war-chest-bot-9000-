@@ -109,13 +109,74 @@ fn gemm_ld(
     }
 }
 
-/// c[m x n] = a[m x k] * b[k x n], all row-major and tightly packed.
-fn gemm(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
-    gemm_ld(m, n, k, a, k, b, n, 0.0, c, n);
-}
-
 /// Must match `torch.nn.LayerNorm`'s default.
 const LN_EPS: f32 = 1e-5;
+
+/// Read the flat weight dump `train/export_weights.py` writes:
+///
+/// ```text
+/// u32 n_dims, n_dims * u32 dims, u32 split,
+/// u32 n_w, n_w * f32,   u32 n_b, n_b * f32,   u32 n_ln, n_ln * f32
+/// ```
+///
+/// Weights are per layer, row-major `[in, out]`, with the belief projection
+/// last; LayerNorm ships weight then bias per hidden layer, in layer order.
+/// Same ordering as `Mlp.push`, so an offline tool measures exactly the network
+/// the trainer ships to the workers.
+impl Mlp {
+    pub fn load_bin(path: &str) -> std::io::Result<Mlp> {
+        let raw = std::fs::read(path)?;
+        let mut at = 0usize;
+        let u32_at = |b: &[u8], at: &mut usize| -> usize {
+            let v = u32::from_le_bytes(b[*at..*at + 4].try_into().unwrap()) as usize;
+            *at += 4;
+            v
+        };
+        let f32s_at = |b: &[u8], at: &mut usize| -> Vec<f32> {
+            let n = u32_at(b, at);
+            let v = (0..n)
+                .map(|i| f32::from_le_bytes(b[*at + i * 4..*at + i * 4 + 4].try_into().unwrap()))
+                .collect();
+            *at += n * 4;
+            v
+        };
+        let nd = u32_at(&raw, &mut at);
+        let dims: Vec<usize> = (0..nd).map(|_| u32_at(&raw, &mut at)).collect();
+        let split = u32_at(&raw, &mut at);
+        let (w, b, ln) = (
+            f32s_at(&raw, &mut at),
+            f32s_at(&raw, &mut at),
+            f32s_at(&raw, &mut at),
+        );
+        let mut mlp = Mlp {
+            dims: dims.clone(),
+            w: Vec::new(),
+            b: Vec::new(),
+            ln_w: Vec::new(),
+            ln_b: Vec::new(),
+            split,
+            wb: Vec::new(),
+        };
+        let (mut wi, mut bi) = (0usize, 0usize);
+        for l in 0..dims.len() - 1 {
+            let (i, o) = (dims[l], dims[l + 1]);
+            mlp.w.push(w[wi..wi + i * o].to_vec());
+            mlp.b.push(b[bi..bi + o].to_vec());
+            wi += i * o;
+            bi += o;
+        }
+        mlp.wb = w[wi..wi + split * dims[1]].to_vec();
+        let mut li = 0usize;
+        for l in 0..dims.len() - 2 {
+            let o = dims[l + 1];
+            mlp.ln_w.push(ln[li..li + o].to_vec());
+            li += o;
+            mlp.ln_b.push(ln[li..li + o].to_vec());
+            li += o;
+        }
+        Ok(mlp)
+    }
+}
 
 // ------------------------------------------------- LayerNorm kernels
 //
