@@ -267,9 +267,14 @@ pub struct Solver<'a> {
     cfg: Cfg,
     pub nodes: Vec<TNode>,
     root_belief: [Belief; 2],
-    regret: Vec<Vec<f32>>,
+    /// Regrets and the current regret-matching iterate, flat by node:
+    /// `[soff[i] .. soff[i] + nc(player) * na]`, laid out `[config * na + a]`.
+    regret: Vec<f32>,
+    cur: Vec<f32>,
+    soff: Vec<u32>,
+    /// The average strategy and its running sum. Only evaluation reads these,
+    /// so generation leaves them empty and they stay per-node.
     sum_strat: Vec<Vec<f32>>,
-    cur: Vec<Vec<f32>>,
     avg: Vec<Vec<f32>>,
     /// Reach per config, flat: node `i`'s two players occupy
     /// `reach[roff[i] .. roff[i] + nc0 + nc1]`, player 0 first. One arena
@@ -312,6 +317,8 @@ pub struct Solver<'a> {
     batch_ready: bool,
     /// Working memory for the chance transitions, reused across the tree.
     draw_scratch: DrawScratch,
+    /// `(config key, cell)` scratch for ordering a public child's support.
+    cell_order: Vec<(u64, u32)>,
     dm: [DrawMap; 3],
 }
 
@@ -349,8 +356,9 @@ impl<'a> Solver<'a> {
             root_mean: [vec![0.0; cfgs[0].len()], vec![0.0; cfgs[1].len()]],
             root_belief: belief,
             regret: Vec::new(),
-            sum_strat: Vec::new(),
             cur: Vec::new(),
+            soff: Vec::new(),
+            sum_strat: Vec::new(),
             avg: Vec::new(),
             reach: Vec::new(),
             roff: Vec::new(),
@@ -370,6 +378,7 @@ impl<'a> Solver<'a> {
             sb: take_buf(R_SB),
             batch_ready: false,
             draw_scratch: DrawScratch::default(),
+            cell_order: Vec::new(),
             dm: Default::default(),
         };
         {
@@ -396,7 +405,8 @@ impl<'a> Solver<'a> {
             sv.reach.resize(sv.reach.len() + c0 + c1, 0.0);
             sv.voff.push(sv.vals.len() as u32);
             sv.vals.resize(sv.vals.len() + c0.max(c1), 0.0);
-            sv.regret.push(vec![0.0; nc * na]);
+            sv.soff.push(sv.regret.len() as u32);
+            sv.regret.resize(sv.regret.len() + nc * na, 0.0);
             sv.sum_strat.push(if keep_avg {
                 vec![0.0; nc * na]
             } else {
@@ -415,9 +425,10 @@ impl<'a> Solver<'a> {
                     }
                 }
             }
-            sv.avg.push(if keep_avg { u.clone() } else { Vec::new() });
-            sv.cur.push(u);
+            sv.cur.extend_from_slice(&u);
+            sv.avg.push(if keep_avg { u } else { Vec::new() });
         }
+        sv.soff.push(sv.regret.len() as u32);
         drop(_t);
         shape!(SOLVES, 1);
         shape!(NODES, sv.nodes.len());
@@ -442,10 +453,11 @@ impl<'a> Solver<'a> {
                     continue;
                 }
                 let (na, p) = (sv.nodes[i].na(), sv.nodes[i].player as usize);
+                let so = sv.soff[i] as usize;
                 for c in 0..sv.nodes[i].nc(p) {
                     let r = sv.reach_of(i, p)[c];
                     for a in 0..na {
-                        sv.sum_strat[i][c * na + a] += r * sv.cur[i][c * na + a];
+                        sv.sum_strat[i][c * na + a] += r * sv.cur[so + c * na + a];
                     }
                 }
             }
@@ -597,39 +609,43 @@ impl<'a> Solver<'a> {
             fill[ch] += 1;
         }
 
-        // Config support of each public child: the union over the private
-        // actions that produce that observation.
+        // Config support of each public child — the union over the private
+        // actions that produce that observation — and, in the same pass, where
+        // each (config, action) cell lands in it.
+        //
+        // Ordering by integer key and reading the support off that single
+        // ordering is what the draw transitions do, and for the same reason:
+        // the obvious version sorts `Config`s and then binary-searches one per
+        // cell, which at ~800 cells per decision node is most of the build.
         let mut child_cfgs: Vec<Vec<Config>> = vec![Vec::new(); nch];
-        for (ci, c) in mine.iter().enumerate() {
-            for a in 0..na {
-                if !legal[ci * na + a] {
-                    continue;
-                }
-                if let Some(n) = advance_config(c, aslot[a], fdown[a]) {
-                    child_cfgs[obs_child[a]].push(n);
-                }
-            }
-        }
-        for v in child_cfgs.iter_mut() {
-            v.sort_unstable();
-            v.dedup();
-        }
-
         let mut trans = vec![-1i32; nc * na];
-        for (ci, c) in mine.iter().enumerate() {
-            for a in 0..na {
-                if !legal[ci * na + a] {
-                    continue;
-                }
-                if let Some(n) = advance_config(c, aslot[a], fdown[a]) {
-                    let ch = obs_child[a];
-                    trans[ci * na + a] = child_cfgs[ch]
-                        .binary_search(&n)
-                        .map(|x| x as i32)
-                        .unwrap_or(-1);
+        let mut ent = std::mem::take(&mut self.cell_order);
+        for ch in 0..nch {
+            ent.clear();
+            for &au in &obs_act[obs_start[ch] as usize..obs_start[ch + 1] as usize] {
+                let a = au as usize;
+                for ci in 0..nc {
+                    if !legal[ci * na + a] {
+                        continue;
+                    }
+                    if let Some(n) = advance_config(&mine[ci], aslot[a], fdown[a]) {
+                        ent.push((n.key(), (ci * na + a) as u32));
+                    }
                 }
             }
+            ent.sort_unstable();
+            let sup = &mut child_cfgs[ch];
+            let mut prev = u64::MAX;
+            for &(k, cell) in ent.iter() {
+                if k != prev {
+                    prev = k;
+                    let (ci, a) = (cell as usize / na, cell as usize % na);
+                    sup.push(advance_config(&mine[ci], aslot[a], fdown[a]).unwrap());
+                }
+                trans[cell as usize] = (sup.len() - 1) as i32;
+            }
         }
+        self.cell_order = ent;
 
         // One world per public child, built from any config that can produce
         // it: the public projection of the successor is the same either way.
@@ -722,7 +738,7 @@ impl<'a> Solver<'a> {
                 }
                 continue;
             }
-            let cur = &self.cur[i];
+            let cur = &self.cur[self.soff[i] as usize..];
             for ch in 0..n.child.len() {
                 let c = n.child[ch];
                 debug_assert!(c > i);
@@ -940,7 +956,11 @@ impl<'a> Solver<'a> {
             self.vals[vbase..vbase + nc].fill(0.0);
             if me == traverser {
                 let n = &self.nodes[i];
-                let (regret, cur) = (&mut self.regret[i], &self.cur[i]);
+                let so = self.soff[i] as usize;
+                let (regret, cur) = (
+                    &mut self.regret[so..],
+                    &self.cur[so..],
+                );
                 // Children are built after their parent, so the parent's value
                 // row and every child's are disjoint slices of one arena.
                 let (lo, hi) = self.vals.split_at_mut(self.voff[i + 1] as usize);
@@ -1003,7 +1023,9 @@ impl<'a> Solver<'a> {
                     continue;
                 }
                 let (na, nc) = (n.na(), n.nc(traverser));
-                let (regret, cur) = (&mut self.regret[i], &mut self.cur[i]);
+                let so = self.soff[i] as usize;
+                let regret = &mut self.regret[so..];
+                let cur = &mut self.cur[so..];
                 for c in 0..nc {
                     let mut sum = 0.0;
                     for a in 0..na {
@@ -1044,11 +1066,12 @@ impl<'a> Solver<'a> {
                     continue;
                 }
                 let (na, nc) = (n.na(), n.nc(traverser));
+                let so = self.soff[i] as usize;
                 for c in 0..nc {
                     let r = self.reach_of(i, traverser)[c];
                     let mut sum = 0.0;
                     for a in 0..na {
-                        self.sum_strat[i][c * na + a] += r * self.cur[i][c * na + a];
+                        self.sum_strat[i][c * na + a] += r * self.cur[so + c * na + a];
                         sum += self.sum_strat[i][c * na + a];
                     }
                     if sum > 0.0 {
@@ -1100,7 +1123,8 @@ impl<'a> Solver<'a> {
     /// reference that is the current regret-matching iterate, not the average.
     pub fn sampling_strategy(&self, node: usize, c: usize) -> &[f32] {
         let na = self.nodes[node].na();
-        &self.cur[node][c * na..(c + 1) * na]
+        let so = self.soff[node] as usize;
+        &self.cur[so + c * na..so + (c + 1) * na]
     }
 
     /// The CFR average strategy: the approximate equilibrium of the subgame.

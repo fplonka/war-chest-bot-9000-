@@ -719,6 +719,13 @@ pub fn write_belief_block(
     out.fill(0.0);
     let tot: f32 = w.iter().sum();
     let unif = 1.0 / w.len().max(1) as f32;
+    // Each config's own bag, then the belief-weighted average — *not* the
+    // algebraically equal `reserve - E[hand] - E[facedown]`. That form is
+    // cheaper and numerically wrong exactly where it matters: when a player's
+    // whole reserve is in hand and face-down, every config's bag is empty and
+    // the composition is defined to stay zero, but the subtraction leaves a
+    // rounding residue of ~1e-7 per slot, which then *normalises to one*.
+    // `belief_block_matches_the_direct_definition` pins this.
     let (mut bag, mut fd) = ([0.0f32; NSLOT], [0.0f32; NSLOT]);
     for (ci, c) in cfg.iter().enumerate() {
         let p = if tot > SMOOTH { w[ci] / tot } else { unif };

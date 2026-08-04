@@ -310,3 +310,72 @@ fn compare(
         }
     }
 }
+
+/// The belief block the solver writes per leaf per CFR iteration must equal the
+/// straightforward definition: the hand-key marginal, and the belief-weighted
+/// bag and face-down composition.
+///
+/// `write_belief_block` accumulates the two hidden components and derives the
+/// bag as `reserve - E[hand] - E[facedown]` instead of forming each config's
+/// bag first — half the arithmetic in a loop that runs once per leaf per player
+/// per iteration, but a different expression, so it gets an oracle.
+#[test]
+fn belief_block_matches_the_direct_definition() {
+    let mut rng = Rng::new(0xB33F);
+    let mut checked = 0usize;
+    for seed in 0..400u64 {
+        let mut r = Rng::new(seed.wrapping_mul(0x9E37_79B9));
+        let reserve: [u8; NSLOT] = std::array::from_fn(|_| r.below(6) as u8);
+        let hand_size = r.below(4) as u8;
+        let fd_size = r.below(4) as u8;
+        let cfgs = enumerate_configs(&reserve, hand_size, fd_size);
+        if cfgs.is_empty() {
+            continue;
+        }
+        // Unnormalised weights, including the all-zero case the smoothing
+        // fallback exists for.
+        let w: Vec<f32> = if seed % 17 == 0 {
+            vec![0.0; cfgs.len()]
+        } else {
+            cfgs.iter().map(|_| rng.unit_f64() as f32).collect()
+        };
+
+        let mut got = vec![0.0f32; BELIEF_DIM];
+        write_belief_block(&cfgs, None, &w, &reserve, &mut got);
+
+        let mut bel = Belief {
+            cfg: cfgs.clone(),
+            p: w.clone(),
+        };
+        bel.normalize();
+        let hm = bel.hand_marginal();
+        let (bag, fd) = bel.composition(&reserve);
+        for h in 0..NHAND {
+            assert!(
+                (got[h] - hm[h]).abs() < 2e-6,
+                "hand marginal {} differs: {} vs {}",
+                h,
+                got[h],
+                hm[h]
+            );
+        }
+        for k in 0..NSLOT {
+            assert!(
+                (got[NHAND + k] - bag[k]).abs() < 2e-6,
+                "bag composition {} differs: {} vs {}",
+                k,
+                got[NHAND + k],
+                bag[k]
+            );
+            assert!(
+                (got[NHAND + NSLOT + k] - fd[k]).abs() < 2e-6,
+                "face-down composition {} differs: {} vs {}",
+                k,
+                got[NHAND + NSLOT + k],
+                fd[k]
+            );
+        }
+        checked += 1;
+    }
+    assert!(checked > 100, "only {} belief blocks exercised", checked);
+}
