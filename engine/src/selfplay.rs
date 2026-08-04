@@ -23,7 +23,7 @@
 //!     Without it the value network is noise, CFR plays without purpose, and
 //!     games only ever end at the horizon.
 //!   * `Collect::Rebel` — the ReBeL loop proper: value targets are the CFR
-//!     subgame root values, projected onto the network's hand-key basis.
+//!     subgame root values, one per config in each player's belief support.
 
 use crate::actions::Action;
 use crate::board::{board, NONE, N_HEXES};
@@ -241,14 +241,28 @@ pub enum Collect {
     Rebel,
 }
 
+/// One training row is a public state plus, for each player, that player's
+/// whole belief: the exact configs in support, their probabilities, and the
+/// value the solve gave each one. Nothing is projected onto a fixed-width
+/// basis, so the row carries the same information the solver had.
+///
+/// The config lists are ragged — a belief support runs from one config to a few
+/// hundred — so they live in one flat arena indexed by `coff`, which holds
+/// `2 * n + 1` offsets: row `r`, player `p` spans `coff[2*r+p] .. coff[2*r+p+1]`.
 #[derive(Default)]
 pub struct Data {
-    /// `[n, FEAT]` PBS encodings.
+    /// `[n, PUBFEAT]` public encodings.
     pub vx: Vec<f32>,
-    /// `[n, 2 * NHAND]` per-hand values, player 0 then player 1.
-    pub vy: Vec<f32>,
-    /// `[n, 2 * NHAND]` mask: which hand keys the belief actually supports.
-    pub vm: Vec<f32>,
+    /// `[total_configs, CCOUNTS]` raw counts per config, in the arena order.
+    /// Raw rather than normalised: they are `u8`-valued, and storing them that
+    /// way is what keeps a replay row small enough to hold millions of them.
+    pub cc: Vec<u8>,
+    /// `[total_configs]` belief probability of each config.
+    pub cw: Vec<f32>,
+    /// `[total_configs]` the solve's value for each config.
+    pub cy: Vec<f32>,
+    /// `[2 * n + 1]` arena offsets.
+    pub coff: Vec<u32>,
     pub nv: usize,
     pub games: usize,
     pub decisions: usize,
@@ -260,9 +274,17 @@ pub struct Data {
 
 impl Data {
     pub fn merge(&mut self, o: Data) {
+        let base = self.cw.len() as u32;
         self.vx.extend(o.vx);
-        self.vy.extend(o.vy);
-        self.vm.extend(o.vm);
+        self.cc.extend(o.cc);
+        self.cw.extend(o.cw);
+        self.cy.extend(o.cy);
+        // Both sides carry a leading zero; the merged arena has exactly one, so
+        // the other's is dropped. `coff` must stay `2 * nv + 1` long or every
+        // row after the join is read with somebody else's configs.
+        let tail = if self.coff.is_empty() { 0 } else { 1 };
+        self.coff
+            .extend(o.coff.iter().skip(tail).map(|x| x + base));
         self.nv += o.nv;
         self.games += o.games;
         self.decisions += o.decisions;
@@ -273,27 +295,34 @@ impl Data {
         self.configs += o.configs;
     }
 
-    /// `y[p]` holds one value per *config* in `bel[p]`; project it onto the
-    /// network's hand-key basis by belief-weighted averaging, which is what the
-    /// query encoding's information bottleneck requires.
+    /// `y[p]` holds one value per *config* in `bel[p]`. Every one of them is
+    /// stored: the value function is a function of the config, so there is
+    /// nothing to average away.
     fn push_value(&mut self, s: &State, ctx: &Ctx, bel: &[Belief; 2], y: [&[f32]; 2]) {
         let base = self.vx.len();
-        self.vx.resize(base + FEAT, 0.0);
-        write_features(s, ctx, bel, &mut self.vx[base..base + FEAT]);
+        self.vx.resize(base + PUBFEAT, 0.0);
+        write_public_features(s, ctx, &mut self.vx[base..base + PUBFEAT]);
+        if self.coff.is_empty() {
+            self.coff.push(0);
+        }
         for p in 0..2 {
-            let (mut num, mut den) = ([0.0f32; NHAND], [0.0f32; NHAND]);
+            let res = reserve(s, p as u8, ctx);
+            let mut cnt = [0u8; CCOUNTS];
             for (ci, c) in bel[p].cfg.iter().enumerate() {
-                let h = c.hand_index();
-                num[h] += bel[p].p[ci] * y[p][ci];
-                den[h] += bel[p].p[ci];
+                config_counts(c, &res, &mut cnt);
+                self.cc.extend_from_slice(&cnt);
+                self.cw.push(bel[p].p[ci]);
+                self.cy.push(y[p][ci]);
             }
-            for h in 0..NHAND {
-                self.vy
-                    .push(if den[h] > 0.0 { num[h] / den[h] } else { 0.0 });
-                self.vm.push(if den[h] > 0.0 { 1.0 } else { 0.0 });
-            }
+            self.coff.push(self.cw.len() as u32);
         }
         self.nv += 1;
+    }
+
+    /// The config range of row `r`, player `p`, in the arena.
+    #[inline]
+    pub fn row_span(&self, r: usize, p: usize) -> std::ops::Range<usize> {
+        self.coff[2 * r + p] as usize..self.coff[2 * r + p + 1] as usize
     }
 }
 
@@ -573,25 +602,13 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
         // outcome. This is the warm start only — ReBeL-phase targets come
         // entirely from the subgame solve.
         let m = gc.eval_mix.clamp(0.0, 1.0);
-        for r in from_row..data.nv {
-            let base = r * 2 * NHAND;
-            for h in 0..NHAND {
-                data.vy[base + h] = m * data.vy[base + h] + (1.0 - m) * z;
-                data.vy[base + NHAND + h] = m * data.vy[base + NHAND + h] - (1.0 - m) * z;
-            }
-        }
+        blend_outcome(data, from_row, m, 1.0 - m, z);
     }
     if gc.collect == Collect::Rebel && gc.mc_mix > 0.0 {
         // Anchor the pure bootstrap target to the realised outcome
         // (TD(lambda)-style), blended in once per game.
         let m = gc.mc_mix.clamp(0.0, 1.0);
-        for r in from_row..data.nv {
-            let base = r * 2 * NHAND;
-            for h in 0..NHAND {
-                data.vy[base + h] = (1.0 - m) * data.vy[base + h] + m * z;
-                data.vy[base + NHAND + h] = (1.0 - m) * data.vy[base + NHAND + h] - m * z;
-            }
-        }
+        blend_outcome(data, from_row, 1.0 - m, m, z);
     }
     data.games += 1;
     if s.main_plays >= crate::state::MAX_MAIN_PLAYS {
@@ -602,6 +619,20 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
         None => data.draws += 1,
     }
     z
+}
+
+/// `y <- keep * y + mix * (+-z)` over every config of every row this game
+/// produced. The sign flips for player 1: `z` is White's outcome and the
+/// targets are per-player utilities of a zero-sum game.
+fn blend_outcome(data: &mut Data, from_row: usize, keep: f32, mix: f32, z: f32) {
+    for r in from_row..data.nv {
+        for p in 0..2 {
+            let sign = if p == 0 { 1.0 } else { -1.0 };
+            for i in data.row_span(r, p) {
+                data.cy[i] = keep * data.cy[i] + mix * sign * z;
+            }
+        }
+    }
 }
 
 fn resolve_chance(s: &mut State, player: u8, rng: &mut Rng) {

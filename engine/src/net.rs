@@ -1,28 +1,51 @@
-//! A minimal batched MLP for inference inside the Rust self-play workers.
+//! The value network, for inference inside the Rust self-play workers.
 //!
 //! Training happens in PyTorch; the learned weights are pushed here as flat f32
-//! row-major matrices (`w[l]` is `[in_dim * out_dim]`, i.e. already transposed
-//! from torch's `[out, in]` layout). Forward is ReLU on every layer but the
-//! last. On macOS the matmul goes through Accelerate's BLAS; elsewhere a plain
-//! triple loop keeps the crate dependency-free.
+//! row-major `[in, out]` matrices (torch's `weight.t()`). On macOS the matmuls
+//! go through Accelerate's BLAS; elsewhere a plain triple loop keeps the crate
+//! dependency-free.
 //!
-//! # The split forward
+//! # Shape
 //!
-//! Inside a CFR solve the same leaf is queried once per iteration, and between
-//! iterations only the *belief* part of its encoding moves — the public part is
-//! a property of the leaf's state and is fixed for the whole solve. Since the
-//! belief block is the last `split` inputs and `w[0]` is input-major, the first
-//! layer factorises as
+//! The network answers `v(PBS, config)`: the counterfactual value of one
+//! player's exact private state at a public belief state. It has two towers.
 //!
 //! ```text
-//! h = x_pub · W_pub  +  x_bel · W_bel
-//!     ^^^^^^^^^^^^^   computed once per solve, reused every iteration
+//!   config tower:  z(c)  = relu(phi(c) Wc + bc)                 [dg]
+//!                  g(c)  = z(c) Wg + bg                         [rank + 1]
+//!
+//!   PBS tower:     hpub  = relu(LN(x_pub W0 + b0)) W1
+//!                  e_p   = sum_c beta_p(c) z(c)                 [dg] per player
+//!                  h     = relu(LN(hpub + [e_0; e_1] Wb + b1))  [hidden]
+//!                  u     = h Wu + bu                            [rank]
+//!
+//!   value:         v(c)  = <u, g(c)[..rank]> + g(c)[rank]
 //! ```
 //!
-//! With `FEAT = 812` and a 132-wide belief block that removes 84% of the first
-//! layer, which is the widest one. `prefix` computes the cached half and
-//! `forward_split` the rest — and the latter also emits only the one output
-//! head a CFR traversal actually reads.
+//! This is the reference implementation's shape, generalised. `csrc/liars_dice`
+//! ends in `hidden -> num_hands`, which is exactly `<h, W2[:, c]> + b2[c]` — an
+//! embedding *table* over private states. War Chest's private states do not fit
+//! in a table (hand times face-down runs to ~145k and varies by draft), so the
+//! table becomes an embedding *network* `g`. The belief is the same substitution
+//! on the input side: instead of a fixed-length vector of per-private-state
+//! probabilities, it is the belief-weighted sum of the same config embeddings.
+//!
+//! `rank` is where the two sides meet, and it is the one dimension that has to
+//! be chosen rather than inherited. The reference gets `rank = hidden` for free
+//! because its readout is a lookup; here every config costs a `rank`-long dot
+//! product, per leaf, per iteration. A config is described by sixteen numbers,
+//! so 64 is not a binding constraint on what the value can depend on — and it
+//! is 6x less per-config work than tying it to the hidden width.
+//!
+//! # What is cached, and why the shape is arranged this way
+//!
+//! Inside a CFR solve the same leaf is queried once per iteration and only the
+//! beliefs move. Three things therefore survive the whole solve and are computed
+//! once: the public tower `hpub` (the widest matmul in the network), and both
+//! `z(c)` and `g(c)` for every config in the tree — a config's features do not
+//! depend on the iteration. Per iteration what remains is one `2*dg -> hidden`
+//! matmul per leaf, one LayerNorm, and one dot product per config. That is less
+//! per-iteration work than the fixed-width output head it replaces.
 
 #[cfg(target_vendor = "apple")]
 #[link(name = "Accelerate", kind = "framework")]
@@ -111,72 +134,6 @@ fn gemm_ld(
 
 /// Must match `torch.nn.LayerNorm`'s default.
 const LN_EPS: f32 = 1e-5;
-
-/// Read the flat weight dump `train/export_weights.py` writes:
-///
-/// ```text
-/// u32 n_dims, n_dims * u32 dims, u32 split,
-/// u32 n_w, n_w * f32,   u32 n_b, n_b * f32,   u32 n_ln, n_ln * f32
-/// ```
-///
-/// Weights are per layer, row-major `[in, out]`, with the belief projection
-/// last; LayerNorm ships weight then bias per hidden layer, in layer order.
-/// Same ordering as `Mlp.push`, so an offline tool measures exactly the network
-/// the trainer ships to the workers.
-impl Mlp {
-    pub fn load_bin(path: &str) -> std::io::Result<Mlp> {
-        let raw = std::fs::read(path)?;
-        let mut at = 0usize;
-        let u32_at = |b: &[u8], at: &mut usize| -> usize {
-            let v = u32::from_le_bytes(b[*at..*at + 4].try_into().unwrap()) as usize;
-            *at += 4;
-            v
-        };
-        let f32s_at = |b: &[u8], at: &mut usize| -> Vec<f32> {
-            let n = u32_at(b, at);
-            let v = (0..n)
-                .map(|i| f32::from_le_bytes(b[*at + i * 4..*at + i * 4 + 4].try_into().unwrap()))
-                .collect();
-            *at += n * 4;
-            v
-        };
-        let nd = u32_at(&raw, &mut at);
-        let dims: Vec<usize> = (0..nd).map(|_| u32_at(&raw, &mut at)).collect();
-        let split = u32_at(&raw, &mut at);
-        let (w, b, ln) = (
-            f32s_at(&raw, &mut at),
-            f32s_at(&raw, &mut at),
-            f32s_at(&raw, &mut at),
-        );
-        let mut mlp = Mlp {
-            dims: dims.clone(),
-            w: Vec::new(),
-            b: Vec::new(),
-            ln_w: Vec::new(),
-            ln_b: Vec::new(),
-            split,
-            wb: Vec::new(),
-        };
-        let (mut wi, mut bi) = (0usize, 0usize);
-        for l in 0..dims.len() - 1 {
-            let (i, o) = (dims[l], dims[l + 1]);
-            mlp.w.push(w[wi..wi + i * o].to_vec());
-            mlp.b.push(b[bi..bi + o].to_vec());
-            wi += i * o;
-            bi += o;
-        }
-        mlp.wb = w[wi..wi + split * dims[1]].to_vec();
-        let mut li = 0usize;
-        for l in 0..dims.len() - 2 {
-            let o = dims[l + 1];
-            mlp.ln_w.push(ln[li..li + o].to_vec());
-            li += o;
-            mlp.ln_b.push(ln[li..li + o].to_vec());
-            li += o;
-        }
-        Ok(mlp)
-    }
-}
 
 // ------------------------------------------------- LayerNorm kernels
 //
@@ -309,6 +266,69 @@ fn relu(row: &mut [f32]) {
     }
 }
 
+/// `sum(a * b)`. Written like the LayerNorm kernels above and for the same
+/// reason: this is the per-config readout, so it runs once per config per leaf
+/// per CFR iteration, and a serial reduction chain 384 long is the whole cost.
+#[inline]
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len();
+    debug_assert!(b.len() >= n);
+    let mut i = 0usize;
+    let mut s = 0.0f32;
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let (mut s0, mut s1) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+        let (p, q) = (a.as_ptr(), b.as_ptr());
+        while i + 8 <= n {
+            s0 = vfmaq_f32(s0, vld1q_f32(p.add(i)), vld1q_f32(q.add(i)));
+            s1 = vfmaq_f32(s1, vld1q_f32(p.add(i + 4)), vld1q_f32(q.add(i + 4)));
+            i += 8;
+        }
+        s = vaddvq_f32(vaddq_f32(s0, s1));
+    }
+    while i < n {
+        s += a[i] * b[i];
+        i += 1;
+    }
+    s
+}
+
+/// `out = sum_i w[i] * z[idx[i] * n ..][..n]` — the belief embedding.
+///
+/// One of the two hot loops of a solve: it runs once per leaf per player per
+/// CFR iteration over a support averaging ~20 configs, and it is a gather
+/// followed by an axpy, which is exactly the shape LLVM leaves scalar. Two
+/// accumulator lanes, unrolled by eight, the same treatment the LayerNorm
+/// reductions needed.
+pub fn accumulate(z: &[f32], idx: &[u32], w: &[f32], n: usize, out: &mut [f32]) {
+    debug_assert_eq!(idx.len(), w.len());
+    debug_assert_eq!(out.len(), n);
+    out.fill(0.0);
+    for (c, &i) in idx.iter().enumerate() {
+        let src = &z[i as usize * n..i as usize * n + n];
+        let wc = w[c];
+        let mut k = 0usize;
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            use std::arch::aarch64::*;
+            let vw = vdupq_n_f32(wc);
+            let (p, q) = (out.as_mut_ptr(), src.as_ptr());
+            while k + 8 <= n {
+                let a0 = vfmaq_f32(vld1q_f32(p.add(k)), vld1q_f32(q.add(k)), vw);
+                let a1 = vfmaq_f32(vld1q_f32(p.add(k + 4)), vld1q_f32(q.add(k + 4)), vw);
+                vst1q_f32(p.add(k), a0);
+                vst1q_f32(p.add(k + 4), a1);
+                k += 8;
+            }
+        }
+        while k < n {
+            out[k] += wc * src[k];
+            k += 1;
+        }
+    }
+}
+
 /// Grow `v` to at least `n` without ever re-zeroing what is already there.
 /// Every buffer here is fully overwritten by the matmul that follows, so the
 /// `clear() + resize()` this replaces was a megabyte-scale memset per call.
@@ -319,132 +339,215 @@ fn fit(v: &mut Vec<f32>, n: usize) {
     }
 }
 
+
+/// The value network. See the module docs for the shape; the field names here
+/// are the same symbols.
+///
+/// Every matrix is row-major `[in, out]`. `dims` is `[pub_dim, hidden, cfeat,
+/// dg, rank]` and is the single source of truth for every buffer size, so the
+/// trainer and the workers agree on the layout from one array.
 #[derive(Clone, Default)]
 pub struct Mlp {
-    /// Layer dimensions: `dims[0]` is the input width, `dims[L]` the output.
+    /// `[pub_dim, hidden, cfeat, dg, rank]`.
     pub dims: Vec<usize>,
-    /// `w[l]`: row-major `[dims[l] * dims[l+1]]`.
-    pub w: Vec<Vec<f32>>,
-    /// `b[l]`: `[dims[l+1]]`.
-    pub b: Vec<Vec<f32>>,
-    /// LayerNorm weight/bias for each hidden layer (`dims.len() - 2` of them,
-    /// applied after the affine and before the activation, matching the
-    /// reference implementation's `use_layer_norm`). Empty means no norm, which
-    /// keeps older checkpoints loading unchanged.
-    pub ln_w: Vec<Vec<f32>>,
-    pub ln_b: Vec<Vec<f32>>,
-    /// Width of the belief block, the tail of the PBS encoding. `dims[0]` is
-    /// the *public* width, so the whole query is `dims[0] + split` wide.
-    pub split: usize,
-    /// `[split * dims[1]]`: the belief block's connection into the second
-    /// hidden layer, row-major.
-    pub wb: Vec<f32>,
-}
-
-/// Test/benchmark hook for the raw matmul.
-#[allow(clippy::too_many_arguments)]
-pub fn gemm_probe(
-    m: usize,
-    n: usize,
-    k: usize,
-    a: &[f32],
-    lda: usize,
-    b: &[f32],
-    ldb: usize,
-    c: &mut [f32],
-    ldc: usize,
-) {
-    gemm_ld(m, n, k, a, lda, b, ldb, 0.0, c, ldc);
+    /// Public tower.
+    w0: Vec<f32>,
+    b0: Vec<f32>,
+    ln0_w: Vec<f32>,
+    ln0_b: Vec<f32>,
+    w1: Vec<f32>,
+    b1: Vec<f32>,
+    ln1_w: Vec<f32>,
+    ln1_b: Vec<f32>,
+    /// `[2 * dg, hidden]`: both players' belief embeddings into the hidden
+    /// layer. No bias — it is added to a layer that already has one.
+    wb: Vec<f32>,
+    /// Config tower: `[cfeat, dg]` and its bias.
+    wc: Vec<f32>,
+    bc: Vec<f32>,
+    /// Readout embedding: `[dg, rank + 1]` and its bias. The trailing column is
+    /// the per-config bias term, which is why this is `rank + 1` and not `rank`.
+    wg: Vec<f32>,
+    bg: Vec<f32>,
+    /// The PBS side of the readout: `[hidden, rank]` and its bias.
+    wu: Vec<f32>,
+    bu: Vec<f32>,
 }
 
 impl Mlp {
-    /// Test/benchmark hook for the elementwise pass.
-    pub fn activate_probe(&self, l: usize, rows: usize, add: Option<&[f32]>, out: &mut [f32]) {
-        self.activate(l, rows, add, out);
+    /// Build from the flat arrays the trainer ships. `w` is every matrix
+    /// concatenated in the order `W0, W1, Wb, Wc, Wg`; `b` is `b0, b1, bc, bg`;
+    /// `ln` is `LN0.weight, LN0.bias, LN1.weight, LN1.bias`.
+    ///
+    /// One function builds the network for both entry points — the pyo3
+    /// `set_weights` and the `.bin` loader — so there is nowhere for the two to
+    /// drift apart.
+    pub fn from_flat(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Mlp, String> {
+        if dims.len() != 5 {
+            return Err(format!(
+                "expected 5 dims [pub, hidden, cfeat, dg, rank], got {dims:?}"
+            ));
+        }
+        let (p, h, cf, dg, rk) = (dims[0], dims[1], dims[2], dims[3], dims[4]);
+        let want_w = p * h + h * h + 2 * dg * h + cf * dg + dg * (rk + 1) + h * rk;
+        let want_b = h + h + dg + (rk + 1) + rk;
+        let want_ln = 4 * h;
+        if w.len() != want_w || b.len() != want_b || ln.len() != want_ln {
+            return Err(format!(
+                "weight sizes {}/{}/{} do not match dims {dims:?} (want {want_w}/{want_b}/{want_ln})",
+                w.len(),
+                b.len(),
+                ln.len()
+            ));
+        }
+        let mut wi = 0usize;
+        let mut take = |n: usize| {
+            let v = w[wi..wi + n].to_vec();
+            wi += n;
+            v
+        };
+        let (w0, w1, wb, wc, wg, wu) = (
+            take(p * h),
+            take(h * h),
+            take(2 * dg * h),
+            take(cf * dg),
+            take(dg * (rk + 1)),
+            take(h * rk),
+        );
+        Ok(Mlp {
+            dims: dims.to_vec(),
+            w0,
+            b0: b[..h].to_vec(),
+            ln0_w: ln[..h].to_vec(),
+            ln0_b: ln[h..2 * h].to_vec(),
+            w1,
+            b1: b[h..2 * h].to_vec(),
+            ln1_w: ln[2 * h..3 * h].to_vec(),
+            ln1_b: ln[3 * h..4 * h].to_vec(),
+            wb,
+            wc,
+            bc: b[2 * h..2 * h + dg].to_vec(),
+            wg,
+            bg: b[2 * h + dg..2 * h + dg + rk + 1].to_vec(),
+            wu,
+            bu: b[2 * h + dg + rk + 1..].to_vec(),
+        })
     }
 
-    /// Width of the whole query — public part plus belief block.
-    pub fn in_dim(&self) -> usize {
-        self.dims[0] + self.split
+    /// Read the flat weight dump `train/export_weights.py` writes:
+    ///
+    /// ```text
+    /// u32 n_dims, n_dims * u32 dims,
+    /// u32 n_w, n_w * f32,   u32 n_b, n_b * f32,   u32 n_ln, n_ln * f32
+    /// ```
+    pub fn load_bin(path: &str) -> std::io::Result<Mlp> {
+        let raw = std::fs::read(path)?;
+        let mut at = 0usize;
+        let u32_at = |b: &[u8], at: &mut usize| -> usize {
+            let v = u32::from_le_bytes(b[*at..*at + 4].try_into().unwrap()) as usize;
+            *at += 4;
+            v
+        };
+        let f32s_at = |b: &[u8], at: &mut usize| -> Vec<f32> {
+            let n = u32_at(b, at);
+            let v = (0..n)
+                .map(|i| f32::from_le_bytes(b[*at + i * 4..*at + i * 4 + 4].try_into().unwrap()))
+                .collect();
+            *at += n * 4;
+            v
+        };
+        let nd = u32_at(&raw, &mut at);
+        let dims: Vec<usize> = (0..nd).map(|_| u32_at(&raw, &mut at)).collect();
+        let (w, b, ln) = (
+            f32s_at(&raw, &mut at),
+            f32s_at(&raw, &mut at),
+            f32s_at(&raw, &mut at),
+        );
+        Mlp::from_flat(&dims, &w, &b, &ln)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
-    /// Width of the public part alone.
-    pub fn pub_dim(&self) -> usize {
-        self.dims[0]
-    }
-    pub fn out_dim(&self) -> usize {
-        self.dims[self.dims.len() - 1]
-    }
+
     pub fn is_empty(&self) -> bool {
         self.dims.is_empty()
+    }
+    /// Width of the public encoding.
+    pub fn pub_dim(&self) -> usize {
+        self.dims[0]
     }
     pub fn hidden(&self) -> usize {
         self.dims[1]
     }
+    /// Width of one config vector.
+    pub fn cfeat(&self) -> usize {
+        self.dims[2]
+    }
+    /// Width of a config embedding, and of one player's belief block.
+    pub fn dg(&self) -> usize {
+        self.dims[3]
+    }
+    /// Width of the value readout's inner product.
+    pub fn rank(&self) -> usize {
+        self.dims[4]
+    }
+    /// Width of both players' belief blocks together.
+    pub fn belief_dim(&self) -> usize {
+        2 * self.dims[3]
+    }
 
-    /// Bias (plus an optional cached addend) + optional LayerNorm + optional
-    /// ReLU, in place over `rows x n`.
+    /// LayerNorm + ReLU over `rows x n`, in place, with an optional cached
+    /// addend folded into the bias pass.
     ///
-    /// This is written for the vectoriser, not for brevity, because it is the
-    /// hot half of inference: the matmuls around it run at ~1.3 Tflop/s through
-    /// AMX, and a straightforward `row.iter().sum()` LayerNorm — a serial chain
-    /// of 3-cycle adds, 384 long, twice per row — took **five times** as long as
-    /// all three matmuls put together. `LANES` independent accumulators break
-    /// the chain and let the reductions run in NEON registers. The
-    /// re-association changes the last bits of the LayerNorm statistics;
-    /// `train/test_parity.py` bounds the result against torch.
-    fn activate(&self, l: usize, rows: usize, add: Option<&[f32]>, out: &mut [f32]) {
-        let n = self.dims[l + 1];
-        let last = l + 1 == self.w.len();
-        let bias = &self.b[l];
-        let norm = if last || self.ln_w.is_empty() {
-            None
-        } else {
-            Some((&self.ln_w[l], &self.ln_b[l]))
-        };
+    /// Written for the vectoriser, not for brevity, because it is the hot half
+    /// of inference: the matmuls run at ~1.3 Tflop/s through AMX, and a
+    /// straightforward `row.iter().sum()` LayerNorm — a serial chain of 3-cycle
+    /// adds, 384 long, twice per row — took **five times** as long as all the
+    /// matmuls put together. The re-association changes the last bits of the
+    /// statistics; `train/test_parity.py` bounds the result against torch.
+    fn ln_relu(&self, rows: usize, n: usize, bias: &[f32], g: &[f32], bt: &[f32],
+               add: Option<&[f32]>, out: &mut [f32]) {
         let inv_n = 1.0 / n as f32;
         for r in 0..rows {
             let row = &mut out[r * n..r * n + n];
             let sum = add_bias_sum(row, bias, add.map(|a| &a[r * n..r * n + n]));
-            // LayerNorm over the feature dimension, then the activation.
             // Biased variance (divide by n, not n-1) to match torch.
-            if let Some((g, bt)) = norm {
-                let mean = sum * inv_n;
-                let var = sq_dev(row, mean) * inv_n;
-                let inv = 1.0 / (var + LN_EPS).sqrt();
-                // Scale, shift and (for a hidden layer) rectify in one pass.
-                let floor = if last { f32::NEG_INFINITY } else { 0.0 };
-                scale_shift(row, mean, inv, g, bt, floor);
-            } else if !last {
-                relu(row);
+            let mean = sum * inv_n;
+            let var = sq_dev(row, mean) * inv_n;
+            let inv = 1.0 / (var + LN_EPS).sqrt();
+            scale_shift(row, mean, inv, g, bt, 0.0);
+        }
+    }
+
+    /// The config tower, for `n` config vectors (`phi` is `[n * cfeat]`).
+    /// Produces the belief embedding `z` (`[n * dg]`) and the readout embedding
+    /// `g` (`[n * (rank + 1)]`).
+    ///
+    /// A config's features do not depend on the CFR iteration, so a solve runs
+    /// this once for every config in its tree and then never again.
+    pub fn embed(&self, phi: &[f32], n: usize, z: &mut Vec<f32>, g: &mut Vec<f32>) {
+        let (h, cf, dg) = (self.rank(), self.cfeat(), self.dg());
+        debug_assert_eq!(phi.len(), n * cf);
+        fit(z, n * dg);
+        gemm_ld(n, dg, cf, phi, cf, &self.wc, dg, 0.0, &mut z[..n * dg], dg);
+        for r in 0..n {
+            let row = &mut z[r * dg..r * dg + dg];
+            for (x, b) in row.iter_mut().zip(self.bc.iter()) {
+                *x += *b;
+            }
+            relu(row);
+        }
+        fit(g, n * (h + 1));
+        gemm_ld(n, h + 1, dg, z, dg, &self.wg, h + 1, 0.0, &mut g[..n * (h + 1)], h + 1);
+        for r in 0..n {
+            let row = &mut g[r * (h + 1)..(r + 1) * (h + 1)];
+            for (x, b) in row.iter_mut().zip(self.bg.iter()) {
+                *x += *b;
             }
         }
     }
 
-    /// Forward `rows` samples (`x` is `[rows * in_dim]` row-major, public part
-    /// then belief block) into `out` (`[rows * out_dim]`). Used for the torch
-    /// parity check and by callers with no solve to amortise over; the solver
-    /// goes through `trunk` + `forward_split`.
-    pub fn forward(&self, x: &[f32], rows: usize, scratch: &mut Vec<f32>, out: &mut Vec<f32>) {
-        let feat = self.in_dim();
-        debug_assert_eq!(x.len(), rows * feat);
-        let mut xbel = Vec::with_capacity(rows * self.split);
-        for r in 0..rows {
-            xbel.extend_from_slice(&x[r * feat + self.dims[0]..(r + 1) * feat]);
-        }
-        let mut pre = Vec::new();
-        self.trunk(x, rows, feat, scratch, &mut pre);
-        self.forward_split(&xbel, rows, &pre, 0..self.out_dim(), scratch, out);
-        out.truncate(rows * self.out_dim());
-    }
-
-    /// The whole public tower: `relu(LN(xpub·W0 + b0))` pushed through `W1`,
-    /// leaving the second hidden layer's pre-activation minus its bias and
-    /// minus the belief block's contribution.
-    ///
-    /// This is the point of the architecture. A leaf's public encoding is fixed
-    /// for the whole solve while its beliefs move every CFR iteration, so
-    /// everything here is computed once per leaf per solve and only the belief
-    /// projection and the output head run per iteration.
+    /// The public tower: `relu(LN(x_pub W0 + b0))` pushed through `W1`, leaving
+    /// the hidden layer's pre-activation minus its bias and minus the belief
+    /// contribution. Computed once per leaf per solve.
     pub fn trunk(
         &self,
         xpub: &[f32],
@@ -453,76 +556,62 @@ impl Mlp {
         scratch: &mut Vec<f32>,
         out: &mut Vec<f32>,
     ) {
-        let (k, n) = (self.dims[0], self.dims[1]);
-        fit(scratch, rows * n);
-        gemm_ld(rows, n, k, xpub, stride, &self.w[0], n, 0.0, &mut scratch[..rows * n], n);
-        self.activate(0, rows, None, &mut scratch[..rows * n]);
-        let n2 = self.dims[2];
-        fit(out, rows * n2);
-        gemm_ld(rows, n2, n, scratch, n, &self.w[1], n2, 0.0, &mut out[..rows * n2], n2);
+        let (k, h) = (self.pub_dim(), self.hidden());
+        fit(scratch, rows * h);
+        gemm_ld(rows, h, k, xpub, stride, &self.w0, h, 0.0, &mut scratch[..rows * h], h);
+        self.ln_relu(rows, h, &self.b0, &self.ln0_w, &self.ln0_b, None, &mut scratch[..rows * h]);
+        fit(out, rows * h);
+        gemm_ld(rows, h, h, scratch, h, &self.w1, h, 0.0, &mut out[..rows * h], h);
     }
 
-    /// Finish a forward pass whose public tower is already in `pre`
-    /// (`rows x dims[2]`, from `trunk`). `xbel` is `[rows * split]`. Only the
-    /// output columns in `head` are produced, since a CFR traversal reads one
-    /// player's head at a time.
-    ///
-    /// Splitting this further — caching each player's belief projection
-    /// separately, since only one player's beliefs move between iterations —
-    /// was tried and is slower: it halves a matmul that costs 30 us and adds a
-    /// megabyte of buffer traffic to the elementwise pass around it.
-    pub fn forward_split(
-        &self,
-        xbel: &[f32],
-        rows: usize,
-        pre: &[f32],
-        head: std::ops::Range<usize>,
-        scratch: &mut Vec<f32>,
-        out: &mut Vec<f32>,
-    ) {
-        let n2 = self.dims[2];
-        debug_assert!(pre.len() >= rows * n2);
-        debug_assert_eq!(xbel.len(), rows * self.split);
-
-        // Second hidden layer: the belief block's projection, with the cached
-        // tower folded in during the bias pass rather than pre-copied.
-        fit(scratch, rows * n2);
-        gemm_ld(
-            rows,
-            n2,
-            self.split,
-            xbel,
-            self.split,
-            &self.wb,
-            n2,
-            0.0,
-            &mut scratch[..rows * n2],
-            n2,
-        );
-        self.activate(1, rows, Some(pre), &mut scratch[..rows * n2]);
-
-        // Output head, restricted to the columns the caller asked for.
-        let n3 = self.dims[3];
-        let (width, off) = (head.len(), head.start);
-        fit(out, rows * width);
-        gemm_ld(
-            rows,
-            width,
-            n2,
-            scratch,
-            n2,
-            &self.w[2][off..],
-            n3,
-            0.0,
-            &mut out[..rows * width],
-            width,
-        );
-        let bias = &self.b[2][off..off + width];
+    /// The PBS side of the value, given the cached trunk in `pre` and the two
+    /// belief embeddings in `xbel` (`[rows * 2 * dg]`). Writes `[rows * rank]`.
+    /// This is the only part of the network that runs per CFR iteration.
+    pub fn pbs_head(&self, xbel: &[f32], rows: usize, pre: &[f32], scratch: &mut Vec<f32>,
+                    out: &mut Vec<f32>) {
+        let (h, bd, rk) = (self.hidden(), self.belief_dim(), self.rank());
+        debug_assert_eq!(xbel.len(), rows * bd);
+        debug_assert!(pre.len() >= rows * h);
+        fit(scratch, rows * h);
+        gemm_ld(rows, h, bd, xbel, bd, &self.wb, h, 0.0, &mut scratch[..rows * h], h);
+        self.ln_relu(rows, h, &self.b1, &self.ln1_w, &self.ln1_b, Some(pre),
+                     &mut scratch[..rows * h]);
+        fit(out, rows * rk);
+        gemm_ld(rows, rk, h, scratch, h, &self.wu, rk, 0.0, &mut out[..rows * rk], rk);
         for r in 0..rows {
-            let row = &mut out[r * width..r * width + width];
-            for j in 0..width {
-                row[j] += bias[j];
+            for (x, b) in out[r * rk..r * rk + rk].iter_mut().zip(self.bu.iter()) {
+                *x += *b;
             }
         }
+    }
+
+    /// The per-config readout: `v = <u, g[..rank]> + g[rank]`, for the configs
+    /// `idx` names in a `g` table built by `embed`.
+    pub fn values(&self, u: &[f32], g: &[f32], idx: &[u32], out: &mut [f32]) {
+        let rk = self.rank();
+        debug_assert_eq!(idx.len(), out.len());
+        for (o, &i) in out.iter_mut().zip(idx.iter()) {
+            let row = &g[i as usize * (rk + 1)..];
+            *o = dot(u, &row[..rk]) + row[rk];
+        }
+    }
+
+    /// One value per row, for callers with no solve to amortise over: the torch
+    /// parity check and the offline tools. `xpub` is `[rows * pub_dim]`, `xbel`
+    /// `[rows * 2 * dg]`, `phi` `[rows * cfeat]` — one config per row.
+    pub fn forward(&self, xpub: &[f32], xbel: &[f32], phi: &[f32], rows: usize) -> Vec<f32> {
+        let (mut sb, mut pre) = (Vec::new(), Vec::new());
+        self.trunk(xpub, rows, self.pub_dim(), &mut sb, &mut pre);
+        let mut u = Vec::new();
+        self.pbs_head(xbel, rows, &pre, &mut sb, &mut u);
+        let (mut z, mut g) = (Vec::new(), Vec::new());
+        self.embed(phi, rows, &mut z, &mut g);
+        let rk = self.rank();
+        (0..rows)
+            .map(|r| {
+                let row = &g[r * (rk + 1)..];
+                dot(&u[r * rk..r * rk + rk], &row[..rk]) + row[rk]
+            })
+            .collect()
     }
 }

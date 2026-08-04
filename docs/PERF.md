@@ -95,8 +95,14 @@ h = x_pub · W_pub  +  x_bel · W_bel
 ```
 
 With `FEAT = 812` and a 132-wide belief block that is 84% of the widest layer,
-computed once per leaf instead of eight times. `forward_split` also emits only
-the output head the current traversal reads.
+computed once per leaf instead of eight times.
+
+The network has since been rebuilt around the config rather than the hand
+(`docs/REBEL.md` §4) and this split survived it unchanged — it is now
+`Mlp::trunk` plus `Mlp::pbs_head`, and the config tower is cached the same way,
+once per *distinct* config per solve. The one new hot loop, accumulating the
+belief embedding, needed the same hand-vectorisation as the LayerNorm below:
+scalar it was 41% of all CPU, vectorised it is 9%.
 
 Together with §1: **262 → 550 decisions/s** (trained-agent positions).
 
@@ -178,15 +184,7 @@ per element.
   player's strategy moves between two CFR iterations, so only one player's
   beliefs do — the other's projection is still valid. This halves a 30 µs
   matmul and adds a megabyte of buffer traffic to the elementwise pass around
-  it. Measured **35% slower**. `Mlp::forward_split` says so.
-* **`reserve - E[hand] - E[facedown]` for the bag composition.** Algebraically
-  equal to averaging each config's own bag and half the arithmetic, in a loop
-  that runs once per leaf per player per iteration. It is also numerically wrong
-  exactly where it matters: when a player's whole reserve is in hand and face
-  down, every config's bag is empty and the composition must stay zero, but the
-  subtraction leaves a ~1e-7 residue per slot which then *normalises to one*.
-  Caught by `belief_block_matches_the_direct_definition`, which was written for
-  this change and now stays as a permanent oracle.
+  it. Measured **35% slower**.
 * **Bigger generation batches** for load balance: 48, 96 and 192 games per epoch
   all measure the same, so rayon's work stealing is already handling the spread
   in game lengths.

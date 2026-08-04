@@ -28,88 +28,48 @@
 //!
 //! Beliefs are per player and independent (separate bags, no shared hidden
 //! resource), so a PBS factorises as `(public state, belief_0, belief_1)`.
+//!
+//! # What the network is a function of
+//!
+//! The value of a leaf is a *counterfactual value per information state*, so it
+//! is indexed by the same object beliefs and regrets are indexed by: the config.
+//! Two encodings come out of here and they have different jobs.
+//!
+//!   * `write_public_features` — the public state. Identical for every config,
+//!     which is what lets one public tree carry all of them.
+//!   * `write_config_feats` — one config's exact counts: hand, face-down and the
+//!     derived bag, plus whose config it is. This is the *argument* of the value
+//!     function, and the belief encoding is a weighted sum of the same vectors,
+//!     so both sides of the network see the same description of a config.
+//!
+//! Nothing here summarises a config into anything coarser. An earlier build
+//! keyed values by hand alone and averaged the face-down composition into a
+//! marginal; that made the strategy measurable with respect to the hand, so the
+//! agent could not act on coins it had buried itself — a restriction of the
+//! strategy space, i.e. a different game. `docs/REBEL.md` records what it cost.
 
 use crate::actions::Action;
 use crate::board::{board, NONE, N_HEXES};
 use crate::state::{Cont, State, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP, Z_HAND, Z_SUPPLY};
 use crate::units::{write_card_features, CARD_FEATS, N_UNITS};
-use std::sync::OnceLock;
 
 /// Distinct coin types a player can own: 4 drafted units + the Royal Coin.
 pub const NSLOT: usize = 5;
 /// Hand size cap.
 pub const HAND_CAP: usize = 3;
-/// Multisets of size <= HAND_CAP over NSLOT types: 1 + 5 + 15 + 35.
-pub const NHAND: usize = 56;
 
-// ---------------------------------------------------------------- hand table
+// ------------------------------------------------------------ config features
 
-/// Enumeration of every possible hand. The value network is keyed by hand — the
-/// deliberate information bottleneck in ReBeL's query encoding — so hands still
-/// need a dense index even though beliefs range over configs.
-pub struct HandTab {
-    pub cnt: Vec<[u8; NSLOT]>,
-    pub size: Vec<u8>,
-    pub key: Vec<i16>,
-}
-
-static HAND_TAB: OnceLock<HandTab> = OnceLock::new();
-
-fn hand_key(c: &[u8; NSLOT]) -> usize {
-    let mut k = 0usize;
-    for i in (0..NSLOT).rev() {
-        k = k * 4 + c[i].min(3) as usize;
-    }
-    k
-}
-
-pub fn hands() -> &'static HandTab {
-    HAND_TAB.get_or_init(|| {
-        let mut cnt: Vec<[u8; NSLOT]> = Vec::new();
-        for total in 0..=HAND_CAP as u8 {
-            let mut c = [0u8; NSLOT];
-            enumerate(&mut c, 0, total, &mut cnt);
-        }
-        assert_eq!(cnt.len(), NHAND);
-        let mut key = vec![-1i16; 4usize.pow(NSLOT as u32)];
-        for (i, c) in cnt.iter().enumerate() {
-            key[hand_key(c)] = i as i16;
-        }
-        let size = cnt.iter().map(|c| c.iter().sum()).collect();
-        HandTab { cnt, size, key }
-    })
-}
-
-fn enumerate(c: &mut [u8; NSLOT], slot: usize, left: u8, out: &mut Vec<[u8; NSLOT]>) {
-    if slot == NSLOT - 1 {
-        c[slot] = left;
-        out.push(*c);
-        c[slot] = 0;
-        return;
-    }
-    for take in 0..=left {
-        c[slot] = take;
-        enumerate(c, slot + 1, left - take, out);
-    }
-    c[slot] = 0;
-}
-
-/// Dense index of a hand multiset, for the value network's output head.
-#[inline]
-pub fn hand_index(hand: &[u8; NSLOT]) -> usize {
-    hand_index_in(hands(), hand)
-}
-
-/// The same, against a table the caller already has in hand. `hands()` goes
-/// through a `OnceLock` on every call, which is nothing on its own and adds up
-/// when a subgame indexes tens of thousands of configs while assembling its
-/// leaf batch.
-#[inline]
-pub fn hand_index_in(tab: &HandTab, hand: &[u8; NSLOT]) -> usize {
-    let k = tab.key[hand_key(hand)];
-    debug_assert!(k >= 0, "hand over the size cap");
-    k.max(0) as usize
-}
+/// Raw counts describing one config: hand, face-down, bag, in slot order.
+pub const CCOUNTS: usize = 3 * NSLOT;
+/// The config vector the network reads: `CCOUNTS` counts plus a flag saying
+/// whose config it is. Player 0's and player 1's slots mean different units, and
+/// the value asked for is "this player's counterfactual value", so the seat has
+/// to be part of the argument.
+pub const CFEAT: usize = CCOUNTS + 1;
+/// Divisor for every count. A player owns at most 5 coins of any one type, so
+/// every count lands in `[0, 1]` and one constant serves all three zones.
+pub const CNORM: f32 = 5.0;
 
 // --------------------------------------------------------------- game context
 
@@ -169,10 +129,6 @@ impl Config {
         }
         b
     }
-    #[inline]
-    pub fn hand_index(&self) -> usize {
-        hand_index(&self.hand)
-    }
     /// A single integer that orders configs exactly as `Ord` does: hand
     /// lexicographically, then face-down. Sorting and deduping child supports
     /// is the hot part of building a subgame, and comparing one `u64` beats
@@ -196,6 +152,34 @@ impl Config {
         }
         k
     }
+}
+
+/// One config as raw counts: hand, then face-down, then the derived bag.
+///
+/// The bag is `reserve - hand - facedown` and so carries no information the
+/// first two do not — but it is the quantity that decides what you draw next
+/// round, and handing it over saves the network from having to learn a
+/// subtraction it can only do if it also finds the reserve in the public block.
+#[inline]
+pub fn config_counts(c: &Config, reserve: &[u8; NSLOT], out: &mut [u8; CCOUNTS]) {
+    for k in 0..NSLOT {
+        out[k] = c.hand[k];
+        out[NSLOT + k] = c.fd[k];
+        out[2 * NSLOT + k] = reserve[k].saturating_sub(c.hand[k] + c.fd[k]);
+    }
+}
+
+/// The config vector the network reads. `player` is the seat the config belongs
+/// to — the value asked for is that player's counterfactual value.
+#[inline]
+pub fn write_config_feats(c: &Config, reserve: &[u8; NSLOT], player: usize, out: &mut [f32]) {
+    debug_assert_eq!(out.len(), CFEAT);
+    let mut cnt = [0u8; CCOUNTS];
+    config_counts(c, reserve, &mut cnt);
+    for k in 0..CCOUNTS {
+        out[k] = cnt[k] as f32 / CNORM;
+    }
+    out[CCOUNTS] = player as f32;
 }
 
 /// `reserve[k] = bag[k] + hand[k] + facedown[k]` — public, and invariant to how
@@ -363,38 +347,6 @@ impl Belief {
         self.cfg.binary_search(c).ok()
     }
 
-    /// Marginal over hand keys — the value network's output basis.
-    pub fn hand_marginal(&self) -> [f32; NHAND] {
-        let mut out = [0.0f32; NHAND];
-        for (c, w) in self.cfg.iter().zip(self.p.iter()) {
-            out[c.hand_index()] += *w;
-        }
-        out
-    }
-
-    /// Expected bag and face-down composition, as fractions. These marginals
-    /// stand in for the part of the config the network is not keyed by.
-    pub fn composition(&self, reserve: &[u8; NSLOT]) -> ([f32; NSLOT], [f32; NSLOT]) {
-        let (mut bag, mut fd) = ([0.0f32; NSLOT], [0.0f32; NSLOT]);
-        for (c, w) in self.cfg.iter().zip(self.p.iter()) {
-            let b = c.bag(reserve);
-            for k in 0..NSLOT {
-                bag[k] += *w * b[k] as f32;
-                fd[k] += *w * c.fd[k] as f32;
-            }
-        }
-        let norm = |v: &mut [f32; NSLOT]| {
-            let s: f32 = v.iter().sum();
-            if s > 1e-9 {
-                for x in v.iter_mut() {
-                    *x /= s;
-                }
-            }
-        };
-        norm(&mut bag);
-        norm(&mut fd);
-        (bag, fd)
-    }
 }
 
 /// How a coin play moves a config. `slot` is the coin spent (-1 for the
@@ -680,9 +632,6 @@ pub fn obs_key(a: &Action) -> u32 {
 const MAX_COINS: f32 = 4.0 * 5.0 + 1.0;
 
 pub const PEND_KINDS: usize = 12;
-/// Belief block per player: hand-key distribution plus bag and face-down
-/// composition marginals.
-pub const BELIEF_DIM: usize = NHAND + 2 * NSLOT;
 
 /// Channels in the per-hex block: owner (2), stack height, the owner's slot
 /// one-hot (`NSLOT`), the location marker's owner (2), is-location, and the
@@ -720,10 +669,10 @@ pub const OFF_PLAYER: usize = OFF_CARDS + 2 * NSLOT * CARD_FEATS;
 /// Offset of the global scalars.
 pub const OFF_GLOBAL: usize = OFF_PLAYER + 2 * PLAYER_SCALARS;
 
-/// Everything before the belief blocks.
-pub const OFF_BELIEF: usize =
-    OFF_GLOBAL + GLOBAL_SCALARS + PEND_KINDS + PEND_SLOT;
-pub const FEAT: usize = OFF_BELIEF + 2 * BELIEF_DIM;
+/// Width of the public encoding. It is the whole of it: beliefs no longer ride
+/// along as a fixed-width tail, because a belief is a distribution over configs
+/// and the network reads it as a weighted sum of config vectors instead.
+pub const PUBFEAT: usize = OFF_GLOBAL + GLOBAL_SCALARS + PEND_KINDS + PEND_SLOT;
 
 /// Round divisor. Measured on the starter draft (`examples/featstats.rs`):
 /// rounds reach 81 under random play and 121 under one-ply greedy, because a
@@ -749,40 +698,15 @@ fn pending_kind(s: &State) -> usize {
     }
 }
 
-/// Encode a PBS. Reads only public information: bag, hand and face-down
-/// discards appear solely through their public sum (the reserve) and their
-/// public sizes. Their composition reaches the network only through the belief
-/// block, which is what makes the encoding leak-free.
-pub fn write_features(s: &State, ctx: &Ctx, b: &[Belief; 2], out: &mut [f32]) {
-    debug_assert_eq!(out.len(), FEAT);
-    write_public_features(s, ctx, &mut out[..OFF_BELIEF]);
-    for p in 0..2usize {
-        let res = reserve(s, p as u8, ctx);
-        let at = OFF_BELIEF + p * BELIEF_DIM;
-        write_belief_block(&b[p].cfg, None, &b[p].p, &res, &mut out[at..at + BELIEF_DIM]);
-    }
-}
-
-/// One player's belief block: the hand-key marginal plus the bag and face-down
-/// composition marginals, from an **unnormalised** weight vector (the caller's
-/// reach). Normalisation matches `Belief::normalize`, including its fallback to
-/// uniform when the weights have underflowed.
+/// Belief weights, normalised the way the network consumes them. `w` is the
+/// caller's *unnormalised* reach; normalisation matches `Belief::normalize`,
+/// including its fallback to uniform when the weights have underflowed.
 ///
-/// Split out of `write_features` because inside a solve this is the only part
-/// of the encoding that moves between CFR iterations.
-/// `hidx`, when given, is the precomputed hand key of every config — inside a
-/// solve those are fixed for the whole subgame while this runs once per leaf
-/// per iteration.
-pub fn write_belief_block(
-    cfg: &[Config],
-    hidx: Option<&[u16]>,
-    w: &[f32],
-    reserve: &[u8; NSLOT],
-    out: &mut [f32],
-) {
-    debug_assert_eq!(out.len(), BELIEF_DIM);
-    debug_assert_eq!(cfg.len(), w.len());
-    out.fill(0.0);
+/// The network turns this into `sum_c beta(c) * z(config_feats(c))` with a
+/// learned `z`, so the belief reaches it as a weighted set of exact configs
+/// rather than as a summary statistic of them.
+pub fn normalize_weights(w: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(w.len(), out.len());
     // One reciprocal for the whole support rather than a divide per config:
     // this runs once per leaf per player per CFR iteration over a support that
     // averages ~35 configs, and f32 division does not pipeline.
@@ -792,43 +716,16 @@ pub fn write_belief_block(
     } else {
         (0.0, 1.0 / w.len().max(1) as f32)
     };
-    // Each config's own bag, then the belief-weighted average — *not* the
-    // algebraically equal `reserve - E[hand] - E[facedown]`. That form is
-    // cheaper and numerically wrong exactly where it matters: when a player's
-    // whole reserve is in hand and face-down, every config's bag is empty and
-    // the composition is defined to stay zero, but the subtraction leaves a
-    // rounding residue of ~1e-7 per slot, which then *normalises to one*.
-    // `belief_block_matches_the_direct_definition` pins this.
-    let (mut bag, mut fd) = ([0.0f32; NSLOT], [0.0f32; NSLOT]);
-    for (ci, c) in cfg.iter().enumerate() {
-        let p = w[ci] * scale + flat;
-        out[match hidx {
-            Some(t) => t[ci] as usize,
-            None => c.hand_index(),
-        }] += p;
-        for k in 0..NSLOT {
-            bag[k] += p * reserve[k].saturating_sub(c.hand[k] + c.fd[k]) as f32;
-            fd[k] += p * c.fd[k] as f32;
-        }
+    for (o, x) in out.iter_mut().zip(w.iter()) {
+        *o = *x * scale + flat;
     }
-    let norm = |v: &mut [f32; NSLOT]| {
-        let s: f32 = v.iter().sum();
-        if s > 1e-9 {
-            for x in v.iter_mut() {
-                *x /= s;
-            }
-        }
-    };
-    norm(&mut bag);
-    norm(&mut fd);
-    out[NHAND..NHAND + NSLOT].copy_from_slice(&bag);
-    out[NHAND + NSLOT..BELIEF_DIM].copy_from_slice(&fd);
 }
 
-/// The public half of the encoding: everything before the belief blocks. Fixed
-/// for a given state, so a solve computes it once per leaf.
+/// The public encoding. Fixed for a given state, so a solve computes it once
+/// per leaf. Reads only public information: bag, hand and face-down discards
+/// appear solely through their public sum (the reserve) and their public sizes.
 pub fn write_public_features(s: &State, ctx: &Ctx, out: &mut [f32]) {
-    debug_assert_eq!(out.len(), OFF_BELIEF);
+    debug_assert_eq!(out.len(), PUBFEAT);
     out.fill(0.0);
     let bd = board();
 
@@ -959,5 +856,5 @@ pub fn write_public_features(s: &State, ctx: &Ctx, out: &mut [f32]) {
         }
     }
     i += PEND_SLOT;
-    debug_assert_eq!(i, OFF_BELIEF);
+    debug_assert_eq!(i, PUBFEAT);
 }

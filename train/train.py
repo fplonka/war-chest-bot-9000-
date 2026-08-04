@@ -12,11 +12,16 @@ Two phases inside one wall-clock budget:
    *initial checkpoint*.
 
 2. **ReBeL** (the rest). Self-play where every decision solves a depth-limited
-   CFR subgame over public belief states; targets are the CFR root values,
-   projected onto the network's hand-key basis.
+   CFR subgame over public belief states; the targets are the CFR root values,
+   one per config in each player's belief support.
 
 Everything except the gradient step runs in Rust across all cores; Python ships
 weights down and pulls tensors back once per epoch.
+
+A training row is a public state plus, for each player, the whole belief: the
+exact configs in support, their probabilities, and the value the solve gave
+each. The config lists are ragged, so they live in a flat arena and a batch is
+assembled by gathering spans -- see `Buffer`.
 """
 
 import argparse
@@ -35,71 +40,121 @@ import torch.nn.functional as F
 import warchest
 import mirror
 
-FEAT = warchest.FEAT
-NHAND = warchest.NHAND
+PUBFEAT = warchest.PUBFEAT
+CFEAT = warchest.CFEAT
+CCOUNTS = warchest.CCOUNTS
+CNORM = warchest.CNORM
 # Weight slots in the Rust workers: 0 live, 1 initial checkpoint, 2 champion.
 CHAMP_SLOT = 2
 
 
 class Mlp(nn.Module):
-    """The value network, split around the belief block.
+    """The value network: `v(PBS, config) -> scalar`.
 
-    Same shape and the same parameter count as a plain `FEAT -> h -> h -> dout`
-    MLP; the only change is *where* the belief block connects. It is the last
-    `SPLIT` inputs and it is the only part of a leaf's encoding that moves
-    between CFR iterations, so wiring it into the second hidden layer instead of
-    the first leaves the whole public tower — the widest matmul in the network,
-    plus a full hidden layer — computable once per leaf per subgame solve rather
-    than once per iteration. See `Mlp::trunk` in `engine/src/net.rs`.
+    Two towers. The config tower embeds one player's exact private state; the
+    PBS tower embeds the public state and, through a belief-weighted sum of the
+    *same* config embeddings, the belief. The value is their inner product.
+
+        z(c) = relu(phi(c) Wc + bc)                 config embedding   [dg]
+        g(c) = z(c) Wg + bg                         readout embedding  [r + 1]
+        e_p  = sum_c beta_p(c) z(c)                 belief             [dg]
+        h    = relu(LN(relu(LN(x W0 + b0)) W1 + b1 + [e_0; e_1] Wb))
+        u    = h Wu + bu                            PBS readout        [r]
+        v(c) = <u, g(c)[:r]> + g(c)[r]
+
+    This is `csrc/liars_dice`'s shape with its two fixed-width private-state
+    dimensions replaced by learned functions of the private state, because War
+    Chest's private states do not fit in a fixed-width table. Set `g` to a
+    one-hot lookup and the two are the same network.
+
+    `rank` is the one dimension that has to be chosen rather than inherited: the
+    reference gets `rank = hidden` for free because its readout is a lookup,
+    while here every config costs a `rank`-long dot product. A config is
+    sixteen numbers, so 64 is not a binding constraint on what the value can
+    depend on, and it is 6x less per-config work than the hidden width.
+
+    LayerNorm on every hidden layer, as the reference does (`use_layer_norm:
+    true`): the raw features include unbounded-ish coin counts and the
+    bootstrapped targets shift scale over training, so normalising between the
+    affine and the activation is what keeps the hidden distribution stable as
+    the target distribution moves.
     """
 
-    def __init__(self, din, hidden, dout, split=None, layers=2):
+    def __init__(self, hidden, dg=64, rank=64):
         super().__init__()
-        self.split = warchest.BELIEF_SPLIT if split is None else split
-        dims = [din - self.split] + [hidden] * layers + [dout]
-        self.dims = dims
-        self.lin = nn.ModuleList(nn.Linear(dims[i], dims[i + 1]) for i in range(len(dims) - 1))
-        # The belief block's connection into the second hidden layer. No bias:
-        # it is added to a layer that already has one.
-        self.bel = nn.Linear(self.split, hidden, bias=False)
-        # LayerNorm on every hidden layer, as the reference does
-        # (`use_layer_norm: true`). Two of the raw features are unbounded-ish
-        # coin counts, and the bootstrapped targets shift scale over training,
-        # so normalising between the affine and the activation is what keeps
-        # the hidden distribution stable as the target distribution moves.
-        self.norm = nn.ModuleList(nn.LayerNorm(d) for d in dims[1:-1])
+        self.dims = [PUBFEAT, hidden, CFEAT, dg, rank]
+        self.w0 = nn.Linear(PUBFEAT, hidden)
+        self.w1 = nn.Linear(hidden, hidden)
+        # The belief's connection into the hidden layer. No bias: it is added to
+        # a layer that already has one.
+        self.wb = nn.Linear(2 * dg, hidden, bias=False)
+        self.wc = nn.Linear(CFEAT, dg)
+        self.wg = nn.Linear(dg, rank + 1)
+        self.wu = nn.Linear(hidden, rank)
+        self.ln0 = nn.LayerNorm(hidden)
+        self.ln1 = nn.LayerNorm(hidden)
         # Start near zero so the first bootstrapped targets are not dominated by
         # random leaf values.
-        nn.init.zeros_(self.lin[-1].bias)
-        nn.init.normal_(self.lin[-1].weight, std=1e-3)
+        nn.init.zeros_(self.wg.bias)
+        nn.init.normal_(self.wg.weight, std=1e-3)
 
-    def forward(self, x):
-        xp, xb = x[..., : self.dims[0]], x[..., self.dims[0]:]
-        h = F.relu(self.norm[0](self.lin[0](xp)))
-        h = F.relu(self.norm[1](self.lin[1](h) + self.bel(xb)))
-        return self.lin[2](h)
+    def forward(self, xpub, phi, inv, w, seg, nseg):
+        """Values for every config in a ragged batch.
+
+        `xpub` is `[B, PUBFEAT]`. The configs of every row and player are
+        concatenated into one list of length `N`; `w[i]` is config `i`'s belief
+        probability and `seg[i] = 2 * row + player` says where it belongs.
+
+        The config tower runs over *distinct* configs only: `phi` is `[U, CFEAT]`
+        and `inv` maps each of the `N` entries to its row in it. A batch of 1024
+        positions carries ~50k configs drawn from a couple of thousand distinct
+        ones, and the readout embedding is `dg x (hidden + 1)` — by far the
+        widest matmul here if it runs per entry. The Rust solver deduplicates
+        for the same reason.
+        """
+        z = F.relu(self.wc(phi))
+        g = self.wg(z)
+        # The belief: a weighted sum of config embeddings, per (row, player).
+        e = torch.zeros(nseg, z.shape[1], dtype=z.dtype, device=z.device)
+        e.index_add_(0, seg, z[inv] * w.unsqueeze(1))
+        h = F.relu(self.ln0(self.w0(xpub)))
+        h = F.relu(self.ln1(self.w1(h) + self.wb(e.reshape(xpub.shape[0], -1))))
+        u = self.wu(h)
+        rk = u.shape[1]
+        gc = g[inv]
+        return (u[seg // 2] * gc[:, :rk]).sum(-1) + gc[:, rk]
 
     def push(self, slot):
-        """Ship weights to the Rust workers (row-major `[in, out]` per layer)."""
+        """Ship weights to the Rust workers (row-major `[in, out]` per matrix).
+
+        The order here is `Mlp::from_flat`'s and nothing else knows it, so the
+        two cannot drift apart without `test_parity.py` failing.
+        """
         w = np.concatenate([l.weight.detach().cpu().t().contiguous().numpy().ravel()
-                            for l in list(self.lin) + [self.bel]])
-        b = np.concatenate([l.bias.detach().cpu().numpy().ravel() for l in self.lin])
-        # Per hidden layer: LayerNorm weight then bias, in layer order.
+                            for l in (self.w0, self.w1, self.wb, self.wc, self.wg, self.wu)])
+        b = np.concatenate([l.bias.detach().cpu().numpy().ravel()
+                            for l in (self.w0, self.w1, self.wc, self.wg, self.wu)])
         ln = np.concatenate([t.detach().cpu().numpy().ravel()
-                             for n in self.norm for t in (n.weight, n.bias)])
+                             for n in (self.ln0, self.ln1) for t in (n.weight, n.bias)])
         warchest.set_weights(self.dims, np.ascontiguousarray(w, np.float32),
-                             np.ascontiguousarray(b, np.float32), slot,
-                             np.ascontiguousarray(ln, np.float32), self.split)
+                             np.ascontiguousarray(b, np.float32),
+                             np.ascontiguousarray(ln, np.float32), slot)
 
 
 class Buffer:
-    """Fixed-capacity FIFO ring over flat sample arrays.
+    """Fixed-capacity FIFO over rows whose config lists are ragged.
 
-    Features are stored as float16. Bootstrapped targets are averaged over
-    whatever history the buffer holds, so its length is a real algorithmic
-    knob, not just a memory setting -- the reference implementation runs a 2M
-    buffer. Halving the width of the widest array is what makes that affordable
-    here.
+    Two rings advance together: one over rows, one over the config arena the
+    rows point into. A row's configs sit at an *absolute* arena offset, so a row
+    is live exactly while both rings still hold it -- and because both are
+    written in order, the rows the arena has evicted are always the oldest ones,
+    which is a single monotone pointer rather than a validity test per row.
+
+    Bootstrapped targets are averaged over whatever history the buffer holds, so
+    its length is a real algorithmic knob and not just a memory setting -- the
+    reference implementation runs a 2M buffer. Counts are stored as the `uint8`
+    they are and everything else as float16, which is what makes that
+    affordable: a row costs `PUBFEAT * 2` bytes plus 20 per config.
 
     Preallocated and written with wraparound rather than grown by
     concatenation. The concatenate form rebuilt the whole buffer every epoch:
@@ -109,38 +164,63 @@ class Buffer:
     actually filled.
     """
 
-    def __init__(self, cap, widths, dtypes):
-        self.cap = cap
-        self.parts = [np.zeros((cap, w), dtype=d) for w, d in zip(widths, dtypes)]
-        self.n = 0    # rows live, saturating at cap
-        self.pos = 0  # next row to write
+    def __init__(self, cap, ccap):
+        self.cap, self.ccap = cap, ccap
+        self.x = np.zeros((cap, PUBFEAT), np.float16)
+        self.cstart = np.zeros(cap, np.int64)   # absolute arena offset
+        self.clen = np.zeros((cap, 2), np.int32)
+        self.cc = np.zeros((ccap, CCOUNTS), np.uint8)
+        self.cp = np.zeros(ccap, np.uint8)
+        self.cw = np.zeros(ccap, np.float16)
+        self.cy = np.zeros(ccap, np.float16)
+        self.rows = 0   # rows ever written
+        self.cfgs = 0   # configs ever written
+        self.lo = 0     # oldest row whose configs are still in the arena
 
-    def add(self, arrays):
-        m = len(arrays[0])
-        if m >= self.cap:  # keep only the newest cap rows
-            arrays = [a[m - self.cap:] for a in arrays]
-            m = self.cap
-        end = self.pos + m
-        if end <= self.cap:
-            for p, a in zip(self.parts, arrays):
-                p[self.pos:end] = a
-        else:
-            k = self.cap - self.pos
-            for p, a in zip(self.parts, arrays):
-                p[self.pos:] = a[:k]
-                p[:end - self.cap] = a[k:]
-        self.pos = end % self.cap
-        self.n = min(self.n + m, self.cap)
+    def add(self, x, cc, cw, cy, coff):
+        n = len(x)
+        lens = np.diff(coff).reshape(n, 2)
+        cp = np.repeat(np.tile([0, 1], n).astype(np.uint8), lens.ravel())
+        starts = self.cfgs + coff[:-1:2]
+        for i in range(0, n, 4096):
+            j = min(i + 4096, n)
+            sl = np.arange(i, j) + self.rows
+            self.x[sl % self.cap] = x[i:j]
+            self.cstart[sl % self.cap] = starts[i:j]
+            self.clen[sl % self.cap] = lens[i:j]
+        m = len(cw)
+        sl = (np.arange(m) + self.cfgs) % self.ccap
+        self.cc[sl], self.cp[sl], self.cw[sl], self.cy[sl] = cc, cp, cw, cy
+        self.rows += n
+        self.cfgs += m
+        # Advance past every row the arena no longer holds in full.
+        floor = self.cfgs - self.ccap
+        self.lo = max(self.lo, self.rows - self.cap)
+        while self.lo < self.rows and self.cstart[self.lo % self.cap] < floor:
+            self.lo += 1
 
     def clear(self):
-        self.n, self.pos = 0, 0
+        self.lo = self.rows
 
     def __len__(self):
-        return self.n
+        return self.rows - self.lo
+
+    def gather(self, ids):
+        """Assemble a batch from absolute row ids."""
+        s = ids % self.cap
+        lens = self.clen[s].sum(1).astype(np.int64)
+        total = int(lens.sum())
+        # Arena indices of every config of every chosen row, flattened.
+        base = np.repeat(self.cstart[s], lens)
+        within = np.arange(total, dtype=np.int64) - np.repeat(
+            np.concatenate([[0], np.cumsum(lens)[:-1]]), lens)
+        at = (base + within) % self.ccap
+        seg = 2 * np.repeat(np.arange(len(ids), dtype=np.int64), lens) + self.cp[at]
+        return (self.x[s], self.cc[at], self.cp[at], self.cw[at].astype(np.float32),
+                self.cy[at].astype(np.float32), seg)
 
     def sample(self, batch, rng):
-        idx = rng.integers(0, self.n, size=batch)
-        return [p[idx].astype(np.float32, copy=False) for p in self.parts]
+        return self.gather(rng.integers(self.lo, self.rows, size=batch))
 
     def ordered(self):
         """Live rows oldest-first.
@@ -149,20 +229,50 @@ class Buffer:
         one epoch come from the same games and are heavily correlated, so a
         random split leaks. Splitting by recency does not.
         """
-        if self.n < self.cap:
-            return [p[:self.n] for p in self.parts]
-        return [np.concatenate([p[self.pos:], p[:self.pos]]) for p in self.parts]
+        return self.gather(np.arange(self.lo, self.rows))
 
 
-def unpack(d, key, width):
-    a = np.asarray(d[key], dtype=np.float32)
-    return a.reshape(len(a) // width, width)
+def make_batch(parts, rng, device, augment):
+    """Numpy batch -> tensors, with the 180-degree mirror on a random half.
+
+    Rotating the board and swapping the seats is an exact symmetry, so every
+    row is usable twice. Measured offline on a frozen dump: held-out loss
+    0.008446 -> 0.008161 and the train/test gap shrinks 38%, because the binding
+    constraint on this network is distinct positions, not parameters. Applied
+    per batch rather than stored, so the buffer does not double.
+
+    On the config side the swap is one bit: a config carries the seat it belongs
+    to as a feature, and `seg` is `2 * row + seat`.
+    """
+    x, cc, cp, cw, cy, seg = parts
+    x = x.astype(np.float32)
+    if augment:
+        which = rng.random(len(x)) < 0.5
+        x[which] = mirror.mirror_x(x[which])
+        flip = which[seg // 2]
+        cp = np.where(flip, 1 - cp, cp)
+        seg = np.where(flip, seg ^ 1, seg)
+    # Distinct configs only. Every count fits in four bits, so the whole vector
+    # packs into one integer and the dedup is a sort rather than a row compare.
+    packed = cp.astype(np.uint64)
+    for k in range(CCOUNTS):
+        packed = (packed << np.uint64(4)) | cc[:, k].astype(np.uint64)
+    uniq, inv = np.unique(packed, return_inverse=True)
+    first = np.zeros(len(uniq), np.int64)
+    first[inv[::-1]] = np.arange(len(inv))[::-1]
+    phi = np.concatenate([cc[first].astype(np.float32) / CNORM,
+                          cp[first, None].astype(np.float32)], 1)
+    t = lambda a, d=torch.float32: torch.as_tensor(a, dtype=d, device=device)
+    return (t(x), t(phi), t(inv, torch.long), t(cw), t(seg, torch.long), t(cy), 2 * len(x))
 
 
-def value_loss(net, vx, vy, vm):
-    # Huber over the hand keys the belief actually supports.
-    per = F.smooth_l1_loss(net(vx), vy, reduction="none", beta=0.5)
-    return (per * vm).sum() / vm.sum().clamp(min=1.0)
+def value_loss(net, xpub, phi, inv, w, seg, y, nseg):
+    # Belief-weighted Huber over every config in the support. Weighting by the
+    # belief is what makes the loss match the distribution CFR queries: a config
+    # the belief gives 1% to is worth 1% of the gradient.
+    v = net(xpub, phi, inv, w, seg, nseg)
+    per = F.smooth_l1_loss(v, y, reduction="none", beta=0.5)
+    return (per * w).sum() / w.sum().clamp(min=1e-6)
 
 
 def train_steps(net, opt, buf, steps, batch, rng, device, augment=True):
@@ -170,15 +280,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True):
         return float("nan")
     tot = 0.0
     for _ in range(steps):
-        parts = buf.sample(batch, rng)
-        if augment:
-            # Rotate half of each batch 180 degrees and swap the seats. Measured
-            # offline on a frozen dump: held-out loss 0.008446 -> 0.008161 and
-            # the train/test gap shrinks 38%, because the binding constraint on
-            # this network is distinct positions, not parameters. Applied per
-            # batch rather than stored, so the buffer does not double.
-            parts = mirror.augment(*parts, rng.random(batch) < 0.5)
-        parts = [torch.as_tensor(p, device=device) for p in parts]
+        parts = make_batch(buf.sample(batch, rng), rng, device, augment)
         loss = value_loss(net, *parts)
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -199,6 +301,17 @@ def main():
     ap.add_argument("--warm-minutes", type=float, default=-1.0,
                     help="absolute warm-start length in minutes; overrides --warm-frac")
     ap.add_argument("--hidden", type=int, default=384)
+    # Width of a config embedding, and so of one player's belief block. This is
+    # the rank of the value function's dependence on the private state, and it
+    # is also what the belief is summarised into -- the one place where a fixed
+    # width is a real approximation, since a belief is a distribution over a
+    # config space too large to enumerate.
+    ap.add_argument("--dg", type=int, default=64)
+    # Rank of the value readout's inner product -- see `Mlp`.
+    ap.add_argument("--rank", type=int, default=64)
+    # Arena size per row of replay capacity. Self-play carries ~24 configs a
+    # decision; whichever of the two rings fills first sets the real window.
+    ap.add_argument("--cfgs-per-row", type=int, default=48)
     ap.add_argument("--batch", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=1e-3)
     # Step-decay the learning rate at fixed fractions of the ReBeL phase (the
@@ -298,19 +411,17 @@ def main():
     rng = np.random.default_rng(args.seed)
     dev = torch.device(args.device)
 
-    value = Mlp(FEAT, args.hidden, 2 * NHAND).to(dev)
+    value = Mlp(args.hidden, args.dg, args.rank).to(dev)
     opt = torch.optim.Adam(value.parameters(), lr=args.lr)
     # Step-decay plan: halve the lr at each listed fraction of the ReBeL phase.
     lr_decays = sorted(float(x) for x in args.lr_decay_frac.split(",") if x.strip())
     next_decay = 0
     value.push(0)
     # Buffer capacity is the knob the data-scaling curve points at, so every
-    # byte per row is a row we cannot hold. Features are float16; targets live
-    # in [-1, 1] where float16 resolves to ~0.001, a fiftieth of the network's
-    # own error; the mask is exactly {0, 1}. Together that is 2376 bytes a row
-    # against 3104 for the all-float32 form -- 23% more rows for the same RAM.
-    buf = Buffer(args.cap, [FEAT, 2 * NHAND, 2 * NHAND],
-                 [np.float16, np.float16, np.uint8])
+    # byte per row is a row we cannot hold. Public features are float16; counts
+    # are the uint8 they already are; probabilities and targets live in [-1, 1]
+    # where float16 resolves to ~0.001, a fiftieth of the network's own error.
+    buf = Buffer(args.cap, args.cap * args.cfgs_per_row)
 
     total = args.minutes * 60.0
     warm = total * args.warm_frac if args.warm_minutes < 0 else args.warm_minutes * 60.0
@@ -334,7 +445,7 @@ def main():
     cap_v = args.cap_value
     warchest.set_cap_value(cap_v)
     probe = None
-    print(f"[cfg] FEAT={FEAT} NHAND={NHAND} hidden={args.hidden} depth={args.depth} "
+    print(f"[cfg] PUBFEAT={PUBFEAT} CFEAT={CFEAT} hidden={args.hidden} dg={args.dg} rank={args.rank} depth={args.depth} "
           f"iters={args.iters} budget={total:.0f}s warm={warm:.0f}s device={dev} "
           f"draft={'random' if args.random_draft else 'starter'} "
           f"gate_every={args.gate_every:.0f}s promote={args.promote} "
@@ -354,8 +465,8 @@ def main():
             value.push(CHAMP_SLOT)
             champ["state"] = {k: v.detach().cpu().clone()
                               for k, v in value.state_dict().items()}
-            torch.save({"value": value.state_dict(), "hidden": args.hidden},
-                       f"{args.out}/ckpt_init.pt")
+            torch.save({"value": value.state_dict(), "hidden": args.hidden,
+                        "dg": args.dg, "rank": args.rank}, f"{args.out}/ckpt_init.pt")
             # Drop the warm-phase data. Its job was to initialise the *network*,
             # not to serve as bootstrap targets: it comes from a different
             # policy and its targets are not bootstrapped. Keeping it is
@@ -381,16 +492,19 @@ def main():
         gen_s = time.time() - tg
         # Utilities live in [-1, 1]; so does the true value function, so clip
         # the bootstrapped targets to that range.
-        vy = np.clip(unpack(d, "vy", 2 * NHAND), -1.0, 1.0)
-        vx, vm = unpack(d, "vx", FEAT), unpack(d, "vm", 2 * NHAND)
-        buf.add([vx.astype(np.float16), vy, vm])
-        # A frozen slice of positions from the warm phase. If the network's
-        # spread on these collapses, the value function has gone degenerate --
-        # the failure mode a falling training loss hides.
-        if probe is None and len(vx) >= 2048:
-            probe = torch.as_tensor(vx[:2048], device=dev)
-        tgt = vy[vm > 0]
-        tgt_mean, tgt_std = float(tgt.mean()), float(tgt.std())
+        vx = np.asarray(d["vx"], np.float32).reshape(-1, PUBFEAT)
+        cc = np.asarray(d["cc"], np.uint8).reshape(-1, CCOUNTS)
+        cw = np.asarray(d["cw"], np.float32)
+        cy = np.clip(np.asarray(d["cy"], np.float32), -1.0, 1.0)
+        coff = np.asarray(d["coff"], np.int64)
+        buf.add(vx.astype(np.float16), cc, cw.astype(np.float16),
+                cy.astype(np.float16), coff)
+        # A frozen batch from the warm phase. If the network's spread on it
+        # collapses, the value function has gone degenerate -- the failure mode
+        # a falling training loss hides.
+        if probe is None and len(buf) >= 2048:
+            probe = make_batch(buf.sample(2048, rng), rng, dev, False)
+        tgt_mean, tgt_std = float(cy.mean()), float(cy.std())
 
         tt = time.time()
         # Hold a fixed train:generation sample ratio (the reference's
@@ -405,7 +519,8 @@ def main():
         train_s = time.time() - tt
         value.push(0)
         with torch.no_grad():
-            probe_std = float(value(probe).std()) if probe is not None else float("nan")
+            probe_std = float(value(*probe[:5], probe[6]).std()) \
+                if probe is not None else float("nan")
 
         # Anneal the horizon payoff to zero on a fixed schedule over the first
         # `anneal_frac` of the ReBeL phase. It must not react to the observed
@@ -475,12 +590,12 @@ def main():
             # Checkpoint to disk at every gate. A nine-hour run that keeps its
             # only copy of the champion in Python memory loses everything to a
             # crash or a sleep at hour seven.
-            torch.save({"value": champ["state"], "hidden": args.hidden,
+            torch.save({"value": champ["state"], "hidden": args.hidden, "dg": args.dg, "rank": args.rank,
                         "score": champ["score"], "t": champ["t"],
                         "promotions": champ["promotions"]},
                        f"{args.out}/ckpt_champion.pt")
-            torch.save({"value": value.state_dict(), "hidden": args.hidden},
-                       f"{args.out}/ckpt_live.pt")
+            torch.save({"value": value.state_dict(), "hidden": args.hidden,
+                        "dg": args.dg, "rank": args.rank}, f"{args.out}/ckpt_live.pt")
             next_gate = time.time() - t0 + args.gate_every
 
         dec = max(d["decisions"], 1)
@@ -522,18 +637,20 @@ def main():
     elif gate_curve:
         print(f"\nno promotion in {len(gate_curve)} gates -- shipping the live network. "
               f"Champion scores: {[g['champ'] for g in gate_curve]}", flush=True)
-    torch.save({"value": value.state_dict(), "hidden": args.hidden}, f"{args.out}/ckpt_final.pt")
+    torch.save({"value": value.state_dict(), "hidden": args.hidden, "dg": args.dg, "rank": args.rank},
+               f"{args.out}/ckpt_final.pt")
     with open(f"{args.out}/log.json", "w") as f:
         json.dump({"epochs": log, "gate": gate_curve,
                    "champ": {k: champ[k] for k in ("score", "t", "promotions")}}, f, indent=1)
 
     if args.dump_buffer:
         # Oldest row first, so a recency split is an honest held-out set.
-        vx_o, vy_o, vm_o = buf.ordered()
-        np.savez(args.dump_buffer, vx=vx_o, vy=vy_o, vm=vm_o,
-                 feat=np.int32(FEAT), nhand=np.int32(NHAND),
-                 belief_split=np.int32(warchest.BELIEF_SPLIT))
-        print(f"dumped {len(vx_o)} buffer rows to {args.dump_buffer}", flush=True)
+        x, cc, cp, cw, cy, seg = buf.ordered()
+        np.savez(args.dump_buffer, x=x, cc=cc, cp=cp, cw=cw, cy=cy, seg=seg,
+                 pubfeat=np.int32(PUBFEAT), cfeat=np.int32(CFEAT),
+                 ccounts=np.int32(CCOUNTS), cnorm=np.float32(CNORM))
+        print(f"dumped {len(x)} buffer rows ({len(cy)} configs) to {args.dump_buffer}",
+              flush=True)
 
     # ------------------------------------------------------------- evaluation
     warchest.set_cap_value(0.0)

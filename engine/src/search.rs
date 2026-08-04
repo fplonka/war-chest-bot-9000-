@@ -11,8 +11,8 @@
 //! Conventions follow the reference implementation (`csrc/liars_dice` of
 //! `facebookresearch/rebel`):
 //!   * alternating-traverser linear CFR,
-//!   * leaf values are *counterfactual* — the network's per-hand value scaled by
-//!     the opponent's unnormalised reach into that leaf,
+//!   * leaf values are *counterfactual* — the network's value for that exact
+//!     config, scaled by the opponent's unnormalised reach into that leaf,
 //!   * the network is queried with normalised reaches as the beliefs,
 //!   * the root value target is the running mean of per-config root values,
 //!   * acting and belief propagation use the current regret-matching iterate.
@@ -61,7 +61,7 @@ impl Default for Cfg {
     }
 }
 
-/// The value network: PBS -> one value per hand key per player.
+/// The value network: `(PBS, config) -> counterfactual value`.
 #[derive(Clone, Default)]
 pub struct Nets {
     pub value: Mlp,
@@ -215,30 +215,30 @@ impl TNode {
     }
 }
 
-/// The belief blocks are the tail of the encoding, and they are the only part
-/// that moves between CFR iterations at a fixed leaf.
-const SPLIT: usize = FEAT - OFF_BELIEF;
-
 // A subgame's leaf batch runs to a couple of megabytes — the public encodings,
 // the cached first layer, the belief blocks, the network scratch — and a game
 // builds a fresh solver every couple of decisions. Allocating those buffers per
 // solve meant faulting in megabytes of fresh zero pages thousands of times a
 // second; the arithmetic that followed was the cheap part. They are handed back
 // on drop and reused, capacity and all.
-/// The five per-solve buffers, pooled *by role*: they differ in size by 5x, so
-/// a single shared pool handed each one somebody else's buffer and made it grow
+/// The per-solve buffers, pooled *by role*: they differ in size by 5x, so a
+/// single shared pool handed each one somebody else's buffer and made it grow
 /// — and growth is the one thing that zeroes.
-const N_ROLES: usize = 5;
+const N_ROLES: usize = 8;
 const R_H0: usize = 0;
 const R_XPUB: usize = 1;
 const R_XB0: usize = 2;
 const R_OB: usize = 3;
 const R_SB: usize = 4;
+const R_CPHI: usize = 5;
+const R_CZ: usize = 6;
+const R_CG: usize = 7;
 
 thread_local! {
     static BUFS: std::cell::RefCell<[Vec<Vec<f32>>; N_ROLES]> = const {
         std::cell::RefCell::new([
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
         ])
     };
 }
@@ -300,20 +300,35 @@ pub struct Solver<'a> {
     leaf_rows: Vec<usize>,
     /// Terminal leaves, scored from the game instead of the network.
     term_leaves: Vec<usize>,
-    /// Per row, per player: the public reserve.
-    leaf_res: Vec<[[u8; NSLOT]; 2]>,
-    /// Per row, per player: the hand key of every config in support, packed
-    /// back to back and indexed through `leaf_hoff`.
-    leaf_hand: Vec<u16>,
-    leaf_hoff: Vec<u32>,
-    /// `rows * hidden`: the public half of the first layer.
+    /// Per row, per player: an index into `cphi` for every config in support,
+    /// packed back to back and indexed through `leaf_coff`.
+    leaf_cidx: Vec<u32>,
+    leaf_coff: Vec<u32>,
+    /// The subgame's distinct config vectors, `[n * CFEAT]`, and the map that
+    /// deduplicates them. The same config recurs at hundreds of leaves — a
+    /// depth-2 subgame has a few hundred leaves over a few dozen distinct
+    /// configs — and the config tower is the one part of the network whose cost
+    /// scales with the support, so it runs once per distinct config per solve.
+    cphi: Vec<f32>,
+    cmap: std::collections::HashMap<u64, u32>,
+    /// How many distinct configs `cphi` actually holds. Pooled buffers keep
+    /// their length across solves, so the count cannot be read off `cphi.len()`.
+    ncfg: usize,
+    /// `embed` output for `cphi`: the belief embedding and the readout
+    /// embedding. Both survive every CFR iteration.
+    cz: Vec<f32>,
+    cg: Vec<f32>,
+    /// `rows * hidden`: the public half of the hidden layer.
     h0: Vec<f32>,
-    /// `rows * OFF_BELIEF`: the public half, filled during the build.
+    /// `rows * PUBFEAT`: the public encoding, filled during the build.
     xpub: Vec<f32>,
-    /// `rows * SPLIT`: the belief half of the encoding.
+    /// `rows * 2 * dg`: both players' belief embeddings.
     xb: Vec<f32>,
+    /// `rows * hidden`: the hidden layer, rebuilt per iteration.
     ob: Vec<f32>,
     sb: Vec<f32>,
+    /// Normalised belief weights for one leaf's support.
+    wbuf: Vec<f32>,
     batch_ready: bool,
     /// Traverser of the previous leaf query, i.e. whose beliefs have moved
     /// since. `None` before the first query of a solve.
@@ -333,6 +348,9 @@ impl Drop for Solver<'_> {
             (R_XB0, &mut self.xb),
             (R_OB, &mut self.ob),
             (R_SB, &mut self.sb),
+            (R_CPHI, &mut self.cphi),
+            (R_CZ, &mut self.cz),
+            (R_CG, &mut self.cg),
         ] {
             give_buf(role, std::mem::take(v));
         }
@@ -371,14 +389,19 @@ impl<'a> Solver<'a> {
             steps: [0, 0],
             leaf_rows: Vec::new(),
             term_leaves: Vec::new(),
-            leaf_res: Vec::new(),
-            leaf_hand: Vec::new(),
-            leaf_hoff: Vec::new(),
+            leaf_cidx: Vec::new(),
+            leaf_coff: Vec::new(),
+            cphi: take_buf(R_CPHI),
+            cmap: std::collections::HashMap::new(),
+            ncfg: 0,
+            cz: take_buf(R_CZ),
+            cg: take_buf(R_CG),
             h0: take_buf(R_H0),
             xpub: take_buf(R_XPUB),
             xb: take_buf(R_XB0),
             ob: take_buf(R_OB),
             sb: take_buf(R_SB),
+            wbuf: Vec::new(),
             batch_ready: false,
             last_traverser: None,
             draw_scratch: DrawScratch::default(),
@@ -791,70 +814,106 @@ impl<'a> Solver<'a> {
             self.term_leaves.push(id);
             return;
         }
-        let at = self.leaf_rows.len() * OFF_BELIEF;
-        if self.xpub.len() < at + OFF_BELIEF {
+        let at = self.leaf_rows.len() * PUBFEAT;
+        if self.xpub.len() < at + PUBFEAT {
             // Grow in chunks so the zero-fill happens a handful of times per
             // solve, and not at all once the pooled buffer is warm.
-            self.xpub.resize(at + 64 * OFF_BELIEF, 0.0);
+            self.xpub.resize(at + 64 * PUBFEAT, 0.0);
         }
-        write_public_features(s, self.ctx, &mut self.xpub[at..at + OFF_BELIEF]);
-        self.leaf_res
-            .push([reserve(s, 0, self.ctx), reserve(s, 1, self.ctx)]);
-        let tab = hands();
+        write_public_features(s, self.ctx, &mut self.xpub[at..at + PUBFEAT]);
         for p in 0..2 {
-            self.leaf_hoff.push(self.leaf_hand.len() as u32);
+            let res = reserve(s, p as u8, self.ctx);
+            self.leaf_coff.push(self.leaf_cidx.len() as u32);
             for c in cfgs[p].iter() {
-                self.leaf_hand.push(hand_index_in(tab, &c.hand) as u16);
+                let idx = self.intern_config(c, &res, p);
+                self.leaf_cidx.push(idx);
             }
         }
         self.leaf_rows.push(id);
     }
 
-    /// Push the leaf batch's public half through the network's public tower.
-    /// Everything else about the batch was assembled during `build`.
+    /// Index of one config's feature vector in `cphi`, adding it if new.
+    ///
+    /// The key is the raw counts the vector is built from — hand, face-down and
+    /// bag, four bits each, plus the seat — so two configs share a row exactly
+    /// when their feature vectors are identical. Keying on the `Config` alone
+    /// would be wrong: the bag depends on the node's reserve, which changes as
+    /// coins leave it.
+    fn intern_config(&mut self, c: &Config, res: &[u8; NSLOT], p: usize) -> u32 {
+        let mut cnt = [0u8; CCOUNTS];
+        config_counts(c, res, &mut cnt);
+        let mut key = p as u64;
+        for x in cnt.iter() {
+            debug_assert!(*x < 16, "count over the key width");
+            key = (key << 4) | *x as u64;
+        }
+        if let Some(&i) = self.cmap.get(&key) {
+            return i;
+        }
+        let i = self.ncfg as u32;
+        self.ncfg += 1;
+        let at = i as usize * CFEAT;
+        if self.cphi.len() < at + CFEAT {
+            self.cphi.resize(at + 64 * CFEAT, 0.0);
+        }
+        for k in 0..CCOUNTS {
+            self.cphi[at + k] = cnt[k] as f32 / CNORM;
+        }
+        self.cphi[at + CCOUNTS] = p as f32;
+        self.cmap.insert(key, i);
+        i
+    }
+
+    /// Everything about the batch that does not move between CFR iterations:
+    /// the public tower, and the config tower over every distinct config in the
+    /// tree. Both are pure functions of the subgame, so this runs once.
     fn ensure_leaf_batch(&mut self) {
         if self.batch_ready {
             return;
         }
         self.batch_ready = true;
-        self.leaf_hoff.push(self.leaf_hand.len() as u32);
+        self.leaf_coff.push(self.leaf_cidx.len() as u32);
         let rows = self.leaf_rows.len();
-        if self.xb.len() < rows * SPLIT {
-            self.xb.resize(rows * SPLIT, 0.0);
+        if self.nets.value.is_empty() {
+            return;
         }
-        if !self.nets.value.is_empty() {
-            debug_assert_eq!(self.nets.value.in_dim(), FEAT);
-            let _t = timed!(PUBNET);
-            let xpub = std::mem::take(&mut self.xpub);
-            self.nets
-                .value
-                .trunk(&xpub, rows, OFF_BELIEF, &mut self.sb, &mut self.h0);
-            self.xpub = xpub;
+        let net = &self.nets.value;
+        debug_assert_eq!(net.pub_dim(), PUBFEAT);
+        debug_assert_eq!(net.cfeat(), CFEAT);
+        if self.xb.len() < rows * net.belief_dim() {
+            self.xb.resize(rows * net.belief_dim(), 0.0);
         }
+        let _t = timed!(PUBNET);
+        let xpub = std::mem::take(&mut self.xpub);
+        net.trunk(&xpub, rows, PUBFEAT, &mut self.sb, &mut self.h0);
+        self.xpub = xpub;
+        let cphi = std::mem::take(&mut self.cphi);
+        net.embed(&cphi[..self.ncfg * CFEAT], self.ncfg, &mut self.cz, &mut self.cg);
+        self.cphi = cphi;
     }
 
     /// Fill `vals` at every leaf with the traverser's counterfactual values.
     fn leaf_values(&mut self, traverser: usize) {
         self.ensure_leaf_batch();
         let rows = self.leaf_rows.len();
+        let empty = self.nets.value.is_empty();
+        let dg = if empty { 0 } else { self.nets.value.dg() };
         // Only one player's beliefs have moved since the previous query: the
         // one whose strategy regret matching updated at the end of the last
-        // step. The other player's block of the encoding is still exactly what
-        // it was, so it is not rewritten. (Caching the *projection* of it
-        // through the first layer as well was tried and is slower — see
-        // `Mlp::forward_split`.)
+        // step. The other player's embedding is still exactly what it was, so
+        // it is not rewritten.
         let redo = self.last_traverser;
         self.last_traverser = Some(traverser);
-        {
+        if !empty {
             let _t = timed!(BELFEAT);
-            let (nodes, reach, roff, nc, hoff, hand, res, xb) = (
-                &self.nodes,
+            let (reach, roff, nc, coff, cidx, cz, wbuf, xb) = (
                 &self.reach,
                 &self.roff,
                 &self.nc,
-                &self.leaf_hoff,
-                &self.leaf_hand,
-                &self.leaf_res,
+                &self.leaf_coff,
+                &self.leaf_cidx,
+                &self.cz,
+                &mut self.wbuf,
                 &mut self.xb,
             );
             for (r, &i) in self.leaf_rows.iter().enumerate() {
@@ -862,37 +921,32 @@ impl<'a> Solver<'a> {
                     if redo.is_some_and(|l| l != p) {
                         continue;
                     }
-                    let (h0, h1) = (hoff[2 * r + p] as usize, hoff[2 * r + p + 1] as usize);
-                    let at = r * SPLIT + p * BELIEF_DIM;
+                    let n = nc[i][p] as usize;
                     let ra = roff[i] as usize + if p == 1 { nc[i][0] as usize } else { 0 };
-                    write_belief_block(
-                        &nodes[i].cfgs[p],
-                        Some(&hand[h0..h1]),
-                        &reach[ra..ra + nc[i][p] as usize],
-                        &res[r][p],
-                        &mut xb[at..at + BELIEF_DIM],
+                    // The belief the network reads is the normalised reach, as
+                    // in the reference -- but as a weighted sum of the same
+                    // config embeddings the value readout uses, so a config is
+                    // described to the network exactly one way.
+                    if wbuf.len() < n {
+                        wbuf.resize(n, 0.0);
+                    }
+                    normalize_weights(&reach[ra..ra + n], &mut wbuf[..n]);
+                    let at = r * 2 * dg + p * dg;
+                    let cs = coff[2 * r + p] as usize;
+                    crate::net::accumulate(
+                        cz,
+                        &cidx[cs..cs + n],
+                        &wbuf[..n],
+                        dg,
+                        &mut xb[at..at + dg],
                     );
                 }
             }
         }
-        {
+        if !empty {
             let _t = timed!(NET);
             let net = &self.nets.value;
-            if !net.is_empty() {
-                net.forward_split(
-                    &self.xb[..rows * SPLIT],
-                    rows,
-                    &self.h0,
-                    traverser * NHAND..(traverser + 1) * NHAND,
-                    &mut self.sb,
-                    &mut self.ob,
-                );
-            } else {
-                if self.ob.len() < rows * NHAND {
-                    self.ob.resize(rows * NHAND, 0.0);
-                }
-                self.ob[..rows * NHAND].fill(0.0);
-            }
+            net.pbs_head(&self.xb[..rows * 2 * dg], rows, &self.h0, &mut self.sb, &mut self.ob);
         }
 
         let _t = timed!(LEAFPOST);
@@ -905,25 +959,40 @@ impl<'a> Solver<'a> {
             let vo = self.voff[i] as usize;
             self.vals[vo..vo + n].fill(u * opp_reach);
         }
-        let (reach, roff, ncs, voff, hoff, hand, ob, vals) = (
+        let rk = if empty { 0 } else { self.nets.value.rank() };
+        let (net, reach, roff, ncs, voff, coff, cidx, ob, cg, vals) = (
+            &self.nets.value,
             &self.reach,
             &self.roff,
             &self.nc,
             &self.voff,
-            &self.leaf_hoff,
-            &self.leaf_hand,
+            &self.leaf_coff,
+            &self.leaf_cidx,
             &self.ob,
+            &self.cg,
             &mut self.vals,
         );
         for (r, &i) in self.leaf_rows.iter().enumerate() {
             let ra = roff[i] as usize + if opp == 1 { ncs[i][0] as usize } else { 0 };
             let opp_reach: f32 = reach[ra..ra + ncs[i][opp] as usize].iter().sum();
             let n = ncs[i][traverser] as usize;
-            let off = r * NHAND;
-            let hs = hoff[2 * r + traverser] as usize;
             let vo = voff[i] as usize;
-            for c in 0..n {
-                vals[vo + c] = ob[off + hand[hs + c] as usize] * opp_reach;
+            if empty {
+                vals[vo..vo + n].fill(0.0);
+                continue;
+            }
+            // Only the traverser's own configs are ever looked up here. The
+            // opponent's private state reaches this value solely through the
+            // belief embedding, which is what keeps the query leak-free.
+            let cs = coff[2 * r + traverser] as usize;
+            net.values(
+                &ob[r * rk..r * rk + rk],
+                cg,
+                &cidx[cs..cs + n],
+                &mut vals[vo..vo + n],
+            );
+            for v in vals[vo..vo + n].iter_mut() {
+                *v *= opp_reach;
             }
         }
     }
@@ -1130,8 +1199,8 @@ impl<'a> Solver<'a> {
         self.steps[0] > 0 && self.steps[1] > 0
     }
 
-    /// Per-config root values for both players: the ReBeL value target, before
-    /// projection onto the network's hand-key basis.
+    /// Per-config root values for both players: the ReBeL value target, in the
+    /// same indexing as the root beliefs.
     pub fn root_values(&self, p: usize) -> &[f32] {
         &self.root_mean[p]
     }
