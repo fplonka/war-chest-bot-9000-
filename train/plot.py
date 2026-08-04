@@ -68,8 +68,11 @@ def style(ax, title, ylabel):
 
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else "runs/latest"
-    with open(f"{out}/log.json") as f:
-        log = json.load(f)
+    try:
+        with open(f"{out}/log.json") as f:
+            log = json.load(f)
+    except FileNotFoundError:
+        sys.exit(f"{out}/log.json not found — is the run started, and is the path right?")
     reb = [r for r in log["epochs"] if r["phase"] == "rebel"]
     if not reb:
         sys.exit(f"{out}: no ReBeL epochs yet — still warming up")

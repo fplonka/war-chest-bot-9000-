@@ -481,10 +481,6 @@ def main():
                        f"{args.out}/ckpt_champion.pt")
             torch.save({"value": value.state_dict(), "hidden": args.hidden},
                        f"{args.out}/ckpt_live.pt")
-            with open(f"{args.out}/log.json", "w") as f:
-                json.dump({"epochs": log, "gate": gate_curve,
-                           "champ": {k: champ[k] for k in ("score", "t", "promotions")}},
-                          f, indent=1)
             next_gate = time.time() - t0 + args.gate_every
 
         dec = max(d["decisions"], 1)
@@ -498,6 +494,14 @@ def main():
                "gen_s": round(gen_s, 2), "train_s": round(train_s, 2), "buf": len(buf),
                "lr": opt.param_groups[0]["lr"]}
         log.append(rec)
+        # Rewritten every epoch, not just at gates: this is the file `plot.py`
+        # reads, and a run should be watchable from its first minute rather than
+        # only after the first gate. It is a few hundred kilobytes even on a
+        # long run, so the cost is nothing against a multi-second epoch.
+        with open(f"{args.out}/log.json", "w") as f:
+            json.dump({"epochs": log, "gate": gate_curve,
+                       "champ": {k: champ[k] for k in ("score", "t", "promotions")}},
+                      f, indent=1)
         gstr = "  GATE " + " ".join(f"{k}={v:.3f}" for k, v in scores.items()) if scores else ""
         print(f"[t={rec['t']:6.1f}s] {phase:6s} ep{epoch:3d} games={rec['games']:4d} "
               f"dec={dec:6d} cap={rec['cap_frac']:.2f} cfgs={rec['configs']:5.1f} "

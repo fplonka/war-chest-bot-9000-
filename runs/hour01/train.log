@@ -1,0 +1,26 @@
+[cfg] FEAT=1104 NHAND=56 hidden=384 depth=2 iters=16 budget=3600s warm=300s device=cpu draft=starter gate_every=600s promote=0.55 train_gen_ratio=4.0 augment=True cap=2000000
+[t=   1.0s] greedy ep  0 games=  96 dec= 18576 cap=0.38 cfgs= 25.1 L=0.08317 tgt=+0.009/0.464 pstd=0.343 capv=0.000 lr=1.0e-03 gen=0.1s train=0.9s
+[t=   1.9s] greedy ep  1 games=  96 dec= 17338 cap=0.27 cfgs= 26.0 L=0.07223 tgt=+0.015/0.502 pstd=0.381 capv=0.000 lr=1.0e-03 gen=0.1s train=0.8s
+[t=   3.4s] greedy ep  2 games=  96 dec= 17012 cap=0.26 cfgs= 24.8 L=0.06968 tgt=+0.024/0.496 pstd=0.385 capv=0.000 lr=1.0e-03 gen=0.7s train=0.8s
+[t=   4.4s] greedy ep  3 games=  96 dec= 17060 cap=0.30 cfgs= 24.6 L=0.06214 tgt=+0.032/0.487 pstd=0.392 capv=0.000 lr=1.0e-03 gen=0.1s train=0.9s
+[t=   5.4s] greedy ep  4 games=  96 dec= 17106 cap=0.31 cfgs= 23.3 L=0.06661 tgt=+0.007/0.489 pstd=0.391 capv=0.000 lr=1.0e-03 gen=0.1s train=0.8s
+[t=   6.3s] greedy ep  5 games=  96 dec= 17537 cap=0.31 cfgs= 25.8 L=0.07508 tgt=+0.006/0.485 pstd=0.388 capv=0.000 lr=1.0e-03 gen=0.1s train=0.8s
+[t=   7.4s] greedy ep  6 games=  96 dec= 17759 cap=0.28 cfgs= 25.4 L=0.07540 tgt=+0.019/0.511 pstd=0.384 capv=0.000 lr=1.0e-03 gen=0.2s train=0.9s
+[t=   8.4s] greedy ep  7 games=  96 dec= 16949 cap=0.27 cfgs= 24.6 L=0.07662 tgt=+0.013/0.485 pstd=0.395 capv=0.000 lr=1.0e-03 gen=0.1s train=0.9s
+[t=   9.4s] greedy ep  8 games=  96 dec= 17413 cap=0.29 cfgs= 23.3 L=0.07746 tgt=+0.008/0.484 pstd=0.367 capv=0.000 lr=1.0e-03 gen=0.1s train=0.9s
+[t=  10.5s] greedy ep  9 games=  96 dec= 18620 cap=0.44 cfgs= 23.6 L=0.07561 tgt=-0.001/0.465 pstd=0.369 capv=0.000 lr=1.0e-03 gen=0.1s train=0.9s
+[t=  11.5s] greedy ep 10 games=  96 dec= 16665 cap=0.20 cfgs= 26.5 L=0.07904 tgt=+0.018/0.522 pstd=0.394 capv=0.000 lr=1.0e-03 gen=0.1s train=0.9s
+[t=  12.5s] greedy ep 11 games=  96 dec= 17598 cap=0.31 cfgs= 24.9 L=0.08164 tgt=+0.005/0.479 pstd=0.378 capv=0.000 lr=1.0e-03 gen=0.1s train=0.9s
+[t=  13.8s] greedy ep 12 games=  96 dec= 17750 cap=0.33 cfgs= 22.6 L=0.08347 tgt=+0.016/0.477 pstd=0.390 capv=0.000 lr=1.0e-03 gen=0.3s train=0.9s
+[t=  14.7s] greedy ep 13 games=  96 dec= 16552 cap=0.21 cfgs= 25.2 L=0.08515 tgt=+0.012/0.525 pstd=0.368 capv=0.000 lr=1.0e-03 gen=0.1s train=0.8s
+[t=  15.8s] greedy ep 14 games=  96 dec= 16951 cap=0.28 cfgs= 23.4 L=0.08629 tgt=+0.008/0.517 pstd=0.389 capv=0.000 lr=1.0e-03 gen=0.1s train=0.9s
+[t=  16.7s] greedy ep 15 games=  96 dec= 17080 cap=0.31 cfgs= 25.7 L=0.08820 tgt=+0.004/0.501 pstd=0.364 capv=0.000 lr=1.0e-03 gen=0.1s train=0.9s
+[t=  17.8s] greedy ep 16 games=  96 dec= 18270 cap=0.38 cfgs= 24.7 L=0.08762 tgt=+0.006/0.470 pstd=0.389 capv=0.000 lr=1.0e-03 gen=0.1s train=0.9s
+[t=  18.7s] greedy ep 17 games=  96 dec= 16485 cap=0.21 cfgs= 25.2 L=0.08670 tgt=+0.011/0.520 pstd=0.376 capv=0.000 lr=1.0e-03 gen=0.1s train=0.8s
+[t=  19.7s] greedy ep 18 games=  96 dec= 17531 cap=0.33 cfgs= 23.1 L=0.08893 tgt=-0.007/0.498 pstd=0.365 capv=0.000 lr=1.0e-03 gen=0.1s train=0.9s
+[t=  20.7s] greedy ep 19 games=  96 dec= 16677 cap=0.27 cfgs= 26.4 L=0.09128 tgt=-0.010/0.518 pstd=0.385 capv=0.000 lr=1.0e-03 gen=0.1s train=0.8s
+[t=  21.7s] greedy ep 20 games=  96 dec= 16965 cap=0.31 cfgs= 23.8 L=0.09139 tgt=-0.002/0.485 pstd=0.403 capv=0.000 lr=1.0e-03 gen=0.1s train=0.9s
+[t=  22.7s] greedy ep 21 games=  96 dec= 17543 cap=0.32 cfgs= 24.7 L=0.09201 tgt=+0.012/0.487 pstd=0.359 capv=0.000 lr=1.0e-03 gen=0.1s train=0.9s
+[t=  23.8s] greedy ep 22 games=  96 dec= 17586 cap=0.30 cfgs= 24.2 L=0.09328 tgt=+0.016/0.486 pstd=0.376 capv=0.000 lr=1.0e-03 gen=0.1s train=0.9s
+[t=  24.9s] greedy ep 23 games=  96 dec= 18170 cap=0.38 cfgs= 24.9 L=0.09287 tgt=+0.003/0.451 pstd=0.432 capv=0.000 lr=1.0e-03 gen=0.1s train=0.9s
+[t=  25.9s] greedy ep 24 games=  96 dec= 17685 cap=0.31 cfgs= 23.1 L=0.09476 tgt=+0.004/0.483 pstd=0.371 capv=0.000 lr=1.0e-03 gen=0.1s train=0.9s
