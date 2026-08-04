@@ -2,12 +2,40 @@
 
 The binding constraint on this project is **generation throughput**: how many
 self-play games with a full CFR solve at every decision fit in the wall-clock
-budget. A 10-minute run used to buy 7 ReBeL epochs. It now buys ~120.
+budget. A 10-minute run used to buy 7 ReBeL epochs. It now buys ~110.
 
 Everything here is a performance change. The only one that touches the model is
 the network split (§4), and it is parameter-for-parameter the same network with
 one weight matrix moved; it was validated on a training run like every other
 step, and it *improved* the result.
+
+## The number
+
+| measurement | before | after | ratio |
+|---|---|---|---|
+| ReBeL epochs in a 10-minute budget | 7 | 111 | 15.9x |
+| generation, games/s (in-training) | 1.16 | 10.9 | **9.4x** |
+| benchmark, trained-agent positions | 262 dec/s | ~1900 dec/s | 7.3x |
+| benchmark, **identical** workload | 56.5 s | 2.19 s | **25.8x** |
+
+The last row is the only strictly matched comparison — both builds driven by an
+all-zero network, which makes every leaf value zero, so CFR stays uniform and
+the two play *exactly* the same games with exactly the same subgame trees while
+still doing the full matmul work. Same 2068 decisions either side, interleaved
+reps, best of three.
+
+The spread between 7x and 26x is not noise, it is the shape of the win: the old
+code's cost grew superlinearly in the size of the belief support (dense
+`[parent][child]` draw matrices, a heap allocation per node per solve), and the
+identical-workload run sits at 44 configs per decision against a trained agent's
+23. **The optimisations help most exactly where the old code was worst**, which
+is the late, complicated positions. End to end, in the training loop, it comes
+out at 9-10x.
+
+A caveat on measuring any of this on a laptop: a busy window server and a
+terminal tailing a log cost ~1.8x on this benchmark. Numbers here are best-of-N
+on an otherwise idle machine, and the training runs were compared against
+`runs/diagW2` taken under the same conditions.
 
 ## How this was measured
 
@@ -70,7 +98,7 @@ With `FEAT = 812` and a 132-wide belief block that is 84% of the widest layer,
 computed once per leaf instead of eight times. `forward_split` also emits only
 the output head the current traversal reads.
 
-Together with §1: **262 → 550 decisions/s.**
+Together with §1: **262 → 550 decisions/s** (trained-agent positions).
 
 ## 3. The matmuls were never the problem
 
@@ -164,6 +192,27 @@ per element.
   in game lengths.
 * **Fewer threads.** On this 4P+4E machine, 8 rayon threads beat 6 (1690) and 4
   (1292) despite AMX contention.
+
+## The training runs
+
+Same command as the baseline, `--minutes 10 --warm-frac 0.15 --cap-value 0
+--eval-games 200 --seed 11`, 200 paired evaluation games on the real game.
+
+| run | code | ReBeL epochs | vs Greedy | vs initial |
+|---|---|---|---|---|
+| `runs/diagW2` (baseline) | before | 7 | 0.920 | 0.800 |
+| `runs/perf01_netsplit` | §1-2 | 32 | 0.965 | 0.920 |
+| `runs/perf02_twotower` | §4 | 98 | 1.000 | 0.960 |
+| `runs/perf03_arena` | §5 | 116 | 0.990 | 0.925 |
+| `runs/perf04_final` | §6 | 111 | 0.993 | 0.950 |
+| `runs/perf05_ship` | shipped | 55 | 0.963 | 0.958 |
+
+The last four are the same algorithm at increasing speed; their spread
+(0.963-1.000 and 0.925-0.960) is the run-to-run noise of a 10-minute budget, and
+the standard error on 200 games is ~0.015. `perf05` ran on a machine under heavy
+UI load — its 55 epochs are half what the same code does idle, and its build was
+A/B'd directly against `perf04`'s at 1073 decisions/s each, on bit-identical
+trajectories.
 
 ## Where it is now
 

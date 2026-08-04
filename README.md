@@ -17,6 +17,7 @@ train/           train.py (PyTorch training loop)
 docs/
   ENGINE_FIXES.md  rule corrections found by replaying 1,112 real games
   REBEL.md         the ReBeL agent: PBS design, CFR solver, deviations
+  PERF.md          how the generation loop got ~10x faster, and what didn't work
 papers/          War Chest rulebook, ReBeL, TurboReBeL
 ```
 
@@ -33,6 +34,9 @@ state is exactly `(hand, face-down discards)` — the bag is derived from a publ
 reserve — and the reachable set has median 8 and p99 385 members, so CFR
 enumerates information states exactly instead of approximating them with
 particles. See `docs/REBEL.md`.
+
+Ten minutes on an 8-core M1 is enough to beat the handcrafted Greedy reference
+198-1-1. See `docs/PERF.md` for how the generation loop got there.
 
 ## Design
 
@@ -53,9 +57,14 @@ that way has a scenario test — see `docs/ENGINE_FIXES.md`.
 
 ```bash
 cd engine
-cargo test                          # 39 tests (the invariant playout takes ~100s)
-cargo run --release --bin bench     # throughput, ~2.8M applies/sec/core
+cargo test                          # 50 tests (the solver oracle takes ~85s)
+cargo run --release --bin bench     # engine throughput, ~2.8M applies/sec/core
+cargo run --release --bin rebelbench -- weights.bin   # generation throughput
 maturin develop --release           # python module `warchest` (Game)
 ```
+
+`rebelbench` runs the ReBeL generation loop without Python, on weights exported
+by `train/export_weights.py`, and is what `docs/PERF.md`'s numbers come from.
+Build it with `--features prof` for a per-phase breakdown.
 
 The `python` feature is off by default; the pure-Rust API needs no pyo3.
