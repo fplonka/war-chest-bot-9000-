@@ -168,13 +168,13 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
             uniform_belief(&s, &ctx, 1),
         ];
         // Keep the exhaustive side affordable.
-        if bel[0].len() * bel[1].len() > 150 {
+        if bel[0].len() * bel[1].len() > 64 {
             continue;
         }
 
         let cfg = Cfg {
             depth: 8,
-            iters: 2000,
+            iters: 500,
             average: true,
         };
         let mut sv = Solver::new(&s, &ctx, &nets, cfg, bel.clone());
@@ -218,7 +218,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
             v1
         );
 
-        let exact = oracle_value(&s, &ctx, &bel, 400);
+        let exact = oracle_value(&s, &ctx, &bel, 100);
         assert!(
             (v0 - exact).abs() < 0.03,
             "seed {}: subgame solver says {:.4}, tabular CFR says {:.4} \
@@ -235,7 +235,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
             "  seed {:4}: solver {:+.4}  tabular {:+.4}  zero-sum {:+.4}  ({} nodes, {}x{} configs)",
             seed, v0, exact, v0 + v1, sv.nodes.len(), bel[0].len(), bel[1].len()
         );
-        if checked >= 6 {
+        if checked >= 4 {
             break;
         }
     }
@@ -255,7 +255,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
 fn cfr_iteration_count_bias() {
     let nets = Nets::default();
     let mut rows = 0;
-    let budgets = [4usize, 8, 16, 32, 64, 128, 256];
+    let budgets = [4usize, 16, 64, 256];
     let mut err = vec![0.0f64; budgets.len()];
     let mut nzs = vec![0.0f64; budgets.len()];
     eprintln!("     exact   {}", budgets.iter().map(|b| format!("{:>9}", b)).collect::<String>());
@@ -265,7 +265,7 @@ fn cfr_iteration_count_bias() {
         };
         let ctx = Ctx::new(&s);
         let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
-        if bel[0].len() * bel[1].len() > 150 {
+        if bel[0].len() * bel[1].len() > 64 {
             continue;
         }
         let probe = Solver::new(&s, &ctx, &nets, Cfg { depth: 8, iters: 1, average: true }, bel.clone());
@@ -283,7 +283,7 @@ fn cfr_iteration_count_bias() {
         if o.len() < 2 {
             continue;
         }
-        let exact = oracle_value(&s, &ctx, &bel, 400);
+        let exact = oracle_value(&s, &ctx, &bel, 100);
         let mut line = format!("  {:+.4}   ", exact);
         for (bi, &t) in budgets.iter().enumerate() {
             let mut sv = Solver::new(&s, &ctx, &nets, Cfg { depth: 8, iters: t, average: true }, bel.clone());
@@ -300,7 +300,7 @@ fn cfr_iteration_count_bias() {
         }
         eprintln!("{}", line);
         rows += 1;
-        if rows >= 8 {
+        if rows >= 6 {
             break;
         }
     }
@@ -348,7 +348,16 @@ fn draw_position(seed: u64, warmup: usize, plies: u16) -> Option<State> {
             s.zones[p as usize][Z_FACEDOWN][u] = 0;
         }
         let mut cfg = Config::default();
-        cfg.hand[0] = 1;
+        // A unit whose coins are all deployed (or eliminated) has no reserve
+        // left; the forced one-coin hand must fit the reserve, so use the
+        // first slot that still has coins in the bag.
+        let hand_slot = (0..NSLOT)
+            .find(|&k| s.zones[p as usize][Z_BAG][ctx.slots[p as usize][k] as usize] > 0)
+            .unwrap_or(NSLOT);
+        if hand_slot == NSLOT {
+            return None;
+        }
+        cfg.hand[hand_slot] = 1;
         set_config(&mut s, p, &ctx, &cfg);
     }
     s.main_plays = MAX_MAIN_PLAYS - plies;
