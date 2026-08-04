@@ -315,6 +315,9 @@ pub struct Solver<'a> {
     ob: Vec<f32>,
     sb: Vec<f32>,
     batch_ready: bool,
+    /// Traverser of the previous leaf query, i.e. whose beliefs have moved
+    /// since. `None` before the first query of a solve.
+    last_traverser: Option<usize>,
     /// Working memory for the chance transitions, reused across the tree.
     draw_scratch: DrawScratch,
     /// `key << IDX_BITS | cell` scratch for ordering a public child's support.
@@ -377,20 +380,21 @@ impl<'a> Solver<'a> {
             ob: take_buf(R_OB),
             sb: take_buf(R_SB),
             batch_ready: false,
+            last_traverser: None,
             draw_scratch: DrawScratch::default(),
             cell_order: Vec::new(),
             dm: Default::default(),
         };
         {
             let _t = timed!(BUILD);
-            // A depth-2 subgame runs to roughly 800 nodes and a `TNode` is
-            // about a kilobyte, so growing the vector by doubling copied
-            // hundreds of kilobytes per solve.
-            sv.nodes.reserve(1024);
-            sv.reach.reserve(1024);
-            sv.vals.reserve(1024);
-            sv.regret.reserve(1024);
-            sv.cur.reserve(1024);
+            // A depth-2 subgame runs to roughly 550 nodes, so this is one
+            // allocation each instead of a doubling sequence. Sizing it larger
+            // measures no better: the allocator handles the churn.
+            sv.nodes.reserve(640);
+            sv.reach.reserve(640);
+            sv.vals.reserve(640);
+            sv.regret.reserve(640);
+            sv.cur.reserve(640);
             sv.build(root.clone(), cfg.depth.max(1), cfgs);
         }
         let _t = timed!(ALLOC);
@@ -833,6 +837,14 @@ impl<'a> Solver<'a> {
     fn leaf_values(&mut self, traverser: usize) {
         self.ensure_leaf_batch();
         let rows = self.leaf_rows.len();
+        // Only one player's beliefs have moved since the previous query: the
+        // one whose strategy regret matching updated at the end of the last
+        // step. The other player's block of the encoding is still exactly what
+        // it was, so it is not rewritten. (Caching the *projection* of it
+        // through the first layer as well was tried and is slower — see
+        // `Mlp::forward_split`.)
+        let redo = self.last_traverser;
+        self.last_traverser = Some(traverser);
         {
             let _t = timed!(BELFEAT);
             let (nodes, reach, roff, nc, hoff, hand, res, xb) = (
@@ -847,6 +859,9 @@ impl<'a> Solver<'a> {
             );
             for (r, &i) in self.leaf_rows.iter().enumerate() {
                 for p in 0..2 {
+                    if redo.is_some_and(|l| l != p) {
+                        continue;
+                    }
                     let (h0, h1) = (hoff[2 * r + p] as usize, hoff[2 * r + p + 1] as usize);
                     let at = r * SPLIT + p * BELIEF_DIM;
                     let ra = roff[i] as usize + if p == 1 { nc[i][0] as usize } else { 0 };

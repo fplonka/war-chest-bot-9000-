@@ -512,6 +512,7 @@ impl DrawScratch {
         support: &mut Vec<Config>,
         map: &mut DrawMap,
     ) {
+        let tg = crate::timed!(DGEN);
         self.kid.clear();
         self.prob.clear();
         map.start.clear();
@@ -540,6 +541,8 @@ impl DrawScratch {
         }
         // Sort once by integer key, then read the support and the child index
         // of every row off that single ordering — no per-row binary search.
+        drop(tg);
+        let _ts = crate::timed!(DSORT);
         assert!(self.kid.len() < 1 << IDX_BITS, "draw fan-out over the index width");
         self.order.clear();
         self.order.extend(
@@ -570,6 +573,7 @@ impl DrawScratch {
     /// the public tree, so composing them collapses the run into one node —
     /// and with it the states, reach vectors and value vectors of the rest.
     pub fn compose(&mut self, a: &DrawMap, b: &DrawMap, n_child: usize, out: &mut DrawMap) {
+        let _t = crate::timed!(DCOMP);
         if self.acc.len() < n_child {
             self.acc.resize(n_child, 0.0);
             self.hit.resize(n_child, false);

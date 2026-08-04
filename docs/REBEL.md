@@ -129,8 +129,28 @@ knowledge enters through the value network, which is what CFR actually consumes.
 
 ## 4. The value network
 
-`FEAT -> h -> h -> 2·NHAND`, a 2-hidden-layer MLP (`--hidden`, default 384),
-trained in PyTorch and evaluated in Rust through Accelerate's `cblas_sgemm`.
+A 2-hidden-layer MLP (`--hidden`, default 384), trained in PyTorch and evaluated
+in Rust through Accelerate's `cblas_sgemm`, **split around the belief block**:
+
+```
+x_public (680) --W0--> h --LN,relu--> --W1--> \
+                                               (+) --LN,relu--> --W2--> 2·NHAND
+x_belief (132) ------------------------Wb---> /
+```
+
+Same parameter count and same depth as a plain `FEAT -> h -> h -> 2·NHAND`; the
+only difference is *where* the belief block connects. It matters because of how
+a subgame queries the network: the same leaf is evaluated once per CFR
+iteration, and between iterations only its beliefs move — the public half of its
+encoding is a property of the leaf's state and is fixed for the whole solve. So
+the entire public tower (the widest matmul in the network, plus a full hidden
+layer) is computed **once per leaf per solve**, and only the 132×h belief
+projection and the output head run per iteration. That is 2.6x less
+per-iteration matmul work, and it made the value function *better*, not worse
+(§5).
+
+`Mlp::trunk` computes the cached half; `Mlp::forward_split` the rest, emitting
+only the one output head the current traversal reads.
 
 **The deliberate information bottleneck.** In-subgame CFR uses exact
 `(hand, facedown)` configs, but the network keys values by **hand** (56 keys per
@@ -190,23 +210,21 @@ difference between a usable result and a coin flip.
 Evaluation plays paired matches — same draft and the same random stream for both
 seatings — using a full solve and the CFR average strategy.
 
-### Measured result (30 minutes, 8-core M1, `runs/final30b`)
+### Measured result (10 minutes, 8-core M1, depth 2, `runs/perf04_final`)
 
 ```
-Greedy vs uniform-random (sanity)        score 0.951 +- 0.018     <- the baseline is real
-initial checkpoint vs Greedy             score 0.525 +- 0.041
-final checkpoint  vs Greedy              score 0.680 +- 0.038
-final checkpoint  vs initial checkpoint  score 0.674 +- 0.038
+final checkpoint  vs Greedy              score 0.99 - 1.00
+final checkpoint  vs initial checkpoint  score 0.92 - 0.96
 ```
 
-600 paired games per pairing. Gate curve against Greedy over the ReBeL phase:
-0.493 → 0.593 → 0.637 → 0.640 → **0.740** → 0.653 → 0.623 → 0.690. The fraction
-of games hitting the 256-play horizon falls from 0.23 to ~0.08 as the agent
-learns to actually finish games.
+200 paired games per pairing, on the real game (horizon payoff annealed to 0).
+Three runs of the same configuration span 0.99-1.00 and 0.925-0.960; the spread
+is the run-to-run noise of a 10-minute budget, not a difference between builds.
 
-Throughput on 8 cores: ~900 games/s for the greedy warm start, ~11 games/s with
-a full CFR solve at every decision (~2000 solved decisions/s), ~25 configs per
-decision.
+Throughput on 8 cores in the ReBeL phase: **~11.5 games/s** with a full CFR
+solve at every decision (~1400 solved decisions/s), ~24 configs per decision.
+That is 9-10x what this took before `docs/PERF.md`'s work, which is what turns a
+10-minute budget from 7 ReBeL epochs into ~120.
 
 ### The Monte-Carlo anchor
 
@@ -235,22 +253,14 @@ expectation. `--mc-mix 0` recovers plain ReBeL, and reproduces the collapse.
 
 ## 7. Known gaps
 
-* **Depth 1 by default.** `--depth 2` works and gives a genuine opponent reply
-  inside the subgame; it costs roughly the branching factor in time. The 30
-  minute budget does not pay for it.
-* **T = 16 CFR iterations**, against the paper's 256/1024. Same reason.
-* **No micro-endgame oracle yet.** The right next test is tabular CFR on real
-  late-game positions small enough to solve exactly, compared against recursive
-  net-based solving — the analogue of the reference's `recursive_eval`.
+* **T = 8 CFR iterations**, against the paper's 256/1024. Measured against exact
+  values on micro-endgames, mean |error| is 0.0035 at T=8 beside a target spread
+  of ~0.3, and target rate is the binding constraint at depth 2.
 * **No policy network.** The paper treats it as optional (value net alone
   converges); it would be worth adding for CFR warm starting and for fast play.
-* **The horizon coefficient is not annealed yet.** `CAP_MARKER_VALUE` stays at
-  0.15 for the whole run. Now that the horizon fraction drops below 0.1, it
-  should decay toward 0 so the equilibrium stops being distorted.
-* **The warm-started checkpoint only just clears Greedy** (0.525 ± 0.041). That
-  is expected — a one-ply CFR solve on a value network fitted to greedy play is
-  not obviously better than greedy itself — but it means the interesting claim
-  is the +0.155 that self-play adds on top.
+* **The subgame is chance-free except for round-start draws**, which are walked
+  through rather than branched (the reference's own v1 simplification for other
+  chance nodes still applies: they are clamped as leaves).
 
 ## 8. Layout
 

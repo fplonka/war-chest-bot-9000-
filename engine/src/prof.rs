@@ -21,7 +21,7 @@ mod imp {
     }
 
     counters!(
-        BUILD, BACTS, BDRAW, BAPPLY, BPUSH, ALLOC, REACH, PUBFEAT, PUBNET, BELFEAT, NET, LEAFPOST, BACK, RM, AVG, WALK,
+        BUILD, BACTS, BDRAW, DGEN, DSORT, DCOMP, BAPPLY, BPUSH, ALLOC, REACH, PUBFEAT, PUBNET, BELFEAT, NET, LEAFPOST, BACK, RM, AVG, WALK,
     );
 
     pub struct Timer(std::time::Instant, &'static AtomicU64);
