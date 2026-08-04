@@ -3,11 +3,23 @@
 //! Belief bookkeeping bugs do not crash — they just make the bot quietly wrong —
 //! so these are the load-bearing tests of the whole ReBeL stack.
 //!
-//! 1. `features_do_not_leak_private_information`: the PBS encoding must be a
-//!    function of the public state and the beliefs alone. Swapping a player's
-//!    true config for any other config consistent with the same public counts
-//!    must not move a single feature.
-//! 2. `belief_tracker_matches_brute_force`: the incremental tracker is compared
+//! 1. `features_do_not_leak_private_information`: the public encoding must be a
+//!    function of the public state alone. Swapping a player's true config for
+//!    any other config consistent with the same public counts must not move a
+//!    single feature.
+//! 2. `a_solve_reads_only_the_beliefs`: the same property one level up. The
+//!    value network is now asked about specific configs, so the leak the first
+//!    test guards is no longer the only way private information could reach it;
+//!    this one solves the same public position in two different worlds and
+//!    requires bit-identical values and strategies.
+//! 3. `config_features_separate_every_config`: the value function's argument
+//!    must actually identify the config. If two distinct private states shared
+//!    a feature vector the network could not tell them apart, which is the bug
+//!    the hand-keyed encoding had by construction.
+//! 4. `the_value_function_separates_configs_sharing_a_hand`: end to end — two
+//!    configs with the same hand and different face-down piles must get
+//!    different leaf values, and therefore different play.
+//! 5. `belief_tracker_matches_brute_force`: the incremental tracker is compared
 //!    against an exhaustive enumeration of every world consistent with the
 //!    observation sequence, weighted by exact draw probabilities and the
 //!    announced policy. The brute-force side goes through the engine only — it
@@ -15,12 +27,33 @@
 
 use std::collections::HashMap;
 
+use warchest::net::Mlp;
 use warchest::rebel::*;
 use warchest::rng::Rng;
-use warchest::search::node_actions;
+use warchest::search::{node_actions, Cfg, Nets, Solver};
 use warchest::selfplay::make_game;
-use warchest::state::{State, Z_BAG, Z_FACEDOWN, Z_FACEUP};
+use warchest::state::{Cont, State, Z_BAG, Z_FACEDOWN, Z_FACEUP};
 use warchest::Action;
+
+/// A network with random weights, for tests that need the value function to
+/// actually distinguish things rather than return zero.
+fn random_net(seed: u64, hidden: usize, dg: usize) -> Mlp {
+    let mut r = Rng::new(seed);
+    let dims = [PUBFEAT, hidden, CFEAT, dg, dg];
+    let nw = PUBFEAT * hidden + hidden * hidden + 2 * dg * hidden + CFEAT * dg + dg * (dg + 1) + hidden * dg;
+    let mut draw = |n: usize, scale: f32| -> Vec<f32> {
+        (0..n).map(|_| (r.unit_f64() as f32 - 0.5) * scale).collect()
+    };
+    let w = draw(nw, 0.2);
+    let b = draw(hidden + hidden + dg + (dg + 1) + dg, 0.2);
+    // LayerNorm starts at its identity, as torch does.
+    let mut ln = Vec::new();
+    for _ in 0..2 {
+        ln.extend(std::iter::repeat(1.0).take(hidden));
+        ln.extend(std::iter::repeat(0.0).take(hidden));
+    }
+    Mlp::from_flat(&dims, &w, &b, &ln).expect("random net")
+}
 
 /// Instantiate a world from the shared public state plus both configs.
 fn world(pubs: &State, ctx: &Ctx, c: &(Config, Config)) -> State {
@@ -98,10 +131,6 @@ fn leak_check(random_draft: bool) -> (usize, usize) {
     for g in 0..12u64 {
         let mut s = make_game(&mut Rng::new(g + 1), random_draft);
         let ctx = Ctx::new(&s);
-        let bel = [
-            Belief::point(Config::default()),
-            Belief::point(Config::default()),
-        ];
         for _ in 0..150 {
             if s.is_terminal() {
                 break;
@@ -113,14 +142,14 @@ fn leak_check(random_draft: bool) -> (usize, usize) {
                 if all.len() < 2 {
                     continue;
                 }
-                let mut a = vec![0.0f32; FEAT];
-                let mut b = vec![0.0f32; FEAT];
+                let mut a = vec![0.0f32; PUBFEAT];
+                let mut b = vec![0.0f32; PUBFEAT];
                 let mut sa = s.clone();
                 set_config(&mut sa, p, &ctx, &all[0]);
-                write_features(&sa, &ctx, &bel, &mut a);
+                write_public_features(&sa, &ctx, &mut a);
                 let mut sb = s.clone();
                 set_config(&mut sb, p, &ctx, &all[all.len() - 1]);
-                write_features(&sb, &ctx, &bel, &mut b);
+                write_public_features(&sb, &ctx, &mut b);
                 assert_eq!(
                     a, b,
                     "features changed when only player {}'s hidden config changed",
@@ -340,71 +369,227 @@ fn compare(
     }
 }
 
-/// The belief block the solver writes per leaf per CFR iteration must equal the
-/// straightforward definition: the hand-key marginal, and the belief-weighted
-/// bag and face-down composition.
-///
-/// `write_belief_block` accumulates the two hidden components and derives the
-/// bag as `reserve - E[hand] - E[facedown]` instead of forming each config's
-/// bag first — half the arithmetic in a loop that runs once per leaf per player
-/// per iteration, but a different expression, so it gets an oracle.
+
+// ------------------------------------------------- the value function's argument
+
+/// Two different private states must never share a feature vector. This is the
+/// property that makes `v(PBS, config)` a function *of the config*: without it
+/// the network is being asked about an equivalence class, which is what the
+/// hand-keyed encoding was and why it changed the game being solved.
 #[test]
-fn belief_block_matches_the_direct_definition() {
+fn config_features_separate_every_config() {
+    let mut seen: HashMap<Vec<u32>, Config> = HashMap::new();
+    let mut checked = 0usize;
+    for seed in 0..300u64 {
+        let mut r = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
+        let reserve: [u8; NSLOT] = std::array::from_fn(|_| r.below(6) as u8);
+        for hand_size in 0..=HAND_CAP as u8 {
+            for fd_size in 0..4u8 {
+                let cfgs = enumerate_configs(&reserve, hand_size, fd_size);
+                seen.clear();
+                for c in &cfgs {
+                    for p in 0..2usize {
+                        let mut phi = vec![0.0f32; CFEAT];
+                        write_config_feats(c, &reserve, p, &mut phi);
+                        // Bit patterns, so this compares exactly rather than
+                        // up to a tolerance chosen to make it pass.
+                        let key: Vec<u32> = phi.iter().map(|x| x.to_bits()).collect();
+                        if let Some(prev) = seen.insert(key, *c) {
+                            assert_eq!(prev, *c, "two configs share a feature vector");
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 10_000, "only {checked} config vectors exercised");
+}
+
+/// The counts must be the ones the name says, and the bag must be the derived
+/// one. A transposition here would be invisible to every other test: the
+/// network would happily learn whatever permutation it was given.
+#[test]
+fn config_counts_are_hand_facedown_bag() {
+    let reserve = [4u8, 3, 5, 2, 1];
+    let c = Config { hand: [1, 0, 2, 0, 0], fd: [2, 1, 0, 0, 1] };
+    let mut cnt = [0u8; CCOUNTS];
+    config_counts(&c, &reserve, &mut cnt);
+    assert_eq!(&cnt[..NSLOT], &c.hand, "hand block");
+    assert_eq!(&cnt[NSLOT..2 * NSLOT], &c.fd, "face-down block");
+    assert_eq!(&cnt[2 * NSLOT..], &[1u8, 2, 3, 2, 0], "bag block");
+    let mut phi = vec![0.0f32; CFEAT];
+    write_config_feats(&c, &reserve, 1, &mut phi);
+    for k in 0..CCOUNTS {
+        assert_eq!(phi[k], cnt[k] as f32 / CNORM);
+    }
+    assert_eq!(phi[CCOUNTS], 1.0, "seat flag");
+}
+
+// ------------------------------------------------------ no leak through a solve
+
+/// Find a mid-game decision node whose acting player has at least two configs
+/// sharing a hand — the situation the whole rearchitecture is about.
+fn position_with_ambiguous_facedown(seed: u64) -> Option<(State, Ctx, [Belief; 2])> {
+    let mut rng = Rng::new(seed);
+    let mut s = make_game(&mut Rng::new(seed), false);
+    for _ in 0..40 + rng.below(60) {
+        if s.is_terminal() {
+            return None;
+        }
+        let acts = s.legal_actions();
+        if acts.is_empty() {
+            return None;
+        }
+        s.apply_inplace(acts[rng.below(acts.len())]);
+    }
+    while !s.is_terminal() && s.is_chance() {
+        let acts = s.legal_actions();
+        s.apply_inplace(acts[rng.below(acts.len())]);
+    }
+    if s.is_terminal() || s.is_chance() || !matches!(s.pending(), Cont::MainPlay) {
+        return None;
+    }
+    let ctx = Ctx::new(&s);
+    let mut bel = Vec::new();
+    for p in 0..2u8 {
+        let res = reserve(&s, p, &ctx);
+        let truth = true_config(&s, p, &ctx);
+        let cfg = enumerate_configs(&res, truth.hand_size(), truth.fd_size());
+        if cfg.is_empty() {
+            return None;
+        }
+        let w = 1.0 / cfg.len() as f32;
+        bel.push(Belief { p: vec![w; cfg.len()], cfg });
+    }
+    let me = s.to_act() as usize;
+    let mut hands: HashMap<[u8; NSLOT], usize> = HashMap::new();
+    for c in &bel[me].cfg {
+        *hands.entry(c.hand).or_insert(0) += 1;
+    }
+    if !hands.values().any(|&n| n > 1) {
+        return None;
+    }
+    Some((s, ctx, [bel[0].clone(), bel[1].clone()]))
+}
+
+/// A solve must be a function of the public state and the beliefs — nothing
+/// else. The tree is built from a `State` that still carries somebody's true
+/// hidden coins, so "the solver never looks at them" is a property worth
+/// checking rather than assuming: instantiate the same public position in two
+/// different worlds and require the results to agree bit for bit.
+#[test]
+fn a_solve_reads_only_the_beliefs() {
+    let mut nets = Nets::default();
+    nets.value = random_net(0xA11CE, 64, 16);
+    let cfg = Cfg { depth: 2, iters: 8, average: true };
+    let mut checked = 0usize;
+    for seed in 1..80u64 {
+        let Some((s, ctx, bel)) = position_with_ambiguous_facedown(seed) else {
+            continue;
+        };
+        // Two worlds with the same public projection: the first and the last
+        // config in each player's support.
+        let mut runs = Vec::new();
+        for pick in [0usize, 1] {
+            let mut w = s.clone();
+            for p in 0..2usize {
+                let cs = &bel[p].cfg;
+                let c = if pick == 0 { cs[0] } else { cs[cs.len() - 1] };
+                set_config(&mut w, p as u8, &ctx, &c);
+            }
+            let mut sv = Solver::new(&w, &ctx, &nets, cfg, bel.clone());
+            sv.complete();
+            let strat: Vec<f32> = (0..bel[w.to_act() as usize].cfg.len())
+                .flat_map(|c| sv.average_strategy(0, c).to_vec())
+                .collect();
+            runs.push((sv.root_values(0).to_vec(), sv.root_values(1).to_vec(), strat));
+        }
+        assert_eq!(runs[0].0, runs[1].0, "player 0 root values moved with the true world");
+        assert_eq!(runs[0].1, runs[1].1, "player 1 root values moved with the true world");
+        assert_eq!(runs[0].2, runs[1].2, "the root strategy moved with the true world");
+        checked += 1;
+    }
+    assert!(checked > 20, "only {checked} positions exercised");
+}
+
+/// The regression test for the thing this architecture exists to fix.
+///
+/// Two configs that share a hand but hold different face-down piles have
+/// different bags and therefore different futures. They must get different
+/// values, and because CFR derives its strategy from those values, different
+/// play. Under the old hand-keyed head both were identically zero-difference by
+/// construction — the network could not express the distinction and the solver
+/// could not act on it.
+#[test]
+fn the_value_function_separates_configs_sharing_a_hand() {
+    let mut nets = Nets::default();
+    nets.value = random_net(0xBEEF, 64, 16);
+    let cfg = Cfg { depth: 2, iters: 8, average: true };
+    let (mut positions, mut val_differs, mut strat_differs) = (0usize, 0usize, 0usize);
+    for seed in 1..80u64 {
+        let Some((s, ctx, bel)) = position_with_ambiguous_facedown(seed) else {
+            continue;
+        };
+        let me = s.to_act() as usize;
+        let mut sv = Solver::new(&s, &ctx, &nets, cfg, bel.clone());
+        sv.complete();
+        let v = sv.root_values(me);
+        for i in 0..bel[me].cfg.len() {
+            for j in 0..i {
+                if bel[me].cfg[i].hand != bel[me].cfg[j].hand {
+                    continue;
+                }
+                positions += 1;
+                if (v[i] - v[j]).abs() > 1e-9 {
+                    val_differs += 1;
+                }
+                let (a, b) = (sv.average_strategy(0, i), sv.average_strategy(0, j));
+                if a.iter().zip(b.iter()).any(|(x, y)| (x - y).abs() > 1e-9) {
+                    strat_differs += 1;
+                }
+            }
+        }
+    }
+    assert!(positions > 50, "only {positions} same-hand pairs found");
+    // Not every pair must differ — two face-down piles can leave the same bag
+    // when the coins came from the same slot — but the overwhelming majority
+    // must, and under the old architecture the count was exactly zero except
+    // where a round-start draw happened to fall inside the horizon.
+    let vf = val_differs as f64 / positions as f64;
+    let sf = strat_differs as f64 / positions as f64;
+    assert!(vf > 0.9, "only {:.0}% of same-hand config pairs got distinct values", vf * 100.0);
+    assert!(sf > 0.5, "only {:.0}% of same-hand config pairs got distinct play", sf * 100.0);
+}
+
+/// `normalize_weights` is what turns a reach vector into the belief the network
+/// reads, and it has to agree with `Belief::normalize` — including the fallback
+/// to uniform when the reaches have underflowed to zero, which is where a
+/// mismatch would silently produce a different query than the trainer saw.
+#[test]
+fn normalized_weights_match_belief_normalize() {
     let mut rng = Rng::new(0xB33F);
     let mut checked = 0usize;
     for seed in 0..400u64 {
         let mut r = Rng::new(seed.wrapping_mul(0x9E37_79B9));
         let reserve: [u8; NSLOT] = std::array::from_fn(|_| r.below(6) as u8);
-        let hand_size = r.below(4) as u8;
-        let fd_size = r.below(4) as u8;
-        let cfgs = enumerate_configs(&reserve, hand_size, fd_size);
+        let cfgs = enumerate_configs(&reserve, r.below(4) as u8, r.below(4) as u8);
         if cfgs.is_empty() {
             continue;
         }
-        // Unnormalised weights, including the all-zero case the smoothing
-        // fallback exists for.
         let w: Vec<f32> = if seed % 17 == 0 {
             vec![0.0; cfgs.len()]
         } else {
             cfgs.iter().map(|_| rng.unit_f64() as f32).collect()
         };
-
-        let mut got = vec![0.0f32; BELIEF_DIM];
-        write_belief_block(&cfgs, None, &w, &reserve, &mut got);
-
-        let mut bel = Belief {
-            cfg: cfgs.clone(),
-            p: w.clone(),
-        };
+        let mut got = vec![0.0f32; cfgs.len()];
+        normalize_weights(&w, &mut got);
+        let mut bel = Belief { cfg: cfgs.clone(), p: w.clone() };
         bel.normalize();
-        let hm = bel.hand_marginal();
-        let (bag, fd) = bel.composition(&reserve);
-        for h in 0..NHAND {
-            assert!(
-                (got[h] - hm[h]).abs() < 2e-6,
-                "hand marginal {} differs: {} vs {}",
-                h,
-                got[h],
-                hm[h]
-            );
-        }
-        for k in 0..NSLOT {
-            assert!(
-                (got[NHAND + k] - bag[k]).abs() < 2e-6,
-                "bag composition {} differs: {} vs {}",
-                k,
-                got[NHAND + k],
-                bag[k]
-            );
-            assert!(
-                (got[NHAND + NSLOT + k] - fd[k]).abs() < 2e-6,
-                "face-down composition {} differs: {} vs {}",
-                k,
-                got[NHAND + NSLOT + k],
-                fd[k]
-            );
+        for (a, b) in got.iter().zip(bel.p.iter()) {
+            assert!((a - b).abs() < 2e-7, "{a} vs {b}");
         }
         checked += 1;
     }
-    assert!(checked > 100, "only {} belief blocks exercised", checked);
+    assert!(checked > 100, "only {checked} weight vectors exercised");
 }

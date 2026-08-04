@@ -507,84 +507,22 @@ fn nets() -> &'static RwLock<Vec<Nets>> {
     NETS.get_or_init(|| RwLock::new(vec![Nets::default(); N_SLOTS]))
 }
 
-fn split_mlp(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32], split: usize) -> PyResult<Mlp> {
-    let mut mlp = Mlp {
-        dims: dims.to_vec(),
-        w: Vec::new(),
-        b: Vec::new(),
-        ln_w: Vec::new(),
-        ln_b: Vec::new(),
-        split,
-        wb: Vec::new(),
-    };
-    let (mut wi, mut bi) = (0usize, 0usize);
-    for l in 0..dims.len() - 1 {
-        let (i, o) = (dims[l], dims[l + 1]);
-        if wi + i * o > w.len() || bi + o > b.len() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "weight buffer too short for the given dims",
-            ));
-        }
-        mlp.w.push(w[wi..wi + i * o].to_vec());
-        mlp.b.push(b[bi..bi + o].to_vec());
-        wi += i * o;
-        bi += o;
-    }
-    // The belief block's connection into the second hidden layer, shipped last.
-    if split > 0 {
-        let need = split * dims[1];
-        if wi + need > w.len() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "weight buffer too short for the belief projection",
-            ));
-        }
-        mlp.wb = w[wi..wi + need].to_vec();
-    }
-    // LayerNorm parameters for the hidden layers, weight then bias per layer.
-    // An empty buffer means the network has no norm.
-    if !ln.is_empty() {
-        let hidden = dims.len() - 2;
-        let need: usize = 2 * dims[1..dims.len() - 1].iter().sum::<usize>();
-        if ln.len() != need {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "layernorm buffer is {} floats, expected {}",
-                ln.len(),
-                need
-            )));
-        }
-        let mut li = 0usize;
-        for l in 0..hidden {
-            let o = dims[l + 1];
-            mlp.ln_w.push(ln[li..li + o].to_vec());
-            li += o;
-            mlp.ln_b.push(ln[li..li + o].to_vec());
-            li += o;
-        }
-    }
-    Ok(mlp)
-}
-
-/// Install value-network weights. `w` holds every layer's `[in, out]` matrix
-/// concatenated row-major (torch's `weight.t()`), `b` every bias.
+/// Install value-network weights. `dims` is `[pub, hidden, cfeat, dg]`; `w`,
+/// `b` and `ln` are the flat arrays `Mlp::from_flat` documents.
 #[pyfunction]
-#[pyo3(signature = (dims, w, b, slot=0, ln=None, split=0))]
+#[pyo3(signature = (dims, w, b, ln, slot=0))]
 fn set_weights(
     dims: Vec<usize>,
     w: PyReadonlyArray1<f32>,
     b: PyReadonlyArray1<f32>,
+    ln: PyReadonlyArray1<f32>,
     slot: usize,
-    ln: Option<PyReadonlyArray1<f32>>,
-    split: usize,
 ) -> PyResult<()> {
     if slot >= N_SLOTS {
         return Err(pyo3::exceptions::PyValueError::new_err("slot out of range"));
     }
-    let empty: [f32; 0] = [];
-    let ln_slice = match &ln {
-        Some(a) => a.as_slice()?,
-        None => &empty,
-    };
-    let mlp = split_mlp(&dims, w.as_slice()?, b.as_slice()?, ln_slice, split)?;
+    let mlp = Mlp::from_flat(&dims, w.as_slice()?, b.as_slice()?, ln.as_slice()?)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
     nets().write().unwrap()[slot].value = mlp;
     Ok(())
 }
@@ -613,9 +551,16 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     out.set_item("draws", d.draws)?;
     out.set_item("cap_hits", d.cap_hits)?;
     out.set_item("configs", d.configs)?;
+    assert_eq!(
+        d.coff.len(),
+        if d.nv == 0 { 0 } else { 2 * d.nv + 1 },
+        "config offsets do not match the row count"
+    );
     out.set_item("vx", d.vx.into_pyarray_bound(py))?;
-    out.set_item("vy", d.vy.into_pyarray_bound(py))?;
-    out.set_item("vm", d.vm.into_pyarray_bound(py))?;
+    out.set_item("cc", d.cc.into_pyarray_bound(py))?;
+    out.set_item("cw", d.cw.into_pyarray_bound(py))?;
+    out.set_item("cy", d.cy.into_pyarray_bound(py))?;
+    out.set_item("coff", d.coff.into_pyarray_bound(py))?;
     Ok(out.into())
 }
 
@@ -670,7 +615,7 @@ fn gen_data(
 
 /// Head-to-head evaluation with alternating colours and paired drafts.
 #[pyfunction]
-#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=false))]
+#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=false, iters_b=None))]
 #[allow(clippy::too_many_arguments)]
 fn eval_match(
     py: Python<'_>,
@@ -684,13 +629,19 @@ fn eval_match(
     slot_a: usize,
     slot_b: usize,
     random_draft: bool,
+    iters_b: Option<usize>,
 ) -> PyResult<(usize, usize, usize)> {
     let cfg = Cfg {
         depth,
         iters,
         average: true,
     };
-    let (aa, bb) = (agent_of(a, cfg, temp, slot_a)?, agent_of(b, cfg, temp, slot_b)?);
+    let cfg_b = Cfg {
+        depth,
+        iters: iters_b.unwrap_or(iters),
+        average: true,
+    };
+    let (aa, bb) = (agent_of(a, cfg, temp, slot_a)?, agent_of(b, cfg_b, temp, slot_b)?);
     Ok(py.allow_threads(|| {
         let n = nets().read().unwrap();
         rs_eval_match(games, seed, &n, aa, bb, random_draft)
@@ -703,14 +654,21 @@ fn set_cap_value(v: f32) {
     crate::state::set_cap_marker_value(v);
 }
 
-/// Run the Rust value network forward on `x` (`rows * FEAT`, row-major) and
-/// return `rows * 2*NHAND` outputs. Exists so the Python side can assert that
-/// the inference path used to generate targets is numerically the same network
-/// that PyTorch trains -- a silent divergence there would corrupt every target
-/// while every other test kept passing.
+/// Run the Rust value network forward: `xpub` is `rows * PUBFEAT`, `xbel` is
+/// `rows * 2*dg` and `phi` is `rows * CFEAT` — one config scored per row.
+/// Returns `rows` values. Exists so the Python side can assert that the
+/// inference path used to generate targets is numerically the same network that
+/// PyTorch trains -- a silent divergence there would corrupt every target while
+/// every other test kept passing.
 #[pyfunction]
-#[pyo3(signature = (x, rows, slot=0))]
-fn infer(x: PyReadonlyArray1<f32>, rows: usize, slot: usize) -> PyResult<Vec<f32>> {
+#[pyo3(signature = (xpub, xbel, phi, rows, slot=0))]
+fn infer(
+    xpub: PyReadonlyArray1<f32>,
+    xbel: PyReadonlyArray1<f32>,
+    phi: PyReadonlyArray1<f32>,
+    rows: usize,
+    slot: usize,
+) -> PyResult<Vec<f32>> {
     if slot >= N_SLOTS {
         return Err(pyo3::exceptions::PyValueError::new_err("slot out of range"));
     }
@@ -719,9 +677,7 @@ fn infer(x: PyReadonlyArray1<f32>, rows: usize, slot: usize) -> PyResult<Vec<f32
     if mlp.is_empty() {
         return Err(pyo3::exceptions::PyValueError::new_err("no weights in slot"));
     }
-    let (mut scratch, mut out) = (Vec::new(), Vec::new());
-    mlp.forward(x.as_slice()?, rows, &mut scratch, &mut out);
-    Ok(out)
+    Ok(mlp.forward(xpub.as_slice()?, xbel.as_slice()?, phi.as_slice()?, rows))
 }
 
 /// The gather a convolutional trunk needs: `N_HEXES * 7` indices, each hex
@@ -773,14 +729,14 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hex_mirror, m)?)?;
     m.add_class::<Game>()?;
     m.add("MAX_MAIN_PLAYS", crate::state::MAX_MAIN_PLAYS)?;
-    m.add("FEAT", crate::rebel::FEAT)?;
-    m.add("BELIEF_SPLIT", 2 * crate::rebel::BELIEF_DIM)?;
-    m.add("NHAND", crate::rebel::NHAND)?;
+    m.add("PUBFEAT", crate::rebel::PUBFEAT)?;
+    m.add("CFEAT", crate::rebel::CFEAT)?;
+    m.add("CCOUNTS", crate::rebel::CCOUNTS)?;
+    m.add("CNORM", crate::rebel::CNORM)?;
     m.add("N_HEXES", crate::board::N_HEXES)?;
     m.add("N_UNITS", crate::units::N_UNITS)?;
     m.add("NSLOT", crate::rebel::NSLOT)?;
     m.add("CARD_FEATS", crate::units::CARD_FEATS)?;
-    m.add("BELIEF_DIM", crate::rebel::BELIEF_DIM)?;
     // Block offsets in the public half of the encoding. Exported so the
     // training side can build the mirror permutation from one source of truth
     // rather than restating the layout.
@@ -796,7 +752,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("OFF_CARDS", crate::rebel::OFF_CARDS)?;
     m.add("OFF_PLAYER", crate::rebel::OFF_PLAYER)?;
     m.add("OFF_GLOBAL", crate::rebel::OFF_GLOBAL)?;
-    m.add("OFF_BELIEF", crate::rebel::OFF_BELIEF)?;
     m.add_function(wrap_pyfunction!(hex_neighborhood, m)?)?;
     m.add_function(wrap_pyfunction!(set_weights, m)?)?;
     m.add_function(wrap_pyfunction!(set_cap_value, m)?)?;

@@ -1,50 +1,52 @@
 """Ask how much of a dumped replay buffer's target signal is actually learnable.
 
-Every architecture tried so far plateaus at the same held-out error, which is
-the signature of a floor that has nothing to do with the network. There are
-three candidate explanations and they need separating before any more
-architecture work is justified:
+When held-out error stops falling, there are three candidate explanations and
+they need separating before any architecture work is justified:
 
   1. **Drift.** Targets are bootstrapped, so a row recorded early in a run and
      a row recorded late carry values computed from different networks. Across
      a whole buffer the target stops being a function of the input alone.
-  2. **A bug.** Contradictory labels, a mis-shaped mask, a target written to
-     the wrong head.
-  3. **Nothing wrong.** The value really does have irreducible spread given the
-     network only sees a hand key rather than a full config.
+  2. **A bug.** Contradictory labels, a target written against the wrong
+     config, a belief that does not match the values beside it.
+  3. **Nothing wrong.** Some irreducible spread the network cannot see.
 
 This script is deliberately **model-free**: it never trains anything, so it
-cannot be fooled by an optimiser or an architecture. It finds rows whose inputs
-are byte-identical and measures how much their targets disagree. That
-disagreement is a hard lower bound on the error *any* network can achieve --
-identical inputs must produce identical outputs.
+cannot be fooled by an optimiser or an architecture. It finds rows whose whole
+input is byte-identical -- public encoding, config lists and belief weights --
+and measures how much their targets disagree. That disagreement is a hard lower
+bound on the error *any* network can achieve: identical inputs must produce
+identical outputs.
 
 The age gap is what separates (1) from (2). If duplicates recorded far apart
 disagree while duplicates recorded close together agree, the floor is drift. If
 even near-simultaneous duplicates disagree, something is wrong.
 
-    python train/diagnose.py runs/feat01/buf.npz
+    python train/diagnose.py runs/mine/buf.npz
 """
 
 import argparse
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
 
+from dump import Dump
 
-def duplicate_groups(vx, max_rows):
-    """Group row indices by exact feature bytes."""
-    x = np.ascontiguousarray(vx[:max_rows])
-    view = x.view(np.void, )  # noqa: E203 - one void scalar per row
-    view = np.ascontiguousarray(x).view([("b", np.void, x.dtype.itemsize * x.shape[1])]).ravel()
-    order = np.argsort(view, kind="stable")
-    srt = view[order]
-    # Boundaries of runs of equal rows.
-    new = np.ones(len(srt), dtype=bool)
-    new[1:] = srt[1:] != srt[:-1]
-    starts = np.flatnonzero(new)
-    sizes = np.diff(np.append(starts, len(srt)))
-    return order, starts, sizes
+
+def row_keys(d, n):
+    """One hashable key per row: everything the network is given, verbatim."""
+    keys = []
+    for r in range(n):
+        a, b = int(d.row_start[r]), int(d.row_start[r + 1])
+        keys.append(
+            d.x[r].tobytes()
+            + d.cc[a:b].tobytes()
+            + d.cp[a:b].tobytes()
+            + d.cw[a:b].tobytes()
+        )
+    return keys
 
 
 def main():
@@ -54,57 +56,49 @@ def main():
                     help="rows to scan for duplicates (from the start of the dump)")
     args = ap.parse_args()
 
-    d = np.load(args.dump)
-    vx, vy, vm = d["vx"], d["vy"], d["vm"]
-    n = min(args.max_rows, len(vx))
-    print(f"[data] {len(vx)} rows total, scanning the first {n} for duplicates")
-    print(f"[data] FEAT={vx.shape[1]} dtype={vx.dtype}")
+    d = Dump(args.dump)
+    n = min(args.max_rows, len(d))
+    print(f"[data] {len(d)} rows total ({len(d.cy)} configs), scanning the first {n}")
+    print(f"[data] PUBFEAT={d.pubfeat} CCOUNTS={d.ccounts} dtype={d.x.dtype}")
+    print(f"[data] target spread over all configs: std {d.cy.std():.4f} "
+          f"mean {d.cy.mean():+.4f}")
 
-    tgt_all = vy[vm > 0]
-    print(f"[data] target spread over all rows: std {tgt_all.std():.4f} "
-          f"mean {tgt_all.mean():+.4f}")
-
-    order, starts, sizes = duplicate_groups(vx, n)
-    dup = starts[sizes > 1]
-    dupsz = sizes[sizes > 1]
-    print(f"\n[dups] {len(dup)} distinct inputs occur more than once; "
-          f"{int(dupsz.sum())} rows are in a duplicate group "
-          f"({100 * dupsz.sum() / n:.1f}% of scanned rows)")
-    if len(dup) == 0:
+    groups = {}
+    for r, k in enumerate(row_keys(d, n)):
+        groups.setdefault(k, []).append(r)
+    dup = [v for v in groups.values() if len(v) > 1]
+    ndup = sum(len(v) for v in dup)
+    print(f"\n[dups] {len(dup)} distinct inputs occur more than once; {ndup} rows are "
+          f"in a duplicate group ({100 * ndup / max(n, 1):.1f}% of scanned rows)")
+    if not dup:
         print("       no exact duplicates -- cannot bound the noise this way")
         sys.exit(0)
-    print(f"[dups] group sizes: max {dupsz.max()}, median {int(np.median(dupsz))}")
+    szs = np.array([len(v) for v in dup])
+    print(f"[dups] group sizes: max {szs.max()}, median {int(np.median(szs))}")
 
-    # For every duplicate group, the spread of the targets on the hand keys the
-    # mask actually supports, and how far apart in the run the rows were taken.
-    within, gaps, sizes_kept = [], [], []
-    for s, k in zip(dup, dupsz):
-        idx = order[s:s + k]
-        m = vm[idx]
-        y = vy[idx]
-        sup = m.min(axis=0) > 0        # keys supported in *every* row of the group
-        if not sup.any():
-            continue
-        yy = y[:, sup]
-        # Spread around the group mean, pooled over the supported keys.
-        within.append(np.sqrt(((yy - yy.mean(axis=0)) ** 2).mean()))
-        gaps.append(int(idx.max() - idx.min()))
-        sizes_kept.append(k)
-    if not within:
-        print("       duplicate groups share no supported hand key")
-        sys.exit(0)
-    within = np.array(within)
-    gaps = np.array(gaps)
+    # For every duplicate group, the belief-weighted spread of the per-config
+    # targets around the group mean, and how far apart the rows were recorded.
+    within, gaps = [], []
+    for rows in dup:
+        ys, ws = [], None
+        for r in rows:
+            a, b = int(d.row_start[r]), int(d.row_start[r + 1])
+            ys.append(d.cy[a:b].astype(np.float64))
+            ws = d.cw[a:b].astype(np.float64)
+        y = np.stack(ys)
+        dev = y - y.mean(axis=0)
+        within.append(np.sqrt((ws * (dev ** 2)).sum() / max(ws.sum() * len(rows), 1e-9)))
+        gaps.append(max(rows) - min(rows))
+    within, gaps = np.array(within), np.array(gaps)
 
     rms = float(np.sqrt((within ** 2).mean()))
     print(f"\n[noise] within-duplicate target RMS: {rms:.4f}")
-    print(f"        (compare: overall target std {tgt_all.std():.4f}, and the "
-          f"best held-out RMS any architecture reached, ~0.092)")
+    print(f"        (compare: overall target std {d.cy.std():.4f})")
     print(f"        share of duplicate groups whose targets agree exactly: "
           f"{100 * (within == 0).mean():.1f}%")
 
     # Drift versus bug: does disagreement grow with how far apart the rows were
-    # recorded? Rows are appended in generation order, so index distance is age.
+    # recorded? Rows are stored in generation order, so index distance is age.
     print("\n[drift] within-duplicate RMS by how far apart the rows were recorded")
     edges = [0, 1, 100, 1_000, 10_000, 50_000, 1 << 62]
     names = ["same batch", "<100 rows", "<1k", "<10k", "<50k", ">=50k"]

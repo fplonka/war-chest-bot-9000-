@@ -12,11 +12,13 @@ engine/          Rust crate, lib name `warchest`
   src/           rebel, search, selfplay, net  (the ReBeL agent)
   tests/         36 scenario tests, playout invariants, PBS correctness tests
   examples/      coords.rs (hex dump), featstats.rs (feature ranges),
-                 solvererr.rs (CFR target error vs iteration count)
+                 solvererr.rs (CFR target error vs iteration count),
+                 cfgvalue.rs (how far the value separates configs)
   src/bin/       bench.rs (applies/sec, playouts/sec)
 train/           train.py    PyTorch training loop
   offline.py     fit architectures to a frozen replay dump (noise-free A/B)
   diagnose.py    model-free check on how learnable a dump's targets are
+  dump.py        reading a dumped replay buffer
   mirror.py      the board's 180-degree symmetry, as a data augmentation
 docs/
   ENGINE_FIXES.md  rule corrections found by replaying 1,112 real games
@@ -37,10 +39,12 @@ War Chest turns out to be an unusually good fit for ReBeL. A player's private
 state is exactly `(hand, face-down discards)` — the bag is derived from a public
 reserve — and the reachable set has median 8 and p99 385 members, so CFR
 enumerates information states exactly instead of approximating them with
-particles. See `docs/REBEL.md`.
+particles. The value network is a function of that exact private state, not of a
+summary of it: `docs/REBEL.md` §4 explains why the alternative is not an
+approximation but a different game.
 
 Ten minutes on an 8-core M1 is enough to beat the handcrafted Greedy reference
-198-1-1. See `docs/PERF.md` for how the generation loop got there.
+370-1-29. See `docs/PERF.md` for how the generation loop got there.
 
 ## Design
 
@@ -61,7 +65,7 @@ that way has a scenario test — see `docs/ENGINE_FIXES.md`.
 
 ```bash
 cd engine
-cargo test                          # 51 tests (the solver oracle takes ~85s)
+cargo test                          # 55 tests (the solver oracle takes ~85s)
 cargo run --release --bin bench     # engine throughput, ~2.8M applies/sec/core
 cargo run --release --bin rebelbench -- weights.bin   # generation throughput
 maturin develop --release           # python module `warchest` (Game)

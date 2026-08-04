@@ -129,48 +129,117 @@ knowledge enters through the value network, which is what CFR actually consumes.
 
 ## 4. The value network
 
-A 2-hidden-layer MLP (`--hidden`, default 384), trained in PyTorch and evaluated
-in Rust through Accelerate's `cblas_sgemm`, **split around the belief block**:
+The value of a leaf is a counterfactual value **per information state**, so it
+is indexed by the same object beliefs, reaches and regrets are indexed by: the
+config. `v̂(PBS, c) -> scalar`.
 
+```text
+  config tower:  z(c) = relu(phi(c) Wc + bc)                 [dg]
+                 g(c) = z(c) Wg + bg                         [rank + 1]
+
+  PBS tower:     hpub = relu(LN(x_pub W0 + b0)) W1
+                 e_p  = sum_c beta_p(c) z(c)                 [dg] per player
+                 h    = relu(LN(hpub + [e_0; e_1] Wb + b1))  [hidden]
+                 u    = h Wu + bu                            [rank]
+
+  value:         v(c) = <u, g(c)[..rank]> + g(c)[rank]
 ```
-x_public (680) --W0--> h --LN,relu--> --W1--> \
-                                               (+) --LN,relu--> --W2--> 2·NHAND
-x_belief (132) ------------------------Wb---> /
-```
 
-Same parameter count and same depth as a plain `FEAT -> h -> h -> 2·NHAND`; the
-only difference is *where* the belief block connects. It matters because of how
-a subgame queries the network: the same leaf is evaluated once per CFR
-iteration, and between iterations only its beliefs move — the public half of its
-encoding is a property of the leaf's state and is fixed for the whole solve. So
-the entire public tower (the widest matmul in the network, plus a full hidden
-layer) is computed **once per leaf per solve**, and only the 132×h belief
-projection and the output head run per iteration. That is 2.6x less
-per-iteration matmul work, and it made the value function *better*, not worse
-(§5).
+`phi(c)` is one config's exact counts: hand, face-down, and the derived bag,
+plus the seat it belongs to. Sixteen numbers, nothing bucketed or averaged.
+`config_features_separate_every_config` pins that two distinct private states
+never share a feature vector, which is what makes `v̂` a function *of the
+config* rather than of an equivalence class of them.
 
-`Mlp::trunk` computes the cached half; `Mlp::forward_split` the rest, emitting
-only the one output head the current traversal reads.
+This is the reference implementation's shape, generalised. `csrc/liars_dice`
+ends in `hidden -> num_hands`, which is exactly `<h, W2[:, c]> + b2[c]` — an
+embedding *table* over private states, and `num_hands` also indexes its beliefs,
+its regrets and its strategies. War Chest's private states do not fit in a table
+(hand x face-down runs to ~145k and varies by draft), so the table becomes an
+embedding *network* `g`. The belief is the same substitution on the input side:
+instead of a fixed-length vector of per-private-state probabilities, it is the
+belief-weighted sum of the same config embeddings.
 
-**The deliberate information bottleneck.** In-subgame CFR uses exact
-`(hand, facedown)` configs, but the network keys values by **hand** (56 keys per
-player), with bag and face-down composition entering as marginal features.
-Configs sharing a hand share a leaf value. This is a coarseness choice in `v̂`,
-not a soundness bug — CFR-D stays well defined under a coarser value function —
-and it is what keeps leaf queries affordable in the inner loop. Root training
-targets are belief-weighted averages over configs per hand key
-(`Data::push_value`). If value loss ever plateaus high, the escape hatch is to
-widen the key to `(hand, bucketed bag composition)`.
+**What is cached.** Inside a solve the same leaf is queried once per iteration
+and only the beliefs move, so three things survive the whole solve: the public
+tower `hpub` (the widest matmul in the network), and both `z(c)` and `g(c)` for
+every config in the tree — a config's features do not depend on the iteration.
+The same config recurs at hundreds of leaves, so the config tower runs once per
+*distinct* config per solve (`Solver::intern_config`); the trainer deduplicates
+a batch the same way, and it is the difference between a 0.5-second and a
+4-second training step. What remains per iteration is one `2·dg -> hidden`
+matmul per leaf, one LayerNorm, and one `rank`-long dot product per config.
 
-Features (`rebel.rs::write_features`) are public by construction: per-hex
+`rank` is the one width that has to be chosen rather than inherited. The
+reference gets `rank = hidden` for free because its readout is a lookup; here
+every config costs a dot product of that length, per leaf, per iteration. A
+config is sixteen numbers, so 64 is not a binding constraint on what the value
+can depend on, and it is 6x less per-config work than the hidden width.
+
+### What this replaced, and what it cost
+
+The previous build keyed values by **hand** alone — 56 keys per player, with the
+face-down composition entering as a belief-averaged marginal — and
+`Data::push_value` projected the solver's per-config root values onto that basis
+before training on them. §4 of this document used to call that "a coarseness
+choice in `v̂`, not a soundness bug". That was wrong, and the error is worth
+being precise about.
+
+Configs sharing a hand have identical legal action sets, so if they also share
+every leaf value they get identical regrets and therefore an identical strategy.
+The coarse value function did not merely misvalue those situations: it made the
+agent's strategy **measurable with respect to the hand**, so the agent could not
+act on coins it had buried itself. A restricted strategy space is a different
+game, and the fixed point being learned was that game's equilibrium.
+
+Measured before the change (`examples/cfgvalue.rs`, 120 positions, uniform
+beliefs over consistent configs, T=16):
+
+| | greedy play | random play |
+|---|---|---|
+| configs per position / distinct hands | 3.5 / 2.5 | 137.3 / 18.1 |
+| belief mass in hands holding >1 config | 9.5% | 60.8% |
+| within-hand RMS bag deviation, per slot | 0.108 coins | 0.467 coins |
+| same-hand config pairs getting identical play | 86% | 92% |
+
+So the information was real — up to 1.34 coins of bag difference inside one hand
+— and ~90% of the time the agent could not use it. The value error the
+projection deleted was 0.0014 to 0.020 depending on depth, against a held-out
+network error of ~0.09; small, and *growing with depth*, because the collapse
+was only visible where a round-start draw fell inside the horizon. That is a
+lower bound on itself and not the reason to fix it. The reason is that it was a
+different game.
+
+### Features
+
+`rebel.rs::write_public_features` is public by construction: per-hex
 occupancy/height/marker, per-player reserve/face-up/supply/eliminated counts,
-slot identities, marker and count scalars, `plies_remaining`, and the two belief
-blocks (hand-key distribution + bag and face-down composition marginals). Bag,
-hand and face-down appear *only* through their public sum and their public
-sizes.
+slot identities, marker and count scalars, `plies_remaining`. Bag, hand and
+face-down appear there *only* through their public sum (the reserve) and their
+public sizes. `features_do_not_leak_private_information` checks it directly, and
+`a_solve_reads_only_the_beliefs` checks the same property one level up — the
+network is now asked about specific configs, so it matters that each query uses
+only the *traverser's own* config, and that solving the same public position in
+two different worlds gives bit-identical values and strategies.
 
-Loss is Huber over the supported hand keys; targets are clipped to ±1, which is
+Loss is a belief-weighted Huber over every config in the support: a config the
+belief gives 1% to is worth 1% of the gradient, which is what makes the loss
+match the distribution CFR actually queries. Targets are clipped to ±1, which is
 where the true value function lives.
+
+### The remaining approximation
+
+The belief reaches the network as `sum_c beta(c) z(c)`, a fixed-width sum of
+learned config embeddings. Unlike the value's dependence on a single config,
+this one **cannot** be made exact at fixed width: a belief is a distribution
+over a config space of ~145k, and the reference only escapes this because its
+private space is small enough to feed verbatim. Two beliefs whose embeddings
+coincide are indistinguishable to the network.
+
+This does not change the game being solved — CFR carries exact beliefs
+internally, and only the network's view of them is compressed — so it is
+ordinary function-approximation error that shrinks with `dg` and with data. It
+is still worth knowing the size of; see `TODO.md`.
 
 ## 5. Training
 
@@ -210,21 +279,29 @@ difference between a usable result and a coin flip.
 Evaluation plays paired matches — same draft and the same random stream for both
 seatings — using a full solve and the CFR average strategy.
 
-### Measured result (10 minutes, 8-core M1, depth 2, `runs/perf04_final`)
+### Measured result (10 minutes, 8-core M1, depth 2)
 
 ```
-final checkpoint  vs Greedy              score 0.99 - 1.00
-final checkpoint  vs initial checkpoint  score 0.92 - 0.96
+final checkpoint  vs Greedy              score 0.961    (runs/cfgvalue01)
+final checkpoint  vs initial checkpoint  score 0.940
 ```
 
-200 paired games per pairing, on the real game (horizon payoff annealed to 0).
-Three runs of the same configuration span 0.99-1.00 and 0.925-0.960; the spread
-is the run-to-run noise of a 10-minute budget, not a difference between builds.
+400 paired games per pairing, on the real game (horizon payoff annealed to 0).
+Three runs of the *hand-keyed* build spanned 0.99-1.00 and 0.925-0.960, so the
+headline `final_vs_init` is inside its range and `vs Greedy` is a little below
+it, on 75 ReBeL epochs against ~95.
 
-Throughput on 8 cores in the ReBeL phase: **~11.5 games/s** with a full CFR
-solve at every decision (~1400 solved decisions/s), ~24 configs per decision.
-That is 9-10x what this took before `docs/PERF.md`'s work, which is what turns a
-10-minute budget from 7 ReBeL epochs into ~120.
+Neither number should be read as a verdict on the config-keyed value function.
+The network's own held-out error is ~0.09 and the error the hand key forced was
+0.002-0.02 (§4), which a 10-minute budget cannot resolve either way. What the
+rebuild *is* verified to have done is measured directly: the share of same-hand
+config pairs receiving different play went from 8% to 91%.
+
+Throughput on 8 cores in the ReBeL phase: **12.2 games/s** with a full CFR solve
+at every decision, ~19 configs per decision (`rebelbench` on an idle machine;
+the numbers inside `runs/cfgvalue01/train.log` are contaminated by a concurrent
+build). The hand-keyed build managed ~14, so per-config values cost about 18% of
+generation rate.
 
 ### The Monte-Carlo anchor, and why it is off
 
@@ -252,15 +329,17 @@ outrun — a run long enough to drift could still need it, so `--mc-mix` stays.
 Held-out error sat at RMS ~0.092 against a target spread of 0.39 and would not
 move. Because a target is a deterministic function of the network's own input —
 the CFR root value of the subgame at `(state, ctx, beliefs)`, which is exactly
-what `write_features` encodes — a dumped replay buffer is a noise-free
+what a row encodes — a dumped replay buffer is a noise-free
 supervised dataset, and the question can be settled offline in minutes instead
 of by training runs whose headline score wanders by ±0.05 (`train/offline.py`).
 
 Three explanations were tested and two died:
 
-* **Capacity.** No. Five architectures spanning 2.6x in trunk cost — the current
-  MLP, a 512-wide MLP, and hex convolutions at 2 and 3 layers, 16 and 32
-  channels — all landed within 4% of each other.
+* **Capacity.** No. Five architectures spanning 2.6x in trunk cost — the MLP of
+  the day, a 512-wide MLP, and hex convolutions at 2 and 3 layers, 16 and 32
+  channels — all landed within 4% of each other. (Measured on the hand-keyed
+  network; the numbers in this section are all from before §4's rewrite and have
+  not been re-measured against the config-keyed one.)
 * **A bug in the targets.** No. `train/diagnose.py` finds rows whose inputs are
   byte-identical and compares their targets: rows recorded close together agree
   *exactly*. The encoding-to-target map is clean.
@@ -293,8 +372,20 @@ never written.
 
 * `tests/rebel_pbs.rs::features_do_not_leak_private_information` — swapping a
   player's true config for any other config consistent with the same public
-  counts must not move a single feature. This is the direct check that the bot
-  cannot read its opponent's hidden coins.
+  counts must not move a single feature of the public encoding.
+* `tests/rebel_pbs.rs::a_solve_reads_only_the_beliefs` — the same property one
+  level up, and the one that matters now that the network is asked about
+  specific configs: solve the same public position in two different worlds and
+  the root values and the root strategy must agree bit for bit. Feeding both
+  players' configs into a query would produce a perfect-information bot that
+  looked spectacular; this is what would catch it.
+* `tests/rebel_pbs.rs::config_features_separate_every_config` — two distinct
+  private states must never share a feature vector, which is what makes the
+  value a function of the config rather than of an equivalence class.
+* `tests/rebel_pbs.rs::the_value_function_separates_configs_sharing_a_hand` —
+  the regression test for the architecture this replaced: configs with the same
+  hand and different face-down piles must get different values and different
+  play. It was zero by construction before.
 * `tests/rebel_pbs.rs::belief_tracker_matches_brute_force` — the incremental
   tracker versus an exhaustive enumeration of every world consistent with the
   observation sequence, weighted by exact draw probabilities and the announced
