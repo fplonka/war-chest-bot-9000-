@@ -425,7 +425,7 @@ def main():
             # ~20x, so it dominates the buffer for the whole run -- at depth 2
             # a 9-minute ReBeL phase contributed 7% of the buffer and the
             # network simply kept fitting greedy play (`runs/diagC`,
-            # final_vs_init 0.478, i.e. no improvement at all).
+            # the run ended no stronger than it started).
             buf.clear()
             phase = "rebel"
             print(f"[t={el:6.1f}s] --- switching to ReBeL ---", flush=True)

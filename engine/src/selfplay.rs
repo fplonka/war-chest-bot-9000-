@@ -465,9 +465,9 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
             Agent::Rebel { cfg, slot } => {
                 // A walk belongs to the checkpoint that built it. Playing a
                 // decision on another slot's solver would make that player
-                // act with the wrong network — `final_vs_init` pairs slot 0
-                // against slot 1 — so end a walk built by a different slot
-                // before starting a new one.
+                // act with the wrong network — the Elo ladder pits one
+                // snapshot's slot against another's — so end a walk built by a
+                // different slot before starting a new one.
                 if walk.as_ref().is_some_and(|w| w.slot != slot) {
                     finish_walk(walk.take().unwrap(), gc, &ctx, data);
                 }

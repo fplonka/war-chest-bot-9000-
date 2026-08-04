@@ -57,8 +57,11 @@ particles. The value network is a function of that exact private state, not of a
 summary of it: `docs/REBEL.md` §4 explains why the alternative is not an
 approximation but a different game.
 
-Ten minutes on an 8-core M1 is enough to beat the handcrafted Greedy reference
-370-1-29. See `docs/PERF.md` for how the generation loop got there.
+Thirty minutes on an 8-core M1 takes the agent from 356 Elo to 852, against 174
+for the handcrafted Greedy reference and 0 for random play — and shows it
+gaining almost nothing after the first seventeen (`runs/elo01`). See
+`docs/PERF.md` for how the generation loop got fast enough for that to fit in
+half an hour.
 
 ## Design
 

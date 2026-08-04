@@ -262,8 +262,9 @@ ReBeL never plays a policy directly, so the value network is the natural
 injection point for a starting behaviour; a heuristic *policy* prior would
 additionally need the warm-start machinery of the paper's Appendix J just to
 survive early CFR iterations. The network at the end of this phase is saved as
-`ckpt_init.pt`, the **initial checkpoint**. Its bias washes out: every
-subsequent target comes from real solves and real outcomes.
+snapshot 0, labelled `init`: the zero point the Elo curve is read against. Its
+bias washes out — every subsequent target comes from real solves and real
+outcomes.
 
 Phase 2 — **ReBeL**. Self-play with a CFR solve at every decision.
 
@@ -298,29 +299,45 @@ training for the same eight cores.
 Ladder matches are paired — the same draft and the same random stream for both
 seatings — and use a full solve and the CFR average strategy.
 
-### Measured result (10 minutes, 8-core M1, depth 2)
+### Measured result (30 minutes, 8-core M1, depth 2, T=64)
 
-```
-final checkpoint  vs Greedy              score 0.961    (runs/cfgvalue01)
-final checkpoint  vs initial checkpoint  score 0.940
-```
+`runs/elo01`, 60 paired games per pairing, on the real game (horizon payoff 0),
+Random pinned at 0:
 
-400 paired games per pairing, on the real game (horizon payoff annealed to 0).
-Three runs of the *hand-keyed* build spanned 0.99-1.00 and 0.925-0.960, so the
-headline `final_vs_init` is inside its range and `vs Greedy` is a little below
-it, on 75 ReBeL epochs against ~95.
+| snapshot | trained | Elo |
+|---|---|---|
+| init (end of warm start) | 5 min | 356 ± 29 |
+| s1 | 11 min | 748 ± 22 |
+| s2 | 17 min | 842 ± 22 |
+| s3 | 23 min | 852 ± 22 |
+| final | 30 min | 852 ± 22 |
+| Greedy | — | 174 ± 32 |
+| Random | — | 0 ± 38 |
 
-Neither number should be read as a verdict on the config-keyed value function.
-The network's own held-out error is ~0.09 and the error the hand key forced was
-0.002-0.02 (§4), which a 10-minute budget cannot resolve either way. What the
-rebuild *is* verified to have done is measured directly: the share of same-hand
-config pairs receiving different play went from 8% to 91%.
+**The agent gains 392 Elo in the first six minutes of self-play, 94 in the next
+six, and nothing measurable in the thirteen after that.** The plateau is the
+result; the champion gate this replaced could not have shown it, because a
+ratchet reports promotions rather than a shape.
 
-Throughput on 8 cores in the ReBeL phase: **12.2 games/s** with a full CFR solve
-at every decision, ~19 configs per decision (`rebelbench` on an idle machine;
-the numbers inside `runs/cfgvalue01/train.log` are contaminated by a concurrent
-build). The hand-keyed build managed ~14, so per-config values cost about 18% of
-generation rate.
+Two checks on the ladder itself. Two snapshots taken 46 seconds apart rate three
+points apart, inside the ±22 they are measured to, which is the noise floor
+behaving as it should — nothing in the fit knows they are nearly the same
+network. And the gap from `init` to `final`, 496 Elo, is the same quantity the
+old `final_vs_init` score reported: `runs/cfgvalue01`'s 0.940 is 478 Elo. The
+scale is new; the claim is not.
+
+Earlier results, for continuity: three runs of the *hand-keyed* build scored
+0.99-1.00 against Greedy and 0.925-0.960 against their own initial checkpoint,
+and `runs/cfgvalue01` (10 minutes, T=16, the first config-keyed run) scored 0.961
+and 0.940. None of these can be compared to the table above except through the
+`init`-to-`final` gap: budget, iteration count and the replay sampler all changed
+together.
+
+Throughput on 8 cores in the ReBeL phase: **2.2 games/s** at T=64 with a full CFR
+solve at every decision, against ~3.8 at T=16 — a factor of 1.6 for 4x the
+iterations, because self-play stops at a uniformly random iterate and so averages
+half the limit. The hand-keyed build managed ~14 games/s at T=8; per-config
+values cost about 18% of generation rate (`docs/PERF.md`).
 
 ### The Monte-Carlo anchor, and why it is off
 
