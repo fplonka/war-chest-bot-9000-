@@ -655,7 +655,7 @@ fn resolve_chance(s: &mut State, player: u8, rng: &mut Rng) {
     s.apply_inplace(acts[ai]);
 }
 
-fn effective_bag_count(s: &State, p: u8, unit: u8) -> u8 {
+pub(crate) fn effective_bag_count(s: &State, p: u8, unit: u8) -> u8 {
     let bag_total: u8 = s.zones[p as usize][Z_BAG].iter().sum();
     if bag_total > 0 {
         s.zones[p as usize][Z_BAG][unit as usize]

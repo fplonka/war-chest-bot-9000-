@@ -20,12 +20,39 @@ train/           train.py    PyTorch training loop
   diagnose.py    model-free check on how learnable a dump's targets are
   dump.py        reading a dumped replay buffer
   mirror.py      the board's 180-degree symmetry, as a data augmentation
+webui/           play.py + index.html: browser UI for playing a trained agent
+play.sh          one-liner: build the extension, serve the UI, open the browser
 docs/
   ENGINE_FIXES.md  rule corrections found by replaying 1,112 real games
   REBEL.md         the ReBeL agent: PBS design, CFR solver, deviations
   PERF.md          how the generation loop got ~10x faster, and what didn't work
 papers/          War Chest rulebook, ReBeL, TurboReBeL
 ```
+
+## Playing against a trained agent
+
+```bash
+./play.sh                      # newest runs/*/ckpt_final.pt, opens the browser
+./play.sh --ckpt runs/cfgvalue01/ckpt_final.pt
+```
+
+You play white with the rulebook's starter army (Swordsman, Pikeman,
+Crossbowman, Light Cavalry) against the fixed black army (Archer, Cavalry,
+Lancer, Scout). Round-start draws and the agent's moves resolve automatically;
+every decision that is yours — including triggered follow-ups like the
+Swordsman's free move — appears as a clickable legal action. The agent solves
+the depth-limited subgame at each of its decisions with the same CFR-average
+configuration evaluation uses (`--depth`, `--iters`), so it plays like the
+checkpoint's `eval.json` says it plays. The agent's hand, bag and face-down
+discards are hidden from the browser; only public counts are shown.
+
+The session object behind the UI is `warchest.LiveGame` (`engine/src/live.rs`),
+which mirrors the self-play loop: public beliefs over both players' configs,
+chance resolution from the true bag, and a Bayes update on the *public*
+observation after every action. The one deliberate divergence from self-play is
+that the human's belief update assumes a uniform behaviour model for the human
+— the agent has no model of how a person plays, and a model that assumed
+agent-like play could drop the true config from the belief support.
 
 ## Training
 

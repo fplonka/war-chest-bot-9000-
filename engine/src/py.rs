@@ -29,7 +29,7 @@ fn hexopt(v: u8) -> Option<u8> {
 }
 
 /// Serialize an action to a python dict: {kind, actor, ...params}.
-fn action_to_dict(py: Python<'_>, s: &State, a: &Action) -> PyResult<PyObject> {
+pub(crate) fn action_to_dict(py: Python<'_>, s: &State, a: &Action) -> PyResult<PyObject> {
     let d = PyDict::new_bound(py);
     d.set_item("actor", s.to_act())?;
     d.set_item("code", a.encode())?;
@@ -159,7 +159,7 @@ fn tac(
 
 /// Parse an action dict back into an Action. Accepts either a bare `code`
 /// (fast path) or `kind` + params.
-fn action_from_dict(d: &Bound<'_, PyDict>) -> PyResult<Action> {
+pub(crate) fn action_from_dict(d: &Bound<'_, PyDict>) -> PyResult<Action> {
     // Fast path: an explicit integer code.
     if let Ok(Some(code)) = d.get_item("code") {
         if let Ok(c) = code.extract::<u32>() {
@@ -317,7 +317,7 @@ fn zones_dict(py: Python<'_>, s: &State, p: u8) -> PyResult<PyObject> {
     Ok(d.into())
 }
 
-fn state_to_dict(py: Python<'_>, s: &State) -> PyResult<PyObject> {
+pub(crate) fn state_to_dict(py: Python<'_>, s: &State) -> PyResult<PyObject> {
     let b = board();
     let d = PyDict::new_bound(py);
     d.set_item("round", s.round)?;
@@ -502,7 +502,7 @@ use std::sync::{OnceLock, RwLock};
 /// a long run, selecting checkpoints on either of them is selecting on noise.
 pub const N_SLOTS: usize = 3;
 
-fn nets() -> &'static RwLock<Vec<Nets>> {
+pub(crate) fn nets() -> &'static RwLock<Vec<Nets>> {
     static NETS: OnceLock<RwLock<Vec<Nets>>> = OnceLock::new();
     NETS.get_or_init(|| RwLock::new(vec![Nets::default(); N_SLOTS]))
 }
@@ -689,6 +689,25 @@ fn infer(
 /// which is what lets a stack of these express the straight-line and
 /// exactly-two-away relations the unit cards are full of.
 #[pyfunction]
+/// All 37 hexes' axial coords, indexed by hex. The browser UI's board
+/// geometry; mirrors `Board::coord`.
+fn hex_coords() -> Vec<(i8, i8)> {
+    board().coord.to_vec()
+}
+
+/// The unit table as (unitTypeId, name, coin count) triples, for the UI to
+/// label hands and drafts from the engine's source of truth.
+#[pyfunction]
+fn units_info() -> Vec<(u16, &'static str, u8)> {
+    (0..N_UNITS)
+        .map(|u| {
+            let d = def(u as u8);
+            (d.id, d.name, d.coins)
+        })
+        .collect()
+}
+
+#[pyfunction]
 fn hex_neighborhood() -> Vec<u32> {
     let bd = crate::board::board();
     let n = crate::board::N_HEXES;
@@ -727,7 +746,10 @@ fn hex_mirror() -> Vec<u32> {
 #[pymodule]
 fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hex_mirror, m)?)?;
+    m.add_function(wrap_pyfunction!(hex_coords, m)?)?;
+    m.add_function(wrap_pyfunction!(units_info, m)?)?;
     m.add_class::<Game>()?;
+    m.add_class::<crate::live::LiveGame>()?;
     m.add("MAX_MAIN_PLAYS", crate::state::MAX_MAIN_PLAYS)?;
     m.add("PUBFEAT", crate::rebel::PUBFEAT)?;
     m.add("CFEAT", crate::rebel::CFEAT)?;
