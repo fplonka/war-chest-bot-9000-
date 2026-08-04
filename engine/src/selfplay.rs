@@ -331,6 +331,8 @@ struct Walk<'a> {
     sv: Solver<'a>,
     slot: usize,
     node: usize,
+    /// Draws taken so far inside the current collapsed chance node.
+    drawn: u8,
     root_s: State,
     root_bel: [Belief; 2],
 }
@@ -381,15 +383,21 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
                 let nid = w.node;
                 let n = &w.sv.nodes[nid];
                 assert!(n.chance && n.player == player, "walk not at the draw");
-                let child = n.child[0];
-                assert!(
-                    w.sv.nodes[child].cfgs[player as usize] == bel[player as usize].cfg,
-                    "walk desync: post-draw support does not match the game belief"
-                );
-                if w.sv.nodes[child].leaf {
-                    walk_ended = true;
-                } else {
-                    w.node = child;
+                // One tree node stands for a whole run of that player's draws,
+                // so it is exhausted only once the game has taken all of them.
+                w.drawn += 1;
+                if w.drawn == n.draw_steps {
+                    w.drawn = 0;
+                    let child = n.child[0];
+                    assert!(
+                        *w.sv.nodes[child].cfgs[player as usize] == bel[player as usize].cfg[..],
+                        "walk desync: post-draw support does not match the game belief"
+                    );
+                    if w.sv.nodes[child].leaf {
+                        walk_ended = true;
+                    } else {
+                        w.node = child;
+                    }
                 }
             }
             if walk_ended {
@@ -459,6 +467,7 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
                         sv,
                         slot,
                         node: 0,
+                        drawn: 0,
                         root_s: s.clone(),
                         root_bel: bel.clone(),
                     });
@@ -474,7 +483,7 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
                 // corrupt every target from here on, so fail loudly.
                 assert!(
                     n.player == player
-                        && n.cfgs[player as usize] == bel[player as usize].cfg,
+                        && *n.cfgs[player as usize] == bel[player as usize].cfg[..],
                     "walk desync: subgame tree no longer matches the game belief"
                 );
                 let na = n.na();

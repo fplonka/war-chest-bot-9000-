@@ -31,6 +31,7 @@
 
 use crate::actions::Action;
 use crate::{shape, timed};
+use std::rc::Rc;
 use crate::board::NONE;
 use crate::net::Mlp;
 use crate::rebel::*;
@@ -172,8 +173,11 @@ pub struct TNode {
     /// public child, and the drawing player's configs transition through the
     /// `draw` chance map.
     pub chance: bool,
-    /// The drawing player's chance transition. Empty for decision nodes.
+    /// The drawing player's chance transition, composed over the whole run of
+    /// consecutive draws this node stands for. Empty for decision nodes.
     pub draw: DrawMap,
+    /// How many of the game's draws this node covers (0 for a decision node).
+    pub draw_steps: u8,
     pub acts: Vec<Action>,
     pub aslot: Vec<i8>,
     pub fdown: Vec<bool>,
@@ -188,7 +192,12 @@ pub struct TNode {
     pub obs_act: Vec<u32>,
     pub child: Vec<usize>,
     /// Config support per player at this node.
-    pub cfgs: [Vec<Config>; 2],
+    ///
+    /// Shared rather than owned: every public child of a decision node has the
+    /// *same* support for the idle player, and a draw leaves the idle player's
+    /// support untouched, so a subgame that copied these per node spent most of
+    /// its build time duplicating lists nobody edits.
+    pub cfgs: [Rc<[Config]>; 2],
     /// `[config * na + action]`, for the acting player.
     pub legal: Vec<bool>,
     /// `[config * na + action]` -> the successor's config index in the child.
@@ -258,7 +267,10 @@ impl<'a> Solver<'a> {
         cfg: Cfg,
         belief: [Belief; 2],
     ) -> Solver<'a> {
-        let cfgs = [belief[0].cfg.clone(), belief[1].cfg.clone()];
+        let cfgs: [Rc<[Config]>; 2] = [
+            belief[0].cfg.as_slice().into(),
+            belief[1].cfg.as_slice().into(),
+        ];
         let mut sv = Solver {
             ctx,
             nets,
@@ -286,6 +298,14 @@ impl<'a> Solver<'a> {
         };
         {
             let _t = timed!(BUILD);
+            // A depth-2 subgame runs to roughly 800 nodes and a `TNode` is
+            // about a kilobyte, so growing the vector by doubling copied
+            // hundreds of kilobytes per solve.
+            sv.nodes.reserve(1024);
+            sv.reach.reserve(1024);
+            sv.vals.reserve(1024);
+            sv.regret.reserve(1024);
+            sv.cur.reserve(1024);
             sv.build(root.clone(), cfg.depth.max(1), cfgs);
         }
         let _t = timed!(ALLOC);
@@ -355,7 +375,7 @@ impl<'a> Solver<'a> {
 
     // ------------------------------------------------------------ tree build
 
-    fn build(&mut self, s: State, depth: usize, cfgs: [Vec<Config>; 2]) -> usize {
+    fn build(&mut self, s: State, depth: usize, cfgs: [Rc<[Config]>; 2]) -> usize {
         let player = s.to_act();
         // A plain round-start draw is walked through (one public child, no
         // depth cost). Other chance nodes (Warrior Priest draws — excluded
@@ -370,6 +390,7 @@ impl<'a> Solver<'a> {
             leaf,
             chance: false,
             draw: DrawMap::default(),
+            draw_steps: 0,
             acts: Vec::new(),
             aslot: Vec::new(),
             fdown: Vec::new(),
@@ -397,23 +418,45 @@ impl<'a> Solver<'a> {
             // player's reach passes through untouched. The depth is not
             // consumed: a draw is not a decision, and spending depth here is
             // what stops subgames from spanning a round boundary.
-            let acts = s.legal_actions();
-            debug_assert!(matches!(acts.first(), Some(Action::DrawCoin { .. })));
-            let mut cs = s.clone();
-            cs.apply_inplace(acts[0]);
-            let me = player as usize;
-            let res = reserve(&s, player, self.ctx);
-            let fu = faceup_counts(&s, player, self.ctx);
+            //
+            // A round start queues up to three draws in a row for the same
+            // player. None of them branches and none of them is a decision, so
+            // the whole run collapses into this one node with the composed
+            // transition; `steps` is how many of the game's draws it stands
+            // for, which is what the self-play walk counts off.
             let td = timed!(BDRAW);
-            let (child_cfgs, draw) = draw_transition(&cfgs[me], &res, &fu);
+            let me = player as usize;
+            let mut cs = s;
+            let mut support: Rc<[Config]> = cfgs[me].clone();
+            let mut draw = DrawMap::default();
+            let mut steps = 0u8;
+            loop {
+                let acts = cs.legal_actions();
+                debug_assert!(matches!(acts.first(), Some(Action::DrawCoin { .. })));
+                let res = reserve(&cs, player, self.ctx);
+                let fu = faceup_counts(&cs, player, self.ctx);
+                let (next, step) = draw_transition(&support, &res, &fu);
+                draw = if steps == 0 {
+                    step
+                } else {
+                    draw.then(&step, next.len())
+                };
+                support = next.into();
+                cs.apply_inplace(acts[0]);
+                steps += 1;
+                if !(matches!(cs.pending(), Cont::Draw { .. }) && cs.to_act() == player) {
+                    break;
+                }
+            }
             drop(td);
             let mut cc = cfgs;
-            cc[me] = child_cfgs;
+            cc[me] = support;
             let ch = self.build(cs, depth, cc);
             let n = &mut self.nodes[id];
             n.chance = true;
             n.child = vec![ch];
             n.draw = draw;
+            n.draw_steps = steps;
             return id;
         }
 
@@ -512,7 +555,7 @@ impl<'a> Solver<'a> {
             cs.apply_inplace(acts[a]);
             drop(tb);
             let mut cc = cfgs.clone();
-            cc[me] = std::mem::take(&mut child_cfgs[ch]);
+            cc[me] = std::mem::take(&mut child_cfgs[ch]).into();
             child.push(self.build(cs, depth - 1, cc));
         }
 
@@ -612,34 +655,42 @@ impl<'a> Solver<'a> {
         }
         self.batch_ready = true;
         let _t = timed!(PUBFEAT);
-        let mut xpub: Vec<f32> = Vec::new();
+        // Pass one collects the leaves so pass two can size every buffer up
+        // front: growing them inside the fill loop meant reallocating and
+        // memcpying a megabyte of features per solve.
         for i in 0..self.nodes.len() {
             if !self.nodes[i].leaf {
                 continue;
             }
             if self.nodes[i].s.is_terminal() {
                 self.term_leaves.push(i);
-                continue;
+            } else {
+                self.leaf_rows.push(i);
             }
-            let base = xpub.len();
-            xpub.resize(base + OFF_BELIEF, 0.0);
-            write_public_features(&self.nodes[i].s, self.ctx, &mut xpub[base..base + OFF_BELIEF]);
-            let res = [
-                reserve(&self.nodes[i].s, 0, self.ctx),
-                reserve(&self.nodes[i].s, 1, self.ctx),
-            ];
-            self.leaf_res.push(res);
+        }
+        let rows = self.leaf_rows.len();
+        let mut xpub: Vec<f32> = vec![0.0; rows * OFF_BELIEF];
+        self.leaf_res.reserve(rows);
+        self.leaf_hoff.reserve(2 * rows + 1);
+        let mut hands = 0usize;
+        for &i in &self.leaf_rows {
+            hands += self.nodes[i].cfgs[0].len() + self.nodes[i].cfgs[1].len();
+        }
+        self.leaf_hand.reserve(hands);
+        for (r, &i) in self.leaf_rows.iter().enumerate() {
+            let n = &self.nodes[i];
+            let at = r * OFF_BELIEF;
+            write_public_features(&n.s, self.ctx, &mut xpub[at..at + OFF_BELIEF]);
+            self.leaf_res
+                .push([reserve(&n.s, 0, self.ctx), reserve(&n.s, 1, self.ctx)]);
             for p in 0..2 {
                 self.leaf_hoff.push(self.leaf_hand.len() as u32);
-                for c in 0..self.nodes[i].cfgs[p].len() {
-                    let h = self.nodes[i].cfgs[p][c].hand_index() as u16;
-                    self.leaf_hand.push(h);
+                for c in n.cfgs[p].iter() {
+                    self.leaf_hand.push(c.hand_index() as u16);
                 }
             }
-            self.leaf_rows.push(i);
         }
         self.leaf_hoff.push(self.leaf_hand.len() as u32);
-        let rows = self.leaf_rows.len();
         self.xb.clear();
         self.xb.resize(rows * SPLIT, 0.0);
         if !self.nets.value.is_empty() {

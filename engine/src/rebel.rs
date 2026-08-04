@@ -428,6 +428,58 @@ pub struct DrawMap {
 }
 
 impl DrawMap {
+    /// The transition that changes nothing — the seed for composing a run of
+    /// draws into one.
+    pub fn identity(n: usize) -> DrawMap {
+        DrawMap {
+            start: (0..=n as u32).collect(),
+            to: (0..n as u32).collect(),
+            p: vec![1.0; n],
+        }
+    }
+
+    /// `self` then `next`, as one transition. A round start queues up to three
+    /// consecutive draws for the same player and none of them branches the
+    /// public tree, so composing them collapses six nodes into two — and with
+    /// them their states, reach vectors and value vectors, which is over half
+    /// of every subgame.
+    pub fn then(&self, next: &DrawMap, n_child: usize) -> DrawMap {
+        let rows = self.rows();
+        let mut out = DrawMap {
+            start: vec![0u32; rows + 1],
+            to: Vec::with_capacity(self.to.len()),
+            p: Vec::with_capacity(self.p.len()),
+        };
+        let mut acc = vec![0.0f32; n_child];
+        let mut hit = vec![false; n_child];
+        let mut touched: Vec<u32> = Vec::new();
+        for i in 0..rows {
+            touched.clear();
+            let (mid, pm) = self.row(i);
+            for k in 0..mid.len() {
+                let (to, pt) = next.row(mid[k] as usize);
+                for j in 0..to.len() {
+                    let t = to[j] as usize;
+                    if !hit[t] {
+                        hit[t] = true;
+                        touched.push(to[j]);
+                    }
+                    acc[t] += pm[k] * pt[j];
+                }
+            }
+            // Kept sorted so the child's rows stay in support order.
+            touched.sort_unstable();
+            for &t in &touched {
+                out.to.push(t);
+                out.p.push(acc[t as usize]);
+                acc[t as usize] = 0.0;
+                hit[t as usize] = false;
+            }
+            out.start[i + 1] = out.to.len() as u32;
+        }
+        out
+    }
+
     #[inline]
     pub fn row(&self, ci: usize) -> (&[u32], &[f32]) {
         let (a, b) = (self.start[ci] as usize, self.start[ci + 1] as usize);
