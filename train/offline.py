@@ -46,7 +46,8 @@ import torch.nn.functional as F
 import warchest
 import mirror
 from dump import Dump, subset
-from train import Mlp, make_batch, value_loss
+from train import make_batch, value_loss
+from value_net import Mlp
 
 
 def build(name):

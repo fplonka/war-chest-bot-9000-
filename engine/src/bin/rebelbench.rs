@@ -19,7 +19,7 @@ fn main() {
     let path = a.get(1).cloned().unwrap_or_else(|| "weights.bin".into());
     let games: usize = a.get(2).and_then(|x| x.parse().ok()).unwrap_or(48);
     let depth: usize = a.get(3).and_then(|x| x.parse().ok()).unwrap_or(2);
-    let iters: usize = a.get(4).and_then(|x| x.parse().ok()).unwrap_or(8);
+    let iters: usize = a.get(4).and_then(|x| x.parse().ok()).unwrap_or(64);
     let threads: usize = a.get(5).and_then(|x| x.parse().ok()).unwrap_or(0);
     if threads > 0 {
         rayon::ThreadPoolBuilder::new()

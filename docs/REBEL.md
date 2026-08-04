@@ -272,15 +272,31 @@ Training runs on the rulebook's recommended **starter matchup** by default
 `--random-draft` switches to randomised drafts, a training-distribution
 extension with unit-set indicators already in the encoding.
 
-Every `--gate-every` seconds the live network plays a short match against the
-fixed Greedy reference and the best-scoring weights are kept; that checkpoint is
-what gets saved. Bootstrapped value learning is not monotone — the gate curve
-below wanders by ±0.1 — so selecting on measured strength rather than on
-"whatever was live when the clock ran out" is both standard practice and the
-difference between a usable result and a coin flip.
+Every `--snapshot-every` minutes the network is written to disk and training
+continues. Nothing is compared, promoted or selected while the run is going.
 
-Evaluation plays paired matches — same draft and the same random stream for both
-seatings — using a full solve and the CFR average strategy.
+Evaluation is one round robin at the end, `train/ladder.py`: every snapshot
+against every other snapshot, against Greedy and against Random, scored with
+Bradley-Terry into an Elo per player, with Random pinned at 0. What the run
+reports is therefore a *curve* — strength against minutes trained — rather than
+a number whose provenance depends on which checkpoint a mid-run match happened
+to like.
+
+This replaced a champion gate (AlphaGo Zero's rule: promote the live network
+when it beats the reigning champion over 300 paired games). The gate was wrong
+here in three ways. It spent training time on games — minutes per gate, on a
+machine where minutes are the whole budget. Its standard error is ±0.029 at 300
+games and ±0.046 at 120, which is the same size as or larger than the
+improvement between two snapshots twenty minutes apart, so the promotions it
+made were substantially draws of noise. And it answered a question nobody had:
+"which single checkpoint should we ship" matters much less than "is this
+training run making the agent stronger, and how fast", which a ratchet built out
+of noisy pairwise tests cannot show at all. The ladder measures every snapshot
+against every other one, at the end, where games are no longer competing with
+training for the same eight cores.
+
+Ladder matches are paired — the same draft and the same random stream for both
+seatings — and use a full solve and the CFR average strategy.
 
 ### Measured result (10 minutes, 8-core M1, depth 2)
 
@@ -357,7 +373,19 @@ data-scaling curve confirms it and does not saturate — 40k rows give 0.0122,
 80k 0.0103, 160k 0.0086, 284k 0.0082 — and at full data with augmentation the
 train/test gap closes to zero.
 
-Two consequences. Replay capacity is an algorithmic knob, not a memory setting.
+Those two findings pull against each other, and the sampler is where they are
+traded off. Data says hold as many distinct positions as memory allows; drift
+says an old row's target was written by a network that has since moved, and is
+wrong by up to 0.023 — a quarter of the held-out error — by the time the buffer
+turns over. So a batch is a mixture: `--recent-mix` of it is drawn from the
+newest `--recent-frac` of the buffer and the rest uniformly from all of it, which
+at the defaults (0.5, 0.2) draws a row from the fresh slice six times as often as
+an old one — three times the average rate — while leaving every row reachable. Pure recency was not tried and should not
+be: it would discard exactly the distinct positions the scaling curve says are
+the binding constraint.
+
+Two more consequences. Replay capacity is an algorithmic knob, not a memory
+setting.
 And the 180-degree board symmetry is worth exploiting: rotating the board maps
 white's starting locations exactly onto black's, so every position can be
 presented a second way with the seats swapped, for free (`train/mirror.py`,
@@ -400,7 +428,7 @@ never written.
 
 ## 7. Known gaps
 
-* **T = 16 CFR iterations**, against the paper's 256/1024. The earlier default
+* **T = 64 CFR iterations**, against the paper's 256/1024. The earlier default
   of 8 rested on micro-endgames solved against exact values (mean |error|
   0.0035), which converge almost immediately and understate the error on the
   ~540-node subgames self-play actually solves. Measured on real mid-game
@@ -409,8 +437,8 @@ never written.
   8%, 3% and 1.3% of the spread of the values themselves, and stable across
   belief supports from 3 to 136 configs.
 
-  **16 is where the systematic component of that error disappears, which is why
-  it is the setting and why 32 and 64 are not.** What decides this is the
+  The default was 16 for a while, on the following argument. What decides it is
+  the
   *signed* mean error, not the absolute one. Zero-mean error behaves like noise:
   the network averages it away over millions of rows and it adds in quadrature
   with the network's own 23%-of-spread error, where a further 3% → 1.3% is
@@ -430,11 +458,26 @@ never written.
   the same value, so what they remove is noise. The share of positions whose
   configs err in a consistent direction is ~50% at every T, exactly chance,
   which is what a noise term looks like. T=16 costs 36% of the target rate;
-  T=32 costs 63% to buy nothing that survives averaging.
+  T=32 costs 63%.
+
+  **The default is now 64, and the argument above is the reason to distrust the
+  argument, not the setting.** It reasons entirely about how a *fitted* network
+  averages target error, and concludes that under-solving is free as long as its
+  error is zero-mean. But the target is not data the network merely fits: it is
+  the value of the subgame CFR was asked to solve, and at T=16 the subgame is
+  one we stopped solving a fifth of the way in. The whole claim ReBeL makes is
+  that a depth-limited *solved* subgame yields values consistent with the game's
+  equilibrium. A cheap approximation to that solve gives up the property the
+  method is built on in exchange for throughput, and throughput was never the
+  scarce thing the agent's strength was bounded by — data was, and data is
+  bounded by capacity as much as by rate. T=512 (the paper's regime) is worth a
+  run of its own; 64 is the step taken first.
 
   Note that a training loss curve cannot be used to choose T: changing T changes
   the target function, so a lower loss at higher T may only mean the targets
-  became easier to fit. Comparing those curves across T would mislead.
+  became easier to fit. Comparing those curves across T would mislead. The Elo
+  ladder can, because it scores the resulting agents against a fixed reference
+  and against each other; that comparison has not been run yet.
 * **No policy network.** The paper treats it as optional (value net alone
   converges); it would be worth adding for CFR warm starting and for fast play.
 * **The subgame is chance-free except for round-start draws**, which are walked
@@ -449,5 +492,8 @@ engine/src/search.rs    depth-limited CFR subgame solver
 engine/src/selfplay.rs  self-play loop, belief filter, data collection, greedy bot, eval
 engine/src/net.rs       batched inference MLP (Accelerate BLAS)
 engine/src/py.rs        pyo3: set_weights / gen_data / eval_match
-train/train.py          PyTorch training loop
+train/value_net.py      the value network, shared by everything that loads one
+train/train.py          PyTorch training loop, snapshots on a timer
+train/ladder.py         round robin over a run's snapshots -> Elo
+train/plot.py           the four panels a run is read from
 ```

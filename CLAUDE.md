@@ -39,6 +39,11 @@ Prefer measurements that have no noise in them:
   solving the same position to convergence and comparing.
 - `engine/examples/featstats.rs` measures the real range of a feature, which is
   how two features were found to be silently pinned at their maximum.
+- `train/ladder.py` rates a run's snapshots against each other and against the
+  fixed Greedy and Random references, all in one round robin at the end. Strength
+  over training time comes from there. Do not build anything that picks a "best"
+  checkpoint mid-run: that was tried, and a mid-run match is noisier than the
+  thing it is trying to detect.
 
 When you do compare builds by speed, drive both with an all-zero network so they
 play identical games — `docs/PERF.md` explains why.

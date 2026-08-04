@@ -19,7 +19,7 @@ import torch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import warchest  # noqa: E402
-from train import Mlp  # noqa: E402
+from value_net import Mlp  # noqa: E402
 
 
 def main():

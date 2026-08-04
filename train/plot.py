@@ -1,9 +1,10 @@
-"""Show how a training run is going. Opens a window.
+"""Show how a training run went. Opens a window.
 
     python train/plot.py runs/hour01
 
-Reads `log.json`, which the trainer rewrites at every gate, so this works on a
-run that is still going.
+Reads `log.json`, which the trainer rewrites every epoch, so this works on a run
+that is still going, and `ladder.json` if `ladder.py` has already rated the
+snapshots.
 
 Four panels sharing one time axis rather than one crowded chart with two y-axes:
 the measures have unrelated scales, and a second y-axis invites reading a
@@ -66,6 +67,42 @@ def style(ax, title, ylabel):
         ax.spines[side].set_visible(False)
 
 
+def elo_panel(ax, ladder):
+    """Elo against minutes trained: the run's headline.
+
+    Snapshots carry a training time and form the curve; Greedy and Random have
+    no training time at all, so they are horizontal reference lines rather than
+    points on it. The band is one standard error, which on a few hundred games
+    is wide enough that it should be visible whenever the curve is read.
+    """
+    if not ladder:
+        ax.text(0.5, 0.5, "no ladder yet  (python train/ladder.py <run>)",
+                ha="center", va="center", color=MUTED, fontsize=9,
+                transform=ax.transAxes)
+        style(ax, "Elo vs training time", "elo")
+        return
+    snaps = [p for p in ladder["players"] if p["t"] is not None]
+    x = np.array([p["t"] for p in snaps]) / 60.0
+    y = np.array([p["elo"] for p in snaps])
+    se = np.array([p["se"] for p in snaps])
+    ax.fill_between(x, y - se, y + se, color=BLUE, alpha=0.15, zorder=1)
+    ax.plot(x, y, "-o", color=BLUE, linewidth=2, markersize=6, zorder=3,
+            label="snapshot")
+    # Direct labels in the right margin, so nothing sits on top of the marks.
+    at_right = ax.get_yaxis_transform()
+    for p, color in (("greedy", GREEN), ("random", MAGENTA)):
+        ref = next((q for q in ladder["players"] if q["name"] == p), None)
+        if ref is None:
+            continue
+        ax.axhline(ref["elo"], color=color, linewidth=1.4, linestyle="--", zorder=2)
+        ax.annotate(f" {p}", (1.0, ref["elo"]), xycoords=at_right, color=color,
+                    fontsize=8, va="center", annotation_clip=False)
+    ax.annotate(" final", (1.0, y[-1]), xycoords=at_right, color=BLUE, fontsize=8,
+                va="center", annotation_clip=False)
+    style(ax, f"Elo vs training time  ·  {ladder['games_per_pair']} games per pairing"
+              f"  (band = 1 s.e.)", "elo")
+
+
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else "runs/latest"
     try:
@@ -73,50 +110,30 @@ def main():
             log = json.load(f)
     except FileNotFoundError:
         sys.exit(f"{out}/log.json not found — is the run started, and is the path right?")
+    try:
+        with open(f"{out}/ladder.json") as f:
+            ladder = json.load(f)
+    except FileNotFoundError:
+        ladder = None
     reb = [r for r in log["epochs"] if r["phase"] == "rebel"]
     if not reb:
         sys.exit(f"{out}: no ReBeL epochs yet — still warming up")
     t = np.array([r["t"] for r in reb]) / 60.0
-    gate = log.get("gate", [])
 
-    fig, axes = plt.subplots(2, 2, figsize=(11, 6.5), sharex=True)
+    fig, axes = plt.subplots(2, 2, figsize=(11, 6.5))
     fig.patch.set_facecolor("#fcfcfb")
     for ax in axes.ravel():
         ax.set_facecolor("#fcfcfb")
 
-    # 1. Value loss. Linear: it settles inside a factor of about two, where a
+    # 1. Strength, in Elo, against how long the network had been trained when
+    #    each snapshot was taken. The only strength measurement the run makes.
+    elo_panel(axes[0][0], ladder)
+
+    # 2. Value loss. Linear: it settles inside a factor of about two, where a
     #    log axis costs readable ticks and shows nothing extra.
-    ax = axes[0][0]
+    ax = axes[0][1]
     series(ax, t, [r["loss"] for r in reb], BLUE, "loss")
     style(ax, "Value loss", "huber")
-
-    # 2. Strength against the reference opponents. A win rate, so it gets a
-    #    0.5 line, and promotions are marked where the champion was replaced.
-    ax = axes[0][1]
-    if gate:
-        gt = np.array([g["t"] for g in gate]) / 60.0
-        for key, color in (("champ", BLUE), ("greedy", GREEN), ("init", MAGENTA)):
-            if key in gate[0]:
-                v = [g[key] for g in gate]
-                ax.plot(gt, v, "-o", color=color, linewidth=2, markersize=6, label=key)
-                ax.annotate(f" {key}", (gt[-1], v[-1]), color=color, fontsize=8,
-                            va="center")
-        promo = [g["t"] / 60.0 for g in gate if g.get("promoted")]
-        for p in promo:
-            ax.axvline(p, color=MUTED, linewidth=0.8, linestyle=":", zorder=0)
-        ax.axhline(0.5, color=MUTED, linewidth=1, linestyle="--", zorder=0)
-        ax.set_ylim(0, 1.05)
-        ax.legend(fontsize=8, frameon=False, loc="lower right", ncols=3)
-        n = sum(1 for g in gate if g.get("promoted"))
-        ax.set_title(f"Strength vs reference  ·  {n} promotions"
-                     f"  (dotted = promoted, dashed = even)",
-                     fontsize=10, color=INK, loc="left", pad=8)
-    else:
-        ax.text(0.5, 0.5, "no gate yet", ha="center", va="center",
-                color=MUTED, fontsize=9, transform=ax.transAxes)
-        ax.set_title("Strength vs reference", fontsize=10, color=INK, loc="left",
-                     pad=8)
-    style(ax, ax.get_title(), "win rate")
 
     # 3. The degeneracy canary. If the spread of the network's predictions
     #    collapses toward zero, the value function has gone flat -- the failure
@@ -135,15 +152,21 @@ def main():
     ax.set_ylim(bottom=0)
     style(ax, "Generation throughput", "per second")
 
-    for ax in axes[1]:
+    for ax in axes.ravel():
         ax.set_xlabel("minutes", fontsize=8, color=MUTED)
 
+    cfg = log.get("cfg", {})
     buf = reb[-1]["buf"]
     fig.suptitle(f"{out}  ·  {len(reb)} ReBeL epochs  ·  {t[-1]:.0f} min"
+                 f"  ·  depth {cfg.get('depth', '?')}, {cfg.get('iters', '?')} CFR iters"
                  f"  ·  buffer {buf:,}",
                  fontsize=11, color=INK, x=0.01, ha="left")
-    fig.tight_layout(rect=(0, 0, 0.94, 0.95))
-    plt.show()
+    fig.tight_layout(rect=(0, 0, 0.95, 0.95))
+    if len(sys.argv) > 2:
+        fig.savefig(sys.argv[2], dpi=150)
+        print(f"wrote {sys.argv[2]}")
+    else:
+        plt.show()
 
 
 if __name__ == "__main__":

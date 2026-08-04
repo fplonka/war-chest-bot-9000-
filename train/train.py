@@ -8,8 +8,9 @@ Two phases inside one wall-clock budget:
    ReBeL never plays a policy directly — every move comes out of CFR using the
    value network at the leaves — so the value network is the natural place to
    inject a starting behaviour. Without it CFR searches on noise and no game
-   ever ends inside the horizon. The network at the end of this phase is the
-   *initial checkpoint*.
+   ever ends inside the horizon. The network at the end of this phase is
+   snapshot 0, labelled `init`: where ReBeL started, and the zero point the Elo
+   curve is read against.
 
 2. **ReBeL** (the rest). Self-play where every decision solves a depth-limited
    CFR subgame over public belief states; the targets are the CFR root values,
@@ -22,6 +23,12 @@ A training row is a public state plus, for each player, the whole belief: the
 exact configs in support, their probabilities, and the value the solve gave
 each. The config lists are ragged, so they live in a flat arena and a batch is
 assembled by gathering spans -- see `Buffer`.
+
+The run saves a snapshot every `--snapshot-every` minutes and does not try to
+decide which one is best while it is training. `ladder.py` plays them against
+each other, and against Greedy and Random, once the run is over and turns the
+results into Elo — a curve of strength against training time, which is the
+thing we actually wanted to know.
 """
 
 import argparse
@@ -38,107 +45,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import warchest
+import ladder
 import mirror
+from value_net import Mlp
 
 PUBFEAT = warchest.PUBFEAT
 CFEAT = warchest.CFEAT
 CCOUNTS = warchest.CCOUNTS
 CNORM = warchest.CNORM
-# Weight slots in the Rust workers: 0 live, 1 initial checkpoint, 2 champion.
-CHAMP_SLOT = 2
-
-
-class Mlp(nn.Module):
-    """The value network: `v(PBS, config) -> scalar`.
-
-    Two towers. The config tower embeds one player's exact private state; the
-    PBS tower embeds the public state and, through a belief-weighted sum of the
-    *same* config embeddings, the belief. The value is their inner product.
-
-        z(c) = relu(phi(c) Wc + bc)                 config embedding   [dg]
-        g(c) = z(c) Wg + bg                         readout embedding  [r + 1]
-        e_p  = sum_c beta_p(c) z(c)                 belief             [dg]
-        h    = relu(LN(relu(LN(x W0 + b0)) W1 + b1 + [e_0; e_1] Wb))
-        u    = h Wu + bu                            PBS readout        [r]
-        v(c) = <u, g(c)[:r]> + g(c)[r]
-
-    This is `csrc/liars_dice`'s shape with its two fixed-width private-state
-    dimensions replaced by learned functions of the private state, because War
-    Chest's private states do not fit in a fixed-width table. Set `g` to a
-    one-hot lookup and the two are the same network.
-
-    `rank` is the one dimension that has to be chosen rather than inherited: the
-    reference gets `rank = hidden` for free because its readout is a lookup,
-    while here every config costs a `rank`-long dot product. A config is
-    sixteen numbers, so 64 is not a binding constraint on what the value can
-    depend on, and it is 6x less per-config work than the hidden width.
-
-    LayerNorm on every hidden layer, as the reference does (`use_layer_norm:
-    true`): the raw features include unbounded-ish coin counts and the
-    bootstrapped targets shift scale over training, so normalising between the
-    affine and the activation is what keeps the hidden distribution stable as
-    the target distribution moves.
-    """
-
-    def __init__(self, hidden, dg=64, rank=64):
-        super().__init__()
-        self.dims = [PUBFEAT, hidden, CFEAT, dg, rank]
-        self.w0 = nn.Linear(PUBFEAT, hidden)
-        self.w1 = nn.Linear(hidden, hidden)
-        # The belief's connection into the hidden layer. No bias: it is added to
-        # a layer that already has one.
-        self.wb = nn.Linear(2 * dg, hidden, bias=False)
-        self.wc = nn.Linear(CFEAT, dg)
-        self.wg = nn.Linear(dg, rank + 1)
-        self.wu = nn.Linear(hidden, rank)
-        self.ln0 = nn.LayerNorm(hidden)
-        self.ln1 = nn.LayerNorm(hidden)
-        # Start near zero so the first bootstrapped targets are not dominated by
-        # random leaf values.
-        nn.init.zeros_(self.wg.bias)
-        nn.init.normal_(self.wg.weight, std=1e-3)
-
-    def forward(self, xpub, phi, inv, w, seg, nseg):
-        """Values for every config in a ragged batch.
-
-        `xpub` is `[B, PUBFEAT]`. The configs of every row and player are
-        concatenated into one list of length `N`; `w[i]` is config `i`'s belief
-        probability and `seg[i] = 2 * row + player` says where it belongs.
-
-        The config tower runs over *distinct* configs only: `phi` is `[U, CFEAT]`
-        and `inv` maps each of the `N` entries to its row in it. A batch of 1024
-        positions carries ~50k configs drawn from a couple of thousand distinct
-        ones, and the readout embedding is `dg x (hidden + 1)` — by far the
-        widest matmul here if it runs per entry. The Rust solver deduplicates
-        for the same reason.
-        """
-        z = F.relu(self.wc(phi))
-        g = self.wg(z)
-        # The belief: a weighted sum of config embeddings, per (row, player).
-        e = torch.zeros(nseg, z.shape[1], dtype=z.dtype, device=z.device)
-        e.index_add_(0, seg, z[inv] * w.unsqueeze(1))
-        h = F.relu(self.ln0(self.w0(xpub)))
-        h = F.relu(self.ln1(self.w1(h) + self.wb(e.reshape(xpub.shape[0], -1))))
-        u = self.wu(h)
-        rk = u.shape[1]
-        gc = g[inv]
-        return (u[seg // 2] * gc[:, :rk]).sum(-1) + gc[:, rk]
-
-    def push(self, slot):
-        """Ship weights to the Rust workers (row-major `[in, out]` per matrix).
-
-        The order here is `Mlp::from_flat`'s and nothing else knows it, so the
-        two cannot drift apart without `test_parity.py` failing.
-        """
-        w = np.concatenate([l.weight.detach().cpu().t().contiguous().numpy().ravel()
-                            for l in (self.w0, self.w1, self.wb, self.wc, self.wg, self.wu)])
-        b = np.concatenate([l.bias.detach().cpu().numpy().ravel()
-                            for l in (self.w0, self.w1, self.wc, self.wg, self.wu)])
-        ln = np.concatenate([t.detach().cpu().numpy().ravel()
-                             for n in (self.ln0, self.ln1) for t in (n.weight, n.bias)])
-        warchest.set_weights(self.dims, np.ascontiguousarray(w, np.float32),
-                             np.ascontiguousarray(b, np.float32),
-                             np.ascontiguousarray(ln, np.float32), slot)
 
 
 class Buffer:
@@ -219,8 +133,30 @@ class Buffer:
         return (self.x[s], self.cc[at], self.cp[at], self.cw[at].astype(np.float32),
                 self.cy[at].astype(np.float32), seg)
 
-    def sample(self, batch, rng):
-        return self.gather(rng.integers(self.lo, self.rows, size=batch))
+    def sample(self, batch, rng, recent_mix=0.0, recent_frac=0.2):
+        """A batch, part of it drawn from the newest rows only.
+
+        Uniform sampling over a 2M-row buffer is not neutral here: the targets
+        are bootstrapped, so an old row's target was written by an old network
+        and is wrong by however much the network has moved since. Sampling
+        purely by recency is not the fix either, because held-out error falls
+        monotonically with the number of *distinct* positions trained on
+        (40k -> 0.0122, 284k -> 0.0082), and a recency-only sampler throws that
+        away to refit a small window.
+
+        So: a mixture. `recent_mix` of the batch comes from the newest
+        `recent_frac` of the buffer and the rest from all of it, which draws a
+        row in the fresh slice `1 + mix / ((1 - mix) * frac)` times as often as
+        an old one -- 6x at the defaults, or 3x the average rate -- while
+        leaving every row reachable. Two uniform draws, and no weight vector to
+        rebuild each epoch.
+        """
+        ids = rng.integers(self.lo, self.rows, size=batch)
+        k = int(batch * recent_mix)
+        if k > 0:
+            span = max(1, int((self.rows - self.lo) * recent_frac))
+            ids[:k] = rng.integers(self.rows - span, self.rows, size=k)
+        return self.gather(ids)
 
     def ordered(self):
         """Live rows oldest-first.
@@ -275,12 +211,14 @@ def value_loss(net, xpub, phi, inv, w, seg, y, nseg):
     return (per * w).sum() / w.sum().clamp(min=1e-6)
 
 
-def train_steps(net, opt, buf, steps, batch, rng, device, augment=True):
+def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
+                recent_mix=0.0, recent_frac=0.2):
     if len(buf) < batch:
         return float("nan")
     tot = 0.0
     for _ in range(steps):
-        parts = make_batch(buf.sample(batch, rng), rng, device, augment)
+        parts = make_batch(buf.sample(batch, rng, recent_mix, recent_frac),
+                           rng, device, augment)
         loss = value_loss(net, *parts)
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -288,6 +226,17 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True):
         opt.step()
         tot += loss.detach().item()
     return tot / steps
+
+
+def write_log(args, epochs, snaps):
+    """The run's whole record: settings, per-epoch stats, snapshot manifest.
+
+    One file, rewritten in place, so `plot.py` and `ladder.py` have a single
+    thing to read and a run that is still going is readable at any moment.
+    """
+    with open(f"{args.out}/log.json", "w") as f:
+        json.dump({"cfg": vars(args), "epochs": epochs, "snapshots": snaps},
+                  f, indent=1)
 
 
 def main():
@@ -323,12 +272,10 @@ def main():
     # realised game outcome in (MuZero-style n-step / TD(lambda)) can speed
     # learning; 0 recovers plain ReBeL.
     ap.add_argument("--mc-mix", type=float, default=0.0)
-    # Extra fixed-reference diagnostics logged alongside the champion gate.
-    # They do not select anything -- both saturate -- but they are comparable
-    # across runs in a way the champion score is not. Each costs a full match,
-    # so "none" is reasonable on a long run.
-    ap.add_argument("--gate-vs", default="greedy",
-                    choices=["none", "greedy", "init", "both"])
+    # Fraction of each batch drawn from the newest slice of the buffer, and how
+    # big that slice is. See `Buffer.sample`.
+    ap.add_argument("--recent-mix", type=float, default=0.5)
+    ap.add_argument("--recent-frac", type=float, default=0.2)
     ap.add_argument("--warm-games", type=int, default=96)
     ap.add_argument("--rebel-games", type=int, default=48)
     ap.add_argument("--train-gen-ratio", type=float, default=4.0)
@@ -336,11 +283,9 @@ def main():
     # CFR to 1-ply value iteration over the network. 2 is the reference's
     # setting for liar's dice and the minimum that is actually ReBeL.
     ap.add_argument("--depth", type=int, default=2)
-    # CFR iterations per subgame. The old default of 8 was justified on
-    # micro-endgames, which converge almost immediately and badly understate the
-    # error on the ~540-node subgames self-play actually solves. Measured on
-    # real mid-game positions against a converged T=512 reference
-    # (`examples/solvererr.rs`), mean |error| in the root value is:
+    # CFR iterations per subgame. Measured on real mid-game positions against a
+    # converged T=512 reference (`examples/solvererr.rs`), mean |error| in the
+    # root value is:
     #
     #     T=8  0.0098   (8% of the spread of the values themselves)
     #     T=16 0.0036   (3%)
@@ -349,11 +294,12 @@ def main():
     # This is *bias*, not noise -- the same position gives the same wrong number
     # every time -- so the network fits it happily and converges to the fixed
     # point of the under-solved operator. No training loss curve can show it.
-    # Against that, T=16 costs 36% of the target rate and T=32 costs 63%, while
-    # the data-scaling curve says a 36% data cut is worth roughly 3.5% of
-    # held-out loss. Bias that compounds through bootstrapping is worth more
-    # than that, and T=32 buys little more than T=16 for twice the cost.
-    ap.add_argument("--iters", type=int, default=16)
+    # Earlier runs traded that bias for throughput and settled on 16, on the
+    # grounds that the lost data was worth more. That is the wrong trade to keep
+    # making: the whole claim of ReBeL is that the targets are the values of a
+    # *solved* subgame, and at T=16 they are the values of a subgame we stopped
+    # solving early. 64 costs roughly 2.5x the generation rate of 16.
+    ap.add_argument("--iters", type=int, default=64)
     ap.add_argument("--explore", type=float, default=0.25)
     ap.add_argument("--temp", type=float, default=2.0)
     ap.add_argument("--eval-mix", type=float, default=0.5)
@@ -367,19 +313,14 @@ def main():
     # It reaches zero early so the tail of training -- and the checkpoint we
     # ship -- is fitted to the real game.
     ap.add_argument("--anneal-frac", type=float, default=0.4)
-    # Gating is pure overhead against training time, so it runs rarely rather
-    # than with many games: at 120 games the standard error is ~0.046, so a
-    # peak 2 sigma above trend is probably noise and selecting on it biases the
-    # reported score upward. Fewer, larger gates cost the same and select
-    # better. `final_vs_init` is the headline number for exactly this reason --
-    # it is not the quantity the checkpoint was selected on.
-    ap.add_argument("--gate-every", type=float, default=1200.0)
-    ap.add_argument("--gate-games", type=int, default=300)
-    # Promotion threshold against the reigning champion, AlphaGo Zero's gating
-    # rule. At 300 paired games the standard error is ~0.029, so 0.55 is about
-    # 1.7 sigma: high enough that noise alone rarely promotes, low enough that
-    # real progress is not held back.
-    ap.add_argument("--promote", type=float, default=0.55)
+    # Save the network this often. Snapshots cost a file write and nothing else:
+    # no games are played during training, and no snapshot is treated as better
+    # than another until the ladder says so.
+    ap.add_argument("--snapshot-every", type=float, default=6.0,
+                    help="minutes between snapshots")
+    # Paired games per pairing in the closing Elo ladder. 0 skips it, for when
+    # the ladder will be run separately (`python train/ladder.py <run>`).
+    ap.add_argument("--ladder-games", type=int, default=60)
     # Dump the replay buffer at the end of the run, oldest row first. Targets
     # here are a deterministic function of the input, so a frozen dump supports
     # noise-free offline comparisons of network architectures -- which is the
@@ -396,7 +337,6 @@ def main():
     # and peaks at 5.1 GiB alongside PyTorch -- comfortable on a 16 GiB machine,
     # where 3M (7.5 GiB) would leave little headroom for the workers.
     ap.add_argument("--cap", type=int, default=2_000_000)
-    ap.add_argument("--eval-games", type=int, default=400)
     ap.add_argument("--random-draft", action="store_true")
     ap.add_argument("--no-augment", action="store_true",
                     help="disable the 180-degree mirror augmentation")
@@ -428,28 +368,45 @@ def main():
     warm = min(warm, total)
     t0 = time.time()
     epoch, phase, log = 0, "greedy", []
-    # Bootstrapped value learning is not monotone, so the shipped checkpoint is
-    # the reigning *champion* rather than whatever is live when the clock runs
-    # out. The champion only changes when the live network beats it over
-    # `gate_games` paired games, which is a comparison that stays informative
-    # for the whole run because the reference moves with it.
-    champ = {"score": -1.0, "t": 0.0, "state": None, "promotions": 0}
-    # Gate rarely: each gate is minutes of eval, so only big runs bother. The
-    # first gate is `gate_every` seconds into the ReBeL phase; a run shorter
-    # than that has no gates and ships the latest weights.
-    next_gate = warm + args.gate_every
-    gate_curve = []
     # The marker-differential payoff at the horizon distorts the game being
     # solved, so it is annealed away as soon as horizon games become rare, and
     # evaluation always runs on the real game (value 0).
     cap_v = args.cap_value
     warchest.set_cap_value(cap_v)
     probe = None
+
+    # Snapshots. Nothing selects between them during the run. Bootstrapped value
+    # learning is not monotone, so there is a real question about which weights
+    # are best -- but a match large enough to answer it costs minutes of the
+    # budget (300 paired games: standard error 0.029, about the size of the gap
+    # between neighbouring snapshots), and answering it from a noisy match is
+    # how you ship a checkpoint chosen by a coin flip. The ladder rates all of
+    # them at the end, off the clock.
+    snaps = []
+
+    def snapshot(label, el):
+        # "init" and "final" are the two the reader always wants named; the rest
+        # are numbered, and the manifest carries the time each was taken at.
+        # Relabelling instead of resaving keeps the ladder from rating the same
+        # weights twice when the clock runs out just after a periodic snapshot.
+        if snaps and el - snaps[-1]["t"] < 30.0:
+            snaps[-1]["label"] = label
+            return
+        path = f"{args.out}/snap_{len(snaps):02d}.pt"
+        torch.save({"value": value.state_dict(), "hidden": args.hidden,
+                    "dg": args.dg, "rank": args.rank, "t": round(el, 1),
+                    "label": label}, path)
+        snaps.append({"label": label, "t": round(el, 1),
+                      "file": os.path.basename(path)})
+        print(f"[t={el:6.1f}s] --- snapshot {snaps[-1]['file']} ({label}) ---", flush=True)
+
+    next_snap = float("inf")
     print(f"[cfg] PUBFEAT={PUBFEAT} CFEAT={CFEAT} hidden={args.hidden} dg={args.dg} rank={args.rank} depth={args.depth} "
           f"iters={args.iters} budget={total:.0f}s warm={warm:.0f}s device={dev} "
           f"draft={'random' if args.random_draft else 'starter'} "
-          f"gate_every={args.gate_every:.0f}s promote={args.promote} "
+          f"snapshot_every={args.snapshot_every:.1f}min "
           f"train_gen_ratio={args.train_gen_ratio} "
+          f"recent_mix={args.recent_mix}/{args.recent_frac} "
           f"augment={not args.no_augment} cap={args.cap}", flush=True)
 
     while True:
@@ -457,16 +414,10 @@ def main():
         if el >= total:
             break
         if phase == "greedy" and el >= warm:
-            # Freeze the warm-started network into slot 1: the initial
-            # checkpoint the ReBeL phase has to beat. Slot 2 is the champion,
-            # which starts as the same network and is only replaced when the
-            # live one measurably beats it.
-            value.push(1)
-            value.push(CHAMP_SLOT)
-            champ["state"] = {k: v.detach().cpu().clone()
-                              for k, v in value.state_dict().items()}
-            torch.save({"value": value.state_dict(), "hidden": args.hidden,
-                        "dg": args.dg, "rank": args.rank}, f"{args.out}/ckpt_init.pt")
+            # The warm-started network is snapshot 0: where the ReBeL phase
+            # started, and the zero point the Elo curve is read against.
+            snapshot("init", el)
+            next_snap = el + args.snapshot_every * 60.0
             # Drop the warm-phase data. Its job was to initialise the *network*,
             # not to serve as bootstrap targets: it comes from a different
             # policy and its targets are not bootstrapped. Keeping it is
@@ -477,8 +428,7 @@ def main():
             # final_vs_init 0.478, i.e. no improvement at all).
             buf.clear()
             phase = "rebel"
-            print(f"[t={el:6.1f}s] --- initial checkpoint saved, switching to ReBeL ---",
-                  flush=True)
+            print(f"[t={el:6.1f}s] --- switching to ReBeL ---", flush=True)
 
         tg = time.time()
         kw = dict(random_draft=args.random_draft)
@@ -515,7 +465,8 @@ def main():
         # thin first epochs after the buffer is cleared.
         steps = max(1, round(args.train_gen_ratio * len(vx) / args.batch))
         lv = train_steps(value, opt, buf, steps, args.batch, rng, dev,
-                         augment=not args.no_augment)
+                         augment=not args.no_augment, recent_mix=args.recent_mix,
+                         recent_frac=args.recent_frac)
         train_s = time.time() - tt
         value.push(0)
         with torch.no_grad():
@@ -542,61 +493,12 @@ def main():
             print(f"[t={el:6.1f}s] --- lr -> {opt.param_groups[0]['lr']:.2e} ---", flush=True)
             next_decay += 1
 
-        # Periodic gate against the fixed reference opponent. Always scored on
-        # the real game (horizon payoff 0, so running out the clock is a draw)
-        # regardless of what the generator is currently training against --
-        # otherwise gate scores drift with the anneal and checkpoint selection
-        # would prefer whichever weights exploit the shaped payoff best.
-        gate = None
-        scores = {}
-        promoted = False
-        if phase == "rebel" and time.time() - t0 >= next_gate:
-            warchest.set_cap_value(0.0)
-            seedg = 900 + epoch
-            # The selection gate: live network against the reigning champion.
-            # Both fixed references saturate -- vs Greedy at ~0.97 and vs the
-            # initial checkpoint at ~0.94 within ten minutes -- so on a long run
-            # neither can order two late checkpoints, and selecting on them is
-            # selecting on noise. The champion moves, so this stays a live
-            # measurement for the whole run.
-            w, l, dr = warchest.eval_match(args.gate_games, seedg + 2, "rebel", "rebel",
-                                           depth=args.depth, iters=args.iters, temp=args.temp,
-                                           slot_a=0, slot_b=CHAMP_SLOT,
-                                           random_draft=args.random_draft)
-            gate = (w + 0.5 * dr) / max(w + l + dr, 1)
-            scores["champ"] = gate
-            # The fixed references stay in the log as a curve, since they are
-            # comparable across runs in a way the champion score is not.
-            if args.gate_vs in ("greedy", "both"):
-                w, l, dr = warchest.eval_match(args.gate_games, seedg, "rebel", "greedy",
-                                               depth=args.depth, iters=args.iters, temp=args.temp,
-                                               slot_a=0, random_draft=args.random_draft)
-                scores["greedy"] = (w + 0.5 * dr) / max(w + l + dr, 1)
-            if args.gate_vs in ("init", "both"):
-                w, l, dr = warchest.eval_match(args.gate_games, seedg + 1, "rebel", "rebel",
-                                               depth=args.depth, iters=args.iters, temp=args.temp,
-                                               slot_a=0, slot_b=1, random_draft=args.random_draft)
-                scores["init"] = (w + 0.5 * dr) / max(w + l + dr, 1)
-            warchest.set_cap_value(cap_v)
-            promoted = gate >= args.promote
-            if promoted:
-                champ = {"score": round(gate, 4), "t": round(time.time() - t0, 1),
-                         "state": {k: v.detach().cpu().clone() for k, v in
-                                   value.state_dict().items()},
-                         "promotions": champ["promotions"] + 1}
-                value.push(CHAMP_SLOT)
-            gate_curve.append({"t": round(time.time() - t0, 1), "promoted": promoted,
-                               **{k: round(v, 3) for k, v in scores.items()}})
-            # Checkpoint to disk at every gate. A nine-hour run that keeps its
-            # only copy of the champion in Python memory loses everything to a
-            # crash or a sleep at hour seven.
-            torch.save({"value": champ["state"], "hidden": args.hidden, "dg": args.dg, "rank": args.rank,
-                        "score": champ["score"], "t": champ["t"],
-                        "promotions": champ["promotions"]},
-                       f"{args.out}/ckpt_champion.pt")
-            torch.save({"value": value.state_dict(), "hidden": args.hidden,
-                        "dg": args.dg, "rank": args.rank}, f"{args.out}/ckpt_live.pt")
-            next_gate = time.time() - t0 + args.gate_every
+        # Snapshot on a wall-clock schedule. No games are played and nothing
+        # is compared: the snapshot is just the weights, and the ladder decides
+        # afterwards what they were worth.
+        if phase == "rebel" and time.time() - t0 >= next_snap:
+            snapshot(f"s{len(snaps)}", time.time() - t0)
+            next_snap = time.time() - t0 + args.snapshot_every * 60.0
 
         dec = max(d["decisions"], 1)
         rec = {"t": round(time.time() - t0, 1), "epoch": epoch, "phase": phase,
@@ -609,39 +511,20 @@ def main():
                "gen_s": round(gen_s, 2), "train_s": round(train_s, 2), "buf": len(buf),
                "lr": opt.param_groups[0]["lr"]}
         log.append(rec)
-        # Rewritten every epoch, not just at gates: this is the file `plot.py`
-        # reads, and a run should be watchable from its first minute rather than
-        # only after the first gate. It is a few hundred kilobytes even on a
-        # long run, so the cost is nothing against a multi-second epoch.
-        with open(f"{args.out}/log.json", "w") as f:
-            json.dump({"epochs": log, "gate": gate_curve,
-                       "champ": {k: champ[k] for k in ("score", "t", "promotions")}},
-                      f, indent=1)
-        gstr = "  GATE " + " ".join(f"{k}={v:.3f}" for k, v in scores.items()) if scores else ""
+        # Rewritten every epoch: this is the file `plot.py` reads, and a run
+        # should be watchable from its first minute. It is a few hundred
+        # kilobytes even on a long run, so the cost is nothing against a
+        # multi-second epoch.
+        write_log(args, log, snaps)
         print(f"[t={rec['t']:6.1f}s] {phase:6s} ep{epoch:3d} games={rec['games']:4d} "
               f"dec={dec:6d} cap={rec['cap_frac']:.2f} cfgs={rec['configs']:5.1f} "
               f"L={lv:.5f} tgt={tgt_mean:+.3f}/{tgt_std:.3f} pstd={probe_std:.3f} "
-              f"capv={cap_v:.3f} lr={rec['lr']:.1e} gen={gen_s:.1f}s train={train_s:.1f}s"
-              + (f"{gstr}{'  *PROMOTED*' if promoted else ''}"
-                 if gate is not None else ""), flush=True)
+              f"capv={cap_v:.3f} lr={rec['lr']:.1e} gen={gen_s:.1f}s train={train_s:.1f}s",
+              flush=True)
         epoch += 1
 
-    # Ship the champion. If no gate ever ran (a run shorter than `gate_every`)
-    # or nothing ever cleared the promotion threshold, the live network is what
-    # there is -- and "no promotion in N gates" is itself the finding.
-    if champ["state"] is not None and champ["promotions"] > 0:
-        value.load_state_dict(champ["state"])
-        value.push(0)
-        print(f"\nshipping champion from t={champ['t']}s ({champ['promotions']} promotions, "
-              f"last gate score {champ['score']:.3f})", flush=True)
-    elif gate_curve:
-        print(f"\nno promotion in {len(gate_curve)} gates -- shipping the live network. "
-              f"Champion scores: {[g['champ'] for g in gate_curve]}", flush=True)
-    torch.save({"value": value.state_dict(), "hidden": args.hidden, "dg": args.dg, "rank": args.rank},
-               f"{args.out}/ckpt_final.pt")
-    with open(f"{args.out}/log.json", "w") as f:
-        json.dump({"epochs": log, "gate": gate_curve,
-                   "champ": {k: champ[k] for k in ("score", "t", "promotions")}}, f, indent=1)
+    snapshot("final", time.time() - t0)
+    write_log(args, log, snaps)
 
     if args.dump_buffer:
         # Oldest row first, so a recency split is an honest held-out set.
@@ -652,37 +535,13 @@ def main():
         print(f"dumped {len(x)} buffer rows ({len(cy)} configs) to {args.dump_buffer}",
               flush=True)
 
-    # ------------------------------------------------------------- evaluation
-    warchest.set_cap_value(0.0)
-    print(f"\n=== evaluation on the real game (horizon payoff 0; training ended at "
-          f"{cap_v:.3f}) ===", flush=True)
-    n = args.eval_games
-    kw = dict(depth=args.depth, iters=args.iters, temp=args.temp,
-              random_draft=args.random_draft)
-
-    def report(name, res):
-        w, l, dr = res
-        tot = max(w + l + dr, 1)
-        score = (w + 0.5 * dr) / tot
-        se = (score * (1 - score) / tot) ** 0.5
-        print(f"{name:38s} W{w:4d} L{l:4d} D{dr:4d}   score {score:.3f} +- {2*se:.3f}",
-              flush=True)
-        return score
-
-    r = {}
-    r["final_vs_greedy"] = report("final checkpoint vs Greedy",
-                                  warchest.eval_match(n, 303, "rebel", "greedy", slot_a=0, **kw))
-    r["final_vs_init"] = report("final checkpoint vs initial checkpoint",
-                                warchest.eval_match(n, 101, "rebel", "rebel",
-                                                    slot_a=0, slot_b=1, **kw))
-    with open(f"{args.out}/eval.json", "w") as f:
-        json.dump(r, f, indent=1)
-
-    ok = r["final_vs_init"] > 0.5 and r["final_vs_greedy"] > 0.5
-    print(f"\nGOAL: the run produced a checkpoint better than the initial one that also "
-          f"beats Greedy -> {'PASS' if ok else 'FAIL'}", flush=True)
-    print("      (ReBeL self-play must carry the warm-started network past its own "
-          "start; final_vs_init is the headline)", flush=True)
+    # ------------------------------------------------------------- the ladder
+    # Every snapshot against every other, plus Greedy and Random, on the real
+    # game. This is the only strength measurement the run makes, and it makes it
+    # once, at the end, where it can afford enough games to mean something.
+    if args.ladder_games > 0:
+        ladder.run(args.out, games=args.ladder_games, depth=args.depth,
+                   iters=args.iters, temp=args.temp, random_draft=args.random_draft)
 
 
 if __name__ == "__main__":

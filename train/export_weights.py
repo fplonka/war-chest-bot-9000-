@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from train import Mlp  # noqa: E402
+from value_net import Mlp  # noqa: E402
 
 
 def load(path):

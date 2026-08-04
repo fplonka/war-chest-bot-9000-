@@ -492,23 +492,30 @@ use crate::selfplay::{eval_match as rs_eval_match, run_games, Agent, Collect, Da
 use numpy::{IntoPyArray, PyReadonlyArray1};
 use std::sync::{OnceLock, RwLock};
 
-/// Independent weight slots, so a match can pit one checkpoint against
-/// another. Slot 0 is the live network, slot 1 the initial checkpoint (the
-/// headline `final_vs_init` yardstick), slot 2 the reigning champion that
-/// gating promotes against.
-///
-/// A *moving* reference is the point of slot 2. Both fixed references saturate
-/// — the initial checkpoint is already beaten ~0.94 inside ten minutes — so on
-/// a long run, selecting checkpoints on either of them is selecting on noise.
-pub const N_SLOTS: usize = 3;
-
+/// Independent weight slots, so a match can pit one checkpoint against another.
+/// Slot 0 is the live network the trainer generates with; the rest hold
+/// whatever checkpoints a caller wants to play off against each other, and the
+/// pool grows to fit. The Elo ladder loads one snapshot per slot and plays a
+/// round robin, which is the only reason more than one slot exists.
 fn nets() -> &'static RwLock<Vec<Nets>> {
     static NETS: OnceLock<RwLock<Vec<Nets>>> = OnceLock::new();
-    NETS.get_or_init(|| RwLock::new(vec![Nets::default(); N_SLOTS]))
+    NETS.get_or_init(|| RwLock::new(vec![Nets::default()]))
 }
 
-/// Install value-network weights. `dims` is `[pub, hidden, cfeat, dg]`; `w`,
-/// `b` and `ln` are the flat arrays `Mlp::from_flat` documents.
+fn check_slot(slot: usize) -> PyResult<()> {
+    let n = nets().read().unwrap();
+    if slot >= n.len() || n[slot].value.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "no weights in slot {}",
+            slot
+        )));
+    }
+    Ok(())
+}
+
+/// Install value-network weights, growing the slot pool to fit. `dims` is
+/// `[pub, hidden, cfeat, dg]`; `w`, `b` and `ln` are the flat arrays
+/// `Mlp::from_flat` documents.
 #[pyfunction]
 #[pyo3(signature = (dims, w, b, ln, slot=0))]
 fn set_weights(
@@ -518,20 +525,24 @@ fn set_weights(
     ln: PyReadonlyArray1<f32>,
     slot: usize,
 ) -> PyResult<()> {
-    if slot >= N_SLOTS {
-        return Err(pyo3::exceptions::PyValueError::new_err("slot out of range"));
-    }
     let mlp = Mlp::from_flat(&dims, w.as_slice()?, b.as_slice()?, ln.as_slice()?)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    nets().write().unwrap()[slot].value = mlp;
+    let mut n = nets().write().unwrap();
+    if slot >= n.len() {
+        n.resize(slot + 1, Nets::default());
+    }
+    n[slot].value = mlp;
     Ok(())
 }
 
 fn agent_of(name: &str, cfg: Cfg, temp: f32, slot: usize) -> PyResult<Agent> {
     Ok(match name {
         "greedy" => Agent::Greedy { temp },
-        "uniform" => Agent::Uniform,
-        "rebel" => Agent::Rebel { cfg, slot },
+        "random" => Agent::Random,
+        "rebel" => {
+            check_slot(slot)?;
+            Agent::Rebel { cfg, slot }
+        }
         other => {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "unknown agent '{}'",
@@ -615,7 +626,7 @@ fn gen_data(
 
 /// Head-to-head evaluation with alternating colours and paired drafts.
 #[pyfunction]
-#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=false, iters_b=None))]
+#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=false))]
 #[allow(clippy::too_many_arguments)]
 fn eval_match(
     py: Python<'_>,
@@ -629,19 +640,13 @@ fn eval_match(
     slot_a: usize,
     slot_b: usize,
     random_draft: bool,
-    iters_b: Option<usize>,
 ) -> PyResult<(usize, usize, usize)> {
     let cfg = Cfg {
         depth,
         iters,
         average: true,
     };
-    let cfg_b = Cfg {
-        depth,
-        iters: iters_b.unwrap_or(iters),
-        average: true,
-    };
-    let (aa, bb) = (agent_of(a, cfg, temp, slot_a)?, agent_of(b, cfg_b, temp, slot_b)?);
+    let (aa, bb) = (agent_of(a, cfg, temp, slot_a)?, agent_of(b, cfg, temp, slot_b)?);
     Ok(py.allow_threads(|| {
         let n = nets().read().unwrap();
         rs_eval_match(games, seed, &n, aa, bb, random_draft)
@@ -669,14 +674,9 @@ fn infer(
     rows: usize,
     slot: usize,
 ) -> PyResult<Vec<f32>> {
-    if slot >= N_SLOTS {
-        return Err(pyo3::exceptions::PyValueError::new_err("slot out of range"));
-    }
+    check_slot(slot)?;
     let guard = nets().read().unwrap();
     let mlp = &guard[slot].value;
-    if mlp.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err("no weights in slot"));
-    }
     Ok(mlp.forward(xpub.as_slice()?, xbel.as_slice()?, phi.as_slice()?, rows))
 }
 

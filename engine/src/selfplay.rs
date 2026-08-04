@@ -133,8 +133,8 @@ pub fn eval_squashed(s: &State, p: u8) -> f32 {
 pub enum Agent {
     /// Greedy one-ply search on `eval_static`, softmaxed at `temp`.
     Greedy { temp: f32 },
-    /// Uniform over legal actions.
-    Uniform,
+    /// Uniform over legal actions: the weakest reference on the Elo ladder.
+    Random,
     /// ReBeL: solve the depth-limited subgame, act on the CFR strategy.
     Rebel { cfg: Cfg, slot: usize },
 }
@@ -213,7 +213,7 @@ fn greedy_policy(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config], temp: f32) -
     np
 }
 
-fn uniform_policy(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config]) -> NodePolicy {
+fn random_policy(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config]) -> NodePolicy {
     let mut np = NodePolicy::frame(s, ctx, player, cfgs);
     let na = np.acts.len();
     for ci in 0..cfgs.len() {
@@ -456,11 +456,11 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
                 }
                 greedy_policy(&s, &ctx, player, &cfgs, temp)
             }
-            Agent::Uniform => {
+            Agent::Random => {
                 if let Some(w) = walk.take() {
                     finish_walk(w, gc, &ctx, data);
                 }
-                uniform_policy(&s, &ctx, player, &cfgs)
+                random_policy(&s, &ctx, player, &cfgs)
             }
             Agent::Rebel { cfg, slot } => {
                 // A walk belongs to the checkpoint that built it. Playing a

@@ -1,5 +1,8 @@
 # TODO
 
+- [ ] turbo rebel, higher T
+- [ ] isomorphism: 5 coin slots ordering, for non fixed draft
+
 - [ ] **Put the Warrior Priest back in the game.** Units 18 and 54 are missing
       from `DRAFT_POOL` in `engine/src/selfplay.rs` — two of nineteen — because
       the attribute triggers a *private* mid-round draw, which adds "which coin
@@ -28,9 +31,10 @@
       * Treat Greedy as a draw generator, not a neutral yardstick. Measured:
         deterministic Greedy *self-play* times out **100%** of the time, with
         neither marker count moving for the last ~240 of 256 plays. The stalling
-        is a property of the weak reference opponent. The champion gate already
-        provides a moving, stronger reference; the fixed ones mostly serve to
-        manufacture timeouts.
+        is a property of the weak reference opponent. The Elo ladder mostly
+        routes around this — the snapshots' ratings are set by games against each
+        other, and Greedy and Random only anchor the scale — but the draws are
+        still there in the pairings that involve them.
       Scoring a timeout as -1 for both players was considered and rejected: it
       makes the game non-zero-sum, and zero-sum is load-bearing here — ReBeL's
       guarantees, CFR's convergence to Nash, `tests/rebel_solver.rs`'s oracle
@@ -43,8 +47,15 @@
       enumerate, so unlike the value's dependence on a *single* config, this one
       cannot be made exact at fixed width. Sweep `--dg` offline and find out
       what it costs.
+- [ ] **T = 512.** `--iters 64` is the current default and was itself a step
+      back from a throughput-driven 16 (`docs/REBEL.md` section 7). The paper
+      runs 256-1024. The measurement to make is not a loss curve — changing T
+      changes the target function — but two runs of equal wall-clock at
+      different T, rated on one ladder against each other and against a common
+      Greedy anchor. That comparison needs `ladder.py` to accept snapshots from
+      more than one run directory; it currently takes one.
 - [ ] The big run (9h, this machine). Settings the measurements point to:
-      `--iters 16 --cap 2000000 --warm-minutes 5 --gate-every 1200 --gate-vs both`.
+      `--iters 64 --cap 2000000 --warm-minutes 5 --snapshot-every 20`.
       Rationale for each is in `docs/REBEL.md` sections 5 and 7.
 - [ ] Random-draft training runs. The encoding now carries each card's tactic
       and attribute flags, so a draft the network has never seen is describable
@@ -64,3 +75,4 @@
       network memorises (`docs/REBEL.md` section 5), so extra parameters buy
       nothing; `--hidden 512` was the best architecture tested once
       augmentation removed the overfitting, by 1.5%.
+

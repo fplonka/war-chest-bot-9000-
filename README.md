@@ -15,7 +15,10 @@ engine/          Rust crate, lib name `warchest`
                  solvererr.rs (CFR target error vs iteration count),
                  cfgvalue.rs (how far the value separates configs)
   src/bin/       bench.rs (applies/sec, playouts/sec)
-train/           train.py    PyTorch training loop
+train/           train.py    PyTorch training loop, snapshots on a timer
+  value_net.py   the value network itself, shared by every tool that loads one
+  ladder.py      round robin over a run's snapshots, plus Greedy and Random -> Elo
+  plot.py        the four panels a run is read from
   offline.py     fit architectures to a frozen replay dump (noise-free A/B)
   diagnose.py    model-free check on how learnable a dump's targets are
   dump.py        reading a dumped replay buffer
@@ -36,7 +39,15 @@ is a commercial product, so it is not redistributed here.
 uv venv --python 3.12 .venv && VIRTUAL_ENV=.venv uv pip install torch numpy maturin
 cd engine && maturin develop --release && cd ..
 .venv/bin/python train/train.py --minutes 30 --out runs/mine
+.venv/bin/python train/plot.py runs/mine
 ```
+
+A run saves the network every few minutes and judges nothing while it trains.
+When it ends, `train/ladder.py` plays every snapshot against every other one,
+against the handcrafted Greedy bot and against Random, and fits an Elo to each —
+so what a run reports is strength against minutes trained, with Random at 0.
+`train.py` runs it automatically; `python train/ladder.py runs/mine --games 200`
+reruns it with more games.
 
 War Chest turns out to be an unusually good fit for ReBeL. A player's private
 state is exactly `(hand, face-down discards)` — the bag is derived from a public
@@ -76,6 +87,9 @@ maturin develop --release           # python module `warchest` (Game)
 
 `rebelbench` runs the ReBeL generation loop without Python, on weights exported
 by `train/export_weights.py`, and is what `docs/PERF.md`'s numbers come from.
-Build it with `--features prof` for a per-phase breakdown.
+Build it with `--features prof` for a per-phase breakdown. Its `games depth
+iters threads` arguments default to the trainer's settings, so a throughput
+number is only comparable to another taken at the same ones — `iters` in
+particular is most of the cost.
 
 The `python` feature is off by default; the pure-Rust API needs no pyo3.
