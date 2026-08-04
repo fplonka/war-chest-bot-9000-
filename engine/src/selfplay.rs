@@ -51,19 +51,16 @@ pub fn make_game(rng: &mut Rng, random: bool) -> State {
     if !random {
         return State::from_draft(&STARTER_WHITE, &STARTER_BLACK, first);
     }
-    let pick = |rng: &mut Rng| -> Vec<u16> {
-        let mut c: Vec<u16> = Vec::new();
-        while c.len() < 4 {
-            let id = DRAFT_POOL[rng.below(DRAFT_POOL.len())];
-            if !c.contains(&id) {
-                c.push(id);
-            }
-        }
-        c
-    };
-    let w = pick(rng);
-    let b = pick(rng);
-    State::from_draft(&w, &b, first)
+    // Eight units off one shuffled pool, four each. The pool is *shared*: a unit
+    // type is one card with one set of coins, so the two players' sets are
+    // necessarily disjoint. Drafting each side independently would put a second
+    // copy of a card's coins into the game — with `Berserker 5` on both sides,
+    // ten Berserker coins would exist where the card says five.
+    let mut pool = DRAFT_POOL;
+    for i in (1..pool.len()).rev() {
+        pool.swap(i, rng.below(i + 1));
+    }
+    State::from_draft(&pool[..4], &pool[4..8], first)
 }
 
 // ------------------------------------------------------------- greedy policy

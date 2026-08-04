@@ -26,7 +26,9 @@
       Rationale for each is in `docs/REBEL.md` sections 5 and 7.
 - [ ] Random-draft training runs. The encoding now carries each card's tactic
       and attribute flags, so a draft the network has never seen is describable
-      rather than an unseen identity code -- which was the prerequisite.
+      rather than an unseen identity code -- which was the prerequisite. The
+      draft generator itself was dealing both sides off the pool independently
+      and has been fixed; no run to date used it.
 - [ ] Validate the mirror augmentation against the engine rather than against
       invariants. `train/mirror.py` derives its permutation from exported
       layout offsets and checks involution plus what must and must not move; a

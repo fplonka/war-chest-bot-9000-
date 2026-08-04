@@ -4,7 +4,8 @@
 use warchest::board::{board, NONE, N_HEXES};
 use warchest::rng::Rng;
 use warchest::state::{State, BLACK, WHITE};
-use warchest::units::{def, N_UNITS};
+use warchest::selfplay::make_game;
+use warchest::units::{def, N_UNITS, ROYAL_COIN};
 
 const POOL: [u16; 19] = [
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 17, 18, 19, 52, 53, 54,
@@ -140,5 +141,37 @@ fn invariants_random_playouts() {
     // Report (not assert) cap hits per spec; but flag loudly if many.
     if cap_hits > 0 {
         eprintln!("WARNING: {} playouts hit the 1000-action cap", cap_hits);
+    }
+}
+
+/// A unit type is one card with one set of coins, so the two players' drafted
+/// sets must be disjoint and no coin type may exist twice over.
+///
+/// `make_game` used to draft each side independently off the same pool, which
+/// gave both players a full set of the same unit in 70% of random drafts and
+/// put twice a card's coins into the game. Nothing caught it: the engine takes
+/// the draft as input and conserves whatever it is handed, and every run to
+/// date used the fixed starter matchup, which is disjoint by construction.
+#[test]
+fn random_drafts_never_duplicate_a_unit_card() {
+    for g in 0..5000u64 {
+        let s = make_game(&mut Rng::new(g), true);
+        for u in 0..N_UNITS {
+            if u as u8 == ROYAL_COIN {
+                // One per player by the rules, not a drafted card.
+                continue;
+            }
+            let (w, b) = (s.total_coins(0, u), s.total_coins(1, u));
+            assert!(
+                w == 0 || b == 0,
+                "game {g}: unit {u} drafted by both players ({w} and {b} coins)"
+            );
+            assert!(
+                w + b <= def(u as u8).coins,
+                "game {g}: unit {u} has {} coins in play, the card has {}",
+                w + b,
+                def(u as u8).coins
+            );
+        }
     }
 }
