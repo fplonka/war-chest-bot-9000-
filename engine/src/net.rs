@@ -117,6 +117,16 @@ fn gemm(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
 /// Must match `torch.nn.LayerNorm`'s default.
 const LN_EPS: f32 = 1e-5;
 
+/// Grow `v` to at least `n` without ever re-zeroing what is already there.
+/// Every buffer here is fully overwritten by the matmul that follows, so the
+/// `clear() + resize()` this replaces was a megabyte-scale memset per call.
+#[inline]
+fn fit(v: &mut Vec<f32>, n: usize) {
+    if v.len() < n {
+        v.resize(n, 0.0);
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Mlp {
     /// Layer dimensions: `dims[0]` is the input width, `dims[L]` the output.
@@ -133,7 +143,28 @@ pub struct Mlp {
     pub ln_b: Vec<Vec<f32>>,
 }
 
+/// Test/benchmark hook for the raw matmul.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_probe(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    lda: usize,
+    b: &[f32],
+    ldb: usize,
+    c: &mut [f32],
+    ldc: usize,
+) {
+    gemm_ld(m, n, k, a, lda, b, ldb, 0.0, c, ldc);
+}
+
 impl Mlp {
+    /// Test/benchmark hook for the elementwise pass.
+    pub fn activate_probe(&self, l: usize, rows: usize, add: Option<&[f32]>, out: &mut [f32]) {
+        self.activate(l, rows, add, out);
+    }
+
     pub fn in_dim(&self) -> usize {
         self.dims[0]
     }
@@ -147,8 +178,19 @@ impl Mlp {
         self.dims[1]
     }
 
-    /// Bias + optional LayerNorm + optional ReLU, in place over `rows x n`.
-    fn activate(&self, l: usize, rows: usize, out: &mut [f32]) {
+    /// Bias (plus an optional cached addend) + optional LayerNorm + optional
+    /// ReLU, in place over `rows x n`.
+    ///
+    /// This is written for the vectoriser, not for brevity, because it is the
+    /// hot half of inference: the matmuls around it run at ~1.3 Tflop/s through
+    /// AMX, and a straightforward `row.iter().sum()` LayerNorm — a serial chain
+    /// of 3-cycle adds, 384 long, twice per row — took **five times** as long as
+    /// all three matmuls put together. `LANES` independent accumulators break
+    /// the chain and let the reductions run in NEON registers. The
+    /// re-association changes the last bits of the LayerNorm statistics;
+    /// `train/test_parity.py` bounds the result against torch.
+    fn activate(&self, l: usize, rows: usize, add: Option<&[f32]>, out: &mut [f32]) {
+        const LANES: usize = 8;
         let n = self.dims[l + 1];
         let last = l + 1 == self.w.len();
         let bias = &self.b[l];
@@ -157,23 +199,88 @@ impl Mlp {
         } else {
             Some((&self.ln_w[l], &self.ln_b[l]))
         };
+        let inv_n = 1.0 / n as f32;
+        let tail = n - n % LANES;
         for r in 0..rows {
             let row = &mut out[r * n..r * n + n];
-            for j in 0..n {
-                row[j] += bias[j];
+
+            // Pass 1: fold in the bias and the cached public half, and take the
+            // sum on the way past.
+            let mut acc = [0.0f32; LANES];
+            match add {
+                Some(a) => {
+                    let a = &a[r * n..r * n + n];
+                    for ((rc, bc), ac) in row
+                        .chunks_exact_mut(LANES)
+                        .zip(bias.chunks_exact(LANES))
+                        .zip(a.chunks_exact(LANES))
+                    {
+                        for t in 0..LANES {
+                            rc[t] += bc[t] + ac[t];
+                            acc[t] += rc[t];
+                        }
+                    }
+                    for j in tail..n {
+                        row[j] += bias[j] + a[j];
+                        acc[0] += row[j];
+                    }
+                }
+                None => {
+                    for (rc, bc) in row.chunks_exact_mut(LANES).zip(bias.chunks_exact(LANES)) {
+                        for t in 0..LANES {
+                            rc[t] += bc[t];
+                            acc[t] += rc[t];
+                        }
+                    }
+                    for j in tail..n {
+                        row[j] += bias[j];
+                        acc[0] += row[j];
+                    }
+                }
             }
+
             // LayerNorm over the feature dimension, then the activation.
             // Biased variance (divide by n, not n-1) to match torch.
             if let Some((g, bt)) = norm {
-                let mean = row.iter().sum::<f32>() / n as f32;
-                let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n as f32;
-                let inv = 1.0 / (var + LN_EPS).sqrt();
-                for j in 0..n {
-                    row[j] = (row[j] - mean) * inv * g[j] + bt[j];
+                let mean = acc.iter().sum::<f32>() * inv_n;
+                let mut v = [0.0f32; LANES];
+                for rc in row.chunks_exact(LANES) {
+                    for t in 0..LANES {
+                        let d = rc[t] - mean;
+                        v[t] += d * d;
+                    }
                 }
-            }
-            if !last {
-                for j in 0..n {
+                for j in tail..n {
+                    let d = row[j] - mean;
+                    v[0] += d * d;
+                }
+                let var = v.iter().sum::<f32>() * inv_n;
+                let inv = 1.0 / (var + LN_EPS).sqrt();
+                // Scale, shift and (for a hidden layer) rectify in one pass.
+                let floor = if last { f32::NEG_INFINITY } else { 0.0 };
+                for ((rc, gc), bc) in row
+                    .chunks_exact_mut(LANES)
+                    .zip(g.chunks_exact(LANES))
+                    .zip(bt.chunks_exact(LANES))
+                {
+                    for t in 0..LANES {
+                        let x = (rc[t] - mean) * inv * gc[t] + bc[t];
+                        rc[t] = if x > floor { x } else { floor };
+                    }
+                }
+                for j in tail..n {
+                    let x = (row[j] - mean) * inv * g[j] + bt[j];
+                    row[j] = if x > floor { x } else { floor };
+                }
+            } else if !last {
+                for rc in row.chunks_exact_mut(LANES) {
+                    for t in 0..LANES {
+                        if rc[t] < 0.0 {
+                            rc[t] = 0.0;
+                        }
+                    }
+                }
+                for j in tail..n {
                     if row[j] < 0.0 {
                         row[j] = 0.0;
                     }
@@ -184,20 +291,22 @@ impl Mlp {
 
     /// Forward `rows` samples (`x` is `[rows * in_dim]` row-major) into `out`
     /// (`[rows * out_dim]`). `scratch` is reused across calls to avoid allocs.
+    /// `out` may be left longer than `rows * out_dim`; only the prefix is
+    /// meaningful.
     pub fn forward(&self, x: &[f32], rows: usize, scratch: &mut Vec<f32>, out: &mut Vec<f32>) {
         debug_assert_eq!(x.len(), rows * self.in_dim());
         let layers = self.w.len();
         for l in 0..layers {
             let (k, n) = (self.dims[l], self.dims[l + 1]);
             let src: &[f32] = if l == 0 { x } else { scratch };
-            out.clear();
-            out.resize(rows * n, 0.0);
-            gemm(rows, n, k, src, &self.w[l], out);
-            self.activate(l, rows, out);
+            fit(out, rows * n);
+            gemm(rows, n, k, src, &self.w[l], &mut out[..rows * n]);
+            self.activate(l, rows, None, &mut out[..rows * n]);
             if l + 1 != layers {
                 std::mem::swap(scratch, out);
             }
         }
+        out.truncate(rows * self.out_dim());
     }
 
     /// The part of the first layer that depends only on the leading
@@ -207,8 +316,7 @@ impl Mlp {
     pub fn prefix(&self, xpub: &[f32], rows: usize, stride: usize, split: usize, out: &mut Vec<f32>) {
         let n = self.dims[1];
         let k = self.dims[0] - split;
-        out.clear();
-        out.resize(rows * n, 0.0);
+        fit(out, rows * n);
         gemm_ld(rows, n, k, xpub, stride, &self.w[0], n, 0.0, out, n);
     }
 
@@ -229,34 +337,56 @@ impl Mlp {
     ) {
         let layers = self.w.len();
         let n1 = self.dims[1];
-        debug_assert_eq!(prefix.len(), rows * n1);
+        debug_assert!(prefix.len() >= rows * n1);
         debug_assert_eq!(xbel.len(), rows * split);
 
-        // Layer 0: the cached public half plus the belief half.
-        out.clear();
-        out.extend_from_slice(prefix);
+        // Layer 0: the belief half, with the cached public half folded in
+        // during the bias pass rather than pre-copied into the buffer.
+        fit(out, rows * n1);
         let woff = (self.dims[0] - split) * n1;
-        gemm_ld(rows, n1, split, xbel, split, &self.w[0][woff..], n1, 1.0, out, n1);
-        self.activate(0, rows, out);
+        gemm_ld(
+            rows,
+            n1,
+            split,
+            xbel,
+            split,
+            &self.w[0][woff..],
+            n1,
+            0.0,
+            &mut out[..rows * n1],
+            n1,
+        );
+        self.activate(0, rows, Some(prefix), &mut out[..rows * n1]);
 
         for l in 1..layers {
             let (k, n) = (self.dims[l], self.dims[l + 1]);
             std::mem::swap(scratch, out);
             let last = l + 1 == layers;
             let (width, off) = if last { (head.len(), head.start) } else { (n, 0) };
-            out.clear();
-            out.resize(rows * width, 0.0);
-            gemm_ld(rows, width, k, scratch, k, &self.w[l][off..], n, 0.0, out, width);
+            fit(out, rows * width);
+            gemm_ld(
+                rows,
+                width,
+                k,
+                scratch,
+                k,
+                &self.w[l][off..],
+                n,
+                0.0,
+                &mut out[..rows * width],
+                width,
+            );
             if last {
                 // A bias add over the selected head; no norm, no activation.
                 let bias = &self.b[l][off..off + width];
                 for r in 0..rows {
+                    let row = &mut out[r * width..r * width + width];
                     for j in 0..width {
-                        out[r * width + j] += bias[j];
+                        row[j] += bias[j];
                     }
                 }
             } else {
-                self.activate(l, rows, out);
+                self.activate(l, rows, None, &mut out[..rows * width]);
             }
         }
     }

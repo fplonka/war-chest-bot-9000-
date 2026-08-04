@@ -32,3 +32,7 @@ path = "src/bin/rebelbench.rs"
 [profile.release]
 lto = true
 codegen-units = 1
+
+[[bin]]
+name = "gemmbench"
+path = "src/bin/gemmbench.rs"
