@@ -22,7 +22,8 @@ from value_net import Mlp  # noqa: E402
 
 def load(path):
     """A checkpoint as an `Mlp`, in the shape it was saved with."""
-    ck = torch.load(path, map_location="cpu")
+    # Our own checkpoints; torch 2.6+ defaults to weights_only=True.
+    ck = torch.load(path, map_location="cpu", weights_only=False)
     net = Mlp(ck["hidden"], ck.get("dg", 64), ck.get("rank", 64))
     net.load_state_dict(ck["value"])
     return net
