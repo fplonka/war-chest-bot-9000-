@@ -231,13 +231,16 @@ const SPLIT: usize = FEAT - OFF_BELIEF;
 const N_ROLES: usize = 5;
 const R_H0: usize = 0;
 const R_XPUB: usize = 1;
-const R_XB: usize = 2;
+const R_XB0: usize = 2;
 const R_OB: usize = 3;
 const R_SB: usize = 4;
 
 thread_local! {
-    static BUFS: std::cell::RefCell<[Vec<Vec<f32>>; N_ROLES]> =
-        const { std::cell::RefCell::new([Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()]) };
+    static BUFS: std::cell::RefCell<[Vec<Vec<f32>>; N_ROLES]> = const {
+        std::cell::RefCell::new([
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+        ])
+    };
 }
 
 fn take_buf(role: usize) -> Vec<f32> {
@@ -268,10 +271,19 @@ pub struct Solver<'a> {
     sum_strat: Vec<Vec<f32>>,
     cur: Vec<Vec<f32>>,
     avg: Vec<Vec<f32>>,
-    /// `[node][player]` -> reach per config.
-    reach: Vec<[Vec<f32>; 2]>,
-    /// `[node]` -> the traverser's counterfactual value per config.
-    vals: Vec<Vec<f32>>,
+    /// Reach per config, flat: node `i`'s two players occupy
+    /// `reach[roff[i] .. roff[i] + nc0 + nc1]`, player 0 first. One arena
+    /// rather than `Vec<Vec<f32>>` — the CFR passes touch every node, and two
+    /// pointer hops per node is what they were spending their time on.
+    reach: Vec<f32>,
+    roff: Vec<u32>,
+    /// The traverser's counterfactual value per config, flat the same way:
+    /// `vals[voff[i] .. voff[i] + max(nc0, nc1)]`.
+    vals: Vec<f32>,
+    voff: Vec<u32>,
+    /// `[node]` -> config counts per player, so the hot loops never chase the
+    /// `Rc` to ask how long a support is.
+    nc: Vec<[u32; 2]>,
     root_mean: [Vec<f32>; 2],
     steps: [usize; 2],
 
@@ -308,7 +320,7 @@ impl Drop for Solver<'_> {
         for (role, v) in [
             (R_H0, &mut self.h0),
             (R_XPUB, &mut self.xpub),
-            (R_XB, &mut self.xb),
+            (R_XB0, &mut self.xb),
             (R_OB, &mut self.ob),
             (R_SB, &mut self.sb),
         ] {
@@ -341,7 +353,10 @@ impl<'a> Solver<'a> {
             cur: Vec::new(),
             avg: Vec::new(),
             reach: Vec::new(),
+            roff: Vec::new(),
             vals: Vec::new(),
+            voff: Vec::new(),
+            nc: Vec::new(),
             steps: [0, 0],
             leaf_rows: Vec::new(),
             term_leaves: Vec::new(),
@@ -350,7 +365,7 @@ impl<'a> Solver<'a> {
             leaf_hoff: Vec::new(),
             h0: take_buf(R_H0),
             xpub: take_buf(R_XPUB),
-            xb: take_buf(R_XB),
+            xb: take_buf(R_XB0),
             ob: take_buf(R_OB),
             sb: take_buf(R_SB),
             batch_ready: false,
@@ -375,8 +390,12 @@ impl<'a> Solver<'a> {
             let n = &sv.nodes[i];
             let (na, p) = (n.na(), n.player as usize);
             let nc = n.nc(p);
-            sv.reach.push([vec![0.0; n.nc(0)], vec![0.0; n.nc(1)]]);
-            sv.vals.push(vec![0.0; n.nc(0).max(n.nc(1))]);
+            let (c0, c1) = (n.nc(0), n.nc(1));
+            sv.nc.push([c0 as u32, c1 as u32]);
+            sv.roff.push(sv.reach.len() as u32);
+            sv.reach.resize(sv.reach.len() + c0 + c1, 0.0);
+            sv.voff.push(sv.vals.len() as u32);
+            sv.vals.resize(sv.vals.len() + c0.max(c1), 0.0);
             sv.regret.push(vec![0.0; nc * na]);
             sv.sum_strat.push(if keep_avg {
                 vec![0.0; nc * na]
@@ -424,7 +443,7 @@ impl<'a> Solver<'a> {
                 }
                 let (na, p) = (sv.nodes[i].na(), sv.nodes[i].player as usize);
                 for c in 0..sv.nodes[i].nc(p) {
-                    let r = sv.reach[i][p][c];
+                    let r = sv.reach_of(i, p)[c];
                     for a in 0..na {
                         sv.sum_strat[i][c * na + a] += r * sv.cur[i][c * na + a];
                     }
@@ -654,12 +673,11 @@ impl<'a> Solver<'a> {
     /// heap allocations per node per pass.
     fn precompute_reaches(&mut self) {
         let _t = timed!(REACH);
-        for r in self.reach.iter_mut() {
-            r[0].iter_mut().for_each(|v| *v = 0.0);
-            r[1].iter_mut().for_each(|v| *v = 0.0);
-        }
+        self.reach.fill(0.0);
         for p in 0..2 {
-            self.reach[0][p].copy_from_slice(&self.root_belief[p].p);
+            let at = self.roff[0] as usize + if p == 1 { self.nc[0][0] as usize } else { 0 };
+            let n = self.nc[0][p] as usize;
+            self.reach[at..at + n].copy_from_slice(&self.root_belief[p].p);
         }
         for i in 0..self.nodes.len() {
             let n = &self.nodes[i];
@@ -668,6 +686,16 @@ impl<'a> Solver<'a> {
             }
             let (na, me) = (n.na(), n.player as usize);
             let op = 1 - me;
+            // Offsets of each player's block inside a node's reach region.
+            let blk = |cnt: [u32; 2], p: usize| -> (usize, usize) {
+                (
+                    if p == 0 { 0 } else { cnt[0] as usize },
+                    cnt[p] as usize,
+                )
+            };
+            let (pme, nme) = blk(self.nc[i], me);
+            let (pop, nop) = blk(self.nc[i], op);
+            let base = self.roff[i] as usize;
             if n.chance {
                 // Draw: one public child. The idle player's reach passes
                 // through unchanged; the drawing player's configs transition
@@ -676,17 +704,20 @@ impl<'a> Solver<'a> {
                 // the leaf values take the counterfactual convention.
                 let c = n.child[0];
                 debug_assert!(c > i);
-                let (lo, hi) = self.reach.split_at_mut(c);
-                let (src, dst) = (&lo[i], &mut hi[0]);
-                dst[op].copy_from_slice(&src[op]);
-                for ci in 0..src[me].len() {
-                    let w = src[me][ci];
+                let cbase = self.roff[c] as usize;
+                let (cme, _) = blk(self.nc[c], me);
+                let (cop, _) = blk(self.nc[c], op);
+                let (lo, hi) = self.reach.split_at_mut(cbase);
+                let (src, dst) = (&lo[base..], &mut hi[..]);
+                dst[cop..cop + nop].copy_from_slice(&src[pop..pop + nop]);
+                for ci in 0..nme {
+                    let w = src[pme + ci];
                     if w == 0.0 {
                         continue;
                     }
                     let (to, pr) = n.draw.row(ci);
                     for k in 0..to.len() {
-                        dst[me][to[k] as usize] += w * pr[k];
+                        dst[cme + to[k] as usize] += w * pr[k];
                     }
                 }
                 continue;
@@ -695,15 +726,18 @@ impl<'a> Solver<'a> {
             for ch in 0..n.child.len() {
                 let c = n.child[ch];
                 debug_assert!(c > i);
-                let (lo, hi) = self.reach.split_at_mut(c);
-                let (src, dst) = (&lo[i], &mut hi[0]);
+                let cbase = self.roff[c] as usize;
+                let (cme, _) = blk(self.nc[c], me);
+                let (cop, _) = blk(self.nc[c], op);
+                let (lo, hi) = self.reach.split_at_mut(cbase);
+                let (src, dst) = (&lo[base..], &mut hi[..]);
                 // The idle player's information state is untouched, and the
                 // child's support for them is the same list.
-                dst[op].copy_from_slice(&src[op]);
+                dst[cop..cop + nop].copy_from_slice(&src[pop..pop + nop]);
                 let (s0, s1) = (n.obs_start[ch] as usize, n.obs_start[ch + 1] as usize);
                 for &au in &n.obs_act[s0..s1] {
                     let a = au as usize;
-                    for ci in 0..src[me].len() {
+                    for ci in 0..nme {
                         if !n.legal[ci * na + a] {
                             continue;
                         }
@@ -711,16 +745,20 @@ impl<'a> Solver<'a> {
                         if t < 0 {
                             continue;
                         }
-                        dst[me][t as usize] += src[me][ci] * cur[ci * na + a];
+                        dst[cme + t as usize] += src[pme + ci] * cur[ci * na + a];
                     }
                 }
             }
         }
     }
 
-    /// Everything about the leaf batch that does not move across iterations:
-    /// which leaves there are, their public encoding pushed through the first
-    /// layer, their reserves, and the hand key of every config in support.
+    /// Node `i`'s reach vector for player `p`.
+    #[inline]
+    fn reach_of(&self, i: usize, p: usize) -> &[f32] {
+        let at = self.roff[i] as usize + if p == 1 { self.nc[i][0] as usize } else { 0 };
+        &self.reach[at..at + self.nc[i][p] as usize]
+    }
+
     /// Record a leaf in the network batch. Called from `build`, while the
     /// leaf's state is still the one just constructed and therefore still in
     /// cache — walking the finished node array to do this instead meant
@@ -779,9 +817,11 @@ impl<'a> Solver<'a> {
         let rows = self.leaf_rows.len();
         {
             let _t = timed!(BELFEAT);
-            let (nodes, reach, hoff, hand, res, xb) = (
+            let (nodes, reach, roff, nc, hoff, hand, res, xb) = (
                 &self.nodes,
                 &self.reach,
+                &self.roff,
+                &self.nc,
                 &self.leaf_hoff,
                 &self.leaf_hand,
                 &self.leaf_res,
@@ -791,10 +831,11 @@ impl<'a> Solver<'a> {
                 for p in 0..2 {
                     let (h0, h1) = (hoff[2 * r + p] as usize, hoff[2 * r + p + 1] as usize);
                     let at = r * SPLIT + p * BELIEF_DIM;
+                    let ra = roff[i] as usize + if p == 1 { nc[i][0] as usize } else { 0 };
                     write_belief_block(
                         &nodes[i].cfgs[p],
                         Some(&hand[h0..h1]),
-                        &reach[i][p],
+                        &reach[ra..ra + nc[i][p] as usize],
                         &res[r][p],
                         &mut xb[at..at + BELIEF_DIM],
                     );
@@ -823,29 +864,33 @@ impl<'a> Solver<'a> {
 
         let _t = timed!(LEAFPOST);
         let opp = 1 - traverser;
-        for &i in &self.term_leaves {
-            let opp_reach: f32 = self.reach[i][opp].iter().sum();
+        for k in 0..self.term_leaves.len() {
+            let i = self.term_leaves[k];
+            let opp_reach: f32 = self.reach_of(i, opp).iter().sum();
             let u = self.nodes[i].s.utility(traverser);
-            let nc = self.nodes[i].nc(traverser);
-            for c in 0..nc {
-                self.vals[i][c] = u * opp_reach;
-            }
+            let n = self.nc[i][traverser] as usize;
+            let vo = self.voff[i] as usize;
+            self.vals[vo..vo + n].fill(u * opp_reach);
         }
-        let (nodes, reach, hoff, hand, ob, vals) = (
-            &self.nodes,
+        let (reach, roff, ncs, voff, hoff, hand, ob, vals) = (
             &self.reach,
+            &self.roff,
+            &self.nc,
+            &self.voff,
             &self.leaf_hoff,
             &self.leaf_hand,
             &self.ob,
             &mut self.vals,
         );
         for (r, &i) in self.leaf_rows.iter().enumerate() {
-            let opp_reach: f32 = reach[i][opp].iter().sum();
-            let nc = nodes[i].nc(traverser);
+            let ra = roff[i] as usize + if opp == 1 { ncs[i][0] as usize } else { 0 };
+            let opp_reach: f32 = reach[ra..ra + ncs[i][opp] as usize].iter().sum();
+            let n = ncs[i][traverser] as usize;
             let off = r * NHAND;
             let hs = hoff[2 * r + traverser] as usize;
-            for c in 0..nc {
-                vals[i][c] = ob[off + hand[hs + c] as usize] * opp_reach;
+            let vo = voff[i] as usize;
+            for c in 0..n {
+                vals[vo + c] = ob[off + hand[hs + c] as usize] * opp_reach;
             }
         }
     }
@@ -873,8 +918,9 @@ impl<'a> Solver<'a> {
                 // the leaf values carry.
                 let ch = self.nodes[i].child[0];
                 debug_assert!(ch > i);
-                let (lo, hi) = self.vals.split_at_mut(ch);
-                let (dst, src) = (&mut lo[i], &hi[0]);
+                let (vi, vc) = (self.voff[i] as usize, self.voff[ch] as usize);
+                let (lo, hi) = self.vals.split_at_mut(vc);
+                let (dst, src) = (&mut lo[vi..], &hi[..]);
                 if me == traverser {
                     let n = &self.nodes[i];
                     for c in 0..nc {
@@ -890,19 +936,18 @@ impl<'a> Solver<'a> {
                 }
                 continue;
             }
-            for c in 0..nc {
-                self.vals[i][c] = 0.0;
-            }
+            let vbase = self.voff[i] as usize;
+            self.vals[vbase..vbase + nc].fill(0.0);
             if me == traverser {
                 let n = &self.nodes[i];
                 let (regret, cur) = (&mut self.regret[i], &self.cur[i]);
                 // Children are built after their parent, so the parent's value
-                // row and every child's are disjoint slices of one buffer.
-                let (lo, hi) = self.vals.split_at_mut(i + 1);
-                let vi = &mut lo[i];
+                // row and every child's are disjoint slices of one arena.
+                let (lo, hi) = self.vals.split_at_mut(self.voff[i + 1] as usize);
+                let vi = &mut lo[vbase..];
                 for a in 0..na {
                     let ch = n.child[n.obs_child[a]];
-                    let cv = &hi[ch - i - 1];
+                    let cv = &hi[self.voff[ch] as usize - self.voff[i + 1] as usize..];
                     for c in 0..nc {
                         if !n.legal[c * na + a] {
                             continue;
@@ -930,8 +975,9 @@ impl<'a> Solver<'a> {
                 // baked into the reach probabilities at the children.
                 for ch in 0..self.nodes[i].child.len() {
                     let c_id = self.nodes[i].child[ch];
+                    let cv = self.voff[c_id] as usize;
                     for c in 0..nc {
-                        self.vals[i][c] += self.vals[c_id][c];
+                        self.vals[vbase + c] += self.vals[cv + c];
                     }
                 }
             }
@@ -943,7 +989,7 @@ impl<'a> Solver<'a> {
         let alpha = 2.0 / (self.steps[traverser] as f32 + 2.0);
         for c in 0..self.root_mean[traverser].len() {
             self.root_mean[traverser][c] +=
-                (self.vals[0][c] - self.root_mean[traverser][c]) * alpha;
+                (self.vals[self.voff[0] as usize + c] - self.root_mean[traverser][c]) * alpha;
         }
         // Linear CFR: discount by t/(t+1) after each update.
         {
@@ -999,7 +1045,7 @@ impl<'a> Solver<'a> {
                 }
                 let (na, nc) = (n.na(), n.nc(traverser));
                 for c in 0..nc {
-                    let r = self.reach[i][traverser][c];
+                    let r = self.reach_of(i, traverser)[c];
                     let mut sum = 0.0;
                     for a in 0..na {
                         self.sum_strat[i][c * na + a] += r * self.cur[i][c * na + a];

@@ -140,13 +140,13 @@ fn add_bias_sum(row: &mut [f32], bias: &[f32], add: Option<&[f32]>) -> f32 {
         use std::arch::aarch64::*;
         let (mut s0, mut s1) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
         let (p, b) = (row.as_mut_ptr(), bias.as_ptr());
-        let a = add.map_or(std::ptr::null(), |a| a.as_ptr());
+        let a0 = add.map_or(std::ptr::null(), |a| a.as_ptr());
         while i + 8 <= n {
             let mut x0 = vaddq_f32(vld1q_f32(p.add(i)), vld1q_f32(b.add(i)));
             let mut x1 = vaddq_f32(vld1q_f32(p.add(i + 4)), vld1q_f32(b.add(i + 4)));
-            if !a.is_null() {
-                x0 = vaddq_f32(x0, vld1q_f32(a.add(i)));
-                x1 = vaddq_f32(x1, vld1q_f32(a.add(i + 4)));
+            if !a0.is_null() {
+                x0 = vaddq_f32(x0, vld1q_f32(a0.add(i)));
+                x1 = vaddq_f32(x1, vld1q_f32(a0.add(i + 4)));
             }
             vst1q_f32(p.add(i), x0);
             vst1q_f32(p.add(i + 4), x1);
@@ -405,6 +405,11 @@ impl Mlp {
     /// (`rows x dims[2]`, from `trunk`). `xbel` is `[rows * split]`. Only the
     /// output columns in `head` are produced, since a CFR traversal reads one
     /// player's head at a time.
+    ///
+    /// Splitting this further — caching each player's belief projection
+    /// separately, since only one player's beliefs move between iterations —
+    /// was tried and is slower: it halves a matmul that costs 30 us and adds a
+    /// megabyte of buffer traffic to the elementwise pass around it.
     pub fn forward_split(
         &self,
         xbel: &[f32],
