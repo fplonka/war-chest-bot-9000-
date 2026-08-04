@@ -10,11 +10,33 @@
       `Config { hand, fd, pending_coin }` — at most 5x the config count for the
       span of one coin play, still exactly enumerable — plus removing the
       Warrior Priest clamp from the subgame's chance handling.
-- [ ] The horizon payoff (`CAP_MARKER_VALUE`) is a rule we invented. It is
-      annealed to zero over the first 40% of the ReBeL phase and evaluation
-      always runs at zero, so the shipped checkpoint is fitted to the real game
-      — but confirm the cap-hit rate really reaches ~0 on a long run rather than
-      assuming it, and consider whether the anneal can start lower.
+- [ ] **The horizon, and the draws it manufactures.** A game is cut off at 256
+      coin plays and scored as a draw. War Chest has no draws, so every one is
+      an outcome we invented: 29 of 400 evaluation games vs Greedy in
+      `runs/cfgvalue01` (7.3%), 10 of 400 vs the initial checkpoint. The
+      generation-time cap rate is only 0-4%, so reading that number alone
+      understates it.
+      Three things to do, in order.
+      * Report the draw rate beside every score instead of folding draws into
+        0.5. A score of 0.961 with 7% draws is a different claim from 0.961 with
+        none.
+      * Raise `MAX_MAIN_PLAYS`. It is a `u16` const and the cost falls only on
+        games that would run long. 256 was calibrated against site data saying
+        real games top out near 200 actions — but our games plainly run longer
+        than human games, so it was calibrated on the wrong distribution. Then
+        check the cap rate rather than assuming.
+      * Treat Greedy as a draw generator, not a neutral yardstick. Measured:
+        deterministic Greedy *self-play* times out **100%** of the time, with
+        neither marker count moving for the last ~240 of 256 plays. The stalling
+        is a property of the weak reference opponent. The champion gate already
+        provides a moving, stronger reference; the fixed ones mostly serve to
+        manufacture timeouts.
+      Scoring a timeout as -1 for both players was considered and rejected: it
+      makes the game non-zero-sum, and zero-sum is load-bearing here — ReBeL's
+      guarantees, CFR's convergence to Nash, `tests/rebel_solver.rs`'s oracle
+      (the two players' root values must sum to zero), and the antisymmetry that
+      `blend_outcome` and the warm start rely on. Worth revisiting only if
+      raising the horizon fails.
 - [ ] The belief reaches the network as a fixed-width sum of learned config
       embeddings (`dg`). That is the one place a fixed width is a real
       approximation: a belief is a distribution over a config space too large to
