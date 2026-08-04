@@ -317,8 +317,8 @@ pub struct Solver<'a> {
     batch_ready: bool,
     /// Working memory for the chance transitions, reused across the tree.
     draw_scratch: DrawScratch,
-    /// `(config key, cell)` scratch for ordering a public child's support.
-    cell_order: Vec<(u64, u32)>,
+    /// `key << IDX_BITS | cell` scratch for ordering a public child's support.
+    cell_order: Vec<u64>,
     dm: [DrawMap; 3],
 }
 
@@ -572,6 +572,7 @@ impl<'a> Solver<'a> {
         let na = acts.len();
         debug_assert!(na > 0, "a decision node must offer a reachable action");
 
+        assert!(nc * na < 1 << IDX_BITS, "decision node over the index width");
         let mut legal = vec![false; nc * na];
         for (ci, c) in mine.iter().enumerate() {
             for a in 0..na {
@@ -629,20 +630,21 @@ impl<'a> Solver<'a> {
                         continue;
                     }
                     if let Some(n) = advance_config(&mine[ci], aslot[a], fdown[a]) {
-                        ent.push((n.key(), (ci * na + a) as u32));
+                        ent.push((n.key() << IDX_BITS) | (ci * na + a) as u64);
                     }
                 }
             }
             ent.sort_unstable();
             let sup = &mut child_cfgs[ch];
             let mut prev = u64::MAX;
-            for &(k, cell) in ent.iter() {
+            for &packed in ent.iter() {
+                let (k, cell) = (packed >> IDX_BITS, (packed & IDX_MASK) as usize);
                 if k != prev {
                     prev = k;
-                    let (ci, a) = (cell as usize / na, cell as usize % na);
+                    let (ci, a) = (cell / na, cell % na);
                     sup.push(advance_config(&mine[ci], aslot[a], fdown[a]).unwrap());
                 }
-                trans[cell as usize] = (sup.len() - 1) as i32;
+                trans[cell] = (sup.len() - 1) as i32;
             }
         }
         self.cell_order = ent;

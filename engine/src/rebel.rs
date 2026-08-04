@@ -179,14 +179,19 @@ impl Config {
     /// walking two five-byte arrays — but only if the key is computed once per
     /// element rather than once per comparison, which is why this is a method
     /// and not an `Ord` impl.
+    /// 2 bits per hand slot (a hand holds at most `HAND_CAP` = 3 coins in
+    /// total, so no slot exceeds 3) and 5 per face-down slot (bounded by the
+    /// largest supply in the game), for 35 bits — which leaves room to pack an
+    /// element index alongside it in one `u64`.
     #[inline]
     pub fn key(&self) -> u64 {
         let mut k = 0u64;
         for i in 0..NSLOT {
-            debug_assert!(self.hand[i] < 32 && self.fd[i] < 32);
-            k = (k << 5) | self.hand[i] as u64;
+            debug_assert!(self.hand[i] < 4, "hand slot over the key width");
+            k = (k << 2) | self.hand[i] as u64;
         }
         for i in 0..NSLOT {
+            debug_assert!(self.fd[i] < 32, "face-down slot over the key width");
             k = (k << 5) | self.fd[i] as u64;
         }
         k
@@ -471,12 +476,22 @@ impl DrawMap {
 /// the buffers involved are all small — which is exactly why the allocator
 /// traffic mattered more than the arithmetic. One scratch lives on the solver
 /// and is reused for the whole tree.
+/// Bits reserved for the element index when a config key and an index are
+/// packed into one `u64`. `Config::key` occupies 35, so this leaves nine spare
+/// — and the largest thing sorted this way, a decision node's
+/// `config x action` grid, runs to a few tens of thousands.
+pub const IDX_BITS: u32 = 24;
+pub const IDX_MASK: u64 = (1 << IDX_BITS) - 1;
+
 #[derive(Default)]
 pub struct DrawScratch {
     kid: Vec<Config>,
     prob: Vec<f32>,
-    /// `(key, index into kid)`, sorted by key to build the child support.
-    order: Vec<(u64, u32)>,
+    /// `key << IDX_BITS | index into kid`, sorted to build the child support.
+    /// One `u64` rather than a `(u64, u32)` pair: a config key needs 50 bits
+    /// and the index at most `IDX_BITS`, so packing them halves the width the
+    /// sort moves around.
+    order: Vec<u64>,
     acc: Vec<f32>,
     hit: Vec<bool>,
     touched: Vec<u32>,
@@ -525,9 +540,14 @@ impl DrawScratch {
         }
         // Sort once by integer key, then read the support and the child index
         // of every row off that single ordering — no per-row binary search.
+        assert!(self.kid.len() < 1 << IDX_BITS, "draw fan-out over the index width");
         self.order.clear();
-        self.order
-            .extend(self.kid.iter().enumerate().map(|(i, c)| (c.key(), i as u32)));
+        self.order.extend(
+            self.kid
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.key() << IDX_BITS) | i as u64),
+        );
         self.order.sort_unstable();
         support.clear();
         map.to.clear();
@@ -535,12 +555,13 @@ impl DrawScratch {
         map.p.clear();
         map.p.extend_from_slice(&self.prob);
         let mut prev = u64::MAX;
-        for &(k, i) in self.order.iter() {
+        for &packed in self.order.iter() {
+            let (k, i) = (packed >> IDX_BITS, (packed & IDX_MASK) as usize);
             if k != prev {
                 prev = k;
-                support.push(self.kid[i as usize]);
+                support.push(self.kid[i]);
             }
-            map.to[i as usize] = (support.len() - 1) as u32;
+            map.to[i] = (support.len() - 1) as u32;
         }
     }
 
@@ -717,8 +738,15 @@ pub fn write_belief_block(
     debug_assert_eq!(out.len(), BELIEF_DIM);
     debug_assert_eq!(cfg.len(), w.len());
     out.fill(0.0);
+    // One reciprocal for the whole support rather than a divide per config:
+    // this runs once per leaf per player per CFR iteration over a support that
+    // averages ~35 configs, and f32 division does not pipeline.
     let tot: f32 = w.iter().sum();
-    let unif = 1.0 / w.len().max(1) as f32;
+    let (scale, flat) = if tot > SMOOTH {
+        (1.0 / tot, 0.0)
+    } else {
+        (0.0, 1.0 / w.len().max(1) as f32)
+    };
     // Each config's own bag, then the belief-weighted average — *not* the
     // algebraically equal `reserve - E[hand] - E[facedown]`. That form is
     // cheaper and numerically wrong exactly where it matters: when a player's
@@ -728,7 +756,7 @@ pub fn write_belief_block(
     // `belief_block_matches_the_direct_definition` pins this.
     let (mut bag, mut fd) = ([0.0f32; NSLOT], [0.0f32; NSLOT]);
     for (ci, c) in cfg.iter().enumerate() {
-        let p = if tot > SMOOTH { w[ci] / tot } else { unif };
+        let p = w[ci] * scale + flat;
         out[match hidx {
             Some(t) => t[ci] as usize,
             None => c.hand_index(),
