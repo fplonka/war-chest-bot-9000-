@@ -18,10 +18,16 @@ rayon = "1.10"
 [features]
 default = []
 python = ["pyo3", "numpy"]
+# Phase timers inside the generation loop; adds ~5% overhead.
+prof = []
 
 [[bin]]
 name = "bench"
 path = "src/bin/bench.rs"
+
+[[bin]]
+name = "rebelbench"
+path = "src/bin/rebelbench.rs"
 
 [profile.release]
 lto = true

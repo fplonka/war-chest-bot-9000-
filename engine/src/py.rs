@@ -617,7 +617,11 @@ fn gen_data(
     random_draft: bool,
     eval_mix: f32,
 ) -> PyResult<PyObject> {
-    let cfg = Cfg { depth, iters };
+    let cfg = Cfg {
+        depth,
+        iters,
+        average: true,
+    };
     let (agent, collect) = match mode {
         "greedy" => (Agent::Greedy { temp }, Collect::Mc),
         "rebel" => (Agent::Rebel { cfg, slot: 0 }, Collect::Rebel),
@@ -660,7 +664,11 @@ fn eval_match(
     slot_b: usize,
     random_draft: bool,
 ) -> PyResult<(usize, usize, usize)> {
-    let cfg = Cfg { depth, iters };
+    let cfg = Cfg {
+        depth,
+        iters,
+        average: true,
+    };
     let (aa, bb) = (agent_of(a, cfg, temp, slot_a)?, agent_of(b, cfg, temp, slot_b)?);
     Ok(py.allow_threads(|| {
         let n = nets().read().unwrap();

@@ -30,6 +30,7 @@
 //!    belief update sums over the private actions consistent with what was seen.
 
 use crate::actions::Action;
+use crate::{shape, timed};
 use crate::board::NONE;
 use crate::net::Mlp;
 use crate::rebel::*;
@@ -42,11 +43,20 @@ pub struct Cfg {
     pub depth: usize,
     /// CFR iterations (alternating, so each player is traversed iters/2 times).
     pub iters: usize,
+    /// Maintain the CFR *average* strategy. Only evaluation reads it —
+    /// self-play acts on the current regret-matching iterate — and keeping it
+    /// costs a second reach pass plus two sweeps over every strategy cell per
+    /// iteration, so generation turns it off.
+    pub average: bool,
 }
 
 impl Default for Cfg {
     fn default() -> Self {
-        Cfg { depth: 1, iters: 16 }
+        Cfg {
+            depth: 1,
+            iters: 16,
+            average: true,
+        }
     }
 }
 
@@ -160,17 +170,22 @@ pub struct TNode {
     pub leaf: bool,
     /// Draw pass-through node: the public tree does not branch, there is one
     /// public child, and the drawing player's configs transition through the
-    /// `draw_p` chance matrix.
+    /// `draw` chance map.
     pub chance: bool,
-    /// `[parent_config][child_config]` draw probabilities, for the drawing
-    /// player. Empty for decision nodes.
-    pub draw_p: Vec<Vec<f32>>,
+    /// The drawing player's chance transition. Empty for decision nodes.
+    pub draw: DrawMap,
     pub acts: Vec<Action>,
     pub aslot: Vec<i8>,
     pub fdown: Vec<bool>,
     /// Action index -> position in `child` (many private actions, one public
     /// observation).
     pub obs_child: Vec<usize>,
+    /// The same map inverted, CSR-style: the actions leading to public child
+    /// `ch` are `obs_act[obs_start[ch]..obs_start[ch + 1]]`. Reach propagation
+    /// walks children on the outside so it can borrow parent and child reach
+    /// vectors disjointly instead of copying the parent's.
+    pub obs_start: Vec<u32>,
+    pub obs_act: Vec<u32>,
     pub child: Vec<usize>,
     /// Config support per player at this node.
     pub cfgs: [Vec<Config>; 2],
@@ -191,6 +206,10 @@ impl TNode {
     }
 }
 
+/// The belief blocks are the tail of the encoding, and they are the only part
+/// that moves between CFR iterations at a fixed leaf.
+const SPLIT: usize = FEAT - OFF_BELIEF;
+
 pub struct Solver<'a> {
     ctx: &'a Ctx,
     nets: &'a Nets,
@@ -207,10 +226,28 @@ pub struct Solver<'a> {
     vals: Vec<Vec<f32>>,
     root_mean: [Vec<f32>; 2],
     steps: [usize; 2],
-    leaves: Vec<usize>,
+
+    // ---------------------------------------------------------- leaf batch
+    // Built once per solve. Everything here is a property of the leaf's public
+    // state or its config support, so it survives every CFR iteration; only
+    // `xb` (the belief blocks) is rewritten per iteration.
+    /// Non-terminal leaves in node order — the rows of the network batch.
+    leaf_rows: Vec<usize>,
+    /// Terminal leaves, scored from the game instead of the network.
+    term_leaves: Vec<usize>,
+    /// Per row, per player: the public reserve.
+    leaf_res: Vec<[[u8; NSLOT]; 2]>,
+    /// Per row, per player: the hand key of every config in support, packed
+    /// back to back and indexed through `leaf_hoff`.
+    leaf_hand: Vec<u16>,
+    leaf_hoff: Vec<u32>,
+    /// `rows * hidden`: the public half of the first layer.
+    h0: Vec<f32>,
+    /// `rows * SPLIT`: the belief half of the encoding.
     xb: Vec<f32>,
     ob: Vec<f32>,
     sb: Vec<f32>,
+    batch_ready: bool,
 }
 
 impl<'a> Solver<'a> {
@@ -236,21 +273,35 @@ impl<'a> Solver<'a> {
             reach: Vec::new(),
             vals: Vec::new(),
             steps: [0, 0],
-            leaves: Vec::new(),
+            leaf_rows: Vec::new(),
+            term_leaves: Vec::new(),
+            leaf_res: Vec::new(),
+            leaf_hand: Vec::new(),
+            leaf_hoff: Vec::new(),
+            h0: Vec::new(),
             xb: Vec::new(),
             ob: Vec::new(),
             sb: Vec::new(),
+            batch_ready: false,
         };
-        sv.build(root.clone(), cfg.depth.max(1), cfgs);
+        {
+            let _t = timed!(BUILD);
+            sv.build(root.clone(), cfg.depth.max(1), cfgs);
+        }
+        let _t = timed!(ALLOC);
+        let keep_avg = cfg.average;
         for i in 0..sv.nodes.len() {
             let n = &sv.nodes[i];
             let (na, p) = (n.na(), n.player as usize);
             let nc = n.nc(p);
-            sv.reach
-                .push([vec![0.0; n.nc(0)], vec![0.0; n.nc(1)]]);
+            sv.reach.push([vec![0.0; n.nc(0)], vec![0.0; n.nc(1)]]);
             sv.vals.push(vec![0.0; n.nc(0).max(n.nc(1))]);
             sv.regret.push(vec![0.0; nc * na]);
-            sv.sum_strat.push(vec![0.0; nc * na]);
+            sv.sum_strat.push(if keep_avg {
+                vec![0.0; nc * na]
+            } else {
+                Vec::new()
+            });
             // CFR starts from a uniform strategy over the legal actions, as in
             // the reference. No heuristic prior is injected here: the greedy
             // knowledge enters through the pretrained value network, which is
@@ -264,21 +315,38 @@ impl<'a> Solver<'a> {
                     }
                 }
             }
-            sv.cur.push(u.clone());
-            sv.avg.push(u);
+            sv.avg.push(if keep_avg { u.clone() } else { Vec::new() });
+            sv.cur.push(u);
         }
-        // Seed the strategy sums with one reach-weighted uniform strategy, as
-        // `get_uniform_reach_weigted_strategy` does in the reference.
-        sv.precompute_reaches();
-        for i in 0..sv.nodes.len() {
-            if sv.nodes[i].leaf {
-                continue;
+        drop(_t);
+        shape!(SOLVES, 1);
+        shape!(NODES, sv.nodes.len());
+        #[cfg(feature = "prof")]
+        for n in &sv.nodes {
+            if n.leaf {
+                shape!(LEAVES, 1);
+            } else {
+                shape!(INNER_CA, n.na() * n.nc(n.player as usize));
+                if n.chance {
+                    shape!(CHANCE, 1);
+                }
             }
-            let (na, p) = (sv.nodes[i].na(), sv.nodes[i].player as usize);
-            for c in 0..sv.nodes[i].nc(p) {
-                let r = sv.reach[i][p][c];
-                for a in 0..na {
-                    sv.sum_strat[i][c * na + a] += r * sv.cur[i][c * na + a];
+            shape!(CFGSUM, n.nc(0) + n.nc(1));
+        }
+        sv.precompute_reaches();
+        if keep_avg {
+            // Seed the strategy sums with one reach-weighted uniform strategy,
+            // as `get_uniform_reach_weigted_strategy` does in the reference.
+            for i in 0..sv.nodes.len() {
+                if sv.nodes[i].leaf {
+                    continue;
+                }
+                let (na, p) = (sv.nodes[i].na(), sv.nodes[i].player as usize);
+                for c in 0..sv.nodes[i].nc(p) {
+                    let r = sv.reach[i][p][c];
+                    for a in 0..na {
+                        sv.sum_strat[i][c * na + a] += r * sv.cur[i][c * na + a];
+                    }
                 }
             }
         }
@@ -300,11 +368,13 @@ impl<'a> Solver<'a> {
             player,
             leaf,
             chance: false,
-            draw_p: Vec::new(),
+            draw: DrawMap::default(),
             acts: Vec::new(),
             aslot: Vec::new(),
             fdown: Vec::new(),
             obs_child: Vec::new(),
+            obs_start: Vec::new(),
+            obs_act: Vec::new(),
             child: Vec::new(),
             cfgs: cfgs.clone(),
             legal: Vec::new(),
@@ -332,18 +402,14 @@ impl<'a> Solver<'a> {
             let me = player as usize;
             let res = reserve(&s, player, self.ctx);
             let fu = faceup_counts(&s, player, self.ctx);
-            let bel = Belief {
-                cfg: cfgs[me].clone(),
-                p: vec![1.0; cfgs[me].len()],
-            };
-            let (child_cfgs, draw_p) = draw_transition(&bel, &res, &fu);
-            let mut cc = cfgs.clone();
+            let (child_cfgs, draw) = draw_transition(&cfgs[me], &res, &fu);
+            let mut cc = cfgs;
             cc[me] = child_cfgs;
             let ch = self.build(cs, depth, cc);
             let n = &mut self.nodes[id];
             n.chance = true;
             n.child = vec![ch];
-            n.draw_p = draw_p;
+            n.draw = draw;
             return id;
         }
 
@@ -374,10 +440,26 @@ impl<'a> Solver<'a> {
                 }
             };
         }
+        // The inverse map, CSR by public child.
+        let nch = obs_keys.len();
+        let mut obs_start = vec![0u32; nch + 1];
+        for a in 0..na {
+            obs_start[obs_child[a] + 1] += 1;
+        }
+        for ch in 0..nch {
+            obs_start[ch + 1] += obs_start[ch];
+        }
+        let mut fill = obs_start.clone();
+        let mut obs_act = vec![0u32; na];
+        for a in 0..na {
+            let ch = obs_child[a];
+            obs_act[fill[ch] as usize] = a as u32;
+            fill[ch] += 1;
+        }
 
         // Config support of each public child: the union over the private
         // actions that produce that observation.
-        let mut child_cfgs: Vec<Vec<Config>> = vec![Vec::new(); obs_keys.len()];
+        let mut child_cfgs: Vec<Vec<Config>> = vec![Vec::new(); nch];
         for (ci, c) in mine.iter().enumerate() {
             for a in 0..na {
                 if !legal[ci * na + a] {
@@ -411,9 +493,9 @@ impl<'a> Solver<'a> {
 
         // One world per public child, built from any config that can produce
         // it: the public projection of the successor is the same either way.
-        let mut child = Vec::with_capacity(obs_keys.len());
-        for ch in 0..obs_keys.len() {
-            let a = (0..na).find(|&a| obs_child[a] == ch).unwrap();
+        let mut child = Vec::with_capacity(nch);
+        for ch in 0..nch {
+            let a = obs_act[obs_start[ch] as usize] as usize;
             let rep = *mine
                 .iter()
                 .find(|c| aslot[a] < 0 || c.hand[aslot[a] as usize] > 0)
@@ -422,7 +504,7 @@ impl<'a> Solver<'a> {
             set_config(&mut cs, player, self.ctx, &rep);
             cs.apply_inplace(acts[a]);
             let mut cc = cfgs.clone();
-            cc[me] = child_cfgs[ch].clone();
+            cc[me] = std::mem::take(&mut child_cfgs[ch]);
             child.push(self.build(cs, depth - 1, cc));
         }
 
@@ -431,6 +513,8 @@ impl<'a> Solver<'a> {
         n.aslot = aslot;
         n.fdown = fdown;
         n.obs_child = obs_child;
+        n.obs_start = obs_start;
+        n.obs_act = obs_act;
         n.child = child;
         n.legal = legal;
         n.trans = trans;
@@ -439,7 +523,14 @@ impl<'a> Solver<'a> {
 
     // -------------------------------------------------------------- CFR core
 
+    /// Push reach probabilities down the tree under the current strategies.
+    ///
+    /// Children are always built after their parent, so `child > parent` and
+    /// the parent's row can be borrowed alongside the child's through one
+    /// `split_at_mut` — no copy of the parent's reach, which used to be two
+    /// heap allocations per node per pass.
     fn precompute_reaches(&mut self) {
+        let _t = timed!(REACH);
         for r in self.reach.iter_mut() {
             r[0].iter_mut().for_each(|v| *v = 0.0);
             r[1].iter_mut().for_each(|v| *v = 0.0);
@@ -448,125 +539,192 @@ impl<'a> Solver<'a> {
             self.reach[0][p].copy_from_slice(&self.root_belief[p].p);
         }
         for i in 0..self.nodes.len() {
-            if self.nodes[i].leaf {
+            let n = &self.nodes[i];
+            if n.leaf {
                 continue;
             }
-            let (na, me) = (self.nodes[i].na(), self.nodes[i].player as usize);
+            let (na, me) = (n.na(), n.player as usize);
             let op = 1 - me;
-            let src_op = self.reach[i][op].clone();
-            let src_me = self.reach[i][me].clone();
-            if self.nodes[i].chance {
+            if n.chance {
                 // Draw: one public child. The idle player's reach passes
                 // through unchanged; the drawing player's configs transition
                 // through the chance matrix, so the chance factor lives in
                 // the drawing player's reach and is discarded with it when
                 // the leaf values take the counterfactual convention.
-                let c = self.nodes[i].child[0];
-                self.reach[c][op].copy_from_slice(&src_op);
-                let child_nc = self.nodes[c].nc(me);
-                for ci in 0..src_me.len() {
-                    if src_me[ci] == 0.0 {
+                let c = n.child[0];
+                debug_assert!(c > i);
+                let (lo, hi) = self.reach.split_at_mut(c);
+                let (src, dst) = (&lo[i], &mut hi[0]);
+                dst[op].copy_from_slice(&src[op]);
+                for ci in 0..src[me].len() {
+                    let w = src[me][ci];
+                    if w == 0.0 {
                         continue;
                     }
-                    for t in 0..child_nc {
-                        let p = self.nodes[i].draw_p[ci][t];
-                        if p > 0.0 {
-                            self.reach[c][me][t] += src_me[ci] * p;
-                        }
+                    let (to, pr) = n.draw.row(ci);
+                    for k in 0..to.len() {
+                        dst[me][to[k] as usize] += w * pr[k];
                     }
                 }
                 continue;
             }
-            for ch in 0..self.nodes[i].child.len() {
-                let c = self.nodes[i].child[ch];
+            let cur = &self.cur[i];
+            for ch in 0..n.child.len() {
+                let c = n.child[ch];
+                debug_assert!(c > i);
+                let (lo, hi) = self.reach.split_at_mut(c);
+                let (src, dst) = (&lo[i], &mut hi[0]);
                 // The idle player's information state is untouched, and the
                 // child's support for them is the same list.
-                self.reach[c][op].copy_from_slice(&src_op);
-            }
-            for a in 0..na {
-                let c = self.nodes[i].child[self.nodes[i].obs_child[a]];
-                for ci in 0..src_me.len() {
-                    if !self.nodes[i].legal[ci * na + a] {
-                        continue;
+                dst[op].copy_from_slice(&src[op]);
+                let (s0, s1) = (n.obs_start[ch] as usize, n.obs_start[ch + 1] as usize);
+                for &au in &n.obs_act[s0..s1] {
+                    let a = au as usize;
+                    for ci in 0..src[me].len() {
+                        if !n.legal[ci * na + a] {
+                            continue;
+                        }
+                        let t = n.trans[ci * na + a];
+                        if t < 0 {
+                            continue;
+                        }
+                        dst[me][t as usize] += src[me][ci] * cur[ci * na + a];
                     }
-                    let t = self.nodes[i].trans[ci * na + a];
-                    if t < 0 {
-                        continue;
-                    }
-                    self.reach[c][me][t as usize] += src_me[ci] * self.cur[i][ci * na + a];
                 }
             }
+        }
+    }
+
+    /// Everything about the leaf batch that does not move across iterations:
+    /// which leaves there are, their public encoding pushed through the first
+    /// layer, their reserves, and the hand key of every config in support.
+    fn ensure_leaf_batch(&mut self) {
+        if self.batch_ready {
+            return;
+        }
+        self.batch_ready = true;
+        let _t = timed!(PUBFEAT);
+        let mut xpub: Vec<f32> = Vec::new();
+        for i in 0..self.nodes.len() {
+            if !self.nodes[i].leaf {
+                continue;
+            }
+            if self.nodes[i].s.is_terminal() {
+                self.term_leaves.push(i);
+                continue;
+            }
+            let base = xpub.len();
+            xpub.resize(base + OFF_BELIEF, 0.0);
+            write_public_features(&self.nodes[i].s, self.ctx, &mut xpub[base..base + OFF_BELIEF]);
+            let res = [
+                reserve(&self.nodes[i].s, 0, self.ctx),
+                reserve(&self.nodes[i].s, 1, self.ctx),
+            ];
+            self.leaf_res.push(res);
+            for p in 0..2 {
+                self.leaf_hoff.push(self.leaf_hand.len() as u32);
+                for c in 0..self.nodes[i].cfgs[p].len() {
+                    let h = self.nodes[i].cfgs[p][c].hand_index() as u16;
+                    self.leaf_hand.push(h);
+                }
+            }
+            self.leaf_rows.push(i);
+        }
+        self.leaf_hoff.push(self.leaf_hand.len() as u32);
+        let rows = self.leaf_rows.len();
+        self.xb.clear();
+        self.xb.resize(rows * SPLIT, 0.0);
+        if !self.nets.value.is_empty() {
+            debug_assert_eq!(self.nets.value.in_dim(), FEAT);
+            let _t = timed!(PUBNET);
+            self.nets
+                .value
+                .prefix(&xpub, rows, OFF_BELIEF, SPLIT, &mut self.h0);
         }
     }
 
     /// Fill `vals` at every leaf with the traverser's counterfactual values.
     fn leaf_values(&mut self, traverser: usize) {
-        if self.leaves.is_empty() {
-            self.leaves = (0..self.nodes.len())
-                .filter(|&i| self.nodes[i].leaf)
-                .collect();
-        }
-        let leaves = std::mem::take(&mut self.leaves);
-        let mut rows = 0usize;
-        self.xb.clear();
-        for &i in &leaves {
-            if self.nodes[i].s.is_terminal() {
-                continue;
-            }
-            rows += 1;
-            let b = [self.leaf_belief(i, 0), self.leaf_belief(i, 1)];
-            let base = self.xb.len();
-            self.xb.resize(base + FEAT, 0.0);
-            write_features(
-                &self.nodes[i].s,
-                self.ctx,
-                &b,
-                &mut self.xb[base..base + FEAT],
+        self.ensure_leaf_batch();
+        let rows = self.leaf_rows.len();
+        {
+            let _t = timed!(BELFEAT);
+            let (nodes, reach, hoff, hand, res, xb) = (
+                &self.nodes,
+                &self.reach,
+                &self.leaf_hoff,
+                &self.leaf_hand,
+                &self.leaf_res,
+                &mut self.xb,
             );
-        }
-        if rows > 0 && !self.nets.value.is_empty() {
-            self.nets
-                .value
-                .forward(&self.xb, rows, &mut self.sb, &mut self.ob);
-        } else {
-            self.ob.clear();
-            self.ob.resize(rows * 2 * NHAND, 0.0);
-        }
-        let mut row = 0usize;
-        for &i in &leaves {
-            let opp = 1 - traverser;
-            let opp_reach: f32 = self.reach[i][opp].iter().sum();
-            let nc = self.nodes[i].nc(traverser);
-            if self.nodes[i].s.is_terminal() {
-                let u = self.nodes[i].s.utility(traverser);
-                for c in 0..nc {
-                    self.vals[i][c] = u * opp_reach;
+            for (r, &i) in self.leaf_rows.iter().enumerate() {
+                for p in 0..2 {
+                    let (h0, h1) = (hoff[2 * r + p] as usize, hoff[2 * r + p + 1] as usize);
+                    let at = r * SPLIT + p * BELIEF_DIM;
+                    write_belief_block(
+                        &nodes[i].cfgs[p],
+                        Some(&hand[h0..h1]),
+                        &reach[i][p],
+                        &res[r][p],
+                        &mut xb[at..at + BELIEF_DIM],
+                    );
                 }
-            } else {
-                let off = row * 2 * NHAND + traverser * NHAND;
-                for c in 0..nc {
-                    let h = self.nodes[i].cfgs[traverser][c].hand_index();
-                    self.vals[i][c] = self.ob[off + h] * opp_reach;
-                }
-                row += 1;
             }
         }
-        self.leaves = leaves;
-    }
+        {
+            let _t = timed!(NET);
+            let net = &self.nets.value;
+            if !net.is_empty() {
+                net.forward_split(
+                    &self.xb,
+                    rows,
+                    SPLIT,
+                    &self.h0,
+                    traverser * NHAND..(traverser + 1) * NHAND,
+                    &mut self.sb,
+                    &mut self.ob,
+                );
+            } else {
+                self.ob.clear();
+                self.ob.resize(rows * NHAND, 0.0);
+            }
+        }
 
-    /// The normalised reach at a leaf, as a belief the network can consume.
-    fn leaf_belief(&self, node: usize, p: usize) -> Belief {
-        let mut b = Belief {
-            cfg: self.nodes[node].cfgs[p].clone(),
-            p: self.reach[node][p].clone(),
-        };
-        b.normalize();
-        b
+        let _t = timed!(LEAFPOST);
+        let opp = 1 - traverser;
+        for &i in &self.term_leaves {
+            let opp_reach: f32 = self.reach[i][opp].iter().sum();
+            let u = self.nodes[i].s.utility(traverser);
+            let nc = self.nodes[i].nc(traverser);
+            for c in 0..nc {
+                self.vals[i][c] = u * opp_reach;
+            }
+        }
+        let (nodes, reach, hoff, hand, ob, vals) = (
+            &self.nodes,
+            &self.reach,
+            &self.leaf_hoff,
+            &self.leaf_hand,
+            &self.ob,
+            &mut self.vals,
+        );
+        for (r, &i) in self.leaf_rows.iter().enumerate() {
+            let opp_reach: f32 = reach[i][opp].iter().sum();
+            let nc = nodes[i].nc(traverser);
+            let off = r * NHAND;
+            let hs = hoff[2 * r + traverser] as usize;
+            for c in 0..nc {
+                vals[i][c] = ob[off + hand[hs + c] as usize] * opp_reach;
+            }
+        }
     }
 
     fn update_regrets(&mut self, traverser: usize) {
-        self.precompute_reaches();
+        // Reaches are already consistent with `cur`: `new` establishes that and
+        // every `step` re-establishes it after regret matching, so recomputing
+        // them here would repeat the previous pass exactly.
         self.leaf_values(traverser);
+        let _t = timed!(BACK);
         for i in (0..self.nodes.len()).rev() {
             if self.nodes[i].leaf {
                 continue;
@@ -583,18 +741,21 @@ impl<'a> Solver<'a> {
                 // opponent's chance factor is already in their reach, which
                 // the leaf values carry.
                 let ch = self.nodes[i].child[0];
+                debug_assert!(ch > i);
+                let (lo, hi) = self.vals.split_at_mut(ch);
+                let (dst, src) = (&mut lo[i], &hi[0]);
                 if me == traverser {
-                    let ch_nc = self.nodes[ch].nc(traverser);
+                    let n = &self.nodes[i];
                     for c in 0..nc {
+                        let (to, pr) = n.draw.row(c);
                         let mut v = 0.0;
-                        for t in 0..ch_nc {
-                            v += self.nodes[i].draw_p[c][t] * self.vals[ch][t];
+                        for k in 0..to.len() {
+                            v += pr[k] * src[to[k] as usize];
                         }
-                        self.vals[i][c] = v;
+                        dst[c] = v;
                     }
                 } else {
-                    let v = self.vals[ch][..nc].to_vec();
-                    self.vals[i][..nc].copy_from_slice(&v);
+                    dst[..nc].copy_from_slice(&src[..nc]);
                 }
                 continue;
             }
@@ -602,26 +763,33 @@ impl<'a> Solver<'a> {
                 self.vals[i][c] = 0.0;
             }
             if me == traverser {
+                let n = &self.nodes[i];
+                let (regret, cur) = (&mut self.regret[i], &self.cur[i]);
+                // Children are built after their parent, so the parent's value
+                // row and every child's are disjoint slices of one buffer.
+                let (lo, hi) = self.vals.split_at_mut(i + 1);
+                let vi = &mut lo[i];
                 for a in 0..na {
-                    let ch = self.nodes[i].child[self.nodes[i].obs_child[a]];
+                    let ch = n.child[n.obs_child[a]];
+                    let cv = &hi[ch - i - 1];
                     for c in 0..nc {
-                        if !self.nodes[i].legal[c * na + a] {
+                        if !n.legal[c * na + a] {
                             continue;
                         }
-                        let t = self.nodes[i].trans[c * na + a];
+                        let t = n.trans[c * na + a];
                         if t < 0 {
                             continue;
                         }
-                        let av = self.vals[ch][t as usize];
-                        self.regret[i][c * na + a] += av;
-                        self.vals[i][c] += av * self.cur[i][c * na + a];
+                        let av = cv[t as usize];
+                        regret[c * na + a] += av;
+                        vi[c] += av * cur[c * na + a];
                     }
                 }
                 for c in 0..nc {
-                    let base = self.vals[i][c];
+                    let base = vi[c];
                     for a in 0..na {
-                        if self.nodes[i].legal[c * na + a] {
-                            self.regret[i][c * na + a] -= base;
+                        if n.legal[c * na + a] {
+                            regret[c * na + a] -= base;
                         }
                     }
                 }
@@ -647,64 +815,74 @@ impl<'a> Solver<'a> {
                 (self.vals[0][c] - self.root_mean[traverser][c]) * alpha;
         }
         // Linear CFR: discount by t/(t+1) after each update.
-        let m = self.steps[traverser] as f32 + 1.0;
-        let disc = m / (m + 1.0);
-        for i in 0..self.nodes.len() {
-            if self.nodes[i].leaf || self.nodes[i].chance || self.nodes[i].player as usize != traverser
-            {
-                continue;
-            }
-            let (na, nc) = (self.nodes[i].na(), self.nodes[i].nc(traverser));
-            for c in 0..nc {
-                let mut sum = 0.0;
-                for a in 0..na {
-                    let v = if self.nodes[i].legal[c * na + a] {
-                        self.regret[i][c * na + a].max(1e-6)
-                    } else {
-                        0.0
-                    };
-                    self.cur[i][c * na + a] = v;
-                    sum += v;
+        {
+            let _t = timed!(RM);
+            let m = self.steps[traverser] as f32 + 1.0;
+            let disc = m / (m + 1.0);
+            let keep_avg = self.cfg.average;
+            for i in 0..self.nodes.len() {
+                let n = &self.nodes[i];
+                if n.leaf || n.chance || n.player as usize != traverser {
+                    continue;
                 }
-                if sum > 0.0 {
+                let (na, nc) = (n.na(), n.nc(traverser));
+                let (regret, cur) = (&mut self.regret[i], &mut self.cur[i]);
+                for c in 0..nc {
+                    let mut sum = 0.0;
                     for a in 0..na {
-                        self.cur[i][c * na + a] /= sum;
-                    }
-                }
-                for a in 0..na {
-                    self.regret[i][c * na + a] *= disc;
-                    self.sum_strat[i][c * na + a] *= disc;
-                }
-            }
-        }
-        // Accumulate the average strategy, weighted by the traverser's reach
-        // under the strategy just computed.
-        self.precompute_reaches();
-        for i in 0..self.nodes.len() {
-            if self.nodes[i].leaf || self.nodes[i].chance || self.nodes[i].player as usize != traverser
-            {
-                continue;
-            }
-            let (na, nc) = (self.nodes[i].na(), self.nodes[i].nc(traverser));
-            for c in 0..nc {
-                let r = self.reach[i][traverser][c];
-                let mut sum = 0.0;
-                for a in 0..na {
-                    self.sum_strat[i][c * na + a] += r * self.cur[i][c * na + a];
-                    sum += self.sum_strat[i][c * na + a];
-                }
-                if sum > 0.0 {
-                    for a in 0..na {
-                        self.avg[i][c * na + a] = self.sum_strat[i][c * na + a] / sum;
-                    }
-                } else {
-                    let k = (0..na).filter(|&a| self.nodes[i].legal[c * na + a]).count() as f32;
-                    for a in 0..na {
-                        self.avg[i][c * na + a] = if self.nodes[i].legal[c * na + a] {
-                            1.0 / k
+                        let v = if n.legal[c * na + a] {
+                            regret[c * na + a].max(1e-6)
                         } else {
                             0.0
                         };
+                        cur[c * na + a] = v;
+                        sum += v;
+                    }
+                    if sum > 0.0 {
+                        let inv = 1.0 / sum;
+                        for a in 0..na {
+                            cur[c * na + a] *= inv;
+                        }
+                    }
+                    for a in 0..na {
+                        regret[c * na + a] *= disc;
+                    }
+                }
+                if keep_avg {
+                    for x in self.sum_strat[i].iter_mut() {
+                        *x *= disc;
+                    }
+                }
+            }
+        }
+        // Restore the reach probabilities under the strategy just computed:
+        // the next iteration's traversal reads them, and so does the average
+        // strategy accumulation below.
+        self.precompute_reaches();
+        if self.cfg.average {
+            let _t = timed!(AVG);
+            for i in 0..self.nodes.len() {
+                let n = &self.nodes[i];
+                if n.leaf || n.chance || n.player as usize != traverser {
+                    continue;
+                }
+                let (na, nc) = (n.na(), n.nc(traverser));
+                for c in 0..nc {
+                    let r = self.reach[i][traverser][c];
+                    let mut sum = 0.0;
+                    for a in 0..na {
+                        self.sum_strat[i][c * na + a] += r * self.cur[i][c * na + a];
+                        sum += self.sum_strat[i][c * na + a];
+                    }
+                    if sum > 0.0 {
+                        for a in 0..na {
+                            self.avg[i][c * na + a] = self.sum_strat[i][c * na + a] / sum;
+                        }
+                    } else {
+                        let k = (0..na).filter(|&a| n.legal[c * na + a]).count() as f32;
+                        for a in 0..na {
+                            self.avg[i][c * na + a] = if n.legal[c * na + a] { 1.0 / k } else { 0.0 };
+                        }
                     }
                 }
             }
@@ -749,7 +927,9 @@ impl<'a> Solver<'a> {
     }
 
     /// The CFR average strategy: the approximate equilibrium of the subgame.
+    /// Only available when the solver was configured to maintain it.
     pub fn average_strategy(&self, node: usize, c: usize) -> &[f32] {
+        debug_assert!(self.cfg.average, "solver was built without the average strategy");
         let na = self.nodes[node].na();
         &self.avg[node][c * na..(c + 1) * na]
     }

@@ -8,7 +8,7 @@ use warchest::search::Cfg;
 use warchest::selfplay::{play_game, Agent, Collect, Data, GameCfg};
 
 fn cfg() -> Cfg {
-    Cfg { depth: 2, iters: 8 }
+    Cfg { depth: 2, iters: 8, average: true }
 }
 
 /// Self-play with empty nets: the walk mechanics (build, act on the sampled

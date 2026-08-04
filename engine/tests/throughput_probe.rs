@@ -10,7 +10,7 @@ use warchest::selfplay::{play_game, Agent, Collect, Data, GameCfg};
 fn throughput_probe() {
     for iters in [16usize, 8] {
         let nets = [Nets::default()];
-        let cfg = Cfg { depth: 2, iters };
+        let cfg = Cfg { depth: 2, iters, average: true };
         let n = 8;
         let t0 = Instant::now();
         let mut games = 0u64;
@@ -46,7 +46,7 @@ fn throughput_probe() {
     // Eval mode (avg strategy, no targets):
     {
         let nets = [Nets::default()];
-        let cfg = Cfg { depth: 2, iters: 16 };
+        let cfg = Cfg { depth: 2, iters: 16, average: true };
         let t0 = Instant::now();
         let mut games = 0u64;
         for seed in 0..16u64 {

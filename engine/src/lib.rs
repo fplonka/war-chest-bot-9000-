@@ -9,6 +9,7 @@
 pub mod actions;
 pub mod board;
 pub mod net;
+pub mod prof;
 pub mod rebel;
 pub mod rng;
 pub mod rules;

@@ -413,19 +413,43 @@ pub fn belief_after_draw(b: &Belief, reserve: &[u8; NSLOT], faceup: &[u8; NSLOT]
     Belief::from_pairs(pairs)
 }
 
-/// The chance transition of a draw, as a matrix: for each config in `b`, which
-/// configs it can become (one per drawable coin type, reshuffling first if its
-/// bag is empty) and with what probability. Returns the sorted-deduped child
-/// support and a `[parent][child]` probability matrix — the per-config chance
-/// factor the subgame tree's reach accounting needs, kept separate from both
-/// players' strategies.
+/// A draw's chance transition, CSR by parent config: parent `ci` becomes child
+/// `to[k]` with probability `p[k]` for `k` in `start[ci]..start[ci + 1]`.
+///
+/// Sparse because a config can draw at most `NSLOT` distinct coin types while
+/// the child support is the union over the whole belief — the dense matrix this
+/// replaces was ~30x30 with at most 5 non-zeros per row, and the subgame walks
+/// it twice per CFR iteration.
+#[derive(Clone, Debug, Default)]
+pub struct DrawMap {
+    pub start: Vec<u32>,
+    pub to: Vec<u32>,
+    pub p: Vec<f32>,
+}
+
+impl DrawMap {
+    #[inline]
+    pub fn row(&self, ci: usize) -> (&[u32], &[f32]) {
+        let (a, b) = (self.start[ci] as usize, self.start[ci + 1] as usize);
+        (&self.to[a..b], &self.p[a..b])
+    }
+    pub fn rows(&self) -> usize {
+        self.start.len().saturating_sub(1)
+    }
+}
+
+/// The chance transition of a draw: for each config in `cfg`, which configs it
+/// can become (one per drawable coin type, reshuffling first if its bag is
+/// empty) and with what probability. Returns the sorted-deduped child support
+/// and the transition — the per-config chance factor the subgame tree's reach
+/// accounting needs, kept separate from both players' strategies.
 pub fn draw_transition(
-    b: &Belief,
+    cfg: &[Config],
     reserve: &[u8; NSLOT],
     faceup: &[u8; NSLOT],
-) -> (Vec<Config>, Vec<Vec<f32>>) {
-    let mut rows: Vec<(usize, Config, f32)> = Vec::new();
-    for (ci, c) in b.cfg.iter().enumerate() {
+) -> (Vec<Config>, DrawMap) {
+    let mut rows: Vec<(usize, Config, f32)> = Vec::with_capacity(cfg.len() * NSLOT);
+    for (ci, c) in cfg.iter().enumerate() {
         let (src, base) = draw_source(c, reserve, faceup);
         let total: u32 = src.iter().map(|&x| x as u32).sum();
         if total == 0 {
@@ -446,12 +470,27 @@ pub fn draw_transition(
     let mut support: Vec<Config> = rows.iter().map(|r| r.1).collect();
     support.sort_unstable();
     support.dedup();
-    let mut mat = vec![vec![0.0f32; support.len()]; b.len()];
+    // `rows` is already grouped by parent, so counting gives the CSR offsets.
+    let mut map = DrawMap {
+        start: vec![0u32; cfg.len() + 1],
+        to: vec![0u32; rows.len()],
+        p: vec![0.0f32; rows.len()],
+    };
+    for (ci, _, _) in &rows {
+        map.start[ci + 1] += 1;
+    }
+    for ci in 0..cfg.len() {
+        map.start[ci + 1] += map.start[ci];
+    }
+    let mut fill = map.start.clone();
     for (ci, c, p) in rows {
         let t = support.binary_search(&c).expect("child config in support");
-        mat[ci][t] += p;
+        let at = fill[ci] as usize;
+        map.to[at] = t as u32;
+        map.p[at] = p;
+        fill[ci] += 1;
     }
-    (support, mat)
+    (support, map)
 }
 
 /// What a config draws from, and what it looks like after any reshuffle:
@@ -546,6 +585,66 @@ fn pending_kind(s: &State) -> usize {
 /// block, which is what makes the encoding leak-free.
 pub fn write_features(s: &State, ctx: &Ctx, b: &[Belief; 2], out: &mut [f32]) {
     debug_assert_eq!(out.len(), FEAT);
+    write_public_features(s, ctx, &mut out[..OFF_BELIEF]);
+    for p in 0..2usize {
+        let res = reserve(s, p as u8, ctx);
+        let at = OFF_BELIEF + p * BELIEF_DIM;
+        write_belief_block(&b[p].cfg, None, &b[p].p, &res, &mut out[at..at + BELIEF_DIM]);
+    }
+}
+
+/// One player's belief block: the hand-key marginal plus the bag and face-down
+/// composition marginals, from an **unnormalised** weight vector (the caller's
+/// reach). Normalisation matches `Belief::normalize`, including its fallback to
+/// uniform when the weights have underflowed.
+///
+/// Split out of `write_features` because inside a solve this is the only part
+/// of the encoding that moves between CFR iterations.
+/// `hidx`, when given, is the precomputed hand key of every config — inside a
+/// solve those are fixed for the whole subgame while this runs once per leaf
+/// per iteration.
+pub fn write_belief_block(
+    cfg: &[Config],
+    hidx: Option<&[u16]>,
+    w: &[f32],
+    reserve: &[u8; NSLOT],
+    out: &mut [f32],
+) {
+    debug_assert_eq!(out.len(), BELIEF_DIM);
+    debug_assert_eq!(cfg.len(), w.len());
+    out.fill(0.0);
+    let tot: f32 = w.iter().sum();
+    let unif = 1.0 / w.len().max(1) as f32;
+    let (mut bag, mut fd) = ([0.0f32; NSLOT], [0.0f32; NSLOT]);
+    for (ci, c) in cfg.iter().enumerate() {
+        let p = if tot > SMOOTH { w[ci] / tot } else { unif };
+        out[match hidx {
+            Some(t) => t[ci] as usize,
+            None => c.hand_index(),
+        }] += p;
+        for k in 0..NSLOT {
+            bag[k] += p * reserve[k].saturating_sub(c.hand[k] + c.fd[k]) as f32;
+            fd[k] += p * c.fd[k] as f32;
+        }
+    }
+    let norm = |v: &mut [f32; NSLOT]| {
+        let s: f32 = v.iter().sum();
+        if s > 1e-9 {
+            for x in v.iter_mut() {
+                *x /= s;
+            }
+        }
+    };
+    norm(&mut bag);
+    norm(&mut fd);
+    out[NHAND..NHAND + NSLOT].copy_from_slice(&bag);
+    out[NHAND + NSLOT..BELIEF_DIM].copy_from_slice(&fd);
+}
+
+/// The public half of the encoding: everything before the belief blocks. Fixed
+/// for a given state, so a solve computes it once per leaf.
+pub fn write_public_features(s: &State, ctx: &Ctx, out: &mut [f32]) {
+    debug_assert_eq!(out.len(), OFF_BELIEF);
     out.fill(0.0);
     let bd = board();
     let mut i = 0;
@@ -614,15 +713,5 @@ pub fn write_features(s: &State, ctx: &Ctx, b: &[Belief; 2], out: &mut [f32]) {
     i += 5;
     out[i + pending_kind(s)] = 1.0;
     i += PEND_KINDS;
-
-    for p in 0..2usize {
-        let res = reserve(s, p as u8, ctx);
-        let hm = b[p].hand_marginal();
-        let (bag, fd) = b[p].composition(&res);
-        out[i..i + NHAND].copy_from_slice(&hm);
-        out[i + NHAND..i + NHAND + NSLOT].copy_from_slice(&bag);
-        out[i + NHAND + NSLOT..i + BELIEF_DIM].copy_from_slice(&fd);
-        i += BELIEF_DIM;
-    }
-    debug_assert_eq!(i, FEAT);
+    debug_assert_eq!(i, OFF_BELIEF);
 }

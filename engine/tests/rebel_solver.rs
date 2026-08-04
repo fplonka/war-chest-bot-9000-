@@ -176,6 +176,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
         let cfg = Cfg {
             depth: 8,
             iters: 2000,
+            average: true,
         };
         let mut sv = Solver::new(&s, &ctx, &nets, cfg, bel.clone());
         // If any leaf were non-terminal the (empty) network would silently
@@ -268,7 +269,7 @@ fn cfr_iteration_count_bias() {
         if bel[0].len() * bel[1].len() > 150 {
             continue;
         }
-        let probe = Solver::new(&s, &ctx, &nets, Cfg { depth: 8, iters: 1 }, bel.clone());
+        let probe = Solver::new(&s, &ctx, &nets, Cfg { depth: 8, iters: 1, average: true }, bel.clone());
         if !probe.nodes.iter().all(|n| !n.leaf || n.s.is_terminal()) || probe.nodes.len() > 8_000 {
             continue;
         }
@@ -286,7 +287,7 @@ fn cfr_iteration_count_bias() {
         let exact = oracle_value(&s, &ctx, &bel, 400);
         let mut line = format!("  {:+.4}   ", exact);
         for (bi, &t) in budgets.iter().enumerate() {
-            let mut sv = Solver::new(&s, &ctx, &nets, Cfg { depth: 8, iters: t }, bel.clone());
+            let mut sv = Solver::new(&s, &ctx, &nets, Cfg { depth: 8, iters: t, average: true }, bel.clone());
             sv.multistep(t);
             let v0: f64 = (0..bel[0].len())
                 .map(|c| bel[0].p[c] as f64 * sv.root_values(0)[c] as f64)
@@ -396,6 +397,7 @@ fn draw_pass_through_consistency() {
             Cfg {
                 depth: 5,
                 iters: 80,
+                average: true,
             },
             bel.clone(),
         );
@@ -433,8 +435,8 @@ fn draw_pass_through_consistency() {
                 after.cfg,
                 "post-draw support must equal belief_after_draw's, in order"
             );
-            for (ci, row) in n.draw_p.iter().enumerate() {
-                let sum: f32 = row.iter().sum();
+            for ci in 0..n.draw.rows() {
+                let sum: f32 = n.draw.row(ci).1.iter().sum();
                 assert!(
                     (sum - 1.0).abs() < 1e-5,
                     "draw row {} sums to {}",

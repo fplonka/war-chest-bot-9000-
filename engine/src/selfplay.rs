@@ -440,7 +440,13 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
                     // Acting on a random iterate keeps the targets unbiased
                     // (Theorem 3); in eval mode the full solve runs up front
                     // and the walk acts on the average strategy instead.
-                    let mut sv = Solver::new(&s, &ctx, &nets[slot], cfg, bel.clone());
+                    // The average strategy is only read in evaluation mode;
+                    // maintaining it during generation is pure overhead.
+                    let scfg = Cfg {
+                        average: gc.eval,
+                        ..cfg
+                    };
+                    let mut sv = Solver::new(&s, &ctx, &nets[slot], scfg, bel.clone());
                     let stop = if gc.eval {
                         cfg.iters
                     } else {
