@@ -117,6 +117,137 @@ fn gemm(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
 /// Must match `torch.nn.LayerNorm`'s default.
 const LN_EPS: f32 = 1e-5;
 
+// ------------------------------------------------- LayerNorm kernels
+//
+// The three passes a LayerNorm needs, hand-vectorised. Written out with
+// intrinsics because LLVM would not vectorise the portable version: it unrolled
+// the accumulator array into eight *scalar* `fadd`s and left the NEON registers
+// idle, which put this pass at five times the cost of the matmuls it wraps.
+// Two accumulators per pass keep the 3-cycle FP add latency covered.
+
+/// `row += bias (+ add)`, returning the sum of the result.
+#[inline]
+fn add_bias_sum(row: &mut [f32], bias: &[f32], add: Option<&[f32]>) -> f32 {
+    let n = row.len();
+    assert!(bias.len() >= n);
+    if let Some(a) = add {
+        assert!(a.len() >= n);
+    }
+    let mut i = 0usize;
+    let mut s = 0.0f32;
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let (mut s0, mut s1) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+        let (p, b) = (row.as_mut_ptr(), bias.as_ptr());
+        let a = add.map_or(std::ptr::null(), |a| a.as_ptr());
+        while i + 8 <= n {
+            let mut x0 = vaddq_f32(vld1q_f32(p.add(i)), vld1q_f32(b.add(i)));
+            let mut x1 = vaddq_f32(vld1q_f32(p.add(i + 4)), vld1q_f32(b.add(i + 4)));
+            if !a.is_null() {
+                x0 = vaddq_f32(x0, vld1q_f32(a.add(i)));
+                x1 = vaddq_f32(x1, vld1q_f32(a.add(i + 4)));
+            }
+            vst1q_f32(p.add(i), x0);
+            vst1q_f32(p.add(i + 4), x1);
+            s0 = vaddq_f32(s0, x0);
+            s1 = vaddq_f32(s1, x1);
+            i += 8;
+        }
+        s = vaddvq_f32(vaddq_f32(s0, s1));
+    }
+    while i < n {
+        row[i] += bias[i] + add.map_or(0.0, |a| a[i]);
+        s += row[i];
+        i += 1;
+    }
+    s
+}
+
+/// Sum of squared deviations from `mean`.
+#[inline]
+fn sq_dev(row: &[f32], mean: f32) -> f32 {
+    let n = row.len();
+    let mut i = 0usize;
+    let mut v = 0.0f32;
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let (mut v0, mut v1) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+        let m = vdupq_n_f32(mean);
+        let p = row.as_ptr();
+        while i + 8 <= n {
+            let d0 = vsubq_f32(vld1q_f32(p.add(i)), m);
+            let d1 = vsubq_f32(vld1q_f32(p.add(i + 4)), m);
+            v0 = vfmaq_f32(v0, d0, d0);
+            v1 = vfmaq_f32(v1, d1, d1);
+            i += 8;
+        }
+        v = vaddvq_f32(vaddq_f32(v0, v1));
+    }
+    while i < n {
+        let d = row[i] - mean;
+        v += d * d;
+        i += 1;
+    }
+    v
+}
+
+/// `row = max(((row - mean) * inv) * g + bt, floor)`.
+#[inline]
+fn scale_shift(row: &mut [f32], mean: f32, inv: f32, g: &[f32], bt: &[f32], floor: f32) {
+    let n = row.len();
+    assert!(g.len() >= n && bt.len() >= n);
+    let mut i = 0usize;
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let (m, sc, lo) = (vdupq_n_f32(mean), vdupq_n_f32(inv), vdupq_n_f32(floor));
+        let (p, gp, bp) = (row.as_mut_ptr(), g.as_ptr(), bt.as_ptr());
+        while i + 8 <= n {
+            let d0 = vmulq_f32(vsubq_f32(vld1q_f32(p.add(i)), m), sc);
+            let d1 = vmulq_f32(vsubq_f32(vld1q_f32(p.add(i + 4)), m), sc);
+            let y0 = vmaxq_f32(vfmaq_f32(vld1q_f32(bp.add(i)), d0, vld1q_f32(gp.add(i))), lo);
+            let y1 = vmaxq_f32(
+                vfmaq_f32(vld1q_f32(bp.add(i + 4)), d1, vld1q_f32(gp.add(i + 4))),
+                lo,
+            );
+            vst1q_f32(p.add(i), y0);
+            vst1q_f32(p.add(i + 4), y1);
+            i += 8;
+        }
+    }
+    while i < n {
+        let x = (row[i] - mean) * inv * g[i] + bt[i];
+        row[i] = if x > floor { x } else { floor };
+        i += 1;
+    }
+}
+
+/// `row = max(row, 0)`.
+#[inline]
+fn relu(row: &mut [f32]) {
+    let n = row.len();
+    let mut i = 0usize;
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let z = vdupq_n_f32(0.0);
+        let p = row.as_mut_ptr();
+        while i + 8 <= n {
+            vst1q_f32(p.add(i), vmaxq_f32(vld1q_f32(p.add(i)), z));
+            vst1q_f32(p.add(i + 4), vmaxq_f32(vld1q_f32(p.add(i + 4)), z));
+            i += 8;
+        }
+    }
+    while i < n {
+        if row[i] < 0.0 {
+            row[i] = 0.0;
+        }
+        i += 1;
+    }
+}
+
 /// Grow `v` to at least `n` without ever re-zeroing what is already there.
 /// Every buffer here is fully overwritten by the matmul that follows, so the
 /// `clear() + resize()` this replaces was a megabyte-scale memset per call.
@@ -190,7 +321,6 @@ impl Mlp {
     /// re-association changes the last bits of the LayerNorm statistics;
     /// `train/test_parity.py` bounds the result against torch.
     fn activate(&self, l: usize, rows: usize, add: Option<&[f32]>, out: &mut [f32]) {
-        const LANES: usize = 8;
         let n = self.dims[l + 1];
         let last = l + 1 == self.w.len();
         let bias = &self.b[l];
@@ -200,91 +330,20 @@ impl Mlp {
             Some((&self.ln_w[l], &self.ln_b[l]))
         };
         let inv_n = 1.0 / n as f32;
-        let tail = n - n % LANES;
         for r in 0..rows {
             let row = &mut out[r * n..r * n + n];
-
-            // Pass 1: fold in the bias and the cached public half, and take the
-            // sum on the way past.
-            let mut acc = [0.0f32; LANES];
-            match add {
-                Some(a) => {
-                    let a = &a[r * n..r * n + n];
-                    for ((rc, bc), ac) in row
-                        .chunks_exact_mut(LANES)
-                        .zip(bias.chunks_exact(LANES))
-                        .zip(a.chunks_exact(LANES))
-                    {
-                        for t in 0..LANES {
-                            rc[t] += bc[t] + ac[t];
-                            acc[t] += rc[t];
-                        }
-                    }
-                    for j in tail..n {
-                        row[j] += bias[j] + a[j];
-                        acc[0] += row[j];
-                    }
-                }
-                None => {
-                    for (rc, bc) in row.chunks_exact_mut(LANES).zip(bias.chunks_exact(LANES)) {
-                        for t in 0..LANES {
-                            rc[t] += bc[t];
-                            acc[t] += rc[t];
-                        }
-                    }
-                    for j in tail..n {
-                        row[j] += bias[j];
-                        acc[0] += row[j];
-                    }
-                }
-            }
-
+            let sum = add_bias_sum(row, bias, add.map(|a| &a[r * n..r * n + n]));
             // LayerNorm over the feature dimension, then the activation.
             // Biased variance (divide by n, not n-1) to match torch.
             if let Some((g, bt)) = norm {
-                let mean = acc.iter().sum::<f32>() * inv_n;
-                let mut v = [0.0f32; LANES];
-                for rc in row.chunks_exact(LANES) {
-                    for t in 0..LANES {
-                        let d = rc[t] - mean;
-                        v[t] += d * d;
-                    }
-                }
-                for j in tail..n {
-                    let d = row[j] - mean;
-                    v[0] += d * d;
-                }
-                let var = v.iter().sum::<f32>() * inv_n;
+                let mean = sum * inv_n;
+                let var = sq_dev(row, mean) * inv_n;
                 let inv = 1.0 / (var + LN_EPS).sqrt();
                 // Scale, shift and (for a hidden layer) rectify in one pass.
                 let floor = if last { f32::NEG_INFINITY } else { 0.0 };
-                for ((rc, gc), bc) in row
-                    .chunks_exact_mut(LANES)
-                    .zip(g.chunks_exact(LANES))
-                    .zip(bt.chunks_exact(LANES))
-                {
-                    for t in 0..LANES {
-                        let x = (rc[t] - mean) * inv * gc[t] + bc[t];
-                        rc[t] = if x > floor { x } else { floor };
-                    }
-                }
-                for j in tail..n {
-                    let x = (row[j] - mean) * inv * g[j] + bt[j];
-                    row[j] = if x > floor { x } else { floor };
-                }
+                scale_shift(row, mean, inv, g, bt, floor);
             } else if !last {
-                for rc in row.chunks_exact_mut(LANES) {
-                    for t in 0..LANES {
-                        if rc[t] < 0.0 {
-                            rc[t] = 0.0;
-                        }
-                    }
-                }
-                for j in tail..n {
-                    if row[j] < 0.0 {
-                        row[j] = 0.0;
-                    }
-                }
+                relu(row);
             }
         }
     }

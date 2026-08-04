@@ -363,6 +363,7 @@ impl<'a> Solver<'a> {
         let draw_pass = matches!(s.pending(), Cont::Draw { .. });
         let leaf = s.is_terminal() || (!draw_pass && (depth == 0 || s.is_chance()));
         let id = self.nodes.len();
+        let _tp = timed!(BPUSH);
         self.nodes.push(TNode {
             s: s.clone(),
             player,
@@ -380,6 +381,7 @@ impl<'a> Solver<'a> {
             legal: Vec::new(),
             trans: Vec::new(),
         });
+        drop(_tp);
         if leaf {
             return id;
         }
@@ -402,7 +404,9 @@ impl<'a> Solver<'a> {
             let me = player as usize;
             let res = reserve(&s, player, self.ctx);
             let fu = faceup_counts(&s, player, self.ctx);
+            let td = timed!(BDRAW);
             let (child_cfgs, draw) = draw_transition(&cfgs[me], &res, &fu);
+            drop(td);
             let mut cc = cfgs;
             cc[me] = child_cfgs;
             let ch = self.build(cs, depth, cc);
@@ -416,7 +420,9 @@ impl<'a> Solver<'a> {
         let me = player as usize;
         let mine = cfgs[me].clone();
         let nc = mine.len();
+        let ta = timed!(BACTS);
         let (acts, aslot, fdown) = node_actions(&s, player, self.ctx, &mine);
+        drop(ta);
         let na = acts.len();
         debug_assert!(na > 0, "a decision node must offer a reachable action");
 
@@ -500,9 +506,11 @@ impl<'a> Solver<'a> {
                 .iter()
                 .find(|c| aslot[a] < 0 || c.hand[aslot[a] as usize] > 0)
                 .expect("a kept action is playable by some config in the support");
+            let tb = timed!(BAPPLY);
             let mut cs = s.clone();
             set_config(&mut cs, player, self.ctx, &rep);
             cs.apply_inplace(acts[a]);
+            drop(tb);
             let mut cc = cfgs.clone();
             cc[me] = std::mem::take(&mut child_cfgs[ch]);
             child.push(self.build(cs, depth - 1, cc));

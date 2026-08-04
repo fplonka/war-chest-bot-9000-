@@ -988,7 +988,7 @@ fn footman_tactic_covers_both_versions_in_any_order() {
     match s2.pending() {
         Cont::FootmanManeuver { hexes } => {
             assert_eq!(
-                hexes.as_slice(),
+                hexes.to_vec().as_slice(),
                 &[W1 as u8, CENTER as u8],
                 "both footman versions owe a maneuver"
             );
@@ -1017,7 +1017,7 @@ fn footman_tactic_covers_both_versions_in_any_order() {
         to: 16,
     });
     match s3.pending() {
-        Cont::FootmanManeuver { hexes } => assert_eq!(hexes.as_slice(), &[CENTER as u8]),
+        Cont::FootmanManeuver { hexes } => assert_eq!(hexes.to_vec().as_slice(), &[CENTER as u8]),
         other => panic!(
             "expected FootmanManeuver for the remaining footman, got {:?}",
             other

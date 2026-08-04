@@ -244,14 +244,14 @@ impl State {
                         Cont::FootmanManeuver { .. } => {
                             // Mandatory-if-able: if no remaining footman has a
                             // legal maneuver, the node is skipped entirely.
-                            self.pending = c.clone();
+                            self.pending = c;
                             if self.legal_actions().is_empty() {
                                 continue;
                             }
                             return;
                         }
                         Cont::CavalryAttack { .. } => {
-                            self.pending = c.clone();
+                            self.pending = c;
                             if self.legal_actions().is_empty() {
                                 continue;
                             }
@@ -377,7 +377,7 @@ impl State {
             // play still comes after it: swap the WP draw in as the pending
             // node; its apply re-installs the RoyalGuardChoice.
             if self.wp_trigger_ready(from) {
-                if let Cont::RoyalGuardChoice { rg_hex, .. } = self.pending.clone() {
+                if let Cont::RoyalGuardChoice { rg_hex, .. } = self.pending {
                     self.wp_triggers_this_play += 1;
                     let p = self.hex_owner[from];
                     self.set_pending(Cont::WarriorPriestDraw { player: p, rg_hex });
@@ -986,7 +986,7 @@ impl State {
         if self.winner != NONE {
             return out;
         }
-        match self.pending.clone() {
+        match self.pending {
             Cont::Draw { player } => {
                 for (u, mult) in self.drawable(player) {
                     // Multiplicity: emit once per distinct type; the count is the
@@ -1043,7 +1043,7 @@ impl State {
             Cont::FootmanManeuver { hexes } => {
                 // The player chooses which remaining footman maneuvers next
                 // (order is free; verified against replays).
-                for h in hexes {
+                for h in hexes.iter() {
                     self.list_basic_maneuvers(h as usize, ManVariant::Footman, &mut out);
                 }
                 // Mandatory if any option exists; advance() skips it otherwise.
@@ -1166,7 +1166,7 @@ impl State {
     /// In-place apply. Assumes `action` is legal for the current pending node.
     pub fn apply_inplace(&mut self, action: Action) {
         use Action::*;
-        match self.pending.clone() {
+        match self.pending {
             // -------- chance: round-start draw --------
             Cont::Draw { player } => {
                 if let DrawCoin { unit } = action {
@@ -1216,7 +1216,7 @@ impl State {
 
         // For the remaining pending kinds, dispatch on the action itself.
         let actor = self.to_act();
-        match self.pending.clone() {
+        match self.pending {
             Cont::MainPlay => {
                 self.main_plays += 1;
                 self.apply_main(self.active, action);
@@ -1434,11 +1434,12 @@ impl State {
                 // BOTH versions count: a Footman coin maneuvers Footman V2
                 // units and vice versa (verified from server replays).
                 self.zmove(p, Z_HAND, Z_FACEUP, coin);
-                let mut hexes: Vec<u8> = Vec::new();
+                let mut hexes = crate::state::HexSet::default();
                 for u in [FOOTMAN, FOOTMAN_V2] {
-                    hexes.extend(self.hexes_of(p, u).iter().map(|&h| h as u8));
+                    for &h in self.hexes_of(p, u).iter() {
+                        hexes.insert(h as u8);
+                    }
                 }
-                hexes.sort_unstable();
                 if !hexes.is_empty() {
                     self.push_cont(Cont::FootmanManeuver { hexes });
                 }
@@ -1504,7 +1505,7 @@ impl State {
 
     /// Resolve one Footman-tactic maneuver (the acting footman is the action's
     /// `from` hex); the other remaining footmen stay owed a maneuver.
-    fn apply_footman(&mut self, hexes: Vec<u8>, action: Action) {
+    fn apply_footman(&mut self, hexes: crate::state::HexSet, action: Action) {
         use Action::*;
         let from = match action {
             FootMove { from, .. } | FootControl { from } | FootAttack { from, .. } => from,
@@ -1518,7 +1519,8 @@ impl State {
         }
         // Queue the remaining footmen as a fresh decision node (re-checked for
         // legality by advance()); post-triggers from this maneuver resolve first.
-        let rest: Vec<u8> = hexes.into_iter().filter(|&h| h != from).collect();
+        let mut rest = hexes;
+        rest.remove(from);
         if !rest.is_empty() {
             self.push_cont(Cont::FootmanManeuver { hexes: rest });
         }

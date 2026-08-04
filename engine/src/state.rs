@@ -58,7 +58,63 @@ pub const BLACK: u8 = 1;
 /// (below) is the item currently being decided; `conts` holds items to resolve
 /// after it. Every variant that requires a player choice becomes a decision
 /// node; forced steps are executed inline by `apply` without a node.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A set of board hexes as a bitmask (`N_HEXES <= 64`), iterating in ascending
+/// hex order.
+///
+/// The point is that it is inline: it is what makes `Cont`, and therefore
+/// `State`, `Copy`. Cloning a state used to allocate — twice, for the `conts`
+/// vector and for this list — and a depth-2 subgame clones one per node, per
+/// child probe, and per greedy rollout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
+pub struct HexSet(pub u64);
+
+impl HexSet {
+    #[inline]
+    pub fn insert(&mut self, h: u8) {
+        debug_assert!((h as usize) < 64);
+        self.0 |= 1u64 << h;
+    }
+    /// Removing a non-hex (`NONE`) is a no-op, which is what the Footman
+    /// tactic's "drop whoever just acted" wants when nobody did.
+    #[inline]
+    pub fn remove(&mut self, h: u8) {
+        if h < 64 {
+            self.0 &= !(1u64 << h);
+        }
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.count_ones() as usize
+    }
+    #[inline]
+    pub fn iter(self) -> HexSetIter {
+        HexSetIter(self.0)
+    }
+    pub fn to_vec(self) -> Vec<u8> {
+        self.iter().collect()
+    }
+}
+
+pub struct HexSetIter(u64);
+
+impl Iterator for HexSetIter {
+    type Item = u8;
+    #[inline]
+    fn next(&mut self) -> Option<u8> {
+        if self.0 == 0 {
+            return None;
+        }
+        let h = self.0.trailing_zeros() as u8;
+        self.0 &= self.0 - 1;
+        Some(h)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cont {
     /// A chance node: `player` draws one coin from their bag (refill applies).
     /// Each round-start draw is one such node; a "draw to 3" is a run of them.
@@ -77,7 +133,7 @@ pub enum Cont {
     /// Footman tactic: `hexes` are the Footman units still owed a maneuver.
     /// The player picks which of them maneuvers next (order is a free choice,
     /// verified against server replays); each acts at most once.
-    FootmanManeuver { hexes: Vec<u8> },
+    FootmanManeuver { hexes: HexSet },
     /// Cavalry tactic second step: the unit at `hex` must attack if able (the
     /// "move, then attack" of the Cavalry card). Skipped if no target.
     CavalryAttack { hex: u8 },
@@ -102,7 +158,68 @@ pub enum Cont {
     _AttackPost { atk_hex: u8 },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The LIFO continuation stack, inline.
+///
+/// A round start queues at most six draws plus the main play, and a coin play's
+/// follow-ups never went deeper than that over millions of random playouts —
+/// but the cap is asserted rather than assumed, and `tests/invariants.rs`
+/// exercises it.
+pub const CONT_CAP: usize = 16;
+
+#[derive(Clone, Copy, Debug, Eq)]
+pub struct ContStack {
+    n: u8,
+    v: [Cont; CONT_CAP],
+}
+
+impl Default for ContStack {
+    fn default() -> ContStack {
+        ContStack {
+            n: 0,
+            v: [Cont::MainPlay; CONT_CAP],
+        }
+    }
+}
+
+impl PartialEq for ContStack {
+    fn eq(&self, o: &ContStack) -> bool {
+        self.n == o.n && self.v[..self.n as usize] == o.v[..o.n as usize]
+    }
+}
+
+impl ContStack {
+    #[inline]
+    pub fn push(&mut self, c: Cont) {
+        assert!(
+            (self.n as usize) < CONT_CAP,
+            "continuation stack overflow: raise CONT_CAP"
+        );
+        self.v[self.n as usize] = c;
+        self.n += 1;
+    }
+    #[inline]
+    pub fn pop(&mut self) -> Option<Cont> {
+        if self.n == 0 {
+            return None;
+        }
+        self.n -= 1;
+        Some(self.v[self.n as usize])
+    }
+    #[inline]
+    pub fn clear(&mut self) {
+        self.n = 0;
+    }
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.n as usize
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct State {
     // ---- board occupancy (flat, indexed by hex) ----
     pub hex_type: [u8; N_HEXES],  // unit index or NONE
@@ -131,7 +248,7 @@ pub struct State {
 
     // ---- decision context ----
     pub pending: Cont,
-    pub conts: Vec<Cont>,
+    pub conts: ContStack,
     /// Warrior Priest V2: number of WP-draw triggers already spent this coin
     /// play (reset each MainPlay). Enforces the once-per-turn cap.
     pub wp_triggers_this_play: u8,
@@ -163,7 +280,7 @@ impl State {
             winner: NONE,
             adjudicated_draw: false,
             pending: Cont::MainPlay, // replaced below
-            conts: Vec::new(),
+            conts: ContStack::default(),
             wp_triggers_this_play: 0,
             interrupt: false,
         };
@@ -232,21 +349,28 @@ impl State {
             return;
         }
 
-        let mut seq: Vec<Cont> = Vec::new();
-        for _ in 0..need_first {
-            seq.push(Cont::Draw { player: first });
-        }
-        for _ in 0..need_other {
-            seq.push(Cont::Draw { player: other });
-        }
-        seq.push(Cont::MainPlay);
-
-        // seq is in forward order; pending = seq[0], conts = rest reversed (LIFO).
+        // Forward order is `need_first` draws, then `need_other`, then the main
+        // play; the stack is LIFO, so push in reverse and take the first item
+        // as pending.
         self.conts.clear();
-        self.pending = seq.remove(0);
-        for c in seq.into_iter().rev() {
-            self.conts.push(c);
+        self.conts.push(Cont::MainPlay);
+        for _ in 0..need_other {
+            self.conts.push(Cont::Draw { player: other });
         }
+        for _ in 1..need_first {
+            self.conts.push(Cont::Draw { player: first });
+        }
+        self.pending = if need_first > 0 {
+            Cont::Draw { player: first }
+        } else if need_other > 0 {
+            // No draws for the first player: the other's first draw leads, and
+            // the stack must not keep a copy of it.
+            self.conts.pop();
+            Cont::Draw { player: other }
+        } else {
+            self.conts.pop();
+            Cont::MainPlay
+        };
     }
 
     /// Push a follow-up onto the LIFO continuation stack (resolved after the
@@ -382,7 +506,7 @@ impl State {
             winner: NONE,
             adjudicated_draw: false,
             pending: Cont::MainPlay,
-            conts: Vec::new(),
+            conts: ContStack::default(),
             wp_triggers_this_play: 0,
             interrupt: false,
         }
