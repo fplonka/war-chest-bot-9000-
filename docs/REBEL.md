@@ -2,7 +2,10 @@
 
 An implementation of ReBeL — *Combining Deep Reinforcement Learning and Search
 for Imperfect-Information Games*, Brown, Bakhtin, Lerer & Gong (NeurIPS 2020),
-`papers/ReBeL_2007.13544v2.pdf` — on the War Chest engine in this repo.
+[arXiv:2007.13544](https://arxiv.org/abs/2007.13544) — on the War Chest engine
+in this repo. The reference implementation it follows is
+[facebookresearch/rebel](https://github.com/facebookresearch/rebel), whose
+`csrc/liars_dice` is cited throughout.
 
 Everything except the gradient step runs in Rust: the game, the belief filter,
 the CFR subgame solves and the network forward passes. PyTorch ships weights

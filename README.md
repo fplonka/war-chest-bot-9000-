@@ -24,8 +24,11 @@ docs/
   ENGINE_FIXES.md  rule corrections found by replaying 1,112 real games
   REBEL.md         the ReBeL agent: PBS design, CFR solver, deviations
   PERF.md          how the generation loop got ~10x faster, and what didn't work
-papers/          War Chest rulebook, ReBeL, TurboReBeL
 ```
+
+Not in the repo: `papers/` (gitignored) is where the AEG rulebook, the ReBeL
+paper (arXiv:2007.13544) and the TurboReBeL paper are kept locally. The rulebook
+is a commercial product, so it is not redistributed here.
 
 ## Training
 

@@ -6,3 +6,8 @@ __pycache__/
 
 # Replay-buffer dumps: ~1 GB each, and regenerable with `--dump-buffer`.
 *.npz
+
+# Reference PDFs: the AEG rulebook is a commercial product and the papers are
+# better fetched from their sources than redistributed here. See docs/REBEL.md
+# and engine/RULES.md for what they are and where to get them.
+papers/
