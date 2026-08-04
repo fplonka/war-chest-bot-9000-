@@ -36,6 +36,7 @@ fn load(path: &str) -> Mlp {
     let mut at = 0usize;
     let nd = read_u32(&raw, &mut at);
     let dims: Vec<usize> = (0..nd).map(|_| read_u32(&raw, &mut at)).collect();
+    let split = read_u32(&raw, &mut at);
     let (w, b, ln) = (
         read_f32s(&raw, &mut at),
         read_f32s(&raw, &mut at),
@@ -47,6 +48,8 @@ fn load(path: &str) -> Mlp {
         b: Vec::new(),
         ln_w: Vec::new(),
         ln_b: Vec::new(),
+        split,
+        wb: Vec::new(),
     };
     let (mut wi, mut bi) = (0usize, 0usize);
     for l in 0..dims.len() - 1 {
@@ -56,6 +59,7 @@ fn load(path: &str) -> Mlp {
         wi += i * o;
         bi += o;
     }
+    mlp.wb = w[wi..wi + split * dims[1]].to_vec();
     let mut li = 0usize;
     for l in 0..dims.len() - 2 {
         let o = dims[l + 1];

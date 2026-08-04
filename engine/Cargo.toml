@@ -36,7 +36,3 @@ codegen-units = 1
 [[bin]]
 name = "gemmbench"
 path = "src/bin/gemmbench.rs"
-
-[[bin]]
-name = "sz"
-path = "src/bin/sz.rs"

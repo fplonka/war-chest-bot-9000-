@@ -7,13 +7,15 @@
 use std::time::Instant;
 use warchest::net::{gemm_probe, Mlp};
 
-fn mk(dims: &[usize]) -> Mlp {
+fn mk(dims: &[usize], split: usize) -> Mlp {
     let mut m = Mlp {
         dims: dims.to_vec(),
         w: Vec::new(),
         b: Vec::new(),
         ln_w: Vec::new(),
         ln_b: Vec::new(),
+        split,
+        wb: (0..split * dims[1]).map(|i| (i % 13) as f32 * 1e-4).collect(),
     };
     let mut x = 12345u64;
     let mut rnd = || {
@@ -55,19 +57,19 @@ fn main() {
         .nth(1)
         .and_then(|x| x.parse().ok())
         .unwrap_or(384);
-    let m = mk(&[feat, h, h, 112]);
+    let m = mk(&[feat - split, h, h, 112], split);
     for &rows in &[368usize, 1472] {
         println!("rows = {}", rows);
         let xpub: Vec<f32> = (0..rows * (feat - split)).map(|i| (i % 7) as f32 * 0.1).collect();
         let xbel: Vec<f32> = (0..rows * split).map(|i| (i % 5) as f32 * 0.1).collect();
         let (mut sb, mut ob, mut h0) = (vec![0.0f32; rows * h], vec![0.0f32; rows * h], Vec::new());
-        m.prefix(&xpub, rows, feat - split, split, &mut h0);
+        m.trunk(&xpub, rows, feat - split, &mut sb, &mut h0);
         let mut a = vec![0.0f32; rows * h];
         let mut b = vec![0.0f32; rows * h];
         let reps = 400;
 
         bench("gemm belief k=132", (rows * split * h) as f64, reps, || {
-            gemm_probe(rows, h, split, &xbel, split, &m.w[0][(feat - split) * h..], h, &mut a, h);
+            gemm_probe(rows, h, split, &xbel, split, &m.wb, h, &mut a, h);
         });
         bench("gemm hidden k=h", (rows * h * h) as f64, reps, || {
             gemm_probe(rows, h, h, &a, h, &m.w[1], h, &mut b, h);
@@ -78,11 +80,11 @@ fn main() {
         bench("activate(LN+relu)", (rows * h * 6) as f64, reps, || {
             m.activate_probe(0, rows, Some(&h0), &mut a);
         });
-        bench("full split-forward", ((split * h + h * h + h * 56) * rows) as f64, reps, || {
-            m.forward_split(&xbel, rows, split, &h0, 0..56, &mut sb, &mut ob);
+        bench("full split-forward", ((split * h + h * 56) * rows) as f64, reps, || {
+            m.forward_split(&xbel, rows, &h0, 0..56, &mut sb, &mut ob);
         });
-        bench("prefix k=680", (rows * (feat - split) * h) as f64, 100, || {
-            m.prefix(&xpub, rows, feat - split, split, &mut h0);
+        bench("trunk (public tower)", (rows * ((feat - split) * h + h * h)) as f64, 100, || {
+            m.trunk(&xpub, rows, feat - split, &mut sb, &mut h0);
         });
     }
 }

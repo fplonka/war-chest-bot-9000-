@@ -97,7 +97,16 @@ fn enumerate(c: &mut [u8; NSLOT], slot: usize, left: u8, out: &mut Vec<[u8; NSLO
 /// Dense index of a hand multiset, for the value network's output head.
 #[inline]
 pub fn hand_index(hand: &[u8; NSLOT]) -> usize {
-    let k = hands().key[hand_key(hand)];
+    hand_index_in(hands(), hand)
+}
+
+/// The same, against a table the caller already has in hand. `hands()` goes
+/// through a `OnceLock` on every call, which is nothing on its own and adds up
+/// when a subgame indexes tens of thousands of configs while assembling its
+/// leaf batch.
+#[inline]
+pub fn hand_index_in(tab: &HandTab, hand: &[u8; NSLOT]) -> usize {
+    let k = tab.key[hand_key(hand)];
     debug_assert!(k >= 0, "hand over the size cap");
     k.max(0) as usize
 }

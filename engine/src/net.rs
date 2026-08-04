@@ -272,6 +272,12 @@ pub struct Mlp {
     /// keeps older checkpoints loading unchanged.
     pub ln_w: Vec<Vec<f32>>,
     pub ln_b: Vec<Vec<f32>>,
+    /// Width of the belief block, the tail of the PBS encoding. `dims[0]` is
+    /// the *public* width, so the whole query is `dims[0] + split` wide.
+    pub split: usize,
+    /// `[split * dims[1]]`: the belief block's connection into the second
+    /// hidden layer, row-major.
+    pub wb: Vec<f32>,
 }
 
 /// Test/benchmark hook for the raw matmul.
@@ -296,7 +302,12 @@ impl Mlp {
         self.activate(l, rows, add, out);
     }
 
+    /// Width of the whole query — public part plus belief block.
     pub fn in_dim(&self) -> usize {
+        self.dims[0] + self.split
+    }
+    /// Width of the public part alone.
+    pub fn pub_dim(&self) -> usize {
         self.dims[0]
     }
     pub fn out_dim(&self) -> usize {
@@ -348,104 +359,103 @@ impl Mlp {
         }
     }
 
-    /// Forward `rows` samples (`x` is `[rows * in_dim]` row-major) into `out`
-    /// (`[rows * out_dim]`). `scratch` is reused across calls to avoid allocs.
-    /// `out` may be left longer than `rows * out_dim`; only the prefix is
-    /// meaningful.
+    /// Forward `rows` samples (`x` is `[rows * in_dim]` row-major, public part
+    /// then belief block) into `out` (`[rows * out_dim]`). Used for the torch
+    /// parity check and by callers with no solve to amortise over; the solver
+    /// goes through `trunk` + `forward_split`.
     pub fn forward(&self, x: &[f32], rows: usize, scratch: &mut Vec<f32>, out: &mut Vec<f32>) {
-        debug_assert_eq!(x.len(), rows * self.in_dim());
-        let layers = self.w.len();
-        for l in 0..layers {
-            let (k, n) = (self.dims[l], self.dims[l + 1]);
-            let src: &[f32] = if l == 0 { x } else { scratch };
-            fit(out, rows * n);
-            gemm(rows, n, k, src, &self.w[l], &mut out[..rows * n]);
-            self.activate(l, rows, None, &mut out[..rows * n]);
-            if l + 1 != layers {
-                std::mem::swap(scratch, out);
-            }
+        let feat = self.in_dim();
+        debug_assert_eq!(x.len(), rows * feat);
+        let mut xbel = Vec::with_capacity(rows * self.split);
+        for r in 0..rows {
+            xbel.extend_from_slice(&x[r * feat + self.dims[0]..(r + 1) * feat]);
         }
+        let mut pre = Vec::new();
+        self.trunk(x, rows, feat, scratch, &mut pre);
+        self.forward_split(&xbel, rows, &pre, 0..self.out_dim(), scratch, out);
         out.truncate(rows * self.out_dim());
     }
 
-    /// The part of the first layer that depends only on the leading
-    /// `in_dim - split` inputs: `out[rows x hidden] = xpub · W[0][..pub]`.
-    /// `xpub` is row-major with row stride `stride`, so callers can hold the
-    /// public halves of many rows in one packed buffer.
-    pub fn prefix(&self, xpub: &[f32], rows: usize, stride: usize, split: usize, out: &mut Vec<f32>) {
-        let n = self.dims[1];
-        let k = self.dims[0] - split;
-        fit(out, rows * n);
-        gemm_ld(rows, n, k, xpub, stride, &self.w[0], n, 0.0, out, n);
+    /// The whole public tower: `relu(LN(xpub·W0 + b0))` pushed through `W1`,
+    /// leaving the second hidden layer's pre-activation minus its bias and
+    /// minus the belief block's contribution.
+    ///
+    /// This is the point of the architecture. A leaf's public encoding is fixed
+    /// for the whole solve while its beliefs move every CFR iteration, so
+    /// everything here is computed once per leaf per solve and only the belief
+    /// projection and the output head run per iteration.
+    pub fn trunk(
+        &self,
+        xpub: &[f32],
+        rows: usize,
+        stride: usize,
+        scratch: &mut Vec<f32>,
+        out: &mut Vec<f32>,
+    ) {
+        let (k, n) = (self.dims[0], self.dims[1]);
+        fit(scratch, rows * n);
+        gemm_ld(rows, n, k, xpub, stride, &self.w[0], n, 0.0, &mut scratch[..rows * n], n);
+        self.activate(0, rows, None, &mut scratch[..rows * n]);
+        let n2 = self.dims[2];
+        fit(out, rows * n2);
+        gemm_ld(rows, n2, n, scratch, n, &self.w[1], n2, 0.0, &mut out[..rows * n2], n2);
     }
 
-    /// Finish a forward pass whose public half is already in `prefix`
-    /// (`rows x hidden`, from `prefix`). `xbel` is `[rows * split]`. Only the
+    /// Finish a forward pass whose public tower is already in `pre`
+    /// (`rows x dims[2]`, from `trunk`). `xbel` is `[rows * split]`. Only the
     /// output columns in `head` are produced, since a CFR traversal reads one
     /// player's head at a time.
-    #[allow(clippy::too_many_arguments)]
     pub fn forward_split(
         &self,
         xbel: &[f32],
         rows: usize,
-        split: usize,
-        prefix: &[f32],
+        pre: &[f32],
         head: std::ops::Range<usize>,
         scratch: &mut Vec<f32>,
         out: &mut Vec<f32>,
     ) {
-        let layers = self.w.len();
-        let n1 = self.dims[1];
-        debug_assert!(prefix.len() >= rows * n1);
-        debug_assert_eq!(xbel.len(), rows * split);
+        let n2 = self.dims[2];
+        debug_assert!(pre.len() >= rows * n2);
+        debug_assert_eq!(xbel.len(), rows * self.split);
 
-        // Layer 0: the belief half, with the cached public half folded in
-        // during the bias pass rather than pre-copied into the buffer.
-        fit(out, rows * n1);
-        let woff = (self.dims[0] - split) * n1;
+        // Second hidden layer: the belief block's projection, with the cached
+        // tower folded in during the bias pass rather than pre-copied.
+        fit(scratch, rows * n2);
         gemm_ld(
             rows,
-            n1,
-            split,
+            n2,
+            self.split,
             xbel,
-            split,
-            &self.w[0][woff..],
-            n1,
+            self.split,
+            &self.wb,
+            n2,
             0.0,
-            &mut out[..rows * n1],
-            n1,
+            &mut scratch[..rows * n2],
+            n2,
         );
-        self.activate(0, rows, Some(prefix), &mut out[..rows * n1]);
+        self.activate(1, rows, Some(pre), &mut scratch[..rows * n2]);
 
-        for l in 1..layers {
-            let (k, n) = (self.dims[l], self.dims[l + 1]);
-            std::mem::swap(scratch, out);
-            let last = l + 1 == layers;
-            let (width, off) = if last { (head.len(), head.start) } else { (n, 0) };
-            fit(out, rows * width);
-            gemm_ld(
-                rows,
-                width,
-                k,
-                scratch,
-                k,
-                &self.w[l][off..],
-                n,
-                0.0,
-                &mut out[..rows * width],
-                width,
-            );
-            if last {
-                // A bias add over the selected head; no norm, no activation.
-                let bias = &self.b[l][off..off + width];
-                for r in 0..rows {
-                    let row = &mut out[r * width..r * width + width];
-                    for j in 0..width {
-                        row[j] += bias[j];
-                    }
-                }
-            } else {
-                self.activate(l, rows, None, &mut out[..rows * width]);
+        // Output head, restricted to the columns the caller asked for.
+        let n3 = self.dims[3];
+        let (width, off) = (head.len(), head.start);
+        fit(out, rows * width);
+        gemm_ld(
+            rows,
+            width,
+            n2,
+            scratch,
+            n2,
+            &self.w[2][off..],
+            n3,
+            0.0,
+            &mut out[..rows * width],
+            width,
+        );
+        let bias = &self.b[2][off..off + width];
+        for r in 0..rows {
+            let row = &mut out[r * width..r * width + width];
+            for j in 0..width {
+                row[j] += bias[j];
             }
         }
     }

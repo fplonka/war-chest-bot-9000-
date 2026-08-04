@@ -219,6 +219,45 @@ impl TNode {
 /// that moves between CFR iterations at a fixed leaf.
 const SPLIT: usize = FEAT - OFF_BELIEF;
 
+// A subgame's leaf batch runs to a couple of megabytes — the public encodings,
+// the cached first layer, the belief blocks, the network scratch — and a game
+// builds a fresh solver every couple of decisions. Allocating those buffers per
+// solve meant faulting in megabytes of fresh zero pages thousands of times a
+// second; the arithmetic that followed was the cheap part. They are handed back
+// on drop and reused, capacity and all.
+/// The five per-solve buffers, pooled *by role*: they differ in size by 5x, so
+/// a single shared pool handed each one somebody else's buffer and made it grow
+/// — and growth is the one thing that zeroes.
+const N_ROLES: usize = 5;
+const R_H0: usize = 0;
+const R_XPUB: usize = 1;
+const R_XB: usize = 2;
+const R_OB: usize = 3;
+const R_SB: usize = 4;
+
+thread_local! {
+    static BUFS: std::cell::RefCell<[Vec<Vec<f32>>; N_ROLES]> =
+        const { std::cell::RefCell::new([Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()]) };
+}
+
+fn take_buf(role: usize) -> Vec<f32> {
+    BUFS.with(|b| b.borrow_mut()[role].pop().unwrap_or_default())
+}
+
+fn give_buf(role: usize, v: Vec<f32>) {
+    if v.capacity() == 0 {
+        return;
+    }
+    // Kept at length, not cleared: every user grows on demand and overwrites
+    // what it reads, so a cleared buffer would just have to be re-zeroed.
+    BUFS.with(|b| {
+        let mut b = b.borrow_mut();
+        if b[role].len() < 2 {
+            b[role].push(v);
+        }
+    });
+}
+
 pub struct Solver<'a> {
     ctx: &'a Ctx,
     nets: &'a Nets,
@@ -252,6 +291,8 @@ pub struct Solver<'a> {
     leaf_hoff: Vec<u32>,
     /// `rows * hidden`: the public half of the first layer.
     h0: Vec<f32>,
+    /// `rows * OFF_BELIEF`: the public half, filled during the build.
+    xpub: Vec<f32>,
     /// `rows * SPLIT`: the belief half of the encoding.
     xb: Vec<f32>,
     ob: Vec<f32>,
@@ -260,6 +301,20 @@ pub struct Solver<'a> {
     /// Working memory for the chance transitions, reused across the tree.
     draw_scratch: DrawScratch,
     dm: [DrawMap; 3],
+}
+
+impl Drop for Solver<'_> {
+    fn drop(&mut self) {
+        for (role, v) in [
+            (R_H0, &mut self.h0),
+            (R_XPUB, &mut self.xpub),
+            (R_XB, &mut self.xb),
+            (R_OB, &mut self.ob),
+            (R_SB, &mut self.sb),
+        ] {
+            give_buf(role, std::mem::take(v));
+        }
+    }
 }
 
 impl<'a> Solver<'a> {
@@ -293,10 +348,11 @@ impl<'a> Solver<'a> {
             leaf_res: Vec::new(),
             leaf_hand: Vec::new(),
             leaf_hoff: Vec::new(),
-            h0: Vec::new(),
-            xb: Vec::new(),
-            ob: Vec::new(),
-            sb: Vec::new(),
+            h0: take_buf(R_H0),
+            xpub: take_buf(R_XPUB),
+            xb: take_buf(R_XB),
+            ob: take_buf(R_OB),
+            sb: take_buf(R_SB),
             batch_ready: false,
             draw_scratch: DrawScratch::default(),
             dm: Default::default(),
@@ -409,6 +465,7 @@ impl<'a> Solver<'a> {
         });
         drop(_tp);
         if leaf {
+            self.push_leaf(id, &s, &cfgs);
             return id;
         }
 
@@ -664,56 +721,55 @@ impl<'a> Solver<'a> {
     /// Everything about the leaf batch that does not move across iterations:
     /// which leaves there are, their public encoding pushed through the first
     /// layer, their reserves, and the hand key of every config in support.
+    /// Record a leaf in the network batch. Called from `build`, while the
+    /// leaf's state is still the one just constructed and therefore still in
+    /// cache — walking the finished node array to do this instead meant
+    /// re-reading a 700-byte state per leaf out of a half-megabyte tree.
+    fn push_leaf(&mut self, id: usize, s: &State, cfgs: &[Rc<[Config]>; 2]) {
+        let _t = timed!(PUBFEAT);
+        if s.is_terminal() {
+            self.term_leaves.push(id);
+            return;
+        }
+        let at = self.leaf_rows.len() * OFF_BELIEF;
+        if self.xpub.len() < at + OFF_BELIEF {
+            // Grow in chunks so the zero-fill happens a handful of times per
+            // solve, and not at all once the pooled buffer is warm.
+            self.xpub.resize(at + 64 * OFF_BELIEF, 0.0);
+        }
+        write_public_features(s, self.ctx, &mut self.xpub[at..at + OFF_BELIEF]);
+        self.leaf_res
+            .push([reserve(s, 0, self.ctx), reserve(s, 1, self.ctx)]);
+        let tab = hands();
+        for p in 0..2 {
+            self.leaf_hoff.push(self.leaf_hand.len() as u32);
+            for c in cfgs[p].iter() {
+                self.leaf_hand.push(hand_index_in(tab, &c.hand) as u16);
+            }
+        }
+        self.leaf_rows.push(id);
+    }
+
+    /// Push the leaf batch's public half through the network's public tower.
+    /// Everything else about the batch was assembled during `build`.
     fn ensure_leaf_batch(&mut self) {
         if self.batch_ready {
             return;
         }
         self.batch_ready = true;
-        let _t = timed!(PUBFEAT);
-        // Pass one collects the leaves so pass two can size every buffer up
-        // front: growing them inside the fill loop meant reallocating and
-        // memcpying a megabyte of features per solve.
-        for i in 0..self.nodes.len() {
-            if !self.nodes[i].leaf {
-                continue;
-            }
-            if self.nodes[i].s.is_terminal() {
-                self.term_leaves.push(i);
-            } else {
-                self.leaf_rows.push(i);
-            }
-        }
-        let rows = self.leaf_rows.len();
-        let mut xpub: Vec<f32> = vec![0.0; rows * OFF_BELIEF];
-        self.leaf_res.reserve(rows);
-        self.leaf_hoff.reserve(2 * rows + 1);
-        let mut hands = 0usize;
-        for &i in &self.leaf_rows {
-            hands += self.nodes[i].cfgs[0].len() + self.nodes[i].cfgs[1].len();
-        }
-        self.leaf_hand.reserve(hands);
-        for (r, &i) in self.leaf_rows.iter().enumerate() {
-            let n = &self.nodes[i];
-            let at = r * OFF_BELIEF;
-            write_public_features(&n.s, self.ctx, &mut xpub[at..at + OFF_BELIEF]);
-            self.leaf_res
-                .push([reserve(&n.s, 0, self.ctx), reserve(&n.s, 1, self.ctx)]);
-            for p in 0..2 {
-                self.leaf_hoff.push(self.leaf_hand.len() as u32);
-                for c in n.cfgs[p].iter() {
-                    self.leaf_hand.push(c.hand_index() as u16);
-                }
-            }
-        }
         self.leaf_hoff.push(self.leaf_hand.len() as u32);
-        self.xb.clear();
-        self.xb.resize(rows * SPLIT, 0.0);
+        let rows = self.leaf_rows.len();
+        if self.xb.len() < rows * SPLIT {
+            self.xb.resize(rows * SPLIT, 0.0);
+        }
         if !self.nets.value.is_empty() {
             debug_assert_eq!(self.nets.value.in_dim(), FEAT);
             let _t = timed!(PUBNET);
+            let xpub = std::mem::take(&mut self.xpub);
             self.nets
                 .value
-                .prefix(&xpub, rows, OFF_BELIEF, SPLIT, &mut self.h0);
+                .trunk(&xpub, rows, OFF_BELIEF, &mut self.sb, &mut self.h0);
+            self.xpub = xpub;
         }
     }
 
@@ -750,17 +806,18 @@ impl<'a> Solver<'a> {
             let net = &self.nets.value;
             if !net.is_empty() {
                 net.forward_split(
-                    &self.xb,
+                    &self.xb[..rows * SPLIT],
                     rows,
-                    SPLIT,
                     &self.h0,
                     traverser * NHAND..(traverser + 1) * NHAND,
                     &mut self.sb,
                     &mut self.ob,
                 );
             } else {
-                self.ob.clear();
-                self.ob.resize(rows * NHAND, 0.0);
+                if self.ob.len() < rows * NHAND {
+                    self.ob.resize(rows * NHAND, 0.0);
+                }
+                self.ob[..rows * NHAND].fill(0.0);
             }
         }
 

@@ -20,7 +20,6 @@ use warchest::rng::Rng;
 use warchest::search::{node_actions, Cfg, Nets, Solver};
 use warchest::selfplay::make_game;
 use warchest::state::{State, MAX_MAIN_PLAYS, Z_BAG, Z_FACEDOWN, Z_HAND};
-use warchest::units::N_UNITS;
 
 /// A real position `plies` coin plays from the horizon, reached by random play
 /// so it is a state the engine actually produces.
@@ -423,16 +422,25 @@ fn draw_pass_through_consistency() {
                 n.cfgs[1 - me],
                 "idle player's support must pass through the draw untouched"
             );
-            let res = reserve(&n.s, n.player, &ctx);
-            let fu = faceup_counts(&n.s, n.player, &ctx);
-            let b = Belief {
-                cfg: n.cfgs[me].clone(),
+            // One node stands for a whole run of this player's draws, so the
+            // oracle applies `belief_after_draw` once per step, walking the
+            // state alongside it.
+            assert!(n.draw_steps >= 1, "a draw node covers at least one draw");
+            let mut ws = n.s.clone();
+            let mut b = Belief {
+                cfg: n.cfgs[me].to_vec(),
                 p: vec![1.0; n.cfgs[me].len()],
             };
-            let after = belief_after_draw(&b, &res, &fu);
+            for _ in 0..n.draw_steps {
+                let res = reserve(&ws, n.player, &ctx);
+                let fu = faceup_counts(&ws, n.player, &ctx);
+                b = belief_after_draw(&b, &res, &fu);
+                let acts = ws.legal_actions();
+                ws.apply_inplace(acts[0]);
+            }
             assert_eq!(
-                sv.nodes[ch].cfgs[me],
-                after.cfg,
+                sv.nodes[ch].cfgs[me].to_vec(),
+                b.cfg,
                 "post-draw support must equal belief_after_draw's, in order"
             );
             for ci in 0..n.draw.rows() {
@@ -446,8 +454,8 @@ fn draw_pass_through_consistency() {
             }
             assert_eq!(
                 sv.nodes[ch].s.hand_size(n.player),
-                n.s.hand_size(n.player) + 1,
-                "a draw adds exactly one coin to the hand"
+                n.s.hand_size(n.player) + n.draw_steps,
+                "each covered draw adds exactly one coin to the hand"
             );
         }
         sv.multistep(80);

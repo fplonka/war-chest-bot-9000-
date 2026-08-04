@@ -36,11 +36,26 @@ NHAND = warchest.NHAND
 
 
 class Mlp(nn.Module):
-    def __init__(self, din, hidden, dout, layers=2):
+    """The value network, split around the belief block.
+
+    Same shape and the same parameter count as a plain `FEAT -> h -> h -> dout`
+    MLP; the only change is *where* the belief block connects. It is the last
+    `SPLIT` inputs and it is the only part of a leaf's encoding that moves
+    between CFR iterations, so wiring it into the second hidden layer instead of
+    the first leaves the whole public tower — the widest matmul in the network,
+    plus a full hidden layer — computable once per leaf per subgame solve rather
+    than once per iteration. See `Mlp::trunk` in `engine/src/net.rs`.
+    """
+
+    def __init__(self, din, hidden, dout, split=None, layers=2):
         super().__init__()
-        dims = [din] + [hidden] * layers + [dout]
+        self.split = warchest.BELIEF_SPLIT if split is None else split
+        dims = [din - self.split] + [hidden] * layers + [dout]
         self.dims = dims
         self.lin = nn.ModuleList(nn.Linear(dims[i], dims[i + 1]) for i in range(len(dims) - 1))
+        # The belief block's connection into the second hidden layer. No bias:
+        # it is added to a layer that already has one.
+        self.bel = nn.Linear(self.split, hidden, bias=False)
         # LayerNorm on every hidden layer, as the reference does
         # (`use_layer_norm: true`). Two of the raw features are unbounded-ish
         # coin counts, and the bootstrapped targets shift scale over training,
@@ -53,23 +68,22 @@ class Mlp(nn.Module):
         nn.init.normal_(self.lin[-1].weight, std=1e-3)
 
     def forward(self, x):
-        for i, l in enumerate(self.lin):
-            x = l(x)
-            if i + 1 < len(self.lin):
-                x = F.relu(self.norm[i](x))
-        return x
+        xp, xb = x[..., : self.dims[0]], x[..., self.dims[0]:]
+        h = F.relu(self.norm[0](self.lin[0](xp)))
+        h = F.relu(self.norm[1](self.lin[1](h) + self.bel(xb)))
+        return self.lin[2](h)
 
     def push(self, slot):
         """Ship weights to the Rust workers (row-major `[in, out]` per layer)."""
         w = np.concatenate([l.weight.detach().cpu().t().contiguous().numpy().ravel()
-                            for l in self.lin])
+                            for l in list(self.lin) + [self.bel]])
         b = np.concatenate([l.bias.detach().cpu().numpy().ravel() for l in self.lin])
         # Per hidden layer: LayerNorm weight then bias, in layer order.
         ln = np.concatenate([t.detach().cpu().numpy().ravel()
                              for n in self.norm for t in (n.weight, n.bias)])
         warchest.set_weights(self.dims, np.ascontiguousarray(w, np.float32),
                              np.ascontiguousarray(b, np.float32), slot,
-                             np.ascontiguousarray(ln, np.float32))
+                             np.ascontiguousarray(ln, np.float32), self.split)
 
 
 class Buffer:

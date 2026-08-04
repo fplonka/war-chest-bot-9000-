@@ -501,13 +501,15 @@ fn nets() -> &'static RwLock<Vec<Nets>> {
     NETS.get_or_init(|| RwLock::new(vec![Nets::default(); N_SLOTS]))
 }
 
-fn split_mlp(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> PyResult<Mlp> {
+fn split_mlp(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32], split: usize) -> PyResult<Mlp> {
     let mut mlp = Mlp {
         dims: dims.to_vec(),
         w: Vec::new(),
         b: Vec::new(),
         ln_w: Vec::new(),
         ln_b: Vec::new(),
+        split,
+        wb: Vec::new(),
     };
     let (mut wi, mut bi) = (0usize, 0usize);
     for l in 0..dims.len() - 1 {
@@ -521,6 +523,16 @@ fn split_mlp(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> PyResult<Mlp> 
         mlp.b.push(b[bi..bi + o].to_vec());
         wi += i * o;
         bi += o;
+    }
+    // The belief block's connection into the second hidden layer, shipped last.
+    if split > 0 {
+        let need = split * dims[1];
+        if wi + need > w.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "weight buffer too short for the belief projection",
+            ));
+        }
+        mlp.wb = w[wi..wi + need].to_vec();
     }
     // LayerNorm parameters for the hidden layers, weight then bias per layer.
     // An empty buffer means the network has no norm.
@@ -549,13 +561,14 @@ fn split_mlp(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> PyResult<Mlp> 
 /// Install value-network weights. `w` holds every layer's `[in, out]` matrix
 /// concatenated row-major (torch's `weight.t()`), `b` every bias.
 #[pyfunction]
-#[pyo3(signature = (dims, w, b, slot=0, ln=None))]
+#[pyo3(signature = (dims, w, b, slot=0, ln=None, split=0))]
 fn set_weights(
     dims: Vec<usize>,
     w: PyReadonlyArray1<f32>,
     b: PyReadonlyArray1<f32>,
     slot: usize,
     ln: Option<PyReadonlyArray1<f32>>,
+    split: usize,
 ) -> PyResult<()> {
     if slot >= N_SLOTS {
         return Err(pyo3::exceptions::PyValueError::new_err("slot out of range"));
@@ -565,7 +578,7 @@ fn set_weights(
         Some(a) => a.as_slice()?,
         None => &empty,
     };
-    let mlp = split_mlp(&dims, w.as_slice()?, b.as_slice()?, ln_slice)?;
+    let mlp = split_mlp(&dims, w.as_slice()?, b.as_slice()?, ln_slice, split)?;
     nets().write().unwrap()[slot].value = mlp;
     Ok(())
 }
@@ -708,6 +721,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Game>()?;
     m.add("MAX_MAIN_PLAYS", crate::state::MAX_MAIN_PLAYS)?;
     m.add("FEAT", crate::rebel::FEAT)?;
+    m.add("BELIEF_SPLIT", 2 * crate::rebel::BELIEF_DIM)?;
     m.add("NHAND", crate::rebel::NHAND)?;
     m.add_function(wrap_pyfunction!(set_weights, m)?)?;
     m.add_function(wrap_pyfunction!(set_cap_value, m)?)?;
