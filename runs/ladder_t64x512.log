@@ -1,0 +1,109 @@
+[ladder] 14 players, 91 pairings, 100 paired games each (depth=2 iters=64)
+                        random vs greedy                       W   0 L  73 D  27  score 0.135
+                        random vs t64_h384_dg64_s11.init       W   0 L  84 D  16  score 0.080
+                        random vs t64_h384_dg64_s11.s1         W   0 L  99 D   1  score 0.005
+                        random vs t64_h384_dg64_s11.s2         W   0 L  94 D   6  score 0.030
+                        random vs t64_h384_dg64_s11.s3         W   0 L  97 D   3  score 0.015
+                        random vs t64_h384_dg64_s11.s4         W   0 L  99 D   1  score 0.005
+                        random vs t64_h384_dg64_s11.final      W   0 L  95 D   5  score 0.025
+                        random vs t64_h512_dg96_s13.init       W   0 L  65 D  35  score 0.175
+                        random vs t64_h512_dg96_s13.s1         W   0 L  98 D   2  score 0.010
+                        random vs t64_h512_dg96_s13.s2         W   0 L  98 D   2  score 0.010
+                        random vs t64_h512_dg96_s13.s3         W   0 L 100 D   0  score 0.000
+                        random vs t64_h512_dg96_s13.s4         W   0 L  91 D   9  score 0.045
+                        random vs t64_h512_dg96_s13.final      W   0 L  99 D   1  score 0.005
+                        greedy vs t64_h384_dg64_s11.init       W   7 L  81 D  12  score 0.130
+                        greedy vs t64_h384_dg64_s11.s1         W   0 L  99 D   1  score 0.005
+                        greedy vs t64_h384_dg64_s11.s2         W   0 L  97 D   3  score 0.015
+                        greedy vs t64_h384_dg64_s11.s3         W   0 L 100 D   0  score 0.000
+                        greedy vs t64_h384_dg64_s11.s4         W   0 L  99 D   1  score 0.005
+                        greedy vs t64_h384_dg64_s11.final      W   0 L  97 D   3  score 0.015
+                        greedy vs t64_h512_dg96_s13.init       W  16 L  64 D  20  score 0.260
+                        greedy vs t64_h512_dg96_s13.s1         W   0 L 100 D   0  score 0.000
+                        greedy vs t64_h512_dg96_s13.s2         W   0 L 100 D   0  score 0.000
+                        greedy vs t64_h512_dg96_s13.s3         W   0 L 100 D   0  score 0.000
+                        greedy vs t64_h512_dg96_s13.s4         W   0 L  96 D   4  score 0.020
+                        greedy vs t64_h512_dg96_s13.final      W   0 L 100 D   0  score 0.000
+        t64_h384_dg64_s11.init vs t64_h384_dg64_s11.s1         W   1 L  97 D   2  score 0.020
+        t64_h384_dg64_s11.init vs t64_h384_dg64_s11.s2         W   1 L  99 D   0  score 0.010
+        t64_h384_dg64_s11.init vs t64_h384_dg64_s11.s3         W   0 L  98 D   2  score 0.010
+        t64_h384_dg64_s11.init vs t64_h384_dg64_s11.s4         W   0 L 100 D   0  score 0.000
+        t64_h384_dg64_s11.init vs t64_h384_dg64_s11.final      W   1 L  98 D   1  score 0.015
+        t64_h384_dg64_s11.init vs t64_h512_dg96_s13.init       W  56 L  32 D  12  score 0.620
+        t64_h384_dg64_s11.init vs t64_h512_dg96_s13.s1         W   1 L  98 D   1  score 0.015
+        t64_h384_dg64_s11.init vs t64_h512_dg96_s13.s2         W   2 L  97 D   1  score 0.025
+        t64_h384_dg64_s11.init vs t64_h512_dg96_s13.s3         W   0 L 100 D   0  score 0.000
+        t64_h384_dg64_s11.init vs t64_h512_dg96_s13.s4         W   1 L  94 D   5  score 0.035
+        t64_h384_dg64_s11.init vs t64_h512_dg96_s13.final      W   0 L 100 D   0  score 0.000
+          t64_h384_dg64_s11.s1 vs t64_h384_dg64_s11.s2         W  31 L  68 D   1  score 0.315
+          t64_h384_dg64_s11.s1 vs t64_h384_dg64_s11.s3         W  27 L  73 D   0  score 0.270
+          t64_h384_dg64_s11.s1 vs t64_h384_dg64_s11.s4         W  30 L  69 D   1  score 0.305
+          t64_h384_dg64_s11.s1 vs t64_h384_dg64_s11.final      W  23 L  74 D   3  score 0.245
+          t64_h384_dg64_s11.s1 vs t64_h512_dg96_s13.init       W  98 L   2 D   0  score 0.980
+          t64_h384_dg64_s11.s1 vs t64_h512_dg96_s13.s1         W  61 L  39 D   0  score 0.610
+          t64_h384_dg64_s11.s1 vs t64_h512_dg96_s13.s2         W  36 L  64 D   0  score 0.360
+          t64_h384_dg64_s11.s1 vs t64_h512_dg96_s13.s3         W  38 L  62 D   0  score 0.380
+          t64_h384_dg64_s11.s1 vs t64_h512_dg96_s13.s4         W  33 L  65 D   2  score 0.340
+          t64_h384_dg64_s11.s1 vs t64_h512_dg96_s13.final      W  37 L  63 D   0  score 0.370
+          t64_h384_dg64_s11.s2 vs t64_h384_dg64_s11.s3         W  46 L  53 D   1  score 0.465
+          t64_h384_dg64_s11.s2 vs t64_h384_dg64_s11.s4         W  41 L  58 D   1  score 0.415
+          t64_h384_dg64_s11.s2 vs t64_h384_dg64_s11.final      W  32 L  68 D   0  score 0.320
+          t64_h384_dg64_s11.s2 vs t64_h512_dg96_s13.init       W  98 L   1 D   1  score 0.985
+          t64_h384_dg64_s11.s2 vs t64_h512_dg96_s13.s1         W  74 L  25 D   1  score 0.745
+          t64_h384_dg64_s11.s2 vs t64_h512_dg96_s13.s2         W  62 L  35 D   3  score 0.635
+          t64_h384_dg64_s11.s2 vs t64_h512_dg96_s13.s3         W  55 L  43 D   2  score 0.560
+          t64_h384_dg64_s11.s2 vs t64_h512_dg96_s13.s4         W  43 L  56 D   1  score 0.435
+          t64_h384_dg64_s11.s2 vs t64_h512_dg96_s13.final      W  43 L  53 D   4  score 0.450
+          t64_h384_dg64_s11.s3 vs t64_h384_dg64_s11.s4         W  44 L  55 D   1  score 0.445
+          t64_h384_dg64_s11.s3 vs t64_h384_dg64_s11.final      W  42 L  58 D   0  score 0.420
+          t64_h384_dg64_s11.s3 vs t64_h512_dg96_s13.init       W  99 L   0 D   1  score 0.995
+          t64_h384_dg64_s11.s3 vs t64_h512_dg96_s13.s1         W  73 L  26 D   1  score 0.735
+          t64_h384_dg64_s11.s3 vs t64_h512_dg96_s13.s2         W  66 L  32 D   2  score 0.670
+          t64_h384_dg64_s11.s3 vs t64_h512_dg96_s13.s3         W  59 L  41 D   0  score 0.590
+          t64_h384_dg64_s11.s3 vs t64_h512_dg96_s13.s4         W  52 L  47 D   1  score 0.525
+          t64_h384_dg64_s11.s3 vs t64_h512_dg96_s13.final      W  45 L  54 D   1  score 0.455
+          t64_h384_dg64_s11.s4 vs t64_h384_dg64_s11.final      W  47 L  53 D   0  score 0.470
+          t64_h384_dg64_s11.s4 vs t64_h512_dg96_s13.init       W  98 L   1 D   1  score 0.985
+          t64_h384_dg64_s11.s4 vs t64_h512_dg96_s13.s1         W  83 L  17 D   0  score 0.830
+          t64_h384_dg64_s11.s4 vs t64_h512_dg96_s13.s2         W  69 L  30 D   1  score 0.695
+          t64_h384_dg64_s11.s4 vs t64_h512_dg96_s13.s3         W  58 L  40 D   2  score 0.590
+          t64_h384_dg64_s11.s4 vs t64_h512_dg96_s13.s4         W  63 L  36 D   1  score 0.635
+          t64_h384_dg64_s11.s4 vs t64_h512_dg96_s13.final      W  58 L  41 D   1  score 0.585
+       t64_h384_dg64_s11.final vs t64_h512_dg96_s13.init       W  96 L   1 D   3  score 0.975
+       t64_h384_dg64_s11.final vs t64_h512_dg96_s13.s1         W  79 L  20 D   1  score 0.795
+       t64_h384_dg64_s11.final vs t64_h512_dg96_s13.s2         W  70 L  27 D   3  score 0.715
+       t64_h384_dg64_s11.final vs t64_h512_dg96_s13.s3         W  70 L  30 D   0  score 0.700
+       t64_h384_dg64_s11.final vs t64_h512_dg96_s13.s4         W  59 L  40 D   1  score 0.595
+       t64_h384_dg64_s11.final vs t64_h512_dg96_s13.final      W  48 L  52 D   0  score 0.480
+        t64_h512_dg96_s13.init vs t64_h512_dg96_s13.s1         W   0 L 100 D   0  score 0.000
+        t64_h512_dg96_s13.init vs t64_h512_dg96_s13.s2         W   1 L  97 D   2  score 0.020
+        t64_h512_dg96_s13.init vs t64_h512_dg96_s13.s3         W   1 L  98 D   1  score 0.015
+        t64_h512_dg96_s13.init vs t64_h512_dg96_s13.s4         W   1 L  97 D   2  score 0.020
+        t64_h512_dg96_s13.init vs t64_h512_dg96_s13.final      W   0 L  97 D   3  score 0.015
+          t64_h512_dg96_s13.s1 vs t64_h512_dg96_s13.s2         W  38 L  61 D   1  score 0.385
+          t64_h512_dg96_s13.s1 vs t64_h512_dg96_s13.s3         W  24 L  74 D   2  score 0.250
+          t64_h512_dg96_s13.s1 vs t64_h512_dg96_s13.s4         W  24 L  73 D   3  score 0.255
+          t64_h512_dg96_s13.s1 vs t64_h512_dg96_s13.final      W  24 L  75 D   1  score 0.245
+          t64_h512_dg96_s13.s2 vs t64_h512_dg96_s13.s3         W  40 L  59 D   1  score 0.405
+          t64_h512_dg96_s13.s2 vs t64_h512_dg96_s13.s4         W  36 L  61 D   3  score 0.375
+          t64_h512_dg96_s13.s2 vs t64_h512_dg96_s13.final      W  37 L  63 D   0  score 0.370
+          t64_h512_dg96_s13.s3 vs t64_h512_dg96_s13.s4         W  55 L  45 D   0  score 0.550
+          t64_h512_dg96_s13.s3 vs t64_h512_dg96_s13.final      W  45 L  54 D   1  score 0.455
+          t64_h512_dg96_s13.s4 vs t64_h512_dg96_s13.final      W  43 L  57 D   0  score 0.430
+
+=== Elo (runs/t64_h384_dg64_s11, random = 0) ===
+                      player   trained     elo    +-   score
+     t64_h384_dg64_s11.final  270.0min    1062    12   0.750
+        t64_h384_dg64_s11.s4  245.5min    1052    12   0.740
+     t64_h512_dg96_s13.final  270.2min    1017    12   0.703
+        t64_h384_dg64_s11.s3  185.3min    1013    12   0.698
+        t64_h384_dg64_s11.s2  125.2min     982    12   0.665
+        t64_h512_dg96_s13.s4  245.9min     979    12   0.662
+        t64_h512_dg96_s13.s3  185.8min     973    12   0.655
+        t64_h512_dg96_s13.s2  125.7min     911    12   0.587
+        t64_h384_dg64_s11.s1   65.0min     876    12   0.550
+        t64_h512_dg96_s13.s1   65.4min     819    12   0.492
+      t64_h384_dg64_s11.init    5.0min     362    19   0.195
+      t64_h512_dg96_s13.init    5.0min     290    19   0.161
+                      greedy         -     157    21   0.101
+                      random         -       0    25   0.042
