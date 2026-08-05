@@ -570,16 +570,17 @@ impl<'a> Solver<'a> {
         // depth cost). Other chance nodes (Warrior Priest draws — excluded
         // from every draft) stay leaves, as do depth-0 nodes and terminals.
         let draw_pass = matches!(s.pending(), Cont::Draw { .. });
-        // Depth counts completed coin plays. A decision node at depth 0 is a
-        // leaf only if it can spend a coin; a node whose actions all spend
-        // nothing is a tactic's micro-choice (cavalry: move, then choose the
-        // attack) and rides free even at the budget's edge. Otherwise "depth
-        // 2" would sometimes contain zero opponent moves, because a compound
+        // Depth counts completed coin plays. A main-play node spends exactly
+        // one coin per legal action and every micro node's actions spend
+        // nothing, so "is this a main play?" is the whole story: a micro
+        // node at depth 0 (cavalry: move, then choose the attack) rides free,
+        // a main-play node at depth 0 is a leaf. Without this, "depth 2"
+        // would sometimes contain zero opponent moves, because a compound
         // tactic is several decision nodes for one coin.
+        let mainplay = matches!(s.pending(), Cont::MainPlay);
         let mut leaf = s.is_terminal() || (!draw_pass && s.is_chance());
         if !leaf && !draw_pass && depth == 0 {
-            let (acts0, _, _) = node_actions(&s, player, self.ctx, &cfgs[player as usize]);
-            leaf = acts0.iter().any(|a| action_coin(a, &s) != NONE);
+            leaf = mainplay;
         }
         let id = self.nodes.len();
         let _tp = timed!(BPUSH);
@@ -772,14 +773,24 @@ impl<'a> Solver<'a> {
             drop(tb);
             let mut cc = cfgs.clone();
             cc[me] = std::mem::take(&mut child_cfgs[ch]).into();
-            // One depth unit per *completed coin play*, not per decision node:
-            // an observation group whose actions all spend no coin is inside a
-            // tactic and rides free. Children are only built from non-leaf
-            // nodes, and a depth-0 non-leaf is all-free, so this never
-            // underflows.
-            let spends = obs_act[obs_start[ch] as usize..obs_start[ch + 1] as usize]
-                .iter()
-                .any(|&au| action_coin(&acts[au as usize], &s) != NONE);
+            // One depth unit per *completed coin play*, not per decision node.
+            // Every legal action at a main-play node spends exactly one coin
+            // and every action at a micro node spends none, so the node-level
+            // structural test decides the whole observation group and no
+            // per-action scan is needed. The known future divergence:
+            // Cont::WarriorPriestPlay spends a real coin without being
+            // MainPlay — when the Warrior Priest re-enters the draft pool the
+            // predicate becomes `MainPlay | WarriorPriestPlay`, and the debug
+            // assertion below exists so that day is a test failure, not a
+            // silent depth miscount.
+            let spends = matches!(s.pending(), Cont::MainPlay);
+            debug_assert_eq!(
+                spends,
+                obs_act[obs_start[ch] as usize..obs_start[ch + 1] as usize]
+                    .iter()
+                    .any(|&au| action_coin(&acts[au as usize], &s) != NONE),
+                "structural mainplay test diverged from action_coin"
+            );
             child.push(self.build(cs, depth - usize::from(spends), cc));
         }
 

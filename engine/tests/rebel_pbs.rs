@@ -595,3 +595,123 @@ fn normalized_weights_match_belief_normalize() {
     }
     assert!(checked > 100, "only {checked} weight vectors exercised");
 }
+
+#[test]
+fn from_pairs_keeps_zero_weight_configs() {
+    // Support is reachability, never weight. A belief weight is a product of
+    // one strategy probability per decision; regret matching floors those at
+    // 1e-6, so after enough of them a reachable config's weight reaches
+    // exactly 0.0 in f32. Dropping it would shift every later strategy row
+    // index by one — the walk-desync panic that killed
+    // runs/t256_h384_dg64_s12 at epoch 168.
+    let a = Config::default();
+    let b = Config { hand: [1, 0, 0, 0, 0], fd: [0; NSLOT] };
+    let c = Config { hand: [0; NSLOT], fd: [1, 0, 0, 0, 0] };
+    let bel = Belief::from_pairs(vec![
+        (b, 0.25),
+        (c, -0.5), // a negative weight is still dropped
+        (a, 0.0),  // underflowed to exactly zero: kept, in sorted position
+    ]);
+    assert_eq!(bel.cfg, vec![a, b], "zero-weight config must stay in the support");
+    assert_eq!(bel.p[0], 0.0, "the kept config's weight stays exactly zero");
+    assert_eq!(bel.p[1], 1.0, "kept configs are renormalized");
+}
+
+#[test]
+fn zero_weight_config_survives_the_walk_update() {
+    // The crash shape, end to end: the Bayes update multiplies a config's
+    // prior by its strategy probability at every decision, and a config the
+    // strategy keeps calling unlikely reaches exactly 0.0 in f32. The subgame
+    // tree keeps every reachable config, so a belief that dropped the
+    // underflowed one would no longer match the tree's config list and the
+    // walk's support assertion would fire mid-run. Drive the update with a
+    // prior small enough that every product underflows, then require the new
+    // support to equal the tree child's config list element for element — the
+    // invariant the desync assert protects: support is reachability, never
+    // weight.
+    let nets = [Nets::default(), Nets::default()];
+    let mut rng = Rng::new(777);
+    for _ in 0..200 {
+        let mut s = make_game(&mut rng, false);
+        for _ in 0..40 + rng.below(60) {
+            if s.is_terminal() {
+                break;
+            }
+            let acts = s.legal_actions();
+            if acts.is_empty() {
+                break;
+            }
+            s.apply_inplace(acts[rng.below(acts.len())]);
+        }
+        while !s.is_terminal() && s.is_chance() {
+            let acts = s.legal_actions();
+            s.apply_inplace(acts[rng.below(acts.len())]);
+        }
+        if s.is_terminal() || s.is_chance() || !matches!(s.pending(), Cont::MainPlay) {
+            continue;
+        }
+        let ctx = Ctx::new(&s);
+        let me = s.to_act() as usize;
+        let mut bel = Vec::new();
+        for p in 0..2u8 {
+            let res = reserve(&s, p, &ctx);
+            let truth = true_config(&s, p, &ctx);
+            let cfg = enumerate_configs(&res, truth.hand_size(), truth.fd_size());
+            if cfg.len() < 2 {
+                break;
+            }
+            let w = 1.0 / cfg.len() as f32;
+            bel.push(Belief { p: vec![w; cfg.len()], cfg });
+        }
+        if bel.len() != 2 {
+            continue;
+        }
+        let mut bel = [bel[0].clone(), bel[1].clone()];
+        // Config 0 of the acting player gets a prior so small that every
+        // product with a strategy probability underflows to exactly 0.0 in
+        // f32 (denormals end near 1.4e-45).
+        bel[me].p[0] = 1e-46;
+        bel[me].normalize();
+        let mut sv = Solver::new(
+            &s, &ctx, &nets[0],
+            Cfg { depth: 2, iters: 8, snapshots: false },
+            bel.clone(),
+        );
+        sv.multistep(8);
+        let n0 = &sv.nodes[0];
+        let na = n0.na();
+        // An action the underflowed config can actually play, so the tree's
+        // child support includes it.
+        let Some(chosen) = (0..na).find(|&a| n0.legal[na + a]) else {
+            continue;
+        };
+        let child = n0.child[n0.obs_child[chosen]];
+        if sv.nodes[child].chance {
+            // A draw child's config list is the post-draw support, which this
+            // pre-draw update does not model; keep searching.
+            continue;
+        }
+        // The walk's Bayes update on the public observation of `chosen`.
+        let obs = obs_key(&n0.acts[chosen]);
+        let mut pairs = Vec::new();
+        for (ci, c) in bel[me].cfg.iter().enumerate() {
+            let row = sv.average_strategy(0, ci);
+            for a in 0..na {
+                if !n0.legal[ci * na + a] || obs_key(&n0.acts[a]) != obs {
+                    continue;
+                }
+                if let Some(n) = advance_config(c, n0.aslot[a], n0.fdown[a]) {
+                    pairs.push((n, bel[me].p[ci] * row[a]));
+                }
+            }
+        }
+        let new_bel = Belief::from_pairs(pairs);
+        assert_eq!(
+            &*sv.nodes[child].cfgs[me],
+            &new_bel.cfg[..],
+            "walk update dropped a reachable config (weight underflow); the tree keeps it, so the desync assert would fire"
+        );
+        return;
+    }
+    panic!("no usable position in 200 random games");
+}

@@ -446,7 +446,15 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
                 }
             }
             if walk_ended {
-                carried = finish_walk(walk.take().unwrap(), &bel);
+                if gc.collect == Collect::Rebel {
+                    carried = finish_walk(walk.take().unwrap(), &bel);
+                } else {
+                    // Evaluation: the carried beliefs exist only to be valued
+                    // by the next solve's Phase 2, which collection runs and
+                    // evaluation does not — drop them with the walk.
+                    walk.take();
+                    carried.clear();
+                }
             }
             continue;
         }
@@ -498,7 +506,9 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
                     // level — under the reference strategy (the CFR average),
                     // and the walk acts on that same average.
                     let scfg = Cfg {
-                        snapshots: true,
+                        // Evaluation never reads the per-iterate snapshots or
+                        // the carried beliefs, so it must not pay for either.
+                        snapshots: gc.collect == Collect::Rebel,
                         ..cfg
                     };
                     let mut sv = Solver::new(&s, &ctx, &nets[slot], scfg, bel.clone());
@@ -633,7 +643,14 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
             }
         }
         if walk_ended {
-            carried = finish_walk(walk.take().unwrap(), &bel);
+            if gc.collect == Collect::Rebel {
+                carried = finish_walk(walk.take().unwrap(), &bel);
+            } else {
+                // Evaluation: see the chance-path site — carried beliefs are
+                // Phase-2 input for collection only.
+                walk.take();
+                carried.clear();
+            }
         }
     }
 
