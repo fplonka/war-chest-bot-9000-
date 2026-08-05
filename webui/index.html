@@ -28,10 +28,8 @@
   @media (max-width: 920px) {
     main { grid-template-columns: 1fr; grid-template-areas: "board" "moves" "hand" "log"; }
   }
-  #boardwrap { grid-area: board; justify-self: center;
-               background: var(--panel); border: 1px solid var(--line);
-               border-radius: 10px; padding: 10px 12px 8px; }
-  #board { width: 560px; max-width: 100%; height: auto; display: block; }
+  #boardwrap { grid-area: board; justify-self: center; }
+  #board { width: 640px; max-width: 100%; height: auto; display: block; }
   #moveswrap { grid-area: moves; }
   #handwrap { grid-area: hand; }
   #logwrap { grid-area: log; }
@@ -74,7 +72,7 @@
   #banner.win { color: #7fa879; } #banner.lose { color: #e06c75; }
   #banner.draw { color: var(--gold); }
   .marker-note { font-size: 11px; color: var(--dim); }
-  svg text.coord { fill: #6c6a6c; font-size: 9px; }
+  svg text.coord { fill: #6d6961; font-size: 9px; }
   svg text.unit { font-size: 12px; font-weight: 700; text-anchor: middle;
                   dominant-baseline: central; }
 </style>
@@ -227,12 +225,17 @@ function unitAbbr(id) { return ABBR[meta.units[id]] || meta.units[id] || "?"; }
 function renderBoard() {
   const svg = $("board");
   const geo = meta.geometry;
-  let w = 0, h = 0;
+  // viewBox centred on the hex grid itself (not on the max centre), with a
+  // uniform margin, so the board is dead-centre in its row
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
   for (const [x, y] of geo.coords) {
     const [px, py] = centerOf(x, y);
-    w = Math.max(w, px); h = Math.max(h, py);
+    x0 = Math.min(x0, px - R); x1 = Math.max(x1, px + R);
+    y0 = Math.min(y0, py - R); y1 = Math.max(y1, py + R);
   }
-  svg.setAttribute("viewBox", `-36 -36 ${w + 100} ${h + 80}`);
+  const M = 34;
+  svg.setAttribute("viewBox",
+    `${x0 - M} ${y0 - M} ${(x1 - x0) + 2 * M} ${(y1 - y0) + 2 * M}`);
   svg.innerHTML = "";
   const ns = "http://www.w3.org/2000/svg";
   const occ = new Map(state.board.map(o => [o.hex, o]));
@@ -250,14 +253,14 @@ function renderBoard() {
     const m = markers.get(i);
     // location hexes get a bright outline and a tint by who controls them;
     // plain hexes are dark so the pieces stand out
-    let fill = "#2e2e2f", stroke = "#444241", sw = 1.2;
+    let fill = "#2f2d2a", stroke = "#46423d", sw = 1.2;
     if (li !== undefined) {
       sw = 2;
       // control is the loudest signal on the board: blue = you, red = agent,
       // grey = neutral, each in both the fill and the outline. The blue and
       // red are matched in weight so they read as one colour pair.
-      stroke = m === 0 ? "#a2b9df" : m === 1 ? "#d6958a" : "#7c7a7b";
-      fill = m === 0 ? "#5b83c8" : m === 1 ? "#bd5a50" : "#424143";
+      stroke = m === 0 ? "#a2b9df" : m === 1 ? "#d6958a" : "#7c7871";
+      fill = m === 0 ? "#5b83c8" : m === 1 ? "#bd5a50" : "#42403c";
     }
     const hex = document.createElementNS(ns, "polygon");
     hex.setAttribute("points", hexPoints(cx, cy));
@@ -271,23 +274,14 @@ function renderBoard() {
       hex.appendChild(t);
     }
     svg.appendChild(hex);
-    // faint chess-style marker of the last movement: a dot where the unit
-    // came from, a halo where it stands now (drawn under the piece)
-    if (lm) {
-      if (geo.hex_of[lm.from] === i) {
-        const dot = document.createElementNS(ns, "circle");
-        dot.setAttribute("cx", cx); dot.setAttribute("cy", cy);
-        dot.setAttribute("r", 9);
-        dot.setAttribute("fill", "rgba(140,220,140,0.4)");
-        svg.appendChild(dot);
-      }
-      if (geo.hex_of[lm.to] === i) {
-        const halo = document.createElementNS(ns, "circle");
-        halo.setAttribute("cx", cx); halo.setAttribute("cy", cy);
-        halo.setAttribute("r", 21);
-        halo.setAttribute("fill", "rgba(140,220,140,0.22)");
-        svg.appendChild(halo);
-      }
+    // faint green wash over the origin and destination hex of the last
+    // movement (chess-style, as a full-hex tint; drawn under the piece)
+    if (lm && (geo.hex_of[lm.from] === i || geo.hex_of[lm.to] === i)) {
+      const wash = document.createElementNS(ns, "polygon");
+      wash.setAttribute("points", hexPoints(cx, cy));
+      wash.setAttribute("fill", "rgba(140,220,140,0.15)");
+      wash.setAttribute("stroke", "none");
+      svg.appendChild(wash);
     }
     const t = document.createElementNS(ns, "text");
     // coordinate label: centred, tucked under the hex's top edge — clear of
