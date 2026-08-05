@@ -170,7 +170,7 @@ function renderBoard() {
     const [px, py] = centerOf(x, y);
     w = Math.max(w, px); h = Math.max(h, py);
   }
-  svg.setAttribute("viewBox", `-20 -20 ${w + 90} ${h + 70}`);
+  svg.setAttribute("viewBox", `-36 -36 ${w + 100} ${h + 80}`);
   svg.innerHTML = "";
   const ns = "http://www.w3.org/2000/svg";
   const occ = new Map(state.board.map(o => [o.hex, o]));
@@ -204,7 +204,11 @@ function renderBoard() {
     }
     svg.appendChild(hex);
     const t = document.createElementNS(ns, "text");
-    t.setAttribute("x", cx - R * 0.72); t.setAttribute("y", cy - R * 0.78);
+    // coordinate label: centred, tucked under the hex's top edge — clear of
+    // the unit disc (centre), the marker diamond (top-right) and the stack
+    // badge (bottom-right)
+    t.setAttribute("x", cx); t.setAttribute("y", cy - 20);
+    t.setAttribute("text-anchor", "middle");
     t.setAttribute("class", "coord");
     t.textContent = `${x},${y}`;
     svg.appendChild(t);
@@ -326,11 +330,19 @@ function render() {
     banner.style.display = "none";
     $("movetitle").textContent = state.to_act === state.human
       ? "Your move" : "Agent is thinking…";
-    let html = "", last = null;
+    // one section per action kind (the engine emits actions coin-by-coin,
+    // so "Deploy" would otherwise repeat for every deployable coin)
+    const groups = new Map();
     for (const a of state.actions) {
       const g = KIND_GROUP[a.kind] || a.kind;
-      if (g !== last) { html += `<div class="mgroup">${g}</div>`; last = g; }
-      html += `<button class="move" data-code="${a.code}">${a.label}</button>`;
+      if (!groups.has(g)) groups.set(g, []);
+      groups.get(g).push(a);
+    }
+    let html = "";
+    for (const [g, acts] of groups) {
+      html += `<div class="mgroup">${g}</div>`;
+      for (const a of acts)
+        html += `<button class="move" data-code="${a.code}">${a.label}</button>`;
     }
     $("movelist").innerHTML = html;
     if (state.to_act !== state.human) $("movelist").innerHTML = "";
