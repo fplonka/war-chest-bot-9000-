@@ -76,3 +76,17 @@
       nothing; `--hidden 512` was the best architecture tested once
       augmentation removed the overfitting, by 1.5%.
 
+- [ ] **Run 2 (t256_h384_dg64_s12) crashed with a rare walk desync.** Panic at
+      `src/selfplay.rs:425`: `walk desync: post-draw support does not match the
+      game belief`, thrown from `gen_data` at epoch 168 (~89 min, seed 12,
+      iters=256). Run 1 (seed 11, iters=64) played a full 270 min without it,
+      so the trigger state is rare and seed-dependent. Working hypothesis: the
+      game belief's Bayes update on the acting player's public observation
+      (`Belief::from_pairs`, which drops zero-weight configs) prunes configs
+      that the walk tree's reachability-built support keeps; when the round
+      continues with the same player drawing immediately after their decision,
+      the post-draw support check fires before the decision-node check (line
+      520) ever would. Needs a careful read of `search.rs`'s decision-node
+      support construction before touching anything — both asserts are
+      load-bearing and a wrong fix would silently corrupt targets. Re-run 2
+      after this is resolved.

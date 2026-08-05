@@ -1,0 +1,183 @@
+[cfg] PUBFEAT=972 CFEAT=16 hidden=384 dg=64 rank=64 depth=2 iters=256 budget=16200s warm=300s device=cpu draft=starter snapshot_every=60.0min train_gen_ratio=4.0 recent_mix=0.5/0.2 augment=True cap=2000000
+[t=   4.5s] greedy ep  0 games=  96 dec= 17650 cap=0.32 cfgs= 26.0 L=0.06799 tgt=-0.023/0.479 pstd=0.416 capv=0.040 lr=1.0e-03 gen=1.4s train=3.0s
+[t=   7.4s] greedy ep  1 games=  96 dec= 17846 cap=0.35 cfgs= 22.8 L=0.04990 tgt=-0.060/0.487 pstd=0.406 capv=0.040 lr=1.0e-03 gen=0.1s train=2.8s
+[t=  10.3s] greedy ep  2 games=  96 dec= 16714 cap=0.25 cfgs= 24.3 L=0.05419 tgt=-0.005/0.512 pstd=0.416 capv=0.040 lr=1.0e-03 gen=0.1s train=2.7s
+[t=  13.2s] greedy ep  3 games=  96 dec= 17743 cap=0.39 cfgs= 23.0 L=0.05240 tgt=-0.039/0.480 pstd=0.410 capv=0.040 lr=1.0e-03 gen=0.1s train=2.7s
+[t=  16.4s] greedy ep  4 games=  96 dec= 17092 cap=0.27 cfgs= 26.3 L=0.06677 tgt=-0.002/0.458 pstd=0.402 capv=0.040 lr=1.0e-03 gen=0.1s train=3.0s
+[t=  19.5s] greedy ep  5 games=  96 dec= 17624 cap=0.34 cfgs= 24.8 L=0.05628 tgt=-0.022/0.474 pstd=0.428 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t=  22.5s] greedy ep  6 games=  96 dec= 17619 cap=0.34 cfgs= 23.4 L=0.05800 tgt=-0.023/0.473 pstd=0.404 capv=0.040 lr=1.0e-03 gen=0.1s train=2.8s
+[t=  25.3s] greedy ep  7 games=  96 dec= 17528 cap=0.32 cfgs= 22.8 L=0.05935 tgt=-0.032/0.476 pstd=0.414 capv=0.040 lr=1.0e-03 gen=0.1s train=2.7s
+[t=  28.4s] greedy ep  8 games=  96 dec= 17853 cap=0.31 cfgs= 24.0 L=0.05773 tgt=+0.012/0.471 pstd=0.399 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t=  31.9s] greedy ep  9 games=  96 dec= 16271 cap=0.23 cfgs= 25.9 L=0.06171 tgt=+0.016/0.504 pstd=0.416 capv=0.040 lr=1.0e-03 gen=0.7s train=2.7s
+[t=  35.0s] greedy ep 10 games=  96 dec= 17444 cap=0.32 cfgs= 23.8 L=0.06136 tgt=-0.023/0.477 pstd=0.383 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t=  38.1s] greedy ep 11 games=  96 dec= 18369 cap=0.39 cfgs= 23.2 L=0.05841 tgt=-0.028/0.457 pstd=0.383 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t=  40.9s] greedy ep 12 games=  96 dec= 16987 cap=0.31 cfgs= 23.2 L=0.06043 tgt=-0.045/0.497 pstd=0.391 capv=0.040 lr=1.0e-03 gen=0.1s train=2.7s
+[t=  44.0s] greedy ep 13 games=  96 dec= 17597 cap=0.29 cfgs= 24.5 L=0.06132 tgt=-0.011/0.486 pstd=0.372 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t=  46.9s] greedy ep 14 games=  96 dec= 16694 cap=0.23 cfgs= 25.3 L=0.06837 tgt=-0.072/0.525 pstd=0.377 capv=0.040 lr=1.0e-03 gen=0.2s train=2.7s
+[t=  49.9s] greedy ep 15 games=  96 dec= 17002 cap=0.25 cfgs= 25.9 L=0.06775 tgt=-0.028/0.491 pstd=0.390 capv=0.040 lr=1.0e-03 gen=0.1s train=2.8s
+[t=  52.9s] greedy ep 16 games=  96 dec= 16653 cap=0.25 cfgs= 23.6 L=0.06779 tgt=-0.023/0.503 pstd=0.363 capv=0.040 lr=1.0e-03 gen=0.1s train=2.8s
+[t=  55.9s] greedy ep 17 games=  96 dec= 17594 cap=0.33 cfgs= 23.6 L=0.06573 tgt=-0.029/0.482 pstd=0.363 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t=  58.9s] greedy ep 18 games=  96 dec= 18043 cap=0.39 cfgs= 23.6 L=0.06717 tgt=-0.020/0.451 pstd=0.376 capv=0.040 lr=1.0e-03 gen=0.1s train=2.8s
+[t=  62.0s] greedy ep 19 games=  96 dec= 18229 cap=0.36 cfgs= 23.6 L=0.06488 tgt=-0.035/0.478 pstd=0.384 capv=0.040 lr=1.0e-03 gen=0.1s train=3.0s
+[t=  64.9s] greedy ep 20 games=  96 dec= 16631 cap=0.26 cfgs= 26.8 L=0.06586 tgt=-0.020/0.492 pstd=0.351 capv=0.040 lr=1.0e-03 gen=0.1s train=2.7s
+[t=  68.0s] greedy ep 21 games=  96 dec= 17997 cap=0.35 cfgs= 23.8 L=0.06455 tgt=-0.016/0.487 pstd=0.395 capv=0.040 lr=1.0e-03 gen=0.1s train=3.0s
+[t=  71.0s] greedy ep 22 games=  96 dec= 17186 cap=0.28 cfgs= 23.4 L=0.06680 tgt=-0.039/0.507 pstd=0.395 capv=0.040 lr=1.0e-03 gen=0.1s train=2.8s
+[t=  74.1s] greedy ep 23 games=  96 dec= 18417 cap=0.39 cfgs= 23.7 L=0.06712 tgt=-0.034/0.456 pstd=0.391 capv=0.040 lr=1.0e-03 gen=0.1s train=3.0s
+[t=  77.2s] greedy ep 24 games=  96 dec= 17847 cap=0.33 cfgs= 24.6 L=0.06607 tgt=+0.013/0.452 pstd=0.393 capv=0.040 lr=1.0e-03 gen=0.1s train=3.0s
+[t=  80.2s] greedy ep 25 games=  96 dec= 17130 cap=0.26 cfgs= 24.3 L=0.06730 tgt=-0.044/0.516 pstd=0.361 capv=0.040 lr=1.0e-03 gen=0.1s train=2.8s
+[t=  83.3s] greedy ep 26 games=  96 dec= 17706 cap=0.31 cfgs= 24.0 L=0.06804 tgt=-0.033/0.490 pstd=0.387 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t=  86.2s] greedy ep 27 games=  96 dec= 16841 cap=0.26 cfgs= 24.7 L=0.06903 tgt=-0.007/0.513 pstd=0.376 capv=0.040 lr=1.0e-03 gen=0.1s train=2.8s
+[t=  89.3s] greedy ep 28 games=  96 dec= 18338 cap=0.35 cfgs= 22.8 L=0.07195 tgt=-0.036/0.479 pstd=0.385 capv=0.040 lr=1.0e-03 gen=0.1s train=3.0s
+[t=  92.2s] greedy ep 29 games=  96 dec= 16308 cap=0.24 cfgs= 26.6 L=0.07156 tgt=-0.023/0.503 pstd=0.403 capv=0.040 lr=1.0e-03 gen=0.1s train=2.7s
+[t=  95.1s] greedy ep 30 games=  96 dec= 17047 cap=0.29 cfgs= 24.5 L=0.07318 tgt=-0.039/0.500 pstd=0.401 capv=0.040 lr=1.0e-03 gen=0.1s train=2.7s
+[t=  98.1s] greedy ep 31 games=  96 dec= 17402 cap=0.29 cfgs= 23.5 L=0.07231 tgt=-0.017/0.492 pstd=0.386 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t= 101.6s] greedy ep 32 games=  96 dec= 16833 cap=0.27 cfgs= 25.0 L=0.07242 tgt=-0.008/0.490 pstd=0.362 capv=0.040 lr=1.0e-03 gen=0.5s train=2.9s
+[t= 105.2s] greedy ep 33 games=  96 dec= 16936 cap=0.25 cfgs= 24.4 L=0.07417 tgt=-0.005/0.523 pstd=0.395 capv=0.040 lr=1.0e-03 gen=0.7s train=2.9s
+[t= 108.3s] greedy ep 34 games=  96 dec= 17348 cap=0.31 cfgs= 24.5 L=0.07537 tgt=-0.023/0.487 pstd=0.387 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t= 111.4s] greedy ep 35 games=  96 dec= 17283 cap=0.30 cfgs= 24.5 L=0.07598 tgt=-0.045/0.487 pstd=0.350 capv=0.040 lr=1.0e-03 gen=0.1s train=3.0s
+[t= 114.6s] greedy ep 36 games=  96 dec= 18397 cap=0.38 cfgs= 23.7 L=0.07510 tgt=-0.033/0.473 pstd=0.403 capv=0.040 lr=1.0e-03 gen=0.1s train=3.1s
+[t= 117.5s] greedy ep 37 games=  96 dec= 16360 cap=0.24 cfgs= 24.5 L=0.07437 tgt=+0.022/0.527 pstd=0.385 capv=0.040 lr=1.0e-03 gen=0.1s train=2.7s
+[t= 120.6s] greedy ep 38 games=  96 dec= 18278 cap=0.34 cfgs= 23.9 L=0.07353 tgt=-0.011/0.491 pstd=0.360 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t= 123.8s] greedy ep 39 games=  96 dec= 18504 cap=0.39 cfgs= 23.7 L=0.07309 tgt=-0.017/0.451 pstd=0.396 capv=0.040 lr=1.0e-03 gen=0.1s train=3.1s
+[t= 126.7s] greedy ep 40 games=  96 dec= 16475 cap=0.25 cfgs= 24.5 L=0.07321 tgt=-0.006/0.492 pstd=0.364 capv=0.040 lr=1.0e-03 gen=0.1s train=2.7s
+[t= 129.8s] greedy ep 41 games=  96 dec= 16889 cap=0.28 cfgs= 24.4 L=0.07348 tgt=-0.005/0.491 pstd=0.385 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t= 133.1s] greedy ep 42 games=  96 dec= 18024 cap=0.34 cfgs= 22.8 L=0.07412 tgt=-0.023/0.478 pstd=0.381 capv=0.040 lr=1.0e-03 gen=0.2s train=3.1s
+[t= 136.2s] greedy ep 43 games=  96 dec= 16914 cap=0.24 cfgs= 26.4 L=0.07334 tgt=-0.000/0.487 pstd=0.349 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t= 139.2s] greedy ep 44 games=  96 dec= 17157 cap=0.29 cfgs= 23.6 L=0.07436 tgt=-0.003/0.491 pstd=0.357 capv=0.040 lr=1.0e-03 gen=0.1s train=2.8s
+[t= 142.0s] greedy ep 45 games=  96 dec= 16184 cap=0.22 cfgs= 27.3 L=0.07491 tgt=-0.025/0.501 pstd=0.367 capv=0.040 lr=1.0e-03 gen=0.1s train=2.7s
+[t= 144.9s] greedy ep 46 games=  96 dec= 16816 cap=0.27 cfgs= 24.4 L=0.07633 tgt=-0.017/0.501 pstd=0.382 capv=0.040 lr=1.0e-03 gen=0.1s train=2.7s
+[t= 148.0s] greedy ep 47 games=  96 dec= 18804 cap=0.43 cfgs= 22.1 L=0.07448 tgt=-0.042/0.460 pstd=0.332 capv=0.040 lr=1.0e-03 gen=0.1s train=3.0s
+[t= 150.9s] greedy ep 48 games=  96 dec= 17181 cap=0.30 cfgs= 24.2 L=0.07439 tgt=-0.011/0.488 pstd=0.361 capv=0.040 lr=1.0e-03 gen=0.1s train=2.7s
+[t= 153.7s] greedy ep 49 games=  96 dec= 16830 cap=0.29 cfgs= 24.6 L=0.07406 tgt=-0.016/0.500 pstd=0.341 capv=0.040 lr=1.0e-03 gen=0.1s train=2.7s
+[t= 156.7s] greedy ep 50 games=  96 dec= 17518 cap=0.32 cfgs= 23.1 L=0.07598 tgt=-0.037/0.507 pstd=0.339 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t= 159.8s] greedy ep 51 games=  96 dec= 16799 cap=0.26 cfgs= 27.1 L=0.07681 tgt=-0.014/0.504 pstd=0.342 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t= 163.1s] greedy ep 52 games=  96 dec= 18478 cap=0.36 cfgs= 23.5 L=0.07702 tgt=-0.049/0.462 pstd=0.392 capv=0.040 lr=1.0e-03 gen=0.1s train=3.1s
+[t= 167.7s] greedy ep 53 games=  96 dec= 16933 cap=0.27 cfgs= 28.0 L=0.07596 tgt=-0.010/0.478 pstd=0.388 capv=0.040 lr=1.0e-03 gen=1.7s train=2.9s
+[t= 171.0s] greedy ep 54 games=  96 dec= 17796 cap=0.30 cfgs= 23.2 L=0.07679 tgt=-0.018/0.476 pstd=0.373 capv=0.040 lr=1.0e-03 gen=0.2s train=3.0s
+[t= 174.2s] greedy ep 55 games=  96 dec= 18180 cap=0.39 cfgs= 23.1 L=0.07616 tgt=-0.022/0.450 pstd=0.350 capv=0.040 lr=1.0e-03 gen=0.1s train=3.1s
+[t= 177.4s] greedy ep 56 games=  96 dec= 17383 cap=0.32 cfgs= 24.7 L=0.07610 tgt=+0.012/0.464 pstd=0.329 capv=0.040 lr=1.0e-03 gen=0.1s train=3.0s
+[t= 180.6s] greedy ep 57 games=  96 dec= 17337 cap=0.32 cfgs= 25.1 L=0.07677 tgt=-0.050/0.475 pstd=0.362 capv=0.040 lr=1.0e-03 gen=0.2s train=3.0s
+[t= 183.8s] greedy ep 58 games=  96 dec= 18046 cap=0.32 cfgs= 23.9 L=0.07744 tgt=-0.015/0.463 pstd=0.359 capv=0.040 lr=1.0e-03 gen=0.1s train=3.0s
+[t= 186.8s] greedy ep 59 games=  96 dec= 18167 cap=0.38 cfgs= 23.0 L=0.07715 tgt=-0.018/0.465 pstd=0.386 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t= 189.9s] greedy ep 60 games=  96 dec= 17610 cap=0.31 cfgs= 25.2 L=0.07722 tgt=-0.008/0.485 pstd=0.375 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t= 193.0s] greedy ep 61 games=  96 dec= 16858 cap=0.27 cfgs= 24.4 L=0.07806 tgt=-0.010/0.504 pstd=0.380 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t= 196.1s] greedy ep 62 games=  96 dec= 17892 cap=0.36 cfgs= 23.1 L=0.07669 tgt=-0.023/0.475 pstd=0.329 capv=0.040 lr=1.0e-03 gen=0.1s train=3.0s
+[t= 198.9s] greedy ep 63 games=  96 dec= 16272 cap=0.22 cfgs= 26.0 L=0.07672 tgt=-0.027/0.521 pstd=0.364 capv=0.040 lr=1.0e-03 gen=0.1s train=2.6s
+[t= 202.0s] greedy ep 64 games=  96 dec= 17413 cap=0.28 cfgs= 24.5 L=0.07766 tgt=-0.045/0.481 pstd=0.373 capv=0.040 lr=1.0e-03 gen=0.1s train=3.0s
+[t= 205.4s] greedy ep 65 games=  96 dec= 17167 cap=0.29 cfgs= 25.8 L=0.07762 tgt=+0.005/0.487 pstd=0.360 capv=0.040 lr=1.0e-03 gen=0.4s train=3.0s
+[t= 208.6s] greedy ep 66 games=  96 dec= 18148 cap=0.40 cfgs= 23.3 L=0.07853 tgt=-0.023/0.464 pstd=0.355 capv=0.040 lr=1.0e-03 gen=0.1s train=3.0s
+[t= 212.6s] greedy ep 67 games=  96 dec= 17062 cap=0.27 cfgs= 25.6 L=0.07988 tgt=-0.047/0.478 pstd=0.342 capv=0.040 lr=1.0e-03 gen=1.2s train=2.7s
+[t= 215.6s] greedy ep 68 games=  96 dec= 17124 cap=0.28 cfgs= 24.5 L=0.07944 tgt=-0.021/0.470 pstd=0.352 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t= 218.7s] greedy ep 69 games=  96 dec= 17276 cap=0.28 cfgs= 23.7 L=0.08096 tgt=-0.029/0.511 pstd=0.345 capv=0.040 lr=1.0e-03 gen=0.1s train=3.0s
+[t= 221.8s] greedy ep 70 games=  96 dec= 17274 cap=0.30 cfgs= 25.4 L=0.07954 tgt=+0.008/0.464 pstd=0.355 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t= 224.8s] greedy ep 71 games=  96 dec= 17037 cap=0.26 cfgs= 25.0 L=0.08091 tgt=+0.001/0.486 pstd=0.353 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t= 227.7s] greedy ep 72 games=  96 dec= 16698 cap=0.24 cfgs= 23.7 L=0.08156 tgt=+0.019/0.497 pstd=0.359 capv=0.040 lr=1.0e-03 gen=0.1s train=2.8s
+[t= 230.7s] greedy ep 73 games=  96 dec= 16980 cap=0.28 cfgs= 24.4 L=0.08074 tgt=-0.018/0.495 pstd=0.365 capv=0.040 lr=1.0e-03 gen=0.1s train=2.8s
+[t= 233.7s] greedy ep 74 games=  96 dec= 17033 cap=0.28 cfgs= 23.4 L=0.08236 tgt=-0.030/0.492 pstd=0.335 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t= 236.7s] greedy ep 75 games=  96 dec= 17088 cap=0.25 cfgs= 24.6 L=0.08467 tgt=-0.029/0.494 pstd=0.341 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t= 239.8s] greedy ep 76 games=  96 dec= 17130 cap=0.30 cfgs= 24.2 L=0.08276 tgt=+0.002/0.479 pstd=0.367 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t= 242.9s] greedy ep 77 games=  96 dec= 17710 cap=0.33 cfgs= 23.7 L=0.08368 tgt=-0.037/0.469 pstd=0.350 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t= 245.7s] greedy ep 78 games=  96 dec= 16583 cap=0.22 cfgs= 25.1 L=0.08426 tgt=-0.036/0.528 pstd=0.358 capv=0.040 lr=1.0e-03 gen=0.1s train=2.7s
+[t= 248.7s] greedy ep 79 games=  96 dec= 16523 cap=0.26 cfgs= 26.2 L=0.08394 tgt=-0.008/0.479 pstd=0.342 capv=0.040 lr=1.0e-03 gen=0.1s train=2.8s
+[t= 251.6s] greedy ep 80 games=  96 dec= 16916 cap=0.29 cfgs= 25.2 L=0.08387 tgt=+0.011/0.479 pstd=0.347 capv=0.040 lr=1.0e-03 gen=0.1s train=2.8s
+[t= 254.8s] greedy ep 81 games=  96 dec= 17783 cap=0.28 cfgs= 25.1 L=0.08496 tgt=-0.002/0.478 pstd=0.366 capv=0.040 lr=1.0e-03 gen=0.1s train=3.0s
+[t= 258.1s] greedy ep 82 games=  96 dec= 18124 cap=0.36 cfgs= 23.6 L=0.08349 tgt=-0.011/0.448 pstd=0.363 capv=0.040 lr=1.0e-03 gen=0.1s train=3.2s
+[t= 261.1s] greedy ep 83 games=  96 dec= 16736 cap=0.29 cfgs= 25.5 L=0.08382 tgt=-0.022/0.510 pstd=0.363 capv=0.040 lr=1.0e-03 gen=0.1s train=2.8s
+[t= 264.3s] greedy ep 84 games=  96 dec= 17615 cap=0.31 cfgs= 23.0 L=0.08354 tgt=-0.004/0.464 pstd=0.349 capv=0.040 lr=1.0e-03 gen=0.1s train=3.0s
+[t= 267.4s] greedy ep 85 games=  96 dec= 17462 cap=0.34 cfgs= 24.6 L=0.08334 tgt=-0.024/0.481 pstd=0.361 capv=0.040 lr=1.0e-03 gen=0.1s train=3.0s
+[t= 270.4s] greedy ep 86 games=  96 dec= 16745 cap=0.24 cfgs= 25.5 L=0.08339 tgt=-0.036/0.516 pstd=0.350 capv=0.040 lr=1.0e-03 gen=0.1s train=2.8s
+[t= 273.5s] greedy ep 87 games=  96 dec= 17391 cap=0.30 cfgs= 23.9 L=0.08352 tgt=-0.005/0.486 pstd=0.336 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t= 276.6s] greedy ep 88 games=  96 dec= 17583 cap=0.30 cfgs= 24.2 L=0.08387 tgt=-0.028/0.487 pstd=0.344 capv=0.040 lr=1.0e-03 gen=0.1s train=3.0s
+[t= 279.9s] greedy ep 89 games=  96 dec= 18058 cap=0.35 cfgs= 24.6 L=0.08290 tgt=-0.045/0.474 pstd=0.324 capv=0.040 lr=1.0e-03 gen=0.1s train=3.1s
+[t= 283.0s] greedy ep 90 games=  96 dec= 17264 cap=0.32 cfgs= 24.7 L=0.08287 tgt=-0.016/0.493 pstd=0.370 capv=0.040 lr=1.0e-03 gen=0.1s train=2.9s
+[t= 288.2s] greedy ep 91 games=  96 dec= 17287 cap=0.27 cfgs= 23.9 L=0.08306 tgt=-0.014/0.501 pstd=0.337 capv=0.040 lr=1.0e-03 gen=2.1s train=3.0s
+[t= 291.4s] greedy ep 92 games=  96 dec= 17645 cap=0.32 cfgs= 23.9 L=0.08326 tgt=-0.018/0.491 pstd=0.348 capv=0.040 lr=1.0e-03 gen=0.1s train=3.0s
+[t= 294.4s] greedy ep 93 games=  96 dec= 16731 cap=0.27 cfgs= 24.1 L=0.08407 tgt=-0.027/0.484 pstd=0.351 capv=0.040 lr=1.0e-03 gen=0.1s train=2.8s
+[t= 297.4s] greedy ep 94 games=  96 dec= 17489 cap=0.31 cfgs= 25.1 L=0.08296 tgt=-0.016/0.462 pstd=0.374 capv=0.040 lr=1.0e-03 gen=0.1s train=2.8s
+[t= 300.3s] greedy ep 95 games=  96 dec= 17407 cap=0.28 cfgs= 25.7 L=0.08341 tgt=-0.017/0.499 pstd=0.353 capv=0.040 lr=1.0e-03 gen=0.1s train=2.8s
+[t= 300.3s] --- snapshot snap_00.pt (init) ---
+[t= 300.3s] --- switching to ReBeL ---
+[t= 369.0s] rebel  ep 96 games=  48 dec=  5773 cap=0.04 cfgs= 20.4 L=0.02669 tgt=-0.035/0.406 pstd=0.311 capv=0.040 lr=1.0e-03 gen=68.2s train=0.4s
+[t= 444.4s] rebel  ep 97 games=  48 dec=  5417 cap=0.02 cfgs= 23.3 L=0.01755 tgt=-0.062/0.457 pstd=0.318 capv=0.040 lr=1.0e-03 gen=75.0s train=0.4s
+[t= 514.6s] rebel  ep 98 games=  48 dec=  4999 cap=0.02 cfgs= 24.7 L=0.01687 tgt=-0.143/0.458 pstd=0.314 capv=0.039 lr=1.0e-03 gen=69.8s train=0.4s
+[t= 584.7s] rebel  ep 99 games=  48 dec=  4638 cap=0.00 cfgs= 25.2 L=0.01501 tgt=-0.090/0.476 pstd=0.314 capv=0.039 lr=1.0e-03 gen=69.7s train=0.4s
+[t= 653.5s] rebel  ep100 games=  48 dec=  4324 cap=0.02 cfgs= 26.6 L=0.01565 tgt=-0.110/0.486 pstd=0.323 capv=0.038 lr=1.0e-03 gen=68.4s train=0.3s
+[t= 730.7s] rebel  ep101 games=  48 dec=  5087 cap=0.00 cfgs= 25.7 L=0.01384 tgt=-0.139/0.507 pstd=0.328 capv=0.038 lr=1.0e-03 gen=76.8s train=0.4s
+[t= 796.5s] rebel  ep102 games=  48 dec=  4587 cap=0.02 cfgs= 20.5 L=0.01385 tgt=-0.011/0.450 pstd=0.325 capv=0.037 lr=1.0e-03 gen=65.4s train=0.4s
+[t= 860.3s] rebel  ep103 games=  48 dec=  4487 cap=0.02 cfgs= 19.2 L=0.01365 tgt=+0.008/0.450 pstd=0.317 capv=0.037 lr=1.0e-03 gen=63.5s train=0.3s
+[t= 924.6s] rebel  ep104 games=  48 dec=  4213 cap=0.00 cfgs= 24.5 L=0.01389 tgt=-0.115/0.497 pstd=0.318 capv=0.036 lr=1.0e-03 gen=64.0s train=0.3s
+[t= 995.3s] rebel  ep105 games=  48 dec=  4532 cap=0.02 cfgs= 25.3 L=0.01276 tgt=-0.093/0.479 pstd=0.325 capv=0.036 lr=1.0e-03 gen=70.3s train=0.4s
+[t=1063.1s] rebel  ep106 games=  48 dec=  4673 cap=0.04 cfgs= 24.6 L=0.01209 tgt=-0.198/0.546 pstd=0.323 capv=0.036 lr=1.0e-03 gen=67.4s train=0.4s
+[t=1124.9s] rebel  ep107 games=  48 dec=  3990 cap=0.00 cfgs= 23.2 L=0.01346 tgt=-0.111/0.439 pstd=0.326 capv=0.035 lr=1.0e-03 gen=61.4s train=0.3s
+[t=1185.1s] rebel  ep108 games=  48 dec=  4032 cap=0.00 cfgs= 21.5 L=0.01206 tgt=-0.095/0.516 pstd=0.325 capv=0.035 lr=1.0e-03 gen=59.9s train=0.3s
+[t=1257.6s] rebel  ep109 games=  48 dec=  4718 cap=0.02 cfgs= 20.8 L=0.01292 tgt=-0.100/0.508 pstd=0.328 capv=0.034 lr=1.0e-03 gen=72.1s train=0.3s
+[t=1331.4s] rebel  ep110 games=  48 dec=  4431 cap=0.02 cfgs= 23.4 L=0.01210 tgt=-0.125/0.531 pstd=0.326 capv=0.034 lr=1.0e-03 gen=73.4s train=0.3s
+[t=1403.1s] rebel  ep111 games=  48 dec=  4290 cap=0.02 cfgs= 20.9 L=0.01251 tgt=-0.098/0.506 pstd=0.324 capv=0.034 lr=1.0e-03 gen=71.4s train=0.3s
+[t=1475.7s] rebel  ep112 games=  48 dec=  4950 cap=0.02 cfgs= 18.6 L=0.01332 tgt=-0.081/0.462 pstd=0.311 capv=0.033 lr=1.0e-03 gen=72.2s train=0.4s
+[t=1554.1s] rebel  ep113 games=  48 dec=  4321 cap=0.00 cfgs= 22.6 L=0.01242 tgt=-0.071/0.493 pstd=0.316 capv=0.033 lr=1.0e-03 gen=78.1s train=0.3s
+[t=1625.7s] rebel  ep114 games=  48 dec=  4344 cap=0.00 cfgs= 19.2 L=0.01394 tgt=-0.052/0.456 pstd=0.319 capv=0.032 lr=1.0e-03 gen=71.2s train=0.3s
+[t=1696.0s] rebel  ep115 games=  48 dec=  4227 cap=0.02 cfgs= 20.8 L=0.01268 tgt=-0.108/0.475 pstd=0.321 capv=0.032 lr=1.0e-03 gen=69.9s train=0.3s
+[t=1769.5s] rebel  ep116 games=  48 dec=  4272 cap=0.02 cfgs= 21.4 L=0.01353 tgt=-0.069/0.451 pstd=0.320 capv=0.031 lr=1.0e-03 gen=73.2s train=0.3s
+[t=1846.0s] rebel  ep117 games=  48 dec=  4493 cap=0.02 cfgs= 22.7 L=0.01299 tgt=-0.158/0.525 pstd=0.323 capv=0.031 lr=1.0e-03 gen=76.2s train=0.3s
+[t=1918.5s] rebel  ep118 games=  48 dec=  3960 cap=0.00 cfgs= 22.9 L=0.01266 tgt=-0.125/0.492 pstd=0.322 capv=0.030 lr=1.0e-03 gen=72.2s train=0.3s
+[t=1989.6s] rebel  ep119 games=  48 dec=  4408 cap=0.02 cfgs= 21.3 L=0.01327 tgt=-0.102/0.509 pstd=0.324 capv=0.030 lr=1.0e-03 gen=70.7s train=0.3s
+[t=2062.6s] rebel  ep120 games=  48 dec=  4499 cap=0.00 cfgs= 21.2 L=0.01235 tgt=-0.096/0.462 pstd=0.325 capv=0.029 lr=1.0e-03 gen=72.6s train=0.3s
+[t=2132.8s] rebel  ep121 games=  48 dec=  4370 cap=0.02 cfgs= 20.5 L=0.01283 tgt=-0.099/0.490 pstd=0.327 capv=0.029 lr=1.0e-03 gen=69.8s train=0.3s
+[t=2202.3s] rebel  ep122 games=  48 dec=  3976 cap=0.00 cfgs= 24.2 L=0.01250 tgt=-0.120/0.532 pstd=0.329 capv=0.028 lr=1.0e-03 gen=69.2s train=0.3s
+[t=2267.3s] rebel  ep123 games=  48 dec=  4065 cap=0.00 cfgs= 20.2 L=0.01195 tgt=-0.083/0.481 pstd=0.321 capv=0.028 lr=1.0e-03 gen=64.7s train=0.3s
+[t=2336.1s] rebel  ep124 games=  48 dec=  4343 cap=0.00 cfgs= 19.0 L=0.01258 tgt=-0.078/0.478 pstd=0.320 capv=0.028 lr=1.0e-03 gen=68.5s train=0.3s
+[t=2408.0s] rebel  ep125 games=  48 dec=  4110 cap=0.00 cfgs= 21.0 L=0.01322 tgt=-0.108/0.471 pstd=0.324 capv=0.027 lr=1.0e-03 gen=71.5s train=0.3s
+[t=2482.0s] rebel  ep126 games=  48 dec=  4592 cap=0.04 cfgs= 18.1 L=0.01201 tgt=-0.023/0.474 pstd=0.317 capv=0.027 lr=1.0e-03 gen=73.6s train=0.3s
+[t=2555.8s] rebel  ep127 games=  48 dec=  4781 cap=0.02 cfgs= 18.8 L=0.01336 tgt=-0.047/0.426 pstd=0.313 capv=0.026 lr=1.0e-03 gen=73.5s train=0.3s
+[t=2618.7s] rebel  ep128 games=  48 dec=  4070 cap=0.02 cfgs= 18.7 L=0.01375 tgt=-0.097/0.461 pstd=0.321 capv=0.026 lr=1.0e-03 gen=62.6s train=0.3s
+[t=2681.0s] rebel  ep129 games=  48 dec=  4130 cap=0.02 cfgs= 19.1 L=0.01328 tgt=-0.051/0.451 pstd=0.318 capv=0.025 lr=1.0e-03 gen=61.9s train=0.3s
+[t=2755.6s] rebel  ep130 games=  48 dec=  4511 cap=0.00 cfgs= 19.2 L=0.01309 tgt=-0.012/0.446 pstd=0.317 capv=0.025 lr=1.0e-03 gen=74.3s train=0.3s
+[t=2825.9s] rebel  ep131 games=  48 dec=  4463 cap=0.00 cfgs= 18.6 L=0.01375 tgt=-0.075/0.504 pstd=0.318 capv=0.025 lr=1.0e-03 gen=70.0s train=0.3s
+[t=2900.3s] rebel  ep132 games=  48 dec=  4566 cap=0.04 cfgs= 20.2 L=0.01319 tgt=-0.098/0.565 pstd=0.316 capv=0.024 lr=1.0e-03 gen=74.0s train=0.3s
+[t=2976.5s] rebel  ep133 games=  48 dec=  4042 cap=0.00 cfgs= 23.6 L=0.01337 tgt=-0.098/0.484 pstd=0.319 capv=0.024 lr=1.0e-03 gen=75.8s train=0.3s
+[t=3048.3s] rebel  ep134 games=  48 dec=  4310 cap=0.02 cfgs= 20.9 L=0.01311 tgt=-0.077/0.440 pstd=0.323 capv=0.023 lr=1.0e-03 gen=71.5s train=0.3s
+[t=3114.5s] rebel  ep135 games=  48 dec=  4560 cap=0.00 cfgs= 17.2 L=0.01229 tgt=-0.049/0.455 pstd=0.319 capv=0.023 lr=1.0e-03 gen=65.9s train=0.3s
+[t=3185.8s] rebel  ep136 games=  48 dec=  4245 cap=0.00 cfgs= 19.6 L=0.01245 tgt=-0.081/0.498 pstd=0.326 capv=0.022 lr=1.0e-03 gen=71.0s train=0.3s
+[t=3250.9s] rebel  ep137 games=  48 dec=  4230 cap=0.02 cfgs= 17.5 L=0.01194 tgt=-0.032/0.490 pstd=0.322 capv=0.022 lr=1.0e-03 gen=64.8s train=0.3s
+[t=3320.5s] rebel  ep138 games=  48 dec=  3859 cap=0.00 cfgs= 22.0 L=0.01273 tgt=-0.108/0.492 pstd=0.322 capv=0.021 lr=1.0e-03 gen=69.3s train=0.3s
+[t=3389.8s] rebel  ep139 games=  48 dec=  4268 cap=0.00 cfgs= 20.2 L=0.01183 tgt=-0.054/0.499 pstd=0.325 capv=0.021 lr=1.0e-03 gen=68.9s train=0.3s
+[t=3458.7s] rebel  ep140 games=  48 dec=  4316 cap=0.02 cfgs= 18.9 L=0.01242 tgt=-0.053/0.487 pstd=0.328 capv=0.021 lr=1.0e-03 gen=68.6s train=0.3s
+[t=3531.9s] rebel  ep141 games=  48 dec=  4272 cap=0.02 cfgs= 20.2 L=0.01195 tgt=-0.079/0.520 pstd=0.327 capv=0.020 lr=1.0e-03 gen=72.9s train=0.3s
+[t=3599.3s] rebel  ep142 games=  48 dec=  4107 cap=0.00 cfgs= 21.1 L=0.01235 tgt=-0.113/0.503 pstd=0.324 capv=0.020 lr=1.0e-03 gen=67.1s train=0.3s
+[t=3673.6s] rebel  ep143 games=  48 dec=  4220 cap=0.00 cfgs= 21.7 L=0.01220 tgt=-0.114/0.514 pstd=0.324 capv=0.019 lr=1.0e-03 gen=73.9s train=0.3s
+[t=3745.0s] rebel  ep144 games=  48 dec=  4433 cap=0.00 cfgs= 20.2 L=0.01151 tgt=-0.057/0.494 pstd=0.323 capv=0.019 lr=1.0e-03 gen=71.1s train=0.3s
+[t=3812.4s] rebel  ep145 games=  48 dec=  4686 cap=0.04 cfgs= 16.9 L=0.01155 tgt=-0.048/0.479 pstd=0.323 capv=0.018 lr=1.0e-03 gen=67.2s train=0.3s
+[t=3878.9s] rebel  ep146 games=  48 dec=  4190 cap=0.02 cfgs= 17.4 L=0.01157 tgt=-0.038/0.482 pstd=0.316 capv=0.018 lr=1.0e-03 gen=66.1s train=0.3s
+[t=3947.9s] --- snapshot snap_01.pt (s1) ---
+[t=3947.9s] rebel  ep147 games=  48 dec=  4232 cap=0.00 cfgs= 21.1 L=0.01194 tgt=-0.105/0.490 pstd=0.322 capv=0.017 lr=1.0e-03 gen=68.8s train=0.3s
+[t=4020.3s] rebel  ep148 games=  48 dec=  4170 cap=0.00 cfgs= 21.4 L=0.01236 tgt=-0.036/0.456 pstd=0.326 capv=0.017 lr=1.0e-03 gen=72.1s train=0.3s
+[t=4089.1s] rebel  ep149 games=  48 dec=  4379 cap=0.02 cfgs= 19.1 L=0.01198 tgt=-0.036/0.487 pstd=0.327 capv=0.017 lr=1.0e-03 gen=68.4s train=0.3s
+[t=4155.8s] rebel  ep150 games=  48 dec=  4391 cap=0.00 cfgs= 19.4 L=0.01304 tgt=-0.053/0.458 pstd=0.323 capv=0.016 lr=1.0e-03 gen=66.3s train=0.3s
+[t=4224.2s] rebel  ep151 games=  48 dec=  3941 cap=0.00 cfgs= 20.6 L=0.01192 tgt=-0.086/0.497 pstd=0.321 capv=0.016 lr=1.0e-03 gen=68.1s train=0.3s
+[t=4284.1s] rebel  ep152 games=  48 dec=  4078 cap=0.00 cfgs= 18.6 L=0.01207 tgt=-0.058/0.500 pstd=0.324 capv=0.015 lr=1.0e-03 gen=59.6s train=0.3s
+[t=4348.8s] rebel  ep153 games=  48 dec=  4406 cap=0.02 cfgs= 17.1 L=0.01174 tgt=+0.006/0.438 pstd=0.325 capv=0.015 lr=1.0e-03 gen=64.3s train=0.3s
+[t=4419.3s] rebel  ep154 games=  48 dec=  4768 cap=0.00 cfgs= 17.3 L=0.01295 tgt=-0.012/0.457 pstd=0.327 capv=0.015 lr=1.0e-03 gen=70.2s train=0.3s
+[t=4491.2s] rebel  ep155 games=  48 dec=  4671 cap=0.00 cfgs= 16.3 L=0.01352 tgt=+0.008/0.466 pstd=0.315 capv=0.014 lr=1.0e-03 gen=71.6s train=0.3s
+[t=4556.9s] rebel  ep156 games=  48 dec=  4499 cap=0.00 cfgs= 17.2 L=0.01257 tgt=-0.056/0.457 pstd=0.323 capv=0.014 lr=1.0e-03 gen=65.4s train=0.3s
+[t=4623.6s] rebel  ep157 games=  48 dec=  4108 cap=0.00 cfgs= 18.9 L=0.01221 tgt=-0.025/0.475 pstd=0.328 capv=0.013 lr=1.0e-03 gen=66.3s train=0.3s
+[t=4685.6s] rebel  ep158 games=  48 dec=  3954 cap=0.00 cfgs= 18.7 L=0.01244 tgt=-0.090/0.490 pstd=0.315 capv=0.013 lr=1.0e-03 gen=61.7s train=0.3s
+[t=4754.3s] rebel  ep159 games=  48 dec=  4469 cap=0.00 cfgs= 18.9 L=0.01256 tgt=-0.082/0.473 pstd=0.318 capv=0.012 lr=1.0e-03 gen=68.4s train=0.3s
+[t=4817.8s] rebel  ep160 games=  48 dec=  4399 cap=0.00 cfgs= 15.7 L=0.01248 tgt=-0.032/0.454 pstd=0.329 capv=0.012 lr=1.0e-03 gen=63.1s train=0.3s
+[t=4880.3s] rebel  ep161 games=  48 dec=  4126 cap=0.00 cfgs= 17.9 L=0.01276 tgt=-0.053/0.495 pstd=0.332 capv=0.012 lr=1.0e-03 gen=62.2s train=0.3s
+[t=4951.0s] rebel  ep162 games=  48 dec=  4360 cap=0.00 cfgs= 18.8 L=0.01251 tgt=-0.039/0.482 pstd=0.324 capv=0.011 lr=1.0e-03 gen=70.4s train=0.3s
+[t=5018.6s] rebel  ep163 games=  48 dec=  4337 cap=0.00 cfgs= 20.0 L=0.01247 tgt=-0.117/0.524 pstd=0.318 capv=0.011 lr=1.0e-03 gen=67.3s train=0.3s
+[t=5082.5s] rebel  ep164 games=  48 dec=  4209 cap=0.00 cfgs= 15.9 L=0.01348 tgt=-0.011/0.442 pstd=0.319 capv=0.010 lr=1.0e-03 gen=63.6s train=0.3s
+[t=5147.2s] rebel  ep165 games=  48 dec=  4219 cap=0.00 cfgs= 17.1 L=0.01282 tgt=-0.059/0.450 pstd=0.312 capv=0.010 lr=1.0e-03 gen=64.4s train=0.3s
+[t=5209.0s] rebel  ep166 games=  48 dec=  3959 cap=0.00 cfgs= 19.6 L=0.01270 tgt=-0.077/0.487 pstd=0.308 capv=0.010 lr=1.0e-03 gen=61.5s train=0.3s
+[t=5270.1s] rebel  ep167 games=  48 dec=  4019 cap=0.00 cfgs= 17.9 L=0.01277 tgt=-0.008/0.402 pstd=0.313 capv=0.009 lr=1.0e-03 gen=60.8s train=0.3s
+[t=5334.3s] rebel  ep168 games=  48 dec=  4180 cap=0.00 cfgs= 18.7 L=0.01300 tgt=-0.069/0.467 pstd=0.316 capv=0.009 lr=1.0e-03 gen=64.0s train=0.3s
+thread '<unnamed>' panicked at src/selfplay.rs:425:21:
+walk desync: post-draw support does not match the game belief
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+Traceback (most recent call last):
+  File "/Users/filip/Code/warchest-engine/train/train.py", line 548, in <module>
+    main()
+  File "/Users/filip/Code/warchest-engine/train/train.py", line 439, in main
+    d = warchest.gen_data(args.rebel_games, args.seed * 1_000_003 + epoch, "rebel",
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+pyo3_runtime.PanicException: walk desync: post-draw support does not match the game belief

@@ -1,6 +1,11 @@
-"""Play a run's snapshots against each other and turn the results into Elo.
+"""Play one or more runs' snapshots against each other and turn the results into Elo.
 
     python train/ladder.py runs/mine --games 60
+    python train/ladder.py runs/a runs/b --games 100 --iters 64
+
+With several run directories the snapshots are entered as `run.label` so the
+runs' overlapping labels (`init`, `s1`, ...) do not collide, each run's
+checkpoints go into their own slots, and Random and Greedy appear once.
 
 A training run saves the network every few minutes and does not judge the
 snapshots while it is running. This plays a full round robin between them --
@@ -86,32 +91,40 @@ def elo_stderr(n, elo):
     return out
 
 
-def players_of(run):
-    """The ladder's entrants: Random, Greedy, then the run's snapshots in order.
+def players_of(runs):
+    """The ladder's entrants: Random, Greedy, then each run's snapshots.
 
     Random first because it is the fixed zero of the scale; Greedy second
     because it is the other fixed reference. Both are pure functions of the
     rules, so a rating measured here is comparable to one measured in any other
-    run.
+    run. Every run's snapshots follow, named `run.label` and loaded into their
+    own slots, so a combined ladder over several runs keeps each checkpoint's
+    provenance.
     """
-    with open(f"{run}/log.json") as f:
-        log = json.load(f)
-    ps = [{"name": "random", "agent": "random", "slot": 0, "t": None},
-          {"name": "greedy", "agent": "greedy", "slot": 0, "t": None}]
-    for i, s in enumerate(log.get("snapshots", [])):
-        ps.append({"name": s["label"], "agent": "rebel", "slot": i,
-                   "t": s["t"], "file": s["file"]})
+    ps = [{"name": "random", "agent": "random", "slot": 0, "t": None, "run": None},
+          {"name": "greedy", "agent": "greedy", "slot": 0, "t": None, "run": None}]
+    for run in runs:
+        tag = os.path.basename(run.rstrip("/"))
+        with open(f"{run}/log.json") as f:
+            log = json.load(f)
+        for s in log.get("snapshots", []):
+            ps.append({"name": f"{tag}.{s['label']}", "agent": "rebel",
+                       "slot": len(ps), "t": s["t"], "file": s["file"],
+                       "run": run})
     return ps
 
 
-def run(out, games=60, depth=2, iters=64, temp=2.0, random_draft=False, seed=7):
+def run(runs, out=None, games=60, depth=2, iters=64, temp=2.0,
+        random_draft=False, seed=7):
     """Round robin, Elo fit, `ladder.json`, printed table. Returns the ratings."""
-    ps = players_of(out)
+    if out is None:
+        out = runs[0]
+    ps = players_of(runs)
     nets = [p for p in ps if p["agent"] == "rebel"]
     if not nets:
-        raise SystemExit(f"{out}: no snapshots in log.json")
+        raise SystemExit(f"{runs}: no snapshots in log.json")
     for p in nets:
-        load(f"{out}/{p['file']}").push(p["slot"])
+        load(f"{p['run']}/{p['file']}").push(p["slot"])
     # Always the real game: the horizon's marker payoff is a training aid, and
     # scoring on it would rank whoever exploits it best.
     warchest.set_cap_value(0.0)
@@ -137,14 +150,15 @@ def run(out, games=60, depth=2, iters=64, temp=2.0, random_draft=False, seed=7):
         sc[i][j], sc[j][i] = w + 0.5 * d, l + 0.5 * d
         pairs.append({"a": a["name"], "b": b["name"], "w": w, "l": l, "d": d,
                       "score": round((w + 0.5 * d) / max(w + l + d, 1), 3)})
-        print(f"  {a['name']:>8s} vs {b['name']:<8s} W{w:4d} L{l:4d} D{d:4d}  "
+        print(f"  {a['name']:>28s} vs {b['name']:<28s} W{w:4d} L{l:4d} D{d:4d}  "
               f"score {pairs[-1]['score']:.3f}", flush=True)
 
     npr = n + PRIOR * (1 - np.eye(k)) * (n > 0)
     spr = sc + 0.5 * PRIOR * (1 - np.eye(k)) * (n > 0)
     elo = fit_elo(npr, spr)
     se = elo_stderr(n, elo)
-    res = {"games_per_pair": games, "depth": depth, "iters": iters,
+    res = {"runs": list(runs), "games_per_pair": games, "depth": depth,
+           "iters": iters,
            "players": [{"name": p["name"], "t": p["t"], "elo": round(float(e), 1),
                         "se": round(float(s), 1),
                         "score": round(float(sc[i].sum() / max(n[i].sum(), 1)), 3)}
@@ -154,17 +168,19 @@ def run(out, games=60, depth=2, iters=64, temp=2.0, random_draft=False, seed=7):
         json.dump(res, f, indent=1)
 
     print(f"\n=== Elo ({out}, random = 0) ===", flush=True)
-    print(f"{'player':>10s} {'trained':>9s} {'elo':>7s} {'+-':>5s} {'score':>7s}", flush=True)
+    print(f"{'player':>28s} {'trained':>9s} {'elo':>7s} {'+-':>5s} {'score':>7s}", flush=True)
     for p in sorted(res["players"], key=lambda p: -p["elo"]):
         tm = f"{p['t'] / 60:.1f}min" if p["t"] is not None else "-"
-        print(f"{p['name']:>10s} {tm:>9s} {p['elo']:>7.0f} {p['se']:>5.0f} "
+        print(f"{p['name']:>28s} {tm:>9s} {p['elo']:>7.0f} {p['se']:>5.0f} "
               f"{p['score']:>7.3f}", flush=True)
     return res
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("out", help="run directory")
+    ap.add_argument("out", nargs="+", help="one or more run directories")
+    ap.add_argument("--out", dest="dest", default=None,
+                    help="where to write ladder.json (default: the first run directory)")
     ap.add_argument("--games", type=int, default=60,
                     help="paired games per pairing")
     ap.add_argument("--depth", type=int, default=-1)
@@ -173,14 +189,17 @@ def main():
     ap.add_argument("--random-draft", action="store_true")
     ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args()
-    # Play at the run's own search settings unless told otherwise: a checkpoint
+    # Play at the runs' own search settings unless told otherwise: a checkpoint
     # trained at one iteration count and rated at another is a different agent.
-    with open(f"{args.out}/log.json") as f:
-        cfg = json.load(f).get("cfg", {})
-    depth = args.depth if args.depth > 0 else cfg.get("depth", 2)
-    iters = args.iters if args.iters > 0 else cfg.get("iters", 64)
-    run(args.out, games=args.games, depth=depth, iters=iters, temp=args.temp,
-        random_draft=args.random_draft or cfg.get("random_draft", False),
+    # With several runs the defaults are the strongest settings any of them
+    # used, so no run is rated below the search it trained with.
+    cfgs = [json.load(open(f"{d}/log.json")).get("cfg", {}) for d in args.out]
+    depth = args.depth if args.depth > 0 else max(c.get("depth", 2) for c in cfgs)
+    iters = args.iters if args.iters > 0 else max(c.get("iters", 64) for c in cfgs)
+    run(args.out, out=args.dest, games=args.games, depth=depth, iters=iters,
+        temp=args.temp,
+        random_draft=args.random_draft or any(c.get("random_draft", False)
+                                              for c in cfgs),
         seed=args.seed)
 
 
