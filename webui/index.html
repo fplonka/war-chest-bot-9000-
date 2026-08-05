@@ -24,14 +24,6 @@
   #boardwrap { background: var(--panel); border: 1px solid var(--line);
                border-radius: 10px; padding: 10px 12px 8px; }
   #board { width: 100%; max-width: 560px; height: auto; display: block; }
-  #boardcap { display: flex; flex-wrap: wrap; gap: 6px 16px; justify-content: center;
-              font-size: 12px; color: var(--dim); padding-top: 6px; }
-  #boardcap .you { color: #e8ebf1; }
-  #boardcap .agn { color: #9aa2b0; }
-  #boardcap .ctl { color: #d9a441; }
-  #boardcap .cap-me { color: #8fb0f0; }
-  #boardcap .cap-them { color: #e08a80; }
-  #boardcap .cap-neu { color: #7a86a3; }
   #side { flex: 1; min-width: 300px; max-width: 460px; display: flex;
           flex-direction: column; gap: 12px; }
   .card { background: var(--panel); border: 1px solid var(--line);
@@ -81,14 +73,7 @@
   <button id="newgame">New game</button>
 </header>
 <main>
-  <section id="boardwrap"><svg id="board"></svg>
-  <div id="boardcap"><span><span class="you">●</span> you</span>
-    <span><span class="agn">●</span> agent</span>
-    <span><span class="cap-me">■ blue hex</span> you control</span>
-    <span><span class="cap-them">■ red hex</span> agent controls</span>
-    <span><span class="cap-neu">■ grey hex</span> neutral</span>
-    <span><span class="ctl">◆</span> control marker · gold number = stack count</span></div>
-</section>
+  <section id="boardwrap"><svg id="board"></svg></section>
   <section id="side">
     <div class="card">
       <h2>Your hand</h2>
@@ -146,6 +131,63 @@ const KIND_GROUP = {
   grant_control:"Granted control", rg_soak_supply:"Royal Guard defense",
   rg_soak_stack:"Royal Guard defense", draw:"Draw"};
 
+// --- presentation helpers ---
+
+// The engine's Display writes "(spend X)" on face-down plays. The human may
+// not know which coin the agent spent (Pass / Claim initiative / Recruit pay
+// face-down), so agent log lines must drop it.
+const SPEND_RE = / \(spend [^)]*\)$/;
+const cleanSpend = s => s.replace(SPEND_RE, "");
+
+// Friendlier tactic wording, e.g. "Archer 3,4=>1,4" -> "Archer shoots 3,4 → 1,4".
+// Works from the engine's label + the action kind (buttons have both; log
+// lines guess the kind from the label's wording).
+function prettyAction(kind, label) {
+  const c = label.match(/\d+,\d+/g) || [];
+  const a = c[0] || "", b = c[1] || "", t = c[2] || "";
+  const arrow = "→";
+  switch (kind) {
+    case "archer": return `Archer shoots ${a} ${arrow} ${b}`;
+    case "cavalry_move": return `Cavalry charges ${a} ${arrow} ${b}`;
+    case "cavalry_attack": return `Cavalry attacks ${a} ${arrow} ${b}`;
+    case "crossbow": return `Crossbowman shoots ${a} ${arrow} ${b}`;
+    case "ensign": return `Ensign directs ${a} ${arrow} ${b}`;
+    case "lancer": return `Lancer charges ${a} ${arrow} ${b}, attacks ${t}`;
+    case "light_cavalry": return `Light Cavalry dashes ${a} ${arrow} ${b}`;
+    case "marshal": return `Marshal orders ${a} to attack ${b}`;
+    case "royal_guard": return `Royal Guard moves ${a} ${arrow} ${b}`;
+    default: return label;
+  }
+}
+function prettyLogLine(label) {
+  let kind = null;
+  if (label.startsWith("Archer ")) kind = "archer";
+  else if (label.startsWith("Cavalry move ")) kind = "cavalry_move";
+  else if (label.startsWith("Cavalry attack ")) kind = "cavalry_attack";
+  else if (label.startsWith("Crossbow ")) kind = "crossbow";
+  else if (label.startsWith("Ensign ")) kind = "ensign";
+  else if (label.startsWith("Lancer ")) kind = "lancer";
+  else if (label.startsWith("LightCav ")) kind = "light_cavalry";
+  else if (label.startsWith("Marshal: ")) kind = "marshal";
+  else if (label.startsWith("RoyalGuard ")) kind = "royal_guard";
+  return kind ? prettyAction(kind, label) : label;
+}
+
+// The last action that actually MOVED a unit (a deploy places, it does not
+// move; an attack keeps the attacker put). Tactics that move are included.
+// Parsed from the raw engine label so the prettifier cannot interfere.
+const MOVE_LABEL_RE = /^(?:Move|Cavalry move|LightCav|Lancer|Ensign moves|RoyalGuard|Swordsman move|Berserk move|Merc move|Footman move|Granted move)\s+(\d+,\d+)->(\d+,\d+)/;
+function lastMove(state) {
+  // the most recent action that moved a unit — scans back past round-start
+  // draws so the indicator survives them
+  for (let k = state.log.length - 1; k >= 0; k--) {
+    const last = state.log[k].replace(/^(You|Agent): /, "");
+    const m = last.match(MOVE_LABEL_RE);
+    if (m) return { from: m[1], to: m[2] };
+  }
+  return null;
+}
+
 let meta = null, state = null, busy = false;
 
 const $ = id => document.getElementById(id);
@@ -181,6 +223,7 @@ function renderBoard() {
   const ns = "http://www.w3.org/2000/svg";
   const occ = new Map(state.board.map(o => [o.hex, o]));
   const markers = new Map(Object.entries(state.markers).map(([c, o]) => [geo.hex_of[c], o]));
+  const lm = lastMove(state);
   // location 0,1 = your start bases; 2,3 = agent's; 4..9 = neutral
   const locIdx = new Map(Object.entries(geo.locations).map(([li, hex]) => [hex, Number(li)]));
   const locName = li => li <= 1 ? "your start location"
@@ -213,29 +256,32 @@ function renderBoard() {
       hex.appendChild(t);
     }
     svg.appendChild(hex);
+    // faint chess-style marker of the last movement: a dot where the unit
+    // came from, a halo where it stands now (drawn under the piece)
+    if (lm) {
+      if (geo.hex_of[lm.from] === i) {
+        const dot = document.createElementNS(ns, "circle");
+        dot.setAttribute("cx", cx); dot.setAttribute("cy", cy);
+        dot.setAttribute("r", 9);
+        dot.setAttribute("fill", "rgba(140,220,140,0.4)");
+        svg.appendChild(dot);
+      }
+      if (geo.hex_of[lm.to] === i) {
+        const halo = document.createElementNS(ns, "circle");
+        halo.setAttribute("cx", cx); halo.setAttribute("cy", cy);
+        halo.setAttribute("r", 21);
+        halo.setAttribute("fill", "rgba(140,220,140,0.22)");
+        svg.appendChild(halo);
+      }
+    }
     const t = document.createElementNS(ns, "text");
     // coordinate label: centred, tucked under the hex's top edge — clear of
-    // the unit disc (centre), the marker diamond (top-right) and the stack
-    // badge (bottom-right)
+    // the unit disc (centre) and the stack badge (bottom-right)
     t.setAttribute("x", cx); t.setAttribute("y", cy - 20);
     t.setAttribute("text-anchor", "middle");
     t.setAttribute("class", "coord");
     t.textContent = `${x},${y}`;
     svg.appendChild(t);
-    // control marker: diamond at the top-right, offset if a unit stands here.
-    // White diamond = you, black diamond = agent — same colour code as pieces.
-    if (m !== undefined) {
-      const mx = cx + R * 0.55, my = cy - R * 0.6;
-      const d = document.createElementNS(ns, "polygon");
-      d.setAttribute("points",
-        `${mx},${my - 8.5} ${mx + 8.5},${my} ${mx},${my + 8.5} ${mx - 8.5},${my}`);
-      d.setAttribute("fill", m === 0 ? "#f0f0f0" : "#15181f");
-      d.setAttribute("stroke", m === 0 ? "#10131a" : "#c9ced9");
-      const t2 = document.createElementNS(ns, "title");
-      t2.textContent = "control marker: " + (m === 0 ? "you" : "agent");
-      d.appendChild(t2);
-      svg.appendChild(d);
-    }
     // unit stack
     if (occ.has(i)) {
       const o = occ.get(i);
@@ -369,17 +415,23 @@ function render() {
     for (const [g, acts] of groups) {
       html += `<div class="mgroup">${g}</div>`;
       for (const a of acts)
-        html += `<button class="move" data-code="${a.code}">${a.label}</button>`;
+        html += `<button class="move" data-code="${a.code}">${prettyAction(a.kind, a.label)}</button>`;
     }
     $("movelist").innerHTML = html;
     if (state.to_act !== state.human) $("movelist").innerHTML = "";
     for (const b of $("movelist").querySelectorAll("button.move"))
       b.onclick = () => move(b.dataset.code);
   }
-  // log
-  $("log").innerHTML = state.log.map((l, i) => {
-    const cls = l.startsWith("You") ? "me" : l.startsWith("Agent") ? "agent" : "draw";
-    return `<div class="${cls}">${l}</div>`;
+  // log: the agent's face-down spends stay hidden; tactic wording is
+  // friendlier on both sides ("Archer shoots 3,4 → 1,4")
+  $("log").innerHTML = state.log.map(l => {
+    const isAgent = l.startsWith("Agent");
+    const cls = l.startsWith("You") ? "me" : isAgent ? "agent" : "draw";
+    let text = l.replace("ClaimInitiative", "Claim initiative");
+    if (isAgent) text = cleanSpend(text);
+    const body = text.replace(/^(You|Agent): /, "");
+    const pretty = prettyLogLine(body);
+    return `<div class="${cls}">${text.replace(body, pretty)}</div>`;
   }).reverse().join("");
   renderBoard();
 }
