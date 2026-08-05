@@ -91,23 +91,28 @@ def elo_stderr(n, elo):
     return out
 
 
-def players_of(runs):
-    """The ladder's entrants: Random, Greedy, then each run's snapshots.
+def players_of(runs, refs=True, labels=None):
+    """The ladder's entrants: optionally Random and Greedy, then each run's
+    snapshots.
 
     Random first because it is the fixed zero of the scale; Greedy second
     because it is the other fixed reference. Both are pure functions of the
     rules, so a rating measured here is comparable to one measured in any other
-    run. Every run's snapshots follow, named `run.label` and loaded into their
-    own slots, so a combined ladder over several runs keeps each checkpoint's
-    provenance.
+    run (`--no-refs` skips them). Every run's snapshots follow, named
+    `run.label` and loaded into their own slots, so a combined ladder over
+    several runs keeps each checkpoint's provenance.
     """
-    ps = [{"name": "random", "agent": "random", "slot": 0, "t": None, "run": None},
-          {"name": "greedy", "agent": "greedy", "slot": 0, "t": None, "run": None}]
+    ps = []
+    if refs:
+        ps = [{"name": "random", "agent": "random", "slot": 0, "t": None, "run": None},
+              {"name": "greedy", "agent": "greedy", "slot": 0, "t": None, "run": None}]
     for run in runs:
         tag = os.path.basename(run.rstrip("/"))
         with open(f"{run}/log.json") as f:
             log = json.load(f)
         for s in log.get("snapshots", []):
+            if labels is not None and s["label"] not in labels:
+                continue
             ps.append({"name": f"{tag}.{s['label']}", "agent": "rebel",
                        "slot": len(ps), "t": s["t"], "file": s["file"],
                        "run": run})
@@ -115,11 +120,11 @@ def players_of(runs):
 
 
 def run(runs, out=None, games=60, depth=2, iters=64, temp=2.0,
-        random_draft=False, seed=7):
+        random_draft=False, seed=7, refs=True, labels=None):
     """Round robin, Elo fit, `ladder.json`, printed table. Returns the ratings."""
     if out is None:
         out = runs[0]
-    ps = players_of(runs)
+    ps = players_of(runs, refs, labels)
     nets = [p for p in ps if p["agent"] == "rebel"]
     if not nets:
         raise SystemExit(f"{runs}: no snapshots in log.json")
@@ -187,6 +192,10 @@ def main():
     ap.add_argument("--iters", type=int, default=-1)
     ap.add_argument("--temp", type=float, default=2.0)
     ap.add_argument("--random-draft", action="store_true")
+    ap.add_argument("--no-refs", action="store_true",
+                    help="skip the Random and Greedy references")
+    ap.add_argument("--labels", default=None,
+                    help="only these snapshot labels, comma-separated (default: all)")
     ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args()
     # Play at the runs' own search settings unless told otherwise: a checkpoint
@@ -200,7 +209,8 @@ def main():
         temp=args.temp,
         random_draft=args.random_draft or any(c.get("random_draft", False)
                                               for c in cfgs),
-        seed=args.seed)
+        seed=args.seed, refs=not args.no_refs,
+        labels=args.labels.split(",") if args.labels else None)
 
 
 if __name__ == "__main__":
