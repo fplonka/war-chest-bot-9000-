@@ -29,6 +29,9 @@
   #boardcap .you { color: #e8ebf1; }
   #boardcap .agn { color: #9aa2b0; }
   #boardcap .ctl { color: #d9a441; }
+  #boardcap .cap-me { color: #8fb0f0; }
+  #boardcap .cap-them { color: #e08a80; }
+  #boardcap .cap-neu { color: #7a86a3; }
   #side { flex: 1; min-width: 300px; max-width: 460px; display: flex;
           flex-direction: column; gap: 12px; }
   .card { background: var(--panel); border: 1px solid var(--line);
@@ -81,8 +84,10 @@
   <section id="boardwrap"><svg id="board"></svg>
   <div id="boardcap"><span><span class="you">●</span> you</span>
     <span><span class="agn">●</span> agent</span>
-    <span><span class="ctl">◆</span> control marker</span>
-    <span>gold number = stack (bolster) count</span></div>
+    <span><span class="cap-me">■ blue hex</span> you control</span>
+    <span><span class="cap-them">■ red hex</span> agent controls</span>
+    <span><span class="cap-neu">■ grey hex</span> neutral</span>
+    <span><span class="ctl">◆</span> control marker · gold number = stack count</span></div>
 </section>
   <section id="side">
     <div class="card">
@@ -100,6 +105,7 @@
           <ul class="zones" id="agentzones"></ul>
         </div>
       </div>
+      <div class="marker-note" id="ctrlneutral" style="margin-top:6px"></div>
     </div>
     <div class="card">
       <h2 id="movetitle">Your move</h2>
@@ -189,8 +195,11 @@ function renderBoard() {
     // plain hexes are dark so the pieces stand out
     let fill = "#2b3142", stroke = "#3d4557", sw = 1.2;
     if (li !== undefined) {
-      stroke = "#7a86a3"; sw = 2;
-      fill = m === 0 ? "#4c5a78" : m === 1 ? "#333b50" : "#3a4260";
+      sw = 2;
+      // control is the loudest signal on the board: blue = you, red = agent,
+      // grey = neutral, each in both the fill and the outline
+      stroke = m === 0 ? "#9db8f5" : m === 1 ? "#e08a80" : "#7a86a3";
+      fill = m === 0 ? "#5f84d4" : m === 1 ? "#b45a52" : "#3a4260";
     }
     const hex = document.createElementNS(ns, "polygon");
     hex.setAttribute("points", hexPoints(cx, cy));
@@ -199,7 +208,8 @@ function renderBoard() {
     hex.setAttribute("stroke-width", sw);
     if (li !== undefined) {
       const t = document.createElementNS(ns, "title");
-      t.textContent = locName(li) + (m !== undefined ? (m === 0 ? " · you" : " · agent") : "");
+      t.textContent = locName(li) + (m === 0 ? " — you control"
+                    : m === 1 ? " — agent controls" : " — neutral");
       hex.appendChild(t);
     }
     svg.appendChild(hex);
@@ -212,14 +222,15 @@ function renderBoard() {
     t.setAttribute("class", "coord");
     t.textContent = `${x},${y}`;
     svg.appendChild(t);
-    // control marker: diamond at the top-right, offset if a unit stands here
+    // control marker: diamond at the top-right, offset if a unit stands here.
+    // White diamond = you, black diamond = agent — same colour code as pieces.
     if (m !== undefined) {
       const mx = cx + R * 0.55, my = cy - R * 0.6;
       const d = document.createElementNS(ns, "polygon");
       d.setAttribute("points",
-        `${mx},${my - 6.5} ${mx + 6.5},${my} ${mx},${my + 6.5} ${mx - 6.5},${my}`);
-      d.setAttribute("fill", m === 0 ? "#f0f0f0" : "#8f97a6");
-      d.setAttribute("stroke", "#10131a");
+        `${mx},${my - 8.5} ${mx + 8.5},${my} ${mx},${my + 8.5} ${mx - 8.5},${my}`);
+      d.setAttribute("fill", m === 0 ? "#f0f0f0" : "#15181f");
+      d.setAttribute("stroke", m === 0 ? "#10131a" : "#c9ced9");
       const t2 = document.createElementNS(ns, "title");
       t2.textContent = "control marker: " + (m === 0 ? "you" : "agent");
       d.appendChild(t2);
@@ -292,6 +303,20 @@ function render() {
     `${state.markers_on_board[state.human]}/6 on the board · ${state.markers_hand[state.human]} in hand`;
   $("agentmarkers").textContent =
     `${state.markers_on_board[state.agent]}/6 on the board · ${state.markers_hand[state.agent]} in hand`;
+  // which locations each side controls, spelled out (location id order)
+  const locCoords = Object.values(meta.geometry.locations)
+    .map(i => meta.geometry.coords[i].join(","));
+  const mine = [], theirs = [], neut = [];
+  for (const c of locCoords) {
+    const o = state.markers[c];
+    if (o === state.human) mine.push(c);
+    else if (o === state.agent) theirs.push(c);
+    else neut.push(c);
+  }
+  $("yourmarkers").textContent += mine.length ? ` · controls: ${mine.join(" ")}` : "";
+  $("agentmarkers").textContent += theirs.length ? ` · controls: ${theirs.join(" ")}` : "";
+  $("ctrlneutral").textContent = neut.length
+    ? `Neutral locations: ${neut.join(" ")}` : "no neutral locations";
   $("yourzones").innerHTML =
     `<li>Bag: ${Object.entries(you.bag).map(([id, n]) => `${meta.units[id]}×${n}`).join(" ") || "—"}</li>` +
     `<li>Face-up discard: ${zoneList(you, "faceup_discard")}</li>` +
@@ -311,7 +336,9 @@ function render() {
       ? " · <b>your turn</b>"
       : " · agent's turn";
   }
-  $("status").innerHTML = status + ` · <span class="marker-note">agent: depth ${meta.depth}, ${meta.iters} CFR iters</span>`;
+  $("status").innerHTML = status + ` · you ${state.markers_on_board[state.human]}/6 · ` +
+    `agent ${state.markers_on_board[state.agent]}/6` +
+    ` · <span class="marker-note">agent: depth ${meta.depth}, ${meta.iters} CFR iters</span>`;
   // moves
   const banner = $("banner");
   if (state.terminal) {
