@@ -5,9 +5,9 @@
 <title>War Chest — vs the ReBeL agent</title>
 <style>
   :root {
-    --bg: #171a21; --panel: #20242e; --panel2: #262b37; --line: #343b4a;
-    --ink: #d8dce6; --dim: #8b93a3; --acc: #7aa2f7; --gold: #d9a441;
-    --white: #eceff4; --black: #3d434f;
+    --bg: #191713; --panel: #24211d; --panel2: #2c2823; --line: #3b362f;
+    --ink: #ddd7cd; --dim: #948c81; --acc: #d0a054; --gold: #d4a44c;
+    --white: #ece7df; --black: #4b453f;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--ink);
@@ -17,15 +17,24 @@
   header h1 { font-size: 17px; margin: 0; letter-spacing: .5px; }
   #status { flex: 1; color: var(--dim); }
   #status b { color: var(--ink); }
-  #newgame { background: var(--acc); border: 0; color: #0d1220; font-weight: 600;
+  #newgame { background: var(--acc); border: 0; color: #1c1509; font-weight: 600;
              padding: 6px 14px; border-radius: 6px; cursor: pointer; }
-  main { display: flex; gap: 16px; padding: 16px 18px; align-items: flex-start;
-         flex-wrap: wrap; }
-  #boardwrap { background: var(--panel); border: 1px solid var(--line);
+  main { display: grid; gap: 14px; padding: 16px 18px; align-items: start;
+         grid-template-columns: minmax(0, 1fr) minmax(300px, 440px);
+         grid-template-areas:
+           "board board"
+           "moves hand"
+           "log   log"; }
+  @media (max-width: 920px) {
+    main { grid-template-columns: 1fr; grid-template-areas: "board" "moves" "hand" "log"; }
+  }
+  #boardwrap { grid-area: board; justify-self: center;
+               background: var(--panel); border: 1px solid var(--line);
                border-radius: 10px; padding: 10px 12px 8px; }
-  #board { width: 100%; max-width: 560px; height: auto; display: block; }
-  #side { flex: 1; min-width: 300px; max-width: 460px; display: flex;
-          flex-direction: column; gap: 12px; }
+  #board { width: 560px; max-width: 100%; height: auto; display: block; }
+  #moveswrap { grid-area: moves; }
+  #handwrap { grid-area: hand; }
+  #logwrap { grid-area: log; }
   .card { background: var(--panel); border: 1px solid var(--line);
           border-radius: 10px; padding: 12px 14px; }
   .card h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
@@ -37,10 +46,14 @@
   .chip .empty { color: var(--dim); }
   .row { display: flex; justify-content: space-between; gap: 10px; }
   .row .half { flex: 1; }
-  ul.zones { list-style: none; margin: 4px 0 0; padding: 0; font-size: 13px;
-             color: var(--dim); }
-  ul.zones li { padding: 1px 0; }
-  .hidden-zone { color: var(--dim); font-style: italic; }
+  dl.zones { margin: 0; }
+  .zrow { display: flex; gap: 8px; padding: 2px 0; font-size: 12.5px;
+          align-items: baseline; }
+  .zrow dt { flex: 0 0 64px; color: var(--dim); font-size: 10.5px;
+             text-transform: uppercase; letter-spacing: .6px; }
+  .zrow dd { margin: 0; color: var(--ink); }
+  .zrow.sub dd { color: var(--dim); }
+  .zrow dd .none { font-style: italic; }
   #movelist { display: flex; flex-direction: column; gap: 2px; max-height: 340px;
               overflow-y: auto; }
   .mgroup { margin-top: 8px; font-size: 11px; text-transform: uppercase;
@@ -49,19 +62,19 @@
   button.move { text-align: left; background: var(--panel2); color: var(--ink);
                 border: 1px solid var(--line); border-radius: 6px;
                 padding: 5px 10px; cursor: pointer; font-size: 13px; }
-  button.move:hover { border-color: var(--acc); background: #2c3342; }
+  button.move:hover { border-color: var(--acc); background: #35302a; }
   button.move:disabled { opacity: .45; cursor: default; }
   #log { font-family: ui-monospace, Menlo, monospace; font-size: 12px;
          max-height: 200px; overflow-y: auto; }
   #log div { padding: 1px 0; color: var(--dim); }
   #log div.me { color: var(--ink); }
-  #log div.agent { color: #b48ead; }
+  #log div.agent { color: #b98a6a; }
   #log div.draw { color: #7fa879; }
   #banner { display: none; font-weight: 700; font-size: 15px; padding: 8px 0; }
   #banner.win { color: #7fa879; } #banner.lose { color: #e06c75; }
   #banner.draw { color: var(--gold); }
   .marker-note { font-size: 11px; color: var(--dim); }
-  svg text.coord { fill: #59637c; font-size: 9px; }
+  svg text.coord { fill: #6e6659; font-size: 9px; }
   svg text.unit { font-size: 12px; font-weight: 700; text-anchor: middle;
                   dominant-baseline: central; }
 </style>
@@ -74,29 +87,30 @@
 </header>
 <main>
   <section id="boardwrap"><svg id="board"></svg></section>
-  <section id="side">
-    <div class="card">
-      <h2>Your hand</h2>
-      <div class="chips" id="hand"></div>
-      <div class="row" style="margin-top:8px">
-        <div class="half">
-          <h2>Your markers</h2>
-          <div id="yourmarkers" class="marker-note"></div>
-          <ul class="zones" id="yourzones"></ul>
-        </div>
-        <div class="half">
-          <h2>Agent</h2>
-          <div id="agentmarkers" class="marker-note"></div>
-          <ul class="zones" id="agentzones"></ul>
-        </div>
-      </div>
-      <div class="marker-note" id="ctrlneutral" style="margin-top:6px"></div>
-    </div>
+  <section id="moveswrap">
     <div class="card">
       <h2 id="movetitle">Your move</h2>
       <div id="banner"></div>
       <div id="movelist"></div>
     </div>
+  </section>
+  <section id="handwrap">
+    <div class="card">
+      <h2>Your hand</h2>
+      <div class="chips" id="hand"></div>
+      <div class="row" style="margin-top:10px">
+        <div class="half">
+          <h2>You</h2>
+          <dl class="zones" id="yourzones"></dl>
+        </div>
+        <div class="half">
+          <h2>Agent</h2>
+          <dl class="zones" id="agentzones"></dl>
+        </div>
+      </div>
+    </div>
+  </section>
+  <section id="logwrap">
     <div class="card">
       <h2>Game log</h2>
       <div id="log"></div>
@@ -236,13 +250,13 @@ function renderBoard() {
     const m = markers.get(i);
     // location hexes get a bright outline and a tint by who controls them;
     // plain hexes are dark so the pieces stand out
-    let fill = "#2b3142", stroke = "#3d4557", sw = 1.2;
+    let fill = "#302c26", stroke = "#453f37", sw = 1.2;
     if (li !== undefined) {
       sw = 2;
       // control is the loudest signal on the board: blue = you, red = agent,
       // grey = neutral, each in both the fill and the outline
-      stroke = m === 0 ? "#9db8f5" : m === 1 ? "#e08a80" : "#7a86a3";
-      fill = m === 0 ? "#5f84d4" : m === 1 ? "#b45a52" : "#3a4260";
+      stroke = m === 0 ? "#9fb8e0" : m === 1 ? "#d88a7e" : "#7d7466";
+      fill = m === 0 ? "#5d83c9" : m === 1 ? "#b0584e" : "#46413a";
     }
     const hex = document.createElementNS(ns, "polygon");
     hex.setAttribute("points", hexPoints(cx, cy));
@@ -291,8 +305,8 @@ function renderBoard() {
       const c = document.createElementNS(ns, "circle");
       c.setAttribute("cx", cx); c.setAttribute("cy", cy);
       c.setAttribute("r", me ? 16 : 15);
-      c.setAttribute("fill", me ? "#e8ebf1" : "#454c5a");
-      c.setAttribute("stroke", me ? "#10131a" : "#9aa2b0");
+      c.setAttribute("fill", me ? "#ece7df" : "#4d4741");
+      c.setAttribute("stroke", me ? "#10131a" : "#a49b8d");
       c.setAttribute("stroke-width", 2);
       g.appendChild(c);
       const u = document.createElementNS(ns, "text");
@@ -310,7 +324,7 @@ function renderBoard() {
         const b = document.createElementNS(ns, "circle");
         b.setAttribute("cx", cx + 11.5); b.setAttribute("cy", cy + 11.5);
         b.setAttribute("r", 7.5);
-        b.setAttribute("fill", "#e0a83e");
+        b.setAttribute("fill", "#d4a44c");
         b.setAttribute("stroke", "#10131a");
         svg.appendChild(b);
         const bt = document.createElementNS(ns, "text");
@@ -325,15 +339,13 @@ function renderBoard() {
   }
 }
 
-function zoneList(z, zone) {
-  const d = z[zone];
-  if (d.hidden) return "<li class='hidden-zone'>hidden</li>";
-  const items = Object.entries(d).map(([id, n]) => {
-    if (n === 0) return null;
-    const name = meta.units[id] || id;
-    return `<li>${name} ×${n}</li>`;
-  }).filter(Boolean);
-  return items.length ? items.join("") : "<li>—</li>";
+function fmtCounts(d) {
+  const items = Object.entries(d).filter(([, n]) => n > 0)
+    .map(([id, n]) => `${meta.units[id] || id} ×${n}`);
+  return items.length ? items.join(" · ") : "<span class='none'>—</span>";
+}
+function zoneRow(label, html, sub) {
+  return `<div class="zrow${sub ? " sub" : ""}"><dt>${label}</dt><dd>${html}</dd></div>`;
 }
 
 function render() {
@@ -344,36 +356,19 @@ function render() {
     n > 0 ? `<span class="chip"><b>${meta.units[id] || id}</b> ×${n}</span>` : null)
     .filter(Boolean).join("");
   $("hand").innerHTML = hand || "<span class='chip empty'>empty</span>";
-  // markers
-  $("yourmarkers").textContent =
-    `${state.markers_on_board[state.human]}/6 on the board · ${state.markers_hand[state.human]} in hand`;
-  $("agentmarkers").textContent =
-    `${state.markers_on_board[state.agent]}/6 on the board · ${state.markers_hand[state.agent]} in hand`;
-  // which locations each side controls, spelled out (location id order)
-  const locCoords = Object.values(meta.geometry.locations)
-    .map(i => meta.geometry.coords[i].join(","));
-  const mine = [], theirs = [], neut = [];
-  for (const c of locCoords) {
-    const o = state.markers[c];
-    if (o === state.human) mine.push(c);
-    else if (o === state.agent) theirs.push(c);
-    else neut.push(c);
-  }
-  $("yourmarkers").textContent += mine.length ? ` · controls: ${mine.join(" ")}` : "";
-  $("agentmarkers").textContent += theirs.length ? ` · controls: ${theirs.join(" ")}` : "";
-  $("ctrlneutral").textContent = neut.length
-    ? `Neutral locations: ${neut.join(" ")}` : "no neutral locations";
+  // zones, most decision-relevant first; the sub rows are the long-game bookkeeping
   $("yourzones").innerHTML =
-    `<li>Bag: ${Object.entries(you.bag).map(([id, n]) => `${meta.units[id]}×${n}`).join(" ") || "—"}</li>` +
-    `<li>Face-up discard: ${zoneList(you, "faceup_discard")}</li>` +
-    `<li>Face-down discard: ${zoneList(you, "facedown_discard")}</li>` +
-    `<li>Supply: ${zoneList(you, "supply")}</li>` +
-    `<li>Eliminated: ${zoneList(you, "eliminated")}</li>`;
+    zoneRow("Bag", fmtCounts(you.bag)) +
+    zoneRow("Supply", fmtCounts(you.supply)) +
+    zoneRow("Face-down", fmtCounts(you.facedown_discard), true) +
+    zoneRow("Face-up", fmtCounts(you.faceup_discard), true) +
+    zoneRow("Eliminated", fmtCounts(you.eliminated), true);
   $("agentzones").innerHTML =
-    `<li>Hand: ${agent.hand_size} · Bag: ${agent.bag_size} · Face-down: ${agent.facedown_count}</li>` +
-    `<li>Face-up discard: ${zoneList(agent, "faceup_discard")}</li>` +
-    `<li>Supply: ${zoneList(agent, "supply")}</li>` +
-    `<li>Eliminated: ${zoneList(agent, "eliminated")}</li>`;
+    zoneRow("Holds",
+      `hand ${agent.hand_size} · bag ${agent.bag_size} · face-down ${agent.facedown_count}`) +
+    zoneRow("Supply", fmtCounts(agent.supply)) +
+    zoneRow("Face-up", fmtCounts(agent.faceup_discard), true) +
+    zoneRow("Eliminated", fmtCounts(agent.eliminated), true);
   // status
   const holder = state.initiative === state.human ? "you" : "agent";
   let status = `Round ${state.round} · initiative: <b>${holder}</b>`;
