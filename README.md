@@ -32,9 +32,14 @@ papers/          War Chest rulebook, ReBeL, TurboReBeL
 ## Playing against a trained agent
 
 ```bash
-./play.sh                      # newest runs/*/ckpt_final.pt, opens the browser
-./play.sh --ckpt runs/cfgvalue01/ckpt_final.pt
+./play.sh                      # newest final checkpoint, opens the browser
+./play.sh --ckpt runs/t64_h384_dg64_s11/snap_05.pt
 ```
+
+The default is the newest `runs/*/ckpt_final.pt`, falling back to the newest
+`runs/*/snap_*.pt` final snapshot (the long runs save `snap_XX.pt`); pass
+`--ckpt` to pick a specific checkpoint. `--depth`/`--iters` default to the
+training configuration (2/16).
 
 You play white with the rulebook's starter army (Swordsman, Pikeman,
 Crossbowman, Light Cavalry) against the fixed black army (Archer, Cavalry,
@@ -42,9 +47,11 @@ Lancer, Scout). Round-start draws and the agent's moves resolve automatically;
 every decision that is yours — including triggered follow-ups like the
 Swordsman's free move — appears as a clickable legal action. The agent solves
 the depth-limited subgame at each of its decisions with the same CFR-average
-configuration evaluation uses (`--depth`, `--iters`), so it plays like the
-checkpoint's `eval.json` says it plays. The agent's hand, bag and face-down
-discards are hidden from the browser; only public counts are shown.
+configuration evaluation uses, so it plays like the checkpoint's `eval.json`
+says it plays. The agent's hand, bag and face-down discards are hidden from
+the browser — including the coin it spends face-down on Pass / Claim
+initiative / Recruit, which the game log never reveals — and only public
+counts are shown.
 
 The session object behind the UI is `warchest.LiveGame` (`engine/src/live.rs`),
 which mirrors the self-play loop: public beliefs over both players' configs,

@@ -189,11 +189,17 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def latest_checkpoint() -> Path:
-    cands = sorted((ROOT / "runs").glob("*/ckpt_final.pt"),
+    """The newest final checkpoint: `ckpt_final.pt`, else the newest
+    `snap_XX.pt` (the long runs save snapshots under that name)."""
+    final = sorted((ROOT / "runs").glob("*/ckpt_final.pt"),
                    key=lambda p: p.stat().st_mtime, reverse=True)
-    if not cands:
-        raise SystemExit("no runs/*/ckpt_final.pt found — pass --ckpt explicitly")
-    return cands[0]
+    if final:
+        return final[0]
+    snaps = sorted((ROOT / "runs").glob("*/snap_*.pt"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    if not snaps:
+        raise SystemExit("no runs/*/ckpt_final.pt or runs/*/snap_*.pt found — pass --ckpt explicitly")
+    return snaps[0]
 
 
 def main():
