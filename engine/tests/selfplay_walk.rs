@@ -8,7 +8,7 @@ use warchest::search::Cfg;
 use warchest::selfplay::{play_game, Agent, Collect, Data, GameCfg};
 
 fn cfg() -> Cfg {
-    Cfg { depth: 2, iters: 8, average: true }
+    Cfg { depth: 2, iters: 8, snapshots: false }
 }
 
 /// Self-play with empty nets: the walk mechanics (build, act on the sampled
@@ -29,7 +29,6 @@ fn walk_serves_multiple_decisions_per_solve() {
                 ],
                 collect: Collect::Rebel,
                 explore,
-                eval: false,
                 random_draft: false,
                 eval_mix: 0.0,
                 mc_mix: 0.0,
@@ -37,16 +36,16 @@ fn walk_serves_multiple_decisions_per_solve() {
             let z = play_game(&mut rng, &nets, &gc, &mut d);
             assert!(z.is_finite());
             assert!(d.nv > 0, "no targets collected");
-            // One target per solve root; the walk serves several decisions
-            // per solve, so rows must be fewer than decisions overall.
-            assert!(d.nv <= d.decisions, "more rows than decisions");
             total_dec += d.decisions;
             total_rows += d.nv;
         }
     }
+    // TurboReBeL: each solve yields T+1 rows (the carried beliefs valued
+    // under the reference strategy) while the walk serves a couple of
+    // decisions, so rows must exceed decisions overall.
     assert!(
-        total_rows < total_dec,
-        "walk never reused a subgame: {} rows for {} decisions",
+        total_rows > total_dec,
+        "the T+1 multiplier is missing: {} rows for {} decisions",
         total_rows,
         total_dec
     );
@@ -65,7 +64,6 @@ fn walk_in_eval_mode() {
         ],
         collect: Collect::None,
         explore: 0.0,
-        eval: true,
         random_draft: false,
         eval_mix: 0.0,
         mc_mix: 0.0,
@@ -89,7 +87,6 @@ fn walk_interrupted_by_non_rebel_agent() {
         ],
         collect: Collect::Rebel,
         explore: 0.1,
-        eval: false,
         random_draft: false,
         eval_mix: 0.0,
         mc_mix: 0.0,
@@ -124,7 +121,6 @@ fn walk_never_crosses_slots() {
             ],
             collect: Collect::Rebel,
             explore: 0.1,
-            eval: false,
             random_draft: false,
             eval_mix: 0.0,
             mc_mix: 0.0,
@@ -136,11 +132,7 @@ fn walk_never_crosses_slots() {
         total_rows += d.nv;
     }
     assert!(
-        total_rows <= total_dec,
-        "more rows than decisions"
-    );
-    assert!(
-        total_rows > total_dec * 8 / 10,
+        total_rows < total_dec * 3,
         "rows/decisions = {}/{} — a walk crossed slot boundaries",
         total_rows,
         total_dec
@@ -165,7 +157,6 @@ fn walk_with_random_drafts() {
             ],
             collect: Collect::Rebel,
             explore: 0.3,
-            eval: false,
             random_draft: true,
             eval_mix: 0.0,
             mc_mix: 0.0,
@@ -176,5 +167,10 @@ fn walk_with_random_drafts() {
         total_dec += d.decisions;
         total_rows += d.nv;
     }
-    assert!(total_rows < total_dec);
+    assert!(
+        total_rows > total_dec,
+        "the T+1 multiplier is missing: {} rows for {} decisions",
+        total_rows,
+        total_dec
+    );
 }

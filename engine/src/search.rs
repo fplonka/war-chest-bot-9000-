@@ -9,14 +9,22 @@
 //! come from the value network.
 //!
 //! Conventions follow the reference implementation (`csrc/liars_dice` of
-//! `facebookresearch/rebel`):
+//! `facebookresearch/rebel`), with TurboReBeL's reorganisation of the data
+//! generation:
 //!   * alternating-traverser linear CFR,
 //!   * leaf values are *counterfactual* — the network's value for that exact
 //!     config, scaled by the opponent's unnormalised reach into that leaf,
 //!   * the network is queried with normalised reaches as the beliefs,
-//!   * the root value target is the running mean of per-config root values,
-//!   * acting and belief propagation use the current regret-matching iterate.
+//!   * the value target is the root value under the **fixed reference
+//!     strategy** — the CFR average at the end of the solve — computed by a
+//!     fixed-policy pass (no regrets) per root belief (`value_under`), one for
+//!     every belief the walk carries in (`carried_beliefs`);
+//!   * acting and belief propagation use the CFR average strategy.
 //!
+//! That is TurboReBeL's single-sample multi-iteration generation (ICLR 2026,
+//! "Turbo ReBeL"): one solve yields T+1 training rows instead of one, all
+//! valued under the same reference strategy, so a higher iteration count stops
+//! costing data rate. See docs/REBEL.md.
 //! Three things differ from poker, all consequences of War Chest's observation
 //! structure:
 //!
@@ -44,19 +52,19 @@ pub struct Cfg {
     pub depth: usize,
     /// CFR iterations (alternating, so each player is traversed iters/2 times).
     pub iters: usize,
-    /// Maintain the CFR *average* strategy. Only evaluation reads it —
-    /// self-play acts on the current regret-matching iterate — and keeping it
-    /// costs a second reach pass plus two sweeps over every strategy cell per
-    /// iteration, so generation turns it off.
-    pub average: bool,
+    /// Snapshot the CFR average strategy at every iteration. Generation needs
+    /// the per-iterate averages for TurboReBeL's carried beliefs (`value_under`
+    /// and `carried_beliefs`); evaluation acts on the solved tree and never
+    /// looks at an intermediate iterate, so it turns them off.
+    pub snapshots: bool,
 }
 
 impl Default for Cfg {
     fn default() -> Self {
         Cfg {
             depth: 1,
-            iters: 16,
-            average: true,
+            iters: 64,
+            snapshots: true,
         }
     }
 }
@@ -243,6 +251,32 @@ thread_local! {
     };
 }
 
+// The per-solve snapshot arena is a `Vec<Vec<f32>>` (one flat copy of `avg`
+// per iterate), so it pools separately from the flat buffers above.
+thread_local! {
+    static SNAP_POOL: std::cell::RefCell<Vec<Vec<Vec<f32>>>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+fn take_snaps() -> Vec<Vec<f32>> {
+    let mut v = SNAP_POOL.with(|p| p.borrow_mut().pop().unwrap_or_default());
+    v.clear();
+    v
+}
+
+fn give_snaps(v: Vec<Vec<f32>>) {
+    if v.is_empty() {
+        return;
+    }
+    SNAP_POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.len() < 2 {
+            p.push(v);
+        }
+    });
+}
+
 fn take_buf(role: usize) -> Vec<f32> {
     BUFS.with(|b| b.borrow_mut()[role].pop().unwrap_or_default())
 }
@@ -272,10 +306,18 @@ pub struct Solver<'a> {
     regret: Vec<f32>,
     cur: Vec<f32>,
     soff: Vec<u32>,
-    /// The average strategy and its running sum. Only evaluation reads these,
-    /// so generation leaves them empty and they stay per-node.
+    /// The average strategy and its running sum, per node. Always maintained:
+    /// the walk acts on the average, and generation snapshots it per iterate.
     sum_strat: Vec<Vec<f32>>,
     avg: Vec<Vec<f32>>,
+    /// One flat copy of `avg` (per-node regions in node order, aligned with
+    /// `soff`) taken before the first iteration and after each one: snapshot
+    /// `t` is the average strategy at iterate t, and the last is the reference
+    /// strategy `value_under` and the walk act on. Pooled across solves.
+    snaps: Vec<Vec<f32>>,
+    /// Total strategy cells (sum over decision nodes of `nc * na`), so the
+    /// snapshot arenas are reserved to size instead of grown.
+    ncells: usize,
     /// Reach per config, flat: node `i`'s two players occupy
     /// `reach[roff[i] .. roff[i] + nc0 + nc1]`, player 0 first. One arena
     /// rather than `Vec<Vec<f32>>` — the CFR passes touch every node, and two
@@ -289,7 +331,6 @@ pub struct Solver<'a> {
     /// `[node]` -> config counts per player, so the hot loops never chase the
     /// `Rc` to ask how long a support is.
     nc: Vec<[u32; 2]>,
-    root_mean: [Vec<f32>; 2],
     steps: [usize; 2],
 
     // ---------------------------------------------------------- leaf batch
@@ -354,6 +395,7 @@ impl Drop for Solver<'_> {
         ] {
             give_buf(role, std::mem::take(v));
         }
+        give_snaps(std::mem::take(&mut self.snaps));
     }
 }
 
@@ -374,13 +416,14 @@ impl<'a> Solver<'a> {
             nets,
             cfg,
             nodes: Vec::new(),
-            root_mean: [vec![0.0; cfgs[0].len()], vec![0.0; cfgs[1].len()]],
             root_belief: belief,
             regret: Vec::new(),
             cur: Vec::new(),
             soff: Vec::new(),
             sum_strat: Vec::new(),
             avg: Vec::new(),
+            snaps: take_snaps(),
+            ncells: 0,
             reach: Vec::new(),
             roff: Vec::new(),
             vals: Vec::new(),
@@ -421,7 +464,6 @@ impl<'a> Solver<'a> {
             sv.build(root.clone(), cfg.depth.max(1), cfgs);
         }
         let _t = timed!(ALLOC);
-        let keep_avg = cfg.average;
         for i in 0..sv.nodes.len() {
             let n = &sv.nodes[i];
             let (na, p) = (n.na(), n.player as usize);
@@ -434,11 +476,8 @@ impl<'a> Solver<'a> {
             sv.vals.resize(sv.vals.len() + c0.max(c1), 0.0);
             sv.soff.push(sv.regret.len() as u32);
             sv.regret.resize(sv.regret.len() + nc * na, 0.0);
-            sv.sum_strat.push(if keep_avg {
-                vec![0.0; nc * na]
-            } else {
-                Vec::new()
-            });
+            sv.ncells += nc * na;
+            sv.sum_strat.push(vec![0.0; nc * na]);
             // CFR starts from a uniform strategy over the legal actions, as in
             // the reference. No heuristic prior is injected here: the greedy
             // knowledge enters through the pretrained value network, which is
@@ -453,7 +492,7 @@ impl<'a> Solver<'a> {
                 }
             }
             sv.cur.extend_from_slice(&u);
-            sv.avg.push(if keep_avg { u } else { Vec::new() });
+            sv.avg.push(u);
         }
         sv.soff.push(sv.regret.len() as u32);
         drop(_t);
@@ -472,24 +511,38 @@ impl<'a> Solver<'a> {
             shape!(CFGSUM, n.nc(0) + n.nc(1));
         }
         sv.precompute_reaches();
-        if keep_avg {
-            // Seed the strategy sums with one reach-weighted uniform strategy,
-            // as `get_uniform_reach_weigted_strategy` does in the reference.
-            for i in 0..sv.nodes.len() {
-                if sv.nodes[i].leaf {
-                    continue;
-                }
-                let (na, p) = (sv.nodes[i].na(), sv.nodes[i].player as usize);
-                let so = sv.soff[i] as usize;
-                for c in 0..sv.nodes[i].nc(p) {
-                    let r = sv.reach_of(i, p)[c];
-                    for a in 0..na {
-                        sv.sum_strat[i][c * na + a] += r * sv.cur[so + c * na + a];
-                    }
+        // Seed the strategy sums with one reach-weighted uniform strategy,
+        // as `get_uniform_reach_weigted_strategy` does in the reference.
+        for i in 0..sv.nodes.len() {
+            if sv.nodes[i].leaf {
+                continue;
+            }
+            let (na, p) = (sv.nodes[i].na(), sv.nodes[i].player as usize);
+            let so = sv.soff[i] as usize;
+            for c in 0..sv.nodes[i].nc(p) {
+                let r = sv.reach_of(i, p)[c];
+                for a in 0..na {
+                    sv.sum_strat[i][c * na + a] += r * sv.cur[so + c * na + a];
                 }
             }
         }
+        // Snapshot 0: the average before any iteration, i.e. the uniform
+        // policy — the t = 0 member of the carried-belief set.
+        sv.snapshot();
         sv
+    }
+
+    /// One flat copy of `avg`, aligned with `soff`: snapshot `t` is the
+    /// average strategy at iterate t.
+    fn snapshot(&mut self) {
+        if !self.cfg.snapshots {
+            return;
+        }
+        let mut snap = Vec::with_capacity(self.ncells);
+        for v in self.avg.iter() {
+            snap.extend_from_slice(v);
+        }
+        self.snaps.push(snap);
     }
 
     // ------------------------------------------------------------ tree build
@@ -717,12 +770,25 @@ impl<'a> Solver<'a> {
     /// `split_at_mut` — no copy of the parent's reach, which used to be two
     /// heap allocations per node per pass.
     fn precompute_reaches(&mut self) {
+        let cur = std::mem::take(&mut self.cur);
+        let root = [
+            self.root_belief[0].p.clone(),
+            self.root_belief[1].p.clone(),
+        ];
+        self.propagate(&cur, [&root[0], &root[1]]);
+        self.cur = cur;
+    }
+
+    /// Push reach probabilities down the tree under `strat` (a flat arena in
+    /// the same per-node layout as `cur` and the snapshots, aligned with
+    /// `soff`), from the given root beliefs.
+    fn propagate(&mut self, strat: &[f32], root: [&[f32]; 2]) {
         let _t = timed!(REACH);
         self.reach.fill(0.0);
         for p in 0..2 {
             let at = self.roff[0] as usize + if p == 1 { self.nc[0][0] as usize } else { 0 };
             let n = self.nc[0][p] as usize;
-            self.reach[at..at + n].copy_from_slice(&self.root_belief[p].p);
+            self.reach[at..at + n].copy_from_slice(root[p]);
         }
         for i in 0..self.nodes.len() {
             let n = &self.nodes[i];
@@ -767,7 +833,7 @@ impl<'a> Solver<'a> {
                 }
                 continue;
             }
-            let cur = &self.cur[self.soff[i] as usize..];
+            let cur = &strat[self.soff[i] as usize..];
             for ch in 0..n.child.len() {
                 let c = n.child[ch];
                 debug_assert!(c > i);
@@ -948,14 +1014,71 @@ impl<'a> Solver<'a> {
             let net = &self.nets.value;
             net.pbs_head(&self.xb[..rows * 2 * dg], rows, &self.h0, &mut self.sb, &mut self.ob);
         }
+        self.readout(traverser);
+    }
 
+    /// Refresh *both* players' belief blocks and run the PBS head once. The
+    /// fixed-policy passes of TurboReBeL's Phase 2 seed a different root
+    /// belief per pass, so both blocks move and the alternating-traverser
+    /// cache of `leaf_values` does not apply. The per-config readout is left
+    /// to `readout`, which may run twice off the same `ob`.
+    fn leaf_values_both(&mut self) {
+        self.ensure_leaf_batch();
+        let rows = self.leaf_rows.len();
+        let empty = self.nets.value.is_empty();
+        let dg = if empty { 0 } else { self.nets.value.dg() };
+        self.last_traverser = None;
+        if empty {
+            return;
+        }
+        let _t = timed!(BELFEAT);
+        let (reach, roff, nc, coff, cidx, cz, wbuf, xb) = (
+            &self.reach,
+            &self.roff,
+            &self.nc,
+            &self.leaf_coff,
+            &self.leaf_cidx,
+            &self.cz,
+            &mut self.wbuf,
+            &mut self.xb,
+        );
+        for (r, &i) in self.leaf_rows.iter().enumerate() {
+            for p in 0..2 {
+                let n = nc[i][p] as usize;
+                let ra = roff[i] as usize + if p == 1 { nc[i][0] as usize } else { 0 };
+                if wbuf.len() < n {
+                    wbuf.resize(n, 0.0);
+                }
+                normalize_weights(&reach[ra..ra + n], &mut wbuf[..n]);
+                let at = r * 2 * dg + p * dg;
+                let cs = coff[2 * r + p] as usize;
+                crate::net::accumulate(
+                    cz,
+                    &cidx[cs..cs + n],
+                    &wbuf[..n],
+                    dg,
+                    &mut xb[at..at + dg],
+                );
+            }
+        }
+        let _t = timed!(NET);
+        let net = &self.nets.value;
+        net.pbs_head(&self.xb[..rows * 2 * dg], rows, &self.h0, &mut self.sb, &mut self.ob);
+    }
+
+    /// Per-config leaf values for player `p` — counterfactual: the network's
+    /// value for that exact config times the opponent's unnormalised reach
+    /// into the leaf. Runs off the `ob` left by the last `leaf_values` /
+    /// `leaf_values_both`, so two players can be read off one PBS-head pass.
+    fn readout(&mut self, p: usize) {
         let _t = timed!(LEAFPOST);
-        let opp = 1 - traverser;
+        let empty = self.nets.value.is_empty();
+        let opp = 1 - p;
         for k in 0..self.term_leaves.len() {
             let i = self.term_leaves[k];
             let opp_reach: f32 = self.reach_of(i, opp).iter().sum();
-            let u = self.nodes[i].s.utility(traverser);
-            let n = self.nc[i][traverser] as usize;
+            let u = self.nodes[i].s.utility(p);
+            let n = self.nc[i][p] as usize;
             let vo = self.voff[i] as usize;
             self.vals[vo..vo + n].fill(u * opp_reach);
         }
@@ -975,16 +1098,16 @@ impl<'a> Solver<'a> {
         for (r, &i) in self.leaf_rows.iter().enumerate() {
             let ra = roff[i] as usize + if opp == 1 { ncs[i][0] as usize } else { 0 };
             let opp_reach: f32 = reach[ra..ra + ncs[i][opp] as usize].iter().sum();
-            let n = ncs[i][traverser] as usize;
+            let n = ncs[i][p] as usize;
             let vo = voff[i] as usize;
             if empty {
                 vals[vo..vo + n].fill(0.0);
                 continue;
             }
-            // Only the traverser's own configs are ever looked up here. The
+            // Only the player's own configs are ever looked up here. The
             // opponent's private state reaches this value solely through the
             // belief embedding, which is what keeps the query leak-free.
-            let cs = coff[2 * r + traverser] as usize;
+            let cs = coff[2 * r + p] as usize;
             net.values(
                 &ob[r * rk..r * rk + rk],
                 cg,
@@ -1002,6 +1125,17 @@ impl<'a> Solver<'a> {
         // every `step` re-establishes it after regret matching, so recomputing
         // them here would repeat the previous pass exactly.
         self.leaf_values(traverser);
+        let cur = std::mem::take(&mut self.cur);
+        self.backprop(traverser, &cur, true);
+        self.cur = cur;
+    }
+
+    /// One value backpropagation over the tree for `traverser`: the shared
+    /// walk behind both CFR (`update_regrets`) and TurboReBeL's fixed-policy
+    /// passes. With `regrets` the counterfactual values also accumulate into
+    /// `regret`; without, they are pure value propagation under `strat` — a
+    /// fixed strategy, which is the whole of Phase 2's "solve".
+    fn backprop(&mut self, traverser: usize, strat: &[f32], regrets: bool) {
         let _t = timed!(BACK);
         for i in (0..self.nodes.len()).rev() {
             if self.nodes[i].leaf {
@@ -1043,10 +1177,7 @@ impl<'a> Solver<'a> {
             if me == traverser {
                 let n = &self.nodes[i];
                 let so = self.soff[i] as usize;
-                let (regret, cur) = (
-                    &mut self.regret[so..],
-                    &self.cur[so..],
-                );
+                let cur = &strat[so..];
                 // Children are built after their parent, so the parent's value
                 // row and every child's are disjoint slices of one arena.
                 let (lo, hi) = self.vals.split_at_mut(self.voff[i + 1] as usize);
@@ -1063,15 +1194,19 @@ impl<'a> Solver<'a> {
                             continue;
                         }
                         let av = cv[t as usize];
-                        regret[c * na + a] += av;
+                        if regrets {
+                            self.regret[so + c * na + a] += av;
+                        }
                         vi[c] += av * cur[c * na + a];
                     }
                 }
-                for c in 0..nc {
-                    let base = vi[c];
-                    for a in 0..na {
-                        if n.legal[c * na + a] {
-                            regret[c * na + a] -= base;
+                if regrets {
+                    for c in 0..nc {
+                        let base = vi[c];
+                        for a in 0..na {
+                            if n.legal[c * na + a] {
+                                self.regret[so + c * na + a] -= base;
+                            }
                         }
                     }
                 }
@@ -1092,17 +1227,11 @@ impl<'a> Solver<'a> {
 
     pub fn step(&mut self, traverser: usize) {
         self.update_regrets(traverser);
-        let alpha = 2.0 / (self.steps[traverser] as f32 + 2.0);
-        for c in 0..self.root_mean[traverser].len() {
-            self.root_mean[traverser][c] +=
-                (self.vals[self.voff[0] as usize + c] - self.root_mean[traverser][c]) * alpha;
-        }
         // Linear CFR: discount by t/(t+1) after each update.
         {
             let _t = timed!(RM);
             let m = self.steps[traverser] as f32 + 1.0;
             let disc = m / (m + 1.0);
-            let keep_avg = self.cfg.average;
             for i in 0..self.nodes.len() {
                 let n = &self.nodes[i];
                 if n.leaf || n.chance || n.player as usize != traverser {
@@ -1133,10 +1262,8 @@ impl<'a> Solver<'a> {
                         regret[c * na + a] *= disc;
                     }
                 }
-                if keep_avg {
-                    for x in self.sum_strat[i].iter_mut() {
-                        *x *= disc;
-                    }
+                for x in self.sum_strat[i].iter_mut() {
+                    *x *= disc;
                 }
             }
         }
@@ -1144,35 +1271,34 @@ impl<'a> Solver<'a> {
         // the next iteration's traversal reads them, and so does the average
         // strategy accumulation below.
         self.precompute_reaches();
-        if self.cfg.average {
-            let _t = timed!(AVG);
-            for i in 0..self.nodes.len() {
-                let n = &self.nodes[i];
-                if n.leaf || n.chance || n.player as usize != traverser {
-                    continue;
+        let _t = timed!(AVG);
+        for i in 0..self.nodes.len() {
+            let n = &self.nodes[i];
+            if n.leaf || n.chance || n.player as usize != traverser {
+                continue;
+            }
+            let (na, nc) = (n.na(), n.nc(traverser));
+            let so = self.soff[i] as usize;
+            for c in 0..nc {
+                let r = self.reach_of(i, traverser)[c];
+                let mut sum = 0.0;
+                for a in 0..na {
+                    self.sum_strat[i][c * na + a] += r * self.cur[so + c * na + a];
+                    sum += self.sum_strat[i][c * na + a];
                 }
-                let (na, nc) = (n.na(), n.nc(traverser));
-                let so = self.soff[i] as usize;
-                for c in 0..nc {
-                    let r = self.reach_of(i, traverser)[c];
-                    let mut sum = 0.0;
+                if sum > 0.0 {
                     for a in 0..na {
-                        self.sum_strat[i][c * na + a] += r * self.cur[so + c * na + a];
-                        sum += self.sum_strat[i][c * na + a];
+                        self.avg[i][c * na + a] = self.sum_strat[i][c * na + a] / sum;
                     }
-                    if sum > 0.0 {
-                        for a in 0..na {
-                            self.avg[i][c * na + a] = self.sum_strat[i][c * na + a] / sum;
-                        }
-                    } else {
-                        let k = (0..na).filter(|&a| n.legal[c * na + a]).count() as f32;
-                        for a in 0..na {
-                            self.avg[i][c * na + a] = if n.legal[c * na + a] { 1.0 / k } else { 0.0 };
-                        }
+                } else {
+                    let k = (0..na).filter(|&a| n.legal[c * na + a]).count() as f32;
+                    for a in 0..na {
+                        self.avg[i][c * na + a] = if n.legal[c * na + a] { 1.0 / k } else { 0.0 };
                     }
                 }
             }
         }
+        self.snapshot();
         self.steps[traverser] += 1;
     }
 
@@ -1182,41 +1308,74 @@ impl<'a> Solver<'a> {
         }
     }
 
-    /// Run the remaining CFR iterations up to the configured total
-    /// (`self.cfg.iters`), preserving the alternating-traverser schedule of
-    /// `step(i % 2)`. Used to finish a solve whose first `stop` steps were
-    /// run when the subgame was built, after the walk acted on the
-    /// strategies at that iterate.
-    pub fn complete(&mut self) {
-        let iters = self.cfg.iters;
-        let done = self.steps[0] + self.steps[1];
-        for i in done..iters {
-            self.step(i % 2);
+    /// TurboReBeL Phase 2: for each root belief, the per-config root values
+    /// under the fixed reference strategy — the CFR average at the end of the
+    /// solve (the last snapshot). Reach is propagated under the reference and
+    /// values backed up under it; no regrets move and nothing is learned.
+    ///
+    /// `roots` are probability vectors over the root support, per player, in
+    /// the root belief's config order. Returns the per-player per-config root
+    /// values for each member, in the same order.
+    pub fn value_under(&mut self, roots: &[[Vec<f32>; 2]]) -> Vec<[Vec<f32>; 2]> {
+        let reference = self
+            .snaps
+            .last()
+            .cloned()
+            .expect("value_under needs per-iterate snapshots (Cfg::snapshots)");
+        let mut out = Vec::with_capacity(roots.len());
+        for root in roots {
+            let _t = timed!(P2);
+            self.propagate(&reference, [&root[0], &root[1]]);
+            self.leaf_values_both();
+            let mut pair = [Vec::new(), Vec::new()];
+            for p in 0..2usize {
+                self.readout(p);
+                self.backprop(p, &reference, false);
+                let n = self.nc[0][p] as usize;
+                let vo = self.voff[0] as usize;
+                pair[p] = self.vals[vo..vo + n].to_vec();
+            }
+            out.push(pair);
         }
+        out
     }
 
-    pub fn solved(&self) -> bool {
-        self.steps[0] > 0 && self.steps[1] > 0
-    }
-
-    /// Per-config root values for both players: the ReBeL value target, in the
-    /// same indexing as the root beliefs.
-    pub fn root_values(&self, p: usize) -> &[f32] {
-        &self.root_mean[p]
-    }
-
-    /// The strategy used for acting and for belief propagation. As in the
-    /// reference that is the current regret-matching iterate, not the average.
-    pub fn sampling_strategy(&self, node: usize, c: usize) -> &[f32] {
-        let na = self.nodes[node].na();
-        let so = self.soff[node] as usize;
-        &self.cur[so + c * na..so + (c + 1) * na]
+    /// The beliefs at tree node `leaf` under each per-iterate average strategy
+    /// (t = 0..T-1), from the solve's root belief — TurboReBeL's intermediate
+    /// PBSs. The caller appends the walk's live belief as the t = T member.
+    ///
+    /// Every iterate's average gives every legal action positive probability
+    /// (regret matching clamps at 1e-6), so each belief has the same support
+    /// as the node's own — the caller asserts that against the live belief
+    /// before consuming the set.
+    pub fn carried_beliefs(&mut self, leaf: usize) -> Vec<[Vec<f32>; 2]> {
+        let root = [
+            self.root_belief[0].p.clone(),
+            self.root_belief[1].p.clone(),
+        ];
+        let n = self.snaps.len().saturating_sub(1);
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let snap = self.snaps[i].clone();
+            self.propagate(&snap, [&root[0], &root[1]]);
+            let mut pair = [Vec::new(), Vec::new()];
+            for p in 0..2usize {
+                let ra = self.roff[leaf] as usize
+                    + if p == 1 { self.nc[leaf][0] as usize } else { 0 };
+                let n = self.nc[leaf][p] as usize;
+                let mut w = vec![0.0; n];
+                normalize_weights(&self.reach[ra..ra + n], &mut w);
+                pair[p] = w;
+            }
+            out.push(pair);
+        }
+        out
     }
 
     /// The CFR average strategy: the approximate equilibrium of the subgame.
-    /// Only available when the solver was configured to maintain it.
+    /// Acting and belief propagation use it — the reference strategy of
+    /// TurboReBeL's Phase 2 and of the walk through the solved tree.
     pub fn average_strategy(&self, node: usize, c: usize) -> &[f32] {
-        debug_assert!(self.cfg.average, "solver was built without the average strategy");
         let na = self.nodes[node].na();
         &self.avg[node][c * na..(c + 1) * na]
     }

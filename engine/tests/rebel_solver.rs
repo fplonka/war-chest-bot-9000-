@@ -175,7 +175,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
         let cfg = Cfg {
             depth: 8,
             iters: 500,
-            average: true,
+            snapshots: true,
         };
         let mut sv = Solver::new(&s, &ctx, &nets, cfg, bel.clone());
         // If any leaf were non-terminal the (empty) network would silently
@@ -201,11 +201,12 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
         }
         sv.multistep(cfg.iters);
 
+        let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
         let v0: f64 = (0..bel[0].len())
-            .map(|c| bel[0].p[c] as f64 * sv.root_values(0)[c] as f64)
+            .map(|c| bel[0].p[c] as f64 * vals[0][0][c] as f64)
             .sum();
         let v1: f64 = (0..bel[1].len())
-            .map(|c| bel[1].p[c] as f64 * sv.root_values(1)[c] as f64)
+            .map(|c| bel[1].p[c] as f64 * vals[0][1][c] as f64)
             .sum();
         // A zero-sum game solved consistently: the two players' root values
         // must cancel. This is the single most useful invariant on the
@@ -268,7 +269,7 @@ fn cfr_iteration_count_bias() {
         if bel[0].len() * bel[1].len() > 64 {
             continue;
         }
-        let probe = Solver::new(&s, &ctx, &nets, Cfg { depth: 8, iters: 1, average: true }, bel.clone());
+        let probe = Solver::new(&s, &ctx, &nets, Cfg { depth: 8, iters: 1, snapshots: true }, bel.clone());
         if !probe.nodes.iter().all(|n| !n.leaf || n.s.is_terminal()) || probe.nodes.len() > 8_000 {
             continue;
         }
@@ -286,13 +287,14 @@ fn cfr_iteration_count_bias() {
         let exact = oracle_value(&s, &ctx, &bel, 100);
         let mut line = format!("  {:+.4}   ", exact);
         for (bi, &t) in budgets.iter().enumerate() {
-            let mut sv = Solver::new(&s, &ctx, &nets, Cfg { depth: 8, iters: t, average: true }, bel.clone());
+            let mut sv = Solver::new(&s, &ctx, &nets, Cfg { depth: 8, iters: t, snapshots: true }, bel.clone());
             sv.multistep(t);
+            let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
             let v0: f64 = (0..bel[0].len())
-                .map(|c| bel[0].p[c] as f64 * sv.root_values(0)[c] as f64)
+                .map(|c| bel[0].p[c] as f64 * vals[0][0][c] as f64)
                 .sum();
             let v1: f64 = (0..bel[1].len())
-                .map(|c| bel[1].p[c] as f64 * sv.root_values(1)[c] as f64)
+                .map(|c| bel[1].p[c] as f64 * vals[0][1][c] as f64)
                 .sum();
             err[bi] += (v0 - exact).abs();
             nzs[bi] += (v0 + v1).abs();
@@ -405,7 +407,7 @@ fn draw_pass_through_consistency() {
             Cfg {
                 depth: 5,
                 iters: 80,
-                average: true,
+                snapshots: true,
             },
             bel.clone(),
         );
@@ -468,11 +470,12 @@ fn draw_pass_through_consistency() {
             );
         }
         sv.multistep(80);
+        let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
         let v0: f64 = (0..bel[0].len())
-            .map(|c| bel[0].p[c] as f64 * sv.root_values(0)[c] as f64)
+            .map(|c| bel[0].p[c] as f64 * vals[0][0][c] as f64)
             .sum();
         let v1: f64 = (0..bel[1].len())
-            .map(|c| bel[1].p[c] as f64 * sv.root_values(1)[c] as f64)
+            .map(|c| bel[1].p[c] as f64 * vals[0][1][c] as f64)
             .sum();
         assert!(
             (v0 + v1).abs() < 0.05,
