@@ -314,7 +314,11 @@ impl Belief {
         let mut cfg: Vec<Config> = Vec::with_capacity(pairs.len());
         let mut p: Vec<f32> = Vec::with_capacity(pairs.len());
         for (c, w) in pairs {
-            if w <= 0.0 {
+            // Support is reachability, not weight. The subgame tree keeps every
+            // reachable config and the walk indexes its strategy rows by
+            // position in this list, so a weight that underflowed to zero must
+            // not delete a row.
+            if w < 0.0 {
                 continue;
             }
             if cfg.last() == Some(&c) {
