@@ -1,17 +1,17 @@
-# t64_h512_dg96_s13 — the bigger network, 270 minutes
+# t64_h512_dg96_s13 — 270 minutes at hidden 512, dg 96
 
-**Date:** 2026-08-05 · **Result:** more capacity loses at every checkpoint.
+**Date:** 2026-08-05
 
-One change from the baseline run: hidden 512 (was 384) and dg 96 (was 64) — a
-bigger value network and a wider belief embedding, both at once. Everything
-else identical (T=64, depth 2, seed 13, 270 min, snapshots every 60 min).
+## What was run
 
-Rated on the merged ladder with `t64_h384_dg64_s11` (see that run's NOTES.md
-for the full table). The bigger net trails the baseline everywhere: 819 vs 876
-at 65 min, 911 vs 982 at 125, 1017 vs 1062 at the end, and its init is worse
-too (290 vs 362). Consistent with the project's standing finding that the
-network memorises and capacity buys nothing (`docs/REBEL.md` §5) — the new
-result is that this holds at 270 minutes, not just 30.
+Same schedule as t64_h384_dg64_s11 (270 min, warm 5 min, snapshots every 60
+min, iters 64, depth 2) with hidden 512 (was 384), dg 96 (was 64) and seed 13.
+Completed: 670 ReBeL epochs.
 
-`ladder.json` here is a copy of the merged ladder's file, so `plot.py` shows
-both runs' curves on one chart.
+Rated on the merged ladder with t64_h384_dg64_s11 (100 games per pairing, 64
+iters). Ratings: init 290, s1 819, s2 911, s3 973, s4 979, final 1017;
+t64_h384_dg64_s11's at the same snapshot times: 362, 876, 982, 1013, 1052,
+1062. Full table: runs/t64_h384_dg64_s11/NOTES.md.
+
+`ladder.json` in this directory is a copy of the merged ladder's file, so
+`plot.py` draws both runs' curves on one chart.
