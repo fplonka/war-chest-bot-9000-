@@ -5,9 +5,9 @@
 <title>War Chest — vs the ReBeL agent</title>
 <style>
   :root {
-    --bg: #1b1a18; --panel: #252320; --panel2: #2d2b27; --line: #3b3935;
-    --ink: #dedad3; --dim: #96918a; --acc: #d0a054; --gold: #d4a44c;
-    --white: #ece9e4; --black: #4d4a48;
+    --bg: #1a1a19; --panel: #242321; --panel2: #2c2b29; --line: #3a3a3a;
+    --ink: #dedcd7; --dim: #96938f; --acc: #d0a054; --gold: #d4a44c;
+    --white: #ecebe7; --black: #4c4b4d;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--ink);
@@ -62,19 +62,19 @@
   button.move { text-align: left; background: var(--panel2); color: var(--ink);
                 border: 1px solid var(--line); border-radius: 6px;
                 padding: 5px 10px; cursor: pointer; font-size: 13px; }
-  button.move:hover { border-color: var(--acc); background: #34322e; }
+  button.move:hover { border-color: var(--acc); background: #33322f; }
   button.move:disabled { opacity: .45; cursor: default; }
   #log { font-family: ui-monospace, Menlo, monospace; font-size: 12px;
          max-height: 200px; overflow-y: auto; }
   #log div { padding: 1px 0; color: var(--dim); }
   #log div.me { color: var(--ink); }
-  #log div.agent { color: #a89e8e; }
+  #log div.agent { color: #a69c8d; }
   #log div.draw { color: #7fa879; }
   #banner { display: none; font-weight: 700; font-size: 15px; padding: 8px 0; }
   #banner.win { color: #7fa879; } #banner.lose { color: #e06c75; }
   #banner.draw { color: var(--gold); }
   .marker-note { font-size: 11px; color: var(--dim); }
-  svg text.coord { fill: #6d6a65; font-size: 9px; }
+  svg text.coord { fill: #6c6a6c; font-size: 9px; }
   svg text.unit { font-size: 12px; font-weight: 700; text-anchor: middle;
                   dominant-baseline: central; }
 </style>
@@ -250,14 +250,14 @@ function renderBoard() {
     const m = markers.get(i);
     // location hexes get a bright outline and a tint by who controls them;
     // plain hexes are dark so the pieces stand out
-    let fill = "#2f2d2b", stroke = "#44413d", sw = 1.2;
+    let fill = "#2e2e2f", stroke = "#444241", sw = 1.2;
     if (li !== undefined) {
       sw = 2;
       // control is the loudest signal on the board: blue = you, red = agent,
       // grey = neutral, each in both the fill and the outline. The blue and
       // red are matched in weight so they read as one colour pair.
-      stroke = m === 0 ? "#a2b9df" : m === 1 ? "#d99c8f" : "#7d7973";
-      fill = m === 0 ? "#5b83c8" : m === 1 ? "#c25a4e" : "#43413e";
+      stroke = m === 0 ? "#a2b9df" : m === 1 ? "#d6958a" : "#7c7a7b";
+      fill = m === 0 ? "#5b83c8" : m === 1 ? "#bd5a50" : "#424143";
     }
     const hex = document.createElementNS(ns, "polygon");
     hex.setAttribute("points", hexPoints(cx, cy));
@@ -306,8 +306,8 @@ function renderBoard() {
       const c = document.createElementNS(ns, "circle");
       c.setAttribute("cx", cx); c.setAttribute("cy", cy);
       c.setAttribute("r", me ? 16 : 15);
-      c.setAttribute("fill", me ? "#ece9e4" : "#4d4a48");
-      c.setAttribute("stroke", me ? "#111014" : "#a7a29b");
+      c.setAttribute("fill", me ? "#ecebe7" : "#4c4b4d");
+      c.setAttribute("stroke", me ? "#111014" : "#a7a5a6");
       c.setAttribute("stroke-width", 2);
       g.appendChild(c);
       const u = document.createElementNS(ns, "text");
