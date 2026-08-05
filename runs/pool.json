@@ -1,0 +1,8 @@
+{
+  "note": "The best snapshots we have so far, used by every gate ladder via --pool. Elos are from the merged ladder over the 270-minute runs (runs/ladder_t64x512.log, Random pinned at 0). Update after every gate: drop the weakest entry when a new final beats it.",
+  "updated": "2026-08-06",
+  "entries": [
+    {"name": "t64_h384_dg64_s11.final", "run": "runs/t64_h384_dg64_s11", "file": "snap_05.pt", "t": 16200.0, "elo": 1062.0},
+    {"name": "t64_h512_dg96_s13.final", "run": "runs/t64_h512_dg96_s13", "file": "snap_05.pt", "t": 16200.0, "elo": 1017.0}
+  ]
+}

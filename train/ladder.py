@@ -91,16 +91,18 @@ def elo_stderr(n, elo):
     return out
 
 
-def players_of(runs, refs=True, labels=None):
+def players_of(runs, refs=True, labels=None, pool=None):
     """The ladder's entrants: optionally Random and Greedy, then each run's
-    snapshots.
+    snapshots, then the pool file's entries.
 
     Random first because it is the fixed zero of the scale; Greedy second
     because it is the other fixed reference. Both are pure functions of the
     rules, so a rating measured here is comparable to one measured in any other
     run (`--no-refs` skips them). Every run's snapshots follow, named
     `run.label` and loaded into their own slots, so a combined ladder over
-    several runs keeps each checkpoint's provenance.
+    several runs keeps each checkpoint's provenance. The pool file (see
+    `runs/pool.json`) lists the best snapshots we have so far by explicit
+    file, so a gate ladder is `ladder.py <newrun> --pool runs/pool.json`.
     """
     ps = []
     if refs:
@@ -116,15 +118,19 @@ def players_of(runs, refs=True, labels=None):
             ps.append({"name": f"{tag}.{s['label']}", "agent": "rebel",
                        "slot": len(ps), "t": s["t"], "file": s["file"],
                        "run": run})
+    for e in pool or []:
+        ps.append({"name": e["name"], "agent": "rebel", "slot": len(ps),
+                   "t": e.get("t"), "file": e["file"], "run": e["run"]})
     return ps
 
 
 def run(runs, out=None, games=60, depth=2, iters=64, temp=2.0,
-        random_draft=False, seed=7, refs=True, labels=None):
+        random_draft=False, seed=7, refs=True, labels=None, pool=None,
+        depth_b=0, iters_b=0):
     """Round robin, Elo fit, `ladder.json`, printed table. Returns the ratings."""
     if out is None:
         out = runs[0]
-    ps = players_of(runs, refs, labels)
+    ps = players_of(runs, refs, labels, pool)
     nets = [p for p in ps if p["agent"] == "rebel"]
     if not nets:
         raise SystemExit(f"{runs}: no snapshots in log.json")
@@ -150,7 +156,9 @@ def run(runs, out=None, games=60, depth=2, iters=64, temp=2.0,
         w, l, d = warchest.eval_match(games, seed + 1000 * i + j, a["agent"], b["agent"],
                                       depth=depth, iters=iters, temp=temp,
                                       slot_a=a["slot"], slot_b=b["slot"],
-                                      random_draft=random_draft)
+                                      random_draft=random_draft,
+                                      depth_b=depth_b if depth_b > 0 else None,
+                                      iters_b=iters_b if iters_b > 0 else None)
         n[i][j] = n[j][i] = w + l + d
         sc[i][j], sc[j][i] = w + 0.5 * d, l + 0.5 * d
         pairs.append({"a": a["name"], "b": b["name"], "w": w, "l": l, "d": d,
@@ -163,7 +171,7 @@ def run(runs, out=None, games=60, depth=2, iters=64, temp=2.0,
     elo = fit_elo(npr, spr)
     se = elo_stderr(n, elo)
     res = {"runs": list(runs), "games_per_pair": games, "depth": depth,
-           "iters": iters,
+           "iters": iters, "depth_b": depth_b, "iters_b": iters_b,
            "players": [{"name": p["name"], "t": p["t"], "elo": round(float(e), 1),
                         "se": round(float(s), 1),
                         "score": round(float(sc[i].sum() / max(n[i].sum(), 1)), 3)}
@@ -196,6 +204,12 @@ def main():
                     help="skip the Random and Greedy references")
     ap.add_argument("--labels", default=None,
                     help="only these snapshot labels, comma-separated (default: all)")
+    ap.add_argument("--pool", default=None,
+                    help="json file of fixed snapshot entries (the best so far)")
+    ap.add_argument("--depth-b", type=int, default=0,
+                    help="side B's search depth (default: same as side A)")
+    ap.add_argument("--iters-b", type=int, default=0,
+                    help="side B's CFR iterations (default: same as side A)")
     ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args()
     # Play at the runs' own search settings unless told otherwise: a checkpoint
@@ -205,12 +219,14 @@ def main():
     cfgs = [json.load(open(f"{d}/log.json")).get("cfg", {}) for d in args.out]
     depth = args.depth if args.depth > 0 else max(c.get("depth", 2) for c in cfgs)
     iters = args.iters if args.iters > 0 else max(c.get("iters", 64) for c in cfgs)
+    pool = json.load(open(args.pool)).get("entries", []) if args.pool else None
     run(args.out, out=args.dest, games=args.games, depth=depth, iters=iters,
         temp=args.temp,
         random_draft=args.random_draft or any(c.get("random_draft", False)
                                               for c in cfgs),
         seed=args.seed, refs=not args.no_refs,
-        labels=args.labels.split(",") if args.labels else None)
+        labels=args.labels.split(",") if args.labels else None,
+        pool=pool, depth_b=args.depth_b, iters_b=args.iters_b)
 
 
 if __name__ == "__main__":

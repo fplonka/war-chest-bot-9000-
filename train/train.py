@@ -150,6 +150,10 @@ class Buffer:
         an old one -- 6x at the defaults, or 3x the average rate -- while
         leaving every row reachable. Two uniform draws, and no weight vector to
         rebuild each epoch.
+
+        TurboReBeL's per-solve rows are thinned to the ~8 log-spaced iterates
+        plus the live belief before they reach the buffer, so rows inside one
+        solve are not near-duplicates and plain row sampling is unbiased.
         """
         ids = rng.integers(self.lo, self.rows, size=batch)
         k = int(batch * recent_mix)
@@ -157,6 +161,13 @@ class Buffer:
             span = max(1, int((self.rows - self.lo) * recent_frac))
             ids[:k] = rng.integers(self.rows - span, self.rows, size=k)
         return self.gather(ids)
+
+    def sample_old(self, batch, rng, recent_frac=0.2):
+        """A batch from outside the recent slice — the stale majority — for
+        the age-bucket loss. A diagnostic, not training."""
+        span = max(1, int((self.rows - self.lo) * recent_frac))
+        hi = max(self.lo + 1, self.rows - span)
+        return self.gather(rng.integers(self.lo, hi, size=batch))
 
     def ordered(self):
         """Live rows oldest-first.
@@ -389,7 +400,10 @@ def main():
         # are numbered, and the manifest carries the time each was taken at.
         # Relabelling instead of resaving keeps the ladder from rating the same
         # weights twice when the clock runs out just after a periodic snapshot.
-        if snaps and el - snaps[-1]["t"] < 30.0:
+        # The window is a quarter of the snapshot cadence: at 10-minute
+        # snapshots a 30-minute run's final lands ~30 s after the last timed
+        # snapshot, and rating both would waste ladder pairings on near-twins.
+        if snaps and el - snaps[-1]["t"] < args.snapshot_every * 60.0 / 4.0:
             snaps[-1]["label"] = label
             return
         path = f"{args.out}/snap_{len(snaps):02d}.pt"
@@ -447,6 +461,10 @@ def main():
         cw = np.asarray(d["cw"], np.float32)
         cy = np.clip(np.asarray(d["cy"], np.float32), -1.0, 1.0)
         coff = np.asarray(d["coff"], np.int64)
+        # TurboReBeL exposes the solve count so the train:generation ratio
+        # can count solves (the sampling unit of the data) instead of rows,
+        # which turbo multiplies by ~T for near-duplicate data.
+        solves = max(1, int(d["solves"]))
         buf.add(vx.astype(np.float16), cc, cw.astype(np.float16),
                 cy.astype(np.float16), coff)
         # A frozen batch from the warm phase. If the network's spread on it
@@ -463,7 +481,12 @@ def main():
         # is what keeps the ratio stable across depths -- a fixed count swings
         # the ratio by ~18x between depth 1 and depth 2, and over-trains the
         # thin first epochs after the buffer is cleared.
-        steps = max(1, round(args.train_gen_ratio * len(vx) / args.batch))
+        #
+        # The sample unit is the *solve*, not the row: TurboReBeL multiplies
+        # rows per solve by ~T, and counting rows would inflate the step count
+        # by the same factor for near-duplicate data. One solve is one sample,
+        # matching the buffer's sampling unit.
+        steps = max(1, round(args.train_gen_ratio * solves / args.batch))
         lv = train_steps(value, opt, buf, steps, args.batch, rng, dev,
                          augment=not args.no_augment, recent_mix=args.recent_mix,
                          recent_frac=args.recent_frac)
@@ -472,6 +495,20 @@ def main():
         with torch.no_grad():
             probe_std = float(value(*probe[:5], probe[6]).std()) \
                 if probe is not None else float("nan")
+            # Age-bucket loss: bootstrapped targets are written by past
+            # versions of the net, so old rows carry stale labels. This curve
+            # makes that staleness visible: if old-row loss falls while
+            # fresh-row loss rises, training is overfitting the buffer.
+            if len(buf) >= args.batch:
+                old_parts = make_batch(
+                    buf.sample_old(args.batch, rng, args.recent_frac), rng, dev, False)
+                loss_old = float(value_loss(value, *old_parts))
+                new_parts = make_batch(
+                    buf.sample(args.batch, rng, recent_mix=1.0,
+                               recent_frac=args.recent_frac), rng, dev, False)
+                loss_new = float(value_loss(value, *new_parts))
+            else:
+                loss_old = loss_new = float("nan")
 
         # Anneal the horizon payoff to zero on a fixed schedule over the first
         # `anneal_frac` of the ReBeL phase. It must not react to the observed
@@ -503,6 +540,8 @@ def main():
         dec = max(d["decisions"], 1)
         rec = {"t": round(time.time() - t0, 1), "epoch": epoch, "phase": phase,
                "games": d["games"], "decisions": dec, "loss": round(lv, 5),
+               "rows": len(vx), "solves": solves,
+               "loss_old": round(loss_old, 5), "loss_new": round(loss_new, 5),
                "cap_frac": round(d["cap_hits"] / max(d["games"], 1), 3),
                "configs": round(d["configs"] / dec, 1), "cap_value": round(cap_v, 4),
                "steps": steps,
@@ -517,8 +556,9 @@ def main():
         # multi-second epoch.
         write_log(args, log, snaps)
         print(f"[t={rec['t']:6.1f}s] {phase:6s} ep{epoch:3d} games={rec['games']:4d} "
-              f"dec={dec:6d} cap={rec['cap_frac']:.2f} cfgs={rec['configs']:5.1f} "
-              f"L={lv:.5f} tgt={tgt_mean:+.3f}/{tgt_std:.3f} pstd={probe_std:.3f} "
+              f"dec={dec:6d} rows={len(vx):6d} cap={rec['cap_frac']:.2f} "
+              f"cfgs={rec['configs']:5.1f} L={lv:.5f} old={loss_old:.5f} new={loss_new:.5f} "
+              f"tgt={tgt_mean:+.3f}/{tgt_std:.3f} pstd={probe_std:.3f} "
               f"capv={cap_v:.3f} lr={rec['lr']:.1e} gen={gen_s:.1f}s train={train_s:.1f}s",
               flush=True)
         epoch += 1

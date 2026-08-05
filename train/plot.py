@@ -129,11 +129,18 @@ def main():
     #    each snapshot was taken. The only strength measurement the run makes.
     elo_panel(axes[0][0], ladder)
 
-    # 2. Value loss. Linear: it settles inside a factor of about two, where a
-    #    log axis costs readable ticks and shows nothing extra.
+    # 2. Value loss, plus the age buckets: bootstrapped targets are written
+    #    by past versions of the net, so old rows carry stale labels. If the
+    #    old-row loss falls while the fresh-row loss rises, training is
+    #    overfitting the buffer. Linear: it settles inside a factor of about
+    #    two, where a log axis costs readable ticks and shows nothing extra.
     ax = axes[0][1]
     series(ax, t, [r["loss"] for r in reb], BLUE, "loss")
-    style(ax, "Value loss", "huber")
+    if "loss_old" in reb[-1]:
+        series(ax, t, [r["loss_old"] for r in reb], MAGENTA, "old rows", direct=False)
+        series(ax, t, [r["loss_new"] for r in reb], GREEN, "fresh rows", direct=False)
+        ax.legend(fontsize=8, frameon=False, loc="upper right", ncols=3)
+    style(ax, "Value loss  (old vs fresh rows = staleness)", "huber")
 
     # 3. The degeneracy canary. If the spread of the network's predictions
     #    collapses toward zero, the value function has gone flat -- the failure
