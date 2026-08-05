@@ -15,9 +15,10 @@
 
 use std::collections::HashMap;
 
+use warchest::board::NONE;
 use warchest::rebel::*;
 use warchest::rng::Rng;
-use warchest::search::{node_actions, Cfg, Nets, Solver};
+use warchest::search::{action_coin, node_actions, Cfg, Nets, Solver};
 use warchest::selfplay::make_game;
 use warchest::state::{State, MAX_MAIN_PLAYS, Z_BAG, Z_FACEDOWN, Z_HAND};
 
@@ -501,4 +502,73 @@ fn draw_pass_through_consistency() {
         cnt[0], cnt[1], cnt[2], cnt[3], cnt[4]
     );
     assert!(checked >= 4, "only {} draw positions exercised", checked);
+}
+
+#[test]
+fn depth_is_spent_on_coin_plays_not_micro_choices() {
+    // "depth 2" means "my coin play, then yours". A compound tactic
+    // (cavalry: move, then choose the attack) is several decision nodes for
+    // one coin, and charging a depth unit per decision node would exhaust the
+    // budget inside one tactic — zero opponent moves in the tree. Find a
+    // position where the acting player has a free micro-choice available and
+    // check that depth is not consumed by it.
+    let nets = [Nets::default(), Nets::default()];
+    let mut rng = Rng::new(1234);
+    for _ in 0..400 {
+        let mut s = make_game(&mut rng, false);
+        while !s.is_terminal() {
+            if s.is_chance() {
+                let acts = s.legal_actions();
+                s.apply_inplace(acts[rng.below(acts.len())]);
+                continue;
+            }
+            let acts = s.legal_actions();
+            // A free action whose child is a plain decision node: a draw
+            // or terminal child would be a leaf/expanded under both countings
+            // and the test would not discriminate the fix.
+            let free = acts.iter().any(|a| action_coin(a, &s) == NONE);
+            if free && acts.iter().any(|a| {
+                action_coin(a, &s) == NONE && {
+                    let mut cs = s.clone();
+                    cs.apply_inplace(*a);
+                    !cs.is_terminal() && !cs.is_chance()
+                }
+            }) {
+                let ctx = Ctx::new(&s);
+                let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
+                let root_player = s.to_act();
+                // Depth 1: the micro-choice (the root's free child) rides
+                // free, so it is still expanded even though the root sits at
+                // the depth limit. Under the old counting every child of the
+                // root was a leaf and this assertion failed.
+                let mut sv = Solver::new(
+                    &s, &ctx, &nets[0],
+                    Cfg { depth: 1, iters: 4, snapshots: false },
+                    bel,
+                );
+                sv.multistep(4);
+                assert!(
+                    sv.nodes.iter().skip(1).any(|n| !n.leaf),
+                    "depth 1 was consumed by a tactic micro-choice: nothing expanded below the root"
+                );
+                // Depth 2: the opponent's first main play is reached after
+                // one completed coin play, so it must be expanded, not a leaf.
+                let mut sv = Solver::new(
+                    &s, &ctx, &nets[0],
+                    Cfg { depth: 2, iters: 4, snapshots: false },
+                    [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)],
+                );
+                sv.multistep(4);
+                if sv.nodes.iter().any(|n| n.player != root_player) {
+                    assert!(
+                        sv.nodes.iter().any(|n| n.player != root_player && !n.leaf),
+                        "depth 2 contained only leaf opponent nodes: the opponent's move never got expanded"
+                    );
+                }
+                return;
+            }
+            s.apply_inplace(acts[rng.below(acts.len())]);
+        }
+    }
+    panic!("no position with a free micro-choice found in 400 random games");
 }

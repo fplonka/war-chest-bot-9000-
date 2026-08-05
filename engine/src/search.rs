@@ -315,6 +315,10 @@ pub struct Solver<'a> {
     /// `t` is the average strategy at iterate t, and the last is the reference
     /// strategy `value_under` and the walk act on. Pooled across solves.
     snaps: Vec<Vec<f32>>,
+    /// Which snapshot the next `snapshot()` call is (0 = the pre-iteration
+    /// average). Drives the log-spaced thinning: the carried beliefs are one
+    /// per *kept* iterate, and the spread is in the early ones.
+    snap_t: usize,
     /// Total strategy cells (sum over decision nodes of `nc * na`), so the
     /// snapshot arenas are reserved to size instead of grown.
     ncells: usize,
@@ -423,6 +427,7 @@ impl<'a> Solver<'a> {
             sum_strat: Vec::new(),
             avg: Vec::new(),
             snaps: take_snaps(),
+            snap_t: 0,
             ncells: 0,
             reach: Vec::new(),
             roff: Vec::new(),
@@ -534,8 +539,20 @@ impl<'a> Solver<'a> {
 
     /// One flat copy of `avg`, aligned with `soff`: snapshot `t` is the
     /// average strategy at iterate t.
+    ///
+    /// Thinning: the carried beliefs are one per *kept* iterate, and the
+    /// spread is in the early iterations — the late ones all repeat the final
+    /// average — so only the log-spaced iterates (0, 1, 2, 4, 8, ...) plus the
+    /// final one are stored. The final one is the reference strategy Phase 2
+    /// and the walk act on (`value_under` reads `snaps.last()`), so it is kept
+    /// however many iterations actually run.
     fn snapshot(&mut self) {
         if !self.cfg.snapshots {
+            return;
+        }
+        let t = self.snap_t;
+        self.snap_t += 1;
+        if t != 0 && !t.is_power_of_two() && t < self.cfg.iters {
             return;
         }
         let mut snap = Vec::with_capacity(self.ncells);
@@ -553,7 +570,17 @@ impl<'a> Solver<'a> {
         // depth cost). Other chance nodes (Warrior Priest draws — excluded
         // from every draft) stay leaves, as do depth-0 nodes and terminals.
         let draw_pass = matches!(s.pending(), Cont::Draw { .. });
-        let leaf = s.is_terminal() || (!draw_pass && (depth == 0 || s.is_chance()));
+        // Depth counts completed coin plays. A decision node at depth 0 is a
+        // leaf only if it can spend a coin; a node whose actions all spend
+        // nothing is a tactic's micro-choice (cavalry: move, then choose the
+        // attack) and rides free even at the budget's edge. Otherwise "depth
+        // 2" would sometimes contain zero opponent moves, because a compound
+        // tactic is several decision nodes for one coin.
+        let mut leaf = s.is_terminal() || (!draw_pass && s.is_chance());
+        if !leaf && !draw_pass && depth == 0 {
+            let (acts0, _, _) = node_actions(&s, player, self.ctx, &cfgs[player as usize]);
+            leaf = acts0.iter().any(|a| action_coin(a, &s) != NONE);
+        }
         let id = self.nodes.len();
         let _tp = timed!(BPUSH);
         self.nodes.push(TNode {
@@ -745,7 +772,15 @@ impl<'a> Solver<'a> {
             drop(tb);
             let mut cc = cfgs.clone();
             cc[me] = std::mem::take(&mut child_cfgs[ch]).into();
-            child.push(self.build(cs, depth - 1, cc));
+            // One depth unit per *completed coin play*, not per decision node:
+            // an observation group whose actions all spend no coin is inside a
+            // tactic and rides free. Children are only built from non-leaf
+            // nodes, and a depth-0 non-leaf is all-free, so this never
+            // underflows.
+            let spends = obs_act[obs_start[ch] as usize..obs_start[ch + 1] as usize]
+                .iter()
+                .any(|&au| action_coin(&acts[au as usize], &s) != NONE);
+            child.push(self.build(cs, depth - usize::from(spends), cc));
         }
 
         let n = &mut self.nodes[id];

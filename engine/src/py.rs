@@ -567,11 +567,26 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
         if d.nv == 0 { 0 } else { 2 * d.nv + 1 },
         "config offsets do not match the row count"
     );
+    // Internal `soff` holds one start per solve; the exposed array appends
+    // the total row count as the trailing entry, so `len - 1` is the number
+    // of solves.
+    let n_solves = d.soff.len();
+    let mut soff = d.soff.clone();
+    soff.push(d.nv as u32);
+    if !soff.is_empty() {
+        assert_eq!(soff[0], 0, "solve offsets must start at row 0");
+        assert!(
+            soff.windows(2).all(|w| w[0] < w[1]),
+            "solve offsets must be strictly increasing"
+        );
+    }
     out.set_item("vx", d.vx.into_pyarray_bound(py))?;
     out.set_item("cc", d.cc.into_pyarray_bound(py))?;
     out.set_item("cw", d.cw.into_pyarray_bound(py))?;
     out.set_item("cy", d.cy.into_pyarray_bound(py))?;
     out.set_item("coff", d.coff.into_pyarray_bound(py))?;
+    out.set_item("soff", soff.into_pyarray_bound(py))?;
+    out.set_item("solves", n_solves)?;
     Ok(out.into())
 }
 
@@ -624,8 +639,11 @@ fn gen_data(
 }
 
 /// Head-to-head evaluation with alternating colours and paired drafts.
+/// `depth_b`/`iters_b` override side B's search settings, so one net can be
+/// pitted against itself at different depths or iteration counts (the depth
+/// probe); they default to side A's.
 #[pyfunction]
-#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=false))]
+#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=false, depth_b=None, iters_b=None))]
 #[allow(clippy::too_many_arguments)]
 fn eval_match(
     py: Python<'_>,
@@ -639,13 +657,20 @@ fn eval_match(
     slot_a: usize,
     slot_b: usize,
     random_draft: bool,
+    depth_b: Option<usize>,
+    iters_b: Option<usize>,
 ) -> PyResult<(usize, usize, usize)> {
     let cfg = Cfg {
         depth,
         iters,
         snapshots: false,
     };
-    let (aa, bb) = (agent_of(a, cfg, temp, slot_a)?, agent_of(b, cfg, temp, slot_b)?);
+    let cfg_b = Cfg {
+        depth: depth_b.unwrap_or(depth),
+        iters: iters_b.unwrap_or(iters),
+        snapshots: false,
+    };
+    let (aa, bb) = (agent_of(a, cfg, temp, slot_a)?, agent_of(b, cfg_b, temp, slot_b)?);
     Ok(py.allow_threads(|| {
         let n = nets().read().unwrap();
         rs_eval_match(games, seed, &n, aa, bb, random_draft)

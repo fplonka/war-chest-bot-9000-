@@ -266,6 +266,13 @@ pub struct Data {
     pub cy: Vec<f32>,
     /// `[2 * n + 1]` arena offsets.
     pub coff: Vec<u32>,
+    /// Solve starts in row space: `soff[k]` is the row at which solve k
+    /// starts (first entry 0). The Python binding appends the total row count
+    /// as the trailing entry, so the buffer sees `soff[k]..soff[k+1]` as one
+    /// solve's rows. TurboReBeL produces T+1 near-duplicate rows per solve,
+    /// so the replay buffer treats the solve as its sampling unit — this
+    /// array is what lets it. Empty when no rows were collected.
+    pub soff: Vec<u32>,
     pub nv: usize,
     pub games: usize,
     pub decisions: usize,
@@ -288,6 +295,8 @@ impl Data {
         let tail = if self.coff.is_empty() { 0 } else { 1 };
         self.coff
             .extend(o.coff.iter().skip(tail).map(|x| x + base));
+        let rb = self.nv as u32;
+        self.soff.extend(o.soff.iter().map(|x| x + rb));
         self.nv += o.nv;
         self.games += o.games;
         self.decisions += o.decisions;
@@ -296,6 +305,12 @@ impl Data {
         self.draws += o.draws;
         self.cap_hits += o.cap_hits;
         self.configs += o.configs;
+    }
+
+    /// Mark the start of a solve's rows. One call per solve, before its rows
+    /// are pushed; `soff[k]` is the row index where solve k starts.
+    pub fn begin_solve(&mut self) {
+        self.soff.push(self.nv as u32);
     }
 
     /// `y[p]` holds one value per *config* in `bel[p]`. Every one of them is
@@ -498,6 +513,7 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
                         } else {
                             std::mem::take(&mut carried)
                         };
+                        data.begin_solve();
                         for r in &roots {
                             assert_eq!(r[0].len(), bel[0].cfg.len(),
                                        "carried belief does not match the root support: {} vs {} at dec {}",
@@ -568,6 +584,7 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
             // antisymmetric, so this stays zero-sum.
             let e = eval_squashed(&s, 0);
             let (a, b) = (vec![e; bel[0].len()], vec![-e; bel[1].len()]);
+            data.begin_solve();
             data.push_value(&s, &ctx, &bel, [&a, &b]);
         }
 
