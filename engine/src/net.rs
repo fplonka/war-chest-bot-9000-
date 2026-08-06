@@ -758,6 +758,31 @@ impl Mlp {
         let (hex_e, piles) = (N_HEXES * HEX_FACTS, N_HEXES * (HEX_FACTS + de));
         fit(x, rows * xd);
         x[..rows * xd].fill(0.0);
+        // The pile summary reads [4 counts | card embedding] per coin type. The
+        // card half is the same at every leaf of a solve, so it is folded into
+        // the bias once and only the four counts move per row -- which turns the
+        // rest into a single matmul over every (leaf, coin type).
+        let mut pe = vec![0.0f32; NTYPE * de];
+        for t in 0..NTYPE {
+            let out = &mut pe[t * de..(t + 1) * de];
+            out.copy_from_slice(&self.bpile);
+            for i in 0..de {
+                let v = e[t * de + i];
+                let w = &self.wpile[(PILE_COUNTS + i) * de..(PILE_COUNTS + i + 1) * de];
+                for j in 0..de {
+                    out[j] += v * w[j];
+                }
+            }
+        }
+        let mut cnt = vec![0.0f32; rows * NTYPE * PILE_COUNTS];
+        let step = NTYPE * PILE_COUNTS;
+        for r in 0..rows {
+            cnt[r * step..(r + 1) * step]
+                .copy_from_slice(&xpub[r * stride + OFF_PILES..r * stride + OFF_PILES + step]);
+        }
+        let mut ph = vec![0.0f32; rows * NTYPE * de];
+        gemm_ld(rows * NTYPE, de, PILE_COUNTS, &cnt, PILE_COUNTS, &self.wpile, de, 0.0,
+                &mut ph, de);
         for r in 0..rows {
             let src = &xpub[r * stride..r * stride + PUBFEAT];
             let dst = &mut x[r * xd..(r + 1) * xd];
@@ -771,15 +796,10 @@ impl Mlp {
                 }
             }
             for t in 0..NTYPE {
-                let c = &src[OFF_PILES + t * PILE_COUNTS..OFF_PILES + (t + 1) * PILE_COUNTS];
-                let et = &e[t * de..(t + 1) * de];
                 let acc = &mut dst[piles + (t / NSLOT) * de..piles + (t / NSLOT) * de + de];
+                let o = &ph[(r * NTYPE + t) * de..(r * NTYPE + t + 1) * de];
                 for j in 0..de {
-                    let mut s = self.bpile[j];
-                    for (i, v) in c.iter().chain(et.iter()).enumerate() {
-                        s += v * self.wpile[i * de + j];
-                    }
-                    acc[j] += s.max(0.0);
+                    acc[j] += (o[j] + pe[t * de + j]).max(0.0);
                 }
             }
             dst[piles + 2 * de..].copy_from_slice(&src[OFF_LOOSE..OFF_LOOSE + LOOSE]);
@@ -809,36 +829,40 @@ impl Mlp {
             }
         } else {
             let (de, hf) = (self.de(), HFEAT_OF(self.de()));
-            let mut inp = vec![0.0f32; NSLOT * hf];
-            for r in 0..n {
-                let p = &phi[r * self.cfeat()..(r + 1) * self.cfeat()];
-                let seat = p[CCOUNTS];
-                for k in 0..NSLOT {
-                    let row = &mut inp[k * hf..(k + 1) * hf];
-                    row[0] = p[k];
-                    row[1] = p[NSLOT + k];
-                    row[2] = p[2 * NSLOT + k];
-                    row[3] = seat;
-                    let t = seat as usize * NSLOT + k;
-                    row[4..].copy_from_slice(&e[t * de..(t + 1) * de]);
-                }
-                let out = &mut z[r * dg..(r + 1) * dg];
-                out.fill(0.0);
-                for k in 0..NSLOT {
-                    let row = &inp[k * hf..(k + 1) * hf];
-                    for j in 0..dg {
-                        let mut s = self.bc[j];
-                        for (i, v) in row.iter().enumerate() {
-                            s += v * self.wc[i * dg + j];
-                        }
-                        // Rectify *before* the sum. A sum of raw linear maps would
-                        // be a linear map of the sum, and the sum of the inputs has
-                        // forgotten which count belongs to which card -- which is
-                        // the one thing this tower exists to remember.
-                        out[j] += s.max(0.0);
-                    }
+        let cf = self.cfeat();
+        // The five slot rows are independent and identically shaped, so the
+        // whole tower is one matmul over [n * NSLOT, hf] and a segmented sum --
+        // not a scalar triple loop per config, which is what this was and which
+        // left the vector units idle for the widest per-config work there is.
+        let mut inp = vec![0.0f32; n * NSLOT * hf];
+        for r in 0..n {
+            let p = &phi[r * cf..(r + 1) * cf];
+            let seat = p[CCOUNTS];
+            for k in 0..NSLOT {
+                let row = &mut inp[(r * NSLOT + k) * hf..(r * NSLOT + k + 1) * hf];
+                row[0] = p[k];
+                row[1] = p[NSLOT + k];
+                row[2] = p[2 * NSLOT + k];
+                row[3] = seat;
+                let t = seat as usize * NSLOT + k;
+                row[4..].copy_from_slice(&e[t * de..(t + 1) * de]);
+            }
+        }
+        let mut slot = vec![0.0f32; n * NSLOT * dg];
+        gemm_ld(n * NSLOT, dg, hf, &inp, hf, &self.wc, dg, 0.0, &mut slot, dg);
+        for r in 0..n {
+            let out = &mut z[r * dg..(r + 1) * dg];
+            out.fill(0.0);
+            for k in 0..NSLOT {
+                let o = &slot[(r * NSLOT + k) * dg..(r * NSLOT + k + 1) * dg];
+                // Rectify before the sum: a sum of raw linear maps is a linear
+                // map of the sum, which has forgotten which count belongs to
+                // which card -- the one thing this tower exists to remember.
+                for j in 0..dg {
+                    out[j] += (o[j] + self.bc[j]).max(0.0);
                 }
             }
+        }
         }
         fit(g, n * (rk + 1));
         gemm_ld(
