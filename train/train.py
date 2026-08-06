@@ -291,43 +291,46 @@ def policy_loss(net, d, ids, device):
     return (ce * w).sum() / w.sum().clamp(min=1e-6)
 
 
-def policy_steps(net, opt, d, batch, rng, device, weight):
-    """Fit the policy head to this epoch's solves. Returns the mean loss."""
-    n = len(d["prow"])
-    if n == 0:
-        return float("nan")
-    tot, steps = 0.0, max(1, n // batch)
-    for _ in range(steps):
-        loss = policy_loss(net, d, rng.choice(n, min(batch, n), replace=False), device)
-        tot += loss.detach().item()
-        opt.zero_grad(set_to_none=True)
-        (weight * loss).backward()
-        nn.utils.clip_grad_norm_(net.parameters(), 5.0)
-        opt.step()
-    return tot / steps
-
-
 def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
-                recent_mix=0.0, recent_frac=0.2, aux_weight=0.0):
+                recent_mix=0.0, recent_frac=0.2, aux_weight=0.0, policy_weight=0.0,
+                d=None, policy_batch=64):
+    """Returns the mean value loss and the mean policy loss.
+
+    The side tasks are summed into the same backward as the value loss, not
+    stepped separately. Adam divides a gradient by its own magnitude, so a
+    constant in front of a *standalone* step almost cancels -- a weight only
+    means anything when it sets one term's size against another's in one sum.
+    """
     if len(buf) < batch:
-        return float("nan")
-    tot = 0.0
+        return float("nan"), float("nan")
+    live = policy_weight > 0.0 and d is not None and len(d["prow"]) > 0
+    # Drawn unconditionally, and from its own stream: sampling policy labels out
+    # of `rng` would shift every later value batch, so turning the policy on
+    # would change the value batches too and any comparison against it would be
+    # measuring the sampling, not the side task.
+    prng = np.random.default_rng(rng.integers(1 << 62))
+    tot, ptot = 0.0, 0.0
     for _ in range(steps):
         *parts, ay = make_batch(buf.sample(batch, rng, recent_mix, recent_frac),
                                rng, device, augment)
         loss = value_loss(net, *parts)
         # What is reported is the value loss alone, so the column means the same
-        # thing whether or not the auxiliary heads are on.
+        # thing whether or not the side tasks are on.
         tot += loss.detach().item()
-        # The auxiliary heads share the trunk and are dropped at play time, so
-        # they are extra gradient per row for nothing at inference.
+        # Both side tasks share the trunk and are dropped at play time, so they
+        # are extra gradient per row for nothing at inference.
         if aux_weight > 0.0:
             loss = loss + aux_weight * net.aux_loss(parts[0], ay)
+        if live:
+            n = len(d["prow"])
+            pl = policy_loss(net, d, prng.choice(n, min(policy_batch, n), replace=False), device)
+            ptot += pl.detach().item()
+            loss = loss + policy_weight * pl
         opt.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(net.parameters(), 5.0)
         opt.step()
-    return tot / steps
+    return tot / steps, (ptot / steps if live else float("nan"))
 
 
 def write_log(args, epochs, snaps):
@@ -585,9 +588,8 @@ def main():
         # by the same factor for near-duplicate data. One solve is one sample,
         # matching the buffer's sampling unit.
         steps = max(1, round(args.train_gen_ratio * solves / args.batch))
-        lp = (policy_steps(value, opt, d, 256, rng, dev, args.policy)
-              if args.policy > 0.0 and phase == "rebel" else float("nan"))
-        lv = train_steps(value, opt, buf, steps, args.batch, rng, dev, aux_weight=args.aux,
+        lv, lp = train_steps(value, opt, buf, steps, args.batch, rng, dev, aux_weight=args.aux,
+                             policy_weight=(args.policy if phase == "rebel" else 0.0), d=d,
                          augment=not args.no_augment, recent_mix=args.recent_mix,
                          recent_frac=args.recent_frac)
         train_s = time.time() - tt
