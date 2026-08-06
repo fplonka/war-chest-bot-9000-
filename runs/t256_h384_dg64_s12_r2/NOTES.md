@@ -57,3 +57,30 @@ hypothesis both move up.
 - Pool: `runs/pool.json` = t64_h384_dg64_s11.final (1033), s4 (1021).
 - Next: 3a (turbo T=64, d=2, 4.5h), then 3b (turbo T=512, d=2, 4.5h), then
   the turbo ladders and the finals-only ladder against runs 1-3.
+
+Raw results — ladder_3runs (all 18 snapshots of the three 270-min runs + refs, 40 games/pairing at depth 2 / 64 iters):
+
+```
+=== Elo (runs/ladder_3runs, random = 0) ===
+                      player   trained     elo    +-   score
+     t64_h384_dg64_s11.final  270.0min    1033    16   0.777
+        t64_h384_dg64_s11.s4  245.5min    1021    16   0.766
+        t64_h384_dg64_s11.s3  185.3min    1008    16   0.752
+     t64_h512_dg96_s13.final  270.2min     970    15   0.713
+        t64_h512_dg96_s13.s4  245.9min     968    15   0.711
+        t64_h384_dg64_s11.s2  125.2min     927    15   0.666
+        t64_h512_dg96_s13.s3  185.8min     924    15   0.663
+        t64_h512_dg96_s13.s2  125.7min     889    15   0.624
+        t64_h384_dg64_s11.s1   65.0min     876    15   0.609
+ t256_h384_dg64_s12_r2.final  270.2min     853    15   0.583
+    t256_h384_dg64_s12_r2.s4  248.1min     831    15   0.559
+    t256_h384_dg64_s12_r2.s3  187.3min     830    15   0.558
+        t64_h512_dg96_s13.s1   65.4min     810    15   0.536
+    t256_h384_dg64_s12_r2.s2  126.8min     756    16   0.479
+    t256_h384_dg64_s12_r2.s1   65.9min     699    16   0.422
+      t64_h384_dg64_s11.init    5.0min     317    23   0.164
+  t256_h384_dg64_s12_r2.init    5.0min     310    24   0.161
+      t64_h512_dg96_s13.init    5.0min     271    24   0.142
+                      greedy         -     131    27   0.080
+                      random         -       0    33   0.035
+```

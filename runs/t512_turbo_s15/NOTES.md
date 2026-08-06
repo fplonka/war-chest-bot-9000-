@@ -40,3 +40,38 @@ finals ladder run right after). Notes from the run's own log:
   the commit the runs actually used.
 - Ladders done: turbo-vs-turbo (runs/ladder_turbo) and finals-only
   (runs/ladder_finals). Pool: s11.final (919), t64_turbo_s14.final (904).
+
+Raw results — ladder_turbo (turbo64 vs turbo512, all snapshots, 40 games/pairing at depth 2 / 64 iters):
+
+```
+=== Elo (runs/ladder_turbo, random = 0) ===
+                      player   trained     elo    +-   score
+         t64_turbo_s14.final  270.1min    1099    24   0.859
+            t64_turbo_s14.s4  245.9min    1051    22   0.821
+            t64_turbo_s14.s3  185.8min    1050    22   0.820
+            t64_turbo_s14.s2  125.4min     984    21   0.764
+            t64_turbo_s14.s1   65.4min     863    20   0.649
+        t512_turbo_s15.final  270.0min     767    20   0.554
+           t512_turbo_s15.s3  189.8min     755    20   0.542
+           t512_turbo_s15.s4  251.0min     740    20   0.528
+           t512_turbo_s15.s2  127.8min     693    20   0.482
+           t512_turbo_s15.s1   65.0min     641    21   0.434
+         t512_turbo_s15.init    5.0min     374    26   0.229
+          t64_turbo_s14.init    5.0min     297    27   0.182
+                      greedy         -     135    31   0.096
+                      random         -       0    38   0.040
+```
+
+Raw results — ladder_finals (run1/2/3 + both turbo finals + refs, 40 games/pairing at depth 2 / 64 iters):
+
+```
+=== Elo (runs/ladder_finals, random = 0) ===
+                      player   trained     elo    +-   score
+     t64_h384_dg64_s11.final  270.0min     919    30   0.777
+         t64_turbo_s14.final  270.1min     904    29   0.760
+     t64_h512_dg96_s13.final  270.2min     841    28   0.688
+ t256_h384_dg64_s12_r2.final  270.2min     793    28   0.631
+        t512_turbo_s15.final  270.0min     634    31   0.456
+                      greedy         -     226    47   0.154
+                      random         -       0    58   0.033
+```
