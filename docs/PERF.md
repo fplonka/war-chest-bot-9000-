@@ -234,3 +234,52 @@ composed step by step over intermediate supports that grow by ~5x each time,
 where the multivariate hypergeometric gives the same answer directly from the
 parent support in roughly a third of the entries. It needs a fallback for the
 mid-run reshuffle case, and an oracle against the step-by-step chain.
+
+## A second pass, after the card describer and the policy head
+
+Those two added new per-solve work, and it was all written as scalar triple
+loops sitting next to matmuls that run at ~1.3 Tflop/s. Fixing that, and moving
+one older loop onto the coprocessor as well, is **+8.9%** end to end on the
+generation benchmark, with bit-identical trajectories — the same 3731 decisions
+and 14448 targets either side, so no sampled action moved.
+
+| | |
+|---|---|
+| holding tower | one matmul over `[n * NSLOT, hf]` plus a segmented sum |
+| pile summary | the card half is constant across a solve, so it folds into the bias; what is left is four counts wide |
+| per-config readout | `[rows, rank] x [ncfg, rank]^T` instead of ~8.5k short NEON dots per iteration |
+| policy logits | same shape, same new `gemm_nt` |
+
+The readout is the interesting one: it is **~7x the arithmetic** — a leaf carries
+~18 configs and a solve interns ~160 — and still wins, because AMX against NEON
+is worth far more than 7x.
+
+### Three things that did not work
+
+**Splitting the belief projection by player.** An alternating iteration moves one
+player's beliefs, so half the widest per-iteration matmul is reusable. 8% slower:
+fusing the two halves costs a full `[rows, hidden]` read-add-write per iteration,
+which moves about four times the memory the halved matmul saves.
+
+**The same batching trick on the belief encoding.** `[rows, ncfg] x [ncfg, dg]`
+instead of a gather-accumulate per leaf — the exact trade that won for the
+readout — came out 3.5% *slower*. The asymmetry is what to remember: the readout's
+gemm reads two matrices that already exist densely, while this one has to
+materialise a mostly-zero `[rows, ncfg]` weight matrix every iteration. Building
+the input cost more than the coprocessor saved.
+
+**Deferring the average strategy.** It is normalised out of its running sum every
+iteration but only *read* at the log-spaced snapshots, ~9 times in 64. Computing
+it lazily is 2% slower, because the per-iteration version got the row sum for
+free inside the accumulation it was already doing, while a lazy pass has to
+re-read the sums — and 9 passes over both players is about the same work as 64
+over one.
+
+### On measuring any of this
+
+The first pass's warning about a busy machine was understated. Single runs here
+vary by 12%, and sequential A/B — build one, measure, build the other, measure —
+gave the *wrong sign* on two of these three. Every number above is
+**interleaved** (A, B, A, B, ...) and best-of-N, which is the only way a 3%
+effect is separable from drift on a laptop. `rebelbench` takes a warm-start
+weight as its sixth argument so the policy path can be profiled too.

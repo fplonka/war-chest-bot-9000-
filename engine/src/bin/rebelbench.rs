@@ -7,7 +7,7 @@
 //! 10-minute training run is the difference between a 20-second and a
 //! 20-minute edit-measure cycle.
 //!
-//! Usage: `rebelbench <weights.bin> [games] [depth] [iters] [threads]`
+//! Usage: `rebelbench <weights.bin> [games] [depth] [iters] [threads] [warm]`
 
 use std::time::Instant;
 use warchest::net::Mlp;
@@ -21,6 +21,7 @@ fn main() {
     let depth: usize = a.get(3).and_then(|x| x.parse().ok()).unwrap_or(2);
     let iters: usize = a.get(4).and_then(|x| x.parse().ok()).unwrap_or(64);
     let threads: usize = a.get(5).and_then(|x| x.parse().ok()).unwrap_or(0);
+    let warm: f32 = a.get(6).and_then(|x| x.parse().ok()).unwrap_or(0.0);
     if threads > 0 {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -39,6 +40,7 @@ fn main() {
         depth,
         iters,
         snapshots: true,
+        warm,
         ..Default::default()
     };
     let agent = Agent::Rebel { cfg, slot: 0 };
