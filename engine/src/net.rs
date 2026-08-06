@@ -449,6 +449,10 @@ pub struct Mlp {
     bd0: Vec<f32>,
     wd1: Vec<f32>,
     bd1: Vec<f32>,
+    /// Learned per-unit identity embedding `[N_UNITS, de]`, added to the
+    /// describer's fact output: the facts let related cards share learning,
+    /// the id lets an individual card be memorised. Both paths together.
+    wid: Vec<f32>,
     /// Pile summary: `[PILE_COUNTS + de, de]` and its bias. Per coin type, its
     /// four public counts alongside its card embedding, summed per player. A sum
     /// has no order, so any draft fits.
@@ -477,8 +481,11 @@ impl Mlp {
         }
         let (h, dg, rk, de, dc) = (dims[1], dims[3], dims[4], dims[6], dims[7]);
         let (af, hf, xd) = (dims[5] + de, HFEAT_OF(de), xdim_of(de));
+        // The learned per-unit identity table is `[N_UNITS, de]`; the unit
+        // count is a game constant, so it needs no dims entry.
         let want_w = CARD_FEATS * dc
             + dc * de
+            + crate::units::N_UNITS * de
             + (PILE_COUNTS + de) * de
             + xd * h
             + h * h
@@ -505,9 +512,10 @@ impl Mlp {
             wi += n;
             v
         };
-        let (wd0, wd1, wpile, w0, w1, wb, wc, wg, wu, wq, wk, wp) = (
+        let (wd0, wd1, wid, wpile, w0, w1, wb, wc, wg, wu, wq, wk, wp) = (
             take(CARD_FEATS * dc),
             take(dc * de),
+            take(crate::units::N_UNITS * de),
             take((PILE_COUNTS + de) * de),
             take(xd * h),
             take(h * h),
@@ -565,6 +573,7 @@ impl Mlp {
             bd0,
             wd1,
             bd1,
+            wid,
             wpile,
             bpile,
         })
@@ -736,8 +745,10 @@ impl Mlp {
     ///
     /// Reads the card block of any public row — the cards in play are fixed at
     /// the draft, so every row of a game carries the same block and a solve
-    /// builds this once.
-    pub fn cards(&self, xpub_row: &[f32], e: &mut Vec<f32>) {
+    /// builds this once. `ids` is the per-coin-type unit id in player-major
+    /// slot order (what a replay row stores); the learned id embedding is
+    /// added to the facts' output.
+    pub fn cards(&self, xpub_row: &[f32], ids: &[u8], e: &mut Vec<f32>) {
         if self.v1() {
             e.clear();
             return;
@@ -769,8 +780,13 @@ impl Mlp {
             de,
         );
         for t in 0..NTYPE {
-            for (x, b) in e[t * de..(t + 1) * de].iter_mut().zip(self.bd1.iter()) {
+            let out = &mut e[t * de..(t + 1) * de];
+            for (x, b) in out.iter_mut().zip(self.bd1.iter()) {
                 *x += *b;
+            }
+            let id = ids[t] as usize;
+            for j in 0..de {
+                out[j] += self.wid[id * de + j];
             }
         }
     }
@@ -1156,7 +1172,14 @@ impl Mlp {
     ///
     /// The card table is rebuilt per row here, because these callers batch rows
     /// from different games. A solve builds it once.
-    pub fn forward(&self, xpub: &[f32], xbel: &[f32], phi: &[f32], rows: usize) -> Vec<f32> {
+    pub fn forward(
+        &self,
+        xpub: &[f32],
+        xbel: &[f32],
+        phi: &[f32],
+        ids: &[u8],
+        rows: usize,
+    ) -> Vec<f32> {
         let (rk, pd) = (self.rank(), self.pub_dim());
         let (mut sb, mut pre, mut e, mut z, mut g, mut u) = (
             Vec::new(),
@@ -1168,7 +1191,7 @@ impl Mlp {
         );
         (0..rows)
             .map(|r| {
-                self.cards(&xpub[r * pd..(r + 1) * pd], &mut e);
+                self.cards(&xpub[r * pd..(r + 1) * pd], &ids[r * NTYPE..(r + 1) * NTYPE], &mut e);
                 self.trunk(&xpub[r * pd..], 1, pd, &e, &mut sb, &mut pre);
                 self.pbs_head(&xbel[r * self.belief_dim()..], 1, &pre, &mut sb, &mut u);
                 self.embed(

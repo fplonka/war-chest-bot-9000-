@@ -36,14 +36,19 @@ W = warchest
 def rows_like_the_encoder(rng, rows):
     """Public rows with the structure `write_public_features` gives them: real
     numbers in the fact slots, a genuine one-hot (or nothing) in each hex's
-    coin-type block."""
+    coin-type block. The per-coin-type unit ids that drive the describer's id
+    embedding are drawn to match the one-hots (a one-hot names a type, and a
+    type names a unit id in the row)."""
     x = rng.standard_normal((rows, W.PUBFEAT)).astype(np.float32)
     hx = x[:, :W.N_HEXES * W.HEX_CH].reshape(rows, W.N_HEXES, W.HEX_CH)
     hx[:, :, W.HEX_FACTS:] = 0.0
     occ = rng.integers(0, W.NTYPE + 1, (rows, W.N_HEXES))
     r, h = np.nonzero(occ < W.NTYPE)
     hx[r, h, W.HEX_FACTS + occ[r, h]] = 1.0
-    return x
+    # Any unit id is legal for the parity check (the facts block and the id
+    # embedding are independent inputs); draw them per type.
+    unit_ids = rng.integers(0, W.N_UNITS, (rows, W.NTYPE)).astype(np.uint8)
+    return x, unit_ids
 
 
 def actions_like_the_encoder(rng, na):
@@ -79,7 +84,7 @@ def main():
 
     rng = np.random.default_rng(0)
     rows = 64
-    x = rows_like_the_encoder(rng, rows)
+    x, unit_ids = rows_like_the_encoder(rng, rows)
     # One config scored per row, and a belief of one config per player -- the
     # shape `Mlp::forward` takes. `phi` is the scored config; `xbel` is the
     # belief embedding the solver would have accumulated, which the torch side
@@ -88,8 +93,9 @@ def main():
     bel = holdings(rng, 2 * rows, np.tile([0.0, 1.0], rows))
 
     tx, tphi, tbel = (torch.as_tensor(a) for a in (x, phi, bel))
+    tids = torch.as_tensor(unit_ids, dtype=torch.long)
     with torch.no_grad():
-        e = net.cards(tx)
+        e = net.cards(tx, tids)
         # The belief block the solver accumulates: each row's two configs
         # embedded under that row's own card table.
         xbel = net.holdings(tbel, e.repeat_interleave(2, 0)).reshape(rows, 2 * dg).numpy()
@@ -101,13 +107,14 @@ def main():
         w = np.tile([1.0, 1.0, 0.0], rows).astype(np.float32)
         seg = np.repeat(np.arange(rows), 3) * 2 + np.tile([0, 1, 0], rows)
         inv = torch.arange(len(allphi))
-        ref = net(tx, torch.as_tensor(allphi), inv, torch.as_tensor(w),
+        ref = net(tx, tids, torch.as_tensor(allphi), inv, torch.as_tensor(w),
                   torch.as_tensor(seg), 2 * rows).numpy()[2::3]
 
     got = np.asarray(W.infer(
         np.ascontiguousarray(x.ravel()),
         np.ascontiguousarray(xbel.ravel()),
         np.ascontiguousarray(phi.ravel()),
+        np.ascontiguousarray(unit_ids.ravel()),
         rows, 0), np.float32)
 
     err = float(np.abs(ref - got).max())
@@ -117,12 +124,12 @@ def main():
 
     # --- the policy seam: one node, `nc` configs and `na` actions ------------
     nc, na = 7, 11
-    xrow = rows_like_the_encoder(rng, 1)
+    xrow, row_ids = rows_like_the_encoder(rng, 1)
     cphi = holdings(rng, nc, np.zeros(nc))
     psi = actions_like_the_encoder(rng, na)
     txr, tc, tpsi = (torch.as_tensor(a) for a in (xrow, cphi, psi))
     with torch.no_grad():
-        e1 = net.cards(txr)
+        e1 = net.cards(txr, torch.as_tensor(row_ids, dtype=torch.long))
         z = net.holdings(tc, e1.expand(nc, -1, -1))
         # The node's own belief: uniform over its configs, both players alike.
         bl = (z.mean(0).repeat(2)).reshape(1, 2 * dg)
@@ -136,6 +143,7 @@ def main():
         np.ascontiguousarray(bl.numpy().ravel()),
         np.ascontiguousarray(cphi.ravel()),
         np.ascontiguousarray(psi.ravel()),
+        np.ascontiguousarray(row_ids.ravel()),
         nc, na, 0), np.float32).reshape(nc, na)
 
     perr = float(np.abs(pref - pgot).max())

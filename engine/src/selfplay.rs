@@ -251,8 +251,11 @@ pub enum Collect {
 /// `2 * n + 1` offsets: row `r`, player `p` spans `coff[2*r+p] .. coff[2*r+p+1]`.
 #[derive(Default)]
 pub struct Data {
-    /// `[n, PUBFEAT]` public encodings.
-    pub vx: Vec<f32>,
+    /// `[n * ROW_BYTES]` packed replay rows: raw small integers plus the aux
+    /// targets (see `rebel::ROW_*`). The public encoding is *not* stored — a
+    /// row is expanded when a batch is made, so the stored bytes never go
+    /// stale as the network changes.
+    pub rows: Vec<u8>,
     /// `[total_configs, CCOUNTS]` raw counts per config, in the arena order.
     /// Raw rather than normalised: they are `u8`-valued, and storing them that
     /// way is what keeps a replay row small enough to hold millions of them.
@@ -261,16 +264,9 @@ pub struct Data {
     pub cw: Vec<f32>,
     /// `[total_configs]` the solve's value for each config.
     pub cy: Vec<f32>,
-    /// `[n, AUX]` the auxiliary targets, per row: the two players' markers on
-    /// the board three rounds later, whether initiative changes hands at the
-    /// next round, and the game's result as a class. All are facts about how the
-    /// game actually went, so they are backfilled when it ends, and all are
-    /// dense -- unlike the outcome, every row gets a different answer. They are
-    /// training-only: nothing exports them and the Rust play path never sees
-    /// them.
-    pub ay: Vec<f32>,
-    /// `[n]` the round each row was taken at, which is what the backfill needs
-    /// and what it consumes. Not shipped to Python.
+    /// `[n]` the round each row was taken at, which is what the aux backfill
+    /// needs and what it consumes. Not shipped to Python (the aux targets
+    /// themselves live in the row).
     round: Vec<u16>,
 
     // ------------------------------------------------------- policy targets
@@ -315,8 +311,7 @@ pub struct Data {
 impl Data {
     pub fn merge(&mut self, o: Data) {
         let base = self.cw.len() as u32;
-        self.vx.extend(o.vx);
-        self.ay.extend(o.ay);
+        self.rows.extend(o.rows);
         let (row_base, act_base) = (self.nv as u32, (self.pa.len() / AFEAT) as u32);
         self.prow.extend(o.prow.iter().map(|r| r + row_base));
         self.pact.extend(o.pact);
@@ -361,10 +356,9 @@ impl Data {
             matches!(s.pending(), Cont::MainPlay),
             "every saved value row is a normal coin-play state"
         );
-        let base = self.vx.len();
-        self.vx.resize(base + PUBFEAT, 0.0);
-        write_public_features(s, ctx, &mut self.vx[base..base + PUBFEAT]);
-        self.ay.resize(self.ay.len() + AUX, 0.0);
+        let base = self.rows.len();
+        self.rows.resize(base + ROW_BYTES, 0);
+        pack_row(s, ctx, &mut self.rows[base..base + ROW_BYTES]);
         self.round.push(s.round);
         if self.coff.is_empty() {
             self.coff.push(0);
@@ -776,9 +770,9 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
     z
 }
 
-/// How many auxiliary targets a row carries: markers per side three rounds on,
-/// the initiative flip, and the result class.
-pub const AUX: usize = 4;
+/// How many auxiliary targets a row carries. Defined with the frozen row
+/// format; see `rebel::AUX`.
+pub use crate::rebel::AUX;
 /// How far ahead the marker target looks.
 const AUX_ROUNDS: u16 = 3;
 
@@ -790,6 +784,49 @@ type Timeline = Vec<([u8; 2], u8)>;
 /// ask about has happened. A row taken in round `r` wants the board three rounds
 /// later; a game that ends first is asked about its final position instead,
 /// which is the true answer to "how many markers are down later on".
+/// Round-to-nearest-even f32 -> IEEE-754 binary16 bit pattern. The aux
+/// targets are stored as float16 in the frozen row; numpy reads them back
+/// with the same rounding.
+fn f32_to_f16(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let man = b & 0x7f_ffff;
+    if exp == 0xff {
+        // Inf / NaN: keep the top bits (never produced by the aux targets).
+        return (sign as u32 | 0x7c00 | man >> 13) as u16;
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return (sign as u32 | 0x7c00) as u16; // overflow to inf
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign; // underflow to zero
+        }
+        let m = man | 0x800_000;
+        let shift = 14 - e;
+        let half = m >> shift;
+        let rem = m & ((1 << shift) - 1);
+        let round = if rem > (1 << (shift - 1))
+            || (rem == (1 << (shift - 1)) && (half & 1) == 1)
+        {
+            half + 1
+        } else {
+            half
+        };
+        return (sign as u32 | round) as u16;
+    }
+    let half = (man >> 13) as u16;
+    let rem = man & 0x1fff;
+    let round = if rem > 0x1000 || (rem == 0x1000 && (half & 1) == 1) {
+        half + 1
+    } else {
+        half
+    };
+    (sign as u32 | ((e as u32) << 10) | round as u32) as u16
+}
+
 fn fill_aux(data: &mut Data, from_row: usize, tl: &Timeline, z: f32) {
     if tl.is_empty() {
         return;
@@ -798,13 +835,18 @@ fn fill_aux(data: &mut Data, from_row: usize, tl: &Timeline, z: f32) {
     for r in from_row..data.nv {
         let now = (data.round[r] as usize).min(tl.len() - 1);
         let then = (now + AUX_ROUNDS as usize).min(tl.len() - 1);
-        let a = &mut data.ay[r * AUX..(r + 1) * AUX];
-        a[0] = tl[then].0[0] as f32 / 6.0;
-        a[1] = tl[then].0[1] as f32 / 6.0;
-        // Does the initiative change hands by the start of the next round?
-        let next = (now + 1).min(tl.len() - 1);
-        a[2] = (tl[next].1 != tl[now].1) as u8 as f32;
-        a[3] = result;
+        let at = r * ROW_BYTES + ROW_AUX;
+        let row = &mut data.rows[at..at + 2 * AUX];
+        let vals = [
+            tl[then].0[0] as f32 / 6.0,
+            tl[then].0[1] as f32 / 6.0,
+            // Does the initiative change hands by the start of the next round?
+            (tl[(now + 1).min(tl.len() - 1)].1 != tl[now].1) as u8 as f32,
+            result,
+        ];
+        for (k, v) in vals.iter().enumerate() {
+            row[2 * k..2 * k + 2].copy_from_slice(&f32_to_f16(*v).to_le_bytes());
+        }
     }
 }
 

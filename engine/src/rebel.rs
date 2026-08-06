@@ -24,9 +24,10 @@
 //! you can see how many coins someone is holding.
 //!
 //! A `Config` is that triple (`pending_coin` is `None` at every normal-turn
-//! boundary). The reachable set is small — measured over 41k
-//! positions of random play: median 8, mean 34, p99 385 — so CFR enumerates
-//! information states exactly, with no particle approximation.
+//! boundary). The reachable set is small — measured over 120k
+//! positions of random play with the full draft pool: median 22, mean 57,
+//! p99 567 — so CFR enumerates information states exactly, with no particle
+//! approximation.
 //!
 //! Beliefs are per player and independent (separate bags, no shared hidden
 //! resource), so a PBS factorises as `(public state, belief_0, belief_1)`.
@@ -143,10 +144,11 @@ impl Config {
     /// computed once per element rather than once per comparison, which is why
     /// this is a method and not an `Ord` impl.
     /// 2 bits per hand slot (a hand holds at most `HAND_CAP` = 3 coins in
-    /// total, so no slot exceeds 3), 5 per face-down slot (bounded by the
-    /// largest supply in the game) and 3 for the pending coin (`None` = 0,
-    /// `Some(k)` = k + 1), for 38 bits — which leaves room to pack an element
-    /// index alongside it in one `u64`.
+    /// total, so no slot exceeds 3 — `key`'s debug_assert is the overflow
+    /// test), 5 per face-down slot (bounded by the largest supply in the
+    /// game) and 3 for the pending coin (`None` = 0, `Some(k)` = k + 1), for
+    /// 38 bits — which leaves room to pack an element index alongside it in
+    /// one `u64` (`config_key_packing_has_headroom` pins the headroom).
     #[inline]
     pub fn key(&self) -> u64 {
         let mut k = 0u64;
@@ -545,7 +547,7 @@ impl DrawMap {
 /// traffic mattered more than the arithmetic. One scratch lives on the solver
 /// and is reused for the whole tree.
 /// Bits reserved for the element index when a config key and an index are
-/// packed into one `u64`. `Config::key` occupies 35, so this leaves nine spare
+/// packed into one `u64`. `Config::key` occupies 38, so this leaves two spare
 /// — and the largest thing sorted this way, a decision node's
 /// `config x action` grid, runs to a few tens of thousands.
 pub const IDX_BITS: u32 = 24;
@@ -556,7 +558,7 @@ pub struct DrawScratch {
     kid: Vec<Config>,
     prob: Vec<f32>,
     /// `key << IDX_BITS | index into kid`, sorted to build the child support.
-    /// One `u64` rather than a `(u64, u32)` pair: a config key needs 50 bits
+    /// One `u64` rather than a `(u64, u32)` pair: a config key needs 38 bits
     /// and the index at most `IDX_BITS`, so packing them halves the width the
     /// sort moves around.
     order: Vec<u64>,
@@ -773,22 +775,32 @@ pub const PEND_KINDS: usize = 12;
 pub const NTYPE: usize = 2 * NSLOT;
 
 /// Raw per-hex facts: occupant owner (2), stack height, the location marker's
-/// owner (2), is-location, pending-maneuver mask.
+/// owner (2), is-location.
 ///
 /// Every one is a raw fact about the position. A precomputed
 /// distance-to-nearest-unit map was tried and removed: it is a *derived*
 /// summary — the same quantity `eval_static`'s coverage term uses — so it
-/// imports the handcrafted bot's opinion into the encoding.
-pub const HEX_FACTS: usize = 2 + 1 + 2 + 1 + 1;
+/// imports the handcrafted bot's opinion into the encoding. The pending-
+/// maneuver mask was removed with the MainPlay-only freeze: the network is
+/// queried only between normal turns, so no continuation state ever reaches
+/// it.
+pub const HEX_FACTS: usize = 2 + 1 + 2 + 1;
 /// Per hex: the raw facts, then a one-hot of the occupant's coin type.
 pub const HEX_CH: usize = HEX_FACTS + NTYPE;
 pub const HEX_BLOCK: usize = N_HEXES * HEX_CH;
 /// Per coin type: reserve, face-up discard, supply, eliminated.
 pub const PILE_COUNTS: usize = 4;
-pub const PLAYER_SCALARS: usize = 8;
-pub const GLOBAL_SCALARS: usize = 5;
+/// Per player: markers in hand, markers on board, hand size, face-down count,
+/// bag count, holds initiative. Round, turns-taken and first-player are
+/// dropped with the format freeze: at a normal-turn boundary none of them
+/// affects the future (the next round's first player is the initiative
+/// holder, and the horizon is carried by `plies_remaining`).
+pub const PLAYER_SCALARS: usize = 6;
+/// Shared: plies remaining, initiative moved, the player to act.
+pub const GLOBAL_SCALARS: usize = 3;
 /// Slot one-hot for the coin a Footman-V2 instant deploy is holding. Public:
-/// a Recruit reveals which unit was taken.
+/// a Recruit reveals which unit was taken. Kept for the frozen `v1` encoder;
+/// the current encoding never sees continuation state.
 pub const PEND_SLOT: usize = NSLOT;
 
 pub const OFF_PILES: usize = HEX_BLOCK;
@@ -796,7 +808,84 @@ pub const OFF_PILES: usize = HEX_BLOCK;
 pub const OFF_CARDS: usize = OFF_PILES + NTYPE * PILE_COUNTS;
 /// The scalars that belong to no hex and no card.
 pub const OFF_LOOSE: usize = OFF_CARDS + NTYPE * CARD_FEATS;
-pub const LOOSE: usize = 2 * PLAYER_SCALARS + GLOBAL_SCALARS + PEND_KINDS + PEND_SLOT;
+pub const LOOSE: usize = 2 * PLAYER_SCALARS + GLOBAL_SCALARS;
+
+// --------------------------------------------------------------- replay rows
+//
+// The frozen compact row format. A row is raw small integers (plus the four
+// float16 aux targets) — never floats of a learned encoding — and the network
+// input is rebuilt from it when a batch is made (`expand_row`). Board
+// coordinates, location hexes and card facts are constants and are not stored
+// per row. Rows carry a format version and a hash of the rules tables so a
+// dump written by a different rules build fails loudly instead of training on
+// silently wrong features.
+
+/// Packed size of one row in bytes. Layout (offsets are `ROW_*`):
+///
+/// ```text
+/// 0   u32  format_version
+/// 4   u64  rules_table_hash
+/// 12  u8   unit_ids[2 * NSLOT]      player-major, slot order
+/// 22  u8   hex_owner[37]            NONE sentinel
+/// 59  u8   hex_unit_slot[37]        NONE sentinel
+/// 96  u8   hex_height[37]
+/// 133 u8   hex_marker_owner[37]     NONE sentinel
+/// 170 u8   pile_counts[2][5][4]     reserve, face-up, supply, eliminated
+/// 210 u8   initiative_holder
+/// 211 u8   initiative_moved
+/// 212 u8   player_to_act
+/// 213 u16  main_plays_remaining
+/// 215 f16  aux_targets[4]
+/// ```
+/// How many auxiliary targets a row carries (markers per side three rounds
+/// on, the initiative flip, the result class). Part of the frozen row.
+pub const AUX: usize = 4;
+
+pub const ROW_VERSION: usize = 0;
+pub const ROW_HASH: usize = 4;
+pub const ROW_IDS: usize = 12;
+pub const ROW_HEX_OWNER: usize = 22;
+pub const ROW_HEX_SLOT: usize = ROW_HEX_OWNER + N_HEXES;
+pub const ROW_HEX_HEIGHT: usize = ROW_HEX_SLOT + N_HEXES;
+pub const ROW_HEX_MARKER: usize = ROW_HEX_HEIGHT + N_HEXES;
+pub const ROW_PILES: usize = ROW_HEX_MARKER + N_HEXES;
+pub const ROW_INITIATIVE: usize = ROW_PILES + 2 * NSLOT * PILE_COUNTS;
+pub const ROW_INIT_MOVED: usize = ROW_INITIATIVE + 1;
+pub const ROW_TO_ACT: usize = ROW_INIT_MOVED + 1;
+pub const ROW_PLIES: usize = ROW_TO_ACT + 1;
+pub const ROW_AUX: usize = ROW_PLIES + 2;
+pub const ROW_BYTES: usize = ROW_AUX + 2 * AUX;
+
+/// The current row format version. Bump when the layout or the expanded
+/// feature layout changes; dumps carry it and refuse to load otherwise.
+pub const ROW_FORMAT_VERSION: u32 = 1;
+
+/// Hash of the constants the expansion depends on: the board's location map,
+/// the unit card-fact table and the layout constants. A rules change that
+/// moves any feature moves this hash, so a dump from another rules build
+/// fails `Dump.check` instead of silently mis-training.
+pub fn rules_table_hash() -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |x: u64| {
+        h ^= x;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    };
+    let bd = board();
+    for &l in bd.is_location.iter() {
+        mix(l as u64);
+    }
+    for u in 0..N_UNITS {
+        let mut f = [0.0f32; CARD_FEATS];
+        write_card_features(u as u8, &mut f);
+        for x in f {
+            mix(x.to_bits() as u64);
+        }
+    }
+    for c in [PUBFEAT, HEX_FACTS, HEX_CH, CARD_FEATS, NSLOT, NTYPE, N_HEXES, PILE_COUNTS, LOOSE] {
+        mix(c as u64);
+    }
+    h
+}
 
 /// Width of the public encoding.
 ///
@@ -858,129 +947,250 @@ pub fn normalize_weights(w: &[f32], out: &mut [f32]) {
 
 /// The public encoding. Fixed for a given state, so a solve computes it once
 /// per leaf. Reads only public information: bag, hand and face-down discards
-/// appear solely through their public sum (the reserve) and their public sizes.
+/// appear solely through their public sum (the reserve) and their public
+/// sizes.
+///
+/// Two producers feed this one layout: `write_public_features` from a live
+/// `State` (the solver's leaf batch) and `expand_row` from a stored replay
+/// row (the training batches). Both go through `write_public_features_raw`,
+/// so the training side and the inference side cannot drift.
 pub fn write_public_features(s: &State, ctx: &Ctx, out: &mut [f32]) {
     debug_assert_eq!(out.len(), PUBFEAT);
+    let mut hex_owner = [NONE; N_HEXES];
+    let mut hex_slot = [NONE; N_HEXES];
+    let mut hex_height = [0u8; N_HEXES];
+    let mut hex_marker = [NONE; N_HEXES];
+    for h in 0..N_HEXES {
+        hex_owner[h] = s.hex_owner[h];
+        hex_slot[h] = if s.hex_owner[h] == NONE {
+            NONE
+        } else {
+            ctx.slot_of[s.hex_owner[h] as usize][s.hex_type[h] as usize] as u8
+        };
+        hex_height[h] = s.hex_height[h];
+        hex_marker[h] = s.loc_marker[h];
+    }
+    let mut piles = [0u8; 2 * NSLOT * PILE_COUNTS];
+    for p in 0..2usize {
+        let res = reserve(s, p as u8, ctx);
+        for k in 0..NSLOT {
+            let u = ctx.slots[p][k] as usize;
+            let at = (p * NSLOT + k) * PILE_COUNTS;
+            piles[at] = res[k];
+            piles[at + 1] = s.zones[p][Z_FACEUP][u];
+            piles[at + 2] = s.zones[p][Z_SUPPLY][u];
+            piles[at + 3] = s.zones[p][Z_ELIM][u];
+        }
+    }
+    let mut ids = [0u8; 2 * NSLOT];
+    for t in 0..2 * NSLOT {
+        ids[t] = ctx.slots[t / NSLOT][t % NSLOT];
+    }
+    let mut markers_hand = [0u8; 2];
+    let mut hand_size = [0u8; 2];
+    let mut fd_size = [0u8; 2];
+    let mut bag_size = [0u8; 2];
+    for p in 0..2usize {
+        markers_hand[p] = s.markers_hand[p];
+        hand_size[p] = s.hand_size(p as u8);
+        fd_size[p] = s.zones[p][Z_FACEDOWN].iter().sum();
+        bag_size[p] = s.bag_size(p as u8);
+    }
+    write_public_features_raw(
+        &hex_owner,
+        &hex_slot,
+        &hex_height,
+        &hex_marker,
+        &piles,
+        &ids,
+        &markers_hand,
+        &hand_size,
+        &fd_size,
+        &bag_size,
+        s.initiative,
+        s.initiative_moved,
+        s.to_act(),
+        (crate::state::MAX_MAIN_PLAYS - s.main_plays.min(crate::state::MAX_MAIN_PLAYS)) as u16,
+        out,
+    );
+}
+
+/// The shared core of the public encoding: raw fields in, `PUBFEAT` floats
+/// out. Called by `write_public_features` (from a `State`) and `expand_row`
+/// (from a stored replay row).
+#[allow(clippy::too_many_arguments)]
+pub fn write_public_features_raw(
+    hex_owner: &[u8; N_HEXES],
+    hex_slot: &[u8; N_HEXES],
+    hex_height: &[u8; N_HEXES],
+    hex_marker: &[u8; N_HEXES],
+    piles: &[u8],
+    ids: &[u8],
+    markers_hand: &[u8],
+    hand_size: &[u8],
+    fd_size: &[u8],
+    bag_size: &[u8],
+    initiative: u8,
+    initiative_moved: bool,
+    to_act: u8,
+    plies_remaining: u16,
+    out: &mut [f32],
+) {
+    debug_assert_eq!(out.len(), PUBFEAT);
+    debug_assert_eq!(piles.len(), 2 * NSLOT * PILE_COUNTS);
+    debug_assert_eq!(ids.len(), 2 * NSLOT);
     out.fill(0.0);
     let bd = board();
 
-    // Which board unit, if any, still owes a maneuver at this decision node.
-    // `pending_kind` below says *what kind* of trigger is open; without this it
-    // does not say *whose*, and the Footman tactic can owe two at once.
-    //
-    // Only the hex-valued payloads are encoded. `WarriorPriestPlay { coin }`
-    // carries a coin drawn privately, so encoding it would leak — which is the
-    // same reason `docs/REBEL.md` keeps the Warrior Priest out of the draft
-    // pool. `FootmanInstantDeploy`'s coin is public (a Recruit reveals the unit
-    // taken) and is encoded with the globals instead.
-    let mut pending_hexes = crate::state::HexSet(0);
-    let mark = |h: u8, set: &mut crate::state::HexSet| {
-        if (h as usize) < N_HEXES {
-            set.insert(h);
-        }
-    };
-    match *s.pending() {
-        Cont::SwordsmanMove { hex }
-        | Cont::BerserkerChain { hex, .. }
-        | Cont::CavalryAttack { hex }
-        | Cont::MercenaryManeuver { hex } => mark(hex, &mut pending_hexes),
-        Cont::FootmanManeuver { hexes } => {
-            for h in hexes.iter() {
-                mark(h, &mut pending_hexes);
-            }
-        }
-        Cont::RoyalGuardChoice { rg_hex, .. } | Cont::WarriorPriestDraw { rg_hex, .. } => {
-            mark(rg_hex, &mut pending_hexes)
-        }
-        Cont::_AttackPost { atk_hex } => mark(atk_hex, &mut pending_hexes),
-        _ => {}
-    }
-
     let mut i = 0;
     for h in 0..N_HEXES {
-        let owner = s.hex_owner[h];
+        let owner = hex_owner[h];
         if owner != NONE {
             out[i + owner as usize] = 1.0;
             // Divisor is the largest coin count on any card. Bolstering has no
             // height limit (RULES.md section 5) and heights of 4 and 5 are
             // ~20% of occupied-hex observations under random play, so the
             // previous /3 collapsed them onto the same value.
-            out[i + 2] = s.hex_height[h] as f32 / 5.0;
-            let k = ctx.slot_of[owner as usize][s.hex_type[h] as usize];
-            if k >= 0 {
-                out[i + HEX_FACTS + owner as usize * NSLOT + k as usize] = 1.0;
+            out[i + 2] = hex_height[h] as f32 / 5.0;
+            if hex_slot[h] != NONE {
+                out[i + HEX_FACTS + owner as usize * NSLOT + hex_slot[h] as usize] = 1.0;
             }
         }
-        if s.loc_marker[h] != NONE {
-            out[i + 3 + s.loc_marker[h] as usize] = 1.0;
+        if hex_marker[h] != NONE {
+            out[i + 3 + hex_marker[h] as usize] = 1.0;
         }
         out[i + 5] = bd.is_location[h] as u8 as f32;
-        out[i + 6] = ((pending_hexes.0 >> h) & 1) as f32;
         i += HEX_CH;
     }
     debug_assert_eq!(i, OFF_PILES);
 
-    // The piles, per coin type rather than per player-and-slot: the same counts,
-    // indexed the way everything else in the encoding indexes a card.
-    for p in 0..2usize {
-        let res = reserve(s, p as u8, ctx);
-        for k in 0..NSLOT {
-            let u = ctx.slots[p][k] as usize;
-            out[i] = res[k] as f32 / 5.0;
-            out[i + 1] = s.zones[p][Z_FACEUP][u] as f32 / 5.0;
-            out[i + 2] = s.zones[p][Z_SUPPLY][u] as f32 / 5.0;
-            out[i + 3] = s.zones[p][Z_ELIM][u] as f32 / 5.0;
-            i += PILE_COUNTS;
-        }
+    // The piles, per coin type rather than per player-and-slot: the same
+    // counts, indexed the way everything else in the encoding indexes a card.
+    for t in 0..2 * NSLOT {
+        let at = t * PILE_COUNTS;
+        out[i] = piles[at] as f32 / 5.0;
+        out[i + 1] = piles[at + 1] as f32 / 5.0;
+        out[i + 2] = piles[at + 2] as f32 / 5.0;
+        out[i + 3] = piles[at + 3] as f32 / 5.0;
+        i += PILE_COUNTS;
     }
     debug_assert_eq!(i, OFF_CARDS);
 
     // What each card in play actually does. The describer reads these; every
     // other reference to a card is a one-hot into this table.
-    for p in 0..2usize {
-        for k in 0..NSLOT {
-            write_card_features(ctx.slots[p][k], &mut out[i..i + CARD_FEATS]);
-            i += CARD_FEATS;
-        }
+    for t in 0..2 * NSLOT {
+        write_card_features(ids[t], &mut out[i..i + CARD_FEATS]);
+        i += CARD_FEATS;
     }
     debug_assert_eq!(i, OFF_LOOSE);
 
     for p in 0..2usize {
-        let fd: u8 = s.zones[p][Z_FACEDOWN].iter().sum();
-        out[i] = s.markers_hand[p] as f32 / 6.0;
-        out[i + 1] = s.markers_on_board(p as u8) as f32 / 6.0;
-        out[i + 2] = s.hand_size(p as u8) as f32 / 3.0;
+        out[i] = markers_hand[p] as f32 / 6.0;
+        out[i + 1] = (6 - markers_hand[p]) as f32 / 6.0;
+        out[i + 2] = hand_size[p] as f32 / 3.0;
         // Divisors are the true maxima, not estimates. A player's coins are
         // bounded by the whole reserve, and both of these saturated under the
         // previous /10 and /12: the face-down count reaches 14 and the bag
         // reaches 18, so the two most dynamic scalars in the encoding were
         // being clipped in exactly the late-game states that matter most.
-        out[i + 3] = fd as f32 / MAX_COINS;
-        out[i + 4] = s.bag_size(p as u8) as f32 / MAX_COINS;
-        out[i + 5] = s.turns_taken[p] as f32 / 3.0;
-        out[i + 6] = (s.initiative == p as u8) as u8 as f32;
-        out[i + 7] = (s.first_player == p as u8) as u8 as f32;
+        out[i + 3] = fd_size[p] as f32 / MAX_COINS;
+        out[i + 4] = bag_size[p] as f32 / MAX_COINS;
+        out[i + 5] = (initiative == p as u8) as u8 as f32;
         i += PLAYER_SCALARS;
     }
 
-    out[i] = (s.round as f32 / MAX_ROUND).min(1.0);
-    // plies_remaining: PBS values near the horizon are not well defined without it.
-    let cap = crate::state::MAX_MAIN_PLAYS;
-    out[i + 1] = (cap - s.main_plays.min(cap)) as f32 / cap as f32;
-    out[i + 2] = s.initiative_moved as u8 as f32;
-    out[i + 3] = (s.active == 0) as u8 as f32;
-    out[i + 4] = (s.to_act() == 0) as u8 as f32;
+    // plies_remaining: PBS values near the horizon are not well defined
+    // without it. The round number, turns taken and the first player are
+    // dropped with the format freeze: none of them affects the future at a
+    // normal-turn boundary.
+    out[i] = plies_remaining as f32 / crate::state::MAX_MAIN_PLAYS as f32;
+    out[i + 1] = initiative_moved as u8 as f32;
+    out[i + 2] = (to_act == 0) as u8 as f32;
     i += GLOBAL_SCALARS;
-    out[i + pending_kind(s)] = 1.0;
-    i += PEND_KINDS;
-    // The coin a Footman-V2 instant deploy is holding. Public, unlike the
-    // Warrior Priest's drawn coin (see the pending-mask note above).
-    if let Cont::FootmanInstantDeploy { coin } = *s.pending() {
-        let k = ctx.slot_of[s.to_act() as usize][coin as usize];
-        if k >= 0 {
-            out[i + k as usize] = 1.0;
+    debug_assert_eq!(i, PUBFEAT);
+}
+
+/// Pack one replay row from a live state. The aux targets are backfilled
+/// later (`fill_aux`); everything else is final here.
+pub fn pack_row(s: &State, ctx: &Ctx, out: &mut [u8]) {
+    debug_assert_eq!(out.len(), ROW_BYTES);
+    out[ROW_VERSION..ROW_VERSION + 4].copy_from_slice(&ROW_FORMAT_VERSION.to_le_bytes());
+    out[ROW_HASH..ROW_HASH + 8].copy_from_slice(&rules_table_hash().to_le_bytes());
+    for t in 0..2 * NSLOT {
+        out[ROW_IDS + t] = ctx.slots[t / NSLOT][t % NSLOT];
+    }
+    for h in 0..N_HEXES {
+        out[ROW_HEX_OWNER + h] = s.hex_owner[h];
+        out[ROW_HEX_SLOT + h] = if s.hex_owner[h] == NONE {
+            NONE
+        } else {
+            ctx.slot_of[s.hex_owner[h] as usize][s.hex_type[h] as usize] as u8
+        };
+        out[ROW_HEX_HEIGHT + h] = s.hex_height[h];
+        out[ROW_HEX_MARKER + h] = s.loc_marker[h];
+    }
+    for p in 0..2usize {
+        let res = reserve(s, p as u8, ctx);
+        for k in 0..NSLOT {
+            let u = ctx.slots[p][k] as usize;
+            let at = ROW_PILES + (p * NSLOT + k) * PILE_COUNTS;
+            out[at] = res[k];
+            out[at + 1] = s.zones[p][Z_FACEUP][u];
+            out[at + 2] = s.zones[p][Z_SUPPLY][u];
+            out[at + 3] = s.zones[p][Z_ELIM][u];
         }
     }
-    i += PEND_SLOT;
-    debug_assert_eq!(i, PUBFEAT);
+    out[ROW_INITIATIVE] = s.initiative;
+    out[ROW_INIT_MOVED] = s.initiative_moved as u8;
+    out[ROW_TO_ACT] = s.to_act();
+    let plies = crate::state::MAX_MAIN_PLAYS - s.main_plays.min(crate::state::MAX_MAIN_PLAYS);
+    out[ROW_PLIES..ROW_PLIES + 2].copy_from_slice(&plies.to_le_bytes());
+    // Aux bytes stay zero until `fill_aux` patches them.
+}
+
+/// Expand a stored replay row into the public encoding, in place.
+///
+/// `hand_size`/`fd_size`/`bag_size` are the public per-player counts carried
+/// by the row's config support (every config in a support shares them); they
+/// are the only part of the row that is not stored directly.
+pub fn expand_row(row: &[u8], hand_size: &[u8; 2], fd_size: &[u8; 2], bag_size: &[u8; 2], out: &mut [f32]) {
+    debug_assert_eq!(row.len(), ROW_BYTES);
+    let mut hex_owner = [NONE; N_HEXES];
+    let mut hex_slot = [NONE; N_HEXES];
+    let mut hex_height = [0u8; N_HEXES];
+    let mut hex_marker = [NONE; N_HEXES];
+    hex_owner.copy_from_slice(&row[ROW_HEX_OWNER..ROW_HEX_OWNER + N_HEXES]);
+    hex_slot.copy_from_slice(&row[ROW_HEX_SLOT..ROW_HEX_SLOT + N_HEXES]);
+    hex_height.copy_from_slice(&row[ROW_HEX_HEIGHT..ROW_HEX_HEIGHT + N_HEXES]);
+    hex_marker.copy_from_slice(&row[ROW_HEX_MARKER..ROW_HEX_MARKER + N_HEXES]);
+    let mut markers_hand = [0u8; 2];
+    for h in 0..N_HEXES {
+        if hex_marker[h] != NONE {
+            markers_hand[hex_marker[h] as usize] += 1;
+        }
+    }
+    for p in 0..2usize {
+        markers_hand[p] = 6 - markers_hand[p];
+    }
+    let mut initiative = row[ROW_INITIATIVE];
+    if initiative > 1 {
+        initiative = 0; // defensive; a packed row is engine-written
+    }
+    write_public_features_raw(
+        &hex_owner,
+        &hex_slot,
+        &hex_height,
+        &hex_marker,
+        &row[ROW_PILES..ROW_PILES + 2 * NSLOT * PILE_COUNTS],
+        &row[ROW_IDS..ROW_IDS + 2 * NSLOT],
+        &markers_hand,
+        hand_size,
+        fd_size,
+        bag_size,
+        initiative,
+        row[ROW_INIT_MOVED] != 0,
+        row[ROW_TO_ACT],
+        u16::from_le_bytes([row[ROW_PLIES], row[ROW_PLIES + 1]]),
+        out,
+    );
 }

@@ -530,6 +530,9 @@ pub struct Solver<'a> {
     /// The card table `[NTYPE, de]`. The draft is fixed for the game, so this is
     /// built once per solve and read by every tower that names a card.
     ce: Vec<f32>,
+    /// The draft's unit ids in player-major slot order, for the describer's
+    /// learned id embedding. Constant per solve.
+    ids: [u8; NTYPE],
     /// Decision nodes in the network batch, after the leaves. Only populated
     /// when a warm start needs the policy head at them.
     inner_rows: Vec<usize>,
@@ -592,6 +595,10 @@ impl<'a> Solver<'a> {
             belief[0].cfg.as_slice().into(),
             belief[1].cfg.as_slice().into(),
         ];
+        let mut ids = [0u8; NTYPE];
+        for t in 0..NTYPE {
+            ids[t] = ctx.slots[t / NSLOT][t % NSLOT];
+        }
         let mut sv = Solver {
             ctx,
             nets,
@@ -623,6 +630,7 @@ impl<'a> Solver<'a> {
             cz: take_buf(R_CZ),
             cg: take_buf(R_CG),
             ce: Vec::new(),
+            ids,
             inner_rows: Vec::new(),
             vt: Vec::new(),
             pubfeat: if nets.value.is_empty() { PUBFEAT } else { nets.value.pub_dim() },
@@ -1241,7 +1249,7 @@ impl<'a> Solver<'a> {
         // downstream — the hex block, the pile summary, the holding tower, the
         // action tower — reads a row of it by coin-type index.
         if rows > 0 {
-            net.cards(&xpub[..self.pubfeat], &mut self.ce);
+            net.cards(&xpub[..self.pubfeat], &self.ids, &mut self.ce);
         }
         net.trunk(&xpub, rows, self.pubfeat, &self.ce, &mut self.sb, &mut self.h0);
         self.xpub = xpub;

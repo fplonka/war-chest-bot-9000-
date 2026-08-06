@@ -18,6 +18,7 @@ AFEAT = warchest.AFEAT
 CCOUNTS = warchest.CCOUNTS
 CARD_FEATS = warchest.CARD_FEATS
 N_HEXES = warchest.N_HEXES
+N_UNITS = warchest.N_UNITS
 NSLOT = warchest.NSLOT
 NTYPE = warchest.NTYPE
 HEX_CH = warchest.HEX_CH
@@ -69,10 +70,14 @@ class Mlp(nn.Module):
         self.de = de
         xdim = N_HEXES * (HEX_FACTS + de) + 2 * de + LOOSE
         # The card describer, and the pile summary that reads it. Everything
-        # that names a card names a coin-type index into `e`, so no part of the
-        # network sees a unit identity and an unseen draft is describable.
+        # that names a card names a coin-type index into `e`. The describer
+        # reads the card's rulebook facts (so related cards share learning)
+        # and adds a learned per-unit identity embedding (so an individual
+        # card can be memorised); both are needed because a draft the network
+        # has never seen must still be describable.
         self.wd0 = nn.Linear(CARD_FEATS, dc)
         self.wd1 = nn.Linear(dc, de)
+        self.wid = nn.Embedding(N_UNITS, de)
         self.wpile = nn.Linear(PILE_COUNTS + de, de)
         self.w0 = nn.Linear(xdim, hidden)
         self.w1 = nn.Linear(hidden, hidden)
@@ -110,7 +115,7 @@ class Mlp(nn.Module):
         # and reporting it as a strength result.
         self.has_policy = True
 
-    def aux_loss(self, xpub, target):
+    def aux_loss(self, xpub, unit_ids, target):
         """The auxiliary heads' loss, on the same hidden layer the value reads.
 
         `target` is `[B, AUX]`: two marker counts three rounds on, the
@@ -123,7 +128,7 @@ class Mlp(nn.Module):
         gradient on the part of the trunk every row shares.
         """
         b = xpub.shape[0]
-        e = self.cards(xpub)
+        e = self.cards(xpub, unit_ids)
         h = F.relu(self.ln0(self.w0(self.trunk_input(xpub, e))))
         zero = torch.zeros(b, self.wb.in_features, dtype=h.dtype, device=h.device)
         h = F.relu(self.ln1(self.w1(h) + self.wb(zero)))
@@ -132,10 +137,16 @@ class Mlp(nn.Module):
                 + F.binary_cross_entropy_with_logits(a[:, 2], target[:, 2])
                 + F.cross_entropy(a[:, 3:], target[:, 3].long()))
 
-    def cards(self, xpub):
-        """The card table `e`, `[B, NTYPE, de]` — one embedding per coin type."""
+    def cards(self, xpub, unit_ids):
+        """The card table `e`, `[B, NTYPE, de]` — one embedding per coin type.
+
+        `unit_ids` is `[B, NTYPE]` (the row's stored ids, player-major slot
+        order): the learned id embedding of each coin type is added to the
+        facts' output.
+        """
         c = xpub[:, OFF_CARDS:OFF_CARDS + NTYPE * CARD_FEATS]
-        return self.wd1(F.relu(self.wd0(c.reshape(-1, NTYPE, CARD_FEATS))))
+        return (self.wd1(F.relu(self.wd0(c.reshape(-1, NTYPE, CARD_FEATS))))
+                + self.wid(unit_ids))
 
     def trunk_input(self, xpub, e):
         """The trunk's input, assembled from a stored row and the card table.
@@ -180,7 +191,7 @@ class Mlp(nn.Module):
         pay = psi[:, AOFF_PAYS:AOFF_PAYS + NTYPE].unsqueeze(1) @ e     # [A, 1, de]
         return F.relu(self.wq(torch.cat([psi, pay.squeeze(1)], -1)))
 
-    def forward(self, xpub, phi, inv, w, seg, nseg):
+    def forward(self, xpub, unit_ids, phi, inv, w, seg, nseg):
         """Values for every config in a ragged batch.
 
         `xpub` is `[B, PUBFEAT]`. The configs of every row and player are
@@ -191,7 +202,7 @@ class Mlp(nn.Module):
         `[U, CFEAT]` and `inv` maps each of the `N` entries to its row in it. The
         Rust solver deduplicates for the same reason.
         """
-        e = self.cards(xpub)
+        e = self.cards(xpub, unit_ids)
         # A distinct config belongs to a row, and a row to a game, so it reads
         # that game's card table. `seg // 2` is the row of each entry; the first
         # entry naming a distinct config fixes which table it uses.
@@ -218,10 +229,13 @@ class Mlp(nn.Module):
         one place for the two sides to agree and `test_parity.py` checks it.
         """
         f = lambda a: np.ascontiguousarray(a, np.float32)
-        w = f(np.concatenate([l.weight.detach().cpu().t().contiguous().numpy().ravel()
-                              for l in (self.wd0, self.wd1, self.wpile,
-                                        self.w0, self.w1, self.wb, self.wc, self.wg,
-                                        self.wu, self.wq, self.wk, self.wp)]))
+        w = f(np.concatenate(
+            [l.weight.detach().cpu().t().contiguous().numpy().ravel()
+             for l in (self.wd0, self.wd1)]
+            + [self.wid.weight.detach().cpu().contiguous().numpy().ravel()]
+            + [l.weight.detach().cpu().t().contiguous().numpy().ravel()
+               for l in (self.wpile, self.w0, self.w1, self.wb, self.wc, self.wg,
+                         self.wu, self.wq, self.wk, self.wp)]))
         b = f(np.concatenate([l.bias.detach().cpu().numpy().ravel()
                               for l in (self.wd0, self.wd1, self.wpile,
                                         self.w0, self.w1, self.wc, self.wg, self.wu,

@@ -7,13 +7,13 @@ use warchest::board::N_HEXES;
 use warchest::net::Mlp;
 use warchest::rebel::{AFEAT, CFEAT, HEX_CH, HEX_FACTS, LOOSE, NTYPE, PILE_COUNTS, PUBFEAT};
 use warchest::rng::Rng;
-use warchest::units::CARD_FEATS;
+use warchest::units::{CARD_FEATS, N_UNITS};
 
 fn main() {
     let (h, dg, rk, de, dc) = (128usize, 32usize, 48usize, 16usize, 24usize);
     let dims = [PUBFEAT, h, CFEAT, dg, rk, AFEAT, de, dc];
     let xd = N_HEXES * (HEX_FACTS + de) + 2 * de + LOOSE;
-    let nw = CARD_FEATS * dc + dc * de + (PILE_COUNTS + de) * de
+    let nw = CARD_FEATS * dc + dc * de + N_UNITS * de + (PILE_COUNTS + de) * de
         + xd * h + h * h + 2 * dg * h + (4 + de) * dg + dg * (rk + 1) + h * rk
         + (AFEAT + de) * rk + dg * rk + h * rk;
     let mut r = Rng::new(12345);
@@ -45,11 +45,12 @@ fn main() {
         }
     }
     let xbel = draw(rows * 2 * dg);
+    let ids: Vec<u8> = (0..rows * NTYPE).map(|i| (i % N_UNITS) as u8).collect();
     let mut phi = draw(rows * CFEAT);
     for r0 in 0..rows {
         phi[r0 * CFEAT + CFEAT - 1] = (r0 % 2) as f32;
     }
-    for (i, x) in net.forward(&xpub, &xbel, &phi, rows).iter().enumerate() {
+    for (i, x) in net.forward(&xpub, &xbel, &phi, &ids, rows).iter().enumerate() {
         println!("{i:3} {x:.9}");
     }
 }

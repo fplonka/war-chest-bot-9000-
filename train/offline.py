@@ -68,8 +68,8 @@ def evaluate(net, parts, rng, dev, batch=4096):
     for i in range(0, n, batch):
         ids = np.arange(i, min(i + batch, n))
         b = make_batch(subset(parts, ids), rng, dev, False)
-        xpub, phi, inv, w, seg, y, nseg = b
-        v = net(xpub, phi, inv, w, seg, nseg)
+        xpub, unit_ids, phi, inv, w, seg, y, nseg = b[:8]
+        v = net(xpub, unit_ids, phi, inv, w, seg, nseg)
         per = F.smooth_l1_loss(v, y, reduction="none", beta=0.5)
         tot += float((per * w).sum())
         sq += float((((v - y) ** 2) * w).sum())
@@ -163,16 +163,24 @@ def main():
     dev = torch.device(args.device)
     d = Dump(args.dump)
     d.check(warchest.PUBFEAT, warchest.CCOUNTS)
+    # Solve-aligned held-out split: oldest solves train, the newest block is
+    # the test set (see --test-frac below; the split happens at solve
+    # boundaries so no solve straddles it).
     lo = max(0, len(d) - args.fresh) if args.fresh else 0
     ntest = max(1, int((len(d) - lo) * args.test_frac))
-    print(f"[data] {len(d) - lo} rows, PUBFEAT={warchest.PUBFEAT}, holding out the "
-          f"newest {ntest} ({100 * args.test_frac:.0f}%) by recency", flush=True)
-
+    # Snap the split to the nearest solve boundary at or before the raw cut.
     split = len(d) - ntest
+    bounds = [s for s in d.soff if lo < s <= split]
+    split = bounds[-1] if bounds else split
+    ntest = len(d) - split
+    print(f"[data] {len(d) - lo} rows, PUBFEAT={warchest.PUBFEAT}, holding out the "
+          f"newest {ntest} ({100 * ntest / max(len(d) - lo, 1):.0f}%) by solve-aligned recency",
+          flush=True)
+
     tr_lo = max(lo, split - args.train_window) if args.train_window else lo
     tr = d.rows(tr_lo, split)
     te = d.rows(split, len(d))
-    mirror.self_check(tr[0])
+    mirror.self_check_rows(tr[0], tr[1], tr[2], tr[5])
     # The spread of the targets is the scale everything else is measured
     # against: an RMS error is only meaningful beside it.
     tgt_std = float(te[4].std())

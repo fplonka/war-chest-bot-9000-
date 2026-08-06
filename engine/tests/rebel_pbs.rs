@@ -32,7 +32,7 @@ use warchest::rebel::*;
 use warchest::rng::Rng;
 use warchest::search::{node_actions, Cfg, Nets, Solver};
 use warchest::selfplay::make_game;
-use warchest::units::{write_card_features, CARD_FEATS};
+use warchest::units::{write_card_features, CARD_FEATS, N_UNITS};
 use warchest::state::{Cont, State, Z_BAG, Z_FACEDOWN, Z_FACEUP};
 use warchest::Action;
 
@@ -43,7 +43,7 @@ fn random_net(seed: u64, hidden: usize, dg: usize) -> Mlp {
     let (de, dc, rk) = (16usize, 32usize, dg);
     let dims = [PUBFEAT, hidden, CFEAT, dg, rk, AFEAT, de, dc];
     let xd = warchest::board::N_HEXES * (HEX_FACTS + de) + 2 * de + LOOSE;
-    let nw = CARD_FEATS * dc + dc * de + (PILE_COUNTS + de) * de
+    let nw = CARD_FEATS * dc + dc * de + N_UNITS * de + (PILE_COUNTS + de) * de
         + xd * hidden + hidden * hidden + 2 * dg * hidden + (4 + de) * dg
         + dg * (rk + 1) + hidden * rk + (AFEAT + de) * rk + dg * rk + hidden * rk;
     let mut draw = |n: usize, scale: f32| -> Vec<f32> {
@@ -389,6 +389,134 @@ fn compare(
     }
 }
 
+
+/// The config key must stay inside the packed `u64` budget (the key shares a
+/// word with the element index in the solver's sort): 38 bits of config +
+/// `IDX_BITS` index bits must not overflow. Also pins that the key
+/// distinguishes pendings and that hand slots never exceed the two-bit width.
+#[test]
+fn config_key_packing_has_headroom() {
+    for seed in 0..200u64 {
+        let mut r = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
+        let mut c = Config::default();
+        for k in 0..NSLOT {
+            // A hand holds at most 3 and a face-down slot at most 5.
+            c.hand[k] = r.below(4) as u8;
+            c.fd[k] = r.below(6) as u8;
+        }
+        c.pending_coin = if r.next_u64() & 1 == 0 { None } else { Some(r.below(NSLOT) as u8) };
+        let key = c.key();
+        assert!(
+            key < (1u64 << (64 - IDX_BITS)),
+            "config key must leave room for the element index: {:#x}",
+            key
+        );
+        // Same counts, different pending -> different key; equal -> equal.
+        let mut d = c;
+        assert_eq!(c.key(), d.key());
+        d.pending_coin = match c.pending_coin {
+            None => Some(0),
+            Some(p) if p + 1 < NSLOT as u8 => Some(p + 1),
+            Some(_) => None,
+        };
+        if c.pending_coin != d.pending_coin {
+            assert_ne!(c.key(), d.key());
+        }
+    }
+    // Explicit extreme: every slot at its maximum with a pending coin.
+    let mut c = Config::default();
+    for k in 0..NSLOT {
+        c.hand[k] = 3;
+        c.fd[k] = 5;
+    }
+    c.pending_coin = Some(NSLOT as u8 - 1);
+    assert!(c.key() < (1u64 << (64 - IDX_BITS)));
+    // The hand width is two bits; `key`'s debug_assert is the overflow test
+    // for a slot value of 4 or more (it fires in every debug test build).
+}
+
+/// The reachable-config census, re-run with the Warrior Priests in the draft
+/// pool: how big the belief supports get. Reported, not asserted — the
+/// numbers feed the docs, and the solver's sizing depends on them.
+#[test]
+fn reachable_config_census_with_warrior_priests() {
+    let mut sizes: Vec<usize> = Vec::new();
+    let mut rng = Rng::new(0xC0FFEE);
+    for g in 0..200u64 {
+        let mut s = make_game(&mut rng, true);
+        let ctx = Ctx::new(&s);
+        for _ in 0..300 {
+            if s.is_terminal() {
+                break;
+            }
+            for p in 0..2u8 {
+                let res = reserve(&s, p, &ctx);
+                let truth = true_config(&s, p, &ctx);
+                sizes.push(enumerate_configs(&res, truth.hand_size(), truth.fd_size()).len());
+            }
+            let acts = s.legal_actions();
+            s.apply_inplace(acts[rng.below(acts.len())]);
+        }
+    }
+    sizes.sort_unstable();
+    let n = sizes.len();
+    let (med, p99) = (sizes[n / 2], sizes[(n as f64 * 0.99) as usize]);
+    let mean = sizes.iter().sum::<usize>() as f64 / n as f64;
+    eprintln!(
+        "census: {} positions, median {} mean {:.1} p99 {}",
+        n, med, mean, p99
+    );
+}
+
+/// A packed replay row must expand to exactly the features the solver's own
+/// encoder writes for the same state — the two producers of the public
+/// encoding share one core, and this pins that they cannot drift. Walked
+/// over random positions from random drafts (Warrior Priests included).
+#[test]
+fn packed_row_expands_to_the_same_features() {
+    for seed in 0..40u64 {
+        let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
+        let mut s = make_game(&mut rng, true);
+        let ctx = Ctx::new(&s);
+        let mut checked = 0;
+        for _ in 0..120 {
+            if s.is_terminal() {
+                break;
+            }
+            if matches!(s.pending(), Cont::MainPlay) {
+                let mut row = [0u8; ROW_BYTES];
+                pack_row(&s, &ctx, &mut row);
+                let mut hs = [0u8; 2];
+                let mut fd = [0u8; 2];
+                let mut bg = [0u8; 2];
+                for p in 0..2usize {
+                    let res = reserve(&s, p as u8, &ctx);
+                    let truth = true_config(&s, p as u8, &ctx);
+                    hs[p] = truth.hand_size();
+                    fd[p] = truth.fd_size();
+                    let mut bag = 0u8;
+                    for k in 0..NSLOT {
+                        bag += res[k] - truth.hand[k] - truth.fd[k];
+                    }
+                    bg[p] = bag;
+                }
+                let mut direct = vec![0.0f32; PUBFEAT];
+                write_public_features(&s, &ctx, &mut direct);
+                let mut expanded = vec![0.0f32; PUBFEAT];
+                expand_row(&row, &hs, &fd, &bg, &mut expanded);
+                assert_eq!(
+                    direct, expanded,
+                    "seed {}: packed row and live state encode differently",
+                    seed
+                );
+                checked += 1;
+            }
+            let acts = s.legal_actions();
+            s.apply_inplace(acts[rng.below(acts.len())]);
+        }
+        assert!(checked > 20, "seed {} exercised too few MainPlay states", seed);
+    }
+}
 
 // ------------------------------------------------- the value function's argument
 

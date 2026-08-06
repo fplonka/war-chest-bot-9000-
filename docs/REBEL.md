@@ -37,8 +37,8 @@ it.
 A draft fixes 4 unit types plus the Royal Coin, so at most `NSLOT = 5` coin types
 per player; a hand holds at most 3, even across a Warrior Priest draw — the
 trigger is always preceded, in the same play chain, by the coin play that
-fired it. Over 41k positions of random play the
-reachable config set has median 8, mean 34, p99 385. CFR enumerates information
+fired it. Over 120k positions of random play with the full draft pool the
+reachable config set has median 22, mean 57, p99 567. CFR enumerates information
 states exactly — no particle approximation.
 
 Beliefs are per player and independent (separate bags, no shared hidden

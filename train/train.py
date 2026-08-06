@@ -53,6 +53,30 @@ PUBFEAT = warchest.PUBFEAT
 CFEAT = warchest.CFEAT
 CCOUNTS = warchest.CCOUNTS
 CNORM = warchest.CNORM
+NTYPE = warchest.NTYPE
+ROW_BYTES = warchest.ROW_BYTES
+ROW_IDS = warchest.ROW_IDS
+ROW_AUX = warchest.ROW_AUX
+
+
+def public_sizes(cc, cp, seg, n):
+    """Per-row per-player hand/face-down/bag sizes, from the row's config
+    support. `seg` must be non-decreasing with values `2 * row + seat`; all
+    configs in a support share the sizes, so the first config of each span
+    decides."""
+    starts = np.searchsorted(seg, np.arange(2 * n, dtype=np.int64), side="left")
+    cs = cc[starts]
+    return (cs[:, :5].sum(1).astype(np.uint8).reshape(n, 2),
+            cs[:, 5:10].sum(1).astype(np.uint8).reshape(n, 2),
+            cs[:, 10:].sum(1).astype(np.uint8).reshape(n, 2))
+
+
+def expand_batch(rows, hand, fd, bag):
+    """Expand packed replay rows into the public encoding, in one batch.
+    The expansion itself runs in Rust — one source of truth with the
+    solver's leaf encoding."""
+    n = len(rows)
+    return np.asarray(warchest.expand_rows(rows.ravel(), hand, fd, bag), np.float32).reshape(n, -1)
 
 
 class Buffer:
@@ -66,9 +90,12 @@ class Buffer:
 
     Bootstrapped targets are averaged over whatever history the buffer holds, so
     its length is a real algorithmic knob and not just a memory setting -- the
-    reference implementation runs a 2M buffer. Counts are stored as the `uint8`
-    they are and everything else as float16, which is what makes that
-    affordable: a row costs `PUBFEAT * 2` bytes plus 20 per config.
+    reference implementation runs a 2M buffer. A row is the frozen compact
+    format (`ROW_BYTES` raw bytes: hex facts, piles, unit ids, scalars, aux) --
+    ~223 bytes instead of the ~1.9 KB the old float encoding cost -- and the
+    network input is expanded from it when a batch is made. Counts are stored
+    as the `uint8` they are and everything else as float16, which is what makes
+    the cap affordable: a row costs `ROW_BYTES` bytes plus 20 per config.
 
     Preallocated and written with wraparound rather than grown by
     concatenation. The concatenate form rebuilt the whole buffer every epoch:
@@ -76,12 +103,15 @@ class Buffer:
     copies of it, which is most of a 16 GB machine. `np.zeros` maps zero pages
     lazily, so reserving the full capacity up front costs nothing until it is
     actually filled.
+
+    Solve offsets are kept in row space (`soff`), so a dump can be split at
+    solve boundaries for honest offline comparisons.
     """
 
     def __init__(self, cap, ccap):
         self.cap, self.ccap = cap, ccap
-        self.x = np.zeros((cap, PUBFEAT), np.float16)
-        self.ay = np.zeros((cap, AUX), np.float16)
+        self.x = np.zeros((cap, ROW_BYTES), np.uint8)
+        self.soff = np.zeros(0, np.int64)
         self.cstart = np.zeros(cap, np.int64)   # absolute arena offset
         self.clen = np.zeros((cap, 2), np.int32)
         self.cc = np.zeros((ccap, CCOUNTS), np.uint8)
@@ -92,16 +122,16 @@ class Buffer:
         self.cfgs = 0   # configs ever written
         self.lo = 0     # oldest row whose configs are still in the arena
 
-    def add(self, x, ay, cc, cw, cy, coff):
+    def add(self, x, cc, cw, cy, coff, soff):
         n = len(x)
         lens = np.diff(coff).reshape(n, 2)
         cp = np.repeat(np.tile([0, 1], n).astype(np.uint8), lens.ravel())
         starts = self.cfgs + coff[:-1:2]
+        base = self.rows
         for i in range(0, n, 4096):
             j = min(i + 4096, n)
-            sl = np.arange(i, j) + self.rows
+            sl = np.arange(i, j) + base
             self.x[sl % self.cap] = x[i:j]
-            self.ay[sl % self.cap] = ay[i:j]
             self.cstart[sl % self.cap] = starts[i:j]
             self.clen[sl % self.cap] = lens[i:j]
         m = len(cw)
@@ -109,6 +139,8 @@ class Buffer:
         self.cc[sl], self.cp[sl], self.cw[sl], self.cy[sl] = cc, cp, cw, cy
         self.rows += n
         self.cfgs += m
+        # Solve offsets in absolute row space (first entry 0, trailing count).
+        self.soff = np.concatenate([self.soff, np.asarray(soff, np.int64)[1:] + base])
         # Advance past every row the arena no longer holds in full.
         floor = self.cfgs - self.ccap
         self.lo = max(self.lo, self.rows - self.cap)
@@ -122,7 +154,11 @@ class Buffer:
         return self.rows - self.lo
 
     def gather(self, ids):
-        """Assemble a batch from absolute row ids."""
+        """Assemble a batch from absolute row ids.
+
+        Returns `(rows, cc, cp, cw, cy, seg)`; the aux targets and unit ids
+        live inside the packed rows and are read out by `make_batch`.
+        """
         s = ids % self.cap
         lens = self.clen[s].sum(1).astype(np.int64)
         total = int(lens.sum())
@@ -133,7 +169,7 @@ class Buffer:
         at = (base + within) % self.ccap
         seg = 2 * np.repeat(np.arange(len(ids), dtype=np.int64), lens) + self.cp[at]
         return (self.x[s], self.cc[at], self.cp[at], self.cw[at].astype(np.float32),
-                self.cy[at].astype(np.float32), seg, self.ay[s].astype(np.float32))
+                self.cy[at].astype(np.float32), seg)
 
     def sample(self, batch, rng, recent_mix=0.0, recent_frac=0.2):
         """A batch, part of it drawn from the newest rows only.
@@ -190,42 +226,51 @@ def make_batch(parts, rng, device, augment):
     constraint on this network is distinct positions, not parameters. Applied
     per batch rather than stored, so the buffer does not double.
 
-    On the config side the swap is one bit: a config carries the seat it belongs
-    to as a feature, and `seg` is `2 * row + seat`.
+    The mirror runs on the packed rows (hex arrays permuted, owners and
+    players swapped, unit ids exchanged) and the config side is one bit: a
+    config carries the seat it belongs to as a feature, and `seg` is
+    `2 * row + seat`. The network input is then expanded from the (possibly
+    mirrored) rows by the Rust encoder, and the config dedup key includes the
+    post-mirror unit ids: the same counts in different drafts are different
+    holdings.
     """
-    x, cc, cp, cw, cy, seg, ay = parts
-    x = x.astype(np.float32)
+    rows, cc, cp, cw, cy, seg = parts
+    n = len(rows)
+    # Public sizes name seats, so they are read off the config support before
+    # the mirror (the seat flip below would scramble `seg`'s order).
+    hand, fd, bag = public_sizes(cc, cp, seg, n)
     if augment:
-        which = rng.random(len(x)) < 0.5
-        x[which] = mirror.mirror_x(x[which])
-        # The aux targets name seats too: the two marker counts swap, and the
-        # result class inverts (0 = white wins, 2 = black wins, 1 = neither).
-        # The initiative flip is a flip either way.
-        ay[which] = ay[which][:, [1, 0, 2, 3]]
-        ay[which, 3] = 2.0 - ay[which, 3]
+        which = rng.random(n) < 0.5
+        rows[which] = mirror.mirror_rows(rows[which])
         flip = which[seg // 2]
         cp = np.where(flip, 1 - cp, cp)
         seg = np.where(flip, seg ^ 1, seg)
-    # Distinct configs only. Every count fits in four bits, so the whole vector
-    # packs into one integer and the dedup is a sort rather than a row compare.
-    packed = cp.astype(np.uint64)
-    for k in range(CCOUNTS):
-        packed = (packed << np.uint64(4)) | cc[:, k].astype(np.uint64)
-    uniq, inv = np.unique(packed, return_inverse=True)
+        hand[which] = hand[which][:, ::-1]
+        fd[which] = fd[which][:, ::-1]
+        bag[which] = bag[which][:, ::-1]
+    x = expand_batch(rows, hand, fd, bag)
+    unit_ids = rows[:, ROW_IDS:ROW_IDS + NTYPE]
+    ay = rows[:, ROW_AUX:ROW_AUX + 2 * AUX].view(np.float16).reshape(-1, AUX).astype(np.float32)
+    # Distinct configs only. The key is the row's unit ids (post-mirror) in
+    # player/slot order, the seat, and the 15 counts — two drafts with the
+    # same counts are different holdings, so the ids are part of the key.
+    ids_flat = unit_ids[seg // 2]
+    key = np.concatenate([ids_flat, cp[:, None], cc], 1)
+    uniq, inv = np.unique(key, axis=0, return_inverse=True)
     first = np.zeros(len(uniq), np.int64)
     first[inv[::-1]] = np.arange(len(inv))[::-1]
     phi = np.concatenate([cc[first].astype(np.float32) / CNORM,
                           cp[first, None].astype(np.float32)], 1)
     t = lambda a, d=torch.float32: torch.as_tensor(a, dtype=d, device=device)
-    return (t(x), t(phi), t(inv, torch.long), t(cw), t(seg, torch.long), t(cy),
-            2 * len(x), t(ay))
+    return (t(x), t(unit_ids, torch.long), t(phi), t(inv, torch.long), t(cw),
+            t(seg, torch.long), t(cy), 2 * len(rows), t(ay))
 
 
-def value_loss(net, xpub, phi, inv, w, seg, y, nseg):
+def value_loss(net, xpub, unit_ids, phi, inv, w, seg, y, nseg):
     # Belief-weighted Huber over every config in the support. Weighting by the
     # belief is what makes the loss match the distribution CFR queries: a config
     # the belief gives 1% to is worth 1% of the gradient.
-    v = net(xpub, phi, inv, w, seg, nseg)
+    v = net(xpub, unit_ids, phi, inv, w, seg, nseg)
     per = F.smooth_l1_loss(v, y, reduction="none", beta=0.5)
     return (per * w).sum() / w.sum().clamp(min=1e-6)
 
@@ -274,8 +319,16 @@ def policy_loss(net, d, ids, device):
         [cc[idx].astype(np.float32) / CNORM, seats[:, None].astype(np.float32)], 1))
     csol = t(np.repeat(np.arange(S), nc), torch.long)
 
-    x = t(d["vx"].reshape(-1, PUBFEAT)[prow])
-    e = net.cards(x)
+    # Expand the selected rows (one per solve) from the packed format.
+    rows = d["rows"].reshape(-1, ROW_BYTES)[prow]
+    first = np.stack([coff[2 * prow], coff[2 * prow + 1]], 1)  # [S, 2] span starts
+    cs = cc[first]
+    hand = cs[:, :, :5].sum(2).astype(np.uint8)
+    fd = cs[:, :, 5:10].sum(2).astype(np.uint8)
+    bag = cs[:, :, 10:].sum(2).astype(np.uint8)
+    x = t(np.asarray(
+        warchest.expand_rows(rows.ravel(), hand, fd, bag), np.float32).reshape(S, -1))
+    e = net.cards(x, t(rows[:, ROW_IDS:ROW_IDS + NTYPE], torch.long))
     zb = net.holdings(phi(both, seg & 1), e[t(seg // 2, torch.long)])
     b = torch.zeros(2 * S, zb.shape[1], dtype=zb.dtype, device=device)
     b.index_add_(0, t(seg, torch.long), zb * t(cw[both]).unsqueeze(1))
@@ -311,16 +364,17 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
     prng = np.random.default_rng(rng.integers(1 << 62))
     tot, ptot = 0.0, 0.0
     for _ in range(steps):
-        *parts, ay = make_batch(buf.sample(batch, rng, recent_mix, recent_frac),
-                               rng, device, augment)
-        loss = value_loss(net, *parts)
+        parts = make_batch(buf.sample(batch, rng, recent_mix, recent_frac),
+                           rng, device, augment)
+        loss = value_loss(net, *parts[:-1])
+        ay = parts[-1]
         # What is reported is the value loss alone, so the column means the same
         # thing whether or not the side tasks are on.
         tot += loss.detach().item()
         # Both side tasks share the trunk and are dropped at play time, so they
         # are extra gradient per row for nothing at inference.
         if aux_weight > 0.0:
-            loss = loss + aux_weight * net.aux_loss(parts[0], ay)
+            loss = loss + aux_weight * net.aux_loss(parts[0], parts[1], ay)
         if live:
             n = len(d["prow"])
             pl = policy_loss(net, d, prng.choice(n, min(policy_batch, n), replace=False), device)
@@ -561,19 +615,19 @@ def main():
                                   mc_mix=args.mc_mix, cfr=args.cfr, warm=args.warm, **kw)
         gen_s = time.time() - tg
         # Utilities live in [-1, 1]; so does the true value function, so clip
-        # the bootstrapped targets to that range.
-        vx = np.asarray(d["vx"], np.float32).reshape(-1, PUBFEAT)
-        ay = np.asarray(d["ay"], np.float32).reshape(-1, AUX)
+        # the bootstrapped targets to that range. Rows stay packed (raw
+        # bytes); the public encoding is expanded per batch.
+        rows = np.asarray(d["rows"], np.uint8).reshape(-1, ROW_BYTES)
         cc = np.asarray(d["cc"], np.uint8).reshape(-1, CCOUNTS)
         cw = np.asarray(d["cw"], np.float32)
         cy = np.clip(np.asarray(d["cy"], np.float32), -1.0, 1.0)
         coff = np.asarray(d["coff"], np.int64)
+        soff = np.asarray(d["soff"], np.int64)
         # TurboReBeL exposes the solve count so the train:generation ratio
         # can count solves (the sampling unit of the data) instead of rows,
         # which turbo multiplies by ~T for near-duplicate data.
         solves = max(1, int(d["solves"]))
-        buf.add(vx.astype(np.float16), ay.astype(np.float16), cc, cw.astype(np.float16),
-                cy.astype(np.float16), coff)
+        buf.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
         # A frozen batch from the warm phase. If the network's spread on it
         # collapses, the value function has gone degenerate -- the failure mode
         # a falling training loss hides.
@@ -601,7 +655,7 @@ def main():
         train_s = time.time() - tt
         value.push(0)
         with torch.no_grad():
-            probe_std = float(value(*probe[:5], probe[6]).std()) \
+            probe_std = float(value(*probe[:6], probe[7]).std()) \
                 if probe is not None else float("nan")
             # Age-bucket loss: bootstrapped targets are written by past
             # versions of the net, so old rows carry stale labels. This curve
@@ -649,7 +703,7 @@ def main():
         rec = {"t": round(time.time() - t0, 1), "epoch": epoch, "phase": phase,
                "games": d["games"], "decisions": dec, "loss": round(lv, 5),
                "loss_policy": round(lp, 4),
-               "rows": len(vx), "solves": solves,
+               "rows": len(rows), "solves": solves,
                "loss_old": round(loss_old, 5), "loss_new": round(loss_new, 5),
                "cap_frac": round(d["cap_hits"] / max(d["games"], 1), 3),
                "configs": round(d["configs"] / dec, 1), "cap_value": round(cap_v, 4),
@@ -665,7 +719,7 @@ def main():
         # multi-second epoch.
         write_log(args, log, snaps)
         print(f"[t={rec['t']:6.1f}s] {phase:6s} ep{epoch:3d} games={rec['games']:4d} "
-              f"dec={dec:6d} rows={len(vx):6d} cap={rec['cap_frac']:.2f} "
+              f"dec={dec:6d} rows={len(rows):6d} cap={rec['cap_frac']:.2f} "
               f"cfgs={rec['configs']:5.1f} L={lv:.5f} P={lp:.3f} old={loss_old:.5f} new={loss_new:.5f} "
               f"tgt={tgt_mean:+.3f}/{tgt_std:.3f} pstd={probe_std:.3f} "
               f"capv={cap_v:.3f} lr={rec['lr']:.1e} gen={gen_s:.1f}s train={train_s:.1f}s",
@@ -677,11 +731,21 @@ def main():
 
     if args.dump_buffer:
         # Oldest row first, so a recency split is an honest held-out set.
-        x, cc, cp, cw, cy, seg = buf.ordered()
-        np.savez(args.dump_buffer, x=x, cc=cc, cp=cp, cw=cw, cy=cy, seg=seg,
-                 pubfeat=np.int32(PUBFEAT), cfeat=np.int32(CFEAT),
-                 ccounts=np.int32(CCOUNTS), cnorm=np.float32(CNORM))
-        print(f"dumped {len(x)} buffer rows ({len(cy)} configs) to {args.dump_buffer}",
+        # The dump carries the frozen row format (version + rules hash) and
+        # the solve offsets, so offline comparisons can split at solve
+        # boundaries and refuse dumps from a different rules build.
+        rows, cc, cp, cw, cy, seg = buf.ordered()
+        # Solve boundaries in dump-row space; the oldest partial solve starts
+        # before the dump, so 0 is prepended.
+        lo = buf.lo
+        soff = np.concatenate([[0], buf.soff[(buf.soff > lo) & (buf.soff < buf.rows)] - lo,
+                               [len(rows)]])
+        np.savez(args.dump_buffer, rows=rows, cc=cc, cp=cp, cw=cw, cy=cy, seg=seg,
+                 soff=soff, pubfeat=np.int32(PUBFEAT), cfeat=np.int32(CFEAT),
+                 ccounts=np.int32(CCOUNTS), cnorm=np.float32(CNORM),
+                 row_bytes=np.int32(ROW_BYTES), version=np.int32(warchest.ROW_FORMAT_VERSION),
+                 rules_hash=np.uint64(warchest.rules_table_hash()))
+        print(f"dumped {len(rows)} buffer rows ({len(cy)} configs) to {args.dump_buffer}",
               flush=True)
 
     # ------------------------------------------------------------- the ladder

@@ -489,7 +489,7 @@ impl Game {
 use crate::net::Mlp;
 use crate::search::{Cfg, Cfr, Nets};
 use crate::selfplay::{eval_match as rs_eval_match, run_games, Agent, Collect, Data, GameCfg};
-use numpy::{IntoPyArray, PyReadonlyArray1};
+use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2};
 use std::sync::{OnceLock, RwLock};
 
 /// Independent weight slots, so a match can pit one checkpoint against another.
@@ -590,8 +590,8 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
             "solve offsets must be strictly increasing"
         );
     }
-    out.set_item("vx", d.vx.into_pyarray_bound(py))?;
-    out.set_item("ay", d.ay.into_pyarray_bound(py))?;
+    out.set_item("rows", d.rows.into_pyarray_bound(py))?;
+    out.set_item("row_bytes", crate::rebel::ROW_BYTES)?;
     out.set_item("prow", d.prow.into_pyarray_bound(py))?;
     out.set_item("pact", d.pact.into_pyarray_bound(py))?;
     out.set_item("pa", d.pa.into_pyarray_bound(py))?;
@@ -714,18 +714,25 @@ fn set_cap_value(v: f32) {
 /// PyTorch trains -- a silent divergence there would corrupt every target while
 /// every other test kept passing.
 #[pyfunction]
-#[pyo3(signature = (xpub, xbel, phi, rows, slot=0))]
+#[pyo3(signature = (xpub, xbel, phi, unit_ids, rows, slot=0))]
 fn infer(
     xpub: PyReadonlyArray1<f32>,
     xbel: PyReadonlyArray1<f32>,
     phi: PyReadonlyArray1<f32>,
+    unit_ids: PyReadonlyArray1<u8>,
     rows: usize,
     slot: usize,
 ) -> PyResult<Vec<f32>> {
     check_slot(slot)?;
     let guard = nets().read().unwrap();
     let mlp = &guard[slot].value;
-    Ok(mlp.forward(xpub.as_slice()?, xbel.as_slice()?, phi.as_slice()?, rows))
+    Ok(mlp.forward(
+        xpub.as_slice()?,
+        xbel.as_slice()?,
+        phi.as_slice()?,
+        unit_ids.as_slice()?,
+        rows,
+    ))
 }
 
 /// Policy logits for one node: `[nc * na]`, row-major by config. One PBS row,
@@ -736,6 +743,7 @@ fn infer_policy(
     xbel: PyReadonlyArray1<f32>,
     phi: PyReadonlyArray1<f32>,
     psi: PyReadonlyArray1<f32>,
+    unit_ids: PyReadonlyArray1<u8>,
     nc: usize,
     na: usize,
     slot: usize,
@@ -747,7 +755,7 @@ fn infer_policy(
         Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
     );
     let xp = xpub.as_slice()?;
-    mlp.cards(xp, &mut e);
+    mlp.cards(xp, unit_ids.as_slice()?, &mut e);
     mlp.trunk(xp, 1, xp.len(), &e, &mut sb, &mut pre);
     mlp.embed(phi.as_slice()?, nc, &e, &mut z, &mut g);
     mlp.embed_actions(psi.as_slice()?, na, &e, &mut q);
@@ -820,6 +828,59 @@ fn hex_mirror() -> Vec<u32> {
         .collect()
 }
 
+/// Expand packed replay rows into the public encoding, in one batch.
+///
+/// `rows` is `[n * ROW_BYTES]` u8 (see `rebel::ROW_*`); `hand`/`fd`/`bag` are
+/// the public per-player hand/face-down/bag sizes, `[n, 2]` u8, read off the
+/// row's config support by the caller (every config in a support shares
+/// them) — the only part of the public state the row does not carry itself.
+/// Returns `[n, PUBFEAT]` f32, the exact layout `write_public_features`
+/// produces for a live state.
+#[pyfunction]
+fn rules_table_hash() -> u64 {
+    crate::rebel::rules_table_hash()
+}
+
+#[pyfunction]
+fn expand_rows(
+    rows: PyReadonlyArray1<u8>,
+    hand: PyReadonlyArray2<u8>,
+    fd: PyReadonlyArray2<u8>,
+    bag: PyReadonlyArray2<u8>,
+) -> PyResult<Vec<f32>> {
+    use crate::rebel::{expand_row, PUBFEAT, ROW_BYTES};
+    let rows = rows.as_slice()?;
+    let hand = hand.as_array();
+    let fd = fd.as_array();
+    let bag = bag.as_array();
+    let n = rows.len() / ROW_BYTES;
+    if rows.len() != n * ROW_BYTES {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "rows is not a multiple of ROW_BYTES",
+        ));
+    }
+    if hand.shape() != [n, 2] || fd.shape() != [n, 2] || bag.shape() != [n, 2] {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "hand/fd/bag must be [n, 2] u8",
+        ));
+    }
+    let mut out = vec![0.0f32; n * PUBFEAT];
+    for r in 0..n {
+        let row = &rows[r * ROW_BYTES..(r + 1) * ROW_BYTES];
+        let mut hs = [0u8; 2];
+        let mut fds = [0u8; 2];
+        let mut bg = [0u8; 2];
+        for p in 0..2usize {
+            hs[p] = hand[[r, p]];
+            fds[p] = fd[[r, p]];
+            bg[p] = bag[[r, p]];
+        }
+        expand_row(row, &hs, &fds, &bg, &mut out[r * PUBFEAT..(r + 1) * PUBFEAT]);
+    }
+    Ok(out)
+}
+
+
 #[pymodule]
 fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hex_mirror, m)?)?;
@@ -856,6 +917,23 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("OFF_CARDS", crate::rebel::OFF_CARDS)?;
     m.add("OFF_LOOSE", crate::rebel::OFF_LOOSE)?;
     m.add("AOFF_PAYS", crate::rebel::AOFF_PAYS)?;
+    m.add_function(wrap_pyfunction!(expand_rows, m)?)?;
+    m.add("ROW_BYTES", crate::rebel::ROW_BYTES)?;
+    m.add("ROW_VERSION", crate::rebel::ROW_VERSION)?;
+    m.add("ROW_HASH", crate::rebel::ROW_HASH)?;
+    m.add("ROW_IDS", crate::rebel::ROW_IDS)?;
+    m.add("ROW_HEX_OWNER", crate::rebel::ROW_HEX_OWNER)?;
+    m.add("ROW_HEX_SLOT", crate::rebel::ROW_HEX_SLOT)?;
+    m.add("ROW_HEX_HEIGHT", crate::rebel::ROW_HEX_HEIGHT)?;
+    m.add("ROW_HEX_MARKER", crate::rebel::ROW_HEX_MARKER)?;
+    m.add("ROW_PILES", crate::rebel::ROW_PILES)?;
+    m.add("ROW_INITIATIVE", crate::rebel::ROW_INITIATIVE)?;
+    m.add("ROW_INIT_MOVED", crate::rebel::ROW_INIT_MOVED)?;
+    m.add("ROW_TO_ACT", crate::rebel::ROW_TO_ACT)?;
+    m.add("ROW_PLIES", crate::rebel::ROW_PLIES)?;
+    m.add("ROW_AUX", crate::rebel::ROW_AUX)?;
+    m.add("ROW_FORMAT_VERSION", crate::rebel::ROW_FORMAT_VERSION)?;
+    m.add_function(wrap_pyfunction!(rules_table_hash, m)?)?;
     m.add("CCOUNTS", crate::rebel::CCOUNTS)?;
     m.add("PUBFEAT_V1", crate::v1::PUBFEAT_V1)?;
     m.add("AUX", crate::selfplay::AUX)?;
