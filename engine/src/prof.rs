@@ -21,7 +21,7 @@ mod imp {
     }
 
     counters!(
-        BUILD, BACTS, BDRAW, DGEN, DSORT, DCOMP, BAPPLY, BPUSH, ALLOC, REACH, PUBFEAT, PUBNET, BELFEAT, NET, LEAFPOST, BACK, RM, AVG, WALK, SNAP, P2,
+        BUILD, BACTS, BDRAW, DGEN, DSORT, DCOMP, BAPPLY, BPUSH, ALLOC, REACH, PUBFEAT, PUBNET, BELFEAT, NET, LEAFDOT, LEAFPOST, BACK, RM, AVG, WALK, SNAP, P2,
     );
 
     pub struct Timer(std::time::Instant, &'static AtomicU64);
@@ -74,6 +74,10 @@ mod shape {
     pub static CHANCE: AtomicU64 = AtomicU64::new(0);
     pub static INNER_CA: AtomicU64 = AtomicU64::new(0);
     pub static CFGSUM: AtomicU64 = AtomicU64::new(0);
+    /// Distinct configs interned per solve — the height of the readout table,
+    /// against `CFGSUM`'s total slots, which is what decides whether the
+    /// per-config readout is better done leaf by leaf or as one matmul.
+    pub static NCFG: AtomicU64 = AtomicU64::new(0);
 
     pub fn add(c: &AtomicU64, v: u64) {
         c.fetch_add(v, Relaxed);
@@ -82,12 +86,13 @@ mod shape {
     pub fn dump_shape() {
         let s = SOLVES.load(Relaxed).max(1) as f64;
         println!(
-            "  per solve: nodes {:.1} leaves {:.1} chance {:.1} inner c*a {:.0} cfg-slots {:.0}",
+            "  per solve: nodes {:.1} leaves {:.1} chance {:.1} inner c*a {:.0} cfg-slots {:.0} distinct-cfg {:.1}",
             NODES.load(Relaxed) as f64 / s,
             LEAVES.load(Relaxed) as f64 / s,
             CHANCE.load(Relaxed) as f64 / s,
             INNER_CA.load(Relaxed) as f64 / s,
             CFGSUM.load(Relaxed) as f64 / s,
+            NCFG.load(Relaxed) as f64 / s,
         );
     }
 }

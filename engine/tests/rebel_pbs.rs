@@ -419,6 +419,49 @@ fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
     Belief { p: vec![1.0 / n; cfgs.len()], cfg: cfgs }
 }
 
+/// A subgame close enough to the horizon that every leaf is terminal has no
+/// network rows at all. The card table is only built when there is something to
+/// encode, so anything hoisted out of the per-row loop must not read it.
+///
+/// The solver oracle already reaches these positions, but with an empty network,
+/// which returns before the batch is touched. This one uses a real one -- the
+/// combination a benchmark hit and the suite did not.
+#[test]
+fn a_subgame_of_only_terminal_leaves_solves() {
+    let nets = Nets { value: random_net(5, 64, 16) };
+    let mut checked = 0usize;
+    for seed in 0..600u64 {
+        let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
+        let mut s = make_game(&mut rng, false);
+        for _ in 0..60 + seed % 100 {
+            if s.is_terminal() {
+                break;
+            }
+            let acts = s.legal_actions();
+            s.apply_inplace(acts[rng.below(acts.len())]);
+        }
+        if s.is_terminal() || s.is_chance() {
+            continue;
+        }
+        // One coin play from the horizon: every child is terminal.
+        s.main_plays = warchest::state::MAX_MAIN_PLAYS - 1;
+        let ctx = Ctx::new(&s);
+        let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
+        let cfg = Cfg { depth: 2, iters: 8, snapshots: true, ..Default::default() };
+        let mut sv = Solver::new(&s, &ctx, &nets, cfg, bel.clone());
+        assert!(sv.nodes.iter().all(|n| !n.leaf || n.s.is_terminal()),
+                "expected every leaf terminal");
+        sv.multistep(cfg.iters);
+        let v = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
+        assert!(v[0][0].iter().all(|x| x.is_finite()));
+        checked += 1;
+        if checked >= 3 {
+            break;
+        }
+    }
+    assert!(checked >= 3, "only {checked} positions exercised");
+}
+
 /// A pre-describer checkpoint must still be able to play.
 ///
 /// The card describer changed the public encoding's width and layout. If the

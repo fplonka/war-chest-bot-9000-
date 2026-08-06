@@ -139,6 +139,42 @@ fn gemm_ld(
     }
 }
 
+/// `c[m x n] = a[m x k] * b[n x k]^T`, row-major. The second operand is stored
+/// by *row* rather than by column, which is how the readouts hold their action
+/// and config embeddings — so this is the shape a dot product of two lists of
+/// vectors takes, and it goes through the same coprocessor the other matmuls do.
+#[allow(clippy::too_many_arguments)]
+fn gemm_nt(m: usize, n: usize, k: usize, a: &[f32], lda: usize, b: &[f32], ldb: usize,
+           c: &mut [f32], ldc: usize) {
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+    debug_assert!(a.len() >= (m - 1) * lda + k);
+    debug_assert!(b.len() >= (n - 1) * ldb + k);
+    debug_assert!(c.len() >= (m - 1) * ldc + n);
+    #[cfg(target_vendor = "apple")]
+    unsafe {
+        // 101 = CblasRowMajor, 111 = CblasNoTrans, 112 = CblasTrans.
+        cblas_sgemm(101, 111, 112, m as i32, n as i32, k as i32, 1.0, a.as_ptr(), lda as i32,
+                    b.as_ptr(), ldb as i32, 0.0, c.as_mut_ptr(), ldc as i32);
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    for i in 0..m {
+        for j in 0..n {
+            c[i * ldc + j] = dot(&a[i * lda..i * lda + k], &b[j * ldb..j * ldb + k]);
+        }
+    }
+}
+
+/// Every PBS row against every config embedding at once: `out[r][c]` is
+/// `<u[r], g[c][..rk]>`. The bias column is left to the caller, which has to
+/// touch each entry anyway to scale by the opponent's reach.
+#[allow(clippy::too_many_arguments)]
+pub fn dots(u: &[f32], rk: usize, g: &[f32], ldg: usize, rows: usize, ncfg: usize,
+            out: &mut [f32]) {
+    gemm_nt(rows, ncfg, rk, u, rk, g, ldg, &mut out[..rows * ncfg], ncfg);
+}
+
 /// Must match `torch.nn.LayerNorm`'s default.
 const LN_EPS: f32 = 1e-5;
 
@@ -343,7 +379,7 @@ pub fn accumulate(z: &[f32], idx: &[u32], w: &[f32], n: usize, out: &mut [f32]) 
 /// Every buffer here is fully overwritten by the matmul that follows, so the
 /// `clear() + resize()` this replaces was a megabyte-scale memset per call.
 #[inline]
-fn fit(v: &mut Vec<f32>, n: usize) {
+pub fn fit(v: &mut Vec<f32>, n: usize) {
     if v.len() < n {
         v.resize(n, 0.0);
     }
@@ -755,6 +791,14 @@ impl Mlp {
     fn assemble(&self, xpub: &[f32], rows: usize, stride: usize, e: &[f32], x: &mut Vec<f32>) {
         let (de, xd) = (self.de(), self.xdim());
         debug_assert!(!self.v1());
+        // A subgame of only terminal leaves has no network rows, and then no
+        // card table either — it is built only when there is something to
+        // encode. The card half of the pile summary is hoisted out of the row
+        // loop below, so without this it would read an empty table rather than
+        // simply not running.
+        if rows == 0 {
+            return;
+        }
         let (hex_e, piles) = (N_HEXES * HEX_FACTS, N_HEXES * (HEX_FACTS + de));
         fit(x, rows * xd);
         x[..rows * xd].fill(0.0);
@@ -1067,29 +1111,34 @@ impl Mlp {
         scratch: &mut Vec<f32>,
         out: &mut [f32],
     ) {
-        let (dg, rk) = (self.dg(), self.rank());
-        debug_assert_eq!(out.len(), cidx.len() * na);
+        let (dg, rk, nc) = (self.dg(), self.rank(), cidx.len());
+        debug_assert_eq!(out.len(), nc * na);
         self.hidden_layer(xbel, 1, pre, scratch);
         let mut upi = Vec::new();
         self.readout(scratch, 1, &self.wp, &self.bp, &mut upi);
-        let mut k = vec![0.0f32; rk];
+        // `k(c) = u_pi + z(c) Wk + bk`, one row per config, then every logit is
+        // a dot of a `k` row with a `q` row. Both are matmuls: gathering the
+        // configs' embeddings into one block first costs a copy and turns two
+        // scalar triple loops -- `nc * rank * dg` of them, walking `Wk` with a
+        // stride -- into work the vector units do.
+        let mut zc = vec![0.0f32; nc * dg];
         for (ci, &c) in cidx.iter().enumerate() {
-            // k(c) = z(c) Wk + bk, added to the PBS readout before the dot with
-            // each action: one vector per config, then `na` dot products.
-            let zc = &z[c as usize * dg..(c as usize + 1) * dg];
+            zc[ci * dg..(ci + 1) * dg]
+                .copy_from_slice(&z[c as usize * dg..(c as usize + 1) * dg]);
+        }
+        let mut k = vec![0.0f32; nc * rk];
+        gemm_ld(nc, rk, dg, &zc, dg, &self.wk, rk, 0.0, &mut k, rk);
+        for ci in 0..nc {
             for j in 0..rk {
-                let mut s = self.bk[j] + upi[j];
-                for (i, zi) in zc.iter().enumerate() {
-                    s += zi * self.wk[i * rk + j];
-                }
-                k[j] = s;
-            }
-            for a in 0..na {
-                out[ci * na + a] = dot(&k, &q[a * rk..a * rk + rk]);
+                k[ci * rk + j] += self.bk[j] + upi[j];
             }
         }
+        gemm_nt(nc, na, rk, &k, rk, q, rk, out, na);
     }
 
+    /// Every PBS row against every config embedding at once: `out[r][c]` is
+    /// `<u[r], g[c][..rank]>`. The bias column is left to the caller, which has
+    /// to touch each entry anyway to scale by the opponent's reach.
     /// The per-config readout: `v = <u, g[..rank]> + g[rank]`, for the configs
     /// `idx` names in a `g` table built by `embed`.
     pub fn values(&self, u: &[f32], g: &[f32], idx: &[u32], out: &mut [f32]) {

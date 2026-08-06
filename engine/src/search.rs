@@ -497,6 +497,12 @@ pub struct Solver<'a> {
     /// The card table `[NTYPE, de]`. The draft is fixed for the game, so this is
     /// built once per solve and read by every tower that names a card.
     ce: Vec<f32>,
+    /// Decision nodes in the network batch, after the leaves. Only populated
+    /// when a warm start needs the policy head at them.
+    inner_rows: Vec<usize>,
+    /// `[rows, ncfg]`: every leaf's PBS vector dotted with every interned config
+    /// embedding, rebuilt per readout.
+    vt: Vec<f32>,
     /// `rows * hidden`: the public half of the hidden layer.
     h0: Vec<f32>,
     /// Width of one public row: the *net's*, not the current encoding's. A
@@ -584,6 +590,8 @@ impl<'a> Solver<'a> {
             cz: take_buf(R_CZ),
             cg: take_buf(R_CG),
             ce: Vec::new(),
+            inner_rows: Vec::new(),
+            vt: Vec::new(),
             pubfeat: if nets.value.is_empty() { PUBFEAT } else { nets.value.pub_dim() },
             h0: take_buf(R_H0),
             xpub: take_buf(R_XPUB),
@@ -1072,13 +1080,21 @@ impl<'a> Solver<'a> {
     /// cache — walking the finished node array to do this instead meant
     /// re-reading a 700-byte state per leaf out of a half-megabyte tree.
     fn push_leaf(&mut self, id: usize, s: &State, cfgs: &[Rc<[Config]>; 2]) {
-        let _t = timed!(PUBFEAT);
         if s.is_terminal() {
             self.term_leaves.push(id);
             return;
         }
+        self.push_row(id, s, cfgs);
+        self.leaf_rows.push(id);
+    }
+
+    /// One row of the network batch: its public encoding, and its configs
+    /// interned into the shared table. Leaves and — when a warm start needs
+    /// them — decision nodes go through here alike.
+    fn push_row(&mut self, _id: usize, s: &State, cfgs: &[Rc<[Config]>; 2]) {
+        let _t = timed!(PUBFEAT);
         let pf = self.pubfeat;
-        let at = self.leaf_rows.len() * pf;
+        let at = (self.leaf_coff.len() / 2) * pf;
         if self.xpub.len() < at + pf {
             // Grow in chunks so the zero-fill happens a handful of times per
             // solve, and not at all once the pooled buffer is warm.
@@ -1093,7 +1109,6 @@ impl<'a> Solver<'a> {
                 self.leaf_cidx.push(idx);
             }
         }
-        self.leaf_rows.push(id);
     }
 
     /// Index of one config's feature vector in `cphi`, adding it if new.
@@ -1136,20 +1151,37 @@ impl<'a> Solver<'a> {
             return;
         }
         self.batch_ready = true;
-        self.leaf_coff.push(self.leaf_cidx.len() as u32);
-        let rows = self.leaf_rows.len();
         if self.nets.value.is_empty() {
+            self.leaf_coff.push(self.leaf_cidx.len() as u32);
             return;
         }
+        // A warm start reads the policy head at every decision node, so those
+        // nodes join the same batch as the leaves — appended after them, so a
+        // leaf's row index is still its position in `leaf_rows` and nothing on
+        // the value path moves. They then share the card table, the one public
+        // tower pass and the one config-tower pass, instead of running their own
+        // of each. Nothing is pushed when the warm start is off.
+        if self.cfg.warm > 0.0 {
+            for i in 0..self.nodes.len() {
+                if self.nodes[i].leaf || self.nodes[i].chance {
+                    continue;
+                }
+                self.push_row(i, &self.nodes[i].s.clone(), &self.nodes[i].cfgs.clone());
+                self.inner_rows.push(i);
+            }
+        }
+        self.leaf_coff.push(self.leaf_cidx.len() as u32);
+        let (leaves, rows) = (self.leaf_rows.len(), self.leaf_rows.len() + self.inner_rows.len());
         let net = &self.nets.value;
         debug_assert_eq!(net.pub_dim(), self.pubfeat);
         debug_assert_eq!(net.cfeat(), CFEAT);
-        if self.xb.len() < rows * net.belief_dim() {
-            self.xb.resize(rows * net.belief_dim(), 0.0);
+        if self.xb.len() < leaves * net.belief_dim() {
+            self.xb.resize(leaves * net.belief_dim(), 0.0);
         }
+        shape!(NCFG, self.ncfg);
         let _t = timed!(PUBNET);
         let xpub = std::mem::take(&mut self.xpub);
-        // The cards in play are fixed at the draft, so every leaf of the subgame
+        // The cards in play are fixed at the draft, so every row of the subgame
         // carries the same card block and the table is built once. Everything
         // downstream — the hex block, the pile summary, the holding tower, the
         // action tower — reads a row of it by coin-type index.
@@ -1300,18 +1332,39 @@ impl<'a> Solver<'a> {
             self.vals[vo..vo + n].fill(u * opp_reach);
         }
         let rk = if empty { 0 } else { self.nets.value.rank() };
-        let (net, reach, roff, ncs, voff, coff, cidx, ob, cg, vals) = (
-            &self.nets.value,
+        // The readout is a dot product of the leaf's PBS vector with each of its
+        // configs' embeddings. Done leaf by leaf it is a few thousand short
+        // vectorised dots per iteration; done as one matmul against the whole
+        // interned table it is ~7x the arithmetic but runs on the matrix
+        // coprocessor, which is worth far more than 7x. A solve interns ~160
+        // distinct configs against ~17k slots, so the table is small and the
+        // result stays in cache.
+        if !empty {
+            let _t = timed!(LEAFDOT);
+            let rows = self.leaf_rows.len();
+            crate::net::fit(&mut self.vt, rows * self.ncfg);
+            crate::net::dots(
+                &self.ob[..rows * rk],
+                rk,
+                &self.cg[..self.ncfg * (rk + 1)],
+                rk + 1,
+                rows,
+                self.ncfg,
+                &mut self.vt,
+            );
+        }
+        let (reach, roff, ncs, voff, coff, cidx, cg, vt, vals) = (
             &self.reach,
             &self.roff,
             &self.nc,
             &self.voff,
             &self.leaf_coff,
             &self.leaf_cidx,
-            &self.ob,
             &self.cg,
+            &self.vt,
             &mut self.vals,
         );
+        let ncfg = self.ncfg;
         for (r, &i) in self.leaf_rows.iter().enumerate() {
             let ra = roff[i] as usize + if opp == 1 { ncs[i][0] as usize } else { 0 };
             let opp_reach: f32 = reach[ra..ra + ncs[i][opp] as usize].iter().sum();
@@ -1325,14 +1378,10 @@ impl<'a> Solver<'a> {
             // opponent's private state reaches this value solely through the
             // belief embedding, which is what keeps the query leak-free.
             let cs = coff[2 * r + p] as usize;
-            net.values(
-                &ob[r * rk..r * rk + rk],
-                cg,
-                &cidx[cs..cs + n],
-                &mut vals[vo..vo + n],
-            );
-            for v in vals[vo..vo + n].iter_mut() {
-                *v *= opp_reach;
+            let row = &vt[r * ncfg..(r + 1) * ncfg];
+            for (v, &c) in vals[vo..vo + n].iter_mut().zip(&cidx[cs..cs + n]) {
+                // The trailing column of `g` is the per-config bias term.
+                *v = (row[c as usize] + cg[c as usize * (rk + 1) + rk]) * opp_reach;
             }
         }
     }
@@ -1732,56 +1781,40 @@ impl<'a> Solver<'a> {
     /// Write the policy head's distribution into `cur` at every decision node.
     /// Returns false if the network has no usable policy.
     fn policy_into_cur(&mut self) -> bool {
-        let net = &self.nets.value;
-        let inner: Vec<usize> = (0..self.nodes.len())
-            .filter(|&i| !self.nodes[i].leaf && !self.nodes[i].chance)
-            .collect();
-        if inner.is_empty() {
+        self.ensure_leaf_batch();
+        if self.inner_rows.is_empty() {
             return false;
         }
-        // A depth-2 tree has a couple of dozen decision nodes against several
-        // hundred leaves, so encoding them costs a few percent of the batch the
-        // solve already builds.
-        let (mut xpub, mut phi, mut coff) = (Vec::new(), Vec::new(), vec![0u32]);
-        for &i in &inner {
-            let at = xpub.len();
-            xpub.resize(at + self.pubfeat, 0.0);
-            let (st, pf) = (self.nodes[i].s, self.pubfeat);
-            if self.nets.value.v1() {
-                crate::v1::write_public_features_v1(&st, self.ctx, &mut xpub[at..at + pf]);
-            } else {
-                write_public_features(&st, self.ctx, &mut xpub[at..at + pf]);
-            }
-            for p in 0..2usize {
-                let res = reserve(&self.nodes[i].s, p as u8, self.ctx);
-                for c in self.nodes[i].cfgs[p].iter() {
-                    let at = phi.len();
-                    phi.resize(at + CFEAT, 0.0);
-                    write_config_feats(c, &res, p, &mut phi[at..at + CFEAT]);
-                }
-                coff.push((phi.len() / CFEAT) as u32);
-            }
-        }
-        let rows = inner.len();
-        let (dg, mut z, mut g, mut sb, mut pre) =
-            (net.dg(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        net.embed(&phi, phi.len() / CFEAT, &self.ce, &mut z, &mut g);
-        net.trunk(&xpub, rows, self.pubfeat, &self.ce, &mut sb, &mut pre);
-
-        let (mut q, mut logit, mut w) = (Vec::new(), Vec::new(), Vec::new());
-        let mut psi = Vec::new();
+        // Everything the head needs is already in the solve's batch: the public
+        // tower ran over these rows alongside the leaves, and their configs were
+        // interned into the same table. What is left per node is its action
+        // descriptions, its belief block, and the readout.
+        let net = &self.nets.value;
+        let (dg, h) = (net.dg(), net.hidden());
+        let base = self.leaf_rows.len();
+        let (mut q, mut logit, mut w, mut psi, mut sb) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut xbel = vec![0.0f32; 2 * dg];
-        for (r, &i) in inner.iter().enumerate() {
+        for k in 0..self.inner_rows.len() {
+            let (r, i) = (base + k, self.inner_rows[k]);
             let (na, me) = (self.nodes[i].na(), self.nodes[i].player as usize);
             // The belief the head reads is the normalised reach, as everywhere
             // else. At this point the reaches are the uniform ones `new` left.
             xbel.iter_mut().for_each(|x| *x = 0.0);
             for p in 0..2usize {
-                let (lo, hi) = (coff[2 * r + p] as usize, coff[2 * r + p + 1] as usize);
+                let (lo, hi) = (
+                    self.leaf_coff[2 * r + p] as usize,
+                    self.leaf_coff[2 * r + p + 1] as usize,
+                );
                 w.resize(hi - lo, 0.0);
                 normalize_weights(self.reach_of(i, p), &mut w);
-                let idx: Vec<u32> = (lo as u32..hi as u32).collect();
-                crate::net::accumulate(&z, &idx, &w, dg, &mut xbel[p * dg..(p + 1) * dg]);
+                crate::net::accumulate(
+                    &self.cz,
+                    &self.leaf_cidx[lo..hi],
+                    &w,
+                    dg,
+                    &mut xbel[p * dg..(p + 1) * dg],
+                );
             }
             psi.resize(na * AFEAT, 0.0);
             for a in 0..na {
@@ -1796,19 +1829,22 @@ impl<'a> Solver<'a> {
                 );
             }
             net.embed_actions(&psi, na, &self.ce, &mut q);
-            let (lo, hi) = (coff[2 * r + me] as usize, coff[2 * r + me + 1] as usize);
-            let idx: Vec<u32> = (lo as u32..hi as u32).collect();
-            logit.resize(idx.len() * na, 0.0);
+            let (lo, hi) = (
+                self.leaf_coff[2 * r + me] as usize,
+                self.leaf_coff[2 * r + me + 1] as usize,
+            );
+            logit.resize((hi - lo) * na, 0.0);
             net.policy(
                 &xbel,
-                &pre[r * net.hidden()..],
-                &z,
-                &idx,
+                &self.h0[r * h..],
+                &self.cz,
+                &self.leaf_cidx[lo..hi],
                 &q,
                 na,
                 &mut sb,
                 &mut logit,
             );
+            let idx = lo..hi;
             // Softmax over the *legal* actions of each config, with the same
             // floor regret matching uses, so every legal action keeps positive
             // probability and the carried beliefs keep full support.
