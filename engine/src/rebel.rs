@@ -48,7 +48,7 @@
 //! agent could not act on coins it had buried itself — a restriction of the
 //! strategy space, i.e. a different game. `docs/REBEL.md` records what it cost.
 
-use crate::actions::Action;
+use crate::actions::{Action, N_KINDS};
 use crate::board::{board, NONE, N_HEXES};
 use crate::state::{Cont, State, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP, Z_HAND, Z_SUPPLY};
 use crate::units::{write_card_features, CARD_FEATS, N_UNITS};
@@ -180,6 +180,48 @@ pub fn write_config_feats(c: &Config, reserve: &[u8; NSLOT], player: usize, out:
         out[k] = cnt[k] as f32 / CNORM;
     }
     out[CCOUNTS] = player as f32;
+}
+
+// ------------------------------------------------------------ action features
+
+/// The action vector the policy head reads: what kind of action it is, the
+/// three squares it names, which of the player's coin slots pays for it, which
+/// slot a Recruit takes, and whether the coin goes face down.
+///
+/// One-hot throughout, and every field of the action is in there, so two
+/// distinct actions never share a description — the same property
+/// `config_features_separate_every_config` pins for the private state, for the
+/// same reason. It is what lets the policy head be an embedding *network* over
+/// a node-dependent action list rather than a fixed-width output vector, which
+/// War Chest's hex-indexed actions could never fit.
+///
+/// The `+ 1` on each one-hot is the "absent" slot: most actions name no square
+/// at all, and a plain zero block would be indistinguishable from a square the
+/// board does not have.
+pub const AFEAT: usize =
+    N_KINDS + 3 * (N_HEXES + 1) + 2 * (NSLOT + 1) + 1;
+
+/// `slot` is the coin slot the action spends (`-1` for the micro-decisions
+/// inside a tactic, which spend nothing) and `fdown` whether it goes face down;
+/// the solver has both per action already, so they are passed rather than
+/// re-derived.
+pub fn write_action_feats(a: &Action, ctx: &Ctx, player: usize, slot: i8, fdown: bool, out: &mut [f32]) {
+    debug_assert_eq!(out.len(), AFEAT);
+    out.fill(0.0);
+    let mut at = 0usize;
+    let mut hot = |i: usize, n: usize, out: &mut [f32]| {
+        out[at + i] = 1.0;
+        at += n;
+    };
+    hot(a.kind(), N_KINDS, out);
+    for h in a.hexes() {
+        hot(if h == NONE { N_HEXES } else { h as usize }, N_HEXES + 1, out);
+    }
+    hot(if slot < 0 { NSLOT } else { slot as usize }, NSLOT + 1, out);
+    let r = a.recruited();
+    let rs = if r == NONE { -1 } else { ctx.slot_of[player][r as usize] };
+    hot(if rs < 0 { NSLOT } else { rs as usize }, NSLOT + 1, out);
+    out[at] = fdown as u8 as f32;
 }
 
 /// `reserve[k] = bag[k] + hand[k] + facedown[k]` — public, and invariant to how

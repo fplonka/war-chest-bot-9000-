@@ -406,6 +406,54 @@ fn config_features_separate_every_config() {
     assert!(checked > 10_000, "only {checked} config vectors exercised");
 }
 
+/// The same property for actions, and it matters for the same reason: the
+/// policy head is an embedding *network* over a node-dependent action list
+/// rather than a fixed-width output vector, so two actions that share a
+/// description are two actions the head can never tell apart, and it would
+/// learn the average of what the solver wanted for each.
+///
+/// Run over the action lists real subgame nodes actually build, so it covers
+/// the tactic chains and the partially-private plays rather than a synthetic
+/// enumeration.
+#[test]
+fn action_features_separate_every_action() {
+    let mut checked = 0usize;
+    let mut kinds: HashMap<usize, usize> = HashMap::new();
+    for seed in 0..1500u64 {
+        let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
+        let mut s = make_game(&mut rng, false);
+        for _ in 0..seed % 220 {
+            if s.is_terminal() {
+                break;
+            }
+            let acts = s.legal_actions();
+            s.apply_inplace(acts[rng.below(acts.len())]);
+        }
+        if s.is_terminal() || s.is_chance() {
+            continue;
+        }
+        let ctx = Ctx::new(&s);
+        let p = s.to_act();
+        let cfgs = [true_config(&s, p, &ctx)];
+        let (acts, aslot, fdown) = node_actions(&s, p, &ctx, &cfgs);
+        let mut seen: HashMap<Vec<u32>, Action> = HashMap::new();
+        for i in 0..acts.len() {
+            let mut psi = vec![0.0f32; AFEAT];
+            write_action_feats(&acts[i], &ctx, p as usize, aslot[i], fdown[i], &mut psi);
+            *kinds.entry(acts[i].kind()).or_default() += 1;
+            // Bit patterns, so this compares exactly rather than up to a
+            // tolerance chosen to make it pass.
+            let key: Vec<u32> = psi.iter().map(|x| x.to_bits()).collect();
+            if let Some(prev) = seen.insert(key, acts[i]) {
+                assert_eq!(prev, acts[i], "two actions share a feature vector");
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked > 5_000, "only {checked} action vectors exercised");
+    assert!(kinds.len() >= 8, "only {} action kinds exercised", kinds.len());
+}
+
 /// The counts must be the ones the name says, and the bag must be the derived
 /// one. A transposition here would be invisible to every other test: the
 /// network would happily learn whatever permutation it was given.

@@ -50,6 +50,8 @@
 pub const KIND_BITS: u32 = 6;
 pub const FIELD_BITS: u32 = 6;
 pub const FIELD_NONE: u32 = 63;
+/// How many stable kind numbers there are. The policy head one-hots this.
+pub const N_KINDS: usize = 39;
 
 use crate::board::NONE;
 
@@ -169,6 +171,68 @@ fn pack(kind: u32, a: u32, b: u32, c: u32, d: u32) -> u32 {
 }
 
 impl Action {
+    /// The stable kind number, which is the low bits of the encoding.
+    #[inline]
+    pub fn kind(&self) -> usize {
+        (self.encode() & ((1 << KIND_BITS) - 1)) as usize
+    }
+
+    /// The board squares an action names: where the acting piece stands, where
+    /// it ends up, and what it acts on — `NONE` for any the action does not
+    /// have. This is the spatial half of how the policy head describes an
+    /// action, and it is kept semantic rather than read off `encode`'s fields
+    /// because those hold a unit index as often as a hex.
+    ///
+    /// Three slots rather than two because the Lancer names all three: it moves
+    /// to one square and strikes another, and collapsing them would give two
+    /// different charges the same description.
+    pub fn hexes(&self) -> [u8; 3] {
+        use Action::*;
+        match *self {
+            Deploy { hex, .. } | Bolster { hex, .. } | FootmanInstantDeploy { hex } => {
+                [NONE, hex, NONE]
+            }
+            Move { from, to }
+            | TacCavalryMove { from, to }
+            | TacEnsign { from, to }
+            | TacLightCav { from, to }
+            | TacRoyalGuard { from, to }
+            | FootMove { from, to }
+            | SwordsmanMove { from, to }
+            | BerserkMove { from, to }
+            | MercMove { from, to }
+            | GrantMove { from, to } => [from, to, NONE],
+            Attack { from, target }
+            | TacArcher { from, target }
+            | TacCavalryAttack { from, target }
+            | TacCrossbow { from, target }
+            | FootAttack { from, target }
+            | BerserkAttack { from, target }
+            | MercAttack { from, target }
+            | GrantAttack { from, target } => [from, NONE, target],
+            TacLancer { from, to, target } => [from, to, target],
+            TacMarshal { unit_hex, target } => [unit_hex, NONE, target],
+            Control { from }
+            | FootControl { from }
+            | BerserkControl { from }
+            | MercControl { from }
+            | GrantControl { from } => [from, NONE, NONE],
+            // Coin plays that touch no square, chance, and the declines.
+            _ => [NONE, NONE, NONE],
+        }
+    }
+
+    /// The unit type a Recruit takes out of the supply, or `NONE`. It is the
+    /// one choice in an action that neither the kind, the squares, nor the coin
+    /// spent describes.
+    #[inline]
+    pub fn recruited(&self) -> u8 {
+        match *self {
+            Action::Recruit { unit, .. } => unit,
+            _ => NONE,
+        }
+    }
+
     pub fn encode(&self) -> u32 {
         use Action::*;
         match *self {
