@@ -487,7 +487,7 @@ impl Game {
 // and pulls tensors back once per epoch.
 
 use crate::net::Mlp;
-use crate::search::{Cfg, Nets};
+use crate::search::{Cfg, Cfr, Nets};
 use crate::selfplay::{eval_match as rs_eval_match, run_games, Agent, Collect, Data, GameCfg};
 use numpy::{IntoPyArray, PyReadonlyArray1};
 use std::sync::{OnceLock, RwLock};
@@ -533,6 +533,16 @@ fn set_weights(
     }
     n[slot].value = mlp;
     Ok(())
+}
+
+fn cfr_of(name: &str) -> PyResult<Cfr> {
+    Cfr::named(name).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown cfr '{}': one of {}",
+            name,
+            Cfr::NAMED.map(|(n, _)| n).join(", ")
+        ))
+    })
 }
 
 fn agent_of(name: &str, cfg: Cfg, temp: f32, slot: usize) -> PyResult<Agent> {
@@ -593,7 +603,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
 /// Run `games` self-play games across all cores and return the training data.
 /// `mode` is "greedy" (Monte-Carlo warm start) or "rebel".
 #[pyfunction]
-#[pyo3(signature = (games, seed, mode, depth=1, iters=16, explore=0.25, temp=2.0, random_draft=false, eval_mix=0.5, mc_mix=0.0))]
+#[pyo3(signature = (games, seed, mode, depth=1, iters=16, explore=0.25, temp=2.0, random_draft=false, eval_mix=0.5, mc_mix=0.0, cfr="linear"))]
 #[allow(clippy::too_many_arguments)]
 fn gen_data(
     py: Python<'_>,
@@ -607,11 +617,13 @@ fn gen_data(
     random_draft: bool,
     eval_mix: f32,
     mc_mix: f32,
+    cfr: &str,
 ) -> PyResult<PyObject> {
     let cfg = Cfg {
         depth,
         iters,
         snapshots: true,
+        cfr: cfr_of(cfr)?,
     };
     let (agent, collect) = match mode {
         "greedy" => (Agent::Greedy { temp }, Collect::Mc),
@@ -643,7 +655,7 @@ fn gen_data(
 /// pitted against itself at different depths or iteration counts (the depth
 /// probe); they default to side A's.
 #[pyfunction]
-#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=false, depth_b=None, iters_b=None))]
+#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=false, depth_b=None, iters_b=None, cfr="linear"))]
 #[allow(clippy::too_many_arguments)]
 fn eval_match(
     py: Python<'_>,
@@ -659,16 +671,18 @@ fn eval_match(
     random_draft: bool,
     depth_b: Option<usize>,
     iters_b: Option<usize>,
+    cfr: &str,
 ) -> PyResult<(usize, usize, usize)> {
     let cfg = Cfg {
         depth,
         iters,
         snapshots: false,
+        cfr: cfr_of(cfr)?,
     };
     let cfg_b = Cfg {
-        depth: depth_b.unwrap_or(depth),
         iters: iters_b.unwrap_or(iters),
-        snapshots: false,
+        depth: depth_b.unwrap_or(depth),
+        ..cfg
     };
     let (aa, bb) = (agent_of(a, cfg, temp, slot_a)?, agent_of(b, cfg_b, temp, slot_b)?);
     Ok(py.allow_threads(|| {

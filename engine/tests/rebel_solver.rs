@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use warchest::board::NONE;
 use warchest::rebel::*;
 use warchest::rng::Rng;
-use warchest::search::{action_coin, node_actions, Cfg, Nets, Solver};
+use warchest::search::{action_coin, node_actions, Cfg, Cfr, Nets, Solver};
 use warchest::selfplay::make_game;
 use warchest::state::{State, MAX_MAIN_PLAYS, Z_BAG, Z_FACEDOWN, Z_HAND};
 
@@ -177,72 +177,90 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
             depth: 8,
             iters: 500,
             snapshots: true,
+            ..Default::default()
         };
-        let mut sv = Solver::new(&s, &ctx, &nets, cfg, bel.clone());
-        // If any leaf were non-terminal the (empty) network would silently
-        // return zero and the comparison would be meaningless.
-        assert!(
-            sv.nodes.iter().all(|n| !n.leaf || n.s.is_terminal()),
-            "the whole remaining game must fit inside the subgame"
-        );
-        if sv.nodes.len() > 8_000 {
-            continue;
+        {
+            let sv = Solver::new(&s, &ctx, &nets, cfg, bel.clone());
+            // If any leaf were non-terminal the (empty) network would silently
+            // return zero and the comparison would be meaningless.
+            assert!(
+                sv.nodes.iter().all(|n| !n.leaf || n.s.is_terminal()),
+                "the whole remaining game must fit inside the subgame"
+            );
+            if sv.nodes.len() > 8_000 {
+                continue;
+            }
+            // A position where every line ends in the same score tests nothing.
+            let mut outcomes: Vec<i32> = sv
+                .nodes
+                .iter()
+                .filter(|n| n.leaf && n.s.is_terminal())
+                .map(|n| (n.s.utility(0) * 1000.0) as i32)
+                .collect();
+            outcomes.sort_unstable();
+            outcomes.dedup();
+            if outcomes.len() < 2 {
+                continue;
+            }
         }
-        // A position where every line ends in the same score tests nothing.
-        let mut outcomes: Vec<i32> = sv
-            .nodes
-            .iter()
-            .filter(|n| n.leaf && n.s.is_terminal())
-            .map(|n| (n.s.utility(0) * 1000.0) as i32)
-            .collect();
-        outcomes.sort_unstable();
-        outcomes.dedup();
-        if outcomes.len() < 2 {
-            continue;
-        }
-        sv.multistep(cfg.iters);
 
-        let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
-        let v0: f64 = (0..bel[0].len())
-            .map(|c| bel[0].p[c] as f64 * vals[0][0][c] as f64)
-            .sum();
-        let v1: f64 = (0..bel[1].len())
-            .map(|c| bel[1].p[c] as f64 * vals[0][1][c] as f64)
-            .sum();
-        // A zero-sum game solved consistently: the two players' root values
-        // must cancel. This is the single most useful invariant on the
-        // counterfactual-value convention.
-        assert!(
-            (v0 + v1).abs() < 0.02,
-            "seed {}: root values are not zero-sum: {:.4} + {:.4}",
-            seed,
-            v0,
-            v1
-        );
-
+        // The exhaustive side is the expensive one, so it runs once and every
+        // variant is held to it. In a two-player zero-sum game the value is
+        // unique, so any regret rule that converges must land on the same
+        // number — which makes this the whole correctness net for the family.
         let exact = oracle_value(&s, &ctx, &bel, 100);
-        assert!(
-            (v0 - exact).abs() < 0.03,
-            "seed {}: subgame solver says {:.4}, tabular CFR says {:.4} \
-             ({} public nodes, {}x{} configs)",
-            seed,
-            v0,
-            exact,
-            sv.nodes.len(),
-            bel[0].len(),
-            bel[1].len()
-        );
+        for (name, rule) in Cfr::NAMED {
+            let mut sv = Solver::new(&s, &ctx, &nets, Cfg { cfr: rule, ..cfg }, bel.clone());
+            // Exploitability early, before the solve has gone anywhere. Read
+            // mid-flight on purpose: a fixed-policy pass must leave the solve
+            // able to continue.
+            sv.multistep(2);
+            let early = sv.nash_conv().nash as f64;
+            sv.multistep(cfg.iters - 2);
+            let late = sv.nash_conv().nash as f64;
+
+            let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
+            let v0: f64 = (0..bel[0].len())
+                .map(|c| bel[0].p[c] as f64 * vals[0][0][c] as f64)
+                .sum();
+            let v1: f64 = (0..bel[1].len())
+                .map(|c| bel[1].p[c] as f64 * vals[0][1][c] as f64)
+                .sum();
+            // A zero-sum game solved consistently: the two players' root values
+            // must cancel. This is the single most useful invariant on the
+            // counterfactual-value convention.
+            assert!(
+                (v0 + v1).abs() < 0.02,
+                "seed {seed} {name}: root values are not zero-sum: {v0:.4} + {v1:.4}"
+            );
+            assert!(
+                (v0 - exact).abs() < 0.03,
+                "seed {seed} {name}: subgame solver says {v0:.4}, tabular CFR says \
+                 {exact:.4} ({}x{} configs)",
+                bel[0].len(),
+                bel[1].len()
+            );
+            // A best response can never do worse than the strategy it answers,
+            // so NashConv is non-negative; and 500 iterations of any of these
+            // rules must beat 2.
+            assert!(late > -1e-3, "seed {seed} {name}: NashConv is negative: {late:.5}");
+            assert!(
+                late < early.max(1e-3),
+                "seed {seed} {name}: NashConv did not fall: {early:.5} -> {late:.5}"
+            );
+            eprintln!(
+                "  seed {seed:4} {name:>7}: value {v0:+.4} (exact {exact:+.4})  \
+                 zero-sum {:+.4}  NashConv {early:.4} -> {late:.4}",
+                v0 + v1
+            );
+        }
         checked += 1;
-        eprintln!(
-            "  seed {:4}: solver {:+.4}  tabular {:+.4}  zero-sum {:+.4}  ({} nodes, {}x{} configs)",
-            seed, v0, exact, v0 + v1, sv.nodes.len(), bel[0].len(), bel[1].len()
-        );
         if checked >= 4 {
             break;
         }
     }
     assert!(checked >= 4, "only {} positions exercised", checked);
-    eprintln!("verified {} micro-endgames against tabular CFR", checked);
+    eprintln!("verified {} micro-endgames against tabular CFR, for every regret rule", checked);
 }
 
 /// How badly does a short solve misprice a position?
@@ -270,7 +288,7 @@ fn cfr_iteration_count_bias() {
         if bel[0].len() * bel[1].len() > 64 {
             continue;
         }
-        let probe = Solver::new(&s, &ctx, &nets, Cfg { depth: 8, iters: 1, snapshots: true }, bel.clone());
+        let probe = Solver::new(&s, &ctx, &nets, Cfg { depth: 8, iters: 1, snapshots: true, ..Default::default() }, bel.clone());
         if !probe.nodes.iter().all(|n| !n.leaf || n.s.is_terminal()) || probe.nodes.len() > 8_000 {
             continue;
         }
@@ -288,7 +306,7 @@ fn cfr_iteration_count_bias() {
         let exact = oracle_value(&s, &ctx, &bel, 100);
         let mut line = format!("  {:+.4}   ", exact);
         for (bi, &t) in budgets.iter().enumerate() {
-            let mut sv = Solver::new(&s, &ctx, &nets, Cfg { depth: 8, iters: t, snapshots: true }, bel.clone());
+            let mut sv = Solver::new(&s, &ctx, &nets, Cfg { depth: 8, iters: t, snapshots: true, ..Default::default() }, bel.clone());
             sv.multistep(t);
             let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
             let v0: f64 = (0..bel[0].len())
@@ -409,6 +427,7 @@ fn draw_pass_through_consistency() {
                 depth: 5,
                 iters: 80,
                 snapshots: true,
+                ..Default::default()
             },
             bel.clone(),
         );
@@ -543,7 +562,7 @@ fn depth_is_spent_on_coin_plays_not_micro_choices() {
                 // root was a leaf and this assertion failed.
                 let mut sv = Solver::new(
                     &s, &ctx, &nets[0],
-                    Cfg { depth: 1, iters: 4, snapshots: false },
+                    Cfg { depth: 1, iters: 4, snapshots: false, ..Default::default() },
                     bel,
                 );
                 sv.multistep(4);
@@ -555,7 +574,7 @@ fn depth_is_spent_on_coin_plays_not_micro_choices() {
                 // one completed coin play, so it must be expanded, not a leaf.
                 let mut sv = Solver::new(
                     &s, &ctx, &nets[0],
-                    Cfg { depth: 2, iters: 4, snapshots: false },
+                    Cfg { depth: 2, iters: 4, snapshots: false, ..Default::default() },
                     [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)],
                 );
                 sv.multistep(4);

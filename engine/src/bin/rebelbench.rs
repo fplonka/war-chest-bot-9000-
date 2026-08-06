@@ -39,6 +39,7 @@ fn main() {
         depth,
         iters,
         snapshots: true,
+        ..Default::default()
     };
     let agent = Agent::Rebel { cfg, slot: 0 };
     let gc = GameCfg {

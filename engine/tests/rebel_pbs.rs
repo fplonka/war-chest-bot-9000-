@@ -482,7 +482,7 @@ fn position_with_ambiguous_facedown(seed: u64) -> Option<(State, Ctx, [Belief; 2
 fn a_solve_reads_only_the_beliefs() {
     let mut nets = Nets::default();
     nets.value = random_net(0xA11CE, 64, 16);
-    let cfg = Cfg { depth: 2, iters: 8, snapshots: true };
+    let cfg = Cfg { depth: 2, iters: 8, snapshots: true, ..Default::default() };
     let mut checked = 0usize;
     for seed in 1..80u64 {
         let Some((s, ctx, bel)) = position_with_ambiguous_facedown(seed) else {
@@ -526,7 +526,7 @@ fn a_solve_reads_only_the_beliefs() {
 fn the_value_function_separates_configs_sharing_a_hand() {
     let mut nets = Nets::default();
     nets.value = random_net(0xBEEF, 64, 16);
-    let cfg = Cfg { depth: 2, iters: 8, snapshots: true };
+    let cfg = Cfg { depth: 2, iters: 8, snapshots: true, ..Default::default() };
     let (mut positions, mut val_differs, mut strat_differs) = (0usize, 0usize, 0usize);
     for seed in 1..80u64 {
         let Some((s, ctx, bel)) = position_with_ambiguous_facedown(seed) else {
@@ -674,7 +674,7 @@ fn zero_weight_config_survives_the_walk_update() {
         bel[me].normalize();
         let mut sv = Solver::new(
             &s, &ctx, &nets[0],
-            Cfg { depth: 2, iters: 8, snapshots: false },
+            Cfg { depth: 2, iters: 8, snapshots: false, ..Default::default() },
             bel.clone(),
         );
         sv.multistep(8);

@@ -244,6 +244,7 @@ impl LiveGame {
             depth: self.depth,
             iters: self.iters,
             snapshots: false,
+            ..Default::default()
         };
         // Work on copies so the solver's borrows do not tie up `self`; the
         // state is `Copy` and the belief only needs a clone per decision.

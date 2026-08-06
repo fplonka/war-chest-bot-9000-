@@ -1,45 +1,50 @@
-//! How wrong is the CFR value target at the iteration count self-play uses?
+//! How good is a solve, at the iteration count generation uses, under each
+//! regret rule?
 //!
-//! Generation runs `T` alternating linear-CFR iterations per subgame. The
-//! only evidence that any particular T is enough came from micro-endgames
-//! solved against exact values, where mean |error| was 0.0035 at T=8 — but a
-//! micro-endgame converges almost immediately, so that number says very
-//! little about the ~540-node depth-2 subgames self-play actually solves.
+//! Two questions, one harness, no training runs and no noise.
 //!
-//! This matters in a way the offline loss work cannot see. An under-converged
-//! solve does not produce *noisy* targets — the same position gives the same
-//! number every time — it produces **biased** ones. A biased target function is
-//! perfectly learnable, so the value network fits it happily and converges to
-//! the fixed point of the under-solved operator. Nothing in a training loss
-//! curve or a held-out fit would ever show it.
+//! **How far from solved?** `NashConv` — what a best response to the solve's
+//! own average strategy would gain, summed over the players. Zero means the
+//! strategy is an equilibrium of the subgame it induces, which is the fixed
+//! point ReBeL's whole argument rests on. This is the number that compares two
+//! *different* regret rules, because it is absolute: it does not grade an
+//! algorithm against its own answer, which is what the previous version of this
+//! tool did and why it could not have chosen between them.
 //!
-//! So: take real mid-game positions, solve each once to `TMAX`, and read the
-//! fixed-policy root value under the average strategy off at every
-//! intermediate `T` (`value_under` — the exact quantity TurboReBeL's Phase 2
-//! uses as its target). The difference between the reading at `T` and at
-//! `TMAX` *is* the target error at that `T`. No training run, no noise.
+//! **How wrong is the target?** The value target is the root value under the
+//! average strategy (`value_under`, exactly what TurboReBeL's Phase 2 records),
+//! and its error is the distance to a converged reference. This is the quantity
+//! the value network actually fits, and an under-converged solve does not make
+//! it *noisy* — the same position gives the same number every time — it makes it
+//! **biased**. A biased target function is perfectly learnable, so the network
+//! fits it happily and converges to the fixed point of the under-solved
+//! operator. No training loss curve would ever show that.
+//!
+//! Both are read off one solve per rule per position: the rungs are readings
+//! taken as the solve passes them.
 //!
 //! Beliefs here are uniform over the configs consistent with the public counts
 //! rather than the true Bayes posterior. That keeps the harness small, and what
 //! governs how hard a subgame is to solve — its tree shape and the size of the
-//! belief support — is matched either way. The absolute values would shift
-//! under the real posterior; the convergence behaviour is what is being
-//! measured.
+//! belief support — is matched either way. The absolute values would shift under
+//! the real posterior; the convergence behaviour is what is being measured.
 //!
-//! `cargo run --release --example solvererr -- weights.bin [positions] [depth]`
+//! `cargo run --release --example solvererr -- weights.bin [positions] [depth] [greedy|random] [skip]`
 
 use warchest::board::N_HEXES;
 use warchest::net::Mlp;
 use warchest::rebel::{enumerate_configs, reserve, true_config, Belief, Config, Ctx};
 use warchest::rng::Rng;
-use warchest::search::{Cfg, Nets, Solver};
+use warchest::search::{Cfg, Cfr, Nets, Solver};
 use warchest::selfplay::{eval_static, make_game};
 use warchest::state::{Cont, State};
 
-/// The iteration counts to report, and the converged reference they are
-/// measured against.
-const LADDER: [usize; 6] = [2, 4, 8, 16, 32, 64];
+/// The iteration counts to report, and the converged solve they are measured
+/// against. The reference is the rule TurboReBeL itself runs, taken far past
+/// every rung.
+const LADDER: [usize; 7] = [4, 8, 16, 32, 64, 128, 256];
 const TMAX: usize = 512;
+const REFERENCE: Cfr = Cfr::DISCOUNTED;
 
 /// One-ply greedy on the public evaluation, to reach realistic mid-game
 /// positions. Chance nodes resolve uniformly over the listed draws.
@@ -75,10 +80,37 @@ fn open_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
     Belief { p: vec![w; cfg.len()], cfg }
 }
 
+/// One rule's readings at every rung of one position, and at `TMAX`.
+struct Run {
+    /// Player 0's root value per config.
+    vals: Vec<Vec<f32>>,
+    nash: Vec<f64>,
+    zero_sum: Vec<f64>,
+}
+
+/// One solve, read off at each rung as it passes: the fixed-policy passes
+/// restore the solve's reaches, so a reading does not disturb what follows.
+fn solve(s: &State, ctx: &Ctx, nets: &Nets, bel: &[Belief; 2], depth: usize, rule: Cfr) -> Run {
+    let cfg = Cfg { depth, iters: TMAX, snapshots: true, cfr: rule };
+    let mut sv = Solver::new(s, ctx, nets, cfg, bel.clone());
+    let root = [[bel[0].p.clone(), bel[1].p.clone()]];
+    let mut r = Run { vals: Vec::new(), nash: Vec::new(), zero_sum: Vec::new() };
+    let mut done = 0usize;
+    for t in LADDER.iter().copied().chain([TMAX]) {
+        sv.multistep(t - done);
+        done = t;
+        let c = sv.nash_conv();
+        r.nash.push(c.nash as f64);
+        r.zero_sum.push(c.zero_sum.abs() as f64);
+        r.vals.push(sv.value_under(&root)[0][0].clone());
+    }
+    r
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let path = a.get(1).cloned().unwrap_or_else(|| "weights.bin".into());
-    let want: usize = a.get(2).and_then(|x| x.parse().ok()).unwrap_or(200);
+    let want: usize = a.get(2).and_then(|x| x.parse().ok()).unwrap_or(100);
     let depth: usize = a.get(3).and_then(|x| x.parse().ok()).unwrap_or(2);
     // How the sampled positions are reached. Greedy play drives coins onto the
     // board and drains the reserve, which collapses the belief support to a
@@ -93,29 +125,26 @@ fn main() {
 
     let mut nets = Nets::default();
     nets.value = Mlp::load_bin(&path).expect("weights file");
-    println!("dims {:?}, depth {depth}, reference T={TMAX}, positions from {} play,\n         sampled {}-{} plies in",
-             nets.value.dims, if greedy { "greedy" } else { "random" }, skip, skip + 60);
+    println!(
+        "dims {:?}, depth {depth}, reference {REFERENCE:?} at T={TMAX},\n\
+         positions from {} play, sampled {}-{} plies in",
+        nets.value.dims,
+        if greedy { "greedy" } else { "random" },
+        skip,
+        skip + 60
+    );
     warchest::state::set_cap_marker_value(0.0);
 
-    // err[i] accumulates |value(LADDER[i]) - value(TMAX)| over every config of
-    // every sampled position; `spread` is the spread of the reference values
-    // themselves, which is the scale the error has to be read against.
-    let mut err = [0.0f64; LADDER.len()];
-    // The *signed* error, which is the number that decides how much T matters.
-    // A zero-mean error behaves like noise: it averages out through the
-    // bootstrap and adds in quadrature with the network's own error, where
-    // shrinking it below a few percent is invisible. A signed error is a bias
-    // that compounds every time the operator is applied, and displaces the
-    // fixed point by roughly bias/(1 - gamma) -- with gamma near 1 on an
-    // undiscounted 256-ply horizon, that is an amplification, not a wash.
-    let mut signed = [0.0f64; LADDER.len()];
-    // Whether the sign is consistent *within* a position, which is what makes
-    // it survive averaging over a subgame's configs.
-    let mut same_sign = [0usize; LADDER.len()];
-    let mut n = 0usize;
+    let rules = Cfr::NAMED;
+    let rungs = LADDER.len() + 1;
+    // Per rule, per rung, summed over every config of every position: the
+    // target's absolute and signed error against the reference, and NashConv.
+    let mut err = vec![vec![0.0f64; rungs]; rules.len()];
+    let mut signed = vec![vec![0.0f64; rungs]; rules.len()];
+    let mut nash = vec![vec![0.0f64; rungs]; rules.len()];
+    let mut asym = vec![vec![0.0f64; rungs]; rules.len()];
+    let (mut n, mut positions, mut support) = (0usize, 0usize, 0usize);
     let (mut ref_sum, mut ref_sq) = (0.0f64, 0.0f64);
-    let mut support = 0usize;
-    let mut positions = 0usize;
 
     let mut game = 0u64;
     while positions < want {
@@ -141,37 +170,25 @@ fn main() {
         }
         let ctx = Ctx::new(&s);
         let bel = [open_belief(&s, &ctx, 0), open_belief(&s, &ctx, 1)];
-        let cfg = Cfg { depth, iters: TMAX, snapshots: true };
-        let mut sv = Solver::new(&s, &ctx, &nets, cfg, bel.clone());
 
-        // One solve, read off at each rung: `value_under` is the fixed-policy
-        // root value under the average strategy run so far — exactly the
-        // target TurboReBeL's Phase 2 would have taken had the solve stopped
-        // there.
-        let mut snap: Vec<Vec<f32>> = Vec::new();
-        let mut done = 0usize;
-        for t in LADDER {
-            sv.multistep(t - done);
-            done = t;
-            let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
-            snap.push(vals[0][0].clone());
-        }
-        sv.multistep(TMAX - done);
-        let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
-        let reference = vals[0][0].clone();
+        let runs: Vec<Run> = rules
+            .iter()
+            .map(|(_, r)| solve(&s, &ctx, &nets, &bel, depth, *r))
+            .collect();
+        // Every rule is graded against the same numbers, which is what makes
+        // the columns comparable.
+        let ri = rules.iter().position(|(_, r)| *r == REFERENCE).unwrap();
+        let reference = runs[ri].vals[rungs - 1].clone();
 
-        for (i, v) in snap.iter().enumerate() {
-            let mut pos = 0usize;
-            for (a, b) in v.iter().zip(reference.iter()) {
-                let d = (a - b) as f64;
-                err[i] += d.abs();
-                signed[i] += d;
-                pos += (d > 0.0) as usize;
-            }
-            // Did this position's configs mostly err the same way?
-            let k = reference.len().max(1);
-            if pos * 4 >= k * 3 || pos * 4 <= k {
-                same_sign[i] += 1;
+        for (k, run) in runs.iter().enumerate() {
+            for t in 0..rungs {
+                nash[k][t] += run.nash[t];
+                asym[k][t] += run.zero_sum[t];
+                for (a, b) in run.vals[t].iter().zip(reference.iter()) {
+                    let d = (a - b) as f64;
+                    err[k][t] += d.abs();
+                    signed[k][t] += d;
+                }
             }
         }
         for r in &reference {
@@ -181,7 +198,7 @@ fn main() {
         n += reference.len();
         support += reference.len();
         positions += 1;
-        if positions % 25 == 0 {
+        if positions % 10 == 0 {
             println!("  ... {positions}/{want} positions");
         }
     }
@@ -192,31 +209,41 @@ fn main() {
         "\n{positions} positions, {:.1} configs each, reference value spread {spread:.4}",
         support as f64 / positions as f64
     );
+
+    let table = |title: &str, acc: &[Vec<f64>], div: f64| {
+        println!("\n{title}\n");
+        print!("{:>7}", "T");
+        for (name, _) in rules {
+            print!("{name:>12}");
+        }
+        println!();
+        for t in 0..rungs {
+            print!("{:>7}", if t < LADDER.len() { LADDER[t] } else { TMAX });
+            for a in acc.iter() {
+                print!("{:>12.5}", a[t] / div);
+            }
+            println!();
+        }
+    };
+    table("NashConv — what a best response to the solve would gain.", &nash, positions as f64);
+    table("mean |target error| against the reference.", &err, n as f64);
+    table("signed mean target error.", &signed, n as f64);
+    table("|v_0 + v_1| — how far the network is from antisymmetric.", &asym, positions as f64);
+
     println!(
-        "\n{:>6}  {:>12}  {:>10}  {:>13}  {:>12}",
-        "T", "mean |err|", "vs spread", "signed mean", "one-sided"
-    );
-    for (i, t) in LADDER.iter().enumerate() {
-        let e = err[i] / n as f64;
-        let sg = signed[i] / n as f64;
-        println!(
-            "{t:>6}  {e:>12.5}  {:>9.1}%  {sg:>+13.5}  {:>11.0}%",
-            100.0 * e / spread.max(1e-9),
-            100.0 * same_sign[i] as f64 / positions as f64
-        );
-    }
-    println!(
-        "\n`signed mean` is the whole question. If it is far smaller than\n\
-         `mean |err|`, the error is noise that averages out through the\n\
-         bootstrap and T past ~16 buys nothing. If the two are comparable, it\n\
-         is a bias that compounds and caps how good the value function can get.\n\
-         `one-sided` is the share of positions whose configs mostly erred the\n\
-         same way, which is what lets a bias survive averaging."
-    );
-    println!(
-        "\nread: the target error at the T generation uses, against the spread of\n\
-         the values themselves and against the value network's own held-out\n\
-         error (~0.09). Raising T only helps if this is a comparable fraction.\n\
+        "\nread: NashConv picks the regret rule — it is absolute, so the columns\n\
+         compare. The target error says what the choice costs the value\n\
+         network: judge it against the spread of the values themselves\n\
+         ({spread:.4}) and against the network's own held-out error (~0.09).\n\
+         A signed mean far below the absolute one is error that averages away\n\
+         through the bootstrap; comparable, and it is a bias that compounds\n\
+         every time the operator is applied.\n\
+         The T={TMAX} row is zero for the reference rule by construction. What\n\
+         it shows for the others is whether they agree at convergence, which\n\
+         they must if the fixed point is unique.\n\
+         The last table is a property of the *network*, not of the solve, and\n\
+         should barely move across a row: the subgame is only as zero-sum as\n\
+         the value network is antisymmetric, and CFR's guarantees assume it is.\n\
          (board is {N_HEXES} hexes; beliefs are uniform over consistent configs)"
     );
 }

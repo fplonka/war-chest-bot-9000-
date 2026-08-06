@@ -108,7 +108,7 @@ Conventions follow `csrc/liars_dice` closely:
 
 | | |
 |---|---|
-| solver | alternating-traverser **linear CFR** |
+| solver | alternating-traverser CFR; the regret rule is a setting (below) |
 | leaf value | `v_net(PBS)[hand(c)] × (opponent's unnormalised reach)` — counterfactual |
 | network query | public features + both **normalised** reach vectors |
 | initial strategy | uniform over legal actions, strategy sums seeded reach-weighted |
@@ -125,8 +125,39 @@ Three things differ from poker:
    `(config, action) → config'` map, precomputed per node.
 3. **Actions are partially private** (above).
 
-**No heuristic is injected into the search.** CFR starts uniform; there is no
-prior-biased regret initialisation and no heuristic action pruning, both of
+### Which CFR
+
+`Cfr { alpha, beta, gamma, predict }` in `search.rs`. Every variant worth
+comparing is one formula with four numbers, which is why there is a parameter
+struct here rather than five implementations. Discounted CFR (Brown & Sandholm
+2019) multiplies accumulated *positive* regrets by `t^alpha / (t^alpha + 1)` and
+negative ones by `t^beta / (t^beta + 1)` each iteration, and contributions to
+the average strategy by `(t / (t + 1))^gamma`; `predict` is Predictive CFR+'s
+optimism, which regret-matches on `R + predict * r` — the regret just observed
+standing in for the one about to be seen.
+
+| name | alpha | beta | gamma | predict | |
+|---|---|---|---|---|---|
+| `linear` | 1 | 1 | 1 | 0 | the reference implementation's, and the default |
+| `plus` | inf | -inf | 2 | 0 | CFR+ (Tammelin 2014) |
+| `dcfr` | 1.5 | 0 | 2 | 0 | DCFR — **what TurboReBeL itself runs** |
+| `pcfr` | inf | -inf | 2 | 1 | PCFR+ (Farina, Kroer & Sandholm 2021) |
+| `sapcfr` | inf | -inf | 2 | 1/3 | SAPCFR+ (Meng et al., AAAI 2026) |
+
+`beta = -inf` zeroes negative accumulated regret, which is regret matching+;
+`alpha = inf` leaves positive regret undiscounted. We shipped TurboReBeL's data
+generation on top of linear CFR, so the solver is currently off-paper; §7 has
+what that costs.
+
+Regret matching floors the strategy at `1e-6` rather than at zero in every
+variant. That is load-bearing, not cosmetic: `carried_beliefs` hands the
+self-play walk one belief per iterate and the walk asserts each has the same
+support as the live one, so a hard zero would drop configs and fail the assert.
+
+**No handcrafted heuristic is injected into the search.** CFR starts uniform;
+there is no
+prior-biased regret initialisation from a handcrafted evaluation and no
+heuristic action pruning, both of
 which would bias the equilibrium by an amount nobody can measure. The greedy
 knowledge enters through the value network, which is what CFR actually consumes.
 
@@ -434,6 +465,13 @@ never written.
   the regression test for the architecture this replaced: configs with the same
   hand and different face-down piles must get different values and different
   play. It was zero by construction before.
+* `tests/rebel_solver.rs::subgame_solver_matches_tabular_cfr_on_micro_endgames`
+  — the subgame solver against an independent vanilla CFR over world states,
+  run under **every** regret rule. The game value of a two-player zero-sum game
+  is unique, so any rule that converges must land on the same number; that makes
+  one oracle the correctness net for the whole family. It also checks NashConv
+  is non-negative and falls with iterations, and that reading a solve mid-flight
+  leaves it able to continue.
 * `tests/rebel_pbs.rs::belief_tracker_matches_brute_force` — the incremental
   tracker versus an exhaustive enumeration of every world consistent with the
   observation sequence, weighted by exact draw probabilities and the announced
@@ -445,7 +483,31 @@ never written.
 
 ## 7. Known gaps
 
-* **T = 64 CFR iterations**, against the paper's 256/1024. The earlier default
+* **T = 64 CFR iterations**, against the paper's 256/1024.
+
+  **Two corrections to everything below, August 2026.**
+
+  *The numbers in this section were measured through a bug.* `value_under`
+  left the tree's reach probabilities propagated under the reference strategy,
+  and `update_regrets` assumes they are consistent with the current iterate and
+  does not recompute them. Self-play never noticed — it calls `value_under`
+  once, after the solve — but `solvererr.rs` reads a solve at each rung and then
+  keeps iterating, so every rung after the first resumed from the wrong reaches.
+  Both fixed-policy passes now restore them. The tables below have not yet been
+  re-measured.
+
+  *The question in this section was the wrong one.* It grades a solve by the
+  distance from its own converged answer, which cannot compare two different
+  regret rules, because each is graded against itself. The metric is now
+  `Solver::nash_conv` — what a best response to the solve's own average strategy
+  would gain, summed over the players — which is absolute, is zero exactly when
+  the strategy is a fixed point of the subgame operator, and is what the CFR
+  literature reports. Preliminary, 10 depth-2 positions with ~160-config
+  supports: **DCFR at T=64 reaches the NashConv linear CFR needs T=512 for**
+  (0.00035 against 0.00036). All four modern rules beat linear at every T and
+  land within ~20% of each other. A full run is pending.
+
+  The earlier default
   of 8 rested on micro-endgames solved against exact values (mean |error|
   0.0035), which converge almost immediately and understate the error on the
   ~540-node subgames self-play actually solves. Measured on real mid-game
@@ -495,6 +557,26 @@ never written.
   became easier to fit. Comparing those curves across T would mislead. The Elo
   ladder can, because it scores the resulting agents against a fixed reference
   and against each other; that comparison has not been run yet.
+* **The subgame is not quite zero-sum.** Its leaves are network values, and
+  nothing makes the network's value for player 0 at a leaf the negative of its
+  value for player 1 there. So the game CFR is handed is only as zero-sum as the
+  value network is antisymmetric — and CFR's convergence guarantee, and ReBeL's
+  argument on top of it, both assume zero-sum.
+
+  `nash_conv` reports the residual `v_0 + v_1` at the root for free. Measured on
+  `t64_turbo_s14`'s final network, depth 2, 10 positions: **0.097 against a
+  value spread of 0.128**. That is about what independent per-player errors of
+  ~0.07 would produce, so it is the network's known held-out error showing up in
+  a second place rather than a new defect — and it is a useful thing to have,
+  because unlike a held-out loss it needs no reference and can be read during a
+  run. It goes to exactly zero when every leaf is terminal, which is what the
+  micro-endgame test sees.
+
+  What has *not* been established is whether the residual matters: it may be
+  harmless noise CFR averages over, or a consistent tilt that displaces the
+  fixed point. Mirror augmentation already pushes toward antisymmetry
+  indirectly. Symmetrising the value head — predicting `v_0` and taking
+  `v_1 = -v_0` — would enforce it by construction and is the obvious experiment.
 * **No policy network.** The paper treats it as optional (value net alone
   converges); it would be worth adding for CFR warm starting and for fast play.
 * **The subgame is chance-free except for round-start draws**, which are walked

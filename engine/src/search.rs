@@ -57,6 +57,8 @@ pub struct Cfg {
     /// and `carried_beliefs`); evaluation acts on the solved tree and never
     /// looks at an intermediate iterate, so it turns them off.
     pub snapshots: bool,
+    /// The regret-update rule.
+    pub cfr: Cfr,
 }
 
 impl Default for Cfg {
@@ -65,8 +67,103 @@ impl Default for Cfg {
             depth: 1,
             iters: 64,
             snapshots: true,
+            cfr: Cfr::LINEAR,
         }
     }
+}
+
+/// Which CFR the solver runs.
+///
+/// Every variant worth comparing is one formula with four numbers. Discounted
+/// CFR (Brown & Sandholm 2019) multiplies accumulated *positive* regrets by
+/// `t^alpha / (t^alpha + 1)` and negative ones by `t^beta / (t^beta + 1)` each
+/// iteration, and contributions to the average strategy by
+/// `(t / (t + 1))^gamma`; `predict` adds Predictive CFR+'s optimism, which
+/// does regret matching on `R + predict * r` — the regret just observed
+/// standing in for the one about to be. So:
+///
+/// | | alpha | beta | gamma | predict |
+/// |---|---|---|---|---|
+/// | linear CFR (the reference implementation's) | 1 | 1 | 1 | 0 |
+/// | CFR+ (Tammelin 2014) | inf | -inf | 2 | 0 |
+/// | DCFR (what TurboReBeL itself runs) | 1.5 | 0 | 2 | 0 |
+/// | PCFR+ (Farina et al. 2021) | inf | -inf | 2 | 1 |
+/// | SAPCFR+ (Meng et al. 2026) | inf | -inf | 2 | 1/3 |
+///
+/// `beta = -inf` zeroes negative accumulated regret, which is regret matching+;
+/// `alpha = inf` leaves positive regret undiscounted.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Cfr {
+    pub alpha: f32,
+    pub beta: f32,
+    pub gamma: f32,
+    pub predict: f32,
+}
+
+impl Cfr {
+    pub const LINEAR: Cfr = Cfr { alpha: 1.0, beta: 1.0, gamma: 1.0, predict: 0.0 };
+    pub const PLUS: Cfr = Cfr { alpha: f32::INFINITY, beta: f32::NEG_INFINITY, gamma: 2.0, predict: 0.0 };
+    pub const DISCOUNTED: Cfr = Cfr { alpha: 1.5, beta: 0.0, gamma: 2.0, predict: 0.0 };
+    pub const PREDICTIVE: Cfr = Cfr { alpha: f32::INFINITY, beta: f32::NEG_INFINITY, gamma: 2.0, predict: 1.0 };
+    pub const SIMPLE_ASYM: Cfr = Cfr { alpha: f32::INFINITY, beta: f32::NEG_INFINITY, gamma: 2.0, predict: 1.0 / 3.0 };
+
+    /// The five named variants, for the tools that sweep them.
+    pub const NAMED: [(&'static str, Cfr); 5] = [
+        ("linear", Cfr::LINEAR),
+        ("plus", Cfr::PLUS),
+        ("dcfr", Cfr::DISCOUNTED),
+        ("pcfr", Cfr::PREDICTIVE),
+        ("sapcfr", Cfr::SIMPLE_ASYM),
+    ];
+
+    pub fn named(name: &str) -> Option<Cfr> {
+        Cfr::NAMED.iter().find(|(n, _)| *n == name).map(|(_, c)| *c)
+    }
+
+    /// `t^p / (t^p + 1)`, with the infinities that name "do not discount" and
+    /// "discard entirely" evaluated rather than computed.
+    fn factor(t: f32, p: f32) -> f32 {
+        if p.is_infinite() {
+            return if p > 0.0 { 1.0 } else { 0.0 };
+        }
+        let x = t.powf(p);
+        x / (x + 1.0)
+    }
+}
+
+/// How well a solve came out, in two numbers that are read together.
+#[derive(Clone, Copy, Debug)]
+pub struct Conv {
+    /// `sum_p (BR_p - v_p)`: what a best response to the solve's own average
+    /// strategy would gain, summed over the players. Zero means the strategy is
+    /// an equilibrium of the subgame it induces — the fixed point ReBeL
+    /// iterates towards — and it is what tells two regret rules apart at a
+    /// given iteration count, because unlike a distance to some other solve it
+    /// is absolute.
+    pub nash: f32,
+    /// `v_0 + v_1` at the root. **This is not zero**, and that is not a bug in
+    /// the solver. The subgame's leaves are network values, and nothing makes
+    /// the network's value for player 0 at a leaf the negative of its value for
+    /// player 1 there. So the depth-limited game the solver is handed is only
+    /// *approximately* zero-sum, by however far the value network is from
+    /// antisymmetric — which is what this measures, and it is a property of the
+    /// network rather than of the solve. It vanishes when every leaf is
+    /// terminal, which is the case `tests/rebel_solver.rs` pins against an
+    /// independent solver.
+    pub zero_sum: f32,
+}
+
+/// What a backward pass over the tree does with the values it computes.
+#[derive(Clone, Copy, PartialEq)]
+enum Back {
+    /// CFR: the traverser averages over their strategy, and the per-action
+    /// values less the node value accumulate as instantaneous regret.
+    Regret,
+    /// Pure value propagation under a fixed strategy — TurboReBeL's Phase 2.
+    Value,
+    /// The traverser maxes instead of averaging, which makes the root values a
+    /// best response to whatever the opponent's reaches were built under.
+    BestResponse,
 }
 
 /// The value network: `(PBS, config) -> counterfactual value`.
@@ -304,6 +401,12 @@ pub struct Solver<'a> {
     /// Regrets and the current regret-matching iterate, flat by node:
     /// `[soff[i] .. soff[i] + nc(player) * na]`, laid out `[config * na + a]`.
     regret: Vec<f32>,
+    /// The instantaneous counterfactual regret of the traversal just finished,
+    /// same layout. Kept apart from `regret` because the accumulated regret is
+    /// discounted before this iteration's is added to it, so afterwards there
+    /// is no way to recover it — and Predictive CFR+ needs it a second time,
+    /// as its guess at the regret the next iteration will see.
+    inst: Vec<f32>,
     cur: Vec<f32>,
     soff: Vec<u32>,
     /// The average strategy and its running sum, per node. Always maintained:
@@ -422,6 +525,7 @@ impl<'a> Solver<'a> {
             nodes: Vec::new(),
             root_belief: belief,
             regret: Vec::new(),
+            inst: Vec::new(),
             cur: Vec::new(),
             soff: Vec::new(),
             sum_strat: Vec::new(),
@@ -481,6 +585,7 @@ impl<'a> Solver<'a> {
             sv.vals.resize(sv.vals.len() + c0.max(c1), 0.0);
             sv.soff.push(sv.regret.len() as u32);
             sv.regret.resize(sv.regret.len() + nc * na, 0.0);
+            sv.inst.resize(sv.regret.len(), 0.0);
             sv.ncells += nc * na;
             sv.sum_strat.push(vec![0.0; nc * na]);
             // CFR starts from a uniform strategy over the legal actions, as in
@@ -1167,21 +1272,22 @@ impl<'a> Solver<'a> {
     }
 
     fn update_regrets(&mut self, traverser: usize) {
-        // Reaches are already consistent with `cur`: `new` establishes that and
-        // every `step` re-establishes it after regret matching, so recomputing
-        // them here would repeat the previous pass exactly.
+        // Reaches are already consistent with `cur`: `new` establishes that,
+        // every `step` re-establishes it after regret matching, and the
+        // fixed-policy passes restore it before returning, so recomputing them
+        // here would repeat the previous pass exactly.
         self.leaf_values(traverser);
         let cur = std::mem::take(&mut self.cur);
-        self.backprop(traverser, &cur, true);
+        self.backprop(traverser, &cur, Back::Regret);
         self.cur = cur;
     }
 
-    /// One value backpropagation over the tree for `traverser`: the shared
-    /// walk behind both CFR (`update_regrets`) and TurboReBeL's fixed-policy
-    /// passes. With `regrets` the counterfactual values also accumulate into
-    /// `regret`; without, they are pure value propagation under `strat` — a
-    /// fixed strategy, which is the whole of Phase 2's "solve".
-    fn backprop(&mut self, traverser: usize, strat: &[f32], regrets: bool) {
+    /// One value backpropagation over the tree for `traverser`: the shared walk
+    /// behind CFR (`update_regrets`), TurboReBeL's fixed-policy passes
+    /// (`value_under`) and the best response (`nash_conv`). `mode` picks what
+    /// the traverser's own decision nodes do with their children's values —
+    /// average under `strat`, average and record the regret, or take the max.
+    fn backprop(&mut self, traverser: usize, strat: &[f32], mode: Back) {
         let _t = timed!(BACK);
         for i in (0..self.nodes.len()).rev() {
             if self.nodes[i].leaf {
@@ -1219,11 +1325,18 @@ impl<'a> Solver<'a> {
                 continue;
             }
             let vbase = self.voff[i] as usize;
-            self.vals[vbase..vbase + nc].fill(0.0);
+            // A best response takes a max at the traverser's own nodes, so
+            // those start below every candidate; a config with no legal action
+            // there is put back to zero below. Every other node accumulates.
+            let br = mode == Back::BestResponse && me == traverser;
+            self.vals[vbase..vbase + nc].fill(if br { f32::NEG_INFINITY } else { 0.0 });
             if me == traverser {
                 let n = &self.nodes[i];
                 let so = self.soff[i] as usize;
                 let cur = &strat[so..];
+                if mode == Back::Regret {
+                    self.inst[so..so + nc * na].fill(0.0);
+                }
                 // Children are built after their parent, so the parent's value
                 // row and every child's are disjoint slices of one arena.
                 let (lo, hi) = self.vals.split_at_mut(self.voff[i + 1] as usize);
@@ -1240,21 +1353,35 @@ impl<'a> Solver<'a> {
                             continue;
                         }
                         let av = cv[t as usize];
-                        if regrets {
-                            self.regret[so + c * na + a] += av;
+                        match mode {
+                            Back::Regret => {
+                                self.inst[so + c * na + a] += av;
+                                vi[c] += av * cur[c * na + a];
+                            }
+                            Back::Value => vi[c] += av * cur[c * na + a],
+                            Back::BestResponse => vi[c] = vi[c].max(av),
                         }
-                        vi[c] += av * cur[c * na + a];
                     }
                 }
-                if regrets {
-                    for c in 0..nc {
-                        let base = vi[c];
-                        for a in 0..na {
-                            if n.legal[c * na + a] {
-                                self.regret[so + c * na + a] -= base;
+                match mode {
+                    Back::Regret => {
+                        for c in 0..nc {
+                            let base = vi[c];
+                            for a in 0..na {
+                                if n.legal[c * na + a] {
+                                    self.inst[so + c * na + a] -= base;
+                                }
                             }
                         }
                     }
+                    Back::BestResponse => {
+                        for c in 0..nc {
+                            if vi[c] == f32::NEG_INFINITY {
+                                vi[c] = 0.0;
+                            }
+                        }
+                    }
+                    Back::Value => {}
                 }
             } else {
                 // The traverser's information state is unchanged across an
@@ -1273,11 +1400,21 @@ impl<'a> Solver<'a> {
 
     pub fn step(&mut self, traverser: usize) {
         self.update_regrets(traverser);
-        // Linear CFR: discount by t/(t+1) after each update.
+        // Fold this traversal's instantaneous regret into the accumulated one,
+        // discount, and regret-match. `Cfr` says how: see its table.
+        //
+        // Regret matching floors at EPS rather than at zero, so every legal
+        // action keeps positive probability in every iterate. That is not
+        // cosmetic — `carried_beliefs` hands the self-play walk a belief per
+        // iterate, and the walk asserts that each has the same support as the
+        // live one. A hard zero here would drop configs and fail that assert.
+        const EPS: f32 = 1e-6;
         {
             let _t = timed!(RM);
+            let k = self.cfg.cfr;
             let m = self.steps[traverser] as f32 + 1.0;
-            let disc = m / (m + 1.0);
+            let (da, db) = (Cfr::factor(m, k.alpha), Cfr::factor(m, k.beta));
+            let dg = (m / (m + 1.0)).powf(k.gamma);
             for i in 0..self.nodes.len() {
                 let n = &self.nodes[i];
                 if n.leaf || n.chance || n.player as usize != traverser {
@@ -1286,16 +1423,20 @@ impl<'a> Solver<'a> {
                 let (na, nc) = (n.na(), n.nc(traverser));
                 let so = self.soff[i] as usize;
                 let regret = &mut self.regret[so..];
+                let inst = &self.inst[so..];
                 let cur = &mut self.cur[so..];
                 for c in 0..nc {
                     let mut sum = 0.0;
                     for a in 0..na {
-                        let v = if n.legal[c * na + a] {
-                            regret[c * na + a].max(1e-6)
-                        } else {
-                            0.0
-                        };
-                        cur[c * na + a] = v;
+                        let j = c * na + a;
+                        if !n.legal[j] {
+                            cur[j] = 0.0;
+                            continue;
+                        }
+                        let r = regret[j] * if regret[j] > 0.0 { da } else { db } + inst[j];
+                        regret[j] = r;
+                        let v = (r + k.predict * inst[j]).max(EPS);
+                        cur[j] = v;
                         sum += v;
                     }
                     if sum > 0.0 {
@@ -1304,12 +1445,9 @@ impl<'a> Solver<'a> {
                             cur[c * na + a] *= inv;
                         }
                     }
-                    for a in 0..na {
-                        regret[c * na + a] *= disc;
-                    }
                 }
                 for x in self.sum_strat[i].iter_mut() {
-                    *x *= disc;
+                    *x *= dg;
                 }
             }
         }
@@ -1363,11 +1501,7 @@ impl<'a> Solver<'a> {
     /// the root belief's config order. Returns the per-player per-config root
     /// values for each member, in the same order.
     pub fn value_under(&mut self, roots: &[[Vec<f32>; 2]]) -> Vec<[Vec<f32>; 2]> {
-        let reference = self
-            .snaps
-            .last()
-            .cloned()
-            .expect("value_under needs per-iterate snapshots (Cfg::snapshots)");
+        let reference = self.reference();
         let mut out = Vec::with_capacity(roots.len());
         for root in roots {
             let _t = timed!(P2);
@@ -1376,14 +1510,73 @@ impl<'a> Solver<'a> {
             let mut pair = [Vec::new(), Vec::new()];
             for p in 0..2usize {
                 self.readout(p);
-                self.backprop(p, &reference, false);
+                self.backprop(p, &reference, Back::Value);
                 let n = self.nc[0][p] as usize;
                 let vo = self.voff[0] as usize;
                 pair[p] = self.vals[vo..vo + n].to_vec();
             }
             out.push(pair);
         }
+        self.restore();
         out
+    }
+
+    /// How well the solve came out, for the reference strategy — the CFR
+    /// average at
+    /// the end of the solve.
+    ///
+    /// **The leaf values are frozen** at the ones the reference strategy
+    /// induces. They are a function of the beliefs at the leaf, so a real
+    /// deviation would move them, and this is therefore the exploitability of
+    /// the depth-limited game the reference *defines* rather than of the true
+    /// continuation. That is the usual convention in depth-limited solving, and
+    /// it is exactly the fixed-point question ReBeL iterates — but it is not
+    /// the exploitability of War Chest and must not be reported as if it were.
+    pub fn nash_conv(&mut self) -> Conv {
+        let reference = self.reference();
+        let root = [
+            self.root_belief[0].p.clone(),
+            self.root_belief[1].p.clone(),
+        ];
+        self.propagate(&reference, [&root[0], &root[1]]);
+        self.leaf_values_both();
+        let (mut nash, mut zero_sum) = (0.0, 0.0);
+        for p in 0..2usize {
+            // One `readout` serves both passes: `backprop` skips leaves, so the
+            // leaf values it left are still there for the second walk.
+            self.readout(p);
+            let vo = self.voff[0] as usize;
+            let nc = self.nc[0][p] as usize;
+            let expect = |v: &[f32]| -> f32 {
+                (0..nc).map(|c| root[p][c] * v[vo + c]).sum()
+            };
+            self.backprop(p, &reference, Back::Value);
+            let v = expect(&self.vals);
+            self.backprop(p, &reference, Back::BestResponse);
+            nash += expect(&self.vals) - v;
+            zero_sum += v;
+        }
+        self.restore();
+        Conv { nash, zero_sum }
+    }
+
+    /// The strategy the fixed-policy passes run under: the CFR average at the
+    /// end of the solve.
+    fn reference(&self) -> Vec<f32> {
+        self.snaps
+            .last()
+            .cloned()
+            .expect("a fixed-policy pass needs per-iterate snapshots (Cfg::snapshots)")
+    }
+
+    /// Put the reaches back under `cur` after a fixed-policy pass has
+    /// propagated something else through them. `update_regrets` assumes they
+    /// are consistent with `cur` and does not recompute them, so without this a
+    /// solve that is read mid-flight — which is exactly what the solver-error
+    /// harness does — would resume from another strategy's reaches.
+    fn restore(&mut self) {
+        self.precompute_reaches();
+        self.last_traverser = None;
     }
 
     /// The beliefs at tree node `leaf` under each per-iterate average strategy
