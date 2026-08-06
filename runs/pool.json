@@ -1,8 +1,8 @@
 {
-  "note": "The best snapshots we have so far, used by every gate ladder via --pool. Elos are from the three-run ladder over the 270-minute runs (runs/ladder_3runs/run.log, 40 games per pairing at depth 2 / 64 iters, Random pinned at 0). Update after every gate: drop the weakest entry when a new final beats it.",
+  "note": "The best snapshots we have so far, used by every gate ladder via --pool. Elos are from the finals-only ladder over runs 1-3 + both turbo runs (runs/ladder_finals/run.log, 40 games per pairing at depth 2 / 64 iters, Random pinned at 0). Update after every gate: drop the weakest entry when a new final beats it.",
   "updated": "2026-08-07",
   "entries": [
-    {"name": "t64_h384_dg64_s11.final", "run": "runs/t64_h384_dg64_s11", "file": "snap_05.pt", "t": 16200.0, "elo": 1033.0},
-    {"name": "t64_h384_dg64_s11.s4", "run": "runs/t64_h384_dg64_s11", "file": "snap_04.pt", "t": 14730.0, "elo": 1021.0}
+    {"name": "t64_h384_dg64_s11.final", "run": "runs/t64_h384_dg64_s11", "file": "snap_05.pt", "t": 16200.0, "elo": 919.0},
+    {"name": "t64_turbo_s14.final", "run": "runs/t64_turbo_s14", "file": "snap_05.pt", "t": 16200.0, "elo": 904.0}
   ]
 }
