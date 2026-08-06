@@ -23,8 +23,10 @@ no threshold, and is measured on the finished run where the games are cheap.
 Ratings come from the Bradley-Terry model, which is what Elo *is*: player `i`
 beats `j` with probability `1 / (1 + 10 ** ((e_j - e_i) / 400))`. Draws count
 half. Fitting is Zermelo's MM iteration, a handful of lines that cannot diverge
-and needs no optimiser. Random is pinned at 0 so the numbers mean the same thing
-across runs.
+and needs no optimiser. The first reference player is pinned at 0, so which
+references a ladder includes decides what its zero means -- with `--refs greedy`
+the numbers read as Elo above Greedy, and are not comparable to a ladder that
+also carried Random.
 """
 
 import argparse
@@ -91,7 +93,7 @@ def elo_stderr(n, elo):
     return out
 
 
-def players_of(runs, refs=True, labels=None, pool=None):
+def players_of(runs, refs=("greedy",), labels=None, pool=None):
     """The ladder's entrants: optionally Random and Greedy, then each run's
     snapshots, then the pool file's entries.
 
@@ -104,10 +106,10 @@ def players_of(runs, refs=True, labels=None, pool=None):
     `runs/pool.json`) lists the best snapshots we have so far by explicit
     file, so a gate ladder is `ladder.py <newrun> --pool runs/pool.json`.
     """
-    ps = []
-    if refs:
-        ps = [{"name": "random", "agent": "random", "slot": 0, "t": None, "run": None},
-              {"name": "greedy", "agent": "greedy", "slot": 0, "t": None, "run": None}]
+    # Fixed bots, in the order given: the first is the rating's zero. Random is
+    # off by default -- it loses to everything, so every game against it is a
+    # foregone conclusion that buys almost no information about the players.
+    ps = [{"name": r, "agent": r, "slot": 0, "t": None, "run": None} for r in refs]
     for run in runs:
         tag = os.path.basename(run.rstrip("/"))
         with open(f"{run}/log.json") as f:
@@ -125,7 +127,7 @@ def players_of(runs, refs=True, labels=None, pool=None):
 
 
 def run(runs, out=None, games=60, depth=2, iters=64, temp=2.0,
-        random_draft=False, seed=7, refs=True, labels=None, pool=None,
+        random_draft=False, seed=7, refs=("greedy",), labels=None, pool=None,
         depth_b=0, iters_b=0):
     """Round robin, Elo fit, `ladder.json`, printed table. Returns the ratings."""
     if out is None:
@@ -180,7 +182,8 @@ def run(runs, out=None, games=60, depth=2, iters=64, temp=2.0,
     with open(f"{out}/ladder.json", "w") as f:
         json.dump(res, f, indent=1)
 
-    print(f"\n=== Elo ({out}, random = 0) ===", flush=True)
+    zero = ps[0]["name"] if ps else "?"
+    print(f"\n=== Elo ({out}, {zero} = 0) ===", flush=True)
     print(f"{'player':>28s} {'trained':>9s} {'elo':>7s} {'+-':>5s} {'score':>7s}", flush=True)
     for p in sorted(res["players"], key=lambda p: -p["elo"]):
         tm = f"{p['t'] / 60:.1f}min" if p["t"] is not None else "-"
@@ -200,6 +203,9 @@ def main():
     ap.add_argument("--iters", type=int, default=-1)
     ap.add_argument("--temp", type=float, default=2.0)
     ap.add_argument("--random-draft", action="store_true")
+    ap.add_argument("--refs", default="greedy",
+                    help="comma list of fixed bots (greedy, random), or empty for none. "
+                         "The first is pinned at 0.")
     ap.add_argument("--no-refs", action="store_true",
                     help="skip the Random and Greedy references")
     ap.add_argument("--labels", default=None,
@@ -224,7 +230,8 @@ def main():
         temp=args.temp,
         random_draft=args.random_draft or any(c.get("random_draft", False)
                                               for c in cfgs),
-        seed=args.seed, refs=not args.no_refs,
+        seed=args.seed,
+        refs=() if args.no_refs else tuple(x for x in args.refs.split(",") if x),
         labels=args.labels.split(",") if args.labels else None,
         pool=pool, depth_b=args.depth_b, iters_b=args.iters_b)
 
