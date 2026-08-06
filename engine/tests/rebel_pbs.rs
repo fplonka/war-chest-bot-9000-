@@ -41,7 +41,7 @@ use warchest::Action;
 fn random_net(seed: u64, hidden: usize, dg: usize) -> Mlp {
     let mut r = Rng::new(seed);
     let (de, dc, rk) = (16usize, 32usize, dg);
-    let dims = [PUBFEAT, hidden, hidden, CFEAT, dg, rk, AFEAT, de, dc];
+    let dims = [PUBFEAT, hidden, hidden, CFEAT, dg, rk, AFEAT, de, dc, 0];
     let xd = warchest::board::N_HEXES * (HEX_FACTS + de) + 2 * de + LOOSE;
     let nw = CARD_FEATS * dc + dc * de + N_UNITS * de + (PILE_COUNTS + de) * de
         + xd * hidden + hidden * hidden + 2 * dg * hidden + (4 + de) * dg
@@ -467,6 +467,50 @@ fn reachable_config_census_with_warrior_priests() {
         "census: {} positions, median {} mean {:.1} p99 {}",
         n, med, mean, p99
     );
+}
+
+/// A subgame root survives the roots-file round trip: state, both beliefs
+/// and every continuation. The GPU sizing tools read this format.
+#[test]
+fn roots_round_trip() {
+    for seed in 0..30u64 {
+        let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
+        let mut s = make_game(&mut rng, true);
+        let ctx = Ctx::new(&s);
+        let mut bel = [
+            Belief::point(Config::default()),
+            Belief::point(Config::default()),
+        ];
+        for _ in 0..40 {
+            if s.is_terminal() {
+                break;
+            }
+            if matches!(s.pending(), Cont::MainPlay) {
+                let mut buf: Vec<u8> = Vec::new();
+                let mut w = std::io::Cursor::new(&mut buf);
+                warchest::roots::write_root(&mut w, &s, &bel).unwrap();
+                let mut r = std::io::Cursor::new(&buf);
+                let (s2, bel2) = warchest::roots::read_root(&mut r).unwrap();
+                assert_eq!(s, s2, "seed {}: state did not round trip", seed);
+                assert_eq!(bel[0].cfg, bel2[0].cfg);
+                assert_eq!(bel[0].p, bel2[0].p);
+                assert_eq!(bel[1].cfg, bel2[1].cfg);
+                assert_eq!(bel[1].p, bel2[1].p);
+            }
+            let acts = s.legal_actions();
+            s.apply_inplace(acts[rng.below(acts.len())]);
+            let p = s.to_act();
+            if s.is_chance() {
+                let res = reserve(&s, p, &ctx);
+                let fu = faceup_counts(&s, p, &ctx);
+                let wp = matches!(s.pending(), Cont::WarriorPriestDraw { .. });
+                bel[p as usize] = belief_after_draw(&bel[p as usize], &res, &fu, wp);
+            } else {
+                let truth = true_config(&s, p, &ctx);
+                bel[p as usize] = Belief::point(truth);
+            }
+        }
+    }
 }
 
 /// A packed replay row must expand to exactly the features the solver's own

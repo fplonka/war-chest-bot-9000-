@@ -484,9 +484,15 @@ impl Mlp {
         if dims.len() == 5 {
             return Mlp::from_flat_v1(dims, w, b, ln);
         }
-        if dims.len() != 9 {
+        if dims.len() != 10 {
             return Err(format!(
-                "expected 9 dims [pub, hidden, head, cfeat, dg, rank, afeat, de, dc], got {dims:?}"
+                "expected 10 dims [pub, hidden, head, cfeat, dg, rank, afeat, de, dc, enc], got {dims:?}"
+            ));
+        }
+        if dims[9] != 0 {
+            return Err(format!(
+                "encoder {} (hex) is not implemented in Rust yet; only 0 (flat) ships",
+                dims[9]
             ));
         }
         let (h, hd, dg, rk, de, dc) = (dims[1], dims[2], dims[4], dims[5], dims[7], dims[8]);

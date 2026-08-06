@@ -11,7 +11,7 @@ use warchest::units::{CARD_FEATS, N_UNITS};
 
 fn main() {
     let (h, dg, rk, de, dc) = (128usize, 32usize, 48usize, 16usize, 24usize);
-    let dims = [PUBFEAT, h, h, CFEAT, dg, rk, AFEAT, de, dc];
+    let dims = [PUBFEAT, h, h, CFEAT, dg, rk, AFEAT, de, dc, 0];
     let xd = N_HEXES * (HEX_FACTS + de) + 2 * de + LOOSE;
     let nw = CARD_FEATS * dc + dc * de + N_UNITS * de + (PILE_COUNTS + de) * de
         + xd * h + h * h + 2 * dg * h + (4 + de) * dg + dg * (rk + 1) + h * rk

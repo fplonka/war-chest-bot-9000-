@@ -12,6 +12,7 @@ pub mod net;
 pub mod prof;
 pub mod rebel;
 pub mod rng;
+pub mod roots;
 pub mod rules;
 pub mod search;
 pub mod selfplay;

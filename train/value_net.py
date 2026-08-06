@@ -20,6 +20,17 @@ CARD_FEATS = warchest.CARD_FEATS
 N_HEXES = warchest.N_HEXES
 N_UNITS = warchest.N_UNITS
 NSLOT = warchest.NSLOT
+
+# The hex-neighbour encoder's fixed geometry: hex width, layer count, and the
+# per-hex gather of (self, six neighbours) in the board's fixed direction
+# order, off-board = the zero row (index N_HEXES).
+HEX_W = 192
+HEX_LAYERS = 6
+_HEX_NB = np.asarray(warchest.hex_neighborhood(), dtype=np.int64).reshape(N_HEXES, 7)
+# Normalized axial coordinates per hex, (x-3)/3, (y-3)/3.
+_COORDS = np.zeros((N_HEXES, 2), np.float32)
+for h, (x, y) in enumerate(warchest.hex_coords()):
+    _COORDS[h] = ((x - 3) / 3.0, (y - 3) / 3.0)
 NTYPE = warchest.NTYPE
 HEX_CH = warchest.HEX_CH
 HEX_FACTS = warchest.HEX_FACTS
@@ -30,6 +41,32 @@ OFF_CARDS = warchest.OFF_CARDS
 OFF_LOOSE = warchest.OFF_LOOSE
 AOFF_PAYS = warchest.AOFF_PAYS
 AUX = warchest.AUX
+
+
+class HexLayer(nn.Module):
+    """One residual neighbour layer: every hex reads itself and its six
+    neighbours in the board's fixed direction order (off-board = zero).
+
+        y[h] = relu(layer_norm(x[h] + Wself x[h] + sum_d Wdir[d] x[nb(h,d)]))
+
+    The self term is the plain residual plus Wself's contribution; the
+    directions are fixed, so a stack of these can express the straight-line
+    relations the unit cards are full of.
+    """
+
+    def __init__(self, w):
+        super().__init__()
+        self.wself = nn.Linear(w, w, bias=False)
+        self.wdir = nn.ModuleList([nn.Linear(w, w, bias=False) for _ in range(6)])
+        self.ln = nn.LayerNorm(w)
+
+    def forward(self, x):
+        # Off-board neighbours read the zero row (index N_HEXES).
+        nb = F.pad(x, (0, 0, 0, 1))[:, _HEX_NB, :]  # [B, 37, 7, w]
+        agg = self.wself(x)
+        for d in range(6):
+            agg = agg + self.wdir[d](nb[:, :, d + 1, :])
+        return F.relu(self.ln(x + agg))
 
 
 class Mlp(nn.Module):
@@ -64,14 +101,15 @@ class Mlp(nn.Module):
     the target distribution moves.
     """
 
-    def __init__(self, hidden, dg=64, rank=64, de=32, dc=64, head=None):
+    def __init__(self, hidden, dg=64, rank=64, de=32, dc=64, head=None, hex_net=False):
         super().__init__()
         # `head` is the width of the second public matrix, the belief
         # projection, the second LayerNorm and both readouts. It is
         # checkpoint metadata like every other width; `head == hidden` is
         # the network the head-width split was taken from.
         head = hidden if head is None else head
-        self.dims = [PUBFEAT, hidden, head, CFEAT, dg, rank, AFEAT, de, dc]
+        self.hex_net = hex_net
+        self.dims = [PUBFEAT, hidden, head, CFEAT, dg, rank, AFEAT, de, dc, int(hex_net)]
         self.de = de
         self.head = head
         xdim = N_HEXES * (HEX_FACTS + de) + 2 * de + LOOSE
@@ -85,7 +123,15 @@ class Mlp(nn.Module):
         self.wd1 = nn.Linear(dc, de)
         self.wid = nn.Embedding(N_UNITS, de)
         self.wpile = nn.Linear(PILE_COUNTS + de, de)
-        self.w0 = nn.Linear(xdim, hidden)
+        if hex_net:
+            # The hex trunk: raw facts + occupant embedding + axial coords per
+            # hex through six residual neighbour layers, then the 37 vectors
+            # are summed and combined with the piles and loose scalars.
+            self.hex_in = nn.Linear(HEX_FACTS + de + 2, HEX_W)
+            self.hex_layers = nn.ModuleList([HexLayer(HEX_W) for _ in range(HEX_LAYERS)])
+            self.w_combine = nn.Linear(HEX_W + 2 * de + LOOSE, hidden)
+        else:
+            self.w0 = nn.Linear(xdim, hidden)
         self.w1 = nn.Linear(hidden, head)
         # The belief's connection into the hidden layer. No bias: it is added to
         # a layer that already has one.
@@ -144,7 +190,7 @@ class Mlp(nn.Module):
         """
         b = xpub.shape[0]
         e = self.cards(xpub, unit_ids)
-        h = F.relu(self.ln0(self.w0(self.trunk_input(xpub, e))))
+        h = F.relu(self.ln0(self.public_trunk(xpub, e)))
         zero = torch.zeros(b, self.wb.in_features, dtype=h.dtype, device=h.device)
         h = F.relu(self.ln1(self.w1(h) + self.wb(zero)))
         a = self.aux(h)
@@ -162,6 +208,30 @@ class Mlp(nn.Module):
         c = xpub[:, OFF_CARDS:OFF_CARDS + NTYPE * CARD_FEATS]
         return (self.wd1(F.relu(self.wd0(c.reshape(-1, NTYPE, CARD_FEATS))))
                 + self.wid(unit_ids))
+
+    def hex_input(self, xpub, e):
+        """The hex trunk's input: one `[HEX_W]` vector per hex after the six
+        residual neighbour layers, then the per-hex vectors summed and joined
+        with the pile summary and the loose scalars."""
+        b = xpub.shape[0]
+        hx = xpub[:, :N_HEXES * HEX_CH].reshape(b, N_HEXES, HEX_CH)
+        facts = hx[:, :, :HEX_FACTS]
+        emb = hx[:, :, HEX_FACTS:] @ e                       # [B, 37, de]
+        coords = torch.as_tensor(_COORDS, dtype=xpub.dtype, device=xpub.device)
+        x = F.relu(self.hex_in(torch.cat([facts, emb, coords.expand(b, -1, -1)], -1)))
+        for layer in self.hex_layers:
+            x = layer(x)
+        piles = xpub[:, OFF_PILES:OFF_CARDS].reshape(b, NTYPE, PILE_COUNTS)
+        p = F.relu(self.wpile(torch.cat([piles, e], -1))).reshape(b, 2, NSLOT, -1).sum(2).reshape(b, -1)
+        return torch.cat([x.sum(1), p, xpub[:, OFF_LOOSE:OFF_LOOSE + LOOSE]], -1)
+
+    def public_trunk(self, xpub, e):
+        """The pre-activation public trunk: `w0` over the flat input, or the
+        hex encoder's combine over its summed hex vectors. The LN0+ReLU and
+        everything downstream is shared."""
+        if self.hex_net:
+            return self.w_combine(self.hex_input(xpub, e))
+        return self.w0(self.trunk_input(xpub, e))
 
     def trunk_input(self, xpub, e):
         """The trunk's input, assembled from a stored row and the card table.
@@ -228,7 +298,7 @@ class Mlp(nn.Module):
         g = self.wg(z)
         b = torch.zeros(nseg, z.shape[1], dtype=z.dtype, device=z.device)
         b.index_add_(0, seg, z[inv] * w.unsqueeze(1))
-        h = F.relu(self.ln0(self.w0(self.trunk_input(xpub, e))))
+        h = F.relu(self.ln0(self.public_trunk(xpub, e)))
         h = F.relu(self.ln1(self.w1(h) + self.wb(b.reshape(xpub.shape[0], -1))))
         u = self.wu(h)
         rk = u.shape[1]

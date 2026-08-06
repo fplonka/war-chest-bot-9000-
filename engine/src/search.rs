@@ -1963,6 +1963,12 @@ impl<'a> Solver<'a> {
         }
     }
 
+    /// How many per-iterate snapshots the solve kept (the log-spaced set plus
+    /// the final reference). Part of the tree-size contract.
+    pub fn snapshot_count(&self) -> usize {
+        self.snaps.len()
+    }
+
     /// The CFR average strategy: the approximate equilibrium of the subgame.
     /// Acting and belief propagation use it — the reference strategy of
     /// TurboReBeL's Phase 2 and of the walk through the solved tree.

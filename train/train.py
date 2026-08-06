@@ -332,7 +332,7 @@ def policy_loss(net, d, ids, device):
     zb = net.holdings(phi(both, seg & 1), e[t(seg // 2, torch.long)])
     b = torch.zeros(2 * S, zb.shape[1], dtype=zb.dtype, device=device)
     b.index_add_(0, t(seg, torch.long), zb * t(cw[both]).unsqueeze(1))
-    h = F.relu(net.ln0(net.w0(net.trunk_input(x, e))))
+    h = F.relu(net.ln0(net.public_trunk(x, e)))
     h = F.relu(net.ln1(net.w1(h) + net.wb(b.reshape(S, -1))))
 
     q = net.actions(t(apad.reshape(-1, AFEAT)),

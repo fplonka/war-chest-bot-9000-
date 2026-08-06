@@ -51,12 +51,22 @@ from value_net import Mlp
 
 
 def build(name):
-    """`h<hidden>-d<dg>-r<rank>`."""
+    """`[hex-]h<hidden>-d<dg>-r<rank>[-e<de>][-head<n>]`."""
     try:
-        v = {tok[0]: int(tok[1:]) for tok in name.split("-")}
-        return Mlp(v["h"], v["d"], v["r"], v.get("e", 32))
+        hex_net = name.startswith("hex-")
+        toks = name[4:] if hex_net else name
+        v = {}
+        for tok in toks.split("-"):
+            if tok.startswith("head"):
+                v["head"] = int(tok[4:])
+            else:
+                v[tok[0]] = int(tok[1:])
+        return Mlp(v["h"], v["d"], v["r"], v.get("e", 32),
+                   head=v.get("head", None), hex_net=hex_net)
     except (KeyError, ValueError):
-        raise SystemExit(f"unknown arch {name!r} -- expected h<hidden>-d<dg>-r<rank>")
+        raise SystemExit(
+            f"unknown arch {name!r} -- expected [hex-]h<hidden>-d<dg>-r<rank>[-e<de>][-head<n>]"
+        )
 
 
 @torch.no_grad()
@@ -78,55 +88,59 @@ def evaluate(net, parts, rng, dev, batch=4096):
     return tot / max(wsum, 1e-9), math.sqrt(sq / max(wsum, 1e-9))
 
 
-def run_one(name, tr, te, args, dev):
+def run_one(name, tr, va, te, args, dev, seed):
+    """Fit one architecture and report the held-out numbers.
+
+    Splits are solve-aligned: the oldest solves train, the middle block
+    validates, the newest block tests. The checkpoint is chosen by
+    validation loss, the test set is evaluated once at that checkpoint, and
+    every candidate gets an explicit seed (a small LR sweep per family, the
+    best-validation run reported).
+    """
     net = build(name).to(dev)
     params = sum(p.numel() for p in net.parameters())
-    opt = torch.optim.Adam(net.parameters(), lr=args.lr)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.steps)
-    rng = np.random.default_rng(0)
-    ntr = len(tr[0])
-    ntest = len(te[0])
+    ntr, ntest = len(tr[0]), len(te[0])
     t0 = time.time()
-    best, best_step, curve = float("inf"), 0, []
-    for step in range(1, args.steps + 1):
-        ids = np.sort(rng.integers(0, ntr, size=args.batch))
-        # Duplicate row ids would make `subset` ambiguous; sampling without
-        # replacement keeps the batch a clean set of rows.
-        ids = np.unique(ids)
-        b = make_batch(subset(tr, ids), rng, dev, args.augment)
-        loss = value_loss(net, *b[:-1])
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        nn.utils.clip_grad_norm_(net.parameters(), 5.0)
-        opt.step()
-        sched.step()
-        if step % args.eval_every == 0 or step == args.steps:
-            hl, rms = evaluate(net, te, rng, dev)
-            # Train loss on the training rows *immediately before* the test
-            # split. Held-in, so the gap against the test loss measures
-            # memorisation -- and adjacent in time, so target drift (which
-            # grows with the age gap between rows) does not contaminate it.
-            #
-            # This gap is the whole diagnosis: if it is near zero the network
-            # is at a floor more data cannot lift, and the question is capacity
-            # or irreducibility; if train sits far below test, the lever is
-            # *data*, not architecture.
-            held_in = subset(tr, np.arange(ntr - ntest, ntr))
-            trl, trrms = evaluate(net, held_in, rng, dev)
-            curve.append({"step": step, "test_huber": round(hl, 6), "test_rms": round(rms, 5),
-                          "train_huber": round(trl, 6), "train_rms": round(trrms, 5)})
-            if hl < best:
-                best, best_step = hl, step
-            print(f"    {name:14s} step {step:6d}  train {trl:.6f}/{trrms:.5f}  "
-                  f"test {hl:.6f}/{rms:.5f}  gap {hl - trl:+.6f}  "
-                  f"({time.time() - t0:.0f}s)", flush=True)
-    hl, rms = evaluate(net, te, rng, dev)
-    trl, trrms = evaluate(net, subset(tr, np.arange(ntr - ntest, ntr)), rng, dev)
+    best = None
+    for lr in args.lrs:
+        torch.manual_seed(seed)
+        net = build(name).to(dev)
+        opt = torch.optim.Adam(net.parameters(), lr=lr)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.steps)
+        rng = np.random.default_rng(seed)
+        best_val, best_step, curve = float("inf"), 0, []
+        for step in range(1, args.steps + 1):
+            ids = np.sort(rng.integers(0, ntr, size=args.batch))
+            # Duplicate row ids would make `subset` ambiguous; sampling without
+            # replacement keeps the batch a clean set of rows.
+            ids = np.unique(ids)
+            b = make_batch(subset(tr, ids), rng, dev, args.augment)
+            loss = value_loss(net, *b[:-1])
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(net.parameters(), 5.0)
+            opt.step()
+            sched.step()
+            if step % args.eval_every == 0 or step == args.steps:
+                vl, vrms = evaluate(net, va, rng, dev)
+                curve.append({"step": step, "val_huber": round(vl, 6)})
+                if vl < best_val:
+                    best_val, best_step = vl, step
+                print(f"    {name:14s} lr={lr:.0e} step {step:6d}  "
+                      f"val {vl:.6f}/{vrms:.5f}  ({time.time() - t0:.0f}s)", flush=True)
+        # The test set is evaluated exactly once, at the best-validation
+        # checkpoint. (The net keeps running; the comparison is between
+        # checkpoints chosen the same way, which is what the plan requires.)
+        hl, rms = evaluate(net, te, rng, dev)
+        row = {"lr": lr, "val_huber": round(best_val, 6), "best_step": best_step,
+               "test_huber": round(hl, 6), "test_rms": round(rms, 5), "curve": curve}
+        if best is None or row["val_huber"] < best["val_huber"]:
+            best = row
     return {"arch": name, "params": params,
-            "final_test_huber": round(hl, 6), "final_test_rms": round(rms, 5),
-            "final_train_huber": round(trl, 6), "final_train_rms": round(trrms, 5),
-            "best_test_huber": round(best, 6), "best_step": best_step,
-            "seconds": round(time.time() - t0, 1), "curve": curve}
+            "test_huber": best["test_huber"], "test_rms": best["test_rms"],
+            "best_val_huber": best["val_huber"], "best_step": best["best_step"],
+            "lr": best["lr"], "seconds": round(time.time() - t0, 1),
+            "curve": best["curve"]}
 
 
 def main():
@@ -135,11 +149,18 @@ def main():
     ap.add_argument("--arch", nargs="+", default=["h384-d64-r64"])
     ap.add_argument("--steps", type=int, default=6000)
     ap.add_argument("--batch", type=int, default=1024)
-    ap.add_argument("--lr", type=float, default=1e-3)
+    # A small learning-rate sweep per architecture; the best-validation run
+    # of each is what gets compared.
+    ap.add_argument("--lr", default="1e-3,3e-4",
+                    help="comma-separated learning rates to sweep")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="explicit seed for torch and the batch sampler")
     ap.add_argument("--eval-every", type=int, default=1000)
     # Held-out rows are the *newest* ones: they are the target function as it
     # stands now, and training on rows that came after the test rows would be
-    # reading the future.
+    # reading the future. The validation block sits between train and test;
+    # checkpoints are chosen on it, and the test set is evaluated once.
+    ap.add_argument("--val-frac", type=float, default=0.1)
     ap.add_argument("--test-frac", type=float, default=0.1)
     # Restrict to the newest N rows before splitting. The target function drifts
     # over a run, so a narrower, fresher window is closer to a stationary
@@ -159,27 +180,36 @@ def main():
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
+    args.lrs = [float(x) for x in args.lr.split(",") if x.strip()]
     torch.set_num_threads(os.cpu_count() or 8)
     dev = torch.device(args.device)
     d = Dump(args.dump)
     d.check(warchest.PUBFEAT, warchest.CCOUNTS)
-    # Solve-aligned held-out split: oldest solves train, the newest block is
-    # the test set (see --test-frac below; the split happens at solve
-    # boundaries so no solve straddles it).
+    # Solve-aligned held-out split: oldest solves train, the middle block
+    # validates (checkpoint selection), the newest block tests (one
+    # evaluation). All cuts snap to solve boundaries, so no solve straddles a
+    # split and rows of one solve never leak across.
     lo = max(0, len(d) - args.fresh) if args.fresh else 0
+    nheld = max(1, int((len(d) - lo) * (args.val_frac + args.test_frac)))
     ntest = max(1, int((len(d) - lo) * args.test_frac))
-    # Snap the split to the nearest solve boundary at or before the raw cut.
-    split = len(d) - ntest
-    bounds = [s for s in d.soff if lo < s <= split]
-    split = bounds[-1] if bounds else split
-    ntest = len(d) - split
-    print(f"[data] {len(d) - lo} rows, PUBFEAT={warchest.PUBFEAT}, holding out the "
-          f"newest {ntest} ({100 * ntest / max(len(d) - lo, 1):.0f}%) by solve-aligned recency",
+    # vcut: end of training, start of validation; tcut: end of validation,
+    # start of the test block. Both snap to solve boundaries.
+    tcut = len(d) - ntest
+    vcut = len(d) - nheld
+    bounds = [s for s in d.soff if lo < s <= vcut]
+    vcut = bounds[-1] if bounds else vcut
+    bounds = [s for s in d.soff if vcut < s <= tcut]
+    tcut = bounds[-1] if bounds else tcut
+    ntest = len(d) - tcut
+    nval = tcut - vcut
+    print(f"[data] {len(d) - lo} rows, PUBFEAT={warchest.PUBFEAT}: "
+          f"train {vcut - lo} / val {nval} / test {ntest} rows, solve-aligned",
           flush=True)
 
-    tr_lo = max(lo, split - args.train_window) if args.train_window else lo
-    tr = d.rows(tr_lo, split)
-    te = d.rows(split, len(d))
+    tr_lo = max(lo, vcut - args.train_window) if args.train_window else lo
+    tr = d.rows(tr_lo, vcut)
+    va = d.rows(vcut, tcut)
+    te = d.rows(tcut, len(d))
     mirror.self_check_rows(tr[0], tr[1], tr[2], tr[5])
     # The spread of the targets is the scale everything else is measured
     # against: an RMS error is only meaningful beside it.
@@ -189,20 +219,19 @@ def main():
     print(f"[data] training on {len(tr[0])} rows ({len(tr[4])} configs)", flush=True)
 
     results = []
-    for name in args.arch:
+    for idx, name in enumerate(args.arch):
         print(f"  -- {name}", flush=True)
-        r = run_one(name, tr, te, args, dev)
+        r = run_one(name, tr, va, te, args, dev, args.seed + idx)
         r["target_std"] = round(tgt_std, 4)
-        r["explained"] = round(1 - (r["final_test_rms"] / tgt_std) ** 2, 4)
+        r["explained"] = round(1 - (r["test_rms"] / tgt_std) ** 2, 4)
         results.append(r)
 
-    print(f"\n{'arch':14s} {'params':>9s} {'train':>10s} {'test':>10s} "
-          f"{'gap':>9s} {'test_rms':>9s} {'var expl':>9s} {'sec':>6s}")
-    for r in sorted(results, key=lambda r: r["final_test_huber"]):
-        print(f"{r['arch']:14s} {r['params']:9d} "
-              f"{r['final_train_huber']:10.6f} {r['final_test_huber']:10.6f} "
-              f"{r['final_test_huber'] - r['final_train_huber']:+9.6f} "
-              f"{r['final_test_rms']:9.5f} {r['explained']:9.4f} {r['seconds']:6.1f}")
+    print(f"\n{'arch':14s} {'params':>9s} {'lr':>8s} {'best_step':>9s} "
+          f"{'val':>10s} {'test':>10s} {'test_rms':>9s} {'var expl':>9s} {'sec':>6s}")
+    for r in sorted(results, key=lambda r: r["test_huber"]):
+        print(f"{r['arch']:14s} {r['params']:9d} {r['lr']:8.0e} {r['best_step']:9d} "
+              f"{r['best_val_huber']:10.6f} {r['test_huber']:10.6f} "
+              f"{r['test_rms']:9.5f} {r['explained']:9.4f} {r['seconds']:6.1f}")
     if args.out:
         with open(args.out, "w") as f:
             json.dump({"args": vars(args), "results": results}, f, indent=1)

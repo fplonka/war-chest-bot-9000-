@@ -464,7 +464,18 @@ fn finish_walk<'a>(w: Walk<'a>, bel: &[Belief; 2]) -> Vec<[Vec<f32>; 2]> {
 }
 
 /// Play one game to the end. Returns the result from White's point of view.
-pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) -> f32 {
+///
+/// When `roots` is given, every subgame root — the public state and both
+/// beliefs at each ReBeL decision — is appended to it. The GPU tree-sizing
+/// work collects these during a training run; they cost a clone per solve
+/// site and nothing when `None`.
+pub fn play_game(
+    rng: &mut Rng,
+    nets: &[Nets],
+    gc: &GameCfg,
+    data: &mut Data,
+    mut roots: Option<&mut Vec<(State, [Belief; 2])>>,
+) -> f32 {
     let mut s = make_game(rng, gc.random_draft);
     let ctx = Ctx::new(&s);
     let mut bel = [
@@ -580,6 +591,9 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
                     carried.clear();
                 }
                 if walk.is_none() {
+                    if let Some(r) = roots.as_deref_mut() {
+                        r.push((s, bel.clone()));
+                    }
                     // Start a new subgame at this decision: build the tree
                     // and run the full solve (Phase 1). TurboReBeL's Phase 2
                     // then values every carried belief — the T+1 rows of this
@@ -911,13 +925,41 @@ fn worker_seed(seed: u64, i: usize) -> u64 {
     seed.wrapping_mul(0x9E3779B97F4A7C15) ^ (i as u64).wrapping_mul(0xD1B54A32D192ED03)
 }
 
+/// Collect subgame roots from `games` random-draft games: `(state, belief)`
+/// pairs at every solve site, for GPU tree sizing.
+pub fn collect_roots(
+    games: usize,
+    seed: u64,
+    nets: &[Nets],
+    gc: &GameCfg,
+    cap: usize,
+) -> Vec<(State, [Belief; 2])> {
+    let mut out: Vec<(State, [Belief; 2])> = Vec::new();
+    for i in 0..games {
+        if out.len() >= cap {
+            break;
+        }
+        let mut rng = Rng::new(worker_seed(seed, i));
+        let mut d = Data::default();
+        let mut roots: Vec<(State, [Belief; 2])> = Vec::new();
+        play_game(&mut rng, nets, gc, &mut d, Some(&mut roots));
+        for r in roots {
+            if out.len() >= cap {
+                break;
+            }
+            out.push(r);
+        }
+    }
+    out
+}
+
 /// Play `games` games in parallel, returning merged data and statistics.
 pub fn run_games(games: usize, seed: u64, nets: &[Nets], gc: &GameCfg) -> Data {
     (0..games)
         .into_par_iter()
         .fold(Data::default, |mut acc, i| {
             let mut rng = Rng::new(worker_seed(seed, i));
-            play_game(&mut rng, nets, gc, &mut acc);
+            play_game(&mut rng, nets, gc, &mut acc, None);
             acc
         })
         .reduce(Data::default, |mut a, b| {
@@ -951,7 +993,7 @@ pub fn eval_match(
                 mc_mix: 0.0,
             };
             let mut d = Data::default();
-            let z = play_game(&mut rng, nets, &gc, &mut d);
+            let z = play_game(&mut rng, nets, &gc, &mut d, None);
             let za = if swap { -z } else { z };
             if za > 1e-6 {
                 (1, 0, 0)

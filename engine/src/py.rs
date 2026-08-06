@@ -701,6 +701,43 @@ fn eval_match(
     }))
 }
 
+/// Play `games` random-draft games and write up to `cap` subgame roots
+/// (public state + both beliefs, one per solve site) to `path` — the GPU
+/// tree-sizing sample of plan section 6. Uses the pushed nets, like
+/// `gen_data`.
+#[pyfunction]
+#[pyo3(signature = (games, seed, path, cap=1000, random_draft=true))]
+fn save_roots(
+    py: Python<'_>,
+    games: usize,
+    seed: u64,
+    path: &str,
+    cap: usize,
+    random_draft: bool,
+) -> PyResult<usize> {
+    let gc = GameCfg {
+        agents: [
+            Agent::Rebel { cfg: Cfg { depth: 2, iters: 64, snapshots: false, ..Default::default() }, slot: 0 },
+            Agent::Rebel { cfg: Cfg { depth: 2, iters: 64, snapshots: false, ..Default::default() }, slot: 0 },
+        ],
+        collect: Collect::None,
+        explore: 0.25,
+        random_draft,
+        eval_mix: 0.0,
+        mc_mix: 0.0,
+    };
+    let roots = py.allow_threads(|| {
+        let n = nets().read().unwrap();
+        crate::selfplay::collect_roots(games, seed, &n, &gc, cap)
+    });
+    let f = std::fs::File::create(path)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+    let mut w = std::io::BufWriter::new(f);
+    crate::roots::write_roots(&mut w, &roots)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+    Ok(roots.len())
+}
+
 /// Set the horizon payoff per marker of lead. The trainer anneals it to 0.
 #[pyfunction]
 fn set_cap_value(v: f32) {
@@ -941,6 +978,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hex_neighborhood, m)?)?;
     m.add_function(wrap_pyfunction!(set_weights, m)?)?;
     m.add_function(wrap_pyfunction!(set_cap_value, m)?)?;
+    m.add_function(wrap_pyfunction!(save_roots, m)?)?;
     m.add_function(wrap_pyfunction!(gen_data, m)?)?;
     m.add_function(wrap_pyfunction!(eval_match, m)?)?;
     m.add_function(wrap_pyfunction!(infer, m)?)?;
