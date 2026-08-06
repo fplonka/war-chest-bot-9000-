@@ -264,6 +264,17 @@ pub struct Data {
     pub cw: Vec<f32>,
     /// `[total_configs]` the solve's value for each config.
     pub cy: Vec<f32>,
+    /// `[n, AUX]` the auxiliary targets, per row: the two players' markers on
+    /// the board three rounds later, whether initiative changes hands at the
+    /// next round, and the game's result as a class. All are facts about how the
+    /// game actually went, so they are backfilled when it ends, and all are
+    /// dense -- unlike the outcome, every row gets a different answer. They are
+    /// training-only: nothing exports them and the Rust play path never sees
+    /// them.
+    pub ay: Vec<f32>,
+    /// `[n]` the round each row was taken at, which is what the backfill needs
+    /// and what it consumes. Not shipped to Python.
+    round: Vec<u16>,
     /// `[2 * n + 1]` arena offsets.
     pub coff: Vec<u32>,
     /// Solve starts in row space: `soff[k]` is the row at which solve k
@@ -286,6 +297,7 @@ impl Data {
     pub fn merge(&mut self, o: Data) {
         let base = self.cw.len() as u32;
         self.vx.extend(o.vx);
+        self.ay.extend(o.ay);
         self.cc.extend(o.cc);
         self.cw.extend(o.cw);
         self.cy.extend(o.cy);
@@ -320,6 +332,8 @@ impl Data {
         let base = self.vx.len();
         self.vx.resize(base + PUBFEAT, 0.0);
         write_public_features(s, ctx, &mut self.vx[base..base + PUBFEAT]);
+        self.ay.resize(self.ay.len() + AUX, 0.0);
+        self.round.push(s.round);
         if self.coff.is_empty() {
             self.coff.push(0);
         }
@@ -411,8 +425,16 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
     // done. Empty means the first level: Phase 2 then values just the live
     // belief.
     let mut carried: Vec<[Vec<f32>; 2]> = Vec::new();
+    // One entry per round, for the auxiliary targets. Recorded as the game runs
+    // because they ask about the future, and read back once it is over.
+    let mut timeline: Timeline = Vec::new();
 
     while !s.is_terminal() {
+        while timeline.len() <= s.round as usize {
+            timeline.push(([s.markers_on_board(0), s.markers_on_board(1)], s.initiative));
+        }
+        let last = timeline.len() - 1;
+        timeline[last] = ([s.markers_on_board(0), s.markers_on_board(1)], s.initiative);
         let player = s.to_act();
         if s.is_chance() {
             let res = reserve(&s, player, &ctx);
@@ -668,6 +690,7 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
         let m = gc.mc_mix.clamp(0.0, 1.0);
         blend_outcome(data, from_row, 1.0 - m, m, z);
     }
+    fill_aux(data, from_row, &timeline, z);
     data.games += 1;
     if s.main_plays >= crate::state::MAX_MAIN_PLAYS {
         data.cap_hits += 1;
@@ -677,6 +700,38 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
         None => data.draws += 1,
     }
     z
+}
+
+/// How many auxiliary targets a row carries: markers per side three rounds on,
+/// the initiative flip, and the result class.
+pub const AUX: usize = 4;
+/// How far ahead the marker target looks.
+const AUX_ROUNDS: u16 = 3;
+
+/// One entry per round the game reached: each player's markers on the board,
+/// and who held the initiative. The aux targets are read off this.
+type Timeline = Vec<([u8; 2], u8)>;
+
+/// Fill in the auxiliary targets now that the game is over and the future they
+/// ask about has happened. A row taken in round `r` wants the board three rounds
+/// later; a game that ends first is asked about its final position instead,
+/// which is the true answer to "how many markers are down later on".
+fn fill_aux(data: &mut Data, from_row: usize, tl: &Timeline, z: f32) {
+    if tl.is_empty() {
+        return;
+    }
+    let result = if z > 0.0 { 0.0 } else if z < 0.0 { 2.0 } else { 1.0 };
+    for r in from_row..data.nv {
+        let now = (data.round[r] as usize).min(tl.len() - 1);
+        let then = (now + AUX_ROUNDS as usize).min(tl.len() - 1);
+        let a = &mut data.ay[r * AUX..(r + 1) * AUX];
+        a[0] = tl[then].0[0] as f32 / 6.0;
+        a[1] = tl[then].0[1] as f32 / 6.0;
+        // Does the initiative change hands by the start of the next round?
+        let next = (now + 1).min(tl.len() - 1);
+        a[2] = (tl[next].1 != tl[now].1) as u8 as f32;
+        a[3] = result;
+    }
 }
 
 /// `y <- keep * y + mix * (+-z)` over every config of every row this game

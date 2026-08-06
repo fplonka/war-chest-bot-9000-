@@ -94,7 +94,7 @@ def run_one(name, tr, te, args, dev):
         # replacement keeps the batch a clean set of rows.
         ids = np.unique(ids)
         b = make_batch(subset(tr, ids), rng, dev, args.augment)
-        loss = value_loss(net, *b)
+        loss = value_loss(net, *b[:-1])
         opt.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(net.parameters(), 5.0)

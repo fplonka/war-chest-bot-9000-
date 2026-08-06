@@ -591,6 +591,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
         );
     }
     out.set_item("vx", d.vx.into_pyarray_bound(py))?;
+    out.set_item("ay", d.ay.into_pyarray_bound(py))?;
     out.set_item("cc", d.cc.into_pyarray_bound(py))?;
     out.set_item("cw", d.cw.into_pyarray_bound(py))?;
     out.set_item("cy", d.cy.into_pyarray_bound(py))?;
@@ -822,6 +823,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CFEAT", crate::rebel::CFEAT)?;
     m.add("AFEAT", crate::rebel::AFEAT)?;
     m.add("CCOUNTS", crate::rebel::CCOUNTS)?;
+    m.add("AUX", crate::selfplay::AUX)?;
     m.add("CNORM", crate::rebel::CNORM)?;
     m.add("N_HEXES", crate::board::N_HEXES)?;
     m.add("N_UNITS", crate::units::N_UNITS)?;
@@ -845,6 +847,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("OFF_LOOSE", crate::rebel::OFF_LOOSE)?;
     m.add("AOFF_PAYS", crate::rebel::AOFF_PAYS)?;
     m.add("CCOUNTS", crate::rebel::CCOUNTS)?;
+    m.add("AUX", crate::selfplay::AUX)?;
     m.add_function(wrap_pyfunction!(infer_policy, m)?)?;
     m.add_function(wrap_pyfunction!(hex_neighborhood, m)?)?;
     m.add_function(wrap_pyfunction!(set_weights, m)?)?;

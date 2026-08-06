@@ -28,6 +28,7 @@ OFF_PILES = warchest.OFF_PILES
 OFF_CARDS = warchest.OFF_CARDS
 OFF_LOOSE = warchest.OFF_LOOSE
 AOFF_PAYS = warchest.AOFF_PAYS
+AUX = warchest.AUX
 
 
 class Mlp(nn.Module):
@@ -88,6 +89,13 @@ class Mlp(nn.Module):
         self.wq = nn.Linear(AFEAT + de, rank)
         self.wk = nn.Linear(dg, rank)
         self.wp = nn.Linear(hidden, rank)
+        # Auxiliary heads, training only. Their targets are dense facts about how
+        # the game actually went -- markers three rounds on, whether initiative
+        # changes hands, the result -- so every row carries a different answer
+        # and every row gives the shared layers a gradient the single value
+        # number does not. Never in `flat()`, so the Rust play path never sees
+        # them and they cost nothing at play time.
+        self.aux = nn.Linear(hidden, AUX + 2)
         self.ln0 = nn.LayerNorm(hidden)
         self.ln1 = nn.LayerNorm(hidden)
         # Start near zero so the first bootstrapped targets are not dominated by
@@ -102,20 +110,28 @@ class Mlp(nn.Module):
         # and reporting it as a strength result.
         self.has_policy = True
 
-    def forward(self, xpub, phi, inv, w, seg, nseg):
-        """Values for every config in a ragged batch.
+    def aux_loss(self, xpub, target):
+        """The auxiliary heads' loss, on the same hidden layer the value reads.
 
-        `xpub` is `[B, PUBFEAT]`. The configs of every row and player are
-        concatenated into one list of length `N`; `w[i]` is config `i`'s belief
-        probability and `seg[i] = 2 * row + player` says where it belongs.
+        `target` is `[B, AUX]`: two marker counts three rounds on, the
+        initiative-flip flag, and the result class. One matrix produces
+        `AUX + 2` numbers, because the result is three classes rather than one:
+        two regressions, one binary, one 3-way.
 
-        The config tower runs over *distinct* configs only: `phi` is `[U, CFEAT]`
-        and `inv` maps each of the `N` entries to its row in it. A batch of 1024
-        positions carries ~50k configs drawn from a couple of thousand distinct
-        ones, and the readout embedding is `dg x (hidden + 1)` — by far the
-        widest matmul here if it runs per entry. The Rust solver deduplicates
-        for the same reason.
+        Beliefs are not needed -- these are facts about the public future -- so
+        the hidden layer is taken with an empty belief block, which keeps the
+        gradient on the part of the trunk every row shares.
         """
+        b = xpub.shape[0]
+        e = self.cards(xpub)
+        h = F.relu(self.ln0(self.w0(self.trunk_input(xpub, e))))
+        zero = torch.zeros(b, self.wb.in_features, dtype=h.dtype, device=h.device)
+        h = F.relu(self.ln1(self.w1(h) + self.wb(zero)))
+        a = self.aux(h)
+        return (F.mse_loss(a[:, :2], target[:, :2])
+                + F.binary_cross_entropy_with_logits(a[:, 2], target[:, 2])
+                + F.cross_entropy(a[:, 3:], target[:, 3].long()))
+
     def cards(self, xpub):
         """The card table `e`, `[B, NTYPE, de]` — one embedding per coin type."""
         c = xpub[:, OFF_CARDS:OFF_CARDS + NTYPE * CARD_FEATS]

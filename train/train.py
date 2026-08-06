@@ -47,7 +47,7 @@ import torch.nn.functional as F
 import warchest
 import ladder
 import mirror
-from value_net import Mlp
+from value_net import Mlp, AUX
 
 PUBFEAT = warchest.PUBFEAT
 CFEAT = warchest.CFEAT
@@ -81,6 +81,7 @@ class Buffer:
     def __init__(self, cap, ccap):
         self.cap, self.ccap = cap, ccap
         self.x = np.zeros((cap, PUBFEAT), np.float16)
+        self.ay = np.zeros((cap, AUX), np.float16)
         self.cstart = np.zeros(cap, np.int64)   # absolute arena offset
         self.clen = np.zeros((cap, 2), np.int32)
         self.cc = np.zeros((ccap, CCOUNTS), np.uint8)
@@ -91,7 +92,7 @@ class Buffer:
         self.cfgs = 0   # configs ever written
         self.lo = 0     # oldest row whose configs are still in the arena
 
-    def add(self, x, cc, cw, cy, coff):
+    def add(self, x, ay, cc, cw, cy, coff):
         n = len(x)
         lens = np.diff(coff).reshape(n, 2)
         cp = np.repeat(np.tile([0, 1], n).astype(np.uint8), lens.ravel())
@@ -100,6 +101,7 @@ class Buffer:
             j = min(i + 4096, n)
             sl = np.arange(i, j) + self.rows
             self.x[sl % self.cap] = x[i:j]
+            self.ay[sl % self.cap] = ay[i:j]
             self.cstart[sl % self.cap] = starts[i:j]
             self.clen[sl % self.cap] = lens[i:j]
         m = len(cw)
@@ -131,7 +133,7 @@ class Buffer:
         at = (base + within) % self.ccap
         seg = 2 * np.repeat(np.arange(len(ids), dtype=np.int64), lens) + self.cp[at]
         return (self.x[s], self.cc[at], self.cp[at], self.cw[at].astype(np.float32),
-                self.cy[at].astype(np.float32), seg)
+                self.cy[at].astype(np.float32), seg, self.ay[s].astype(np.float32))
 
     def sample(self, batch, rng, recent_mix=0.0, recent_frac=0.2):
         """A batch, part of it drawn from the newest rows only.
@@ -191,11 +193,16 @@ def make_batch(parts, rng, device, augment):
     On the config side the swap is one bit: a config carries the seat it belongs
     to as a feature, and `seg` is `2 * row + seat`.
     """
-    x, cc, cp, cw, cy, seg = parts
+    x, cc, cp, cw, cy, seg, ay = parts
     x = x.astype(np.float32)
     if augment:
         which = rng.random(len(x)) < 0.5
         x[which] = mirror.mirror_x(x[which])
+        # The aux targets name seats too: the two marker counts swap, and the
+        # result class inverts (0 = white wins, 2 = black wins, 1 = neither).
+        # The initiative flip is a flip either way.
+        ay[which] = ay[which][:, [1, 0, 2, 3]]
+        ay[which, 3] = 2.0 - ay[which, 3]
         flip = which[seg // 2]
         cp = np.where(flip, 1 - cp, cp)
         seg = np.where(flip, seg ^ 1, seg)
@@ -210,7 +217,8 @@ def make_batch(parts, rng, device, augment):
     phi = np.concatenate([cc[first].astype(np.float32) / CNORM,
                           cp[first, None].astype(np.float32)], 1)
     t = lambda a, d=torch.float32: torch.as_tensor(a, dtype=d, device=device)
-    return (t(x), t(phi), t(inv, torch.long), t(cw), t(seg, torch.long), t(cy), 2 * len(x))
+    return (t(x), t(phi), t(inv, torch.long), t(cw), t(seg, torch.long), t(cy),
+            2 * len(x), t(ay))
 
 
 def value_loss(net, xpub, phi, inv, w, seg, y, nseg):
@@ -223,19 +231,25 @@ def value_loss(net, xpub, phi, inv, w, seg, y, nseg):
 
 
 def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
-                recent_mix=0.0, recent_frac=0.2):
+                recent_mix=0.0, recent_frac=0.2, aux_weight=0.0):
     if len(buf) < batch:
         return float("nan")
     tot = 0.0
     for _ in range(steps):
-        parts = make_batch(buf.sample(batch, rng, recent_mix, recent_frac),
-                           rng, device, augment)
+        *parts, ay = make_batch(buf.sample(batch, rng, recent_mix, recent_frac),
+                               rng, device, augment)
         loss = value_loss(net, *parts)
+        # What is reported is the value loss alone, so the column means the same
+        # thing whether or not the auxiliary heads are on.
+        tot += loss.detach().item()
+        # The auxiliary heads share the trunk and are dropped at play time, so
+        # they are extra gradient per row for nothing at inference.
+        if aux_weight > 0.0:
+            loss = loss + aux_weight * net.aux_loss(parts[0], ay)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(net.parameters(), 5.0)
         opt.step()
-        tot += loss.detach().item()
     return tot / steps
 
 
@@ -269,6 +283,8 @@ def main():
     ap.add_argument("--dg", type=int, default=64)
     # Rank of the value readout's inner product -- see `Mlp`.
     ap.add_argument("--rank", type=int, default=64)
+    ap.add_argument("--aux", type=float, default=0.1,
+                    help="weight on the auxiliary heads' loss. They predict dense facts\nabout how the game went -- markers three rounds on, the initiative\nflip, the result -- so every row gives the shared trunk a gradient\nthe single value number does not. 0 disables them.")
     ap.add_argument("--de", type=int, default=32,
                     help="width of a card embedding: what the describer summarises a\ncard's rulebook facts into, and what every part that names a card reads")
     # Arena size per row of replay capacity. Self-play carries ~24 configs a
@@ -459,6 +475,7 @@ def main():
         # Utilities live in [-1, 1]; so does the true value function, so clip
         # the bootstrapped targets to that range.
         vx = np.asarray(d["vx"], np.float32).reshape(-1, PUBFEAT)
+        ay = np.asarray(d["ay"], np.float32).reshape(-1, AUX)
         cc = np.asarray(d["cc"], np.uint8).reshape(-1, CCOUNTS)
         cw = np.asarray(d["cw"], np.float32)
         cy = np.clip(np.asarray(d["cy"], np.float32), -1.0, 1.0)
@@ -467,7 +484,7 @@ def main():
         # can count solves (the sampling unit of the data) instead of rows,
         # which turbo multiplies by ~T for near-duplicate data.
         solves = max(1, int(d["solves"]))
-        buf.add(vx.astype(np.float16), cc, cw.astype(np.float16),
+        buf.add(vx.astype(np.float16), ay.astype(np.float16), cc, cw.astype(np.float16),
                 cy.astype(np.float16), coff)
         # A frozen batch from the warm phase. If the network's spread on it
         # collapses, the value function has gone degenerate -- the failure mode
@@ -489,7 +506,7 @@ def main():
         # by the same factor for near-duplicate data. One solve is one sample,
         # matching the buffer's sampling unit.
         steps = max(1, round(args.train_gen_ratio * solves / args.batch))
-        lv = train_steps(value, opt, buf, steps, args.batch, rng, dev,
+        lv = train_steps(value, opt, buf, steps, args.batch, rng, dev, aux_weight=args.aux,
                          augment=not args.no_augment, recent_mix=args.recent_mix,
                          recent_frac=args.recent_frac)
         train_s = time.time() - tt
@@ -504,11 +521,11 @@ def main():
             if len(buf) >= args.batch:
                 old_parts = make_batch(
                     buf.sample_old(args.batch, rng, args.recent_frac), rng, dev, False)
-                loss_old = float(value_loss(value, *old_parts))
+                loss_old = float(value_loss(value, *old_parts[:-1]))
                 new_parts = make_batch(
                     buf.sample(args.batch, rng, recent_mix=1.0,
                                recent_frac=args.recent_frac), rng, dev, False)
-                loss_new = float(value_loss(value, *new_parts))
+                loss_new = float(value_loss(value, *new_parts[:-1]))
             else:
                 loss_old = loss_new = float("nan")
 
