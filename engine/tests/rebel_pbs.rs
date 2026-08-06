@@ -411,6 +411,73 @@ fn config_features_separate_every_config() {
     assert!(checked > 10_000, "only {checked} config vectors exercised");
 }
 
+fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
+    let res = reserve(s, p, ctx);
+    let truth = true_config(s, p, ctx);
+    let cfgs = enumerate_configs(&res, truth.hand_size(), truth.fd_size());
+    let n = cfgs.len().max(1) as f32;
+    Belief { p: vec![1.0 / n; cfgs.len()], cfg: cfgs }
+}
+
+/// A warm start must not move where the solve converges.
+///
+/// Seeding CFR from the policy head changes the path, not the destination: the
+/// subgame's value is unique, so a warm-started solve and a cold one must agree
+/// once both have converged. If they do not, the seeded regrets are not regrets
+/// of the game being solved and the warm start is biasing the answer rather
+/// than accelerating it -- which is exactly the failure a strength gate could
+/// not distinguish from a real gain.
+///
+/// The policy here is a random network's, so it is arbitrary. That is the point:
+/// no seed, however bad, may change the fixed point.
+#[test]
+fn a_warm_start_does_not_move_the_fixed_point() {
+    let nets = Nets { value: random_net(7, 96, 24) };
+    let mut checked = 0usize;
+    for seed in 0..400u64 {
+        let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
+        let mut s = make_game(&mut rng, false);
+        for _ in 0..40 + seed % 120 {
+            if s.is_terminal() {
+                break;
+            }
+            let acts = s.legal_actions();
+            s.apply_inplace(acts[rng.below(acts.len())]);
+        }
+        if s.is_terminal() || s.is_chance() {
+            continue;
+        }
+        let ctx = Ctx::new(&s);
+        let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
+        if bel[0].len() > 24 || bel[1].len() > 24 {
+            continue;
+        }
+        let base = Cfg { depth: 2, iters: 400, snapshots: true, ..Default::default() };
+        let mut v = Vec::new();
+        for warm in [0.0f32, 15.0] {
+            let mut sv = Solver::new(&s, &ctx, &nets, Cfg { warm, ..base }, bel.clone());
+            sv.warm_start(warm);
+            sv.multistep(base.iters);
+            let root = [[bel[0].p.clone(), bel[1].p.clone()]];
+            let vals = sv.value_under(&root);
+            v.push((0..bel[0].len())
+                .map(|c| bel[0].p[c] as f64 * vals[0][0][c] as f64)
+                .sum::<f64>());
+            assert!(sv.nash_conv().nash > -1e-3, "seed {seed}: NashConv is negative");
+        }
+        assert!(
+            (v[0] - v[1]).abs() < 0.01,
+            "seed {seed}: cold solve says {:.4}, warm says {:.4}",
+            v[0], v[1]
+        );
+        checked += 1;
+        if checked >= 6 {
+            break;
+        }
+    }
+    assert!(checked >= 6, "only {checked} positions exercised");
+}
+
 /// The card describer is the whole of what makes an unseen draft readable: the
 /// network keys on what a card *does* rather than on which card it is. That only
 /// works if the rulebook facts tell the draftable cards apart. If two share a

@@ -275,6 +275,28 @@ pub struct Data {
     /// `[n]` the round each row was taken at, which is what the backfill needs
     /// and what it consumes. Not shipped to Python.
     round: Vec<u16>,
+
+    // ------------------------------------------------------- policy targets
+    // One per solve, not one per row. A solve's rows share a public state and
+    // differ only in belief, while the reference strategy is a single object,
+    // so labelling every row would teach the head that the belief does not
+    // matter. The exact label belongs to the live-belief row -- the one whose
+    // belief is the solve's own root -- which `finish_solve` records.
+    //
+    // These are per epoch and never enter the replay buffer. A value target is
+    // bootstrapped and gains from being averaged over a long history; a
+    // strategy is not, and is regenerated in full every epoch.
+    /// `[s]` the row each solve's label belongs to.
+    pub prow: Vec<u32>,
+    /// `[s]` which player was to act there.
+    pub pact: Vec<u8>,
+    /// `[sum na, AFEAT]` the action descriptions, and `[s + 1]` offsets in
+    /// actions.
+    pub pa: Vec<f32>,
+    pub paoff: Vec<u32>,
+    /// `[sum nc * na]` the reference strategy: one distribution per config of
+    /// the acting player, in the row's config order.
+    pub pp: Vec<f32>,
     /// `[2 * n + 1]` arena offsets.
     pub coff: Vec<u32>,
     /// Solve starts in row space: `soff[k]` is the row at which solve k
@@ -298,6 +320,15 @@ impl Data {
         let base = self.cw.len() as u32;
         self.vx.extend(o.vx);
         self.ay.extend(o.ay);
+        let (row_base, act_base) = (self.nv as u32, (self.pa.len() / AFEAT) as u32);
+        self.prow.extend(o.prow.iter().map(|r| r + row_base));
+        self.pact.extend(o.pact);
+        self.pa.extend(o.pa);
+        // Same leading-zero rule as `coff`: the merged arena keeps exactly one.
+        let phead = if self.paoff.is_empty() { 0 } else { 1 };
+        self.paoff
+            .extend(o.paoff.iter().skip(phead).map(|x| x + act_base));
+        self.pp.extend(o.pp);
         self.cc.extend(o.cc);
         self.cw.extend(o.cw);
         self.cy.extend(o.cy);
@@ -349,6 +380,32 @@ impl Data {
             self.coff.push(self.cw.len() as u32);
         }
         self.nv += 1;
+    }
+
+    /// Record the policy label for the solve just pushed: the reference
+    /// strategy at its root, and the descriptions of the actions it is over.
+    /// `row` is the live-belief row, whose belief is the solve's own root.
+    fn push_policy(&mut self, sv: &Solver, ctx: &Ctx, row: usize, player: u8) {
+        let n = &sv.nodes[0];
+        let (na, nc) = (n.na(), n.nc(player as usize));
+        if na == 0 || nc == 0 {
+            return;
+        }
+        if self.paoff.is_empty() {
+            self.paoff.push(0);
+        }
+        let base = self.pa.len();
+        self.pa.resize(base + na * AFEAT, 0.0);
+        for a in 0..na {
+            write_action_feats(&n.acts[a], ctx, player as usize, n.aslot[a], n.fdown[a],
+                               &mut self.pa[base + a * AFEAT..base + (a + 1) * AFEAT]);
+        }
+        self.paoff.push((self.pa.len() / AFEAT) as u32);
+        for c in 0..nc {
+            self.pp.extend_from_slice(sv.average_strategy(0, c));
+        }
+        self.prow.push(row as u32);
+        self.pact.push(player);
     }
 
     /// The config range of row `r`, player `p`, in the arena.
@@ -534,6 +591,7 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
                         ..cfg
                     };
                     let mut sv = Solver::new(&s, &ctx, &nets[slot], scfg, bel.clone());
+                    sv.warm_start(scfg.warm);
                     sv.multistep(cfg.iters);
                     if gc.collect == Collect::Rebel {
                         // Phase 2: one fixed-policy value pass per carried
@@ -570,6 +628,12 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
                                 [&v[0], &v[1]],
                             );
                         }
+                        // `roots` ends with the live belief -- `finish_walk`
+                        // appends it last, and the first level carries only it
+                        // -- so the row just pushed is the one whose belief is
+                        // this solve's own root, and the only one the reference
+                        // strategy is the exact answer for.
+                        data.push_policy(&sv, &ctx, data.nv - 1, player);
                     }
                     walk = Some(Walk {
                         sv,

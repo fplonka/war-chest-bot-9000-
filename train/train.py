@@ -47,7 +47,7 @@ import torch.nn.functional as F
 import warchest
 import ladder
 import mirror
-from value_net import Mlp, AUX
+from value_net import Mlp, AUX, AFEAT
 
 PUBFEAT = warchest.PUBFEAT
 CFEAT = warchest.CFEAT
@@ -230,6 +230,83 @@ def value_loss(net, xpub, phi, inv, w, seg, y, nseg):
     return (per * w).sum() / w.sum().clamp(min=1e-6)
 
 
+def policy_loss(net, d, ids, device):
+    """Cross-entropy from the policy head to the solves' own reference strategy,
+    weighted by the belief -- the same weighting the value loss uses, and for the
+    same reason: a config the belief gives 1% to is worth 1% of the gradient.
+
+    Trained on the fresh epoch only, never from the replay buffer. A value target
+    is bootstrapped and gains from being averaged over a long history; a strategy
+    is not, and the epoch regenerates every one of them.
+
+    Action lists are ragged across solves, so they are padded to the widest in
+    the batch and masked. The target gives illegal actions probability exactly
+    zero, so legality needs no separate mask in the loss; the solver masks by
+    real legality when it reads the head.
+    """
+    prow, pact, paoff, coff = d["prow"][ids], d["pact"][ids], d["paoff"], d["coff"]
+    pa, pp = d["pa"].reshape(-1, AFEAT), d["pp"]
+    cc, cw = d["cc"].reshape(-1, CCOUNTS), d["cw"]
+    na = (paoff[ids + 1] - paoff[ids]).astype(np.int64)
+    S, NA = len(ids), int(na.max())
+
+    # The row's configs: both players for the belief block, the acting player's
+    # alone for the strategy, which is indexed by them.
+    both = [np.arange(coff[2 * r], coff[2 * r + 2]) for r in prow]
+    mine = [np.arange(coff[2 * r + p], coff[2 * r + p + 1]) for r, p in zip(prow, pact)]
+    nc = np.array([len(m) for m in mine])
+    seg = np.concatenate([2 * j + (np.arange(len(b)) >= coff[2 * r + 1] - coff[2 * r])
+                          for j, (b, r) in enumerate(zip(both, prow))]).astype(np.int64)
+    both, mine = np.concatenate(both), np.concatenate(mine)
+
+    apad = np.zeros((S, NA, AFEAT), np.float32)
+    amask = np.zeros((S, NA), bool)
+    tgt = np.zeros((int(nc.sum()), NA), np.float32)
+    at, ct = 0, 0
+    for j, i in enumerate(ids):
+        apad[j, :na[j]] = pa[paoff[i]:paoff[i] + na[j]]
+        amask[j, :na[j]] = True
+        tgt[ct:ct + nc[j], :na[j]] = pp[at:at + nc[j] * na[j]].reshape(nc[j], na[j])
+        at, ct = at + nc[j] * na[j], ct + nc[j]
+
+    t = lambda a, dt=torch.float32: torch.as_tensor(np.ascontiguousarray(a), dtype=dt, device=device)
+    phi = lambda idx, seats: t(np.concatenate(
+        [cc[idx].astype(np.float32) / CNORM, seats[:, None].astype(np.float32)], 1))
+    csol = t(np.repeat(np.arange(S), nc), torch.long)
+
+    x = t(d["vx"].reshape(-1, PUBFEAT)[prow])
+    e = net.cards(x)
+    zb = net.holdings(phi(both, seg & 1), e[t(seg // 2, torch.long)])
+    b = torch.zeros(2 * S, zb.shape[1], dtype=zb.dtype, device=device)
+    b.index_add_(0, t(seg, torch.long), zb * t(cw[both]).unsqueeze(1))
+    h = F.relu(net.ln0(net.w0(net.trunk_input(x, e))))
+    h = F.relu(net.ln1(net.w1(h) + net.wb(b.reshape(S, -1))))
+
+    q = net.actions(t(apad.reshape(-1, AFEAT)),
+                    e.repeat_interleave(NA, 0)).reshape(S, NA, -1)
+    k = net.wp(h)[csol] + net.wk(net.holdings(phi(mine, np.repeat(pact, nc)), e[csol]))
+    logit = (k.unsqueeze(1) * q[csol]).sum(-1).masked_fill(~t(amask, torch.bool)[csol], -1e30)
+    ce = -(t(tgt) * logit.log_softmax(-1)).sum(-1)
+    w = t(cw[mine])
+    return (ce * w).sum() / w.sum().clamp(min=1e-6)
+
+
+def policy_steps(net, opt, d, batch, rng, device, weight):
+    """Fit the policy head to this epoch's solves. Returns the mean loss."""
+    n = len(d["prow"])
+    if n == 0:
+        return float("nan")
+    tot, steps = 0.0, max(1, n // batch)
+    for _ in range(steps):
+        loss = policy_loss(net, d, rng.choice(n, min(batch, n), replace=False), device)
+        tot += loss.detach().item()
+        opt.zero_grad(set_to_none=True)
+        (weight * loss).backward()
+        nn.utils.clip_grad_norm_(net.parameters(), 5.0)
+        opt.step()
+    return tot / steps
+
+
 def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
                 recent_mix=0.0, recent_frac=0.2, aux_weight=0.0):
     if len(buf) < batch:
@@ -283,6 +360,8 @@ def main():
     ap.add_argument("--dg", type=int, default=64)
     # Rank of the value readout's inner product -- see `Mlp`.
     ap.add_argument("--rank", type=int, default=64)
+    ap.add_argument("--policy", type=float, default=0.1,
+                    help="weight on the policy head's loss. Its labels are free -- every\nsolve already computes the reference strategy -- and the head is what\na warm start and any action shortlist read. 0 disables.")
     ap.add_argument("--aux", type=float, default=0.1,
                     help="weight on the auxiliary heads' loss. They predict dense facts\nabout how the game went -- markers three rounds on, the initiative\nflip, the result -- so every row gives the shared trunk a gradient\nthe single value number does not. 0 disables them.")
     ap.add_argument("--de", type=int, default=32,
@@ -506,6 +585,8 @@ def main():
         # by the same factor for near-duplicate data. One solve is one sample,
         # matching the buffer's sampling unit.
         steps = max(1, round(args.train_gen_ratio * solves / args.batch))
+        lp = (policy_steps(value, opt, d, 256, rng, dev, args.policy)
+              if args.policy > 0.0 and phase == "rebel" else float("nan"))
         lv = train_steps(value, opt, buf, steps, args.batch, rng, dev, aux_weight=args.aux,
                          augment=not args.no_augment, recent_mix=args.recent_mix,
                          recent_frac=args.recent_frac)
@@ -559,6 +640,7 @@ def main():
         dec = max(d["decisions"], 1)
         rec = {"t": round(time.time() - t0, 1), "epoch": epoch, "phase": phase,
                "games": d["games"], "decisions": dec, "loss": round(lv, 5),
+               "loss_policy": round(lp, 4),
                "rows": len(vx), "solves": solves,
                "loss_old": round(loss_old, 5), "loss_new": round(loss_new, 5),
                "cap_frac": round(d["cap_hits"] / max(d["games"], 1), 3),
@@ -576,7 +658,7 @@ def main():
         write_log(args, log, snaps)
         print(f"[t={rec['t']:6.1f}s] {phase:6s} ep{epoch:3d} games={rec['games']:4d} "
               f"dec={dec:6d} rows={len(vx):6d} cap={rec['cap_frac']:.2f} "
-              f"cfgs={rec['configs']:5.1f} L={lv:.5f} old={loss_old:.5f} new={loss_new:.5f} "
+              f"cfgs={rec['configs']:5.1f} L={lv:.5f} P={lp:.3f} old={loss_old:.5f} new={loss_new:.5f} "
               f"tgt={tgt_mean:+.3f}/{tgt_std:.3f} pstd={probe_std:.3f} "
               f"capv={cap_v:.3f} lr={rec['lr']:.1e} gen={gen_s:.1f}s train={train_s:.1f}s",
               flush=True)

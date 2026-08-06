@@ -90,9 +90,11 @@ struct Run {
 
 /// One solve, read off at each rung as it passes: the fixed-policy passes
 /// restore the solve's reaches, so a reading does not disturb what follows.
-fn solve(s: &State, ctx: &Ctx, nets: &Nets, bel: &[Belief; 2], depth: usize, rule: Cfr) -> Run {
-    let cfg = Cfg { depth, iters: TMAX, snapshots: true, cfr: rule };
+fn solve(s: &State, ctx: &Ctx, nets: &Nets, bel: &[Belief; 2], depth: usize, rule: Cfr,
+         warm: f32) -> Run {
+    let cfg = Cfg { depth, iters: TMAX, snapshots: true, cfr: rule, warm };
     let mut sv = Solver::new(s, ctx, nets, cfg, bel.clone());
+    sv.warm_start(warm);
     let root = [[bel[0].p.clone(), bel[1].p.clone()]];
     let mut r = Run { vals: Vec::new(), nash: Vec::new(), zero_sum: Vec::new() };
     let mut done = 0usize;
@@ -122,12 +124,16 @@ fn main() {
     // window covers the opening and early middlegame; a later window is what
     // checks that the finding is not an artefact of one phase.
     let skip: usize = a.get(5).and_then(|x| x.parse().ok()).unwrap_or(20);
+    // Non-zero turns the sweep into A4's test: every rule is run cold and again
+    // seeded from the policy head, worth this many iterations. The decision rule
+    // is whether warm at T/2 beats cold at T.
+    let warm: f32 = a.get(6).and_then(|x| x.parse().ok()).unwrap_or(0.0);
 
     let mut nets = Nets::default();
     nets.value = Mlp::load_bin(&path).expect("weights file");
     println!(
         "dims {:?}, depth {depth}, reference {REFERENCE:?} at T={TMAX},\n\
-         positions from {} play, sampled {}-{} plies in",
+         positions from {} play, sampled {}-{} plies in, warm start {warm}",
         nets.value.dims,
         if greedy { "greedy" } else { "random" },
         skip,
@@ -135,7 +141,18 @@ fn main() {
     );
     warchest::state::set_cap_marker_value(0.0);
 
-    let rules = Cfr::NAMED;
+    // With a warm start every rule appears twice, cold then warm, so the two
+    // columns sit side by side in every table.
+    let rules: Vec<(String, Cfr, f32)> = Cfr::NAMED
+        .iter()
+        .flat_map(|(n, c)| {
+            let mut v = vec![(n.to_string(), *c, 0.0)];
+            if warm > 0.0 {
+                v.push((format!("{n}+warm"), *c, warm));
+            }
+            v
+        })
+        .collect();
     let rungs = LADDER.len() + 1;
     // Per rule, per rung, summed over every config of every position: the
     // target's absolute and signed error against the reference, and NashConv.
@@ -173,11 +190,11 @@ fn main() {
 
         let runs: Vec<Run> = rules
             .iter()
-            .map(|(_, r)| solve(&s, &ctx, &nets, &bel, depth, *r))
+            .map(|(_, r, w)| solve(&s, &ctx, &nets, &bel, depth, *r, *w))
             .collect();
         // Every rule is graded against the same numbers, which is what makes
         // the columns comparable.
-        let ri = rules.iter().position(|(_, r)| *r == REFERENCE).unwrap();
+        let ri = rules.iter().position(|(_, r, w)| *r == REFERENCE && *w == 0.0).unwrap();
         let reference = runs[ri].vals[rungs - 1].clone();
 
         for (k, run) in runs.iter().enumerate() {
@@ -213,7 +230,7 @@ fn main() {
     let table = |title: &str, acc: &[Vec<f64>], div: f64| {
         println!("\n{title}\n");
         print!("{:>7}", "T");
-        for (name, _) in rules {
+        for (name, _, _) in rules.iter() {
             print!("{name:>12}");
         }
         println!();

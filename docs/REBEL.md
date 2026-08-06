@@ -169,26 +169,56 @@ every buffer size. `Mlp.flat()` produces the flat arrays both `set_weights` and
 `export_weights.py` ship, so there is one place for Python and Rust to agree, and
 `train/test_parity.py` checks it.
 
+### The card describer
+
+Nothing in the network names a *unit*. Each of the ten coin types in play — five
+per player — is summarised by its 25 rulebook facts, and everything that refers
+to a card refers to a coin-type index into that table:
+
+```text
+  e = relu(card facts Wd0 + bd0) Wd1 + bd1                   [NTYPE, de]
+```
+
+Built once per solve: the draft is fixed for the game. The hex block, the pile
+summary, the holding tower and the action tower all read a row of it, through a
+one-hot over the ten coin types. That is what makes a draft the network has
+never seen describable rather than an unknown identity code, and
+`card_features_separate_every_draftable_unit` pins the precondition — if two
+cards shared a fact vector the describer would merge them silently.
+
+**A stored row holds one-hots, not embeddings.** `e` is learned, so a replay row
+that contained it would carry whichever weights were live when it was written,
+go stale as training moved them, and pass no gradient back to the describer. The
+row keeps raw facts and the network does the lookup, which also keeps
+`write_public_features` a pure function of the position.
+
+The pile summary and the holding tower are **sums over coin types**. A sum has no
+order, so nothing depends on which slot a card landed in and any draft fits.
+
 ### Value
 
 The value of a leaf is a counterfactual value **per information state**, so it is
 indexed by the config: `v̂(PBS, c) -> scalar`.
 
 ```text
-  config tower:  z(c) = relu(phi(c) Wc + bc)                 [dg]
-                 g(c) = z(c) Wg + bg                         [rank + 1]
+  holding tower: z(c) = sum_k relu([counts_k, seat, e_k] Wc + bc)   [dg]
+                 g(c) = z(c) Wg + bg                                [rank + 1]
 
-  PBS tower:     hpub = relu(LN(x_pub W0 + b0)) W1
-                 e_p  = sum_c beta_p(c) z(c)                 [dg] per player
-                 h    = relu(LN(hpub + [e_0; e_1] Wb + b1))  [hidden]
+  trunk input:   x    = [hex facts | e of each occupant | pile summary | loose]
+  PBS tower:     hpub = relu(LN(x W0 + b0)) W1
+                 b_p  = sum_c beta_p(c) z(c)                 [dg] per player
+                 h    = relu(LN(hpub + [b_0; b_1] Wb + b1))  [hidden]
                  u    = h Wu + bu                            [rank]
 
   value:         v(c) = <u, g(c)[..rank]> + g(c)[rank]
 ```
 
-`phi(c)` is one config's exact counts — hand, face-down, derived bag, plus the
-seat. `config_features_separate_every_config` pins that two distinct private
-states never share a feature vector.
+The holding tower rectifies *before* the sum. A sum of raw linear maps is a
+linear map of the sum, and the sum of the inputs has forgotten which count
+belongs to which card — the one thing the tower exists to remember.
+
+`config_features_separate_every_config` pins that two distinct private states
+never share a feature vector.
 
 This is the reference implementation's shape with its fixed-width private-state
 dimensions replaced by learned functions, because War Chest's private states do
@@ -219,7 +249,35 @@ and differ only in belief, so they would all carry the same strategy.
 
 Checkpoints written before the policy head loaded with `strict=False` leave these
 three matrices at their initialisation; `has_policy` records that, and anything
-reading the policy asserts on it.
+reading the policy asserts on it. Checkpoints from before the card describer do
+not load at all — the trunk's input is a different width.
+
+### Auxiliary heads
+
+Training only, one matrix off the same hidden layer: each player's markers on the
+board three rounds later, whether initiative changes hands next round, and the
+result as three classes. Backfilled from a per-round timeline the game records as
+it runs. They are dense — every row gets a different answer, unlike the single
+value number — and they are never in `flat()`, so the Rust play path never sees
+them and they cost nothing at inference. `--aux`, default 0.1.
+
+### Warm start
+
+`Solver::warm_start` seeds a solve from the policy head instead of from a uniform
+strategy, as ReBeL's Appendix J does (after Brown & Sandholm 2016): take the
+policy, compute an exact best response to it, and start CFR as though that policy
+had been played for `--warm` iterations. The best response is the pass
+`nash_conv` already needs with regret recording on, so nothing new is computed.
+
+`a_warm_start_does_not_move_the_fixed_point` pins the property that matters: the
+subgame's value is unique, so a warm-started solve and a cold one must agree once
+both converge. A seed that changed the answer would be biasing it rather than
+accelerating it, and a strength gate could not tell those apart.
+
+Default 0 — off — until the measurement says otherwise. `examples/solvererr.rs`
+takes a warm-start weight as its sixth argument and then reports every regret
+rule cold and warm side by side; the decision rule is whether warm at `T/2` beats
+cold at `T`.
 
 ### What is cached
 
@@ -258,6 +316,14 @@ the end of this phase is snapshot 0, labelled `init`.
 
 **Phase 2 — ReBeL.** Self-play with a CFR solve at every decision. Default
 `--iters 64`, `--depth 2`.
+
+**The policy head** is trained on the fresh epoch only, never from the replay
+buffer (`--policy`, default 0.1). A value target is bootstrapped and gains from
+being averaged over a long history; a strategy is not, and the epoch regenerates
+every one of them. Its label attaches to the solve's **live-belief row** — the
+rows of one solve share a public state and differ only in belief, while the
+reference strategy is a single object, so labelling all of them would teach the
+head that the belief does not matter.
 
 Training runs on the rulebook's starter matchup by default;
 `--random-draft` randomises the draft.
@@ -315,6 +381,7 @@ Nothing is compared, promoted or selected while a run is going.
 * `examples/featstats.rs` — the real range of every feature.
 * `examples/cfgvalue.rs` — how far the value separates configs.
 * `train/ladder.py` — Elo over snapshots plus Greedy and Random.
+* `train/test_parity.py` — the Rust network against PyTorch, per seam.
 
 ## 9. Layout
 

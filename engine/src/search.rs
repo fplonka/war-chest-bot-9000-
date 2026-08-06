@@ -59,6 +59,10 @@ pub struct Cfg {
     pub snapshots: bool,
     /// The regret-update rule.
     pub cfr: Cfr,
+    /// Iterations the policy head's strategy is worth when a solve is seeded
+    /// from it. 0 starts uniform, which is the default until the measurement
+    /// says otherwise.
+    pub warm: f32,
 }
 
 impl Default for Cfg {
@@ -68,6 +72,7 @@ impl Default for Cfg {
             iters: 64,
             snapshots: true,
             cfr: Cfr::LINEAR,
+            warm: 0.0,
         }
     }
 }
@@ -1345,7 +1350,7 @@ impl<'a> Solver<'a> {
                 let n = &self.nodes[i];
                 let so = self.soff[i] as usize;
                 let cur = &strat[so..];
-                if mode == Back::Regret {
+                if mode != Back::Value {
                     self.inst[so..so + nc * na].fill(0.0);
                 }
                 // Children are built after their parent, so the parent's value
@@ -1370,7 +1375,13 @@ impl<'a> Solver<'a> {
                                 vi[c] += av * cur[c * na + a];
                             }
                             Back::Value => vi[c] += av * cur[c * na + a],
-                            Back::BestResponse => vi[c] = vi[c].max(av),
+                            // Records the regret too: `warm_start` wants the
+                            // regrets a best response leaves, and nothing else
+                            // reads `inst` until the next traversal fills it.
+                            Back::BestResponse => {
+                                self.inst[so + c * na + a] += av;
+                                vi[c] = vi[c].max(av);
+                            }
                         }
                     }
                 }
@@ -1389,6 +1400,12 @@ impl<'a> Solver<'a> {
                         for c in 0..nc {
                             if vi[c] == f32::NEG_INFINITY {
                                 vi[c] = 0.0;
+                            }
+                            let base = vi[c];
+                            for a in 0..na {
+                                if n.legal[c * na + a] {
+                                    self.inst[so + c * na + a] -= base;
+                                }
                             }
                         }
                     }
@@ -1620,6 +1637,174 @@ impl<'a> Solver<'a> {
             out.push(pair);
         }
         out
+    }
+
+    /// Seed the solve from the policy head instead of from a uniform strategy,
+    /// as ReBeL's Appendix J does (after Brown & Sandholm 2016): take the
+    /// policy, compute an exact best response to it, and start CFR as though
+    /// that policy had already been played for `weight` iterations.
+    ///
+    /// The best response is the pass `nash_conv` already needs, run with regret
+    /// recording on, so nothing new is computed — the regrets it leaves are the
+    /// ones CFR would have accumulated against the policy, and scaling them is
+    /// the whole of the warm start.
+    ///
+    /// This is not a handcrafted prior. It is the network's own summary of what
+    /// the solves before it converged to, and `nash_conv` measures what it does
+    /// to the answer with no noise in the measurement.
+    pub fn warm_start(&mut self, weight: f32) {
+        if weight <= 0.0 || self.nets.value.is_empty() {
+            return;
+        }
+        self.ensure_leaf_batch();
+        if !self.policy_into_cur() {
+            return;
+        }
+        self.precompute_reaches();
+        for p in 0..2usize {
+            self.leaf_values(p);
+            let cur = std::mem::take(&mut self.cur);
+            self.backprop(p, &cur, Back::BestResponse);
+            self.cur = cur;
+            for i in 0..self.nodes.len() {
+                let n = &self.nodes[i];
+                if n.leaf || n.chance || n.player as usize != p {
+                    continue;
+                }
+                let (na, nc) = (n.na(), n.nc(p));
+                let so = self.soff[i] as usize;
+                for j in 0..nc * na {
+                    self.regret[so + j] = weight * self.inst[so + j];
+                }
+                // The average strategy starts as though the policy had been
+                // played for those iterations, which is what makes the seeded
+                // regrets and the average consistent with each other.
+                let r: Vec<f32> = self.reach_of(i, p).to_vec();
+                for c in 0..nc {
+                    for a in 0..na {
+                        self.sum_strat[i][c * na + a] = weight * r[c] * self.cur[so + c * na + a];
+                    }
+                }
+            }
+            self.steps[p] = weight as usize;
+        }
+        // The iterate-0 snapshot was taken from the uniform strategy in `new`;
+        // the solve now starts somewhere else, so it is retaken.
+        self.recompute_avg();
+        self.snaps.clear();
+        self.snap_t = 0;
+        self.snapshot();
+    }
+
+    /// Write the policy head's distribution into `cur` at every decision node.
+    /// Returns false if the network has no usable policy.
+    fn policy_into_cur(&mut self) -> bool {
+        let net = &self.nets.value;
+        let inner: Vec<usize> = (0..self.nodes.len())
+            .filter(|&i| !self.nodes[i].leaf && !self.nodes[i].chance)
+            .collect();
+        if inner.is_empty() {
+            return false;
+        }
+        // A depth-2 tree has a couple of dozen decision nodes against several
+        // hundred leaves, so encoding them costs a few percent of the batch the
+        // solve already builds.
+        let (mut xpub, mut phi, mut coff) = (Vec::new(), Vec::new(), vec![0u32]);
+        for &i in &inner {
+            let at = xpub.len();
+            xpub.resize(at + PUBFEAT, 0.0);
+            write_public_features(&self.nodes[i].s, self.ctx, &mut xpub[at..at + PUBFEAT]);
+            for p in 0..2usize {
+                let res = reserve(&self.nodes[i].s, p as u8, self.ctx);
+                for c in self.nodes[i].cfgs[p].iter() {
+                    let at = phi.len();
+                    phi.resize(at + CFEAT, 0.0);
+                    write_config_feats(c, &res, p, &mut phi[at..at + CFEAT]);
+                }
+                coff.push((phi.len() / CFEAT) as u32);
+            }
+        }
+        let rows = inner.len();
+        let (dg, mut z, mut g, mut sb, mut pre) =
+            (net.dg(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        net.embed(&phi, phi.len() / CFEAT, &self.ce, &mut z, &mut g);
+        net.trunk(&xpub, rows, PUBFEAT, &self.ce, &mut sb, &mut pre);
+
+        let (mut q, mut logit, mut w) = (Vec::new(), Vec::new(), Vec::new());
+        let mut psi = Vec::new();
+        let mut xbel = vec![0.0f32; 2 * dg];
+        for (r, &i) in inner.iter().enumerate() {
+            let (na, me) = (self.nodes[i].na(), self.nodes[i].player as usize);
+            // The belief the head reads is the normalised reach, as everywhere
+            // else. At this point the reaches are the uniform ones `new` left.
+            xbel.iter_mut().for_each(|x| *x = 0.0);
+            for p in 0..2usize {
+                let (lo, hi) = (coff[2 * r + p] as usize, coff[2 * r + p + 1] as usize);
+                w.resize(hi - lo, 0.0);
+                normalize_weights(self.reach_of(i, p), &mut w);
+                let idx: Vec<u32> = (lo as u32..hi as u32).collect();
+                crate::net::accumulate(&z, &idx, &w, dg, &mut xbel[p * dg..(p + 1) * dg]);
+            }
+            psi.resize(na * AFEAT, 0.0);
+            for a in 0..na {
+                let n = &self.nodes[i];
+                write_action_feats(&n.acts[a], self.ctx, me, n.aslot[a], n.fdown[a],
+                                   &mut psi[a * AFEAT..(a + 1) * AFEAT]);
+            }
+            net.embed_actions(&psi, na, &self.ce, &mut q);
+            let (lo, hi) = (coff[2 * r + me] as usize, coff[2 * r + me + 1] as usize);
+            let idx: Vec<u32> = (lo as u32..hi as u32).collect();
+            logit.resize(idx.len() * na, 0.0);
+            net.policy(&xbel, &pre[r * net.hidden()..], &z, &idx, &q, na, &mut sb, &mut logit);
+            // Softmax over the *legal* actions of each config, with the same
+            // floor regret matching uses, so every legal action keeps positive
+            // probability and the carried beliefs keep full support.
+            let so = self.soff[i] as usize;
+            let n = &self.nodes[i];
+            for c in 0..idx.len() {
+                let row = &logit[c * na..(c + 1) * na];
+                let m = (0..na)
+                    .filter(|&a| n.legal[c * na + a])
+                    .fold(f32::NEG_INFINITY, |m, a| m.max(row[a]));
+                let mut sum = 0.0;
+                for a in 0..na {
+                    let v = if n.legal[c * na + a] { (row[a] - m).exp() } else { 0.0 };
+                    self.cur[so + c * na + a] = v;
+                    sum += v;
+                }
+                if sum > 0.0 {
+                    for a in 0..na {
+                        let x = &mut self.cur[so + c * na + a];
+                        *x = (*x / sum).max(if n.legal[c * na + a] { 1e-6 } else { 0.0 });
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Rebuild `avg` from `sum_strat`, normalised per config.
+    fn recompute_avg(&mut self) {
+        for i in 0..self.nodes.len() {
+            let n = &self.nodes[i];
+            if n.leaf || n.chance {
+                continue;
+            }
+            let (na, nc) = (n.na(), n.nc(n.player as usize));
+            for c in 0..nc {
+                let sum: f32 = self.sum_strat[i][c * na..(c + 1) * na].iter().sum();
+                let k = (0..na).filter(|&a| n.legal[c * na + a]).count().max(1) as f32;
+                for a in 0..na {
+                    self.avg[i][c * na + a] = if sum > 0.0 {
+                        self.sum_strat[i][c * na + a] / sum
+                    } else if n.legal[c * na + a] {
+                        1.0 / k
+                    } else {
+                        0.0
+                    };
+                }
+            }
+        }
     }
 
     /// The CFR average strategy: the approximate equilibrium of the subgame.
