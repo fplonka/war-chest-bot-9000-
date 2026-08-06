@@ -411,6 +411,12 @@ def main():
     # *solved* subgame, and at T=16 they are the values of a subgame we stopped
     # solving early. 64 costs roughly 2.5x the generation rate of 16.
     ap.add_argument("--iters", type=int, default=64)
+    ap.add_argument("--cfr", default="linear",
+                    help="the regret rule: linear, plus, dcfr, pcfr, sapcfr. "
+                         "See docs/REBEL.md; they are one formula with four numbers.")
+    ap.add_argument("--warm", type=float, default=0.0,
+                    help="iterations the policy head's strategy is worth when a solve "
+                         "is seeded from it. 0 starts uniform.")
     ap.add_argument("--explore", type=float, default=0.25)
     ap.add_argument("--temp", type=float, default=2.0)
     ap.add_argument("--eval-mix", type=float, default=0.5)
@@ -552,7 +558,7 @@ def main():
         else:
             d = warchest.gen_data(args.rebel_games, args.seed * 1_000_003 + epoch, "rebel",
                                   depth=args.depth, iters=args.iters, explore=args.explore,
-                                  mc_mix=args.mc_mix, **kw)
+                                  mc_mix=args.mc_mix, cfr=args.cfr, warm=args.warm, **kw)
         gen_s = time.time() - tg
         # Utilities live in [-1, 1]; so does the true value function, so clip
         # the bootstrapped targets to that range.
