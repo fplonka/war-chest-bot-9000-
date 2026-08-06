@@ -5,17 +5,22 @@
 
 ## Measurements waiting on the machine
 
-- [ ] **D0.** Ladder 3a (`t64_turbo_s14`) against 3b (`t512_turbo_s15`) to price
-      T=512 in Elo at equal wall-clock, and DCFR against linear at equal
-      wall-clock. Together they set the target T, which decides whether the GPU
-      work package happens at all.
+- [x] **D0, half of it.** T=512 lost ~270 Elo to T=64 at equal wall-clock even
+      with turbo removing the data cost (`8121f3c`). Data volume beats target
+      quality at this scale; T=64 stays the default. Two consequences: the GPU
+      work package exists to pay for large T and no longer has a reason to,
+      and every "reach a given solve quality in fewer iterations" argument is
+      worth much less than it looked.
 - [ ] **The regret rule.** `examples/solvererr.rs` on a trained net, ~9 min for
       100 positions. Preliminary on 10 positions: DCFR at T=64 reaches the
-      NashConv linear needs T=512 for. Then one confirming run.
+      NashConv linear needs T=512 for. Read against D0 this is no longer a way
+      to lower T — T is already low — but it is free accuracy at the T we run,
+      so it is still worth a confirming gate.
 - [ ] **A4.** Whether the warm start pays. `solvererr <weights> <n> <depth>
       <play> <skip> <warm>` reports every rule cold and warm; adopt only if warm
       at T/2 beats cold at T. Needs a checkpoint whose policy head is actually
-      trained.
+      trained. D0 lowers the prior on this: if solve quality is not the binding
+      constraint, arriving at it sooner buys little.
 - [ ] **A2 offline.** Fit the card-describer network against a fixed-draft one on
       a **random-draft** dump. It deletes unit identity, which is a perfect
       feature on the starter matchup, so a fixed-draft dump would produce a
