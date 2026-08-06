@@ -1,0 +1,10 @@
+[ladder] 3 players, 3 pairings, 100 paired games each (depth=2 iters=256)
+          t64_h384_dg64_s11.s1 vs t256_h384_dg64_s12.s1        W  68 L  29 D   3  score 0.695
+          t64_h384_dg64_s11.s1 vs t64_h512_dg96_s13.s1         W  54 L  44 D   2  score 0.550
+         t256_h384_dg64_s12.s1 vs t64_h512_dg96_s13.s1         W  29 L  69 D   2  score 0.300
+
+=== Elo (runs/ladder_s1_t256, random = 0) ===
+                      player   trained     elo    +-   score
+        t64_h384_dg64_s11.s1   65.0min       0    26   0.623
+        t64_h512_dg96_s13.s1   65.4min     -23    25   0.575
+       t256_h384_dg64_s12.s1   65.8min    -155    27   0.302
