@@ -17,6 +17,7 @@ pub mod search;
 pub mod selfplay;
 pub mod state;
 pub mod units;
+pub mod v1;
 
 pub use actions::Action;
 pub use state::{State, BLACK, WHITE};

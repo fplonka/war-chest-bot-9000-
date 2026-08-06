@@ -38,13 +38,13 @@
 //!    belief update sums over the private actions consistent with what was seen.
 
 use crate::actions::Action;
-use crate::{shape, timed};
-use std::rc::Rc;
 use crate::board::NONE;
 use crate::net::Mlp;
 use crate::rebel::*;
 use crate::state::{Cont, State};
 use crate::units::{ENSIGN, MARSHAL, ROYAL_COIN};
+use crate::{shape, timed};
+use std::rc::Rc;
 
 #[derive(Clone, Copy)]
 pub struct Cfg {
@@ -106,11 +106,36 @@ pub struct Cfr {
 }
 
 impl Cfr {
-    pub const LINEAR: Cfr = Cfr { alpha: 1.0, beta: 1.0, gamma: 1.0, predict: 0.0 };
-    pub const PLUS: Cfr = Cfr { alpha: f32::INFINITY, beta: f32::NEG_INFINITY, gamma: 2.0, predict: 0.0 };
-    pub const DISCOUNTED: Cfr = Cfr { alpha: 1.5, beta: 0.0, gamma: 2.0, predict: 0.0 };
-    pub const PREDICTIVE: Cfr = Cfr { alpha: f32::INFINITY, beta: f32::NEG_INFINITY, gamma: 2.0, predict: 1.0 };
-    pub const SIMPLE_ASYM: Cfr = Cfr { alpha: f32::INFINITY, beta: f32::NEG_INFINITY, gamma: 2.0, predict: 1.0 / 3.0 };
+    pub const LINEAR: Cfr = Cfr {
+        alpha: 1.0,
+        beta: 1.0,
+        gamma: 1.0,
+        predict: 0.0,
+    };
+    pub const PLUS: Cfr = Cfr {
+        alpha: f32::INFINITY,
+        beta: f32::NEG_INFINITY,
+        gamma: 2.0,
+        predict: 0.0,
+    };
+    pub const DISCOUNTED: Cfr = Cfr {
+        alpha: 1.5,
+        beta: 0.0,
+        gamma: 2.0,
+        predict: 0.0,
+    };
+    pub const PREDICTIVE: Cfr = Cfr {
+        alpha: f32::INFINITY,
+        beta: f32::NEG_INFINITY,
+        gamma: 2.0,
+        predict: 1.0,
+    };
+    pub const SIMPLE_ASYM: Cfr = Cfr {
+        alpha: f32::INFINITY,
+        beta: f32::NEG_INFINITY,
+        gamma: 2.0,
+        predict: 1.0 / 3.0,
+    };
 
     /// The five named variants, for the tools that sweep them.
     pub const NAMED: [(&'static str, Cfr); 5] = [
@@ -251,9 +276,7 @@ pub fn node_actions(
                 } else {
                     ctx.slot_of[player as usize][coin as usize]
                 };
-                if slot >= 0
-                    && !cfgs.is_empty()
-                    && !cfgs.iter().any(|c| c.hand[slot as usize] > 0)
+                if slot >= 0 && !cfgs.is_empty() && !cfgs.iter().any(|c| c.hand[slot as usize] > 0)
                 {
                     continue;
                 }
@@ -476,7 +499,11 @@ pub struct Solver<'a> {
     ce: Vec<f32>,
     /// `rows * hidden`: the public half of the hidden layer.
     h0: Vec<f32>,
-    /// `rows * PUBFEAT`: the public encoding, filled during the build.
+    /// Width of one public row: the *net's*, not the current encoding's. A
+    /// pre-describer checkpoint reads a 972-wide row written by `v1`'s frozen
+    /// encoder, so that a gate can play the new architecture against the pool.
+    pubfeat: usize,
+    /// `rows * pubfeat`: the public encoding, filled during the build.
     xpub: Vec<f32>,
     /// `rows * 2 * dg`: both players' belief embeddings.
     xb: Vec<f32>,
@@ -557,6 +584,7 @@ impl<'a> Solver<'a> {
             cz: take_buf(R_CZ),
             cg: take_buf(R_CG),
             ce: Vec::new(),
+            pubfeat: if nets.value.is_empty() { PUBFEAT } else { nets.value.pub_dim() },
             h0: take_buf(R_H0),
             xpub: take_buf(R_XPUB),
             xb: take_buf(R_XB0),
@@ -760,7 +788,8 @@ impl<'a> Solver<'a> {
                 if steps == 0 {
                     std::mem::swap(&mut draw, &mut step);
                 } else {
-                    self.draw_scratch.compose(&draw, &step, next.len(), &mut acc);
+                    self.draw_scratch
+                        .compose(&draw, &step, next.len(), &mut acc);
                     std::mem::swap(&mut draw, &mut acc);
                 }
                 std::mem::swap(&mut cur, &mut next);
@@ -794,7 +823,10 @@ impl<'a> Solver<'a> {
         let na = acts.len();
         debug_assert!(na > 0, "a decision node must offer a reachable action");
 
-        assert!(nc * na < 1 << IDX_BITS, "decision node over the index width");
+        assert!(
+            nc * na < 1 << IDX_BITS,
+            "decision node over the index width"
+        );
         let mut legal = vec![false; nc * na];
         for (ci, c) in mine.iter().enumerate() {
             for a in 0..na {
@@ -931,10 +963,7 @@ impl<'a> Solver<'a> {
     /// heap allocations per node per pass.
     fn precompute_reaches(&mut self) {
         let cur = std::mem::take(&mut self.cur);
-        let root = [
-            self.root_belief[0].p.clone(),
-            self.root_belief[1].p.clone(),
-        ];
+        let root = [self.root_belief[0].p.clone(), self.root_belief[1].p.clone()];
         self.propagate(&cur, [&root[0], &root[1]]);
         self.cur = cur;
     }
@@ -959,10 +988,7 @@ impl<'a> Solver<'a> {
             let op = 1 - me;
             // Offsets of each player's block inside a node's reach region.
             let blk = |cnt: [u32; 2], p: usize| -> (usize, usize) {
-                (
-                    if p == 0 { 0 } else { cnt[0] as usize },
-                    cnt[p] as usize,
-                )
+                (if p == 0 { 0 } else { cnt[0] as usize }, cnt[p] as usize)
             };
             let (pme, nme) = blk(self.nc[i], me);
             let (pop, nop) = blk(self.nc[i], op);
@@ -1030,6 +1056,17 @@ impl<'a> Solver<'a> {
         &self.reach[at..at + self.nc[i][p] as usize]
     }
 
+    /// One public row, in whichever encoding this solve's network was trained
+    /// with.
+    fn encode(&mut self, s: &State, at: usize) {
+        let pf = self.pubfeat;
+        if self.nets.value.v1() {
+            crate::v1::write_public_features_v1(s, self.ctx, &mut self.xpub[at..at + pf]);
+        } else {
+            write_public_features(s, self.ctx, &mut self.xpub[at..at + pf]);
+        }
+    }
+
     /// Record a leaf in the network batch. Called from `build`, while the
     /// leaf's state is still the one just constructed and therefore still in
     /// cache — walking the finished node array to do this instead meant
@@ -1040,13 +1077,14 @@ impl<'a> Solver<'a> {
             self.term_leaves.push(id);
             return;
         }
-        let at = self.leaf_rows.len() * PUBFEAT;
-        if self.xpub.len() < at + PUBFEAT {
+        let pf = self.pubfeat;
+        let at = self.leaf_rows.len() * pf;
+        if self.xpub.len() < at + pf {
             // Grow in chunks so the zero-fill happens a handful of times per
             // solve, and not at all once the pooled buffer is warm.
-            self.xpub.resize(at + 64 * PUBFEAT, 0.0);
+            self.xpub.resize(at + 64 * pf, 0.0);
         }
-        write_public_features(s, self.ctx, &mut self.xpub[at..at + PUBFEAT]);
+        self.encode(s, at);
         for p in 0..2 {
             let res = reserve(s, p as u8, self.ctx);
             self.leaf_coff.push(self.leaf_cidx.len() as u32);
@@ -1104,7 +1142,7 @@ impl<'a> Solver<'a> {
             return;
         }
         let net = &self.nets.value;
-        debug_assert_eq!(net.pub_dim(), PUBFEAT);
+        debug_assert_eq!(net.pub_dim(), self.pubfeat);
         debug_assert_eq!(net.cfeat(), CFEAT);
         if self.xb.len() < rows * net.belief_dim() {
             self.xb.resize(rows * net.belief_dim(), 0.0);
@@ -1116,12 +1154,18 @@ impl<'a> Solver<'a> {
         // downstream — the hex block, the pile summary, the holding tower, the
         // action tower — reads a row of it by coin-type index.
         if rows > 0 {
-            net.cards(&xpub[..PUBFEAT], &mut self.ce);
+            net.cards(&xpub[..self.pubfeat], &mut self.ce);
         }
-        net.trunk(&xpub, rows, PUBFEAT, &self.ce, &mut self.sb, &mut self.h0);
+        net.trunk(&xpub, rows, self.pubfeat, &self.ce, &mut self.sb, &mut self.h0);
         self.xpub = xpub;
         let cphi = std::mem::take(&mut self.cphi);
-        net.embed(&cphi[..self.ncfg * CFEAT], self.ncfg, &self.ce, &mut self.cz, &mut self.cg);
+        net.embed(
+            &cphi[..self.ncfg * CFEAT],
+            self.ncfg,
+            &self.ce,
+            &mut self.cz,
+            &mut self.cg,
+        );
         self.cphi = cphi;
     }
 
@@ -1179,7 +1223,13 @@ impl<'a> Solver<'a> {
         if !empty {
             let _t = timed!(NET);
             let net = &self.nets.value;
-            net.pbs_head(&self.xb[..rows * 2 * dg], rows, &self.h0, &mut self.sb, &mut self.ob);
+            net.pbs_head(
+                &self.xb[..rows * 2 * dg],
+                rows,
+                &self.h0,
+                &mut self.sb,
+                &mut self.ob,
+            );
         }
         self.readout(traverser);
     }
@@ -1219,18 +1269,18 @@ impl<'a> Solver<'a> {
                 normalize_weights(&reach[ra..ra + n], &mut wbuf[..n]);
                 let at = r * 2 * dg + p * dg;
                 let cs = coff[2 * r + p] as usize;
-                crate::net::accumulate(
-                    cz,
-                    &cidx[cs..cs + n],
-                    &wbuf[..n],
-                    dg,
-                    &mut xb[at..at + dg],
-                );
+                crate::net::accumulate(cz, &cidx[cs..cs + n], &wbuf[..n], dg, &mut xb[at..at + dg]);
             }
         }
         let _t = timed!(NET);
         let net = &self.nets.value;
-        net.pbs_head(&self.xb[..rows * 2 * dg], rows, &self.h0, &mut self.sb, &mut self.ob);
+        net.pbs_head(
+            &self.xb[..rows * 2 * dg],
+            rows,
+            &self.h0,
+            &mut self.sb,
+            &mut self.ob,
+        );
     }
 
     /// Per-config leaf values for player `p` — counterfactual: the network's
@@ -1350,7 +1400,7 @@ impl<'a> Solver<'a> {
                 let n = &self.nodes[i];
                 let so = self.soff[i] as usize;
                 let cur = &strat[so..];
-                if mode != Back::Value {
+                if mode == Back::Regret {
                     self.inst[so..so + nc * na].fill(0.0);
                 }
                 // Children are built after their parent, so the parent's value
@@ -1375,13 +1425,7 @@ impl<'a> Solver<'a> {
                                 vi[c] += av * cur[c * na + a];
                             }
                             Back::Value => vi[c] += av * cur[c * na + a],
-                            // Records the regret too: `warm_start` wants the
-                            // regrets a best response leaves, and nothing else
-                            // reads `inst` until the next traversal fills it.
-                            Back::BestResponse => {
-                                self.inst[so + c * na + a] += av;
-                                vi[c] = vi[c].max(av);
-                            }
+                            Back::BestResponse => vi[c] = vi[c].max(av),
                         }
                     }
                 }
@@ -1400,12 +1444,6 @@ impl<'a> Solver<'a> {
                         for c in 0..nc {
                             if vi[c] == f32::NEG_INFINITY {
                                 vi[c] = 0.0;
-                            }
-                            let base = vi[c];
-                            for a in 0..na {
-                                if n.legal[c * na + a] {
-                                    self.inst[so + c * na + a] -= base;
-                                }
                             }
                         }
                     }
@@ -1562,10 +1600,7 @@ impl<'a> Solver<'a> {
     /// the exploitability of War Chest and must not be reported as if it were.
     pub fn nash_conv(&mut self) -> Conv {
         let reference = self.reference();
-        let root = [
-            self.root_belief[0].p.clone(),
-            self.root_belief[1].p.clone(),
-        ];
+        let root = [self.root_belief[0].p.clone(), self.root_belief[1].p.clone()];
         self.propagate(&reference, [&root[0], &root[1]]);
         self.leaf_values_both();
         let (mut nash, mut zero_sum) = (0.0, 0.0);
@@ -1575,9 +1610,7 @@ impl<'a> Solver<'a> {
             self.readout(p);
             let vo = self.voff[0] as usize;
             let nc = self.nc[0][p] as usize;
-            let expect = |v: &[f32]| -> f32 {
-                (0..nc).map(|c| root[p][c] * v[vo + c]).sum()
-            };
+            let expect = |v: &[f32]| -> f32 { (0..nc).map(|c| root[p][c] * v[vo + c]).sum() };
             self.backprop(p, &reference, Back::Value);
             let v = expect(&self.vals);
             self.backprop(p, &reference, Back::BestResponse);
@@ -1616,10 +1649,7 @@ impl<'a> Solver<'a> {
     /// as the node's own — the caller asserts that against the live belief
     /// before consuming the set.
     pub fn carried_beliefs(&mut self, leaf: usize) -> Vec<[Vec<f32>; 2]> {
-        let root = [
-            self.root_belief[0].p.clone(),
-            self.root_belief[1].p.clone(),
-        ];
+        let root = [self.root_belief[0].p.clone(), self.root_belief[1].p.clone()];
         let n = self.snaps.len().saturating_sub(1);
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
@@ -1627,8 +1657,8 @@ impl<'a> Solver<'a> {
             self.propagate(&snap, [&root[0], &root[1]]);
             let mut pair = [Vec::new(), Vec::new()];
             for p in 0..2usize {
-                let ra = self.roff[leaf] as usize
-                    + if p == 1 { self.nc[leaf][0] as usize } else { 0 };
+                let ra =
+                    self.roff[leaf] as usize + if p == 1 { self.nc[leaf][0] as usize } else { 0 };
                 let n = self.nc[leaf][p] as usize;
                 let mut w = vec![0.0; n];
                 normalize_weights(&self.reach[ra..ra + n], &mut w);
@@ -1639,15 +1669,18 @@ impl<'a> Solver<'a> {
         out
     }
 
-    /// Seed the solve from the policy head instead of from a uniform strategy,
-    /// as ReBeL's Appendix J does (after Brown & Sandholm 2016): take the
-    /// policy, compute an exact best response to it, and start CFR as though
-    /// that policy had already been played for `weight` iterations.
+    /// Seed the solve from the policy head instead of from a uniform strategy:
+    /// start CFR as though the policy had already been played for `weight`
+    /// iterations. One CFR traversal under the policy gives the instantaneous
+    /// regret it accrues, `r(a) = v(a) - sum_a pi(a) v(a)`; scaling that by
+    /// `weight` is the whole of the warm start, and seeding the average
+    /// strategy the same way is what keeps the two consistent.
     ///
-    /// The best response is the pass `nash_conv` already needs, run with regret
-    /// recording on, so nothing new is computed — the regrets it leaves are the
-    /// ones CFR would have accumulated against the policy, and scaling them is
-    /// the whole of the warm start.
+    /// The baseline has to be the value of *playing the policy*. An earlier
+    /// version used the best-response value, `v(a) - max_a v(a)`, which is
+    /// non-positive everywhere and zero at the best action — so regret matching
+    /// clamped every action to the floor and handed back a uniform strategy,
+    /// destroying exactly the information the seed exists to inject.
     ///
     /// This is not a handcrafted prior. It is the network's own summary of what
     /// the solves before it converged to, and `nash_conv` measures what it does
@@ -1664,7 +1697,7 @@ impl<'a> Solver<'a> {
         for p in 0..2usize {
             self.leaf_values(p);
             let cur = std::mem::take(&mut self.cur);
-            self.backprop(p, &cur, Back::BestResponse);
+            self.backprop(p, &cur, Back::Regret);
             self.cur = cur;
             for i in 0..self.nodes.len() {
                 let n = &self.nodes[i];
@@ -1712,8 +1745,13 @@ impl<'a> Solver<'a> {
         let (mut xpub, mut phi, mut coff) = (Vec::new(), Vec::new(), vec![0u32]);
         for &i in &inner {
             let at = xpub.len();
-            xpub.resize(at + PUBFEAT, 0.0);
-            write_public_features(&self.nodes[i].s, self.ctx, &mut xpub[at..at + PUBFEAT]);
+            xpub.resize(at + self.pubfeat, 0.0);
+            let (st, pf) = (self.nodes[i].s, self.pubfeat);
+            if self.nets.value.v1() {
+                crate::v1::write_public_features_v1(&st, self.ctx, &mut xpub[at..at + pf]);
+            } else {
+                write_public_features(&st, self.ctx, &mut xpub[at..at + pf]);
+            }
             for p in 0..2usize {
                 let res = reserve(&self.nodes[i].s, p as u8, self.ctx);
                 for c in self.nodes[i].cfgs[p].iter() {
@@ -1728,7 +1766,7 @@ impl<'a> Solver<'a> {
         let (dg, mut z, mut g, mut sb, mut pre) =
             (net.dg(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         net.embed(&phi, phi.len() / CFEAT, &self.ce, &mut z, &mut g);
-        net.trunk(&xpub, rows, PUBFEAT, &self.ce, &mut sb, &mut pre);
+        net.trunk(&xpub, rows, self.pubfeat, &self.ce, &mut sb, &mut pre);
 
         let (mut q, mut logit, mut w) = (Vec::new(), Vec::new(), Vec::new());
         let mut psi = Vec::new();
@@ -1748,14 +1786,29 @@ impl<'a> Solver<'a> {
             psi.resize(na * AFEAT, 0.0);
             for a in 0..na {
                 let n = &self.nodes[i];
-                write_action_feats(&n.acts[a], self.ctx, me, n.aslot[a], n.fdown[a],
-                                   &mut psi[a * AFEAT..(a + 1) * AFEAT]);
+                write_action_feats(
+                    &n.acts[a],
+                    self.ctx,
+                    me,
+                    n.aslot[a],
+                    n.fdown[a],
+                    &mut psi[a * AFEAT..(a + 1) * AFEAT],
+                );
             }
             net.embed_actions(&psi, na, &self.ce, &mut q);
             let (lo, hi) = (coff[2 * r + me] as usize, coff[2 * r + me + 1] as usize);
             let idx: Vec<u32> = (lo as u32..hi as u32).collect();
             logit.resize(idx.len() * na, 0.0);
-            net.policy(&xbel, &pre[r * net.hidden()..], &z, &idx, &q, na, &mut sb, &mut logit);
+            net.policy(
+                &xbel,
+                &pre[r * net.hidden()..],
+                &z,
+                &idx,
+                &q,
+                na,
+                &mut sb,
+                &mut logit,
+            );
             // Softmax over the *legal* actions of each config, with the same
             // floor regret matching uses, so every legal action keeps positive
             // probability and the carried beliefs keep full support.
@@ -1768,7 +1821,11 @@ impl<'a> Solver<'a> {
                     .fold(f32::NEG_INFINITY, |m, a| m.max(row[a]));
                 let mut sum = 0.0;
                 for a in 0..na {
-                    let v = if n.legal[c * na + a] { (row[a] - m).exp() } else { 0.0 };
+                    let v = if n.legal[c * na + a] {
+                        (row[a] - m).exp()
+                    } else {
+                        0.0
+                    };
                     self.cur[so + c * na + a] = v;
                     sum += v;
                 }

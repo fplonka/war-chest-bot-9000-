@@ -259,25 +259,48 @@ board three rounds later, whether initiative changes hands next round, and the
 result as three classes. Backfilled from a per-round timeline the game records as
 it runs. They are dense — every row gets a different answer, unlike the single
 value number — and they are never in `flat()`, so the Rust play path never sees
-them and they cost nothing at inference. `--aux`, default 0.1.
+them and they cost nothing at inference. `--aux`, default 0 until gated.
 
 ### Warm start
 
 `Solver::warm_start` seeds a solve from the policy head instead of from a uniform
-strategy, as ReBeL's Appendix J does (after Brown & Sandholm 2016): take the
-policy, compute an exact best response to it, and start CFR as though that policy
-had been played for `--warm` iterations. The best response is the pass
-`nash_conv` already needs with regret recording on, so nothing new is computed.
+strategy: start CFR as though the policy had already been played for `--warm`
+iterations. One traversal under the policy gives the instantaneous regret it
+accrues, `r(a) = v(a) − Σ_a π(a) v(a)`; scaling that by the weight is the whole
+of it, and seeding the average strategy the same way keeps the two consistent.
+
+The baseline has to be the value of *playing the policy*. Using the
+best-response value instead — `v(a) − max_a v(a)` — is non-positive everywhere
+and zero at the best action, so regret matching clamps every action to the floor
+and hands back a uniform strategy, destroying exactly what the seed exists to
+inject.
 
 `a_warm_start_does_not_move_the_fixed_point` pins the property that matters: the
 subgame's value is unique, so a warm-started solve and a cold one must agree once
 both converge. A seed that changed the answer would be biasing it rather than
 accelerating it, and a strength gate could not tell those apart.
 
-Default 0 — off — until the measurement says otherwise. `examples/solvererr.rs`
-takes a warm-start weight as its sixth argument and then reports every regret
-rule cold and warm side by side; the decision rule is whether warm at `T/2` beats
-cold at `T`.
+Default 0 — off. `examples/solvererr.rs` takes a warm-start weight as its sixth
+argument and reports every regret rule cold and warm side by side; the decision
+rule is whether warm at `T/2` beats cold at `T`.
+
+Measured so far, on a head with 2.5 minutes of training: warm is worse than cold
+at every rung, monotonically in the seed weight, and converges to the same place.
+That is what a *correct* seed carrying a *weak* policy looks like — this head is
+worth less than four CFR iterations, so injecting it as fifteen costs accuracy.
+A4 is blocked on a policy head worth more than that.
+
+### The pre-describer encoder
+
+`engine/src/v1.rs` and `train/value_net_v1.py` are the encoding and network a
+checkpoint from before the card describer was trained with, frozen and
+eval-only. Keyed off `dims` (five entries against the current eight); a solve
+takes its encoder from the net it was handed rather than from a constant.
+
+They exist for one reason: the describer changed the public encoding's width, and
+a gate that cannot play the new architecture against the pool cannot answer the
+only question a gate is for. Nothing here is maintained or extended — delete both
+when the pool has rotated past every checkpoint that needs them.
 
 ### What is cached
 
@@ -317,8 +340,9 @@ the end of this phase is snapshot 0, labelled `init`.
 **Phase 2 — ReBeL.** Self-play with a CFR solve at every decision. Default
 `--iters 64`, `--depth 2`.
 
-**The policy head** is trained on the fresh epoch only, never from the replay
-buffer (`--policy`, default 0.1). A value target is bootstrapped and gains from
+**The policy head** (`--policy`, default 0 — it trains the shared trunk, so it
+changes the value network and has to be gated as its own change) is trained on
+the fresh epoch only, never from the replay buffer. A value target is bootstrapped and gains from
 being averaged over a long history; a strategy is not, and the epoch regenerates
 every one of them. Its label attaches to the solve's **live-belief row** — the
 rows of one solve share a public state and differ only in belief, while the

@@ -419,6 +419,55 @@ fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
     Belief { p: vec![1.0 / n; cfgs.len()], cfg: cfgs }
 }
 
+/// A pre-describer checkpoint must still be able to play.
+///
+/// The card describer changed the public encoding's width and layout. If the
+/// pool cannot be loaded and played, no gate can ask whether the new
+/// architecture is better than what came before — which is the only question a
+/// gate exists to answer. So the old encoder and the old towers stay, keyed off
+/// the checkpoint's `dims`, and a solve picks its encoder from the net it was
+/// handed rather than from a constant.
+#[test]
+fn a_pre_describer_checkpoint_still_solves() {
+    let (hidden, dg, rank) = (64usize, 16usize, 16usize);
+    let mut r = Rng::new(3);
+    let dims = [warchest::v1::PUBFEAT_V1, hidden, CFEAT, dg, rank];
+    let nw = dims[0] * hidden + hidden * hidden + 2 * dg * hidden + CFEAT * dg
+        + dg * (rank + 1) + hidden * rank;
+    let mut draw = |n: usize| -> Vec<f32> {
+        (0..n).map(|_| (r.unit_f64() as f32 - 0.5) * 0.2).collect()
+    };
+    let w = draw(nw);
+    let b = draw(hidden + hidden + dg + (rank + 1) + rank);
+    let mut ln = Vec::new();
+    for _ in 0..2 {
+        ln.extend(std::iter::repeat(1.0).take(hidden));
+        ln.extend(std::iter::repeat(0.0).take(hidden));
+    }
+    let net = Mlp::from_flat(&dims, &w, &b, &ln).expect("v1 net");
+    assert!(net.v1() && net.pub_dim() == warchest::v1::PUBFEAT_V1);
+
+    let nets = Nets { value: net };
+    let mut rng = Rng::new(11);
+    let mut s = make_game(&mut rng, false);
+    for _ in 0..60 {
+        if s.is_terminal() || s.is_chance() {
+            break;
+        }
+        let acts = s.legal_actions();
+        s.apply_inplace(acts[rng.below(acts.len())]);
+    }
+    let ctx = Ctx::new(&s);
+    let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
+    let cfg = Cfg { depth: 2, iters: 32, snapshots: true, ..Default::default() };
+    let mut sv = Solver::new(&s, &ctx, &nets, cfg, bel.clone());
+    sv.multistep(cfg.iters);
+    let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
+    assert!(vals[0][0].iter().all(|v| v.is_finite()), "v1 solve produced non-finite values");
+    assert!(vals[0][0].iter().any(|v| *v != 0.0), "v1 solve produced all zeros");
+    assert!(sv.nash_conv().nash > -1e-3, "v1 NashConv is negative");
+}
+
 /// A warm start must not move where the solve converges.
 ///
 /// Seeding CFR from the policy head changes the path, not the destination: the

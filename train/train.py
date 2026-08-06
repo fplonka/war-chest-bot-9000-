@@ -360,10 +360,10 @@ def main():
     ap.add_argument("--dg", type=int, default=64)
     # Rank of the value readout's inner product -- see `Mlp`.
     ap.add_argument("--rank", type=int, default=64)
-    ap.add_argument("--policy", type=float, default=0.1,
-                    help="weight on the policy head's loss. Its labels are free -- every\nsolve already computes the reference strategy -- and the head is what\na warm start and any action shortlist read. 0 disables.")
-    ap.add_argument("--aux", type=float, default=0.1,
-                    help="weight on the auxiliary heads' loss. They predict dense facts\nabout how the game went -- markers three rounds on, the initiative\nflip, the result -- so every row gives the shared trunk a gradient\nthe single value number does not. 0 disables them.")
+    ap.add_argument("--policy", type=float, default=0.0,
+                    help="weight on the policy head's loss. Its labels are free -- every\nsolve already computes the reference strategy -- and the head is what\na warm start and any action shortlist read. Off by default: it trains\nthe shared trunk, so it changes the value network and has to be gated\nas its own change.")
+    ap.add_argument("--aux", type=float, default=0.0,
+                    help="weight on the auxiliary heads' loss. They predict dense facts\nabout how the game went -- markers three rounds on, the initiative\nflip, the result -- so every row gives the shared trunk a gradient\nthe single value number does not. Off by default until gated.")
     ap.add_argument("--de", type=int, default=32,
                     help="width of a card embedding: what the describer summarises a\ncard's rulebook facts into, and what every part that names a card reads")
     # Arena size per row of replay capacity. Self-play carries ~24 configs a

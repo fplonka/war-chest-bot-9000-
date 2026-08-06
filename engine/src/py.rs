@@ -832,6 +832,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CFEAT", crate::rebel::CFEAT)?;
     m.add("AFEAT", crate::rebel::AFEAT)?;
     m.add("CCOUNTS", crate::rebel::CCOUNTS)?;
+    m.add("PUBFEAT_V1", crate::v1::PUBFEAT_V1)?;
     m.add("AUX", crate::selfplay::AUX)?;
     m.add("CNORM", crate::rebel::CNORM)?;
     m.add("N_HEXES", crate::board::N_HEXES)?;
@@ -856,6 +857,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("OFF_LOOSE", crate::rebel::OFF_LOOSE)?;
     m.add("AOFF_PAYS", crate::rebel::AOFF_PAYS)?;
     m.add("CCOUNTS", crate::rebel::CCOUNTS)?;
+    m.add("PUBFEAT_V1", crate::v1::PUBFEAT_V1)?;
     m.add("AUX", crate::selfplay::AUX)?;
     m.add_function(wrap_pyfunction!(infer_policy, m)?)?;
     m.add_function(wrap_pyfunction!(hex_neighborhood, m)?)?;

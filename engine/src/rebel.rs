@@ -681,7 +681,7 @@ pub fn obs_key(a: &Action) -> u32 {
 /// supply in the game (5 each) plus one Royal Coin. Every per-player coin count
 /// -- bag, hand, face-up, face-down -- is bounded by this, so it is the correct
 /// divisor for those features rather than an estimate.
-const MAX_COINS: f32 = 4.0 * 5.0 + 1.0;
+pub const MAX_COINS: f32 = 4.0 * 5.0 + 1.0;
 
 pub const PEND_KINDS: usize = 12;
 
@@ -735,9 +735,9 @@ pub const PUBFEAT: usize = OFF_LOOSE + LOOSE;
 /// drained reserve makes rounds short in coin plays and therefore numerous.
 /// The previous divisor of 40 left this feature pinned at 1.0 for most of
 /// essentially every game.
-const MAX_ROUND: f32 = 128.0;
+pub const MAX_ROUND: f32 = 128.0;
 
-fn pending_kind(s: &State) -> usize {
+pub fn pending_kind(s: &State) -> usize {
     match s.pending() {
         Cont::Draw { .. } => 0,
         Cont::MainPlay => 1,

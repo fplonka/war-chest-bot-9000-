@@ -49,8 +49,8 @@
 
 use crate::board::N_HEXES;
 use crate::rebel::{
-    CCOUNTS, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_CARDS, OFF_LOOSE, OFF_PILES, PILE_COUNTS,
-    PUBFEAT, AOFF_PAYS,
+    AOFF_PAYS, CCOUNTS, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_CARDS, OFF_LOOSE, OFF_PILES,
+    PILE_COUNTS, PUBFEAT,
 };
 use crate::units::CARD_FEATS;
 
@@ -232,7 +232,10 @@ fn scale_shift(row: &mut [f32], mean: f32, inv: f32, g: &[f32], bt: &[f32], floo
         while i + 8 <= n {
             let d0 = vmulq_f32(vsubq_f32(vld1q_f32(p.add(i)), m), sc);
             let d1 = vmulq_f32(vsubq_f32(vld1q_f32(p.add(i + 4)), m), sc);
-            let y0 = vmaxq_f32(vfmaq_f32(vld1q_f32(bp.add(i)), d0, vld1q_f32(gp.add(i))), lo);
+            let y0 = vmaxq_f32(
+                vfmaq_f32(vld1q_f32(bp.add(i)), d0, vld1q_f32(gp.add(i))),
+                lo,
+            );
             let y1 = vmaxq_f32(
                 vfmaq_f32(vld1q_f32(bp.add(i + 4)), d1, vld1q_f32(gp.add(i + 4))),
                 lo,
@@ -346,7 +349,6 @@ fn fit(v: &mut Vec<f32>, n: usize) {
     }
 }
 
-
 /// The value network. See the module docs for the shape; the field names here
 /// are the same symbols.
 ///
@@ -427,6 +429,11 @@ impl Mlp {
     /// `set_weights` and the `.bin` loader — so there is nowhere for the two to
     /// drift apart.
     pub fn from_flat(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Mlp, String> {
+        // A five-entry `dims` is a checkpoint from before the card describer.
+        // It is loadable so the pool can still be played against; see `v1`.
+        if dims.len() == 5 {
+            return Mlp::from_flat_v1(dims, w, b, ln);
+        }
         if dims.len() != 8 {
             return Err(format!(
                 "expected 8 dims [pub, hidden, cfeat, dg, rank, afeat, de, dc], got {dims:?}"
@@ -434,9 +441,18 @@ impl Mlp {
         }
         let (h, dg, rk, de, dc) = (dims[1], dims[3], dims[4], dims[6], dims[7]);
         let (af, hf, xd) = (dims[5] + de, HFEAT_OF(de), xdim_of(de));
-        let want_w = CARD_FEATS * dc + dc * de + (PILE_COUNTS + de) * de
-            + xd * h + h * h + 2 * dg * h + hf * dg + dg * (rk + 1) + h * rk
-            + af * rk + dg * rk + h * rk;
+        let want_w = CARD_FEATS * dc
+            + dc * de
+            + (PILE_COUNTS + de) * de
+            + xd * h
+            + h * h
+            + 2 * dg * h
+            + hf * dg
+            + dg * (rk + 1)
+            + h * rk
+            + af * rk
+            + dg * rk
+            + h * rk;
         let want_b = dc + de + de + h + h + dg + (rk + 1) + 4 * rk;
         let want_ln = 4 * h;
         if w.len() != want_w || b.len() != want_b || ln.len() != want_ln {
@@ -586,9 +602,63 @@ impl Mlp {
     pub fn de(&self) -> usize {
         self.dims[6]
     }
+    /// Whether this is a checkpoint from before the card describer, which reads
+    /// the frozen `v1` encoding and has no policy head.
+    pub fn v1(&self) -> bool {
+        self.dims.len() == 5
+    }
     /// Width of the trunk's input, once the card embeddings are spliced in.
     pub fn xdim(&self) -> usize {
-        xdim_of(self.de())
+        if self.v1() {
+            self.pub_dim()
+        } else {
+            xdim_of(self.de())
+        }
+    }
+
+    /// A pre-describer checkpoint: six matrices, the flat public encoding fed
+    /// straight to `W0`, and a holding tower that is one linear map of the
+    /// counts. Frozen alongside `v1`'s encoder and deleted with it.
+    fn from_flat_v1(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Mlp, String> {
+        let (p, h, cf, dg, rk) = (dims[0], dims[1], dims[2], dims[3], dims[4]);
+        let want_w = p * h + h * h + 2 * dg * h + cf * dg + dg * (rk + 1) + h * rk;
+        let want_b = h + h + dg + (rk + 1) + rk;
+        if w.len() != want_w || b.len() != want_b || ln.len() != 4 * h {
+            return Err(format!("v1 weight sizes do not match dims {dims:?}"));
+        }
+        let mut wi = 0usize;
+        let mut take = |n: usize| {
+            let v = w[wi..wi + n].to_vec();
+            wi += n;
+            v
+        };
+        let (w0, w1, wb, wc, wg, wu) = (
+            take(p * h),
+            take(h * h),
+            take(2 * dg * h),
+            take(cf * dg),
+            take(dg * (rk + 1)),
+            take(h * rk),
+        );
+        Ok(Mlp {
+            dims: dims.to_vec(),
+            w0,
+            b0: b[..h].to_vec(),
+            ln0_w: ln[..h].to_vec(),
+            ln0_b: ln[h..2 * h].to_vec(),
+            w1,
+            b1: b[h..2 * h].to_vec(),
+            ln1_w: ln[2 * h..3 * h].to_vec(),
+            ln1_b: ln[3 * h..4 * h].to_vec(),
+            wb,
+            wc,
+            bc: b[2 * h..2 * h + dg].to_vec(),
+            wg,
+            bg: b[2 * h + dg..2 * h + dg + rk + 1].to_vec(),
+            wu,
+            bu: b[2 * h + dg + rk + 1..].to_vec(),
+            ..Default::default()
+        })
     }
 
     /// LayerNorm + ReLU over `rows x n`, in place, with an optional cached
@@ -600,8 +670,16 @@ impl Mlp {
     /// adds, 384 long, twice per row — took **five times** as long as all the
     /// matmuls put together. The re-association changes the last bits of the
     /// statistics; `train/test_parity.py` bounds the result against torch.
-    fn ln_relu(&self, rows: usize, n: usize, bias: &[f32], g: &[f32], bt: &[f32],
-               add: Option<&[f32]>, out: &mut [f32]) {
+    fn ln_relu(
+        &self,
+        rows: usize,
+        n: usize,
+        bias: &[f32],
+        g: &[f32],
+        bt: &[f32],
+        add: Option<&[f32]>,
+        out: &mut [f32],
+    ) {
         let inv_n = 1.0 / n as f32;
         for r in 0..rows {
             let row = &mut out[r * n..r * n + n];
@@ -624,10 +702,16 @@ impl Mlp {
     /// the draft, so every row of a game carries the same block and a solve
     /// builds this once.
     pub fn cards(&self, xpub_row: &[f32], e: &mut Vec<f32>) {
+        if self.v1() {
+            e.clear();
+            return;
+        }
         let (de, dc) = (self.de(), self.dims[7]);
         let cards = &xpub_row[OFF_CARDS..OFF_CARDS + NTYPE * CARD_FEATS];
         let mut hid = vec![0.0f32; NTYPE * dc];
-        gemm_ld(NTYPE, dc, CARD_FEATS, cards, CARD_FEATS, &self.wd0, dc, 0.0, &mut hid, dc);
+        gemm_ld(
+            NTYPE, dc, CARD_FEATS, cards, CARD_FEATS, &self.wd0, dc, 0.0, &mut hid, dc,
+        );
         for t in 0..NTYPE {
             let row = &mut hid[t * dc..(t + 1) * dc];
             for (x, b) in row.iter_mut().zip(self.bd0.iter()) {
@@ -636,7 +720,18 @@ impl Mlp {
             relu(row);
         }
         fit(e, NTYPE * de);
-        gemm_ld(NTYPE, de, dc, &hid, dc, &self.wd1, de, 0.0, &mut e[..NTYPE * de], de);
+        gemm_ld(
+            NTYPE,
+            de,
+            dc,
+            &hid,
+            dc,
+            &self.wd1,
+            de,
+            0.0,
+            &mut e[..NTYPE * de],
+            de,
+        );
         for t in 0..NTYPE {
             for (x, b) in e[t * de..(t + 1) * de].iter_mut().zip(self.bd1.iter()) {
                 *x += *b;
@@ -659,6 +754,7 @@ impl Mlp {
     /// copies instead of `N_HEXES` strided ones.
     fn assemble(&self, xpub: &[f32], rows: usize, stride: usize, e: &[f32], x: &mut Vec<f32>) {
         let (de, xd) = (self.de(), self.xdim());
+        debug_assert!(!self.v1());
         let (hex_e, piles) = (N_HEXES * HEX_FACTS, N_HEXES * (HEX_FACTS + de));
         fit(x, rows * xd);
         x[..rows * xd].fill(0.0);
@@ -698,42 +794,65 @@ impl Mlp {
     /// A config's features do not depend on the CFR iteration, so a solve runs
     /// this once for every distinct config in its tree and then never again.
     pub fn embed(&self, phi: &[f32], n: usize, e: &[f32], z: &mut Vec<f32>, g: &mut Vec<f32>) {
-        let (rk, dg, de) = (self.rank(), self.dg(), self.de());
-        let hf = HFEAT_OF(de);
+        let (rk, dg) = (self.rank(), self.dg());
         debug_assert_eq!(phi.len(), n * self.cfeat());
         fit(z, n * dg);
-        let mut inp = vec![0.0f32; NSLOT * hf];
-        for r in 0..n {
-            let p = &phi[r * self.cfeat()..(r + 1) * self.cfeat()];
-            let seat = p[CCOUNTS];
-            for k in 0..NSLOT {
-                let row = &mut inp[k * hf..(k + 1) * hf];
-                row[0] = p[k];
-                row[1] = p[NSLOT + k];
-                row[2] = p[2 * NSLOT + k];
-                row[3] = seat;
-                let t = seat as usize * NSLOT + k;
-                row[4..].copy_from_slice(&e[t * de..(t + 1) * de]);
+        if self.v1() {
+            let cf = self.cfeat();
+            gemm_ld(n, dg, cf, phi, cf, &self.wc, dg, 0.0, &mut z[..n * dg], dg);
+            for r in 0..n {
+                let row = &mut z[r * dg..r * dg + dg];
+                for (x, b) in row.iter_mut().zip(self.bc.iter()) {
+                    *x += *b;
+                }
+                relu(row);
             }
-            let out = &mut z[r * dg..(r + 1) * dg];
-            out.fill(0.0);
-            for k in 0..NSLOT {
-                let row = &inp[k * hf..(k + 1) * hf];
-                for j in 0..dg {
-                    let mut s = self.bc[j];
-                    for (i, v) in row.iter().enumerate() {
-                        s += v * self.wc[i * dg + j];
+        } else {
+            let (de, hf) = (self.de(), HFEAT_OF(self.de()));
+            let mut inp = vec![0.0f32; NSLOT * hf];
+            for r in 0..n {
+                let p = &phi[r * self.cfeat()..(r + 1) * self.cfeat()];
+                let seat = p[CCOUNTS];
+                for k in 0..NSLOT {
+                    let row = &mut inp[k * hf..(k + 1) * hf];
+                    row[0] = p[k];
+                    row[1] = p[NSLOT + k];
+                    row[2] = p[2 * NSLOT + k];
+                    row[3] = seat;
+                    let t = seat as usize * NSLOT + k;
+                    row[4..].copy_from_slice(&e[t * de..(t + 1) * de]);
+                }
+                let out = &mut z[r * dg..(r + 1) * dg];
+                out.fill(0.0);
+                for k in 0..NSLOT {
+                    let row = &inp[k * hf..(k + 1) * hf];
+                    for j in 0..dg {
+                        let mut s = self.bc[j];
+                        for (i, v) in row.iter().enumerate() {
+                            s += v * self.wc[i * dg + j];
+                        }
+                        // Rectify *before* the sum. A sum of raw linear maps would
+                        // be a linear map of the sum, and the sum of the inputs has
+                        // forgotten which count belongs to which card -- which is
+                        // the one thing this tower exists to remember.
+                        out[j] += s.max(0.0);
                     }
-                    // Rectify *before* the sum. A sum of raw linear maps would
-                    // be a linear map of the sum, and the sum of the inputs has
-                    // forgotten which count belongs to which card -- which is
-                    // the one thing this tower exists to remember.
-                    out[j] += s.max(0.0);
                 }
             }
         }
         fit(g, n * (rk + 1));
-        gemm_ld(n, rk + 1, dg, z, dg, &self.wg, rk + 1, 0.0, &mut g[..n * (rk + 1)], rk + 1);
+        gemm_ld(
+            n,
+            rk + 1,
+            dg,
+            z,
+            dg,
+            &self.wg,
+            rk + 1,
+            0.0,
+            &mut g[..n * (rk + 1)],
+            rk + 1,
+        );
         for r in 0..n {
             let row = &mut g[r * (rk + 1)..(r + 1) * (rk + 1)];
             for (x, b) in row.iter_mut().zip(self.bg.iter()) {
@@ -755,20 +874,62 @@ impl Mlp {
         out: &mut Vec<f32>,
     ) {
         let (xd, h) = (self.xdim(), self.hidden());
+        // v1 feeds the stored row straight to `W0`; there is nothing to splice.
         let mut x = Vec::new();
-        self.assemble(xpub, rows, stride, e, &mut x);
+        let (src, lda) = if self.v1() {
+            (xpub, stride)
+        } else {
+            self.assemble(xpub, rows, stride, e, &mut x);
+            (&x[..], xd)
+        };
         fit(scratch, rows * h);
-        gemm_ld(rows, h, xd, &x, xd, &self.w0, h, 0.0, &mut scratch[..rows * h], h);
-        self.ln_relu(rows, h, &self.b0, &self.ln0_w, &self.ln0_b, None, &mut scratch[..rows * h]);
+        gemm_ld(
+            rows,
+            h,
+            xd,
+            src,
+            lda,
+            &self.w0,
+            h,
+            0.0,
+            &mut scratch[..rows * h],
+            h,
+        );
+        self.ln_relu(
+            rows,
+            h,
+            &self.b0,
+            &self.ln0_w,
+            &self.ln0_b,
+            None,
+            &mut scratch[..rows * h],
+        );
         fit(out, rows * h);
-        gemm_ld(rows, h, h, scratch, h, &self.w1, h, 0.0, &mut out[..rows * h], h);
+        gemm_ld(
+            rows,
+            h,
+            h,
+            scratch,
+            h,
+            &self.w1,
+            h,
+            0.0,
+            &mut out[..rows * h],
+            h,
+        );
     }
 
     /// The PBS side of the value, given the cached trunk in `pre` and the two
     /// belief embeddings in `xbel` (`[rows * 2 * dg]`). Writes `[rows * rank]`.
     /// This is the only part of the network that runs per CFR iteration.
-    pub fn pbs_head(&self, xbel: &[f32], rows: usize, pre: &[f32], scratch: &mut Vec<f32>,
-                    out: &mut Vec<f32>) {
+    pub fn pbs_head(
+        &self,
+        xbel: &[f32],
+        rows: usize,
+        pre: &[f32],
+        scratch: &mut Vec<f32>,
+        out: &mut Vec<f32>,
+    ) {
         self.hidden_layer(xbel, rows, pre, scratch);
         self.readout(scratch, rows, &self.wu, &self.bu, out);
     }
@@ -782,8 +943,27 @@ impl Mlp {
         debug_assert_eq!(xbel.len(), rows * bd);
         debug_assert!(pre.len() >= rows * h);
         fit(out, rows * h);
-        gemm_ld(rows, h, bd, xbel, bd, &self.wb, h, 0.0, &mut out[..rows * h], h);
-        self.ln_relu(rows, h, &self.b1, &self.ln1_w, &self.ln1_b, Some(pre), &mut out[..rows * h]);
+        gemm_ld(
+            rows,
+            h,
+            bd,
+            xbel,
+            bd,
+            &self.wb,
+            h,
+            0.0,
+            &mut out[..rows * h],
+            h,
+        );
+        self.ln_relu(
+            rows,
+            h,
+            &self.b1,
+            &self.ln1_w,
+            &self.ln1_b,
+            Some(pre),
+            &mut out[..rows * h],
+        );
     }
 
     /// `hid W + b`, into `[rows * rank]`.
@@ -823,7 +1003,18 @@ impl Mlp {
             }
         }
         fit(out, na * rk);
-        gemm_ld(na, rk, af + de, &inp, af + de, &self.wq, rk, 0.0, &mut out[..na * rk], rk);
+        gemm_ld(
+            na,
+            rk,
+            af + de,
+            &inp,
+            af + de,
+            &self.wq,
+            rk,
+            0.0,
+            &mut out[..na * rk],
+            rk,
+        );
         for r in 0..na {
             let row = &mut out[r * rk..r * rk + rk];
             for (x, b) in row.iter_mut().zip(self.bq.iter()) {
@@ -841,8 +1032,17 @@ impl Mlp {
     /// legality is the caller's mask and applying it twice is how a
     /// renormalisation goes wrong.
     #[allow(clippy::too_many_arguments)]
-    pub fn policy(&self, xbel: &[f32], pre: &[f32], z: &[f32], cidx: &[u32], q: &[f32],
-                  na: usize, scratch: &mut Vec<f32>, out: &mut [f32]) {
+    pub fn policy(
+        &self,
+        xbel: &[f32],
+        pre: &[f32],
+        z: &[f32],
+        cidx: &[u32],
+        q: &[f32],
+        na: usize,
+        scratch: &mut Vec<f32>,
+        out: &mut [f32],
+    ) {
         let (dg, rk) = (self.dg(), self.rank());
         debug_assert_eq!(out.len(), cidx.len() * na);
         self.hidden_layer(xbel, 1, pre, scratch);
@@ -885,14 +1085,26 @@ impl Mlp {
     /// from different games. A solve builds it once.
     pub fn forward(&self, xpub: &[f32], xbel: &[f32], phi: &[f32], rows: usize) -> Vec<f32> {
         let (rk, pd) = (self.rank(), self.pub_dim());
-        let (mut sb, mut pre, mut e, mut z, mut g, mut u) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut sb, mut pre, mut e, mut z, mut g, mut u) = (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         (0..rows)
             .map(|r| {
                 self.cards(&xpub[r * pd..(r + 1) * pd], &mut e);
                 self.trunk(&xpub[r * pd..], 1, pd, &e, &mut sb, &mut pre);
                 self.pbs_head(&xbel[r * self.belief_dim()..], 1, &pre, &mut sb, &mut u);
-                self.embed(&phi[r * self.cfeat()..(r + 1) * self.cfeat()], 1, &e, &mut z, &mut g);
+                self.embed(
+                    &phi[r * self.cfeat()..(r + 1) * self.cfeat()],
+                    1,
+                    &e,
+                    &mut z,
+                    &mut g,
+                );
                 dot(&u[..rk], &g[..rk]) + g[rk]
             })
             .collect()
