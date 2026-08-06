@@ -1,0 +1,178 @@
+{
+ "runs": [
+  "runs/arch_base",
+  "runs/arch_dcfr",
+  "runs/arch_policy"
+ ],
+ "games_per_pair": 100,
+ "depth": 2,
+ "iters": 64,
+ "depth_b": 0,
+ "iters_b": 0,
+ "players": [
+  {
+   "name": "greedy",
+   "t": null,
+   "elo": 0.0,
+   "se": 58.8,
+   "score": 0.013
+  },
+  {
+   "name": "arch_base.final",
+   "t": 3903.1,
+   "elo": 663.1,
+   "se": 17.5,
+   "score": 0.541
+  },
+  {
+   "name": "arch_dcfr.final",
+   "t": 3922.4,
+   "elo": 695.6,
+   "se": 17.4,
+   "score": 0.588
+  },
+  {
+   "name": "arch_policy.final",
+   "t": 3900.7,
+   "elo": 646.3,
+   "se": 17.6,
+   "score": 0.517
+  },
+  {
+   "name": "t64_turbo_s14.s1",
+   "t": 3922.0,
+   "elo": 733.0,
+   "se": 17.5,
+   "score": 0.642
+  },
+  {
+   "name": "t64_h384_dg64_s11.s1",
+   "t": 3901.0,
+   "elo": 773.4,
+   "se": 17.9,
+   "score": 0.699
+  }
+ ],
+ "pairs": [
+  {
+   "a": "greedy",
+   "b": "arch_base.final",
+   "w": 0,
+   "l": 95,
+   "d": 5,
+   "score": 0.025
+  },
+  {
+   "a": "greedy",
+   "b": "arch_dcfr.final",
+   "w": 0,
+   "l": 100,
+   "d": 0,
+   "score": 0.0
+  },
+  {
+   "a": "greedy",
+   "b": "arch_policy.final",
+   "w": 0,
+   "l": 98,
+   "d": 2,
+   "score": 0.01
+  },
+  {
+   "a": "greedy",
+   "b": "t64_turbo_s14.s1",
+   "w": 0,
+   "l": 97,
+   "d": 3,
+   "score": 0.015
+  },
+  {
+   "a": "greedy",
+   "b": "t64_h384_dg64_s11.s1",
+   "w": 1,
+   "l": 98,
+   "d": 1,
+   "score": 0.015
+  },
+  {
+   "a": "arch_base.final",
+   "b": "arch_dcfr.final",
+   "w": 42,
+   "l": 56,
+   "d": 2,
+   "score": 0.43
+  },
+  {
+   "a": "arch_base.final",
+   "b": "arch_policy.final",
+   "w": 50,
+   "l": 47,
+   "d": 3,
+   "score": 0.515
+  },
+  {
+   "a": "arch_base.final",
+   "b": "t64_turbo_s14.s1",
+   "w": 34,
+   "l": 61,
+   "d": 5,
+   "score": 0.365
+  },
+  {
+   "a": "arch_base.final",
+   "b": "t64_h384_dg64_s11.s1",
+   "w": 41,
+   "l": 57,
+   "d": 2,
+   "score": 0.42
+  },
+  {
+   "a": "arch_dcfr.final",
+   "b": "arch_policy.final",
+   "w": 56,
+   "l": 43,
+   "d": 1,
+   "score": 0.565
+  },
+  {
+   "a": "arch_dcfr.final",
+   "b": "t64_turbo_s14.s1",
+   "w": 43,
+   "l": 56,
+   "d": 1,
+   "score": 0.435
+  },
+  {
+   "a": "arch_dcfr.final",
+   "b": "t64_h384_dg64_s11.s1",
+   "w": 36,
+   "l": 62,
+   "d": 2,
+   "score": 0.37
+  },
+  {
+   "a": "arch_policy.final",
+   "b": "t64_turbo_s14.s1",
+   "w": 36,
+   "l": 59,
+   "d": 5,
+   "score": 0.385
+  },
+  {
+   "a": "arch_policy.final",
+   "b": "t64_h384_dg64_s11.s1",
+   "w": 27,
+   "l": 69,
+   "d": 4,
+   "score": 0.29
+  },
+  {
+   "a": "t64_turbo_s14.s1",
+   "b": "t64_h384_dg64_s11.s1",
+   "w": 39,
+   "l": 57,
+   "d": 4,
+   "score": 0.41
+  }
+ ]
+}

@@ -1,0 +1,25 @@
+[ladder] 6 players, 15 pairings, 100 paired games each (depth=2 iters=64)
+                        greedy vs arch_base.final              W   0 L  95 D   5  score 0.025
+                        greedy vs arch_dcfr.final              W   0 L 100 D   0  score 0.000
+                        greedy vs arch_policy.final            W   0 L  98 D   2  score 0.010
+                        greedy vs t64_turbo_s14.s1             W   0 L  97 D   3  score 0.015
+                        greedy vs t64_h384_dg64_s11.s1         W   1 L  98 D   1  score 0.015
+               arch_base.final vs arch_dcfr.final              W  42 L  56 D   2  score 0.430
+               arch_base.final vs arch_policy.final            W  50 L  47 D   3  score 0.515
+               arch_base.final vs t64_turbo_s14.s1             W  34 L  61 D   5  score 0.365
+               arch_base.final vs t64_h384_dg64_s11.s1         W  41 L  57 D   2  score 0.420
+               arch_dcfr.final vs arch_policy.final            W  56 L  43 D   1  score 0.565
+               arch_dcfr.final vs t64_turbo_s14.s1             W  43 L  56 D   1  score 0.435
+               arch_dcfr.final vs t64_h384_dg64_s11.s1         W  36 L  62 D   2  score 0.370
+             arch_policy.final vs t64_turbo_s14.s1             W  36 L  59 D   5  score 0.385
+             arch_policy.final vs t64_h384_dg64_s11.s1         W  27 L  69 D   4  score 0.290
+              t64_turbo_s14.s1 vs t64_h384_dg64_s11.s1         W  39 L  57 D   4  score 0.410
+
+=== Elo (runs/ladder_arch_finals, greedy = 0) ===
+                      player   trained     elo    +-   score
+        t64_h384_dg64_s11.s1   65.0min     773    18   0.699
+            t64_turbo_s14.s1   65.4min     733    18   0.642
+             arch_dcfr.final   65.4min     696    17   0.588
+             arch_base.final   65.1min     663    18   0.541
+           arch_policy.final   65.0min     646    18   0.517
+                      greedy         -       0    59   0.013
