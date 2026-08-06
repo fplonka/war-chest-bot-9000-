@@ -40,13 +40,17 @@ use warchest::Action;
 /// actually distinguish things rather than return zero.
 fn random_net(seed: u64, hidden: usize, dg: usize) -> Mlp {
     let mut r = Rng::new(seed);
-    let dims = [PUBFEAT, hidden, CFEAT, dg, dg];
-    let nw = PUBFEAT * hidden + hidden * hidden + 2 * dg * hidden + CFEAT * dg + dg * (dg + 1) + hidden * dg;
+    let (de, dc, rk) = (16usize, 32usize, dg);
+    let dims = [PUBFEAT, hidden, CFEAT, dg, rk, AFEAT, de, dc];
+    let xd = warchest::board::N_HEXES * (HEX_FACTS + de) + 2 * de + LOOSE;
+    let nw = CARD_FEATS * dc + dc * de + (PILE_COUNTS + de) * de
+        + xd * hidden + hidden * hidden + 2 * dg * hidden + (4 + de) * dg
+        + dg * (rk + 1) + hidden * rk + (AFEAT + de) * rk + dg * rk + hidden * rk;
     let mut draw = |n: usize, scale: f32| -> Vec<f32> {
         (0..n).map(|_| (r.unit_f64() as f32 - 0.5) * scale).collect()
     };
     let w = draw(nw, 0.2);
-    let b = draw(hidden + hidden + dg + (dg + 1) + dg, 0.2);
+    let b = draw(dc + de + de + hidden + hidden + dg + (rk + 1) + 4 * rk, 0.2);
     // LayerNorm starts at its identity, as torch does.
     let mut ln = Vec::new();
     for _ in 0..2 {
@@ -159,7 +163,7 @@ fn leak_check(random_draft: bool) -> (usize, usize) {
                 // The pending-maneuver mask is channel `6 + NSLOT` of the
                 // hex-major block.
                 if (0..warchest::board::N_HEXES)
-                    .any(|h| a[h * HEX_CH + 6 + NSLOT] != 0.0)
+                    .any(|h| a[h * HEX_CH + 6] != 0.0)
                 {
                     pending_seen += 1;
                 }

@@ -718,6 +718,35 @@ fn infer(
     Ok(mlp.forward(xpub.as_slice()?, xbel.as_slice()?, phi.as_slice()?, rows))
 }
 
+/// Policy logits for one node: `[nc * na]`, row-major by config. One PBS row,
+/// `nc` configs and `na` actions. The parity test's half of the policy seam.
+#[pyfunction]
+fn infer_policy(
+    xpub: PyReadonlyArray1<f32>,
+    xbel: PyReadonlyArray1<f32>,
+    phi: PyReadonlyArray1<f32>,
+    psi: PyReadonlyArray1<f32>,
+    nc: usize,
+    na: usize,
+    slot: usize,
+) -> PyResult<Vec<f32>> {
+    check_slot(slot)?;
+    let guard = nets().read().unwrap();
+    let mlp = &guard[slot].value;
+    let (mut e, mut sb, mut pre, mut z, mut g, mut q) = (
+        Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+    );
+    let xp = xpub.as_slice()?;
+    mlp.cards(xp, &mut e);
+    mlp.trunk(xp, 1, xp.len(), &e, &mut sb, &mut pre);
+    mlp.embed(phi.as_slice()?, nc, &e, &mut z, &mut g);
+    mlp.embed_actions(psi.as_slice()?, na, &e, &mut q);
+    let idx: Vec<u32> = (0..nc as u32).collect();
+    let mut out = vec![0.0f32; nc * na];
+    mlp.policy(xbel.as_slice()?, &pre, &z, &idx, &q, na, &mut sb, &mut out);
+    Ok(out)
+}
+
 /// The gather a convolutional trunk needs: `N_HEXES * 7` indices, each hex
 /// followed by its six axial neighbours in a fixed direction order.
 ///
@@ -801,18 +830,22 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Block offsets in the public half of the encoding. Exported so the
     // training side can build the mirror permutation from one source of truth
     // rather than restating the layout.
+    m.add("NTYPE", crate::rebel::NTYPE)?;
     m.add("HEX_CH", crate::rebel::HEX_CH)?;
+    m.add("HEX_FACTS", crate::rebel::HEX_FACTS)?;
     m.add("HEX_BLOCK", crate::rebel::HEX_BLOCK)?;
-    m.add("ZONE_FEATS", crate::rebel::ZONE_FEATS)?;
+    m.add("PILE_COUNTS", crate::rebel::PILE_COUNTS)?;
     m.add("PLAYER_SCALARS", crate::rebel::PLAYER_SCALARS)?;
     m.add("GLOBAL_SCALARS", crate::rebel::GLOBAL_SCALARS)?;
     m.add("PEND_KINDS", crate::rebel::PEND_KINDS)?;
     m.add("PEND_SLOT", crate::rebel::PEND_SLOT)?;
-    m.add("OFF_ZONES", crate::rebel::OFF_ZONES)?;
-    m.add("OFF_IDENT", crate::rebel::OFF_IDENT)?;
+    m.add("LOOSE", crate::rebel::LOOSE)?;
+    m.add("OFF_PILES", crate::rebel::OFF_PILES)?;
     m.add("OFF_CARDS", crate::rebel::OFF_CARDS)?;
-    m.add("OFF_PLAYER", crate::rebel::OFF_PLAYER)?;
-    m.add("OFF_GLOBAL", crate::rebel::OFF_GLOBAL)?;
+    m.add("OFF_LOOSE", crate::rebel::OFF_LOOSE)?;
+    m.add("AOFF_PAYS", crate::rebel::AOFF_PAYS)?;
+    m.add("CCOUNTS", crate::rebel::CCOUNTS)?;
+    m.add_function(wrap_pyfunction!(infer_policy, m)?)?;
     m.add_function(wrap_pyfunction!(hex_neighborhood, m)?)?;
     m.add_function(wrap_pyfunction!(set_weights, m)?)?;
     m.add_function(wrap_pyfunction!(set_cap_value, m)?)?;

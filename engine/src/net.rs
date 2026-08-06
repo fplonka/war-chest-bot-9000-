@@ -47,6 +47,13 @@
 //! matmul per leaf, one LayerNorm, and one dot product per config. That is less
 //! per-iteration work than the fixed-width output head it replaces.
 
+use crate::board::N_HEXES;
+use crate::rebel::{
+    CCOUNTS, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_CARDS, OFF_LOOSE, OFF_PILES, PILE_COUNTS,
+    PUBFEAT, AOFF_PAYS,
+};
+use crate::units::CARD_FEATS;
+
 #[cfg(target_vendor = "apple")]
 #[link(name = "Accelerate", kind = "framework")]
 extern "C" {
@@ -393,6 +400,22 @@ pub struct Mlp {
     /// The PBS side of the policy readout: `[hidden, rank]` and its bias.
     wp: Vec<f32>,
     bp: Vec<f32>,
+    // -------------------------------------------------------- card describer
+    // `e(card) = relu(card Wd0 + bd0) Wd1 + bd1`, `[NTYPE, de]`. Runs once per
+    // game: the cards in play do not change. Everything else that refers to a
+    // card — the hex block, the pile summary, the holding tower, the action
+    // tower — refers to it by coin-type index and reads its row out of this
+    // table, so nothing anywhere names a *unit*, and a draft the network has
+    // never seen is describable rather than an unknown identity code.
+    wd0: Vec<f32>,
+    bd0: Vec<f32>,
+    wd1: Vec<f32>,
+    bd1: Vec<f32>,
+    /// Pile summary: `[PILE_COUNTS + de, de]` and its bias. Per coin type, its
+    /// four public counts alongside its card embedding, summed per player. A sum
+    /// has no order, so any draft fits.
+    wpile: Vec<f32>,
+    bpile: Vec<f32>,
 }
 
 impl Mlp {
@@ -404,15 +427,17 @@ impl Mlp {
     /// `set_weights` and the `.bin` loader — so there is nowhere for the two to
     /// drift apart.
     pub fn from_flat(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Mlp, String> {
-        if dims.len() != 6 {
+        if dims.len() != 8 {
             return Err(format!(
-                "expected 6 dims [pub, hidden, cfeat, dg, rank, afeat], got {dims:?}"
+                "expected 8 dims [pub, hidden, cfeat, dg, rank, afeat, de, dc], got {dims:?}"
             ));
         }
-        let (p, h, cf, dg, rk, af) = (dims[0], dims[1], dims[2], dims[3], dims[4], dims[5]);
-        let want_w = p * h + h * h + 2 * dg * h + cf * dg + dg * (rk + 1) + h * rk
+        let (h, dg, rk, de, dc) = (dims[1], dims[3], dims[4], dims[6], dims[7]);
+        let (af, hf, xd) = (dims[5] + de, HFEAT_OF(de), xdim_of(de));
+        let want_w = CARD_FEATS * dc + dc * de + (PILE_COUNTS + de) * de
+            + xd * h + h * h + 2 * dg * h + hf * dg + dg * (rk + 1) + h * rk
             + af * rk + dg * rk + h * rk;
-        let want_b = h + h + dg + (rk + 1) + rk + 3 * rk;
+        let want_b = dc + de + de + h + h + dg + (rk + 1) + 4 * rk;
         let want_ln = 4 * h;
         if w.len() != want_w || b.len() != want_b || ln.len() != want_ln {
             return Err(format!(
@@ -428,11 +453,14 @@ impl Mlp {
             wi += n;
             v
         };
-        let (w0, w1, wb, wc, wg, wu, wq, wk, wp) = (
-            take(p * h),
+        let (wd0, wd1, wpile, w0, w1, wb, wc, wg, wu, wq, wk, wp) = (
+            take(CARD_FEATS * dc),
+            take(dc * de),
+            take((PILE_COUNTS + de) * de),
+            take(xd * h),
             take(h * h),
             take(2 * dg * h),
-            take(cf * dg),
+            take(hf * dg),
             take(dg * (rk + 1)),
             take(h * rk),
             take(af * rk),
@@ -445,7 +473,10 @@ impl Mlp {
             bi += n;
             v
         };
-        let (b0, b1, bc, bg, bu, bq, bk, bp) = (
+        let (bd0, bd1, bpile, b0, b1, bc, bg, bu, bq, bk, bp) = (
+            takeb(dc),
+            takeb(de),
+            takeb(de),
             takeb(h),
             takeb(h),
             takeb(dg),
@@ -478,6 +509,12 @@ impl Mlp {
             bk,
             wp,
             bp,
+            wd0,
+            bd0,
+            wd1,
+            bd1,
+            wpile,
+            bpile,
         })
     }
 
@@ -540,9 +577,18 @@ impl Mlp {
     pub fn belief_dim(&self) -> usize {
         2 * self.dims[3]
     }
-    /// Width of one action vector.
+    /// Width of one stored action vector, before the paying card's embedding is
+    /// appended.
     pub fn afeat(&self) -> usize {
         self.dims[5]
+    }
+    /// Width of a card embedding.
+    pub fn de(&self) -> usize {
+        self.dims[6]
+    }
+    /// Width of the trunk's input, once the card embeddings are spliced in.
+    pub fn xdim(&self) -> usize {
+        xdim_of(self.de())
     }
 
     /// LayerNorm + ReLU over `rows x n`, in place, with an optional cached
@@ -572,44 +618,147 @@ impl Mlp {
     /// Produces the belief embedding `z` (`[n * dg]`) and the readout embedding
     /// `g` (`[n * (rank + 1)]`).
     ///
-    /// A config's features do not depend on the CFR iteration, so a solve runs
-    /// this once for every config in its tree and then never again.
-    pub fn embed(&self, phi: &[f32], n: usize, z: &mut Vec<f32>, g: &mut Vec<f32>) {
-        let (h, cf, dg) = (self.rank(), self.cfeat(), self.dg());
-        debug_assert_eq!(phi.len(), n * cf);
-        fit(z, n * dg);
-        gemm_ld(n, dg, cf, phi, cf, &self.wc, dg, 0.0, &mut z[..n * dg], dg);
-        for r in 0..n {
-            let row = &mut z[r * dg..r * dg + dg];
-            for (x, b) in row.iter_mut().zip(self.bc.iter()) {
+    /// The card table `e`: `[NTYPE, de]`, one embedding per coin type in play.
+    ///
+    /// Reads the card block of any public row — the cards in play are fixed at
+    /// the draft, so every row of a game carries the same block and a solve
+    /// builds this once.
+    pub fn cards(&self, xpub_row: &[f32], e: &mut Vec<f32>) {
+        let (de, dc) = (self.de(), self.dims[7]);
+        let cards = &xpub_row[OFF_CARDS..OFF_CARDS + NTYPE * CARD_FEATS];
+        let mut hid = vec![0.0f32; NTYPE * dc];
+        gemm_ld(NTYPE, dc, CARD_FEATS, cards, CARD_FEATS, &self.wd0, dc, 0.0, &mut hid, dc);
+        for t in 0..NTYPE {
+            let row = &mut hid[t * dc..(t + 1) * dc];
+            for (x, b) in row.iter_mut().zip(self.bd0.iter()) {
                 *x += *b;
             }
             relu(row);
         }
-        fit(g, n * (h + 1));
-        gemm_ld(n, h + 1, dg, z, dg, &self.wg, h + 1, 0.0, &mut g[..n * (h + 1)], h + 1);
+        fit(e, NTYPE * de);
+        gemm_ld(NTYPE, de, dc, &hid, dc, &self.wd1, de, 0.0, &mut e[..NTYPE * de], de);
+        for t in 0..NTYPE {
+            for (x, b) in e[t * de..(t + 1) * de].iter_mut().zip(self.bd1.iter()) {
+                *x += *b;
+            }
+        }
+    }
+
+    /// The trunk's input, assembled from a stored row and the card table:
+    /// the raw hex facts, then each hex's occupant embedding, then the pile
+    /// summary, then the loose scalars.
+    ///
+    /// The stored row holds a one-hot per hex rather than an embedding, because
+    /// the embedding is learned and a replay row that contained it would go
+    /// stale as training moved the weights. Gathering `e`'s row is exactly the
+    /// one-hot matmul, since at most one entry is set.
+    ///
+    /// The blocks are concatenated rather than interleaved per hex. `W0` is
+    /// fully connected over the result, so any fixed permutation of its input is
+    /// the same network with permuted rows, and this one is two contiguous
+    /// copies instead of `N_HEXES` strided ones.
+    fn assemble(&self, xpub: &[f32], rows: usize, stride: usize, e: &[f32], x: &mut Vec<f32>) {
+        let (de, xd) = (self.de(), self.xdim());
+        let (hex_e, piles) = (N_HEXES * HEX_FACTS, N_HEXES * (HEX_FACTS + de));
+        fit(x, rows * xd);
+        x[..rows * xd].fill(0.0);
+        for r in 0..rows {
+            let src = &xpub[r * stride..r * stride + PUBFEAT];
+            let dst = &mut x[r * xd..(r + 1) * xd];
+            for h in 0..N_HEXES {
+                let hx = &src[h * HEX_CH..(h + 1) * HEX_CH];
+                dst[h * HEX_FACTS..(h + 1) * HEX_FACTS].copy_from_slice(&hx[..HEX_FACTS]);
+                debug_assert!(hx[HEX_FACTS..].iter().filter(|v| **v != 0.0).count() <= 1);
+                if let Some(t) = hx[HEX_FACTS..].iter().position(|&v| v != 0.0) {
+                    dst[hex_e + h * de..hex_e + (h + 1) * de]
+                        .copy_from_slice(&e[t * de..(t + 1) * de]);
+                }
+            }
+            for t in 0..NTYPE {
+                let c = &src[OFF_PILES + t * PILE_COUNTS..OFF_PILES + (t + 1) * PILE_COUNTS];
+                let et = &e[t * de..(t + 1) * de];
+                let acc = &mut dst[piles + (t / NSLOT) * de..piles + (t / NSLOT) * de + de];
+                for j in 0..de {
+                    let mut s = self.bpile[j];
+                    for (i, v) in c.iter().chain(et.iter()).enumerate() {
+                        s += v * self.wpile[i * de + j];
+                    }
+                    acc[j] += s.max(0.0);
+                }
+            }
+            dst[piles + 2 * de..].copy_from_slice(&src[OFF_LOOSE..OFF_LOOSE + LOOSE]);
+        }
+    }
+
+    /// The holding tower. Per coin type, its three counts and the seat alongside
+    /// that card's embedding, through one shared matrix, summed over the five
+    /// slots and rectified. The sum is what makes any draft fit: it has no
+    /// order, so nothing depends on which slot a card landed in.
+    ///
+    /// A config's features do not depend on the CFR iteration, so a solve runs
+    /// this once for every distinct config in its tree and then never again.
+    pub fn embed(&self, phi: &[f32], n: usize, e: &[f32], z: &mut Vec<f32>, g: &mut Vec<f32>) {
+        let (rk, dg, de) = (self.rank(), self.dg(), self.de());
+        let hf = HFEAT_OF(de);
+        debug_assert_eq!(phi.len(), n * self.cfeat());
+        fit(z, n * dg);
+        let mut inp = vec![0.0f32; NSLOT * hf];
         for r in 0..n {
-            let row = &mut g[r * (h + 1)..(r + 1) * (h + 1)];
+            let p = &phi[r * self.cfeat()..(r + 1) * self.cfeat()];
+            let seat = p[CCOUNTS];
+            for k in 0..NSLOT {
+                let row = &mut inp[k * hf..(k + 1) * hf];
+                row[0] = p[k];
+                row[1] = p[NSLOT + k];
+                row[2] = p[2 * NSLOT + k];
+                row[3] = seat;
+                let t = seat as usize * NSLOT + k;
+                row[4..].copy_from_slice(&e[t * de..(t + 1) * de]);
+            }
+            let out = &mut z[r * dg..(r + 1) * dg];
+            out.fill(0.0);
+            for k in 0..NSLOT {
+                let row = &inp[k * hf..(k + 1) * hf];
+                for j in 0..dg {
+                    let mut s = self.bc[j];
+                    for (i, v) in row.iter().enumerate() {
+                        s += v * self.wc[i * dg + j];
+                    }
+                    // Rectify *before* the sum. A sum of raw linear maps would
+                    // be a linear map of the sum, and the sum of the inputs has
+                    // forgotten which count belongs to which card -- which is
+                    // the one thing this tower exists to remember.
+                    out[j] += s.max(0.0);
+                }
+            }
+        }
+        fit(g, n * (rk + 1));
+        gemm_ld(n, rk + 1, dg, z, dg, &self.wg, rk + 1, 0.0, &mut g[..n * (rk + 1)], rk + 1);
+        for r in 0..n {
+            let row = &mut g[r * (rk + 1)..(r + 1) * (rk + 1)];
             for (x, b) in row.iter_mut().zip(self.bg.iter()) {
                 *x += *b;
             }
         }
     }
 
-    /// The public tower: `relu(LN(x_pub W0 + b0))` pushed through `W1`, leaving
-    /// the hidden layer's pre-activation minus its bias and minus the belief
+    /// The public tower: `relu(LN(x W0 + b0))` pushed through `W1`, leaving the
+    /// hidden layer's pre-activation minus its bias and minus the belief
     /// contribution. Computed once per leaf per solve.
     pub fn trunk(
         &self,
         xpub: &[f32],
         rows: usize,
         stride: usize,
+        e: &[f32],
         scratch: &mut Vec<f32>,
         out: &mut Vec<f32>,
     ) {
-        let (k, h) = (self.pub_dim(), self.hidden());
+        let (xd, h) = (self.xdim(), self.hidden());
+        let mut x = Vec::new();
+        self.assemble(xpub, rows, stride, e, &mut x);
         fit(scratch, rows * h);
-        gemm_ld(rows, h, k, xpub, stride, &self.w0, h, 0.0, &mut scratch[..rows * h], h);
+        gemm_ld(rows, h, xd, &x, xd, &self.w0, h, 0.0, &mut scratch[..rows * h], h);
         self.ln_relu(rows, h, &self.b0, &self.ln0_w, &self.ln0_b, None, &mut scratch[..rows * h]);
         fit(out, rows * h);
         gemm_ld(rows, h, h, scratch, h, &self.w1, h, 0.0, &mut out[..rows * h], h);
@@ -649,16 +798,32 @@ impl Mlp {
         }
     }
 
-    /// The action tower: `q(a) = relu(psi(a) Wq + bq)` for `na` actions,
-    /// `psi` being `[na * afeat]`. Writes `[na * rank]`.
+    /// The action tower: `q(a) = relu([psi(a) | e(paying card)] Wq + bq)` for
+    /// `na` actions, `psi` being `[na * afeat]`. Writes `[na * rank]`.
+    ///
+    /// The paying card's embedding is gathered through the coin-type one-hot
+    /// `psi` already carries, exactly as the hex block gathers the occupant's —
+    /// so what pays for an action is described by what that card does, not by
+    /// which slot it sits in.
     ///
     /// Cheap and per node, not per config: an action's description does not
     /// depend on who is holding what.
-    pub fn embed_actions(&self, psi: &[f32], na: usize, out: &mut Vec<f32>) {
-        let (af, rk) = (self.afeat(), self.rank());
+    pub fn embed_actions(&self, psi: &[f32], na: usize, e: &[f32], out: &mut Vec<f32>) {
+        let (af, rk, de) = (self.afeat(), self.rank(), self.de());
         debug_assert_eq!(psi.len(), na * af);
+        let mut inp = vec![0.0f32; na * (af + de)];
+        for r in 0..na {
+            let src = &psi[r * af..(r + 1) * af];
+            let dst = &mut inp[r * (af + de)..(r + 1) * (af + de)];
+            dst[..af].copy_from_slice(src);
+            let pays = &src[AOFF_PAYS..AOFF_PAYS + NTYPE];
+            debug_assert!(pays.iter().filter(|v| **v != 0.0).count() <= 1);
+            if let Some(t) = pays.iter().position(|&v| v != 0.0) {
+                dst[af..].copy_from_slice(&e[t * de..(t + 1) * de]);
+            }
+        }
         fit(out, na * rk);
-        gemm_ld(na, rk, af, psi, af, &self.wq, rk, 0.0, &mut out[..na * rk], rk);
+        gemm_ld(na, rk, af + de, &inp, af + de, &self.wq, rk, 0.0, &mut out[..na * rk], rk);
         for r in 0..na {
             let row = &mut out[r * rk..r * rk + rk];
             for (x, b) in row.iter_mut().zip(self.bq.iter()) {
@@ -715,19 +880,35 @@ impl Mlp {
     /// One value per row, for callers with no solve to amortise over: the torch
     /// parity check and the offline tools. `xpub` is `[rows * pub_dim]`, `xbel`
     /// `[rows * 2 * dg]`, `phi` `[rows * cfeat]` — one config per row.
+    ///
+    /// The card table is rebuilt per row here, because these callers batch rows
+    /// from different games. A solve builds it once.
     pub fn forward(&self, xpub: &[f32], xbel: &[f32], phi: &[f32], rows: usize) -> Vec<f32> {
-        let (mut sb, mut pre) = (Vec::new(), Vec::new());
-        self.trunk(xpub, rows, self.pub_dim(), &mut sb, &mut pre);
-        let mut u = Vec::new();
-        self.pbs_head(xbel, rows, &pre, &mut sb, &mut u);
-        let (mut z, mut g) = (Vec::new(), Vec::new());
-        self.embed(phi, rows, &mut z, &mut g);
-        let rk = self.rank();
+        let (rk, pd) = (self.rank(), self.pub_dim());
+        let (mut sb, mut pre, mut e, mut z, mut g, mut u) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         (0..rows)
             .map(|r| {
-                let row = &g[r * (rk + 1)..];
-                dot(&u[r * rk..r * rk + rk], &row[..rk]) + row[rk]
+                self.cards(&xpub[r * pd..(r + 1) * pd], &mut e);
+                self.trunk(&xpub[r * pd..], 1, pd, &e, &mut sb, &mut pre);
+                self.pbs_head(&xbel[r * self.belief_dim()..], 1, &pre, &mut sb, &mut u);
+                self.embed(&phi[r * self.cfeat()..(r + 1) * self.cfeat()], 1, &e, &mut z, &mut g);
+                dot(&u[..rk], &g[..rk]) + g[rk]
             })
             .collect()
     }
+}
+
+/// One coin type's input to the holding tower: its three counts, the seat, and
+/// its card embedding.
+#[allow(non_snake_case)]
+const fn HFEAT_OF(de: usize) -> usize {
+    4 + de
+}
+
+/// Width of the trunk's input, once the card embeddings are spliced in: the raw
+/// hex facts, one embedding per hex, the per-player pile summary, the loose
+/// scalars.
+const fn xdim_of(de: usize) -> usize {
+    N_HEXES * (HEX_FACTS + de) + 2 * de + LOOSE
 }

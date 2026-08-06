@@ -466,6 +466,9 @@ pub struct Solver<'a> {
     /// embedding. Both survive every CFR iteration.
     cz: Vec<f32>,
     cg: Vec<f32>,
+    /// The card table `[NTYPE, de]`. The draft is fixed for the game, so this is
+    /// built once per solve and read by every tower that names a card.
+    ce: Vec<f32>,
     /// `rows * hidden`: the public half of the hidden layer.
     h0: Vec<f32>,
     /// `rows * PUBFEAT`: the public encoding, filled during the build.
@@ -548,6 +551,7 @@ impl<'a> Solver<'a> {
             ncfg: 0,
             cz: take_buf(R_CZ),
             cg: take_buf(R_CG),
+            ce: Vec::new(),
             h0: take_buf(R_H0),
             xpub: take_buf(R_XPUB),
             xb: take_buf(R_XB0),
@@ -1102,10 +1106,17 @@ impl<'a> Solver<'a> {
         }
         let _t = timed!(PUBNET);
         let xpub = std::mem::take(&mut self.xpub);
-        net.trunk(&xpub, rows, PUBFEAT, &mut self.sb, &mut self.h0);
+        // The cards in play are fixed at the draft, so every leaf of the subgame
+        // carries the same card block and the table is built once. Everything
+        // downstream — the hex block, the pile summary, the holding tower, the
+        // action tower — reads a row of it by coin-type index.
+        if rows > 0 {
+            net.cards(&xpub[..PUBFEAT], &mut self.ce);
+        }
+        net.trunk(&xpub, rows, PUBFEAT, &self.ce, &mut self.sb, &mut self.h0);
         self.xpub = xpub;
         let cphi = std::mem::take(&mut self.cphi);
-        net.embed(&cphi[..self.ncfg * CFEAT], self.ncfg, &mut self.cz, &mut self.cg);
+        net.embed(&cphi[..self.ncfg * CFEAT], self.ncfg, &self.ce, &mut self.cz, &mut self.cg);
         self.cphi = cphi;
     }
 

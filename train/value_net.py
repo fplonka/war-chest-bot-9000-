@@ -15,6 +15,19 @@ import warchest
 PUBFEAT = warchest.PUBFEAT
 CFEAT = warchest.CFEAT
 AFEAT = warchest.AFEAT
+CCOUNTS = warchest.CCOUNTS
+CARD_FEATS = warchest.CARD_FEATS
+N_HEXES = warchest.N_HEXES
+NSLOT = warchest.NSLOT
+NTYPE = warchest.NTYPE
+HEX_CH = warchest.HEX_CH
+HEX_FACTS = warchest.HEX_FACTS
+PILE_COUNTS = warchest.PILE_COUNTS
+LOOSE = warchest.LOOSE
+OFF_PILES = warchest.OFF_PILES
+OFF_CARDS = warchest.OFF_CARDS
+OFF_LOOSE = warchest.OFF_LOOSE
+AOFF_PAYS = warchest.AOFF_PAYS
 
 
 class Mlp(nn.Module):
@@ -49,20 +62,30 @@ class Mlp(nn.Module):
     the target distribution moves.
     """
 
-    def __init__(self, hidden, dg=64, rank=64):
+    def __init__(self, hidden, dg=64, rank=64, de=32, dc=64):
         super().__init__()
-        self.dims = [PUBFEAT, hidden, CFEAT, dg, rank, AFEAT]
-        self.w0 = nn.Linear(PUBFEAT, hidden)
+        self.dims = [PUBFEAT, hidden, CFEAT, dg, rank, AFEAT, de, dc]
+        self.de = de
+        xdim = N_HEXES * (HEX_FACTS + de) + 2 * de + LOOSE
+        # The card describer, and the pile summary that reads it. Everything
+        # that names a card names a coin-type index into `e`, so no part of the
+        # network sees a unit identity and an unseen draft is describable.
+        self.wd0 = nn.Linear(CARD_FEATS, dc)
+        self.wd1 = nn.Linear(dc, de)
+        self.wpile = nn.Linear(PILE_COUNTS + de, de)
+        self.w0 = nn.Linear(xdim, hidden)
         self.w1 = nn.Linear(hidden, hidden)
         # The belief's connection into the hidden layer. No bias: it is added to
         # a layer that already has one.
         self.wb = nn.Linear(2 * dg, hidden, bias=False)
-        self.wc = nn.Linear(CFEAT, dg)
+        # The holding tower is per coin type and summed over the five slots, so
+        # it has no order and any draft fits.
+        self.wc = nn.Linear(4 + de, dg)
         self.wg = nn.Linear(dg, rank + 1)
         self.wu = nn.Linear(hidden, rank)
         # The policy head: an action tower, and the two halves of its readout.
         # Both towers are shared with the value, so this is three matrices.
-        self.wq = nn.Linear(AFEAT, rank)
+        self.wq = nn.Linear(AFEAT + de, rank)
         self.wk = nn.Linear(dg, rank)
         self.wp = nn.Linear(hidden, rank)
         self.ln0 = nn.LayerNorm(hidden)
@@ -93,13 +116,77 @@ class Mlp(nn.Module):
         widest matmul here if it runs per entry. The Rust solver deduplicates
         for the same reason.
         """
-        z = F.relu(self.wc(phi))
+    def cards(self, xpub):
+        """The card table `e`, `[B, NTYPE, de]` — one embedding per coin type."""
+        c = xpub[:, OFF_CARDS:OFF_CARDS + NTYPE * CARD_FEATS]
+        return self.wd1(F.relu(self.wd0(c.reshape(-1, NTYPE, CARD_FEATS))))
+
+    def trunk_input(self, xpub, e):
+        """The trunk's input, assembled from a stored row and the card table.
+
+        A row stores one-hots, not embeddings: the embedding is learned, so a
+        stored row that held it would carry whichever weights were live when the
+        row was written and would pass no gradient back to the describer. The
+        gather is written as the one-hot matmul it is.
+        """
+        b = xpub.shape[0]
+        hx = xpub[:, :N_HEXES * HEX_CH].reshape(b, N_HEXES, HEX_CH)
+        hex_e = hx[:, :, HEX_FACTS:] @ e                             # [B, N_HEXES, de]
+        piles = xpub[:, OFF_PILES:OFF_CARDS].reshape(b, NTYPE, PILE_COUNTS)
+        p = F.relu(self.wpile(torch.cat([piles, e], -1)))             # [B, NTYPE, de]
+        return torch.cat([
+            hx[:, :, :HEX_FACTS].reshape(b, -1),
+            hex_e.reshape(b, -1),
+            p.reshape(b, 2, NSLOT, -1).sum(2).reshape(b, -1),
+            xpub[:, OFF_LOOSE:OFF_LOOSE + LOOSE],
+        ], -1)
+
+    def holdings(self, phi, e):
+        """The holding tower: per coin type, three counts and the seat alongside
+        that card's embedding, through one shared matrix, summed over the five
+        slots. `phi` is `[U, CFEAT]` and `e` the card table of each config's own
+        row, `[U, NTYPE, de]`."""
+        seat = phi[:, CCOUNTS].long()
+        counts = phi[:, :CCOUNTS].reshape(-1, 3, NSLOT).transpose(1, 2)   # [U, NSLOT, 3]
+        # The seat picks which half of the card table this holding's slots index.
+        mine = e[torch.arange(e.shape[0], device=e.device).unsqueeze(1),
+                 seat.unsqueeze(1) * NSLOT + torch.arange(NSLOT, device=e.device)]
+        s = phi[:, CCOUNTS].reshape(-1, 1, 1).expand(-1, NSLOT, 1)
+        # Rectify before the sum: a sum of raw linear maps is a linear map of
+        # the sum, and the sum of the inputs has forgotten which count belongs
+        # to which card -- the one thing this tower exists to remember.
+        return F.relu(self.wc(torch.cat([counts, s, mine], -1))).sum(1)
+
+    def actions(self, psi, e):
+        """The action tower. `psi` is `[A, AFEAT]` and `e` the card table of each
+        action's own row, `[A, NTYPE, de]`. The paying card's embedding is
+        gathered through the coin-type one-hot `psi` already carries."""
+        pay = psi[:, AOFF_PAYS:AOFF_PAYS + NTYPE].unsqueeze(1) @ e     # [A, 1, de]
+        return F.relu(self.wq(torch.cat([psi, pay.squeeze(1)], -1)))
+
+    def forward(self, xpub, phi, inv, w, seg, nseg):
+        """Values for every config in a ragged batch.
+
+        `xpub` is `[B, PUBFEAT]`. The configs of every row and player are
+        concatenated into one list of length `N`; `w[i]` is config `i`'s belief
+        probability and `seg[i] = 2 * row + player` says where it belongs.
+
+        The holding tower runs over *distinct* configs only: `phi` is
+        `[U, CFEAT]` and `inv` maps each of the `N` entries to its row in it. The
+        Rust solver deduplicates for the same reason.
+        """
+        e = self.cards(xpub)
+        # A distinct config belongs to a row, and a row to a game, so it reads
+        # that game's card table. `seg // 2` is the row of each entry; the first
+        # entry naming a distinct config fixes which table it uses.
+        crow = torch.zeros(phi.shape[0], dtype=torch.long, device=phi.device)
+        crow.scatter_(0, inv, seg // 2)
+        z = self.holdings(phi, e[crow])
         g = self.wg(z)
-        # The belief: a weighted sum of config embeddings, per (row, player).
-        e = torch.zeros(nseg, z.shape[1], dtype=z.dtype, device=z.device)
-        e.index_add_(0, seg, z[inv] * w.unsqueeze(1))
-        h = F.relu(self.ln0(self.w0(xpub)))
-        h = F.relu(self.ln1(self.w1(h) + self.wb(e.reshape(xpub.shape[0], -1))))
+        b = torch.zeros(nseg, z.shape[1], dtype=z.dtype, device=z.device)
+        b.index_add_(0, seg, z[inv] * w.unsqueeze(1))
+        h = F.relu(self.ln0(self.w0(self.trunk_input(xpub, e))))
+        h = F.relu(self.ln1(self.w1(h) + self.wb(b.reshape(xpub.shape[0], -1))))
         u = self.wu(h)
         rk = u.shape[1]
         gc = g[inv]
@@ -116,10 +203,12 @@ class Mlp(nn.Module):
         """
         f = lambda a: np.ascontiguousarray(a, np.float32)
         w = f(np.concatenate([l.weight.detach().cpu().t().contiguous().numpy().ravel()
-                              for l in (self.w0, self.w1, self.wb, self.wc, self.wg,
+                              for l in (self.wd0, self.wd1, self.wpile,
+                                        self.w0, self.w1, self.wb, self.wc, self.wg,
                                         self.wu, self.wq, self.wk, self.wp)]))
         b = f(np.concatenate([l.bias.detach().cpu().numpy().ravel()
-                              for l in (self.w0, self.w1, self.wc, self.wg, self.wu,
+                              for l in (self.wd0, self.wd1, self.wpile,
+                                        self.w0, self.w1, self.wc, self.wg, self.wu,
                                         self.wq, self.wk, self.wp)]))
         ln = f(np.concatenate([t.detach().cpu().numpy().ravel()
                                for n in (self.ln0, self.ln1) for t in (n.weight, n.bias)]))

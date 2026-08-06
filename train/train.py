@@ -269,6 +269,8 @@ def main():
     ap.add_argument("--dg", type=int, default=64)
     # Rank of the value readout's inner product -- see `Mlp`.
     ap.add_argument("--rank", type=int, default=64)
+    ap.add_argument("--de", type=int, default=32,
+                    help="width of a card embedding: what the describer summarises a\ncard's rulebook facts into, and what every part that names a card reads")
     # Arena size per row of replay capacity. Self-play carries ~24 configs a
     # decision; whichever of the two rings fills first sets the real window.
     ap.add_argument("--cfgs-per-row", type=int, default=48)
@@ -362,7 +364,7 @@ def main():
     rng = np.random.default_rng(args.seed)
     dev = torch.device(args.device)
 
-    value = Mlp(args.hidden, args.dg, args.rank).to(dev)
+    value = Mlp(args.hidden, args.dg, args.rank, args.de).to(dev)
     opt = torch.optim.Adam(value.parameters(), lr=args.lr)
     # Step-decay plan: halve the lr at each listed fraction of the ReBeL phase.
     lr_decays = sorted(float(x) for x in args.lr_decay_frac.split(",") if x.strip())
@@ -408,7 +410,7 @@ def main():
             return
         path = f"{args.out}/snap_{len(snaps):02d}.pt"
         torch.save({"value": value.state_dict(), "hidden": args.hidden,
-                    "dg": args.dg, "rank": args.rank, "t": round(el, 1),
+                    "dg": args.dg, "rank": args.rank, "de": args.de, "t": round(el, 1),
                     "label": label}, path)
         snaps.append({"label": label, "t": round(el, 1),
                       "file": os.path.basename(path)})

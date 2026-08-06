@@ -23,16 +23,20 @@ from value_net import Mlp  # noqa: E402
 def load(path):
     """A checkpoint as an `Mlp`, in the shape it was saved with.
 
-    Checkpoints written before the policy head existed have no `wq`/`wk`/`wp`,
-    so those are left at their random initialisation and `has_policy` is set to
-    False. That is safe for anything that only searches — search asks the
-    network for values and never for action probabilities, so an old snapshot
-    plays exactly the moves it always did and its Elo stays comparable. It is
-    not safe for anything that reads the policy, which is what the flag is for.
+    Checkpoints from before the card describer do not load at all: the trunk's
+    input is a different width, so `w0` has a different shape. That break is
+    deliberate — the describer is what makes an unseen draft readable, and there
+    is no version of the network that both keys on unit identity and does not.
+
+    Checkpoints from after that but before the policy head have no
+    `wq`/`wk`/`wp`. Those are left at their initialisation and `has_policy` goes
+    False, which is safe for anything that only searches — search asks for values
+    and never for action probabilities — and is exactly what anything reading the
+    policy must refuse.
     """
     # Our own checkpoints; torch 2.6+ defaults to weights_only=True.
     ck = torch.load(path, map_location="cpu", weights_only=False)
-    net = Mlp(ck["hidden"], ck.get("dg", 64), ck.get("rank", 64))
+    net = Mlp(ck["hidden"], ck.get("dg", 64), ck.get("rank", 64), ck.get("de", 32))
     missing, _ = net.load_state_dict(ck["value"], strict=False)
     net.has_policy = not any(k.startswith(("wq.", "wk.", "wp.")) for k in missing)
     return net

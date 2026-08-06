@@ -54,7 +54,7 @@ def build(name):
     """`h<hidden>-d<dg>-r<rank>`."""
     try:
         v = {tok[0]: int(tok[1:]) for tok in name.split("-")}
-        return Mlp(v["h"], v["d"], v["r"])
+        return Mlp(v["h"], v["d"], v["r"], v.get("e", 32))
     except (KeyError, ValueError):
         raise SystemExit(f"unknown arch {name!r} -- expected h<hidden>-d<dg>-r<rank>")
 

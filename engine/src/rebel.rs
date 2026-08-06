@@ -199,7 +199,11 @@ pub fn write_config_feats(c: &Config, reserve: &[u8; NSLOT], player: usize, out:
 /// at all, and a plain zero block would be indistinguishable from a square the
 /// board does not have.
 pub const AFEAT: usize =
-    N_KINDS + 3 * (N_HEXES + 1) + 2 * (NSLOT + 1) + 1;
+    N_KINDS + 3 * (N_HEXES + 1) + 2 * (NTYPE + 1) + 1;
+
+/// Where the paying coin type's one-hot starts. The action tower gathers that
+/// card's embedding from it, the same way the hex block does.
+pub const AOFF_PAYS: usize = N_KINDS + 3 * (N_HEXES + 1);
 
 /// `slot` is the coin slot the action spends (`-1` for the micro-decisions
 /// inside a tactic, which spend nothing) and `fdown` whether it goes face down;
@@ -213,14 +217,16 @@ pub fn write_action_feats(a: &Action, ctx: &Ctx, player: usize, slot: i8, fdown:
         out[at + i] = 1.0;
         at += n;
     };
+    // A coin type index, or `NTYPE` for "this action pays nothing" / "this is
+    // not a recruit" — the same indexing the hex and pile blocks use.
+    let ty = |k: i8| if k < 0 { NTYPE } else { player * NSLOT + k as usize };
     hot(a.kind(), N_KINDS, out);
     for h in a.hexes() {
         hot(if h == NONE { N_HEXES } else { h as usize }, N_HEXES + 1, out);
     }
-    hot(if slot < 0 { NSLOT } else { slot as usize }, NSLOT + 1, out);
+    hot(ty(slot), NTYPE + 1, out);
     let r = a.recruited();
-    let rs = if r == NONE { -1 } else { ctx.slot_of[player][r as usize] };
-    hot(if rs < 0 { NSLOT } else { rs as usize }, NSLOT + 1, out);
+    hot(ty(if r == NONE { -1 } else { ctx.slot_of[player][r as usize] }), NTYPE + 1, out);
     out[at] = fdown as u8 as f32;
 }
 
@@ -679,46 +685,50 @@ const MAX_COINS: f32 = 4.0 * 5.0 + 1.0;
 
 pub const PEND_KINDS: usize = 12;
 
-/// Channels in the per-hex block: owner (2), stack height, the owner's slot
-/// one-hot (`NSLOT`), the location marker's owner (2), is-location, and the
-/// pending-maneuver mask.
+/// The coin types in play: each player's `NSLOT` slots, player-major, so type
+/// `p * NSLOT + k` is player `p`'s slot `k`. Everywhere the encoding refers to a
+/// card — on a hex, in a pile, in a holding, paying for an action — it refers to
+/// an index into this list, and the network turns that index into the card's
+/// embedding. Nothing anywhere names a *unit*, which is what lets a draft the
+/// network has never seen be read at all.
+pub const NTYPE: usize = 2 * NSLOT;
+
+/// Raw per-hex facts: occupant owner (2), stack height, the location marker's
+/// owner (2), is-location, pending-maneuver mask.
 ///
-/// The block is laid out hex-major and comes first in the encoding, so a
-/// convolutional trunk can read it as a `[N_HEXES, HEX_CH]` image directly.
-///
-/// Every channel here is a raw fact about the position. A precomputed
+/// Every one is a raw fact about the position. A precomputed
 /// distance-to-nearest-unit map was tried and removed: it is a *derived*
 /// summary — the same quantity `eval_static`'s coverage term uses — so it
-/// imports the handcrafted bot's opinion into the encoding, and it exists only
-/// to paper over the limited reach of a shallow convolution. If the network
-/// needs board-wide context, the honest fix is in the architecture (pooling),
-/// not a hand-built feature.
-pub const HEX_CH: usize = 2 + 1 + NSLOT + 2 + 1 + 1;
-/// Size of the per-hex block.
+/// imports the handcrafted bot's opinion into the encoding.
+pub const HEX_FACTS: usize = 2 + 1 + 2 + 1 + 1;
+/// Per hex: the raw facts, then a one-hot of the occupant's coin type.
+pub const HEX_CH: usize = HEX_FACTS + NTYPE;
 pub const HEX_BLOCK: usize = N_HEXES * HEX_CH;
-/// Per player: reserve, face-up, supply and eliminated counts per coin slot.
-pub const ZONE_FEATS: usize = 4 * NSLOT;
+/// Per coin type: reserve, face-up discard, supply, eliminated.
+pub const PILE_COUNTS: usize = 4;
 pub const PLAYER_SCALARS: usize = 8;
 pub const GLOBAL_SCALARS: usize = 5;
 /// Slot one-hot for the coin a Footman-V2 instant deploy is holding. Public:
 /// a Recruit reveals which unit was taken.
 pub const PEND_SLOT: usize = NSLOT;
 
-/// Offset of the per-player zone counts (just past the hex block).
-pub const OFF_ZONES: usize = HEX_BLOCK;
-/// Offset of the per-slot unit identity one-hots.
-pub const OFF_IDENT: usize = OFF_ZONES + 2 * ZONE_FEATS;
-/// Offset of the per-slot card-property blocks.
-pub const OFF_CARDS: usize = OFF_IDENT + 2 * NSLOT * N_UNITS;
-/// Offset of the per-player scalars.
-pub const OFF_PLAYER: usize = OFF_CARDS + 2 * NSLOT * CARD_FEATS;
-/// Offset of the global scalars.
-pub const OFF_GLOBAL: usize = OFF_PLAYER + 2 * PLAYER_SCALARS;
+pub const OFF_PILES: usize = HEX_BLOCK;
+/// The rulebook facts of each coin type in play — the card describer's input.
+pub const OFF_CARDS: usize = OFF_PILES + NTYPE * PILE_COUNTS;
+/// The scalars that belong to no hex and no card.
+pub const OFF_LOOSE: usize = OFF_CARDS + NTYPE * CARD_FEATS;
+pub const LOOSE: usize = 2 * PLAYER_SCALARS + GLOBAL_SCALARS + PEND_KINDS + PEND_SLOT;
 
-/// Width of the public encoding. It is the whole of it: beliefs no longer ride
-/// along as a fixed-width tail, because a belief is a distribution over configs
-/// and the network reads it as a weighted sum of config vectors instead.
-pub const PUBFEAT: usize = OFF_GLOBAL + GLOBAL_SCALARS + PEND_KINDS + PEND_SLOT;
+/// Width of the public encoding.
+///
+/// This is what a *replay row* stores, and it is deliberately not what the
+/// trunk consumes: the card embedding is a learned function, so a stored row
+/// that contained it would hold whichever weights were live when the row was
+/// written, go stale as training moved them, and pass no gradient back to the
+/// describer. So the row keeps raw facts and one-hots, and the network does the
+/// lookup itself — `Mlp::trunk` turns the per-hex type one-hots into
+/// `[N_HEXES, de]` with one matmul against the card table.
+pub const PUBFEAT: usize = OFF_LOOSE + LOOSE;
 
 /// Round divisor. Measured on the starter draft (`examples/featstats.rs`):
 /// rounds reach 81 under random play and 121 under one-ply greedy, because a
@@ -819,50 +829,42 @@ pub fn write_public_features(s: &State, ctx: &Ctx, out: &mut [f32]) {
             out[i + 2] = s.hex_height[h] as f32 / 5.0;
             let k = ctx.slot_of[owner as usize][s.hex_type[h] as usize];
             if k >= 0 {
-                out[i + 3 + k as usize] = 1.0;
+                out[i + HEX_FACTS + owner as usize * NSLOT + k as usize] = 1.0;
             }
         }
         if s.loc_marker[h] != NONE {
-            out[i + 3 + NSLOT + s.loc_marker[h] as usize] = 1.0;
+            out[i + 3 + s.loc_marker[h] as usize] = 1.0;
         }
-        out[i + 5 + NSLOT] = bd.is_location[h] as u8 as f32;
-        out[i + 6 + NSLOT] = ((pending_hexes.0 >> h) & 1) as f32;
+        out[i + 5] = bd.is_location[h] as u8 as f32;
+        out[i + 6] = ((pending_hexes.0 >> h) & 1) as f32;
         i += HEX_CH;
     }
-    debug_assert_eq!(i, OFF_ZONES);
+    debug_assert_eq!(i, OFF_PILES);
 
+    // The piles, per coin type rather than per player-and-slot: the same counts,
+    // indexed the way everything else in the encoding indexes a card.
     for p in 0..2usize {
         let res = reserve(s, p as u8, ctx);
         for k in 0..NSLOT {
             let u = ctx.slots[p][k] as usize;
-            out[i + k] = res[k] as f32 / 5.0;
-            out[i + NSLOT + k] = s.zones[p][Z_FACEUP][u] as f32 / 5.0;
-            out[i + 2 * NSLOT + k] = s.zones[p][Z_SUPPLY][u] as f32 / 5.0;
-            out[i + 3 * NSLOT + k] = s.zones[p][Z_ELIM][u] as f32 / 5.0;
-        }
-        i += ZONE_FEATS;
-    }
-    debug_assert_eq!(i, OFF_IDENT);
-
-    for p in 0..2usize {
-        for k in 0..NSLOT {
-            out[i + ctx.slots[p][k] as usize] = 1.0;
-            i += N_UNITS;
+            out[i] = res[k] as f32 / 5.0;
+            out[i + 1] = s.zones[p][Z_FACEUP][u] as f32 / 5.0;
+            out[i + 2] = s.zones[p][Z_SUPPLY][u] as f32 / 5.0;
+            out[i + 3] = s.zones[p][Z_ELIM][u] as f32 / 5.0;
+            i += PILE_COUNTS;
         }
     }
     debug_assert_eq!(i, OFF_CARDS);
 
-    // What each drafted card actually does. Under a fixed draft these are
-    // constant across games and carry no information, but they are what lets a
-    // draft the network has never seen be encoded at all, so they are the
-    // prerequisite for `--random-draft`.
+    // What each card in play actually does. The describer reads these; every
+    // other reference to a card is a one-hot into this table.
     for p in 0..2usize {
         for k in 0..NSLOT {
             write_card_features(ctx.slots[p][k], &mut out[i..i + CARD_FEATS]);
             i += CARD_FEATS;
         }
     }
-    debug_assert_eq!(i, OFF_PLAYER);
+    debug_assert_eq!(i, OFF_LOOSE);
 
     for p in 0..2usize {
         let fd: u8 = s.zones[p][Z_FACEDOWN].iter().sum();
@@ -881,7 +883,6 @@ pub fn write_public_features(s: &State, ctx: &Ctx, out: &mut [f32]) {
         out[i + 7] = (s.first_player == p as u8) as u8 as f32;
         i += PLAYER_SCALARS;
     }
-    debug_assert_eq!(i, OFF_GLOBAL);
 
     out[i] = (s.round as f32 / MAX_ROUND).min(1.0);
     // plies_remaining: PBS values near the horizon are not well defined without it.
