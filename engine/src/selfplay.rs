@@ -50,7 +50,7 @@ const STARTER_BLACK: [u16; 4] = [1, 3, 8, 16]; // Archer, Cavalry, Lancer, Scout
 /// put "which coin must I now play" into the private state; the paper's own
 /// advice for such a case is to clamp or exclude, and excluding keeps the
 /// config space exactly `(hand, facedown)`.
-const DRAFT_POOL: [u16; 17] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 17, 19, 52, 53];
+pub const DRAFT_POOL: [u16; 17] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 17, 19, 52, 53];
 
 pub fn make_game(rng: &mut Rng, random: bool) -> State {
     let first = if rng.next_u64() & 1 == 0 { WHITE } else { BLACK };

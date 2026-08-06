@@ -32,6 +32,7 @@ use warchest::rebel::*;
 use warchest::rng::Rng;
 use warchest::search::{node_actions, Cfg, Nets, Solver};
 use warchest::selfplay::make_game;
+use warchest::units::{write_card_features, CARD_FEATS};
 use warchest::state::{Cont, State, Z_BAG, Z_FACEDOWN, Z_FACEUP};
 use warchest::Action;
 
@@ -404,6 +405,39 @@ fn config_features_separate_every_config() {
         }
     }
     assert!(checked > 10_000, "only {checked} config vectors exercised");
+}
+
+/// The card describer is the whole of what makes an unseen draft readable: the
+/// network keys on what a card *does* rather than on which card it is. That only
+/// works if the rulebook facts tell the draftable cards apart. If two share a
+/// vector the describer merges them silently, and every part that reads the
+/// embedding — the hex block, the pile summary, the holding tower, the action
+/// tower — is built on the merge.
+///
+/// The Royal Coin is in play for both sides and is drafted by nobody, so it is
+/// checked alongside the pool.
+#[test]
+fn card_features_separate_every_draftable_unit() {
+    let mut seen: HashMap<Vec<u32>, u8> = HashMap::new();
+    let units: Vec<u8> = warchest::selfplay::DRAFT_POOL
+        .iter()
+        .filter_map(|&id| warchest::units::index_of_id(id))
+        .chain([warchest::units::ROYAL_COIN])
+        .collect();
+    assert_eq!(units.len(), 18, "the draft pool did not resolve to unit indices");
+    for u in units {
+        let mut f = vec![0.0f32; CARD_FEATS];
+        write_card_features(u, &mut f);
+        let key: Vec<u32> = f.iter().map(|x| x.to_bits()).collect();
+        if let Some(prev) = seen.insert(key, u) {
+            assert_eq!(
+                prev, u,
+                "units {} and {} share a card vector, so the describer cannot \
+                 tell them apart",
+                prev, u
+            );
+        }
+    }
 }
 
 /// The same property for actions, and it matters for the same reason: the
