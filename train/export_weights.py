@@ -45,7 +45,7 @@ def load(path):
         net = MlpV1(*args)
         net.load_state_dict(ck["value"])
         return net
-    net = Mlp(*args, ck.get("de", 32))
+    net = Mlp(*args, ck.get("de", 32), head=ck.get("head", ck["hidden"]))
     missing, _ = net.load_state_dict(ck["value"], strict=False)
     net.has_policy = not any(k.startswith(("wq.", "wk.", "wp.")) for k in missing)
     return net

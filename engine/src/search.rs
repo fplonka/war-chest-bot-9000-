@@ -1853,7 +1853,7 @@ impl<'a> Solver<'a> {
         // interned into the same table. What is left per node is its action
         // descriptions, its belief block, and the readout.
         let net = &self.nets.value;
-        let (dg, h) = (net.dg(), net.hidden());
+        let (dg, h) = (net.dg(), net.head());
         let base = self.leaf_rows.len();
         let (mut q, mut logit, mut w, mut psi, mut sb) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());

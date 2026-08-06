@@ -41,16 +41,17 @@ use warchest::Action;
 fn random_net(seed: u64, hidden: usize, dg: usize) -> Mlp {
     let mut r = Rng::new(seed);
     let (de, dc, rk) = (16usize, 32usize, dg);
-    let dims = [PUBFEAT, hidden, CFEAT, dg, rk, AFEAT, de, dc];
+    let dims = [PUBFEAT, hidden, hidden, CFEAT, dg, rk, AFEAT, de, dc];
     let xd = warchest::board::N_HEXES * (HEX_FACTS + de) + 2 * de + LOOSE;
     let nw = CARD_FEATS * dc + dc * de + N_UNITS * de + (PILE_COUNTS + de) * de
         + xd * hidden + hidden * hidden + 2 * dg * hidden + (4 + de) * dg
+        + dg * dg + dg * dg
         + dg * (rk + 1) + hidden * rk + (AFEAT + de) * rk + dg * rk + hidden * rk;
     let mut draw = |n: usize, scale: f32| -> Vec<f32> {
         (0..n).map(|_| (r.unit_f64() as f32 - 0.5) * scale).collect()
     };
     let w = draw(nw, 0.2);
-    let b = draw(dc + de + de + hidden + hidden + dg + (rk + 1) + 4 * rk, 0.2);
+    let b = draw(dc + de + de + hidden + hidden + dg + dg + dg + (rk + 1) + 4 * rk, 0.2);
     // LayerNorm starts at its identity, as torch does.
     let mut ln = Vec::new();
     for _ in 0..2 {

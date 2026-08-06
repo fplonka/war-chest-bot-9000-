@@ -409,6 +409,11 @@ def main():
     ap.add_argument("--warm-minutes", type=float, default=-1.0,
                     help="absolute warm-start length in minutes; overrides --warm-frac")
     ap.add_argument("--hidden", type=int, default=384)
+    # Width of the second public matrix, the belief projection, the second
+    # LayerNorm and the readouts. Metadata like every other width; default
+    # equals --hidden, which is the network this split came from.
+    ap.add_argument("--head", type=int, default=0,
+                    help="readout width (default: --hidden)")
     # Width of a config embedding, and so of one player's belief block. This is
     # the rank of the value function's dependence on the private state, and it
     # is also what the belief is summarised into -- the one place where a fixed
@@ -522,7 +527,8 @@ def main():
     rng = np.random.default_rng(args.seed)
     dev = torch.device(args.device)
 
-    value = Mlp(args.hidden, args.dg, args.rank, args.de).to(dev)
+    value = Mlp(args.hidden, args.dg, args.rank, args.de,
+                head=(args.head or args.hidden)).to(dev)
     opt = torch.optim.Adam(value.parameters(), lr=args.lr)
     # Step-decay plan: halve the lr at each listed fraction of the ReBeL phase.
     lr_decays = sorted(float(x) for x in args.lr_decay_frac.split(",") if x.strip())
@@ -568,6 +574,7 @@ def main():
             return
         path = f"{args.out}/snap_{len(snaps):02d}.pt"
         torch.save({"value": value.state_dict(), "hidden": args.hidden,
+                    "head": args.head or args.hidden,
                     "dg": args.dg, "rank": args.rank, "de": args.de, "t": round(el, 1),
                     "label": label}, path)
         snaps.append({"label": label, "t": round(el, 1),
@@ -575,7 +582,7 @@ def main():
         print(f"[t={el:6.1f}s] --- snapshot {snaps[-1]['file']} ({label}) ---", flush=True)
 
     next_snap = float("inf")
-    print(f"[cfg] PUBFEAT={PUBFEAT} CFEAT={CFEAT} hidden={args.hidden} dg={args.dg} rank={args.rank} depth={args.depth} "
+    print(f"[cfg] PUBFEAT={PUBFEAT} CFEAT={CFEAT} hidden={args.hidden} head={args.head or args.hidden} dg={args.dg} rank={args.rank} depth={args.depth} "
           f"iters={args.iters} budget={total:.0f}s warm={warm:.0f}s device={dev} "
           f"draft={'random' if args.random_draft else 'starter'} "
           f"snapshot_every={args.snapshot_every:.1f}min "

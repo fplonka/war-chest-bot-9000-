@@ -64,10 +64,16 @@ class Mlp(nn.Module):
     the target distribution moves.
     """
 
-    def __init__(self, hidden, dg=64, rank=64, de=32, dc=64):
+    def __init__(self, hidden, dg=64, rank=64, de=32, dc=64, head=None):
         super().__init__()
-        self.dims = [PUBFEAT, hidden, CFEAT, dg, rank, AFEAT, de, dc]
+        # `head` is the width of the second public matrix, the belief
+        # projection, the second LayerNorm and both readouts. It is
+        # checkpoint metadata like every other width; `head == hidden` is
+        # the network the head-width split was taken from.
+        head = hidden if head is None else head
+        self.dims = [PUBFEAT, hidden, head, CFEAT, dg, rank, AFEAT, de, dc]
         self.de = de
+        self.head = head
         xdim = N_HEXES * (HEX_FACTS + de) + 2 * de + LOOSE
         # The card describer, and the pile summary that reads it. Everything
         # that names a card names a coin-type index into `e`. The describer
@@ -80,33 +86,42 @@ class Mlp(nn.Module):
         self.wid = nn.Embedding(N_UNITS, de)
         self.wpile = nn.Linear(PILE_COUNTS + de, de)
         self.w0 = nn.Linear(xdim, hidden)
-        self.w1 = nn.Linear(hidden, hidden)
+        self.w1 = nn.Linear(hidden, head)
         # The belief's connection into the hidden layer. No bias: it is added to
         # a layer that already has one.
-        self.wb = nn.Linear(2 * dg, hidden, bias=False)
+        self.wb = nn.Linear(2 * dg, head, bias=False)
         # The holding tower is per coin type and summed over the five slots, so
-        # it has no order and any draft fits.
+        # it has no order and any draft fits. A residual MLP sits on the sum:
+        # s = sum_k relu([counts_k, seat, e_k] Wc + bc) is the additive tower,
+        # and z = s + relu(s Wh1 + bh1) Wh2 + bh2 lets the tower learn card
+        # combinations. Wh2/bh2 start at zero, so the network begins exactly as
+        # the additive one.
         self.wc = nn.Linear(4 + de, dg)
+        self.wh1 = nn.Linear(dg, dg)
+        self.wh2 = nn.Linear(dg, dg)
         self.wg = nn.Linear(dg, rank + 1)
-        self.wu = nn.Linear(hidden, rank)
+        self.wu = nn.Linear(head, rank)
         # The policy head: an action tower, and the two halves of its readout.
         # Both towers are shared with the value, so this is three matrices.
         self.wq = nn.Linear(AFEAT + de, rank)
         self.wk = nn.Linear(dg, rank)
-        self.wp = nn.Linear(hidden, rank)
+        self.wp = nn.Linear(head, rank)
         # Auxiliary heads, training only. Their targets are dense facts about how
         # the game actually went -- markers three rounds on, whether initiative
         # changes hands, the result -- so every row carries a different answer
         # and every row gives the shared layers a gradient the single value
         # number does not. Never in `flat()`, so the Rust play path never sees
         # them and they cost nothing at play time.
-        self.aux = nn.Linear(hidden, AUX + 2)
+        self.aux = nn.Linear(head, AUX + 2)
         self.ln0 = nn.LayerNorm(hidden)
-        self.ln1 = nn.LayerNorm(hidden)
+        self.ln1 = nn.LayerNorm(head)
         # Start near zero so the first bootstrapped targets are not dominated by
         # random leaf values.
         nn.init.zeros_(self.wg.bias)
         nn.init.normal_(self.wg.weight, std=1e-3)
+        # The holding residual starts as the identity: zeroed second stage.
+        nn.init.zeros_(self.wh2.weight)
+        nn.init.zeros_(self.wh2.bias)
         # True only when the weights were actually trained. A checkpoint from
         # before the policy head exists loads with `strict=False` and leaves
         # these three matrices at their random initialisation, which plays fine
@@ -182,7 +197,8 @@ class Mlp(nn.Module):
         # Rectify before the sum: a sum of raw linear maps is a linear map of
         # the sum, and the sum of the inputs has forgotten which count belongs
         # to which card -- the one thing this tower exists to remember.
-        return F.relu(self.wc(torch.cat([counts, s, mine], -1))).sum(1)
+        z = F.relu(self.wc(torch.cat([counts, s, mine], -1))).sum(1)
+        return z + self.wh2(F.relu(self.wh1(z)))
 
     def actions(self, psi, e):
         """The action tower. `psi` is `[A, AFEAT]` and `e` the card table of each
@@ -234,12 +250,14 @@ class Mlp(nn.Module):
              for l in (self.wd0, self.wd1)]
             + [self.wid.weight.detach().cpu().contiguous().numpy().ravel()]
             + [l.weight.detach().cpu().t().contiguous().numpy().ravel()
-               for l in (self.wpile, self.w0, self.w1, self.wb, self.wc, self.wg,
+               for l in (self.wpile, self.w0, self.w1, self.wb, self.wc,
+                         self.wh1, self.wh2, self.wg,
                          self.wu, self.wq, self.wk, self.wp)]))
         b = f(np.concatenate([l.bias.detach().cpu().numpy().ravel()
                               for l in (self.wd0, self.wd1, self.wpile,
-                                        self.w0, self.w1, self.wc, self.wg, self.wu,
-                                        self.wq, self.wk, self.wp)]))
+                                        self.w0, self.w1, self.wc,
+                                        self.wh1, self.wh2,
+                                        self.wg, self.wu, self.wq, self.wk, self.wp)]))
         ln = f(np.concatenate([t.detach().cpu().numpy().ravel()
                                for n in (self.ln0, self.ln1) for t in (n.weight, n.bias)]))
         return w, b, ln

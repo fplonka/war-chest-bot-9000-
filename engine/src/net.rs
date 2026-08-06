@@ -388,9 +388,12 @@ pub fn fit(v: &mut Vec<f32>, n: usize) {
 /// The value network. See the module docs for the shape; the field names here
 /// are the same symbols.
 ///
-/// Every matrix is row-major `[in, out]`. `dims` is `[pub_dim, hidden, cfeat,
-/// dg, rank]` and is the single source of truth for every buffer size, so the
-/// trainer and the workers agree on the layout from one array.
+/// Every matrix is row-major `[in, out]`. `dims` is `[pub_dim, hidden, head,
+/// cfeat, dg, rank, afeat, de, dc]` and is the single source of truth for
+/// every buffer size, so the trainer and the workers agree on the layout from
+/// one array. `head` is the width of the second public matrix, the belief
+/// projection, the second LayerNorm and both readouts; `head == hidden` is
+/// the pre-split network. All widths are checkpoint metadata.
 #[derive(Clone, Default)]
 pub struct Mlp {
     /// `[pub_dim, hidden, cfeat, dg, rank]`.
@@ -407,9 +410,16 @@ pub struct Mlp {
     /// `[2 * dg, hidden]`: both players' belief embeddings into the hidden
     /// layer. No bias — it is added to a layer that already has one.
     wb: Vec<f32>,
-    /// Config tower: `[cfeat, dg]` and its bias.
+    /// Config tower: `[cfeat, dg]` and its bias. The per-card sum `s` then
+    /// passes through a residual MLP (`wh1`/`wh2`, both `[dg, dg]`) whose
+    /// second stage starts zeroed, so the network begins exactly as the
+    /// additive tower and can learn card combinations.
     wc: Vec<f32>,
     bc: Vec<f32>,
+    wh1: Vec<f32>,
+    bh1: Vec<f32>,
+    wh2: Vec<f32>,
+    bh2: Vec<f32>,
     /// Readout embedding: `[dg, rank + 1]` and its bias. The trailing column is
     /// the per-config bias term, which is why this is `rank + 1` and not `rank`.
     wg: Vec<f32>,
@@ -474,13 +484,13 @@ impl Mlp {
         if dims.len() == 5 {
             return Mlp::from_flat_v1(dims, w, b, ln);
         }
-        if dims.len() != 8 {
+        if dims.len() != 9 {
             return Err(format!(
-                "expected 8 dims [pub, hidden, cfeat, dg, rank, afeat, de, dc], got {dims:?}"
+                "expected 9 dims [pub, hidden, head, cfeat, dg, rank, afeat, de, dc], got {dims:?}"
             ));
         }
-        let (h, dg, rk, de, dc) = (dims[1], dims[3], dims[4], dims[6], dims[7]);
-        let (af, hf, xd) = (dims[5] + de, HFEAT_OF(de), xdim_of(de));
+        let (h, hd, dg, rk, de, dc) = (dims[1], dims[2], dims[4], dims[5], dims[7], dims[8]);
+        let (af, hf, xd) = (dims[6] + de, HFEAT_OF(de), xdim_of(de));
         // The learned per-unit identity table is `[N_UNITS, de]`; the unit
         // count is a game constant, so it needs no dims entry.
         let want_w = CARD_FEATS * dc
@@ -488,16 +498,18 @@ impl Mlp {
             + crate::units::N_UNITS * de
             + (PILE_COUNTS + de) * de
             + xd * h
-            + h * h
-            + 2 * dg * h
+            + h * hd
+            + 2 * dg * hd
             + hf * dg
+            + dg * dg          // holding residual, stage one
+            + dg * dg          // holding residual, stage two
             + dg * (rk + 1)
-            + h * rk
+            + hd * rk
             + af * rk
             + dg * rk
-            + h * rk;
-        let want_b = dc + de + de + h + h + dg + (rk + 1) + 4 * rk;
-        let want_ln = 4 * h;
+            + hd * rk;
+        let want_b = dc + de + de + h + hd + dg + dg + dg + (rk + 1) + 4 * rk;
+        let want_ln = h + hd + h + hd;
         if w.len() != want_w || b.len() != want_b || ln.len() != want_ln {
             return Err(format!(
                 "weight sizes {}/{}/{} do not match dims {dims:?} (want {want_w}/{want_b}/{want_ln})",
@@ -512,20 +524,22 @@ impl Mlp {
             wi += n;
             v
         };
-        let (wd0, wd1, wid, wpile, w0, w1, wb, wc, wg, wu, wq, wk, wp) = (
+        let (wd0, wd1, wid, wpile, w0, w1, wb, wc, wh1, wh2, wg, wu, wq, wk, wp) = (
             take(CARD_FEATS * dc),
             take(dc * de),
             take(crate::units::N_UNITS * de),
             take((PILE_COUNTS + de) * de),
             take(xd * h),
-            take(h * h),
-            take(2 * dg * h),
+            take(h * hd),
+            take(2 * dg * hd),
             take(hf * dg),
+            take(dg * dg),
+            take(dg * dg),
             take(dg * (rk + 1)),
-            take(h * rk),
+            take(hd * rk),
             take(af * rk),
             take(dg * rk),
-            take(h * rk),
+            take(hd * rk),
         );
         let mut bi = 0usize;
         let mut takeb = |n: usize| {
@@ -533,12 +547,14 @@ impl Mlp {
             bi += n;
             v
         };
-        let (bd0, bd1, bpile, b0, b1, bc, bg, bu, bq, bk, bp) = (
+        let (bd0, bd1, bpile, b0, b1, bc, bh1, bh2, bg, bu, bq, bk, bp) = (
             takeb(dc),
             takeb(de),
             takeb(de),
             takeb(h),
-            takeb(h),
+            takeb(hd),
+            takeb(dg),
+            takeb(dg),
             takeb(dg),
             takeb(rk + 1),
             takeb(rk),
@@ -554,11 +570,15 @@ impl Mlp {
             ln0_b: ln[h..2 * h].to_vec(),
             w1,
             b1,
-            ln1_w: ln[2 * h..3 * h].to_vec(),
-            ln1_b: ln[3 * h..4 * h].to_vec(),
+            ln1_w: ln[2 * h..2 * h + hd].to_vec(),
+            ln1_b: ln[2 * h + hd..2 * h + 2 * hd].to_vec(),
             wb,
             wc,
             bc,
+            wh1,
+            bh1,
+            wh2,
+            bh2,
             wg,
             bg,
             wu,
@@ -622,30 +642,36 @@ impl Mlp {
     pub fn hidden(&self) -> usize {
         self.dims[1]
     }
-    /// Width of one config vector.
+    /// Width of the second public matrix and the readouts. A `v1` checkpoint
+    /// predates the split, so its head is its hidden width.
+    pub fn head(&self) -> usize {
+        if self.v1() { self.hidden() } else { self.dims[2] }
+    }
+    /// Width of one config vector. A pre-describer (`v1`) checkpoint has the
+    /// five-entry dims, so the accessors are version-aware.
     pub fn cfeat(&self) -> usize {
-        self.dims[2]
+        if self.v1() { self.dims[2] } else { self.dims[3] }
     }
     /// Width of a config embedding, and of one player's belief block.
     pub fn dg(&self) -> usize {
-        self.dims[3]
+        if self.v1() { self.dims[3] } else { self.dims[4] }
     }
     /// Width of the value readout's inner product.
     pub fn rank(&self) -> usize {
-        self.dims[4]
+        if self.v1() { self.dims[4] } else { self.dims[5] }
     }
     /// Width of both players' belief blocks together.
     pub fn belief_dim(&self) -> usize {
-        2 * self.dims[3]
+        2 * self.dg()
     }
     /// Width of one stored action vector, before the paying card's embedding is
-    /// appended.
+    /// appended. A `v1` checkpoint has no policy head.
     pub fn afeat(&self) -> usize {
-        self.dims[5]
+        if self.v1() { 0 } else { self.dims[6] }
     }
-    /// Width of a card embedding.
+    /// Width of a card embedding. A `v1` checkpoint has no card describer.
     pub fn de(&self) -> usize {
-        self.dims[6]
+        if self.v1() { 0 } else { self.dims[7] }
     }
     /// Whether this is a checkpoint from before the card describer, which reads
     /// the frozen `v1` encoding and has no policy head.
@@ -753,7 +779,7 @@ impl Mlp {
             e.clear();
             return;
         }
-        let (de, dc) = (self.de(), self.dims[7]);
+        let (de, dc) = (self.de(), self.dims[8]);
         let cards = &xpub_row[OFF_CARDS..OFF_CARDS + NTYPE * CARD_FEATS];
         let mut hid = vec![0.0f32; NTYPE * dc];
         gemm_ld(
@@ -909,6 +935,7 @@ impl Mlp {
             }
         }
         let mut slot = vec![0.0f32; n * NSLOT * dg];
+        let mut res = vec![0.0f32; n * dg];
         gemm_ld(n * NSLOT, dg, hf, &inp, hf, &self.wc, dg, 0.0, &mut slot, dg);
         for r in 0..n {
             let out = &mut z[r * dg..(r + 1) * dg];
@@ -921,6 +948,25 @@ impl Mlp {
                 for j in 0..dg {
                     out[j] += (o[j] + self.bc[j]).max(0.0);
                 }
+            }
+        }
+        // The residual: z = s + relu(s Wh1 + bh1) Wh2 + bh2. With Wh2 zeroed
+        // (how every fresh checkpoint starts) this is exactly the additive
+        // tower; trained, it lets the tower combine cards.
+        fit(&mut res, n * dg);
+        gemm_ld(n, dg, dg, &z[..n * dg], dg, &self.wh1, dg, 0.0, &mut res, dg);
+        for r in 0..n {
+            let row = &mut res[r * dg..(r + 1) * dg];
+            for (x, b) in row.iter_mut().zip(self.bh1.iter()) {
+                *x += *b;
+            }
+            relu(row);
+        }
+        gemm_ld(n, dg, dg, &res[..n * dg], dg, &self.wh2, dg, 1.0, &mut z[..n * dg], dg);
+        for r in 0..n {
+            let row = &mut z[r * dg..(r + 1) * dg];
+            for (x, b) in row.iter_mut().zip(self.bh2.iter()) {
+                *x += *b;
             }
         }
         }
