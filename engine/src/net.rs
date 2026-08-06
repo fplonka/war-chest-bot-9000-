@@ -372,6 +372,27 @@ pub struct Mlp {
     /// The PBS side of the readout: `[hidden, rank]` and its bias.
     wu: Vec<f32>,
     bu: Vec<f32>,
+    // ------------------------------------------------------------ policy head
+    // Three more matrices, sharing both towers with the value. An action is
+    // described rather than indexed (`rebel::write_action_feats`), so this is an
+    // embedding network over a node-dependent action list instead of a
+    // fixed-width output vector — the same substitution the config tower makes,
+    // and for the same reason.
+    //
+    //   q(a)       = relu(psi(a) Wq + bq)          [rank]
+    //   logit(a,c) = <u_pi + k(c), q(a)>
+    //
+    // where `u_pi = h Wp + bp` comes from the PBS hidden layer the value
+    // readout also reads, and `k(c) = z(c) Wk + bk` from the config embedding.
+    /// Action tower: `[afeat, rank]` and its bias.
+    wq: Vec<f32>,
+    bq: Vec<f32>,
+    /// The config side of the policy readout: `[dg, rank]` and its bias.
+    wk: Vec<f32>,
+    bk: Vec<f32>,
+    /// The PBS side of the policy readout: `[hidden, rank]` and its bias.
+    wp: Vec<f32>,
+    bp: Vec<f32>,
 }
 
 impl Mlp {
@@ -383,14 +404,15 @@ impl Mlp {
     /// `set_weights` and the `.bin` loader — so there is nowhere for the two to
     /// drift apart.
     pub fn from_flat(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Mlp, String> {
-        if dims.len() != 5 {
+        if dims.len() != 6 {
             return Err(format!(
-                "expected 5 dims [pub, hidden, cfeat, dg, rank], got {dims:?}"
+                "expected 6 dims [pub, hidden, cfeat, dg, rank, afeat], got {dims:?}"
             ));
         }
-        let (p, h, cf, dg, rk) = (dims[0], dims[1], dims[2], dims[3], dims[4]);
-        let want_w = p * h + h * h + 2 * dg * h + cf * dg + dg * (rk + 1) + h * rk;
-        let want_b = h + h + dg + (rk + 1) + rk;
+        let (p, h, cf, dg, rk, af) = (dims[0], dims[1], dims[2], dims[3], dims[4], dims[5]);
+        let want_w = p * h + h * h + 2 * dg * h + cf * dg + dg * (rk + 1) + h * rk
+            + af * rk + dg * rk + h * rk;
+        let want_b = h + h + dg + (rk + 1) + rk + 3 * rk;
         let want_ln = 4 * h;
         if w.len() != want_w || b.len() != want_b || ln.len() != want_ln {
             return Err(format!(
@@ -406,31 +428,56 @@ impl Mlp {
             wi += n;
             v
         };
-        let (w0, w1, wb, wc, wg, wu) = (
+        let (w0, w1, wb, wc, wg, wu, wq, wk, wp) = (
             take(p * h),
             take(h * h),
             take(2 * dg * h),
             take(cf * dg),
             take(dg * (rk + 1)),
             take(h * rk),
+            take(af * rk),
+            take(dg * rk),
+            take(h * rk),
+        );
+        let mut bi = 0usize;
+        let mut takeb = |n: usize| {
+            let v = b[bi..bi + n].to_vec();
+            bi += n;
+            v
+        };
+        let (b0, b1, bc, bg, bu, bq, bk, bp) = (
+            takeb(h),
+            takeb(h),
+            takeb(dg),
+            takeb(rk + 1),
+            takeb(rk),
+            takeb(rk),
+            takeb(rk),
+            takeb(rk),
         );
         Ok(Mlp {
             dims: dims.to_vec(),
             w0,
-            b0: b[..h].to_vec(),
+            b0,
             ln0_w: ln[..h].to_vec(),
             ln0_b: ln[h..2 * h].to_vec(),
             w1,
-            b1: b[h..2 * h].to_vec(),
+            b1,
             ln1_w: ln[2 * h..3 * h].to_vec(),
             ln1_b: ln[3 * h..4 * h].to_vec(),
             wb,
             wc,
-            bc: b[2 * h..2 * h + dg].to_vec(),
+            bc,
             wg,
-            bg: b[2 * h + dg..2 * h + dg + rk + 1].to_vec(),
+            bg,
             wu,
-            bu: b[2 * h + dg + rk + 1..].to_vec(),
+            bu,
+            wq,
+            bq,
+            wk,
+            bk,
+            wp,
+            bp,
         })
     }
 
@@ -492,6 +539,10 @@ impl Mlp {
     /// Width of both players' belief blocks together.
     pub fn belief_dim(&self) -> usize {
         2 * self.dims[3]
+    }
+    /// Width of one action vector.
+    pub fn afeat(&self) -> usize {
+        self.dims[5]
     }
 
     /// LayerNorm + ReLU over `rows x n`, in place, with an optional cached
@@ -569,18 +620,83 @@ impl Mlp {
     /// This is the only part of the network that runs per CFR iteration.
     pub fn pbs_head(&self, xbel: &[f32], rows: usize, pre: &[f32], scratch: &mut Vec<f32>,
                     out: &mut Vec<f32>) {
-        let (h, bd, rk) = (self.hidden(), self.belief_dim(), self.rank());
+        self.hidden_layer(xbel, rows, pre, scratch);
+        self.readout(scratch, rows, &self.wu, &self.bu, out);
+    }
+
+    /// The hidden layer itself: the cached trunk in `pre` plus the belief
+    /// contribution, normalised and rectified. Both readouts start here, which
+    /// is why it is separate — the value's runs every CFR iteration, the
+    /// policy's runs once per solve.
+    fn hidden_layer(&self, xbel: &[f32], rows: usize, pre: &[f32], out: &mut Vec<f32>) {
+        let (h, bd) = (self.hidden(), self.belief_dim());
         debug_assert_eq!(xbel.len(), rows * bd);
         debug_assert!(pre.len() >= rows * h);
-        fit(scratch, rows * h);
-        gemm_ld(rows, h, bd, xbel, bd, &self.wb, h, 0.0, &mut scratch[..rows * h], h);
-        self.ln_relu(rows, h, &self.b1, &self.ln1_w, &self.ln1_b, Some(pre),
-                     &mut scratch[..rows * h]);
+        fit(out, rows * h);
+        gemm_ld(rows, h, bd, xbel, bd, &self.wb, h, 0.0, &mut out[..rows * h], h);
+        self.ln_relu(rows, h, &self.b1, &self.ln1_w, &self.ln1_b, Some(pre), &mut out[..rows * h]);
+    }
+
+    /// `hid W + b`, into `[rows * rank]`.
+    fn readout(&self, hid: &[f32], rows: usize, w: &[f32], b: &[f32], out: &mut Vec<f32>) {
+        let (h, rk) = (self.hidden(), self.rank());
         fit(out, rows * rk);
-        gemm_ld(rows, rk, h, scratch, h, &self.wu, rk, 0.0, &mut out[..rows * rk], rk);
+        gemm_ld(rows, rk, h, hid, h, w, rk, 0.0, &mut out[..rows * rk], rk);
         for r in 0..rows {
-            for (x, b) in out[r * rk..r * rk + rk].iter_mut().zip(self.bu.iter()) {
+            for (x, bb) in out[r * rk..r * rk + rk].iter_mut().zip(b.iter()) {
+                *x += *bb;
+            }
+        }
+    }
+
+    /// The action tower: `q(a) = relu(psi(a) Wq + bq)` for `na` actions,
+    /// `psi` being `[na * afeat]`. Writes `[na * rank]`.
+    ///
+    /// Cheap and per node, not per config: an action's description does not
+    /// depend on who is holding what.
+    pub fn embed_actions(&self, psi: &[f32], na: usize, out: &mut Vec<f32>) {
+        let (af, rk) = (self.afeat(), self.rank());
+        debug_assert_eq!(psi.len(), na * af);
+        fit(out, na * rk);
+        gemm_ld(na, rk, af, psi, af, &self.wq, rk, 0.0, &mut out[..na * rk], rk);
+        for r in 0..na {
+            let row = &mut out[r * rk..r * rk + rk];
+            for (x, b) in row.iter_mut().zip(self.bq.iter()) {
                 *x += *b;
+            }
+            relu(row);
+        }
+    }
+
+    /// Policy logits for one decision node: `[nc * na]`, row-major by config.
+    ///
+    /// `xbel`/`pre` are that node's single PBS row, `cidx` names its configs in
+    /// the `z` table `embed` built, and `q` is `embed_actions`' output. The
+    /// caller softmaxes; nothing here knows which actions are legal, because
+    /// legality is the caller's mask and applying it twice is how a
+    /// renormalisation goes wrong.
+    #[allow(clippy::too_many_arguments)]
+    pub fn policy(&self, xbel: &[f32], pre: &[f32], z: &[f32], cidx: &[u32], q: &[f32],
+                  na: usize, scratch: &mut Vec<f32>, out: &mut [f32]) {
+        let (dg, rk) = (self.dg(), self.rank());
+        debug_assert_eq!(out.len(), cidx.len() * na);
+        self.hidden_layer(xbel, 1, pre, scratch);
+        let mut upi = Vec::new();
+        self.readout(scratch, 1, &self.wp, &self.bp, &mut upi);
+        let mut k = vec![0.0f32; rk];
+        for (ci, &c) in cidx.iter().enumerate() {
+            // k(c) = z(c) Wk + bk, added to the PBS readout before the dot with
+            // each action: one vector per config, then `na` dot products.
+            let zc = &z[c as usize * dg..(c as usize + 1) * dg];
+            for j in 0..rk {
+                let mut s = self.bk[j] + upi[j];
+                for (i, zi) in zc.iter().enumerate() {
+                    s += zi * self.wk[i * rk + j];
+                }
+                k[j] = s;
+            }
+            for a in 0..na {
+                out[ci * na + a] = dot(&k, &q[a * rk..a * rk + rk]);
             }
         }
     }

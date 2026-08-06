@@ -14,6 +14,7 @@ import warchest
 
 PUBFEAT = warchest.PUBFEAT
 CFEAT = warchest.CFEAT
+AFEAT = warchest.AFEAT
 
 
 class Mlp(nn.Module):
@@ -50,7 +51,7 @@ class Mlp(nn.Module):
 
     def __init__(self, hidden, dg=64, rank=64):
         super().__init__()
-        self.dims = [PUBFEAT, hidden, CFEAT, dg, rank]
+        self.dims = [PUBFEAT, hidden, CFEAT, dg, rank, AFEAT]
         self.w0 = nn.Linear(PUBFEAT, hidden)
         self.w1 = nn.Linear(hidden, hidden)
         # The belief's connection into the hidden layer. No bias: it is added to
@@ -59,12 +60,24 @@ class Mlp(nn.Module):
         self.wc = nn.Linear(CFEAT, dg)
         self.wg = nn.Linear(dg, rank + 1)
         self.wu = nn.Linear(hidden, rank)
+        # The policy head: an action tower, and the two halves of its readout.
+        # Both towers are shared with the value, so this is three matrices.
+        self.wq = nn.Linear(AFEAT, rank)
+        self.wk = nn.Linear(dg, rank)
+        self.wp = nn.Linear(hidden, rank)
         self.ln0 = nn.LayerNorm(hidden)
         self.ln1 = nn.LayerNorm(hidden)
         # Start near zero so the first bootstrapped targets are not dominated by
         # random leaf values.
         nn.init.zeros_(self.wg.bias)
         nn.init.normal_(self.wg.weight, std=1e-3)
+        # True only when the weights were actually trained. A checkpoint from
+        # before the policy head exists loads with `strict=False` and leaves
+        # these three matrices at their random initialisation, which plays fine
+        # as long as nothing reads them -- search asks only for values. Anything
+        # that does read them asserts on this rather than quietly playing noise
+        # and reporting it as a strength result.
+        self.has_policy = True
 
     def forward(self, xpub, phi, inv, w, seg, nseg):
         """Values for every config in a ragged batch.
@@ -92,18 +105,26 @@ class Mlp(nn.Module):
         gc = g[inv]
         return (u[seg // 2] * gc[:, :rk]).sum(-1) + gc[:, rk]
 
-    def push(self, slot):
-        """Ship weights to the Rust workers (row-major `[in, out]` per matrix).
+    def flat(self):
+        """The weights as the three flat arrays Rust reads: every matrix
+        row-major `[in, out]`, then every bias, then the LayerNorms.
 
-        The order here is `Mlp::from_flat`'s and nothing else knows it, so the
-        two cannot drift apart without `test_parity.py` failing.
+        The order here is `Mlp::from_flat`'s and nothing else knows it. Both
+        ways of getting weights into Rust — `push` for a live run and
+        `export_weights.py` for the offline tools — go through this, so there is
+        one place for the two sides to agree and `test_parity.py` checks it.
         """
-        w = np.concatenate([l.weight.detach().cpu().t().contiguous().numpy().ravel()
-                            for l in (self.w0, self.w1, self.wb, self.wc, self.wg, self.wu)])
-        b = np.concatenate([l.bias.detach().cpu().numpy().ravel()
-                            for l in (self.w0, self.w1, self.wc, self.wg, self.wu)])
-        ln = np.concatenate([t.detach().cpu().numpy().ravel()
-                             for n in (self.ln0, self.ln1) for t in (n.weight, n.bias)])
-        warchest.set_weights(self.dims, np.ascontiguousarray(w, np.float32),
-                             np.ascontiguousarray(b, np.float32),
-                             np.ascontiguousarray(ln, np.float32), slot)
+        f = lambda a: np.ascontiguousarray(a, np.float32)
+        w = f(np.concatenate([l.weight.detach().cpu().t().contiguous().numpy().ravel()
+                              for l in (self.w0, self.w1, self.wb, self.wc, self.wg,
+                                        self.wu, self.wq, self.wk, self.wp)]))
+        b = f(np.concatenate([l.bias.detach().cpu().numpy().ravel()
+                              for l in (self.w0, self.w1, self.wc, self.wg, self.wu,
+                                        self.wq, self.wk, self.wp)]))
+        ln = f(np.concatenate([t.detach().cpu().numpy().ravel()
+                               for n in (self.ln0, self.ln1) for t in (n.weight, n.bias)]))
+        return w, b, ln
+
+    def push(self, slot):
+        """Ship weights to the Rust workers."""
+        warchest.set_weights(self.dims, *self.flat(), slot)

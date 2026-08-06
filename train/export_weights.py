@@ -21,23 +21,27 @@ from value_net import Mlp  # noqa: E402
 
 
 def load(path):
-    """A checkpoint as an `Mlp`, in the shape it was saved with."""
+    """A checkpoint as an `Mlp`, in the shape it was saved with.
+
+    Checkpoints written before the policy head existed have no `wq`/`wk`/`wp`,
+    so those are left at their random initialisation and `has_policy` is set to
+    False. That is safe for anything that only searches — search asks the
+    network for values and never for action probabilities, so an old snapshot
+    plays exactly the moves it always did and its Elo stays comparable. It is
+    not safe for anything that reads the policy, which is what the flag is for.
+    """
     # Our own checkpoints; torch 2.6+ defaults to weights_only=True.
     ck = torch.load(path, map_location="cpu", weights_only=False)
     net = Mlp(ck["hidden"], ck.get("dg", 64), ck.get("rank", 64))
-    net.load_state_dict(ck["value"])
+    missing, _ = net.load_state_dict(ck["value"], strict=False)
+    net.has_policy = not any(k.startswith(("wq.", "wk.", "wp.")) for k in missing)
     return net
 
 
 def main():
     src, dst = sys.argv[1], sys.argv[2]
     net = load(src)
-    w = np.concatenate([l.weight.detach().t().contiguous().numpy().ravel()
-                        for l in (net.w0, net.w1, net.wb, net.wc, net.wg, net.wu)])
-    b = np.concatenate([l.bias.detach().numpy().ravel()
-                        for l in (net.w0, net.w1, net.wc, net.wg, net.wu)])
-    ln = np.concatenate([t.detach().numpy().ravel()
-                         for n in (net.ln0, net.ln1) for t in (n.weight, n.bias)])
+    w, b, ln = net.flat()
     with open(dst, "wb") as f:
         f.write(struct.pack("<I", len(net.dims)))
         f.write(struct.pack(f"<{len(net.dims)}I", *net.dims))

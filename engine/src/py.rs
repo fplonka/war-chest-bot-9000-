@@ -791,6 +791,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("MAX_MAIN_PLAYS", crate::state::MAX_MAIN_PLAYS)?;
     m.add("PUBFEAT", crate::rebel::PUBFEAT)?;
     m.add("CFEAT", crate::rebel::CFEAT)?;
+    m.add("AFEAT", crate::rebel::AFEAT)?;
     m.add("CCOUNTS", crate::rebel::CCOUNTS)?;
     m.add("CNORM", crate::rebel::CNORM)?;
     m.add("N_HEXES", crate::board::N_HEXES)?;
