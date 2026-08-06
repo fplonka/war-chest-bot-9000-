@@ -94,10 +94,7 @@ fn uniform_row(
     c: &Config,
 ) -> (Vec<Action>, Vec<i8>, Vec<bool>, Vec<f64>) {
     let (acts, aslot, fdown) = node_actions(s, p, ctx, std::slice::from_ref(c));
-    let legal: Vec<bool> = aslot
-        .iter()
-        .map(|&k| k < 0 || c.hand[k as usize] > 0)
-        .collect();
+    let legal: Vec<bool> = aslot.iter().map(|&k| action_legal(c, k)).collect();
     let n = legal.iter().filter(|&&x| x).count() as f64;
     let probs = legal
         .iter()
@@ -206,8 +203,25 @@ fn belief_tracker_matches_brute_force() {
 }
 
 fn run_one(seed: u64) {
+    // The starter matchup: no Warrior Priest, so the pending-coin machinery is
+    // dormant — the comparison still runs, and is the regression test for the
+    // ordinary path.
+    run_one_draft(seed, &[17, 12, 4, 9], &[1, 3, 8, 16]);
+}
+
+/// The same exhaustive-vs-incremental comparison on a draft with both Warrior
+/// Priests: private mid-round draws put `pending_coin` into the config, so the
+/// belief update, the walk and the brute force all carry it.
+#[test]
+fn belief_tracker_matches_brute_force_with_warrior_priests() {
+    for seed in 0..4u64 {
+        run_one_draft(seed + 100, &[18, 17, 12, 4], &[54, 1, 3, 8]);
+    }
+}
+
+fn run_one_draft(seed: u64, white: &[u16], black: &[u16]) {
     let mut rng = Rng::new(seed + 1);
-    let mut s = make_game(&mut rng, false);
+    let mut s = State::from_draft(white, black, warchest::state::WHITE);
     let ctx = Ctx::new(&s);
     let mut bel = [
         Belief::point(Config::default()),
@@ -243,7 +257,8 @@ fn run_one(seed: u64) {
 
             let res = reserve(&s, p, &ctx);
             let fu = faceup_counts(&s, p, &ctx);
-            bel[p as usize] = belief_after_draw(&bel[p as usize], &res, &fu);
+            let wp = matches!(s.pending(), Cont::WarriorPriestDraw { .. });
+            bel[p as usize] = belief_after_draw(&bel[p as usize], &res, &fu, wp);
 
             let acts = s.legal_actions();
             let wts = draw_weights(&s, p, &acts);
@@ -587,7 +602,7 @@ fn card_features_separate_every_draftable_unit() {
         .filter_map(|&id| warchest::units::index_of_id(id))
         .chain([warchest::units::ROYAL_COIN])
         .collect();
-    assert_eq!(units.len(), 18, "the draft pool did not resolve to unit indices");
+    assert_eq!(units.len(), 20, "the draft pool did not resolve to unit indices");
     for u in units {
         let mut f = vec![0.0f32; CARD_FEATS];
         write_card_features(u, &mut f);
@@ -657,7 +672,7 @@ fn action_features_separate_every_action() {
 #[test]
 fn config_counts_are_hand_facedown_bag() {
     let reserve = [4u8, 3, 5, 2, 1];
-    let c = Config { hand: [1, 0, 2, 0, 0], fd: [2, 1, 0, 0, 1] };
+    let c = Config { hand: [1, 0, 2, 0, 0], fd: [2, 1, 0, 0, 1], pending_coin: None };
     let mut cnt = [0u8; CCOUNTS];
     config_counts(&c, &reserve, &mut cnt);
     assert_eq!(&cnt[..NSLOT], &c.hand, "hand block");
@@ -850,8 +865,8 @@ fn from_pairs_keeps_zero_weight_configs() {
     // index by one — the walk-desync panic that killed
     // runs/t256_h384_dg64_s12 at epoch 168.
     let a = Config::default();
-    let b = Config { hand: [1, 0, 0, 0, 0], fd: [0; NSLOT] };
-    let c = Config { hand: [0; NSLOT], fd: [1, 0, 0, 0, 0] };
+    let b = Config { hand: [1, 0, 0, 0, 0], fd: [0; NSLOT], pending_coin: None };
+    let c = Config { hand: [0; NSLOT], fd: [1, 0, 0, 0, 0], pending_coin: None };
     let bel = Belief::from_pairs(vec![
         (b, 0.25),
         (c, -0.5), // a negative weight is still dropped

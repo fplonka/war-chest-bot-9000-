@@ -13,8 +13,9 @@
 //!   * the **identities of face-down discards** — the coin spent on Pass,
 //!     Claim Initiative, or a Recruit payment is never revealed.
 //!
-//! So a player's private state is the pair `(hand, facedown)`, and the bag is
-//! *derived*:
+//! So a player's private state is the pair `(hand, facedown)`, plus — while a
+//! Warrior Priest forced play is pending — which hand slot holds the coin that
+//! must be played (`pending_coin`). The bag is *derived*:
 //!
 //!   `bag = reserve - hand - facedown`,  `reserve = bag + hand + facedown`
 //!
@@ -22,7 +23,8 @@
 //! and eliminated). Hand size, bag size and face-down count are public too —
 //! you can see how many coins someone is holding.
 //!
-//! A `Config` is that pair. The reachable set is small — measured over 41k
+//! A `Config` is that triple (`pending_coin` is `None` at every normal-turn
+//! boundary). The reachable set is small — measured over 41k
 //! positions of random play: median 8, mean 34, p99 385 — so CFR enumerates
 //! information states exactly, with no particle approximation.
 //!
@@ -109,6 +111,11 @@ impl Ctx {
 pub struct Config {
     pub hand: [u8; NSLOT],
     pub fd: [u8; NSLOT],
+    /// The coin slot that must be played next: set by a Warrior Priest draw,
+    /// cleared when the forced play resolves. `None` at every MainPlay
+    /// boundary — the drawn coin sits in the hand, this only says which one
+    /// the rules force you to play. Never a replay or network feature.
+    pub pending_coin: Option<u8>,
 }
 
 impl Config {
@@ -130,15 +137,16 @@ impl Config {
         b
     }
     /// A single integer that orders configs exactly as `Ord` does: hand
-    /// lexicographically, then face-down. Sorting and deduping child supports
-    /// is the hot part of building a subgame, and comparing one `u64` beats
-    /// walking two five-byte arrays — but only if the key is computed once per
-    /// element rather than once per comparison, which is why this is a method
-    /// and not an `Ord` impl.
+    /// lexicographically, then face-down, then the pending coin. Sorting and
+    /// deduping child supports is the hot part of building a subgame, and
+    /// comparing one `u64` beats walking the arrays — but only if the key is
+    /// computed once per element rather than once per comparison, which is why
+    /// this is a method and not an `Ord` impl.
     /// 2 bits per hand slot (a hand holds at most `HAND_CAP` = 3 coins in
-    /// total, so no slot exceeds 3) and 5 per face-down slot (bounded by the
-    /// largest supply in the game), for 35 bits — which leaves room to pack an
-    /// element index alongside it in one `u64`.
+    /// total, so no slot exceeds 3), 5 per face-down slot (bounded by the
+    /// largest supply in the game) and 3 for the pending coin (`None` = 0,
+    /// `Some(k)` = k + 1), for 38 bits — which leaves room to pack an element
+    /// index alongside it in one `u64`.
     #[inline]
     pub fn key(&self) -> u64 {
         let mut k = 0u64;
@@ -150,6 +158,8 @@ impl Config {
             debug_assert!(self.fd[i] < 32, "face-down slot over the key width");
             k = (k << 5) | self.fd[i] as u64;
         }
+        debug_assert!(self.pending_coin.map_or(0, |p| p as u64 + 1) < 8);
+        k = (k << 3) | self.pending_coin.map_or(0, |p| p as u64 + 1);
         k
     }
 }
@@ -245,13 +255,22 @@ pub fn reserve(s: &State, p: u8, ctx: &Ctx) -> [u8; NSLOT] {
     out
 }
 
-/// The true config of `p` in a world state.
+/// The true config of `p` in a world state, including the pending forced-play
+/// coin when `p` is mid-Warrior-Priest-play.
 pub fn true_config(s: &State, p: u8, ctx: &Ctx) -> Config {
     let mut c = Config::default();
     for k in 0..NSLOT {
         let u = ctx.slots[p as usize][k] as usize;
         c.hand[k] = s.zones[p as usize][Z_HAND][u];
         c.fd[k] = s.zones[p as usize][Z_FACEDOWN][u];
+    }
+    if let Cont::WarriorPriestPlay { player, coin } = *s.pending() {
+        if player == p {
+            let k = ctx.slot_of[p as usize][coin as usize];
+            if k >= 0 {
+                c.pending_coin = Some(k as u8);
+            }
+        }
     }
     c
 }
@@ -287,7 +306,7 @@ pub fn enumerate_configs(reserve: &[u8; NSLOT], hand_size: u8, fd_size: u8) -> V
         if k == NSLOT - 1 {
             if left + hand[k] <= res[k] {
                 fd[k] = left;
-                out.push(Config { hand: *hand, fd: *fd });
+                out.push(Config { hand: *hand, fd: *fd, pending_coin: None });
                 fd[k] = 0;
             }
             return;
@@ -401,12 +420,40 @@ impl Belief {
 
 }
 
+/// Is `slot` a legal coin for this config to spend right now? `slot` is the
+/// coin slot the action spends (-1 for the micro-decisions that spend
+/// nothing). A pending forced play allows only the pending coin; otherwise any
+/// coin the config holds.
+#[inline]
+pub fn action_legal(c: &Config, slot: i8) -> bool {
+    match c.pending_coin {
+        Some(p) => slot == p as i8,
+        None => slot < 0 || c.hand[slot as usize] > 0,
+    }
+}
+
 /// How a coin play moves a config. `slot` is the coin spent (-1 for the
 /// micro-decisions that spend nothing); `facedown` says whether it goes to the
 /// face-down discard (Pass / Claim Initiative / Recruit payment) or leaves the
 /// reserve in full view.
+///
+/// A Warrior Priest forced play spends the pending coin and clears the flag;
+/// the drawn coin is physically in the hand, so `slot` must be exactly the
+/// pending slot.
 #[inline]
 pub fn advance_config(c: &Config, slot: i8, facedown: bool) -> Option<Config> {
+    if let Some(p) = c.pending_coin {
+        if slot != p as i8 || c.hand[p as usize] == 0 {
+            return None;
+        }
+        let mut n = *c;
+        n.hand[p as usize] -= 1;
+        if facedown {
+            n.fd[p as usize] += 1;
+        }
+        n.pending_coin = None;
+        return Some(n);
+    }
     if slot < 0 {
         return Some(*c);
     }
@@ -422,11 +469,21 @@ pub fn advance_config(c: &Config, slot: i8, facedown: bool) -> Option<Config> {
     Some(n)
 }
 
-/// Belief update through a round-start draw. The drawn coin is private, so the
-/// public tree does not branch: the belief is convolved with each config's own
-/// draw distribution. A config whose bag is empty reshuffles first, which folds
-/// its face-down discards into the bag and therefore *erases* them.
-pub fn belief_after_draw(b: &Belief, reserve: &[u8; NSLOT], faceup: &[u8; NSLOT]) -> Belief {
+/// Belief update through a draw. The drawn coin is private, so the public tree
+/// does not branch: the belief is convolved with each config's own draw
+/// distribution. A config whose bag is empty reshuffles first, which folds its
+/// face-down discards into the bag and therefore *erases* them.
+///
+/// `set_pending` marks a Warrior Priest draw: the drawn coin is forced to be
+/// played next, so every child carries it as its `pending_coin`. The drawn
+/// coin lands in the hand, and the hand never exceeds `HAND_CAP` — the trigger
+/// is always preceded by the coin play that fired it.
+pub fn belief_after_draw(
+    b: &Belief,
+    reserve: &[u8; NSLOT],
+    faceup: &[u8; NSLOT],
+    set_pending: bool,
+) -> Belief {
     let mut pairs: Vec<(Config, f32)> = Vec::with_capacity(b.len() * NSLOT);
     for (c, w) in b.cfg.iter().zip(b.p.iter()) {
         let (src, base) = draw_source(c, reserve, faceup);
@@ -441,7 +498,14 @@ pub fn belief_after_draw(b: &Belief, reserve: &[u8; NSLOT], faceup: &[u8; NSLOT]
             }
             let mut n = base;
             n.hand[k] += 1;
-            if n.hand_size() as usize <= HAND_CAP {
+            if set_pending {
+                debug_assert!(
+                    n.hand_size() as usize <= HAND_CAP,
+                    "a WP draw must not push the hand over the cap"
+                );
+                n.pending_coin = Some(k as u8);
+                pairs.push((n, *w * src[k] as f32 / total as f32));
+            } else if n.hand_size() as usize <= HAND_CAP {
                 pairs.push((n, *w * src[k] as f32 / total as f32));
             }
         }
@@ -508,6 +572,11 @@ impl DrawScratch {
     /// child support and the transition — the per-config chance factor the
     /// subgame tree's reach accounting needs, kept separate from both players'
     /// strategies.
+    ///
+    /// `set_pending` marks a Warrior Priest draw: the drawn coin is forced to
+    /// be played next, so every child carries it as its `pending_coin` (the
+    /// hand cap cannot be exceeded — the trigger is always preceded by the
+    /// coin play that fired it).
     pub fn transition(
         &mut self,
         cfg: &[Config],
@@ -515,6 +584,7 @@ impl DrawScratch {
         faceup: &[u8; NSLOT],
         support: &mut Vec<Config>,
         map: &mut DrawMap,
+        set_pending: bool,
     ) {
         let tg = crate::timed!(DGEN);
         self.kid.clear();
@@ -535,7 +605,15 @@ impl DrawScratch {
                     }
                     let mut n = base;
                     n.hand[k] += 1;
-                    if n.hand_size() as usize <= HAND_CAP {
+                    if set_pending {
+                        debug_assert!(
+                            n.hand_size() as usize <= HAND_CAP,
+                            "a WP draw must not push the hand over the cap"
+                        );
+                        n.pending_coin = Some(k as u8);
+                        self.kid.push(n);
+                        self.prob.push(src[k] as f32 * inv);
+                    } else if n.hand_size() as usize <= HAND_CAP {
                         self.kid.push(n);
                         self.prob.push(src[k] as f32 * inv);
                     }
@@ -620,9 +698,10 @@ pub fn draw_transition(
     cfg: &[Config],
     reserve: &[u8; NSLOT],
     faceup: &[u8; NSLOT],
+    set_pending: bool,
 ) -> (Vec<Config>, DrawMap) {
     let (mut support, mut map) = (Vec::new(), DrawMap::default());
-    DrawScratch::default().transition(cfg, reserve, faceup, &mut support, &mut map);
+    DrawScratch::default().transition(cfg, reserve, faceup, &mut support, &mut map, set_pending);
     (support, map)
 }
 

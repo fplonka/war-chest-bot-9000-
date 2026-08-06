@@ -151,9 +151,14 @@ ATTRIBUTES (free/triggered effects):
 - Swordsman: after it attacks, it may make a free one-step move.
 - Warrior Priest: after it ATTACKS or CONTROLS, draw one coin from your bag
   (refill-shuffle applies if empty) and IMMEDIATELY use it as a normal coin
-  play (any action; pass always legal). The hand can therefore transiently
-  hold 4 coins mid-turn.
-- Warrior Priest V2: same, at most once per turn (one trigger per coin play).
+  play (any action; pass always legal). The forced play must use the drawn
+  coin, so the Royal Guard tactic — which is a play of the Royal Coin, not of
+  a drawn RG coin — is offered only when the drawn coin IS the Royal Coin
+  (adjudication, 2026; the census never separated this case). The hand never
+  transiently exceeds 3: the trigger is always preceded, in the same play
+  chain, by a coin play that emptied a hand slot.
+- Warrior Priest V2: same, at most once per turn. Only V2's own trigger
+  counts against the cap: a V1 trigger earlier in the turn does not block V2.
 - Footman V2 extra attribute: after you RECRUIT a Footman coin while you
   already have a Footman unit deployed, you may immediately deploy the
   recruited coin (normal deploy legality) instead of putting it in discard.

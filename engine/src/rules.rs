@@ -281,7 +281,7 @@ impl State {
     /// Advance to the next player's turn, or to the next round.
     fn end_turn(&mut self) {
         self.turns_taken[self.active as usize] += 1;
-        self.wp_triggers_this_play = 0;
+        self.wp_v2_triggered = false;
         // Alternate to the opponent (begin_main_turn corrects for shortages).
         self.active = other(self.active);
         self.begin_main_turn();
@@ -316,12 +316,15 @@ impl State {
 
 impl State {
     /// Warrior Priest post-trigger after it ATTACKS or CONTROLS: draw a coin and
-    /// forcibly play it. V2 caps at one trigger per coin play.
+    /// forcibly play it. V2 caps at one trigger per turn, and only V2's own
+    /// trigger counts against that cap — a V1 trigger must not block V2.
     fn queue_wp_post(&mut self, hex: usize) {
         if !self.wp_trigger_ready(hex) {
             return;
         }
-        self.wp_triggers_this_play += 1;
+        if def(self.hex_type[hex]).warrior_priest_v2 {
+            self.wp_v2_triggered = true;
+        }
         let p = self.hex_owner[hex];
         self.push_cont(Cont::WarriorPriestDraw {
             player: p,
@@ -338,7 +341,7 @@ impl State {
         if !d.warrior_priest {
             return false;
         }
-        if d.warrior_priest_v2 && self.wp_triggers_this_play >= 1 {
+        if d.warrior_priest_v2 && self.wp_v2_triggered {
             return false; // V2 once-per-turn cap.
         }
         true
@@ -378,7 +381,9 @@ impl State {
             // node; its apply re-installs the RoyalGuardChoice.
             if self.wp_trigger_ready(from) {
                 if let Cont::RoyalGuardChoice { rg_hex, .. } = self.pending {
-                    self.wp_triggers_this_play += 1;
+                    if def(self.hex_type[from]).warrior_priest_v2 {
+                        self.wp_v2_triggered = true;
+                    }
                     let p = self.hex_owner[from];
                     self.set_pending(Cont::WarriorPriestDraw { player: p, rg_hex });
                 }
@@ -1074,7 +1079,8 @@ impl State {
     }
 
     /// Legal Warrior-Priest forced-play actions: any action playable with the
-    /// drawn `coin` type, plus Pass (always legal). If `coin == NONE`, only Pass.
+    /// drawn `coin` type — the forced play must use the drawn coin — plus Pass
+    /// (always legal). If `coin == NONE`, only Pass.
     fn list_wp_play(&self, p: u8, coin: u8, out: &mut Vec<Action>) {
         out.push(Action::Pass { coin });
         if coin == NONE {
@@ -1119,7 +1125,13 @@ impl State {
             }
             for h in self.hexes_of(p, coin) {
                 self.list_basic_maneuvers(h, ManVariant::Main, out);
-                self.list_tactics(h, out);
+                // The Royal Guard tactic is a play of the Royal Coin, not of a
+                // drawn RG coin, and the forced play must use the drawn coin —
+                // so it is offered only when the drawn coin IS the Royal Coin
+                // (the branch below). See RULES.md.
+                if def(self.hex_type[h]).tactic != Tactic::RoyalGuard {
+                    self.list_tactics(h, out);
+                }
             }
         } else {
             // Drawn Royal Coin: facedown plays plus the Royal Guard tactic.

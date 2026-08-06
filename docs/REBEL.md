@@ -35,7 +35,9 @@ tree carry every config, and `features_do_not_leak_private_information` checks
 it.
 
 A draft fixes 4 unit types plus the Royal Coin, so at most `NSLOT = 5` coin types
-per player; a hand holds at most 3. Over 41k positions of random play the
+per player; a hand holds at most 3, even across a Warrior Priest draw — the
+trigger is always preceded, in the same play chain, by the coin play that
+fired it. Over 41k positions of random play the
 reachable config set has median 8, mean 34, p99 385. CFR enumerates information
 states exactly — no particle approximation.
 
@@ -57,9 +59,12 @@ deterministic convolution of the belief with each config's draw distribution
 erases the face-down component; bag emptiness is public, so every config
 reshuffles at the same moment.
 
-**The Warrior Priest (units 18 and 54) is excluded from the draft pool.** Its
-attribute triggers a private mid-round draw, which would add "which coin must I
-now play" to the private state.
+**The Warrior Priest pair (units 18 and 54) is in the draft pool.** Its
+attribute triggers a private mid-round draw, so the private state is the
+triple `(hand, facedown, pending_coin)` — which coin the forced play must use.
+The pending coin is transient: it is set by the draw, cleared when the forced
+play resolves, and is always absent at a network-query boundary, so it never
+enters a replay row or the encoding.
 
 ## 2. Horizon
 

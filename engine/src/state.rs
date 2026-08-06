@@ -249,9 +249,9 @@ pub struct State {
     // ---- decision context ----
     pub pending: Cont,
     pub conts: ContStack,
-    /// Warrior Priest V2: number of WP-draw triggers already spent this coin
-    /// play (reset each MainPlay). Enforces the once-per-turn cap.
-    pub wp_triggers_this_play: u8,
+    /// Warrior Priest V2: whether V2 itself already triggered this turn (reset
+    /// at end_turn). V1 has no cap, and a V1 trigger must not block V2.
+    pub wp_v2_triggered: bool,
     /// Transient flag: set when a maneuver's resolution installed a mid-attack
     /// decision node (defender Royal Guard choice), so the caller must NOT
     /// advance past it. Reset whenever a new decision node is set.
@@ -281,7 +281,7 @@ impl State {
             adjudicated_draw: false,
             pending: Cont::MainPlay, // replaced below
             conts: ContStack::default(),
-            wp_triggers_this_play: 0,
+            wp_v2_triggered: false,
             interrupt: false,
         };
 
@@ -507,7 +507,7 @@ impl State {
             adjudicated_draw: false,
             pending: Cont::MainPlay,
             conts: ContStack::default(),
-            wp_triggers_this_play: 0,
+            wp_v2_triggered: false,
             interrupt: false,
         }
     }

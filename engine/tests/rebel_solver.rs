@@ -20,7 +20,11 @@ use warchest::rebel::*;
 use warchest::rng::Rng;
 use warchest::search::{action_coin, node_actions, Cfg, Cfr, Nets, Solver};
 use warchest::selfplay::make_game;
-use warchest::state::{State, MAX_MAIN_PLAYS, Z_BAG, Z_FACEDOWN, Z_HAND};
+use warchest::state::{Cont, State, MAX_MAIN_PLAYS, Z_BAG, Z_FACEDOWN, Z_HAND};
+use warchest::units::{
+    ARCHER, CAVALRY, CROSSBOWMAN, FOOTMAN, LANCER, PIKEMAN, ROYAL_COIN, SWORDSMAN,
+    WARRIOR_PRIEST,
+};
 
 /// A real position `plies` coin plays from the horizon, reached by random play
 /// so it is a state the engine actually produces.
@@ -465,7 +469,7 @@ fn draw_pass_through_consistency() {
             for _ in 0..n.draw_steps {
                 let res = reserve(&ws, n.player, &ctx);
                 let fu = faceup_counts(&ws, n.player, &ctx);
-                b = belief_after_draw(&b, &res, &fu);
+                b = belief_after_draw(&b, &res, &fu, false);
                 let acts = ws.legal_actions();
                 ws.apply_inplace(acts[0]);
             }
@@ -521,6 +525,148 @@ fn draw_pass_through_consistency() {
         cnt[0], cnt[1], cnt[2], cnt[3], cnt[4]
     );
     assert!(checked >= 4, "only {} draw positions exercised", checked);
+}
+
+/// A Warrior Priest draw inside a subgame: the private mid-round draw is a
+/// chance node like a round-start draw, but its children carry the pending
+/// forced-play coin, and the forced play is a config-dependent decision node
+/// whose legal set is exactly the pending coin's plays. Checks the structure
+/// (`belief_after_draw`-consistent support, one public child, per-config
+/// legality), that every non-terminal leaf is a MainPlay state, and that the
+/// solve runs to completion.
+#[test]
+fn warrior_priest_draw_walks_through_the_tree() {
+    use warchest::state::Z_BAG;
+    let nets = Nets::default();
+    // White: WP at W1, enemy at E1. Hand holds one WP coin (the trigger);
+    // the bag holds a WP coin and a Swordsman coin, so a draw can leave
+    // either of two pendings. The root belief carries two configs so the
+    // draw's children span both pendings.
+    let mut s = State::blank(warchest::state::WHITE);
+    s.set_unit(17, warchest::state::WHITE, WARRIOR_PRIEST, 1); // (2,3)
+    s.set_unit(19, warchest::state::BLACK, FOOTMAN, 3); // (4,3)
+    // Full 5-type reserve per player, as `Ctx::new` requires. Only the WP and
+    // Swordsman coins are actually reachable.
+    for u in [WARRIOR_PRIEST, SWORDSMAN, PIKEMAN, CROSSBOWMAN, ROYAL_COIN] {
+        s.add_zone(warchest::state::WHITE, Z_BAG, u, 1);
+    }
+    for u in [FOOTMAN, ARCHER, CAVALRY, LANCER, ROYAL_COIN] {
+        s.add_zone(warchest::state::BLACK, Z_BAG, u, 1);
+    }
+    s.add_zone(warchest::state::WHITE, Z_HAND, WARRIOR_PRIEST, 1);
+    let ctx = Ctx::new(&s);
+    let wp = ctx.slot_of[0][WARRIOR_PRIEST as usize] as u8;
+    let sw = ctx.slot_of[0][SWORDSMAN as usize] as u8;
+    assert_ne!(wp, sw);
+    let mut c1 = Config::default();
+    c1.hand[wp as usize] = 1;
+    let mut c2 = Config::default();
+    c2.hand[wp as usize] = 1;
+    c2.hand[sw as usize] = 1;
+    let bel = [
+        Belief { cfg: vec![c1, c2], p: vec![0.5, 0.5] },
+        Belief::point(Config::default()),
+    ];
+    let mut sv = Solver::new(
+        &s,
+        &ctx,
+        &nets,
+        Cfg { depth: 2, iters: 8, snapshots: true, ..Default::default() },
+        bel.clone(),
+    );
+
+    // Find the WP draw node: a chance node whose state is a WarriorPriestDraw.
+    let draws: Vec<usize> = (0..sv.nodes.len())
+        .filter(|&i| {
+            sv.nodes[i].chance
+                && matches!(sv.nodes[i].s.pending(), Cont::WarriorPriestDraw { .. })
+        })
+        .collect();
+    assert_eq!(draws.len(), 1, "exactly one WP draw in the tree");
+    let d = draws[0];
+    let n = &sv.nodes[d];
+    assert_eq!(n.child.len(), 1, "a draw has exactly one public child");
+    assert_eq!(n.draw_steps, 1, "a WP draw is a single draw");
+    // The child support must be exactly `belief_after_draw(set_pending=true)`,
+    // in order — the invariant the self-play walk asserts at runtime.
+    let res = reserve(&n.s, n.player, &ctx);
+    let fu = faceup_counts(&n.s, n.player, &ctx);
+    let oracle = belief_after_draw(
+        &Belief { cfg: n.cfgs[n.player as usize].to_vec(), p: vec![1.0; n.nc(n.player as usize)] },
+        &res,
+        &fu,
+        true,
+    );
+    let ch = n.child[0];
+    assert_eq!(
+        sv.nodes[ch].cfgs[n.player as usize].to_vec(),
+        oracle.cfg,
+        "post-draw support must equal belief_after_draw's, in order"
+    );
+    // Every child carries a pending coin (no fizzle here: the bag is not
+    // empty), and every draw row is a proper distribution.
+    for c in sv.nodes[ch].cfgs[n.player as usize].iter() {
+        assert!(c.pending_coin.is_some(), "a WP draw child carries its pending coin");
+    }
+    for ci in 0..n.draw.rows() {
+        let sum: f32 = n.draw.row(ci).1.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "draw row {} sums to {}", ci, sum);
+    }
+
+    // The child is a WarriorPriestPlay decision node. Its actions come from
+    // both pendings and its per-config legality is the pending match.
+    let wpn = &sv.nodes[ch];
+    assert!(matches!(wpn.s.pending(), Cont::WarriorPriestPlay { .. }));
+    assert!(!wpn.leaf && !wpn.chance);
+    assert!(wpn.na() > 0);
+    let me = wpn.player as usize;
+    for (ci, c) in wpn.cfgs[me].iter().enumerate() {
+        let pend = c.pending_coin.expect("pending");
+        for a in 0..wpn.na() {
+            assert_eq!(
+                wpn.legal[ci * wpn.na() + a],
+                wpn.aslot[a] == pend as i8,
+                "WP play legality must be the pending match"
+            );
+        }
+    }
+    // At least two distinct pendings are represented.
+    let mut pendings: Vec<u8> = wpn.cfgs[me]
+        .iter()
+        .map(|c| c.pending_coin.unwrap())
+        .collect();
+    pendings.sort_unstable();
+    pendings.dedup();
+    assert!(
+        pendings.len() >= 2,
+        "expected both pendings in the support, got {:?}",
+        pendings
+    );
+
+    // The forced play's children have no pending coin: it is cleared when the
+    // drawn coin is spent.
+    for &c in wpn.child.iter() {
+        for cc in sv.nodes[c].cfgs[me].iter() {
+            assert!(cc.pending_coin.is_none(), "the forced play clears the pending coin");
+        }
+    }
+
+    // Every non-terminal leaf is a MainPlay state.
+    for i in 0..sv.nodes.len() {
+        if sv.nodes[i].leaf && !sv.nodes[i].s.is_terminal() {
+            assert!(
+                matches!(sv.nodes[i].s.pending(), Cont::MainPlay),
+                "non-terminal leaf {} is not a MainPlay state",
+                i
+            );
+        }
+    }
+
+    // The solve runs to completion and Phase 2 agrees with itself.
+    sv.multistep(8);
+    let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
+    assert!(vals[0][0].iter().all(|v| v.is_finite()));
+    assert!(vals[0][1].iter().all(|v| v.is_finite()));
 }
 
 #[test]

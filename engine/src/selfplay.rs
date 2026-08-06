@@ -45,12 +45,11 @@ use rayon::prelude::*;
 const STARTER_WHITE: [u16; 4] = [17, 12, 4, 9]; // Swordsman, Pikeman, Crossbowman, Light Cavalry
 const STARTER_BLACK: [u16; 4] = [1, 3, 8, 16]; // Archer, Cavalry, Lancer, Scout
 
-/// Draftable units, excluding the Warrior Priest and Warrior Priest V2 (ids 18
-/// and 54). Their attribute triggers a *private* mid-round draw, which would
-/// put "which coin must I now play" into the private state; the paper's own
-/// advice for such a case is to clamp or exclude, and excluding keeps the
-/// config space exactly `(hand, facedown)`.
-pub const DRAFT_POOL: [u16; 17] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 17, 19, 52, 53];
+/// Draftable units. The Warrior Priest pair (ids 18 and 54) is included: their
+/// private mid-round draw puts "which coin must I now play" into the private
+/// state as `Config::pending_coin`, which the solver, belief filter and walk
+/// all carry.
+pub const DRAFT_POOL: [u16; 19] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 17, 18, 19, 52, 53, 54];
 
 pub fn make_game(rng: &mut Rng, random: bool) -> State {
     let first = if rng.next_u64() & 1 == 0 { WHITE } else { BLACK };
@@ -162,7 +161,7 @@ impl NodePolicy {
         let mut legal = vec![false; cfgs.len() * na];
         for (ci, c) in cfgs.iter().enumerate() {
             for a in 0..na {
-                legal[ci * na + a] = aslot[a] < 0 || c.hand[aslot[a] as usize] > 0;
+                legal[ci * na + a] = action_legal(c, aslot[a]);
             }
         }
         NodePolicy {
@@ -183,9 +182,7 @@ fn greedy_policy(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config], temp: f32) -
     let na = np.acts.len();
     let mut score = vec![f32::NEG_INFINITY; na];
     for a in 0..na {
-        let rep = cfgs
-            .iter()
-            .find(|c| np.aslot[a] < 0 || c.hand[np.aslot[a] as usize] > 0);
+        let rep = cfgs.iter().find(|c| action_legal(c, np.aslot[a]));
         let Some(rep) = rep else { continue };
         let mut probe = s.clone();
         set_config(&mut probe, player, ctx, rep);
@@ -360,6 +357,10 @@ impl Data {
     /// stored: the value function is a function of the config, so there is
     /// nothing to average away.
     fn push_value(&mut self, s: &State, ctx: &Ctx, bel: &[Belief; 2], y: [&[f32]; 2]) {
+        debug_assert!(
+            matches!(s.pending(), Cont::MainPlay),
+            "every saved value row is a normal coin-play state"
+        );
         let base = self.vx.len();
         self.vx.resize(base + PUBFEAT, 0.0);
         write_public_features(s, ctx, &mut self.vx[base..base + PUBFEAT]);
@@ -386,6 +387,10 @@ impl Data {
     /// strategy at its root, and the descriptions of the actions it is over.
     /// `row` is the live-belief row, whose belief is the solve's own root.
     fn push_policy(&mut self, sv: &Solver, ctx: &Ctx, row: usize, player: u8) {
+        debug_assert!(
+            matches!(sv.nodes[0].s.pending(), Cont::MainPlay),
+            "a policy label is the strategy at a normal coin-play root"
+        );
         let n = &sv.nodes[0];
         let (na, nc) = (n.na(), n.nc(player as usize));
         if na == 0 || nc == 0 {
@@ -496,7 +501,9 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
         if s.is_chance() {
             let res = reserve(&s, player, &ctx);
             let fu = faceup_counts(&s, player, &ctx);
-            bel[player as usize] = belief_after_draw(&bel[player as usize], &res, &fu);
+            let wp = matches!(s.pending(), Cont::WarriorPriestDraw { .. });
+            bel[player as usize] =
+                belief_after_draw(&bel[player as usize], &res, &fu, wp);
             resolve_chance(&mut s, player, rng);
             // The walk spans draws now: a draw is an internal node of the
             // subgame with one public child, so advance through it. The
@@ -674,10 +681,13 @@ pub fn play_game(rng: &mut Rng, nets: &[Nets], gc: &GameCfg, data: &mut Data) ->
             }
         };
 
-        if gc.collect == Collect::Mc {
+        if gc.collect == Collect::Mc && matches!(s.pending(), Cont::MainPlay) {
             // Park the handcrafted evaluation in the target now; the realised
             // outcome is blended in once the game ends. `eval_static` is exactly
             // antisymmetric, so this stays zero-sum.
+            //
+            // Rows are taken only at MainPlay states, like every other training
+            // row: a value target never shows the network a mid-play chain.
             let e = eval_squashed(&s, 0);
             let (a, b) = (vec![e; bel[0].len()], vec![-e; bel[1].len()]);
             data.begin_solve();
@@ -813,7 +823,10 @@ fn blend_outcome(data: &mut Data, from_row: usize, keep: f32, mix: f32, z: f32) 
 }
 
 fn resolve_chance(s: &mut State, player: u8, rng: &mut Rng) {
-    debug_assert!(matches!(s.pending(), Cont::Draw { .. }));
+    debug_assert!(matches!(
+        s.pending(),
+        Cont::Draw { .. } | Cont::WarriorPriestDraw { .. }
+    ));
     let acts = s.legal_actions();
     let mut w: Vec<f64> = Vec::with_capacity(acts.len());
     let mut any = false;

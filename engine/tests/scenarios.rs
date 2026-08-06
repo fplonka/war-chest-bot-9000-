@@ -706,6 +706,101 @@ fn warrior_priest_v2_once_per_turn() {
     );
 }
 
+#[test]
+fn warrior_priest_v1_does_not_block_v2() {
+    // A V1 trigger earlier in the turn must not consume V2's once-per-turn
+    // trigger. White controls with a V1 Warrior Priest, then attacks with a V2
+    // Warrior Priest in the same coin play (via the V1 forced play drawing a
+    // V2 coin — see warrior_priest_v2_once_per_turn for the chain shape).
+    let mut s = State::blank(WHITE);
+    // V1 on a neutral location; V2 adjacent to an enemy that survives.
+    s.set_unit(LOC_11, WHITE, WARRIOR_PRIEST, 1);
+    s.set_unit(CENTER, WHITE, WARRIOR_PRIEST_V2, 1);
+    s.set_unit(E1, BLACK, FOOTMAN, 3); // survives two attacks
+    // V1 attacks instead of controls: simpler, both trigger on attack.
+    s.add_zone(WHITE, Z_HAND, WARRIOR_PRIEST, 1); // coin to spend on the V1 attack
+    s.add_zone(WHITE, Z_BAG, WARRIOR_PRIEST_V2, 1); // V1's forced draw: a V2 coin
+    let s2 = s.apply(Action::Attack {
+        from: LOC_11 as u8,
+        target: E1 as u8,
+    });
+    // V1 triggers: draw.
+    assert!(matches!(s2.pending(), Cont::WarriorPriestDraw { .. }));
+    let s3 = s2.apply(Action::DrawCoin {
+        unit: WARRIOR_PRIEST_V2,
+    });
+    // Forced play with the drawn V2 coin: attack with the V2 unit.
+    let s4 = s3.apply(Action::Attack {
+        from: CENTER as u8,
+        target: E1 as u8,
+    });
+    // The V2 forced play's attack must trigger a fresh WP draw: V1's earlier
+    // trigger does not block V2.
+    assert!(
+        matches!(s4.pending(), Cont::WarriorPriestDraw { .. }),
+        "V1's trigger must not block V2's"
+    );
+}
+
+#[test]
+fn warrior_priest_forced_play_of_rg_coin_cannot_use_rg_tactic() {
+    // The forced play must use the drawn coin. The Royal Guard tactic is a
+    // play of the Royal Coin, not of a drawn RG coin, so it is not offered
+    // even when the Royal Coin is in hand.
+    let mut s = State::blank(WHITE);
+    s.set_unit(W1, WHITE, WARRIOR_PRIEST, 1); // triggers the draw
+    s.set_unit(CENTER, WHITE, ROYAL_GUARD, 1); // deployed RG to move
+    s.set_marker(LOC_25, WHITE); // empty location it could move to
+    s.set_unit(E1, BLACK, FOOTMAN, 3); // attack target
+    s.add_zone(WHITE, Z_HAND, WARRIOR_PRIEST, 1); // coin for the trigger
+    s.add_zone(WHITE, Z_HAND, ROYAL_COIN, 1); // royal coin in hand
+    s.add_zone(WHITE, Z_BAG, ROYAL_GUARD, 1); // the WP draws an RG coin
+    let s2 = s.apply(Action::Attack {
+        from: W1 as u8,
+        target: E1 as u8,
+    });
+    let s3 = s2.apply(Action::DrawCoin {
+        unit: ROYAL_GUARD,
+    });
+    let plays = s3.legal_actions();
+    assert!(has(&plays, Action::Pass { coin: ROYAL_GUARD }));
+    assert!(
+        !has(
+            &plays,
+            Action::TacRoyalGuard {
+                from: CENTER as u8,
+                to: LOC_25 as u8
+            }
+        ),
+        "an RG-coin forced play must not offer the Royal-Guard tactic"
+    );
+    // The Royal Coin's own forced play does offer it (the drawn coin IS the
+    // Royal Coin).
+    let mut t = State::blank(WHITE);
+    t.set_unit(W1, WHITE, WARRIOR_PRIEST, 1);
+    t.set_unit(CENTER, WHITE, ROYAL_GUARD, 1);
+    t.set_marker(LOC_25, WHITE);
+    t.set_unit(E1, BLACK, FOOTMAN, 3);
+    t.add_zone(WHITE, Z_HAND, WARRIOR_PRIEST, 1);
+    t.add_zone(WHITE, Z_BAG, ROYAL_COIN, 1);
+    let t2 = t.apply(Action::Attack {
+        from: W1 as u8,
+        target: E1 as u8,
+    });
+    let t3 = t2.apply(Action::DrawCoin { unit: ROYAL_COIN });
+    let tplays = t3.legal_actions();
+    assert!(
+        has(
+            &tplays,
+            Action::TacRoyalGuard {
+                from: CENTER as u8,
+                to: LOC_25 as u8
+            }
+        ),
+        "a Royal-Coin forced play offers the Royal-Guard tactic"
+    );
+}
+
 // =========================================================== INITIATIVE
 
 #[test]

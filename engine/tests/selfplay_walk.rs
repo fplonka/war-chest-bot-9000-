@@ -174,3 +174,33 @@ fn walk_with_random_drafts() {
         total_dec
     );
 }
+
+/// The walk across private Warrior Priest draws. Random drafts include the
+/// Warrior Priest pair, so a WP-heavy seed stream crosses mid-round draws and
+/// forced plays often; every hard desync assert in `play_game` (post-draw
+/// support equality, belief-filter support, true-config presence) is the test.
+#[test]
+fn walk_across_warrior_priest_draws() {
+    let nets = [warchest::search::Nets::default()];
+    let mut total_dec = 0usize;
+    for seed in 0..16u64 {
+        let mut rng = Rng::new(seed * 65537 + 11);
+        let mut d = Data::default();
+        let gc = GameCfg {
+            agents: [
+                Agent::Rebel { cfg: cfg(), slot: 0 },
+                Agent::Rebel { cfg: cfg(), slot: 0 },
+            ],
+            collect: Collect::Rebel,
+            explore: 0.25,
+            random_draft: true,
+            eval_mix: 0.0,
+            mc_mix: 0.0,
+        };
+        let z = play_game(&mut rng, &nets, &gc, &mut d);
+        assert!(z.is_finite());
+        assert!(d.nv > 0);
+        total_dec += d.decisions;
+    }
+    assert!(total_dec > 0);
+}

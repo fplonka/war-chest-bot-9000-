@@ -32,7 +32,7 @@ use crate::rebel::*;
 use crate::rng::Rng;
 use crate::search::{node_actions, Cfg, Solver};
 use crate::selfplay::effective_bag_count;
-use crate::state::{State, BLACK, WHITE};
+use crate::state::{Cont, State, BLACK, WHITE};
 use crate::units::{def, index_of_id};
 
 fn err<T>(msg: impl Into<String>) -> PyResult<T> {
@@ -203,7 +203,7 @@ impl LiveGame {
         for (ci, c) in cfgs.iter().enumerate() {
             let mut legal_n = 0usize;
             for k in 0..na {
-                if aslot[k] < 0 || c.hand[aslot[k] as usize] > 0 {
+                if action_legal(c, aslot[k]) {
                     legal_n += 1;
                 }
             }
@@ -212,7 +212,7 @@ impl LiveGame {
             }
             let w = self.bel[player as usize].p[ci] / legal_n as f32;
             for k in 0..na {
-                if aslot[k] >= 0 && c.hand[aslot[k] as usize] == 0 {
+                if !action_legal(c, aslot[k]) {
                     continue;
                 }
                 if obs_key(&acts[k]) != obs {
@@ -301,8 +301,9 @@ impl LiveGame {
                 // counts, exactly like the self-play loop.
                 let res = reserve(&self.s, player, &self.ctx);
                 let fu = faceup_counts(&self.s, player, &self.ctx);
+                let wp = matches!(self.s.pending(), Cont::WarriorPriestDraw { .. });
                 self.bel[player as usize] =
-                    belief_after_draw(&self.bel[player as usize], &res, &fu);
+                    belief_after_draw(&self.bel[player as usize], &res, &fu, wp);
                 let acts = self.s.legal_actions();
                 let mut w: Vec<f64> = Vec::with_capacity(acts.len());
                 let mut any = false;

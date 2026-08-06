@@ -285,6 +285,39 @@ pub fn node_actions(
                 acts.push(a);
             }
         }
+    } else if matches!(s.pending(), Cont::WarriorPriestPlay { .. }) {
+        // A forced play is config-dependent the same way a main play is: the
+        // legal set is a function of the config's pending coin. Probe one
+        // state per pending slot present in the support; the probe's pending
+        // node names the drawn unit so `legal_actions` lists exactly the plays
+        // of that coin.
+        for k in 0..NSLOT {
+            if !cfgs.is_empty() && !cfgs.iter().any(|c| c.pending_coin == Some(k as u8)) {
+                continue;
+            }
+            let mut probe = s.clone();
+            let mut one = Config::default();
+            one.hand[k] = 1;
+            set_config(&mut probe, player, ctx, &one);
+            probe.pending = Cont::WarriorPriestPlay {
+                player,
+                coin: ctx.slots[player as usize][k],
+            };
+            for a in probe.legal_actions() {
+                if !seen.insert(a.encode()) {
+                    continue;
+                }
+                let coin = action_coin(&a, &probe);
+                let slot = if coin == NONE {
+                    -1
+                } else {
+                    ctx.slot_of[player as usize][coin as usize]
+                };
+                aslot.push(slot);
+                fdown.push(is_facedown_play(&a));
+                acts.push(a);
+            }
+        }
     } else {
         // Micro-decisions spend nothing out of hand: the config is untouched.
         for a in s.legal_actions() {
@@ -716,10 +749,15 @@ impl<'a> Solver<'a> {
 
     fn build(&mut self, s: State, depth: usize, cfgs: [Rc<[Config]>; 2]) -> usize {
         let player = s.to_act();
-        // A plain round-start draw is walked through (one public child, no
-        // depth cost). Other chance nodes (Warrior Priest draws — excluded
-        // from every draft) stay leaves, as do depth-0 nodes and terminals.
-        let draw_pass = matches!(s.pending(), Cont::Draw { .. });
+        // A draw is walked through (one public child, no depth cost): the
+        // outcome is private, so the public tree does not branch. Round-start
+        // draws collapse over a whole run; a Warrior Priest draw is a single
+        // chance node whose children carry the pending forced-play coin.
+        // Depth-0 nodes and terminals are leaves.
+        let draw_pass = matches!(
+            s.pending(),
+            Cont::Draw { .. } | Cont::WarriorPriestDraw { .. }
+        );
         // Depth counts completed coin plays. A main-play node spends exactly
         // one coin per legal action and every micro node's actions spend
         // nothing, so "is this a main play?" is the whole story: a micro
@@ -786,13 +824,15 @@ impl<'a> Solver<'a> {
                 std::mem::take(&mut self.dm[2]),
             );
             let mut steps = 0u8;
+            // A Warrior Priest draw's children carry the forced-play coin.
+            let wp = matches!(s.pending(), Cont::WarriorPriestDraw { .. });
             loop {
                 let acts = cs.legal_actions();
                 debug_assert!(matches!(acts.first(), Some(Action::DrawCoin { .. })));
                 let res = reserve(&cs, player, self.ctx);
                 let fu = faceup_counts(&cs, player, self.ctx);
                 self.draw_scratch
-                    .transition(&cur, &res, &fu, &mut next, &mut step);
+                    .transition(&cur, &res, &fu, &mut next, &mut step, wp);
                 if steps == 0 {
                     std::mem::swap(&mut draw, &mut step);
                 } else {
@@ -835,10 +875,17 @@ impl<'a> Solver<'a> {
             nc * na < 1 << IDX_BITS,
             "decision node over the index width"
         );
+        // A Warrior Priest forced play may only spend the pending coin, so the
+        // per-config mask is the pending match rather than the hand check.
+        let wp_play = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
         let mut legal = vec![false; nc * na];
         for (ci, c) in mine.iter().enumerate() {
             for a in 0..na {
-                legal[ci * na + a] = aslot[a] < 0 || c.hand[aslot[a] as usize] > 0;
+                legal[ci * na + a] = if wp_play {
+                    c.pending_coin == Some(aslot[a] as u8)
+                } else {
+                    action_legal(c, aslot[a])
+                };
             }
         }
 
@@ -918,7 +965,7 @@ impl<'a> Solver<'a> {
             let a = obs_act[obs_start[ch] as usize] as usize;
             let rep = *mine
                 .iter()
-                .find(|c| aslot[a] < 0 || c.hand[aslot[a] as usize] > 0)
+                .find(|c| action_legal(c, aslot[a]))
                 .expect("a kept action is playable by some config in the support");
             let tb = timed!(BAPPLY);
             let mut cs = s.clone();
@@ -928,18 +975,16 @@ impl<'a> Solver<'a> {
             let mut cc = cfgs.clone();
             cc[me] = std::mem::take(&mut child_cfgs[ch]).into();
             // One depth unit per *completed coin play*, not per decision node.
-            // Every legal action at a main-play node spends exactly one coin
-            // and every action at a micro node spends none, so the node-level
-            // structural test decides the whole observation group and no
-            // per-action scan is needed. The known future divergence:
-            // Cont::WarriorPriestPlay spends a real coin without being
-            // MainPlay — when the Warrior Priest re-enters the draft pool the
-            // predicate becomes `MainPlay | WarriorPriestPlay`, and the debug
-            // assertion below exists so that day is a test failure, not a
-            // silent depth miscount.
+            // A main-play node spends exactly one coin and consumes a depth
+            // unit; a Warrior Priest forced play also spends a coin but rides
+            // free (the chain belongs to the coin play that triggered it);
+            // every micro node spends nothing. The node-level structural test
+            // decides the whole observation group, and the debug assertion
+            // keeps it honest against `action_coin`.
             let spends = matches!(s.pending(), Cont::MainPlay);
             debug_assert_eq!(
-                spends,
+                matches!(s.pending(), Cont::MainPlay)
+                    || matches!(s.pending(), Cont::WarriorPriestPlay { .. }),
                 obs_act[obs_start[ch] as usize..obs_start[ch + 1] as usize]
                     .iter()
                     .any(|&au| action_coin(&acts[au as usize], &s) != NONE),
@@ -1092,6 +1137,12 @@ impl<'a> Solver<'a> {
     /// interned into the shared table. Leaves and — when a warm start needs
     /// them — decision nodes go through here alike.
     fn push_row(&mut self, _id: usize, s: &State, cfgs: &[Rc<[Config]>; 2]) {
+        // The network is queried only at normal coin-play states: a subgame
+        // finishes every tactic, trigger and forced play before a leaf.
+        debug_assert!(
+            matches!(s.pending(), Cont::MainPlay),
+            "a network row must be a MainPlay state"
+        );
         let _t = timed!(PUBFEAT);
         let pf = self.pubfeat;
         let at = (self.leaf_coff.len() / 2) * pf;
@@ -1164,6 +1215,10 @@ impl<'a> Solver<'a> {
         if self.cfg.warm > 0.0 {
             for i in 0..self.nodes.len() {
                 if self.nodes[i].leaf || self.nodes[i].chance {
+                    continue;
+                }
+                // The policy head is read only at normal coin-play choices.
+                if !matches!(self.nodes[i].s.pending(), Cont::MainPlay) {
                     continue;
                 }
                 self.push_row(i, &self.nodes[i].s.clone(), &self.nodes[i].cfgs.clone());
