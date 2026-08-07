@@ -34,6 +34,11 @@ path = "src/bin/bench.rs"
 name = "rebelbench"
 path = "src/bin/rebelbench.rs"
 
+[[example]]
+name = "gpu_bench"
+path = "examples/gpu_bench.rs"
+required-features = ["gpu"]
+
 [profile.release]
 lto = true
 codegen-units = 1
