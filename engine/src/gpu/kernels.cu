@@ -686,3 +686,84 @@ __global__ void warm_seed_kernel(const SolveDesc* descs, const int* slots,
         }
     }
 }
+
+// ------------------------------------------------------- build kernels (2)
+
+// pe[t][j] = bpile[j] + sum_k e[t][k] * wpile[(4 + k)][j]: the card half of
+// the pile summary, folded into the bias once per solve. One thread per
+// (type, de) element. Ports the pe loop of net.rs::assemble.
+__global__ void pile_pe_kernel(float* pe, const float* e, const float* wpile,
+                               const float* bpile, int de) {
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= NTYPE * de) return;
+    int ty = t / de, j = t % de;
+    float acc = bpile[j];
+    const float* er = e + (size_t)ty * de;
+    for (int k = 0; k < de; k++) {
+        acc += er[k] * wpile[((size_t)4 + k) * de + j];
+    }
+    pe[t] = acc;
+}
+
+// relu(x + bias), one thread per element.
+__global__ void relu_bias_kernel(float* x, const float* bias, int n, int width) {
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n * width) return;
+    int j = t % width;
+    float v = x[t] + bias[j];
+    x[t] = v > 0.0f ? v : 0.0f;
+}
+
+// Uniform strategy init at admission: cur/avg = uniform over the legal
+// actions per config, at every decision node. Grid (nodes, nslots). Ports
+// the strategy init of Solver::new.
+__global__ void init_strategy_kernel(const SolveDesc* descs, const int* slots,
+                                     int nslots) {
+    int s = blockIdx.y;
+    if (s >= nslots) return;
+    const SolveDesc* d = descs + slots[s];
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= d->nodes) return;
+    int kind = d->node_kind[i];
+    if (kind != 0) return;
+    int me = d->node_player[i];
+    int nc = nc_of(d, i, me);
+    int na = na_of(d, i);
+    int so = (int)d->soff[i];
+    for (int c = 0; c < nc; c++) {
+        int k = 0;
+        for (int a = 0; a < na; a++) {
+            if (legal_cell(d, so + c * na + a)) k++;
+        }
+        float u = 1.0f / (float)(k > 0 ? k : 1);
+        for (int a = 0; a < na; a++) {
+            int cell = so + c * na + a;
+            float v = legal_cell(d, cell) ? u : 0.0f;
+            d->cur[cell] = v;
+            d->avg[cell] = v;
+        }
+    }
+}
+
+// Seed the average strategy sum with one reach-weighted uniform strategy,
+// as Solver::new does (the initial reach was uploaded). Grid (nodes, nslots).
+__global__ void seed_sum_kernel(const SolveDesc* descs, const int* slots,
+                                int nslots) {
+    int s = blockIdx.y;
+    if (s >= nslots) return;
+    const SolveDesc* d = descs + slots[s];
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= d->nodes) return;
+    int kind = d->node_kind[i];
+    if (kind != 0) return;
+    int me = d->node_player[i];
+    int nc = nc_of(d, i, me);
+    int na = na_of(d, i);
+    int so = (int)d->soff[i];
+    const float* r = d->reach + reach_at(d, i, me, 0);
+    for (int c = 0; c < nc; c++) {
+        for (int a = 0; a < na; a++) {
+            d->sum_strat[so + c * na + a] += r[c] * d->cur[so + c * na + a];
+        }
+    }
+}
