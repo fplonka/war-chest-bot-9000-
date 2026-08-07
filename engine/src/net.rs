@@ -512,6 +512,168 @@ pub struct Mlp {
     wp: Lin,
 }
 
+/// One matrix's place in the flat arrays: `[i, o]` weights at `w`, bias at
+/// `b` (biasless matrices use `usize::MAX`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Span {
+    pub w: usize,
+    pub b: usize,
+    pub i: usize,
+    pub o: usize,
+}
+
+/// Where every v3 matrix lives in the flat arrays — the one description of
+/// the blob. `from_flat_v3` slices through it and the GPU service points
+/// device GEMMs at it, so the two sides cannot disagree.
+#[derive(Clone, Debug, Default)]
+pub struct V3Layout {
+    pub de: usize,
+    pub dg: usize,
+    pub rank: usize,
+    pub head_in: usize,
+    pub head_out: usize,
+    pub nres: usize,
+    pub card: Vec<Span>,
+    /// `[N_UNITS, de]`, weights only.
+    pub wid: usize,
+    pub pile: Span,
+    pub pub_lin: Vec<Span>,
+    /// Per public layer: (gain, bias) offsets into the ln array.
+    pub pub_ln: Vec<(usize, usize)>,
+    pub pub_out: Span,
+    /// `[2 * dg, head_in]`, weights only.
+    pub wb: usize,
+    pub ln1: (usize, usize),
+    pub hmlp: Vec<Span>,
+    pub wu: Span,
+    pub slot: Vec<Span>,
+    pub slot_out: Span,
+    pub res: Vec<(Span, Span)>,
+    pub wg: Span,
+    pub wq: Span,
+    pub wk: Span,
+    pub wp: Span,
+    pub w_len: usize,
+    pub b_len: usize,
+    pub ln_len: usize,
+}
+
+impl V3Layout {
+    /// Walk the v3 dims (see `from_flat_v3`) into spans.
+    pub fn new(dims: &[usize]) -> Result<V3Layout, String> {
+        if dims.first() != Some(&3) {
+            return Err(format!("not a v3 dims vector: {dims:?}"));
+        }
+        let mut at = 1;
+        let mut scalar = |name: &str| -> Result<usize, String> {
+            let v = *dims.get(at).ok_or(format!("dims truncated at {name}"))?;
+            at += 1;
+            Ok(v)
+        };
+        let (de, dg, rank, head_in, nres) = (
+            scalar("de")?, scalar("dg")?, scalar("rank")?, scalar("head_in")?, scalar("nres")?,
+        );
+        let mut list = |name: &str| -> Result<Vec<usize>, String> {
+            let n = *dims.get(at).ok_or(format!("dims truncated at {name}"))?;
+            at += 1;
+            if at + n > dims.len() {
+                return Err(format!("dims truncated inside {name}"));
+            }
+            let v = dims[at..at + n].to_vec();
+            at += n;
+            Ok(v)
+        };
+        let (card_w, pub_w, hmlp_w, slot_w) =
+            (list("card")?, list("pub")?, list("hmlp")?, list("slot")?);
+        if at != dims.len() {
+            return Err(format!("dims has {} trailing entries", dims.len() - at));
+        }
+        if pub_w.is_empty() {
+            return Err("the public tower needs at least one layer".into());
+        }
+        let mut l = V3Layout {
+            de, dg, rank, head_in, nres,
+            head_out: hmlp_w.last().copied().unwrap_or(head_in),
+            ..Default::default()
+        };
+        let (mut w, mut b, mut ln) = (0usize, 0usize, 0usize);
+        let mut lin = |w: &mut usize, b: &mut usize, i: usize, o: usize| {
+            let s = Span { w: *w, b: *b, i, o };
+            *w += i * o;
+            *b += o;
+            s
+        };
+        let chain = |w: &mut usize, b: &mut usize, first: usize, mid: &[usize], last: usize,
+                     lin: &mut dyn FnMut(&mut usize, &mut usize, usize, usize) -> Span|
+            -> Vec<Span> {
+            let mut v = Vec::new();
+            let mut prev = first;
+            for &h in mid.iter().chain(std::iter::once(&last)) {
+                v.push(lin(w, b, prev, h));
+                prev = h;
+            }
+            v
+        };
+        l.card = chain(&mut w, &mut b, CARD_FEATS, &card_w, de, &mut lin);
+        l.wid = w;
+        w += crate::units::N_UNITS * de;
+        l.pile = lin(&mut w, &mut b, PILE_COUNTS + de, de);
+        let mut prev = xdim_of(de);
+        for &h in &pub_w {
+            l.pub_lin.push(lin(&mut w, &mut b, prev, h));
+            prev = h;
+        }
+        l.pub_out = lin(&mut w, &mut b, prev, head_in);
+        l.wb = w;
+        w += 2 * dg * head_in;
+        let mut prev = head_in;
+        for &h in &hmlp_w {
+            l.hmlp.push(lin(&mut w, &mut b, prev, h));
+            prev = h;
+        }
+        l.wu = lin(&mut w, &mut b, prev, rank);
+        let mut prev = hfeat(de);
+        for &h in &slot_w {
+            l.slot.push(lin(&mut w, &mut b, prev, h));
+            prev = h;
+        }
+        l.slot_out = lin(&mut w, &mut b, prev, dg);
+        for _ in 0..nres {
+            let a = lin(&mut w, &mut b, dg, dg);
+            let bb = lin(&mut w, &mut b, dg, dg);
+            l.res.push((a, bb));
+        }
+        l.wg = lin(&mut w, &mut b, dg, rank + 1);
+        l.wq = lin(&mut w, &mut b, AFEAT + de, rank);
+        l.wk = lin(&mut w, &mut b, dg, rank);
+        l.wp = lin(&mut w, &mut b, l.head_out, rank);
+        for &h in &pub_w {
+            l.pub_ln.push((ln, ln + h));
+            ln += 2 * h;
+        }
+        l.ln1 = (ln, ln + head_in);
+        ln += 2 * head_in;
+        l.w_len = w;
+        l.b_len = b;
+        l.ln_len = ln;
+        Ok(l)
+    }
+
+    /// The trunk input width this layout assembles.
+    pub fn xdim(&self) -> usize {
+        xdim_of(self.de)
+    }
+    /// The holding tower's per-slot input width.
+    pub fn hfeat(&self) -> usize {
+        hfeat(self.de)
+    }
+    /// Tower widths: (pub, hmlp, card, slot) layer output widths.
+    pub fn widths(&self) -> (Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>) {
+        let o = |v: &[Span]| v.iter().map(|s| s.o).collect();
+        (o(&self.pub_lin), o(&self.hmlp), o(&self.card), o(&self.slot))
+    }
+}
+
 impl Mlp {
     /// Build from the flat arrays the trainer ships. Three formats load:
     /// v3 (`dims[0] == 3`, the tower format below), v2 (the frozen 10-entry
@@ -546,101 +708,46 @@ impl Mlp {
     /// wb have none). LayerNorms: one (gain, bias) pair per pub layer, then
     /// ln1. `train/value_net.py::flat` writes this and nothing else knows it.
     fn from_flat_v3(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Mlp, String> {
-        let mut at = 1;
-        let mut scalar = |name: &str| -> Result<usize, String> {
-            let v = *dims.get(at).ok_or(format!("dims truncated at {name}"))?;
-            at += 1;
-            Ok(v)
+        let l = V3Layout::new(dims)?;
+        if w.len() != l.w_len || b.len() != l.b_len || ln.len() != l.ln_len {
+            return Err(format!(
+                "weight sizes {}/{}/{} do not match dims {dims:?} (want {}/{}/{})",
+                w.len(), b.len(), ln.len(), l.w_len, l.b_len, l.ln_len
+            ));
+        }
+        let lin = |s: &Span| Lin {
+            w: w[s.w..s.w + s.i * s.o].to_vec(),
+            b: b[s.b..s.b + s.o].to_vec(),
+            i: s.i,
+            o: s.o,
         };
-        let (de, dg, rank, head_in, nres) = (
-            scalar("de")?, scalar("dg")?, scalar("rank")?, scalar("head_in")?, scalar("nres")?,
-        );
-        let mut list = |name: &str| -> Result<Vec<usize>, String> {
-            let n = *dims.get(at).ok_or(format!("dims truncated at {name}"))?;
-            at += 1;
-            if at + n > dims.len() {
-                return Err(format!("dims truncated inside {name}"));
-            }
-            let v = dims[at..at + n].to_vec();
-            at += n;
-            Ok(v)
+        let norm = |(g, bt): (usize, usize), n: usize| {
+            (ln[g..g + n].to_vec(), ln[bt..bt + n].to_vec())
         };
-        let (card_w, pub_w, hmlp_w, slot_w) =
-            (list("card")?, list("pub")?, list("hmlp")?, list("slot")?);
-        if at != dims.len() {
-            return Err(format!("dims has {} trailing entries", dims.len() - at));
-        }
-        if pub_w.is_empty() {
-            return Err("the public tower needs at least one layer".into());
-        }
-
-        let (mut cw, mut cb, mut cl) = (Cur::new(w, "w"), Cur::new(b, "b"), Cur::new(ln, "ln"));
-        let lin = |cw: &mut Cur, cb: &mut Cur, i: usize, o: usize| -> Result<Lin, String> {
-            Ok(Lin { w: cw.take(i * o)?, b: cb.take(o)?, i, o })
-        };
-        let chain = |cw: &mut Cur, cb: &mut Cur, first: usize, hidden: &[usize], last: usize|
-            -> Result<Vec<Lin>, String> {
-            let mut v = Vec::new();
-            let mut prev = first;
-            for &h in hidden {
-                v.push(Lin { w: cw.take(prev * h)?, b: cb.take(h)?, i: prev, o: h });
-                prev = h;
-            }
-            v.push(Lin { w: cw.take(prev * last)?, b: cb.take(last)?, i: prev, o: last });
-            Ok(v)
-        };
-
-        // Card tower ends at `de`; the chain helper appends that final layer.
-        let card = chain(&mut cw, &mut cb, CARD_FEATS, &card_w, de)?;
-        let wid = cw.take(crate::units::N_UNITS * de)?;
-        let pile = lin(&mut cw, &mut cb, PILE_COUNTS + de, de)?;
-        let mut pub_lin = Vec::new();
-        let mut prev = xdim_of(de);
-        for &h in &pub_w {
-            pub_lin.push(lin(&mut cw, &mut cb, prev, h)?);
-            prev = h;
-        }
-        let pub_out = lin(&mut cw, &mut cb, prev, head_in)?;
-        let wb = cw.take(2 * dg * head_in)?;
-        let mut hmlp = Vec::new();
-        let mut prev = head_in;
-        for &h in &hmlp_w {
-            hmlp.push(lin(&mut cw, &mut cb, prev, h)?);
-            prev = h;
-        }
-        let wu = lin(&mut cw, &mut cb, prev, rank)?;
-        let head_out = prev;
-        let mut slot = Vec::new();
-        let mut prev = hfeat(de);
-        for &h in &slot_w {
-            slot.push(lin(&mut cw, &mut cb, prev, h)?);
-            prev = h;
-        }
-        let slot_out = lin(&mut cw, &mut cb, prev, dg)?;
-        let mut res = Vec::new();
-        for _ in 0..nres {
-            let a = lin(&mut cw, &mut cb, dg, dg)?;
-            let bb = lin(&mut cw, &mut cb, dg, dg)?;
-            res.push((a, bb));
-        }
-        let wg = lin(&mut cw, &mut cb, dg, rank + 1)?;
-        let wq = lin(&mut cw, &mut cb, AFEAT + de, rank)?;
-        let wk = lin(&mut cw, &mut cb, dg, rank)?;
-        let wp = lin(&mut cw, &mut cb, head_out, rank)?;
-        let mut pub_ln = Vec::new();
-        for &h in &pub_w {
-            pub_ln.push((cl.take(h)?, cl.take(h)?));
-        }
-        let ln1 = (cl.take(head_in)?, cl.take(head_in)?);
-        cw.done()?;
-        cb.done()?;
-        cl.done()?;
         Ok(Mlp {
             dims: dims.to_vec(),
             v1: false,
-            de, dg, rank, head_in,
-            card, wid, pile, pub_lin, pub_ln, pub_out, wb, ln1, hmlp, wu,
-            slot, slot_out, res, wg, wq, wk, wp,
+            de: l.de,
+            dg: l.dg,
+            rank: l.rank,
+            head_in: l.head_in,
+            card: l.card.iter().map(&lin).collect(),
+            wid: w[l.wid..l.wid + crate::units::N_UNITS * l.de].to_vec(),
+            pile: lin(&l.pile),
+            pub_lin: l.pub_lin.iter().map(&lin).collect(),
+            pub_ln: l.pub_lin.iter().zip(&l.pub_ln).map(|(s, &o)| norm(o, s.o)).collect(),
+            pub_out: lin(&l.pub_out),
+            wb: w[l.wb..l.wb + 2 * l.dg * l.head_in].to_vec(),
+            ln1: norm(l.ln1, l.head_in),
+            hmlp: l.hmlp.iter().map(&lin).collect(),
+            wu: lin(&l.wu),
+            slot: l.slot.iter().map(&lin).collect(),
+            slot_out: lin(&l.slot_out),
+            res: l.res.iter().map(|(a, bb)| (lin(a), lin(bb))).collect(),
+            wg: lin(&l.wg),
+            wq: lin(&l.wq),
+            wk: lin(&l.wk),
+            wp: lin(&l.wp),
         })
     }
 

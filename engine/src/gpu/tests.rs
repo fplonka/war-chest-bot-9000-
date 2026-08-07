@@ -13,49 +13,38 @@ use crate::selfplay::{collect_roots, Agent, Collect, GameCfg};
 use crate::serialize::Job;
 
 use super::client::GpuClient;
-use super::service::{spawn, weight_offsets, Service, Step};
-
-/// The arenas after a probe, for comparison with the CPU solver's.
-pub struct ProbeOut {
-    pub e: Vec<f32>,
-    pub z: Vec<f32>,
-    pub g: Vec<f32>,
-    pub h0: Vec<f32>,
-    pub reach: Vec<f32>,
-    pub vals: Vec<f32>,
-    pub regret: Vec<f32>,
-    pub inst: Vec<f32>,
-    pub cur: Vec<f32>,
-    pub sum_strat: Vec<f32>,
-    pub avg: Vec<f32>,
-    pub xb: Vec<f32>,
-    pub u: Vec<f32>,
-}
+use super::service::{spawn, Service, Step};
 
 const DG: usize = 64;
 const RK: usize = 64;
 
+/// The classic shape, in the v3 tower format: card [64], pub [384],
+/// head 384, no extra head layers, no slot hiddens, one residual block.
 fn test_dims() -> Vec<usize> {
-    vec![crate::rebel::PUBFEAT, 384, 384, crate::rebel::CFEAT, DG, RK,
-         crate::rebel::AFEAT, 32, 64, 0]
+    vec![3, 32, DG, RK, 384, 1, 1, 64, 1, 384, 0, 0]
 }
 
 /// Deterministic random weights, scaled so activations stay near +-1 — the
 /// range real training produces, which is what makes the plan's absolute
 /// tolerances (1e-5 per phase, 1e-4 per solve) meaningful. The lengths come
-/// from the service's own layout, so the test cannot disagree with it.
+/// from the shared layout, so the test cannot disagree with the service.
 fn test_weights() -> (Vec<usize>, Vec<f32>, Vec<f32>, Vec<f32>) {
     let dims = test_dims();
-    let (ow, ob, oln) = weight_offsets(&dims).expect("dims");
+    let l = crate::net::V3Layout::new(&dims).expect("dims");
     let mut rng = Rng::new(0xD15EA5E);
-    let w = (0..*ow.last().unwrap())
+    let w = (0..l.w_len)
         .map(|_| (rng.next_u64() as f32 / u64::MAX as f32 - 0.5) * 0.6)
         .collect();
-    let b = vec![0.0f32; *ob.last().unwrap()];
-    let mut ln = vec![0.0f32; *oln.last().unwrap()];
-    // Both LayerNorm gains start at one; their shifts stay at zero.
-    for g in ln.iter_mut().take(dims[1] + dims[2]) {
-        *g = 1.0;
+    let b = vec![0.0f32; l.b_len];
+    let mut ln = vec![0.0f32; l.ln_len];
+    // LayerNorm gains start at one; their shifts stay at zero.
+    for (g, _) in l.pub_ln.iter() {
+        for x in ln[*g..*g + 384].iter_mut() {
+            *x = 1.0;
+        }
+    }
+    for x in ln[l.ln1.0..l.ln1.0 + l.head_in].iter_mut() {
+        *x = 1.0;
     }
     (dims, w, b, ln)
 }
@@ -71,6 +60,7 @@ const TEST_CFG: Cfg = Cfg {
     cfr: crate::search::Cfr::LINEAR,
     warm: 0.0,
     node_cap: 0,
+    gpu_build: false,
 };
 
 /// Real subgame roots and the jobs that describe them. One tree exercises
@@ -171,12 +161,12 @@ fn assert_varied(set: &[(Solver, Job)]) {
 fn start_probe() -> Service {
     let (dims, w, b, ln) = test_weights();
     let (_tx, rx) = std::sync::mpsc::channel();
-    Service::new(rx, dims, w, b, ln).expect("service")
+    Service::new(0, rx, dims, w, b, ln).expect("service")
 }
 
 fn start_client() -> GpuClient {
     let (dims, w, b, ln) = test_weights();
-    spawn(dims, w, b, ln).expect("spawn")
+    spawn(0, dims, w, b, ln).expect("spawn")
 }
 
 fn cmp(name: &str, a: &[f32], b: &[f32], atol: f32, rtol: f32) {
@@ -202,7 +192,7 @@ fn phase_oracle() {
     let mut svc = start_probe();
     for (t, (mut sv, job)) in test_solves(&nets, TEST_CFG, true).into_iter().enumerate() {
         let at = |s: &str| format!("tree {t} {s}");
-        let (rows, hd) = (sv.leaf_rows.len(), dims[2]);
+        let (rows, hd) = (sv.leaf_rows.len(), 384);
         // The job's config table extends the solver's: the serializer interns
         // any support member the leaf batch missed, appending after the rows
         // the batch already holds. Those extra rows have no CPU counterpart,
@@ -348,7 +338,7 @@ fn zero_network_uniformity() {
     let (_, job) = test_solves(&nets, TEST_CFG, false).into_iter().next().unwrap();
     let carried = job.carried.clone();
     let t = job.tables.clone();
-    let gpu = spawn(dims, zw, b, ln).expect("spawn");
+    let gpu = spawn(0, dims, zw, b, ln).expect("spawn");
     let strategy = gpu.solve(job, &carried).expect("trip 1").strategy;
 
     let legal = |cell: usize| (t.legal_bits[cell >> 3] >> (cell & 7)) & 1 == 1;

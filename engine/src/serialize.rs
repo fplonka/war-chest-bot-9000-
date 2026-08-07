@@ -403,9 +403,6 @@ impl W {
     fn u32(&mut self, v: u32) {
         self.b.extend_from_slice(&v.to_le_bytes());
     }
-    fn u64(&mut self, v: u64) {
-        self.b.extend_from_slice(&v.to_le_bytes());
-    }
     fn f32(&mut self, v: f32) {
         self.b.extend_from_slice(&v.to_le_bytes());
     }
@@ -419,22 +416,10 @@ impl W {
             self.u32(x);
         }
     }
-    fn u64s(&mut self, v: &[u64]) {
-        self.u32(v.len() as u32);
-        for &x in v {
-            self.u64(x);
-        }
-    }
     fn i32s(&mut self, v: &[i32]) {
         self.u32(v.len() as u32);
         for &x in v {
             self.b.extend_from_slice(&x.to_le_bytes());
-        }
-    }
-    fn i8s(&mut self, v: &[i8]) {
-        self.u32(v.len() as u32);
-        for &x in v {
-            self.b.push(x as u8);
         }
     }
     fn f32s(&mut self, v: &[f32]) {
@@ -466,10 +451,6 @@ impl<'a> R<'a> {
         let s = self.take(4, what)?;
         Ok(u32::from_le_bytes(s.try_into().unwrap()))
     }
-    fn u64(&mut self, what: &str) -> Result<u64, String> {
-        let s = self.take(8, what)?;
-        Ok(u64::from_le_bytes(s.try_into().unwrap()))
-    }
     fn f32(&mut self, what: &str) -> Result<f32, String> {
         let s = self.take(4, what)?;
         Ok(f32::from_le_bytes(s.try_into().unwrap()))
@@ -486,28 +467,12 @@ impl<'a> R<'a> {
         }
         Ok(v)
     }
-    fn u64s(&mut self, what: &str) -> Result<Vec<u64>, String> {
-        let n = self.u32(what)? as usize;
-        let mut v = Vec::with_capacity(n);
-        for _ in 0..n {
-            v.push(self.u64(what)?);
-        }
-        Ok(v)
-    }
     fn i32s(&mut self, what: &str) -> Result<Vec<i32>, String> {
         let n = self.u32(what)? as usize;
         let mut v = Vec::with_capacity(n);
         for _ in 0..n {
             let s = self.take(4, what)?;
             v.push(i32::from_le_bytes(s.try_into().unwrap()));
-        }
-        Ok(v)
-    }
-    fn i8s(&mut self, what: &str) -> Result<Vec<i8>, String> {
-        let n = self.u32(what)? as usize;
-        let mut v = Vec::with_capacity(n);
-        for _ in 0..n {
-            v.push(self.take(1, what)?[0] as i8);
         }
         Ok(v)
     }

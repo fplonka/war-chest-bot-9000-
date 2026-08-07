@@ -308,6 +308,8 @@ pub struct Data {
     pub draws: usize,
     pub cap_hits: usize,
     pub configs: usize,
+    /// Seconds workers spent blocked on the GPU (idle CPU), summed.
+    pub gpu_wait_s: f32,
 }
 
 impl Data {
@@ -340,6 +342,7 @@ impl Data {
         self.wins[0] += o.wins[0];
         self.wins[1] += o.wins[1];
         self.draws += o.draws;
+        self.gpu_wait_s += o.gpu_wait_s;
         self.cap_hits += o.cap_hits;
         self.configs += o.configs;
     }
@@ -491,6 +494,8 @@ struct Walk<'a> {
     strat: Vec<f32>,
     /// The resident solve's id (GPU path), for trip 2.
     gpu_id: u64,
+    /// Which service solved it (trip 2 must go to the same one).
+    dev: usize,
 }
 
 impl<'a> Walk<'a> {
@@ -518,11 +523,13 @@ impl<'a> Walk<'a> {
 fn finish_walk<'a>(
     w: Walk<'a>,
     bel: &[Belief; 2],
-    gpu: Option<&GpuClient>,
+    gpu: Option<&[GpuClient]>,
 ) -> Vec<[Vec<f32>; 2]> {
+    let dev = w.dev;
     let Walk { mut sv, node, gpu_id, .. } = w;
-    let mut out = if let Some(gpu) = gpu {
-        gpu.carried_beliefs(gpu_id, node as u32)
+    let mut out = if let Some(gpus) = gpu {
+        gpus[dev % gpus.len()]
+            .carried_beliefs(gpu_id, node as u32)
             .expect("gpu trip 2")
     } else {
         sv.carried_beliefs(node)
@@ -558,11 +565,14 @@ pub struct Game<'a> {
     gc: &'a GameCfg,
     /// Subgame roots for the tree-sizing work (None in production).
     roots: Option<Vec<(State, [Belief; 2])>>,
-    /// The GPU solve this game is waiting on, and the state to resume with.
-    pending: Option<crate::gpu::SolveHandle>,
+    /// The GPU job this game wants solved, and the state to resume with.
+    /// The worker owns the actual submission, so it can tag replies onto one
+    /// channel and resume whichever of its games answers first.
+    pending_job: Option<crate::serialize::Job>,
     pending_sv: Option<Solver<'a>>,
     pending_roots: Option<Vec<[Vec<f32>; 2]>>,
     pending_slot: usize,
+    pending_dev: usize,
     pending_player: u8,
 }
 
@@ -593,10 +603,11 @@ impl<'a> Game<'a> {
             from_row: 0,
             gc,
             roots: None,
-            pending: None,
+            pending_job: None,
             pending_sv: None,
             pending_roots: None,
             pending_slot: 0,
+            pending_dev: 0,
             pending_player: 0,
         }
     }
@@ -609,9 +620,19 @@ impl<'a> Game<'a> {
         self.roots.take().unwrap_or_default()
     }
 
-    /// Take the pending solve handle (after `Step::Submitted`).
-    pub fn take_pending(&mut self) -> Option<crate::gpu::SolveHandle> {
-        self.pending.take()
+    /// Take the pending job (after `Step::Submitted`); the worker submits it.
+    pub fn take_job(&mut self) -> Option<crate::serialize::Job> {
+        self.pending_job.take()
+    }
+
+    /// The nets slot of the pending solve, for routing to a service.
+    pub fn pending_slot(&self) -> usize {
+        self.pending_slot
+    }
+
+    /// Which service the worker submitted to; trip 2 goes to the same one.
+    pub fn set_pending_dev(&mut self, dev: usize) {
+        self.pending_dev = dev;
     }
 
     /// The rows produced so far (the worker takes them when a game ends).
@@ -625,7 +646,7 @@ impl<'a> Game<'a> {
     }
 
     /// Play until a GPU solve is submitted or the game ends.
-    pub fn advance(&mut self, gpu: Option<&GpuClient>, nets: &'a [Nets]) -> Step {
+    pub fn advance(&mut self, gpu: Option<&[GpuClient]>, nets: &'a [Nets]) -> Step {
         let gc = self.gc;
         let Game {
             rng,
@@ -766,8 +787,8 @@ impl<'a> Game<'a> {
                             walk.take();
                             carried.clear();
                             fallback = Some(random_policy(s, ctx, player, &cfgs));
-                        } else if let Some(gpu) = gpu {
-                            // GPU path: submit the tree as one job. The
+                        } else if gpu.is_some() {
+                            // GPU path: package the tree as one job. The
                             // carried roots (or the live belief, for the
                             // first level) travel with it; trip 1 returns
                             // the reference strategy and the root values.
@@ -777,8 +798,7 @@ impl<'a> Game<'a> {
                                 std::mem::take(carried)
                             };
                             let job = Job::from_solver(&sv, &roots_v);
-                            let handle = gpu.submit(job).expect("gpu submit");
-                            self.pending = Some(handle);
+                            self.pending_job = Some(job);
                             self.pending_sv = Some(sv);
                             self.pending_roots = Some(roots_v);
                             self.pending_slot = slot;
@@ -839,6 +859,7 @@ impl<'a> Game<'a> {
                                 drawn: 0,
                                 strat: Vec::new(),
                                 gpu_id: 0,
+                                dev: 0,
                             });
                         }
                     }
@@ -983,6 +1004,7 @@ impl<'a> Game<'a> {
             drawn: 0,
             strat: trip1.strategy,
             gpu_id: trip1.id,
+            dev: self.pending_dev,
         });
     }
 
@@ -1220,90 +1242,95 @@ pub fn collect_roots(
 
 /// Play `games` games in parallel, returning merged data and statistics.
 
-/// The GPU generation loop: `workers` threads, each playing two games so the
-/// CPU has work while a game's solve runs on the GPU (docs/arch plan B1).
-/// Each game submits its solve as one job and blocks on trip 1; the worker
-/// alternates between its two games, waiting on whichever solve is ready.
-/// When a game ends its rows are merged and a fresh game takes its place.
+/// The GPU generation loop.
+///
+/// Worker count follows the box, not the game count (the old rule
+/// `games / 2` left a 64-core machine at 24 workers when the trainer asked
+/// for 48 games). Each worker interleaves a few games and resumes whichever
+/// game's solve answers first: trip-1 replies are tagged onto one channel
+/// per worker, so a slow solve never blocks a finished one behind it.
+///
+/// `gpus` is one client per service and `route` maps a solve's nets slot to
+/// a service index: training routes everything to service 0, a GPU ladder
+/// splits the two checkpoints between two devices.
 #[cfg(feature = "gpu")]
 pub fn run_games_gpu(
     games: usize,
     seed: u64,
     nets: &[Nets],
     gc: &GameCfg,
-    gpu: &crate::gpu::GpuClient,
+    gpus: &[crate::gpu::GpuClient],
+    route: &(dyn Fn(usize) -> usize + Sync),
 ) -> Data {
-    let workers = (games / 2).max(1).min(64);
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    /// Live games per worker: one solving on the GPU while another builds
+    /// its tree on the CPU.
+    const PER: usize = 2;
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(8)
+        .min(games.div_ceil(PER).max(1));
+    let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
-            .map(|w| {
-                let gc = gc;
-                let nets = nets;
-                let gpu = gpu;
+            .map(|_| {
+                let (gc, nets, gpus, next, route) = (gc, nets, gpus, &next, route);
                 scope.spawn(move || {
                     let mut out = Data::default();
-                    let mut slot = w * 2;
-                    // Two interleaved games; each holds at most one pending
-                    // solve (it cannot progress past a solve site without
-                    // trip 1).
-                    let mut games_a: Option<Game> = None;
-                    let mut games_b: Option<Game> = None;
-                    let mut ha: Option<crate::gpu::SolveHandle> = None;
-                    let mut hb: Option<crate::gpu::SolveHandle> = None;
-
-                    // (Re)start a game in `g` if it ended, and advance it as
-                    // far as it can go without blocking. Returns the pending
-                    // handle if the game is now waiting on the GPU.
-                    fn advance_slot<'a>(
-                        g: &mut Option<Game<'a>>,
-                        h: &mut Option<crate::gpu::SolveHandle>,
-                        slot: &mut usize,
-                        games: usize,
-                        seed: u64,
-                        gc: &'a GameCfg,
-                        nets: &'a [Nets],
-                        gpu: &crate::gpu::GpuClient,
-                        out: &mut Data,
-                    ) {
-                        if g.is_none() {
-                            if *slot >= games {
-                                return;
-                            }
-                            let rng = Rng::new(worker_seed(seed, *slot));
-                            *slot += 1;
-                            *g = Some(Game::new(rng, gc));
-                        }
-                        if h.is_some() {
-                            return;
-                        }
-                        let game = g.as_mut().unwrap();
-                        match game.advance(Some(gpu), nets) {
-                            Step::Submitted => *h = game.take_pending(),
-                            Step::Ended => {
-                                let _ = game.finish();
-                                out.merge(game.take_data());
-                                *g = None;
-                            }
-                        }
-                    }
-
+                    let mut game: Vec<Option<Game>> = (0..PER).map(|_| None).collect();
+                    let mut busy = vec![false; PER];
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let mut live = 0usize;
                     loop {
-                        advance_slot(&mut games_a, &mut ha, &mut slot, games, seed,
-                                     gc, nets, gpu, &mut out);
-                        advance_slot(&mut games_b, &mut hb, &mut slot, games, seed,
-                                     gc, nets, gpu, &mut out);
-                        if games_a.is_none() && games_b.is_none() {
+                        // Advance every idle game to its next solve (or its
+                        // end), starting fresh games while any remain.
+                        for k in 0..PER {
+                            if busy[k] {
+                                continue;
+                            }
+                            loop {
+                                if game[k].is_none() {
+                                    let i = next.fetch_add(1, Ordering::Relaxed);
+                                    if i >= games {
+                                        break;
+                                    }
+                                    game[k] = Some(Game::new(Rng::new(worker_seed(seed, i)), gc));
+                                    live += 1;
+                                }
+                                let g = game[k].as_mut().unwrap();
+                                match g.advance(Some(gpus), nets) {
+                                    Step::Submitted => {
+                                        let job = g.take_job().expect("submitted job");
+                                        let dev = route(g.pending_slot()) % gpus.len();
+                                        g.set_pending_dev(dev);
+                                        gpus[dev].submit_tagged(job, k, tx.clone()).expect("gpu submit");
+                                        busy[k] = true;
+                                        break;
+                                    }
+                                    Step::Ended => {
+                                        let _ = g.finish();
+                                        out.merge(g.take_data());
+                                        game[k] = None;
+                                        live -= 1;
+                                    }
+                                }
+                            }
+                        }
+                        if live == 0 {
                             break;
                         }
-                        // Wait on the first pending solve, then advance the
-                        // game whose turn it is.
-                        if let Some(h) = ha.take() {
-                            let trip1 = h.wait().expect("gpu trip 1");
-                            games_a.as_mut().expect("pending game").resume(trip1);
-                        } else if let Some(h) = hb.take() {
-                            let trip1 = h.wait().expect("gpu trip 1");
-                            games_b.as_mut().expect("pending game").resume(trip1);
+                        if !busy.iter().any(|&b| b) {
+                            continue;
                         }
+                        // Resume whichever game answered first.
+                        let t0 = std::time::Instant::now();
+                        let (k, res) = rx.recv().expect("gpu trip 1");
+                        out.gpu_wait_s += t0.elapsed().as_secs_f32();
+                        busy[k] = false;
+                        game[k]
+                            .as_mut()
+                            .expect("pending game")
+                            .resume(res.expect("gpu trip 1"));
                     }
                     out
                 })
@@ -1315,6 +1342,44 @@ pub fn run_games_gpu(
         }
         merged
     })
+}
+
+/// A GPU evaluation match: the same paired-seating scheme as `eval_match`,
+/// as two batches (seats swapped in the second) over the same seed stream.
+/// Weights live on the services; `a` and `b` route by their nets slots.
+#[cfg(feature = "gpu")]
+pub fn eval_match_gpu(
+    games: usize,
+    seed: u64,
+    nets: &[Nets],
+    a: Agent,
+    b: Agent,
+    random_draft: bool,
+    gpus: &[crate::gpu::GpuClient],
+) -> (usize, usize, usize) {
+    let mk = |agents: [Agent; 2]| GameCfg {
+        agents,
+        collect: Collect::None,
+        explore: 0.0,
+        random_draft,
+        eval_mix: 0.0,
+        mc_mix: 0.0,
+    };
+    // Route: side A's checkpoint sits on service 0, side B's on service 1.
+    let slot_of = |ag: &Agent| match ag {
+        Agent::Rebel { slot, .. } => *slot,
+        _ => usize::MAX,
+    };
+    let (sa, _sb) = (slot_of(&a), slot_of(&b));
+    let route = move |slot: usize| usize::from(slot != sa);
+    let pairs = games / 2;
+    let d1 = run_games_gpu(pairs, seed.wrapping_add(7), nets, &mk([a, b]), gpus, &route);
+    let d2 = run_games_gpu(pairs, seed.wrapping_add(7), nets, &mk([b, a]), gpus, &route);
+    (
+        d1.wins[0] + d2.wins[1],
+        d1.wins[1] + d2.wins[0],
+        d1.draws + d2.draws,
+    )
 }
 
 pub fn run_games(games: usize, seed: u64, nets: &[Nets], gc: &GameCfg) -> Data {

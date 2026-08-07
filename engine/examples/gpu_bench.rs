@@ -67,7 +67,7 @@ fn main() {
     );
 
     let (dims, w, b, ln) = weights();
-    let gpu = warchest::gpu::service::spawn(dims, w, b, ln).expect("gpu service");
+    let gpu = warchest::gpu::service::spawn(0, dims, w, b, ln).expect("gpu service");
 
     let done = Arc::new(AtomicUsize::new(0));
     let stop = Arc::new(AtomicUsize::new(0));
@@ -110,22 +110,22 @@ fn main() {
 /// The shape the service is built for, with weights that are the right size
 /// and otherwise arbitrary — the benchmark measures time, not values.
 fn weights() -> (Vec<usize>, Vec<f32>, Vec<f32>, Vec<f32>) {
-    let dims: Vec<usize> = vec![
-        warchest::rebel::PUBFEAT, 384, 384, warchest::rebel::CFEAT, 64, 64,
-        warchest::rebel::AFEAT, 32, 64, 0,
-    ];
-    let (ow, ob, oln) = warchest::gpu::service::weight_offsets(&dims).expect("dims");
+    // The classic shape, in the v3 tower format.
+    let dims: Vec<usize> = vec![3, 32, 64, 64, 384, 1, 1, 64, 1, 384, 0, 0];
+    let l = warchest::net::V3Layout::new(&dims).expect("dims");
     let mut rng = warchest::rng::Rng::new(7);
-    let w = (0..*ow.last().unwrap())
+    let w = (0..l.w_len)
         .map(|_| (rng.next_u64() as f32 / u64::MAX as f32 - 0.5) * 0.6)
         .collect();
-    let b = vec![0.0f32; *ob.last().unwrap()];
-    let mut ln = vec![0.0f32; *oln.last().unwrap()];
-    for (i, g) in ln.iter_mut().enumerate() {
-        // The two LayerNorm gains are the first and third blocks.
-        if i < dims[1] || (i >= 2 * dims[1] && i < 2 * dims[1] + dims[2]) {
-            *g = 1.0;
+    let b = vec![0.0f32; l.b_len];
+    let mut ln = vec![0.0f32; l.ln_len];
+    for &(g, _) in &l.pub_ln {
+        for x in ln[g..g + 384].iter_mut() {
+            *x = 1.0;
         }
+    }
+    for x in ln[l.ln1.0..l.ln1.0 + l.head_in].iter_mut() {
+        *x = 1.0;
     }
     (dims, w, b, ln)
 }

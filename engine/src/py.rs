@@ -502,58 +502,66 @@ use std::sync::{OnceLock, RwLock};
 /// the trainer's publications to it. Without the `gpu` feature every call
 /// fails loudly — a misconfigured box must not silently run on the CPU.
 #[cfg(feature = "gpu")]
-static GPU_CLIENT: OnceLock<std::sync::Mutex<Option<crate::gpu::GpuClient>>> = OnceLock::new();
+static GPU_CLIENTS: OnceLock<std::sync::Mutex<Vec<crate::gpu::GpuClient>>> = OnceLock::new();
 
 #[cfg(feature = "gpu")]
-pub(crate) fn gpu_client() -> &'static std::sync::Mutex<Option<crate::gpu::GpuClient>> {
-    GPU_CLIENT.get_or_init(|| std::sync::Mutex::new(None))
+pub(crate) fn gpu_clients() -> &'static std::sync::Mutex<Vec<crate::gpu::GpuClient>> {
+    GPU_CLIENTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
+/// Start one solve service per listed CUDA device (typically `[0]` for
+/// training; the ladder starts one per device and pits weights against each
+/// other). Call once; a shape change needs a fresh process.
 #[cfg(feature = "gpu")]
 #[pyfunction]
+#[pyo3(signature = (dims, w, b, ln, devices=vec![0]))]
 fn gpu_start(
     py: Python<'_>,
     dims: Vec<usize>,
     w: PyReadonlyArray1<f32>,
     b: PyReadonlyArray1<f32>,
     ln: PyReadonlyArray1<f32>,
+    devices: Vec<usize>,
 ) -> PyResult<()> {
     let (w, b, ln) = (w.as_slice()?.to_vec(), b.as_slice()?.to_vec(), ln.as_slice()?.to_vec());
     py.allow_threads(move || {
-        let client = crate::gpu::service::spawn(dims, w, b, ln)
-            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
-        *gpu_client().lock().unwrap() = Some(client);
+        let mut clients = Vec::new();
+        for d in devices {
+            clients.push(
+                crate::gpu::service::spawn(d, dims.clone(), w.clone(), b.clone(), ln.clone())
+                    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?,
+            );
+        }
+        *gpu_clients().lock().unwrap() = clients;
         Ok(())
     })
 }
 
 #[cfg(feature = "gpu")]
 #[pyfunction]
+#[pyo3(signature = (dims, w, b, ln, device=0))]
 fn gpu_set_weights(
     _py: Python<'_>,
     dims: Vec<usize>,
     w: PyReadonlyArray1<f32>,
     b: PyReadonlyArray1<f32>,
     ln: PyReadonlyArray1<f32>,
+    device: usize,
 ) -> PyResult<()> {
-    let c = gpu_client().lock().unwrap().clone();
-    match c {
-        Some(c) => {
-            c.set_weights(dims, w.as_slice()?.to_vec(), b.as_slice()?.to_vec(),
-                          ln.as_slice()?.to_vec())
-        }
-        None => {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "gpu service not started (gpu_start was not called)"))
-        }
-    }
+    let clients = gpu_clients().lock().unwrap();
+    let c = clients.get(device).ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(
+            "gpu service not started (gpu_start was not called)")
+    })?;
+    c.set_weights(dims, w.as_slice()?.to_vec(), b.as_slice()?.to_vec(),
+                  ln.as_slice()?.to_vec());
     Ok(())
 }
 
 #[cfg(feature = "gpu")]
 #[pyfunction]
 fn gpu_stop(_py: Python<'_>) -> PyResult<()> {
-    *gpu_client().lock().unwrap() = None;
+    gpu_clients().lock().unwrap().clear();
     Ok(())
 }
 
@@ -606,12 +614,12 @@ fn gpu_gen_data(
     };
     let d = py.allow_threads(|| {
         let n = nets().read().unwrap();
-        let c = gpu_client().lock().unwrap().clone();
-        let c = c.ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "gpu service not started (gpu_start was not called)")
-        })?;
-        Ok::<_, pyo3::PyErr>(crate::selfplay::run_games_gpu(games, seed, &n, &gc, &c))
+        let clients = gpu_clients().lock().unwrap().clone();
+        if clients.is_empty() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "gpu service not started (gpu_start was not called)"));
+        }
+        Ok::<_, pyo3::PyErr>(crate::selfplay::run_games_gpu(games, seed, &n, &gc, &clients, &|_| 0))
     })?;
     data_to_dict(py, d)
 }
@@ -787,7 +795,7 @@ fn gen_data(
 /// pitted against itself at different depths or iteration counts (the depth
 /// probe); they default to side A's.
 #[pyfunction]
-#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=false, depth_b=None, iters_b=None, cfr="linear", warm=0.0))]
+#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=false, depth_b=None, iters_b=None, cfr="linear", warm=0.0, gpu=false))]
 #[allow(clippy::too_many_arguments)]
 fn eval_match(
     py: Python<'_>,
@@ -805,6 +813,7 @@ fn eval_match(
     iters_b: Option<usize>,
     cfr: &str,
     warm: f32,
+    gpu: bool,
 ) -> PyResult<(usize, usize, usize)> {
     let cfg = Cfg {
         depth,
@@ -821,6 +830,16 @@ fn eval_match(
         ..cfg
     };
     let (aa, bb) = (agent_of(a, cfg, temp, slot_a)?, agent_of(b, cfg_b, temp, slot_b)?);
+    #[cfg(feature = "gpu")]
+    if gpu {
+        return Ok(py.allow_threads(|| {
+            let n = nets().read().unwrap();
+            let clients = gpu_clients().lock().unwrap().clone();
+            crate::selfplay::eval_match_gpu(games, seed, &n, aa, bb, random_draft, &clients)
+        }));
+    }
+    #[cfg(not(feature = "gpu"))]
+    let _ = gpu;
     Ok(py.allow_threads(|| {
         let n = nets().read().unwrap();
         rs_eval_match(games, seed, &n, aa, bb, random_draft)

@@ -1,170 +1,93 @@
-//! The GPU service thread: owns GPU-0, keeps the live set of solves resident,
-//! and advances it with ticks (plan section 8, B3).
+//! The GPU service thread: owns one CUDA device, keeps the live set of
+//! solves resident, and advances all of them with ticks.
 //!
-//! A tick runs the phases once each over the solves that need them. Solves in
-//! the iterate stage take one CFR iteration; solves in the value stage take
-//! one fixed-policy pass over a carried root; solves in the carry stage
-//! propagate one kept snapshot to the exit leaf. Per-solve state comes from
-//! the descriptor and per-phase switches from the launch group, so solves at
-//! different iterations share a tick and no alignment is needed.
+//! The design in one paragraph. Three streams: `compute` runs ticks, `build`
+//! admits jobs, `download` (owned by a separate thread) returns results — so
+//! the service thread never waits on the device. All memory is cut from
+//! slabs at startup; after that the service makes no CUDA allocations. A
+//! tick is one fixed launch sequence over the whole live set: kernels are
+//! one block per solve, read their stage from the descriptor, and return
+//! early when a phase does not apply, so iterate, value and carry solves
+//! share the same launches and nothing is staged per tick — the launch
+//! headers change only when the live set's membership does. All per-tick
+//! state (iteration counter, traverser, stage, DCFR discounts) advances on
+//! the device in `advance_state`; the host runs the same arithmetic on
+//! shadow copies to know when results are due.
 //!
-//! Two invariants make this file short. Device memory is described once, in
-//! `layout.rs`, and reached only through the accessors it generates. And
-//! every kernel has the same signature, so `Service::launch` is the only
-//! launch site — there is no per-kernel argument plumbing to get wrong.
+//! Admission is batched: up to `MAX_BATCH` jobs upload together and their
+//! card/trunk/holding towers run as one GEMM chain over the packed batch,
+//! then scatter kernels place each solve's h0 rows and z/g tables. The
+//! compute stream waits on one build event, so ticks and builds overlap.
+//!
+//! The network shape (tower widths and depths) comes from the checkpoint;
+//! kernels are NVRTC-compiled for it at startup. New weights of the same
+//! shape apply when the live set drains; a different shape is an error —
+//! restart the service.
 
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
 
 use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
 use cudarc::cublas::CudaBlas;
-use cudarc::driver::safe::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig};
+use cudarc::driver::safe::{CudaContext, CudaEvent, CudaFunction, CudaModule, CudaStream, LaunchConfig};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, PushKernelArg};
 use cudarc::nvrtc;
 
+use crate::net::V3Layout;
 use crate::serialize::{Job, JobMeta};
 
 use super::client::{Cmd, GpuClient, Trip1, Trip2};
 use super::layout::{
-    arena_offsets, cuda_preamble, pack_tables, Arena, Derived, Desc, Sizes, Tbl, N_ARENAS,
+    arena_offsets, cuda_preamble, pack_tables, Arena, Derived, Desc, Sizes, N_ARENAS,
     STAGE_CARRY, STAGE_ITERATE, STAGE_VALUE,
 };
 
 /// Live-set capacity, in solve slots.
 const CAP: usize = 256;
-
-/// Row-pool capacity. A solve's network rows are its non-terminal leaves. The
-/// pool holds the whole live set at once, so a solve's rows are contiguous and
-/// stable for its lifetime and no tick ever packs them; it is what actually
-/// bounds the live set, since real trees vary by an order of magnitude and
-/// `CAP` slots of the largest would not fit in memory.
+/// Row-pool capacity; the real bound on the live set.
 const MAX_ROWS: usize = 256 * 1024;
-
-/// Threads per block for the flat phases.
+/// Threads per block.
 const BLOCK: u32 = 256;
+/// Admission batch bounds: jobs, network rows, distinct configs.
+const MAX_BATCH: usize = 32;
+const MAX_BATCH_ROWS: usize = 32 * 1024;
+const MAX_BATCH_CFG: usize = 64 * 1024;
+/// Ints per batch-map entry: slot, row0-in-batch, nrows, cfg0-in-batch, ncfg.
+const BMAP_INTS: usize = 5;
 
-/// How many launches one staging round may hold.
-///
-/// A sweep is one launch per level and a tick runs several sweeps, so this
-/// scales with tree depth: the deepest trees measured have thirteen levels,
-/// which puts a busy tick near a hundred launches. Sized well past that,
-/// because overflowing it is a crash rather than a slowdown.
-const MAX_LAUNCHES: usize = 512;
-
-/// Per-phase timing, when `WARCHEST_GPU_TIMING` is set. Off by default: it
-/// puts an event around every launch and synchronises once per tick, which is
-/// exactly the overlap the service otherwise relies on.
-/// Spans one flush may hold. A tick uses about twenty-five, and every
-/// admission that lands in the same loop adds a dozen more.
-const MAX_SPANS: usize = 1024;
-
-struct Timing {
-    events: Vec<cudarc::driver::CudaEvent>,
-    names: Vec<&'static str>,
-    total: std::collections::BTreeMap<&'static str, f32>,
-    ticks: u64,
-    since: std::time::Instant,
-}
-
-impl Timing {
-    fn new(stream: &Arc<CudaStream>) -> Option<Timing> {
-        if std::env::var("WARCHEST_GPU_TIMING").is_err() {
-            return None;
-        }
-        let events = (0..2 * MAX_SPANS)
-            // The default flag is DISABLE_TIMING, which makes elapsed_ms fail.
-            .map(|_| {
-                stream
-                    .context()
-                    .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
-                    .expect("event")
-            })
-            .collect();
-        Some(Timing {
-            events,
-            names: Vec::new(),
-            total: std::collections::BTreeMap::new(),
-            ticks: 0,
-            since: std::time::Instant::now(),
-        })
-    }
-
-    /// Fold the tick's elapsed times into the running totals and report every
-    /// few hundred ticks, so a long run prints a stable profile.
-    fn flush(&mut self) {
-        for (i, name) in self.names.iter().enumerate() {
-            let ms = self.events[2 * i]
-                .elapsed_ms(&self.events[2 * i + 1])
-                .expect("timing events need CU_EVENT_DEFAULT");
-            *self.total.entry(name).or_insert(0.0) += ms;
-        }
-        self.names.clear();
-        self.ticks += 1;
-        if self.ticks % 25 != 0 {
-            return;
-        }
-        let sum: f32 = self.total.values().sum();
-        let wall = self.since.elapsed().as_secs_f32() * 1000.0;
-        let mut rows: Vec<_> = self.total.iter().collect();
-        rows.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
-        eprintln!(
-            "[gpu] {} ticks in {wall:.0} ms ({:.1} ticks/s); {sum:.0} ms on the device ({:.0}%):",
-            self.ticks,
-            self.ticks as f32 / (wall / 1000.0),
-            100.0 * sum / wall,
-        );
-        for (name, ms) in rows {
-            eprintln!("[gpu]   {name:<14} {ms:8.1} ms  {:5.1}%", 100.0 * ms / sum);
-        }
-    }
+/// Slab sizes, in MiB, overridable by environment (the T4 CI box is small).
+fn env_mb(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default) << 20
 }
 
 // ------------------------------------------------------------------ context
 
-/// The `Ctx` struct of kernels.cu: the weights and the row pools, everything
-/// a tick shares across solves.
+/// The `Ctx` struct of kernels.cu: weight pointers, row pools, build scratch.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Ctx {
-    w0: *const f32, b0: *const f32, ln0w: *const f32, ln0b: *const f32,
-    w1: *const f32, b1: *const f32, ln1w: *const f32, ln1b: *const f32,
-    wb: *const f32, wu: *const f32, bu: *const f32,
-    wc: *const f32, bc: *const f32, wh1: *const f32, bh1: *const f32,
-    wh2: *const f32, bh2: *const f32, wg: *const f32, bg: *const f32,
-    wd0: *const f32, bd0: *const f32, wd1: *const f32, bd1: *const f32,
-    wid: *const f32, wpile: *const f32, bpile: *const f32,
-    wq: *const f32, bq: *const f32, wk: *const f32, bk: *const f32,
-    wp: *const f32, bp: *const f32,
-    h0: *mut f32, xb: *mut f32, h: *mut f32, u: *mut f32,
-    bx: *mut f32, bh: *mut f32, bgather: *mut f32,
-    hidden: i32, head: i32, dg: i32, rk: i32, de: i32, dc: i32,
-    af: i32, xd: i32, hf: i32, cfeat: i32, pubfeat: i32,
+    card_w: [*const f32; 8], card_b: [*const f32; 8],
+    wid: *const f32,
+    pile_w: *const f32, pile_b: *const f32,
+    pub_w: [*const f32; 8], pub_b: [*const f32; 8],
+    pub_lnw: [*const f32; 8], pub_lnb: [*const f32; 8],
+    pub_out_w: *const f32, pub_out_b: *const f32,
+    wb: *const f32, ln1w: *const f32, ln1b: *const f32,
+    hmlp_w: [*const f32; 8], hmlp_b: [*const f32; 8],
+    wu_w: *const f32, wu_b: *const f32,
+    slot_w: [*const f32; 8], slot_b: [*const f32; 8],
+    slot_out_w: *const f32, slot_out_b: *const f32,
+    res_aw: [*const f32; 4], res_ab: [*const f32; 4],
+    res_bw: [*const f32; 4], res_bb: [*const f32; 4],
+    wg_w: *const f32, wg_b: *const f32,
+    h0: *mut f32, xb: *mut f32, h: *mut f32, h2: *mut f32, u: *mut f32,
+    bx: *mut f32, bh: *mut f32, bh2: *mut f32, bg: *mut f32,
+    bmap: *const i32,
 }
 
 unsafe impl cudarc::driver::DeviceRepr for Ctx {}
 unsafe impl cudarc::driver::ValidAsZeroBits for Ctx {}
 unsafe impl Send for Ctx {}
-
-/// The `Group` struct of kernels.cu: which solves a launch covers, where each
-/// one's threads start, and the switches every solve in it shares.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct GroupDev {
-    slots: *const i32,
-    starts: *const i32,
-    n: i32,
-    total: i32,
-    mode: i32,
-    p_player: i32,
-    nplayers: i32,
-    strat_src: i32,
-    level: i32,
-}
-
-unsafe impl cudarc::driver::DeviceRepr for GroupDev {}
-unsafe impl cudarc::driver::ValidAsZeroBits for GroupDev {}
-unsafe impl Send for GroupDev {}
 
 impl Default for Ctx {
     fn default() -> Ctx {
@@ -173,82 +96,37 @@ impl Default for Ctx {
     }
 }
 
-/// The per-phase switches a launch carries: regret mode, the current
-/// strategy, one player. Phases that need something else name it.
-#[derive(Clone, Copy, Default, PartialEq)]
-struct Phase {
+/// The `Group` struct of kernels.cu.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GroupDev {
+    slots: *const i32,
+    n: i32,
     mode: i32,
     p_player: i32,
-    nplayers: i32,
-    strat_src: i32,
     level: i32,
+    total: i32,
 }
 
-/// The default phase, spelled short because most launches take it as is.
-const P: Phase = Phase { mode: 0, p_player: 0, nplayers: 1, strat_src: 0, level: 0 };
+unsafe impl cudarc::driver::DeviceRepr for GroupDev {}
+unsafe impl cudarc::driver::ValidAsZeroBits for GroupDev {}
+unsafe impl Send for GroupDev {}
 
-/// `p_player` sentinel: each solve uses its own traverser rather than one
-/// player fixed for the whole group.
-const TRAVERSER: i32 = -1;
-
-/// One staged launch: which group header it uses, and its grid.
+/// The tick's launch headers, by fixed slot. They point at the live list and
+/// change only when membership does.
 #[derive(Clone, Copy)]
-struct Launch {
-    meta: usize,
-    grid: u32,
+enum Hdr {
+    Plain = 0,
+    ReadIt,        // p_player = -1 (iterate readout/backprop)
+    ReadV0,        // p_player = 0 (value pass)
+    ReadV1,        // p_player = 1
+    ReachVC,       // mode = 0 (value + carry)
+    ReachIt,       // mode = 1 (iterate)
+    HmlpBase,      // + 2*k: layer k into h2 (mode 1) or h (mode 0)
 }
+const N_HDRS: usize = Hdr::HmlpBase as usize + 16;
 
-/// Threads per item. Most phases give an item one thread; the two that walk a
-/// row's config list give it a whole warp.
-const THREAD: usize = 1;
-const WARP: usize = 32;
-
-/// The launches a CFR iteration needs, in the order they run.
-#[derive(Default, Clone)]
-struct IterateSet {
-    belief_one: Option<Launch>,
-    belief_two: Option<Launch>,
-    head_norm: Option<Launch>,
-    head_bias: Option<Launch>,
-    readout: Option<Launch>,
-    backprop: Vec<Launch>,
-    regret: Option<Launch>,
-    clear: Option<Launch>,
-    seed: Option<Launch>,
-    propagate: Vec<Launch>,
-    average: Option<Launch>,
-    snapshot: Option<Launch>,
-}
-
-/// The launches one fixed-policy value pass needs, per player.
-#[derive(Default, Clone)]
-struct ValuePass {
-    readout: Option<Launch>,
-    backprop: Vec<Launch>,
-    collect: Option<Launch>,
-}
-
-#[derive(Default, Clone)]
-struct ValueSet {
-    clear: Option<Launch>,
-    seed: Option<Launch>,
-    propagate: Vec<Launch>,
-    belief: Option<Launch>,
-    head_norm: Option<Launch>,
-    head_bias: Option<Launch>,
-    pass: [ValuePass; 2],
-}
-
-#[derive(Default, Clone)]
-struct CarrySet {
-    clear: Option<Launch>,
-    seed: Option<Launch>,
-    propagate: Vec<Launch>,
-    beliefs: Option<Launch>,
-}
-
-/// How far into a CFR iteration to run. Only the phase oracle test stops
-/// short; the tick always runs `All`.
+/// How far into a tick to run; the phase-oracle test stops early.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Step {
     Build,
@@ -262,163 +140,25 @@ pub(crate) enum Step {
     All,
 }
 
-// ------------------------------------------------------------------ weights
+// ------------------------------------------------------------------ slabs
 
-/// The network's flat arrays on the device, plus the derived pointer table.
-struct Weights {
-    dims: Vec<usize>,
-    _w: CudaSlice<f32>,
-    _b: CudaSlice<f32>,
-    _ln: CudaSlice<f32>,
-    ctx: Ctx,
-}
-
-/// Slice bounds of the flat arrays, following `Mlp::from_flat`'s layout
-/// (train/value_net.py::flat writes the same order). The last entry of each
-/// scan is that array's total length, which is how callers size one.
-pub fn weight_offsets(
-    dims: &[usize],
-) -> Result<(Vec<usize>, Vec<usize>, Vec<usize>), String> {
-    if dims.len() != 10 || dims[9] != 0 {
-        return Err(format!("gpu: unsupported dims {dims:?}"));
-    }
-    let (h, hd, dg, rk, de, dc) = (dims[1], dims[2], dims[4], dims[5], dims[7], dims[8]);
-    let (af, hf, xd) = (dims[6] + de, crate::net::hfeat(de), xdim(de));
-    let (cf, nu, pc) = (crate::units::CARD_FEATS, crate::units::N_UNITS, crate::rebel::PILE_COUNTS);
-    let scan = |lens: &[usize]| {
-        let mut at = 0;
-        let mut v = Vec::with_capacity(lens.len() + 1);
-        for &n in lens {
-            v.push(at);
-            at += n;
-        }
-        v.push(at);
-        v
-    };
-    Ok((
-        scan(&[cf * dc, dc * de, nu * de, (pc + de) * de, xd * h, h * hd, 2 * dg * hd,
-               hf * dg, dg * dg, dg * dg, dg * (rk + 1), hd * rk, af * rk, dg * rk, hd * rk]),
-        scan(&[dc, de, de, h, hd, dg, dg, dg, rk + 1, rk, rk, rk, rk]),
-        scan(&[h, h, hd, hd]),
-    ))
-}
-
-/// The trunk input width: the hex block, the two per-player pile summaries,
-/// and the loose scalars.
-fn xdim(de: usize) -> usize {
-    crate::board::N_HEXES * (crate::rebel::HEX_FACTS + de) + 2 * de + crate::rebel::LOOSE
-}
-
-impl Weights {
-    fn upload(
-        stream: &Arc<CudaStream>,
-        pools: &Pools,
-        dims: Vec<usize>,
-        w: Vec<f32>,
-        b: Vec<f32>,
-        ln: Vec<f32>,
-    ) -> Result<Weights, String> {
-        let (ow, ob, oln) = weight_offsets(&dims)?;
-        let want = |o: &[usize]| *o.last().unwrap();
-        if w.len() != want(&ow) || b.len() != want(&ob) || ln.len() != want(&oln) {
-            return Err(format!(
-                "gpu: weight sizes {}/{}/{} do not match dims {dims:?}",
-                w.len(), b.len(), ln.len()
-            ));
-        }
-        let wb = htod(stream, &w)?;
-        let bb = htod(stream, &b)?;
-        let lb = htod(stream, &ln)?;
-        let (wp, bp, lp) = (ptr(stream, &wb), ptr(stream, &bb), ptr(stream, &lb));
-        let w_at = |i: usize| unsafe { wp.add(ow[i]) };
-        let b_at = |i: usize| unsafe { bp.add(ob[i]) };
-        let l_at = |i: usize| unsafe { lp.add(oln[i]) };
-        let (h, hd, dg, rk, de, dc) = (dims[1], dims[2], dims[4], dims[5], dims[7], dims[8]);
-        let ctx = Ctx {
-            w0: w_at(4), b0: b_at(3), ln0w: l_at(0), ln0b: l_at(1),
-            w1: w_at(5), b1: b_at(4), ln1w: l_at(2), ln1b: l_at(3),
-            wb: w_at(6), wu: w_at(11), bu: b_at(9),
-            wc: w_at(7), bc: b_at(5), wh1: w_at(8), bh1: b_at(6),
-            wh2: w_at(9), bh2: b_at(7), wg: w_at(10), bg: b_at(8),
-            wd0: w_at(0), bd0: b_at(0), wd1: w_at(1), bd1: b_at(1),
-            wid: w_at(2), wpile: w_at(3), bpile: b_at(2),
-            wq: w_at(12), bq: b_at(10), wk: w_at(13), bk: b_at(11),
-            wp: w_at(14), bp: b_at(12),
-            h0: pools.h0_ptr, xb: pools.xb_ptr, h: pools.h_ptr, u: pools.u_ptr,
-            bx: pools.bx_ptr, bh: pools.bh_ptr, bgather: pools.bg_ptr,
-            hidden: h as i32, head: hd as i32, dg: dg as i32, rk: rk as i32,
-            de: de as i32, dc: dc as i32, af: (dims[6] + de) as i32,
-            xd: xdim(de) as i32, hf: (crate::rebel::PILE_COUNTS + de) as i32,
-            cfeat: crate::rebel::CFEAT as i32, pubfeat: crate::rebel::PUBFEAT as i32,
-        };
-        Ok(Weights { dims, _w: wb, _b: bb, _ln: lb, ctx })
-    }
-}
-
-// ------------------------------------------------------------------ pools
-
-/// The row pools: one contiguous buffer per network activation, indexed by a
-/// solve's stable row base. Building a solve writes its `h0` rows straight in,
-/// so the head's GEMMs run over the live set with no packing step.
-struct Pools {
-    _h0: CudaSlice<f32>,
-    _xb: CudaSlice<f32>,
-    _h: CudaSlice<f32>,
-    _u: CudaSlice<f32>,
-    _bx: CudaSlice<f32>,
-    _bh: CudaSlice<f32>,
-    _bg: CudaSlice<f32>,
-    h0_ptr: *mut f32,
-    xb_ptr: *mut f32,
-    h_ptr: *mut f32,
-    u_ptr: *mut f32,
-    bx_ptr: *mut f32,
-    bh_ptr: *mut f32,
-    bg_ptr: *mut f32,
-    /// Allocated row ranges, sorted by start; first fit.
+/// First-fit suballocation over one flat range. Every device blob — tables,
+/// arenas, network rows — is a range from one of these, so the service never
+/// calls the CUDA allocator after startup.
+struct Slab {
     used: Vec<(usize, usize)>,
-    /// One past the highest row in use, which is how far the head GEMMs run.
+    cap: usize,
     high: usize,
 }
 
-impl Pools {
-    fn new(stream: &Arc<CudaStream>, dims: &[usize]) -> Result<Pools, String> {
-        let (h, hd, dg, rk, de) = (dims[1], dims[2], dims[4], dims[5], dims[7]);
-        // The build's widest use of each scratch: the trunk input, the widest
-        // hidden matrix, and the widest gather.
-        let bx = MAX_BUILD_ROWS * xdim(de);
-        let bh = MAX_BUILD_ROWS.max(MAX_CFG * crate::rebel::NSLOT) * h.max(dg);
-        let bg = (MAX_BUILD_ROWS * crate::rebel::NTYPE * de + crate::rebel::NTYPE * de)
-            .max(MAX_CFG * crate::rebel::NSLOT * crate::net::hfeat(de));
-        let mut p = Pools {
-            _h0: zeros(stream, MAX_ROWS * hd)?,
-            _xb: zeros(stream, MAX_ROWS * 2 * dg)?,
-            _h: zeros(stream, MAX_ROWS * hd.max(h))?,
-            _u: zeros(stream, MAX_ROWS * rk)?,
-            _bx: zeros(stream, bx)?,
-            _bh: zeros(stream, bh)?,
-            _bg: zeros(stream, bg)?,
-            h0_ptr: std::ptr::null_mut(), xb_ptr: std::ptr::null_mut(),
-            h_ptr: std::ptr::null_mut(), u_ptr: std::ptr::null_mut(),
-            bx_ptr: std::ptr::null_mut(), bh_ptr: std::ptr::null_mut(),
-            bg_ptr: std::ptr::null_mut(),
-            used: Vec::new(),
-            high: 0,
-        };
-        p.h0_ptr = ptr_mut(stream, &mut p._h0);
-        p.xb_ptr = ptr_mut(stream, &mut p._xb);
-        p.h_ptr = ptr_mut(stream, &mut p._h);
-        p.u_ptr = ptr_mut(stream, &mut p._u);
-        p.bx_ptr = ptr_mut(stream, &mut p._bx);
-        p.bh_ptr = ptr_mut(stream, &mut p._bh);
-        p.bg_ptr = ptr_mut(stream, &mut p._bg);
-        Ok(p)
+impl Slab {
+    fn new(cap: usize) -> Slab {
+        Slab { used: Vec::new(), cap, high: 0 }
     }
-
-    /// Where a run of `n` rows would go, by first fit. Ranges are kept
-    /// sorted, so the gap before each one is the only place a run can start.
-    /// `None` means the pool is full, which is what bounds the live set.
-    fn find_gap(&self, n: usize) -> Option<(usize, usize)> {
+    fn fits(&self, n: usize) -> bool {
+        self.gap(n).is_some()
+    }
+    fn gap(&self, n: usize) -> Option<(usize, usize)> {
         let mut at = 0;
         for (i, &(start, len)) in self.used.iter().enumerate() {
             if start - at >= n {
@@ -426,31 +166,103 @@ impl Pools {
             }
             at = start + len;
         }
-        (at + n <= MAX_ROWS).then_some((at, self.used.len()))
+        (at + n <= self.cap).then_some((at, self.used.len()))
     }
-
     fn alloc(&mut self, n: usize) -> Option<usize> {
-        let (at, i) = self.find_gap(n)?;
+        let (at, i) = self.gap(n)?;
         self.used.insert(i, (at, n));
         self.high = self.high.max(at + n);
         Some(at)
     }
-
     fn free(&mut self, at: usize) {
         self.used.retain(|&(s, _)| s != at);
         self.high = self.used.iter().map(|&(s, n)| s + n).max().unwrap_or(0);
     }
 }
 
-/// Build-scratch bounds. A tree past these is rejected rather than silently
-/// overrunning; the CPU solver's node cap keeps real trees far below.
-const MAX_BUILD_ROWS: usize = 16 * 1024;
-const MAX_CFG: usize = 32 * 1024;
+// ------------------------------------------------------------------ weights
+
+struct Weights {
+    dims: Vec<usize>,
+    layout: V3Layout,
+    _w: CudaSlice<f32>,
+    _b: CudaSlice<f32>,
+    _ln: CudaSlice<f32>,
+    ctx: Ctx,
+}
+
+impl Weights {
+    fn upload(
+        stream: &Arc<CudaStream>,
+        dims: &[usize],
+        w: Vec<f32>,
+        b: Vec<f32>,
+        ln: Vec<f32>,
+    ) -> Result<Weights, String> {
+        let l = V3Layout::new(dims)?;
+        if w.len() != l.w_len || b.len() != l.b_len || ln.len() != l.ln_len {
+            return Err(format!(
+                "gpu: weight sizes {}/{}/{} do not match dims {dims:?}",
+                w.len(), b.len(), ln.len()
+            ));
+        }
+        if l.card.len() > 8 || l.pub_lin.len() > 8 || l.hmlp.len() > 8
+            || l.slot.len() > 8 || l.res.len() > 4
+        {
+            return Err("gpu: tower deeper than the kernel pointer tables (8/4)".into());
+        }
+        let wb = htod(stream, &w)?;
+        let bb = htod(stream, &b)?;
+        let lb = htod(stream, &ln)?;
+        let (wp, bp, lp) = (ptr(stream, &wb), ptr(stream, &bb), ptr(stream, &lb));
+        let w_at = |o: usize| unsafe { wp.add(o) };
+        let b_at = |o: usize| unsafe { bp.add(o) };
+        let l_at = |o: usize| unsafe { lp.add(o) };
+        let mut ctx = Ctx::default();
+        for (k, s) in l.card.iter().enumerate() {
+            ctx.card_w[k] = w_at(s.w);
+            ctx.card_b[k] = b_at(s.b);
+        }
+        ctx.wid = w_at(l.wid);
+        ctx.pile_w = w_at(l.pile.w);
+        ctx.pile_b = b_at(l.pile.b);
+        for (k, s) in l.pub_lin.iter().enumerate() {
+            ctx.pub_w[k] = w_at(s.w);
+            ctx.pub_b[k] = b_at(s.b);
+            ctx.pub_lnw[k] = l_at(l.pub_ln[k].0);
+            ctx.pub_lnb[k] = l_at(l.pub_ln[k].1);
+        }
+        ctx.pub_out_w = w_at(l.pub_out.w);
+        ctx.pub_out_b = b_at(l.pub_out.b);
+        ctx.wb = w_at(l.wb);
+        ctx.ln1w = l_at(l.ln1.0);
+        ctx.ln1b = l_at(l.ln1.1);
+        for (k, s) in l.hmlp.iter().enumerate() {
+            ctx.hmlp_w[k] = w_at(s.w);
+            ctx.hmlp_b[k] = b_at(s.b);
+        }
+        ctx.wu_w = w_at(l.wu.w);
+        ctx.wu_b = b_at(l.wu.b);
+        for (k, s) in l.slot.iter().enumerate() {
+            ctx.slot_w[k] = w_at(s.w);
+            ctx.slot_b[k] = b_at(s.b);
+        }
+        ctx.slot_out_w = w_at(l.slot_out.w);
+        ctx.slot_out_b = b_at(l.slot_out.b);
+        for (k, (a, bbk)) in l.res.iter().enumerate() {
+            ctx.res_aw[k] = w_at(a.w);
+            ctx.res_ab[k] = b_at(a.b);
+            ctx.res_bw[k] = w_at(bbk.w);
+            ctx.res_bb[k] = b_at(bbk.b);
+        }
+        ctx.wg_w = w_at(l.wg.w);
+        ctx.wg_b = b_at(l.wg.b);
+        Ok(Weights { dims: dims.to_vec(), layout: l, _w: wb, _b: bb, _ln: lb, ctx })
+    }
+}
 
 // ------------------------------------------------------------------ kernels
 
-/// Every kernel, by the name NVRTC exports. They all have the same signature,
-/// so this table is the only thing that names them.
 macro_rules! kernels {
     ($($name:ident),* $(,)?) => {
         struct Kernels { $($name: CudaFunction,)* }
@@ -464,85 +276,158 @@ macro_rules! kernels {
 }
 
 kernels! {
-    belief_sums, head_norm, head_bias, readout, backprop, regret_match, propagate,
-    average, snapshot, collect_root, leaf_beliefs, init_strategy, reach_clear, reach_seed,
-    cards_finish, pile_pe, assemble, trunk_norm, holding_in, slot_sum, embed_relu,
-    embed_bias, readout_bias, cards_relu, abi_probe,
+    belief_sums, head_entry, hmlp_act, readout, backprop_solve, regret_match,
+    reach_prop, average, collect_root, leaf_beliefs, advance_state,
+    pack_cards, bias_act, cards_finish, pile_pe, assemble, pack_piles,
+    trunk_norm, scatter_h0, holding_in, slot_sum, scatter_zg, init_strategy,
+    seed_avg, abi_probe,
 }
 
 // ------------------------------------------------------------------ solves
 
-/// One resident solve: its device blobs, its descriptor, and the host mirror
-/// of the state the tick advances.
+/// One resident solve: device ranges, the host shadow of the device state
+/// machine, and the reply channels.
 struct Solve {
     id: u64,
     meta: JobMeta,
-    _tables: CudaSlice<u8>,
-    arenas: CudaSlice<f32>,
-    desc: Desc,
+    tbl_at: usize,
+    arena_at: usize,
+    row0: usize,
+    nrows: usize,
     aoff: [u32; N_ARENAS + 1],
+    /// The admission descriptor. The device mutates its own copy; the host
+    /// mirror is rebuilt from the counters below when a field must change
+    /// (trip 2's exit leaf), so the two never disagree.
+    desc: Desc,
+    /// Support offsets per (node, player), for the trip-2 leaf counts.
+    cfg_off: Vec<u32>,
+    // Host shadow of the device state machine (advance_state).
     stage: i32,
     t: usize,
     step: usize,
-    snap_t: usize,
-    traverser: usize,
-    steps: [usize; 2],
-    first_query: bool,
-    row0: usize,
-    nrows: usize,
-    reach_len: usize,
-    nleaf: usize,
-    nterm: usize,
-    nodes: usize,
-    ncells: usize,
-    nsnaps: usize,
     nroots: usize,
+    nsnaps: usize,
+    nleaf_cfg: [usize; 2],
     nc_root: [usize; 2],
-    nc_leaf: [usize; 2],
-    /// Config counts per node, for sizing the trip-2 exit leaf.
-    cfg_off: Vec<u32>,
-    /// Node index boundaries per BFS level, so a per-level launch knows how
-    /// many nodes this solve contributes to it.
-    level_start: Vec<u32>,
-    nlevels: usize,
-    trip1: Option<mpsc::Sender<Result<Trip1, String>>>,
+    ncells: usize,
+    trip1: Option<(usize, mpsc::Sender<(usize, Result<Trip1, String>)>)>,
     trip2: Option<mpsc::Sender<Result<Trip2, String>>>,
+    /// Trip 2 asked and the downloader owns the final read; release after.
+    draining: bool,
+}
+
+// ------------------------------------------------------------ downloader
+
+/// One request to the downloader thread: wait for `event`, copy the ranges,
+/// reply. Raw device pointers are safe because the service keeps the solve's
+/// ranges allocated until the downloader confirms (`done` channel).
+enum Dl {
+    Trip1 {
+        event: CudaEvent,
+        tag: usize,
+        reply: mpsc::Sender<(usize, Result<Trip1, String>)>,
+        id: u64,
+        strategy: (u64, usize),
+        root_vals: (u64, usize),
+        nc_root: [usize; 2],
+    },
+    Trip2 {
+        event: CudaEvent,
+        reply: mpsc::Sender<Result<Trip2, String>>,
+        slot: usize,
+        beliefs: (u64, usize),
+        nc_leaf: [usize; 2],
+        nsnaps: usize,
+    },
+}
+
+fn downloader(stream: Arc<CudaStream>, rx: mpsc::Receiver<Dl>, done: mpsc::Sender<usize>) {
+    let fetch = |ev: &CudaEvent, (at, len): (u64, usize)| -> Vec<f32> {
+        let mut host = vec![0.0f32; len];
+        if len == 0 {
+            return host;
+        }
+        // Order the copy after the tick that produced the data, then wait on
+        // this thread only; the compute stream never stalls.
+        let _ = stream.wait(ev);
+        unsafe {
+            let _ = cudarc::driver::result::memcpy_dtoh_async(
+                &mut host,
+                at,
+                stream.cu_stream(),
+            );
+        }
+        let _ = stream.synchronize();
+        host
+    };
+    while let Ok(req) = rx.recv() {
+        match req {
+            Dl::Trip1 { event, tag, reply, id, strategy, root_vals, nc_root } => {
+                let strategy = fetch(&event, strategy);
+                let flat = fetch(&event, root_vals);
+                let stride = (nc_root[0] + nc_root[1]).max(1);
+                let root_values = flat
+                    .chunks_exact(stride)
+                    .map(|c| [c[..nc_root[0]].to_vec(), c[nc_root[0]..].to_vec()])
+                    .collect();
+                let _ = reply.send((tag, Ok(Trip1 { id, strategy, root_values })));
+            }
+            Dl::Trip2 { event, reply, slot, beliefs, nc_leaf, nsnaps } => {
+                let flat = fetch(&event, beliefs);
+                let stride = (nc_leaf[0] + nc_leaf[1]).max(1);
+                let out: Trip2 = flat
+                    .chunks_exact(stride)
+                    .take(nsnaps.saturating_sub(1))
+                    .map(|c| [c[..nc_leaf[0]].to_vec(), c[nc_leaf[0]..].to_vec()])
+                    .collect();
+                let _ = reply.send(Ok(out));
+                let _ = done.send(slot);
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------ service
 
 pub struct Service {
-    stream: Arc<CudaStream>,
+    compute: Arc<CudaStream>,
+    build: Arc<CudaStream>,
     blas: CudaBlas,
+    build_blas: CudaBlas,
     f: Kernels,
-    pools: Pools,
     weights: Weights,
-    incoming: Option<Weights>,
+    incoming: Option<(Vec<usize>, Vec<f32>, Vec<f32>, Vec<f32>)>,
     ctx: CudaSlice<Ctx>,
+    // Slabs and pools.
+    tables: CudaSlice<u8>,
+    tbl_slab: Slab,
+    arenas: CudaSlice<f32>,
+    arena_slab: Slab,
+    rows: Slab,
+    _pools: Vec<CudaSlice<f32>>,
+    // Live set.
     live: Vec<Option<Solve>>,
     free: Vec<usize>,
     next_id: u64,
-    rx: mpsc::Receiver<Cmd>,
+    live_slots: CudaSlice<i32>,
+    live_count: usize,
+    live_dirty: bool,
     descs: CudaSlice<Desc>,
-    /// Group staging. Every launch of a tick is built here and uploaded in
-    /// one pair of copies; `g_data_ptr` is the device address the staged
-    /// group headers point into, which is stable because `g_data` outlives
-    /// the service.
-    g_data: CudaSlice<i32>,
     g_meta: CudaSlice<GroupDev>,
-    g_data_ptr: *const i32,
-    h_data: Vec<i32>,
-    h_meta: Vec<GroupDev>,
-    h_descs: Vec<Desc>,
-    timing: Option<Timing>,
-    /// Jobs that arrived when the live set was full. The row pool, not the
-    /// slot count, is usually what fills; a worker blocked here costs nothing
-    /// and the alternative is failing a solve the walk cannot do without.
-    waiting: std::collections::VecDeque<(Job, mpsc::Sender<Result<Trip1, String>>)>,
+    bmap: CudaSlice<i32>,
+    // Plumbing.
+    rx: mpsc::Receiver<Cmd>,
+    dl_tx: mpsc::Sender<Dl>,
+    done_rx: mpsc::Receiver<usize>,
+    waiting: std::collections::VecDeque<(Job, usize, mpsc::Sender<(usize, Result<Trip1, String>)>)>,
+    /// Ticks and solves served, for the log line.
+    ticks: u64,
+    solved: u64,
 }
 
-/// Spawn the service thread; returns the worker-side client.
+/// Spawn the service thread on CUDA device `device`; returns the client.
 pub fn spawn(
+    device: usize,
     dims: Vec<usize>,
     w: Vec<f32>,
     b: Vec<f32>,
@@ -550,89 +435,196 @@ pub fn spawn(
 ) -> Result<GpuClient, String> {
     let (tx, rx) = mpsc::channel();
     let client = GpuClient::new(tx);
+    let (ready_tx, ready_rx) = mpsc::channel();
     std::thread::Builder::new()
-        .name("gpu-service".into())
-        .spawn(move || match Service::new(rx, dims, w, b, ln) {
-            Ok(mut svc) => svc.run(),
-            Err(e) => eprintln!("gpu service failed to start: {e}"),
+        .name(format!("gpu-service-{device}"))
+        .spawn(move || match Service::new(device, rx, dims, w, b, ln) {
+            Ok(mut svc) => {
+                let _ = ready_tx.send(Ok(()));
+                svc.run()
+            }
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+            }
         })
         .map_err(|e| format!("{e:?}"))?;
+    ready_rx
+        .recv()
+        .map_err(|_| "gpu service thread died".to_string())??;
     Ok(client)
 }
 
 impl Service {
     pub(crate) fn new(
+        device: usize,
         rx: mpsc::Receiver<Cmd>,
         dims: Vec<usize>,
         w: Vec<f32>,
         b: Vec<f32>,
         ln: Vec<f32>,
     ) -> Result<Service, String> {
-        let dev = CudaContext::new(0).map_err(|e| format!("cuda device: {e:?}"))?;
-        let stream = dev.default_stream();
-        let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("{e:?}"))?;
-        let src = format!("{}\n{}", cuda_preamble(), include_str!("kernels.cu"));
+        let dev = CudaContext::new(device).map_err(|e| format!("cuda device {device}: {e:?}"))?;
+        let compute = dev.new_stream().map_err(|e| format!("{e:?}"))?;
+        let build = dev.new_stream().map_err(|e| format!("{e:?}"))?;
+        let download = dev.new_stream().map_err(|e| format!("{e:?}"))?;
+        let blas = CudaBlas::new(compute.clone()).map_err(|e| format!("{e:?}"))?;
+        let build_blas = CudaBlas::new(build.clone()).map_err(|e| format!("{e:?}"))?;
+
+        let layout = V3Layout::new(&dims)?;
+        let (maj, min) = (
+            dev.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+                .map_err(|e| format!("{e:?}"))?,
+            dev.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+                .map_err(|e| format!("{e:?}"))?,
+        );
+        let arch = format!("compute_{maj}{min}");
+        let src = format!("{}\n{}", cuda_preamble(&layout), include_str!("kernels.cu"));
         let ptx = nvrtc::compile_ptx_with_opts(
             &src,
-            nvrtc::CompileOptions { arch: Some("compute_75"), ..Default::default() },
+            nvrtc::CompileOptions { arch: Some(Box::leak(arch.into_boxed_str())), ..Default::default() },
         )
         .map_err(|e| format!("nvrtc: {e:?}"))?;
         let module = dev.load_module(ptx).map_err(|e| format!("module: {e:?}"))?;
         let f = Kernels::load(&module)?;
-        let pools = Pools::new(&stream, &dims)?;
-        let weights = Weights::upload(&stream, &pools, dims, w, b, ln)?;
-        let ctx = htod(&stream, &[weights.ctx])?;
-        check_abi(&stream, &f.abi_probe)?;
-        let mut g_data_buf = zeros::<i32>(&stream, MAX_LAUNCHES * (2 * CAP + 1))?;
-        let g_data_ptr = ptr_mut(&stream, &mut g_data_buf) as *const i32;
+
+        // Pools: stable network rows, and the build scratch. Sizes derive
+        // from the shape; the batch caps bound the scratch.
+        let (pubw, hmlp, _, slotw) = layout.widths();
+        let h_stride = std::iter::once(layout.head_in).chain(hmlp.iter().copied()).max().unwrap();
+        let max_pub = pubw.iter().copied().chain([layout.head_in, layout.xdim()]).max().unwrap();
+        let slot_max = slotw.iter().copied().chain([layout.dg, layout.hfeat()]).max().unwrap();
+        let bh_len = (MAX_BATCH_ROWS * max_pub)
+            .max(MAX_BATCH_CFG * crate::rebel::NSLOT * slot_max)
+            .max(MAX_BATCH_ROWS * crate::rebel::NTYPE * layout.de);
+        let bg_len = (MAX_BATCH_ROWS * crate::rebel::NTYPE
+            * crate::units::CARD_FEATS.max(crate::rebel::PILE_COUNTS)
+            + MAX_BATCH * crate::rebel::NTYPE * layout.de)
+            .max(MAX_BATCH_CFG * crate::rebel::NSLOT * layout.hfeat())
+            .max(MAX_BATCH_CFG * (layout.rank + 1));
+        let mut pools = Vec::new();
+        let mut pool = |stream: &Arc<CudaStream>, n: usize| -> Result<*mut f32, String> {
+            let mut s: CudaSlice<f32> = stream.alloc_zeros(n.max(1)).map_err(|e| format!("{e:?}"))?;
+            let p = ptr_mut(stream, &mut s);
+            pools.push(s);
+            Ok(p)
+        };
+        let mut ctx0 = Ctx::default();
+        ctx0.h0 = pool(&compute, MAX_ROWS * layout.head_in)?;
+        ctx0.xb = pool(&compute, MAX_ROWS * 2 * layout.dg)?;
+        ctx0.h = pool(&compute, MAX_ROWS * h_stride)?;
+        ctx0.h2 = pool(&compute, if hmlp.is_empty() { 1 } else { MAX_ROWS * h_stride })?;
+        ctx0.u = pool(&compute, MAX_ROWS * layout.rank)?;
+        ctx0.bx = pool(&compute, MAX_BATCH_ROWS * layout.xdim())?;
+        ctx0.bh = pool(&compute, bh_len)?;
+        ctx0.bh2 = pool(&compute, bh_len)?;
+        ctx0.bg = pool(&compute, bg_len)?;
+
+        let mut bmap: CudaSlice<i32> = compute
+            .alloc_zeros(MAX_BATCH * BMAP_INTS)
+            .map_err(|e| format!("{e:?}"))?;
+        ctx0.bmap = ptr_mut(&compute, &mut bmap) as *const i32;
+
+        let mut weights = Weights::upload(&compute, &dims, w, b, ln)?;
+        merge_ctx(&mut weights.ctx, &ctx0);
+        let ctx = htod(&compute, &[weights.ctx])?;
+        check_abi(&compute, &f.abi_probe)?;
+
+        let tables: CudaSlice<u8> = compute
+            .alloc_zeros(env_mb("WARCHEST_GPU_TABLE_MB", 512))
+            .map_err(|e| format!("table slab: {e:?}"))?;
+        let arenas: CudaSlice<f32> = compute
+            .alloc_zeros(env_mb("WARCHEST_GPU_ARENA_MB", 1536) / 4)
+            .map_err(|e| format!("arena slab: {e:?}"))?;
+        let tbl_slab = Slab::new(tables.len());
+        let arena_slab = Slab::new(arenas.len());
+
+        let (dl_tx, dl_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name(format!("gpu-download-{device}"))
+            .spawn(move || downloader(download, dl_rx, done_tx))
+            .map_err(|e| format!("{e:?}"))?;
+
         Ok(Service {
-            descs: zeros(&stream, CAP)?,
-            g_data: g_data_buf,
-            g_meta: zeros(&stream, MAX_LAUNCHES)?,
-            g_data_ptr,
-            h_data: Vec::with_capacity(MAX_LAUNCHES * (2 * CAP + 1)),
-            h_meta: Vec::with_capacity(MAX_LAUNCHES),
-            timing: Timing::new(&stream),
-            h_descs: Vec::with_capacity(CAP),
-            waiting: std::collections::VecDeque::new(),
+            descs: compute.alloc_zeros(CAP).map_err(|e| format!("{e:?}"))?,
+            g_meta: compute.alloc_zeros(N_HDRS).map_err(|e| format!("{e:?}"))?,
+            live_slots: compute.alloc_zeros(CAP).map_err(|e| format!("{e:?}"))?,
+            live_count: 0,
+            live_dirty: false,
             live: (0..CAP).map(|_| None).collect(),
             free: (0..CAP).rev().collect(),
             next_id: 1,
-            stream, blas, f, pools, weights, incoming: None, ctx, rx,
+            waiting: std::collections::VecDeque::new(),
+            tables,
+            tbl_slab,
+            arenas,
+            arena_slab,
+            rows: Slab::new(MAX_ROWS),
+            _pools: pools,
+            bmap,
+            incoming: None,
+            dl_tx,
+            done_rx,
+            ticks: 0,
+            solved: 0,
+            compute, build, blas, build_blas, f, weights, ctx, rx,
         })
     }
 
     fn run(&mut self) {
         loop {
-            match self.rx.recv_timeout(Duration::from_micros(50)) {
-                Ok(cmd) => self.handle(cmd),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            // Drain commands; block only when nothing is in flight.
+            loop {
+                match self.rx.try_recv() {
+                    Ok(cmd) => self.handle(cmd),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => return,
+                }
             }
-            // Drain whatever else arrived while we were busy, so a burst of
-            // submissions joins the same tick.
-            while let Ok(cmd) = self.rx.try_recv() {
-                self.handle(cmd);
+            while let Ok(slot) = self.done_rx.try_recv() {
+                self.release(slot);
             }
-            // Admission is outside the tick: a tick only runs when something
-            // is live, and with an empty live set that would never admit the
-            // first job.
-            self.admit_waiting();
-            if self.live.iter().any(|s| s.is_some()) {
+            // Weights apply only between solves: stop admitting, drain, swap.
+            if self.incoming.is_some() && self.live_count == 0 && self.waiting.is_empty() {
+                let (dims, w, b, ln) = self.incoming.take().unwrap();
+                match Weights::upload(&self.compute, &dims, w, b, ln) {
+                    Ok(mut fresh) => {
+                        let keep = self.weights.ctx;
+                        merge_ctx(&mut fresh.ctx, &keep);
+                        self.weights = fresh;
+                        let _ = self.compute.memcpy_htod(&[self.weights.ctx], &mut self.ctx);
+                    }
+                    Err(e) => eprintln!("gpu: bad weights: {e}"),
+                }
+            }
+            if self.incoming.is_none() {
+                self.admit_batch();
+            }
+            if self.live_count > 0 {
                 self.tick();
+            } else if self.waiting.is_empty() {
+                // Idle: block for the next command instead of spinning.
+                match self.rx.recv() {
+                    Ok(cmd) => self.handle(cmd),
+                    Err(_) => return,
+                }
             }
         }
     }
 
     fn handle(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::Submit { job, reply } => self.waiting.push_back((job, reply)),
+            Cmd::Submit { job, tag, reply } => self.waiting.push_back((job, tag, reply)),
             Cmd::Trip2 { id, leaf, reply } => self.start_carry(id, leaf, reply),
             Cmd::SetWeights { dims, w, b, ln } => {
-                match Weights::upload(&self.stream, &self.pools, dims, w, b, ln) {
-                    Ok(weights) => self.incoming = Some(weights),
-                    Err(e) => eprintln!("gpu: bad weights: {e}"),
+                if dims != self.weights.dims {
+                    eprintln!(
+                        "gpu: weight shape changed ({:?} -> {dims:?}); restart the service",
+                        self.weights.dims
+                    );
+                    return;
                 }
+                self.incoming = Some((dims, w, b, ln));
             }
             Cmd::Shutdown => {}
         }
@@ -640,436 +632,143 @@ impl Service {
 
     // ------------------------------------------------------------ launching
 
-    /// Stage a launch over `slots`, with `threads(solve)` threads for each.
-    ///
-    /// Nothing is sent to the device here. A launch needs three small arrays —
-    /// the slots, their thread offsets, and the group header — and uploading
-    /// those per launch costs several driver round trips each, which for a
-    /// tick of fifteen launches is more time than the kernels. So the whole
-    /// tick is staged into one host buffer and uploaded once by `commit`.
-    fn stage(
-        &mut self,
-        slots: &[usize],
-        phase: Phase,
-        threads: impl Fn(&Solve) -> usize,
-    ) -> Option<Launch> {
-        self.stage_wide(slots, phase, THREAD, threads)
-    }
-
-    fn stage_wide(
-        &mut self,
-        slots: &[usize],
-        phase: Phase,
-        unit: usize,
-        threads: impl Fn(&Solve) -> usize,
-    ) -> Option<Launch> {
-        if slots.is_empty() {
-            return None;
-        }
-        let slots_at = self.h_data.len();
-        self.h_data.extend(slots.iter().map(|&s| s as i32));
-        let starts_at = self.h_data.len();
-        let mut total = 0usize;
-        for &s in slots {
-            self.h_data.push(total as i32);
-            total += threads(self.live[s].as_ref().expect("live slot"));
-        }
-        self.h_data.push(total as i32);
-        if total == 0 {
-            self.h_data.truncate(slots_at);
-            return None;
-        }
-        Some(self.stage_meta(slots_at, starts_at, slots.len(), total, unit, phase))
-    }
-
-    /// Stage a whole sweep as one launch per level.
-    ///
-    /// The levels have to run in order, which used to mean one block per solve
-    /// and `__syncthreads` between levels — capping the sweep at one block's
-    /// threads per solve however much of the device sat idle. A launch per
-    /// level orders them just as well and lets every node of every solve at
-    /// that level run at once. Solves shallower than a given level contribute
-    /// no threads to it.
-    fn stage_sweep(&mut self, slots: &[usize], phase: Phase, backward: bool) -> Vec<Launch> {
-        self.stage_sweep_wide(slots, phase, backward, THREAD)
-    }
-
-    fn stage_sweep_wide(
-        &mut self,
-        slots: &[usize],
-        phase: Phase,
-        backward: bool,
-        unit: usize,
-    ) -> Vec<Launch> {
-        if slots.is_empty() {
-            return Vec::new();
-        }
-        let depth = slots
-            .iter()
-            .map(|&s| self.live[s].as_ref().expect("live slot").nlevels)
-            .max()
-            .unwrap_or(0);
-        (0..depth)
-            .filter_map(|k| {
-                let phase = Phase { level: k as i32, ..phase };
-                self.stage_wide(slots, phase, unit, |sv| {
-                    // Backwards, level 0 of the sweep is the solve's deepest.
-                    let lev = if backward { sv.nlevels.checked_sub(k + 1) } else { Some(k) };
-                    match lev {
-                        Some(l) if l + 1 < sv.level_start.len() => {
-                            (sv.level_start[l + 1] - sv.level_start[l]) as usize
-                        }
-                        _ => 0,
-                    }
-                })
-            })
-            .collect()
-    }
-
-    fn stage_meta(
-        &mut self,
-        slots_at: usize,
-        starts_at: usize,
-        n: usize,
-        total: usize,
-        unit: usize,
-        phase: Phase,
-    ) -> Launch {
-        assert!(
-            self.h_data.len() <= self.g_data.len() && self.h_meta.len() < MAX_LAUNCHES,
-            "group staging overflow: {} ints, {} launches",
-            self.h_data.len(),
-            self.h_meta.len(),
-        );
-        let base = self.g_data_ptr;
-        self.h_meta.push(GroupDev {
-            // SAFETY: both offsets are inside `g_data`, asserted above.
-            slots: unsafe { base.add(slots_at) },
-            starts: unsafe { base.add(starts_at) },
-            n: n as i32,
-            total: total as i32,
-            mode: phase.mode,
-            p_player: phase.p_player,
-            nplayers: phase.nplayers,
-            strat_src: phase.strat_src,
-            level: phase.level,
-        });
-        let grid = if total > 0 { (total * unit).div_ceil(BLOCK as usize) } else { n };
-        Launch { meta: self.h_meta.len() - 1, grid: grid as u32 }
-    }
-
-    /// Send everything staged since the last commit: two copies, whatever the
-    /// launch count.
-    fn commit(&mut self) {
-        if self.h_meta.is_empty() {
+    fn fire(&self, which: fn(&Kernels) -> &CudaFunction, hdr: usize, grid: u32, stream: &Arc<CudaStream>) {
+        if grid == 0 {
             return;
         }
-        let _ = self.stream.memcpy_htod(&self.h_data, &mut self.g_data.slice_mut(..self.h_data.len()));
-        let _ = self.stream.memcpy_htod(&self.h_meta, &mut self.g_meta.slice_mut(..self.h_meta.len()));
-    }
-
-    /// Open a timed span. Paired with `end`; a no-op unless timing is on.
-    fn begin(&mut self, name: &'static str) {
-        let stream = self.stream.clone();
-        let Some(t) = &mut self.timing else { return };
-        let i = t.names.len();
-        if i >= MAX_SPANS {
-            return;
-        }
-        t.names.push(name);
-        let _ = t.events[2 * i].record(&stream);
-    }
-
-    fn end(&mut self) {
-        let stream = self.stream.clone();
-        let Some(t) = &mut self.timing else { return };
-        if t.names.is_empty() || t.names.len() > MAX_SPANS {
-            return;
-        }
-        let i = t.names.len() - 1;
-        let _ = t.events[2 * i + 1].record(&stream);
-    }
-
-    fn reset_staging(&mut self) {
-        self.h_data.clear();
-        self.h_meta.clear();
-    }
-
-    /// Run a staged launch. Ordering against the cuBLAS calls between them is
-    /// the stream's, as it is for any two kernels.
-    fn fire(&mut self, which: fn(&Kernels) -> &CudaFunction, l: Option<Launch>) {
-        self.fire_named(which, l, "")
-    }
-
-    /// Run a staged sweep, level by level.
-    fn fire_sweep(&mut self, which: fn(&Kernels) -> &CudaFunction, ls: &[Launch], name: &'static str) {
-        for &l in ls {
-            self.fire_named(which, Some(l), name);
-        }
-    }
-
-    fn fire_named(
-        &mut self,
-        which: fn(&Kernels) -> &CudaFunction,
-        l: Option<Launch>,
-        name: &'static str,
-    ) {
-        let Some(l) = l else { return };
         let cfg = LaunchConfig {
-            grid_dim: (l.grid, 1, 1),
+            grid_dim: (grid, 1, 1),
             block_dim: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
         let f = which(&self.f).clone();
-        self.begin(name);
-        {
-            let group = self.g_meta.slice(l.meta..l.meta + 1);
-            let mut b = self.stream.launch_builder(&f);
-            b.arg(&self.descs);
-            b.arg(&group);
-            b.arg(&self.ctx);
-            let _ = unsafe { b.launch(cfg) };
+        let group = self.g_meta.slice(hdr..hdr + 1);
+        let mut b = stream.launch_builder(&f);
+        b.arg(&self.descs);
+        b.arg(&group);
+        b.arg(&self.ctx);
+        let _ = unsafe { b.launch(cfg) };
+    }
+
+    /// Rewrite the tick's launch headers; runs only when membership changed.
+    fn upload_headers(&mut self) {
+        let base = ptr(&self.compute, &self.live_slots);
+        let mk = |mode: i32, p: i32, level: i32| GroupDev {
+            slots: base,
+            n: self.live_count as i32,
+            mode,
+            p_player: p,
+            level,
+            total: 0,
+        };
+        let mut h = vec![GroupDev::default(); N_HDRS];
+        h[Hdr::Plain as usize] = mk(0, 0, 0);
+        h[Hdr::ReadIt as usize] = mk(0, -1, 0);
+        h[Hdr::ReadV0 as usize] = mk(0, 0, 0);
+        h[Hdr::ReadV1 as usize] = mk(0, 1, 0);
+        h[Hdr::ReachVC as usize] = mk(0, 0, 0);
+        h[Hdr::ReachIt as usize] = mk(1, 0, 0);
+        for k in 0..self.weights.layout.hmlp.len() {
+            // Layer k reads the previous buffer and writes h (mode 0) or h2
+            // (mode 1); the first layer reads h, so it writes h2.
+            h[Hdr::HmlpBase as usize + k] = mk((k % 2 == 0) as i32, 0, k as i32);
         }
-        self.end();
+        let _ = self.compute.memcpy_htod(&h, &mut self.g_meta);
     }
 
     // ------------------------------------------------------------ the tick
 
     fn tick(&mut self) {
-        if let Some(w) = self.incoming.take() {
-            // Weights change between solves, never inside one: a fresh set
-            // only takes effect once the live set has drained.
-            if self.live.iter().all(|s| s.is_none()) {
-                self.weights = w;
-                let _ = self.stream.memcpy_htod(&[self.weights.ctx], &mut self.ctx);
-            } else {
-                self.incoming = Some(w);
+        self.tick_upto(Step::All);
+    }
+
+    fn tick_upto(&mut self, upto: Step) {
+        if self.live_dirty {
+            let slots: Vec<i32> = (0..CAP)
+                .filter(|&s| self.live[s].is_some())
+                .map(|s| s as i32)
+                .collect();
+            self.live_count = slots.len();
+            if !slots.is_empty() {
+                let _ = self
+                    .compute
+                    .memcpy_htod(&slots, &mut self.live_slots.slice_mut(..slots.len()));
             }
+            self.upload_headers();
+            self.live_dirty = false;
         }
-        let by = |st: i32| -> Vec<usize> {
-            (0..CAP).filter(|&s| self.live[s].as_ref().is_some_and(|v| v.stage == st)).collect()
-        };
-        let (iter, value, carry) = (by(STAGE_ITERATE), by(STAGE_VALUE), by(STAGE_CARRY));
-        if iter.is_empty() && value.is_empty() && carry.is_empty() {
+        if self.live_count == 0 || upto <= Step::None {
             return;
         }
-        self.upload_descs();
-        let snap = self.snapshot_due(&iter);
-        let carry = self.carry_active(&carry);
+        let l = &self.weights.layout;
+        let n = self.live_count as u32;
+        let hi = self.rows.high;
+        let c = self.weights.ctx;
 
-        // Stage every launch of the tick, send them in one go, then run them.
-        self.reset_staging();
-        let it = self.stage_iterate(&iter, &snap);
-        let va = self.stage_value(&value);
-        let ca = self.stage_carry(&carry);
-        self.commit();
-        self.fire_iterate(&iter, &it, Step::All);
-        self.fire_value(&value, &va);
-        self.fire_carry(&ca);
-
-        if self.timing.is_some() {
-            let _ = self.stream.synchronize();
-            self.timing.as_mut().expect("timing").flush();
+        // 1. Value/carry passes re-seed and propagate their strategy first.
+        self.fire(|k| &k.reach_prop, Hdr::ReachVC as usize, n, &self.compute.clone());
+        // 2. Belief sums into the xb pool.
+        self.fire(|k| &k.belief_sums, Hdr::Plain as usize, n, &self.compute.clone());
+        // 3. The head: GEMM, entry norm, extra layers, readout GEMM.
+        gemm(&self.blas, hi, l.head_in, 2 * l.dg, c.xb as *const f32, 2 * l.dg,
+             c.wb, l.head_in, c.h, h_stride_of(l), 0.0);
+        self.fire(|k| &k.head_entry, Hdr::Plain as usize, n, &self.compute.clone());
+        let mut cur = c.h as *const f32;
+        for (k, s) in l.hmlp.iter().enumerate() {
+            let dst = if k % 2 == 0 { c.h2 } else { c.h };
+            gemm(&self.blas, hi, s.o, s.i, cur, h_stride_of(l), self.weights_at(s.w),
+                 s.o, dst, h_stride_of(l), 0.0);
+            self.fire(|f| &f.hmlp_act, Hdr::HmlpBase as usize + k, n, &self.compute.clone());
+            cur = dst as *const f32;
         }
-        self.advance(&snap);
-    }
-
-    /// Stage one CFR iteration for every solve in the iterate stage.
-    fn stage_iterate(&mut self, slots: &[usize], snap: &[usize]) -> IterateSet {
-        if slots.is_empty() {
-            return IterateSet::default();
-        }
-        let rk = self.weights.dims[5];
-        // The traverser's side is all a later iteration needs; the first one
-        // has to build both, because neither side is cached yet.
-        let (mut one, mut two) = (Vec::new(), Vec::new());
-        for &s in slots {
-            if self.live[s].as_ref().unwrap().first_query { two.push(s) } else { one.push(s) }
-        }
-        // The readout and backward sweep run for each solve's own traverser,
-        // which `p_player: TRAVERSER` defers to the descriptor.
-        let rb = Phase { mode: 0, p_player: TRAVERSER, nplayers: 2, strat_src: 0, ..P };
-        IterateSet {
-            belief_one: self.stage_wide(&one, Phase { nplayers: 1, ..P }, WARP, |sv| sv.nleaf),
-            belief_two: self.stage_wide(&two, Phase { nplayers: 2, ..P }, WARP, |sv| sv.nleaf * 2),
-            head_norm: self.stage_wide(slots, P, WARP, |sv| sv.nleaf),
-            head_bias: self.stage(slots, P, |sv| sv.nleaf * rk),
-            readout: self.stage_wide(slots, rb, WARP, |sv| sv.nleaf + sv.nterm),
-            backprop: self.stage_sweep_wide(slots, rb, true, WARP),
-            regret: self.stage_wide(slots, P, WARP, |sv| sv.nodes),
-            clear: self.stage(slots, P, |sv| sv.reach_len),
-            seed: self.stage(slots, P, |sv| sv.nc_root[0] + sv.nc_root[1]),
-            propagate: self.stage_sweep_wide(slots, P, false, WARP),
-            average: self.stage_wide(slots, P, WARP, |sv| sv.nodes),
-            snapshot: self.stage(snap, P, |sv| sv.ncells),
-        }
-    }
-
-    /// Run a staged iteration. `upto` stops early; the phase oracle test uses
-    /// it to compare one phase at a time against the CPU solver, and so
-    /// exercises this exact sequence.
-    fn fire_iterate(&mut self, slots: &[usize], l: &IterateSet, upto: Step) {
-        if slots.is_empty() || upto <= Step::None {
-            return;
-        }
-        self.fire_named(|k| &k.belief_sums, l.belief_one, "belief");
-        self.fire_named(|k| &k.belief_sums, l.belief_two, "belief");
-        self.head(slots, l.head_norm, l.head_bias);
+        gemm(&self.blas, hi, l.rank, l.head_out, cur, h_stride_of(l),
+             self.weights_at(l.wu.w), l.rank, c.u, l.rank, 0.0);
         if upto == Step::Head {
             return;
         }
-        self.fire_named(|k| &k.readout, l.readout, "readout");
+        // 4. Iterate pass: readout + backprop for the traverser.
+        self.fire(|k| &k.readout, Hdr::ReadIt as usize, n, &self.compute.clone());
         if upto == Step::Readout {
             return;
         }
-        self.fire_sweep(|k| &k.backprop, &l.backprop, "backprop");
+        self.fire(|k| &k.backprop_solve, Hdr::ReadIt as usize, n, &self.compute.clone());
         if upto == Step::Backprop {
             return;
         }
-        self.fire_named(|k| &k.regret_match, l.regret, "regret");
+        self.fire(|k| &k.regret_match, Hdr::Plain as usize, n, &self.compute.clone());
         if upto == Step::Regret {
             return;
         }
-        self.fire_named(|k| &k.reach_clear, l.clear, "reach");
-        self.fire_named(|k| &k.reach_seed, l.seed, "reach");
-        self.fire_sweep(|k| &k.propagate, &l.propagate, "propagate");
+        // 5. Value passes: both players against the average strategy.
+        for hdr in [Hdr::ReadV0, Hdr::ReadV1] {
+            self.fire(|k| &k.readout, hdr as usize, n, &self.compute.clone());
+            self.fire(|k| &k.backprop_solve, hdr as usize, n, &self.compute.clone());
+            self.fire(|k| &k.collect_root, hdr as usize, n, &self.compute.clone());
+        }
+        // 6. Iterate reach follows regret matching.
+        self.fire(|k| &k.reach_prop, Hdr::ReachIt as usize, n, &self.compute.clone());
         if upto == Step::Propagate {
             return;
         }
-        self.fire_named(|k| &k.average, l.average, "average");
+        self.fire(|k| &k.average, Hdr::Plain as usize, n, &self.compute.clone());
         if upto == Step::Average {
             return;
         }
-        self.fire_named(|k| &k.snapshot, l.snapshot, "snapshot");
+        // 7. Carry harvest, then the device state machine.
+        self.fire(|k| &k.leaf_beliefs, Hdr::Plain as usize, n, &self.compute.clone());
+        let adv_grid = (self.live_count as u32).div_ceil(BLOCK);
+        self.fire(|k| &k.advance_state, Hdr::Plain as usize, adv_grid.max(1), &self.compute.clone());
+        self.ticks += 1;
+        self.advance_host();
     }
 
-    /// Stage one fixed-policy pass over the carried root a value-stage solve
-    /// is on: re-seed the reach from it, then read out and sweep for each
-    /// player, harvesting the root values into the solve's own arena.
-    fn stage_value(&mut self, slots: &[usize]) -> ValueSet {
-        if slots.is_empty() {
-            return ValueSet::default();
-        }
-        let rk = self.weights.dims[5];
-        let mut v = ValueSet {
-            clear: self.stage(slots, Phase { strat_src: 1, ..P }, |sv| sv.reach_len),
-            seed: self.stage(slots, Phase { strat_src: 1, ..P }, |sv| sv.nc_root[0] + sv.nc_root[1]),
-            propagate: self.stage_sweep_wide(slots, Phase { strat_src: 1, ..P }, false, WARP),
-            belief: self.stage_wide(slots, Phase { nplayers: 2, ..P }, WARP, |sv| sv.nleaf * 2),
-            head_norm: self.stage_wide(slots, P, WARP, |sv| sv.nleaf),
-            head_bias: self.stage(slots, P, |sv| sv.nleaf * rk),
-            pass: Default::default(),
-        };
-        for p in 0..2 {
-            let phase = Phase { mode: 1, p_player: p as i32, nplayers: 2, strat_src: 1, ..P };
-            v.pass[p] = ValuePass {
-                readout: self.stage_wide(slots, phase, WARP, |sv| sv.nleaf + sv.nterm),
-                backprop: self.stage_sweep_wide(slots, phase, true, WARP),
-                collect: self.stage(slots, phase, |sv| sv.nc_root[0] + sv.nc_root[1]),
-            };
-        }
-        v
+    fn weights_at(&self, off: usize) -> *const f32 {
+        let (p, _s) = self.weights._w.device_ptr(&self.compute);
+        unsafe { (p as usize as *const f32).add(off) }
     }
 
-    fn fire_value(&mut self, slots: &[usize], l: &ValueSet) {
-        if slots.is_empty() {
-            return;
-        }
-        self.fire_named(|k| &k.reach_clear, l.clear, "reach");
-        self.fire_named(|k| &k.reach_seed, l.seed, "reach");
-        self.fire_sweep(|k| &k.propagate, &l.propagate, "propagate");
-        self.fire_named(|k| &k.belief_sums, l.belief, "belief");
-        self.head(slots, l.head_norm, l.head_bias);
-        for p in 0..2 {
-            self.fire_named(|k| &k.readout, l.pass[p].readout, "readout");
-            self.fire_sweep(|k| &k.backprop, &l.pass[p].backprop, "backprop");
-            self.fire_named(|k| &k.collect_root, l.pass[p].collect, "collect");
-        }
-    }
-
-    /// Stage one kept snapshot propagated to the trip-2 exit leaf, whose
-    /// normalised reach is that snapshot's carried belief.
-    fn stage_carry(&mut self, slots: &[usize]) -> CarrySet {
-        CarrySet {
-            clear: self.stage(slots, Phase { strat_src: 2, ..P }, |sv| sv.reach_len),
-            seed: self.stage(slots, Phase { strat_src: 2, ..P }, |sv| sv.nc_root[0] + sv.nc_root[1]),
-            propagate: self.stage_sweep_wide(slots, Phase { strat_src: 2, ..P }, false, WARP),
-            beliefs: self.stage(slots, P, |_| 2),
-        }
-    }
-
-    fn fire_carry(&mut self, l: &CarrySet) {
-        self.fire_named(|k| &k.reach_clear, l.clear, "reach");
-        self.fire_named(|k| &k.reach_seed, l.seed, "reach");
-        self.fire_sweep(|k| &k.propagate, &l.propagate, "propagate");
-        self.fire_named(|k| &k.leaf_beliefs, l.beliefs, "beliefs");
-    }
-
-    /// Carry-stage solves the walk has already given an exit leaf. The rest
-    /// sit resident and idle until trip 2 asks.
-    fn carry_active(&self, slots: &[usize]) -> Vec<usize> {
-        slots
-            .iter()
-            .copied()
-            .filter(|&s| self.live[s].as_ref().unwrap().trip2.is_some())
-            .collect()
-    }
-
-    /// The iterate-stage solves whose next iteration is a kept one.
-    fn snapshot_due(&self, slots: &[usize]) -> Vec<usize> {
-        slots
-            .iter()
-            .copied()
-            .filter(|&s| {
-                let sv = self.live[s].as_ref().unwrap();
-                sv.meta.snapshots && sv.meta.snap_iters.contains(&(sv.t + 1))
-            })
-            .collect()
-    }
-
-    /// The head: two cuBLAS GEMMs with the LayerNorm between them, over the
-    /// span of the row pool this group occupies. The rows were laid out at
-    /// admission and never move, so this is one call per GEMM however ragged
-    /// the live set is — the packing step a per-solve layout would need does
-    /// not exist. A group's span may include rows belonging to solves outside
-    /// it; those rows are computed and ignored, which costs a little
-    /// arithmetic and saves the packing.
-    fn head(&mut self, slots: &[usize], norm: Option<Launch>, bias: Option<Launch>) {
-        let Some((lo, hi)) = self.row_span(slots) else { return };
-        let (hd, dg, rk) = (self.weights.dims[2], self.weights.dims[4], self.weights.dims[5]);
-        let c = self.weights.ctx;
-        let rows = hi - lo;
-        let at = |p: *mut f32, w: usize| unsafe { p.add(lo * w) };
-        // h = xb . Wb, then h = relu(LN1(h0 + h)), then u = h . Wu + bu.
-        self.begin("gemm");
-        gemm(&self.blas, rows, hd, 2 * dg,
-             at(c.xb, 2 * dg), 2 * dg, c.wb, hd, at(c.h, hd), hd, 0.0);
-        self.end();
-        self.fire_named(|k| &k.head_norm, norm, "head_norm");
-        self.begin("gemm");
-        gemm(&self.blas, rows, rk, hd, at(c.h, hd), hd, c.wu, rk, at(c.u, rk), rk, 0.0);
-        self.end();
-        self.fire_named(|k| &k.head_bias, bias, "head_bias");
-    }
-
-    /// The rows a group covers, as one range of the pool.
-    fn row_span(&self, slots: &[usize]) -> Option<(usize, usize)> {
-        let mut span: Option<(usize, usize)> = None;
-        for &s in slots {
-            let sv = self.live[s].as_ref()?;
-            let (lo, hi) = (sv.row0, sv.row0 + sv.nrows);
-            span = Some(match span {
-                Some((a, b)) => (a.min(lo), b.max(hi)),
-                None => (lo, hi),
-            });
-        }
-        span.filter(|&(lo, hi)| hi > lo)
-    }
-
-    /// Advance the host mirrors one step and post whatever became ready. The
-    /// device state advanced in the launches above; this is the bookkeeping
-    /// that decides what happens next tick.
-    fn advance(&mut self, snapped: &[usize]) {
+    /// The host shadow of `advance_state`, plus trip scheduling.
+    fn advance_host(&mut self) {
         let mut trip1 = Vec::new();
         let mut trip2 = Vec::new();
         let mut done = Vec::new();
@@ -1077,20 +776,14 @@ impl Service {
             let Some(sv) = &mut self.live[s] else { continue };
             match sv.stage {
                 STAGE_ITERATE => {
-                    sv.first_query = false;
-                    sv.steps[sv.traverser] += 1;
                     sv.t += 1;
-                    if snapped.contains(&s) {
-                        sv.snap_t += 1;
-                    }
-                    sv.traverser = sv.t % 2;
                     if sv.t == sv.meta.iters {
                         sv.step = 0;
                         if sv.nroots > 0 {
                             sv.stage = STAGE_VALUE;
                         } else {
-                            trip1.push(s);
                             sv.stage = STAGE_CARRY;
+                            trip1.push(s);
                         }
                     }
                 }
@@ -1102,21 +795,17 @@ impl Service {
                         trip1.push(s);
                     }
                 }
-                _ => match &sv.trip2 {
-                    // An evaluation solve keeps no snapshots and so has no
-                    // second trip: it is finished the moment trip 1 is out.
-                    None if sv.nsnaps == 0 => done.push(s),
-                    // Otherwise the solve stays resident until the walk says
-                    // which leaf it left the tree at.
-                    None => {}
-                    Some(_) => {
+                _ => {
+                    if sv.trip2.is_some() && !sv.draining {
                         sv.step += 1;
-                        if sv.step + 1 >= sv.nsnaps {
+                        if sv.step + 1 >= sv.nsnaps.max(1) {
                             trip2.push(s);
-                            done.push(s);
                         }
+                    } else if sv.trip2.is_none() && sv.nsnaps == 0 && sv.trip1.is_none() {
+                        // Evaluation solve: finished at trip 1.
+                        done.push(s);
                     }
-                },
+                }
             }
         }
         for s in trip1 {
@@ -1130,67 +819,73 @@ impl Service {
         }
     }
 
-    fn upload_descs(&mut self) {
-        let v = &mut self.h_descs;
-        v.clear();
-        v.resize(CAP, Desc::default());
-        for s in 0..CAP {
-            let Some(sv) = &self.live[s] else { continue };
-            let mut d = sv.desc;
-            d.t = sv.t as i32;
-            d.stage = sv.stage;
-            d.step = sv.step as i32;
-            d.traverser = sv.traverser as i32;
-            d.snap_t = sv.snap_t as i32;
-            d.steps = [sv.steps[0] as i32, sv.steps[1] as i32];
-            d.first_query = sv.first_query as i32;
-            d.nc_leaf = [sv.nc_leaf[0] as i32, sv.nc_leaf[1] as i32];
-            v[s] = d;
-        }
-        let _ = self.stream.memcpy_htod(&self.h_descs, &mut self.descs);
-    }
-
     // ------------------------------------------------------------ admission
 
-    /// Admit as many queued jobs as the live set has room for, stopping at
-    /// the first that does not fit so jobs keep their arrival order.
-    fn admit_waiting(&mut self) {
-        while let Some((job, _)) = self.waiting.front() {
-            if self.free.is_empty() || self.pools.find_gap(job.tables.rows).is_none() {
-                return;
+    /// Admit a batch: everything queued, up to the batch caps and whatever
+    /// fits in the slabs, in arrival order.
+    fn admit_batch(&mut self) {
+        let mut batch = Vec::new();
+        let (mut rows, mut cfgs) = (0usize, 0usize);
+        while let Some((job, _, _)) = self.waiting.front() {
+            let t = &job.tables;
+            if batch.len() == MAX_BATCH
+                || rows + t.rows > MAX_BATCH_ROWS
+                || cfgs + t.ncfg > MAX_BATCH_CFG
+            {
+                break;
             }
-            let (job, reply) = self.waiting.pop_front().expect("front exists");
-            if let Err(e) = self.admit(job, reply.clone()) {
-                let _ = reply.send(Err(e));
+            if self.free.is_empty()
+                || !self.rows.fits(t.rows)
+                || !self.tbl_slab.fits(table_len(job))
+                || !self.arena_slab.fits(arena_len_of(job, &self.weights.layout))
+            {
+                break;
+            }
+            let (job, tag, reply) = self.waiting.pop_front().unwrap();
+            rows += job.tables.rows;
+            cfgs += job.tables.ncfg;
+            match self.admit(job, tag, reply.clone()) {
+                Ok(slot) => batch.push(slot),
+                Err(e) => {
+                    let _ = reply.send((0, Err(e)));
+                }
             }
         }
+        if batch.is_empty() {
+            return;
+        }
+        self.build_batch(&batch);
+        // The compute stream may not run these solves' ticks until the build
+        // lands; one event orders the two streams without blocking the host.
+        let ev = self.build.record_event(None).ok();
+        if let Some(ev) = ev {
+            let _ = self.compute.wait(&ev);
+        }
+        self.live_dirty = true;
     }
 
-    /// Admit one solve: upload its tables, cut its arenas, run the build, and
-    /// put it in the iterate stage.
+    /// Upload one job: tables into the table slab, zeroed arenas, descriptor.
     fn admit(
         &mut self,
         job: Job,
-        reply: mpsc::Sender<Result<Trip1, String>>,
-    ) -> Result<(), String> {
+        tag: usize,
+        reply: mpsc::Sender<(usize, Result<Trip1, String>)>,
+    ) -> Result<usize, String> {
+        if job.meta.warm > 0.0 {
+            return Err("gpu: warm start is not implemented (plan A4)".into());
+        }
         let t = &job.tables;
-        let (dg, rk, de) = (self.weights.dims[4], self.weights.dims[5], self.weights.dims[7]);
+        let l = &self.weights.layout;
         let derived = Derived::new(&job);
         let nc = |i: usize, p: usize| (t.cfg_off[2 * i + p + 1] - t.cfg_off[2 * i + p]) as usize;
         let nc_root = [nc(0, 0), nc(0, 1)];
         let max_nc = (0..t.nodes).map(|i| nc(i, 0).max(nc(i, 1))).max().unwrap_or(0);
-        if job.meta.warm > 0.0 {
-            // Seeding CFR from the policy head is plan A4, which is gated on a
-            // NashConv measurement that has not been made. Refusing is the
-            // honest answer; silently solving cold would look like it worked.
-            return Err("gpu: warm start is not implemented (plan A4)".into());
-        }
-        if t.rows > MAX_BUILD_ROWS || t.ncfg > MAX_CFG {
-            return Err(format!("gpu: tree too large (rows {} cfg {})", t.rows, t.ncfg));
-        }
         let nsnaps = if job.meta.snapshots { job.meta.snap_iters.len() } else { 0 };
+        if job.meta.snap_iters.len() > 16 {
+            return Err("gpu: more than 16 kept iterates".into());
+        }
         let sizes = Sizes {
-            reach_len: t.reach.len(),
+            reach_len: t.reach_len,
             vals_len: derived.vals_len(),
             ncells: t.ncells,
             nsnaps,
@@ -1198,31 +893,32 @@ impl Service {
             nc_root: nc_root[0] + nc_root[1],
             max_nc,
             nroots: job.carried.len(),
-            dg, rk, de,
+            dg: l.dg,
+            rk: l.rank,
+            de: l.de,
         };
         let (aoff, arena_len) = arena_offsets(&sizes);
         let (blob, toff) = pack_tables(t, &derived);
 
         let slot = self.free.pop().ok_or("gpu: live set full")?;
-        let row0 = match self.pools.alloc(t.rows) {
-            Some(r) => r,
-            None => {
-                self.free.push(slot);
-                return Err("gpu: row pool full".into());
-            }
-        };
-        let tables = htod(&self.stream, &blob)?;
-        let mut arenas = zeros(&self.stream, arena_len)?;
-        // The initial reach is the uniform-strategy reach `Solver::new`
-        // propagates before seeding the average.
+        let row0 = self.rows.alloc(t.rows).ok_or("gpu: row pool full")?;
+        let tbl_at = self.tbl_slab.alloc(blob.len()).ok_or("gpu: table slab full")?;
+        let arena_at = self.arena_slab.alloc(arena_len).ok_or("gpu: arena slab full")?;
+
+        // Upload tables and zero the arena on the build stream.
         {
-            let r0 = aoff[Arena::reach as usize] as usize;
-            let mut dst = arenas.slice_mut(r0..r0 + t.reach.len());
-            let _ = self.stream.memcpy_htod(&t.reach, &mut dst);
+            let mut dst = self.tables.slice_mut(tbl_at..tbl_at + blob.len());
+            self.build
+                .memcpy_htod(&blob, &mut dst)
+                .map_err(|e| format!("{e:?}"))?;
+            let mut az = self.arenas.slice_mut(arena_at..arena_at + arena_len);
+            self.build.memset_zeros(&mut az).map_err(|e| format!("{e:?}"))?;
         }
-        let desc = Desc {
-            tbl: ptr(&self.stream, &tables),
-            arena: ptr_mut(&self.stream, &mut arenas),
+        let (tbl_ptr, _) = self.tables.device_ptr(&self.build);
+        let (arena_ptr, _) = self.arenas.device_ptr(&self.build);
+        let mut desc = Desc {
+            tbl: (tbl_ptr as usize + tbl_at) as *const u8,
+            arena: (arena_ptr as usize as *mut f32).wrapping_add(arena_at),
             toff,
             aoff,
             nodes: t.nodes as i32,
@@ -1234,248 +930,407 @@ impl Service {
             nlevels: t.nlevels as i32,
             nsnaps: nsnaps as i32,
             nroots: job.carried.len() as i32,
+            iters: job.meta.iters as i32,
             row0: row0 as i32,
             nc_root: [nc_root[0] as i32, nc_root[1] as i32],
+            nc_leaf: [0, 0],
+            leaf: -1,
+            stage: STAGE_ITERATE,
+            traverser: 0,
+            snap_t: if nsnaps > 0 { 1 } else { 0 },
+            first_query: 1,
             snapshots: job.meta.snapshots as i32,
             alpha: job.meta.cfr.alpha,
             beta: job.meta.cfr.beta,
             gamma: job.meta.cfr.gamma,
             predict: job.meta.cfr.predict,
-            warm: job.meta.warm,
-            first_query: 1,
             ..Desc::default()
         };
+        for (k, &it) in job.meta.snap_iters.iter().enumerate() {
+            desc.snap_iters[k] = it as i32;
+        }
+        // The first iteration's DCFR discounts (advance_state computes the
+        // rest): m = steps[traverser] + 1 = 1.
+        let f = |p: f32| -> f32 {
+            if p.is_infinite() {
+                if p > 0.0 { 1.0 } else { 0.0 }
+            } else {
+                let x = 1.0f32.powf(p);
+                x / (x + 1.0)
+            }
+        };
+        desc.da = f(job.meta.cfr.alpha);
+        desc.db = f(job.meta.cfr.beta);
+        desc.ds = (1.0f32 / 2.0).powf(job.meta.cfr.gamma);
+        let _ = self
+            .build
+            .memcpy_htod(&[desc], &mut self.descs.slice_mut(slot..slot + 1));
+
         self.live[slot] = Some(Solve {
             id: self.next_id,
             meta: job.meta,
-            _tables: tables,
-            arenas,
-            desc,
+            tbl_at,
+            arena_at,
+            row0,
+            nrows: t.rows,
             aoff,
+            desc,
+            cfg_off: t.cfg_off.clone(),
             stage: STAGE_ITERATE,
             t: 0,
             step: 0,
-            // Snapshot 0 is the uniform average, taken below; the counter is
-            // the slot the *next* kept iterate goes to, so it is bumped after
-            // that first copy rather than before it.
-            snap_t: 0,
-            traverser: 0,
-            steps: [0, 0],
-            first_query: true,
-            row0,
-            nrows: t.rows,
-            reach_len: t.reach.len(),
-            nleaf: t.nleaf,
-            nterm: t.nterm,
-            nodes: t.nodes,
-            ncells: t.ncells,
-            nsnaps,
             nroots: job.carried.len(),
+            nsnaps,
+            nleaf_cfg: [0, 0],
             nc_root,
-            nc_leaf: [0, 0],
-            cfg_off: t.cfg_off.clone(),
-            level_start: t.level_start.clone(),
-            nlevels: t.nlevels,
-            trip1: Some(reply),
+            ncells: t.ncells,
+            trip1: Some((tag, reply)),
             trip2: None,
+            draining: false,
         });
         self.next_id += 1;
-        self.upload_descs();
-        self.build(slot)?;
-        Ok(())
+        Ok(slot)
     }
 
-    /// The build: the card table, the trunk (into the solve's h0 rows), the
-    /// holding tower, and the action tower. Each GEMM is one cuBLAS call over
-    /// the whole solve; the kernels between them add biases and gather.
-    fn build(&mut self, slot: usize) -> Result<(), String> {
-        let one = [slot];
+    /// The batched build: pack the batch, run each tower's GEMM chain once,
+    /// scatter results into the solves, initialise their CFR state.
+    fn build_batch(&mut self, slots: &[usize]) {
+        let l = self.weights.layout.clone();
         let c = self.weights.ctx;
-        let (h, hd, dg, rk, de, dc) = (
-            self.weights.dims[1], self.weights.dims[2], self.weights.dims[4],
-            self.weights.dims[5], self.weights.dims[7], self.weights.dims[8],
-        );
-        let (rows, ncfg, row0, arena) = {
-            let sv = self.live[slot].as_ref().unwrap();
-            (sv.nrows, sv.desc.ncfg as usize, sv.row0, sv.desc.arena)
-        };
-        let cf = crate::units::CARD_FEATS;
-        let ntype = crate::rebel::NTYPE;
-        let nslot = crate::rebel::NSLOT;
-        let hf = crate::net::hfeat(de);
-        let at = |a: Arena| unsafe { arena.add(self.live[slot].as_ref().unwrap().aoff[a as usize] as usize) };
-        let (a_e, a_z, a_g) = (at(Arena::e), at(Arena::z), at(Arena::g));
-        let xpub = self.table_ptr(slot, Tbl::leaf_xpub);
-
-        self.reset_staging();
-        let l_cards_relu = self.stage(&one, P, |_| ntype * dc);
-        let l_cards_finish = self.stage(&one, P, |_| ntype * de);
-        let l_pile_pe = self.stage(&one, P, |_| ntype * de);
-        let l_assemble = self.stage(&one, P, |sv| sv.nrows);
-        let l_trunk_norm = self.stage_wide(&one, P, WARP, |sv| sv.nrows);
-        let l_holding_in = self.stage(&one, P, |_| ncfg * nslot);
-        let l_slot_sum = self.stage(&one, P, |_| ncfg);
-        let l_embed_relu = self.stage(&one, P, |_| ncfg * dg);
-        let l_embed_bias = self.stage(&one, P, |_| ncfg * dg);
-        let l_readout_bias = self.stage(&one, P, |_| ncfg * (rk + 1));
-        let l_init = self.stage(&one, P, |sv| sv.nodes);
-        let l_snapshot = self.stage(&one, P, |sv| sv.ncells);
-        self.commit();
-
-        // The card table: e = relu(facts . Wd0 + bd0) . Wd1 + bd1 + wid[id].
-        // The facts block is the same at every row, so it is read from row 0.
-        let facts = unsafe { xpub.add(crate::rebel::OFF_CARDS) };
-        gemm(&self.blas, ntype, dc, cf, facts, cf, c.wd0, dc, c.bh, dc, 0.0);
-        self.fire_named(|k| &k.cards_relu, l_cards_relu, "build");
-        gemm(&self.blas, ntype, de, dc, c.bh as *const f32, dc, c.wd1, de, a_e, de, 0.0);
-        self.fire_named(|k| &k.cards_finish, l_cards_finish, "build");
-
-        // The trunk: the pile summary's two halves, the assembled input, then
-        // h_pub = relu(LN0(x . W0 + b0)) and h0 = h_pub . W1, written straight
-        // into the solve's rows of the h0 pool.
-        self.fire_named(|k| &k.pile_pe, l_pile_pe, "build");
-        gemm_batched(&self.blas, ntype, de, crate::rebel::PILE_COUNTS,
-             unsafe { xpub.add(crate::rebel::OFF_PILES) }, crate::rebel::PILE_COUNTS,
-             crate::rebel::PUBFEAT, c.wpile, de, c.bgather, de, ntype * de, rows);
-        self.fire_named(|k| &k.assemble, l_assemble, "build");
-        gemm(&self.blas, rows, h, xdim(de), c.bx as *const f32, xdim(de), c.w0, h, c.bh, h, 0.0);
-        self.fire_named(|k| &k.trunk_norm, l_trunk_norm, "build");
-        gemm(&self.blas, rows, hd, h, c.bh as *const f32, h, c.w1, hd,
-             unsafe { c.h0.add(row0 * hd) }, hd, 0.0);
-
-        // The holding tower: z, then the residual, then g.
-        self.fire_named(|k| &k.holding_in, l_holding_in, "build");
-        gemm(&self.blas, ncfg * nslot, dg, hf, c.bgather as *const f32, hf, c.wc, dg, c.bh, dg, 0.0);
-        self.fire_named(|k| &k.slot_sum, l_slot_sum, "build");
-        gemm(&self.blas, ncfg, dg, dg, a_z as *const f32, dg, c.wh1, dg, c.bh, dg, 0.0);
-        self.fire_named(|k| &k.embed_relu, l_embed_relu, "build");
-        gemm(&self.blas, ncfg, dg, dg, c.bh as *const f32, dg, c.wh2, dg, a_z, dg, 1.0);
-        self.fire_named(|k| &k.embed_bias, l_embed_bias, "build");
-        gemm(&self.blas, ncfg, rk + 1, dg, a_z as *const f32, dg, c.wg, rk + 1, a_g, rk + 1, 0.0);
-        self.fire_named(|k| &k.readout_bias, l_readout_bias, "build");
-
-        // Uniform strategy and the reach-weighted seed, then snapshot 0.
-        self.fire_named(|k| &k.init_strategy, l_init, "init");
-        if self.live[slot].as_ref().unwrap().nsnaps > 0 {
-            self.fire_named(|k| &k.snapshot, l_snapshot, "snapshot");
-            self.live[slot].as_mut().unwrap().snap_t = 1;
+        let stream = self.build.clone();
+        // Batch map + a slots list + per-batch headers, staged into g_meta
+        // slots past the tick's fixed ones? No: build uses its own header
+        // upload each batch (it is per-batch by nature). Reuse bmap buffer
+        // for the slot list too: [map entries..., slots...].
+        let mut map = Vec::with_capacity(slots.len() * BMAP_INTS);
+        let (mut rows, mut cfgs) = (0usize, 0usize);
+        for &s in slots {
+            let sv = self.live[s].as_ref().unwrap();
+            map.extend_from_slice(&[
+                s as i32,
+                rows as i32,
+                sv.nrows as i32,
+                cfgs as i32,
+                self.desc_ncfg(s) as i32,
+            ]);
+            rows += sv.nrows;
+            cfgs += self.desc_ncfg(s);
         }
-        Ok(())
+        let _ = stream.memcpy_htod(&map, &mut self.bmap.slice_mut(..map.len()));
+        // Group headers for the build launches live in the tail of g_meta.
+        // Header layout: [N_HDRS-2] = grid-stride (total = per-kernel), we
+        // instead upload per-launch headers one by one; the build is per
+        // batch, a dozen small copies are irrelevant next to the GEMMs.
+        let base = ptr(&stream, &self.live_slots);
+        let _ = base;
+        let nb = slots.len();
+        let slot_ids: Vec<i32> = slots.iter().map(|&s| s as i32).collect();
+        // Batch slot list sits after the map in bmap.
+        let at = map.len();
+        let _ = stream.memcpy_htod(&slot_ids, &mut self.bmap.slice_mut(at..at + nb));
+        let (bmap_ptr, _) = self.bmap.device_ptr(&stream);
+        let slots_dev = (bmap_ptr as usize + at * 4) as *const i32;
+
+        let hdr = |n: i32, mode: i32, p: i32, level: i32, total: i32| GroupDev {
+            slots: slots_dev,
+            n,
+            mode,
+            p_player: p,
+            level,
+            total,
+        };
+        // One reusable header slot at the end of g_meta.
+        let hslot = N_HDRS - 1;
+        let mut set = |g: GroupDev, me: &mut Self| {
+            let _ = me
+                .build
+                .memcpy_htod(&[g], &mut me.g_meta.slice_mut(hslot..hslot + 1));
+        };
+        let grid = |items: usize| (items.max(1) as u32).div_ceil(BLOCK);
+        let wgrid = |items: usize| ((items.max(1) * 32) as u32).div_ceil(BLOCK);
+
+        // ---- cards: pack -> GEMM chain -> finish (adds wid) --------------
+        set(hdr(nb as i32, 0, 0, 0, (nb * crate::rebel::NTYPE) as i32), self);
+        self.fire_b(|k| &k.pack_cards, hslot, grid(nb * crate::rebel::NTYPE * crate::units::CARD_FEATS));
+        let nrows_card = nb * crate::rebel::NTYPE;
+        let mut src = c.bg as *const f32;
+        let mut buf = 0; // 0 -> bh, 1 -> bh2
+        for (k, s) in l.card.iter().enumerate() {
+            let dst = if buf == 0 { c.bh } else { c.bh2 };
+            gemm(&self.build_blas, nrows_card, s.o, s.i, src, s.i,
+                 self.weights_at(s.w), s.o, dst, s.o, 0.0);
+            if k + 1 < l.card.len() {
+                set(hdr(nb as i32, 0, buf, k as i32, nrows_card as i32), self);
+                self.fire_b(|f| &f.bias_act, hslot, grid(nrows_card * s.o));
+                src = dst;
+                buf ^= 1;
+            } else if buf == 1 {
+                // cards_finish reads bh; copy parity by re-running the GEMM
+                // into bh would be silly — instead cards_finish reads the
+                // buffer named by mode. (mode = which buffer holds the out.)
+            }
+        }
+        let card_buf = (l.card.len() + 1) % 2; // which buffer the last GEMM wrote
+        set(hdr(nb as i32, card_buf as i32, 0, (l.card.len() - 1) as i32,
+                nrows_card as i32), self);
+        self.fire_b(|k| &k.cards_finish, hslot, grid(nb * crate::rebel::NTYPE * l.de));
+        // ---- pile: pe tail, count pack, count GEMM ------------------------
+        set(hdr(nb as i32, 0, 0, 0, nb as i32), self);
+        self.fire_b(|k| &k.pile_pe, hslot, grid(nb * crate::rebel::NTYPE * l.de));
+        set(hdr(nb as i32, 0, 0, 0, rows as i32), self);
+        self.fire_b(|k| &k.pack_piles, hslot, grid(rows * crate::rebel::NTYPE * crate::rebel::PILE_COUNTS));
+        gemm(&self.build_blas, rows * crate::rebel::NTYPE, l.de, crate::rebel::PILE_COUNTS,
+             c.bg as *const f32, crate::rebel::PILE_COUNTS, self.weights_at(l.pile.w), l.de,
+             c.bh, l.de, 0.0);
+        // ---- trunk: assemble -> pub chain -> pub_out -> scatter h0 --------
+        set(hdr(nb as i32, 0, 0, 0, rows as i32), self);
+        self.fire_b(|k| &k.assemble, hslot, rows.max(1) as u32);
+        let mut src = c.bx as *const f32;
+        let mut buf = 0;
+        for (k, s) in l.pub_lin.iter().enumerate() {
+            let dst = if buf == 0 { c.bh } else { c.bh2 };
+            gemm(&self.build_blas, rows, s.o, s.i, src, s.i, self.weights_at(s.w), s.o,
+                 dst, s.o, 0.0);
+            set(hdr(nb as i32, 0, buf, k as i32, rows as i32), self);
+            self.fire_b(|f| &f.trunk_norm, hslot, wgrid(rows));
+            src = dst;
+            buf ^= 1;
+        }
+        let dst = if buf == 0 { c.bh } else { c.bh2 };
+        gemm(&self.build_blas, rows, l.head_in, l.pub_out.i, src, l.pub_out.i,
+             self.weights_at(l.pub_out.w), l.head_in, dst, l.head_in, 0.0);
+        set(hdr(nb as i32, 0, buf, 0, rows as i32), self);
+        self.fire_b(|k| &k.scatter_h0, hslot, grid(rows * l.head_in));
+        // ---- holding tower -------------------------------------------------
+        set(hdr(nb as i32, 0, 0, 0, cfgs as i32), self);
+        self.fire_b(|k| &k.holding_in, hslot, grid(cfgs * crate::rebel::NSLOT));
+        let nsl = cfgs * crate::rebel::NSLOT;
+        let mut src = c.bg as *const f32;
+        let mut buf = 0;
+        for (k, s) in l.slot.iter().enumerate() {
+            let dst = if buf == 0 { c.bh } else { c.bh2 };
+            gemm(&self.build_blas, nsl, s.o, s.i, src, s.i, self.weights_at(s.w), s.o,
+                 dst, s.o, 0.0);
+            set(hdr(nb as i32, 2, buf, k as i32, nsl as i32), self);
+            self.fire_b(|f| &f.bias_act, hslot, grid(nsl * s.o));
+            src = dst;
+            buf ^= 1;
+        }
+        let dst = if buf == 0 { c.bh } else { c.bh2 };
+        gemm(&self.build_blas, nsl, l.dg, l.slot_out.i, src, l.slot_out.i,
+             self.weights_at(l.slot_out.w), l.dg, dst, l.dg, 0.0);
+        // slot_sum reads `p_player ? bh2 : bh` and writes the other: z ends
+        // in the opposite buffer.
+        set(hdr(nb as i32, 0, buf, 0, cfgs as i32), self);
+        self.fire_b(|k| &k.slot_sum, hslot, wgrid(cfgs));
+        let mut zbuf = buf ^ 1; // where z lives now
+        for (k, (a, bres)) in l.res.iter().enumerate() {
+            let (zp, rp) = if zbuf == 0 { (c.bh, c.bh2) } else { (c.bh2, c.bh) };
+            gemm(&self.build_blas, cfgs, l.dg, l.dg, zp as *const f32, l.dg,
+                 self.weights_at(a.w), l.dg, rp, l.dg, 0.0);
+            set(hdr(nb as i32, 3, zbuf ^ 1, k as i32, cfgs as i32), self);
+            self.fire_b(|f| &f.bias_act, hslot, grid(cfgs * l.dg));
+            gemm(&self.build_blas, cfgs, l.dg, l.dg, rp as *const f32, l.dg,
+                 self.weights_at(bres.w), l.dg, zp, l.dg, 1.0);
+            set(hdr(nb as i32, 4, zbuf, k as i32, cfgs as i32), self);
+            self.fire_b(|f| &f.bias_act, hslot, grid(cfgs * l.dg));
+            let _ = zbuf; // z stays in zp
+        }
+        let zp = if zbuf == 0 { c.bh } else { c.bh2 };
+        gemm(&self.build_blas, cfgs, l.rank + 1, l.dg, zp as *const f32, l.dg,
+             self.weights_at(l.wg.w), l.rank + 1, c.bg, l.rank + 1, 0.0);
+        set(hdr(nb as i32, 0, zbuf, 0, cfgs as i32), self);
+        self.fire_b(|k| &k.scatter_zg, hslot, grid(cfgs * (l.dg + l.rank + 1)));
+        // ---- CFR init: uniform strategy, initial reach, seeded average ----
+        set(hdr(nb as i32, 0, 0, 0, 0), self);
+        self.fire_b(|k| &k.init_strategy, hslot, nb as u32);
+        set(hdr(nb as i32, 1, 0, 0, 0), self);
+        self.fire_b(|k| &k.reach_prop, hslot, nb as u32);
+        set(hdr(nb as i32, 0, 0, 0, 0), self);
+        self.fire_b(|k| &k.seed_avg, hslot, nb as u32);
+        let _ = zbuf;
     }
 
-    /// The device address of one of a solve's uploaded tables.
-    fn table_ptr(&self, slot: usize, table: Tbl) -> *const f32 {
+    fn fire_b(&self, which: fn(&Kernels) -> &CudaFunction, hdr: usize, grid: u32) {
+        if grid == 0 {
+            return;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let f = which(&self.f).clone();
+        let group = self.g_meta.slice(hdr..hdr + 1);
+        let mut b = self.build.launch_builder(&f);
+        b.arg(&self.descs);
+        b.arg(&group);
+        b.arg(&self.ctx);
+        let _ = unsafe { b.launch(cfg) };
+    }
+
+    fn desc_ncfg(&self, slot: usize) -> usize {
+        // ncfg is not mirrored on Solve; read it from the job we admitted.
+        // (Stored at admission; kept simple by recomputing from aoff spans.)
         let sv = self.live[slot].as_ref().unwrap();
-        unsafe { sv.desc.tbl.add(sv.desc.toff[table as usize] as usize) as *const f32 }
+        let z = (sv.aoff[Arena::g as usize] - sv.aoff[Arena::z as usize]) as usize;
+        z / self.weights.layout.dg
     }
 
     // ------------------------------------------------------------ the trips
 
-    /// Trip 1: the reference strategy and the carried roots' values. Two
-    /// downloads, both of whole arenas; nothing was copied out per tick.
+    /// Trip 1: hand the reference strategy and the carried-root values to
+    /// the downloader. The solve stays resident (carry stage), but its
+    /// network rows are free the moment the value passes are done.
     fn send_trip1(&mut self, s: usize) {
+        let ev = self.compute.record_event(None).ok();
         let sv = self.live[s].as_mut().unwrap();
-        let Some(tx) = sv.trip1.take() else { return };
+        let Some((tag, tx)) = sv.trip1.take() else { return };
+        let (arena_ptr, _) = self.arenas.device_ptr(&self.compute);
+        let at = |a: Arena| arena_ptr + ((sv.arena_at + sv.aoff[a as usize] as usize) * 4) as u64;
         let stride = sv.nc_root[0] + sv.nc_root[1];
-        let strategy = d2h(&self.stream, &sv.arenas, sv.aoff[Arena::avg as usize] as usize, sv.ncells);
-        let flat = d2h(&self.stream, &sv.arenas, sv.aoff[Arena::root_vals as usize] as usize, sv.nroots * stride);
-        let root_values = flat
-            .chunks_exact(stride.max(1))
-            .map(|c| [c[..sv.nc_root[0]].to_vec(), c[sv.nc_root[0]..].to_vec()])
-            .collect();
-        let _ = tx.send(Ok(Trip1 { id: sv.id, strategy, root_values }));
+        let req = Dl::Trip1 {
+            event: ev.expect("event"),
+            tag,
+            reply: tx,
+            id: sv.id,
+            strategy: (at(Arena::avg), sv.ncells),
+            root_vals: (at(Arena::root_vals), sv.nroots * stride),
+            nc_root: sv.nc_root,
+        };
+        // The head rows are dead from here on: value passes are done and the
+        // carry stage never reads them. Freeing now is what keeps the head
+        // GEMM's row span tight.
+        self.rows.free(sv.row0);
+        sv.nrows = 0;
+        self.solved += 1;
+        let _ = self.dl_tx.send(req);
     }
 
-    /// The walk left the tree at `leaf`: record it and let the carry stage
-    /// replay each kept snapshot to that leaf.
+    /// The walk left the tree at `leaf`: rebuild the solve's descriptor from
+    /// the host mirror (now with the exit leaf and its support counts) and
+    /// re-upload it. The upload is stream-ordered before the next tick, and
+    /// every mutable field is derivable from the mirror, so replacing the
+    /// device copy wholesale is exact.
     fn start_carry(&mut self, id: u64, leaf: u32, reply: mpsc::Sender<Result<Trip2, String>>) {
-        let Some(sv) = self.live.iter_mut().flatten().find(|v| v.id == id) else {
+        let Some(s) = (0..CAP).find(|&s| self.live[s].as_ref().is_some_and(|v| v.id == id)) else {
             let _ = reply.send(Err(format!("gpu: unknown solve id {id}")));
             return;
         };
+        let sv = self.live[s].as_mut().unwrap();
+        let iters = sv.meta.iters;
         let l = leaf as usize;
-        sv.nc_leaf = [
+        sv.nleaf_cfg = [
             (sv.cfg_off[2 * l + 1] - sv.cfg_off[2 * l]) as usize,
             (sv.cfg_off[2 * l + 2] - sv.cfg_off[2 * l + 1]) as usize,
         ];
-        sv.desc.leaf = l as i32;
         sv.step = 0;
         sv.trip2 = Some(reply);
+        let d = &mut sv.desc;
+        d.leaf = l as i32;
+        d.nc_leaf = [sv.nleaf_cfg[0] as i32, sv.nleaf_cfg[1] as i32];
+        d.stage = STAGE_CARRY;
+        d.step = 0;
+        d.t = iters as i32;
+        d.traverser = (iters & 1) as i32;
+        d.steps = [iters.div_ceil(2) as i32, (iters / 2) as i32];
+        d.first_query = 0;
+        d.snap_t = sv.nsnaps as i32;
+        let desc = *d;
+        let _ = self
+            .compute
+            .memcpy_htod(&[desc], &mut self.descs.slice_mut(s..s + 1));
     }
 
-    /// Trip 2: the carried beliefs at the exit leaf, one per kept snapshot.
+    /// Trip 2: the carried beliefs at the exit leaf, downloaded after the
+    /// carry replays finish.
     fn send_trip2(&mut self, s: usize) {
+        let ev = self.compute.record_event(None).ok();
         let sv = self.live[s].as_mut().unwrap();
         let Some(tx) = sv.trip2.take() else { return };
-        let stride = sv.nc_leaf[0] + sv.nc_leaf[1];
+        sv.draining = true;
+        let (arena_ptr, _) = self.arenas.device_ptr(&self.compute);
+        let at = arena_ptr
+            + ((sv.arena_at + sv.aoff[Arena::beliefs as usize] as usize) * 4) as u64;
+        let stride = sv.nleaf_cfg[0] + sv.nleaf_cfg[1];
         let n = sv.nsnaps.saturating_sub(1);
-        let flat = d2h(&self.stream, &sv.arenas, sv.aoff[Arena::beliefs as usize] as usize, n * stride);
-        let out = flat
-            .chunks_exact(stride.max(1))
-            .map(|c| [c[..sv.nc_leaf[0]].to_vec(), c[sv.nc_leaf[0]..].to_vec()])
-            .collect();
-        let _ = tx.send(Ok(out));
-    }
-
-    /// Test hook: admit one solve and run a CFR iteration up to `upto`, then
-    /// read back the arenas the CPU solver can be compared against. It drives
-    /// `iterate`, so what it checks is what the tick runs.
-    #[cfg(test)]
-    pub(crate) fn probe(&mut self, job: Job, upto: Step) -> Result<super::tests::ProbeOut, String> {
-        let (tx, _rx) = mpsc::channel();
-        self.admit(job, tx)?;
-        let s = self.live.iter().position(|x| x.is_some()).expect("admitted");
-        self.upload_descs();
-        self.reset_staging();
-        let l = self.stage_iterate(&[s], &[]);
-        self.commit();
-        self.fire_iterate(&[s], &l, upto);
-        self.stream.synchronize().map_err(|e| format!("{e:?}"))?;
-        self.stream.context().check_err().map_err(|e| format!("{upto:?}: {e:?}"))?;
-        let (dg, rk) = (self.weights.dims[4], self.weights.dims[5]);
-        let sv = self.live[s].as_ref().unwrap();
-        let span = |k: Arena| {
-            (sv.aoff[k as usize + 1] - sv.aoff[k as usize]) as usize
+        let req = Dl::Trip2 {
+            event: ev.expect("event"),
+            reply: tx,
+            slot: s,
+            beliefs: (at, n * stride),
+            nc_leaf: sv.nleaf_cfg,
+            nsnaps: sv.nsnaps,
         };
-        let a = |k: Arena, n: usize| d2h(&self.stream, &sv.arenas, sv.aoff[k as usize] as usize, n);
-        let out = super::tests::ProbeOut {
-            e: a(Arena::e, span(Arena::e)),
-            z: a(Arena::z, span(Arena::z)),
-            g: a(Arena::g, span(Arena::g)),
-            h0: d2h(&self.stream, &self.pools._h0, sv.row0 * self.weights.dims[2],
-                    sv.nrows * self.weights.dims[2]),
-            reach: a(Arena::reach, span(Arena::reach)),
-            vals: a(Arena::vals, span(Arena::vals)),
-            regret: a(Arena::regret, sv.ncells),
-            inst: a(Arena::inst, sv.ncells),
-            cur: a(Arena::cur, sv.ncells),
-            sum_strat: a(Arena::sum_strat, sv.ncells),
-            avg: a(Arena::avg, sv.ncells),
-            xb: d2h(&self.stream, &self.pools._xb, sv.row0 * 2 * dg, sv.nleaf * 2 * dg),
-            u: d2h(&self.stream, &self.pools._u, sv.row0 * rk, sv.nleaf * rk),
-        };
-        self.release(s);
-        Ok(out)
+        let _ = self.dl_tx.send(req);
     }
 
     fn release(&mut self, s: usize) {
         if let Some(sv) = self.live[s].take() {
-            self.pools.free(sv.row0);
+            if sv.nrows > 0 {
+                self.rows.free(sv.row0);
+            }
+            self.tbl_slab.free(sv.tbl_at);
+            self.arena_slab.free(sv.arena_at);
+            self.free.push(s);
+            self.live_dirty = true;
         }
-        self.free.push(s);
     }
 }
 
+fn h_stride_of(l: &V3Layout) -> usize {
+    std::iter::once(l.head_in)
+        .chain(l.hmlp.iter().map(|s| s.o))
+        .max()
+        .unwrap()
+}
+
+fn merge_ctx(dst: &mut Ctx, pools: &Ctx) {
+    dst.h0 = pools.h0;
+    dst.xb = pools.xb;
+    dst.h = pools.h;
+    dst.h2 = pools.h2;
+    dst.u = pools.u;
+    dst.bx = pools.bx;
+    dst.bh = pools.bh;
+    dst.bh2 = pools.bh2;
+    dst.bg = pools.bg;
+    dst.bmap = pools.bmap;
+}
+
+fn table_len(job: &Job) -> usize {
+    // pack_tables pads for alignment; a small overestimate is fine.
+    let d = Derived::new(job);
+    super::layout::pack_tables(&job.tables, &d).0.len()
+}
+
+fn arena_len_of(job: &Job, l: &V3Layout) -> usize {
+    let t = &job.tables;
+    let d = Derived::new(job);
+    let nc = |i: usize, p: usize| (t.cfg_off[2 * i + p + 1] - t.cfg_off[2 * i + p]) as usize;
+    let nsnaps = if job.meta.snapshots { job.meta.snap_iters.len() } else { 0 };
+    let sizes = Sizes {
+        reach_len: t.reach_len,
+        vals_len: d.vals_len(),
+        ncells: t.ncells,
+        nsnaps,
+        ncfg: t.ncfg,
+        nc_root: nc(0, 0) + nc(0, 1),
+        max_nc: (0..t.nodes).map(|i| nc(i, 0).max(nc(i, 1))).max().unwrap_or(0),
+        nroots: job.carried.len(),
+        dg: l.dg,
+        rk: l.rank,
+        de: l.de,
+    };
+    arena_offsets(&sizes).1
+}
+
 /// Compare the device's view of `Desc` with the host's, field by field.
-///
-/// Everything else in this module rests on the two agreeing: the descriptor is
-/// written by Rust and read by CUDA, and a padding difference would corrupt
-/// every kernel while looking like a numerical bug. Both the probe kernel and
-/// the expected values are generated from the one declaration in `layout.rs`,
-/// so a field cannot be checked on one side only.
 fn check_abi(stream: &Arc<CudaStream>, probe: &CudaFunction) -> Result<(), String> {
     let want = super::layout::abi_expected();
-    let mut got = zeros::<i32>(stream, want.len())?;
+    let mut got = stream
+        .alloc_zeros::<i32>(want.len())
+        .map_err(|e| format!("{e:?}"))?;
     let mut b = stream.launch_builder(probe);
     b.arg(&mut got);
     let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 };
@@ -1493,13 +1348,6 @@ fn check_abi(stream: &Arc<CudaStream>, probe: &CudaFunction) -> Result<(), Strin
 
 // ------------------------------------------------------------------ helpers
 
-fn zeros<T: cudarc::driver::ValidAsZeroBits + cudarc::driver::DeviceRepr>(
-    stream: &Arc<CudaStream>,
-    n: usize,
-) -> Result<CudaSlice<T>, String> {
-    stream.alloc_zeros(n.max(1)).map_err(|e| format!("{e:?}"))
-}
-
 fn htod<T: cudarc::driver::DeviceRepr + Unpin>(
     stream: &Arc<CudaStream>,
     v: &[T],
@@ -1507,21 +1355,6 @@ fn htod<T: cudarc::driver::DeviceRepr + Unpin>(
     let mut buf = unsafe { stream.alloc(v.len().max(1)) }.map_err(|e| format!("{e:?}"))?;
     stream.memcpy_htod(v, &mut buf).map_err(|e| format!("{e:?}"))?;
     Ok(buf)
-}
-
-/// Read part of a device buffer back to the host.
-///
-/// cudarc issues the copy asynchronously and, for an ordinary host slice,
-/// attaches no synchronisation to it — so the wait belongs here. It costs
-/// nothing in the steady state: downloads happen at a solve's two trip
-/// boundaries, never inside a tick.
-fn d2h(stream: &Arc<CudaStream>, buf: &CudaSlice<f32>, off: usize, n: usize) -> Vec<f32> {
-    let mut v = vec![0.0f32; n];
-    if n > 0 {
-        let _ = stream.memcpy_dtoh(&buf.slice(off..off + n), &mut v);
-        let _ = stream.synchronize();
-    }
-    v
 }
 
 fn ptr<T>(stream: &Arc<CudaStream>, buf: &CudaSlice<T>) -> *const T {
@@ -1534,40 +1367,9 @@ fn ptr_mut<T>(stream: &Arc<CudaStream>, buf: &mut CudaSlice<T>) -> *mut T {
     p as usize as *mut T
 }
 
-/// A batch of identical row-major GEMMs sharing one `B`: `C_i = A_i . B`,
-/// where the `A_i` are `stride_a` apart. Used where a matrix is a block of
-/// each row of a wider table and gathering it first would be pure copying.
-#[allow(clippy::too_many_arguments)]
-fn gemm_batched(
-    blas: &CudaBlas,
-    m: usize, n: usize, k: usize,
-    a: *const f32, lda: usize, stride_a: usize,
-    b: *const f32, ldb: usize,
-    c: *mut f32, ldc: usize, stride_c: usize,
-    batch: usize,
-) {
-    if m == 0 || n == 0 || k == 0 || batch == 0 {
-        return;
-    }
-    let (alpha, beta) = (1.0f32, 0.0f32);
-    // SAFETY: as `gemm` — device pointers the service owns, shapes from the
-    // arena sizes the caller cut.
-    let _ = unsafe {
-        cudarc::cublas::result::sgemm_strided_batched(
-            *blas.handle(), CUBLAS_OP_N, CUBLAS_OP_N,
-            n as i32, m as i32, k as i32, &alpha,
-            b, ldb as i32, 0,
-            a, lda as i32, stride_a as i64,
-            &beta, c, ldc as i32, stride_c as i64,
-            batch as i32,
-        )
-    };
-}
-
-/// One row-major GEMM over raw device pointers: `C[m,n] = A[m,k] . B[k,n]`,
-/// plus `beta * C`. Every matrix is stored row-major, so cuBLAS — which is
-/// column-major — is handed the product transposed, with the row strides as
-/// its leading dimensions.
+/// One row-major GEMM over raw device pointers: `C[m,n] = A[m,k] . B[k,n]`
+/// plus `beta * C`, with explicit row strides. cuBLAS is column-major, so it
+/// is handed the transposed product.
 #[allow(clippy::too_many_arguments)]
 fn gemm(
     blas: &CudaBlas,
@@ -1581,10 +1383,7 @@ fn gemm(
         return;
     }
     let alpha = 1.0f32;
-    // SAFETY: the pointers are device addresses owned by the service's own
-    // buffers, and the shapes come from the arena sizes the caller cut.
-    // Swapping the operands is what turns the column-major call into the
-    // row-major product above.
+    // SAFETY: device pointers the service owns; shapes from the layout.
     let _ = unsafe {
         cudarc::cublas::result::sgemm(
             *blas.handle(),
@@ -1603,4 +1402,101 @@ fn gemm(
             ldc as i32,
         )
     };
+}
+
+// ------------------------------------------------------------------ probe
+
+/// The arenas after a probe, for the phase-oracle test.
+#[cfg(test)]
+pub struct ProbeOut {
+    pub e: Vec<f32>,
+    pub z: Vec<f32>,
+    pub g: Vec<f32>,
+    pub h0: Vec<f32>,
+    pub reach: Vec<f32>,
+    pub vals: Vec<f32>,
+    pub regret: Vec<f32>,
+    pub inst: Vec<f32>,
+    pub cur: Vec<f32>,
+    pub sum_strat: Vec<f32>,
+    pub avg: Vec<f32>,
+    pub xb: Vec<f32>,
+    pub u: Vec<f32>,
+}
+
+#[cfg(test)]
+impl Service {
+    /// Admit one solve, run one tick up to `upto`, read the arenas back.
+    /// Test-only, so it may synchronize as much as it likes.
+    pub(crate) fn probe(&mut self, job: Job, upto: Step) -> Result<ProbeOut, String> {
+        let (tx, _rx) = mpsc::channel();
+        self.waiting.push_back((job, 0, tx));
+        self.admit_batch();
+        let s = (0..CAP)
+            .find(|&s| self.live[s].is_some())
+            .ok_or("probe: not admitted")?;
+        self.tick_upto(upto);
+        self.build.synchronize().map_err(|e| format!("{e:?}"))?;
+        self.compute.synchronize().map_err(|e| format!("{e:?}"))?;
+        self.compute
+            .context()
+            .check_err()
+            .map_err(|e| format!("{upto:?}: {e:?}"))?;
+        let sv = self.live[s].as_ref().unwrap();
+        let l = &self.weights.layout;
+        let span = |k: Arena| {
+            (
+                sv.arena_at + sv.aoff[k as usize] as usize,
+                (sv.aoff[k as usize + 1] - sv.aoff[k as usize]) as usize,
+            )
+        };
+        let arena = |k: Arena| -> Vec<f32> {
+            let (at, n) = span(k);
+            self.d2h_arena(at, n)
+        };
+        let cells = |k: Arena| -> Vec<f32> {
+            let (at, _) = span(k);
+            self.d2h_arena(at, sv.ncells)
+        };
+        let pool = |idx: usize, stride: usize, n: usize| -> Vec<f32> {
+            let mut v = vec![0.0f32; n];
+            if n > 0 {
+                let p = &self._pools[idx];
+                let _ = self
+                    .compute
+                    .memcpy_dtoh(&p.slice(sv.row0 * stride..sv.row0 * stride + n), &mut v);
+                let _ = self.compute.synchronize();
+            }
+            v
+        };
+        let nleaf = sv.desc.nleaf as usize;
+        let out = ProbeOut {
+            e: arena(Arena::e),
+            z: arena(Arena::z),
+            g: arena(Arena::g),
+            h0: pool(0, l.head_in, sv.nrows * l.head_in),
+            reach: arena(Arena::reach),
+            vals: arena(Arena::vals),
+            regret: cells(Arena::regret),
+            inst: cells(Arena::inst),
+            cur: cells(Arena::cur),
+            sum_strat: cells(Arena::sum_strat),
+            avg: cells(Arena::avg),
+            xb: pool(1, 2 * l.dg, nleaf * 2 * l.dg),
+            u: pool(4, l.rank, nleaf * l.rank),
+        };
+        self.release(s);
+        Ok(out)
+    }
+
+    fn d2h_arena(&self, at: usize, n: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; n];
+        if n > 0 {
+            let _ = self
+                .compute
+                .memcpy_dtoh(&self.arenas.slice(at..at + n), &mut v);
+            let _ = self.compute.synchronize();
+        }
+        v
+    }
 }
