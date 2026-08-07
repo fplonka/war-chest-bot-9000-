@@ -939,6 +939,15 @@ impl Service {
 
     /// One row-major GEMM: C[m,n] = A[m,k] · B[k,n] (+ beta·C). All buffers
     /// row-major [in, out] as stored; cuBLAS sees the transposes.
+    /// Synchronize and surface the first CUDA error, with a label.
+    #[cfg(test)]
+    fn chk(&self, what: &str) {
+        let _ = self.stream.synchronize();
+        if let Err(e) = self.dev.check_err() {
+            panic!("{what}: {e:?}");
+        }
+    }
+
     fn upload_slots(&mut self, slots: &[usize]) {
         self.group.clear();
         self.group.extend(slots.iter().map(|&s| s as i32));
@@ -1219,6 +1228,8 @@ impl Service {
         let __a3 = dc as i32;
         b.arg(&__a3);
         let _ = unsafe { b.launch(cfg) };
+        #[cfg(test)]
+        self.chk("cards relu");
         let mut tmp_m = tmp.clone();
         gemm(&self.blas, 
             crate::rebel::NTYPE, de, dc,
@@ -1238,6 +1249,8 @@ impl Service {
         let __a5 = de as i32;
         b2.arg(&__a5);
         let _ = unsafe { b2.launch(cfg2) };
+        #[cfg(test)]
+        self.chk("cards finish");
         Ok(())
     }
 
@@ -1276,6 +1289,8 @@ impl Service {
         let __a6 = de as i32;
         b.arg(&__a6);
         let _ = unsafe { b.launch(cfg) };
+        #[cfg(test)]
+        self.chk("pile_pe");
         let xpub = tview::<f32>(tables, off.leaf_xpub, rows * self.weights.dims[0]);
         let x = self.stream.alloc_zeros::<f32>(rows * xd).map_err(|e| format!("{e:?}"))?;
         let mut x_m = x.clone();
@@ -1292,6 +1307,8 @@ impl Service {
         let __a9 = de as i32;
         b2.arg(&__a9);
         let _ = unsafe { b2.launch(cfg2) };
+        #[cfg(test)]
+        self.chk("assemble");
         // scratch = x·w0; LN0+ReLU in place; h0 = scratch·w1.
         let mut scratch = self.stream.alloc_zeros::<f32>(rows * h).map_err(|e| format!("{e:?}"))?;
         gemm(&self.blas, rows, h, xd, &x_m, xd, &w0, h, &mut scratch, h, 0.0);
@@ -1309,6 +1326,8 @@ impl Service {
         let __a12 = h as i32;
         b3.arg(&__a12);
         let _ = unsafe { b3.launch(cfg3) };
+        #[cfg(test)]
+        self.chk("trunk ln");
         let mut h0 = arenas.slice_mut(off.h0..off.h0 + rows * hd);
         gemm(&self.blas, rows, hd, h, &scratch, h, &w1, hd, &mut h0, hd, 0.0);
         let _ = hf;
@@ -1354,6 +1373,8 @@ impl Service {
         let __a15 = de as i32;
         b.arg(&__a15);
         let _ = unsafe { b.launch(cfg) };
+        #[cfg(test)]
+        self.chk("holding_in");
         let mut slot_m = slot.clone();
         gemm(&self.blas, n * crate::rebel::NSLOT, dg, hf, &inp_m, hf, &wc, dg, &mut slot_m, dg, 0.0);
         let mut z = arenas.slice_mut(off.cz + crate::rebel::NTYPE * de..off.cz + crate::rebel::NTYPE * de + n * dg);
@@ -1367,6 +1388,8 @@ impl Service {
         let __a17 = dg as i32;
         b2.arg(&__a17);
         let _ = unsafe { b2.launch(cfg2) };
+        #[cfg(test)]
+        self.chk("slot_sum");
         // Residual: z = z + relu(z·wh1 + bh1)·wh2 + bh2.
         let mut res_m = res.clone();
         gemm(&self.blas, n, dg, dg, &z, dg, &wh1, dg, &mut res_m, dg, 0.0);
@@ -1379,6 +1402,8 @@ impl Service {
         let __a19 = dg as i32;
         b3.arg(&__a19);
         let _ = unsafe { b3.launch(cfg3) };
+        #[cfg(test)]
+        self.chk("embed res relu");
         let mut z2 = arenas.slice_mut(off.cz + crate::rebel::NTYPE * de..off.cz + crate::rebel::NTYPE * de + n * dg);
         gemm(&self.blas, n, dg, dg, &res_m, dg, &wh2, dg, &mut z2, dg, 1.0);
         let mut b4 = self.stream.launch_builder(&self.f.bias_add);
@@ -1389,6 +1414,8 @@ impl Service {
         let __a21 = dg as i32;
         b4.arg(&__a21);
         let _ = unsafe { b4.launch(cfg3) };
+        #[cfg(test)]
+        self.chk("embed add2");
         // g = z·wg + bg.
         let mut z3 = self.stream.alloc_zeros(n * dg).map_err(|e| format!("{e:?}"))?;
         {
@@ -1405,6 +1432,8 @@ impl Service {
         let __a23 = (rk + 1) as i32;
         b5.arg(&__a23);
         let _ = unsafe { b5.launch(cfg3) };
+        #[cfg(test)]
+        self.chk("embed g bias");
         Ok(())
     }
 
