@@ -304,7 +304,7 @@ A4 is blocked on a policy head worth more than that.
 
 `engine/src/v1.rs` and `train/value_net_v1.py` are the encoding and network a
 checkpoint from before the card describer was trained with, frozen and
-eval-only. Keyed off `dims` (five entries against the current eight); a solve
+eval-only. Keyed off `dims` (five entries against the current ten); a solve
 takes its encoder from the net it was handed rather than from a constant.
 
 They exist for one reason: the describer changed the public encoding's width, and
@@ -318,8 +318,8 @@ Inside a solve only the beliefs move, so three things survive it: the public
 tower `hpub`, and `z(c)` and `g(c)` for every config in the tree. The config
 tower runs once per *distinct* config per solve (`Solver::intern_config`); the
 trainer deduplicates a batch the same way. What remains per iteration is one
-`2·dg -> hidden` matmul per leaf, one LayerNorm, and one `rank`-long dot product
-per config.
+`2·dg -> head` matmul per leaf, one LayerNorm, and one `rank`-long dot
+product per config.
 
 ### Features
 
