@@ -943,7 +943,7 @@ impl Service {
     #[cfg(test)]
     fn chk(&self, what: &str) {
         let _ = self.stream.synchronize();
-        if let Err(e) = self.dev.check_err() {
+        if let Err(e) = self.stream.context().check_err() {
             panic!("{what}: {e:?}");
         }
     }
