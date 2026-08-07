@@ -56,13 +56,18 @@ def build(name):
         hex_net = name.startswith("hex-")
         toks = name[4:] if hex_net else name
         v = {}
+        flags = {}
         for tok in toks.split("-"):
             if tok.startswith("head"):
                 v["head"] = int(tok[4:])
+            elif tok in ("noid", "nofacts", "nor"):
+                flags[tok] = True
             else:
                 v[tok[0]] = int(tok[1:])
         return Mlp(v["h"], v["d"], v["r"], v.get("e", 32),
-                   head=v.get("head", None), hex_net=hex_net)
+                   head=v.get("head", None), hex_net=hex_net,
+                   no_id=flags.get("noid", False), no_facts=flags.get("nofacts", False),
+                   no_residual=flags.get("nor", False))
     except (KeyError, ValueError):
         raise SystemExit(
             f"unknown arch {name!r} -- expected [hex-]h<hidden>-d<dg>-r<rank>[-e<de>][-head<n>]"

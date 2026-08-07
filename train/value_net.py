@@ -101,7 +101,14 @@ class Mlp(nn.Module):
     the target distribution moves.
     """
 
-    def __init__(self, hidden, dg=64, rank=64, de=32, dc=64, head=None, hex_net=False):
+    def __init__(self, hidden, dg=64, rank=64, de=32, dc=64, head=None, hex_net=False,
+                 no_id=False, no_facts=False, no_residual=False):
+        # The 7a screening variants: the learned id embedding, the facts path,
+        # and the holding residual can each be switched off. Screening-only;
+        # the shipped network is the full default.
+        self.no_id = no_id
+        self.no_facts = no_facts
+        self.no_residual = no_residual
         super().__init__()
         # `head` is the width of the second public matrix, the belief
         # projection, the second LayerNorm and both readouts. It is
@@ -207,8 +214,12 @@ class Mlp(nn.Module):
         facts' output.
         """
         c = xpub[:, OFF_CARDS:OFF_CARDS + NTYPE * CARD_FEATS]
-        return (self.wd1(F.relu(self.wd0(c.reshape(-1, NTYPE, CARD_FEATS))))
-                + self.wid(unit_ids))
+        e = torch.zeros(xpub.shape[0], NTYPE, self.de, dtype=xpub.dtype, device=xpub.device)
+        if not self.no_facts:
+            e = self.wd1(F.relu(self.wd0(c.reshape(-1, NTYPE, CARD_FEATS))))
+        if not self.no_id:
+            e = e + self.wid(unit_ids)
+        return e
 
     def hex_input(self, xpub, e):
         """The hex trunk's input: one `[HEX_W]` vector per hex after the six
@@ -269,6 +280,8 @@ class Mlp(nn.Module):
         # the sum, and the sum of the inputs has forgotten which count belongs
         # to which card -- the one thing this tower exists to remember.
         z = F.relu(self.wc(torch.cat([counts, s, mine], -1))).sum(1)
+        if self.no_residual:
+            return z
         return z + self.wh2(F.relu(self.wh1(z)))
 
     def actions(self, psi, e):
