@@ -35,9 +35,8 @@
       it makes the game non-zero-sum, and zero-sum is load-bearing.
 - [ ] **The subgame is not quite zero-sum.** Its leaves are network values;
       predicting v_0 and defining v_1 = -v_0 would enforce it by construction.
-- [ ] Draw transitions are the largest remaining non-network CPU cost. A run
-      of k draws is composed step by step over supports that grow ~5x each
-      time; the multivariate hypergeometric gives the same answer directly.
-      The solver node cap (200k) bounds the damage until then.
+- [x] Draw transitions: round-start runs are now one direct multivariate
+      hypergeometric per source config (see rebel.rs::DrawScratch::run),
+      pinned to the old composition by test.
 - [ ] Validate the mirror augmentation against the engine rather than against
       invariants (a State::mirror() in Rust would make the encoder the oracle).

@@ -128,16 +128,34 @@ def players_of(runs, refs=("greedy",), labels=None, pool=None):
 
 def run(runs, out=None, games=60, depth=2, iters=64, temp=2.0,
         random_draft=False, seed=7, refs=("greedy",), labels=None, pool=None,
-        depth_b=0, iters_b=0):
-    """Round robin, Elo fit, `ladder.json`, printed table. Returns the ratings."""
+        depth_b=0, iters_b=0, gpu=False):
+    """Round robin, Elo fit, `ladder.json`, printed table. Returns the ratings.
+
+    With `gpu=True` two solve services run (CUDA devices 0 and 1); each
+    pairing loads side A's weights on device 0 and side B's on device 1, so
+    both GPUs are busy while the ladder plays. All checkpoints must share
+    one network shape (the services are compiled for it), and v1-era
+    checkpoints cannot play on the GPU.
+    """
     if out is None:
         out = runs[0]
     ps = players_of(runs, refs, labels, pool)
     nets = [p for p in ps if p["agent"] == "rebel"]
     if not nets:
         raise SystemExit(f"{runs}: no snapshots in log.json")
+    by_slot = {}
     for p in nets:
-        load(f"{p['run']}/{p['file']}").push(p["slot"])
+        net = load(f"{p['run']}/{p['file']}")
+        net.push(p["slot"])
+        by_slot[p["slot"]] = net
+    if gpu:
+        shapes = {tuple(n.dims) for n in by_slot.values()}
+        if len(shapes) != 1:
+            raise SystemExit(f"--gpu needs one shared network shape, got {shapes}")
+        if next(iter(shapes))[0] != 3:
+            raise SystemExit("--gpu cannot play v1-era checkpoints")
+        first = next(iter(by_slot.values()))
+        warchest.gpu_start(first.dims, *first.flat(), devices=[0, 1])
     # Always the real game: the horizon's marker payoff is a training aid, and
     # scoring on it would rank whoever exploits it best.
     warchest.set_cap_value(0.0)
@@ -155,12 +173,20 @@ def run(runs, out=None, games=60, depth=2, iters=64, temp=2.0,
         # the pairings share a stream too would correlate their errors, and the
         # standard errors below assume they do not.
         a, b = ps[i], ps[j]
+        if gpu:
+            if a["agent"] == "rebel":
+                na = by_slot[a["slot"]]
+                warchest.gpu_set_weights(na.dims, *na.flat(), device=0)
+            if b["agent"] == "rebel":
+                nb = by_slot[b["slot"]]
+                warchest.gpu_set_weights(nb.dims, *nb.flat(), device=1)
         w, l, d = warchest.eval_match(games, seed + 1000 * i + j, a["agent"], b["agent"],
                                       depth=depth, iters=iters, temp=temp,
                                       slot_a=a["slot"], slot_b=b["slot"],
                                       random_draft=random_draft,
                                       depth_b=depth_b if depth_b > 0 else None,
-                                      iters_b=iters_b if iters_b > 0 else None)
+                                      iters_b=iters_b if iters_b > 0 else None,
+                                      gpu=gpu)
         n[i][j] = n[j][i] = w + l + d
         sc[i][j], sc[j][i] = w + 0.5 * d, l + 0.5 * d
         pairs.append({"a": a["name"], "b": b["name"], "w": w, "l": l, "d": d,
@@ -217,6 +243,8 @@ def main():
     ap.add_argument("--iters-b", type=int, default=0,
                     help="side B's CFR iterations (default: same as side A)")
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--gpu", action="store_true",
+                    help="two solve services (CUDA 0/1), one per pairing side")
     args = ap.parse_args()
     # Play at the runs' own search settings unless told otherwise: a checkpoint
     # trained at one iteration count and rated at another is a different agent.
@@ -233,7 +261,7 @@ def main():
         seed=args.seed,
         refs=() if args.no_refs else tuple(x for x in args.refs.split(",") if x),
         labels=args.labels.split(",") if args.labels else None,
-        pool=pool, depth_b=args.depth_b, iters_b=args.iters_b)
+        pool=pool, depth_b=args.depth_b, iters_b=args.iters_b, gpu=args.gpu)
 
 
 if __name__ == "__main__":

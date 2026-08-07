@@ -4,16 +4,18 @@ The laptop has no CUDA, so the oracle tests that need a device run here. The
 container builds the engine with the `gpu` feature once and keeps the cargo
 target directory in a volume, so a re-run only recompiles what changed.
 
-    uvx modal run gpu_ci.py                    # every gpu test
-    uvx modal run gpu_ci.py --test phase       # one test, by substring
-    uvx modal run gpu_ci.py --no-release       # unoptimised, for a backtrace
-    uvx modal run gpu_ci.py --bench "128 20 64" # the throughput benchmark
+    uvx modal run gpu_ci.py                          # every gpu test (T4)
+    uvx modal run gpu_ci.py --test phase             # one test, by substring
+    uvx modal run gpu_ci.py --no-release             # unoptimised backtraces
+    uvx modal run gpu_ci.py --gpu L4 --bench "128 20 64"   # service benchmark
+    uvx modal run gpu_ci.py --gpu L4 --gen "64 64 2"       # end-to-end benchmark
 
 Optimised by default: the tests build a real subgame on the CPU first, and a
 debug build spends minutes there before the first kernel runs.
 
-Uses the cheapest GPU that runs the kernels (T4 is compute_75, which is what
-they are compiled for).
+GPU choice: T4 for correctness (cheapest), L4 for benchmarks (Ada, like the
+target box), L40S for final estimates (nearly a 4090). Kernels are
+NVRTC-compiled for the device at startup, so any of them works.
 """
 
 import io
@@ -24,12 +26,12 @@ import tarfile
 
 import modal
 
-REPO = "/Users/filip/Code/warchest-cuda"
+REPO = os.path.dirname(os.path.abspath(__file__))
 # Directories that are large and never needed to build or test.
 SKIP = {"target", ".venv", "runs", ".git", "__pycache__", "papers", "node_modules"}
 
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.1.0-devel-ubuntu22.04", add_python="3.11")
+    modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.11")
     .run_commands(
         "apt-get update && apt-get install -y --no-install-recommends "
         "curl build-essential pkg-config libssl-dev",
@@ -61,17 +63,16 @@ def repo_tarball() -> io.BytesIO:
     return buf
 
 
-@app.function(image=image, gpu="T4", timeout=1800,
-              volumes={"/root/warchest": CARGO, "/root/src": SRC})
-def run(test: str, release: bool, bench: str, timing: bool):
+def _run(test: str, release: bool, bench: str, gen: str, timing: bool):
     os.makedirs("/repo", exist_ok=True)
     subprocess.run(
         ["tar", "xzf", "/root/src/repo.tgz", "-C", "/repo", "--strip-components=1"],
         check=True,
     )
-    if bench:
+    if bench or gen:
+        example = "gpu_bench" if bench else "gpu_gen_bench"
         cmd = ["cargo", "run", "--release", "--features", "gpu",
-               "--example", "gpu_bench", "--"] + bench.split()
+               "--example", example, "--"] + (bench or gen).split()
         print("$", " ".join(cmd), flush=True)
         env = {**os.environ, **ENV}
         if timing:
@@ -94,8 +95,30 @@ def run(test: str, release: bool, bench: str, timing: bool):
         raise SystemExit(p.returncode)
 
 
+# One function per GPU type; modal fixes the GPU at declaration.
+common = dict(image=image, timeout=1800,
+              volumes={"/root/warchest": CARGO, "/root/src": SRC})
+
+
+@app.function(gpu="T4", **common)
+def run_t4(test: str, release: bool, bench: str, gen: str, timing: bool):
+    _run(test, release, bench, gen, timing)
+
+
+@app.function(gpu="L4", **common)
+def run_l4(test: str, release: bool, bench: str, gen: str, timing: bool):
+    _run(test, release, bench, gen, timing)
+
+
+@app.function(gpu="L40S", **common)
+def run_l40s(test: str, release: bool, bench: str, gen: str, timing: bool):
+    _run(test, release, bench, gen, timing)
+
+
 @app.local_entrypoint()
-def main(test: str = "", no_release: bool = False, bench: str = "", timing: bool = False):
+def main(test: str = "", no_release: bool = False, bench: str = "",
+         gen: str = "", timing: bool = False, gpu: str = "T4"):
     with SRC.batch_upload(force=True) as batch:
         batch.put_file(repo_tarball(), "/repo.tgz")
-    run.remote(test, not no_release, bench, timing)
+    fn = {"T4": run_t4, "L4": run_l4, "L40S": run_l40s}[gpu.upper()]
+    fn.remote(test, not no_release, bench, gen, timing)

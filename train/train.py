@@ -35,6 +35,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -535,7 +536,8 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     torch.manual_seed(args.seed)
-    torch.set_num_threads(os.cpu_count() or 8)
+    # With the GPU service, the CPU cores belong to the Rust workers.
+    torch.set_num_threads(2 if args.gpu else (os.cpu_count() or 8))
     rng = np.random.default_rng(args.seed)
     dev = torch.device(args.device)
 
@@ -560,6 +562,7 @@ def main():
     # where float16 resolves to ~0.001, a fiftieth of the network's own error.
     buf = Buffer(args.cap, args.cap * args.cfgs_per_row)
 
+    gen_box = None
     total = args.minutes * 60.0
     warm = total * args.warm_frac if args.warm_minutes < 0 else args.warm_minutes * 60.0
     warm = min(warm, total)
@@ -633,13 +636,38 @@ def main():
 
         tg = time.time()
         kw = dict(random_draft=args.random_draft)
+
+        def start_gen(gen_seed):
+            # One background thread; gpu_gen_data releases the GIL, so GPU 0
+            # generates the next batch while this thread trains on the last.
+            box = {}
+
+            def go():
+                box["d"] = warchest.gpu_gen_data(
+                    args.rebel_games, gen_seed, "rebel",
+                    depth=args.depth, iters=args.iters, explore=args.explore,
+                    mc_mix=args.mc_mix, cfr=args.cfr, warm=args.warm, **kw)
+
+            th = threading.Thread(target=go, daemon=True)
+            th.start()
+            return th, box
+
         if phase == "greedy":
             d = warchest.gen_data(args.warm_games, args.seed * 1_000_003 + epoch, "greedy",
                                   temp=args.temp, eval_mix=args.eval_mix, **kw)
         elif args.gpu:
-            d = warchest.gpu_gen_data(args.rebel_games, args.seed * 1_000_003 + epoch, "rebel",
-                                      depth=args.depth, iters=args.iters, explore=args.explore,
-                                      mc_mix=args.mc_mix, cfr=args.cfr, warm=args.warm, **kw)
+            # Generation overlaps training: batch N+1 is produced (from the
+            # weights published after batch N-1's training) while batch N
+            # trains. The service drains between calls, so a publication
+            # never lands mid-solve. One batch of weight staleness, same as
+            # ReBeL's periodic publication.
+            if gen_box is None:
+                gen_box = start_gen(args.seed * 1_000_003 + epoch)
+            th, box = gen_box
+            th.join()
+            d = box["d"]
+            warchest.gpu_set_weights(value.dims, *value.flat())
+            gen_box = start_gen(args.seed * 1_000_003 + epoch + 1)
         else:
             d = warchest.gen_data(args.rebel_games, args.seed * 1_000_003 + epoch, "rebel",
                                   depth=args.depth, iters=args.iters, explore=args.explore,
@@ -685,8 +713,6 @@ def main():
                          recent_frac=args.recent_frac)
         train_s = time.time() - tt
         value.push(0)
-        if args.gpu:
-            warchest.gpu_set_weights(value.dims, *value.flat())
         with torch.no_grad():
             probe_std = float(value(*probe[:6], probe[7]).std()) \
                 if probe is not None else float("nan")
