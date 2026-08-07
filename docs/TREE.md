@@ -103,6 +103,18 @@ carry `pending_coin` inside the config (see below).
 Generation (TurboReBeL) additionally returns the per-iterate average snapshots
 and the carried-belief roots for the next solve.
 
+## Operating model (aligned with the CUDA plan)
+
+The GPU service owns one device and keeps a **live set** of solves resident
+(expect 100-250). A tick advances every live solve by one CFR iteration:
+~6 phase kernels plus the shared-weight GEMMs. Training solves make two
+round trips: trip 1 returns the targets for the carried beliefs and the
+reference strategy (the walk acts on it); trip 2, when the walk leaves the
+tree, returns the carried beliefs at the exit leaf. Eval solves make one
+trip. The CPU keeps the game — rules, tree build, feature encoding, belief
+tracking — exactly as today. All arrays above are uploaded once per solve
+and stay resident until the solve finishes.
+
 ## Sizing
 
 `engine/examples/treesize.rs` builds depth-2/3/4 trees from collected roots
