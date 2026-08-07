@@ -1635,6 +1635,10 @@ fn gemm<A: cudarc::driver::DevicePtr<f32>, B: cudarc::driver::DevicePtr<f32>,
     let cfg = GemmConfig {
         transa: CUBLAS_OP_N,
         transb: CUBLAS_OP_N,
+        // Row-major C[m,n] = A[m,k]·B[k,n] with every matrix stored
+        // row-major: cuBLAS sees the transposes, so the col-major leading
+        // dimensions are the row-major row strides (n for C, ldb for A,
+        // lda for B).
         m: n as i32,
         n: m as i32,
         k: k as i32,
@@ -1642,7 +1646,7 @@ fn gemm<A: cudarc::driver::DevicePtr<f32>, B: cudarc::driver::DevicePtr<f32>,
         lda: ldb as i32,
         ldb: lda as i32,
         beta,
-        ldc: m as i32,
+        ldc: n as i32,
     };
     let _ = unsafe { blas.gemm(cfg, b, a, c) };
 }
