@@ -1040,18 +1040,19 @@ impl Mlp {
             None,
             &mut scratch[..rows * h],
         );
-        fit(out, rows * h);
+        let hd = self.head();
+        fit(out, rows * hd);
         gemm_ld(
             rows,
-            h,
+            hd,
             h,
             scratch,
             h,
             &self.w1,
-            h,
+            hd,
             0.0,
-            &mut out[..rows * h],
-            h,
+            &mut out[..rows * hd],
+            hd,
         );
     }
 
@@ -1075,38 +1076,38 @@ impl Mlp {
     /// is why it is separate — the value's runs every CFR iteration, the
     /// policy's runs once per solve.
     fn hidden_layer(&self, xbel: &[f32], rows: usize, pre: &[f32], out: &mut Vec<f32>) {
-        let (h, bd) = (self.hidden(), self.belief_dim());
+        let (hd, bd) = (self.head(), self.belief_dim());
         debug_assert_eq!(xbel.len(), rows * bd);
-        debug_assert!(pre.len() >= rows * h);
-        fit(out, rows * h);
+        debug_assert!(pre.len() >= rows * self.hidden());
+        fit(out, rows * hd);
         gemm_ld(
             rows,
-            h,
+            hd,
             bd,
             xbel,
             bd,
             &self.wb,
-            h,
+            hd,
             0.0,
-            &mut out[..rows * h],
-            h,
+            &mut out[..rows * hd],
+            hd,
         );
         self.ln_relu(
             rows,
-            h,
+            hd,
             &self.b1,
             &self.ln1_w,
             &self.ln1_b,
             Some(pre),
-            &mut out[..rows * h],
+            &mut out[..rows * hd],
         );
     }
 
     /// `hid W + b`, into `[rows * rank]`.
     fn readout(&self, hid: &[f32], rows: usize, w: &[f32], b: &[f32], out: &mut Vec<f32>) {
-        let (h, rk) = (self.hidden(), self.rank());
+        let (hd, rk) = (self.head(), self.rank());
         fit(out, rows * rk);
-        gemm_ld(rows, rk, h, hid, h, w, rk, 0.0, &mut out[..rows * rk], rk);
+        gemm_ld(rows, rk, hd, hid, hd, w, rk, 0.0, &mut out[..rows * rk], rk);
         for r in 0..rows {
             for (x, bb) in out[r * rk..r * rk + rk].iter_mut().zip(b.iter()) {
                 *x += *bb;

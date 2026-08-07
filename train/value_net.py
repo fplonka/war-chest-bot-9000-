@@ -111,6 +111,7 @@ class Mlp(nn.Module):
         self.hex_net = hex_net
         self.dims = [PUBFEAT, hidden, head, CFEAT, dg, rank, AFEAT, de, dc, int(hex_net)]
         self.de = de
+        self.dg = dg
         self.head = head
         xdim = N_HEXES * (HEX_FACTS + de) + 2 * de + LOOSE
         # The card describer, and the pile summary that reads it. Everything

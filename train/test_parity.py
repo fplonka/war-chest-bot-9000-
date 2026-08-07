@@ -80,6 +80,12 @@ def main():
         torch.nn.init.normal_(n.bias, std=0.2)
     torch.nn.init.normal_(net.wg.weight, std=0.05)
     torch.nn.init.normal_(net.wg.bias, std=0.05)
+    # Move the holding residual off its zeroed initialisation, or the parity
+    # check would never exercise it.
+    torch.nn.init.normal_(net.wh1.weight, std=0.1)
+    torch.nn.init.normal_(net.wh1.bias, std=0.1)
+    torch.nn.init.normal_(net.wh2.weight, std=0.1)
+    torch.nn.init.normal_(net.wh2.bias, std=0.1)
     net.push(0)
 
     rng = np.random.default_rng(0)
@@ -150,6 +156,38 @@ def main():
     assert pref.std() > 0.1, f"degenerate reference logits (std {pref.std():.4f})"
     assert perr < 2e-4, f"POLICY PARITY FAILURE: max |torch - rust| = {perr:.3e}"
     print(f"policy parity ok: max |torch - rust| = {perr:.3e}, logit std {pref.std():.4f}")
+
+    # --- head != hidden: the split widths must not be assumed equal ---------
+    torch.manual_seed(1)
+    net2 = Mlp(256, 32, 48, 16, head=128)
+    torch.nn.init.normal_(net2.wh1.weight, std=0.1)
+    torch.nn.init.normal_(net2.wh2.weight, std=0.1)
+    net2.push(0)
+    x2, ids2 = rows_like_the_encoder(rng, rows)
+    phi2 = holdings(rng, rows, rng.integers(0, 2, rows))
+    bel2 = holdings(rng, 2 * rows, np.tile([0.0, 1.0], rows))
+    tx2 = torch.as_tensor(x2)
+    tids2 = torch.as_tensor(ids2, dtype=torch.long)
+    with torch.no_grad():
+        e2 = net2.cards(tx2, tids2)
+        xbel2 = net2.holdings(torch.as_tensor(bel2),
+                              e2.repeat_interleave(2, 0)).reshape(rows, 2 * net2.dg).numpy()
+        allphi2 = np.concatenate([bel2.reshape(rows, 2, -1),
+                                  phi2.reshape(rows, 1, -1)], 1).reshape(3 * rows, -1)
+        w2 = np.tile([1.0, 1.0, 0.0], rows).astype(np.float32)
+        seg2 = np.repeat(np.arange(rows), 3) * 2 + np.tile([0, 1, 0], rows)
+        inv2 = torch.arange(len(allphi2))
+        ref2 = net2(tx2, tids2, torch.as_tensor(allphi2), inv2, torch.as_tensor(w2),
+                    torch.as_tensor(seg2), 2 * rows).numpy()[2::3]
+    got2 = np.asarray(W.infer(
+        np.ascontiguousarray(x2.ravel()),
+        np.ascontiguousarray(xbel2.ravel()),
+        np.ascontiguousarray(phi2.ravel()),
+        np.ascontiguousarray(ids2.ravel()),
+        rows, 0), np.float32)
+    err2 = float(np.abs(ref2 - got2).max())
+    assert err2 < 2e-4, f"HEAD PARITY FAILURE (head!=hidden): max |torch - rust| = {err2:.3e}"
+    print(f"head-parity ok (head 128 != hidden 256): max |torch - rust| = {err2:.3e}")
 
 
 if __name__ == "__main__":

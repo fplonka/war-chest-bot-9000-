@@ -169,8 +169,12 @@ solves.
 ## 5. The networks
 
 `train/value_net.py` defines them; `engine/src/net.rs` runs them. `dims` is
-`[pub, hidden, cfeat, dg, rank, afeat]` and is the single source of truth for
-every buffer size. `Mlp.flat()` produces the flat arrays both `set_weights` and
+`[pub, hidden, head, cfeat, dg, rank, afeat, de, dc, enc]` and is the single
+source of truth for every buffer size — `head` is the width of the second
+public matrix, the belief projection, the second LayerNorm and both readouts
+(`head == hidden` is the pre-split network), and `enc` names the board
+encoder (0 = flat; the hex-neighbour candidate is Python-only until a screen
+picks it). `Mlp.flat()` produces the flat arrays both `set_weights` and
 `export_weights.py` ship, so there is one place for Python and Rust to agree, and
 `train/test_parity.py` checks it.
 
@@ -181,7 +185,7 @@ per player — is summarised by its 25 rulebook facts, and everything that refer
 to a card refers to a coin-type index into that table:
 
 ```text
-  e = relu(card facts Wd0 + bd0) Wd1 + bd1                   [NTYPE, de]
+  e = relu(card facts Wd0 + bd0) Wd1 + bd1 + id_emb(unit)    [NTYPE, de]
 ```
 
 Built once per solve: the draft is fixed for the game. The hex block, the pile
@@ -207,12 +211,13 @@ indexed by the config: `v̂(PBS, c) -> scalar`.
 
 ```text
   holding tower: z(c) = sum_k relu([counts_k, seat, e_k] Wc + bc)   [dg]
+                 z(c) += relu(z Wh1 + bh1) Wh2 + bh2  (residual; Wh2 starts 0)
                  g(c) = z(c) Wg + bg                                [rank + 1]
 
   trunk input:   x    = [hex facts | e of each occupant | pile summary | loose]
-  PBS tower:     hpub = relu(LN(x W0 + b0)) W1
+  PBS tower:     hpub = relu(LN(x W0 + b0)) W1               [head]
                  b_p  = sum_c beta_p(c) z(c)                 [dg] per player
-                 h    = relu(LN(hpub + [b_0; b_1] Wb + b1))  [hidden]
+                 h    = relu(LN(hpub + [b_0; b_1] Wb + b1))  [head]
                  u    = h Wu + bu                            [rank]
 
   value:         v(c) = <u, g(c)[..rank]> + g(c)[rank]

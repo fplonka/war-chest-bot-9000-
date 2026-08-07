@@ -831,14 +831,17 @@ fn f32_to_f16(x: f32) -> u16 {
         };
         return (sign as u32 | round) as u16;
     }
-    let half = (man >> 13) as u16;
+    // Round-to-nearest-even; when the mantissa carries into the exponent the
+    // f16 value must become the next binade, not wrap to a subnormal.
+    let mut half = (man >> 13) as u32;
     let rem = man & 0x1fff;
-    let round = if rem > 0x1000 || (rem == 0x1000 && (half & 1) == 1) {
-        half + 1
-    } else {
-        half
-    };
-    (sign as u32 | ((e as u32) << 10) | round as u32) as u16
+    if rem > 0x1000 || (rem == 0x1000 && (half & 1) == 1) {
+        half += 1;
+        if half == 0x400 {
+            return (sign as u32 | ((e as u32 + 1) << 10)) as u16;
+        }
+    }
+    (sign as u32 | ((e as u32) << 10) | half) as u16
 }
 
 fn fill_aux(data: &mut Data, from_row: usize, tl: &Timeline, z: f32) {

@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use warchest::board::NONE;
 use warchest::rebel::*;
 use warchest::rng::Rng;
-use warchest::search::{action_coin, node_actions, Cfg, Cfr, Nets, Solver};
+use warchest::search::{action_coin, node_actions, snapshot_iters, Cfg, Cfr, Nets, Solver};
 use warchest::selfplay::make_game;
 use warchest::state::{Cont, State, MAX_MAIN_PLAYS, Z_BAG, Z_FACEDOWN, Z_HAND};
 use warchest::units::{
@@ -525,6 +525,28 @@ fn draw_pass_through_consistency() {
         cnt[0], cnt[1], cnt[2], cnt[3], cnt[4]
     );
     assert!(checked >= 4, "only {} draw positions exercised", checked);
+}
+
+/// The kept-iterate list: log-spaced plus the final, always starting at 0
+/// and always containing the last iteration — the exact list the GPU
+/// contract uploads.
+#[test]
+fn snapshot_iterations_are_log_spaced_plus_final() {
+    for iters in [1usize, 2, 8, 64, 512] {
+        let v = snapshot_iters(iters);
+        assert_eq!(v[0], 0, "iter 0 is always kept");
+        assert_eq!(*v.last().unwrap(), iters, "the final iteration is always kept");
+        assert_eq!(v, {
+            let mut w = Vec::new();
+            for t in 0..=iters {
+                if t == 0 || t.is_power_of_two() || t == iters {
+                    w.push(t);
+                }
+            }
+            w
+        });
+        assert!(v.windows(2).all(|x| x[0] < x[1]), "kept iterations are increasing");
+    }
 }
 
 /// A Warrior Priest draw inside a subgame: the private mid-round draw is a

@@ -77,6 +77,21 @@ impl Default for Cfg {
     }
 }
 
+/// The exact iterations the per-iterate average strategy is kept at:
+/// log-spaced early (0, 1, 2, 4, 8, ...) plus the final one. This list is
+/// the runtime metadata of the tree contract — the GPU must not assume
+/// powers of two, and any list including 0 and the final iteration is a
+/// legal request.
+pub fn snapshot_iters(iters: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    for t in 0..=iters {
+        if t == 0 || t.is_power_of_two() || t == iters {
+            out.push(t);
+        }
+    }
+    out
+}
+
 /// Which CFR the solver runs.
 ///
 /// Every variant worth comparing is one formula with four numbers. Discounted
@@ -483,6 +498,9 @@ pub struct Solver<'a> {
     /// average). Drives the log-spaced thinning: the carried beliefs are one
     /// per *kept* iterate, and the spread is in the early ones.
     snap_t: usize,
+    /// The kept iteration numbers (`snapshot_iters`); the GPU contract
+    /// uploads this list verbatim.
+    snap_list: Vec<usize>,
     /// Total strategy cells (sum over decision nodes of `nc * na`), so the
     /// snapshot arenas are reserved to size instead of grown.
     ncells: usize,
@@ -613,6 +631,7 @@ impl<'a> Solver<'a> {
             avg: Vec::new(),
             snaps: take_snaps(),
             snap_t: 0,
+            snap_list: snapshot_iters(cfg.iters),
             ncells: 0,
             reach: Vec::new(),
             roff: Vec::new(),
@@ -743,7 +762,7 @@ impl<'a> Solver<'a> {
         }
         let t = self.snap_t;
         self.snap_t += 1;
-        if t != 0 && !t.is_power_of_two() && t < self.cfg.iters {
+        if !self.snap_list.contains(&t) {
             return;
         }
         let mut snap = Vec::with_capacity(self.ncells);
@@ -1963,10 +1982,16 @@ impl<'a> Solver<'a> {
         }
     }
 
-    /// How many per-iterate snapshots the solve kept (the log-spaced set plus
-    /// the final reference). Part of the tree-size contract.
+    /// How many per-iterate snapshots the solve kept. Part of the tree-size
+    /// contract.
     pub fn snapshot_count(&self) -> usize {
         self.snaps.len()
+    }
+
+    /// The exact kept iteration numbers, in order — the contract's
+    /// `snap_iters` array.
+    pub fn snapshot_iterations(&self) -> &[usize] {
+        &self.snap_list
     }
 
     /// The CFR average strategy: the approximate equilibrium of the subgame.
