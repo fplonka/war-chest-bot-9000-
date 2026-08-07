@@ -383,6 +383,7 @@ name = "warchest-engine"
 version = "0.1.0"
 dependencies = [
  "cudarc",
+ "matrixmultiply",
  "numpy",
  "pyo3",
  "rayon",

@@ -118,24 +118,19 @@ fn gemm_ld(
             ldc as i32,
         );
     }
+    // Everywhere else: matrixmultiply, a portable single-threaded GEMM with
+    // SIMD kernels. Single-threaded is correct here — the workers already run
+    // one game per core, so a threaded BLAS would fight them for cores.
     #[cfg(not(target_vendor = "apple"))]
-    {
-        for i in 0..m {
-            if beta == 0.0 {
-                for j in 0..n {
-                    c[i * ldc + j] = 0.0;
-                }
-            }
-            for p in 0..k {
-                let av = a[i * lda + p];
-                if av == 0.0 {
-                    continue;
-                }
-                for j in 0..n {
-                    c[i * ldc + j] += av * b[p * ldb + j];
-                }
-            }
-        }
+    // SAFETY: the debug_asserts above are the exact bounds sgemm reads.
+    unsafe {
+        matrixmultiply::sgemm(
+            m, k, n, 1.0,
+            a.as_ptr(), lda as isize, 1,
+            b.as_ptr(), ldb as isize, 1,
+            beta,
+            c.as_mut_ptr(), ldc as isize, 1,
+        );
     }
 }
 
@@ -158,11 +153,18 @@ fn gemm_nt(m: usize, n: usize, k: usize, a: &[f32], lda: usize, b: &[f32], ldb: 
         cblas_sgemm(101, 111, 112, m as i32, n as i32, k as i32, 1.0, a.as_ptr(), lda as i32,
                     b.as_ptr(), ldb as i32, 0.0, c.as_mut_ptr(), ldc as i32);
     }
+    // The transposed operand is a stride swap: B[n x k] row-major read as
+    // B^T[k x n] has row stride 1 and column stride ldb.
     #[cfg(not(target_vendor = "apple"))]
-    for i in 0..m {
-        for j in 0..n {
-            c[i * ldc + j] = dot(&a[i * lda..i * lda + k], &b[j * ldb..j * ldb + k]);
-        }
+    // SAFETY: the debug_asserts above are the exact bounds sgemm reads.
+    unsafe {
+        matrixmultiply::sgemm(
+            m, k, n, 1.0,
+            a.as_ptr(), lda as isize, 1,
+            b.as_ptr(), 1, ldb as isize,
+            0.0,
+            c.as_mut_ptr(), ldc as isize, 1,
+        );
     }
 }
 
@@ -1274,4 +1276,53 @@ pub const fn hfeat(de: usize) -> usize {
 /// scalars.
 const fn xdim_of(de: usize) -> usize {
     N_HEXES * (HEX_FACTS + de) + 2 * de + LOOSE
+}
+
+#[cfg(test)]
+mod gemm_tests {
+    use super::*;
+
+    /// Scalar reference for both GEMM shapes. The production path is a real
+    /// GEMM backend (Accelerate on Apple, matrixmultiply elsewhere); this pins
+    /// it to the naive definition on every platform.
+    fn reference(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], bt: bool, beta: f32,
+                 c: &mut [f32]) {
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = if beta == 0.0 { 0.0 } else { c[i * n + j] };
+                for p in 0..k {
+                    let bv = if bt { b[j * k + p] } else { b[p * n + j] };
+                    s += a[i * k + p] * bv;
+                }
+                c[i * n + j] = s;
+            }
+        }
+    }
+
+    fn filled(n: usize, seed: u64) -> Vec<f32> {
+        let mut rng = crate::rng::Rng::new(seed);
+        (0..n).map(|_| (rng.next_u64() % 2000) as f32 / 1000.0 - 1.0).collect()
+    }
+
+    #[test]
+    fn gemm_matches_reference() {
+        for &(m, n, k) in &[(1, 1, 1), (3, 5, 7), (17, 64, 33), (40, 96, 128)] {
+            let (a, b) = (filled(m * k, 1), filled(k * n, 2));
+            let mut c = filled(m * n, 3);
+            let mut want = c.clone();
+            gemm_ld(m, n, k, &a, k, &b, n, 1.0, &mut c, n);
+            reference(m, n, k, &a, &b, false, 1.0, &mut want);
+            for (x, y) in c.iter().zip(&want) {
+                assert!((x - y).abs() < 1e-3, "gemm_ld {m}x{n}x{k}: {x} vs {y}");
+            }
+
+            let bt = filled(n * k, 4);
+            let (mut ct, mut wt) = (vec![0.0; m * n], vec![0.0; m * n]);
+            gemm_nt(m, n, k, &a, k, &bt, k, &mut ct, n);
+            reference(m, n, k, &a, &bt, true, 0.0, &mut wt);
+            for (x, y) in ct.iter().zip(&wt) {
+                assert!((x - y).abs() < 1e-3, "gemm_nt {m}x{n}x{k}: {x} vs {y}");
+            }
+        }
+    }
 }

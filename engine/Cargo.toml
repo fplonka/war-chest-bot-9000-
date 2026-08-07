@@ -14,6 +14,7 @@ crate-type = ["cdylib", "rlib"]
 pyo3 = { version = "0.21", features = ["abi3-py39", "extension-module"], optional = true }
 numpy = { version = "0.21", optional = true }
 rayon = "1.10"
+matrixmultiply = "0.3"
 cudarc = { version = "0.17", optional = true, default-features = false, features = ["cuda-12000", "dynamic-loading", "driver", "nvrtc", "cublas"] }
 
 [features]
