@@ -21,3 +21,185 @@
 [t= 427.0s] rebel  ep 17 games=  48 dec=  9159 rows= 34546 cap=0.42 cfgs=  8.6 L=0.01538 P=nan old=0.00907 new=0.00962 tgt=-0.004/0.427 pstd=0.376 capv=0.040 lr=1.0e-03 gen=120.8s train=2.2s
 [t= 457.9s] rebel  ep 18 games=  48 dec=  8294 rows= 31016 cap=0.29 cfgs=  7.4 L=0.01061 P=nan old=0.00777 new=0.00643 tgt=+0.070/0.372 pstd=0.348 capv=0.039 lr=1.0e-03 gen=28.8s train=1.8s
 [t= 506.7s] rebel  ep 19 games=  48 dec=  7990 rows= 29712 cap=0.25 cfgs=  7.5 L=0.01046 P=nan old=0.00755 new=0.00904 tgt=+0.034/0.332 pstd=0.329 capv=0.039 lr=1.0e-03 gen=46.7s train=1.8s
+[t= 627.7s] rebel  ep 20 games=  48 dec=  7432 rows= 26928 cap=0.21 cfgs=  9.5 L=0.01034 P=nan old=0.00903 new=0.00772 tgt=-0.015/0.351 pstd=0.310 capv=0.039 lr=1.0e-03 gen=119.0s train=1.6s
+[t= 756.9s] --- snapshot snap_01.pt (s1) ---
+[t= 756.9s] rebel  ep 21 games=  48 dec=  8089 rows= 29791 cap=0.27 cfgs=  8.5 L=0.00958 P=nan old=0.00738 new=0.00702 tgt=+0.005/0.361 pstd=0.315 capv=0.038 lr=1.0e-03 gen=127.2s train=1.8s
+[t= 792.3s] rebel  ep 22 games=  48 dec=  7212 rows= 26640 cap=0.17 cfgs= 11.1 L=0.01067 P=nan old=0.00716 new=0.00943 tgt=+0.024/0.346 pstd=0.315 capv=0.037 lr=1.0e-03 gen=33.3s train=1.7s
+[t= 854.3s] rebel  ep 23 games=  48 dec=  7107 rows= 25952 cap=0.15 cfgs= 11.0 L=0.01035 P=nan old=0.00799 new=0.00868 tgt=+0.046/0.344 pstd=0.311 capv=0.037 lr=1.0e-03 gen=59.9s train=1.8s
+[t= 927.1s] rebel  ep 24 games=  48 dec=  6758 rows= 24924 cap=0.15 cfgs=  9.2 L=0.00985 P=nan old=0.00839 new=0.00877 tgt=+0.071/0.284 pstd=0.299 capv=0.037 lr=1.0e-03 gen=71.0s train=1.5s
+[t=1079.7s] rebel  ep 25 games=  48 dec=  7365 rows= 26710 cap=0.15 cfgs=  9.3 L=0.00998 P=nan old=0.00783 new=0.00907 tgt=+0.034/0.319 pstd=0.293 capv=0.036 lr=1.0e-03 gen=150.6s train=1.6s
+[t=1228.7s] --- snapshot snap_02.pt (s2) ---
+[t=1228.7s] rebel  ep 26 games=  48 dec=  6519 rows= 23962 cap=0.15 cfgs=  9.5 L=0.00927 P=nan old=0.00790 new=0.00817 tgt=+0.031/0.328 pstd=0.297 capv=0.035 lr=1.0e-03 gen=147.1s train=1.5s
+[t=1405.5s] rebel  ep 27 games=  48 dec=  6990 rows= 25364 cap=0.10 cfgs= 10.1 L=0.00987 P=nan old=0.00700 new=0.01034 tgt=+0.053/0.346 pstd=0.295 capv=0.034 lr=1.0e-03 gen=174.9s train=1.6s
+[t=1506.9s] rebel  ep 28 games=  48 dec=  6524 rows= 23548 cap=0.08 cfgs= 10.0 L=0.00915 P=nan old=0.00827 new=0.00943 tgt=+0.050/0.320 pstd=0.292 capv=0.033 lr=1.0e-03 gen=99.6s train=1.5s
+[t=1554.9s] rebel  ep 29 games=  48 dec=  6054 rows= 22033 cap=0.06 cfgs= 10.2 L=0.00991 P=nan old=0.01093 new=0.00818 tgt=+0.045/0.322 pstd=0.294 capv=0.032 lr=1.0e-03 gen=46.2s train=1.4s
+[t=1671.1s] --- snapshot snap_03.pt (s3) ---
+[t=1671.1s] rebel  ep 30 games=  48 dec=  6053 rows= 21982 cap=0.10 cfgs= 10.8 L=0.00944 P=nan old=0.00848 new=0.00871 tgt=+0.049/0.361 pstd=0.301 capv=0.032 lr=1.0e-03 gen=114.4s train=1.5s
+[t=1724.8s] rebel  ep 31 games=  48 dec=  6335 rows= 23401 cap=0.08 cfgs= 11.6 L=0.01013 P=nan old=0.00669 new=0.00723 tgt=+0.058/0.327 pstd=0.296 capv=0.031 lr=1.0e-03 gen=51.8s train=1.6s
+[t=1776.2s] rebel  ep 32 games=  48 dec=  6345 rows= 23250 cap=0.12 cfgs= 10.9 L=0.00995 P=nan old=0.00726 new=0.00960 tgt=+0.038/0.335 pstd=0.299 capv=0.031 lr=1.0e-03 gen=49.4s train=1.6s
+[t=1829.1s] rebel  ep 33 games=  48 dec=  6495 rows= 23664 cap=0.10 cfgs= 12.3 L=0.01032 P=nan old=0.00720 new=0.00820 tgt=+0.060/0.329 pstd=0.298 capv=0.031 lr=1.0e-03 gen=50.9s train=1.7s
+[t=1916.0s] rebel  ep 34 games=  48 dec=  5464 rows= 19873 cap=0.02 cfgs= 11.0 L=0.01024 P=nan old=0.00853 new=0.01289 tgt=+0.064/0.305 pstd=0.291 capv=0.030 lr=1.0e-03 gen=85.3s train=1.4s
+[t=1962.3s] rebel  ep 35 games=  48 dec=  6634 rows= 24664 cap=0.19 cfgs= 11.2 L=0.01022 P=nan old=0.00889 new=0.00961 tgt=+0.083/0.325 pstd=0.290 capv=0.030 lr=1.0e-03 gen=44.3s train=1.6s
+[t=2105.0s] --- snapshot snap_04.pt (s4) ---
+[t=2105.0s] rebel  ep 36 games=  48 dec=  6175 rows= 22611 cap=0.08 cfgs= 12.9 L=0.01055 P=nan old=0.00700 new=0.01038 tgt=+0.065/0.311 pstd=0.300 capv=0.030 lr=1.0e-03 gen=140.9s train=1.5s
+[t=2223.7s] rebel  ep 37 games=  48 dec=  5829 rows= 21076 cap=0.00 cfgs= 12.7 L=0.01054 P=nan old=0.00829 new=0.00996 tgt=+0.061/0.297 pstd=0.295 capv=0.029 lr=1.0e-03 gen=117.0s train=1.4s
+[t=2397.6s] rebel  ep 38 games=  48 dec=  6440 rows= 23080 cap=0.04 cfgs= 13.0 L=0.00995 P=nan old=0.00730 new=0.00752 tgt=+0.066/0.312 pstd=0.299 capv=0.028 lr=1.0e-03 gen=172.1s train=1.5s
+[t=2490.8s] --- snapshot snap_05.pt (s5) ---
+[t=2490.8s] rebel  ep 39 games=  48 dec=  5800 rows= 20869 cap=0.06 cfgs= 11.9 L=0.01037 P=nan old=0.01025 new=0.00891 tgt=+0.073/0.344 pstd=0.285 capv=0.027 lr=1.0e-03 gen=91.5s train=1.4s
+[t=2713.7s] rebel  ep 40 games=  48 dec=  5899 rows= 21075 cap=0.06 cfgs= 12.4 L=0.01099 P=nan old=0.00910 new=0.01051 tgt=+0.067/0.302 pstd=0.296 capv=0.026 lr=1.0e-03 gen=221.1s train=1.4s
+[t=2896.5s] --- snapshot snap_06.pt (s6) ---
+[t=2896.5s] rebel  ep 41 games=  48 dec=  6186 rows= 22351 cap=0.08 cfgs= 12.6 L=0.01070 P=nan old=0.00968 new=0.01201 tgt=+0.048/0.329 pstd=0.288 capv=0.025 lr=1.0e-03 gen=180.9s train=1.5s
+[t=2968.4s] rebel  ep 42 games=  48 dec=  6181 rows= 22274 cap=0.06 cfgs= 13.3 L=0.01042 P=nan old=0.00962 new=0.00706 tgt=+0.047/0.307 pstd=0.293 capv=0.024 lr=1.0e-03 gen=70.0s train=1.6s
+[t=3088.5s] rebel  ep 43 games=  48 dec=  6216 rows= 22377 cap=0.12 cfgs= 12.5 L=0.01063 P=nan old=0.00842 new=0.00940 tgt=+0.045/0.351 pstd=0.290 capv=0.023 lr=1.0e-03 gen=118.2s train=1.6s
+[t=3281.3s] --- snapshot snap_07.pt (s7) ---
+[t=3281.3s] rebel  ep 44 games=  48 dec=  5990 rows= 21266 cap=0.06 cfgs= 12.8 L=0.01009 P=nan old=0.00944 new=0.01106 tgt=+0.043/0.310 pstd=0.292 capv=0.022 lr=1.0e-03 gen=190.9s train=1.5s
+[t=3318.6s] rebel  ep 45 games=  48 dec=  6819 rows= 25272 cap=0.17 cfgs= 12.0 L=0.00985 P=nan old=0.00763 new=0.00892 tgt=+0.078/0.309 pstd=0.290 capv=0.021 lr=1.0e-03 gen=35.1s train=1.8s
+[t=3428.0s] rebel  ep 46 games=  48 dec=  6473 rows= 23404 cap=0.15 cfgs= 11.7 L=0.00990 P=nan old=0.01237 new=0.00966 tgt=+0.059/0.305 pstd=0.283 capv=0.021 lr=1.0e-03 gen=107.3s train=1.7s
+[t=3548.2s] rebel  ep 47 games=  48 dec=  6001 rows= 21605 cap=0.10 cfgs= 13.1 L=0.00975 P=nan old=0.00941 new=0.00745 tgt=+0.067/0.318 pstd=0.281 capv=0.020 lr=1.0e-03 gen=118.4s train=1.5s
+[t=3627.5s] rebel  ep 48 games=  48 dec=  5729 rows= 20867 cap=0.08 cfgs= 12.6 L=0.00949 P=nan old=0.00779 new=0.00848 tgt=+0.069/0.316 pstd=0.278 capv=0.020 lr=1.0e-03 gen=77.6s train=1.5s
+[t=3716.8s] --- snapshot snap_08.pt (s8) ---
+[t=3716.8s] rebel  ep 49 games=  48 dec=  5862 rows= 21243 cap=0.08 cfgs= 13.5 L=0.00985 P=nan old=0.01126 new=0.00835 tgt=+0.086/0.323 pstd=0.287 capv=0.019 lr=1.0e-03 gen=87.3s train=1.6s
+[t=3826.7s] rebel  ep 50 games=  48 dec=  5700 rows= 20285 cap=0.06 cfgs= 15.1 L=0.00997 P=nan old=0.00849 new=0.00881 tgt=+0.072/0.306 pstd=0.286 capv=0.019 lr=1.0e-03 gen=108.1s train=1.4s
+[t=3927.6s] rebel  ep 51 games=  48 dec=  5682 rows= 20747 cap=0.08 cfgs= 14.2 L=0.00979 P=nan old=0.00967 new=0.00961 tgt=+0.048/0.377 pstd=0.282 capv=0.018 lr=1.0e-03 gen=99.1s train=1.5s
+[t=4013.0s] rebel  ep 52 games=  48 dec=  5699 rows= 20625 cap=0.06 cfgs= 12.6 L=0.00986 P=nan old=0.00761 new=0.00982 tgt=+0.073/0.332 pstd=0.280 capv=0.017 lr=1.0e-03 gen=83.6s train=1.4s
+[t=4104.7s] --- snapshot snap_09.pt (s9) ---
+[t=4104.7s] rebel  ep 53 games=  48 dec=  5595 rows= 20352 cap=0.02 cfgs= 12.9 L=0.01009 P=nan old=0.00871 new=0.01136 tgt=+0.075/0.328 pstd=0.286 capv=0.017 lr=1.0e-03 gen=89.9s train=1.5s
+[t=4152.9s] rebel  ep 54 games=  48 dec=  6483 rows= 23672 cap=0.15 cfgs= 11.5 L=0.01023 P=nan old=0.00972 new=0.01302 tgt=+0.087/0.338 pstd=0.291 capv=0.016 lr=1.0e-03 gen=46.2s train=1.7s
+[t=4239.9s] rebel  ep 55 games=  48 dec=  6456 rows= 23536 cap=0.15 cfgs= 12.5 L=0.01068 P=nan old=0.00676 new=0.00773 tgt=+0.093/0.324 pstd=0.277 capv=0.016 lr=1.0e-03 gen=84.9s train=1.7s
+[t=4335.2s] rebel  ep 56 games=  48 dec=  6193 rows= 22587 cap=0.08 cfgs= 13.4 L=0.01063 P=nan old=0.01031 new=0.01432 tgt=+0.058/0.316 pstd=0.290 capv=0.015 lr=1.0e-03 gen=93.3s train=1.6s
+[t=4386.4s] rebel  ep 57 games=  48 dec=  6197 rows= 22664 cap=0.10 cfgs= 12.8 L=0.01057 P=nan old=0.00948 new=0.01120 tgt=+0.055/0.308 pstd=0.284 capv=0.015 lr=1.0e-03 gen=49.2s train=1.7s
+[t=4520.1s] --- snapshot snap_10.pt (s10) ---
+[t=4520.1s] rebel  ep 58 games=  48 dec=  6021 rows= 21829 cap=0.04 cfgs= 13.8 L=0.01070 P=nan old=0.00808 new=0.00879 tgt=+0.059/0.312 pstd=0.282 capv=0.014 lr=1.0e-03 gen=131.8s train=1.6s
+[t=4645.5s] rebel  ep 59 games=  48 dec=  4982 rows= 17757 cap=0.00 cfgs= 14.1 L=0.01079 P=nan old=0.00880 new=0.00955 tgt=+0.081/0.336 pstd=0.289 capv=0.013 lr=1.0e-03 gen=123.7s train=1.3s
+[t=4838.2s] rebel  ep 60 games=  48 dec=  5769 rows= 20512 cap=0.04 cfgs= 11.9 L=0.01056 P=nan old=0.00828 new=0.01127 tgt=+0.081/0.355 pstd=0.287 capv=0.013 lr=1.0e-03 gen=190.9s train=1.5s
+[t=4986.8s] --- snapshot snap_11.pt (s11) ---
+[t=4986.8s] rebel  ep 61 games=  48 dec=  6905 rows= 25282 cap=0.15 cfgs= 13.0 L=0.00986 P=nan old=0.00747 new=0.01013 tgt=+0.090/0.381 pstd=0.283 capv=0.011 lr=1.0e-03 gen=146.3s train=1.9s
+[t=5079.1s] rebel  ep 62 games=  48 dec=  6106 rows= 22121 cap=0.10 cfgs= 15.6 L=0.00982 P=nan old=0.00804 new=0.01121 tgt=+0.070/0.314 pstd=0.281 capv=0.011 lr=1.0e-03 gen=90.4s train=1.5s
+[t=5138.5s] rebel  ep 63 games=  48 dec=  6074 rows= 22232 cap=0.06 cfgs= 11.6 L=0.01071 P=nan old=0.00887 new=0.01002 tgt=+0.062/0.311 pstd=0.280 capv=0.010 lr=1.0e-03 gen=57.5s train=1.6s
+[t=5342.9s] rebel  ep 64 games=  48 dec=  6180 rows= 21910 cap=0.08 cfgs= 14.0 L=0.00940 P=nan old=0.00986 new=0.01051 tgt=+0.039/0.318 pstd=0.276 capv=0.010 lr=1.0e-03 gen=202.5s train=1.6s
+[t=5439.3s] --- snapshot snap_12.pt (s12) ---
+[t=5439.3s] rebel  ep 65 games=  48 dec=  5557 rows= 20059 cap=0.06 cfgs= 13.9 L=0.00989 P=nan old=0.01142 new=0.01156 tgt=+0.070/0.311 pstd=0.281 capv=0.008 lr=1.0e-03 gen=94.6s train=1.5s
+[t=5501.4s] rebel  ep 66 games=  48 dec=  5901 rows= 21632 cap=0.08 cfgs= 14.3 L=0.01055 P=nan old=0.01048 new=0.01031 tgt=+0.062/0.377 pstd=0.287 capv=0.008 lr=1.0e-03 gen=60.1s train=1.6s
+[t=5645.2s] rebel  ep 67 games=  48 dec=  6741 rows= 24521 cap=0.12 cfgs= 11.4 L=0.01038 P=nan old=0.00908 new=0.01115 tgt=+0.089/0.333 pstd=0.274 capv=0.007 lr=1.0e-03 gen=141.8s train=1.7s
+[t=5645.3s] --- lr -> 5.00e-04 ---
+[t=5709.3s] rebel  ep 68 games=  48 dec=  6051 rows= 22121 cap=0.04 cfgs= 14.6 L=0.01011 P=nan old=0.01050 new=0.00877 tgt=+0.028/0.333 pstd=0.285 capv=0.006 lr=5.0e-04 gen=62.1s train=1.6s
+[t=5814.6s] --- snapshot snap_13.pt (s13) ---
+[t=5814.6s] rebel  ep 69 games=  48 dec=  6702 rows= 24206 cap=0.10 cfgs= 13.1 L=0.01063 P=nan old=0.00761 new=0.00934 tgt=+0.118/0.315 pstd=0.288 capv=0.006 lr=5.0e-04 gen=103.2s train=1.8s
+[t=5956.2s] rebel  ep 70 games=  48 dec=  5883 rows= 21217 cap=0.04 cfgs= 14.2 L=0.01044 P=nan old=0.01101 new=0.00925 tgt=+0.065/0.335 pstd=0.289 capv=0.005 lr=5.0e-04 gen=139.6s train=1.6s
+[t=6042.3s] rebel  ep 71 games=  48 dec=  5011 rows= 18521 cap=0.04 cfgs= 12.5 L=0.00982 P=nan old=0.00939 new=0.00965 tgt=+0.083/0.323 pstd=0.278 capv=0.004 lr=5.0e-04 gen=84.5s train=1.3s
+[t=6144.6s] rebel  ep 72 games=  48 dec=  5765 rows= 21123 cap=0.06 cfgs= 13.5 L=0.01021 P=nan old=0.00998 new=0.01014 tgt=+0.052/0.377 pstd=0.282 capv=0.004 lr=5.0e-04 gen=100.6s train=1.5s
+[t=6278.7s] --- snapshot snap_14.pt (s14) ---
+[t=6278.7s] rebel  ep 73 games=  48 dec=  6119 rows= 21800 cap=0.06 cfgs= 14.6 L=0.00977 P=nan old=0.00964 new=0.00761 tgt=+0.086/0.309 pstd=0.280 capv=0.003 lr=5.0e-04 gen=132.1s train=1.6s
+[t=6414.9s] rebel  ep 74 games=  48 dec=  6256 rows= 22063 cap=0.08 cfgs= 12.5 L=0.01048 P=nan old=0.00667 new=0.01101 tgt=+0.075/0.341 pstd=0.278 capv=0.002 lr=5.0e-04 gen=134.3s train=1.6s
+[t=6551.5s] rebel  ep 75 games=  48 dec=  5770 rows= 20216 cap=0.08 cfgs= 13.6 L=0.01070 P=nan old=0.00777 new=0.00954 tgt=+0.061/0.341 pstd=0.283 capv=0.002 lr=5.0e-04 gen=134.8s train=1.4s
+[t=6793.8s] --- snapshot snap_15.pt (s15) ---
+[t=6793.8s] rebel  ep 76 games=  48 dec=  5360 rows= 18782 cap=0.02 cfgs= 14.7 L=0.01036 P=nan old=0.01054 new=0.00679 tgt=+0.093/0.330 pstd=0.281 capv=0.001 lr=5.0e-04 gen=240.6s train=1.4s
+[t=6937.5s] rebel  ep 77 games=  48 dec=  5699 rows= 20567 cap=0.06 cfgs= 13.7 L=0.00991 P=nan old=0.00899 new=0.00834 tgt=+0.055/0.330 pstd=0.286 capv=0.000 lr=5.0e-04 gen=141.8s train=1.5s
+[t=7045.6s] rebel  ep 78 games=  48 dec=  5546 rows= 19994 cap=0.04 cfgs= 13.5 L=0.00995 P=nan old=0.00947 new=0.00751 tgt=+0.068/0.292 pstd=0.284 capv=0.000 lr=5.0e-04 gen=106.2s train=1.5s
+[t=7116.2s] rebel  ep 79 games=  48 dec=  6223 rows= 22848 cap=0.08 cfgs= 14.7 L=0.01008 P=nan old=0.00950 new=0.00978 tgt=+0.107/0.340 pstd=0.283 capv=0.000 lr=5.0e-04 gen=68.6s train=1.6s
+[t=7235.6s] --- snapshot snap_16.pt (s16) ---
+[t=7235.7s] rebel  ep 80 games=  48 dec=  6691 rows= 24598 cap=0.12 cfgs= 13.4 L=0.01043 P=nan old=0.00931 new=0.00846 tgt=+0.089/0.310 pstd=0.284 capv=0.000 lr=5.0e-04 gen=117.4s train=1.7s
+[t=7446.4s] rebel  ep 81 games=  48 dec=  6855 rows= 24521 cap=0.12 cfgs= 12.9 L=0.01063 P=nan old=0.01134 new=0.00951 tgt=+0.054/0.310 pstd=0.282 capv=0.000 lr=5.0e-04 gen=208.6s train=1.8s
+[t=7545.8s] rebel  ep 82 games=  48 dec=  6263 rows= 23075 cap=0.12 cfgs= 12.8 L=0.01062 P=nan old=0.00697 new=0.00916 tgt=+0.067/0.335 pstd=0.287 capv=0.000 lr=5.0e-04 gen=97.5s train=1.6s
+[t=7700.5s] --- snapshot snap_17.pt (s17) ---
+[t=7700.5s] rebel  ep 83 games=  48 dec=  5435 rows= 19198 cap=0.02 cfgs= 14.3 L=0.01071 P=nan old=0.00976 new=0.01228 tgt=+0.054/0.341 pstd=0.284 capv=0.000 lr=5.0e-04 gen=152.8s train=1.5s
+[t=7778.2s] rebel  ep 84 games=  48 dec=  5363 rows= 19506 cap=0.02 cfgs= 12.9 L=0.01015 P=nan old=0.00801 new=0.00806 tgt=+0.061/0.314 pstd=0.287 capv=0.000 lr=5.0e-04 gen=76.0s train=1.4s
+[t=7829.0s] rebel  ep 85 games=  48 dec=  5941 rows= 21490 cap=0.04 cfgs= 14.9 L=0.01059 P=nan old=0.01173 new=0.01098 tgt=+0.027/0.338 pstd=0.288 capv=0.000 lr=5.0e-04 gen=48.8s train=1.6s
+[t=7885.7s] rebel  ep 86 games=  48 dec=  5521 rows= 20017 cap=0.02 cfgs= 13.9 L=0.00948 P=nan old=0.00884 new=0.01141 tgt=+0.054/0.317 pstd=0.276 capv=0.000 lr=5.0e-04 gen=54.8s train=1.5s
+[t=7934.2s] rebel  ep 87 games=  48 dec=  6645 rows= 24288 cap=0.12 cfgs= 12.0 L=0.00969 P=nan old=0.00940 new=0.01415 tgt=+0.105/0.327 pstd=0.281 capv=0.000 lr=5.0e-04 gen=46.4s train=1.7s
+[t=8046.9s] rebel  ep 88 games=  48 dec=  5841 rows= 21017 cap=0.04 cfgs= 13.7 L=0.01019 P=nan old=0.00948 new=0.01049 tgt=+0.045/0.341 pstd=0.282 capv=0.000 lr=5.0e-04 gen=111.0s train=1.4s
+[t=8170.8s] --- snapshot snap_18.pt (s18) ---
+[t=8170.8s] rebel  ep 89 games=  48 dec=  5818 rows= 21022 cap=0.10 cfgs= 12.8 L=0.01070 P=nan old=0.00745 new=0.01007 tgt=+0.037/0.334 pstd=0.279 capv=0.000 lr=5.0e-04 gen=122.0s train=1.5s
+[t=8297.5s] rebel  ep 90 games=  48 dec=  5409 rows= 19357 cap=0.08 cfgs= 14.6 L=0.01002 P=nan old=0.00913 new=0.01032 tgt=+0.025/0.384 pstd=0.283 capv=0.000 lr=5.0e-04 gen=124.8s train=1.5s
+[t=8419.8s] rebel  ep 91 games=  48 dec=  5557 rows= 20046 cap=0.06 cfgs= 14.2 L=0.01043 P=nan old=0.00908 new=0.01102 tgt=+0.062/0.312 pstd=0.275 capv=0.000 lr=5.0e-04 gen=120.5s train=1.5s
+[t=8532.6s] --- snapshot snap_19.pt (s19) ---
+[t=8532.6s] rebel  ep 92 games=  48 dec=  6220 rows= 22748 cap=0.08 cfgs= 12.6 L=0.01026 P=nan old=0.00921 new=0.00980 tgt=+0.093/0.313 pstd=0.281 capv=0.000 lr=5.0e-04 gen=110.8s train=1.6s
+[t=8610.7s] rebel  ep 93 games=  48 dec=  5749 rows= 20848 cap=0.04 cfgs= 14.2 L=0.00979 P=nan old=0.00721 new=0.01033 tgt=+0.053/0.329 pstd=0.284 capv=0.000 lr=5.0e-04 gen=76.2s train=1.5s
+[t=8685.4s] rebel  ep 94 games=  48 dec=  6128 rows= 22179 cap=0.10 cfgs= 11.9 L=0.01059 P=nan old=0.00945 new=0.00832 tgt=+0.063/0.367 pstd=0.283 capv=0.000 lr=5.0e-04 gen=72.7s train=1.6s
+[t=8742.2s] rebel  ep 95 games=  48 dec=  6536 rows= 23905 cap=0.08 cfgs= 12.5 L=0.00999 P=nan old=0.00978 new=0.00969 tgt=+0.068/0.336 pstd=0.278 capv=0.000 lr=5.0e-04 gen=54.7s train=1.8s
+[t=8979.1s] --- snapshot snap_20.pt (s20) ---
+[t=8979.1s] rebel  ep 96 games=  48 dec=  6011 rows= 21606 cap=0.06 cfgs= 14.6 L=0.01031 P=nan old=0.00912 new=0.01008 tgt=+0.074/0.351 pstd=0.280 capv=0.000 lr=5.0e-04 gen=235.0s train=1.6s
+[t=9017.9s] rebel  ep 97 games=  48 dec=  6233 rows= 22816 cap=0.12 cfgs= 12.4 L=0.01012 P=nan old=0.00885 new=0.01053 tgt=+0.060/0.342 pstd=0.276 capv=0.000 lr=5.0e-04 gen=36.7s train=1.7s
+[t=9065.0s] rebel  ep 98 games=  48 dec=  5459 rows= 19976 cap=0.02 cfgs= 14.8 L=0.01078 P=nan old=0.01074 new=0.00982 tgt=+0.062/0.312 pstd=0.279 capv=0.000 lr=5.0e-04 gen=45.3s train=1.5s
+[t=9119.2s] rebel  ep 99 games=  48 dec=  6105 rows= 22240 cap=0.12 cfgs= 14.0 L=0.01026 P=nan old=0.00813 new=0.01047 tgt=+0.071/0.321 pstd=0.279 capv=0.000 lr=5.0e-04 gen=52.2s train=1.7s
+[t=9184.9s] rebel  ep100 games=  48 dec=  6133 rows= 22104 cap=0.08 cfgs= 13.5 L=0.01052 P=nan old=0.01097 new=0.01071 tgt=+0.047/0.295 pstd=0.277 capv=0.000 lr=5.0e-04 gen=63.7s train=1.6s
+[t=9259.2s] rebel  ep101 games=  48 dec=  5541 rows= 20144 cap=0.08 cfgs= 14.6 L=0.00991 P=nan old=0.00877 new=0.00889 tgt=+0.005/0.403 pstd=0.281 capv=0.000 lr=5.0e-04 gen=72.5s train=1.4s
+[t=9321.2s] rebel  ep102 games=  48 dec=  6020 rows= 21760 cap=0.10 cfgs= 11.4 L=0.01126 P=nan old=0.01021 new=0.00934 tgt=+0.068/0.322 pstd=0.286 capv=0.000 lr=5.0e-04 gen=60.2s train=1.6s
+[t=9417.6s] --- snapshot snap_21.pt (s21) ---
+[t=9417.6s] rebel  ep103 games=  48 dec=  5841 rows= 21233 cap=0.06 cfgs= 12.7 L=0.00955 P=nan old=0.00896 new=0.01052 tgt=+0.034/0.332 pstd=0.278 capv=0.000 lr=5.0e-04 gen=94.4s train=1.6s
+[t=9555.3s] rebel  ep104 games=  48 dec=  5871 rows= 20760 cap=0.06 cfgs= 11.8 L=0.01019 P=nan old=0.01155 new=0.00822 tgt=+0.064/0.309 pstd=0.282 capv=0.000 lr=5.0e-04 gen=135.8s train=1.5s
+[t=9702.0s] rebel  ep105 games=  48 dec=  5864 rows= 20774 cap=0.06 cfgs= 12.1 L=0.01059 P=nan old=0.00992 new=0.00995 tgt=+0.076/0.320 pstd=0.283 capv=0.000 lr=5.0e-04 gen=144.9s train=1.5s
+[t=9895.2s] --- snapshot snap_22.pt (s22) ---
+[t=9895.2s] rebel  ep106 games=  48 dec=  6261 rows= 22369 cap=0.10 cfgs= 14.0 L=0.01038 P=nan old=0.01022 new=0.01049 tgt=+0.062/0.350 pstd=0.283 capv=0.000 lr=5.0e-04 gen=191.2s train=1.7s
+[t=9957.0s] rebel  ep107 games=  48 dec=  5411 rows= 19472 cap=0.04 cfgs= 13.8 L=0.01007 P=nan old=0.00704 new=0.01153 tgt=+0.051/0.330 pstd=0.284 capv=0.000 lr=5.0e-04 gen=59.9s train=1.5s
+[t=10089.9s] rebel  ep108 games=  48 dec=  5838 rows= 20590 cap=0.06 cfgs= 13.4 L=0.00983 P=nan old=0.00780 new=0.01018 tgt=+0.059/0.322 pstd=0.278 capv=0.000 lr=5.0e-04 gen=131.0s train=1.6s
+[t=10171.3s] rebel  ep109 games=  48 dec=  5650 rows= 20273 cap=0.02 cfgs= 13.3 L=0.01071 P=nan old=0.00925 new=0.00896 tgt=+0.077/0.314 pstd=0.273 capv=0.000 lr=5.0e-04 gen=79.6s train=1.5s
+[t=10349.8s] --- snapshot snap_23.pt (s23) ---
+[t=10349.8s] rebel  ep110 games=  48 dec=  5910 rows= 20987 cap=0.08 cfgs= 13.1 L=0.01070 P=nan old=0.01045 new=0.01037 tgt=+0.092/0.324 pstd=0.277 capv=0.000 lr=5.0e-04 gen=176.6s train=1.5s
+[t=10409.5s] rebel  ep111 games=  48 dec=  5426 rows= 19576 cap=0.04 cfgs= 15.3 L=0.01168 P=nan old=0.00870 new=0.00891 tgt=+0.071/0.312 pstd=0.277 capv=0.000 lr=5.0e-04 gen=57.8s train=1.5s
+[t=10478.3s] rebel  ep112 games=  48 dec=  6373 rows= 23304 cap=0.10 cfgs= 12.6 L=0.01055 P=nan old=0.00910 new=0.00871 tgt=+0.072/0.292 pstd=0.278 capv=0.000 lr=5.0e-04 gen=66.7s train=1.8s
+[t=10541.1s] rebel  ep113 games=  48 dec=  6376 rows= 23256 cap=0.10 cfgs= 13.8 L=0.01077 P=nan old=0.00876 new=0.01007 tgt=+0.055/0.312 pstd=0.275 capv=0.000 lr=5.0e-04 gen=60.6s train=1.8s
+[t=10638.0s] rebel  ep114 games=  48 dec=  5805 rows= 21138 cap=0.10 cfgs= 13.3 L=0.01045 P=nan old=0.00855 new=0.00858 tgt=+0.055/0.335 pstd=0.281 capv=0.000 lr=5.0e-04 gen=95.1s train=1.5s
+[t=10780.6s] --- snapshot snap_24.pt (s24) ---
+[t=10780.6s] rebel  ep115 games=  48 dec=  5515 rows= 20095 cap=0.02 cfgs= 14.3 L=0.01096 P=nan old=0.00949 new=0.00970 tgt=+0.061/0.334 pstd=0.285 capv=0.000 lr=5.0e-04 gen=140.8s train=1.5s
+[t=10863.7s] rebel  ep116 games=  48 dec=  5864 rows= 20963 cap=0.02 cfgs= 14.3 L=0.01091 P=nan old=0.01002 new=0.00919 tgt=+0.066/0.312 pstd=0.282 capv=0.000 lr=5.0e-04 gen=81.2s train=1.5s
+[t=11053.9s] rebel  ep117 games=  48 dec=  6229 rows= 21654 cap=0.06 cfgs= 15.4 L=0.00995 P=nan old=0.00896 new=0.01086 tgt=+0.076/0.352 pstd=0.281 capv=0.000 lr=5.0e-04 gen=188.2s train=1.7s
+[t=11053.9s] --- lr -> 2.50e-04 ---
+[t=11333.5s] --- snapshot snap_25.pt (s25) ---
+[t=11333.5s] rebel  ep118 games=  48 dec=  6325 rows= 22349 cap=0.08 cfgs= 12.8 L=0.01080 P=nan old=0.00871 new=0.01119 tgt=+0.088/0.330 pstd=0.281 capv=0.000 lr=2.5e-04 gen=277.5s train=1.7s
+[t=11531.9s] rebel  ep119 games=  48 dec=  5418 rows= 18918 cap=0.02 cfgs= 15.2 L=0.01095 P=nan old=0.00802 new=0.01097 tgt=+0.053/0.356 pstd=0.283 capv=0.000 lr=2.5e-04 gen=196.6s train=1.4s
+[t=11707.9s] --- snapshot snap_26.pt (s26) ---
+[t=11707.9s] rebel  ep120 games=  48 dec=  6342 rows= 22876 cap=0.12 cfgs= 14.0 L=0.01081 P=nan old=0.01037 new=0.01041 tgt=+0.041/0.364 pstd=0.280 capv=0.000 lr=2.5e-04 gen=174.0s train=1.6s
+[t=11824.1s] rebel  ep121 games=  48 dec=  5584 rows= 20122 cap=0.06 cfgs= 14.6 L=0.01110 P=nan old=0.00915 new=0.00915 tgt=+0.066/0.359 pstd=0.279 capv=0.000 lr=2.5e-04 gen=114.4s train=1.5s
+[t=11951.4s] rebel  ep122 games=  48 dec=  6661 rows= 24131 cap=0.15 cfgs= 12.5 L=0.01076 P=nan old=0.00908 new=0.01083 tgt=+0.078/0.354 pstd=0.279 capv=0.000 lr=2.5e-04 gen=125.0s train=1.9s
+[t=12006.0s] rebel  ep123 games=  48 dec=  5669 rows= 20705 cap=0.06 cfgs= 14.1 L=0.01031 P=nan old=0.00869 new=0.01379 tgt=+0.058/0.358 pstd=0.283 capv=0.000 lr=2.5e-04 gen=52.7s train=1.5s
+[t=12294.7s] --- snapshot snap_27.pt (s27) ---
+[t=12294.7s] rebel  ep124 games=  48 dec=  5707 rows= 20382 cap=0.08 cfgs= 13.8 L=0.01033 P=nan old=0.00985 new=0.01058 tgt=+0.038/0.376 pstd=0.279 capv=0.000 lr=2.5e-04 gen=286.7s train=1.6s
+[t=12421.2s] rebel  ep125 games=  48 dec=  6278 rows= 22651 cap=0.10 cfgs= 12.5 L=0.01099 P=nan old=0.01051 new=0.01199 tgt=+0.097/0.352 pstd=0.281 capv=0.000 lr=2.5e-04 gen=124.5s train=1.6s
+[t=12586.9s] rebel  ep126 games=  48 dec=  6276 rows= 22854 cap=0.10 cfgs= 14.9 L=0.01037 P=nan old=0.01019 new=0.00852 tgt=+0.062/0.361 pstd=0.281 capv=0.000 lr=2.5e-04 gen=163.6s train=1.7s
+[t=12672.8s] --- snapshot snap_28.pt (s28) ---
+[t=12672.8s] rebel  ep127 games=  48 dec=  5404 rows= 19389 cap=0.00 cfgs= 14.5 L=0.01015 P=nan old=0.00861 new=0.01073 tgt=+0.098/0.333 pstd=0.277 capv=0.000 lr=2.5e-04 gen=84.0s train=1.6s
+[t=12731.6s] rebel  ep128 games=  48 dec=  6275 rows= 22896 cap=0.10 cfgs= 11.9 L=0.01022 P=nan old=0.00819 new=0.00956 tgt=+0.089/0.332 pstd=0.281 capv=0.000 lr=2.5e-04 gen=56.6s train=1.7s
+[t=12792.4s] rebel  ep129 games=  48 dec=  6051 rows= 22248 cap=0.04 cfgs= 13.0 L=0.01038 P=nan old=0.01018 new=0.01201 tgt=+0.082/0.367 pstd=0.285 capv=0.000 lr=2.5e-04 gen=58.7s train=1.7s
+[t=12861.7s] rebel  ep130 games=  48 dec=  5591 rows= 20497 cap=0.08 cfgs= 13.6 L=0.01011 P=nan old=0.00844 new=0.01070 tgt=+0.100/0.337 pstd=0.283 capv=0.000 lr=2.5e-04 gen=67.5s train=1.5s
+[t=12999.5s] rebel  ep131 games=  48 dec=  5584 rows= 20123 cap=0.00 cfgs= 13.9 L=0.01051 P=nan old=0.00979 new=0.00944 tgt=+0.074/0.354 pstd=0.279 capv=0.000 lr=2.5e-04 gen=135.8s train=1.6s
+[t=13065.2s] --- snapshot snap_29.pt (s29) ---
+[t=13065.2s] rebel  ep132 games=  48 dec=  5772 rows= 21185 cap=0.10 cfgs= 12.4 L=0.01017 P=nan old=0.00840 new=0.01068 tgt=+0.087/0.305 pstd=0.283 capv=0.000 lr=2.5e-04 gen=63.6s train=1.7s
+[t=13101.9s] rebel  ep133 games=  48 dec=  4985 rows= 18048 cap=0.00 cfgs= 15.0 L=0.01042 P=nan old=0.00945 new=0.00968 tgt=+0.060/0.356 pstd=0.282 capv=0.000 lr=2.5e-04 gen=35.0s train=1.4s
+[t=13306.4s] rebel  ep134 games=  48 dec=  6106 rows= 22170 cap=0.10 cfgs= 13.5 L=0.01031 P=nan old=0.00967 new=0.00954 tgt=+0.092/0.362 pstd=0.282 capv=0.000 lr=2.5e-04 gen=202.4s train=1.7s
+[t=13388.0s] rebel  ep135 games=  48 dec=  5803 rows= 21338 cap=0.04 cfgs= 14.2 L=0.01035 P=nan old=0.01088 new=0.01293 tgt=+0.068/0.332 pstd=0.283 capv=0.000 lr=2.5e-04 gen=79.5s train=1.7s
+[t=13468.2s] --- snapshot snap_30.pt (s30) ---
+[t=13468.2s] rebel  ep136 games=  48 dec=  5004 rows= 17808 cap=0.02 cfgs= 14.9 L=0.01008 P=nan old=0.00823 new=0.00896 tgt=+0.058/0.321 pstd=0.283 capv=0.000 lr=2.5e-04 gen=78.5s train=1.4s
+[t=13529.1s] rebel  ep137 games=  48 dec=  4977 rows= 17904 cap=0.02 cfgs= 15.3 L=0.01086 P=nan old=0.01043 new=0.01137 tgt=+0.063/0.315 pstd=0.286 capv=0.000 lr=2.5e-04 gen=59.1s train=1.5s
+[t=13625.3s] rebel  ep138 games=  48 dec=  5615 rows= 20242 cap=0.04 cfgs= 15.0 L=0.01032 P=nan old=0.00874 new=0.00740 tgt=+0.093/0.324 pstd=0.286 capv=0.000 lr=2.5e-04 gen=94.3s train=1.5s
+[t=13787.4s] rebel  ep139 games=  48 dec=  6170 rows= 21905 cap=0.06 cfgs= 12.0 L=0.01068 P=nan old=0.01049 new=0.01586 tgt=+0.069/0.312 pstd=0.281 capv=0.000 lr=2.5e-04 gen=160.0s train=1.8s
+[t=13880.2s] --- snapshot snap_31.pt (s31) ---
+[t=13880.2s] rebel  ep140 games=  48 dec=  5644 rows= 20597 cap=0.06 cfgs= 14.0 L=0.00996 P=nan old=0.00884 new=0.00948 tgt=+0.060/0.344 pstd=0.288 capv=0.000 lr=2.5e-04 gen=90.9s train=1.6s
+[t=13993.7s] rebel  ep141 games=  48 dec=  5913 rows= 21265 cap=0.08 cfgs= 14.6 L=0.00992 P=nan old=0.01044 new=0.01225 tgt=+0.059/0.304 pstd=0.284 capv=0.000 lr=2.5e-04 gen=111.3s train=1.7s
+[t=14123.6s] rebel  ep142 games=  48 dec=  5120 rows= 18089 cap=0.08 cfgs= 14.9 L=0.01116 P=nan old=0.00945 new=0.00870 tgt=+0.081/0.367 pstd=0.287 capv=0.000 lr=2.5e-04 gen=128.1s train=1.5s
+[t=14204.2s] rebel  ep143 games=  48 dec=  5529 rows= 20081 cap=0.02 cfgs= 14.7 L=0.01150 P=nan old=0.00935 new=0.00869 tgt=+0.071/0.297 pstd=0.283 capv=0.000 lr=2.5e-04 gen=78.6s train=1.6s
+[t=14323.4s] --- snapshot snap_32.pt (s32) ---
+[t=14323.4s] rebel  ep144 games=  48 dec=  5981 rows= 21770 cap=0.06 cfgs= 15.1 L=0.01109 P=nan old=0.00946 new=0.00880 tgt=+0.083/0.348 pstd=0.281 capv=0.000 lr=2.5e-04 gen=117.0s train=1.8s
+[t=14536.7s] rebel  ep145 games=  48 dec=  6132 rows= 21748 cap=0.10 cfgs= 13.4 L=0.01060 P=nan old=0.01125 new=0.01274 tgt=+0.097/0.330 pstd=0.282 capv=0.000 lr=2.5e-04 gen=211.2s train=1.8s
+[t=14743.1s] --- snapshot snap_33.pt (s33) ---
+[t=14743.1s] rebel  ep146 games=  48 dec=  6054 rows= 21960 cap=0.10 cfgs= 12.8 L=0.01039 P=nan old=0.01103 new=0.01336 tgt=+0.049/0.316 pstd=0.282 capv=0.000 lr=2.5e-04 gen=204.3s train=1.7s
+[t=14800.3s] rebel  ep147 games=  48 dec=  5973 rows= 21608 cap=0.06 cfgs= 14.2 L=0.01075 P=nan old=0.01111 new=0.01076 tgt=+0.094/0.314 pstd=0.284 capv=0.000 lr=2.5e-04 gen=55.1s train=1.7s
+[t=14841.9s] rebel  ep148 games=  48 dec=  6130 rows= 22264 cap=0.06 cfgs= 14.4 L=0.01093 P=nan old=0.00919 new=0.01088 tgt=+0.063/0.352 pstd=0.283 capv=0.000 lr=2.5e-04 gen=39.4s train=1.8s
+[t=14899.7s] rebel  ep149 games=  48 dec=  5481 rows= 20000 cap=0.04 cfgs= 14.3 L=0.01014 P=nan old=0.01468 new=0.00785 tgt=+0.071/0.336 pstd=0.284 capv=0.000 lr=2.5e-04 gen=55.8s train=1.6s
+[t=14963.4s] rebel  ep150 games=  48 dec=  6010 rows= 21872 cap=0.08 cfgs= 13.4 L=0.01103 P=nan old=0.00979 new=0.00944 tgt=+0.084/0.371 pstd=0.281 capv=0.000 lr=2.5e-04 gen=61.5s train=1.7s
+[t=15052.0s] rebel  ep151 games=  48 dec=  5925 rows= 21481 cap=0.06 cfgs= 15.7 L=0.01012 P=nan old=0.00878 new=0.00854 tgt=+0.047/0.321 pstd=0.281 capv=0.000 lr=2.5e-04 gen=86.4s train=1.8s
+[t=15163.5s] --- snapshot snap_34.pt (s34) ---
+[t=15163.5s] rebel  ep152 games=  48 dec=  5387 rows= 19408 cap=0.02 cfgs= 14.8 L=0.01038 P=nan old=0.00938 new=0.01170 tgt=+0.075/0.329 pstd=0.280 capv=0.000 lr=2.5e-04 gen=108.9s train=2.2s
+[t=15390.5s] rebel  ep153 games=  48 dec=  5797 rows= 20648 cap=0.08 cfgs= 14.5 L=0.01084 P=nan old=0.01364 new=0.00939 tgt=+0.079/0.378 pstd=0.285 capv=0.000 lr=2.5e-04 gen=224.9s train=1.7s
+[t=15464.7s] rebel  ep154 games=  48 dec=  5346 rows= 19281 cap=0.02 cfgs= 15.0 L=0.01152 P=nan old=0.01115 new=0.00949 tgt=+0.046/0.315 pstd=0.281 capv=0.000 lr=2.5e-04 gen=72.1s train=1.7s
+[t=15610.6s] --- snapshot snap_35.pt (s35) ---
+[t=15610.7s] rebel  ep155 games=  48 dec=  5230 rows= 18527 cap=0.02 cfgs= 16.0 L=0.01053 P=nan old=0.01011 new=0.00937 tgt=+0.091/0.309 pstd=0.282 capv=0.000 lr=2.5e-04 gen=144.0s train=1.5s
+[t=15714.2s] rebel  ep156 games=  48 dec=  6074 rows= 22217 cap=0.06 cfgs= 15.0 L=0.01027 P=nan old=0.00908 new=0.01049 tgt=+0.091/0.335 pstd=0.280 capv=0.000 lr=2.5e-04 gen=100.7s train=2.2s
+[t=15762.2s] rebel  ep157 games=  48 dec=  5656 rows= 20672 cap=0.06 cfgs= 15.2 L=0.01030 P=nan old=0.00938 new=0.00790 tgt=+0.033/0.363 pstd=0.286 capv=0.000 lr=2.5e-04 gen=46.0s train=1.7s
+[t=15819.4s] rebel  ep158 games=  48 dec=  5587 rows= 20528 cap=0.06 cfgs= 15.0 L=0.01121 P=nan old=0.01049 new=0.01463 tgt=+0.043/0.337 pstd=0.275 capv=0.000 lr=2.5e-04 gen=54.7s train=2.0s
+[t=15971.9s] --- snapshot snap_36.pt (s36) ---
+[t=15971.9s] rebel  ep159 games=  48 dec=  5468 rows= 19606 cap=0.06 cfgs= 14.1 L=0.01185 P=nan old=0.00873 new=0.00978 tgt=+0.067/0.332 pstd=0.284 capv=0.000 lr=2.5e-04 gen=150.3s train=1.8s
+[t=16187.7s] rebel  ep160 games=  48 dec=  5616 rows= 19832 cap=0.04 cfgs= 13.8 L=0.01149 P=nan old=0.00969 new=0.00971 tgt=+0.066/0.299 pstd=0.285 capv=0.000 lr=2.5e-04 gen=212.8s train=2.4s
+[t=16259.6s] rebel  ep161 games=  48 dec=  5979 rows= 21736 cap=0.04 cfgs= 16.3 L=0.01058 P=nan old=0.01123 new=0.01091 tgt=+0.090/0.360 pstd=0.281 capv=0.000 lr=2.5e-04 gen=69.2s train=2.2s
+[t=16259.6s] --- snapshot snap_37.pt (final) ---
+dumped 2000000 buffer rows (54624298 configs) to runs/pre_cuda_random/buffer.npz

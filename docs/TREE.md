@@ -123,3 +123,9 @@ median/p95/p99 of nodes, leaves, action cells, configs, upload bytes, and CPU
 build time. The live GPU pool is sized from p99, not the average; the tree
 arrays are re-uploaded per solve, and the pool must hold the worst observed
 solve plus the network's resident weights.
+
+Measured on the pre-CUDA dump run's roots (2026-08-07, trained net, 2M-node
+cap): depth 2 p99 = 18k nodes / 52 MB upload; depth 3 p99 = 299k nodes /
+1.0 GB; depth 4 p99 = 1.8M nodes / 5.8 GB, with 10% of depth-4 roots hitting
+the cap. The CPU generation cap is 200k nodes; the GPU build receives the
+cap as runtime metadata and must size its pool from the same p99 rule.

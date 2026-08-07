@@ -73,7 +73,9 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(2_000_000);
     for depth in depths {
-        let cfg = Cfg { depth, iters, snapshots: true, ..Default::default() };
+        // The solver's own node cap bounds the build (the tool's post-build
+        // cap check below only decides what to report).
+        let cfg = Cfg { depth, iters, snapshots: true, node_cap, ..Default::default() };
         let (mut ns, mut ls, mut cs, mut fs, mut bs, mut times) = (
             Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
         );
