@@ -348,21 +348,6 @@ impl Service {
             },
         )
         .map_err(|e| format!("nvrtc: {e:?}"))?;
-        #[cfg(test)]
-        {
-            let src = ptx.to_src();
-            for name in ["belief_sums", "ln_relu_kernel", "readout_kernel", "backprop_kernel",
-                         "rm_kernel", "propagate_kernel", "avg_kernel", "leaf_beliefs_kernel",
-                         "cards_finish", "pile_pe_kernel", "assemble_kernel", "relu_bias_kernel",
-                         "holding_in_kernel", "slot_sum_kernel", "add2_kernel",
-                         "action_in_kernel", "init_strategy_kernel", "seed_sum_kernel",
-                         "warm_seed_kernel", "bias_add_kernel"] {
-                if !src.contains(name) {
-                    eprintln!("ptx missing kernel {name}");
-                }
-            }
-            eprintln!("ptx len {}", src.len());
-        }
         let module = dev.load_module(ptx).map_err(|e| format!("module: {e:?}"))?;
         let f = Kernels::load(&module)?;
         let weights = Weights::upload(stream.clone(), dims, w, b, ln)?;

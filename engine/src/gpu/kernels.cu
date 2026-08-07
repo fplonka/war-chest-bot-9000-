@@ -133,7 +133,7 @@ __device__ __forceinline__ float normalize_scale(const float* w, int n,
 // the packed xb buffer at (packed_row_off + row). `nplayers` is 1 (traverser
 // only) or 2 (both); the thread's player is rp % nplayers (row-major).
 // Ports normalize_weights + accumulate of Solver::leaf_values.
-__global__ void belief_sums(
+extern "C" __global__ void belief_sums(
     const SolveDesc* descs, const int* slots, int nslots,
     float* xb_packed, const Weights* w) {
     int s = blockIdx.y;
@@ -165,7 +165,7 @@ __global__ void belief_sums(
 // sum = sum_j (row[j] + bias[j] + add[j]), mean = sum/n,
 // var = sum_j (row[j] - mean)^2 / n, inv = 1/sqrt(var + LN_EPS).
 // One thread per row. Ports net.rs::ln_relu.
-__global__ void ln_relu_kernel(float* out, const float* bias, const float* g,
+extern "C" __global__ void ln_relu_kernel(float* out, const float* bias, const float* g,
                                const float* bt, const float* add, int has_add,
                                int rows, int n) {
     int r = blockIdx.x * blockDim.x + threadIdx.x;
@@ -192,7 +192,7 @@ __global__ void ln_relu_kernel(float* out, const float* bias, const float* g,
     }
 }
 
-__global__ void bias_add_kernel(float* u, const float* bu, int rows, int rk) {
+extern "C" __global__ void bias_add_kernel(float* u, const float* bu, int rows, int rk) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= (size_t)rows * rk) return;
     int j = t % rk;
@@ -204,7 +204,7 @@ __global__ void bias_add_kernel(float* u, const float* bu, int rows, int rk) {
 // One thread per non-terminal leaf row plus one per terminal leaf. Ports
 // Solver::readout: v = <u, g[..rk]> + g[rk] times the opponent's reach;
 // terminals use the game utility.
-__global__ void readout_kernel(
+extern "C" __global__ void readout_kernel(
     const SolveDesc* descs, const int* slots, int nslots,
     const float* u_packed, const Weights* w) {
     int s = blockIdx.y;
@@ -254,7 +254,7 @@ __global__ void readout_kernel(
 // One block per solve; levels sequential inside the block; one thread per
 // node within a level. Ports Solver::backprop. The traverser's own row is
 // accumulated in place in the vals arena (children live in deeper levels).
-__global__ void backprop_kernel(const SolveDesc* descs, const int* slots,
+extern "C" __global__ void backprop_kernel(const SolveDesc* descs, const int* slots,
                                 int nslots, const Weights* w) {
     int s = blockIdx.y;
     if (s >= nslots) return;
@@ -355,7 +355,7 @@ __global__ void backprop_kernel(const SolveDesc* descs, const int* slots,
 // One thread per node of the group's solves (bfs order). Ports the RM block
 // of Solver::step: discount + fold inst, clamp, normalize per config, and
 // the sum_strat discount. Only the solve's traverser's nodes are touched.
-__global__ void rm_kernel(const SolveDesc* descs, const int* slots,
+extern "C" __global__ void rm_kernel(const SolveDesc* descs, const int* slots,
                           int nslots) {
     int s = blockIdx.y;
     if (s >= nslots) return;
@@ -399,7 +399,7 @@ __global__ void rm_kernel(const SolveDesc* descs, const int* slots,
 
 // One block per solve; levels sequential; one thread per node. Ports
 // Solver::propagate, chance CSR included.
-__global__ void propagate_kernel(const SolveDesc* descs, const int* slots,
+extern "C" __global__ void propagate_kernel(const SolveDesc* descs, const int* slots,
                                  int nslots, const Weights* w) {
     int s = blockIdx.y;
     if (s >= nslots) return;
@@ -484,7 +484,7 @@ __global__ void propagate_kernel(const SolveDesc* descs, const int* slots,
 
 // One thread per node of the group's solves. Ports the AVG block of
 // Solver::step (must run after the forward sweep: reads the fresh reaches).
-__global__ void avg_kernel(const SolveDesc* descs, const int* slots,
+extern "C" __global__ void avg_kernel(const SolveDesc* descs, const int* slots,
                            int nslots) {
     int s = blockIdx.y;
     if (s >= nslots) return;
@@ -529,7 +529,7 @@ __global__ void avg_kernel(const SolveDesc* descs, const int* slots,
 // Normalise the reach at the exit leaf into the solve's belief buffer, one
 // thread per (snapshot, player): out[(snap * 2 + p) * max_nc + c]. Ports
 // Solver::carried_beliefs.
-__global__ void leaf_beliefs_kernel(const SolveDesc* descs, const int* slots,
+extern "C" __global__ void leaf_beliefs_kernel(const SolveDesc* descs, const int* slots,
                                     int nslots, float* out) {
     int s = blockIdx.y;
     if (s >= nslots) return;
@@ -551,7 +551,7 @@ __global__ void leaf_beliefs_kernel(const SolveDesc* descs, const int* slots,
 
 // The card table finish: e = hid Wd1 + bd1 + wid[ids] (the Wd1 GEMM ran in
 // the service). One thread per (type, de) element.
-__global__ void cards_finish(float* e, const float* hid, const float* bd1,
+extern "C" __global__ void cards_finish(float* e, const float* hid, const float* bd1,
                              const float* wid, const unsigned char* ids,
                              int ntype, int de) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
@@ -564,7 +564,7 @@ __global__ void cards_finish(float* e, const float* hid, const float* bd1,
 // occupant embedding, the pile summary (the service precomputed
 // ph = cnt @ wpile[:4] and pe = bpile + e @ wpile[4:]), and the loose
 // scalars. One thread per row. Ports net.rs::assemble.
-__global__ void assemble_kernel(
+extern "C" __global__ void assemble_kernel(
     float* x, const float* xpub, const float* e, const float* ph,
     const float* pe, int rows, int pubfeat, int de) {
     int r = blockIdx.x * blockDim.x + threadIdx.x;
@@ -599,7 +599,7 @@ __global__ void assemble_kernel(
 
 // Holding tower input: [n * NSLOT][hf] from cphi + e. One thread per
 // (config, slot). Ports the input build of net.rs::embed.
-__global__ void holding_in_kernel(float* inp, const float* cphi, const float* e,
+extern "C" __global__ void holding_in_kernel(float* inp, const float* cphi, const float* e,
                                   int n, int cfeat, int de) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n * NSLOT) return;
@@ -618,7 +618,7 @@ __global__ void holding_in_kernel(float* inp, const float* cphi, const float* e,
 
 // Sum the per-slot rectified outputs into z. One thread per config. Ports
 // the slot sum of net.rs::embed (the service GEMMs wc/bc before this).
-__global__ void slot_sum_kernel(float* z, const float* slot, const float* bc,
+extern "C" __global__ void slot_sum_kernel(float* z, const float* slot, const float* bc,
                                 int n, int dg) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n) return;
@@ -634,7 +634,7 @@ __global__ void slot_sum_kernel(float* z, const float* slot, const float* bc,
 }
 
 // z += res + bh2, one thread per element (the residual's second stage).
-__global__ void add2_kernel(float* z, const float* res, const float* bh2,
+extern "C" __global__ void add2_kernel(float* z, const float* res, const float* bh2,
                             int n, int dg) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n * dg) return;
@@ -645,7 +645,7 @@ __global__ void add2_kernel(float* z, const float* res, const float* bh2,
 // Action tower input: [na][af] = [psi | e of the paying card]. One thread
 // per (action, de) column; the psi copy is done by the first thread of the
 // action. Ports the gather of net.rs::embed_actions.
-__global__ void action_in_kernel(float* inp, const float* psi, const float* e,
+extern "C" __global__ void action_in_kernel(float* inp, const float* psi, const float* e,
                                  int na, int afeat, int de) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= na * de) return;
@@ -665,7 +665,7 @@ __global__ void action_in_kernel(float* inp, const float* psi, const float* e,
 
 // Seeding after the warm start: regret = w * inst, sum_strat = w * r * cur,
 // per traverser node. Grid (nodes, nslots). Ports Solver::warm_start's seed.
-__global__ void warm_seed_kernel(const SolveDesc* descs, const int* slots,
+extern "C" __global__ void warm_seed_kernel(const SolveDesc* descs, const int* slots,
                                  int nslots, float weight) {
     int s = blockIdx.y;
     if (s >= nslots) return;
@@ -692,7 +692,7 @@ __global__ void warm_seed_kernel(const SolveDesc* descs, const int* slots,
 // pe[t][j] = bpile[j] + sum_k e[t][k] * wpile[(4 + k)][j]: the card half of
 // the pile summary, folded into the bias once per solve. One thread per
 // (type, de) element. Ports the pe loop of net.rs::assemble.
-__global__ void pile_pe_kernel(float* pe, const float* e, const float* wpile,
+extern "C" __global__ void pile_pe_kernel(float* pe, const float* e, const float* wpile,
                                const float* bpile, int de) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= NTYPE * de) return;
@@ -706,7 +706,7 @@ __global__ void pile_pe_kernel(float* pe, const float* e, const float* wpile,
 }
 
 // relu(x + bias), one thread per element.
-__global__ void relu_bias_kernel(float* x, const float* bias, int n, int width) {
+extern "C" __global__ void relu_bias_kernel(float* x, const float* bias, int n, int width) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n * width) return;
     int j = t % width;
@@ -717,7 +717,7 @@ __global__ void relu_bias_kernel(float* x, const float* bias, int n, int width) 
 // Uniform strategy init at admission: cur/avg = uniform over the legal
 // actions per config, at every decision node. Grid (nodes, nslots). Ports
 // the strategy init of Solver::new.
-__global__ void init_strategy_kernel(const SolveDesc* descs, const int* slots,
+extern "C" __global__ void init_strategy_kernel(const SolveDesc* descs, const int* slots,
                                      int nslots) {
     int s = blockIdx.y;
     if (s >= nslots) return;
@@ -747,7 +747,7 @@ __global__ void init_strategy_kernel(const SolveDesc* descs, const int* slots,
 
 // Seed the average strategy sum with one reach-weighted uniform strategy,
 // as Solver::new does (the initial reach was uploaded). Grid (nodes, nslots).
-__global__ void seed_sum_kernel(const SolveDesc* descs, const int* slots,
+extern "C" __global__ void seed_sum_kernel(const SolveDesc* descs, const int* slots,
                                 int nslots) {
     int s = blockIdx.y;
     if (s >= nslots) return;
