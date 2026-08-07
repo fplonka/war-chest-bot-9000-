@@ -76,11 +76,21 @@ fn tables_are_consistent() {
         assert_eq!(t.soff.len(), n + 1);
         assert_eq!(t.soff[n] as usize, t.ncells);
         assert_eq!(t.cfg_off.len(), 2 * n + 1);
-        assert_eq!(t.cfg_off[2 * n] as usize, t.cfg_id.len());
-        assert_eq!(t.members, t.cfg_id.len());
-        assert_eq!(t.cfg_hand.len(), t.members * 5);
-        assert_eq!(t.cfg_fd.len(), t.members * 5);
-        assert_eq!(t.cfg_pending.len(), t.members);
+        assert_eq!(t.reach_off[n] as usize, t.reach_len);
+        // Reverse tables: every non-root node has exactly one gather block,
+        // in the row space matching its parent's kind.
+        assert_eq!(*t.rev_start.last().unwrap() as usize, t.rev_src.len());
+        assert_eq!(t.rev_src.len(), t.rev_cell.len());
+        assert_eq!(*t.rvd_start.last().unwrap() as usize, t.rvd_src.len());
+        assert_eq!(t.rvd_src.len(), t.rvd_p.len());
+        for j in 1..n {
+            let p = t.node_parent[j] as usize;
+            assert!(p < j, "parent after child at {j}");
+            let dec = t.node_kind[p] == 0;
+            assert_eq!(t.rev_row_of[j] != u32::MAX, dec, "rev block kind at {j}");
+            assert_eq!(t.rvd_row_of[j] != u32::MAX, !dec, "rvd block kind at {j}");
+        }
+        assert_eq!(t.node_parent[0], u32::MAX);
         assert_eq!(t.leaf_coff.len(), 2 * t.rows + 1);
         assert_eq!(t.leaf_coff[2 * t.rows] as usize, t.leaf_cidx.len());
         // BFS order is a permutation of 0..n and levels tile it.

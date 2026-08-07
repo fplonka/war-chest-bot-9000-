@@ -70,6 +70,11 @@ pub struct Cfg {
     /// enough that an unbounded build hangs training for minutes on one
     /// decision.
     pub node_cap: usize,
+    /// Build for the GPU service: the tree, features and offsets only. The
+    /// CFR arenas (regrets, strategies, reaches, values, snapshots) are
+    /// neither allocated nor initialised — the device builds its own from
+    /// the job, so doing it here too was pure allocation traffic.
+    pub gpu_build: bool,
 }
 
 impl Default for Cfg {
@@ -81,6 +86,7 @@ impl Default for Cfg {
             cfr: Cfr::LINEAR,
             warm: 0.0,
             node_cap: 0,
+            gpu_build: false,
         }
     }
 }
@@ -697,14 +703,19 @@ impl<'a> Solver<'a> {
             let nc = n.nc(p);
             let (c0, c1) = (n.nc(0), n.nc(1));
             sv.nc.push([c0 as u32, c1 as u32]);
+            sv.soff.push(sv.ncells as u32);
+            sv.ncells += nc * na;
+            if cfg.gpu_build {
+                // The device owns the arenas; the walk after trip 1 reads
+                // only the tree, the features and `soff`.
+                continue;
+            }
             sv.roff.push(sv.reach.len() as u32);
             sv.reach.resize(sv.reach.len() + c0 + c1, 0.0);
             sv.voff.push(sv.vals.len() as u32);
             sv.vals.resize(sv.vals.len() + c0.max(c1), 0.0);
-            sv.soff.push(sv.regret.len() as u32);
-            sv.regret.resize(sv.regret.len() + nc * na, 0.0);
-            sv.inst.resize(sv.regret.len(), 0.0);
-            sv.ncells += nc * na;
+            sv.regret.resize(sv.ncells, 0.0);
+            sv.inst.resize(sv.ncells, 0.0);
             sv.sum_strat.push(vec![0.0; nc * na]);
             // CFR starts from a uniform strategy over the legal actions, as in
             // the reference. No heuristic prior is injected here: the greedy
@@ -722,7 +733,7 @@ impl<'a> Solver<'a> {
             sv.cur.extend_from_slice(&u);
             sv.avg.push(u);
         }
-        sv.soff.push(sv.regret.len() as u32);
+        sv.soff.push(sv.ncells as u32);
         drop(_t);
         shape!(SOLVES, 1);
         shape!(NODES, sv.nodes.len());
@@ -738,25 +749,27 @@ impl<'a> Solver<'a> {
             }
             shape!(CFGSUM, n.nc(0) + n.nc(1));
         }
-        sv.precompute_reaches();
-        // Seed the strategy sums with one reach-weighted uniform strategy,
-        // as `get_uniform_reach_weigted_strategy` does in the reference.
-        for i in 0..sv.nodes.len() {
-            if sv.nodes[i].leaf {
-                continue;
-            }
-            let (na, p) = (sv.nodes[i].na(), sv.nodes[i].player as usize);
-            let so = sv.soff[i] as usize;
-            for c in 0..sv.nodes[i].nc(p) {
-                let r = sv.reach_of(i, p)[c];
-                for a in 0..na {
-                    sv.sum_strat[i][c * na + a] += r * sv.cur[so + c * na + a];
+        if !cfg.gpu_build {
+            sv.precompute_reaches();
+            // Seed the strategy sums with one reach-weighted uniform strategy,
+            // as `get_uniform_reach_weigted_strategy` does in the reference.
+            for i in 0..sv.nodes.len() {
+                if sv.nodes[i].leaf {
+                    continue;
+                }
+                let (na, p) = (sv.nodes[i].na(), sv.nodes[i].player as usize);
+                let so = sv.soff[i] as usize;
+                for c in 0..sv.nodes[i].nc(p) {
+                    let r = sv.reach_of(i, p)[c];
+                    for a in 0..na {
+                        sv.sum_strat[i][c * na + a] += r * sv.cur[so + c * na + a];
+                    }
                 }
             }
+            // Snapshot 0: the average before any iteration, i.e. the uniform
+            // policy — the t = 0 member of the carried-belief set.
+            sv.snapshot();
         }
-        // Snapshot 0: the average before any iteration, i.e. the uniform
-        // policy — the t = 0 member of the carried-belief set.
-        sv.snapshot();
         sv
     }
 

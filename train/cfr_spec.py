@@ -52,7 +52,7 @@ class Job:
         self.b = open(path, "rb").read()
         self.at = 0
         magic, ver = self.u32(), self.u32()
-        assert magic == 0x57434A32 and ver == 2, f"bad job magic/version {magic:x}/{ver}"
+        assert magic == 0x57434A33 and ver == 3, f"bad job magic/version {magic:x}/{ver}"
         self.depth, self.iters = self.u32(), self.u32()
         self.snapshots = bool(self.take(1)[0])
         self.alpha, self.beta, self.gamma, self.predict, self.warm = (
@@ -71,22 +71,25 @@ class Job:
         self.obs_child = self.u32s()
         self.legal_bits = self.u8s()
         self.trans = self.i32s()
-        self.action_pays = self.i8s()
-        self.action_fdown = self.u8s()
         self.draw_off = self.u32s()
         self.draw_to = self.u32s()
         self.draw_p = self.f32s()
-        self.draw_steps = self.u8s()
         self.draw_row_off = self.u32s()
         self.draw_row_start = self.u32s()
         self.cfg_off = self.u32s()
-        self.cfg_id = self.u32s()
-        self.cfg_hand = self.u8s()
-        self.cfg_fd = self.u8s()
-        self.cfg_pending = self.i8s()
         self.reach_off = self.u32s()
-        self.reach = self.f32s()
         self.soff = self.u32s()
+        # Reverse (gather) transitions; this spec keeps the forward loops,
+        # so they are read to stay in sync with the byte order only.
+        self.node_parent = self.u32s()
+        self.rev_row_of = self.u32s()
+        self.rev_start = self.u32s()
+        self.rev_src = self.u32s()
+        self.rev_cell = self.u32s()
+        self.rvd_row_of = self.u32s()
+        self.rvd_start = self.u32s()
+        self.rvd_src = self.u32s()
+        self.rvd_p = self.f32s()
         self.leaf_rows = self.u32s()
         self.inner_rows = self.u32s()
         self.term_leaves = self.u32s()
@@ -95,11 +98,8 @@ class Job:
         self.leaf_cidx = self.u32s()
         self.leaf_xpub = self.f32s()
         self.cphi = self.f32s()
-        self.cmap_key = self.u64s()
         self.bfs_order = self.u32s()
         self.level_start = self.u32s()
-        self.psi_off = self.u32s()
-        self.psi = self.f32s()
         self.ids = self.u8s()
         self.root0 = self.f32s()
         self.root1 = self.f32s()
@@ -367,11 +367,7 @@ class Solve:
         self.h0 = self.trunk(job.leaf_xpub, job.rows, e)
         z, g = self.embed(job.cphi, job.ncfg, e)
         self.z, self.g = z, g
-        if job.warm > 0:
-            self.q = {}
-            for i in range(job.nodes):
-                if job.node_kind[i] == 0:
-                    self.q[i] = self.actions(self.psi_of(i), e)
+        assert job.warm == 0, "warm start is plan A4; the job no longer carries psi"
         # Strategy init, exactly Solver::new: uniform cur, zero regrets, the
         # reach-weighted uniform seed, snapshot 0 = the uniform average.
         for i in range(job.nodes):
@@ -408,10 +404,6 @@ class Solve:
         j = self.j
         at = j.reach_off[i] + (int(j.nc[i, 0]) if p == 1 else 0)
         return self.reach[at:at + int(j.nc[i, p])]
-
-    def psi_of(self, i):
-        j = self.j
-        return j.psi[j.psi_off[i] * AFEAT:j.psi_off[i + 1] * AFEAT]
 
     def child_of(self, i, a):
         j = self.j

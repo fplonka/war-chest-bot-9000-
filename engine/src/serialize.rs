@@ -18,16 +18,14 @@
 //! `NONE = 255` where the solver uses it. Everything below mirrors
 //! `docs/TREE.md`; see that file for the meaning of each array.
 
-use crate::rebel::{
-    config_counts, write_action_feats, AFEAT, CFEAT, CCOUNTS, Config, NSLOT,
-};
+use crate::rebel::CFEAT;
 use crate::search::{Cfr, Solver};
 
 /// The byte format this module writes. Bump when an array changes shape or
 /// meaning (docs/TREE.md "the version bumps when any of them changes shape or
 /// meaning").
-pub const JOB_VERSION: u32 = 2;
-const MAGIC: u32 = 0x5743_4A32; // "WCJ2"
+pub const JOB_VERSION: u32 = 3;
+const MAGIC: u32 = 0x5743_4A33; // "WCJ3"
 
 /// Runtime metadata that travels with a job (not part of the frozen tree
 /// contract — it is per-request).
@@ -65,7 +63,6 @@ pub struct TreeTables {
     pub nlevels: usize,
     pub ncells: usize,
     pub pubfeat: usize,
-    pub npsi_rows: usize,
     pub reach_len: usize,
     // -- tree structure --
     pub node_kind: Vec<u8>,
@@ -83,12 +80,9 @@ pub struct TreeTables {
     /// `(c*na+a) >> 3`, cells in `soff` order.
     pub legal_bits: Vec<u8>,
     pub trans: Vec<i32>,
-    pub action_pays: Vec<i8>,
-    pub action_fdown: Vec<u8>,
     pub draw_off: Vec<u32>,
     pub draw_to: Vec<u32>,
     pub draw_p: Vec<f32>,
-    pub draw_steps: Vec<u8>,
     /// Offset of each node's draw row-boundary segment into `draw_row_start`
     /// (one segment per chance node, `rows + 1` entries). The flat `draw_to`
     /// entries of a node split into rows through it.
@@ -96,14 +90,23 @@ pub struct TreeTables {
     pub draw_row_start: Vec<u32>,
     // -- config support --
     pub cfg_off: Vec<u32>,
-    pub cfg_id: Vec<u32>,
-    pub cfg_hand: Vec<u8>,
-    pub cfg_fd: Vec<u8>,
-    pub cfg_pending: Vec<i8>,
     // -- arenas --
     pub reach_off: Vec<u32>,
-    pub reach: Vec<f32>,
     pub soff: Vec<u32>,
+    // -- reverse (gather) transitions, for the GPU's forward sweep --
+    /// Each non-root node's parent (`u32::MAX` for the root).
+    pub node_parent: Vec<u32>,
+    /// Per node: its first row in `rev_start` when its parent is a decision
+    /// node (`u32::MAX` otherwise). A node's rows are its own me-configs.
+    pub rev_row_of: Vec<u32>,
+    pub rev_start: Vec<u32>,
+    pub rev_src: Vec<u32>,
+    pub rev_cell: Vec<u32>,
+    /// The same, for chance parents: entries are (parent config, draw prob).
+    pub rvd_row_of: Vec<u32>,
+    pub rvd_start: Vec<u32>,
+    pub rvd_src: Vec<u32>,
+    pub rvd_p: Vec<f32>,
     // -- leaves --
     pub leaf_rows: Vec<u32>,
     /// Decision nodes in the network batch, after the leaves (warm start).
@@ -115,13 +118,9 @@ pub struct TreeTables {
     pub leaf_xpub: Vec<f32>,
     // -- config table --
     pub cphi: Vec<f32>,
-    pub cmap_key: Vec<u64>,
     // -- derived: BFS level order for the sweeps --
     pub bfs_order: Vec<u32>,
     pub level_start: Vec<u32>,
-    // -- action features (the policy head's input), per decision node --
-    pub psi_off: Vec<u32>,
-    pub psi: Vec<f32>,
     // -- the draft's unit ids in player-major slot order --
     pub ids: Vec<u8>,
 }
@@ -172,86 +171,58 @@ impl TreeTables {
         let mut t = TreeTables {
             nodes,
             pubfeat: sv.pubfeat,
+            ncfg: sv.ncfg,
+            cphi: sv.cphi[..sv.ncfg * CFEAT].to_vec(),
             ..Default::default()
         };
-        // The config table is extended with any support member the leaf batch
-        // never interned, so every `cfg_id` is valid. The leaf batch's own
-        // rows keep their indices; the extra rows are never read.
-        let mut cphi = sv.cphi.clone();
-        let mut cmap = sv.cmap.clone();
-        let mut ncfg = sv.ncfg;
-        let intern = |c: &Config, res: &[u8; NSLOT], p: usize,
-                      cphi: &mut Vec<f32>, cmap: &mut std::collections::HashMap<u64, u32>,
-                      ncfg: &mut usize| -> u32 {
-            let mut cnt = [0u8; CCOUNTS];
-            config_counts(c, res, &mut cnt);
-            let mut key = p as u64;
-            for x in cnt.iter() {
-                key = (key << 4) | *x as u64;
-            }
-            if let Some(&i) = cmap.get(&key) {
-                return i;
-            }
-            let i = *ncfg as u32;
-            *ncfg += 1;
-            let at = i as usize * CFEAT;
-            cphi.resize(at + CFEAT, 0.0);
-            for k in 0..CCOUNTS {
-                cphi[at + k] = cnt[k] as f32 / 5.0;
-            }
-            cphi[at + CCOUNTS] = p as f32;
-            cmap.insert(key, i);
-            i
-        };
+        // Config support counts per node per player. Only the *leaf* configs
+        // are interned into the feature table (`push_row` did that during the
+        // build); inner supports travel as counts and local transitions,
+        // which is all the sweeps read.
         let mut cfg_off = Vec::with_capacity(2 * nodes + 1);
-        let mut cfg_id = Vec::new();
-        let mut cfg_hand = Vec::new();
-        let mut cfg_fd = Vec::new();
-        let mut cfg_pending = Vec::new();
+        let mut cfg_at = 0u32;
         for i in 0..nodes {
             let n = &sv.nodes[i];
-            let res = crate::rebel::reserve(&n.s, 0, &sv.ctx);
-            for p in 0..2usize {
-                cfg_off.push(cfg_id.len() as u32);
-                let res_p = if p == 0 { res } else { crate::rebel::reserve(&n.s, 1, &sv.ctx) };
-                for c in n.cfgs[p].iter() {
-                    let id = intern(c, &res_p, p, &mut cphi, &mut cmap, &mut ncfg);
-                    cfg_id.push(id);
-                    for k in 0..NSLOT {
-                        cfg_hand.push(c.hand[k]);
-                        cfg_fd.push(c.fd[k]);
-                    }
-                    cfg_pending.push(c.pending_coin.map_or(-1, |k| k as i8));
-                }
-            }
+            cfg_off.push(cfg_at);
+            cfg_at += n.cfgs[0].len() as u32;
+            cfg_off.push(cfg_at);
+            cfg_at += n.cfgs[1].len() as u32;
         }
-        cfg_off.push(cfg_id.len() as u32);
-        t.members = cfg_id.len();
+        cfg_off.push(cfg_at);
         t.cfg_off = cfg_off;
-        t.cfg_id = cfg_id;
-        t.cfg_hand = cfg_hand;
-        t.cfg_fd = cfg_fd;
-        t.cfg_pending = cfg_pending;
-        t.ncfg = ncfg;
-        t.cphi = cphi;
-        // cmap_key in row order.
-        let mut keys: Vec<(u32, u64)> = cmap.iter().map(|(&k, &i)| (i, k)).collect();
-        keys.sort_unstable();
-        t.cmap_key = keys.iter().map(|&(_, k)| k).collect();
 
-        // Node arrays and flat CSRs.
+        // Node arrays, flat CSRs, and the reverse (gather) transition tables.
+        //
+        // The reverse tables exist for the GPU's forward reach sweep: pushing
+        // mass parent-to-child makes writers collide (several parent configs
+        // reach the same child config), while gathering gives every output
+        // exactly one writer and a fixed summation order. The entry order per
+        // output is exactly the CPU's accumulation order — actions in
+        // observation order, then parent configs ascending (decision), parent
+        // configs ascending then draw outcomes (chance) — so the two sides
+        // sum in the same sequence.
         let mut child_start = Vec::with_capacity(nodes + 1);
         let mut obs_off = Vec::with_capacity(nodes + 1);
         let mut draw_off = Vec::with_capacity(nodes + 1);
         let mut reach_off = Vec::with_capacity(nodes + 1);
-        let mut psi_off = Vec::with_capacity(nodes + 1);
         let mut soff = Vec::with_capacity(nodes + 1);
         let mut obs_start = Vec::new();
-        let mut psi = Vec::new();
+        let mut reach_at = 0u32;
+        t.node_parent = vec![u32::MAX; nodes];
+        t.rev_row_of = vec![u32::MAX; nodes];
+        t.rvd_row_of = vec![u32::MAX; nodes];
+        t.rev_start.push(0);
+        t.rvd_start.push(0);
+        // Scratch: per-target-config entry lists for the node being reversed.
+        let mut gather: Vec<Vec<(u32, u32)>> = Vec::new();
+        let mut gather_p: Vec<Vec<(u32, f32)>> = Vec::new();
         for i in 0..nodes {
             let n = &sv.nodes[i];
             child_start.push(t.node_child.len() as u32);
             t.node_child.extend(n.child.iter().map(|&c| c as u32));
+            for &c in &n.child {
+                t.node_parent[c] = i as u32;
+            }
             t.node_kind.push(if n.leaf {
                 2
             } else if n.chance {
@@ -264,33 +235,45 @@ impl TreeTables {
             obs_off.push(obs_start.len() as u32);
             obs_start.extend_from_slice(&n.obs_start);
             t.obs_act.extend_from_slice(&n.obs_act);
-            t.obs_child.extend_from_slice(&n.obs_child.iter().map(|&c| c as u32).collect::<Vec<_>>());
-            t.action_pays.extend_from_slice(&n.aslot);
-            t.action_fdown.extend_from_slice(&n.fdown.iter().map(|&b| b as u8).collect::<Vec<_>>());
+            t.obs_child
+                .extend(n.obs_child.iter().map(|&c| c as u32));
             draw_off.push(t.draw_to.len() as u32);
             t.draw_to.extend_from_slice(&n.draw.to);
             t.draw_p.extend_from_slice(&n.draw.p);
-            t.draw_steps.push(n.draw_steps);
             t.draw_row_off.push(t.draw_row_start.len() as u32);
             t.draw_row_start.extend_from_slice(&n.draw.start);
             if n.chance {
-                // Sanity: the flat CSR must cover the draw map's rows.
                 debug_assert_eq!(n.draw.start.len(), n.draw.rows() + 1);
+                // Reverse the draw CSR for the one public child: per child
+                // config, the (parent config, probability) entries.
+                let ch = n.child[0];
+                let me = n.player as usize;
+                let m = sv.nodes[ch].cfgs[me].len();
+                gather_p.iter_mut().for_each(|v| v.clear());
+                gather_p.resize(m.max(gather_p.len()), Vec::new());
+                let nme = n.cfgs[me].len();
+                for ci in 0..nme {
+                    let (to, pr) = n.draw.row(ci);
+                    for k in 0..to.len() {
+                        gather_p[to[k] as usize].push((ci as u32, pr[k]));
+                    }
+                }
+                t.rvd_row_of[ch] = (t.rvd_start.len() - 1) as u32;
+                for tv in gather_p[..m].iter() {
+                    for &(src, p) in tv {
+                        t.rvd_src.push(src);
+                        t.rvd_p.push(p);
+                    }
+                    t.rvd_start.push(t.rvd_src.len() as u32);
+                }
             }
-            reach_off.push(sv.roff[i]);
-            let (c0, c1) = (sv.nc[i][0] as usize, sv.nc[i][1] as usize);
-            let at = sv.roff[i] as usize + c0;
-            t.reach.extend_from_slice(&sv.reach[at - c0..at + c1]);
+            reach_off.push(reach_at);
+            let (c0, c1) = (n.cfgs[0].len() as u32, n.cfgs[1].len() as u32);
+            reach_at += c0 + c1;
             soff.push(sv.soff[i]);
             if !n.leaf && !n.chance {
                 let (na, me) = (n.na(), n.player as usize);
-                let nc = n.nc(me);
-                psi_off.push(psi.len() as u32 / AFEAT as u32);
-                let mut row = vec![0.0f32; AFEAT];
-                for a in 0..na {
-                    write_action_feats(&n.acts[a], &sv.ctx, me, n.aslot[a], n.fdown[a], &mut row);
-                    psi.extend_from_slice(&row);
-                }
+                let nc = n.cfgs[me].len();
                 // legal bits + trans, in soff order.
                 for c in 0..nc {
                     for a in 0..na {
@@ -303,31 +286,57 @@ impl TreeTables {
                         t.trans.push(n.trans[j]);
                     }
                 }
-            } else {
-                psi_off.push(psi.len() as u32 / AFEAT as u32);
+                // Reverse the strategy transitions per public child: per
+                // child config, the (parent config, strategy cell) entries.
+                for ch_i in 0..n.child.len() {
+                    let ch = n.child[ch_i];
+                    let m = sv.nodes[ch].cfgs[me].len();
+                    gather.iter_mut().for_each(|v| v.clear());
+                    gather.resize(m.max(gather.len()), Vec::new());
+                    let (s0, s1) = (n.obs_start[ch_i] as usize, n.obs_start[ch_i + 1] as usize);
+                    for &au in &n.obs_act[s0..s1] {
+                        let a = au as usize;
+                        for c in 0..nc {
+                            if !n.legal[c * na + a] {
+                                continue;
+                            }
+                            let tr = n.trans[c * na + a];
+                            if tr < 0 {
+                                continue;
+                            }
+                            gather[tr as usize]
+                                .push((c as u32, (sv.soff[i] as usize + c * na + a) as u32));
+                        }
+                    }
+                    t.rev_row_of[ch] = (t.rev_start.len() - 1) as u32;
+                    for tv in gather[..m].iter() {
+                        for &(src, cell) in tv {
+                            t.rev_src.push(src);
+                            t.rev_cell.push(cell);
+                        }
+                        t.rev_start.push(t.rev_src.len() as u32);
+                    }
+                }
             }
         }
         child_start.push(t.node_child.len() as u32);
         obs_off.push(obs_start.len() as u32);
         draw_off.push(t.draw_to.len() as u32);
         t.draw_row_off.push(t.draw_row_start.len() as u32);
-        reach_off.push(sv.reach.len() as u32);
-        psi_off.push(psi.len() as u32 / AFEAT as u32);
+        reach_off.push(reach_at);
         soff.push(sv.soff[nodes]);
         t.node_child_start = child_start;
         t.obs_off = obs_off;
         t.obs_start = obs_start;
         t.draw_off = draw_off;
         t.reach_off = reach_off;
-        t.psi_off = psi_off;
         t.soff = soff;
         t.cells = sv.ncells;
         t.ncells = sv.ncells;
         t.actions = t.obs_act.len();
         t.children = t.node_child.len();
         t.draw_entries = t.draw_to.len();
-        t.reach_len = t.reach.len();
-        t.npsi_rows = t.psi.len() / AFEAT;
+        t.reach_len = reach_at as usize;
         t.ids = sv.ids.to_vec();
 
         // Leaves.
@@ -556,22 +565,23 @@ impl Job {
         w.u32s(&t.obs_child);
         w.u8s(&t.legal_bits);
         w.i32s(&t.trans);
-        w.i8s(&t.action_pays);
-        w.u8s(&t.action_fdown);
         w.u32s(&t.draw_off);
         w.u32s(&t.draw_to);
         w.f32s(&t.draw_p);
-        w.u8s(&t.draw_steps);
         w.u32s(&t.draw_row_off);
         w.u32s(&t.draw_row_start);
         w.u32s(&t.cfg_off);
-        w.u32s(&t.cfg_id);
-        w.u8s(&t.cfg_hand);
-        w.u8s(&t.cfg_fd);
-        w.i8s(&t.cfg_pending);
         w.u32s(&t.reach_off);
-        w.f32s(&t.reach);
         w.u32s(&t.soff);
+        w.u32s(&t.node_parent);
+        w.u32s(&t.rev_row_of);
+        w.u32s(&t.rev_start);
+        w.u32s(&t.rev_src);
+        w.u32s(&t.rev_cell);
+        w.u32s(&t.rvd_row_of);
+        w.u32s(&t.rvd_start);
+        w.u32s(&t.rvd_src);
+        w.f32s(&t.rvd_p);
         // leaves
         w.u32s(&t.leaf_rows);
         w.u32s(&t.inner_rows);
@@ -582,13 +592,9 @@ impl Job {
         w.f32s(&t.leaf_xpub);
         // config table
         w.f32s(&t.cphi);
-        w.u64s(&t.cmap_key);
         // levels
         w.u32s(&t.bfs_order);
         w.u32s(&t.level_start);
-        // action features
-        w.u32s(&t.psi_off);
-        w.f32s(&t.psi);
         w.u8s(&t.ids);
         // beliefs
         w.f32s(&self.root[0]);
@@ -646,22 +652,23 @@ impl Job {
         t.obs_child = r.u32s("obs_child")?;
         t.legal_bits = r.u8s("legal_bits")?;
         t.trans = r.i32s("trans")?;
-        t.action_pays = r.i8s("action_pays")?;
-        t.action_fdown = r.u8s("action_fdown")?;
         t.draw_off = r.u32s("draw_off")?;
         t.draw_to = r.u32s("draw_to")?;
         t.draw_p = r.f32s("draw_p")?;
-        t.draw_steps = r.u8s("draw_steps")?;
         t.draw_row_off = r.u32s("draw_row_off")?;
         t.draw_row_start = r.u32s("draw_row_start")?;
         t.cfg_off = r.u32s("cfg_off")?;
-        t.cfg_id = r.u32s("cfg_id")?;
-        t.cfg_hand = r.u8s("cfg_hand")?;
-        t.cfg_fd = r.u8s("cfg_fd")?;
-        t.cfg_pending = r.i8s("cfg_pending")?;
         t.reach_off = r.u32s("reach_off")?;
-        t.reach = r.f32s("reach")?;
         t.soff = r.u32s("soff")?;
+        t.node_parent = r.u32s("node_parent")?;
+        t.rev_row_of = r.u32s("rev_row_of")?;
+        t.rev_start = r.u32s("rev_start")?;
+        t.rev_src = r.u32s("rev_src")?;
+        t.rev_cell = r.u32s("rev_cell")?;
+        t.rvd_row_of = r.u32s("rvd_row_of")?;
+        t.rvd_start = r.u32s("rvd_start")?;
+        t.rvd_src = r.u32s("rvd_src")?;
+        t.rvd_p = r.f32s("rvd_p")?;
         t.leaf_rows = r.u32s("leaf_rows")?;
         t.inner_rows = r.u32s("inner_rows")?;
         t.term_leaves = r.u32s("term_leaves")?;
@@ -670,11 +677,8 @@ impl Job {
         t.leaf_cidx = r.u32s("leaf_cidx")?;
         t.leaf_xpub = r.f32s("leaf_xpub")?;
         t.cphi = r.f32s("cphi")?;
-        t.cmap_key = r.u64s("cmap_key")?;
         t.bfs_order = r.u32s("bfs_order")?;
         t.level_start = r.u32s("level_start")?;
-        t.psi_off = r.u32s("psi_off")?;
-        t.psi = r.f32s("psi")?;
         t.ids = r.u8s("ids")?;
         // sanity checks
         rd_check(t.node_kind.len(), nodes, "node_kind")?;
@@ -686,25 +690,25 @@ impl Job {
         rd_check(t.draw_row_off.len(), nodes + 1, "draw_row_off")?;
         rd_check(t.reach_off.len(), nodes + 1, "reach_off")?;
         rd_check(t.soff.len(), nodes + 1, "soff")?;
-        rd_check(t.psi_off.len(), nodes + 1, "psi_off")?;
         rd_check(t.cfg_off.len(), 2 * nodes + 1, "cfg_off")?;
         rd_check(t.cphi.len(), ncfg * CFEAT, "cphi")?;
-        rd_check(t.cmap_key.len(), ncfg, "cmap_key")?;
         rd_check(t.leaf_xpub.len(), rows * pubfeat, "leaf_xpub")?;
         rd_check(t.leaf_coff.len(), 2 * rows + 1, "leaf_coff")?;
-        rd_check(t.psi.len() % AFEAT, 0, "psi")?;
+        rd_check(t.node_parent.len(), nodes, "node_parent")?;
+        rd_check(t.rev_row_of.len(), nodes, "rev_row_of")?;
+        rd_check(t.rvd_row_of.len(), nodes, "rvd_row_of")?;
+        rd_check(t.rev_src.len(), t.rev_cell.len(), "rev_cell")?;
+        rd_check(t.rvd_src.len(), t.rvd_p.len(), "rvd_p")?;
         t.cells = t.trans.len();
         t.actions = t.obs_act.len();
         t.children = t.node_child.len();
-        t.members = t.cfg_id.len();
         t.draw_entries = t.draw_to.len();
         t.nleaf = t.leaf_rows.len();
         t.nterm = t.term_leaves.len();
         t.n_inner = rows - t.nleaf;
         t.leaf_configs = t.leaf_cidx.len();
         t.nlevels = t.level_start.len() - 1;
-        t.reach_len = t.reach.len();
-        t.npsi_rows = t.psi.len() / AFEAT;
+        t.reach_len = *t.reach_off.last().unwrap_or(&0) as usize;
         let root = [
             r.f32s("root0")?,
             r.f32s("root1")?,
@@ -753,20 +757,18 @@ impl Job {
                 obs_child: vec![],
                 legal_bits: vec![],
                 trans: vec![],
-                action_pays: vec![],
-                action_fdown: vec![],
                 draw_off: vec![0, 0],
                 draw_row_off: vec![0, 0],
                 draw_row_start: vec![],
-                draw_steps: vec![0],
-                cfg_off: vec![0, 0, 0],
-                cfg_id: vec![],
-                cfg_hand: vec![],
-                cfg_fd: vec![],
-                cfg_pending: vec![],
-                reach_off: vec![0, 0],
-                reach: vec![],
+                cfg_off: vec![0, 1, 2],
+                reach_off: vec![0, 2],
+                reach_len: 2,
                 soff: vec![0, 0],
+                node_parent: vec![u32::MAX],
+                rev_row_of: vec![u32::MAX],
+                rev_start: vec![0],
+                rvd_row_of: vec![u32::MAX],
+                rvd_start: vec![0],
                 leaf_rows: vec![0],
                 term_leaves: vec![],
                 terminal_utility: vec![],
@@ -774,11 +776,8 @@ impl Job {
                 leaf_cidx: vec![0, 0],
                 leaf_xpub: vec![0.0; 8],
                 cphi: vec![0.0; CFEAT],
-                cmap_key: vec![42],
                 bfs_order: vec![0],
                 level_start: vec![0, 1],
-                psi_off: vec![0, 0],
-                psi: vec![],
                 ids: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
                 ..Default::default()
             },
@@ -800,5 +799,101 @@ mod tests {
         let back = Job::from_bytes(&bytes).expect("parse");
         assert_eq!(back.to_bytes(), bytes, "byte-identical round trip");
         assert_eq!(back.tables.cphi.len(), CFEAT);
+    }
+}
+
+#[cfg(test)]
+mod gather_tests {
+    use super::*;
+    use crate::search::{Cfg, Nets};
+    use crate::selfplay::{collect_roots, Agent, Collect, GameCfg};
+
+    /// The reverse (gather) tables must reproduce the forward propagate
+    /// exactly: replaying the solver's initial reach through them, level by
+    /// level, must land on the reach the CPU solver computed. This is the
+    /// arithmetic the GPU's forward sweep runs.
+    #[test]
+    fn gather_matches_forward() {
+        let cfg = Cfg { depth: 2, iters: 4, snapshots: true, ..Default::default() };
+        let nets = [Nets::default()];
+        let gc = GameCfg {
+            agents: [Agent::Rebel { cfg, slot: 0 }; 2],
+            collect: Collect::Rebel,
+            explore: 0.3,
+            random_draft: true,
+            eval_mix: 0.0,
+            mc_mix: 0.0,
+        };
+        let mut checked = 0;
+        for (s, bel) in collect_roots(10, 0x9E17, &nets, &gc, 6) {
+            let ctx = crate::rebel::Ctx::new(&s);
+            let sv = crate::search::Solver::new(&s, ctx, &nets[0], cfg, bel);
+            if sv.capped() {
+                continue;
+            }
+            let job = Job::from_solver(&sv, &[]);
+            let t = &job.tables;
+            let nc = |i: usize, p: usize| {
+                (t.cfg_off[2 * i + p + 1] - t.cfg_off[2 * i + p]) as usize
+            };
+            let mut reach = vec![0.0f32; t.reach_len];
+            // Root: both players' current beliefs, as the solver seeds them.
+            let (r0, r1) = (nc(0, 0), nc(0, 1));
+            reach[..r0].copy_from_slice(&job.root[0]);
+            reach[r0..r0 + r1].copy_from_slice(&job.root[1]);
+            for &ju in &t.bfs_order {
+                let j = ju as usize;
+                if j == 0 {
+                    continue;
+                }
+                let p = t.node_parent[j] as usize;
+                let me = t.node_player[p] as usize;
+                let op = 1 - me;
+                let at = |i: usize, pl: usize| {
+                    t.reach_off[i] as usize + if pl == 1 { nc(i, 0) } else { 0 }
+                };
+                // Idle player's block passes through unchanged.
+                for c in 0..nc(j, op) {
+                    reach[at(j, op) + c] = reach[at(p, op) + c];
+                }
+                if t.rev_row_of[j] != u32::MAX {
+                    let row0 = t.rev_row_of[j] as usize;
+                    for c in 0..nc(j, me) {
+                        let (lo, hi) = (
+                            t.rev_start[row0 + c] as usize,
+                            t.rev_start[row0 + c + 1] as usize,
+                        );
+                        let mut acc = 0.0f32;
+                        for k in lo..hi {
+                            acc += reach[at(p, me) + t.rev_src[k] as usize]
+                                * sv.cur[t.rev_cell[k] as usize];
+                        }
+                        reach[at(j, me) + c] = acc;
+                    }
+                } else {
+                    let row0 = t.rvd_row_of[j] as usize;
+                    for c in 0..nc(j, me) {
+                        let (lo, hi) = (
+                            t.rvd_start[row0 + c] as usize,
+                            t.rvd_start[row0 + c + 1] as usize,
+                        );
+                        let mut acc = 0.0f32;
+                        for k in lo..hi {
+                            acc += reach[at(p, me) + t.rvd_src[k] as usize] * t.rvd_p[k];
+                        }
+                        reach[at(j, me) + c] = acc;
+                    }
+                }
+            }
+            assert_eq!(reach.len(), sv.reach.len());
+            for (i, (a, b)) in reach.iter().zip(&sv.reach).enumerate() {
+                assert!(
+                    (a - b).abs() <= 1e-6 + 1e-5 * b.abs(),
+                    "reach diverges at {i}: {a} vs {b}"
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 4, "too few solves checked: {checked}");
     }
 }

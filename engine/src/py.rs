@@ -584,6 +584,7 @@ fn gpu_gen_data(
         cfr: cfr_of(cfr)?,
         warm,
         node_cap: 200_000,
+        ..Default::default()
     };
     let (agent, collect) = match mode {
         "greedy" => (Agent::Greedy { temp }, Collect::Mc),
@@ -754,6 +755,7 @@ fn gen_data(
         // boundaries); an unbounded build hangs a worker for minutes on one
         // decision. Capped solves fall back to a uniform policy instead.
         node_cap: 200_000,
+        ..Default::default()
     };
     let (agent, collect) = match mode {
         "greedy" => (Agent::Greedy { temp }, Collect::Mc),
@@ -811,6 +813,7 @@ fn eval_match(
         cfr: cfr_of(cfr)?,
         warm,
         node_cap: 200_000,
+        ..Default::default()
     };
     let cfg_b = Cfg {
         iters: iters_b.unwrap_or(iters),

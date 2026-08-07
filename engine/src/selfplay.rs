@@ -747,6 +747,9 @@ impl<'a> Game<'a> {
                             // snapshots or the carried beliefs, so it must
                             // not pay for either.
                             snapshots: gc.collect == Collect::Rebel,
+                            // On the GPU path the device builds its own
+                            // arenas; allocating them here too is waste.
+                            gpu_build: gpu.is_some(),
                             ..cfg
                         };
                         let mut sv = Solver::new(s, *ctx, &nets[slot], scfg, bel.clone());
