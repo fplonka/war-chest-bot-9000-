@@ -594,7 +594,6 @@ pub struct Solver<'a> {
     draw_scratch: DrawScratch,
     /// `key << IDX_BITS | cell` scratch for ordering a public child's support.
     cell_order: Vec<u64>,
-    dm: [DrawMap; 3],
 }
 
 impl Drop for Solver<'_> {
@@ -678,7 +677,6 @@ impl<'a> Solver<'a> {
             capped: false,
             draw_scratch: DrawScratch::default(),
             cell_order: Vec::new(),
-            dm: Default::default(),
         };
         {
             let _t = timed!(BUILD);
@@ -865,49 +863,42 @@ impl<'a> Solver<'a> {
             let td = timed!(BDRAW);
             let me = player as usize;
             let mut cs = s;
-            let mut cur: Vec<Config> = cfgs[me].to_vec();
-            let mut next: Vec<Config> = Vec::new();
-            let (mut draw, mut step, mut acc) = (
-                std::mem::take(&mut self.dm[0]),
-                std::mem::take(&mut self.dm[1]),
-                std::mem::take(&mut self.dm[2]),
-            );
-            let mut steps = 0u8;
+            let mut support: Vec<Config> = Vec::new();
+            let mut draw = DrawMap::default();
+            // The reserve and the face-up pile are what the draws read, and a
+            // draw changes neither (a refill does, and `run` accounts for it
+            // internally), so both come from the state at the head of the run.
+            let res = reserve(&cs, player, &self.ctx);
+            let fu = faceup_counts(&cs, player, &self.ctx);
             // A Warrior Priest draw's children carry the forced-play coin.
             let wp = matches!(s.pending(), Cont::WarriorPriestDraw { .. });
+            let mut steps = 0u8;
             loop {
                 let acts = cs.legal_actions();
                 debug_assert!(matches!(acts.first(), Some(Action::DrawCoin { .. })));
-                let res = reserve(&cs, player, &self.ctx);
-                let fu = faceup_counts(&cs, player, &self.ctx);
-                self.draw_scratch
-                    .transition(&cur, &res, &fu, &mut next, &mut step, wp);
-                if steps == 0 {
-                    std::mem::swap(&mut draw, &mut step);
-                } else {
-                    self.draw_scratch
-                        .compose(&draw, &step, next.len(), &mut acc);
-                    std::mem::swap(&mut draw, &mut acc);
-                }
-                std::mem::swap(&mut cur, &mut next);
                 cs.apply_inplace(acts[0]);
                 steps += 1;
                 if !(matches!(cs.pending(), Cont::Draw { .. }) && cs.to_act() == player) {
                     break;
                 }
             }
+            if wp {
+                debug_assert_eq!(steps, 1, "a WP draw is a single forced draw");
+                self.draw_scratch
+                    .transition(&cfgs[me], &res, &fu, &mut support, &mut draw, true);
+            } else {
+                self.draw_scratch
+                    .run(&cfgs[me], &res, &fu, steps, &mut support, &mut draw);
+            }
             drop(td);
             let mut cc = cfgs;
-            cc[me] = cur.as_slice().into();
+            cc[me] = support.as_slice().into();
             let ch = self.build(cs, depth, cc);
             let n = &mut self.nodes[id];
             n.chance = true;
             n.child = vec![ch];
-            // The node keeps its own map; the other two buffers go back to the
-            // scratch set for the next chance node.
             n.draw = draw;
             n.draw_steps = steps;
-            self.dm = [DrawMap::default(), step, acc];
             return id;
         }
 

@@ -623,9 +623,120 @@ impl DrawScratch {
             }
             map.start.push(self.kid.len() as u32);
         }
-        // Sort once by integer key, then read the support and the child index
-        // of every row off that single ordering — no per-row binary search.
         drop(tg);
+        self.pack(support, map);
+    }
+
+    /// A whole run of `k` round-start draws as one transition.
+    ///
+    /// Drawing `k` coins without replacement is multivariate hypergeometric:
+    /// `P(x) = prod C(bag_i, x_i) / C(B, k)`. The per-draw composition this
+    /// replaces built the same distribution one draw at a time over supports
+    /// that grew ~5x per step, and was the largest non-network CPU cost.
+    ///
+    /// The refill rule (RULES.md §4.1) splits a run in two: when the bag
+    /// holds fewer than `k` coins, the whole bag is drawn (deterministic),
+    /// the discard pile refills it (face-down forgotten), and the remainder
+    /// is hypergeometric over the refilled source. Warrior Priest draws stay
+    /// on `transition`: they are single draws that set `pending_coin`.
+    pub fn run(
+        &mut self,
+        cfg: &[Config],
+        reserve: &[u8; NSLOT],
+        faceup: &[u8; NSLOT],
+        k: u8,
+        support: &mut Vec<Config>,
+        map: &mut DrawMap,
+    ) {
+        let tg = crate::timed!(DGEN);
+        self.kid.clear();
+        self.prob.clear();
+        map.start.clear();
+        map.start.push(0);
+        let k = k as u32;
+        for c in cfg.iter() {
+            let bag = c.bag(reserve);
+            let b: u32 = bag.iter().map(|&x| x as u32).sum();
+            if b >= k {
+                self.deal(&bag, k, *c);
+            } else {
+                // The whole bag is drawn. Then the discards refill it.
+                let mut base = *c;
+                for s in 0..NSLOT {
+                    base.hand[s] += bag[s];
+                }
+                let mut r = [0u8; NSLOT];
+                for s in 0..NSLOT {
+                    r[s] = faceup[s] + c.fd[s];
+                }
+                let rt: u32 = r.iter().map(|&x| x as u32).sum();
+                let left = k - b;
+                if rt == 0 {
+                    // Nothing to refill from: the remaining draws are no-ops
+                    // and the face-down pile never moved (`transition` keeps
+                    // the config unchanged in this case too).
+                    self.kid.push(base);
+                    self.prob.push(1.0);
+                } else {
+                    base.fd = [0; NSLOT];
+                    if rt <= left {
+                        // Shortage: the refilled bag is drawn dry as well.
+                        for s in 0..NSLOT {
+                            base.hand[s] += r[s];
+                        }
+                        self.kid.push(base);
+                        self.prob.push(1.0);
+                    } else {
+                        self.deal(&r, left, base);
+                    }
+                }
+            }
+            map.start.push(self.kid.len() as u32);
+        }
+        drop(tg);
+        self.pack(support, map);
+    }
+
+    /// Every way to draw `k` coins from `src`, with hypergeometric weight,
+    /// appended to `kid`/`prob`. Children enumerate in slot order, which is
+    /// deterministic; `pack` sorts them by key anyway.
+    fn deal(&mut self, src: &[u8; NSLOT], k: u32, base: Config) {
+        fn choose(n: u32, k: u32) -> f64 {
+            (0..k).map(|i| (n - i) as f64 / (i + 1) as f64).product()
+        }
+        fn rec(
+            src: &[u8; NSLOT],
+            slot: usize,
+            left: u32,
+            num: f64,
+            c: Config,
+            denom: f64,
+            kid: &mut Vec<Config>,
+            prob: &mut Vec<f32>,
+        ) {
+            if slot == NSLOT {
+                if left == 0 {
+                    debug_assert!(c.hand_size() as usize <= HAND_CAP);
+                    kid.push(c);
+                    prob.push((num / denom) as f32);
+                }
+                return;
+            }
+            for x in 0..=left.min(src[slot] as u32) {
+                let mut c2 = c;
+                c2.hand[slot] += x as u8;
+                rec(src, slot + 1, left - x, num * choose(src[slot] as u32, x), c2, denom,
+                    kid, prob);
+            }
+        }
+        let total: u32 = src.iter().map(|&x| x as u32).sum();
+        rec(src, 0, k, 1.0, base, choose(total, k), &mut self.kid, &mut self.prob);
+    }
+
+    /// Sort the emitted children once by integer key, then read the support
+    /// and the child index of every row off that single ordering — no per-row
+    /// binary search. Shared by `transition` and `run`.
+    fn pack(&mut self, support: &mut Vec<Config>, map: &mut DrawMap) {
         let _ts = crate::timed!(DSORT);
         assert!(self.kid.len() < 1 << IDX_BITS, "draw fan-out over the index width");
         self.order.clear();
@@ -1193,4 +1304,155 @@ pub fn expand_row(row: &[u8], hand_size: &[u8; 2], fd_size: &[u8; 2], bag_size: 
         u16::from_le_bytes([row[ROW_PLIES], row[ROW_PLIES + 1]]),
         out,
     );
+}
+
+#[cfg(test)]
+mod draw_tests {
+    use super::*;
+
+    /// The per-draw composition `run` replaced, kept as the test reference.
+    /// `(res, fu)` evolve the way the state's do: a step that finds the bag
+    /// empty refills from the discards, after which the face-up pile is empty
+    /// and the reserve has grown by it.
+    fn composed(
+        cfg: &[Config],
+        res0: &[u8; NSLOT],
+        fu0: &[u8; NSLOT],
+        k: u8,
+    ) -> (Vec<Config>, DrawMap) {
+        let mut sc = DrawScratch::default();
+        let (mut res, mut fu) = (*res0, *fu0);
+        let mut cur = cfg.to_vec();
+        let mut next = Vec::new();
+        let (mut draw, mut step, mut acc) = (DrawMap::default(), DrawMap::default(), DrawMap::default());
+        for j in 0..k {
+            // Bag size is public, so config 0 speaks for the whole support.
+            let empty = cur[0].bag(&res).iter().all(|&x| x == 0);
+            sc.transition(&cur, &res, &fu, &mut next, &mut step, false);
+            if j == 0 {
+                std::mem::swap(&mut draw, &mut step);
+            } else {
+                sc.compose(&draw, &step, next.len(), &mut acc);
+                std::mem::swap(&mut draw, &mut acc);
+            }
+            std::mem::swap(&mut cur, &mut next);
+            if empty {
+                for s in 0..NSLOT {
+                    res[s] += fu[s];
+                    fu[s] = 0;
+                }
+            }
+        }
+        (cur, draw)
+    }
+
+    fn assert_same(cfg: &[Config], res: &[u8; NSLOT], fu: &[u8; NSLOT], k: u8, what: &str) {
+        let (want_sup, want) = composed(cfg, res, fu, k);
+        let mut sc = DrawScratch::default();
+        let (mut sup, mut map) = (Vec::new(), DrawMap::default());
+        sc.run(cfg, res, fu, k, &mut sup, &mut map);
+        assert_eq!(sup, want_sup, "{what}: support");
+        assert_eq!(map.rows(), want.rows(), "{what}: rows");
+        for i in 0..map.rows() {
+            let (gt, gp) = map.row(i);
+            let (wt, wp) = want.row(i);
+            let mut got: Vec<(u32, f32)> = gt.iter().copied().zip(gp.iter().copied()).collect();
+            let mut wnt: Vec<(u32, f32)> = wt.iter().copied().zip(wp.iter().copied()).collect();
+            got.sort_by_key(|e| e.0);
+            wnt.sort_by_key(|e| e.0);
+            assert_eq!(
+                got.iter().map(|e| e.0).collect::<Vec<_>>(),
+                wnt.iter().map(|e| e.0).collect::<Vec<_>>(),
+                "{what}: row {i} children"
+            );
+            for (g, w) in got.iter().zip(&wnt) {
+                assert!((g.1 - w.1).abs() < 1e-5, "{what}: row {i} prob {} vs {}", g.1, w.1);
+            }
+            let tot: f32 = gp.iter().sum();
+            assert!((tot - 1.0).abs() < 1e-5, "{what}: row {i} sums to {tot}");
+        }
+    }
+
+    /// Distribute `total` over the slots without exceeding `cap[s] - used[s]`.
+    fn spread(rng: &mut crate::rng::Rng, total: u8, cap: &[u8; NSLOT], used: &[u8; NSLOT]) -> Option<[u8; NSLOT]> {
+        let mut out = [0u8; NSLOT];
+        'outer: for _ in 0..total {
+            for _ in 0..32 {
+                let s = (rng.next_u64() % NSLOT as u64) as usize;
+                if used[s] + out[s] < cap[s] {
+                    out[s] += 1;
+                    continue 'outer;
+                }
+            }
+            return None;
+        }
+        Some(out)
+    }
+
+    #[test]
+    fn run_matches_composition() {
+        // Hand-built cases for each branch, then fuzz.
+        let c = |hand: [u8; NSLOT], fd: [u8; NSLOT]| Config { hand, fd, pending_coin: None };
+
+        // Plenty in the bag: pure hypergeometric.
+        assert_same(
+            &[c([0; NSLOT], [1, 1, 0, 0, 0]), c([0; NSLOT], [0, 0, 1, 1, 0])],
+            &[5, 4, 3, 2, 5], &[1, 0, 2, 0, 0], 3, "plenty",
+        );
+        // Mid-run refill: one coin in the bag, three to draw. Every config
+        // fits under the reserve per slot and shares the public totals.
+        assert_same(
+            &[
+                c([0; NSLOT], [2, 1, 0, 0, 0]),
+                c([0; NSLOT], [2, 0, 1, 0, 0]),
+                c([0; NSLOT], [1, 1, 1, 0, 0]),
+            ],
+            &[2, 1, 1, 0, 0], &[1, 2, 0, 0, 0], 3, "refill",
+        );
+        // Empty refill: nothing face-up, nothing face-down.
+        assert_same(
+            &[c([1, 0, 0, 0, 0], [0; NSLOT])],
+            &[2, 0, 0, 0, 0], &[0; NSLOT], 2, "empty refill",
+        );
+        // Shortage: an empty bag, and a refill too small for the run.
+        assert_same(
+            &[c([0; NSLOT], [0; NSLOT])],
+            &[0; NSLOT], &[2, 0, 0, 0, 0], 3, "shortage",
+        );
+        // Refill drawn exactly dry.
+        assert_same(
+            &[c([0; NSLOT], [0; NSLOT])],
+            &[1, 1, 0, 0, 0], &[1, 0, 0, 0, 0], 3, "exact dry",
+        );
+
+        let mut rng = crate::rng::Rng::new(0xD12A);
+        let mut done = 0;
+        while done < 300 {
+            let mut res = [0u8; NSLOT];
+            for s in 0..NSLOT {
+                res[s] = (rng.next_u64() % 4) as u8;
+            }
+            let mut fu = [0u8; NSLOT];
+            for s in 0..NSLOT {
+                fu[s] = (rng.next_u64() % 2) as u8;
+            }
+            let ht = (rng.next_u64() % 3) as u8;
+            let fdt = (rng.next_u64() % 4) as u8;
+            let k = 3 - ht;
+            // A support whose members share the public totals.
+            let mut cfgs = Vec::new();
+            for _ in 0..6 {
+                let Some(hand) = spread(&mut rng, ht, &res, &[0; NSLOT]) else { continue };
+                let Some(fd) = spread(&mut rng, fdt, &res, &hand) else { continue };
+                cfgs.push(c(hand, fd));
+            }
+            if cfgs.is_empty() {
+                continue;
+            }
+            cfgs.sort_by_key(|x| x.key());
+            cfgs.dedup();
+            assert_same(&cfgs, &res, &fu, k, "fuzz");
+            done += 1;
+        }
+    }
 }
