@@ -477,6 +477,16 @@ impl Service {
         }
         self.upload_descs();
         if !belief.is_empty() {
+            // Size the packed scratch *before* the belief kernel writes it
+            // (the head's GEMMs read the same rows).
+            let rows: usize = belief.iter().map(|&s| self.live[s].as_ref().unwrap().nleaf).sum();
+            let (dg, hd, rk) = (self.weights.dims[4], self.weights.dims[2], self.weights.dims[5]);
+            if self.xb.len() < rows * 2 * dg {
+                self.xb = self.stream.alloc_zeros(rows * 2 * dg).unwrap();
+                self.h = self.stream.alloc_zeros(rows * hd).unwrap();
+                self.u = self.stream.alloc_zeros(rows * rk).unwrap();
+                self.h0p = self.stream.alloc_zeros(rows * hd).unwrap();
+            }
             self.launch_belief(&belief);
             self.launch_head(&belief);
         }
@@ -1541,6 +1551,14 @@ impl Service {
             sv.desc.mode = 0;
             sv.desc.traverser = 0;
             sv.desc.strat_src = 0;
+            let rows = sv.nleaf;
+            let (dg, hd, rk) = (self.weights.dims[4], self.weights.dims[2], self.weights.dims[5]);
+            if self.xb.len() < rows * 2 * dg {
+                self.xb = self.stream.alloc_zeros(rows * 2 * dg).unwrap();
+                self.h = self.stream.alloc_zeros(rows * hd).unwrap();
+                self.u = self.stream.alloc_zeros(rows * rk).unwrap();
+                self.h0p = self.stream.alloc_zeros(rows * hd).unwrap();
+            }
             self.upload_descs();
             self.launch_belief(&[s]);
             self.launch_head(&[s]);
