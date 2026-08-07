@@ -1,41 +1,55 @@
-//! The GPU service thread: owns GPU-0, keeps the live set of solves
-//! resident, and advances it with ticks (docs/arch plan, section 8, B3).
+//! The GPU service thread: owns GPU-0, keeps the live set of solves resident,
+//! and advances it with ticks (plan section 8, B3).
 //!
-//! A tick runs each phase once over the solves that need it: the belief
-//! sums, the head (cuBLAS GEMMs + LayerNorm), the value readout, the
-//! backward sweep, regret matching, the forward reach sweep, the average
-//! accumulation, and bookkeeping. Solves in the value stage run one
-//! fixed-policy pass per tick; solves in the carry stage propagate one
-//! snapshot per tick. Per-solve scalars (stage, t, traverser, mode) come
-//! from the solve descriptor, so solves at different t share a tick.
+//! A tick runs the phases once each over the solves that need them. Solves in
+//! the iterate stage take one CFR iteration; solves in the value stage take
+//! one fixed-policy pass over a carried root; solves in the carry stage
+//! propagate one kept snapshot to the exit leaf. Per-solve state comes from
+//! the descriptor and per-phase switches from the launch group, so solves at
+//! different iterations share a tick and no alignment is needed.
 //!
-//! The kernel arena layout and the phase math are the Rust solver's; the
-//! in-crate tests compare against it.
+//! Two invariants make this file short. Device memory is described once, in
+//! `layout.rs`, and reached only through the accessors it generates. And
+//! every kernel has the same signature, so `Service::launch` is the only
+//! launch site — there is no per-kernel argument plumbing to get wrong.
 
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
-use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
-use cudarc::driver::safe::{CudaContext, CudaModule, CudaStream, LaunchConfig};
-use std::sync::Arc;
-use cudarc::driver::{CudaSlice, CudaView, DevicePtr, DevicePtrMut, PushKernelArg};
+use cudarc::cublas::CudaBlas;
+use cudarc::driver::safe::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig};
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, PushKernelArg};
 use cudarc::nvrtc;
 
 use crate::serialize::{Job, JobMeta};
 
 use super::client::{Cmd, GpuClient, Trip1, Trip2};
+use super::layout::{
+    arena_offsets, cuda_preamble, pack_tables, Arena, Derived, Desc, Sizes, Tbl, N_ARENAS,
+    STAGE_CARRY, STAGE_ITERATE, STAGE_VALUE,
+};
 
-/// Live-set capacity (solve slots). Sized from p99 tree sizes; each solve
-/// holds a few MB of device arenas.
+/// Live-set capacity, in solve slots.
 const CAP: usize = 256;
 
-// ------------------------------------------------------------------ devices
+/// Row-pool capacity. A solve's network rows are its non-terminal leaves; the
+/// p99 tree has a few hundred. The pool holds the whole live set at once, so
+/// a solve's rows are contiguous and stable for its lifetime and no tick ever
+/// packs them.
+const MAX_ROWS: usize = 128 * 1024;
 
-/// The `Weights` struct of kernels.cu, as Rust.
+/// Threads per block for the flat phases.
+const BLOCK: u32 = 256;
+
+// ------------------------------------------------------------------ context
+
+/// The `Ctx` struct of kernels.cu: the weights and the row pools, everything
+/// a tick shares across solves.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct WeightsDev {
+struct Ctx {
     w0: *const f32, b0: *const f32, ln0w: *const f32, ln0b: *const f32,
     w1: *const f32, b1: *const f32, ln1w: *const f32, ln1b: *const f32,
     wb: *const f32, wu: *const f32, bu: *const f32,
@@ -45,130 +59,149 @@ struct WeightsDev {
     wid: *const f32, wpile: *const f32, bpile: *const f32,
     wq: *const f32, bq: *const f32, wk: *const f32, bk: *const f32,
     wp: *const f32, bp: *const f32,
+    h0: *mut f32, xb: *mut f32, h: *mut f32, u: *mut f32,
+    bx: *mut f32, bh: *mut f32, bgather: *mut f32,
     hidden: i32, head: i32, dg: i32, rk: i32, de: i32, dc: i32,
-    af: i32, xd: i32, hf: i32, cfeat: i32,
+    af: i32, xd: i32, hf: i32, cfeat: i32, pubfeat: i32,
 }
 
-/// The `SolveDesc` struct of kernels.cu, as Rust.
+unsafe impl cudarc::driver::DeviceRepr for Ctx {}
+unsafe impl cudarc::driver::ValidAsZeroBits for Ctx {}
+unsafe impl Send for Ctx {}
+
+/// The `Group` struct of kernels.cu: which solves a launch covers, where each
+/// one's threads start, and the switches every solve in it shares.
 #[repr(C)]
-#[derive(Clone, Copy)]
-struct SolveDesc {
-    reach: *mut f32, vals: *mut f32, regret: *mut f32, inst: *mut f32, cur: *mut f32,
-    sum_strat: *mut f32, avg: *mut f32, snaps: *mut f32,
-    cz: *mut f32, cg: *mut f32, q: *mut f32,
-    root0: *const f32, root1: *const f32,
-    node_kind: *const u8, node_player: *const u8, node_leaf: *const u8,
-    node_child_start: *const u32, node_child: *const u32,
-    obs_off: *const u32, obs_start: *const u32, obs_act: *const u32, obs_child: *const u32,
-    legal_bits: *const u8, trans: *const i32,
-    draw_off: *const u32, draw_to: *const u32, draw_p: *const f32, draw_steps: *const u8,
-    draw_row_off: *const u32, draw_row_start: *const u32,
-    cfg_off: *const u32, reach_off: *const u32, soff: *const u32, voff: *const u32,
-    act_off: *const u32,
-    leaf_rows: *const u32, term_leaves: *const u32, terminal_utility: *const f32,
-    leaf_coff: *const u32, leaf_cidx: *const u32,
-    bfs_order: *const u32, level_start: *const u32,
-    nodes: i32, rows: i32, nleaf: i32, nterm: i32, ncells: i32, ncfg: i32,
-    nlevels: i32, nsnaps: i32, snap_t: i32, t: i32, traverser: i32, stage: i32,
-    step: i32, mode: i32, leaf: i32, first_query: i32, snapshots: i32,
-    alpha: f32, beta: f32, gamma: f32, predict: f32,
-    steps: [i32; 2], nroots: i32, max_nc: i32, strat_src: i32,
-    row_off: i32, nplayers: i32, p_player: i32,
+#[derive(Clone, Copy, Default)]
+struct GroupDev {
+    slots: *const i32,
+    starts: *const i32,
+    n: i32,
+    total: i32,
+    mode: i32,
+    p_player: i32,
+    nplayers: i32,
+    strat_src: i32,
 }
 
-unsafe impl cudarc::driver::DeviceRepr for SolveDesc {}
-unsafe impl cudarc::driver::DeviceRepr for WeightsDev {}
-unsafe impl cudarc::driver::ValidAsZeroBits for SolveDesc {}
-unsafe impl cudarc::driver::ValidAsZeroBits for WeightsDev {}
+unsafe impl cudarc::driver::DeviceRepr for GroupDev {}
+unsafe impl cudarc::driver::ValidAsZeroBits for GroupDev {}
+unsafe impl Send for GroupDev {}
 
-const STAGE_ITERATE: i32 = 0;
-const STAGE_VALUE: i32 = 1;
-const STAGE_CARRY: i32 = 2;
+impl Default for Ctx {
+    fn default() -> Ctx {
+        // SAFETY: every field is an integer or a device pointer.
+        unsafe { std::mem::zeroed() }
+    }
+}
 
-/// The device-side weights: the flat arrays plus a device copy of the
-/// pointer table the kernels read.
+/// The per-phase switches a launch carries: regret mode, the current
+/// strategy, one player. Phases that need something else name it.
+#[derive(Clone, Copy, Default, PartialEq)]
+struct Phase {
+    mode: i32,
+    p_player: i32,
+    nplayers: i32,
+    strat_src: i32,
+}
+
+/// The default phase, spelled short because most launches take it as is.
+const P: Phase = Phase { mode: 0, p_player: 0, nplayers: 1, strat_src: 0 };
+
+/// `p_player` sentinel: each solve uses its own traverser rather than one
+/// player fixed for the whole group.
+const TRAVERSER: i32 = -1;
+
+/// How far into a CFR iteration to run. Only the phase oracle test stops
+/// short; the tick always runs `All`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Step {
+    Build,
+    None,
+    Head,
+    Readout,
+    Backprop,
+    Regret,
+    Propagate,
+    Average,
+    All,
+}
+
+// ------------------------------------------------------------------ weights
+
+/// The network's flat arrays on the device, plus the derived pointer table.
 struct Weights {
     dims: Vec<usize>,
-    w: CudaSlice<f32>,
-    b: CudaSlice<f32>,
-    ln: CudaSlice<f32>,
-    dev: CudaSlice<WeightsDev>,
+    _w: CudaSlice<f32>,
+    _b: CudaSlice<f32>,
+    _ln: CudaSlice<f32>,
+    ctx: Ctx,
 }
 
-/// Pointer offsets into the flat arrays, following `Mlp::from_flat`'s layout
-/// (train/value_net.py::flat is the same order).
-fn weight_offsets(dims: &[usize]) -> Result<(Vec<(usize, usize)>, Vec<(usize, usize)>, Vec<(usize, usize)>), String> {
+/// Slice bounds of the flat arrays, following `Mlp::from_flat`'s layout
+/// (train/value_net.py::flat writes the same order). The last entry of each
+/// scan is that array's total length, which is how callers size one.
+pub fn weight_offsets(
+    dims: &[usize],
+) -> Result<(Vec<usize>, Vec<usize>, Vec<usize>), String> {
     if dims.len() != 10 || dims[9] != 0 {
         return Err(format!("gpu: unsupported dims {dims:?}"));
     }
     let (h, hd, dg, rk, de, dc) = (dims[1], dims[2], dims[4], dims[5], dims[7], dims[8]);
-    let (af, hf, xd) = (
-        dims[6] + de,
-        4 + de,
-        crate::board::N_HEXES * (crate::rebel::HEX_FACTS + de) + 2 * de + crate::rebel::LOOSE,
-    );
-    let cf = crate::units::CARD_FEATS;
-    let nu = crate::units::N_UNITS;
-    let pc = crate::rebel::PILE_COUNTS;
-    let mut w = Vec::new();
-    let mut at = 0usize;
-    let mut take = |n: usize| {
-        w.push((at, n));
-        at += n;
+    let (af, hf, xd) = (dims[6] + de, crate::net::hfeat(de), xdim(de));
+    let (cf, nu, pc) = (crate::units::CARD_FEATS, crate::units::N_UNITS, crate::rebel::PILE_COUNTS);
+    let scan = |lens: &[usize]| {
+        let mut at = 0;
+        let mut v = Vec::with_capacity(lens.len() + 1);
+        for &n in lens {
+            v.push(at);
+            at += n;
+        }
+        v.push(at);
+        v
     };
-    take(cf * dc); take(dc * de); take(nu * de); take((pc + de) * de);
-    take(xd * h); take(h * hd); take(2 * dg * hd); take(hf * dg);
-    take(dg * dg); take(dg * dg); take(dg * (rk + 1)); take(hd * rk);
-    take(af * rk); take(dg * rk); take(hd * rk);
-    let mut b = Vec::new();
-    let mut atb = 0usize;
-    let mut takeb = |n: usize| {
-        b.push((atb, n));
-        atb += n;
-    };
-    takeb(dc); takeb(de); takeb(de); takeb(h); takeb(hd); takeb(dg);
-    takeb(dg); takeb(dg); takeb(rk + 1); takeb(rk); takeb(rk); takeb(rk); takeb(rk);
-    let ln = vec![(0, h), (h, h), (2 * h, hd), (2 * h + hd, hd)];
-    Ok((w, b, ln))
+    Ok((
+        scan(&[cf * dc, dc * de, nu * de, (pc + de) * de, xd * h, h * hd, 2 * dg * hd,
+               hf * dg, dg * dg, dg * dg, dg * (rk + 1), hd * rk, af * rk, dg * rk, hd * rk]),
+        scan(&[dc, de, de, h, hd, dg, dg, dg, rk + 1, rk, rk, rk, rk]),
+        scan(&[h, h, hd, hd]),
+    ))
+}
+
+/// The trunk input width: the hex block, the two per-player pile summaries,
+/// and the loose scalars.
+fn xdim(de: usize) -> usize {
+    crate::board::N_HEXES * (crate::rebel::HEX_FACTS + de) + 2 * de + crate::rebel::LOOSE
 }
 
 impl Weights {
     fn upload(
-        stream: Arc<CudaStream>,
+        stream: &Arc<CudaStream>,
+        pools: &Pools,
         dims: Vec<usize>,
         w: Vec<f32>,
         b: Vec<f32>,
         ln: Vec<f32>,
     ) -> Result<Weights, String> {
-        let (off_w, off_b, off_ln) = weight_offsets(&dims)?;
-        let total = |v: &[(usize, usize)]| v.last().map(|&(a, l)| a + l).unwrap_or(0);
-        if w.len() != total(&off_w) || b.len() != total(&off_b) || ln.len() != total(&off_ln) {
+        let (ow, ob, oln) = weight_offsets(&dims)?;
+        let want = |o: &[usize]| *o.last().unwrap();
+        if w.len() != want(&ow) || b.len() != want(&ob) || ln.len() != want(&oln) {
             return Err(format!(
                 "gpu: weight sizes {}/{}/{} do not match dims {dims:?}",
                 w.len(), b.len(), ln.len()
             ));
         }
-        let mut wb = unsafe { stream.alloc(w.len()) }.map_err(|e| format!("{e:?}"))?;
-        stream.memcpy_htod(&w, &mut wb).map_err(|e| format!("{e:?}"))?;
-        let mut bb = unsafe { stream.alloc(b.len()) }.map_err(|e| format!("{e:?}"))?;
-        stream.memcpy_htod(&b, &mut bb).map_err(|e| format!("{e:?}"))?;
-        let mut lb = unsafe { stream.alloc(ln.len()) }.map_err(|e| format!("{e:?}"))?;
-        stream.memcpy_htod(&ln, &mut lb).map_err(|e| format!("{e:?}"))?;
-        let wptr = device_ptr_of(&stream, &wb);
-        let bptr = device_ptr_of(&stream, &bb);
-        let lnptr = device_ptr_of(&stream, &lb);
-        let w_at = |i: usize| unsafe { wptr.add(off_w[i].0) };
-        let b_at = |i: usize| unsafe { bptr.add(off_b[i].0) };
-        let ln_at = |i: usize| unsafe { lnptr.add(off_ln[i].0) };
+        let wb = htod(stream, &w)?;
+        let bb = htod(stream, &b)?;
+        let lb = htod(stream, &ln)?;
+        let (wp, bp, lp) = (ptr(stream, &wb), ptr(stream, &bb), ptr(stream, &lb));
+        let w_at = |i: usize| unsafe { wp.add(ow[i]) };
+        let b_at = |i: usize| unsafe { bp.add(ob[i]) };
+        let l_at = |i: usize| unsafe { lp.add(oln[i]) };
         let (h, hd, dg, rk, de, dc) = (dims[1], dims[2], dims[4], dims[5], dims[7], dims[8]);
-        let (af, hf, xd) = (
-            dims[6] + de,
-            4 + de,
-            crate::board::N_HEXES * (crate::rebel::HEX_FACTS + de) + 2 * de + crate::rebel::LOOSE,
-        );
-        let dev = WeightsDev {
-            w0: w_at(4), b0: b_at(3), ln0w: ln_at(0), ln0b: ln_at(1),
-            w1: w_at(5), b1: b_at(4), ln1w: ln_at(2), ln1b: ln_at(3),
+        let ctx = Ctx {
+            w0: w_at(4), b0: b_at(3), ln0w: l_at(0), ln0b: l_at(1),
+            w1: w_at(5), b1: b_at(4), ln1w: l_at(2), ln1b: l_at(3),
             wb: w_at(6), wu: w_at(11), bu: b_at(9),
             wc: w_at(7), bc: b_at(5), wh1: w_at(8), bh1: b_at(6),
             wh2: w_at(9), bh2: b_at(7), wg: w_at(10), bg: b_at(8),
@@ -176,139 +209,193 @@ impl Weights {
             wid: w_at(2), wpile: w_at(3), bpile: b_at(2),
             wq: w_at(12), bq: b_at(10), wk: w_at(13), bk: b_at(11),
             wp: w_at(14), bp: b_at(12),
+            h0: pools.h0_ptr, xb: pools.xb_ptr, h: pools.h_ptr, u: pools.u_ptr,
+            bx: pools.bx_ptr, bh: pools.bh_ptr, bgather: pools.bg_ptr,
             hidden: h as i32, head: hd as i32, dg: dg as i32, rk: rk as i32,
-            de: de as i32, dc: dc as i32, af: af as i32, xd: xd as i32,
-            hf: hf as i32, cfeat: crate::rebel::CFEAT as i32,
+            de: de as i32, dc: dc as i32, af: (dims[6] + de) as i32,
+            xd: xdim(de) as i32, hf: (crate::rebel::PILE_COUNTS + de) as i32,
+            cfeat: crate::rebel::CFEAT as i32, pubfeat: crate::rebel::PUBFEAT as i32,
         };
-        let mut dev_buf = unsafe { stream.alloc(1) }.map_err(|e| format!("{e:?}"))?;
-        stream.memcpy_htod(&[dev], &mut dev_buf).map_err(|e| format!("{e:?}"))?;
-        Ok(Weights { dims, w: wb, b: bb, ln: lb, dev: dev_buf })
+        Ok(Weights { dims, _w: wb, _b: bb, _ln: lb, ctx })
     }
 }
+
+// ------------------------------------------------------------------ pools
+
+/// The row pools: one contiguous buffer per network activation, indexed by a
+/// solve's stable row base. Building a solve writes its `h0` rows straight in,
+/// so the head's GEMMs run over the live set with no packing step.
+struct Pools {
+    _h0: CudaSlice<f32>,
+    _xb: CudaSlice<f32>,
+    _h: CudaSlice<f32>,
+    _u: CudaSlice<f32>,
+    _bx: CudaSlice<f32>,
+    _bh: CudaSlice<f32>,
+    _bg: CudaSlice<f32>,
+    h0_ptr: *mut f32,
+    xb_ptr: *mut f32,
+    h_ptr: *mut f32,
+    u_ptr: *mut f32,
+    bx_ptr: *mut f32,
+    bh_ptr: *mut f32,
+    bg_ptr: *mut f32,
+    /// Allocated row ranges, sorted by start; first fit.
+    used: Vec<(usize, usize)>,
+    /// One past the highest row in use, which is how far the head GEMMs run.
+    high: usize,
+}
+
+impl Pools {
+    fn new(stream: &Arc<CudaStream>, dims: &[usize]) -> Result<Pools, String> {
+        let (h, hd, dg, rk, de) = (dims[1], dims[2], dims[4], dims[5], dims[7]);
+        // The build's widest use of each scratch: the trunk input, the widest
+        // hidden matrix, and the widest gather.
+        let bx = MAX_BUILD_ROWS * xdim(de);
+        let bh = MAX_BUILD_ROWS.max(MAX_CFG * crate::rebel::NSLOT) * h.max(dg);
+        let bg = (MAX_BUILD_ROWS * crate::rebel::NTYPE * de + crate::rebel::NTYPE * de)
+            .max(MAX_CFG * crate::rebel::NSLOT * crate::net::hfeat(de));
+        let mut p = Pools {
+            _h0: zeros(stream, MAX_ROWS * hd)?,
+            _xb: zeros(stream, MAX_ROWS * 2 * dg)?,
+            _h: zeros(stream, MAX_ROWS * hd.max(h))?,
+            _u: zeros(stream, MAX_ROWS * rk)?,
+            _bx: zeros(stream, bx)?,
+            _bh: zeros(stream, bh)?,
+            _bg: zeros(stream, bg)?,
+            h0_ptr: std::ptr::null_mut(), xb_ptr: std::ptr::null_mut(),
+            h_ptr: std::ptr::null_mut(), u_ptr: std::ptr::null_mut(),
+            bx_ptr: std::ptr::null_mut(), bh_ptr: std::ptr::null_mut(),
+            bg_ptr: std::ptr::null_mut(),
+            used: Vec::new(),
+            high: 0,
+        };
+        p.h0_ptr = ptr_mut(stream, &mut p._h0);
+        p.xb_ptr = ptr_mut(stream, &mut p._xb);
+        p.h_ptr = ptr_mut(stream, &mut p._h);
+        p.u_ptr = ptr_mut(stream, &mut p._u);
+        p.bx_ptr = ptr_mut(stream, &mut p._bx);
+        p.bh_ptr = ptr_mut(stream, &mut p._bh);
+        p.bg_ptr = ptr_mut(stream, &mut p._bg);
+        Ok(p)
+    }
+
+    /// First fit. Ranges are kept sorted, so the gap before each one is the
+    /// only place a new range can start.
+    fn alloc(&mut self, n: usize) -> Option<usize> {
+        let mut at = 0;
+        for i in 0..self.used.len() {
+            let (start, len) = self.used[i];
+            if start - at >= n {
+                self.used.insert(i, (at, n));
+                self.high = self.high.max(at + n);
+                return Some(at);
+            }
+            at = start + len;
+        }
+        if at + n > MAX_ROWS {
+            return None;
+        }
+        self.used.push((at, n));
+        self.high = self.high.max(at + n);
+        Some(at)
+    }
+
+    fn free(&mut self, at: usize) {
+        self.used.retain(|&(s, _)| s != at);
+        self.high = self.used.iter().map(|&(s, n)| s + n).max().unwrap_or(0);
+    }
+}
+
+/// Build-scratch bounds. A tree past these is rejected rather than silently
+/// overrunning; the CPU solver's node cap keeps real trees far below.
+const MAX_BUILD_ROWS: usize = 4096;
+const MAX_CFG: usize = 8192;
 
 // ------------------------------------------------------------------ kernels
 
-struct Kernels {
-    belief_sums: cudarc::driver::CudaFunction,
-    ln_relu: cudarc::driver::CudaFunction,
-    bias_add: cudarc::driver::CudaFunction,
-    readout: cudarc::driver::CudaFunction,
-    backprop: cudarc::driver::CudaFunction,
-    rm: cudarc::driver::CudaFunction,
-    propagate: cudarc::driver::CudaFunction,
-    avg: cudarc::driver::CudaFunction,
-    leaf_beliefs: cudarc::driver::CudaFunction,
-    cards_finish: cudarc::driver::CudaFunction,
-    pile_pe: cudarc::driver::CudaFunction,
-    assemble: cudarc::driver::CudaFunction,
-    relu_bias: cudarc::driver::CudaFunction,
-    holding_in: cudarc::driver::CudaFunction,
-    slot_sum: cudarc::driver::CudaFunction,
-    add2: cudarc::driver::CudaFunction,
-    action_in: cudarc::driver::CudaFunction,
-    init_strategy: cudarc::driver::CudaFunction,
-    seed_sum: cudarc::driver::CudaFunction,
-    warm_seed: cudarc::driver::CudaFunction,
+/// Every kernel, by the name NVRTC exports. They all have the same signature,
+/// so this table is the only thing that names them.
+macro_rules! kernels {
+    ($($name:ident),* $(,)?) => {
+        struct Kernels { $($name: CudaFunction,)* }
+        impl Kernels {
+            fn load(m: &Arc<CudaModule>) -> Result<Kernels, String> {
+                Ok(Kernels { $($name: m.load_function(stringify!($name))
+                    .map_err(|e| format!("kernel {}: {e:?}", stringify!($name)))?,)* })
+            }
+        }
+    };
 }
 
-impl Kernels {
-    fn load(module: &Arc<CudaModule>) -> Result<Kernels, String> {
-        let f = |n: &str| module.load_function(n).map_err(|e| format!("kernel {n}: {e:?}"));
-        Ok(Kernels {
-            belief_sums: f("belief_sums")?,
-            ln_relu: f("ln_relu_kernel")?,
-            bias_add: f("bias_add_kernel")?,
-            readout: f("readout_kernel")?,
-            backprop: f("backprop_kernel")?,
-            rm: f("rm_kernel")?,
-            propagate: f("propagate_kernel")?,
-            avg: f("avg_kernel")?,
-            leaf_beliefs: f("leaf_beliefs_kernel")?,
-            cards_finish: f("cards_finish")?,
-            pile_pe: f("pile_pe_kernel")?,
-            assemble: f("assemble_kernel")?,
-            relu_bias: f("relu_bias_kernel")?,
-            holding_in: f("holding_in_kernel")?,
-            slot_sum: f("slot_sum_kernel")?,
-            add2: f("add2_kernel")?,
-            action_in: f("action_in_kernel")?,
-            init_strategy: f("init_strategy_kernel")?,
-            seed_sum: f("seed_sum_kernel")?,
-            warm_seed: f("warm_seed_kernel")?,
-        })
-    }
+kernels! {
+    belief_sums, head_norm, head_bias, readout, backprop, regret_match, propagate,
+    average, snapshot, collect_root, leaf_beliefs, init_strategy,
+    cards_finish, pile_pe, assemble, trunk_norm, holding_in, slot_sum, embed_relu,
+    embed_bias, readout_bias, cards_relu, abi_probe,
 }
 
-// ------------------------------------------------------------------ solve state
+// ------------------------------------------------------------------ solves
 
-/// Offsets into the solve's two device blobs (u8 tables, f32 arenas).
-#[derive(Clone, Copy)]
-struct Offsets {
-    reach: usize, vals: usize, regret: usize, inst: usize, cur: usize,
-    sum_strat: usize, avg: usize, snaps: usize, h0: usize, cz: usize, cg: usize,
-    q: usize,
-    node_kind: usize, node_player: usize, node_leaf: usize,
-    node_child_start: usize, node_child: usize,
-    obs_off: usize, obs_start: usize, obs_act: usize, obs_child: usize,
-    legal_bits: usize, trans: usize,
-    draw_off: usize, draw_to: usize, draw_p: usize, draw_steps: usize,
-    draw_row_off: usize, draw_row_start: usize,
-    cfg_off: usize, reach_off: usize, soff: usize, voff: usize, act_off: usize,
-    leaf_rows: usize, term_leaves: usize, terminal_utility: usize,
-    leaf_coff: usize, leaf_cidx: usize,
-    bfs_order: usize, level_start: usize,
-    psi_off: usize, psi: usize, ids: usize,
-    cphi: usize, leaf_xpub: usize,
-}
-
-struct LiveSolve {
-    slot: usize,
+/// One resident solve: its device blobs, its descriptor, and the host mirror
+/// of the state the tick advances.
+struct Solve {
     id: u64,
     meta: JobMeta,
-    tables: CudaSlice<u8>,
+    _tables: CudaSlice<u8>,
     arenas: CudaSlice<f32>,
-    roots: CudaSlice<f32>,
-    beliefs: Option<CudaSlice<f32>>,
-    off: Offsets,
-    desc: SolveDesc,
-    // Host state (the source of truth; the desc mirrors it per tick).
-    stage: i32, t: usize, traverser: usize, step: usize, first_query: bool,
-    snap_t: usize, steps: [usize; 2],
-    nsnaps: usize, nroots: usize, nc_root: [usize; 2],
-    nleaf: usize, ncells: usize, nodes: usize,
-    /// Host copy of the config-support CSR (needed for the trip-2 leaf's
-    /// support sizes).
-    cfg_off_host: Vec<u32>,
+    desc: Desc,
+    aoff: [u32; N_ARENAS + 1],
+    stage: i32,
+    t: usize,
+    step: usize,
+    snap_t: usize,
+    traverser: usize,
+    steps: [usize; 2],
+    first_query: bool,
+    row0: usize,
+    nrows: usize,
+    nleaf: usize,
+    nterm: usize,
+    nodes: usize,
+    ncells: usize,
+    nsnaps: usize,
+    nroots: usize,
+    nc_root: [usize; 2],
     nc_leaf: [usize; 2],
+    /// Config counts per node, for sizing the trip-2 exit leaf.
+    cfg_off: Vec<u32>,
     trip1: Option<mpsc::Sender<Result<Trip1, String>>>,
     trip2: Option<mpsc::Sender<Result<Trip2, String>>>,
-    root_values: Vec<[Vec<f32>; 2]>,
-    leaf: usize,
 }
 
 // ------------------------------------------------------------------ service
 
 pub struct Service {
-    stream: std::sync::Arc<CudaStream>,
+    stream: Arc<CudaStream>,
     blas: CudaBlas,
     f: Kernels,
+    pools: Pools,
     weights: Weights,
     incoming: Option<Weights>,
-    live: Vec<Option<LiveSolve>>,
+    ctx: CudaSlice<Ctx>,
+    live: Vec<Option<Solve>>,
     free: Vec<usize>,
     next_id: u64,
     rx: mpsc::Receiver<Cmd>,
-    xb: CudaSlice<f32>,
-    h: CudaSlice<f32>,
-    u: CudaSlice<f32>,
-    h0p: CudaSlice<f32>,
-    descs: CudaSlice<SolveDesc>,
-    slots: CudaSlice<i32>,
-    group: Vec<i32>,
+    descs: CudaSlice<Desc>,
+    /// Group staging: the device buffers a launch's `Group` points at. Reused
+    /// every launch — safe because the stream orders the upload against the
+    /// kernels that read it.
+    g_slots: CudaSlice<i32>,
+    g_starts: CudaSlice<i32>,
+    g_dev: CudaSlice<GroupDev>,
+    h_slots: Vec<i32>,
+    h_starts: Vec<i32>,
+    h_descs: Vec<Desc>,
 }
 
-/// Spawn the service thread; returns the worker-side client. The initial
-/// weights are the trainer's current flat arrays.
+/// Spawn the service thread; returns the worker-side client.
 pub fn spawn(
     dims: Vec<usize>,
     w: Vec<f32>,
@@ -319,11 +406,9 @@ pub fn spawn(
     let client = GpuClient::new(tx);
     std::thread::Builder::new()
         .name("gpu-service".into())
-        .spawn(move || {
-            match Service::new(rx, dims, w, b, ln) {
-                Ok(mut svc) => svc.run(),
-                Err(e) => eprintln!("gpu service failed to start: {e}"),
-            }
+        .spawn(move || match Service::new(rx, dims, w, b, ln) {
+            Ok(mut svc) => svc.run(),
+            Err(e) => eprintln!("gpu service failed to start: {e}"),
         })
         .map_err(|e| format!("{e:?}"))?;
     Ok(client)
@@ -340,58 +425,61 @@ impl Service {
         let dev = CudaContext::new(0).map_err(|e| format!("cuda device: {e:?}"))?;
         let stream = dev.default_stream();
         let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("{e:?}"))?;
+        let src = format!("{}\n{}", cuda_preamble(), include_str!("kernels.cu"));
         let ptx = nvrtc::compile_ptx_with_opts(
-            include_str!("kernels.cu"),
-            nvrtc::CompileOptions {
-                arch: Some("compute_75"),
-                ..Default::default()
-            },
+            &src,
+            nvrtc::CompileOptions { arch: Some("compute_75"), ..Default::default() },
         )
         .map_err(|e| format!("nvrtc: {e:?}"))?;
         let module = dev.load_module(ptx).map_err(|e| format!("module: {e:?}"))?;
         let f = Kernels::load(&module)?;
-        let weights = Weights::upload(stream.clone(), dims, w, b, ln)?;
-        let descs = stream.alloc_zeros::<SolveDesc>(CAP).map_err(|e| format!("{e:?}"))?;
-        let slots = stream.alloc_zeros::<i32>(CAP).map_err(|e| format!("{e:?}"))?;
-        let xb = stream.alloc_zeros::<f32>(1).map_err(|e| format!("{e:?}"))?;
-        let h = stream.alloc_zeros::<f32>(1).map_err(|e| format!("{e:?}"))?;
-        let u = stream.alloc_zeros::<f32>(1).map_err(|e| format!("{e:?}"))?;
-        let h0p = stream.alloc_zeros::<f32>(1).map_err(|e| format!("{e:?}"))?;
-        let free = (0..CAP).rev().collect();
+        let pools = Pools::new(&stream, &dims)?;
+        let weights = Weights::upload(&stream, &pools, dims, w, b, ln)?;
+        let ctx = htod(&stream, &[weights.ctx])?;
+        check_abi(&stream, &f.abi_probe)?;
         Ok(Service {
-            stream, blas, f, weights, incoming: None,
+            descs: zeros(&stream, CAP)?,
+            g_slots: zeros(&stream, CAP)?,
+            g_starts: zeros(&stream, CAP + 1)?,
+            g_dev: zeros(&stream, 1)?,
+            h_slots: Vec::with_capacity(CAP),
+            h_starts: Vec::with_capacity(CAP + 1),
+            h_descs: Vec::with_capacity(CAP),
             live: (0..CAP).map(|_| None).collect(),
-            free, next_id: 1, rx, xb, h, u, h0p, descs, slots, group: Vec::new(),
+            free: (0..CAP).rev().collect(),
+            next_id: 1,
+            stream, blas, f, pools, weights, incoming: None, ctx, rx,
         })
     }
 
     fn run(&mut self) {
         loop {
-            match self.rx.recv_timeout(Duration::from_millis(1)) {
-                Ok(cmd) => self.handle_cmd(cmd),
+            match self.rx.recv_timeout(Duration::from_micros(50)) {
+                Ok(cmd) => self.handle(cmd),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
-            let busy = self.live.iter().any(|s| s.is_some());
-            if busy || self.incoming.is_some() {
+            // Drain whatever else arrived while we were busy, so a burst of
+            // submissions joins the same tick.
+            while let Ok(cmd) = self.rx.try_recv() {
+                self.handle(cmd);
+            }
+            if self.live.iter().any(|s| s.is_some()) {
                 self.tick();
-                let _ = self.stream.synchronize();
             }
         }
     }
 
-    fn handle_cmd(&mut self, cmd: Cmd) {
+    fn handle(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Submit { job, reply } => {
-                if let Err(e) = self.admit(job, reply) {
-                    eprintln!("gpu: admit failed: {e}");
+                if let Err(e) = self.admit(job, reply.clone()) {
+                    let _ = reply.send(Err(e));
                 }
             }
-            Cmd::Trip2 { id, leaf, reply } => {
-                self.trip2(id, leaf, reply);
-            }
+            Cmd::Trip2 { id, leaf, reply } => self.start_carry(id, leaf, reply),
             Cmd::SetWeights { dims, w, b, ln } => {
-                match Weights::upload(self.stream.clone(), dims, w, b, ln) {
+                match Weights::upload(&self.stream, &self.pools, dims, w, b, ln) {
                     Ok(weights) => self.incoming = Some(weights),
                     Err(e) => eprintln!("gpu: bad weights: {e}"),
                 }
@@ -400,126 +488,254 @@ impl Service {
         }
     }
 
+    // ------------------------------------------------------------ launching
+
+    /// Launch one kernel over `slots`, with `threads(solve)` threads for each.
+    /// The only launch site in the service: every kernel takes the descriptor
+    /// array, the group, and the context, in that order.
+    fn launch(
+        &mut self,
+        which: fn(&Kernels) -> &CudaFunction,
+        slots: &[usize],
+        phase: Phase,
+        threads: impl Fn(&Solve) -> usize,
+    ) {
+        if slots.is_empty() {
+            return;
+        }
+        self.h_slots.clear();
+        self.h_starts.clear();
+        let mut total = 0usize;
+        for &s in slots {
+            let sv = self.live[s].as_ref().expect("live slot");
+            self.h_slots.push(s as i32);
+            self.h_starts.push(total as i32);
+            total += threads(sv);
+        }
+        self.h_starts.push(total as i32);
+        if total == 0 {
+            return;
+        }
+        let _ = self.stream.memcpy_htod(&self.h_slots, &mut self.g_slots);
+        let _ = self.stream.memcpy_htod(&self.h_starts, &mut self.g_starts);
+        let group = GroupDev {
+            slots: ptr(&self.stream, &self.g_slots),
+            starts: ptr(&self.stream, &self.g_starts),
+            n: slots.len() as i32,
+            total: total as i32,
+            mode: phase.mode,
+            p_player: phase.p_player,
+            nplayers: phase.nplayers,
+            strat_src: phase.strat_src,
+        };
+        let _ = self.stream.memcpy_htod(&[group], &mut self.g_dev);
+        let cfg = LaunchConfig {
+            grid_dim: (total.div_ceil(BLOCK as usize) as u32, 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        self.dispatch(which(&self.f).clone(), cfg);
+    }
+
+    /// Launch a per-solve sweep: one block per solve, levels sequential inside
+    /// it. `total` is unused by these kernels; the grid is the slot count.
+    fn launch_sweep(&mut self, which: fn(&Kernels) -> &CudaFunction, slots: &[usize], phase: Phase) {
+        if slots.is_empty() {
+            return;
+        }
+        self.h_slots.clear();
+        self.h_starts.clear();
+        for &s in slots {
+            self.h_slots.push(s as i32);
+            self.h_starts.push(0);
+        }
+        self.h_starts.push(0);
+        let _ = self.stream.memcpy_htod(&self.h_slots, &mut self.g_slots);
+        let _ = self.stream.memcpy_htod(&self.h_starts, &mut self.g_starts);
+        let group = GroupDev {
+            slots: ptr(&self.stream, &self.g_slots),
+            starts: ptr(&self.stream, &self.g_starts),
+            n: slots.len() as i32,
+            total: 0,
+            mode: phase.mode,
+            p_player: phase.p_player,
+            nplayers: phase.nplayers,
+            strat_src: phase.strat_src,
+        };
+        let _ = self.stream.memcpy_htod(&[group], &mut self.g_dev);
+        let cfg = LaunchConfig {
+            grid_dim: (slots.len() as u32, 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        self.dispatch(which(&self.f).clone(), cfg);
+    }
+
+    fn dispatch(&mut self, f: CudaFunction, cfg: LaunchConfig) {
+        let mut b = self.stream.launch_builder(&f);
+        b.arg(&self.descs);
+        b.arg(&self.g_dev);
+        b.arg(&self.ctx);
+        let _ = unsafe { b.launch(cfg) };
+    }
+
     // ------------------------------------------------------------ the tick
 
     fn tick(&mut self) {
         if let Some(w) = self.incoming.take() {
-            self.weights = w;
+            // Weights change between solves, never inside one: a fresh set
+            // only takes effect once the live set has drained.
+            if self.live.iter().all(|s| s.is_none()) {
+                self.weights = w;
+                let _ = self.stream.memcpy_htod(&[self.weights.ctx], &mut self.ctx);
+            } else {
+                self.incoming = Some(w);
+            }
         }
-        if self.live.iter().all(|s| s.is_none()) {
+        let by = |st: i32| -> Vec<usize> {
+            (0..CAP).filter(|&s| self.live[s].as_ref().is_some_and(|v| v.stage == st)).collect()
+        };
+        let (iter, value, carry) = (by(STAGE_ITERATE), by(STAGE_VALUE), by(STAGE_CARRY));
+        if iter.is_empty() && value.is_empty() && carry.is_empty() {
             return;
         }
-        let mut belief: Vec<usize> = Vec::new();
-        let mut readout_a: Vec<usize> = Vec::new();
-        let mut readout_b: Vec<usize> = Vec::new();
-        let mut backprop_a: Vec<usize> = Vec::new();
-        let mut backprop_b: Vec<usize> = Vec::new();
-        let mut rm: Vec<usize> = Vec::new();
-        let mut prop: Vec<usize> = Vec::new();
-        let mut avg: Vec<usize> = Vec::new();
-        let mut carry: Vec<usize> = Vec::new();
-        for s in 0..CAP {
-            let Some(sv) = &self.live[s] else { continue };
-            match sv.stage {
-                STAGE_ITERATE => {
-                    belief.push(s); readout_a.push(s); backprop_a.push(s);
-                    rm.push(s); prop.push(s); avg.push(s);
-                }
-                STAGE_VALUE => {
-                    belief.push(s); readout_a.push(s); readout_b.push(s);
-                    backprop_a.push(s); backprop_b.push(s); prop.push(s);
-                }
-                _ => {
-                    prop.push(s);
-                    carry.push(s);
-                }
-            }
-        }
-        // Per-solve tick fields on the host mirrors.
-        let mut row_off = 0i32;
-        for &s in &belief {
-            let sv = self.live[s].as_mut().unwrap();
-            sv.desc.row_off = row_off;
-            sv.desc.nplayers = if sv.stage == STAGE_ITERATE && !sv.first_query { 1 } else { 2 };
-            row_off += sv.nleaf as i32;
-        }
-        for &s in &readout_a {
-            let sv = self.live[s].as_mut().unwrap();
-            sv.desc.p_player = if sv.stage == STAGE_ITERATE { sv.traverser as i32 } else { 0 };
-            sv.desc.mode = if sv.stage == STAGE_ITERATE { 0 } else { 1 };
-            sv.desc.traverser = if sv.stage == STAGE_ITERATE { sv.traverser as i32 } else { 0 };
-        }
-        for &s in &readout_b {
-            let sv = self.live[s].as_mut().unwrap();
-            sv.desc.p_player = 1;
-            sv.desc.mode = 1;
-            sv.desc.traverser = 1;
-        }
-        for &s in &backprop_a {
-            let sv = self.live[s].as_mut().unwrap();
-            sv.desc.mode = if sv.stage == STAGE_ITERATE { 0 } else { 1 };
-            sv.desc.traverser = if sv.stage == STAGE_ITERATE { sv.traverser as i32 } else { 0 };
-            sv.desc.strat_src = if sv.stage == STAGE_ITERATE { 0 } else { 1 };
-        }
-        for &s in &backprop_b {
-            let sv = self.live[s].as_mut().unwrap();
-            sv.desc.mode = 1;
-            sv.desc.traverser = 1;
-            sv.desc.strat_src = 1;
-        }
-        for &s in &prop {
-            let sv = self.live[s].as_mut().unwrap();
-            sv.desc.strat_src = match sv.stage {
-                STAGE_ITERATE => 0,
-                STAGE_VALUE => 1,
-                _ => 2,
-            };
-        }
         self.upload_descs();
-        if !belief.is_empty() {
-            // Size the packed scratch *before* the belief kernel writes it
-            // (the head's GEMMs read the same rows).
-            let rows: usize = belief.iter().map(|&s| self.live[s].as_ref().unwrap().nleaf).sum();
-            let (dg, hd, rk) = (self.weights.dims[4], self.weights.dims[2], self.weights.dims[5]);
-            if self.xb.len() < rows * 2 * dg {
-                self.xb = self.stream.alloc_zeros(rows * 2 * dg).unwrap();
-                self.h = self.stream.alloc_zeros(rows * hd).unwrap();
-                self.u = self.stream.alloc_zeros(rows * rk).unwrap();
-                self.h0p = self.stream.alloc_zeros(rows * hd).unwrap();
-            }
-            self.launch_belief(&belief);
-            self.launch_head(&belief);
+        let snap = self.snapshot_due(&iter);
+        self.iterate(&iter, &snap, Step::All);
+        self.value_pass(&value);
+        self.carry_pass(&carry);
+        self.advance(&snap);
+    }
+
+    /// One CFR iteration, for every solve in the iterate stage. `upto` stops
+    /// early; the phase oracle test uses it to compare one phase at a time
+    /// against the CPU solver, and so exercises this exact sequence.
+    fn iterate(&mut self, slots: &[usize], snap: &[usize], upto: Step) {
+        if slots.is_empty() || upto <= Step::None {
+            return;
         }
-        if !readout_a.is_empty() {
-            self.launch_readout(&readout_a);
+        // The traverser's side is all a later iteration needs; the first one
+        // has to build both, because neither side is cached yet.
+        let (mut one, mut two) = (Vec::new(), Vec::new());
+        for &s in slots {
+            if self.live[s].as_ref().unwrap().first_query { two.push(s) } else { one.push(s) }
         }
-        if !readout_b.is_empty() {
-            self.launch_readout(&readout_b);
+        self.launch(|k| &k.belief_sums, &one, Phase { nplayers: 1, ..P }, |sv| sv.nleaf);
+        self.launch(|k| &k.belief_sums, &two, Phase { nplayers: 2, ..P }, |sv| sv.nleaf * 2);
+        self.head(slots);
+        if upto == Step::Head {
+            return;
         }
-        if !backprop_a.is_empty() {
-            self.launch_backprop(&backprop_a);
+        // The readout and backward sweep run for each solve's own traverser,
+        // which `p_player: TRAVERSER` defers to the descriptor.
+        let phase = Phase { mode: 0, p_player: TRAVERSER, nplayers: 2, strat_src: 0 };
+        self.launch(|k| &k.readout, slots, phase, |sv| sv.nleaf + sv.nterm);
+        if upto == Step::Readout {
+            return;
         }
-        if !backprop_b.is_empty() {
-            self.launch_backprop(&backprop_b);
+        self.launch_sweep(|k| &k.backprop, slots, phase);
+        if upto == Step::Backprop {
+            return;
         }
-        if !rm.is_empty() {
-            self.launch_rm(&rm);
+        self.launch(|k| &k.regret_match, slots, P, |sv| sv.nodes);
+        if upto == Step::Regret {
+            return;
         }
-        if !prop.is_empty() {
-            self.launch_propagate(&prop);
+        self.launch_sweep(|k| &k.propagate, slots, P);
+        if upto == Step::Propagate {
+            return;
         }
-        if !avg.is_empty() {
-            self.launch_avg(&avg);
+        self.launch(|k| &k.average, slots, P, |sv| sv.nodes);
+        if upto == Step::Average {
+            return;
         }
-        if !carry.is_empty() {
-            self.launch_leaf_beliefs(&carry);
+        self.launch(|k| &k.snapshot, snap, P, |sv| sv.ncells);
+    }
+
+    /// One fixed-policy pass over the carried root a value-stage solve is on:
+    /// re-seed the reach from it, then read out and sweep for each player,
+    /// harvesting the root values into the solve's own arena.
+    fn value_pass(&mut self, slots: &[usize]) {
+        if slots.is_empty() {
+            return;
         }
-        // Advance host state and post replies. The device work (snapshot
-        // copies, value downloads, replies) runs after the borrows release.
-        let mut copies: Vec<(usize, usize, usize, usize)> = Vec::new(); // (slot, src, dst, n)
-        let mut downloads: Vec<(usize, usize, usize)> = Vec::new();     // (slot, off, n) root values
-        let mut trip1s: Vec<usize> = Vec::new();
-        let mut done: Vec<usize> = Vec::new();
+        self.launch_sweep(|k| &k.propagate, slots, Phase { strat_src: 1, ..P });
+        self.launch(|k| &k.belief_sums, slots, Phase { nplayers: 2, ..P }, |sv| sv.nleaf * 2);
+        self.head(slots);
+        for p in 0..2 {
+            let phase = Phase { mode: 1, p_player: p, nplayers: 2, strat_src: 1 };
+            self.launch(|k| &k.readout, slots, phase, |sv| sv.nleaf + sv.nterm);
+            self.launch_sweep(|k| &k.backprop, slots, phase);
+            self.launch(|k| &k.collect_root, slots, phase, |sv| sv.nc_root[0] + sv.nc_root[1]);
+        }
+    }
+
+    /// One kept snapshot propagated to the trip-2 exit leaf, whose normalised
+    /// reach is that snapshot's carried belief.
+    fn carry_pass(&mut self, slots: &[usize]) {
+        let active: Vec<usize> = slots
+            .iter()
+            .copied()
+            .filter(|&s| self.live[s].as_ref().unwrap().trip2.is_some())
+            .collect();
+        self.launch_sweep(|k| &k.propagate, &active, Phase { strat_src: 2, ..P });
+        self.launch(|k| &k.leaf_beliefs, &active, P, |_| 2);
+    }
+
+    /// The iterate-stage solves whose next iteration is a kept one.
+    fn snapshot_due(&self, slots: &[usize]) -> Vec<usize> {
+        slots
+            .iter()
+            .copied()
+            .filter(|&s| {
+                let sv = self.live[s].as_ref().unwrap();
+                sv.meta.snapshots && sv.meta.snap_iters.contains(&(sv.t + 1))
+            })
+            .collect()
+    }
+
+    /// The head: two cuBLAS GEMMs with the LayerNorm between them, over the
+    /// span of the row pool this group occupies. The rows were laid out at
+    /// admission and never move, so this is one call per GEMM however ragged
+    /// the live set is — the packing step a per-solve layout would need does
+    /// not exist. A group's span may include rows belonging to solves outside
+    /// it; those rows are computed and ignored, which costs a little
+    /// arithmetic and saves the packing.
+    fn head(&mut self, slots: &[usize]) {
+        let Some((lo, hi)) = self.row_span(slots) else { return };
+        let (hd, dg, rk) = (self.weights.dims[2], self.weights.dims[4], self.weights.dims[5]);
+        let c = self.weights.ctx;
+        let rows = hi - lo;
+        let at = |p: *mut f32, w: usize| unsafe { p.add(lo * w) };
+        // h = xb . Wb, then h = relu(LN1(h0 + h)), then u = h . Wu + bu.
+        gemm(&self.blas, rows, hd, 2 * dg,
+             at(c.xb, 2 * dg), 2 * dg, c.wb, hd, at(c.h, hd), hd, 0.0);
+        self.launch(|k| &k.head_norm, slots, P, |sv| sv.nleaf);
+        gemm(&self.blas, rows, rk, hd, at(c.h, hd), hd, c.wu, rk, at(c.u, rk), rk, 0.0);
+        self.launch(|k| &k.head_bias, slots, P, |sv| sv.nleaf);
+    }
+
+    /// The rows a group covers, as one range of the pool.
+    fn row_span(&self, slots: &[usize]) -> Option<(usize, usize)> {
+        let mut span: Option<(usize, usize)> = None;
+        for &s in slots {
+            let sv = self.live[s].as_ref()?;
+            let (lo, hi) = (sv.row0, sv.row0 + sv.nrows);
+            span = Some(match span {
+                Some((a, b)) => (a.min(lo), b.max(hi)),
+                None => (lo, hi),
+            });
+        }
+        span.filter(|&(lo, hi)| hi > lo)
+    }
+
+    /// Advance the host mirrors one step and post whatever became ready. The
+    /// device state advanced in the launches above; this is the bookkeeping
+    /// that decides what happens next tick.
+    fn advance(&mut self, snapped: &[usize]) {
+        let mut trip1 = Vec::new();
+        let mut trip2 = Vec::new();
+        let mut done = Vec::new();
         for s in 0..CAP {
             let Some(sv) = &mut self.live[s] else { continue };
             match sv.stage {
@@ -527,1207 +743,492 @@ impl Service {
                     sv.first_query = false;
                     sv.steps[sv.traverser] += 1;
                     sv.t += 1;
-                    if sv.meta.snapshots && sv.meta.snap_iters.contains(&sv.t) {
-                        copies.push((s, sv.off.avg, sv.off.snaps + sv.snap_t * sv.ncells, sv.ncells));
+                    if snapped.contains(&s) {
                         sv.snap_t += 1;
                     }
+                    sv.traverser = sv.t % 2;
                     if sv.t == sv.meta.iters {
-                        if sv.meta.snapshots && sv.nroots > 0 {
+                        sv.step = 0;
+                        if sv.nroots > 0 {
                             sv.stage = STAGE_VALUE;
-                            sv.step = 0;
                         } else {
-                            trip1s.push(s);
-                            if sv.meta.snapshots {
-                                sv.stage = STAGE_CARRY;
-                                sv.step = 0;
-                                sv.desc.leaf = sv.leaf as i32;
-                            } else {
-                                done.push(s);
-                            }
+                            trip1.push(s);
+                            sv.stage = STAGE_CARRY;
                         }
                     }
-                    sv.traverser = sv.t % 2;
                 }
                 STAGE_VALUE => {
-                    let n0 = sv.nc_root[0];
-                    let n1 = sv.nc_root[1];
-                    downloads.push((s, sv.off.vals, n0));
-                    downloads.push((s, sv.off.vals, n1));
                     sv.step += 1;
                     if sv.step >= sv.nroots {
-                        trip1s.push(s);
-                        if sv.meta.snapshots && sv.nsnaps > 1 {
-                            sv.stage = STAGE_CARRY;
-                            sv.step = 0;
-                            sv.desc.leaf = sv.leaf as i32;
-                        } else {
+                        sv.step = 0;
+                        sv.stage = STAGE_CARRY;
+                        trip1.push(s);
+                    }
+                }
+                _ => match &sv.trip2 {
+                    // An evaluation solve keeps no snapshots and so has no
+                    // second trip: it is finished the moment trip 1 is out.
+                    None if sv.nsnaps == 0 => done.push(s),
+                    // Otherwise the solve stays resident until the walk says
+                    // which leaf it left the tree at.
+                    None => {}
+                    Some(_) => {
+                        sv.step += 1;
+                        if sv.step + 1 >= sv.nsnaps {
+                            trip2.push(s);
                             done.push(s);
                         }
                     }
-                }
-                _ => {
-                    sv.step += 1;
-                    if sv.step + 1 >= sv.nsnaps {
-                        done.push(s);
-                    }
-                }
+                },
             }
         }
-        // Two value downloads per value solve: player 0 then player 1. The
-        // loop above pushed them in order; group them per solve here.
-        let mut i = 0;
-        while i < downloads.len() {
-            let (s, off, n0) = downloads[i];
-            let (_, _, n1) = downloads[i + 1];
-            let arenas = &self.live[s].as_ref().unwrap().arenas;
-            let v0 = d2h_arenas(&self.stream, arenas, off, n0);
-            let v1 = d2h_arenas(&self.stream, arenas, off, n1);
-            self.live[s].as_mut().unwrap().root_values.push([v0, v1]);
-            i += 2;
+        for s in trip1 {
+            self.send_trip1(s);
         }
-        for (s, src, dst, n) in copies {
-            d2d_arenas(&self.stream, &mut self.live[s].as_mut().unwrap().arenas, src, dst, n);
-        }
-        for s in trip1s {
-            self.finalize_trip1(s);
-        }
-        // The carry stage's trip 2: after the last snapshot propagation the
-        // solve is done; send the beliefs and free.
-        for s in done.clone() {
-            if let Some(sv) = &self.live[s] {
-                if sv.stage == STAGE_CARRY {
-                    self.send_trip2(s);
-                }
-            }
+        for s in trip2 {
+            self.send_trip2(s);
         }
         for s in done {
-            self.free_solve(s);
+            self.release(s);
         }
     }
 
     fn upload_descs(&mut self) {
-        let mut v: Vec<SolveDesc> = Vec::with_capacity(CAP);
+        let v = &mut self.h_descs;
+        v.clear();
+        v.resize(CAP, Desc::default());
         for s in 0..CAP {
-            match &self.live[s] {
-                Some(sv) => {
-                    let mut d = sv.desc;
-                    d.t = sv.t as i32;
-                    d.stage = sv.stage;
-                    d.step = sv.step as i32;
-                    d.traverser = sv.traverser as i32;
-                    d.steps = [sv.steps[0] as i32, sv.steps[1] as i32];
-                    d.snap_t = sv.snap_t as i32;
-                    d.first_query = sv.first_query as i32;
-                    d.leaf = sv.leaf as i32;
-                    v.push(d);
-                }
-                None => v.push(unsafe { std::mem::zeroed() }),
-            }
+            let Some(sv) = &self.live[s] else { continue };
+            let mut d = sv.desc;
+            d.t = sv.t as i32;
+            d.stage = sv.stage;
+            d.step = sv.step as i32;
+            d.traverser = sv.traverser as i32;
+            d.snap_t = sv.snap_t as i32;
+            d.steps = [sv.steps[0] as i32, sv.steps[1] as i32];
+            d.first_query = sv.first_query as i32;
+            d.nc_leaf = [sv.nc_leaf[0] as i32, sv.nc_leaf[1] as i32];
+            v[s] = d;
         }
-        let _ = self.stream.memcpy_htod(&v, &mut self.descs);
+        let _ = self.stream.memcpy_htod(&self.h_descs, &mut self.descs);
     }
 
-    // ------------------------------------------------------------ commands
+    // ------------------------------------------------------------ admission
 
-    /// Admit one solve: upload its tables, run the build GEMMs (the card
-    /// table, the trunk, the config tower, the action towers), initialise
-    /// the strategy arenas exactly as Solver::new does, and put the solve in
-    /// the iterate stage. The trip-1 reply channel is stored on the solve.
+    /// Admit one solve: upload its tables, cut its arenas, run the build, and
+    /// put it in the iterate stage.
     fn admit(
         &mut self,
         job: Job,
         reply: mpsc::Sender<Result<Trip1, String>>,
     ) -> Result<(), String> {
-        let Some(slot) = self.free.pop() else {
-            return Err("live set full".into());
-        };
-        let meta = job.meta.clone();
         let t = &job.tables;
-        let dg = self.weights.dims[4];
-        let hd = self.weights.dims[2];
-        let rk = self.weights.dims[5];
-        let de = self.weights.dims[7];
-        let (nc0, nc1) = (
-            (t.cfg_off[1] - t.cfg_off[0]) as usize,
-            (t.cfg_off[2] - t.cfg_off[1]) as usize,
-        );
-        let nsnaps = meta.snap_iters.len();
-        let ncarry = nsnaps.saturating_sub(1);
-        let nroots = job.carried.len();
-        // ---- layout of the two blobs ----
-        let mut off = Offsets {
-            reach: 0, vals: 0, regret: 0, inst: 0, cur: 0, sum_strat: 0, avg: 0,
-            snaps: 0, h0: 0, cz: 0, cg: 0, q: 0,
-            node_kind: 0, node_player: 0, node_leaf: 0, node_child_start: 0,
-            node_child: 0, obs_off: 0, obs_start: 0, obs_act: 0, obs_child: 0,
-            legal_bits: 0, trans: 0, draw_off: 0, draw_to: 0, draw_p: 0,
-            draw_steps: 0, draw_row_off: 0, draw_row_start: 0, cfg_off: 0,
-            reach_off: 0, soff: 0, voff: 0, act_off: 0, leaf_rows: 0,
-            term_leaves: 0, terminal_utility: 0, leaf_coff: 0, leaf_cidx: 0,
-            bfs_order: 0, level_start: 0, psi_off: 0, psi: 0, ids: 0, cphi: 0,
-            leaf_xpub: 0,
+        let (dg, rk, de) = (self.weights.dims[4], self.weights.dims[5], self.weights.dims[7]);
+        let derived = Derived::new(&job);
+        let nc = |i: usize, p: usize| (t.cfg_off[2 * i + p + 1] - t.cfg_off[2 * i + p]) as usize;
+        let nc_root = [nc(0, 0), nc(0, 1)];
+        let max_nc = (0..t.nodes).map(|i| nc(i, 0).max(nc(i, 1))).max().unwrap_or(0);
+        if job.meta.warm > 0.0 {
+            // Seeding CFR from the policy head is plan A4, which is gated on a
+            // NashConv measurement that has not been made. Refusing is the
+            // honest answer; silently solving cold would look like it worked.
+            return Err("gpu: warm start is not implemented (plan A4)".into());
+        }
+        if t.rows > MAX_BUILD_ROWS || t.ncfg > MAX_CFG {
+            return Err(format!("gpu: tree too large (rows {} cfg {})", t.rows, t.ncfg));
+        }
+        let nsnaps = if job.meta.snapshots { job.meta.snap_iters.len() } else { 0 };
+        let sizes = Sizes {
+            reach_len: t.reach.len(),
+            vals_len: derived.vals_len(),
+            ncells: t.ncells,
+            nsnaps,
+            ncfg: t.ncfg,
+            nc_root: nc_root[0] + nc_root[1],
+            max_nc,
+            nroots: job.carried.len(),
+            dg, rk, de,
         };
-        // Arena blob (f32): reach, vals, regret, inst, cur, sum_strat, avg,
-        // snaps, h0, cz, cg, q.
-        let reach_len = t.reach.len();
-        // The solver's vals arena: max(nc0, nc1) per node, cumulative.
-        let mut vals_len = 0usize;
-        for i in 0..t.nodes {
-            let n0 = t.cfg_off[2 * i + 1] - t.cfg_off[2 * i];
-            let n1 = t.cfg_off[2 * i + 2] - t.cfg_off[2 * i + 1];
-            vals_len += n0.max(n1) as usize;
-        }
-        let (rows, ncells) = (t.rows, t.ncells);
-        let nsnaps_stored = if meta.snapshots { nsnaps } else { 0 };
-        off.reach = 0;
-        off.vals = reach_len;
-        off.regret = off.vals + vals_len;
-        off.inst = off.regret + ncells;
-        off.cur = off.inst + ncells;
-        off.sum_strat = off.cur + ncells;
-        off.avg = off.sum_strat + ncells;
-        off.snaps = off.avg + ncells;
-        off.h0 = off.snaps + nsnaps_stored * ncells;
-        // cz block: the card table e [NTYPE*de] then the belief embeddings z
-        // [ncfg*dg]; the desc's cz points at the z part.
-        off.cz = off.h0 + rows * hd;
-        off.cg = off.cz + crate::rebel::NTYPE * de + t.ncfg * dg;
-        off.q = off.cg + t.ncfg * (rk + 1);
-        let n_psi = t.psi.len() / crate::rebel::AFEAT;
-        let arena_floats = off.q + n_psi * rk;
-        let mut arenas = self
-            .stream
-            .alloc_zeros::<f32>(arena_floats)
-            .map_err(|e| format!("{e:?}"))?;
-        // Table blob (u8, 4-aligned; u64 arrays are 8-aligned). Only the
-        // arrays the kernels read travel; the rest of the job format stays
-        // on the wire for the oracle tests.
-        let mut tbl: Vec<u8> = Vec::new();
-        fn put_u8(tbl: &mut Vec<u8>, v: &[u8], off: &mut usize) {
-            let at = tbl.len();
-            tbl.extend_from_slice(v);
-            *off = at;
-        }
-        fn put_u32(tbl: &mut Vec<u8>, v: &[u32], off: &mut usize) {
-            while tbl.len() % 4 != 0 { tbl.push(0); }
-            let at = tbl.len();
-            for &x in v { tbl.extend_from_slice(&x.to_le_bytes()); }
-            *off = at;
-        }
-        fn put_f32(tbl: &mut Vec<u8>, v: &[f32], off: &mut usize) {
-            while tbl.len() % 4 != 0 { tbl.push(0); }
-            let at = tbl.len();
-            for &x in v { tbl.extend_from_slice(&x.to_le_bytes()); }
-            *off = at;
-        }
-        fn put_i32(tbl: &mut Vec<u8>, v: &[i32], off: &mut usize) {
-            while tbl.len() % 4 != 0 { tbl.push(0); }
-            let at = tbl.len();
-            for &x in v { tbl.extend_from_slice(&x.to_le_bytes()); }
-            *off = at;
-        }
-        // voff and act_off are derived on the host (the solver's own layout,
-        // which the kernels index through).
-        let mut voff = vec![0u32; t.nodes + 1];
-        let mut acc = 0u32;
-        for i in 0..t.nodes {
-            voff[i] = acc;
-            let n0 = t.cfg_off[2 * i + 1] - t.cfg_off[2 * i];
-            let n1 = t.cfg_off[2 * i + 2] - t.cfg_off[2 * i + 1];
-            acc += n0.max(n1);
-        }
-        voff[t.nodes] = acc;
-        let mut act_off = vec![0u32; t.nodes + 1];
-        let mut aacc = 0u32;
-        for i in 0..t.nodes {
-            act_off[i] = aacc;
-            let a0 = t.obs_off[i] as usize;
-            let a1 = t.obs_off[i + 1] as usize;
-            if a1 > a0 {
-                aacc += t.obs_start[a1 - 1];
+        let (aoff, arena_len) = arena_offsets(&sizes);
+        let (blob, toff) = pack_tables(t, &derived);
+
+        let slot = self.free.pop().ok_or("gpu: live set full")?;
+        let row0 = match self.pools.alloc(t.rows) {
+            Some(r) => r,
+            None => {
+                self.free.push(slot);
+                return Err("gpu: row pool full".into());
             }
+        };
+        let tables = htod(&self.stream, &blob)?;
+        let mut arenas = zeros(&self.stream, arena_len)?;
+        // The initial reach is the uniform-strategy reach `Solver::new`
+        // propagates before seeding the average.
+        {
+            let r0 = aoff[Arena::reach as usize] as usize;
+            let mut dst = arenas.slice_mut(r0..r0 + t.reach.len());
+            let _ = self.stream.memcpy_htod(&t.reach, &mut dst);
         }
-        act_off[t.nodes] = aacc;
-        put_u8(&mut tbl, &t.node_kind, &mut off.node_kind);
-        put_u8(&mut tbl, &t.node_player, &mut off.node_player);
-        put_u8(&mut tbl, &t.node_leaf, &mut off.node_leaf);
-        put_u32(&mut tbl, &t.node_child_start, &mut off.node_child_start);
-        put_u32(&mut tbl, &t.node_child, &mut off.node_child);
-        put_u32(&mut tbl, &t.obs_off, &mut off.obs_off);
-        put_u32(&mut tbl, &t.obs_start, &mut off.obs_start);
-        put_u32(&mut tbl, &t.obs_act, &mut off.obs_act);
-        put_u32(&mut tbl, &t.obs_child, &mut off.obs_child);
-        put_u8(&mut tbl, &t.legal_bits, &mut off.legal_bits);
-        put_i32(&mut tbl, &t.trans, &mut off.trans);
-        put_u32(&mut tbl, &t.draw_off, &mut off.draw_off);
-        put_u32(&mut tbl, &t.draw_to, &mut off.draw_to);
-        put_f32(&mut tbl, &t.draw_p, &mut off.draw_p);
-        put_u32(&mut tbl, &t.draw_row_off, &mut off.draw_row_off);
-        put_u32(&mut tbl, &t.draw_row_start, &mut off.draw_row_start);
-        put_u32(&mut tbl, &t.cfg_off, &mut off.cfg_off);
-        put_u32(&mut tbl, &t.reach_off, &mut off.reach_off);
-        put_u32(&mut tbl, &t.soff, &mut off.soff);
-        put_u32(&mut tbl, &voff, &mut off.voff);
-        put_u32(&mut tbl, &act_off, &mut off.act_off);
-        put_u32(&mut tbl, &t.leaf_rows, &mut off.leaf_rows);
-        put_u32(&mut tbl, &t.term_leaves, &mut off.term_leaves);
-        put_f32(&mut tbl, &t.terminal_utility, &mut off.terminal_utility);
-        put_u32(&mut tbl, &t.leaf_coff, &mut off.leaf_coff);
-        put_u32(&mut tbl, &t.leaf_cidx, &mut off.leaf_cidx);
-        put_f32(&mut tbl, &t.leaf_xpub, &mut off.leaf_xpub);
-        put_f32(&mut tbl, &t.cphi, &mut off.cphi);
-        put_u32(&mut tbl, &t.bfs_order, &mut off.bfs_order);
-        put_u32(&mut tbl, &t.level_start, &mut off.level_start);
-        put_u32(&mut tbl, &t.psi_off, &mut off.psi_off);
-        put_f32(&mut tbl, &t.psi, &mut off.psi);
-        put_u8(&mut tbl, &t.ids, &mut off.ids);
-        let mut tables = unsafe { self.stream.alloc(tbl.len()) }.map_err(|e| format!("{e:?}"))?;
-        self.stream.memcpy_htod(&tbl, &mut tables).map_err(|e| format!("{e:?}"))?;
-        #[cfg(test)]
-        eprintln!("admit: tables uploaded ({} bytes)", tbl.len());
-        // roots
-        let mut rootv: Vec<f32> = Vec::with_capacity(nc0 + nc1 + nroots * (nc0 + nc1));
-        rootv.extend_from_slice(&job.root[0]);
-        rootv.extend_from_slice(&job.root[1]);
-        let mut roots = unsafe { self.stream.alloc(rootv.len()) }.map_err(|e| format!("{e:?}"))?;
-        self.stream.memcpy_htod(&rootv, &mut roots).map_err(|e| format!("{e:?}"))?;
-        #[cfg(test)]
-        eprintln!("admit: roots uploaded");
-        // ---- the solve descriptor ----
-        let ab = device_ptr_mut_of(&self.stream, &mut arenas);
-        let tb = device_ptr_of(&self.stream, &tables) as *mut u8;
-        let desc = SolveDesc {
-            reach: unsafe { ab.add(off.reach) },
-            vals: unsafe { ab.add(off.vals) },
-            regret: unsafe { ab.add(off.regret) },
-            inst: unsafe { ab.add(off.inst) },
-            cur: unsafe { ab.add(off.cur) },
-            sum_strat: unsafe { ab.add(off.sum_strat) },
-            avg: unsafe { ab.add(off.avg) },
-            snaps: if meta.snapshots { unsafe { ab.add(off.snaps) } } else { std::ptr::null_mut() },
-            cz: unsafe { ab.add(off.cz + crate::rebel::NTYPE * de) },
-            cg: unsafe { ab.add(off.cg) },
-            q: unsafe { ab.add(off.q) },
-            root0: device_ptr_of(&self.stream, &roots),
-            root1: unsafe { device_ptr_of(&self.stream, &roots).add(nc0) },
-            node_kind: unsafe { tb.add(off.node_kind) },
-            node_player: unsafe { tb.add(off.node_player) },
-            node_leaf: unsafe { tb.add(off.node_leaf) },
-            node_child_start: unsafe { tb.add(off.node_child_start) as *const u32 },
-            node_child: unsafe { tb.add(off.node_child) as *const u32 },
-            obs_off: unsafe { tb.add(off.obs_off) as *const u32 },
-            obs_start: unsafe { tb.add(off.obs_start) as *const u32 },
-            obs_act: unsafe { tb.add(off.obs_act) as *const u32 },
-            obs_child: unsafe { tb.add(off.obs_child) as *const u32 },
-            legal_bits: unsafe { tb.add(off.legal_bits) },
-            trans: unsafe { tb.add(off.trans) as *const i32 },
-            draw_off: unsafe { tb.add(off.draw_off) as *const u32 },
-            draw_to: unsafe { tb.add(off.draw_to) as *const u32 },
-            draw_p: unsafe { tb.add(off.draw_p) as *const f32 },
-            draw_steps: unsafe { tb.add(off.draw_steps) },
-            draw_row_off: unsafe { tb.add(off.draw_row_off) as *const u32 },
-            draw_row_start: unsafe { tb.add(off.draw_row_start) as *const u32 },
-            cfg_off: unsafe { tb.add(off.cfg_off) as *const u32 },
-            reach_off: unsafe { tb.add(off.reach_off) as *const u32 },
-            soff: unsafe { tb.add(off.soff) as *const u32 },
-            voff: unsafe { tb.add(off.voff) as *const u32 },
-            act_off: unsafe { tb.add(off.act_off) as *const u32 },
-            leaf_rows: unsafe { tb.add(off.leaf_rows) as *const u32 },
-            term_leaves: unsafe { tb.add(off.term_leaves) as *const u32 },
-            terminal_utility: unsafe { tb.add(off.terminal_utility) as *const f32 },
-            leaf_coff: unsafe { tb.add(off.leaf_coff) as *const u32 },
-            leaf_cidx: unsafe { tb.add(off.leaf_cidx) as *const u32 },
-            bfs_order: unsafe { tb.add(off.bfs_order) as *const u32 },
-            level_start: unsafe { tb.add(off.level_start) as *const u32 },
+        let desc = Desc {
+            tbl: ptr(&self.stream, &tables),
+            arena: ptr_mut(&self.stream, &mut arenas),
+            toff,
+            aoff,
             nodes: t.nodes as i32,
-            rows: rows as i32,
+            rows: t.rows as i32,
             nleaf: t.nleaf as i32,
             nterm: t.nterm as i32,
-            ncells: ncells as i32,
+            ncells: t.ncells as i32,
             ncfg: t.ncfg as i32,
             nlevels: t.nlevels as i32,
             nsnaps: nsnaps as i32,
-            snap_t: 0,
-            t: 0,
-            traverser: 0,
-            stage: STAGE_ITERATE,
-            step: 0,
-            mode: 0,
-            leaf: 0,
+            nroots: job.carried.len() as i32,
+            row0: row0 as i32,
+            nc_root: [nc_root[0] as i32, nc_root[1] as i32],
+            snapshots: job.meta.snapshots as i32,
+            alpha: job.meta.cfr.alpha,
+            beta: job.meta.cfr.beta,
+            gamma: job.meta.cfr.gamma,
+            predict: job.meta.cfr.predict,
+            warm: job.meta.warm,
             first_query: 1,
-            snapshots: meta.snapshots as i32,
-            alpha: meta.cfr.alpha,
-            beta: meta.cfr.beta,
-            gamma: meta.cfr.gamma,
-            predict: meta.cfr.predict,
-            steps: [0, 0],
-            nroots: nroots as i32,
-            max_nc: 0,
-            strat_src: 0,
-            row_off: 0,
-            nplayers: 2,
-            p_player: 0,
+            ..Desc::default()
         };
-        // The initial reach (the uniform-strategy reach `Solver::new`
-        // propagates before seeding) goes into the reach arena.
-        {
-            let mut dst = arenas.slice_mut(off.reach..off.reach + reach_len);
-            let _ = self.stream.memcpy_htod(&t.reach, &mut dst);
-        }
-        // ---- build GEMMs ----
-        #[cfg(test)]
-        eprintln!("admit: desc built, starting build GEMMs");
-        self.build_cards(&mut arenas, &tables, off, rows, de)?;
-        #[cfg(test)]
-        eprintln!("admit: cards done");
-        self.build_trunk(&mut arenas, &tables, off, rows, hd, de)?;
-        #[cfg(test)]
-        eprintln!("admit: trunk done");
-        self.build_embed(&mut arenas, &tables, off, t.ncfg, dg, rk, de)?;
-        #[cfg(test)]
-        eprintln!("admit: embed done");
-        if meta.warm > 0.0 {
-            self.build_actions(&mut arenas, &tables, off, n_psi, rk, de)?;
-        }
-        // ---- insert the solve, then initialise the strategy arenas ----
-        let mut sv = LiveSolve {
-            slot,
+        self.live[slot] = Some(Solve {
             id: self.next_id,
-            meta,
-            tables,
+            meta: job.meta,
+            _tables: tables,
             arenas,
-            roots,
-            beliefs: None,
-            off,
             desc,
+            aoff,
             stage: STAGE_ITERATE,
             t: 0,
-            traverser: 0,
             step: 0,
-            first_query: true,
-            snap_t: 1,
+            // Snapshot 0 is the uniform average, taken below; the counter is
+            // the slot the *next* kept iterate goes to, so it is bumped after
+            // that first copy rather than before it.
+            snap_t: 0,
+            traverser: 0,
             steps: [0, 0],
-            nsnaps,
-            nroots,
-            nc_root: [nc0, nc1],
+            first_query: true,
+            row0,
+            nrows: t.rows,
             nleaf: t.nleaf,
-            ncells,
+            nterm: t.nterm,
             nodes: t.nodes,
-            cfg_off_host: t.cfg_off.clone(),
+            ncells: t.ncells,
+            nsnaps,
+            nroots: job.carried.len(),
+            nc_root,
             nc_leaf: [0, 0],
+            cfg_off: t.cfg_off.clone(),
             trip1: Some(reply),
             trip2: None,
-            root_values: Vec::new(),
-            leaf: 0,
-        };
+        });
         self.next_id += 1;
-        let snapshots = sv.meta.snapshots;
-        let warm = sv.meta.warm;
-        let (n_cells, off_avg, off_snaps) = (sv.ncells, sv.off.avg, sv.off.snaps);
-        self.live[slot] = Some(sv);
-        // Strategy init: uniform cur/avg, zero regrets, the reach-weighted
-        // seed, and snapshot 0 — exactly Solver::new's sequence.
         self.upload_descs();
-        self.launch_init(&[slot]);
-        if snapshots {
-            d2d_arenas(&self.stream, &mut self.live[slot].as_mut().unwrap().arenas,
-                       off_avg, off_snaps, n_cells);
-        }
-        if warm > 0.0 {
-            self.warm_start(slot);
+        self.build(slot)?;
+        // Uniform strategy and the reach-weighted seed, then snapshot 0.
+        self.launch(|k| &k.init_strategy, &[slot], P, |sv| sv.nodes);
+        if nsnaps > 0 {
+            self.launch(|k| &k.snapshot, &[slot], P, |sv| sv.ncells);
+            self.live[slot].as_mut().unwrap().snap_t = 1;
         }
         Ok(())
     }
 
-    /// The A4 warm start: policy_into_cur at the inner rows, then the
-    /// seeding. Ports Solver::warm_start.
-    fn warm_start(&mut self, slot: usize) {
-        let _ = slot;
-        // Implemented with the policy kernels (see the warm-start pass).
-    }
-
-
-    // ------------------------------------------------------------ launches
-
-    /// One row-major GEMM: C[m,n] = A[m,k] · B[k,n] (+ beta·C). All buffers
-    /// row-major [in, out] as stored; cuBLAS sees the transposes.
-    /// Synchronize and surface the first CUDA error, with a label.
-    #[cfg(test)]
-    fn chk(&self, what: &str) {
-        let _ = self.stream.synchronize();
-        if let Err(e) = self.stream.context().check_err() {
-            panic!("{what}: {e:?}");
-        }
-    }
-
-    fn upload_slots(&mut self, slots: &[usize]) {
-        self.group.clear();
-        self.group.extend(slots.iter().map(|&s| s as i32));
-        let _ = self.stream.memcpy_htod(&self.group, &mut self.slots);
-    }
-
-    fn cfg1(total: usize) -> LaunchConfig {
-        LaunchConfig {
-            grid_dim: (div_ceil(total, 256) as u32, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        }
-    }
-
-    fn cfg2(total: usize, nslots: usize) -> LaunchConfig {
-        LaunchConfig {
-            grid_dim: (div_ceil(total, 256) as u32, nslots as u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        }
-    }
-
-    fn woff(&self) -> (Vec<(usize, usize)>, Vec<(usize, usize)>, Vec<(usize, usize)>) {
-        weight_offsets(&self.weights.dims).expect("dims checked at upload")
-    }
-
-    fn launch_belief(&mut self, slots: &[usize]) {
-        self.upload_slots(slots);
-        let max_threads = slots
-            .iter()
-            .map(|&s| {
-                let sv = self.live[s].as_ref().unwrap();
-                sv.nleaf * if sv.stage == STAGE_ITERATE && !sv.first_query { 1 } else { 2 }
-            })
-            .max()
-            .unwrap_or(0);
-        let cfg = LaunchConfig {
-            grid_dim: (div_ceil(max_threads, 256) as u32, slots.len() as u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
+    /// The build: the card table, the trunk (into the solve's h0 rows), the
+    /// holding tower, and the action tower. Each GEMM is one cuBLAS call over
+    /// the whole solve; the kernels between them add biases and gather.
+    fn build(&mut self, slot: usize) -> Result<(), String> {
+        let one = [slot];
+        let c = self.weights.ctx;
+        let (h, hd, dg, rk, de, dc) = (
+            self.weights.dims[1], self.weights.dims[2], self.weights.dims[4],
+            self.weights.dims[5], self.weights.dims[7], self.weights.dims[8],
+        );
+        let (rows, ncfg, row0, arena) = {
+            let sv = self.live[slot].as_ref().unwrap();
+            (sv.nrows, sv.desc.ncfg as usize, sv.row0, sv.desc.arena)
         };
-        let mut b = self.stream.launch_builder(&self.f.belief_sums);
-        b.arg(&self.descs);
-        b.arg(&self.slots);
-        let nsl = slots.len() as i32;
-        b.arg(&nsl);
-        b.arg(&mut self.xb);
-        b.arg(&self.weights.dev);
-        let _ = unsafe { b.launch(cfg) };
-    }
-
-    fn launch_head(&mut self, slots: &[usize]) {
-        let (dg, hd, rk) = (self.weights.dims[4], self.weights.dims[2], self.weights.dims[5]);
-        let rows: usize = slots.iter().map(|&s| self.live[s].as_ref().unwrap().nleaf).sum();
-        if rows == 0 {
-            return;
-        }
-        if self.xb.len() < rows * 2 * dg {
-            self.xb = self.stream.alloc_zeros(rows * 2 * dg).unwrap();
-            self.h = self.stream.alloc_zeros(rows * hd).unwrap();
-            self.u = self.stream.alloc_zeros(rows * rk).unwrap();
-            self.h0p = self.stream.alloc_zeros(rows * hd).unwrap();
-        }
-        // Pack h0 rows into h0p at each solve's packed row offset.
-        for &s in slots {
-            let sv = self.live[s].as_ref().unwrap();
-            let ro = sv.desc.row_off as usize;
-            let src = sv.arenas.slice(sv.off.h0..sv.off.h0 + sv.nleaf * hd);
-            let mut dst = self.h0p.slice_mut(ro * hd..(ro + sv.nleaf) * hd);
-            let _ = self.stream.memcpy_dtod(&src, &mut dst);
-        }
-        let (off_w, off_b, _) = self.woff();
-        // h = xb · wb, LN1 with h0p as the add term, then u.
-        let xb = self.xb.slice(..rows * 2 * dg);
-        let wb = self.weights.w.slice(off_w[6].0..off_w[6].0 + 2 * dg * hd);
-        let mut h_mut = self.h.slice_mut(..rows * hd);
-        gemm(&self.blas, rows, hd, 2 * dg, &xb, 2 * dg, &wb, hd, &mut h_mut, hd, 0.0);
-        let b1 = self.weights.b.slice(off_b[4].0..off_b[4].0 + hd);
-        let ln1w = self.weights.ln.slice(2 * self.weights.dims[1]..2 * self.weights.dims[1] + hd);
-        let ln1b = self.weights.ln.slice(2 * self.weights.dims[1] + hd..2 * self.weights.dims[1] + 2 * hd);
-        let cfg = Self::cfg1(rows);
-        let mut b = self.stream.launch_builder(&self.f.ln_relu);
-        b.arg(&mut self.h);
-        b.arg(&b1);
-        b.arg(&ln1w);
-        b.arg(&ln1b);
-        b.arg(&self.h0p);
-        let one = 1i32;
-        let rows_i = rows as i32;
-        let hd_i = hd as i32;
-        b.arg(&one);
-        b.arg(&rows_i);
-        b.arg(&hd_i);
-        let _ = unsafe { b.launch(cfg) };
-        let h = self.h.slice(..rows * hd);
-        let wu = self.weights.w.slice(off_w[11].0..off_w[11].0 + hd * rk);
-        let mut u_mut = self.u.slice_mut(..rows * rk);
-        gemm(&self.blas, rows, rk, hd, &h, hd, &wu, rk, &mut u_mut, rk, 0.0);
-        let bu = self.weights.b.slice(off_b[9].0..off_b[9].0 + rk);
-        let cfg2 = Self::cfg1(rows * rk);
-        let mut b2 = self.stream.launch_builder(&self.f.bias_add);
-        b2.arg(&mut self.u);
-        b2.arg(&bu);
-        b2.arg(&rows_i);
-        let rk_i = rk as i32;
-        b2.arg(&rk_i);
-        let _ = unsafe { b2.launch(cfg2) };
-    }
-
-    fn launch_readout(&mut self, slots: &[usize]) {
-        self.upload_slots(slots);
-        let max_threads = slots
-            .iter()
-            .map(|&s| {
-                let sv = self.live[s].as_ref().unwrap();
-                sv.nleaf + sv.desc.nterm as usize
-            })
-            .max()
-            .unwrap_or(0);
-        let cfg = LaunchConfig {
-            grid_dim: (div_ceil(max_threads, 256) as u32, slots.len() as u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut b = self.stream.launch_builder(&self.f.readout);
-        b.arg(&self.descs);
-        b.arg(&self.slots);
-        let nsl = slots.len() as i32;
-        b.arg(&nsl);
-        b.arg(&self.u);
-        b.arg(&self.weights.dev);
-        let _ = unsafe { b.launch(cfg) };
-    }
-
-    fn launch_backprop(&mut self, slots: &[usize]) {
-        self.upload_slots(slots);
-        let cfg = LaunchConfig {
-            grid_dim: (1, slots.len() as u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut b = self.stream.launch_builder(&self.f.backprop);
-        b.arg(&self.descs);
-        b.arg(&self.slots);
-        let nsl = slots.len() as i32;
-        b.arg(&nsl);
-        b.arg(&self.weights.dev);
-        let _ = unsafe { b.launch(cfg) };
-    }
-
-    fn launch_rm(&mut self, slots: &[usize]) {
-        self.upload_slots(slots);
-        let max_nodes = slots.iter().map(|&s| self.live[s].as_ref().unwrap().nodes).max().unwrap_or(0);
-        let cfg = Self::cfg2(max_nodes, slots.len());
-        let mut b = self.stream.launch_builder(&self.f.rm);
-        b.arg(&self.descs);
-        b.arg(&self.slots);
-        let nsl = slots.len() as i32;
-        b.arg(&nsl);
-        let _ = unsafe { b.launch(cfg) };
-    }
-
-    fn launch_propagate(&mut self, slots: &[usize]) {
-        self.upload_slots(slots);
-        let cfg = LaunchConfig {
-            grid_dim: (1, slots.len() as u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut b = self.stream.launch_builder(&self.f.propagate);
-        b.arg(&self.descs);
-        b.arg(&self.slots);
-        let nsl = slots.len() as i32;
-        b.arg(&nsl);
-        b.arg(&self.weights.dev);
-        let _ = unsafe { b.launch(cfg) };
-    }
-
-    fn launch_avg(&mut self, slots: &[usize]) {
-        self.upload_slots(slots);
-        let max_nodes = slots.iter().map(|&s| self.live[s].as_ref().unwrap().nodes).max().unwrap_or(0);
-        let cfg = Self::cfg2(max_nodes, slots.len());
-        let mut b = self.stream.launch_builder(&self.f.avg);
-        b.arg(&self.descs);
-        b.arg(&self.slots);
-        let nsl = slots.len() as i32;
-        b.arg(&nsl);
-        let _ = unsafe { b.launch(cfg) };
-    }
-
-    fn launch_leaf_beliefs(&mut self, slots: &[usize]) {
-        self.upload_slots(slots);
-        let max_threads = slots
-            .iter()
-            .map(|&s| {
-                let sv = self.live[s].as_ref().unwrap();
-                2 * sv.nsnaps.saturating_sub(1)
-            })
-            .max()
-            .unwrap_or(0);
-        let cfg = LaunchConfig {
-            grid_dim: (div_ceil(max_threads, 256) as u32, slots.len() as u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        for &s in slots {
-            let sv = self.live[s].as_ref().unwrap();
-            let Some(bel) = &sv.beliefs else { continue };
-            let mut b = self.stream.launch_builder(&self.f.leaf_beliefs);
-            b.arg(&self.descs);
-            b.arg(&self.slots);
-            let nsl = slots.len() as i32;
-        b.arg(&nsl);
-            b.arg(bel);
-            let _ = unsafe { b.launch(cfg) };
-        }
-    }
-
-    /// The grid-(nodes, nslots) kernels used at admission: init + seed.
-    fn launch_init(&mut self, slots: &[usize]) {
-        self.upload_slots(slots);
-        let max_nodes = slots.iter().map(|&s| self.live[s].as_ref().unwrap().nodes).max().unwrap_or(0);
-        let cfg = Self::cfg2(max_nodes, slots.len());
-        let mut b = self.stream.launch_builder(&self.f.init_strategy);
-        b.arg(&self.descs);
-        b.arg(&self.slots);
-        let nsl = slots.len() as i32;
-        b.arg(&nsl);
-        let _ = unsafe { b.launch(cfg) };
-        let mut b2 = self.stream.launch_builder(&self.f.seed_sum);
-        b2.arg(&self.descs);
-        b2.arg(&self.slots);
-        let __a1 = slots.len() as i32;
-        b2.arg(&__a1);
-        let _ = unsafe { b2.launch(cfg) };
-    }
-
-    // ------------------------------------------------------------ build GEMMs
-
-    /// The card table: e[NTYPE][de] = relu(facts·wd0 + bd0)·wd1 + bd1 + wid.
-    /// Ports net.rs::cards. The facts block of row 0 is the same for every
-    /// row of the solve (the draft is fixed per game).
-    fn build_cards(
-        &self,
-        arenas: &mut CudaSlice<f32>,
-        tables: &CudaSlice<u8>,
-        off: Offsets,
-        _rows: usize,
-        de: usize,
-    ) -> Result<(), String> {
-        let (dc,) = (self.weights.dims[8],);
         let cf = crate::units::CARD_FEATS;
-        // The facts block sits in row 0 of the uploaded xpub.
-        let facts = tview::<f32>(
-            tables,
-            off.leaf_xpub + crate::rebel::OFF_CARDS,
-            cf * crate::rebel::NTYPE,
-        );
-        let (off_w, off_b, _) = self.woff();
-        let wd0 = self.weights.w.slice(off_w[0].0..off_w[0].0 + cf * dc);
-        let wd1 = self.weights.w.slice(off_w[1].0..off_w[1].0 + dc * de);
-        let wid = self.weights.w.slice(off_w[2].0..off_w[2].0 + crate::units::N_UNITS * de);
-        let bd0 = self.weights.b.slice(off_b[0].0..off_b[0].0 + dc);
-        let bd1 = self.weights.b.slice(off_b[1].0..off_b[1].0 + de);
-        let hid = self.stream.alloc_zeros::<f32>(crate::rebel::NTYPE * dc).map_err(|e| format!("{e:?}"))?;
-        let tmp = self.stream.alloc_zeros::<f32>(crate::rebel::NTYPE * de).map_err(|e| format!("{e:?}"))?;
-        let mut hid_m = hid.clone();
-        gemm(&self.blas, 
-            crate::rebel::NTYPE, dc, cf,
-            &facts, cf, &wd0, dc, &mut hid_m, dc, 0.0,
-        );
-        let cfg = Self::cfg1(crate::rebel::NTYPE * dc);
-        let mut b = self.stream.launch_builder(&self.f.relu_bias);
-        b.arg(&mut hid_m);
-        b.arg(&bd0);
-        let __a2 = crate::rebel::NTYPE as i32;
-        b.arg(&__a2);
-        let __a3 = dc as i32;
-        b.arg(&__a3);
-        let _ = unsafe { b.launch(cfg) };
-        #[cfg(test)]
-        self.chk("cards relu");
-        let mut tmp_m = tmp.clone();
-        gemm(&self.blas, 
-            crate::rebel::NTYPE, de, dc,
-            &hid_m, dc, &wd1, de, &mut tmp_m, de, 0.0,
-        );
-        let mut e = arenas.slice_mut(off.cz..off.cz + crate::rebel::NTYPE * de);
-        let ids = tview::<u8>(tables, off.ids, crate::rebel::NTYPE);
-        let cfg2 = Self::cfg1(crate::rebel::NTYPE * de);
-        let mut b2 = self.stream.launch_builder(&self.f.cards_finish);
-        b2.arg(&mut e);
-        b2.arg(&tmp_m);
-        b2.arg(&bd1);
-        b2.arg(&wid);
-        b2.arg(&ids);
-        let __a4 = crate::rebel::NTYPE as i32;
-        b2.arg(&__a4);
-        let __a5 = de as i32;
-        b2.arg(&__a5);
-        let _ = unsafe { b2.launch(cfg2) };
-        #[cfg(test)]
-        self.chk("cards finish");
+        let ntype = crate::rebel::NTYPE;
+        let nslot = crate::rebel::NSLOT;
+        let hf = crate::net::hfeat(de);
+        let at = |a: Arena| unsafe { arena.add(self.live[slot].as_ref().unwrap().aoff[a as usize] as usize) };
+        let (a_e, a_z, a_g) = (at(Arena::e), at(Arena::z), at(Arena::g));
+        let xpub = self.table_ptr(slot, Tbl::leaf_xpub);
+
+        // The card table: e = relu(facts . Wd0 + bd0) . Wd1 + bd1 + wid[id].
+        // The facts block is the same at every row, so it is read from row 0.
+        let facts = unsafe { xpub.add(crate::rebel::OFF_CARDS) };
+        gemm(&self.blas, ntype, dc, cf, facts, cf, c.wd0, dc, c.bh, dc, 0.0);
+        self.launch(|k| &k.cards_relu, &one, P, |_| ntype * dc);
+        gemm(&self.blas, ntype, de, dc, c.bh as *const f32, dc, c.wd1, de, a_e, de, 0.0);
+        self.launch(|k| &k.cards_finish, &one, P, |_| ntype * de);
+
+        // The trunk: the pile summary's two halves, the assembled input, then
+        // h_pub = relu(LN0(x . W0 + b0)) and h0 = h_pub . W1, written straight
+        // into the solve's rows of the h0 pool.
+        self.launch(|k| &k.pile_pe, &one, P, |_| ntype * de);
+        gemm_batched(&self.blas, ntype, de, crate::rebel::PILE_COUNTS,
+             unsafe { xpub.add(crate::rebel::OFF_PILES) }, crate::rebel::PILE_COUNTS,
+             crate::rebel::PUBFEAT, c.wpile, de, c.bgather, de, ntype * de, rows);
+        self.launch(|k| &k.assemble, &one, P, |sv| sv.nrows);
+        gemm(&self.blas, rows, h, xdim(de), c.bx as *const f32, xdim(de), c.w0, h, c.bh, h, 0.0);
+        self.launch(|k| &k.trunk_norm, &one, P, |sv| sv.nrows);
+        gemm(&self.blas, rows, hd, h, c.bh as *const f32, h, c.w1, hd,
+             unsafe { c.h0.add(row0 * hd) }, hd, 0.0);
+
+        // The holding tower: z, then the residual, then g.
+        self.launch(|k| &k.holding_in, &one, P, |_| ncfg * nslot);
+        gemm(&self.blas, ncfg * nslot, dg, hf, c.bgather as *const f32, hf, c.wc, dg, c.bh, dg, 0.0);
+        self.launch(|k| &k.slot_sum, &one, P, |_| ncfg);
+        gemm(&self.blas, ncfg, dg, dg, a_z as *const f32, dg, c.wh1, dg, c.bh, dg, 0.0);
+        self.launch(|k| &k.embed_relu, &one, P, |_| ncfg * dg);
+        gemm(&self.blas, ncfg, dg, dg, c.bh as *const f32, dg, c.wh2, dg, a_z, dg, 1.0);
+        self.launch(|k| &k.embed_bias, &one, P, |_| ncfg * dg);
+        gemm(&self.blas, ncfg, rk + 1, dg, a_z as *const f32, dg, c.wg, rk + 1, a_g, rk + 1, 0.0);
+        self.launch(|k| &k.readout_bias, &one, P, |_| ncfg * (rk + 1));
+
         Ok(())
     }
 
-    /// The trunk: assemble the per-row input from xpub + e, then
-    /// h0 = relu(LN0(x·w0 + b0))·w1. Ports net.rs::assemble + trunk.
-    fn build_trunk(
-        &self,
-        arenas: &mut CudaSlice<f32>,
-        tables: &CudaSlice<u8>,
-        off: Offsets,
-        rows: usize,
-        hd: usize,
-        de: usize,
-    ) -> Result<(), String> {
-        let (h,) = (self.weights.dims[1],);
-        let (hf, xd) = (4 + de,
-            crate::board::N_HEXES * (crate::rebel::HEX_FACTS + de) + 2 * de + crate::rebel::LOOSE);
-        let (off_w, off_b, _) = self.woff();
-        let wpile = self.weights.w.slice(off_w[3].0..off_w[3].0 + (4 + de) * de);
-        let bpile = self.weights.b.slice(off_b[2].0..off_b[2].0 + de);
-        let w0 = self.weights.w.slice(off_w[4].0..off_w[4].0 + xd * h);
-        let b0 = self.weights.b.slice(off_b[3].0..off_b[3].0 + h);
-        let w1 = self.weights.w.slice(off_w[5].0..off_w[5].0 + h * hd);
-        let ln0w = self.weights.ln.slice(0..h);
-        let ln0b = self.weights.ln.slice(h..2 * h);
-        let e = arenas.slice(off.cz..off.cz + crate::rebel::NTYPE * de);
-        // pe = bpile + e·wpile[4:] (once per solve), then assemble.
-        let pe = self.stream.alloc_zeros::<f32>(crate::rebel::NTYPE * de).map_err(|e| format!("{e:?}"))?;
-        let mut pe_m = pe.clone();
-        let cfg = Self::cfg1(crate::rebel::NTYPE * de);
-        let mut b = self.stream.launch_builder(&self.f.pile_pe);
-        b.arg(&mut pe_m);
-        b.arg(&e);
-        b.arg(&wpile);
-        b.arg(&bpile);
-        let __a6 = de as i32;
-        b.arg(&__a6);
-        let _ = unsafe { b.launch(cfg) };
-        #[cfg(test)]
-        self.chk("pile_pe");
-        let xpub = tview::<f32>(tables, off.leaf_xpub, rows * self.weights.dims[0]);
-        let x = self.stream.alloc_zeros::<f32>(rows * xd).map_err(|e| format!("{e:?}"))?;
-        let mut x_m = x.clone();
-        let cfg2 = Self::cfg1(rows);
-        let mut b2 = self.stream.launch_builder(&self.f.assemble);
-        b2.arg(&mut x_m);
-        b2.arg(&xpub);
-        b2.arg(&e);
-        b2.arg(&pe_m);
-        let __a7 = rows as i32;
-        b2.arg(&__a7);
-        let __a8 = self.weights.dims[0] as i32;
-        b2.arg(&__a8);
-        let __a9 = de as i32;
-        b2.arg(&__a9);
-        #[cfg(test)]
-        {
-            let px = device_ptr_of(&self.stream, &pe_m);
-            eprintln!("assemble ptrs: pe_m={px:?} rows={rows} pf={} de={de}", self.weights.dims[0]);
-        }
-        let _ = unsafe { b2.launch(cfg2) };
-        #[cfg(test)]
-        self.chk("assemble");
-        // scratch = x·w0; LN0+ReLU in place; h0 = scratch·w1.
-        let mut scratch = self.stream.alloc_zeros::<f32>(rows * h).map_err(|e| format!("{e:?}"))?;
-        gemm(&self.blas, rows, h, xd, &x_m, xd, &w0, h, &mut scratch, h, 0.0);
-        let cfg3 = Self::cfg1(rows);
-        let mut b3 = self.stream.launch_builder(&self.f.ln_relu);
-        b3.arg(&mut scratch);
-        b3.arg(&b0);
-        b3.arg(&ln0w);
-        b3.arg(&ln0b);
-        b3.arg(&x_m);
-        let __a10 = 0i32;
-        b3.arg(&__a10);
-        let __a11 = rows as i32;
-        b3.arg(&__a11);
-        let __a12 = h as i32;
-        b3.arg(&__a12);
-        let _ = unsafe { b3.launch(cfg3) };
-        #[cfg(test)]
-        self.chk("trunk ln");
-        let mut h0 = arenas.slice_mut(off.h0..off.h0 + rows * hd);
-        gemm(&self.blas, rows, hd, h, &scratch, h, &w1, hd, &mut h0, hd, 0.0);
-        let _ = hf;
-        Ok(())
+    /// The device address of one of a solve's uploaded tables.
+    fn table_ptr(&self, slot: usize, table: Tbl) -> *const f32 {
+        let sv = self.live[slot].as_ref().unwrap();
+        unsafe { sv.desc.tbl.add(sv.desc.toff[table as usize] as usize) as *const f32 }
     }
 
-    /// The config tower: z, g from cphi. Ports net.rs::embed.
-    fn build_embed(
-        &self,
-        arenas: &mut CudaSlice<f32>,
-        tables: &CudaSlice<u8>,
-        off: Offsets,
-        n: usize,
-        dg: usize,
-        rk: usize,
-        de: usize,
-    ) -> Result<(), String> {
-        let (hf,) = (4 + de,);
-        let (off_w, off_b, _) = self.woff();
-        let wc = self.weights.w.slice(off_w[7].0..off_w[7].0 + hf * dg);
-        let bc = self.weights.b.slice(off_b[5].0..off_b[5].0 + dg);
-        let wh1 = self.weights.w.slice(off_w[8].0..off_w[8].0 + dg * dg);
-        let bh1 = self.weights.b.slice(off_b[6].0..off_b[6].0 + dg);
-        let wh2 = self.weights.w.slice(off_w[9].0..off_w[9].0 + dg * dg);
-        let bh2 = self.weights.b.slice(off_b[7].0..off_b[7].0 + dg);
-        let wg = self.weights.w.slice(off_w[10].0..off_w[10].0 + dg * (rk + 1));
-        let bg = self.weights.b.slice(off_b[8].0..off_b[8].0 + rk + 1);
-        let cphi = tview::<f32>(tables, off.cphi, n * crate::rebel::CFEAT);
-        let e = arenas.slice(off.cz..off.cz + crate::rebel::NTYPE * de);
-        let inp = self.stream.alloc_zeros::<f32>(n * crate::rebel::NSLOT * hf).map_err(|e| format!("{e:?}"))?;
-        let slot = self.stream.alloc_zeros::<f32>(n * crate::rebel::NSLOT * dg).map_err(|e| format!("{e:?}"))?;
-        let res = self.stream.alloc_zeros::<f32>(n * dg).map_err(|e| format!("{e:?}"))?;
-        let mut inp_m = inp.clone();
-        let cfg = Self::cfg1(n * crate::rebel::NSLOT);
-        let mut b = self.stream.launch_builder(&self.f.holding_in);
-        b.arg(&mut inp_m);
-        b.arg(&cphi);
-        b.arg(&e);
-        let __a13 = n as i32;
-        b.arg(&__a13);
-        let __a14 = crate::rebel::CFEAT as i32;
-        b.arg(&__a14);
-        let __a15 = de as i32;
-        b.arg(&__a15);
-        let _ = unsafe { b.launch(cfg) };
-        #[cfg(test)]
-        self.chk("holding_in");
-        let mut slot_m = slot.clone();
-        gemm(&self.blas, n * crate::rebel::NSLOT, dg, hf, &inp_m, hf, &wc, dg, &mut slot_m, dg, 0.0);
-        let mut z = arenas.slice_mut(off.cz + crate::rebel::NTYPE * de..off.cz + crate::rebel::NTYPE * de + n * dg);
-        let cfg2 = Self::cfg1(n);
-        let mut b2 = self.stream.launch_builder(&self.f.slot_sum);
-        b2.arg(&mut z);
-        b2.arg(&slot_m);
-        b2.arg(&bc);
-        let __a16 = n as i32;
-        b2.arg(&__a16);
-        let __a17 = dg as i32;
-        b2.arg(&__a17);
-        let _ = unsafe { b2.launch(cfg2) };
-        #[cfg(test)]
-        self.chk("slot_sum");
-        // Residual: z = z + relu(z·wh1 + bh1)·wh2 + bh2.
-        let mut res_m = res.clone();
-        gemm(&self.blas, n, dg, dg, &z, dg, &wh1, dg, &mut res_m, dg, 0.0);
-        let cfg3 = Self::cfg1(n * dg);
-        let mut b3 = self.stream.launch_builder(&self.f.relu_bias);
-        b3.arg(&mut res_m);
-        b3.arg(&bh1);
-        let __a18 = n as i32;
-        b3.arg(&__a18);
-        let __a19 = dg as i32;
-        b3.arg(&__a19);
-        let _ = unsafe { b3.launch(cfg3) };
-        #[cfg(test)]
-        self.chk("embed res relu");
-        let mut z2 = arenas.slice_mut(off.cz + crate::rebel::NTYPE * de..off.cz + crate::rebel::NTYPE * de + n * dg);
-        gemm(&self.blas, n, dg, dg, &res_m, dg, &wh2, dg, &mut z2, dg, 1.0);
-        let mut b4 = self.stream.launch_builder(&self.f.bias_add);
-        b4.arg(&mut z2);
-        b4.arg(&bh2);
-        let __a20 = n as i32;
-        b4.arg(&__a20);
-        let __a21 = dg as i32;
-        b4.arg(&__a21);
-        let _ = unsafe { b4.launch(cfg3) };
-        #[cfg(test)]
-        self.chk("embed add2");
-        // g = z·wg + bg.
-        let mut z3 = self.stream.alloc_zeros(n * dg).map_err(|e| format!("{e:?}"))?;
-        {
-            let z_src = arenas.slice(off.cz + crate::rebel::NTYPE * de..off.cz + crate::rebel::NTYPE * de + n * dg);
-            let _ = self.stream.memcpy_dtod(&z_src, &mut z3);
-        }
-        let mut g = arenas.slice_mut(off.cg..off.cg + n * (rk + 1));
-        gemm(&self.blas, n, rk + 1, dg, &z3, dg, &wg, rk + 1, &mut g, rk + 1, 0.0);
-        let mut b5 = self.stream.launch_builder(&self.f.bias_add);
-        b5.arg(&mut g);
-        b5.arg(&bg);
-        let __a22 = n as i32;
-        b5.arg(&__a22);
-        let __a23 = (rk + 1) as i32;
-        b5.arg(&__a23);
-        let _ = unsafe { b5.launch(cfg3) };
-        #[cfg(test)]
-        self.chk("embed g bias");
-        Ok(())
+    // ------------------------------------------------------------ the trips
+
+    /// Trip 1: the reference strategy and the carried roots' values. Two
+    /// downloads, both of whole arenas; nothing was copied out per tick.
+    fn send_trip1(&mut self, s: usize) {
+        let sv = self.live[s].as_mut().unwrap();
+        let Some(tx) = sv.trip1.take() else { return };
+        let stride = sv.nc_root[0] + sv.nc_root[1];
+        let strategy = d2h(&self.stream, &sv.arenas, sv.aoff[Arena::avg as usize] as usize, sv.ncells);
+        let flat = d2h(&self.stream, &sv.arenas, sv.aoff[Arena::root_vals as usize] as usize, sv.nroots * stride);
+        let root_values = flat
+            .chunks_exact(stride.max(1))
+            .map(|c| [c[..sv.nc_root[0]].to_vec(), c[sv.nc_root[0]..].to_vec()])
+            .collect();
+        let _ = tx.send(Ok(Trip1 { id: sv.id, strategy, root_values }));
     }
 
-    /// The action towers: q(a) = relu([psi | e_pay]·wq + bq) for every
-    /// decision node's actions. Ports net.rs::embed_actions.
-    fn build_actions(
-        &self,
-        arenas: &mut CudaSlice<f32>,
-        tables: &CudaSlice<u8>,
-        off: Offsets,
-        total_na: usize,
-        rk: usize,
-        de: usize,
-    ) -> Result<(), String> {
-        let afeat = crate::rebel::AFEAT;
-        let af = afeat + de;
-        let (off_w, off_b, _) = self.woff();
-        let wq = self.weights.w.slice(off_w[12].0..off_w[12].0 + af * rk);
-        let bq = self.weights.b.slice(off_b[10].0..off_b[10].0 + rk);
-        let psi = tview::<f32>(tables, off.psi, total_na * afeat);
-        let e = arenas.slice(off.cz..off.cz + crate::rebel::NTYPE * de);
-        let inp = self.stream.alloc_zeros::<f32>(total_na * af).map_err(|e| format!("{e:?}"))?;
-        let mut inp_m = inp.clone();
-        let cfg = Self::cfg1(total_na * de);
-        let mut b = self.stream.launch_builder(&self.f.action_in);
-        b.arg(&mut inp_m);
-        b.arg(&psi);
-        b.arg(&e);
-        let __a24 = total_na as i32;
-        b.arg(&__a24);
-        let __a25 = afeat as i32;
-        b.arg(&__a25);
-        let __a26 = de as i32;
-        b.arg(&__a26);
-        let _ = unsafe { b.launch(cfg) };
-        let mut q = arenas.slice_mut(off.q..off.q + total_na * rk);
-        gemm(&self.blas, total_na, rk, af, &inp_m, af, &wq, rk, &mut q, rk, 0.0);
-        let cfg2 = Self::cfg1(total_na * rk);
-        let mut b2 = self.stream.launch_builder(&self.f.relu_bias);
-        b2.arg(&mut q);
-        b2.arg(&bq);
-        let __a27 = total_na as i32;
-        b2.arg(&__a27);
-        let __a28 = rk as i32;
-        b2.arg(&__a28);
-        let _ = unsafe { b2.launch(cfg2) };
-        Ok(())
-    }
-
-    // ------------------------------------------------------------ lifecycle
-
-    /// Send trip 1: the reference strategy (the final average) and the
-    /// Phase-2 root values collected during the value stage.
-    fn finalize_trip1(&mut self, s: usize) {
-        let (tx, id, strategy, root_values) = {
-            let sv = self.live[s].as_mut().unwrap();
-            let strategy = d2h_arenas(&self.stream, &sv.arenas, sv.off.avg, sv.ncells);
-            (sv.trip1.take(), sv.id, strategy, sv.root_values.clone())
-        };
-        if let Some(tx) = tx {
-            let _ = tx.send(Ok(Trip1 { id, strategy, root_values }));
-        }
-    }
-
-    /// Send trip 2: the carried beliefs at the exit leaf, one per kept
-    /// snapshot (t = 0..T-1), then free the solve.
-    fn send_trip2(&mut self, s: usize) {
-        let (tx, id, raw, nsnaps, max_nc, nc_leaf) = {
-            let sv = self.live[s].as_mut().unwrap();
-            let buf = sv.beliefs.as_ref().expect("belief buffer");
-            let mut raw = vec![0.0f32; buf.len()];
-            let _ = self.stream.memcpy_dtoh(buf, &mut raw);
-            (sv.trip2.take(), sv.id, raw, sv.nsnaps, sv.desc.max_nc as usize, sv.nc_leaf)
-        };
-        let ncarry = nsnaps.saturating_sub(1);
-        let mut out = Vec::with_capacity(ncarry);
-        for i in 0..ncarry {
-            let base = (i * 2) * max_nc;
-            let p0 = raw[base..base + nc_leaf[0]].to_vec();
-            let p1 = raw[base + max_nc..base + max_nc + nc_leaf[1]].to_vec();
-            out.push([p0, p1]);
-        }
-        if let Some(tx) = tx {
-            let _ = tx.send(Ok(out));
-        }
-        self.free_solve(s);
-        let _ = id;
-    }
-
-    fn free_solve(&mut self, s: usize) {
-        self.live[s] = None;
-        self.free.push(s);
-    }
-
-    /// The walk left the tree at `leaf`: allocate the belief buffer, set the
-    /// carry stage. The reply is posted when every kept snapshot has been
-    /// propagated to the leaf.
-    fn trip2(&mut self, id: u64, leaf: u32, reply: mpsc::Sender<Result<Trip2, String>>) {
-        for s in 0..CAP {
-            let Some(sv) = &mut self.live[s] else { continue };
-            if sv.id != id {
-                continue;
-            }
-            let l = leaf as usize;
-            let n0 = (sv.cfg_off_host[2 * l + 1] - sv.cfg_off_host[2 * l]) as usize;
-            let n1 = (sv.cfg_off_host[2 * l + 2] - sv.cfg_off_host[2 * l + 1]) as usize;
-            let max_nc = n0.max(n1);
-            let ncarry = sv.nsnaps.saturating_sub(1);
-            let buf = match self.stream.alloc_zeros::<f32>(ncarry * 2 * max_nc) {
-                Ok(b) => b,
-                Err(e) => {
-                    let _ = reply.send(Err(format!("{e:?}")));
-                    return;
-                }
-            };
-            sv.leaf = l;
-            sv.nc_leaf = [n0, n1];
-            sv.desc.leaf = l as i32;
-            sv.desc.max_nc = max_nc as i32;
-            sv.beliefs = Some(buf);
-            sv.trip2 = Some(reply);
-            sv.stage = STAGE_CARRY;
-            sv.step = 0;
+    /// The walk left the tree at `leaf`: record it and let the carry stage
+    /// replay each kept snapshot to that leaf.
+    fn start_carry(&mut self, id: u64, leaf: u32, reply: mpsc::Sender<Result<Trip2, String>>) {
+        let Some(sv) = self.live.iter_mut().flatten().find(|v| v.id == id) else {
+            let _ = reply.send(Err(format!("gpu: unknown solve id {id}")));
             return;
-        }
-        let _ = reply.send(Err(format!("gpu: unknown solve id {id}")));
-    }
-    // ------------------------------------------------------------ tests
-
-    /// Test hook: admit one solve, run the tick phases up to `phase`, and
-    /// return the arenas for comparison with the CPU solver. Phase 0 is the
-    /// post-init state; 1 = belief+head, 2 = readout, 3 = backprop,
-    /// 4 = regret matching, 5 = forward reach, 6 = average.
-    #[cfg(test)]
-    pub(crate) fn probe_phase(&mut self, job: Job, phase: usize) -> Result<super::tests::ProbeOut, String> {
-        let (tx, _rx) = mpsc::channel();
-        eprintln!("probe: admitting");
-        self.admit(job, tx)?;
-        eprintln!("probe: admitted");
-        self.chk("after admit");
-        let s = self.live.iter().position(|x| x.is_some()).expect("admitted");
-        if phase >= 1 {
-            let sv = self.live[s].as_mut().unwrap();
-            sv.desc.row_off = 0;
-            sv.desc.nplayers = 2;
-            sv.desc.p_player = 0;
-            sv.desc.mode = 0;
-            sv.desc.traverser = 0;
-            sv.desc.strat_src = 0;
-            let rows = sv.nleaf;
-            let (dg, hd, rk) = (self.weights.dims[4], self.weights.dims[2], self.weights.dims[5]);
-            if self.xb.len() < rows * 2 * dg {
-                self.xb = self.stream.alloc_zeros(rows * 2 * dg).unwrap();
-                self.h = self.stream.alloc_zeros(rows * hd).unwrap();
-                self.u = self.stream.alloc_zeros(rows * rk).unwrap();
-                self.h0p = self.stream.alloc_zeros(rows * hd).unwrap();
-            }
-            self.upload_descs();
-            self.launch_belief(&[s]);
-            self.launch_head(&[s]);
-            self.chk("phase 1");
-        }
-        if phase >= 2 {
-            self.launch_readout(&[s]);
-            self.chk("phase 2");
-        }
-        if phase >= 3 {
-            self.launch_backprop(&[s]);
-            self.chk("phase 3");
-        }
-        if phase >= 4 {
-            self.launch_rm(&[s]);
-            self.chk("phase 4");
-        }
-        if phase >= 5 {
-            self.launch_propagate(&[s]);
-            self.chk("phase 5");
-        }
-        if phase >= 6 {
-            self.launch_avg(&[s]);
-            self.chk("phase 6");
-        }
-        let _ = self.stream.synchronize();
-        let sv = self.live[s].as_ref().unwrap();
-        let (dg, rk) = (self.weights.dims[4], self.weights.dims[5]);
-        let out = super::tests::ProbeOut {
-            reach: d2h_arenas(&self.stream, &sv.arenas, sv.off.reach, sv.off.vals - sv.off.reach),
-            vals: d2h_arenas(&self.stream, &sv.arenas, sv.off.vals, sv.off.regret - sv.off.vals),
-            regret: d2h_arenas(&self.stream, &sv.arenas, sv.off.regret, sv.ncells),
-            inst: d2h_arenas(&self.stream, &sv.arenas, sv.off.inst, sv.ncells),
-            cur: d2h_arenas(&self.stream, &sv.arenas, sv.off.cur, sv.ncells),
-            sum_strat: d2h_arenas(&self.stream, &sv.arenas, sv.off.sum_strat, sv.ncells),
-            avg: d2h_arenas(&self.stream, &sv.arenas, sv.off.avg, sv.ncells),
-            snaps: d2h_arenas(&self.stream, &sv.arenas, sv.off.snaps, sv.off.h0 - sv.off.snaps),
-            xb: d2h_arenas(&self.stream, &self.xb, 0, sv.nleaf * 2 * dg),
-            u: d2h_arenas(&self.stream, &self.u, 0, sv.nleaf * rk),
         };
-        self.free_solve(s);
+        let l = leaf as usize;
+        sv.nc_leaf = [
+            (sv.cfg_off[2 * l + 1] - sv.cfg_off[2 * l]) as usize,
+            (sv.cfg_off[2 * l + 2] - sv.cfg_off[2 * l + 1]) as usize,
+        ];
+        sv.desc.leaf = l as i32;
+        sv.step = 0;
+        sv.trip2 = Some(reply);
+    }
+
+    /// Trip 2: the carried beliefs at the exit leaf, one per kept snapshot.
+    fn send_trip2(&mut self, s: usize) {
+        let sv = self.live[s].as_mut().unwrap();
+        let Some(tx) = sv.trip2.take() else { return };
+        let stride = sv.nc_leaf[0] + sv.nc_leaf[1];
+        let n = sv.nsnaps.saturating_sub(1);
+        let flat = d2h(&self.stream, &sv.arenas, sv.aoff[Arena::beliefs as usize] as usize, n * stride);
+        let out = flat
+            .chunks_exact(stride.max(1))
+            .map(|c| [c[..sv.nc_leaf[0]].to_vec(), c[sv.nc_leaf[0]..].to_vec()])
+            .collect();
+        let _ = tx.send(Ok(out));
+    }
+
+    /// Test hook: admit one solve and run a CFR iteration up to `upto`, then
+    /// read back the arenas the CPU solver can be compared against. It drives
+    /// `iterate`, so what it checks is what the tick runs.
+    #[cfg(test)]
+    pub(crate) fn probe(&mut self, job: Job, upto: Step) -> Result<super::tests::ProbeOut, String> {
+        let (tx, _rx) = mpsc::channel();
+        self.admit(job, tx)?;
+        let s = self.live.iter().position(|x| x.is_some()).expect("admitted");
+        self.upload_descs();
+        self.iterate(&[s], &[], upto);
+        self.stream.synchronize().map_err(|e| format!("{e:?}"))?;
+        self.stream.context().check_err().map_err(|e| format!("{upto:?}: {e:?}"))?;
+        let (dg, rk) = (self.weights.dims[4], self.weights.dims[5]);
+        let sv = self.live[s].as_ref().unwrap();
+        let span = |k: Arena| {
+            (sv.aoff[k as usize + 1] - sv.aoff[k as usize]) as usize
+        };
+        let a = |k: Arena, n: usize| d2h(&self.stream, &sv.arenas, sv.aoff[k as usize] as usize, n);
+        let out = super::tests::ProbeOut {
+            e: a(Arena::e, span(Arena::e)),
+            z: a(Arena::z, span(Arena::z)),
+            g: a(Arena::g, span(Arena::g)),
+            h0: d2h(&self.stream, &self.pools._h0, sv.row0 * self.weights.dims[2],
+                    sv.nrows * self.weights.dims[2]),
+            reach: a(Arena::reach, span(Arena::reach)),
+            vals: a(Arena::vals, span(Arena::vals)),
+            regret: a(Arena::regret, sv.ncells),
+            inst: a(Arena::inst, sv.ncells),
+            cur: a(Arena::cur, sv.ncells),
+            sum_strat: a(Arena::sum_strat, sv.ncells),
+            avg: a(Arena::avg, sv.ncells),
+            xb: d2h(&self.stream, &self.pools._xb, sv.row0 * 2 * dg, sv.nleaf * 2 * dg),
+            u: d2h(&self.stream, &self.pools._u, sv.row0 * rk, sv.nleaf * rk),
+        };
+        self.release(s);
         Ok(out)
     }
 
-}
-
-
-
-/// D2D copy inside one solve's arena blob (the snapshot copies), via a
-/// temporary device buffer (the views would otherwise borrow the blob both
-/// ways at once).
-fn d2d_arenas(stream: &Arc<CudaStream>, arenas: &mut CudaSlice<f32>,
-              src_off: usize, dst_off: usize, n: usize) {
-    let src = arenas.slice(src_off..src_off + n);
-    let mut tmp = stream.alloc_zeros(n).expect("d2d tmp");
-    let _ = stream.memcpy_dtod(&src, &mut tmp);
-    let mut dst = arenas.slice_mut(dst_off..dst_off + n);
-    let _ = stream.memcpy_dtod(&tmp, &mut dst);
-}
-
-/// D2H of a range of one solve's arena blob.
-fn d2h_arenas(stream: &Arc<CudaStream>, arenas: &CudaSlice<f32>, off: usize, n: usize) -> Vec<f32> {
-    let view = arenas.slice(off..off + n);
-    let mut v = vec![0.0f32; n];
-    let _ = stream.memcpy_dtoh(&view, &mut v);
-    v
-}
-
-/// One row-major GEMM: C[m,n] = A[m,k] · B[k,n] (+ beta·C). All buffers
-/// row-major [in, out] as stored; cuBLAS sees the transposes.
-fn gemm<A: cudarc::driver::DevicePtr<f32>, B: cudarc::driver::DevicePtr<f32>,
-        C: cudarc::driver::DevicePtrMut<f32>>(
-    blas: &CudaBlas,
-    m: usize, n: usize, k: usize,
-    a: &A, lda: usize,
-    b: &B, ldb: usize,
-    c: &mut C, ldc: usize,
-    beta: f32,
-) {
-    let cfg = GemmConfig {
-        transa: CUBLAS_OP_N,
-        transb: CUBLAS_OP_N,
-        // Row-major C[m,n] = A[m,k]·B[k,n] with every matrix stored
-        // row-major: cuBLAS sees the transposes, so the col-major leading
-        // dimensions are the row-major row strides (n for C, ldb for A,
-        // lda for B).
-        m: n as i32,
-        n: m as i32,
-        k: k as i32,
-        alpha: 1.0,
-        lda: ldb as i32,
-        ldb: lda as i32,
-        beta,
-        ldc: n as i32,
-    };
-    let _ = unsafe { blas.gemm(cfg, b, a, c) };
-}
-
-/// Typed device view into the solve's table blob (byte offsets).
-fn tview<T>(tables: &CudaSlice<u8>, byte_off: usize, n: usize) -> CudaView<'_, T> {
-    unsafe {
-        tables
-            .slice(byte_off..byte_off + n * std::mem::size_of::<T>())
-            .transmute::<T>(n)
-            .expect("aligned table view")
+    fn release(&mut self, s: usize) {
+        if let Some(sv) = self.live[s].take() {
+            self.pools.free(sv.row0);
+        }
+        self.free.push(s);
     }
 }
 
-fn div_ceil(a: usize, b: usize) -> usize {
-    a.div_ceil(b)
+/// Compare the device's view of `Desc` with the host's, field by field.
+///
+/// Everything else in this module rests on the two agreeing: the descriptor is
+/// written by Rust and read by CUDA, and a padding difference would corrupt
+/// every kernel while looking like a numerical bug. Both the probe kernel and
+/// the expected values are generated from the one declaration in `layout.rs`,
+/// so a field cannot be checked on one side only.
+fn check_abi(stream: &Arc<CudaStream>, probe: &CudaFunction) -> Result<(), String> {
+    let want = super::layout::abi_expected();
+    let mut got = zeros::<i32>(stream, want.len())?;
+    let mut b = stream.launch_builder(probe);
+    b.arg(&mut got);
+    let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 };
+    unsafe { b.launch(cfg) }.map_err(|e| format!("abi probe: {e:?}"))?;
+    let mut host = vec![0i32; want.len()];
+    stream.memcpy_dtoh(&got, &mut host).map_err(|e| format!("{e:?}"))?;
+    stream.synchronize().map_err(|e| format!("{e:?}"))?;
+    for ((name, &w), &g) in super::layout::abi_names().iter().zip(&want).zip(&host) {
+        if w != g as usize {
+            return Err(format!("gpu: Desc.{name} is {w} on the host, {g} on the device"));
+        }
+    }
+    Ok(())
 }
 
-/// Raw device pointer of a buffer, on the service's single stream.
-fn device_ptr_of<T>(stream: &Arc<CudaStream>, buf: &CudaSlice<T>) -> *const T {
+// ------------------------------------------------------------------ helpers
+
+fn zeros<T: cudarc::driver::ValidAsZeroBits + cudarc::driver::DeviceRepr>(
+    stream: &Arc<CudaStream>,
+    n: usize,
+) -> Result<CudaSlice<T>, String> {
+    stream.alloc_zeros(n.max(1)).map_err(|e| format!("{e:?}"))
+}
+
+fn htod<T: cudarc::driver::DeviceRepr + Unpin>(
+    stream: &Arc<CudaStream>,
+    v: &[T],
+) -> Result<CudaSlice<T>, String> {
+    let mut buf = unsafe { stream.alloc(v.len().max(1)) }.map_err(|e| format!("{e:?}"))?;
+    stream.memcpy_htod(v, &mut buf).map_err(|e| format!("{e:?}"))?;
+    Ok(buf)
+}
+
+/// Read part of a device buffer back to the host.
+///
+/// cudarc issues the copy asynchronously and, for an ordinary host slice,
+/// attaches no synchronisation to it — so the wait belongs here. It costs
+/// nothing in the steady state: downloads happen at a solve's two trip
+/// boundaries, never inside a tick.
+fn d2h(stream: &Arc<CudaStream>, buf: &CudaSlice<f32>, off: usize, n: usize) -> Vec<f32> {
+    let mut v = vec![0.0f32; n];
+    if n > 0 {
+        let _ = stream.memcpy_dtoh(&buf.slice(off..off + n), &mut v);
+        let _ = stream.synchronize();
+    }
+    v
+}
+
+fn ptr<T>(stream: &Arc<CudaStream>, buf: &CudaSlice<T>) -> *const T {
     let (p, _sync) = buf.device_ptr(stream);
     p as usize as *const T
 }
 
-/// Raw mutable device pointer of a buffer.
-fn device_ptr_mut_of<T>(stream: &Arc<CudaStream>, buf: &mut CudaSlice<T>) -> *mut T {
+fn ptr_mut<T>(stream: &Arc<CudaStream>, buf: &mut CudaSlice<T>) -> *mut T {
     let (p, _sync) = buf.device_ptr_mut(stream);
     p as usize as *mut T
+}
+
+/// A batch of identical row-major GEMMs sharing one `B`: `C_i = A_i . B`,
+/// where the `A_i` are `stride_a` apart. Used where a matrix is a block of
+/// each row of a wider table and gathering it first would be pure copying.
+#[allow(clippy::too_many_arguments)]
+fn gemm_batched(
+    blas: &CudaBlas,
+    m: usize, n: usize, k: usize,
+    a: *const f32, lda: usize, stride_a: usize,
+    b: *const f32, ldb: usize,
+    c: *mut f32, ldc: usize, stride_c: usize,
+    batch: usize,
+) {
+    if m == 0 || n == 0 || k == 0 || batch == 0 {
+        return;
+    }
+    let (alpha, beta) = (1.0f32, 0.0f32);
+    // SAFETY: as `gemm` — device pointers the service owns, shapes from the
+    // arena sizes the caller cut.
+    let _ = unsafe {
+        cudarc::cublas::result::sgemm_strided_batched(
+            *blas.handle(), CUBLAS_OP_N, CUBLAS_OP_N,
+            n as i32, m as i32, k as i32, &alpha,
+            b, ldb as i32, 0,
+            a, lda as i32, stride_a as i64,
+            &beta, c, ldc as i32, stride_c as i64,
+            batch as i32,
+        )
+    };
+}
+
+/// One row-major GEMM over raw device pointers: `C[m,n] = A[m,k] . B[k,n]`,
+/// plus `beta * C`. Every matrix is stored row-major, so cuBLAS — which is
+/// column-major — is handed the product transposed, with the row strides as
+/// its leading dimensions.
+#[allow(clippy::too_many_arguments)]
+fn gemm(
+    blas: &CudaBlas,
+    m: usize, n: usize, k: usize,
+    a: *const f32, lda: usize,
+    b: *const f32, ldb: usize,
+    c: *mut f32, ldc: usize,
+    beta: f32,
+) {
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+    let alpha = 1.0f32;
+    // SAFETY: the pointers are device addresses owned by the service's own
+    // buffers, and the shapes come from the arena sizes the caller cut.
+    // Swapping the operands is what turns the column-major call into the
+    // row-major product above.
+    let _ = unsafe {
+        cudarc::cublas::result::sgemm(
+            *blas.handle(),
+            CUBLAS_OP_N,
+            CUBLAS_OP_N,
+            n as i32,
+            m as i32,
+            k as i32,
+            &alpha,
+            b,
+            ldb as i32,
+            a,
+            lda as i32,
+            &beta,
+            c,
+            ldc as i32,
+        )
+    };
 }

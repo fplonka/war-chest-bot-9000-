@@ -30,6 +30,7 @@ pub enum Ty {
 }
 
 impl Ty {
+    #[cfg(test)]
     fn size(self) -> usize {
         match self {
             Ty::U8 => 1,
@@ -124,6 +125,13 @@ macro_rules! tables {
         /// How many tables a descriptor carries offsets for.
         pub const N_TABLES: usize = [$(stringify!($name)),*].len();
 
+        /// Each table's slot in `Desc::toff`. The host names a table the same
+        /// way `kernels.cu` does, and the discriminants are the declaration
+        /// order both sides were generated from.
+        #[allow(non_camel_case_types)]
+        #[derive(Clone, Copy)]
+        pub enum Tbl { $($name),* }
+
         /// Pack every table into one blob, in declaration order.
         pub fn pack_tables($t: &TreeTables, $d: &Derived) -> (Vec<u8>, [u32; N_TABLES]) {
             let mut blob = Vec::new();
@@ -183,8 +191,6 @@ tables! { t, d,
     level_start: U32 = &t.level_start,
     leaf_xpub: F32 = &t.leaf_xpub,
     cphi: F32 = &t.cphi,
-    psi_off: U32 = &t.psi_off,
-    psi: F32 = &t.psi,
     ids: U8 = &t.ids,
     root: F32 = &d.root,
     carried: F32 = &d.carried,
@@ -198,10 +204,12 @@ pub struct Sizes {
     pub ncells: usize,
     pub nsnaps: usize,
     pub ncfg: usize,
-    pub nact: usize,
-    pub nroot_cfg: usize,
+    /// Configs at the root, both players — the stride of a belief vector.
+    pub nc_root: usize,
+    /// The widest node in the tree; the carry stage's exit leaf is one of
+    /// them, and is not known until trip 2 asks.
+    pub max_nc: usize,
     pub nroots: usize,
-    pub rows: usize,
     pub dg: usize,
     pub rk: usize,
     pub de: usize,
@@ -213,18 +221,31 @@ macro_rules! arenas {
         /// How many arenas a descriptor carries offsets for.
         pub const N_ARENAS: usize = [$(stringify!($name)),*].len();
 
-        /// Cumulative arena offsets, in declaration order, and the total.
-        pub fn arena_offsets($n: &Sizes) -> ([u32; N_ARENAS], usize) {
+        /// Each arena's slot in `Desc::aoff`, matching the `A_*` accessors.
+        #[allow(non_camel_case_types)]
+        #[derive(Clone, Copy)]
+        pub enum Arena { $($name),* }
+
+        /// Cumulative arena offsets in declaration order, with the total in
+        /// the last slot — so every arena's length is the gap to the next.
+        pub fn arena_offsets($n: &Sizes) -> ([u32; N_ARENAS + 1], usize) {
             let mut at = 0usize;
-            let off = [$({ let a = at; at += $len; a as u32 }),*];
+            let mut off = [0u32; N_ARENAS + 1];
+            let mut i = 0;
+            $(off[i] = at as u32; at += $len; i += 1;)*
+            off[i] = at as u32;
             (off, at)
         }
 
-        /// `#define A_name(d)` for each arena: a float pointer into the blob.
+        /// `A_name(d)` for each arena's base, `A_len_name(d)` for its length.
         fn arena_defs() -> String {
             let mut s = String::new();
             for (i, name) in [$(stringify!($name)),*].iter().enumerate() {
-                s += &format!("#define A_{n}(d) ((d)->arena + (d)->aoff[{i}])\n", n = name, i = i);
+                s += &format!(
+                    "#define A_{n}(d) ((d)->arena + (d)->aoff[{i}])\n\
+                     #define A_len_{n}(d) ((int)((d)->aoff[{j}] - (d)->aoff[{i}]))\n",
+                    n = name, i = i, j = i + 1,
+                );
             }
             s
         }
@@ -243,10 +264,8 @@ arenas! { n,
     e = crate::rebel::NTYPE * n.de,
     z = n.ncfg * n.dg,
     g = n.ncfg * (n.rk + 1),
-    q = n.nact * n.rk,
-    ph = n.rows * crate::rebel::NTYPE * n.de,
-    beliefs = n.nsnaps * 2 * n.nroot_cfg,
-    root_vals = n.nroots * 2 * n.nroot_cfg,
+    beliefs = n.nsnaps * 2 * n.max_nc,
+    root_vals = n.nroots * n.nc_root,
 }
 
 /// Declare the descriptor's scalars. Each becomes a field of the Rust struct
@@ -274,15 +293,58 @@ macro_rules! scalars {
             pub tbl: *const u8,
             pub arena: *mut f32,
             pub toff: [u32; N_TABLES],
-            pub aoff: [u32; N_ARENAS],
+            pub aoff: [u32; N_ARENAS + 1],
             $(pub $name: $ty,)*
+        }
+
+        /// A kernel that reports the device's view of `Desc`: its size, then
+        /// the byte offset of every field. Generating it from the same
+        /// declaration as the struct is what makes the check total — a field
+        /// cannot be added to one side and forgotten on the other.
+        fn abi_probe() -> String {
+            let mut s = String::from(
+                "// NVRTC compiles without <cstddef>, and its frontend has no\n\
+                 // __builtin_offsetof, so spell the classic definition out.\n\
+                 #define OFF(m) ((int)(unsigned long long)(&((Desc*)0)->m))\n\
+                 extern \"C\" __global__ void abi_probe(int* out) {\n\
+                 \x20 out[0] = (int)sizeof(Desc);\n\
+                 \x20 out[1] = OFF(tbl);\n\
+                 \x20 out[2] = OFF(arena);\n\
+                 \x20 out[3] = OFF(toff);\n\
+                 \x20 out[4] = OFF(aoff);\n",
+            );
+            let mut i = 5;
+            $(s += &format!("  out[{}] = OFF({});\n", i, stringify!($name));
+              i += 1;)*
+            let _ = i;
+            s + "}\n"
+        }
+
+        /// The host's view of the same, in the same order.
+        pub fn abi_expected() -> Vec<usize> {
+            let mut v = vec![
+                std::mem::size_of::<Desc>(),
+                std::mem::offset_of!(Desc, tbl),
+                std::mem::offset_of!(Desc, arena),
+                std::mem::offset_of!(Desc, toff),
+                std::mem::offset_of!(Desc, aoff),
+            ];
+            $(v.push(std::mem::offset_of!(Desc, $name));)*
+            v
+        }
+
+        /// Field names matching `abi_expected`, so a mismatch can say which.
+        pub fn abi_names() -> Vec<&'static str> {
+            let mut v = vec!["sizeof", "tbl", "arena", "toff", "aoff"];
+            $(v.push(stringify!($name));)*
+            v
         }
 
         fn desc_def() -> String {
             let mut s = format!(
                 "typedef struct {{\n  const unsigned char* tbl;\n  float* arena;\n  \
                  unsigned int toff[{}];\n  unsigned int aoff[{}];\n",
-                N_TABLES, N_ARENAS,
+                N_TABLES, N_ARENAS + 1,
             );
             $(s += &cuda_field(stringify!($name), stringify!($ty));)*
             s + "} Desc;\n"
@@ -316,11 +378,6 @@ scalars! {
     steps: [i32; 2],
     first_query: i32,
     snapshots: i32,
-    // Per-phase switches the tick sets.
-    mode: i32,
-    p_player: i32,
-    nplayers: i32,
-    strat_src: i32,
     // CFR variant.
     alpha: f32,
     beta: f32,
@@ -353,22 +410,26 @@ pub const STAGE_CARRY: i32 = 2;
 /// Prepended to `kernels.cu` before NVRTC sees it.
 pub fn cuda_preamble() -> String {
     format!(
-        "// Generated by gpu/layout.rs — do not edit.\n{}{}{}{}",
+        "// Generated by gpu/layout.rs — do not edit.\n{}{}{}{}{}",
         geometry_defs(),
         desc_def(),
         table_defs(),
         arena_defs(),
+        abi_probe(),
     )
 }
 
-/// Board and feature geometry. These are frozen by the job format; emitting
-/// them from the Rust constants keeps `kernels.cu` from restating them.
+/// Board and feature geometry, plus the stage tags. These are frozen by the
+/// job format; emitting them from the Rust constants keeps `kernels.cu` from
+/// restating them.
 fn geometry_defs() -> String {
     format!(
-        "#define N_HEXES {}\n#define NSLOT {}\n#define NTYPE {}\n#define HEX_FACTS {}\n\
+        "#define STAGE_ITERATE {STAGE_ITERATE}\n#define STAGE_VALUE {STAGE_VALUE}\n\
+         #define STAGE_CARRY {STAGE_CARRY}\n\
+         #define N_HEXES {}\n#define NSLOT {}\n#define NTYPE {}\n#define HEX_FACTS {}\n\
          #define HEX_CH {}\n#define OFF_LOOSE {}\n#define LOOSE {}\n#define OFF_PILES {}\n\
          #define PILE_COUNTS {}\n#define OFF_CARDS {}\n#define CARD_FEATS {}\n\
-         #define AFEAT {}\n#define CFEAT {}\n#define N_UNITS {}\n",
+         #define CFEAT {}\n#define N_UNITS {}\n",
         crate::board::N_HEXES,
         crate::rebel::NSLOT,
         crate::rebel::NTYPE,
@@ -380,7 +441,6 @@ fn geometry_defs() -> String {
         crate::rebel::PILE_COUNTS,
         crate::rebel::OFF_CARDS,
         crate::units::CARD_FEATS,
-        crate::rebel::AFEAT,
         crate::rebel::CFEAT,
         crate::units::N_UNITS,
     )
@@ -401,6 +461,42 @@ mod tests {
         for (i, (name, ty)) in table_types().into_iter().enumerate() {
             assert_eq!(off[i] as usize % ty.size(), 0, "{name} misaligned");
         }
+    }
+
+    /// Every table must land inside the blob it was packed into. A table
+    /// whose offset ran past the end would read another solve's memory, or
+    /// nothing at all, and no GPU is needed to notice.
+    #[test]
+    fn tables_fit_inside_the_blob() {
+        let job = crate::serialize::Job::stub();
+        let d = Derived::new(&job);
+        let (blob, off) = pack_tables(&job.tables, &d);
+        for (i, (name, _)) in table_types().into_iter().enumerate() {
+            assert!(
+                (off[i] as usize) < blob.len().max(1),
+                "{name} starts at {} but the blob is {} bytes",
+                off[i],
+                blob.len()
+            );
+        }
+    }
+
+    /// The arenas must tile the block exactly: ascending, no gap, no overlap,
+    /// and the last offset is the total. Every `A_len_*` accessor is the gap
+    /// to the next arena, so an out-of-order declaration would silently give
+    /// a kernel a negative length.
+    #[test]
+    fn arenas_tile_the_block() {
+        let n = Sizes {
+            reach_len: 7, vals_len: 11, ncells: 13, nsnaps: 3, ncfg: 5,
+            nc_root: 4, max_nc: 6, nroots: 2, dg: 64, rk: 64, de: 32,
+        };
+        let (off, total) = arena_offsets(&n);
+        for w in off.windows(2) {
+            assert!(w[1] >= w[0], "arena offsets must ascend: {w:?}");
+        }
+        assert_eq!(*off.last().unwrap() as usize, total, "last offset is the total");
+        assert!(total > 0, "a solve needs some arena");
     }
 
     #[test]

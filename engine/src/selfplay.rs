@@ -1201,7 +1201,7 @@ pub fn collect_roots(
         if out.len() >= cap {
             break;
         }
-        let mut rng = Rng::new(worker_seed(seed, i));
+        let rng = Rng::new(worker_seed(seed, i));
         let mut d = Data::default();
         let mut roots: Vec<(State, [Belief; 2])> = Vec::new();
         play_game(rng, nets, gc, &mut d, Some(&mut roots));
@@ -1318,7 +1318,7 @@ pub fn run_games(games: usize, seed: u64, nets: &[Nets], gc: &GameCfg) -> Data {
     (0..games)
         .into_par_iter()
         .fold(Data::default, |mut acc, i| {
-            let mut rng = Rng::new(worker_seed(seed, i));
+            let rng = Rng::new(worker_seed(seed, i));
             play_game(rng, nets, gc, &mut acc, None);
             acc
         })
@@ -1342,7 +1342,7 @@ pub fn eval_match(
     (0..games)
         .into_par_iter()
         .map(|i| {
-            let mut rng = Rng::new(worker_seed(seed.wrapping_add(7), i / 2));
+            let rng = Rng::new(worker_seed(seed.wrapping_add(7), i / 2));
             let swap = i % 2 == 1;
             let gc = GameCfg {
                 agents: if swap { [b, a] } else { [a, b] },

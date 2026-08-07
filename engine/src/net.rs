@@ -496,7 +496,7 @@ impl Mlp {
             ));
         }
         let (h, hd, dg, rk, de, dc) = (dims[1], dims[2], dims[4], dims[5], dims[7], dims[8]);
-        let (af, hf, xd) = (dims[6] + de, HFEAT_OF(de), xdim_of(de));
+        let (af, hf, xd) = (dims[6] + de, hfeat(de), xdim_of(de));
         // The learned per-unit identity table is `[N_UNITS, de]`; the unit
         // count is a game constant, so it needs no dims entry.
         let want_w = CARD_FEATS * dc
@@ -920,7 +920,7 @@ impl Mlp {
                 relu(row);
             }
         } else {
-            let (de, hf) = (self.de(), HFEAT_OF(self.de()));
+            let (de, hf) = (self.de(), hfeat(self.de()));
         let cf = self.cfeat();
         // The five slot rows are independent and identically shaped, so the
         // whole tower is one matmul over [n * NSLOT, hf] and a segmented sum --
@@ -1263,7 +1263,9 @@ impl Mlp {
 /// One coin type's input to the holding tower: its three counts, the seat, and
 /// its card embedding.
 #[allow(non_snake_case)]
-const fn HFEAT_OF(de: usize) -> usize {
+/// The holding tower's input width: three counts and the seat, plus the
+/// card embedding. Named here because the GPU build has to cut the same row.
+pub const fn hfeat(de: usize) -> usize {
     4 + de
 }
 

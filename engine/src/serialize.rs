@@ -19,7 +19,7 @@
 //! `docs/TREE.md`; see that file for the meaning of each array.
 
 use crate::rebel::{
-    config_counts, write_action_feats, AFEAT, CFEAT, CCOUNTS, Config, NSLOT, NTYPE,
+    config_counts, write_action_feats, AFEAT, CFEAT, CCOUNTS, Config, NSLOT,
 };
 use crate::search::{Cfr, Solver};
 

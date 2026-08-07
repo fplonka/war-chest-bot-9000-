@@ -1,154 +1,89 @@
-"""Work-package-B verification on a CUDA box (modal).
+"""Work-package-B verification on a CUDA box, via modal.
 
-Bare minimum GPU time: the container builds the engine with the `gpu`
-feature once (cargo target cached in a volume) and runs the oracle tests
-that need CUDA. The CPU-only tests and the torch spec run on the laptop.
+The laptop has no CUDA, so the oracle tests that need a device run here. The
+container builds the engine with the `gpu` feature once and keeps the cargo
+target directory in a volume, so a re-run only recompiles what changed.
 
-    uvx modal run gpu_ci.py            # the default: unit tests
-    uvx modal run gpu_ci.py --bench    # the B5.6 benchmark
-    uvx modal run gpu_ci.py --ladder   # the B5.5 same-weights ladder
+    uvx modal run gpu_ci.py                    # every gpu test
+    uvx modal run gpu_ci.py --test phase       # one test, by substring
+    uvx modal run gpu_ci.py --no-release       # unoptimised, for a backtrace
 
-Uses the cheapest modal GPU that works (T4; the kernels compile to
-compute_75, which T4 is). Edit FILTER to run one test.
+Optimised by default: the tests build a real subgame on the CPU first, and a
+debug build spends minutes there before the first kernel runs.
+
+Uses the cheapest GPU that runs the kernels (T4 is compute_75, which is what
+they are compiled for).
 """
 
 import io
 import os
 import subprocess
-import sys
+
 import tarfile
 
 import modal
-from modal.mount import Mount
 
-# cargo test filter ("" = all; e.g. "phase_oracle", "full_solve_oracle")
-FILTER = "phase_oracle"
-
-VOL = modal.Volume.from_name("warchest-cargo", create_if_missing=True)
-SRC = modal.Volume.from_name("warchest-src", create_if_missing=True)
+REPO = "/Users/filip/Code/warchest-cuda"
+# Directories that are large and never needed to build or test.
+SKIP = {"target", ".venv", "runs", ".git", "__pycache__", "papers", "node_modules"}
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.1.0-devel-ubuntu22.04", add_python="3.11")
     .run_commands(
-        "apt-get update && apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev gdb",
-        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable",
-        "ln -sf /root/.cargo/bin/cargo /usr/local/bin/cargo && ln -sf /root/.cargo/bin/rustc /usr/local/bin/rustc",
+        "apt-get update && apt-get install -y --no-install-recommends "
+        "curl build-essential pkg-config libssl-dev",
+        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y "
+        "--default-toolchain stable",
+        # CARGO_HOME points at the cache volume, so the toolchain binaries
+        # rustup installed under /root/.cargo must be reachable by path.
+        "ln -sf /root/.cargo/bin/cargo /root/.cargo/bin/rustc /usr/local/bin/",
     )
-    .pip_install("numpy")
 )
 
 app = modal.App("warchest-gpu-ci")
-
-ENV = {
-    "CARGO_TARGET_DIR": "/root/warchest/target",
-    "CARGO_HOME": "/root/warchest/cargo",
-}
+CARGO = modal.Volume.from_name("warchest-cargo", create_if_missing=True)
+SRC = modal.Volume.from_name("warchest-src", create_if_missing=True)
+ENV = {"CARGO_TARGET_DIR": "/root/warchest/target", "CARGO_HOME": "/root/warchest/cargo"}
 
 
 def repo_tarball() -> io.BytesIO:
-    """The repo, without the bulky build/runtime dirs."""
-    skip = {"target", ".venv", "runs", ".git", "__pycache__", "papers", "node_modules"}
+    """The repo, without the bulky build and runtime directories."""
 
-    def filt(i):
-        rel = i.name.split("/repo/")[-1] if "/repo/" in i.name else i.name
-        return None if any(c in skip for c in rel.split("/")[:-1]) else i
+    def keep(info):
+        parts = info.name.split("/")[:-1]
+        return None if any(p in SKIP for p in parts) else info
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        tar.add("/Users/filip/Code/warchest-cuda", arcname="repo", filter=filt)
+        tar.add(REPO, arcname="repo", filter=keep)
     buf.seek(0)
     return buf
 
 
-@app.function(image=image, gpu="T4", timeout=3600,
-              volumes={"/root/warchest": VOL, "/root/src": SRC})
-def run_tests():
+@app.function(image=image, gpu="T4", timeout=1800,
+              volumes={"/root/warchest": CARGO, "/root/src": SRC})
+def run(test: str, release: bool):
     os.makedirs("/repo", exist_ok=True)
-    subprocess.run(["tar", "xzf", "/root/src/repo.tgz", "-C", "/repo", "--strip-components=1"], check=True)
-    os.chdir("/repo/engine")
+    subprocess.run(
+        ["tar", "xzf", "/root/src/repo.tgz", "-C", "/repo", "--strip-components=1"],
+        check=True,
+    )
     cmd = ["cargo", "test", "--features", "gpu", "--lib"]
-    if FILTER:
-        cmd.append(FILTER)
+    if release:
+        cmd.append("--release")
+    if test:
+        cmd.append(test)
     cmd += ["--", "--nocapture", "--test-threads=1"]
-    r = subprocess.run(cmd, env={**os.environ, **ENV},
-                       capture_output=True, text=True)
-    print(r.stdout[-20000:])
-    print(r.stderr[-4000:])
-    if r.returncode != 0:
-        # always rerun under gdb for a backtrace (fast: the binary is built)
-        import glob
-        bins = glob.glob("/root/warchest/target/debug/deps/warchest-*")
-        bins = [b for b in bins if "d" in b and b.endswith(".d") is False]
-        # the lib test binary is the one with a long hash, no extension
-        bins = [b for b in bins if "." not in b.split("/")[-1]]
-        if bins:
-            g = subprocess.run(["gdb", "-batch", "-ex", "run", "-ex", "bt", bins[0], "phase_oracle"],
-                               env={**os.environ, **ENV}, capture_output=True, text=True)
-            print("GDB OUTPUT:\n", g.stdout[-15000:], g.stderr[-2000:])
-    if r.returncode != 0:
-        raise SystemExit(r.returncode)
-
-
-@app.function(image=image, gpu="T4", timeout=3600,
-              volumes={"/root/warchest": VOL, "/root/src": SRC})
-def bench():
-    os.makedirs("/repo", exist_ok=True)
-    subprocess.run(["tar", "xzf", "/root/src/repo.tgz", "-C", "/repo", "--strip-components=1"], check=True)
-    os.chdir("/repo/engine")
-    cmd = ["cargo", "run", "--release", "--features", "gpu", "--example", "gpu_bench"]
-    r = subprocess.run(cmd, env={**os.environ, **ENV},
-                       capture_output=True, text=True)
-    print(r.stdout[-20000:])
-    print(r.stderr[-4000:])
-    if r.returncode != 0:
-        # always rerun under gdb for a backtrace (fast: the binary is built)
-        import glob
-        bins = glob.glob("/root/warchest/target/debug/deps/warchest-*")
-        bins = [b for b in bins if "d" in b and b.endswith(".d") is False]
-        # the lib test binary is the one with a long hash, no extension
-        bins = [b for b in bins if "." not in b.split("/")[-1]]
-        if bins:
-            g = subprocess.run(["gdb", "-batch", "-ex", "run", "-ex", "bt", bins[0], "phase_oracle"],
-                               env={**os.environ, **ENV}, capture_output=True, text=True)
-            print("GDB OUTPUT:\n", g.stdout[-15000:], g.stderr[-2000:])
-    if r.returncode != 0:
-        raise SystemExit(r.returncode)
-
-
-@app.function(image=image, gpu="T4", timeout=3600,
-              volumes={"/root/warchest": VOL, "/root/src": SRC})
-def ladder():
-    os.makedirs("/repo", exist_ok=True)
-    subprocess.run(["tar", "xzf", "/root/src/repo.tgz", "-C", "/repo", "--strip-components=1"], check=True)
-    os.chdir("/repo/engine")
-    cmd = ["cargo", "run", "--release", "--features", "gpu", "--example", "gpu_ladder"]
-    r = subprocess.run(cmd, env={**os.environ, **ENV},
-                       capture_output=True, text=True)
-    print(r.stdout[-20000:])
-    print(r.stderr[-4000:])
-    if r.returncode != 0:
-        # always rerun under gdb for a backtrace (fast: the binary is built)
-        import glob
-        bins = glob.glob("/root/warchest/target/debug/deps/warchest-*")
-        bins = [b for b in bins if "d" in b and b.endswith(".d") is False]
-        # the lib test binary is the one with a long hash, no extension
-        bins = [b for b in bins if "." not in b.split("/")[-1]]
-        if bins:
-            g = subprocess.run(["gdb", "-batch", "-ex", "run", "-ex", "bt", bins[0], "phase_oracle"],
-                               env={**os.environ, **ENV}, capture_output=True, text=True)
-            print("GDB OUTPUT:\n", g.stdout[-15000:], g.stderr[-2000:])
-    if r.returncode != 0:
-        raise SystemExit(r.returncode)
+    print("$", " ".join(cmd), flush=True)
+    # Stream the output: a failing kernel can take a while to surface, and a
+    # silent container for ten minutes is indistinguishable from a hang.
+    p = subprocess.run(cmd, cwd="/repo/engine", env={**os.environ, **ENV})
+    if p.returncode != 0:
+        raise SystemExit(p.returncode)
 
 
 @app.local_entrypoint()
-def main():
-    print("uploading repo tarball...")
+def main(test: str = "", no_release: bool = False):
     with SRC.batch_upload(force=True) as batch:
         batch.put_file(repo_tarball(), "/repo.tgz")
-    if "--bench" in sys.argv:
-        bench.remote()
-    elif "--ladder" in sys.argv:
-        ladder.remote()
-    else:
-        run_tests.remote()
+    run.remote(test, not no_release)
