@@ -208,7 +208,7 @@ pub struct Conv {
 
 /// What a backward pass over the tree does with the values it computes.
 #[derive(Clone, Copy, PartialEq)]
-enum Back {
+pub enum Back {
     /// CFR: the traverser averages over their strategy, and the per-action
     /// values less the node value accumulate as instantaneous regret.
     Regret,
@@ -477,106 +477,106 @@ fn give_buf(role: usize, v: Vec<f32>) {
 }
 
 pub struct Solver<'a> {
-    ctx: &'a Ctx,
+    pub(crate) ctx: &'a Ctx,
     nets: &'a Nets,
-    cfg: Cfg,
+    pub(crate) cfg: Cfg,
     pub nodes: Vec<TNode>,
-    root_belief: [Belief; 2],
+    pub(crate) root_belief: [Belief; 2],
     /// Regrets and the current regret-matching iterate, flat by node:
     /// `[soff[i] .. soff[i] + nc(player) * na]`, laid out `[config * na + a]`.
-    regret: Vec<f32>,
+    pub(crate) regret: Vec<f32>,
     /// The instantaneous counterfactual regret of the traversal just finished,
     /// same layout. Kept apart from `regret` because the accumulated regret is
     /// discounted before this iteration's is added to it, so afterwards there
     /// is no way to recover it — and Predictive CFR+ needs it a second time,
     /// as its guess at the regret the next iteration will see.
-    inst: Vec<f32>,
-    cur: Vec<f32>,
-    soff: Vec<u32>,
+    pub inst: Vec<f32>,
+    pub cur: Vec<f32>,
+    pub(crate) soff: Vec<u32>,
     /// The average strategy and its running sum, per node. Always maintained:
     /// the walk acts on the average, and generation snapshots it per iterate.
-    sum_strat: Vec<Vec<f32>>,
-    avg: Vec<Vec<f32>>,
+    pub sum_strat: Vec<Vec<f32>>,
+    pub avg: Vec<Vec<f32>>,
     /// One flat copy of `avg` (per-node regions in node order, aligned with
     /// `soff`) taken before the first iteration and after each one: snapshot
     /// `t` is the average strategy at iterate t, and the last is the reference
     /// strategy `value_under` and the walk act on. Pooled across solves.
-    snaps: Vec<Vec<f32>>,
+    pub snaps: Vec<Vec<f32>>,
     /// Which snapshot the next `snapshot()` call is (0 = the pre-iteration
     /// average). Drives the log-spaced thinning: the carried beliefs are one
     /// per *kept* iterate, and the spread is in the early ones.
-    snap_t: usize,
+    pub(crate) snap_t: usize,
     /// The kept iteration numbers (`snapshot_iters`); the GPU contract
     /// uploads this list verbatim.
-    snap_list: Vec<usize>,
+    pub(crate) snap_list: Vec<usize>,
     /// Total strategy cells (sum over decision nodes of `nc * na`), so the
     /// snapshot arenas are reserved to size instead of grown.
-    ncells: usize,
+    pub ncells: usize,
     /// Reach per config, flat: node `i`'s two players occupy
     /// `reach[roff[i] .. roff[i] + nc0 + nc1]`, player 0 first. One arena
     /// rather than `Vec<Vec<f32>>` — the CFR passes touch every node, and two
     /// pointer hops per node is what they were spending their time on.
-    reach: Vec<f32>,
-    roff: Vec<u32>,
+    pub reach: Vec<f32>,
+    pub(crate) roff: Vec<u32>,
     /// The traverser's counterfactual value per config, flat the same way:
     /// `vals[voff[i] .. voff[i] + max(nc0, nc1)]`.
-    vals: Vec<f32>,
-    voff: Vec<u32>,
+    pub vals: Vec<f32>,
+    pub(crate) voff: Vec<u32>,
     /// `[node]` -> config counts per player, so the hot loops never chase the
     /// `Rc` to ask how long a support is.
-    nc: Vec<[u32; 2]>,
-    steps: [usize; 2],
+    pub(crate) nc: Vec<[u32; 2]>,
+    pub(crate) steps: [usize; 2],
 
     // ---------------------------------------------------------- leaf batch
     // Built once per solve. Everything here is a property of the leaf's public
     // state or its config support, so it survives every CFR iteration; only
     // `xb` (the belief blocks) is rewritten per iteration.
     /// Non-terminal leaves in node order — the rows of the network batch.
-    leaf_rows: Vec<usize>,
+    pub leaf_rows: Vec<usize>,
     /// Terminal leaves, scored from the game instead of the network.
-    term_leaves: Vec<usize>,
+    pub(crate) term_leaves: Vec<usize>,
     /// Per row, per player: an index into `cphi` for every config in support,
     /// packed back to back and indexed through `leaf_coff`.
-    leaf_cidx: Vec<u32>,
-    leaf_coff: Vec<u32>,
+    pub(crate) leaf_cidx: Vec<u32>,
+    pub(crate) leaf_coff: Vec<u32>,
     /// The subgame's distinct config vectors, `[n * CFEAT]`, and the map that
     /// deduplicates them. The same config recurs at hundreds of leaves — a
     /// depth-2 subgame has a few hundred leaves over a few dozen distinct
     /// configs — and the config tower is the one part of the network whose cost
     /// scales with the support, so it runs once per distinct config per solve.
-    cphi: Vec<f32>,
-    cmap: std::collections::HashMap<u64, u32>,
+    pub(crate) cphi: Vec<f32>,
+    pub(crate) cmap: std::collections::HashMap<u64, u32>,
     /// How many distinct configs `cphi` actually holds. Pooled buffers keep
     /// their length across solves, so the count cannot be read off `cphi.len()`.
-    ncfg: usize,
+    pub ncfg: usize,
     /// `embed` output for `cphi`: the belief embedding and the readout
     /// embedding. Both survive every CFR iteration.
-    cz: Vec<f32>,
-    cg: Vec<f32>,
+    pub cz: Vec<f32>,
+    pub cg: Vec<f32>,
     /// The card table `[NTYPE, de]`. The draft is fixed for the game, so this is
     /// built once per solve and read by every tower that names a card.
-    ce: Vec<f32>,
+    pub ce: Vec<f32>,
     /// The draft's unit ids in player-major slot order, for the describer's
     /// learned id embedding. Constant per solve.
-    ids: [u8; NTYPE],
+    pub(crate) ids: [u8; NTYPE],
     /// Decision nodes in the network batch, after the leaves. Only populated
     /// when a warm start needs the policy head at them.
-    inner_rows: Vec<usize>,
+    pub inner_rows: Vec<usize>,
     /// `[rows, ncfg]`: every leaf's PBS vector dotted with every interned config
     /// embedding, rebuilt per readout.
     vt: Vec<f32>,
     /// `rows * hidden`: the public half of the hidden layer.
-    h0: Vec<f32>,
+    pub h0: Vec<f32>,
     /// Width of one public row: the *net's*, not the current encoding's. A
     /// pre-describer checkpoint reads a 972-wide row written by `v1`'s frozen
     /// encoder, so that a gate can play the new architecture against the pool.
-    pubfeat: usize,
+    pub(crate) pubfeat: usize,
     /// `rows * pubfeat`: the public encoding, filled during the build.
-    xpub: Vec<f32>,
+    pub(crate) xpub: Vec<f32>,
     /// `rows * 2 * dg`: both players' belief embeddings.
-    xb: Vec<f32>,
+    pub xb: Vec<f32>,
     /// `rows * hidden`: the hidden layer, rebuilt per iteration.
-    ob: Vec<f32>,
+    pub ob: Vec<f32>,
     sb: Vec<f32>,
     /// Normalised belief weights for one leaf's support.
     wbuf: Vec<f32>,
@@ -1303,7 +1303,7 @@ impl<'a> Solver<'a> {
     }
 
     /// Fill `vals` at every leaf with the traverser's counterfactual values.
-    fn leaf_values(&mut self, traverser: usize) {
+    pub fn leaf_values(&mut self, traverser: usize) {
         self.ensure_leaf_batch();
         let rows = self.leaf_rows.len();
         let empty = self.nets.value.is_empty();
@@ -1503,7 +1503,7 @@ impl<'a> Solver<'a> {
     /// (`value_under`) and the best response (`nash_conv`). `mode` picks what
     /// the traverser's own decision nodes do with their children's values —
     /// average under `strat`, average and record the regret, or take the max.
-    fn backprop(&mut self, traverser: usize, strat: &[f32], mode: Back) {
+    pub fn backprop(&mut self, traverser: usize, strat: &[f32], mode: Back) {
         let _t = timed!(BACK);
         for i in (0..self.nodes.len()).rev() {
             if self.nodes[i].leaf {
