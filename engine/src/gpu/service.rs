@@ -330,7 +330,7 @@ pub fn spawn(
 }
 
 impl Service {
-    fn new(
+    pub(crate) fn new(
         rx: mpsc::Receiver<Cmd>,
         dims: Vec<usize>,
         w: Vec<f32>,
@@ -1522,6 +1522,63 @@ impl Service {
         }
         let _ = reply.send(Err(format!("gpu: unknown solve id {id}")));
     }
+    // ------------------------------------------------------------ tests
+
+    /// Test hook: admit one solve, run the tick phases up to `phase`, and
+    /// return the arenas for comparison with the CPU solver. Phase 0 is the
+    /// post-init state; 1 = belief+head, 2 = readout, 3 = backprop,
+    /// 4 = regret matching, 5 = forward reach, 6 = average.
+    #[cfg(test)]
+    pub(crate) fn probe_phase(&mut self, job: Job, phase: usize) -> Result<super::tests::ProbeOut, String> {
+        let (tx, _rx) = mpsc::channel();
+        self.admit(job, tx)?;
+        let s = self.live.iter().position(|x| x.is_some()).expect("admitted");
+        if phase >= 1 {
+            let sv = self.live[s].as_mut().unwrap();
+            sv.desc.row_off = 0;
+            sv.desc.nplayers = 2;
+            sv.desc.p_player = 0;
+            sv.desc.mode = 0;
+            sv.desc.traverser = 0;
+            sv.desc.strat_src = 0;
+            self.upload_descs();
+            self.launch_belief(&[s]);
+            self.launch_head(&[s]);
+        }
+        if phase >= 2 {
+            self.launch_readout(&[s]);
+        }
+        if phase >= 3 {
+            self.launch_backprop(&[s]);
+        }
+        if phase >= 4 {
+            self.launch_rm(&[s]);
+        }
+        if phase >= 5 {
+            self.launch_propagate(&[s]);
+        }
+        if phase >= 6 {
+            self.launch_avg(&[s]);
+        }
+        let _ = self.stream.synchronize();
+        let sv = self.live[s].as_ref().unwrap();
+        let (dg, rk) = (self.weights.dims[4], self.weights.dims[5]);
+        let out = super::tests::ProbeOut {
+            reach: d2h_arenas(&self.stream, &sv.arenas, sv.off.reach, sv.off.vals - sv.off.reach),
+            vals: d2h_arenas(&self.stream, &sv.arenas, sv.off.vals, sv.off.regret - sv.off.vals),
+            regret: d2h_arenas(&self.stream, &sv.arenas, sv.off.regret, sv.ncells),
+            inst: d2h_arenas(&self.stream, &sv.arenas, sv.off.inst, sv.ncells),
+            cur: d2h_arenas(&self.stream, &sv.arenas, sv.off.cur, sv.ncells),
+            sum_strat: d2h_arenas(&self.stream, &sv.arenas, sv.off.sum_strat, sv.ncells),
+            avg: d2h_arenas(&self.stream, &sv.arenas, sv.off.avg, sv.ncells),
+            snaps: d2h_arenas(&self.stream, &sv.arenas, sv.off.snaps, sv.off.h0 - sv.off.snaps),
+            xb: d2h_arenas(&self.stream, &self.xb, 0, sv.nleaf * 2 * dg),
+            u: d2h_arenas(&self.stream, &self.u, 0, sv.nleaf * rk),
+        };
+        self.free_solve(s);
+        Ok(out)
+    }
+
 }
 
 

@@ -89,7 +89,7 @@ fn main() {
         }
         let ctx = warchest::rebel::Ctx::new(&s);
         let root_bel = [bel[0].p.clone(), bel[1].p.clone()];
-        let mut sv = Solver::new(&s, &ctx, &nets[0], cfg, bel);
+        let mut sv = Solver::new(&s, ctx, &nets[0], cfg, bel);
         if sv.capped() {
             continue;
         }

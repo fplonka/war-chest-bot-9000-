@@ -81,7 +81,7 @@ fn main() {
         'roots: for (s, bel) in roots.iter().take(if max_roots == 0 { roots.len() } else { max_roots }) {
             let ctx = Ctx::new(s);
             let t0 = Instant::now();
-            let sv = Solver::new(s, &ctx, &nets, cfg, bel.clone());
+            let sv = Solver::new(s, ctx, &nets, cfg, bel.clone());
             times.push(t0.elapsed().as_micros() as usize);
             if sv.nodes.len() > node_cap {
                 capped += 1;

@@ -187,7 +187,7 @@ fn main() {
         // function that held everywhere except at a round-start draw.
         {
             let cfg = Cfg { depth: 2, iters, snapshots: true, ..Default::default() };
-            let mut sv = Solver::new(&s, &ctx, &nets, cfg, bel.clone());
+            let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
             sv.multistep(iters);
             let mut worst = 0.0f64;
             for i in 0..bel[me].cfg.len() {
@@ -215,7 +215,7 @@ fn main() {
         // ---- value residual at each depth.
         for (di, &d) in DEPTHS.iter().enumerate() {
             let cfg = Cfg { depth: d, iters, snapshots: true, ..Default::default() };
-            let mut sv = Solver::new(&s, &ctx, &nets, cfg, bel.clone());
+            let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
             sv.multistep(iters);
             let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
             for p in 0..2 {

@@ -57,11 +57,18 @@ impl GpuClient {
     pub fn solve(&self, job: Job, carried: &[[Vec<f32>; 2]]) -> Result<Trip1, String> {
         let mut job = job;
         job.carried = carried.to_vec();
+        let h = self.submit(job)?;
+        h.wait()
+    }
+
+    /// Submit one solve without blocking. The worker may hold several
+    /// pending solves (one per game) and wait on them in any order.
+    pub fn submit(&self, job: Job) -> Result<SolveHandle, String> {
         let (tx, rx) = mpsc::channel();
         self.tx
             .send(Cmd::Submit { job, reply: tx })
             .map_err(|_| "gpu service gone".to_string())?;
-        rx.recv().map_err(|_| "gpu service gone".to_string())?
+        Ok(SolveHandle { rx })
     }
 
     /// The walk left the tree at `leaf`: get the carried beliefs and free
@@ -83,5 +90,16 @@ impl GpuClient {
 impl Drop for GpuClient {
     fn drop(&mut self) {
         let _ = self.tx.send(Cmd::Shutdown);
+    }
+}
+
+/// A submitted solve; the worker blocks on `wait` for trip 1.
+pub struct SolveHandle {
+    rx: mpsc::Receiver<Result<Trip1, String>>,
+}
+
+impl SolveHandle {
+    pub fn wait(self) -> Result<Trip1, String> {
+        self.rx.recv().map_err(|_| "gpu service gone".to_string())?
     }
 }

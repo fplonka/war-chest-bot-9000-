@@ -210,10 +210,10 @@ impl TreeTables {
         let mut cfg_pending = Vec::new();
         for i in 0..nodes {
             let n = &sv.nodes[i];
-            let res = crate::rebel::reserve(&n.s, 0, sv.ctx);
+            let res = crate::rebel::reserve(&n.s, 0, &sv.ctx);
             for p in 0..2usize {
                 cfg_off.push(cfg_id.len() as u32);
-                let res_p = if p == 0 { res } else { crate::rebel::reserve(&n.s, 1, sv.ctx) };
+                let res_p = if p == 0 { res } else { crate::rebel::reserve(&n.s, 1, &sv.ctx) };
                 for c in n.cfgs[p].iter() {
                     let id = intern(c, &res_p, p, &mut cphi, &mut cmap, &mut ncfg);
                     cfg_id.push(id);
@@ -288,7 +288,7 @@ impl TreeTables {
                 psi_off.push(psi.len() as u32 / AFEAT as u32);
                 let mut row = vec![0.0f32; AFEAT];
                 for a in 0..na {
-                    write_action_feats(&n.acts[a], sv.ctx, me, n.aslot[a], n.fdown[a], &mut row);
+                    write_action_feats(&n.acts[a], &sv.ctx, me, n.aslot[a], n.fdown[a], &mut row);
                     psi.extend_from_slice(&row);
                 }
                 // legal bits + trans, in soff order.
@@ -760,6 +760,8 @@ mod tests {
                 action_pays: vec![],
                 action_fdown: vec![],
                 draw_off: vec![0, 0],
+                draw_row_off: vec![0, 0],
+                draw_row_start: vec![],
                 draw_steps: vec![0],
                 cfg_off: vec![0, 0, 0],
                 cfg_id: vec![],

@@ -477,7 +477,10 @@ fn give_buf(role: usize, v: Vec<f32>) {
 }
 
 pub struct Solver<'a> {
-    pub(crate) ctx: &'a Ctx,
+    /// Owned (it is `Copy`): the walk holds a solver across a whole subgame,
+    /// and the GPU path keeps one around while the solve runs on the device,
+    /// so the solver cannot borrow a builder-local context.
+    pub(crate) ctx: Ctx,
     nets: &'a Nets,
     pub(crate) cfg: Cfg,
     pub nodes: Vec<TNode>,
@@ -615,7 +618,7 @@ impl Drop for Solver<'_> {
 impl<'a> Solver<'a> {
     pub fn new(
         root: &State,
-        ctx: &'a Ctx,
+        ctx: Ctx,
         nets: &'a Nets,
         cfg: Cfg,
         belief: [Belief; 2],
@@ -875,8 +878,8 @@ impl<'a> Solver<'a> {
             loop {
                 let acts = cs.legal_actions();
                 debug_assert!(matches!(acts.first(), Some(Action::DrawCoin { .. })));
-                let res = reserve(&cs, player, self.ctx);
-                let fu = faceup_counts(&cs, player, self.ctx);
+                let res = reserve(&cs, player, &self.ctx);
+                let fu = faceup_counts(&cs, player, &self.ctx);
                 self.draw_scratch
                     .transition(&cur, &res, &fu, &mut next, &mut step, wp);
                 if steps == 0 {
@@ -912,7 +915,7 @@ impl<'a> Solver<'a> {
         let mine = cfgs[me].clone();
         let nc = mine.len();
         let ta = timed!(BACTS);
-        let (acts, aslot, fdown) = node_actions(&s, player, self.ctx, &mine);
+        let (acts, aslot, fdown) = node_actions(&s, player, &self.ctx, &mine);
         drop(ta);
         let na = acts.len();
         debug_assert!(na > 0, "a decision node must offer a reachable action");
@@ -1015,7 +1018,7 @@ impl<'a> Solver<'a> {
                 .expect("a kept action is playable by some config in the support");
             let tb = timed!(BAPPLY);
             let mut cs = s.clone();
-            set_config(&mut cs, player, self.ctx, &rep);
+            set_config(&mut cs, player, &self.ctx, &rep);
             cs.apply_inplace(acts[a]);
             drop(tb);
             let mut cc = cfgs.clone();
@@ -1060,7 +1063,7 @@ impl<'a> Solver<'a> {
     /// the parent's row can be borrowed alongside the child's through one
     /// `split_at_mut` — no copy of the parent's reach, which used to be two
     /// heap allocations per node per pass.
-    fn precompute_reaches(&mut self) {
+    pub fn precompute_reaches(&mut self) {
         let cur = std::mem::take(&mut self.cur);
         let root = [self.root_belief[0].p.clone(), self.root_belief[1].p.clone()];
         self.propagate(&cur, [&root[0], &root[1]]);
@@ -1160,9 +1163,9 @@ impl<'a> Solver<'a> {
     fn encode(&mut self, s: &State, at: usize) {
         let pf = self.pubfeat;
         if self.nets.value.v1() {
-            crate::v1::write_public_features_v1(s, self.ctx, &mut self.xpub[at..at + pf]);
+            crate::v1::write_public_features_v1(s, &self.ctx, &mut self.xpub[at..at + pf]);
         } else {
-            write_public_features(s, self.ctx, &mut self.xpub[at..at + pf]);
+            write_public_features(s, &self.ctx, &mut self.xpub[at..at + pf]);
         }
     }
 
@@ -1199,7 +1202,7 @@ impl<'a> Solver<'a> {
         }
         self.encode(s, at);
         for p in 0..2 {
-            let res = reserve(s, p as u8, self.ctx);
+            let res = reserve(s, p as u8, &self.ctx);
             self.leaf_coff.push(self.leaf_cidx.len() as u32);
             for c in cfgs[p].iter() {
                 let idx = self.intern_config(c, &res, p);
@@ -1420,7 +1423,7 @@ impl<'a> Solver<'a> {
     /// value for that exact config times the opponent's unnormalised reach
     /// into the leaf. Runs off the `ob` left by the last `leaf_values` /
     /// `leaf_values_both`, so two players can be read off one PBS-head pass.
-    fn readout(&mut self, p: usize) {
+    pub fn readout(&mut self, p: usize) {
         let _t = timed!(LEAFPOST);
         let empty = self.nets.value.is_empty();
         let opp = 1 - p;
@@ -1616,6 +1619,19 @@ impl<'a> Solver<'a> {
 
     pub fn step(&mut self, traverser: usize) {
         self.update_regrets(traverser);
+        self.rm_block(traverser);
+        // Restore the reach probabilities under the strategy just computed:
+        // the next iteration's traversal reads them, and so does the average
+        // strategy accumulation below.
+        self.precompute_reaches();
+        self.avg_block(traverser);
+        self.snapshot();
+        self.steps[traverser] += 1;
+    }
+
+    /// The regret-matching block of a step, standalone (the GPU phase tests
+    /// compare against it). Ported by the CUDA `rm` kernel.
+    pub fn rm_block(&mut self, traverser: usize) {
         // Fold this traversal's instantaneous regret into the accumulated one,
         // discount, and regret-match. `Cfr` says how: see its table.
         //
@@ -1625,52 +1641,52 @@ impl<'a> Solver<'a> {
         // iterate, and the walk asserts that each has the same support as the
         // live one. A hard zero here would drop configs and fail that assert.
         const EPS: f32 = 1e-6;
-        {
-            let _t = timed!(RM);
-            let k = self.cfg.cfr;
-            let m = self.steps[traverser] as f32 + 1.0;
-            let (da, db) = (Cfr::factor(m, k.alpha), Cfr::factor(m, k.beta));
-            let dg = (m / (m + 1.0)).powf(k.gamma);
-            for i in 0..self.nodes.len() {
-                let n = &self.nodes[i];
-                if n.leaf || n.chance || n.player as usize != traverser {
-                    continue;
+        let _t = timed!(RM);
+        let k = self.cfg.cfr;
+        let m = self.steps[traverser] as f32 + 1.0;
+        let (da, db) = (Cfr::factor(m, k.alpha), Cfr::factor(m, k.beta));
+        let dg = (m / (m + 1.0)).powf(k.gamma);
+        for i in 0..self.nodes.len() {
+            let n = &self.nodes[i];
+            if n.leaf || n.chance || n.player as usize != traverser {
+                continue;
+            }
+            let (na, nc) = (n.na(), n.nc(traverser));
+            let so = self.soff[i] as usize;
+            let regret = &mut self.regret[so..];
+            let inst = &self.inst[so..];
+            let cur = &mut self.cur[so..];
+            for c in 0..nc {
+                let mut sum = 0.0;
+                for a in 0..na {
+                    let j = c * na + a;
+                    if !n.legal[j] {
+                        cur[j] = 0.0;
+                        continue;
+                    }
+                    let r = regret[j] * if regret[j] > 0.0 { da } else { db } + inst[j];
+                    regret[j] = r;
+                    let v = (r + k.predict * inst[j]).max(EPS);
+                    cur[j] = v;
+                    sum += v;
                 }
-                let (na, nc) = (n.na(), n.nc(traverser));
-                let so = self.soff[i] as usize;
-                let regret = &mut self.regret[so..];
-                let inst = &self.inst[so..];
-                let cur = &mut self.cur[so..];
-                for c in 0..nc {
-                    let mut sum = 0.0;
+                if sum > 0.0 {
+                    let inv = 1.0 / sum;
                     for a in 0..na {
-                        let j = c * na + a;
-                        if !n.legal[j] {
-                            cur[j] = 0.0;
-                            continue;
-                        }
-                        let r = regret[j] * if regret[j] > 0.0 { da } else { db } + inst[j];
-                        regret[j] = r;
-                        let v = (r + k.predict * inst[j]).max(EPS);
-                        cur[j] = v;
-                        sum += v;
+                        cur[c * na + a] *= inv;
                     }
-                    if sum > 0.0 {
-                        let inv = 1.0 / sum;
-                        for a in 0..na {
-                            cur[c * na + a] *= inv;
-                        }
-                    }
-                }
-                for x in self.sum_strat[i].iter_mut() {
-                    *x *= dg;
                 }
             }
+            for x in self.sum_strat[i].iter_mut() {
+                *x *= dg;
+            }
         }
-        // Restore the reach probabilities under the strategy just computed:
-        // the next iteration's traversal reads them, and so does the average
-        // strategy accumulation below.
-        self.precompute_reaches();
+    }
+
+    /// The average-strategy block of a step, standalone (the GPU phase tests
+    /// compare against it). Reads the fresh reaches (`precompute_reaches`
+    /// ran). Ported by the CUDA `avg` kernel.
+    pub fn avg_block(&mut self, traverser: usize) {
         let _t = timed!(AVG);
         for i in 0..self.nodes.len() {
             let n = &self.nodes[i];
@@ -1698,8 +1714,6 @@ impl<'a> Solver<'a> {
                 }
             }
         }
-        self.snapshot();
-        self.steps[traverser] += 1;
     }
 
     pub fn multistep(&mut self, iters: usize) {
@@ -1922,7 +1936,7 @@ impl<'a> Solver<'a> {
                 let n = &self.nodes[i];
                 write_action_feats(
                     &n.acts[a],
-                    self.ctx,
+                    &self.ctx,
                     me,
                     n.aslot[a],
                     n.fdown[a],

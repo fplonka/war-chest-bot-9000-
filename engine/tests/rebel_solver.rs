@@ -184,7 +184,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
             ..Default::default()
         };
         {
-            let sv = Solver::new(&s, &ctx, &nets, cfg, bel.clone());
+            let sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
             // If any leaf were non-terminal the (empty) network would silently
             // return zero and the comparison would be meaningless.
             assert!(
@@ -214,7 +214,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
         // number — which makes this the whole correctness net for the family.
         let exact = oracle_value(&s, &ctx, &bel, 100);
         for (name, rule) in Cfr::NAMED {
-            let mut sv = Solver::new(&s, &ctx, &nets, Cfg { cfr: rule, ..cfg }, bel.clone());
+            let mut sv = Solver::new(&s, ctx, &nets, Cfg { cfr: rule, ..cfg }, bel.clone());
             // Exploitability early, before the solve has gone anywhere. Read
             // mid-flight on purpose: a fixed-policy pass must leave the solve
             // able to continue.
@@ -292,7 +292,7 @@ fn cfr_iteration_count_bias() {
         if bel[0].len() * bel[1].len() > 64 {
             continue;
         }
-        let probe = Solver::new(&s, &ctx, &nets, Cfg { depth: 8, iters: 1, snapshots: true, ..Default::default() }, bel.clone());
+        let probe = Solver::new(&s, ctx, &nets, Cfg { depth: 8, iters: 1, snapshots: true, ..Default::default() }, bel.clone());
         if !probe.nodes.iter().all(|n| !n.leaf || n.s.is_terminal()) || probe.nodes.len() > 8_000 {
             continue;
         }
@@ -310,7 +310,7 @@ fn cfr_iteration_count_bias() {
         let exact = oracle_value(&s, &ctx, &bel, 100);
         let mut line = format!("  {:+.4}   ", exact);
         for (bi, &t) in budgets.iter().enumerate() {
-            let mut sv = Solver::new(&s, &ctx, &nets, Cfg { depth: 8, iters: t, snapshots: true, ..Default::default() }, bel.clone());
+            let mut sv = Solver::new(&s, ctx, &nets, Cfg { depth: 8, iters: t, snapshots: true, ..Default::default() }, bel.clone());
             sv.multistep(t);
             let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
             let v0: f64 = (0..bel[0].len())
@@ -424,8 +424,7 @@ fn draw_pass_through_consistency() {
             continue;
         }
         let mut sv = Solver::new(
-            &s,
-            &ctx,
+            &s, ctx,
             &nets,
             Cfg {
                 depth: 5,
@@ -590,8 +589,7 @@ fn warrior_priest_draw_walks_through_the_tree() {
         Belief::point(Config::default()),
     ];
     let mut sv = Solver::new(
-        &s,
-        &ctx,
+        &s, ctx,
         &nets,
         Cfg { depth: 2, iters: 8, snapshots: true, ..Default::default() },
         bel.clone(),
@@ -729,7 +727,7 @@ fn depth_is_spent_on_coin_plays_not_micro_choices() {
                 // the depth limit. Under the old counting every child of the
                 // root was a leaf and this assertion failed.
                 let mut sv = Solver::new(
-                    &s, &ctx, &nets[0],
+                    &s, ctx, &nets[0],
                     Cfg { depth: 1, iters: 4, snapshots: false, ..Default::default() },
                     bel,
                 );
@@ -741,7 +739,7 @@ fn depth_is_spent_on_coin_plays_not_micro_choices() {
                 // Depth 2: the opponent's first main play is reached after
                 // one completed coin play, so it must be expanded, not a leaf.
                 let mut sv = Solver::new(
-                    &s, &ctx, &nets[0],
+                    &s, ctx, &nets[0],
                     Cfg { depth: 2, iters: 4, snapshots: false, ..Default::default() },
                     [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)],
                 );

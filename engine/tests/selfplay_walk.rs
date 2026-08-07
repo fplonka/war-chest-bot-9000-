@@ -33,7 +33,7 @@ fn walk_serves_multiple_decisions_per_solve() {
                 eval_mix: 0.0,
                 mc_mix: 0.0,
             };
-            let z = play_game(&mut rng, &nets, &gc, &mut d, None);
+            let z = play_game(rng, &nets, &gc, &mut d, None);
             assert!(z.is_finite());
             assert!(d.nv > 0, "no targets collected");
             total_dec += d.decisions;
@@ -68,7 +68,7 @@ fn walk_in_eval_mode() {
         eval_mix: 0.0,
         mc_mix: 0.0,
     };
-    let z = play_game(&mut rng, &nets, &gc, &mut d, None);
+    let z = play_game(rng, &nets, &gc, &mut d, None);
     assert!(z.is_finite());
     assert_eq!(d.nv, 0, "eval must not collect targets");
 }
@@ -91,7 +91,7 @@ fn walk_interrupted_by_non_rebel_agent() {
         eval_mix: 0.0,
         mc_mix: 0.0,
     };
-    let z = play_game(&mut rng, &nets, &gc, &mut d, None);
+    let z = play_game(rng, &nets, &gc, &mut d, None);
     assert!(z.is_finite());
     assert!(d.nv > 0, "interrupted walks must still yield their target");
     assert!(d.nv <= d.decisions);
@@ -125,7 +125,7 @@ fn walk_never_crosses_slots() {
             eval_mix: 0.0,
             mc_mix: 0.0,
         };
-        let z = play_game(&mut rng, &nets, &gc, &mut d, None);
+        let z = play_game(rng, &nets, &gc, &mut d, None);
         assert!(z.is_finite());
         assert!(d.nv > 0);
         total_dec += d.decisions;
@@ -161,7 +161,7 @@ fn walk_with_random_drafts() {
             eval_mix: 0.0,
             mc_mix: 0.0,
         };
-        let z = play_game(&mut rng, &nets, &gc, &mut d, None);
+        let z = play_game(rng, &nets, &gc, &mut d, None);
         assert!(z.is_finite());
         assert!(d.nv > 0);
         total_dec += d.decisions;
@@ -197,7 +197,7 @@ fn walk_across_warrior_priest_draws() {
             eval_mix: 0.0,
             mc_mix: 0.0,
         };
-        let z = play_game(&mut rng, &nets, &gc, &mut d, None);
+        let z = play_game(rng, &nets, &gc, &mut d, None);
         assert!(z.is_finite());
         assert!(d.nv > 0);
         total_dec += d.decisions;
@@ -226,7 +226,7 @@ fn capped_solves_fall_back_and_games_finish() {
             eval_mix: 0.0,
             mc_mix: 0.0,
         };
-        let z = play_game(&mut rng, &nets, &gc, &mut d, None);
+        let z = play_game(rng, &nets, &gc, &mut d, None);
         assert!(z.is_finite());
         total_dec += d.decisions;
     }

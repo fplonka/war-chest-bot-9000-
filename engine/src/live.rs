@@ -252,7 +252,7 @@ impl LiveGame {
         let mut s = self.s;
         let mut bel = self.bel.clone();
         let guard = nets().read().unwrap();
-        let mut sv = Solver::new(&s, &ctx, &guard[self.slot], scfg, bel.clone());
+        let mut sv = Solver::new(&s, ctx, &guard[self.slot], scfg, bel.clone());
         if sv.capped() {
             // Pathological root: play uniformly instead of solving. The
             // belief update below uses the true state's actions, which stays

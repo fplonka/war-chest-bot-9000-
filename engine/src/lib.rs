@@ -15,7 +15,6 @@ pub mod rng;
 pub mod roots;
 pub mod rules;
 pub mod search;
-#[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod serialize;
 pub mod selfplay;

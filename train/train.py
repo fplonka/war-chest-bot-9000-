@@ -517,6 +517,11 @@ def main():
     ap.add_argument("--no-augment", action="store_true",
                     help="disable the 180-degree mirror augmentation")
     ap.add_argument("--device", default="cpu")
+    # Work package B: run the ReBeL solves on the CUDA service (one thread
+    # owns GPU-0; the trainer stays on --device). The service must be present
+    # at startup or the run fails loudly rather than falling back to CPU.
+    ap.add_argument("--gpu", action="store_true",
+                    help="run solves on the in-process CUDA service")
     ap.add_argument("--out", default="runs/latest")
     ap.add_argument("--seed", type=int, default=1)
     args = ap.parse_args()
@@ -534,6 +539,10 @@ def main():
     lr_decays = sorted(float(x) for x in args.lr_decay_frac.split(",") if x.strip())
     next_decay = 0
     value.push(0)
+    if args.gpu:
+        dims, w, b, ln = value.dims, *value.flat()
+        warchest.gpu_start(dims, w, b, ln)
+        print("[gpu] solve service up", flush=True)
     # Buffer capacity is the knob the data-scaling curve points at, so every
     # byte per row is a row we cannot hold. Public features are float16; counts
     # are the uint8 they already are; probabilities and targets live in [-1, 1]
@@ -616,6 +625,10 @@ def main():
         if phase == "greedy":
             d = warchest.gen_data(args.warm_games, args.seed * 1_000_003 + epoch, "greedy",
                                   temp=args.temp, eval_mix=args.eval_mix, **kw)
+        elif args.gpu:
+            d = warchest.gpu_gen_data(args.rebel_games, args.seed * 1_000_003 + epoch, "rebel",
+                                      depth=args.depth, iters=args.iters, explore=args.explore,
+                                      mc_mix=args.mc_mix, cfr=args.cfr, warm=args.warm, **kw)
         else:
             d = warchest.gen_data(args.rebel_games, args.seed * 1_000_003 + epoch, "rebel",
                                   depth=args.depth, iters=args.iters, explore=args.explore,
@@ -661,6 +674,8 @@ def main():
                          recent_frac=args.recent_frac)
         train_s = time.time() - tt
         value.push(0)
+        if args.gpu:
+            warchest.gpu_set_weights(value.dims, *value.flat())
         with torch.no_grad():
             probe_std = float(value(*probe[:6], probe[7]).std()) \
                 if probe is not None else float("nan")

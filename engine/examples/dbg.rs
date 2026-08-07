@@ -31,7 +31,7 @@ fn main() {
     let roots = collect_roots(4, 0xC0FFEE, &nets, &gc, 6);
     let (s, bel) = &roots[which];
     let ctx = warchest::rebel::Ctx::new(s);
-    let mut sv = Solver::new(s, &ctx, &nets[0],
+    let mut sv = Solver::new(s, ctx, &nets[0],
         Cfg { depth: 2, iters: 8, snapshots: true, ..Default::default() }, bel.clone());
     dump("reach0", dir, &sv.reach);
     dump("cur0", dir, &sv.cur);
@@ -58,7 +58,7 @@ fn main() {
     // RM (phase 5a).
     // (step does RM + propagate + AVG; replicate via step and dump)
     drop(sv);
-    let mut sv2 = Solver::new(s, &ctx, &nets[0],
+    let mut sv2 = Solver::new(s, ctx, &nets[0],
         Cfg { depth: 2, iters: 8, snapshots: true, ..Default::default() }, bel.clone());
     sv2.step(0);
     dump("reach3", dir, &sv2.reach);

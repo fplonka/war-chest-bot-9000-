@@ -30,7 +30,7 @@ fn real_solver_round_trips() {
     let mut checked = 0;
     for (s, bel) in roots {
         let ctx = warchest::rebel::Ctx::new(&s);
-        let sv = Solver::new(&s, &ctx, &nets[0], cfg(), bel);
+        let sv = Solver::new(&s, ctx, &nets[0], cfg(), bel);
         if sv.capped() {
             continue;
         }
@@ -64,7 +64,7 @@ fn tables_are_consistent() {
     let roots = collect_roots(12, 0xABCD, &nets, &gc, 6);
     for (s, bel) in roots {
         let ctx = warchest::rebel::Ctx::new(&s);
-        let sv = Solver::new(&s, &ctx, &nets[0], cfg(), bel);
+        let sv = Solver::new(&s, ctx, &nets[0], cfg(), bel);
         if sv.capped() {
             continue;
         }
@@ -131,7 +131,7 @@ fn starter_draft_round_trips() {
         let roots = collect_roots(3, seed, &nets, &gc, 2);
         for (s, bel) in roots {
             let ctx = warchest::rebel::Ctx::new(&s);
-        let sv = Solver::new(&s, &ctx, &nets[0], cfg(), bel);
+        let sv = Solver::new(&s, ctx, &nets[0], cfg(), bel);
             if sv.capped() {
                 continue;
             }

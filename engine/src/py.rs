@@ -497,6 +497,124 @@ use std::sync::{OnceLock, RwLock};
 /// whatever checkpoints a caller wants to play off against each other, and the
 /// pool grows to fit. The Elo ladder loads one snapshot per slot and plays a
 /// round robin, which is the only reason more than one slot exists.
+/// The in-process GPU solve service (work package B). `gpu_start` spawns
+/// it; `gpu_gen_data` runs generation through it; `gpu_set_weights` forwards
+/// the trainer's publications to it. Without the `gpu` feature every call
+/// fails loudly — a misconfigured box must not silently run on the CPU.
+#[cfg(feature = "gpu")]
+static GPU_CLIENT: OnceLock<std::sync::Mutex<Option<crate::gpu::GpuClient>>> = OnceLock::new();
+
+#[cfg(feature = "gpu")]
+pub(crate) fn gpu_client() -> &'static std::sync::Mutex<Option<crate::gpu::GpuClient>> {
+    GPU_CLIENT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(feature = "gpu")]
+#[pyfunction]
+fn gpu_start(
+    py: Python<'_>,
+    dims: Vec<usize>,
+    w: PyReadonlyArray1<f32>,
+    b: PyReadonlyArray1<f32>,
+    ln: PyReadonlyArray1<f32>,
+) -> PyResult<()> {
+    let (w, b, ln) = (w.as_slice()?.to_vec(), b.as_slice()?.to_vec(), ln.as_slice()?.to_vec());
+    py.allow_threads(move || {
+        let client = crate::gpu::service::spawn(dims, w, b, ln)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        *gpu_client().lock().unwrap() = Some(client);
+        Ok(())
+    })
+}
+
+#[cfg(feature = "gpu")]
+#[pyfunction]
+fn gpu_set_weights(
+    _py: Python<'_>,
+    dims: Vec<usize>,
+    w: PyReadonlyArray1<f32>,
+    b: PyReadonlyArray1<f32>,
+    ln: PyReadonlyArray1<f32>,
+) -> PyResult<()> {
+    let c = gpu_client().lock().unwrap().clone();
+    match c {
+        Some(c) => {
+            c.set_weights(dims, w.as_slice()?.to_vec(), b.as_slice()?.to_vec(),
+                          ln.as_slice()?.to_vec())
+        }
+        None => {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "gpu service not started (gpu_start was not called)"))
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "gpu")]
+#[pyfunction]
+fn gpu_stop(_py: Python<'_>) -> PyResult<()> {
+    *gpu_client().lock().unwrap() = None;
+    Ok(())
+}
+
+/// The GPU generation call: like `gen_data` but the Rebel solves run on the
+/// GPU service. Panics at startup (here: returns an error) if the service is
+/// missing, so a misconfigured box fails loudly instead of running slow.
+#[cfg(feature = "gpu")]
+#[pyfunction]
+fn gpu_gen_data(
+    py: Python<'_>,
+    games: usize,
+    seed: u64,
+    mode: &str,
+    depth: usize,
+    iters: usize,
+    explore: f32,
+    temp: f32,
+    random_draft: bool,
+    eval_mix: f32,
+    mc_mix: f32,
+    cfr: &str,
+    warm: f32,
+) -> PyResult<PyObject> {
+    let cfg = Cfg {
+        depth,
+        iters,
+        snapshots: true,
+        cfr: cfr_of(cfr)?,
+        warm,
+        node_cap: 200_000,
+    };
+    let (agent, collect) = match mode {
+        "greedy" => (Agent::Greedy { temp }, Collect::Mc),
+        "rebel" => (Agent::Rebel { cfg, slot: 0 }, Collect::Rebel),
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown mode '{}'",
+                other
+            )))
+        }
+    };
+    let gc = GameCfg {
+        agents: [agent, agent],
+        collect,
+        explore,
+        random_draft,
+        eval_mix,
+        mc_mix,
+    };
+    let d = py.allow_threads(|| {
+        let n = nets().read().unwrap();
+        let c = gpu_client().lock().unwrap().clone();
+        let c = c.ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "gpu service not started (gpu_start was not called)")
+        })?;
+        Ok::<_, pyo3::PyErr>(crate::selfplay::run_games_gpu(games, seed, &n, &gc, &c))
+    })?;
+    data_to_dict(py, d)
+}
+
 pub(crate) fn nets() -> &'static RwLock<Vec<Nets>> {
     static NETS: OnceLock<RwLock<Vec<Nets>>> = OnceLock::new();
     NETS.get_or_init(|| RwLock::new(vec![Nets::default()]))
@@ -985,6 +1103,13 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(set_cap_value, m)?)?;
     m.add_function(wrap_pyfunction!(save_roots, m)?)?;
     m.add_function(wrap_pyfunction!(gen_data, m)?)?;
+    #[cfg(feature = "gpu")]
+    {
+        m.add_function(wrap_pyfunction!(gpu_start, m)?)?;
+        m.add_function(wrap_pyfunction!(gpu_set_weights, m)?)?;
+        m.add_function(wrap_pyfunction!(gpu_stop, m)?)?;
+        m.add_function(wrap_pyfunction!(gpu_gen_data, m)?)?;
+    }
     m.add_function(wrap_pyfunction!(eval_match, m)?)?;
     m.add_function(wrap_pyfunction!(infer, m)?)?;
     Ok(())
