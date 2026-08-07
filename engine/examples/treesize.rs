@@ -16,7 +16,6 @@ use std::time::Instant;
 use warchest::rebel::*;
 use warchest::roots;
 use warchest::search::{Cfg, Nets, Solver};
-use warchest::state::State;
 
 /// The flat upload contract of docs/TREE.md, as bytes per tree, sized from
 /// the arrays a solver already builds. Rough but honest: the point is
@@ -53,6 +52,9 @@ fn main() {
         .get(2)
         .map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect())
         .unwrap_or_else(|| vec![2, 3, 4]);
+    // Optional root limit: depth 4 on random-play roots is heavy, so a
+    // smaller sample is a reasonable preliminary. 0 = all.
+    let max_roots: usize = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let f = std::fs::File::open(&path).expect("roots file");
     let mut r = std::io::BufReader::new(f);
@@ -62,16 +64,29 @@ fn main() {
 
     let nets = Nets::default(); // all-zero: identical games, full matmul work
     let iters = 64usize;
+    // The tail of the tree-size distribution is fat — a handful of roots
+    // explode (random-play beliefs stay broad). The tool caps the build so
+    // the table is computable; the cap-hit rate is reported beside the
+    // percentiles, and the trained-run roots (plan section 6) are tamer.
+    let node_cap: usize = std::env::var("TREESIZE_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2_000_000);
     for depth in depths {
         let cfg = Cfg { depth, iters, snapshots: true, ..Default::default() };
         let (mut ns, mut ls, mut cs, mut fs, mut bs, mut times) = (
             Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
         );
-        for (s, bel) in &roots {
+        let mut capped = 0usize;
+        'roots: for (s, bel) in roots.iter().take(if max_roots == 0 { roots.len() } else { max_roots }) {
             let ctx = Ctx::new(s);
             let t0 = Instant::now();
             let sv = Solver::new(s, &ctx, &nets, cfg, bel.clone());
             times.push(t0.elapsed().as_micros() as usize);
+            if sv.nodes.len() > node_cap {
+                capped += 1;
+                continue 'roots;
+            }
             let (mut nodes, mut leaves, mut cells, mut cfgs) = (0, 0, 0, 0);
             for n in &sv.nodes {
                 nodes += 1;
@@ -87,6 +102,10 @@ fn main() {
             cs.push(cells);
             fs.push(cfgs);
             bs.push(uploaded_bytes(nodes, leaves, cells, cfgs, sv.snapshot_count()));
+        }
+        let n_done = roots.len().min(if max_roots == 0 { roots.len() } else { max_roots });
+        if capped > 0 {
+            println!("depth {depth}  {capped}/{n_done} roots exceeded the {node_cap}-node cap");
         }
         for (name, v) in [
             ("nodes", &ns),
