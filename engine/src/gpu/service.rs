@@ -44,9 +44,13 @@ const MAX_ROWS: usize = 256 * 1024;
 /// Threads per block for the flat phases.
 const BLOCK: u32 = 256;
 
-/// How many launches one staging round may hold. A tick uses about twenty;
-/// an admission's build about a dozen.
-const MAX_LAUNCHES: usize = 64;
+/// How many launches one staging round may hold.
+///
+/// A sweep is one launch per level and a tick runs several sweeps, so this
+/// scales with tree depth: the deepest trees measured have thirteen levels,
+/// which puts a busy tick near a hundred launches. Sized well past that,
+/// because overflowing it is a crash rather than a slowdown.
+const MAX_LAUNCHES: usize = 512;
 
 /// Per-phase timing, when `WARCHEST_GPU_TIMING` is set. Off by default: it
 /// puts an event around every launch and synchronises once per tick, which is
@@ -731,7 +735,12 @@ impl Service {
         unit: usize,
         phase: Phase,
     ) -> Launch {
-        assert!(self.h_data.len() <= self.g_data.len(), "group staging overflow");
+        assert!(
+            self.h_data.len() <= self.g_data.len() && self.h_meta.len() < MAX_LAUNCHES,
+            "group staging overflow: {} ints, {} launches",
+            self.h_data.len(),
+            self.h_meta.len(),
+        );
         let base = self.g_data_ptr;
         self.h_meta.push(GroupDev {
             // SAFETY: both offsets are inside `g_data`, asserted above.
