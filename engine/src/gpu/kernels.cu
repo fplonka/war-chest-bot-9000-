@@ -19,6 +19,8 @@
 #define EPS 1e-6f
 #define LN_EPS 1e-5f
 #define SMOOTH 1e-30f
+// NVRTC does not pull in math.h's INFINITY; spell the bit pattern out.
+#define INFINITY_F (__int_as_float(0x7f800000))
 
 #define N_HEXES 37
 #define NSLOT 5
@@ -297,7 +299,7 @@ __global__ void backprop_kernel(const SolveDesc* descs, const int* slots,
                 if (mode == 0) {
                     for (int j = 0; j < nc * na; j++) d->inst[so + j] = 0.0f;
                 }
-                float neg_inf = -INFINITY;
+                float neg_inf = -INFINITY_F;
                 for (int c = 0; c < nc; c++) {
                     d->vals[vbase + c] = mode == 2 ? neg_inf : 0.0f;
                 }
