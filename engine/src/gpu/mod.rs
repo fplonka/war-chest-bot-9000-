@@ -11,6 +11,8 @@
 pub mod client;
 
 #[cfg(feature = "gpu")]
+pub mod layout;
+#[cfg(feature = "gpu")]
 pub mod service;
 #[cfg(feature = "gpu")]
 #[cfg(test)]

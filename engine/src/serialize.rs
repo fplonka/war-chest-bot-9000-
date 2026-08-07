@@ -722,17 +722,13 @@ impl Job {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// CPU -> bytes -> CPU must be the identity, byte for byte.
-    #[test]
-    fn round_trip() {
-        // Build a tiny solver directly: the serializer only reads the tables,
-        // so a hand-built Solver is overkill; instead we build one through the
-        // real path (the tests below the engine have solvers; here we just
-        // check the byte layer on a synthetic job).
-        let job = Job {
+impl Job {
+    /// The smallest well-formed job: a single terminal leaf with one config
+    /// per player. Real trees come from `Job::from_solver`; this exists for
+    /// the layers that only need a shape to walk — the byte round trip and
+    /// the device layout's alignment check.
+    pub fn stub() -> Job {
+        Job {
             meta: JobMeta {
                 depth: 2,
                 iters: 4,
@@ -788,7 +784,18 @@ mod tests {
             },
             root: [vec![1.0], vec![1.0]],
             carried: vec![],
-        };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CPU -> bytes -> CPU must be the identity, byte for byte.
+    #[test]
+    fn round_trip() {
+        let job = Job::stub();
         let bytes = job.to_bytes();
         let back = Job::from_bytes(&bytes).expect("parse");
         assert_eq!(back.to_bytes(), bytes, "byte-identical round trip");

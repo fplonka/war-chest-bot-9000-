@@ -783,12 +783,16 @@ impl Service {
         put_u8(&mut tbl, &t.ids, &mut off.ids);
         let mut tables = unsafe { self.stream.alloc(tbl.len()) }.map_err(|e| format!("{e:?}"))?;
         self.stream.memcpy_htod(&tbl, &mut tables).map_err(|e| format!("{e:?}"))?;
+        #[cfg(test)]
+        eprintln!("admit: tables uploaded ({} bytes)", tbl.len());
         // roots
         let mut rootv: Vec<f32> = Vec::with_capacity(nc0 + nc1 + nroots * (nc0 + nc1));
         rootv.extend_from_slice(&job.root[0]);
         rootv.extend_from_slice(&job.root[1]);
         let mut roots = unsafe { self.stream.alloc(rootv.len()) }.map_err(|e| format!("{e:?}"))?;
         self.stream.memcpy_htod(&rootv, &mut roots).map_err(|e| format!("{e:?}"))?;
+        #[cfg(test)]
+        eprintln!("admit: roots uploaded");
         // ---- the solve descriptor ----
         let ab = device_ptr_mut_of(&self.stream, &mut arenas);
         let tb = device_ptr_of(&self.stream, &tables) as *mut u8;
@@ -871,9 +875,17 @@ impl Service {
             let _ = self.stream.memcpy_htod(&t.reach, &mut dst);
         }
         // ---- build GEMMs ----
+        #[cfg(test)]
+        eprintln!("admit: desc built, starting build GEMMs");
         self.build_cards(&mut arenas, &tables, off, rows, de)?;
+        #[cfg(test)]
+        eprintln!("admit: cards done");
         self.build_trunk(&mut arenas, &tables, off, rows, hd, de)?;
+        #[cfg(test)]
+        eprintln!("admit: trunk done");
         self.build_embed(&mut arenas, &tables, off, t.ncfg, dg, rk, de)?;
+        #[cfg(test)]
+        eprintln!("admit: embed done");
         if meta.warm > 0.0 {
             self.build_actions(&mut arenas, &tables, off, n_psi, rk, de)?;
         }
@@ -1306,6 +1318,11 @@ impl Service {
         b2.arg(&__a8);
         let __a9 = de as i32;
         b2.arg(&__a9);
+        #[cfg(test)]
+        {
+            let px = device_ptr_of(&self.stream, &pe_m);
+            eprintln!("assemble ptrs: pe_m={px:?} rows={rows} pf={} de={de}", self.weights.dims[0]);
+        }
         let _ = unsafe { b2.launch(cfg2) };
         #[cfg(test)]
         self.chk("assemble");
@@ -1570,7 +1587,10 @@ impl Service {
     #[cfg(test)]
     pub(crate) fn probe_phase(&mut self, job: Job, phase: usize) -> Result<super::tests::ProbeOut, String> {
         let (tx, _rx) = mpsc::channel();
+        eprintln!("probe: admitting");
         self.admit(job, tx)?;
+        eprintln!("probe: admitted");
+        self.chk("after admit");
         let s = self.live.iter().position(|x| x.is_some()).expect("admitted");
         if phase >= 1 {
             let sv = self.live[s].as_mut().unwrap();
@@ -1591,21 +1611,27 @@ impl Service {
             self.upload_descs();
             self.launch_belief(&[s]);
             self.launch_head(&[s]);
+            self.chk("phase 1");
         }
         if phase >= 2 {
             self.launch_readout(&[s]);
+            self.chk("phase 2");
         }
         if phase >= 3 {
             self.launch_backprop(&[s]);
+            self.chk("phase 3");
         }
         if phase >= 4 {
             self.launch_rm(&[s]);
+            self.chk("phase 4");
         }
         if phase >= 5 {
             self.launch_propagate(&[s]);
+            self.chk("phase 5");
         }
         if phase >= 6 {
             self.launch_avg(&[s]);
+            self.chk("phase 6");
         }
         let _ = self.stream.synchronize();
         let sv = self.live[s].as_ref().unwrap();
