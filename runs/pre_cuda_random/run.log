@@ -32,3 +32,12 @@
 [t= 145.7s] greedy ep  7 games=  96 dec= 18319 rows= 17483 cap=0.32 cfgs= 27.7 L=0.02013 P=nan old=0.01127 new=0.00546 tgt=-0.059/0.503 pstd=0.477 capv=0.040 lr=1.0e-03 gen=0.1s train=17.3s
 [t= 167.4s] greedy ep  8 games=  96 dec= 18824 rows= 18083 cap=0.34 cfgs= 26.1 L=0.01912 P=nan old=0.01222 new=0.00572 tgt=-0.018/0.491 pstd=0.475 capv=0.040 lr=1.0e-03 gen=0.1s train=20.9s
 [t= 186.5s] greedy ep  9 games=  96 dec= 18100 rows= 17381 cap=0.26 cfgs= 26.3 L=0.01838 P=nan old=0.01126 new=0.00633 tgt=-0.043/0.522 pstd=0.472 capv=0.040 lr=1.0e-03 gen=0.1s train=18.5s
+[t= 203.7s] greedy ep 10 games=  96 dec= 17757 rows= 17029 cap=0.23 cfgs= 28.7 L=0.01894 P=nan old=0.01118 new=0.00796 tgt=-0.035/0.525 pstd=0.481 capv=0.040 lr=1.0e-03 gen=0.1s train=16.6s
+[t= 220.7s] greedy ep 11 games=  96 dec= 18043 rows= 17250 cap=0.28 cfgs= 27.7 L=0.01933 P=nan old=0.01059 new=0.00679 tgt=-0.047/0.493 pstd=0.485 capv=0.040 lr=1.0e-03 gen=0.1s train=16.4s
+[t= 237.5s] greedy ep 12 games=  96 dec= 17420 rows= 16700 cap=0.25 cfgs= 27.9 L=0.01974 P=nan old=0.01250 new=0.00735 tgt=-0.028/0.502 pstd=0.484 capv=0.040 lr=1.0e-03 gen=0.1s train=16.2s
+[t= 255.0s] greedy ep 13 games=  96 dec= 18339 rows= 17564 cap=0.29 cfgs= 27.2 L=0.01776 P=nan old=0.01245 new=0.00761 tgt=-0.034/0.497 pstd=0.471 capv=0.040 lr=1.0e-03 gen=0.1s train=16.8s
+[t= 271.8s] greedy ep 14 games=  96 dec= 17985 rows= 17266 cap=0.25 cfgs= 27.8 L=0.01770 P=nan old=0.01214 new=0.00821 tgt=-0.037/0.515 pstd=0.479 capv=0.040 lr=1.0e-03 gen=0.1s train=16.2s
+[t= 288.8s] greedy ep 15 games=  96 dec= 18309 rows= 17520 cap=0.30 cfgs= 26.8 L=0.01709 P=nan old=0.01285 new=0.00774 tgt=-0.021/0.493 pstd=0.478 capv=0.040 lr=1.0e-03 gen=0.1s train=16.4s
+[t= 306.5s] greedy ep 16 games=  96 dec= 19097 rows= 18291 cap=0.33 cfgs= 27.3 L=0.01729 P=nan old=0.01319 new=0.00824 tgt=+0.006/0.479 pstd=0.494 capv=0.040 lr=1.0e-03 gen=0.1s train=17.1s
+[t= 306.5s] --- snapshot snap_00.pt (init) ---
+[t= 306.5s] --- switching to ReBeL ---

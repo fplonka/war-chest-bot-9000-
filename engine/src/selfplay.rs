@@ -590,6 +590,9 @@ pub fn play_game(
                     walk.take();
                     carried.clear();
                 }
+                // A pathological root falls back to a uniform policy; the
+                // policy is produced outside the walk bookkeeping below.
+                let mut fallback: Option<NodePolicy> = None;
                 if walk.is_none() {
                     if let Some(r) = roots.as_deref_mut() {
                         r.push((s, bel.clone()));
@@ -606,6 +609,19 @@ pub fn play_game(
                         ..cfg
                     };
                     let mut sv = Solver::new(&s, &ctx, &nets[slot], scfg, bel.clone());
+                    if sv.capped() {
+                        // The tree-size tail is fat (broad random-draft
+                        // beliefs at round boundaries); an unbounded build
+                        // hangs a worker for minutes on one decision. Fall
+                        // back to a uniform policy for this decision and drop
+                        // the walk (and any carried beliefs); the next Rebel
+                        // decision starts a fresh solve. No rows are collected
+                        // here, so the data keeps the MainPlay-only invariant
+                        // without a search that never ends.
+                        walk.take();
+                        carried.clear();
+                        fallback = Some(random_policy(&s, &ctx, player, &cfgs));
+                    } else {
                     sv.warm_start(scfg.warm);
                     sv.multistep(cfg.iters);
                     if gc.collect == Collect::Rebel {
@@ -656,7 +672,11 @@ pub fn play_game(
                         node: 0,
                         drawn: 0,
                     });
+                    }
                 }
+                if let Some(np) = fallback {
+                    np
+                } else {
                 let w = walk.as_mut().unwrap();
                 let nid = w.node;
                 let n = &w.sv.nodes[nid];
@@ -686,6 +706,8 @@ pub fn play_game(
                     np.probs[ci * na..(ci + 1) * na].copy_from_slice(row);
                 }
                 np
+                }
+
             }
         };
 

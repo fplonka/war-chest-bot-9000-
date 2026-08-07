@@ -92,7 +92,7 @@ struct Run {
 /// restore the solve's reaches, so a reading does not disturb what follows.
 fn solve(s: &State, ctx: &Ctx, nets: &Nets, bel: &[Belief; 2], depth: usize, rule: Cfr,
          warm: f32) -> Run {
-    let cfg = Cfg { depth, iters: TMAX, snapshots: true, cfr: rule, warm };
+    let cfg = Cfg { depth, iters: TMAX, snapshots: true, cfr: rule, warm, ..Default::default() };
     let mut sv = Solver::new(s, ctx, nets, cfg, bel.clone());
     sv.warm_start(warm);
     let root = [[bel[0].p.clone(), bel[1].p.clone()]];

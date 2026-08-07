@@ -63,6 +63,13 @@ pub struct Cfg {
     /// from it. 0 starts uniform, which is the default until the measurement
     /// says otherwise.
     pub warm: f32,
+    /// Max tree nodes a solve may build. 0 = unlimited. A solve that hits the
+    /// cap is flagged `capped` and its caller falls back to a non-search
+    /// policy for that decision: the tail of the tree-size distribution
+    /// (random-draft roots with broad beliefs at round boundaries) is fat
+    /// enough that an unbounded build hangs training for minutes on one
+    /// decision.
+    pub node_cap: usize,
 }
 
 impl Default for Cfg {
@@ -73,6 +80,7 @@ impl Default for Cfg {
             snapshots: true,
             cfr: Cfr::LINEAR,
             warm: 0.0,
+            node_cap: 0,
         }
     }
 }
@@ -576,6 +584,9 @@ pub struct Solver<'a> {
     /// Traverser of the previous leaf query, i.e. whose beliefs have moved
     /// since. `None` before the first query of a solve.
     last_traverser: Option<usize>,
+    /// The build hit `Cfg::node_cap`: the tree is incomplete and the caller
+    /// must not solve or walk it.
+    capped: bool,
     /// Working memory for the chance transitions, reused across the tree.
     draw_scratch: DrawScratch,
     /// `key << IDX_BITS | cell` scratch for ordering a public child's support.
@@ -661,6 +672,7 @@ impl<'a> Solver<'a> {
             wbuf: Vec::new(),
             batch_ready: false,
             last_traverser: None,
+            capped: false,
             draw_scratch: DrawScratch::default(),
             cell_order: Vec::new(),
             dm: Default::default(),
@@ -818,6 +830,13 @@ impl<'a> Solver<'a> {
             trans: Vec::new(),
         });
         drop(_tp);
+        if self.cfg.node_cap > 0 && self.nodes.len() >= self.cfg.node_cap {
+            // Pathological root: stop expanding. The node stays a stub (no
+            // actions, no children); the caller checks `capped` and falls
+            // back to a non-search policy, so nothing here is ever walked.
+            self.capped = true;
+            return id;
+        }
         if leaf {
             self.push_leaf(id, &s, &cfgs);
             return id;
@@ -1980,6 +1999,11 @@ impl<'a> Solver<'a> {
                 }
             }
         }
+    }
+
+    /// True when the build hit the node cap and the solve must not be used.
+    pub fn capped(&self) -> bool {
+        self.capped
     }
 
     /// How many per-iterate snapshots the solve kept. Part of the tree-size

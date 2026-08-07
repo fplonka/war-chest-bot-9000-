@@ -632,6 +632,10 @@ fn gen_data(
         snapshots: true,
         cfr: cfr_of(cfr)?,
         warm,
+        // The tree-size tail is fat (broad random-draft beliefs at round
+        // boundaries); an unbounded build hangs a worker for minutes on one
+        // decision. Capped solves fall back to a uniform policy instead.
+        node_cap: 200_000,
     };
     let (agent, collect) = match mode {
         "greedy" => (Agent::Greedy { temp }, Collect::Mc),
@@ -688,6 +692,7 @@ fn eval_match(
         snapshots: false,
         cfr: cfr_of(cfr)?,
         warm,
+        node_cap: 200_000,
     };
     let cfg_b = Cfg {
         iters: iters_b.unwrap_or(iters),

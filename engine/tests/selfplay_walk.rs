@@ -203,4 +203,34 @@ fn walk_across_warrior_priest_draws() {
         total_dec += d.decisions;
     }
     assert!(total_dec > 0);
+}/// A tiny node cap: some random-draft roots would build enormous trees, and
+/// the solve must fall back to a uniform policy for that decision instead of
+/// hanging the worker. The game continues, no rows come from capped solves,
+/// and nothing panics.
+#[test]
+fn capped_solves_fall_back_and_games_finish() {
+    let nets = [warchest::search::Nets::default()];
+    let mut total_dec = 0usize;
+    for seed in 0..10u64 {
+        let mut rng = Rng::new(seed * 7919 + 5);
+        let mut d = Data::default();
+        let scfg = Cfg { node_cap: 40, ..cfg() };
+        let gc = GameCfg {
+            agents: [
+                Agent::Rebel { cfg: scfg, slot: 0 },
+                Agent::Rebel { cfg: scfg, slot: 0 },
+            ],
+            collect: Collect::Rebel,
+            explore: 0.25,
+            random_draft: true,
+            eval_mix: 0.0,
+            mc_mix: 0.0,
+        };
+        let z = play_game(&mut rng, &nets, &gc, &mut d, None);
+        assert!(z.is_finite());
+        total_dec += d.decisions;
+    }
+    assert!(total_dec > 0);
 }
+
+

@@ -253,6 +253,18 @@ impl LiveGame {
         let mut bel = self.bel.clone();
         let guard = nets().read().unwrap();
         let mut sv = Solver::new(&s, &ctx, &guard[self.slot], scfg, bel.clone());
+        if sv.capped() {
+            // Pathological root: play uniformly instead of solving. The
+            // belief update below uses the true state's actions, which stays
+            // sound for the human opponent.
+            let acts = self.s.legal_actions();
+            let chosen = self.rng.below(acts.len());
+            let act = acts[chosen];
+            let label = format!("{}", act);
+            self.s.apply_inplace(act);
+            self.log.push(format!("Agent: {}", label));
+            return Ok(());
+        }
         sv.multistep(self.iters);
         let nid = 0usize;
         let na = sv.nodes[nid].na();
