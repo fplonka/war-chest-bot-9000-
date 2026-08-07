@@ -15,6 +15,8 @@ pub mod rng;
 pub mod roots;
 pub mod rules;
 pub mod search;
+pub mod gpu;
+pub mod serialize;
 pub mod selfplay;
 pub mod state;
 pub mod units;

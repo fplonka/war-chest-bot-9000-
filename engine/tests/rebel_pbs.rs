@@ -636,7 +636,7 @@ fn a_subgame_of_only_terminal_leaves_solves() {
         let ctx = Ctx::new(&s);
         let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
         let cfg = Cfg { depth: 2, iters: 8, snapshots: true, ..Default::default() };
-        let mut sv = Solver::new(&s, &ctx, &nets, cfg, bel.clone());
+        let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
         assert!(sv.nodes.iter().all(|n| !n.leaf || n.s.is_terminal()),
                 "expected every leaf terminal");
         sv.multistep(cfg.iters);
@@ -691,7 +691,7 @@ fn a_pre_describer_checkpoint_still_solves() {
     let ctx = Ctx::new(&s);
     let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
     let cfg = Cfg { depth: 2, iters: 32, snapshots: true, ..Default::default() };
-    let mut sv = Solver::new(&s, &ctx, &nets, cfg, bel.clone());
+    let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
     sv.multistep(cfg.iters);
     let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
     assert!(vals[0][0].iter().all(|v| v.is_finite()), "v1 solve produced non-finite values");
@@ -735,7 +735,7 @@ fn a_warm_start_does_not_move_the_fixed_point() {
         let base = Cfg { depth: 2, iters: 400, snapshots: true, ..Default::default() };
         let mut v = Vec::new();
         for warm in [0.0f32, 15.0] {
-            let mut sv = Solver::new(&s, &ctx, &nets, Cfg { warm, ..base }, bel.clone());
+            let mut sv = Solver::new(&s, ctx, &nets, Cfg { warm, ..base }, bel.clone());
             sv.warm_start(warm);
             sv.multistep(base.iters);
             let root = [[bel[0].p.clone(), bel[1].p.clone()]];
@@ -931,7 +931,7 @@ fn a_solve_reads_only_the_beliefs() {
                 let c = if pick == 0 { cs[0] } else { cs[cs.len() - 1] };
                 set_config(&mut w, p as u8, &ctx, &c);
             }
-            let mut sv = Solver::new(&w, &ctx, &nets, cfg, bel.clone());
+            let mut sv = Solver::new(&w, ctx, &nets, cfg, bel.clone());
             sv.multistep(cfg.iters);
             let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
             let strat: Vec<f32> = (0..bel[w.to_act() as usize].cfg.len())
@@ -966,7 +966,7 @@ fn the_value_function_separates_configs_sharing_a_hand() {
             continue;
         };
         let me = s.to_act() as usize;
-        let mut sv = Solver::new(&s, &ctx, &nets, cfg, bel.clone());
+        let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
         sv.multistep(cfg.iters);
         let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
         let v = &vals[0][me];
@@ -1106,7 +1106,7 @@ fn zero_weight_config_survives_the_walk_update() {
         bel[me].p[0] = 1e-46;
         bel[me].normalize();
         let mut sv = Solver::new(
-            &s, &ctx, &nets[0],
+            &s, ctx, &nets[0],
             Cfg { depth: 2, iters: 8, snapshots: false, ..Default::default() },
             bel.clone(),
         );

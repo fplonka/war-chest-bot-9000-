@@ -35,7 +35,9 @@ use crate::actions::Action;
 use crate::board::{board, NONE, N_HEXES};
 use crate::rebel::*;
 use crate::rng::Rng;
+use crate::gpu::GpuClient;
 use crate::search::{node_actions, Cfg, Nets, Solver};
+use crate::serialize::Job;
 use crate::state::{Cont, State, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP, BLACK, WHITE};
 use rayon::prelude::*;
 
@@ -407,6 +409,34 @@ impl Data {
         self.pact.push(player);
     }
 
+    /// `push_policy` with an explicit reference strategy, for the GPU path
+    /// where the solve ran on the device: `strat` is the downloaded flat
+    /// reference strategy (`soff`-aligned), so the root's rows are
+    /// `strat[soff[0] + c * na..]` with `soff[0] == 0`.
+    fn push_policy_strat(&mut self, sv: &Solver, ctx: &Ctx, row: usize, player: u8,
+                         strat: &[f32]) {
+        let n = &sv.nodes[0];
+        let (na, nc) = (n.na(), n.nc(player as usize));
+        if na == 0 || nc == 0 {
+            return;
+        }
+        if self.paoff.is_empty() {
+            self.paoff.push(0);
+        }
+        let base = self.pa.len();
+        self.pa.resize(base + na * AFEAT, 0.0);
+        for a in 0..na {
+            write_action_feats(&n.acts[a], ctx, player as usize, n.aslot[a], n.fdown[a],
+                               &mut self.pa[base + a * AFEAT..base + (a + 1) * AFEAT]);
+        }
+        self.paoff.push((self.pa.len() / AFEAT) as u32);
+        for c in 0..nc {
+            self.pp.extend_from_slice(&strat[c * na..(c + 1) * na]);
+        }
+        self.prow.push(row as u32);
+        self.pact.push(player);
+    }
+
     /// The config range of row `r`, player `p`, in the arena.
     #[inline]
     pub fn row_span(&self, r: usize, p: usize) -> std::ops::Range<usize> {
@@ -440,14 +470,40 @@ pub struct GameCfg {
     pub mc_mix: f32,
 }
 
+
+// ----------------------------------------------------------------- game loop
+
 /// A live ReBeL walk: the solver for the current subgame, the checkpoint
 /// slot it was built with, and the tree node the game is currently at.
+///
+/// On the GPU path (`strat` non-empty) the solve runs on the service: the
+/// solver object is the walk's tree holder, the strategy rows come from the
+/// downloaded reference strategy, and `gpu_id` names the resident solve for
+/// the trip-2 carried beliefs.
 struct Walk<'a> {
     sv: Solver<'a>,
     slot: usize,
     node: usize,
     /// Draws taken so far inside the current collapsed chance node.
     drawn: u8,
+    /// The downloaded reference strategy (GPU path), `soff`-aligned. Empty
+    /// on the CPU path, where `sv.average_strategy` is the source.
+    strat: Vec<f32>,
+    /// The resident solve's id (GPU path), for trip 2.
+    gpu_id: u64,
+}
+
+impl<'a> Walk<'a> {
+    /// The reference strategy row for config `c` of node `node`.
+    fn strategy(&self, node: usize, c: usize) -> &[f32] {
+        if self.strat.is_empty() {
+            self.sv.average_strategy(node, c)
+        } else {
+            let na = self.sv.nodes[node].na();
+            let so = self.sv.soff[node] as usize;
+            &self.strat[so + c * na..so + (c + 1) * na]
+        }
+    }
 }
 
 /// End a walk: take TurboReBeL's intermediate PBSs off the solver — the
@@ -456,11 +512,505 @@ struct Walk<'a> {
 /// belief as the t = T member; the next subgame's Phase 2 values the whole
 /// set. Rows are *not* taken here: they were pushed at the solve site, which
 /// is where the reference strategy lives.
-fn finish_walk<'a>(w: Walk<'a>, bel: &[Belief; 2]) -> Vec<[Vec<f32>; 2]> {
-    let Walk { mut sv, node, .. } = w;
-    let mut out = sv.carried_beliefs(node);
+///
+/// On the GPU path the beliefs come from the service (trip 2): it propagates
+/// each kept snapshot to the exit leaf and returns the normalised reaches.
+fn finish_walk<'a>(
+    w: Walk<'a>,
+    bel: &[Belief; 2],
+    gpu: Option<&GpuClient>,
+) -> Vec<[Vec<f32>; 2]> {
+    let Walk { mut sv, node, gpu_id, .. } = w;
+    let mut out = if let Some(gpu) = gpu {
+        gpu.carried_beliefs(gpu_id, node as u32)
+            .expect("gpu trip 2")
+    } else {
+        sv.carried_beliefs(node)
+    };
     out.push([bel[0].p.clone(), bel[1].p.clone()]);
     out
+}
+
+/// One game, as a resumable state machine.
+///
+/// `advance` plays until the next GPU solve is submitted (returning
+/// `Step::Submitted`) or the game ends (`Step::Ended`, after which `finish`
+/// returns the result). On the CPU path (`gpu` is `None`) the solve runs
+/// inline and `advance` never returns `Submitted`. Two games per worker share
+/// a thread: while one is blocked on the GPU, the other keeps the CPU busy.
+pub struct Game<'a> {
+    rng: Rng,
+    s: State,
+    ctx: Ctx,
+    bel: [Belief; 2],
+    walk: Option<Walk<'a>>,
+    /// TurboReBeL's carried beliefs: the T+1 probability vectors at the next
+    /// subgame's root under the previous solve's per-iterate average
+    /// strategies (plus the live belief), which Phase 2 values once the next
+    /// solve is done. Empty means the first level.
+    carried: Vec<[Vec<f32>; 2]>,
+    /// One entry per round, for the auxiliary targets.
+    timeline: Timeline,
+    /// The rows this game produced; merged into the caller's `Data` by
+    /// `play_game` or the GPU worker when the game ends.
+    data: Data,
+    from_row: usize,
+    gc: &'a GameCfg,
+    /// Subgame roots for the tree-sizing work (None in production).
+    roots: Option<Vec<(State, [Belief; 2])>>,
+    /// The GPU solve this game is waiting on, and the state to resume with.
+    pending: Option<crate::gpu::SolveHandle>,
+    pending_sv: Option<Solver<'a>>,
+    pending_roots: Option<Vec<[Vec<f32>; 2]>>,
+    pending_slot: usize,
+    pending_player: u8,
+}
+
+/// What `Game::advance` returns.
+pub enum Step {
+    /// A solve was submitted to the GPU; call `take_pending` and wait.
+    Submitted,
+    /// The game ended; call `finish` for the result.
+    Ended,
+}
+
+impl<'a> Game<'a> {
+    pub fn new(mut rng: Rng, gc: &'a GameCfg) -> Game<'a> {
+        let s = make_game(&mut rng, gc.random_draft);
+        let ctx = Ctx::new(&s);
+        Game {
+            rng,
+            s,
+            ctx,
+            bel: [
+                Belief::point(Config::default()),
+                Belief::point(Config::default()),
+            ],
+            walk: None,
+            carried: Vec::new(),
+            timeline: Vec::new(),
+            data: Data::default(),
+            from_row: 0,
+            gc,
+            roots: None,
+            pending: None,
+            pending_sv: None,
+            pending_roots: None,
+            pending_slot: 0,
+            pending_player: 0,
+        }
+    }
+
+    pub fn set_roots(&mut self, r: Vec<(State, [Belief; 2])>) {
+        self.roots = Some(r);
+    }
+
+    pub fn take_roots(&mut self) -> Vec<(State, [Belief; 2])> {
+        self.roots.take().unwrap_or_default()
+    }
+
+    /// Take the pending solve handle (after `Step::Submitted`).
+    pub fn take_pending(&mut self) -> Option<crate::gpu::SolveHandle> {
+        self.pending.take()
+    }
+
+    /// The rows produced so far (the worker takes them when a game ends).
+    pub fn take_data(&mut self) -> Data {
+        std::mem::take(&mut self.data)
+    }
+
+    /// True when the game has ended (used by the worker's idle check).
+    pub fn is_terminal(&self) -> bool {
+        self.s.is_terminal()
+    }
+
+    /// Play until a GPU solve is submitted or the game ends.
+    pub fn advance(&mut self, gpu: Option<&GpuClient>, nets: &'a [Nets]) -> Step {
+        let gc = self.gc;
+        let Game {
+            rng,
+            s,
+            ctx,
+            bel,
+            walk,
+            carried,
+            timeline,
+            data,
+            roots,
+            ..
+        } = self;
+        let mut roots_out: Option<&mut Vec<(State, [Belief; 2])>> = roots.as_mut();
+        while !s.is_terminal() {
+            while timeline.len() <= s.round as usize {
+                timeline.push(([s.markers_on_board(0), s.markers_on_board(1)], s.initiative));
+            }
+            let last = timeline.len() - 1;
+            timeline[last] = ([s.markers_on_board(0), s.markers_on_board(1)], s.initiative);
+            let player = s.to_act();
+            if s.is_chance() {
+                let res = reserve(s, player, ctx);
+                let fu = faceup_counts(s, player, ctx);
+                let wp = matches!(s.pending(), Cont::WarriorPriestDraw { .. });
+                bel[player as usize] =
+                    belief_after_draw(&bel[player as usize], &res, &fu, wp);
+                resolve_chance(s, player, rng);
+                // The walk spans draws now: a draw is an internal node of the
+                // subgame with one public child, so advance through it. The
+                // post-draw belief must equal the tree's post-draw config
+                // support (same list, same order) or every strategy row read
+                // from here on is wrong.
+                let mut walk_ended = false;
+                if let Some(w) = walk.as_mut() {
+                    let nid = w.node;
+                    let n = &w.sv.nodes[nid];
+                    assert!(n.chance && n.player == player, "walk not at the draw");
+                    // One tree node stands for a whole run of that player's
+                    // draws, so it is exhausted only once the game has taken
+                    // all of them.
+                    w.drawn += 1;
+                    if w.drawn == n.draw_steps {
+                        w.drawn = 0;
+                        let child = n.child[0];
+                        assert!(
+                            *w.sv.nodes[child].cfgs[player as usize] == bel[player as usize].cfg[..],
+                            "walk desync: post-draw support does not match the game belief"
+                        );
+                        w.node = child;
+                        if w.sv.nodes[child].leaf {
+                            walk_ended = true;
+                        }
+                    }
+                }
+                if walk_ended {
+                    if gc.collect == Collect::Rebel {
+                        *carried = finish_walk(walk.take().unwrap(), bel, gpu);
+                    } else {
+                        // Evaluation: the carried beliefs exist only to be
+                        // valued by the next solve's Phase 2, which collection
+                        // runs and evaluation does not — drop them with the
+                        // walk.
+                        walk.take();
+                        carried.clear();
+                    }
+                }
+                continue;
+            }
+
+            let cfgs = bel[player as usize].cfg.clone();
+            let truth = true_config(s, player, ctx);
+            let true_ci = bel[player as usize]
+                .index_of(&truth)
+                // Losing the real world would silently corrupt every target
+                // taken from here on, so fail loudly instead.
+                .expect("belief filter dropped the true config");
+            data.decisions += 1;
+            data.configs += cfgs.len();
+
+            let np = match gc.agents[player as usize] {
+                Agent::Greedy { temp } => {
+                    // A non-ReBeL decision is not in the walk's tree: end any
+                    // pending walk and drop the carried beliefs (they belong
+                    // to the state the walk ended at).
+                    walk.take();
+                    carried.clear();
+                    greedy_policy(s, ctx, player, &cfgs, temp)
+                }
+                Agent::Random => {
+                    walk.take();
+                    carried.clear();
+                    random_policy(s, ctx, player, &cfgs)
+                }
+                Agent::Rebel { cfg, slot } => {
+                    // A walk belongs to the checkpoint that built it. Playing
+                    // a decision on another slot's solver would make that
+                    // player act with the wrong network — the Elo ladder pits
+                    // one snapshot's slot against another's — so end a walk
+                    // built by a different slot before starting a new one.
+                    if walk.as_ref().is_some_and(|w| w.slot != slot) {
+                        walk.take();
+                        carried.clear();
+                    }
+                    // A pathological root falls back to a uniform policy; the
+                    // policy is produced outside the walk bookkeeping below.
+                    let mut fallback: Option<NodePolicy> = None;
+                    if walk.is_none() {
+                        if let Some(r) = roots_out.as_deref_mut() {
+                            r.push((s.clone(), bel.clone()));
+                        }
+                        // Start a new subgame at this decision: build the
+                        // tree (Phase 1's CPU half). TurboReBeL's Phase 2 then
+                        // values every carried belief — the T+1 rows of this
+                        // level — under the reference strategy (the CFR
+                        // average), and the walk acts on that same average.
+                        let scfg = Cfg {
+                            // Evaluation never reads the per-iterate
+                            // snapshots or the carried beliefs, so it must
+                            // not pay for either.
+                            snapshots: gc.collect == Collect::Rebel,
+                            ..cfg
+                        };
+                        let mut sv = Solver::new(s, *ctx, &nets[slot], scfg, bel.clone());
+                        if sv.capped() {
+                            // The tree-size tail is fat (broad random-draft
+                            // beliefs at round boundaries); an unbounded build
+                            // hangs a worker for minutes on one decision.
+                            // Fall back to a uniform policy for this decision
+                            // and drop the walk (and any carried beliefs); the
+                            // next Rebel decision starts a fresh solve. No
+                            // rows are collected here, so the data keeps the
+                            // MainPlay-only invariant without a search that
+                            // never ends.
+                            walk.take();
+                            carried.clear();
+                            fallback = Some(random_policy(s, ctx, player, &cfgs));
+                        } else if let Some(gpu) = gpu {
+                            // GPU path: submit the tree as one job. The
+                            // carried roots (or the live belief, for the
+                            // first level) travel with it; trip 1 returns
+                            // the reference strategy and the root values.
+                            let roots_v: Vec<[Vec<f32>; 2]> = if carried.is_empty() {
+                                vec![[bel[0].p.clone(), bel[1].p.clone()]]
+                            } else {
+                                std::mem::take(carried)
+                            };
+                            let job = Job::from_solver(&sv, &roots_v);
+                            let handle = gpu.submit(job).expect("gpu submit");
+                            self.pending = Some(handle);
+                            self.pending_sv = Some(sv);
+                            self.pending_roots = Some(roots_v);
+                            self.pending_slot = slot;
+                            self.pending_player = player;
+                            return Step::Submitted;
+                        } else {
+                            // CPU path: the full solve, then the walk.
+                            sv.warm_start(scfg.warm);
+                            sv.multistep(cfg.iters);
+                            if gc.collect == Collect::Rebel {
+                                // Phase 2: one fixed-policy value pass per
+                                // carried belief. The first level carries
+                                // nothing yet, so it values just the live
+                                // belief — the same single row the old loop
+                                // took per solve.
+                                let roots_v: Vec<[Vec<f32>; 2]> = if carried.is_empty() {
+                                    vec![[bel[0].p.clone(), bel[1].p.clone()]]
+                                } else {
+                                    std::mem::take(carried)
+                                };
+                                data.begin_solve();
+                                for r in &roots_v {
+                                    assert_eq!(r[0].len(), bel[0].cfg.len(),
+                                               "carried belief does not match the root support: {} vs {} at dec {}",
+                                               r[0].len(), bel[0].cfg.len(), data.decisions);
+                                    assert_eq!(r[1].len(), bel[1].cfg.len(),
+                                               "carried belief does not match the root support: {} vs {} at dec {}",
+                                               r[1].len(), bel[1].cfg.len(), data.decisions);
+                                }
+                                let vals = sv.value_under(&roots_v);
+                                for (r, v) in roots_v.iter().zip(vals.iter()) {
+                                    assert_eq!(r[0].len(), bel[0].cfg.len(),
+                                               "carried belief does not match the root support");
+                                    assert_eq!(r[1].len(), bel[1].cfg.len(),
+                                               "carried belief does not match the root support");
+                                    data.push_value(
+                                        s,
+                                        ctx,
+                                        &[
+                                            Belief { cfg: bel[0].cfg.clone(), p: r[0].clone() },
+                                            Belief { cfg: bel[1].cfg.clone(), p: r[1].clone() },
+                                        ],
+                                        [&v[0], &v[1]],
+                                    );
+                                }
+                                // `roots` ends with the live belief —
+                                // `finish_walk` appends it last, and the first
+                                // level carries only it — so the row just
+                                // pushed is the one whose belief is this
+                                // solve's own root, and the only one the
+                                // reference strategy is the exact answer for.
+                                data.push_policy(&sv, ctx, data.nv - 1, player);
+                            }
+                            *walk = Some(Walk {
+                                sv,
+                                slot,
+                                node: 0,
+                                drawn: 0,
+                                strat: Vec::new(),
+                                gpu_id: 0,
+                            });
+                        }
+                    }
+                    if let Some(np) = fallback {
+                        np
+                    } else {
+                        let w = walk.as_mut().unwrap();
+                        let nid = w.node;
+                        let n = &w.sv.nodes[nid];
+                        // The tree was built from the belief at the subgame
+                        // root and advanced in lockstep with the Bayes
+                        // filter: the acting player's config support must be
+                        // the same list *in order*, because the strategy rows
+                        // are indexed by it. A silent desync would read the
+                        // wrong row for the true config and corrupt every
+                        // target from here on, so fail loudly.
+                        assert!(
+                            n.player == player
+                                && *n.cfgs[player as usize] == bel[player as usize].cfg[..],
+                            "walk desync: subgame tree no longer matches the game belief"
+                        );
+                        let na = n.na();
+                        let mut np = NodePolicy {
+                            acts: n.acts.clone(),
+                            aslot: n.aslot.clone(),
+                            fdown: n.fdown.clone(),
+                            legal: n.legal.clone(),
+                            probs: vec![0.0; cfgs.len() * na],
+                        };
+                        for ci in 0..cfgs.len() {
+                            // Act on the CFR average — the reference strategy
+                            // of the solve. Evaluation and generation are the
+                            // same walk now.
+                            let row = w.strategy(nid, ci);
+                            np.probs[ci * na..(ci + 1) * na].copy_from_slice(row);
+                        }
+                        np
+                    }
+                }
+            };
+
+            if gc.collect == Collect::Mc && matches!(s.pending(), Cont::MainPlay) {
+                // Park the handcrafted evaluation in the target now; the
+                // realised outcome is blended in once the game ends.
+                // `eval_static` is exactly antisymmetric, so this stays
+                // zero-sum. Rows are taken only at MainPlay states, like
+                // every other training row.
+                let e = eval_squashed(s, 0);
+                let (a, b) = (vec![e; bel[0].len()], vec![-e; bel[1].len()]);
+                data.begin_solve();
+                data.push_value(s, ctx, bel, [&a, &b]);
+            }
+
+            let na = np.acts.len();
+            let mut chosen = sample_row(rng, &np.probs[true_ci * na..(true_ci + 1) * na]);
+            if gc.explore > 0.0
+                && player as u64 == (rng.next_u64() & 1)
+                && rng.unit_f64() < gc.explore as f64
+            {
+                let legal: Vec<usize> = (0..na).filter(|&a| np.legal[true_ci * na + a]).collect();
+                if !legal.is_empty() {
+                    chosen = legal[rng.below(legal.len())];
+                }
+            }
+
+            // Bayes update on the *public observation*: several private
+            // actions can produce it, and the belief must sum over all of
+            // them.
+            let obs = obs_key(&np.acts[chosen]);
+            let mut pairs: Vec<(Config, f32)> = Vec::new();
+            for (ci, c) in cfgs.iter().enumerate() {
+                for a in 0..na {
+                    if !np.legal[ci * na + a] || obs_key(&np.acts[a]) != obs {
+                        continue;
+                    }
+                    if let Some(n) = advance_config(c, np.aslot[a], np.fdown[a]) {
+                        pairs.push((n, bel[player as usize].p[ci] * np.probs[ci * na + a]));
+                    }
+                }
+            }
+            bel[player as usize] = Belief::from_pairs(pairs);
+            s.apply_inplace(np.acts[chosen]);
+
+            // Advance the walk along the solved tree. The public observation
+            // of the chosen action selects the child; if that child is a leaf
+            // (depth exhausted, terminal, or a draw), the walk ends and the
+            // next subgame takes over — with this solve's carried beliefs.
+            let mut walk_ended = false;
+            if let Some(w) = walk.as_mut() {
+                let nid = w.node;
+                let child = w.sv.nodes[nid].child[w.sv.nodes[nid].obs_child[chosen]];
+                // Advance regardless: if the child is a leaf, the walk ends
+                // *at* it, and the carried beliefs must be read off that
+                // node's reach.
+                w.node = child;
+                if w.sv.nodes[child].leaf {
+                    walk_ended = true;
+                }
+            }
+            if walk_ended {
+                if gc.collect == Collect::Rebel {
+                    *carried = finish_walk(walk.take().unwrap(), bel, gpu);
+                } else {
+                    walk.take();
+                    carried.clear();
+                }
+            }
+        }
+        Step::Ended
+    }
+
+    /// Resume after trip 1: push the Phase-2 rows and start the walk with
+    /// the downloaded reference strategy.
+    pub fn resume(&mut self, trip1: crate::gpu::Trip1) {
+        let gc = self.gc;
+        let sv = self.pending_sv.take().expect("pending solver");
+        let slot = self.pending_slot;
+        let player = self.pending_player;
+        let roots_v = self.pending_roots.take().expect("pending roots");
+        if gc.collect == Collect::Rebel {
+            self.data.begin_solve();
+            for (r, v) in roots_v.iter().zip(trip1.root_values.iter()) {
+                self.data.push_value(
+                    &self.s,
+                    &self.ctx,
+                    &[
+                        Belief { cfg: self.bel[0].cfg.clone(), p: r[0].clone() },
+                        Belief { cfg: self.bel[1].cfg.clone(), p: r[1].clone() },
+                    ],
+                    [&v[0], &v[1]],
+                );
+            }
+            // The policy label comes from the downloaded reference strategy.
+            self.data
+                .push_policy_strat(&sv, &self.ctx, self.data.nv - 1, player, &trip1.strategy);
+        }
+        self.carried = Vec::new();
+        self.walk = Some(Walk {
+            sv,
+            slot,
+            node: 0,
+            drawn: 0,
+            strat: trip1.strategy,
+            gpu_id: trip1.id,
+        });
+    }
+
+    /// The game ended: blend the outcome into the parked targets, fill the
+    /// aux heads, and return the result from White's point of view.
+    pub fn finish(&mut self) -> f32 {
+        let z = self.s.utility(WHITE as usize);
+        if self.gc.collect == Collect::Mc {
+            // The parked value is the handcrafted evaluation; blend in the
+            // realised outcome. This is the warm start only — ReBeL-phase
+            // targets come entirely from the subgame solve.
+            let m = self.gc.eval_mix.clamp(0.0, 1.0);
+            blend_outcome(&mut self.data, self.from_row, m, 1.0 - m, z);
+        }
+        if self.gc.collect == Collect::Rebel && self.gc.mc_mix > 0.0 {
+            // Anchor the pure bootstrap target to the realised outcome
+            // (TD(lambda)-style), blended in once per game.
+            let m = self.gc.mc_mix.clamp(0.0, 1.0);
+            blend_outcome(&mut self.data, self.from_row, 1.0 - m, m, z);
+        }
+        fill_aux(&mut self.data, self.from_row, &self.timeline, z);
+        self.data.games += 1;
+        if self.s.main_plays >= crate::state::MAX_MAIN_PLAYS {
+            self.data.cap_hits += 1;
+        }
+        match self.s.winner() {
+            Some(w) => self.data.wins[w as usize] += 1,
+            None => self.data.draws += 1,
+        }
+        z
+    }
 }
 
 /// Play one game to the end. Returns the result from White's point of view.
@@ -470,342 +1020,29 @@ fn finish_walk<'a>(w: Walk<'a>, bel: &[Belief; 2]) -> Vec<[Vec<f32>; 2]> {
 /// work collects these during a training run; they cost a clone per solve
 /// site and nothing when `None`.
 pub fn play_game(
-    rng: &mut Rng,
+    rng: Rng,
     nets: &[Nets],
     gc: &GameCfg,
     data: &mut Data,
     mut roots: Option<&mut Vec<(State, [Belief; 2])>>,
 ) -> f32 {
-    let mut s = make_game(rng, gc.random_draft);
-    let ctx = Ctx::new(&s);
-    let mut bel = [
-        Belief::point(Config::default()),
-        Belief::point(Config::default()),
-    ];
-    let from_row = data.nv;
-    // The live ReBeL walk, if the game is inside a solved subgame. Rebuilt
-    // only when the previous walk ended at a leaf of its tree.
-    let mut walk: Option<Walk> = None;
-    // TurboReBeL's carried beliefs: the T+1 probability vectors at the next
-    // subgame's root under the previous solve's per-iterate average strategies
-    // (plus the live belief), which Phase 2 values once the next solve is
-    // done. Empty means the first level: Phase 2 then values just the live
-    // belief.
-    let mut carried: Vec<[Vec<f32>; 2]> = Vec::new();
-    // One entry per round, for the auxiliary targets. Recorded as the game runs
-    // because they ask about the future, and read back once it is over.
-    let mut timeline: Timeline = Vec::new();
-
-    while !s.is_terminal() {
-        while timeline.len() <= s.round as usize {
-            timeline.push(([s.markers_on_board(0), s.markers_on_board(1)], s.initiative));
-        }
-        let last = timeline.len() - 1;
-        timeline[last] = ([s.markers_on_board(0), s.markers_on_board(1)], s.initiative);
-        let player = s.to_act();
-        if s.is_chance() {
-            let res = reserve(&s, player, &ctx);
-            let fu = faceup_counts(&s, player, &ctx);
-            let wp = matches!(s.pending(), Cont::WarriorPriestDraw { .. });
-            bel[player as usize] =
-                belief_after_draw(&bel[player as usize], &res, &fu, wp);
-            resolve_chance(&mut s, player, rng);
-            // The walk spans draws now: a draw is an internal node of the
-            // subgame with one public child, so advance through it. The
-            // post-draw belief must equal the tree's post-draw config support
-            // (same list, same order) or every strategy row read from here on
-            // is wrong.
-            let mut walk_ended = false;
-            if let Some(w) = walk.as_mut() {
-                let nid = w.node;
-                let n = &w.sv.nodes[nid];
-                assert!(n.chance && n.player == player, "walk not at the draw");
-                // One tree node stands for a whole run of that player's draws,
-                // so it is exhausted only once the game has taken all of them.
-                w.drawn += 1;
-                if w.drawn == n.draw_steps {
-                    w.drawn = 0;
-                    let child = n.child[0];
-                    assert!(
-                        *w.sv.nodes[child].cfgs[player as usize] == bel[player as usize].cfg[..],
-                        "walk desync: post-draw support does not match the game belief"
-                    );
-                    w.node = child;
-                    if w.sv.nodes[child].leaf {
-                        walk_ended = true;
-                    }
-                }
-            }
-            if walk_ended {
-                if gc.collect == Collect::Rebel {
-                    carried = finish_walk(walk.take().unwrap(), &bel);
-                } else {
-                    // Evaluation: the carried beliefs exist only to be valued
-                    // by the next solve's Phase 2, which collection runs and
-                    // evaluation does not — drop them with the walk.
-                    walk.take();
-                    carried.clear();
-                }
-            }
-            continue;
-        }
-
-        let cfgs = bel[player as usize].cfg.clone();
-        let truth = true_config(&s, player, &ctx);
-        let true_ci = bel[player as usize]
-            .index_of(&truth)
-            // Losing the real world would silently corrupt every target taken
-            // from here on, so fail loudly instead.
-            .expect("belief filter dropped the true config");
-        data.decisions += 1;
-        data.configs += cfgs.len();
-
-        let np = match gc.agents[player as usize] {
-            Agent::Greedy { temp } => {
-                // A non-ReBeL decision is not in the walk's tree: end any
-                // pending walk. Its rows were pushed at the solve site, and
-                // any carried beliefs are meaningless here — the tree is not
-                // in lockstep with a game the other player has been steering
-                // outside it, and a pending set belongs to the state the walk
-                // ended at, which the game has now left — so the next solve
-                // starts from just the live belief.
-                walk.take();
-                carried.clear();
-                greedy_policy(&s, &ctx, player, &cfgs, temp)
-            }
-            Agent::Random => {
-                walk.take();
-                carried.clear();
-                random_policy(&s, &ctx, player, &cfgs)
-            }
-            Agent::Rebel { cfg, slot } => {
-                // A walk belongs to the checkpoint that built it. Playing a
-                // decision on another slot's solver would make that player
-                // act with the wrong network — the Elo ladder pits one
-                // snapshot's slot against another's — so end a walk built by a
-                // different slot before starting a new one.
-                if walk.as_ref().is_some_and(|w| w.slot != slot) {
-                    // A walk belongs to the checkpoint that built it; the
-                    // carried beliefs are not transferable either.
-                    walk.take();
-                    carried.clear();
-                }
-                // A pathological root falls back to a uniform policy; the
-                // policy is produced outside the walk bookkeeping below.
-                let mut fallback: Option<NodePolicy> = None;
-                if walk.is_none() {
-                    if let Some(r) = roots.as_deref_mut() {
-                        r.push((s, bel.clone()));
-                    }
-                    // Start a new subgame at this decision: build the tree
-                    // and run the full solve (Phase 1). TurboReBeL's Phase 2
-                    // then values every carried belief — the T+1 rows of this
-                    // level — under the reference strategy (the CFR average),
-                    // and the walk acts on that same average.
-                    let scfg = Cfg {
-                        // Evaluation never reads the per-iterate snapshots or
-                        // the carried beliefs, so it must not pay for either.
-                        snapshots: gc.collect == Collect::Rebel,
-                        ..cfg
-                    };
-                    let mut sv = Solver::new(&s, &ctx, &nets[slot], scfg, bel.clone());
-                    if sv.capped() {
-                        // The tree-size tail is fat (broad random-draft
-                        // beliefs at round boundaries); an unbounded build
-                        // hangs a worker for minutes on one decision. Fall
-                        // back to a uniform policy for this decision and drop
-                        // the walk (and any carried beliefs); the next Rebel
-                        // decision starts a fresh solve. No rows are collected
-                        // here, so the data keeps the MainPlay-only invariant
-                        // without a search that never ends.
-                        walk.take();
-                        carried.clear();
-                        fallback = Some(random_policy(&s, &ctx, player, &cfgs));
-                    } else {
-                    sv.warm_start(scfg.warm);
-                    sv.multistep(cfg.iters);
-                    if gc.collect == Collect::Rebel {
-                        // Phase 2: one fixed-policy value pass per carried
-                        // belief. The first level carries nothing yet, so it
-                        // values just the live belief — the same single row
-                        // the old loop took per solve.
-                        let roots: Vec<[Vec<f32>; 2]> = if carried.is_empty() {
-                            vec![[bel[0].p.clone(), bel[1].p.clone()]]
-                        } else {
-                            std::mem::take(&mut carried)
-                        };
-                        data.begin_solve();
-                        for r in &roots {
-                            assert_eq!(r[0].len(), bel[0].cfg.len(),
-                                       "carried belief does not match the root support: {} vs {} at dec {}",
-                                       r[0].len(), bel[0].cfg.len(), data.decisions);
-                            assert_eq!(r[1].len(), bel[1].cfg.len(),
-                                       "carried belief does not match the root support: {} vs {} at dec {}",
-                                       r[1].len(), bel[1].cfg.len(), data.decisions);
-                        }
-                        let vals = sv.value_under(&roots);
-                        for (r, v) in roots.iter().zip(vals.iter()) {
-                            assert_eq!(r[0].len(), bel[0].cfg.len(),
-                                       "carried belief does not match the root support");
-                            assert_eq!(r[1].len(), bel[1].cfg.len(),
-                                       "carried belief does not match the root support");
-                            data.push_value(
-                                &s,
-                                &ctx,
-                                &[
-                                    Belief { cfg: bel[0].cfg.clone(), p: r[0].clone() },
-                                    Belief { cfg: bel[1].cfg.clone(), p: r[1].clone() },
-                                ],
-                                [&v[0], &v[1]],
-                            );
-                        }
-                        // `roots` ends with the live belief -- `finish_walk`
-                        // appends it last, and the first level carries only it
-                        // -- so the row just pushed is the one whose belief is
-                        // this solve's own root, and the only one the reference
-                        // strategy is the exact answer for.
-                        data.push_policy(&sv, &ctx, data.nv - 1, player);
-                    }
-                    walk = Some(Walk {
-                        sv,
-                        slot,
-                        node: 0,
-                        drawn: 0,
-                    });
-                    }
-                }
-                if let Some(np) = fallback {
-                    np
-                } else {
-                let w = walk.as_mut().unwrap();
-                let nid = w.node;
-                let n = &w.sv.nodes[nid];
-                // The tree was built from the belief at the subgame root and
-                // advanced in lockstep with the Bayes filter: the acting
-                // player's config support must be the same list *in order*,
-                // because the strategy rows are indexed by it. A silent
-                // desync would read the wrong row for the true config and
-                // corrupt every target from here on, so fail loudly.
-                assert!(
-                    n.player == player
-                        && *n.cfgs[player as usize] == bel[player as usize].cfg[..],
-                    "walk desync: subgame tree no longer matches the game belief"
-                );
-                let na = n.na();
-                let mut np = NodePolicy {
-                    acts: n.acts.clone(),
-                    aslot: n.aslot.clone(),
-                    fdown: n.fdown.clone(),
-                    legal: n.legal.clone(),
-                    probs: vec![0.0; cfgs.len() * na],
-                };
-                for ci in 0..cfgs.len() {
-                    // Act on the CFR average — the reference strategy of the
-                    // solve. Evaluation and generation are the same walk now.
-                    let row = w.sv.average_strategy(nid, ci);
-                    np.probs[ci * na..(ci + 1) * na].copy_from_slice(row);
-                }
-                np
-                }
-
-            }
-        };
-
-        if gc.collect == Collect::Mc && matches!(s.pending(), Cont::MainPlay) {
-            // Park the handcrafted evaluation in the target now; the realised
-            // outcome is blended in once the game ends. `eval_static` is exactly
-            // antisymmetric, so this stays zero-sum.
-            //
-            // Rows are taken only at MainPlay states, like every other training
-            // row: a value target never shows the network a mid-play chain.
-            let e = eval_squashed(&s, 0);
-            let (a, b) = (vec![e; bel[0].len()], vec![-e; bel[1].len()]);
-            data.begin_solve();
-            data.push_value(&s, &ctx, &bel, [&a, &b]);
-        }
-
-        let na = np.acts.len();
-        let mut chosen = sample_row(rng, &np.probs[true_ci * na..(true_ci + 1) * na]);
-        if gc.explore > 0.0
-            && player as u64 == (rng.next_u64() & 1)
-            && rng.unit_f64() < gc.explore as f64
-        {
-            let legal: Vec<usize> = (0..na).filter(|&a| np.legal[true_ci * na + a]).collect();
-            if !legal.is_empty() {
-                chosen = legal[rng.below(legal.len())];
-            }
-        }
-
-        // Bayes update on the *public observation*: several private actions can
-        // produce it, and the belief must sum over all of them.
-        let obs = obs_key(&np.acts[chosen]);
-        let mut pairs: Vec<(Config, f32)> = Vec::new();
-        for (ci, c) in cfgs.iter().enumerate() {
-            for a in 0..na {
-                if !np.legal[ci * na + a] || obs_key(&np.acts[a]) != obs {
-                    continue;
-                }
-                if let Some(n) = advance_config(c, np.aslot[a], np.fdown[a]) {
-                    pairs.push((n, bel[player as usize].p[ci] * np.probs[ci * na + a]));
-                }
-            }
-        }
-        bel[player as usize] = Belief::from_pairs(pairs);
-        s.apply_inplace(np.acts[chosen]);
-
-        // Advance the walk along the solved tree. The public observation of
-        // the chosen action selects the child; if that child is a leaf
-        // (depth exhausted, terminal, or a draw), the walk ends and the
-        // next subgame takes over — with this solve's carried beliefs.
-        let mut walk_ended = false;
-        if let Some(w) = walk.as_mut() {
-            let nid = w.node;
-            let child = w.sv.nodes[nid].child[w.sv.nodes[nid].obs_child[chosen]];
-            // Advance regardless: if the child is a leaf, the walk ends *at*
-            // it, and the carried beliefs must be read off that node's reach.
-            w.node = child;
-            if w.sv.nodes[child].leaf {
-                walk_ended = true;
-            }
-        }
-        if walk_ended {
-            if gc.collect == Collect::Rebel {
-                carried = finish_walk(walk.take().unwrap(), &bel);
-            } else {
-                // Evaluation: see the chance-path site — carried beliefs are
-                // Phase-2 input for collection only.
-                walk.take();
-                carried.clear();
-            }
-        }
+    let mut g = Game::new(rng, gc);
+    if roots.is_some() {
+        g.set_roots(Vec::new());
     }
-
-    let z = s.utility(WHITE as usize);
-    if gc.collect == Collect::Mc {
-        // The parked value is the handcrafted evaluation; blend in the realised
-        // outcome. This is the warm start only — ReBeL-phase targets come
-        // entirely from the subgame solve.
-        let m = gc.eval_mix.clamp(0.0, 1.0);
-        blend_outcome(data, from_row, m, 1.0 - m, z);
+    let z = loop {
+        match g.advance(None, nets) {
+            Step::Ended => break g.finish(),
+            Step::Submitted => unreachable!("cpu path never submits"),
+        }
+    };
+    if let Some(r) = roots.as_deref_mut() {
+        r.extend(g.take_roots());
     }
-    if gc.collect == Collect::Rebel && gc.mc_mix > 0.0 {
-        // Anchor the pure bootstrap target to the realised outcome
-        // (TD(lambda)-style), blended in once per game.
-        let m = gc.mc_mix.clamp(0.0, 1.0);
-        blend_outcome(data, from_row, 1.0 - m, m, z);
-    }
-    fill_aux(data, from_row, &timeline, z);
-    data.games += 1;
-    if s.main_plays >= crate::state::MAX_MAIN_PLAYS {
-        data.cap_hits += 1;
-    }
-    match s.winner() {
-        Some(w) => data.wins[w as usize] += 1,
-        None => data.draws += 1,
-    }
+    let d = g.take_data();
+    data.merge(d);
     z
 }
-
 /// How many auxiliary targets a row carries. Defined with the frozen row
 /// format; see `rebel::AUX`.
 pub use crate::rebel::AUX;
@@ -964,10 +1201,10 @@ pub fn collect_roots(
         if out.len() >= cap {
             break;
         }
-        let mut rng = Rng::new(worker_seed(seed, i));
+        let rng = Rng::new(worker_seed(seed, i));
         let mut d = Data::default();
         let mut roots: Vec<(State, [Belief; 2])> = Vec::new();
-        play_game(&mut rng, nets, gc, &mut d, Some(&mut roots));
+        play_game(rng, nets, gc, &mut d, Some(&mut roots));
         for r in roots {
             if out.len() >= cap {
                 break;
@@ -979,12 +1216,110 @@ pub fn collect_roots(
 }
 
 /// Play `games` games in parallel, returning merged data and statistics.
+
+/// The GPU generation loop: `workers` threads, each playing two games so the
+/// CPU has work while a game's solve runs on the GPU (docs/arch plan B1).
+/// Each game submits its solve as one job and blocks on trip 1; the worker
+/// alternates between its two games, waiting on whichever solve is ready.
+/// When a game ends its rows are merged and a fresh game takes its place.
+#[cfg(feature = "gpu")]
+pub fn run_games_gpu(
+    games: usize,
+    seed: u64,
+    nets: &[Nets],
+    gc: &GameCfg,
+    gpu: &crate::gpu::GpuClient,
+) -> Data {
+    let workers = (games / 2).max(1).min(64);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|w| {
+                let gc = gc;
+                let nets = nets;
+                let gpu = gpu;
+                scope.spawn(move || {
+                    let mut out = Data::default();
+                    let mut slot = w * 2;
+                    // Two interleaved games; each holds at most one pending
+                    // solve (it cannot progress past a solve site without
+                    // trip 1).
+                    let mut games_a: Option<Game> = None;
+                    let mut games_b: Option<Game> = None;
+                    let mut ha: Option<crate::gpu::SolveHandle> = None;
+                    let mut hb: Option<crate::gpu::SolveHandle> = None;
+
+                    // (Re)start a game in `g` if it ended, and advance it as
+                    // far as it can go without blocking. Returns the pending
+                    // handle if the game is now waiting on the GPU.
+                    fn advance_slot<'a>(
+                        g: &mut Option<Game<'a>>,
+                        h: &mut Option<crate::gpu::SolveHandle>,
+                        slot: &mut usize,
+                        games: usize,
+                        seed: u64,
+                        gc: &'a GameCfg,
+                        nets: &'a [Nets],
+                        gpu: &crate::gpu::GpuClient,
+                        out: &mut Data,
+                    ) {
+                        if g.is_none() {
+                            if *slot >= games {
+                                return;
+                            }
+                            let rng = Rng::new(worker_seed(seed, *slot));
+                            *slot += 1;
+                            *g = Some(Game::new(rng, gc));
+                        }
+                        if h.is_some() {
+                            return;
+                        }
+                        let game = g.as_mut().unwrap();
+                        match game.advance(Some(gpu), nets) {
+                            Step::Submitted => *h = game.take_pending(),
+                            Step::Ended => {
+                                let _ = game.finish();
+                                out.merge(game.take_data());
+                                *g = None;
+                            }
+                        }
+                    }
+
+                    loop {
+                        advance_slot(&mut games_a, &mut ha, &mut slot, games, seed,
+                                     gc, nets, gpu, &mut out);
+                        advance_slot(&mut games_b, &mut hb, &mut slot, games, seed,
+                                     gc, nets, gpu, &mut out);
+                        if games_a.is_none() && games_b.is_none() {
+                            break;
+                        }
+                        // Wait on the first pending solve, then advance the
+                        // game whose turn it is.
+                        if let Some(h) = ha.take() {
+                            let trip1 = h.wait().expect("gpu trip 1");
+                            games_a.as_mut().expect("pending game").resume(trip1);
+                        } else if let Some(h) = hb.take() {
+                            let trip1 = h.wait().expect("gpu trip 1");
+                            games_b.as_mut().expect("pending game").resume(trip1);
+                        }
+                    }
+                    out
+                })
+            })
+            .collect();
+        let mut merged = Data::default();
+        for h in handles {
+            merged.merge(h.join().expect("gpu worker"));
+        }
+        merged
+    })
+}
+
 pub fn run_games(games: usize, seed: u64, nets: &[Nets], gc: &GameCfg) -> Data {
     (0..games)
         .into_par_iter()
         .fold(Data::default, |mut acc, i| {
-            let mut rng = Rng::new(worker_seed(seed, i));
-            play_game(&mut rng, nets, gc, &mut acc, None);
+            let rng = Rng::new(worker_seed(seed, i));
+            play_game(rng, nets, gc, &mut acc, None);
             acc
         })
         .reduce(Data::default, |mut a, b| {
@@ -1007,7 +1342,7 @@ pub fn eval_match(
     (0..games)
         .into_par_iter()
         .map(|i| {
-            let mut rng = Rng::new(worker_seed(seed.wrapping_add(7), i / 2));
+            let rng = Rng::new(worker_seed(seed.wrapping_add(7), i / 2));
             let swap = i % 2 == 1;
             let gc = GameCfg {
                 agents: if swap { [b, a] } else { [a, b] },
@@ -1018,7 +1353,7 @@ pub fn eval_match(
                 mc_mix: 0.0,
             };
             let mut d = Data::default();
-            let z = play_game(&mut rng, nets, &gc, &mut d, None);
+            let z = play_game(rng, nets, &gc, &mut d, None);
             let za = if swap { -z } else { z };
             if za > 1e-6 {
                 (1, 0, 0)
