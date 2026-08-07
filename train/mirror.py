@@ -165,7 +165,9 @@ def self_check(vx, n=512):
 
 def self_check_rows(rows, cc, cp, seg):
     """The row-level checks: involution, and expansion commutes with the
-    feature mirror."""
+    feature mirror. `rows` may be a leading slice of the batch; the config
+    arrays are the full batch's, so sizes are read from the first config of
+    each span as usual."""
     mr = mirror_rows(rows)
     assert np.array_equal(mirror_rows(mr), rows), "row mirror is not an involution"
     # Unit ids swap players; piles swap players.
