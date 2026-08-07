@@ -7,6 +7,7 @@ target directory in a volume, so a re-run only recompiles what changed.
     uvx modal run gpu_ci.py                    # every gpu test
     uvx modal run gpu_ci.py --test phase       # one test, by substring
     uvx modal run gpu_ci.py --no-release       # unoptimised, for a backtrace
+    uvx modal run gpu_ci.py --bench "128 20 64" # the throughput benchmark
 
 Optimised by default: the tests build a real subgame on the CPU first, and a
 debug build spends minutes there before the first kernel runs.
@@ -62,12 +63,23 @@ def repo_tarball() -> io.BytesIO:
 
 @app.function(image=image, gpu="T4", timeout=1800,
               volumes={"/root/warchest": CARGO, "/root/src": SRC})
-def run(test: str, release: bool):
+def run(test: str, release: bool, bench: str, timing: bool):
     os.makedirs("/repo", exist_ok=True)
     subprocess.run(
         ["tar", "xzf", "/root/src/repo.tgz", "-C", "/repo", "--strip-components=1"],
         check=True,
     )
+    if bench:
+        cmd = ["cargo", "run", "--release", "--features", "gpu",
+               "--example", "gpu_bench", "--"] + bench.split()
+        print("$", " ".join(cmd), flush=True)
+        env = {**os.environ, **ENV}
+        if timing:
+            env["WARCHEST_GPU_TIMING"] = "1"
+        p = subprocess.run(cmd, cwd="/repo/engine", env=env)
+        if p.returncode != 0:
+            raise SystemExit(p.returncode)
+        return
     cmd = ["cargo", "test", "--features", "gpu", "--lib"]
     if release:
         cmd.append("--release")
@@ -83,7 +95,7 @@ def run(test: str, release: bool):
 
 
 @app.local_entrypoint()
-def main(test: str = "", no_release: bool = False):
+def main(test: str = "", no_release: bool = False, bench: str = "", timing: bool = False):
     with SRC.batch_upload(force=True) as batch:
         batch.put_file(repo_tarball(), "/repo.tgz")
-    run.remote(test, not no_release)
+    run.remote(test, not no_release, bench, timing)

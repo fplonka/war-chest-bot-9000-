@@ -60,6 +60,7 @@ typedef struct {
     int p_player;  // the player a readout/backprop pass is for
     int nplayers;  // belief players this pass: 1 (traverser) or 2 (both)
     int strat_src; // sweep strategy: 0 current, 1 average, 2 snapshot[step]
+    int level;     // which level of the sweep this launch is
 } Group;
 
 // ------------------------------------------------------------------ helpers
@@ -140,10 +141,37 @@ __device__ __forceinline__ const float* root_of(const Desc* d) {
     const Desc* d = descs + g->slots[_k];                                     \
     int i = _t - g->starts[_k];
 
-// Boilerplate for a per-solve sweep: one block per solve.
-#define BLOCK_SOLVE(d)                                                        \
-    if (blockIdx.x >= g->n) return;                                           \
-    const Desc* d = descs + g->slots[blockIdx.x];
+// Boilerplate for a phase that gives each item a whole warp. The kernels that
+// walk a row's config list use this: the config loop then runs once per warp
+// instead of once per lane, the lanes divide the embedding width between them,
+// and every read of a config's row is one coalesced transaction rather than
+// thirty-two scattered ones. Whole warps retire together, so there is no
+// partial-warp divergence to pay for.
+#define FLAT_WARP(d, i, lane)                                                 \
+    int lane = threadIdx.x & 31;                                              \
+    int _w = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;                    \
+    if (_w >= g->total) return;                                               \
+    int _k = find_slot(g->starts, g->n, _w);                                  \
+    const Desc* d = descs + g->slots[_k];                                     \
+    int i = _w - g->starts[_k];
+
+// The widest embedding a warp splits between its lanes, in units of 32.
+#define MAX_LANES 4
+
+__device__ __forceinline__ float warp_sum(float v) {
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
+    return v;
+}
+
+// The reach block's total, summed across the warp rather than by every lane.
+__device__ __forceinline__ void warp_normalize(const float* w, int n, int lane,
+                                               float* scale, float* flat) {
+    float tot = 0.0f;
+    for (int i = lane; i < n; i += 32) tot += w[i];
+    tot = warp_sum(tot);
+    *scale = tot > SMOOTH ? 1.0f / tot : 0.0f;
+    *flat = tot > SMOOTH ? 0.0f : 1.0f / (float)(n > 0 ? n : 1);
+}
 
 // ------------------------------------------------------- phase 1: belief sums
 
@@ -157,68 +185,85 @@ __device__ __forceinline__ const float* root_of(const Desc* d) {
 // regret matching just moved, so it is the only belief that has changed. The
 // other side is still exactly what the last tick left in the pool.
 extern "C" __global__ void belief_sums(const Desc* descs, const Group* g, const Ctx* ctx) {
-    FLAT_THREAD(d, rp)
+    FLAT_WARP(d, rp, lane)
     int row = rp / g->nplayers;
     int p = g->nplayers == 1 ? 1 - d->traverser : rp % 2;
     int leaf = (int)T_leaf_rows(d)[row];
     int n = nc_of(d, leaf, p);
     const float* r = A_reach(d) + reach_at(d, leaf, p, 0);
     float scale, flat;
-    normalize_scale(r, n, &scale, &flat);
+    warp_normalize(r, n, lane, &scale, &flat);
     int dg = ctx->dg;
-    float* out = ctx->xb + ((size_t)(d->row0 + row) * 2 + p) * dg;
-    for (int j = 0; j < dg; j++) out[j] = 0.0f;
+    int chunks = (dg + 31) >> 5;
+    // The sum lives in registers for the whole config loop. Accumulating it
+    // in the output row instead would make every config a read-modify-write
+    // of global memory, which is what this phase used to spend its time on.
+    float acc[MAX_LANES];
+    for (int k = 0; k < chunks; k++) acc[k] = 0.0f;
     int c0 = (int)T_leaf_coff(d)[2 * row + p];
     for (int c = 0; c < n; c++) {
         int ci = (int)T_leaf_cidx(d)[c0 + c];
         float wc = r[c] * scale + flat;
         const float* z = A_z(d) + (size_t)ci * dg;
-        for (int j = 0; j < dg; j++) out[j] += wc * z[j];
+        for (int k = 0; k < chunks; k++) {
+            int j = (k << 5) + lane;
+            if (j < dg) acc[k] += wc * z[j];
+        }
+    }
+    float* out = ctx->xb + ((size_t)(d->row0 + row) * 2 + p) * dg;
+    for (int k = 0; k < chunks; k++) {
+        int j = (k << 5) + lane;
+        if (j < dg) out[j] = acc[k];
     }
 }
 
 // ------------------------------------------------------- phase 2: the head
 
-// `row[j] = relu((row[j] - mean) * inv * gain[j] + bt[j])` over a row of the
-// packed pool, where the row is first completed with its bias and, for LN1,
-// the solve's cached h0. One thread per row. Ports net.rs::ln_relu.
-__device__ __forceinline__ void ln_relu_row(float* row, const float* bias,
-                                            const float* gain, const float* bt,
-                                            const float* add, int n) {
+// `row[j] = relu((row[j] - mean) * inv * gain[j] + bt[j])`, where the row is
+// first completed with its bias and, for LN1, the solve's cached h0.
+//
+// A warp per row, not a thread: the rows are hundreds of floats apart, so a
+// thread per row makes all thirty-two lanes of a warp touch thirty-two
+// different rows and every read is its own memory transaction. Splitting one
+// row across the lanes makes each read a single coalesced one, and the two
+// means become warp reductions. Ports net.rs::ln_relu.
+__device__ __forceinline__ void ln_relu_warp(float* row, const float* bias,
+                                             const float* gain, const float* bt,
+                                             const float* add, int n, int lane) {
     float sum = 0.0f;
-    for (int j = 0; j < n; j++) {
+    for (int j = lane; j < n; j += 32) {
         float x = row[j] + bias[j];
         if (add) x += add[j];
         row[j] = x;
         sum += x;
     }
-    float mean = sum * (1.0f / n);
+    float mean = warp_sum(sum) * (1.0f / n);
     float var = 0.0f;
-    for (int j = 0; j < n; j++) {
+    for (int j = lane; j < n; j += 32) {
         float e = row[j] - mean;
         var += e * e;
     }
-    float inv = rsqrtf(var * (1.0f / n) + LN_EPS);
-    for (int j = 0; j < n; j++) {
+    float inv = rsqrtf(warp_sum(var) * (1.0f / n) + LN_EPS);
+    for (int j = lane; j < n; j += 32) {
         float x = (row[j] - mean) * inv * gain[j] + bt[j];
         row[j] = x > 0.0f ? x : 0.0f;
     }
 }
 
-// LN1 over the head rows: h = relu(LN1(h0 + xb·Wb)). The GEMM ran in cuBLAS.
+// LN1 over the head rows: h = relu(LN1(h0 + xb.Wb)). The GEMM ran in cuBLAS.
 extern "C" __global__ void head_norm(const Desc* descs, const Group* g, const Ctx* ctx) {
-    FLAT_THREAD(d, row)
+    FLAT_WARP(d, row, lane)
     int hd = ctx->head;
     size_t at = (size_t)(d->row0 + row) * hd;
-    ln_relu_row(ctx->h + at, ctx->b1, ctx->ln1w, ctx->ln1b, ctx->h0 + at, hd);
+    ln_relu_warp(ctx->h + at, ctx->b1, ctx->ln1w, ctx->ln1b, ctx->h0 + at, hd, lane);
 }
 
-// u += bu after the second head GEMM. One thread per row.
+// u += bu after the second head GEMM. One thread per element, so the writes
+// of a warp are one transaction.
 extern "C" __global__ void head_bias(const Desc* descs, const Group* g, const Ctx* ctx) {
-    FLAT_THREAD(d, row)
+    FLAT_THREAD(d, i)
     int rk = ctx->rk;
-    float* u = ctx->u + (size_t)(d->row0 + row) * rk;
-    for (int j = 0; j < rk; j++) u[j] += ctx->bu[j];
+    ctx->u[(size_t)(d->row0 + i / rk) * rk + i % rk] += ctx->bu[i % rk];
 }
 
 // ------------------------------------------------------- phase 3: readout
@@ -227,129 +272,141 @@ extern "C" __global__ void head_bias(const Desc* descs, const Group* g, const Ct
 // Solver::readout: v = <u, g[..rk]> + g[rk], times the opponent's reach;
 // terminals use the game utility.
 extern "C" __global__ void readout(const Desc* descs, const Group* g, const Ctx* ctx) {
-    FLAT_THREAD(d, rp)
+    FLAT_WARP(d, rp, lane)
     int p = player_of(d, g);
     int opp = 1 - p;
     int rk = ctx->rk;
     int leaf = rp < d->nleaf ? (int)T_leaf_rows(d)[rp]
                              : (int)T_term_leaves(d)[rp - d->nleaf];
-    float opp_reach = 0.0f;
     int nop = nc_of(d, leaf, opp);
     const float* ro = A_reach(d) + reach_at(d, leaf, opp, 0);
-    for (int c = 0; c < nop; c++) opp_reach += ro[c];
+    float opp_reach = 0.0f;
+    for (int c = lane; c < nop; c += 32) opp_reach += ro[c];
+    opp_reach = warp_sum(opp_reach);
     int n = nc_of(d, leaf, p);
     float* v = A_vals(d) + T_voff(d)[leaf];
-    if (rp < d->nleaf) {
-        const float* u = ctx->u + (size_t)(d->row0 + rp) * rk;
-        int c0 = (int)T_leaf_coff(d)[2 * rp + p];
-        for (int c = 0; c < n; c++) {
-            int ci = (int)T_leaf_cidx(d)[c0 + c];
-            const float* gr = A_g(d) + (size_t)ci * (rk + 1);
-            float acc = 0.0f;
-            for (int j = 0; j < rk; j++) acc += u[j] * gr[j];
-            v[c] = (acc + gr[rk]) * opp_reach;
-        }
-    } else {
+    if (rp >= d->nleaf) {
         float ut = T_terminal_utility(d)[rp - d->nleaf];
         if (T_node_player(d)[leaf] != p) ut = -ut;
         float val = ut * opp_reach;
-        for (int c = 0; c < n; c++) v[c] = val;
+        for (int c = lane; c < n; c += 32) v[c] = val;
+        return;
+    }
+    // `u` is the same for every config of the row, so it is read once into
+    // registers and the config loop only streams `g`.
+    int chunks = (rk + 31) >> 5;
+    const float* u = ctx->u + (size_t)(d->row0 + rp) * rk;
+    float ur[MAX_LANES];
+    for (int k = 0; k < chunks; k++) {
+        int j = (k << 5) + lane;
+        ur[k] = j < rk ? u[j] : 0.0f;
+    }
+    int c0 = (int)T_leaf_coff(d)[2 * rp + p];
+    for (int c = 0; c < n; c++) {
+        int ci = (int)T_leaf_cidx(d)[c0 + c];
+        const float* gr = A_g(d) + (size_t)ci * (rk + 1);
+        float part = 0.0f;
+        for (int k = 0; k < chunks; k++) {
+            int j = (k << 5) + lane;
+            if (j < rk) part += ur[k] * gr[j];
+        }
+        part = warp_sum(part);
+        if (lane == 0) v[c] = (part + gr[rk]) * opp_reach;
     }
 }
 
 // ------------------------------------------------------- phase 4: backward sweep
 
-// One block per solve; levels sequential inside the block; one thread per node
-// within a level. Ports Solver::backprop. mode: 0 regret, 1 value, 2 best
-// response.
+// One launch per level, one thread per node in it. Ports Solver::backprop.
+// mode: 0 regret, 1 value, 2 best response.
+//
+// The levels used to run inside one block per solve, so that `__syncthreads`
+// could order them — which capped the sweep at one block's worth of threads
+// per solve and left a big tree's block grinding while the rest of the device
+// idled. A launch per level orders them just as well, and every node of every
+// solve at that level runs at once. Solves deeper than this launch's level
+// contribute nothing to it, which the group's per-solve span already says.
 extern "C" __global__ void backprop(const Desc* descs, const Group* g, const Ctx* ctx) {
-    BLOCK_SOLVE(d)
+    FLAT_WARP(d, at, lane)
+    // Backwards: level 0 of the sweep is the solve's deepest.
+    int lev = d->nlevels - 1 - g->level;
+    if (lev < 0) return;
+    int i = (int)T_bfs_order(d)[T_level_start(d)[lev] + at];
+    int kind = T_node_kind(d)[i];
+    if (kind == 2) return;
     int mode = g->mode;
     int traverser = player_of(d, g);
     const float* strat = strat_of(d, g);
     float* vals = A_vals(d);
     float* inst = A_inst(d);
-    const unsigned int* ls = T_level_start(d);
-    const unsigned int* order = T_bfs_order(d);
     const unsigned int* child_start = T_node_child_start(d);
     const unsigned int* child = T_node_child(d);
     const unsigned int* voff = T_voff(d);
-    for (int lev = d->nlevels - 1; lev >= 0; lev--) {
-        int lo = (int)ls[lev], hi = (int)ls[lev + 1];
-        for (int i0 = lo + threadIdx.x; i0 < hi; i0 += blockDim.x) {
-            int i = (int)order[i0];
-            int kind = T_node_kind(d)[i];
-            if (kind == 2) continue;
-            int me = T_node_player(d)[i];
-            int nc = nc_of(d, i, traverser);
-            int vbase = (int)voff[i];
-            if (kind == 1) {  // chance
-                int ch = (int)child[child_start[i]];
-                const float* src = vals + voff[ch];
-                if (me == traverser) {
-                    int d0 = (int)T_draw_off(d)[i];
-                    const unsigned int* b = T_draw_row_start(d) + T_draw_row_off(d)[i];
-                    for (int c = 0; c < nc; c++) {
-                        float acc = 0.0f;
-                        for (int k = (int)b[c]; k < (int)b[c + 1]; k++) {
-                            acc += T_draw_p(d)[d0 + k] * src[T_draw_to(d)[d0 + k]];
-                        }
-                        vals[vbase + c] = acc;
-                    }
-                } else {
-                    for (int c = 0; c < nc; c++) vals[vbase + c] = src[c];
+    int me = T_node_player(d)[i];
+    int nc = nc_of(d, i, traverser);
+    int vbase = (int)voff[i];
+    if (kind == 1) {  // chance
+        int ch = (int)child[child_start[i]];
+        const float* src = vals + voff[ch];
+        if (me == traverser) {
+            int d0 = (int)T_draw_off(d)[i];
+            const unsigned int* b = T_draw_row_start(d) + T_draw_row_off(d)[i];
+            for (int c = lane; c < nc; c += 32) {
+                float acc = 0.0f;
+                for (int k = (int)b[c]; k < (int)b[c + 1]; k++) {
+                    acc += T_draw_p(d)[d0 + k] * src[T_draw_to(d)[d0 + k]];
                 }
-                continue;
+                vals[vbase + c] = acc;
             }
-            int na = na_of(d, i);
-            int so = (int)T_soff(d)[i];
-            if (me == traverser) {
-                if (mode == 0) {
-                    for (int j = 0; j < nc * na; j++) inst[so + j] = 0.0f;
-                }
-                float neg_inf = -INFINITY_F;
-                for (int c = 0; c < nc; c++) vals[vbase + c] = mode == 2 ? neg_inf : 0.0f;
-                for (int a = 0; a < na; a++) {
-                    int ch = (int)child[child_start[i] + T_obs_child(d)[T_act_off(d)[i] + a]];
-                    const float* cv = vals + voff[ch];
-                    for (int c = 0; c < nc; c++) {
-                        int cell = so + c * na + a;
-                        if (!legal_cell(d, cell)) continue;
-                        int tr = T_trans(d)[cell];
-                        if (tr < 0) continue;
-                        float av = cv[tr];
-                        if (mode == 0) {
-                            inst[cell] += av;
-                            vals[vbase + c] += av * strat[cell];
-                        } else if (mode == 1) {
-                            vals[vbase + c] += av * strat[cell];
-                        } else if (av > vals[vbase + c]) {
-                            vals[vbase + c] = av;
-                        }
-                    }
-                }
-                if (mode == 0) {
-                    for (int c = 0; c < nc; c++) {
-                        float base = vals[vbase + c];
-                        for (int a = 0; a < na; a++) {
-                            int cell = so + c * na + a;
-                            if (legal_cell(d, cell)) inst[cell] -= base;
-                        }
-                    }
-                } else if (mode == 2) {
-                    for (int c = 0; c < nc; c++) {
-                        if (vals[vbase + c] == neg_inf) vals[vbase + c] = 0.0f;
-                    }
-                }
-            } else {
-                for (int c = 0; c < nc; c++) vals[vbase + c] = 0.0f;
-                for (unsigned int ci = child_start[i]; ci < child_start[i + 1]; ci++) {
-                    const float* cv = vals + voff[child[ci]];
-                    for (int c = 0; c < nc; c++) vals[vbase + c] += cv[c];
-                }
+        } else {
+            for (int c = lane; c < nc; c += 32) vals[vbase + c] = src[c];
+        }
+        return;
+    }
+    int na = na_of(d, i);
+    int so = (int)T_soff(d)[i];
+    if (me != traverser) {
+        for (int c = lane; c < nc; c += 32) {
+            float acc = 0.0f;
+            for (unsigned int ci = child_start[i]; ci < child_start[i + 1]; ci++) {
+                acc += vals[voff[child[ci]] + c];
+            }
+            vals[vbase + c] = acc;
+        }
+        return;
+    }
+    // The configs of a node are independent, and a node can have hundreds of
+    // them, so they go one per config rather than all to one thread. The
+    // node's value accumulates in a register: leaving it in `vals` would make
+    // every action a read-modify-write of global memory.
+    float neg_inf = -INFINITY_F;
+    for (int c = lane; c < nc; c += 32) {
+        float acc = mode == 2 ? neg_inf : 0.0f;
+        for (int a = 0; a < na; a++) {
+            int cell = so + c * na + a;
+            if (mode == 0) inst[cell] = 0.0f;
+            if (!legal_cell(d, cell)) continue;
+            int tr = T_trans(d)[cell];
+            if (tr < 0) continue;
+            int ch = (int)child[child_start[i] + T_obs_child(d)[T_act_off(d)[i] + a]];
+            float av = vals[voff[ch] + tr];
+            if (mode == 0) {
+                inst[cell] = av;
+                acc += av * strat[cell];
+            } else if (mode == 1) {
+                acc += av * strat[cell];
+            } else if (av > acc) {
+                acc = av;
             }
         }
-        __syncthreads();
+        if (mode == 2 && acc == neg_inf) acc = 0.0f;
+        vals[vbase + c] = acc;
+        if (mode == 0) {
+            for (int a = 0; a < na; a++) {
+                int cell = so + c * na + a;
+                if (legal_cell(d, cell)) inst[cell] -= acc;
+            }
+        }
     }
 }
 
@@ -359,7 +416,7 @@ extern "C" __global__ void backprop(const Desc* descs, const Group* g, const Ctx
 // the instantaneous regret, clamp, normalise per config, discount sum_strat.
 // Only the traverser's decision nodes are touched.
 extern "C" __global__ void regret_match(const Desc* descs, const Group* g, const Ctx* ctx) {
-    FLAT_THREAD(d, t)
+    FLAT_WARP(d, t, lane)
     int i = (int)T_bfs_order(d)[t];
     if (T_node_kind(d)[i] != 0 || T_node_player(d)[i] != d->traverser) return;
     float m = (float)(d->steps[d->traverser] + 1);
@@ -372,7 +429,8 @@ extern "C" __global__ void regret_match(const Desc* descs, const Group* g, const
     float* regret = A_regret(d);
     float* inst = A_inst(d);
     float* cur = A_cur(d);
-    for (int c = 0; c < nc; c++) {
+    float* sum_strat = A_sum_strat(d);
+    for (int c = lane; c < nc; c += 32) {
         float sum = 0.0f;
         for (int a = 0; a < na; a++) {
             int cell = so + c * na + a;
@@ -390,100 +448,105 @@ extern "C" __global__ void regret_match(const Desc* descs, const Group* g, const
             float inv = 1.0f / sum;
             for (int a = 0; a < na; a++) cur[so + c * na + a] *= inv;
         }
+        for (int a = 0; a < na; a++) sum_strat[so + c * na + a] *= ds;
     }
-    float* sum_strat = A_sum_strat(d);
-    for (int j = 0; j < nc * na; j++) sum_strat[so + j] *= ds;
 }
 
 // ------------------------------------------------------- phase 6: forward reach
 
-// One block per solve; levels sequential; one thread per node. Ports
-// Solver::propagate, chance CSR included.
+// Clear the reach arena. The forward sweep accumulates into the child blocks,
+// so it starts clean on every pass, as Solver::propagate refills it.
+extern "C" __global__ void reach_clear(const Desc* descs, const Group* g, const Ctx* ctx) {
+    FLAT_THREAD(d, i)
+    A_reach(d)[i] = 0.0f;
+}
+
+// Seed the root block from the belief this pass propagates: the live root
+// while iterating, each carried root in turn during the value stage.
+extern "C" __global__ void reach_seed(const Desc* descs, const Group* g, const Ctx* ctx) {
+    FLAT_THREAD(d, i)
+    int p = i < d->nc_root[0] ? 0 : 1;
+    int c = p == 0 ? i : i - d->nc_root[0];
+    A_reach(d)[reach_at(d, 0, p, c)] = root_of(d)[i];
+}
+
+// One launch per level, one thread per node in it. Ports Solver::propagate,
+// chance CSR included. Like the backward sweep, a launch per level replaces
+// the per-solve block and its __syncthreads.
 extern "C" __global__ void propagate(const Desc* descs, const Group* g, const Ctx* ctx) {
-    BLOCK_SOLVE(d)
+    FLAT_WARP(d, at, lane)
+    int lev = g->level;
+    if (lev >= d->nlevels) return;
+    int i = (int)T_bfs_order(d)[T_level_start(d)[lev] + at];
+    int kind = T_node_kind(d)[i];
+    if (kind == 2) return;
     const float* strat = strat_of(d, g);
     float* reach = A_reach(d);
-    // The sweep accumulates into the child blocks, so the arena starts clean
-    // on every pass, exactly as Solver::propagate refills it.
-    for (int c = threadIdx.x; c < A_len_reach(d); c += blockDim.x) reach[c] = 0.0f;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        const float* root = root_of(d);
-        for (int p = 0; p < 2; p++) {
-            int n = d->nc_root[p];
-            float* dst = reach + reach_at(d, 0, p, 0);
-            const float* src = root + (p == 1 ? d->nc_root[0] : 0);
-            for (int c = 0; c < n; c++) dst[c] = src[c];
-        }
-    }
-    __syncthreads();
-    const unsigned int* ls = T_level_start(d);
-    const unsigned int* order = T_bfs_order(d);
     const unsigned int* child_start = T_node_child_start(d);
     const unsigned int* child = T_node_child(d);
     const unsigned int* reach_off = T_reach_off(d);
-    for (int lev = 0; lev < d->nlevels; lev++) {
-        int lo = (int)ls[lev], hi = (int)ls[lev + 1];
-        for (int i0 = lo + threadIdx.x; i0 < hi; i0 += blockDim.x) {
-            int i = (int)order[i0];
-            int kind = T_node_kind(d)[i];
-            if (kind == 2) continue;
-            int me = T_node_player(d)[i];
-            int op = 1 - me;
-            int n_me = nc_of(d, i, me);
-            int n_op = nc_of(d, i, op);
-            int base = (int)reach_off[i];
-            int n0_i = nc_of(d, i, 0);
-            int me_at = base + (me == 1 ? n0_i : 0);
-            int op_at = base + (op == 1 ? n0_i : 0);
-            const float* src_me = reach + me_at;
-            if (kind == 1) {  // chance
-                int ch = (int)child[child_start[i]];
-                int cbase = (int)reach_off[ch];
-                int n0_c = nc_of(d, ch, 0);
-                int c_me_at = cbase + (me == 1 ? n0_c : 0);
-                int c_op_at = cbase + (op == 1 ? n0_c : 0);
-                for (int c = 0; c < n_op; c++) reach[c_op_at + c] = reach[op_at + c];
-                int d0 = (int)T_draw_off(d)[i];
-                const unsigned int* b = T_draw_row_start(d) + T_draw_row_off(d)[i];
-                for (int c = 0; c < n_me; c++) {
-                    float wc = src_me[c];
-                    if (wc == 0.0f) continue;
-                    for (int k = (int)b[c]; k < (int)b[c + 1]; k++) {
-                        reach[c_me_at + T_draw_to(d)[d0 + k]] += wc * T_draw_p(d)[d0 + k];
-                    }
-                }
-                continue;
-            }
-            int na = na_of(d, i);
-            int so = (int)T_soff(d)[i];
-            const float* cur = strat + so;
-            int o0 = (int)T_obs_off(d)[i];
-            int act_base = (int)T_act_off(d)[i];
-            unsigned int first_ch = child_start[i];
-            unsigned int nch = child_start[i + 1] - first_ch;
-            for (unsigned int ci = 0; ci < nch; ci++) {
-                int ch = (int)child[first_ch + ci];
-                int cbase = (int)reach_off[ch];
-                int n0_c = nc_of(d, ch, 0);
-                int c_me_at = cbase + (me == 1 ? n0_c : 0);
-                int c_op_at = cbase + (op == 1 ? n0_c : 0);
-                for (int c = 0; c < n_op; c++) reach[c_op_at + c] = reach[op_at + c];
-                unsigned int a0 = T_obs_start(d)[o0 + ci];
-                unsigned int a1 = T_obs_start(d)[o0 + ci + 1];
-                for (unsigned int ai = a0; ai < a1; ai++) {
-                    int a = (int)T_obs_act(d)[act_base + ai];
-                    for (int c = 0; c < n_me; c++) {
-                        int cell = so + c * na + a;
-                        if (!legal_cell(d, cell)) continue;
-                        int tr = T_trans(d)[cell];
-                        if (tr < 0) continue;
-                        reach[c_me_at + tr] += src_me[c] * cur[c * na + a];
-                    }
-                }
+    int me = T_node_player(d)[i];
+    int op = 1 - me;
+    int n_me = nc_of(d, i, me);
+    int n_op = nc_of(d, i, op);
+    int base = (int)reach_off[i];
+    int n0_i = nc_of(d, i, 0);
+    int me_at = base + (me == 1 ? n0_i : 0);
+    int op_at = base + (op == 1 ? n0_i : 0);
+    const float* src_me = reach + me_at;
+    if (kind == 1) {  // chance
+        int ch = (int)child[child_start[i]];
+        int cbase = (int)reach_off[ch];
+        int n0_c = nc_of(d, ch, 0);
+        int c_me_at = cbase + (me == 1 ? n0_c : 0);
+        int c_op_at = cbase + (op == 1 ? n0_c : 0);
+        for (int c = lane; c < n_op; c += 32) reach[c_op_at + c] = reach[op_at + c];
+        int d0 = (int)T_draw_off(d)[i];
+        const unsigned int* b = T_draw_row_start(d) + T_draw_row_off(d)[i];
+        // The draw rows of one config are disjoint in the child block, but
+        // different configs can reach the same one, so the config loop stays
+        // whole and only lane 0 runs it.
+        if (lane != 0) return;
+        for (int c = 0; c < n_me; c++) {
+            float wc = src_me[c];
+            if (wc == 0.0f) continue;
+            for (int k = (int)b[c]; k < (int)b[c + 1]; k++) {
+                reach[c_me_at + T_draw_to(d)[d0 + k]] += wc * T_draw_p(d)[d0 + k];
             }
         }
-        __syncthreads();
+        return;
+    }
+    int na = na_of(d, i);
+    int so = (int)T_soff(d)[i];
+    const float* cur = strat + so;
+    int o0 = (int)T_obs_off(d)[i];
+    int act_base = (int)T_act_off(d)[i];
+    unsigned int first_ch = child_start[i];
+    unsigned int nch = child_start[i + 1] - first_ch;
+    // A lane per public child. The scatter below accumulates into the child's
+    // reach block, and a child has one parent, so lanes never collide —
+    // whereas splitting the config loop would, since different parent configs
+    // reach the same child config (measured: often). Atomics would fix that
+    // and give up the fixed reduction order the service promises.
+    for (unsigned int ci = lane; ci < nch; ci += 32) {
+        int ch = (int)child[first_ch + ci];
+        int cbase = (int)reach_off[ch];
+        int n0_c = nc_of(d, ch, 0);
+        int c_me_at = cbase + (me == 1 ? n0_c : 0);
+        int c_op_at = cbase + (op == 1 ? n0_c : 0);
+        for (int c = 0; c < n_op; c++) reach[c_op_at + c] = reach[op_at + c];
+        unsigned int a0 = T_obs_start(d)[o0 + ci];
+        unsigned int a1 = T_obs_start(d)[o0 + ci + 1];
+        for (unsigned int ai = a0; ai < a1; ai++) {
+            int a = (int)T_obs_act(d)[act_base + ai];
+            for (int c = 0; c < n_me; c++) {
+                int cell = so + c * na + a;
+                if (!legal_cell(d, cell)) continue;
+                int tr = T_trans(d)[cell];
+                if (tr < 0) continue;
+                reach[c_me_at + tr] += src_me[c] * cur[c * na + a];
+            }
+        }
     }
 }
 
@@ -492,7 +555,7 @@ extern "C" __global__ void propagate(const Desc* descs, const Group* g, const Ct
 // One thread per node. Ports the AVG block of Solver::step; must run after the
 // forward sweep, because it reads the fresh reaches.
 extern "C" __global__ void average(const Desc* descs, const Group* g, const Ctx* ctx) {
-    FLAT_THREAD(d, t)
+    FLAT_WARP(d, t, lane)
     int i = (int)T_bfs_order(d)[t];
     if (T_node_kind(d)[i] != 0 || T_node_player(d)[i] != d->traverser) return;
     int nc = nc_of(d, i, d->traverser);
@@ -502,7 +565,7 @@ extern "C" __global__ void average(const Desc* descs, const Group* g, const Ctx*
     float* sum_strat = A_sum_strat(d);
     float* avg = A_avg(d);
     const float* cur = A_cur(d);
-    for (int c = 0; c < nc; c++) {
+    for (int c = lane; c < nc; c += 32) {
         float sum = 0.0f;
         for (int a = 0; a < na; a++) {
             int cell = so + c * na + a;
@@ -663,9 +726,9 @@ extern "C" __global__ void assemble(const Desc* descs, const Group* g, const Ctx
 
 // LN0 + ReLU over the trunk's hidden rows, in the h pool. One thread per row.
 extern "C" __global__ void trunk_norm(const Desc* descs, const Group* g, const Ctx* ctx) {
-    FLAT_THREAD(d, row)
+    FLAT_WARP(d, row, lane)
     int hidden = ctx->hidden;
-    ln_relu_row(ctx->bh + (size_t)row * hidden, ctx->b0, ctx->ln0w, ctx->ln0b, 0, hidden);
+    ln_relu_warp(ctx->bh + (size_t)row * hidden, ctx->b0, ctx->ln0w, ctx->ln0b, 0, hidden, lane);
 }
 
 // The holding tower's input rows, [ncfg * NSLOT][4 + de], from cphi and e.

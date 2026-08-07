@@ -52,13 +52,18 @@ fn main() {
             let carried = vec![[bel[0].p.clone(), bel[1].p.clone()]];
             Job::from_solver(&sv, &carried)
         })
+        .filter(|j| !j.tables.leaf_rows.is_empty())
         .collect();
-    let rows: usize = jobs.iter().map(|j| j.tables.nleaf).sum::<usize>() / jobs.len();
-    let nodes: usize = jobs.iter().map(|j| j.tables.nodes).sum::<usize>() / jobs.len();
+    assert!(!jobs.is_empty(), "no usable jobs");
+    let mut sizes: Vec<usize> = jobs.iter().map(|j| j.tables.rows).collect();
+    sizes.sort_unstable();
+    let rows: usize = sizes.iter().sum::<usize>() / sizes.len();
     eprintln!(
-        "{} jobs in {:.1}s (mean {rows} network rows, {nodes} nodes)",
+        "{} jobs in {:.1}s: rows/solve mean {rows}, median {}, max {}",
         jobs.len(),
-        t0.elapsed().as_secs_f64()
+        t0.elapsed().as_secs_f64(),
+        sizes[sizes.len() / 2],
+        sizes[sizes.len() - 1],
     );
 
     let (dims, w, b, ln) = weights();
