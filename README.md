@@ -84,10 +84,10 @@ so what a run reports is strength against minutes trained, with Random at 0.
 reruns it with more games.
 
 War Chest turns out to be an unusually good fit for ReBeL. A player's private
-state is exactly `(hand, face-down discards)` — the bag is derived from a public
-reserve — and the reachable set has median 8 and p99 385 members, so CFR
-enumerates information states exactly instead of approximating them with
-particles. The value network is a function of that exact private state, not of a
+state is `(hand, face-down discards, pending forced-play coin)` — the bag is
+derived from a public reserve — and the reachable set has median 22 and p99 567
+members with the full draft pool, so CFR enumerates information states exactly
+instead of approximating them with particles. The value network is a function of that exact private state, not of a
 summary of it: `docs/REBEL.md` §4 explains why the alternative is not an
 approximation but a different game.
 
