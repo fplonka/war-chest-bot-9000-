@@ -49,8 +49,8 @@
 
 use crate::board::N_HEXES;
 use crate::rebel::{
-    AOFF_PAYS, CCOUNTS, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_CARDS, OFF_LOOSE, OFF_PILES,
-    PILE_COUNTS, PUBFEAT,
+    AFEAT, AOFF_PAYS, CCOUNTS, CFEAT, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_CARDS,
+    OFF_LOOSE, OFF_PILES, PILE_COUNTS, PUBFEAT,
 };
 use crate::units::CARD_FEATS;
 
@@ -387,223 +387,355 @@ pub fn fit(v: &mut Vec<f32>, n: usize) {
     }
 }
 
-/// The value network. See the module docs for the shape; the field names here
-/// are the same symbols.
+/// One linear layer: row-major `[i, o]` weights and an `o`-long bias.
 ///
-/// Every matrix is row-major `[in, out]`. `dims` is `[pub_dim, hidden, head,
-/// cfeat, dg, rank, afeat, de, dc]` and is the single source of truth for
-/// every buffer size, so the trainer and the workers agree on the layout from
-/// one array. `head` is the width of the second public matrix, the belief
-/// projection, the second LayerNorm and both readouts; `head == hidden` is
-/// the pre-split network. All widths are checkpoint metadata.
+/// The whole network is chains of these. Depth and width live in the chain
+/// lengths and layer shapes, which come from the checkpoint (`dims`), so a
+/// deeper or narrower tower is a different checkpoint, never different code.
+#[derive(Clone, Default)]
+pub struct Lin {
+    w: Vec<f32>,
+    b: Vec<f32>,
+    pub i: usize,
+    pub o: usize,
+}
+
+impl Lin {
+    /// `out[rows, o] += src[rows, i] . w` (or `=` when `beta` is 0). `lda` is
+    /// the row stride of `src`, so a chain can read a sub-block of a wider
+    /// matrix without copying it.
+    fn gemm(&self, src: &[f32], rows: usize, lda: usize, beta: f32, out: &mut [f32]) {
+        gemm_ld(rows, self.o, self.i, src, lda, &self.w, self.o, beta, out, self.o);
+    }
+
+    fn bias(&self, rows: usize, out: &mut [f32]) {
+        for r in 0..rows {
+            let row = &mut out[r * self.o..(r + 1) * self.o];
+            for (x, b) in row.iter_mut().zip(&self.b) {
+                *x += *b;
+            }
+        }
+    }
+
+    fn bias_relu(&self, rows: usize, out: &mut [f32]) {
+        for r in 0..rows {
+            let row = &mut out[r * self.o..(r + 1) * self.o];
+            for (x, b) in row.iter_mut().zip(&self.b) {
+                *x += *b;
+            }
+            relu(row);
+        }
+    }
+}
+
+/// A cursor over one of the flat weight arrays the trainer ships.
+struct Cur<'a> {
+    v: &'a [f32],
+    at: usize,
+    what: &'static str,
+}
+
+impl<'a> Cur<'a> {
+    fn new(v: &'a [f32], what: &'static str) -> Cur<'a> {
+        Cur { v, at: 0, what }
+    }
+    fn take(&mut self, n: usize) -> Result<Vec<f32>, String> {
+        if self.at + n > self.v.len() {
+            return Err(format!(
+                "{} array too short: need {} past {}, have {}",
+                self.what, n, self.at, self.v.len()
+            ));
+        }
+        let out = self.v[self.at..self.at + n].to_vec();
+        self.at += n;
+        Ok(out)
+    }
+    fn done(&self) -> Result<(), String> {
+        if self.at != self.v.len() {
+            return Err(format!(
+                "{} array too long: read {}, have {}",
+                self.what, self.at, self.v.len()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The value network, as tower chains. See the module docs for the shape; the
+/// wiring between towers is fixed (it is the game-specific part: the card
+/// table, the set sums, the belief sums, the bilinear readout), while every
+/// tower's depth and width comes from the checkpoint.
+///
+/// Towers, in the order the data flows:
+///
+/// * `card`: `CARD_FEATS -> ... -> de`, ReLU between, linear out, `wid[id]`
+///   added. One row per coin type, once per solve.
+/// * `pile`: one shared layer over `[4 counts | e]`, summed per player.
+/// * `pub_lin` + `pub_ln`: the public trunk. Every layer is
+///   `relu(LN(x W + b))`; `pub_out` then projects to the head width with *no*
+///   norm — its bias is applied at the head entry, inside `ln1`. That split
+///   is what lets a solve cache `h0` and re-run only the head per iteration.
+/// * `hmlp` + `wu`: the per-iteration head. Entry:
+///   `relu(LN1(h0 + [b_me|b_opp] Wb))`, then plain ReLU layers, then the
+///   readout `u`.
+/// * `slot` + `slot_out`: the holding tower, per coin-type row, rectified and
+///   summed over the five slots; `res` blocks refine the sum
+///   (`z += B(relu(A z))`); `wg` reads out `[rank + 1]`.
+/// * `wq`/`wk`/`wp`: the policy readout's three matrices.
 #[derive(Clone, Default)]
 pub struct Mlp {
-    /// `[pub_dim, hidden, cfeat, dg, rank]`.
+    /// The checkpoint's shape vector, verbatim (v3: see `from_flat_v3`).
     pub dims: Vec<usize>,
-    /// Public tower.
-    w0: Vec<f32>,
-    b0: Vec<f32>,
-    ln0_w: Vec<f32>,
-    ln0_b: Vec<f32>,
-    w1: Vec<f32>,
-    b1: Vec<f32>,
-    ln1_w: Vec<f32>,
-    ln1_b: Vec<f32>,
-    /// `[2 * dg, hidden]`: both players' belief embeddings into the hidden
-    /// layer. No bias — it is added to a layer that already has one.
-    wb: Vec<f32>,
-    /// Config tower: `[cfeat, dg]` and its bias. The per-card sum `s` then
-    /// passes through a residual MLP (`wh1`/`wh2`, both `[dg, dg]`) whose
-    /// second stage starts zeroed, so the network begins exactly as the
-    /// additive tower and can learn card combinations.
-    wc: Vec<f32>,
-    bc: Vec<f32>,
-    wh1: Vec<f32>,
-    bh1: Vec<f32>,
-    wh2: Vec<f32>,
-    bh2: Vec<f32>,
-    /// Readout embedding: `[dg, rank + 1]` and its bias. The trailing column is
-    /// the per-config bias term, which is why this is `rank + 1` and not `rank`.
-    wg: Vec<f32>,
-    bg: Vec<f32>,
-    /// The PBS side of the readout: `[hidden, rank]` and its bias.
-    wu: Vec<f32>,
-    bu: Vec<f32>,
-    // ------------------------------------------------------------ policy head
-    // Three more matrices, sharing both towers with the value. An action is
-    // described rather than indexed (`rebel::write_action_feats`), so this is an
-    // embedding network over a node-dependent action list instead of a
-    // fixed-width output vector — the same substitution the config tower makes,
-    // and for the same reason.
-    //
-    //   q(a)       = relu(psi(a) Wq + bq)          [rank]
-    //   logit(a,c) = <u_pi + k(c), q(a)>
-    //
-    // where `u_pi = h Wp + bp` comes from the PBS hidden layer the value
-    // readout also reads, and `k(c) = z(c) Wk + bk` from the config embedding.
-    /// Action tower: `[afeat, rank]` and its bias.
-    wq: Vec<f32>,
-    bq: Vec<f32>,
-    /// The config side of the policy readout: `[dg, rank]` and its bias.
-    wk: Vec<f32>,
-    bk: Vec<f32>,
-    /// The PBS side of the policy readout: `[hidden, rank]` and its bias.
-    wp: Vec<f32>,
-    bp: Vec<f32>,
-    // -------------------------------------------------------- card describer
-    // `e(card) = relu(card Wd0 + bd0) Wd1 + bd1`, `[NTYPE, de]`. Runs once per
-    // game: the cards in play do not change. Everything else that refers to a
-    // card — the hex block, the pile summary, the holding tower, the action
-    // tower — refers to it by coin-type index and reads its row out of this
-    // table, so nothing anywhere names a *unit*, and a draft the network has
-    // never seen is describable rather than an unknown identity code.
-    wd0: Vec<f32>,
-    bd0: Vec<f32>,
-    wd1: Vec<f32>,
-    bd1: Vec<f32>,
-    /// Learned per-unit identity embedding `[N_UNITS, de]`, added to the
-    /// describer's fact output: the facts let related cards share learning,
-    /// the id lets an individual card be memorised. Both paths together.
+    v1: bool,
+    de: usize,
+    dg: usize,
+    rank: usize,
+    head_in: usize,
+    card: Vec<Lin>,
+    /// Learned per-unit identity embedding `[N_UNITS, de]`.
     wid: Vec<f32>,
-    /// Pile summary: `[PILE_COUNTS + de, de]` and its bias. Per coin type, its
-    /// four public counts alongside its card embedding, summed per player. A sum
-    /// has no order, so any draft fits.
-    wpile: Vec<f32>,
-    bpile: Vec<f32>,
+    pile: Lin,
+    pub_lin: Vec<Lin>,
+    pub_ln: Vec<(Vec<f32>, Vec<f32>)>,
+    pub_out: Lin,
+    /// `[2 * dg, head_in]`, no bias — it feeds a layer that already has one.
+    wb: Vec<f32>,
+    ln1: (Vec<f32>, Vec<f32>),
+    hmlp: Vec<Lin>,
+    wu: Lin,
+    slot: Vec<Lin>,
+    slot_out: Lin,
+    res: Vec<(Lin, Lin)>,
+    wg: Lin,
+    wq: Lin,
+    wk: Lin,
+    wp: Lin,
 }
 
 impl Mlp {
-    /// Build from the flat arrays the trainer ships. `w` is every matrix
-    /// concatenated in the order `W0, W1, Wb, Wc, Wg`; `b` is `b0, b1, bc, bg`;
-    /// `ln` is `LN0.weight, LN0.bias, LN1.weight, LN1.bias`.
-    ///
-    /// One function builds the network for both entry points — the pyo3
-    /// `set_weights` and the `.bin` loader — so there is nowhere for the two to
-    /// drift apart.
+    /// Build from the flat arrays the trainer ships. Three formats load:
+    /// v3 (`dims[0] == 3`, the tower format below), v2 (the frozen 10-entry
+    /// fixed layout), and v1 (5 entries, pre-describer). All three land in
+    /// the same tower representation; only parsing differs.
     pub fn from_flat(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Mlp, String> {
-        // A five-entry `dims` is a checkpoint from before the card describer.
-        // It is loadable so the pool can still be played against; see `v1`.
         if dims.len() == 5 {
             return Mlp::from_flat_v1(dims, w, b, ln);
         }
-        if dims.len() != 10 {
-            return Err(format!(
-                "expected 10 dims [pub, hidden, head, cfeat, dg, rank, afeat, de, dc, enc], got {dims:?}"
-            ));
+        if dims.first() == Some(&3) {
+            return Mlp::from_flat_v3(dims, w, b, ln);
         }
+        if dims.len() == 10 {
+            return Mlp::from_flat_v2(dims, w, b, ln);
+        }
+        Err(format!("unrecognised dims {dims:?}"))
+    }
+
+    /// The v3 tower format:
+    ///
+    /// ```text
+    /// dims = [3, de, dg, rank, head_in, nres,
+    ///         |card|, card widths...,     // hidden widths, CARD_FEATS -> .. -> de
+    ///         |pub|,  pub widths...,      // LN+ReLU layers, xdim -> .. (>= 1)
+    ///         |hmlp|, hmlp widths...,     // extra ReLU head layers (may be 0)
+    ///         |slot|, slot widths...]     // hidden widths, hfeat -> .. -> dg
+    /// ```
+    ///
+    /// Weight blob order (each matrix row-major `[in, out]`): card layers,
+    /// wid, pile, pub layers, pub_out, wb, hmlp layers, wu, slot layers,
+    /// slot_out, res pairs, wg, wq, wk, wp. Biases in the same order (wid and
+    /// wb have none). LayerNorms: one (gain, bias) pair per pub layer, then
+    /// ln1. `train/value_net.py::flat` writes this and nothing else knows it.
+    fn from_flat_v3(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Mlp, String> {
+        let mut at = 1;
+        let mut scalar = |name: &str| -> Result<usize, String> {
+            let v = *dims.get(at).ok_or(format!("dims truncated at {name}"))?;
+            at += 1;
+            Ok(v)
+        };
+        let (de, dg, rank, head_in, nres) = (
+            scalar("de")?, scalar("dg")?, scalar("rank")?, scalar("head_in")?, scalar("nres")?,
+        );
+        let mut list = |name: &str| -> Result<Vec<usize>, String> {
+            let n = *dims.get(at).ok_or(format!("dims truncated at {name}"))?;
+            at += 1;
+            if at + n > dims.len() {
+                return Err(format!("dims truncated inside {name}"));
+            }
+            let v = dims[at..at + n].to_vec();
+            at += n;
+            Ok(v)
+        };
+        let (card_w, pub_w, hmlp_w, slot_w) =
+            (list("card")?, list("pub")?, list("hmlp")?, list("slot")?);
+        if at != dims.len() {
+            return Err(format!("dims has {} trailing entries", dims.len() - at));
+        }
+        if pub_w.is_empty() {
+            return Err("the public tower needs at least one layer".into());
+        }
+
+        let (mut cw, mut cb, mut cl) = (Cur::new(w, "w"), Cur::new(b, "b"), Cur::new(ln, "ln"));
+        let lin = |cw: &mut Cur, cb: &mut Cur, i: usize, o: usize| -> Result<Lin, String> {
+            Ok(Lin { w: cw.take(i * o)?, b: cb.take(o)?, i, o })
+        };
+        let chain = |cw: &mut Cur, cb: &mut Cur, first: usize, hidden: &[usize], last: usize|
+            -> Result<Vec<Lin>, String> {
+            let mut v = Vec::new();
+            let mut prev = first;
+            for &h in hidden {
+                v.push(Lin { w: cw.take(prev * h)?, b: cb.take(h)?, i: prev, o: h });
+                prev = h;
+            }
+            v.push(Lin { w: cw.take(prev * last)?, b: cb.take(last)?, i: prev, o: last });
+            Ok(v)
+        };
+
+        // Card tower ends at `de`; the chain helper appends that final layer.
+        let card = chain(&mut cw, &mut cb, CARD_FEATS, &card_w, de)?;
+        let wid = cw.take(crate::units::N_UNITS * de)?;
+        let pile = lin(&mut cw, &mut cb, PILE_COUNTS + de, de)?;
+        let mut pub_lin = Vec::new();
+        let mut prev = xdim_of(de);
+        for &h in &pub_w {
+            pub_lin.push(lin(&mut cw, &mut cb, prev, h)?);
+            prev = h;
+        }
+        let pub_out = lin(&mut cw, &mut cb, prev, head_in)?;
+        let wb = cw.take(2 * dg * head_in)?;
+        let mut hmlp = Vec::new();
+        let mut prev = head_in;
+        for &h in &hmlp_w {
+            hmlp.push(lin(&mut cw, &mut cb, prev, h)?);
+            prev = h;
+        }
+        let wu = lin(&mut cw, &mut cb, prev, rank)?;
+        let head_out = prev;
+        let mut slot = Vec::new();
+        let mut prev = hfeat(de);
+        for &h in &slot_w {
+            slot.push(lin(&mut cw, &mut cb, prev, h)?);
+            prev = h;
+        }
+        let slot_out = lin(&mut cw, &mut cb, prev, dg)?;
+        let mut res = Vec::new();
+        for _ in 0..nres {
+            let a = lin(&mut cw, &mut cb, dg, dg)?;
+            let bb = lin(&mut cw, &mut cb, dg, dg)?;
+            res.push((a, bb));
+        }
+        let wg = lin(&mut cw, &mut cb, dg, rank + 1)?;
+        let wq = lin(&mut cw, &mut cb, AFEAT + de, rank)?;
+        let wk = lin(&mut cw, &mut cb, dg, rank)?;
+        let wp = lin(&mut cw, &mut cb, head_out, rank)?;
+        let mut pub_ln = Vec::new();
+        for &h in &pub_w {
+            pub_ln.push((cl.take(h)?, cl.take(h)?));
+        }
+        let ln1 = (cl.take(head_in)?, cl.take(head_in)?);
+        cw.done()?;
+        cb.done()?;
+        cl.done()?;
+        Ok(Mlp {
+            dims: dims.to_vec(),
+            v1: false,
+            de, dg, rank, head_in,
+            card, wid, pile, pub_lin, pub_ln, pub_out, wb, ln1, hmlp, wu,
+            slot, slot_out, res, wg, wq, wk, wp,
+        })
+    }
+
+    /// The frozen 10-entry fixed layout, kept so `.bin` weight dumps and old
+    /// checkpoints still load. It is the v3 network with `card = [dc]`,
+    /// `pub = [hidden]`, `hmlp = []`, `slot = []`, `nres = 1`.
+    fn from_flat_v2(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Mlp, String> {
         if dims[9] != 0 {
             return Err(format!(
-                "encoder {} (hex) is not implemented in Rust yet; only 0 (flat) ships",
+                "encoder {} (hex) is not implemented in Rust; only 0 (flat) ships",
                 dims[9]
             ));
         }
         let (h, hd, dg, rk, de, dc) = (dims[1], dims[2], dims[4], dims[5], dims[7], dims[8]);
+        let v3 = vec![3, de, dg, rk, hd, 1, 1, dc, 1, h, 0, 0];
+        // The v2 blob orders the matrices differently, so reorder rather than
+        // reparse: slice the old layout, concatenate in v3 order.
+        let seg = |lens: &[usize]| -> Vec<(usize, usize)> {
+            let mut at = 0;
+            lens.iter().map(|&n| { let s = at; at += n; (s, at) }).collect()
+        };
         let (af, hf, xd) = (dims[6] + de, hfeat(de), xdim_of(de));
-        // The learned per-unit identity table is `[N_UNITS, de]`; the unit
-        // count is a game constant, so it needs no dims entry.
-        let want_w = CARD_FEATS * dc
-            + dc * de
-            + crate::units::N_UNITS * de
-            + (PILE_COUNTS + de) * de
-            + xd * h
-            + h * hd
-            + 2 * dg * hd
-            + hf * dg
-            + dg * dg          // holding residual, stage one
-            + dg * dg          // holding residual, stage two
-            + dg * (rk + 1)
-            + hd * rk
-            + af * rk
-            + dg * rk
-            + hd * rk;
-        let want_b = dc + de + de + h + hd + dg + dg + dg + (rk + 1) + 4 * rk;
-        let want_ln = h + hd + h + hd;
-        if w.len() != want_w || b.len() != want_b || ln.len() != want_ln {
+        let ws = seg(&[CARD_FEATS * dc, dc * de, crate::units::N_UNITS * de,
+                       (PILE_COUNTS + de) * de, xd * h, h * hd, 2 * dg * hd, hf * dg,
+                       dg * dg, dg * dg, dg * (rk + 1), hd * rk, af * rk, dg * rk, hd * rk]);
+        let bs = seg(&[dc, de, de, h, hd, dg, dg, dg, rk + 1, rk, rk, rk, rk]);
+        if w.len() != ws.last().unwrap().1 || b.len() != bs.last().unwrap().1
+            || ln.len() != 2 * h + 2 * hd
+        {
             return Err(format!(
-                "weight sizes {}/{}/{} do not match dims {dims:?} (want {want_w}/{want_b}/{want_ln})",
-                w.len(),
-                b.len(),
-                ln.len()
+                "weight sizes {}/{}/{} do not match dims {dims:?}",
+                w.len(), b.len(), ln.len()
             ));
         }
-        let mut wi = 0usize;
-        let mut take = |n: usize| {
-            let v = w[wi..wi + n].to_vec();
-            wi += n;
-            v
+        let wat = |i: usize| &w[ws[i].0..ws[i].1];
+        let bat = |i: usize| &b[bs[i].0..bs[i].1];
+        // v3 w order: card(wd0,wd1), wid, pile, pub(w0), pub_out(w1), wb,
+        // wu, slot_out(wc), res(wh1,wh2), wg, wq, wk, wp.
+        let w3: Vec<f32> = [wat(0), wat(1), wat(2), wat(3), wat(4), wat(5), wat(6),
+                            wat(11), wat(7), wat(8), wat(9), wat(10), wat(12), wat(13), wat(14)]
+            .concat();
+        // v3 b order: card(bd0,bd1), pile, pub(b0), pub_out(b1), wu(bu),
+        // slot_out(bc), res(bh1,bh2), wg(bg), wq, wk, wp.
+        let b3: Vec<f32> = [bat(0), bat(1), bat(2), bat(3), bat(4), bat(9), bat(5),
+                            bat(6), bat(7), bat(8), bat(10), bat(11), bat(12)]
+            .concat();
+        Mlp::from_flat_v3(&v3, &w3, &b3, ln)
+    }
+
+    /// A pre-describer checkpoint: six matrices, the flat `v1` encoding fed
+    /// straight to the first layer, and a holding tower that is one linear
+    /// map of the counts. Loadable so the pool can still be played against.
+    fn from_flat_v1(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Mlp, String> {
+        let (p, h, cf, dg, rk) = (dims[0], dims[1], dims[2], dims[3], dims[4]);
+        let want_w = p * h + h * h + 2 * dg * h + cf * dg + dg * (rk + 1) + h * rk;
+        let want_b = h + h + dg + (rk + 1) + rk;
+        if w.len() != want_w || b.len() != want_b || ln.len() != 4 * h {
+            return Err(format!("v1 weight sizes do not match dims {dims:?}"));
+        }
+        let (mut cw, mut cb) = (Cur::new(w, "w"), Cur::new(b, "b"));
+        let lin = |cw: &mut Cur, cb: &mut Cur, i: usize, o: usize| -> Result<Lin, String> {
+            Ok(Lin { w: cw.take(i * o)?, b: cb.take(o)?, i, o })
         };
-        let (wd0, wd1, wid, wpile, w0, w1, wb, wc, wh1, wh2, wg, wu, wq, wk, wp) = (
-            take(CARD_FEATS * dc),
-            take(dc * de),
-            take(crate::units::N_UNITS * de),
-            take((PILE_COUNTS + de) * de),
-            take(xd * h),
-            take(h * hd),
-            take(2 * dg * hd),
-            take(hf * dg),
-            take(dg * dg),
-            take(dg * dg),
-            take(dg * (rk + 1)),
-            take(hd * rk),
-            take(af * rk),
-            take(dg * rk),
-            take(hd * rk),
-        );
-        let mut bi = 0usize;
-        let mut takeb = |n: usize| {
-            let v = b[bi..bi + n].to_vec();
-            bi += n;
-            v
-        };
-        let (bd0, bd1, bpile, b0, b1, bc, bh1, bh2, bg, bu, bq, bk, bp) = (
-            takeb(dc),
-            takeb(de),
-            takeb(de),
-            takeb(h),
-            takeb(hd),
-            takeb(dg),
-            takeb(dg),
-            takeb(dg),
-            takeb(rk + 1),
-            takeb(rk),
-            takeb(rk),
-            takeb(rk),
-            takeb(rk),
-        );
+        // Old order: w0, w1, wb, wc, wg, wu; b0, b1, bc, bg, bu.
+        let w0 = Lin { w: cw.take(p * h)?, b: cb.take(h)?, i: p, o: h };
+        let w1w = cw.take(h * h)?;
+        let wb = cw.take(2 * dg * h)?;
+        let wcw = cw.take(cf * dg)?;
+        let b1 = cb.take(h)?;
+        let bc = cb.take(dg)?;
+        let wg = lin(&mut cw, &mut cb, dg, rk + 1)?;
+        let wu = lin(&mut cw, &mut cb, h, rk)?;
+        cw.done()?;
+        cb.done()?;
         Ok(Mlp {
             dims: dims.to_vec(),
-            w0,
-            b0,
-            ln0_w: ln[..h].to_vec(),
-            ln0_b: ln[h..2 * h].to_vec(),
-            w1,
-            b1,
-            ln1_w: ln[2 * h..2 * h + hd].to_vec(),
-            ln1_b: ln[2 * h + hd..2 * h + 2 * hd].to_vec(),
+            v1: true,
+            de: 0, dg, rank: rk, head_in: h,
+            card: Vec::new(),
+            wid: Vec::new(),
+            pile: Lin::default(),
+            pub_lin: vec![w0],
+            pub_ln: vec![(ln[..h].to_vec(), ln[h..2 * h].to_vec())],
+            pub_out: Lin { w: w1w, b: b1, i: h, o: h },
             wb,
-            wc,
-            bc,
-            wh1,
-            bh1,
-            wh2,
-            bh2,
-            wg,
-            bg,
+            ln1: (ln[2 * h..3 * h].to_vec(), ln[3 * h..4 * h].to_vec()),
+            hmlp: Vec::new(),
             wu,
-            bu,
-            wq,
-            bq,
-            wk,
-            bk,
-            wp,
-            bp,
-            wd0,
-            bd0,
-            wd1,
-            bd1,
-            wid,
-            wpile,
-            bpile,
+            slot: Vec::new(),
+            slot_out: Lin { w: wcw, b: bc, i: cf, o: dg },
+            res: Vec::new(),
+            wg,
+            wq: Lin::default(),
+            wk: Lin::default(),
+            wp: Lin::default(),
         })
     }
 
@@ -645,110 +777,65 @@ impl Mlp {
     }
     /// Width of the public encoding.
     pub fn pub_dim(&self) -> usize {
-        self.dims[0]
+        if self.v1 { self.dims[0] } else { PUBFEAT }
     }
-    pub fn hidden(&self) -> usize {
-        self.dims[1]
-    }
-    /// Width of the second public matrix and the readouts. A `v1` checkpoint
-    /// predates the split, so its head is its hidden width.
+    /// Width of `h0` and of the head entry (`ln1`).
     pub fn head(&self) -> usize {
-        if self.v1() { self.hidden() } else { self.dims[2] }
+        self.head_in
     }
-    /// Width of one config vector. A pre-describer (`v1`) checkpoint has the
-    /// five-entry dims, so the accessors are version-aware.
+    /// Width the readouts consume: the last head layer's output.
+    pub fn head_out(&self) -> usize {
+        self.hmlp.last().map_or(self.head_in, |l| l.o)
+    }
+    /// Width of one config vector.
     pub fn cfeat(&self) -> usize {
-        if self.v1() { self.dims[2] } else { self.dims[3] }
+        if self.v1 { self.dims[2] } else { CFEAT }
     }
     /// Width of a config embedding, and of one player's belief block.
     pub fn dg(&self) -> usize {
-        if self.v1() { self.dims[3] } else { self.dims[4] }
+        self.dg
     }
     /// Width of the value readout's inner product.
     pub fn rank(&self) -> usize {
-        if self.v1() { self.dims[4] } else { self.dims[5] }
+        self.rank
     }
     /// Width of both players' belief blocks together.
     pub fn belief_dim(&self) -> usize {
-        2 * self.dg()
+        2 * self.dg
     }
-    /// Width of one stored action vector, before the paying card's embedding is
-    /// appended. A `v1` checkpoint has no policy head.
+    /// Width of one stored action vector, before the paying card's embedding.
     pub fn afeat(&self) -> usize {
-        if self.v1() { 0 } else { self.dims[6] }
+        if self.v1 { 0 } else { AFEAT }
     }
-    /// Width of a card embedding. A `v1` checkpoint has no card describer.
+    /// Width of a card embedding. Zero for a `v1` checkpoint.
     pub fn de(&self) -> usize {
-        if self.v1() { 0 } else { self.dims[7] }
+        self.de
     }
-    /// Whether this is a checkpoint from before the card describer, which reads
-    /// the frozen `v1` encoding and has no policy head.
+    /// Whether this is a checkpoint from before the card describer.
     pub fn v1(&self) -> bool {
-        self.dims.len() == 5
+        self.v1
     }
     /// Width of the trunk's input, once the card embeddings are spliced in.
     pub fn xdim(&self) -> usize {
-        if self.v1() {
-            self.pub_dim()
-        } else {
-            xdim_of(self.de())
-        }
+        if self.v1 { self.pub_dim() } else { xdim_of(self.de) }
     }
-
-    /// A pre-describer checkpoint: six matrices, the flat public encoding fed
-    /// straight to `W0`, and a holding tower that is one linear map of the
-    /// counts. Frozen alongside `v1`'s encoder and deleted with it.
-    fn from_flat_v1(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Mlp, String> {
-        let (p, h, cf, dg, rk) = (dims[0], dims[1], dims[2], dims[3], dims[4]);
-        let want_w = p * h + h * h + 2 * dg * h + cf * dg + dg * (rk + 1) + h * rk;
-        let want_b = h + h + dg + (rk + 1) + rk;
-        if w.len() != want_w || b.len() != want_b || ln.len() != 4 * h {
-            return Err(format!("v1 weight sizes do not match dims {dims:?}"));
-        }
-        let mut wi = 0usize;
-        let mut take = |n: usize| {
-            let v = w[wi..wi + n].to_vec();
-            wi += n;
-            v
-        };
-        let (w0, w1, wb, wc, wg, wu) = (
-            take(p * h),
-            take(h * h),
-            take(2 * dg * h),
-            take(cf * dg),
-            take(dg * (rk + 1)),
-            take(h * rk),
-        );
-        Ok(Mlp {
-            dims: dims.to_vec(),
-            w0,
-            b0: b[..h].to_vec(),
-            ln0_w: ln[..h].to_vec(),
-            ln0_b: ln[h..2 * h].to_vec(),
-            w1,
-            b1: b[h..2 * h].to_vec(),
-            ln1_w: ln[2 * h..3 * h].to_vec(),
-            ln1_b: ln[3 * h..4 * h].to_vec(),
-            wb,
-            wc,
-            bc: b[2 * h..2 * h + dg].to_vec(),
-            wg,
-            bg: b[2 * h + dg..2 * h + dg + rk + 1].to_vec(),
-            wu,
-            bu: b[2 * h + dg + rk + 1..].to_vec(),
-            ..Default::default()
-        })
+    /// The tower shapes, for anything (the GPU service) that mirrors the
+    /// chains: (card, pub widths, pub_out, hmlp widths, slot widths, nres).
+    #[allow(clippy::type_complexity)]
+    pub fn towers(&self) -> (Vec<usize>, Vec<usize>, usize, Vec<usize>, Vec<usize>, usize) {
+        (
+            self.card.iter().map(|l| l.o).collect(),
+            self.pub_lin.iter().map(|l| l.o).collect(),
+            self.head_in,
+            self.hmlp.iter().map(|l| l.o).collect(),
+            self.slot.iter().map(|l| l.o).collect(),
+            self.res.len(),
+        )
     }
 
     /// LayerNorm + ReLU over `rows x n`, in place, with an optional cached
-    /// addend folded into the bias pass.
-    ///
-    /// Written for the vectoriser, not for brevity, because it is the hot half
-    /// of inference: the matmuls run at ~1.3 Tflop/s through AMX, and a
-    /// straightforward `row.iter().sum()` LayerNorm — a serial chain of 3-cycle
-    /// adds, 384 long, twice per row — took **five times** as long as all the
-    /// matmuls put together. The re-association changes the last bits of the
-    /// statistics; `train/test_parity.py` bounds the result against torch.
+    /// addend folded into the bias pass. Hand-vectorised: see the kernels at
+    /// the top of this file for why.
     fn ln_relu(
         &self,
         rows: usize,
@@ -771,98 +858,59 @@ impl Mlp {
         }
     }
 
-    /// The config tower, for `n` config vectors (`phi` is `[n * cfeat]`).
-    /// Produces the belief embedding `z` (`[n * dg]`) and the readout embedding
-    /// `g` (`[n * (rank + 1)]`).
-    ///
-    /// The card table `e`: `[NTYPE, de]`, one embedding per coin type in play.
-    ///
-    /// Reads the card block of any public row — the cards in play are fixed at
-    /// the draft, so every row of a game carries the same block and a solve
-    /// builds this once. `ids` is the per-coin-type unit id in player-major
-    /// slot order (what a replay row stores); the learned id embedding is
-    /// added to the facts' output.
+    /// The card table `e`, `[NTYPE, de]` — one embedding per coin type,
+    /// `relu` chain over the rulebook facts plus the learned id embedding.
+    /// Runs once per solve; every other tower reads rows of the result.
     pub fn cards(&self, xpub_row: &[f32], ids: &[u8], e: &mut Vec<f32>) {
-        if self.v1() {
+        if self.v1 {
             e.clear();
             return;
         }
-        let (de, dc) = (self.de(), self.dims[8]);
+        let de = self.de;
         let cards = &xpub_row[OFF_CARDS..OFF_CARDS + NTYPE * CARD_FEATS];
-        let mut hid = vec![0.0f32; NTYPE * dc];
-        gemm_ld(
-            NTYPE, dc, CARD_FEATS, cards, CARD_FEATS, &self.wd0, dc, 0.0, &mut hid, dc,
-        );
-        for t in 0..NTYPE {
-            let row = &mut hid[t * dc..(t + 1) * dc];
-            for (x, b) in row.iter_mut().zip(self.bd0.iter()) {
-                *x += *b;
-            }
-            relu(row);
+        let mut cur: Vec<f32> = cards.to_vec();
+        let mut nxt = Vec::new();
+        let last = self.card.len() - 1;
+        for l in &self.card[..last] {
+            fit(&mut nxt, NTYPE * l.o);
+            l.gemm(&cur, NTYPE, l.i, 0.0, &mut nxt[..NTYPE * l.o]);
+            l.bias_relu(NTYPE, &mut nxt);
+            std::mem::swap(&mut cur, &mut nxt);
         }
+        let l = &self.card[last];
         fit(e, NTYPE * de);
-        gemm_ld(
-            NTYPE,
-            de,
-            dc,
-            &hid,
-            dc,
-            &self.wd1,
-            de,
-            0.0,
-            &mut e[..NTYPE * de],
-            de,
-        );
+        l.gemm(&cur, NTYPE, l.i, 0.0, &mut e[..NTYPE * de]);
+        l.bias(NTYPE, e);
         for t in 0..NTYPE {
-            let out = &mut e[t * de..(t + 1) * de];
-            for (x, b) in out.iter_mut().zip(self.bd1.iter()) {
-                *x += *b;
-            }
             let id = ids[t] as usize;
             for j in 0..de {
-                out[j] += self.wid[id * de + j];
+                e[t * de + j] += self.wid[id * de + j];
             }
         }
     }
 
     /// The trunk's input, assembled from a stored row and the card table:
     /// the raw hex facts, then each hex's occupant embedding, then the pile
-    /// summary, then the loose scalars.
-    ///
-    /// The stored row holds a one-hot per hex rather than an embedding, because
-    /// the embedding is learned and a replay row that contained it would go
-    /// stale as training moved the weights. Gathering `e`'s row is exactly the
-    /// one-hot matmul, since at most one entry is set.
-    ///
-    /// The blocks are concatenated rather than interleaved per hex. `W0` is
-    /// fully connected over the result, so any fixed permutation of its input is
-    /// the same network with permuted rows, and this one is two contiguous
-    /// copies instead of `N_HEXES` strided ones.
+    /// summary, then the loose scalars. See `train/value_net.py::trunk_input`
+    /// for the layout rationale; the two must agree block for block.
     fn assemble(&self, xpub: &[f32], rows: usize, stride: usize, e: &[f32], x: &mut Vec<f32>) {
-        let (de, xd) = (self.de(), self.xdim());
-        debug_assert!(!self.v1());
-        // A subgame of only terminal leaves has no network rows, and then no
-        // card table either — it is built only when there is something to
-        // encode. The card half of the pile summary is hoisted out of the row
-        // loop below, so without this it would read an empty table rather than
-        // simply not running.
+        let (de, xd) = (self.de, self.xdim());
+        debug_assert!(!self.v1);
         if rows == 0 {
             return;
         }
         let (hex_e, piles) = (N_HEXES * HEX_FACTS, N_HEXES * (HEX_FACTS + de));
         fit(x, rows * xd);
         x[..rows * xd].fill(0.0);
-        // The pile summary reads [4 counts | card embedding] per coin type. The
-        // card half is the same at every leaf of a solve, so it is folded into
-        // the bias once and only the four counts move per row -- which turns the
-        // rest into a single matmul over every (leaf, coin type).
+        // The card half of the pile summary is the same at every row, so it
+        // folds into the bias once; only the four counts move per row.
         let mut pe = vec![0.0f32; NTYPE * de];
         for t in 0..NTYPE {
             let out = &mut pe[t * de..(t + 1) * de];
-            out.copy_from_slice(&self.bpile);
+            out.copy_from_slice(&self.pile.b);
             for i in 0..de {
                 let v = e[t * de + i];
-                let w = &self.wpile[(PILE_COUNTS + i) * de..(PILE_COUNTS + i + 1) * de];
+                let w = &self.pile.w[(PILE_COUNTS + i) * de..(PILE_COUNTS + i + 1) * de];
                 for j in 0..de {
                     out[j] += v * w[j];
                 }
@@ -875,7 +923,7 @@ impl Mlp {
                 .copy_from_slice(&xpub[r * stride + OFF_PILES..r * stride + OFF_PILES + step]);
         }
         let mut ph = vec![0.0f32; rows * NTYPE * de];
-        gemm_ld(rows * NTYPE, de, PILE_COUNTS, &cnt, PILE_COUNTS, &self.wpile, de, 0.0,
+        gemm_ld(rows * NTYPE, de, PILE_COUNTS, &cnt, PILE_COUNTS, &self.pile.w, de, 0.0,
                 &mut ph, de);
         for r in 0..rows {
             let src = &xpub[r * stride..r * stride + PUBFEAT];
@@ -900,108 +948,79 @@ impl Mlp {
         }
     }
 
-    /// The holding tower. Per coin type, its three counts and the seat alongside
-    /// that card's embedding, through one shared matrix, summed over the five
-    /// slots and rectified. The sum is what makes any draft fit: it has no
-    /// order, so nothing depends on which slot a card landed in.
-    ///
-    /// A config's features do not depend on the CFR iteration, so a solve runs
-    /// this once for every distinct config in its tree and then never again.
+    /// The holding tower over `n` config vectors: per coin-type row through
+    /// the slot chain, rectified, summed over the five slots, refined by the
+    /// residual blocks. Produces `z` (`[n, dg]`) and the readout `g`
+    /// (`[n, rank + 1]`). Runs once per distinct config per solve.
     pub fn embed(&self, phi: &[f32], n: usize, e: &[f32], z: &mut Vec<f32>, g: &mut Vec<f32>) {
-        let (rk, dg) = (self.rank(), self.dg());
+        let (rk, dg) = (self.rank, self.dg);
         debug_assert_eq!(phi.len(), n * self.cfeat());
         fit(z, n * dg);
-        if self.v1() {
+        if self.v1 {
             let cf = self.cfeat();
-            gemm_ld(n, dg, cf, phi, cf, &self.wc, dg, 0.0, &mut z[..n * dg], dg);
-            for r in 0..n {
-                let row = &mut z[r * dg..r * dg + dg];
-                for (x, b) in row.iter_mut().zip(self.bc.iter()) {
-                    *x += *b;
-                }
-                relu(row);
-            }
+            self.slot_out.gemm(phi, n, cf, 0.0, &mut z[..n * dg]);
+            self.slot_out.bias_relu(n, z);
         } else {
-            let (de, hf) = (self.de(), hfeat(self.de()));
-        let cf = self.cfeat();
-        // The five slot rows are independent and identically shaped, so the
-        // whole tower is one matmul over [n * NSLOT, hf] and a segmented sum --
-        // not a scalar triple loop per config, which is what this was and which
-        // left the vector units idle for the widest per-config work there is.
-        let mut inp = vec![0.0f32; n * NSLOT * hf];
-        for r in 0..n {
-            let p = &phi[r * cf..(r + 1) * cf];
-            let seat = p[CCOUNTS];
-            for k in 0..NSLOT {
-                let row = &mut inp[(r * NSLOT + k) * hf..(r * NSLOT + k + 1) * hf];
-                row[0] = p[k];
-                row[1] = p[NSLOT + k];
-                row[2] = p[2 * NSLOT + k];
-                row[3] = seat;
-                let t = seat as usize * NSLOT + k;
-                row[4..].copy_from_slice(&e[t * de..(t + 1) * de]);
+            let (de, hf) = (self.de, hfeat(self.de));
+            let cf = self.cfeat();
+            // The five slot rows are independent and identically shaped, so
+            // the tower is matmuls over [n * NSLOT, .] and a segmented sum.
+            let mut inp = vec![0.0f32; n * NSLOT * hf];
+            for r in 0..n {
+                let p = &phi[r * cf..(r + 1) * cf];
+                let seat = p[CCOUNTS];
+                for k in 0..NSLOT {
+                    let row = &mut inp[(r * NSLOT + k) * hf..(r * NSLOT + k + 1) * hf];
+                    row[0] = p[k];
+                    row[1] = p[NSLOT + k];
+                    row[2] = p[2 * NSLOT + k];
+                    row[3] = seat;
+                    let t = seat as usize * NSLOT + k;
+                    row[4..].copy_from_slice(&e[t * de..(t + 1) * de]);
+                }
             }
-        }
-        let mut slot = vec![0.0f32; n * NSLOT * dg];
-        let mut res = vec![0.0f32; n * dg];
-        gemm_ld(n * NSLOT, dg, hf, &inp, hf, &self.wc, dg, 0.0, &mut slot, dg);
-        for r in 0..n {
-            let out = &mut z[r * dg..(r + 1) * dg];
-            out.fill(0.0);
-            for k in 0..NSLOT {
-                let o = &slot[(r * NSLOT + k) * dg..(r * NSLOT + k + 1) * dg];
-                // Rectify before the sum: a sum of raw linear maps is a linear
-                // map of the sum, which has forgotten which count belongs to
-                // which card -- the one thing this tower exists to remember.
-                for j in 0..dg {
-                    out[j] += (o[j] + self.bc[j]).max(0.0);
+            let mut a = inp;
+            let mut b = Vec::new();
+            for l in &self.slot {
+                fit(&mut b, n * NSLOT * l.o);
+                l.gemm(&a, n * NSLOT, l.i, 0.0, &mut b[..n * NSLOT * l.o]);
+                l.bias_relu(n * NSLOT, &mut b);
+                std::mem::swap(&mut a, &mut b);
+            }
+            let mut slot = vec![0.0f32; n * NSLOT * dg];
+            self.slot_out.gemm(&a, n * NSLOT, self.slot_out.i, 0.0, &mut slot);
+            for r in 0..n {
+                let out = &mut z[r * dg..(r + 1) * dg];
+                out.fill(0.0);
+                for k in 0..NSLOT {
+                    let o = &slot[(r * NSLOT + k) * dg..(r * NSLOT + k + 1) * dg];
+                    // Rectify before the sum: a sum of raw linear maps forgets
+                    // which count belongs to which card.
+                    for j in 0..dg {
+                        out[j] += (o[j] + self.slot_out.b[j]).max(0.0);
+                    }
                 }
             }
         }
-        // The residual: z = s + relu(s Wh1 + bh1) Wh2 + bh2. With Wh2 zeroed
-        // (how every fresh checkpoint starts) this is exactly the additive
-        // tower; trained, it lets the tower combine cards.
-        fit(&mut res, n * dg);
-        gemm_ld(n, dg, dg, &z[..n * dg], dg, &self.wh1, dg, 0.0, &mut res, dg);
-        for r in 0..n {
-            let row = &mut res[r * dg..(r + 1) * dg];
-            for (x, b) in row.iter_mut().zip(self.bh1.iter()) {
-                *x += *b;
-            }
-            relu(row);
-        }
-        gemm_ld(n, dg, dg, &res[..n * dg], dg, &self.wh2, dg, 1.0, &mut z[..n * dg], dg);
-        for r in 0..n {
-            let row = &mut z[r * dg..(r + 1) * dg];
-            for (x, b) in row.iter_mut().zip(self.bh2.iter()) {
-                *x += *b;
-            }
-        }
+        // Residual blocks: z += B(relu(A z)). A fresh checkpoint zeroes each
+        // B, so training starts from the additive tower.
+        let mut r1 = Vec::new();
+        for (a, bb) in &self.res {
+            fit(&mut r1, n * dg);
+            a.gemm(&z[..n * dg], n, dg, 0.0, &mut r1[..n * dg]);
+            a.bias_relu(n, &mut r1);
+            bb.gemm(&r1[..n * dg], n, dg, 1.0, &mut z[..n * dg]);
+            bb.bias(n, z);
         }
         fit(g, n * (rk + 1));
-        gemm_ld(
-            n,
-            rk + 1,
-            dg,
-            z,
-            dg,
-            &self.wg,
-            rk + 1,
-            0.0,
-            &mut g[..n * (rk + 1)],
-            rk + 1,
-        );
-        for r in 0..n {
-            let row = &mut g[r * (rk + 1)..(r + 1) * (rk + 1)];
-            for (x, b) in row.iter_mut().zip(self.bg.iter()) {
-                *x += *b;
-            }
-        }
+        self.wg.gemm(&z[..n * dg], n, dg, 0.0, &mut g[..n * (rk + 1)]);
+        self.wg.bias(n, g);
     }
 
-    /// The public tower: `relu(LN(x W0 + b0))` pushed through `W1`, leaving the
-    /// hidden layer's pre-activation minus its bias and minus the belief
-    /// contribution. Computed once per leaf per solve.
+    /// The public tower: every layer `relu(LN(x W + b))`, then `pub_out`
+    /// projects to the head width. The result is `h0`, pre-norm — `pub_out`'s
+    /// bias and `ln1` are applied at the head entry, per iteration. Computed
+    /// once per leaf per solve.
     pub fn trunk(
         &self,
         xpub: &[f32],
@@ -1011,51 +1030,28 @@ impl Mlp {
         scratch: &mut Vec<f32>,
         out: &mut Vec<f32>,
     ) {
-        let (xd, h) = (self.xdim(), self.hidden());
-        // v1 feeds the stored row straight to `W0`; there is nothing to splice.
         let mut x = Vec::new();
-        let (src, lda) = if self.v1() {
+        let (src, lda) = if self.v1 {
             (xpub, stride)
         } else {
             self.assemble(xpub, rows, stride, e, &mut x);
-            (&x[..], xd)
+            (&x[..], self.xdim())
         };
-        fit(scratch, rows * h);
-        gemm_ld(
-            rows,
-            h,
-            xd,
-            src,
-            lda,
-            &self.w0,
-            h,
-            0.0,
-            &mut scratch[..rows * h],
-            h,
-        );
-        self.ln_relu(
-            rows,
-            h,
-            &self.b0,
-            &self.ln0_w,
-            &self.ln0_b,
-            None,
-            &mut scratch[..rows * h],
-        );
-        let hd = self.head();
-        fit(out, rows * hd);
-        gemm_ld(
-            rows,
-            hd,
-            h,
-            scratch,
-            h,
-            &self.w1,
-            hd,
-            0.0,
-            &mut out[..rows * hd],
-            hd,
-        );
+        let l0 = &self.pub_lin[0];
+        let mut a = std::mem::take(scratch);
+        fit(&mut a, rows * l0.o);
+        l0.gemm(src, rows, lda, 0.0, &mut a[..rows * l0.o]);
+        self.ln_relu(rows, l0.o, &l0.b, &self.pub_ln[0].0, &self.pub_ln[0].1, None, &mut a);
+        let mut b = Vec::new();
+        for (l, ln) in self.pub_lin[1..].iter().zip(&self.pub_ln[1..]) {
+            fit(&mut b, rows * l.o);
+            l.gemm(&a, rows, l.i, 0.0, &mut b[..rows * l.o]);
+            self.ln_relu(rows, l.o, &l.b, &ln.0, &ln.1, None, &mut b);
+            std::mem::swap(&mut a, &mut b);
+        }
+        fit(out, rows * self.head_in);
+        self.pub_out.gemm(&a, rows, self.pub_out.i, 0.0, &mut out[..rows * self.head_in]);
+        *scratch = a;
     }
 
     /// The PBS side of the value, given the cached trunk in `pre` and the two
@@ -1070,65 +1066,44 @@ impl Mlp {
         out: &mut Vec<f32>,
     ) {
         self.hidden_layer(xbel, rows, pre, scratch);
-        self.readout(scratch, rows, &self.wu, &self.bu, out);
+        self.readout(scratch, rows, &self.wu, out);
     }
 
-    /// The hidden layer itself: the cached trunk in `pre` plus the belief
-    /// contribution, normalised and rectified. Both readouts start here, which
-    /// is why it is separate — the value's runs every CFR iteration, the
-    /// policy's runs once per solve.
+    /// The head: `relu(LN1(h0 + xbel Wb))`, then the extra head layers. Both
+    /// readouts start here — the value's runs every CFR iteration, the
+    /// policy's once per solve.
     fn hidden_layer(&self, xbel: &[f32], rows: usize, pre: &[f32], out: &mut Vec<f32>) {
-        let (hd, bd) = (self.head(), self.belief_dim());
+        let (hd, bd) = (self.head_in, self.belief_dim());
         debug_assert_eq!(xbel.len(), rows * bd);
-        debug_assert!(pre.len() >= rows * self.hidden());
         fit(out, rows * hd);
-        gemm_ld(
-            rows,
-            hd,
-            bd,
-            xbel,
-            bd,
-            &self.wb,
-            hd,
-            0.0,
-            &mut out[..rows * hd],
-            hd,
-        );
-        self.ln_relu(
-            rows,
-            hd,
-            &self.b1,
-            &self.ln1_w,
-            &self.ln1_b,
-            Some(pre),
-            &mut out[..rows * hd],
-        );
+        gemm_ld(rows, hd, bd, xbel, bd, &self.wb, hd, 0.0, &mut out[..rows * hd], hd);
+        self.ln_relu(rows, hd, &self.pub_out.b, &self.ln1.0, &self.ln1.1, Some(pre),
+                     &mut out[..rows * hd]);
+        if self.hmlp.is_empty() {
+            return;
+        }
+        let mut a = std::mem::take(out);
+        let mut b = Vec::new();
+        for l in &self.hmlp {
+            fit(&mut b, rows * l.o);
+            l.gemm(&a, rows, l.i, 0.0, &mut b[..rows * l.o]);
+            l.bias_relu(rows, &mut b);
+            std::mem::swap(&mut a, &mut b);
+        }
+        *out = a;
     }
 
     /// `hid W + b`, into `[rows * rank]`.
-    fn readout(&self, hid: &[f32], rows: usize, w: &[f32], b: &[f32], out: &mut Vec<f32>) {
-        let (hd, rk) = (self.head(), self.rank());
-        fit(out, rows * rk);
-        gemm_ld(rows, rk, hd, hid, hd, w, rk, 0.0, &mut out[..rows * rk], rk);
-        for r in 0..rows {
-            for (x, bb) in out[r * rk..r * rk + rk].iter_mut().zip(b.iter()) {
-                *x += *bb;
-            }
-        }
+    fn readout(&self, hid: &[f32], rows: usize, w: &Lin, out: &mut Vec<f32>) {
+        fit(out, rows * w.o);
+        w.gemm(hid, rows, w.i, 0.0, &mut out[..rows * w.o]);
+        w.bias(rows, out);
     }
 
     /// The action tower: `q(a) = relu([psi(a) | e(paying card)] Wq + bq)` for
-    /// `na` actions, `psi` being `[na * afeat]`. Writes `[na * rank]`.
-    ///
-    /// The paying card's embedding is gathered through the coin-type one-hot
-    /// `psi` already carries, exactly as the hex block gathers the occupant's —
-    /// so what pays for an action is described by what that card does, not by
-    /// which slot it sits in.
-    ///
-    /// Cheap and per node, not per config: an action's description does not
-    /// depend on who is holding what.
+    /// `na` actions. Cheap and per node, not per config.
     pub fn embed_actions(&self, psi: &[f32], na: usize, e: &[f32], out: &mut Vec<f32>) {
-        let (af, rk, de) = (self.afeat(), self.rank(), self.de());
+        let (af, rk, de) = (self.afeat(), self.rank, self.de);
         debug_assert_eq!(psi.len(), na * af);
         let mut inp = vec![0.0f32; na * (af + de)];
         for r in 0..na {
@@ -1142,34 +1117,12 @@ impl Mlp {
             }
         }
         fit(out, na * rk);
-        gemm_ld(
-            na,
-            rk,
-            af + de,
-            &inp,
-            af + de,
-            &self.wq,
-            rk,
-            0.0,
-            &mut out[..na * rk],
-            rk,
-        );
-        for r in 0..na {
-            let row = &mut out[r * rk..r * rk + rk];
-            for (x, b) in row.iter_mut().zip(self.bq.iter()) {
-                *x += *b;
-            }
-            relu(row);
-        }
+        self.wq.gemm(&inp, na, af + de, 0.0, &mut out[..na * rk]);
+        self.wq.bias_relu(na, out);
     }
 
     /// Policy logits for one decision node: `[nc * na]`, row-major by config.
-    ///
-    /// `xbel`/`pre` are that node's single PBS row, `cidx` names its configs in
-    /// the `z` table `embed` built, and `q` is `embed_actions`' output. The
-    /// caller softmaxes; nothing here knows which actions are legal, because
-    /// legality is the caller's mask and applying it twice is how a
-    /// renormalisation goes wrong.
+    /// The caller softmaxes and masks legality.
     #[allow(clippy::too_many_arguments)]
     pub fn policy(
         &self,
@@ -1182,38 +1135,32 @@ impl Mlp {
         scratch: &mut Vec<f32>,
         out: &mut [f32],
     ) {
-        let (dg, rk, nc) = (self.dg(), self.rank(), cidx.len());
+        let (dg, rk, nc) = (self.dg, self.rank, cidx.len());
         debug_assert_eq!(out.len(), nc * na);
         self.hidden_layer(xbel, 1, pre, scratch);
         let mut upi = Vec::new();
-        self.readout(scratch, 1, &self.wp, &self.bp, &mut upi);
-        // `k(c) = u_pi + z(c) Wk + bk`, one row per config, then every logit is
-        // a dot of a `k` row with a `q` row. Both are matmuls: gathering the
-        // configs' embeddings into one block first costs a copy and turns two
-        // scalar triple loops -- `nc * rank * dg` of them, walking `Wk` with a
-        // stride -- into work the vector units do.
+        self.readout(scratch, 1, &self.wp, &mut upi);
+        // `k(c) = u_pi + z(c) Wk + bk`, then every logit is a dot of a `k`
+        // row with a `q` row — both matmuls.
         let mut zc = vec![0.0f32; nc * dg];
         for (ci, &c) in cidx.iter().enumerate() {
             zc[ci * dg..(ci + 1) * dg]
                 .copy_from_slice(&z[c as usize * dg..(c as usize + 1) * dg]);
         }
         let mut k = vec![0.0f32; nc * rk];
-        gemm_ld(nc, rk, dg, &zc, dg, &self.wk, rk, 0.0, &mut k, rk);
+        self.wk.gemm(&zc, nc, dg, 0.0, &mut k);
         for ci in 0..nc {
             for j in 0..rk {
-                k[ci * rk + j] += self.bk[j] + upi[j];
+                k[ci * rk + j] += self.wk.b[j] + upi[j];
             }
         }
         gemm_nt(nc, na, rk, &k, rk, q, rk, out, na);
     }
 
-    /// Every PBS row against every config embedding at once: `out[r][c]` is
-    /// `<u[r], g[c][..rank]>`. The bias column is left to the caller, which has
-    /// to touch each entry anyway to scale by the opponent's reach.
     /// The per-config readout: `v = <u, g[..rank]> + g[rank]`, for the configs
     /// `idx` names in a `g` table built by `embed`.
     pub fn values(&self, u: &[f32], g: &[f32], idx: &[u32], out: &mut [f32]) {
-        let rk = self.rank();
+        let rk = self.rank;
         debug_assert_eq!(idx.len(), out.len());
         for (o, &i) in out.iter_mut().zip(idx.iter()) {
             let row = &g[i as usize * (rk + 1)..];
@@ -1221,12 +1168,8 @@ impl Mlp {
         }
     }
 
-    /// One value per row, for callers with no solve to amortise over: the torch
-    /// parity check and the offline tools. `xpub` is `[rows * pub_dim]`, `xbel`
-    /// `[rows * 2 * dg]`, `phi` `[rows * cfeat]` — one config per row.
-    ///
-    /// The card table is rebuilt per row here, because these callers batch rows
-    /// from different games. A solve builds it once.
+    /// One value per row, for callers with no solve to amortise over: the
+    /// torch parity check and the offline tools.
     pub fn forward(
         &self,
         xpub: &[f32],
@@ -1235,14 +1178,9 @@ impl Mlp {
         ids: &[u8],
         rows: usize,
     ) -> Vec<f32> {
-        let (rk, pd) = (self.rank(), self.pub_dim());
+        let (rk, pd) = (self.rank, self.pub_dim());
         let (mut sb, mut pre, mut e, mut z, mut g, mut u) = (
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
         );
         (0..rows)
             .map(|r| {
@@ -1324,5 +1262,110 @@ mod gemm_tests {
                 assert!((x - y).abs() < 1e-3, "gemm_nt {m}x{n}x{k}: {x} vs {y}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    /// Restate the v3 blob sizes independently of the parser, so a slip in
+    /// either shows as a mismatch here rather than as garbage values.
+    fn v3_sizes(de: usize, dg: usize, rk: usize, hd: usize, nres: usize,
+                card: &[usize], pubw: &[usize], hmlp: &[usize], slot: &[usize])
+                -> (usize, usize, usize) {
+        let chain = |first: usize, mid: &[usize], last: usize| -> (usize, usize) {
+            let mut w = 0;
+            let mut b = 0;
+            let mut prev = first;
+            for &h in mid.iter().chain(std::iter::once(&last)) {
+                w += prev * h;
+                b += h;
+                prev = h;
+            }
+            (w, b)
+        };
+        let (cw, cb) = chain(CARD_FEATS, card, de);
+        let (pw, pb) = chain(xdim_of(de), &pubw[..pubw.len() - 1], pubw[pubw.len() - 1]);
+        let (ow, ob) = (pubw[pubw.len() - 1] * hd, hd);
+        let (hw, hb) = chain(hd, hmlp, rk); // hmlp chain ends in wu
+        let head_out = hmlp.last().copied().unwrap_or(hd);
+        let (sw, sb) = chain(hfeat(de), slot, dg);
+        let w = cw + crate::units::N_UNITS * de + (PILE_COUNTS + de) * de
+            + pw + ow + 2 * dg * hd + hw + sw
+            + nres * 2 * dg * dg + dg * (rk + 1)
+            + (AFEAT + de) * rk + dg * rk + head_out * rk;
+        let b = cb + de + pb + ob + hb + sb + nres * 2 * dg + (rk + 1) + 3 * rk;
+        let ln = 2 * pubw.iter().sum::<usize>() + 2 * hd;
+        (w, b, ln)
+    }
+
+    fn ramp(n: usize) -> Vec<f32> {
+        (0..n).map(|i| ((i % 37) as f32 - 18.0) * 0.01).collect()
+    }
+
+    fn dims_of(de: usize, dg: usize, rk: usize, hd: usize, nres: usize,
+               card: &[usize], pubw: &[usize], hmlp: &[usize], slot: &[usize]) -> Vec<usize> {
+        let mut d = vec![3, de, dg, rk, hd, nres];
+        for list in [card, pubw, hmlp, slot] {
+            d.push(list.len());
+            d.extend_from_slice(list);
+        }
+        d
+    }
+
+    #[test]
+    fn v3_loads_at_any_depth() {
+        for (de, dg, rk, hd, nres, card, pubw, hmlp, slot) in [
+            (32, 64, 64, 384, 1, vec![64], vec![384], vec![], vec![]),      // = v2 default
+            (16, 96, 48, 128, 2, vec![24, 24], vec![192, 96], vec![96], vec![24]),
+            (8, 32, 16, 64, 0, vec![], vec![64, 64, 64], vec![48, 48], vec![]),
+        ] {
+            let (nw, nb, nl) = v3_sizes(de, dg, rk, hd, nres, &card, &pubw, &hmlp, &slot);
+            let dims = dims_of(de, dg, rk, hd, nres, &card, &pubw, &hmlp, &slot);
+            let net = Mlp::from_flat(&dims, &ramp(nw), &ramp(nb), &ramp(nl))
+                .unwrap_or_else(|e| panic!("{dims:?}: {e}"));
+            assert_eq!(net.de(), de);
+            assert_eq!(net.head(), hd);
+            assert_eq!(net.head_out(), hmlp.last().copied().unwrap_or(hd));
+            assert_eq!(net.rank(), rk);
+            // A forward pass over structured rows must be finite and move.
+            let rows = 3;
+            let mut xpub = vec![0.0f32; rows * PUBFEAT];
+            for (i, x) in xpub.iter_mut().enumerate() {
+                *x = ((i % 7) as f32) * 0.1;
+            }
+            // One-hot occupant blocks, as the encoder writes them.
+            for r in 0..rows {
+                for h in 0..N_HEXES {
+                    let at = r * PUBFEAT + h * HEX_CH + HEX_FACTS;
+                    for j in 0..NTYPE {
+                        xpub[at + j] = 0.0;
+                    }
+                    xpub[at + (h + r) % NTYPE] = 1.0;
+                }
+            }
+            let ids: Vec<u8> = (0..rows * NTYPE).map(|i| (i % 19) as u8).collect();
+            let xbel = ramp(rows * net.belief_dim());
+            let phi = ramp(rows * net.cfeat());
+            let out = net.forward(&xpub, &xbel, &phi, &ids, rows);
+            assert!(out.iter().all(|v| v.is_finite()), "{dims:?}: {out:?}");
+            assert!(out.iter().any(|v| v.abs() > 1e-6), "{dims:?}: all-zero output");
+        }
+    }
+
+    /// The frozen v2 layout must still load (old checkpoints, .bin dumps).
+    #[test]
+    fn v2_still_loads() {
+        let (p, h, hd, dg, rk, de, dc) = (PUBFEAT, 96, 64, 32, 24, 16, 24);
+        let dims = vec![p, h, hd, CFEAT, dg, rk, AFEAT, de, dc, 0];
+        let (af, hf, xd) = (AFEAT + de, hfeat(de), xdim_of(de));
+        let nw = CARD_FEATS * dc + dc * de + crate::units::N_UNITS * de
+            + (PILE_COUNTS + de) * de + xd * h + h * hd + 2 * dg * hd + hf * dg
+            + dg * dg + dg * dg + dg * (rk + 1) + hd * rk + af * rk + dg * rk + hd * rk;
+        let nb = dc + de + de + h + hd + dg + dg + dg + (rk + 1) + 4 * rk;
+        let net = Mlp::from_flat(&dims, &ramp(nw), &ramp(nb), &ramp(2 * h + 2 * hd)).unwrap();
+        assert_eq!(net.head(), hd);
+        assert_eq!(net.towers(), (vec![dc, de], vec![h], hd, vec![], vec![], 1));
     }
 }

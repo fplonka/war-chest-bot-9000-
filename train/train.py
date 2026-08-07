@@ -414,6 +414,13 @@ def main():
     # equals --hidden, which is the network this split came from.
     ap.add_argument("--head", type=int, default=0,
                     help="readout width (default: --hidden)")
+    # Tower depths (comma lists of widths; empty = the classic shape). These
+    # are the experiment knobs the flexible format exists for.
+    ap.add_argument("--pub", default="", help="public tower widths, e.g. 384,384")
+    ap.add_argument("--hmlp", default="", help="extra per-iteration head widths")
+    ap.add_argument("--card", default="", help="card describer hidden widths")
+    ap.add_argument("--slot", default="", help="holding tower hidden widths")
+    ap.add_argument("--nres", type=int, default=1, help="holding residual blocks")
     # Width of a config embedding, and so of one player's belief block. This is
     # the rank of the value function's dependence on the private state, and it
     # is also what the belief is summarised into -- the one place where a fixed
@@ -532,8 +539,12 @@ def main():
     rng = np.random.default_rng(args.seed)
     dev = torch.device(args.device)
 
+    towers = lambda s: [int(x) for x in s.split(",") if x.strip()] or None
     value = Mlp(args.hidden, args.dg, args.rank, args.de,
-                head=(args.head or args.hidden)).to(dev)
+                head=(args.head or args.hidden),
+                pub=towers(args.pub), hmlp=towers(args.hmlp),
+                card=towers(args.card), slot=towers(args.slot),
+                nres=args.nres).to(dev)
     opt = torch.optim.Adam(value.parameters(), lr=args.lr)
     # Step-decay plan: halve the lr at each listed fraction of the ReBeL phase.
     lr_decays = sorted(float(x) for x in args.lr_decay_frac.split(",") if x.strip())
@@ -582,8 +593,8 @@ def main():
             snaps[-1]["label"] = label
             return
         path = f"{args.out}/snap_{len(snaps):02d}.pt"
-        torch.save({"value": value.state_dict(), "hidden": args.hidden,
-                    "head": args.head or args.hidden,
+        torch.save({"value": value.state_dict(), "spec": value.spec(),
+                    "hidden": args.hidden, "head": args.head or args.hidden,
                     "dg": args.dg, "rank": args.rank, "de": args.de, "t": round(el, 1),
                     "label": label}, path)
         snaps.append({"label": label, "t": round(el, 1),

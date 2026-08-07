@@ -57,8 +57,20 @@ def build(name):
         toks = name[4:] if hex_net else name
         v = {}
         flags = {}
+        lists, nres = {}, 1
+        csv = lambda s: [int(x) for x in s.split(",") if x.strip()]
         for tok in toks.split("-"):
-            if tok.startswith("head"):
+            if tok.startswith("pub"):
+                lists["pub"] = csv(tok[3:])
+            elif tok.startswith("mlp"):
+                lists["hmlp"] = csv(tok[3:])
+            elif tok.startswith("slot"):
+                lists["slot"] = csv(tok[4:])
+            elif tok.startswith("card"):
+                lists["card"] = csv(tok[4:])
+            elif tok.startswith("res"):
+                nres = int(tok[3:])
+            elif tok.startswith("head"):
                 v["head"] = int(tok[4:])
             elif tok in ("noid", "nofacts", "nor"):
                 flags[tok] = True
@@ -67,10 +79,11 @@ def build(name):
         return Mlp(v["h"], v["d"], v["r"], v.get("e", 32),
                    head=v.get("head", None), hex_net=hex_net,
                    no_id=flags.get("noid", False), no_facts=flags.get("nofacts", False),
-                   no_residual=flags.get("nor", False))
+                   no_residual=flags.get("nor", False), nres=nres, **lists)
     except (KeyError, ValueError):
         raise SystemExit(
-            f"unknown arch {name!r} -- expected [hex-]h<hidden>-d<dg>-r<rank>[-e<de>][-head<n>]"
+            f"unknown arch {name!r} -- expected [hex-]h<hidden>-d<dg>-r<rank>[-e<de>]"
+            f"[-head<n>][-pub<w,w>][-mlp<w,w>][-slot<w,w>][-card<w,w>][-res<n>]"
         )
 
 

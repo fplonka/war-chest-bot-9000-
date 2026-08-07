@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from value_net import Mlp  # noqa: E402
+from value_net import Mlp, upgrade_state_dict  # noqa: E402
 from value_net_v1 import MlpV1  # noqa: E402
 
 
@@ -37,16 +37,21 @@ def load(path):
     """
     # Our own checkpoints; torch 2.6+ defaults to weights_only=True.
     ck = torch.load(path, map_location="cpu", weights_only=False)
+    sd = ck["value"]
     args = (ck["hidden"], ck.get("dg", 64), ck.get("rank", 64))
     # A checkpoint with no card describer is a pre-A2 one and reads the frozen
     # v1 encoding. Told apart by the weights themselves, not by a version field
     # the old checkpoints never carried.
-    if "wd0.weight" not in ck["value"]:
+    if "wd0.weight" not in sd and "card.0.weight" not in sd:
         net = MlpV1(*args)
-        net.load_state_dict(ck["value"])
+        net.load_state_dict(sd)
         return net
-    net = Mlp(*args, ck.get("de", 32), head=ck.get("head", ck["hidden"]))
-    missing, _ = net.load_state_dict(ck["value"], strict=False)
+    if "spec" in ck:
+        net = Mlp(**ck["spec"])
+    else:
+        net = Mlp(*args, ck.get("de", 32), head=ck.get("head", ck["hidden"]))
+    # Fixed-layout checkpoints carry the old attribute names; rename.
+    missing, _ = net.load_state_dict(upgrade_state_dict(sd), strict=False)
     net.has_policy = not any(k.startswith(("wq.", "wk.", "wp.")) for k in missing)
     return net
 

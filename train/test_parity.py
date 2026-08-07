@@ -75,17 +75,17 @@ def main():
     # Move every parameter off its initialisation, or the comparison passes for
     # the wrong reason: LayerNorm ships as weight=1, bias=0, which is the
     # identity, and the readout ships at ~1e-3.
-    for n in (net.ln0, net.ln1):
+    for n in (net.pub_ln[0], net.ln1):
         torch.nn.init.normal_(n.weight, mean=1.0, std=0.3)
         torch.nn.init.normal_(n.bias, std=0.2)
     torch.nn.init.normal_(net.wg.weight, std=0.05)
     torch.nn.init.normal_(net.wg.bias, std=0.05)
     # Move the holding residual off its zeroed initialisation, or the parity
     # check would never exercise it.
-    torch.nn.init.normal_(net.wh1.weight, std=0.1)
-    torch.nn.init.normal_(net.wh1.bias, std=0.1)
-    torch.nn.init.normal_(net.wh2.weight, std=0.1)
-    torch.nn.init.normal_(net.wh2.bias, std=0.1)
+    torch.nn.init.normal_(net.res[0].a.weight, std=0.1)
+    torch.nn.init.normal_(net.res[0].a.bias, std=0.1)
+    torch.nn.init.normal_(net.res[0].b.weight, std=0.1)
+    torch.nn.init.normal_(net.res[0].b.bias, std=0.1)
     net.push(0)
 
     rng = np.random.default_rng(0)
@@ -139,8 +139,7 @@ def main():
         z = net.holdings(tc, e1.expand(nc, -1, -1))
         # The node's own belief: uniform over its configs, both players alike.
         bl = (z.mean(0).repeat(2)).reshape(1, 2 * dg)
-        h = torch.relu(net.ln0(net.w0(net.trunk_input(txr, e1))))
-        h = torch.relu(net.ln1(net.w1(h) + net.wb(bl)))
+        h = net._head(net._public(txr, e1), bl)
         q = net.actions(tpsi, e1.expand(na, -1, -1))
         pref = ((net.wp(h) + net.wk(z)).unsqueeze(1) * q.unsqueeze(0)).sum(-1).numpy()
 
@@ -160,8 +159,8 @@ def main():
     # --- head != hidden: the split widths must not be assumed equal ---------
     torch.manual_seed(1)
     net2 = Mlp(256, 32, 48, 16, head=128)
-    torch.nn.init.normal_(net2.wh1.weight, std=0.1)
-    torch.nn.init.normal_(net2.wh2.weight, std=0.1)
+    torch.nn.init.normal_(net2.res[0].a.weight, std=0.1)
+    torch.nn.init.normal_(net2.res[0].b.weight, std=0.1)
     net2.push(0)
     x2, ids2 = rows_like_the_encoder(rng, rows)
     phi2 = holdings(rng, rows, rng.integers(0, 2, rows))
@@ -188,6 +187,46 @@ def main():
     err2 = float(np.abs(ref2 - got2).max())
     assert err2 < 2e-4, f"HEAD PARITY FAILURE (head!=hidden): max |torch - rust| = {err2:.3e}"
     print(f"head-parity ok (head 128 != hidden 256): max |torch - rust| = {err2:.3e}")
+
+    # --- deep towers: depth and width are checkpoint data, not code ---------
+    torch.manual_seed(2)
+    net3 = Mlp(192, 32, 48, 16, head=96, pub=[192, 96], hmlp=[96, 64],
+               card=[24, 24], slot=[20], nres=2)
+    for n in list(net3.pub_ln) + [net3.ln1]:
+        torch.nn.init.normal_(n.weight, mean=1.0, std=0.3)
+        torch.nn.init.normal_(n.bias, std=0.2)
+    torch.nn.init.normal_(net3.wg.weight, std=0.05)
+    for blk in net3.res:
+        for lin in (blk.a, blk.b):
+            torch.nn.init.normal_(lin.weight, std=0.1)
+            torch.nn.init.normal_(lin.bias, std=0.1)
+    net3.push(0)
+    x3, ids3 = rows_like_the_encoder(rng, rows)
+    phi3 = holdings(rng, rows, rng.integers(0, 2, rows))
+    bel3 = holdings(rng, 2 * rows, np.tile([0.0, 1.0], rows))
+    tx3 = torch.as_tensor(x3)
+    tids3 = torch.as_tensor(ids3, dtype=torch.long)
+    with torch.no_grad():
+        e3 = net3.cards(tx3, tids3)
+        xbel3 = net3.holdings(torch.as_tensor(bel3),
+                              e3.repeat_interleave(2, 0)).reshape(rows, 2 * net3.dg).numpy()
+        allphi3 = np.concatenate([bel3.reshape(rows, 2, -1),
+                                  phi3.reshape(rows, 1, -1)], 1).reshape(3 * rows, -1)
+        w3 = np.tile([1.0, 1.0, 0.0], rows).astype(np.float32)
+        seg3 = np.repeat(np.arange(rows), 3) * 2 + np.tile([0, 1, 0], rows)
+        inv3 = torch.arange(len(allphi3))
+        ref3 = net3(tx3, tids3, torch.as_tensor(allphi3), inv3, torch.as_tensor(w3),
+                    torch.as_tensor(seg3), 2 * rows).numpy()[2::3]
+    got3 = np.asarray(W.infer(
+        np.ascontiguousarray(x3.ravel()),
+        np.ascontiguousarray(xbel3.ravel()),
+        np.ascontiguousarray(phi3.ravel()),
+        np.ascontiguousarray(ids3.ravel()),
+        rows, 0), np.float32)
+    err3 = float(np.abs(ref3 - got3).max())
+    assert ref3.std() > 0.05, f"degenerate deep-tower output (std {ref3.std():.4f})"
+    assert err3 < 2e-4, f"DEEP-TOWER PARITY FAILURE: max |torch - rust| = {err3:.3e}"
+    print(f"deep-tower parity ok: max |torch - rust| = {err3:.3e}")
 
 
 if __name__ == "__main__":

@@ -202,6 +202,8 @@ def load_weights(path):
     w = f32s()
     b = f32s()
     ln = f32s()
+    if dims[0] == 3:
+        return _slice_v3(dims, w, b, ln)
     (pub, h, hd, cf, dg, rk, af0, de, dc, enc) = dims
     af, hf, xd = af0 + de, 4 + de, N_HEXES * (HEX_FACTS + de) + 2 * de + LOOSE
     at[0] = 0
@@ -255,6 +257,78 @@ def load_weights(path):
         "ln1w": ln[2 * h:2 * h + hd], "ln1b": ln[2 * h + hd:2 * h + 2 * hd],
     }
     return dims, W, B, L
+
+
+def _slice_v3(dims, w, b, ln):
+    """A v3 (tower) blob, restricted to the classic shape this spec models:
+    one card hidden layer, one public layer, no extra head layers, no slot
+    hiddens, one residual block. The spec is a debugging oracle; deeper
+    towers need its forward loops generalised first."""
+    tag, de, dg, rk, hd, nres = dims[:6]
+    at = 6
+    lists = []
+    for _ in range(4):
+        n = dims[at]
+        lists.append(list(dims[at + 1:at + 1 + n]))
+        at += 1 + n
+    card, pub, hmlp, slot = lists
+    assert at == len(dims), "trailing dims entries"
+    assert len(card) == 1 and len(pub) == 1 and not hmlp and not slot and nres == 1, (
+        f"cfr_spec models the classic shape only, got card={card} pub={pub} "
+        f"hmlp={hmlp} slot={slot} nres={nres}")
+    dc, h = card[0], pub[0]
+    af, hf, xd = AFEAT + de, 4 + de, N_HEXES * (HEX_FACTS + de) + 2 * de + LOOSE
+    at = [0]
+
+    def take(n):
+        v = w[at[0]:at[0] + n]
+        at[0] += n
+        return v
+
+    W = {}
+    W["wd0"] = take(CARD_FEATS * dc).reshape(CARD_FEATS, dc)
+    W["wd1"] = take(dc * de).reshape(dc, de)
+    W["wid"] = take(20 * de).reshape(20, de)
+    W["wpile"] = take((PILE_COUNTS + de) * de).reshape(PILE_COUNTS + de, de)
+    W["w0"] = take(xd * h).reshape(xd, h)
+    W["w1"] = take(h * hd).reshape(h, hd)
+    W["wb"] = take(2 * dg * hd).reshape(2 * dg, hd)
+    W["wu"] = take(hd * rk).reshape(hd, rk)
+    W["wc"] = take(hf * dg).reshape(hf, dg)
+    W["wh1"] = take(dg * dg).reshape(dg, dg)
+    W["wh2"] = take(dg * dg).reshape(dg, dg)
+    W["wg"] = take(dg * (rk + 1)).reshape(dg, rk + 1)
+    W["wq"] = take(af * rk).reshape(af, rk)
+    W["wk"] = take(dg * rk).reshape(dg, rk)
+    W["wp"] = take(hd * rk).reshape(hd, rk)
+    assert at[0] == len(w), f"weight slice mismatch {at[0]}/{len(w)}"
+    at[0] = 0
+
+    def takeb(n):
+        v = b[at[0]:at[0] + n]
+        at[0] += n
+        return v
+
+    B = {}
+    B["bd0"] = takeb(dc)
+    B["bd1"] = takeb(de)
+    B["bpile"] = takeb(de)
+    B["b0"] = takeb(h)
+    B["b1"] = takeb(hd)
+    B["bu"] = takeb(rk)
+    B["bc"] = takeb(dg)
+    B["bh1"] = takeb(dg)
+    B["bh2"] = takeb(dg)
+    B["bg"] = takeb(rk + 1)
+    B["bq"] = takeb(rk)
+    B["bk"] = takeb(rk)
+    B["bp"] = takeb(rk)
+    assert at[0] == len(b), f"bias slice mismatch {at[0]}/{len(b)}"
+    L = {
+        "ln0w": ln[:h], "ln0b": ln[h:2 * h],
+        "ln1w": ln[2 * h:2 * h + hd], "ln1b": ln[2 * h + hd:2 * h + 2 * hd],
+    }
+    return [0, h, hd, CCOUNTS + 1, dg, rk, AFEAT, de, dc, 0], W, B, L
 
 
 class Solve:
