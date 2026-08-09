@@ -349,30 +349,40 @@ impl Executor {
         let sweep_blocks_per_sm = std::env::var("WARCHEST_SWEEP_BLOCKS_PER_SM")
             .ok()
             .and_then(|x| x.parse::<u32>().ok())
-            .filter(|&x| x > 0)
-            // The unrestricted occupancy maximum overpopulates cooperative
-            // level barriers on the heterogeneous 1,000-root tape. Three
-            // blocks/SM measured 695/s versus 642/s unrestricted; four and
-            // five were both slower. Keep the environment override for other
-            // cards and diagnostic sweeps.
-            .unwrap_or(3);
+            .filter(|&x| x > 0);
+        let kernel_cap = |name: &str, default: u32| {
+            std::env::var(name)
+                .ok()
+                .and_then(|x| x.parse::<u32>().ok())
+                .filter(|&x| x > 0)
+                .or(sweep_blocks_per_sm)
+                .unwrap_or(default)
+        };
         let sweep_block = std::env::var("WARCHEST_SWEEP_BLOCK")
             .ok()
             .and_then(|x| x.parse::<u32>().ok())
             .filter(|&x| (32..=1024).contains(&x) && x % 32 == 0)
             .unwrap_or(BLOCK);
-        let blocks_per_sm = kernels
+        let backprop_blocks_per_sm = kernels
             .backprop_sweep
             .occupancy_max_active_blocks_per_multiprocessor(sweep_block, 0, None)
             .map_err(|e| format!("backprop sweep occupancy: {e:?}"))?
-            .min(sweep_blocks_per_sm);
-        let backprop_blocks = sms.saturating_mul(blocks_per_sm).max(1);
-        let blocks_per_sm = kernels
+            // The unrestricted six-block grids overpopulate cooperative level
+            // barriers. On the heterogeneous 1,000-root tape, backprop 4 plus
+            // reach 2 averaged 709/s versus 693/s at 3/3 and 642/s at 6/6.
+            .min(kernel_cap("WARCHEST_BACKPROP_BLOCKS_PER_SM", 4));
+        let backprop_blocks = sms.saturating_mul(backprop_blocks_per_sm).max(1);
+        let reach_blocks_per_sm = kernels
             .reach_sweep
             .occupancy_max_active_blocks_per_multiprocessor(sweep_block, 0, None)
             .map_err(|e| format!("reach sweep occupancy: {e:?}"))?
-            .min(sweep_blocks_per_sm);
-        let reach_blocks = sms.saturating_mul(blocks_per_sm).max(1);
+            .min(kernel_cap("WARCHEST_REACH_BLOCKS_PER_SM", 2));
+        let reach_blocks = sms.saturating_mul(reach_blocks_per_sm).max(1);
+        if std::env::var_os("WARCHEST_GPU_PROFILE").is_some() {
+            eprintln!(
+                "v5_sweeps block={sweep_block} backprop_blocks_per_sm={backprop_blocks_per_sm} reach_blocks_per_sm={reach_blocks_per_sm}"
+            );
+        }
         let initial = WeightBank::upload(&stream, &dims, w, b, ln)?;
         let mut banks = HashMap::new();
         banks.insert(0, initial);
