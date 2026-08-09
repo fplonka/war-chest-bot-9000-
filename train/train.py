@@ -573,6 +573,8 @@ def main():
                     help="CPU builder threads in the continuous GPU pipeline")
     ap.add_argument("--gpu-actors", type=int, default=128,
                     help="live game actors per GPU builder thread")
+    ap.add_argument("--gpu-inflight", type=int, default=32,
+                    help="maximum submitted solves per GPU builder thread")
     ap.add_argument("--gpu-chunk", type=int, default=1024,
                     help="fresh solves per replay chunk delivered to Python")
     ap.add_argument("--gpu-drain-seconds", type=float, default=20.0,
@@ -717,7 +719,8 @@ def main():
             depth=args.depth, iters=args.iters, explore=args.explore,
             random_draft=args.random_draft, cfr=args.cfr, warm=args.warm,
             eval_mix=args.eval_mix, workers=args.gpu_workers,
-            actors_per_worker=args.gpu_actors, chunk_solves=args.gpu_chunk)
+            actors_per_worker=args.gpu_actors,
+            inflight_per_worker=args.gpu_inflight, chunk_solves=args.gpu_chunk)
         deadline = t0 + total
         drain = max(0.0, min(args.gpu_drain_seconds, total - warm))
         stop_at = deadline - drain

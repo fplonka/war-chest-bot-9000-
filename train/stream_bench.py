@@ -40,6 +40,8 @@ def main():
     ap.add_argument("--workers", type=int, default=36)
     ap.add_argument("--actors", type=int, default=128,
                     help="live game actors per worker")
+    ap.add_argument("--inflight", type=int, default=32,
+                    help="maximum submitted solves per worker")
     ap.add_argument("--chunk", type=int, default=1024,
                     help="completed solves per Python result chunk")
     ap.add_argument("--report-every", type=float, default=2.0)
@@ -63,6 +65,7 @@ def main():
         eval_mix=0.5,
         workers=args.workers,
         actors_per_worker=args.actors,
+        inflight_per_worker=args.inflight,
         chunk_solves=args.chunk,
     )
 

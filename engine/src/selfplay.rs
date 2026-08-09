@@ -1667,6 +1667,7 @@ pub fn run_games_gpu_stream(
     gpus: &[crate::gpu::GpuClient],
     workers: usize,
     actors_per_worker: usize,
+    inflight_per_worker: usize,
     chunk_solves: usize,
     stop: &std::sync::atomic::AtomicBool,
     output: std::sync::mpsc::SyncSender<Result<Option<Data>, String>>,
@@ -1680,6 +1681,7 @@ pub fn run_games_gpu_stream(
     );
     let workers = workers.max(1);
     let per = actors_per_worker.max(1);
+    let max_inflight = inflight_per_worker.max(1).min(per);
     let chunk_solves = chunk_solves.max(1);
     let next = AtomicUsize::new(0);
     let (data_tx, data_rx) = std::sync::mpsc::sync_channel(workers * 4);
@@ -1693,19 +1695,29 @@ pub fn run_games_gpu_stream(
                 let mut busy = vec![false; per];
                 let (tx, rx) = std::sync::mpsc::channel();
                 let mut live = 0usize;
+                let mut inflight = 0usize;
+                let mut cursor = 0usize;
                 loop {
                     let stopping = stop.load(Ordering::Acquire);
-                    for k in 0..per {
-                        if busy[k] {
-                            continue;
-                        }
-                        if stopping {
+                    if stopping {
+                        for k in 0..per {
+                            if busy[k] {
+                                continue;
+                            }
                             if let Some(mut g) = game[k].take() {
                                 let mut d = g.take_data();
                                 d.censored_games += 1;
                                 let _ = data_tx.send(Ok(d));
                                 live -= 1;
                             }
+                        }
+                    }
+                    let mut scanned = 0usize;
+                    while !stopping && scanned < per && inflight < max_inflight {
+                        let k = cursor;
+                        cursor = (cursor + 1) % per;
+                        scanned += 1;
+                        if busy[k] {
                             continue;
                         }
                         loop {
@@ -1740,6 +1752,7 @@ pub fn run_games_gpu_stream(
                                         let _ = data_tx.send(Err(e));
                                     } else {
                                         busy[k] = true;
+                                        inflight += 1;
                                     }
                                     break;
                                 }
@@ -1768,6 +1781,7 @@ pub fn run_games_gpu_stream(
                         continue;
                     };
                     busy[k] = false;
+                    inflight -= 1;
                     if stop.load(Ordering::Acquire) {
                         match result {
                             Ok(value) => {

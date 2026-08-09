@@ -575,7 +575,7 @@ impl Drop for GpuGenerator {
 
 #[cfg(feature = "gpu")]
 #[pyfunction]
-#[pyo3(signature = (seed, depth=2, iters=64, explore=0.25, random_draft=true, cfr="linear", warm=0.0, eval_mix=0.5, workers=36, actors_per_worker=64, chunk_solves=1024))]
+#[pyo3(signature = (seed, depth=2, iters=64, explore=0.25, random_draft=true, cfr="linear", warm=0.0, eval_mix=0.5, workers=36, actors_per_worker=128, inflight_per_worker=32, chunk_solves=1024))]
 #[allow(clippy::too_many_arguments)]
 fn gpu_stream_start(
     seed: u64,
@@ -588,6 +588,7 @@ fn gpu_stream_start(
     eval_mix: f32,
     workers: usize,
     actors_per_worker: usize,
+    inflight_per_worker: usize,
     chunk_solves: usize,
 ) -> PyResult<GpuGenerator> {
     let cfg = Cfg {
@@ -631,6 +632,7 @@ fn gpu_stream_start(
                 &clients,
                 workers,
                 actors_per_worker,
+                inflight_per_worker,
                 chunk_solves,
                 &run_stop,
                 tx,
@@ -1177,10 +1179,7 @@ fn units_info() -> Vec<(u16, &'static str, u8)> {
 fn card_features_table() -> Vec<f32> {
     let mut out = vec![0.0; N_UNITS * CARD_FEATS];
     for u in 0..N_UNITS {
-        write_card_features(
-            u as u8,
-            &mut out[u * CARD_FEATS..(u + 1) * CARD_FEATS],
-        );
+        write_card_features(u as u8, &mut out[u * CARD_FEATS..(u + 1) * CARD_FEATS]);
     }
     out
 }
