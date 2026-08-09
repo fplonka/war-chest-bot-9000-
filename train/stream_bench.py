@@ -60,6 +60,7 @@ def main():
         random_draft=True,
         cfr="linear",
         warm=0.0,
+        eval_mix=0.5,
         workers=args.workers,
         actors_per_worker=args.actors,
         chunk_solves=args.chunk,

@@ -1523,7 +1523,8 @@ impl Mlp {
                     &mut e,
                 );
                 self.trunk(&xpub[r * pd..], 1, pd, &e, &mut sb, &mut pre);
-                self.pbs_head(&xbel[r * self.belief_dim()..], 1, &pre, &mut sb, &mut u);
+                let bd = self.belief_dim();
+                self.pbs_head(&xbel[r * bd..(r + 1) * bd], 1, &pre, &mut sb, &mut u);
                 self.embed(
                     &phi[r * self.cfeat()..(r + 1) * self.cfeat()],
                     1,

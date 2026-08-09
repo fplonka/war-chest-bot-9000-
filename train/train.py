@@ -48,6 +48,7 @@ import torch.nn.functional as F
 import warchest
 import ladder
 import mirror
+from export_weights import load as load_checkpoint
 from value_net import Mlp, AUX, AFEAT
 
 PUBFEAT = warchest.PUBFEAT
@@ -411,6 +412,8 @@ def main():
     # absolute length on any run longer than about half an hour.
     ap.add_argument("--warm-minutes", type=float, default=-1.0,
                     help="absolute warm-start length in minutes; overrides --warm-frac")
+    ap.add_argument("--init", default="",
+                    help="optional checkpoint to start from (useful for bounded GPU gates)")
     ap.add_argument("--hidden", type=int, default=384)
     # Width of the second public matrix, the belief projection, the second
     # LayerNorm and the readouts. Metadata like every other width; default
@@ -538,6 +541,16 @@ def main():
     # what the cards are busy with.
     ap.add_argument("--gpu-devices", default="0",
                     help="comma-separated CUDA devices for the solve services")
+    ap.add_argument("--gpu-workers", type=int, default=36,
+                    help="CPU builder threads in the continuous GPU pipeline")
+    ap.add_argument("--gpu-actors", type=int, default=96,
+                    help="live game actors per GPU builder thread")
+    ap.add_argument("--gpu-chunk", type=int, default=1024,
+                    help="fresh solves per replay chunk delivered to Python")
+    ap.add_argument("--gpu-drain-seconds", type=float, default=20.0,
+                    help="deadline reserve for submitted waves and final optimizer debt")
+    ap.add_argument("--gpu-publish-steps", type=int, default=16,
+                    help="optimizer steps between immutable GPU weight banks")
     ap.add_argument("--out", default="runs/latest")
     ap.add_argument("--seed", type=int, default=1)
     args = ap.parse_args()
@@ -555,6 +568,12 @@ def main():
                 pub=towers(args.pub), hmlp=towers(args.hmlp),
                 card=towers(args.card), slot=towers(args.slot),
                 nres=args.nres).to(dev)
+    if args.init:
+        initial = load_checkpoint(args.init)
+        if list(initial.dims) != list(value.dims):
+            raise ValueError(
+                f"--init shape {initial.dims} does not match requested shape {value.dims}")
+        value.load_state_dict(initial.state_dict())
     opt = torch.optim.Adam(value.parameters(), lr=args.lr)
     # Step-decay plan: halve the lr at each listed fraction of the ReBeL phase.
     lr_decays = sorted(float(x) for x in args.lr_decay_frac.split(",") if x.strip())
@@ -562,6 +581,13 @@ def main():
     value.push(0)
     gpu_devices = [int(x) for x in args.gpu_devices.split(",") if x.strip()]
     if args.gpu:
+        # Measured live-wave defaults on the target two-3090 box. Environment
+        # overrides remain available for controlled scheduler A/Bs.
+        os.environ.setdefault("WARCHEST_DIRECT", "1")
+        os.environ.setdefault("WARCHEST_WAVE_LANES", "3")
+        os.environ.setdefault("WARCHEST_WAVE_ROWS", "196608")
+        os.environ.setdefault("WARCHEST_WAVE_JOBS", "256")
+        os.environ.setdefault("WARCHEST_WAVE_US", "75000")
         dims, w, b, ln = value.dims, *value.flat()
         warchest.gpu_start(dims, w, b, ln, devices=gpu_devices)
         print(f"[gpu] solve services up on {gpu_devices}", flush=True)
@@ -606,7 +632,11 @@ def main():
         # The window is a quarter of the snapshot cadence: at 10-minute
         # snapshots a 30-minute run's final lands ~30 s after the last timed
         # snapshot, and rating both would waste ladder pairings on near-twins.
-        if snaps and el - snaps[-1]["t"] < args.snapshot_every * 60.0 / 4.0:
+        # Never collapse a short run's trained result into `init`: those are
+        # opposite ends of the experiment even when the whole run is shorter
+        # than the ordinary snapshot de-duplication window.
+        if snaps and snaps[-1]["label"] != "init" and \
+                el - snaps[-1]["t"] < args.snapshot_every * 60.0 / 4.0:
             snaps[-1]["label"] = label
             return
         path = f"{args.out}/snap_{len(snaps):02d}.pt"
@@ -617,6 +647,239 @@ def main():
         snaps.append({"label": label, "t": round(el, 1),
                       "file": os.path.basename(path)})
         print(f"[t={el:6.1f}s] --- snapshot {snaps[-1]['file']} ({label}) ---", flush=True)
+
+    def run_gpu_stream():
+        """Continuous solve -> replay -> optimizer pipeline for the production
+        pure-bootstrap configuration. Generation is backpressured by a bounded
+        Rust/Python chunk queue; optimizer work is paid from exact sample debt,
+        and immutable GPU weights are published on a fixed step cadence."""
+        nonlocal probe, cap_v, next_decay, next_snap, epoch, rebel_solves
+
+        if args.mc_mix != 0.0 or args.aux != 0.0 or args.policy != 0.0:
+            raise ValueError("continuous GPU generation requires --mc-mix 0 --aux 0 --policy 0")
+        if args.warm != 0.0:
+            raise ValueError("the v5 GPU executor requires --warm 0")
+        if args.train_gen_ratio <= 0.0:
+            raise ValueError("--train-gen-ratio must be positive")
+
+        gen = warchest.gpu_stream_start(
+            args.seed * 1_000_003 + epoch,
+            depth=args.depth, iters=args.iters, explore=args.explore,
+            random_draft=args.random_draft, cfr=args.cfr, warm=args.warm,
+            eval_mix=args.eval_mix, workers=args.gpu_workers,
+            actors_per_worker=args.gpu_actors, chunk_solves=args.gpu_chunk)
+        deadline = t0 + total
+        drain = max(0.0, min(args.gpu_drain_seconds, total - warm))
+        stop_at = deadline - drain
+        publish_steps = max(1, args.gpu_publish_steps)
+        optimizer_rows = 0
+        optimizer_steps = 0
+        publications = 0
+        stopping = False
+        done = False
+        next_report = time.time() + 10.0
+        counter_names = (
+            "games", "decisions", "horizon_hits", "node_caps",
+            "oversize_routes", "exact_fallbacks", "censored_games",
+            "dropped", "configs")
+        totals = {name: 0 for name in counter_names}
+        window = {name: 0 for name in counter_names}
+        window.update(rows=0, solves=0, target_n=0, target_sum=0.0,
+                      target_sq=0.0, conv_s=0.0, add_s=0.0,
+                      train_s=0.0, gpu_wait_s=0.0,
+                      loss_sum=0.0, train_steps=0)
+
+        def emit_report(now):
+            nonlocal probe, epoch
+            elapsed = max(now - rebel_t0, 1e-9)
+            debt = max(0.0, args.train_gen_ratio * rebel_solves - optimizer_rows)
+            credit = optimizer_rows / args.train_gen_ratio
+            raw_sps = rebel_solves / elapsed
+            balanced_sps = min(rebel_solves, credit) / elapsed
+            if probe is None and len(buf) >= 2048:
+                probe = make_batch(buf.sample(2048, rng), rng, dev, False)
+            with torch.no_grad():
+                probe_std = float(value(*probe[:6], probe[7]).std()) \
+                    if probe is not None else float("nan")
+                if len(buf) >= args.batch:
+                    old_parts = make_batch(
+                        buf.sample_old(args.batch, rng, args.recent_frac), rng, dev, False)
+                    loss_old = float(value_loss(value, *old_parts[:-1]))
+                    new_parts = make_batch(
+                        buf.sample(args.batch, rng, recent_mix=1.0,
+                                   recent_frac=args.recent_frac), rng, dev, False)
+                    loss_new = float(value_loss(value, *new_parts[:-1]))
+                else:
+                    loss_old = loss_new = float("nan")
+            tn = max(window["target_n"], 1)
+            tgt_mean = window["target_sum"] / tn
+            tgt_var = max(0.0, window["target_sq"] / tn - tgt_mean * tgt_mean)
+            dec = max(window["decisions"], 1)
+            games = max(window["games"], 1)
+            lv = window["loss_sum"] / max(window["train_steps"], 1)
+            rec = {
+                "t": round(now - t0, 1), "epoch": epoch, "phase": "rebel",
+                "games": window["games"], "decisions": window["decisions"],
+                "rows": window["rows"], "solves": window["solves"],
+                "loss": round(lv, 5), "loss_policy": float("nan"),
+                "loss_old": round(loss_old, 5), "loss_new": round(loss_new, 5),
+                "horizon_frac": round(window["horizon_hits"] / games, 3),
+                "node_caps": window["node_caps"],
+                "oversize_routes": window["oversize_routes"],
+                "exact_fallbacks": window["exact_fallbacks"],
+                "censored_games": window["censored_games"],
+                "dropped": window["dropped"],
+                "configs": round(window["configs"] / dec, 1),
+                "cap_value": round(cap_v, 4),
+                "steps": window["train_steps"],
+                "optimizer_steps": optimizer_steps,
+                "optimizer_rows": optimizer_rows,
+                "optimizer_debt": round(debt, 1),
+                "publications": publications,
+                "weight_age_steps": optimizer_steps % publish_steps,
+                "tgt_mean": round(tgt_mean, 4),
+                "tgt_std": round(tgt_var ** 0.5, 4),
+                "probe_std": round(probe_std, 4),
+                "gen_s": round(elapsed, 2),
+                "train_s": round(window["train_s"], 2),
+                "conv_s": round(window["conv_s"], 2),
+                "add_s": round(window["add_s"], 2),
+                "gpu_wait_s": round(window["gpu_wait_s"], 2),
+                "buf": len(buf),
+                "solves_per_s": round(raw_sps, 1),
+                "balanced_solves_per_s": round(balanced_sps, 1),
+                "lr": opt.param_groups[0]["lr"],
+                "deadline_remaining": round(max(0.0, deadline - now), 1),
+            }
+            log.append(rec)
+            write_log(args, log, snaps)
+            print(
+                f"[t={rec['t']:6.1f}s] rebel stream solves={rebel_solves} "
+                f"raw={raw_sps:.0f}/s balanced={balanced_sps:.0f}/s "
+                f"debt={debt:.0f} rows steps={optimizer_steps} "
+                f"over={totals['oversize_routes']} drop={totals['dropped']} "
+                f"L={lv:.5f} tgt={tgt_mean:+.3f}/{tgt_var ** 0.5:.3f} "
+                f"conv={window['conv_s']:.2f}s add={window['add_s']:.2f}s "
+                f"train={window['train_s']:.2f}s",
+                flush=True)
+            epoch += 1
+            for name in counter_names:
+                window[name] = 0
+            for name in ("rows", "solves", "target_n", "target_sum", "target_sq",
+                         "conv_s", "add_s", "train_s", "gpu_wait_s",
+                         "loss_sum", "train_steps"):
+                window[name] = 0
+
+        try:
+            while True:
+                now = time.time()
+                if not stopping and now >= stop_at:
+                    gen.stop()
+                    stopping = True
+                    print(f"[t={now - t0:6.1f}s] --- stopping GPU admission; draining ---",
+                          flush=True)
+
+                data = None
+                if not done:
+                    try:
+                        data = gen.next(timeout=0.05)
+                    except StopIteration:
+                        done = True
+
+                if data is not None:
+                    tc = time.time()
+                    rows = np.asarray(data["rows"], np.uint8).reshape(-1, ROW_BYTES)
+                    cc = np.asarray(data["cc"], np.uint8).reshape(-1, CCOUNTS)
+                    cw = np.asarray(data["cw"], np.float32)
+                    cy = np.clip(np.asarray(data["cy"], np.float32), -1.0, 1.0)
+                    coff = np.asarray(data["coff"], np.int64)
+                    soff = np.asarray(data["soff"], np.int64)
+                    solves = int(data["solves"])
+                    window["conv_s"] += time.time() - tc
+                    ta = time.time()
+                    if len(rows) > 0:
+                        buf.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
+                    window["add_s"] += time.time() - ta
+                    rebel_solves += solves
+                    window["solves"] += solves
+                    window["rows"] += len(rows)
+                    window["target_n"] += cy.size
+                    window["target_sum"] += float(cy.sum(dtype=np.float64))
+                    window["target_sq"] += float(np.square(cy.astype(np.float64)).sum())
+                    window["gpu_wait_s"] += float(data.get("gpu_wait_s", 0.0))
+                    for name in counter_names:
+                        v = int(data.get(name, 0))
+                        totals[name] += v
+                        window[name] += v
+
+                debt = max(0.0, args.train_gen_ratio * rebel_solves - optimizer_rows)
+                if debt >= args.batch and len(buf) >= args.batch:
+                    until_publish = publish_steps - optimizer_steps % publish_steps
+                    nsteps = min(int(debt // args.batch), until_publish)
+                    tt = time.time()
+                    lv, _ = train_steps(
+                        value, opt, buf, nsteps, args.batch, rng, dev,
+                        aux_weight=0.0, policy_weight=0.0,
+                        augment=not args.no_augment,
+                        recent_mix=args.recent_mix, recent_frac=args.recent_frac)
+                    window["train_s"] += time.time() - tt
+                    window["loss_sum"] += lv * nsteps
+                    window["train_steps"] += nsteps
+                    optimizer_steps += nsteps
+                    optimizer_rows += nsteps * args.batch
+                    if optimizer_steps % publish_steps == 0:
+                        value.push(0)
+                        flat = value.flat()
+                        for i in range(len(gpu_devices)):
+                            warchest.gpu_set_weights(value.dims, *flat, device=i)
+                        publications += 1
+
+                now = time.time()
+                rebel_elapsed = max(0.0, now - rebel_t0)
+                span = max(args.anneal_frac * (total - warm), 1.0)
+                cap_v = args.cap_value * max(0.0, 1.0 - rebel_elapsed / span)
+                warchest.set_cap_value(cap_v)
+                while next_decay < len(lr_decays) and \
+                        rebel_elapsed >= lr_decays[next_decay] * (total - warm):
+                    for pg in opt.param_groups:
+                        pg["lr"] /= 2
+                    print(f"[t={now - t0:6.1f}s] --- lr -> {opt.param_groups[0]['lr']:.2e} ---",
+                          flush=True)
+                    next_decay += 1
+                if now - t0 >= next_snap:
+                    snapshot(f"s{len(snaps)}", now - t0)
+                    next_snap = now - t0 + args.snapshot_every * 60.0
+                if now >= next_report:
+                    emit_report(now)
+                    next_report = now + 10.0
+
+                debt = max(0.0, args.train_gen_ratio * rebel_solves - optimizer_rows)
+                if done and debt < args.batch:
+                    break
+        finally:
+            if not stopping:
+                gen.stop()
+
+        now = time.time()
+        if any(window[name] for name in ("solves", "games", "decisions", "train_steps")):
+            emit_report(now)
+        # The run's denominator is the fixed ReBeL wall-clock interval, not an
+        # early exit made flattering by a short drain. Usually this is only a
+        # few seconds of reserve left after all submitted waves have completed.
+        while time.time() < deadline:
+            time.sleep(min(0.05, deadline - time.time()))
+        elapsed = max(time.time() - rebel_t0, 1e-9)
+        debt = max(0.0, args.train_gen_ratio * rebel_solves - optimizer_rows)
+        credit = optimizer_rows / args.train_gen_ratio
+        raw_sps = rebel_solves / elapsed
+        balanced_sps = min(rebel_solves, credit) / elapsed
+        print(
+            f"[gpu-summary] solves={rebel_solves} optimizer_rows={optimizer_rows} "
+            f"debt={debt:.0f} raw={raw_sps:.1f}/s balanced={balanced_sps:.1f}/s "
+            f"over={totals['oversize_routes']} exact={totals['exact_fallbacks']} "
+            f"censored={totals['censored_games']} dropped={totals['dropped']} "
+            f"overrun={max(0.0, time.time() - deadline):.2f}s",
+            flush=True)
 
     next_snap = float("inf")
     print(f"[cfg] PUBFEAT={PUBFEAT} CFEAT={CFEAT} hidden={args.hidden} head={args.head or args.hidden} dg={args.dg} rank={args.rank} depth={args.depth} "
@@ -657,6 +920,10 @@ def main():
             rebel_t0 = time.time()
             rebel_solves = 0
             print(f"[t={el:6.1f}s] --- switching to ReBeL ---", flush=True)
+            if args.gpu and args.mc_mix == 0.0 and args.aux == 0.0 \
+                    and args.policy == 0.0 and args.warm == 0.0:
+                run_gpu_stream()
+                break
 
         tg = time.time()
         kw = dict(random_draft=args.random_draft)

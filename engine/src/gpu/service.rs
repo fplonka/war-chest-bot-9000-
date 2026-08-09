@@ -360,6 +360,7 @@ fn run(
                 }
             }
         }
+        retain_needed_banks(&mut exec, current_version, &pending);
     }
 }
 
@@ -401,6 +402,16 @@ fn handle(
         }
         Cmd::Shutdown => *shutdown = true,
     }
+    retain_needed_banks(exec, *current_version, pending);
+}
+
+fn retain_needed_banks(exec: &mut Executor, current: u64, pending: &VecDeque<Pending>) {
+    let mut keep = Vec::with_capacity(pending.len() + 1);
+    keep.push(current);
+    keep.extend(pending.iter().map(|p| p.version));
+    keep.sort_unstable();
+    keep.dedup();
+    exec.retain_weight_versions(&keep);
 }
 
 fn bucket_rows(pending: &VecDeque<Pending>) -> usize {

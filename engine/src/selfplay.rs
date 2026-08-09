@@ -1669,7 +1669,7 @@ pub fn run_games_gpu_stream(
     actors_per_worker: usize,
     chunk_solves: usize,
     stop: &std::sync::atomic::AtomicBool,
-    output: std::sync::mpsc::Sender<Result<Option<Data>, String>>,
+    output: std::sync::mpsc::SyncSender<Result<Option<Data>, String>>,
 ) {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1769,12 +1769,27 @@ pub fn run_games_gpu_stream(
                     };
                     busy[k] = false;
                     if stop.load(Ordering::Acquire) {
-                        if let Some(mut g) = game[k].take() {
-                            let mut d = g.take_data();
-                            d.gpu_wait_s += waited.elapsed().as_secs_f32();
-                            d.censored_games += 1;
-                            let _ = data_tx.send(Ok(d));
-                            live -= 1;
+                        match result {
+                            Ok(value) => {
+                                // Stop closes admission, not accounting. This
+                                // solve completed while the final waves drained;
+                                // keep its final bootstrap target, then censor
+                                // only the unfinished public game around it.
+                                let mut g = game[k].take().expect("draining stream game");
+                                g.resume(value);
+                                let mut d = g.take_data();
+                                d.gpu_wait_s += waited.elapsed().as_secs_f32();
+                                d.censored_games += 1;
+                                let _ = data_tx.send(Ok(d));
+                                live -= 1;
+                            }
+                            Err(e) => {
+                                let _ = game[k].take();
+                                live -= 1;
+                                let _ = data_tx.send(Err(format!(
+                                    "GPU stream solve failed while draining: {e}"
+                                )));
+                            }
                         }
                         continue;
                     }

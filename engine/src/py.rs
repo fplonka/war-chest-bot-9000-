@@ -575,7 +575,7 @@ impl Drop for GpuGenerator {
 
 #[cfg(feature = "gpu")]
 #[pyfunction]
-#[pyo3(signature = (seed, depth=2, iters=64, explore=0.25, random_draft=true, cfr="linear", warm=0.0, workers=36, actors_per_worker=64, chunk_solves=1024))]
+#[pyo3(signature = (seed, depth=2, iters=64, explore=0.25, random_draft=true, cfr="linear", warm=0.0, eval_mix=0.5, workers=36, actors_per_worker=64, chunk_solves=1024))]
 #[allow(clippy::too_many_arguments)]
 fn gpu_stream_start(
     seed: u64,
@@ -585,6 +585,7 @@ fn gpu_stream_start(
     random_draft: bool,
     cfr: &str,
     warm: f32,
+    eval_mix: f32,
     workers: usize,
     actors_per_worker: usize,
     chunk_solves: usize,
@@ -604,7 +605,7 @@ fn gpu_stream_start(
         collect: Collect::Rebel,
         explore,
         random_draft,
-        eval_mix: 0.0,
+        eval_mix,
         mc_mix: 0.0,
     };
     let nets = nets().read().unwrap().clone();
@@ -616,7 +617,10 @@ fn gpu_stream_start(
     }
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let run_stop = stop.clone();
-    let (tx, rx) = std::sync::mpsc::channel();
+    // Bound complete replay chunks as well as Rust's worker-to-merger queue.
+    // If conversion/training falls behind, backpressure reaches actor resume
+    // instead of retaining an unbounded number of multi-megabyte Python arrays.
+    let (tx, rx) = std::sync::mpsc::sync_channel(4);
     let thread = std::thread::Builder::new()
         .name("warchest-gpu-stream".into())
         .spawn(move || {
@@ -866,6 +870,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     out.set_item("censored_games", d.censored_games)?;
     out.set_item("dropped", d.dropped)?;
     out.set_item("configs", d.configs)?;
+    out.set_item("gpu_wait_s", d.gpu_wait_s)?;
     assert_eq!(
         d.coff.len(),
         if d.nv == 0 { 0 } else { 2 * d.nv + 1 },

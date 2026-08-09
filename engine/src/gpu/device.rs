@@ -419,6 +419,13 @@ impl Executor {
         Ok(())
     }
 
+    /// Retire immutable banks once this lane has no queued wave stamped with
+    /// their version. Lane command order proves that no unseen older submit can
+    /// arrive after the publication that introduced a newer version.
+    pub fn retain_weight_versions(&mut self, keep: &[u64]) {
+        self.banks.retain(|version, _| keep.contains(version));
+    }
+
     pub fn solve(&mut self, wave: Wave, version: u64) -> Result<Vec<SolveResult>, String> {
         let profile = std::env::var_os("WARCHEST_GPU_PROFILE").is_some();
         let started = Instant::now();
