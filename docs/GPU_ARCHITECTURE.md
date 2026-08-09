@@ -4,10 +4,11 @@ Status: implementation in progress. The v5 milestone build reached 717.1
 solves/s on one RTX 3090 and 1,438.9/s on two on the frozen production tape.
 The later live scheduler added cost isolation and exact exclusive-whale routing,
 so those homogeneous-tape numbers describe commit `c40d246`, not the current
-service. On the warmed fixed live stream, the current FP32 build reaches 915.5/s
-before stop over 180.1 seconds and 839.3/s including drain, with zero drops. A
-correct five-minute Greedy-warm/ReBeL run reached 624.5 balanced solves/s. The
-five-minute 1,200/s and golden-run gates have not been achieved yet.
+service. Lane-local whale isolation raised the warmed fixed live stream from
+915.5 to 1,051.5/s before stop over 180.2 seconds, and from 839.3 to 1,009.4/s
+including drain. The matching five-minute Greedy-warm/ReBeL gate improved from
+624.5 to 699.7 balanced solves/s, with zero drops or exact fallbacks and bounded
+debt. The five-minute 1,200/s and golden-run gates have not been achieved yet.
 
 This is a replacement design, not an incremental plan for the resident CUDA
 service. Keep the verified rules, tree semantics, compact training-row format,
@@ -727,6 +728,14 @@ reduced the 180-second pre-stop rate from 915.5 to 892.4/s; fuller waves did not
 repay their packing and transfer cost, and the change was reverted. Stable-memory
 live self-play above 1,400/s remains required before this integration gate is
 complete.
+
+The first material live-tail improvement was removing the card-wide barrier for
+exclusive whales. An aged trace showed that barrier leaving two of one card's
+three streams idle. Commit `8a32c46` instead trims only the selected lane and
+lets the other two continue. The 180-second warmed stream improved from 915.5
+to 1,051.5/s before stop, and the real five-minute balanced trainer improved
+from 624.5 to 699.7/s. Peak memory remained bounded at 21,473 MiB on the busier
+24 GiB card while PyTorch trained concurrently on the other service card.
 
 ### 4. Replace the trainer boundary
 

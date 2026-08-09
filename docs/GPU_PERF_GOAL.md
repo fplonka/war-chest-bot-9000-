@@ -152,10 +152,12 @@ and live cost isolation landed afterward, so those numbers are a historical
 executor milestone rather than throughput of the current heterogeneous live
 scheduler.
 
-The current warmed FP32 live-stream control completed 164,864 solves before
-stop over 180.1 seconds, or 915.5/s, and 839.3/s including drain. The correct
-five-minute Greedy-warm/ReBeL training run reached 624.5 balanced solves/s with
-zero drops and bounded debt. Those are the active generation and training
+The warmed FP32 live-stream control completed 164,864 solves before stop over
+180.1 seconds, or 915.5/s, and 839.3/s including drain. Lane-local whale
+isolation raised those results to 1,051.5/s before stop and 1,009.4/s including
+drain. The matching correct five-minute Greedy-warm/ReBeL training gate improved
+from 624.5 to 699.7 balanced solves/s, with zero drops, no exact fallbacks, 240
+rows of debt, and no overrun. Those are the active generation and training
 baselines; the opening burst is not used as a steady-state result.
 
 ## How to measure progress
