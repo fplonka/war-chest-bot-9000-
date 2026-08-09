@@ -1,0 +1,7 @@
+# First live device-batch trainer
+
+We were measuring whether compact replay expansion on GPU 1 converts its 24.9x isolated preparation win into real balanced throughput. This was the corrected retry after explicitly pinning Triton to `cuda:1`, with 128 actors per builder and a 12-second drain reserve.
+
+The steady pipeline cleared 1,200 while admission was open. Cumulative balanced throughput was 1,320/s at 10 seconds, 1,246/s at 21 seconds, 1,438/s at 31 seconds, and 1,238/s at 41 seconds, always with zero optimizer debt. Batch preparation dropped to 10-44 ms per step depending on configuration width, versus roughly 160 ms in the preceding integrated run; total optimizer steps were generally 80-130 ms. This is the first real training measurement above the target during its live interval.
+
+Shutdown still invalidated the fixed-budget result. Every one of the 4,608 actors was allowed to hold a submitted solve, so stopping admission at 48 seconds left a queue that drained until 63.5 seconds. The run counted 58,318 solves and 232,448 optimizer rows, leaving 824 rows of debt, but the actual overrun denominator reduced balanced throughput to 915.0/s. Four large solves used the dedicated path, with zero exact fallback and zero drop. At this point trainer throughput was sufficient; the remaining task was to bound submitted work independently of the 128-actor state pool so the deadline drain is a few seconds rather than fifteen.
