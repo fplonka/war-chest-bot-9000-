@@ -181,15 +181,25 @@ pub struct WorkVector {
 }
 
 impl WorkVector {
-    /// Jobs in this tail need an isolated one-job lane wave. `mutable_bytes`
-    /// includes allocator power-of-two rounding, so this tests the reservation
-    /// CUDA will actually attempt.
-    pub fn requires_exclusive_route(self) -> bool {
+    fn reserved_bytes(self) -> usize {
         let table_reservation = self
             .table_bytes
             .checked_next_power_of_two()
             .unwrap_or(self.table_bytes);
-        self.mutable_bytes.saturating_add(table_reservation) >= (4usize << 30)
+        self.mutable_bytes.saturating_add(table_reservation)
+    }
+
+    /// Jobs in this tail need an isolated one-job lane wave. `mutable_bytes`
+    /// includes allocator power-of-two rounding, so this tests the reservation
+    /// CUDA will actually attempt.
+    pub fn requires_exclusive_route(self) -> bool {
+        self.reserved_bytes() >= (4usize << 30)
+    }
+
+    /// This rarer tail cannot coexist with the ordinary buffers retained by
+    /// the other lanes on a 24 GiB card. Drain and trim one card around it.
+    pub fn requires_card_exclusive_route(self) -> bool {
+        self.reserved_bytes() >= (6usize << 30)
     }
 }
 
@@ -1220,6 +1230,33 @@ mod tests {
         let mut wide = job.clone();
         wide.tables.legal_action.push(u16::MAX as u32);
         assert_eq!(wide.index_width(), IndexWidth::Wide);
+    }
+
+    #[test]
+    fn whale_routes_match_card_memory_classes() {
+        let ordinary = WorkVector {
+            mutable_bytes: 3usize << 30,
+            table_bytes: 1,
+            ..Default::default()
+        };
+        assert!(!ordinary.requires_exclusive_route());
+        assert!(!ordinary.requires_card_exclusive_route());
+
+        let lane_whale = WorkVector {
+            mutable_bytes: 4usize << 30,
+            table_bytes: 1,
+            ..Default::default()
+        };
+        assert!(lane_whale.requires_exclusive_route());
+        assert!(!lane_whale.requires_card_exclusive_route());
+
+        let card_whale = WorkVector {
+            mutable_bytes: 4usize << 30,
+            table_bytes: (1usize << 30) + 1,
+            ..Default::default()
+        };
+        assert!(card_whale.requires_exclusive_route());
+        assert!(card_whale.requires_card_exclusive_route());
     }
 }
 

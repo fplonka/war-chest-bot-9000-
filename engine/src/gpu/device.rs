@@ -405,6 +405,18 @@ impl Executor {
         Ok(())
     }
 
+    /// Release wave-sized allocations while retaining the lane's CUDA
+    /// context, kernels, cuBLAS handle, and immutable weight banks.
+    pub fn trim(&mut self) -> Result<(), String> {
+        self.stream
+            .synchronize()
+            .map_err(|e| format!("synchronize before GPU trim: {e:?}"))?;
+        self.buffers = None;
+        self.graphs.clear();
+        self.next_graph = 0;
+        Ok(())
+    }
+
     /// Retire immutable banks once this lane has no queued wave stamped with
     /// their version. Lane command order proves that no unseen older submit can
     /// arrive after the publication that introduced a newer version.
