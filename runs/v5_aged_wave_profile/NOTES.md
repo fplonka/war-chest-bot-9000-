@@ -11,3 +11,11 @@ An uninstrumented Nsight Systems trace captured ten seconds at roughly 130 secon
 Two direct follow-ups were negative and were reverted. Computing the LayerNorm second moment in the first pass, instead of revisiting the 384 register values for variance, was neutral to about 0.4% slower on interleaved tapes. Changing the register-heavy kernel from 256 to 128 threads per block initially looked slightly faster, but the longer interleaved pair averaged 394.9 versus 404.2 solves/s; 512 threads was worse again. The existing stable variance calculation and 256-thread launch therefore remain production defaults.
 
 Folding leaf readout into the cooperative backpropagation kernel was also a clear regression. It preserved the operation order with a grid-wide barrier and removed about 27,000 launches per ten traced seconds, but constraining readout to the four-block-per-SM cooperative grid reduced the matched tape from 398.4 to 360.4 solves/s (about 9.5%). The standalone readout kernel's wider occupancy is worth more than the launch saving, so the two kernels remain separate.
+
+Storing the rank-64 leaf and configuration readout vectors as float16 was not
+worth keeping either. Compressing both made one wave-composition strategy
+probability move by 0.32. Keeping the dynamic leaf vector in float32 reduced
+that worst change to 0.089, but the identical frozen tape improved only from
+453.6 to 454.4 solves/s, about 0.2%. The production float32 readout vectors were
+restored rather than spending correctness margin and code on a noise-level
+speed change.
