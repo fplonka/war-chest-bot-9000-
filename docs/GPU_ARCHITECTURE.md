@@ -2,8 +2,11 @@
 
 Status: implementation in progress. The v5 deterministic production tape now
 reaches 717.1 solves/s on one RTX 3090 and 1,438.9 solves/s on two. The tape
-throughput gates are cleared; the live self-play, balanced trainer, and golden
-run gates have not been achieved yet.
+throughput gates are cleared. A 30-second live-stream diagnostic with 3,456
+actors reached 1,294.5 completed solves/s before stop, including two exact whale
+routes and no drops; its current stop/drain accounting reduced the full 41.1 s
+interval to 946.1/s. The balanced trainer, five-minute deadline, and golden-run
+gates have not been achieved yet.
 
 This is a replacement design, not an incremental plan for the resident CUDA
 service. Keep the verified rules, tree semantics, compact training-row format,
@@ -21,9 +24,10 @@ The proposed system has four defining properties:
 
 1. CPU workers build verified public trees into a sparse, immutable contract.
    They never block as game-sized threads waiting for CUDA.
-2. Each GPU executes cost-bucketed, contiguous waves with CUDA Graphs. A wave
-   has one weight version and one fixed 64-iteration schedule; there is no
-   fragmented per-solve slab and no host-driven live-set tick.
+2. Each GPU executes cost-bucketed, contiguous waves on reusable CUDA streams.
+   Homogeneous frozen tapes can reuse CUDA Graphs; heterogeneous live waves use
+   direct launches. A wave has one weight version and one fixed 64-iteration
+   schedule; there is no fragmented per-solve slab or host-driven live-set tick.
 3. Mutable CFR state exists only for legal action cells. Instantaneous regret
    and a persistent normalised-average arena do not exist.
 4. Solves, replay insertion, optimizer steps, and weight publication are one
@@ -350,18 +354,20 @@ normal wave. Oldest-first aging prevents starvation. The dispatcher routes to
 the GPU with the lowest predicted finish time, not round robin. GPU 1's
 prediction includes queued optimizer credit and its replay/training reserve.
 
-Capture the fixed operation sequence as a CUDA Graph. A graph contains the
-one-time network towers, 64 CFR iterations, fixed-strategy value passes for the
-carried roots, final policy normalization, result copies, and the known
-log-spaced snapshot points. Reuse a small number of graph executables and
-update counts/pointers, or launch against bounded class capacities with a
-measured padding ceiling. Do not create a graph variant for every observed
-tree size.
+The frozen tape can capture the fixed operation sequence as a CUDA Graph. Live
+waves are different: profiling 809 waves found that cuBLAS/topology changes made
+graph updates fail for most shapes, so recapture and instantiation cost 28.9 ms
+per wave on average while queueing the useful work cost 40.3 ms. Direct stream
+submission removes that construction cost and runs the identical fast FP32
+kernels/GEMMs in the identical order. `WARCHEST_DIRECT=1` selects it while the
+end-to-end crossover is measured. Do not create a graph variant for every
+observed tree size.
 
 This changes the launch economics. At 32 jobs/wave and 600 solves/s/card, a
 card needs about 19 waves/s, not tens of thousands of host launches per second.
-Graph nodes still launch kernels internally, but host submission gaps and the
-dynamic header rebuild disappear, and each node sees one contiguous work list.
+Whichever submission mode is used, each kernel sees one contiguous work list;
+the wave itself, rather than graph capture, is the important launch-economics
+change.
 
 ### CFR kernel schedule
 

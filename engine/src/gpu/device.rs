@@ -437,9 +437,17 @@ impl Executor {
             .ok_or_else(|| format!("GPU weight version {version} is unavailable"))?;
         let device = DeviceWave::upload(&self.stream, &wave, &bank.layout, self.buffers.take())?;
         let uploaded = Instant::now();
-        self.stream
-            .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-            .map_err(|e| format!("begin v5 CUDA Graph: {e:?}"))?;
+        // Arbitrary live waves often make cuBLAS choose a different captured
+        // topology, in which case graph update cannot reuse the executable and
+        // capture+instantiation is pure overhead. Keep a direct-stream A/B path
+        // while tuning that crossover; it executes the identical kernels and
+        // GEMMs in the identical order.
+        let direct = std::env::var_os("WARCHEST_DIRECT").is_some();
+        if !direct {
+            self.stream
+                .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+                .map_err(|e| format!("begin v5 CUDA Graph: {e:?}"))?;
+        }
         let queued = (|| -> Result<(), String> {
             self.build_towers(&device, bank)?;
             self.initialise(&device, bank, &wave)?;
@@ -509,18 +517,25 @@ impl Executor {
             }
             Ok(())
         })();
-        let graph = unsafe { result::stream::end_capture(self.stream.cu_stream()) }
-            .map_err(|e| format!("end v5 CUDA Graph capture: {e:?}"))?;
-        queued?;
-        if graph.is_null() {
-            return Err("v5 CUDA Graph capture produced no graph".into());
-        }
-        let graph = CapturedGraph(graph);
-        let (graph_slot, graph_reused) =
-            update_graph(&mut self.graphs, &mut self.next_graph, graph.0)?;
+        let graph = if direct {
+            queued?;
+            None
+        } else {
+            let graph = unsafe { result::stream::end_capture(self.stream.cu_stream()) }
+                .map_err(|e| format!("end v5 CUDA Graph capture: {e:?}"))?;
+            queued?;
+            if graph.is_null() {
+                return Err("v5 CUDA Graph capture produced no graph".into());
+            }
+            let graph = CapturedGraph(graph);
+            let (slot, reused) = update_graph(&mut self.graphs, &mut self.next_graph, graph.0)?;
+            Some((slot, reused))
+        };
         let captured = Instant::now();
-        unsafe { result::graph::launch(self.graphs[graph_slot].raw, self.stream.cu_stream()) }
-            .map_err(|e| format!("launch v5 CUDA Graph: {e:?}"))?;
+        if let Some((slot, _)) = graph {
+            unsafe { result::graph::launch(self.graphs[slot].raw, self.stream.cu_stream()) }
+                .map_err(|e| format!("launch v5 CUDA Graph: {e:?}"))?;
+        }
 
         let strategy = copy_arena(
             &self.stream,
@@ -542,8 +557,9 @@ impl Executor {
         let result = unpack(wave, strategy, root_values, carries, version);
         if profile {
             let unpacked = Instant::now();
+            let graph_reused = graph.is_some_and(|(_, reused)| reused);
             eprintln!(
-                "v5_device jobs={profile_jobs} rows={profile_rows} cells={profile_cells} graph_reused={graph_reused} upload_ms={:.2} capture_ms={:.2} queue_ms={:.2} gpu_ms={:.2} unpack_ms={:.2} total_ms={:.2}",
+                "v5_device jobs={profile_jobs} rows={profile_rows} cells={profile_cells} direct={direct} graph_reused={graph_reused} upload_ms={:.2} capture_ms={:.2} queue_ms={:.2} gpu_ms={:.2} unpack_ms={:.2} total_ms={:.2}",
                 1e3 * (uploaded - started).as_secs_f64(),
                 1e3 * (captured - uploaded).as_secs_f64(),
                 1e3 * (queued_output - captured).as_secs_f64(),

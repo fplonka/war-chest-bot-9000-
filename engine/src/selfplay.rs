@@ -288,8 +288,8 @@ pub struct Data {
     /// Valid solves too large to coexist with the ordinary GPU wave lanes.
     /// They run through the serialized exact path and are never discarded.
     pub oversize_routes: usize,
-    /// GPU submissions retried by the exact CPU solver, including oversize
-    /// routes and unexpected device errors.
+    /// GPU submissions retried by the exact CPU solver after an unexpected
+    /// device error. Oversize jobs normally complete on the serialized GPU path.
     pub exact_fallbacks: usize,
     /// Live games intentionally discarded at a wall-clock deadline. This is
     /// time-censored work, not a capacity drop and never enters replay.
