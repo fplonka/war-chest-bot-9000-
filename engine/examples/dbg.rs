@@ -24,19 +24,48 @@ fn main() {
     let net = Mlp::load_bin("/tmp/oracle_test/weights.bin").unwrap();
     let nets = [Nets { value: net }];
     let gc = GameCfg {
-        agents: [Agent::Rebel { cfg: Cfg { depth: 2, iters: 4, snapshots: false, ..Default::default() }, slot: 0 }; 2],
-        collect: Collect::None, explore: 0.0, random_draft: true,
-        eval_mix: 0.0, mc_mix: 0.0,
+        agents: [Agent::Rebel {
+            cfg: Cfg {
+                depth: 2,
+                iters: 4,
+                snapshots: false,
+                ..Default::default()
+            },
+            slot: 0,
+        }; 2],
+        collect: Collect::None,
+        explore: 0.0,
+        random_draft: true,
+        eval_mix: 0.0,
+        mc_mix: 0.0,
     };
     let roots = collect_roots(4, 0xC0FFEE, &nets, &gc, 6);
     let (s, bel) = &roots[which];
     let ctx = warchest::rebel::Ctx::new(s);
-    let mut sv = Solver::new(s, ctx, &nets[0],
-        Cfg { depth: 2, iters: 8, snapshots: true, ..Default::default() }, bel.clone());
+    let mut sv = Solver::new(
+        s,
+        ctx,
+        &nets[0],
+        Cfg {
+            depth: 2,
+            iters: 8,
+            snapshots: true,
+            ..Default::default()
+        },
+        bel.clone(),
+    );
     dump("reach0", dir, &sv.reach);
     dump("cur0", dir, &sv.cur);
-    dump("sum0", dir, &sv.sum_strat.iter().flatten().cloned().collect::<Vec<_>>());
-    dump("avg0", dir, &sv.avg.iter().flatten().cloned().collect::<Vec<_>>());
+    dump(
+        "sum0",
+        dir,
+        &sv.sum_strat.iter().flatten().cloned().collect::<Vec<_>>(),
+    );
+    dump(
+        "avg0",
+        dir,
+        &sv.avg.iter().flatten().cloned().collect::<Vec<_>>(),
+    );
     // Leaf values for traverser 0 (phases 1-3). This also runs the build
     // GEMMs (ensure_leaf_batch), filling h0/ce/cz/cg.
     sv.leaf_values(0);
@@ -58,12 +87,30 @@ fn main() {
     // RM (phase 5a).
     // (step does RM + propagate + AVG; replicate via step and dump)
     drop(sv);
-    let mut sv2 = Solver::new(s, ctx, &nets[0],
-        Cfg { depth: 2, iters: 8, snapshots: true, ..Default::default() }, bel.clone());
+    let mut sv2 = Solver::new(
+        s,
+        ctx,
+        &nets[0],
+        Cfg {
+            depth: 2,
+            iters: 8,
+            snapshots: true,
+            ..Default::default()
+        },
+        bel.clone(),
+    );
     sv2.step(0);
     dump("reach3", dir, &sv2.reach);
     dump("cur3", dir, &sv2.cur);
-    dump("sum3", dir, &sv2.sum_strat.iter().flatten().cloned().collect::<Vec<_>>());
-    dump("avg3", dir, &sv2.avg.iter().flatten().cloned().collect::<Vec<_>>());
+    dump(
+        "sum3",
+        dir,
+        &sv2.sum_strat.iter().flatten().cloned().collect::<Vec<_>>(),
+    );
+    dump(
+        "avg3",
+        dir,
+        &sv2.avg.iter().flatten().cloned().collect::<Vec<_>>(),
+    );
     println!("dumped to {}", dir.display());
 }

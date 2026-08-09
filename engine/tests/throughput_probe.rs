@@ -10,7 +10,12 @@ use warchest::selfplay::{play_game, Agent, Collect, Data, GameCfg};
 fn throughput_probe() {
     for iters in [16usize, 8] {
         let nets = [Nets::default()];
-        let cfg = Cfg { depth: 2, iters, snapshots: false, ..Default::default() };
+        let cfg = Cfg {
+            depth: 2,
+            iters,
+            snapshots: false,
+            ..Default::default()
+        };
         let n = 8;
         let t0 = Instant::now();
         let mut games = 0u64;
@@ -19,10 +24,7 @@ fn throughput_probe() {
             let mut rng = Rng::new(seed * 31 + 5);
             let mut d = Data::default();
             let gc = GameCfg {
-                agents: [
-                    Agent::Rebel { cfg, slot: 0 },
-                    Agent::Rebel { cfg, slot: 0 },
-                ],
+                agents: [Agent::Rebel { cfg, slot: 0 }, Agent::Rebel { cfg, slot: 0 }],
                 collect: Collect::Rebel,
                 explore: 0.0,
                 random_draft: false,
@@ -46,17 +48,19 @@ fn throughput_probe() {
     // Eval mode (avg strategy, no targets):
     {
         let nets = [Nets::default()];
-        let cfg = Cfg { depth: 2, iters: 16, snapshots: false, ..Default::default() };
+        let cfg = Cfg {
+            depth: 2,
+            iters: 16,
+            snapshots: false,
+            ..Default::default()
+        };
         let t0 = Instant::now();
         let mut games = 0u64;
         for seed in 0..16u64 {
             let mut rng = Rng::new(seed * 31 + 5);
             let mut d = Data::default();
             let gc = GameCfg {
-                agents: [
-                    Agent::Rebel { cfg, slot: 0 },
-                    Agent::Rebel { cfg, slot: 0 },
-                ],
+                agents: [Agent::Rebel { cfg, slot: 0 }, Agent::Rebel { cfg, slot: 0 }],
                 collect: Collect::None,
                 explore: 0.0,
                 random_draft: false,

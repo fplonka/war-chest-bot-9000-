@@ -4,12 +4,17 @@
 
 use warchest::rng::Rng;
 use warchest::search::{Cfg, Nets, Solver};
-use warchest::serialize::Job;
 use warchest::selfplay::collect_roots;
 use warchest::selfplay::{Agent, Collect, GameCfg};
+use warchest::serialize::Job;
 
 fn cfg() -> Cfg {
-    Cfg { depth: 2, iters: 8, snapshots: true, ..Default::default() }
+    Cfg {
+        depth: 2,
+        iters: 8,
+        snapshots: true,
+        ..Default::default()
+    }
 }
 
 /// Serialize a real solver, parse it back, and require byte-identical
@@ -18,7 +23,10 @@ fn cfg() -> Cfg {
 fn real_solver_round_trips() {
     let nets = [Nets::default()];
     let gc = GameCfg {
-        agents: [Agent::Rebel { cfg: cfg(), slot: 0 }; 2],
+        agents: [Agent::Rebel {
+            cfg: cfg(),
+            slot: 0,
+        }; 2],
         collect: Collect::Rebel,
         explore: 0.0,
         random_draft: true,
@@ -54,7 +62,10 @@ fn real_solver_round_trips() {
 fn tables_are_consistent() {
     let nets = [Nets::default()];
     let gc = GameCfg {
-        agents: [Agent::Rebel { cfg: cfg(), slot: 0 }; 2],
+        agents: [Agent::Rebel {
+            cfg: cfg(),
+            slot: 0,
+        }; 2],
         collect: Collect::Rebel,
         explore: 0.0,
         random_draft: true,
@@ -111,7 +122,11 @@ fn tables_are_consistent() {
             leaf_marks[i as usize] += 1;
         }
         for i in 0..n {
-            assert_eq!(leaf_marks[i] > 0, t.node_leaf[i] == 1, "leaf flag mismatch at {i}");
+            assert_eq!(
+                leaf_marks[i] > 0,
+                t.node_leaf[i] == 1,
+                "leaf flag mismatch at {i}"
+            );
         }
         // terminal utilities are ±1 (or horizon-scaled), and finite.
         for &u in &t.terminal_utility {
@@ -131,7 +146,10 @@ fn starter_draft_round_trips() {
     for seed in 0..10u64 {
         let mut rng = Rng::new(seed.wrapping_mul(31) + 7);
         let gc = GameCfg {
-            agents: [Agent::Rebel { cfg: cfg(), slot: 0 }; 2],
+            agents: [Agent::Rebel {
+                cfg: cfg(),
+                slot: 0,
+            }; 2],
             collect: Collect::Rebel,
             explore: 0.5,
             random_draft: seed % 2 == 0,
@@ -141,7 +159,7 @@ fn starter_draft_round_trips() {
         let roots = collect_roots(3, seed, &nets, &gc, 2);
         for (s, bel) in roots {
             let ctx = warchest::rebel::Ctx::new(&s);
-        let sv = Solver::new(&s, ctx, &nets[0], cfg(), bel);
+            let sv = Solver::new(&s, ctx, &nets[0], cfg(), bel);
             if sv.capped() {
                 continue;
             }

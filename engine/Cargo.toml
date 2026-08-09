@@ -15,7 +15,7 @@ pyo3 = { version = "0.21", features = ["abi3-py39", "extension-module"], optiona
 numpy = { version = "0.21", optional = true }
 rayon = "1.10"
 matrixmultiply = "0.3"
-cudarc = { version = "0.17", optional = true, default-features = false, features = ["cuda-12000", "dynamic-loading", "driver", "nvrtc", "cublas"] }
+cudarc = { version = "0.17", optional = true, default-features = false, features = ["cuda-version-from-build-system", "dynamic-loading", "driver", "nvrtc", "cublas"] }
 
 [features]
 default = []
@@ -24,7 +24,9 @@ python = ["pyo3", "numpy"]
 prof = []
 # The CUDA solve service (work package B). Dynamic-loading cudarc needs no
 # CUDA toolkit at build time; the kernels are compiled by NVRTC at startup.
-# Pick the feature matching the box's CUDA runtime (12.x here).
+# Bind to the toolkit on the machine that builds the GPU feature. This matters
+# for NVRTC's versioned API: CUDA 13 removed symbols that a CUDA-12 binding
+# eagerly loads, even though the kernels themselves are source-compatible.
 gpu = ["dep:cudarc"]
 
 [[bin]]

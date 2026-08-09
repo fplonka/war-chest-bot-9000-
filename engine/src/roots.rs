@@ -5,8 +5,8 @@
 
 use std::io::{Read, Write};
 
-use crate::rebel::{Belief, Config, NSLOT};
 use crate::board::N_HEXES;
+use crate::rebel::{Belief, Config, NSLOT};
 use crate::state::{Cont, ContStack, State, CONT_CAP, N_PLAYERS, N_ZONES};
 use crate::units::N_UNITS;
 
@@ -41,14 +41,20 @@ fn rf32<R: Read>(r: &mut R) -> std::io::Result<f32> {
 fn write_cont<W: Write>(w: &mut W, c: &Cont) -> std::io::Result<()> {
     use Cont::*;
     match *c {
-        Draw { player } => { w8(w, 0)?; w8(w, player) }
+        Draw { player } => {
+            w8(w, 0)?;
+            w8(w, player)
+        }
         MainPlay => w8(w, 1),
         RoyalGuardChoice { defender, rg_hex } => {
             w8(w, 2)?;
             w8(w, defender)?;
             w8(w, rg_hex)
         }
-        SwordsmanMove { hex } => { w8(w, 3)?; w8(w, hex) }
+        SwordsmanMove { hex } => {
+            w8(w, 3)?;
+            w8(w, hex)
+        }
         BerserkerChain { hex, v2 } => {
             w8(w, 4)?;
             w8(w, hex)?;
@@ -58,9 +64,18 @@ fn write_cont<W: Write>(w: &mut W, c: &Cont) -> std::io::Result<()> {
             w8(w, 5)?;
             wu32(w, hexes.0 as u32)
         }
-        CavalryAttack { hex } => { w8(w, 6)?; w8(w, hex) }
-        MercenaryManeuver { hex } => { w8(w, 7)?; w8(w, hex) }
-        FootmanInstantDeploy { coin } => { w8(w, 8)?; w8(w, coin) }
+        CavalryAttack { hex } => {
+            w8(w, 6)?;
+            w8(w, hex)
+        }
+        MercenaryManeuver { hex } => {
+            w8(w, 7)?;
+            w8(w, hex)
+        }
+        FootmanInstantDeploy { coin } => {
+            w8(w, 8)?;
+            w8(w, coin)
+        }
         WarriorPriestDraw { player, rg_hex } => {
             w8(w, 9)?;
             w8(w, player)?;
@@ -71,7 +86,10 @@ fn write_cont<W: Write>(w: &mut W, c: &Cont) -> std::io::Result<()> {
             w8(w, player)?;
             w8(w, coin)
         }
-        _AttackPost { atk_hex } => { w8(w, 11)?; w8(w, atk_hex) }
+        _AttackPost { atk_hex } => {
+            w8(w, 11)?;
+            w8(w, atk_hex)
+        }
     }
 }
 
@@ -80,17 +98,36 @@ fn read_cont<R: Read>(r: &mut R) -> std::io::Result<Cont> {
     Ok(match r8(r)? {
         0 => Draw { player: r8(r)? },
         1 => MainPlay,
-        2 => RoyalGuardChoice { defender: r8(r)?, rg_hex: r8(r)? },
+        2 => RoyalGuardChoice {
+            defender: r8(r)?,
+            rg_hex: r8(r)?,
+        },
         3 => SwordsmanMove { hex: r8(r)? },
-        4 => BerserkerChain { hex: r8(r)?, v2: r8(r)? != 0 },
-        5 => FootmanManeuver { hexes: crate::state::HexSet(ru32(r)? as u64) },
+        4 => BerserkerChain {
+            hex: r8(r)?,
+            v2: r8(r)? != 0,
+        },
+        5 => FootmanManeuver {
+            hexes: crate::state::HexSet(ru32(r)? as u64),
+        },
         6 => CavalryAttack { hex: r8(r)? },
         7 => MercenaryManeuver { hex: r8(r)? },
         8 => FootmanInstantDeploy { coin: r8(r)? },
-        9 => WarriorPriestDraw { player: r8(r)?, rg_hex: r8(r)? },
-        10 => WarriorPriestPlay { player: r8(r)?, coin: r8(r)? },
+        9 => WarriorPriestDraw {
+            player: r8(r)?,
+            rg_hex: r8(r)?,
+        },
+        10 => WarriorPriestPlay {
+            player: r8(r)?,
+            coin: r8(r)?,
+        },
         11 => _AttackPost { atk_hex: r8(r)? },
-        t => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad cont tag {t}"))),
+        t => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("bad cont tag {t}"),
+            ))
+        }
     })
 }
 
@@ -221,9 +258,14 @@ pub fn read_root<R: Read>(r: &mut R) -> std::io::Result<(State, [Belief; 2])> {
     for p in 0..2 {
         let n = ru32(r)? as usize;
         if n > 100_000 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "belief too large"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "belief too large",
+            ));
         }
-        bel[p].cfg = (0..n).map(|_| read_config(r)).collect::<std::io::Result<_>>()?;
+        bel[p].cfg = (0..n)
+            .map(|_| read_config(r))
+            .collect::<std::io::Result<_>>()?;
         bel[p].p = (0..n).map(|_| rf32(r)).collect::<std::io::Result<_>>()?;
     }
     Ok((s, bel))
@@ -243,10 +285,16 @@ pub fn write_roots<W: Write>(w: &mut W, roots: &[(State, [Belief; 2])]) -> std::
 /// Load every root from a file.
 pub fn read_roots<R: Read>(r: &mut R) -> std::io::Result<Vec<(State, [Belief; 2])>> {
     if ru32(r)? != ROOTS_MAGIC {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad roots magic"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad roots magic",
+        ));
     }
     if ru32(r)? != ROOTS_VERSION {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad roots version"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad roots version",
+        ));
     }
     let n = ru32(r)? as usize;
     let mut out = Vec::with_capacity(n);

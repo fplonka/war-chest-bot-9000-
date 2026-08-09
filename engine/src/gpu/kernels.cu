@@ -33,6 +33,7 @@
 
 #define DG_CH ((DG + 31) / 32)
 #define RK_CH ((RK + 31) / 32)
+#define HEAD_CH ((HEADW + 31) / 32)
 
 // The network weights, the row pools and the build scratch: everything a
 // tick shares across solves. Uploaded once per weight publication; the batch
@@ -64,11 +65,14 @@ typedef struct {
 } Ctx;
 
 #define BMAP_INTS 5
+// Entries the service's batch map can hold (`MAX_BATCH` in service.rs).
+#define BMAP_CAP 32
 
 // The solves a launch covers: one block per entry of `slots`. The scalars are
 // per-launch switches; everything per-solve lives in the descriptor.
 typedef struct {
     const int* slots;
+    const int* prefix;
     int n;
     int mode;      // kernel-specific switch (documented at each kernel)
     int p_player;  // readout/backprop player: -1 = the solve's traverser
@@ -102,12 +106,17 @@ __device__ __forceinline__ bool legal_cell(const Desc* d, int cell) {
     return (T_legal_bits(d)[cell >> 3] >> (cell & 7)) & 1;
 }
 
-// The strategy a sweep reads, by stage: the current iterate, the average
-// (value passes), or the kept snapshot `step` (carry replays).
+// The strategy a normal sweep reads: current during CFR, final average during
+// fixed-policy value passes. Kept intermediate averages are propagated when
+// they are created, so no full-tree strategy snapshots exist.
 __device__ __forceinline__ const float* strat_of(const Desc* d) {
-    if (d->stage == STAGE_ITERATE) return A_cur(d);
-    if (d->stage == STAGE_VALUE) return A_avg(d);
-    return A_snaps(d) + (size_t)d->step * d->ncells;
+    return d->stage == STAGE_ITERATE ? A_cur(d) : A_avg(d);
+}
+
+__device__ __forceinline__ bool snapshot_due(const Desc* d) {
+    return d->stage == STAGE_ITERATE && d->snapshots
+        && d->snap_t < d->nsnaps - 1
+        && d->snap_iters[d->snap_t] == d->t + 1;
 }
 
 // The root belief a forward sweep seeds: the live root, or each carried root
@@ -134,10 +143,43 @@ __device__ __forceinline__ void warp_normalize(const float* w, int n, int lane,
 // Block-per-solve prologue: bind the descriptor and the warp geometry.
 #define SOLVE(d)                                                              \
     const Desc* d = descs + g->slots[blockIdx.x];                             \
+    if (d->stage == STAGE_DRAIN) return;                                      \
+    WC_DESC(d);                                                               \
     int lane = threadIdx.x & 31;                                              \
     int warp = threadIdx.x >> 5;                                              \
     int nwarps = blockDim.x >> 5;                                             \
     (void)lane; (void)warp; (void)nwarps;
+
+// Map a flat task index to its solve and solve-local index. An eight-step
+// binary search over the live prefix is cheaper than materialising and
+// uploading a task record for every row or node.
+__device__ __forceinline__ int flat_owner(const Group* g, int item, int* local) {
+    int lo = 0, hi = g->n;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (g->prefix[mid + 1] <= item) lo = mid + 1;
+        else hi = mid;
+    }
+    WC_CHECK(lo < g->n, "flat_owner slot", lo, g->n);
+    *local = item - g->prefix[lo];
+    return g->slots[lo];
+}
+
+// Find the entry of a running-count table that owns `item`, searching
+// `pfx[lo..hi]` (a sorted prefix, `pfx[hi]` past the end). Returns the entry
+// index and leaves the offset inside it in `*within`. This is how a
+// one-thread-per-config launch recovers the node it belongs to.
+__device__ __forceinline__ int cfg_owner(
+    const unsigned int* pfx, int lo, int hi, int item, int* within
+) {
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if ((int)pfx[mid + 1] <= item) lo = mid + 1;
+        else hi = mid;
+    }
+    *within = item - (int)pfx[lo];
+    return lo;
+}
 
 // LayerNorm + ReLU of one row, split across a warp; `add` may be null.
 // Ports net.rs::ln_relu (biased variance, torch's epsilon).
@@ -164,25 +206,190 @@ __device__ __forceinline__ void ln_relu_warp(float* row, const float* bias,
     }
 }
 
-// ------------------------------------------------------- belief sums
+// ------------------------------------------------ flattened live-set sweeps
 
-// xb[row][p] = sum_c w_c z[c] over the row's config support, weights being
-// the normalised reach. Ports normalize_weights + accumulate of
-// Solver::leaf_values. Warp per (row, player); the accumulator lives in
-// registers for the whole config loop.
-//
-// Which sides: the first query of a solve and every value pass build both;
-// later iterations rebuild only the *previous* traverser's side, the one
-// whose strategy regret matching just moved.
-extern "C" __global__ void belief_sums(const Desc* descs, const Group* g, const Ctx* ctx) {
+// Clear and seed one solve's reach arena. The level propagation is split into
+// `reach_level_flat` launches so each public node becomes an independent
+// block instead of one solve block serialising the whole ragged tree.
+extern "C" __global__ void reach_seed_flat(
+    const Desc* descs, const Group* g, const Ctx* ctx
+) {
     SOLVE(d)
-    if (d->stage == STAGE_CARRY) return;
+    (void)ctx;
+    if (g->mode == 2) { if (!snapshot_due(d)) return; }
+    else if (g->mode == 1) { if (d->stage != STAGE_ITERATE) return; }
+    else { if (d->stage != STAGE_VALUE) return; }
+    float* reach = g->mode == 2 ? A_snap_reach(d) : A_reach(d);
+    int rlen = (int)T_reach_off(d)[d->nodes];
+    for (int i = threadIdx.x; i < rlen; i += blockDim.x) reach[i] = 0.0f;
+    __syncthreads();
+    const float* root = g->mode == 2 ? T_root(d) : root_of(d);
+    int nr = d->nc_root[0] + d->nc_root[1];
+    for (int i = threadIdx.x; i < nr; i += blockDim.x) {
+        int p = i < d->nc_root[0] ? 0 : 1;
+        int c = p == 0 ? i : i - d->nc_root[0];
+        reach[reach_at(d, 0, p, c)] = root[i];
+    }
+}
+
+extern "C" __global__ void reach_level_flat(
+    const Desc* descs, const Group* g, const Ctx* ctx, int pass
+) {
+    int lane = threadIdx.x & 31;
+    int task = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (task >= g->total) return;
+    int slot = 0, local = 0;
+    if (lane == 0) slot = flat_owner(g, task, &local);
+    slot = __shfl_sync(0xffffffffu, slot, 0);
+    local = __shfl_sync(0xffffffffu, local, 0);
+    const Desc* d = descs + slot;
+    WC_DESC(d);
+    (void)ctx;
+    if (d->stage == STAGE_DRAIN) return;
+    if (pass == 2) { if (!snapshot_due(d)) return; }
+    else if (pass == 1) { if (d->stage != STAGE_ITERATE) return; }
+    else { if (d->stage != STAGE_VALUE) return; }
+    WC_CHECK(g->level < d->nlevels, "reach level", g->level, d->nlevels);
+    WC_CHECK(local < (int)(T_level_start(d)[g->level + 1]
+                           - T_level_start(d)[g->level]),
+             "reach local", local,
+             (int)(T_level_start(d)[g->level + 1] - T_level_start(d)[g->level]));
+    int at = (int)T_level_start(d)[g->level] + local;
+    WC_CHECK(at < d->nodes, "reach at", at, d->nodes);
+    int j = (int)T_bfs_order(d)[at];
+    WC_CHECK(j < d->nodes, "reach node", j, d->nodes);
+    if (j == 0) return;
+    int p = (int)T_node_parent(d)[j];
+    WC_CHECK(p < d->nodes, "reach parent", p, d->nodes);
+    int me = T_node_player(d)[p];
+    WC_CHECK(me == 0 || me == 1, "reach me", me, 2);
+    float* reach = pass == 2 ? A_snap_reach(d) : A_reach(d);
+
+    // CFR alternates traversers, and a player's counterfactual reach depends
+    // only on that player's own decisions (plus fixed chance transitions).
+    // After regret matching only the traverser's strategy changed, so update
+    // that half in place and leave the opponent's still-current reach alone.
+    // The root is unchanged, which also removes the iterate clear/seed pass.
+    if (pass == 1) {
+        int changed = d->traverser;
+        int out_at = reach_at(d, j, changed, 0);
+        int parent_at = reach_at(d, p, changed, 0);
+        int n = nc_of(d, j, changed);
+        WC_CHECK(out_at + n <= A_len_reach(d), "reach1 out", out_at + n,
+                 A_len_reach(d));
+        WC_CHECK(parent_at + nc_of(d, p, changed) <= A_len_reach(d),
+                 "reach1 parent span", parent_at + nc_of(d, p, changed),
+                 A_len_reach(d));
+        if (me != changed) {
+            WC_CHECK(n <= nc_of(d, p, changed), "reach1 copy", n,
+                     nc_of(d, p, changed));
+            for (int c = lane; c < n; c += 32) reach[out_at + c] = reach[parent_at + c];
+        } else if (T_rev_row_of(d)[j] != NONE) {
+            int row0 = (int)T_rev_row_of(d)[j];
+            WC_CHECK(row0 + n < T_cap_rev_start(d), "reach1 rev row", row0 + n,
+                     T_cap_rev_start(d));
+            const float* strat = A_cur(d);
+            for (int c = lane; c < n; c += 32) {
+                int lo = (int)T_rev_start(d)[row0 + c];
+                int hi = (int)T_rev_start(d)[row0 + c + 1];
+                WC_CHECK(hi <= T_cap_rev_src(d), "reach1 rev nnz", hi,
+                         T_cap_rev_src(d));
+                float acc = 0.0f;
+                for (int k = lo; k < hi; k++) {
+                    WC_CHECK((int)T_rev_src(d)[k] < nc_of(d, p, changed),
+                             "reach1 src", T_rev_src(d)[k], nc_of(d, p, changed));
+                    WC_CHECK((int)T_rev_cell(d)[k] < d->ncells, "reach1 cell",
+                             T_rev_cell(d)[k], d->ncells);
+                    acc += reach[parent_at + T_rev_src(d)[k]] * strat[T_rev_cell(d)[k]];
+                }
+                reach[out_at + c] = acc;
+            }
+        } else {
+            int row0 = (int)T_rvd_row_of(d)[j];
+            WC_CHECK(T_rvd_row_of(d)[j] != NONE, "reach1 rvd none", j, d->nodes);
+            WC_CHECK(row0 + n < T_cap_rvd_start(d), "reach1 rvd row", row0 + n,
+                     T_cap_rvd_start(d));
+            for (int c = lane; c < n; c += 32) {
+                int lo = (int)T_rvd_start(d)[row0 + c];
+                int hi = (int)T_rvd_start(d)[row0 + c + 1];
+                WC_CHECK(hi <= T_cap_rvd_src(d), "reach1 rvd nnz", hi,
+                         T_cap_rvd_src(d));
+                float acc = 0.0f;
+                for (int k = lo; k < hi; k++) {
+                    WC_CHECK((int)T_rvd_src(d)[k] < nc_of(d, p, changed),
+                             "reach1 rvd src", T_rvd_src(d)[k],
+                             nc_of(d, p, changed));
+                    acc += reach[parent_at + T_rvd_src(d)[k]] * T_rvd_p(d)[k];
+                }
+                reach[out_at + c] = acc;
+            }
+        }
+        return;
+    }
+
+    int op = 1 - me;
+    int me_at = reach_at(d, j, me, 0);
+    int op_at = reach_at(d, j, op, 0);
+    int pme_at = reach_at(d, p, me, 0);
+    int pop_at = reach_at(d, p, op, 0);
+    int nop = nc_of(d, j, op);
+    for (int c = lane; c < nop; c += 32) {
+        reach[op_at + c] = reach[pop_at + c];
+    }
+    int nme = nc_of(d, j, me);
+    if (T_rev_row_of(d)[j] != NONE) {
+        int row0 = (int)T_rev_row_of(d)[j];
+        const float* strat = pass == 2 ? A_avg(d) : strat_of(d);
+        for (int c = lane; c < nme; c += 32) {
+            int lo = (int)T_rev_start(d)[row0 + c];
+            int hi = (int)T_rev_start(d)[row0 + c + 1];
+            float acc = 0.0f;
+            for (int k = lo; k < hi; k++) {
+                WC_CHECK((int)T_rev_src(d)[k] < nc_of(d, p, me), "reach src",
+                         T_rev_src(d)[k], nc_of(d, p, me));
+                WC_CHECK((int)T_rev_cell(d)[k] < d->ncells, "reach cell",
+                         T_rev_cell(d)[k], d->ncells);
+                acc += reach[pme_at + T_rev_src(d)[k]] * strat[T_rev_cell(d)[k]];
+            }
+            reach[me_at + c] = acc;
+        }
+    } else {
+        int row0 = (int)T_rvd_row_of(d)[j];
+        for (int c = lane; c < nme; c += 32) {
+            int lo = (int)T_rvd_start(d)[row0 + c];
+            int hi = (int)T_rvd_start(d)[row0 + c + 1];
+            float acc = 0.0f;
+            for (int k = lo; k < hi; k++) {
+                acc += reach[pme_at + T_rvd_src(d)[k]] * T_rvd_p(d)[k];
+            }
+            reach[me_at + c] = acc;
+        }
+    }
+}
+
+// One warp per network leaf, spread across the whole live set. Most iterate
+// ticks need one player's projection; the first query and value stage compute
+// both players sequentially in the same warp instead of launching a grid with
+// half of its warps returning.
+extern "C" __global__ void belief_sums_flat(
+    const Desc* descs, const Group* g, const Ctx* ctx, int unused
+) {
+    (void)unused;
+    int lane = threadIdx.x & 31;
+    int task = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (task >= g->total) return;
+    int slot = 0, local = 0;
+    if (lane == 0) slot = flat_owner(g, task, &local);
+    slot = __shfl_sync(0xffffffffu, slot, 0);
+    local = __shfl_sync(0xffffffffu, local, 0);
+    const Desc* d = descs + slot;
+    WC_DESC(d);
+    if (d->stage == STAGE_CARRY || d->stage == STAGE_DRAIN) return;
+    int row = local;
     int both = (d->stage == STAGE_VALUE) || d->first_query;
-    int per_row = both ? 2 : 1;
-    int todo = d->nleaf * per_row;
-    for (int rp = warp; rp < todo; rp += nwarps) {
-        int row = rp / per_row;
-        int p = both ? (rp & 1) : 1 - d->traverser;
+    int np = both ? 2 : 1;
+    for (int side = 0; side < np; side++) {
+        int p = both ? side : 1 - d->traverser;
         int leaf = (int)T_leaf_rows(d)[row];
         int n = nc_of(d, leaf, p);
         const float* r = A_reach(d) + reach_at(d, leaf, p, 0);
@@ -193,6 +400,7 @@ extern "C" __global__ void belief_sums(const Desc* descs, const Group* g, const 
         int c0 = (int)T_leaf_coff(d)[2 * row + p];
         for (int c = 0; c < n; c++) {
             int ci = (int)T_leaf_cidx(d)[c0 + c];
+            WC_CHECK(ci < d->ncfg, "belief cfg", ci, d->ncfg);
             float wc = r[c] * scale + flat;
             const float* z = A_z(d) + (size_t)ci * DG;
             for (int k = 0; k < DG_CH; k++) {
@@ -208,19 +416,317 @@ extern "C" __global__ void belief_sums(const Desc* descs, const Group* g, const 
     }
 }
 
-// ------------------------------------------------------- the head
-
-// h = relu(LN1(h0 + xb.Wb + b1)) over the solve's leaf rows. The GEMM ran in
-// cuBLAS into the h pool; this completes the entry. Warp per row.
-extern "C" __global__ void head_entry(const Desc* descs, const Group* g, const Ctx* ctx) {
-    SOLVE(d)
-    if (d->stage == STAGE_CARRY) return;
-    for (int row = warp; row < d->nleaf; row += nwarps) {
-        ln_relu_warp(ctx->h + (size_t)(d->row0 + row) * H_STRIDE, ctx->pub_out_b,
-                     ctx->ln1w, ctx->ln1b,
-                     ctx->h0 + (size_t)(d->row0 + row) * HEADW, HEADW, lane);
+// One warp per network row for the LayerNorm entry activation.
+extern "C" __global__ void head_entry_flat(
+    const Desc* descs, const Group* g, const Ctx* ctx, int unused
+) {
+    (void)unused;
+    int lane = threadIdx.x & 31;
+    int task = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (task >= g->total) return;
+    int slot = 0, row = 0;
+    if (lane == 0) slot = flat_owner(g, task, &row);
+    slot = __shfl_sync(0xffffffffu, slot, 0);
+    row = __shfl_sync(0xffffffffu, row, 0);
+    const Desc* d = descs + slot;
+    WC_DESC(d);
+    if (d->stage == STAGE_CARRY || d->stage == STAGE_DRAIN) return;
+    // HEADW is compile-time, so keep this warp's row fragment in registers.
+    // The generic LayerNorm helper spills the biased residual to `h`, then
+    // reads it for variance and again for the output.  At tens of thousands
+    // of rows per tick that extra write and two reads saturate DRAM.  This is
+    // the same per-lane accumulation and warp reduction order, with a single
+    // final store.
+    float* dst = ctx->h + (size_t)(d->row0 + row) * H_STRIDE;
+    const float* add = ctx->h0 + (size_t)(d->row0 + row) * HEADW;
+    float x[HEAD_CH];
+    float sum = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < HEAD_CH; k++) {
+        int j = (k << 5) + lane;
+        float v = 0.0f;
+        if (j < HEADW) {
+            v = dst[j] + ctx->pub_out_b[j];
+            v += add[j];
+            sum += v;
+        }
+        x[k] = v;
+    }
+    float mean = warp_sum(sum) * (1.0f / HEADW);
+    float var = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < HEAD_CH; k++) {
+        int j = (k << 5) + lane;
+        if (j < HEADW) {
+            float e = x[k] - mean;
+            var += e * e;
+        }
+    }
+    float inv = rsqrtf(warp_sum(var) * (1.0f / HEADW) + LN_EPS);
+    #pragma unroll
+    for (int k = 0; k < HEAD_CH; k++) {
+        int j = (k << 5) + lane;
+        if (j < HEADW) {
+            float v = (x[k] - mean) * inv * ctx->ln1w[j] + ctx->ln1b[j];
+            dst[j] = v > 0.0f ? v : 0.0f;
+        }
     }
 }
+
+// One warp per leaf. Typical trained-play leaves have far fewer than the 256
+// configurations a whole block provides threads for; mapping eight leaves per
+// block keeps those small readouts resident together while preserving each
+// config dot product's lane reduction order.
+extern "C" __global__ void readout_flat(
+    const Desc* descs, const Group* g, const Ctx* ctx, int p_player
+) {
+    int lane = threadIdx.x & 31;
+    int task = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (task >= g->total) return;
+    int slot = 0, rp = 0;
+    if (lane == 0) slot = flat_owner(g, task, &rp);
+    slot = __shfl_sync(0xffffffffu, slot, 0);
+    rp = __shfl_sync(0xffffffffu, rp, 0);
+    const Desc* d = descs + slot;
+    WC_DESC(d);
+    if (d->stage == STAGE_DRAIN) return;
+    if (p_player < 0) { if (d->stage != STAGE_ITERATE) return; }
+    else              { if (d->stage != STAGE_VALUE) return; }
+    int p = p_player < 0 ? d->traverser : p_player;
+    int opp = 1 - p;
+    WC_CHECK(rp < d->nleaf + d->nterm, "readout row", rp, d->nleaf + d->nterm);
+    int leaf = rp < d->nleaf ? (int)T_leaf_rows(d)[rp]
+                             : (int)T_term_leaves(d)[rp - d->nleaf];
+    WC_CHECK(leaf < d->nodes, "readout leaf", leaf, d->nodes);
+    int nop = nc_of(d, leaf, opp);
+    const float* ro = A_reach(d) + reach_at(d, leaf, opp, 0);
+    float opp_reach = 0.0f;
+    for (int c = lane; c < nop; c += 32) opp_reach += ro[c];
+    opp_reach = warp_sum(opp_reach);
+    int n = nc_of(d, leaf, p);
+    float* v = A_vals(d) + T_voff(d)[leaf];
+    if (rp >= d->nleaf) {
+        float ut = T_terminal_utility(d)[rp - d->nleaf];
+        if (T_node_player(d)[leaf] != p) ut = -ut;
+        float val = ut * opp_reach;
+        for (int c = lane; c < n; c += 32) v[c] = val;
+        return;
+    }
+    const float* u = ctx->u + (size_t)(d->row0 + rp) * RK;
+    float ur[RK_CH];
+    for (int k = 0; k < RK_CH; k++) {
+        int j = (k << 5) + lane;
+        ur[k] = j < RK ? u[j] + ctx->wu_b[j] : 0.0f;
+    }
+    int c0 = (int)T_leaf_coff(d)[2 * rp + p];
+    for (int c = 0; c < n; c++) {
+        int ci = (int)T_leaf_cidx(d)[c0 + c];
+        WC_CHECK(ci < d->ncfg, "readout cfg", ci, d->ncfg);
+        const float* gr = A_g(d) + (size_t)ci * (RK + 1);
+        float part = 0.0f;
+        for (int k = 0; k < RK_CH; k++) {
+            int j = (k << 5) + lane;
+            if (j < RK) part += ur[k] * gr[j];
+        }
+        part = warp_sum(part);
+        if (lane == 0) v[c] = (part + gr[RK]) * opp_reach;
+    }
+}
+
+// One thread per (node of this level, traverser config). Same reasoning as
+// regret matching: the per-config work is independent, and node config counts
+// span three orders of magnitude inside one tree.
+extern "C" __global__ void backprop_level_flat(
+    const Desc* descs, const Group* g, const Ctx* ctx, int p_player
+) {
+    int task = blockIdx.x * blockDim.x + threadIdx.x;
+    if (task >= g->total) return;
+    int local = 0;
+    int slot = flat_owner(g, task, &local);
+    const Desc* d = descs + slot;
+    WC_DESC(d);
+    (void)ctx;
+    if (d->stage == STAGE_DRAIN) return;
+    int mode;
+    if (p_player < 0) {
+        if (d->stage != STAGE_ITERATE) return;
+        mode = 0;
+    } else {
+        if (d->stage != STAGE_VALUE) return;
+        mode = 1;
+    }
+    int traverser = p_player < 0 ? d->traverser : p_player;
+    const unsigned int* pfx = traverser ? T_sweep_cfg1(d) : T_sweep_cfg0(d);
+    int lo = (int)T_sweep_level_start(d)[g->level];
+    int hi = (int)T_sweep_level_start(d)[g->level + 1];
+    int c = 0;
+    int at = cfg_owner(pfx, lo, hi, (int)pfx[lo] + local, &c);
+    if (at >= hi) return;
+    int i = (int)T_sweep_order(d)[at];
+    WC_CHECK(i < d->nodes, "backprop node", i, d->nodes);
+    int kind = T_node_kind(d)[i];
+    int me = T_node_player(d)[i];
+    const unsigned int* child_start = T_node_child_start(d);
+    const unsigned int* child = T_node_child(d);
+    const unsigned int* voff = T_voff(d);
+    float* vals = A_vals(d);
+    int vbase = (int)voff[i];
+    if (kind == 1) {
+        int ch = (int)child[child_start[i]];
+        const float* src = vals + voff[ch];
+        if (me == traverser) {
+            int d0 = (int)T_draw_off(d)[i];
+            const unsigned int* b = T_draw_row_start(d) + T_draw_row_off(d)[i];
+            float acc = 0.0f;
+            for (int k = (int)b[c]; k < (int)b[c + 1]; k++) {
+                WC_CHECK((int)T_draw_to(d)[d0 + k] < nc_of(d, ch, traverser),
+                         "backprop draw", T_draw_to(d)[d0 + k],
+                         nc_of(d, ch, traverser));
+                acc += T_draw_p(d)[d0 + k] * src[T_draw_to(d)[d0 + k]];
+            }
+            vals[vbase + c] = acc;
+        } else {
+            vals[vbase + c] = src[c];
+        }
+        return;
+    }
+    if (me != traverser) {
+        float acc = 0.0f;
+        for (unsigned int ci = child_start[i]; ci < child_start[i + 1]; ci++) {
+            acc += vals[voff[child[ci]] + c];
+        }
+        vals[vbase + c] = acc;
+        return;
+    }
+    int na = na_of(d, i);
+    int so = (int)T_soff(d)[i] + c * na;
+    WC_CHECK(c < nc_of(d, i, traverser), "backprop cfg", c,
+             nc_of(d, i, traverser));
+    WC_CHECK(so + na <= d->ncells, "backprop cells", so + na, d->ncells);
+    const float* strat = strat_of(d);
+    float* inst = A_inst(d);
+    float acc = 0.0f;
+    for (int a = 0; a < na; a++) {
+        int cell = so + a;
+        if (mode == 0) inst[cell] = 0.0f;
+        if (!legal_cell(d, cell)) continue;
+        WC_CHECK(cell < T_cap_trans(d), "backprop trans cap", cell,
+                 T_cap_trans(d));
+        int tr = T_trans(d)[cell];
+        if (tr < 0) continue;
+        int ch = (int)child[child_start[i] + T_obs_child(d)[T_act_off(d)[i] + a]];
+        WC_CHECK(ch < d->nodes, "backprop child", ch, d->nodes);
+        WC_CHECK(tr < nc_of(d, ch, traverser), "backprop trans", tr,
+                 nc_of(d, ch, traverser));
+        float av = vals[voff[ch] + tr];
+        if (mode == 0) inst[cell] = av;
+        acc += av * strat[cell];
+    }
+    vals[vbase + c] = acc;
+    if (mode == 0) {
+        for (int a = 0; a < na; a++) {
+            if (legal_cell(d, so + a)) inst[so + a] -= acc;
+        }
+    }
+}
+
+// One *thread* per (traverser decision node, config). A config's action loop
+// needs no cross-lane reduction, and the config counts are wildly uneven — a
+// subgame root can hold hundreds while a node two levels down holds one — so a
+// warp per node left a single lane grinding through the root while the rest of
+// the launch had already finished. `T_dec_cfg*` is the running config count
+// along the node list, and the binary search over it is what turns a flat
+// thread index back into (node, config).
+extern "C" __global__ void regret_match_flat(
+    const Desc* descs, const Group* g, const Ctx* ctx, int unused
+) {
+    int task = blockIdx.x * blockDim.x + threadIdx.x;
+    if (task >= g->total) return;
+    int local = 0;
+    int slot = flat_owner(g, task, &local);
+    const Desc* d = descs + slot;
+    WC_DESC(d);
+    (void)ctx; (void)unused;
+    if (d->stage != STAGE_ITERATE) return;
+    int tr = d->traverser;
+    int c = 0;
+    int ni = cfg_owner(tr ? T_dec_cfg1(d) : T_dec_cfg0(d), 0, d->ndec[tr], local, &c);
+    // The launch size comes from the host's copy of the same running counts.
+    // If the two ever disagreed this would index past the node list, so make
+    // the disagreement a dropped thread (which the oracle test sees as a wrong
+    // answer) rather than a stray write into another solve's arena.
+    if (ni >= d->ndec[tr]) return;
+    int i = tr ? (int)T_decision1(d)[ni] : (int)T_decision0(d)[ni];
+    WC_CHECK(i < d->nodes, "regret node", i, d->nodes);
+    int na = na_of(d, i);
+    int so = (int)T_soff(d)[i] + c * na;
+    WC_CHECK(so + na <= d->ncells, "regret cell", so + na, d->ncells);
+    float* regret = A_regret(d);
+    float* inst = A_inst(d);
+    float* cur = A_cur(d);
+    float* sum_strat = A_sum_strat(d);
+    float sum = 0.0f;
+    for (int a = 0; a < na; a++) {
+        int cell = so + a;
+        if (!legal_cell(d, cell)) { cur[cell] = 0.0f; continue; }
+        float r = regret[cell] * (regret[cell] > 0.0f ? d->da : d->db) + inst[cell];
+        regret[cell] = r;
+        float v = fmaxf(r + d->predict * inst[cell], EPS);
+        cur[cell] = v;
+        sum += v;
+    }
+    if (sum > 0.0f) {
+        float inv = 1.0f / sum;
+        for (int a = 0; a < na; a++) cur[so + a] *= inv;
+    }
+    for (int a = 0; a < na; a++) sum_strat[so + a] *= d->ds;
+}
+
+extern "C" __global__ void average_flat(
+    const Desc* descs, const Group* g, const Ctx* ctx, int unused
+) {
+    int task = blockIdx.x * blockDim.x + threadIdx.x;
+    if (task >= g->total) return;
+    int local = 0;
+    int slot = flat_owner(g, task, &local);
+    const Desc* d = descs + slot;
+    WC_DESC(d);
+    (void)ctx; (void)unused;
+    if (d->stage != STAGE_ITERATE) return;
+    int tr = d->traverser;
+    int c = 0;
+    int ni = cfg_owner(tr ? T_dec_cfg1(d) : T_dec_cfg0(d), 0, d->ndec[tr], local, &c);
+    if (ni >= d->ndec[tr]) return;
+    int i = tr ? (int)T_decision1(d)[ni] : (int)T_decision0(d)[ni];
+    WC_CHECK(i < d->nodes, "average node", i, d->nodes);
+    int na = na_of(d, i);
+    int so = (int)T_soff(d)[i] + c * na;
+    WC_CHECK(so + na <= d->ncells, "average cell", so + na, d->ncells);
+    float* sum_strat = A_sum_strat(d);
+    float* avg = A_avg(d);
+    const float* cur = A_cur(d);
+    float rc = A_reach(d)[reach_at(d, i, tr, c)];
+    float sum = 0.0f;
+    for (int a = 0; a < na; a++) {
+        sum_strat[so + a] += rc * cur[so + a];
+        sum += sum_strat[so + a];
+    }
+    if (sum > 0.0f) {
+        float inv = 1.0f / sum;
+        for (int a = 0; a < na; a++) avg[so + a] = sum_strat[so + a] * inv;
+    } else {
+        int k = 0;
+        for (int a = 0; a < na; a++) if (legal_cell(d, so + a)) k++;
+        float u = 1.0f / (float)(k > 0 ? k : 1);
+        for (int a = 0; a < na; a++) {
+            avg[so + a] = legal_cell(d, so + a) ? u : 0.0f;
+        }
+    }
+}
+
+// ------------------------------------------------------- belief sums
+
+// ------------------------------------------------------- the head
 
 // relu(x + b) over one extra head layer's rows. `g->level` names the layer;
 // `g->mode` picks which pool the GEMM wrote (0 = h, 1 = h2). Only present
@@ -240,183 +746,9 @@ extern "C" __global__ void hmlp_act(const Desc* descs, const Group* g, const Ctx
 
 // ------------------------------------------------------- readout
 
-// v(config) = (<u + bu, g[..RK]> + g[RK]) * opponent reach mass, per leaf
-// per config; terminal leaves take the game utility. Ports Solver::readout.
-// Warp per row; u is read once into registers, bu folded there.
-extern "C" __global__ void readout(const Desc* descs, const Group* g, const Ctx* ctx) {
-    SOLVE(d)
-    if (g->p_player < 0) { if (d->stage != STAGE_ITERATE) return; }
-    else                 { if (d->stage != STAGE_VALUE) return; }
-    int p = player_of(d, g);
-    int opp = 1 - p;
-    int todo = d->nleaf + d->nterm;
-    for (int rp = warp; rp < todo; rp += nwarps) {
-        int leaf = rp < d->nleaf ? (int)T_leaf_rows(d)[rp]
-                                 : (int)T_term_leaves(d)[rp - d->nleaf];
-        int nop = nc_of(d, leaf, opp);
-        const float* ro = A_reach(d) + reach_at(d, leaf, opp, 0);
-        float opp_reach = 0.0f;
-        for (int c = lane; c < nop; c += 32) opp_reach += ro[c];
-        opp_reach = warp_sum(opp_reach);
-        int n = nc_of(d, leaf, p);
-        float* v = A_vals(d) + T_voff(d)[leaf];
-        if (rp >= d->nleaf) {
-            float ut = T_terminal_utility(d)[rp - d->nleaf];
-            if (T_node_player(d)[leaf] != p) ut = -ut;
-            float val = ut * opp_reach;
-            for (int c = lane; c < n; c += 32) v[c] = val;
-            continue;
-        }
-        const float* u = ctx->u + (size_t)(d->row0 + rp) * RK;
-        float ur[RK_CH];
-        for (int k = 0; k < RK_CH; k++) {
-            int j = (k << 5) + lane;
-            ur[k] = j < RK ? u[j] + ctx->wu_b[j] : 0.0f;
-        }
-        int c0 = (int)T_leaf_coff(d)[2 * rp + p];
-        for (int c = 0; c < n; c++) {
-            int ci = (int)T_leaf_cidx(d)[c0 + c];
-            const float* gr = A_g(d) + (size_t)ci * (RK + 1);
-            float part = 0.0f;
-            for (int k = 0; k < RK_CH; k++) {
-                int j = (k << 5) + lane;
-                if (j < RK) part += ur[k] * gr[j];
-            }
-            part = warp_sum(part);
-            if (lane == 0) v[c] = (part + gr[RK]) * opp_reach;
-        }
-    }
-}
-
 // ------------------------------------------------------- backward sweep
 
-// One block per solve; levels deepest-first with a block barrier between
-// them; warp per node, lane per config. Ports Solver::backprop.
-// g->p_player < 0: the iterate pass (regret mode). >= 0: a value-stage pass.
-extern "C" __global__ void backprop_solve(const Desc* descs, const Group* g, const Ctx* ctx) {
-    SOLVE(d)
-    int mode;
-    if (g->p_player < 0) {
-        if (d->stage != STAGE_ITERATE) return;
-        mode = 0;
-    } else {
-        if (d->stage != STAGE_VALUE) return;
-        mode = 1;
-    }
-    int traverser = player_of(d, g);
-    const float* strat = strat_of(d);
-    float* vals = A_vals(d);
-    float* inst = A_inst(d);
-    const unsigned int* child_start = T_node_child_start(d);
-    const unsigned int* child = T_node_child(d);
-    const unsigned int* voff = T_voff(d);
-    for (int lev = d->nlevels - 1; lev >= 0; lev--) {
-        int l0 = (int)T_level_start(d)[lev];
-        int l1 = (int)T_level_start(d)[lev + 1];
-        for (int at = l0 + warp; at < l1; at += nwarps) {
-            int i = (int)T_bfs_order(d)[at];
-            int kind = T_node_kind(d)[i];
-            if (kind == 2) continue;
-            int me = T_node_player(d)[i];
-            int nc = nc_of(d, i, traverser);
-            int vbase = (int)voff[i];
-            if (kind == 1) {  // chance
-                int ch = (int)child[child_start[i]];
-                const float* src = vals + voff[ch];
-                if (me == traverser) {
-                    int d0 = (int)T_draw_off(d)[i];
-                    const unsigned int* b = T_draw_row_start(d) + T_draw_row_off(d)[i];
-                    for (int c = lane; c < nc; c += 32) {
-                        float acc = 0.0f;
-                        for (int k = (int)b[c]; k < (int)b[c + 1]; k++) {
-                            acc += T_draw_p(d)[d0 + k] * src[T_draw_to(d)[d0 + k]];
-                        }
-                        vals[vbase + c] = acc;
-                    }
-                } else {
-                    for (int c = lane; c < nc; c += 32) vals[vbase + c] = src[c];
-                }
-                continue;
-            }
-            int na = na_of(d, i);
-            int so = (int)T_soff(d)[i];
-            if (me != traverser) {
-                for (int c = lane; c < nc; c += 32) {
-                    float acc = 0.0f;
-                    for (unsigned int ci = child_start[i]; ci < child_start[i + 1]; ci++) {
-                        acc += vals[voff[child[ci]] + c];
-                    }
-                    vals[vbase + c] = acc;
-                }
-                continue;
-            }
-            for (int c = lane; c < nc; c += 32) {
-                float acc = 0.0f;
-                for (int a = 0; a < na; a++) {
-                    int cell = so + c * na + a;
-                    if (mode == 0) inst[cell] = 0.0f;
-                    if (!legal_cell(d, cell)) continue;
-                    int tr = T_trans(d)[cell];
-                    if (tr < 0) continue;
-                    int ch = (int)child[child_start[i] + T_obs_child(d)[T_act_off(d)[i] + a]];
-                    float av = vals[voff[ch] + tr];
-                    if (mode == 0) inst[cell] = av;
-                    acc += av * strat[cell];
-                }
-                vals[vbase + c] = acc;
-                if (mode == 0) {
-                    for (int a = 0; a < na; a++) {
-                        int cell = so + c * na + a;
-                        if (legal_cell(d, cell)) inst[cell] -= acc;
-                    }
-                }
-            }
-        }
-        __syncthreads();
-    }
-}
-
 // ------------------------------------------------------- regret matching
-
-// Ports the RM block of Solver::step: fold the instantaneous regret with the
-// DCFR discounts (computed once per iteration by advance_state), clamp,
-// normalise per config, discount sum_strat. Warp per node, lane per config.
-extern "C" __global__ void regret_match(const Desc* descs, const Group* g, const Ctx* ctx) {
-    SOLVE(d)
-    if (d->stage != STAGE_ITERATE) return;
-    float da = d->da, db = d->db, ds = d->ds;
-    float* regret = A_regret(d);
-    float* inst = A_inst(d);
-    float* cur = A_cur(d);
-    float* sum_strat = A_sum_strat(d);
-    for (int t = warp; t < d->nodes; t += nwarps) {
-        int i = (int)T_bfs_order(d)[t];
-        if (T_node_kind(d)[i] != 0 || T_node_player(d)[i] != d->traverser) continue;
-        int nc = nc_of(d, i, d->traverser);
-        int na = na_of(d, i);
-        int so = (int)T_soff(d)[i];
-        for (int c = lane; c < nc; c += 32) {
-            float sum = 0.0f;
-            for (int a = 0; a < na; a++) {
-                int cell = so + c * na + a;
-                if (!legal_cell(d, cell)) {
-                    cur[cell] = 0.0f;
-                    continue;
-                }
-                float r = regret[cell] * (regret[cell] > 0.0f ? da : db) + inst[cell];
-                regret[cell] = r;
-                float v = fmaxf(r + d->predict * inst[cell], EPS);
-                cur[cell] = v;
-                sum += v;
-            }
-            if (sum > 0.0f) {
-                float inv = 1.0f / sum;
-                for (int a = 0; a < na; a++) cur[so + c * na + a] *= inv;
-            }
-            for (int a = 0; a < na; a++) sum_strat[so + c * na + a] *= ds;
-        }
-    }
-}
 
 // ------------------------------------------------------- forward reach sweep
 
@@ -491,55 +823,6 @@ extern "C" __global__ void reach_prop(const Desc* descs, const Group* g, const C
 
 // ------------------------------------------------------- average strategy
 
-// Ports the AVG block of Solver::step, plus the snapshot copy when the next
-// iterate is a kept one (log-spaced list in the descriptor). Runs after the
-// forward sweep, because it reads the fresh reaches.
-extern "C" __global__ void average(const Desc* descs, const Group* g, const Ctx* ctx) {
-    SOLVE(d)
-    if (d->stage != STAGE_ITERATE) return;
-    float* sum_strat = A_sum_strat(d);
-    float* avg = A_avg(d);
-    const float* cur = A_cur(d);
-    for (int t = warp; t < d->nodes; t += nwarps) {
-        int i = (int)T_bfs_order(d)[t];
-        if (T_node_kind(d)[i] != 0 || T_node_player(d)[i] != d->traverser) continue;
-        int nc = nc_of(d, i, d->traverser);
-        int na = na_of(d, i);
-        int so = (int)T_soff(d)[i];
-        const float* r = A_reach(d) + reach_at(d, i, d->traverser, 0);
-        for (int c = lane; c < nc; c += 32) {
-            float sum = 0.0f;
-            for (int a = 0; a < na; a++) {
-                int cell = so + c * na + a;
-                sum_strat[cell] += r[c] * cur[cell];
-                sum += sum_strat[cell];
-            }
-            if (sum > 0.0f) {
-                float inv = 1.0f / sum;
-                for (int a = 0; a < na; a++) avg[so + c * na + a] = sum_strat[so + c * na + a] * inv;
-            } else {
-                int k = 0;
-                for (int a = 0; a < na; a++) {
-                    if (legal_cell(d, so + c * na + a)) k++;
-                }
-                float u = 1.0f / (float)(k > 0 ? k : 1);
-                for (int a = 0; a < na; a++) {
-                    int cell = so + c * na + a;
-                    avg[cell] = legal_cell(d, cell) ? u : 0.0f;
-                }
-            }
-        }
-    }
-    // Snapshot the running average when the *next* iterate is a kept one.
-    if (!d->snapshots) return;
-    int due = 0;
-    for (int k = 0; k < d->nsnaps; k++) due |= (d->snap_iters[k] == d->t + 1);
-    if (!due) return;
-    __syncthreads();
-    float* snap = A_snaps(d) + (size_t)d->snap_t * d->ncells;
-    for (int i = threadIdx.x; i < d->ncells; i += blockDim.x) snap[i] = avg[i];
-}
-
 // ------------------------------------------------------- harvests
 
 // The value stage's harvest: carried root `step`'s per-config values, per
@@ -556,21 +839,58 @@ extern "C" __global__ void collect_root(const Desc* descs, const Group* g, const
     for (int c = threadIdx.x; c < n; c += blockDim.x) out[c] = v[c];
 }
 
-// The carry stage: normalise the reach at the exit leaf into the beliefs
-// arena, one warp per player. Ports Solver::carried_beliefs.
-extern "C" __global__ void leaf_beliefs(const Desc* descs, const Group* g, const Ctx* ctx) {
-    SOLVE(d)
-    if (d->stage != STAGE_CARRY || d->leaf < 0) return;
-    for (int p = warp; p < 2; p += nwarps) {
-        int leaf = d->leaf;
+// A kept intermediate average has just been propagated into `snap_reach`.
+// Store its normalised belief at every possible exit leaf. Trip 2 then reads
+// only the row the real walk chose; no full-tree strategy replay is needed.
+extern "C" __global__ void snapshot_beliefs_flat(
+    const Desc* descs, const Group* g, const Ctx* ctx, int unused
+) {
+    (void)ctx; (void)unused;
+    int lane = threadIdx.x & 31;
+    int task = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (task >= g->total) return;
+    int slot = 0, row = 0;
+    if (lane == 0) slot = flat_owner(g, task, &row);
+    slot = __shfl_sync(0xffffffffu, slot, 0);
+    row = __shfl_sync(0xffffffffu, row, 0);
+    const Desc* d = descs + slot;
+    WC_DESC(d);
+    if (!snapshot_due(d)) return;
+    WC_CHECK(row < d->nleaf + d->nterm, "snap row", row, d->nleaf + d->nterm);
+    int leaf = row < d->nleaf ? (int)T_leaf_rows(d)[row]
+                              : (int)T_term_leaves(d)[row - d->nleaf];
+    WC_CHECK(leaf < d->nodes, "snap leaf", leaf, d->nodes);
+    WC_CHECK(d->snap_t < d->nsnaps - 1, "snap slot", d->snap_t, d->nsnaps - 1);
+    int stride = (int)T_snap_coff(d)[2 * (d->nleaf + d->nterm)];
+    for (int p = 0; p < 2; p++) {
         int n = nc_of(d, leaf, p);
-        const float* r = A_reach(d) + reach_at(d, leaf, p, 0);
+        const float* r = A_snap_reach(d) + reach_at(d, leaf, p, 0);
         float scale, flat;
         warp_normalize(r, n, lane, &scale, &flat);
-        int stride = d->nc_leaf[0] + d->nc_leaf[1];
-        float* o = A_beliefs(d) + (size_t)d->step * stride + (p == 1 ? d->nc_leaf[0] : 0);
+        int off = (int)T_snap_coff(d)[2 * row + p];
+        float* o = A_snap_beliefs(d) + (size_t)d->snap_t * stride + off;
         for (int c = lane; c < n; c += 32) o[c] = r[c] * scale + flat;
     }
+}
+
+// Trip 2 selects one exit leaf's two config spans from each kept snapshot.
+// Gather the strided source into one contiguous device row so the downloader
+// issues one pinned D2H transfer rather than two tiny transfers per snapshot.
+extern "C" __global__ void gather_trip2(
+    unsigned long long src_addr, unsigned long long dst_addr,
+    int leaf_configs, int off0, int off1,
+    int n0, int n1, int nsnaps
+) {
+    const float* src = (const float*)src_addr;
+    float* dst = (float*)dst_addr;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = n0 + n1;
+    int total = nsnaps * stride;
+    if (i >= total) return;
+    int s = i / stride;
+    int c = i - s * stride;
+    int off = c < n0 ? off0 + c : off1 + c - n0;
+    dst[i] = src[(size_t)s * leaf_configs + off];
 }
 
 // ------------------------------------------------------- state advance
@@ -584,6 +904,7 @@ extern "C" __global__ void advance_state(const Desc* descs_c, const Group* g, co
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= g->n) return;
     Desc* d = descs + g->slots[k];
+    if (d->stage == STAGE_DRAIN) return;
     if (d->stage == STAGE_ITERATE) {
         d->first_query = 0;
         d->steps[d->traverser] += 1;
@@ -621,26 +942,87 @@ extern "C" __global__ void advance_state(const Desc* descs_c, const Group* g, co
 
 // Grid-stride helpers over the admission batch: find the batch entry that
 // owns a flat item index by scanning the (tiny) batch map.
+// The batch map holds at most `MAX_BATCH` entries. Walking past the last one
+// reads whatever follows it and turns into `descs[garbage]`, so the walk is
+// bounded: a launch whose task count disagrees with the entries' own counts
+// is a host bug, and it should say so rather than wander off the buffer.
 __device__ __forceinline__ const int* bmap_of(const Ctx* ctx, int item, int per, int* local) {
     // per = 1: rows; per = 0: configs.
-    for (int e = 0; ; e++) {
+    int start = item;
+    for (int e = 0; e < BMAP_CAP; e++) {
         const int* m = ctx->bmap + e * BMAP_INTS;
         int n = per ? m[2] : m[4];
         if (item < n) { *local = item; return m; }
         item -= n;
     }
+    WC_SAY("bmap_of item", start, BMAP_CAP);
+    *local = 0;
+    return ctx->bmap;
+}
+
+// As above, but network leaves rather than all public rows (warm-start rows
+// may follow them in a solve's batch).
+__device__ __forceinline__ const int* bmap_leaf_of(
+    const Desc* descs, const Ctx* ctx, int item, int* local
+) {
+    int start = item;
+    for (int e = 0; e < BMAP_CAP; e++) {
+        const int* m = ctx->bmap + e * BMAP_INTS;
+        int n = descs[m[0]].nleaf + descs[m[0]].nterm;
+        if (item < n) { *local = item; return m; }
+        item -= n;
+    }
+    WC_SAY("bmap_leaf_of item", start, BMAP_CAP);
+    *local = 0;
+    return ctx->bmap;
+}
+
+// Snapshot 0 is the initial uniform average, whose reach has already been
+// built for CFR initialisation. Harvest every possible exit leaf now.
+extern "C" __global__ void seed_snapshot_beliefs(
+    const Desc* descs, const Group* g, const Ctx* ctx
+) {
+    int lane = threadIdx.x & 31;
+    int task = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (task >= g->total) return;
+    int row;
+    const int* m = bmap_leaf_of(descs, ctx, task, &row);
+    WC_CHECK(m[0] >= 0 && m[0] < SLOT_CAP, "seed slot", m[0], SLOT_CAP);
+    const Desc* d = descs + m[0];
+    WC_DESC(d);
+    WC_CHECK(row < d->nleaf + d->nterm, "seed leaf row", row,
+             d->nleaf + d->nterm);
+    if (!d->snapshots || d->nsnaps <= 1) return;
+    int leaf = row < d->nleaf ? (int)T_leaf_rows(d)[row]
+                              : (int)T_term_leaves(d)[row - d->nleaf];
+    WC_CHECK(leaf < d->nodes, "seed leaf", leaf, d->nodes);
+    for (int p = 0; p < 2; p++) {
+        int n = nc_of(d, leaf, p);
+        int at = reach_at(d, leaf, p, 0);
+        WC_CHECK(at + n <= A_len_reach(d), "seed reach", at + n,
+                 A_len_reach(d));
+        const float* r = A_reach(d) + at;
+        float scale, flat;
+        warp_normalize(r, n, lane, &scale, &flat);
+        int off = (int)T_snap_coff(d)[2 * row + p];
+        WC_CHECK(off + n <= A_len_snap_beliefs(d), "seed beliefs", off + n,
+                 A_len_snap_beliefs(d));
+        float* o = A_snap_beliefs(d) + off;
+        for (int c = lane; c < n; c += 32) o[c] = r[c] * scale + flat;
+    }
 }
 
 // The card facts of every job in the batch, packed for one GEMM chain:
 // bg[(job * NTYPE + t)][CARD_FEATS]. The facts block is identical at every
-// row of a job, so row 0 speaks for the solve.
+// row of a job. The compact contract stores it once per solve.
 extern "C" __global__ void pack_cards(const Desc* descs, const Group* g, const Ctx* ctx) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int per = NTYPE * CARD_FEATS;
     if (i >= g->n * per) return;
     const int* m = ctx->bmap + (i / per) * BMAP_INTS;
     const Desc* d = descs + m[0];
-    ctx->bg[(size_t)i] = T_leaf_xpub(d)[OFF_CARDS + i % per];
+    WC_DESC(d);
+    ctx->bg[(size_t)i] = T_card_feat(d)[i % per];
 }
 
 // Generic bias(+ReLU) over a build scratch matrix. g->mode picks the tower
@@ -665,15 +1047,17 @@ extern "C" __global__ void bias_act(const Desc* descs, const Group* g, const Ctx
 }
 
 // e = (card chain output) + bd_last + wid[id], written to each solve's own
-// card table. The chain's last GEMM left its output in bh.
+// card table. `mode` names the ping-pong buffer the last GEMM wrote.
 extern "C" __global__ void cards_finish(const Desc* descs, const Group* g, const Ctx* ctx) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= g->n * NTYPE * DE) return;
     const int* m = ctx->bmap + i / (NTYPE * DE) * BMAP_INTS;
     Desc* d = (Desc*)descs + m[0];
+    WC_DESC(d);
     int t = (i / DE) % NTYPE, j = i % DE;
     int id = T_ids(d)[t];
-    A_e(d)[t * DE + j] = ctx->bh[i] + ctx->card_b[NCARD - 1][j] + ctx->wid[id * DE + j];
+    const float* x = g->mode ? ctx->bh2 : ctx->bh;
+    A_e(d)[t * DE + j] = x[i] + ctx->card_b[NCARD - 1][j] + ctx->wid[id * DE + j];
 }
 
 // The card half of the pile summary, per job per coin type, into the tail of
@@ -683,6 +1067,7 @@ extern "C" __global__ void pile_pe(const Desc* descs, const Group* g, const Ctx*
     if (i >= g->n * NTYPE * DE) return;
     const int* m = ctx->bmap + i / (NTYPE * DE) * BMAP_INTS;
     const Desc* d = descs + m[0];
+    WC_DESC(d);
     int t = (i / DE) % NTYPE, j = i % DE;
     float acc = ctx->pile_b[j];
     const float* er = A_e(d) + (size_t)t * DE;
@@ -694,11 +1079,13 @@ extern "C" __global__ void pile_pe(const Desc* descs, const Group* g, const Ctx*
 // row, its card table and the pile blocks. One block per row.
 // Ports net.rs::assemble.
 extern "C" __global__ void assemble(const Desc* descs, const Group* g, const Ctx* ctx) {
+    if (blockIdx.x >= g->total) return;
     int local;
     const int* m = bmap_of(ctx, blockIdx.x, 1, &local);
     const Desc* d = descs + m[0];
+    WC_DESC(d);
     int batch_row = m[1] + local;
-    const float* src = T_leaf_xpub(d) + (size_t)local * PUBFEAT;
+    const unsigned char* src = T_leaf_raw(d) + (size_t)local * GPU_ROW_BYTES;
     float* dst = ctx->bx + (size_t)batch_row * XD;
     int hex_e = N_HEXES * HEX_FACTS;
     int piles = hex_e + N_HEXES * DE;
@@ -707,12 +1094,17 @@ extern "C" __global__ void assemble(const Desc* descs, const Group* g, const Ctx
     // Hex facts and the occupant's embedding (a one-hot gather).
     for (int h = threadIdx.x / 32; h < N_HEXES; h += blockDim.x / 32) {
         int lane = threadIdx.x & 31;
-        const float* hx = src + h * HEX_CH;
-        for (int j = lane; j < HEX_FACTS; j += 32) dst[h * HEX_FACTS + j] = hx[j];
-        int t = -1;
-        for (int k = 0; k < NTYPE; k++) {
-            if (hx[HEX_FACTS + k] != 0.0f) { t = k; break; }
+        int owner = src[GR_HEX_OWNER + h];
+        int slot = src[GR_HEX_SLOT + h];
+        if (lane < HEX_FACTS) {
+            float v = 0.0f;
+            if (lane < 2) v = owner == lane ? 1.0f : 0.0f;
+            else if (lane == 2) v = (float)src[GR_HEX_HEIGHT + h] / 5.0f;
+            else if (lane < 5) v = src[GR_HEX_MARKER + h] == lane - 3 ? 1.0f : 0.0f;
+            else v = (float)HEX_LOCATION[h];
+            dst[h * HEX_FACTS + lane] = v;
         }
+        int t = owner < 2 && slot < NSLOT ? owner * NSLOT + slot : -1;
         if (t >= 0) {
             const float* e_row = A_e(d) + (size_t)t * DE;
             for (int j = lane; j < DE; j += 32) dst[hex_e + h * DE + j] = e_row[j];
@@ -732,8 +1124,27 @@ extern "C" __global__ void assemble(const Desc* descs, const Group* g, const Ctx
         }
         __syncthreads();
     }
+    float* loose = dst + piles + 2 * DE;
     for (int j = threadIdx.x; j < LOOSE; j += blockDim.x) {
-        dst[piles + 2 * DE + j] = src[OFF_LOOSE + j];
+        float v = 0.0f;
+        if (j < 2 * 6) {
+            int p = j / 6, k = j % 6;
+            int markers = src[GR_MARKERS + p];
+            if (k == 0) v = (float)markers / 6.0f;
+            else if (k == 1) v = (float)(6 - markers) / 6.0f;
+            else if (k == 2) v = (float)src[GR_HAND + p] / 3.0f;
+            else if (k == 3) v = (float)src[GR_FD + p] / MAX_COINS;
+            else if (k == 4) v = (float)src[GR_BAG + p] / MAX_COINS;
+            else v = src[GR_INITIATIVE] == p ? 1.0f : 0.0f;
+        } else if (j == 12) {
+            int plies = src[GR_PLIES] | ((int)src[GR_PLIES + 1] << 8);
+            v = (float)plies / MAX_PLIES;
+        } else if (j == 13) {
+            v = src[GR_INIT_MOVED] ? 1.0f : 0.0f;
+        } else {
+            v = src[GR_TO_ACT] == 0 ? 1.0f : 0.0f;
+        }
+        loose[j] = v;
     }
 }
 
@@ -746,7 +1157,9 @@ extern "C" __global__ void pack_piles(const Desc* descs, const Group* g, const C
     int local;
     const int* m = bmap_of(ctx, i / per, 1, &local);
     const Desc* d = descs + m[0];
-    ctx->bg[(size_t)i] = T_leaf_xpub(d)[(size_t)local * PUBFEAT + OFF_PILES + i % per];
+    WC_DESC(d);
+    ctx->bg[(size_t)i] = (float)T_leaf_raw(d)[(size_t)local * GPU_ROW_BYTES
+                                               + GR_PILES + i % per] / 5.0f;
 }
 
 // LN + ReLU over one public tower layer's batch rows. g->level names the
@@ -769,6 +1182,7 @@ extern "C" __global__ void scatter_h0(const Desc* descs, const Group* g, const C
     int local;
     const int* m = bmap_of(ctx, i / HEADW, 1, &local);
     const Desc* d = descs + m[0];
+    WC_DESC(d);
     const float* src = (g->p_player ? ctx->bh2 : ctx->bh);
     ctx->h0[((size_t)d->row0 + local) * HEADW + i % HEADW] =
         src[(size_t)(m[1] + local) * HEADW + i % HEADW];
@@ -782,6 +1196,7 @@ extern "C" __global__ void holding_in(const Desc* descs, const Group* g, const C
     int local;
     const int* m = bmap_of(ctx, i / NSLOT, 0, &local);
     const Desc* d = descs + m[0];
+    WC_DESC(d);
     int k = i % NSLOT;
     const float* p = T_cphi(d) + (size_t)local * CFEAT;
     float seat = p[CFEAT - 1];
@@ -826,7 +1241,8 @@ extern "C" __global__ void scatter_zg(const Desc* descs, const Group* g, const C
     int local;
     const int* m = bmap_of(ctx, cfg, 0, &local);
     Desc* d = (Desc*)descs + m[0];
-    const float* zbuf = g->p_player ? ctx->bh : ctx->bh2;
+    WC_DESC(d);
+    const float* zbuf = g->p_player ? ctx->bh2 : ctx->bh;
     if (j < DG) {
         A_z(d)[(size_t)local * DG + j] = zbuf[(size_t)cfg * DG + j];
     } else {
@@ -865,8 +1281,8 @@ extern "C" __global__ void init_strategy(const Desc* descs, const Group* g, cons
     }
 }
 
-// The reach-weighted uniform seed of the strategy sum, plus snapshot 0 (the
-// uniform average). Runs after init_strategy and the first reach_prop.
+// The reach-weighted uniform seed of the strategy sum. Snapshot 0's beliefs
+// are harvested separately from the initial uniform reach.
 extern "C" __global__ void seed_avg(const Desc* descs, const Group* g, const Ctx* ctx) {
     SOLVE(d)
     float* sum_strat = A_sum_strat(d);
@@ -886,9 +1302,4 @@ extern "C" __global__ void seed_avg(const Desc* descs, const Group* g, const Ctx
             }
         }
     }
-    if (!d->snapshots) return;
-    __syncthreads();
-    const float* avg = A_avg(d);
-    float* snap = A_snaps(d);
-    for (int i = threadIdx.x; i < d->ncells; i += blockDim.x) snap[i] = avg[i];
 }

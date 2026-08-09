@@ -523,7 +523,11 @@ fn gpu_start(
     ln: PyReadonlyArray1<f32>,
     devices: Vec<usize>,
 ) -> PyResult<()> {
-    let (w, b, ln) = (w.as_slice()?.to_vec(), b.as_slice()?.to_vec(), ln.as_slice()?.to_vec());
+    let (w, b, ln) = (
+        w.as_slice()?.to_vec(),
+        b.as_slice()?.to_vec(),
+        ln.as_slice()?.to_vec(),
+    );
     py.allow_threads(move || {
         let mut clients = Vec::new();
         for d in devices {
@@ -551,10 +555,15 @@ fn gpu_set_weights(
     let clients = gpu_clients().lock().unwrap();
     let c = clients.get(device).ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(
-            "gpu service not started (gpu_start was not called)")
+            "gpu service not started (gpu_start was not called)",
+        )
     })?;
-    c.set_weights(dims, w.as_slice()?.to_vec(), b.as_slice()?.to_vec(),
-                  ln.as_slice()?.to_vec());
+    c.set_weights(
+        dims,
+        w.as_slice()?.to_vec(),
+        b.as_slice()?.to_vec(),
+        ln.as_slice()?.to_vec(),
+    );
     Ok(())
 }
 
@@ -617,9 +626,21 @@ fn gpu_gen_data(
         let clients = gpu_clients().lock().unwrap().clone();
         if clients.is_empty() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "gpu service not started (gpu_start was not called)"));
+                "gpu service not started (gpu_start was not called)",
+            ));
         }
-        Ok::<_, pyo3::PyErr>(crate::selfplay::run_games_gpu(games, seed, &n, &gc, &clients, &|_| 0))
+        // Every generation solve is the same checkpoint, so there is nothing
+        // to route by: spread submissions round robin over however many
+        // services were started. With one service this is the old `|_| 0`.
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        Ok::<_, pyo3::PyErr>(crate::selfplay::run_games_gpu(
+            games,
+            seed,
+            &n,
+            &gc,
+            &clients,
+            &|_| next.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ))
     })?;
     data_to_dict(py, d)
 }
@@ -829,7 +850,10 @@ fn eval_match(
         depth: depth_b.unwrap_or(depth),
         ..cfg
     };
-    let (aa, bb) = (agent_of(a, cfg, temp, slot_a)?, agent_of(b, cfg_b, temp, slot_b)?);
+    let (aa, bb) = (
+        agent_of(a, cfg, temp, slot_a)?,
+        agent_of(b, cfg_b, temp, slot_b)?,
+    );
     #[cfg(feature = "gpu")]
     if gpu {
         return Ok(py.allow_threads(|| {
@@ -862,8 +886,24 @@ fn save_roots(
 ) -> PyResult<usize> {
     let gc = GameCfg {
         agents: [
-            Agent::Rebel { cfg: Cfg { depth: 2, iters: 64, snapshots: false, ..Default::default() }, slot: 0 },
-            Agent::Rebel { cfg: Cfg { depth: 2, iters: 64, snapshots: false, ..Default::default() }, slot: 0 },
+            Agent::Rebel {
+                cfg: Cfg {
+                    depth: 2,
+                    iters: 64,
+                    snapshots: false,
+                    ..Default::default()
+                },
+                slot: 0,
+            },
+            Agent::Rebel {
+                cfg: Cfg {
+                    depth: 2,
+                    iters: 64,
+                    snapshots: false,
+                    ..Default::default()
+                },
+                slot: 0,
+            },
         ],
         collect: Collect::None,
         explore: 0.25,
@@ -934,7 +974,12 @@ fn infer_policy(
     let guard = nets().read().unwrap();
     let mlp = &guard[slot].value;
     let (mut e, mut sb, mut pre, mut z, mut g, mut q) = (
-        Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
     );
     let xp = xpub.as_slice()?;
     mlp.cards(xp, unit_ids.as_slice()?, &mut e);
@@ -983,7 +1028,11 @@ fn hex_neighborhood() -> Vec<u32> {
         out.push(h as u32);
         for d in 0..6 {
             let x = bd.neighbors[h][d];
-            out.push(if x == crate::board::NONE { n as u32 } else { x as u32 });
+            out.push(if x == crate::board::NONE {
+                n as u32
+            } else {
+                x as u32
+            });
         }
     }
     out
@@ -1004,7 +1053,9 @@ fn hex_mirror() -> Vec<u32> {
         .map(|h| {
             let (x, y) = bd.coord[h];
             let t = (6 - x, 6 - y);
-            let m = (0..n).find(|&k| bd.coord[k] == t).expect("rotation stays on the board");
+            let m = (0..n)
+                .find(|&k| bd.coord[k] == t)
+                .expect("rotation stays on the board");
             m as u32
         })
         .collect()
@@ -1057,11 +1108,16 @@ fn expand_rows(
             fds[p] = fd[[r, p]];
             bg[p] = bag[[r, p]];
         }
-        expand_row(row, &hs, &fds, &bg, &mut out[r * PUBFEAT..(r + 1) * PUBFEAT]);
+        expand_row(
+            row,
+            &hs,
+            &fds,
+            &bg,
+            &mut out[r * PUBFEAT..(r + 1) * PUBFEAT],
+        );
     }
     Ok(out)
 }
-
 
 #[pymodule]
 fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {

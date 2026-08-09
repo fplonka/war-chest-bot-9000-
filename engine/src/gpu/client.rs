@@ -7,7 +7,8 @@
 //! game's solve with its own tag on one shared channel and resumes whichever
 //! game answers first, instead of waiting on them in a fixed order.
 
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
 
 use crate::serialize::Job;
 
@@ -47,12 +48,22 @@ pub(crate) enum Cmd {
 /// Handle to the service, shared by all workers.
 #[derive(Clone)]
 pub struct GpuClient {
+    inner: Arc<ClientInner>,
+}
+
+struct ClientInner {
     tx: mpsc::Sender<Cmd>,
+    thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl GpuClient {
-    pub(crate) fn new(tx: mpsc::Sender<Cmd>) -> GpuClient {
-        GpuClient { tx }
+    pub(crate) fn new(tx: mpsc::Sender<Cmd>, thread: JoinHandle<()>) -> GpuClient {
+        GpuClient {
+            inner: Arc::new(ClientInner {
+                tx,
+                thread: Mutex::new(Some(thread)),
+            }),
+        }
     }
 
     /// Submit one solve and block until trip 1.
@@ -79,7 +90,8 @@ impl GpuClient {
         tag: usize,
         reply: mpsc::Sender<(usize, Result<Trip1, String>)>,
     ) -> Result<(), String> {
-        self.tx
+        self.inner
+            .tx
             .send(Cmd::Submit { job, tag, reply })
             .map_err(|_| "gpu service gone".to_string())
     }
@@ -88,8 +100,13 @@ impl GpuClient {
     /// the solve.
     pub fn carried_beliefs(&self, id: u64, leaf: u32) -> Result<Trip2, String> {
         let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(Cmd::Trip2 { id, leaf, reply: tx })
+        self.inner
+            .tx
+            .send(Cmd::Trip2 {
+                id,
+                leaf,
+                reply: tx,
+            })
             .map_err(|_| "gpu service gone".to_string())?;
         rx.recv().map_err(|_| "gpu service gone".to_string())?
     }
@@ -97,13 +114,16 @@ impl GpuClient {
     /// Publish fresh weights (from the trainer). Applied when the live set
     /// drains; a different shape is refused — restart the service.
     pub fn set_weights(&self, dims: Vec<usize>, w: Vec<f32>, b: Vec<f32>, ln: Vec<f32>) {
-        let _ = self.tx.send(Cmd::SetWeights { dims, w, b, ln });
+        let _ = self.inner.tx.send(Cmd::SetWeights { dims, w, b, ln });
     }
 }
 
-impl Drop for GpuClient {
+impl Drop for ClientInner {
     fn drop(&mut self) {
         let _ = self.tx.send(Cmd::Shutdown);
+        if let Some(thread) = self.thread.get_mut().unwrap().take() {
+            let _ = thread.join();
+        }
     }
 }
 

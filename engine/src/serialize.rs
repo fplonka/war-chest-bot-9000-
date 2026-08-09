@@ -18,14 +18,15 @@
 //! `NONE = 255` where the solver uses it. Everything below mirrors
 //! `docs/TREE.md`; see that file for the meaning of each array.
 
-use crate::rebel::CFEAT;
+use crate::rebel::{CFEAT, GPU_ROW_BYTES, NTYPE, PUBFEAT};
 use crate::search::{Cfr, Solver};
+use crate::units::{write_card_features, CARD_FEATS};
 
 /// The byte format this module writes. Bump when an array changes shape or
 /// meaning (docs/TREE.md "the version bumps when any of them changes shape or
 /// meaning").
-pub const JOB_VERSION: u32 = 3;
-const MAGIC: u32 = 0x5743_4A33; // "WCJ3"
+pub const JOB_VERSION: u32 = 4;
+const MAGIC: u32 = 0x5743_4A34; // "WCJ4"
 
 /// Runtime metadata that travels with a job (not part of the frozen tree
 /// contract — it is per-request).
@@ -115,7 +116,14 @@ pub struct TreeTables {
     pub terminal_utility: Vec<f32>,
     pub leaf_coff: Vec<u32>,
     pub leaf_cidx: Vec<u32>,
-    pub leaf_xpub: Vec<f32>,
+    /// Config spans for every possible walk exit: `leaf_rows` followed by
+    /// `term_leaves`, two player spans per node.
+    pub snap_coff: Vec<u32>,
+    pub snapshot_configs: usize,
+    /// Compact public rows, expanded to `PUBFEAT` by the GPU build kernels.
+    pub leaf_raw: Vec<u8>,
+    /// The solve-wide printed-card facts (`NTYPE * CARD_FEATS`).
+    pub card_feat: Vec<f32>,
     // -- config table --
     pub cphi: Vec<f32>,
     // -- derived: BFS level order for the sweeps --
@@ -144,11 +152,9 @@ impl Job {
     /// solve's Phase 2 must value: the previous solve's carried beliefs, or
     /// just the live belief for the first level.
     pub fn from_solver(sv: &Solver, carried: &[[Vec<f32>; 2]]) -> Job {
+        let _t = crate::timed!(SERIAL);
         let tables = TreeTables::from_solver(sv);
-        let root = [
-            sv.root_belief[0].p.clone(),
-            sv.root_belief[1].p.clone(),
-        ];
+        let root = [sv.root_belief[0].p.clone(), sv.root_belief[1].p.clone()];
         Job {
             meta: JobMeta {
                 depth: sv.cfg.depth,
@@ -235,8 +241,7 @@ impl TreeTables {
             obs_off.push(obs_start.len() as u32);
             obs_start.extend_from_slice(&n.obs_start);
             t.obs_act.extend_from_slice(&n.obs_act);
-            t.obs_child
-                .extend(n.obs_child.iter().map(|&c| c as u32));
+            t.obs_child.extend(n.obs_child.iter().map(|&c| c as u32));
             draw_off.push(t.draw_to.len() as u32);
             t.draw_to.extend_from_slice(&n.draw.to);
             t.draw_p.extend_from_slice(&n.draw.p);
@@ -359,12 +364,32 @@ impl TreeTables {
         if leaf_coff.len() == 2 * t.rows {
             leaf_coff.push(sv.leaf_cidx.len() as u32);
         }
-        debug_assert_eq!(leaf_coff.len(), 2 * t.rows + 1, "leaf_coff must be canonical");
+        debug_assert_eq!(
+            leaf_coff.len(),
+            2 * t.rows + 1,
+            "leaf_coff must be canonical"
+        );
         t.leaf_coff = leaf_coff;
         t.leaf_cidx = sv.leaf_cidx.clone();
         t.leaf_configs = sv.leaf_cidx.len();
-        let pf = sv.pubfeat;
-        t.leaf_xpub = sv.xpub[..t.rows * pf].to_vec();
+        let mut snap_at = 0u32;
+        for &i in sv.leaf_rows.iter().chain(&sv.term_leaves) {
+            for p in 0..2 {
+                t.snap_coff.push(snap_at);
+                snap_at += sv.nodes[i].cfgs[p].len() as u32;
+            }
+        }
+        t.snap_coff.push(snap_at);
+        t.snapshot_configs = snap_at as usize;
+        let raw = t.rows * GPU_ROW_BYTES;
+        t.leaf_raw = sv.gpu_rows[..raw].to_vec();
+        t.card_feat.resize(NTYPE * CARD_FEATS, 0.0);
+        for (slot, &id) in sv.ids.iter().enumerate() {
+            write_card_features(
+                id,
+                &mut t.card_feat[slot * CARD_FEATS..(slot + 1) * CARD_FEATS],
+            );
+        }
 
         // BFS levels: node 0's children, then their children, ...
         let mut bfs: Vec<u32> = Vec::with_capacity(nodes);
@@ -386,6 +411,42 @@ impl TreeTables {
         t.bfs_order = bfs;
         t.nlevels = level_start.len() - 1;
         t.level_start = level_start;
+        #[cfg(feature = "prof")]
+        {
+            use crate::prof::{
+                add, CH_CHILD_CHANCE, CH_CHILD_DECISION, CH_CHILD_LEAF, CH_PARENT_CHANCE,
+                CH_PARENT_DECISION, CH_PARENT_ROOT, NCFG, S_CELLS, S_DEC_REV_NNZ, S_DRAW_NNZ,
+                S_DRAW_REV_NNZ, S_LEVELS, S_REACH, S_ROWS, S_SNAP_CFG,
+            };
+            add(&NCFG, t.ncfg as u64);
+            add(&S_ROWS, t.rows as u64);
+            add(&S_LEVELS, t.nlevels as u64);
+            add(&S_REACH, t.reach_len as u64);
+            add(&S_CELLS, t.ncells as u64);
+            add(&S_DRAW_NNZ, t.draw_to.len() as u64);
+            add(&S_DEC_REV_NNZ, t.rev_src.len() as u64);
+            add(&S_DRAW_REV_NNZ, t.rvd_src.len() as u64);
+            add(&S_SNAP_CFG, t.snapshot_configs as u64);
+            for i in 0..nodes {
+                if t.node_kind[i] != 1 {
+                    continue;
+                }
+                let parent = t.node_parent[i];
+                if parent == u32::MAX {
+                    add(&CH_PARENT_ROOT, 1);
+                } else if t.node_kind[parent as usize] == 1 {
+                    add(&CH_PARENT_CHANCE, 1);
+                } else {
+                    add(&CH_PARENT_DECISION, 1);
+                }
+                let child = t.node_child[t.node_child_start[i] as usize] as usize;
+                match t.node_kind[child] {
+                    2 => add(&CH_CHILD_LEAF, 1),
+                    1 => add(&CH_CHILD_CHANCE, 1),
+                    _ => add(&CH_CHILD_DECISION, 1),
+                }
+            }
+        }
         t
     }
 }
@@ -554,7 +615,9 @@ impl Job {
         w.f32s(&t.terminal_utility);
         w.u32s(&t.leaf_coff);
         w.u32s(&t.leaf_cidx);
-        w.f32s(&t.leaf_xpub);
+        w.u32s(&t.snap_coff);
+        w.u8s(&t.leaf_raw);
+        w.f32s(&t.card_feat);
         // config table
         w.f32s(&t.cphi);
         // levels
@@ -640,7 +703,9 @@ impl Job {
         t.terminal_utility = r.f32s("terminal_utility")?;
         t.leaf_coff = r.u32s("leaf_coff")?;
         t.leaf_cidx = r.u32s("leaf_cidx")?;
-        t.leaf_xpub = r.f32s("leaf_xpub")?;
+        t.snap_coff = r.u32s("snap_coff")?;
+        t.leaf_raw = r.u8s("leaf_raw")?;
+        t.card_feat = r.f32s("card_feat")?;
         t.cphi = r.f32s("cphi")?;
         t.bfs_order = r.u32s("bfs_order")?;
         t.level_start = r.u32s("level_start")?;
@@ -657,7 +722,9 @@ impl Job {
         rd_check(t.soff.len(), nodes + 1, "soff")?;
         rd_check(t.cfg_off.len(), 2 * nodes + 1, "cfg_off")?;
         rd_check(t.cphi.len(), ncfg * CFEAT, "cphi")?;
-        rd_check(t.leaf_xpub.len(), rows * pubfeat, "leaf_xpub")?;
+        rd_check(pubfeat, PUBFEAT, "pubfeat")?;
+        rd_check(t.leaf_raw.len(), rows * GPU_ROW_BYTES, "leaf_raw")?;
+        rd_check(t.card_feat.len(), NTYPE * CARD_FEATS, "card_feat")?;
         rd_check(t.leaf_coff.len(), 2 * rows + 1, "leaf_coff")?;
         rd_check(t.node_parent.len(), nodes, "node_parent")?;
         rd_check(t.rev_row_of.len(), nodes, "rev_row_of")?;
@@ -670,14 +737,13 @@ impl Job {
         t.draw_entries = t.draw_to.len();
         t.nleaf = t.leaf_rows.len();
         t.nterm = t.term_leaves.len();
+        rd_check(t.snap_coff.len(), 2 * (t.nleaf + t.nterm) + 1, "snap_coff")?;
+        t.snapshot_configs = *t.snap_coff.last().unwrap_or(&0) as usize;
         t.n_inner = rows - t.nleaf;
         t.leaf_configs = t.leaf_cidx.len();
         t.nlevels = t.level_start.len() - 1;
         t.reach_len = *t.reach_off.last().unwrap_or(&0) as usize;
-        let root = [
-            r.f32s("root0")?,
-            r.f32s("root1")?,
-        ];
+        let root = [r.f32s("root0")?, r.f32s("root1")?];
         let nroots = r.u32("nroots")? as usize;
         let mut carried = Vec::with_capacity(nroots);
         for _ in 0..nroots {
@@ -686,7 +752,12 @@ impl Job {
         if !r.done() {
             return Err("job: trailing bytes".into());
         }
-        Ok(Job { meta, tables: t, root, carried })
+        Ok(Job {
+            meta,
+            tables: t,
+            root,
+            carried,
+        })
     }
 }
 
@@ -710,7 +781,7 @@ impl Job {
                 nodes: 1,
                 ncfg: 1,
                 rows: 1,
-                pubfeat: 8,
+                pubfeat: PUBFEAT,
                 ncells: 2,
                 node_kind: vec![2],
                 node_player: vec![0],
@@ -739,7 +810,10 @@ impl Job {
                 terminal_utility: vec![],
                 leaf_coff: vec![0, 1, 2],
                 leaf_cidx: vec![0, 0],
-                leaf_xpub: vec![0.0; 8],
+                snap_coff: vec![0, 1, 2],
+                snapshot_configs: 2,
+                leaf_raw: vec![0; GPU_ROW_BYTES],
+                card_feat: vec![0.0; NTYPE * CARD_FEATS],
                 cphi: vec![0.0; CFEAT],
                 bfs_order: vec![0],
                 level_start: vec![0, 1],
@@ -779,7 +853,12 @@ mod gather_tests {
     /// arithmetic the GPU's forward sweep runs.
     #[test]
     fn gather_matches_forward() {
-        let cfg = Cfg { depth: 2, iters: 4, snapshots: true, ..Default::default() };
+        let cfg = Cfg {
+            depth: 2,
+            iters: 4,
+            snapshots: true,
+            ..Default::default()
+        };
         let nets = [Nets::default()];
         let gc = GameCfg {
             agents: [Agent::Rebel { cfg, slot: 0 }; 2],
@@ -798,9 +877,8 @@ mod gather_tests {
             }
             let job = Job::from_solver(&sv, &[]);
             let t = &job.tables;
-            let nc = |i: usize, p: usize| {
-                (t.cfg_off[2 * i + p + 1] - t.cfg_off[2 * i + p]) as usize
-            };
+            let nc =
+                |i: usize, p: usize| (t.cfg_off[2 * i + p + 1] - t.cfg_off[2 * i + p]) as usize;
             let mut reach = vec![0.0f32; t.reach_len];
             // Root: both players' current beliefs, as the solver seeds them.
             let (r0, r1) = (nc(0, 0), nc(0, 1));

@@ -343,7 +343,10 @@ impl State {
         // reachable in a long game with heavy bolstering, and a panic rather
         // than a hang, because it is `begin_main_turn` that guards the ply cap
         // and this path bypasses it.
-        if need_first == 0 && need_other == 0 && self.hand_size(first) == 0 && self.hand_size(other) == 0
+        if need_first == 0
+            && need_other == 0
+            && self.hand_size(first) == 0
+            && self.hand_size(other) == 0
         {
             self.adjudicated_draw = true;
             return;

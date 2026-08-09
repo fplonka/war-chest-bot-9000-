@@ -33,12 +33,12 @@
 
 use crate::actions::Action;
 use crate::board::{board, NONE, N_HEXES};
+use crate::gpu::GpuClient;
 use crate::rebel::*;
 use crate::rng::Rng;
-use crate::gpu::GpuClient;
 use crate::search::{node_actions, Cfg, Nets, Solver};
 use crate::serialize::Job;
-use crate::state::{Cont, State, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP, BLACK, WHITE};
+use crate::state::{Cont, State, BLACK, WHITE, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP};
 use rayon::prelude::*;
 
 /// The rulebook's recommended starter matchup. Training on one fixed matchup
@@ -51,10 +51,16 @@ const STARTER_BLACK: [u16; 4] = [1, 3, 8, 16]; // Archer, Cavalry, Lancer, Scout
 /// private mid-round draw puts "which coin must I now play" into the private
 /// state as `Config::pending_coin`, which the solver, belief filter and walk
 /// all carry.
-pub const DRAFT_POOL: [u16; 19] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 17, 18, 19, 52, 53, 54];
+pub const DRAFT_POOL: [u16; 19] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 17, 18, 19, 52, 53, 54,
+];
 
 pub fn make_game(rng: &mut Rng, random: bool) -> State {
-    let first = if rng.next_u64() & 1 == 0 { WHITE } else { BLACK };
+    let first = if rng.next_u64() & 1 == 0 {
+        WHITE
+    } else {
+        BLACK
+    };
     if !random {
         return State::from_draft(&STARTER_WHITE, &STARTER_BLACK, first);
     }
@@ -270,6 +276,9 @@ pub struct Data {
     /// needs and what it consumes. Not shipped to Python (the aux targets
     /// themselves live in the row).
     round: Vec<u16>,
+    /// Games abandoned because the solve service refused their subgame. Zero
+    /// in every healthy run; a rising count means the caps need looking at.
+    pub dropped: usize,
 
     // ------------------------------------------------------- policy targets
     // One per solve, not one per row. A solve's rows share a public state and
@@ -332,13 +341,13 @@ impl Data {
         // the other's is dropped. `coff` must stay `2 * nv + 1` long or every
         // row after the join is read with somebody else's configs.
         let tail = if self.coff.is_empty() { 0 } else { 1 };
-        self.coff
-            .extend(o.coff.iter().skip(tail).map(|x| x + base));
+        self.coff.extend(o.coff.iter().skip(tail).map(|x| x + base));
         let rb = self.nv as u32;
         self.soff.extend(o.soff.iter().map(|x| x + rb));
         self.nv += o.nv;
         self.games += o.games;
         self.decisions += o.decisions;
+        self.dropped += o.dropped;
         self.wins[0] += o.wins[0];
         self.wins[1] += o.wins[1];
         self.draws += o.draws;
@@ -401,8 +410,14 @@ impl Data {
         let base = self.pa.len();
         self.pa.resize(base + na * AFEAT, 0.0);
         for a in 0..na {
-            write_action_feats(&n.acts[a], ctx, player as usize, n.aslot[a], n.fdown[a],
-                               &mut self.pa[base + a * AFEAT..base + (a + 1) * AFEAT]);
+            write_action_feats(
+                &n.acts[a],
+                ctx,
+                player as usize,
+                n.aslot[a],
+                n.fdown[a],
+                &mut self.pa[base + a * AFEAT..base + (a + 1) * AFEAT],
+            );
         }
         self.paoff.push((self.pa.len() / AFEAT) as u32);
         for c in 0..nc {
@@ -416,8 +431,7 @@ impl Data {
     /// where the solve ran on the device: `strat` is the downloaded flat
     /// reference strategy (`soff`-aligned), so the root's rows are
     /// `strat[soff[0] + c * na..]` with `soff[0] == 0`.
-    fn push_policy_strat(&mut self, sv: &Solver, ctx: &Ctx, row: usize, player: u8,
-                         strat: &[f32]) {
+    fn push_policy_strat(&mut self, sv: &Solver, ctx: &Ctx, row: usize, player: u8, strat: &[f32]) {
         let n = &sv.nodes[0];
         let (na, nc) = (n.na(), n.nc(player as usize));
         if na == 0 || nc == 0 {
@@ -429,8 +443,14 @@ impl Data {
         let base = self.pa.len();
         self.pa.resize(base + na * AFEAT, 0.0);
         for a in 0..na {
-            write_action_feats(&n.acts[a], ctx, player as usize, n.aslot[a], n.fdown[a],
-                               &mut self.pa[base + a * AFEAT..base + (a + 1) * AFEAT]);
+            write_action_feats(
+                &n.acts[a],
+                ctx,
+                player as usize,
+                n.aslot[a],
+                n.fdown[a],
+                &mut self.pa[base + a * AFEAT..base + (a + 1) * AFEAT],
+            );
         }
         self.paoff.push((self.pa.len() / AFEAT) as u32);
         for c in 0..nc {
@@ -472,7 +492,6 @@ pub struct GameCfg {
     /// TD(λ) anchor). 0.0 is plain ReBeL: pure bootstrap targets.
     pub mc_mix: f32,
 }
-
 
 // ----------------------------------------------------------------- game loop
 
@@ -526,8 +545,14 @@ fn finish_walk<'a>(
     gpu: Option<&[GpuClient]>,
 ) -> Vec<[Vec<f32>; 2]> {
     let dev = w.dev;
-    let Walk { mut sv, node, gpu_id, .. } = w;
+    let Walk {
+        mut sv,
+        node,
+        gpu_id,
+        ..
+    } = w;
     let mut out = if let Some(gpus) = gpu {
+        let _t = crate::timed!(TRIP2);
         gpus[dev % gpus.len()]
             .carried_beliefs(gpu_id, node as u32)
             .expect("gpu trip 2")
@@ -672,8 +697,7 @@ impl<'a> Game<'a> {
                 let res = reserve(s, player, ctx);
                 let fu = faceup_counts(s, player, ctx);
                 let wp = matches!(s.pending(), Cont::WarriorPriestDraw { .. });
-                bel[player as usize] =
-                    belief_after_draw(&bel[player as usize], &res, &fu, wp);
+                bel[player as usize] = belief_after_draw(&bel[player as usize], &res, &fu, wp);
                 resolve_chance(s, player, rng);
                 // The walk spans draws now: a draw is an internal node of the
                 // subgame with one public child, so advance through it. The
@@ -693,7 +717,8 @@ impl<'a> Game<'a> {
                         w.drawn = 0;
                         let child = n.child[0];
                         assert!(
-                            *w.sv.nodes[child].cfgs[player as usize] == bel[player as usize].cfg[..],
+                            *w.sv.nodes[child].cfgs[player as usize]
+                                == bel[player as usize].cfg[..],
                             "walk desync: post-draw support does not match the game belief"
                         );
                         w.node = child;
@@ -830,16 +855,28 @@ impl<'a> Game<'a> {
                                 }
                                 let vals = sv.value_under(&roots_v);
                                 for (r, v) in roots_v.iter().zip(vals.iter()) {
-                                    assert_eq!(r[0].len(), bel[0].cfg.len(),
-                                               "carried belief does not match the root support");
-                                    assert_eq!(r[1].len(), bel[1].cfg.len(),
-                                               "carried belief does not match the root support");
+                                    assert_eq!(
+                                        r[0].len(),
+                                        bel[0].cfg.len(),
+                                        "carried belief does not match the root support"
+                                    );
+                                    assert_eq!(
+                                        r[1].len(),
+                                        bel[1].cfg.len(),
+                                        "carried belief does not match the root support"
+                                    );
                                     data.push_value(
                                         s,
                                         ctx,
                                         &[
-                                            Belief { cfg: bel[0].cfg.clone(), p: r[0].clone() },
-                                            Belief { cfg: bel[1].cfg.clone(), p: r[1].clone() },
+                                            Belief {
+                                                cfg: bel[0].cfg.clone(),
+                                                p: r[0].clone(),
+                                            },
+                                            Belief {
+                                                cfg: bel[1].cfg.clone(),
+                                                p: r[1].clone(),
+                                            },
                                         ],
                                         [&v[0], &v[1]],
                                     );
@@ -986,8 +1023,14 @@ impl<'a> Game<'a> {
                     &self.s,
                     &self.ctx,
                     &[
-                        Belief { cfg: self.bel[0].cfg.clone(), p: r[0].clone() },
-                        Belief { cfg: self.bel[1].cfg.clone(), p: r[1].clone() },
+                        Belief {
+                            cfg: self.bel[0].cfg.clone(),
+                            p: r[0].clone(),
+                        },
+                        Belief {
+                            cfg: self.bel[1].cfg.clone(),
+                            p: r[1].clone(),
+                        },
                     ],
                     [&v[0], &v[1]],
                 );
@@ -1106,9 +1149,7 @@ fn f32_to_f16(x: f32) -> u16 {
         let shift = 14 - e;
         let half = m >> shift;
         let rem = m & ((1 << shift) - 1);
-        let round = if rem > (1 << (shift - 1))
-            || (rem == (1 << (shift - 1)) && (half & 1) == 1)
-        {
+        let round = if rem > (1 << (shift - 1)) || (rem == (1 << (shift - 1)) && (half & 1) == 1) {
             half + 1
         } else {
             half
@@ -1132,7 +1173,13 @@ fn fill_aux(data: &mut Data, from_row: usize, tl: &Timeline, z: f32) {
     if tl.is_empty() {
         return;
     }
-    let result = if z > 0.0 { 0.0 } else if z < 0.0 { 2.0 } else { 1.0 };
+    let result = if z > 0.0 {
+        0.0
+    } else if z < 0.0 {
+        2.0
+    } else {
+        1.0
+    };
     for r in from_row..data.nv {
         let now = (data.round[r] as usize).min(tl.len() - 1);
         let then = (now + AUX_ROUNDS as usize).min(tl.len() - 1);
@@ -1193,7 +1240,8 @@ pub(crate) fn effective_bag_count(s: &State, p: u8, unit: u8) -> u8 {
     if bag_total > 0 {
         s.zones[p as usize][Z_BAG][unit as usize]
     } else {
-        s.zones[p as usize][Z_FACEUP][unit as usize] + s.zones[p as usize][Z_FACEDOWN][unit as usize]
+        s.zones[p as usize][Z_FACEUP][unit as usize]
+            + s.zones[p as usize][Z_FACEDOWN][unit as usize]
     }
 }
 
@@ -1244,6 +1292,18 @@ pub fn collect_roots(
 
 /// The GPU generation loop.
 ///
+/// Games each generation worker keeps in flight. Two is enough to hide one
+/// CPU tree build behind one GPU solve; more is what fills the service's live
+/// set when the service, not the CPU, is the bottleneck.
+#[cfg(feature = "gpu")]
+pub fn gen_workers_per() -> usize {
+    std::env::var("WARCHEST_GEN_PER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2)
+        .clamp(1, 16)
+}
+
 /// Worker count follows the box, not the game count (the old rule
 /// `games / 2` left a 64-core machine at 24 workers when the trainer asked
 /// for 48 games). Each worker interleaves a few games and resumes whichever
@@ -1263,13 +1323,25 @@ pub fn run_games_gpu(
     route: &(dyn Fn(usize) -> usize + Sync),
 ) -> Data {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    /// Live games per worker: one solving on the GPU while another builds
-    /// its tree on the CPU.
-    const PER: usize = 2;
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(8)
-        .min(games.div_ceil(PER).max(1));
+    // Live games per worker: one solving on the GPU while another builds its
+    // tree on the CPU. More than two is worth it whenever the service is the
+    // bottleneck — the resident live set is `workers * per`, and a bigger live
+    // set is what fills the tick's grids — so it is a knob, not a constant.
+    let per = gen_workers_per();
+    // Workers spend most of their time blocked on a solve, not running, so
+    // the useful count is not the core count: it is whatever keeps the
+    // service's live set full. `WARCHEST_GEN_WORKERS` overrides the
+    // one-per-core default for exactly that reason.
+    let workers = std::env::var("WARCHEST_GEN_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().saturating_sub(2).max(1))
+                .unwrap_or(8)
+        })
+        .min(games.div_ceil(per).max(1));
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
@@ -1277,14 +1349,14 @@ pub fn run_games_gpu(
                 let (gc, nets, gpus, next, route) = (gc, nets, gpus, &next, route);
                 scope.spawn(move || {
                     let mut out = Data::default();
-                    let mut game: Vec<Option<Game>> = (0..PER).map(|_| None).collect();
-                    let mut busy = vec![false; PER];
+                    let mut game: Vec<Option<Game>> = (0..per).map(|_| None).collect();
+                    let mut busy = vec![false; per];
                     let (tx, rx) = std::sync::mpsc::channel();
                     let mut live = 0usize;
                     loop {
                         // Advance every idle game to its next solve (or its
                         // end), starting fresh games while any remain.
-                        for k in 0..PER {
+                        for k in 0..per {
                             if busy[k] {
                                 continue;
                             }
@@ -1298,12 +1370,18 @@ pub fn run_games_gpu(
                                     live += 1;
                                 }
                                 let g = game[k].as_mut().unwrap();
-                                match g.advance(Some(gpus), nets) {
+                                let step = {
+                                    let _t = crate::timed!(ADVANCE);
+                                    g.advance(Some(gpus), nets)
+                                };
+                                match step {
                                     Step::Submitted => {
                                         let job = g.take_job().expect("submitted job");
                                         let dev = route(g.pending_slot()) % gpus.len();
                                         g.set_pending_dev(dev);
-                                        gpus[dev].submit_tagged(job, k, tx.clone()).expect("gpu submit");
+                                        gpus[dev]
+                                            .submit_tagged(job, k, tx.clone())
+                                            .expect("gpu submit");
                                         busy[k] = true;
                                         break;
                                     }
@@ -1324,13 +1402,31 @@ pub fn run_games_gpu(
                         }
                         // Resume whichever game answered first.
                         let t0 = std::time::Instant::now();
-                        let (k, res) = rx.recv().expect("gpu trip 1");
+                        let (k, res) = {
+                            let _t = crate::timed!(TRIP1);
+                            rx.recv().expect("gpu trip 1")
+                        };
                         out.gpu_wait_s += t0.elapsed().as_secs_f32();
                         busy[k] = false;
-                        game[k]
-                            .as_mut()
-                            .expect("pending game")
-                            .resume(res.expect("gpu trip 1"));
+                        match res {
+                            Ok(trip1) => {
+                                game[k].as_mut().expect("pending game").resume(trip1)
+                            }
+                            // A subgame the service cannot hold is a real
+                            // position, but it is one in ten thousand and it
+                            // would otherwise take the whole run down with it.
+                            // Abandon that game -- its partial data is
+                            // discarded rather than merged, so the buffer never
+                            // sees a half-played game -- and start another.
+                            Err(e) => {
+                                out.dropped += 1;
+                                if out.dropped == 1 {
+                                    eprintln!("gen: abandoning a game: {e}");
+                                }
+                                game[k] = None;
+                                live -= 1;
+                            }
+                        }
                     }
                     out
                 })

@@ -582,6 +582,9 @@ pub struct Solver<'a> {
     pub(crate) pubfeat: usize,
     /// `rows * pubfeat`: the public encoding, filled during the build.
     pub(crate) xpub: Vec<f32>,
+    /// Compact public rows for GPU admission. The device expands these into
+    /// the same trunk input; a GPU-built solver never materialises `xpub`.
+    pub(crate) gpu_rows: Vec<u8>,
     /// `rows * 2 * dg`: both players' belief embeddings.
     pub xb: Vec<f32>,
     /// `rows * hidden`: the hidden layer, rebuilt per iteration.
@@ -671,9 +674,14 @@ impl<'a> Solver<'a> {
             ids,
             inner_rows: Vec::new(),
             vt: Vec::new(),
-            pubfeat: if nets.value.is_empty() { PUBFEAT } else { nets.value.pub_dim() },
+            pubfeat: if nets.value.is_empty() {
+                PUBFEAT
+            } else {
+                nets.value.pub_dim()
+            },
             h0: take_buf(R_H0),
             xpub: take_buf(R_XPUB),
+            gpu_rows: Vec::new(),
             xb: take_buf(R_XB0),
             ob: take_buf(R_OB),
             sb: take_buf(R_SB),
@@ -1197,14 +1205,30 @@ impl<'a> Solver<'a> {
             "a network row must be a MainPlay state"
         );
         let _t = timed!(PUBFEAT);
-        let pf = self.pubfeat;
-        let at = (self.leaf_coff.len() / 2) * pf;
-        if self.xpub.len() < at + pf {
-            // Grow in chunks so the zero-fill happens a handful of times per
-            // solve, and not at all once the pooled buffer is warm.
-            self.xpub.resize(at + 64 * pf, 0.0);
+        let row = self.leaf_coff.len() / 2;
+        let raw_at = row * crate::rebel::GPU_ROW_BYTES;
+        if self.gpu_rows.len() < raw_at + crate::rebel::GPU_ROW_BYTES {
+            self.gpu_rows
+                .resize(raw_at + 64 * crate::rebel::GPU_ROW_BYTES, 0);
         }
-        self.encode(s, at);
+        crate::rebel::pack_gpu_row(
+            s,
+            &self.ctx,
+            &mut self.gpu_rows[raw_at..raw_at + crate::rebel::GPU_ROW_BYTES],
+        );
+        // The CPU solver needs the expanded public feature batch. A GPU solve
+        // does not: expanding 897 floats here only to upload and immediately
+        // rearrange them was its largest host and PCIe cost.
+        if !self.cfg.gpu_build {
+            let pf = self.pubfeat;
+            let at = row * pf;
+            if self.xpub.len() < at + pf {
+                // Grow in chunks so the zero-fill happens a handful of times
+                // per solve, and not at all once the pooled buffer is warm.
+                self.xpub.resize(at + 64 * pf, 0.0);
+            }
+            self.encode(s, at);
+        }
         for p in 0..2 {
             let res = reserve(s, p as u8, &self.ctx);
             self.leaf_coff.push(self.leaf_cidx.len() as u32);
@@ -1279,7 +1303,10 @@ impl<'a> Solver<'a> {
             }
         }
         self.leaf_coff.push(self.leaf_cidx.len() as u32);
-        let (leaves, rows) = (self.leaf_rows.len(), self.leaf_rows.len() + self.inner_rows.len());
+        let (leaves, rows) = (
+            self.leaf_rows.len(),
+            self.leaf_rows.len() + self.inner_rows.len(),
+        );
         let net = &self.nets.value;
         debug_assert_eq!(net.pub_dim(), self.pubfeat);
         debug_assert_eq!(net.cfeat(), CFEAT);
@@ -1296,7 +1323,14 @@ impl<'a> Solver<'a> {
         if rows > 0 {
             net.cards(&xpub[..self.pubfeat], &self.ids, &mut self.ce);
         }
-        net.trunk(&xpub, rows, self.pubfeat, &self.ce, &mut self.sb, &mut self.h0);
+        net.trunk(
+            &xpub,
+            rows,
+            self.pubfeat,
+            &self.ce,
+            &mut self.sb,
+            &mut self.h0,
+        );
         self.xpub = xpub;
         let cphi = std::mem::take(&mut self.cphi);
         net.embed(

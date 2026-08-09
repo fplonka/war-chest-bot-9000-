@@ -84,11 +84,9 @@ impl LiveGame {
             return err("agent must be 0 (white) or 1 (black)");
         }
         let get_units = |key: &str| -> PyResult<Vec<u16>> {
-            let v = draft
-                .get_item(key)?
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyValueError::new_err(format!("draft needs '{}'", key))
-                })?;
+            let v = draft.get_item(key)?.ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!("draft needs '{}'", key))
+            })?;
             let ids: Vec<u16> = v.extract()?;
             if ids.len() != 4 {
                 return err(format!("'{}' must have 4 unitTypeIds", key));
@@ -104,9 +102,7 @@ impl LiveGame {
         let black = get_units("black_units")?;
         let fp: String = draft
             .get_item("first_player")?
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("draft needs 'first_player'")
-            })?
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("draft needs 'first_player'"))?
             .extract()?;
         let first = match fp.as_str() {
             "white" => WHITE,
@@ -284,8 +280,7 @@ impl LiveGame {
                 if !sv.nodes[nid].legal[ci * na + a] || obs_key(&sv.nodes[nid].acts[a]) != obs {
                     continue;
                 }
-                if let Some(n) = advance_config(c, sv.nodes[nid].aslot[a], sv.nodes[nid].fdown[a])
-                {
+                if let Some(n) = advance_config(c, sv.nodes[nid].aslot[a], sv.nodes[nid].fdown[a]) {
                     pairs.push((n, bel[player as usize].p[ci] * probs[ci * na + a]));
                 }
             }

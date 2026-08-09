@@ -530,6 +530,12 @@ def main():
     # at startup or the run fails loudly rather than falling back to CPU.
     ap.add_argument("--gpu", action="store_true",
                     help="run solves on the in-process CUDA service")
+    # One service per listed CUDA device. Two services on a two-card box beat
+    # one by nearly the card count: the trainer's own device still has plenty
+    # of room left over, because this network is small and the trainer is not
+    # what the cards are busy with.
+    ap.add_argument("--gpu-devices", default="0",
+                    help="comma-separated CUDA devices for the solve services")
     ap.add_argument("--out", default="runs/latest")
     ap.add_argument("--seed", type=int, default=1)
     args = ap.parse_args()
@@ -552,10 +558,11 @@ def main():
     lr_decays = sorted(float(x) for x in args.lr_decay_frac.split(",") if x.strip())
     next_decay = 0
     value.push(0)
+    gpu_devices = [int(x) for x in args.gpu_devices.split(",") if x.strip()]
     if args.gpu:
         dims, w, b, ln = value.dims, *value.flat()
-        warchest.gpu_start(dims, w, b, ln)
-        print("[gpu] solve service up", flush=True)
+        warchest.gpu_start(dims, w, b, ln, devices=gpu_devices)
+        print(f"[gpu] solve services up on {gpu_devices}", flush=True)
     # Buffer capacity is the knob the data-scaling curve points at, so every
     # byte per row is a row we cannot hold. Public features are float16; counts
     # are the uint8 they already are; probabilities and targets live in [-1, 1]
@@ -568,6 +575,11 @@ def main():
     warm = min(warm, total)
     t0 = time.time()
     epoch, phase, log = 0, "greedy", []
+    # Fresh subgames per second over the whole ReBeL phase: the rate
+    # docs/GPU_PERF_GOAL.md is about. Generation overlaps training, so
+    # per-epoch `gen_s` is not it -- only cumulative solves over cumulative
+    # ReBeL wall time counts every cost, including the trainer's own.
+    rebel_t0, rebel_solves = None, 0
     # The marker-differential payoff at the horizon distorts the game being
     # solved, so it is annealed away as soon as horizon games become rare, and
     # evaluation always runs on the real game (value 0).
@@ -632,6 +644,8 @@ def main():
             # the run ended no stronger than it started).
             buf.clear()
             phase = "rebel"
+            rebel_t0 = time.time()
+            rebel_solves = 0
             print(f"[t={el:6.1f}s] --- switching to ReBeL ---", flush=True)
 
         tg = time.time()
@@ -646,6 +660,7 @@ def main():
                 box["d"] = warchest.gpu_gen_data(
                     args.rebel_games, gen_seed, "rebel",
                     depth=args.depth, iters=args.iters, explore=args.explore,
+                    temp=args.temp, eval_mix=args.eval_mix,
                     mc_mix=args.mc_mix, cfr=args.cfr, warm=args.warm, **kw)
 
             th = threading.Thread(target=go, daemon=True)
@@ -666,7 +681,9 @@ def main():
             th, box = gen_box
             th.join()
             d = box["d"]
-            warchest.gpu_set_weights(value.dims, *value.flat())
+            flat = value.flat()
+            for i in range(len(gpu_devices)):
+                warchest.gpu_set_weights(value.dims, *flat, device=i)
             gen_box = start_gen(args.seed * 1_000_003 + epoch + 1)
         else:
             d = warchest.gen_data(args.rebel_games, args.seed * 1_000_003 + epoch, "rebel",
@@ -686,6 +703,11 @@ def main():
         # can count solves (the sampling unit of the data) instead of rows,
         # which turbo multiplies by ~T for near-duplicate data.
         solves = max(1, int(d["solves"]))
+        if phase == "rebel":
+            if rebel_t0 is None:
+                rebel_t0, rebel_solves = time.time(), 0
+            rebel_solves += solves
+        sps = rebel_solves / max(time.time() - rebel_t0, 1e-9) if rebel_t0 else 0.0
         buf.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
         # A frozen batch from the warm phase. If the network's spread on it
         # collapses, the value function has gone degenerate -- the failure mode
@@ -770,6 +792,7 @@ def main():
                "tgt_mean": round(tgt_mean, 4), "tgt_std": round(tgt_std, 4),
                "probe_std": round(probe_std, 4),
                "gen_s": round(gen_s, 2), "train_s": round(train_s, 2), "buf": len(buf),
+               "solves_per_s": round(sps, 1),
                "lr": opt.param_groups[0]["lr"]}
         log.append(rec)
         # Rewritten every epoch: this is the file `plot.py` reads, and a run
@@ -781,7 +804,8 @@ def main():
               f"dec={dec:6d} rows={len(rows):6d} cap={rec['cap_frac']:.2f} "
               f"cfgs={rec['configs']:5.1f} L={lv:.5f} P={lp:.3f} old={loss_old:.5f} new={loss_new:.5f} "
               f"tgt={tgt_mean:+.3f}/{tgt_std:.3f} pstd={probe_std:.3f} "
-              f"capv={cap_v:.3f} lr={rec['lr']:.1e} gen={gen_s:.1f}s train={train_s:.1f}s",
+              f"capv={cap_v:.3f} lr={rec['lr']:.1e} gen={gen_s:.1f}s train={train_s:.1f}s "
+              f"sps={sps:.0f}",
               flush=True)
         epoch += 1
 

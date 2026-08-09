@@ -41,6 +41,27 @@ CFEAT = CCOUNTS + 1                       # 16
 AFEAT = 39 + 3 * (N_HEXES + 1) + 2 * (NTYPE + 1) + 1  # 176
 AOFF_PAYS = 39 + 3 * (N_HEXES + 1)         # 153
 
+# Compact GPU public-row geometry (`rebel.rs::GPU_ROW_*`).
+GR_HEX_OWNER = 0
+GR_HEX_SLOT = GR_HEX_OWNER + N_HEXES
+GR_HEX_HEIGHT = GR_HEX_SLOT + N_HEXES
+GR_HEX_MARKER = GR_HEX_HEIGHT + N_HEXES
+GR_PILES = GR_HEX_MARKER + N_HEXES
+GR_MARKERS = GR_PILES + NTYPE * PILE_COUNTS
+GR_HAND = GR_MARKERS + 2
+GR_FD = GR_HAND + 2
+GR_BAG = GR_FD + 2
+GR_INITIATIVE = GR_BAG + 2
+GR_INIT_MOVED = GR_INITIATIVE + 1
+GR_TO_ACT = GR_INIT_MOVED + 1
+GR_PLIES = GR_TO_ACT + 1
+GPU_ROW_BYTES = GR_PLIES + 2
+_coords = [(x, y) for y in range(7) for x in range(7)
+           if abs(x - 3) <= 3 and abs(y - 3) <= 3 and abs(x + y - 6) <= 3]
+_locations = {(4, 0), (6, 1), (0, 5), (2, 6), (2, 1),
+              (3, 2), (5, 3), (1, 3), (3, 4), (4, 5)}
+HEX_LOCATION = np.asarray([c in _locations for c in _coords], np.float32)
+
 
 # ---------------------------------------------------------------- job reader
 
@@ -52,7 +73,7 @@ class Job:
         self.b = open(path, "rb").read()
         self.at = 0
         magic, ver = self.u32(), self.u32()
-        assert magic == 0x57434A33 and ver == 3, f"bad job magic/version {magic:x}/{ver}"
+        assert magic == 0x57434A34 and ver == 4, f"bad job magic/version {magic:x}/{ver}"
         self.depth, self.iters = self.u32(), self.u32()
         self.snapshots = bool(self.take(1)[0])
         self.alpha, self.beta, self.gamma, self.predict, self.warm = (
@@ -96,7 +117,9 @@ class Job:
         self.terminal_utility = self.f32s()
         self.leaf_coff = self.u32s()
         self.leaf_cidx = self.u32s()
-        self.leaf_xpub = self.f32s()
+        self.snap_coff = self.u32s()
+        self.leaf_raw = self.u8s()
+        self.card_feat = self.f32s()
         self.cphi = self.f32s()
         self.bfs_order = self.u32s()
         self.level_start = self.u32s()
@@ -361,10 +384,11 @@ class Solve:
         self.last_traverser = None
         # Build GEMMs (once per solve): the card table, the trunk, the config
         # tower, and (warm start) the action towers.
-        e = self.cards(job.leaf_xpub[:job.pubfeat], job.ids)
+        xpub = self.expand_public(job.leaf_raw, job.rows, job.card_feat)
+        e = self.cards(job.card_feat, job.ids)
         self.e = e
         self.xb = torch.zeros(job.rows, 2 * dg, dtype=dtype)
-        self.h0 = self.trunk(job.leaf_xpub, job.rows, e)
+        self.h0 = self.trunk(xpub, job.rows, e)
         z, g = self.embed(job.cphi, job.ncfg, e)
         self.z, self.g = z, g
         assert job.warm == 0, "warm start is plan A4; the job no longer carries psi"
@@ -421,8 +445,44 @@ class Solve:
 
     # ------------------------------------------------------- the network
 
-    def cards(self, xpub_row, ids):
-        c = torch.tensor(np.ascontiguousarray(xpub_row[OFF_CARDS:OFF_LOOSE]),
+    @staticmethod
+    def expand_public(raw, rows, card_feat):
+        """Reference expansion of the device's compact public rows."""
+        r = np.ascontiguousarray(raw).reshape(rows, GPU_ROW_BYTES)
+        x = np.zeros((rows, PUBFEAT), np.float32)
+        for h in range(N_HEXES):
+            at = h * HEX_CH
+            owner = r[:, GR_HEX_OWNER + h]
+            slot = r[:, GR_HEX_SLOT + h]
+            x[:, at] = owner == 0
+            x[:, at + 1] = owner == 1
+            x[:, at + 2] = r[:, GR_HEX_HEIGHT + h].astype(np.float32) / 5.0
+            marker = r[:, GR_HEX_MARKER + h]
+            x[:, at + 3] = marker == 0
+            x[:, at + 4] = marker == 1
+            x[:, at + 5] = HEX_LOCATION[h]
+            for p in range(2):
+                for k in range(NSLOT):
+                    x[:, at + HEX_FACTS + p * NSLOT + k] = ((owner == p) & (slot == k))
+        x[:, OFF_PILES:OFF_CARDS] = r[:, GR_PILES:GR_MARKERS].astype(np.float32) / 5.0
+        x[:, OFF_CARDS:OFF_LOOSE] = np.asarray(card_feat, np.float32).reshape(1, -1)
+        loose = x[:, OFF_LOOSE:OFF_LOOSE + LOOSE]
+        for p in range(2):
+            m = r[:, GR_MARKERS + p].astype(np.float32)
+            loose[:, p * 6] = m / 6.0
+            loose[:, p * 6 + 1] = (6.0 - m) / 6.0
+            loose[:, p * 6 + 2] = r[:, GR_HAND + p].astype(np.float32) / 3.0
+            loose[:, p * 6 + 3] = r[:, GR_FD + p].astype(np.float32) / 21.0
+            loose[:, p * 6 + 4] = r[:, GR_BAG + p].astype(np.float32) / 21.0
+            loose[:, p * 6 + 5] = r[:, GR_INITIATIVE] == p
+        plies = r[:, GR_PLIES].astype(np.uint16) + (r[:, GR_PLIES + 1].astype(np.uint16) << 8)
+        loose[:, 12] = plies.astype(np.float32) / 256.0
+        loose[:, 13] = r[:, GR_INIT_MOVED] != 0
+        loose[:, 14] = r[:, GR_TO_ACT] == 0
+        return x.reshape(-1)
+
+    def cards(self, card_feat, ids):
+        c = torch.tensor(np.ascontiguousarray(card_feat),
                          dtype=self.dtype).reshape(NTYPE, CARD_FEATS)
         hid = F.relu(c @ self.W["wd0"] + self.B["bd0"])
         e = hid @ self.W["wd1"] + self.B["bd1"]
