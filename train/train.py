@@ -350,7 +350,7 @@ def policy_loss(net, d, ids, device):
 
 def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
                 recent_mix=0.0, recent_frac=0.2, aux_weight=0.0, policy_weight=0.0,
-                d=None, policy_batch=64):
+                d=None, policy_batch=64, profile_cuda=False):
     """Returns the mean value loss and the mean policy loss.
 
     The side tasks are summed into the same backward as the value loss, not
@@ -359,7 +359,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
     means anything when it sets one term's size against another's in one sum.
     """
     if len(buf) < batch:
-        return float("nan"), float("nan")
+        return float("nan"), float("nan"), {}
     live = policy_weight > 0.0 and d is not None and len(d["prow"]) > 0
     # Drawn unconditionally, and from its own stream: sampling policy labels out
     # of `rng` would shift every later value batch, so turning the policy on
@@ -367,14 +367,33 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
     # measuring the sampling, not the side task.
     prng = np.random.default_rng(rng.integers(1 << 62))
     tot, ptot = 0.0, 0.0
+    stat = {"sample_s": 0.0, "prepare_s": 0.0, "forward_wall_s": 0.0,
+            "backward_wall_s": 0.0, "batch_configs": 0, "steps": steps,
+            "gpu_forward_s": 0.0, "gpu_backward_s": 0.0}
+    event_pairs = []
+    stream = torch.cuda.current_stream(device) if profile_cuda and device.type == "cuda" else None
     for _ in range(steps):
-        parts = make_batch(buf.sample(batch, rng, recent_mix, recent_frac),
-                           rng, device, augment)
+        ts = time.perf_counter()
+        sampled = buf.sample(batch, rng, recent_mix, recent_frac)
+        stat["sample_s"] += time.perf_counter() - ts
+        stat["batch_configs"] += len(sampled[1])
+        ts = time.perf_counter()
+        parts = make_batch(sampled, rng, device, augment)
+        stat["prepare_s"] += time.perf_counter() - ts
+        if stream is not None:
+            f0 = torch.cuda.Event(enable_timing=True)
+            f1 = torch.cuda.Event(enable_timing=True)
+            b1 = torch.cuda.Event(enable_timing=True)
+            f0.record(stream)
+        ts = time.perf_counter()
         loss = value_loss(net, *parts[:-1])
         ay = parts[-1]
         # What is reported is the value loss alone, so the column means the same
         # thing whether or not the side tasks are on.
         tot += loss.detach().item()
+        stat["forward_wall_s"] += time.perf_counter() - ts
+        if stream is not None:
+            f1.record(stream)
         # Both side tasks share the trunk and are dropped at play time, so they
         # are extra gradient per row for nothing at inference.
         if aux_weight > 0.0:
@@ -384,11 +403,20 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
             pl = policy_loss(net, d, prng.choice(n, min(policy_batch, n), replace=False), device)
             ptot += pl.detach().item()
             loss = loss + policy_weight * pl
+        ts = time.perf_counter()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(net.parameters(), 5.0)
         opt.step()
-    return tot / steps, (ptot / steps if live else float("nan"))
+        stat["backward_wall_s"] += time.perf_counter() - ts
+        if stream is not None:
+            b1.record(stream)
+            event_pairs.append((f0, f1, b1))
+    if event_pairs:
+        torch.cuda.synchronize(device)
+        stat["gpu_forward_s"] = sum(a.elapsed_time(b) for a, b, _ in event_pairs) / 1000.0
+        stat["gpu_backward_s"] = sum(b.elapsed_time(c) for _, b, c in event_pairs) / 1000.0
+    return tot / steps, (ptot / steps if live else float("nan")), stat
 
 
 def write_log(args, epochs, snaps):
@@ -692,7 +720,10 @@ def main():
         window.update(rows=0, solves=0, target_n=0, target_sum=0.0,
                       target_sq=0.0, conv_s=0.0, add_s=0.0,
                       train_s=0.0, gpu_wait_s=0.0,
-                      loss_sum=0.0, train_steps=0)
+                      loss_sum=0.0, train_steps=0, sample_s=0.0,
+                      prepare_s=0.0, forward_wall_s=0.0,
+                      backward_wall_s=0.0, gpu_forward_s=0.0,
+                      gpu_backward_s=0.0, batch_configs=0)
 
         def emit_report(now):
             nonlocal probe, epoch
@@ -747,6 +778,16 @@ def main():
                 "probe_std": round(probe_std, 4),
                 "gen_s": round(elapsed, 2),
                 "train_s": round(window["train_s"], 2),
+                "sample_s": round(window["sample_s"], 2),
+                "prepare_s": round(window["prepare_s"], 2),
+                "forward_wall_s": round(window["forward_wall_s"], 2),
+                "backward_wall_s": round(window["backward_wall_s"], 2),
+                "gpu_forward_s": round(window["gpu_forward_s"], 2),
+                "gpu_backward_s": round(window["gpu_backward_s"], 2),
+                "batch_configs": round(
+                    window["batch_configs"] / max(window["train_steps"], 1), 1),
+                "target_configs_per_row": round(
+                    window["target_n"] / max(window["rows"], 1), 1),
                 "conv_s": round(window["conv_s"], 2),
                 "add_s": round(window["add_s"], 2),
                 "gpu_wait_s": round(window["gpu_wait_s"], 2),
@@ -764,6 +805,8 @@ def main():
                 f"debt={debt:.0f} rows steps={optimizer_steps} "
                 f"over={totals['oversize_routes']} drop={totals['dropped']} "
                 f"L={lv:.5f} tgt={tgt_mean:+.3f}/{tgt_var ** 0.5:.3f} "
+                f"cfg/b={rec['batch_configs']:.0f} prep={window['prepare_s']:.2f}s "
+                f"gpu={window['gpu_forward_s'] + window['gpu_backward_s']:.2f}s "
                 f"conv={window['conv_s']:.2f}s add={window['add_s']:.2f}s "
                 f"train={window['train_s']:.2f}s",
                 flush=True)
@@ -772,7 +815,9 @@ def main():
                 window[name] = 0
             for name in ("rows", "solves", "target_n", "target_sum", "target_sq",
                          "conv_s", "add_s", "train_s", "gpu_wait_s",
-                         "loss_sum", "train_steps"):
+                         "loss_sum", "train_steps", "sample_s", "prepare_s",
+                         "forward_wall_s", "backward_wall_s", "gpu_forward_s",
+                         "gpu_backward_s", "batch_configs"):
                 window[name] = 0
 
         try:
@@ -822,14 +867,19 @@ def main():
                     until_publish = publish_steps - optimizer_steps % publish_steps
                     nsteps = min(int(debt // args.batch), until_publish)
                     tt = time.time()
-                    lv, _ = train_steps(
+                    lv, _, train_stat = train_steps(
                         value, opt, buf, nsteps, args.batch, rng, dev,
                         aux_weight=0.0, policy_weight=0.0,
                         augment=not args.no_augment,
-                        recent_mix=args.recent_mix, recent_frac=args.recent_frac)
+                        recent_mix=args.recent_mix, recent_frac=args.recent_frac,
+                        profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1")
                     window["train_s"] += time.time() - tt
                     window["loss_sum"] += lv * nsteps
                     window["train_steps"] += nsteps
+                    for name in ("sample_s", "prepare_s", "forward_wall_s",
+                                 "backward_wall_s", "gpu_forward_s", "gpu_backward_s",
+                                 "batch_configs"):
+                        window[name] += train_stat[name]
                     optimizer_steps += nsteps
                     optimizer_rows += nsteps * args.batch
                     if optimizer_steps % publish_steps == 0:
@@ -1020,10 +1070,11 @@ def main():
         # by the same factor for near-duplicate data. One solve is one sample,
         # matching the buffer's sampling unit.
         steps = max(1, round(args.train_gen_ratio * solves / args.batch))
-        lv, lp = train_steps(value, opt, buf, steps, args.batch, rng, dev, aux_weight=args.aux,
-                             policy_weight=(args.policy if phase == "rebel" else 0.0), d=d,
-                         augment=not args.no_augment, recent_mix=args.recent_mix,
-                         recent_frac=args.recent_frac)
+        lv, lp, _ = train_steps(
+            value, opt, buf, steps, args.batch, rng, dev, aux_weight=args.aux,
+            policy_weight=(args.policy if phase == "rebel" else 0.0), d=d,
+            augment=not args.no_augment, recent_mix=args.recent_mix,
+            recent_frac=args.recent_frac)
         train_s = time.time() - tt
         value.push(0)
         with torch.no_grad():
