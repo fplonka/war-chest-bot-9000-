@@ -600,6 +600,10 @@ def main():
     args.matmul_precision = torch.get_float32_matmul_precision()
     rng = np.random.default_rng(args.seed)
     dev = torch.device(args.device)
+    if args.gpu and dev.type == "cuda":
+        # Triton launches on PyTorch's current device. Pin it before the Rust
+        # services create their independent contexts for both solve cards.
+        torch.cuda.set_device(dev)
 
     towers = lambda s: [int(x) for x in s.split(",") if x.strip()] or None
     value = Mlp(args.hidden, args.dg, args.rank, args.de,
