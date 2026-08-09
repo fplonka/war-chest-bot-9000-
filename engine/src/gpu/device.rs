@@ -27,7 +27,7 @@ use super::wave::Wave;
 
 const BLOCK: u32 = 256;
 const GRAPH_CLASSES: usize = 4;
-const N_TABLES: usize = 53;
+const N_TABLES: usize = 51;
 const N_ARENAS: usize = 21;
 
 #[repr(usize)]
@@ -39,9 +39,7 @@ enum Table {
     NodeChild,
     LegalRowOf,
     LegalOff,
-    LegalAction,
-    LegalChild,
-    LegalTrans,
+    LegalValue,
     DrawOff,
     DrawTo,
     DrawP,
@@ -240,7 +238,7 @@ kernels! {
     pack_cards, bias_act, cards_finish, pile_pe, pack_piles, assemble,
     trunk_norm, holding_in, slot_sum, finish_zg,
     init_strategy, seed_reach, reach_sweep, seed_sum, root_average,
-    belief_sums, head_entry, head_act, wu_bias, readout, backprop_sweep,
+    belief_sums, head_entry, head_act, readout, backprop_sweep,
     normalize_strategy, gather_carry, collect_root,
 }
 
@@ -313,6 +311,14 @@ impl Executor {
         let cuda_root = std::env::var("CUDA_PATH")
             .or_else(|_| std::env::var("CUDA_HOME"))
             .unwrap_or_else(|_| "/usr/local/cuda".into());
+        // cudarc 0.17's `use_fast_math` option only enables contraction; pass
+        // NVRTC's actual umbrella flag so division, square root and denormal
+        // handling use the native fast paths too. The production path is fast
+        // math by default; the opt-out exists only for numerical diagnosis.
+        let mut nvrtc_options = vec!["--generate-line-info".into(), "--use_fast_math".into()];
+        if std::env::var_os("WARCHEST_GPU_PRECISE_MATH").is_some() {
+            nvrtc_options.pop();
+        }
         let source = format!(
             "{}\n{}",
             cuda_preamble(&layout),
@@ -326,7 +332,7 @@ impl Executor {
                     format!("{cuda_root}/include"),
                     format!("{cuda_root}/targets/x86_64-linux/include/cccl"),
                 ],
-                options: vec!["--generate-line-info".into()],
+                options: nvrtc_options,
                 ..Default::default()
             },
         )
@@ -404,7 +410,7 @@ impl Executor {
         let started = Instant::now();
         let profile_jobs = wave.jobs.len();
         let profile_rows = wave.row_node.len();
-        let profile_cells = wave.legal_action.len();
+        let profile_cells = wave.legal_value.len();
         if wave.meta.warm > 0.0 {
             return Err("v5 FP32 baseline does not yet implement policy-head warm starts".into());
         }
@@ -507,7 +513,7 @@ impl Executor {
             &device,
             Arena::SnapStrat,
             0,
-            wave.legal_action.len(),
+            wave.legal_value.len(),
         )?;
         let root_total = wave.jobs.last().map_or(0, |j| j.root_values.end);
         let root_values = copy_arena(&self.stream, &device, Arena::RootValues, 0, root_total)?;
@@ -656,7 +662,6 @@ impl Executor {
             l.head_in,
             0.0,
         )?;
-
         launch!(self, d, bank, holding_in, threads_usize(cfgs * NSLOT))?;
         let mut src = d.ptr(Arena::Bg);
         let mut which = 0usize;
@@ -953,7 +958,6 @@ impl Executor {
             l.rank,
             0.0,
         )?;
-        launch!(self, d, bank, wu_bias, threads_usize(rows * l.rank))?;
         Ok(())
     }
 
@@ -1223,7 +1227,7 @@ impl DeviceWave {
                 "network leaves",
             )?,
             ncfg: i32n(w.config_job.len(), "configs")?,
-            cells: i32n(w.legal_action.len(), "legal cells")?,
+            cells: i32n(w.legal_value.len(), "legal cells")?,
             reach_len: i32n(*w.reach_off.last().unwrap_or(&0) as usize, "reach")?,
             vals_len: i32n(*w.voff.last().unwrap_or(&0) as usize, "values")?,
             exits: i32n(w.exit_nodes.len(), "exits")?,
@@ -1344,9 +1348,7 @@ macro_rules! wave_table_fields {
         $put!(NodeChild, $w.node_child.as_slice());
         $put!(LegalRowOf, $w.legal_row_of.as_slice());
         $put!(LegalOff, $w.legal_off.as_slice());
-        $put!(LegalAction, $w.legal_action.as_slice());
-        $put!(LegalChild, $w.legal_child.as_slice());
-        $put!(LegalTrans, $w.legal_trans.as_slice());
+        $put!(LegalValue, $w.legal_value.as_slice());
         $put!(DrawOff, $w.draw_off.as_slice());
         $put!(DrawTo, $w.draw_to.as_slice());
         $put!(DrawP, $w.draw_p.as_slice());
@@ -1477,7 +1479,7 @@ fn arena_layout(w: &Wave, l: &V3Layout) -> Result<([u64; N_ARENAS], usize), Stri
     let rows = w.row_node.len();
     let cfgs = w.config_job.len();
     let jobs = w.jobs.len();
-    let cells = w.legal_action.len();
+    let cells = w.legal_value.len();
     let reach = *w.reach_off.last().unwrap_or(&0) as usize;
     let vals = *w.voff.last().unwrap_or(&0) as usize;
     let roots = w.jobs.last().map_or(0, |j| j.root_values.end);
@@ -1534,6 +1536,10 @@ fn arena_layout(w: &Wave, l: &V3Layout) -> Result<([u64; N_ARENAS], usize), Stri
     let mut off = [0u64; N_ARENAS];
     let mut at = 0usize;
     for (i, &n) in sizes.iter().enumerate() {
+        at = at
+            .checked_add(31)
+            .ok_or("wave FP32 arena alignment overflow")?
+            & !31;
         off[i] = at as u64;
         at = at.checked_add(n).ok_or("wave FP32 arena size overflow")?;
     }

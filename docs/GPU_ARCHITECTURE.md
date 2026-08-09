@@ -1,8 +1,9 @@
 # Architecture for 1,200--2,000 ReBeL solves/s
 
-Status: implementation in progress. The v5 one-card wave gate reached 640.4
-solves/s on the production tape on 2026-08-09; the 1,200 balanced-solves/s
-training target has not been achieved yet.
+Status: implementation in progress. The v5 deterministic production tape now
+reaches 717.1 solves/s on one RTX 3090 and 1,438.9 solves/s on two. The tape
+throughput gates are cleared; the live self-play, balanced trainer, and golden
+run gates have not been achieved yet.
 
 This is a replacement design, not an incremental plan for the resident CUDA
 service. Keep the verified rules, tree semantics, compact training-row format,
@@ -404,13 +405,15 @@ turn the small-matrix and launch-heavy workload into sustained work.
 ### Precision
 
 FP32 CFR, reaches, reductions, outputs, and optimizer state are the baseline.
-Network GEMMs use native, untiled cuBLAS SGEMM with its default fast math. Do
-not pad matrices to a fixed oracle shape or select pedantic math merely to make
-different batch shapes bit-identical. Associating an FP32 reduction differently
-can change the last bits, and CFR can amplify that into a small policy change.
-Correctness therefore comes from structural invariants, a tight zero-network
-end-to-end oracle, and measured bounds against the CPU reference rather than
-exact batch-composition identity.
+Network GEMMs use native, untiled cuBLAS SGEMM with its default fast math, and
+the custom kernels are compiled with NVRTC's `--use_fast_math` umbrella flag.
+`WARCHEST_GPU_PRECISE_MATH=1` is a diagnostic opt-out, not a production mode.
+Do not pad matrices to a fixed oracle shape or select pedantic math merely to
+make different batch shapes bit-identical. Associating an FP32 reduction
+differently can change the last bits, and CFR can amplify that into a small
+policy change. Correctness therefore comes from structural invariants, a tight
+zero-network end-to-end oracle, and measured bounds against the CPU reference
+rather than exact batch-composition identity.
 
 Explicit TF32 was measured on the production tape after the wave engine was
 working. It improved a long A/B from 577.9 to 587.7 solves/s, but changed one
@@ -680,10 +683,12 @@ Gate: all GPU oracles pass and tape throughput is at least 600 solves/s on one
 test. If it misses, profile the graph before adding more concurrency or
 precision modes.
 
-Achieved on 2026-08-09: 640.4 solves/s over a 20-second measured interval on
+Achieved on 2026-08-09. The first passing build reached 640.4 solves/s. The
+current build reaches 717.1 solves/s over a 32.0-second wall-clock interval on
 one RTX 3090, including queue fill/drain, wave packing, transfers, graph work,
 and result materialisation. The run used 64 production roots, three reusable
-lanes, and the native FP32 SGEMM path.
+lanes, native FP32 SGEMM, fast NVRTC arithmetic, direct legal-cell value
+indices, branch-grouped sparse tasks, and cooperative level sweeps.
 
 ### 3. Integrate the streaming runtime
 
@@ -696,9 +701,12 @@ Gate: generation-only production tape and live self-play both exceed 1,400/s
 with stable memory. The margin is intentional; training and tails still need
 room.
 
-Current measurement on 2026-08-09: the deterministic tape reaches 1,302.3
-solves/s across both RTX 3090s. Scaling from one card is essentially linear;
-the remaining gap is per-card execution rather than static routing imbalance.
+Tape half achieved on 2026-08-09: the deterministic tape reaches 1,438.9
+solves/s over a 32.1-second wall-clock interval across both RTX 3090s. The run
+used six producers, three lanes per card, and `taskset -c 0-35` so GPU feeder
+work stayed on one hardware thread per physical core. Stable-memory live
+self-play above 1,400/s, the whale path, and zero-drop admission are still
+required before this integration gate is complete.
 
 ### 4. Replace the trainer boundary
 

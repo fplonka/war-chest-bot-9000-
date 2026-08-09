@@ -145,12 +145,20 @@ The historical 573 solves/s result from `gpu_gen_bench` remains useful kernel
 context, not evidence that training is close to the goal. It used a later
 strong checkpoint and a different work distribution.
 
+The retired v4 benchmark has now been replaced by the v5 contiguous-wave tape.
+On 2026-08-09, 64 production roots reached 717.1 solves/s on one RTX 3090 and
+1,438.9 solves/s on both cards, with queue fill and drain included. This clears
+the deterministic tape margin, but it is still generation-only evidence: it
+does not claim live actor/build throughput or trainer balance.
+
 ## How to measure progress
 
-`engine/examples/gpu_gen_bench.rs` accepts `GPU_WEIGHTS`, `GPU_SEED`, and
-`GPU_CAP_VALUE`; use all three when replaying a trainer interval. All-zero
-weights remain the right way to prove identical CPU/GPU game trajectories for
-a scheduling-only A/B. Neither mode replaces a real training run.
+`engine/examples/wave_tape.rs` accepts a flat weight file, a frozen roots file,
+a root count, and a duration. `WARCHEST_TAPE_DEVICES`,
+`WARCHEST_TAPE_PRODUCERS`, and `WARCHEST_TAPE_QUEUE` select the feeder setup;
+the wave capacity variables remain executor tuning parameters. All-zero weights
+remain the right way to prove identical CPU/GPU game trajectories for a
+scheduling-only A/B. Neither mode replaces a real training run.
 
 Short development measurements should use the deterministic early/mid/late
 production tapes proposed in `docs/GPU_ARCHITECTURE.md`, stay below five

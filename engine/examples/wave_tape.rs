@@ -1,4 +1,4 @@
-//! Deterministic one-card throughput gate for the v5 contiguous-wave executor.
+//! Deterministic throughput gate for the v5 contiguous-wave executor.
 //!
 //! Usage: `wave_tape <weights.bin> <roots.bin> [roots=256] [seconds=30]`
 //!

@@ -57,9 +57,9 @@ pub struct Wave {
     pub node_child: Vec<u32>,
     pub legal_row_of: Vec<u32>,
     pub legal_off: Vec<u32>,
-    pub legal_action: Vec<u32>,
-    pub legal_child: Vec<u32>,
-    pub legal_trans: Vec<u32>,
+    /// Direct `A_VALS` index for each legal cell, or `u32::MAX` when the
+    /// action has no successor in this depth-limited tree.
+    pub legal_value: Vec<u32>,
     pub draw_off: Vec<u32>,
     pub draw_to: Vec<u32>,
     pub draw_p: Vec<f32>,
@@ -141,9 +141,7 @@ impl Wave {
             node_child: Vec::new(),
             legal_row_of: Vec::new(),
             legal_off: vec![0],
-            legal_action: Vec::new(),
-            legal_child: Vec::new(),
-            legal_trans: Vec::new(),
+            legal_value: Vec::new(),
             draw_off: Vec::new(),
             draw_to: Vec::new(),
             draw_p: Vec::new(),
@@ -202,7 +200,7 @@ impl Wave {
         let node0 = self.node_kind.len();
         let child0 = self.node_child.len();
         let legal_row0 = self.legal_off.len() - 1;
-        let cell0 = self.legal_action.len();
+        let cell0 = self.legal_value.len();
         let draw0 = self.draw_to.len();
         let draw_row0 = self.draw_row_start.len();
         let reach0 = *self.reach_off.last().unwrap() as usize;
@@ -244,10 +242,6 @@ impl Wave {
         }));
         self.legal_off
             .extend(t.legal_off.iter().skip(1).map(|&x| cell0 as u32 + x));
-        self.legal_action.extend_from_slice(&t.legal_action);
-        self.legal_child
-            .extend(t.legal_child.iter().map(|&x| node0 as u32 + x));
-        self.legal_trans.extend_from_slice(&t.legal_trans);
         self.draw_off
             .extend(t.draw_off.iter().take(t.nodes).map(|&x| draw0 as u32 + x));
         self.draw_to.extend_from_slice(&t.draw_to);
@@ -270,6 +264,19 @@ impl Wave {
             va += n0.max(n1);
             self.voff.push(va);
         }
+        self.legal_value
+            .extend(
+                t.legal_child
+                    .iter()
+                    .zip(&t.legal_trans)
+                    .map(|(&child, &trans)| {
+                        if trans == u32::MAX {
+                            u32::MAX
+                        } else {
+                            self.voff[node0 + child as usize] + trans
+                        }
+                    }),
+            );
         self.node_parent.extend(t.node_parent.iter().map(|&x| {
             if x == u32::MAX {
                 x
@@ -369,6 +376,11 @@ impl Wave {
 
     fn build_tasks(&mut self, jobs: &[&PackedJob], levels: usize) {
         for level in 0..levels {
+            // Keep the compact `(node, config)` record, but make neighbouring
+            // CUDA threads take the same reach branch: plain copies, strategy
+            // reverse gathers, then chance reverse gathers.
+            let mut reach: [[Vec<Task>; 3]; 2] =
+                std::array::from_fn(|_| std::array::from_fn(|_| Vec::new()));
             for (job_id, job) in jobs.iter().enumerate() {
                 let t = &job.tables;
                 if level >= t.nlevels {
@@ -382,8 +394,17 @@ impl Wave {
                     if i != node0 {
                         for p in 0..2 {
                             let nc = self.nc(i as usize, p);
+                            let node = i as usize;
+                            let parent = self.node_parent[node] as usize;
+                            let mode = if self.node_player[parent] as usize != p {
+                                0
+                            } else if self.rev_row_of[node] != u32::MAX {
+                                1
+                            } else {
+                                2
+                            };
                             for c in 0..nc {
-                                self.reach_task[p].push(Task {
+                                reach[p][mode].push(Task {
                                     node: i,
                                     config: c as u32,
                                 });
@@ -404,6 +425,9 @@ impl Wave {
                 }
             }
             for p in 0..2 {
+                for bucket in &mut reach[p] {
+                    self.reach_task[p].append(bucket);
+                }
                 self.reach_level[p][level + 1] = self.reach_task[p].len() as u32;
                 self.back_level[p][level + 1] = self.back_task[p].len() as u32;
             }
@@ -450,10 +474,8 @@ impl Wave {
             return Err("wave node arrays disagree".into());
         }
         if *self.node_child_start.last().unwrap() as usize != self.node_child.len()
-            || *self.legal_off.last().unwrap() as usize != self.legal_action.len()
-            || *self.soff.last().unwrap() as usize != self.legal_action.len()
-            || self.legal_child.len() != self.legal_action.len()
-            || self.legal_trans.len() != self.legal_action.len()
+            || *self.legal_off.last().unwrap() as usize != self.legal_value.len()
+            || *self.soff.last().unwrap() as usize != self.legal_value.len()
         {
             return Err("wave sparse-cell arrays disagree".into());
         }

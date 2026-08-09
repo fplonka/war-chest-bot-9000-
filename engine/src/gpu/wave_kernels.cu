@@ -39,53 +39,51 @@ typedef struct {
 #define T_NODE_CHILD 4
 #define T_LEGAL_ROW_OF 5
 #define T_LEGAL_OFF 6
-#define T_LEGAL_ACTION 7
-#define T_LEGAL_CHILD 8
-#define T_LEGAL_TRANS 9
-#define T_DRAW_OFF 10
-#define T_DRAW_TO 11
-#define T_DRAW_P 12
-#define T_DRAW_ROW_OFF 13
-#define T_DRAW_ROW_START 14
-#define T_REACH_OFF 15
-#define T_SOFF 16
-#define T_VOFF 17
-#define T_NODE_PARENT 18
-#define T_REV_ROW_OF 19
-#define T_REV_START 20
-#define T_REV_SRC 21
-#define T_REV_CELL 22
-#define T_RVD_ROW_OF 23
-#define T_RVD_START 24
-#define T_RVD_SRC 25
-#define T_RVD_P 26
-#define T_ROW_NODE 27
-#define T_ROW_JOB 28
-#define T_ROW_CFG_OFF 29
-#define T_ROW_CFG 30
-#define T_RAW_ROWS 31
-#define T_CARD_FEAT 32
-#define T_IDS 33
-#define T_CONFIG_JOB 34
-#define T_CPHI 35
-#define T_ROOTS 36
-#define T_CARRIED 37
-#define T_NODE_UTILITY 38
-#define T_EXIT_NODES 39
-#define T_EXIT_COFF 40
-#define T_DECISION0 41
-#define T_DECISION1 42
-#define T_REACH_TASK0 43
-#define T_REACH_TASK1 44
-#define T_REACH_LEVEL0 45
-#define T_REACH_LEVEL1 46
-#define T_BACK_TASK0 47
-#define T_BACK_TASK1 48
-#define T_BACK_LEVEL0 49
-#define T_BACK_LEVEL1 50
-#define T_READOUT 51
-#define T_JOBS 52
-#define N_TABLES 53
+#define T_LEGAL_VALUE 7
+#define T_DRAW_OFF 8
+#define T_DRAW_TO 9
+#define T_DRAW_P 10
+#define T_DRAW_ROW_OFF 11
+#define T_DRAW_ROW_START 12
+#define T_REACH_OFF 13
+#define T_SOFF 14
+#define T_VOFF 15
+#define T_NODE_PARENT 16
+#define T_REV_ROW_OF 17
+#define T_REV_START 18
+#define T_REV_SRC 19
+#define T_REV_CELL 20
+#define T_RVD_ROW_OF 21
+#define T_RVD_START 22
+#define T_RVD_SRC 23
+#define T_RVD_P 24
+#define T_ROW_NODE 25
+#define T_ROW_JOB 26
+#define T_ROW_CFG_OFF 27
+#define T_ROW_CFG 28
+#define T_RAW_ROWS 29
+#define T_CARD_FEAT 30
+#define T_IDS 31
+#define T_CONFIG_JOB 32
+#define T_CPHI 33
+#define T_ROOTS 34
+#define T_CARRIED 35
+#define T_NODE_UTILITY 36
+#define T_EXIT_NODES 37
+#define T_EXIT_COFF 38
+#define T_DECISION0 39
+#define T_DECISION1 40
+#define T_REACH_TASK0 41
+#define T_REACH_TASK1 42
+#define T_REACH_LEVEL0 43
+#define T_REACH_LEVEL1 44
+#define T_BACK_TASK0 45
+#define T_BACK_TASK1 46
+#define T_BACK_LEVEL0 47
+#define T_BACK_LEVEL1 48
+#define T_READOUT 49
+#define T_JOBS 50
+#define N_TABLES 51
 
 // Mutable FP32 arena slots. Keep in lockstep with device.rs::Arena.
 #define A_REACH 0
@@ -576,14 +574,8 @@ extern "C" __global__ void head_act(const WaveDev* w, const WeightDev* wt,
     *x = fmaxf(*x + wt->hmlp_b[level][col], 0.0f);
 }
 
-extern "C" __global__ void wu_bias(const WaveDev* w, const WeightDev* wt) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < w->rows * RK) AP(w, A_U)[i] += wt->wu_b[i % RK];
-}
-
 extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
                                     int player) {
-    (void)wt;
     int lane = threadIdx.x & 31;
     int task = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     if (task >= w->readout_n) return;
@@ -607,7 +599,7 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
     #pragma unroll
     for (int k = 0; k < RK_CH; k++) {
         int j = (k << 5) + lane;
-        u[k] = j < RK ? ur[j] : 0.0f;
+        u[k] = j < RK ? ur[j] + wt->wu_b[j] : 0.0f;
     }
     unsigned int c0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + player];
     for (int c = 0; c < n; c++) {
@@ -671,10 +663,8 @@ __device__ __forceinline__ void backprop_task(
     const float* strat = AP(w, mode ? A_SNAP_STRAT : A_CUR);
     float base = 0.0f;
     for (unsigned int x = lo + lane; x < hi; x += 32) {
-        unsigned int tr = TP(w, unsigned int, T_LEGAL_TRANS)[x];
-        if (tr != NONE)
-            base += vals[TP(w, unsigned int, T_VOFF)
-                         [TP(w, unsigned int, T_LEGAL_CHILD)[x]] + tr] * strat[x];
+        unsigned int value = TP(w, unsigned int, T_LEGAL_VALUE)[x];
+        if (value != NONE) base += vals[value] * strat[x];
     }
     base = warp_sum(base);
     if (lane == 0) vals[vbase + c] = base;
@@ -682,10 +672,8 @@ __device__ __forceinline__ void backprop_task(
     float total = 0.0f;
     for (unsigned int x = lo + lane; x < hi; x += 32) {
         float delta = 0.0f;
-        unsigned int tr = TP(w, unsigned int, T_LEGAL_TRANS)[x];
-        if (tr != NONE)
-            delta += vals[TP(w, unsigned int, T_VOFF)
-                          [TP(w, unsigned int, T_LEGAL_CHILD)[x]] + tr];
+        unsigned int value = TP(w, unsigned int, T_LEGAL_VALUE)[x];
+        if (value != NONE) delta += vals[value];
         delta -= base;
         float old = AP(w, A_REGRET)[x];
         float r = old * (old > 0.0f ? da : db) + delta;
