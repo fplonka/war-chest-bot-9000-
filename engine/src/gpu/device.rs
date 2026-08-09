@@ -1240,7 +1240,10 @@ impl DeviceWave {
             None => (None, None, None),
         };
         let mut tables = grow_buffer(stream, tables, table_len.max(1), "wave tables")?;
-        upload_tables(stream, w, &jobs, &toff, &mut tables)?;
+        let table_blob = pack_tables(w, &jobs, &toff, table_len)?;
+        stream
+            .memcpy_htod(&table_blob, &mut tables.slice_mut(..table_len))
+            .map_err(|e| format!("wave table H2D: {e:?}"))?;
         let arena_need = arena_len.max(1);
         let mut arena = grow_buffer(stream, arena, arena_need, "wave arena")?;
         stream
@@ -1476,28 +1479,23 @@ fn table_layout(w: &Wave, jobs: &[JobDev]) -> Result<([u64; N_TABLES], usize), S
     Ok((layout.off, layout.len))
 }
 
-fn upload_tables(
-    stream: &Arc<CudaStream>,
+fn pack_tables(
     w: &Wave,
     jobs: &[JobDev],
     off: &[u64; N_TABLES],
-    tables: &mut CudaSlice<u8>,
-) -> Result<(), String> {
+    len: usize,
+) -> Result<Vec<u8>, String> {
+    let mut tables = vec![0u8; len];
     macro_rules! put {
         ($slot:ident, $values:expr) => {
-            copy_table(stream, tables, off[Table::$slot as usize] as usize, $values)?
+            copy_table(&mut tables, off[Table::$slot as usize] as usize, $values)?
         };
     }
     wave_table_fields!(put, w, jobs);
-    Ok(())
+    Ok(tables)
 }
 
-fn copy_table<T: Copy>(
-    stream: &Arc<CudaStream>,
-    tables: &mut CudaSlice<u8>,
-    at: usize,
-    values: &[T],
-) -> Result<(), String> {
+fn copy_table<T: Copy>(tables: &mut [u8], at: usize, values: &[T]) -> Result<(), String> {
     let n = values
         .len()
         .checked_mul(size_of::<T>())
@@ -1507,9 +1505,8 @@ fn copy_table<T: Copy>(
     }
     // SAFETY: every table element is Copy and Task/ReadTask/JobDev use repr(C).
     let raw = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), n) };
-    stream
-        .memcpy_htod(raw, &mut tables.slice_mut(at..at + n))
-        .map_err(|e| format!("wave table H2D: {e:?}"))
+    tables[at..at + n].copy_from_slice(raw);
+    Ok(())
 }
 
 fn arena_layout(w: &Wave, l: &V3Layout) -> Result<([u64; N_ARENAS], usize), String> {
