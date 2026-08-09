@@ -1,5 +1,6 @@
-//! End-to-end FP32 gates for the v5 wave. These compile everywhere with an
-//! explicit cudarc version and execute only on a CUDA test host.
+//! End-to-end gates for the v5 wave. Storage and CUDA kernels are FP32; the
+//! production GEMMs may down-convert internally for tensor-core throughput.
+//! These compile everywhere and execute only on a CUDA test host.
 
 use crate::net::{Mlp, V3Layout};
 use crate::rng::Rng;
@@ -30,6 +31,10 @@ fn gpu_guard() -> MutexGuard<'static, ()> {
     GPU.get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn fast_gemm() -> bool {
+    std::env::var_os("WARCHEST_GPU_PRECISE_GEMM").is_none()
 }
 
 fn test_weights() -> (Vec<usize>, Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -254,12 +259,20 @@ fn full_wave_oracle() {
             2e-3,
         );
         let want_roots = sv.value_under(&job.carried);
+        let root_tol = if fast_gemm() {
+            // FP16 internal operands retain FP32 accumulation and output, but
+            // deliberately do not promise CPU-oracle rounding. Probability,
+            // shape, finiteness, zero-network, and reuse gates remain tight.
+            (3e-3, 5e-4)
+        } else {
+            (1e-3, 2e-4)
+        };
         cmp(
             &format!("tree {tree} root values"),
             &flatten_pairs(&result.root_values),
             &flatten_pairs(&want_roots),
-            1e-3,
-            2e-4,
+            root_tol.0,
+            root_tol.1,
         );
         let leaf = sv
             .leaf_rows
@@ -357,12 +370,17 @@ fn wave_composition_stays_bounded() {
         assert_result_invariants(&set[measured_id].1, &alone);
         assert_result_invariants(&set[measured_id].1, &together);
         assert_result_invariants(&set[measured_id].1, &after);
+        let company_strategy_tol = if fast_gemm() {
+            (3e-2, 2e-3)
+        } else {
+            (5e-3, 2e-3)
+        };
         cmp(
             &format!("tree {measured_id} strategy depends on wave company"),
             &together.strategy,
             &alone.strategy,
-            5e-3,
-            2e-3,
+            company_strategy_tol.0,
+            company_strategy_tol.1,
         );
         cmp(
             &format!("tree {measured_id} strategy depends on reused capacity"),
@@ -378,12 +396,17 @@ fn wave_composition_stays_bounded() {
             1e-6,
             1e-6,
         );
+        let company_root_tol = if fast_gemm() {
+            (3e-3, 5e-4)
+        } else {
+            (1e-3, 2e-4)
+        };
         cmp(
             &format!("tree {measured_id} root values depend on wave company"),
             &flatten_pairs(&together.root_values),
             &flatten_pairs(&alone.root_values),
-            1e-3,
-            2e-4,
+            company_root_tol.0,
+            company_root_tol.1,
         );
     }
 }
