@@ -1239,10 +1239,13 @@ fn zero_weight_config_survives_the_walk_update() {
         );
         sv.multistep(8);
         let n0 = &sv.nodes[0];
-        let na = n0.na();
         // An action the underflowed config can actually play, so the tree's
         // child support includes it.
-        let Some(chosen) = (0..na).find(|&a| n0.legal[na + a]) else {
+        let Some(chosen) = n0
+            .legal_row(1)
+            .map(|cell| n0.legal_action[cell] as usize)
+            .next()
+        else {
             continue;
         };
         let child = n0.child[n0.obs_child[chosen]];
@@ -1256,12 +1259,13 @@ fn zero_weight_config_survives_the_walk_update() {
         let mut pairs = Vec::new();
         for (ci, c) in bel[me].cfg.iter().enumerate() {
             let row = sv.average_strategy(0, ci);
-            for a in 0..na {
-                if !n0.legal[ci * na + a] || obs_key(&n0.acts[a]) != obs {
+            for (cell, &p) in n0.legal_row(ci).zip(row) {
+                let a = n0.legal_action[cell] as usize;
+                if obs_key(&n0.acts[a]) != obs {
                     continue;
                 }
                 if let Some(n) = advance_config(c, n0.aslot[a], n0.fdown[a]) {
-                    pairs.push((n, bel[me].p[ci] * row[a]));
+                    pairs.push((n, bel[me].p[ci] * p));
                 }
             }
         }

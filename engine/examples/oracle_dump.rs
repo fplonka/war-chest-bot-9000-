@@ -25,7 +25,7 @@ use warchest::net::Mlp;
 use warchest::rng::Rng;
 use warchest::search::{Cfg, Nets, Solver};
 use warchest::selfplay::{collect_roots, Agent, Collect, GameCfg};
-use warchest::serialize::Job;
+use warchest::serialize::PackedJob;
 
 /// The production shape the pre-CUDA runs train. The service reads dims from
 /// the weights, so any shape works — this one is just the default.
@@ -109,7 +109,7 @@ fn main() {
         let leaf = *sv.leaf_rows.first().expect("non-terminal leaves");
         let carried = sv.carried_beliefs(leaf);
         let conv = sv.nash_conv();
-        let job = Job::from_solver(&sv, &roots_v);
+        let job = PackedJob::from_solver(&sv, &roots_v);
         fs::write(format!("{out_dir}/solve_{k}.bin"), job.to_bytes()).expect("job");
         fs::write(
             format!("{out_dir}/solve_{k}.ref"),

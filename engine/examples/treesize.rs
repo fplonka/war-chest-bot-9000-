@@ -112,7 +112,7 @@ fn main() {
                     leaves += 1;
                 } else if !n.chance {
                     cells += n.na() * n.nc(n.player as usize);
-                    legal_cells += n.legal.iter().filter(|&&v| v).count();
+                    legal_cells += n.legal_action.len();
                 }
                 cfgs += n.nc(0) + n.nc(1);
             }

@@ -64,7 +64,7 @@ fn main() {
     dump(
         "avg0",
         dir,
-        &sv.avg.iter().flatten().cloned().collect::<Vec<_>>(),
+        sv.snaps.last().expect("initial average snapshot"),
     );
     // Leaf values for traverser 0 (phases 1-3). This also runs the build
     // GEMMs (ensure_leaf_batch), filling h0/ce/cz/cg.
@@ -78,11 +78,9 @@ fn main() {
     dump("xb1", dir, &sv.xb[..rows * 2 * dg]);
     dump("ob1", dir, &sv.ob[..rows * 384]);
     dump("vals1", dir, &sv.vals);
-    // backprop (phase 4) for traverser 0: inst + vals.
-    let cur = std::mem::take(&mut sv.cur);
-    sv.backprop(0, &cur, warchest::search::Back::Regret);
-    sv.cur = cur;
-    dump("inst2", dir, &sv.inst);
+    // Fused backprop/regret matching for traverser 0.
+    sv.backprop(0, &[], warchest::search::Back::Regret);
+    dump("cur2", dir, &sv.cur);
     dump("vals2", dir, &sv.vals);
     // RM (phase 5a).
     // (step does RM + propagate + AVG; replicate via step and dump)
@@ -110,7 +108,7 @@ fn main() {
     dump(
         "avg3",
         dir,
-        &sv2.avg.iter().flatten().cloned().collect::<Vec<_>>(),
+        sv2.snaps.last().expect("iteration average snapshot"),
     );
     println!("dumped to {}", dir.display());
 }

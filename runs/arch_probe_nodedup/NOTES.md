@@ -23,6 +23,14 @@ End to end, against `arch_probe_published` on the same box:
 | arch_probe_published | 38,799 | 248.5 s | 156.1 solves/s |
 | arch_probe_nodedup | 42,031 | 215.5 s | 195.0 solves/s |
 
+The 165 optimizer steps consumed 168,960 rows, or 42,240 solves of credit at
+the fixed ratio of four, so balanced throughput was also 195.0 solves/s and
+there was no training debt. No game was dropped. There were 256 genuine
+200,000-node solver fallbacks across the four ReBeL batches. The final log and
+snapshot landed at 251.3 seconds, 11.3 seconds after the nominal four-minute
+process budget, confirming that the epoch barrier still cannot enforce the
+deadline.
+
 Read that as suggestive, not measured. The two runs are one sample each and
 they are not perfectly matched: this one took four ReBeL batches where the
 other took three, and the generator-side cumulative counter went the other way

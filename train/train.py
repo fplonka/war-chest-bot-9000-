@@ -703,6 +703,12 @@ def main():
         # Utilities live in [-1, 1]; so does the true value function, so clip
         # the bootstrapped targets to that range. Rows stay packed (raw
         # bytes); the public encoding is expanded per batch.
+        # Everything from here to `tt` used to sit in no timer at all, and it
+        # is not small: on the 3072-game sweep it was 210-360 s of a 750-980 s
+        # ReBeL phase, more than the training pass. Split it into the numpy
+        # conversion and the replay insertion so the next person tunes the one
+        # that costs.
+        tr = time.time()
         rows = np.asarray(d["rows"], np.uint8).reshape(-1, ROW_BYTES)
         cc = np.asarray(d["cc"], np.uint8).reshape(-1, CCOUNTS)
         cw = np.asarray(d["cw"], np.float32)
@@ -718,7 +724,10 @@ def main():
                 rebel_t0, rebel_solves = time.time(), 0
             rebel_solves += solves
         sps = rebel_solves / max(time.time() - rebel_t0, 1e-9) if rebel_t0 else 0.0
+        conv_s = time.time() - tr
+        tr = time.time()
         buf.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
+        add_s = time.time() - tr
         # A frozen batch from the warm phase. If the network's spread on it
         # collapses, the value function has gone degenerate -- the failure mode
         # a falling training loss hides.
@@ -802,7 +811,8 @@ def main():
                "steps": steps,
                "tgt_mean": round(tgt_mean, 4), "tgt_std": round(tgt_std, 4),
                "probe_std": round(probe_std, 4),
-               "gen_s": round(gen_s, 2), "train_s": round(train_s, 2), "buf": len(buf),
+               "gen_s": round(gen_s, 2), "train_s": round(train_s, 2),
+               "conv_s": round(conv_s, 2), "add_s": round(add_s, 2), "buf": len(buf),
                "solves_per_s": round(sps, 1),
                "lr": opt.param_groups[0]["lr"]}
         log.append(rec)
@@ -816,7 +826,8 @@ def main():
               f"nodecap={rec['node_caps']} drop={rec['dropped']} "
               f"cfgs={rec['configs']:5.1f} L={lv:.5f} P={lp:.3f} old={loss_old:.5f} new={loss_new:.5f} "
               f"tgt={tgt_mean:+.3f}/{tgt_std:.3f} pstd={probe_std:.3f} "
-              f"capv={cap_v:.3f} lr={rec['lr']:.1e} gen={gen_s:.1f}s train={train_s:.1f}s "
+              f"capv={cap_v:.3f} lr={rec['lr']:.1e} gen={gen_s:.1f}s "
+              f"conv={conv_s:.1f}s add={add_s:.1f}s train={train_s:.1f}s "
               f"sps={sps:.0f}",
               flush=True)
         epoch += 1

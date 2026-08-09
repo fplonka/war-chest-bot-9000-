@@ -1020,7 +1020,7 @@ pub const ROW_BYTES: usize = ROW_AUX + 2 * AUX;
 // expanded `PUBFEAT` f32 vector for every one repeats one-hots, card facts and
 // normalised byte counts, so the GPU contract keeps only the public small
 // integers and expands them while assembling the trunk input. Card ids are
-// solve-wide (`TreeTables::ids`) and therefore do not appear per row.
+// solve-wide (`PackedTables::ids`) and therefore do not appear per row.
 pub const GPU_ROW_HEX_OWNER: usize = 0;
 pub const GPU_ROW_HEX_SLOT: usize = GPU_ROW_HEX_OWNER + N_HEXES;
 pub const GPU_ROW_HEX_HEIGHT: usize = GPU_ROW_HEX_SLOT + N_HEXES;

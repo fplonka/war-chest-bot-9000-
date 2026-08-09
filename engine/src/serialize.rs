@@ -18,20 +18,23 @@
 //! `NONE = 255` where the solver uses it. Everything below mirrors
 //! `docs/TREE.md`; see that file for the meaning of each array.
 
+use crate::actions::Action;
+use crate::rebel::Config;
 use crate::rebel::{CFEAT, GPU_ROW_BYTES, NTYPE, PUBFEAT};
 use crate::search::{Cfr, Solver};
 use crate::units::{write_card_features, CARD_FEATS};
+use std::rc::Rc;
 
 /// The byte format this module writes. Bump when an array changes shape or
 /// meaning (docs/TREE.md "the version bumps when any of them changes shape or
 /// meaning").
-pub const JOB_VERSION: u32 = 4;
-const MAGIC: u32 = 0x5743_4A34; // "WCJ4"
+pub const JOB_VERSION: u32 = 5;
+const MAGIC: u32 = 0x5743_4A35; // "WCJ5"
 
 /// Runtime metadata that travels with a job (not part of the frozen tree
 /// contract — it is per-request).
 #[derive(Clone, Debug)]
-pub struct JobMeta {
+pub struct PackedMeta {
     pub depth: usize,
     pub iters: usize,
     /// Keep the per-iterate average snapshots (generation) or not (evaluation).
@@ -48,7 +51,7 @@ pub struct JobMeta {
 /// (warm start), in batch order — leaves first, so a leaf's row index is its
 /// position in `leaf_rows`.
 #[derive(Clone, Debug, Default)]
-pub struct TreeTables {
+pub struct PackedTables {
     pub nodes: usize,
     pub children: usize,
     pub actions: usize,
@@ -68,7 +71,6 @@ pub struct TreeTables {
     // -- tree structure --
     pub node_kind: Vec<u8>,
     pub node_player: Vec<u8>,
-    pub node_leaf: Vec<u8>,
     pub node_child_start: Vec<u32>,
     pub node_child: Vec<u32>,
     /// Offset of each node's `obs_start` segment into `obs_start` (one
@@ -77,10 +79,17 @@ pub struct TreeTables {
     pub obs_start: Vec<u32>,
     pub obs_act: Vec<u32>,
     pub obs_child: Vec<u32>,
-    /// `legal`, bit-packed: cell `c * na + a` is bit `(c*na+a) & 7` of byte
-    /// `(c*na+a) >> 3`, cells in `soff` order.
-    pub legal_bits: Vec<u8>,
-    pub trans: Vec<i32>,
+    /// Per decision node, its first config row in `legal_off`
+    /// (`u32::MAX` for leaves/chance nodes). `legal_off` is one global CSR
+    /// boundary array; the other legal arrays have one entry per legal cell.
+    pub legal_row_of: Vec<u32>,
+    pub legal_off: Vec<u32>,
+    pub legal_action: Vec<u32>,
+    pub legal_child: Vec<u32>,
+    pub legal_trans: Vec<u32>,
+    /// Direct source-config row for each legal cell. This avoids recovering a
+    /// row with a search in the hot sparse sweeps.
+    pub cell_row: Vec<u32>,
     pub draw_off: Vec<u32>,
     pub draw_to: Vec<u32>,
     pub draw_p: Vec<f32>,
@@ -136,27 +145,180 @@ pub struct TreeTables {
 /// One solve job: the tree tables, the root beliefs, and the previous solve's
 /// carried root vectors (Phase 2 must value each of them).
 #[derive(Clone, Debug)]
-pub struct Job {
-    pub meta: JobMeta,
-    pub tables: TreeTables,
+pub struct PackedJob {
+    pub meta: PackedMeta,
+    pub tables: PackedTables,
     pub root: [Vec<f32>; 2],
     pub carried: Vec<[Vec<f32>; 2]>,
 }
 
+/// Local-index representation selected for a wave. Wave-global offsets stay
+/// `u32`; narrow jobs store proven-local values as `u16`, while any job that
+/// fails the proof takes the exact wide path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndexWidth {
+    Narrow,
+    Wide,
+}
+
+/// Admission and scheduling cost carried by every packed solve. Counts are in
+/// actual work units and bytes rather than a single job count, because roots
+/// differ by orders of magnitude.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WorkVector {
+    pub network_rows: usize,
+    pub legal_cells: usize,
+    pub reach_slots: usize,
+    pub reverse_nonzeros: usize,
+    pub table_bytes: usize,
+    pub mutable_bytes: usize,
+    pub carried_output_bytes: usize,
+    pub levels: usize,
+}
+
+/// The compact public tree retained by a game actor while and after its GPU
+/// solve runs. It contains only what the real game walk reads: public children,
+/// action metadata, config-support identity, sparse policy rows, and leaf/draw
+/// markers. Search states, transitions, reverse gathers, reaches, values, and
+/// network scratch stay in `PackedJob` or die with the CPU builder.
+#[derive(Clone)]
+pub struct WalkTree {
+    pub node_kind: Vec<u8>,
+    pub node_player: Vec<u8>,
+    pub node_child_off: Vec<u32>,
+    pub node_child: Vec<u32>,
+    pub node_action_off: Vec<u32>,
+    pub actions: Vec<Action>,
+    pub aslot: Vec<i8>,
+    pub fdown: Vec<bool>,
+    pub obs_child: Vec<u32>,
+    pub legal_row_of: Vec<u32>,
+    pub legal_off: Vec<u32>,
+    pub legal_action: Vec<u32>,
+    pub supports: Vec<[Rc<[Config]>; 2]>,
+    pub draw_steps: Vec<u8>,
+    pub soff: Vec<u32>,
+}
+
+impl WalkTree {
+    pub fn from_solver(sv: &Solver<'_>) -> WalkTree {
+        let nodes = sv.nodes.len();
+        let mut w = WalkTree {
+            node_kind: Vec::with_capacity(nodes),
+            node_player: Vec::with_capacity(nodes),
+            node_child_off: Vec::with_capacity(nodes + 1),
+            node_child: Vec::new(),
+            node_action_off: Vec::with_capacity(nodes + 1),
+            actions: Vec::new(),
+            aslot: Vec::new(),
+            fdown: Vec::new(),
+            obs_child: Vec::new(),
+            legal_row_of: vec![u32::MAX; nodes],
+            legal_off: vec![0],
+            legal_action: Vec::new(),
+            supports: Vec::with_capacity(nodes),
+            draw_steps: Vec::with_capacity(nodes),
+            soff: sv.soff.clone(),
+        };
+        for (i, n) in sv.nodes.iter().enumerate() {
+            w.node_kind.push(if n.leaf {
+                2
+            } else if n.chance {
+                1
+            } else {
+                0
+            });
+            w.node_player.push(n.player);
+            w.node_child_off.push(w.node_child.len() as u32);
+            w.node_child.extend(n.child.iter().map(|&x| x as u32));
+            w.node_action_off.push(w.actions.len() as u32);
+            w.actions.extend_from_slice(&n.acts);
+            w.aslot.extend_from_slice(&n.aslot);
+            w.fdown.extend_from_slice(&n.fdown);
+            w.obs_child.extend(n.obs_child.iter().map(|&x| x as u32));
+            if !n.leaf && !n.chance {
+                w.legal_row_of[i] = (w.legal_off.len() - 1) as u32;
+                let base = w.legal_action.len() as u32;
+                w.legal_action.extend_from_slice(&n.legal_action);
+                w.legal_off
+                    .extend(n.legal_off.iter().skip(1).map(|&x| base + x));
+            }
+            w.supports.push(n.cfgs.clone());
+            w.draw_steps.push(n.draw_steps);
+        }
+        w.node_child_off.push(w.node_child.len() as u32);
+        w.node_action_off.push(w.actions.len() as u32);
+        debug_assert_eq!(w.soff.len(), nodes + 1);
+        w
+    }
+
+    #[inline]
+    pub fn is_leaf(&self, node: usize) -> bool {
+        self.node_kind[node] == 2
+    }
+
+    #[inline]
+    pub fn is_chance(&self, node: usize) -> bool {
+        self.node_kind[node] == 1
+    }
+
+    #[inline]
+    pub fn children(&self, node: usize) -> &[u32] {
+        &self.node_child[self.node_child_off[node] as usize..self.node_child_off[node + 1] as usize]
+    }
+
+    #[inline]
+    pub fn action_range(&self, node: usize) -> std::ops::Range<usize> {
+        self.node_action_off[node] as usize..self.node_action_off[node + 1] as usize
+    }
+
+    #[inline]
+    pub fn legal_row(&self, node: usize, config: usize) -> std::ops::Range<usize> {
+        let row = self.legal_row_of[node] as usize + config;
+        self.legal_off[row] as usize..self.legal_off[row + 1] as usize
+    }
+
+    #[inline]
+    pub fn child_for_action(&self, node: usize, action: usize) -> usize {
+        let aa = self.node_action_off[node] as usize + action;
+        let local = self.obs_child[aa] as usize;
+        self.children(node)[local] as usize
+    }
+
+    /// Bytes owned by the actor-side walk, excluding shared `Rc` config
+    /// supports. Used by the host byte-credit admission gate.
+    pub fn owned_bytes(&self) -> usize {
+        self.node_kind.len()
+            + self.node_player.len()
+            + 4 * self.node_child_off.len()
+            + 4 * self.node_child.len()
+            + 4 * self.node_action_off.len()
+            + std::mem::size_of::<Action>() * self.actions.len()
+            + self.aslot.len()
+            + self.fdown.len()
+            + 4 * self.obs_child.len()
+            + 4 * self.legal_row_of.len()
+            + 4 * self.legal_off.len()
+            + 4 * self.legal_action.len()
+            + self.draw_steps.len()
+            + 4 * self.soff.len()
+    }
+}
+
 // ---------------------------------------------------------------- building
 
-impl Job {
+impl PackedJob {
     /// Serialize a freshly built solver (before any iteration) into a job.
     ///
     /// `carried` are the probability vectors over the root support the next
     /// solve's Phase 2 must value: the previous solve's carried beliefs, or
     /// just the live belief for the first level.
-    pub fn from_solver(sv: &Solver, carried: &[[Vec<f32>; 2]]) -> Job {
+    pub fn from_solver(sv: &Solver, carried: &[[Vec<f32>; 2]]) -> PackedJob {
         let _t = crate::timed!(SERIAL);
-        let tables = TreeTables::from_solver(sv);
+        let tables = PackedTables::from_solver(sv);
         let root = [sv.root_belief[0].p.clone(), sv.root_belief[1].p.clone()];
-        Job {
-            meta: JobMeta {
+        PackedJob {
+            meta: PackedMeta {
                 depth: sv.cfg.depth,
                 iters: sv.cfg.iters,
                 snapshots: sv.cfg.snapshots,
@@ -169,12 +331,122 @@ impl Job {
             carried: carried.to_vec(),
         }
     }
+
+    /// Produce both builder outputs before the full solver is released.
+    pub fn from_solver_with_walk(
+        sv: &Solver<'_>,
+        carried: &[[Vec<f32>; 2]],
+    ) -> (PackedJob, WalkTree) {
+        let walk = WalkTree::from_solver(sv);
+        (PackedJob::from_solver(sv, carried), walk)
+    }
+
+    /// Whether every value selected for local 16-bit storage fits without
+    /// truncation. `u16::MAX` is reserved for `NO_TRANS`; offsets remain wide.
+    pub fn index_width(&self) -> IndexWidth {
+        const MAX: u32 = u16::MAX as u32 - 1;
+        let t = &self.tables;
+        let local_counts_fit = t.cfg_off.windows(2).all(|w| w[1] - w[0] <= MAX);
+        let trans_fit = t
+            .legal_trans
+            .iter()
+            .all(|&x| x == crate::search::NO_TRANS || x <= MAX);
+        if t.nodes <= MAX as usize
+            && t.legal_action.iter().all(|&x| x <= MAX)
+            && t.cell_row.iter().all(|&x| x <= MAX)
+            && t.rev_src.iter().all(|&x| x <= MAX)
+            && t.rvd_src.iter().all(|&x| x <= MAX)
+            && t.leaf_cidx.iter().all(|&x| x <= MAX)
+            && trans_fit
+            && local_counts_fit
+        {
+            IndexWidth::Narrow
+        } else {
+            IndexWidth::Wide
+        }
+    }
+
+    pub fn work(&self) -> WorkVector {
+        let t = &self.tables;
+        let vals = (0..t.nodes)
+            .map(|i| {
+                let n0 = t.cfg_off[2 * i + 1] - t.cfg_off[2 * i];
+                let n1 = t.cfg_off[2 * i + 2] - t.cfg_off[2 * i + 1];
+                n0.max(n1) as usize
+            })
+            .sum::<usize>();
+        let root_configs = (t.cfg_off[2] - t.cfg_off[0]) as usize;
+        let snapshots = self.meta.snap_iters.len();
+        WorkVector {
+            network_rows: t.rows,
+            legal_cells: t.ncells,
+            reach_slots: t.reach_len,
+            reverse_nonzeros: t.rev_src.len() + t.rvd_src.len(),
+            table_bytes: t.owned_bytes()
+                + 4 * (self.root[0].len() + self.root[1].len())
+                + 4 * self.carried.len() * root_configs,
+            // FP32 baseline: regret/current/sum, reach, values, config
+            // embeddings and one snapshot reach scratch block.
+            mutable_bytes: 4 * (3 * t.ncells + 2 * t.reach_len + vals + t.cphi.len() + t.ncfg),
+            carried_output_bytes: 4
+                * (t.ncells
+                    + self.carried.len() * root_configs
+                    + snapshots.saturating_sub(1) * t.snapshot_configs),
+            levels: t.nlevels,
+        }
+    }
 }
 
-impl TreeTables {
-    fn from_solver(sv: &Solver) -> TreeTables {
+impl PackedTables {
+    pub fn owned_bytes(&self) -> usize {
+        let u8s =
+            self.node_kind.len() + self.node_player.len() + self.leaf_raw.len() + self.ids.len();
+        let u32s = self.node_child_start.len()
+            + self.node_child.len()
+            + self.obs_off.len()
+            + self.obs_start.len()
+            + self.obs_act.len()
+            + self.obs_child.len()
+            + self.legal_row_of.len()
+            + self.legal_off.len()
+            + self.legal_action.len()
+            + self.legal_child.len()
+            + self.legal_trans.len()
+            + self.cell_row.len()
+            + self.draw_off.len()
+            + self.draw_to.len()
+            + self.draw_row_off.len()
+            + self.draw_row_start.len()
+            + self.cfg_off.len()
+            + self.reach_off.len()
+            + self.soff.len()
+            + self.node_parent.len()
+            + self.rev_row_of.len()
+            + self.rev_start.len()
+            + self.rev_src.len()
+            + self.rev_cell.len()
+            + self.rvd_row_of.len()
+            + self.rvd_start.len()
+            + self.rvd_src.len()
+            + self.leaf_rows.len()
+            + self.inner_rows.len()
+            + self.term_leaves.len()
+            + self.leaf_coff.len()
+            + self.leaf_cidx.len()
+            + self.snap_coff.len()
+            + self.bfs_order.len()
+            + self.level_start.len();
+        let f32s = self.draw_p.len()
+            + self.rvd_p.len()
+            + self.terminal_utility.len()
+            + self.card_feat.len()
+            + self.cphi.len();
+        u8s + 4 * (u32s + f32s)
+    }
+
+    fn from_solver(sv: &Solver) -> PackedTables {
         let nodes = sv.nodes.len();
-        let mut t = TreeTables {
+        let mut t = PackedTables {
             nodes,
             pubfeat: sv.pubfeat,
             ncfg: sv.ncfg,
@@ -217,6 +489,8 @@ impl TreeTables {
         t.node_parent = vec![u32::MAX; nodes];
         t.rev_row_of = vec![u32::MAX; nodes];
         t.rvd_row_of = vec![u32::MAX; nodes];
+        t.legal_row_of = vec![u32::MAX; nodes];
+        t.legal_off.push(0);
         t.rev_start.push(0);
         t.rvd_start.push(0);
         // Scratch: per-target-config entry lists for the node being reversed.
@@ -237,7 +511,6 @@ impl TreeTables {
                 0
             });
             t.node_player.push(n.player);
-            t.node_leaf.push(n.leaf as u8);
             obs_off.push(obs_start.len() as u32);
             obs_start.extend_from_slice(&n.obs_start);
             t.obs_act.extend_from_slice(&n.obs_act);
@@ -277,20 +550,16 @@ impl TreeTables {
             reach_at += c0 + c1;
             soff.push(sv.soff[i]);
             if !n.leaf && !n.chance {
-                let (na, me) = (n.na(), n.player as usize);
-                let nc = n.cfgs[me].len();
-                // legal bits + trans, in soff order.
-                for c in 0..nc {
-                    for a in 0..na {
-                        let j = c * na + a;
-                        let cell = sv.soff[i] as usize + j;
-                        t.legal_bits.resize((cell >> 3) + 1, 0);
-                        if n.legal[j] {
-                            t.legal_bits[cell >> 3] |= 1 << (cell & 7);
-                        }
-                        t.trans.push(n.trans[j]);
-                    }
+                let me = n.player as usize;
+                t.legal_row_of[i] = (t.legal_off.len() - 1) as u32;
+                let cell_base = t.legal_action.len() as u32;
+                for &off in &n.legal_off[1..] {
+                    t.legal_off.push(cell_base + off);
                 }
+                t.legal_action.extend_from_slice(&n.legal_action);
+                t.legal_child.extend_from_slice(&n.legal_child);
+                t.legal_trans.extend_from_slice(&n.legal_trans);
+                t.cell_row.extend_from_slice(&n.cell_row);
                 // Reverse the strategy transitions per public child: per
                 // child config, the (parent config, strategy cell) entries.
                 for ch_i in 0..n.child.len() {
@@ -301,16 +570,16 @@ impl TreeTables {
                     let (s0, s1) = (n.obs_start[ch_i] as usize, n.obs_start[ch_i + 1] as usize);
                     for &au in &n.obs_act[s0..s1] {
                         let a = au as usize;
-                        for c in 0..nc {
-                            if !n.legal[c * na + a] {
+                        for &cell_u in
+                            &n.action_cell[n.action_off[a] as usize..n.action_off[a + 1] as usize]
+                        {
+                            let cell = cell_u as usize;
+                            let tr = n.legal_trans[cell];
+                            if tr == crate::search::NO_TRANS {
                                 continue;
                             }
-                            let tr = n.trans[c * na + a];
-                            if tr < 0 {
-                                continue;
-                            }
-                            gather[tr as usize]
-                                .push((c as u32, (sv.soff[i] as usize + c * na + a) as u32));
+                            let c = n.cell_row[cell] as usize;
+                            gather[tr as usize].push((c as u32, sv.soff[i] + cell_u));
                         }
                     }
                     t.rev_row_of[ch] = (t.rev_start.len() - 1) as u32;
@@ -477,12 +746,6 @@ impl W {
             self.u32(x);
         }
     }
-    fn i32s(&mut self, v: &[i32]) {
-        self.u32(v.len() as u32);
-        for &x in v {
-            self.b.extend_from_slice(&x.to_le_bytes());
-        }
-    }
     fn f32s(&mut self, v: &[f32]) {
         self.u32(v.len() as u32);
         for &x in v {
@@ -528,15 +791,6 @@ impl<'a> R<'a> {
         }
         Ok(v)
     }
-    fn i32s(&mut self, what: &str) -> Result<Vec<i32>, String> {
-        let n = self.u32(what)? as usize;
-        let mut v = Vec::with_capacity(n);
-        for _ in 0..n {
-            let s = self.take(4, what)?;
-            v.push(i32::from_le_bytes(s.try_into().unwrap()));
-        }
-        Ok(v)
-    }
     fn f32s(&mut self, what: &str) -> Result<Vec<f32>, String> {
         let n = self.u32(what)? as usize;
         let mut v = Vec::with_capacity(n);
@@ -558,7 +812,7 @@ fn rd_check(got: usize, want: usize, what: &str) -> Result<(), String> {
     Ok(())
 }
 
-impl Job {
+impl PackedJob {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut w = W::new();
         w.u32(MAGIC);
@@ -582,15 +836,18 @@ impl Job {
         // tree
         w.u8s(&t.node_kind);
         w.u8s(&t.node_player);
-        w.u8s(&t.node_leaf);
         w.u32s(&t.node_child_start);
         w.u32s(&t.node_child);
         w.u32s(&t.obs_off);
         w.u32s(&t.obs_start);
         w.u32s(&t.obs_act);
         w.u32s(&t.obs_child);
-        w.u8s(&t.legal_bits);
-        w.i32s(&t.trans);
+        w.u32s(&t.legal_row_of);
+        w.u32s(&t.legal_off);
+        w.u32s(&t.legal_action);
+        w.u32s(&t.legal_child);
+        w.u32s(&t.legal_trans);
+        w.u32s(&t.cell_row);
         w.u32s(&t.draw_off);
         w.u32s(&t.draw_to);
         w.f32s(&t.draw_p);
@@ -635,7 +892,7 @@ impl Job {
         w.b
     }
 
-    pub fn from_bytes(b: &[u8]) -> Result<Job, String> {
+    pub fn from_bytes(b: &[u8]) -> Result<PackedJob, String> {
         let mut r = R::new(b);
         if r.u32("magic")? != MAGIC {
             return Err("job: bad magic".into());
@@ -643,7 +900,7 @@ impl Job {
         if r.u32("version")? != JOB_VERSION {
             return Err(format!("job: unsupported version"));
         }
-        let meta = JobMeta {
+        let meta = PackedMeta {
             depth: r.u32("depth")? as usize,
             iters: r.u32("iters")? as usize,
             snapshots: r.take(1, "snapshots")?[0] != 0,
@@ -661,7 +918,7 @@ impl Job {
         let rows = r.u32("rows")? as usize;
         let pubfeat = r.u32("pubfeat")? as usize;
         let ncells = r.u32("ncells")? as usize;
-        let mut t = TreeTables {
+        let mut t = PackedTables {
             nodes,
             ncfg,
             rows,
@@ -671,15 +928,18 @@ impl Job {
         };
         t.node_kind = r.u8s("node_kind")?;
         t.node_player = r.u8s("node_player")?;
-        t.node_leaf = r.u8s("node_leaf")?;
         t.node_child_start = r.u32s("node_child_start")?;
         t.node_child = r.u32s("node_child")?;
         t.obs_off = r.u32s("obs_off")?;
         t.obs_start = r.u32s("obs_start")?;
         t.obs_act = r.u32s("obs_act")?;
         t.obs_child = r.u32s("obs_child")?;
-        t.legal_bits = r.u8s("legal_bits")?;
-        t.trans = r.i32s("trans")?;
+        t.legal_row_of = r.u32s("legal_row_of")?;
+        t.legal_off = r.u32s("legal_off")?;
+        t.legal_action = r.u32s("legal_action")?;
+        t.legal_child = r.u32s("legal_child")?;
+        t.legal_trans = r.u32s("legal_trans")?;
+        t.cell_row = r.u32s("cell_row")?;
         t.draw_off = r.u32s("draw_off")?;
         t.draw_to = r.u32s("draw_to")?;
         t.draw_p = r.f32s("draw_p")?;
@@ -713,7 +973,7 @@ impl Job {
         // sanity checks
         rd_check(t.node_kind.len(), nodes, "node_kind")?;
         rd_check(t.node_player.len(), nodes, "node_player")?;
-        rd_check(t.node_leaf.len(), nodes, "node_leaf")?;
+        rd_check(t.legal_row_of.len(), nodes, "legal_row_of")?;
         rd_check(t.node_child_start.len(), nodes + 1, "node_child_start")?;
         rd_check(t.obs_off.len(), nodes + 1, "obs_off")?;
         rd_check(t.draw_off.len(), nodes + 1, "draw_off")?;
@@ -731,7 +991,16 @@ impl Job {
         rd_check(t.rvd_row_of.len(), nodes, "rvd_row_of")?;
         rd_check(t.rev_src.len(), t.rev_cell.len(), "rev_cell")?;
         rd_check(t.rvd_src.len(), t.rvd_p.len(), "rvd_p")?;
-        t.cells = t.trans.len();
+        rd_check(t.legal_action.len(), ncells, "legal_action")?;
+        rd_check(t.legal_child.len(), ncells, "legal_child")?;
+        rd_check(t.legal_trans.len(), ncells, "legal_trans")?;
+        rd_check(t.cell_row.len(), ncells, "cell_row")?;
+        rd_check(
+            *t.legal_off.last().unwrap_or(&0) as usize,
+            ncells,
+            "legal_off",
+        )?;
+        t.cells = t.legal_action.len();
         t.actions = t.obs_act.len();
         t.children = t.node_child.len();
         t.draw_entries = t.draw_to.len();
@@ -752,7 +1021,7 @@ impl Job {
         if !r.done() {
             return Err("job: trailing bytes".into());
         }
-        Ok(Job {
+        Ok(PackedJob {
             meta,
             tables: t,
             root,
@@ -762,14 +1031,14 @@ impl Job {
 }
 
 #[cfg(test)]
-impl Job {
+impl PackedJob {
     /// The smallest well-formed job: a single terminal leaf with one config
-    /// per player. Real trees come from `Job::from_solver`; this exists for
+    /// per player. Real trees come from `PackedJob::from_solver`; this exists for
     /// the layers that only need a shape to walk — the byte round trip and
     /// the device layout's alignment check.
-    pub fn stub() -> Job {
-        Job {
-            meta: JobMeta {
+    pub fn stub() -> PackedJob {
+        PackedJob {
+            meta: PackedMeta {
                 depth: 2,
                 iters: 4,
                 snapshots: true,
@@ -777,22 +1046,21 @@ impl Job {
                 warm: 0.0,
                 snap_iters: vec![0, 1, 2, 4],
             },
-            tables: TreeTables {
+            tables: PackedTables {
                 nodes: 1,
                 ncfg: 1,
                 rows: 1,
                 pubfeat: PUBFEAT,
-                ncells: 2,
+                ncells: 0,
                 node_kind: vec![2],
                 node_player: vec![0],
-                node_leaf: vec![1],
                 node_child_start: vec![0, 0],
                 obs_off: vec![0, 0],
                 obs_start: vec![0],
                 obs_act: vec![],
                 obs_child: vec![],
-                legal_bits: vec![],
-                trans: vec![],
+                legal_row_of: vec![u32::MAX],
+                legal_off: vec![0],
                 draw_off: vec![0, 0],
                 draw_row_off: vec![0, 0],
                 draw_row_start: vec![],
@@ -833,11 +1101,24 @@ mod tests {
     /// CPU -> bytes -> CPU must be the identity, byte for byte.
     #[test]
     fn round_trip() {
-        let job = Job::stub();
+        let job = PackedJob::stub();
         let bytes = job.to_bytes();
-        let back = Job::from_bytes(&bytes).expect("parse");
+        let back = PackedJob::from_bytes(&bytes).expect("parse");
         assert_eq!(back.to_bytes(), bytes, "byte-identical round trip");
         assert_eq!(back.tables.cphi.len(), CFEAT);
+    }
+
+    #[test]
+    fn narrow_indices_never_truncate() {
+        let job = PackedJob::stub();
+        assert_eq!(job.index_width(), IndexWidth::Narrow);
+        let work = job.work();
+        assert_eq!(work.network_rows, 1);
+        assert!(work.table_bytes > 0);
+
+        let mut wide = job.clone();
+        wide.tables.legal_action.push(u16::MAX as u32);
+        assert_eq!(wide.index_width(), IndexWidth::Wide);
     }
 }
 
@@ -875,7 +1156,7 @@ mod gather_tests {
             if sv.capped() {
                 continue;
             }
-            let job = Job::from_solver(&sv, &[]);
+            let job = PackedJob::from_solver(&sv, &[]);
             let t = &job.tables;
             let nc =
                 |i: usize, p: usize| (t.cfg_off[2 * i + p + 1] - t.cfg_off[2 * i + p]) as usize;

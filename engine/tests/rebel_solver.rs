@@ -691,8 +691,11 @@ fn warrior_priest_draw_walks_through_the_tree() {
     for (ci, c) in wpn.cfgs[me].iter().enumerate() {
         let pend = c.pending_coin.expect("pending");
         for a in 0..wpn.na() {
+            let legal = wpn
+                .legal_row(ci)
+                .any(|cell| wpn.legal_action[cell] as usize == a);
             assert_eq!(
-                wpn.legal[ci * wpn.na() + a],
+                legal,
                 wpn.aslot[a] == pend as i8,
                 "WP play legality must be the pending match"
             );
