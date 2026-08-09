@@ -557,8 +557,13 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     torch.manual_seed(args.seed)
-    # With the GPU service, the CPU cores belong to the Rust workers.
-    torch.set_num_threads(2 if args.gpu else (os.cpu_count() or 8))
+    # With the GPU service, the CPU cores belong to the Rust builders. The
+    # CUDA step itself needs one Python feeder thread. A contended frozen-data
+    # profile held 101 ms/step with this limit, while the first integrated
+    # smoke with two threads reported roughly 250 ms/step.
+    torch.set_num_threads(1 if args.gpu else (os.cpu_count() or 8))
+    if args.gpu:
+        torch.set_num_interop_threads(1)
     rng = np.random.default_rng(args.seed)
     dev = torch.device(args.device)
 
