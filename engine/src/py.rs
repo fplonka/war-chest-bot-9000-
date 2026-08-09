@@ -629,17 +629,18 @@ fn gpu_gen_data(
                 "gpu service not started (gpu_start was not called)",
             ));
         }
-        // Every generation solve is the same checkpoint, so there is nothing
-        // to route by: spread submissions round robin over however many
-        // services were started. With one service this is the old `|_| 0`.
-        let next = std::sync::atomic::AtomicUsize::new(0);
+        // Each solve is the same checkpoint, but not the same amount of work.
+        // Route against the queued cost after the tree has been built so a
+        // broad-belief tail does not strand one card while the other drains.
+        let route = |_| {
+            clients
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, gpu)| gpu.queued_work())
+                .map_or(0, |(i, _)| i)
+        };
         Ok::<_, pyo3::PyErr>(crate::selfplay::run_games_gpu(
-            games,
-            seed,
-            &n,
-            &gc,
-            &clients,
-            &|_| next.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            games, seed, &n, &gc, &clients, &route,
         ))
     })?;
     data_to_dict(py, d)

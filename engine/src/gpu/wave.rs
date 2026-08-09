@@ -4,6 +4,8 @@
 //! kernels consume direct `(node, config)` task records; they never search a
 //! live-slot prefix or recover ownership from a flattened index.
 
+use std::borrow::Borrow;
+
 use crate::rebel::{CFEAT, GPU_ROW_BYTES};
 use crate::serialize::{IndexWidth, PackedJob, PackedMeta, WorkVector};
 
@@ -114,10 +116,11 @@ impl Wave {
         a.index_width() == b.index_width() && same_meta(&a.meta, &b.meta)
     }
 
-    pub fn pack(jobs: &[PackedJob]) -> Result<Wave, String> {
+    pub fn pack<J: Borrow<PackedJob>>(submitted: &[J]) -> Result<Wave, String> {
+        let jobs: Vec<&PackedJob> = submitted.iter().map(Borrow::borrow).collect();
         let first = jobs.first().ok_or("cannot pack an empty wave")?;
         let width = first.index_width();
-        for j in &jobs[1..] {
+        for &j in &jobs[1..] {
             if !same_meta(&first.meta, &j.meta) {
                 return Err("wave mixes different CFR schedules".into());
             }
@@ -185,11 +188,11 @@ impl Wave {
 
         // Task maps are level-major across the whole wave. Pack the immutable
         // arrays first, then derive maps from the already-patched node ids.
-        for (job_id, job) in jobs.iter().enumerate() {
+        for (job_id, &job) in jobs.iter().enumerate() {
             w.push_job(job_id, job)?;
             add_work(&mut w.work, job.work());
         }
-        w.build_tasks(jobs, max_levels);
+        w.build_tasks(&jobs, max_levels);
         w.validate()?;
         Ok(w)
     }
@@ -364,7 +367,7 @@ impl Wave {
         Ok(())
     }
 
-    fn build_tasks(&mut self, jobs: &[PackedJob], levels: usize) {
+    fn build_tasks(&mut self, jobs: &[&PackedJob], levels: usize) {
         for level in 0..levels {
             for (job_id, job) in jobs.iter().enumerate() {
                 let t = &job.tables;

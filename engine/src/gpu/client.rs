@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 
-use crate::serialize::PackedJob;
+use crate::serialize::{PackedJob, WorkVector};
 
 pub type CarriedBeliefs = Vec<[Vec<f32>; 2]>;
 
@@ -72,8 +72,10 @@ pub struct SolveResult {
 
 pub(crate) enum Cmd {
     Submit {
-        job: PackedJob,
+        job: Arc<PackedJob>,
+        work: WorkVector,
         tag: usize,
+        cost: u64,
         reply: mpsc::Sender<(usize, Result<SolveResult, String>)>,
     },
     Publish {
@@ -86,6 +88,28 @@ pub(crate) enum Cmd {
     Shutdown,
 }
 
+/// Immutable submission with its admission vector computed exactly once.
+/// Cloning this handle is cheap and is useful for deterministic workload
+/// tapes; production normally creates it and submits it once.
+#[derive(Clone)]
+pub struct PreparedJob {
+    job: Arc<PackedJob>,
+    work: WorkVector,
+    cost: u64,
+}
+
+impl PreparedJob {
+    pub fn new(job: PackedJob) -> PreparedJob {
+        let work = job.work();
+        let cost = job_cost(work, job.meta.iters);
+        PreparedJob {
+            job: Arc::new(job),
+            work,
+            cost,
+        }
+    }
+}
+
 /// Handle shared by actors assigned to one CUDA device.
 #[derive(Clone)]
 pub struct GpuClient {
@@ -96,22 +120,32 @@ struct ClientInner {
     tx: mpsc::Sender<Cmd>,
     thread: Mutex<Option<JoinHandle<()>>>,
     next_weight_version: AtomicU64,
+    queued_work: Arc<AtomicU64>,
 }
 
 impl GpuClient {
-    pub(crate) fn new(tx: mpsc::Sender<Cmd>, thread: JoinHandle<()>) -> GpuClient {
+    pub(crate) fn new(
+        tx: mpsc::Sender<Cmd>,
+        thread: JoinHandle<()>,
+        queued_work: Arc<AtomicU64>,
+    ) -> GpuClient {
         GpuClient {
             inner: Arc::new(ClientInner {
                 tx,
                 thread: Mutex::new(Some(thread)),
                 next_weight_version: AtomicU64::new(1),
+                queued_work,
             }),
         }
     }
 
     pub fn submit(&self, job: PackedJob) -> Result<SolveHandle, String> {
+        self.submit_prepared(PreparedJob::new(job))
+    }
+
+    pub fn submit_prepared(&self, job: PreparedJob) -> Result<SolveHandle, String> {
         let (tx, rx) = mpsc::channel();
-        self.submit_tagged(job, 0, tx)?;
+        self.submit_tagged_prepared(job, 0, tx)?;
         Ok(SolveHandle { rx })
     }
 
@@ -121,10 +155,33 @@ impl GpuClient {
         tag: usize,
         reply: mpsc::Sender<(usize, Result<SolveResult, String>)>,
     ) -> Result<(), String> {
-        self.inner
+        self.submit_tagged_prepared(PreparedJob::new(job), tag, reply)
+    }
+
+    fn submit_tagged_prepared(
+        &self,
+        job: PreparedJob,
+        tag: usize,
+        reply: mpsc::Sender<(usize, Result<SolveResult, String>)>,
+    ) -> Result<(), String> {
+        let PreparedJob { job, work, cost } = job;
+        self.inner.queued_work.fetch_add(cost, Ordering::Relaxed);
+        if self
+            .inner
             .tx
-            .send(Cmd::Submit { job, tag, reply })
-            .map_err(|_| "GPU wave executor is gone".to_string())
+            .send(Cmd::Submit {
+                job,
+                work,
+                tag,
+                cost,
+                reply,
+            })
+            .is_err()
+        {
+            self.inner.queued_work.fetch_sub(cost, Ordering::Relaxed);
+            return Err("GPU wave executor is gone".into());
+        }
+        Ok(())
     }
 
     /// Publish an immutable weight bank. Already-dispatched waves keep their
@@ -143,6 +200,24 @@ impl GpuClient {
         });
         version
     }
+
+    /// Monotone work estimate currently queued or executing on this card.
+    /// Training routes a new solve to the least-finish-time candidate instead
+    /// of alternating cards regardless of their tails.
+    pub fn queued_work(&self) -> u64 {
+        self.inner.queued_work.load(Ordering::Relaxed)
+    }
+}
+
+fn job_cost(w: WorkVector, configured_iters: usize) -> u64 {
+    let iters = configured_iters.max(1) as u64;
+    (w.network_rows as u64)
+        .saturating_mul(iters)
+        .saturating_mul(16)
+        .saturating_add((w.legal_cells as u64).saturating_mul(iters))
+        .saturating_add((w.reach_slots as u64).saturating_mul(iters))
+        .saturating_add(w.table_bytes as u64 / 16)
+        .max(1)
 }
 
 impl Drop for ClientInner {

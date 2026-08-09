@@ -9,6 +9,8 @@ pub(crate) mod wave;
 mod device;
 #[cfg(feature = "gpu")]
 pub mod service;
+#[cfg(all(test, feature = "gpu"))]
+mod tests;
 
 pub use client::{CarriedBeliefs, CarryStore, GpuClient, SolveHandle, SolveResult};
 #[cfg(feature = "gpu")]

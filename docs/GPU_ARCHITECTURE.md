@@ -1,6 +1,8 @@
 # Architecture for 1,200--2,000 ReBeL solves/s
 
-Status: proposal. The 1,200 solves/s number has not been achieved yet.
+Status: implementation in progress. The v5 one-card wave gate reached 640.4
+solves/s on the production tape on 2026-08-09; the 1,200 balanced-solves/s
+training target has not been achieved yet.
 
 This is a replacement design, not an incremental plan for the resident CUDA
 service. Keep the verified rules, tree semantics, compact training-row format,
@@ -70,7 +72,8 @@ The following are also hard requirements:
 
 - zero games dropped because a GPU allocation or admission failed;
 - a separate count of solver builds that really hit `Cfg::node_cap`;
-- unchanged CPU/GPU oracle tolerances in the FP32 baseline;
+- bounded CPU/GPU numerical comparisons, probability/index invariants, and a
+  tight all-zero-network oracle in the FP32 baseline;
 - no missing target rows, changed snapshot iterations, or silent precision
   mode;
 - a `NOTES.md` for every training run.
@@ -401,14 +404,21 @@ turn the small-matrix and launch-heavy workload into sustained work.
 ### Precision
 
 FP32 CFR, reaches, reductions, outputs, and optimizer state are the baseline.
-Prior TF32 experiments moved phase outputs by roughly `1e-3`--`4e-3` and failed
-the existing oracle. Do not relax that oracle to manufacture a speed result.
+Network GEMMs use native, untiled cuBLAS SGEMM with its default fast math. Do
+not pad matrices to a fixed oracle shape or select pedantic math merely to make
+different batch shapes bit-identical. Associating an FP32 reduction differently
+can change the last bits, and CFR can amplify that into a small policy change.
+Correctness therefore comes from structural invariants, a tight zero-network
+end-to-end oracle, and measured bounds against the CPU reference rather than
+exact batch-composition identity.
 
-After the FP32 wave engine is correct, TF32 or BF16 may be tested for network
-GEMMs only, with FP32 accumulation and epilogues. It needs a separate gate over
-representative early/mid/late roots, final root values and policies,
-`solvererr`, frozen offline targets, and the ladder. It is a possible 2,000/s
-lever, not a dependency for 1,200.
+Explicit TF32 was measured on the production tape after the wave engine was
+working. It improved a long A/B from 577.9 to 587.7 solves/s, but changed one
+eight-iteration policy probability by 0.094 after CFR amplification. The
+zero-network oracle still agreed to about `6e-8`, so this was numerical
+sensitivity rather than an indexing fault, but the trade was not worthwhile.
+TF32 or BF16 may be revisited only if it produces a material end-to-end gain
+and passes the target-statistics, `solvererr`, frozen-offline, and ladder gates.
 
 ## Finish a solve without retaining its main GPU arena
 
@@ -599,10 +609,11 @@ Every structural or kernel change passes, in order:
 
 1. sparse CPU contract versus the frozen dense-CPU outputs on every tape root;
 2. CPU contract round trip and internal index/transition invariants;
-3. per-phase FP32 CPU/GPU oracle on representative roots at 64 iterations;
-4. full strategy, root-value, and carried-belief oracle;
-5. wave-composition and batch-invariance tests, including a whale beside small
-   jobs;
+3. bounded per-phase FP32 CPU/GPU comparison on representative roots at 64
+   iterations;
+4. full strategy, root-value, and carried-belief comparison plus probability
+   and shape invariants;
+5. bounded wave-composition tests, including a whale beside small jobs;
 6. all-zero-network identical-game trajectories for end-to-end scheduling
    changes;
 7. target mean/std/quantiles and frozen offline learnability on a generated
@@ -668,6 +679,11 @@ Gate: all GPU oracles pass and tape throughput is at least 600 solves/s on one
 3090 for the weighted intended workload. This is the decisive architectural
 test. If it misses, profile the graph before adding more concurrency or
 precision modes.
+
+Achieved on 2026-08-09: 640.4 solves/s over a 20-second measured interval on
+one RTX 3090, including queue fill/drain, wave packing, transfers, graph work,
+and result materialisation. The run used 64 production roots, three reusable
+lanes, and the native FP32 SGEMM path.
 
 ### 3. Integrate the streaming runtime
 

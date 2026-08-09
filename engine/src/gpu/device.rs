@@ -1,0 +1,1750 @@
+//! One contiguous FP32 wave on one CUDA stream.
+//!
+//! The first correctness lane intentionally has no resident solve state: a
+//! wave uploads one immutable byte blob and owns one flat FP32 arena until its
+//! single completion is copied out. The dispatcher, not a device state
+//! machine, decides which solves share the wave.
+
+use std::collections::HashMap;
+use std::mem::{align_of, size_of, MaybeUninit};
+use std::sync::Arc;
+use std::time::Instant;
+
+use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
+use cudarc::cublas::CudaBlas;
+use cudarc::driver::safe::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig};
+use cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY;
+use cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
+use cudarc::driver::{result, sys, CudaSlice, DevicePtr, DevicePtrMut, PushKernelArg};
+use cudarc::nvrtc;
+
+use crate::gpu::client::{CarryStore, SolveResult};
+use crate::net::V3Layout;
+use crate::rebel::{CFEAT, GPU_ROW_BYTES, NSLOT, NTYPE, PILE_COUNTS};
+use crate::units::CARD_FEATS;
+
+use super::wave::Wave;
+
+const BLOCK: u32 = 256;
+const GRAPH_CLASSES: usize = 4;
+const N_TABLES: usize = 53;
+const N_ARENAS: usize = 21;
+
+#[repr(usize)]
+enum Table {
+    NodeKind,
+    NodePlayer,
+    NodeNc,
+    NodeChildStart,
+    NodeChild,
+    LegalRowOf,
+    LegalOff,
+    LegalAction,
+    LegalChild,
+    LegalTrans,
+    DrawOff,
+    DrawTo,
+    DrawP,
+    DrawRowOff,
+    DrawRowStart,
+    ReachOff,
+    Soff,
+    Voff,
+    NodeParent,
+    RevRowOf,
+    RevStart,
+    RevSrc,
+    RevCell,
+    RvdRowOf,
+    RvdStart,
+    RvdSrc,
+    RvdP,
+    RowNode,
+    RowJob,
+    RowCfgOff,
+    RowCfg,
+    RawRows,
+    CardFeat,
+    Ids,
+    ConfigJob,
+    Cphi,
+    Roots,
+    Carried,
+    NodeUtility,
+    ExitNodes,
+    ExitCoff,
+    Decision0,
+    Decision1,
+    ReachTask0,
+    ReachTask1,
+    ReachLevel0,
+    ReachLevel1,
+    BackTask0,
+    BackTask1,
+    BackLevel0,
+    BackLevel1,
+    Readout,
+    Jobs,
+}
+
+#[repr(usize)]
+#[derive(Clone, Copy)]
+enum Arena {
+    Reach,
+    SnapReach,
+    Vals,
+    Regret,
+    Cur,
+    Sum,
+    SnapStrat,
+    E,
+    Z,
+    G,
+    H0,
+    Xb,
+    H,
+    H2,
+    U,
+    RootValues,
+    Carry,
+    Bx,
+    Bh,
+    Bh2,
+    Bg,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct JobDev {
+    node0: u32,
+    nodes: u32,
+    row0: u32,
+    rows: u32,
+    nleaf: u32,
+    config0: u32,
+    ncfg: u32,
+    cell0: u32,
+    ncells: u32,
+    reach0: u32,
+    reach_len: u32,
+    vals0: u32,
+    vals_len: u32,
+    root0: u32,
+    root_n0: u32,
+    root_n1: u32,
+    carried0: u32,
+    nroots: u32,
+    root_value0: u32,
+    exit0: u32,
+    nexits: u32,
+    exit_cfg0: u32,
+    snapshot_configs: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WaveDev {
+    table: *const u8,
+    arena: *mut f32,
+    toff: [u64; N_TABLES],
+    aoff: [u64; N_ARENAS],
+    jobs: i32,
+    nodes: i32,
+    rows: i32,
+    nleaf: i32,
+    ncfg: i32,
+    cells: i32,
+    reach_len: i32,
+    vals_len: i32,
+    exits: i32,
+    snapshot_configs: i32,
+    carry_snapshots: i32,
+    nlevels: i32,
+    decision_n: [i32; 2],
+    reach_task_n: [i32; 2],
+    back_task_n: [i32; 2],
+    readout_n: i32,
+}
+
+unsafe impl cudarc::driver::DeviceRepr for WaveDev {}
+unsafe impl cudarc::driver::ValidAsZeroBits for WaveDev {}
+unsafe impl Send for WaveDev {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WeightDev {
+    card_w: [*const f32; 8],
+    card_b: [*const f32; 8],
+    wid: *const f32,
+    pile_w: *const f32,
+    pile_b: *const f32,
+    pub_w: [*const f32; 8],
+    pub_b: [*const f32; 8],
+    pub_lnw: [*const f32; 8],
+    pub_lnb: [*const f32; 8],
+    pub_out_w: *const f32,
+    pub_out_b: *const f32,
+    wb: *const f32,
+    ln1w: *const f32,
+    ln1b: *const f32,
+    hmlp_w: [*const f32; 8],
+    hmlp_b: [*const f32; 8],
+    wu_w: *const f32,
+    wu_b: *const f32,
+    slot_w: [*const f32; 8],
+    slot_b: [*const f32; 8],
+    slot_out_w: *const f32,
+    slot_out_b: *const f32,
+    res_aw: [*const f32; 4],
+    res_ab: [*const f32; 4],
+    res_bw: [*const f32; 4],
+    res_bb: [*const f32; 4],
+    wg_w: *const f32,
+    wg_b: *const f32,
+}
+
+unsafe impl cudarc::driver::DeviceRepr for WeightDev {}
+unsafe impl cudarc::driver::ValidAsZeroBits for WeightDev {}
+unsafe impl Send for WeightDev {}
+
+impl Default for WeightDev {
+    fn default() -> Self {
+        // SAFETY: this is a plain table of device pointers.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+struct WeightBank {
+    layout: V3Layout,
+    _w: CudaSlice<f32>,
+    _b: CudaSlice<f32>,
+    _ln: CudaSlice<f32>,
+    dev: CudaSlice<WeightDev>,
+}
+
+macro_rules! kernels {
+    ($($name:ident),* $(,)?) => {
+        struct Kernels { $($name: CudaFunction,)* }
+        impl Kernels {
+            fn load(module: &Arc<CudaModule>) -> Result<Self, String> {
+                Ok(Self {
+                    $($name: module.load_function(stringify!($name))
+                        .map_err(|e| format!("kernel {}: {e:?}", stringify!($name)))?,)*
+                })
+            }
+        }
+    };
+}
+
+kernels! {
+    pack_cards, bias_act, cards_finish, pile_pe, pack_piles, assemble,
+    trunk_norm, holding_in, slot_sum, finish_zg,
+    init_strategy, seed_reach, reach_level, seed_sum, root_average,
+    belief_sums, head_entry, head_act, wu_bias, readout, backprop,
+    normalize_strategy, gather_carry, collect_root,
+}
+
+pub struct Executor {
+    stream: Arc<CudaStream>,
+    blas: CudaBlas,
+    kernels: Kernels,
+    dims: Vec<usize>,
+    banks: HashMap<u64, WeightBank>,
+    buffers: Option<DeviceBuffers>,
+    graphs: Vec<GraphExec>,
+    next_graph: usize,
+}
+
+struct GraphExec {
+    raw: sys::CUgraphExec,
+}
+
+impl Drop for GraphExec {
+    fn drop(&mut self) {
+        let raw = std::mem::replace(&mut self.raw, std::ptr::null_mut());
+        if !raw.is_null() {
+            let _ = unsafe { result::graph::exec_destroy(raw) };
+        }
+    }
+}
+
+struct CapturedGraph(sys::CUgraph);
+
+impl Drop for CapturedGraph {
+    fn drop(&mut self) {
+        let raw = std::mem::replace(&mut self.0, std::ptr::null_mut());
+        if !raw.is_null() {
+            let _ = unsafe { result::graph::destroy(raw) };
+        }
+    }
+}
+
+impl Executor {
+    pub fn new(
+        device: usize,
+        dims: Vec<usize>,
+        w: Vec<f32>,
+        b: Vec<f32>,
+        ln: Vec<f32>,
+    ) -> Result<Self, String> {
+        let context =
+            CudaContext::new(device).map_err(|e| format!("cuda device {device}: {e:?}"))?;
+        // Raw pointers in WaveDev/WeightDev have one explicit stream ordering
+        // protocol; per-slice event tracking would duplicate it at every node.
+        unsafe { context.disable_event_tracking() };
+        let stream = context
+            .new_stream()
+            .map_err(|e| format!("CUDA stream: {e:?}"))?;
+        let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cuBLAS: {e:?}"))?;
+        let layout = V3Layout::new(&dims)?;
+        validate_layout(&layout)?;
+        let (major, minor) = (
+            context
+                .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+                .map_err(|e| format!("CUDA capability: {e:?}"))?,
+            context
+                .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+                .map_err(|e| format!("CUDA capability: {e:?}"))?,
+        );
+        let arch = format!("compute_{major}{minor}");
+        let source = format!(
+            "{}\n{}",
+            cuda_preamble(&layout),
+            include_str!("wave_kernels.cu")
+        );
+        let ptx = nvrtc::compile_ptx_with_opts(
+            &source,
+            nvrtc::CompileOptions {
+                arch: Some(Box::leak(arch.into_boxed_str())),
+                options: vec!["--generate-line-info".into()],
+                ..Default::default()
+            },
+        )
+        .map_err(|e| format!("v5 NVRTC: {e:?}"))?;
+        let module = context
+            .load_module(ptx)
+            .map_err(|e| format!("v5 CUDA module: {e:?}"))?;
+        let kernels = Kernels::load(&module)?;
+        let initial = WeightBank::upload(&stream, &dims, w, b, ln)?;
+        let mut banks = HashMap::new();
+        banks.insert(0, initial);
+        Ok(Self {
+            stream,
+            blas,
+            kernels,
+            dims,
+            banks,
+            buffers: None,
+            graphs: Vec::with_capacity(GRAPH_CLASSES),
+            next_graph: 0,
+        })
+    }
+
+    pub fn publish(
+        &mut self,
+        version: u64,
+        dims: Vec<usize>,
+        w: Vec<f32>,
+        b: Vec<f32>,
+        ln: Vec<f32>,
+    ) -> Result<(), String> {
+        if dims != self.dims {
+            return Err(format!(
+                "GPU weight shape changed from {:?} to {:?}; restart executors",
+                self.dims, dims
+            ));
+        }
+        let bank = WeightBank::upload(&self.stream, &dims, w, b, ln)?;
+        self.banks.insert(version, bank);
+        Ok(())
+    }
+
+    pub fn solve(&mut self, wave: Wave, version: u64) -> Result<Vec<SolveResult>, String> {
+        let profile = std::env::var_os("WARCHEST_GPU_PROFILE").is_some();
+        let started = Instant::now();
+        let profile_jobs = wave.jobs.len();
+        let profile_rows = wave.row_node.len();
+        let profile_cells = wave.legal_action.len();
+        if wave.meta.warm > 0.0 {
+            return Err("v5 FP32 baseline does not yet implement policy-head warm starts".into());
+        }
+        if wave.jobs.iter().any(|j| j.rows.len() != j.network_leaves) {
+            return Err("wave has policy rows despite warm=0".into());
+        }
+        let bank = self
+            .banks
+            .get(&version)
+            .ok_or_else(|| format!("GPU weight version {version} is unavailable"))?;
+        let device = DeviceWave::upload(&self.stream, &wave, &bank.layout, self.buffers.take())?;
+        let uploaded = Instant::now();
+        self.stream
+            .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .map_err(|e| format!("begin v5 CUDA Graph: {e:?}"))?;
+        let queued = (|| -> Result<(), String> {
+            self.build_towers(&device, bank)?;
+            self.initialise(&device, bank, &wave)?;
+
+            if wave.meta.iters == 0 {
+                self.materialize(&device, bank, &wave, [false, false])?;
+            }
+            for t in 0..wave.meta.iters {
+                let p = t & 1;
+                self.run_head(&device, bank, t == 0, p)?;
+                self.launch_readout(&device, bank, p)?;
+                let m = (t / 2 + 1) as f32;
+                let cfr = wave.meta.cfr;
+                let (da, db, ds) = (
+                    factor(m, cfr.alpha),
+                    factor(m, cfr.beta),
+                    (m / (m + 1.0)).powf(cfr.gamma),
+                );
+                for level in (0..wave.work.levels).rev() {
+                    let begin = wave.back_level[p][level] as i32;
+                    let end = wave.back_level[p][level + 1] as i32;
+                    launch!(
+                        self,
+                        device,
+                        bank,
+                        backprop,
+                        warps((end - begin).max(0) as usize),
+                        p as i32,
+                        begin,
+                        end,
+                        0i32,
+                        da,
+                        db,
+                        ds,
+                        cfr.predict
+                    )?;
+                }
+                for level in 0..wave.work.levels {
+                    let begin = wave.reach_level[p][level] as i32;
+                    let end = wave.reach_level[p][level + 1] as i32;
+                    launch!(
+                        self,
+                        device,
+                        bank,
+                        reach_level,
+                        threads(end - begin),
+                        p as i32,
+                        begin,
+                        end,
+                        0i32,
+                        0i32,
+                        1i32
+                    )?;
+                }
+                launch!(
+                    self,
+                    device,
+                    bank,
+                    root_average,
+                    wave.jobs.len() as u32,
+                    p as i32
+                )?;
+
+                let completed = t + 1;
+                if let Some(s) = wave.meta.snap_iters.iter().position(|&x| x == completed) {
+                    if wave.meta.snapshots || completed == wave.meta.iters {
+                        self.materialize(&device, bank, &wave, [true, completed >= 2])?;
+                        if wave.meta.snapshots && s + 1 < wave.meta.snap_iters.len() {
+                            self.snapshot_carry(&device, bank, &wave, s as i32)?;
+                        }
+                    }
+                }
+            }
+
+            let max_roots = wave.jobs.iter().map(|j| j.nroots).max().unwrap_or(0);
+            for root in 0..max_roots {
+                launch!(
+                    self,
+                    device,
+                    bank,
+                    seed_reach,
+                    wave.jobs.len() as u32,
+                    0i32,
+                    root as i32
+                )?;
+                self.full_reach(&device, bank, &wave, false, true)?;
+                self.run_head(&device, bank, true, 0)?;
+                for p in 0..2 {
+                    self.launch_readout(&device, bank, p)?;
+                    for level in (0..wave.work.levels).rev() {
+                        let begin = wave.back_level[p][level] as i32;
+                        let end = wave.back_level[p][level + 1] as i32;
+                        launch!(
+                            self,
+                            device,
+                            bank,
+                            backprop,
+                            warps((end - begin).max(0) as usize),
+                            p as i32,
+                            begin,
+                            end,
+                            1i32,
+                            0.0f32,
+                            0.0f32,
+                            0.0f32,
+                            0.0f32
+                        )?;
+                    }
+                    launch!(
+                        self,
+                        device,
+                        bank,
+                        collect_root,
+                        wave.jobs.len() as u32,
+                        root as i32,
+                        p as i32
+                    )?;
+                }
+            }
+            Ok(())
+        })();
+        let graph = unsafe { result::stream::end_capture(self.stream.cu_stream()) }
+            .map_err(|e| format!("end v5 CUDA Graph capture: {e:?}"))?;
+        queued?;
+        if graph.is_null() {
+            return Err("v5 CUDA Graph capture produced no graph".into());
+        }
+        let graph = CapturedGraph(graph);
+        let (graph_slot, graph_reused) =
+            update_graph(&mut self.graphs, &mut self.next_graph, graph.0)?;
+        let captured = Instant::now();
+        unsafe { result::graph::launch(self.graphs[graph_slot].raw, self.stream.cu_stream()) }
+            .map_err(|e| format!("launch v5 CUDA Graph: {e:?}"))?;
+
+        let strategy = copy_arena(
+            &self.stream,
+            &device,
+            Arena::SnapStrat,
+            0,
+            wave.legal_action.len(),
+        )?;
+        let root_total = wave.jobs.last().map_or(0, |j| j.root_values.end);
+        let root_values = copy_arena(&self.stream, &device, Arena::RootValues, 0, root_total)?;
+        let carry_n = device.host.carry_snapshots as usize * wave.snapshot_configs;
+        let carries = copy_arena(&self.stream, &device, Arena::Carry, 0, carry_n)?;
+        let queued_output = Instant::now();
+        self.stream
+            .synchronize()
+            .map_err(|e| format!("GPU wave completion: {e:?}"))?;
+        let completed = Instant::now();
+        self.buffers = Some(device.into_buffers());
+        let result = unpack(wave, strategy, root_values, carries, version);
+        if profile {
+            let unpacked = Instant::now();
+            eprintln!(
+                "v5_device jobs={profile_jobs} rows={profile_rows} cells={profile_cells} graph_reused={graph_reused} upload_ms={:.2} capture_ms={:.2} queue_ms={:.2} gpu_ms={:.2} unpack_ms={:.2} total_ms={:.2}",
+                1e3 * (uploaded - started).as_secs_f64(),
+                1e3 * (captured - uploaded).as_secs_f64(),
+                1e3 * (queued_output - captured).as_secs_f64(),
+                1e3 * (completed - queued_output).as_secs_f64(),
+                1e3 * (unpacked - completed).as_secs_f64(),
+                1e3 * (unpacked - started).as_secs_f64(),
+            );
+        }
+        result
+    }
+
+    fn build_towers(&self, d: &DeviceWave, bank: &WeightBank) -> Result<(), String> {
+        let l = &bank.layout;
+        let rows = d.host.rows as usize;
+        let cfgs = d.host.ncfg as usize;
+        let jobs = d.host.jobs as usize;
+
+        launch!(
+            self,
+            d,
+            bank,
+            pack_cards,
+            threads_usize(jobs * NTYPE * CARD_FEATS)
+        )?;
+        let mut src = d.ptr(Arena::Bg);
+        let mut which = 0usize;
+        for (k, layer) in l.card.iter().enumerate() {
+            let dst = d.ptr_mut(if which == 0 { Arena::Bh } else { Arena::Bh2 });
+            gemm(
+                &self.blas,
+                jobs * NTYPE,
+                layer.o,
+                layer.i,
+                src,
+                layer.i,
+                bank.w_ptr(layer.w),
+                layer.o,
+                dst,
+                layer.o,
+                0.0,
+            )?;
+            if k + 1 < l.card.len() {
+                launch!(
+                    self,
+                    d,
+                    bank,
+                    bias_act,
+                    threads_usize(jobs * NTYPE * layer.o),
+                    0i32,
+                    k as i32,
+                    (jobs * NTYPE) as i32,
+                    which as i32
+                )?;
+                src = dst;
+                which ^= 1;
+            }
+        }
+        launch!(
+            self,
+            d,
+            bank,
+            cards_finish,
+            threads_usize(jobs * NTYPE * l.de),
+            which as i32
+        )?;
+
+        launch!(self, d, bank, pile_pe, threads_usize(jobs * NTYPE * l.de))?;
+        launch!(
+            self,
+            d,
+            bank,
+            pack_piles,
+            threads_usize(rows * NTYPE * PILE_COUNTS)
+        )?;
+        gemm(
+            &self.blas,
+            rows * NTYPE,
+            l.de,
+            PILE_COUNTS,
+            d.ptr(Arena::Bg),
+            PILE_COUNTS,
+            bank.w_ptr(l.pile.w),
+            l.de,
+            d.ptr_mut(Arena::Bh),
+            l.de,
+            0.0,
+        )?;
+        launch!(self, d, bank, assemble, rows as u32)?;
+
+        let mut src = d.ptr(Arena::Bx);
+        let mut which = 0usize;
+        for (k, layer) in l.pub_lin.iter().enumerate() {
+            let dst = d.ptr_mut(if which == 0 { Arena::Bh } else { Arena::Bh2 });
+            gemm(
+                &self.blas,
+                rows,
+                layer.o,
+                layer.i,
+                src,
+                layer.i,
+                bank.w_ptr(layer.w),
+                layer.o,
+                dst,
+                layer.o,
+                0.0,
+            )?;
+            launch!(
+                self,
+                d,
+                bank,
+                trunk_norm,
+                warps(rows),
+                k as i32,
+                rows as i32,
+                which as i32
+            )?;
+            src = dst;
+            which ^= 1;
+        }
+        gemm(
+            &self.blas,
+            rows,
+            l.head_in,
+            l.pub_out.i,
+            src,
+            l.pub_out.i,
+            bank.w_ptr(l.pub_out.w),
+            l.head_in,
+            d.ptr_mut(Arena::H0),
+            l.head_in,
+            0.0,
+        )?;
+
+        launch!(self, d, bank, holding_in, threads_usize(cfgs * NSLOT))?;
+        let mut src = d.ptr(Arena::Bg);
+        let mut which = 0usize;
+        for (k, layer) in l.slot.iter().enumerate() {
+            let dst = d.ptr_mut(if which == 0 { Arena::Bh } else { Arena::Bh2 });
+            gemm(
+                &self.blas,
+                cfgs * NSLOT,
+                layer.o,
+                layer.i,
+                src,
+                layer.i,
+                bank.w_ptr(layer.w),
+                layer.o,
+                dst,
+                layer.o,
+                0.0,
+            )?;
+            launch!(
+                self,
+                d,
+                bank,
+                bias_act,
+                threads_usize(cfgs * NSLOT * layer.o),
+                2i32,
+                k as i32,
+                (cfgs * NSLOT) as i32,
+                which as i32
+            )?;
+            src = dst;
+            which ^= 1;
+        }
+        let dst = d.ptr_mut(if which == 0 { Arena::Bh } else { Arena::Bh2 });
+        gemm(
+            &self.blas,
+            cfgs * NSLOT,
+            l.dg,
+            l.slot_out.i,
+            src,
+            l.slot_out.i,
+            bank.w_ptr(l.slot_out.w),
+            l.dg,
+            dst,
+            l.dg,
+            0.0,
+        )?;
+        launch!(self, d, bank, slot_sum, warps(cfgs), which as i32)?;
+        let zwhich = which ^ 1;
+        for (k, (a, b)) in l.res.iter().enumerate() {
+            let z = d.ptr_mut(if zwhich == 0 { Arena::Bh } else { Arena::Bh2 });
+            let tmp = d.ptr_mut(if zwhich == 0 { Arena::Bh2 } else { Arena::Bh });
+            gemm(
+                &self.blas,
+                cfgs,
+                l.dg,
+                l.dg,
+                z,
+                l.dg,
+                bank.w_ptr(a.w),
+                l.dg,
+                tmp,
+                l.dg,
+                0.0,
+            )?;
+            launch!(
+                self,
+                d,
+                bank,
+                bias_act,
+                threads_usize(cfgs * l.dg),
+                3i32,
+                k as i32,
+                cfgs as i32,
+                (zwhich ^ 1) as i32
+            )?;
+            gemm(
+                &self.blas,
+                cfgs,
+                l.dg,
+                l.dg,
+                tmp,
+                l.dg,
+                bank.w_ptr(b.w),
+                l.dg,
+                z,
+                l.dg,
+                1.0,
+            )?;
+            launch!(
+                self,
+                d,
+                bank,
+                bias_act,
+                threads_usize(cfgs * l.dg),
+                4i32,
+                k as i32,
+                cfgs as i32,
+                zwhich as i32
+            )?;
+        }
+        let z = d.ptr(if zwhich == 0 { Arena::Bh } else { Arena::Bh2 });
+        gemm(
+            &self.blas,
+            cfgs,
+            l.rank + 1,
+            l.dg,
+            z,
+            l.dg,
+            bank.w_ptr(l.wg.w),
+            l.rank + 1,
+            d.ptr_mut(Arena::G),
+            l.rank + 1,
+            0.0,
+        )?;
+        launch!(
+            self,
+            d,
+            bank,
+            finish_zg,
+            threads_usize(cfgs * (l.dg + l.rank + 1)),
+            zwhich as i32
+        )?;
+        Ok(())
+    }
+
+    fn initialise(&self, d: &DeviceWave, bank: &WeightBank, w: &Wave) -> Result<(), String> {
+        for p in 0..2 {
+            launch!(
+                self,
+                d,
+                bank,
+                init_strategy,
+                threads(w.decision[p].len() as i32),
+                p as i32
+            )?;
+        }
+        launch!(self, d, bank, seed_reach, w.jobs.len() as u32, 0i32, -1i32)?;
+        self.full_reach(d, bank, w, false, false)?;
+        for p in 0..2 {
+            launch!(
+                self,
+                d,
+                bank,
+                seed_sum,
+                threads(w.decision[p].len() as i32),
+                p as i32
+            )?;
+        }
+        if d.host.carry_snapshots > 0 {
+            launch!(
+                self,
+                d,
+                bank,
+                gather_carry,
+                warps(w.exit_nodes.len()),
+                0i32,
+                0i32
+            )?;
+        }
+        Ok(())
+    }
+
+    fn full_reach(
+        &self,
+        d: &DeviceWave,
+        bank: &WeightBank,
+        w: &Wave,
+        snap: bool,
+        strat_snap: bool,
+    ) -> Result<(), String> {
+        for level in 0..w.work.levels {
+            for p in 0..2 {
+                let begin = w.reach_level[p][level] as i32;
+                let end = w.reach_level[p][level + 1] as i32;
+                launch!(
+                    self,
+                    d,
+                    bank,
+                    reach_level,
+                    threads(end - begin),
+                    p as i32,
+                    begin,
+                    end,
+                    snap as i32,
+                    strat_snap as i32,
+                    0i32
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn materialize(
+        &self,
+        d: &DeviceWave,
+        bank: &WeightBank,
+        w: &Wave,
+        touched: [bool; 2],
+    ) -> Result<(), String> {
+        for p in 0..2 {
+            launch!(
+                self,
+                d,
+                bank,
+                normalize_strategy,
+                threads(w.decision[p].len() as i32),
+                p as i32,
+                touched[p] as i32
+            )?;
+        }
+        Ok(())
+    }
+
+    fn snapshot_carry(
+        &self,
+        d: &DeviceWave,
+        bank: &WeightBank,
+        w: &Wave,
+        slot: i32,
+    ) -> Result<(), String> {
+        launch!(self, d, bank, seed_reach, w.jobs.len() as u32, 1i32, -1i32)?;
+        self.full_reach(d, bank, w, true, true)?;
+        launch!(
+            self,
+            d,
+            bank,
+            gather_carry,
+            warps(w.exit_nodes.len()),
+            slot,
+            1i32
+        )?;
+        Ok(())
+    }
+
+    fn run_head(
+        &self,
+        d: &DeviceWave,
+        bank: &WeightBank,
+        both: bool,
+        traverser: usize,
+    ) -> Result<(), String> {
+        let l = &bank.layout;
+        let rows = d.host.rows as usize;
+        launch!(
+            self,
+            d,
+            bank,
+            belief_sums,
+            warps(d.host.nleaf as usize),
+            traverser as i32,
+            both as i32
+        )?;
+        gemm(
+            &self.blas,
+            rows,
+            l.head_in,
+            2 * l.dg,
+            d.ptr(Arena::Xb),
+            2 * l.dg,
+            bank.w_ptr(l.wb),
+            l.head_in,
+            d.ptr_mut(Arena::H),
+            h_stride(l),
+            0.0,
+        )?;
+        launch!(self, d, bank, head_entry, warps(rows))?;
+
+        let mut src = d.ptr(Arena::H);
+        let mut src_width = l.head_in;
+        let mut which = 0usize;
+        for (level, layer) in l.hmlp.iter().enumerate() {
+            let next = which ^ 1;
+            let dst = d.ptr_mut(if next == 0 { Arena::H } else { Arena::H2 });
+            gemm(
+                &self.blas,
+                rows,
+                layer.o,
+                src_width,
+                src,
+                h_stride(l),
+                bank.w_ptr(layer.w),
+                layer.o,
+                dst,
+                h_stride(l),
+                0.0,
+            )?;
+            launch!(
+                self,
+                d,
+                bank,
+                head_act,
+                threads_usize(rows * layer.o),
+                level as i32,
+                rows as i32,
+                next as i32
+            )?;
+            src = dst;
+            src_width = layer.o;
+            which = next;
+        }
+        gemm(
+            &self.blas,
+            rows,
+            l.rank,
+            src_width,
+            src,
+            h_stride(l),
+            bank.w_ptr(l.wu.w),
+            l.rank,
+            d.ptr_mut(Arena::U),
+            l.rank,
+            0.0,
+        )?;
+        launch!(self, d, bank, wu_bias, threads_usize(rows * l.rank))?;
+        Ok(())
+    }
+
+    fn launch_readout(
+        &self,
+        d: &DeviceWave,
+        bank: &WeightBank,
+        player: usize,
+    ) -> Result<(), String> {
+        launch!(
+            self,
+            d,
+            bank,
+            readout,
+            warps(d.host.readout_n as usize),
+            player as i32
+        )
+    }
+}
+
+fn update_graph(
+    slots: &mut Vec<GraphExec>,
+    next: &mut usize,
+    graph: sys::CUgraph,
+) -> Result<(usize, bool), String> {
+    for (at, exec) in slots.iter().enumerate() {
+        let mut info = MaybeUninit::<sys::CUgraphExecUpdateResultInfo>::uninit();
+        let call = unsafe { sys::cuGraphExecUpdate_v2(exec.raw, graph, info.as_mut_ptr()) };
+        if call.result().is_ok()
+            && unsafe { info.assume_init() }.result
+                == sys::CUgraphExecUpdateResult_enum::CU_GRAPH_EXEC_UPDATE_SUCCESS
+        {
+            return Ok((at, true));
+        }
+    }
+    let raw =
+        unsafe { result::graph::instantiate(graph, CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY) }
+            .map_err(|e| format!("instantiate v5 CUDA Graph: {e:?}"))?;
+    let at = if slots.len() < GRAPH_CLASSES {
+        slots.push(GraphExec { raw });
+        slots.len() - 1
+    } else {
+        let at = *next % GRAPH_CLASSES;
+        slots[at] = GraphExec { raw };
+        *next = next.wrapping_add(1);
+        at
+    };
+    Ok((at, false))
+}
+
+impl WeightBank {
+    fn upload(
+        stream: &Arc<CudaStream>,
+        dims: &[usize],
+        w: Vec<f32>,
+        b: Vec<f32>,
+        ln: Vec<f32>,
+    ) -> Result<Self, String> {
+        let layout = V3Layout::new(dims)?;
+        validate_layout(&layout)?;
+        if w.len() != layout.w_len || b.len() != layout.b_len || ln.len() != layout.ln_len {
+            return Err(format!(
+                "GPU weight sizes {}/{}/{} do not match {:?} ({}/{}/{})",
+                w.len(),
+                b.len(),
+                ln.len(),
+                dims,
+                layout.w_len,
+                layout.b_len,
+                layout.ln_len
+            ));
+        }
+        let wb = htod(stream, &w)?;
+        let bb = htod(stream, &b)?;
+        let lb = htod(stream, &ln)?;
+        let (wp, bp, lp) = (ptr(stream, &wb), ptr(stream, &bb), ptr(stream, &lb));
+        let mut d = WeightDev::default();
+        let wa = |x| unsafe { wp.add(x) };
+        let ba = |x| unsafe { bp.add(x) };
+        let la = |x| unsafe { lp.add(x) };
+        for (k, s) in layout.card.iter().enumerate() {
+            d.card_w[k] = wa(s.w);
+            d.card_b[k] = ba(s.b);
+        }
+        d.wid = wa(layout.wid);
+        d.pile_w = wa(layout.pile.w);
+        d.pile_b = ba(layout.pile.b);
+        for (k, s) in layout.pub_lin.iter().enumerate() {
+            d.pub_w[k] = wa(s.w);
+            d.pub_b[k] = ba(s.b);
+            d.pub_lnw[k] = la(layout.pub_ln[k].0);
+            d.pub_lnb[k] = la(layout.pub_ln[k].1);
+        }
+        d.pub_out_w = wa(layout.pub_out.w);
+        d.pub_out_b = ba(layout.pub_out.b);
+        d.wb = wa(layout.wb);
+        d.ln1w = la(layout.ln1.0);
+        d.ln1b = la(layout.ln1.1);
+        for (k, s) in layout.hmlp.iter().enumerate() {
+            d.hmlp_w[k] = wa(s.w);
+            d.hmlp_b[k] = ba(s.b);
+        }
+        d.wu_w = wa(layout.wu.w);
+        d.wu_b = ba(layout.wu.b);
+        for (k, s) in layout.slot.iter().enumerate() {
+            d.slot_w[k] = wa(s.w);
+            d.slot_b[k] = ba(s.b);
+        }
+        d.slot_out_w = wa(layout.slot_out.w);
+        d.slot_out_b = ba(layout.slot_out.b);
+        for (k, (a, b)) in layout.res.iter().enumerate() {
+            d.res_aw[k] = wa(a.w);
+            d.res_ab[k] = ba(a.b);
+            d.res_bw[k] = wa(b.w);
+            d.res_bb[k] = ba(b.b);
+        }
+        d.wg_w = wa(layout.wg.w);
+        d.wg_b = ba(layout.wg.b);
+        let dev = htod(stream, &[d])?;
+        Ok(Self {
+            layout,
+            _w: wb,
+            _b: bb,
+            _ln: lb,
+            dev,
+        })
+    }
+
+    fn w_ptr(&self, off: usize) -> *const f32 {
+        unsafe { ptr(self.dev.stream(), &self._w).add(off) }
+    }
+}
+
+struct DeviceBuffers {
+    tables: CudaSlice<u8>,
+    arena: CudaSlice<f32>,
+    dev: CudaSlice<WaveDev>,
+}
+
+struct DeviceWave {
+    buffers: DeviceBuffers,
+    _jobs: Vec<JobDev>,
+    host: WaveDev,
+}
+
+impl DeviceWave {
+    fn upload(
+        stream: &Arc<CudaStream>,
+        w: &Wave,
+        l: &V3Layout,
+        reuse: Option<DeviceBuffers>,
+    ) -> Result<Self, String> {
+        let jobs = job_devices(w)?;
+        let (toff, table_len) = table_layout(w, &jobs)?;
+        let (aoff, arena_len) = arena_layout(w, l)?;
+        let (tables, arena, dev) = match reuse {
+            Some(x) => (Some(x.tables), Some(x.arena), Some(x.dev)),
+            None => (None, None, None),
+        };
+        let mut tables = grow_buffer(stream, tables, table_len.max(1), "wave tables")?;
+        upload_tables(stream, w, &jobs, &toff, &mut tables)?;
+        let arena_need = arena_len.max(1);
+        let mut arena = grow_buffer(stream, arena, arena_need, "wave arena")?;
+        stream
+            .memset_zeros(&mut arena.slice_mut(..arena_need))
+            .map_err(|e| format!("wave arena zero: {e:?}"))?;
+        let carry_snapshots = if w.meta.snapshots {
+            w.meta.snap_iters.len().saturating_sub(1)
+        } else {
+            0
+        };
+        let host = WaveDev {
+            table: ptr_mut(stream, &mut tables),
+            arena: ptr_mut(stream, &mut arena),
+            toff,
+            aoff,
+            jobs: i32n(w.jobs.len(), "jobs")?,
+            nodes: i32n(w.node_kind.len(), "nodes")?,
+            rows: i32n(w.row_node.len(), "rows")?,
+            nleaf: i32n(
+                w.jobs.iter().map(|j| j.network_leaves).sum(),
+                "network leaves",
+            )?,
+            ncfg: i32n(w.config_job.len(), "configs")?,
+            cells: i32n(w.legal_action.len(), "legal cells")?,
+            reach_len: i32n(*w.reach_off.last().unwrap_or(&0) as usize, "reach")?,
+            vals_len: i32n(*w.voff.last().unwrap_or(&0) as usize, "values")?,
+            exits: i32n(w.exit_nodes.len(), "exits")?,
+            snapshot_configs: i32n(w.snapshot_configs, "snapshot configs")?,
+            carry_snapshots: i32n(carry_snapshots, "carry snapshots")?,
+            nlevels: i32n(w.work.levels, "levels")?,
+            decision_n: [
+                i32n(w.decision[0].len(), "p0 decisions")?,
+                i32n(w.decision[1].len(), "p1 decisions")?,
+            ],
+            reach_task_n: [
+                i32n(w.reach_task[0].len(), "p0 reach")?,
+                i32n(w.reach_task[1].len(), "p1 reach")?,
+            ],
+            back_task_n: [
+                i32n(w.back_task[0].len(), "p0 back")?,
+                i32n(w.back_task[1].len(), "p1 back")?,
+            ],
+            readout_n: i32n(w.readout.len(), "readouts")?,
+        };
+        let dev = match dev {
+            Some(mut dev) => {
+                stream
+                    .memcpy_htod(&[host], &mut dev)
+                    .map_err(|e| format!("wave header H2D: {e:?}"))?;
+                dev
+            }
+            None => htod(stream, &[host])?,
+        };
+        if std::env::var_os("WARCHEST_GPU_DEBUG").is_some() {
+            eprintln!(
+                "v5 wave jobs={} rows={} cfgs={} cells={} arena={} floats offsets={:?} arena_ptr={:p} dev_ptr={:p}",
+                host.jobs,
+                host.rows,
+                host.ncfg,
+                host.cells,
+                arena_len,
+                host.aoff,
+                host.arena,
+                ptr(stream, &dev),
+            );
+        }
+        Ok(Self {
+            buffers: DeviceBuffers { tables, arena, dev },
+            _jobs: jobs,
+            host,
+        })
+    }
+
+    fn into_buffers(self) -> DeviceBuffers {
+        self.buffers
+    }
+
+    fn ptr(&self, a: Arena) -> *const f32 {
+        unsafe {
+            ptr(self.buffers.dev.stream(), &self.buffers.arena)
+                .add(self.host.aoff[a as usize] as usize)
+        }
+    }
+
+    fn ptr_mut(&self, a: Arena) -> *mut f32 {
+        self.ptr(a) as *mut f32
+    }
+}
+
+fn grow_buffer<T: cudarc::driver::DeviceRepr>(
+    stream: &Arc<CudaStream>,
+    current: Option<CudaSlice<T>>,
+    need: usize,
+    name: &str,
+) -> Result<CudaSlice<T>, String> {
+    if let Some(buffer) = current {
+        if buffer.len() >= need {
+            return Ok(buffer);
+        }
+    }
+    let capacity = need.checked_next_power_of_two().unwrap_or(need);
+    unsafe { stream.alloc(capacity) }
+        .map_err(|e| format!("{name} allocation ({capacity} elements): {e:?}"))
+}
+
+struct TableLayout {
+    len: usize,
+    off: [u64; N_TABLES],
+}
+
+impl TableLayout {
+    fn new() -> Self {
+        Self {
+            len: 0,
+            off: [0; N_TABLES],
+        }
+    }
+
+    fn put<T: Copy>(&mut self, slot: Table, values: &[T]) -> Result<(), String> {
+        let align = align_of::<T>();
+        let pad = (align - self.len % align) % align;
+        self.len = self
+            .len
+            .checked_add(pad)
+            .ok_or("wave table size overflow")?;
+        self.off[slot as usize] = self.len as u64;
+        let n = values
+            .len()
+            .checked_mul(size_of::<T>())
+            .ok_or("wave table size overflow")?;
+        self.len = self.len.checked_add(n).ok_or("wave table size overflow")?;
+        Ok(())
+    }
+}
+
+macro_rules! wave_table_fields {
+    ($put:ident, $w:ident, $jobs:ident) => {
+        $put!(NodeKind, $w.node_kind.as_slice());
+        $put!(NodePlayer, $w.node_player.as_slice());
+        $put!(NodeNc, $w.node_nc.as_slice());
+        $put!(NodeChildStart, $w.node_child_start.as_slice());
+        $put!(NodeChild, $w.node_child.as_slice());
+        $put!(LegalRowOf, $w.legal_row_of.as_slice());
+        $put!(LegalOff, $w.legal_off.as_slice());
+        $put!(LegalAction, $w.legal_action.as_slice());
+        $put!(LegalChild, $w.legal_child.as_slice());
+        $put!(LegalTrans, $w.legal_trans.as_slice());
+        $put!(DrawOff, $w.draw_off.as_slice());
+        $put!(DrawTo, $w.draw_to.as_slice());
+        $put!(DrawP, $w.draw_p.as_slice());
+        $put!(DrawRowOff, $w.draw_row_off.as_slice());
+        $put!(DrawRowStart, $w.draw_row_start.as_slice());
+        $put!(ReachOff, $w.reach_off.as_slice());
+        $put!(Soff, $w.soff.as_slice());
+        $put!(Voff, $w.voff.as_slice());
+        $put!(NodeParent, $w.node_parent.as_slice());
+        $put!(RevRowOf, $w.rev_row_of.as_slice());
+        $put!(RevStart, $w.rev_start.as_slice());
+        $put!(RevSrc, $w.rev_src.as_slice());
+        $put!(RevCell, $w.rev_cell.as_slice());
+        $put!(RvdRowOf, $w.rvd_row_of.as_slice());
+        $put!(RvdStart, $w.rvd_start.as_slice());
+        $put!(RvdSrc, $w.rvd_src.as_slice());
+        $put!(RvdP, $w.rvd_p.as_slice());
+        $put!(RowNode, $w.row_node.as_slice());
+        $put!(RowJob, $w.row_job.as_slice());
+        $put!(RowCfgOff, $w.row_cfg_off.as_slice());
+        $put!(RowCfg, $w.row_cfg.as_slice());
+        $put!(RawRows, $w.raw_rows.as_slice());
+        $put!(CardFeat, $w.card_feat.as_slice());
+        $put!(Ids, $w.ids.as_slice());
+        $put!(ConfigJob, $w.config_job.as_slice());
+        $put!(Cphi, $w.cphi.as_slice());
+        $put!(Roots, $w.roots.as_slice());
+        $put!(Carried, $w.carried.as_slice());
+        $put!(NodeUtility, $w.node_utility.as_slice());
+        $put!(ExitNodes, $w.exit_nodes.as_slice());
+        $put!(ExitCoff, $w.exit_coff.as_slice());
+        $put!(Decision0, $w.decision[0].as_slice());
+        $put!(Decision1, $w.decision[1].as_slice());
+        $put!(ReachTask0, $w.reach_task[0].as_slice());
+        $put!(ReachTask1, $w.reach_task[1].as_slice());
+        $put!(ReachLevel0, $w.reach_level[0].as_slice());
+        $put!(ReachLevel1, $w.reach_level[1].as_slice());
+        $put!(BackTask0, $w.back_task[0].as_slice());
+        $put!(BackTask1, $w.back_task[1].as_slice());
+        $put!(BackLevel0, $w.back_level[0].as_slice());
+        $put!(BackLevel1, $w.back_level[1].as_slice());
+        $put!(Readout, $w.readout.as_slice());
+        $put!(Jobs, $jobs);
+    };
+}
+
+fn job_devices(w: &Wave) -> Result<Vec<JobDev>, String> {
+    w.jobs
+        .iter()
+        .map(|j| {
+            Ok(JobDev {
+                node0: u32n(j.nodes.start, "job node")?,
+                nodes: u32n(j.nodes.len(), "job nodes")?,
+                row0: u32n(j.rows.start, "job row")?,
+                rows: u32n(j.rows.len(), "job rows")?,
+                nleaf: u32n(j.network_leaves, "job leaves")?,
+                config0: u32n(j.configs.start, "job config")?,
+                ncfg: u32n(j.configs.len(), "job configs")?,
+                cell0: u32n(j.cells.start, "job cell")?,
+                ncells: u32n(j.cells.len(), "job cells")?,
+                reach0: u32n(j.reach.start, "job reach")?,
+                reach_len: u32n(j.reach.len(), "job reach length")?,
+                vals0: u32n(j.vals.start, "job values")?,
+                vals_len: u32n(j.vals.len(), "job values length")?,
+                root0: u32n(j.root.start, "job root")?,
+                root_n0: u32n(j.root_nc[0], "job root p0")?,
+                root_n1: u32n(j.root_nc[1], "job root p1")?,
+                carried0: u32n(j.carried.start, "job carried")?,
+                nroots: u32n(j.nroots, "job roots")?,
+                root_value0: u32n(j.root_values.start, "job root values")?,
+                exit0: u32n(j.exits.start, "job exit")?,
+                nexits: u32n(j.exits.len(), "job exits")?,
+                exit_cfg0: u32n(j.exit_configs.start, "job exit configs")?,
+                snapshot_configs: u32n(j.exit_configs.len(), "job snapshot configs")?,
+            })
+        })
+        .collect()
+}
+
+fn table_layout(w: &Wave, jobs: &[JobDev]) -> Result<([u64; N_TABLES], usize), String> {
+    let mut layout = TableLayout::new();
+    macro_rules! put {
+        ($slot:ident, $values:expr) => {
+            layout.put(Table::$slot, $values)?
+        };
+    }
+    wave_table_fields!(put, w, jobs);
+    Ok((layout.off, layout.len))
+}
+
+fn upload_tables(
+    stream: &Arc<CudaStream>,
+    w: &Wave,
+    jobs: &[JobDev],
+    off: &[u64; N_TABLES],
+    tables: &mut CudaSlice<u8>,
+) -> Result<(), String> {
+    macro_rules! put {
+        ($slot:ident, $values:expr) => {
+            copy_table(stream, tables, off[Table::$slot as usize] as usize, $values)?
+        };
+    }
+    wave_table_fields!(put, w, jobs);
+    Ok(())
+}
+
+fn copy_table<T: Copy>(
+    stream: &Arc<CudaStream>,
+    tables: &mut CudaSlice<u8>,
+    at: usize,
+    values: &[T],
+) -> Result<(), String> {
+    let n = values
+        .len()
+        .checked_mul(size_of::<T>())
+        .ok_or("wave table size overflow")?;
+    if n == 0 {
+        return Ok(());
+    }
+    // SAFETY: every table element is Copy and Task/ReadTask/JobDev use repr(C).
+    let raw = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), n) };
+    stream
+        .memcpy_htod(raw, &mut tables.slice_mut(at..at + n))
+        .map_err(|e| format!("wave table H2D: {e:?}"))
+}
+
+fn arena_layout(w: &Wave, l: &V3Layout) -> Result<([u64; N_ARENAS], usize), String> {
+    let rows = w.row_node.len();
+    let cfgs = w.config_job.len();
+    let jobs = w.jobs.len();
+    let cells = w.legal_action.len();
+    let reach = *w.reach_off.last().unwrap_or(&0) as usize;
+    let vals = *w.voff.last().unwrap_or(&0) as usize;
+    let roots = w.jobs.last().map_or(0, |j| j.root_values.end);
+    let carry_snaps = if w.meta.snapshots {
+        w.meta.snap_iters.len().saturating_sub(1)
+    } else {
+        0
+    };
+    let (pubw, _, _, slotw) = l.widths();
+    let max_pub = pubw
+        .into_iter()
+        .chain([l.xdim(), l.head_in])
+        .max()
+        .unwrap_or(1);
+    let slot_max = slotw
+        .into_iter()
+        .chain([l.hfeat(), l.dg])
+        .max()
+        .unwrap_or(1);
+    let card_max = l.card.iter().map(|x| x.o).max().unwrap_or(l.de);
+    let bh = (rows * max_pub)
+        .max(cfgs * NSLOT * slot_max)
+        .max(jobs * NTYPE * card_max)
+        .max(rows * NTYPE * l.de)
+        .max(cfgs * l.dg);
+    let bg = (jobs * NTYPE * CARD_FEATS)
+        .max(rows * NTYPE * PILE_COUNTS)
+        .max(rows * NTYPE * l.de + jobs * NTYPE * l.de)
+        .max(cfgs * NSLOT * l.hfeat())
+        .max(cfgs * (l.rank + 1));
+    let sizes = [
+        reach,
+        reach,
+        vals,
+        cells,
+        cells,
+        cells,
+        cells,
+        jobs * NTYPE * l.de,
+        cfgs * l.dg,
+        cfgs * (l.rank + 1),
+        rows * l.head_in,
+        rows * 2 * l.dg,
+        rows * h_stride(l),
+        rows * h_stride(l),
+        rows * l.rank,
+        roots,
+        carry_snaps * w.snapshot_configs,
+        rows * l.xdim(),
+        bh,
+        bh,
+        bg,
+    ];
+    let mut off = [0u64; N_ARENAS];
+    let mut at = 0usize;
+    for (i, &n) in sizes.iter().enumerate() {
+        off[i] = at as u64;
+        at = at.checked_add(n).ok_or("wave FP32 arena size overflow")?;
+    }
+    Ok((off, at))
+}
+
+fn unpack(
+    w: Wave,
+    strategy: Vec<f32>,
+    root_values: Vec<f32>,
+    carry: Vec<f32>,
+    version: u64,
+) -> Result<Vec<SolveResult>, String> {
+    let snapshots = if w.meta.snapshots {
+        w.meta.snap_iters.len().saturating_sub(1)
+    } else {
+        0
+    };
+    let mut out = Vec::with_capacity(w.jobs.len());
+    for j in &w.jobs {
+        let mut roots = Vec::with_capacity(j.nroots);
+        let stride = j.root_nc[0] + j.root_nc[1];
+        for r in 0..j.nroots {
+            let at = j.root_values.start + r * stride;
+            roots.push([
+                root_values[at..at + j.root_nc[0]].to_vec(),
+                root_values[at + j.root_nc[0]..at + stride].to_vec(),
+            ]);
+        }
+        let mut data = Vec::with_capacity(snapshots * j.exit_configs.len());
+        for s in 0..snapshots {
+            let at = s * w.snapshot_configs + j.exit_configs.start;
+            data.extend_from_slice(&carry[at..at + j.exit_configs.len()]);
+        }
+        let node0 = j.nodes.start as u32;
+        let cfg0 = j.exit_configs.start as u32;
+        out.push(SolveResult {
+            strategy: strategy[j.cells.clone()].to_vec(),
+            root_values: roots,
+            carries: CarryStore {
+                exit_nodes: w.exit_nodes[j.exits.clone()]
+                    .iter()
+                    .map(|&x| x - node0)
+                    .collect(),
+                coff: w.exit_coff[2 * j.exits.start..=2 * j.exits.end]
+                    .iter()
+                    .map(|&x| x - cfg0)
+                    .collect(),
+                snapshots,
+                snapshot_configs: j.exit_configs.len(),
+                data,
+            },
+            weight_version: version,
+        });
+    }
+    Ok(out)
+}
+
+fn copy_arena(
+    stream: &Arc<CudaStream>,
+    d: &DeviceWave,
+    arena: Arena,
+    start: usize,
+    len: usize,
+) -> Result<Vec<f32>, String> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let at = d.host.aoff[arena as usize] as usize + start;
+    stream
+        .memcpy_dtov(&d.buffers.arena.slice(at..at + len))
+        .map_err(|e| format!("wave result copy: {e:?}"))
+}
+
+fn validate_layout(l: &V3Layout) -> Result<(), String> {
+    if l.card.is_empty() || l.pub_lin.is_empty() {
+        return Err("v5 requires non-empty card and public towers".into());
+    }
+    if l.card.len() > 8
+        || l.pub_lin.len() > 8
+        || l.hmlp.len() > 8
+        || l.slot.len() > 8
+        || l.res.len() > 4
+    {
+        return Err("network tower exceeds v5 kernel pointer tables".into());
+    }
+    Ok(())
+}
+
+fn h_stride(l: &V3Layout) -> usize {
+    std::iter::once(l.head_in)
+        .chain(l.hmlp.iter().map(|x| x.o))
+        .max()
+        .unwrap_or(l.head_in)
+}
+
+fn factor(t: f32, p: f32) -> f32 {
+    if p.is_infinite() {
+        if p > 0.0 {
+            1.0
+        } else {
+            0.0
+        }
+    } else {
+        let x = t.powf(p);
+        x / (x + 1.0)
+    }
+}
+
+fn threads(n: i32) -> u32 {
+    if n <= 0 {
+        0
+    } else {
+        (n as u32).div_ceil(BLOCK)
+    }
+}
+fn threads_usize(n: usize) -> u32 {
+    if n == 0 {
+        0
+    } else {
+        (n as u32).div_ceil(BLOCK)
+    }
+}
+fn warps(n: usize) -> u32 {
+    if n == 0 {
+        0
+    } else {
+        ((n as u32) * 32).div_ceil(BLOCK)
+    }
+}
+
+macro_rules! launch {
+    ($me:expr, $wave:expr, $bank:expr, $kernel:ident, $grid:expr $(, $arg:expr)* $(,)?) => {{
+        let grid = $grid;
+        if grid != 0 {
+            let f = $me.kernels.$kernel.clone();
+            let mut args = $me.stream.launch_builder(&f);
+            args.arg(&$wave.buffers.dev).arg(&$bank.dev);
+            $(let scalar = $arg; args.arg(&scalar);)*
+            let cfg = LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { args.launch(cfg) }
+                .map_err(|e| format!("CUDA {} launch: {e:?}", stringify!($kernel)))?;
+        }
+        Ok::<(), String>(())
+    }};
+}
+use launch;
+
+fn htod<T: cudarc::driver::DeviceRepr + Unpin>(
+    stream: &Arc<CudaStream>,
+    values: &[T],
+) -> Result<CudaSlice<T>, String> {
+    let mut out =
+        unsafe { stream.alloc(values.len().max(1)) }.map_err(|e| format!("CUDA alloc: {e:?}"))?;
+    if !values.is_empty() {
+        stream
+            .memcpy_htod(values, &mut out)
+            .map_err(|e| format!("CUDA H2D: {e:?}"))?;
+    }
+    Ok(out)
+}
+
+fn ptr<T>(stream: &Arc<CudaStream>, value: &CudaSlice<T>) -> *const T {
+    let (p, _) = value.device_ptr(stream);
+    p as usize as *const T
+}
+
+fn ptr_mut<T>(stream: &Arc<CudaStream>, value: &mut CudaSlice<T>) -> *mut T {
+    let (p, _) = value.device_ptr_mut(stream);
+    p as usize as *mut T
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemm(
+    blas: &CudaBlas,
+    m: usize,
+    n: usize,
+    k: usize,
+    a: *const f32,
+    lda: usize,
+    b: *const f32,
+    ldb: usize,
+    c: *mut f32,
+    ldc: usize,
+    beta: f32,
+) -> Result<(), String> {
+    if m == 0 || n == 0 || k == 0 {
+        return Ok(());
+    }
+    let alpha = 1.0f32;
+    unsafe {
+        cudarc::cublas::result::sgemm(
+            *blas.handle(),
+            CUBLAS_OP_N,
+            CUBLAS_OP_N,
+            n as i32,
+            m as i32,
+            k as i32,
+            &alpha,
+            b,
+            ldb as i32,
+            a,
+            lda as i32,
+            &beta,
+            c,
+            ldc as i32,
+        )
+    }
+    .map_err(|e| format!("cuBLAS SGEMM {m}x{k}x{n}: {e:?}"))?;
+    Ok(())
+}
+
+fn u32n(x: usize, what: &str) -> Result<u32, String> {
+    u32::try_from(x).map_err(|_| format!("wave {what} exceeds u32"))
+}
+fn i32n(x: usize, what: &str) -> Result<i32, String> {
+    i32::try_from(x).map_err(|_| format!("wave {what} exceeds i32 launch range"))
+}
+
+fn cuda_preamble(l: &V3Layout) -> String {
+    let arr = |name: &str, values: &[usize]| {
+        let body = if values.is_empty() {
+            "0".into()
+        } else {
+            values
+                .iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!("static __device__ const int {name}[] = {{{body}}};\n")
+    };
+    let (pubw, hmlp, card, slot) = l.widths();
+    let locations = crate::board::board()
+        .is_location
+        .iter()
+        .map(|&x| if x { "1" } else { "0" })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "#define DE {}\n#define DG {}\n#define RK {}\n#define HEADW {}\n\
+         #define HEADOUT {}\n#define H_STRIDE {}\n#define XD {}\n#define HF {}\n\
+         #define NCARD {}\n#define NPUB {}\n#define NHMLP {}\n#define NSLOTL {}\n#define NRES {}\n\
+         {}{}{}{}\
+         #define N_HEXES {}\n#define NSLOT {}\n#define NTYPE {}\n#define HEX_FACTS {}\n\
+         #define PILE_COUNTS {}\n#define CARD_FEATS {}\n#define CFEAT {}\n\
+         #define MAX_COINS {:.1}f\n#define MAX_PLIES {:.1}f\n#define LOOSE {}\n\
+         #define GPU_ROW_BYTES {}\n#define GR_HEX_OWNER {}\n#define GR_HEX_SLOT {}\n\
+         #define GR_HEX_HEIGHT {}\n#define GR_HEX_MARKER {}\n#define GR_PILES {}\n\
+         #define GR_MARKERS {}\n#define GR_HAND {}\n#define GR_FD {}\n#define GR_BAG {}\n\
+         #define GR_INITIATIVE {}\n#define GR_INIT_MOVED {}\n#define GR_TO_ACT {}\n#define GR_PLIES {}\n\
+         static __device__ const unsigned char HEX_LOCATION[N_HEXES] = {{{locations}}};\n",
+        l.de, l.dg, l.rank, l.head_in, l.head_out, h_stride(l), l.xdim(), l.hfeat(),
+        l.card.len(), l.pub_lin.len(), l.hmlp.len(), l.slot.len(), l.res.len(),
+        arr("CARDW", &card), arr("PUBW", &pubw), arr("HMLPW", &hmlp), arr("SLOTW", &slot),
+        crate::board::N_HEXES, NSLOT, NTYPE, crate::rebel::HEX_FACTS,
+        PILE_COUNTS, CARD_FEATS, CFEAT, crate::rebel::MAX_COINS,
+        crate::state::MAX_MAIN_PLAYS as f32, crate::rebel::LOOSE,
+        GPU_ROW_BYTES, crate::rebel::GPU_ROW_HEX_OWNER, crate::rebel::GPU_ROW_HEX_SLOT,
+        crate::rebel::GPU_ROW_HEX_HEIGHT, crate::rebel::GPU_ROW_HEX_MARKER,
+        crate::rebel::GPU_ROW_PILES, crate::rebel::GPU_ROW_MARKERS,
+        crate::rebel::GPU_ROW_HAND, crate::rebel::GPU_ROW_FD, crate::rebel::GPU_ROW_BAG,
+        crate::rebel::GPU_ROW_INITIATIVE, crate::rebel::GPU_ROW_INIT_MOVED,
+        crate::rebel::GPU_ROW_TO_ACT, crate::rebel::GPU_ROW_PLIES,
+    )
+}

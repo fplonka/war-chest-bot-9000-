@@ -1,7 +1,9 @@
-//! Cost-bucketed dispatcher for one v5 CUDA wave executor.
+//! Cost-bucketed dispatcher for one v5 CUDA device and its reusable lanes.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::serialize::{PackedJob, WorkVector};
@@ -13,10 +15,12 @@ use super::wave::Wave;
 pub struct Service;
 
 struct Pending {
-    job: PackedJob,
+    job: Arc<PackedJob>,
+    work: WorkVector,
     tag: usize,
     reply: mpsc::Sender<(usize, Result<SolveResult, String>)>,
     version: u64,
+    cost: u64,
     queued: Instant,
 }
 
@@ -29,20 +33,14 @@ pub fn spawn(
 ) -> Result<GpuClient, String> {
     let (tx, rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
+    let queued_work = Arc::new(AtomicU64::new(0));
+    let service_work = queued_work.clone();
     let thread = std::thread::Builder::new()
-        .name(format!("warchest-wave-{device}"))
-        .spawn(move || match Executor::new(device, dims, w, b, ln) {
-            Ok(exec) => {
-                let _ = ready_tx.send(Ok(()));
-                run(rx, exec);
-            }
-            Err(e) => {
-                let _ = ready_tx.send(Err(e));
-            }
-        })
+        .name(format!("warchest-dispatch-{device}"))
+        .spawn(move || dispatcher(device, dims, w, b, ln, rx, ready_tx, service_work))
         .map_err(|e| format!("start GPU wave executor: {e}"))?;
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(GpuClient::new(tx, thread)),
+        Ok(Ok(())) => Ok(GpuClient::new(tx, thread, queued_work)),
         Ok(Err(e)) => {
             let _ = thread.join();
             Err(e)
@@ -54,7 +52,143 @@ pub fn spawn(
     }
 }
 
-fn run(rx: mpsc::Receiver<Cmd>, mut exec: Executor) {
+fn dispatcher(
+    device: usize,
+    dims: Vec<usize>,
+    w: Vec<f32>,
+    b: Vec<f32>,
+    ln: Vec<f32>,
+    rx: mpsc::Receiver<Cmd>,
+    ready: mpsc::Sender<Result<(), String>>,
+    queued_work: Arc<AtomicU64>,
+) {
+    let lanes = env_usize("WARCHEST_WAVE_LANES", 2).clamp(1, 3);
+    let (lane_ready_tx, lane_ready_rx) = mpsc::channel();
+    let mut senders = Vec::with_capacity(lanes);
+    let mut joins = Vec::with_capacity(lanes);
+    let mut lane_work = Vec::with_capacity(lanes);
+    for lane in 0..lanes {
+        let (tx, lane_rx) = mpsc::channel();
+        let lane_ready = lane_ready_tx.clone();
+        let global = queued_work.clone();
+        let local = Arc::new(AtomicU64::new(0));
+        let local_run = local.clone();
+        let (ldims, lw, lb, lln) = (dims.clone(), w.clone(), b.clone(), ln.clone());
+        match std::thread::Builder::new()
+            .name(format!("warchest-wave-{device}-{lane}"))
+            .spawn(move || match Executor::new(device, ldims, lw, lb, lln) {
+                Ok(exec) => {
+                    let _ = lane_ready.send(Ok(()));
+                    run(lane_rx, exec, global, local_run);
+                }
+                Err(e) => {
+                    let _ = lane_ready.send(Err(e));
+                }
+            }) {
+            Ok(join) => {
+                senders.push(tx);
+                joins.push(join);
+                lane_work.push(local);
+            }
+            Err(e) => {
+                let _ = ready.send(Err(format!("start GPU lane {lane}: {e}")));
+                for tx in &senders {
+                    let _ = tx.send(Cmd::Shutdown);
+                }
+                for join in joins {
+                    let _ = join.join();
+                }
+                return;
+            }
+        }
+    }
+    drop(lane_ready_tx);
+    for lane in 0..lanes {
+        match lane_ready_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = ready.send(Err(format!("GPU lane {lane}: {e}")));
+                for tx in &senders {
+                    let _ = tx.send(Cmd::Shutdown);
+                }
+                for join in joins {
+                    let _ = join.join();
+                }
+                return;
+            }
+            Err(_) => {
+                let _ = ready.send(Err("GPU lane died during startup".into()));
+                return;
+            }
+        }
+    }
+    let _ = ready.send(Ok(()));
+
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            Cmd::Submit {
+                job,
+                work,
+                tag,
+                cost,
+                reply,
+            } => {
+                let lane = lane_work
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, x)| x.load(Ordering::Relaxed))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                lane_work[lane].fetch_add(cost, Ordering::Relaxed);
+                let cmd = Cmd::Submit {
+                    job,
+                    work,
+                    tag,
+                    cost,
+                    reply,
+                };
+                if let Err(e) = senders[lane].send(cmd) {
+                    lane_work[lane].fetch_sub(cost, Ordering::Relaxed);
+                    queued_work.fetch_sub(cost, Ordering::Relaxed);
+                    if let Cmd::Submit { tag, reply, .. } = e.0 {
+                        let _ = reply.send((tag, Err(format!("GPU lane {lane} is gone"))));
+                    }
+                }
+            }
+            Cmd::Publish {
+                version,
+                dims,
+                w,
+                b,
+                ln,
+            } => {
+                for tx in &senders {
+                    let _ = tx.send(Cmd::Publish {
+                        version,
+                        dims: dims.clone(),
+                        w: w.clone(),
+                        b: b.clone(),
+                        ln: ln.clone(),
+                    });
+                }
+            }
+            Cmd::Shutdown => break,
+        }
+    }
+    for tx in &senders {
+        let _ = tx.send(Cmd::Shutdown);
+    }
+    for join in joins {
+        let _ = join.join();
+    }
+}
+
+fn run(
+    rx: mpsc::Receiver<Cmd>,
+    mut exec: Executor,
+    queued_work: Arc<AtomicU64>,
+    lane_work: Arc<AtomicU64>,
+) {
     let row_target = env_usize("WARCHEST_WAVE_ROWS", 48 * 1024).max(1);
     let max_jobs = env_usize("WARCHEST_WAVE_JOBS", 64).clamp(1, 256);
     let latency = Duration::from_micros(env_usize("WARCHEST_WAVE_US", 800) as u64);
@@ -65,7 +199,13 @@ fn run(rx: mpsc::Receiver<Cmd>, mut exec: Executor) {
     while !shutdown || !pending.is_empty() {
         if pending.is_empty() && !shutdown {
             match rx.recv() {
-                Ok(cmd) => handle(cmd, &mut exec, &mut current_version, &mut pending, &mut shutdown),
+                Ok(cmd) => handle(
+                    cmd,
+                    &mut exec,
+                    &mut current_version,
+                    &mut pending,
+                    &mut shutdown,
+                ),
                 Err(_) => shutdown = true,
             }
         }
@@ -81,7 +221,13 @@ fn run(rx: mpsc::Receiver<Cmd>, mut exec: Executor) {
             .unwrap_or_else(Instant::now);
         while !shutdown && Instant::now() < deadline && bucket_rows(&pending) < row_target {
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(cmd) => handle(cmd, &mut exec, &mut current_version, &mut pending, &mut shutdown),
+                Ok(cmd) => handle(
+                    cmd,
+                    &mut exec,
+                    &mut current_version,
+                    &mut pending,
+                    &mut shutdown,
+                ),
                 Err(mpsc::RecvTimeoutError::Timeout) => break,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     shutdown = true;
@@ -93,20 +239,20 @@ fn run(rx: mpsc::Receiver<Cmd>, mut exec: Executor) {
         let Some(seed) = pending.pop_front() else {
             continue;
         };
-        let class = cost_class(seed.job.work());
+        let class = cost_class(seed.work);
         let mut batch = vec![seed];
-        let mut rows = batch[0].job.tables.rows;
+        let mut rows = batch[0].work.network_rows;
         let mut i = 0;
         while i < pending.len() && batch.len() < max_jobs && rows < row_target {
             let take = {
                 let p = &pending[i];
                 p.version == batch[0].version
-                    && cost_class(p.job.work()) == class
+                    && cost_class(p.work) == class
                     && Wave::compatible(&p.job, &batch[0].job)
             };
             if take {
                 let p = pending.remove(i).expect("pending index");
-                rows += p.job.tables.rows;
+                rows += p.work.network_rows;
                 batch.push(p);
             } else {
                 i += 1;
@@ -118,13 +264,25 @@ fn run(rx: mpsc::Receiver<Cmd>, mut exec: Executor) {
         let mut tickets = Vec::with_capacity(count);
         for p in batch {
             jobs.push(p.job);
-            tickets.push((p.tag, p.reply));
+            tickets.push((p.tag, p.reply, p.cost));
         }
-        let result = Wave::pack(&jobs).and_then(|wave| exec.solve(wave, version));
+        let pack_started = Instant::now();
+        let packed = Wave::pack(&jobs);
+        let packed_at = Instant::now();
+        let result = packed.and_then(|wave| exec.solve(wave, version));
+        if std::env::var_os("WARCHEST_GPU_PROFILE").is_some() {
+            eprintln!(
+                "v5_service jobs={count} pack_ms={:.2} solve_ms={:.2}",
+                1e3 * (packed_at - pack_started).as_secs_f64(),
+                1e3 * packed_at.elapsed().as_secs_f64(),
+            );
+        }
         match result {
             Ok(results) if results.len() == count => {
-                for ((tag, reply), value) in tickets.into_iter().zip(results) {
+                for ((tag, reply, cost), value) in tickets.into_iter().zip(results) {
                     let _ = reply.send((tag, Ok(value)));
+                    queued_work.fetch_sub(cost, Ordering::Relaxed);
+                    lane_work.fetch_sub(cost, Ordering::Relaxed);
                 }
             }
             Ok(results) => {
@@ -133,13 +291,17 @@ fn run(rx: mpsc::Receiver<Cmd>, mut exec: Executor) {
                     results.len(),
                     count
                 );
-                for (tag, reply) in tickets {
+                for (tag, reply, cost) in tickets {
                     let _ = reply.send((tag, Err(e.clone())));
+                    queued_work.fetch_sub(cost, Ordering::Relaxed);
+                    lane_work.fetch_sub(cost, Ordering::Relaxed);
                 }
             }
             Err(e) => {
-                for (tag, reply) in tickets {
+                for (tag, reply, cost) in tickets {
                     let _ = reply.send((tag, Err(e.clone())));
+                    queued_work.fetch_sub(cost, Ordering::Relaxed);
+                    lane_work.fetch_sub(cost, Ordering::Relaxed);
                 }
             }
         }
@@ -154,12 +316,20 @@ fn handle(
     shutdown: &mut bool,
 ) {
     match cmd {
-        Cmd::Submit { job, tag, reply } => pending.push_back(Pending {
+        Cmd::Submit {
             job,
+            work,
+            tag,
+            cost,
+            reply,
+        } => pending.push_back(Pending {
+            job,
+            work,
             tag,
             reply,
             version: *current_version,
             queued: Instant::now(),
+            cost,
         }),
         Cmd::Publish {
             version,
@@ -179,21 +349,21 @@ fn bucket_rows(pending: &VecDeque<Pending>) -> usize {
     let Some(seed) = pending.front() else {
         return 0;
     };
-    let class = cost_class(seed.job.work());
+    let class = cost_class(seed.work);
     pending
         .iter()
         .filter(|p| {
             p.version == seed.version
-                && cost_class(p.job.work()) == class
+                && cost_class(p.work) == class
                 && Wave::compatible(&p.job, &seed.job)
         })
-        .map(|p| p.job.tables.rows)
+        .map(|p| p.work.network_rows)
         .sum()
 }
 
-/// Logarithmic cost classes keep a whale from setting every common wave's
-/// capacity while preserving oldest-first service within each compatible
-/// bucket. Class 31 is exclusive.
+/// Coarse physical capacity classes keep a whale from setting every common
+/// wave's shape without splitting an ordinary production tape into tiny
+/// power-of-two batches. Class 31 is exclusive.
 fn cost_class(w: WorkVector) -> u8 {
     let bytes = w
         .table_bytes
@@ -208,7 +378,15 @@ fn cost_class(w: WorkVector) -> u8 {
         .max(w.reach_slots / 16)
         .max(w.reverse_nonzeros / 16)
         .max(1);
-    (usize::BITS - work.leading_zeros()) as u8
+    if bytes >= (512usize << 20) || work >= 4_000_000 {
+        3
+    } else if bytes >= (64usize << 20) || work >= 500_000 {
+        2
+    } else if bytes >= (16usize << 20) || work >= 125_000 {
+        1
+    } else {
+        0
+    }
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
