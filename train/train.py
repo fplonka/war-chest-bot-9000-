@@ -350,7 +350,7 @@ def policy_loss(net, d, ids, device):
 
 def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
                 recent_mix=0.0, recent_frac=0.2, aux_weight=0.0, policy_weight=0.0,
-                d=None, policy_batch=64, profile_cuda=False):
+                d=None, policy_batch=64, profile_cuda=False, batch_fn=make_batch):
     """Returns the mean value loss and the mean policy loss.
 
     The side tasks are summed into the same backward as the value loss, not
@@ -378,7 +378,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
         stat["sample_s"] += time.perf_counter() - ts
         stat["batch_configs"] += len(sampled[1])
         ts = time.perf_counter()
-        parts = make_batch(sampled, rng, device, augment)
+        parts = batch_fn(sampled, rng, device, augment)
         stat["prepare_s"] += time.perf_counter() - ts
         if stream is not None:
             f0 = torch.cuda.Event(enable_timing=True)
@@ -635,6 +635,13 @@ def main():
     # are the uint8 they already are; probabilities and targets live in [-1, 1]
     # where float16 resolves to ~0.001, a fiftieth of the network's own error.
     buf = Buffer(args.cap, args.cap * args.cfgs_per_row)
+    batcher = make_batch
+    if args.gpu:
+        # Compile the compact replay expanders before the run clock starts.
+        # CPU/offline tools keep the Rust/numpy path as an independent oracle.
+        import gpu_batch
+        gpu_batch.warmup(dev)
+        batcher = gpu_batch.make_batch
 
     gen_box = None
     total = args.minutes * 60.0
@@ -739,15 +746,15 @@ def main():
             raw_sps = rebel_solves / elapsed
             balanced_sps = min(rebel_solves, credit) / elapsed
             if probe is None and len(buf) >= 2048:
-                probe = make_batch(buf.sample(2048, rng), rng, dev, False)
+                probe = batcher(buf.sample(2048, rng), rng, dev, False)
             with torch.no_grad():
                 probe_std = float(value(*probe[:6], probe[7]).std()) \
                     if probe is not None else float("nan")
                 if len(buf) >= args.batch:
-                    old_parts = make_batch(
+                    old_parts = batcher(
                         buf.sample_old(args.batch, rng, args.recent_frac), rng, dev, False)
                     loss_old = float(value_loss(value, *old_parts[:-1]))
-                    new_parts = make_batch(
+                    new_parts = batcher(
                         buf.sample(args.batch, rng, recent_mix=1.0,
                                    recent_frac=args.recent_frac), rng, dev, False)
                     loss_new = float(value_loss(value, *new_parts[:-1]))
@@ -878,7 +885,8 @@ def main():
                         aux_weight=0.0, policy_weight=0.0,
                         augment=not args.no_augment,
                         recent_mix=args.recent_mix, recent_frac=args.recent_frac,
-                        profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1")
+                        profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1",
+                        batch_fn=batcher)
                     window["train_s"] += time.time() - tt
                     window["loss_sum"] += lv * nsteps
                     window["train_steps"] += nsteps
@@ -1061,7 +1069,7 @@ def main():
         # collapses, the value function has gone degenerate -- the failure mode
         # a falling training loss hides.
         if probe is None and len(buf) >= 2048:
-            probe = make_batch(buf.sample(2048, rng), rng, dev, False)
+            probe = batcher(buf.sample(2048, rng), rng, dev, False)
         tgt_mean, tgt_std = float(cy.mean()), float(cy.std())
 
         tt = time.time()
@@ -1081,7 +1089,7 @@ def main():
             value, opt, buf, steps, args.batch, rng, dev, aux_weight=args.aux,
             policy_weight=(args.policy if phase == "rebel" else 0.0), d=d,
             augment=not args.no_augment, recent_mix=args.recent_mix,
-            recent_frac=args.recent_frac)
+            recent_frac=args.recent_frac, batch_fn=batcher)
         train_s = time.time() - tt
         value.push(0)
         with torch.no_grad():
@@ -1092,10 +1100,10 @@ def main():
             # makes that staleness visible: if old-row loss falls while
             # fresh-row loss rises, training is overfitting the buffer.
             if len(buf) >= args.batch:
-                old_parts = make_batch(
+                old_parts = batcher(
                     buf.sample_old(args.batch, rng, args.recent_frac), rng, dev, False)
                 loss_old = float(value_loss(value, *old_parts[:-1]))
-                new_parts = make_batch(
+                new_parts = batcher(
                     buf.sample(args.batch, rng, recent_mix=1.0,
                                recent_frac=args.recent_frac), rng, dev, False)
                 loss_new = float(value_loss(value, *new_parts[:-1]))

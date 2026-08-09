@@ -11,7 +11,7 @@ use pyo3::types::{PyDict, PyList};
 use crate::actions::Action;
 use crate::board::{board, NONE, N_HEXES};
 use crate::state::*;
-use crate::units::{def, index_of_id, N_UNITS};
+use crate::units::{def, index_of_id, write_card_features, CARD_FEATS, N_UNITS};
 
 #[pyclass]
 struct Game {
@@ -1170,6 +1170,26 @@ fn units_info() -> Vec<(u16, &'static str, u8)> {
         .collect()
 }
 
+/// Frozen encoder constants for the device-side replay expander. Export the
+/// tables from the rules engine instead of restating card or board facts in
+/// the trainer.
+#[pyfunction]
+fn card_features_table() -> Vec<f32> {
+    let mut out = vec![0.0; N_UNITS * CARD_FEATS];
+    for u in 0..N_UNITS {
+        write_card_features(
+            u as u8,
+            &mut out[u * CARD_FEATS..(u + 1) * CARD_FEATS],
+        );
+    }
+    out
+}
+
+#[pyfunction]
+fn hex_location_flags() -> Vec<u8> {
+    board().is_location.iter().map(|&x| x as u8).collect()
+}
+
 #[pyfunction]
 fn hex_neighborhood() -> Vec<u32> {
     let bd = crate::board::board();
@@ -1275,6 +1295,8 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hex_mirror, m)?)?;
     m.add_function(wrap_pyfunction!(hex_coords, m)?)?;
     m.add_function(wrap_pyfunction!(units_info, m)?)?;
+    m.add_function(wrap_pyfunction!(card_features_table, m)?)?;
+    m.add_function(wrap_pyfunction!(hex_location_flags, m)?)?;
     m.add_class::<Game>()?;
     m.add_class::<crate::live::LiveGame>()?;
     m.add("MAX_MAIN_PLAYS", crate::state::MAX_MAIN_PLAYS)?;
