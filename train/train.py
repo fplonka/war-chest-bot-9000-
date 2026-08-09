@@ -592,6 +592,12 @@ def main():
     torch.set_num_threads(1 if args.gpu else (os.cpu_count() or 8))
     if args.gpu:
         torch.set_num_interop_threads(1)
+        # Ampere's normal high-throughput float32 GEMM path. Parameters, loss
+        # reductions, gradients, and Adam state remain FP32; only the internal
+        # matrix products may use TF32. Exact scalar-CPU last bits are not a
+        # training requirement, and this setting is recorded in log.json.
+        torch.set_float32_matmul_precision("high")
+    args.matmul_precision = torch.get_float32_matmul_precision()
     rng = np.random.default_rng(args.seed)
     dev = torch.device(args.device)
 
@@ -943,7 +949,8 @@ def main():
           f"snapshot_every={args.snapshot_every:.1f}min "
           f"train_gen_ratio={args.train_gen_ratio} "
           f"recent_mix={args.recent_mix}/{args.recent_frac} "
-          f"augment={not args.no_augment} cap={args.cap}", flush=True)
+          f"augment={not args.no_augment} cap={args.cap} "
+          f"matmul={torch.get_float32_matmul_precision()}", flush=True)
 
     while True:
         el = time.time() - t0
