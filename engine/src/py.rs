@@ -719,6 +719,9 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     out.set_item("black_wins", d.wins[1])?;
     out.set_item("draws", d.draws)?;
     out.set_item("cap_hits", d.cap_hits)?;
+    out.set_item("horizon_hits", d.cap_hits)?;
+    out.set_item("node_caps", d.node_caps)?;
+    out.set_item("dropped", d.dropped)?;
     out.set_item("configs", d.configs)?;
     assert_eq!(
         d.coff.len(),

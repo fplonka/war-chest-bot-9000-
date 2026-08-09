@@ -253,6 +253,7 @@ fn walk_across_warrior_priest_draws() {
 fn capped_solves_fall_back_and_games_finish() {
     let nets = [warchest::search::Nets::default()];
     let mut total_dec = 0usize;
+    let mut total_node_caps = 0usize;
     for seed in 0..10u64 {
         let mut rng = Rng::new(seed * 7919 + 5);
         let mut d = Data::default();
@@ -274,6 +275,11 @@ fn capped_solves_fall_back_and_games_finish() {
         let z = play_game(rng, &nets, &gc, &mut d, None);
         assert!(z.is_finite());
         total_dec += d.decisions;
+        total_node_caps += d.node_caps;
     }
     assert!(total_dec > 0);
+    assert!(
+        total_node_caps > 0,
+        "the real solver-cap counter stayed zero"
+    );
 }

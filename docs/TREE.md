@@ -108,5 +108,6 @@ Unchanged in spirit from the plan: the solver state lives on the device for
 the life of the solve; a tick advances every live solve one step (iterate /
 value / carry by its own stage); admission uploads a batch and runs the
 network builds as batched GEMM chains; the walk costs two round trips per
-generation solve and one per evaluation solve. `docs/HANDOFF.md` describes
-the current implementation.
+generation solve and one per evaluation solve. `docs/GPU_ARCHITECTURE.md`
+explains why this WIP operating model should be replaced for the 1,200/s
+training target.

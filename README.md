@@ -125,9 +125,11 @@ maturin develop --release           # python module `warchest` (Game)
 `rebelbench` runs the ReBeL generation loop without Python, on weights exported
 by `train/export_weights.py`, and is what `docs/PERF.md`'s numbers come from.
 The GPU path's numbers come from `examples/gpu_bench.rs` (service only) and
-`examples/gpu_gen_bench.rs` (end to end, identical seeded games on both
-paths); `docs/HANDOFF.md` is the current state of the GPU rewrite and its
-verification runbook.
+`examples/gpu_gen_bench.rs` (end-to-end generation only, with identical seeded
+games on both paths). `docs/GPU_PERF_GOAL.md` defines the real training target
+and corrected baseline; `docs/GPU_ARCHITECTURE.md` is the proposed replacement
+architecture and verification runbook.
+
 Build it with `--features prof` for a per-phase breakdown. Its `games depth
 iters threads` arguments default to the trainer's settings, so a throughput
 number is only comparable to another taken at the same ones — `iters` in

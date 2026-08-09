@@ -1,5 +1,12 @@
 # gpu1200
 
+> Correction, 2026-08-09: this run's `cap` field was misread. It counts games
+> reaching the 256-play horizon, not subgames hitting the 200,000-node cap.
+> The first ReBeL batch also ran on the freshly initialized network because the
+> warm weights had not yet been published to the solve services. The correction
+> below preserves the useful crash and capacity findings without treating that
+> batch as the intended training baseline.
+
 ## What we were trying
 
 Get the CUDA solve service to 1,200 fresh ReBeL solves a second in a real
@@ -39,14 +46,22 @@ Finding it needed three things worth keeping:
 `compute-sanitizer` was tried repeatedly and is not usable here: it does not
 finish a four-game run in fifteen minutes.
 
-**The benchmark is not measuring the training workload.** With the crash fixed,
-`gpu_gen_bench` reaches 573 solves/s on the two cards. A real training run
-reaches **164**. The reason is visible in one number: `cap`, the fraction of
-decisions whose subgame hits the 200,000-node cap, is 0.4% in the benchmark and
-99% in the training run, and the trainer carries 85 configs per row against the
-benchmark's 27. Nearly every subgame the trainer solves is as large as the cap
-allows. Treating the benchmark as the stop condition for the goal is therefore
-wrong, and that is the single most useful thing this run established.
+**The benchmark is not the training target, but the original explanation of
+the gap was wrong.** With the crash fixed, `gpu_gen_bench` reached 573 solves/s
+on two cards while this run's first generation call reported 164. `cap=0.99`
+means that 99% of games reached the 256-play horizon. It says nothing about the
+tree node cap. The logged `configs=85` is configs per game decision, not per
+training row.
+
+The solve services were created before warm training and were not given the
+warm snapshot at the phase transition. This whole 1,024-game batch used the
+freshly initialized network, producing near-uniform play, broad beliefs,
+almost all horizon games, and target standard deviation 0.0175. An exact
+256-game replay measured 130 solves/s on those initial weights and 297 solves/s
+on the intended warm snapshot. A later corrected trainer probe produced
+healthy target spread and 156 solves/s end to end. The benchmark still cannot
+be the stop condition, but "nearly every subgame hit 200,000 nodes" was never a
+measurement.
 
 **Concurrency is bounded by host memory, not by the live set.** Worker count
 used to be fixed at one per core, which is wrong for threads that spend 66-84%
@@ -56,22 +71,23 @@ it 70 -> 320 moved the benchmark from 439 to 573. But a 30-minute attempt at
 holding a hundred-thousand-node tree, exhausts 125 GiB. Pick the worker count
 from measured resident memory per slot, not from the core count.
 
-**Early training produces subgames the service cannot hold at all** — 130k
-nodes, 280M strategy cells, 7 GiB of arena for one solve. A refusal used to
-panic the worker and take the run down; the generation loop now abandons that
-game instead and counts it (`Data::dropped`). Two games in a thousand, at this
-stage of training. It is a real bias toward easy positions and the honest fix
-— solving those on the CPU — has not been written.
+**The stale initial-weight workload produced subgames the service could not
+hold at all** — examples reached 130k nodes and 280M dense strategy cells. A
+refusal used to panic the worker and take the run down; the generation loop now
+abandons that game and counts it (`Data::dropped`). About two games in a
+thousand were observed in this workload. That remains an unacceptable bias and
+must become an exact oversize route, but it is not evidence about the true
+node-cap frequency or the intended warm-checkpoint distribution.
 
 ## State of the project at this point
 
-The goal is not met: 164 solves/s sustained against a target of 1,200. What is
-done is that the run no longer crashes, which it always did before, so the
-measurement is now possible at all. `docs/GPU_PERF_GOAL.md` carries the numbers
-and what is known about where the remaining time goes: both cards report 99%
-utilisation while the service's resident live set averages 45 solves against
-the 256+ its own micro-benchmark holds, so the cards are busy without being
-productive, and the tick's grids shrink with the live set.
+The goal was not met. The reported 164 solves/s covered generation through the
+batch return, not the current training pass or the remaining replay/result
+work, and the batch used the wrong weights. It is retained as a stale-network
+capacity measurement, not the golden baseline. The useful state at this point
+was that the service no longer crashed and its high-utilisation/small-grid
+profile could finally be measured. `docs/GPU_PERF_GOAL.md` now carries the
+corrected baseline and `docs/GPU_ARCHITECTURE.md` the proposed replacement.
 
 This run's snapshots are here for provenance only. Thirteen minutes of ReBeL
 from a fresh network teaches nothing about strength, and no ladder was run.

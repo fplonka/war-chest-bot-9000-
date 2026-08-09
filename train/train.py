@@ -231,9 +231,7 @@ def make_batch(parts, rng, device, augment):
     players swapped, unit ids exchanged) and the config side is one bit: a
     config carries the seat it belongs to as a feature, and `seg` is
     `2 * row + seat`. The network input is then expanded from the (possibly
-    mirrored) rows by the Rust encoder, and the config dedup key includes the
-    post-mirror unit ids: the same counts in different drafts are different
-    holdings.
+    mirrored) rows by the Rust encoder.
     """
     rows, cc, cp, cw, cy, seg = parts
     n = len(rows)
@@ -252,16 +250,20 @@ def make_batch(parts, rng, device, augment):
     x = expand_batch(rows, hand, fd, bag)
     unit_ids = rows[:, ROW_IDS:ROW_IDS + NTYPE]
     ay = rows[:, ROW_AUX:ROW_AUX + 2 * AUX].view(np.float16).reshape(-1, AUX).astype(np.float32)
-    # Distinct configs only. The key is the row's unit ids (post-mirror) in
-    # player/slot order, the seat, and the 15 counts — two drafts with the
-    # same counts are different holdings, so the ids are part of the key.
-    ids_flat = unit_ids[seg // 2]
-    key = np.concatenate([ids_flat, cp[:, None], cc], 1)
-    uniq, inv = np.unique(key, axis=0, return_inverse=True)
-    first = np.zeros(len(uniq), np.int64)
-    first[inv[::-1]] = np.arange(len(inv))[::-1]
-    phi = np.concatenate([cc[first].astype(np.float32) / CNORM,
-                          cp[first, None].astype(np.float32)], 1)
+    # Every config gets its own holding-tower row, duplicates included.
+    #
+    # This used to deduplicate: the key was the row's unit ids (post-mirror),
+    # the seat and the 15 counts, and `inv` mapped each config back to its
+    # representative. It removed about 32% of config rows and cost more than it
+    # saved. `np.unique` over that key was ~105 ms of the ~173 ms step, on the
+    # same cores the generation workers want; computing the tower for every row
+    # instead took the whole step to ~72 ms, and 228 -> 101 ms with 320 workers
+    # running. The result is unchanged, not approximated: with `inv` the
+    # identity, `crow` in `Mlp.forward` collapses to `seg // 2` and the two
+    # gathers become no-ops, so the tower sees exactly the inputs it saw before.
+    phi = np.concatenate([cc.astype(np.float32) / CNORM,
+                          cp[:, None].astype(np.float32)], 1)
+    inv = np.arange(len(cc), dtype=np.int64)
     t = lambda a, d=torch.float32: torch.as_tensor(a, dtype=d, device=device)
     return (t(x), t(unit_ids, torch.long), t(phi), t(inv, torch.long), t(cw),
             t(seg, torch.long), t(cy), 2 * len(rows), t(ay))
@@ -633,6 +635,14 @@ def main():
             # The warm-started network is snapshot 0: where the ReBeL phase
             # started, and the zero point the Elo curve is read against.
             snapshot("init", el)
+            # The solve services were started before warm training. Publish
+            # the warm-started weights before the first ReBeL batch; otherwise
+            # that whole batch runs on the freshly initialised network and the
+            # first upload does not happen until after it returns.
+            if args.gpu:
+                flat = value.flat()
+                for i in range(len(gpu_devices)):
+                    warchest.gpu_set_weights(value.dims, *flat, device=i)
             next_snap = el + args.snapshot_every * 60.0
             # Drop the warm-phase data. Its job was to initialise the *network*,
             # not to serve as bootstrap targets: it comes from a different
@@ -786,7 +796,8 @@ def main():
                "loss_policy": round(lp, 4),
                "rows": len(rows), "solves": solves,
                "loss_old": round(loss_old, 5), "loss_new": round(loss_new, 5),
-               "cap_frac": round(d["cap_hits"] / max(d["games"], 1), 3),
+               "horizon_frac": round(d["horizon_hits"] / max(d["games"], 1), 3),
+               "node_caps": int(d["node_caps"]), "dropped": int(d["dropped"]),
                "configs": round(d["configs"] / dec, 1), "cap_value": round(cap_v, 4),
                "steps": steps,
                "tgt_mean": round(tgt_mean, 4), "tgt_std": round(tgt_std, 4),
@@ -801,7 +812,8 @@ def main():
         # multi-second epoch.
         write_log(args, log, snaps)
         print(f"[t={rec['t']:6.1f}s] {phase:6s} ep{epoch:3d} games={rec['games']:4d} "
-              f"dec={dec:6d} rows={len(rows):6d} cap={rec['cap_frac']:.2f} "
+              f"dec={dec:6d} rows={len(rows):6d} horizon={rec['horizon_frac']:.2f} "
+              f"nodecap={rec['node_caps']} drop={rec['dropped']} "
               f"cfgs={rec['configs']:5.1f} L={lv:.5f} P={lp:.3f} old={loss_old:.5f} new={loss_new:.5f} "
               f"tgt={tgt_mean:+.3f}/{tgt_std:.3f} pstd={probe_std:.3f} "
               f"capv={cap_v:.3f} lr={rec['lr']:.1e} gen={gen_s:.1f}s train={train_s:.1f}s "

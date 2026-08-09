@@ -78,7 +78,9 @@ utility = CAP_MARKER_VALUE · Δmarkers    (horizon reached)
 ```
 
 Zero-sum and strictly inside ±1. The coefficient is annealed to zero over a run;
-the per-epoch `cap` column reports the fraction of games reaching the horizon.
+the per-epoch `horizon` column reports the fraction of games reaching it.
+Historical logs called this column `cap`; it never measured the search-tree
+node cap.
 
 ## 3. Search
 

@@ -277,7 +277,7 @@ pub struct Data {
     /// themselves live in the row).
     round: Vec<u16>,
     /// Games abandoned because the solve service refused their subgame. Zero
-    /// in every healthy run; a rising count means the caps need looking at.
+    /// in every healthy run; GPU capacity is not an algorithmic game filter.
     pub dropped: usize,
 
     // ------------------------------------------------------- policy targets
@@ -315,7 +315,12 @@ pub struct Data {
     pub decisions: usize,
     pub wins: [usize; 2],
     pub draws: usize,
+    /// Completed games that reached `MAX_MAIN_PLAYS`. This is the game horizon,
+    /// not the solver's tree-node cap.
     pub cap_hits: usize,
+    /// Attempted subgame builds that hit `Cfg::node_cap` and used the uniform
+    /// policy fallback instead of producing a solve.
+    pub node_caps: usize,
     pub configs: usize,
     /// Seconds workers spent blocked on the GPU (idle CPU), summed.
     pub gpu_wait_s: f32,
@@ -353,6 +358,7 @@ impl Data {
         self.draws += o.draws;
         self.gpu_wait_s += o.gpu_wait_s;
         self.cap_hits += o.cap_hits;
+        self.node_caps += o.node_caps;
         self.configs += o.configs;
     }
 
@@ -811,6 +817,7 @@ impl<'a> Game<'a> {
                             // never ends.
                             walk.take();
                             carried.clear();
+                            data.node_caps += 1;
                             fallback = Some(random_policy(s, ctx, player, &cfgs));
                         } else if gpu.is_some() {
                             // GPU path: package the tree as one job. The
@@ -1413,11 +1420,12 @@ pub fn run_games_gpu(
                                 game[k].as_mut().expect("pending game").resume(trip1)
                             }
                             // A subgame the service cannot hold is a real
-                            // position, but it is one in ten thousand and it
-                            // would otherwise take the whole run down with it.
-                            // Abandon that game -- its partial data is
-                            // discarded rather than merged, so the buffer never
-                            // sees a half-played game -- and start another.
+                            // position. The WIP service still abandons that
+                            // game instead of taking the process down; its
+                            // partial data is discarded rather than merged, so
+                            // the buffer never sees a half-played game. This is
+                            // counted as an error and must be zero in a valid
+                            // training run.
                             Err(e) => {
                                 out.dropped += 1;
                                 if out.dropped == 1 {

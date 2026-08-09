@@ -59,7 +59,7 @@ fn main() {
     let d = run_games(games, 12345, &nets, &gc);
     let secs = t0.elapsed().as_secs_f64();
     println!(
-        "games {} in {:.2}s -> {:.3} games/s | decisions {} -> {:.0} dec/s | samples {} -> {:.0} tgt/s | cfgs/dec {:.1} | cap {:.2}",
+        "games {} in {:.2}s -> {:.3} games/s | decisions {} -> {:.0} dec/s | samples {} -> {:.0} tgt/s | cfgs/dec {:.1} | horizon {:.2} | node-caps {} | dropped {}",
         d.games,
         secs,
         d.games as f64 / secs,
@@ -69,6 +69,8 @@ fn main() {
         d.nv as f64 / secs,
         d.configs as f64 / d.decisions.max(1) as f64,
         d.cap_hits as f64 / d.games.max(1) as f64,
+        d.node_caps,
+        d.dropped,
     );
     warchest::prof::dump_shape();
     warchest::prof::dump();

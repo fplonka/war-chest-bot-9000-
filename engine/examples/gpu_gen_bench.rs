@@ -1,6 +1,6 @@
-//! The end-to-end generation benchmark: real games, real tree builds, the
-//! real worker loop, against the GPU service — the number that decides when
-//! performance work stops (the handoff's stop condition).
+//! The end-to-end generation benchmark: real games, real tree builds, and the
+//! real worker loop against the GPU service. It is a controlled diagnostic;
+//! only balanced throughput in `train.py` satisfies the production target.
 //!
 //! By default weights are all-zero, so every leaf value is zero, CFR stays
 //! uniform, and the CPU and GPU builds play the *same* seeded games (zeros
@@ -10,6 +10,9 @@
 //! trained policy distribution. That mode is intended to be used with
 //! `GPU_ONLY=1`: ordinary floating-point differences can change later moves,
 //! so a same-seed CPU game is no longer a useful exact oracle.
+//! `GPU_SEED` and `GPU_CAP_VALUE` override the seed and horizon payoff, so a
+//! trainer epoch can be replayed instead of silently measuring a different
+//! game distribution.
 //!
 //! Prints, for the GPU path and a same-seeds CPU reference: games/s,
 //! solves/s, training rows/s, and the workers' summed GPU-wait share. The
@@ -29,6 +32,15 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     let arg = |i: usize, d: usize| a.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);
     let (games, iters, depth) = (arg(1, 64), arg(2, 64), arg(3, 2));
+    let seed = std::env::var("GPU_SEED")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0xBE9C);
+    let cap_value = std::env::var("GPU_CAP_VALUE")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(warchest::state::CAP_MARKER_VALUE_DEFAULT);
+    warchest::state::set_cap_marker_value(cap_value);
 
     let weight_path = std::env::var("GPU_WEIGHTS").ok();
     let (dims, w, b, ln) = if let Some(path) = weight_path.as_deref() {
@@ -54,6 +66,7 @@ fn main() {
         weight_path.as_deref().unwrap_or("all-zero"),
         dims
     );
+    println!("game          seed {seed} cap-value {cap_value}");
     let nets = [Nets {
         value: Mlp::from_flat(&dims, &w, &b, &ln).expect("weights"),
     }];
@@ -94,7 +107,7 @@ fn main() {
         .collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let t0 = Instant::now();
-    let d = run_games_gpu(games, 0xBE9C, &nets, &gc, &gpus, &|_| {
+    let d = run_games_gpu(games, seed, &nets, &gc, &gpus, &|_| {
         next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     });
     let el = t0.elapsed().as_secs_f64();
@@ -125,8 +138,8 @@ fn main() {
         per
     );
     println!(
-        "tallies       solves {} decisions {} wins {:?} draws {} caps {}",
-        solves, d.decisions, d.wins, d.draws, d.cap_hits
+        "tallies       solves {} decisions {} wins {:?} draws {} horizon {} node-caps {} dropped {}",
+        solves, d.decisions, d.wins, d.draws, d.cap_hits, d.node_caps, d.dropped
     );
     warchest::prof::dump_shape();
     warchest::prof::dump_gpu();
@@ -139,7 +152,7 @@ fn main() {
     }
 
     let t0 = Instant::now();
-    let c = run_games(games, 0xBE9C, &nets, &gc);
+    let c = run_games(games, seed, &nets, &gc);
     let el_cpu = t0.elapsed().as_secs_f64();
     let cpu_solves = c.soff.len();
     println!("== cpu path (same seeds) ==");
@@ -150,8 +163,8 @@ fn main() {
     println!("solves/s      {:.0}", cpu_solves as f64 / el_cpu);
     println!("decisions/s   {:.0}", c.decisions as f64 / el_cpu);
     println!(
-        "tallies       solves {} decisions {} wins {:?} draws {} caps {}",
-        cpu_solves, c.decisions, c.wins, c.draws, c.cap_hits
+        "tallies       solves {} decisions {} wins {:?} draws {} horizon {} node-caps {} dropped {}",
+        cpu_solves, c.decisions, c.wins, c.draws, c.cap_hits, c.node_caps, c.dropped
     );
     println!("== ratio ==   {:.1}x", el_cpu / el);
     if weight_path.is_none() && (d.decisions, d.wins, d.draws) != (c.decisions, c.wins, c.draws) {

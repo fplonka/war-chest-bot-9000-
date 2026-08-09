@@ -393,11 +393,27 @@ pub struct TNode {
     /// support untouched, so a subgame that copied these per node spent most of
     /// its build time duplicating lists nobody edits.
     pub cfgs: [Rc<[Config]>; 2],
-    /// `[config * na + action]`, for the acting player.
-    pub legal: Vec<bool>,
-    /// `[config * na + action]` -> the successor's config index in the child.
-    pub trans: Vec<i32>,
+    /// Legal actions for the acting player's configs, in CSR form. Config
+    /// `c` owns cells `legal_off[c]..legal_off[c + 1]`; actions within a row
+    /// retain the public action order.
+    pub legal_off: Vec<u32>,
+    pub legal_action: Vec<u32>,
+    /// The public child node and successor-config index for each legal cell.
+    /// `NO_TRANS` is explicit: legality and having an information-state
+    /// successor are different facts and must never be inferred from a signed
+    /// sentinel.
+    pub legal_child: Vec<u32>,
+    pub legal_trans: Vec<u32>,
+    /// Sparse action-major view used by the CPU oracle. It preserves the old
+    /// action-then-config FP32 accumulation order without restoring a dense
+    /// config-by-action table. `cell_row` is also the direct row map the wave
+    /// kernels need later.
+    pub action_off: Vec<u32>,
+    pub action_cell: Vec<u32>,
+    pub cell_row: Vec<u32>,
 }
+
+pub const NO_TRANS: u32 = u32::MAX;
 
 impl TNode {
     #[inline]
@@ -407,6 +423,11 @@ impl TNode {
     #[inline]
     pub fn nc(&self, p: usize) -> usize {
         self.cfgs[p].len()
+    }
+
+    #[inline]
+    pub fn legal_row(&self, c: usize) -> std::ops::Range<usize> {
+        self.legal_off[c] as usize..self.legal_off[c + 1] as usize
     }
 }
 
@@ -601,8 +622,10 @@ pub struct Solver<'a> {
     capped: bool,
     /// Working memory for the chance transitions, reused across the tree.
     draw_scratch: DrawScratch,
-    /// `key << IDX_BITS | cell` scratch for ordering a public child's support.
-    cell_order: Vec<u64>,
+    /// `(config key, legal cell)` scratch for ordering a public child's
+    /// support. Keeping the index separate removes the old 24-bit width
+    /// assertion; every valid wide job remains representable.
+    cell_order: Vec<(u64, u32)>,
 }
 
 impl Drop for Solver<'_> {
@@ -707,12 +730,13 @@ impl<'a> Solver<'a> {
         let _t = timed!(ALLOC);
         for i in 0..sv.nodes.len() {
             let n = &sv.nodes[i];
-            let (na, p) = (n.na(), n.player as usize);
+            let p = n.player as usize;
             let nc = n.nc(p);
             let (c0, c1) = (n.nc(0), n.nc(1));
             sv.nc.push([c0 as u32, c1 as u32]);
             sv.soff.push(sv.ncells as u32);
-            sv.ncells += nc * na;
+            let cells = n.legal_action.len();
+            sv.ncells += cells;
             if cfg.gpu_build {
                 // The device owns the arenas; the walk after trip 1 reads
                 // only the tree, the features and `soff`.
@@ -724,18 +748,17 @@ impl<'a> Solver<'a> {
             sv.vals.resize(sv.vals.len() + c0.max(c1), 0.0);
             sv.regret.resize(sv.ncells, 0.0);
             sv.inst.resize(sv.ncells, 0.0);
-            sv.sum_strat.push(vec![0.0; nc * na]);
+            sv.sum_strat.push(vec![0.0; cells]);
             // CFR starts from a uniform strategy over the legal actions, as in
             // the reference. No heuristic prior is injected here: the greedy
             // knowledge enters through the pretrained value network, which is
             // what CFR actually consumes.
-            let mut u = vec![0.0f32; nc * na];
+            let mut u = vec![0.0f32; cells];
             for c in 0..nc {
-                let k = (0..na).filter(|&a| n.legal[c * na + a]).count() as f32;
-                for a in 0..na {
-                    if n.legal[c * na + a] {
-                        u[c * na + a] = 1.0 / k;
-                    }
+                let row = n.legal_row(c);
+                let k = row.len() as f32;
+                for cell in row {
+                    u[cell] = 1.0 / k;
                 }
             }
             sv.cur.extend_from_slice(&u);
@@ -765,12 +788,12 @@ impl<'a> Solver<'a> {
                 if sv.nodes[i].leaf {
                     continue;
                 }
-                let (na, p) = (sv.nodes[i].na(), sv.nodes[i].player as usize);
+                let p = sv.nodes[i].player as usize;
                 let so = sv.soff[i] as usize;
                 for c in 0..sv.nodes[i].nc(p) {
                     let r = sv.reach_of(i, p)[c];
-                    for a in 0..na {
-                        sv.sum_strat[i][c * na + a] += r * sv.cur[so + c * na + a];
+                    for cell in sv.nodes[i].legal_row(c) {
+                        sv.sum_strat[i][cell] += r * sv.cur[so + cell];
                     }
                 }
             }
@@ -848,8 +871,13 @@ impl<'a> Solver<'a> {
             obs_act: Vec::new(),
             child: Vec::new(),
             cfgs: cfgs.clone(),
-            legal: Vec::new(),
-            trans: Vec::new(),
+            legal_off: Vec::new(),
+            legal_action: Vec::new(),
+            legal_child: Vec::new(),
+            legal_trans: Vec::new(),
+            action_off: Vec::new(),
+            action_cell: Vec::new(),
+            cell_row: Vec::new(),
         });
         drop(_tp);
         if self.cfg.node_cap > 0 && self.nodes.len() >= self.cfg.node_cap {
@@ -932,22 +960,30 @@ impl<'a> Solver<'a> {
         let na = acts.len();
         debug_assert!(na > 0, "a decision node must offer a reachable action");
 
-        assert!(
-            nc * na < 1 << IDX_BITS,
-            "decision node over the index width"
-        );
         // A Warrior Priest forced play may only spend the pending coin, so the
         // per-config mask is the pending match rather than the hand check.
         let wp_play = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
-        let mut legal = vec![false; nc * na];
+        let mut legal_off = Vec::with_capacity(nc + 1);
+        let mut legal_action = Vec::new();
+        let mut legal_child = Vec::new();
+        let mut legal_trans = Vec::new();
+        let mut cell_row = Vec::new();
+        legal_off.push(0);
         for (ci, c) in mine.iter().enumerate() {
             for a in 0..na {
-                legal[ci * na + a] = if wp_play {
+                let legal = if wp_play {
                     c.pending_coin == Some(aslot[a] as u8)
                 } else {
                     action_legal(c, aslot[a])
                 };
+                if legal {
+                    legal_action.push(a as u32);
+                    legal_child.push(0);
+                    legal_trans.push(NO_TRANS);
+                    cell_row.push(ci as u32);
+                }
             }
+            legal_off.push(legal_action.len() as u32);
         }
 
         // Group private actions by what the opponent actually observes.
@@ -980,6 +1016,28 @@ impl<'a> Solver<'a> {
             fill[ch] += 1;
         }
 
+        // Patch each legal cell to its observation-local child and build a
+        // sparse action-major view. The primary representation remains
+        // config-major CSR; this second ordering preserves the CPU oracle's
+        // action-then-config FP32 accumulation order.
+        for (cell, &au) in legal_action.iter().enumerate() {
+            legal_child[cell] = obs_child[au as usize] as u32;
+        }
+        let mut action_off = vec![0u32; na + 1];
+        for &a in &legal_action {
+            action_off[a as usize + 1] += 1;
+        }
+        for a in 0..na {
+            action_off[a + 1] += action_off[a];
+        }
+        let mut action_fill = action_off.clone();
+        let mut action_cell = vec![0u32; legal_action.len()];
+        for (cell, &a) in legal_action.iter().enumerate() {
+            let at = &mut action_fill[a as usize];
+            action_cell[*at as usize] = cell as u32;
+            *at += 1;
+        }
+
         // Config support of each public child — the union over the private
         // actions that produce that observation — and, in the same pass, where
         // each (config, action) cell lands in it.
@@ -989,32 +1047,34 @@ impl<'a> Solver<'a> {
         // the obvious version sorts `Config`s and then binary-searches one per
         // cell, which at ~800 cells per decision node is most of the build.
         let mut child_cfgs: Vec<Vec<Config>> = vec![Vec::new(); nch];
-        let mut trans = vec![-1i32; nc * na];
         let mut ent = std::mem::take(&mut self.cell_order);
         for ch in 0..nch {
             ent.clear();
             for &au in &obs_act[obs_start[ch] as usize..obs_start[ch + 1] as usize] {
                 let a = au as usize;
-                for ci in 0..nc {
-                    if !legal[ci * na + a] {
+                for &cell_u in &action_cell[action_off[a] as usize..action_off[a + 1] as usize] {
+                    let cell = cell_u as usize;
+                    if legal_child[cell] as usize != ch {
                         continue;
                     }
+                    let ci = cell_row[cell] as usize;
                     if let Some(n) = advance_config(&mine[ci], aslot[a], fdown[a]) {
-                        ent.push((n.key() << IDX_BITS) | (ci * na + a) as u64);
+                        ent.push((n.key(), cell_u));
                     }
                 }
             }
-            ent.sort_unstable();
+            ent.sort_unstable_by_key(|&(key, cell)| (key, cell));
             let sup = &mut child_cfgs[ch];
             let mut prev = u64::MAX;
-            for &packed in ent.iter() {
-                let (k, cell) = (packed >> IDX_BITS, (packed & IDX_MASK) as usize);
+            for &(k, cell_u) in ent.iter() {
+                let cell = cell_u as usize;
                 if k != prev {
                     prev = k;
-                    let (ci, a) = (cell / na, cell % na);
+                    let ci = cell_row[cell] as usize;
+                    let a = legal_action[cell] as usize;
                     sup.push(advance_config(&mine[ci], aslot[a], fdown[a]).unwrap());
                 }
-                trans[cell] = (sup.len() - 1) as i32;
+                legal_trans[cell] = (sup.len() - 1) as u32;
             }
         }
         self.cell_order = ent;
@@ -1062,8 +1122,16 @@ impl<'a> Solver<'a> {
         n.obs_start = obs_start;
         n.obs_act = obs_act;
         n.child = child;
-        n.legal = legal;
-        n.trans = trans;
+        for c in &mut legal_child {
+            *c = n.child[*c as usize] as u32;
+        }
+        n.legal_off = legal_off;
+        n.legal_action = legal_action;
+        n.legal_child = legal_child;
+        n.legal_trans = legal_trans;
+        n.action_off = action_off;
+        n.action_cell = action_cell;
+        n.cell_row = cell_row;
         id
     }
 
@@ -1098,7 +1166,7 @@ impl<'a> Solver<'a> {
             if n.leaf {
                 continue;
             }
-            let (na, me) = (n.na(), n.player as usize);
+            let me = n.player as usize;
             let op = 1 - me;
             // Offsets of each player's block inside a node's reach region.
             let blk = |cnt: [u32; 2], p: usize| -> (usize, usize) {
@@ -1148,15 +1216,17 @@ impl<'a> Solver<'a> {
                 let (s0, s1) = (n.obs_start[ch] as usize, n.obs_start[ch + 1] as usize);
                 for &au in &n.obs_act[s0..s1] {
                     let a = au as usize;
-                    for ci in 0..nme {
-                        if !n.legal[ci * na + a] {
+                    for &cell_u in
+                        &n.action_cell[n.action_off[a] as usize..n.action_off[a + 1] as usize]
+                    {
+                        let cell = cell_u as usize;
+                        debug_assert_eq!(n.legal_child[cell] as usize, c);
+                        let t = n.legal_trans[cell];
+                        if t == NO_TRANS {
                             continue;
                         }
-                        let t = n.trans[ci * na + a];
-                        if t < 0 {
-                            continue;
-                        }
-                        dst[cme + t as usize] += src[pme + ci] * cur[ci * na + a];
+                        let ci = n.cell_row[cell] as usize;
+                        dst[cme + t as usize] += src[pme + ci] * cur[cell];
                     }
                 }
             }
