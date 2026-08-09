@@ -79,7 +79,7 @@ fn dispatcher(
             .spawn(move || match Executor::new(device, ldims, lw, lb, lln) {
                 Ok(exec) => {
                     let _ = lane_ready.send(Ok(()));
-                    run(lane_rx, exec, global, local_run);
+                    run(device, lane, lane_rx, exec, global, local_run);
                 }
                 Err(e) => {
                     let _ = lane_ready.send(Err(e));
@@ -238,6 +238,8 @@ fn dispatcher(
 }
 
 fn run(
+    device: usize,
+    lane: usize,
     rx: mpsc::Receiver<Cmd>,
     mut exec: Executor,
     queued_work: Arc<AtomicU64>,
@@ -246,6 +248,7 @@ fn run(
     let row_target = env_usize("WARCHEST_WAVE_ROWS", 48 * 1024).max(1);
     let max_jobs = env_usize("WARCHEST_WAVE_JOBS", 64).clamp(1, 256);
     let latency = Duration::from_micros(env_usize("WARCHEST_WAVE_US", 800) as u64);
+    let profile = std::env::var_os("WARCHEST_GPU_PROFILE").is_some();
     let mut current_version = 0u64;
     let mut pending = VecDeque::new();
     let mut shutdown = false;
@@ -314,6 +317,36 @@ fn run(
         }
         let version = batch[0].version;
         let count = batch.len();
+        let profile_shape = profile.then(|| {
+            let cells = batch.iter().map(|p| p.work.legal_cells).sum::<usize>();
+            let reach = batch.iter().map(|p| p.work.reach_slots).sum::<usize>();
+            let reverse = batch.iter().map(|p| p.work.reverse_nonzeros).sum::<usize>();
+            let table_bytes = batch.iter().map(|p| p.work.table_bytes).sum::<usize>();
+            let mutable_bytes = batch.iter().map(|p| p.work.mutable_bytes).sum::<usize>();
+            let max_bytes = batch
+                .iter()
+                .map(|p| {
+                    p.work
+                        .table_bytes
+                        .saturating_add(p.work.mutable_bytes)
+                        .saturating_add(p.work.carried_output_bytes)
+                })
+                .max()
+                .unwrap_or(0);
+            let oldest_ms = batch
+                .iter()
+                .map(|p| p.queued.elapsed().as_secs_f64() * 1e3)
+                .fold(0.0f64, f64::max);
+            (
+                cells,
+                reach,
+                reverse,
+                table_bytes,
+                mutable_bytes,
+                max_bytes,
+                oldest_ms,
+            )
+        });
         let mut jobs = Vec::with_capacity(count);
         let mut tickets = Vec::with_capacity(count);
         for p in batch {
@@ -324,9 +357,14 @@ fn run(
         let packed = Wave::pack(&jobs);
         let packed_at = Instant::now();
         let result = packed.and_then(|wave| exec.solve(wave, version));
-        if std::env::var_os("WARCHEST_GPU_PROFILE").is_some() {
+        if let Some((cells, reach, reverse, table_bytes, mutable_bytes, max_bytes, oldest_ms)) =
+            profile_shape
+        {
             eprintln!(
-                "v5_service jobs={count} pack_ms={:.2} solve_ms={:.2}",
+                "v5_service device={device} lane={lane} class={class} jobs={count} rows={rows} cells={cells} reach={reach} reverse={reverse} table_mib={:.1} mutable_mib={:.1} max_job_mib={:.1} oldest_ms={oldest_ms:.2} pack_ms={:.2} solve_ms={:.2}",
+                table_bytes as f64 / 1048576.0,
+                mutable_bytes as f64 / 1048576.0,
+                max_bytes as f64 / 1048576.0,
                 1e3 * (packed_at - pack_started).as_secs_f64(),
                 1e3 * packed_at.elapsed().as_secs_f64(),
             );
