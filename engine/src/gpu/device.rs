@@ -405,20 +405,6 @@ impl Executor {
         Ok(())
     }
 
-    /// Release this lane's wave-sized allocations and graph executables while
-    /// retaining the CUDA context, kernels, cuBLAS handle, and immutable weight
-    /// banks. An exclusive wave trims only the lane that will execute it; the
-    /// other lanes keep making progress and retain their ordinary buffers.
-    pub fn trim(&mut self) -> Result<(), String> {
-        self.stream
-            .synchronize()
-            .map_err(|e| format!("synchronize before GPU trim: {e:?}"))?;
-        self.buffers = None;
-        self.graphs.clear();
-        self.next_graph = 0;
-        Ok(())
-    }
-
     /// Retire immutable banks once this lane has no queued wave stamped with
     /// their version. Lane command order proves that no unseen older submit can
     /// arrive after the publication that introduced a newer version.
@@ -1235,16 +1221,33 @@ impl DeviceWave {
         let jobs = job_devices(w)?;
         let (toff, table_len) = table_layout(w, &jobs)?;
         let (aoff, arena_len) = arena_layout(w, l)?;
+        // Before a multi-GiB growth, drop both old allocations so neither is
+        // live while the other grows. Once a lane has paid for a whale-sized
+        // pair, retain it for later waves instead of reallocating every whale.
+        let table_need = table_len.max(1);
+        let arena_need = arena_len.max(1);
+        let reservation = table_need
+            .checked_next_power_of_two()
+            .unwrap_or(table_need)
+            .saturating_add(
+                arena_need
+                    .checked_next_power_of_two()
+                    .unwrap_or(arena_need)
+                    .saturating_mul(size_of::<f32>()),
+            );
+        let reuse = reuse.filter(|x| {
+            reservation < (4usize << 30)
+                || (x.tables.len() >= table_need && x.arena.len() >= arena_need)
+        });
         let (tables, arena, dev) = match reuse {
             Some(x) => (Some(x.tables), Some(x.arena), Some(x.dev)),
             None => (None, None, None),
         };
-        let mut tables = grow_buffer(stream, tables, table_len.max(1), "wave tables")?;
+        let mut tables = grow_buffer(stream, tables, table_need, "wave tables")?;
         let table_blob = pack_tables(w, &jobs, &toff, table_len)?;
         stream
             .memcpy_htod(&table_blob, &mut tables.slice_mut(..table_len))
             .map_err(|e| format!("wave table H2D: {e:?}"))?;
-        let arena_need = arena_len.max(1);
         let mut arena = grow_buffer(stream, arena, arena_need, "wave arena")?;
         stream
             .memset_zeros(&mut arena.slice_mut(..arena_need))

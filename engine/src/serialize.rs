@@ -181,9 +181,9 @@ pub struct WorkVector {
 }
 
 impl WorkVector {
-    /// Jobs in this tail cannot safely share a card with the ordinary reusable
-    /// lanes. `mutable_bytes` includes allocator power-of-two rounding, so this
-    /// tests the reservation CUDA will actually attempt.
+    /// Jobs in this tail need an isolated one-job lane wave. `mutable_bytes`
+    /// includes allocator power-of-two rounding, so this tests the reservation
+    /// CUDA will actually attempt.
     pub fn requires_exclusive_route(self) -> bool {
         let table_reservation = self
             .table_bytes

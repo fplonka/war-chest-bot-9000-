@@ -302,12 +302,7 @@ fn run(
         let pack_started = Instant::now();
         let packed = Wave::pack(&jobs);
         let packed_at = Instant::now();
-        let result = if tickets[0].3 {
-            exec.trim()
-                .and_then(|()| packed.and_then(|wave| exec.solve(wave, version)))
-        } else {
-            packed.and_then(|wave| exec.solve(wave, version))
-        };
+        let result = packed.and_then(|wave| exec.solve(wave, version));
         if let Some((cells, reach, reverse, table_bytes, mutable_bytes, max_bytes, oldest_ms)) =
             profile_shape
         {
@@ -418,7 +413,7 @@ fn bucket_rows(pending: &VecDeque<Pending>) -> usize {
 
 /// Coarse physical capacity classes keep a whale from setting every common
 /// wave's shape without splitting an ordinary production tape into tiny
-/// power-of-two batches. Class 31 is exclusive.
+/// power-of-two batches. Class 31 is isolated to one job and one lane.
 fn cost_class(w: WorkVector) -> u8 {
     let bytes = w
         .table_bytes
