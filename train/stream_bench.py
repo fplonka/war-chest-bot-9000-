@@ -38,7 +38,7 @@ def main():
     ap.add_argument("--devices", default="0,1")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--workers", type=int, default=36)
-    ap.add_argument("--actors", type=int, default=64,
+    ap.add_argument("--actors", type=int, default=128,
                     help="live game actors per worker")
     ap.add_argument("--chunk", type=int, default=1024,
                     help="completed solves per Python result chunk")

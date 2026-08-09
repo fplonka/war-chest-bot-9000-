@@ -571,7 +571,7 @@ def main():
                     help="comma-separated CUDA devices for the solve services")
     ap.add_argument("--gpu-workers", type=int, default=36,
                     help="CPU builder threads in the continuous GPU pipeline")
-    ap.add_argument("--gpu-actors", type=int, default=96,
+    ap.add_argument("--gpu-actors", type=int, default=128,
                     help="live game actors per GPU builder thread")
     ap.add_argument("--gpu-chunk", type=int, default=1024,
                     help="fresh solves per replay chunk delivered to Python")

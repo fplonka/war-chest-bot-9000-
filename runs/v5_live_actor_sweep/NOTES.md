@@ -1,0 +1,7 @@
+# Live actor-count sweep
+
+We were looking for stable generation margin before spending another balanced training run. Each diagnostic used the published warm checkpoint, 36 CPU builders, both RTX 3090s, direct three-lane waves, random drafts, depth 2, and 64 linear-CFR iterations. Only the number of lightweight live games per builder changed; no optimizer ran.
+
+Concurrency was not monotone, but 128 actors per builder was clearly the useful regime. Sixteen actors per builder completed 16,384 solves in 30.04 seconds (545.4/s) and reached ten large-job routes and 14 true node-cap events. Sixty-four completed 29,696 in 30.03 seconds (988.8/s), with one large-job route. At 128, the service completed 45,056 in 30.11 seconds (1,496.4/s), then counted 49,728 over the full 36.58-second drain (1,359.6/s), with one large-job route, no exact fallback, no node-cap event, and no drop. The earlier 96-actor live diagnostic had reached about 1,294/s before stop.
+
+The lower-concurrency cohorts advanced into broad late positions together and stopped supplying enough compatible work to both cards. The 4,608-game pool at 128 actors kept a wider mix of ready positions and cleared the architecture's live generation-only 1,400/s gate with bounded memory. At this point the production trainer still defaulted to 96 actors; the next integrated measurement should use 128 and determine how much of the 1,496/s margin survives replay and optimizer work.
