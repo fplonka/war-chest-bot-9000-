@@ -184,23 +184,25 @@ fn dispatcher(
                     }
                     continue;
                 }
-                // Keep compatible cost classes together until a lane forms a
-                // wave. Routing every submission to the momentarily lightest
-                // lane split the live tail three ways: measured class-2/3
-                // waves averaged only 5.5/1.5 jobs even though the card had
-                // enough same-class work for useful contiguous GEMMs. The
-                // production three-lane layout gives the two common classes
-                // their own queues and keeps the two sparse tail classes on
-                // the remaining lane. One- and two-lane diagnostic layouts
-                // collapse the same mapping without changing admission.
-                let lane = match senders.len() {
-                    0 | 1 => 0,
-                    2 => usize::from(cost_class(work) != 0),
-                    _ => match cost_class(work) {
-                        0 => 0,
-                        1 => 1,
-                        _ => 2,
-                    },
+                // Keep the sparse tail together until a lane forms a useful
+                // wave. Class 0 dominates the opening and class 1 can dominate
+                // the middle, so both must retain least-work routing across
+                // every lane. A static lane per common class cut the measured
+                // 30-second opening from 1,534 to 851 solves/s. Classes 2+
+                // were only about 5% of completed jobs but occupied roughly
+                // 40% of lane time, and their waves averaged 5.5/1.5 jobs
+                // after being split three ways, so only that sparse tail gets
+                // an affinity lane.
+                let class = cost_class(work);
+                let lane = if senders.len() > 1 && class >= 2 {
+                    senders.len() - 1
+                } else {
+                    lane_work
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, x)| x.load(Ordering::Relaxed))
+                        .map(|(i, _)| i)
+                        .unwrap_or(0)
                 };
                 lane_work[lane].fetch_add(cost, Ordering::Relaxed);
                 let cmd = Cmd::Submit {
