@@ -63,14 +63,28 @@ fn main() {
     report_tape(&jobs, capped, build_s);
     let jobs: Vec<_> = jobs.into_iter().map(PreparedJob::new).collect();
 
-    let gpu = warchest::gpu::service::spawn(0, dims, w, b, ln).expect("GPU executor");
+    let devices: Vec<usize> = std::env::var("WARCHEST_TAPE_DEVICES")
+        .unwrap_or_else(|_| "0".into())
+        .split(',')
+        .map(|x| x.trim().parse().expect("CUDA device"))
+        .collect();
+    assert!(!devices.is_empty(), "WARCHEST_TAPE_DEVICES is empty");
+    let gpus: Vec<_> = devices
+        .iter()
+        .map(|&device| {
+            warchest::gpu::service::spawn(device, dims.clone(), w.clone(), b.clone(), ln.clone())
+                .expect("GPU executor")
+        })
+        .collect();
     // Warm up cuBLAS, NVRTC, graph creation, and the allocator outside the
     // tape timer.  The real trainer creates its services before the ReBeL
     // clock starts as well.
-    gpu.submit_prepared(jobs[0].clone())
-        .expect("warm submit")
-        .wait()
-        .expect("warm solve");
+    for (device, gpu) in gpus.iter().enumerate() {
+        gpu.submit_prepared(jobs[device % jobs.len()].clone())
+            .expect("warm submit")
+            .wait()
+            .expect("warm solve");
+    }
 
     let queue = std::env::var("WARCHEST_TAPE_QUEUE")
         .ok()
@@ -88,7 +102,7 @@ fn main() {
     let (completed, elapsed) = std::thread::scope(|scope| {
         let mut threads = Vec::with_capacity(producers);
         for producer in 0..producers {
-            let gpu = gpu.clone();
+            let gpus = &gpus;
             let jobs = &jobs;
             let barrier = barrier.clone();
             threads.push(scope.spawn(move || {
@@ -98,6 +112,10 @@ fn main() {
                 barrier.wait();
                 let start = Instant::now();
                 while pending.len() < producer_queue {
+                    let gpu = gpus
+                        .iter()
+                        .min_by_key(|gpu| gpu.queued_work())
+                        .expect("GPU service");
                     let h = gpu
                         .submit_prepared(jobs[submitted % jobs.len()].clone())
                         .expect("submit");
@@ -107,6 +125,10 @@ fn main() {
                 while start.elapsed() < deadline {
                     pending.pop_front().expect("pending").wait().expect("solve");
                     completed += 1;
+                    let gpu = gpus
+                        .iter()
+                        .min_by_key(|gpu| gpu.queued_work())
+                        .expect("GPU service");
                     let h = gpu
                         .submit_prepared(jobs[submitted % jobs.len()].clone())
                         .expect("submit");
@@ -127,8 +149,9 @@ fn main() {
             .fold((0usize, 0.0f64), |(cn, et), (c, e)| (cn + c, et.max(e)))
     });
     println!(
-        "completed={completed} elapsed_s={elapsed:.3} solves_per_s={:.1} queue={queue} producers={producers}",
-        completed as f64 / elapsed
+        "completed={completed} elapsed_s={elapsed:.3} solves_per_s={:.1} devices={} queue={queue} producers={producers}",
+        completed as f64 / elapsed,
+        devices.len(),
     );
 }
 

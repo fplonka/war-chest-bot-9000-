@@ -1009,12 +1009,26 @@ fn update_graph(
     graph: sys::CUgraph,
 ) -> Result<(usize, bool), String> {
     for (at, exec) in slots.iter().enumerate() {
-        let mut info = MaybeUninit::<sys::CUgraphExecUpdateResultInfo>::uninit();
+        let mut info = MaybeUninit::<sys::CUgraphExecUpdateResultInfo>::zeroed();
         let call = unsafe { sys::cuGraphExecUpdate_v2(exec.raw, graph, info.as_mut_ptr()) };
-        if call.result().is_ok()
-            && unsafe { info.assume_init() }.result
-                == sys::CUgraphExecUpdateResult_enum::CU_GRAPH_EXEC_UPDATE_SUCCESS
-        {
+        let status = call.result();
+        let info = unsafe { info.assume_init() };
+        if let Err(error) = status {
+            if std::env::var_os("WARCHEST_GRAPH_PROFILE").is_some() {
+                eprintln!(
+                    "v5_graph_update slot={at} call=Err({error:?}) result={:?}",
+                    info.result
+                );
+            }
+            continue;
+        }
+        if std::env::var_os("WARCHEST_GRAPH_PROFILE").is_some() {
+            eprintln!(
+                "v5_graph_update slot={at} call={status:?} result={:?}",
+                info.result
+            );
+        }
+        if info.result == sys::CUgraphExecUpdateResult_enum::CU_GRAPH_EXEC_UPDATE_SUCCESS {
             return Ok((at, true));
         }
     }

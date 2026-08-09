@@ -696,6 +696,10 @@ Gate: generation-only production tape and live self-play both exceed 1,400/s
 with stable memory. The margin is intentional; training and tails still need
 room.
 
+Current measurement on 2026-08-09: the deterministic tape reaches 1,302.3
+solves/s across both RTX 3090s. Scaling from one card is essentially linear;
+the remaining gap is per-card execution rather than static routing imbalance.
+
 ### 4. Replace the trainer boundary
 
 - device replay ring and CUDA batch operator;

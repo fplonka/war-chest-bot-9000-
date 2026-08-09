@@ -585,12 +585,22 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
         return;
     }
     const float* ur = AP(w, A_U) + (unsigned long long)q.row * RK;
+    float u[RK_CH];
+    #pragma unroll
+    for (int k = 0; k < RK_CH; k++) {
+        int j = (k << 5) + lane;
+        u[k] = j < RK ? ur[j] : 0.0f;
+    }
     unsigned int c0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + player];
     for (int c = 0; c < n; c++) {
         unsigned int cfg = TP(w, unsigned int, T_ROW_CFG)[c0 + c];
         const float* g = AP(w, A_G) + (unsigned long long)cfg * (RK + 1);
         float part = 0.0f;
-        for (int j = lane; j < RK; j += 32) part += ur[j] * g[j];
+        #pragma unroll
+        for (int k = 0; k < RK_CH; k++) {
+            int j = (k << 5) + lane;
+            if (j < RK) part += u[k] * g[j];
+        }
         part = warp_sum(part);
         if (lane == 0) out[c] = (part + g[RK]) * orc;
     }
