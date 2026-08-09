@@ -1,12 +1,13 @@
 # Architecture for 1,200--2,000 ReBeL solves/s
 
-Status: implementation in progress. The v5 deterministic production tape now
-reaches 717.1 solves/s on one RTX 3090 and 1,438.9 solves/s on two. The tape
-throughput gates are cleared. A 30-second live-stream diagnostic with 3,456
-actors reached 1,294.5 completed solves/s before stop, including two exact whale
-routes and no drops; its current stop/drain accounting reduced the full 41.1 s
-interval to 946.1/s. The balanced trainer, five-minute deadline, and golden-run
-gates have not been achieved yet.
+Status: implementation in progress. The v5 milestone build reached 717.1
+solves/s on one RTX 3090 and 1,438.9/s on two on the frozen production tape.
+The later live scheduler added cost isolation and exact exclusive-whale routing,
+so those homogeneous-tape numbers describe commit `c40d246`, not the current
+service. On the warmed fixed live stream, the current FP32 build reaches 915.5/s
+before stop over 180.1 seconds and 839.3/s including drain, with zero drops. A
+correct five-minute Greedy-warm/ReBeL run reached 624.5 balanced solves/s. The
+five-minute 1,200/s and golden-run gates have not been achieved yet.
 
 This is a replacement design, not an incremental plan for the resident CUDA
 service. Keep the verified rules, tree semantics, compact training-row format,
@@ -429,6 +430,14 @@ sensitivity rather than an indexing fault, but the trade was not worthwhile.
 TF32 or BF16 may be revisited only if it produces a material end-to-end gain
 and passes the target-statistics, `solvererr`, frozen-offline, and ladder gates.
 
+It was revisited after the live tail was measurable. Explicit Ampere TF32 raised
+an identical direct-launch tape from 581.1 to 597.4/s, but the 180-second warmed
+live stream moved from 915.5 to 909.3/s before stop while producing more node
+caps and exclusive routes. Two randomized-network bounds also failed, although
+the zero-network and structural oracles passed. The experiment was reverted
+because it did not make real generation faster, not because exact CPU floating
+point agreement is required.
+
 ## Finish a solve without retaining its main GPU arena
 
 TurboReBeL needs beliefs at the eventual exit leaf under each kept intermediate
@@ -689,8 +698,8 @@ Gate: all GPU oracles pass and tape throughput is at least 600 solves/s on one
 test. If it misses, profile the graph before adding more concurrency or
 precision modes.
 
-Achieved on 2026-08-09. The first passing build reached 640.4 solves/s. The
-current build reaches 717.1 solves/s over a 32.0-second wall-clock interval on
+Achieved on 2026-08-09. The first passing build reached 640.4 solves/s. Commit
+`c40d246` reached 717.1 solves/s over a 32.0-second wall-clock interval on
 one RTX 3090, including queue fill/drain, wave packing, transfers, graph work,
 and result materialisation. The run used 64 production roots, three reusable
 lanes, native FP32 SGEMM, fast NVRTC arithmetic, direct legal-cell value
@@ -707,12 +716,17 @@ Gate: generation-only production tape and live self-play both exceed 1,400/s
 with stable memory. The margin is intentional; training and tails still need
 room.
 
-Tape half achieved on 2026-08-09: the deterministic tape reaches 1,438.9
+Tape half achieved historically on 2026-08-09: commit `c40d246` reached 1,438.9
 solves/s over a 32.1-second wall-clock interval across both RTX 3090s. The run
 used six producers, three lanes per card, and `taskset -c 0-35` so GPU feeder
-work stayed on one hardware thread per physical core. Stable-memory live
-self-play above 1,400/s, the whale path, and zero-drop admission are still
-required before this integration gate is complete.
+work stayed on one hardware thread per physical core. Exact whale routing and
+cost isolation landed afterward. They make the heterogeneous frozen tape slower
+but keep live memory bounded, so the current decision metric is aged live
+self-play. Merging the two common live cost classes was measured there and
+reduced the 180-second pre-stop rate from 915.5 to 892.4/s; fuller waves did not
+repay their packing and transfer cost, and the change was reverted. Stable-memory
+live self-play above 1,400/s remains required before this integration gate is
+complete.
 
 ### 4. Replace the trainer boundary
 

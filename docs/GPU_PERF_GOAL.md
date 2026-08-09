@@ -145,11 +145,18 @@ The historical 573 solves/s result from `gpu_gen_bench` remains useful kernel
 context, not evidence that training is close to the goal. It used a later
 strong checkpoint and a different work distribution.
 
-The retired v4 benchmark has now been replaced by the v5 contiguous-wave tape.
-On 2026-08-09, 64 production roots reached 717.1 solves/s on one RTX 3090 and
-1,438.9 solves/s on both cards, with queue fill and drain included. This clears
-the deterministic tape margin, but it is still generation-only evidence: it
-does not claim live actor/build throughput or trainer balance.
+The retired v4 benchmark was replaced by the v5 contiguous-wave tape. On
+2026-08-09, commit `c40d246` reached 717.1 solves/s on one RTX 3090 and 1,438.9
+solves/s on both cards, with queue fill and drain included. Exact whale routing
+and live cost isolation landed afterward, so those numbers are a historical
+executor milestone rather than throughput of the current heterogeneous live
+scheduler.
+
+The current warmed FP32 live-stream control completed 164,864 solves before
+stop over 180.1 seconds, or 915.5/s, and 839.3/s including drain. The correct
+five-minute Greedy-warm/ReBeL training run reached 624.5 balanced solves/s with
+zero drops and bounded debt. Those are the active generation and training
+baselines; the opening burst is not used as a steady-state result.
 
 ## How to measure progress
 
