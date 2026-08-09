@@ -23,8 +23,11 @@ averaged 63.8% and 63.2%. Retained buffers reached 22,613 and 23,331 MiB, close
 enough to the 24 GiB card limit that five lanes need a retirement guard before
 an unattended long run.
 
-At this point the Greedy warm-up had clearly avoided the random-network draw
-trap, and the final checkpoint had seen abundant completed-game data. The run
-saved the post-Greedy checkpoint as `snap_00.pt` and the five-minute trained
-checkpoint as `snap_01.pt`; their ladder comparison still had to establish that
-the ReBeL updates improved playing strength.
+The closing 30-game-per-pair ladder confirmed that the dynamics were useful.
+The final checkpoint beat the post-Greedy checkpoint 13--5 with 12 draws and
+placed about 122 Elo higher. The post-Greedy checkpoint lost to Greedy 7--16
+with 7 draws, while the final checkpoint beat Greedy 15--7 with 8 draws. The
+final checkpoint also beat Random 14--0 with 16 draws. The sample is small, but
+all three comparisons move in the expected direction: the Greedy warm-up
+avoided the random-network draw trap, and five minutes of ReBeL updates made the
+agent measurably stronger.
