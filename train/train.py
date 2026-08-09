@@ -558,6 +558,8 @@ def main():
     ap.add_argument("--no-augment", action="store_true",
                     help="disable the 180-degree mirror augmentation")
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--train-stream-priority", type=int, default=0,
+                    help="CUDA trainer stream priority (negative is higher; 0 keeps the default stream)")
     # Work package B: run the ReBeL solves on the CUDA service (one thread
     # owns GPU-0; the trainer stays on --device). The service must be present
     # at startup or the run fails loudly rather than falling back to CPU.
@@ -606,6 +608,15 @@ def main():
         # Triton launches on PyTorch's current device. Pin it before the Rust
         # services create their independent contexts for both solve cards.
         torch.cuda.set_device(dev)
+        if args.train_stream_priority > 0:
+            ap.error("--train-stream-priority must be zero or negative")
+        if args.train_stream_priority < 0:
+            default_stream = torch.cuda.current_stream(dev)
+            train_stream = torch.cuda.Stream(
+                device=dev, priority=args.train_stream_priority)
+            train_stream.wait_stream(default_stream)
+            torch.cuda.set_stream(train_stream)
+            print(f"[train] CUDA stream priority {args.train_stream_priority}", flush=True)
 
     towers = lambda s: [int(x) for x in s.split(",") if x.strip()] or None
     value = Mlp(args.hidden, args.dg, args.rank, args.de,
