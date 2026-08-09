@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::mem::{align_of, size_of, MaybeUninit};
-use std::sync::Arc;
+use std::sync::{Arc, Once, OnceLock};
 use std::time::Instant;
 
 use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
@@ -1772,25 +1772,65 @@ fn gemm(
         return Ok(());
     }
     let alpha = 1.0f32;
-    unsafe {
-        cudarc::cublas::result::sgemm(
-            *blas.handle(),
-            CUBLAS_OP_N,
-            CUBLAS_OP_N,
-            n as i32,
-            m as i32,
-            k as i32,
-            &alpha,
-            b,
-            ldb as i32,
-            a,
-            lda as i32,
-            &beta,
-            c,
-            ldc as i32,
-        )
-    }
-    .map_err(|e| format!("cuBLAS SGEMM {m}x{k}x{n}: {e:?}"))?;
+    static FAST_F16: OnceLock<bool> = OnceLock::new();
+    static LOG_MODE: Once = Once::new();
+    let fast_f16 =
+        *FAST_F16.get_or_init(|| std::env::var_os("WARCHEST_GPU_PRECISE_GEMM").is_none());
+    LOG_MODE.call_once(|| {
+        eprintln!(
+            "v5 GEMM compute={}",
+            if fast_f16 { "fast-f16" } else { "fp32" }
+        );
+    });
+    let result = if fast_f16 {
+        use cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F;
+        use cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+        use cudarc::cublas::sys::cudaDataType_t::CUDA_R_32F;
+
+        unsafe {
+            cudarc::cublas::result::gemm_ex(
+                *blas.handle(),
+                CUBLAS_OP_N,
+                CUBLAS_OP_N,
+                n as i32,
+                m as i32,
+                k as i32,
+                (&alpha as *const f32).cast(),
+                b.cast(),
+                CUDA_R_32F,
+                ldb as i32,
+                a.cast(),
+                CUDA_R_32F,
+                lda as i32,
+                (&beta as *const f32).cast(),
+                c.cast(),
+                CUDA_R_32F,
+                ldc as i32,
+                CUBLAS_COMPUTE_32F_FAST_16F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            )
+        }
+    } else {
+        unsafe {
+            cudarc::cublas::result::sgemm(
+                *blas.handle(),
+                CUBLAS_OP_N,
+                CUBLAS_OP_N,
+                n as i32,
+                m as i32,
+                k as i32,
+                &alpha,
+                b,
+                ldb as i32,
+                a,
+                lda as i32,
+                &beta,
+                c,
+                ldc as i32,
+            )
+        }
+    };
+    result.map_err(|e| format!("cuBLAS GEMM {m}x{k}x{n}: {e:?}"))?;
     Ok(())
 }
 
