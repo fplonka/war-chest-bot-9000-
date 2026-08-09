@@ -558,6 +558,8 @@ def main():
     ap.add_argument("--no-augment", action="store_true",
                     help="disable the 180-degree mirror augmentation")
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--train-threads", type=int, default=0,
+                    help="PyTorch CPU threads (0: 1 for CUDA training, 8 for CPU training with GPU solves)")
     # Work package B: run the ReBeL solves on the CUDA service (one thread
     # owns GPU-0; the trainer stays on --device). The service must be present
     # at startup or the run fails loudly rather than falling back to CPU.
@@ -587,11 +589,19 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     torch.manual_seed(args.seed)
+    dev = torch.device(args.device)
     # With the GPU service, the CPU cores belong to the Rust builders. The
-    # CUDA step itself needs one Python feeder thread. A contended frozen-data
-    # profile held 101 ms/step with this limit, while the first integrated
-    # smoke with two threads reported roughly 250 ms/step.
-    torch.set_num_threads(1 if args.gpu else (os.cpu_count() or 8))
+    # CUDA step itself needs one Python feeder thread. CPU training can instead
+    # free the solve service's second card; eight threads fit a production step
+    # in 172 ms on the target box while leaving most cores to the builders.
+    if args.train_threads < 0:
+        ap.error("--train-threads must be non-negative")
+    train_threads = args.train_threads or (
+        (1 if dev.type == "cuda" else min(8, os.cpu_count() or 8))
+        if args.gpu else (os.cpu_count() or 8)
+    )
+    torch.set_num_threads(train_threads)
+    args.train_threads_effective = train_threads
     if args.gpu:
         torch.set_num_interop_threads(1)
         # Ampere's normal high-throughput float32 GEMM path. Parameters, loss
@@ -601,7 +611,6 @@ def main():
         torch.set_float32_matmul_precision("high")
     args.matmul_precision = torch.get_float32_matmul_precision()
     rng = np.random.default_rng(args.seed)
-    dev = torch.device(args.device)
     if args.gpu and dev.type == "cuda":
         # Triton launches on PyTorch's current device. Pin it before the Rust
         # services create their independent contexts for both solve cards.
@@ -642,7 +651,7 @@ def main():
     # where float16 resolves to ~0.001, a fiftieth of the network's own error.
     buf = Buffer(args.cap, args.cap * args.cfgs_per_row)
     batcher = make_batch
-    if args.gpu:
+    if args.gpu and dev.type == "cuda":
         # Compile the compact replay expanders before the run clock starts.
         # CPU/offline tools keep the Rust/numpy path as an independent oracle.
         import gpu_batch
