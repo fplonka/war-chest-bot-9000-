@@ -61,6 +61,9 @@ fn main() {
     assert!(!jobs.is_empty(), "the tape produced no valid jobs");
     let build_s = build0.elapsed().as_secs_f64();
     report_tape(&jobs, capped, build_s);
+    if std::env::var_os("WARCHEST_TAPE_LARGEST_FIRST").is_some() {
+        jobs.sort_by_key(|job| std::cmp::Reverse(job.work().mutable_bytes));
+    }
     let jobs: Vec<_> = jobs.into_iter().map(PreparedJob::new).collect();
 
     let devices: Vec<usize> = std::env::var("WARCHEST_TAPE_DEVICES")
