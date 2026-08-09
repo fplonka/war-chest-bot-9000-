@@ -1,0 +1,90 @@
+{
+ "runs": [
+  "/workspace/warchest-engine/runs/v5_lane_whale_25m_learning"
+ ],
+ "games_per_pair": 30,
+ "depth": 2,
+ "iters": 64,
+ "depth_b": 0,
+ "iters_b": 0,
+ "players": [
+  {
+   "name": "greedy",
+   "t": null,
+   "elo": 0.0,
+   "se": 42.6,
+   "score": 0.583
+  },
+  {
+   "name": "random",
+   "t": null,
+   "elo": -231.5,
+   "se": 46.0,
+   "score": 0.217
+  },
+  {
+   "name": "v5_lane_whale_25m_learning.init",
+   "t": 301.0,
+   "elo": -154.5,
+   "se": 42.9,
+   "score": 0.333
+  },
+  {
+   "name": "v5_lane_whale_25m_learning.s1",
+   "t": 661.1,
+   "elo": 198.4,
+   "se": 53.0,
+   "score": 0.867
+  }
+ ],
+ "pairs": [
+  {
+   "a": "greedy",
+   "b": "random",
+   "w": 24,
+   "l": 0,
+   "d": 6,
+   "score": 0.9
+  },
+  {
+   "a": "greedy",
+   "b": "v5_lane_whale_25m_learning.init",
+   "w": 16,
+   "l": 2,
+   "d": 12,
+   "score": 0.733
+  },
+  {
+   "a": "greedy",
+   "b": "v5_lane_whale_25m_learning.s1",
+   "w": 3,
+   "l": 26,
+   "d": 1,
+   "score": 0.117
+  },
+  {
+   "a": "random",
+   "b": "v5_lane_whale_25m_learning.init",
+   "w": 1,
+   "l": 7,
+   "d": 22,
+   "score": 0.4
+  },
+  {
+   "a": "random",
+   "b": "v5_lane_whale_25m_learning.s1",
+   "w": 0,
+   "l": 21,
+   "d": 9,
+   "score": 0.15
+  },
+  {
+   "a": "v5_lane_whale_25m_learning.init",
+   "b": "v5_lane_whale_25m_learning.s1",
+   "w": 2,
+   "l": 24,
+   "d": 4,
+   "score": 0.133
+  }
+ ]
+}
