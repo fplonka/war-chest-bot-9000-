@@ -3,6 +3,7 @@
 // wave-global; kernels never recover a solve owner in their hot loops.
 
 #include <cooperative_groups.h>
+#include <cuda_fp16.h>
 
 namespace cg = cooperative_groups;
 
@@ -532,6 +533,43 @@ extern "C" __global__ void belief_sums(const WaveDev* w, const WeightDev* wt,
     }
 }
 
+extern "C" __global__ void belief_sums_f16(const WaveDev* w, const WeightDev* wt,
+                                             int traverser, int both) {
+    (void)wt;
+    int lane = threadIdx.x & 31;
+    int task = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (task >= w->nleaf) return;
+    ReadTask q = TP(w, ReadTask, T_READOUT)[task];
+    for (int side = 0; side < (both ? 2 : 1); side++) {
+        int p = both ? side : 1 - traverser;
+        int n = nc_of(w, q.node, p);
+        const float* r = AP(w, A_REACH) + reach_at(w, q.node, p, 0);
+        float scale, flat;
+        norm_parts(r, n, lane, &scale, &flat);
+        float acc[DG_CH];
+        #pragma unroll
+        for (int z = 0; z < DG_CH; z++) acc[z] = 0.0f;
+        unsigned int c0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + p];
+        for (int c = 0; c < n; c++) {
+            unsigned int cfg = TP(w, unsigned int, T_ROW_CFG)[c0 + c];
+            float wc = r[c] * scale + flat;
+            const float* z = AP(w, A_Z) + (unsigned long long)cfg * DG;
+            #pragma unroll
+            for (int k = 0; k < DG_CH; k++) {
+                int x = (k << 5) + lane;
+                if (x < DG) acc[k] += wc * z[x];
+            }
+        }
+        half* out = reinterpret_cast<half*>(AP(w, A_XB))
+            + ((unsigned long long)q.row * 2 + p) * DG;
+        #pragma unroll
+        for (int k = 0; k < DG_CH; k++) {
+            int x = (k << 5) + lane;
+            if (x < DG) out[x] = __float2half_rn(acc[k]);
+        }
+    }
+}
+
 extern "C" __global__ void head_entry(const WaveDev* w, const WeightDev* wt) {
     int lane = threadIdx.x & 31;
     int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
@@ -559,6 +597,41 @@ extern "C" __global__ void head_entry(const WaveDev* w, const WeightDev* wt) {
         if (j < HEADW) {
             float v = (x[k] - mean) * inv * wt->ln1w[j] + wt->ln1b[j];
             dst[j] = v > 0.0f ? v : 0.0f;
+        }
+    }
+}
+
+extern "C" __global__ void head_entry_f16(const WaveDev* w, const WeightDev* wt) {
+    int lane = threadIdx.x & 31;
+    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (row >= w->rows) return;
+    const float* src = AP(w, A_H) + (unsigned long long)row * HEADW;
+    half* dst = reinterpret_cast<half*>(AP(w, A_H2))
+        + (unsigned long long)row * HEADW;
+    const float* add = AP(w, A_H0) + (unsigned long long)row * HEADW;
+    float x[HEAD_CH], sum = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < HEAD_CH; k++) {
+        int j = (k << 5) + lane;
+        float v = j < HEADW
+            ? src[j] + wt->pub_out_b[j] + add[j]
+            : 0.0f;
+        x[k] = v;
+        if (j < HEADW) sum += v;
+    }
+    float mean = warp_sum(sum) / (float)HEADW, var = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < HEAD_CH; k++) {
+        int j = (k << 5) + lane;
+        if (j < HEADW) { float d = x[k] - mean; var += d * d; }
+    }
+    float inv = rsqrtf(warp_sum(var) / (float)HEADW + LN_EPS);
+    #pragma unroll
+    for (int k = 0; k < HEAD_CH; k++) {
+        int j = (k << 5) + lane;
+        if (j < HEADW) {
+            float v = (x[k] - mean) * inv * wt->ln1w[j] + wt->ln1b[j];
+            dst[j] = __float2half_rn(v > 0.0f ? v : 0.0f);
         }
     }
 }

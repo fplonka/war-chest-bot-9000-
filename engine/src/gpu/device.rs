@@ -215,6 +215,7 @@ impl Default for WeightDev {
 struct WeightBank {
     layout: V3Layout,
     _w: CudaSlice<f32>,
+    _w16: CudaSlice<u16>,
     _b: CudaSlice<f32>,
     _ln: CudaSlice<f32>,
     dev: CudaSlice<WeightDev>,
@@ -238,7 +239,7 @@ kernels! {
     pack_cards, bias_act, cards_finish, pile_pe, pack_piles, assemble,
     trunk_norm, holding_in, slot_sum, finish_zg,
     init_strategy, seed_reach, reach_sweep, seed_sum, root_average,
-    belief_sums, head_entry, head_act, readout, backprop_sweep,
+    belief_sums, belief_sums_f16, head_entry, head_entry_f16, head_act, readout, backprop_sweep,
     normalize_strategy, gather_carry, collect_root,
 }
 
@@ -938,6 +939,48 @@ impl Executor {
     ) -> Result<(), String> {
         let l = &bank.layout;
         let rows = d.host.rows as usize;
+        // Production has no extra head MLP. Keep the residual sum in FP32
+        // through LayerNorm, then store only the operands that the next
+        // tensor-core GEMM would down-convert anyway. This avoids repeated
+        // cuBLAS conversion and halves the dynamic belief/head traffic without
+        // introducing the unstable pre-LayerNorm rounding point.
+        if fast_gemm() && l.hmlp.is_empty() {
+            launch!(
+                self,
+                d,
+                bank,
+                belief_sums_f16,
+                warps(d.host.nleaf as usize),
+                traverser as i32,
+                both as i32
+            )?;
+            gemm_f16(
+                &self.blas,
+                rows,
+                l.head_in,
+                2 * l.dg,
+                d.ptr(Arena::Xb).cast(),
+                2 * l.dg,
+                bank.w16_ptr(l.wb),
+                l.head_in,
+                d.ptr_mut(Arena::H),
+                l.head_in,
+            )?;
+            launch!(self, d, bank, head_entry_f16, warps(rows))?;
+            gemm_f16(
+                &self.blas,
+                rows,
+                l.rank,
+                l.head_in,
+                d.ptr(Arena::H2).cast(),
+                l.head_in,
+                bank.w16_ptr(l.wu.w),
+                l.rank,
+                d.ptr_mut(Arena::U),
+                l.rank,
+            )?;
+            return Ok(());
+        }
         launch!(
             self,
             d,
@@ -1165,7 +1208,9 @@ impl WeightBank {
                 layout.ln_len
             ));
         }
+        let w16: Vec<u16> = w.iter().map(|&x| crate::selfplay::f32_to_f16(x)).collect();
         let wb = htod(stream, &w)?;
+        let wb16 = htod(stream, &w16)?;
         let bb = htod(stream, &b)?;
         let lb = htod(stream, &ln)?;
         let (wp, bp, lp) = (ptr(stream, &wb), ptr(stream, &bb), ptr(stream, &lb));
@@ -1215,6 +1260,7 @@ impl WeightBank {
         Ok(Self {
             layout,
             _w: wb,
+            _w16: wb16,
             _b: bb,
             _ln: lb,
             dev,
@@ -1223,6 +1269,10 @@ impl WeightBank {
 
     fn w_ptr(&self, off: usize) -> *const f32 {
         unsafe { ptr(self.dev.stream(), &self._w).add(off) }
+    }
+
+    fn w16_ptr(&self, off: usize) -> *const u16 {
+        unsafe { ptr(self.dev.stream(), &self._w16).add(off) }
     }
 }
 
@@ -1552,6 +1602,7 @@ fn arena_layout(w: &Wave, l: &V3Layout) -> Result<([u64; N_ARENAS], usize), Stri
     } else {
         0
     };
+    let fast_head = fast_gemm() && l.hmlp.is_empty();
     let (pubw, _, _, slotw) = l.widths();
     let max_pub = pubw
         .into_iter()
@@ -1586,9 +1637,17 @@ fn arena_layout(w: &Wave, l: &V3Layout) -> Result<([u64; N_ARENAS], usize), Stri
         cfgs * l.dg,
         cfgs * (l.rank + 1),
         rows * l.head_in,
-        rows * 2 * l.dg,
+        if fast_head {
+            (rows * 2 * l.dg).div_ceil(2)
+        } else {
+            rows * 2 * l.dg
+        },
         rows * h_stride(l),
-        rows * h_stride(l),
+        if fast_head {
+            (rows * l.head_in).div_ceil(2)
+        } else {
+            rows * h_stride(l)
+        },
         rows * l.rank,
         roots,
         carry_snaps * w.snapshot_configs,
@@ -1781,6 +1840,11 @@ fn ptr_mut<T>(stream: &Arc<CudaStream>, value: &mut CudaSlice<T>) -> *mut T {
     p as usize as *mut T
 }
 
+fn fast_gemm() -> bool {
+    static FAST_F16: OnceLock<bool> = OnceLock::new();
+    *FAST_F16.get_or_init(|| std::env::var_os("WARCHEST_GPU_PRECISE_GEMM").is_none())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn gemm(
     blas: &CudaBlas,
@@ -1799,10 +1863,8 @@ fn gemm(
         return Ok(());
     }
     let alpha = 1.0f32;
-    static FAST_F16: OnceLock<bool> = OnceLock::new();
     static LOG_MODE: Once = Once::new();
-    let fast_f16 =
-        *FAST_F16.get_or_init(|| std::env::var_os("WARCHEST_GPU_PRECISE_GEMM").is_none());
+    let fast_f16 = fast_gemm();
     LOG_MODE.call_once(|| {
         eprintln!(
             "v5 GEMM compute={}",
@@ -1858,6 +1920,53 @@ fn gemm(
         }
     };
     result.map_err(|e| format!("cuBLAS GEMM {m}x{k}x{n}: {e:?}"))?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemm_f16(
+    blas: &CudaBlas,
+    m: usize,
+    n: usize,
+    k: usize,
+    a: *const u16,
+    lda: usize,
+    b: *const u16,
+    ldb: usize,
+    c: *mut f32,
+    ldc: usize,
+) -> Result<(), String> {
+    if m == 0 || n == 0 || k == 0 {
+        return Ok(());
+    }
+    use cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F;
+    use cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+    use cudarc::cublas::sys::cudaDataType_t::{CUDA_R_16F, CUDA_R_32F};
+    let (alpha, beta) = (1.0f32, 0.0f32);
+    unsafe {
+        cudarc::cublas::result::gemm_ex(
+            *blas.handle(),
+            CUBLAS_OP_N,
+            CUBLAS_OP_N,
+            n as i32,
+            m as i32,
+            k as i32,
+            (&alpha as *const f32).cast(),
+            b.cast(),
+            CUDA_R_16F,
+            ldb as i32,
+            a.cast(),
+            CUDA_R_16F,
+            lda as i32,
+            (&beta as *const f32).cast(),
+            c.cast(),
+            CUDA_R_32F,
+            ldc as i32,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        )
+    }
+    .map_err(|e| format!("cuBLAS FP16 GEMM {m}x{k}x{n}: {e:?}"))?;
     Ok(())
 }
 

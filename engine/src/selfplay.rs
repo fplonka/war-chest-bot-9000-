@@ -1307,7 +1307,7 @@ type Timeline = Vec<([u8; 2], u8)>;
 /// Round-to-nearest-even f32 -> IEEE-754 binary16 bit pattern. The aux
 /// targets are stored as float16 in the frozen row; numpy reads them back
 /// with the same rounding.
-fn f32_to_f16(x: f32) -> u16 {
+pub(crate) fn f32_to_f16(x: f32) -> u16 {
     let b = x.to_bits();
     let sign = ((b >> 16) & 0x8000) as u16;
     let exp = ((b >> 23) & 0xff) as i32;
