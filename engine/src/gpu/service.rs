@@ -245,6 +245,7 @@ fn run(
     queued_work: Arc<AtomicU64>,
     lane_work: Arc<AtomicU64>,
 ) {
+    const ORDINARY_WAVE_BYTES: usize = 2usize << 30;
     let row_target = env_usize("WARCHEST_WAVE_ROWS", 48 * 1024).max(1);
     let max_jobs = env_usize("WARCHEST_WAVE_JOBS", 64).clamp(1, 256);
     let latency = Duration::from_micros(env_usize("WARCHEST_WAVE_US", 800) as u64);
@@ -299,6 +300,7 @@ fn run(
         let class = cost_class(seed.work);
         let mut batch = vec![seed];
         let mut rows = batch[0].work.network_rows;
+        let mut bytes = reservation_bytes(batch[0].work);
         let mut i = 0;
         while class != 31 && i < pending.len() && batch.len() < max_jobs && rows < row_target {
             let take = {
@@ -306,10 +308,12 @@ fn run(
                 p.version == batch[0].version
                     && cost_class(p.work) == class
                     && Wave::compatible(&p.job, &batch[0].job)
+                    && bytes.saturating_add(reservation_bytes(p.work)) <= ORDINARY_WAVE_BYTES
             };
             if take {
                 let p = pending.remove(i).expect("pending index");
                 rows += p.work.network_rows;
+                bytes = bytes.saturating_add(reservation_bytes(p.work));
                 batch.push(p);
             } else {
                 i += 1;
@@ -472,10 +476,7 @@ fn bucket_rows(pending: &VecDeque<Pending>) -> usize {
 /// wave's shape without splitting an ordinary production tape into tiny
 /// power-of-two batches. Class 31 is exclusive.
 fn cost_class(w: WorkVector) -> u8 {
-    let bytes = w
-        .table_bytes
-        .saturating_add(w.mutable_bytes)
-        .saturating_add(w.carried_output_bytes);
+    let bytes = reservation_bytes(w);
     if w.requires_exclusive_route() || w.legal_cells >= 8_000_000 {
         return 31;
     }
@@ -489,11 +490,19 @@ fn cost_class(w: WorkVector) -> u8 {
         3
     } else if bytes >= (64usize << 20) || work >= 500_000 {
         2
-    } else if bytes >= (16usize << 20) || work >= 125_000 {
-        1
     } else {
         0
     }
+}
+
+fn reservation_bytes(w: WorkVector) -> usize {
+    let tables = w
+        .table_bytes
+        .checked_next_power_of_two()
+        .unwrap_or(w.table_bytes);
+    tables
+        .saturating_add(w.mutable_bytes)
+        .saturating_add(w.carried_output_bytes)
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
