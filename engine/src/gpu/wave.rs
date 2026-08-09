@@ -514,6 +514,7 @@ fn same_meta(a: &PackedMeta, b: &PackedMeta) -> bool {
         && a.cfr.predict.to_bits() == b.cfr.predict.to_bits()
         && a.warm.to_bits() == b.warm.to_bits()
         && a.snap_iters == b.snap_iters
+        && a.net_dims == b.net_dims
 }
 
 fn add_work(dst: &mut WorkVector, x: WorkVector) {

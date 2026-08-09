@@ -509,6 +509,138 @@ pub(crate) fn gpu_clients() -> &'static std::sync::Mutex<Vec<crate::gpu::GpuClie
     GPU_CLIENTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
+/// Python-side handle for the continuous Rust actor/build/GPU pipeline. `next`
+/// yields one solve-complete replay chunk, returns `None` on a polling timeout,
+/// and raises `StopIteration` once a requested stop has fully drained.
+#[cfg(feature = "gpu")]
+#[pyclass]
+struct GpuGenerator {
+    rx: std::sync::Mutex<std::sync::mpsc::Receiver<Result<Option<crate::selfplay::Data>, String>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    done: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "gpu")]
+#[pymethods]
+impl GpuGenerator {
+    #[pyo3(signature = (timeout=0.1))]
+    fn next(&self, py: Python<'_>, timeout: f64) -> PyResult<Option<PyObject>> {
+        if self.done.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(pyo3::exceptions::PyStopIteration::new_err(()));
+        }
+        let event = py.allow_threads(|| {
+            let rx = self.rx.lock().unwrap();
+            if timeout < 0.0 {
+                rx.recv()
+                    .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+            } else {
+                rx.recv_timeout(std::time::Duration::from_secs_f64(timeout.max(0.0)))
+            }
+        });
+        match event {
+            Ok(Ok(Some(data))) => data_to_dict(py, data).map(Some),
+            Ok(Ok(None)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.done.store(true, std::sync::atomic::Ordering::Release);
+                if let Some(thread) = self.thread.lock().unwrap().take() {
+                    let _ = thread.join();
+                }
+                Err(pyo3::exceptions::PyStopIteration::new_err(()))
+            }
+            Ok(Err(e)) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        }
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_done(&self) -> bool {
+        self.done.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl Drop for GpuGenerator {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if self.done.load(std::sync::atomic::Ordering::Acquire) {
+            if let Some(thread) = self.thread.get_mut().unwrap().take() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+#[pyfunction]
+#[pyo3(signature = (seed, depth=2, iters=64, explore=0.25, random_draft=true, cfr="linear", warm=0.0, workers=36, actors_per_worker=64, chunk_solves=1024))]
+#[allow(clippy::too_many_arguments)]
+fn gpu_stream_start(
+    seed: u64,
+    depth: usize,
+    iters: usize,
+    explore: f32,
+    random_draft: bool,
+    cfr: &str,
+    warm: f32,
+    workers: usize,
+    actors_per_worker: usize,
+    chunk_solves: usize,
+) -> PyResult<GpuGenerator> {
+    let cfg = Cfg {
+        depth,
+        iters,
+        snapshots: true,
+        cfr: cfr_of(cfr)?,
+        warm,
+        node_cap: 200_000,
+        ..Default::default()
+    };
+    let agent = Agent::Rebel { cfg, slot: 0 };
+    let gc = GameCfg {
+        agents: [agent, agent],
+        collect: Collect::Rebel,
+        explore,
+        random_draft,
+        eval_mix: 0.0,
+        mc_mix: 0.0,
+    };
+    let nets = nets().read().unwrap().clone();
+    let clients = gpu_clients().lock().unwrap().clone();
+    if clients.is_empty() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "gpu service not started (gpu_start was not called)",
+        ));
+    }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let run_stop = stop.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread = std::thread::Builder::new()
+        .name("warchest-gpu-stream".into())
+        .spawn(move || {
+            crate::selfplay::run_games_gpu_stream(
+                seed,
+                &nets,
+                &gc,
+                &clients,
+                workers,
+                actors_per_worker,
+                chunk_solves,
+                &run_stop,
+                tx,
+            );
+        })
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("start GPU stream: {e}")))?;
+    Ok(GpuGenerator {
+        rx: std::sync::Mutex::new(rx),
+        stop,
+        thread: std::sync::Mutex::new(Some(thread)),
+        done: std::sync::atomic::AtomicBool::new(false),
+    })
+}
+
 /// Start one solve service per listed CUDA device (typically `[0]` for
 /// training; the ladder starts one per device and pits weights against each
 /// other). Call once; a shape change needs a fresh process.
@@ -579,6 +711,7 @@ fn gpu_stop(_py: Python<'_>) -> PyResult<()> {
 /// missing, so a misconfigured box fails loudly instead of running slow.
 #[cfg(feature = "gpu")]
 #[pyfunction]
+#[pyo3(signature = (games, seed, mode, depth, iters, explore, temp, random_draft, eval_mix, mc_mix, cfr, warm, max_seconds=0.0))]
 fn gpu_gen_data(
     py: Python<'_>,
     games: usize,
@@ -593,6 +726,7 @@ fn gpu_gen_data(
     mc_mix: f32,
     cfr: &str,
     warm: f32,
+    max_seconds: f64,
 ) -> PyResult<PyObject> {
     let cfg = Cfg {
         depth,
@@ -622,7 +756,10 @@ fn gpu_gen_data(
         mc_mix,
     };
     let d = py.allow_threads(|| {
-        let n = nets().read().unwrap();
+        // A shard owns a small immutable CPU-side shape/oracle snapshot. Do
+        // not hold the global read lock for the whole game batch: the trainer
+        // must be able to publish the next version while shards are live.
+        let n = nets().read().unwrap().clone();
         let clients = gpu_clients().lock().unwrap().clone();
         if clients.is_empty() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -639,8 +776,10 @@ fn gpu_gen_data(
                 .min_by_key(|(_, gpu)| gpu.queued_work())
                 .map_or(0, |(i, _)| i)
         };
-        Ok::<_, pyo3::PyErr>(crate::selfplay::run_games_gpu(
-            games, seed, &n, &gc, &clients, &route,
+        let deadline = (max_seconds > 0.0)
+            .then(|| std::time::Instant::now() + std::time::Duration::from_secs_f64(max_seconds));
+        Ok::<_, pyo3::PyErr>(crate::selfplay::run_games_gpu_until(
+            games, seed, &n, &gc, &clients, &route, deadline,
         ))
     })?;
     data_to_dict(py, d)
@@ -722,6 +861,9 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     out.set_item("cap_hits", d.cap_hits)?;
     out.set_item("horizon_hits", d.cap_hits)?;
     out.set_item("node_caps", d.node_caps)?;
+    out.set_item("oversize_routes", d.oversize_routes)?;
+    out.set_item("exact_fallbacks", d.exact_fallbacks)?;
+    out.set_item("censored_games", d.censored_games)?;
     out.set_item("dropped", d.dropped)?;
     out.set_item("configs", d.configs)?;
     assert_eq!(
@@ -1187,10 +1329,12 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gen_data, m)?)?;
     #[cfg(feature = "gpu")]
     {
+        m.add_class::<GpuGenerator>()?;
         m.add_function(wrap_pyfunction!(gpu_start, m)?)?;
         m.add_function(wrap_pyfunction!(gpu_set_weights, m)?)?;
         m.add_function(wrap_pyfunction!(gpu_stop, m)?)?;
         m.add_function(wrap_pyfunction!(gpu_gen_data, m)?)?;
+        m.add_function(wrap_pyfunction!(gpu_stream_start, m)?)?;
     }
     m.add_function(wrap_pyfunction!(eval_match, m)?)?;
     m.add_function(wrap_pyfunction!(infer, m)?)?;

@@ -806,7 +806,10 @@ def main():
                "rows": len(rows), "solves": solves,
                "loss_old": round(loss_old, 5), "loss_new": round(loss_new, 5),
                "horizon_frac": round(d["horizon_hits"] / max(d["games"], 1), 3),
-               "node_caps": int(d["node_caps"]), "dropped": int(d["dropped"]),
+               "node_caps": int(d["node_caps"]),
+               "oversize_routes": int(d.get("oversize_routes", 0)),
+               "exact_fallbacks": int(d.get("exact_fallbacks", 0)),
+               "dropped": int(d["dropped"]),
                "configs": round(d["configs"] / dec, 1), "cap_value": round(cap_v, 4),
                "steps": steps,
                "tgt_mean": round(tgt_mean, 4), "tgt_std": round(tgt_std, 4),
@@ -823,7 +826,8 @@ def main():
         write_log(args, log, snaps)
         print(f"[t={rec['t']:6.1f}s] {phase:6s} ep{epoch:3d} games={rec['games']:4d} "
               f"dec={dec:6d} rows={len(rows):6d} horizon={rec['horizon_frac']:.2f} "
-              f"nodecap={rec['node_caps']} drop={rec['dropped']} "
+              f"nodecap={rec['node_caps']} over={rec['oversize_routes']} "
+              f"exact={rec['exact_fallbacks']} drop={rec['dropped']} "
               f"cfgs={rec['configs']:5.1f} L={lv:.5f} P={lp:.3f} old={loss_old:.5f} new={loss_new:.5f} "
               f"tgt={tgt_mean:+.3f}/{tgt_std:.3f} pstd={probe_std:.3f} "
               f"capv={cap_v:.3f} lr={rec['lr']:.1e} gen={gen_s:.1f}s "

@@ -2,7 +2,7 @@
 //!
 //! One job = one solve: everything the GPU service needs to run the CFR
 //! iterations of a solved subgame, plus the beliefs its Phase 2 must value.
-//! The byte format is the TREE.md contract (`docs/TREE.md`, version 2) and
+//! The byte format is the WCJ6 TREE.md contract (`docs/TREE.md`) and
 //! the same bytes serve three consumers: the GPU service (uploaded to the
 //! device), the torch CFR specification (`train/cfr_spec.py`, the executable
 //! oracle for the kernels), and the oracle tests (CPU -> bytes -> CPU).
@@ -11,16 +11,17 @@
 //! snapshots) are **not** uploaded: the service initialises them exactly as
 //! `Solver::new` does (uniform current strategy, zero regrets, the
 //! reach-weighted uniform strategy seed, snapshot 0 = the uniform average).
-//! Only the initial `reach` (the uniform-strategy reach `new` propagates
-//! before seeding) travels, because the walk's first belief queries read it.
+//! Initial reach is not uploaded either: the wave seeds the root beliefs and
+//! runs the same sparse forward gather before any consumer reads it.
 //!
 //! Layout: little-endian, `u32` counts prefix every array, `f32` floats,
 //! `NONE = 255` where the solver uses it. Everything below mirrors
 //! `docs/TREE.md`; see that file for the meaning of each array.
 
 use crate::actions::Action;
+use crate::net::V3Layout;
 use crate::rebel::Config;
-use crate::rebel::{CFEAT, GPU_ROW_BYTES, NTYPE, PUBFEAT};
+use crate::rebel::{CFEAT, GPU_ROW_BYTES, NSLOT, NTYPE, PILE_COUNTS, PUBFEAT};
 use crate::search::{Cfr, Solver};
 use crate::units::{write_card_features, CARD_FEATS};
 use std::rc::Rc;
@@ -28,8 +29,8 @@ use std::rc::Rc;
 /// The byte format this module writes. Bump when an array changes shape or
 /// meaning (docs/TREE.md "the version bumps when any of them changes shape or
 /// meaning").
-pub const JOB_VERSION: u32 = 5;
-const MAGIC: u32 = 0x5743_4A35; // "WCJ5"
+pub const JOB_VERSION: u32 = 6;
+const MAGIC: u32 = 0x5743_4A36; // "WCJ6"
 
 /// Runtime metadata that travels with a job (not part of the frozen tree
 /// contract — it is per-request).
@@ -44,6 +45,9 @@ pub struct PackedMeta {
     pub warm: f32,
     /// The kept iteration numbers, in order (`Solver::snapshot_iters`).
     pub snap_iters: Vec<usize>,
+    /// Exact v3 network shape. Admission uses it to account for every device
+    /// scratch matrix before choosing an ordinary or exclusive lane.
+    pub net_dims: Vec<usize>,
 }
 
 /// Every uploaded array of the contract. `rows` is the network batch size:
@@ -174,6 +178,19 @@ pub struct WorkVector {
     pub mutable_bytes: usize,
     pub carried_output_bytes: usize,
     pub levels: usize,
+}
+
+impl WorkVector {
+    /// Jobs in this tail cannot safely share a card with the ordinary reusable
+    /// lanes. `mutable_bytes` includes allocator power-of-two rounding, so this
+    /// tests the reservation CUDA will actually attempt.
+    pub fn requires_exclusive_route(self) -> bool {
+        let table_reservation = self
+            .table_bytes
+            .checked_next_power_of_two()
+            .unwrap_or(self.table_bytes);
+        self.mutable_bytes.saturating_add(table_reservation) >= (4usize << 30)
+    }
 }
 
 /// The compact public tree retained by a game actor while and after its GPU
@@ -325,6 +342,7 @@ impl PackedJob {
                 cfr: sv.cfg.cfr,
                 warm: sv.cfg.warm,
                 snap_iters: sv.snap_list.clone(),
+                net_dims: sv.network_dims().to_vec(),
             },
             tables,
             root,
@@ -385,9 +403,9 @@ impl PackedJob {
             table_bytes: t.owned_bytes()
                 + 4 * (self.root[0].len() + self.root[1].len())
                 + 4 * self.carried.len() * root_configs,
-            // FP32 baseline: regret/current/sum, reach, values, config
-            // embeddings and one snapshot reach scratch block.
-            mutable_bytes: 4 * (3 * t.ncells + 2 * t.reach_len + vals + t.cphi.len() + t.ncfg),
+            // Exact one-job device arena, including network scratch and the
+            // allocator's power-of-two growth policy.
+            mutable_bytes: device_arena_bytes(self, vals),
             carried_output_bytes: 4
                 * (t.ncells
                     + self.carried.len() * root_configs
@@ -395,6 +413,86 @@ impl PackedJob {
             levels: t.nlevels,
         }
     }
+}
+
+/// Exact one-job reservation for the contiguous FP32 arena. Wave packing is
+/// subadditive for its max-sized scratch blocks, so per-job admission is a
+/// conservative bound for a multi-job wave. Keep this in lockstep with
+/// `gpu::device::arena_layout`.
+fn device_arena_bytes(job: &PackedJob, vals: usize) -> usize {
+    let t = &job.tables;
+    let Ok(l) = V3Layout::new(&job.meta.net_dims) else {
+        return usize::MAX;
+    };
+    let (rows, cfgs, cells) = (t.rows, t.ncfg, t.ncells);
+    let roots = job
+        .carried
+        .len()
+        .saturating_mul(job.root[0].len().saturating_add(job.root[1].len()));
+    let carry_snaps = if job.meta.snapshots {
+        job.meta.snap_iters.len().saturating_sub(1)
+    } else {
+        0
+    };
+    let (pubw, _, cardw, slotw) = l.widths();
+    let max_pub = pubw
+        .into_iter()
+        .chain([l.xdim(), l.head_in])
+        .max()
+        .unwrap_or(1);
+    let slot_max = slotw
+        .into_iter()
+        .chain([l.hfeat(), l.dg])
+        .max()
+        .unwrap_or(1);
+    let card_max = cardw.into_iter().max().unwrap_or(l.de);
+    let mul = |a: usize, b: usize| a.saturating_mul(b);
+    let bh = mul(rows, max_pub)
+        .max(mul(mul(cfgs, NSLOT), slot_max))
+        .max(mul(NTYPE, card_max))
+        .max(mul(mul(rows, NTYPE), l.de))
+        .max(mul(cfgs, l.dg));
+    let bg = mul(NTYPE, CARD_FEATS)
+        .max(mul(mul(rows, NTYPE), PILE_COUNTS))
+        .max(mul(mul(rows, NTYPE), l.de).saturating_add(mul(NTYPE, l.de)))
+        .max(mul(mul(cfgs, NSLOT), l.hfeat()))
+        .max(mul(cfgs, l.rank + 1));
+    let h_stride = std::iter::once(l.head_in)
+        .chain(l.hmlp.iter().map(|x| x.o))
+        .max()
+        .unwrap_or(l.head_in);
+    let sizes = [
+        t.reach_len,
+        t.reach_len,
+        vals,
+        cells,
+        cells,
+        cells,
+        cells,
+        mul(NTYPE, l.de),
+        mul(cfgs, l.dg),
+        mul(cfgs, l.rank + 1),
+        mul(rows, l.head_in),
+        mul(rows, 2 * l.dg),
+        mul(rows, h_stride),
+        mul(rows, h_stride),
+        mul(rows, l.rank),
+        roots,
+        mul(carry_snaps, t.snapshot_configs),
+        mul(rows, l.xdim()),
+        bh,
+        bh,
+        bg,
+    ];
+    let mut floats = 0usize;
+    for n in sizes {
+        floats = floats.saturating_add(31) & !31usize;
+        floats = floats.saturating_add(n);
+    }
+    floats
+        .checked_next_power_of_two()
+        .unwrap_or(floats)
+        .saturating_mul(std::mem::size_of::<f32>())
 }
 
 impl PackedTables {
@@ -827,6 +925,7 @@ impl PackedJob {
         w.f32(m.cfr.predict);
         w.f32(m.warm);
         w.u32s(&m.snap_iters.iter().map(|&x| x as u32).collect::<Vec<_>>());
+        w.u32s(&m.net_dims.iter().map(|&x| x as u32).collect::<Vec<_>>());
         let t = &self.tables;
         w.u32(t.nodes as u32);
         w.u32(t.ncfg as u32);
@@ -912,6 +1011,7 @@ impl PackedJob {
             },
             warm: r.f32("warm")?,
             snap_iters: r.u32s("snap_iters")?.iter().map(|&x| x as usize).collect(),
+            net_dims: r.u32s("net_dims")?.iter().map(|&x| x as usize).collect(),
         };
         let nodes = r.u32("nodes")? as usize;
         let ncfg = r.u32("ncfg")? as usize;
@@ -1045,6 +1145,7 @@ impl PackedJob {
                 cfr: Cfr::DISCOUNTED,
                 warm: 0.0,
                 snap_iters: vec![0, 1, 2, 4],
+                net_dims: vec![3, 32, 64, 64, 384, 1, 1, 64, 1, 384, 0, 0],
             },
             tables: PackedTables {
                 nodes: 1,

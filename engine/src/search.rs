@@ -654,6 +654,10 @@ impl Drop for Solver<'_> {
 }
 
 impl<'a> Solver<'a> {
+    pub(crate) fn network_dims(&self) -> &[usize] {
+        &self.nets.value.dims
+    }
+
     pub fn new(
         root: &State,
         ctx: Ctx,

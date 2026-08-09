@@ -246,7 +246,7 @@ fn random_policy(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config]) -> NodePolic
 
 // -------------------------------------------------------------- data records
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Collect {
     None,
     /// Monte-Carlo value targets from the game outcome (greedy warm start).
@@ -285,6 +285,15 @@ pub struct Data {
     /// Games abandoned because the solve service refused their subgame. Zero
     /// in every healthy run; GPU capacity is not an algorithmic game filter.
     pub dropped: usize,
+    /// Valid solves too large to coexist with the ordinary GPU wave lanes.
+    /// They run through the serialized exact path and are never discarded.
+    pub oversize_routes: usize,
+    /// GPU submissions retried by the exact CPU solver, including oversize
+    /// routes and unexpected device errors.
+    pub exact_fallbacks: usize,
+    /// Live games intentionally discarded at a wall-clock deadline. This is
+    /// time-censored work, not a capacity drop and never enters replay.
+    pub censored_games: usize,
 
     // ------------------------------------------------------- policy targets
     // One per solve, not one per row. A solve's rows share a public state and
@@ -359,6 +368,9 @@ impl Data {
         self.games += o.games;
         self.decisions += o.decisions;
         self.dropped += o.dropped;
+        self.oversize_routes += o.oversize_routes;
+        self.exact_fallbacks += o.exact_fallbacks;
+        self.censored_games += o.censored_games;
         self.wins[0] += o.wins[0];
         self.wins[1] += o.wins[1];
         self.draws += o.draws;
@@ -701,6 +713,7 @@ pub struct Game<'a> {
     pending_roots: Option<Vec<[Vec<f32>; 2]>>,
     pending_slot: usize,
     pending_player: u8,
+    pending_oversize: bool,
 }
 
 /// What `Game::advance` returns.
@@ -735,6 +748,7 @@ impl<'a> Game<'a> {
             pending_roots: None,
             pending_slot: 0,
             pending_player: 0,
+            pending_oversize: false,
         }
     }
 
@@ -922,6 +936,7 @@ impl<'a> Game<'a> {
                                 std::mem::take(carried)
                             };
                             let (job, walk_tree) = PackedJob::from_solver_with_walk(&sv, &roots_v);
+                            self.pending_oversize = job.work().requires_exclusive_route();
                             self.pending_job = Some(job);
                             self.pending_walk = Some(walk_tree);
                             self.pending_roots = Some(roots_v);
@@ -1109,6 +1124,7 @@ impl<'a> Game<'a> {
         let slot = self.pending_slot;
         let player = self.pending_player;
         let roots_v = self.pending_roots.take().expect("pending roots");
+        self.pending_oversize = false;
         if gc.collect == Collect::Rebel {
             self.data.begin_solve();
             for (r, v) in roots_v.iter().zip(result.root_values.iter()) {
@@ -1146,6 +1162,72 @@ impl<'a> Game<'a> {
             strat: result.strategy,
             carries: Some(result.carries),
         });
+        self.data.oversize_routes += result.oversize_route as usize;
+    }
+
+    /// Rebuild and solve a pending GPU job on the verified CPU path. This is
+    /// deliberately serialized by the caller: an oversize solve is rare, but
+    /// allowing several of its multi-gigabyte arenas at once would merely move
+    /// the capacity failure from device memory to host memory.
+    #[cfg(feature = "gpu")]
+    pub fn retry_cpu(&mut self, nets: &'a [Nets]) {
+        // Release the packed GPU representation before allocating the CPU CFR
+        // arenas. The worker has normally taken `pending_job` already; keep the
+        // take here so direct callers cannot accidentally retain it.
+        self.pending_job.take();
+        self.pending_walk.take().expect("pending walk tree");
+        let roots_v = self.pending_roots.take().expect("pending roots");
+        let oversize = std::mem::take(&mut self.pending_oversize);
+        let player = self.pending_player;
+        let Agent::Rebel { cfg, slot } = self.gc.agents[player as usize] else {
+            panic!("GPU retry requested for a non-ReBeL agent");
+        };
+        let scfg = Cfg {
+            snapshots: self.gc.collect == Collect::Rebel,
+            gpu_build: false,
+            ..cfg
+        };
+        let mut sv = Solver::new(&self.s, self.ctx, &nets[slot], scfg, self.bel.clone());
+        assert!(
+            !sv.capped(),
+            "a GPU job that passed the node cap capped on its exact CPU retry"
+        );
+        sv.warm_start(scfg.warm);
+        sv.multistep(cfg.iters);
+        if self.gc.collect == Collect::Rebel {
+            self.data.begin_solve();
+            let vals = sv.value_under(&roots_v);
+            for (r, v) in roots_v.iter().zip(&vals) {
+                self.data.push_value(
+                    &self.s,
+                    &self.ctx,
+                    &[
+                        Belief {
+                            cfg: self.bel[0].cfg.clone(),
+                            p: r[0].clone(),
+                        },
+                        Belief {
+                            cfg: self.bel[1].cfg.clone(),
+                            p: r[1].clone(),
+                        },
+                    ],
+                    [&v[0], &v[1]],
+                );
+            }
+            self.data
+                .push_policy(&sv, &self.ctx, self.data.nv - 1, player);
+        }
+        self.carried.clear();
+        self.walk = Some(Walk {
+            tree: WalkState::Cpu(sv),
+            slot,
+            node: 0,
+            drawn: 0,
+            strat: Vec::new(),
+            carries: None,
+        });
+        self.data.exact_fallbacks += 1;
+        self.data.oversize_routes += oversize as usize;
     }
 
     /// The game ended: blend the outcome into the parked targets, fill the
@@ -1398,7 +1480,7 @@ pub fn gen_workers_per() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2)
-        .clamp(1, 16)
+        .clamp(1, 64)
 }
 
 /// Worker count follows the box, not the game count (the old rule
@@ -1419,7 +1501,24 @@ pub fn run_games_gpu(
     gpus: &[crate::gpu::GpuClient],
     route: &(dyn Fn(usize) -> usize + Sync),
 ) -> Data {
+    run_games_gpu_until(games, seed, nets, gc, gpus, route, None)
+}
+
+/// Deadline-aware form used by the streaming trainer. At the deadline no new
+/// game or solve is admitted; already-submitted waves drain, and unfinished
+/// games are reported as time-censored rather than silently counted as drops.
+#[cfg(feature = "gpu")]
+pub fn run_games_gpu_until(
+    games: usize,
+    seed: u64,
+    nets: &[Nets],
+    gc: &GameCfg,
+    gpus: &[crate::gpu::GpuClient],
+    route: &(dyn Fn(usize) -> usize + Sync),
+    deadline: Option<std::time::Instant>,
+) -> Data {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    static EXACT_FALLBACK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     // Live games per worker: one solving on the GPU while another builds its
     // tree on the CPU. More than two is worth it whenever the service is the
     // bottleneck — the resident live set is `workers * per`, and a bigger live
@@ -1451,10 +1550,18 @@ pub fn run_games_gpu(
                     let (tx, rx) = std::sync::mpsc::channel();
                     let mut live = 0usize;
                     loop {
+                        let expired = deadline.is_some_and(|x| std::time::Instant::now() >= x);
                         // Advance every idle game to its next solve (or its
                         // end), starting fresh games while any remain.
                         for k in 0..per {
                             if busy[k] {
+                                continue;
+                            }
+                            if expired {
+                                if game[k].take().is_some() {
+                                    live -= 1;
+                                    out.censored_games += 1;
+                                }
                                 continue;
                             }
                             loop {
@@ -1473,6 +1580,13 @@ pub fn run_games_gpu(
                                 };
                                 match step {
                                     Step::Submitted => {
+                                        if deadline.is_some_and(|x| std::time::Instant::now() >= x)
+                                        {
+                                            game[k] = None;
+                                            live -= 1;
+                                            out.censored_games += 1;
+                                            break;
+                                        }
                                         let job = g.take_job().expect("submitted job");
                                         let dev = route(g.pending_slot()) % gpus.len();
                                         gpus[dev]
@@ -1482,6 +1596,13 @@ pub fn run_games_gpu(
                                         break;
                                     }
                                     Step::Ended => {
+                                        if deadline.is_some_and(|x| std::time::Instant::now() >= x)
+                                        {
+                                            game[k] = None;
+                                            live -= 1;
+                                            out.censored_games += 1;
+                                            break;
+                                        }
                                         let _ = g.finish();
                                         out.merge(g.take_data());
                                         game[k] = None;
@@ -1504,22 +1625,18 @@ pub fn run_games_gpu(
                         };
                         out.gpu_wait_s += t0.elapsed().as_secs_f32();
                         busy[k] = false;
+                        if deadline.is_some_and(|x| std::time::Instant::now() >= x) {
+                            game[k] = None;
+                            live -= 1;
+                            out.censored_games += 1;
+                            continue;
+                        }
                         match res {
                             Ok(trip1) => game[k].as_mut().expect("pending game").resume(trip1),
-                            // A subgame the service cannot hold is a real
-                            // position. The WIP service still abandons that
-                            // game instead of taking the process down; its
-                            // partial data is discarded rather than merged, so
-                            // the buffer never sees a half-played game. This is
-                            // counted as an error and must be zero in a valid
-                            // training run.
                             Err(e) => {
-                                out.dropped += 1;
-                                if out.dropped == 1 {
-                                    eprintln!("gen: abandoning a game: {e}");
-                                }
-                                game[k] = None;
-                                live -= 1;
+                                eprintln!("gen: exact CPU retry after GPU error: {e}");
+                                let _exclusive = EXACT_FALLBACK.lock().unwrap();
+                                game[k].as_mut().expect("pending game").retry_cpu(nets);
                             }
                         }
                     }
@@ -1533,6 +1650,186 @@ pub fn run_games_gpu(
         }
         merged
     })
+}
+
+/// Continuous ReBeL generation for the trainer. A fixed number of CPU builder
+/// threads each owns many lightweight game actors; completed solves are
+/// detached immediately and merged into bounded chunks while the actors keep
+/// playing. This eager path is valid for pure bootstrap targets (`mc_mix=0`)
+/// with the auxiliary loss disabled: value and policy targets are final at GPU
+/// completion, while outcome-dependent auxiliary bytes remain zero.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn run_games_gpu_stream(
+    seed: u64,
+    nets: &[Nets],
+    gc: &GameCfg,
+    gpus: &[crate::gpu::GpuClient],
+    workers: usize,
+    actors_per_worker: usize,
+    chunk_solves: usize,
+    stop: &std::sync::atomic::AtomicBool,
+    output: std::sync::mpsc::Sender<Result<Option<Data>, String>>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    assert_eq!(gc.collect, Collect::Rebel);
+    assert_eq!(
+        gc.mc_mix, 0.0,
+        "eager stream requires pure bootstrap targets"
+    );
+    let workers = workers.max(1);
+    let per = actors_per_worker.max(1);
+    let chunk_solves = chunk_solves.max(1);
+    let next = AtomicUsize::new(0);
+    let (data_tx, data_rx) = std::sync::mpsc::sync_channel(workers * 4);
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let data_tx = data_tx.clone();
+            let next = &next;
+            scope.spawn(move || {
+                let mut game: Vec<Option<Game>> = (0..per).map(|_| None).collect();
+                let mut busy = vec![false; per];
+                let (tx, rx) = std::sync::mpsc::channel();
+                let mut live = 0usize;
+                loop {
+                    let stopping = stop.load(Ordering::Acquire);
+                    for k in 0..per {
+                        if busy[k] {
+                            continue;
+                        }
+                        if stopping {
+                            if let Some(mut g) = game[k].take() {
+                                let mut d = g.take_data();
+                                d.censored_games += 1;
+                                let _ = data_tx.send(Ok(d));
+                                live -= 1;
+                            }
+                            continue;
+                        }
+                        loop {
+                            if game[k].is_none() {
+                                let i = next.fetch_add(1, Ordering::Relaxed);
+                                game[k] = Some(Game::new(Rng::new(worker_seed(seed, i)), gc));
+                                live += 1;
+                            }
+                            let g = game[k].as_mut().expect("live stream game");
+                            let step = {
+                                let _t = crate::timed!(ADVANCE);
+                                g.advance(Some(gpus), nets)
+                            };
+                            match step {
+                                Step::Submitted => {
+                                    if stop.load(Ordering::Acquire) {
+                                        let mut g = game[k].take().unwrap();
+                                        let mut d = g.take_data();
+                                        d.censored_games += 1;
+                                        let _ = data_tx.send(Ok(d));
+                                        live -= 1;
+                                        break;
+                                    }
+                                    let job = g.take_job().expect("submitted stream job");
+                                    let dev = gpus
+                                        .iter()
+                                        .enumerate()
+                                        .min_by_key(|(_, gpu)| gpu.queued_work())
+                                        .map_or(0, |(i, _)| i);
+                                    if let Err(e) = gpus[dev].submit_tagged(job, k, tx.clone()) {
+                                        stop.store(true, Ordering::Release);
+                                        let _ = data_tx.send(Err(e));
+                                    } else {
+                                        busy[k] = true;
+                                    }
+                                    break;
+                                }
+                                Step::Ended => {
+                                    let _ = g.finish();
+                                    let d = g.take_data();
+                                    if data_tx.send(Ok(d)).is_err() {
+                                        stop.store(true, Ordering::Release);
+                                    }
+                                    game[k] = None;
+                                    live -= 1;
+                                }
+                            }
+                        }
+                    }
+                    if live == 0 && stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if !busy.iter().any(|&x| x) {
+                        continue;
+                    }
+                    let waited = std::time::Instant::now();
+                    let Ok((k, result)) = rx.recv() else {
+                        stop.store(true, Ordering::Release);
+                        let _ = data_tx.send(Err("GPU stream completion channel closed".into()));
+                        continue;
+                    };
+                    busy[k] = false;
+                    if stop.load(Ordering::Acquire) {
+                        if let Some(mut g) = game[k].take() {
+                            let mut d = g.take_data();
+                            d.gpu_wait_s += waited.elapsed().as_secs_f32();
+                            d.censored_games += 1;
+                            let _ = data_tx.send(Ok(d));
+                            live -= 1;
+                        }
+                        continue;
+                    }
+                    match result {
+                        Ok(value) => {
+                            let g = game[k].as_mut().expect("pending stream game");
+                            g.resume(value);
+                            let mut d = g.take_data();
+                            d.gpu_wait_s += waited.elapsed().as_secs_f32();
+                            if data_tx.send(Ok(d)).is_err() {
+                                stop.store(true, Ordering::Release);
+                            }
+                        }
+                        Err(e) => {
+                            stop.store(true, Ordering::Release);
+                            let _ = data_tx.send(Err(format!("GPU stream solve failed: {e}")));
+                        }
+                    }
+                }
+            });
+        }
+        drop(data_tx);
+
+        let mut chunk = Data::default();
+        let mut failed = false;
+        while let Ok(item) = data_rx.recv() {
+            match item {
+                Ok(d) if !failed => {
+                    chunk.merge(d);
+                    if chunk.soff.len() >= chunk_solves {
+                        if output.send(Ok(Some(std::mem::take(&mut chunk)))).is_err() {
+                            stop.store(true, Ordering::Release);
+                            failed = true;
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) if !failed => {
+                    failed = true;
+                    stop.store(true, Ordering::Release);
+                    let _ = output.send(Err(e));
+                }
+                Err(_) => {}
+            }
+        }
+        if !failed
+            && (chunk.soff.len() > 0
+                || chunk.games > 0
+                || chunk.censored_games > 0
+                || chunk.decisions > 0)
+        {
+            let _ = output.send(Ok(Some(chunk)));
+        }
+        let _ = output.send(Ok(None));
+    });
 }
 
 /// A GPU evaluation match: the same paired-seating scheme as `eval_match`,

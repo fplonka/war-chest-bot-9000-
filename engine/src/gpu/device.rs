@@ -405,6 +405,20 @@ impl Executor {
         Ok(())
     }
 
+    /// Release wave-sized allocations and graph executables while retaining
+    /// the CUDA context, kernels, cuBLAS handle, and immutable weight banks.
+    /// The dispatcher calls this on every lane before admitting a multi-GiB
+    /// exclusive wave, then ordinary lanes regrow on demand.
+    pub fn trim(&mut self) -> Result<(), String> {
+        self.stream
+            .synchronize()
+            .map_err(|e| format!("synchronize before GPU trim: {e:?}"))?;
+        self.buffers = None;
+        self.graphs.clear();
+        self.next_graph = 0;
+        Ok(())
+    }
+
     pub fn solve(&mut self, wave: Wave, version: u64) -> Result<Vec<SolveResult>, String> {
         let profile = std::env::var_os("WARCHEST_GPU_PROFILE").is_some();
         let started = Instant::now();
@@ -1593,6 +1607,7 @@ fn unpack(
                 data,
             },
             weight_version: version,
+            oversize_route: false,
         });
     }
     Ok(out)
@@ -1809,4 +1824,26 @@ fn cuda_preamble(l: &V3Layout) -> String {
         crate::rebel::GPU_ROW_INITIATIVE, crate::rebel::GPU_ROW_INIT_MOVED,
         crate::rebel::GPU_ROW_TO_ACT, crate::rebel::GPU_ROW_PLIES,
     )
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+    use crate::serialize::PackedJob;
+
+    #[test]
+    fn one_job_admission_matches_device_arena_growth() {
+        let mut job = PackedJob::stub();
+        job.carried.push([vec![1.0], vec![1.0]]);
+        let reserved = job.work().mutable_bytes;
+        let wave = Wave::pack(&[job]).expect("pack stub wave");
+        let layout = V3Layout::new(&wave.meta.net_dims).expect("network layout");
+        let (_, floats) = arena_layout(&wave, &layout).expect("device arena layout");
+        let allocated = floats
+            .max(1)
+            .checked_next_power_of_two()
+            .unwrap_or(floats.max(1))
+            * size_of::<f32>();
+        assert_eq!(reserved, allocated);
+    }
 }

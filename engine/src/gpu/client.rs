@@ -68,6 +68,7 @@ pub struct SolveResult {
     pub root_values: Vec<[Vec<f32>; 2]>,
     pub carries: CarryStore,
     pub weight_version: u64,
+    pub oversize_route: bool,
 }
 
 pub(crate) enum Cmd {
@@ -84,6 +85,9 @@ pub(crate) enum Cmd {
         w: Vec<f32>,
         b: Vec<f32>,
         ln: Vec<f32>,
+    },
+    Trim {
+        ready: mpsc::SyncSender<Result<(), String>>,
     },
     Shutdown,
 }
