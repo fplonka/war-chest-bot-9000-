@@ -62,7 +62,7 @@ fn dispatcher(
     ready: mpsc::Sender<Result<(), String>>,
     queued_work: Arc<AtomicU64>,
 ) {
-    let lanes = env_usize("WARCHEST_WAVE_LANES", 2).clamp(1, 3);
+    let lanes = env_usize("WARCHEST_WAVE_LANES", 2).clamp(1, 4);
     let (lane_ready_tx, lane_ready_rx) = mpsc::channel();
     let mut senders = Vec::with_capacity(lanes);
     let mut joins = Vec::with_capacity(lanes);
