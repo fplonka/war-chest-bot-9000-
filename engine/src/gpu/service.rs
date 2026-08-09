@@ -133,57 +133,6 @@ fn dispatcher(
                 cost,
                 reply,
             } => {
-                if work.requires_exclusive_route() {
-                    // An exclusive wave needs the memory retained by every
-                    // ordinary lane. Drain this card, release those buffers,
-                    // run the whale alone, and only then resume admission.
-                    while lane_work.iter().any(|x| x.load(Ordering::Acquire) != 0) {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    let mut trim_error = None;
-                    for tx in &senders {
-                        let (done_tx, done_rx) = mpsc::sync_channel(0);
-                        if tx.send(Cmd::Trim { ready: done_tx }).is_err() {
-                            trim_error = Some("GPU lane is gone during exclusive trim".into());
-                            break;
-                        }
-                        match done_rx.recv() {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => {
-                                trim_error = Some(e);
-                                break;
-                            }
-                            Err(_) => {
-                                trim_error = Some("GPU lane died during exclusive trim".into());
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(e) = trim_error {
-                        queued_work.fetch_sub(cost, Ordering::Relaxed);
-                        let _ = reply.send((tag, Err(e)));
-                        continue;
-                    }
-                    lane_work[0].fetch_add(cost, Ordering::Release);
-                    if let Err(e) = senders[0].send(Cmd::Submit {
-                        job,
-                        work,
-                        tag,
-                        cost,
-                        reply,
-                    }) {
-                        lane_work[0].fetch_sub(cost, Ordering::Release);
-                        queued_work.fetch_sub(cost, Ordering::Relaxed);
-                        if let Cmd::Submit { tag, reply, .. } = e.0 {
-                            let _ = reply.send((tag, Err("GPU exclusive lane is gone".into())));
-                        }
-                        continue;
-                    }
-                    while lane_work[0].load(Ordering::Acquire) != 0 {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    continue;
-                }
                 let lane = lane_work
                     .iter()
                     .enumerate()
@@ -222,9 +171,6 @@ fn dispatcher(
                         ln: ln.clone(),
                     });
                 }
-            }
-            Cmd::Trim { ready } => {
-                let _ = ready.send(Err("trim is an internal lane command".into()));
             }
             Cmd::Shutdown => break,
         }
@@ -356,7 +302,12 @@ fn run(
         let pack_started = Instant::now();
         let packed = Wave::pack(&jobs);
         let packed_at = Instant::now();
-        let result = packed.and_then(|wave| exec.solve(wave, version));
+        let result = if tickets[0].3 {
+            exec.trim()
+                .and_then(|()| packed.and_then(|wave| exec.solve(wave, version)))
+        } else {
+            packed.and_then(|wave| exec.solve(wave, version))
+        };
         if let Some((cells, reach, reverse, table_bytes, mutable_bytes, max_bytes, oldest_ms)) =
             profile_shape
         {
@@ -435,9 +386,6 @@ fn handle(
             Ok(()) => *current_version = version,
             Err(e) => eprintln!("GPU weight publication {version} failed: {e}"),
         },
-        Cmd::Trim { ready } => {
-            let _ = ready.send(exec.trim());
-        }
         Cmd::Shutdown => *shutdown = true,
     }
     retain_needed_banks(exec, *current_version, pending);

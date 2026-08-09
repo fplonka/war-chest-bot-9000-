@@ -86,9 +86,6 @@ pub(crate) enum Cmd {
         b: Vec<f32>,
         ln: Vec<f32>,
     },
-    Trim {
-        ready: mpsc::SyncSender<Result<(), String>>,
-    },
     Shutdown,
 }
 

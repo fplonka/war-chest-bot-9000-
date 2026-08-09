@@ -405,10 +405,10 @@ impl Executor {
         Ok(())
     }
 
-    /// Release wave-sized allocations and graph executables while retaining
-    /// the CUDA context, kernels, cuBLAS handle, and immutable weight banks.
-    /// The dispatcher calls this on every lane before admitting a multi-GiB
-    /// exclusive wave, then ordinary lanes regrow on demand.
+    /// Release this lane's wave-sized allocations and graph executables while
+    /// retaining the CUDA context, kernels, cuBLAS handle, and immutable weight
+    /// banks. An exclusive wave trims only the lane that will execute it; the
+    /// other lanes keep making progress and retain their ordinary buffers.
     pub fn trim(&mut self) -> Result<(), String> {
         self.stream
             .synchronize()
