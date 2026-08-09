@@ -10,7 +10,9 @@ use std::mem::{align_of, size_of, MaybeUninit};
 use std::sync::Arc;
 use std::time::Instant;
 
+use cudarc::cublas::sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH;
 use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
+use cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS;
 use cudarc::cublas::CudaBlas;
 use cudarc::driver::safe::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig};
 use cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY;
@@ -297,6 +299,15 @@ impl Executor {
             .new_stream()
             .map_err(|e| format!("CUDA stream: {e:?}"))?;
         let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cuBLAS: {e:?}"))?;
+        let precise_math = std::env::var_os("WARCHEST_GPU_PRECISE_MATH").is_some();
+        if !precise_math {
+            let status = unsafe {
+                cudarc::cublas::sys::cublasSetMathMode(*blas.handle(), CUBLAS_TF32_TENSOR_OP_MATH)
+            };
+            if status != CUBLAS_STATUS_SUCCESS {
+                return Err(format!("enable cuBLAS TF32 tensor math: {status:?}"));
+            }
+        }
         let layout = V3Layout::new(&dims)?;
         validate_layout(&layout)?;
         let (major, minor) = (
@@ -316,7 +327,7 @@ impl Executor {
         // handling use the native fast paths too. The production path is fast
         // math by default; the opt-out exists only for numerical diagnosis.
         let mut nvrtc_options = vec!["--generate-line-info".into(), "--use_fast_math".into()];
-        if std::env::var_os("WARCHEST_GPU_PRECISE_MATH").is_some() {
+        if precise_math {
             nvrtc_options.pop();
         }
         let source = format!(
