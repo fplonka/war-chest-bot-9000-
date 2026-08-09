@@ -350,7 +350,12 @@ impl Executor {
             .ok()
             .and_then(|x| x.parse::<u32>().ok())
             .filter(|&x| x > 0)
-            .unwrap_or(u32::MAX);
+            // The unrestricted occupancy maximum overpopulates cooperative
+            // level barriers on the heterogeneous 1,000-root tape. Three
+            // blocks/SM measured 695/s versus 642/s unrestricted; four and
+            // five were both slower. Keep the environment override for other
+            // cards and diagnostic sweeps.
+            .unwrap_or(3);
         let sweep_block = std::env::var("WARCHEST_SWEEP_BLOCK")
             .ok()
             .and_then(|x| x.parse::<u32>().ok())
