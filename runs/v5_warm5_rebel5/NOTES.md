@@ -12,4 +12,10 @@ The trainer again kept up, so the sustained miss is on the search side. ReBeL re
 
 ## State of the project at this point
 
-This is the first sustained v5 measurement with the intended Greedy initialization. It improves materially on the invalid short-warm run, but it does not clear the performance gate. The initial and final snapshots still need the post-run ladder before we can say whether the harder workload represents useful learning. Until that result exists, the correct next action is strength validation rather than more scheduler tuning.
+This is the first sustained v5 measurement with the intended Greedy initialization. It improves materially on the invalid short-warm run, but it does not clear the performance gate.
+
+## Ladder follow-up
+
+The 60-game-per-pair round robin shows that the ReBeL phase learned in the right direction. Final beat init 25–9 with 26 draws, a score of 0.633, and beat Random 28–1 with 31 draws. Against Greedy it won 24–16 with 20 draws, a score of 0.567. The combined fit put Greedy at zero Elo, final at −3 ± 28, init at −108 ± 27, and Random at −220 ± 30.
+
+The direct results establish that self-play made the model substantially stronger and moved it from below Greedy to roughly Greedy strength. The favorable head-to-head score against Greedy is not yet statistically decisive, which is why the fitted ratings call them tied. This is enough to reject the earlier degenerate-game explanation for the performance tail: the fully warmed run is learning useful play, and its sustained search workload is the one worth optimizing.
