@@ -239,8 +239,8 @@ macro_rules! kernels {
 kernels! {
     pack_cards, bias_act, cards_finish, pile_pe, pack_piles, assemble,
     trunk_norm, holding_in, slot_sum, finish_zg,
-    init_strategy, seed_reach, reach_level, seed_sum, root_average,
-    belief_sums, head_entry, head_act, wu_bias, readout, backprop,
+    init_strategy, seed_reach, reach_sweep, seed_sum, root_average,
+    belief_sums, head_entry, head_act, wu_bias, readout, backprop_sweep,
     normalize_strategy, gather_carry, collect_root,
 }
 
@@ -253,6 +253,9 @@ pub struct Executor {
     buffers: Option<DeviceBuffers>,
     graphs: Vec<GraphExec>,
     next_graph: usize,
+    backprop_blocks: u32,
+    reach_blocks: u32,
+    sweep_block: u32,
 }
 
 struct GraphExec {
@@ -307,6 +310,9 @@ impl Executor {
                 .map_err(|e| format!("CUDA capability: {e:?}"))?,
         );
         let arch = format!("compute_{major}{minor}");
+        let cuda_root = std::env::var("CUDA_PATH")
+            .or_else(|_| std::env::var("CUDA_HOME"))
+            .unwrap_or_else(|_| "/usr/local/cuda".into());
         let source = format!(
             "{}\n{}",
             cuda_preamble(&layout),
@@ -316,6 +322,10 @@ impl Executor {
             &source,
             nvrtc::CompileOptions {
                 arch: Some(Box::leak(arch.into_boxed_str())),
+                include_paths: vec![
+                    format!("{cuda_root}/include"),
+                    format!("{cuda_root}/targets/x86_64-linux/include/cccl"),
+                ],
                 options: vec!["--generate-line-info".into()],
                 ..Default::default()
             },
@@ -325,6 +335,33 @@ impl Executor {
             .load_module(ptx)
             .map_err(|e| format!("v5 CUDA module: {e:?}"))?;
         let kernels = Kernels::load(&module)?;
+        let sms = context
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )
+            .map_err(|e| format!("CUDA multiprocessor count: {e:?}"))? as u32;
+        let sweep_blocks_per_sm = std::env::var("WARCHEST_SWEEP_BLOCKS_PER_SM")
+            .ok()
+            .and_then(|x| x.parse::<u32>().ok())
+            .filter(|&x| x > 0)
+            .unwrap_or(u32::MAX);
+        let sweep_block = std::env::var("WARCHEST_SWEEP_BLOCK")
+            .ok()
+            .and_then(|x| x.parse::<u32>().ok())
+            .filter(|&x| (32..=1024).contains(&x) && x % 32 == 0)
+            .unwrap_or(BLOCK);
+        let blocks_per_sm = kernels
+            .backprop_sweep
+            .occupancy_max_active_blocks_per_multiprocessor(sweep_block, 0, None)
+            .map_err(|e| format!("backprop sweep occupancy: {e:?}"))?
+            .min(sweep_blocks_per_sm);
+        let backprop_blocks = sms.saturating_mul(blocks_per_sm).max(1);
+        let blocks_per_sm = kernels
+            .reach_sweep
+            .occupancy_max_active_blocks_per_multiprocessor(sweep_block, 0, None)
+            .map_err(|e| format!("reach sweep occupancy: {e:?}"))?
+            .min(sweep_blocks_per_sm);
+        let reach_blocks = sms.saturating_mul(blocks_per_sm).max(1);
         let initial = WeightBank::upload(&stream, &dims, w, b, ln)?;
         let mut banks = HashMap::new();
         banks.insert(0, initial);
@@ -337,6 +374,9 @@ impl Executor {
             buffers: None,
             graphs: Vec::with_capacity(GRAPH_CLASSES),
             next_graph: 0,
+            backprop_blocks,
+            reach_blocks,
+            sweep_block,
         })
     }
 
@@ -398,42 +438,8 @@ impl Executor {
                     factor(m, cfr.beta),
                     (m / (m + 1.0)).powf(cfr.gamma),
                 );
-                for level in (0..wave.work.levels).rev() {
-                    let begin = wave.back_level[p][level] as i32;
-                    let end = wave.back_level[p][level + 1] as i32;
-                    launch!(
-                        self,
-                        device,
-                        bank,
-                        backprop,
-                        warps((end - begin).max(0) as usize),
-                        p as i32,
-                        begin,
-                        end,
-                        0i32,
-                        da,
-                        db,
-                        ds,
-                        cfr.predict
-                    )?;
-                }
-                for level in 0..wave.work.levels {
-                    let begin = wave.reach_level[p][level] as i32;
-                    let end = wave.reach_level[p][level + 1] as i32;
-                    launch!(
-                        self,
-                        device,
-                        bank,
-                        reach_level,
-                        threads(end - begin),
-                        p as i32,
-                        begin,
-                        end,
-                        0i32,
-                        0i32,
-                        1i32
-                    )?;
-                }
+                self.launch_backprop_sweep(&device, bank, p, false, da, db, ds, cfr.predict)?;
+                self.launch_reach_sweep(&device, bank, p, false, false, true)?;
                 launch!(
                     self,
                     device,
@@ -465,29 +471,11 @@ impl Executor {
                     0i32,
                     root as i32
                 )?;
-                self.full_reach(&device, bank, &wave, false, true)?;
+                self.full_reach(&device, bank, false, true)?;
                 self.run_head(&device, bank, true, 0)?;
                 for p in 0..2 {
                     self.launch_readout(&device, bank, p)?;
-                    for level in (0..wave.work.levels).rev() {
-                        let begin = wave.back_level[p][level] as i32;
-                        let end = wave.back_level[p][level + 1] as i32;
-                        launch!(
-                            self,
-                            device,
-                            bank,
-                            backprop,
-                            warps((end - begin).max(0) as usize),
-                            p as i32,
-                            begin,
-                            end,
-                            1i32,
-                            0.0f32,
-                            0.0f32,
-                            0.0f32,
-                            0.0f32
-                        )?;
-                    }
+                    self.launch_backprop_sweep(&device, bank, p, true, 0.0, 0.0, 0.0, 0.0)?;
                     launch!(
                         self,
                         device,
@@ -806,7 +794,7 @@ impl Executor {
             )?;
         }
         launch!(self, d, bank, seed_reach, w.jobs.len() as u32, 0i32, -1i32)?;
-        self.full_reach(d, bank, w, false, false)?;
+        self.full_reach(d, bank, false, false)?;
         for p in 0..2 {
             launch!(
                 self,
@@ -835,28 +823,11 @@ impl Executor {
         &self,
         d: &DeviceWave,
         bank: &WeightBank,
-        w: &Wave,
         snap: bool,
         strat_snap: bool,
     ) -> Result<(), String> {
-        for level in 0..w.work.levels {
-            for p in 0..2 {
-                let begin = w.reach_level[p][level] as i32;
-                let end = w.reach_level[p][level + 1] as i32;
-                launch!(
-                    self,
-                    d,
-                    bank,
-                    reach_level,
-                    threads(end - begin),
-                    p as i32,
-                    begin,
-                    end,
-                    snap as i32,
-                    strat_snap as i32,
-                    0i32
-                )?;
-            }
+        for p in 0..2 {
+            self.launch_reach_sweep(d, bank, p, snap, strat_snap, false)?;
         }
         Ok(())
     }
@@ -890,7 +861,7 @@ impl Executor {
         slot: i32,
     ) -> Result<(), String> {
         launch!(self, d, bank, seed_reach, w.jobs.len() as u32, 1i32, -1i32)?;
-        self.full_reach(d, bank, w, true, true)?;
+        self.full_reach(d, bank, true, true)?;
         launch!(
             self,
             d,
@@ -983,6 +954,77 @@ impl Executor {
             0.0,
         )?;
         launch!(self, d, bank, wu_bias, threads_usize(rows * l.rank))?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_backprop_sweep(
+        &self,
+        d: &DeviceWave,
+        bank: &WeightBank,
+        player: usize,
+        fixed: bool,
+        da: f32,
+        db: f32,
+        ds: f32,
+        predict: f32,
+    ) -> Result<(), String> {
+        if d.host.back_task_n[player] == 0 {
+            return Ok(());
+        }
+        let f = self.kernels.backprop_sweep.clone();
+        let mut args = self.stream.launch_builder(&f);
+        let player = player as i32;
+        let mode = fixed as i32;
+        args.arg(&d.buffers.dev)
+            .arg(&bank.dev)
+            .arg(&player)
+            .arg(&mode)
+            .arg(&da)
+            .arg(&db)
+            .arg(&ds)
+            .arg(&predict);
+        let cfg = LaunchConfig {
+            grid_dim: (self.backprop_blocks, 1, 1),
+            block_dim: (self.sweep_block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch_cooperative(cfg) }
+            .map_err(|e| format!("CUDA backprop sweep launch: {e:?}"))?;
+        Ok(())
+    }
+
+    fn launch_reach_sweep(
+        &self,
+        d: &DeviceWave,
+        bank: &WeightBank,
+        player: usize,
+        snap: bool,
+        strat_snap: bool,
+        accumulate: bool,
+    ) -> Result<(), String> {
+        if d.host.reach_task_n[player] == 0 {
+            return Ok(());
+        }
+        let f = self.kernels.reach_sweep.clone();
+        let mut args = self.stream.launch_builder(&f);
+        let player = player as i32;
+        let snap = snap as i32;
+        let strat_snap = strat_snap as i32;
+        let accumulate = accumulate as i32;
+        args.arg(&d.buffers.dev)
+            .arg(&bank.dev)
+            .arg(&player)
+            .arg(&snap)
+            .arg(&strat_snap)
+            .arg(&accumulate);
+        let cfg = LaunchConfig {
+            grid_dim: (self.reach_blocks, 1, 1),
+            block_dim: (self.sweep_block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch_cooperative(cfg) }
+            .map_err(|e| format!("CUDA reach sweep launch: {e:?}"))?;
         Ok(())
     }
 

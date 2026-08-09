@@ -2,6 +2,10 @@
 // shape and feature geometry. Every tree/config/cell address below is already
 // wave-global; kernels never recover a solve owner in their hot loops.
 
+#include <cooperative_groups.h>
+
+namespace cg = cooperative_groups;
+
 #define EPS 1e-6f
 #define LN_EPS 1e-5f
 #define SMOOTH 1e-30f
@@ -399,12 +403,9 @@ extern "C" __global__ void seed_reach(const WaveDev* w, const WeightDev* wt,
     }
 }
 
-extern "C" __global__ void reach_level(const WaveDev* w, const WeightDev* wt,
-                                        int player, int begin, int end,
-                                        int snap, int strat_snap, int accumulate) {
-    (void)wt;
-    int k = begin + blockIdx.x * blockDim.x + threadIdx.x;
-    if (k >= end) return;
+__device__ __forceinline__ void reach_task(
+    const WaveDev* w, int player, int k,
+    int snap, int strat_snap, int accumulate) {
     const Task* tasks = TP(w, Task, player ? T_REACH_TASK1 : T_REACH_TASK0);
     Task q = tasks[k];
     int node = q.node, c = q.config;
@@ -443,6 +444,23 @@ extern "C" __global__ void reach_level(const WaveDev* w, const WeightDev* wt,
         unsigned int hi = TP(w, unsigned int, T_LEGAL_OFF)[row + 1];
         for (unsigned int x = lo; x < hi; x++)
             AP(w, A_SUM)[x] += value * AP(w, A_CUR)[x];
+    }
+}
+
+extern "C" __global__ void reach_sweep(
+    const WaveDev* w, const WeightDev* wt, int player,
+    int snap, int strat_snap, int accumulate) {
+    (void)wt;
+    cg::grid_group grid = cg::this_grid();
+    int thread = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    const unsigned int* level = TP(
+        w, unsigned int, player ? T_REACH_LEVEL1 : T_REACH_LEVEL0);
+    for (int l = 0; l < w->nlevels; l++) {
+        int begin = level[l], end = level[l + 1];
+        for (int k = begin + thread; k < end; k += stride)
+            reach_task(w, player, k, snap, strat_snap, accumulate);
+        grid.sync();
     }
 }
 
@@ -607,13 +625,9 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
 }
 
 // mode 0: CFR update using current strategy; mode 1: fixed final strategy.
-extern "C" __global__ void backprop(const WaveDev* w, const WeightDev* wt,
-                                     int player, int begin, int end, int mode,
-                                     float da, float db, float ds, float predict) {
-    (void)wt;
-    int lane = threadIdx.x & 31;
-    int k = begin + ((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
-    if (k >= end) return;
+__device__ __forceinline__ void backprop_task(
+    const WaveDev* w, int player, int k, int lane, int mode,
+    float da, float db, float ds, float predict) {
     const Task* tasks = TP(w, Task, player ? T_BACK_TASK1 : T_BACK_TASK0);
     Task q = tasks[k];
     int node = q.node, c = q.config;
@@ -685,6 +699,24 @@ extern "C" __global__ void backprop(const WaveDev* w, const WeightDev* wt,
     if (total > 0.0f) {
         float inv = 1.0f / total;
         for (unsigned int x = lo + lane; x < hi; x += 32) AP(w, A_CUR)[x] *= inv;
+    }
+}
+
+extern "C" __global__ void backprop_sweep(
+    const WaveDev* w, const WeightDev* wt, int player, int mode,
+    float da, float db, float ds, float predict) {
+    (void)wt;
+    cg::grid_group grid = cg::this_grid();
+    int lane = threadIdx.x & 31;
+    int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int stride = (gridDim.x * blockDim.x) >> 5;
+    const unsigned int* level = TP(
+        w, unsigned int, player ? T_BACK_LEVEL1 : T_BACK_LEVEL0);
+    for (int l = w->nlevels - 1; l >= 0; l--) {
+        int begin = level[l], end = level[l + 1];
+        for (int k = begin + warp; k < end; k += stride)
+            backprop_task(w, player, k, lane, mode, da, db, ds, predict);
+        grid.sync();
     }
 }
 
