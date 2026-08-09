@@ -183,6 +183,7 @@ impl Wave {
             back_level: [vec![0; max_levels + 1], vec![0; max_levels + 1]],
             readout: Vec::new(),
         };
+        w.reserve_tables(&jobs);
 
         // Task maps are level-major across the whole wave. Pack the immutable
         // arrays first, then derive maps from the already-patched node ids.
@@ -193,6 +194,84 @@ impl Wave {
         w.build_tasks(&jobs, max_levels);
         w.validate()?;
         Ok(w)
+    }
+
+    /// Reserve the final concatenated sizes before patching. Large tail waves
+    /// otherwise repeatedly copy tens or hundreds of MiB while each of these
+    /// independent SoA vectors grows geometrically.
+    fn reserve_tables(&mut self, jobs: &[&PackedJob]) {
+        macro_rules! table_len {
+            ($field:ident) => {
+                jobs.iter().map(|j| j.tables.$field.len()).sum::<usize>()
+            };
+        }
+        macro_rules! reserve {
+            ($dst:ident, $n:expr) => {
+                self.$dst.reserve($n)
+            };
+        }
+
+        let nodes = table_len!(node_kind);
+        let rows = jobs.iter().map(|j| j.tables.rows).sum::<usize>();
+        let cfgs = jobs.iter().map(|j| j.tables.ncfg).sum::<usize>();
+        reserve!(jobs, jobs.len());
+        reserve!(node_kind, nodes);
+        reserve!(node_player, nodes);
+        reserve!(node_nc, 2 * nodes);
+        reserve!(node_child_start, nodes);
+        reserve!(node_child, table_len!(node_child));
+        reserve!(legal_row_of, table_len!(legal_row_of));
+        reserve!(legal_off, table_len!(legal_off).saturating_sub(jobs.len()));
+        reserve!(legal_value, table_len!(legal_child));
+        reserve!(draw_off, nodes);
+        reserve!(draw_to, table_len!(draw_to));
+        reserve!(draw_p, table_len!(draw_p));
+        reserve!(draw_row_off, nodes);
+        reserve!(draw_row_start, table_len!(draw_row_start));
+        reserve!(reach_off, nodes);
+        reserve!(soff, nodes);
+        reserve!(voff, nodes);
+        reserve!(node_parent, nodes);
+        reserve!(rev_row_of, nodes);
+        reserve!(rev_start, table_len!(rev_start).saturating_sub(jobs.len()));
+        reserve!(rev_src, table_len!(rev_src));
+        reserve!(rev_cell, table_len!(rev_cell));
+        reserve!(rvd_row_of, nodes);
+        reserve!(rvd_start, table_len!(rvd_start).saturating_sub(jobs.len()));
+        reserve!(rvd_src, table_len!(rvd_src));
+        reserve!(rvd_p, table_len!(rvd_p));
+        reserve!(row_node, rows);
+        reserve!(row_job, rows);
+        reserve!(
+            row_cfg_off,
+            table_len!(leaf_coff).saturating_sub(jobs.len())
+        );
+        reserve!(row_cfg, table_len!(leaf_cidx));
+        reserve!(raw_rows, table_len!(leaf_raw));
+        reserve!(card_feat, table_len!(card_feat));
+        reserve!(ids, table_len!(ids));
+        reserve!(config_job, cfgs);
+        reserve!(cphi, table_len!(cphi));
+        reserve!(
+            roots,
+            jobs.iter()
+                .map(|j| j.root[0].len() + j.root[1].len())
+                .sum::<usize>()
+        );
+        reserve!(
+            carried,
+            jobs.iter()
+                .flat_map(|j| &j.carried)
+                .map(|r| r[0].len() + r[1].len())
+                .sum::<usize>()
+        );
+        reserve!(node_utility, nodes);
+        let terminals = table_len!(term_leaves);
+        reserve!(terminal, terminals);
+        reserve!(terminal_utility, terminals);
+        reserve!(exit_nodes, table_len!(leaf_rows) + terminals);
+        reserve!(exit_coff, table_len!(snap_coff).saturating_sub(jobs.len()));
+        reserve!(readout, table_len!(leaf_rows) + terminals);
     }
 
     fn push_job(&mut self, job_id: usize, job: &PackedJob) -> Result<(), String> {
@@ -375,12 +454,62 @@ impl Wave {
     }
 
     fn build_tasks(&mut self, jobs: &[&PackedJob], levels: usize) {
+        let mut reach_caps = vec![[[0usize; 3]; 2]; levels];
+        let mut decision_caps = [0usize; 2];
+        let mut back_caps = [0usize; 2];
+        for job in jobs {
+            let t = &job.tables;
+            for level in 0..t.nlevels {
+                let lo = t.level_start[level] as usize;
+                let hi = t.level_start[level + 1] as usize;
+                for &local in &t.bfs_order[lo..hi] {
+                    let node = local as usize;
+                    let nc = [
+                        (t.cfg_off[2 * node + 1] - t.cfg_off[2 * node]) as usize,
+                        (t.cfg_off[2 * node + 2] - t.cfg_off[2 * node + 1]) as usize,
+                    ];
+                    if node != 0 {
+                        let parent = t.node_parent[node] as usize;
+                        for p in 0..2 {
+                            let mode = if t.node_player[parent] as usize != p {
+                                0
+                            } else if t.rev_row_of[node] != u32::MAX {
+                                1
+                            } else {
+                                2
+                            };
+                            reach_caps[level][p][mode] += nc[p];
+                        }
+                    }
+                    if t.node_kind[node] != 2 {
+                        for p in 0..2 {
+                            back_caps[p] += nc[p];
+                        }
+                    }
+                    if t.node_kind[node] == 0 {
+                        let p = t.node_player[node] as usize;
+                        decision_caps[p] += nc[p];
+                    }
+                }
+            }
+        }
+        for p in 0..2 {
+            self.decision[p].reserve(decision_caps[p]);
+            self.reach_task[p].reserve(
+                reach_caps
+                    .iter()
+                    .map(|level| level[p].iter().sum::<usize>())
+                    .sum(),
+            );
+            self.back_task[p].reserve(back_caps[p]);
+        }
         for level in 0..levels {
             // Keep the compact `(node, config)` record, but make neighbouring
             // CUDA threads take the same reach branch: plain copies, strategy
             // reverse gathers, then chance reverse gathers.
-            let mut reach: [[Vec<Task>; 3]; 2] =
-                std::array::from_fn(|_| std::array::from_fn(|_| Vec::new()));
+            let mut reach: [[Vec<Task>; 3]; 2] = std::array::from_fn(|p| {
+                std::array::from_fn(|mode| Vec::with_capacity(reach_caps[level][p][mode]))
+            });
             for (job_id, job) in jobs.iter().enumerate() {
                 let t = &job.tables;
                 if level >= t.nlevels {
