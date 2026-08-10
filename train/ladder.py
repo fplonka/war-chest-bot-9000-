@@ -106,7 +106,15 @@ def elo_stderr(n, elo):
 SEARCH = {"depth": 2, "iters": 64, "cfr": "linear", "warm": 0.0}
 
 
-def players_of(runs, refs=("greedy",), labels=None):
+def parse_search(spec):
+    """`"dcfr:64"` -> the SEARCH dict with that rule and iteration count."""
+    if not spec:
+        return None
+    cfr, _, iters = spec.partition(":")
+    return dict(SEARCH, cfr=cfr, iters=int(iters or SEARCH["iters"]))
+
+
+def players_of(runs, refs=("greedy",), labels=None, search=None):
     """The ladder's entrants: the fixed bots, then every run's snapshots.
 
     The first reference is pinned at 0, so which references a ladder carries
@@ -135,10 +143,10 @@ def players_of(runs, refs=("greedy",), labels=None):
             if labels is not None and s["label"] not in labels:
                 continue
             ck = torch.load(f"{run}/{s['file']}", map_location="cpu", weights_only=False)
-            search = ck.get("search") or {k: cfg.get(k, v) for k, v in SEARCH.items()}
+            own = ck.get("search") or {k: cfg.get(k, v) for k, v in SEARCH.items()}
             ps.append({"name": f"{tag}.{s['label']}", "agent": "rebel",
                        "slot": len(ps), "t": s["t"], "file": s["file"],
-                       "run": run, "search": search})
+                       "run": run, "search": search or own})
     return ps
 
 
@@ -220,7 +228,7 @@ SPRT_BLOCK = 200            # games between tests; small enough to stop early
 
 def run(runs, out=None, games=60, temp=2.0, random_draft=False, seed=7,
         refs=("greedy",), labels=None, focus=(), focus_games=0, gpu=False,
-        sprt=True):
+        sprt=True, search=None):
     """Round robin, Elo fit, `ladder.json`, printed table. Returns the ratings.
 
     Games go where the information is. A round robin at one sample size spends
@@ -240,7 +248,7 @@ def run(runs, out=None, games=60, temp=2.0, random_draft=False, seed=7,
     """
     if out is None:
         out = runs[0]
-    ps = players_of(runs, refs, labels)
+    ps = players_of(runs, refs, labels, search)
     focus, focus_games = set(focus), focus_games or games
     nets = [p for p in ps if p["agent"] == "rebel"]
     if not nets:
@@ -381,6 +389,11 @@ def main():
     ap.add_argument("--labels", default=None,
                     help="only these snapshot labels, comma-separated (default: all)")
     ap.add_argument("--seed", type=int, default=7)
+    # Every checkpoint plays at the settings it trained with, which compares
+    # whole systems. To compare the *networks*, give them all one search: an arm
+    # trained at T=16 is otherwise charged for playing at T=16 as well.
+    ap.add_argument("--eval-search", default="",
+                    help="force one search on every checkpoint, e.g. dcfr:64")
     ap.add_argument("--gpu", action="store_true",
                     help="two solve services (CUDA 0/1), one per pairing side")
     args = ap.parse_args()
@@ -392,7 +405,7 @@ def main():
         seed=args.seed,
         refs=tuple(x for x in args.refs.split(",") if x),
         labels=args.labels.split(",") if args.labels else None,
-        gpu=args.gpu)
+        search=parse_search(args.eval_search), gpu=args.gpu)
 
 
 if __name__ == "__main__":
