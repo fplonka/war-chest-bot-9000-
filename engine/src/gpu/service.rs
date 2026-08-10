@@ -86,7 +86,7 @@ fn dispatcher(
     ready: mpsc::Sender<Result<(), String>>,
     queued_work: Arc<AtomicU64>,
 ) {
-    let lanes = env_usize("WARCHEST_WAVE_LANES", 2).clamp(1, 5);
+    let lanes = env_usize("WARCHEST_WAVE_LANES", 2).clamp(1, 12);
     let whale_lanes = env_usize("WARCHEST_WAVE_WHALE_LANES", 1).clamp(1, lanes);
     let route_profile = std::env::var_os("WARCHEST_ROUTE_PROFILE").is_some();
     let (lane_ready_tx, lane_ready_rx) = mpsc::channel();
@@ -859,6 +859,12 @@ fn bucket_rows(pending: &VecDeque<Pending>) -> usize {
 /// Coarse physical capacity classes keep a whale from setting every common
 /// wave's shape without splitting an ordinary production tape into tiny
 /// power-of-two batches. Class 31 is isolated to one job and one lane.
+///
+/// Only jobs of the same class share a wave, so every extra class divides the
+/// lane's queue and shrinks the waves it can form. `WARCHEST_WAVE_CLASS_SHIFT`
+/// coarsens the ordinary classes: 2 collapses all four into one, which is what
+/// the mature live stream wants because its queue holds a mixture and a
+/// per-solve cost that falls steeply with jobs per wave.
 fn cost_class(w: WorkVector) -> u8 {
     let bytes = w
         .table_bytes
@@ -873,7 +879,7 @@ fn cost_class(w: WorkVector) -> u8 {
         .max(w.reach_slots / 16)
         .max(w.reverse_nonzeros / 16)
         .max(1);
-    if bytes >= (512usize << 20) || work >= 4_000_000 {
+    let class = if bytes >= (512usize << 20) || work >= 4_000_000 {
         3
     } else if bytes >= (64usize << 20) || work >= 500_000 {
         2
@@ -881,7 +887,13 @@ fn cost_class(w: WorkVector) -> u8 {
         1
     } else {
         0
-    }
+    };
+    class >> class_shift()
+}
+
+fn class_shift() -> u8 {
+    static SHIFT: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *SHIFT.get_or_init(|| env_usize("WARCHEST_WAVE_CLASS_SHIFT", 0).min(2) as u8)
 }
 
 #[cfg(test)]

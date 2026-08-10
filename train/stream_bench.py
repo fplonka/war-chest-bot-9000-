@@ -46,6 +46,8 @@ def main():
     ap.add_argument("--chunk", type=int, default=1024,
                     help="completed solves per Python result chunk")
     ap.add_argument("--report-every", type=float, default=2.0)
+    ap.add_argument("--iters", type=int, default=64,
+                    help="CFR iterations; only 64 is the production workload")
     ap.add_argument("--cap-value", type=float,
                     help="override the engine's horizon marker payoff")
     args = ap.parse_args()
@@ -62,7 +64,7 @@ def main():
     gen = warchest.gpu_stream_start(
         args.seed,
         depth=2,
-        iters=64,
+        iters=args.iters,
         explore=0.25,
         random_draft=True,
         cfr="linear",
@@ -75,6 +77,8 @@ def main():
     )
 
     totals = {name: 0 for name in COUNTERS}
+    gpu_wait = 0.0
+    merge_wait = 0.0
     started = time.monotonic()
     next_report = args.report_every
     stopped = False
@@ -93,6 +97,12 @@ def main():
             if data is not None:
                 for name in COUNTERS:
                     totals[name] += int(data.get(name, 0))
+                # Seconds a game actor spent parked on the GPU. Divided by
+                # workers x wall time it is the fraction of the builder pool
+                # that is waiting rather than building, which is the number
+                # that says whether more builders would help.
+                gpu_wait += float(data.get("gpu_wait_s", 0.0))
+                merge_wait += float(data.get("merge_wait_s", 0.0))
             elapsed = time.monotonic() - started
             if elapsed >= next_report and not stopped:
                 print(json.dumps({
@@ -102,6 +112,8 @@ def main():
                     "solves_per_s": round(totals["solves"] / elapsed, 1),
                     "oversize_routes": totals["oversize_routes"],
                     "card_exclusive_routes": totals["card_exclusive_routes"],
+                    "wait_frac": round(gpu_wait / (args.workers * elapsed), 3),
+                    "merge_frac": round(merge_wait / (args.workers * elapsed), 3),
                 }), flush=True)
                 next_report += args.report_every
     finally:
@@ -113,6 +125,8 @@ def main():
     prestop = prestop or {**totals, "seconds": elapsed}
     print(json.dumps({
         "phase": "prestop",
+        "wait_frac": round(gpu_wait / (args.workers * prestop["seconds"]), 3),
+        "merge_frac": round(merge_wait / (args.workers * prestop["seconds"]), 3),
         **prestop,
         "solves_per_s": round(prestop["solves"] / prestop["seconds"], 1),
     }), flush=True)

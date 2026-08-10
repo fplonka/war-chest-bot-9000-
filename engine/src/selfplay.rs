@@ -341,6 +341,10 @@ pub struct Data {
     pub configs: usize,
     /// Seconds workers spent blocked on the GPU (idle CPU), summed.
     pub gpu_wait_s: f32,
+    /// Seconds a builder spent blocked handing a finished solve to the merge
+    /// thread. It is invisible in both CPU time and `gpu_wait_s`, so without
+    /// it a saturated result path looks like a system with nothing saturated.
+    pub merge_wait_s: f32,
 }
 
 impl Data {
@@ -378,6 +382,7 @@ impl Data {
         self.wins[1] += o.wins[1];
         self.draws += o.draws;
         self.gpu_wait_s += o.gpu_wait_s;
+        self.merge_wait_s += o.merge_wait_s;
         self.cap_hits += o.cap_hits;
         self.node_caps += o.node_caps;
         self.configs += o.configs;
@@ -1701,6 +1706,7 @@ pub fn run_games_gpu_stream(
                 let mut live = 0usize;
                 let mut inflight = 0usize;
                 let mut cursor = 0usize;
+                let mut merge_wait = 0.0f32;
                 loop {
                     let stopping = stop.load(Ordering::Acquire);
                     if stopping {
@@ -1762,7 +1768,8 @@ pub fn run_games_gpu_stream(
                                 }
                                 Step::Ended => {
                                     let _ = g.finish();
-                                    let d = g.take_data();
+                                    let mut d = g.take_data();
+                                    d.merge_wait_s += std::mem::take(&mut merge_wait);
                                     if data_tx.send(Ok(d)).is_err() {
                                         stop.store(true, Ordering::Release);
                                     }
@@ -1817,7 +1824,13 @@ pub fn run_games_gpu_stream(
                             g.resume(value);
                             let mut d = g.take_data();
                             d.gpu_wait_s += waited.elapsed().as_secs_f32();
-                            if data_tx.send(Ok(d)).is_err() {
+                            // Carries the previous handoff's block time: this
+                            // one is not known until the send returns.
+                            d.merge_wait_s += std::mem::take(&mut merge_wait);
+                            let handoff = std::time::Instant::now();
+                            let sent = data_tx.send(Ok(d));
+                            merge_wait += handoff.elapsed().as_secs_f32();
+                            if sent.is_err() {
                                 stop.store(true, Ordering::Release);
                             }
                         }

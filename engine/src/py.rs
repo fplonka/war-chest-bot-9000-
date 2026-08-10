@@ -874,6 +874,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     out.set_item("dropped", d.dropped)?;
     out.set_item("configs", d.configs)?;
     out.set_item("gpu_wait_s", d.gpu_wait_s)?;
+    out.set_item("merge_wait_s", d.merge_wait_s)?;
     assert_eq!(
         d.coff.len(),
         if d.nv == 0 { 0 } else { 2 * d.nv + 1 },

@@ -251,6 +251,9 @@ pub struct Executor {
     dims: Vec<usize>,
     banks: HashMap<u64, WeightBank>,
     buffers: Option<DeviceBuffers>,
+    /// Host blob the wave tables are assembled into before the H2D copy. One
+    /// per lane, grown to its high-water mark and reused.
+    staging: Vec<u8>,
     graphs: Vec<GraphExec>,
     next_graph: usize,
     backprop_blocks: u32,
@@ -395,6 +398,7 @@ impl Executor {
             dims,
             banks,
             buffers: None,
+            staging: Vec::new(),
             graphs: Vec::with_capacity(GRAPH_CLASSES),
             next_graph: 0,
             backprop_blocks,
@@ -459,7 +463,13 @@ impl Executor {
             .banks
             .get(&version)
             .ok_or_else(|| format!("GPU weight version {version} is unavailable"))?;
-        let device = DeviceWave::upload(&self.stream, &wave, &bank.layout, self.buffers.take())?;
+        let device = DeviceWave::upload(
+            &self.stream,
+            &wave,
+            &bank.layout,
+            self.buffers.take(),
+            &mut self.staging,
+        )?;
         let uploaded = Instant::now();
         // Arbitrary live waves often make cuBLAS choose a different captured
         // topology, in which case graph update cannot reuse the executable and
@@ -1332,6 +1342,7 @@ impl DeviceWave {
         w: &Wave,
         l: &V3Layout,
         reuse: Option<DeviceBuffers>,
+        staging: &mut Vec<u8>,
     ) -> Result<Self, String> {
         let jobs = job_devices(w)?;
         let (toff, table_len) = table_layout(w, &jobs)?;
@@ -1358,15 +1369,34 @@ impl DeviceWave {
             Some(x) => (Some(x.tables), Some(x.arena), Some(x.dev)),
             None => (None, None, None),
         };
+        let step = Instant::now();
         let mut tables = grow_buffer(stream, tables, table_need, "wave tables")?;
-        let table_blob = pack_tables(w, &jobs, &toff, table_len)?;
+        let allocated = step.elapsed();
+        let step = Instant::now();
+        pack_tables(w, &jobs, &toff, table_len, staging)?;
+        let packed = step.elapsed();
+        let step = Instant::now();
         stream
-            .memcpy_htod(&table_blob, &mut tables.slice_mut(..table_len))
+            .memcpy_htod(&staging[..table_len], &mut tables.slice_mut(..table_len))
             .map_err(|e| format!("wave table H2D: {e:?}"))?;
+        let copied = step.elapsed();
+        let step = Instant::now();
         let mut arena = grow_buffer(stream, arena, arena_need, "wave arena")?;
         stream
             .memset_zeros(&mut arena.slice_mut(..arena_need))
             .map_err(|e| format!("wave arena zero: {e:?}"))?;
+        let zeroed = step.elapsed();
+        if std::env::var_os("WARCHEST_UPLOAD_PROFILE").is_some() {
+            eprintln!(
+                "v5_upload table_kib={} arena_kib={} alloc_ms={:.2} pack_ms={:.2} htod_ms={:.2} zero_ms={:.2}",
+                table_len / 1024,
+                arena_need * size_of::<f32>() / 1024,
+                1e3 * allocated.as_secs_f64(),
+                1e3 * packed.as_secs_f64(),
+                1e3 * copied.as_secs_f64(),
+                1e3 * zeroed.as_secs_f64(),
+            );
+        }
         let carry_snapshots = if w.meta.snapshots {
             w.meta.snap_iters.len().saturating_sub(1)
         } else {
@@ -1597,20 +1627,31 @@ fn table_layout(w: &Wave, jobs: &[JobDev]) -> Result<([u64; N_TABLES], usize), S
     Ok((layout.off, layout.len))
 }
 
+/// Fill a lane's reusable host staging blob with this wave's tables.
+///
+/// The buffer is grown and never cleared. Every byte the device addresses is
+/// written by the field copies below; only the alignment padding between
+/// tables keeps whatever the previous wave left there, and nothing reads it.
+/// A fresh `vec![0u8; len]` per wave was 15.6 ms of the 113 ms lane budget --
+/// mostly first-touch page faults on ~20 MiB of new pages, with the card idle
+/// for all of it.
 fn pack_tables(
     w: &Wave,
     jobs: &[JobDev],
     off: &[u64; N_TABLES],
     len: usize,
-) -> Result<Vec<u8>, String> {
-    let mut tables = vec![0u8; len];
+    tables: &mut Vec<u8>,
+) -> Result<(), String> {
+    if tables.len() < len {
+        tables.resize(len, 0);
+    }
     macro_rules! put {
         ($slot:ident, $values:expr) => {
-            copy_table(&mut tables, off[Table::$slot as usize] as usize, $values)?
+            copy_table(tables, off[Table::$slot as usize] as usize, $values)?
         };
     }
     wave_table_fields!(put, w, jobs);
-    Ok(tables)
+    Ok(())
 }
 
 fn copy_table<T: Copy>(tables: &mut [u8], at: usize, values: &[T]) -> Result<(), String> {
