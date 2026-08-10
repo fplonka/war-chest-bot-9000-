@@ -26,10 +26,19 @@ from the older lane-local route, so a scheduler A/B is still needed before
 assigning the whole slowdown to the card barrier, but the correctness and
 memory-safety question is answered.
 
+The completed two-GPU ladder was monotone even though one individual pairing
+was noisy. With Greedy fixed at zero, ratings were +327 for the loaded initial
+checkpoint, +371 after five minutes, +412 after ten, +453 after fifteen, and
++536 after twenty. The final checkpoint beat the initial checkpoint 21--6 with
+three draws, beat the fifteen-minute checkpoint 17--6 with seven draws, beat
+Greedy 30--0, and beat Random 30--0. Continued training therefore improved an
+already strong, game-finishing model; the hard workload is not a fake dynamic
+caused by random initialization or all-draw targets.
+
 At this point the build is the five-lane, aliased-reach implementation at
 `20f57d4`, with the new four-gibibyte card-exclusive route. The run began from
 the strongest checkpoint of `v5_aliased_25m_learning`; its initial, five-, ten-,
-fifteen-, and twenty-minute checkpoints are saved but have not yet been rated.
+fifteen-, and twenty-minute checkpoints are saved and rated in `ladder.json`.
 The next change should preserve a hard memory bound without stopping every lane
 for these searches, then compare it on identical work before another long
 training run.

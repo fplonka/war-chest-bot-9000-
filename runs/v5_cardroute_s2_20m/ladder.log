@@ -1,0 +1,33 @@
+[ladder] 7 players, 21 pairings, 30 paired games each (depth=2 iters=64)
+                        greedy vs random                       W  24 L   0 D   6  score 0.900
+v5 GEMM compute=fast-f16
+                        greedy vs v5_cardroute_s2_20m.init     W   0 L  28 D   2  score 0.033
+                        greedy vs v5_cardroute_s2_20m.s1       W   2 L  25 D   3  score 0.117
+                        greedy vs v5_cardroute_s2_20m.s2       W   0 L  26 D   4  score 0.067
+                        greedy vs v5_cardroute_s2_20m.s3       W   0 L  26 D   4  score 0.067
+                        greedy vs v5_cardroute_s2_20m.final    W   0 L  30 D   0  score 0.000
+                        random vs v5_cardroute_s2_20m.init     W   0 L  27 D   3  score 0.050
+                        random vs v5_cardroute_s2_20m.s1       W   0 L  28 D   2  score 0.033
+                        random vs v5_cardroute_s2_20m.s2       W   0 L  29 D   1  score 0.017
+                        random vs v5_cardroute_s2_20m.s3       W   0 L  29 D   1  score 0.017
+                        random vs v5_cardroute_s2_20m.final    W   0 L  30 D   0  score 0.000
+      v5_cardroute_s2_20m.init vs v5_cardroute_s2_20m.s1       W  14 L  14 D   2  score 0.500
+      v5_cardroute_s2_20m.init vs v5_cardroute_s2_20m.s2       W  10 L  19 D   1  score 0.350
+      v5_cardroute_s2_20m.init vs v5_cardroute_s2_20m.s3       W   6 L  24 D   0  score 0.200
+      v5_cardroute_s2_20m.init vs v5_cardroute_s2_20m.final    W   6 L  21 D   3  score 0.250
+        v5_cardroute_s2_20m.s1 vs v5_cardroute_s2_20m.s2       W  17 L  13 D   0  score 0.567
+        v5_cardroute_s2_20m.s1 vs v5_cardroute_s2_20m.s3       W  11 L  16 D   3  score 0.417
+        v5_cardroute_s2_20m.s1 vs v5_cardroute_s2_20m.final    W   6 L  23 D   1  score 0.217
+        v5_cardroute_s2_20m.s2 vs v5_cardroute_s2_20m.s3       W  11 L  15 D   4  score 0.433
+        v5_cardroute_s2_20m.s2 vs v5_cardroute_s2_20m.final    W  11 L  15 D   4  score 0.433
+        v5_cardroute_s2_20m.s3 vs v5_cardroute_s2_20m.final    W   6 L  17 D   7  score 0.317
+
+=== Elo (/workspace/warchest-engine/runs/v5_cardroute_s2_20m, greedy = 0) ===
+                      player   trained     elo    +-   score
+   v5_cardroute_s2_20m.final   20.0min     536    34   0.797
+      v5_cardroute_s2_20m.s3   15.0min     453    31   0.697
+      v5_cardroute_s2_20m.s2   10.0min     412    31   0.644
+      v5_cardroute_s2_20m.s1    5.0min     371    31   0.592
+    v5_cardroute_s2_20m.init    0.0min     327    31   0.536
+                      greedy         -       0    43   0.197
+                      random         -    -248    62   0.036
