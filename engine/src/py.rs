@@ -607,7 +607,6 @@ fn gpu_stream_start(
         explore,
         random_draft,
         eval_mix,
-        mc_mix: 0.0,
     };
     let nets = nets().read().unwrap().clone();
     let clients = gpu_clients().lock().unwrap().clone();
@@ -717,7 +716,7 @@ fn gpu_stop(_py: Python<'_>) -> PyResult<()> {
 /// missing, so a misconfigured box fails loudly instead of running slow.
 #[cfg(feature = "gpu")]
 #[pyfunction]
-#[pyo3(signature = (games, seed, mode, depth, iters, explore, temp, random_draft, eval_mix, mc_mix, cfr, warm, max_seconds=0.0))]
+#[pyo3(signature = (games, seed, mode, depth, iters, explore, temp, random_draft, eval_mix, cfr, warm, max_seconds=0.0))]
 fn gpu_gen_data(
     py: Python<'_>,
     games: usize,
@@ -729,7 +728,6 @@ fn gpu_gen_data(
     temp: f32,
     random_draft: bool,
     eval_mix: f32,
-    mc_mix: f32,
     cfr: &str,
     warm: f32,
     max_seconds: f64,
@@ -759,7 +757,6 @@ fn gpu_gen_data(
         explore,
         random_draft,
         eval_mix,
-        mc_mix,
     };
     let d = py.allow_threads(|| {
         // A shard owns a small immutable CPU-side shape/oracle snapshot. Do
@@ -912,7 +909,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
 /// Run `games` self-play games across all cores and return the training data.
 /// `mode` is "greedy" (Monte-Carlo warm start) or "rebel".
 #[pyfunction]
-#[pyo3(signature = (games, seed, mode, depth=1, iters=16, explore=0.25, temp=2.0, random_draft=false, eval_mix=0.5, mc_mix=0.0, cfr="linear", warm=0.0))]
+#[pyo3(signature = (games, seed, mode, depth=1, iters=16, explore=0.25, temp=2.0, random_draft=false, eval_mix=0.5, cfr="linear", warm=0.0))]
 #[allow(clippy::too_many_arguments)]
 fn gen_data(
     py: Python<'_>,
@@ -925,7 +922,6 @@ fn gen_data(
     temp: f32,
     random_draft: bool,
     eval_mix: f32,
-    mc_mix: f32,
     cfr: &str,
     warm: f32,
 ) -> PyResult<PyObject> {
@@ -957,7 +953,6 @@ fn gen_data(
         explore,
         random_draft,
         eval_mix,
-        mc_mix,
     };
     let d = py.allow_threads(|| {
         let n = nets().read().unwrap();

@@ -93,6 +93,17 @@ def cmd_run(args):
           f"({len(config.arms(args.name))} arms x {args.seeds} seeds)")
     for name, cfg in todo:
         print(f"  {name:<28s} {config.delta(cfg) or 'baseline'}")
+    train_min = sum(c.minutes for _, c in todo)
+    # Per run: its snapshots plus `init`. Played pairings are the within-run
+    # chains, everyone against Greedy, and the finals against each other.
+    n, per = len(todo), config.BASELINE.snapshots + 1
+    k = n * per + 1
+    played = n * (per * (per - 1) // 2) + (k - 1) + n * (n - 1) // 2
+    ladder_games = (played - n * (n - 1) // 2) * args.games \
+        + (n * (n - 1) // 2) * args.focus_games
+    print(f"[exp] {train_min:.0f} min of training, then a {k}-player ladder: "
+          f"{played} pairings, {ladder_games:,} games, "
+          f"roughly {ladder_games * 100 / 1300 / 60:.0f} min")
     if args.dry_run:
         return
     done = []

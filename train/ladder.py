@@ -109,10 +109,11 @@ def players_of(runs, refs=("greedy",), labels=None):
     """The ladder's entrants: the fixed bots, then every run's snapshots.
 
     The first reference is pinned at 0, so which references a ladder carries
-    decides what its zero means. Greedy is the default and Random is not: a
-    game against an opponent 400 Elo away carries a tenth of the information of
-    a game against an equal, so a pairing everyone wins is a pairing that buys
-    nothing. Keep the references fixed forever -- they are pure functions of the
+    decides what its zero means. Greedy is the only reference worth playing.
+    Random is not in this list and should not be added back: a game against an
+    opponent 400 Elo away carries a tenth of the information of a game against
+    an equal, and every trained checkpoint beats Random ~30-0. Those games are
+    a foregone conclusion bought at full price. Keep the references fixed forever -- they are pure functions of the
     rules, which is what makes a rating from one ladder comparable to a rating
     from another. A pool of rotating champions was tried and removed: when the
     zero moves, old numbers stop meaning anything.
@@ -138,6 +139,31 @@ def players_of(runs, refs=("greedy",), labels=None):
                        "slot": len(ps), "t": s["t"], "file": s["file"],
                        "run": run, "search": search})
     return ps
+
+
+def pairing_games(a, b, focus, curve_games, focus_games):
+    """How many games this pairing is worth. 0 skips it.
+
+    Three kinds of pairing, and only two of them are worth paying for:
+
+    * **Within one run** — the learning curve. Consecutive snapshots differ by
+      far more than a few hundred games can miss, so this is cheap.
+    * **Between two runs' finals** — the comparison the experiment exists to
+      make. This is where the games go.
+    * **Between one run's `s1` and another's `s2`** — nobody asked. Skipped.
+      These are most of the pairings once several arms are in one ladder, and
+      they are what turns a round robin quadratic in the snapshot count.
+
+    Everything still reaches everything through Greedy and through its own run's
+    chain, so the ratings stay on one connected graph and remain comparable.
+    """
+    if a["run"] is None or b["run"] is None:      # a fixed reference
+        return curve_games
+    if {a["name"], b["name"]} <= focus:
+        return focus_games
+    if a["run"] == b["run"]:
+        return curve_games
+    return 0
 
 
 def run(runs, out=None, games=60, temp=2.0, random_draft=False, seed=7,
@@ -187,8 +213,16 @@ def run(runs, out=None, games=60, temp=2.0, random_draft=False, seed=7,
     n = np.zeros((k, k))
     sc = np.zeros((k, k))
     pairs = []
-    print(f"[ladder] {k} players, {k * (k - 1) // 2} pairings, {games} paired games each"
-          + (f" ({focus_games} for the {len(focus)} focus players)" if focus else ""),
+    # Pairings grow with the square of the player count, so say what this will
+    # cost before spending it. A game is on the order of a hundred solves, and
+    # the golden run generates ~1,300 solves a second.
+    plan = {(i, j): pairing_games(ps[i], ps[j], focus, games, focus_games)
+            for i, j in itertools.combinations(range(k), 2)}
+    played = sum(1 for v in plan.values() if v)
+    total_games = sum(plan.values())
+    print(f"[ladder] {k} players, {played} of {len(plan)} pairings played "
+          f"({games} games each, {focus_games} between the arms' finals)  ->  "
+          f"{total_games:,} games, roughly {total_games * 100 / 1300 / 60:.0f} min",
           flush=True)
     for i, j in itertools.combinations(range(k), 2):
         # A seed per pairing rather than one shared across the tournament.
@@ -205,7 +239,9 @@ def run(runs, out=None, games=60, temp=2.0, random_draft=False, seed=7,
                 nb = by_slot[b["slot"]]
                 warchest.gpu_set_weights(nb.dims, *nb.flat(), device=1)
         sa, sb = a["search"], b["search"]
-        n_ij = focus_games if {a["name"], b["name"]} <= focus else games
+        n_ij = plan[(i, j)]
+        if n_ij == 0:
+            continue
         w, l, d = warchest.eval_match(n_ij, seed + 1000 * i + j, a["agent"], b["agent"],
                                       depth=sa["depth"], iters=sa["iters"],
                                       cfr=sa["cfr"], warm=sa["warm"], temp=temp,
@@ -258,8 +294,9 @@ def main():
     ap.add_argument("--temp", type=float, default=2.0)
     ap.add_argument("--random-draft", action="store_true")
     ap.add_argument("--refs", default="greedy",
-                    help="comma list of fixed bots (greedy, random), or empty for none. "
-                         "The first is pinned at 0.")
+                    help="comma list of fixed reference bots, or empty for none. "
+                         "The first is pinned at 0. Greedy is the only one worth "
+                         "playing: see players_of.")
     ap.add_argument("--labels", default=None,
                     help="only these snapshot labels, comma-separated (default: all)")
     ap.add_argument("--seed", type=int, default=7)

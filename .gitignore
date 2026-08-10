@@ -11,3 +11,7 @@ __pycache__/
 # better fetched from their sources than redistributed here. See docs/REBEL.md
 # and engine/RULES.md for what they are and where to get them.
 papers/
+runs/plotly.min.js
+runs/*/report.html
+runs/*.html
+data/

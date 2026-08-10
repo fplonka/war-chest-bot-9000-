@@ -21,24 +21,39 @@ disagree the direct record is the one that answers the experiment's question.
 """
 
 import argparse
+import io
 import json
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import plotly.graph_objects as go
+import plotly.offline
+from plotly.subplots import make_subplots
+
 import config
 
-W, H, PAD = 460, 190, 38
-INK = ["#2a78d6", "#008300", "#e87ba4", "#b8860b", "#7b52ab"]
+# Series colours. Mid-tone and saturated, so one rendering reads on a light or a
+# dark page -- the plot ground is transparent and the page's own background
+# shows through, so these have to work against both.
+INK = ["#3d8bfd", "#20a37a", "#e0709f", "#d99b28", "#9b7bd4"]
+AXIS = "#8a8a8a"
+JS = "plotly.min.js"        # written once into runs/, shared by every report
+RUNS_DIR = "runs"
 
 
 def read(run):
     """A run's log, ladder and truth score; missing pieces are None."""
     with open(f"{run}/log.json") as f:
         log = json.load(f)
+    # Epochs that generated nothing are the drain at the end of a run: they
+    # report loss 0 and a handful of solves, and plotting them drags every
+    # curve to the floor in its final pixel.
     out = {"name": os.path.basename(run.rstrip("/")), "cfg": log.get("cfg", {}),
-           "epochs": [e for e in log["epochs"] if e["phase"] == "rebel"],
+           "epochs": [e for e in log["epochs"]
+                      if e["phase"] == "rebel" and e.get("solves", 0) > 0
+                      and e.get("steps", 1) > 0],
            "snaps": log.get("snapshots", []), "ladder": None}
     try:
         with open(f"{run}/ladder.json") as f:
@@ -58,55 +73,122 @@ def ema(y, span=12):
     return out
 
 
-def chart(title, ylabel, series, zero=False, hlines=()):
-    """One SVG panel. `series` is `(label, xs, ys, smooth)`."""
-    pts = [(x, y) for _, xs, ys, _ in series for x, y in zip(xs, ys)]
-    pts += [(0, v) for _, v in hlines]
-    if not pts:
-        return f'<figure><figcaption>{title}</figcaption><p class=none>no data</p></figure>'
-    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
-    x0, x1 = min(xs), max(xs) or 1
-    y0, y1 = (0 if zero else min(ys)), max(ys)
-    if y1 - y0 < 1e-9:
-        y1 = y0 + 1
-    sx = lambda x: PAD + (x - x0) / (x1 - x0 or 1) * (W - PAD - 12)
-    sy = lambda y: H - PAD - (y - y0) / (y1 - y0) * (H - PAD - 14)
+def panel(title, ylabel, series, zero=False, hlines=(), markers=False):
+    """A panel's specification. Drawn later, into a shared subplot grid.
 
-    g = [f'<line class=ax x1={PAD} y1={H - PAD} x2={W - 12} y2={H - PAD}/>']
-    for f in (0.0, 0.5, 1.0):
-        v = y0 + f * (y1 - y0)
-        g.append(f'<line class=grid x1={PAD} y1={sy(v):.1f} x2={W - 12} y2={sy(v):.1f}/>')
-        g.append(f'<text class=tick x={PAD - 5} y={sy(v) + 3:.1f}>{fmt(v)}</text>')
-    g.append(f'<text class=tick x={PAD} y={H - PAD + 14} text-anchor=start>{fmt(x0)}</text>')
-    g.append(f'<text class=tick x={W - 12} y={H - PAD + 14} text-anchor=end>{fmt(x1)}</text>')
-    for v, c in zip([v for _, v in hlines], INK[1:]):
-        g.append(f'<line class=ref stroke="{c}" x1={PAD} y1={sy(v):.1f} '
-                 f'x2={W - 12} y2={sy(v):.1f}/>')
-    for i, (label, xa, ya, smooth) in enumerate(series):
-        c = INK[i % len(INK)]
-        if smooth:
-            d = " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in zip(xa, ya))
-            g.append(f'<polyline class=dots stroke="{c}" points="{d}"/>')
-            ya = ema(ya)
-        d = " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in zip(xa, ya))
-        g.append(f'<polyline class=line stroke="{c}" points="{d}"/>')
-    keys = "".join(f'<span style="color:{INK[i % len(INK)]}">{s[0]}</span>'
-                   for i, s in enumerate(series) if s[0])
-    keys += "".join(f'<span style="color:{c}">{n}</span>'
-                    for (n, _), c in zip(hlines, INK[1:]))
-    return (f'<figure><figcaption>{title}<em>{ylabel}</em></figcaption>'
-            f'<svg viewBox="0 0 {W} {H}">{"".join(g)}</svg>'
-            f'<div class=key>{keys}</div></figure>')
+    This used to be a hand-rolled SVG emitter -- axis lines, tick placement and
+    number formatting all written here, and all of it silently broken, because
+    every attribute was unquoted and HTML swallowed the trailing slash. The page
+    rendered nothing but the polylines and still looked plausible. There is no
+    reason to own that code when a plotting library does ticks, scales, legends
+    and hover for free.
+    """
+    return dict(title=title, ylabel=ylabel, series=series, zero=zero,
+                hlines=hlines, markers=markers)
+
+
+def dashboard(specs, cols=3):
+    """Every panel in one figure: shared hover, aligned axes, one legend-free
+    grid. Series are named in the subplot titles instead of in a legend, so
+    colours never have to be matched across panels."""
+    specs = [s for s in specs if s]
+    rows = -(-len(specs) // cols)
+    titles = []
+    for sp in specs:
+        names = [f'<span style="color:{INK[i % len(INK)]}">{lab}</span>'
+                 for i, (lab, *_ ) in enumerate(sp["series"]) if lab]
+        names += [f'<span style="color:{INK[(i + 1) % len(INK)]}">{n}</span>'
+                  for i, (n, _) in enumerate(sp["hlines"])]
+        titles.append(f'<b>{sp["title"]}</b>'
+                      + (f'  {" ".join(names)}' if names else "")
+                      + f'  <span style="color:{AXIS}">· {sp["ylabel"]}</span>')
+    fig = make_subplots(rows=rows, cols=cols, subplot_titles=titles,
+                        vertical_spacing=0.13, horizontal_spacing=0.06)
+    for k, sp in enumerate(specs):
+        r, c = k // cols + 1, k % cols + 1
+        for i, (label, x, y, smooth) in enumerate(sp["series"]):
+            col = INK[i % len(INK)]
+            if smooth:
+                # Raw behind, trend in front: per-epoch values are jumpy because
+                # every epoch trains on a fresh sample of a large buffer, so the
+                # trend is the readable part and the scatter is its context.
+                fig.add_trace(go.Scatter(
+                    x=x, y=y, mode="lines", line=dict(color=col, width=1),
+                    opacity=0.22, showlegend=False, hoverinfo="skip"), r, c)
+                y = ema(y)
+            fig.add_trace(go.Scatter(
+                x=x, y=y, name=label or sp["title"],
+                mode="lines+markers" if sp["markers"] else "lines",
+                line=dict(color=col, width=1.8), marker=dict(size=6),
+                showlegend=False,
+                hovertemplate=f"{label or sp['ylabel']}: %{{y:.4g}}<extra></extra>"),
+                r, c)
+        for i, (name, v) in enumerate(sp["hlines"]):
+            fig.add_hline(y=v, row=r, col=c, line=dict(
+                color=INK[(i + 1) % len(INK)], width=1, dash="dash"))
+        if sp["zero"]:
+            fig.update_yaxes(rangemode="tozero", row=r, col=c)
+        else:
+            # Percentile limits: one bad epoch -- a drain record, a warm-up
+            # spike -- must not set the axis and flatten everything else.
+            vals = sorted(v for _, _, ys, _ in sp["series"] for v in ys)
+            if vals:
+                lo, hi = quantiles(vals, 0.01), quantiles(vals, 0.99)
+                pad = (hi - lo) * 0.12 or abs(hi) * 0.1 or 1.0
+                fig.update_yaxes(range=[lo - pad, hi + pad], row=r, col=c)
+        if r == rows:
+            fig.update_xaxes(title_text="minutes", row=r, col=c)
+
+    fig.update_layout(
+        height=250 * rows, margin=dict(l=48, r=14, t=34, b=40),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color=AXIS, size=11,
+                  family="ui-monospace,SFMono-Regular,Menlo,monospace"),
+        hovermode="x unified",
+        hoverlabel=dict(font_size=11, bgcolor="rgba(20,20,24,0.92)",
+                        font_color="#eee", bordercolor=AXIS))
+    fig.update_xaxes(showgrid=False, zeroline=False, linecolor=AXIS,
+                     ticks="outside", ticklen=3, title_standoff=6)
+    fig.update_yaxes(gridcolor="rgba(138,138,138,0.20)", zeroline=False,
+                     linecolor=AXIS, ticks="outside", ticklen=3)
+    for a in fig.layout.annotations:          # subplot titles, left-aligned
+        a.update(x=a.x - 0.5 / cols + 0.004, xanchor="left", font_size=12)
+    return fig.to_html(include_plotlyjs=False, full_html=False,
+                       default_height=f"{250 * rows}px",
+                       config={"displaylogo": False, "responsive": True,
+                               "modeBarButtonsToRemove":
+                                   ["select2d", "lasso2d", "autoScale2d"]})
+
+
+def varies(series, rel=0.05):
+    """Did anything actually move? A panel pinned at its configured constant
+    costs a reader's attention and returns nothing."""
+    for _, _, ys, _ in series:
+        if not ys:
+            continue
+        lo, hi = min(ys), max(ys)
+        if hi - lo > rel * max(abs(hi), 1e-9):
+            return True
+    return False
+
+
+def quantiles(vals, q):
+    """The q-quantile by nearest rank. No numpy: this module is imported by the
+    trainer at the end of a run and should not need the scientific stack."""
+    v = sorted(vals)
+    return v[min(len(v) - 1, max(0, int(q * (len(v) - 1) + 0.5)))]
 
 
 def fmt(v):
-    if abs(v) >= 100:
+    """Short enough to fit the gutter. Two significant figures is all a tick
+    needs; the exact numbers are in the tables below."""
+    if abs(v) >= 100 or v == int(v):
         return f"{v:.0f}"
-    return f"{v:.3g}"
+    return f"{v:.2g}"
 
 
 def panels(runs):
-    """The four curves, each overlaying every run."""
+    """Every panel of the dashboard, each overlaying every run."""
     mins = lambda r: [e["t"] / 60.0 for e in r["epochs"]]
     one = len(runs) == 1
     tag = lambda r: "" if one else r["name"]
@@ -120,43 +202,74 @@ def panels(runs):
         if snaps:
             elo.append((tag(r) or "snapshot", [p["t"] / 60.0 for p in snaps],
                         [p["elo"] for p in snaps], False))
-        for ref in ("greedy", "random"):
-            p = next((q for q in r["ladder"]["players"] if q["name"] == ref), None)
-            if p and ref not in [n for n, _ in hl]:
-                hl.append((ref, p["elo"]))
+        p = next((q for q in r["ladder"]["players"] if q["name"] == "greedy"), None)
+        if p and "greedy" not in [n for n, _ in hl]:
+            hl.append(("greedy", p["elo"]))
 
-    out = [chart("Strength against training time", "elo", elo, hlines=hl)]
+    out = [panel("Strength vs training time", "elo", elo, hlines=hl,
+                 markers=True)]
 
     if one and "loss_old" in (runs[0]["epochs"] or [{}])[-1]:
         r = runs[0]
-        out.append(chart("Value loss by row age", "huber", [
+        out.append(panel("Value loss by row age", "huber", [
             ("old rows", mins(r), [e["loss_old"] for e in r["epochs"]], True),
             ("fresh rows", mins(r), [e["loss_new"] for e in r["epochs"]], True)]))
     else:
-        out.append(chart("Value loss", "huber",
+        out.append(panel("Value loss", "huber",
                          [(tag(r), mins(r), [e["loss"] for e in r["epochs"]], True)
                           for r in runs]))
 
-    out.append(chart("Spread of predictions (collapse toward 0 = degenerate)", "std",
+    out.append(panel("Spread of predictions", "std",
                      [(tag(r) or "prediction", mins(r),
                        [e["probe_std"] for e in r["epochs"]], True) for r in runs]
                      + ([("target", mins(runs[0]),
                           [e["tgt_std"] for e in runs[0]["epochs"]], True)] if one else []),
                      zero=True))
-    out.append(chart("Generation throughput", "solves/s",
-                     [(tag(r), mins(r), [e["solves_per_s"] for e in r["epochs"]], True)
-                      for r in runs], zero=True))
+    # Two throughput lines, and the gap between them is the information. The
+    # per-epoch rate is what the box is doing right now; the cumulative rate is
+    # total solves over total ReBeL wall time, which is the only number a run's
+    # cost can be read from -- it counts every stall, drain and optimizer step,
+    # including the ones an instantaneous reading happens to miss. A run whose
+    # instantaneous rate holds while its cumulative rate sags is losing time
+    # somewhere between the epochs.
+    inst, cum = [], []
+    for r in runs:
+        eps = r["epochs"]
+        if not eps:
+            continue
+        # Elapsed runs from the start of the ReBeL phase, which is one epoch
+        # before the first record. Dividing by the gap since the first record
+        # gives a divide-by-zero on that record itself.
+        t0 = eps[0]["t"] - (eps[1]["t"] - eps[0]["t"] if len(eps) > 1 else 1.0)
+        run_avg, cx, total = [], [], 0
+        for e in eps:
+            total += e["solves"]
+            el = e["t"] - t0
+            if el < 1.0:
+                continue
+            run_avg.append(total / el)
+            cx.append(e["t"] / 60.0)
+        inst.append((f"{tag(r)} now".strip(), mins(r),
+                     [e["solves_per_s"] for e in eps], True))
+        if run_avg:
+            cum.append((f"{tag(r)} run average".strip(), cx, run_avg, False))
+    out.append(panel("Generation throughput", "solves/s", inst + cum, zero=True))
     # Rows trained per solve generated. This, not the buffer size, is what
     # governs how hard a run overfits its own replay -- and the old-vs-fresh
-    # loss split above is its readout.
-    out.append(chart("Replay ratio (rows trained per solve)", "x",
-                     [(tag(r), mins(r),
-                       [e["steps"] * r["cfg"].get("batch", 1024) / max(e["solves"], 1)
-                        for e in r["epochs"]], True) for r in runs], zero=True))
+    # loss split above is its readout. It normally sits flat at whatever
+    # train_gen_ratio asks for, and a flat line is not information: the panel
+    # only appears when the ratio actually moved, which is the case worth
+    # looking at (the trainer falling behind generation, or racing ahead).
+    ratio = [(tag(r), mins(r),
+              [e["steps"] * r["cfg"].get("batch", 1024) / max(e["solves"], 1)
+               for e in r["epochs"]], True) for r in runs]
+    if varies(ratio):
+        out.append(panel("Replay ratio", "rows/solve",
+                         ratio, zero=True))
     # The horizon cuts a game at 256 coin plays and scores it a draw, and War
     # Chest has no draws. A rising rate means the ladder below is measuring a
     # game that is increasingly not the real one.
-    out.append(chart("Games cut at the horizon", "fraction",
+    out.append(panel("Games cut at horizon", "fraction",
                      [(tag(r), mins(r), [e["horizon_frac"] for e in r["epochs"]], True)
                       for r in runs], zero=True))
     return out
@@ -181,91 +294,107 @@ def health(r):
 def ladder_table(lad):
     if not lad:
         return "<p class=none>no ladder yet — <code>python train/ladder.py &lt;run&gt;</code></p>"
+    players = [p for p in lad["players"] if p["name"] != "random"]
+    pairs_in = [p for p in lad["pairs"] if "random" not in (p["a"], p["b"])]
+
     def prow(p):
         when = "—" if p["t"] is None else f"{p['t'] / 60:.0f} min"
         return (f"<tr><td>{p['name']}</td><td class=n>{when}</td>"
                 f"<td class=n>{p['elo']:.0f}</td><td class=n>±{p['se']:.0f}</td>"
                 f"<td class=n>{p['score']:.3f}</td></tr>")
 
-    rows = "".join(prow(p) for p in sorted(lad["players"], key=lambda p: -p["elo"]))
+    rows = "".join(prow(p) for p in sorted(players, key=lambda p: -p["elo"]))
     pairs = "".join(
         f"<tr><td>{p['a']} <span class=vs>vs</span> {p['b']}</td>"
         f"<td class=n>{p['w']}–{p['l']}–{p['d']}</td>"
         f"<td class=n>{p.get('n', p['w'] + p['l'] + p['d'])}</td>"
         f"<td class=n>{p['score']:.3f}</td></tr>"
-        for p in sorted(lad["pairs"], key=lambda p: -(p.get("n", 0))))
-    return (f"<table><thead><tr><th>player<th class=n>trained<th class=n>elo"
-            f"<th class=n>±<th class=n>score</thead>{rows}</table>"
-            f"<h3>Head to head</h3><table><thead><tr><th>pairing<th class=n>W–L–D"
-            f"<th class=n>games<th class=n>score</thead>{pairs}</table>")
+        for p in sorted(pairs_in, key=lambda p: -(p.get("n", 0))))
+    return (f"<div class=tw><table><thead><tr><th>player<th class=n>trained"
+            f"<th class=n>elo<th class=n>±<th class=n>score</thead>{rows}</table></div>"
+            f"<h3>Head to head</h3><div class=tw><table><thead><tr><th>pairing"
+            f"<th class=n>W–L–D<th class=n>games<th class=n>score</thead>"
+            f"{pairs}</table></div>")
 
 
 CSS = """
-:root{--ink:#0b0b0b;--mut:#52514e;--line:#e6e5e2;--bg:#fcfcfb}
+:root{--bg:#fff;--ink:#111;--mut:#666;--line:#ddd;--grid:#eee}
+@media (prefers-color-scheme:dark){
+  :root{--bg:#111;--ink:#e8e8e8;--mut:#999;--line:#333;--grid:#262626}
+}
+:root[data-theme="dark"]{--bg:#111;--ink:#e8e8e8;--mut:#999;--line:#333;--grid:#262626}
+:root[data-theme="light"]{--bg:#fff;--ink:#111;--mut:#666;--line:#ddd;--grid:#eee}
 *{box-sizing:border-box}
-body{margin:0;padding:32px;background:var(--bg);color:var(--ink);
- font:14px/1.55 ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif;max-width:1000px}
-h1{font-size:19px;margin:0 0 2px}h2{font-size:15px;margin:30px 0 10px}
-h3{font-size:13px;color:var(--mut);margin:20px 0 6px;font-weight:600}
-.sub{color:var(--mut);margin:0 0 4px}
-code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
-.delta{margin:10px 0 0;padding:0}
-.delta span{display:inline-block;background:#eef3fb;color:#1c4e8a;border-radius:4px;
- padding:2px 7px;margin:0 6px 6px 0;font-family:ui-monospace,Menlo,monospace;font-size:12px}
-.delta span.none{background:var(--line);color:var(--mut)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:16px}
-figure{margin:0;border:1px solid var(--line);border-radius:8px;padding:10px 6px 6px;
- background:#fff;overflow:hidden}
-figcaption{font-size:12px;font-weight:600;padding:0 8px 4px}
-figcaption em{color:var(--mut);font-weight:400;font-style:normal;float:right}
-svg{width:100%;height:auto;display:block}
-.line{fill:none;stroke-width:2}.dots{fill:none;stroke-width:1;opacity:.16}
-.ax,.grid line{stroke:var(--line)}line.grid{stroke:var(--line)}
-.ref{stroke-width:1.3;stroke-dasharray:4 3}
-.tick{font-size:9px;fill:var(--mut);text-anchor:end}
-.key{font-size:11px;padding:2px 8px 0}.key span{margin-right:12px;font-weight:600}
-dl{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;
- margin:10px 0 0;padding:0}
-dt{font-size:11px;color:var(--mut)}dd{margin:0;font-size:15px;
- font-family:ui-monospace,Menlo,monospace}
-table{border-collapse:collapse;width:100%;margin:6px 0;font-size:13px}
-th,td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--line)}
-th{font-size:11px;color:var(--mut);font-weight:600}
-td.n,th.n{text-align:right;font-family:ui-monospace,Menlo,monospace}
-.vs{color:var(--mut)}.none{color:var(--mut);font-size:13px}
-footer{color:var(--mut);font-size:12px;margin-top:28px;border-top:1px solid var(--line);
- padding-top:10px}
+body{margin:0;padding:16px;background:var(--bg);color:var(--ink);
+ font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+ font-variant-numeric:tabular-nums}
+h1{font-size:14px;font-weight:700;margin:0 0 2px}
+h2{font-size:12px;font-weight:700;margin:22px 0 6px;color:var(--mut)}
+h3{font-size:12px;font-weight:700;margin:16px 0 4px}
+.meta{color:var(--mut);margin:0 0 6px}
+.delta{display:flex;flex-wrap:wrap;gap:4px 16px;margin:0 0 10px;color:var(--mut)}
+.delta span{color:var(--ink)}
+.js-plotly-plot{margin:0 0 4px}
+dl{display:flex;flex-wrap:wrap;gap:0 22px;margin:4px 0}
+dt{font-size:11px;color:var(--mut)}
+dd{margin:0 0 4px}
+table{border-collapse:collapse;margin:4px 0;font-size:12px}
+th,td{text-align:left;padding:2px 14px 2px 0;white-space:nowrap}
+th{color:var(--mut);font-weight:400;border-bottom:1px solid var(--line)}
+td.n,th.n{text-align:right}
+.tw{overflow-x:auto}
+.none{color:var(--mut);font-size:11px}
+footer{color:var(--mut);font-size:11px;margin-top:24px;border-top:1px solid var(--line);
+ padding-top:8px}
 """
 
-
-def page(runs, title):
+def page(runs, title, js):
     d = [f"<span>{k}={v}</span>" for k, v in config.delta(runs[0]["cfg"]).items()] \
         if len(runs) == 1 else \
         [f"<span>{r['name']}: " + (", ".join(f"{k}={v}" for k, v in
                                              config.delta(r["cfg"]).items()) or "baseline")
          + "</span>" for r in runs]
+    sha = runs[0]["cfg"].get("git", "")
     body = [f"<h1>{title}</h1>",
-            f"<p class=sub mono>{runs[0]['cfg'].get('git', '?')} · "
-            f"{len(runs[0]['epochs'])} ReBeL epochs</p>",
-            f"<div class=delta>{''.join(d) or '<span class=none>baseline</span>'}</div>",
-            "<h2>Curves</h2>", f"<div class=grid>{''.join(panels(runs))}</div>"]
+            '<p class="meta">'
+            + (f"{sha} · " if sha and sha != "?" else "")
+            + f"{len(runs[0]['epochs'])} ReBeL epochs</p>",
+            f'<div class="delta">{"".join(d) or "<span>baseline</span>"}</div>',
+            dashboard(panels(runs))]
     for r in runs:
-        body.append(f"<h2>{r['name']}</h2><dl>{health(r)}</dl>")
+        body.append(f"<h3>{r['name']}</h3><dl>{health(r)}</dl>")
         body.append(ladder_table(r["ladder"]))
     body.append("<footer>Generated by train/report.py. Elo error bars are per-player "
                 "placement, not a test between two players; a difference is only "
                 "resolved when the pairing between them has the games to resolve it "
                 "(≈1,000 games for 22 Elo).</footer>")
     return (f"<!doctype html><meta charset=utf-8><title>{title}</title>"
+            f'<script src="{js}" charset="utf-8"></script>' 
             f"<style>{CSS}</style>{''.join(body)}")
 
 
 def write(runs, out=None, title=None):
-    """Render `runs` (directories) to one page. The callable form exp.py uses."""
+    """Render `runs` (directories) to one page. The callable form exp.py uses.
+
+    The Plotly bundle is written once into `runs/` and every report links to it
+    by relative path, rather than being inlined into each page. Three megabytes
+    per run adds up fast on a box that produces a report an hour, and one shared
+    copy still travels with an `rsync` of the runs directory -- so the pages
+    keep working with no network, which a CDN link would not.
+    """
     loaded = [read(r) for r in runs]
     out = out or f"{runs[0]}/report.html"
+    outdir = os.path.dirname(os.path.abspath(out))
+    root = os.path.abspath(RUNS_DIR)
+    js = os.path.join(root, JS)
+    if not os.path.exists(js):
+        os.makedirs(root, exist_ok=True)
+        with open(js, "w") as f:
+            f.write(plotly.offline.get_plotlyjs())
+        print(f"[report] wrote {js}", flush=True)
     with open(out, "w") as f:
-        f.write(page(loaded, title or " · ".join(r["name"] for r in loaded)))
+        f.write(page(loaded, title or " · ".join(r["name"] for r in loaded),
+                     os.path.relpath(js, outdir)))
     print(f"[report] {out}", flush=True)
     return out
 

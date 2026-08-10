@@ -50,7 +50,6 @@ fn main() {
         explore: 0.25,
         random_draft: false,
         eval_mix: 0.5,
-        mc_mix: 0.0,
     };
 
     // Warm the allocator / caches, then measure.

@@ -42,7 +42,6 @@ fn walk_serves_multiple_decisions_per_solve() {
                 explore,
                 random_draft: false,
                 eval_mix: 0.0,
-                mc_mix: 0.0,
             };
             let z = play_game(rng, &nets, &gc, &mut d, None);
             assert!(z.is_finite());
@@ -83,7 +82,6 @@ fn walk_in_eval_mode() {
         explore: 0.0,
         random_draft: false,
         eval_mix: 0.0,
-        mc_mix: 0.0,
     };
     let z = play_game(rng, &nets, &gc, &mut d, None);
     assert!(z.is_finite());
@@ -109,7 +107,6 @@ fn walk_interrupted_by_non_rebel_agent() {
         explore: 0.1,
         random_draft: false,
         eval_mix: 0.0,
-        mc_mix: 0.0,
     };
     let z = play_game(rng, &nets, &gc, &mut d, None);
     assert!(z.is_finite());
@@ -149,7 +146,6 @@ fn walk_never_crosses_slots() {
             explore: 0.1,
             random_draft: false,
             eval_mix: 0.0,
-            mc_mix: 0.0,
         };
         let z = play_game(rng, &nets, &gc, &mut d, None);
         assert!(z.is_finite());
@@ -194,7 +190,6 @@ fn walk_with_random_drafts() {
             explore: 0.3,
             random_draft: true,
             eval_mix: 0.0,
-            mc_mix: 0.0,
         };
         let z = play_game(rng, &nets, &gc, &mut d, None);
         assert!(z.is_finite());
@@ -236,7 +231,6 @@ fn walk_across_warrior_priest_draws() {
             explore: 0.25,
             random_draft: true,
             eval_mix: 0.0,
-            mc_mix: 0.0,
         };
         let z = play_game(rng, &nets, &gc, &mut d, None);
         assert!(z.is_finite());
@@ -270,7 +264,6 @@ fn capped_solves_fall_back_and_games_finish() {
             explore: 0.25,
             random_draft: true,
             eval_mix: 0.0,
-            mc_mix: 0.0,
         };
         let z = play_game(rng, &nets, &gc, &mut d, None);
         assert!(z.is_finite());

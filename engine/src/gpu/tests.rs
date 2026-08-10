@@ -97,7 +97,6 @@ fn fixtures<'a>(nets: &'a Nets) -> Vec<(Solver<'a>, PackedJob)> {
         explore: 0.0,
         random_draft: true,
         eval_mix: 0.0,
-        mc_mix: 0.0,
     };
     let roots = collect_roots(1, 0xABCD, std::slice::from_ref(nets), &gc, 4000);
     assert!(roots.len() >= 4, "fixture game produced too few roots");

@@ -1454,8 +1454,7 @@ mod gather_tests {
             explore: 0.3,
             random_draft: true,
             eval_mix: 0.0,
-            mc_mix: 0.0,
-        };
+            };
         let mut checked = 0;
         for (s, bel) in collect_roots(10, 0x9E17, &nets, &gc, 6) {
             let ctx = crate::rebel::Ctx::new(&s);

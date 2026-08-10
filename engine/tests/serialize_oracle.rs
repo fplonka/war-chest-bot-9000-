@@ -31,7 +31,6 @@ fn real_solver_round_trips() {
         explore: 0.0,
         random_draft: true,
         eval_mix: 0.0,
-        mc_mix: 0.0,
     };
     let roots = collect_roots(12, 0x5EED, &nets, &gc, 8);
     assert!(!roots.is_empty(), "no roots collected");
@@ -94,7 +93,6 @@ fn tables_are_consistent() {
         explore: 0.0,
         random_draft: true,
         eval_mix: 0.0,
-        mc_mix: 0.0,
     };
     let roots = collect_roots(12, 0xABCD, &nets, &gc, 6);
     for (s, bel) in roots {
@@ -215,7 +213,6 @@ fn starter_draft_round_trips() {
             explore: 0.5,
             random_draft: seed % 2 == 0,
             eval_mix: 0.0,
-            mc_mix: 0.0,
         };
         let roots = collect_roots(3, seed, &nets, &gc, 2);
         for (s, bel) in roots {

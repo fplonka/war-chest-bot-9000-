@@ -77,7 +77,7 @@ def build(args):
           f"leaves from {args.ckpt}", flush=True)
     d = warchest.gen_data(args.games, args.seed, "rebel", depth=args.depth,
                           iters=args.iters, explore=args.explore, temp=2.0,
-                          eval_mix=0.0, mc_mix=0.0, cfr=args.cfr, warm=0.0,
+                          eval_mix=0.0, cfr=args.cfr, warm=0.0,
                           random_draft=args.random_draft)
 
     rows = np.asarray(d["rows"], np.uint8).reshape(-1, ROW_BYTES)

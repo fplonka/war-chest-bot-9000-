@@ -29,7 +29,7 @@ class Cfg:
     minutes: float = 60.0
     warm_minutes: float = 5.0      # absolute; the warm phase's data is discarded
     warm_frac: float = 0.2         # used only when warm_minutes < 0
-    snapshot_every: float = 9.0    # minutes; snapshots cost a file write
+    snapshots: int = 3             # evenly spaced over the ReBeL phase, last at the end
     init: str = ""                 # optional checkpoint to start from
 
     # -------------------------------------------------------------- network
@@ -78,7 +78,6 @@ class Cfg:
     explore: float = 0.25
     temp: float = 2.0
     eval_mix: float = 0.5
-    mc_mix: float = 0.0            # blend of realised outcome into the target; 0 = plain ReBeL
     # Horizon payoff per marker of differential, annealed to zero over
     # `anneal_frac` of the ReBeL phase so the shipped checkpoint is fitted to
     # the real game. Each side has 6 markers, so this must stay far below a
@@ -127,9 +126,8 @@ EXPERIMENTS = {
     "iters":    [{}, {"iters": 32}, {"iters": 128}],
     # Does a short run rank changes the way a long one does? If it does, every
     # experiment above costs a quarter of what it costs today. Run this first.
-    "cadence":  [{"minutes": 15, "snapshot_every": 5},
-                 {"minutes": 15, "snapshot_every": 5, "cfr": "dcfr"},
-                 {"minutes": 15, "snapshot_every": 5, "iters": 32}],
+    "cadence":  [{"minutes": 15}, {"minutes": 15, "cfr": "dcfr"},
+                 {"minutes": 15, "iters": 32}],
 }
 
 

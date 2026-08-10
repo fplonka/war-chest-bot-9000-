@@ -534,10 +534,6 @@ pub struct GameCfg {
     /// every ReBeL-phase target comes from real solves and real outcomes, so
     /// the bias washes out.
     pub eval_mix: f32,
-    /// ReBeL phase only: how much of the value target comes from the realised
-    /// game outcome instead of the pure CFR bootstrap (MuZero-style n-step /
-    /// TD(λ) anchor). 0.0 is plain ReBeL: pure bootstrap targets.
-    pub mc_mix: f32,
 }
 
 // ----------------------------------------------------------------- game loop
@@ -1250,12 +1246,6 @@ impl<'a> Game<'a> {
             let m = self.gc.eval_mix.clamp(0.0, 1.0);
             blend_outcome(&mut self.data, self.from_row, m, 1.0 - m, z);
         }
-        if self.gc.collect == Collect::Rebel && self.gc.mc_mix > 0.0 {
-            // Anchor the pure bootstrap target to the realised outcome
-            // (TD(lambda)-style), blended in once per game.
-            let m = self.gc.mc_mix.clamp(0.0, 1.0);
-            blend_outcome(&mut self.data, self.from_row, 1.0 - m, m, z);
-        }
         fill_aux(&mut self.data, self.from_row, &self.timeline, z);
         self.data.games += 1;
         if self.s.main_plays >= crate::state::MAX_MAIN_PLAYS {
@@ -1664,9 +1654,10 @@ pub fn run_games_gpu_until(
 /// Continuous ReBeL generation for the trainer. A fixed number of CPU builder
 /// threads each owns many lightweight game actors; completed solves are
 /// detached immediately and merged into bounded chunks while the actors keep
-/// playing. This eager path is valid for pure bootstrap targets (`mc_mix=0`)
-/// with the auxiliary loss disabled: value and policy targets are final at GPU
-/// completion, while outcome-dependent auxiliary bytes remain zero.
+/// playing. This is valid because ReBeL targets are pure bootstrap: a value
+/// target is final the moment its solve completes and never depends on how the
+/// game later ended. The auxiliary heads do depend on that, which is why they
+/// are not available on this path.
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 pub fn run_games_gpu_stream(
@@ -1897,7 +1888,6 @@ pub fn eval_match_gpu(
         explore: 0.0,
         random_draft,
         eval_mix: 0.0,
-        mc_mix: 0.0,
     };
     // Route: side A's checkpoint sits on service 0, side B's on service 1.
     let slot_of = |ag: &Agent| match ag {
@@ -1952,7 +1942,6 @@ pub fn eval_match(
                 explore: 0.0,
                 random_draft,
                 eval_mix: 0.0,
-                mc_mix: 0.0,
             };
             let mut d = Data::default();
             let z = play_game(rng, nets, &gc, &mut d, None);

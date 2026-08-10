@@ -24,7 +24,7 @@ exact configs in support, their probabilities, and the value the solve gave
 each. The config lists are ragged, so they live in a flat arena and a batch is
 assembled by gathering spans -- see `Buffer`.
 
-The run saves a snapshot every `snapshot_every` minutes and judges nothing
+The run saves `snapshots` checkpoints over the ReBeL phase and judges nothing
 while it trains: it produces checkpoints and stops. `ladder.py` rates them
 afterwards, off the clock, where a measurement can afford enough games to mean
 something — and can be rerun at a larger sample size without regenerating
@@ -49,6 +49,7 @@ import torch.nn.functional as F
 import warchest
 import config
 import mirror
+import report
 from export_weights import load as load_checkpoint
 from value_net import Mlp, AUX, AFEAT
 
@@ -587,14 +588,11 @@ def main():
         # are numbered, and the manifest carries the time each was taken at.
         # Relabelling instead of resaving keeps the ladder from rating the same
         # weights twice when the clock runs out just after a periodic snapshot.
-        # The window is a quarter of the snapshot cadence: at 10-minute
-        # snapshots a 30-minute run's final lands ~30 s after the last timed
-        # snapshot, and rating both would waste ladder pairings on near-twins.
         # Never collapse a short run's trained result into `init`: those are
         # opposite ends of the experiment even when the whole run is shorter
-        # than the ordinary snapshot de-duplication window.
+        # than the de-duplication window.
         if snaps and snaps[-1]["label"] != "init" and \
-                el - snaps[-1]["t"] < args.snapshot_every * 60.0 / 4.0:
+                el - snaps[-1]["t"] < snap_gap / 4.0:
             snaps[-1]["label"] = label
             return
         path = f"{args.out}/snap_{len(snaps):02d}.pt"
@@ -618,8 +616,8 @@ def main():
         and immutable GPU weights are published on a fixed step cadence."""
         nonlocal probe, cap_v, next_decay, next_snap, epoch, rebel_solves
 
-        if args.mc_mix != 0.0 or args.aux != 0.0 or args.policy != 0.0:
-            raise ValueError("continuous GPU generation requires --mc-mix 0 --aux 0 --policy 0")
+        if args.aux != 0.0 or args.policy != 0.0:
+            raise ValueError("continuous GPU generation requires aux=0 policy=0")
         if args.warm != 0.0:
             raise ValueError("the v5 GPU executor requires --warm 0")
         if args.train_gen_ratio <= 0.0:
@@ -838,7 +836,7 @@ def main():
                     next_decay += 1
                 if now - t0 >= next_snap:
                     snapshot(f"s{len(snaps)}", now - t0)
-                    next_snap = now - t0 + args.snapshot_every * 60.0
+                    next_snap = now - t0 + snap_gap
                 if now >= next_report:
                     emit_report(now)
                     next_report = now + 10.0
@@ -872,11 +870,19 @@ def main():
             f"overrun={max(0.0, time.time() - deadline):.2f}s",
             flush=True)
 
+    # Snapshots are a *count*, evenly spaced over the ReBeL phase with the last
+    # one at the end. A count is what an experiment actually chooses: it is the
+    # number of players each run puts on the ladder, and ladder cost grows with
+    # the square of that. An interval made the count a function of the run
+    # length, so a longer run silently paid a quadratically larger ladder.
+    # `init` is saved on top of these -- it is the warm-start output, the zero
+    # of the Elo curve, and the thing `--init` resumes from.
+    snap_gap = (total - warm) / max(args.snapshots, 1)
     next_snap = float("inf")
     print(f"[cfg] PUBFEAT={PUBFEAT} CFEAT={CFEAT} hidden={args.hidden} head={args.head or args.hidden} dg={args.dg} rank={args.rank} depth={args.depth} "
           f"iters={args.iters} budget={total:.0f}s warm={warm:.0f}s device={dev} "
           f"draft={'random' if args.random_draft else 'starter'} "
-          f"snapshot_every={args.snapshot_every:.1f}min "
+          f"snapshots={args.snapshots} (every {snap_gap / 60:.1f}min) "
           f"train_gen_ratio={args.train_gen_ratio} "
           f"recent_mix={args.recent_mix}/{args.recent_frac} "
           f"augment={not args.no_augment} cap={args.cap} "
@@ -898,7 +904,7 @@ def main():
                 flat = value.flat()
                 for i in range(len(gpu_devices)):
                     warchest.gpu_set_weights(value.dims, *flat, device=i)
-            next_snap = el + args.snapshot_every * 60.0
+            next_snap = el + snap_gap
             # Drop the warm-phase data. Its job was to initialise the *network*,
             # not to serve as bootstrap targets: it comes from a different
             # policy and its targets are not bootstrapped. Keeping it is
@@ -912,7 +918,7 @@ def main():
             rebel_t0 = time.time()
             rebel_solves = 0
             print(f"[t={el:6.1f}s] --- switching to ReBeL ---", flush=True)
-            if args.gpu and args.mc_mix == 0.0 and args.aux == 0.0 \
+            if args.gpu and args.aux == 0.0 \
                     and args.policy == 0.0 and args.warm == 0.0:
                 run_gpu_stream()
                 break
@@ -930,7 +936,7 @@ def main():
                     args.rebel_games, gen_seed, "rebel",
                     depth=args.depth, iters=args.iters, explore=args.explore,
                     temp=args.temp, eval_mix=args.eval_mix,
-                    mc_mix=args.mc_mix, cfr=args.cfr, warm=args.warm, **kw)
+                    cfr=args.cfr, warm=args.warm, **kw)
 
             th = threading.Thread(target=go, daemon=True)
             th.start()
@@ -957,7 +963,7 @@ def main():
         else:
             d = warchest.gen_data(args.rebel_games, args.seed * 1_000_003 + epoch, "rebel",
                                   depth=args.depth, iters=args.iters, explore=args.explore,
-                                  mc_mix=args.mc_mix, cfr=args.cfr, warm=args.warm, **kw)
+                                  cfr=args.cfr, warm=args.warm, **kw)
         gen_s = time.time() - tg
         # Utilities live in [-1, 1]; so does the true value function, so clip
         # the bootstrapped targets to that range. Rows stay packed (raw
@@ -1057,7 +1063,7 @@ def main():
         # afterwards what they were worth.
         if phase == "rebel" and time.time() - t0 >= next_snap:
             snapshot(f"s{len(snaps)}", time.time() - t0)
-            next_snap = time.time() - t0 + args.snapshot_every * 60.0
+            next_snap = time.time() - t0 + snap_gap
 
         dec = max(d["decisions"], 1)
         rec = {"t": round(time.time() - t0, 1), "epoch": epoch, "phase": phase,
@@ -1101,6 +1107,16 @@ def main():
 
     snapshot("final", time.time() - t0)
     write_log(args, log, snaps)
+
+    # A finished run renders itself. The ladder is a separate step and may not
+    # have run yet, so the page comes up without the strength panel and gains
+    # it when `exp.py judge` rewrites the page -- but the curves, the health
+    # counters and the config delta are readable the moment the run ends,
+    # without opening a terminal on the box.
+    try:
+        report.write([args.out])
+    except Exception as e:                                  # never fail a run over a plot
+        print(f"[report] skipped: {e}", flush=True)
 
     if args.dump_buffer:
         # Oldest row first, so a recency split is an honest held-out set.
