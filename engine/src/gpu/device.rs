@@ -459,8 +459,7 @@ impl Executor {
             .banks
             .get(&version)
             .ok_or_else(|| format!("GPU weight version {version} is unavailable"))?;
-        let mut device =
-            DeviceWave::upload(&self.stream, &wave, &bank.layout, self.buffers.take())?;
+        let device = DeviceWave::upload(&self.stream, &wave, &bank.layout, self.buffers.take())?;
         let uploaded = Instant::now();
         // Arbitrary live waves often make cuBLAS choose a different captured
         // topology, in which case graph update cannot reuse the executable and
@@ -475,10 +474,6 @@ impl Executor {
         }
         let queued = (|| -> Result<(), String> {
             self.build_towers(&device, bank)?;
-            // Tower construction and CFR use disjoint phases of one scratch
-            // pool. Tower GEMMs overwrite that pool, so restore the original
-            // zero-initialized CFR state before seeding the solve.
-            device.clear_runtime(&self.stream)?;
             self.initialise(&device, bank, &wave)?;
 
             if wave.meta.iters == 0 {
@@ -1329,7 +1324,6 @@ struct DeviceWave {
     buffers: DeviceBuffers,
     _jobs: Vec<JobDev>,
     host: WaveDev,
-    runtime_clear: std::ops::Range<usize>,
 }
 
 impl DeviceWave {
@@ -1341,9 +1335,7 @@ impl DeviceWave {
     ) -> Result<Self, String> {
         let jobs = job_devices(w)?;
         let (toff, table_len) = table_layout(w, &jobs)?;
-        let arena_layout = arena_layout(w, l)?;
-        let aoff = arena_layout.off;
-        let arena_len = arena_layout.len;
+        let (aoff, arena_len) = arena_layout(w, l)?;
         // Before a multi-GiB growth, drop both old allocations so neither is
         // live while the other grows. Once a lane has paid for a whale-sized
         // pair, retain it for later waves instead of reallocating every whale.
@@ -1440,14 +1432,7 @@ impl DeviceWave {
             buffers: DeviceBuffers { tables, arena, dev },
             _jobs: jobs,
             host,
-            runtime_clear: arena_layout.runtime,
         })
-    }
-
-    fn clear_runtime(&mut self, stream: &Arc<CudaStream>) -> Result<(), String> {
-        stream
-            .memset_zeros(&mut self.buffers.arena.slice_mut(self.runtime_clear.clone()))
-            .map_err(|e| format!("clear reused wave runtime: {e:?}"))
     }
 
     fn into_buffers(self) -> DeviceBuffers {
@@ -1642,33 +1627,7 @@ fn copy_table<T: Copy>(tables: &mut [u8], at: usize, values: &[T]) -> Result<(),
     Ok(())
 }
 
-struct ArenaLayout {
-    off: [u64; N_ARENAS],
-    len: usize,
-    runtime: std::ops::Range<usize>,
-}
-
-fn align_arena(at: usize) -> Result<usize, String> {
-    at.checked_add(31)
-        .map(|x| x & !31)
-        .ok_or_else(|| "wave FP32 arena alignment overflow".into())
-}
-
-fn put_arena(
-    off: &mut [u64; N_ARENAS],
-    at: &mut usize,
-    arena: Arena,
-    n: usize,
-) -> Result<(), String> {
-    *at = align_arena(*at)?;
-    off[arena as usize] = *at as u64;
-    *at = at
-        .checked_add(n)
-        .ok_or_else(|| "wave FP32 arena size overflow".to_string())?;
-    Ok(())
-}
-
-fn arena_layout(w: &Wave, l: &V3Layout) -> Result<ArenaLayout, String> {
+fn arena_layout(w: &Wave, l: &V3Layout) -> Result<([u64; N_ARENAS], usize), String> {
     let rows = w.row_node.len();
     let cfgs = w.config_job.len();
     let jobs = w.jobs.len();
@@ -1744,119 +1703,16 @@ fn arena_layout(w: &Wave, l: &V3Layout) -> Result<ArenaLayout, String> {
         bg,
     ];
     let mut off = [0u64; N_ARENAS];
-
-    // Z, G, and the static public residual survive for the whole solve. Card
-    // embeddings and the four tower scratch matrices die when build_towers
-    // returns, before any CFR state is read. Put those two phases in the same
-    // pool, then explicitly clear the runtime side between them.
-    let mut persistent_end = 0usize;
-    for arena in [Arena::Z, Arena::G, Arena::H0] {
-        put_arena(&mut off, &mut persistent_end, arena, sizes[arena as usize])?;
+    let mut at = 0usize;
+    for (i, &n) in sizes.iter().enumerate() {
+        at = at
+            .checked_add(31)
+            .ok_or("wave FP32 arena alignment overflow")?
+            & !31;
+        off[i] = at as u64;
+        at = at.checked_add(n).ok_or("wave FP32 arena size overflow")?;
     }
-    let phase_base = align_arena(persistent_end)?;
-
-    let mut runtime_end = phase_base;
-    for arena in [
-        Arena::Reach,
-        Arena::SnapReach,
-        Arena::Vals,
-        Arena::Regret,
-        Arena::Cur,
-        Arena::Sum,
-        Arena::SnapStrat,
-        Arena::RootValues,
-        Arena::Carry,
-    ] {
-        put_arena(&mut off, &mut runtime_end, arena, sizes[arena as usize])?;
-    }
-    if fast_head {
-        // Xb is dead before head_entry writes H2; H is dead before the final
-        // projection writes U. Stream ordering makes both aliases exact.
-        runtime_end = align_arena(runtime_end)?;
-        off[Arena::Xb as usize] = runtime_end as u64;
-        off[Arena::H2 as usize] = runtime_end as u64;
-        runtime_end = runtime_end
-            .checked_add(sizes[Arena::Xb as usize].max(sizes[Arena::H2 as usize]))
-            .ok_or("wave FP32 dynamic scratch overflow")?;
-        runtime_end = align_arena(runtime_end)?;
-        off[Arena::H as usize] = runtime_end as u64;
-        off[Arena::U as usize] = runtime_end as u64;
-        runtime_end = runtime_end
-            .checked_add(sizes[Arena::H as usize].max(sizes[Arena::U as usize]))
-            .ok_or("wave FP32 dynamic output overflow")?;
-    } else {
-        for arena in [Arena::Xb, Arena::H, Arena::H2, Arena::U] {
-            put_arena(&mut off, &mut runtime_end, arena, sizes[arena as usize])?;
-        }
-    }
-
-    let mut tower_end = phase_base;
-    for arena in [Arena::E, Arena::Bx, Arena::Bh, Arena::Bh2, Arena::Bg] {
-        put_arena(&mut off, &mut tower_end, arena, sizes[arena as usize])?;
-    }
-    let len = runtime_end.max(tower_end);
-
-    if std::env::var_os("WARCHEST_ARENA_PROFILE").is_some() && w.jobs.len() == 1 {
-        let mut serial = 0usize;
-        for &n in &sizes {
-            serial = align_arena(serial)?
-                .checked_add(n)
-                .ok_or("wave FP32 serial profile overflow")?;
-        }
-        if serial.saturating_mul(size_of::<f32>()) >= (1usize << 30) {
-            const NAMES: [&str; N_ARENAS] = [
-                "reach",
-                "snap_reach",
-                "vals",
-                "regret",
-                "cur",
-                "sum",
-                "snap_strat",
-                "e",
-                "z",
-                "g",
-                "h0",
-                "xb",
-                "h",
-                "h2",
-                "u",
-                "root_values",
-                "carry",
-                "bx",
-                "bh",
-                "bh2",
-                "bg",
-            ];
-            let mut top = sizes
-                .iter()
-                .enumerate()
-                .map(|(i, &n)| (n, NAMES[i]))
-                .collect::<Vec<_>>();
-            top.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-            let top = top
-                .into_iter()
-                .take(8)
-                .map(|(n, name)| format!("{name}:{:.1}", n as f64 * 4.0 / 1048576.0))
-                .collect::<Vec<_>>()
-                .join(",");
-            let allocated = len.max(1).checked_next_power_of_two().unwrap_or(len.max(1));
-            eprintln!(
-                "v5_arena_plan rows={rows} cfgs={cfgs} cells={cells} serial_mib={:.1} pooled_mib={:.1} allocated_mib={:.1} persistent_mib={:.1} runtime_mib={:.1} tower_mib={:.1} top={top}",
-                serial as f64 * 4.0 / 1048576.0,
-                len as f64 * 4.0 / 1048576.0,
-                allocated as f64 * 4.0 / 1048576.0,
-                phase_base as f64 * 4.0 / 1048576.0,
-                (runtime_end - phase_base) as f64 * 4.0 / 1048576.0,
-                (tower_end - phase_base) as f64 * 4.0 / 1048576.0,
-            );
-        }
-    }
-
-    Ok(ArenaLayout {
-        off,
-        len,
-        runtime: phase_base..runtime_end,
-    })
+    Ok((off, at))
 }
 
 fn unpack(
@@ -2293,12 +2149,11 @@ mod reservation_tests {
         let reserved = job.work().mutable_bytes;
         let wave = Wave::pack(&[job]).expect("pack stub wave");
         let layout = V3Layout::new(&wave.meta.net_dims).expect("network layout");
-        let arena = arena_layout(&wave, &layout).expect("device arena layout");
-        let allocated = arena
-            .len
+        let (_, floats) = arena_layout(&wave, &layout).expect("device arena layout");
+        let allocated = floats
             .max(1)
             .checked_next_power_of_two()
-            .unwrap_or(arena.len.max(1))
+            .unwrap_or(floats.max(1))
             * size_of::<f32>();
         assert_eq!(reserved, allocated);
     }

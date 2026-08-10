@@ -189,12 +189,11 @@ impl WorkVector {
         self.mutable_bytes.saturating_add(table_reservation)
     }
 
-    /// Jobs in this tail need an isolated one-job lane wave. Two-gibibyte
-    /// arenas are safe beside ordinary lanes, but batching two of them would
-    /// recreate a four-gibibyte allocation. `mutable_bytes` includes allocator
-    /// power-of-two rounding, so this tests the reservation CUDA will attempt.
+    /// Jobs in this tail need an isolated one-job lane wave. `mutable_bytes`
+    /// includes allocator power-of-two rounding, so this tests the reservation
+    /// CUDA will actually attempt.
     pub fn requires_exclusive_route(self) -> bool {
-        self.mutable_bytes >= (2usize << 30) || self.reserved_bytes() >= (4usize << 30)
+        self.reserved_bytes() >= (4usize << 30)
     }
 
     /// A four-GiB contiguous arena needs extra headroom, but can still run
@@ -577,38 +576,11 @@ fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
         bh,
         bg,
     ];
-    let align = |x: usize| x.saturating_add(31) & !31usize;
-    let put = |at: &mut usize, n: usize| {
-        *at = align(*at).saturating_add(n);
-    };
-
-    // Persistent Z/G/H0 precede one shared phase pool. Card/tower scratch
-    // occupies that pool only while the static network towers are built; CFR
-    // state and dynamic-head scratch reuse it after an ordered device clear.
-    // Indices mirror `gpu::device::Arena` without making serialization depend
-    // on the optional GPU module.
-    let mut persistent = 0usize;
-    for i in [8usize, 9, 10] {
-        put(&mut persistent, sizes[i]);
+    let mut floats = 0usize;
+    for n in sizes {
+        floats = floats.saturating_add(31) & !31usize;
+        floats = floats.saturating_add(n);
     }
-    let phase_base = align(persistent);
-    let mut runtime = phase_base;
-    for i in [0usize, 1, 2, 3, 4, 5, 6, 15, 16] {
-        put(&mut runtime, sizes[i]);
-    }
-    if fast_head {
-        put(&mut runtime, sizes[11].max(sizes[13]));
-        put(&mut runtime, sizes[12].max(sizes[14]));
-    } else {
-        for i in [11usize, 12, 13, 14] {
-            put(&mut runtime, sizes[i]);
-        }
-    }
-    let mut tower = phase_base;
-    for i in [7usize, 17, 18, 19, 20] {
-        put(&mut tower, sizes[i]);
-    }
-    let floats = runtime.max(tower);
     floats
         .checked_next_power_of_two()
         .unwrap_or(floats)
@@ -1345,22 +1317,13 @@ mod tests {
     #[test]
     fn whale_routes_match_card_memory_classes() {
         let ordinary = WorkVector {
-            mutable_bytes: 1usize << 30,
+            mutable_bytes: 3usize << 30,
             table_bytes: 1,
             ..Default::default()
         };
         assert!(!ordinary.requires_exclusive_route());
         assert!(!ordinary.requires_arena_guard_route());
         assert!(!ordinary.requires_card_exclusive_route());
-
-        let isolated = WorkVector {
-            mutable_bytes: 2usize << 30,
-            table_bytes: 1,
-            ..Default::default()
-        };
-        assert!(isolated.requires_exclusive_route());
-        assert!(!isolated.requires_arena_guard_route());
-        assert!(!isolated.requires_card_exclusive_route());
 
         let lane_whale = WorkVector {
             mutable_bytes: 2usize << 30,
