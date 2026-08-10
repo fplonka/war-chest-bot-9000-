@@ -167,12 +167,14 @@ fn dispatcher(
                     }
                     continue;
                 }
-                let lane = lane_work
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, x)| x.load(Ordering::Relaxed))
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
+                // Keep common 4 GiB whales on one lane. Sending each one to
+                // the currently emptiest lane eventually leaves every lane
+                // retaining a whale-sized buffer, which exhausts a 24 GiB
+                // card with five lanes even though every individual solve
+                // fits. Ordinary work may still use lane 0 while it is idle;
+                // its large queued cost naturally steers that work elsewhere
+                // while a whale is pending.
+                let lane = dispatch_lane(&lane_work, work.requires_exclusive_route());
                 lane_work[lane].fetch_add(cost, Ordering::Relaxed);
                 let cmd = Cmd::Submit {
                     job,
@@ -503,6 +505,33 @@ fn cost_class(w: WorkVector) -> u8 {
         1
     } else {
         0
+    }
+}
+
+fn dispatch_lane(lane_work: &[Arc<AtomicU64>], exclusive: bool) -> usize {
+    if exclusive {
+        return 0;
+    }
+    lane_work
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, x)| x.load(Ordering::Relaxed))
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whales_share_one_retained_buffer() {
+        let lanes = [9, 2, 5]
+            .into_iter()
+            .map(|x| Arc::new(AtomicU64::new(x)))
+            .collect::<Vec<_>>();
+        assert_eq!(dispatch_lane(&lanes, true), 0);
+        assert_eq!(dispatch_lane(&lanes, false), 1);
     }
 }
 
