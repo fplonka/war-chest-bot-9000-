@@ -24,3 +24,12 @@ the other four lanes retained their own large buffers. At this point `init`,
 25-minute run. Long runs need a stricter retained-buffer bound (or four total
 lanes) before retrying; the saved checkpoints can be laddered and used as an
 initial network without pretending the failed run completed.
+
+The partial ladder nevertheless gives a clear learning curve. With 30 paired
+games per matchup, the six-minute checkpoint beat the warm-only checkpoint
+26--1 with 3 draws, and the twelve-minute checkpoint then beat the six-minute
+checkpoint 20--8 with 2 draws. Against Greedy the sequence went from a 4--18
+loss, to a 20--1 win, to a 28--0 win. Fitted ratings rose from -169 Elo at the
+warm-only checkpoint to +214 at six minutes and +377 at twelve minutes, with
+Greedy fixed at zero. More training was still improving playing strength
+rather than merely changing the draw rate.
