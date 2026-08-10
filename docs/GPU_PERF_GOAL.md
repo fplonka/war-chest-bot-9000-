@@ -247,7 +247,18 @@ and memory work.
 trainer, but no Greedy warm-up, initialised from a late checkpoint, and
 `--cap-value 0`, so the expensive workload is present from about ninety seconds
 in instead of after ten minutes. This is the one that predicts a golden run.
-Repeats agree within about 2% at equal cumulative solves.
+Repeats agree within about 2% at equal cumulative solves. Its own ladder:
+
+| build | steady solves/s |
+|---|---:|
+| the build `runs/gpu_golden` ran on | 707.1, 764.3 |
+| high-priority trainer stream | 864.8 |
+| pooled node array, smaller `TNode`, hot-path passes removed | 1,070.4 |
+| lane-major readout, cheap interning hash | 1,107.2 |
+
+`runs/gpu_golden` (1,023.5) and `runs/gpu_golden8` (1,315.4) are the golden runs
+that bracket the third row, which is the ratio to use when deciding whether a
+thirty-minute run is worth starting.
 
 Read all three with `tools/run_rate.py`, over a span of *solves* rather than
 wall time. Cost per solve grows as games leave the opening, so a faster build
