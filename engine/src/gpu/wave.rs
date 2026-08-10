@@ -7,7 +7,7 @@
 use std::borrow::Borrow;
 
 use crate::rebel::{CFEAT, GPU_ROW_BYTES};
-use crate::serialize::{IndexWidth, PackedJob, PackedMeta, WorkVector};
+use crate::serialize::{device_value_layout, IndexWidth, PackedJob, PackedMeta, WorkVector};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -70,8 +70,12 @@ pub struct Wave {
     /// act, so only changed beliefs occupy device storage.
     pub reach_base: Vec<u32>,
     pub reach_len: usize,
+    /// Arena base for each `(node, player)` value vector. The two player
+    /// layouts overlap because traversal is sequential, and an unchanged
+    /// vector across an opponent chance edge aliases its sole child.
+    pub vals_base: Vec<u32>,
+    pub vals_len: usize,
     pub soff: Vec<u32>,
-    pub voff: Vec<u32>,
     pub node_parent: Vec<u32>,
     pub rev_row_of: Vec<u32>,
     pub rev_start: Vec<u32>,
@@ -153,8 +157,9 @@ impl Wave {
             draw_row_start: Vec::new(),
             reach_base: Vec::new(),
             reach_len: 0,
+            vals_base: Vec::new(),
+            vals_len: 0,
             soff: vec![0],
-            voff: vec![0],
             node_parent: Vec::new(),
             rev_row_of: Vec::new(),
             rev_start: vec![0],
@@ -234,8 +239,8 @@ impl Wave {
         reserve!(draw_row_off, nodes);
         reserve!(draw_row_start, table_len!(draw_row_start));
         reserve!(reach_base, 2 * nodes);
+        reserve!(vals_base, 2 * nodes);
         reserve!(soff, nodes);
-        reserve!(voff, nodes);
         reserve!(node_parent, nodes);
         reserve!(rev_row_of, nodes);
         reserve!(rev_start, table_len!(rev_start).saturating_sub(jobs.len()));
@@ -288,7 +293,7 @@ impl Wave {
         let draw0 = self.draw_to.len();
         let draw_row0 = self.draw_row_start.len();
         let reach0 = self.reach_len;
-        let vals0 = *self.voff.last().unwrap() as usize;
+        let vals0 = self.vals_len;
         let rev_row0 = self.rev_start.len() - 1;
         let rev0 = self.rev_src.len();
         let rvd_row0 = self.rvd_start.len() - 1;
@@ -356,26 +361,43 @@ impl Wave {
         self.reach_len = reach_at;
         self.soff
             .extend(t.soff.iter().skip(1).map(|&x| cell0 as u32 + x));
-        let mut va = vals0 as u32;
-        for i in 0..t.nodes {
-            let n0 = t.cfg_off[2 * i + 1] - t.cfg_off[2 * i];
-            let n1 = t.cfg_off[2 * i + 2] - t.cfg_off[2 * i + 1];
-            va += n0.max(n1);
-            self.voff.push(va);
+        let (local_vals, vals_len) = device_value_layout(t).ok_or("invalid value alias layout")?;
+        self.vals_base.resize(2 * (node0 + t.nodes), 0);
+        for local in 0..t.nodes {
+            for p in 0..2 {
+                self.vals_base[2 * (node0 + local) + p] = u32::try_from(
+                    vals0
+                        .checked_add(local_vals[p][local] as usize)
+                        .ok_or("wave value offset overflow")?,
+                )
+                .map_err(|_| "wave value offset exceeds u32")?;
+            }
         }
-        self.legal_value
-            .extend(
-                t.legal_child
-                    .iter()
-                    .zip(&t.legal_trans)
-                    .map(|(&child, &trans)| {
-                        if trans == u32::MAX {
-                            u32::MAX
-                        } else {
-                            self.voff[node0 + child as usize] + trans
-                        }
-                    }),
-            );
+        self.vals_len = vals0
+            .checked_add(vals_len)
+            .ok_or("wave value length overflow")?;
+        self.legal_value.resize(cell0 + t.ncells, u32::MAX);
+        for local in 0..t.nodes {
+            if t.node_kind[local] != 0 {
+                continue;
+            }
+            let p = t.node_player[local] as usize;
+            let nc = (t.cfg_off[2 * local + p + 1] - t.cfg_off[2 * local + p]) as usize;
+            let row0 = t.legal_row_of[local] as usize;
+            for row in row0..row0 + nc {
+                let lo = t.legal_off[row] as usize;
+                let hi = t.legal_off[row + 1] as usize;
+                for cell in lo..hi {
+                    let trans = t.legal_trans[cell];
+                    if trans != u32::MAX {
+                        let child = node0 + t.legal_child[cell] as usize;
+                        self.legal_value[cell0 + cell] = self.vals_base[2 * child + p]
+                            .checked_add(trans)
+                            .ok_or("legal value offset overflow")?;
+                    }
+                }
+            }
+        }
         self.node_parent.extend(t.node_parent.iter().map(|&x| {
             if x == u32::MAX {
                 x
@@ -459,7 +481,7 @@ impl Wave {
             configs: config0..config0 + t.ncfg,
             cells: cell0..cell0 + t.ncells,
             reach: reach0..reach_at,
-            vals: vals0..va as usize,
+            vals: vals0..self.vals_len,
             root: root0..root0 + root_n,
             carried: carried0..carried0 + carried_n,
             root_values: root_value0..root_value0 + carried_n,
@@ -500,6 +522,9 @@ impl Wave {
                     }
                     if t.node_kind[node] != 2 {
                         for p in 0..2 {
+                            if t.node_kind[node] == 1 && t.node_player[node] as usize != p {
+                                continue;
+                            }
                             back_caps[p] += nc[p];
                         }
                     }
@@ -561,6 +586,11 @@ impl Wave {
                     }
                     if t.node_kind[local as usize] != 2 {
                         for p in 0..2 {
+                            if t.node_kind[local as usize] == 1
+                                && t.node_player[local as usize] as usize != p
+                            {
+                                continue;
+                            }
                             let nc = self.nc(i as usize, p);
                             for c in 0..nc {
                                 self.back_task[p].push(Task {
@@ -616,8 +646,8 @@ impl Wave {
             || self.node_nc.len() != 2 * nodes
             || self.node_child_start.len() != nodes + 1
             || self.reach_base.len() != 2 * nodes
+            || self.vals_base.len() != 2 * nodes
             || self.soff.len() != nodes + 1
-            || self.voff.len() != nodes + 1
         {
             return Err("wave node arrays disagree".into());
         }
@@ -654,7 +684,18 @@ impl Wave {
                 if end > self.reach_len {
                     return Err("wave reach alias out of bounds".into());
                 }
+                let end = self.vals_base[2 * node + p] as usize + self.nc(node, p);
+                if end > self.vals_len {
+                    return Err("wave value alias out of bounds".into());
+                }
             }
+        }
+        if self
+            .legal_value
+            .iter()
+            .any(|&x| x != u32::MAX && x as usize >= self.vals_len)
+        {
+            return Err("wave legal value out of bounds".into());
         }
         Ok(())
     }

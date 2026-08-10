@@ -48,7 +48,7 @@ typedef struct {
 #define T_DRAW_ROW_START 12
 #define T_REACH_BASE 13
 #define T_SOFF 14
-#define T_VOFF 15
+#define T_VALS_BASE 15
 #define T_NODE_PARENT 16
 #define T_REV_ROW_OF 17
 #define T_REV_START 18
@@ -146,6 +146,10 @@ __device__ __forceinline__ int nc_of(const WaveDev* w, int node, int p) {
 
 __device__ __forceinline__ int reach_at(const WaveDev* w, int node, int p, int c) {
     return (int)TP(w, unsigned int, T_REACH_BASE)[2 * node + p] + c;
+}
+
+__device__ __forceinline__ int value_at(const WaveDev* w, int node, int p, int c) {
+    return (int)TP(w, unsigned int, T_VALS_BASE)[2 * node + p] + c;
 }
 
 __device__ __forceinline__ void norm_parts(const float* x, int n, int lane,
@@ -529,7 +533,7 @@ extern "C" __global__ void belief_sums(const WaveDev* w, const WeightDev* wt,
             // value slot that readout is about to overwrite (player 0), or in
             // dead snapshot-reach scratch (player 1).
             AP(w, p ? A_VALS : A_SNAP_REACH)
-                [TP(w, unsigned int, T_VOFF)[q.node]] = total;
+                [value_at(w, q.node, 1 - p, 0)] = total;
         }
         float acc[DG_CH];
         #pragma unroll
@@ -569,7 +573,7 @@ extern "C" __global__ void belief_sums_f16(const WaveDev* w, const WeightDev* wt
         norm_parts(r, n, lane, &scale, &flat, &total);
         if (lane == 0) {
             AP(w, p ? A_VALS : A_SNAP_REACH)
-                [TP(w, unsigned int, T_VOFF)[q.node]] = total;
+                [value_at(w, q.node, 1 - p, 0)] = total;
         }
         float acc[DG_CH];
         #pragma unroll
@@ -682,11 +686,11 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
     ReadTask q = TP(w, ReadTask, T_READOUT)[task];
     int opp = 1 - player;
     int n = nc_of(w, q.node, player);
-    float* out = AP(w, A_VALS) + TP(w, unsigned int, T_VOFF)[q.node];
+    int vbase = value_at(w, q.node, player, 0);
+    float* out = AP(w, A_VALS) + vbase;
     float orc;
     if (q.row != NONE) {
-        orc = AP(w, player ? A_SNAP_REACH : A_VALS)
-            [TP(w, unsigned int, T_VOFF)[q.node]];
+        orc = AP(w, player ? A_SNAP_REACH : A_VALS)[vbase];
     } else {
         int nop = nc_of(w, q.node, opp);
         const float* ro = AP(w, A_REACH) + reach_at(w, q.node, opp, 0);
@@ -732,7 +736,7 @@ __device__ __forceinline__ void backprop_task(
     int kind = TP(w, unsigned char, T_NODE_KIND)[node];
     int actor = TP(w, unsigned char, T_NODE_PLAYER)[node];
     float* vals = AP(w, A_VALS);
-    unsigned int vbase = TP(w, unsigned int, T_VOFF)[node];
+    unsigned int vbase = value_at(w, node, player, 0);
     if (kind == 1) {
         int child = TP(w, unsigned int, T_NODE_CHILD)
             [TP(w, unsigned int, T_NODE_CHILD_START)[node]];
@@ -744,12 +748,10 @@ __device__ __forceinline__ void backprop_task(
             float v = 0.0f;
             for (unsigned int x = lo + lane; x < hi; x += 32)
                 v += TP(w, float, T_DRAW_P)[d0 + x]
-                   * vals[TP(w, unsigned int, T_VOFF)[child]
-                          + TP(w, unsigned int, T_DRAW_TO)[d0 + x]];
+                   * vals[value_at(w, child, player,
+                                   TP(w, unsigned int, T_DRAW_TO)[d0 + x])];
             v = warp_sum(v);
             if (lane == 0) vals[vbase + c] = v;
-        } else if (lane == 0) {
-            vals[vbase + c] = vals[TP(w, unsigned int, T_VOFF)[child] + c];
         }
         return;
     }
@@ -758,7 +760,7 @@ __device__ __forceinline__ void backprop_task(
         const unsigned int* cs = TP(w, unsigned int, T_NODE_CHILD_START);
         const unsigned int* ch = TP(w, unsigned int, T_NODE_CHILD);
         for (unsigned int x = cs[node] + lane; x < cs[node + 1]; x += 32)
-            v += vals[TP(w, unsigned int, T_VOFF)[ch[x]] + c];
+            v += vals[value_at(w, ch[x], player, c)];
         v = warp_sum(v);
         if (lane == 0) vals[vbase + c] = v;
         return;
@@ -868,7 +870,7 @@ extern "C" __global__ void collect_root(const WaveDev* w, const WeightDev* wt,
     if (root_index >= (int)d.nroots) return;
     int n = player ? d.root_n1 : d.root_n0;
     int base = player ? d.root_n0 : 0;
-    const float* src = AP(w, A_VALS) + TP(w, unsigned int, T_VOFF)[d.node0];
+    const float* src = AP(w, A_VALS) + value_at(w, d.node0, player, 0);
     float* dst = AP(w, A_ROOT_VALUES) + d.root_value0
         + (unsigned long long)root_index * (d.root_n0 + d.root_n1) + base;
     for (int c = threadIdx.x; c < n; c += blockDim.x) dst[c] = src[c];

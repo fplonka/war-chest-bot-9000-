@@ -397,13 +397,7 @@ impl PackedJob {
     pub fn work(&self) -> WorkVector {
         let t = &self.tables;
         let reach = device_reach_slots(t);
-        let vals = (0..t.nodes)
-            .map(|i| {
-                let n0 = t.cfg_off[2 * i + 1] - t.cfg_off[2 * i];
-                let n1 = t.cfg_off[2 * i + 2] - t.cfg_off[2 * i + 1];
-                n0.max(n1) as usize
-            })
-            .sum::<usize>();
+        let vals = device_value_layout(t).map_or(usize::MAX, |(_, n)| n);
         let root_configs = (t.cfg_off[2] - t.cfg_off[0]) as usize;
         let snapshots = self.meta.snap_iters.len();
         let fp32_output = t
@@ -451,6 +445,47 @@ fn device_reach_slots(t: &PackedTables) -> usize {
         slots = slots.saturating_add(nc(node, t.node_player[parent] as usize));
     }
     slots
+}
+
+/// Values are evaluated for one traverser at a time, so the two players can
+/// reuse the same arena span. Across a chance edge only the drawing player's
+/// private configuration changes; the other player's value vector is exactly
+/// its sole child's vector and aliases it instead of being copied.
+pub(crate) fn device_value_layout(t: &PackedTables) -> Option<([Vec<u32>; 2], usize)> {
+    let mut base: [Vec<u32>; 2] = std::array::from_fn(|_| vec![0; t.nodes]);
+    let mut lengths = [0usize; 2];
+    for p in 0..2 {
+        let mut at = 0usize;
+        let mut ready = vec![false; t.nodes];
+        for &node_u in t.bfs_order.iter().rev() {
+            let node = node_u as usize;
+            if node >= t.nodes {
+                return None;
+            }
+            if t.node_kind[node] == 1 && t.node_player[node] as usize != p {
+                let lo = *t.node_child_start.get(node)? as usize;
+                let hi = *t.node_child_start.get(node + 1)? as usize;
+                if hi != lo + 1 {
+                    return None;
+                }
+                let child = *t.node_child.get(lo)? as usize;
+                if child >= t.nodes || !ready[child] {
+                    return None;
+                }
+                base[p][node] = base[p][child];
+            } else {
+                base[p][node] = u32::try_from(at).ok()?;
+                let n = (t.cfg_off[2 * node + p + 1] - t.cfg_off[2 * node + p]) as usize;
+                at = at.checked_add(n)?;
+            }
+            ready[node] = true;
+        }
+        if ready.iter().any(|&x| !x) {
+            return None;
+        }
+        lengths[p] = at;
+    }
+    Some((base, lengths[0].max(lengths[1])))
 }
 
 fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
@@ -1306,6 +1341,24 @@ mod tests {
         };
         assert!(card_whale.requires_exclusive_route());
         assert!(card_whale.requires_card_exclusive_route());
+    }
+
+    #[test]
+    fn opponent_chance_values_alias_the_child() {
+        let t = PackedTables {
+            nodes: 2,
+            node_kind: vec![1, 2],
+            node_player: vec![0, 0],
+            node_child_start: vec![0, 1, 1],
+            node_child: vec![1],
+            cfg_off: vec![0, 1, 2, 4, 5],
+            bfs_order: vec![0, 1],
+            ..Default::default()
+        };
+        let (base, len) = device_value_layout(&t).expect("value layout");
+        assert_eq!(base[0], vec![2, 0]);
+        assert_eq!(base[1], vec![0, 0]);
+        assert_eq!(len, 3);
     }
 }
 
