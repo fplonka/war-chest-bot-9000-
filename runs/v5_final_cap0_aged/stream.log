@@ -1,0 +1,21 @@
+v5 GEMM compute=fast-f16
+{"phase": "live", "seconds": 10.193, "solves": 17408, "solves_per_s": 1707.9, "oversize_routes": 0}
+{"phase": "live", "seconds": 20.044, "solves": 44032, "solves_per_s": 2196.8, "oversize_routes": 0}
+{"phase": "live", "seconds": 30.047, "solves": 53248, "solves_per_s": 1772.2, "oversize_routes": 3}
+{"phase": "live", "seconds": 40.089, "solves": 64512, "solves_per_s": 1609.2, "oversize_routes": 9}
+{"phase": "live", "seconds": 50.12, "solves": 74752, "solves_per_s": 1491.4, "oversize_routes": 15}
+{"phase": "live", "seconds": 60.1, "solves": 82944, "solves_per_s": 1380.1, "oversize_routes": 33}
+{"phase": "live", "seconds": 70.138, "solves": 91136, "solves_per_s": 1299.4, "oversize_routes": 43}
+{"phase": "live", "seconds": 80.069, "solves": 98304, "solves_per_s": 1227.7, "oversize_routes": 73}
+{"phase": "live", "seconds": 90.116, "solves": 105472, "solves_per_s": 1170.4, "oversize_routes": 99}
+{"phase": "live", "seconds": 100.164, "solves": 113664, "solves_per_s": 1134.8, "oversize_routes": 121}
+{"phase": "live", "seconds": 110.058, "solves": 120832, "solves_per_s": 1097.9, "oversize_routes": 143}
+{"phase": "live", "seconds": 120.19, "solves": 129024, "solves_per_s": 1073.5, "oversize_routes": 163}
+{"phase": "live", "seconds": 130.151, "solves": 138240, "solves_per_s": 1062.2, "oversize_routes": 178}
+{"phase": "live", "seconds": 140.061, "solves": 144384, "solves_per_s": 1030.9, "oversize_routes": 194}
+{"phase": "live", "seconds": 150.101, "solves": 153600, "solves_per_s": 1023.3, "oversize_routes": 218}
+{"phase": "live", "seconds": 160.096, "solves": 160768, "solves_per_s": 1004.2, "oversize_routes": 232}
+{"phase": "live", "seconds": 170.184, "solves": 168960, "solves_per_s": 992.8, "oversize_routes": 256}
+{"phase": "live", "seconds": 180.155, "solves": 178176, "solves_per_s": 989.0, "oversize_routes": 275}
+{"phase": "prestop", "solves": 178176, "games": 646, "decisions": 555499, "oversize_routes": 275, "exact_fallbacks": 0, "censored_games": 0, "dropped": 0, "node_caps": 1558, "seconds": 180.15521188895218, "solves_per_s": 989.0}
+{"phase": "drained", "solves": 180308, "games": 679, "decisions": 570922, "oversize_routes": 284, "exact_fallbacks": 0, "censored_games": 4608, "dropped": 0, "node_caps": 1872, "seconds": 226.141, "solves_per_s": 797.3}

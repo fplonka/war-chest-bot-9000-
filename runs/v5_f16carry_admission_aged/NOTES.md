@@ -15,7 +15,10 @@ from 329 to 289, and post-stop drain fell from 22.2 to 9.7 seconds. There were
 857 completed games, 1,576 node caps, no exact fallback, and no dropped work.
 
 Average GPU use was 69.5% and 69.4%, up from 65.6% and 64.4% in the control.
-Peak memory was 9,813 and 9,095 MiB, leaving ample room on both 24 GiB cards.
+Peak memory was 22,293 and 21,895 MiB. The initially written 9,813/9,095 MiB
+figures came from the same string-comparison bug in the CSV summary and were
+corrected from the saved samples. Float16 carry did not lower allocator high
+water enough to make five lanes comfortably safe by itself.
 The live games are not an exact A/B because float16 beliefs can change sampled
 actions; the identical frozen tape was 1.6% faster for float16 carry and 0.9%
 faster for corrected admission. At this point both changes pass the fast and
