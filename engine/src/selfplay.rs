@@ -1675,10 +1675,6 @@ pub fn run_games_gpu_stream(
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     assert_eq!(gc.collect, Collect::Rebel);
-    assert_eq!(
-        gc.mc_mix, 0.0,
-        "eager stream requires pure bootstrap targets"
-    );
     let workers = workers.max(1);
     let per = actors_per_worker.max(1);
     let max_inflight = inflight_per_worker.max(1).min(per);
