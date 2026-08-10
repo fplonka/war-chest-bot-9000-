@@ -130,6 +130,8 @@ def main():
         **prestop,
         "solves_per_s": round(prestop["solves"] / prestop["seconds"], 1),
     }), flush=True)
+    if hasattr(warchest, "prof_dump"):
+        warchest.prof_dump()
     print(json.dumps({
         "phase": "drained",
         **totals,

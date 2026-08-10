@@ -1078,6 +1078,14 @@ fn save_roots(
     Ok(roots.len())
 }
 
+/// Print the generation loop's phase timers. Empty unless the extension was
+/// built with the `prof` feature; the host side of a GPU run is otherwise
+/// invisible, and it is the part that has to fit in the CPU budget.
+#[pyfunction]
+fn prof_dump() {
+    crate::prof::dump();
+}
+
 /// Set the horizon payoff per marker of lead. The trainer anneals it to 0.
 #[pyfunction]
 fn set_cap_value(v: f32) {
@@ -1353,6 +1361,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hex_neighborhood, m)?)?;
     m.add_function(wrap_pyfunction!(set_weights, m)?)?;
     m.add_function(wrap_pyfunction!(set_cap_value, m)?)?;
+    m.add_function(wrap_pyfunction!(prof_dump, m)?)?;
     m.add_function(wrap_pyfunction!(save_roots, m)?)?;
     m.add_function(wrap_pyfunction!(gen_data, m)?)?;
     #[cfg(feature = "gpu")]

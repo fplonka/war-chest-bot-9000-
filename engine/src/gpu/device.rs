@@ -1503,14 +1503,27 @@ fn grow_buffer<T: cudarc::driver::DeviceRepr>(
     name: &str,
 ) -> Result<CudaSlice<T>, String> {
     if let Some(buffer) = current {
-        if buffer.len() >= need {
+        let bytes = buffer.len().saturating_mul(size_of::<T>());
+        // Keep it if it fits and is not hoarding. A lane that once served one
+        // gibibyte-sized wave would otherwise hold that gibibyte for the rest
+        // of the run, and eight lanes doing that is how a 24 GiB card fills up
+        // and a long run dies of an out-of-memory error twenty minutes in.
+        // Below the floor the excess is not worth an allocation, and the four
+        // times margin keeps ordinary wave-to-wave variation from thrashing.
+        if buffer.len() >= need && (bytes <= RETAIN_FLOOR_BYTES || buffer.len() <= 4 * need) {
             return Ok(buffer);
         }
+        // Dropped here rather than after the allocation below, so a shrink
+        // never has both the old and the new buffer live.
     }
     let capacity = need.checked_next_power_of_two().unwrap_or(need);
     unsafe { stream.alloc(capacity) }
         .map_err(|e| format!("{name} allocation ({capacity} elements): {e:?}"))
 }
+
+/// A retained lane buffer under this size is never given back: the memory is
+/// not worth a `cuMemAlloc` on the wave's critical path.
+const RETAIN_FLOOR_BYTES: usize = 128 << 20;
 
 struct TableLayout {
     len: usize,
