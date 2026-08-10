@@ -134,6 +134,8 @@ def run_one(name, tr, va, te, args, dev, seed):
             ids = np.unique(ids)
             b = make_batch(subset(tr, ids), rng, dev, args.augment)
             loss = value_loss(net, *b[:-1])
+            if args.aux:
+                loss = loss + args.aux * net.aux_loss(b[0], b[1], b[-1])
             opt.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(net.parameters(), 5.0)
@@ -194,6 +196,9 @@ def main():
     # swapped. Free extra data, which is what the train/test gap says the
     # network is actually short of.
     ap.add_argument("--augment", action="store_true")
+    ap.add_argument("--aux", type=float, default=0.0,
+                    help="weight on the auxiliary heads; the value loss reported "
+                         "is still the value loss alone, so the columns compare")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--out", default="")
     args = ap.parse_args()

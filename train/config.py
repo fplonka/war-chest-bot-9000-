@@ -66,12 +66,11 @@ class Cfg:
     # CFR to 1-ply value iteration over the network. 2 is the minimum that is
     # actually ReBeL.
     depth: int = 2
-    # CFR iterations per subgame. Against a converged T=512 reference
-    # (`examples/solvererr.rs`) the mean |error| in the root value is 0.0098 at
-    # T=8, 0.0036 at T=16, 0.0016 at T=32. That is *bias*, not noise -- the same
-    # position gives the same wrong number every time -- so the network fits it
-    # happily and converges to the fixed point of the under-solved operator. No
-    # loss curve can show that.
+    # CFR iterations per subgame, and most of the cost of a solve. The bias this
+    # leaves in the target is real but tiny next to the network's own error:
+    # 0.00025 at T=64 and 0.0018 at T=16, against a held-out error of ~0.088
+    # (`runs/solvererr_g8`). Iterations buy accuracy the network cannot use, so
+    # the open question is how much data the same wall clock buys instead.
     iters: int = 64
     cfr: str = "linear"            # linear, plus, dcfr, pcfr, sapcfr (docs/REBEL.md)
     warm: float = 0.0              # iterations the policy head's seed is worth
@@ -123,7 +122,10 @@ EXPERIMENTS = {
     "dcfr":     [{}, {"cfr": "dcfr"}],
     "aux":      [{}, {"aux": 0.3}],
     "policy":   [{}, {"policy": 0.3}],
-    "iters":    [{}, {"iters": 32}, {"iters": 128}],
+    # Solve quality per unit time, not per solve. `runs/solvererr_g8` puts dcfr
+    # at T=32 slightly ahead of linear at T=64, and dcfr at T=16 still 50x
+    # inside the network's own error -- for 2-3x the solves per second.
+    "iters":    [{}, {"cfr": "dcfr", "iters": 32}, {"cfr": "dcfr", "iters": 16}],
     # Does a short run rank changes the way a long one does? If it does, every
     # experiment above costs a quarter of what it costs today. Run this first.
     "cadence":  [{"minutes": 15}, {"minutes": 15, "cfr": "dcfr"},
