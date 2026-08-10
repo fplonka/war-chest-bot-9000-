@@ -238,6 +238,7 @@ macro_rules! kernels {
 kernels! {
     pack_cards, bias_act, cards_finish, pile_pe, pack_piles, assemble,
     trunk_norm, holding_in, slot_sum, finish_zg,
+    pack_head_static_f16,
     init_strategy, seed_reach, reach_sweep, seed_sum, root_average,
     belief_sums, belief_sums_f16, head_entry, head_entry_f16, head_act, readout, backprop_sweep,
     normalize_strategy, gather_carry, collect_root,
@@ -700,19 +701,47 @@ impl Executor {
             src = dst;
             which ^= 1;
         }
-        gemm(
-            &self.blas,
-            rows,
-            l.head_in,
-            l.pub_out.i,
-            src,
-            l.pub_out.i,
-            bank.w_ptr(l.pub_out.w),
-            l.head_in,
-            d.ptr_mut(Arena::H0),
-            l.head_in,
-            0.0,
-        )?;
+        if fast_gemm() && l.hmlp.is_empty() {
+            // The public residual is fixed for all CFR iterations. Produce it
+            // once in the idle tower scratch, fold its bias, and retain it as
+            // FP16; the dynamic residual and LayerNorm reduction remain FP32.
+            let dst = d.ptr_mut(if which == 0 { Arena::Bh } else { Arena::Bh2 });
+            gemm(
+                &self.blas,
+                rows,
+                l.head_in,
+                l.pub_out.i,
+                src,
+                l.pub_out.i,
+                bank.w_ptr(l.pub_out.w),
+                l.head_in,
+                dst,
+                l.head_in,
+                0.0,
+            )?;
+            launch!(
+                self,
+                d,
+                bank,
+                pack_head_static_f16,
+                threads_usize(rows * l.head_in),
+                which as i32
+            )?;
+        } else {
+            gemm(
+                &self.blas,
+                rows,
+                l.head_in,
+                l.pub_out.i,
+                src,
+                l.pub_out.i,
+                bank.w_ptr(l.pub_out.w),
+                l.head_in,
+                d.ptr_mut(Arena::H0),
+                l.head_in,
+                0.0,
+            )?;
+        }
         launch!(self, d, bank, holding_in, threads_usize(cfgs * NSLOT))?;
         let mut src = d.ptr(Arena::Bg);
         let mut which = 0usize;
@@ -1636,7 +1665,11 @@ fn arena_layout(w: &Wave, l: &V3Layout) -> Result<([u64; N_ARENAS], usize), Stri
         jobs * NTYPE * l.de,
         cfgs * l.dg,
         cfgs * (l.rank + 1),
-        rows * l.head_in,
+        if fast_head {
+            (rows * l.head_in).div_ceil(2)
+        } else {
+            rows * l.head_in
+        },
         if fast_head {
             (rows * 2 * l.dg).div_ceil(2)
         } else {

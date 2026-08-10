@@ -488,7 +488,11 @@ fn device_arena_bytes(job: &PackedJob, vals: usize) -> usize {
         mul(NTYPE, l.de),
         mul(cfgs, l.dg),
         mul(cfgs, l.rank + 1),
-        mul(rows, l.head_in),
+        if fast_head {
+            mul(rows, l.head_in).div_ceil(2)
+        } else {
+            mul(rows, l.head_in)
+        },
         if fast_head {
             mul(mul(rows, 2), l.dg).div_ceil(2)
         } else {

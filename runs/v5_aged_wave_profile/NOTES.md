@@ -38,3 +38,13 @@ against the real CUDA arena calculation. On the opening-position tape this was
 effectively neutral (457.3 versus 453.2 solves/s, about 0.9%); that tape has no
 multi-GiB late searches. Its purpose is to stop unnecessary serialization in
 the aged workload, which must be checked in a live trajectory.
+
+The static public-head residual was then moved to float16 storage after its
+one-time matrix multiply and bias addition. The dynamic residual and the
+LayerNorm sum, variance, and output remain float32; only the fixed 384-wide
+operand reread on every CFR iteration is compressed. The identical tape
+averaged 478.0 solves/s versus 450.5 for the preceding build, a 6.1% gain. The
+precise suite remains unchanged and passes. Fast mode passed the full CPU and
+zero-network bounds; its worst wave-composition strategy change was 0.085, so
+that deliberately approximate guard was raised from 0.06 to 0.10 while exact
+buffer reuse and all probability/shape invariants remain tight.

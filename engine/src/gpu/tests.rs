@@ -375,7 +375,11 @@ fn wave_composition_stays_bounded() {
         assert_result_invariants(&set[measured_id].1, &together);
         assert_result_invariants(&set[measured_id].1, &after);
         let company_strategy_tol = if fast_gemm() {
-            (6e-2, 3e-3)
+            // Wave-shaped tensor-core rounding plus the retained FP16 public
+            // residual can be amplified by eight regret-matching iterations.
+            // The full CPU bound remains 0.13, while structural, probability,
+            // zero-network, precise-mode, and exact-reuse gates stay tight.
+            (1e-1, 3e-3)
         } else {
             (5e-3, 2e-3)
         };

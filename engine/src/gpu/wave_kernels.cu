@@ -363,6 +363,17 @@ extern "C" __global__ void finish_zg(const WaveDev* w, const WeightDev* wt,
     }
 }
 
+extern "C" __global__ void pack_head_static_f16(const WaveDev* w,
+                                                  const WeightDev* wt,
+                                                  int which) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= w->rows * HEADW) return;
+    int col = i % HEADW;
+    const float* src = AP(w, which ? A_BH2 : A_BH);
+    half* dst = reinterpret_cast<half*>(AP(w, A_H0));
+    dst[i] = __float2half_rn(src[i] + wt->pub_out_b[col]);
+}
+
 // --------------------------------------------------------------- CFR state
 
 extern "C" __global__ void init_strategy(const WaveDev* w, const WeightDev* wt,
@@ -608,14 +619,13 @@ extern "C" __global__ void head_entry_f16(const WaveDev* w, const WeightDev* wt)
     const float* src = AP(w, A_H) + (unsigned long long)row * HEADW;
     half* dst = reinterpret_cast<half*>(AP(w, A_H2))
         + (unsigned long long)row * HEADW;
-    const float* add = AP(w, A_H0) + (unsigned long long)row * HEADW;
+    const half* add = reinterpret_cast<const half*>(AP(w, A_H0))
+        + (unsigned long long)row * HEADW;
     float x[HEAD_CH], sum = 0.0f;
     #pragma unroll
     for (int k = 0; k < HEAD_CH; k++) {
         int j = (k << 5) + lane;
-        float v = j < HEADW
-            ? src[j] + wt->pub_out_b[j] + add[j]
-            : 0.0f;
+        float v = j < HEADW ? src[j] + __half2float(add[j]) : 0.0f;
         x[k] = v;
         if (j < HEADW) sum += v;
     }
