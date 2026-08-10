@@ -49,7 +49,6 @@ import torch.nn.functional as F
 import warchest
 import config
 import mirror
-import report
 from export_weights import load as load_checkpoint
 from value_net import Mlp, AUX, AFEAT
 
@@ -1120,6 +1119,7 @@ def main():
     # counters and the config delta are readable the moment the run ends,
     # without opening a terminal on the box.
     try:
+        import report
         report.write([args.out])
     except Exception as e:                                  # never fail a run over a plot
         print(f"[report] skipped: {e}", flush=True)

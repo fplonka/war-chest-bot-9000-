@@ -84,18 +84,12 @@ class Cfg:
     # real win or stalling the clock becomes a competing win condition.
     cap_value: float = 0.04
     anneal_frac: float = 0.4
-    # Random armies every game, not the rulebook's fixed starter pair. The one
-    # run we trust (`runs/gpu_golden8`) trained this way, and a net that has
-    # only ever seen one matchup is not the net a hero run wants.
-    random_draft: bool = True
+    random_draft: bool = True      # random armies, not the fixed starter pair
     warm_games: int = 96
     rebel_games: int = 48
 
     # ------------------------------------------------------------- hardware
-    # The trainer's card, and it must carry an index: `torch.cuda.set_device`
-    # rejects a bare "cuda". Card 1 also serves solves, but the trainer is
-    # small and card 0 is the one the Rust services start on first.
-    device: str = "cuda:1"
+    device: str = "cuda:1"         # must carry an index; set_device rejects "cuda"
     gpu: bool = True
     gpu_devices: str = "0,1"
     gpu_workers: int = 36
