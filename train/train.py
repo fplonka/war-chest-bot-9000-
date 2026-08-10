@@ -744,7 +744,7 @@ def main():
         next_report = time.time() + 10.0
         counter_names = (
             "games", "decisions", "horizon_hits", "node_caps",
-            "oversize_routes", "exact_fallbacks", "censored_games",
+            "oversize_routes", "card_exclusive_routes", "exact_fallbacks", "censored_games",
             "dropped", "configs")
         totals = {name: 0 for name in counter_names}
         window = {name: 0 for name in counter_names}
@@ -793,6 +793,7 @@ def main():
                 "horizon_frac": round(window["horizon_hits"] / games, 3),
                 "node_caps": window["node_caps"],
                 "oversize_routes": window["oversize_routes"],
+                "card_exclusive_routes": window["card_exclusive_routes"],
                 "exact_fallbacks": window["exact_fallbacks"],
                 "censored_games": window["censored_games"],
                 "dropped": window["dropped"],
@@ -834,7 +835,8 @@ def main():
                 f"[t={rec['t']:6.1f}s] rebel stream solves={rebel_solves} "
                 f"raw={raw_sps:.0f}/s balanced={balanced_sps:.0f}/s "
                 f"debt={debt:.0f} rows steps={optimizer_steps} "
-                f"over={totals['oversize_routes']} drop={totals['dropped']} "
+                f"over={totals['oversize_routes']} card={totals['card_exclusive_routes']} "
+                f"drop={totals['dropped']} "
                 f"L={lv:.5f} tgt={tgt_mean:+.3f}/{tgt_var ** 0.5:.3f} "
                 f"cfg/b={rec['batch_configs']:.0f} prep={window['prepare_s']:.2f}s "
                 f"gpu={window['gpu_forward_s'] + window['gpu_backward_s']:.2f}s "
@@ -963,7 +965,8 @@ def main():
         print(
             f"[gpu-summary] solves={rebel_solves} optimizer_rows={optimizer_rows} "
             f"debt={debt:.0f} raw={raw_sps:.1f}/s balanced={balanced_sps:.1f}/s "
-            f"over={totals['oversize_routes']} exact={totals['exact_fallbacks']} "
+            f"over={totals['oversize_routes']} card={totals['card_exclusive_routes']} "
+            f"exact={totals['exact_fallbacks']} "
             f"censored={totals['censored_games']} dropped={totals['dropped']} "
             f"overrun={max(0.0, time.time() - deadline):.2f}s",
             flush=True)
@@ -1164,6 +1167,7 @@ def main():
                "horizon_frac": round(d["horizon_hits"] / max(d["games"], 1), 3),
                "node_caps": int(d["node_caps"]),
                "oversize_routes": int(d.get("oversize_routes", 0)),
+               "card_exclusive_routes": int(d.get("card_exclusive_routes", 0)),
                "exact_fallbacks": int(d.get("exact_fallbacks", 0)),
                "dropped": int(d["dropped"]),
                "configs": round(d["configs"] / dec, 1), "cap_value": round(cap_v, 4),
@@ -1183,6 +1187,7 @@ def main():
         print(f"[t={rec['t']:6.1f}s] {phase:6s} ep{epoch:3d} games={rec['games']:4d} "
               f"dec={dec:6d} rows={len(rows):6d} horizon={rec['horizon_frac']:.2f} "
               f"nodecap={rec['node_caps']} over={rec['oversize_routes']} "
+              f"card={rec['card_exclusive_routes']} "
               f"exact={rec['exact_fallbacks']} drop={rec['dropped']} "
               f"cfgs={rec['configs']:5.1f} L={lv:.5f} P={lp:.3f} old={loss_old:.5f} new={loss_new:.5f} "
               f"tgt={tgt_mean:+.3f}/{tgt_std:.3f} pstd={probe_std:.3f} "

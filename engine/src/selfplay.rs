@@ -288,6 +288,8 @@ pub struct Data {
     /// Valid solves too large to coexist with the ordinary GPU wave lanes.
     /// They run through the serialized exact path and are never discarded.
     pub oversize_routes: usize,
+    /// Oversized solves that drained and trimmed every lane on one card.
+    pub card_exclusive_routes: usize,
     /// GPU submissions retried by the exact CPU solver after an unexpected
     /// device error. Oversize jobs normally complete on the serialized GPU path.
     pub exact_fallbacks: usize,
@@ -369,6 +371,7 @@ impl Data {
         self.decisions += o.decisions;
         self.dropped += o.dropped;
         self.oversize_routes += o.oversize_routes;
+        self.card_exclusive_routes += o.card_exclusive_routes;
         self.exact_fallbacks += o.exact_fallbacks;
         self.censored_games += o.censored_games;
         self.wins[0] += o.wins[0];
@@ -1163,6 +1166,7 @@ impl<'a> Game<'a> {
             carries: Some(result.carries),
         });
         self.data.oversize_routes += result.oversize_route as usize;
+        self.data.card_exclusive_routes += result.card_exclusive_route as usize;
     }
 
     /// Rebuild and solve a pending GPU job on the verified CPU path. This is

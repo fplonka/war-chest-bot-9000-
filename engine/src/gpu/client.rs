@@ -118,6 +118,7 @@ pub struct SolveResult {
     pub carries: CarryStore,
     pub weight_version: u64,
     pub oversize_route: bool,
+    pub card_exclusive_route: bool,
 }
 
 pub(crate) enum Cmd {

@@ -24,6 +24,7 @@ COUNTERS = (
     "games",
     "decisions",
     "oversize_routes",
+    "card_exclusive_routes",
     "exact_fallbacks",
     "censored_games",
     "dropped",
@@ -100,6 +101,7 @@ def main():
                     "solves": totals["solves"],
                     "solves_per_s": round(totals["solves"] / elapsed, 1),
                     "oversize_routes": totals["oversize_routes"],
+                    "card_exclusive_routes": totals["card_exclusive_routes"],
                 }), flush=True)
                 next_report += args.report_every
     finally:

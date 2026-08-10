@@ -868,6 +868,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     out.set_item("horizon_hits", d.cap_hits)?;
     out.set_item("node_caps", d.node_caps)?;
     out.set_item("oversize_routes", d.oversize_routes)?;
+    out.set_item("card_exclusive_routes", d.card_exclusive_routes)?;
     out.set_item("exact_fallbacks", d.exact_fallbacks)?;
     out.set_item("censored_games", d.censored_games)?;
     out.set_item("dropped", d.dropped)?;

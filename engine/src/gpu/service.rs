@@ -383,9 +383,11 @@ fn run(
         }
         match result {
             Ok(results) if results.len() == count => {
-                for ((tag, reply, cost, oversize, _), mut value) in tickets.into_iter().zip(results)
+                for ((tag, reply, cost, oversize, card), mut value) in
+                    tickets.into_iter().zip(results)
                 {
                     value.oversize_route = oversize;
+                    value.card_exclusive_route = card;
                     let _ = reply.send((tag, Ok(value)));
                     queued_work.fetch_sub(cost, Ordering::Relaxed);
                     lane_work.fetch_sub(cost, Ordering::Relaxed);

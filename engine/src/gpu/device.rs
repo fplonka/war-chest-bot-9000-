@@ -1761,6 +1761,7 @@ fn unpack(
             },
             weight_version: version,
             oversize_route: false,
+            card_exclusive_route: false,
         });
     }
     Ok(out)
