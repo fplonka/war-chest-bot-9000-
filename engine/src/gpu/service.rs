@@ -64,6 +64,7 @@ fn dispatcher(
 ) {
     let lanes = env_usize("WARCHEST_WAVE_LANES", 2).clamp(1, 5);
     let whale_lanes = env_usize("WARCHEST_WAVE_WHALE_LANES", 1).clamp(1, lanes);
+    let route_profile = std::env::var_os("WARCHEST_ROUTE_PROFILE").is_some();
     let (lane_ready_tx, lane_ready_rx) = mpsc::channel();
     let mut senders = Vec::with_capacity(lanes);
     let mut joins = Vec::with_capacity(lanes);
@@ -135,6 +136,7 @@ fn dispatcher(
                 reply,
             } => {
                 if work.requires_card_exclusive_route() {
+                    let route_started = Instant::now();
                     // A 4 GiB contiguous mutable arena, or a 6 GiB combined
                     // reservation, cannot reliably coexist with the ordinary
                     // retained buffers and trainer on a 24 GiB card. This tail
@@ -144,11 +146,13 @@ fn dispatcher(
                     while lane_work.iter().any(|x| x.load(Ordering::Acquire) != 0) {
                         std::thread::sleep(Duration::from_millis(1));
                     }
+                    let drained_at = Instant::now();
                     if let Err(e) = trim_lanes(&senders) {
                         queued_work.fetch_sub(cost, Ordering::Relaxed);
                         let _ = reply.send((tag, Err(e)));
                         continue;
                     }
+                    let trimmed_at = Instant::now();
                     lane_work[0].fetch_add(cost, Ordering::Release);
                     if let Err(e) = senders[0].send(Cmd::Submit {
                         job,
@@ -166,6 +170,21 @@ fn dispatcher(
                     }
                     while lane_work[0].load(Ordering::Acquire) != 0 {
                         std::thread::sleep(Duration::from_millis(1));
+                    }
+                    if route_profile {
+                        let table_reserved = work
+                            .table_bytes
+                            .checked_next_power_of_two()
+                            .unwrap_or(work.table_bytes);
+                        eprintln!(
+                            "v5_card_route device={device} mutable_mib={:.1} table_mib={:.1} reserved_mib={:.1} drain_ms={:.1} trim_ms={:.1} solve_ms={:.1}",
+                            work.mutable_bytes as f64 / 1048576.0,
+                            table_reserved as f64 / 1048576.0,
+                            work.mutable_bytes.saturating_add(table_reserved) as f64 / 1048576.0,
+                            1e3 * (drained_at - route_started).as_secs_f64(),
+                            1e3 * (trimmed_at - drained_at).as_secs_f64(),
+                            1e3 * trimmed_at.elapsed().as_secs_f64(),
+                        );
                     }
                     continue;
                 }
