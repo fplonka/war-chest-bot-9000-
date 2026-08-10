@@ -463,7 +463,7 @@ impl Executor {
             .banks
             .get(&version)
             .ok_or_else(|| format!("GPU weight version {version} is unavailable"))?;
-        let device = DeviceWave::upload(
+        let mut device = DeviceWave::upload(
             &self.stream,
             &wave,
             &bank.layout,
@@ -484,6 +484,7 @@ impl Executor {
         }
         let queued = (|| -> Result<(), String> {
             self.build_towers(&device, bank)?;
+            device.clear_solve_state(&self.stream)?;
             self.initialise(&device, bank, &wave)?;
 
             if wave.meta.iters == 0 {
@@ -1334,6 +1335,8 @@ struct DeviceWave {
     buffers: DeviceBuffers,
     _jobs: Vec<JobDev>,
     host: WaveDev,
+    /// Floats the tower phase overwrites that the solve phase needs zeroed.
+    solve_state: std::ops::Range<usize>,
 }
 
 impl DeviceWave {
@@ -1346,7 +1349,7 @@ impl DeviceWave {
     ) -> Result<Self, String> {
         let jobs = job_devices(w)?;
         let (toff, table_len) = table_layout(w, &jobs)?;
-        let (aoff, arena_len) = arena_layout(w, l)?;
+        let (aoff, arena_len, solve_state) = arena_layout(w, l)?;
         // Before a multi-GiB growth, drop both old allocations so neither is
         // live while the other grows. Once a lane has paid for a whale-sized
         // pair, retain it for later waves instead of reallocating every whale.
@@ -1462,7 +1465,19 @@ impl DeviceWave {
             buffers: DeviceBuffers { tables, arena, dev },
             _jobs: jobs,
             host,
+            solve_state,
         })
+    }
+
+    /// Restore the zeroed CFR state the tower GEMMs wrote over. Stream order
+    /// puts this after every tower kernel and before `initialise`.
+    fn clear_solve_state(&mut self, stream: &Arc<CudaStream>) -> Result<(), String> {
+        if self.solve_state.is_empty() {
+            return Ok(());
+        }
+        stream
+            .memset_zeros(&mut self.buffers.arena.slice_mut(self.solve_state.clone()))
+            .map_err(|e| format!("clear reused wave solve state: {e:?}"))
     }
 
     fn into_buffers(self) -> DeviceBuffers {
@@ -1668,7 +1683,13 @@ fn copy_table<T: Copy>(tables: &mut [u8], at: usize, values: &[T]) -> Result<(),
     Ok(())
 }
 
-fn arena_layout(w: &Wave, l: &V3Layout) -> Result<([u64; N_ARENAS], usize), String> {
+/// Returns the per-arena offsets, the total float count, and the span that
+/// `clear_solve_state` must re-zero once the towers are built.
+#[allow(clippy::type_complexity)]
+fn arena_layout(
+    w: &Wave,
+    l: &V3Layout,
+) -> Result<([u64; N_ARENAS], usize, std::ops::Range<usize>), String> {
     let rows = w.row_node.len();
     let cfgs = w.config_job.len();
     let jobs = w.jobs.len();
@@ -1683,11 +1704,11 @@ fn arena_layout(w: &Wave, l: &V3Layout) -> Result<([u64; N_ARENAS], usize), Stri
     };
     let fast_head = fast_gemm() && l.hmlp.is_empty();
     let (pubw, _, _, slotw) = l.widths();
-    let max_pub = pubw
-        .into_iter()
-        .chain([l.xdim(), l.head_in])
-        .max()
-        .unwrap_or(1);
+    // Bh/Bh2 only ever hold tower *outputs*: public layers, the head-entry
+    // projection, and the card/holding towers. The public trunk's `xdim`-wide
+    // input lives in Bx and is never written here, so including it made both
+    // buffers about four times wider than anything that lands in them.
+    let max_pub = pubw.into_iter().chain([l.head_in]).max().unwrap_or(1);
     let slot_max = slotw
         .into_iter()
         .chain([l.hfeat(), l.dg])
@@ -1743,18 +1764,102 @@ fn arena_layout(w: &Wave, l: &V3Layout) -> Result<([u64; N_ARENAS], usize), Stri
         bh,
         bg,
     ];
+    if std::env::var_os("WARCHEST_ARENA_PROFILE").is_some() {
+        let named = [
+            "reach",
+            "snap_reach",
+            "vals",
+            "regret",
+            "cur",
+            "sum",
+            "snap_strat",
+            "e",
+            "z",
+            "g",
+            "h0",
+            "xb",
+            "h",
+            "h2",
+            "u",
+            "root_values",
+            "carry",
+            "bx",
+            "bh",
+            "bh2",
+            "bg",
+        ];
+        let mut top: Vec<_> = named.iter().zip(sizes.iter()).collect();
+        top.sort_by_key(|(_, &n)| std::cmp::Reverse(n));
+        let report: Vec<String> = top
+            .iter()
+            .take(7)
+            .map(|(name, &n)| format!("{name}={:.1}", n as f64 * 4.0 / 1048576.0))
+            .collect();
+        eprintln!(
+            "v5_arena rows={rows} cfgs={cfgs} cells={cells} total_mib={:.1} {}",
+            sizes.iter().sum::<usize>() as f64 * 4.0 / 1048576.0,
+            report.join(" "),
+        );
+    }
     let mut off = [0u64; N_ARENAS];
     let mut at = 0usize;
-    for (i, &n) in sizes.iter().enumerate() {
-        at = at
+    let place = |off: &mut [u64; N_ARENAS], at: &mut usize, a: Arena| -> Result<(), String> {
+        *at = at
             .checked_add(31)
             .ok_or("wave FP32 arena alignment overflow")?
             & !31;
-        off[i] = at as u64;
-        at = at.checked_add(n).ok_or("wave FP32 arena size overflow")?;
+        off[a as usize] = *at as u64;
+        *at = at
+            .checked_add(sizes[a as usize])
+            .ok_or("wave FP32 arena size overflow")?;
+        Ok(())
+    };
+    for a in PERSISTENT {
+        place(&mut off, &mut at, a)?;
     }
-    Ok((off, at))
+    // The four tower buffers are scratch for `build_towers` and are dead
+    // before `initialise` touches any CFR state, so the two phases share one
+    // region and `clear_solve_state` re-zeroes the CFR side between them.
+    // Bx alone is `rows * xdim`, which is most of a wave's memory; keeping it
+    // alive beside the whole solve is what pushed mature waves over the
+    // four-gibibyte exclusive-route boundary.
+    let base = at
+        .checked_add(31)
+        .ok_or("wave FP32 arena alignment overflow")?
+        & !31;
+    let mut tower = base;
+    for a in TOWER_SCRATCH {
+        place(&mut off, &mut tower, a)?;
+    }
+    let mut solve = base;
+    for a in SOLVE_STATE {
+        place(&mut off, &mut solve, a)?;
+    }
+    Ok((off, tower.max(solve), base..solve))
 }
+
+/// Arenas that `build_towers` produces and the CFR iterations then read.
+const PERSISTENT: [Arena; 4] = [Arena::E, Arena::Z, Arena::G, Arena::H0];
+
+/// Scratch that only exists while the towers are being built.
+const TOWER_SCRATCH: [Arena; 4] = [Arena::Bx, Arena::Bh, Arena::Bh2, Arena::Bg];
+
+/// State that only exists from `initialise` onwards.
+const SOLVE_STATE: [Arena; 13] = [
+    Arena::Reach,
+    Arena::SnapReach,
+    Arena::Vals,
+    Arena::Regret,
+    Arena::Cur,
+    Arena::Sum,
+    Arena::SnapStrat,
+    Arena::Xb,
+    Arena::H,
+    Arena::H2,
+    Arena::U,
+    Arena::RootValues,
+    Arena::Carry,
+];
 
 fn unpack(
     w: Wave,
@@ -2190,7 +2295,7 @@ mod reservation_tests {
         let reserved = job.work().mutable_bytes;
         let wave = Wave::pack(&[job]).expect("pack stub wave");
         let layout = V3Layout::new(&wave.meta.net_dims).expect("network layout");
-        let (_, floats) = arena_layout(&wave, &layout).expect("device arena layout");
+        let (_, floats, _) = arena_layout(&wave, &layout).expect("device arena layout");
         let allocated = floats
             .max(1)
             .checked_next_power_of_two()

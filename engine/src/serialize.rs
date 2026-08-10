@@ -510,11 +510,9 @@ fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
         0
     };
     let (pubw, _, cardw, slotw) = l.widths();
-    let max_pub = pubw
-        .into_iter()
-        .chain([l.xdim(), l.head_in])
-        .max()
-        .unwrap_or(1);
+    // Mirrors `gpu::device::arena_layout`: Bh/Bh2 hold tower outputs only, so
+    // the `xdim`-wide trunk input does not size them.
+    let max_pub = pubw.into_iter().chain([l.head_in]).max().unwrap_or(1);
     let slot_max = slotw
         .into_iter()
         .chain([l.hfeat(), l.dg])
@@ -576,15 +574,78 @@ fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
         bh,
         bg,
     ];
-    let mut floats = 0usize;
-    for n in sizes {
-        floats = floats.saturating_add(31) & !31usize;
-        floats = floats.saturating_add(n);
-    }
+    // Same three-region layout as `gpu::device::arena_layout`: persistent tower
+    // outputs, then one region shared by the tower scratch and the CFR state,
+    // which are never live at the same time.
+    let span = |group: &[usize]| {
+        let mut floats = 0usize;
+        for &n in group {
+            floats = floats.saturating_add(31) & !31usize;
+            floats = floats.saturating_add(n);
+        }
+        floats
+    };
+    let at = |a: DeviceArena| sizes[a as usize];
+    let persistent = span(&[
+        at(DeviceArena::E),
+        at(DeviceArena::Z),
+        at(DeviceArena::G),
+        at(DeviceArena::H0),
+    ]);
+    let tower = span(&[
+        at(DeviceArena::Bx),
+        at(DeviceArena::Bh),
+        at(DeviceArena::Bh2),
+        at(DeviceArena::Bg),
+    ]);
+    let solve = span(&[
+        at(DeviceArena::Reach),
+        at(DeviceArena::SnapReach),
+        at(DeviceArena::Vals),
+        at(DeviceArena::Regret),
+        at(DeviceArena::Cur),
+        at(DeviceArena::Sum),
+        at(DeviceArena::SnapStrat),
+        at(DeviceArena::Xb),
+        at(DeviceArena::H),
+        at(DeviceArena::H2),
+        at(DeviceArena::U),
+        at(DeviceArena::RootValues),
+        at(DeviceArena::Carry),
+    ]);
+    let floats = (persistent.saturating_add(31) & !31usize).saturating_add(tower.max(solve));
     floats
         .checked_next_power_of_two()
         .unwrap_or(floats)
         .saturating_mul(std::mem::size_of::<f32>())
+}
+
+/// The device arena slots, in the order `sizes` above lists them. This mirrors
+/// `gpu::device::Arena`; the exact-admission test pins the two together.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+enum DeviceArena {
+    Reach,
+    SnapReach,
+    Vals,
+    Regret,
+    Cur,
+    Sum,
+    SnapStrat,
+    E,
+    Z,
+    G,
+    H0,
+    Xb,
+    H,
+    H2,
+    U,
+    RootValues,
+    Carry,
+    Bx,
+    Bh,
+    Bh2,
+    Bg,
 }
 
 impl PackedTables {
