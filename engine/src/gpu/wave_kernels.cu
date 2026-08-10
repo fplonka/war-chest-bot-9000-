@@ -151,12 +151,14 @@ __device__ __forceinline__ int reach_at(const WaveDev* w, int node, int p, int c
 }
 
 __device__ __forceinline__ void norm_parts(const float* x, int n, int lane,
-                                            float* scale, float* flat) {
+                                            float* scale, float* flat,
+                                            float* total) {
     float sum = 0.0f;
     for (int i = lane; i < n; i += 32) sum += x[i];
     sum = warp_sum(sum);
     *scale = sum > SMOOTH ? 1.0f / sum : 0.0f;
     *flat = sum > SMOOTH ? 0.0f : 1.0f / (float)(n > 0 ? n : 1);
+    if (total) *total = sum;
 }
 
 __device__ __forceinline__ void ln_relu(float* row, const float* bias,
@@ -540,8 +542,15 @@ extern "C" __global__ void belief_sums(const WaveDev* w, const WeightDev* wt,
         int p = both ? side : 1 - traverser;
         int n = nc_of(w, q.node, p);
         const float* r = AP(w, A_REACH) + reach_at(w, q.node, p, 0);
-        float scale, flat;
-        norm_parts(r, n, lane, &scale, &flat);
+        float scale, flat, total;
+        norm_parts(r, n, lane, &scale, &flat, &total);
+        if (lane == 0) {
+            // Readout needs the same opponent reach mass. Cache it in the
+            // value slot that readout is about to overwrite (player 0), or in
+            // dead snapshot-reach scratch (player 1).
+            AP(w, p ? A_VALS : A_SNAP_REACH)
+                [TP(w, unsigned int, T_VOFF)[q.node]] = total;
+        }
         float acc[DG_CH];
         #pragma unroll
         for (int z = 0; z < DG_CH; z++) acc[z] = 0.0f;
@@ -576,8 +585,12 @@ extern "C" __global__ void belief_sums_f16(const WaveDev* w, const WeightDev* wt
         int p = both ? side : 1 - traverser;
         int n = nc_of(w, q.node, p);
         const float* r = AP(w, A_REACH) + reach_at(w, q.node, p, 0);
-        float scale, flat;
-        norm_parts(r, n, lane, &scale, &flat);
+        float scale, flat, total;
+        norm_parts(r, n, lane, &scale, &flat, &total);
+        if (lane == 0) {
+            AP(w, p ? A_VALS : A_SNAP_REACH)
+                [TP(w, unsigned int, T_VOFF)[q.node]] = total;
+        }
         float acc[DG_CH];
         #pragma unroll
         for (int z = 0; z < DG_CH; z++) acc[z] = 0.0f;
@@ -688,13 +701,19 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
     if (task >= w->readout_n) return;
     ReadTask q = TP(w, ReadTask, T_READOUT)[task];
     int opp = 1 - player;
-    int nop = nc_of(w, q.node, opp);
-    const float* ro = AP(w, A_REACH) + reach_at(w, q.node, opp, 0);
-    float orc = 0.0f;
-    for (int c = lane; c < nop; c += 32) orc += ro[c];
-    orc = warp_sum(orc);
     int n = nc_of(w, q.node, player);
     float* out = AP(w, A_VALS) + TP(w, unsigned int, T_VOFF)[q.node];
+    float orc;
+    if (q.row != NONE) {
+        orc = AP(w, player ? A_SNAP_REACH : A_VALS)
+            [TP(w, unsigned int, T_VOFF)[q.node]];
+    } else {
+        int nop = nc_of(w, q.node, opp);
+        const float* ro = AP(w, A_REACH) + reach_at(w, q.node, opp, 0);
+        orc = 0.0f;
+        for (int c = lane; c < nop; c += 32) orc += ro[c];
+        orc = warp_sum(orc);
+    }
     if (q.row == NONE) {
         float u = TP(w, float, T_NODE_UTILITY)[q.node];
         if (TP(w, unsigned char, T_NODE_PLAYER)[q.node] != player) u = -u;
@@ -851,7 +870,7 @@ extern "C" __global__ void gather_carry(const WaveDev* w, const WeightDev* wt,
         int n = nc_of(w, node, p);
         const float* src = reach + reach_at(w, node, p, 0);
         float scale, flat;
-        norm_parts(src, n, lane, &scale, &flat);
+        norm_parts(src, n, lane, &scale, &flat, nullptr);
         unsigned int off = TP(w, unsigned int, T_EXIT_COFF)[2 * exit + p];
         half* dst = reinterpret_cast<half*>(AP(w, A_CARRY))
             + (unsigned long long)slot * w->snapshot_configs + off;
