@@ -45,9 +45,13 @@ def main():
     ap.add_argument("--chunk", type=int, default=1024,
                     help="completed solves per Python result chunk")
     ap.add_argument("--report-every", type=float, default=2.0)
+    ap.add_argument("--cap-value", type=float,
+                    help="override the engine's horizon marker payoff")
     args = ap.parse_args()
 
     net = load(args.checkpoint)
+    if args.cap_value is not None:
+        warchest.set_cap_value(args.cap_value)
     # The CPU builder reads the global Rust-side network shape while CUDA reads
     # the flat bank passed to gpu_start. Keep them on the same checkpoint, just
     # as train.py does before it starts the services.
