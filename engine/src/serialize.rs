@@ -405,6 +405,14 @@ impl PackedJob {
             .sum::<usize>();
         let root_configs = (t.cfg_off[2] - t.cfg_off[0]) as usize;
         let snapshots = self.meta.snap_iters.len();
+        let fp32_output = t
+            .ncells
+            .saturating_add(self.carried.len().saturating_mul(root_configs))
+            .saturating_mul(std::mem::size_of::<f32>());
+        let fp16_carry = snapshots
+            .saturating_sub(1)
+            .saturating_mul(t.snapshot_configs)
+            .saturating_mul(std::mem::size_of::<u16>());
         WorkVector {
             network_rows: t.rows,
             legal_cells: t.ncells,
@@ -416,16 +424,13 @@ impl PackedJob {
             // Exact one-job device arena, including network scratch and the
             // allocator's power-of-two growth policy.
             mutable_bytes: device_arena_bytes(self, vals),
-            carried_output_bytes: 4
-                * (t.ncells
-                    + self.carried.len() * root_configs
-                    + snapshots.saturating_sub(1) * t.snapshot_configs),
+            carried_output_bytes: fp32_output.saturating_add(fp16_carry),
             levels: t.nlevels,
         }
     }
 }
 
-/// Exact one-job reservation for the contiguous FP32 arena. Wave packing is
+/// Exact one-job reservation for the contiguous mixed-width arena. Wave packing is
 /// subadditive for its max-sized scratch blocks, so per-job admission is a
 /// conservative bound for a multi-job wave. Keep this in lockstep with
 /// `gpu::device::arena_layout`.
@@ -471,6 +476,7 @@ fn device_arena_bytes(job: &PackedJob, vals: usize) -> usize {
         .chain(l.hmlp.iter().map(|x| x.o))
         .max()
         .unwrap_or(l.head_in);
+    let fast_head = std::env::var_os("WARCHEST_GPU_PRECISE_GEMM").is_none() && l.hmlp.is_empty();
     let sizes = [
         t.reach_len,
         t.reach_len,
@@ -483,12 +489,20 @@ fn device_arena_bytes(job: &PackedJob, vals: usize) -> usize {
         mul(cfgs, l.dg),
         mul(cfgs, l.rank + 1),
         mul(rows, l.head_in),
-        mul(rows, 2 * l.dg),
+        if fast_head {
+            mul(mul(rows, 2), l.dg).div_ceil(2)
+        } else {
+            mul(mul(rows, 2), l.dg)
+        },
         mul(rows, h_stride),
-        mul(rows, h_stride),
+        if fast_head {
+            mul(rows, l.head_in).div_ceil(2)
+        } else {
+            mul(rows, h_stride)
+        },
         mul(rows, l.rank),
         roots,
-        mul(carry_snaps, t.snapshot_configs),
+        mul(carry_snaps, t.snapshot_configs).div_ceil(2),
         mul(rows, l.xdim()),
         bh,
         bh,

@@ -29,3 +29,12 @@ precise correctness suites passed. An interleaved fixed-tape comparison averaged
 452.8 solves/s versus 445.5 for float32 storage, a 1.6% improvement. More
 importantly, this halves the largest retained result buffer and gives the late
 large searches more memory headroom.
+
+The scheduler's one-job memory estimate still described the old all-float32
+arena, so it could route a search as an isolated 4 GiB or card-exclusive 8 GiB
+job even when the CUDA allocator no longer made that reservation. The estimate
+now mirrors the fast-head and carried-belief float16 layouts, with a unit test
+against the real CUDA arena calculation. On the opening-position tape this was
+effectively neutral (457.3 versus 453.2 solves/s, about 0.9%); that tape has no
+multi-GiB late searches. Its purpose is to stop unnecessary serialization in
+the aged workload, which must be checked in a live trajectory.
