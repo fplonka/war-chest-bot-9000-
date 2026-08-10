@@ -568,7 +568,7 @@ impl Executor {
         let root_total = wave.jobs.last().map_or(0, |j| j.root_values.end);
         let root_values = copy_arena(&self.stream, &device, Arena::RootValues, 0, root_total)?;
         let carry_n = device.host.carry_snapshots as usize * wave.snapshot_configs;
-        let carries = copy_arena(&self.stream, &device, Arena::Carry, 0, carry_n)?;
+        let carries = copy_arena_f16(&self.stream, &device, Arena::Carry, carry_n)?;
         let queued_output = Instant::now();
         self.stream
             .synchronize()
@@ -1650,7 +1650,7 @@ fn arena_layout(w: &Wave, l: &V3Layout) -> Result<([u64; N_ARENAS], usize), Stri
         },
         rows * l.rank,
         roots,
-        carry_snaps * w.snapshot_configs,
+        (carry_snaps * w.snapshot_configs).div_ceil(2),
         rows * l.xdim(),
         bh,
         bh,
@@ -1673,7 +1673,7 @@ fn unpack(
     w: Wave,
     strategy: Vec<f32>,
     root_values: Vec<f32>,
-    carry: Vec<f32>,
+    carry: Vec<u16>,
     version: u64,
 ) -> Result<Vec<SolveResult>, String> {
     let snapshots = if w.meta.snapshots {
@@ -1736,6 +1736,24 @@ fn copy_arena(
     stream
         .memcpy_dtov(&d.buffers.arena.slice(at..at + len))
         .map_err(|e| format!("wave result copy: {e:?}"))
+}
+
+fn copy_arena_f16(
+    stream: &Arc<CudaStream>,
+    d: &DeviceWave,
+    arena: Arena,
+    len: usize,
+) -> Result<Vec<u16>, String> {
+    let words = copy_arena(stream, d, arena, 0, len.div_ceil(2))?;
+    let mut out = Vec::with_capacity(len);
+    for word in words {
+        let bits = word.to_bits();
+        out.push(bits as u16);
+        if out.len() < len {
+            out.push((bits >> 16) as u16);
+        }
+    }
+    Ok(out)
 }
 
 fn validate_layout(l: &V3Layout) -> Result<(), String> {

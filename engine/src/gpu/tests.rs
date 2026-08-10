@@ -216,12 +216,8 @@ fn assert_result_invariants(job: &PackedJob, result: &SolveResult) {
         "carry data shape"
     );
     for snap in 0..carries.snapshots {
-        let at = snap * carries.snapshot_configs;
-        assert_probabilities(
-            &format!("carry snapshot {snap}"),
-            &carries.data[at..at + carries.snapshot_configs],
-            &carries.coff,
-        );
+        let values = carries.snapshot(snap);
+        assert_probabilities(&format!("carry snapshot {snap}"), &values, &carries.coff);
     }
 }
 

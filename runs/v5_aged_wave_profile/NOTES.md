@@ -19,3 +19,13 @@ that worst change to 0.089, but the identical frozen tape improved only from
 453.6 to 454.4 solves/s, about 0.2%. The production float32 readout vectors were
 restored rather than spending correctness margin and code on a noise-level
 speed change.
+
+The retained belief snapshots were a better float16 target. They are already
+probabilities, and only the two spans selected by the eventual real-game exit
+need to be expanded on the CPU. Storing them as float16 on the GPU and host,
+then renormalizing those selected spans after expansion, changed carried
+probabilities by at most 0.000342 in the fast-path oracle checks. All fast and
+precise correctness suites passed. An interleaved fixed-tape comparison averaged
+452.8 solves/s versus 445.5 for float32 storage, a 1.6% improvement. More
+importantly, this halves the largest retained result buffer and gives the late
+large searches more memory headroom.

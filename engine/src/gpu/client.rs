@@ -13,15 +13,16 @@ use crate::serialize::{PackedJob, WorkVector};
 
 pub type CarriedBeliefs = Vec<[Vec<f32>; 2]>;
 
-/// Pageable host store streamed out while a wave materialises its requested
-/// snapshots. `exit_nodes` is `leaf_rows` followed by terminal leaves;
-/// `coff` gives both player spans within one snapshot's flat config block.
+/// Pageable binary16 host store streamed out while a wave materialises its
+/// requested snapshots. `exit_nodes` is `leaf_rows` followed by terminal
+/// leaves; `coff` gives both player spans within one snapshot's flat config
+/// block. Only the exit selected by the real game walk is expanded to FP32.
 pub struct CarryStore {
     pub exit_nodes: Vec<u32>,
     pub coff: Vec<u32>,
     pub snapshots: usize,
     pub snapshot_configs: usize,
-    pub data: Vec<f32>,
+    pub data: Vec<u16>,
 }
 
 impl CarryStore {
@@ -49,16 +50,64 @@ impl CarryStore {
             let p0 = self.coff[2 * exit] as usize..self.coff[2 * exit + 1] as usize;
             let p1 = self.coff[2 * exit + 1] as usize..self.coff[2 * exit + 2] as usize;
             out.push([
-                self.data[base + p0.start..base + p0.end].to_vec(),
-                self.data[base + p1.start..base + p1.end].to_vec(),
+                decode_probability(&self.data[base + p0.start..base + p0.end]),
+                decode_probability(&self.data[base + p1.start..base + p1.end]),
             ]);
         }
         Ok(out)
     }
 
-    pub fn owned_bytes(&self) -> usize {
-        4 * (self.exit_nodes.len() + self.coff.len() + self.data.len())
+    #[cfg(all(test, feature = "gpu"))]
+    pub(crate) fn snapshot(&self, slot: usize) -> Vec<f32> {
+        let at = slot * self.snapshot_configs;
+        let mut out = decode_f16(&self.data[at..at + self.snapshot_configs]);
+        for bounds in self.coff.windows(2) {
+            normalize(&mut out[bounds[0] as usize..bounds[1] as usize]);
+        }
+        out
     }
+
+    pub fn owned_bytes(&self) -> usize {
+        4 * (self.exit_nodes.len() + self.coff.len()) + 2 * self.data.len()
+    }
+}
+
+fn decode_f16(src: &[u16]) -> Vec<f32> {
+    src.iter().map(|&x| f16_to_f32(x)).collect()
+}
+
+fn decode_probability(src: &[u16]) -> Vec<f32> {
+    let mut out = decode_f16(src);
+    normalize(&mut out);
+    out
+}
+
+fn normalize(values: &mut [f32]) {
+    let sum: f32 = values.iter().sum();
+    if sum > 0.0 {
+        for x in values {
+            *x /= sum;
+        }
+    }
+}
+
+fn f16_to_f32(x: u16) -> f32 {
+    let sign = (x as u32 & 0x8000) << 16;
+    let exp = (x >> 10) & 0x1f;
+    let man = x & 0x03ff;
+    if exp == 0 {
+        if man == 0 {
+            return f32::from_bits(sign);
+        }
+        let magnitude = man as f32 * (1.0 / 16_777_216.0);
+        return if sign == 0 { magnitude } else { -magnitude };
+    }
+    let bits = if exp == 0x1f {
+        sign | 0x7f80_0000 | (man as u32) << 13
+    } else {
+        sign | ((exp as u32 + 112) << 23) | (man as u32) << 13
+    };
+    f32::from_bits(bits)
 }
 
 /// One completed solve. All indices are solve-local again by the time this

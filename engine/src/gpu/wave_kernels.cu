@@ -819,8 +819,10 @@ extern "C" __global__ void gather_carry(const WaveDev* w, const WeightDev* wt,
         float scale, flat;
         norm_parts(src, n, lane, &scale, &flat);
         unsigned int off = TP(w, unsigned int, T_EXIT_COFF)[2 * exit + p];
-        float* dst = AP(w, A_CARRY) + (unsigned long long)slot * w->snapshot_configs + off;
-        for (int c = lane; c < n; c += 32) dst[c] = src[c] * scale + flat;
+        half* dst = reinterpret_cast<half*>(AP(w, A_CARRY))
+            + (unsigned long long)slot * w->snapshot_configs + off;
+        for (int c = lane; c < n; c += 32)
+            dst[c] = __float2half_rn(src[c] * scale + flat);
     }
 }
 
