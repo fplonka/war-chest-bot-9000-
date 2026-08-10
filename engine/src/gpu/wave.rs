@@ -119,6 +119,11 @@ pub struct Wave {
     pub readout: Vec<ReadTask>,
 }
 
+fn deep_validate() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WARCHEST_WAVE_VALIDATE").is_some())
+}
+
 impl Wave {
     pub fn compatible(a: &PackedJob, b: &PackedJob) -> bool {
         a.index_width() == b.index_width() && same_meta(&a.meta, &b.meta)
@@ -203,6 +208,15 @@ impl Wave {
         }
         w.build_tasks(&jobs, max_levels);
         w.validate()?;
+        // The linear checks below are a full extra pass over the wave's
+        // largest arrays -- every legal cell, every reach task, every node --
+        // and `pack` runs on the lane thread in exactly the window the
+        // pipelining is trying to keep short. The constant-time shape checks
+        // above stay; the scans run in debug builds, under
+        // `WARCHEST_WAVE_VALIDATE`, and in the tests that pack a wave.
+        if cfg!(debug_assertions) || deep_validate() {
+            w.validate_deep()?;
+        }
         Ok(w)
     }
 
@@ -669,6 +683,12 @@ impl Wave {
         {
             return Err("wave carry arrays disagree".into());
         }
+        Ok(())
+    }
+
+    /// The parts of validation that cost a pass over the wave.
+    pub(crate) fn validate_deep(&self) -> Result<(), String> {
+        let nodes = self.node_kind.len();
         for (p, tasks) in self.reach_task.iter().enumerate() {
             for task in tasks {
                 if task.node as usize >= nodes
@@ -734,6 +754,7 @@ mod tests {
         let a = PackedJob::stub();
         let b = PackedJob::stub();
         let w = Wave::pack(&[a, b]).expect("pack");
+        w.validate_deep().expect("packed wave is well formed");
         assert_eq!(w.jobs.len(), 2);
         assert_eq!(w.node_kind.len(), 2);
         assert_eq!(w.row_node, vec![0, 1]);

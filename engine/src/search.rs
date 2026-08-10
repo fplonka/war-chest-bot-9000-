@@ -287,14 +287,20 @@ pub fn node_actions(
     let mut acts: Vec<Action> = Vec::new();
     let mut aslot: Vec<i8> = Vec::new();
     let mut fdown: Vec<bool> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    // A node offers at most a few dozen distinct actions, so a linear scan of
+    // their encodings beats hashing each one into a fresh table per node.
+    let mut seen: Vec<u32> = Vec::new();
+    // `set_config` recomputes each slot's reserve from the probe's own bag,
+    // hand and face-down counts and redistributes it, and that total is
+    // invariant, so one probe can be reconfigured for every slot instead of
+    // cloning a 688-byte State per slot.
+    let mut probe = *s;
     if matches!(s.pending(), Cont::MainPlay) {
         let res = reserve(s, player, ctx);
         for k in 0..NSLOT {
             if res[k] == 0 {
                 continue;
             }
-            let mut probe = s.clone();
             let mut one = Config::default();
             one.hand[k] = 1;
             set_config(&mut probe, player, ctx, &one);
@@ -302,9 +308,11 @@ pub fn node_actions(
                 continue;
             }
             for a in probe.legal_actions() {
-                if !seen.insert(a.encode()) {
+                let key = a.encode();
+                if seen.contains(&key) {
                     continue;
                 }
+                seen.push(key);
                 let coin = action_coin(&a, &probe);
                 let slot = if coin == NONE {
                     -1
@@ -330,7 +338,6 @@ pub fn node_actions(
             if !cfgs.is_empty() && !cfgs.iter().any(|c| c.pending_coin == Some(k as u8)) {
                 continue;
             }
-            let mut probe = s.clone();
             let mut one = Config::default();
             one.hand[k] = 1;
             set_config(&mut probe, player, ctx, &one);
@@ -339,9 +346,11 @@ pub fn node_actions(
                 coin: ctx.slots[player as usize][k],
             };
             for a in probe.legal_actions() {
-                if !seen.insert(a.encode()) {
+                let key = a.encode();
+                if seen.contains(&key) {
                     continue;
                 }
+                seen.push(key);
                 let coin = action_coin(&a, &probe);
                 let slot = if coin == NONE {
                     -1
@@ -356,7 +365,9 @@ pub fn node_actions(
     } else {
         // Micro-decisions spend nothing out of hand: the config is untouched.
         for a in s.legal_actions() {
-            if seen.insert(a.encode()) {
+            let key = a.encode();
+            if !seen.contains(&key) {
+                seen.push(key);
                 acts.push(a);
                 aslot.push(-1);
                 fdown.push(false);
