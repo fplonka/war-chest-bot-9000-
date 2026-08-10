@@ -967,11 +967,12 @@ fn gen_data(
 }
 
 /// Head-to-head evaluation with alternating colours and paired drafts.
-/// `depth_b`/`iters_b` override side B's search settings, so one net can be
-/// pitted against itself at different depths or iteration counts (the depth
-/// probe); they default to side A's.
+/// `depth_b`/`iters_b`/`cfr_b`/`warm_b` override side B's search settings, so
+/// each side plays with the settings its own checkpoint was trained with, and
+/// so one net can be pitted against itself at different depths, iteration
+/// counts or regret rules. They default to side A's.
 #[pyfunction]
-#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=false, depth_b=None, iters_b=None, cfr="linear", warm=0.0, gpu=false))]
+#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=false, depth_b=None, iters_b=None, cfr="linear", warm=0.0, cfr_b=None, warm_b=None, gpu=false))]
 #[allow(clippy::too_many_arguments)]
 fn eval_match(
     py: Python<'_>,
@@ -989,6 +990,8 @@ fn eval_match(
     iters_b: Option<usize>,
     cfr: &str,
     warm: f32,
+    cfr_b: Option<&str>,
+    warm_b: Option<f32>,
     gpu: bool,
 ) -> PyResult<(usize, usize, usize)> {
     let cfg = Cfg {
@@ -1003,6 +1006,11 @@ fn eval_match(
     let cfg_b = Cfg {
         iters: iters_b.unwrap_or(iters),
         depth: depth_b.unwrap_or(depth),
+        cfr: match cfr_b {
+            Some(name) => cfr_of(name)?,
+            None => cfg.cfr,
+        },
+        warm: warm_b.unwrap_or(warm),
         ..cfg
     };
     let (aa, bb) = (
@@ -1023,59 +1031,6 @@ fn eval_match(
         let n = nets().read().unwrap();
         rs_eval_match(games, seed, &n, aa, bb, random_draft)
     }))
-}
-
-/// Play `games` random-draft games and write up to `cap` subgame roots
-/// (public state + both beliefs, one per solve site) to `path` — the GPU
-/// tree-sizing sample of plan section 6. Uses the pushed nets, like
-/// `gen_data`.
-#[pyfunction]
-#[pyo3(signature = (games, seed, path, cap=1000, random_draft=true))]
-fn save_roots(
-    py: Python<'_>,
-    games: usize,
-    seed: u64,
-    path: &str,
-    cap: usize,
-    random_draft: bool,
-) -> PyResult<usize> {
-    let gc = GameCfg {
-        agents: [
-            Agent::Rebel {
-                cfg: Cfg {
-                    depth: 2,
-                    iters: 64,
-                    snapshots: false,
-                    ..Default::default()
-                },
-                slot: 0,
-            },
-            Agent::Rebel {
-                cfg: Cfg {
-                    depth: 2,
-                    iters: 64,
-                    snapshots: false,
-                    ..Default::default()
-                },
-                slot: 0,
-            },
-        ],
-        collect: Collect::None,
-        explore: 0.25,
-        random_draft,
-        eval_mix: 0.0,
-        mc_mix: 0.0,
-    };
-    let roots = py.allow_threads(|| {
-        let n = nets().read().unwrap();
-        crate::selfplay::collect_roots(games, seed, &n, &gc, cap)
-    });
-    let f = std::fs::File::create(path)
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-    let mut w = std::io::BufWriter::new(f);
-    crate::roots::write_roots(&mut w, &roots)
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-    Ok(roots.len())
 }
 
 /// Print the generation loop's phase timers. Empty unless the extension was
@@ -1319,7 +1274,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CFEAT", crate::rebel::CFEAT)?;
     m.add("AFEAT", crate::rebel::AFEAT)?;
     m.add("CCOUNTS", crate::rebel::CCOUNTS)?;
-    m.add("PUBFEAT_V1", crate::v1::PUBFEAT_V1)?;
     m.add("AUX", crate::selfplay::AUX)?;
     m.add("CNORM", crate::rebel::CNORM)?;
     m.add("N_HEXES", crate::board::N_HEXES)?;
@@ -1361,14 +1315,12 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ROW_FORMAT_VERSION", crate::rebel::ROW_FORMAT_VERSION)?;
     m.add_function(wrap_pyfunction!(rules_table_hash, m)?)?;
     m.add("CCOUNTS", crate::rebel::CCOUNTS)?;
-    m.add("PUBFEAT_V1", crate::v1::PUBFEAT_V1)?;
     m.add("AUX", crate::selfplay::AUX)?;
     m.add_function(wrap_pyfunction!(infer_policy, m)?)?;
     m.add_function(wrap_pyfunction!(hex_neighborhood, m)?)?;
     m.add_function(wrap_pyfunction!(set_weights, m)?)?;
     m.add_function(wrap_pyfunction!(set_cap_value, m)?)?;
     m.add_function(wrap_pyfunction!(prof_dump, m)?)?;
-    m.add_function(wrap_pyfunction!(save_roots, m)?)?;
     m.add_function(wrap_pyfunction!(gen_data, m)?)?;
     #[cfg(feature = "gpu")]
     {

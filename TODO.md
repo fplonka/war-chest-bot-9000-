@@ -1,19 +1,17 @@
 # TODO
 
-## Pre-CUDA (see /tmp/warchest-pre-cuda-plan.md)
+## The ML iteration loop
 
-- [ ] Record the section-7 decisions once runs/pre_cuda_random finishes:
-      7a card/holding, 7b flat-vs-hex, 7c head width (train/pre_cuda_comparisons.sh).
-- [ ] Write runs/pre_cuda_random/NOTES.md.
-- [ ] Save the 1,000-root GPU-sizing sample from the trained net
-      (python train/save_roots.py --ckpt runs/pre_cuda_random/<final>.pt ...)
-      and fill the depth-2/3/4 tree-size table (examples/treesize).
-- [ ] Delete the v1 compatibility path (engine/src/v1.rs, value_net_v1.py,
-      from_flat_v1, PUBFEAT_V1) once the ladder pool has rotated past the
-      old checkpoints; update runs/pool.json with post-freeze snapshots.
-- [ ] The CPU solver's node cap is 200k in generation; the GPU pool sizing
-      (docs/TREE.md) must budget the same tail, and the GPU build should
-      receive the cap as metadata.
+- [ ] **Run `cadence` first.** Does a 15-minute run rank changes the way a
+      60-minute one does? If it does, every experiment below costs a quarter of
+      what it costs now. Nobody runs this because it does not feel like
+      progress; it sets the cadence for everything after it.
+- [ ] Build the first ground-truth set off the strongest checkpoint we have
+      (`train/truth.py build`), record its provenance, and never rebuild it
+      mid-experiment. It is the ruler.
+- [ ] Re-run the `dcfr` / `aux` / `policy` experiments through `exp.py`. The
+      2026-08-06 `arch_*` results are **not** evidence: three arms inside
+      ±20 Elo at 100 games per pairing, which resolves nothing finer than ~70.
 
 ## Measurements waiting on the machine
 
@@ -27,6 +25,13 @@
       is exactly this, now that the dump exists to run it on.
 
 ## Known gaps
+
+- [ ] **The solver's own tests do not compile.** `tests/rebel_solver.rs`,
+      `tests/rebel_pbs.rs` and `examples/wave_tape.rs` reference `TNode::s`,
+      which the GPU tree-builder work removed. They have been dark since that
+      refactor: 20 compile errors at b55c631, none of them new. The PBS and
+      solver oracles are the correctness floor under everything the agent
+      does, so this is the first thing to fix.
 
 - [ ] **The horizon manufactures draws.** A game is cut at 256 coin plays and
       scored as a draw; War Chest has no draws. Report the draw rate beside

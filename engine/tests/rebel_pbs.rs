@@ -665,11 +665,12 @@ fn a_subgame_of_only_terminal_leaves_solves() {
             depth: 2,
             iters: 8,
             snapshots: true,
+            keep_states: true,
             ..Default::default()
         };
         let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
         assert!(
-            sv.nodes.iter().all(|n| !n.leaf || n.s.is_terminal()),
+            sv.nodes.iter().zip(&sv.states).all(|(n, s)| !n.leaf || s.is_terminal()),
             "expected every leaf terminal"
         );
         sv.multistep(cfg.iters);
@@ -683,68 +684,6 @@ fn a_subgame_of_only_terminal_leaves_solves() {
     assert!(checked >= 3, "only {checked} positions exercised");
 }
 
-/// A pre-describer checkpoint must still be able to play.
-///
-/// The card describer changed the public encoding's width and layout. If the
-/// pool cannot be loaded and played, no gate can ask whether the new
-/// architecture is better than what came before — which is the only question a
-/// gate exists to answer. So the old encoder and the old towers stay, keyed off
-/// the checkpoint's `dims`, and a solve picks its encoder from the net it was
-/// handed rather than from a constant.
-#[test]
-fn a_pre_describer_checkpoint_still_solves() {
-    let (hidden, dg, rank) = (64usize, 16usize, 16usize);
-    let mut r = Rng::new(3);
-    let dims = [warchest::v1::PUBFEAT_V1, hidden, CFEAT, dg, rank];
-    let nw = dims[0] * hidden
-        + hidden * hidden
-        + 2 * dg * hidden
-        + CFEAT * dg
-        + dg * (rank + 1)
-        + hidden * rank;
-    let mut draw =
-        |n: usize| -> Vec<f32> { (0..n).map(|_| (r.unit_f64() as f32 - 0.5) * 0.2).collect() };
-    let w = draw(nw);
-    let b = draw(hidden + hidden + dg + (rank + 1) + rank);
-    let mut ln = Vec::new();
-    for _ in 0..2 {
-        ln.extend(std::iter::repeat(1.0).take(hidden));
-        ln.extend(std::iter::repeat(0.0).take(hidden));
-    }
-    let net = Mlp::from_flat(&dims, &w, &b, &ln).expect("v1 net");
-    assert!(net.v1() && net.pub_dim() == warchest::v1::PUBFEAT_V1);
-
-    let nets = Nets { value: net };
-    let mut rng = Rng::new(11);
-    let mut s = make_game(&mut rng, false);
-    for _ in 0..60 {
-        if s.is_terminal() || s.is_chance() {
-            break;
-        }
-        let acts = s.legal_actions();
-        s.apply_inplace(acts[rng.below(acts.len())]);
-    }
-    let ctx = Ctx::new(&s);
-    let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
-    let cfg = Cfg {
-        depth: 2,
-        iters: 32,
-        snapshots: true,
-        ..Default::default()
-    };
-    let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
-    sv.multistep(cfg.iters);
-    let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
-    assert!(
-        vals[0][0].iter().all(|v| v.is_finite()),
-        "v1 solve produced non-finite values"
-    );
-    assert!(
-        vals[0][0].iter().any(|v| *v != 0.0),
-        "v1 solve produced all zeros"
-    );
-    assert!(sv.nash_conv().nash > -1e-3, "v1 NashConv is negative");
-}
 
 /// A warm start must not move where the solve converges.
 ///
@@ -785,6 +724,7 @@ fn a_warm_start_does_not_move_the_fixed_point() {
             depth: 2,
             iters: 400,
             snapshots: true,
+            keep_states: true,
             ..Default::default()
         };
         let mut v = Vec::new();
@@ -994,6 +934,7 @@ fn a_solve_reads_only_the_beliefs() {
         depth: 2,
         iters: 8,
         snapshots: true,
+        keep_states: true,
         ..Default::default()
     };
     let mut checked = 0usize;
@@ -1052,6 +993,7 @@ fn the_value_function_separates_configs_sharing_a_hand() {
         depth: 2,
         iters: 8,
         snapshots: true,
+        keep_states: true,
         ..Default::default()
     };
     let (mut positions, mut val_differs, mut strat_differs) = (0usize, 0usize, 0usize);
@@ -1233,6 +1175,7 @@ fn zero_weight_config_survives_the_walk_update() {
                 depth: 2,
                 iters: 8,
                 snapshots: false,
+                keep_states: true,
                 ..Default::default()
             },
             bel.clone(),

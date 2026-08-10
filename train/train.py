@@ -24,14 +24,15 @@ exact configs in support, their probabilities, and the value the solve gave
 each. The config lists are ragged, so they live in a flat arena and a batch is
 assembled by gathering spans -- see `Buffer`.
 
-The run saves a snapshot every `--snapshot-every` minutes and does not try to
-decide which one is best while it is training. `ladder.py` plays them against
-each other, and against Greedy and Random, once the run is over and turns the
-results into Elo — a curve of strength against training time, which is the
-thing we actually wanted to know.
+The run saves a snapshot every `snapshot_every` minutes and judges nothing
+while it trains: it produces checkpoints and stops. `ladder.py` rates them
+afterwards, off the clock, where a measurement can afford enough games to mean
+something — and can be rerun at a larger sample size without regenerating
+anything. `exp.py` drives both.
 """
 
 import argparse
+import dataclasses
 import json
 import os
 import sys
@@ -46,7 +47,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import warchest
-import ladder
+import config
 import mirror
 from export_weights import load as load_checkpoint
 from value_net import Mlp, AUX, AFEAT
@@ -419,6 +420,29 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
     return tot / steps, (ptot / steps if live else float("nan")), stat
 
 
+def check_alive(args, rec):
+    """Stop a run that has already failed, instead of paying for the rest of it.
+
+    Two ways a run dies quietly. Generation collapses -- an out-of-memory
+    fallback, a scheduler stall -- and the hour produces a tenth of the data it
+    should. Or the value function goes flat: predictions collapse toward a
+    constant, which a falling loss curve actively hides, because a constant
+    predictor has a very good loss. Both are visible within an epoch of
+    happening, and neither recovers.
+
+    Only checked in the ReBeL phase, and only once there is something to check:
+    the warm phase has no solves, and the first epochs legitimately look flat.
+    """
+    if rec["phase"] != "rebel" or rec["epoch"] < 8:
+        return
+    if rec["solves_per_s"] < args.abort_below_sps:
+        raise SystemExit(f"[abort] {rec['solves_per_s']:.0f} solves/s is below "
+                         f"{args.abort_below_sps:.0f}: generation has collapsed")
+    if rec["probe_std"] < args.abort_below_spread:
+        raise SystemExit(f"[abort] prediction spread {rec['probe_std']:.4f} is below "
+                         f"{args.abort_below_spread:.3f}: the value function is degenerate")
+
+
 def write_log(args, epochs, snaps):
     """The run's whole record: settings, per-epoch stats, snapshot manifest.
 
@@ -426,166 +450,37 @@ def write_log(args, epochs, snaps):
     thing to read and a run that is still going is readable at any moment.
     """
     with open(f"{args.out}/log.json", "w") as f:
-        json.dump({"cfg": vars(args), "epochs": epochs, "snapshots": snaps},
+        json.dump({"cfg": dataclasses.asdict(args), "epochs": epochs, "snapshots": snaps},
                   f, indent=1)
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--minutes", type=float, default=30.0)
-    ap.add_argument("--warm-frac", type=float, default=0.2)
-    # The warm phase only has to initialise the network, and its data is
-    # *discarded* at the switch. As a fraction of a long budget it is pure
-    # waste: 0.2 of a nine-hour run is 1.8 hours of throwaway work. Prefer an
-    # absolute length on any run longer than about half an hour.
-    ap.add_argument("--warm-minutes", type=float, default=-1.0,
-                    help="absolute warm-start length in minutes; overrides --warm-frac")
-    ap.add_argument("--init", default="",
-                    help="optional checkpoint to start from (useful for bounded GPU gates)")
-    ap.add_argument("--hidden", type=int, default=384)
-    # Width of the second public matrix, the belief projection, the second
-    # LayerNorm and the readouts. Metadata like every other width; default
-    # equals --hidden, which is the network this split came from.
-    ap.add_argument("--head", type=int, default=0,
-                    help="readout width (default: --hidden)")
-    # Tower depths (comma lists of widths; empty = the classic shape). These
-    # are the experiment knobs the flexible format exists for.
-    ap.add_argument("--pub", default="", help="public tower widths, e.g. 384,384")
-    ap.add_argument("--hmlp", default="", help="extra per-iteration head widths")
-    ap.add_argument("--card", default="", help="card describer hidden widths")
-    ap.add_argument("--slot", default="", help="holding tower hidden widths")
-    ap.add_argument("--nres", type=int, default=1, help="holding residual blocks")
-    # Width of a config embedding, and so of one player's belief block. This is
-    # the rank of the value function's dependence on the private state, and it
-    # is also what the belief is summarised into -- the one place where a fixed
-    # width is a real approximation, since a belief is a distribution over a
-    # config space too large to enumerate.
-    ap.add_argument("--dg", type=int, default=64)
-    # Rank of the value readout's inner product -- see `Mlp`.
-    ap.add_argument("--rank", type=int, default=64)
-    ap.add_argument("--policy", type=float, default=0.0,
-                    help="weight on the policy head's loss. Its labels are free -- every\nsolve already computes the reference strategy -- and the head is what\na warm start and any action shortlist read. Off by default: it trains\nthe shared trunk, so it changes the value network and has to be gated\nas its own change.")
-    ap.add_argument("--aux", type=float, default=0.0,
-                    help="weight on the auxiliary heads' loss. They predict dense facts\nabout how the game went -- markers three rounds on, the initiative\nflip, the result -- so every row gives the shared trunk a gradient\nthe single value number does not. Off by default until gated.")
-    ap.add_argument("--de", type=int, default=32,
-                    help="width of a card embedding: what the describer summarises a\ncard's rulebook facts into, and what every part that names a card reads")
-    # Arena size per row of replay capacity. Self-play carries ~24 configs a
-    # decision; whichever of the two rings fills first sets the real window.
-    ap.add_argument("--cfgs-per-row", type=int, default=48)
-    ap.add_argument("--batch", type=int, default=1024)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    # Step-decay the learning rate at fixed fractions of the ReBeL phase (the
-    # reference repo halves Adam lr every 400 epochs, twice; wall-clock
-    # fractions are more robust here since epoch throughput varies).
-    ap.add_argument("--lr-decay-frac", default="0.33,0.67",
-                    help="fractions of the ReBeL phase at which to halve the lr (comma-separated)")
-    # ReBeL-phase value targets are pure CFR bootstrap. Blending some of the
-    # realised game outcome in (MuZero-style n-step / TD(lambda)) can speed
-    # learning; 0 recovers plain ReBeL.
-    ap.add_argument("--mc-mix", type=float, default=0.0)
-    # Fraction of each batch drawn from the newest slice of the buffer, and how
-    # big that slice is. See `Buffer.sample`.
-    ap.add_argument("--recent-mix", type=float, default=0.5)
-    ap.add_argument("--recent-frac", type=float, default=0.2)
-    ap.add_argument("--warm-games", type=int, default=96)
-    ap.add_argument("--rebel-games", type=int, default=48)
-    ap.add_argument("--train-gen-ratio", type=float, default=4.0)
-    # depth 1 puts *zero* opponent decision nodes in the subgame, which reduces
-    # CFR to 1-ply value iteration over the network. 2 is the reference's
-    # setting for liar's dice and the minimum that is actually ReBeL.
-    ap.add_argument("--depth", type=int, default=2)
-    # CFR iterations per subgame. Measured on real mid-game positions against a
-    # converged T=512 reference (`examples/solvererr.rs`), mean |error| in the
-    # root value is:
-    #
-    #     T=8  0.0098   (8% of the spread of the values themselves)
-    #     T=16 0.0036   (3%)
-    #     T=32 0.0016   (1.3%)
-    #
-    # This is *bias*, not noise -- the same position gives the same wrong number
-    # every time -- so the network fits it happily and converges to the fixed
-    # point of the under-solved operator. No training loss curve can show it.
-    # Earlier runs traded that bias for throughput and settled on 16, on the
-    # grounds that the lost data was worth more. That is the wrong trade to keep
-    # making: the whole claim of ReBeL is that the targets are the values of a
-    # *solved* subgame, and at T=16 they are the values of a subgame we stopped
-    # solving early. 64 costs roughly 2.5x the generation rate of 16.
-    ap.add_argument("--iters", type=int, default=64)
-    ap.add_argument("--cfr", default="linear",
-                    help="the regret rule: linear, plus, dcfr, pcfr, sapcfr. "
-                         "See docs/REBEL.md; they are one formula with four numbers.")
-    ap.add_argument("--warm", type=float, default=0.0,
-                    help="iterations the policy head's strategy is worth when a solve "
-                         "is seeded from it. 0 starts uniform.")
-    ap.add_argument("--explore", type=float, default=0.25)
-    ap.add_argument("--temp", type=float, default=2.0)
-    ap.add_argument("--eval-mix", type=float, default=0.5)
-    # Horizon payoff per marker of differential. Each side has 6 markers, so the
-    # differential reaches +-5 and this must stay far below a real win (+-1) or
-    # stalling out the clock becomes a competing win condition: at 0.15 a
-    # five-marker lead banked 0.75 risk-free, which is what collapsed the first
-    # run. 0.04 caps the shaped payoff at +-0.20.
-    ap.add_argument("--cap-value", type=float, default=0.04)
-    # Fraction of the ReBeL phase over which the horizon payoff decays to zero.
-    # It reaches zero early so the tail of training -- and the checkpoint we
-    # ship -- is fitted to the real game.
-    ap.add_argument("--anneal-frac", type=float, default=0.4)
-    # Save the network this often. Snapshots cost a file write and nothing else:
-    # no games are played during training, and no snapshot is treated as better
-    # than another until the ladder says so.
-    ap.add_argument("--snapshot-every", type=float, default=6.0,
-                    help="minutes between snapshots")
-    # Paired games per pairing in the closing Elo ladder. 0 skips it, for when
-    # the ladder will be run separately (`python train/ladder.py <run>`).
-    ap.add_argument("--ladder-games", type=int, default=60)
-    # Dump the replay buffer at the end of the run, oldest row first. Targets
-    # here are a deterministic function of the input, so a frozen dump supports
-    # noise-free offline comparisons of network architectures -- which is the
-    # only way to resolve effects smaller than the +-0.05 that a short training
-    # run wanders by on its own.
-    ap.add_argument("--dump-buffer", default="",
-                    help="path for an .npz dump of the replay buffer")
-    # Replay capacity, and a genuine algorithmic knob rather than a memory
-    # setting. The held-out error of this network falls monotonically with the
-    # number of distinct positions it trains on, with no sign of saturating:
-    # 40k -> 0.0122, 80k -> 0.0103, 160k -> 0.0086, 284k -> 0.0082. A nine-hour
-    # run generates over ten million rows, so capacity decides how many of them
-    # survive to be trained on. At 2544 bytes a row, 2M costs 4.7 GiB of arrays
-    # and peaks at 5.1 GiB alongside PyTorch -- comfortable on a 16 GiB machine,
-    # where 3M (7.5 GiB) would leave little headroom for the workers.
-    ap.add_argument("--cap", type=int, default=2_000_000)
-    ap.add_argument("--random-draft", action="store_true")
-    ap.add_argument("--no-augment", action="store_true",
-                    help="disable the 180-degree mirror augmentation")
-    ap.add_argument("--device", default="cpu")
-    ap.add_argument("--train-stream-priority", type=int, default=0,
-                    help="CUDA trainer stream priority (negative is higher; 0 keeps the default stream)")
-    # Work package B: run the ReBeL solves on the CUDA service (one thread
-    # owns GPU-0; the trainer stays on --device). The service must be present
-    # at startup or the run fails loudly rather than falling back to CPU.
-    ap.add_argument("--gpu", action="store_true",
-                    help="run solves on the in-process CUDA service")
-    # One service per listed CUDA device. Two services on a two-card box beat
-    # one by nearly the card count: the trainer's own device still has plenty
-    # of room left over, because this network is small and the trainer is not
-    # what the cards are busy with.
-    ap.add_argument("--gpu-devices", default="0",
-                    help="comma-separated CUDA devices for the solve services")
-    ap.add_argument("--gpu-workers", type=int, default=36,
-                    help="CPU builder threads in the continuous GPU pipeline")
-    ap.add_argument("--gpu-actors", type=int, default=128,
-                    help="live game actors per GPU builder thread")
-    ap.add_argument("--gpu-inflight", type=int, default=32,
-                    help="maximum submitted solves per GPU builder thread")
-    ap.add_argument("--gpu-chunk", type=int, default=1024,
-                    help="fresh solves per replay chunk delivered to Python")
-    ap.add_argument("--gpu-drain-seconds", type=float, default=20.0,
-                    help="deadline reserve for submitted waves and final optimizer debt")
-    ap.add_argument("--gpu-publish-steps", type=int, default=16,
-                    help="optimizer steps between immutable GPU weight banks")
-    ap.add_argument("--out", default="runs/latest")
-    ap.add_argument("--seed", type=int, default=1)
-    args = ap.parse_args()
+    ap = argparse.ArgumentParser(
+        description="Train one run. Settings come from a config file written by "
+                    "exp.py, or from BASELINE plus --set overrides.")
+    ap.add_argument("--config", default="", help="JSON config (see config.py)")
+    ap.add_argument("--set", nargs="*", default=[],
+                    help="knob=value overrides on top of the config")
+    ap.add_argument("--out", default="")
+    cli = ap.parse_args()
+
+    args = config.load(cli.config) if cli.config else config.BASELINE
+    over = dict(kv.split("=", 1) for kv in cli.set)
+    if cli.out:
+        over["out"] = cli.out
+    if over:
+        # `field.type` is a type object or its name depending on how the module
+        # was compiled, so key the casts on the name either way.
+        fields = {f.name: getattr(f.type, "__name__", f.type)
+                  for f in dataclasses.fields(config.Cfg)}
+        cast = {"int": int, "float": float,
+                "bool": lambda v: v not in ("0", "false", "False", "")}
+        unknown = set(over) - set(fields)
+        if unknown:
+            raise SystemExit(f"no such knob: {sorted(unknown)}")
+        args = dataclasses.replace(args, **{
+            k: cast.get(fields[k], str)(v) for k, v in over.items()})
+    args.git = config.git_sha()
 
     os.makedirs(args.out, exist_ok=True)
     torch.manual_seed(args.seed)
@@ -609,7 +504,7 @@ def main():
         # services create their independent contexts for both solve cards.
         torch.cuda.set_device(dev)
         if args.train_stream_priority > 0:
-            ap.error("--train-stream-priority must be zero or negative")
+            raise SystemExit("train_stream_priority must be zero or negative")
         if args.train_stream_priority < 0:
             default_stream = torch.cuda.current_stream(dev)
             train_stream = torch.cuda.Stream(
@@ -706,7 +601,12 @@ def main():
         torch.save({"value": value.state_dict(), "spec": value.spec(),
                     "hidden": args.hidden, "head": args.head or args.hidden,
                     "dg": args.dg, "rank": args.rank, "de": args.de, "t": round(el, 1),
-                    "label": label}, path)
+                    "label": label, "git": args.git,
+                    # How this checkpoint plays. A net trained with one regret
+                    # rule and evaluated under another is not the player the
+                    # run produced, and nothing downstream could tell.
+                    "search": {"depth": args.depth, "iters": args.iters,
+                               "cfr": args.cfr, "warm": args.warm}}, path)
         snaps.append({"label": label, "t": round(el, 1),
                       "file": os.path.basename(path)})
         print(f"[t={el:6.1f}s] --- snapshot {snaps[-1]['file']} ({label}) ---", flush=True)
@@ -830,6 +730,7 @@ def main():
                 "deadline_remaining": round(max(0.0, deadline - now), 1),
             }
             log.append(rec)
+            check_alive(args, rec)
             write_log(args, log, snaps)
             print(
                 f"[t={rec['t']:6.1f}s] rebel stream solves={rebel_solves} "
@@ -1179,6 +1080,7 @@ def main():
                "solves_per_s": round(sps, 1),
                "lr": opt.param_groups[0]["lr"]}
         log.append(rec)
+        check_alive(args, rec)
         # Rewritten every epoch: this is the file `plot.py` reads, and a run
         # should be watchable from its first minute. It is a few hundred
         # kilobytes even on a long run, so the cost is nothing against a
@@ -1218,14 +1120,6 @@ def main():
                  rules_hash=np.uint64(warchest.rules_table_hash()))
         print(f"dumped {len(rows)} buffer rows ({len(cy)} configs) to {args.dump_buffer}",
               flush=True)
-
-    # ------------------------------------------------------------- the ladder
-    # Every snapshot against every other, plus Greedy and Random, on the real
-    # game. This is the only strength measurement the run makes, and it makes it
-    # once, at the end, where it can afford enough games to mean something.
-    if args.ladder_games > 0:
-        ladder.run(args.out, games=args.ladder_games, depth=args.depth,
-                   iters=args.iters, temp=args.temp, random_draft=args.random_draft)
 
 
 if __name__ == "__main__":

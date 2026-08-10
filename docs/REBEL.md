@@ -302,18 +302,6 @@ That is what a *correct* seed carrying a *weak* policy looks like — this head 
 worth less than four CFR iterations, so injecting it as fifteen costs accuracy.
 A4 is blocked on a policy head worth more than that.
 
-### The pre-describer encoder
-
-`engine/src/v1.rs` and `train/value_net_v1.py` are the encoding and network a
-checkpoint from before the card describer was trained with, frozen and
-eval-only. Keyed off `dims` (five entries against the current ten); a solve
-takes its encoder from the net it was handed rather than from a constant.
-
-They exist for one reason: the describer changed the public encoding's width, and
-a gate that cannot play the new architecture against the pool cannot answer the
-only question a gate is for. Nothing here is maintained or extended — delete both
-when the pool has rotated past every checkpoint that needs them.
-
 ### What is cached
 
 Inside a solve only the beliefs move, so three things survive it: the public
@@ -341,7 +329,7 @@ second way with the seats swapped (`train/mirror.py`, applied per batch).
 ## 6. Training
 
 ```bash
-python train/train.py --minutes 30 --out runs/mine
+python train/exp.py run dcfr --seeds 2
 ```
 
 **Phase 1 — greedy warm start** (`--warm-frac`). Both players are a stochastic
@@ -430,5 +418,8 @@ engine/src/py.rs        pyo3: set_weights / gen_data / eval_match
 train/value_net.py      the networks, shared by everything that loads one
 train/train.py          PyTorch training loop, snapshots on a timer
 train/ladder.py         round robin over snapshots -> Elo
-train/plot.py           the four panels a run is read from
+train/report.py         one self-contained HTML page per run or comparison
+train/truth.py          a frozen set of solved positions; any checkpoint's error on it
+train/config.py         every knob of a run, one object; the experiments we run
+train/exp.py            an experiment end to end: arms x seeds -> ladder -> report
 ```

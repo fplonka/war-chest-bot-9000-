@@ -17,10 +17,13 @@ engine/          Rust crate, lib name `warchest`
   src/bin/       bench.rs (applies/sec, playouts/sec)
 webui/           play.py + index.html: browser UI for playing a trained agent
 play.sh          one-liner: build the extension, serve the UI, open the browser
-train/           train.py    PyTorch training loop, snapshots on a timer
+train/           config.py   every knob of a run, one object; the experiments we run
+  exp.py         run an experiment end to end: arms x seeds -> ladder -> report
+  train.py       PyTorch training loop, snapshots on a timer, judges nothing
   value_net.py   the value network itself, shared by every tool that loads one
-  ladder.py      round robin over a run's snapshots, plus Greedy and Random -> Elo
-  plot.py        the four panels a run is read from
+  truth.py       a frozen set of solved positions, and any checkpoint's error on it
+  ladder.py      round robin over runs' snapshots, plus Greedy -> Elo
+  report.py      one self-contained HTML page per run or comparison
   offline.py     fit architectures to a frozen replay dump (noise-free A/B)
   diagnose.py    model-free check on how learnable a dump's targets are
   dump.py        reading a dumped replay buffer
@@ -40,9 +43,22 @@ is a commercial product, so it is not redistributed here.
 ```bash
 uv venv --python 3.12 .venv && VIRTUAL_ENV=.venv uv pip install torch numpy maturin
 cd engine && maturin develop --release && cd ..
-.venv/bin/python train/train.py --minutes 30 --out runs/mine
-.venv/bin/python train/plot.py runs/mine
+.venv/bin/python train/exp.py run dcfr --seeds 2     # arms, seeds, ladder, report
+.venv/bin/python train/exp.py ls                     # every run, newest first
 ```
+
+An experiment is declared in `train/config.py` as a list of arms, and an arm is
+only its *delta* from the baseline. `exp.py` runs each arm at each seed, rates
+every resulting checkpoint in one ladder, and writes a self-contained HTML page
+— no manual step anywhere in that chain. One arm at a time is
+`train/train.py --config <json>` or `--set knob=value`.
+
+Not everything needs a training run. `train/truth.py` scores a checkpoint's
+value head against a frozen set of positions solved to convergence: one number,
+seconds, no games and no variance. `train/offline.py` compares architectures on
+a frozen replay dump. `engine/examples/solvererr.rs` answers the regret-rule and
+iteration-count questions without training anything at all. Use those first; a
+ladder is the confirmation, not the search.
 
 ## Playing against a trained agent
 
@@ -76,12 +92,18 @@ that the human's belief update assumes a uniform behaviour model for the human
 — the agent has no model of how a person plays, and a model that assumed
 agent-like play could drop the true config from the belief support.
 
-A run saves the network every few minutes and judges nothing while it trains.
-When it ends, `train/ladder.py` plays every snapshot against every other one,
-against the handcrafted Greedy bot and against Random, and fits an Elo to each —
-so what a run reports is strength against minutes trained, with Random at 0.
-`train.py` runs it automatically; `python train/ladder.py runs/mine --games 200`
-reruns it with more games.
+A run saves the network every few minutes and judges nothing while it trains:
+it produces checkpoints and stops. `train/ladder.py` rates them afterwards, so
+a measurement can be rerun at any sample size without regenerating anything.
+What a run reports is strength against minutes trained, with Greedy at 0.
+
+Sample size is the thing to get right. A pairing of 100 games resolves nothing
+finer than about 70 Elo, 1,000 games about 22, and 5,000 about 10 — while a game
+costs on the order of a hundred solves against the million a training run
+generates. So the ladder puts most of its games on the pairing the experiment is
+about (`--focus`, `--focus-games`) and enough everywhere else to place a player.
+Ladders here used to run 30 to 100 games; the architecture comparisons decided
+that way were inside the noise.
 
 War Chest turns out to be an unusually good fit for ReBeL. A player's private
 state is `(hand, face-down discards, pending forced-play coin)` — the bag is

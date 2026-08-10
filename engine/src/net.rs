@@ -541,7 +541,6 @@ impl<'a> Cur<'a> {
 pub struct Mlp {
     /// The checkpoint's shape vector, verbatim (v3: see `from_flat_v3`).
     pub dims: Vec<usize>,
-    v1: bool,
     de: usize,
     dg: usize,
     rank: usize,
@@ -747,14 +746,11 @@ impl V3Layout {
 }
 
 impl Mlp {
-    /// Build from the flat arrays the trainer ships. Three formats load:
-    /// v3 (`dims[0] == 3`, the tower format below), v2 (the frozen 10-entry
-    /// fixed layout), and v1 (5 entries, pre-describer). All three land in
-    /// the same tower representation; only parsing differs.
+    /// Build from the flat arrays the trainer ships. Two formats load:
+    /// v3 (`dims[0] == 3`, the tower format below) and v2 (the frozen
+    /// 10-entry fixed layout). Both land in the same tower representation;
+    /// only parsing differs.
     pub fn from_flat(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Mlp, String> {
-        if dims.len() == 5 {
-            return Mlp::from_flat_v1(dims, w, b, ln);
-        }
         if dims.first() == Some(&3) {
             return Mlp::from_flat_v3(dims, w, b, ln);
         }
@@ -802,7 +798,6 @@ impl Mlp {
             |(g, bt): (usize, usize), n: usize| (ln[g..g + n].to_vec(), ln[bt..bt + n].to_vec());
         Ok(Mlp {
             dims: dims.to_vec(),
-            v1: false,
             de: l.de,
             dg: l.dg,
             rank: l.rank,
@@ -929,77 +924,6 @@ impl Mlp {
         Mlp::from_flat_v3(&v3, &w3, &b3, ln)
     }
 
-    /// A pre-describer checkpoint: six matrices, the flat `v1` encoding fed
-    /// straight to the first layer, and a holding tower that is one linear
-    /// map of the counts. Loadable so the pool can still be played against.
-    fn from_flat_v1(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Mlp, String> {
-        let (p, h, cf, dg, rk) = (dims[0], dims[1], dims[2], dims[3], dims[4]);
-        let want_w = p * h + h * h + 2 * dg * h + cf * dg + dg * (rk + 1) + h * rk;
-        let want_b = h + h + dg + (rk + 1) + rk;
-        if w.len() != want_w || b.len() != want_b || ln.len() != 4 * h {
-            return Err(format!("v1 weight sizes do not match dims {dims:?}"));
-        }
-        let (mut cw, mut cb) = (Cur::new(w, "w"), Cur::new(b, "b"));
-        let lin = |cw: &mut Cur, cb: &mut Cur, i: usize, o: usize| -> Result<Lin, String> {
-            Ok(Lin {
-                w: cw.take(i * o)?,
-                b: cb.take(o)?,
-                i,
-                o,
-            })
-        };
-        // Old order: w0, w1, wb, wc, wg, wu; b0, b1, bc, bg, bu.
-        let w0 = Lin {
-            w: cw.take(p * h)?,
-            b: cb.take(h)?,
-            i: p,
-            o: h,
-        };
-        let w1w = cw.take(h * h)?;
-        let wb = cw.take(2 * dg * h)?;
-        let wcw = cw.take(cf * dg)?;
-        let b1 = cb.take(h)?;
-        let bc = cb.take(dg)?;
-        let wg = lin(&mut cw, &mut cb, dg, rk + 1)?;
-        let wu = lin(&mut cw, &mut cb, h, rk)?;
-        cw.done()?;
-        cb.done()?;
-        Ok(Mlp {
-            dims: dims.to_vec(),
-            v1: true,
-            de: 0,
-            dg,
-            rank: rk,
-            head_in: h,
-            card: Vec::new(),
-            wid: Vec::new(),
-            pile: Lin::default(),
-            pub_lin: vec![w0],
-            pub_ln: vec![(ln[..h].to_vec(), ln[h..2 * h].to_vec())],
-            pub_out: Lin {
-                w: w1w,
-                b: b1,
-                i: h,
-                o: h,
-            },
-            wb,
-            ln1: (ln[2 * h..3 * h].to_vec(), ln[3 * h..4 * h].to_vec()),
-            hmlp: Vec::new(),
-            wu,
-            slot: Vec::new(),
-            slot_out: Lin {
-                w: wcw,
-                b: bc,
-                i: cf,
-                o: dg,
-            },
-            res: Vec::new(),
-            wg,
-            wq: Lin::default(),
-            wk: Lin::default(),
-            wp: Lin::default(),
-        })
-    }
 
     /// Read the flat weight dump `train/export_weights.py` writes:
     ///
@@ -1046,11 +970,7 @@ impl Mlp {
     }
     /// Width of the public encoding.
     pub fn pub_dim(&self) -> usize {
-        if self.v1 {
-            self.dims[0]
-        } else {
-            PUBFEAT
-        }
+        PUBFEAT
     }
     /// Width of `h0` and of the head entry (`ln1`).
     pub fn head(&self) -> usize {
@@ -1062,11 +982,7 @@ impl Mlp {
     }
     /// Width of one config vector.
     pub fn cfeat(&self) -> usize {
-        if self.v1 {
-            self.dims[2]
-        } else {
-            CFEAT
-        }
+        CFEAT
     }
     /// Width of a config embedding, and of one player's belief block.
     pub fn dg(&self) -> usize {
@@ -1082,27 +998,15 @@ impl Mlp {
     }
     /// Width of one stored action vector, before the paying card's embedding.
     pub fn afeat(&self) -> usize {
-        if self.v1 {
-            0
-        } else {
-            AFEAT
-        }
+        AFEAT
     }
-    /// Width of a card embedding. Zero for a `v1` checkpoint.
+    /// Width of a card embedding.
     pub fn de(&self) -> usize {
         self.de
     }
-    /// Whether this is a checkpoint from before the card describer.
-    pub fn v1(&self) -> bool {
-        self.v1
-    }
     /// Width of the trunk's input, once the card embeddings are spliced in.
     pub fn xdim(&self) -> usize {
-        if self.v1 {
-            self.pub_dim()
-        } else {
-            xdim_of(self.de)
-        }
+        xdim_of(self.de)
     }
     /// The tower shapes, for anything (the GPU service) that mirrors the
     /// chains: (card, pub widths, pub_out, hmlp widths, slot widths, nres).
@@ -1147,10 +1051,6 @@ impl Mlp {
     /// `relu` chain over the rulebook facts plus the learned id embedding.
     /// Runs once per solve; every other tower reads rows of the result.
     pub fn cards(&self, xpub_row: &[f32], ids: &[u8], e: &mut Vec<f32>) {
-        if self.v1 {
-            e.clear();
-            return;
-        }
         let de = self.de;
         let cards = &xpub_row[OFF_CARDS..OFF_CARDS + NTYPE * CARD_FEATS];
         let mut cur: Vec<f32> = cards.to_vec();
@@ -1180,7 +1080,6 @@ impl Mlp {
     /// for the layout rationale; the two must agree block for block.
     fn assemble(&self, xpub: &[f32], rows: usize, stride: usize, e: &[f32], x: &mut Vec<f32>) {
         let (de, xd) = (self.de, self.xdim());
-        debug_assert!(!self.v1);
         if rows == 0 {
             return;
         }
@@ -1251,11 +1150,7 @@ impl Mlp {
         let (rk, dg) = (self.rank, self.dg);
         debug_assert_eq!(phi.len(), n * self.cfeat());
         fit(z, n * dg);
-        if self.v1 {
-            let cf = self.cfeat();
-            self.slot_out.gemm(phi, n, cf, 0.0, &mut z[..n * dg]);
-            self.slot_out.bias_relu(n, z);
-        } else {
+        {
             let (de, hf) = (self.de, hfeat(self.de));
             let cf = self.cfeat();
             // The five slot rows are independent and identically shaped, so
@@ -1328,12 +1223,8 @@ impl Mlp {
         out: &mut Vec<f32>,
     ) {
         let mut x = Vec::new();
-        let (src, lda) = if self.v1 {
-            (xpub, stride)
-        } else {
-            self.assemble(xpub, rows, stride, e, &mut x);
-            (&x[..], self.xdim())
-        };
+        self.assemble(xpub, rows, stride, e, &mut x);
+        let (src, lda) = (&x[..], self.xdim());
         let l0 = &self.pub_lin[0];
         let mut a = std::mem::take(scratch);
         fit(&mut a, rows * l0.o);

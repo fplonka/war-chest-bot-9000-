@@ -4,7 +4,7 @@
 //! iterations of a solved subgame, plus the beliefs its Phase 2 must value.
 //! The byte format is the WCJ6 TREE.md contract (`docs/TREE.md`) and
 //! the same bytes serve three consumers: the GPU service (uploaded to the
-//! device), the torch CFR specification (`train/cfr_spec.py`, the executable
+//! device), the GPU-versus-CPU oracles in `src/gpu/tests.rs` (the executable
 //! oracle for the kernels), and the oracle tests (CPU -> bytes -> CPU).
 //!
 //! The solver's arenas (`regret`, `inst`, `cur`, `sum_strat`, `avg`, the

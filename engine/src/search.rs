@@ -75,6 +75,13 @@ pub struct Cfg {
     /// neither allocated nor initialised — the device builds its own from
     /// the job, so doing it here too was pure allocation traffic.
     pub gpu_build: bool,
+    /// Keep each node's `State` in `Solver::states`, for tests that assert on
+    /// the tree's shape (every leaf terminal, this node is a Warrior Priest
+    /// draw, that leaf's hand has the right size). The tree itself dropped the
+    /// field because it was 688 of a node's 1,136 bytes across 2,039 nodes for
+    /// four read sites, none of them in a hot loop — so this is off in every
+    /// production path and the vector stays empty there.
+    pub keep_states: bool,
 }
 
 impl Default for Cfg {
@@ -87,6 +94,7 @@ impl Default for Cfg {
             warm: 0.0,
             node_cap: 0,
             gpu_build: false,
+            keep_states: false,
         }
     }
 }
@@ -603,6 +611,8 @@ pub struct Solver<'a> {
     nets: &'a Nets,
     pub(crate) cfg: Cfg,
     pub nodes: Vec<TNode>,
+    /// Node states, parallel to `nodes`. Empty unless `Cfg::keep_states`.
+    pub states: Vec<State>,
     pub(crate) root_belief: [Belief; 2],
     /// Regrets and the current regret-matching iterate, flat by node over legal
     /// cells. Node `i` occupies `soff[i] .. soff[i + 1]`; within that range its
@@ -769,6 +779,7 @@ impl<'a> Solver<'a> {
             nets,
             cfg,
             nodes: take_nodes(),
+            states: Vec::new(),
             root_belief: belief,
             regret: Vec::new(),
             cur: Vec::new(),
@@ -996,6 +1007,9 @@ impl<'a> Solver<'a> {
             leaf = mainplay;
         }
         let id = self.nodes.len();
+        if self.cfg.keep_states {
+            self.states.push(s.clone());
+        }
         let _tp = timed!(BPUSH);
         self.nodes.push(TNode {
             util: if leaf && s.is_terminal() {
@@ -1400,15 +1414,10 @@ impl<'a> Solver<'a> {
         &self.reach[at..at + self.nc[i][p] as usize]
     }
 
-    /// One public row, in whichever encoding this solve's network was trained
-    /// with.
+    /// One public row.
     fn encode(&mut self, s: &State, at: usize) {
         let pf = self.pubfeat;
-        if self.nets.value.v1() {
-            crate::v1::write_public_features_v1(s, &self.ctx, &mut self.xpub[at..at + pf]);
-        } else {
-            write_public_features(s, &self.ctx, &mut self.xpub[at..at + pf]);
-        }
+        write_public_features(s, &self.ctx, &mut self.xpub[at..at + pf]);
     }
 
     /// Record a leaf in the network batch. Called from `build`, while the
