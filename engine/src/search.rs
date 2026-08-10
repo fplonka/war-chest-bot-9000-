@@ -543,6 +543,40 @@ fn give_nodes(mut v: Vec<TNode>) {
     });
 }
 
+/// The config-interning map is looked up once per leaf, per player, per config
+/// in support -- about thirty thousand times per mature solve -- and it is only
+/// ever `get` and `insert`, never iterated, so the hash is free to change. The
+/// standard hasher is SipHash, which is overkill for a 39-bit packed count
+/// vector and was most of the compact-leaf-row phase's cost. One multiply and a
+/// shift is enough to spread a key that is already dense.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct KeyHash;
+
+#[derive(Default)]
+pub(crate) struct KeyHasher(u64);
+
+impl std::hash::Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(b as u64);
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        let x = (n ^ self.0).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = x ^ (x >> 29);
+    }
+}
+
+impl std::hash::BuildHasher for KeyHash {
+    type Hasher = KeyHasher;
+    fn build_hasher(&self) -> KeyHasher {
+        KeyHasher(0)
+    }
+}
+
 fn take_buf(role: usize) -> Vec<f32> {
     BUFS.with(|b| b.borrow_mut()[role].pop().unwrap_or_default())
 }
@@ -633,7 +667,7 @@ pub struct Solver<'a> {
     /// configs — and the config tower is the one part of the network whose cost
     /// scales with the support, so it runs once per distinct config per solve.
     pub(crate) cphi: Vec<f32>,
-    pub(crate) cmap: std::collections::HashMap<u64, u32>,
+    pub(crate) cmap: std::collections::HashMap<u64, u32, KeyHash>,
     /// Decision-node states, kept only for a warm start's policy rows.
     warm_states: Vec<(usize, State)>,
     /// Whether the root is a normal coin-play choice, which is all the policy
@@ -756,7 +790,7 @@ impl<'a> Solver<'a> {
             leaf_cidx: Vec::new(),
             leaf_coff: Vec::new(),
             cphi: take_buf(R_CPHI),
-            cmap: std::collections::HashMap::new(),
+            cmap: std::collections::HashMap::with_capacity_and_hasher(1024, KeyHash),
             warm_states: Vec::new(),
             root_mainplay: false,
             ncfg: 0,

@@ -75,10 +75,26 @@ a wave stays on the card while the lane assembles the next one and unpacks the
 last, is what made a deeper in-flight window pay for the first time: in-flight
 80 was worth +9% after that change and nothing before it.
 
-The standing obstacle is now the host tree builder. The phase timers put a
-mature solve at 30.7 CPU-ms: 19.6 building the tree, 4.3 serializing the job,
-3.1 packing public features. This document's budget for 1,200 solves/s is 20 ms,
-so the direct sparse builder in step 1 below is no longer optional.
+**The host tree builder was not short of algorithm, it was short of bytes.** The
+phase timers first put a mature solve at 30.7 CPU-ms, against this document's
+20 ms budget for 1,200 solves/s, and step 1 below reads as though a direct
+sparse builder is the way to close that. It was not needed. Three things
+accounted for a third of it, none of them the tree algorithm:
+
+* the node array was a fresh `Vec` per solve that reserved 640 and doubled from
+  there, while a mature subgame builds 2,039 nodes -- so every solve memcpied
+  the array several times and first-touched megabytes of new pages;
+* a `TNode` was 1,136 bytes, 688 of them a `State` that four places read, none
+  of them in a hot loop. Terminal leaves now keep just their utility;
+* `node_actions` cloned that same `State` once per reserve slot, and dedupd a
+  few dozen action encodings through a freshly allocated `HashSet`.
+
+Host cost is 20.4 CPU-ms/solve after those, and the remaining profile is flat:
+the compact leaf row at 3.5 ms, the draw transitions at 2.9, serialization at
+2.9, and nothing else above 1.9. There is no longer a single item worth a
+rewrite, and `wait_frac` says the builders are only 64% busy -- the device is
+the limit again on a generation-only stream. Add `--features prof` and call
+`warchest.prof_dump()` to see the same table.
 
 ## What counts as success
 

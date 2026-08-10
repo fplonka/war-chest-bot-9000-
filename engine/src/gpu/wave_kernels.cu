@@ -704,6 +704,30 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
         for (int c = lane; c < n; c += 32) out[c] = u * orc;
         return;
     }
+#if READOUT_LANE
+    // One config per lane, not one config per warp. The rank-64 dot used to
+    // cost a five-step shuffle reduction *per config*, and a leaf carries
+    // fifteen or so, so the warp spent most of its time reducing rather than
+    // multiplying. The row's projection goes to shared memory once and each
+    // lane then walks a whole config on its own. The config table is well
+    // under a megabyte per wave, so the lane-divergent gathers stay in L2.
+    __shared__ float readout_smem[(WAVE_BLOCK / 32) * RK];
+    float* us = readout_smem + (threadIdx.x >> 5) * RK;
+    const float* ur = AP(w, A_U) + (unsigned long long)q.row * RK;
+    for (int j = lane; j < RK; j += 32) us[j] = ur[j] + wt->wu_b[j];
+    __syncwarp();
+    unsigned int c0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + player];
+    for (int base = 0; base < n; base += 32) {
+        int c = base + lane;
+        if (c >= n) break;
+        unsigned int cfg = TP(w, unsigned int, T_ROW_CFG)[c0 + c];
+        const float* g = AP(w, A_G) + (unsigned long long)cfg * (RK + 1);
+        float part = 0.0f;
+        #pragma unroll 8
+        for (int j = 0; j < RK; j++) part += us[j] * g[j];
+        out[c] = (part + g[RK]) * orc;
+    }
+#else
     const float* ur = AP(w, A_U) + (unsigned long long)q.row * RK;
     float u[RK_CH];
     #pragma unroll
@@ -724,6 +748,7 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
         part = warp_sum(part);
         if (lane == 0) out[c] = (part + g[RK]) * orc;
     }
+#endif
 }
 
 // mode 0: CFR update using current strategy; mode 1: fixed final strategy.

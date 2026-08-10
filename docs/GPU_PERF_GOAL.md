@@ -189,6 +189,24 @@ measured nothing at every earlier build, because the memory it needed did not
 exist and because a lane that blocks on its own wave cannot use the extra depth
 anyway. It only pays once both are fixed.
 
+## Showing that it trained
+
+Throughput is only half the goal: a run that generates fast and learns nothing
+has not helped. The golden command carries `--ladder-games 0`, so the strength
+check is a separate step over the snapshots the run saved:
+
+```bash
+python train/ladder.py runs/gpu_golden8 --games 30 --random-draft --gpu \
+  --refs greedy,random
+```
+
+That is a round robin between every snapshot, Greedy and Random, fitted to one
+rating each. What it has to show is a curve that rises with training time and
+ends above Greedy -- `runs/v5_cardroute_s2_20m` is the shape to compare against,
+where ratings went +327, +371, +412, +453, +536 over twenty minutes with Greedy
+pinned at zero. A flat or non-monotone curve means the throughput was bought by
+breaking the data, and the run does not count.
+
 ## How to measure progress
 
 Three measurements, in increasing order of faithfulness and cost. Use the
