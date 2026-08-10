@@ -168,6 +168,10 @@ allowed, no overrun, zero dropped solves, zero exact CPU fallbacks, one oversize
 route and no card-exclusive routes. The first complete run of this lineage,
 `runs/gpu_golden`, was 1,023.5.
 
+And it learned: a 30-game round robin over its snapshots puts them at -91, +225,
++281, +473 and +593 Elo with Greedy at zero and Random at -210, strictly
+monotone in training time, with the final checkpoint beating Greedy 30-0.
+
 Nothing about the workload moved: random drafts, depth 2, 64 linear-CFR
 iterations, batch 1,024 at a four-to-one ratio, the same replay rows, targets,
 mirror augmentation, snapshot schedule and horizon-payoff schedule. What changed

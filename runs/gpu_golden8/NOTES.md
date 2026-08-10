@@ -47,6 +47,29 @@ waves, and since they all wait on the same card they went quiet together. An
 Nsight trace put 94% of both cards' idle time in gaps that all ended at the
 first kernel of a wave.
 
+## Did it learn
+
+Yes, and monotonically. A 30-game round robin over the run's snapshots plus
+Greedy and Random, with Greedy pinned at zero:
+
+| player | trained | Elo | score |
+|---|---:|---:|---:|
+| final | 29.0 min | **+593** | 0.906 |
+| s3 | 23.0 min | +473 | 0.806 |
+| s2 | 17.0 min | +281 | 0.611 |
+| s1 | 11.0 min | +225 | 0.550 |
+| greedy | - | 0 | 0.306 |
+| init (warm-only) | 5.0 min | -91 | 0.214 |
+| random | - | -210 | 0.108 |
+
+Every consecutive pair is ordered correctly. The final checkpoint beat Greedy
+30-0 and Random 29-0 with one draw, and beat the warm-only initial checkpoint
+30-0. The warm-only checkpoint itself loses to Greedy, which is the expected
+starting point: five minutes of fitting Greedy's values is not five minutes of
+learning to play. So the throughput was not bought by degrading the data --
+this is the fastest run of the project and also the strongest, going from below
+Greedy to nearly 600 Elo above it in twenty-five minutes.
+
 ## State of the project at this point
 
 Ten lanes per card, 36 builders with 128 game actors each, 32 solves in flight
