@@ -807,10 +807,64 @@ at most one batch of debt, and has zero drops or oracle regressions.
 
 ### 5. Golden run, then stretch
 
-Run the exact 30-minute command, write its `NOTES.md`, and run the ladder. Only
-after 1,200 is reproduced should the 2,000/s work begin: reduce host build cost
-toward 15 ms/solve, tune wave class capacities, test narrow indices, and then
-consider mixed-precision network GEMMs under their separate correctness gate.
+Done: `runs/gpu_golden8` is 1,315.4 balanced solves/s with a monotone ladder
+behind it. What to do next is below.
+
+## Where the next second comes from
+
+Read this before starting any performance work, because the constraint has
+moved and half the obvious ideas are already measured negatives.
+
+**The device is the limit now, not the host.** On the 180-second mature
+generation stream `wait_frac` is 0.45: builders spend nearly half their time
+waiting on a card. Host cost is 20.4 CPU-ms per solve, down from 30.7, and the
+remaining profile is flat -- compact leaf row 3.5 ms, draw transitions 2.9,
+serialization 2.9, nothing else above 1.9. There is no single host item worth a
+rewrite, and further host work currently shows up as idle builders rather than
+throughput. That is why the cheap interning hash and the non-allocating draw
+step measure as nothing: what they free cannot be used.
+
+So, in order:
+
+1. **Device work per solve.** About 1.45 ms of card time across both cards, with
+   the cards 77% busy. The kernel mix is roughly readout 20%, backprop sweep 19%,
+   reach sweep 15%, head entry 12%, belief sums 12%, GEMMs 10% -- so the network
+   is *not* where the time goes; the sparse sweeps and the per-config gathers
+   are. The readout was rewritten one config per lane for +2.6% because it spent
+   a five-step shuffle reduction per config; `belief_sums` walks the same
+   (row, config) pairs and deserves the same question. Do **not** retry FP16 for
+   the `Z`/`G` config tables: a solve interns only ~200 distinct configs, so
+   those tables are about a megabyte per wave and already L2-resident, which is
+   why the earlier attempt measured -0.7%.
+
+2. **The trainer's share of its card.** A high-priority stream took an optimizer
+   step from ~240 ms back toward its uncontended 72-101, and that alone was
+   worth 14% in the mature state -- but the trainer still owns a real fraction
+   of GPU 1. Step 4 above (device replay ring, graph-captured step) is the
+   remaining piece. `WARCHEST_WAVE_LANES` now takes a per-device list; 12/6 was
+   far too extreme, and something like 10/8 is untested.
+
+3. **The host, only if it becomes binding again.** In order: the compact leaf
+   row, the draw transitions, serialization, and flattening `TNode`'s fourteen
+   per-node vectors into solver-level arenas.
+
+### Measured negatives — do not repeat these
+
+* merging the wave cost classes: +14% on the frozen tape, 5% *worse* live;
+* a deeper in-flight window (64 or 80 per builder): better on the
+  generation-only stream, and a collapse to 425 solves/s with the trainer
+  present, because it doubles the trees retained on the host;
+* twelve lanes per card: best on the generation-only stream, out of card memory
+  within ten minutes once the trainer shares it;
+* cooperative sweep grid sizes (1-8 blocks per SM): flat;
+* mimalloc as a Rust `#[global_allocator]`: exhausts the static TLS block and
+  torch then cannot load libgomp. jemalloc via `LD_PRELOAD` is worth ~4%;
+* keeping the training loss on the device without also prefetching the next
+  batch: the step is GPU-bound, so removing one sync alone changes nothing.
+
+The first three of those all share a shape: they were measured on a benchmark
+with no trainer and a horizon too short to feel retained memory. Measure with
+`tools/v5_steady.sh`, and compare at equal cumulative solves.
 
 ## Designs not to pursue first
 
