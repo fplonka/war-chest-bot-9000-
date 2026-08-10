@@ -968,11 +968,10 @@ impl Executor {
     ) -> Result<(), String> {
         let l = &bank.layout;
         let rows = d.host.rows as usize;
-        // Production has no extra head MLP. Keep the residual sum in FP32
-        // through LayerNorm, then store only the operands that the next
-        // tensor-core GEMM would down-convert anyway. This avoids repeated
-        // cuBLAS conversion and halves the dynamic belief/head traffic without
-        // introducing the unstable pre-LayerNorm rounding point.
+        // Production has no extra head MLP. Retain the dynamic GEMM output and
+        // static public residual in FP16, then expand them to form the residual
+        // sum and all LayerNorm reductions in FP32. The following tensor-core
+        // GEMM consumes the post-ReLU value directly as FP16 as well.
         if fast_gemm() && l.hmlp.is_empty() {
             launch!(
                 self,
@@ -983,7 +982,7 @@ impl Executor {
                 traverser as i32,
                 both as i32
             )?;
-            gemm_f16(
+            gemm_f16_to_f16(
                 &self.blas,
                 rows,
                 l.head_in,
@@ -992,7 +991,7 @@ impl Executor {
                 2 * l.dg,
                 bank.w16_ptr(l.wb),
                 l.head_in,
-                d.ptr_mut(Arena::H),
+                d.ptr_mut(Arena::H).cast(),
                 l.head_in,
             )?;
             launch!(self, d, bank, head_entry_f16, warps(rows))?;
@@ -1675,7 +1674,11 @@ fn arena_layout(w: &Wave, l: &V3Layout) -> Result<([u64; N_ARENAS], usize), Stri
         } else {
             rows * 2 * l.dg
         },
-        rows * h_stride(l),
+        if fast_head {
+            (rows * l.head_in).div_ceil(2)
+        } else {
+            rows * h_stride(l)
+        },
         if fast_head {
             (rows * l.head_in).div_ceil(2)
         } else {
@@ -2018,6 +2021,53 @@ fn gemm_f16(
         )
     }
     .map_err(|e| format!("cuBLAS FP16 GEMM {m}x{k}x{n}: {e:?}"))?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemm_f16_to_f16(
+    blas: &CudaBlas,
+    m: usize,
+    n: usize,
+    k: usize,
+    a: *const u16,
+    lda: usize,
+    b: *const u16,
+    ldb: usize,
+    c: *mut u16,
+    ldc: usize,
+) -> Result<(), String> {
+    if m == 0 || n == 0 || k == 0 {
+        return Ok(());
+    }
+    use cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F;
+    use cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+    use cudarc::cublas::sys::cudaDataType_t::CUDA_R_16F;
+    let (alpha, beta) = (1.0f32, 0.0f32);
+    unsafe {
+        cudarc::cublas::result::gemm_ex(
+            *blas.handle(),
+            CUBLAS_OP_N,
+            CUBLAS_OP_N,
+            n as i32,
+            m as i32,
+            k as i32,
+            (&alpha as *const f32).cast(),
+            b.cast(),
+            CUDA_R_16F,
+            ldb as i32,
+            a.cast(),
+            CUDA_R_16F,
+            lda as i32,
+            (&beta as *const f32).cast(),
+            c.cast(),
+            CUDA_R_16F,
+            ldc as i32,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        )
+    }
+    .map_err(|e| format!("cuBLAS FP16-output GEMM {m}x{k}x{n}: {e:?}"))?;
     Ok(())
 }
 

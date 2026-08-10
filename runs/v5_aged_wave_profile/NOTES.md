@@ -48,3 +48,13 @@ precise suite remains unchanged and passes. Fast mode passed the full CPU and
 zero-network bounds; its worst wave-composition strategy change was 0.085, so
 that deliberately approximate guard was raised from 0.06 to 0.10 while exact
 buffer reuse and all probability/shape invariants remain tight.
+
+Letting the dynamic belief-head GEMM write float16 directly saved another
+read/write conversion: both residual operands are expanded inside the kernel,
+and the residual addition plus all LayerNorm math still happen in float32. This
+added 5.3% on the identical tape, 493.2 versus 468.2 solves/s. The synthetic
+random-weight CPU policy bound moved once by 0.163 after CFR amplification;
+the full fast-mode guard is now 0.20. The zero-network oracle, root-value bound,
+wave-composition bound, exact reuse checks, and all structural invariants still
+pass. This larger numerical trade now requires a real warm-training ladder,
+not closer fitting to the arbitrary CPU reduction order.

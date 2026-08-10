@@ -616,7 +616,8 @@ extern "C" __global__ void head_entry_f16(const WaveDev* w, const WeightDev* wt)
     int lane = threadIdx.x & 31;
     int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     if (row >= w->rows) return;
-    const float* src = AP(w, A_H) + (unsigned long long)row * HEADW;
+    const half* src = reinterpret_cast<const half*>(AP(w, A_H))
+        + (unsigned long long)row * HEADW;
     half* dst = reinterpret_cast<half*>(AP(w, A_H2))
         + (unsigned long long)row * HEADW;
     const half* add = reinterpret_cast<const half*>(AP(w, A_H0))
@@ -625,7 +626,9 @@ extern "C" __global__ void head_entry_f16(const WaveDev* w, const WeightDev* wt)
     #pragma unroll
     for (int k = 0; k < HEAD_CH; k++) {
         int j = (k << 5) + lane;
-        float v = j < HEADW ? src[j] + __half2float(add[j]) : 0.0f;
+        float v = j < HEADW
+            ? __half2float(src[j]) + __half2float(add[j])
+            : 0.0f;
         x[k] = v;
         if (j < HEADW) sum += v;
     }
