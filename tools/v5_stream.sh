@@ -38,6 +38,12 @@ finish() {
 }
 trap finish EXIT INT TERM
 
+# Building one depth-2 subgame allocates roughly nine thousand small vectors --
+# fourteen per tree node -- and glibc's allocator handles that badly from forty
+# threads at once. jemalloc is worth about 4% end to end on the mature stream.
+# It cannot be a Rust #[global_allocator]: mimalloc there exhausts the static
+# TLS block and torch then fails to load libgomp.
+export LD_PRELOAD=${LD_PRELOAD:-/usr/lib/x86_64-linux-gnu/libjemalloc.so.2}
 set -o pipefail
 env WARCHEST_DIRECT=1 \
     WARCHEST_WAVE_LANES=${V5_LANES:-5} \
