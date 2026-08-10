@@ -66,6 +66,41 @@ optimizer samples at the end--256 solves at a ratio of four. It also requires
 zero games dropped because a valid job did not fit the GPU service and all
 correctness gates in `docs/GPU_ARCHITECTURE.md` to pass.
 
+## Precision is a free variable
+
+**Matching the CPU oracle bit for bit is not a requirement and never was.** Use
+whatever arithmetic the hardware is fastest at: FP16 or BF16 inputs, TF32,
+tensor cores, fused multiply-add, `--use_fast_math`, a reassociated reduction, a
+different GEMM tile for a different batch shape. The production path already
+runs FP16-input GEMMs with FP32 accumulation and NVRTC fast math, and the
+readout's rank-64 dot changed summation order when it was rewritten one config
+per lane.
+
+What *is* required is that the answers stay right, which is a different claim
+and is established a different way:
+
+- structural invariants -- probabilities normalise, indices stay in range,
+  nothing is NaN or infinite;
+- the all-zero-network oracle, which is exact under any arithmetic because
+  every leaf value is zero, and which therefore still pins scheduling,
+  indexing and wave composition to the last bit;
+- bounded comparisons against the CPU reference on real weights, with a
+  tolerance, not an equality;
+- the wave-composition check: a tree solved alone and the same tree solved
+  beside others must agree, so a result may not depend on what it was batched
+  with;
+- and the gates that actually matter to the model -- target mean and standard
+  deviation, `solvererr` against a converged reference, frozen-offline
+  learnability, and the post-run ladder.
+
+Regret matching is iterative, so a last-bit difference at a leaf can amplify
+into a visibly different policy after 64 iterations. That is numerical
+sensitivity, not a bug, and a bounded comparison is the right instrument for
+it. Do not spend effort making batch shapes bit-identical, and do not select a
+slower kernel to make an equality test pass; if a precision change costs
+measurable end-to-end throughput, revert it for that reason alone, as the two
+TF32 experiments were.
+
 Unless an explicit algorithm experiment says otherwise, the golden run is
 seed 1 with the ordinary network and optimizer settings:
 
