@@ -91,11 +91,35 @@ horizon's marker payoff `cap_value` is 0.04, the same size as the offset, and
 golden8 annealed it to zero with only ~13 minutes of training left to unlearn
 it. Not tested.
 
-The cheap candidate fix is a projection: the constraint is one linear equation
+**What kind of error it is.** The violation correlates **+0.67** with
+`(v_0 - v_1)/2` — how far ahead player 0 is — but **-0.05** with the *magnitude*
+of that lead. A symmetric miscalibration would show the opposite pattern. What
+fits is a difference in value *scale* between the two seats: the network reads
+the leader's advantage on a slightly different ruler depending on which seat the
+leader is in. It is also concentrated early: averaged over fifths of a dump in
+play order the violation runs 0.088, 0.088, 0.074, 0.011, -0.010, fading to
+nothing near terminal positions where the actual win pins the value and the
+network has no room to be inconsistent. Which is to say it is largest exactly
+where the search depends on the network most.
+
+`search.rs` already knew the violation exists — `Conv::zero_sum` documents it
+and correctly says it is a property of the network rather than a bug in the
+solver. What was missing was its size relative to the signal, which is what
+makes it worth acting on rather than noting.
+
+The cheap candidate fix is a projection. The constraint is one linear equation
 per position, so subtracting half the violation from both players' values lands
-on the antisymmetric subspace, which contains the truth and so cannot increase
-error. Untested — it needs the leaf evaluation to change, and it should be an
-experiment arm, not a silent change.
+on the antisymmetric subspace — which contains the truth, and so cannot increase
+error. Better than that, it makes `V = (v_0 - v_1)/2` an *average of two
+estimates of the same quantity*, which should cut independent noise as well as
+bias. Note it shifts every config of a row by one constant, so it changes the
+value *level* of a state without touching how the network discriminates configs
+within it, and the level is exactly what CFR compares across a subgame.
+
+Not implemented. It belongs in the leaf evaluation inside the CFR loop, where
+the belief weights move every iteration, so it is a hot-path change that wants
+doing deliberately and with the parity tests in front of it — not at 2am on the
+back of one measurement.
 
 ## What this does not answer
 
