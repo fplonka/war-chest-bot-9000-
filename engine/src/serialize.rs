@@ -199,7 +199,7 @@ impl WorkVector {
     /// This rarer tail cannot coexist with the ordinary buffers retained by
     /// the other lanes on a 24 GiB card. Drain and trim one card around it.
     pub fn requires_card_exclusive_route(self) -> bool {
-        self.reserved_bytes() >= (6usize << 30)
+        self.mutable_bytes >= (4usize << 30) || self.reserved_bytes() >= (6usize << 30)
     }
 }
 
@@ -1284,12 +1284,20 @@ mod tests {
         assert!(!ordinary.requires_card_exclusive_route());
 
         let lane_whale = WorkVector {
-            mutable_bytes: 4usize << 30,
-            table_bytes: 1,
+            mutable_bytes: 2usize << 30,
+            table_bytes: (1usize << 30) + 1,
             ..Default::default()
         };
         assert!(lane_whale.requires_exclusive_route());
         assert!(!lane_whale.requires_card_exclusive_route());
+
+        let arena_whale = WorkVector {
+            mutable_bytes: 4usize << 30,
+            table_bytes: 1,
+            ..Default::default()
+        };
+        assert!(arena_whale.requires_exclusive_route());
+        assert!(arena_whale.requires_card_exclusive_route());
 
         let card_whale = WorkVector {
             mutable_bytes: 4usize << 30,

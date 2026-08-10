@@ -135,11 +135,12 @@ fn dispatcher(
                 reply,
             } => {
                 if work.requires_card_exclusive_route() {
-                    // A power-of-two 8 GiB (or larger) arena cannot coexist
-                    // with the ordinary buffers on a 24 GiB card. This tail
+                    // A 4 GiB contiguous mutable arena, or a 6 GiB combined
+                    // reservation, cannot reliably coexist with the ordinary
+                    // retained buffers and trainer on a 24 GiB card. This tail
                     // is rare: drain and trim the card, run it on lane 0, and
-                    // let that lane trim its giant buffers before admission
-                    // resumes. Common 4 GiB whales stay lane-local.
+                    // trim again before admission resumes. Common whales made
+                    // from a smaller arena plus tables stay lane-local.
                     while lane_work.iter().any(|x| x.load(Ordering::Acquire) != 0) {
                         std::thread::sleep(Duration::from_millis(1));
                     }
