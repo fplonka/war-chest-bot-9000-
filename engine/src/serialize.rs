@@ -196,10 +196,16 @@ impl WorkVector {
         self.reserved_bytes() >= (4usize << 30)
     }
 
-    /// This rarer tail cannot coexist with the ordinary buffers retained by
-    /// the other lanes on a 24 GiB card. Drain and trim one card around it.
+    /// A four-GiB contiguous arena needs extra headroom, but can still run
+    /// beside three ordinary lanes after one helper lane is trimmed.
+    pub fn requires_arena_guard_route(self) -> bool {
+        self.mutable_bytes >= (4usize << 30) && !self.requires_card_exclusive_route()
+    }
+
+    /// This rarer tail needs at least six GiB by itself. Drain and trim the
+    /// whole card around it rather than risking an allocator failure.
     pub fn requires_card_exclusive_route(self) -> bool {
-        self.mutable_bytes >= (4usize << 30) || self.reserved_bytes() >= (6usize << 30)
+        self.reserved_bytes() >= (6usize << 30)
     }
 }
 
@@ -1316,6 +1322,7 @@ mod tests {
             ..Default::default()
         };
         assert!(!ordinary.requires_exclusive_route());
+        assert!(!ordinary.requires_arena_guard_route());
         assert!(!ordinary.requires_card_exclusive_route());
 
         let lane_whale = WorkVector {
@@ -1324,6 +1331,7 @@ mod tests {
             ..Default::default()
         };
         assert!(lane_whale.requires_exclusive_route());
+        assert!(!lane_whale.requires_arena_guard_route());
         assert!(!lane_whale.requires_card_exclusive_route());
 
         let arena_whale = WorkVector {
@@ -1332,7 +1340,8 @@ mod tests {
             ..Default::default()
         };
         assert!(arena_whale.requires_exclusive_route());
-        assert!(arena_whale.requires_card_exclusive_route());
+        assert!(arena_whale.requires_arena_guard_route());
+        assert!(!arena_whale.requires_card_exclusive_route());
 
         let card_whale = WorkVector {
             mutable_bytes: 4usize << 30,
@@ -1340,6 +1349,7 @@ mod tests {
             ..Default::default()
         };
         assert!(card_whale.requires_exclusive_route());
+        assert!(!card_whale.requires_arena_guard_route());
         assert!(card_whale.requires_card_exclusive_route());
     }
 

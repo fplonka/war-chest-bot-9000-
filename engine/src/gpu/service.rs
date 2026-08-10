@@ -137,12 +137,9 @@ fn dispatcher(
             } => {
                 if work.requires_card_exclusive_route() {
                     let route_started = Instant::now();
-                    // A 4 GiB contiguous mutable arena, or a 6 GiB combined
-                    // reservation, cannot reliably coexist with the ordinary
-                    // retained buffers and trainer on a 24 GiB card. This tail
-                    // is rare: drain and trim the card, run it on lane 0, and
-                    // trim again before admission resumes. Common whales made
-                    // from a smaller arena plus tables stay lane-local.
+                    // A six-GiB (or larger) reservation cannot reliably coexist
+                    // with ordinary retained buffers and the trainer. Drain
+                    // and trim the whole card around this rare tail.
                     while lane_work.iter().any(|x| x.load(Ordering::Acquire) != 0) {
                         std::thread::sleep(Duration::from_millis(1));
                     }
@@ -178,6 +175,63 @@ fn dispatcher(
                             .unwrap_or(work.table_bytes);
                         eprintln!(
                             "v5_card_route device={device} mutable_mib={:.1} table_mib={:.1} reserved_mib={:.1} drain_ms={:.1} trim_ms={:.1} solve_ms={:.1}",
+                            work.mutable_bytes as f64 / 1048576.0,
+                            table_reserved as f64 / 1048576.0,
+                            work.mutable_bytes.saturating_add(table_reserved) as f64 / 1048576.0,
+                            1e3 * (drained_at - route_started).as_secs_f64(),
+                            1e3 * (trimmed_at - drained_at).as_secs_f64(),
+                            1e3 * trimmed_at.elapsed().as_secs_f64(),
+                        );
+                    }
+                    continue;
+                }
+                if work.requires_arena_guard_route() {
+                    let route_started = Instant::now();
+                    // A four-GiB contiguous allocation failed when all five
+                    // lanes retained large buffers. Free the selected whale
+                    // lane plus one least-busy helper, but let the other three
+                    // lanes continue. The whale lane trims again after solve.
+                    let guarded = arena_guard_lanes(&lane_work, whale_lanes);
+                    while guarded
+                        .iter()
+                        .any(|&i| lane_work[i].load(Ordering::Acquire) != 0)
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    let drained_at = Instant::now();
+                    if let Err(e) = trim_lanes(guarded.iter().map(|&i| &senders[i])) {
+                        queued_work.fetch_sub(cost, Ordering::Relaxed);
+                        let _ = reply.send((tag, Err(e)));
+                        continue;
+                    }
+                    let trimmed_at = Instant::now();
+                    let lane = guarded[0];
+                    lane_work[lane].fetch_add(cost, Ordering::Release);
+                    if let Err(e) = senders[lane].send(Cmd::Submit {
+                        job,
+                        work,
+                        tag,
+                        cost,
+                        reply,
+                    }) {
+                        lane_work[lane].fetch_sub(cost, Ordering::Release);
+                        queued_work.fetch_sub(cost, Ordering::Relaxed);
+                        if let Cmd::Submit { tag, reply, .. } = e.0 {
+                            let _ = reply.send((tag, Err("GPU guarded-wave lane is gone".into())));
+                        }
+                        continue;
+                    }
+                    while lane_work[lane].load(Ordering::Acquire) != 0 {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    if route_profile {
+                        let table_reserved = work
+                            .table_bytes
+                            .checked_next_power_of_two()
+                            .unwrap_or(work.table_bytes);
+                        eprintln!(
+                            "v5_arena_guard device={device} lane={lane} helper={} mutable_mib={:.1} table_mib={:.1} reserved_mib={:.1} drain_ms={:.1} trim_ms={:.1} solve_ms={:.1}",
+                            guarded.get(1).copied().unwrap_or(lane),
                             work.mutable_bytes as f64 / 1048576.0,
                             table_reserved as f64 / 1048576.0,
                             work.mutable_bytes.saturating_add(table_reserved) as f64 / 1048576.0,
@@ -242,7 +296,7 @@ fn dispatcher(
     }
 }
 
-fn trim_lanes(senders: &[mpsc::Sender<Cmd>]) -> Result<(), String> {
+fn trim_lanes<'a>(senders: impl IntoIterator<Item = &'a mpsc::Sender<Cmd>>) -> Result<(), String> {
     for tx in senders {
         let (done_tx, done_rx) = mpsc::sync_channel(0);
         tx.send(Cmd::Trim { ready: done_tx })
@@ -374,13 +428,14 @@ fn run(
                 p.cost,
                 p.work.requires_exclusive_route(),
                 p.work.requires_card_exclusive_route(),
+                p.work.requires_arena_guard_route(),
             ));
         }
         let pack_started = Instant::now();
         let packed = Wave::pack(&jobs);
         let packed_at = Instant::now();
         let result = packed.and_then(|wave| exec.solve(wave, version));
-        let result = if tickets[0].4 {
+        let result = if tickets[0].4 || tickets[0].5 {
             result.and_then(|values| {
                 exec.trim()?;
                 Ok(values)
@@ -402,7 +457,7 @@ fn run(
         }
         match result {
             Ok(results) if results.len() == count => {
-                for ((tag, reply, cost, oversize, card), mut value) in
+                for ((tag, reply, cost, oversize, card, _), mut value) in
                     tickets.into_iter().zip(results)
                 {
                     value.oversize_route = oversize;
@@ -418,14 +473,14 @@ fn run(
                     results.len(),
                     count
                 );
-                for (tag, reply, cost, _, _) in tickets {
+                for (tag, reply, cost, _, _, _) in tickets {
                     let _ = reply.send((tag, Err(e.clone())));
                     queued_work.fetch_sub(cost, Ordering::Relaxed);
                     lane_work.fetch_sub(cost, Ordering::Relaxed);
                 }
             }
             Err(e) => {
-                for (tag, reply, cost, _, _) in tickets {
+                for (tag, reply, cost, _, _, _) in tickets {
                     let _ = reply.send((tag, Err(e.clone())));
                     queued_work.fetch_sub(cost, Ordering::Relaxed);
                     lane_work.fetch_sub(cost, Ordering::Relaxed);
@@ -544,6 +599,18 @@ fn dispatch_lane(lane_work: &[Arc<AtomicU64>], whale: bool, whale_lanes: usize) 
         .unwrap_or(0)
 }
 
+fn arena_guard_lanes(lane_work: &[Arc<AtomicU64>], whale_lanes: usize) -> Vec<usize> {
+    let target = dispatch_lane(lane_work, true, whale_lanes);
+    let mut out = vec![target];
+    if let Some(helper) = (0..lane_work.len())
+        .filter(|&i| i != target)
+        .min_by_key(|&i| lane_work[i].load(Ordering::Relaxed))
+    {
+        out.push(helper);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,6 +624,8 @@ mod tests {
         assert_eq!(dispatch_lane(&lanes, true, 1), 0);
         assert_eq!(dispatch_lane(&lanes, true, 2), 1);
         assert_eq!(dispatch_lane(&lanes, false, 1), 1);
+        assert_eq!(arena_guard_lanes(&lanes, 1), vec![0, 1]);
+        assert_eq!(arena_guard_lanes(&lanes, 2), vec![1, 2]);
     }
 }
 
