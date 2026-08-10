@@ -86,7 +86,11 @@ fn dispatcher(
     ready: mpsc::Sender<Result<(), String>>,
     queued_work: Arc<AtomicU64>,
 ) {
-    let lanes = env_usize("WARCHEST_WAVE_LANES", 2).clamp(1, 12);
+    // Per-device, because one card also runs the trainer: with ten solve
+    // lanes beside it an optimizer step costs about 240 ms against 72-101 ms
+    // measured alone, and that contention comes straight back out of
+    // generation. `WARCHEST_WAVE_LANES=12,6` gives the free card more lanes.
+    let lanes = env_list("WARCHEST_WAVE_LANES", device, 2).clamp(1, 12);
     let whale_lanes = env_usize("WARCHEST_WAVE_WHALE_LANES", 1).clamp(1, lanes);
     let route_profile = std::env::var_os("WARCHEST_ROUTE_PROFILE").is_some();
     let (lane_ready_tx, lane_ready_rx) = mpsc::channel();
@@ -1031,6 +1035,24 @@ mod tests {
         release_route_target(&state, second);
         assert_eq!(state.lock().unwrap().blocked, vec![false, false, false]);
     }
+}
+
+/// Read a per-device setting: one value, or a comma-separated list indexed by
+/// device with the last entry covering any further cards.
+fn env_list(name: &str, device: usize, default: usize) -> usize {
+    let Ok(raw) = std::env::var(name) else {
+        return default;
+    };
+    let parts: Vec<usize> = raw
+        .split(',')
+        .filter_map(|x| x.trim().parse().ok())
+        .collect();
+    if parts.is_empty() {
+        return default;
+    }
+    *parts
+        .get(device)
+        .unwrap_or(parts.last().expect("non-empty"))
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
