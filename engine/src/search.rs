@@ -367,7 +367,12 @@ pub fn node_actions(
 }
 
 pub struct TNode {
-    pub s: State,
+    /// Terminal leaves only: the game's utility for `player`. The tree used to
+    /// keep the whole `State` here, 688 of a node's 1,136 bytes, for four read
+    /// sites -- this, the warm start's decision rows, and two debug asserts.
+    /// A mature subgame builds 2,039 nodes, so that was 1.4 MiB per solve
+    /// written and then never looked at.
+    pub util: f32,
     pub player: u8,
     pub leaf: bool,
     /// Draw pass-through node: the public tree does not branch, there is one
@@ -492,6 +497,41 @@ fn give_snaps(v: Vec<Vec<f32>>) {
     });
 }
 
+thread_local! {
+    /// One retired node array per thread. A `TNode` is about six hundred
+    /// bytes -- a `State`, a `DrawMap` and fourteen more vectors -- and a
+    /// mature subgame holds thousands of them, so a fresh `Vec` that doubles
+    /// from 640 memcpies the whole array several times per solve and
+    /// first-touches megabytes of new pages. That was 6.4 of the 27.3
+    /// CPU-milliseconds a mature solve costs, all of it inside `push`.
+    static NODE_POOL: std::cell::RefCell<Vec<Vec<TNode>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Retired arrays above this many nodes are dropped rather than kept: one
+/// pathological subgame near the 200,000-node cap should not pin hundreds of
+/// megabytes per builder thread for the rest of the run.
+const NODE_POOL_CAP: usize = 1 << 16;
+
+fn take_nodes() -> Vec<TNode> {
+    NODE_POOL.with(|b| b.borrow_mut().pop().unwrap_or_default())
+}
+
+fn give_nodes(mut v: Vec<TNode>) {
+    if v.capacity() == 0 || v.capacity() > NODE_POOL_CAP {
+        return;
+    }
+    // Cleared, not kept at length: the elements own heap of their own, and a
+    // retired solver must not hold it. Only the outer allocation is reused.
+    v.clear();
+    NODE_POOL.with(|b| {
+        let mut b = b.borrow_mut();
+        if b.len() < 2 {
+            b.push(v);
+        }
+    });
+}
+
 fn take_buf(role: usize) -> Vec<f32> {
     BUFS.with(|b| b.borrow_mut()[role].pop().unwrap_or_default())
 }
@@ -583,6 +623,11 @@ pub struct Solver<'a> {
     /// scales with the support, so it runs once per distinct config per solve.
     pub(crate) cphi: Vec<f32>,
     pub(crate) cmap: std::collections::HashMap<u64, u32>,
+    /// Decision-node states, kept only for a warm start's policy rows.
+    warm_states: Vec<(usize, State)>,
+    /// Whether the root is a normal coin-play choice, which is all the policy
+    /// label's assertion needed the root's state for.
+    pub root_mainplay: bool,
     /// How many distinct configs `cphi` actually holds. Pooled buffers keep
     /// their length across solves, so the count cannot be read off `cphi.len()`.
     pub ncfg: usize,
@@ -650,6 +695,7 @@ impl Drop for Solver<'_> {
             give_buf(role, std::mem::take(v));
         }
         give_snaps(std::mem::take(&mut self.snaps));
+        give_nodes(std::mem::take(&mut self.nodes));
     }
 }
 
@@ -677,7 +723,7 @@ impl<'a> Solver<'a> {
             ctx,
             nets,
             cfg,
-            nodes: Vec::new(),
+            nodes: take_nodes(),
             root_belief: belief,
             regret: Vec::new(),
             cur: Vec::new(),
@@ -700,6 +746,8 @@ impl<'a> Solver<'a> {
             leaf_coff: Vec::new(),
             cphi: take_buf(R_CPHI),
             cmap: std::collections::HashMap::new(),
+            warm_states: Vec::new(),
+            root_mainplay: false,
             ncfg: 0,
             cz: take_buf(R_CZ),
             cg: take_buf(R_CG),
@@ -735,6 +783,7 @@ impl<'a> Solver<'a> {
             sv.vals.reserve(640);
             sv.regret.reserve(640);
             sv.cur.reserve(640);
+            sv.root_mainplay = matches!(root.pending(), Cont::MainPlay);
             sv.build(root.clone(), cfg.depth.max(1), cfgs);
         }
         let _t = timed!(ALLOC);
@@ -904,7 +953,11 @@ impl<'a> Solver<'a> {
         let id = self.nodes.len();
         let _tp = timed!(BPUSH);
         self.nodes.push(TNode {
-            s: s.clone(),
+            util: if leaf && s.is_terminal() {
+                s.utility(player as usize)
+            } else {
+                0.0
+            },
             player,
             leaf,
             chance: false,
@@ -998,6 +1051,11 @@ impl<'a> Solver<'a> {
             return id;
         }
 
+        // Only a warm start needs a decision node's state after the build, and
+        // it needs them in node order, which is push order.
+        if self.cfg.warm > 0.0 {
+            self.warm_states.push((id, s));
+        }
         let me = player as usize;
         let mine = cfgs[me].clone();
         let nc = mine.len();
@@ -1010,6 +1068,7 @@ impl<'a> Solver<'a> {
         // A Warrior Priest forced play may only spend the pending coin, so the
         // per-config mask is the pending match rather than the hand check.
         let wp_play = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
+        let tcells = timed!(BCELLS);
         let mut legal_off = Vec::with_capacity(nc + 1);
         let mut legal_action = Vec::new();
         let mut legal_child = Vec::new();
@@ -1033,7 +1092,10 @@ impl<'a> Solver<'a> {
             legal_off.push(legal_action.len() as u32);
         }
 
+        drop(tcells);
+
         // Group private actions by what the opponent actually observes.
+        let tobs = timed!(BOBS);
         let mut obs_keys: Vec<u32> = Vec::new();
         let mut obs_child = vec![0usize; na];
         for a in 0..na {
@@ -1085,6 +1147,8 @@ impl<'a> Solver<'a> {
             *at += 1;
         }
 
+        drop(tobs);
+
         // Config support of each public child — the union over the private
         // actions that produce that observation — and, in the same pass, where
         // each (config, action) cell lands in it.
@@ -1093,6 +1157,7 @@ impl<'a> Solver<'a> {
         // ordering is what the draw transitions do, and for the same reason:
         // the obvious version sorts `Config`s and then binary-searches one per
         // cell, which at ~800 cells per decision node is most of the build.
+        let tsup = timed!(BSUP);
         let mut child_cfgs: Vec<Vec<Config>> = vec![Vec::new(); nch];
         let mut ent = std::mem::take(&mut self.cell_order);
         for ch in 0..nch {
@@ -1125,6 +1190,7 @@ impl<'a> Solver<'a> {
             }
         }
         self.cell_order = ent;
+        drop(tsup);
 
         // One world per public child, built from any config that can produce
         // it: the public projection of the successor is the same either way.
@@ -1407,17 +1473,16 @@ impl<'a> Solver<'a> {
         // tower pass and the one config-tower pass, instead of running their own
         // of each. Nothing is pushed when the warm start is off.
         if self.cfg.warm > 0.0 {
-            for i in 0..self.nodes.len() {
-                if self.nodes[i].leaf || self.nodes[i].chance {
-                    continue;
-                }
+            let states = std::mem::take(&mut self.warm_states);
+            for &(i, ref st) in &states {
                 // The policy head is read only at normal coin-play choices.
-                if !matches!(self.nodes[i].s.pending(), Cont::MainPlay) {
+                if !matches!(st.pending(), Cont::MainPlay) {
                     continue;
                 }
-                self.push_row(i, &self.nodes[i].s.clone(), &self.nodes[i].cfgs.clone());
+                self.push_row(i, st, &self.nodes[i].cfgs.clone());
                 self.inner_rows.push(i);
             }
+            self.warm_states = states;
         }
         self.leaf_coff.push(self.leaf_cidx.len() as u32);
         let (leaves, rows) = (
@@ -1585,7 +1650,13 @@ impl<'a> Solver<'a> {
         for k in 0..self.term_leaves.len() {
             let i = self.term_leaves[k];
             let opp_reach: f32 = self.reach_of(i, opp).iter().sum();
-            let u = self.nodes[i].s.utility(p);
+            // Zero-sum by construction (`state::horizon_tests`), so one
+            // stored value serves both seats.
+            let u = if p == self.nodes[i].player as usize {
+                self.nodes[i].util
+            } else {
+                -self.nodes[i].util
+            };
             let n = self.nc[i][p] as usize;
             let vo = self.voff[i] as usize;
             self.vals[vo..vo + n].fill(u * opp_reach);

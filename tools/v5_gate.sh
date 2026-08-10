@@ -38,7 +38,7 @@ trap 'kill $monitor $cpu 2>/dev/null || true' EXIT INT TERM
 # TLS block and torch then fails to load libgomp.
 export LD_PRELOAD=${LD_PRELOAD:-/usr/lib/x86_64-linux-gnu/libjemalloc.so.2}
 export WARCHEST_DIRECT=1
-export WARCHEST_WAVE_LANES=${V5_LANES:-12}
+export WARCHEST_WAVE_LANES=${V5_LANES:-10}
 export WARCHEST_WAVE_WHALE_LANES=${V5_WHALE_LANES:-1}
 export WARCHEST_WAVE_ROWS=${V5_WAVE_ROWS:-196608}
 export WARCHEST_WAVE_JOBS=${V5_WAVE_JOBS:-256}
@@ -55,10 +55,11 @@ python -u train/train.py \
     --explore 0.25 --temp 2 --eval-mix 0.5 \
     --cap-value 0.04 --anneal-frac 0.4 --snapshot-every 6 \
     --cap 2000000 --cfgs-per-row 48 \
-    --gpu --gpu-devices 0,1 --gpu-workers "${V5_WORKERS:-42}" \
-    --gpu-actors "${V5_ACTORS:-110}" --gpu-inflight "${V5_INFLIGHT:-80}" \
+    --gpu --gpu-devices 0,1 --gpu-workers "${V5_WORKERS:-36}" \
+    --gpu-actors "${V5_ACTORS:-128}" --gpu-inflight "${V5_INFLIGHT:-32}" \
     --gpu-chunk 1024 --gpu-drain-seconds "${V5_DRAIN:-20}" \
     --gpu-publish-steps 16 --device cuda:1 \
+    --train-stream-priority "${V5_TRAIN_PRIORITY:--1}" \
     ${V5_INIT:+--init "$V5_INIT"} \
     --seed "${V5_SEED:-1}" --ladder-games "${V5_LADDER:-0}" \
     --out "$run_dir" 2>&1 | tee "$run_dir/train.log"

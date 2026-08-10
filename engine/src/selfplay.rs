@@ -428,7 +428,7 @@ impl Data {
     /// `row` is the live-belief row, whose belief is the solve's own root.
     fn push_policy(&mut self, sv: &Solver, ctx: &Ctx, row: usize, player: u8) {
         debug_assert!(
-            matches!(sv.nodes[0].s.pending(), Cont::MainPlay),
+            sv.root_mainplay,
             "a policy label is the strategy at a normal coin-play root"
         );
         let n = &sv.nodes[0];

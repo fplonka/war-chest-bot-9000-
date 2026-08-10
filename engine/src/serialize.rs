@@ -870,11 +870,7 @@ impl PackedTables {
         t.leaf_rows = sv.leaf_rows.iter().map(|&i| i as u32).collect();
         t.inner_rows = sv.inner_rows.iter().map(|&i| i as u32).collect();
         t.term_leaves = sv.term_leaves.iter().map(|&i| i as u32).collect();
-        t.terminal_utility = sv
-            .term_leaves
-            .iter()
-            .map(|&i| sv.nodes[i].s.utility(sv.nodes[i].player as usize))
-            .collect();
+        t.terminal_utility = sv.term_leaves.iter().map(|&i| sv.nodes[i].util).collect();
         t.rows = sv.leaf_rows.len() + sv.inner_rows.len();
         t.n_inner = sv.inner_rows.len();
         // The batch sentinel is pushed by `ensure_leaf_batch`, which runs on

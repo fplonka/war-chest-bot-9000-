@@ -1083,6 +1083,12 @@ fn save_roots(
 /// invisible, and it is the part that has to fit in the CPU budget.
 #[pyfunction]
 fn prof_dump() {
+    eprintln!(
+        "  sizes: TNode {} B  State {} B",
+        std::mem::size_of::<crate::search::TNode>(),
+        std::mem::size_of::<crate::State>(),
+    );
+    crate::prof::dump_shape();
     crate::prof::dump();
 }
 

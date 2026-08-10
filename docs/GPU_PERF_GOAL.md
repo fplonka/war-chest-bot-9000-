@@ -191,6 +191,36 @@ anyway. It only pays once both are fixed.
 
 ## How to measure progress
 
+Three measurements, in increasing order of faithfulness and cost. Use the
+cheapest one that can see the effect, and never the fast one alone: three
+generation-side changes worth +31% on the aged stream moved the golden run by
+nothing at all, because the aged stream has no trainer.
+
+**`tools/v5_tape.sh`** — `engine/examples/wave_tape.rs` over a frozen root
+sample, 25 seconds, deterministic. It measures the wave executor with no game
+loop and no trainer. Good for attributing executor cost; bad for choosing,
+because it rewards changes the live system cannot use (merging the cost classes
+is +14% here and a 5% regression on a real workload).
+
+**`tools/v5_stream.sh`** — 180 seconds of live self-play from a late checkpoint
+with the horizon payoff at zero, no trainer. 4,608 games all reach the midgame
+together, so it is the heaviest generation-only workload. Good for scheduling
+and memory work.
+
+**`tools/v5_steady.sh`** — nine minutes of real `train.py` with the real
+trainer, but no Greedy warm-up, initialised from a late checkpoint, and
+`--cap-value 0`, so the expensive workload is present from about ninety seconds
+in instead of after ten minutes. This is the one that predicts a golden run.
+Repeats agree within about 2% at equal cumulative solves.
+
+Read all three with `tools/run_rate.py`, over a span of *solves* rather than
+wall time. Cost per solve grows as games leave the opening, so a faster build
+reaches the expensive positions sooner and its wall-time average converges back
+towards a slower build's: `runs/gpu_golden3` is 27% faster than `runs/gpu_golden`
+at 200,000 solves and ends at the same twenty-five-minute average.
+
+## Historical measurement notes
+
 `engine/examples/wave_tape.rs` accepts a flat weight file, a frozen roots file,
 a root count, and a duration. `WARCHEST_TAPE_DEVICES`,
 `WARCHEST_TAPE_PRODUCERS`, and `WARCHEST_TAPE_QUEUE` select the feeder setup;
