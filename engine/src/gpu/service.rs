@@ -63,6 +63,7 @@ fn dispatcher(
     queued_work: Arc<AtomicU64>,
 ) {
     let lanes = env_usize("WARCHEST_WAVE_LANES", 2).clamp(1, 5);
+    let whale_lanes = env_usize("WARCHEST_WAVE_WHALE_LANES", 1).clamp(1, lanes);
     let (lane_ready_tx, lane_ready_rx) = mpsc::channel();
     let mut senders = Vec::with_capacity(lanes);
     let mut joins = Vec::with_capacity(lanes);
@@ -167,14 +168,13 @@ fn dispatcher(
                     }
                     continue;
                 }
-                // Keep common 4 GiB whales on one lane. Sending each one to
-                // the currently emptiest lane eventually leaves every lane
-                // retaining a whale-sized buffer, which exhausts a 24 GiB
-                // card with five lanes even though every individual solve
-                // fits. Ordinary work may still use lane 0 while it is idle;
-                // its large queued cost naturally steers that work elsewhere
-                // while a whale is pending.
-                let lane = dispatch_lane(&lane_work, work.requires_exclusive_route());
+                // Keep common 4 GiB whales on a bounded set of lanes. Sending
+                // each one to the currently emptiest lane eventually leaves
+                // every lane retaining a whale-sized buffer, which exhausts a
+                // 24 GiB card even though every individual solve fits. One is
+                // the safe default; machines with headroom can opt into more.
+                // Ordinary work can still use these lanes while they are idle.
+                let lane = dispatch_lane(&lane_work, work.requires_exclusive_route(), whale_lanes);
                 lane_work[lane].fetch_add(cost, Ordering::Relaxed);
                 let cmd = Cmd::Submit {
                     job,
@@ -508,11 +508,13 @@ fn cost_class(w: WorkVector) -> u8 {
     }
 }
 
-fn dispatch_lane(lane_work: &[Arc<AtomicU64>], exclusive: bool) -> usize {
-    if exclusive {
-        return 0;
-    }
-    lane_work
+fn dispatch_lane(lane_work: &[Arc<AtomicU64>], whale: bool, whale_lanes: usize) -> usize {
+    let eligible = if whale {
+        &lane_work[..whale_lanes.min(lane_work.len())]
+    } else {
+        lane_work
+    };
+    eligible
         .iter()
         .enumerate()
         .min_by_key(|(_, x)| x.load(Ordering::Relaxed))
@@ -525,13 +527,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn whales_share_one_retained_buffer() {
+    fn whales_stay_on_their_bounded_lane_set() {
         let lanes = [9, 2, 5]
             .into_iter()
             .map(|x| Arc::new(AtomicU64::new(x)))
             .collect::<Vec<_>>();
-        assert_eq!(dispatch_lane(&lanes, true), 0);
-        assert_eq!(dispatch_lane(&lanes, false), 1);
+        assert_eq!(dispatch_lane(&lanes, true, 1), 0);
+        assert_eq!(dispatch_lane(&lanes, true, 2), 1);
+        assert_eq!(dispatch_lane(&lanes, false, 1), 1);
     }
 }
 
