@@ -242,13 +242,14 @@ fn dispatcher(
                     }
                     continue;
                 }
-                // Keep common 4 GiB whales on a bounded set of lanes. Sending
-                // each one to the currently emptiest lane eventually leaves
-                // every lane retaining a whale-sized buffer, which exhausts a
-                // 24 GiB card even though every individual solve fits. One is
-                // the safe default; machines with headroom can opt into more.
-                // Ordinary work can still use these lanes while they are idle.
-                let lane = dispatch_lane(&lane_work, work.requires_exclusive_route(), whale_lanes);
+                // Keep whale lanes free of ordinary backlog. They retain the
+                // largest buffers and must be immediately available when a
+                // guarded arena arrives; ordinary work uses the other lanes.
+                let lane = if work.requires_exclusive_route() {
+                    dispatch_whale_lane(&lane_work, whale_lanes)
+                } else {
+                    dispatch_general_lane(&lane_work, whale_lanes)
+                };
                 lane_work[lane].fetch_add(cost, Ordering::Relaxed);
                 let cmd = Cmd::Submit {
                     job,
@@ -585,22 +586,32 @@ fn cost_class(w: WorkVector) -> u8 {
     }
 }
 
-fn dispatch_lane(lane_work: &[Arc<AtomicU64>], whale: bool, whale_lanes: usize) -> usize {
-    let eligible = if whale {
-        &lane_work[..whale_lanes.min(lane_work.len())]
-    } else {
-        lane_work
-    };
+fn least_work_lane(lane_work: &[Arc<AtomicU64>], start: usize, end: usize) -> usize {
+    let end = end.min(lane_work.len());
+    let start = start.min(end);
+    let eligible = &lane_work[start..end];
     eligible
         .iter()
         .enumerate()
         .min_by_key(|(_, x)| x.load(Ordering::Relaxed))
-        .map(|(i, _)| i)
+        .map(|(i, _)| start + i)
         .unwrap_or(0)
 }
 
+fn dispatch_whale_lane(lane_work: &[Arc<AtomicU64>], whale_lanes: usize) -> usize {
+    least_work_lane(lane_work, 0, whale_lanes)
+}
+
+fn dispatch_general_lane(lane_work: &[Arc<AtomicU64>], whale_lanes: usize) -> usize {
+    if whale_lanes < lane_work.len() {
+        least_work_lane(lane_work, whale_lanes, lane_work.len())
+    } else {
+        least_work_lane(lane_work, 0, lane_work.len())
+    }
+}
+
 fn arena_guard_lanes(lane_work: &[Arc<AtomicU64>], whale_lanes: usize) -> Vec<usize> {
-    let target = dispatch_lane(lane_work, true, whale_lanes);
+    let target = dispatch_whale_lane(lane_work, whale_lanes);
     let mut out = vec![target];
     if let Some(helper) = (0..lane_work.len())
         .filter(|&i| i != target)
@@ -621,9 +632,9 @@ mod tests {
             .into_iter()
             .map(|x| Arc::new(AtomicU64::new(x)))
             .collect::<Vec<_>>();
-        assert_eq!(dispatch_lane(&lanes, true, 1), 0);
-        assert_eq!(dispatch_lane(&lanes, true, 2), 1);
-        assert_eq!(dispatch_lane(&lanes, false, 1), 1);
+        assert_eq!(dispatch_whale_lane(&lanes, 1), 0);
+        assert_eq!(dispatch_whale_lane(&lanes, 2), 1);
+        assert_eq!(dispatch_general_lane(&lanes, 1), 1);
         assert_eq!(arena_guard_lanes(&lanes, 1), vec![0, 1]);
         assert_eq!(arena_guard_lanes(&lanes, 2), vec![1, 2]);
     }
