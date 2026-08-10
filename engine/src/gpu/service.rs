@@ -567,9 +567,14 @@ fn run(
     let mut pending = VecDeque::new();
     let mut held = VecDeque::new();
     let mut shutdown = false;
+    // One wave's schedule stays queued on the card while the lane assembles
+    // the next one and answers the last one. Without this a lane went quiet
+    // between waves, and because every lane waits on the same card they went
+    // quiet together: that convoy was the whole of the cards' idle time.
+    let mut flight: Option<Flight> = None;
 
-    while !shutdown || !pending.is_empty() {
-        if pending.is_empty() && !shutdown {
+    while !shutdown || !pending.is_empty() || flight.is_some() {
+        if pending.is_empty() && !shutdown && flight.is_none() {
             match rx.recv() {
                 Ok(cmd) => handle(
                     cmd,
@@ -583,7 +588,7 @@ fn run(
                 Err(_) => shutdown = true,
             }
         }
-        if shutdown && pending.is_empty() {
+        if shutdown && pending.is_empty() && flight.is_none() {
             break;
         }
 
@@ -613,6 +618,10 @@ fn run(
         }
 
         let Some(seed) = pending.pop_front() else {
+            if let Some(flown) = flight.take() {
+                land(flown, &mut exec, device, lane, &queued_work, &lane_work);
+                retain_needed_banks(&mut exec, current_version, &pending, &held);
+            }
             continue;
         };
         let class = cost_class(seed.work);
@@ -681,58 +690,52 @@ fn run(
         }
         let pack_started = Instant::now();
         let packed = Wave::pack(&jobs);
-        let packed_at = Instant::now();
-        let result = packed.and_then(|wave| exec.solve(wave, version));
-        let result = if tickets[0].4 || tickets[0].5 {
-            result.and_then(|values| {
-                exec.trim()?;
-                Ok(values)
-            })
-        } else {
-            result
+        let pack_ms = 1e3 * pack_started.elapsed().as_secs_f64();
+        let exclusive = tickets[0].4 || tickets[0].5;
+        let shape = Shape {
+            device,
+            lane,
+            class,
+            count,
+            rows,
+            pack_ms,
+            launched: Instant::now(),
+            profile_shape,
         };
-        if let Some((cells, reach, reverse, table_bytes, mutable_bytes, max_bytes, oldest_ms)) =
-            profile_shape
-        {
-            eprintln!(
-                "v5_service device={device} lane={lane} class={class} jobs={count} rows={rows} cells={cells} reach={reach} reverse={reverse} table_mib={:.1} mutable_mib={:.1} max_job_mib={:.1} oldest_ms={oldest_ms:.2} pack_ms={:.2} solve_ms={:.2}",
-                table_bytes as f64 / 1048576.0,
-                mutable_bytes as f64 / 1048576.0,
-                max_bytes as f64 / 1048576.0,
-                1e3 * (packed_at - pack_started).as_secs_f64(),
-                1e3 * packed_at.elapsed().as_secs_f64(),
+        // `launch` needs the lane buffers the flying wave still owns, so the
+        // previous wave has to land first. Its results are unpacked and
+        // answered afterwards, by which time the card is busy again.
+        let landed = flight
+            .take()
+            .map(|flown| (exec.collect(flown.inflight), flown.tickets, flown.shape));
+        let launched = packed.and_then(|wave| exec.launch(wave, version));
+        match launched {
+            Ok(inflight) => {
+                flight = Some(Flight {
+                    inflight,
+                    tickets,
+                    shape,
+                });
+            }
+            Err(e) => answer(Err(e), tickets, shape, &queued_work, &lane_work),
+        }
+        if let Some((harvest, tickets, shape)) = landed {
+            answer(
+                harvest.and_then(|h| h.unpack()),
+                tickets,
+                shape,
+                &queued_work,
+                &lane_work,
             );
         }
-        match result {
-            Ok(results) if results.len() == count => {
-                for ((tag, reply, cost, oversize, card, _), mut value) in
-                    tickets.into_iter().zip(results)
-                {
-                    value.oversize_route = oversize;
-                    value.card_exclusive_route = card;
-                    let _ = reply.send((tag, Ok(value)));
-                    queued_work.fetch_sub(cost, Ordering::Relaxed);
-                    lane_work.fetch_sub(cost, Ordering::Relaxed);
-                }
+        // An exclusive wave owns the card by construction, and `trim` gives
+        // its arena straight back, so it is not pipelined.
+        if exclusive {
+            if let Some(flown) = flight.take() {
+                land(flown, &mut exec, device, lane, &queued_work, &lane_work);
             }
-            Ok(results) => {
-                let e = format!(
-                    "GPU wave returned {} results for {} jobs",
-                    results.len(),
-                    count
-                );
-                for (tag, reply, cost, _, _, _) in tickets {
-                    let _ = reply.send((tag, Err(e.clone())));
-                    queued_work.fetch_sub(cost, Ordering::Relaxed);
-                    lane_work.fetch_sub(cost, Ordering::Relaxed);
-                }
-            }
-            Err(e) => {
-                for (tag, reply, cost, _, _, _) in tickets {
-                    let _ = reply.send((tag, Err(e.clone())));
-                    queued_work.fetch_sub(cost, Ordering::Relaxed);
-                    lane_work.fetch_sub(cost, Ordering::Relaxed);
-                }
+            if let Err(e) = exec.trim() {
+                eprintln!("GPU lane {device}/{lane} trim after an exclusive wave failed: {e}");
             }
         }
         retain_needed_banks(&mut exec, current_version, &pending, &held);
@@ -743,6 +746,110 @@ fn run(
             Err("GPU lane shut down with a held route".into()),
         ));
         queued_work.fetch_sub(held.pending.cost, Ordering::Relaxed);
+    }
+}
+
+/// A wave whose schedule is queued on this lane's card, with everything
+/// needed to answer it once it lands.
+struct Flight {
+    inflight: super::device::InFlight,
+    tickets: Vec<Ticket>,
+    shape: Shape,
+}
+
+type Ticket = (
+    usize,
+    mpsc::Sender<(usize, Result<SolveResult, String>)>,
+    u64,
+    bool,
+    bool,
+    bool,
+);
+
+/// What the `WARCHEST_GPU_PROFILE` line reports about one wave.
+struct Shape {
+    device: usize,
+    lane: usize,
+    class: u8,
+    count: usize,
+    rows: usize,
+    pack_ms: f64,
+    launched: Instant,
+    #[allow(clippy::type_complexity)]
+    profile_shape: Option<(usize, usize, usize, usize, usize, usize, f64)>,
+}
+
+/// Wait for a flying wave and answer it. Used when there is no next batch to
+/// launch first, and before any command that needs the lane quiescent.
+fn land(
+    flown: Flight,
+    exec: &mut Executor,
+    _device: usize,
+    _lane: usize,
+    queued_work: &Arc<AtomicU64>,
+    lane_work: &Arc<AtomicU64>,
+) {
+    let result = exec.collect(flown.inflight).and_then(|h| h.unpack());
+    answer(result, flown.tickets, flown.shape, queued_work, lane_work);
+}
+
+fn answer(
+    result: Result<Vec<SolveResult>, String>,
+    tickets: Vec<Ticket>,
+    shape: Shape,
+    queued_work: &Arc<AtomicU64>,
+    lane_work: &Arc<AtomicU64>,
+) {
+    let (device, lane, class, count, rows) = (
+        shape.device,
+        shape.lane,
+        shape.class,
+        shape.count,
+        shape.rows,
+    );
+    if let Some((cells, reach, reverse, table_bytes, mutable_bytes, max_bytes, oldest_ms)) =
+        shape.profile_shape
+    {
+        eprintln!(
+            "v5_service device={device} lane={lane} class={class} jobs={count} rows={rows} cells={cells} reach={reach} reverse={reverse} table_mib={:.1} mutable_mib={:.1} max_job_mib={:.1} oldest_ms={oldest_ms:.2} pack_ms={:.2} solve_ms={:.2}",
+            table_bytes as f64 / 1048576.0,
+            mutable_bytes as f64 / 1048576.0,
+            max_bytes as f64 / 1048576.0,
+            shape.pack_ms,
+            1e3 * shape.launched.elapsed().as_secs_f64(),
+        );
+    }
+    match result {
+        Ok(results) if results.len() == count => {
+            for ((tag, reply, cost, oversize, card, _), mut value) in
+                tickets.into_iter().zip(results)
+            {
+                value.oversize_route = oversize;
+                value.card_exclusive_route = card;
+                let _ = reply.send((tag, Ok(value)));
+                queued_work.fetch_sub(cost, Ordering::Relaxed);
+                lane_work.fetch_sub(cost, Ordering::Relaxed);
+            }
+        }
+        Ok(results) => {
+            let e = format!(
+                "GPU wave returned {} results for {} jobs",
+                results.len(),
+                count
+            );
+            for (tag, reply, cost, _, _, _) in tickets {
+                let _ = reply.send((tag, Err(e.clone())));
+                queued_work.fetch_sub(cost, Ordering::Relaxed);
+                lane_work.fetch_sub(cost, Ordering::Relaxed);
+            }
+        }
+        Err(e) => {
+            for (tag, reply, cost, _, _, _) in tickets {
+                let _ = reply.send((tag, Err(e.clone())));
+                queued_work.fetch_sub(cost, Ordering::Relaxed);
+                lane_work.fetch_sub(cost, Ordering::Relaxed);
+            }
+        }
     }
 }
 

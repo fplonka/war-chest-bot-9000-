@@ -261,6 +261,68 @@ pub struct Executor {
     sweep_block: u32,
 }
 
+/// A wave whose schedule is queued on the lane's stream. It owns the lane's
+/// device buffers until `collect` synchronises, so nothing may reuse them.
+pub struct InFlight {
+    device: DeviceWave,
+    wave: Wave,
+    version: u64,
+    profile: bool,
+    started: Instant,
+    uploaded: Instant,
+    captured: Instant,
+    direct: bool,
+    graph_reused: bool,
+}
+
+/// A finished wave's raw device output, still to be turned into per-job
+/// results. Separating this from `collect` lets the lane launch the next wave
+/// before it does the unpacking.
+pub struct Harvest {
+    wave: Wave,
+    strategy: Vec<f32>,
+    root_values: Vec<f32>,
+    carries: Vec<u16>,
+    version: u64,
+    profile: bool,
+    started: Instant,
+    uploaded: Instant,
+    captured: Instant,
+    queued_output: Instant,
+    completed: Instant,
+    direct: bool,
+    graph_reused: bool,
+}
+
+impl Harvest {
+    pub fn unpack(self) -> Result<Vec<SolveResult>, String> {
+        let jobs = self.wave.jobs.len();
+        let rows = self.wave.row_node.len();
+        let cells = self.wave.legal_value.len();
+        let result = unpack(
+            self.wave,
+            self.strategy,
+            self.root_values,
+            self.carries,
+            self.version,
+        );
+        if self.profile {
+            let unpacked = Instant::now();
+            let (direct, reused) = (self.direct, self.graph_reused);
+            eprintln!(
+                "v5_device jobs={jobs} rows={rows} cells={cells} direct={direct} graph_reused={reused} upload_ms={:.2} capture_ms={:.2} queue_ms={:.2} gpu_ms={:.2} unpack_ms={:.2} total_ms={:.2}",
+                1e3 * (self.uploaded - self.started).as_secs_f64(),
+                1e3 * (self.captured - self.uploaded).as_secs_f64(),
+                1e3 * (self.queued_output - self.captured).as_secs_f64(),
+                1e3 * (self.completed - self.queued_output).as_secs_f64(),
+                1e3 * (unpacked - self.completed).as_secs_f64(),
+                1e3 * (unpacked - self.started).as_secs_f64(),
+            );
+        }
+        result
+    }
+}
+
 struct GraphExec {
     raw: sys::CUgraphExec,
 }
@@ -445,14 +507,16 @@ impl Executor {
         self.banks.retain(|version, _| keep.contains(version));
     }
 
-    pub fn solve(&mut self, wave: Wave, version: u64) -> Result<Vec<SolveResult>, String> {
+    /// Queue a wave's whole 64-iteration schedule and return without waiting
+    /// for any of it. The lane then has the card's service time to spend on
+    /// host work -- answering the previous wave and assembling the next one --
+    /// instead of standing idle between waves, which is where the cards' whole
+    /// remaining idle time sits.
+    pub fn launch(&mut self, wave: Wave, version: u64) -> Result<InFlight, String> {
         let profile = std::env::var_os("WARCHEST_GPU_PROFILE").is_some()
             || (std::env::var_os("WARCHEST_ROUTE_PROFILE").is_some()
                 && wave.work.requires_arena_guard_route());
         let started = Instant::now();
-        let profile_jobs = wave.jobs.len();
-        let profile_rows = wave.row_node.len();
-        let profile_cells = wave.legal_value.len();
         if wave.meta.warm > 0.0 {
             return Err("v5 FP32 baseline does not yet implement policy-head warm starts".into());
         }
@@ -564,6 +628,34 @@ impl Executor {
                 .map_err(|e| format!("launch v5 CUDA Graph: {e:?}"))?;
         }
 
+        Ok(InFlight {
+            device,
+            wave,
+            version,
+            profile,
+            started,
+            uploaded,
+            captured,
+            direct,
+            graph_reused: graph.is_some_and(|(_, reused)| reused),
+        })
+    }
+
+    /// Wait for a launched wave and take its results off the card. The result
+    /// copies are pageable, so issuing them here is what blocks until the
+    /// schedule finishes; that is the point at which the lane means to wait.
+    pub fn collect(&mut self, f: InFlight) -> Result<Harvest, String> {
+        let InFlight {
+            device,
+            wave,
+            version,
+            profile,
+            started,
+            uploaded,
+            captured,
+            direct,
+            graph_reused,
+        } = f;
         let strategy = copy_arena(
             &self.stream,
             &device,
@@ -581,21 +673,26 @@ impl Executor {
             .map_err(|e| format!("GPU wave completion: {e:?}"))?;
         let completed = Instant::now();
         self.buffers = Some(device.into_buffers());
-        let result = unpack(wave, strategy, root_values, carries, version);
-        if profile {
-            let unpacked = Instant::now();
-            let graph_reused = graph.is_some_and(|(_, reused)| reused);
-            eprintln!(
-                "v5_device jobs={profile_jobs} rows={profile_rows} cells={profile_cells} direct={direct} graph_reused={graph_reused} upload_ms={:.2} capture_ms={:.2} queue_ms={:.2} gpu_ms={:.2} unpack_ms={:.2} total_ms={:.2}",
-                1e3 * (uploaded - started).as_secs_f64(),
-                1e3 * (captured - uploaded).as_secs_f64(),
-                1e3 * (queued_output - captured).as_secs_f64(),
-                1e3 * (completed - queued_output).as_secs_f64(),
-                1e3 * (unpacked - completed).as_secs_f64(),
-                1e3 * (unpacked - started).as_secs_f64(),
-            );
-        }
-        result
+        Ok(Harvest {
+            wave,
+            strategy,
+            root_values,
+            carries,
+            version,
+            profile,
+            started,
+            uploaded,
+            captured,
+            queued_output,
+            completed,
+            direct,
+            graph_reused,
+        })
+    }
+
+    pub fn solve(&mut self, wave: Wave, version: u64) -> Result<Vec<SolveResult>, String> {
+        let f = self.launch(wave, version)?;
+        self.collect(f)?.unpack()
     }
 
     fn build_towers(&self, d: &DeviceWave, bank: &WeightBank) -> Result<(), String> {
