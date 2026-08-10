@@ -194,6 +194,13 @@ in the midgame at once, which is the heaviest workload the goal has to sustain
 | pipelined lane | 1,041.0 |
 | pooled node array, `State` out of `TNode` | 1,159.4 |
 | validation and clones off the hot paths | 1,167.9 |
+| one config per lane in the readout | 1,181.0 |
+
+By the last row the builders wait on the device 45% of the time, against 36%
+two rows earlier: the host is no longer the limit on this benchmark, and
+further host work shows up as idle builders rather than throughput. The cheap
+hasher for config interning and the non-allocating draw step are in the last two
+rows and are invisible in the total for exactly that reason.
 
 The last row is the point of the whole exercise: a deeper in-flight window had
 measured nothing at every earlier build, because the memory it needed did not
