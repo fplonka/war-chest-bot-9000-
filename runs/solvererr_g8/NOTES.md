@@ -53,16 +53,49 @@ therefore 2–3x the data in a fixed wall clock. Since `runs/gpu_golden8` was
 still climbing steeply when its 30 minutes ran out, more data is very likely
 what this system wants.
 
-**A side finding that may matter more than the iteration count.** The last table
-`solvererr` prints is |v_0 + v_1|, how far the value network is from
-antisymmetric. It sits at **0.0415 and does not move** across any iteration
-count or any rule — it is a property of the network, not of the solve. The
-reference value spread on these positions is 0.125, so the network's
-antisymmetry violation is a third of the entire signal. CFR's guarantees assume
-the subgame is zero-sum, and the subgame is only as zero-sum as the network is.
-No loss curve shows this. It has not been chased down yet, and part of it may be
-an artefact of the harness using uniform beliefs rather than the true posterior;
-that needs checking before anything is concluded.
+**A side finding that is two hundred times larger than the one above.** The last
+table `solvererr` prints is |v_0 + v_1|, how far the value network is from
+antisymmetric. In a zero-sum game the two players' values must sum to zero. This
+one sits at **0.0415 and does not move** across any iteration count or any rule.
+
+That flatness is the diagnosis: a quantity CFR manufactured would change as CFR
+converges. It does not, so the violation is in the network's leaf values and the
+solve merely inherits it.
+
+It is also not an artefact of `solvererr`'s uniform beliefs. Measured on a set
+of positions solved to convergence under the *real* self-play posterior
+(`truth.py`-generated, 1,334 positions, T=1024 dcfr):
+
+| quantity | value |
+|---|---:|
+| mean `v_0 + v_1` | **+0.0502** |
+| mean &#124;`v_0 + v_1`&#124; | 0.0567 |
+| std `v_0 + v_1` | 0.0451 |
+| std `v_0` (the signal) | 0.3545 |
+
+Two components, and they matter very differently. The **mean** +0.05 is a
+uniform offset, and a constant added to all of one player's values does not
+change that player's best response — it is embarrassing but probably harmless to
+play. The **std** 0.045 is the part that bites: it is state-dependent, so the
+network hands out a bonus in some positions and a penalty in others, which
+distorts the value of one state relative to another and therefore does change
+play. That component is roughly 13% of the value signal, and it is **180 times
+larger than the target bias from stopping CFR at T=64** that this whole sweep was
+about.
+
+Worth noting what it is not: the mirror augmentation does swap seats, but it
+maps a position to a *different* position, which asks the network for
+equivariance, not antisymmetry. Nothing in training has ever asked for
+`v_0(s) = -v_1(s)` at the same `s`. One suspicious coincidence to chase: the
+horizon's marker payoff `cap_value` is 0.04, the same size as the offset, and
+golden8 annealed it to zero with only ~13 minutes of training left to unlearn
+it. Not tested.
+
+The cheap candidate fix is a projection: the constraint is one linear equation
+per position, so subtracting half the violation from both players' values lands
+on the antisymmetric subspace, which contains the truth and so cannot increase
+error. Untested — it needs the leaf evaluation to change, and it should be an
+experiment arm, not a silent change.
 
 ## What this does not answer
 
