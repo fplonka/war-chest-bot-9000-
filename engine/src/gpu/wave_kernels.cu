@@ -46,7 +46,7 @@ typedef struct {
 #define T_DRAW_P 10
 #define T_DRAW_ROW_OFF 11
 #define T_DRAW_ROW_START 12
-#define T_REACH_OFF 13
+#define T_REACH_BASE 13
 #define T_SOFF 14
 #define T_VOFF 15
 #define T_NODE_PARENT 16
@@ -145,9 +145,7 @@ __device__ __forceinline__ int nc_of(const WaveDev* w, int node, int p) {
 }
 
 __device__ __forceinline__ int reach_at(const WaveDev* w, int node, int p, int c) {
-    int at = (int)TP(w, unsigned int, T_REACH_OFF)[node];
-    if (p) at += nc_of(w, node, 0);
-    return at + c;
+    return (int)TP(w, unsigned int, T_REACH_BASE)[2 * node + p] + c;
 }
 
 __device__ __forceinline__ void norm_parts(const float* x, int n, int lane,
@@ -417,46 +415,33 @@ extern "C" __global__ void seed_reach(const WaveDev* w, const WeightDev* wt,
 
 __device__ __forceinline__ void reach_task(
     const WaveDev* w, int player, int k,
-    int snap, int strat_snap, int accumulate) {
+    int snap, int strat_snap) {
     const Task* tasks = TP(w, Task, player ? T_REACH_TASK1 : T_REACH_TASK0);
     Task q = tasks[k];
     int node = q.node, c = q.config;
     int parent = TP(w, unsigned int, T_NODE_PARENT)[node];
-    int actor = TP(w, unsigned char, T_NODE_PLAYER)[parent];
     float* reach = AP(w, snap ? A_SNAP_REACH : A_REACH);
     const float* strat = AP(w, strat_snap ? A_SNAP_STRAT : A_CUR);
     float value = 0.0f;
-    if (actor != player) {
-        value = reach[reach_at(w, parent, player, c)];
+    unsigned int rr = TP(w, unsigned int, T_REV_ROW_OF)[node];
+    if (rr != NONE) {
+        unsigned int row = rr + c;
+        unsigned int lo = TP(w, unsigned int, T_REV_START)[row];
+        unsigned int hi = TP(w, unsigned int, T_REV_START)[row + 1];
+        int base = reach_at(w, parent, player, 0);
+        for (unsigned int x = lo; x < hi; x++)
+            value += reach[base + TP(w, unsigned int, T_REV_SRC)[x]]
+                   * strat[TP(w, unsigned int, T_REV_CELL)[x]];
     } else {
-        unsigned int rr = TP(w, unsigned int, T_REV_ROW_OF)[node];
-        if (rr != NONE) {
-            unsigned int row = rr + c;
-            unsigned int lo = TP(w, unsigned int, T_REV_START)[row];
-            unsigned int hi = TP(w, unsigned int, T_REV_START)[row + 1];
-            int base = reach_at(w, parent, player, 0);
-            for (unsigned int x = lo; x < hi; x++)
-                value += reach[base + TP(w, unsigned int, T_REV_SRC)[x]]
-                       * strat[TP(w, unsigned int, T_REV_CELL)[x]];
-        } else {
-            unsigned int row = TP(w, unsigned int, T_RVD_ROW_OF)[node] + c;
-            unsigned int lo = TP(w, unsigned int, T_RVD_START)[row];
-            unsigned int hi = TP(w, unsigned int, T_RVD_START)[row + 1];
-            int base = reach_at(w, parent, player, 0);
-            for (unsigned int x = lo; x < hi; x++)
-                value += reach[base + TP(w, unsigned int, T_RVD_SRC)[x]]
-                       * TP(w, float, T_RVD_P)[x];
-        }
+        unsigned int row = TP(w, unsigned int, T_RVD_ROW_OF)[node] + c;
+        unsigned int lo = TP(w, unsigned int, T_RVD_START)[row];
+        unsigned int hi = TP(w, unsigned int, T_RVD_START)[row + 1];
+        int base = reach_at(w, parent, player, 0);
+        for (unsigned int x = lo; x < hi; x++)
+            value += reach[base + TP(w, unsigned int, T_RVD_SRC)[x]]
+                   * TP(w, float, T_RVD_P)[x];
     }
     reach[reach_at(w, node, player, c)] = value;
-    if (accumulate && TP(w, unsigned char, T_NODE_KIND)[node] == 0
-        && TP(w, unsigned char, T_NODE_PLAYER)[node] == player) {
-        unsigned int row = TP(w, unsigned int, T_LEGAL_ROW_OF)[node] + c;
-        unsigned int lo = TP(w, unsigned int, T_LEGAL_OFF)[row];
-        unsigned int hi = TP(w, unsigned int, T_LEGAL_OFF)[row + 1];
-        for (unsigned int x = lo; x < hi; x++)
-            AP(w, A_SUM)[x] += value * AP(w, A_CUR)[x];
-    }
 }
 
 extern "C" __global__ void reach_sweep(
@@ -478,9 +463,9 @@ extern "C" __global__ void reach_sweep(
             int begin1 = level1[l], n1 = level1[l + 1] - begin1;
             for (int k = thread; k < n0 + n1; k += stride) {
                 if (k < n0)
-                    reach_task(w, 0, begin0 + k, snap, strat_snap, 0);
+                    reach_task(w, 0, begin0 + k, snap, strat_snap);
                 else
-                    reach_task(w, 1, begin1 + k - n0, snap, strat_snap, 0);
+                    reach_task(w, 1, begin1 + k - n0, snap, strat_snap);
             }
             grid.sync();
         }
@@ -491,28 +476,23 @@ extern "C" __global__ void reach_sweep(
     for (int l = 0; l < w->nlevels; l++) {
         int begin = level[l], end = level[l + 1];
         for (int k = begin + thread; k < end; k += stride)
-            reach_task(w, player, k, snap, strat_snap, accumulate);
+            reach_task(w, player, k, snap, strat_snap);
         grid.sync();
     }
     if (!accumulate) return;
 
-    // The root has no parent and therefore is not part of the forward task
-    // map. Accumulate its strategy sum here after the final level barrier
-    // instead of paying for a separate kernel after every CFR iteration.
-    for (int j = blockIdx.x; j < w->jobs; j += gridDim.x) {
-        JobDev d = TP(w, JobDev, T_JOBS)[j];
-        int node = d.node0;
-        if (TP(w, unsigned char, T_NODE_KIND)[node] != 0
-            || TP(w, unsigned char, T_NODE_PLAYER)[node] != player) continue;
-        int n = nc_of(w, node, player);
-        for (int c = threadIdx.x; c < n; c += blockDim.x) {
-            unsigned int row = TP(w, unsigned int, T_LEGAL_ROW_OF)[node] + c;
-            unsigned int lo = TP(w, unsigned int, T_LEGAL_OFF)[row];
-            unsigned int hi = TP(w, unsigned int, T_LEGAL_OFF)[row + 1];
-            float r = AP(w, A_REACH)[reach_at(w, node, player, c)];
-            for (unsigned int x = lo; x < hi; x++)
-                AP(w, A_SUM)[x] += r * AP(w, A_CUR)[x];
-        }
+    // Unchanged opponent beliefs alias their parent and therefore have no
+    // forward task. Accumulate every decision row in one flat pass after the
+    // final reach barrier, including the root and aliased decision nodes.
+    const Task* decisions = TP(w, Task, player ? T_DECISION1 : T_DECISION0);
+    for (int i = thread; i < w->decision_n[player]; i += stride) {
+        Task q = decisions[i];
+        unsigned int row = TP(w, unsigned int, T_LEGAL_ROW_OF)[q.node] + q.config;
+        unsigned int lo = TP(w, unsigned int, T_LEGAL_OFF)[row];
+        unsigned int hi = TP(w, unsigned int, T_LEGAL_OFF)[row + 1];
+        float r = AP(w, A_REACH)[reach_at(w, q.node, player, q.config)];
+        for (unsigned int x = lo; x < hi; x++)
+            AP(w, A_SUM)[x] += r * AP(w, A_CUR)[x];
     }
 }
 

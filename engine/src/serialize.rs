@@ -396,6 +396,7 @@ impl PackedJob {
 
     pub fn work(&self) -> WorkVector {
         let t = &self.tables;
+        let reach = device_reach_slots(t);
         let vals = (0..t.nodes)
             .map(|i| {
                 let n0 = t.cfg_off[2 * i + 1] - t.cfg_off[2 * i];
@@ -416,14 +417,18 @@ impl PackedJob {
         WorkVector {
             network_rows: t.rows,
             legal_cells: t.ncells,
-            reach_slots: t.reach_len,
+            reach_slots: reach,
             reverse_nonzeros: t.rev_src.len() + t.rvd_src.len(),
-            table_bytes: t.owned_bytes()
-                + 4 * (self.root[0].len() + self.root[1].len())
+            table_bytes: t.owned_bytes().saturating_add(
+                2usize
+                    .saturating_mul(t.nodes)
+                    .saturating_sub(t.reach_off.len())
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            ) + 4 * (self.root[0].len() + self.root[1].len())
                 + 4 * self.carried.len() * root_configs,
             // Exact one-job device arena, including network scratch and the
             // allocator's power-of-two growth policy.
-            mutable_bytes: device_arena_bytes(self, vals),
+            mutable_bytes: device_arena_bytes(self, vals, reach),
             carried_output_bytes: fp32_output.saturating_add(fp16_carry),
             levels: t.nlevels,
         }
@@ -434,7 +439,21 @@ impl PackedJob {
 /// subadditive for its max-sized scratch blocks, so per-job admission is a
 /// conservative bound for a multi-job wave. Keep this in lockstep with
 /// `gpu::device::arena_layout`.
-fn device_arena_bytes(job: &PackedJob, vals: usize) -> usize {
+fn device_reach_slots(t: &PackedTables) -> usize {
+    if t.nodes == 0 {
+        return 0;
+    }
+    let nc =
+        |node: usize, p: usize| (t.cfg_off[2 * node + p + 1] - t.cfg_off[2 * node + p]) as usize;
+    let mut slots = nc(0, 0).saturating_add(nc(0, 1));
+    for node in 1..t.nodes {
+        let parent = t.node_parent[node] as usize;
+        slots = slots.saturating_add(nc(node, t.node_player[parent] as usize));
+    }
+    slots
+}
+
+fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
     let t = &job.tables;
     let Ok(l) = V3Layout::new(&job.meta.net_dims) else {
         return usize::MAX;
@@ -478,8 +497,8 @@ fn device_arena_bytes(job: &PackedJob, vals: usize) -> usize {
         .unwrap_or(l.head_in);
     let fast_head = std::env::var_os("WARCHEST_GPU_PRECISE_GEMM").is_none() && l.hmlp.is_empty();
     let sizes = [
-        t.reach_len,
-        t.reach_len,
+        reach,
+        reach.max(vals),
         vals,
         cells,
         cells,

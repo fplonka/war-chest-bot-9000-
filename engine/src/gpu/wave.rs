@@ -65,7 +65,11 @@ pub struct Wave {
     pub draw_p: Vec<f32>,
     pub draw_row_off: Vec<u32>,
     pub draw_row_start: Vec<u32>,
-    pub reach_off: Vec<u32>,
+    /// Arena base for each `(node, player)` reach vector. A player's vector
+    /// aliases its parent's base across public edges where that player did not
+    /// act, so only changed beliefs occupy device storage.
+    pub reach_base: Vec<u32>,
+    pub reach_len: usize,
     pub soff: Vec<u32>,
     pub voff: Vec<u32>,
     pub node_parent: Vec<u32>,
@@ -147,7 +151,8 @@ impl Wave {
             draw_p: Vec::new(),
             draw_row_off: Vec::new(),
             draw_row_start: Vec::new(),
-            reach_off: vec![0],
+            reach_base: Vec::new(),
+            reach_len: 0,
             soff: vec![0],
             voff: vec![0],
             node_parent: Vec::new(),
@@ -228,7 +233,7 @@ impl Wave {
         reserve!(draw_p, table_len!(draw_p));
         reserve!(draw_row_off, nodes);
         reserve!(draw_row_start, table_len!(draw_row_start));
-        reserve!(reach_off, nodes);
+        reserve!(reach_base, 2 * nodes);
         reserve!(soff, nodes);
         reserve!(voff, nodes);
         reserve!(node_parent, nodes);
@@ -282,7 +287,7 @@ impl Wave {
         let cell0 = self.legal_value.len();
         let draw0 = self.draw_to.len();
         let draw_row0 = self.draw_row_start.len();
-        let reach0 = *self.reach_off.last().unwrap() as usize;
+        let reach0 = self.reach_len;
         let vals0 = *self.voff.last().unwrap() as usize;
         let rev_row0 = self.rev_start.len() - 1;
         let rev0 = self.rev_src.len();
@@ -332,8 +337,23 @@ impl Wave {
                 .map(|&x| draw_row0 as u32 + x),
         );
         self.draw_row_start.extend_from_slice(&t.draw_row_start);
-        self.reach_off
-            .extend(t.reach_off.iter().skip(1).map(|&x| reach0 as u32 + x));
+        self.reach_base.resize(2 * (node0 + t.nodes), 0);
+        let mut reach_at = reach0;
+        for &local_u in &t.bfs_order {
+            let local = local_u as usize;
+            let node = node0 + local;
+            for p in 0..2 {
+                let n = (t.cfg_off[2 * local + p + 1] - t.cfg_off[2 * local + p]) as usize;
+                if local == 0 || t.node_player[t.node_parent[local] as usize] as usize == p {
+                    self.reach_base[2 * node + p] = reach_at as u32;
+                    reach_at += n;
+                } else {
+                    let parent = node0 + t.node_parent[local] as usize;
+                    self.reach_base[2 * node + p] = self.reach_base[2 * parent + p];
+                }
+            }
+        }
+        self.reach_len = reach_at;
         self.soff
             .extend(t.soff.iter().skip(1).map(|&x| cell0 as u32 + x));
         let mut va = vals0 as u32;
@@ -438,7 +458,7 @@ impl Wave {
             network_leaves: t.nleaf,
             configs: config0..config0 + t.ncfg,
             cells: cell0..cell0 + t.ncells,
-            reach: reach0..reach0 + t.reach_len,
+            reach: reach0..reach_at,
             vals: vals0..va as usize,
             root: root0..root0 + root_n,
             carried: carried0..carried0 + carried_n,
@@ -471,13 +491,10 @@ impl Wave {
                     if node != 0 {
                         let parent = t.node_parent[node] as usize;
                         for p in 0..2 {
-                            let mode = if t.node_player[parent] as usize != p {
-                                0
-                            } else if t.rev_row_of[node] != u32::MAX {
-                                1
-                            } else {
-                                2
-                            };
+                            if t.node_player[parent] as usize != p {
+                                continue;
+                            }
+                            let mode = if t.rev_row_of[node] != u32::MAX { 1 } else { 2 };
                             reach_caps[level][p][mode] += nc[p];
                         }
                     }
@@ -505,8 +522,9 @@ impl Wave {
         }
         for level in 0..levels {
             // Keep the compact `(node, config)` record, but make neighbouring
-            // CUDA threads take the same reach branch: plain copies, strategy
-            // reverse gathers, then chance reverse gathers.
+            // CUDA threads take the same reach branch: strategy reverse
+            // gathers, then chance reverse gathers. Unchanged opponent beliefs
+            // alias their parent and need no task.
             let mut reach: [[Vec<Task>; 3]; 2] = std::array::from_fn(|p| {
                 std::array::from_fn(|mode| Vec::with_capacity(reach_caps[level][p][mode]))
             });
@@ -525,9 +543,10 @@ impl Wave {
                             let nc = self.nc(i as usize, p);
                             let node = i as usize;
                             let parent = self.node_parent[node] as usize;
-                            let mode = if self.node_player[parent] as usize != p {
-                                0
-                            } else if self.rev_row_of[node] != u32::MAX {
+                            if self.node_player[parent] as usize != p {
+                                continue;
+                            }
+                            let mode = if self.rev_row_of[node] != u32::MAX {
                                 1
                             } else {
                                 2
@@ -596,7 +615,7 @@ impl Wave {
             || self.node_utility.len() != nodes
             || self.node_nc.len() != 2 * nodes
             || self.node_child_start.len() != nodes + 1
-            || self.reach_off.len() != nodes + 1
+            || self.reach_base.len() != 2 * nodes
             || self.soff.len() != nodes + 1
             || self.voff.len() != nodes + 1
         {
@@ -626,6 +645,14 @@ impl Wave {
                     || task.config as usize >= self.nc(task.node as usize, p)
                 {
                     return Err("wave reach task out of bounds".into());
+                }
+            }
+        }
+        for node in 0..nodes {
+            for p in 0..2 {
+                let end = self.reach_base[2 * node + p] as usize + self.nc(node, p);
+                if end > self.reach_len {
+                    return Err("wave reach alias out of bounds".into());
                 }
             }
         }
@@ -669,7 +696,8 @@ mod tests {
         assert_eq!(w.jobs.len(), 2);
         assert_eq!(w.node_kind.len(), 2);
         assert_eq!(w.row_node, vec![0, 1]);
-        assert_eq!(w.reach_off, vec![0, 2, 4]);
+        assert_eq!(w.reach_base, vec![0, 1, 2, 3]);
+        assert_eq!(w.reach_len, 4);
         assert_eq!(w.exit_nodes, vec![0, 1]);
         assert_eq!(w.exit_coff, vec![0, 1, 2, 3, 4]);
         assert_eq!(w.snapshot_configs, 4);

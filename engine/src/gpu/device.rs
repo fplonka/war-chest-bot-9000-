@@ -45,7 +45,7 @@ enum Table {
     DrawP,
     DrawRowOff,
     DrawRowStart,
-    ReachOff,
+    ReachBase,
     Soff,
     Voff,
     NodeParent,
@@ -1384,7 +1384,7 @@ impl DeviceWave {
             )?,
             ncfg: i32n(w.config_job.len(), "configs")?,
             cells: i32n(w.legal_value.len(), "legal cells")?,
-            reach_len: i32n(*w.reach_off.last().unwrap_or(&0) as usize, "reach")?,
+            reach_len: i32n(w.reach_len, "reach")?,
             vals_len: i32n(*w.voff.last().unwrap_or(&0) as usize, "values")?,
             exits: i32n(w.exit_nodes.len(), "exits")?,
             snapshot_configs: i32n(w.snapshot_configs, "snapshot configs")?,
@@ -1510,7 +1510,7 @@ macro_rules! wave_table_fields {
         $put!(DrawP, $w.draw_p.as_slice());
         $put!(DrawRowOff, $w.draw_row_off.as_slice());
         $put!(DrawRowStart, $w.draw_row_start.as_slice());
-        $put!(ReachOff, $w.reach_off.as_slice());
+        $put!(ReachBase, $w.reach_base.as_slice());
         $put!(Soff, $w.soff.as_slice());
         $put!(Voff, $w.voff.as_slice());
         $put!(NodeParent, $w.node_parent.as_slice());
@@ -1630,7 +1630,7 @@ fn arena_layout(w: &Wave, l: &V3Layout) -> Result<([u64; N_ARENAS], usize), Stri
     let cfgs = w.config_job.len();
     let jobs = w.jobs.len();
     let cells = w.legal_value.len();
-    let reach = *w.reach_off.last().unwrap_or(&0) as usize;
+    let reach = w.reach_len;
     let vals = *w.voff.last().unwrap_or(&0) as usize;
     let roots = w.jobs.last().map_or(0, |j| j.root_values.end);
     let carry_snaps = if w.meta.snapshots {
@@ -1663,7 +1663,7 @@ fn arena_layout(w: &Wave, l: &V3Layout) -> Result<([u64; N_ARENAS], usize), Stri
         .max(cfgs * (l.rank + 1));
     let sizes = [
         reach,
-        reach,
+        reach.max(vals),
         vals,
         cells,
         cells,
