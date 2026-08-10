@@ -84,11 +84,9 @@ impl LiveGame {
             return err("agent must be 0 (white) or 1 (black)");
         }
         let get_units = |key: &str| -> PyResult<Vec<u16>> {
-            let v = draft
-                .get_item(key)?
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyValueError::new_err(format!("draft needs '{}'", key))
-                })?;
+            let v = draft.get_item(key)?.ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!("draft needs '{}'", key))
+            })?;
             let ids: Vec<u16> = v.extract()?;
             if ids.len() != 4 {
                 return err(format!("'{}' must have 4 unitTypeIds", key));
@@ -104,9 +102,7 @@ impl LiveGame {
         let black = get_units("black_units")?;
         let fp: String = draft
             .get_item("first_player")?
-            .ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("draft needs 'first_player'")
-            })?
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("draft needs 'first_player'"))?
             .extract()?;
         let first = match fp.as_str() {
             "white" => WHITE,
@@ -267,12 +263,14 @@ impl LiveGame {
         }
         sv.multistep(self.iters);
         let nid = 0usize;
-        let na = sv.nodes[nid].na();
-        let mut probs = vec![0.0f32; cfgs.len() * na];
+        let mut probs = vec![0.0f32; sv.nodes[nid].legal_action.len()];
         for ci in 0..cfgs.len() {
-            probs[ci * na..(ci + 1) * na].copy_from_slice(sv.average_strategy(nid, ci));
+            let row = sv.nodes[nid].legal_row(ci);
+            probs[row].copy_from_slice(sv.average_strategy(nid, ci));
         }
-        let chosen = sample_row(&mut self.rng, &probs[true_ci * na..(true_ci + 1) * na]);
+        let true_row = sv.nodes[nid].legal_row(true_ci);
+        let chosen_cell = true_row.start + sample_row(&mut self.rng, &probs[true_row]);
+        let chosen = sv.nodes[nid].legal_action[chosen_cell] as usize;
         let act = sv.nodes[nid].acts[chosen];
         let label = format!("{}", act);
         // Belief update on the public observation, weighted by the policy the
@@ -280,13 +278,13 @@ impl LiveGame {
         let obs = obs_key(&act);
         let mut pairs: Vec<(Config, f32)> = Vec::new();
         for (ci, c) in cfgs.iter().enumerate() {
-            for a in 0..na {
-                if !sv.nodes[nid].legal[ci * na + a] || obs_key(&sv.nodes[nid].acts[a]) != obs {
+            for cell in sv.nodes[nid].legal_row(ci) {
+                let a = sv.nodes[nid].legal_action[cell] as usize;
+                if obs_key(&sv.nodes[nid].acts[a]) != obs {
                     continue;
                 }
-                if let Some(n) = advance_config(c, sv.nodes[nid].aslot[a], sv.nodes[nid].fdown[a])
-                {
-                    pairs.push((n, bel[player as usize].p[ci] * probs[ci * na + a]));
+                if let Some(n) = advance_config(c, sv.nodes[nid].aslot[a], sv.nodes[nid].fdown[a]) {
+                    pairs.push((n, bel[player as usize].p[ci] * probs[cell]));
                 }
             }
         }

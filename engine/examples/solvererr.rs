@@ -75,9 +75,16 @@ fn open_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
     let res = reserve(s, p, ctx);
     let truth = true_config(s, p, ctx);
     let cfg = enumerate_configs(&res, truth.hand_size(), truth.fd_size());
-    let cfg = if cfg.is_empty() { vec![Config::default()] } else { cfg };
+    let cfg = if cfg.is_empty() {
+        vec![Config::default()]
+    } else {
+        cfg
+    };
     let w = 1.0 / cfg.len() as f32;
-    Belief { p: vec![w; cfg.len()], cfg }
+    Belief {
+        p: vec![w; cfg.len()],
+        cfg,
+    }
 }
 
 /// One rule's readings at every rung of one position, and at `TMAX`.
@@ -90,13 +97,31 @@ struct Run {
 
 /// One solve, read off at each rung as it passes: the fixed-policy passes
 /// restore the solve's reaches, so a reading does not disturb what follows.
-fn solve(s: &State, ctx: &Ctx, nets: &Nets, bel: &[Belief; 2], depth: usize, rule: Cfr,
-         warm: f32) -> Run {
-    let cfg = Cfg { depth, iters: TMAX, snapshots: true, cfr: rule, warm, ..Default::default() };
+fn solve(
+    s: &State,
+    ctx: &Ctx,
+    nets: &Nets,
+    bel: &[Belief; 2],
+    depth: usize,
+    rule: Cfr,
+    warm: f32,
+) -> Run {
+    let cfg = Cfg {
+        depth,
+        iters: TMAX,
+        snapshots: true,
+        cfr: rule,
+        warm,
+        ..Default::default()
+    };
     let mut sv = Solver::new(s, *ctx, nets, cfg, bel.clone());
     sv.warm_start(warm);
     let root = [[bel[0].p.clone(), bel[1].p.clone()]];
-    let mut r = Run { vals: Vec::new(), nash: Vec::new(), zero_sum: Vec::new() };
+    let mut r = Run {
+        vals: Vec::new(),
+        nash: Vec::new(),
+        zero_sum: Vec::new(),
+    };
     let mut done = 0usize;
     for t in LADDER.iter().copied().chain([TMAX]) {
         sv.multistep(t - done);
@@ -194,7 +219,10 @@ fn main() {
             .collect();
         // Every rule is graded against the same numbers, which is what makes
         // the columns comparable.
-        let ri = rules.iter().position(|(_, r, w)| *r == REFERENCE && *w == 0.0).unwrap();
+        let ri = rules
+            .iter()
+            .position(|(_, r, w)| *r == REFERENCE && *w == 0.0)
+            .unwrap();
         let reference = runs[ri].vals[rungs - 1].clone();
 
         for (k, run) in runs.iter().enumerate() {
@@ -242,10 +270,18 @@ fn main() {
             println!();
         }
     };
-    table("NashConv — what a best response to the solve would gain.", &nash, positions as f64);
+    table(
+        "NashConv — what a best response to the solve would gain.",
+        &nash,
+        positions as f64,
+    );
     table("mean |target error| against the reference.", &err, n as f64);
     table("signed mean target error.", &signed, n as f64);
-    table("|v_0 + v_1| — how far the network is from antisymmetric.", &asym, positions as f64);
+    table(
+        "|v_0 + v_1| — how far the network is from antisymmetric.",
+        &asym,
+        positions as f64,
+    );
 
     println!(
         "\nread: NashConv picks the regret rule — it is absolute, so the columns\n\

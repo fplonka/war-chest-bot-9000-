@@ -3,8 +3,8 @@
 
 use warchest::board::{board, NONE, N_HEXES};
 use warchest::rng::Rng;
-use warchest::state::{State, BLACK, WHITE};
 use warchest::selfplay::make_game;
+use warchest::state::{State, BLACK, WHITE};
 use warchest::units::{def, N_UNITS, ROYAL_COIN};
 
 const POOL: [u16; 19] = [

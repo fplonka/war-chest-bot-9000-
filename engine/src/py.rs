@@ -11,7 +11,7 @@ use pyo3::types::{PyDict, PyList};
 use crate::actions::Action;
 use crate::board::{board, NONE, N_HEXES};
 use crate::state::*;
-use crate::units::{def, index_of_id, N_UNITS};
+use crate::units::{def, index_of_id, write_card_features, CARD_FEATS, N_UNITS};
 
 #[pyclass]
 struct Game {
@@ -509,6 +509,144 @@ pub(crate) fn gpu_clients() -> &'static std::sync::Mutex<Vec<crate::gpu::GpuClie
     GPU_CLIENTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
+/// Python-side handle for the continuous Rust actor/build/GPU pipeline. `next`
+/// yields one solve-complete replay chunk, returns `None` on a polling timeout,
+/// and raises `StopIteration` once a requested stop has fully drained.
+#[cfg(feature = "gpu")]
+#[pyclass]
+struct GpuGenerator {
+    rx: std::sync::Mutex<std::sync::mpsc::Receiver<Result<Option<crate::selfplay::Data>, String>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    done: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "gpu")]
+#[pymethods]
+impl GpuGenerator {
+    #[pyo3(signature = (timeout=0.1))]
+    fn next(&self, py: Python<'_>, timeout: f64) -> PyResult<Option<PyObject>> {
+        if self.done.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(pyo3::exceptions::PyStopIteration::new_err(()));
+        }
+        let event = py.allow_threads(|| {
+            let rx = self.rx.lock().unwrap();
+            if timeout < 0.0 {
+                rx.recv()
+                    .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+            } else {
+                rx.recv_timeout(std::time::Duration::from_secs_f64(timeout.max(0.0)))
+            }
+        });
+        match event {
+            Ok(Ok(Some(data))) => data_to_dict(py, data).map(Some),
+            Ok(Ok(None)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.done.store(true, std::sync::atomic::Ordering::Release);
+                if let Some(thread) = self.thread.lock().unwrap().take() {
+                    let _ = thread.join();
+                }
+                Err(pyo3::exceptions::PyStopIteration::new_err(()))
+            }
+            Ok(Err(e)) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        }
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_done(&self) -> bool {
+        self.done.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl Drop for GpuGenerator {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if self.done.load(std::sync::atomic::Ordering::Acquire) {
+            if let Some(thread) = self.thread.get_mut().unwrap().take() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+#[pyfunction]
+#[pyo3(signature = (seed, depth=2, iters=64, explore=0.25, random_draft=true, cfr="linear", warm=0.0, eval_mix=0.5, workers=36, actors_per_worker=128, inflight_per_worker=32, chunk_solves=1024))]
+#[allow(clippy::too_many_arguments)]
+fn gpu_stream_start(
+    seed: u64,
+    depth: usize,
+    iters: usize,
+    explore: f32,
+    random_draft: bool,
+    cfr: &str,
+    warm: f32,
+    eval_mix: f32,
+    workers: usize,
+    actors_per_worker: usize,
+    inflight_per_worker: usize,
+    chunk_solves: usize,
+) -> PyResult<GpuGenerator> {
+    let cfg = Cfg {
+        depth,
+        iters,
+        snapshots: true,
+        cfr: cfr_of(cfr)?,
+        warm,
+        node_cap: 200_000,
+        ..Default::default()
+    };
+    let agent = Agent::Rebel { cfg, slot: 0 };
+    let gc = GameCfg {
+        agents: [agent, agent],
+        collect: Collect::Rebel,
+        explore,
+        random_draft,
+        eval_mix,
+        mc_mix: 0.0,
+    };
+    let nets = nets().read().unwrap().clone();
+    let clients = gpu_clients().lock().unwrap().clone();
+    if clients.is_empty() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "gpu service not started (gpu_start was not called)",
+        ));
+    }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let run_stop = stop.clone();
+    // Bound complete replay chunks as well as Rust's worker-to-merger queue.
+    // If conversion/training falls behind, backpressure reaches actor resume
+    // instead of retaining an unbounded number of multi-megabyte Python arrays.
+    let (tx, rx) = std::sync::mpsc::sync_channel(4);
+    let thread = std::thread::Builder::new()
+        .name("warchest-gpu-stream".into())
+        .spawn(move || {
+            crate::selfplay::run_games_gpu_stream(
+                seed,
+                &nets,
+                &gc,
+                &clients,
+                workers,
+                actors_per_worker,
+                inflight_per_worker,
+                chunk_solves,
+                &run_stop,
+                tx,
+            );
+        })
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("start GPU stream: {e}")))?;
+    Ok(GpuGenerator {
+        rx: std::sync::Mutex::new(rx),
+        stop,
+        thread: std::sync::Mutex::new(Some(thread)),
+        done: std::sync::atomic::AtomicBool::new(false),
+    })
+}
+
 /// Start one solve service per listed CUDA device (typically `[0]` for
 /// training; the ladder starts one per device and pits weights against each
 /// other). Call once; a shape change needs a fresh process.
@@ -523,7 +661,11 @@ fn gpu_start(
     ln: PyReadonlyArray1<f32>,
     devices: Vec<usize>,
 ) -> PyResult<()> {
-    let (w, b, ln) = (w.as_slice()?.to_vec(), b.as_slice()?.to_vec(), ln.as_slice()?.to_vec());
+    let (w, b, ln) = (
+        w.as_slice()?.to_vec(),
+        b.as_slice()?.to_vec(),
+        ln.as_slice()?.to_vec(),
+    );
     py.allow_threads(move || {
         let mut clients = Vec::new();
         for d in devices {
@@ -551,10 +693,15 @@ fn gpu_set_weights(
     let clients = gpu_clients().lock().unwrap();
     let c = clients.get(device).ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(
-            "gpu service not started (gpu_start was not called)")
+            "gpu service not started (gpu_start was not called)",
+        )
     })?;
-    c.set_weights(dims, w.as_slice()?.to_vec(), b.as_slice()?.to_vec(),
-                  ln.as_slice()?.to_vec());
+    c.set_weights(
+        dims,
+        w.as_slice()?.to_vec(),
+        b.as_slice()?.to_vec(),
+        ln.as_slice()?.to_vec(),
+    );
     Ok(())
 }
 
@@ -570,6 +717,7 @@ fn gpu_stop(_py: Python<'_>) -> PyResult<()> {
 /// missing, so a misconfigured box fails loudly instead of running slow.
 #[cfg(feature = "gpu")]
 #[pyfunction]
+#[pyo3(signature = (games, seed, mode, depth, iters, explore, temp, random_draft, eval_mix, mc_mix, cfr, warm, max_seconds=0.0))]
 fn gpu_gen_data(
     py: Python<'_>,
     games: usize,
@@ -584,6 +732,7 @@ fn gpu_gen_data(
     mc_mix: f32,
     cfr: &str,
     warm: f32,
+    max_seconds: f64,
 ) -> PyResult<PyObject> {
     let cfg = Cfg {
         depth,
@@ -613,13 +762,31 @@ fn gpu_gen_data(
         mc_mix,
     };
     let d = py.allow_threads(|| {
-        let n = nets().read().unwrap();
+        // A shard owns a small immutable CPU-side shape/oracle snapshot. Do
+        // not hold the global read lock for the whole game batch: the trainer
+        // must be able to publish the next version while shards are live.
+        let n = nets().read().unwrap().clone();
         let clients = gpu_clients().lock().unwrap().clone();
         if clients.is_empty() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "gpu service not started (gpu_start was not called)"));
+                "gpu service not started (gpu_start was not called)",
+            ));
         }
-        Ok::<_, pyo3::PyErr>(crate::selfplay::run_games_gpu(games, seed, &n, &gc, &clients, &|_| 0))
+        // Each solve is the same checkpoint, but not the same amount of work.
+        // Route against the queued cost after the tree has been built so a
+        // broad-belief tail does not strand one card while the other drains.
+        let route = |_| {
+            clients
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, gpu)| gpu.queued_work())
+                .map_or(0, |(i, _)| i)
+        };
+        let deadline = (max_seconds > 0.0)
+            .then(|| std::time::Instant::now() + std::time::Duration::from_secs_f64(max_seconds));
+        Ok::<_, pyo3::PyErr>(crate::selfplay::run_games_gpu_until(
+            games, seed, &n, &gc, &clients, &route, deadline,
+        ))
     })?;
     data_to_dict(py, d)
 }
@@ -698,7 +865,16 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     out.set_item("black_wins", d.wins[1])?;
     out.set_item("draws", d.draws)?;
     out.set_item("cap_hits", d.cap_hits)?;
+    out.set_item("horizon_hits", d.cap_hits)?;
+    out.set_item("node_caps", d.node_caps)?;
+    out.set_item("oversize_routes", d.oversize_routes)?;
+    out.set_item("card_exclusive_routes", d.card_exclusive_routes)?;
+    out.set_item("exact_fallbacks", d.exact_fallbacks)?;
+    out.set_item("censored_games", d.censored_games)?;
+    out.set_item("dropped", d.dropped)?;
     out.set_item("configs", d.configs)?;
+    out.set_item("gpu_wait_s", d.gpu_wait_s)?;
+    out.set_item("merge_wait_s", d.merge_wait_s)?;
     assert_eq!(
         d.coff.len(),
         if d.nv == 0 { 0 } else { 2 * d.nv + 1 },
@@ -829,7 +1005,10 @@ fn eval_match(
         depth: depth_b.unwrap_or(depth),
         ..cfg
     };
-    let (aa, bb) = (agent_of(a, cfg, temp, slot_a)?, agent_of(b, cfg_b, temp, slot_b)?);
+    let (aa, bb) = (
+        agent_of(a, cfg, temp, slot_a)?,
+        agent_of(b, cfg_b, temp, slot_b)?,
+    );
     #[cfg(feature = "gpu")]
     if gpu {
         return Ok(py.allow_threads(|| {
@@ -862,8 +1041,24 @@ fn save_roots(
 ) -> PyResult<usize> {
     let gc = GameCfg {
         agents: [
-            Agent::Rebel { cfg: Cfg { depth: 2, iters: 64, snapshots: false, ..Default::default() }, slot: 0 },
-            Agent::Rebel { cfg: Cfg { depth: 2, iters: 64, snapshots: false, ..Default::default() }, slot: 0 },
+            Agent::Rebel {
+                cfg: Cfg {
+                    depth: 2,
+                    iters: 64,
+                    snapshots: false,
+                    ..Default::default()
+                },
+                slot: 0,
+            },
+            Agent::Rebel {
+                cfg: Cfg {
+                    depth: 2,
+                    iters: 64,
+                    snapshots: false,
+                    ..Default::default()
+                },
+                slot: 0,
+            },
         ],
         collect: Collect::None,
         explore: 0.25,
@@ -881,6 +1076,20 @@ fn save_roots(
     crate::roots::write_roots(&mut w, &roots)
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
     Ok(roots.len())
+}
+
+/// Print the generation loop's phase timers. Empty unless the extension was
+/// built with the `prof` feature; the host side of a GPU run is otherwise
+/// invisible, and it is the part that has to fit in the CPU budget.
+#[pyfunction]
+fn prof_dump() {
+    eprintln!(
+        "  sizes: TNode {} B  State {} B",
+        std::mem::size_of::<crate::search::TNode>(),
+        std::mem::size_of::<crate::State>(),
+    );
+    crate::prof::dump_shape();
+    crate::prof::dump();
 }
 
 /// Set the horizon payoff per marker of lead. The trainer anneals it to 0.
@@ -934,7 +1143,12 @@ fn infer_policy(
     let guard = nets().read().unwrap();
     let mlp = &guard[slot].value;
     let (mut e, mut sb, mut pre, mut z, mut g, mut q) = (
-        Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
     );
     let xp = xpub.as_slice()?;
     mlp.cards(xp, unit_ids.as_slice()?, &mut e);
@@ -974,6 +1188,23 @@ fn units_info() -> Vec<(u16, &'static str, u8)> {
         .collect()
 }
 
+/// Frozen encoder constants for the device-side replay expander. Export the
+/// tables from the rules engine instead of restating card or board facts in
+/// the trainer.
+#[pyfunction]
+fn card_features_table() -> Vec<f32> {
+    let mut out = vec![0.0; N_UNITS * CARD_FEATS];
+    for u in 0..N_UNITS {
+        write_card_features(u as u8, &mut out[u * CARD_FEATS..(u + 1) * CARD_FEATS]);
+    }
+    out
+}
+
+#[pyfunction]
+fn hex_location_flags() -> Vec<u8> {
+    board().is_location.iter().map(|&x| x as u8).collect()
+}
+
 #[pyfunction]
 fn hex_neighborhood() -> Vec<u32> {
     let bd = crate::board::board();
@@ -983,7 +1214,11 @@ fn hex_neighborhood() -> Vec<u32> {
         out.push(h as u32);
         for d in 0..6 {
             let x = bd.neighbors[h][d];
-            out.push(if x == crate::board::NONE { n as u32 } else { x as u32 });
+            out.push(if x == crate::board::NONE {
+                n as u32
+            } else {
+                x as u32
+            });
         }
     }
     out
@@ -1004,7 +1239,9 @@ fn hex_mirror() -> Vec<u32> {
         .map(|h| {
             let (x, y) = bd.coord[h];
             let t = (6 - x, 6 - y);
-            let m = (0..n).find(|&k| bd.coord[k] == t).expect("rotation stays on the board");
+            let m = (0..n)
+                .find(|&k| bd.coord[k] == t)
+                .expect("rotation stays on the board");
             m as u32
         })
         .collect()
@@ -1057,17 +1294,24 @@ fn expand_rows(
             fds[p] = fd[[r, p]];
             bg[p] = bag[[r, p]];
         }
-        expand_row(row, &hs, &fds, &bg, &mut out[r * PUBFEAT..(r + 1) * PUBFEAT]);
+        expand_row(
+            row,
+            &hs,
+            &fds,
+            &bg,
+            &mut out[r * PUBFEAT..(r + 1) * PUBFEAT],
+        );
     }
     Ok(out)
 }
-
 
 #[pymodule]
 fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hex_mirror, m)?)?;
     m.add_function(wrap_pyfunction!(hex_coords, m)?)?;
     m.add_function(wrap_pyfunction!(units_info, m)?)?;
+    m.add_function(wrap_pyfunction!(card_features_table, m)?)?;
+    m.add_function(wrap_pyfunction!(hex_location_flags, m)?)?;
     m.add_class::<Game>()?;
     m.add_class::<crate::live::LiveGame>()?;
     m.add("MAX_MAIN_PLAYS", crate::state::MAX_MAIN_PLAYS)?;
@@ -1123,14 +1367,17 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hex_neighborhood, m)?)?;
     m.add_function(wrap_pyfunction!(set_weights, m)?)?;
     m.add_function(wrap_pyfunction!(set_cap_value, m)?)?;
+    m.add_function(wrap_pyfunction!(prof_dump, m)?)?;
     m.add_function(wrap_pyfunction!(save_roots, m)?)?;
     m.add_function(wrap_pyfunction!(gen_data, m)?)?;
     #[cfg(feature = "gpu")]
     {
+        m.add_class::<GpuGenerator>()?;
         m.add_function(wrap_pyfunction!(gpu_start, m)?)?;
         m.add_function(wrap_pyfunction!(gpu_set_weights, m)?)?;
         m.add_function(wrap_pyfunction!(gpu_stop, m)?)?;
         m.add_function(wrap_pyfunction!(gpu_gen_data, m)?)?;
+        m.add_function(wrap_pyfunction!(gpu_stream_start, m)?)?;
     }
     m.add_function(wrap_pyfunction!(eval_match, m)?)?;
     m.add_function(wrap_pyfunction!(infer, m)?)?;

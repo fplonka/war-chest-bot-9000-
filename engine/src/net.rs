@@ -49,8 +49,8 @@
 
 use crate::board::N_HEXES;
 use crate::rebel::{
-    AFEAT, AOFF_PAYS, CCOUNTS, CFEAT, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_CARDS,
-    OFF_LOOSE, OFF_PILES, PILE_COUNTS, PUBFEAT,
+    AFEAT, AOFF_PAYS, CCOUNTS, CFEAT, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_CARDS, OFF_LOOSE,
+    OFF_PILES, PILE_COUNTS, PUBFEAT,
 };
 use crate::units::CARD_FEATS;
 
@@ -125,11 +125,20 @@ fn gemm_ld(
     // SAFETY: the debug_asserts above are the exact bounds sgemm reads.
     unsafe {
         matrixmultiply::sgemm(
-            m, k, n, 1.0,
-            a.as_ptr(), lda as isize, 1,
-            b.as_ptr(), ldb as isize, 1,
+            m,
+            k,
+            n,
+            1.0,
+            a.as_ptr(),
+            lda as isize,
+            1,
+            b.as_ptr(),
+            ldb as isize,
+            1,
             beta,
-            c.as_mut_ptr(), ldc as isize, 1,
+            c.as_mut_ptr(),
+            ldc as isize,
+            1,
         );
     }
 }
@@ -139,8 +148,17 @@ fn gemm_ld(
 /// and config embeddings — so this is the shape a dot product of two lists of
 /// vectors takes, and it goes through the same coprocessor the other matmuls do.
 #[allow(clippy::too_many_arguments)]
-fn gemm_nt(m: usize, n: usize, k: usize, a: &[f32], lda: usize, b: &[f32], ldb: usize,
-           c: &mut [f32], ldc: usize) {
+fn gemm_nt(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    lda: usize,
+    b: &[f32],
+    ldb: usize,
+    c: &mut [f32],
+    ldc: usize,
+) {
     if m == 0 || n == 0 || k == 0 {
         return;
     }
@@ -150,8 +168,22 @@ fn gemm_nt(m: usize, n: usize, k: usize, a: &[f32], lda: usize, b: &[f32], ldb: 
     #[cfg(target_vendor = "apple")]
     unsafe {
         // 101 = CblasRowMajor, 111 = CblasNoTrans, 112 = CblasTrans.
-        cblas_sgemm(101, 111, 112, m as i32, n as i32, k as i32, 1.0, a.as_ptr(), lda as i32,
-                    b.as_ptr(), ldb as i32, 0.0, c.as_mut_ptr(), ldc as i32);
+        cblas_sgemm(
+            101,
+            111,
+            112,
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0,
+            a.as_ptr(),
+            lda as i32,
+            b.as_ptr(),
+            ldb as i32,
+            0.0,
+            c.as_mut_ptr(),
+            ldc as i32,
+        );
     }
     // The transposed operand is a stride swap: B[n x k] row-major read as
     // B^T[k x n] has row stride 1 and column stride ldb.
@@ -159,11 +191,20 @@ fn gemm_nt(m: usize, n: usize, k: usize, a: &[f32], lda: usize, b: &[f32], ldb: 
     // SAFETY: the debug_asserts above are the exact bounds sgemm reads.
     unsafe {
         matrixmultiply::sgemm(
-            m, k, n, 1.0,
-            a.as_ptr(), lda as isize, 1,
-            b.as_ptr(), 1, ldb as isize,
+            m,
+            k,
+            n,
+            1.0,
+            a.as_ptr(),
+            lda as isize,
+            1,
+            b.as_ptr(),
+            1,
+            ldb as isize,
             0.0,
-            c.as_mut_ptr(), ldc as isize, 1,
+            c.as_mut_ptr(),
+            ldc as isize,
+            1,
         );
     }
 }
@@ -172,8 +213,15 @@ fn gemm_nt(m: usize, n: usize, k: usize, a: &[f32], lda: usize, b: &[f32], ldb: 
 /// `<u[r], g[c][..rk]>`. The bias column is left to the caller, which has to
 /// touch each entry anyway to scale by the opponent's reach.
 #[allow(clippy::too_many_arguments)]
-pub fn dots(u: &[f32], rk: usize, g: &[f32], ldg: usize, rows: usize, ncfg: usize,
-            out: &mut [f32]) {
+pub fn dots(
+    u: &[f32],
+    rk: usize,
+    g: &[f32],
+    ldg: usize,
+    rows: usize,
+    ncfg: usize,
+    out: &mut [f32],
+) {
     gemm_nt(rows, ncfg, rk, u, rk, g, ldg, &mut out[..rows * ncfg], ncfg);
 }
 
@@ -405,7 +453,9 @@ impl Lin {
     /// the row stride of `src`, so a chain can read a sub-block of a wider
     /// matrix without copying it.
     fn gemm(&self, src: &[f32], rows: usize, lda: usize, beta: f32, out: &mut [f32]) {
-        gemm_ld(rows, self.o, self.i, src, lda, &self.w, self.o, beta, out, self.o);
+        gemm_ld(
+            rows, self.o, self.i, src, lda, &self.w, self.o, beta, out, self.o,
+        );
     }
 
     fn bias(&self, rows: usize, out: &mut [f32]) {
@@ -443,7 +493,10 @@ impl<'a> Cur<'a> {
         if self.at + n > self.v.len() {
             return Err(format!(
                 "{} array too short: need {} past {}, have {}",
-                self.what, n, self.at, self.v.len()
+                self.what,
+                n,
+                self.at,
+                self.v.len()
             ));
         }
         let out = self.v[self.at..self.at + n].to_vec();
@@ -454,7 +507,9 @@ impl<'a> Cur<'a> {
         if self.at != self.v.len() {
             return Err(format!(
                 "{} array too long: read {}, have {}",
-                self.what, self.at, self.v.len()
+                self.what,
+                self.at,
+                self.v.len()
             ));
         }
         Ok(())
@@ -571,7 +626,11 @@ impl V3Layout {
             Ok(v)
         };
         let (de, dg, rank, head_in, nres) = (
-            scalar("de")?, scalar("dg")?, scalar("rank")?, scalar("head_in")?, scalar("nres")?,
+            scalar("de")?,
+            scalar("dg")?,
+            scalar("rank")?,
+            scalar("head_in")?,
+            scalar("nres")?,
         );
         let mut list = |name: &str| -> Result<Vec<usize>, String> {
             let n = *dims.get(at).ok_or(format!("dims truncated at {name}"))?;
@@ -592,7 +651,11 @@ impl V3Layout {
             return Err("the public tower needs at least one layer".into());
         }
         let mut l = V3Layout {
-            de, dg, rank, head_in, nres,
+            de,
+            dg,
+            rank,
+            head_in,
+            nres,
             head_out: hmlp_w.last().copied().unwrap_or(head_in),
             ..Default::default()
         };
@@ -603,9 +666,13 @@ impl V3Layout {
             *b += o;
             s
         };
-        let chain = |w: &mut usize, b: &mut usize, first: usize, mid: &[usize], last: usize,
+        let chain = |w: &mut usize,
+                     b: &mut usize,
+                     first: usize,
+                     mid: &[usize],
+                     last: usize,
                      lin: &mut dyn FnMut(&mut usize, &mut usize, usize, usize) -> Span|
-            -> Vec<Span> {
+         -> Vec<Span> {
             let mut v = Vec::new();
             let mut prev = first;
             for &h in mid.iter().chain(std::iter::once(&last)) {
@@ -670,7 +737,12 @@ impl V3Layout {
     /// Tower widths: (pub, hmlp, card, slot) layer output widths.
     pub fn widths(&self) -> (Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>) {
         let o = |v: &[Span]| v.iter().map(|s| s.o).collect();
-        (o(&self.pub_lin), o(&self.hmlp), o(&self.card), o(&self.slot))
+        (
+            o(&self.pub_lin),
+            o(&self.hmlp),
+            o(&self.card),
+            o(&self.slot),
+        )
     }
 }
 
@@ -712,7 +784,12 @@ impl Mlp {
         if w.len() != l.w_len || b.len() != l.b_len || ln.len() != l.ln_len {
             return Err(format!(
                 "weight sizes {}/{}/{} do not match dims {dims:?} (want {}/{}/{})",
-                w.len(), b.len(), ln.len(), l.w_len, l.b_len, l.ln_len
+                w.len(),
+                b.len(),
+                ln.len(),
+                l.w_len,
+                l.b_len,
+                l.ln_len
             ));
         }
         let lin = |s: &Span| Lin {
@@ -721,9 +798,8 @@ impl Mlp {
             i: s.i,
             o: s.o,
         };
-        let norm = |(g, bt): (usize, usize), n: usize| {
-            (ln[g..g + n].to_vec(), ln[bt..bt + n].to_vec())
-        };
+        let norm =
+            |(g, bt): (usize, usize), n: usize| (ln[g..g + n].to_vec(), ln[bt..bt + n].to_vec());
         Ok(Mlp {
             dims: dims.to_vec(),
             v1: false,
@@ -735,7 +811,12 @@ impl Mlp {
             wid: w[l.wid..l.wid + crate::units::N_UNITS * l.de].to_vec(),
             pile: lin(&l.pile),
             pub_lin: l.pub_lin.iter().map(&lin).collect(),
-            pub_ln: l.pub_lin.iter().zip(&l.pub_ln).map(|(s, &o)| norm(o, s.o)).collect(),
+            pub_ln: l
+                .pub_lin
+                .iter()
+                .zip(&l.pub_ln)
+                .map(|(s, &o)| norm(o, s.o))
+                .collect(),
             pub_out: lin(&l.pub_out),
             wb: w[l.wb..l.wb + 2 * l.dg * l.head_in].to_vec(),
             ln1: norm(l.ln1, l.head_in),
@@ -767,33 +848,84 @@ impl Mlp {
         // reparse: slice the old layout, concatenate in v3 order.
         let seg = |lens: &[usize]| -> Vec<(usize, usize)> {
             let mut at = 0;
-            lens.iter().map(|&n| { let s = at; at += n; (s, at) }).collect()
+            lens.iter()
+                .map(|&n| {
+                    let s = at;
+                    at += n;
+                    (s, at)
+                })
+                .collect()
         };
         let (af, hf, xd) = (dims[6] + de, hfeat(de), xdim_of(de));
-        let ws = seg(&[CARD_FEATS * dc, dc * de, crate::units::N_UNITS * de,
-                       (PILE_COUNTS + de) * de, xd * h, h * hd, 2 * dg * hd, hf * dg,
-                       dg * dg, dg * dg, dg * (rk + 1), hd * rk, af * rk, dg * rk, hd * rk]);
+        let ws = seg(&[
+            CARD_FEATS * dc,
+            dc * de,
+            crate::units::N_UNITS * de,
+            (PILE_COUNTS + de) * de,
+            xd * h,
+            h * hd,
+            2 * dg * hd,
+            hf * dg,
+            dg * dg,
+            dg * dg,
+            dg * (rk + 1),
+            hd * rk,
+            af * rk,
+            dg * rk,
+            hd * rk,
+        ]);
         let bs = seg(&[dc, de, de, h, hd, dg, dg, dg, rk + 1, rk, rk, rk, rk]);
-        if w.len() != ws.last().unwrap().1 || b.len() != bs.last().unwrap().1
+        if w.len() != ws.last().unwrap().1
+            || b.len() != bs.last().unwrap().1
             || ln.len() != 2 * h + 2 * hd
         {
             return Err(format!(
                 "weight sizes {}/{}/{} do not match dims {dims:?}",
-                w.len(), b.len(), ln.len()
+                w.len(),
+                b.len(),
+                ln.len()
             ));
         }
         let wat = |i: usize| &w[ws[i].0..ws[i].1];
         let bat = |i: usize| &b[bs[i].0..bs[i].1];
         // v3 w order: card(wd0,wd1), wid, pile, pub(w0), pub_out(w1), wb,
         // wu, slot_out(wc), res(wh1,wh2), wg, wq, wk, wp.
-        let w3: Vec<f32> = [wat(0), wat(1), wat(2), wat(3), wat(4), wat(5), wat(6),
-                            wat(11), wat(7), wat(8), wat(9), wat(10), wat(12), wat(13), wat(14)]
-            .concat();
+        let w3: Vec<f32> = [
+            wat(0),
+            wat(1),
+            wat(2),
+            wat(3),
+            wat(4),
+            wat(5),
+            wat(6),
+            wat(11),
+            wat(7),
+            wat(8),
+            wat(9),
+            wat(10),
+            wat(12),
+            wat(13),
+            wat(14),
+        ]
+        .concat();
         // v3 b order: card(bd0,bd1), pile, pub(b0), pub_out(b1), wu(bu),
         // slot_out(bc), res(bh1,bh2), wg(bg), wq, wk, wp.
-        let b3: Vec<f32> = [bat(0), bat(1), bat(2), bat(3), bat(4), bat(9), bat(5),
-                            bat(6), bat(7), bat(8), bat(10), bat(11), bat(12)]
-            .concat();
+        let b3: Vec<f32> = [
+            bat(0),
+            bat(1),
+            bat(2),
+            bat(3),
+            bat(4),
+            bat(9),
+            bat(5),
+            bat(6),
+            bat(7),
+            bat(8),
+            bat(10),
+            bat(11),
+            bat(12),
+        ]
+        .concat();
         Mlp::from_flat_v3(&v3, &w3, &b3, ln)
     }
 
@@ -809,10 +941,20 @@ impl Mlp {
         }
         let (mut cw, mut cb) = (Cur::new(w, "w"), Cur::new(b, "b"));
         let lin = |cw: &mut Cur, cb: &mut Cur, i: usize, o: usize| -> Result<Lin, String> {
-            Ok(Lin { w: cw.take(i * o)?, b: cb.take(o)?, i, o })
+            Ok(Lin {
+                w: cw.take(i * o)?,
+                b: cb.take(o)?,
+                i,
+                o,
+            })
         };
         // Old order: w0, w1, wb, wc, wg, wu; b0, b1, bc, bg, bu.
-        let w0 = Lin { w: cw.take(p * h)?, b: cb.take(h)?, i: p, o: h };
+        let w0 = Lin {
+            w: cw.take(p * h)?,
+            b: cb.take(h)?,
+            i: p,
+            o: h,
+        };
         let w1w = cw.take(h * h)?;
         let wb = cw.take(2 * dg * h)?;
         let wcw = cw.take(cf * dg)?;
@@ -825,19 +967,32 @@ impl Mlp {
         Ok(Mlp {
             dims: dims.to_vec(),
             v1: true,
-            de: 0, dg, rank: rk, head_in: h,
+            de: 0,
+            dg,
+            rank: rk,
+            head_in: h,
             card: Vec::new(),
             wid: Vec::new(),
             pile: Lin::default(),
             pub_lin: vec![w0],
             pub_ln: vec![(ln[..h].to_vec(), ln[h..2 * h].to_vec())],
-            pub_out: Lin { w: w1w, b: b1, i: h, o: h },
+            pub_out: Lin {
+                w: w1w,
+                b: b1,
+                i: h,
+                o: h,
+            },
             wb,
             ln1: (ln[2 * h..3 * h].to_vec(), ln[3 * h..4 * h].to_vec()),
             hmlp: Vec::new(),
             wu,
             slot: Vec::new(),
-            slot_out: Lin { w: wcw, b: bc, i: cf, o: dg },
+            slot_out: Lin {
+                w: wcw,
+                b: bc,
+                i: cf,
+                o: dg,
+            },
             res: Vec::new(),
             wg,
             wq: Lin::default(),
@@ -852,7 +1007,9 @@ impl Mlp {
     /// u32 n_dims, n_dims * u32 dims,
     /// u32 n_w, n_w * f32,   u32 n_b, n_b * f32,   u32 n_ln, n_ln * f32
     /// ```
-    pub fn load_bin(path: &str) -> std::io::Result<Mlp> {
+    pub fn load_flat_bin(
+        path: &str,
+    ) -> std::io::Result<(Vec<usize>, Vec<f32>, Vec<f32>, Vec<f32>)> {
         let raw = std::fs::read(path)?;
         let mut at = 0usize;
         let u32_at = |b: &[u8], at: &mut usize| -> usize {
@@ -875,6 +1032,11 @@ impl Mlp {
             f32s_at(&raw, &mut at),
             f32s_at(&raw, &mut at),
         );
+        Ok((dims, w, b, ln))
+    }
+
+    pub fn load_bin(path: &str) -> std::io::Result<Mlp> {
+        let (dims, w, b, ln) = Self::load_flat_bin(path)?;
         Mlp::from_flat(&dims, &w, &b, &ln)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
@@ -884,7 +1046,11 @@ impl Mlp {
     }
     /// Width of the public encoding.
     pub fn pub_dim(&self) -> usize {
-        if self.v1 { self.dims[0] } else { PUBFEAT }
+        if self.v1 {
+            self.dims[0]
+        } else {
+            PUBFEAT
+        }
     }
     /// Width of `h0` and of the head entry (`ln1`).
     pub fn head(&self) -> usize {
@@ -896,7 +1062,11 @@ impl Mlp {
     }
     /// Width of one config vector.
     pub fn cfeat(&self) -> usize {
-        if self.v1 { self.dims[2] } else { CFEAT }
+        if self.v1 {
+            self.dims[2]
+        } else {
+            CFEAT
+        }
     }
     /// Width of a config embedding, and of one player's belief block.
     pub fn dg(&self) -> usize {
@@ -912,7 +1082,11 @@ impl Mlp {
     }
     /// Width of one stored action vector, before the paying card's embedding.
     pub fn afeat(&self) -> usize {
-        if self.v1 { 0 } else { AFEAT }
+        if self.v1 {
+            0
+        } else {
+            AFEAT
+        }
     }
     /// Width of a card embedding. Zero for a `v1` checkpoint.
     pub fn de(&self) -> usize {
@@ -924,7 +1098,11 @@ impl Mlp {
     }
     /// Width of the trunk's input, once the card embeddings are spliced in.
     pub fn xdim(&self) -> usize {
-        if self.v1 { self.pub_dim() } else { xdim_of(self.de) }
+        if self.v1 {
+            self.pub_dim()
+        } else {
+            xdim_of(self.de)
+        }
     }
     /// The tower shapes, for anything (the GPU service) that mirrors the
     /// chains: (card, pub widths, pub_out, hmlp widths, slot widths, nres).
@@ -1030,8 +1208,18 @@ impl Mlp {
                 .copy_from_slice(&xpub[r * stride + OFF_PILES..r * stride + OFF_PILES + step]);
         }
         let mut ph = vec![0.0f32; rows * NTYPE * de];
-        gemm_ld(rows * NTYPE, de, PILE_COUNTS, &cnt, PILE_COUNTS, &self.pile.w, de, 0.0,
-                &mut ph, de);
+        gemm_ld(
+            rows * NTYPE,
+            de,
+            PILE_COUNTS,
+            &cnt,
+            PILE_COUNTS,
+            &self.pile.w,
+            de,
+            0.0,
+            &mut ph,
+            de,
+        );
         for r in 0..rows {
             let src = &xpub[r * stride..r * stride + PUBFEAT];
             let dst = &mut x[r * xd..(r + 1) * xd];
@@ -1095,7 +1283,8 @@ impl Mlp {
                 std::mem::swap(&mut a, &mut b);
             }
             let mut slot = vec![0.0f32; n * NSLOT * dg];
-            self.slot_out.gemm(&a, n * NSLOT, self.slot_out.i, 0.0, &mut slot);
+            self.slot_out
+                .gemm(&a, n * NSLOT, self.slot_out.i, 0.0, &mut slot);
             for r in 0..n {
                 let out = &mut z[r * dg..(r + 1) * dg];
                 out.fill(0.0);
@@ -1120,7 +1309,8 @@ impl Mlp {
             bb.bias(n, z);
         }
         fit(g, n * (rk + 1));
-        self.wg.gemm(&z[..n * dg], n, dg, 0.0, &mut g[..n * (rk + 1)]);
+        self.wg
+            .gemm(&z[..n * dg], n, dg, 0.0, &mut g[..n * (rk + 1)]);
         self.wg.bias(n, g);
     }
 
@@ -1148,7 +1338,15 @@ impl Mlp {
         let mut a = std::mem::take(scratch);
         fit(&mut a, rows * l0.o);
         l0.gemm(src, rows, lda, 0.0, &mut a[..rows * l0.o]);
-        self.ln_relu(rows, l0.o, &l0.b, &self.pub_ln[0].0, &self.pub_ln[0].1, None, &mut a);
+        self.ln_relu(
+            rows,
+            l0.o,
+            &l0.b,
+            &self.pub_ln[0].0,
+            &self.pub_ln[0].1,
+            None,
+            &mut a,
+        );
         let mut b = Vec::new();
         for (l, ln) in self.pub_lin[1..].iter().zip(&self.pub_ln[1..]) {
             fit(&mut b, rows * l.o);
@@ -1157,7 +1355,13 @@ impl Mlp {
             std::mem::swap(&mut a, &mut b);
         }
         fit(out, rows * self.head_in);
-        self.pub_out.gemm(&a, rows, self.pub_out.i, 0.0, &mut out[..rows * self.head_in]);
+        self.pub_out.gemm(
+            &a,
+            rows,
+            self.pub_out.i,
+            0.0,
+            &mut out[..rows * self.head_in],
+        );
         *scratch = a;
     }
 
@@ -1183,9 +1387,27 @@ impl Mlp {
         let (hd, bd) = (self.head_in, self.belief_dim());
         debug_assert_eq!(xbel.len(), rows * bd);
         fit(out, rows * hd);
-        gemm_ld(rows, hd, bd, xbel, bd, &self.wb, hd, 0.0, &mut out[..rows * hd], hd);
-        self.ln_relu(rows, hd, &self.pub_out.b, &self.ln1.0, &self.ln1.1, Some(pre),
-                     &mut out[..rows * hd]);
+        gemm_ld(
+            rows,
+            hd,
+            bd,
+            xbel,
+            bd,
+            &self.wb,
+            hd,
+            0.0,
+            &mut out[..rows * hd],
+            hd,
+        );
+        self.ln_relu(
+            rows,
+            hd,
+            &self.pub_out.b,
+            &self.ln1.0,
+            &self.ln1.1,
+            Some(pre),
+            &mut out[..rows * hd],
+        );
         if self.hmlp.is_empty() {
             return;
         }
@@ -1251,8 +1473,7 @@ impl Mlp {
         // row with a `q` row — both matmuls.
         let mut zc = vec![0.0f32; nc * dg];
         for (ci, &c) in cidx.iter().enumerate() {
-            zc[ci * dg..(ci + 1) * dg]
-                .copy_from_slice(&z[c as usize * dg..(c as usize + 1) * dg]);
+            zc[ci * dg..(ci + 1) * dg].copy_from_slice(&z[c as usize * dg..(c as usize + 1) * dg]);
         }
         let mut k = vec![0.0f32; nc * rk];
         self.wk.gemm(&zc, nc, dg, 0.0, &mut k);
@@ -1287,13 +1508,23 @@ impl Mlp {
     ) -> Vec<f32> {
         let (rk, pd) = (self.rank, self.pub_dim());
         let (mut sb, mut pre, mut e, mut z, mut g, mut u) = (
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
         );
         (0..rows)
             .map(|r| {
-                self.cards(&xpub[r * pd..(r + 1) * pd], &ids[r * NTYPE..(r + 1) * NTYPE], &mut e);
+                self.cards(
+                    &xpub[r * pd..(r + 1) * pd],
+                    &ids[r * NTYPE..(r + 1) * NTYPE],
+                    &mut e,
+                );
                 self.trunk(&xpub[r * pd..], 1, pd, &e, &mut sb, &mut pre);
-                self.pbs_head(&xbel[r * self.belief_dim()..], 1, &pre, &mut sb, &mut u);
+                let bd = self.belief_dim();
+                self.pbs_head(&xbel[r * bd..(r + 1) * bd], 1, &pre, &mut sb, &mut u);
                 self.embed(
                     &phi[r * self.cfeat()..(r + 1) * self.cfeat()],
                     1,
@@ -1330,8 +1561,16 @@ mod gemm_tests {
     /// Scalar reference for both GEMM shapes. The production path is a real
     /// GEMM backend (Accelerate on Apple, matrixmultiply elsewhere); this pins
     /// it to the naive definition on every platform.
-    fn reference(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], bt: bool, beta: f32,
-                 c: &mut [f32]) {
+    fn reference(
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &[f32],
+        b: &[f32],
+        bt: bool,
+        beta: f32,
+        c: &mut [f32],
+    ) {
         for i in 0..m {
             for j in 0..n {
                 let mut s = if beta == 0.0 { 0.0 } else { c[i * n + j] };
@@ -1346,7 +1585,9 @@ mod gemm_tests {
 
     fn filled(n: usize, seed: u64) -> Vec<f32> {
         let mut rng = crate::rng::Rng::new(seed);
-        (0..n).map(|_| (rng.next_u64() % 2000) as f32 / 1000.0 - 1.0).collect()
+        (0..n)
+            .map(|_| (rng.next_u64() % 2000) as f32 / 1000.0 - 1.0)
+            .collect()
     }
 
     #[test]
@@ -1378,9 +1619,17 @@ mod format_tests {
 
     /// Restate the v3 blob sizes independently of the parser, so a slip in
     /// either shows as a mismatch here rather than as garbage values.
-    fn v3_sizes(de: usize, dg: usize, rk: usize, hd: usize, nres: usize,
-                card: &[usize], pubw: &[usize], hmlp: &[usize], slot: &[usize])
-                -> (usize, usize, usize) {
+    fn v3_sizes(
+        de: usize,
+        dg: usize,
+        rk: usize,
+        hd: usize,
+        nres: usize,
+        card: &[usize],
+        pubw: &[usize],
+        hmlp: &[usize],
+        slot: &[usize],
+    ) -> (usize, usize, usize) {
         let chain = |first: usize, mid: &[usize], last: usize| -> (usize, usize) {
             let mut w = 0;
             let mut b = 0;
@@ -1398,10 +1647,19 @@ mod format_tests {
         let (hw, hb) = chain(hd, hmlp, rk); // hmlp chain ends in wu
         let head_out = hmlp.last().copied().unwrap_or(hd);
         let (sw, sb) = chain(hfeat(de), slot, dg);
-        let w = cw + crate::units::N_UNITS * de + (PILE_COUNTS + de) * de
-            + pw + ow + 2 * dg * hd + hw + sw
-            + nres * 2 * dg * dg + dg * (rk + 1)
-            + (AFEAT + de) * rk + dg * rk + head_out * rk;
+        let w = cw
+            + crate::units::N_UNITS * de
+            + (PILE_COUNTS + de) * de
+            + pw
+            + ow
+            + 2 * dg * hd
+            + hw
+            + sw
+            + nres * 2 * dg * dg
+            + dg * (rk + 1)
+            + (AFEAT + de) * rk
+            + dg * rk
+            + head_out * rk;
         let b = cb + de + pb + ob + hb + sb + nres * 2 * dg + (rk + 1) + 3 * rk;
         let ln = 2 * pubw.iter().sum::<usize>() + 2 * hd;
         (w, b, ln)
@@ -1411,8 +1669,17 @@ mod format_tests {
         (0..n).map(|i| ((i % 37) as f32 - 18.0) * 0.01).collect()
     }
 
-    fn dims_of(de: usize, dg: usize, rk: usize, hd: usize, nres: usize,
-               card: &[usize], pubw: &[usize], hmlp: &[usize], slot: &[usize]) -> Vec<usize> {
+    fn dims_of(
+        de: usize,
+        dg: usize,
+        rk: usize,
+        hd: usize,
+        nres: usize,
+        card: &[usize],
+        pubw: &[usize],
+        hmlp: &[usize],
+        slot: &[usize],
+    ) -> Vec<usize> {
         let mut d = vec![3, de, dg, rk, hd, nres];
         for list in [card, pubw, hmlp, slot] {
             d.push(list.len());
@@ -1424,9 +1691,29 @@ mod format_tests {
     #[test]
     fn v3_loads_at_any_depth() {
         for (de, dg, rk, hd, nres, card, pubw, hmlp, slot) in [
-            (32, 64, 64, 384, 1, vec![64], vec![384], vec![], vec![]),      // = v2 default
-            (16, 96, 48, 128, 2, vec![24, 24], vec![192, 96], vec![96], vec![24]),
-            (8, 32, 16, 64, 0, vec![], vec![64, 64, 64], vec![48, 48], vec![]),
+            (32, 64, 64, 384, 1, vec![64], vec![384], vec![], vec![]), // = v2 default
+            (
+                16,
+                96,
+                48,
+                128,
+                2,
+                vec![24, 24],
+                vec![192, 96],
+                vec![96],
+                vec![24],
+            ),
+            (
+                8,
+                32,
+                16,
+                64,
+                0,
+                vec![],
+                vec![64, 64, 64],
+                vec![48, 48],
+                vec![],
+            ),
         ] {
             let (nw, nb, nl) = v3_sizes(de, dg, rk, hd, nres, &card, &pubw, &hmlp, &slot);
             let dims = dims_of(de, dg, rk, hd, nres, &card, &pubw, &hmlp, &slot);
@@ -1457,7 +1744,10 @@ mod format_tests {
             let phi = ramp(rows * net.cfeat());
             let out = net.forward(&xpub, &xbel, &phi, &ids, rows);
             assert!(out.iter().all(|v| v.is_finite()), "{dims:?}: {out:?}");
-            assert!(out.iter().any(|v| v.abs() > 1e-6), "{dims:?}: all-zero output");
+            assert!(
+                out.iter().any(|v| v.abs() > 1e-6),
+                "{dims:?}: all-zero output"
+            );
         }
     }
 
@@ -1467,9 +1757,21 @@ mod format_tests {
         let (p, h, hd, dg, rk, de, dc) = (PUBFEAT, 96, 64, 32, 24, 16, 24);
         let dims = vec![p, h, hd, CFEAT, dg, rk, AFEAT, de, dc, 0];
         let (af, hf, xd) = (AFEAT + de, hfeat(de), xdim_of(de));
-        let nw = CARD_FEATS * dc + dc * de + crate::units::N_UNITS * de
-            + (PILE_COUNTS + de) * de + xd * h + h * hd + 2 * dg * hd + hf * dg
-            + dg * dg + dg * dg + dg * (rk + 1) + hd * rk + af * rk + dg * rk + hd * rk;
+        let nw = CARD_FEATS * dc
+            + dc * de
+            + crate::units::N_UNITS * de
+            + (PILE_COUNTS + de) * de
+            + xd * h
+            + h * hd
+            + 2 * dg * hd
+            + hf * dg
+            + dg * dg
+            + dg * dg
+            + dg * (rk + 1)
+            + hd * rk
+            + af * rk
+            + dg * rk
+            + hd * rk;
         let nb = dc + de + de + h + hd + dg + dg + dg + (rk + 1) + 4 * rk;
         let net = Mlp::from_flat(&dims, &ramp(nw), &ramp(nb), &ramp(2 * h + 2 * hd)).unwrap();
         assert_eq!(net.head(), hd);

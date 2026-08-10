@@ -67,9 +67,16 @@ fn open_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
     let res = reserve(s, p, ctx);
     let truth = true_config(s, p, ctx);
     let cfg = enumerate_configs(&res, truth.hand_size(), truth.fd_size());
-    let cfg = if cfg.is_empty() { vec![Config::default()] } else { cfg };
+    let cfg = if cfg.is_empty() {
+        vec![Config::default()]
+    } else {
+        cfg
+    };
     let w = 1.0 / cfg.len() as f32;
-    Belief { p: vec![w; cfg.len()], cfg }
+    Belief {
+        p: vec![w; cfg.len()],
+        cfg,
+    }
 }
 
 /// Belief-weighted RMS deviation of `v` within each group of configs sharing a
@@ -175,7 +182,12 @@ fn main() {
         // ---- how many coin plays are left in the round, i.e. how deep a
         // subgame has to be before a round-start draw comes inside it.
         let plays_left: usize = (0..2)
-            .map(|p| s.zones[p][Z_HAND].iter().map(|&x| x as usize).sum::<usize>())
+            .map(|p| {
+                s.zones[p][Z_HAND]
+                    .iter()
+                    .map(|&x| x as usize)
+                    .sum::<usize>()
+            })
             .sum();
 
         // ---- does the root STRATEGY differ between configs sharing a hand?
@@ -186,7 +198,12 @@ fn main() {
         // its own bag even though it knows it. Under the hand-keyed value
         // function that held everywhere except at a round-start draw.
         {
-            let cfg = Cfg { depth: 2, iters, snapshots: true, ..Default::default() };
+            let cfg = Cfg {
+                depth: 2,
+                iters,
+                snapshots: true,
+                ..Default::default()
+            };
             let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
             sv.multistep(iters);
             let mut worst = 0.0f64;
@@ -214,7 +231,12 @@ fn main() {
 
         // ---- value residual at each depth.
         for (di, &d) in DEPTHS.iter().enumerate() {
-            let cfg = Cfg { depth: d, iters, snapshots: true, ..Default::default() };
+            let cfg = Cfg {
+                depth: d,
+                iters,
+                snapshots: true,
+                ..Default::default()
+            };
             let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
             sv.multistep(iters);
             let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
@@ -249,25 +271,43 @@ fn main() {
     let _ = ref_n;
     let mean = ref_sum / pf;
     let var = ref_sq / pf - mean * mean;
-    println!("\n{positions} positions, {:.1} configs each over {:.1} distinct hands",
-             ncfg / pf, nkey / pf);
-    println!("value scale (depth 2): mean {mean:+.4}, spread {:.4}", var.max(0.0).sqrt());
+    println!(
+        "\n{positions} positions, {:.1} configs each over {:.1} distinct hands",
+        ncfg / pf,
+        nkey / pf
+    );
+    println!(
+        "value scale (depth 2): mean {mean:+.4}, spread {:.4}",
+        var.max(0.0).sqrt()
+    );
 
     println!("\n-- information at stake: how much a hand fails to pin down --");
-    println!("  belief mass in hands holding >1 config     : {:>7.1}%", 100.0 * multi_mass / pf);
-    println!("  within-hand RMS bag deviation, per slot    : {:>7.4} coins",
-             (bag_rms / pf / NSLOT as f64).sqrt());
+    println!(
+        "  belief mass in hands holding >1 config     : {:>7.1}%",
+        100.0 * multi_mass / pf
+    );
+    println!(
+        "  within-hand RMS bag deviation, per slot    : {:>7.4} coins",
+        (bag_rms / pf / NSLOT as f64).sqrt()
+    );
     println!("  worst single slot seen                     : {bag_max:>7.4} coins");
 
     println!("\n-- root strategy, between configs sharing a hand (depth 2) --");
     println!("  same-hand config pairs compared             : {pol_pairs}");
-    println!("  pairs whose action distributions differ     : {:>7.1}%",
-             100.0 * pol_diff as f64 / pol_pairs.max(1) as f64);
-    println!("  mean / worst max-abs difference            : {:.5} / {pol_worst:.5}",
-             pol_sum / pol_pairs.max(1) as f64);
+    println!(
+        "  pairs whose action distributions differ     : {:>7.1}%",
+        100.0 * pol_diff as f64 / pol_pairs.max(1) as f64
+    );
+    println!(
+        "  mean / worst max-abs difference            : {:.5} / {pol_worst:.5}",
+        pol_sum / pol_pairs.max(1) as f64
+    );
 
     println!("\n-- how far the value separates configs sharing a hand --");
-    println!("{:>6}  {:>14}  {:>16}  {:>10}", "depth", "all positions", "spans a draw", "n(draw)");
+    println!(
+        "{:>6}  {:>14}  {:>16}  {:>10}",
+        "depth", "all positions", "spans a draw", "n(draw)"
+    );
     for (di, d) in DEPTHS.iter().enumerate() {
         let all = vres[di] / n_all[di].max(1) as f64;
         let dr = vres_draw[di] / n_draw[di].max(1) as f64;

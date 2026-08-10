@@ -1,0 +1,11 @@
+Block 1 order: baseline, candidate, candidate, baseline
+Block 2 order: candidate, baseline, baseline, candidate
+Workload: frozen one-card tape, 64 roots, 20 seconds, GPU 0, 3 producers
+Environment: WARCHEST_DIRECT=1 WARCHEST_WAVE_LANES=5 WARCHEST_WAVE_WHALE_LANES=1 WARCHEST_WAVE_ROWS=196608 WARCHEST_WAVE_JOBS=256 WARCHEST_WAVE_US=75000 WARCHEST_TAPE_QUEUE=128
+
+baseline:  581.8, 574.7, 582.2, 582.5 solves/s
+candidate: 581.7, 587.9, 590.1, 583.9 solves/s
+
+baseline mean:  580.30 solves/s
+candidate mean: 585.90 solves/s
+relative change: +0.97%

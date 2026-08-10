@@ -32,8 +32,8 @@ use warchest::rebel::*;
 use warchest::rng::Rng;
 use warchest::search::{node_actions, Cfg, Nets, Solver};
 use warchest::selfplay::make_game;
-use warchest::units::{write_card_features, CARD_FEATS, N_UNITS};
 use warchest::state::{Cont, State, Z_BAG, Z_FACEDOWN, Z_FACEUP};
+use warchest::units::{write_card_features, CARD_FEATS, N_UNITS};
 use warchest::Action;
 
 /// A network with random weights, for tests that need the value function to
@@ -43,15 +43,31 @@ fn random_net(seed: u64, hidden: usize, dg: usize) -> Mlp {
     let (de, dc, rk) = (16usize, 32usize, dg);
     let dims = [PUBFEAT, hidden, hidden, CFEAT, dg, rk, AFEAT, de, dc, 0];
     let xd = warchest::board::N_HEXES * (HEX_FACTS + de) + 2 * de + LOOSE;
-    let nw = CARD_FEATS * dc + dc * de + N_UNITS * de + (PILE_COUNTS + de) * de
-        + xd * hidden + hidden * hidden + 2 * dg * hidden + (4 + de) * dg
-        + dg * dg + dg * dg
-        + dg * (rk + 1) + hidden * rk + (AFEAT + de) * rk + dg * rk + hidden * rk;
+    let nw = CARD_FEATS * dc
+        + dc * de
+        + N_UNITS * de
+        + (PILE_COUNTS + de) * de
+        + xd * hidden
+        + hidden * hidden
+        + 2 * dg * hidden
+        + (4 + de) * dg
+        + dg * dg
+        + dg * dg
+        + dg * (rk + 1)
+        + hidden * rk
+        + (AFEAT + de) * rk
+        + dg * rk
+        + hidden * rk;
     let mut draw = |n: usize, scale: f32| -> Vec<f32> {
-        (0..n).map(|_| (r.unit_f64() as f32 - 0.5) * scale).collect()
+        (0..n)
+            .map(|_| (r.unit_f64() as f32 - 0.5) * scale)
+            .collect()
     };
     let w = draw(nw, 0.2);
-    let b = draw(dc + de + de + hidden + hidden + dg + dg + dg + (rk + 1) + 4 * rk, 0.2);
+    let b = draw(
+        dc + de + de + hidden + hidden + dg + dg + dg + (rk + 1) + 4 * rk,
+        0.2,
+    );
     // LayerNorm starts at its identity, as torch does.
     let mut ln = Vec::new();
     for _ in 0..2 {
@@ -160,9 +176,7 @@ fn leak_check(random_draft: bool) -> (usize, usize) {
                 );
                 // The pending-maneuver mask is channel `6 + NSLOT` of the
                 // hex-major block.
-                if (0..warchest::board::N_HEXES)
-                    .any(|h| a[h * HEX_CH + 6] != 0.0)
-                {
+                if (0..warchest::board::N_HEXES).any(|h| a[h * HEX_CH + 6] != 0.0) {
                     pending_seen += 1;
                 }
                 checked += 1;
@@ -390,7 +404,6 @@ fn compare(
     }
 }
 
-
 /// The config key must stay inside the packed `u64` budget (the key shares a
 /// word with the element index in the solver's sort): 38 bits of config +
 /// `IDX_BITS` index bits must not overflow. Also pins that the key
@@ -405,7 +418,11 @@ fn config_key_packing_has_headroom() {
             c.hand[k] = r.below(4) as u8;
             c.fd[k] = r.below(6) as u8;
         }
-        c.pending_coin = if r.next_u64() & 1 == 0 { None } else { Some(r.below(NSLOT) as u8) };
+        c.pending_coin = if r.next_u64() & 1 == 0 {
+            None
+        } else {
+            Some(r.below(NSLOT) as u8)
+        };
         let key = c.key();
         assert!(
             key < (1u64 << (64 - IDX_BITS)),
@@ -559,7 +576,11 @@ fn packed_row_expands_to_the_same_features() {
             let acts = s.legal_actions();
             s.apply_inplace(acts[rng.below(acts.len())]);
         }
-        assert!(checked > 20, "seed {} exercised too few MainPlay states", seed);
+        assert!(
+            checked > 20,
+            "seed {} exercised too few MainPlay states",
+            seed
+        );
     }
 }
 
@@ -604,7 +625,10 @@ fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
     let truth = true_config(s, p, ctx);
     let cfgs = enumerate_configs(&res, truth.hand_size(), truth.fd_size());
     let n = cfgs.len().max(1) as f32;
-    Belief { p: vec![1.0 / n; cfgs.len()], cfg: cfgs }
+    Belief {
+        p: vec![1.0 / n; cfgs.len()],
+        cfg: cfgs,
+    }
 }
 
 /// A subgame close enough to the horizon that every leaf is terminal has no
@@ -616,7 +640,9 @@ fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
 /// combination a benchmark hit and the suite did not.
 #[test]
 fn a_subgame_of_only_terminal_leaves_solves() {
-    let nets = Nets { value: random_net(5, 64, 16) };
+    let nets = Nets {
+        value: random_net(5, 64, 16),
+    };
     let mut checked = 0usize;
     for seed in 0..600u64 {
         let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
@@ -635,10 +661,17 @@ fn a_subgame_of_only_terminal_leaves_solves() {
         s.main_plays = warchest::state::MAX_MAIN_PLAYS - 1;
         let ctx = Ctx::new(&s);
         let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
-        let cfg = Cfg { depth: 2, iters: 8, snapshots: true, ..Default::default() };
+        let cfg = Cfg {
+            depth: 2,
+            iters: 8,
+            snapshots: true,
+            ..Default::default()
+        };
         let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
-        assert!(sv.nodes.iter().all(|n| !n.leaf || n.s.is_terminal()),
-                "expected every leaf terminal");
+        assert!(
+            sv.nodes.iter().all(|n| !n.leaf || n.s.is_terminal()),
+            "expected every leaf terminal"
+        );
         sv.multistep(cfg.iters);
         let v = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
         assert!(v[0][0].iter().all(|x| x.is_finite()));
@@ -663,11 +696,14 @@ fn a_pre_describer_checkpoint_still_solves() {
     let (hidden, dg, rank) = (64usize, 16usize, 16usize);
     let mut r = Rng::new(3);
     let dims = [warchest::v1::PUBFEAT_V1, hidden, CFEAT, dg, rank];
-    let nw = dims[0] * hidden + hidden * hidden + 2 * dg * hidden + CFEAT * dg
-        + dg * (rank + 1) + hidden * rank;
-    let mut draw = |n: usize| -> Vec<f32> {
-        (0..n).map(|_| (r.unit_f64() as f32 - 0.5) * 0.2).collect()
-    };
+    let nw = dims[0] * hidden
+        + hidden * hidden
+        + 2 * dg * hidden
+        + CFEAT * dg
+        + dg * (rank + 1)
+        + hidden * rank;
+    let mut draw =
+        |n: usize| -> Vec<f32> { (0..n).map(|_| (r.unit_f64() as f32 - 0.5) * 0.2).collect() };
     let w = draw(nw);
     let b = draw(hidden + hidden + dg + (rank + 1) + rank);
     let mut ln = Vec::new();
@@ -690,12 +726,23 @@ fn a_pre_describer_checkpoint_still_solves() {
     }
     let ctx = Ctx::new(&s);
     let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
-    let cfg = Cfg { depth: 2, iters: 32, snapshots: true, ..Default::default() };
+    let cfg = Cfg {
+        depth: 2,
+        iters: 32,
+        snapshots: true,
+        ..Default::default()
+    };
     let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
     sv.multistep(cfg.iters);
     let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
-    assert!(vals[0][0].iter().all(|v| v.is_finite()), "v1 solve produced non-finite values");
-    assert!(vals[0][0].iter().any(|v| *v != 0.0), "v1 solve produced all zeros");
+    assert!(
+        vals[0][0].iter().all(|v| v.is_finite()),
+        "v1 solve produced non-finite values"
+    );
+    assert!(
+        vals[0][0].iter().any(|v| *v != 0.0),
+        "v1 solve produced all zeros"
+    );
     assert!(sv.nash_conv().nash > -1e-3, "v1 NashConv is negative");
 }
 
@@ -712,7 +759,9 @@ fn a_pre_describer_checkpoint_still_solves() {
 /// no seed, however bad, may change the fixed point.
 #[test]
 fn a_warm_start_does_not_move_the_fixed_point() {
-    let nets = Nets { value: random_net(7, 96, 24) };
+    let nets = Nets {
+        value: random_net(7, 96, 24),
+    };
     let mut checked = 0usize;
     for seed in 0..400u64 {
         let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
@@ -732,7 +781,12 @@ fn a_warm_start_does_not_move_the_fixed_point() {
         if bel[0].len() > 24 || bel[1].len() > 24 {
             continue;
         }
-        let base = Cfg { depth: 2, iters: 400, snapshots: true, ..Default::default() };
+        let base = Cfg {
+            depth: 2,
+            iters: 400,
+            snapshots: true,
+            ..Default::default()
+        };
         let mut v = Vec::new();
         for warm in [0.0f32, 15.0] {
             let mut sv = Solver::new(&s, ctx, &nets, Cfg { warm, ..base }, bel.clone());
@@ -740,15 +794,21 @@ fn a_warm_start_does_not_move_the_fixed_point() {
             sv.multistep(base.iters);
             let root = [[bel[0].p.clone(), bel[1].p.clone()]];
             let vals = sv.value_under(&root);
-            v.push((0..bel[0].len())
-                .map(|c| bel[0].p[c] as f64 * vals[0][0][c] as f64)
-                .sum::<f64>());
-            assert!(sv.nash_conv().nash > -1e-3, "seed {seed}: NashConv is negative");
+            v.push(
+                (0..bel[0].len())
+                    .map(|c| bel[0].p[c] as f64 * vals[0][0][c] as f64)
+                    .sum::<f64>(),
+            );
+            assert!(
+                sv.nash_conv().nash > -1e-3,
+                "seed {seed}: NashConv is negative"
+            );
         }
         assert!(
             (v[0] - v[1]).abs() < 0.01,
             "seed {seed}: cold solve says {:.4}, warm says {:.4}",
-            v[0], v[1]
+            v[0],
+            v[1]
         );
         checked += 1;
         if checked >= 6 {
@@ -775,7 +835,11 @@ fn card_features_separate_every_draftable_unit() {
         .filter_map(|&id| warchest::units::index_of_id(id))
         .chain([warchest::units::ROYAL_COIN])
         .collect();
-    assert_eq!(units.len(), 20, "the draft pool did not resolve to unit indices");
+    assert_eq!(
+        units.len(),
+        20,
+        "the draft pool did not resolve to unit indices"
+    );
     for u in units {
         let mut f = vec![0.0f32; CARD_FEATS];
         write_card_features(u, &mut f);
@@ -836,7 +900,11 @@ fn action_features_separate_every_action() {
         }
     }
     assert!(checked > 5_000, "only {checked} action vectors exercised");
-    assert!(kinds.len() >= 8, "only {} action kinds exercised", kinds.len());
+    assert!(
+        kinds.len() >= 8,
+        "only {} action kinds exercised",
+        kinds.len()
+    );
 }
 
 /// The counts must be the ones the name says, and the bag must be the derived
@@ -845,7 +913,11 @@ fn action_features_separate_every_action() {
 #[test]
 fn config_counts_are_hand_facedown_bag() {
     let reserve = [4u8, 3, 5, 2, 1];
-    let c = Config { hand: [1, 0, 2, 0, 0], fd: [2, 1, 0, 0, 1], pending_coin: None };
+    let c = Config {
+        hand: [1, 0, 2, 0, 0],
+        fd: [2, 1, 0, 0, 1],
+        pending_coin: None,
+    };
     let mut cnt = [0u8; CCOUNTS];
     config_counts(&c, &reserve, &mut cnt);
     assert_eq!(&cnt[..NSLOT], &c.hand, "hand block");
@@ -893,7 +965,10 @@ fn position_with_ambiguous_facedown(seed: u64) -> Option<(State, Ctx, [Belief; 2
             return None;
         }
         let w = 1.0 / cfg.len() as f32;
-        bel.push(Belief { p: vec![w; cfg.len()], cfg });
+        bel.push(Belief {
+            p: vec![w; cfg.len()],
+            cfg,
+        });
     }
     let me = s.to_act() as usize;
     let mut hands: HashMap<[u8; NSLOT], usize> = HashMap::new();
@@ -915,7 +990,12 @@ fn position_with_ambiguous_facedown(seed: u64) -> Option<(State, Ctx, [Belief; 2
 fn a_solve_reads_only_the_beliefs() {
     let mut nets = Nets::default();
     nets.value = random_net(0xA11CE, 64, 16);
-    let cfg = Cfg { depth: 2, iters: 8, snapshots: true, ..Default::default() };
+    let cfg = Cfg {
+        depth: 2,
+        iters: 8,
+        snapshots: true,
+        ..Default::default()
+    };
     let mut checked = 0usize;
     for seed in 1..80u64 {
         let Some((s, ctx, bel)) = position_with_ambiguous_facedown(seed) else {
@@ -939,9 +1019,18 @@ fn a_solve_reads_only_the_beliefs() {
                 .collect();
             runs.push((vals[0][0].clone(), vals[0][1].clone(), strat));
         }
-        assert_eq!(runs[0].0, runs[1].0, "player 0 root values moved with the true world");
-        assert_eq!(runs[0].1, runs[1].1, "player 1 root values moved with the true world");
-        assert_eq!(runs[0].2, runs[1].2, "the root strategy moved with the true world");
+        assert_eq!(
+            runs[0].0, runs[1].0,
+            "player 0 root values moved with the true world"
+        );
+        assert_eq!(
+            runs[0].1, runs[1].1,
+            "player 1 root values moved with the true world"
+        );
+        assert_eq!(
+            runs[0].2, runs[1].2,
+            "the root strategy moved with the true world"
+        );
         checked += 1;
     }
     assert!(checked > 20, "only {checked} positions exercised");
@@ -959,7 +1048,12 @@ fn a_solve_reads_only_the_beliefs() {
 fn the_value_function_separates_configs_sharing_a_hand() {
     let mut nets = Nets::default();
     nets.value = random_net(0xBEEF, 64, 16);
-    let cfg = Cfg { depth: 2, iters: 8, snapshots: true, ..Default::default() };
+    let cfg = Cfg {
+        depth: 2,
+        iters: 8,
+        snapshots: true,
+        ..Default::default()
+    };
     let (mut positions, mut val_differs, mut strat_differs) = (0usize, 0usize, 0usize);
     for seed in 1..80u64 {
         let Some((s, ctx, bel)) = position_with_ambiguous_facedown(seed) else {
@@ -993,8 +1087,16 @@ fn the_value_function_separates_configs_sharing_a_hand() {
     // where a round-start draw happened to fall inside the horizon.
     let vf = val_differs as f64 / positions as f64;
     let sf = strat_differs as f64 / positions as f64;
-    assert!(vf > 0.9, "only {:.0}% of same-hand config pairs got distinct values", vf * 100.0);
-    assert!(sf > 0.5, "only {:.0}% of same-hand config pairs got distinct play", sf * 100.0);
+    assert!(
+        vf > 0.9,
+        "only {:.0}% of same-hand config pairs got distinct values",
+        vf * 100.0
+    );
+    assert!(
+        sf > 0.5,
+        "only {:.0}% of same-hand config pairs got distinct play",
+        sf * 100.0
+    );
 }
 
 /// `normalize_weights` is what turns a reach vector into the belief the network
@@ -1019,7 +1121,10 @@ fn normalized_weights_match_belief_normalize() {
         };
         let mut got = vec![0.0f32; cfgs.len()];
         normalize_weights(&w, &mut got);
-        let mut bel = Belief { cfg: cfgs.clone(), p: w.clone() };
+        let mut bel = Belief {
+            cfg: cfgs.clone(),
+            p: w.clone(),
+        };
         bel.normalize();
         for (a, b) in got.iter().zip(bel.p.iter()) {
             assert!((a - b).abs() < 2e-7, "{a} vs {b}");
@@ -1038,14 +1143,26 @@ fn from_pairs_keeps_zero_weight_configs() {
     // index by one — the walk-desync panic that killed
     // runs/t256_h384_dg64_s12 at epoch 168.
     let a = Config::default();
-    let b = Config { hand: [1, 0, 0, 0, 0], fd: [0; NSLOT], pending_coin: None };
-    let c = Config { hand: [0; NSLOT], fd: [1, 0, 0, 0, 0], pending_coin: None };
+    let b = Config {
+        hand: [1, 0, 0, 0, 0],
+        fd: [0; NSLOT],
+        pending_coin: None,
+    };
+    let c = Config {
+        hand: [0; NSLOT],
+        fd: [1, 0, 0, 0, 0],
+        pending_coin: None,
+    };
     let bel = Belief::from_pairs(vec![
         (b, 0.25),
         (c, -0.5), // a negative weight is still dropped
         (a, 0.0),  // underflowed to exactly zero: kept, in sorted position
     ]);
-    assert_eq!(bel.cfg, vec![a, b], "zero-weight config must stay in the support");
+    assert_eq!(
+        bel.cfg,
+        vec![a, b],
+        "zero-weight config must stay in the support"
+    );
     assert_eq!(bel.p[0], 0.0, "the kept config's weight stays exactly zero");
     assert_eq!(bel.p[1], 1.0, "kept configs are renormalized");
 }
@@ -1094,7 +1211,10 @@ fn zero_weight_config_survives_the_walk_update() {
                 break;
             }
             let w = 1.0 / cfg.len() as f32;
-            bel.push(Belief { p: vec![w; cfg.len()], cfg });
+            bel.push(Belief {
+                p: vec![w; cfg.len()],
+                cfg,
+            });
         }
         if bel.len() != 2 {
             continue;
@@ -1106,16 +1226,26 @@ fn zero_weight_config_survives_the_walk_update() {
         bel[me].p[0] = 1e-46;
         bel[me].normalize();
         let mut sv = Solver::new(
-            &s, ctx, &nets[0],
-            Cfg { depth: 2, iters: 8, snapshots: false, ..Default::default() },
+            &s,
+            ctx,
+            &nets[0],
+            Cfg {
+                depth: 2,
+                iters: 8,
+                snapshots: false,
+                ..Default::default()
+            },
             bel.clone(),
         );
         sv.multistep(8);
         let n0 = &sv.nodes[0];
-        let na = n0.na();
         // An action the underflowed config can actually play, so the tree's
         // child support includes it.
-        let Some(chosen) = (0..na).find(|&a| n0.legal[na + a]) else {
+        let Some(chosen) = n0
+            .legal_row(1)
+            .map(|cell| n0.legal_action[cell] as usize)
+            .next()
+        else {
             continue;
         };
         let child = n0.child[n0.obs_child[chosen]];
@@ -1129,12 +1259,13 @@ fn zero_weight_config_survives_the_walk_update() {
         let mut pairs = Vec::new();
         for (ci, c) in bel[me].cfg.iter().enumerate() {
             let row = sv.average_strategy(0, ci);
-            for a in 0..na {
-                if !n0.legal[ci * na + a] || obs_key(&n0.acts[a]) != obs {
+            for (cell, &p) in n0.legal_row(ci).zip(row) {
+                let a = n0.legal_action[cell] as usize;
+                if obs_key(&n0.acts[a]) != obs {
                     continue;
                 }
                 if let Some(n) = advance_config(c, n0.aslot[a], n0.fdown[a]) {
-                    pairs.push((n, bel[me].p[ci] * row[a]));
+                    pairs.push((n, bel[me].p[ci] * p));
                 }
             }
         }

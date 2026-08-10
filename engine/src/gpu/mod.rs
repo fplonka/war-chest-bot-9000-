@@ -1,23 +1,17 @@
-//! The GPU solve service (work package B): solves run on the CUDA device.
-//!
-//! One process, three roles (docs/arch plan, section 8): the workers build
-//! trees on the CPU and submit them as serialized jobs; the GPU service (one
-//! thread, owns GPU-0) keeps a live set of solves resident and advances it
-//! with ticks; the trainer (Python) publishes weights. The worker-side
-//! client (`client`) compiles always; the service itself is behind the `gpu`
-//! cargo feature, so without CUDA the engine builds and runs exactly as
-//! before and the client's calls fail at runtime.
+//! The v5 GPU wave executor. Packed sparse solves are cost-bucketed into
+//! contiguous waves; a completion contains everything the actor needs and no
+//! solve remains resident while the public game walks its tree.
 
 pub mod client;
+pub(crate) mod wave;
 
 #[cfg(feature = "gpu")]
-pub mod layout;
+mod device;
 #[cfg(feature = "gpu")]
 pub mod service;
-#[cfg(feature = "gpu")]
-#[cfg(test)]
+#[cfg(all(test, feature = "gpu"))]
 mod tests;
 
-pub use client::{GpuClient, SolveHandle, Trip1, Trip2};
+pub use client::{CarriedBeliefs, CarryStore, GpuClient, SolveHandle, SolveResult};
 #[cfg(feature = "gpu")]
 pub use service::Service;

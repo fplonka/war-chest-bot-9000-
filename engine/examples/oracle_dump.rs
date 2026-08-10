@@ -25,7 +25,7 @@ use warchest::net::Mlp;
 use warchest::rng::Rng;
 use warchest::search::{Cfg, Nets, Solver};
 use warchest::selfplay::{collect_roots, Agent, Collect, GameCfg};
-use warchest::serialize::Job;
+use warchest::serialize::PackedJob;
 
 /// The production shape the pre-CUDA runs train. The service reads dims from
 /// the weights, so any shape works — this one is just the default.
@@ -74,7 +74,15 @@ fn main() {
     // Roots from real ReBeL solves under the dump's own weights: the tree
     // shapes are the ones the GPU will actually see.
     let gc = GameCfg {
-        agents: [Agent::Rebel { cfg: Cfg { depth: 2, iters: 4, snapshots: false, ..Default::default() }, slot: 0 }; 2],
+        agents: [Agent::Rebel {
+            cfg: Cfg {
+                depth: 2,
+                iters: 4,
+                snapshots: false,
+                ..Default::default()
+            },
+            slot: 0,
+        }; 2],
         collect: Collect::None,
         explore: 0.0,
         random_draft: true,
@@ -101,10 +109,13 @@ fn main() {
         let leaf = *sv.leaf_rows.first().expect("non-terminal leaves");
         let carried = sv.carried_beliefs(leaf);
         let conv = sv.nash_conv();
-        let job = Job::from_solver(&sv, &roots_v);
+        let job = PackedJob::from_solver(&sv, &roots_v);
         fs::write(format!("{out_dir}/solve_{k}.bin"), job.to_bytes()).expect("job");
-        fs::write(format!("{out_dir}/solve_{k}.ref"), ref_bytes(&sv, &vals, leaf, &carried, conv))
-            .expect("ref");
+        fs::write(
+            format!("{out_dir}/solve_{k}.ref"),
+            ref_bytes(&sv, &vals, leaf, &carried, conv),
+        )
+        .expect("ref");
         println!(
             "solve {k}: nodes={} leaves={} ncfg={} ncells={} iters={iters} -> solve_{k}.bin",
             sv.nodes.len(),
@@ -203,7 +214,12 @@ fn parse_weights(raw: &[u8]) -> (Vec<usize>, Vec<f32>, Vec<f32>, Vec<f32>) {
     };
     let nd = u32_at(raw, &mut at);
     let dims: Vec<usize> = (0..nd).map(|_| u32_at(raw, &mut at)).collect();
-    (dims, f32s_at(raw, &mut at), f32s_at(raw, &mut at), f32s_at(raw, &mut at))
+    (
+        dims,
+        f32s_at(raw, &mut at),
+        f32s_at(raw, &mut at),
+        f32s_at(raw, &mut at),
+    )
 }
 
 /// Deterministic random flat arrays in the production shape, with the
@@ -219,7 +235,8 @@ fn random_flat() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let (af, hf, xd) = (
         DIMS[6] + de,
         4 + de,
-        warchest::board::N_HEXES * (warchest::rebel::HEX_FACTS + de) + 2 * de
+        warchest::board::N_HEXES * (warchest::rebel::HEX_FACTS + de)
+            + 2 * de
             + warchest::rebel::LOOSE,
     );
     let n_w = warchest::units::CARD_FEATS * dc

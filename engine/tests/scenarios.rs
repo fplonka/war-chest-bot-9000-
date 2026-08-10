@@ -717,7 +717,7 @@ fn warrior_priest_v1_does_not_block_v2() {
     s.set_unit(LOC_11, WHITE, WARRIOR_PRIEST, 1);
     s.set_unit(CENTER, WHITE, WARRIOR_PRIEST_V2, 1);
     s.set_unit(E1, BLACK, FOOTMAN, 3); // survives two attacks
-    // V1 attacks instead of controls: simpler, both trigger on attack.
+                                       // V1 attacks instead of controls: simpler, both trigger on attack.
     s.add_zone(WHITE, Z_HAND, WARRIOR_PRIEST, 1); // coin to spend on the V1 attack
     s.add_zone(WHITE, Z_BAG, WARRIOR_PRIEST_V2, 1); // V1's forced draw: a V2 coin
     let s2 = s.apply(Action::Attack {
@@ -759,9 +759,7 @@ fn warrior_priest_forced_play_of_rg_coin_cannot_use_rg_tactic() {
         from: W1 as u8,
         target: E1 as u8,
     });
-    let s3 = s2.apply(Action::DrawCoin {
-        unit: ROYAL_GUARD,
-    });
+    let s3 = s2.apply(Action::DrawCoin { unit: ROYAL_GUARD });
     let plays = s3.legal_actions();
     assert!(has(&plays, Action::Pass { coin: ROYAL_GUARD }));
     assert!(

@@ -8,7 +8,12 @@ use warchest::search::Cfg;
 use warchest::selfplay::{play_game, Agent, Collect, Data, GameCfg};
 
 fn cfg() -> Cfg {
-    Cfg { depth: 2, iters: 8, snapshots: false, ..Default::default() }
+    Cfg {
+        depth: 2,
+        iters: 8,
+        snapshots: false,
+        ..Default::default()
+    }
 }
 
 /// Self-play with empty nets: the walk mechanics (build, act on the sampled
@@ -24,8 +29,14 @@ fn walk_serves_multiple_decisions_per_solve() {
             let mut d = Data::default();
             let gc = GameCfg {
                 agents: [
-                    Agent::Rebel { cfg: cfg(), slot: 0 },
-                    Agent::Rebel { cfg: cfg(), slot: 0 },
+                    Agent::Rebel {
+                        cfg: cfg(),
+                        slot: 0,
+                    },
+                    Agent::Rebel {
+                        cfg: cfg(),
+                        slot: 0,
+                    },
                 ],
                 collect: Collect::Rebel,
                 explore,
@@ -59,8 +70,14 @@ fn walk_in_eval_mode() {
     let mut d = Data::default();
     let gc = GameCfg {
         agents: [
-            Agent::Rebel { cfg: cfg(), slot: 0 },
-            Agent::Rebel { cfg: cfg(), slot: 0 },
+            Agent::Rebel {
+                cfg: cfg(),
+                slot: 0,
+            },
+            Agent::Rebel {
+                cfg: cfg(),
+                slot: 0,
+            },
         ],
         collect: Collect::None,
         explore: 0.0,
@@ -82,7 +99,10 @@ fn walk_interrupted_by_non_rebel_agent() {
     let mut d = Data::default();
     let gc = GameCfg {
         agents: [
-            Agent::Rebel { cfg: cfg(), slot: 0 },
+            Agent::Rebel {
+                cfg: cfg(),
+                slot: 0,
+            },
             Agent::Greedy { temp: 1.0 },
         ],
         collect: Collect::Rebel,
@@ -116,8 +136,14 @@ fn walk_never_crosses_slots() {
         let mut d = Data::default();
         let gc = GameCfg {
             agents: [
-                Agent::Rebel { cfg: cfg(), slot: 0 },
-                Agent::Rebel { cfg: cfg(), slot: 1 },
+                Agent::Rebel {
+                    cfg: cfg(),
+                    slot: 0,
+                },
+                Agent::Rebel {
+                    cfg: cfg(),
+                    slot: 1,
+                },
             ],
             collect: Collect::Rebel,
             explore: 0.1,
@@ -137,7 +163,10 @@ fn walk_never_crosses_slots() {
         total_rows,
         total_dec
     );
-    eprintln!("slot-crossing probe: rows/decisions = {}/{}", total_rows, total_dec);
+    eprintln!(
+        "slot-crossing probe: rows/decisions = {}/{}",
+        total_rows, total_dec
+    );
 }
 
 /// Random drafts exercise different unit sets, slot maps and action shapes;
@@ -152,8 +181,14 @@ fn walk_with_random_drafts() {
         let mut d = Data::default();
         let gc = GameCfg {
             agents: [
-                Agent::Rebel { cfg: cfg(), slot: 0 },
-                Agent::Rebel { cfg: cfg(), slot: 0 },
+                Agent::Rebel {
+                    cfg: cfg(),
+                    slot: 0,
+                },
+                Agent::Rebel {
+                    cfg: cfg(),
+                    slot: 0,
+                },
             ],
             collect: Collect::Rebel,
             explore: 0.3,
@@ -188,8 +223,14 @@ fn walk_across_warrior_priest_draws() {
         let mut d = Data::default();
         let gc = GameCfg {
             agents: [
-                Agent::Rebel { cfg: cfg(), slot: 0 },
-                Agent::Rebel { cfg: cfg(), slot: 0 },
+                Agent::Rebel {
+                    cfg: cfg(),
+                    slot: 0,
+                },
+                Agent::Rebel {
+                    cfg: cfg(),
+                    slot: 0,
+                },
             ],
             collect: Collect::Rebel,
             explore: 0.25,
@@ -203,7 +244,8 @@ fn walk_across_warrior_priest_draws() {
         total_dec += d.decisions;
     }
     assert!(total_dec > 0);
-}/// A tiny node cap: some random-draft roots would build enormous trees, and
+}
+/// A tiny node cap: some random-draft roots would build enormous trees, and
 /// the solve must fall back to a uniform policy for that decision instead of
 /// hanging the worker. The game continues, no rows come from capped solves,
 /// and nothing panics.
@@ -211,10 +253,14 @@ fn walk_across_warrior_priest_draws() {
 fn capped_solves_fall_back_and_games_finish() {
     let nets = [warchest::search::Nets::default()];
     let mut total_dec = 0usize;
+    let mut total_node_caps = 0usize;
     for seed in 0..10u64 {
         let mut rng = Rng::new(seed * 7919 + 5);
         let mut d = Data::default();
-        let scfg = Cfg { node_cap: 40, ..cfg() };
+        let scfg = Cfg {
+            node_cap: 40,
+            ..cfg()
+        };
         let gc = GameCfg {
             agents: [
                 Agent::Rebel { cfg: scfg, slot: 0 },
@@ -229,8 +275,11 @@ fn capped_solves_fall_back_and_games_finish() {
         let z = play_game(rng, &nets, &gc, &mut d, None);
         assert!(z.is_finite());
         total_dec += d.decisions;
+        total_node_caps += d.node_caps;
     }
     assert!(total_dec > 0);
+    assert!(
+        total_node_caps > 0,
+        "the real solver-cap counter stayed zero"
+    );
 }
-
-

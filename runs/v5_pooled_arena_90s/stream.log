@@ -1,0 +1,21 @@
+v5 GEMM compute=fast-f16
+{"phase": "live", "seconds": 10.099, "solves": 17408, "solves_per_s": 1723.7, "oversize_routes": 0, "card_exclusive_routes": 0}
+{"phase": "live", "seconds": 20.074, "solves": 44032, "solves_per_s": 2193.5, "oversize_routes": 2, "card_exclusive_routes": 0}
+{"phase": "live", "seconds": 30.111, "solves": 52224, "solves_per_s": 1734.4, "oversize_routes": 13, "card_exclusive_routes": 0}
+{"phase": "live", "seconds": 40.144, "solves": 57344, "solves_per_s": 1428.5, "oversize_routes": 20, "card_exclusive_routes": 0}
+{"phase": "live", "seconds": 50.132, "solves": 64512, "solves_per_s": 1286.8, "oversize_routes": 26, "card_exclusive_routes": 0}
+{"phase": "live", "seconds": 60.161, "solves": 71680, "solves_per_s": 1191.5, "oversize_routes": 30, "card_exclusive_routes": 0}
+v5_device jobs=5 rows=152935 cells=1100268 direct=true graph_reused=false upload_ms=130.09 capture_ms=3.73 queue_ms=277.71 gpu_ms=0.01 unpack_ms=10.88 total_ms=422.44
+v5_device jobs=1 rows=167065 cells=2014497 direct=true graph_reused=false upload_ms=189.54 capture_ms=6.74 queue_ms=257.59 gpu_ms=2.95 unpack_ms=16.11 total_ms=472.94
+v5_arena_guard device=1 lane=0 helper=3 mutable_mib=4096.0 table_mib=128.0 reserved_mib=4224.0 drain_ms=1842.6 trim_ms=4.0 solve_ms=565.3
+v5_device jobs=1 rows=118342 cells=522846 direct=true graph_reused=false upload_ms=63.53 capture_ms=3.82 queue_ms=100.70 gpu_ms=3.94 unpack_ms=5.65 total_ms=177.64
+v5_arena_guard device=0 lane=0 helper=3 mutable_mib=4096.0 table_mib=64.0 reserved_mib=4160.0 drain_ms=1788.6 trim_ms=0.2 solve_ms=213.9
+v5_device jobs=1 rows=121209 cells=508745 direct=true graph_reused=false upload_ms=94.16 capture_ms=3.56 queue_ms=138.72 gpu_ms=0.01 unpack_ms=4.16 total_ms=240.61
+v5_arena_guard device=0 lane=0 helper=4 mutable_mib=4096.0 table_mib=64.0 reserved_mib=4160.0 drain_ms=1360.3 trim_ms=3.7 solve_ms=281.6
+{"phase": "live", "seconds": 70.107, "solves": 79872, "solves_per_s": 1139.3, "oversize_routes": 52, "card_exclusive_routes": 0}
+{"phase": "live", "seconds": 80.077, "solves": 86016, "solves_per_s": 1074.2, "oversize_routes": 69, "card_exclusive_routes": 0}
+{"phase": "live", "seconds": 90.009, "solves": 92160, "solves_per_s": 1023.9, "oversize_routes": 82, "card_exclusive_routes": 0}
+v5_device jobs=1 rows=111541 cells=2060936 direct=true graph_reused=false upload_ms=168.92 capture_ms=3.84 queue_ms=325.96 gpu_ms=2.93 unpack_ms=67.74 total_ms=569.39
+v5_arena_guard device=1 lane=0 helper=2 mutable_mib=4096.0 table_mib=128.0 reserved_mib=4224.0 drain_ms=2204.8 trim_ms=5.6 solve_ms=666.9
+{"phase": "prestop", "solves": 92160, "games": 18, "decisions": 286001, "oversize_routes": 82, "card_exclusive_routes": 0, "exact_fallbacks": 0, "censored_games": 0, "dropped": 0, "node_caps": 42, "seconds": 90.00944161007646, "solves_per_s": 1023.9}
+{"phase": "drained", "solves": 93916, "games": 21, "decisions": 299217, "oversize_routes": 87, "card_exclusive_routes": 0, "exact_fallbacks": 0, "censored_games": 4608, "dropped": 0, "node_caps": 210, "seconds": 115.949, "solves_per_s": 810.0}

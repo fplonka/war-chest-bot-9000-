@@ -1,0 +1,90 @@
+{
+ "runs": [
+  "/workspace/warchest-engine/runs/v5_aliased_l5_warm_gate"
+ ],
+ "games_per_pair": 30,
+ "depth": 2,
+ "iters": 64,
+ "depth_b": 0,
+ "iters_b": 0,
+ "players": [
+  {
+   "name": "greedy",
+   "t": null,
+   "elo": 0.0,
+   "se": 40.6,
+   "score": 0.594
+  },
+  {
+   "name": "random",
+   "t": null,
+   "elo": -199.9,
+   "se": 43.2,
+   "score": 0.256
+  },
+  {
+   "name": "v5_aliased_l5_warm_gate.init",
+   "t": 301.5,
+   "elo": -145.1,
+   "se": 41.1,
+   "score": 0.344
+  },
+  {
+   "name": "v5_aliased_l5_warm_gate.final",
+   "t": 602.3,
+   "elo": 133.3,
+   "se": 46.4,
+   "score": 0.806
+  }
+ ],
+ "pairs": [
+  {
+   "a": "greedy",
+   "b": "random",
+   "w": 24,
+   "l": 0,
+   "d": 6,
+   "score": 0.9
+  },
+  {
+   "a": "greedy",
+   "b": "v5_aliased_l5_warm_gate.init",
+   "w": 14,
+   "l": 5,
+   "d": 11,
+   "score": 0.65
+  },
+  {
+   "a": "greedy",
+   "b": "v5_aliased_l5_warm_gate.final",
+   "w": 5,
+   "l": 21,
+   "d": 4,
+   "score": 0.233
+  },
+  {
+   "a": "random",
+   "b": "v5_aliased_l5_warm_gate.init",
+   "w": 1,
+   "l": 2,
+   "d": 27,
+   "score": 0.483
+  },
+  {
+   "a": "random",
+   "b": "v5_aliased_l5_warm_gate.final",
+   "w": 0,
+   "l": 19,
+   "d": 11,
+   "score": 0.183
+  },
+  {
+   "a": "v5_aliased_l5_warm_gate.init",
+   "b": "v5_aliased_l5_warm_gate.final",
+   "w": 1,
+   "l": 21,
+   "d": 8,
+   "score": 0.167
+  }
+ ]
+}

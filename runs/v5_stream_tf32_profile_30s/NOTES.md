@@ -1,0 +1,7 @@
+# Integrated TF32 trainer profile
+
+We were testing whether Ampere's fast TF32-backed float32 matrix products help when the optimizer shares GPU 1 with live solves. This repeated the preceding 30-second in-process profile with the same seed and settings, changing PyTorch matmul precision from `highest` to `high`. All tensors, reductions, gradients, and Adam state remained float32; only GEMM internals were allowed lower mantissa precision.
+
+TF32 helped the contended GPU portion, but it is not the whole answer. In the first interval, batches averaged 42,479 configurations and measured GPU work was 104 ms per step, versus 114 ms at 43,881 configurations in strict mode. In the broad interval, batches averaged 100,100 configurations and measured GPU work was 36 ms per step, versus 60 ms at 101,136 configurations. Preparation remained essentially unchanged at about 110 ms per broad step. The fixed-budget result rose from 905.2 to 939.2 balanced solves/s, but a single short streaming comparison is too variable to assign that whole difference to TF32. The stage-normalized GPU timings are the stronger evidence, so the fast mode stays enabled.
+
+The run counted 28,176 solves and 112,640 optimizer rows, leaving 64 rows of debt. It had no large-job routes, exact fallbacks, node-cap events, or drops, and no deadline overrun. At this point fast training GEMMs were explicit and logged, while host preparation of variable-width replay batches remained the largest repeatable trainer cost and solve/trainer scheduling still consumed most of the remaining margin to 1,200.

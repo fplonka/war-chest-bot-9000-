@@ -22,8 +22,7 @@ use warchest::search::{action_coin, node_actions, snapshot_iters, Cfg, Cfr, Nets
 use warchest::selfplay::make_game;
 use warchest::state::{Cont, State, MAX_MAIN_PLAYS, Z_BAG, Z_FACEDOWN, Z_HAND};
 use warchest::units::{
-    ARCHER, CAVALRY, CROSSBOWMAN, FOOTMAN, LANCER, PIKEMAN, ROYAL_COIN, SWORDSMAN,
-    WARRIOR_PRIEST,
+    ARCHER, CAVALRY, CROSSBOWMAN, FOOTMAN, LANCER, PIKEMAN, ROYAL_COIN, SWORDSMAN, WARRIOR_PRIEST,
 };
 
 /// A real position `plies` coin plays from the horizon, reached by random play
@@ -168,10 +167,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
             continue;
         };
         let ctx = Ctx::new(&s);
-        let bel = [
-            uniform_belief(&s, &ctx, 0),
-            uniform_belief(&s, &ctx, 1),
-        ];
+        let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
         // Keep the exhaustive side affordable.
         if bel[0].len() * bel[1].len() > 64 {
             continue;
@@ -247,7 +243,10 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
             // A best response can never do worse than the strategy it answers,
             // so NashConv is non-negative; and 500 iterations of any of these
             // rules must beat 2.
-            assert!(late > -1e-3, "seed {seed} {name}: NashConv is negative: {late:.5}");
+            assert!(
+                late > -1e-3,
+                "seed {seed} {name}: NashConv is negative: {late:.5}"
+            );
             assert!(
                 late < early.max(1e-3),
                 "seed {seed} {name}: NashConv did not fall: {early:.5} -> {late:.5}"
@@ -264,7 +263,10 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
         }
     }
     assert!(checked >= 4, "only {} positions exercised", checked);
-    eprintln!("verified {} micro-endgames against tabular CFR, for every regret rule", checked);
+    eprintln!(
+        "verified {} micro-endgames against tabular CFR, for every regret rule",
+        checked
+    );
 }
 
 /// How badly does a short solve misprice a position?
@@ -282,7 +284,13 @@ fn cfr_iteration_count_bias() {
     let budgets = [4usize, 16, 64, 256];
     let mut err = vec![0.0f64; budgets.len()];
     let mut nzs = vec![0.0f64; budgets.len()];
-    eprintln!("     exact   {}", budgets.iter().map(|b| format!("{:>9}", b)).collect::<String>());
+    eprintln!(
+        "     exact   {}",
+        budgets
+            .iter()
+            .map(|b| format!("{:>9}", b))
+            .collect::<String>()
+    );
     for seed in 0..3000u64 {
         let Some(s) = micro_position(seed, 60 + (seed as usize % 120), 3) else {
             continue;
@@ -292,7 +300,18 @@ fn cfr_iteration_count_bias() {
         if bel[0].len() * bel[1].len() > 64 {
             continue;
         }
-        let probe = Solver::new(&s, ctx, &nets, Cfg { depth: 8, iters: 1, snapshots: true, ..Default::default() }, bel.clone());
+        let probe = Solver::new(
+            &s,
+            ctx,
+            &nets,
+            Cfg {
+                depth: 8,
+                iters: 1,
+                snapshots: true,
+                ..Default::default()
+            },
+            bel.clone(),
+        );
         if !probe.nodes.iter().all(|n| !n.leaf || n.s.is_terminal()) || probe.nodes.len() > 8_000 {
             continue;
         }
@@ -310,7 +329,18 @@ fn cfr_iteration_count_bias() {
         let exact = oracle_value(&s, &ctx, &bel, 100);
         let mut line = format!("  {:+.4}   ", exact);
         for (bi, &t) in budgets.iter().enumerate() {
-            let mut sv = Solver::new(&s, ctx, &nets, Cfg { depth: 8, iters: t, snapshots: true, ..Default::default() }, bel.clone());
+            let mut sv = Solver::new(
+                &s,
+                ctx,
+                &nets,
+                Cfg {
+                    depth: 8,
+                    iters: t,
+                    snapshots: true,
+                    ..Default::default()
+                },
+                bel.clone(),
+            );
             sv.multistep(t);
             let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
             let v0: f64 = (0..bel[0].len())
@@ -408,10 +438,7 @@ fn draw_pass_through_consistency() {
             continue;
         };
         let ctx = Ctx::new(&s);
-        let bel = [
-            uniform_belief(&s, &ctx, 0),
-            uniform_belief(&s, &ctx, 1),
-        ];
+        let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
         if bel[0].len() * bel[1].len() > 1000 {
             cnt[0] += 1;
             continue;
@@ -424,7 +451,8 @@ fn draw_pass_through_consistency() {
             continue;
         }
         let mut sv = Solver::new(
-            &s, ctx,
+            &s,
+            ctx,
             &nets,
             Cfg {
                 depth: 5,
@@ -448,7 +476,11 @@ fn draw_pass_through_consistency() {
                 continue;
             }
             let n = &sv.nodes[i];
-            assert_eq!(n.child.len(), 1, "a draw must have exactly one public child");
+            assert_eq!(
+                n.child.len(),
+                1,
+                "a draw must have exactly one public child"
+            );
             let me = n.player as usize;
             let ch = n.child[0];
             assert_eq!(
@@ -479,12 +511,7 @@ fn draw_pass_through_consistency() {
             );
             for ci in 0..n.draw.rows() {
                 let sum: f32 = n.draw.row(ci).1.iter().sum();
-                assert!(
-                    (sum - 1.0).abs() < 1e-5,
-                    "draw row {} sums to {}",
-                    ci,
-                    sum
-                );
+                assert!((sum - 1.0).abs() < 1e-5, "draw row {} sums to {}", ci, sum);
             }
             assert_eq!(
                 sv.nodes[ch].s.hand_size(n.player),
@@ -534,7 +561,11 @@ fn snapshot_iterations_are_log_spaced_plus_final() {
     for iters in [1usize, 2, 8, 64, 512] {
         let v = snapshot_iters(iters);
         assert_eq!(v[0], 0, "iter 0 is always kept");
-        assert_eq!(*v.last().unwrap(), iters, "the final iteration is always kept");
+        assert_eq!(
+            *v.last().unwrap(),
+            iters,
+            "the final iteration is always kept"
+        );
         assert_eq!(v, {
             let mut w = Vec::new();
             for t in 0..=iters {
@@ -544,7 +575,10 @@ fn snapshot_iterations_are_log_spaced_plus_final() {
             }
             w
         });
-        assert!(v.windows(2).all(|x| x[0] < x[1]), "kept iterations are increasing");
+        assert!(
+            v.windows(2).all(|x| x[0] < x[1]),
+            "kept iterations are increasing"
+        );
     }
 }
 
@@ -566,8 +600,8 @@ fn warrior_priest_draw_walks_through_the_tree() {
     let mut s = State::blank(warchest::state::WHITE);
     s.set_unit(17, warchest::state::WHITE, WARRIOR_PRIEST, 1); // (2,3)
     s.set_unit(19, warchest::state::BLACK, FOOTMAN, 3); // (4,3)
-    // Full 5-type reserve per player, as `Ctx::new` requires. Only the WP and
-    // Swordsman coins are actually reachable.
+                                                        // Full 5-type reserve per player, as `Ctx::new` requires. Only the WP and
+                                                        // Swordsman coins are actually reachable.
     for u in [WARRIOR_PRIEST, SWORDSMAN, PIKEMAN, CROSSBOWMAN, ROYAL_COIN] {
         s.add_zone(warchest::state::WHITE, Z_BAG, u, 1);
     }
@@ -585,21 +619,29 @@ fn warrior_priest_draw_walks_through_the_tree() {
     c2.hand[wp as usize] = 1;
     c2.hand[sw as usize] = 1;
     let bel = [
-        Belief { cfg: vec![c1, c2], p: vec![0.5, 0.5] },
+        Belief {
+            cfg: vec![c1, c2],
+            p: vec![0.5, 0.5],
+        },
         Belief::point(Config::default()),
     ];
     let mut sv = Solver::new(
-        &s, ctx,
+        &s,
+        ctx,
         &nets,
-        Cfg { depth: 2, iters: 8, snapshots: true, ..Default::default() },
+        Cfg {
+            depth: 2,
+            iters: 8,
+            snapshots: true,
+            ..Default::default()
+        },
         bel.clone(),
     );
 
     // Find the WP draw node: a chance node whose state is a WarriorPriestDraw.
     let draws: Vec<usize> = (0..sv.nodes.len())
         .filter(|&i| {
-            sv.nodes[i].chance
-                && matches!(sv.nodes[i].s.pending(), Cont::WarriorPriestDraw { .. })
+            sv.nodes[i].chance && matches!(sv.nodes[i].s.pending(), Cont::WarriorPriestDraw { .. })
         })
         .collect();
     assert_eq!(draws.len(), 1, "exactly one WP draw in the tree");
@@ -612,7 +654,10 @@ fn warrior_priest_draw_walks_through_the_tree() {
     let res = reserve(&n.s, n.player, &ctx);
     let fu = faceup_counts(&n.s, n.player, &ctx);
     let oracle = belief_after_draw(
-        &Belief { cfg: n.cfgs[n.player as usize].to_vec(), p: vec![1.0; n.nc(n.player as usize)] },
+        &Belief {
+            cfg: n.cfgs[n.player as usize].to_vec(),
+            p: vec![1.0; n.nc(n.player as usize)],
+        },
         &res,
         &fu,
         true,
@@ -626,7 +671,10 @@ fn warrior_priest_draw_walks_through_the_tree() {
     // Every child carries a pending coin (no fizzle here: the bag is not
     // empty), and every draw row is a proper distribution.
     for c in sv.nodes[ch].cfgs[n.player as usize].iter() {
-        assert!(c.pending_coin.is_some(), "a WP draw child carries its pending coin");
+        assert!(
+            c.pending_coin.is_some(),
+            "a WP draw child carries its pending coin"
+        );
     }
     for ci in 0..n.draw.rows() {
         let sum: f32 = n.draw.row(ci).1.iter().sum();
@@ -643,8 +691,11 @@ fn warrior_priest_draw_walks_through_the_tree() {
     for (ci, c) in wpn.cfgs[me].iter().enumerate() {
         let pend = c.pending_coin.expect("pending");
         for a in 0..wpn.na() {
+            let legal = wpn
+                .legal_row(ci)
+                .any(|cell| wpn.legal_action[cell] as usize == a);
             assert_eq!(
-                wpn.legal[ci * wpn.na() + a],
+                legal,
                 wpn.aslot[a] == pend as i8,
                 "WP play legality must be the pending match"
             );
@@ -667,7 +718,10 @@ fn warrior_priest_draw_walks_through_the_tree() {
     // drawn coin is spent.
     for &c in wpn.child.iter() {
         for cc in sv.nodes[c].cfgs[me].iter() {
-            assert!(cc.pending_coin.is_none(), "the forced play clears the pending coin");
+            assert!(
+                cc.pending_coin.is_none(),
+                "the forced play clears the pending coin"
+            );
         }
     }
 
@@ -712,13 +766,15 @@ fn depth_is_spent_on_coin_plays_not_micro_choices() {
             // or terminal child would be a leaf/expanded under both countings
             // and the test would not discriminate the fix.
             let free = acts.iter().any(|a| action_coin(a, &s) == NONE);
-            if free && acts.iter().any(|a| {
-                action_coin(a, &s) == NONE && {
-                    let mut cs = s.clone();
-                    cs.apply_inplace(*a);
-                    !cs.is_terminal() && !cs.is_chance()
-                }
-            }) {
+            if free
+                && acts.iter().any(|a| {
+                    action_coin(a, &s) == NONE && {
+                        let mut cs = s.clone();
+                        cs.apply_inplace(*a);
+                        !cs.is_terminal() && !cs.is_chance()
+                    }
+                })
+            {
                 let ctx = Ctx::new(&s);
                 let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
                 let root_player = s.to_act();
@@ -727,8 +783,15 @@ fn depth_is_spent_on_coin_plays_not_micro_choices() {
                 // the depth limit. Under the old counting every child of the
                 // root was a leaf and this assertion failed.
                 let mut sv = Solver::new(
-                    &s, ctx, &nets[0],
-                    Cfg { depth: 1, iters: 4, snapshots: false, ..Default::default() },
+                    &s,
+                    ctx,
+                    &nets[0],
+                    Cfg {
+                        depth: 1,
+                        iters: 4,
+                        snapshots: false,
+                        ..Default::default()
+                    },
                     bel,
                 );
                 sv.multistep(4);
@@ -739,8 +802,15 @@ fn depth_is_spent_on_coin_plays_not_micro_choices() {
                 // Depth 2: the opponent's first main play is reached after
                 // one completed coin play, so it must be expanded, not a leaf.
                 let mut sv = Solver::new(
-                    &s, ctx, &nets[0],
-                    Cfg { depth: 2, iters: 4, snapshots: false, ..Default::default() },
+                    &s,
+                    ctx,
+                    &nets[0],
+                    Cfg {
+                        depth: 2,
+                        iters: 4,
+                        snapshots: false,
+                        ..Default::default()
+                    },
                     [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)],
                 );
                 sv.multistep(4);

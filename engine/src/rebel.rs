@@ -210,8 +210,7 @@ pub fn write_config_feats(c: &Config, reserve: &[u8; NSLOT], player: usize, out:
 /// The `+ 1` on each one-hot is the "absent" slot: most actions name no square
 /// at all, and a plain zero block would be indistinguishable from a square the
 /// board does not have.
-pub const AFEAT: usize =
-    N_KINDS + 3 * (N_HEXES + 1) + 2 * (NTYPE + 1) + 1;
+pub const AFEAT: usize = N_KINDS + 3 * (N_HEXES + 1) + 2 * (NTYPE + 1) + 1;
 
 /// Where the paying coin type's one-hot starts. The action tower gathers that
 /// card's embedding from it, the same way the hex block does.
@@ -221,7 +220,14 @@ pub const AOFF_PAYS: usize = N_KINDS + 3 * (N_HEXES + 1);
 /// inside a tactic, which spend nothing) and `fdown` whether it goes face down;
 /// the solver has both per action already, so they are passed rather than
 /// re-derived.
-pub fn write_action_feats(a: &Action, ctx: &Ctx, player: usize, slot: i8, fdown: bool, out: &mut [f32]) {
+pub fn write_action_feats(
+    a: &Action,
+    ctx: &Ctx,
+    player: usize,
+    slot: i8,
+    fdown: bool,
+    out: &mut [f32],
+) {
     debug_assert_eq!(out.len(), AFEAT);
     out.fill(0.0);
     let mut at = 0usize;
@@ -231,14 +237,32 @@ pub fn write_action_feats(a: &Action, ctx: &Ctx, player: usize, slot: i8, fdown:
     };
     // A coin type index, or `NTYPE` for "this action pays nothing" / "this is
     // not a recruit" — the same indexing the hex and pile blocks use.
-    let ty = |k: i8| if k < 0 { NTYPE } else { player * NSLOT + k as usize };
+    let ty = |k: i8| {
+        if k < 0 {
+            NTYPE
+        } else {
+            player * NSLOT + k as usize
+        }
+    };
     hot(a.kind(), N_KINDS, out);
     for h in a.hexes() {
-        hot(if h == NONE { N_HEXES } else { h as usize }, N_HEXES + 1, out);
+        hot(
+            if h == NONE { N_HEXES } else { h as usize },
+            N_HEXES + 1,
+            out,
+        );
     }
     hot(ty(slot), NTYPE + 1, out);
     let r = a.recruited();
-    hot(ty(if r == NONE { -1 } else { ctx.slot_of[player][r as usize] }), NTYPE + 1, out);
+    hot(
+        ty(if r == NONE {
+            -1
+        } else {
+            ctx.slot_of[player][r as usize]
+        }),
+        NTYPE + 1,
+        out,
+    );
     out[at] = fdown as u8 as f32;
 }
 
@@ -308,7 +332,11 @@ pub fn enumerate_configs(reserve: &[u8; NSLOT], hand_size: u8, fd_size: u8) -> V
         if k == NSLOT - 1 {
             if left + hand[k] <= res[k] {
                 fd[k] = left;
-                out.push(Config { hand: *hand, fd: *fd, pending_coin: None });
+                out.push(Config {
+                    hand: *hand,
+                    fd: *fd,
+                    pending_coin: None,
+                });
                 fd[k] = 0;
             }
             return;
@@ -419,7 +447,6 @@ impl Belief {
     pub fn index_of(&self, c: &Config) -> Option<usize> {
         self.cfg.binary_search(c).ok()
     }
-
 }
 
 /// Is `slot` a legal coin for this config to spend right now? `slot` is the
@@ -725,12 +752,29 @@ impl DrawScratch {
             for x in 0..=left.min(src[slot] as u32) {
                 let mut c2 = c;
                 c2.hand[slot] += x as u8;
-                rec(src, slot + 1, left - x, num * choose(src[slot] as u32, x), c2, denom,
-                    kid, prob);
+                rec(
+                    src,
+                    slot + 1,
+                    left - x,
+                    num * choose(src[slot] as u32, x),
+                    c2,
+                    denom,
+                    kid,
+                    prob,
+                );
             }
         }
         let total: u32 = src.iter().map(|&x| x as u32).sum();
-        rec(src, 0, k, 1.0, base, choose(total, k), &mut self.kid, &mut self.prob);
+        rec(
+            src,
+            0,
+            k,
+            1.0,
+            base,
+            choose(total, k),
+            &mut self.kid,
+            &mut self.prob,
+        );
     }
 
     /// Sort the emitted children once by integer key, then read the support
@@ -738,7 +782,10 @@ impl DrawScratch {
     /// binary search. Shared by `transition` and `run`.
     fn pack(&mut self, support: &mut Vec<Config>, map: &mut DrawMap) {
         let _ts = crate::timed!(DSORT);
-        assert!(self.kid.len() < 1 << IDX_BITS, "draw fan-out over the index width");
+        assert!(
+            self.kid.len() < 1 << IDX_BITS,
+            "draw fan-out over the index width"
+        );
         self.order.clear();
         self.order.extend(
             self.kid
@@ -967,6 +1014,28 @@ pub const ROW_PLIES: usize = ROW_TO_ACT + 1;
 pub const ROW_AUX: usize = ROW_PLIES + 2;
 pub const ROW_BYTES: usize = ROW_AUX + 2 * AUX;
 
+// ---------------------------------------------------------- GPU public rows
+//
+// A solve can have hundreds of thousands of network rows. Uploading the
+// expanded `PUBFEAT` f32 vector for every one repeats one-hots, card facts and
+// normalised byte counts, so the GPU contract keeps only the public small
+// integers and expands them while assembling the trunk input. Card ids are
+// solve-wide (`PackedTables::ids`) and therefore do not appear per row.
+pub const GPU_ROW_HEX_OWNER: usize = 0;
+pub const GPU_ROW_HEX_SLOT: usize = GPU_ROW_HEX_OWNER + N_HEXES;
+pub const GPU_ROW_HEX_HEIGHT: usize = GPU_ROW_HEX_SLOT + N_HEXES;
+pub const GPU_ROW_HEX_MARKER: usize = GPU_ROW_HEX_HEIGHT + N_HEXES;
+pub const GPU_ROW_PILES: usize = GPU_ROW_HEX_MARKER + N_HEXES;
+pub const GPU_ROW_MARKERS: usize = GPU_ROW_PILES + NTYPE * PILE_COUNTS;
+pub const GPU_ROW_HAND: usize = GPU_ROW_MARKERS + 2;
+pub const GPU_ROW_FD: usize = GPU_ROW_HAND + 2;
+pub const GPU_ROW_BAG: usize = GPU_ROW_FD + 2;
+pub const GPU_ROW_INITIATIVE: usize = GPU_ROW_BAG + 2;
+pub const GPU_ROW_INIT_MOVED: usize = GPU_ROW_INITIATIVE + 1;
+pub const GPU_ROW_TO_ACT: usize = GPU_ROW_INIT_MOVED + 1;
+pub const GPU_ROW_PLIES: usize = GPU_ROW_TO_ACT + 1;
+pub const GPU_ROW_BYTES: usize = GPU_ROW_PLIES + 2;
+
 /// The current row format version. Bump when the layout or the expanded
 /// feature layout changes; dumps carry it and refuse to load otherwise.
 pub const ROW_FORMAT_VERSION: u32 = 1;
@@ -992,7 +1061,17 @@ pub fn rules_table_hash() -> u64 {
             mix(x.to_bits() as u64);
         }
     }
-    for c in [PUBFEAT, HEX_FACTS, HEX_CH, CARD_FEATS, NSLOT, NTYPE, N_HEXES, PILE_COUNTS, LOOSE] {
+    for c in [
+        PUBFEAT,
+        HEX_FACTS,
+        HEX_CH,
+        CARD_FEATS,
+        NSLOT,
+        NTYPE,
+        N_HEXES,
+        PILE_COUNTS,
+        LOOSE,
+    ] {
         mix(c as u64);
     }
     h
@@ -1259,12 +1338,95 @@ pub fn pack_row(s: &State, ctx: &Ctx, out: &mut [u8]) {
     // Aux bytes stay zero until `fill_aux` patches them.
 }
 
+/// Pack the public part of a solver network row without expanding it to
+/// floats. This is deliberately parallel to `expand_gpu_row`; their oracle
+/// test compares the result with `write_public_features` for real states.
+pub fn pack_gpu_row(s: &State, ctx: &Ctx, out: &mut [u8]) {
+    debug_assert_eq!(out.len(), GPU_ROW_BYTES);
+    for h in 0..N_HEXES {
+        out[GPU_ROW_HEX_OWNER + h] = s.hex_owner[h];
+        out[GPU_ROW_HEX_SLOT + h] = if s.hex_owner[h] == NONE {
+            NONE
+        } else {
+            ctx.slot_of[s.hex_owner[h] as usize][s.hex_type[h] as usize] as u8
+        };
+        out[GPU_ROW_HEX_HEIGHT + h] = s.hex_height[h];
+        out[GPU_ROW_HEX_MARKER + h] = s.loc_marker[h];
+    }
+    for p in 0..2usize {
+        let res = reserve(s, p as u8, ctx);
+        for k in 0..NSLOT {
+            let u = ctx.slots[p][k] as usize;
+            let at = GPU_ROW_PILES + (p * NSLOT + k) * PILE_COUNTS;
+            out[at] = res[k];
+            out[at + 1] = s.zones[p][Z_FACEUP][u];
+            out[at + 2] = s.zones[p][Z_SUPPLY][u];
+            out[at + 3] = s.zones[p][Z_ELIM][u];
+        }
+        out[GPU_ROW_MARKERS + p] = s.markers_hand[p];
+        out[GPU_ROW_HAND + p] = s.hand_size(p as u8);
+        out[GPU_ROW_FD + p] = s.zones[p][Z_FACEDOWN].iter().sum();
+        out[GPU_ROW_BAG + p] = s.bag_size(p as u8);
+    }
+    out[GPU_ROW_INITIATIVE] = s.initiative;
+    out[GPU_ROW_INIT_MOVED] = s.initiative_moved as u8;
+    out[GPU_ROW_TO_ACT] = s.to_act();
+    let plies = crate::state::MAX_MAIN_PLAYS - s.main_plays.min(crate::state::MAX_MAIN_PLAYS);
+    out[GPU_ROW_PLIES..GPU_ROW_PLIES + 2].copy_from_slice(&plies.to_le_bytes());
+}
+
+/// Host reference for the device's packed-row expansion. Keeping this in the
+/// shared encoder module makes changes to public features fail an ordinary
+/// Rust test instead of silently drifting between inference paths.
+pub fn expand_gpu_row(row: &[u8], ids: &[u8; NTYPE], out: &mut [f32]) {
+    debug_assert_eq!(row.len(), GPU_ROW_BYTES);
+    let mut hex_owner = [NONE; N_HEXES];
+    let mut hex_slot = [NONE; N_HEXES];
+    let mut hex_height = [0u8; N_HEXES];
+    let mut hex_marker = [NONE; N_HEXES];
+    hex_owner.copy_from_slice(&row[GPU_ROW_HEX_OWNER..GPU_ROW_HEX_OWNER + N_HEXES]);
+    hex_slot.copy_from_slice(&row[GPU_ROW_HEX_SLOT..GPU_ROW_HEX_SLOT + N_HEXES]);
+    hex_height.copy_from_slice(&row[GPU_ROW_HEX_HEIGHT..GPU_ROW_HEX_HEIGHT + N_HEXES]);
+    hex_marker.copy_from_slice(&row[GPU_ROW_HEX_MARKER..GPU_ROW_HEX_MARKER + N_HEXES]);
+    let mut markers = [0u8; 2];
+    let mut hand = [0u8; 2];
+    let mut fd = [0u8; 2];
+    let mut bag = [0u8; 2];
+    markers.copy_from_slice(&row[GPU_ROW_MARKERS..GPU_ROW_MARKERS + 2]);
+    hand.copy_from_slice(&row[GPU_ROW_HAND..GPU_ROW_HAND + 2]);
+    fd.copy_from_slice(&row[GPU_ROW_FD..GPU_ROW_FD + 2]);
+    bag.copy_from_slice(&row[GPU_ROW_BAG..GPU_ROW_BAG + 2]);
+    write_public_features_raw(
+        &hex_owner,
+        &hex_slot,
+        &hex_height,
+        &hex_marker,
+        &row[GPU_ROW_PILES..GPU_ROW_PILES + NTYPE * PILE_COUNTS],
+        ids,
+        &markers,
+        &hand,
+        &fd,
+        &bag,
+        row[GPU_ROW_INITIATIVE],
+        row[GPU_ROW_INIT_MOVED] != 0,
+        row[GPU_ROW_TO_ACT],
+        u16::from_le_bytes([row[GPU_ROW_PLIES], row[GPU_ROW_PLIES + 1]]),
+        out,
+    );
+}
+
 /// Expand a stored replay row into the public encoding, in place.
 ///
 /// `hand_size`/`fd_size`/`bag_size` are the public per-player counts carried
 /// by the row's config support (every config in a support shares them); they
 /// are the only part of the row that is not stored directly.
-pub fn expand_row(row: &[u8], hand_size: &[u8; 2], fd_size: &[u8; 2], bag_size: &[u8; 2], out: &mut [f32]) {
+pub fn expand_row(
+    row: &[u8],
+    hand_size: &[u8; 2],
+    fd_size: &[u8; 2],
+    bag_size: &[u8; 2],
+    out: &mut [f32],
+) {
     debug_assert_eq!(row.len(), ROW_BYTES);
     let mut hex_owner = [NONE; N_HEXES];
     let mut hex_slot = [NONE; N_HEXES];
@@ -1324,7 +1486,8 @@ mod draw_tests {
         let (mut res, mut fu) = (*res0, *fu0);
         let mut cur = cfg.to_vec();
         let mut next = Vec::new();
-        let (mut draw, mut step, mut acc) = (DrawMap::default(), DrawMap::default(), DrawMap::default());
+        let (mut draw, mut step, mut acc) =
+            (DrawMap::default(), DrawMap::default(), DrawMap::default());
         for j in 0..k {
             // Bag size is public, so config 0 speaks for the whole support.
             let empty = cur[0].bag(&res).iter().all(|&x| x == 0);
@@ -1366,7 +1529,12 @@ mod draw_tests {
                 "{what}: row {i} children"
             );
             for (g, w) in got.iter().zip(&wnt) {
-                assert!((g.1 - w.1).abs() < 1e-5, "{what}: row {i} prob {} vs {}", g.1, w.1);
+                assert!(
+                    (g.1 - w.1).abs() < 1e-5,
+                    "{what}: row {i} prob {} vs {}",
+                    g.1,
+                    w.1
+                );
             }
             let tot: f32 = gp.iter().sum();
             assert!((tot - 1.0).abs() < 1e-5, "{what}: row {i} sums to {tot}");
@@ -1374,7 +1542,12 @@ mod draw_tests {
     }
 
     /// Distribute `total` over the slots without exceeding `cap[s] - used[s]`.
-    fn spread(rng: &mut crate::rng::Rng, total: u8, cap: &[u8; NSLOT], used: &[u8; NSLOT]) -> Option<[u8; NSLOT]> {
+    fn spread(
+        rng: &mut crate::rng::Rng,
+        total: u8,
+        cap: &[u8; NSLOT],
+        used: &[u8; NSLOT],
+    ) -> Option<[u8; NSLOT]> {
         let mut out = [0u8; NSLOT];
         'outer: for _ in 0..total {
             for _ in 0..32 {
@@ -1392,12 +1565,22 @@ mod draw_tests {
     #[test]
     fn run_matches_composition() {
         // Hand-built cases for each branch, then fuzz.
-        let c = |hand: [u8; NSLOT], fd: [u8; NSLOT]| Config { hand, fd, pending_coin: None };
+        let c = |hand: [u8; NSLOT], fd: [u8; NSLOT]| Config {
+            hand,
+            fd,
+            pending_coin: None,
+        };
 
         // Plenty in the bag: pure hypergeometric.
         assert_same(
-            &[c([0; NSLOT], [1, 1, 0, 0, 0]), c([0; NSLOT], [0, 0, 1, 1, 0])],
-            &[5, 4, 3, 2, 5], &[1, 0, 2, 0, 0], 3, "plenty",
+            &[
+                c([0; NSLOT], [1, 1, 0, 0, 0]),
+                c([0; NSLOT], [0, 0, 1, 1, 0]),
+            ],
+            &[5, 4, 3, 2, 5],
+            &[1, 0, 2, 0, 0],
+            3,
+            "plenty",
         );
         // Mid-run refill: one coin in the bag, three to draw. Every config
         // fits under the reserve per slot and shares the public totals.
@@ -1407,22 +1590,34 @@ mod draw_tests {
                 c([0; NSLOT], [2, 0, 1, 0, 0]),
                 c([0; NSLOT], [1, 1, 1, 0, 0]),
             ],
-            &[2, 1, 1, 0, 0], &[1, 2, 0, 0, 0], 3, "refill",
+            &[2, 1, 1, 0, 0],
+            &[1, 2, 0, 0, 0],
+            3,
+            "refill",
         );
         // Empty refill: nothing face-up, nothing face-down.
         assert_same(
             &[c([1, 0, 0, 0, 0], [0; NSLOT])],
-            &[2, 0, 0, 0, 0], &[0; NSLOT], 2, "empty refill",
+            &[2, 0, 0, 0, 0],
+            &[0; NSLOT],
+            2,
+            "empty refill",
         );
         // Shortage: an empty bag, and a refill too small for the run.
         assert_same(
             &[c([0; NSLOT], [0; NSLOT])],
-            &[0; NSLOT], &[2, 0, 0, 0, 0], 3, "shortage",
+            &[0; NSLOT],
+            &[2, 0, 0, 0, 0],
+            3,
+            "shortage",
         );
         // Refill drawn exactly dry.
         assert_same(
             &[c([0; NSLOT], [0; NSLOT])],
-            &[1, 1, 0, 0, 0], &[1, 0, 0, 0, 0], 3, "exact dry",
+            &[1, 1, 0, 0, 0],
+            &[1, 0, 0, 0, 0],
+            3,
+            "exact dry",
         );
 
         let mut rng = crate::rng::Rng::new(0xD12A);
@@ -1442,8 +1637,12 @@ mod draw_tests {
             // A support whose members share the public totals.
             let mut cfgs = Vec::new();
             for _ in 0..6 {
-                let Some(hand) = spread(&mut rng, ht, &res, &[0; NSLOT]) else { continue };
-                let Some(fd) = spread(&mut rng, fdt, &res, &hand) else { continue };
+                let Some(hand) = spread(&mut rng, ht, &res, &[0; NSLOT]) else {
+                    continue;
+                };
+                let Some(fd) = spread(&mut rng, fdt, &res, &hand) else {
+                    continue;
+                };
                 cfgs.push(c(hand, fd));
             }
             if cfgs.is_empty() {

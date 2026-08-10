@@ -1,0 +1,231 @@
+{
+ "runs": [
+  "/workspace/warchest-engine/runs/gpu_golden8"
+ ],
+ "games_per_pair": 30,
+ "depth": 2,
+ "iters": 64,
+ "depth_b": 0,
+ "iters_b": 0,
+ "players": [
+  {
+   "name": "greedy",
+   "t": null,
+   "elo": 0.0,
+   "se": 35.3,
+   "score": 0.306
+  },
+  {
+   "name": "random",
+   "t": null,
+   "elo": -209.7,
+   "se": 42.7,
+   "score": 0.108
+  },
+  {
+   "name": "gpu_golden8.init",
+   "t": 300.6,
+   "elo": -90.7,
+   "se": 37.2,
+   "score": 0.214
+  },
+  {
+   "name": "gpu_golden8.s1",
+   "t": 660.6,
+   "elo": 225.1,
+   "se": 34.3,
+   "score": 0.55
+  },
+  {
+   "name": "gpu_golden8.s2",
+   "t": 1020.6,
+   "elo": 281.3,
+   "se": 34.7,
+   "score": 0.611
+  },
+  {
+   "name": "gpu_golden8.s3",
+   "t": 1380.7,
+   "elo": 473.4,
+   "se": 38.5,
+   "score": 0.806
+  },
+  {
+   "name": "gpu_golden8.final",
+   "t": 1740.7,
+   "elo": 593.0,
+   "se": 44.9,
+   "score": 0.906
+  }
+ ],
+ "pairs": [
+  {
+   "a": "greedy",
+   "b": "random",
+   "w": 24,
+   "l": 0,
+   "d": 6,
+   "score": 0.9
+  },
+  {
+   "a": "greedy",
+   "b": "gpu_golden8.init",
+   "w": 15,
+   "l": 7,
+   "d": 8,
+   "score": 0.633
+  },
+  {
+   "a": "greedy",
+   "b": "gpu_golden8.s1",
+   "w": 5,
+   "l": 20,
+   "d": 5,
+   "score": 0.25
+  },
+  {
+   "a": "greedy",
+   "b": "gpu_golden8.s2",
+   "w": 0,
+   "l": 27,
+   "d": 3,
+   "score": 0.05
+  },
+  {
+   "a": "greedy",
+   "b": "gpu_golden8.s3",
+   "w": 0,
+   "l": 30,
+   "d": 0,
+   "score": 0.0
+  },
+  {
+   "a": "greedy",
+   "b": "gpu_golden8.final",
+   "w": 0,
+   "l": 30,
+   "d": 0,
+   "score": 0.0
+  },
+  {
+   "a": "random",
+   "b": "gpu_golden8.init",
+   "w": 0,
+   "l": 7,
+   "d": 23,
+   "score": 0.383
+  },
+  {
+   "a": "random",
+   "b": "gpu_golden8.s1",
+   "w": 0,
+   "l": 23,
+   "d": 7,
+   "score": 0.117
+  },
+  {
+   "a": "random",
+   "b": "gpu_golden8.s2",
+   "w": 0,
+   "l": 28,
+   "d": 2,
+   "score": 0.033
+  },
+  {
+   "a": "random",
+   "b": "gpu_golden8.s3",
+   "w": 0,
+   "l": 30,
+   "d": 0,
+   "score": 0.0
+  },
+  {
+   "a": "random",
+   "b": "gpu_golden8.final",
+   "w": 0,
+   "l": 29,
+   "d": 1,
+   "score": 0.017
+  },
+  {
+   "a": "gpu_golden8.init",
+   "b": "gpu_golden8.s1",
+   "w": 1,
+   "l": 25,
+   "d": 4,
+   "score": 0.1
+  },
+  {
+   "a": "gpu_golden8.init",
+   "b": "gpu_golden8.s2",
+   "w": 1,
+   "l": 20,
+   "d": 9,
+   "score": 0.183
+  },
+  {
+   "a": "gpu_golden8.init",
+   "b": "gpu_golden8.s3",
+   "w": 0,
+   "l": 29,
+   "d": 1,
+   "score": 0.017
+  },
+  {
+   "a": "gpu_golden8.init",
+   "b": "gpu_golden8.final",
+   "w": 0,
+   "l": 30,
+   "d": 0,
+   "score": 0.0
+  },
+  {
+   "a": "gpu_golden8.s1",
+   "b": "gpu_golden8.s2",
+   "w": 11,
+   "l": 15,
+   "d": 4,
+   "score": 0.433
+  },
+  {
+   "a": "gpu_golden8.s1",
+   "b": "gpu_golden8.s3",
+   "w": 4,
+   "l": 21,
+   "d": 5,
+   "score": 0.217
+  },
+  {
+   "a": "gpu_golden8.s1",
+   "b": "gpu_golden8.final",
+   "w": 3,
+   "l": 26,
+   "d": 1,
+   "score": 0.117
+  },
+  {
+   "a": "gpu_golden8.s2",
+   "b": "gpu_golden8.s3",
+   "w": 7,
+   "l": 21,
+   "d": 2,
+   "score": 0.267
+  },
+  {
+   "a": "gpu_golden8.s2",
+   "b": "gpu_golden8.final",
+   "w": 3,
+   "l": 27,
+   "d": 0,
+   "score": 0.1
+  },
+  {
+   "a": "gpu_golden8.s3",
+   "b": "gpu_golden8.final",
+   "w": 10,
+   "l": 20,
+   "d": 0,
+   "score": 0.333
+  }
+ ]
+}

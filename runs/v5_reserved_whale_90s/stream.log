@@ -1,0 +1,22 @@
+v5 GEMM compute=fast-f16
+{"phase": "live", "seconds": 10.121, "solves": 16384, "solves_per_s": 1618.9, "oversize_routes": 0, "card_exclusive_routes": 0}
+{"phase": "live", "seconds": 20.132, "solves": 43008, "solves_per_s": 2136.3, "oversize_routes": 0, "card_exclusive_routes": 0}
+v5_arena_guard device=0 lane=0 helper=2 mutable_mib=4096.0 table_mib=128.0 reserved_mib=4224.0 drain_ms=837.5 trim_ms=0.2 solve_ms=546.6
+{"phase": "live", "seconds": 30.142, "solves": 51200, "solves_per_s": 1698.6, "oversize_routes": 1, "card_exclusive_routes": 0}
+v5_arena_guard device=0 lane=0 helper=2 mutable_mib=4096.0 table_mib=256.0 reserved_mib=4352.0 drain_ms=2714.9 trim_ms=0.1 solve_ms=741.0
+v5_arena_guard device=1 lane=0 helper=3 mutable_mib=4096.0 table_mib=256.0 reserved_mib=4352.0 drain_ms=2135.4 trim_ms=0.1 solve_ms=591.4
+{"phase": "live", "seconds": 40.183, "solves": 55296, "solves_per_s": 1376.1, "oversize_routes": 3, "card_exclusive_routes": 0}
+{"phase": "live", "seconds": 50.082, "solves": 60416, "solves_per_s": 1206.3, "oversize_routes": 3, "card_exclusive_routes": 0}
+v5_arena_guard device=1 lane=0 helper=1 mutable_mib=4096.0 table_mib=64.0 reserved_mib=4160.0 drain_ms=1559.7 trim_ms=0.3 solve_ms=325.6
+{"phase": "live", "seconds": 60.071, "solves": 68608, "solves_per_s": 1142.1, "oversize_routes": 3, "card_exclusive_routes": 0}
+v5_arena_guard device=0 lane=0 helper=2 mutable_mib=4096.0 table_mib=128.0 reserved_mib=4224.0 drain_ms=1975.9 trim_ms=0.1 solve_ms=301.4
+v5_arena_guard device=0 lane=0 helper=1 mutable_mib=4096.0 table_mib=64.0 reserved_mib=4160.0 drain_ms=1168.9 trim_ms=0.1 solve_ms=195.1
+{"phase": "live", "seconds": 70.192, "solves": 75776, "solves_per_s": 1079.5, "oversize_routes": 5, "card_exclusive_routes": 0}
+v5_arena_guard device=0 lane=0 helper=4 mutable_mib=4096.0 table_mib=64.0 reserved_mib=4160.0 drain_ms=914.9 trim_ms=28.3 solve_ms=330.5
+v5_arena_guard device=0 lane=0 helper=3 mutable_mib=4096.0 table_mib=64.0 reserved_mib=4160.0 drain_ms=215.7 trim_ms=94.8 solve_ms=270.3
+{"phase": "live", "seconds": 80.073, "solves": 82944, "solves_per_s": 1035.9, "oversize_routes": 8, "card_exclusive_routes": 0}
+v5_arena_guard device=1 lane=0 helper=2 mutable_mib=4096.0 table_mib=256.0 reserved_mib=4352.0 drain_ms=1589.8 trim_ms=0.2 solve_ms=985.3
+v5_arena_guard device=1 lane=0 helper=2 mutable_mib=4096.0 table_mib=128.0 reserved_mib=4224.0 drain_ms=1803.5 trim_ms=54.9 solve_ms=503.4
+{"phase": "live", "seconds": 90.088, "solves": 89088, "solves_per_s": 988.9, "oversize_routes": 10, "card_exclusive_routes": 0}
+{"phase": "prestop", "solves": 89088, "games": 8, "decisions": 275934, "oversize_routes": 10, "card_exclusive_routes": 0, "exact_fallbacks": 0, "censored_games": 0, "dropped": 0, "node_caps": 26, "seconds": 90.08801860106178, "solves_per_s": 988.9}
+{"phase": "drained", "solves": 90477, "games": 13, "decisions": 290197, "oversize_routes": 10, "card_exclusive_routes": 0, "exact_fallbacks": 0, "censored_games": 4608, "dropped": 0, "node_caps": 164, "seconds": 118.347, "solves_per_s": 764.5}

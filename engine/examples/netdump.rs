@@ -13,13 +13,22 @@ fn main() {
     let (h, dg, rk, de, dc) = (128usize, 32usize, 48usize, 16usize, 24usize);
     let dims = [PUBFEAT, h, h, CFEAT, dg, rk, AFEAT, de, dc, 0];
     let xd = N_HEXES * (HEX_FACTS + de) + 2 * de + LOOSE;
-    let nw = CARD_FEATS * dc + dc * de + N_UNITS * de + (PILE_COUNTS + de) * de
-        + xd * h + h * h + 2 * dg * h + (4 + de) * dg + dg * (rk + 1) + h * rk
-        + (AFEAT + de) * rk + dg * rk + h * rk;
+    let nw = CARD_FEATS * dc
+        + dc * de
+        + N_UNITS * de
+        + (PILE_COUNTS + de) * de
+        + xd * h
+        + h * h
+        + 2 * dg * h
+        + (4 + de) * dg
+        + dg * (rk + 1)
+        + h * rk
+        + (AFEAT + de) * rk
+        + dg * rk
+        + h * rk;
     let mut r = Rng::new(12345);
-    let mut draw = |n: usize| -> Vec<f32> {
-        (0..n).map(|_| (r.unit_f64() as f32 - 0.5) * 0.4).collect()
-    };
+    let mut draw =
+        |n: usize| -> Vec<f32> { (0..n).map(|_| (r.unit_f64() as f32 - 0.5) * 0.4).collect() };
     let w = draw(nw);
     let b = draw(dc + de + de + h + h + dg + (rk + 1) + 4 * rk);
     let mut ln = Vec::new();
@@ -50,7 +59,11 @@ fn main() {
     for r0 in 0..rows {
         phi[r0 * CFEAT + CFEAT - 1] = (r0 % 2) as f32;
     }
-    for (i, x) in net.forward(&xpub, &xbel, &phi, &ids, rows).iter().enumerate() {
+    for (i, x) in net
+        .forward(&xpub, &xbel, &phi, &ids, rows)
+        .iter()
+        .enumerate()
+    {
         println!("{i:3} {x:.9}");
     }
 }

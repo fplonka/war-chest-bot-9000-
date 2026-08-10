@@ -75,44 +75,73 @@ fn main() {
     for depth in depths {
         // The solver's own node cap bounds the build (the tool's post-build
         // cap check below only decides what to report).
-        let cfg = Cfg { depth, iters, snapshots: true, node_cap, ..Default::default() };
-        let (mut ns, mut ls, mut cs, mut fs, mut bs, mut times) = (
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+        let cfg = Cfg {
+            depth,
+            iters,
+            snapshots: true,
+            node_cap,
+            ..Default::default()
+        };
+        let (mut ns, mut ls, mut cs, mut lcs, mut fs, mut bs, mut times) = (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
         );
         let mut capped = 0usize;
-        'roots: for (s, bel) in roots.iter().take(if max_roots == 0 { roots.len() } else { max_roots }) {
+        'roots: for (s, bel) in roots.iter().take(if max_roots == 0 {
+            roots.len()
+        } else {
+            max_roots
+        }) {
             let ctx = Ctx::new(s);
             let t0 = Instant::now();
             let sv = Solver::new(s, ctx, &nets, cfg, bel.clone());
             times.push(t0.elapsed().as_micros() as usize);
-            if sv.nodes.len() > node_cap {
+            if sv.capped() {
                 capped += 1;
                 continue 'roots;
             }
-            let (mut nodes, mut leaves, mut cells, mut cfgs) = (0, 0, 0, 0);
+            let (mut nodes, mut leaves, mut cells, mut legal_cells, mut cfgs) = (0, 0, 0, 0, 0);
             for n in &sv.nodes {
                 nodes += 1;
                 if n.leaf {
                     leaves += 1;
                 } else if !n.chance {
                     cells += n.na() * n.nc(n.player as usize);
+                    legal_cells += n.legal_action.len();
                 }
                 cfgs += n.nc(0) + n.nc(1);
             }
             ns.push(nodes);
             ls.push(leaves);
             cs.push(cells);
+            lcs.push(legal_cells);
             fs.push(cfgs);
-            bs.push(uploaded_bytes(nodes, leaves, cells, cfgs, sv.snapshot_count()));
+            bs.push(uploaded_bytes(
+                nodes,
+                leaves,
+                cells,
+                cfgs,
+                sv.snapshot_count(),
+            ));
         }
-        let n_done = roots.len().min(if max_roots == 0 { roots.len() } else { max_roots });
+        let n_done = roots.len().min(if max_roots == 0 {
+            roots.len()
+        } else {
+            max_roots
+        });
         if capped > 0 {
-            println!("depth {depth}  {capped}/{n_done} roots exceeded the {node_cap}-node cap");
+            println!("depth {depth}  {capped}/{n_done} roots hit the {node_cap}-node cap");
         }
         for (name, v) in [
             ("nodes", &ns),
             ("leaves", &ls),
             ("action cells", &cs),
+            ("legal cells", &lcs),
             ("configs", &fs),
             ("upload MB", &bs),
             ("build ms", &times),

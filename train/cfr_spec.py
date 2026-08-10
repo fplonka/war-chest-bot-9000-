@@ -41,6 +41,27 @@ CFEAT = CCOUNTS + 1                       # 16
 AFEAT = 39 + 3 * (N_HEXES + 1) + 2 * (NTYPE + 1) + 1  # 176
 AOFF_PAYS = 39 + 3 * (N_HEXES + 1)         # 153
 
+# Compact GPU public-row geometry (`rebel.rs::GPU_ROW_*`).
+GR_HEX_OWNER = 0
+GR_HEX_SLOT = GR_HEX_OWNER + N_HEXES
+GR_HEX_HEIGHT = GR_HEX_SLOT + N_HEXES
+GR_HEX_MARKER = GR_HEX_HEIGHT + N_HEXES
+GR_PILES = GR_HEX_MARKER + N_HEXES
+GR_MARKERS = GR_PILES + NTYPE * PILE_COUNTS
+GR_HAND = GR_MARKERS + 2
+GR_FD = GR_HAND + 2
+GR_BAG = GR_FD + 2
+GR_INITIATIVE = GR_BAG + 2
+GR_INIT_MOVED = GR_INITIATIVE + 1
+GR_TO_ACT = GR_INIT_MOVED + 1
+GR_PLIES = GR_TO_ACT + 1
+GPU_ROW_BYTES = GR_PLIES + 2
+_coords = [(x, y) for y in range(7) for x in range(7)
+           if abs(x - 3) <= 3 and abs(y - 3) <= 3 and abs(x + y - 6) <= 3]
+_locations = {(4, 0), (6, 1), (0, 5), (2, 6), (2, 1),
+              (3, 2), (5, 3), (1, 3), (3, 4), (4, 5)}
+HEX_LOCATION = np.asarray([c in _locations for c in _coords], np.float32)
+
 
 # ---------------------------------------------------------------- job reader
 
@@ -52,25 +73,31 @@ class Job:
         self.b = open(path, "rb").read()
         self.at = 0
         magic, ver = self.u32(), self.u32()
-        assert magic == 0x57434A33 and ver == 3, f"bad job magic/version {magic:x}/{ver}"
+        assert magic == 0x57434A36 and ver == 6, f"bad job magic/version {magic:x}/{ver}"
         self.depth, self.iters = self.u32(), self.u32()
         self.snapshots = bool(self.take(1)[0])
         self.alpha, self.beta, self.gamma, self.predict, self.warm = (
             self.f32(), self.f32(), self.f32(), self.f32(), self.f32())
         self.snap_iters = self.u32s()
+        # WCJ6 carries the exact network shape so admission can reserve every
+        # scratch matrix before a job reaches CUDA.
+        self.net_dims = self.u32s()
         self.nodes, self.ncfg, self.rows, self.pubfeat, self.ncells = (
             self.u32(), self.u32(), self.u32(), self.u32(), self.u32())
         self.node_kind = self.u8s()
         self.node_player = self.u8s()
-        self.node_leaf = self.u8s()
         self.node_child_start = self.u32s()
         self.node_child = self.u32s()
         self.obs_off = self.u32s()
         self.obs_start = self.u32s()
         self.obs_act = self.u32s()
         self.obs_child = self.u32s()
-        self.legal_bits = self.u8s()
-        self.trans = self.i32s()
+        self.legal_row_of = self.u32s()
+        self.legal_off = self.u32s()
+        self.legal_action = self.u32s()
+        self.legal_child = self.u32s()
+        self.legal_trans = self.u32s()
+        self.cell_row = self.u32s()
         self.draw_off = self.u32s()
         self.draw_to = self.u32s()
         self.draw_p = self.f32s()
@@ -96,7 +123,9 @@ class Job:
         self.terminal_utility = self.f32s()
         self.leaf_coff = self.u32s()
         self.leaf_cidx = self.u32s()
-        self.leaf_xpub = self.f32s()
+        self.snap_coff = self.u32s()
+        self.leaf_raw = self.u8s()
+        self.card_feat = self.f32s()
         self.cphi = self.f32s()
         self.bfs_order = self.u32s()
         self.level_start = self.u32s()
@@ -119,13 +148,6 @@ class Job:
         self.voff = np.array(voff, np.int64)
         self.nleaf = len(self.leaf_rows)
         self.n_inner = self.rows - self.nleaf
-        self.legal = np.zeros(self.ncells, bool)
-        for bi in range(len(self.legal_bits)):
-            byte = int(self.legal_bits[bi])
-            for bit in range(8):
-                cell = bi * 8 + bit
-                if cell < self.ncells and (byte >> bit) & 1:
-                    self.legal[cell] = True
         # Per-node action counts from the obs segments: a segment's last
         # boundary is the node's action count (segments are node-relative).
         self.na = np.zeros(n, np.int64)
@@ -136,6 +158,16 @@ class Job:
         self.action_off = np.concatenate([[0], np.cumsum(self.na)])
         self.child = [self.node_child[self.node_child_start[i]:self.node_child_start[i + 1]]
                       for i in range(n)]
+        # The byte contract stores config-major legal CSR. The CPU oracle's
+        # arithmetic order is action-major, then config, so derive that view
+        # without restoring the retired dense config-by-action table.
+        self.action_cells = []
+        for i in range(n):
+            by_action = [[] for _ in range(int(self.na[i]))]
+            if self.node_kind[i] == 0:
+                for cell in range(int(self.soff[i]), int(self.soff[i + 1])):
+                    by_action[int(self.legal_action[cell])].append(cell)
+            self.action_cells.append(by_action)
 
     def take(self, n):
         s = self.b[self.at:self.at + n]
@@ -342,8 +374,6 @@ class Solve:
         self.W = {k: torch.tensor(v, dtype=dtype) for k, v in W.items()}
         self.B = {k: torch.tensor(v, dtype=dtype) for k, v in B.items()}
         self.L = {k: torch.tensor(v, dtype=dtype) for k, v in L.items()}
-        self.legal = torch.tensor(job.legal)
-        self.trans = torch.tensor(job.trans)
         self.obs_act = torch.tensor(job.obs_act)
         self.obs_child = torch.tensor(job.obs_child)
         self.child = [torch.tensor(c, dtype=torch.long) for c in job.child]
@@ -361,10 +391,11 @@ class Solve:
         self.last_traverser = None
         # Build GEMMs (once per solve): the card table, the trunk, the config
         # tower, and (warm start) the action towers.
-        e = self.cards(job.leaf_xpub[:job.pubfeat], job.ids)
+        xpub = self.expand_public(job.leaf_raw, job.rows, job.card_feat)
+        e = self.cards(job.card_feat, job.ids)
         self.e = e
         self.xb = torch.zeros(job.rows, 2 * dg, dtype=dtype)
-        self.h0 = self.trunk(job.leaf_xpub, job.rows, e)
+        self.h0 = self.trunk(xpub, job.rows, e)
         z, g = self.embed(job.cphi, job.ncfg, e)
         self.z, self.g = z, g
         assert job.warm == 0, "warm start is plan A4; the job no longer carries psi"
@@ -375,23 +406,23 @@ class Solve:
                 continue
             me = int(job.node_player[i])
             nc = int(job.nc[i, me])
-            na = int(job.na[i])
-            so = int(job.soff[i])
-            leg = self.legal[so:so + nc * na].reshape(nc, na)
-            u = (leg / leg.sum(1, keepdim=True).clamp(min=1)).reshape(-1)
-            self.cur[so:so + nc * na] = u
-            self.avg[so:so + nc * na] = u
+            row0 = int(job.legal_row_of[i])
+            for c in range(nc):
+                lo, hi = int(job.legal_off[row0 + c]), int(job.legal_off[row0 + c + 1])
+                if hi > lo:
+                    self.cur[lo:hi] = 1.0 / (hi - lo)
+                    self.avg[lo:hi] = self.cur[lo:hi]
         self.propagate(self.cur, job.root0, job.root1)
         for i in range(job.nodes):
             if job.node_kind[i] != 0:
                 continue
             me = int(job.node_player[i])
             nc = int(job.nc[i, me])
-            na = int(job.na[i])
-            so = int(job.soff[i])
+            row0 = int(job.legal_row_of[i])
             r = self.reach_of(i, me)
-            self.sum_strat[so:so + nc * na] += (
-                r[:, None] * self.cur[so:so + nc * na].reshape(nc, na)).reshape(-1)
+            for c in range(nc):
+                lo, hi = int(job.legal_off[row0 + c]), int(job.legal_off[row0 + c + 1])
+                self.sum_strat[lo:hi] += r[c] * self.cur[lo:hi]
         self.snapshot()
 
     # ------------------------------------------------------- helpers
@@ -421,8 +452,44 @@ class Solve:
 
     # ------------------------------------------------------- the network
 
-    def cards(self, xpub_row, ids):
-        c = torch.tensor(np.ascontiguousarray(xpub_row[OFF_CARDS:OFF_LOOSE]),
+    @staticmethod
+    def expand_public(raw, rows, card_feat):
+        """Reference expansion of the device's compact public rows."""
+        r = np.ascontiguousarray(raw).reshape(rows, GPU_ROW_BYTES)
+        x = np.zeros((rows, PUBFEAT), np.float32)
+        for h in range(N_HEXES):
+            at = h * HEX_CH
+            owner = r[:, GR_HEX_OWNER + h]
+            slot = r[:, GR_HEX_SLOT + h]
+            x[:, at] = owner == 0
+            x[:, at + 1] = owner == 1
+            x[:, at + 2] = r[:, GR_HEX_HEIGHT + h].astype(np.float32) / 5.0
+            marker = r[:, GR_HEX_MARKER + h]
+            x[:, at + 3] = marker == 0
+            x[:, at + 4] = marker == 1
+            x[:, at + 5] = HEX_LOCATION[h]
+            for p in range(2):
+                for k in range(NSLOT):
+                    x[:, at + HEX_FACTS + p * NSLOT + k] = ((owner == p) & (slot == k))
+        x[:, OFF_PILES:OFF_CARDS] = r[:, GR_PILES:GR_MARKERS].astype(np.float32) / 5.0
+        x[:, OFF_CARDS:OFF_LOOSE] = np.asarray(card_feat, np.float32).reshape(1, -1)
+        loose = x[:, OFF_LOOSE:OFF_LOOSE + LOOSE]
+        for p in range(2):
+            m = r[:, GR_MARKERS + p].astype(np.float32)
+            loose[:, p * 6] = m / 6.0
+            loose[:, p * 6 + 1] = (6.0 - m) / 6.0
+            loose[:, p * 6 + 2] = r[:, GR_HAND + p].astype(np.float32) / 3.0
+            loose[:, p * 6 + 3] = r[:, GR_FD + p].astype(np.float32) / 21.0
+            loose[:, p * 6 + 4] = r[:, GR_BAG + p].astype(np.float32) / 21.0
+            loose[:, p * 6 + 5] = r[:, GR_INITIATIVE] == p
+        plies = r[:, GR_PLIES].astype(np.uint16) + (r[:, GR_PLIES + 1].astype(np.uint16) << 8)
+        loose[:, 12] = plies.astype(np.float32) / 256.0
+        loose[:, 13] = r[:, GR_INIT_MOVED] != 0
+        loose[:, 14] = r[:, GR_TO_ACT] == 0
+        return x.reshape(-1)
+
+    def cards(self, card_feat, ids):
+        c = torch.tensor(np.ascontiguousarray(card_feat),
                          dtype=self.dtype).reshape(NTYPE, CARD_FEATS)
         hid = F.relu(c @ self.W["wd0"] + self.B["bd0"])
         e = hid @ self.W["wd1"] + self.B["bd1"]
@@ -568,35 +635,33 @@ class Solve:
                 # decision
                 na = int(j.na[i])
                 so = int(j.soff[i])
-                cur = strat[so:so + nc * na].reshape(nc, na)
+                se = int(j.soff[i + 1])
                 if me == traverser:
                     if mode == 0:
-                        self.inst[so:so + nc * na] = 0
+                        self.inst[so:se] = 0
                     vi = torch.full((nc,), float("-inf") if mode == 2 else 0.0,
                                     dtype=self.dtype)
                     for a in range(na):
-                        ch = self.child_of(i, a)
-                        cv = self.vals[j.voff[ch]:j.voff[ch + 1]]
-                        col = self.trans[so + a:so + nc * na:na]
-                        lcol = self.legal[so + a:so + nc * na:na]
-                        ok = lcol & (col >= 0)
-                        av = torch.zeros(nc, dtype=self.dtype)
-                        av[ok] = cv[col[ok].clamp(min=0)]
-                        if mode == 0:
-                            self.inst[so + a:so + nc * na:na] += av
-                            vi += av * cur[:, a]
-                        elif mode == 1:
-                            vi += av * cur[:, a]
-                        else:
-                            # Best response maxes over the *legal* actions
-                            # only: an illegal cell must not pin the max at 0.
-                            av = torch.where(ok, av, torch.full_like(av, float("-inf")))
-                            vi = torch.maximum(vi, av)
+                        for cell in j.action_cells[i][a]:
+                            tr = int(j.legal_trans[cell])
+                            if tr == 0xffffffff:
+                                continue
+                            ch = int(j.legal_child[cell])
+                            av = self.vals[int(j.voff[ch]) + tr]
+                            c = int(j.cell_row[cell])
+                            if mode == 0:
+                                self.inst[cell] += av
+                                vi[c] += av * strat[cell]
+                            elif mode == 1:
+                                vi[c] += av * strat[cell]
+                            else:
+                                vi[c] = torch.maximum(vi[c], av)
                     if mode == 0:
-                        for a in range(na):
-                            lcol = self.legal[so + a:so + nc * na:na]
-                            self.inst[so + a:so + nc * na:na] -= torch.where(
-                                lcol, vi, torch.zeros_like(vi))
+                        row0 = int(j.legal_row_of[i])
+                        for c in range(nc):
+                            lo = int(j.legal_off[row0 + c])
+                            hi = int(j.legal_off[row0 + c + 1])
+                            self.inst[lo:hi] -= vi[c]
                     elif mode == 2:
                         vi = torch.where(vi == float("-inf"), torch.zeros_like(vi), vi)
                     self.vals[vbase:vbase + nc] = vi
@@ -642,8 +707,6 @@ class Solve:
                         self.reach[c_me_at + to] += src_me[c] * pr
                     continue
                 na = int(j.na[i])
-                so = int(j.soff[i])
-                cur = strat[so:so + n_me * na].reshape(n_me, na)
                 o = self.obs_of(i)
                 act_base = int(j.action_off[i])
                 for ch_i in range(len(self.child[i])):
@@ -654,12 +717,14 @@ class Solve:
                     self.reach[c_op_at:c_op_at + n_op] = self.reach[op_at:op_at + n_op]
                     for a in j.obs_act[act_base + o[ch_i]:act_base + o[ch_i + 1]]:
                         a = int(a)
-                        col = self.trans[so + a:so + n_me * na:na]
-                        lcol = self.legal[so + a:so + n_me * na:na]
-                        ok = lcol & (col >= 0)
-                        tgt = col[ok]
-                        w = src_me[ok] * cur[ok, a]
-                        self.reach[c_me_at + tgt] += w
+                        for cell in j.action_cells[i][a]:
+                            if int(j.legal_child[cell]) != ch:
+                                continue
+                            tr = int(j.legal_trans[cell])
+                            if tr == 0xffffffff:
+                                continue
+                            c = int(j.cell_row[cell])
+                            self.reach[c_me_at + tr] += src_me[c] * strat[cell]
 
     def normalize(self, w):
         tot = float(w.sum())
@@ -683,17 +748,18 @@ class Solve:
             na = int(j.na[i])
             nc = int(j.nc[i, traverser])
             so = int(j.soff[i])
-            cells = slice(so, so + nc * na)
-            leg = self.legal[cells].reshape(nc, na)
-            reg = self.regret[cells].reshape(nc, na)
-            ins = self.inst[cells].reshape(nc, na)
-            r = reg * torch.where(reg > 0, da, db) + ins
-            self.regret[cells] = r.reshape(-1)
-            v = torch.clamp(r + j.predict * ins, min=EPS)
-            v = torch.where(leg, v, torch.zeros_like(v))
-            s = v.sum(1, keepdim=True)
-            self.cur[cells] = torch.where(s > 0, v / s, v).reshape(-1)
-            self.sum_strat[cells] *= dg
+            se = int(j.soff[i + 1])
+            row0 = int(j.legal_row_of[i])
+            for c in range(nc):
+                lo, hi = int(j.legal_off[row0 + c]), int(j.legal_off[row0 + c + 1])
+                reg = self.regret[lo:hi]
+                ins = self.inst[lo:hi]
+                r = reg * torch.where(reg > 0, da, db) + ins
+                self.regret[lo:hi] = r
+                v = torch.clamp(r + j.predict * ins, min=EPS)
+                s = v.sum()
+                self.cur[lo:hi] = v / s if float(s) > 0 else v
+            self.sum_strat[so:se] *= dg
         # Forward reach sweep under the new strategy.
         self.propagate(self.cur, j.root0, j.root1)
         # AVG block.
@@ -702,15 +768,17 @@ class Solve:
                 continue
             na = int(j.na[i])
             nc = int(j.nc[i, traverser])
-            so = int(j.soff[i])
-            cells = slice(so, so + nc * na)
+            row0 = int(j.legal_row_of[i])
             r = self.reach_of(i, traverser)
-            self.sum_strat[cells] += (r[:, None] * self.cur[cells].reshape(nc, na)).reshape(-1)
-            ss = self.sum_strat[cells].reshape(nc, na)
-            s = ss.sum(1, keepdim=True)
-            leg = self.legal[cells].reshape(nc, na)
-            unif = leg / leg.sum(1, keepdim=True).clamp(min=1)
-            self.avg[cells] = torch.where(s > 0, ss / s, unif).reshape(-1)
+            for c in range(nc):
+                lo, hi = int(j.legal_off[row0 + c]), int(j.legal_off[row0 + c + 1])
+                self.sum_strat[lo:hi] += r[c] * self.cur[lo:hi]
+                ss = self.sum_strat[lo:hi]
+                s = ss.sum()
+                if float(s) > 0:
+                    self.avg[lo:hi] = ss / s
+                elif hi > lo:
+                    self.avg[lo:hi] = 1.0 / (hi - lo)
         self.snapshot()
         self.steps[traverser] += 1
 
@@ -805,15 +873,15 @@ class Solve:
             idx = torch.tensor(j.leaf_cidx[c0:c1], dtype=torch.long)
             kk = self.z[idx] @ self.W["wk"] + self.B["bk"] + upi  # [nc, rk]
             logit = kk @ q.t()                                     # [nc, na]
-            leg = self.legal[so:so + nc * na].reshape(nc, na)
-            m = torch.where(leg, logit, torch.full_like(logit, float("-inf"))).max(1,
-                                                                                  keepdim=True).values
-            v = torch.where(leg, torch.exp(logit - m), torch.zeros_like(logit))
-            s = v.sum(1, keepdim=True)
-            cur = torch.where(s > 0, v / s, v)
-            cur = torch.clamp(cur, min=0.0)
-            cur = torch.where(leg, torch.clamp(cur, min=EPS), torch.zeros_like(cur))
-            self.cur[so:so + nc * na] = cur.reshape(-1)
+            row0 = int(j.legal_row_of[i])
+            for c in range(nc):
+                lo, hi = int(j.legal_off[row0 + c]), int(j.legal_off[row0 + c + 1])
+                actions = torch.tensor(j.legal_action[lo:hi], dtype=torch.long)
+                v = torch.exp(logit[c, actions] - logit[c, actions].max())
+                s = v.sum()
+                if float(s) > 0:
+                    v = v / s
+                self.cur[lo:hi] = torch.clamp(v, min=EPS)
         return True
 
     def warm_start(self, weight):
@@ -834,11 +902,13 @@ class Solve:
                 na = int(j.na[i])
                 nc = int(j.nc[i, p])
                 so = int(j.soff[i])
-                cells = slice(so, so + nc * na)
-                self.regret[cells] = weight * self.inst[cells]
+                se = int(j.soff[i + 1])
+                self.regret[so:se] = weight * self.inst[so:se]
                 r = self.reach_of(i, p)
-                self.sum_strat[cells] = (
-                    weight * r[:, None] * self.cur[cells].reshape(nc, na)).reshape(-1)
+                row0 = int(j.legal_row_of[i])
+                for c in range(nc):
+                    lo, hi = int(j.legal_off[row0 + c]), int(j.legal_off[row0 + c + 1])
+                    self.sum_strat[lo:hi] = weight * r[c] * self.cur[lo:hi]
             self.steps[p] = int(weight)
         # The t=0 snapshot was the uniform average; retake it from the seed.
         self.avg.zero_()
@@ -848,13 +918,15 @@ class Solve:
             me = int(j.node_player[i])
             na = int(j.na[i])
             nc = int(j.nc[i, me])
-            so = int(j.soff[i])
-            cells = slice(so, so + nc * na)
-            ss = self.sum_strat[cells].reshape(nc, na)
-            s = ss.sum(1, keepdim=True)
-            leg = self.legal[cells].reshape(nc, na)
-            unif = leg / leg.sum(1, keepdim=True).clamp(min=1)
-            self.avg[cells] = torch.where(s > 0, ss / s, unif).reshape(-1)
+            row0 = int(j.legal_row_of[i])
+            for c in range(nc):
+                lo, hi = int(j.legal_off[row0 + c]), int(j.legal_off[row0 + c + 1])
+                ss = self.sum_strat[lo:hi]
+                s = ss.sum()
+                if float(s) > 0:
+                    self.avg[lo:hi] = ss / s
+                elif hi > lo:
+                    self.avg[lo:hi] = 1.0 / (hi - lo)
         self.snaps.clear()
         self.snap_t = 0
         self.snapshot()

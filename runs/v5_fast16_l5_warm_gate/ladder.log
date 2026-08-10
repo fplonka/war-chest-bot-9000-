@@ -1,0 +1,15 @@
+[ladder] 4 players, 6 pairings, 30 paired games each (depth=2 iters=64)
+                        greedy vs random                       W  24 L   0 D   6  score 0.900
+v5 GEMM compute=fast-f16
+                        greedy vs v5_fast16_l5_warm_gate.init  W  16 L   7 D   7  score 0.650
+                        greedy vs v5_fast16_l5_warm_gate.final W   7 L  15 D   8  score 0.367
+                        random vs v5_fast16_l5_warm_gate.init  W   1 L   8 D  21  score 0.383
+                        random vs v5_fast16_l5_warm_gate.final W   0 L  14 D  16  score 0.267
+   v5_fast16_l5_warm_gate.init vs v5_fast16_l5_warm_gate.final W   5 L  13 D  12  score 0.367
+
+=== Elo (/workspace/warchest-engine/runs/v5_fast16_l5_warm_gate, greedy = 0) ===
+                      player   trained     elo    +-   score
+v5_fast16_l5_warm_gate.final   10.0min      16    40   0.667
+                      greedy         -       0    39   0.639
+ v5_fast16_l5_warm_gate.init    5.0min    -106    39   0.444
+                      random         -    -218    42   0.250

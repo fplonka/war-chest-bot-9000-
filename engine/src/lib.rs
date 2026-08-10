@@ -8,6 +8,7 @@
 
 pub mod actions;
 pub mod board;
+pub mod gpu;
 pub mod net;
 pub mod prof;
 pub mod rebel;
@@ -15,9 +16,8 @@ pub mod rng;
 pub mod roots;
 pub mod rules;
 pub mod search;
-pub mod gpu;
-pub mod serialize;
 pub mod selfplay;
+pub mod serialize;
 pub mod state;
 pub mod units;
 pub mod v1;
