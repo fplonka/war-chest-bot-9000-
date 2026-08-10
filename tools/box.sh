@@ -2,6 +2,7 @@
 # The GPU box, in one script: send the code, run something, bring results back.
 #
 #   tools/box.sh sync                     # push the working tree to the box
+#   tools/box.sh build                    # rebuild the extension there, with CUDA
 #   tools/box.sh <command...>             # run it there, output here
 #   tools/box.sh -bg <tag> <command...>   # detach; log to /workspace/logs/<tag>.log
 #   tools/box.sh pull                     # bring back reports, logs and ladders
@@ -50,6 +51,11 @@ pull)
         --exclude '*' "root@$host:$remote/runs/" "$here/runs/"
     echo "pulled reports into $here/runs"
     ;;
+build)
+    # Without `gpu` the extension has no gpu_start and every run on this box
+    # dies at startup.
+    run_remote "cd engine && maturin develop --release --features gpu 2>&1 | tail -2"
+    ;;
 tail)
     run_remote "tail -f /workspace/logs/${2:?usage: tail <tag>}.log"
     ;;
@@ -57,7 +63,7 @@ go)
     exp=${2:?usage: go <experiment> [extra exp.py args...]}
     shift 2
     "$0" sync
-    run_remote "cd engine && maturin develop --release 2>&1 | tail -2"
+    "$0" build
     run_remote "mkdir -p /workspace/logs
 nohup setsid bash -lc $(printf '%q' "$prelude
 python train/exp.py run $exp $*") >/workspace/logs/$exp.log 2>&1 &
