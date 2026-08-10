@@ -224,7 +224,10 @@ fn dispatcher(
                     let route_id = next_route_id;
                     next_route_id = next_route_id.wrapping_add(1);
                     let target = claim_route_target(&lane_work, &lane_state, whale_lanes);
-                    let (held_tx, held_rx) = mpsc::sync_channel(0);
+                    // More than one route can be held on the same whale lane.
+                    // Buffer the acknowledgement so a later hold cannot park
+                    // the lane ahead of an earlier route's release command.
+                    let (held_tx, held_rx) = mpsc::sync_channel(1);
                     let hold = Cmd::Hold {
                         route_id,
                         job,
