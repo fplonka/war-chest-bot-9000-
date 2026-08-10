@@ -421,7 +421,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
     return tot / steps, (ptot / steps if live else float("nan")), stat
 
 
-def check_alive(args, rec):
+def check_alive(args, rec, prev=None):
     """Stop a run that has already failed, instead of paying for the rest of it.
 
     Two ways a run dies quietly. Generation collapses -- an out-of-memory
@@ -436,8 +436,14 @@ def check_alive(args, rec):
     """
     if rec["phase"] != "rebel" or rec["epoch"] < 8:
         return
-    if rec["solves_per_s"] < args.abort_below_sps:
-        raise SystemExit(f"[abort] {rec['solves_per_s']:.0f} solves/s is below "
+    # `solves_per_s` in the log is cumulative (rebel_solves / elapsed), so it
+    # sags for many minutes after generation has actually stopped. The rate over
+    # the last epoch is what notices.
+    now = rec["solves_per_s"]
+    if prev is not None and rec["t"] - prev["t"] > 0.5:
+        now = rec["solves"] / (rec["t"] - prev["t"])
+    if now < args.abort_below_sps:
+        raise SystemExit(f"[abort] {now:.0f} solves/s over the last epoch is below "
                          f"{args.abort_below_sps:.0f}: generation has collapsed")
     if rec["probe_std"] < args.abort_below_spread:
         raise SystemExit(f"[abort] prediction spread {rec['probe_std']:.4f} is below "
@@ -728,7 +734,7 @@ def main():
                 "deadline_remaining": round(max(0.0, deadline - now), 1),
             }
             log.append(rec)
-            check_alive(args, rec)
+            check_alive(args, rec, log[-2] if len(log) > 1 else None)
             write_log(args, log, snaps)
             print(
                 f"[t={rec['t']:6.1f}s] rebel stream solves={rebel_solves} "
@@ -1086,7 +1092,7 @@ def main():
                "solves_per_s": round(sps, 1),
                "lr": opt.param_groups[0]["lr"]}
         log.append(rec)
-        check_alive(args, rec)
+        check_alive(args, rec, log[-2] if len(log) > 1 else None)
         # Rewritten every epoch: this is the file `plot.py` reads, and a run
         # should be watchable from its first minute. It is a few hundred
         # kilobytes even on a long run, so the cost is nothing against a

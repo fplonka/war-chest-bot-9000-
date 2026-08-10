@@ -87,7 +87,7 @@ def panel(title, ylabel, series, zero=False, hlines=(), markers=False):
                 hlines=hlines, markers=markers)
 
 
-def dashboard(specs, cols=3):
+def dashboard(specs, cols=2):
     """Every panel in one figure: shared hover, aligned axes, one legend-free
     grid. Series are named in the subplot titles instead of in a legend, so
     colours never have to be matched across panels."""
@@ -103,7 +103,7 @@ def dashboard(specs, cols=3):
                       + (f'  {" ".join(names)}' if names else "")
                       + f'  <span style="color:{AXIS}">· {sp["ylabel"]}</span>')
     fig = make_subplots(rows=rows, cols=cols, subplot_titles=titles,
-                        vertical_spacing=0.13, horizontal_spacing=0.06)
+                        vertical_spacing=0.11, horizontal_spacing=0.07)
     for k, sp in enumerate(specs):
         r, c = k // cols + 1, k % cols + 1
         for i, (label, x, y, smooth) in enumerate(sp["series"]):
@@ -140,7 +140,7 @@ def dashboard(specs, cols=3):
             fig.update_xaxes(title_text="minutes", row=r, col=c)
 
     fig.update_layout(
-        height=250 * rows, margin=dict(l=48, r=14, t=34, b=40),
+        height=330 * rows, margin=dict(l=48, r=14, t=34, b=40),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(color=AXIS, size=11,
                   family="ui-monospace,SFMono-Regular,Menlo,monospace"),
@@ -154,7 +154,7 @@ def dashboard(specs, cols=3):
     for a in fig.layout.annotations:          # subplot titles, left-aligned
         a.update(x=a.x - 0.5 / cols + 0.004, xanchor="left", font_size=12)
     return fig.to_html(include_plotlyjs=False, full_html=False,
-                       default_height=f"{250 * rows}px",
+                       default_height=f"{330 * rows}px",
                        config={"displaylogo": False, "responsive": True,
                                "modeBarButtonsToRemove":
                                    ["select2d", "lasso2d", "autoScale2d"]})
@@ -232,40 +232,27 @@ def panels(runs):
     # including the ones an instantaneous reading happens to miss. A run whose
     # instantaneous rate holds while its cumulative rate sags is losing time
     # somewhere between the epochs.
+    # Two throughput lines, and the gap between them is the information.
+    #
+    # Note what the trainer logs: `solves_per_s` is `rebel_solves / elapsed`,
+    # both cumulative -- it is the *run average*, not the current rate. Plotting
+    # it as "now" drew the same curve twice. The instantaneous rate has to come
+    # from the differences between consecutive epochs, which is what this does.
     inst, cum = [], []
     for r in runs:
         eps = r["epochs"]
-        if not eps:
+        if len(eps) < 2:
             continue
-        # Elapsed runs from the start of the ReBeL phase, which is one epoch
-        # before the first record. Dividing by the gap since the first record
-        # gives a divide-by-zero on that record itself.
-        t0 = eps[0]["t"] - (eps[1]["t"] - eps[0]["t"] if len(eps) > 1 else 1.0)
-        run_avg, cx, total = [], [], 0
-        for e in eps:
-            total += e["solves"]
-            el = e["t"] - t0
-            if el < 1.0:
-                continue
-            run_avg.append(total / el)
-            cx.append(e["t"] / 60.0)
-        inst.append((f"{tag(r)} now".strip(), mins(r),
-                     [e["solves_per_s"] for e in eps], True))
-        if run_avg:
-            cum.append((f"{tag(r)} run average".strip(), cx, run_avg, False))
+        nx, ny = [], []
+        for a, b in zip(eps, eps[1:]):
+            dt = b["t"] - a["t"]
+            if dt > 0.5:
+                nx.append(b["t"] / 60.0)
+                ny.append(b["solves"] / dt)
+        inst.append((f"{tag(r)} now".strip(), nx, ny, True))
+        cum.append((f"{tag(r)} run average".strip(), mins(r),
+                    [e["solves_per_s"] for e in eps], False))
     out.append(panel("Generation throughput", "solves/s", inst + cum, zero=True))
-    # Rows trained per solve generated. This, not the buffer size, is what
-    # governs how hard a run overfits its own replay -- and the old-vs-fresh
-    # loss split above is its readout. It normally sits flat at whatever
-    # train_gen_ratio asks for, and a flat line is not information: the panel
-    # only appears when the ratio actually moved, which is the case worth
-    # looking at (the trainer falling behind generation, or racing ahead).
-    ratio = [(tag(r), mins(r),
-              [e["steps"] * r["cfg"].get("batch", 1024) / max(e["solves"], 1)
-               for e in r["epochs"]], True) for r in runs]
-    if varies(ratio):
-        out.append(panel("Replay ratio", "rows/solve",
-                         ratio, zero=True))
     # The horizon cuts a game at 256 coin plays and scores it a draw, and War
     # Chest has no draws. A rising rate means the ladder below is measuring a
     # game that is increasingly not the real one.
@@ -369,11 +356,11 @@ def page(runs, title, js):
                 "resolved when the pairing between them has the games to resolve it "
                 "(≈1,000 games for 22 Elo).</footer>")
     return (f"<!doctype html><meta charset=utf-8><title>{title}</title>"
-            f'<script src="{js}" charset="utf-8"></script>' 
+            f"{js}"
             f"<style>{CSS}</style>{''.join(body)}")
 
 
-def write(runs, out=None, title=None):
+def write(runs, out=None, title=None, standalone=False):
     """Render `runs` (directories) to one page. The callable form exp.py uses.
 
     The Plotly bundle is written once into `runs/` and every report links to it
@@ -385,16 +372,20 @@ def write(runs, out=None, title=None):
     loaded = [read(r) for r in runs]
     out = out or f"{runs[0]}/report.html"
     outdir = os.path.dirname(os.path.abspath(out))
-    root = os.path.abspath(RUNS_DIR)
-    js = os.path.join(root, JS)
-    if not os.path.exists(js):
-        os.makedirs(root, exist_ok=True)
-        with open(js, "w") as f:
-            f.write(plotly.offline.get_plotlyjs())
-        print(f"[report] wrote {js}", flush=True)
+    if standalone:
+        # One file that renders anywhere, for sending to someone. Costs ~4.8 MB.
+        js = f"<script>{plotly.offline.get_plotlyjs()}</script>"
+    else:
+        root = os.path.abspath(RUNS_DIR)
+        path = os.path.join(root, JS)
+        if not os.path.exists(path):
+            os.makedirs(root, exist_ok=True)
+            with open(path, "w") as f:
+                f.write(plotly.offline.get_plotlyjs())
+            print(f"[report] wrote {path}", flush=True)
+        js = f'<script src="{os.path.relpath(path, outdir)}" charset="utf-8"></script>'
     with open(out, "w") as f:
-        f.write(page(loaded, title or " · ".join(r["name"] for r in loaded),
-                     os.path.relpath(js, outdir)))
+        f.write(page(loaded, title or " · ".join(r["name"] for r in loaded), js))
     print(f"[report] {out}", flush=True)
     return out
 
@@ -405,8 +396,11 @@ def main():
     ap.add_argument("-o", "--out", default=None,
                     help="output path (default: <first run>/report.html)")
     ap.add_argument("--title", default=None)
+    ap.add_argument("--standalone", action="store_true",
+                    help="inline the plotting library (~4.8 MB) so the file "
+                         "renders on its own, anywhere")
     args = ap.parse_args()
-    write(args.runs, args.out, args.title)
+    write(args.runs, args.out, args.title, args.standalone)
 
 
 if __name__ == "__main__":
