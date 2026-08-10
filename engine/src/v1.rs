@@ -11,11 +11,19 @@
 
 use crate::board::{board, NONE, N_HEXES};
 use crate::rebel::{
-    pending_kind, reserve, Ctx, GLOBAL_SCALARS, MAX_COINS, MAX_ROUND, NSLOT, PEND_KINDS, PEND_SLOT,
-    PLAYER_SCALARS,
+    pending_kind, reserve, Ctx, MAX_COINS, MAX_ROUND, NSLOT, PEND_KINDS, PEND_SLOT,
 };
 use crate::state::{Cont, State, Z_ELIM, Z_FACEDOWN, Z_FACEUP, Z_SUPPLY};
 use crate::units::{write_card_features, CARD_FEATS, N_UNITS};
+
+/// Frozen counts, not the live ones. The body below writes eight per-player
+/// scalars and five shared ones, which is what a pre-describer checkpoint was
+/// trained on; the shared constants were later trimmed to six and three, and
+/// because this module borrowed them it silently started writing a different
+/// layout at a different width. A "frozen" encoder cannot import anything that
+/// is allowed to move.
+const PLAYER_SCALARS_V1: usize = 8;
+const GLOBAL_SCALARS_V1: usize = 5;
 
 pub const HEX_CH_V1: usize = 2 + 1 + NSLOT + 2 + 1 + 1;
 const HEX_BLOCK_V1: usize = N_HEXES * HEX_CH_V1;
@@ -24,9 +32,9 @@ const OFF_ZONES_V1: usize = HEX_BLOCK_V1;
 const OFF_IDENT_V1: usize = OFF_ZONES_V1 + 2 * ZONE_FEATS_V1;
 const OFF_CARDS_V1: usize = OFF_IDENT_V1 + 2 * NSLOT * N_UNITS;
 const OFF_PLAYER_V1: usize = OFF_CARDS_V1 + 2 * NSLOT * CARD_FEATS;
-const OFF_GLOBAL_V1: usize = OFF_PLAYER_V1 + 2 * PLAYER_SCALARS;
+const OFF_GLOBAL_V1: usize = OFF_PLAYER_V1 + 2 * PLAYER_SCALARS_V1;
 /// 972, against the current encoding's 957.
-pub const PUBFEAT_V1: usize = OFF_GLOBAL_V1 + GLOBAL_SCALARS + PEND_KINDS + PEND_SLOT;
+pub const PUBFEAT_V1: usize = OFF_GLOBAL_V1 + GLOBAL_SCALARS_V1 + PEND_KINDS + PEND_SLOT;
 
 /// The public encoding as it was before the card describer.
 pub fn write_public_features_v1(s: &State, ctx: &Ctx, out: &mut [f32]) {
@@ -138,7 +146,7 @@ pub fn write_public_features_v1(s: &State, ctx: &Ctx, out: &mut [f32]) {
         out[i + 5] = s.turns_taken[p] as f32 / 3.0;
         out[i + 6] = (s.initiative == p as u8) as u8 as f32;
         out[i + 7] = (s.first_player == p as u8) as u8 as f32;
-        i += PLAYER_SCALARS;
+        i += PLAYER_SCALARS_V1;
     }
     debug_assert_eq!(i, OFF_GLOBAL_V1);
 
@@ -149,7 +157,7 @@ pub fn write_public_features_v1(s: &State, ctx: &Ctx, out: &mut [f32]) {
     out[i + 2] = s.initiative_moved as u8 as f32;
     out[i + 3] = (s.active == 0) as u8 as f32;
     out[i + 4] = (s.to_act() == 0) as u8 as f32;
-    i += GLOBAL_SCALARS;
+    i += GLOBAL_SCALARS_V1;
     out[i + pending_kind(s)] = 1.0;
     i += PEND_KINDS;
     // The coin a Footman-V2 instant deploy is holding. Public, unlike the
