@@ -464,6 +464,26 @@ extern "C" __global__ void reach_sweep(
     cg::grid_group grid = cg::this_grid();
     int thread = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = gridDim.x * blockDim.x;
+
+    // Snapshot and Phase-2 evaluation need both independent players under one
+    // fixed strategy. Share one cooperative level schedule instead of
+    // launching and globally synchronising two otherwise identical sweeps.
+    if (player < 0) {
+        const unsigned int* level0 = TP(w, unsigned int, T_REACH_LEVEL0);
+        const unsigned int* level1 = TP(w, unsigned int, T_REACH_LEVEL1);
+        for (int l = 0; l < w->nlevels; l++) {
+            int begin0 = level0[l], n0 = level0[l + 1] - begin0;
+            int begin1 = level1[l], n1 = level1[l + 1] - begin1;
+            for (int k = thread; k < n0 + n1; k += stride) {
+                if (k < n0)
+                    reach_task(w, 0, begin0 + k, snap, strat_snap, 0);
+                else
+                    reach_task(w, 1, begin1 + k - n0, snap, strat_snap, 0);
+            }
+            grid.sync();
+        }
+        return;
+    }
     const unsigned int* level = TP(
         w, unsigned int, player ? T_REACH_LEVEL1 : T_REACH_LEVEL0);
     for (int l = 0; l < w->nlevels; l++) {

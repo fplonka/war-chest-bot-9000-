@@ -903,9 +903,25 @@ impl Executor {
         snap: bool,
         strat_snap: bool,
     ) -> Result<(), String> {
-        for p in 0..2 {
-            self.launch_reach_sweep(d, bank, p, snap, strat_snap, false)?;
+        if d.host.reach_task_n.iter().all(|&n| n == 0) {
+            return Ok(());
         }
+        let f = self.kernels.reach_sweep.clone();
+        let mut args = self.stream.launch_builder(&f);
+        let (player, snap, strat_snap, accumulate) = (-1i32, snap as i32, strat_snap as i32, 0i32);
+        args.arg(&d.buffers.dev)
+            .arg(&bank.dev)
+            .arg(&player)
+            .arg(&snap)
+            .arg(&strat_snap)
+            .arg(&accumulate);
+        let cfg = LaunchConfig {
+            grid_dim: (self.reach_blocks, 1, 1),
+            block_dim: (self.sweep_block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { args.launch_cooperative(cfg) }
+            .map_err(|e| format!("CUDA paired reach sweep launch: {e:?}"))?;
         Ok(())
     }
 

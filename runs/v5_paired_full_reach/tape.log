@@ -1,0 +1,12 @@
+Order: baseline, candidate, candidate, baseline
+Workload: frozen one-card tape, 64 roots, 20 seconds, GPU 0, 3 producers
+Environment: WARCHEST_DIRECT=1 WARCHEST_WAVE_LANES=5 WARCHEST_WAVE_ROWS=196608 WARCHEST_WAVE_JOBS=256 WARCHEST_WAVE_US=75000 WARCHEST_TAPE_QUEUE=128
+
+baseline:  completed=11528 elapsed_s=20.168 solves_per_s=571.6
+candidate: completed=11779 elapsed_s=20.196 solves_per_s=583.2
+candidate: completed=11832 elapsed_s=20.155 solves_per_s=587.0
+baseline:  completed=11653 elapsed_s=20.214 solves_per_s=576.5
+
+baseline mean:  574.05 solves/s
+candidate mean: 585.10 solves/s
+relative change: +1.93%
