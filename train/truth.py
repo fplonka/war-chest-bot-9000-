@@ -58,11 +58,11 @@ from export_weights import load as load_checkpoint
 from offline import evaluate
 from train import CCOUNTS, CNORM, CFEAT, PUBFEAT, ROW_BYTES
 
-# Iterations for the reference solve. `examples/solvererr.rs` measures the root
-# value's mean error against a converged reference at 0.0016 by T=32 and still
-# falling; 1024 is far enough past every rung that what remains is not the
-# limit on anything measured here.
-REFERENCE_ITERS = 1024
+# Iterations for the reference solve. At T=256 with dcfr the remaining target
+# error is 0.00008 (`runs/solvererr_g8`), a thousandth of the network's own
+# ~0.088, so nothing measured against this set is limited by it. Higher was
+# tried and is simply 4x the build cost for the same ruler.
+REFERENCE_ITERS = 256
 REFERENCE_CFR = "dcfr"
 DEFAULT_SET = os.environ.get("WARCHEST_TRUTH", "data/truth.npz")
 
