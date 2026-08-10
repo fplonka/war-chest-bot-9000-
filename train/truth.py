@@ -14,33 +14,46 @@ input -- so a position solved *to convergence* has one right answer, and a
 checkpoint either reproduces it or does not.
 
 So: solve a few thousand positions past the point where the answer is still
-moving, write them down, and never touch them again. Every checkpoint ever
-trained then gets one number, in seconds, with no games and no variance, and
-the number stays comparable across architectures and across months. That is
-what a fixed test set buys, and it is the cheapest measurement here by orders
-of magnitude.
+moving, write them down, and never touch them again. Every checkpoint then gets
+one number, in seconds, with no games and no variance.
 
-What the number means, exactly
-------------------------------
-The targets are the converged values of the depth-limited subgames *under the
-leaf evaluator that built the set*. They are not the true values of War Chest;
-no tractable computation gives those. What they measure is how close a network
-is to the fixed point of the solved operator -- which is the property ReBeL's
-whole argument rests on, and the property an under-converged solve quietly
-destroys. A network trained on T=64 targets converges to the fixed point of the
-*T=64* operator, and that bias is invisible to every loss curve, because the
-same position gives the same wrong number every time. This set is where it
-becomes visible.
+READ THIS BEFORE TRUSTING THE NUMBER
+------------------------------------
+**This set measures similarity to the network that built it, not quality.**
+Measured, not feared. The same five `runs/gpu_golden8` snapshots, scored against
+two sets built the same way from two different leaf evaluators:
 
-Two rules follow, and they are the whole discipline of the thing:
+| checkpoint | Elo | set built from snap_02 | set built from snap_04 |
+|---|---:|---:|---:|
+| snap_02 | +281 | 0.00847 | 0.0637 |
+| snap_03 | +473 | **0.00773** | 0.0350 |
+| snap_04 | +593 | 0.00895 | **0.0163** |
 
-* **Build it with a strong net and a large iteration count.** The positions
-  should be ones a real game reaches, and the answers should have stopped
-  moving. Both cost generation time once and nothing thereafter.
-* **Never rebuild it mid-experiment.** The set is the ruler. Regenerating it
-  changes what every past number meant, exactly as a rotating opponent pool
-  changes what past Elo meant. Build a new one under a new filename, keep both,
-  and say which one a result came from.
+Each set ranks its own builder's neighbourhood best, and on the snap_02 set the
+strongest network we have comes out *worse* than one 312 Elo below it. The
+ranking does not survive changing the ruler.
+
+The reason is structural and was always in the design: the targets are
+`CFR(leaves = builder)`, so a network equal to the builder reproduces them up to
+the search itself, and every other network pays for its distance from the
+builder on top of whatever it gets wrong. The set is a fixed point of the
+*builder's* operator, not of the game.
+
+What it is still good for: telling a badly-trained network from a decently
+trained one (both sets agree snap_00 and snap_01 are far worse), and tracking
+one run's progress over its own snapshots. What it must not do is arbitrate
+between experiment arms -- it systematically favours whichever arm most
+resembles the builder, and if the builder came from the control's configuration
+that is a bias pointed straight at the answer. **The ladder arbitrates.**
+
+The fix, unimplemented: anchor the targets on terminal positions instead of on a
+network. Late-game positions solved deep enough that every leaf of the subgame
+is terminal have exact game values, no evaluator involved, and would be a ruler
+that stays true forever. `Conv::zero_sum` going to zero is the check that a
+solve got there. That is the set worth building.
+
+One rule survives unchanged: **never rebuild a set mid-experiment.** Build a new
+one under a new filename, keep both, and say which one a result came from.
 """
 
 import argparse
