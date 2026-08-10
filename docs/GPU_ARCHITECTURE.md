@@ -1,14 +1,11 @@
 # Architecture for 1,200--2,000 ReBeL solves/s
 
-Status: implementation in progress. The v5 milestone build reached 717.1
-solves/s on one RTX 3090 and 1,438.9/s on two on the frozen production tape.
-The later live scheduler added cost isolation and exact exclusive-whale routing,
-so those homogeneous-tape numbers describe commit `c40d246`, not the current
-service. Lane-local whale isolation raised the warmed fixed live stream from
-915.5 to 1,051.5/s before stop over 180.2 seconds, and from 839.3 to 1,009.4/s
-including drain. The matching five-minute Greedy-warm/ReBeL gate improved from
-624.5 to 699.7 balanced solves/s, with zero drops or exact fallbacks and bounded
-debt. The five-minute 1,200/s and golden-run gates have not been achieved yet.
+Status: implementation in progress. The five-minute gate is met --
+`runs/v5_c_gate_l8` reached 1,404.9 balanced solves/s -- and the first complete
+thirty-minute golden run, `runs/gpu_golden`, reached 1,023.5. See
+`docs/GPU_PERF_GOAL.md` for the current numbers and the aged-stream ladder that
+produced them. What follows is the design; the section below records where its
+diagnosis turned out to be wrong.
 
 This is a replacement design, not an incremental plan for the resident CUDA
 service. Keep the verified rules, tree semantics, compact training-row format,
@@ -37,6 +34,51 @@ The proposed system has four defining properties:
 
 That is the shortest design I think can reach 1,200 on the existing Vast.ai
 box and still have a credible path to 2,000.
+
+## What the measurements actually said
+
+Four beliefs in this document did not survive contact with the machine. They are
+kept here because each one cost days.
+
+**"The device is the ceiling."** It is not, and neither is the host. Every
+configuration of lane count, wave size, cost class, fill window, builder thread
+count, in-flight depth, allocator and even CFR iteration count landed the live
+stream within a few percent of the same number, while the cards were about half
+idle and the builders used under a third of the box's threads. Two independent
+processes, one per card, produced exactly the same total as one process using
+both. The system was latency-coupled: builders waited on cards, cards waited on
+builders, and no single resource was saturated. Nothing that adds capacity to
+one side fixes that; only shortening the loop does.
+
+**The frozen tape is not a decision metric for live throughput.** Merging the
+cost classes and shortening the wave fill window are worth about +50% on
+`wave_tape` and nothing at all live -- and merging classes is a 5% *regression*
+on the aged stream. The tape has no game loop, so it measures the executor in
+isolation and rewards changes that the live system cannot use. Use it to
+attribute executor cost, not to choose.
+
+**Memory was the hidden constraint, and not the way this document assumed.** The
+arena was not the problem; *retaining* it was. A lane grew its buffers to the
+largest wave it had ever served and never gave them back, so a single
+gibibyte-sized search per lane filled a 24 GiB card. That is what killed the
+long run at fifteen minutes, and it is why every attempt at more lanes or more
+in-flight solves ended in `CUDA_ERROR_OUT_OF_MEMORY` rather than a measurement.
+Returning oversized buffers took peak memory from 19.7 to 7.9 GiB at no cost in
+throughput, and only then could the pipeline be widened at all.
+
+**The idle time was one gap per convoy cycle, not launch overhead.** An Nsight
+trace attributed 94% of both cards' idle to a few hundred gaps a second apart,
+each around 30 ms, every one of them ending at `pack_cards` -- the first kernel
+of a wave. Lanes went quiet between waves, and since they all wait on the same
+card they went quiet together. Splitting `solve` into `launch` and `collect`, so
+a wave stays on the card while the lane assembles the next one and unpacks the
+last, is what made a deeper in-flight window pay for the first time: in-flight
+80 was worth +9% after that change and nothing before it.
+
+The standing obstacle is now the host tree builder. The phase timers put a
+mature solve at 30.7 CPU-ms: 19.6 building the tree, 4.3 serializing the job,
+3.1 packing public features. This document's budget for 1,200 solves/s is 20 ms,
+so the direct sparse builder in step 1 below is no longer optional.
 
 ## What counts as success
 

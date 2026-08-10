@@ -157,8 +157,37 @@ The warmed FP32 live-stream control completed 164,864 solves before stop over
 isolation raised those results to 1,051.5/s before stop and 1,009.4/s including
 drain. The matching correct five-minute Greedy-warm/ReBeL training gate improved
 from 624.5 to 699.7 balanced solves/s, with zero drops, no exact fallbacks, 240
-rows of debt, and no overrun. Those are the active generation and training
-baselines; the opening burst is not used as a steady-state result.
+rows of debt, and no overrun.
+
+## Where it stands now
+
+The first complete thirty-minute run is `runs/gpu_golden`: **1,023.5 balanced
+solves/s** over the twenty-five-minute ReBeL interval, 1,533,928 solves, 928
+rows of debt, no overrun, and zero drops, exact fallbacks and oversized routes.
+Peak card memory was 13.0 GiB of 24, against the 23.5 GiB at which the previous
+long run died. `runs/v5_c_gate_l8` is the matching five-minute gate at
+**1,404.9 balanced solves/s**, up from 1,211.1.
+
+The standing development measurement is a 180-second aged generation stream
+from a late checkpoint with the horizon payoff at zero -- 4,608 live games all
+in the midgame at once, which is the heaviest workload the goal has to sustain
+(`tools/v5_stream.sh`). Against it:
+
+| build | aged solves/s |
+|---|---:|
+| session start | 869.8 |
+| smaller wave arena | 904.2 |
+| eight lanes | 966.3 |
+| lane buffers shrink back | 967.0 |
+| ten lanes | 983.5 |
+| jemalloc, 42 builders | 1,023.8 |
+| pipelined lane | 1,041.0 |
+| twelve lanes, 80 solves in flight | 1,136.8 |
+
+The last row is the point of the whole exercise: a deeper in-flight window had
+measured nothing at every earlier build, because the memory it needed did not
+exist and because a lane that blocks on its own wave cannot use the extra depth
+anyway. It only pays once both are fixed.
 
 ## How to measure progress
 
