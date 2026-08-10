@@ -472,6 +472,26 @@ extern "C" __global__ void reach_sweep(
             reach_task(w, player, k, snap, strat_snap, accumulate);
         grid.sync();
     }
+    if (!accumulate) return;
+
+    // The root has no parent and therefore is not part of the forward task
+    // map. Accumulate its strategy sum here after the final level barrier
+    // instead of paying for a separate kernel after every CFR iteration.
+    for (int j = blockIdx.x; j < w->jobs; j += gridDim.x) {
+        JobDev d = TP(w, JobDev, T_JOBS)[j];
+        int node = d.node0;
+        if (TP(w, unsigned char, T_NODE_KIND)[node] != 0
+            || TP(w, unsigned char, T_NODE_PLAYER)[node] != player) continue;
+        int n = nc_of(w, node, player);
+        for (int c = threadIdx.x; c < n; c += blockDim.x) {
+            unsigned int row = TP(w, unsigned int, T_LEGAL_ROW_OF)[node] + c;
+            unsigned int lo = TP(w, unsigned int, T_LEGAL_OFF)[row];
+            unsigned int hi = TP(w, unsigned int, T_LEGAL_OFF)[row + 1];
+            float r = AP(w, A_REACH)[reach_at(w, node, player, c)];
+            for (unsigned int x = lo; x < hi; x++)
+                AP(w, A_SUM)[x] += r * AP(w, A_CUR)[x];
+        }
+    }
 }
 
 extern "C" __global__ void seed_sum(const WaveDev* w, const WeightDev* wt,
@@ -485,25 +505,6 @@ extern "C" __global__ void seed_sum(const WaveDev* w, const WeightDev* wt,
     unsigned int hi = TP(w, unsigned int, T_LEGAL_OFF)[row + 1];
     float r = AP(w, A_REACH)[reach_at(w, q.node, player, q.config)];
     for (unsigned int x = lo; x < hi; x++) AP(w, A_SUM)[x] = r * AP(w, A_CUR)[x];
-}
-
-extern "C" __global__ void root_average(const WaveDev* w, const WeightDev* wt,
-                                         int player) {
-    (void)wt;
-    int j = blockIdx.x;
-    if (j >= w->jobs) return;
-    JobDev d = TP(w, JobDev, T_JOBS)[j];
-    int node = d.node0;
-    if (TP(w, unsigned char, T_NODE_KIND)[node] != 0
-        || TP(w, unsigned char, T_NODE_PLAYER)[node] != player) return;
-    int n = nc_of(w, node, player);
-    for (int c = threadIdx.x; c < n; c += blockDim.x) {
-        unsigned int row = TP(w, unsigned int, T_LEGAL_ROW_OF)[node] + c;
-        unsigned int lo = TP(w, unsigned int, T_LEGAL_OFF)[row];
-        unsigned int hi = TP(w, unsigned int, T_LEGAL_OFF)[row + 1];
-        float r = AP(w, A_REACH)[reach_at(w, node, player, c)];
-        for (unsigned int x = lo; x < hi; x++) AP(w, A_SUM)[x] += r * AP(w, A_CUR)[x];
-    }
 }
 
 // ------------------------------------------------------------ value network

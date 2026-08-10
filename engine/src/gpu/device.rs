@@ -239,7 +239,7 @@ kernels! {
     pack_cards, bias_act, cards_finish, pile_pe, pack_piles, assemble,
     trunk_norm, holding_in, slot_sum, finish_zg,
     pack_head_static_f16,
-    init_strategy, seed_reach, reach_sweep, seed_sum, root_average,
+    init_strategy, seed_reach, reach_sweep, seed_sum,
     belief_sums, belief_sums_f16, head_entry, head_entry_f16, head_act, readout, backprop_sweep,
     normalize_strategy, gather_carry, collect_root,
 }
@@ -490,14 +490,6 @@ impl Executor {
                 );
                 self.launch_backprop_sweep(&device, bank, p, false, da, db, ds, cfr.predict)?;
                 self.launch_reach_sweep(&device, bank, p, false, false, true)?;
-                launch!(
-                    self,
-                    device,
-                    bank,
-                    root_average,
-                    wave.jobs.len() as u32,
-                    p as i32
-                )?;
 
                 let completed = t + 1;
                 if let Some(s) = wave.meta.snap_iters.iter().position(|&x| x == completed) {
