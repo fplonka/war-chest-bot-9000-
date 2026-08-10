@@ -64,6 +64,7 @@ from train import CCOUNTS, CNORM, CFEAT, PUBFEAT, ROW_BYTES
 # limit on anything measured here.
 REFERENCE_ITERS = 1024
 REFERENCE_CFR = "dcfr"
+DEFAULT_SET = os.environ.get("WARCHEST_TRUTH", "data/truth.npz")
 
 
 def build(args):
@@ -103,21 +104,29 @@ def build(args):
           f"target spread {cy.std():.4f}", flush=True)
 
 
-def score(args):
-    """Every checkpoint's belief-weighted error against the frozen set."""
-    d = Dump(args.set)
+def errors(paths, set_path=DEFAULT_SET, device="cpu"):
+    """`{path: (huber, rms)}` against the frozen set, or `{}` if there is none.
+
+    Callers that have no set must still work: the ladder is the older
+    instrument and does not depend on this one.
+    """
+    if not os.path.exists(set_path):
+        return {}
+    d = Dump(set_path)
     d.check(PUBFEAT, CCOUNTS)
     parts = d.rows(0, len(d))
-    dev = torch.device(args.device)
-    rng = np.random.default_rng(0)
-    print(f"[truth] {args.set}: {len(d)} positions, target spread "
-          f"{parts[4].std():.4f}\n", flush=True)
-    print(f"{'checkpoint':>44s} {'huber':>9s} {'rms':>9s}", flush=True)
-    out = []
-    for path in args.ckpts:
-        net = load_checkpoint(path).to(dev)
-        huber, rms = evaluate(net, parts, rng, dev)
-        out.append((path, huber, rms))
+    dev, rng = torch.device(device), np.random.default_rng(0)
+    return {p: evaluate(load_checkpoint(p).to(dev), parts, rng, dev) for p in paths}
+
+
+def score(args):
+    """Every checkpoint's belief-weighted error against the frozen set."""
+    if not os.path.exists(args.set):
+        raise SystemExit(f"no such set {args.set}; build one first")
+    out = errors(args.ckpts, args.set, args.device)
+    print(f"[truth] {args.set}\n\n{'checkpoint':>44s} {'huber':>9s} {'rms':>9s}",
+          flush=True)
+    for path, (huber, rms) in out.items():
         print(f"{path:>44s} {huber:>9.6f} {rms:>9.6f}", flush=True)
     return out
 
@@ -128,7 +137,7 @@ def main():
 
     b = sub.add_parser("build", help="solve a fresh set of positions to convergence")
     b.add_argument("--ckpt", required=True, help="the leaf evaluator; use the strongest we have")
-    b.add_argument("--out", default="data/truth.npz")
+    b.add_argument("--out", default=DEFAULT_SET)
     b.add_argument("--games", type=int, default=64)
     b.add_argument("--iters", type=int, default=REFERENCE_ITERS)
     b.add_argument("--cfr", default=REFERENCE_CFR)
@@ -141,7 +150,7 @@ def main():
 
     s = sub.add_parser("score", help="rate checkpoints against a frozen set")
     s.add_argument("ckpts", nargs="+")
-    s.add_argument("--set", default="data/truth.npz")
+    s.add_argument("--set", default=DEFAULT_SET)
     s.add_argument("--device", default="cpu")
     s.set_defaults(fn=score)
 

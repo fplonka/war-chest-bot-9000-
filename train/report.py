@@ -193,8 +193,7 @@ def panels(runs):
     one = len(runs) == 1
     tag = lambda r: "" if one else r["name"]
 
-    elo = []
-    hl = []
+    elo, tru, hl = [], [], []
     for r in runs:
         if not r["ladder"]:
             continue
@@ -202,12 +201,19 @@ def panels(runs):
         if snaps:
             elo.append((tag(r) or "snapshot", [p["t"] / 60.0 for p in snaps],
                         [p["elo"] for p in snaps], False))
+        scored = [p for p in snaps if p.get("truth") is not None]
+        if scored:
+            tru.append((tag(r) or "snapshot", [p["t"] / 60.0 for p in scored],
+                        [p["truth"] for p in scored], False))
         p = next((q for q in r["ladder"]["players"] if q["name"] == "greedy"), None)
         if p and "greedy" not in [n for n, _ in hl]:
             hl.append(("greedy", p["elo"]))
 
     out = [panel("Strength vs training time", "elo", elo, hlines=hl,
                  markers=True)]
+    if tru:
+        out.append(panel("Error against the frozen truth set", "huber", tru,
+                         markers=True))
 
     if one and "loss_old" in (runs[0]["epochs"] or [{}])[-1]:
         r = runs[0]
@@ -286,9 +292,11 @@ def ladder_table(lad):
 
     def prow(p):
         when = "—" if p["t"] is None else f"{p['t'] / 60:.0f} min"
+        t = p.get("truth")
         return (f"<tr><td>{p['name']}</td><td class=n>{when}</td>"
                 f"<td class=n>{p['elo']:.0f}</td><td class=n>±{p['se']:.0f}</td>"
-                f"<td class=n>{p['score']:.3f}</td></tr>")
+                f"<td class=n>{p['score']:.3f}</td>"
+                f"<td class=n>{'—' if t is None else f'{t:.5f}'}</td></tr>")
 
     rows = "".join(prow(p) for p in sorted(players, key=lambda p: -p["elo"]))
     pairs = "".join(
@@ -298,7 +306,8 @@ def ladder_table(lad):
         f"<td class=n>{p['score']:.3f}</td></tr>"
         for p in sorted(pairs_in, key=lambda p: -(p.get("n", 0))))
     return (f"<div class=tw><table><thead><tr><th>player<th class=n>trained"
-            f"<th class=n>elo<th class=n>±<th class=n>score</thead>{rows}</table></div>"
+            f"<th class=n>elo<th class=n>±<th class=n>score<th class=n>truth"
+            f"</thead>{rows}</table></div>"
             f"<h3>Head to head</h3><div class=tw><table><thead><tr><th>pairing"
             f"<th class=n>W–L–D<th class=n>games<th class=n>score</thead>"
             f"{pairs}</table></div>")

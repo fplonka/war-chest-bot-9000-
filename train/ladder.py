@@ -50,6 +50,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import truth
 import warchest
 from export_weights import load
 
@@ -333,10 +334,16 @@ def run(runs, out=None, games=60, temp=2.0, random_draft=False, seed=7,
     spr = sc + 0.5 * PRIOR * (1 - np.eye(k)) * (n > 0)
     elo = fit_elo(npr, spr)
     se = elo_stderr(n, elo)
+    # The noise-free half of the same question. Elo says who wins; this says how
+    # far the value head is from the fixed point of the solved operator, and the
+    # two disagreeing is itself a result.
+    terr = truth.errors([f"{p['run']}/{p['file']}" for p in nets])
     res = {"runs": list(runs), "games_per_pair": games, "focus_games": focus_games,
-           "focus": sorted(focus),
+           "focus": sorted(focus), "truth_set": truth.DEFAULT_SET if terr else None,
            "players": [{"name": p["name"], "t": p["t"], "search": p["search"], "elo": round(float(e), 1),
                         "se": round(float(s), 1),
+                        "truth": round(terr[f"{p['run']}/{p['file']}"][0], 6)
+                                 if p.get("file") and terr else None,
                         "score": round(float(sc[i].sum() / max(n[i].sum(), 1)), 3)}
                        for i, (p, e, s) in enumerate(zip(ps, elo, se))],
            "pairs": pairs}
@@ -345,11 +352,13 @@ def run(runs, out=None, games=60, temp=2.0, random_draft=False, seed=7,
 
     zero = ps[0]["name"] if ps else "?"
     print(f"\n=== Elo ({out}, {zero} = 0) ===", flush=True)
-    print(f"{'player':>28s} {'trained':>9s} {'elo':>7s} {'+-':>5s} {'score':>7s}", flush=True)
+    print(f"{'player':>28s} {'trained':>9s} {'elo':>7s} {'+-':>5s} {'score':>7s} "
+          f"{'truth':>8s}", flush=True)
     for p in sorted(res["players"], key=lambda p: -p["elo"]):
         tm = f"{p['t'] / 60:.1f}min" if p["t"] is not None else "-"
         print(f"{p['name']:>28s} {tm:>9s} {p['elo']:>7.0f} {p['se']:>5.0f} "
-              f"{p['score']:>7.3f}", flush=True)
+              f"{p['score']:>7.3f} "
+              f"{('%.5f' % p['truth']) if p['truth'] is not None else '-':>8s}", flush=True)
     return res
 
 
