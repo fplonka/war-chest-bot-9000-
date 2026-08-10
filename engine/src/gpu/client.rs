@@ -129,6 +129,22 @@ pub(crate) enum Cmd {
         cost: u64,
         reply: mpsc::Sender<(usize, Result<SolveResult, String>)>,
     },
+    Hold {
+        route_id: u64,
+        job: Arc<PackedJob>,
+        work: WorkVector,
+        tag: usize,
+        cost: u64,
+        reply: mpsc::Sender<(usize, Result<SolveResult, String>)>,
+        ready: mpsc::SyncSender<()>,
+    },
+    ReleaseHeld {
+        route_id: u64,
+    },
+    CancelHeld {
+        route_id: u64,
+        error: String,
+    },
     Publish {
         version: u64,
         dims: Vec<usize>,

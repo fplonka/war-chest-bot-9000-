@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::serialize::{PackedJob, WorkVector};
@@ -22,6 +22,30 @@ struct Pending {
     version: u64,
     cost: u64,
     queued: Instant,
+}
+
+struct HeldPending {
+    route_id: u64,
+    pending: Pending,
+}
+
+struct LaneState {
+    blocked: Vec<bool>,
+    route_refs: Vec<usize>,
+    guard_refs: Vec<usize>,
+}
+
+struct RouteTicket {
+    route_id: u64,
+    target: usize,
+    work: WorkVector,
+    cost: u64,
+    held_ready: mpsc::Receiver<()>,
+}
+
+enum RouteCmd {
+    Run(RouteTicket),
+    Shutdown,
 }
 
 pub fn spawn(
@@ -124,9 +148,66 @@ fn dispatcher(
             }
         }
     }
+    let lane_state = Arc::new(Mutex::new(LaneState {
+        blocked: vec![false; lanes],
+        route_refs: vec![0; lanes],
+        guard_refs: vec![0; lanes],
+    }));
+    let (route_tx, route_rx) = mpsc::channel();
+    let route_senders = senders.clone();
+    let route_work = lane_work.clone();
+    let route_state = lane_state.clone();
+    let route_global = queued_work.clone();
+    let route_join = match std::thread::Builder::new()
+        .name(format!("warchest-routes-{device}"))
+        .spawn(move || {
+            run_routes(
+                device,
+                route_rx,
+                route_senders,
+                route_work,
+                route_state,
+                route_global,
+                route_profile,
+            )
+        }) {
+        Ok(join) => join,
+        Err(e) => {
+            let _ = ready.send(Err(format!("start GPU route worker: {e}")));
+            for tx in &senders {
+                let _ = tx.send(Cmd::Shutdown);
+            }
+            for join in joins {
+                let _ = join.join();
+            }
+            return;
+        }
+    };
     let _ = ready.send(Ok(()));
 
-    while let Ok(cmd) = rx.recv() {
+    let mut deferred = VecDeque::new();
+    let mut next_route_id = 1u64;
+    loop {
+        flush_deferred(
+            &mut deferred,
+            &senders,
+            &lane_work,
+            &lane_state,
+            whale_lanes,
+            &queued_work,
+        );
+        let cmd = if deferred.is_empty() {
+            match rx.recv() {
+                Ok(cmd) => cmd,
+                Err(_) => break,
+            }
+        } else {
+            match rx.recv_timeout(Duration::from_millis(1)) {
+                Ok(cmd) => cmd,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        };
         match cmd {
             Cmd::Submit {
                 job,
@@ -135,136 +216,58 @@ fn dispatcher(
                 cost,
                 reply,
             } => {
-                if work.requires_card_exclusive_route() {
-                    let route_started = Instant::now();
-                    // A six-GiB (or larger) reservation cannot reliably coexist
-                    // with ordinary retained buffers and the trainer. Drain
-                    // and trim the whole card around this rare tail.
-                    while lane_work.iter().any(|x| x.load(Ordering::Acquire) != 0) {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    let drained_at = Instant::now();
-                    if let Err(e) = trim_lanes(&senders) {
-                        queued_work.fetch_sub(cost, Ordering::Relaxed);
-                        let _ = reply.send((tag, Err(e)));
-                        continue;
-                    }
-                    let trimmed_at = Instant::now();
-                    lane_work[0].fetch_add(cost, Ordering::Release);
-                    if let Err(e) = senders[0].send(Cmd::Submit {
+                if work.requires_arena_guard_route() || work.requires_card_exclusive_route() {
+                    // Put the job on its whale lane now so it records the
+                    // weight version at submission order. A separate worker
+                    // drains and trims the bounded lane set; meanwhile the
+                    // dispatcher keeps the other lanes fed.
+                    let route_id = next_route_id;
+                    next_route_id = next_route_id.wrapping_add(1);
+                    let target = claim_route_target(&lane_work, &lane_state, whale_lanes);
+                    let (held_tx, held_rx) = mpsc::sync_channel(0);
+                    let hold = Cmd::Hold {
+                        route_id,
                         job,
                         work,
                         tag,
                         cost,
                         reply,
-                    }) {
-                        lane_work[0].fetch_sub(cost, Ordering::Release);
+                        ready: held_tx,
+                    };
+                    if let Err(e) = senders[target].send(hold) {
+                        release_route_target(&lane_state, target);
                         queued_work.fetch_sub(cost, Ordering::Relaxed);
-                        if let Cmd::Submit { tag, reply, .. } = e.0 {
-                            let _ = reply.send((tag, Err("GPU giant-wave lane is gone".into())));
-                        }
-                        continue;
-                    }
-                    while lane_work[0].load(Ordering::Acquire) != 0 {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    if route_profile {
-                        let table_reserved = work
-                            .table_bytes
-                            .checked_next_power_of_two()
-                            .unwrap_or(work.table_bytes);
-                        eprintln!(
-                            "v5_card_route device={device} mutable_mib={:.1} table_mib={:.1} reserved_mib={:.1} drain_ms={:.1} trim_ms={:.1} solve_ms={:.1}",
-                            work.mutable_bytes as f64 / 1048576.0,
-                            table_reserved as f64 / 1048576.0,
-                            work.mutable_bytes.saturating_add(table_reserved) as f64 / 1048576.0,
-                            1e3 * (drained_at - route_started).as_secs_f64(),
-                            1e3 * (trimmed_at - drained_at).as_secs_f64(),
-                            1e3 * trimmed_at.elapsed().as_secs_f64(),
-                        );
-                    }
-                    continue;
-                }
-                if work.requires_arena_guard_route() {
-                    let route_started = Instant::now();
-                    // A four-GiB contiguous allocation failed when all five
-                    // lanes retained large buffers. Free the selected whale
-                    // lane plus one least-busy helper, but let the other three
-                    // lanes continue. The whale lane trims again after solve.
-                    let guarded = arena_guard_lanes(&lane_work, whale_lanes);
-                    while guarded
-                        .iter()
-                        .any(|&i| lane_work[i].load(Ordering::Acquire) != 0)
-                    {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    let drained_at = Instant::now();
-                    if let Err(e) = trim_lanes(guarded.iter().map(|&i| &senders[i])) {
-                        queued_work.fetch_sub(cost, Ordering::Relaxed);
-                        let _ = reply.send((tag, Err(e)));
-                        continue;
-                    }
-                    let trimmed_at = Instant::now();
-                    let lane = guarded[0];
-                    lane_work[lane].fetch_add(cost, Ordering::Release);
-                    if let Err(e) = senders[lane].send(Cmd::Submit {
-                        job,
-                        work,
-                        tag,
-                        cost,
-                        reply,
-                    }) {
-                        lane_work[lane].fetch_sub(cost, Ordering::Release);
-                        queued_work.fetch_sub(cost, Ordering::Relaxed);
-                        if let Cmd::Submit { tag, reply, .. } = e.0 {
+                        if let Cmd::Hold { tag, reply, .. } = e.0 {
                             let _ = reply.send((tag, Err("GPU guarded-wave lane is gone".into())));
                         }
                         continue;
                     }
-                    while lane_work[lane].load(Ordering::Acquire) != 0 {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    if route_profile {
-                        let table_reserved = work
-                            .table_bytes
-                            .checked_next_power_of_two()
-                            .unwrap_or(work.table_bytes);
-                        eprintln!(
-                            "v5_arena_guard device={device} lane={lane} helper={} mutable_mib={:.1} table_mib={:.1} reserved_mib={:.1} drain_ms={:.1} trim_ms={:.1} solve_ms={:.1}",
-                            guarded.get(1).copied().unwrap_or(lane),
-                            work.mutable_bytes as f64 / 1048576.0,
-                            table_reserved as f64 / 1048576.0,
-                            work.mutable_bytes.saturating_add(table_reserved) as f64 / 1048576.0,
-                            1e3 * (drained_at - route_started).as_secs_f64(),
-                            1e3 * (trimmed_at - drained_at).as_secs_f64(),
-                            1e3 * trimmed_at.elapsed().as_secs_f64(),
-                        );
+                    let ticket = RouteTicket {
+                        route_id,
+                        target,
+                        work,
+                        cost,
+                        held_ready: held_rx,
+                    };
+                    if let Err(e) = route_tx.send(RouteCmd::Run(ticket)) {
+                        let RouteCmd::Run(ticket) = e.0 else {
+                            unreachable!()
+                        };
+                        let _ = senders[target].send(Cmd::CancelHeld {
+                            route_id: ticket.route_id,
+                            error: "GPU route worker is gone".into(),
+                        });
+                        release_route_target(&lane_state, target);
                     }
                     continue;
                 }
-                // Keep whale lanes free of ordinary backlog. They retain the
-                // largest buffers and must be immediately available when a
-                // guarded arena arrives; ordinary work uses the other lanes.
-                let lane = if work.requires_exclusive_route() {
-                    dispatch_whale_lane(&lane_work, whale_lanes)
-                } else {
-                    dispatch_general_lane(&lane_work, whale_lanes)
-                };
-                lane_work[lane].fetch_add(cost, Ordering::Relaxed);
-                let cmd = Cmd::Submit {
+                deferred.push_back(Cmd::Submit {
                     job,
                     work,
                     tag,
                     cost,
                     reply,
-                };
-                if let Err(e) = senders[lane].send(cmd) {
-                    lane_work[lane].fetch_sub(cost, Ordering::Relaxed);
-                    queued_work.fetch_sub(cost, Ordering::Relaxed);
-                    if let Cmd::Submit { tag, reply, .. } = e.0 {
-                        let _ = reply.send((tag, Err(format!("GPU lane {lane} is gone"))));
-                    }
-                }
+                });
             }
             Cmd::Publish {
                 version,
@@ -286,14 +289,250 @@ fn dispatcher(
             Cmd::Trim { ready } => {
                 let _ = ready.send(Err("trim is an internal lane command".into()));
             }
+            Cmd::Hold {
+                tag, reply, ready, ..
+            } => {
+                let _ = ready.send(());
+                let _ = reply.send((tag, Err("hold is an internal lane command".into())));
+            }
+            Cmd::ReleaseHeld { .. } | Cmd::CancelHeld { .. } => {}
             Cmd::Shutdown => break,
         }
+    }
+    let _ = route_tx.send(RouteCmd::Shutdown);
+    let _ = route_join.join();
+    {
+        let mut state = lane_state.lock().unwrap_or_else(|e| e.into_inner());
+        state.blocked.fill(false);
+        state.route_refs.fill(0);
+        state.guard_refs.fill(0);
+    }
+    while !deferred.is_empty() {
+        flush_deferred(
+            &mut deferred,
+            &senders,
+            &lane_work,
+            &lane_state,
+            whale_lanes,
+            &queued_work,
+        );
     }
     for tx in &senders {
         let _ = tx.send(Cmd::Shutdown);
     }
     for join in joins {
         let _ = join.join();
+    }
+}
+
+fn flush_deferred(
+    deferred: &mut VecDeque<Cmd>,
+    senders: &[mpsc::Sender<Cmd>],
+    lane_work: &[Arc<AtomicU64>],
+    lane_state: &Arc<Mutex<LaneState>>,
+    whale_lanes: usize,
+    queued_work: &Arc<AtomicU64>,
+) {
+    let mut i = 0;
+    while i < deferred.len() {
+        let (whale, cost) = match &deferred[i] {
+            Cmd::Submit { work, cost, .. } => (work.requires_exclusive_route(), *cost),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let lane = {
+            let state = lane_state.lock().unwrap_or_else(|e| e.into_inner());
+            let end = if whale {
+                whale_lanes.min(lane_work.len())
+            } else {
+                lane_work.len()
+            };
+            let selected = (0..end)
+                .filter(|&lane| !state.blocked[lane])
+                .min_by_key(|&lane| lane_work[lane].load(Ordering::Relaxed));
+            if let Some(lane) = selected {
+                // Blocking a lane and assigning work both take this mutex, so
+                // a route cannot observe an empty lane between selection and
+                // accounting for this submission.
+                lane_work[lane].fetch_add(cost, Ordering::Relaxed);
+            }
+            selected
+        };
+        let Some(lane) = lane else {
+            i += 1;
+            continue;
+        };
+        let cmd = deferred.remove(i).expect("deferred submission index");
+        if let Err(e) = senders[lane].send(cmd) {
+            lane_work[lane].fetch_sub(cost, Ordering::Relaxed);
+            queued_work.fetch_sub(cost, Ordering::Relaxed);
+            if let Cmd::Submit { tag, reply, .. } = e.0 {
+                let _ = reply.send((tag, Err(format!("GPU lane {lane} is gone"))));
+            }
+        }
+    }
+}
+
+fn claim_route_target(
+    lane_work: &[Arc<AtomicU64>],
+    lane_state: &Arc<Mutex<LaneState>>,
+    whale_lanes: usize,
+) -> usize {
+    let mut state = lane_state.lock().unwrap_or_else(|e| e.into_inner());
+    let end = whale_lanes.min(lane_work.len()).max(1);
+    let target = (0..end)
+        .min_by_key(|&lane| {
+            (
+                state.route_refs[lane],
+                lane_work[lane].load(Ordering::Relaxed),
+            )
+        })
+        .unwrap_or(0);
+    state.route_refs[target] += 1;
+    state.blocked[target] = true;
+    target
+}
+
+fn release_route_target(lane_state: &Arc<Mutex<LaneState>>, target: usize) {
+    let mut state = lane_state.lock().unwrap_or_else(|e| e.into_inner());
+    state.route_refs[target] = state.route_refs[target].saturating_sub(1);
+    state.blocked[target] = state.route_refs[target] != 0 || state.guard_refs[target] != 0;
+}
+
+fn claim_guard_lanes(
+    lane_work: &[Arc<AtomicU64>],
+    lane_state: &Arc<Mutex<LaneState>>,
+    target: usize,
+    card: bool,
+) -> Vec<usize> {
+    let mut state = lane_state.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guarded = if card {
+        (0..lane_work.len()).collect::<Vec<_>>()
+    } else {
+        let helper = (0..lane_work.len())
+            .filter(|&lane| lane != target && !state.blocked[lane])
+            .min_by_key(|&lane| lane_work[lane].load(Ordering::Relaxed))
+            .or_else(|| {
+                (0..lane_work.len())
+                    .filter(|&lane| lane != target)
+                    .min_by_key(|&lane| lane_work[lane].load(Ordering::Relaxed))
+            });
+        let mut lanes = vec![target];
+        if let Some(helper) = helper {
+            lanes.push(helper);
+        }
+        lanes
+    };
+    guarded.sort_unstable();
+    for &lane in &guarded {
+        state.guard_refs[lane] += 1;
+        state.blocked[lane] = true;
+    }
+    guarded
+}
+
+fn release_guard_lanes(lane_state: &Arc<Mutex<LaneState>>, guarded: &[usize]) {
+    let mut state = lane_state.lock().unwrap_or_else(|e| e.into_inner());
+    for &lane in guarded {
+        state.guard_refs[lane] = state.guard_refs[lane].saturating_sub(1);
+        state.blocked[lane] = state.route_refs[lane] != 0 || state.guard_refs[lane] != 0;
+    }
+}
+
+fn cancel_held(
+    sender: &mpsc::Sender<Cmd>,
+    route_id: u64,
+    error: String,
+    cost: u64,
+    queued_work: &Arc<AtomicU64>,
+) {
+    if sender.send(Cmd::CancelHeld { route_id, error }).is_err() {
+        queued_work.fetch_sub(cost, Ordering::Relaxed);
+    }
+}
+
+fn run_routes(
+    device: usize,
+    rx: mpsc::Receiver<RouteCmd>,
+    senders: Vec<mpsc::Sender<Cmd>>,
+    lane_work: Vec<Arc<AtomicU64>>,
+    lane_state: Arc<Mutex<LaneState>>,
+    queued_work: Arc<AtomicU64>,
+    route_profile: bool,
+) {
+    while let Ok(RouteCmd::Run(ticket)) = rx.recv() {
+        let RouteTicket {
+            route_id,
+            target,
+            work,
+            cost,
+            held_ready,
+        } = ticket;
+        let card = work.requires_card_exclusive_route();
+        let route_started = Instant::now();
+        // The target has been blocked since submission. Claim the remaining
+        // memory guard now, then keep dispatching on every unguarded lane while
+        // these lanes finish their already-accounted work.
+        let guarded = claim_guard_lanes(&lane_work, &lane_state, target, card);
+        if held_ready.recv().is_err() {
+            release_guard_lanes(&lane_state, &guarded);
+            release_route_target(&lane_state, target);
+            continue;
+        }
+        while guarded
+            .iter()
+            .any(|&lane| lane_work[lane].load(Ordering::Acquire) != 0)
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let drained_at = Instant::now();
+        if let Err(e) = trim_lanes(guarded.iter().map(|&lane| &senders[lane])) {
+            cancel_held(&senders[target], route_id, e, cost, &queued_work);
+            release_guard_lanes(&lane_state, &guarded);
+            release_route_target(&lane_state, target);
+            continue;
+        }
+        let trimmed_at = Instant::now();
+        lane_work[target].fetch_add(cost, Ordering::Release);
+        if senders[target].send(Cmd::ReleaseHeld { route_id }).is_err() {
+            lane_work[target].fetch_sub(cost, Ordering::Release);
+            queued_work.fetch_sub(cost, Ordering::Relaxed);
+            release_guard_lanes(&lane_state, &guarded);
+            release_route_target(&lane_state, target);
+            continue;
+        }
+        while lane_work[target].load(Ordering::Acquire) != 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if route_profile {
+            let table_reserved = work
+                .table_bytes
+                .checked_next_power_of_two()
+                .unwrap_or(work.table_bytes);
+            let name = if card {
+                "v5_card_route"
+            } else {
+                "v5_arena_guard"
+            };
+            let helper = guarded
+                .iter()
+                .copied()
+                .find(|&lane| lane != target)
+                .unwrap_or(target);
+            eprintln!(
+                "{name} device={device} lane={target} helper={helper} mutable_mib={:.1} table_mib={:.1} reserved_mib={:.1} drain_ms={:.1} trim_ms={:.1} solve_ms={:.1}",
+                work.mutable_bytes as f64 / 1048576.0,
+                table_reserved as f64 / 1048576.0,
+                work.mutable_bytes.saturating_add(table_reserved) as f64 / 1048576.0,
+                1e3 * (drained_at - route_started).as_secs_f64(),
+                1e3 * (trimmed_at - drained_at).as_secs_f64(),
+                1e3 * trimmed_at.elapsed().as_secs_f64(),
+            );
+        }
+        release_guard_lanes(&lane_state, &guarded);
+        release_route_target(&lane_state, target);
     }
 }
 
@@ -323,6 +562,7 @@ fn run(
     let profile = std::env::var_os("WARCHEST_GPU_PROFILE").is_some();
     let mut current_version = 0u64;
     let mut pending = VecDeque::new();
+    let mut held = VecDeque::new();
     let mut shutdown = false;
 
     while !shutdown || !pending.is_empty() {
@@ -333,7 +573,9 @@ fn run(
                     &mut exec,
                     &mut current_version,
                     &mut pending,
+                    &mut held,
                     &mut shutdown,
+                    &queued_work,
                 ),
                 Err(_) => shutdown = true,
             }
@@ -355,7 +597,9 @@ fn run(
                     &mut exec,
                     &mut current_version,
                     &mut pending,
+                    &mut held,
                     &mut shutdown,
+                    &queued_work,
                 ),
                 Err(mpsc::RecvTimeoutError::Timeout) => break,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -488,7 +732,14 @@ fn run(
                 }
             }
         }
-        retain_needed_banks(&mut exec, current_version, &pending);
+        retain_needed_banks(&mut exec, current_version, &pending, &held);
+    }
+    for held in held {
+        let _ = held.pending.reply.send((
+            held.pending.tag,
+            Err("GPU lane shut down with a held route".into()),
+        ));
+        queued_work.fetch_sub(held.pending.cost, Ordering::Relaxed);
     }
 }
 
@@ -497,7 +748,9 @@ fn handle(
     exec: &mut Executor,
     current_version: &mut u64,
     pending: &mut VecDeque<Pending>,
+    held: &mut VecDeque<HeldPending>,
     shutdown: &mut bool,
+    queued_work: &Arc<AtomicU64>,
 ) {
     match cmd {
         Cmd::Submit {
@@ -515,6 +768,42 @@ fn handle(
             queued: Instant::now(),
             cost,
         }),
+        Cmd::Hold {
+            route_id,
+            job,
+            work,
+            tag,
+            cost,
+            reply,
+            ready,
+        } => {
+            held.push_back(HeldPending {
+                route_id,
+                pending: Pending {
+                    job,
+                    work,
+                    tag,
+                    reply,
+                    version: *current_version,
+                    queued: Instant::now(),
+                    cost,
+                },
+            });
+            let _ = ready.send(());
+        }
+        Cmd::ReleaseHeld { route_id } => {
+            if let Some(i) = held.iter().position(|x| x.route_id == route_id) {
+                let held = held.remove(i).expect("held route index");
+                pending.push_back(held.pending);
+            }
+        }
+        Cmd::CancelHeld { route_id, error } => {
+            if let Some(i) = held.iter().position(|x| x.route_id == route_id) {
+                let held = held.remove(i).expect("held route index");
+                let _ = held.pending.reply.send((held.pending.tag, Err(error)));
+                queued_work.fetch_sub(held.pending.cost, Ordering::Relaxed);
+            }
+        }
         Cmd::Publish {
             version,
             dims,
@@ -530,13 +819,19 @@ fn handle(
         }
         Cmd::Shutdown => *shutdown = true,
     }
-    retain_needed_banks(exec, *current_version, pending);
+    retain_needed_banks(exec, *current_version, pending, held);
 }
 
-fn retain_needed_banks(exec: &mut Executor, current: u64, pending: &VecDeque<Pending>) {
-    let mut keep = Vec::with_capacity(pending.len() + 1);
+fn retain_needed_banks(
+    exec: &mut Executor,
+    current: u64,
+    pending: &VecDeque<Pending>,
+    held: &VecDeque<HeldPending>,
+) {
+    let mut keep = Vec::with_capacity(pending.len() + held.len() + 1);
     keep.push(current);
     keep.extend(pending.iter().map(|p| p.version));
+    keep.extend(held.iter().map(|p| p.pending.version));
     keep.sort_unstable();
     keep.dedup();
     exec.retain_weight_versions(&keep);
@@ -586,57 +881,33 @@ fn cost_class(w: WorkVector) -> u8 {
     }
 }
 
-fn least_work_lane(lane_work: &[Arc<AtomicU64>], start: usize, end: usize) -> usize {
-    let end = end.min(lane_work.len());
-    let start = start.min(end);
-    let eligible = &lane_work[start..end];
-    eligible
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, x)| x.load(Ordering::Relaxed))
-        .map(|(i, _)| start + i)
-        .unwrap_or(0)
-}
-
-fn dispatch_whale_lane(lane_work: &[Arc<AtomicU64>], whale_lanes: usize) -> usize {
-    least_work_lane(lane_work, 0, whale_lanes)
-}
-
-fn dispatch_general_lane(lane_work: &[Arc<AtomicU64>], whale_lanes: usize) -> usize {
-    if whale_lanes < lane_work.len() {
-        least_work_lane(lane_work, whale_lanes, lane_work.len())
-    } else {
-        least_work_lane(lane_work, 0, lane_work.len())
-    }
-}
-
-fn arena_guard_lanes(lane_work: &[Arc<AtomicU64>], whale_lanes: usize) -> Vec<usize> {
-    let target = dispatch_whale_lane(lane_work, whale_lanes);
-    let mut out = vec![target];
-    if let Some(helper) = (0..lane_work.len())
-        .filter(|&i| i != target)
-        .min_by_key(|&i| lane_work[i].load(Ordering::Relaxed))
-    {
-        out.push(helper);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn whales_stay_on_their_bounded_lane_set() {
+    fn route_claims_keep_targets_blocked_until_the_queue_drains() {
         let lanes = [9, 2, 5]
             .into_iter()
             .map(|x| Arc::new(AtomicU64::new(x)))
             .collect::<Vec<_>>();
-        assert_eq!(dispatch_whale_lane(&lanes, 1), 0);
-        assert_eq!(dispatch_whale_lane(&lanes, 2), 1);
-        assert_eq!(dispatch_general_lane(&lanes, 1), 1);
-        assert_eq!(arena_guard_lanes(&lanes, 1), vec![0, 1]);
-        assert_eq!(arena_guard_lanes(&lanes, 2), vec![1, 2]);
+        let state = Arc::new(Mutex::new(LaneState {
+            blocked: vec![false; 3],
+            route_refs: vec![0; 3],
+            guard_refs: vec![0; 3],
+        }));
+        let first = claim_route_target(&lanes, &state, 1);
+        let second = claim_route_target(&lanes, &state, 1);
+        assert_eq!((first, second), (0, 0));
+        let guarded = claim_guard_lanes(&lanes, &state, first, false);
+        assert_eq!(guarded, vec![0, 1]);
+        assert_eq!(state.lock().unwrap().blocked, vec![true, true, false]);
+
+        release_guard_lanes(&state, &guarded);
+        release_route_target(&state, first);
+        assert_eq!(state.lock().unwrap().blocked, vec![true, false, false]);
+        release_route_target(&state, second);
+        assert_eq!(state.lock().unwrap().blocked, vec![false, false, false]);
     }
 }
 
