@@ -442,7 +442,9 @@ impl Executor {
     }
 
     pub fn solve(&mut self, wave: Wave, version: u64) -> Result<Vec<SolveResult>, String> {
-        let profile = std::env::var_os("WARCHEST_GPU_PROFILE").is_some();
+        let profile = std::env::var_os("WARCHEST_GPU_PROFILE").is_some()
+            || (std::env::var_os("WARCHEST_ROUTE_PROFILE").is_some()
+                && wave.work.requires_arena_guard_route());
         let started = Instant::now();
         let profile_jobs = wave.jobs.len();
         let profile_rows = wave.row_node.len();
