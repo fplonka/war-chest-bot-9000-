@@ -53,8 +53,10 @@ pull)
     ;;
 build)
     # Without `gpu` the extension has no gpu_start and every run on this box
-    # dies at startup.
-    run_remote "cd engine && maturin develop --release --features gpu 2>&1 | tail -2"
+    # dies at startup. `python` must be repeated: --features replaces the
+    # pyproject list rather than adding to it, and without pyo3 maturin builds
+    # a cffi module instead.
+    run_remote "cd engine && maturin develop --release --features python,gpu 2>&1 | tail -2"
     ;;
 tail)
     run_remote "tail -f /workspace/logs/${2:?usage: tail <tag>}.log"
