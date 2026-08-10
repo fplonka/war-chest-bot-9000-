@@ -6,9 +6,23 @@
       60-minute one does? If it does, every experiment below costs a quarter of
       what it costs now. Nobody runs this because it does not feel like
       progress; it sets the cadence for everything after it.
-- [ ] Build the first ground-truth set off the strongest checkpoint we have
-      (`train/truth.py build`), record its provenance, and never rebuild it
-      mid-experiment. It is the ruler.
+- [x] ~~Build the first ground-truth set off the strongest checkpoint we have.~~
+      Done and the answer was negative: a set built that way ranks its own
+      builder's neighbourhood above stronger networks (numbers in
+      `train/truth.py`). It is not the ruler.
+- [ ] **Build a terminal-anchored ground-truth set instead.** Late-game
+      positions solved deep enough that every leaf of the subgame is terminal
+      have exact game values with no evaluator in them, so the ruler stays true
+      no matter how strong the networks get. `Conv::zero_sum` reaching zero is
+      the check that a solve got there.
+- [ ] **Recover the ~20% throughput lost since `gpu_golden8`.** 1,066 solves/s
+      against 1,315 on the same hardware, measured with nothing else running.
+      `tgt_std` tracks solves rather than wall clock, so this is 20% of the
+      progress of every run. Bisect 22f63f6 and 0192e4a.
+- [ ] **Make the value network antisymmetric.** `v_0 + v_1` is +0.050 mean,
+      0.045 std, against a 0.354 value spread — 180x the target bias from
+      stopping CFR at T=64, and it is the network rather than the solve. See
+      `runs/solvererr_g8/NOTES.md`.
 - [ ] Re-run the `dcfr` / `aux` / `policy` experiments through `exp.py`. The
       2026-08-06 `arch_*` results are **not** evidence: three arms inside
       ±20 Elo at 100 games per pairing, which resolves nothing finer than ~70.

@@ -53,12 +53,17 @@ every resulting checkpoint in one ladder, and writes a self-contained HTML page
 — no manual step anywhere in that chain. One arm at a time is
 `train/train.py --config <json>` or `--set knob=value`.
 
-Not everything needs a training run. `train/truth.py` scores a checkpoint's
-value head against a frozen set of positions solved to convergence: one number,
-seconds, no games and no variance. `train/offline.py` compares architectures on
-a frozen replay dump. `engine/examples/solvererr.rs` answers the regret-rule and
-iteration-count questions without training anything at all. Use those first; a
-ladder is the confirmation, not the search.
+Not everything needs a training run. `train/offline.py` compares architectures
+on a frozen replay dump, and `engine/examples/solvererr.rs` answers the
+regret-rule and iteration-count questions without training anything at all. Use
+those first; a ladder is the confirmation, not the search.
+
+`train/truth.py` scores a checkpoint against a frozen set of positions solved to
+convergence — one number, seconds, no variance — but read its module docstring
+before believing it. The targets are the fixed point of the *network that built
+the set*, and measurement shows the set ranks that network's neighbourhood above
+genuinely stronger ones. It tracks one run's progress; it does not compare arms.
+Only the ladder does that.
 
 ## Playing against a trained agent
 
