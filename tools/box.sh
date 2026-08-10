@@ -39,6 +39,10 @@ sync)
         --exclude runs --exclude target --exclude .venv --exclude papers \
         --exclude __pycache__ --exclude .git --exclude data \
         "$here/" "root@$host:$remote/"
+    # .git is not sent, so leave the sha behind: a run there still records the
+    # commit it came from.
+    git -C "$here" describe --always --dirty --abbrev=7 \
+        | ssh "${ssh_opts[@]}" "root@$host" "cat > $remote/.gitsha"
     echo "synced -> $host:$remote"
     ;;
 pull)

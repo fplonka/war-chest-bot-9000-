@@ -19,6 +19,7 @@ configuration: a bare `BASELINE` is the run every arm is measured against.
 
 import dataclasses
 import json
+import os
 import subprocess
 from dataclasses import dataclass, replace
 
@@ -125,7 +126,8 @@ EXPERIMENTS = {
     # Solve quality per unit time, not per solve. `runs/solvererr_g8` puts dcfr
     # at T=32 slightly ahead of linear at T=64, and dcfr at T=16 still 50x
     # inside the network's own error -- for 2-3x the solves per second.
-    "iters":    [{}, {"cfr": "dcfr", "iters": 32}, {"cfr": "dcfr", "iters": 16}],
+    "iters":    [{"minutes": 30}, {"minutes": 30, "cfr": "dcfr", "iters": 32},
+                 {"minutes": 30, "cfr": "dcfr", "iters": 16}],
     # Does a short run rank changes the way a long one does? If it does, every
     # experiment above costs a quarter of what it costs today. Run this first.
     "cadence":  [{"minutes": 15}, {"minutes": 15, "cfr": "dcfr"},
@@ -186,7 +188,14 @@ def git_sha():
                                capture_output=True, text=True, check=True).stdout.strip()
         return sha + ("+dirty" if dirty else "")
     except Exception:
-        return "unknown"
+        # The box gets an rsync of the tree without .git; `box.sh sync` leaves
+        # the sha it sent behind so a run there is still traceable to a commit.
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "..", ".gitsha")) as f:
+                return f.read().strip() or "unknown"
+        except OSError:
+            return "unknown"
 
 
 def load(path):
