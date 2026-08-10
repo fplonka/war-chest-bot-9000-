@@ -1068,9 +1068,11 @@ impl<'a> Solver<'a> {
             let wp = matches!(s.pending(), Cont::WarriorPriestDraw { .. });
             let mut steps = 0u8;
             loop {
-                let acts = cs.legal_actions();
-                debug_assert!(matches!(acts.first(), Some(Action::DrawCoin { .. })));
-                cs.apply_inplace(acts[0]);
+                // `drawable` is order-preserving and this is its first entry;
+                // `None` is the Warrior Priest fizzle, which `legal_actions`
+                // represents the same way.
+                let unit = cs.first_drawable(player).unwrap_or(crate::board::NONE);
+                cs.apply_inplace(Action::DrawCoin { unit });
                 steps += 1;
                 if !(matches!(cs.pending(), Cont::Draw { .. }) && cs.to_act() == player) {
                     break;

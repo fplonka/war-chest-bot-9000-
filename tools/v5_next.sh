@@ -6,6 +6,11 @@ set -uo pipefail
 
 cd /workspace/warchest-v5
 
+# The ladder runs first, on the build that produced the run.
+echo "=== ladder over the golden run's snapshots ==="
+python -u train/ladder.py /workspace/warchest-engine/runs/gpu_golden8 \
+    --games 30 --random-draft --gpu --refs greedy,random 2>&1 | tail -40
+
 echo "=== build and correctness gate ==="
 (cd engine && cargo test --release --features gpu --lib -- --test-threads=1 2>&1 | tail -4)
 (cd engine && maturin develop --release --features python,gpu 2>&1 | tail -1)
@@ -21,8 +26,4 @@ for rep in 1 2; do
     grep prestop "/workspace/warchest-engine/runs/v5_ro_warp_$rep/stream.log"
 done
 
-echo "=== ladder over the golden run's snapshots ==="
-python -u train/ladder.py /workspace/warchest-engine/runs/gpu_golden8 \
-    --games 30 --random-draft --gpu --refs greedy,random \
-    2>&1 | tail -40
 echo NEXT_DONE

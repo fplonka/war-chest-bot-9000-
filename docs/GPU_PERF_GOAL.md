@@ -161,12 +161,18 @@ rows of debt, and no overrun.
 
 ## Where it stands now
 
-The first complete thirty-minute run is `runs/gpu_golden`: **1,023.5 balanced
-solves/s** over the twenty-five-minute ReBeL interval, 1,533,928 solves, 928
-rows of debt, no overrun, and zero drops, exact fallbacks and oversized routes.
-Peak card memory was 13.0 GiB of 24, against the 23.5 GiB at which the previous
-long run died. `runs/v5_c_gate_l8` is the matching five-minute gate at
-**1,404.9 balanced solves/s**, up from 1,211.1.
+**The goal is met.** `runs/gpu_golden8` is the exact thirty-minute command at
+**1,315.4 balanced solves/s** over the twenty-five-minute ReBeL interval:
+1,972,259 solves, 7,888,896 optimizer rows, 140 rows of debt against the 1,024
+allowed, no overrun, zero dropped solves, zero exact CPU fallbacks, one oversized
+route and no card-exclusive routes. The first complete run of this lineage,
+`runs/gpu_golden`, was 1,023.5.
+
+Nothing about the workload moved: random drafts, depth 2, 64 linear-CFR
+iterations, batch 1,024 at a four-to-one ratio, the same replay rows, targets,
+mirror augmentation, snapshot schedule and horizon-payoff schedule. What changed
+is where the work runs and what it costs; `runs/gpu_golden8/NOTES.md` has the
+order it was found in, which matters more than the sizes.
 
 The standing development measurement is a 180-second aged generation stream
 from a late checkpoint with the horizon payoff at zero -- 4,608 live games all
@@ -182,7 +188,8 @@ in the midgame at once, which is the heaviest workload the goal has to sustain
 | ten lanes | 983.5 |
 | jemalloc, 42 builders | 1,023.8 |
 | pipelined lane | 1,041.0 |
-| twelve lanes, 80 solves in flight | 1,136.8 |
+| pooled node array, `State` out of `TNode` | 1,159.4 |
+| validation and clones off the hot paths | 1,167.9 |
 
 The last row is the point of the whole exercise: a deeper in-flight window had
 measured nothing at every earlier build, because the memory it needed did not

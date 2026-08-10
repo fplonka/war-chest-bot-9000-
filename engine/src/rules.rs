@@ -475,6 +475,29 @@ impl State {
         out
     }
 
+    /// The first coin `drawable` would list, without building the list.
+    ///
+    /// A subgame's draw run applies one coin per step and only ever reads the
+    /// first: which coin is drawn changes nothing public, so any legal
+    /// `DrawCoin` produces the same child. Asking through `legal_actions` cost
+    /// two heap allocations and two passes over the unit table per step, about
+    /// a thousand times per solve.
+    pub(crate) fn first_drawable(&self, p: u8) -> Option<u8> {
+        let z = &self.zones[p as usize];
+        for u in 0..N_UNITS {
+            if z[Z_BAG][u] > 0 {
+                return Some(u as u8);
+            }
+        }
+        // Effective bag after the refill, exactly as `drawable` computes it.
+        for u in 0..N_UNITS {
+            if z[Z_BAG][u] + z[Z_FACEUP][u] + z[Z_FACEDOWN][u] > 0 {
+                return Some(u as u8);
+            }
+        }
+        None
+    }
+
     /// Perform a draw of `unit` for player `p`: refill first if the bag is empty,
     /// then move one `unit` coin from bag to hand.
     fn do_draw(&mut self, p: u8, unit: u8) {
