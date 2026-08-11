@@ -15,6 +15,20 @@
       have exact game values with no evaluator in them, so the ruler stays true
       no matter how strong the networks get. `Conv::zero_sum` reaching zero is
       the check that a solve got there.
+- [ ] **Make ladders cheap.** Three things found while running one, in
+      decreasing certainty:
+      *SPRT ran on one pairing only* — every other pairing played its full fixed
+      count, so `greedy` vs a trained net spent 600 games proving a 0-91 result.
+      Now applies everywhere (`ae5e4c1`), and those pairings stop at 100.
+      *The tuned wave settings were not defaults* — only `train.py` set them, so
+      a ladder ran 48k-row waves on an 800us timer and left both cards near half
+      idle at 50-60% (`80009d9`). Hypothesis, not yet measured: rerun the same
+      ladder on the new build and compare wall clock. 75ms waves could equally
+      hurt a workload with less in flight than training has.
+      *Evaluation could use fewer CFR iterations* — `--eval-search dcfr:16`
+      ranks every checkpoint under one cheap search. Whether the ranking
+      survives is being measured; whether it is faster depends on the same
+      question as below, since a solve may not be iteration-bound at all.
 - [ ] **Recover the ~20% throughput lost since `gpu_golden8`.** 1,066 solves/s
       against 1,315 on the same hardware, measured with nothing else running.
       `tgt_std` tracks solves rather than wall clock, so this is 20% of the
