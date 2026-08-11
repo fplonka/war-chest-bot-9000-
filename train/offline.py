@@ -30,6 +30,7 @@ MLP at 65% of the cost*. `docs/REBEL.md` records that; the code is gone.
 """
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -127,6 +128,7 @@ def run_one(name, tr, va, te, args, dev, seed):
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.steps)
         rng = np.random.default_rng(seed)
         best_val, best_step, curve = float("inf"), 0, []
+        best_state = None
         for step in range(1, args.steps + 1):
             ids = np.sort(rng.integers(0, ntr, size=args.batch))
             # Duplicate row ids would make `subset` ambiguous; sampling without
@@ -146,11 +148,15 @@ def run_one(name, tr, va, te, args, dev, seed):
                 curve.append({"step": step, "val_huber": round(vl, 6)})
                 if vl < best_val:
                     best_val, best_step = vl, step
+                    best_state = copy.deepcopy(net.state_dict())
                 print(f"    {name:14s} lr={lr:.0e} step {step:6d}  "
                       f"val {vl:.6f}/{vrms:.5f}  ({time.time() - t0:.0f}s)", flush=True)
         # The test set is evaluated exactly once, at the best-validation
-        # checkpoint. (The net keeps running; the comparison is between
-        # checkpoints chosen the same way, which is what the plan requires.)
+        # checkpoint -- which means restoring it first. Without this the number
+        # reported is the *last* step's, and a run that overfits after its best
+        # step is scored at its worst.
+        if best_state is not None:
+            net.load_state_dict(best_state)
         hl, rms = evaluate(net, te, rng, dev)
         row = {"lr": lr, "val_huber": round(best_val, 6), "best_step": best_step,
                "test_huber": round(hl, 6), "test_rms": round(rms, 5), "curve": curve}
