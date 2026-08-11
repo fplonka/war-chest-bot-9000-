@@ -575,7 +575,7 @@ impl Drop for GpuGenerator {
 
 #[cfg(feature = "gpu")]
 #[pyfunction]
-#[pyo3(signature = (seed, depth=2, iters=64, explore=0.25, random_draft=true, cfr="linear", warm=0.0, eval_mix=0.5, workers=36, actors_per_worker=128, inflight_per_worker=32, chunk_solves=1024))]
+#[pyo3(signature = (seed, depth=2, iters=64, explore=0.25, random_draft=true, cfr="linear", warm=0.0, zero_sum=true, eval_mix=0.5, workers=36, actors_per_worker=128, inflight_per_worker=32, chunk_solves=1024))]
 #[allow(clippy::too_many_arguments)]
 fn gpu_stream_start(
     seed: u64,
@@ -585,6 +585,7 @@ fn gpu_stream_start(
     random_draft: bool,
     cfr: &str,
     warm: f32,
+    zero_sum: bool,
     eval_mix: f32,
     workers: usize,
     actors_per_worker: usize,
@@ -597,6 +598,7 @@ fn gpu_stream_start(
         snapshots: true,
         cfr: cfr_of(cfr)?,
         warm,
+        zero_sum,
         node_cap: 200_000,
         ..Default::default()
     };
@@ -716,7 +718,7 @@ fn gpu_stop(_py: Python<'_>) -> PyResult<()> {
 /// missing, so a misconfigured box fails loudly instead of running slow.
 #[cfg(feature = "gpu")]
 #[pyfunction]
-#[pyo3(signature = (games, seed, mode, depth, iters, explore, temp, random_draft, eval_mix, cfr, warm, max_seconds=0.0))]
+#[pyo3(signature = (games, seed, mode, depth, iters, explore, temp, random_draft, eval_mix, cfr, warm, zero_sum=true, max_seconds=0.0))]
 fn gpu_gen_data(
     py: Python<'_>,
     games: usize,
@@ -730,6 +732,7 @@ fn gpu_gen_data(
     eval_mix: f32,
     cfr: &str,
     warm: f32,
+    zero_sum: bool,
     max_seconds: f64,
 ) -> PyResult<PyObject> {
     let cfg = Cfg {
@@ -738,6 +741,7 @@ fn gpu_gen_data(
         snapshots: true,
         cfr: cfr_of(cfr)?,
         warm,
+        zero_sum,
         node_cap: 200_000,
         ..Default::default()
     };
@@ -909,7 +913,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
 /// Run `games` self-play games across all cores and return the training data.
 /// `mode` is "greedy" (Monte-Carlo warm start) or "rebel".
 #[pyfunction]
-#[pyo3(signature = (games, seed, mode, depth=1, iters=16, explore=0.25, temp=2.0, random_draft=false, eval_mix=0.5, cfr="linear", warm=0.0))]
+#[pyo3(signature = (games, seed, mode, depth=1, iters=16, explore=0.25, temp=2.0, random_draft=false, eval_mix=0.5, cfr="linear", warm=0.0, zero_sum=true))]
 #[allow(clippy::too_many_arguments)]
 fn gen_data(
     py: Python<'_>,
@@ -924,6 +928,7 @@ fn gen_data(
     eval_mix: f32,
     cfr: &str,
     warm: f32,
+    zero_sum: bool,
 ) -> PyResult<PyObject> {
     let cfg = Cfg {
         depth,
@@ -931,6 +936,7 @@ fn gen_data(
         snapshots: true,
         cfr: cfr_of(cfr)?,
         warm,
+        zero_sum,
         // The tree-size tail is fat (broad random-draft beliefs at round
         // boundaries); an unbounded build hangs a worker for minutes on one
         // decision. Capped solves fall back to a uniform policy instead.
@@ -967,7 +973,7 @@ fn gen_data(
 /// so one net can be pitted against itself at different depths, iteration
 /// counts or regret rules. They default to side A's.
 #[pyfunction]
-#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=false, depth_b=None, iters_b=None, cfr="linear", warm=0.0, cfr_b=None, warm_b=None, gpu=false))]
+#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=false, depth_b=None, iters_b=None, cfr="linear", warm=0.0, cfr_b=None, warm_b=None, zero_sum=true, zero_sum_b=None, gpu=false))]
 #[allow(clippy::too_many_arguments)]
 fn eval_match(
     py: Python<'_>,
@@ -987,6 +993,8 @@ fn eval_match(
     warm: f32,
     cfr_b: Option<&str>,
     warm_b: Option<f32>,
+    zero_sum: bool,
+    zero_sum_b: Option<bool>,
     gpu: bool,
 ) -> PyResult<(usize, usize, usize)> {
     let cfg = Cfg {
@@ -995,6 +1003,7 @@ fn eval_match(
         snapshots: false,
         cfr: cfr_of(cfr)?,
         warm,
+        zero_sum,
         node_cap: 200_000,
         ..Default::default()
     };
@@ -1006,6 +1015,7 @@ fn eval_match(
             None => cfg.cfr,
         },
         warm: warm_b.unwrap_or(warm),
+        zero_sum: zero_sum_b.unwrap_or(zero_sum),
         ..cfg
     };
     let (aa, bb) = (

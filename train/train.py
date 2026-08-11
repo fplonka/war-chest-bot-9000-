@@ -280,11 +280,11 @@ def make_batch(parts, rng, device, augment):
             t(seg, torch.long), t(cy), 2 * len(rows), t(ay))
 
 
-def value_loss(net, xpub, unit_ids, phi, inv, w, seg, y, nseg):
+def value_loss(net, xpub, unit_ids, phi, inv, w, seg, y, nseg, project=True):
     # Belief-weighted Huber over every config in the support. Weighting by the
     # belief is what makes the loss match the distribution CFR queries: a config
     # the belief gives 1% to is worth 1% of the gradient.
-    v = net(xpub, unit_ids, phi, inv, w, seg, nseg)
+    v = net(xpub, unit_ids, phi, inv, w, seg, nseg, project=project)
     per = F.smooth_l1_loss(v, y, reduction="none", beta=0.5)
     return (per * w).sum() / w.sum().clamp(min=1e-6)
 
@@ -360,7 +360,8 @@ def policy_loss(net, d, ids, device):
 
 def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
                 recent_mix=0.0, recent_frac=0.2, aux_weight=0.0, policy_weight=0.0,
-                d=None, policy_batch=64, profile_cuda=False, batch_fn=make_batch):
+                d=None, policy_batch=64, profile_cuda=False, batch_fn=make_batch,
+                project=True):
     """Returns the mean value loss and the mean policy loss.
 
     The side tasks are summed into the same backward as the value loss, not
@@ -396,7 +397,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
             b1 = torch.cuda.Event(enable_timing=True)
             f0.record(stream)
         ts = time.perf_counter()
-        loss = value_loss(net, *parts[:-1])
+        loss = value_loss(net, *parts[:-1], project=project)
         ay = parts[-1]
         # What is reported is the value loss alone, so the column means the same
         # thing whether or not the side tasks are on.
@@ -611,7 +612,8 @@ def main():
                     # rule and evaluated under another is not the player the
                     # run produced, and nothing downstream could tell.
                     "search": {"depth": args.depth, "iters": args.iters,
-                               "cfr": args.cfr, "warm": args.warm}}, path)
+                               "cfr": args.cfr, "warm": args.warm,
+                               "zero_sum": args.zero_sum}}, path)
         snaps.append({"label": label, "t": round(el, 1),
                       "file": os.path.basename(path)})
         print(f"[t={el:6.1f}s] --- snapshot {snaps[-1]['file']} ({label}) ---", flush=True)
@@ -634,6 +636,7 @@ def main():
             args.seed * 1_000_003 + epoch,
             depth=args.depth, iters=args.iters, explore=args.explore,
             random_draft=args.random_draft, cfr=args.cfr, warm=args.warm,
+            zero_sum=args.zero_sum,
             eval_mix=args.eval_mix, workers=args.gpu_workers,
             actors_per_worker=args.gpu_actors,
             inflight_per_worker=args.gpu_inflight, chunk_solves=args.gpu_chunk)
@@ -676,11 +679,11 @@ def main():
                 if len(buf) >= args.batch:
                     old_parts = batcher(
                         buf.sample_old(args.batch, rng, args.recent_frac), rng, dev, False)
-                    loss_old = float(value_loss(value, *old_parts[:-1]))
+                    loss_old = float(value_loss(value, *old_parts[:-1], project=args.zero_sum))
                     new_parts = batcher(
                         buf.sample(args.batch, rng, recent_mix=1.0,
                                    recent_frac=args.recent_frac), rng, dev, False)
-                    loss_new = float(value_loss(value, *new_parts[:-1]))
+                    loss_new = float(value_loss(value, *new_parts[:-1], project=args.zero_sum))
                 else:
                     loss_old = loss_new = float("nan")
             tn = max(window["target_n"], 1)
@@ -816,7 +819,7 @@ def main():
                         augment=not args.no_augment,
                         recent_mix=args.recent_mix, recent_frac=args.recent_frac,
                         profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1",
-                        batch_fn=batcher)
+                        batch_fn=batcher, project=args.zero_sum)
                     window["train_s"] += time.time() - tt
                     window["loss_sum"] += lv * nsteps
                     window["train_steps"] += nsteps
@@ -935,7 +938,7 @@ def main():
                 break
 
         tg = time.time()
-        kw = dict(random_draft=args.random_draft)
+        kw = dict(random_draft=args.random_draft, zero_sum=args.zero_sum)
 
         def start_gen(gen_seed):
             # One background thread; gpu_gen_data releases the GIL, so GPU 0
@@ -1028,7 +1031,8 @@ def main():
             value, opt, buf, steps, args.batch, rng, dev, aux_weight=args.aux,
             policy_weight=(args.policy if phase == "rebel" else 0.0), d=d,
             augment=not args.no_augment, recent_mix=args.recent_mix,
-            recent_frac=args.recent_frac, batch_fn=batcher)
+            recent_frac=args.recent_frac, batch_fn=batcher,
+            project=args.zero_sum)
         train_s = time.time() - tt
         value.push(0)
         with torch.no_grad():
@@ -1041,11 +1045,11 @@ def main():
             if len(buf) >= args.batch:
                 old_parts = batcher(
                     buf.sample_old(args.batch, rng, args.recent_frac), rng, dev, False)
-                loss_old = float(value_loss(value, *old_parts[:-1]))
+                loss_old = float(value_loss(value, *old_parts[:-1], project=args.zero_sum))
                 new_parts = batcher(
                     buf.sample(args.batch, rng, recent_mix=1.0,
                                recent_frac=args.recent_frac), rng, dev, False)
-                loss_new = float(value_loss(value, *new_parts[:-1]))
+                loss_new = float(value_loss(value, *new_parts[:-1], project=args.zero_sum))
             else:
                 loss_old = loss_new = float("nan")
 

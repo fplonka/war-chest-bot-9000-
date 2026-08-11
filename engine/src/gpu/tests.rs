@@ -33,6 +33,7 @@ const TEST_CFG: Cfg = Cfg {
     node_cap: 0,
     gpu_build: false,
     keep_states: false,
+    zero_sum: true,
 };
 
 fn gpu_guard() -> MutexGuard<'static, ()> {

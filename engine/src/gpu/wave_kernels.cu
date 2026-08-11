@@ -117,7 +117,7 @@ typedef struct {
     unsigned long long aoff[N_ARENAS];
     int jobs, nodes, rows, nleaf, ncfg, cells, reach_len, vals_len;
     int exits, snapshot_configs, carry_snapshots, nlevels;
-    int decision_n[2], reach_task_n[2], back_task_n[2], readout_n;
+    int decision_n[2], reach_task_n[2], back_task_n[2], readout_n, zero_sum;
 } WaveDev;
 
 typedef struct {
@@ -724,13 +724,14 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
     // both players is copied into both targets and carried by the bootstrap.
     // Must match `search.rs::readout` and `value_net.py::zero_sum` -- this is
     // the third implementation of that arithmetic and the one production solves
-    // with. Terminal leaves returned above and need no shift.
+    // with. Terminal leaves returned above and need no shift. `w->zero_sum` is
+    // the experiment's flag and is on in production.
     // Only the *opponent's* mean needs its own pass over configs. This
     // player's raw values are written to `out` by the readout below, which
     // accumulates its own weighted sum on the way, so the dot products are
     // paid once rather than twice.
     float opp_mean = 0.0f;
-    {
+    if (w->zero_sum) {
         int nq = nc_of(w, q.node, opp);
         const float* rq = AP(w, A_REACH) + reach_at(w, q.node, opp, 0);
         float sq = 0.0f;
@@ -773,8 +774,11 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
         own_a += rp[c] * raw;
     }
     {
-        float ss = warp_sum(own_s);
-        float delta = 0.5f * (opp_mean + (ss > 0.0f ? warp_sum(own_a) / ss : 0.0f));
+        float delta = 0.0f;
+        if (w->zero_sum) {
+            float ss = warp_sum(own_s);
+            delta = 0.5f * (opp_mean + (ss > 0.0f ? warp_sum(own_a) / ss : 0.0f));
+        }
         for (int c = lane; c < n; c += 32) out[c] = (out[c] - delta) * orc;
     }
 #else
@@ -801,8 +805,11 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
         if (lane == c % 32) { own_s += rp[c]; own_a += rp[c] * raw; }
     }
     {
-        float ss = warp_sum(own_s);
-        float delta = 0.5f * (opp_mean + (ss > 0.0f ? warp_sum(own_a) / ss : 0.0f));
+        float delta = 0.0f;
+        if (w->zero_sum) {
+            float ss = warp_sum(own_s);
+            delta = 0.5f * (opp_mean + (ss > 0.0f ? warp_sum(own_a) / ss : 0.0f));
+        }
         for (int c = lane; c < n; c += 32) out[c] = (out[c] - delta) * orc;
     }
 #endif

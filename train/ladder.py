@@ -103,7 +103,7 @@ def elo_stderr(n, elo):
     return out
 
 
-SEARCH = {"depth": 2, "iters": 64, "cfr": "linear", "warm": 0.0}
+SEARCH = {"depth": 2, "iters": 64, "cfr": "linear", "warm": 0.0, "zero_sum": True}
 
 
 def parse_search(spec):
@@ -143,7 +143,10 @@ def players_of(runs, refs=("greedy",), labels=None, search=None):
             if labels is not None and s["label"] not in labels:
                 continue
             ck = torch.load(f"{run}/{s['file']}", map_location="cpu", weights_only=False)
-            own = ck.get("search") or {k: cfg.get(k, v) for k, v in SEARCH.items()}
+            # A checkpoint older than a knob does not carry it, so fall back to
+            # the run's config and then to the default.
+            own = dict(SEARCH, **{k: cfg.get(k, v) for k, v in SEARCH.items()},
+                       **(ck.get("search") or {}))
             ps.append({"name": f"{tag}.{s['label']}", "agent": "rebel",
                        "slot": len(ps), "t": s["t"], "file": s["file"],
                        "run": run, "search": search or own})
@@ -316,10 +319,11 @@ def run(runs, out=None, games=60, temp=2.0, random_draft=False, seed=7,
         play = lambda n, s: warchest.eval_match(
             n, s, a["agent"], b["agent"],
             depth=sa["depth"], iters=sa["iters"], cfr=sa["cfr"], warm=sa["warm"],
+            zero_sum=sa["zero_sum"],
             temp=temp, slot_a=a["slot"], slot_b=b["slot"],
             random_draft=random_draft,
             depth_b=sb["depth"], iters_b=sb["iters"],
-            cfr_b=sb["cfr"], warm_b=sb["warm"], gpu=gpu)
+            cfr_b=sb["cfr"], warm_b=sb["warm"], zero_sum_b=sb["zero_sum"], gpu=gpu)
 
         verdict = None
         if sprt:

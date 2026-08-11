@@ -56,12 +56,11 @@
       the node cap is being hit often enough to distort the search as well as
       slow it.
 
-- [ ] **Make the value network antisymmetric.** `v_0 + v_1` is +0.025 mean and
-      0.032 absolute against a 0.416 value spread — 8% of the signal, a third of
-      the network's own error, and ~130x the target bias from stopping CFR at
-      T=64. It is the network rather than the solve, and a random network is off
-      by the same amount. `train.py::zero_sum` projects it out of the targets;
-      whether that buys strength is untested. See `runs/solvererr_g8/NOTES.md`.
+- [ ] **Does the zero-sum projection buy strength?** `exp.py run projection`,
+      two arms x two seeds, 5 minutes of warm-up and 20 of ReBeL, then a ladder
+      over the finals alone. Correct is not the same as stronger and only the
+      ladder decides. The measurement and the mechanism are the item below;
+      this line is the experiment that is still owed.
 - [ ] **The zero-sum violation survived the seat fix.** Measured on the same
       11,188 positions, final checkpoints of two 30-minute runs:
 
@@ -104,8 +103,20 @@
       measures the same sensitivity and was already failing at 1.54x before any
       of this; it is 1.18x now.
 
-      Keep measuring the violation on the raw network, never on projected
-      targets, or the instrument is gone.
+      **Now behind `Cfg.zero_sum`, and the knob must not survive the answer.**
+      The projection is a runtime flag in all four paths (`config.py`,
+      `value_net.py::forward`, `search.rs::Cfg`, `PackedMeta` -> the CUDA
+      readout) so that one build can run both arms of the `projection`
+      experiment. When the ladder decides, the winner becomes unconditional and
+      every trace of the flag comes out.
+
+      Do **not** read the raw network's `v_0 + v_1` as an error any more. With
+      the projection on, the whole of `wg.bias` has exactly zero gradient
+      (measured: 6e-8 against 2.85 for the same tensor unprojected, while
+      `wg.weight` stays at 1.15), so the common mode is an unidentified gauge
+      direction. It can sit anywhere and mean nothing. If the projection wins,
+      `wg.bias` should go with the flag -- it is 65 parameters that cannot
+      affect the output.
 
 - [ ] **Depth, not iterations, is the search lever.** `solvererr ... 1` solves
       each position one ply deeper and reports how far the answer moves. On
