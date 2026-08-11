@@ -29,10 +29,32 @@
       ranks every checkpoint under one cheap search. Whether the ranking
       survives is being measured; whether it is faster depends on the same
       question as below, since a solve may not be iteration-bound at all.
-- [ ] **Recover the ~20% throughput lost since `gpu_golden8`.** 1,066 solves/s
-      against 1,315 on the same hardware, measured with nothing else running.
-      `tgt_std` tracks solves rather than wall clock, so this is 20% of the
-      progress of every run. Bisect 22f63f6 and 0192e4a.
+- [ ] **Recover the ~25% throughput lost since `gpu_golden8`.** Instantaneous
+      solves/s by minute into the ReBeL phase:
+
+      | min | golden8 | base4h |
+      |---|---:|---:|
+      | 0-2 | 1399 | 1403 |
+      | 5-10 | 1187 | 805 |
+      | 10-15 | 1359 | 924 |
+      | 15-20 | 1378 | 1010 |
+
+      golden8 has **no decay** — it wanders between 1119 and 1549 with no trend.
+      So the fall is a regression, not the workload getting heavier, and the
+      theory that subgames grow over a run is contradicted by golden8's own
+      numbers: configs per decision fall 29.6 -> 15.9 and rows per solve are
+      flat at 7.85. Solves get *cheaper*. `tgt_std` tracks solves rather than
+      wall clock, so this is ~25% of the progress of every run.
+
+      Read and cleared so far, all in the `0192e4a..7ca856b` window: the
+      generation launch is byte-identical; the wave env block matches what are
+      now the Rust defaults; `net.rs` lost only checkpoint *loading* code (the
+      v1 path); `keep_states` is behind a branch and off in production;
+      `encode` actually lost a branch. `selfplay.rs` lost only `mc_mix`. None of
+      it is in a hot loop.
+
+      An A/B is running: `0192e4a` in `/workspace/warchest-old` against HEAD,
+      same box, same jemalloc, 9 minutes each.
 - [ ] **Make the value network antisymmetric.** `v_0 + v_1` is +0.025 mean and
       0.032 absolute against a 0.416 value spread — 8% of the signal, a third of
       the network's own error, and ~130x the target bias from stopping CFR at
