@@ -116,6 +116,41 @@ of nothing. It is: `readout` scales by the *opponent's* reach at the leaf and
 the two is the joint probability. That is the standard expected-utility formula,
 and `train.py::zero_sum` aggregates the dump the same way.
 
+**Adversarial review (codex, gpt-5.6-sol, read-only).** Set to assume the above
+is wrong and find a mechanical cause. It found no solver bug — it re-derived the
+reach bookkeeping, confirmed every player-1 slice adds exactly `nc0`, confirmed
+chance is counted once (forward propagation inserts a draw probability only into
+the drawing player's reach), and ran the CPU oracles: the explicit-world-state
+CFR oracle matched the PBS solver on four positions across all five regret
+rules with root sums at +-0.0000, and `draw_pass_through_consistency` passed on
+six trees containing draws. It corrected four things:
+
+* **"Two independent outputs" is wrong.** There is one shared bilinear readout
+  conditioned on the seat, not two heads. They are correlated — just
+  unconstrained with respect to their sum.
+* **A concrete mechanism for the common-mode offset.** The value is
+  `<u, g(c)[:rank]> + g(c)[rank]`. That trailing bias term is a projection whose
+  input is a sum of *non-negative* ReLU holding features plus an **uncentred**
+  seat bit (player 0 is 0, player 1 is 1, `rebel.rs:184`). A single
+  initialisation therefore produces a coherent offset shared across all
+  positions — which is exactly the mean component, and why an untrained network
+  shows one at all.
+* **The warm phase does enforce zero-sum, and we throw it away.** Monte-Carlo
+  warm rows store `e` and `-e` explicitly (`selfplay.rs:1052`), so that data
+  *does* carry the constraint. `train.py` clears the buffer at the ReBeL
+  transition, so the only labels that ever expressed it are discarded before the
+  bootstrapped phase begins.
+* **One of my worries was mathematically empty.** I had wondered whether an
+  uneven number of decisions per player could break zero-sum. It cannot: root
+  values are `sum_leaf P(leaf) (u_0 + u_1)`, so if leaf payoffs cancel the root
+  cancels regardless of who moved more often.
+
+Two caveats it raised about the evidence. `solvererr` runs the *fixed* starter
+armies (`random_draft=false`), so its signed average is not evidence about seat
+balance — only its magnitude counts. And per-config clipping of targets to
+[-1, 1] does not preserve an aggregate zero-sum relation, though it happens
+before the projection so it cannot explain the violation.
+
 **What was checked and cleared.** `State::utility` is exactly antisymmetric
 (win +1 / loss -1 / horizon `cap * marker differential`). `eval_static` is
 antisymmetric term by term and `eval_squashed` wraps it in an odd `tanh`.

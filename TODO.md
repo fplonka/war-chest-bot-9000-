@@ -49,7 +49,11 @@
       targets, so the diagnostic survives; (b) check whether the two seats'
       errors against a fixed reference are equal and opposite (shared) or
       one-sided (masked) — the 40-game numbers say +0.003/-0.003, which looks
-      shared, but that is one checkpoint; (c) compare against enforcing it in
+      shared, but that is one checkpoint; and note the adversarial review's
+      candidate mechanism for the offset: the readout's per-config bias term is
+      fed a sum of non-negative ReLU features plus an *uncentred* seat bit
+      (`rebel.rs:184`), which is a common-mode channel by construction. Centring
+      the seat bit is a smaller, more honest experiment than projecting; (c) compare against enforcing it in
       `readout` instead, which fixes the leaves the search actually uses rather
       than only the labels. If `symmetrize` wins on Elo but the raw violation is
       unchanged, it is masking rather than fixing.
