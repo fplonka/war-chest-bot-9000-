@@ -244,8 +244,11 @@ def zero_sum(cw, cy, coff, n):
     a position's value *level* without touching how the network tells that
     position's configs apart.
     """
-    v = np.add.reduceat(cw * cy, coff[:-1]) / np.maximum(
-        np.add.reduceat(cw, coff[:-1]), 1e-9)
+    # In float32: the caller has already cast to float16, and reducing ~20
+    # terms in half precision would put noise into the correction itself.
+    w = cw.astype(np.float32)
+    v = np.add.reduceat(w * cy.astype(np.float32), coff[:-1]) / np.maximum(
+        np.add.reduceat(w, coff[:-1]), 1e-9)
     half = 0.5 * (v[0::2] + v[1::2])
     return cy - np.repeat(np.repeat(half, 2), np.diff(coff)).astype(cy.dtype)
 
