@@ -540,7 +540,7 @@ impl Executor {
         // capture+instantiation is pure overhead. Keep a direct-stream A/B path
         // while tuning that crossover; it executes the identical kernels and
         // GEMMs in the identical order.
-        let direct = std::env::var_os("WARCHEST_DIRECT").is_some();
+        let direct = std::env::var("WARCHEST_DIRECT").map_or(true, |v| v != "0");
         if !direct {
             self.stream
                 .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)

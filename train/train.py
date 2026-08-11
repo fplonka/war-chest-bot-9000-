@@ -538,13 +538,6 @@ def main():
     value.push(0)
     gpu_devices = [int(x) for x in args.gpu_devices.split(",") if x.strip()]
     if args.gpu:
-        # Measured live-wave defaults on the target two-3090 box. Environment
-        # overrides remain available for controlled scheduler A/Bs.
-        os.environ.setdefault("WARCHEST_DIRECT", "1")
-        os.environ.setdefault("WARCHEST_WAVE_LANES", "3")
-        os.environ.setdefault("WARCHEST_WAVE_ROWS", "196608")
-        os.environ.setdefault("WARCHEST_WAVE_JOBS", "256")
-        os.environ.setdefault("WARCHEST_WAVE_US", "75000")
         dims, w, b, ln = value.dims, *value.flat()
         warchest.gpu_start(dims, w, b, ln, devices=gpu_devices)
         print(f"[gpu] solve services up on {gpu_devices}", flush=True)
