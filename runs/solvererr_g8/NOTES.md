@@ -89,13 +89,42 @@ state, and nothing has ever asked for it. The targets are also root values of
 solves whose leaves are this same network, so the violation feeds forward into
 what the network is next trained on.
 
+**Where it enters, in one place.** `Solver::readout` handles the two kinds of
+leaf differently, and the contrast is the whole finding. Terminal leaves:
+
+    // Zero-sum by construction (`state::horizon_tests`), so one
+    // stored value serves both seats.
+    let u = if p == self.nodes[i].player { util } else { -util };
+    self.vals[vo..vo + n].fill(u * opp_reach);
+
+One stored number, negated for the other seat — it *cannot* violate zero-sum.
+And it cancels exactly once aggregated: a terminal contributes
+`b_0(c) b_1(c') u` to player 0 and `b_1(c') b_0(c) (-u)` to player 1, the same
+weight either way. Twenty lines later, network leaves:
+
+    *v = (row[c as usize] + cg[...]) * opp_reach;
+
+Two independent lookups, one per seat, with nothing relating them. They cancel
+only if `sum_c b_0(c) net_0(c) = -sum_c' b_1(c') net_1(c')` at that leaf, which
+is the antisymmetry the network does not have. So the pipeline is exactly
+antisymmetric everywhere it can be and unconstrained in exactly one place.
+
+Worth confirming that the aggregate is the right one, since a counterfactual
+value averaged as if it were an expected value would manufacture a violation out
+of nothing. It is: `readout` scales by the *opponent's* reach at the leaf and
+`nash_conv` weights by the player's *own* belief at the root, and the product of
+the two is the joint probability. That is the standard expected-utility formula,
+and `train.py::zero_sum` aggregates the dump the same way.
+
 **What was checked and cleared.** `State::utility` is exactly antisymmetric
 (win +1 / loss -1 / horizon `cap * marker differential`). `eval_static` is
 antisymmetric term by term and `eval_squashed` wraps it in an odd `tanh`.
 `blend_outcome` flips sign for player 1 correctly, and `eval_mix` only applies
 in the warm phase, so ReBeL targets are pure solve output. `mirror.self_check`
 and `self_check_rows` pass on real data. The first player is randomised per
-game and the draft is random, so the two seats are symmetric by construction —
+game (`from_draft` sets `initiative` and `active` to `first_player`, matching
+RULES.md) and the draft is random, so the two seats are symmetric by
+construction —
 and at 40 games they measure that way: configs 14.8/17.1, hands 1.92/1.96,
 initiative 0.484/0.516, per-seat error 0.103/0.096 with biases +0.003/-0.003.
 
