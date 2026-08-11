@@ -195,6 +195,26 @@ The 85% is the point. The direction of the offset was set by the encoding, not
 by the random draw. After centring it is a coin flip, which is what an unbiased
 quantity looks like.
 
+**The root cause, found by a second adversarial review and verified here.**
+The network has one scalar parameter, `wg.bias[-1]`, added directly to *every*
+configuration's value (`value_net.py:195` and `:352`). It therefore contributes
+exactly `2b` to `v_0 + v_1`, and nothing constrains it: the loss is
+per-configuration regression, and the bootstrap copies any constant it adds
+straight into the next round of targets. Checked against the measurement:
+
+| checkpoint | `wg.bias[-1]` | 2b | measured mean |
+|---|---:|---:|---:|
+| `gpu_golden8` | +0.016244 | +0.0325 | +0.0252 |
+| `base30` | +0.021628 | +0.0433 | +0.0371 |
+
+One parameter accounts for the whole violation and slightly overshoots it, so
+the rest of the network partially offsets it. It also *grew* between the two
+runs, which is why the violation rose rather than fell.
+
+Terminal leaves cannot express this mode -- they store one number and negate it
+-- which is why the terminal-only solver oracles come out at +-0.0000 and why
+the violation appears only where network leaves do.
+
 **It fixed initialisation and nothing else.** `runs/base30` trained 30 minutes
 with the centred bit. On the same 11,188 positions its violation is mean +0.037
 and mean absolute 0.043, against +0.025 and 0.032 for the uncentred
