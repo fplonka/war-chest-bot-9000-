@@ -310,8 +310,25 @@ antisymmetric subspace contains the truth, so the projection cannot increase
 error, and it makes `(m_0 - m_1)/2` an average of two estimates of one quantity
 rather than one estimate.
 
-Implemented at the *target* level rather than the leaf level, as
-`train.py::zero_sum` behind the `symmetrize` knob: the projection runs once when
+**Implemented at the leaf, in all three paths** (`value_net.py::zero_sum`,
+`search.rs::readout`, `gpu/wave_kernels.cu::readout`). The violation on
+`runs/base30`'s checkpoint goes +0.037 to exactly 0.000 over 11,188 positions
+with no retraining, and `solvererr`'s `|v_0+v_1|` goes 0.0415 to 0.00000 at
+every T from 4 to 512 under all five regret rules.
+
+A warning for whoever touches this next: the CUDA half was reverted once on the
+strength of `full_wave_oracle` failing, and that was a mistake. The oracle ran
+eight CFR iterations and compared strategies cell by cell. Past one iteration
+the two solvers cannot be compared that way -- regret matching clamps at EPS, so
+a 1e-7 difference in a leaf value puts a regret on the opposite side of zero and
+the CPU and GPU are thereafter solving different games. Five controlled tests
+showed the projection is identical on both sides: the shift forced to zero
+passes, the shift written as the leaf value passes, the opponent reach written
+as the leaf value passes, and the full projection passes at one iteration. The
+oracle is a one-iteration parity test now.
+
+An earlier version was implemented at the *target* level instead, as
+`train.py::zero_sum` behind a `symmetrize` knob: the projection runs once when
 a solve enters the replay buffer, where both players' belief-weighted values are
 already to hand. Verified to take the violation to exactly zero, moving targets
 by rms 0.035 against a spread of 0.321.
