@@ -29,11 +29,16 @@ class Cfg:
     # ------------------------------------------------------------- schedule
     minutes: float = 60.0
     # The greedy warm phase, in minutes. Its data is discarded at the handover.
-    # In both `runs/base4h` and `runs/gpu_golden8` the warm loss falls from
-    # 0.078 to 0.018 in the first 30 seconds, sits flat until minute 3.5, and
-    # then keeps falling while `probe_std` collapses 0.46 -> 0.375. The last
-    # ~1.5 minutes fit the handcrafted evaluation better and make the network
-    # less expressive. See the `warm` experiment.
+    # Measured (`runs/warm-base-s1/NOTES.md`), holding the ReBeL phase fixed at
+    # 15 minutes and varying only this: final Elo 516/517 at five minutes,
+    # 515/446 at two, 432/-124 at one, -47/-91 at half. Below two minutes runs
+    # do not just get worse, they become unstable -- one seed of the 1-minute
+    # arm collapsed outright. Five is the only setting where both seeds agree.
+    #
+    # Do not "improve" the warm phase by making its network play better. More
+    # warm-up gives a *worse* player -- init Elo -208/-154 at five minutes
+    # against -34/+42 at half -- and the arms with the strongest starting
+    # networks produced the weakest finals.
     warm_minutes: float = 5.0
     warm_frac: float = 0.2         # used only when warm_minutes < 0
     snapshots: int = 3             # evenly spaced over the ReBeL phase, last at the end
