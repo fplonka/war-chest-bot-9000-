@@ -388,7 +388,7 @@ def run(runs, out=None, games=60, temp=2.0, random_draft=False, seed=7,
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("out", nargs="+", help="one or more run directories")
+    ap.add_argument("runs", nargs="+", help="one or more run directories")
     ap.add_argument("--out", dest="dest", default=None,
                     help="where to write ladder.json (default: the first run directory)")
     ap.add_argument("--games", type=int, default=300, help="paired games per pairing")
@@ -413,8 +413,8 @@ def main():
     ap.add_argument("--gpu", action="store_true",
                     help="two solve services (CUDA 0/1), one per pairing side")
     args = ap.parse_args()
-    cfgs = [json.load(open(f"{d}/log.json")).get("cfg", {}) for d in args.out]
-    run(args.out, out=args.dest, games=args.games,
+    cfgs = [json.load(open(f"{d}/log.json")).get("cfg", {}) for d in args.runs]
+    run(args.runs, out=args.dest, games=args.games,
         focus=[x for x in args.focus.split(",") if x], focus_games=args.focus_games,
         temp=args.temp,
         random_draft=args.random_draft or any(c.get("random_draft", False) for c in cfgs),
