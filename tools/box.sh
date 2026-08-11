@@ -6,12 +6,14 @@
 #   tools/box.sh <command...>             # run it there, output here
 #   tools/box.sh -bg <tag> <command...>   # detach; log to /workspace/logs/<tag>.log
 #   tools/box.sh pull                     # bring back reports, logs and ladders
+#   tools/box.sh follow dcfr              # watch an experiment, pulling as it goes
 #   tools/box.sh go dcfr                  # sync, build, run the experiment, pull
 #
 # `go` is the one to use. Everything an experiment needs happens in order and
 # nothing is left to remember: the tree goes up, the extension is rebuilt, the
-# arms run detached so a dropped ssh does not kill them, and the pages come
-# back. Watch it with `tools/box.sh tail <name>`.
+# arms run detached so a dropped ssh does not kill them, and `follow` brings
+# each run's page back as it finishes. Ctrl-C is safe -- the run is detached,
+# so following it again, or a plain `pull`, picks up where this left off.
 #
 # A non-interactive ssh does not source the profile, so cargo, nvcc and the venv
 # are put on PATH by hand.
@@ -69,6 +71,23 @@ build)
 tail)
     run_remote "tail -f /workspace/logs/${2:?usage: tail <tag>}.log"
     ;;
+follow)
+    # A run writes its report.html when it ends, so poll: pull whatever exists,
+    # print where the experiment has got to, and stop once exp.py is gone. One
+    # ssh a minute costs nothing against runs measured in tens of minutes, and
+    # tailing instead would hold a connection open for hours to learn the same
+    # thing.
+    exp=${2:?usage: follow <experiment>}
+    # `[e]xp` so the pattern does not match the shell that carries it: pgrep -f
+    # reads every command line including its own caller's, and a bracket the
+    # regex never matches is what keeps this from following itself forever.
+    while "$0" pull >/dev/null && run_remote "pgrep -f '[e]xp.py run $exp'" >/dev/null; do
+        # The box's login files greet every ssh, so keep the last line only.
+        run_remote "tail -1 /workspace/logs/$exp.log" | tail -1
+        sleep "${WARCHEST_BOX_POLL:-60}"
+    done
+    "$0" pull
+    ;;
 go)
     exp=${2:?usage: go <experiment> [extra exp.py args...]}
     shift 2
@@ -78,7 +97,7 @@ go)
 nohup setsid bash -lc $(printf '%q' "$prelude
 python train/exp.py run $exp $*") >/workspace/logs/$exp.log 2>&1 &
 echo started $exp"
-    echo "running. watch: tools/box.sh tail $exp   then: tools/box.sh pull"
+    "$0" follow "$exp"
     ;;
 -bg)
     tag=${2:?usage: -bg <tag> <command...>}
@@ -88,6 +107,6 @@ nohup setsid bash -lc $(printf '%q' "$prelude
 $*") >/workspace/logs/$tag.log 2>&1 &
 echo started $tag"
     ;;
-"")  sed -n '2,15p' "$0" ;;
+"")  sed -n '2,16p' "$0" ;;
 *)   run_remote "$*" ;;
 esac
