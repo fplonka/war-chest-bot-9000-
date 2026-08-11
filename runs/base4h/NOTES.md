@@ -32,17 +32,35 @@ log, no games and no noise:
 |---|---:|---:|---:|---:|---:|---:|
 | error / spread | 0.239 | 0.204 | 0.195 | 0.193 | 0.187 | 0.189 |
 
-Same story, and it is the honest one: the network stops improving against its
-own targets after about 100 minutes. Whether *strength* plateaus with it is a
-separate question and the ladder is still running as this is written. One result
-from an aborted earlier ladder says the earlier part of the run was real
-improvement: s1 (34 min) scores **0.202** against s3 (93 min), so s3 is far
-stronger. It is the back half that is in question.
+Same story on the network's own terms: it stops improving against its targets
+after about 100 minutes.
+
+**And strength does not plateau with it.** That is the result worth having, and
+it says these loss metrics are not a proxy for playing better. Paired games
+between snapshots, SPRT-gated:
+
+| pairing | minutes | score for the earlier net | implied Elo gap |
+|---|---|---:|---:|
+| s1 vs s3 | 34 -> 93 | 0.280 | +166 |
+| s3 vs s4 | 93 -> 122 | 0.426 | +52 |
+| s3 vs s6 | 93 -> 181 | 0.365 | +96 |
+| s3 vs s7 | 93 -> 211 | 0.305 | **+143** |
+
+The run gains about as much strength in its second half (93 -> 211 minutes,
++143 Elo) as in its first (34 -> 93, +166) — while `tgt_std` moves 0.58 to 0.60
+and the normalised error moves 0.195 to 0.189. Both of the cheap noise-free
+metrics say "finished" through two hours of real improvement.
+
+That is worth carrying forward as a warning. It is tempting to gate long runs on
+the training log because it is free; on this evidence it would have stopped this
+run at 100 minutes and thrown away half its Elo. The ladder is the instrument.
 
 **What the plateau level implies.** An error of 0.19 of the spread means the
 network already accounts for about 96% of the variance in its own targets. A
 network that fits its targets that well is not the binding constraint — the
-targets are. Which puts the two findings from `runs/solvererr_g8` in a different
+targets are, and since strength keeps rising while the fit does not, what is
+improving must be the targets themselves: the same network fitted equally well
+to a better operator plays better. Which puts the two findings from `runs/solvererr_g8` in a different
 light: CFR iteration count contributes a bias of 0.00025, nothing at all, while
 the network's failure to be antisymmetric is 0.032 against a value spread of
 0.416, or about 8%. That is roughly a third of the network's entire remaining
