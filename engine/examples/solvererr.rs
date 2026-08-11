@@ -153,6 +153,13 @@ fn main() {
     // seeded from the policy head, worth this many iterations. The decision rule
     // is whether warm at T/2 beats cold at T.
     let warm: f32 = a.get(6).and_then(|x| x.parse().ok()).unwrap_or(0.0);
+    // Non-zero also solves each position one ply deeper, converged, and reports
+    // how far the deeper answer moves. That gap is what truncating the subgame
+    // at `depth` costs, and unlike NashConv it sees the surrogate itself: a
+    // perfect solve of a too-shallow game is still the wrong game. Judge it
+    // against the network's own error, not against zero. Expensive -- a
+    // depth+1 tree is tens of times bigger -- so it is off by default.
+    let deep: bool = a.get(7).map(|x| x != "0").unwrap_or(false);
 
     let mut nets = Nets::default();
     nets.value = Mlp::load_bin(&path).expect("weights file");
@@ -186,6 +193,7 @@ fn main() {
     let mut nash = vec![vec![0.0f64; rungs]; rules.len()];
     let mut asym = vec![vec![0.0f64; rungs]; rules.len()];
     let (mut n, mut positions, mut support) = (0usize, 0usize, 0usize);
+    let (mut deep_abs, mut deep_signed, mut deep_n) = (0.0f64, 0.0f64, 0usize);
     let (mut ref_sum, mut ref_sq) = (0.0f64, 0.0f64);
 
     let mut game = 0u64;
@@ -236,6 +244,15 @@ fn main() {
                 }
             }
         }
+        if deep {
+            let d = solve(&s, &ctx, &nets, &bel, depth + 1, REFERENCE, 0.0);
+            for (a, b) in d.vals[rungs - 1].iter().zip(reference.iter()) {
+                let g = (a - b) as f64;
+                deep_abs += g.abs();
+                deep_signed += g;
+                deep_n += 1;
+            }
+        }
         for r in &reference {
             ref_sum += *r as f64;
             ref_sq += (*r as f64) * (*r as f64);
@@ -270,6 +287,17 @@ fn main() {
             println!();
         }
     };
+    if deep_n > 0 {
+        println!(
+            "\ndepth {depth} -> {} truncation gap, both converged: mean |gap| {:.5}, \
+             signed {:+.5}, over {deep_n} config values.\n\
+             Read it against the network's own held-out error (~0.099) and the \
+             value spread ({spread:.4}). This is the error NashConv cannot see.",
+            depth + 1,
+            deep_abs / deep_n as f64,
+            deep_signed / deep_n as f64
+        );
+    }
     table(
         "NashConv — what a best response to the solve would gain.",
         &nash,
