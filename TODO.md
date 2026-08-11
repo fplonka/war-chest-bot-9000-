@@ -71,6 +71,14 @@
 
 ## Known gaps
 
+- [ ] **`gpu::tests::wave_composition_stays_bounded` fails.** A tree's strategy
+      moves by 1.54x the allowed tolerance depending on which other jobs share
+      its wave (`gpu 5.355e-1` against `reference 6.924e-1`). The GPU test
+      module did not compile until `keep_states` was added to its `TEST_CFG`,
+      so this has been unmeasured rather than passing. `full_wave_oracle` and
+      `zero_network_oracle` do pass. Probably reduction order in the batched
+      GEMMs, but that is a guess and it should be a measurement.
+
 - [ ] **The solver's own tests do not compile.** `tests/rebel_solver.rs`,
       `tests/rebel_pbs.rs` and `examples/wave_tape.rs` reference `TNode::s`,
       which the GPU tree-builder work removed. They have been dark since that
