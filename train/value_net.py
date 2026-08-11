@@ -193,6 +193,19 @@ class Mlp(nn.Module):
         self.slot_out = nn.Linear(slot[-1] if slot else 4 + de, dg)
         self.res = nn.ModuleList([Res(dg) for _ in range(nres)])
         self.wg = nn.Linear(dg, rank + 1)
+        # Column `rank` of `wg` is added to every config's value unchanged, so
+        # its *bias* is one constant shared by v_0 and v_1. Nothing can see it:
+        # the loss is a per-config regression, and a constant added to both
+        # players' leaf values is copied into both their targets, so the
+        # bootstrap carries it forward instead of correcting it. Measured at
+        # +0.0162 in gpu_golden8 and +0.0216 in base30, which is the whole of
+        # the zero-sum violation those checkpoints show. In a zero-sum game the
+        # correct constant is zero, so it is pinned there and kept out of the
+        # gradient. The rest of the column still varies with the config, which
+        # is a real degree of freedom and stays.
+        with torch.no_grad():
+            self.wg.bias[-1].zero_()
+        self.wg.bias.register_hook(lambda g: torch.cat([g[:-1], g.new_zeros(1)]))
         # The policy head: an action tower and the two halves of its readout.
         self.wq = nn.Linear(AFEAT + de, rank)
         self.wk = nn.Linear(dg, rank)
