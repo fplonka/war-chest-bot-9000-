@@ -53,8 +53,8 @@ therefore 2–3x the data in a fixed wall clock. Since `runs/gpu_golden8` was
 still climbing steeply when its 30 minutes ran out, more data is very likely
 what this system wants.
 
-**A side finding that is two hundred times larger than the one above.** The last
-table `solvererr` prints is |v_0 + v_1|, how far the value network is from
+**A side finding a hundred times larger than the one above.** The last table
+`solvererr` prints is |v_0 + v_1|, how far the value network is from
 antisymmetric. In a zero-sum game the two players' values must sum to zero. This
 one sits at **0.0415 and does not move** across any iteration count or any rule.
 
@@ -62,78 +62,52 @@ That flatness is the diagnosis: a quantity CFR manufactured would change as CFR
 converges. It does not, so the violation is in the network's leaf values and the
 solve merely inherits it.
 
-It is also not an artefact of `solvererr`'s uniform beliefs. Measured on a set
-of positions solved to convergence under the *real* self-play posterior
-(`truth.py`-generated, 1,334 positions, T=1024 dcfr):
-
-| quantity | value |
-|---|---:|
-| mean `v_0 + v_1` | **+0.0502** |
-| mean &#124;`v_0 + v_1`&#124; | 0.0567 |
-| std `v_0 + v_1` | 0.0451 |
-| std `v_0` (the signal) | 0.3545 |
-
-Two components, and they matter very differently. The **mean** +0.05 is a
-uniform offset, and a constant added to all of one player's values does not
-change that player's best response — it is embarrassing but probably harmless to
-play. The **std** 0.045 is the part that bites: it is state-dependent, so the
-network hands out a bonus in some positions and a penalty in others, which
-distorts the value of one state relative to another and therefore does change
-play. That component is roughly 13% of the value signal, and it is **180 times
-larger than the target bias from stopping CFR at T=64** that this whole sweep was
-about.
-
-Worth noting what it is not: the mirror augmentation does swap seats, but it
-maps a position to a *different* position, which asks the network for
-equivariance, not antisymmetry. Nothing in training has ever asked for
-`v_0(s) = -v_1(s)` at the same `s`. One suspicious coincidence to chase: the
-horizon's marker payoff `cap_value` is 0.04, the same size as the offset, and
-golden8 annealed it to zero with only ~13 minutes of training left to unlearn
-it. Not tested.
-
-**What kind of error it is.** The violation correlates **+0.67** with
-`(v_0 - v_1)/2` — how far ahead player 0 is — but **-0.05** with the *magnitude*
-of that lead. A symmetric miscalibration would show the opposite pattern. What
-fits is a difference in value *scale* between the two seats: the network reads
-the leader's advantage on a slightly different ruler depending on which seat the
-leader is in. It is also concentrated early: averaged over fifths of a dump in
-play order the violation runs 0.088, 0.088, 0.074, 0.011, -0.010, fading to
-nothing near terminal positions where the actual win pins the value and the
-network has no room to be inconsistent. Which is to say it is largest exactly
-where the search depends on the network most.
-
-`search.rs` already knew the violation exists — `Conv::zero_sum` documents it
-and correctly says it is a property of the network rather than a bug in the
-solver. What was missing was its size relative to the signal, which is what
-makes it worth acting on rather than noting.
-
-**Where it comes from: nowhere, which is the point.** Measured directly as the
-network's own belief-weighted `v_0 + v_1` on the probe positions, for a randomly
-initialised network and for a trained one:
+Measured directly as the network's own belief-weighted `v_0 + v_1` over 11,188
+positions from 40 games, for a randomly initialised network and a trained one:
 
 | network | mean | mean abs | std |
 |---|---:|---:|---:|
-| untrained | -0.052 | 0.052 | **0.018** |
-| trained 30 min | +0.052 | 0.058 | **0.044** |
+| untrained | -0.055 | 0.057 | 0.033 |
+| trained 30 min | **+0.025** | **0.032** | 0.032 |
 
-Training does not cause the violation and does not cure it — a random network is
-off by the same amount, and it even flipped sign. That is what an unconstrained
-quantity looks like: nothing forces two independent outputs to negate at
-initialisation, and no term in the loss asks for it afterwards, so it drifts.
+Against a value spread of 0.416 that is about **8% of the signal**, and against
+the network's own error of 0.099 on the same positions it is about **a third**.
+Set beside the thing this sweep was actually about — the 0.00025 of target bias
+from stopping CFR at T=64 — it is roughly 130 times larger.
 
-But the split matters more than the magnitude. A constant offset added to both
-players changes nobody's best response and is harmless. The *state-dependent*
-part does change play, because it inflates some positions relative to others.
-That is the part training makes **2.4x worse**, 0.018 to 0.044, and the part the
-projection removes.
+**It comes from nowhere, which is the point.** A random network is off by the
+same amount and with the opposite sign, so training neither creates the
+violation nor removes it; it halves the mean and leaves the spread alone. That
+is what an unconstrained quantity looks like. Nothing forces two independent
+outputs to negate at initialisation, and no term in the loss asks for it after.
 
-The targets are also root values of solves whose leaves are this same network,
-so the violation feeds forward into what the network is then trained on. Worth stating because the obvious candidate is not the culprit:
-the 180-degree mirror augmentation was *on* for `runs/base4h`, and it cannot fix
-this. Mirroring maps a position to a different position with the seats
-exchanged, which asks the network for equivariance between two states. This is a
-constraint between the two players' values at *one* state, and nothing has ever
-asked for it.
+The obvious candidate is not the culprit: the 180-degree mirror augmentation was
+*on* for `runs/base4h` and cannot fix this. Mirroring maps a position to a
+*different* position with the seats exchanged, which asks for equivariance
+between two states. Zero-sum is a constraint between the two players at *one*
+state, and nothing has ever asked for it. The targets are also root values of
+solves whose leaves are this same network, so the violation feeds forward into
+what the network is next trained on.
+
+**What was checked and cleared.** `State::utility` is exactly antisymmetric
+(win +1 / loss -1 / horizon `cap * marker differential`). `eval_static` is
+antisymmetric term by term and `eval_squashed` wraps it in an odd `tanh`.
+`blend_outcome` flips sign for player 1 correctly, and `eval_mix` only applies
+in the warm phase, so ReBeL targets are pure solve output. `mirror.self_check`
+and `self_check_rows` pass on real data. The first player is randomised per
+game and the draft is random, so the two seats are symmetric by construction —
+and at 40 games they measure that way: configs 14.8/17.1, hands 1.92/1.96,
+initiative 0.484/0.516, per-seat error 0.103/0.096 with biases +0.003/-0.003.
+
+**A correction, and a lesson about sample size.** An earlier version of this
+note reported the violation at +0.050 mean / 0.045 sd / 13% of signal, claimed
+training made the state-dependent part 2.4x worse, and reported a 1.93:1 seat
+imbalance in configs with player 1 fit measurably worse. All of that came from
+`data/probe.npz`, which was built with `--games 2`. Its 1,334 positions are two
+games' worth of highly correlated states, and every one of those numbers moved
+or vanished at 40 games. The violation itself survived at roughly half the
+size; the seat imbalance was noise and reversed sign. Build these sets with
+tens of games, not two.
 
 **The fix, stated correctly.** An earlier draft of this note said to subtract
 half the violation from both players' values, which glosses over the structure:
@@ -153,11 +127,19 @@ antisymmetric subspace contains the truth, so the projection cannot increase
 error, and it makes `(m_0 - m_1)/2` an average of two estimates of one quantity
 rather than one estimate.
 
-Not implemented. It lives in `Solver::readout`, which is called per player off a
-shared PBS-head pass and runs every CFR iteration, so it needs both players'
-aggregates available at once — a real change to the hot loop, wanting
-`train/test_parity.py` and `tests/rebel_solver.rs` in front of it rather than a
-quick patch.
+Implemented at the *target* level rather than the leaf level, as
+`train.py::zero_sum` behind the `symmetrize` knob: the projection runs once when
+a solve enters the replay buffer, where both players' belief-weighted values are
+already to hand. Verified to take the violation to exactly zero, moving targets
+by rms 0.035 against a spread of 0.321.
+
+That is the cheap half. It cleans what the network is trained on, but the leaves
+*inside* a solve are still the raw network, so the search still runs on a
+slightly non-zero-sum game and the fix only reaches it through what the network
+learns. The leaf-level version lives in `Solver::readout`, which is called per
+player off a shared PBS-head pass every CFR iteration and would need both
+players' aggregates at once — a hot-loop change wanting `train/test_parity.py`
+and `tests/rebel_solver.rs` in front of it. Do that only if the cheap half pays.
 
 ## What this does not answer
 

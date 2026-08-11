@@ -33,10 +33,12 @@
       against 1,315 on the same hardware, measured with nothing else running.
       `tgt_std` tracks solves rather than wall clock, so this is 20% of the
       progress of every run. Bisect 22f63f6 and 0192e4a.
-- [ ] **Make the value network antisymmetric.** `v_0 + v_1` is +0.050 mean,
-      0.045 std, against a 0.354 value spread — 180x the target bias from
-      stopping CFR at T=64, and it is the network rather than the solve. See
-      `runs/solvererr_g8/NOTES.md`.
+- [ ] **Make the value network antisymmetric.** `v_0 + v_1` is +0.025 mean and
+      0.032 absolute against a 0.416 value spread — 8% of the signal, a third of
+      the network's own error, and ~130x the target bias from stopping CFR at
+      T=64. It is the network rather than the solve, and a random network is off
+      by the same amount. `train.py::zero_sum` projects it out of the targets;
+      whether that buys strength is untested. See `runs/solvererr_g8/NOTES.md`.
 - [ ] Re-run the `dcfr` / `aux` / `policy` experiments through `exp.py`. The
       2026-08-06 `arch_*` results are **not** evidence: three arms inside
       ±20 Elo at 100 games per pairing, which resolves nothing finer than ~70.

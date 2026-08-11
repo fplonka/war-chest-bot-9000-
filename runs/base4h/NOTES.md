@@ -44,10 +44,10 @@ network already accounts for about 96% of the variance in its own targets. A
 network that fits its targets that well is not the binding constraint — the
 targets are. Which puts the two findings from `runs/solvererr_g8` in a different
 light: CFR iteration count contributes a bias of 0.00025, nothing at all, while
-the network's failure to be antisymmetric is 0.045 against a value spread of
-0.354, or about 13%. That is two thirds the size of the network's entire
-remaining error, and unlike the rest of the error it is *structured* — a known
-constraint the values violate in a measurable, correctable way. If the run is
+the network's failure to be antisymmetric is 0.032 against a value spread of
+0.416, or about 8%. That is roughly a third of the network's entire remaining
+error, and unlike the rest of the error it is *structured* — a known constraint
+the values violate in a measurable, correctable way. If the run is
 target-limited rather than fit-limited, that is where the next real gain is.
 
 **And the buffer is not stale.** Rows that have been in the buffer longest are
@@ -115,6 +115,6 @@ produced a cffi module with no `gpu_start` in it.
 Two measurements from the same night bear on how to read this run.
 `runs/solvererr_g8` finds that CFR iteration count is not what limits target
 quality — the bias at T=64 is 350x below the network's own error — and that the
-value network is not antisymmetric by roughly 13% of the value signal. And the
+value network is not antisymmetric by roughly 8% of the value signal. And the
 frozen-truth-set idea turned out to rank whichever network built the set, so the
 ladder is still the only instrument that compares two runs.

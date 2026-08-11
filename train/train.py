@@ -227,10 +227,10 @@ def zero_sum(cw, cy, coff, n):
 
     War Chest is zero-sum, so a position's value to one player is minus its
     value to the other: with `cw` a normalised belief, the two belief-weighted
-    root values must sum to zero. They do not. On positions solved to
-    convergence the sum averages +0.050 with a standard deviation of 0.045,
-    against a value spread of 0.354 -- about 13% of the signal, and two thirds
-    the size of the network's whole remaining error (`runs/solvererr_g8`).
+    root values must sum to zero. They do not. Over 11,188 positions from 40
+    games the sum is +0.025 on average and 0.032 in absolute value, against a
+    value spread of 0.416 -- about 8% of the signal, and a third of the
+    network's own error of 0.099 (`runs/solvererr_g8`).
 
     Nothing in the loop ever asked for this. The mirror augmentation swaps the
     seats but relates two *different* positions, which is equivariance; this is

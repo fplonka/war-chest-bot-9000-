@@ -218,13 +218,12 @@ pub struct Conv {
     /// terminal, which is the case `tests/rebel_solver.rs` pins against an
     /// independent solver.
     ///
-    /// How big: on positions solved to convergence under the real self-play
-    /// posterior, mean +0.050 and std 0.045 against a value spread of 0.354 —
-    /// call it 13% of the signal, and 180x the target bias that stopping CFR at
-    /// T=64 introduces. It correlates +0.67 with `(v_0 - v_1)/2`, so it is a
-    /// difference in value *scale* between the two seats rather than symmetric
-    /// miscalibration, and it is concentrated in early and midgame positions.
-    /// See `runs/solvererr_g8/NOTES.md`. Not accepted, just not yet fixed.
+    /// How big: over 11,188 positions from 40 games, mean +0.025 and mean
+    /// absolute 0.032, against a value spread of 0.416. Call it 8% of the
+    /// signal, a third of the network's own error, and ~130x the target bias
+    /// that stopping CFR at T=64 introduces. A randomly initialised network is
+    /// off by the same amount, so nothing in training creates it and nothing
+    /// removes it. See `runs/solvererr_g8/NOTES.md`.
     pub zero_sum: f32,
 }
 

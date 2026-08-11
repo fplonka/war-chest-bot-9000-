@@ -130,7 +130,7 @@ EXPERIMENTS = {
     "dcfr":     [{}, {"cfr": "dcfr"}],
     "aux":      [{}, {"aux": 0.3}],
     # The largest structured error we have found: the value function is not
-    # zero-sum, by 13% of the value signal.
+    # zero-sum, by ~8% of the value signal and a third of the network's error.
     "symmetrize": [{"minutes": 30}, {"minutes": 30, "symmetrize": True}],
     "policy":   [{}, {"policy": 0.3}],
     # Solve quality per unit time, not per solve. `runs/solvererr_g8` puts dcfr
