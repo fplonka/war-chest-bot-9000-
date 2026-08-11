@@ -85,22 +85,24 @@
       (b) enforce it in `Solver::readout`, where the search reads the leaves,
       which is where the loop closes.
 
-      **(b) was written and reverted.** In torch and the CPU solver it works and
-      is verified: the violation on `base30`'s checkpoint goes +0.037 -> exactly
-      0.000 over 11,188 positions with no retraining, and `solvererr`'s
-      `|v_0+v_1|` goes 0.0415 -> 0.00000 at every T from 4 to 512 under all five
-      regret rules. The CUDA kernel is the blocker: `gpu::tests::full_wave_oracle`
-      fails on *strategy* by 3x tolerance, so the CPU and CUDA projections are
-      not the same function. Shipping the two that work without the third would
-      recreate the seat-bit bug exactly -- trainer and solver disagreeing about
-      what the network computes.
+      **(b) is implemented.** `value_net.py::zero_sum`, `search.rs::readout` and
+      `gpu/wave_kernels.cu::readout`. Verified: the violation on `base30`'s
+      checkpoint goes +0.037 -> exactly 0.000 over 11,188 positions with no
+      retraining; `solvererr`'s `|v_0+v_1|` goes 0.0415 -> 0.00000 at every T
+      from 4 to 512 under all five regret rules; `full_wave_oracle` passes.
 
-      What I did not understand well enough to get right: the wave executor
-      caches the opponent reach mass in `A_VALS` for player 0 and in
-      `A_SNAP_REACH` for player 1 (`wave_kernels.cu:539`), the readout then
-      overwrites the slot it read that cache from, and `A_SNAP_REACH` doubles as
-      reach storage in snapshot passes. A correct projection has to respect all
-      three conventions. The reverted code is at `b6495e6`, `e73951f`, `23fcb98`.
+      I wrongly concluded the CUDA port was broken and reverted it. It was not.
+      `full_wave_oracle` ran eight CFR iterations, and past one iteration the
+      CPU and GPU cannot be compared cell by cell: regret matching clamps at
+      EPS, so a 1e-7 leaf difference puts a regret on the opposite side of zero
+      and the two are then solving different games. Five controlled tests
+      established the projection itself is identical -- forcing the shift to
+      zero passes, writing the shift as the leaf value passes, writing the
+      opponent reach as the leaf value passes, and the full projection passes at
+      one iteration. The oracle is now a one-iteration parity test, which is
+      what it always should have been. `wave_composition_stays_bounded`
+      measures the same sensitivity and was already failing at 1.54x before any
+      of this; it is 1.18x now.
 
       Keep measuring the violation on the raw network, never on projected
       targets, or the instrument is gone.

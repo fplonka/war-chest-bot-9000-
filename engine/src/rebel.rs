@@ -388,7 +388,7 @@ pub struct Belief {
 
 /// Mirrors `kReachSmoothingEps` in the reference: stops an underflowed belief
 /// from turning into NaN downstream.
-const SMOOTH: f32 = 1e-30;
+pub const SMOOTH: f32 = 1e-30;
 
 impl Belief {
     pub fn point(c: Config) -> Belief {
