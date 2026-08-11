@@ -192,8 +192,17 @@ Measured over 40 random initialisations, the seat gap in the holding tower:
 | centred `-0.5/+0.5` | +0.0008 | 50% |
 
 The 85% is the point. The direction of the offset was set by the encoding, not
-by the random draw. After centring it is a coin flip, which is what an
-unbiased quantity looks like.
+by the random draw. After centring it is a coin flip, which is what an unbiased
+quantity looks like.
+
+**It fixed initialisation and nothing else.** `runs/base30` trained 30 minutes
+with the centred bit. On the same 11,188 positions its violation is mean +0.037
+and mean absolute 0.043, against +0.025 and 0.032 for the uncentred
+`gpu_golden8` at the same age. It rose. So the uncentred bit was a cause of the
+offset *at initialisation*, and this note's earlier claim that it was the cause
+of the violation was wrong. What remains is the loop: no term in the loss asks
+for zero-sum, and every solve's leaves are the same network, so the targets
+carry the violation forward.
 
 **It cost a run, and the reason is worth remembering.** The seat channel has
 **three** implementations: `net.rs::holdings` (CPU Rust), `value_net.py::holdings`
