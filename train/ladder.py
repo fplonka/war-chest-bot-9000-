@@ -168,6 +168,13 @@ def players_of(runs, refs=("greedy",), labels=None, search=None):
 # scores of 0.5, and the horizon here manufactures a lot of them, which shows up
 # honestly as a smaller variance and therefore a faster decision.
 ELO0, ELO1 = 0.0, 15.0      # indifference band: below 15 Elo we do not care
+
+# Stopping early is what makes a full round robin affordable, and it costs
+# something: a pairing stopped at its boundary has a win rate biased slightly
+# towards that boundary, so a rating fitted from truncated pairings is not the
+# rating a fixed schedule would give. The bias is small next to the effect sizes
+# a learning curve shows, and it buys spending the games where the curve is
+# genuinely uncertain rather than on pairings settled after 100 games.
 ALPHA = BETA = 0.05
 
 
@@ -223,7 +230,7 @@ def pairing_games(a, b, focus, curve_games, focus_games):
     return 0
 
 
-SPRT_BLOCK = 200            # games between tests; small enough to stop early
+SPRT_BLOCK = 100            # games between tests; small enough to stop early
 
 
 def run(runs, out=None, games=60, temp=2.0, random_draft=False, seed=7,
@@ -281,9 +288,12 @@ def run(runs, out=None, games=60, temp=2.0, random_draft=False, seed=7,
             for i, j in itertools.combinations(range(k), 2)}
     played = sum(1 for v in plan.values() if v)
     total_games = sum(plan.values())
-    print(f"[ladder] {k} players, {played} of {len(plan)} pairings played "
-          f"({games} games each, {focus_games} between the arms' finals)  ->  "
-          f"{total_games:,} games, roughly {total_games * 100 / 1300 / 60:.0f} min",
+    # With SPRT these counts are ceilings, not schedules: a settled pairing
+    # stops at the first block. Net-against-net games run about 3/s on the two
+    # 3090s, and a game against Greedy is far cheaper.
+    print(f"[ladder] {k} players, {played} of {len(plan)} pairings, "
+          f"up to {games} games each ({focus_games} between the arms' finals) "
+          f"-> at most {total_games:,} games, {total_games / 3 / 60:.0f} min",
           flush=True)
     for i, j in itertools.combinations(range(k), 2):
         # A seed per pairing rather than one shared across the tournament.
@@ -312,9 +322,12 @@ def run(runs, out=None, games=60, temp=2.0, random_draft=False, seed=7,
             cfr_b=sb["cfr"], warm_b=sb["warm"], gpu=gpu)
 
         verdict = None
-        if sprt and {a["name"], b["name"]} <= focus:
-            # The pairing the experiment is about: play in blocks and stop as
-            # soon as the evidence is conclusive, or at n_ij if it never is.
+        if sprt:
+            # Every pairing plays in blocks and stops as soon as the evidence
+            # is conclusive, or at n_ij if it never is. A lopsided pairing is
+            # settled by the first block; the games saved there are spent on
+            # the neighbouring snapshots, which is where the curve is actually
+            # uncertain.
             w = l = d = 0
             for blk in range(0, n_ij, SPRT_BLOCK):
                 bw, bl, bd = play(min(SPRT_BLOCK, n_ij - blk),
@@ -333,8 +346,7 @@ def run(runs, out=None, games=60, temp=2.0, random_draft=False, seed=7,
                       "score": round((w + 0.5 * d) / max(w + l + d, 1), 3)})
         note = {"H1": f"  SPRT: better by >{ELO1:.0f} Elo",
                 "H0": f"  SPRT: not better by {ELO1:.0f} Elo",
-                None: ""}[verdict] if verdict is not None or (
-                    sprt and {a["name"], b["name"]} <= focus) else ""
+                None: "  (inconclusive)"}[verdict] if sprt else ""
         print(f"  {a['name']:>28s} vs {b['name']:<28s} W{w:4d} L{l:4d} D{d:4d}  "
               f"score {pairs[-1]['score']:.3f}{note}", flush=True)
 
