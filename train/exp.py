@@ -60,8 +60,15 @@ def launch(cfg, out):
     return rc == 0
 
 
-def judge(runs, games, focus_games, gpu, seed=7):
-    """Rate every arm's every snapshot in one ladder, then write the page."""
+def judge(runs, games, focus_games, gpu, seed=7, labels=None):
+    """Rate every arm's snapshots in one ladder, then write the page.
+
+    `labels` restricts which snapshots enter. A curve over every snapshot of
+    every arm is quadratic in the arm count and mostly pairings nobody asked
+    about: eight arms at four snapshots is 33 players and over 100 pairings.
+    `init,final` is usually the whole experiment -- where each arm started and
+    where it finished.
+    """
     finals = []
     for r in runs:
         with open(f"{r}/log.json") as f:
@@ -69,7 +76,7 @@ def judge(runs, games, focus_games, gpu, seed=7):
         tag = os.path.basename(r.rstrip("/"))
         finals += [f"{tag}.{s['label']}" for s in snaps if s["label"] == "final"]
     ladder.run(runs, out=runs[0], games=games, focus=finals,
-               focus_games=focus_games, gpu=gpu, seed=seed)
+               focus_games=focus_games, gpu=gpu, seed=seed, labels=labels)
     for r in runs:
         # Each run gets its own page, and the comparison gets one more.
         report.write([r], f"{r}/report.html")
@@ -118,11 +125,13 @@ def cmd_run(args):
             done.append(out)
     if not done:
         raise SystemExit("[exp] every run failed; nothing to judge")
-    judge(done, args.games, args.focus_games, gpu=config.BASELINE.gpu, seed=args.seed)
+    judge(done, args.games, args.focus_games, gpu=config.BASELINE.gpu, seed=args.seed,
+          labels=None if args.labels == "all" else args.labels.split(","))
 
 
 def cmd_judge(args):
-    judge(args.runs, args.games, args.focus_games, gpu=args.gpu, seed=args.seed)
+    judge(args.runs, args.games, args.focus_games, gpu=args.gpu, seed=args.seed,
+          labels=None if args.labels == "all" else args.labels.split(","))
 
 
 def cmd_ls(args):
@@ -183,6 +192,8 @@ def main():
         p.add_argument("--focus-games", type=int, default=2000,
                        help="paired games between the arms' final checkpoints")
         p.add_argument("--seed", type=int, default=7)
+        p.add_argument("--labels", default="init,final",
+                       help="snapshot labels to rate, or 'all' for every one")
 
     l = sub.add_parser("ls", help="every run, newest first")
     l.add_argument("--limit", type=int, default=40)
