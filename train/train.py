@@ -32,6 +32,7 @@ anything. `exp.py` drives both.
 """
 
 import argparse
+import collections
 import dataclasses
 import json
 import os
@@ -122,6 +123,10 @@ class Buffer:
         self.cw = np.zeros(ccap, np.float16)
         self.cy = np.zeros(ccap, np.float16)
         self.rows = 0   # rows ever written
+        # (rows written, when) at each insertion, trimmed to the live window.
+        # A cap is set in rows, but what it buys is history, and how many rows
+        # an hour buys moves with the solve rate and with rows per solve.
+        self.stamps = collections.deque()
         self.cfgs = 0   # configs ever written
         self.lo = 0     # oldest row whose configs are still in the arena
 
@@ -142,6 +147,7 @@ class Buffer:
         self.cc[sl], self.cp[sl], self.cw[sl], self.cy[sl] = cc, cp, cw, cy
         self.rows += n
         self.cfgs += m
+        self.stamps.append((base, time.time()))
         # Solve offsets in absolute row space (first entry 0, trailing count).
         self.soff = np.concatenate([self.soff, np.asarray(soff, np.int64)[1:] + base])
         # Advance past every row the arena no longer holds in full.
@@ -159,8 +165,15 @@ class Buffer:
             if i > self.soff.size // 2:
                 self.soff = self.soff[i:].copy()
 
+    def span_seconds(self):
+        """How much wall clock the live buffer holds."""
+        while len(self.stamps) > 1 and self.stamps[1][0] <= self.lo:
+            self.stamps.popleft()
+        return time.time() - self.stamps[0][1] if self.stamps else 0.0
+
     def clear(self):
         self.lo = self.rows
+        self.stamps.clear()
 
     def __len__(self):
         return self.rows - self.lo
@@ -731,7 +744,7 @@ def main():
                 "conv_s": round(window["conv_s"], 2),
                 "add_s": round(window["add_s"], 2),
                 "gpu_wait_s": round(window["gpu_wait_s"], 2),
-                "buf": len(buf),
+                "buf": len(buf), "buf_s": round(buf.span_seconds(), 1),
                 "solves_per_s": round(raw_sps, 1),
                 "balanced_solves_per_s": round(balanced_sps, 1),
                 "lr": opt.param_groups[0]["lr"],
@@ -1098,6 +1111,7 @@ def main():
                "probe_std": round(probe_std, 4),
                "gen_s": round(gen_s, 2), "train_s": round(train_s, 2),
                "conv_s": round(conv_s, 2), "add_s": round(add_s, 2), "buf": len(buf),
+               "buf_s": round(buf.span_seconds(), 1),
                "solves_per_s": round(sps, 1),
                "lr": opt.param_groups[0]["lr"]}
         log.append(rec)
