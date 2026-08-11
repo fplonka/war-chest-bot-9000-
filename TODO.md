@@ -62,21 +62,32 @@
       T=64. It is the network rather than the solve, and a random network is off
       by the same amount. `train.py::zero_sum` projects it out of the targets;
       whether that buys strength is untested. See `runs/solvererr_g8/NOTES.md`.
-- [ ] **Does the centred seat bit remove the violation in a *trained* net?**
-      `35f37ee` centres the seat channel, which removes the common-mode offset
-      at initialisation: mean +0.0398 -> +0.0008 over 40 seeds, and the sign
-      stops being 85% predictable. That is measured at initialisation only.
-      Re-measure `v_0 + v_1` on a checkpoint trained with the new build. The
-      mean should collapse. The state-dependent part (sd ~0.032) should not,
-      because nothing constrains it — and that is the part that changes play.
-      A projection that forced the sum to zero was written and then removed
-      (`train.py::zero_sum`, in the history at `8afa4b4`). It was untested, it
-      corrected a symptom rather than a cause, and it would have destroyed the
-      instrument: with the projection on, `v_0 + v_1` is zero by construction and
-      can no longer tell us anything. Bring it back only if the trained
-      measurement shows the state-dependent part still costs strength. If it
-      does, enforce it in `Solver::readout`, where the search actually reads the
-      leaves, rather than in the labels.
+- [ ] **The zero-sum violation survived the seat fix.** Measured on the same
+      11,188 positions, final checkpoints of two 30-minute runs:
+
+      | network | mean | mean abs | sd |
+      |---|---:|---:|---:|
+      | `gpu_golden8`, uncentred seat bit | +0.025 | 0.032 | 0.032 |
+      | `base30`, centred seat bit | **+0.037** | **0.043** | 0.036 |
+
+      Centring did what it was measured to do at *initialisation* -- the seat
+      gap fell from +0.0398 to +0.0008 over 40 seeds and its sign stopped being
+      85% predictable -- and changed nothing in the trained network. So the
+      uncentred bit was a cause of the offset at initialisation only, and
+      calling it "the cause" was wrong.
+
+      What is left is the loop: nothing in the loss asks for zero-sum, and the
+      targets carry the violation because every solve's leaves are this same
+      network. Two candidates, second one honest:
+      (a) project the targets, as `train.py::zero_sum` did before `9936e7b`
+      removed it -- cheap, but it cleans the labels and leaves the search's own
+      leaves untouched;
+      (b) enforce it in `Solver::readout`, where the search reads the leaves,
+      which is where the loop closes.
+      Do not re-add either until the root cause is understood. Keep measuring
+      the violation on the raw network, never on projected targets, or the
+      instrument is gone.
+
 - [ ] Re-run the `dcfr` / `aux` / `policy` experiments through `exp.py`. The
       2026-08-06 `arch_*` results are **not** evidence: three arms inside
       ±20 Elo at 100 games per pairing, which resolves nothing finer than ~70.
