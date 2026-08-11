@@ -58,7 +58,11 @@ class Cfg:
     train_gen_ratio: float = 4.0
     recent_mix: float = 0.5        # fraction of a batch drawn from the newest slice
     recent_frac: float = 0.2       # how big that slice is
-    cap: int = 2_000_000           # replay capacity: an algorithmic knob, not a memory one
+    # Replay capacity, in rows. Inherited from the ReBeL paper, and at this
+    # project's data rate it holds 7.7 minutes: `runs/base4h` generated 69M rows
+    # and trained on the newest 2M of them, throwing away 97%. A row costs about
+    # 1.2 KB, so 2M is 2.4 GB of the box's 125.
+    cap: int = 2_000_000
     cfgs_per_row: int = 48
     no_augment: bool = False
 
@@ -128,6 +132,12 @@ EXPERIMENTS = {
     # inside the network's own error -- for 2-3x the solves per second.
     "iters":    [{"minutes": 30}, {"minutes": 30, "cfr": "dcfr", "iters": 32},
                  {"minutes": 30, "cfr": "dcfr", "iters": 16}],
+    # How much history the network trains on. `runs/base4h` plateaued after ~100
+    # minutes while its buffer held only the newest 7.7, so the question is
+    # whether the plateau is the window rather than the network. Bigger is also
+    # staler, which is the cost and is what `diagnose.py` measures.
+    "cap":      [{"minutes": 60}, {"minutes": 60, "cap": 8_000_000},
+                 {"minutes": 60, "cap": 24_000_000}],
     # Does a short run rank changes the way a long one does? If it does, every
     # experiment above costs a quarter of what it costs today. Run this first.
     "cadence":  [{"minutes": 15}, {"minutes": 15, "cfr": "dcfr"},
