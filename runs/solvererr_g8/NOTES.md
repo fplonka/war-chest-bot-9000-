@@ -173,6 +173,42 @@ or vanished at 40 games. The violation itself survived at roughly half the
 size; the seat imbalance was noise and reversed sign. Build these sets with
 tens of games, not two.
 
+## The fix that was made, and what it cost
+
+The adversarial review's mechanism turned out to be right, and it is now the
+change we shipped (`35f37ee`). The config's seat scalar is used twice: as a
+gather index for that player's cards, which is correct and necessary, and as a
+raw input channel, which is not. As `0`/`1` that channel is inert for seat 0 and
+active for seat 1. Everything after it is rectified before it is summed, so the
+asymmetry cannot cancel, and it lands in the readout's per-config bias term --
+added directly, not through the public state -- as a constant that differs by
+seat.
+
+Measured over 40 random initialisations, the seat gap in the holding tower:
+
+| encoding | mean gap | same sign across seeds |
+|---|---:|---:|
+| uncentred `0/1` | +0.0398 | **85%** |
+| centred `-0.5/+0.5` | +0.0008 | 50% |
+
+The 85% is the point. The direction of the offset was set by the encoding, not
+by the random draw. After centring it is a coin flip, which is what an
+unbiased quantity looks like.
+
+**It cost a run, and the reason is worth remembering.** The seat channel has
+**three** implementations: `net.rs::holdings` (CPU Rust), `value_net.py::holdings`
+(torch, what the trainer uses), and `gpu/wave_kernels.cu` (CUDA, what production
+actually solves with). The first two were changed and the third was not. The
+trainer and the solver then disagreed about what the network computes. The next
+run saturated -- `tgt_mean` +0.93 against a normal -0.02 -- and generation fell
+from 2,560 to 101 solves/s in four minutes before the liveness check killed it.
+
+Nothing cross-checks those three. There *is* a check that would have caught it,
+`gpu::tests::full_wave_oracle`, and it had not compiled since `keep_states` was
+added to `Cfg`: one missing field in `TEST_CFG`. With that field restored the
+oracle passes and the three encodings agree. Any future change to the config
+feature layout must touch all three files and run that test.
+
 **The fix, stated correctly.** An earlier draft of this note said to subtract
 half the violation from both players' values, which glosses over the structure:
 there is no per-config pair to symmetrize. Player 0's leaf values are indexed by
