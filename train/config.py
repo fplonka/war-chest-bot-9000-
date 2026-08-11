@@ -144,13 +144,16 @@ EXPERIMENTS = {
     # staler, which is the cost and is what `diagnose.py` measures.
     "cap":      [{"minutes": 60}, {"minutes": 60, "cap": 8_000_000},
                  {"minutes": 60, "cap": 24_000_000}],
-    # 5 minutes of greedy warm-up is 17% of a 30-minute run, and the logs say
-    # the useful part is over in 30 seconds. But a 30-second warm phase gave a
-    # bootstrap runaway in a smoke run -- target mean drifting +0.22 -> +0.28
-    # with the spread pinned at 0.09 -- so there is a floor as well as a
-    # ceiling. This looks for the middle.
-    "warm":     [{"minutes": 30}, {"minutes": 30, "warm_minutes": 2},
-                 {"minutes": 30, "warm_minutes": 1}],
+    # Every arm gets the same 20 minutes, and only the split between greedy
+    # warm-up and ReBeL moves. That is the question we actually decide: warm
+    # time is time not spent on ReBeL. 5 minutes is 25% of this budget, and the
+    # logs say the useful part of it is over in 30 seconds. But a 30-second warm
+    # phase gave a bootstrap runaway in a smoke run -- target mean drifting
+    # +0.22 -> +0.28 with the spread pinned at 0.09 -- so there is a floor as
+    # well as a ceiling. The zero arm tests whether the floor exists at all.
+    "warm":     [{"minutes": 20}, {"minutes": 20, "warm_minutes": 2},
+                 {"minutes": 20, "warm_minutes": 1},
+                 {"minutes": 20, "warm_minutes": 0}],
     # Does a short run rank changes the way a long one does? If it does, every
     # experiment above costs a quarter of what it costs today. Run this first.
     "cadence":  [{"minutes": 15}, {"minutes": 15, "cfr": "dcfr"},
