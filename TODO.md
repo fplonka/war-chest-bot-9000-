@@ -6,10 +6,6 @@
       60-minute one does? If it does, every experiment below costs a quarter of
       what it costs now. Nobody runs this because it does not feel like
       progress; it sets the cadence for everything after it.
-- [x] ~~Build the first ground-truth set off the strongest checkpoint we have.~~
-      Done and the answer was negative: a set built that way ranks its own
-      builder's neighbourhood above stronger networks (numbers in
-      `train/truth.py`). It is not the ruler.
 - [ ] **Build a terminal-anchored ground-truth set instead.** Late-game
       positions solved deep enough that every leaf of the subgame is terminal
       have exact game values with no evaluator in them, so the ruler stays true
@@ -59,49 +55,34 @@
 - [ ] **Does the zero-sum projection buy strength?** `exp.py run projection`,
       two arms x two seeds, 5 minutes of warm-up and 20 of ReBeL, then a ladder
       over the finals alone. Correct is not the same as stronger and only the
-      ladder decides. The measurement and the mechanism are the item below;
-      this line is the experiment that is still owed.
-- [ ] **The zero-sum violation survived the seat fix.** Measured on the same
-      11,188 positions, final checkpoints of two 30-minute runs:
+      ladder decides. Running on the box at `009792d`; the history behind the
+      projection is in `runs/solvererr_g8/NOTES.md`.
 
-      | network | mean | mean abs | sd |
+      **At play time it already does, and by a lot.** `gpu_golden8`'s own
+      checkpoint against itself, identical weights, one side projecting at the
+      leaf and one not, four seeds of 60 random-draft games at depth 2 / T=64:
+
+      | seed | projected | raw | draws |
       |---|---:|---:|---:|
-      | `gpu_golden8`, uncentred seat bit | +0.025 | 0.032 | 0.032 |
-      | `base30`, centred seat bit | **+0.037** | **0.043** | 0.036 |
+      | 5 | 39 | 8 | 13 |
+      | 17 | 45 | 9 | 6 |
+      | 29 | 43 | 8 | 9 |
+      | 41 | 45 | 6 | 9 |
+      | **pooled** | **172** | **31** | **37** |
 
-      Centring did what it was measured to do at *initialisation* -- the seat
-      gap fell from +0.0398 to +0.0008 over 40 seeds and its sign stopped being
-      85% predictable -- and changed nothing in the trained network. So the
-      uncentred bit was a cause of the offset at initialisation only, and
-      calling it "the cause" was wrong.
+      0.794 over 240 games, about **+236 Elo**, same sign on every seed. So the
+      search-time half is doing the work, not the label cleaning.
 
-      What is left is the loop: nothing in the loss asks for zero-sum, and the
-      targets carry the violation because every solve's leaves are this same
-      network. Two candidates, second one honest:
-      (a) project the targets, as `train.py::zero_sum` did before `9936e7b`
-      removed it -- cheap, but it cleans the labels and leaves the search's own
-      leaves untouched;
-      (b) enforce it in `Solver::readout`, where the search reads the leaves,
-      which is where the loop closes.
+      The likely mechanism, and it is testable: an unprojected network adds the
+      same constant to *both* players' values at every network leaf
+      (`gpu_golden8` carries `2 * wg.bias[-1]` = +0.033), while terminal leaves
+      are exactly zero-sum. A subgame that mixes the two therefore prices
+      continuing against ending at a systematic offset, and the agent's choice
+      between a terminal line and a continuing one is distorted. It predicts
+      the effect is largest late, where terminal leaves are common.
 
-      **(b) is implemented.** `value_net.py::zero_sum`, `search.rs::readout` and
-      `gpu/wave_kernels.cu::readout`. Verified: the violation on `base30`'s
-      checkpoint goes +0.037 -> exactly 0.000 over 11,188 positions with no
-      retraining; `solvererr`'s `|v_0+v_1|` goes 0.0415 -> 0.00000 at every T
-      from 4 to 512 under all five regret rules; `full_wave_oracle` passes.
-
-      I wrongly concluded the CUDA port was broken and reverted it. It was not.
-      `full_wave_oracle` ran eight CFR iterations, and past one iteration the
-      CPU and GPU cannot be compared cell by cell: regret matching clamps at
-      EPS, so a 1e-7 leaf difference puts a regret on the opposite side of zero
-      and the two are then solving different games. Five controlled tests
-      established the projection itself is identical -- forcing the shift to
-      zero passes, writing the shift as the leaf value passes, writing the
-      opponent reach as the leaf value passes, and the full projection passes at
-      one iteration. The oracle is now a one-iteration parity test, which is
-      what it always should have been. `wave_composition_stays_bounded`
-      measures the same sensitivity and was already failing at 1.54x before any
-      of this; it is 1.18x now.
+      This does not predict the training experiment. A network trained *with*
+      the projection has no such offset for the projection to remove.
 
       **Now behind `Cfg.zero_sum`, and the knob must not survive the answer.**
       The projection is a runtime flag in all four paths (`config.py`,
@@ -159,13 +140,6 @@
       `zero_network_oracle` do pass. Probably reduction order in the batched
       GEMMs, but that is a guess and it should be a measurement.
 
-- [ ] **The solver's own tests do not compile.** `tests/rebel_solver.rs`,
-      `tests/rebel_pbs.rs` and `examples/wave_tape.rs` reference `TNode::s`,
-      which the GPU tree-builder work removed. They have been dark since that
-      refactor: 20 compile errors at b55c631, none of them new. The PBS and
-      solver oracles are the correctness floor under everything the agent
-      does, so this is the first thing to fix.
-
 - [ ] **The horizon manufactures draws.** A game is cut at 256 coin plays and
       scored as a draw; War Chest has no draws. Report the draw rate beside
       every score; raise MAX_MAIN_PLAYS and check the cap rate; treat Greedy
@@ -173,8 +147,5 @@
       it makes the game non-zero-sum, and zero-sum is load-bearing.
 - [ ] **The subgame is not quite zero-sum.** Its leaves are network values;
       predicting v_0 and defining v_1 = -v_0 would enforce it by construction.
-- [x] Draw transitions: round-start runs are now one direct multivariate
-      hypergeometric per source config (see rebel.rs::DrawScratch::run),
-      pinned to the old composition by test.
 - [ ] Validate the mirror augmentation against the engine rather than against
       invariants (a State::mirror() in Rust would make the encoder the oracle).
