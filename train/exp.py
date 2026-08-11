@@ -101,9 +101,12 @@ def cmd_run(args):
     played = n * (per * (per - 1) // 2) + (k - 1) + n * (n - 1) // 2
     ladder_games = (played - n * (n - 1) // 2) * args.games \
         + (n * (n - 1) // 2) * args.focus_games
+    # A ceiling, not a schedule: SPRT stops a settled pairing at its first
+    # block, and most pairings in a curve are settled. Net-against-net games run
+    # about 3/s on two 3090s, measured, so the ceiling is what is priced here.
     print(f"[exp] {train_min:.0f} min of training, then a {k}-player ladder: "
-          f"{played} pairings, {ladder_games:,} games, "
-          f"roughly {ladder_games * 100 / 1300 / 60:.0f} min")
+          f"{played} pairings, at most {ladder_games:,} games "
+          f"({ladder_games / 3 / 60:.0f} min at the ceiling)")
     if args.dry_run:
         return
     done = []
