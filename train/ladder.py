@@ -145,8 +145,8 @@ def players_of(runs, refs=("greedy",), labels=None, search=None):
             ck = torch.load(f"{run}/{s['file']}", map_location="cpu", weights_only=False)
             # A checkpoint older than a knob does not carry it, so fall back to
             # the run's config and then to the default.
-            own = dict(SEARCH, **{k: cfg.get(k, v) for k, v in SEARCH.items()},
-                       **(ck.get("search") or {}))
+            own = {k: cfg.get(k, v) for k, v in SEARCH.items()}
+            own.update(ck.get("search") or {})
             ps.append({"name": f"{tag}.{s['label']}", "agent": "rebel",
                        "slot": len(ps), "t": s["t"], "file": s["file"],
                        "run": run, "search": search or own})

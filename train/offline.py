@@ -158,11 +158,17 @@ def run_one(name, tr, va, te, args, dev, seed):
         if best_state is not None:
             net.load_state_dict(best_state)
         hl, rms = evaluate(net, te, rng, dev)
+        # The same checkpoint on data it was fitted to. Test error alone cannot
+        # tell a network that *cannot represent* the target function from one
+        # that represents it and has not seen enough of it; the gap between
+        # these two can.
+        _, trms = evaluate(net, subset(tr, np.arange(min(len(tr[0]), 8192))), rng, dev)
         row = {"lr": lr, "val_huber": round(best_val, 6), "best_step": best_step,
-               "test_huber": round(hl, 6), "test_rms": round(rms, 5), "curve": curve}
+               "test_huber": round(hl, 6), "test_rms": round(rms, 5),
+               "train_rms": round(trms, 5), "curve": curve}
         if best is None or row["val_huber"] < best["val_huber"]:
             best = row
-    return {"arch": name, "params": params,
+    return {"arch": name, "params": params, "train_rms": best["train_rms"],
             "test_huber": best["test_huber"], "test_rms": best["test_rms"],
             "best_val_huber": best["val_huber"], "best_step": best["best_step"],
             "lr": best["lr"], "seconds": round(time.time() - t0, 1),
@@ -255,12 +261,13 @@ def main():
         r["explained"] = round(1 - (r["test_rms"] / tgt_std) ** 2, 4)
         results.append(r)
 
-    print(f"\n{'arch':14s} {'params':>9s} {'lr':>8s} {'best_step':>9s} "
-          f"{'val':>10s} {'test':>10s} {'test_rms':>9s} {'var expl':>9s} {'sec':>6s}")
+    print(f"\n{'arch':18s} {'params':>9s} {'lr':>8s} {'step':>7s} "
+          f"{'train_rms':>10s} {'test_rms':>9s} {'gap':>6s} {'var expl':>9s} {'sec':>6s}")
     for r in sorted(results, key=lambda r: r["test_huber"]):
-        print(f"{r['arch']:14s} {r['params']:9d} {r['lr']:8.0e} {r['best_step']:9d} "
-              f"{r['best_val_huber']:10.6f} {r['test_huber']:10.6f} "
-              f"{r['test_rms']:9.5f} {r['explained']:9.4f} {r['seconds']:6.1f}")
+        print(f"{r['arch']:18s} {r['params']:9d} {r['lr']:8.0e} {r['best_step']:7d} "
+              f"{r['train_rms']:10.5f} {r['test_rms']:9.5f} "
+              f"{r['test_rms'] / r['train_rms']:6.2f} {r['explained']:9.4f} "
+              f"{r['seconds']:6.1f}")
     if args.out:
         with open(args.out, "w") as f:
             json.dump({"args": vars(args), "results": results}, f, indent=1)
