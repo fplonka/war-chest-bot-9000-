@@ -103,7 +103,7 @@ def elo_stderr(n, elo):
     return out
 
 
-SEARCH = {"depth": 2, "iters": 64, "cfr": "linear", "warm": 0.0, "zero_sum": True}
+SEARCH = {"depth": 2, "iters": 64, "cfr": "linear", "warm": 0.0}
 
 
 def parse_search(spec):
@@ -319,11 +319,10 @@ def run(runs, out=None, games=60, temp=2.0, random_draft=False, seed=7,
         play = lambda n, s: warchest.eval_match(
             n, s, a["agent"], b["agent"],
             depth=sa["depth"], iters=sa["iters"], cfr=sa["cfr"], warm=sa["warm"],
-            zero_sum=sa["zero_sum"],
             temp=temp, slot_a=a["slot"], slot_b=b["slot"],
             random_draft=random_draft,
             depth_b=sb["depth"], iters_b=sb["iters"],
-            cfr_b=sb["cfr"], warm_b=sb["warm"], zero_sum_b=sb["zero_sum"], gpu=gpu)
+            cfr_b=sb["cfr"], warm_b=sb["warm"], gpu=gpu)
 
         verdict = None
         if sprt:

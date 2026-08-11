@@ -97,14 +97,6 @@ class Cfg:
     # `anneal_frac` of the ReBeL phase so the shipped checkpoint is fitted to
     # the real game. Each side has 6 markers, so this must stay far below a
     # real win or stalling the clock becomes a competing win condition.
-    # Project the network's leaf values onto the zero-sum constraint, in the
-    # trainer's forward and in every solve's readout. Temporary: it exists so
-    # one build can run both arms of the `projection` experiment. When that
-    # answers, the winner becomes unconditional and this knob is deleted --
-    # with it on, the readout's whole `wg.bias` has exactly zero gradient, so
-    # the raw network's `v_0 + v_1` is an unidentified gauge and measuring it
-    # means nothing.
-    zero_sum: bool = True
     cap_value: float = 0.04
     anneal_frac: float = 0.4
     random_draft: bool = True      # random armies, not the fixed starter pair
@@ -151,12 +143,6 @@ EXPERIMENTS = {
     # inside the network's own error -- for 2-3x the solves per second.
     "iters":    [{"minutes": 30}, {"minutes": 30, "cfr": "dcfr", "iters": 32},
                  {"minutes": 30, "cfr": "dcfr", "iters": 16}],
-    # Does enforcing zero-sum at the leaf buy strength? The projection is
-    # correct and free -- it deletes one scalar a zero-sum game cannot have --
-    # but "correct" is not "stronger", and only the ladder decides that. Five
-    # minutes of warm-up and twenty of ReBeL, the shortest run the `warm`
-    # experiment showed to be stable on both seeds.
-    "projection": [{"minutes": 25}, {"minutes": 25, "zero_sum": False}],
     # How much history the network trains on. `runs/base4h` plateaued after ~100
     # minutes while its buffer held only the newest 7.7, so the question is
     # whether the plateau is the window rather than the network. Bigger is also

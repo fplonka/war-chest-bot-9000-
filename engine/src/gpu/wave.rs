@@ -725,7 +725,6 @@ fn same_meta(a: &PackedMeta, b: &PackedMeta) -> bool {
     a.depth == b.depth
         && a.iters == b.iters
         && a.snapshots == b.snapshots
-        && a.zero_sum == b.zero_sum
         && a.cfr.alpha.to_bits() == b.cfr.alpha.to_bits()
         && a.cfr.beta.to_bits() == b.cfr.beta.to_bits()
         && a.cfr.gamma.to_bits() == b.cfr.gamma.to_bits()

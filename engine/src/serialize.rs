@@ -29,7 +29,7 @@ use std::rc::Rc;
 /// The byte format this module writes. Bump when an array changes shape or
 /// meaning (docs/TREE.md "the version bumps when any of them changes shape or
 /// meaning").
-pub const JOB_VERSION: u32 = 7;
+pub const JOB_VERSION: u32 = 6;
 const MAGIC: u32 = 0x5743_4A36; // "WCJ6"
 
 /// Runtime metadata that travels with a job (not part of the frozen tree
@@ -40,8 +40,6 @@ pub struct PackedMeta {
     pub iters: usize,
     /// Keep the per-iterate average snapshots (generation) or not (evaluation).
     pub snapshots: bool,
-    /// Project the network's leaf values onto the zero-sum constraint.
-    pub zero_sum: bool,
     pub cfr: Cfr,
     /// Iterations the policy head's strategy is worth (0 = uniform start).
     pub warm: f32,
@@ -357,7 +355,6 @@ impl PackedJob {
                 depth: sv.cfg.depth,
                 iters: sv.cfg.iters,
                 snapshots: sv.cfg.snapshots,
-                zero_sum: sv.cfg.zero_sum,
                 cfr: sv.cfg.cfr,
                 warm: sv.cfg.warm,
                 snap_iters: sv.snap_list.clone(),
@@ -1071,7 +1068,6 @@ impl PackedJob {
         w.u32(m.depth as u32);
         w.u32(m.iters as u32);
         w.b.push(m.snapshots as u8);
-        w.b.push(m.zero_sum as u8);
         w.f32(m.cfr.alpha);
         w.f32(m.cfr.beta);
         w.f32(m.cfr.gamma);
@@ -1156,7 +1152,6 @@ impl PackedJob {
             depth: r.u32("depth")? as usize,
             iters: r.u32("iters")? as usize,
             snapshots: r.take(1, "snapshots")?[0] != 0,
-            zero_sum: r.take(1, "zero_sum")?[0] != 0,
             cfr: Cfr {
                 alpha: r.f32("alpha")?,
                 beta: r.f32("beta")?,
@@ -1296,7 +1291,6 @@ impl PackedJob {
                 depth: 2,
                 iters: 4,
                 snapshots: true,
-                zero_sum: true,
                 cfr: Cfr::DISCOUNTED,
                 warm: 0.0,
                 snap_iters: vec![0, 1, 2, 4],

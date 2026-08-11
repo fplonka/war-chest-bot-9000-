@@ -162,7 +162,6 @@ struct WaveDev {
     reach_task_n: [i32; 2],
     back_task_n: [i32; 2],
     readout_n: i32,
-    zero_sum: i32,
 }
 
 unsafe impl cudarc::driver::DeviceRepr for WaveDev {}
@@ -1536,7 +1535,6 @@ impl DeviceWave {
                 i32n(w.back_task[1].len(), "p1 back")?,
             ],
             readout_n: i32n(w.readout.len(), "readouts")?,
-            zero_sum: w.meta.zero_sum as i32,
         };
         let dev = match dev {
             Some(mut dev) => {

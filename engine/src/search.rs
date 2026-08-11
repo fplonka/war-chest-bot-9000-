@@ -82,11 +82,6 @@ pub struct Cfg {
     /// four read sites, none of them in a hot loop — so this is off in every
     /// production path and the vector stays empty there.
     pub keep_states: bool,
-    /// Project the network's leaf values onto the zero-sum constraint
-    /// (`readout`). On is the production setting; the flag exists so a ladder
-    /// can rate a checkpoint under the search it was trained with, and so the
-    /// arms of one experiment can differ in it inside a single build.
-    pub zero_sum: bool,
 }
 
 impl Default for Cfg {
@@ -100,7 +95,6 @@ impl Default for Cfg {
             node_cap: 0,
             gpu_build: false,
             keep_states: false,
-            zero_sum: true,
         }
     }
 }
@@ -1763,7 +1757,7 @@ impl<'a> Solver<'a> {
             &self.vt,
             &mut self.vals,
         );
-        let (ncfg, project) = (self.ncfg, self.cfg.zero_sum);
+        let ncfg = self.ncfg;
         for (r, &i) in self.leaf_rows.iter().enumerate() {
             let ra = roff[i] as usize + if opp == 1 { ncs[i][0] as usize } else { 0 };
             let opp_reach: f32 = reach[ra..ra + ncs[i][opp] as usize].iter().sum();
@@ -1773,43 +1767,14 @@ impl<'a> Solver<'a> {
                 vals[vo..vo + n].fill(0.0);
                 continue;
             }
-            // A config's *value* is only ever read for the player it belongs
-            // to. The opponent's configs enter through the belief embedding
-            // and, below, through one belief-weighted aggregate — both public
-            // quantities, which is what keeps the query leak-free.
+            // Only the player's own configs are ever looked up here. The
+            // opponent's private state reaches this value solely through the
+            // belief embedding, which is what keeps the query leak-free.
             let cs = coff[2 * r + p] as usize;
             let row = &vt[r * ncfg..(r + 1) * ncfg];
-            let raw = |c: u32| row[c as usize] + cg[c as usize * (rk + 1) + rk];
-            // Zero-sum projection. The game is zero-sum, so the two players'
-            // belief-weighted values at this leaf must cancel; nothing in
-            // training makes them, and a constant shared by both is copied
-            // into both targets and carried forward by the bootstrap. Subtract
-            // half the failure to cancel from every config of both players.
-            // `value_net.py::zero_sum` and `wave_kernels.cu` do the same, and
-            // this must stay in step with them. Terminal leaves are skipped
-            // above: one stored value serves both seats there, so they are
-            // exactly zero-sum already.
-            let mut delta = 0.0f32;
-            if project {
-                for q in 0..2usize {
-                    let qa = roff[i] as usize + if q == 1 { ncs[i][0] as usize } else { 0 };
-                    let nq = ncs[i][q] as usize;
-                    let sq: f32 = reach[qa..qa + nq].iter().sum();
-                    if sq <= 0.0 {
-                        continue;
-                    }
-                    let qs = coff[2 * r + q] as usize;
-                    let mq: f32 = cidx[qs..qs + nq]
-                        .iter()
-                        .zip(&reach[qa..qa + nq])
-                        .map(|(&c, &w)| w * raw(c))
-                        .sum::<f32>()
-                        / sq;
-                    delta += 0.5 * mq;
-                }
-            }
             for (v, &c) in vals[vo..vo + n].iter_mut().zip(&cidx[cs..cs + n]) {
-                *v = (raw(c) - delta) * opp_reach;
+                // The trailing column of `g` is the per-config bias term.
+                *v = (row[c as usize] + cg[c as usize * (rk + 1) + rk]) * opp_reach;
             }
         }
     }
