@@ -149,6 +149,15 @@ class Buffer:
         self.lo = max(self.lo, self.rows - self.cap)
         while self.lo < self.rows and self.cstart[self.lo % self.cap] < floor:
             self.lo += 1
+        # Drop the offsets whose rows have been evicted. `soff` is sorted, so
+        # the dead prefix is one searchsorted. Without this it grows for the
+        # whole run and the concatenate above copies all of it every chunk --
+        # quadratic in the run length, on the same thread that drains the
+        # generator. Amortised by only compacting when half the array is dead.
+        if self.soff.size:
+            i = int(np.searchsorted(self.soff, self.lo, "right"))
+            if i > self.soff.size // 2:
+                self.soff = self.soff[i:].copy()
 
     def clear(self):
         self.lo = self.rows
