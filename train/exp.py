@@ -109,7 +109,8 @@ def cmd_run(args):
     done = []
     for name, cfg in todo:
         out = f"{RUNS}/{name}"
-        cfg = dataclasses.replace(cfg, out=out, dump_buffer=f"{out}/buf.npz")
+        cfg = dataclasses.replace(cfg, out=out,
+                                  dump_buffer=f"{out}/buf.npz" if args.dump else "")
         if launch(cfg, out):
             done.append(out)
     if not done:
@@ -164,6 +165,8 @@ def main():
     r.add_argument("--seeds", type=int, default=2)
     r.add_argument("--dry-run", action="store_true", help="print the plan and stop")
     r.add_argument("--force", action="store_true", help="allow a dirty tree")
+    r.add_argument("--dump", action="store_true",
+                   help="write each run's replay buffer; a few GB per arm")
     r.set_defaults(fn=cmd_run)
 
     j = sub.add_parser("judge", help="rate finished runs (again, or at more games)")
