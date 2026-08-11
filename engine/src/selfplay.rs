@@ -1,12 +1,16 @@
 //! Self-play, training-data generation and evaluation.
 //!
 //! One loop drives every agent. At each decision node an agent produces a
-//! *per-config* policy `P(private action | config)`; the loop then
-//!   1. samples the action from the row for the true config,
-//!   2. Bayes-updates the public belief from what the opponent actually
-//!      **observes** — summing over every private action consistent with that
-//!      observation, which is what keeps face-down plays private,
-//!   3. applies the action to the true state.
+//! *per-config* policy `P(private action | config)`; the loop samples an
+//! action, propagates the public belief through the policy, and applies the
+//! action. Several private actions can share one public observation, so belief
+//! propagation sums over all of them.
+//!
+//! ReBeL exploration samples public branches off-policy. It does not change
+//! the PBS attached to a sampled branch: that PBS is propagated under the
+//! solved reference strategy. One player is selected as the explorer for the
+//! whole subgame walk. After an exploratory action, the representative hidden
+//! configuration is redrawn from the reference PBS before play continues.
 //! Chance nodes are resolved from the true bag and convolve the belief with
 //! each config's own draw distribution.
 //!
@@ -520,8 +524,8 @@ impl Data {
 pub struct GameCfg {
     pub agents: [Agent; 2],
     pub collect: Collect,
-    /// Probability that a uniformly sampled player plays a uniformly random
-    /// action (ReBeL's `random_action_prob`), redrawn each decision.
+    /// Probability that ReBeL's sampled explorer plays a uniformly random
+    /// action. The explorer is fixed for one subgame walk.
     pub explore: f32,
     /// Randomise the draft instead of using the fixed starter matchup.
     pub random_draft: bool,
@@ -552,6 +556,8 @@ enum WalkState<'a> {
 struct Walk<'a> {
     tree: WalkState<'a>,
     slot: usize,
+    /// The one player allowed to explore during this sampled leaf walk.
+    explorer: u8,
     node: usize,
     /// Draws taken so far inside the current collapsed chance node.
     drawn: u8,
@@ -717,6 +723,7 @@ pub struct Game<'a> {
     pending_roots: Option<Vec<[Vec<f32>; 2]>>,
     pending_slot: usize,
     pending_player: u8,
+    pending_explorer: u8,
     pending_oversize: bool,
 }
 
@@ -752,6 +759,7 @@ impl<'a> Game<'a> {
             pending_roots: None,
             pending_slot: 0,
             pending_player: 0,
+            pending_explorer: 0,
             pending_oversize: false,
         }
     }
@@ -946,6 +954,7 @@ impl<'a> Game<'a> {
                             self.pending_roots = Some(roots_v);
                             self.pending_slot = slot;
                             self.pending_player = player;
+                            self.pending_explorer = sample_explorer(rng, gc.explore);
                             return Step::Submitted;
                         } else {
                             // CPU path: the full solve, then the walk.
@@ -1010,6 +1019,7 @@ impl<'a> Game<'a> {
                             *walk = Some(Walk {
                                 tree: WalkState::Cpu(sv),
                                 slot,
+                                explorer: sample_explorer(rng, gc.explore),
                                 node: 0,
                                 drawn: 0,
                                 strat: Vec::new(),
@@ -1061,23 +1071,25 @@ impl<'a> Game<'a> {
                 data.push_value(s, ctx, bel, [&a, &b]);
             }
 
+            let epsilon = gc.explore.clamp(0.0, 1.0);
+            let explorer = walk.as_ref().map(|w| w.explorer);
+            // A ReBeL walk fixes one explorer for the entire sampled leaf.
             let true_row = np.row(true_ci);
-            let mut chosen_cell = true_row.start + sample_row(rng, &np.probs[true_row.clone()]);
-            if gc.explore > 0.0
-                && player as u64 == (rng.next_u64() & 1)
-                && rng.unit_f64() < gc.explore as f64
-            {
-                if !true_row.is_empty() {
-                    chosen_cell = true_row.start + rng.below(true_row.len());
-                }
-            }
+            let uniform_override =
+                explorer == Some(player) && epsilon > 0.0 && rng.unit_f64() < epsilon as f64;
+            let chosen_cell = true_row.start
+                + if uniform_override {
+                    rng.below(true_row.len())
+                } else {
+                    sample_row(rng, &np.probs[true_row.clone()])
+                };
             let chosen = np.legal_action[chosen_cell] as usize;
 
-            // Bayes update on the *public observation*: several private
-            // actions can produce it, and the belief must sum over all of
-            // them.
+            // ReBeL attaches the reference-policy PBS to an off-policy sampled
+            // branch. For ordinary agents, `np` is already their full behaviour
+            // policy, so this is their ordinary Bayesian posterior too.
             let obs = obs_key(&np.acts[chosen]);
-            let mut pairs: Vec<(Config, f32)> = Vec::new();
+            let mut pairs: Vec<(Config, f32)> = Vec::with_capacity(cfgs.len());
             for (ci, c) in cfgs.iter().enumerate() {
                 for cell in np.row(ci) {
                     let a = np.legal_action[cell] as usize;
@@ -1091,6 +1103,19 @@ impl<'a> Game<'a> {
             }
             bel[player as usize] = Belief::from_pairs(pairs);
             s.apply_inplace(np.acts[chosen]);
+            if uniform_override {
+                // Exploration picked only the public branch. Continue from a
+                // private world drawn from the reference-policy PBS attached
+                // to that branch, as ReBeL's public-belief sampler requires.
+                let b = &bel[player as usize];
+                let c = b.cfg[sample_row(rng, &b.p)];
+                set_config(s, player, ctx, &c);
+                assert_eq!(
+                    true_config(s, player, ctx),
+                    c,
+                    "failed to instantiate the sampled reference config"
+                );
+            }
 
             // Advance the walk along the solved tree. The public observation
             // of the chosen action selects the child; if that child is a leaf
@@ -1161,6 +1186,7 @@ impl<'a> Game<'a> {
         self.walk = Some(Walk {
             tree: WalkState::Gpu(tree),
             slot,
+            explorer: self.pending_explorer,
             node: 0,
             drawn: 0,
             strat: result.strategy,
@@ -1226,6 +1252,7 @@ impl<'a> Game<'a> {
         self.walk = Some(Walk {
             tree: WalkState::Cpu(sv),
             slot,
+            explorer: self.pending_explorer,
             node: 0,
             drawn: 0,
             strat: Vec::new(),
@@ -1424,11 +1451,27 @@ pub(crate) fn effective_bag_count(s: &State, p: u8, unit: u8) -> u8 {
 }
 
 fn sample_row(rng: &mut Rng, row: &[f32]) -> usize {
-    let w: Vec<f64> = row.iter().map(|&x| x.max(0.0) as f64).collect();
-    if w.iter().sum::<f64>() > 0.0 {
-        rng.weighted_index(&w)
+    let total: f64 = row.iter().map(|&x| x.max(0.0) as f64).sum();
+    if total <= 0.0 {
+        return rng.below(row.len().max(1));
+    }
+    let mut needle = rng.unit_f64() * total;
+    for (i, &p) in row.iter().enumerate() {
+        let p = p.max(0.0) as f64;
+        if needle < p {
+            return i;
+        }
+        needle -= p;
+    }
+    row.len() - 1
+}
+
+#[inline]
+fn sample_explorer(rng: &mut Rng, explore: f32) -> u8 {
+    if explore > 0.0 {
+        (rng.next_u64() & 1) as u8
     } else {
-        rng.below(row.len().max(1))
+        0
     }
 }
 

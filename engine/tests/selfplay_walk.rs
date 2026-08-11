@@ -5,7 +5,7 @@
 
 use warchest::rng::Rng;
 use warchest::search::Cfg;
-use warchest::selfplay::{play_game, Agent, Collect, Data, GameCfg};
+use warchest::selfplay::{play_game, Agent, Collect, Data, Game, GameCfg, Step};
 
 fn cfg() -> Cfg {
     Cfg {
@@ -14,6 +14,51 @@ fn cfg() -> Cfg {
         snapshots: false,
         ..Default::default()
     }
+}
+
+/// Exercise the actor-side GPU walk without a CUDA device. The packed solve is
+/// completed with a uniform reference strategy; `resume` must retain the
+/// walk's explorer and the same hidden-state resampling used by the CPU path.
+#[test]
+fn gpu_walk_uses_the_reference_sampler() {
+    let nets = [warchest::search::Nets::default()];
+    let gc = GameCfg {
+        agents: [Agent::Rebel {
+            cfg: cfg(),
+            slot: 0,
+        }; 2],
+        collect: Collect::None,
+        explore: 1.0,
+        random_draft: false,
+        eval_mix: 0.0,
+    };
+    let mut game = Game::new(Rng::new(0x6A50), &gc);
+    let mut resumed = 0;
+    for _ in 0..8 {
+        match game.advance(Some(&[]), &nets) {
+            Step::Ended => break,
+            Step::Submitted => {
+                let job = game.take_job().expect("submitted GPU job");
+                let mut strategy = vec![0.0; job.tables.ncells];
+                for bounds in job.tables.legal_off.windows(2) {
+                    let row = bounds[0] as usize..bounds[1] as usize;
+                    if !row.is_empty() {
+                        strategy[row.clone()].fill(1.0 / row.len() as f32);
+                    }
+                }
+                game.resume(warchest::gpu::SolveResult {
+                    strategy,
+                    root_values: Vec::new(),
+                    carries: warchest::gpu::CarryStore::empty(),
+                    weight_version: 0,
+                    oversize_route: false,
+                    card_exclusive_route: false,
+                });
+                resumed += 1;
+            }
+        }
+    }
+    assert!(resumed >= 2, "the GPU walk did not cross a subgame leaf");
 }
 
 /// Self-play with empty nets: the walk mechanics (build, act on the sampled
