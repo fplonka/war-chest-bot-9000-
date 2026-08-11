@@ -708,18 +708,50 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
         for (int c = lane; c < n; c += 32) out[c] = u * orc;
         return;
     }
+    // The row's projection goes to shared memory once. Both readout paths read
+    // it, and so does the zero-sum shift below, which needs it for the
+    // opponent's configs as well as this player's.
+    __shared__ float readout_smem[(WAVE_BLOCK / 32) * RK];
+    float* us = readout_smem + (threadIdx.x >> 5) * RK;
+    {
+        const float* ur = AP(w, A_U) + (unsigned long long)q.row * RK;
+        for (int j = lane; j < RK; j += 32) us[j] = ur[j] + wt->wu_b[j];
+    }
+    __syncwarp();
+    // Zero-sum projection: half the amount by which the two players'
+    // belief-weighted leaf values fail to cancel. The game is zero-sum, so this
+    // must be zero; nothing in training makes it so, and a constant shared by
+    // both players is copied into both targets and carried by the bootstrap.
+    // Must match `search.rs::readout` and `value_net.py::zero_sum` -- this is
+    // the third implementation of that arithmetic and the one production solves
+    // with. Terminal leaves returned above and need no shift.
+    float delta = 0.0f;
+    for (int qp = 0; qp < 2; qp++) {
+        int nq = nc_of(w, q.node, qp);
+        const float* rq = AP(w, A_REACH) + reach_at(w, q.node, qp, 0);
+        float sq = 0.0f;
+        for (int c = lane; c < nq; c += 32) sq += rq[c];
+        sq = warp_sum(sq);
+        if (sq <= 0.0f) continue;
+        unsigned int qc0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + qp];
+        float acc = 0.0f;
+        for (int c = lane; c < nq; c += 32) {
+            unsigned int cfg = TP(w, unsigned int, T_ROW_CFG)[qc0 + c];
+            const float* g = AP(w, A_G) + (unsigned long long)cfg * (RK + 1);
+            float part = 0.0f;
+            #pragma unroll 8
+            for (int j = 0; j < RK; j++) part += us[j] * g[j];
+            acc += rq[c] * (part + g[RK]);
+        }
+        acc = warp_sum(acc);
+        delta += 0.5f * acc / sq;
+    }
 #if READOUT_LANE
     // One config per lane, not one config per warp. The rank-64 dot used to
     // cost a five-step shuffle reduction *per config*, and a leaf carries
     // fifteen or so, so the warp spent most of its time reducing rather than
-    // multiplying. The row's projection goes to shared memory once and each
-    // lane then walks a whole config on its own. The config table is well
-    // under a megabyte per wave, so the lane-divergent gathers stay in L2.
-    __shared__ float readout_smem[(WAVE_BLOCK / 32) * RK];
-    float* us = readout_smem + (threadIdx.x >> 5) * RK;
-    const float* ur = AP(w, A_U) + (unsigned long long)q.row * RK;
-    for (int j = lane; j < RK; j += 32) us[j] = ur[j] + wt->wu_b[j];
-    __syncwarp();
+    // multiplying. Each lane walks a whole config on its own. The config table
+    // is well under a megabyte per wave, so the gathers stay in L2.
     unsigned int c0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + player];
     for (int base = 0; base < n; base += 32) {
         int c = base + lane;
@@ -729,7 +761,7 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
         float part = 0.0f;
         #pragma unroll 8
         for (int j = 0; j < RK; j++) part += us[j] * g[j];
-        out[c] = (part + g[RK]) * orc;
+        out[c] = (part + g[RK] - delta) * orc;
     }
 #else
     const float* ur = AP(w, A_U) + (unsigned long long)q.row * RK;
@@ -750,7 +782,7 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
             if (j < RK) part += u[k] * g[j];
         }
         part = warp_sum(part);
-        if (lane == 0) out[c] = (part + g[RK]) * orc;
+        if (lane == 0) out[c] = (part + g[RK] - delta) * orc;
     }
 #endif
 }
