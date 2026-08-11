@@ -113,11 +113,8 @@ def main():
         w = np.tile([1.0, 1.0, 0.0], rows).astype(np.float32)
         seg = np.repeat(np.arange(rows), 3) * 2 + np.tile([0, 1, 0], rows)
         inv = torch.arange(len(allphi))
-        # Raw, unprojected: `Mlp::forward` in Rust answers for one config and
-        # has no support to run the zero-sum layer over, so the comparison is
-        # between the networks and not between the leaf evaluators.
         ref = net(tx, tids, torch.as_tensor(allphi), inv, torch.as_tensor(w),
-                  torch.as_tensor(seg), 2 * rows, project=False).numpy()[2::3]
+                  torch.as_tensor(seg), 2 * rows).numpy()[2::3]
 
     got = np.asarray(W.infer(
         np.ascontiguousarray(x.ravel()),
@@ -180,7 +177,7 @@ def main():
         seg2 = np.repeat(np.arange(rows), 3) * 2 + np.tile([0, 1, 0], rows)
         inv2 = torch.arange(len(allphi2))
         ref2 = net2(tx2, tids2, torch.as_tensor(allphi2), inv2, torch.as_tensor(w2),
-                    torch.as_tensor(seg2), 2 * rows, project=False).numpy()[2::3]
+                    torch.as_tensor(seg2), 2 * rows).numpy()[2::3]
     got2 = np.asarray(W.infer(
         np.ascontiguousarray(x2.ravel()),
         np.ascontiguousarray(xbel2.ravel()),
@@ -219,7 +216,7 @@ def main():
         seg3 = np.repeat(np.arange(rows), 3) * 2 + np.tile([0, 1, 0], rows)
         inv3 = torch.arange(len(allphi3))
         ref3 = net3(tx3, tids3, torch.as_tensor(allphi3), inv3, torch.as_tensor(w3),
-                    torch.as_tensor(seg3), 2 * rows, project=False).numpy()[2::3]
+                    torch.as_tensor(seg3), 2 * rows).numpy()[2::3]
     got3 = np.asarray(W.infer(
         np.ascontiguousarray(x3.ravel()),
         np.ascontiguousarray(xbel3.ravel()),
