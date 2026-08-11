@@ -1164,7 +1164,14 @@ impl Mlp {
                     row[0] = p[k];
                     row[1] = p[NSLOT + k];
                     row[2] = p[2 * NSLOT + k];
-                    row[3] = seat;
+                    // Centred. As a raw 0/1 this channel is inert for seat 0
+                    // and active for seat 1, and everything after it is
+                    // rectified before it is summed, so the asymmetry cannot
+                    // cancel -- it lands in the readout's per-config bias term
+                    // as a constant that differs by seat. That is a common-mode
+                    // offset in a value that must be antisymmetric. Must match
+                    // `value_net.py::holdings`.
+                    row[3] = seat - 0.5;
                     let t = seat as usize * NSLOT + k;
                     row[4..].copy_from_slice(&e[t * de..(t + 1) * de]);
                 }
