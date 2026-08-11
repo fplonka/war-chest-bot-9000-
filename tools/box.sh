@@ -73,17 +73,15 @@ tail)
     ;;
 follow)
     # A run writes its report.html when it ends, so poll: pull whatever exists,
-    # print where the experiment has got to, and stop once exp.py is gone. One
+    # print where the work has got to, and stop when its process is gone. One
     # ssh a minute costs nothing against runs measured in tens of minutes, and
     # tailing instead would hold a connection open for hours to learn the same
     # thing.
-    exp=${2:?usage: follow <experiment>}
-    # `[e]xp` so the pattern does not match the shell that carries it: pgrep -f
-    # reads every command line including its own caller's, and a bracket the
-    # regex never matches is what keeps this from following itself forever.
-    while "$0" pull >/dev/null && run_remote "pgrep -f '[e]xp.py run $exp'" >/dev/null; do
+    tag=${2:?usage: follow <tag>}
+    while "$0" pull >/dev/null \
+        && run_remote "kill -0 \$(cat /workspace/logs/$tag.pid) 2>/dev/null" >/dev/null 2>&1; do
         # The box's login files greet every ssh, so keep the last line only.
-        run_remote "tail -1 /workspace/logs/$exp.log" | tail -1
+        run_remote "tail -1 /workspace/logs/$tag.log" | tail -1
         sleep "${WARCHEST_BOX_POLL:-60}"
     done
     "$0" pull
@@ -93,17 +91,18 @@ go)
     shift 2
     "$0" sync
     "$0" build
-    run_remote "mkdir -p /workspace/logs
-nohup setsid bash -lc $(printf '%q' "$prelude
-python train/exp.py run $exp $*") >/workspace/logs/$exp.log 2>&1 &
-echo started $exp"
+    "$0" -bg "$exp" "python train/exp.py run $exp $*"
     "$0" follow "$exp"
     ;;
 -bg)
+    # The job records its own pid, which is what `follow` waits on. `setsid`
+    # would otherwise have exited by the time anyone looked, and matching the
+    # command line instead only works for jobs whose tag appears in it.
     tag=${2:?usage: -bg <tag> <command...>}
     shift 2
     run_remote "mkdir -p /workspace/logs
 nohup setsid bash -lc $(printf '%q' "$prelude
+echo \$\$ > /workspace/logs/$tag.pid
 $*") >/workspace/logs/$tag.log 2>&1 &
 echo started $tag"
     ;;
