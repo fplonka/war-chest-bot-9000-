@@ -144,19 +144,27 @@ EXPERIMENTS = {
     # staler, which is the cost and is what `diagnose.py` measures.
     "cap":      [{"minutes": 60}, {"minutes": 60, "cap": 8_000_000},
                  {"minutes": 60, "cap": 24_000_000}],
-    # Every arm gets the same 20 minutes, and only the split between greedy
-    # warm-up and ReBeL moves. That is the question we actually decide: warm
-    # time is time not spent on ReBeL. 5 minutes is 25% of this budget, and the
-    # logs say the useful part of it is over in 30 seconds. But a 30-second warm
-    # phase gave a bootstrap runaway in a smoke run -- target mean drifting
-    # +0.22 -> +0.28 with the spread pinned at 0.09 -- so there is a floor as
-    # well as a ceiling. Zero is not an arm: a 1.2-minute CPU run with no warm
-    # phase put every game into the horizon (`horizon=1.00`) and drove the
-    # prediction spread to 0.036, near the abort threshold. It would spend a
-    # slot to reproduce a known failure.
-    "warm":     [{"minutes": 20}, {"minutes": 20, "warm_minutes": 2},
-                 {"minutes": 20, "warm_minutes": 1},
-                 {"minutes": 20, "warm_minutes": 0.5}],
+    # Every arm gets the same 15 minutes of ReBeL. Only the greedy warm-up
+    # before it moves, so the totals differ: 20, 17, 16, 15.5. This asks the
+    # question directly -- with the ReBeL phase held fixed, does a longer
+    # warm-up produce a stronger network at all? If 1 minute matches 5, the
+    # extra 4 minutes are free to cut. If 5 wins, the win is what it costs.
+    #
+    # Holding the *total* fixed instead conflates two effects: a longer warm-up
+    # both changes the starting network and takes time away from ReBeL. That
+    # design cannot say which one moved the result.
+    #
+    # The logs already narrow the range. In `runs/base4h` and `runs/gpu_golden8`
+    # the warm loss falls 0.078 -> 0.018 in the first 30 seconds and is flat
+    # until minute 3.5; from 3.5 to 5.0 it keeps falling while `probe_std`
+    # collapses 0.46 -> 0.375, so the last 1.5 minutes fit the handcrafted
+    # evaluation better and make the network less expressive. But zero fails: a
+    # CPU run with no warm-up put every game into the horizon and drove the
+    # spread to 0.036, near the abort threshold.
+    "warm":     [{"minutes": 20, "warm_minutes": 5},
+                 {"minutes": 17, "warm_minutes": 2},
+                 {"minutes": 16, "warm_minutes": 1},
+                 {"minutes": 15.5, "warm_minutes": 0.5}],
     # Does a short run rank changes the way a long one does? If it does, every
     # experiment above costs a quarter of what it costs today. Run this first.
     "cadence":  [{"minutes": 15}, {"minutes": 15, "cfr": "dcfr"},
