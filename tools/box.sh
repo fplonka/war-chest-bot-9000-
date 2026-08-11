@@ -24,7 +24,11 @@ remote=${WARCHEST_BOX_DIR:-/workspace/warchest-v5}
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 
 ssh_opts=(-i "$key" -p "$port" -o StrictHostKeyChecking=no -o ServerAliveInterval=30)
+# jemalloc is worth ~4% of generation throughput (docs/GPU_ARCHITECTURE.md);
+# glibc malloc is what the 36 builder threads contend on. mimalloc was tried
+# and exhausts the static TLS block, after which torch cannot load libgomp.
 prelude="export PATH=/root/.cargo/bin:/usr/local/cuda/bin:\$PATH
+export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
 source /venv/main/bin/activate 2>/dev/null || true
 cd $remote"
 

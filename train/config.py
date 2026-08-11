@@ -65,9 +65,6 @@ class Cfg:
     cap: int = 2_000_000
     cfgs_per_row: int = 48
     no_augment: bool = False
-    # Project every solve's targets onto the zero-sum constraint the game
-    # actually obeys. See train.py::zero_sum.
-    symmetrize: bool = False
 
     # --------------------------------------------------------------- search
     # depth 1 puts zero opponent decision nodes in the subgame, which reduces
@@ -129,9 +126,6 @@ BASELINE = Cfg()
 EXPERIMENTS = {
     "dcfr":     [{}, {"cfr": "dcfr"}],
     "aux":      [{}, {"aux": 0.3}],
-    # The largest structured error we have found: the value function is not
-    # zero-sum, by ~8% of the value signal and a third of the network's error.
-    "symmetrize": [{"minutes": 30}, {"minutes": 30, "symmetrize": True}],
     "policy":   [{}, {"policy": 0.3}],
     # Solve quality per unit time, not per solve. `runs/solvererr_g8` puts dcfr
     # at T=32 slightly ahead of linear at T=64, and dcfr at T=16 still 50x

@@ -125,12 +125,10 @@ class Buffer:
         self.cfgs = 0   # configs ever written
         self.lo = 0     # oldest row whose configs are still in the arena
 
-    def add(self, x, cc, cw, cy, coff, soff, symmetrize=False):
+    def add(self, x, cc, cw, cy, coff, soff):
         n = len(x)
         lens = np.diff(coff).reshape(n, 2)
         cp = np.repeat(np.tile([0, 1], n).astype(np.uint8), lens.ravel())
-        if symmetrize:
-            cy = zero_sum(cw, cy, coff, n)
         starts = self.cfgs + coff[:-1:2]
         base = self.rows
         for i in range(0, n, 4096):
@@ -220,37 +218,6 @@ class Buffer:
         random split leaks. Splitting by recency does not.
         """
         return self.gather(np.arange(self.lo, self.rows))
-
-
-def zero_sum(cw, cy, coff, n):
-    """Project a solve's targets onto the zero-sum constraint.
-
-    War Chest is zero-sum, so a position's value to one player is minus its
-    value to the other: with `cw` a normalised belief, the two belief-weighted
-    root values must sum to zero. They do not. Over 11,188 positions from 40
-    games the sum is +0.025 on average and 0.032 in absolute value, against a
-    value spread of 0.416 -- about 8% of the signal, and a third of the
-    network's own error of 0.099 (`runs/solvererr_g8`).
-
-    Nothing in the loop ever asked for this. The mirror augmentation swaps the
-    seats but relates two *different* positions, which is equivariance; this is
-    a constraint between the two players at one position. And it is
-    self-reinforcing, because the leaves of every solve are the same network, so
-    a violation at the leaves comes back as a violation in the target.
-
-    Subtracting half the violation from every config of both players restores
-    it. The constraint is one linear equation per row, the antisymmetric
-    subspace contains the truth, so this cannot increase error -- and it shifts
-    a position's value *level* without touching how the network tells that
-    position's configs apart.
-    """
-    # In float32: the caller has already cast to float16, and reducing ~20
-    # terms in half precision would put noise into the correction itself.
-    w = cw.astype(np.float32)
-    v = np.add.reduceat(w * cy.astype(np.float32), coff[:-1]) / np.maximum(
-        np.add.reduceat(w, coff[:-1]), 1e-9)
-    half = 0.5 * (v[0::2] + v[1::2])
-    return cy - np.repeat(np.repeat(half, 2), np.diff(coff)).astype(cy.dtype)
 
 
 def make_batch(parts, rng, device, augment):
@@ -815,8 +782,7 @@ def main():
                     window["conv_s"] += time.time() - tc
                     ta = time.time()
                     if len(rows) > 0:
-                        buf.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff,
-                                args.symmetrize)
+                        buf.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
                     window["add_s"] += time.time() - ta
                     rebel_solves += solves
                     window["solves"] += solves
@@ -1027,8 +993,7 @@ def main():
         sps = rebel_solves / max(time.time() - rebel_t0, 1e-9) if rebel_t0 else 0.0
         conv_s = time.time() - tr
         tr = time.time()
-        buf.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff,
-                args.symmetrize)
+        buf.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
         add_s = time.time() - tr
         # A frozen batch from the warm phase. If the network's spread on it
         # collapses, the value function has gone degenerate -- the failure mode
