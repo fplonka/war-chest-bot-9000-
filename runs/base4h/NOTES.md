@@ -22,10 +22,39 @@ climbs steadily for the first ~100 minutes and then stops:
 |---|---:|---:|---:|---:|---:|---:|---:|
 | target spread | 0.22 | 0.36 | 0.52 | 0.58 | 0.59 | 0.60 | 0.60 |
 
-The last 140 minutes moved it by 0.02. Whether *strength* plateaus with it is
-the question the ladder answers, and that is still running as this is written —
-target spread growing is not the same thing as playing better, and the two
-coming apart would itself be the finding.
+The last 140 minutes moved it by 0.02.
+
+A spread is not progress on its own, so the better measure is the network's
+error *relative* to it — RMS over target spread, both straight from the training
+log, no games and no noise:
+
+| minutes | 30–60 | 60–100 | 100–140 | 140–180 | 180–210 | 210–240 |
+|---|---:|---:|---:|---:|---:|---:|
+| error / spread | 0.239 | 0.204 | 0.195 | 0.193 | 0.187 | 0.189 |
+
+Same story, and it is the honest one: the network stops improving against its
+own targets after about 100 minutes. Whether *strength* plateaus with it is a
+separate question and the ladder is still running as this is written. One result
+from an aborted earlier ladder says the earlier part of the run was real
+improvement: s1 (34 min) scores **0.202** against s3 (93 min), so s3 is far
+stronger. It is the back half that is in question.
+
+**What the plateau level implies.** An error of 0.19 of the spread means the
+network already accounts for about 96% of the variance in its own targets. A
+network that fits its targets that well is not the binding constraint — the
+targets are. Which puts the two findings from `runs/solvererr_g8` in a different
+light: CFR iteration count contributes a bias of 0.00025, nothing at all, while
+the network's failure to be antisymmetric is 0.045 against a value spread of
+0.354, or about 13%. That is two thirds the size of the network's entire
+remaining error, and unlike the rest of the error it is *structured* — a known
+constraint the values violate in a measurable, correctable way. If the run is
+target-limited rather than fit-limited, that is where the next real gain is.
+
+**And the buffer is not stale.** Rows that have been in the buffer longest are
+fit as well as the newest ones (`loss_old / loss_new` sits between 0.77 and 1.12
+for the whole run, mostly *below* 1). So drift over the buffer's 7.7-minute
+window costs nothing measurable, which is what makes enlarging it a cheap bet
+rather than a trade — though 7.7 minutes of no drift says nothing about 60.
 
 **Throughput halves over the run.** Instantaneous solves per second, computed
 from the cumulative counter rather than the run's own (cumulative, and therefore
