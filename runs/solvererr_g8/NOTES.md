@@ -215,6 +215,33 @@ Terminal leaves cannot express this mode -- they store one number and negate it
 -- which is why the terminal-only solver oracles come out at +-0.0000 and why
 the violation appears only where network leaves do.
 
+**Where it comes from, and two of my errors.** Traced through `runs/base30`'s
+snapshots, the constant is +0.0028 at the end of the warm phase and +0.0168 at
+the first ReBeL snapshot. The warm phase leaves it near zero, which is expected
+because warm targets are exactly antisymmetric; bootstrapping creates it. In the
+dump the offset sits in the configs the belief thinks are *likely*: +0.038 in
+the top belief decile against -0.016 in the bottom half. The targets carry
++0.046 while the network carries +0.037.
+
+I proposed that CFR's regret matching selects positive leaf errors for both
+players at once -- a maximisation bias, as in Q-learning overestimation. An
+adversarial review found two errors in that argument:
+
+* **A unit mistake.** I compared the target offset `v_0 + v_1` against the
+  network's `b`, but `b` contributes `2b`. The honest comparison over the first
+  90 seconds is targets +0.004 -> +0.069 against network +0.006 -> +0.034. The
+  targets do run ahead, by less than I claimed.
+* **My own data contradicts it.** If regret matching selected errors, more CFR
+  iterations would mean more selection and a larger violation. The sweep in this
+  very file shows `|v_0 + v_1|` **flat at 0.0415 from T=4 through T=512**. That
+  is direct counterevidence, and I had the number in hand.
+
+Slow amplification across many bootstrap rounds is not ruled out. The clean test
+is to freeze positions and a checkpoint, measure signed `v_0 + v_1` from iterate
+zero upward, and cross-evaluate the selected strategy with an *independent*
+checkpoint: if same-network evaluation is positive for both players and
+cross-evaluation makes it vanish, that is a winner's curse. Not yet run.
+
 **It fixed initialisation and nothing else.** `runs/base30` trained 30 minutes
 with the centred bit. On the same 11,188 positions its violation is mean +0.037
 and mean absolute 0.043, against +0.025 and 0.032 for the uncentred
@@ -237,6 +264,33 @@ Nothing cross-checks those three. There *is* a check that would have caught it,
 added to `Cfg`: one missing field in `TEST_CFG`. With that field restored the
 oracle passes and the three encodings agree. Any future change to the config
 feature layout must touch all three files and run that test.
+
+**The fix, and it is established practice.** DeepStack's counterfactual-value
+network range-weights both output vectors and subtracts half their aggregate
+zero-sum error in a differentiable outer layer, which the paper states
+guarantees zero-sum before values enter search. ReBeL's released code has an
+ordinary linear output and elementwise Huber, so it carries no such guarantee
+either -- this is a gap in the method as published, not only here.
+
+The elegant statement of it. With `m_p` the belief-weighted mean of player p's
+raw values:
+
+    a_p(c) = r_p(c) - m_p        each player's advantages, belief-zero-mean
+    q      = (m_0 - m_1) / 2     one legitimate antisymmetric game value
+    v_0 = a_0 + q                v_1 = a_1 - q
+
+Keep every within-player value difference. Keep one game value. Delete exactly
+one scalar that cannot exist in a zero-sum game. Nothing that should be free is
+constrained.
+
+It has to be the effective output of *both* training and search, not a
+projection applied to stored targets: `Mlp.forward` using `w` and `seg`, the CPU
+and CUDA leaf paths using the normalised reaches already computed for the belief
+embedding, and subtracted before `readout` multiplies by the opponent's
+unnormalised reach. Terminal leaves are left alone, being exactly zero-sum
+already. One more thing to revisit with it: per-config target clipping to
+[-1, 1] can reintroduce a belief-weighted sum error after the solver has
+produced a zero-sum target.
 
 **The fix, stated correctly.** An earlier draft of this note said to subtract
 half the violation from both players' values, which glosses over the structure:
