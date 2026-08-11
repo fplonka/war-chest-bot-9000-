@@ -1,0 +1,216 @@
+{
+ "runs": [
+  "runs/projection-base-s1",
+  "runs/projection-base-s2",
+  "runs/projection-zero_sumFalse-s1",
+  "runs/projection-zero_sumFalse-s2"
+ ],
+ "games_per_pair": 200,
+ "focus_games": 400,
+ "focus": [
+  "projection-base-s1.final",
+  "projection-base-s2.final",
+  "projection-zero_sumFalse-s1.final",
+  "projection-zero_sumFalse-s2.final"
+ ],
+ "truth_set": null,
+ "players": [
+  {
+   "name": "greedy",
+   "t": null,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0,
+    "zero_sum": true
+   },
+   "elo": 0.0,
+   "se": 43.3,
+   "truth": null,
+   "score": 0.037
+  },
+  {
+   "name": "projection-base-s1.final",
+   "t": 1500.0,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0,
+    "zero_sum": true
+   },
+   "elo": 583.5,
+   "se": 10.1,
+   "truth": null,
+   "score": 0.604
+  },
+  {
+   "name": "projection-base-s2.final",
+   "t": 1500.0,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0,
+    "zero_sum": true
+   },
+   "elo": 533.3,
+   "se": 10.0,
+   "truth": null,
+   "score": 0.515
+  },
+  {
+   "name": "projection-zero_sumFalse-s1.final",
+   "t": 1500.0,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0,
+    "zero_sum": true
+   },
+   "elo": 553.3,
+   "se": 10.0,
+   "truth": null,
+   "score": 0.551
+  },
+  {
+   "name": "projection-zero_sumFalse-s2.final",
+   "t": 1501.1,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0,
+    "zero_sum": true
+   },
+   "elo": 509.2,
+   "se": 10.1,
+   "truth": null,
+   "score": 0.472
+  }
+ ],
+ "pairs": [
+  {
+   "a": "greedy",
+   "b": "projection-base-s1.final",
+   "w": 1,
+   "l": 95,
+   "d": 4,
+   "n": 100,
+   "planned": 200,
+   "sprt": "H0",
+   "llr": -54.3,
+   "score": 0.03
+  },
+  {
+   "a": "greedy",
+   "b": "projection-base-s2.final",
+   "w": 3,
+   "l": 93,
+   "d": 4,
+   "n": 100,
+   "planned": 200,
+   "sprt": "H0",
+   "llr": -26.51,
+   "score": 0.05
+  },
+  {
+   "a": "greedy",
+   "b": "projection-zero_sumFalse-s1.final",
+   "w": 1,
+   "l": 94,
+   "d": 5,
+   "n": 100,
+   "planned": 200,
+   "sprt": "H0",
+   "llr": -48.25,
+   "score": 0.035
+  },
+  {
+   "a": "greedy",
+   "b": "projection-zero_sumFalse-s2.final",
+   "w": 1,
+   "l": 94,
+   "d": 5,
+   "n": 100,
+   "planned": 200,
+   "sprt": "H0",
+   "llr": -48.25,
+   "score": 0.035
+  },
+  {
+   "a": "projection-base-s1.final",
+   "b": "projection-base-s2.final",
+   "w": 197,
+   "l": 147,
+   "d": 56,
+   "n": 400,
+   "planned": 400,
+   "sprt": null,
+   "llr": 2.11,
+   "score": 0.562
+  },
+  {
+   "a": "projection-base-s1.final",
+   "b": "projection-zero_sumFalse-s1.final",
+   "w": 200,
+   "l": 141,
+   "d": 59,
+   "n": 400,
+   "planned": 400,
+   "sprt": null,
+   "llr": 2.62,
+   "score": 0.574
+  },
+  {
+   "a": "projection-base-s1.final",
+   "b": "projection-zero_sumFalse-s2.final",
+   "w": 209,
+   "l": 141,
+   "d": 50,
+   "n": 400,
+   "planned": 400,
+   "sprt": "H1",
+   "llr": 3.03,
+   "score": 0.585
+  },
+  {
+   "a": "projection-base-s2.final",
+   "b": "projection-zero_sumFalse-s1.final",
+   "w": 149,
+   "l": 196,
+   "d": 55,
+   "n": 400,
+   "planned": 400,
+   "sprt": null,
+   "llr": -2.83,
+   "score": 0.441
+  },
+  {
+   "a": "projection-base-s2.final",
+   "b": "projection-zero_sumFalse-s2.final",
+   "w": 193,
+   "l": 147,
+   "d": 60,
+   "n": 400,
+   "planned": 400,
+   "sprt": null,
+   "llr": 1.93,
+   "score": 0.557
+  },
+  {
+   "a": "projection-zero_sumFalse-s1.final",
+   "b": "projection-zero_sumFalse-s2.final",
+   "w": 202,
+   "l": 151,
+   "d": 47,
+   "n": 400,
+   "planned": 400,
+   "sprt": null,
+   "llr": 2.11,
+   "score": 0.564
+  }
+ ]
+}
