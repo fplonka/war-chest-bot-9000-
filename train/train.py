@@ -733,7 +733,11 @@ def main():
                 "deadline_remaining": round(max(0.0, deadline - now), 1),
             }
             log.append(rec)
-            check_alive(args, rec, log[-2] if len(log) > 1 else None)
+            # Not while draining: admission has stopped on purpose, so zero
+            # solves in the last epoch is the run ending correctly, and killing
+            # it here loses the buffer dump the run exists to produce.
+            if not stopping:
+                check_alive(args, rec, log[-2] if len(log) > 1 else None)
             write_log(args, log, snaps)
             print(
                 f"[t={rec['t']:6.1f}s] rebel stream solves={rebel_solves} "
