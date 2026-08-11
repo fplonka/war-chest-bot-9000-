@@ -107,10 +107,28 @@ and correctly says it is a property of the network rather than a bug in the
 solver. What was missing was its size relative to the signal, which is what
 makes it worth acting on rather than noting.
 
-**Why it is self-reinforcing.** The targets are root values of solves whose
-leaves are this same network, so a network that is not antisymmetric produces
-targets that are not antisymmetric, and trains on them. Nothing in the loop
-pushes back. Worth stating because the obvious candidate is not the culprit:
+**Where it comes from: nowhere, which is the point.** Measured directly as the
+network's own belief-weighted `v_0 + v_1` on the probe positions, for a randomly
+initialised network and for a trained one:
+
+| network | mean | mean abs | std |
+|---|---:|---:|---:|
+| untrained | -0.052 | 0.052 | **0.018** |
+| trained 30 min | +0.052 | 0.058 | **0.044** |
+
+Training does not cause the violation and does not cure it — a random network is
+off by the same amount, and it even flipped sign. That is what an unconstrained
+quantity looks like: nothing forces two independent outputs to negate at
+initialisation, and no term in the loss asks for it afterwards, so it drifts.
+
+But the split matters more than the magnitude. A constant offset added to both
+players changes nobody's best response and is harmless. The *state-dependent*
+part does change play, because it inflates some positions relative to others.
+That is the part training makes **2.4x worse**, 0.018 to 0.044, and the part the
+projection removes.
+
+The targets are also root values of solves whose leaves are this same network,
+so the violation feeds forward into what the network is then trained on. Worth stating because the obvious candidate is not the culprit:
 the 180-degree mirror augmentation was *on* for `runs/base4h`, and it cannot fix
 this. Mirroring maps a position to a different position with the seats
 exchanged, which asks the network for equivariance between two states. This is a
