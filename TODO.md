@@ -29,32 +29,33 @@
       ranks every checkpoint under one cheap search. Whether the ranking
       survives is being measured; whether it is faster depends on the same
       question as below, since a solve may not be iteration-bound at all.
-- [ ] **Recover the ~25% throughput lost since `gpu_golden8`.** Instantaneous
-      solves/s by minute into the ReBeL phase:
+- [ ] **Understand the long-run throughput fall.** Not a code regression: the
+      golden8-era commit `0192e4a`, rebuilt and rerun on the clean box, shows
+      the same curve as HEAD. An earlier entry here claimed a ~25% regression;
+      that was wrong, and it came from comparing golden8's 25 minutes against
+      `base4h`'s 4-hour average. At equal age they agree (ReBeL minutes 15-25:
+      golden8 ~1200-1380, base4h 1022).
 
-      | min | golden8 | base4h |
-      |---|---:|---:|
-      | 0-2 | 1399 | 1403 |
-      | 5-10 | 1187 | 805 |
-      | 10-15 | 1359 | 924 |
-      | 15-20 | 1378 | 1010 |
+      The curve is a dip and a recovery, then a slow fall over hours:
+      minute 0-1 runs unthrottled (~2300/s) because the trainer has no debt
+      yet; minutes 1-4 collapse (203/s) because almost no games have *finished*
+      -- `games` per epoch is 0 or 1 and nothing has recycled; minutes 4-8
+      recover to 1331/s as games complete (11 -> 42 -> 102 -> 192). Only after
+      ~25 minutes does the slow fall start, which is why golden8 never saw it.
 
-      golden8 has **no decay** — it wanders between 1119 and 1549 with no trend.
-      So the fall is a regression, not the workload getting heavier, and the
-      theory that subgames grow over a run is contradicted by golden8's own
-      numbers: configs per decision fall 29.6 -> 15.9 and rows per solve are
-      flat at 7.85. Solves get *cheaper*. `tgt_std` tracks solves rather than
-      wall clock, so this is ~25% of the progress of every run.
+      The lead is tree size, not belief support. Configs per decision *fall*
+      (29.6 -> 15.9) as reserves drain, but `node_caps` -- subgames hitting the
+      200k node ceiling -- rises from 75 to 236 per epoch over `base4h` while
+      golden8 stays in 14-152 for its whole life. Better play means longer games
+      and more midgame positions with many legal actions. `gpu_wait_s` falling
+      from 239 to ~50 agrees: the workers wait less on the card, so the limit
+      moved onto the host, which is where trees are built.
 
-      Read and cleared so far, all in the `0192e4a..7ca856b` window: the
-      generation launch is byte-identical; the wave env block matches what are
-      now the Rust defaults; `net.rs` lost only checkpoint *loading* code (the
-      v1 path); `keep_states` is behind a branch and off in production;
-      `encode` actually lost a branch. `selfplay.rs` lost only `mc_mix`. None of
-      it is in a hot loop.
+      Next: instrument nodes per solve directly (the epoch record has
+      `node_caps` and `oversize_routes` but no node count), and check whether
+      the node cap is being hit often enough to distort the search as well as
+      slow it.
 
-      An A/B is running: `0192e4a` in `/workspace/warchest-old` against HEAD,
-      same box, same jemalloc, 9 minutes each.
 - [ ] **Make the value network antisymmetric.** `v_0 + v_1` is +0.025 mean and
       0.032 absolute against a 0.416 value spread — 8% of the signal, a third of
       the network's own error, and ~130x the target bias from stopping CFR at
