@@ -150,10 +150,13 @@ EXPERIMENTS = {
     # logs say the useful part of it is over in 30 seconds. But a 30-second warm
     # phase gave a bootstrap runaway in a smoke run -- target mean drifting
     # +0.22 -> +0.28 with the spread pinned at 0.09 -- so there is a floor as
-    # well as a ceiling. The zero arm tests whether the floor exists at all.
+    # well as a ceiling. Zero is not an arm: a 1.2-minute CPU run with no warm
+    # phase put every game into the horizon (`horizon=1.00`) and drove the
+    # prediction spread to 0.036, near the abort threshold. It would spend a
+    # slot to reproduce a known failure.
     "warm":     [{"minutes": 20}, {"minutes": 20, "warm_minutes": 2},
                  {"minutes": 20, "warm_minutes": 1},
-                 {"minutes": 20, "warm_minutes": 0}],
+                 {"minutes": 20, "warm_minutes": 0.5}],
     # Does a short run rank changes the way a long one does? If it does, every
     # experiment above costs a quarter of what it costs today. Run this first.
     "cadence":  [{"minutes": 15}, {"minutes": 15, "cfr": "dcfr"},
