@@ -39,6 +39,20 @@
       T=64. It is the network rather than the solve, and a random network is off
       by the same amount. `train.py::zero_sum` projects it out of the targets;
       whether that buys strength is untested. See `runs/solvererr_g8/NOTES.md`.
+- [ ] **Does `symmetrize` fix the problem or hide it?** Forcing the two values to
+      sum to zero is only right if the error is shared. If instead one seat's
+      value is simply wrong, splitting the difference *moves half the error onto
+      the seat that was correct* and the total stays put. Worse, it destroys the
+      instrument: once the projection runs, `v_0 + v_1` is zero by construction
+      and can no longer tell us anything. Three things to do before trusting it:
+      (a) keep measuring the violation on the *raw* network, never on projected
+      targets, so the diagnostic survives; (b) check whether the two seats'
+      errors against a fixed reference are equal and opposite (shared) or
+      one-sided (masked) — the 40-game numbers say +0.003/-0.003, which looks
+      shared, but that is one checkpoint; (c) compare against enforcing it in
+      `readout` instead, which fixes the leaves the search actually uses rather
+      than only the labels. If `symmetrize` wins on Elo but the raw violation is
+      unchanged, it is masking rather than fixing.
 - [ ] Re-run the `dcfr` / `aux` / `policy` experiments through `exp.py`. The
       2026-08-06 `arch_*` results are **not** evidence: three arms inside
       ±20 Elo at 100 games per pairing, which resolves nothing finer than ~70.
