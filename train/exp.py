@@ -103,7 +103,9 @@ def cmd_run(args):
     train_min = sum(c.minutes for _, c in todo)
     # Per run: its snapshots plus `init`. Played pairings are the within-run
     # chains, everyone against Greedy, and the finals against each other.
-    n, per = len(todo), config.BASELINE.snapshots + 1
+    n = len(todo)
+    per = (config.BASELINE.snapshots + 1 if args.labels == "all"
+           else len(args.labels.split(",")))
     k = n * per + 1
     played = n * (per * (per - 1) // 2) + (k - 1) + n * (n - 1) // 2
     ladder_games = (played - n * (n - 1) // 2) * args.games \
