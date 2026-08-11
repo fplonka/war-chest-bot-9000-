@@ -84,9 +84,26 @@
       leaves untouched;
       (b) enforce it in `Solver::readout`, where the search reads the leaves,
       which is where the loop closes.
-      Do not re-add either until the root cause is understood. Keep measuring
-      the violation on the raw network, never on projected targets, or the
-      instrument is gone.
+
+      **(b) was written and reverted.** In torch and the CPU solver it works and
+      is verified: the violation on `base30`'s checkpoint goes +0.037 -> exactly
+      0.000 over 11,188 positions with no retraining, and `solvererr`'s
+      `|v_0+v_1|` goes 0.0415 -> 0.00000 at every T from 4 to 512 under all five
+      regret rules. The CUDA kernel is the blocker: `gpu::tests::full_wave_oracle`
+      fails on *strategy* by 3x tolerance, so the CPU and CUDA projections are
+      not the same function. Shipping the two that work without the third would
+      recreate the seat-bit bug exactly -- trainer and solver disagreeing about
+      what the network computes.
+
+      What I did not understand well enough to get right: the wave executor
+      caches the opponent reach mass in `A_VALS` for player 0 and in
+      `A_SNAP_REACH` for player 1 (`wave_kernels.cu:539`), the readout then
+      overwrites the slot it read that cache from, and `A_SNAP_REACH` doubles as
+      reach storage in snapshot passes. A correct projection has to respect all
+      three conventions. The reverted code is at `b6495e6`, `e73951f`, `23fcb98`.
+
+      Keep measuring the violation on the raw network, never on projected
+      targets, or the instrument is gone.
 
 - [ ] **Depth, not iterations, is the search lever.** `solvererr ... 1` solves
       each position one ply deeper and reports how far the answer moves. On
