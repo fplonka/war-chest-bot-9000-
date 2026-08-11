@@ -28,7 +28,13 @@ from dataclasses import dataclass, replace
 class Cfg:
     # ------------------------------------------------------------- schedule
     minutes: float = 60.0
-    warm_minutes: float = 5.0      # absolute; the warm phase's data is discarded
+    # The greedy warm phase, in minutes. Its data is discarded at the handover.
+    # In both `runs/base4h` and `runs/gpu_golden8` the warm loss falls from
+    # 0.078 to 0.018 in the first 30 seconds, sits flat until minute 3.5, and
+    # then keeps falling while `probe_std` collapses 0.46 -> 0.375. The last
+    # ~1.5 minutes fit the handcrafted evaluation better and make the network
+    # less expressive. See the `warm` experiment.
+    warm_minutes: float = 5.0
     warm_frac: float = 0.2         # used only when warm_minutes < 0
     snapshots: int = 3             # evenly spaced over the ReBeL phase, last at the end
     init: str = ""                 # optional checkpoint to start from
@@ -138,6 +144,13 @@ EXPERIMENTS = {
     # staler, which is the cost and is what `diagnose.py` measures.
     "cap":      [{"minutes": 60}, {"minutes": 60, "cap": 8_000_000},
                  {"minutes": 60, "cap": 24_000_000}],
+    # 5 minutes of greedy warm-up is 17% of a 30-minute run, and the logs say
+    # the useful part is over in 30 seconds. But a 30-second warm phase gave a
+    # bootstrap runaway in a smoke run -- target mean drifting +0.22 -> +0.28
+    # with the spread pinned at 0.09 -- so there is a floor as well as a
+    # ceiling. This looks for the middle.
+    "warm":     [{"minutes": 30}, {"minutes": 30, "warm_minutes": 2},
+                 {"minutes": 30, "warm_minutes": 1}],
     # Does a short run rank changes the way a long one does? If it does, every
     # experiment above costs a quarter of what it costs today. Run this first.
     "cadence":  [{"minutes": 15}, {"minutes": 15, "cfr": "dcfr"},
