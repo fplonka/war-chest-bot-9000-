@@ -725,33 +725,27 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
     // Must match `search.rs::readout` and `value_net.py::zero_sum` -- this is
     // the third implementation of that arithmetic and the one production solves
     // with. Terminal leaves returned above and need no shift.
-    // Only the *opponent's* mean needs its own pass over configs. This
-    // player's raw values are written to `out` by the readout below, which
-    // accumulates its own weighted sum on the way, so the dot products are
-    // paid once rather than twice.
-    float opp_mean = 0.0f;
-    {
-        int nq = nc_of(w, q.node, opp);
-        const float* rq = AP(w, A_REACH) + reach_at(w, q.node, opp, 0);
+    float delta = 0.0f;
+    for (int qp = 0; qp < 2; qp++) {
+        int nq = nc_of(w, q.node, qp);
+        const float* rq = AP(w, A_REACH) + reach_at(w, q.node, qp, 0);
         float sq = 0.0f;
         for (int c = lane; c < nq; c += 32) sq += rq[c];
         sq = warp_sum(sq);
-        if (sq > 0.0f) {
-            unsigned int qc0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + opp];
-            float acc = 0.0f;
-            for (int c = lane; c < nq; c += 32) {
-                unsigned int cfg = TP(w, unsigned int, T_ROW_CFG)[qc0 + c];
-                const float* g = AP(w, A_G) + (unsigned long long)cfg * (RK + 1);
-                float part = 0.0f;
-                #pragma unroll 8
-                for (int j = 0; j < RK; j++) part += us[j] * g[j];
-                acc += rq[c] * (part + g[RK]);
-            }
-            opp_mean = warp_sum(acc) / sq;
+        if (sq <= 0.0f) continue;
+        unsigned int qc0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + qp];
+        float acc = 0.0f;
+        for (int c = lane; c < nq; c += 32) {
+            unsigned int cfg = TP(w, unsigned int, T_ROW_CFG)[qc0 + c];
+            const float* g = AP(w, A_G) + (unsigned long long)cfg * (RK + 1);
+            float part = 0.0f;
+            #pragma unroll 8
+            for (int j = 0; j < RK; j++) part += us[j] * g[j];
+            acc += rq[c] * (part + g[RK]);
         }
+        acc = warp_sum(acc);
+        delta += 0.5f * acc / sq;
     }
-    const float* rp = AP(w, A_REACH) + reach_at(w, q.node, player, 0);
-    float own_s = 0.0f, own_a = 0.0f;
 #if READOUT_LANE
     // One config per lane, not one config per warp. The rank-64 dot used to
     // cost a five-step shuffle reduction *per config*, and a leaf carries
@@ -767,15 +761,7 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
         float part = 0.0f;
         #pragma unroll 8
         for (int j = 0; j < RK; j++) part += us[j] * g[j];
-        float raw = part + g[RK];
-        out[c] = raw;                 // raw for now; shifted in the pass below
-        own_s += rp[c];
-        own_a += rp[c] * raw;
-    }
-    {
-        float ss = warp_sum(own_s);
-        float delta = 0.5f * (opp_mean + (ss > 0.0f ? warp_sum(own_a) / ss : 0.0f));
-        for (int c = lane; c < n; c += 32) out[c] = (out[c] - delta) * orc;
+        out[c] = (part + g[RK] - delta) * orc;
     }
 #else
     const float* ur = AP(w, A_U) + (unsigned long long)q.row * RK;
@@ -796,14 +782,7 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
             if (j < RK) part += u[k] * g[j];
         }
         part = warp_sum(part);
-        float raw = part + g[RK];
-        if (lane == 0) out[c] = raw;
-        if (lane == c % 32) { own_s += rp[c]; own_a += rp[c] * raw; }
-    }
-    {
-        float ss = warp_sum(own_s);
-        float delta = 0.5f * (opp_mean + (ss > 0.0f ? warp_sum(own_a) / ss : 0.0f));
-        for (int c = lane; c < n; c += 32) out[c] = (out[c] - delta) * orc;
+        if (lane == 0) out[c] = (part + g[RK] - delta) * orc;
     }
 #endif
 }
