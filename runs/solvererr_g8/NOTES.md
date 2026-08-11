@@ -107,19 +107,39 @@ and correctly says it is a property of the network rather than a bug in the
 solver. What was missing was its size relative to the signal, which is what
 makes it worth acting on rather than noting.
 
-The cheap candidate fix is a projection. The constraint is one linear equation
-per position, so subtracting half the violation from both players' values lands
-on the antisymmetric subspace — which contains the truth, and so cannot increase
-error. Better than that, it makes `V = (v_0 - v_1)/2` an *average of two
-estimates of the same quantity*, which should cut independent noise as well as
-bias. Note it shifts every config of a row by one constant, so it changes the
-value *level* of a state without touching how the network discriminates configs
-within it, and the level is exactly what CFR compares across a subgame.
+**Why it is self-reinforcing.** The targets are root values of solves whose
+leaves are this same network, so a network that is not antisymmetric produces
+targets that are not antisymmetric, and trains on them. Nothing in the loop
+pushes back. Worth stating because the obvious candidate is not the culprit:
+the 180-degree mirror augmentation was *on* for `runs/base4h`, and it cannot fix
+this. Mirroring maps a position to a different position with the seats
+exchanged, which asks the network for equivariance between two states. This is a
+constraint between the two players' values at *one* state, and nothing has ever
+asked for it.
 
-Not implemented. It belongs in the leaf evaluation inside the CFR loop, where
-the belief weights move every iteration, so it is a hot-path change that wants
-doing deliberately and with the parity tests in front of it — not at 2am on the
-back of one measurement.
+**The fix, stated correctly.** An earlier draft of this note said to subtract
+half the violation from both players' values, which glosses over the structure:
+there is no per-config pair to symmetrize. Player 0's leaf values are indexed by
+player 0's configs and player 1's by player 1's, and they are counterfactual —
+each is already weighted by the *opponent's* reach into the leaf. The
+antisymmetry constraint is not per config, it is one linear equation per leaf on
+the belief-weighted aggregates:
+
+    m_0 = E_{b_0}[v_0],  m_1 = E_{b_1}[v_1],  and m_0 + m_1 should be 0.
+
+So the projection is: form `s = m_0 + m_1` per leaf, subtract `s/2` from every
+config's value for both players. That shifts a leaf's value *level* while
+leaving the network's discrimination between configs within a player untouched
+— and the level is exactly what CFR compares across a subgame. The
+antisymmetric subspace contains the truth, so the projection cannot increase
+error, and it makes `(m_0 - m_1)/2` an average of two estimates of one quantity
+rather than one estimate.
+
+Not implemented. It lives in `Solver::readout`, which is called per player off a
+shared PBS-head pass and runs every CFR iteration, so it needs both players'
+aggregates available at once — a real change to the hot loop, wanting
+`train/test_parity.py` and `tests/rebel_solver.rs` in front of it rather than a
+quick patch.
 
 ## What this does not answer
 
