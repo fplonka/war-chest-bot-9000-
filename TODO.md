@@ -88,6 +88,22 @@
       the violation on the raw network, never on projected targets, or the
       instrument is gone.
 
+- [ ] **Depth, not iterations, is the search lever.** `solvererr ... 1` solves
+      each position one ply deeper and reports how far the answer moves. On
+      `runs/base30`'s final checkpoint:
+
+      | sample | configs/position | depth 2->3 gap |
+      |---|---:|---:|
+      | greedy, 24 positions | 2.6 | 0.0239 |
+      | random, 40 positions | 139.4 | 0.0184 |
+
+      Against the network's own error of 0.099 that is ~20%, and it is ~130x
+      the 0.00014 that stopping CFR at T=64 costs. The depth-3 reference is
+      converged: its NashConv at T=512 is 0.00013-0.00019, the same order as
+      depth 2. So the error budget is network 0.099, zero-sum 0.037, depth
+      0.018, iterations 0.0001 -- and annealing T upward chases the smallest
+      term. Open: what depth 3 costs in throughput, and whether a run at depth
+      3 is stronger at equal wall clock.
 - [ ] Re-run the `dcfr` / `aux` / `policy` experiments through `exp.py`. The
       2026-08-06 `arch_*` results are **not** evidence: three arms inside
       ±20 Elo at 100 games per pairing, which resolves nothing finer than ~70.
