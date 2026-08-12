@@ -11,7 +11,7 @@ A dump holds, oldest row first:
 
     rows  [rows, ROW_BYTES] the packed frozen row format (see `rebel::ROW_*`);
                            the network input is expanded from these
-    cc    [configs, CPRIVATE] counts and future forced-play flags, per config
+    cc    [configs, CCOUNTS] hand/face-down/bag counts, per config
     cp    [configs]         which player the config belongs to
     cw    [configs]         its belief probability
     cy    [configs]         the value the solve gave it
@@ -39,7 +39,6 @@ class Dump:
         self.cw, self.cy, self.seg = d["cw"], d["cy"], d["seg"]
         self.soff = np.asarray(d.get("soff", [0, len(self.x)]), np.int64)
         self.pubfeat = int(d["pubfeat"])
-        self.cprivate = int(d.get("cprivate", 0))
         self.ccounts = int(d["ccounts"])
         self.cnorm = float(d["cnorm"])
         self.row_bytes = int(d.get("row_bytes", 0))
@@ -48,7 +47,7 @@ class Dump:
         # `seg` is emitted in row order, so a row range is a contiguous config
         # range and slicing is two binary searches rather than a scan.
         self.row_start = np.searchsorted(self.seg, 2 * np.arange(len(self.x) + 1))
-        self.check(warchest.PUBFEAT, warchest.CPRIVATE, warchest.CCOUNTS)
+        self.check(warchest.PUBFEAT, warchest.CCOUNTS)
 
     def __len__(self):
         return len(self.x)
@@ -60,12 +59,11 @@ class Dump:
                 self.cw[a:b].astype(np.float32), self.cy[a:b].astype(np.float32),
                 self.seg[a:b] - 2 * lo)
 
-    def check(self, pubfeat, cprivate, ccounts):
-        if (self.pubfeat, self.cprivate, self.ccounts) != (pubfeat, cprivate, ccounts):
+    def check(self, pubfeat, ccounts):
+        if (self.pubfeat, self.ccounts) != (pubfeat, ccounts):
             raise SystemExit(
-                f"dump has PUBFEAT/CPRIVATE/CCOUNTS="
-                f"{self.pubfeat}/{self.cprivate}/{self.ccounts}, module has "
-                f"{pubfeat}/{cprivate}/{ccounts} -- rebuild or redump"
+                f"dump has PUBFEAT/CCOUNTS={self.pubfeat}/{self.ccounts}, "
+                f"module has {pubfeat}/{ccounts} -- rebuild or redump"
             )
         if self.row_bytes != warchest.ROW_BYTES:
             raise SystemExit(

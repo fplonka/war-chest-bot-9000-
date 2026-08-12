@@ -668,10 +668,8 @@ fn warrior_priest_draws_and_forces_use() {
     assert!(has(&draws, Action::DrawCoin { unit: ARCHER }));
     let s3 = s2.apply(Action::DrawCoin { unit: ARCHER });
     // now a forced play with the drawn Archer coin; pass always legal.
-    match s3.pending() {
-        Cont::WarriorPriestPlay { coin, .. } => assert_eq!(*coin, ARCHER),
-        other => panic!("expected WarriorPriestPlay, got {:?}", other),
-    }
+    assert!(matches!(s3.pending(), Cont::WarriorPriestPlay { .. }));
+    assert_eq!(s3.zones[WHITE as usize][Z_INFLIGHT][ARCHER as usize], 1);
     let plays = s3.legal_actions();
     assert!(has(&plays, Action::Pass { coin: ARCHER }));
 }
@@ -1193,10 +1191,12 @@ fn warrior_priest_draw_resolves_before_rg_soak_choice() {
     assert_eq!(s4.zones[BLACK as usize][Z_SUPPLY][ROYAL_GUARD as usize], 0);
     assert_eq!(s4.zones[BLACK as usize][Z_ELIM][ROYAL_GUARD as usize], 1);
     assert_eq!(s4.hex_height[E1], 1, "stack untouched after a supply soak");
-    match s4.pending() {
-        Cont::WarriorPriestPlay { coin, .. } => assert_eq!(*coin, ARCHER),
-        other => panic!("expected the forced play after the soak, got {:?}", other),
-    }
+    assert!(
+        matches!(s4.pending(), Cont::WarriorPriestPlay { .. }),
+        "the forced play comes after the soak, got {:?}",
+        s4.pending()
+    );
+    assert_eq!(s4.zones[WHITE as usize][Z_INFLIGHT][ARCHER as usize], 1);
 }
 
 #[test]

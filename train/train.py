@@ -56,7 +56,6 @@ from value_net import ENCODING_VERSION, Mlp, AUX, AFEAT
 PUBFEAT = warchest.PUBFEAT
 CFEAT = warchest.CFEAT
 CCOUNTS = warchest.CCOUNTS
-CPRIVATE = warchest.CPRIVATE
 CNORM = warchest.CNORM
 NTYPE = warchest.NTYPE
 ROW_BYTES = warchest.ROW_BYTES
@@ -103,9 +102,9 @@ class Buffer:
     reference implementation runs a 2M buffer. A row is the frozen compact
     format (`ROW_BYTES` raw bytes: hex facts, piles, unit ids, scalars, aux) --
     ~223 bytes instead of the ~1.9 KB the old float encoding cost -- and the
-    network input is expanded from it when a batch is made. Counts and forced
-    slots are stored as `uint8` and probabilities/targets as float16: a row
-    costs `ROW_BYTES` bytes plus 30 per config.
+    network input is expanded from it when a batch is made. Counts are stored
+    as `uint8` and probabilities/targets as float16: a row costs `ROW_BYTES`
+    bytes plus 20 per config.
 
     Preallocated and written with wraparound rather than grown by
     concatenation. The concatenate form rebuilt the whole buffer every epoch:
@@ -124,7 +123,7 @@ class Buffer:
         self.soff = np.zeros(0, np.int64)
         self.cstart = np.zeros(cap, np.int64)   # absolute arena offset
         self.clen = np.zeros((cap, 2), np.int32)
-        self.cc = np.zeros((ccap, CPRIVATE), np.uint8)
+        self.cc = np.zeros((ccap, CCOUNTS), np.uint8)
         self.cp = np.zeros(ccap, np.uint8)
         self.cw = np.zeros(ccap, np.float16)
         self.cy = np.zeros(ccap, np.float16)
@@ -327,7 +326,7 @@ def policy_loss(net, d, ids, device):
     prow, pact = d["prow"][ids], d["pact"][ids]
     paoff, ppoff, coff = d["paoff"], d["ppoff"], d["coff"]
     pa, pp = d["pa"].reshape(-1, AFEAT), d["pp"]
-    cc, cw = d["cc"].reshape(-1, CPRIVATE), d["cw"]
+    cc, cw = d["cc"].reshape(-1, CCOUNTS), d["cw"]
     na = (paoff[ids + 1] - paoff[ids]).astype(np.int64)
     S, NA = len(ids), int(na.max())
 
@@ -830,7 +829,7 @@ def main():
                 if data is not None:
                     tc = time.time()
                     rows = np.asarray(data["rows"], np.uint8).reshape(-1, ROW_BYTES)
-                    cc = np.asarray(data["cc"], np.uint8).reshape(-1, CPRIVATE)
+                    cc = np.asarray(data["cc"], np.uint8).reshape(-1, CCOUNTS)
                     cw = np.asarray(data["cw"], np.float32)
                     cy = np.asarray(data["cy"], np.float32)
                     coff = np.asarray(data["coff"], np.int64)
@@ -1051,7 +1050,7 @@ def main():
         # that costs.
         tr = time.time()
         rows = np.asarray(d["rows"], np.uint8).reshape(-1, ROW_BYTES)
-        cc = np.asarray(d["cc"], np.uint8).reshape(-1, CPRIVATE)
+        cc = np.asarray(d["cc"], np.uint8).reshape(-1, CCOUNTS)
         cw = np.asarray(d["cw"], np.float32)
         cy = np.asarray(d["cy"], np.float32)
         coff = np.asarray(d["coff"], np.int64)
@@ -1212,7 +1211,7 @@ def main():
                                [len(rows)]])
         np.savez(args.dump_buffer, rows=rows, cc=cc, cp=cp, cw=cw, cy=cy, seg=seg,
                  soff=soff, pubfeat=np.int32(PUBFEAT), cfeat=np.int32(CFEAT),
-                 cprivate=np.int32(CPRIVATE), ccounts=np.int32(CCOUNTS),
+                 ccounts=np.int32(CCOUNTS),
                  cnorm=np.float32(CNORM),
                  row_bytes=np.int32(ROW_BYTES), version=np.int32(warchest.ROW_FORMAT_VERSION),
                  rules_hash=np.uint64(warchest.rules_table_hash()))

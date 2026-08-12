@@ -18,7 +18,6 @@ PUBFEAT = warchest.PUBFEAT
 CFEAT = warchest.CFEAT
 AFEAT = warchest.AFEAT
 CCOUNTS = warchest.CCOUNTS
-CPRIVATE = warchest.CPRIVATE
 CARD_FEATS = warchest.CARD_FEATS
 N_HEXES = warchest.N_HEXES
 N_UNITS = warchest.N_UNITS
@@ -169,13 +168,15 @@ class Mlp(nn.Module):
         self.hmlp = nn.ModuleList(
             [nn.Linear(widths[i], widths[i + 1]) for i in range(len(widths) - 1)])
         self.wu = nn.Linear(head_out, rank)
-        # The holding tower: per coin type through a shared chain, rectified,
-        # summed over the five slots (a sum has no order, so any draft fits),
-        # then the residual blocks.
-        widths = [6 + de, *slot]
+        # The holding tower: per coin type — three counts, the centred seat and
+        # that card's embedding — through a shared chain, rectified, summed over
+        # the five slots (a sum has no order, so any draft fits), then the
+        # residual blocks.
+        hfeat = 4 + de
+        widths = [hfeat, *slot]
         self.slot = nn.ModuleList(
             [nn.Linear(widths[i], widths[i + 1]) for i in range(len(widths) - 1)])
-        self.slot_out = nn.Linear(slot[-1] if slot else 6 + de, dg)
+        self.slot_out = nn.Linear(slot[-1] if slot else hfeat, dg)
         self.res = nn.ModuleList([Res(dg) for _ in range(nres)])
         self.wg = nn.Linear(dg, rank + 1)
         # The policy head: an action tower and the two halves of its readout.
@@ -294,15 +295,14 @@ class Mlp(nn.Module):
         alongside that card's embedding, through the shared chain, rectified,
         summed over the five slots, then the residual blocks. `phi` is
         `[U, CFEAT]`, `e` the card table of each config's row `[U, NTYPE, de]`."""
-        seat = phi[:, CPRIVATE].long()
+        seat = phi[:, CCOUNTS].long()
         counts = phi[:, :CCOUNTS].reshape(-1, 3, NSLOT).transpose(1, 2)   # [U, NSLOT, 3]
-        forced = phi[:, CCOUNTS:CPRIVATE].reshape(-1, 2, NSLOT).transpose(1, 2)
         mine = e[torch.arange(e.shape[0], device=e.device).unsqueeze(1),
                  seat.unsqueeze(1) * NSLOT + torch.arange(NSLOT, device=e.device)]
         # Centred: see net.rs::holdings. A raw 0/1 seat is inert for seat 0 and
         # active for seat 1, and the rectified sum below cannot cancel it.
-        s = (phi[:, CPRIVATE] - 0.5).reshape(-1, 1, 1).expand(-1, NSLOT, 1)
-        x = torch.cat([counts, forced, s, mine], -1)
+        s = (phi[:, CCOUNTS] - 0.5).reshape(-1, 1, 1).expand(-1, NSLOT, 1)
+        x = torch.cat([counts, s, mine], -1)
         for lin in self.slot:
             x = F.relu(lin(x))
         # Rectify before the sum: a sum of raw linear maps forgets which

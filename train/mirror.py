@@ -193,9 +193,9 @@ def self_check_state_oracle(n=256, seed=0x51A7E):
     original, expected, private, expected_private = warchest.mirror_rows_oracle(n, seed)
     original = np.asarray(original, np.uint8).reshape(n, ROW_BYTES)
     expected = np.asarray(expected, np.uint8).reshape(n, ROW_BYTES)
-    private = np.asarray(private, np.uint8).reshape(n, 2, warchest.CPRIVATE)
+    private = np.asarray(private, np.uint8).reshape(n, 2, warchest.CCOUNTS)
     expected_private = np.asarray(expected_private, np.uint8).reshape(
-        n, 2, warchest.CPRIVATE)
+        n, 2, warchest.CCOUNTS)
     got = mirror_rows(original)
     # Aux labels are filled only after a game ends and are not State fields.
     end = warchest.ROW_AUX
@@ -205,6 +205,4 @@ def self_check_state_oracle(n=256, seed=0x51A7E):
     # `cp`). Under the mirrored state's player ordering that is exactly a swap.
     assert np.array_equal(private[:, ::-1], expected_private), \
         "private-config augmentation disagrees with State::mirror"
-    assert np.any(private[:, :, warchest.CCOUNTS:]), \
-        "the State::mirror oracle did not exercise forced-coin flags"
     return True

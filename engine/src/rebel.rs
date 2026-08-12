@@ -13,19 +13,19 @@
 //!   * the **identities of face-down discards** — the coin spent on Pass,
 //!     Claim Initiative, or a Recruit payment is never revealed.
 //!
-//! So a player's private state is the pair `(hand, facedown)`, plus — while a
-//! Warrior Priest forced play is pending — which hand slots hold the current
-//! and (for a nested trigger) queued forced coins. The bag is *derived*:
+//! So a player's private state is the triple `(hand, facedown, inflight)`,
+//! where `inflight` is the Warrior Priest's drawn coin waiting for its forced
+//! play — at most one coin, and empty at every other node. The bag is
+//! *derived*:
 //!
-//!   `bag = reserve - hand - facedown`,  `reserve = bag + hand + facedown`
+//!   `bag = reserve - hand - facedown - inflight`
 //!
 //! where `reserve` is public (total owned minus board, face-up discard, supply
 //! and eliminated). Hand size, bag size and face-down count are public too —
 //! you can see how many coins someone is holding.
 //!
-//! These identities remain in the config while any intervening public
-//! continuation resolves. The reachable set is small — measured over 120k
-//! positions of random play with the full draft pool: median 22, mean 57,
+//! The reachable set is small — measured over 120k positions of random play
+//! with the full draft pool: median 22, mean 57,
 //! p99 567 — so CFR enumerates information states exactly, with no particle
 //! approximation.
 //!
@@ -40,10 +40,10 @@
 //!
 //!   * `write_public_features` — the public state. Identical for every config,
 //!     which is what lets one public tree carry all of them.
-//!   * `write_config_feats` — one config's exact counts and future forced-play
-//!     identities, plus whose config it is. This is the *argument* of the value
-//!     function, and the belief encoding is a weighted sum of the same vectors,
-//!     so both sides of the network see the same description of a config.
+//!   * `write_config_feats` — one config's exact counts, plus whose config it
+//!     is. This is the *argument* of the value function, and the belief
+//!     encoding is a weighted sum of the same vectors, so both sides of the
+//!     network see the same description of a config.
 //!
 //! Nothing here summarises a config into anything coarser. An earlier build
 //! keyed values by hand alone and averaged the face-down composition into a
@@ -53,7 +53,7 @@
 
 use crate::actions::{Action, N_KINDS};
 use crate::board::{board, NONE, N_HEXES};
-use crate::state::{Cont, State, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP, Z_HAND, Z_SUPPLY};
+use crate::state::{State, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP, Z_HAND, Z_INFLIGHT, Z_SUPPLY};
 use crate::units::{write_card_features, CARD_FEATS, N_UNITS};
 
 /// Distinct coin types a player can own: 4 drafted units + the Royal Coin.
@@ -63,16 +63,16 @@ pub const HAND_CAP: usize = 3;
 
 // ------------------------------------------------------------ config features
 
-/// Raw counts describing one config: hand, face-down, bag, in slot order.
+/// A config's private state as raw counts: hand, face-down, bag, in slot
+/// order. This is the whole of it — the Warrior Priest's in-flight coin never
+/// reaches the network, because every row is a `MainPlay` state and nothing is
+/// in flight there.
 pub const CCOUNTS: usize = 3 * NSLOT;
-/// Raw replay bytes describing a config: counts followed by one-hot next and
-/// queued Warrior Priest forced-play slots. `None` is an all-zero one-hot.
-pub const CPRIVATE: usize = CCOUNTS + 2 * NSLOT;
-/// The config vector the network reads: `CPRIVATE` private values plus a flag
+/// The config vector the network reads: `CCOUNTS` private values plus a flag
 /// saying whose config it is. Player 0's and player 1's slots mean different
 /// units, and the value asked for is "this player's counterfactual value", so
 /// the seat has to be part of the argument.
-pub const CFEAT: usize = CPRIVATE + 1;
+pub const CFEAT: usize = CCOUNTS + 1;
 /// Divisor for every count. A player owns at most 5 coins of any one type, so
 /// every count lands in `[0, 1]` and one constant serves all three zones.
 pub const CNORM: f32 = 5.0;
@@ -115,16 +115,12 @@ impl Ctx {
 pub struct Config {
     pub hand: [u8; NSLOT],
     pub fd: [u8; NSLOT],
-    /// The next Warrior Priest forced-play coin in continuation resolution
-    /// order. Other decisions may sit above it on the public continuation
-    /// stack, so this can be set even when the current node is not a forced
-    /// play. The drawn coin itself sits in the hand; the identity is a
-    /// categorical private input in replay and the value network.
-    pub pending_coin: Option<u8>,
-    /// The second Warrior Priest forced-play coin in resolution order. A
-    /// nested trigger can queue one older play, but cannot add a third without
-    /// first consuming the current play.
-    pub queued_coin: Option<u8>,
+    /// The Warrior Priest's drawn coin, waiting for the forced play that must
+    /// spend it (`Z_INFLIGHT` in the world state). The defender's Royal Guard
+    /// soak choice can sit between the draw and that play, so this outlives a
+    /// single node — but never two forced plays: the play is popped the moment
+    /// the soak resolves.
+    pub inflight: Option<u8>,
 }
 
 impl Config {
@@ -146,7 +142,7 @@ impl Config {
         b
     }
     /// A single integer that orders configs exactly as `Ord` does: hand
-    /// lexicographically, then face-down, then the forced coins. Sorting and
+    /// lexicographically, then face-down, then the in-flight coin. Sorting and
     /// deduping child supports is the hot part of building a subgame, and
     /// comparing one `u64` beats walking the arrays — but only if the key is
     /// computed once per element rather than once per comparison, which is why
@@ -154,8 +150,8 @@ impl Config {
     /// 2 bits per hand slot (a hand holds at most `HAND_CAP` = 3 coins in
     /// total, so no slot exceeds 3 — `key`'s debug_assert is the overflow
     /// test), 5 per face-down slot (bounded by the largest supply in the
-    /// game) and 3 for each forced coin (`None` = 0, `Some(k)` = k + 1), for
-    /// 41 bits — which leaves room to pack an element index alongside it in
+    /// game) and 3 for the in-flight coin (`None` = 0, `Some(k)` = k + 1), for
+    /// 38 bits — which leaves room to pack an element index alongside it in
     /// one `u64` (`config_key_packing_has_headroom` pins the headroom).
     #[inline]
     pub fn key(&self) -> u64 {
@@ -168,26 +164,9 @@ impl Config {
             debug_assert!(self.fd[i] < 32, "face-down slot over the key width");
             k = (k << 5) | self.fd[i] as u64;
         }
-        debug_assert!(self.pending_coin.map_or(0, |p| p as u64 + 1) < 8);
-        debug_assert!(self.queued_coin.map_or(0, |p| p as u64 + 1) < 8);
-        k = (k << 3) | self.pending_coin.map_or(0, |p| p as u64 + 1);
-        k = (k << 3) | self.queued_coin.map_or(0, |p| p as u64 + 1);
+        debug_assert!(self.inflight.map_or(0, |p| p as u64 + 1) < 8);
+        k = (k << 3) | self.inflight.map_or(0, |p| p as u64 + 1);
         k
-    }
-
-    #[inline]
-    fn push_pending(&mut self, coin: u8) {
-        assert!(
-            self.queued_coin.is_none(),
-            "Warrior Priest continuation depth exceeded two"
-        );
-        self.queued_coin = self.pending_coin;
-        self.pending_coin = Some(coin);
-    }
-
-    #[inline]
-    fn pop_pending(&mut self) {
-        self.pending_coin = self.queued_coin.take();
     }
 }
 
@@ -200,25 +179,10 @@ impl Config {
 #[inline]
 pub fn config_counts(c: &Config, reserve: &[u8; NSLOT], out: &mut [u8; CCOUNTS]) {
     for k in 0..NSLOT {
+        let inflight = u8::from(c.inflight == Some(k as u8));
         out[k] = c.hand[k];
         out[NSLOT + k] = c.fd[k];
-        out[2 * NSLOT + k] = reserve[k].saturating_sub(c.hand[k] + c.fd[k]);
-    }
-}
-
-/// The raw private config stored in replay: counts plus categorical future
-/// forced-play identities. Unlike counts, the flags are already in `[0, 1]`.
-#[inline]
-pub fn config_private(c: &Config, reserve: &[u8; NSLOT], out: &mut [u8; CPRIVATE]) {
-    let mut counts = [0; CCOUNTS];
-    config_counts(c, reserve, &mut counts);
-    out[..CCOUNTS].copy_from_slice(&counts);
-    out[CCOUNTS..].fill(0);
-    if let Some(k) = c.pending_coin {
-        out[CCOUNTS + k as usize] = 1;
-    }
-    if let Some(k) = c.queued_coin {
-        out[CCOUNTS + NSLOT + k as usize] = 1;
+        out[2 * NSLOT + k] = reserve[k].saturating_sub(c.hand[k] + c.fd[k] + inflight);
     }
 }
 
@@ -227,15 +191,12 @@ pub fn config_private(c: &Config, reserve: &[u8; NSLOT], out: &mut [u8; CPRIVATE
 #[inline]
 pub fn write_config_feats(c: &Config, reserve: &[u8; NSLOT], player: usize, out: &mut [f32]) {
     debug_assert_eq!(out.len(), CFEAT);
-    let mut private = [0u8; CPRIVATE];
-    config_private(c, reserve, &mut private);
+    let mut counts = [0u8; CCOUNTS];
+    config_counts(c, reserve, &mut counts);
     for k in 0..CCOUNTS {
-        out[k] = private[k] as f32 / CNORM;
+        out[k] = counts[k] as f32 / CNORM;
     }
-    for k in CCOUNTS..CPRIVATE {
-        out[k] = private[k] as f32;
-    }
-    out[CPRIVATE] = player as f32;
+    out[CCOUNTS] = player as f32;
 }
 
 // ------------------------------------------------------------ action features
@@ -320,57 +281,33 @@ pub fn reserve(s: &State, p: u8, ctx: &Ctx) -> [u8; NSLOT] {
         let u = ctx.slots[p as usize][k] as usize;
         out[k] = s.zones[p as usize][Z_BAG][u]
             + s.zones[p as usize][Z_HAND][u]
-            + s.zones[p as usize][Z_FACEDOWN][u];
+            + s.zones[p as usize][Z_FACEDOWN][u]
+            + s.zones[p as usize][Z_INFLIGHT][u];
     }
     out
 }
 
-/// The true config of `p` in a world state, including current and queued
-/// Warrior Priest forced plays in their resolution order.
+/// The true config of `p` in a world state. Every private fact is a zone
+/// count, so this is a straight read — the public continuation stack says
+/// *whether* a forced play is owed, never which coin it spends.
 pub fn true_config(s: &State, p: u8, ctx: &Ctx) -> Config {
     let mut c = Config::default();
     for k in 0..NSLOT {
         let u = ctx.slots[p as usize][k] as usize;
         c.hand[k] = s.zones[p as usize][Z_HAND][u];
         c.fd[k] = s.zones[p as usize][Z_FACEDOWN][u];
-    }
-    let mut add = |cont: &Cont| {
-        if let Cont::WarriorPriestPlay { player, coin } = *cont {
-            if player != p {
-                return;
-            }
-            let k = ctx.slot_of[p as usize][coin as usize];
-            if k >= 0 {
-                if c.pending_coin.is_none() {
-                    c.pending_coin = Some(k as u8);
-                } else if c.queued_coin.is_none() {
-                    c.queued_coin = Some(k as u8);
-                } else {
-                    panic!("Warrior Priest continuation depth exceeded two");
-                }
-            }
-        }
-    };
-    // Winning ends resolution immediately, so `State::pending` may still name
-    // the coin play that delivered the sixth marker. It is no longer a future
-    // private action and the belief has already consumed it.
-    if !s.is_terminal() {
-        add(s.pending());
-        for cont in s.conts.iter() {
-            add(cont);
+        if s.zones[p as usize][Z_INFLIGHT][u] > 0 {
+            c.inflight = Some(k as u8);
         }
     }
     c
 }
 
-/// Instantiate a world: overwrite `p`'s hand and face-down discard with `c`,
-/// putting the rest of the reserve back in the bag. The public projection is
-/// unchanged, which is what lets one public tree carry every config.
+/// Instantiate a world: overwrite `p`'s hand, face-down discard and in-flight
+/// coin with `c`, putting the rest of the reserve back in the bag. The public
+/// projection is unchanged, which is what lets one public tree carry every
+/// config.
 pub fn set_config(s: &mut State, p: u8, ctx: &Ctx, c: &Config) {
-    assert!(
-        c.pending_coin.is_some() || c.queued_coin.is_none(),
-        "a queued forced coin needs a current forced coin"
-    );
     assert_eq!(
         c.hand_size(),
         s.hand_size(p),
@@ -378,68 +315,30 @@ pub fn set_config(s: &mut State, p: u8, ctx: &Ctx, c: &Config) {
     );
     assert_eq!(
         c.fd_size(),
-        s.zones[p as usize][crate::state::Z_FACEDOWN]
-            .iter()
-            .copied()
-            .sum::<u8>(),
+        s.zones[p as usize][Z_FACEDOWN].iter().copied().sum::<u8>(),
         "config changes the public face-down size: player={p} config={c:?}"
+    );
+    assert_eq!(
+        u8::from(c.inflight.is_some()),
+        s.zones[p as usize][Z_INFLIGHT].iter().copied().sum::<u8>(),
+        "config changes whether a forced play is owed: player={p} config={c:?}"
     );
     for k in 0..NSLOT {
         let u = ctx.slots[p as usize][k] as usize;
+        let inflight = u8::from(c.inflight == Some(k as u8));
         let res = s.zones[p as usize][Z_BAG][u]
             + s.zones[p as usize][Z_HAND][u]
-            + s.zones[p as usize][Z_FACEDOWN][u];
+            + s.zones[p as usize][Z_FACEDOWN][u]
+            + s.zones[p as usize][Z_INFLIGHT][u];
         assert!(
-            c.hand[k] + c.fd[k] <= res,
+            c.hand[k] + c.fd[k] + inflight <= res,
             "config must fit in the reserve: player={p} slot={k} config={c:?} reserve={res}"
         );
         s.zones[p as usize][Z_HAND][u] = c.hand[k];
         s.zones[p as usize][Z_FACEDOWN][u] = c.fd[k];
-        s.zones[p as usize][Z_BAG][u] = res.saturating_sub(c.hand[k] + c.fd[k]);
+        s.zones[p as usize][Z_INFLIGHT][u] = inflight;
+        s.zones[p as usize][Z_BAG][u] = res - c.hand[k] - c.fd[k] - inflight;
     }
-
-    let slots = [c.pending_coin, c.queued_coin];
-    let required = if s.is_terminal() {
-        0
-    } else {
-        usize::from(matches!(
-            s.pending(),
-            Cont::WarriorPriestPlay { player, .. } if *player == p
-        )) + s
-            .conts
-            .iter()
-            .filter(|cont| matches!(cont, Cont::WarriorPriestPlay { player, .. } if *player == p))
-            .count()
-    };
-    let supplied = slots.iter().flatten().count();
-    assert_eq!(
-        supplied,
-        required,
-        "config/state forced-play depth mismatch: player={p} config={c:?} pending={:?} conts={:?}",
-        s.pending(),
-        s.conts
-    );
-    let mut at = 0usize;
-    let mut replace = |cont: &mut Cont| {
-        if let Cont::WarriorPriestPlay { player, coin } = cont {
-            if *player == p {
-                let slot = slots[at].unwrap();
-                *coin = ctx.slots[p as usize][slot as usize];
-                at += 1;
-            }
-        }
-    };
-    if !s.is_terminal() {
-        replace(&mut s.pending);
-        for cont in s.conts.iter_mut() {
-            replace(cont);
-        }
-    }
-    assert_eq!(
-        at,
-        usize::from(c.pending_coin.is_some()) + usize::from(c.queued_coin.is_some()),
-        "config has a forced coin absent from the state"
-    );
 }
 
 /// Every config consistent with the public counts. Self-play tracks the
@@ -460,8 +359,7 @@ pub fn enumerate_configs(reserve: &[u8; NSLOT], hand_size: u8, fd_size: u8) -> V
                 out.push(Config {
                     hand: *hand,
                     fd: *fd,
-                    pending_coin: None,
-                    queued_coin: None,
+                    inflight: None,
                 });
                 fd[k] = 0;
             }
@@ -577,14 +475,13 @@ impl Belief {
 
 /// Is `slot` a legal coin for this config to spend right now? `slot` is the
 /// coin slot the action spends (-1 for the micro-decisions that spend
-/// nothing). At a public Warrior Priest play only the next forced coin is
-/// legal; other nodes leave future forced coins untouched and use the hand.
+/// nothing). A config with a coin in flight owes its forced play next, so that
+/// coin is the only one it can spend.
 #[inline]
-pub fn action_legal(c: &Config, slot: i8, forced: bool) -> bool {
-    if forced {
-        c.pending_coin == Some(slot as u8)
-    } else {
-        slot < 0 || c.hand[slot as usize] > 0
+pub fn action_legal(c: &Config, slot: i8) -> bool {
+    match c.inflight {
+        Some(k) => slot == k as i8,
+        None => slot < 0 || c.hand[slot as usize] > 0,
     }
 }
 
@@ -593,23 +490,19 @@ pub fn action_legal(c: &Config, slot: i8, forced: bool) -> bool {
 /// face-down discard (Pass / Claim Initiative / Recruit payment) or leaves the
 /// reserve in full view.
 ///
-/// At a public Warrior Priest play the next forced coin is consumed and the
-/// older queued play becomes next. Other decisions leave both future forced
-/// coins untouched. The drawn coin is physically in the hand, so a forced
-/// `slot` must be exactly the next forced slot.
+/// A coin in flight is spent by the forced play and leaves the config empty
+/// of one again; every other play spends from the hand.
 #[inline]
-pub fn advance_config(c: &Config, slot: i8, facedown: bool, forced: bool) -> Option<Config> {
-    if forced {
-        let p = c.pending_coin?;
-        if slot != p as i8 || c.hand[p as usize] == 0 {
+pub fn advance_config(c: &Config, slot: i8, facedown: bool) -> Option<Config> {
+    if let Some(k) = c.inflight {
+        if slot != k as i8 {
             return None;
         }
         let mut n = *c;
-        n.hand[p as usize] -= 1;
+        n.inflight = None;
         if facedown {
-            n.fd[p as usize] += 1;
+            n.fd[k as usize] += 1;
         }
-        n.pop_pending();
         return Some(n);
     }
     if slot < 0 {
@@ -632,15 +525,13 @@ pub fn advance_config(c: &Config, slot: i8, facedown: bool, forced: bool) -> Opt
 /// empty reshuffles first, which folds its
 /// face-down discards into the bag and therefore *erases* them.
 ///
-/// `set_pending` marks a Warrior Priest draw: the drawn coin is forced to be
-/// played next, so every child carries it as its `pending_coin`. The drawn
-/// coin lands in the hand, and the hand never exceeds `HAND_CAP` — the trigger
-/// is always preceded by the coin play that fired it.
+/// `inflight` marks a Warrior Priest draw: the coin does not join the hand but
+/// waits in flight for the forced play that must spend it.
 pub fn belief_after_draw(
     b: &Belief,
     reserve: &[u8; NSLOT],
     faceup: &[u8; NSLOT],
-    set_pending: bool,
+    inflight: bool,
 ) -> Belief {
     let mut pairs: Vec<(Config, f32)> = Vec::with_capacity(b.len() * NSLOT);
     for (c, w) in b.cfg.iter().zip(b.p.iter()) {
@@ -655,17 +546,16 @@ pub fn belief_after_draw(
                 continue;
             }
             let mut n = base;
-            n.hand[k] += 1;
-            if set_pending {
-                debug_assert!(
-                    n.hand_size() as usize <= HAND_CAP,
-                    "a WP draw must not push the hand over the cap"
-                );
-                n.push_pending(k as u8);
-                pairs.push((n, *w * src[k] as f32 / total as f32));
-            } else if n.hand_size() as usize <= HAND_CAP {
-                pairs.push((n, *w * src[k] as f32 / total as f32));
+            if inflight {
+                debug_assert!(n.inflight.is_none(), "a coin is already in flight");
+                n.inflight = Some(k as u8);
+            } else {
+                n.hand[k] += 1;
+                if n.hand_size() as usize > HAND_CAP {
+                    continue;
+                }
             }
+            pairs.push((n, *w * src[k] as f32 / total as f32));
         }
     }
     Belief::from_pairs(pairs)
@@ -731,10 +621,8 @@ impl DrawScratch {
     /// subgame tree's reach accounting needs, kept separate from both players'
     /// strategies.
     ///
-    /// `set_pending` marks a Warrior Priest draw: the drawn coin is forced to
-    /// be played next, so every child carries it as its `pending_coin` (the
-    /// hand cap cannot be exceeded — the trigger is always preceded by the
-    /// coin play that fired it).
+    /// `inflight` marks a Warrior Priest draw: the coin waits in flight for the
+    /// forced play instead of joining the hand.
     pub fn transition(
         &mut self,
         cfg: &[Config],
@@ -742,7 +630,7 @@ impl DrawScratch {
         faceup: &[u8; NSLOT],
         support: &mut Vec<Config>,
         map: &mut DrawMap,
-        set_pending: bool,
+        inflight: bool,
     ) {
         let tg = crate::timed!(DGEN);
         self.kid.clear();
@@ -762,19 +650,17 @@ impl DrawScratch {
                         continue;
                     }
                     let mut n = base;
-                    n.hand[k] += 1;
-                    if set_pending {
-                        debug_assert!(
-                            n.hand_size() as usize <= HAND_CAP,
-                            "a WP draw must not push the hand over the cap"
-                        );
-                        n.push_pending(k as u8);
-                        self.kid.push(n);
-                        self.prob.push(src[k] as f32 * inv);
-                    } else if n.hand_size() as usize <= HAND_CAP {
-                        self.kid.push(n);
-                        self.prob.push(src[k] as f32 * inv);
+                    if inflight {
+                        debug_assert!(n.inflight.is_none(), "a coin is already in flight");
+                        n.inflight = Some(k as u8);
+                    } else {
+                        n.hand[k] += 1;
+                        if n.hand_size() as usize > HAND_CAP {
+                            continue;
+                        }
                     }
+                    self.kid.push(n);
+                    self.prob.push(src[k] as f32 * inv);
                 }
             }
             map.start.push(self.kid.len() as u32);
@@ -794,7 +680,7 @@ impl DrawScratch {
     /// holds fewer than `k` coins, the whole bag is drawn (deterministic),
     /// the discard pile refills it (face-down forgotten), and the remainder
     /// is hypergeometric over the refilled source. Warrior Priest draws stay
-    /// on `transition`: they are single draws that set `pending_coin`.
+    /// on `transition`: they are single draws into the in-flight slot.
     pub fn run(
         &mut self,
         cfg: &[Config],
@@ -987,10 +873,10 @@ pub fn draw_transition(
     cfg: &[Config],
     reserve: &[u8; NSLOT],
     faceup: &[u8; NSLOT],
-    set_pending: bool,
+    inflight: bool,
 ) -> (Vec<Config>, DrawMap) {
     let (mut support, mut map) = (Vec::new(), DrawMap::default());
-    DrawScratch::default().transition(cfg, reserve, faceup, &mut support, &mut map, set_pending);
+    DrawScratch::default().transition(cfg, reserve, faceup, &mut support, &mut map, inflight);
     (support, map)
 }
 
@@ -1046,9 +932,10 @@ pub fn obs_key(a: &Action) -> u32 {
 // ------------------------------------------------------------------ features
 
 /// Semantic version of the network inputs. Weight checkpoints and exported
-/// binaries must match it exactly; version 3 adds future Warrior Priest forced
-/// plays to the private config input. Version 2 centred the seat channel.
-pub const ENCODING_VERSION: u32 = 3;
+/// binaries must match it exactly; version 4 dropped the Warrior Priest
+/// forced-play channels, which were always zero (every row is a `MainPlay`
+/// state). Version 2 centred the seat channel.
+pub const ENCODING_VERSION: u32 = 4;
 
 /// The most coins a player can ever own: four drafted types at the largest
 /// supply in the game (5 each) plus one Royal Coin. Every per-player coin count
@@ -1071,9 +958,8 @@ pub const NTYPE: usize = 2 * NSLOT;
 /// distance-to-nearest-unit map was tried and removed: it is a *derived*
 /// summary — the same quantity `eval_static`'s coverage term uses — so it
 /// imports the handcrafted bot's opinion into the encoding. Value queries are
-/// made only at normal coin-play boundaries. Warrior Priest coins queued below
-/// public micro-decisions remain categorical config inputs until they resolve;
-/// the micro-decisions themselves do not reach the network.
+/// made only at normal coin-play boundaries; micro-decisions and Warrior Priest
+/// forced plays never reach the network.
 pub const HEX_FACTS: usize = 2 + 1 + 2 + 1;
 /// Per hex: the raw facts, then a one-hot of the occupant's coin type.
 pub const HEX_CH: usize = HEX_FACTS + NTYPE;
@@ -1164,11 +1050,10 @@ pub const GPU_ROW_PLIES: usize = GPU_ROW_TO_ACT + 1;
 pub const GPU_ROW_BYTES: usize = GPU_ROW_PLIES + 2;
 
 /// The current replay format version. Bump when row layout, expanded features,
-/// or target semantics change; old dumps must then fail closed. Version 4
-/// carries future Warrior Priest forced plays through intervening public
-/// continuations; version 3 introduced nested forced plays and version 2
-/// required zero-sum projected targets.
-pub const ROW_FORMAT_VERSION: u32 = 4;
+/// or target semantics change; old dumps must then fail closed. Version 5
+/// dropped the Warrior Priest forced-play one-hots from the config bytes;
+/// version 2 required zero-sum projected targets.
+pub const ROW_FORMAT_VERSION: u32 = 5;
 
 /// Hash of the constants the expansion depends on: the board's location map,
 /// the unit card-fact table and the layout constants. A rules change that
@@ -1199,7 +1084,6 @@ pub fn rules_table_hash() -> u64 {
         NSLOT,
         NTYPE,
         CCOUNTS,
-        CPRIVATE,
         CFEAT,
         N_HEXES,
         PILE_COUNTS,
@@ -1678,8 +1562,7 @@ mod draw_tests {
         let c = |hand: [u8; NSLOT], fd: [u8; NSLOT]| Config {
             hand,
             fd,
-            pending_coin: None,
-            queued_coin: None,
+            inflight: None,
         };
 
         // Plenty in the bag: pure hypergeometric.

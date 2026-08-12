@@ -20,7 +20,7 @@ use cudarc::nvrtc;
 
 use crate::gpu::client::{CarryStore, SolveResult};
 use crate::net::V3Layout;
-use crate::rebel::{CCOUNTS, CFEAT, CPRIVATE, GPU_ROW_BYTES, NSLOT, NTYPE, PILE_COUNTS};
+use crate::rebel::{CCOUNTS, CFEAT, GPU_ROW_BYTES, NSLOT, NTYPE, PILE_COUNTS};
 use crate::units::CARD_FEATS;
 
 use super::wave::Wave;
@@ -2372,7 +2372,7 @@ fn cuda_preamble(l: &V3Layout) -> String {
          #define NCARD {}\n#define NPUB {}\n#define NHMLP {}\n#define NSLOTL {}\n#define NRES {}\n\
          {}{}{}{}\
          #define N_HEXES {}\n#define NSLOT {}\n#define NTYPE {}\n#define HEX_FACTS {}\n\
-         #define PILE_COUNTS {}\n#define CARD_FEATS {}\n#define CCOUNTS {}\n#define CPRIVATE {}\n#define CFEAT {}\n\
+         #define PILE_COUNTS {}\n#define CARD_FEATS {}\n#define CCOUNTS {}\n#define CFEAT {}\n\
          #define MAX_COINS {:.1}f\n#define MAX_PLIES {:.1}f\n#define LOOSE {}\n\
          #define GPU_ROW_BYTES {}\n#define GR_HEX_OWNER {}\n#define GR_HEX_SLOT {}\n\
          #define GR_HEX_HEIGHT {}\n#define GR_HEX_MARKER {}\n#define GR_PILES {}\n\
@@ -2385,7 +2385,7 @@ fn cuda_preamble(l: &V3Layout) -> String {
         l.card.len(), l.pub_lin.len(), l.hmlp.len(), l.slot.len(), l.res.len(),
         arr("CARDW", &card), arr("PUBW", &pubw), arr("HMLPW", &hmlp), arr("SLOTW", &slot),
         crate::board::N_HEXES, NSLOT, NTYPE, crate::rebel::HEX_FACTS,
-        PILE_COUNTS, CARD_FEATS, CCOUNTS, CPRIVATE, CFEAT, crate::rebel::MAX_COINS,
+        PILE_COUNTS, CARD_FEATS, CCOUNTS, CFEAT, crate::rebel::MAX_COINS,
         crate::state::MAX_MAIN_PLAYS as f32, crate::rebel::LOOSE,
         GPU_ROW_BYTES, crate::rebel::GPU_ROW_HEX_OWNER, crate::rebel::GPU_ROW_HEX_SLOT,
         crate::rebel::GPU_ROW_HEX_HEIGHT, crate::rebel::GPU_ROW_HEX_MARKER,

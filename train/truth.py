@@ -68,7 +68,7 @@ import warchest
 from dump import Dump
 from export_weights import load as load_checkpoint
 from offline import evaluate
-from train import CCOUNTS, CPRIVATE, CNORM, CFEAT, PUBFEAT, ROW_BYTES
+from train import CCOUNTS, CNORM, CFEAT, PUBFEAT, ROW_BYTES
 
 # Iterations for the reference solve. At T=256 with dcfr the remaining target
 # error is 0.00008 (`runs/solvererr_g8`), a thousandth of the network's own
@@ -94,7 +94,7 @@ def build(args):
                           random_draft=args.random_draft)
 
     rows = np.asarray(d["rows"], np.uint8).reshape(-1, ROW_BYTES)
-    cc = np.asarray(d["cc"], np.uint8).reshape(-1, CPRIVATE)
+    cc = np.asarray(d["cc"], np.uint8).reshape(-1, CCOUNTS)
     cw = np.asarray(d["cw"], np.float32)
     cy = np.asarray(d["cy"], np.float32)
     coff = np.asarray(d["coff"], np.int64)
@@ -108,7 +108,7 @@ def build(args):
     np.savez(args.out, rows=rows, cc=cc, cp=cp, cw=cw, cy=cy,
              soff=np.asarray(d["soff"], np.int64), seg=seg,
              pubfeat=np.int32(PUBFEAT), cfeat=np.int32(CFEAT),
-             cprivate=np.int32(CPRIVATE), ccounts=np.int32(CCOUNTS),
+             ccounts=np.int32(CCOUNTS),
              cnorm=np.float32(CNORM),
              row_bytes=np.int32(ROW_BYTES),
              version=np.int32(warchest.ROW_FORMAT_VERSION),

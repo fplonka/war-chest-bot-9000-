@@ -49,7 +49,11 @@ pub const Z_FACEUP: usize = 2;
 pub const Z_FACEDOWN: usize = 3;
 pub const Z_SUPPLY: usize = 4;
 pub const Z_ELIM: usize = 5;
-pub const N_ZONES: usize = 6;
+/// The Warrior Priest's drawn coin, between the draw and the forced play that
+/// must spend it. A one-coin private zone: its size is public (the pending
+/// node says whether a forced play is owed), its identity is not.
+pub const Z_INFLIGHT: usize = 6;
+pub const N_ZONES: usize = 7;
 
 pub const WHITE: u8 = 0;
 pub const BLACK: u8 = 1;
@@ -150,8 +154,9 @@ pub enum Cont {
     /// it, so the draw's apply re-installs the RoyalGuardChoice node.
     WarriorPriestDraw { player: u8, rg_hex: u8 },
     /// Warrior Priest forced play of the coin just drawn (any action using that
-    /// coin type; pass always legal). `coin` is the drawn unit index.
-    WarriorPriestPlay { player: u8, coin: u8 },
+    /// coin type; pass always legal). The coin itself is in `Z_INFLIGHT`, which
+    /// is where the play pays from — this node names no private information.
+    WarriorPriestPlay { player: u8 },
     /// Internal bookkeeping: after a deferred (RoyalGuard) attack resolves,
     /// queue the attacker's post-triggers. Never a decision node; consumed by
     /// advance() the instant it surfaces.
@@ -222,12 +227,6 @@ impl ContStack {
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &Cont> {
         self.v[..self.n as usize].iter().rev()
-    }
-
-    /// Mutable continuations in resolution order (the stack's top first).
-    #[inline]
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Cont> {
-        self.v[..self.n as usize].iter_mut().rev()
     }
 }
 
@@ -308,9 +307,8 @@ impl State {
                 player: flip(player),
                 rg_hex: mh(rg_hex),
             },
-            Cont::WarriorPriestPlay { player, coin } => Cont::WarriorPriestPlay {
+            Cont::WarriorPriestPlay { player } => Cont::WarriorPriestPlay {
                 player: flip(player),
-                coin,
             },
             Cont::_AttackPost { atk_hex } => Cont::_AttackPost {
                 atk_hex: mh(atk_hex),

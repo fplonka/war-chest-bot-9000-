@@ -66,30 +66,14 @@ def actions_like_the_encoder(rng, na):
 
 
 def holdings(rng, n, seats):
-    """Structurally valid config vectors: counts, forced slots, then seat."""
-    forced = np.zeros((n, 2, W.NSLOT), np.float32)
-    for r in range(n):
-        depth = int(rng.integers(0, 3))
-        for q in range(depth):
-            forced[r, q, int(rng.integers(0, W.NSLOT))] = 1.0
+    """Structurally valid config vectors: counts, then seat."""
     return np.concatenate([
         rng.integers(0, 4, (n, W.CCOUNTS)).astype(np.float32) / W.CNORM,
-        forced.reshape(n, -1),
         seats.reshape(n, 1).astype(np.float32),
     ], 1)
 
 
 def main():
-    # Future forced-play flags are categorical private state, not bag coins.
-    # Keep this at the helper boundary shared by the CPU and Triton batchers.
-    cc = np.zeros((2, W.CPRIVATE), np.uint8)
-    cc[:, 10:W.CCOUNTS] = [[1, 2, 0, 0, 0], [0, 0, 3, 0, 0]]
-    cc[0, W.CCOUNTS] = 1
-    cc[1, W.CCOUNTS + W.NSLOT + 2] = 1
-    _, _, bag = public_sizes(cc, np.asarray([0, 1], np.int64), 1)
-    assert bag.tolist() == [[3, 3]], f"forced flags leaked into bag sizes: {bag}"
-    print("private/public boundary ok: forced flags are not bag counts")
-
     with tempfile.NamedTemporaryFile(suffix=".pt") as f:
         for bad in ({}, {"encoding_version": ENCODING_VERSION - 1}):
             torch.save(bad, f.name)
@@ -112,10 +96,10 @@ def main():
         np.savez(
             f.name,
             rows=np.empty((0, W.ROW_BYTES), np.uint8),
-            cc=np.empty((0, W.CPRIVATE), np.uint8), cp=np.empty(0, np.uint8),
+            cc=np.empty((0, W.CCOUNTS), np.uint8), cp=np.empty(0, np.uint8),
             cw=np.empty(0, np.float16), cy=np.empty(0, np.float16),
             seg=np.empty(0, np.int64), soff=np.asarray([0], np.int64),
-            pubfeat=np.int32(W.PUBFEAT), cprivate=np.int32(W.CPRIVATE),
+            pubfeat=np.int32(W.PUBFEAT),
             ccounts=np.int32(W.CCOUNTS),
             cnorm=np.float32(W.CNORM), row_bytes=np.int32(W.ROW_BYTES),
             version=np.int32(W.ROW_FORMAT_VERSION - 1),

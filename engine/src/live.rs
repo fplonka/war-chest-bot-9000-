@@ -194,13 +194,12 @@ impl LiveGame {
         let cfgs = self.bel[player as usize].cfg.clone();
         let (acts, aslot, fdown) = node_actions(&self.s, player, &self.ctx, &cfgs);
         let na = acts.len();
-        let forced = matches!(self.s.pending(), Cont::WarriorPriestPlay { .. });
         let obs = obs_key(&a);
         let mut pairs: Vec<(Config, f32)> = Vec::new();
         for (ci, c) in cfgs.iter().enumerate() {
             let mut legal_n = 0usize;
             for k in 0..na {
-                if action_legal(c, aslot[k], forced) {
+                if action_legal(c, aslot[k]) {
                     legal_n += 1;
                 }
             }
@@ -209,13 +208,13 @@ impl LiveGame {
             }
             let w = self.bel[player as usize].p[ci] / legal_n as f32;
             for k in 0..na {
-                if !action_legal(c, aslot[k], forced) {
+                if !action_legal(c, aslot[k]) {
                     continue;
                 }
                 if obs_key(&acts[k]) != obs {
                     continue;
                 }
-                if let Some(n) = advance_config(c, aslot[k], fdown[k], forced) {
+                if let Some(n) = advance_config(c, aslot[k], fdown[k]) {
                     pairs.push((n, w));
                 }
             }
@@ -277,7 +276,6 @@ impl LiveGame {
         // Belief update on the public observation, weighted by the policy the
         // solver actually acts on (same formula as self-play).
         let obs = obs_key(&act);
-        let forced = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
         let mut pairs: Vec<(Config, f32)> = Vec::new();
         for (ci, c) in cfgs.iter().enumerate() {
             for cell in sv.nodes[nid].legal_row(ci) {
@@ -286,7 +284,7 @@ impl LiveGame {
                     continue;
                 }
                 if let Some(n) =
-                    advance_config(c, sv.nodes[nid].aslot[a], sv.nodes[nid].fdown[a], forced)
+                    advance_config(c, sv.nodes[nid].aslot[a], sv.nodes[nid].fdown[a])
                 {
                     pairs.push((n, bel[player as usize].p[ci] * probs[cell]));
                 }

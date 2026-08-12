@@ -4,7 +4,7 @@
 use warchest::board::{board, NONE, N_HEXES};
 use warchest::rng::Rng;
 use warchest::selfplay::make_game;
-use warchest::state::{Cont, State, BLACK, WHITE};
+use warchest::state::{Cont, State, BLACK, WHITE, Z_INFLIGHT};
 use warchest::units::{def, N_UNITS, ROYAL_COIN};
 
 const POOL: [u16; 19] = [
@@ -77,25 +77,31 @@ fn check_invariants(s: &State, init: &[[u16; N_UNITS]; 2]) {
         assert!(on <= 6);
         assert_eq!(on + s.markers_hand[p as usize], 6, "marker count broke");
     }
-    // 3b. the hand never exceeds 3, even across Warrior Priest draws: every
-    // WP trigger is preceded, in the same play chain, by a coin play that
-    // emptied a hand slot, so the drawn coin lands in a hand of at most two.
-    // This is the census the pre-CUDA plan asks for (server traces are not in
-    // the repo; the engine itself was verified against them).
+    // 3b. the hand never exceeds 3, and a player has a coin in flight exactly
+    // when they owe a Warrior Priest forced play — never two. The forced play
+    // is the top of the stack the moment it is queued, and only the defender's
+    // Royal Guard soak can resolve before it, so a second one cannot start.
     for p in 0..2u8 {
-        assert!(
-            s.hand_size(p) <= 3,
-            "hand held {} coins: a WP draw pushed it past the cap",
-            s.hand_size(p)
-        );
-        let queued = usize::from(matches!(s.pending(), Cont::WarriorPriestPlay {
-            player, ..
+        assert!(s.hand_size(p) <= 3, "hand held {} coins", s.hand_size(p));
+        let owed = usize::from(matches!(s.pending(), Cont::WarriorPriestPlay {
+            player,
         } if *player == p))
             + s.conts
                 .iter()
-                .filter(|c| matches!(c, Cont::WarriorPriestPlay { player, .. } if *player == p))
+                .filter(|c| matches!(c, Cont::WarriorPriestPlay { player } if *player == p))
                 .count();
-        assert!(queued <= 2, "player {p} has {queued} forced plays queued");
+        let flight: usize = s.zones[p as usize][Z_INFLIGHT]
+            .iter()
+            .map(|&n| n as usize)
+            .sum();
+        assert!(owed <= 1, "player {p} owes {owed} forced plays");
+        // A winning forced play stops resolution where it stands, so the spent
+        // node can survive in `pending`. It names no coin, so nothing reads it.
+        assert_eq!(
+            flight,
+            if s.is_terminal() { 0 } else { owed },
+            "player {p} owes {owed} forced plays but holds {flight} coins"
+        );
     }
     // 4. winner consistency.
     if let Some(w) = s.winner() {

@@ -296,14 +296,32 @@ pub fn node_actions(
     // invariant, so one probe can be reconfigured for every slot instead of
     // cloning a 688-byte State per slot.
     let mut probe = *s;
-    if matches!(s.pending(), Cont::MainPlay) {
+    let forced = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
+    if forced || matches!(s.pending(), Cont::MainPlay) {
+        // Both are coin plays; they differ only in which private zone pays.
+        // Probe one state per payable slot, so `legal_actions` lists exactly
+        // the plays that slot affords, and keep the union.
         let res = reserve(s, player, ctx);
+        let holds = |c: &Config, k: usize| {
+            if forced {
+                c.inflight == Some(k as u8)
+            } else {
+                c.hand[k] > 0
+            }
+        };
         for k in 0..NSLOT {
-            let Some(one) = cfgs.iter().find(|c| c.hand[k] > 0).copied().or_else(|| {
+            let Some(one) = cfgs.iter().find(|c| holds(c, k)).copied().or_else(|| {
                 if cfgs.is_empty() && res[k] > 0 {
+                    // No support to read: synthesise a config holding slot `k`,
+                    // starting from the world's own private state so the probe
+                    // stays consistent with the public node.
                     let mut c = true_config(s, player, ctx);
-                    c.hand = [0; NSLOT];
-                    c.hand[k] = 1;
+                    if forced {
+                        c.inflight = Some(k as u8);
+                    } else {
+                        c.hand = [0; NSLOT];
+                        c.hand[k] = 1;
+                    }
                     Some(c)
                 } else {
                     None
@@ -324,47 +342,9 @@ pub fn node_actions(
                 } else {
                     ctx.slot_of[player as usize][coin as usize]
                 };
-                if slot >= 0 && !cfgs.is_empty() && !cfgs.iter().any(|c| c.hand[slot as usize] > 0)
-                {
+                if slot >= 0 && !cfgs.is_empty() && !cfgs.iter().any(|c| holds(c, slot as usize)) {
                     continue;
                 }
-                aslot.push(slot);
-                fdown.push(is_facedown_play(&a));
-                acts.push(a);
-            }
-        }
-    } else if matches!(s.pending(), Cont::WarriorPriestPlay { .. }) {
-        // A forced play is config-dependent the same way a main play is: the
-        // legal set is a function of the config's pending coin. Probe one
-        // state per pending slot present in the support; the probe's pending
-        // node names the drawn unit so `legal_actions` lists exactly the plays
-        // of that coin.
-        for k in 0..NSLOT {
-            if !cfgs.is_empty() && !cfgs.iter().any(|c| c.pending_coin == Some(k as u8)) {
-                continue;
-            }
-            let mut one = cfgs
-                .iter()
-                .find(|c| c.pending_coin == Some(k as u8))
-                .copied()
-                .unwrap_or_else(|| true_config(s, player, ctx));
-            if cfgs.is_empty() {
-                one.hand[k] = 1;
-                one.pending_coin = Some(k as u8);
-            }
-            set_config(&mut probe, player, ctx, &one);
-            for a in probe.legal_actions() {
-                let key = a.encode();
-                if seen.contains(&key) {
-                    continue;
-                }
-                seen.push(key);
-                let coin = action_coin(&a, &probe);
-                let slot = if coin == NONE {
-                    -1
-                } else {
-                    ctx.slot_of[player as usize][coin as usize]
-                };
                 aslot.push(slot);
                 fdown.push(is_facedown_play(&a));
                 acts.push(a);
@@ -1067,7 +1047,7 @@ impl<'a> Solver<'a> {
             // internally), so both come from the state at the head of the run.
             let res = reserve(&cs, player, &self.ctx);
             let fu = faceup_counts(&cs, player, &self.ctx);
-            // A Warrior Priest draw's children carry the forced-play coin.
+            // A Warrior Priest draw's children hold the coin in flight.
             let wp = matches!(s.pending(), Cont::WarriorPriestDraw { .. });
             let mut steps = 0u8;
             loop {
@@ -1117,12 +1097,12 @@ impl<'a> Solver<'a> {
         let na = acts.len();
         debug_assert!(na > 0, "a decision node must offer a reachable action");
 
-        // A Warrior Priest forced play may only spend the pending coin, so the
-        // per-config mask is the pending match rather than the hand check.
-        let wp_play = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
+        // At a forced play every config in the acting support must hold the
+        // drawn coin: that is what makes its actions legal at all.
         assert!(
-            !wp_play || mine.iter().all(|c| c.pending_coin.is_some()),
-            "acting support and Warrior Priest continuation disagree: pending={:?} support={mine:?}",
+            !matches!(s.pending(), Cont::WarriorPriestPlay { .. })
+                || mine.iter().all(|c| c.inflight.is_some()),
+            "acting support has no coin in flight at a forced play: pending={:?} support={mine:?}",
             s.pending(),
         );
         let tcells = timed!(BCELLS);
@@ -1134,7 +1114,7 @@ impl<'a> Solver<'a> {
         legal_off.push(0);
         for (ci, c) in mine.iter().enumerate() {
             for a in 0..na {
-                let legal = action_legal(c, aslot[a], wp_play);
+                let legal = action_legal(c, aslot[a]);
                 if legal {
                     legal_action.push(a as u32);
                     legal_child.push(0);
@@ -1223,7 +1203,7 @@ impl<'a> Solver<'a> {
                         continue;
                     }
                     let ci = cell_row[cell] as usize;
-                    if let Some(n) = advance_config(&mine[ci], aslot[a], fdown[a], wp_play) {
+                    if let Some(n) = advance_config(&mine[ci], aslot[a], fdown[a]) {
                         ent.push((n.key(), cell_u));
                     }
                 }
@@ -1237,7 +1217,7 @@ impl<'a> Solver<'a> {
                     prev = k;
                     let ci = cell_row[cell] as usize;
                     let a = legal_action[cell] as usize;
-                    sup.push(advance_config(&mine[ci], aslot[a], fdown[a], wp_play).unwrap());
+                    sup.push(advance_config(&mine[ci], aslot[a], fdown[a]).unwrap());
                 }
                 legal_trans[cell] = (sup.len() - 1) as u32;
             }
@@ -1252,7 +1232,7 @@ impl<'a> Solver<'a> {
             let a = obs_act[obs_start[ch] as usize] as usize;
             let rep = *mine
                 .iter()
-                .find(|c| action_legal(c, aslot[a], wp_play))
+                .find(|c| action_legal(c, aslot[a]))
                 .expect("a kept action is playable by some config in the support");
             let tb = timed!(BAPPLY);
             let mut cs = s.clone();
@@ -1472,15 +1452,14 @@ impl<'a> Solver<'a> {
     /// `Config` alone would be wrong: the bag depends on the node's reserve,
     /// which changes as coins leave it.
     fn intern_config(&mut self, c: &Config, res: &[u8; NSLOT], p: usize) -> u32 {
-        let mut private = [0u8; CPRIVATE];
-        config_private(c, res, &mut private);
+        let mut private = [0u8; CCOUNTS];
+        config_counts(c, res, &mut private);
         let mut key = p as u64;
         for &x in &private[..CCOUNTS] {
             debug_assert!(x < 8, "count over the key width");
             key = (key << 3) | x as u64;
         }
-        key = (key << 3) | c.pending_coin.map_or(0, |k| k as u64 + 1);
-        key = (key << 3) | c.queued_coin.map_or(0, |k| k as u64 + 1);
+        key = (key << 3) | c.inflight.map_or(0, |k| k as u64 + 1);
         if let Some(&i) = self.cmap.get(&key) {
             return i;
         }
@@ -1493,10 +1472,10 @@ impl<'a> Solver<'a> {
         for k in 0..CCOUNTS {
             self.cphi[at + k] = private[k] as f32 / CNORM;
         }
-        for k in CCOUNTS..CPRIVATE {
+        for k in CCOUNTS..CCOUNTS {
             self.cphi[at + k] = private[k] as f32;
         }
-        self.cphi[at + CPRIVATE] = p as f32;
+        self.cphi[at + CCOUNTS] = p as f32;
         self.cmap.insert(key, i);
         i
     }

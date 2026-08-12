@@ -52,9 +52,8 @@ const STARTER_WHITE: [u16; 4] = [17, 12, 4, 9]; // Swordsman, Pikeman, Crossbowm
 const STARTER_BLACK: [u16; 4] = [1, 3, 8, 16]; // Archer, Cavalry, Lancer, Scout
 
 /// Draftable units. The Warrior Priest pair (ids 18 and 54) is included: their
-/// private mid-round draw puts "which coin must I now play" into the private
-/// state as `Config`'s current/queued forced coins, which the solver, belief
-/// filter and walk all carry.
+/// private mid-round draw puts the drawn coin in flight, which is one more
+/// private count for the solver, the belief filter and the walk to carry.
 pub const DRAFT_POOL: [u16; 19] = [
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 17, 18, 19, 52, 53, 54,
 ];
@@ -171,13 +170,12 @@ impl NodePolicy {
     fn frame(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config]) -> NodePolicy {
         let (acts, aslot, fdown) = node_actions(s, player, ctx, cfgs);
         let na = acts.len();
-        let forced = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
         let mut legal_off = Vec::with_capacity(cfgs.len() + 1);
         let mut legal_action = Vec::new();
         legal_off.push(0);
         for c in cfgs {
             for a in 0..na {
-                if action_legal(c, aslot[a], forced) {
+                if action_legal(c, aslot[a]) {
                     legal_action.push(a as u32);
                 }
             }
@@ -208,8 +206,7 @@ fn greedy_policy(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config], temp: f32) -
     let na = np.acts.len();
     let mut score = vec![f32::NEG_INFINITY; na];
     for a in 0..na {
-        let forced = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
-        let rep = cfgs.iter().find(|c| action_legal(c, np.aslot[a], forced));
+        let rep = cfgs.iter().find(|c| action_legal(c, np.aslot[a]));
         let Some(rep) = rep else { continue };
         let mut probe = s.clone();
         set_config(&mut probe, player, ctx, rep);
@@ -276,8 +273,8 @@ pub struct Data {
     /// row is expanded when a batch is made, so the stored bytes never go
     /// stale as the network changes.
     pub rows: Vec<u8>,
-    /// `[total_configs, CPRIVATE]` raw config values in arena order: counts and
-    /// future forced-play one-hots. Raw `u8` storage keeps millions affordable.
+    /// `[total_configs, CCOUNTS]` raw config counts in arena order. Raw `u8`
+    /// storage keeps millions affordable.
     pub cc: Vec<u8>,
     /// `[total_configs]` belief probability of each config.
     pub cw: Vec<f32>,
@@ -443,9 +440,9 @@ impl Data {
         }
         for p in 0..2 {
             let res = reserve(s, p as u8, ctx);
-            let mut private = [0u8; CPRIVATE];
+            let mut private = [0u8; CCOUNTS];
             for (ci, c) in bel[p].cfg.iter().enumerate() {
-                config_private(c, &res, &mut private);
+                config_counts(c, &res, &mut private);
                 self.cc.extend_from_slice(&private);
                 self.cw.push(bel[p].p[ci]);
                 self.cy.push(y[p][ci] - centre);
@@ -1126,7 +1123,6 @@ impl<'a> Game<'a> {
                 };
             let chosen = np.legal_action[chosen_cell] as usize;
             let pending_before = *s.pending();
-            let forced = matches!(pending_before, Cont::WarriorPriestPlay { .. });
 
             // ReBeL attaches the reference-policy PBS to an off-policy sampled
             // branch. For ordinary agents, `np` is already their full behaviour
@@ -1139,7 +1135,7 @@ impl<'a> Game<'a> {
                     if obs_key(&np.acts[a]) != obs {
                         continue;
                     }
-                    if let Some(n) = advance_config(c, np.aslot[a], np.fdown[a], forced) {
+                    if let Some(n) = advance_config(c, np.aslot[a], np.fdown[a]) {
                         pairs.push((n, bel[player as usize].p[ci] * np.probs[cell]));
                     }
                 }
@@ -1507,8 +1503,7 @@ fn assert_belief_matches_state(
 ) {
     let res = reserve(s, p, ctx);
     let truth = true_config(s, p, ctx);
-    let forced =
-        usize::from(truth.pending_coin.is_some()) + usize::from(truth.queued_coin.is_some());
+    let forced = truth.inflight.is_some();
     let hand = s.hand_size(p);
     let fd: u8 = s.zones[p as usize][crate::state::Z_FACEDOWN]
         .iter()
@@ -1526,14 +1521,14 @@ fn assert_belief_matches_state(
             s.pending()
         );
         assert_eq!(
-            usize::from(c.pending_coin.is_some()) + usize::from(c.queued_coin.is_some()),
+            c.inflight.is_some(),
             forced,
-            "{event} belief changed public forced-play depth: player={p} action={action:?} state={:?} config={c:?}",
+            "{event} belief disagrees on whether a coin is in flight: player={p} action={action:?} state={:?} config={c:?}",
             s.pending()
         );
         for k in 0..NSLOT {
             assert!(
-                c.hand[k] + c.fd[k] <= res[k],
+                c.hand[k] + c.fd[k] + u8::from(c.inflight == Some(k as u8)) <= res[k],
                 "{event} belief exceeds reserve: player={p} slot={k} reserve={} action={action:?} state={:?} config={c:?}",
                 res[k],
                 s.pending()

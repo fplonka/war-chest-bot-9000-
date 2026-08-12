@@ -20,13 +20,16 @@ Two things are hidden in War Chest:
 
 * the **hand** — which coins were drawn this round;
 * the **identities of face-down discards** — the coin spent on Pass, Claim
-  Initiative or a Recruit payment is never revealed.
+  Initiative or a Recruit payment is never revealed;
+* the **coin in flight** — the Warrior Priest's drawn coin, between the draw
+  and the forced play that must spend it.
 
 Everything else is public, including every *count*. So a player's private state
-is exactly the pair `(hand, facedown)` — a `Config` — and the bag is derived:
+is exactly the triple `(hand, facedown, inflight)` — a `Config` — and the bag is
+derived:
 
 ```
-bag = reserve - hand - facedown        reserve = bag + hand + facedown  (public)
+bag = reserve - hand - facedown - inflight            (reserve is public)
 ```
 
 The reserve is public because every action either moves a coin *within* it (a
@@ -35,9 +38,7 @@ tree carry every config, and `features_do_not_leak_private_information` checks
 it.
 
 A draft fixes 4 unit types plus the Royal Coin, so at most `NSLOT = 5` coin types
-per player; a hand holds at most 3, even across a Warrior Priest draw — the
-trigger is always preceded, in the same play chain, by the coin play that
-fired it. Over 120k positions of random play with the full draft pool the
+per player, and a hand holds at most 3. Over 120k positions of random play with the full draft pool the
 reachable config set has median 22, mean 57, p99 567. CFR enumerates information
 states exactly — no particle approximation.
 
@@ -59,11 +60,12 @@ bag empties the discard pile is shuffled in, which erases the face-down
 component; bag emptiness is public, so every config reshuffles together.
 
 **The Warrior Priest pair (units 18 and 54) is in the draft pool.** Its
-attribute triggers a private mid-round draw, so the private state also carries
-the next and, under a nested trigger, queued forced-play coin. Public decisions
-can resolve above an older forced play, so these identities remain part of the
-config until their corresponding continuation resolves. They are categorical
-per-slot inputs in both replay and the value network.
+attribute triggers a private mid-round draw whose coin must be played at once.
+The coin waits in `Z_INFLIGHT`, a one-coin private zone, and that is the whole
+of the rule: the forced play pays from that zone instead of the hand, and the
+public continuation says only *that* a forced play is owed, never which coin
+spends it. Nothing is in flight at a normal coin play, so the network — which
+is queried only there — never sees the zone.
 
 ## 2. Horizon
 

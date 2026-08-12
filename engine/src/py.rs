@@ -1217,46 +1217,22 @@ fn hex_mirror() -> Vec<u32> {
 /// game-level oracle rather than another restatement of encoder indices.
 #[pyfunction]
 fn mirror_rows_oracle(n: usize, seed: u64) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
-    use crate::rebel::{config_private, pack_row, reserve, true_config, Ctx, CPRIVATE, ROW_BYTES};
+    use crate::rebel::{config_counts, pack_row, reserve, true_config, Ctx, CCOUNTS, ROW_BYTES};
     use crate::rng::Rng;
     use crate::selfplay::make_game;
     let mut rng = Rng::new(seed);
     let mut state = make_game(&mut rng, true);
     let mut original = Vec::with_capacity(n * ROW_BYTES);
     let mut mirrored = Vec::with_capacity(n * ROW_BYTES);
-    let mut private = Vec::with_capacity(n * 2 * CPRIVATE);
-    let mut mirrored_private = Vec::with_capacity(n * 2 * CPRIVATE);
+    let mut private = Vec::with_capacity(n * 2 * CCOUNTS);
+    let mut mirrored_private = Vec::with_capacity(n * 2 * CCOUNTS);
     while original.len() < n * ROW_BYTES {
         if state.is_terminal() {
             state = make_game(&mut rng, true);
             continue;
         }
         if matches!(state.pending(), crate::state::Cont::MainPlay) {
-            let mut sample = state;
-            if original.is_empty() {
-                // Pin both categorical continuation channels in the oracle;
-                // waiting for a naturally nested Warrior Priest play would
-                // make this correctness gate probabilistic.
-                let p = sample.to_act();
-                let mut coins = Vec::new();
-                for (unit, &count) in sample.zones[p as usize][crate::state::Z_HAND]
-                    .iter()
-                    .enumerate()
-                {
-                    for _ in 0..count {
-                        coins.push(unit as u8);
-                    }
-                }
-                for &coin in coins.iter().take(2) {
-                    sample
-                        .conts
-                        .push(crate::state::Cont::WarriorPriestPlay { player: p, coin });
-                }
-                assert!(
-                    !coins.is_empty(),
-                    "a MainPlay oracle state must hold a coin"
-                );
-            }
+            let sample = state;
             let ctx = Ctx::new(&sample);
             let mut row = [0u8; ROW_BYTES];
             pack_row(&sample, &ctx, &mut row);
@@ -1266,8 +1242,8 @@ fn mirror_rows_oracle(n: usize, seed: u64) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8
             pack_row(&ms, &mctx, &mut row);
             mirrored.extend_from_slice(&row);
             for p in 0..2u8 {
-                let mut c = [0; CPRIVATE];
-                config_private(
+                let mut c = [0; CCOUNTS];
+                config_counts(
                     &true_config(&sample, p, &ctx),
                     &reserve(&sample, p, &ctx),
                     &mut c,
@@ -1275,8 +1251,8 @@ fn mirror_rows_oracle(n: usize, seed: u64) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8
                 private.extend_from_slice(&c);
             }
             for p in 0..2u8 {
-                let mut c = [0; CPRIVATE];
-                config_private(&true_config(&ms, p, &mctx), &reserve(&ms, p, &mctx), &mut c);
+                let mut c = [0; CCOUNTS];
+                config_counts(&true_config(&ms, p, &mctx), &reserve(&ms, p, &mctx), &mut c);
                 mirrored_private.extend_from_slice(&c);
             }
         }
@@ -1360,7 +1336,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CFEAT", crate::rebel::CFEAT)?;
     m.add("AFEAT", crate::rebel::AFEAT)?;
     m.add("CCOUNTS", crate::rebel::CCOUNTS)?;
-    m.add("CPRIVATE", crate::rebel::CPRIVATE)?;
     m.add("AUX", crate::selfplay::AUX)?;
     m.add("CNORM", crate::rebel::CNORM)?;
     m.add("N_HEXES", crate::board::N_HEXES)?;

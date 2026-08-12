@@ -32,7 +32,7 @@ use warchest::rebel::*;
 use warchest::rng::Rng;
 use warchest::search::{node_actions, Cfg, Nets, Solver};
 use warchest::selfplay::make_game;
-use warchest::state::{Cont, State, Z_BAG, Z_FACEDOWN, Z_FACEUP, Z_HAND};
+use warchest::state::{Cont, State, Z_BAG, Z_FACEDOWN, Z_FACEUP};
 use warchest::units::{write_card_features, CARD_FEATS, N_UNITS};
 use warchest::Action;
 
@@ -50,7 +50,7 @@ fn random_net(seed: u64, hidden: usize, dg: usize) -> Mlp {
         + xd * hidden
         + hidden * hidden
         + 2 * dg * hidden
-        + (6 + de) * dg
+        + warchest::net::hfeat(de) * dg
         + dg * dg
         + dg * dg
         + dg * (rk + 1)
@@ -111,8 +111,7 @@ fn uniform_row(
     c: &Config,
 ) -> (Vec<Action>, Vec<i8>, Vec<bool>, Vec<f64>) {
     let (acts, aslot, fdown) = node_actions(s, p, ctx, std::slice::from_ref(c));
-    let forced = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
-    let legal: Vec<bool> = aslot.iter().map(|&k| action_legal(c, k, forced)).collect();
+    let legal: Vec<bool> = aslot.iter().map(|&k| action_legal(c, k)).collect();
     let n = legal.iter().filter(|&&x| x).count() as f64;
     let probs = legal
         .iter()
@@ -226,8 +225,8 @@ fn run_one(seed: u64) {
 }
 
 /// The same exhaustive-vs-incremental comparison on a draft with both Warrior
-/// Priests: private mid-round draws put `pending_coin` into the config, so the
-/// belief update, the walk and the brute force all carry it.
+/// Priests: private mid-round draws put a coin in flight, so the belief update,
+/// the walk and the brute force all carry it.
 #[test]
 fn belief_tracker_matches_brute_force_with_warrior_priests() {
     for seed in 0..4u64 {
@@ -323,8 +322,7 @@ fn run_one_draft(seed: u64, white: &[u16], black: &[u16]) {
                 if cprobs[i] <= 0.0 || obs_key(a) != obs {
                     continue;
                 }
-                let forced = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
-                if let Some(n) = advance_config(c, aslot[i], fdown[i], forced) {
+                if let Some(n) = advance_config(c, aslot[i], fdown[i]) {
                     pairs.push((n, bel[p as usize].p[ci] * cprobs[i] as f32));
                 }
             }
@@ -407,9 +405,10 @@ fn compare(
 }
 
 /// The config key must stay inside the packed `u64` budget (the key shares a
-/// word with the element index in the solver's sort): 41 bits of config +
+/// word with the element index in the solver's sort): 38 bits of config +
 /// `IDX_BITS` index bits must not overflow. Also pins that the key
-/// distinguishes pendings and that hand slots never exceed the two-bit width.
+/// distinguishes in-flight coins and that hand slots never exceed the two-bit
+/// width.
 #[test]
 fn config_key_packing_has_headroom() {
     for seed in 0..200u64 {
@@ -420,173 +419,89 @@ fn config_key_packing_has_headroom() {
             c.hand[k] = r.below(4) as u8;
             c.fd[k] = r.below(6) as u8;
         }
-        c.pending_coin = if r.next_u64() & 1 == 0 {
+        c.inflight = if r.next_u64() & 1 == 0 {
             None
         } else {
             Some(r.below(NSLOT) as u8)
         };
-        if c.pending_coin.is_some() && r.next_u64() & 1 != 0 {
-            c.queued_coin = Some(r.below(NSLOT) as u8);
-        }
         let key = c.key();
         assert!(
             key < (1u64 << (64 - IDX_BITS)),
             "config key must leave room for the element index: {:#x}",
             key
         );
-        // Same counts, different pending -> different key; equal -> equal.
+        // Same counts, different in-flight coin -> different key.
         let mut d = c;
         assert_eq!(c.key(), d.key());
-        d.pending_coin = match c.pending_coin {
+        d.inflight = match c.inflight {
             None => Some(0),
             Some(p) if p + 1 < NSLOT as u8 => Some(p + 1),
             Some(_) => None,
         };
-        if c.pending_coin != d.pending_coin {
-            assert_ne!(c.key(), d.key());
-        }
-        d = c;
-        d.queued_coin = match c.queued_coin {
-            None => Some(0),
-            Some(p) if p + 1 < NSLOT as u8 => Some(p + 1),
-            Some(_) => None,
-        };
-        if c.queued_coin != d.queued_coin {
-            assert_ne!(c.key(), d.key());
-        }
+        assert_ne!(c.key(), d.key());
     }
-    // Explicit extreme: every slot at its maximum with a pending coin.
+    // Explicit extreme: every slot at its maximum with a coin in flight.
     let mut c = Config::default();
     for k in 0..NSLOT {
         c.hand[k] = 3;
         c.fd[k] = 5;
     }
-    c.pending_coin = Some(NSLOT as u8 - 1);
-    c.queued_coin = Some(NSLOT as u8 - 1);
+    c.inflight = Some(NSLOT as u8 - 1);
     assert!(c.key() < (1u64 << (64 - IDX_BITS)));
     // The hand width is two bits; `key`'s debug_assert is the overflow test
     // for a slot value of 4 or more (it fires in every debug test build).
 }
 
 #[test]
-fn nested_warrior_priest_plays_stay_in_the_config() {
-    let mut old = Config::default();
-    old.hand[1] = 1;
-    old.pending_coin = Some(1);
-    let drawn = belief_after_draw(&Belief::point(old), &[0, 1, 1, 0, 0], &[0; NSLOT], true);
-    assert_eq!(drawn.cfg.len(), 1);
-    assert_eq!(drawn.cfg[0].pending_coin, Some(2));
-    assert_eq!(drawn.cfg[0].queued_coin, Some(1));
-    let revealed = advance_config(&drawn.cfg[0], 2, false, true).expect("new forced play");
-    assert_eq!(revealed.pending_coin, Some(1));
-    assert_eq!(revealed.queued_coin, None);
-
-    let mut s = make_game(&mut Rng::new(9), false);
-    let ctx = Ctx::new(&s);
-    let player = 0;
-    let slot = 1usize;
-    let coin = ctx.slots[player][slot];
-    s.zones[player][Z_BAG][coin as usize] -= 2;
-    s.zones[player][Z_HAND][coin as usize] += 2;
-    s.pending = Cont::WarriorPriestPlay {
-        player: player as u8,
-        coin,
-    };
-    s.conts.clear();
-    s.conts.push(Cont::WarriorPriestPlay {
-        player: player as u8,
-        coin,
-    });
-
-    let before = true_config(&s, player as u8, &ctx);
-    assert_eq!(before.pending_coin, Some(slot as u8));
-    assert_eq!(before.queued_coin, Some(slot as u8));
-    let after = advance_config(&before, slot as i8, true, true).expect("forced play");
-    s.apply_inplace(Action::Pass { coin });
-    assert_eq!(true_config(&s, player as u8, &ctx), after);
-    assert_eq!(after.pending_coin, Some(slot as u8));
-    assert_eq!(after.queued_coin, None);
-
-    // Instantiating a sampled world changes the hidden continuation coin too,
-    // not just hand/bag/discard counts.
-    let mut sampled = after;
-    sampled.hand[slot] -= 1;
-    sampled.hand[slot + 1] += 1;
-    sampled.pending_coin = Some((slot + 1) as u8);
-    set_config(&mut s, player as u8, &ctx, &sampled);
-    assert_eq!(true_config(&s, player as u8, &ctx), sampled);
-
-    // A normal play can sit above a future forced play. It spends an ordinary
-    // hand coin and must preserve the forced identity until that continuation
-    // becomes current.
-    let mut s = make_game(&mut Rng::new(10), false);
-    let ctx = Ctx::new(&s);
-    let now_slot = 1usize;
-    let future_slot = 2usize;
-    let now_coin = ctx.slots[player][now_slot];
-    let future_coin = ctx.slots[player][future_slot];
-    for coin in [now_coin, future_coin] {
-        s.zones[player][Z_BAG][coin as usize] -= 1;
-        s.zones[player][Z_HAND][coin as usize] += 1;
+fn a_warrior_priest_draw_puts_the_coin_in_flight() {
+    // Belief side: the drawn coin does not join the hand, it waits in flight,
+    // and the forced play spends it.
+    let mut before = Config::default();
+    before.hand[1] = 1;
+    let drawn = belief_after_draw(&Belief::point(before), &[0, 2, 1, 0, 0], &[0; NSLOT], true);
+    assert_eq!(drawn.cfg.len(), 2, "two drawable coins");
+    for c in drawn.cfg.iter() {
+        assert_eq!(c.hand, before.hand, "the hand is untouched by a WP draw");
+        let k = c.inflight.expect("a coin in flight");
+        assert_eq!(
+            advance_config(c, k as i8, false).expect("forced play").inflight,
+            None,
+            "the forced play spends the coin"
+        );
+        assert!(
+            advance_config(c, ((k + 1) % NSLOT as u8) as i8, false).is_none(),
+            "no other coin is legal"
+        );
     }
-    s.active = player as u8;
-    s.pending = Cont::MainPlay;
-    s.conts.clear();
-    s.conts.push(Cont::WarriorPriestPlay {
-        player: player as u8,
-        coin: future_coin,
-    });
 
-    let before = true_config(&s, player as u8, &ctx);
-    assert_eq!(before.pending_coin, Some(future_slot as u8));
-    let reserve = reserve(&s, player as u8, &ctx);
-    let mut alternate = before;
-    alternate.pending_coin = Some(now_slot as u8);
-    let mut encoded = [[0.0; CFEAT]; 2];
-    write_config_feats(&before, &reserve, player, &mut encoded[0]);
-    write_config_feats(&alternate, &reserve, player, &mut encoded[1]);
-    assert_ne!(
-        encoded[0], encoded[1],
-        "the value input must name the future forced coin"
-    );
-    let mut private = [0; CPRIVATE];
-    config_private(&before, &reserve, &mut private);
-    assert_eq!(private[CCOUNTS + future_slot], 1);
-    assert_eq!(private[CCOUNTS..CPRIVATE].iter().sum::<u8>(), 1);
-    let (acts, aslot, fdown) = node_actions(&s, player as u8, &ctx, &[before]);
-    let action = acts
-        .iter()
-        .position(|a| *a == Action::Pass { coin: now_coin })
-        .expect("normal play from another hand coin");
-    assert!(action_legal(&before, aslot[action], false));
-    let after = advance_config(&before, aslot[action], fdown[action], false)
-        .expect("normal play above future forced play");
-    assert_eq!(after.pending_coin, before.pending_coin);
-    s.apply_inplace(acts[action]);
-    assert!(matches!(s.pending(), Cont::WarriorPriestPlay { .. }));
-    assert_eq!(true_config(&s, player as u8, &ctx), after);
-
-    // Empty-support action probing is used by fallback/shape paths. Its
-    // synthetic config must start from the world's future continuation state;
-    // a default config used to panic here after a long random-draft run.
-    let mut probe = s;
-    probe.pending = Cont::MainPlay;
-    probe.conts.clear();
-    probe.conts.push(Cont::WarriorPriestPlay {
-        player: player as u8,
-        coin: future_coin,
-    });
-    assert!(!node_actions(&probe, player as u8, &ctx, &[]).0.is_empty());
-
-    // A winning forced play leaves the consumed node in `State::pending`
-    // because resolution stops immediately. Terminal configs have no future
-    // forced action and must not preserve that stale identity.
-    let mut terminal = s;
-    terminal.winner = player as u8;
-    let done = true_config(&terminal, player as u8, &ctx);
-    assert_eq!(done.pending_coin, None);
-    assert_eq!(done.queued_coin, None);
-    set_config(&mut terminal, player as u8, &ctx, &done);
+    // World side: at a real forced play the config is a plain read of the
+    // zones, and instantiating a sampled config round-trips.
+    let mut rng = Rng::new(7);
+    let mut s = make_game(&mut rng, true);
+    while !matches!(s.pending(), Cont::WarriorPriestPlay { .. }) {
+        if s.is_terminal() {
+            s = make_game(&mut rng, true);
+            continue;
+        }
+        let acts = s.legal_actions();
+        s = s.apply(acts[rng.below(acts.len())]);
+    }
+    let player = s.to_act();
+    let ctx = Ctx::new(&s);
+    let truth = true_config(&s, player, &ctx);
+    assert!(truth.inflight.is_some(), "a forced play holds its coin");
+    let mut world = s;
+    set_config(&mut world, player, &ctx, &truth);
+    assert_eq!(true_config(&world, player, &ctx), truth);
+    let (acts, aslot, _) = node_actions(&s, player, &ctx, &[truth]);
+    assert!(!acts.is_empty());
+    for (a, &slot) in acts.iter().zip(aslot.iter()) {
+        assert_eq!(
+            slot,
+            truth.inflight.unwrap() as i8,
+            "every forced action spends the drawn coin: {a:?}"
+        );
+    }
 }
 
 /// The reachable-config census, re-run with the Warrior Priests in the draft
@@ -994,8 +909,7 @@ fn config_counts_are_hand_facedown_bag() {
     let c = Config {
         hand: [1, 0, 2, 0, 0],
         fd: [2, 1, 0, 0, 1],
-        pending_coin: None,
-        queued_coin: None,
+        inflight: None,
     };
     let mut cnt = [0u8; CCOUNTS];
     config_counts(&c, &reserve, &mut cnt);
@@ -1007,8 +921,8 @@ fn config_counts_are_hand_facedown_bag() {
     for k in 0..CCOUNTS {
         assert_eq!(phi[k], cnt[k] as f32 / CNORM);
     }
-    assert!(phi[CCOUNTS..CPRIVATE].iter().all(|&x| x == 0.0));
-    assert_eq!(phi[CPRIVATE], 1.0, "seat flag");
+    assert!(phi[CCOUNTS..CCOUNTS].iter().all(|&x| x == 0.0));
+    assert_eq!(phi[CCOUNTS], 1.0, "seat flag");
 }
 
 // ------------------------------------------------------ no leak through a solve
@@ -1228,14 +1142,12 @@ fn from_pairs_keeps_zero_weight_configs() {
     let b = Config {
         hand: [1, 0, 0, 0, 0],
         fd: [0; NSLOT],
-        pending_coin: None,
-        queued_coin: None,
+        inflight: None,
     };
     let c = Config {
         hand: [0; NSLOT],
         fd: [1, 0, 0, 0, 0],
-        pending_coin: None,
-        queued_coin: None,
+        inflight: None,
     };
     let bel = Belief::from_pairs(vec![
         (b, 0.25),
@@ -1349,8 +1261,7 @@ fn zero_weight_config_survives_the_walk_update() {
                 if obs_key(&n0.acts[a]) != obs {
                     continue;
                 }
-                let forced = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
-                if let Some(n) = advance_config(c, n0.aslot[a], n0.fdown[a], forced) {
+                if let Some(n) = advance_config(c, n0.aslot[a], n0.fdown[a]) {
                     pairs.push((n, bel[me].p[ci] * p));
                 }
             }

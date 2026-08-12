@@ -335,11 +335,9 @@ extern "C" __global__ void holding_in(const WaveDev* w, const WeightDev* wt) {
     // Must match net.rs::holdings and value_net.py::holdings -- this is the
     // third copy of that encoding and the one production actually solves with.
     out[0] = p[k]; out[1] = p[NSLOT + k]; out[2] = p[2 * NSLOT + k];
-    out[3] = p[CCOUNTS + k];
-    out[4] = p[CCOUNTS + NSLOT + k];
-    out[5] = seat - 0.5f;
+    out[3] = seat - 0.5f;
     const float* e = AP(w, A_E) + ((unsigned long long)job * NTYPE + (int)seat * NSLOT + k) * DE;
-    for (int j = 0; j < DE; j++) out[6 + j] = e[j];
+    for (int j = 0; j < DE; j++) out[4 + j] = e[j];
 }
 
 extern "C" __global__ void slot_sum(const WaveDev* w, const WeightDev* wt,

@@ -49,7 +49,7 @@
 
 use crate::board::N_HEXES;
 use crate::rebel::{
-    AFEAT, AOFF_PAYS, CCOUNTS, CFEAT, CPRIVATE, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_CARDS,
+    AFEAT, AOFF_PAYS, CCOUNTS, CFEAT, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_CARDS,
     OFF_LOOSE, OFF_PILES, PILE_COUNTS, PUBFEAT,
 };
 use crate::units::CARD_FEATS;
@@ -1020,7 +1020,7 @@ impl Mlp {
             let mut inp = vec![0.0f32; n * NSLOT * hf];
             for r in 0..n {
                 let p = &phi[r * cf..(r + 1) * cf];
-                let seat = p[CPRIVATE];
+                let seat = p[CCOUNTS];
                 for k in 0..NSLOT {
                     let row = &mut inp[(r * NSLOT + k) * hf..(r * NSLOT + k + 1) * hf];
                     row[0] = p[k];
@@ -1033,11 +1033,9 @@ impl Mlp {
                     // as a constant that differs by seat. That is a common-mode
                     // offset in a value that must be antisymmetric. Must match
                     // `value_net.py::holdings`.
-                    row[3] = p[CCOUNTS + k];
-                    row[4] = p[CCOUNTS + NSLOT + k];
-                    row[5] = seat - 0.5;
+                    row[3] = seat - 0.5;
                     let t = seat as usize * NSLOT + k;
-                    row[6..].copy_from_slice(&e[t * de..(t + 1) * de]);
+                    row[4..].copy_from_slice(&e[t * de..(t + 1) * de]);
                 }
             }
             let mut a = inp;
@@ -1300,12 +1298,10 @@ impl Mlp {
     }
 }
 
-/// One coin type's input to the holding tower: its three counts, next/queued
-/// forced-play flags, the seat, and its card embedding.
-#[allow(non_snake_case)]
-/// Named here because the GPU build has to cut the same row.
+/// One coin type's input to the holding tower: its three counts, the seat, and
+/// its card embedding. Named here because the GPU build cuts the same row.
 pub const fn hfeat(de: usize) -> usize {
-    6 + de
+    4 + de
 }
 
 /// Width of the trunk's input, once the card embeddings are spliced in: the raw
