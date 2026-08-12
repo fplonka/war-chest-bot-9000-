@@ -63,6 +63,7 @@ pull)
         --include 'train.log' \
         --exclude '*' "root@$host:$remote/runs/" "$here/runs/"
     echo "pulled reports into $here/runs"
+    python3 "$here/tools/runs_index.py"
     ;;
 build)
     # Without `gpu` the extension has no gpu_start and every run on this box
