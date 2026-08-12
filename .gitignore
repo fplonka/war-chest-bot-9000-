@@ -15,3 +15,4 @@ runs/plotly.min.js
 runs/*/report.html
 runs/*.html
 data/
+.DS_Store
