@@ -22,7 +22,7 @@ train/           config.py   every knob of a run, one object; the experiments we
   train.py       PyTorch training loop, snapshots on a timer, judges nothing
   value_net.py   the value network itself, shared by every tool that loads one
   truth.py       a frozen set of solved positions, and any checkpoint's error on it
-  ladder.py      round robin over runs' snapshots, plus Greedy -> Elo
+  ladder.py      sparse checkpoint graph with Greedy anchors -> Elo
   report.py      one self-contained HTML page per run or comparison
   offline.py     fit architectures to a frozen replay dump (noise-free A/B)
   diagnose.py    model-free check on how learnable a dump's targets are
@@ -105,24 +105,17 @@ What a run reports is strength against minutes trained, with Greedy at 0.
 Sample size is the thing to get right. A pairing of 100 games resolves nothing
 finer than about 70 Elo, 1,000 games about 22, and 5,000 about 10 — while a game
 costs on the order of a hundred solves against the million a training run
-generates. So the ladder puts most of its games on the pairing the experiment is
-about (`--focus`, `--focus-games`) and enough everywhere else to place a player.
-Ladders here used to run 30 to 100 games; the architecture comparisons decided
-that way were inside the noise.
+generates. The sparse ladder spends a modest fixed budget on consecutive
+checkpoints and Greedy anchors, and a larger budget only on each candidate final
+against its same-seed control final.
 
 War Chest turns out to be an unusually good fit for ReBeL. A player's private
-state is `(hand, face-down discards, pending forced-play coin)` — the bag is
+state is `(hand, face-down discards, future forced-play coins)` — the bag is
 derived from a public reserve — and the reachable set has median 22 and p99 567
 members with the full draft pool, so CFR enumerates information states exactly
-instead of approximating them with particles. The value network is a function of that exact private state, not of a
-summary of it: `docs/REBEL.md` §4 explains why the alternative is not an
-approximation but a different game.
-
-Thirty minutes on an 8-core M1 takes the agent from 356 Elo to 852, against 174
-for the handcrafted Greedy reference and 0 for random play — and shows it
-gaining almost nothing after the first seventeen (`runs/elo01`). See
-`docs/PERF.md` for how the generation loop got fast enough for that to fit in
-half an hour.
+instead of approximating them with particles. The value network is a function
+of that exact private state, not of a summary of it: `docs/REBEL.md` §4 explains
+why the alternative is not an approximation but a different game.
 
 ## Design
 
@@ -143,7 +136,7 @@ that way has a scenario test — see `docs/ENGINE_FIXES.md`.
 
 ```bash
 cd engine
-cargo test                          # 55 tests (the solver oracle takes ~85s)
+cargo test
 cargo run --release --bin bench     # engine throughput, ~2.8M applies/sec/core
 cargo run --release --bin rebelbench -- weights.bin   # generation throughput
 maturin develop --release           # python module `warchest` (Game)

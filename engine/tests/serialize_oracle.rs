@@ -2,7 +2,6 @@
 //! states must round-trip through the byte format identically, and every
 //! contract array must be consistent with the solver it came from.
 
-use warchest::rng::Rng;
 use warchest::search::{Cfg, Nets, Solver};
 use warchest::selfplay::collect_roots;
 use warchest::selfplay::{Agent, Collect, GameCfg};
@@ -200,10 +199,8 @@ fn tables_are_consistent() {
 #[test]
 fn starter_draft_round_trips() {
     let nets = [Nets::default()];
-    let mut rng = Rng::new(99);
     let mut checked = 0;
     for seed in 0..10u64 {
-        let mut rng = Rng::new(seed.wrapping_mul(31) + 7);
         let gc = GameCfg {
             agents: [Agent::Rebel {
                 cfg: cfg(),
@@ -226,7 +223,6 @@ fn starter_draft_round_trips() {
             assert_eq!(back.to_bytes(), job.to_bytes());
             checked += 1;
         }
-        let _ = rng;
     }
     assert!(checked >= 3);
 }

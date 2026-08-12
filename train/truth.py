@@ -49,8 +49,7 @@ that is a bias pointed straight at the answer. **The ladder arbitrates.**
 The fix, unimplemented: anchor the targets on terminal positions instead of on a
 network. Late-game positions solved deep enough that every leaf of the subgame
 is terminal have exact game values, no evaluator involved, and would be a ruler
-that stays true forever. `Conv::zero_sum` going to zero is the check that a
-solve got there. That is the set worth building.
+that stays true forever. That is the set worth building.
 
 One rule survives unchanged: **never rebuild a set mid-experiment.** Build a new
 one under a new filename, keep both, and say which one a result came from.
@@ -69,7 +68,7 @@ import warchest
 from dump import Dump
 from export_weights import load as load_checkpoint
 from offline import evaluate
-from train import CCOUNTS, CNORM, CFEAT, PUBFEAT, ROW_BYTES
+from train import CCOUNTS, CPRIVATE, CNORM, CFEAT, PUBFEAT, ROW_BYTES
 
 # Iterations for the reference solve. At T=256 with dcfr the remaining target
 # error is 0.00008 (`runs/solvererr_g8`), a thousandth of the network's own
@@ -95,9 +94,9 @@ def build(args):
                           random_draft=args.random_draft)
 
     rows = np.asarray(d["rows"], np.uint8).reshape(-1, ROW_BYTES)
-    cc = np.asarray(d["cc"], np.uint8).reshape(-1, CCOUNTS)
+    cc = np.asarray(d["cc"], np.uint8).reshape(-1, CPRIVATE)
     cw = np.asarray(d["cw"], np.float32)
-    cy = np.clip(np.asarray(d["cy"], np.float32), -1.0, 1.0)
+    cy = np.asarray(d["cy"], np.float32)
     coff = np.asarray(d["coff"], np.int64)
     # `coff` holds two entries per row (one per seat); `seg` is 2*row + seat,
     # which is the layout `dump.py` documents and every batcher expects.
@@ -109,7 +108,8 @@ def build(args):
     np.savez(args.out, rows=rows, cc=cc, cp=cp, cw=cw, cy=cy,
              soff=np.asarray(d["soff"], np.int64), seg=seg,
              pubfeat=np.int32(PUBFEAT), cfeat=np.int32(CFEAT),
-             ccounts=np.int32(CCOUNTS), cnorm=np.float32(CNORM),
+             cprivate=np.int32(CPRIVATE), ccounts=np.int32(CCOUNTS),
+             cnorm=np.float32(CNORM),
              row_bytes=np.int32(ROW_BYTES),
              version=np.int32(warchest.ROW_FORMAT_VERSION),
              rules_hash=np.uint64(warchest.rules_table_hash()))
@@ -125,8 +125,11 @@ def errors(paths, set_path=DEFAULT_SET, device="cpu"):
     """
     if not os.path.exists(set_path):
         return {}
-    d = Dump(set_path)
-    d.check(PUBFEAT, CCOUNTS)
+    try:
+        d = Dump(set_path)
+    except SystemExit as e:
+        print(f"[truth] skipped: {e}", flush=True)
+        return {}
     parts = d.rows(0, len(d))
     dev, rng = torch.device(device), np.random.default_rng(0)
     return {p: evaluate(load_checkpoint(p).to(dev), parts, rng, dev) for p in paths}

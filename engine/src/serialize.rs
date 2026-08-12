@@ -29,7 +29,7 @@ use std::rc::Rc;
 /// The byte format this module writes. Bump when an array changes shape or
 /// meaning (docs/TREE.md "the version bumps when any of them changes shape or
 /// meaning").
-pub const JOB_VERSION: u32 = 6;
+pub const JOB_VERSION: u32 = 7;
 const MAGIC: u32 = 0x5743_4A36; // "WCJ6"
 
 /// Runtime metadata that travels with a job (not part of the frozen tree
@@ -1146,7 +1146,7 @@ impl PackedJob {
             return Err("job: bad magic".into());
         }
         if r.u32("version")? != JOB_VERSION {
-            return Err(format!("job: unsupported version"));
+            return Err("job: unsupported version".to_string());
         }
         let meta = PackedMeta {
             depth: r.u32("depth")? as usize,
@@ -1454,7 +1454,7 @@ mod gather_tests {
             explore: 0.3,
             random_draft: true,
             eval_mix: 0.0,
-            };
+        };
         let mut checked = 0;
         for (s, bel) in collect_roots(10, 0x9E17, &nets, &gc, 6) {
             let ctx = crate::rebel::Ctx::new(&s);

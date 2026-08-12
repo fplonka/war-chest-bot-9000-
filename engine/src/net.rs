@@ -49,8 +49,8 @@
 
 use crate::board::N_HEXES;
 use crate::rebel::{
-    AFEAT, AOFF_PAYS, CCOUNTS, CFEAT, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_CARDS, OFF_LOOSE,
-    OFF_PILES, PILE_COUNTS, PUBFEAT,
+    AFEAT, AOFF_PAYS, CCOUNTS, CFEAT, CPRIVATE, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_CARDS,
+    OFF_LOOSE, OFF_PILES, PILE_COUNTS, PUBFEAT,
 };
 use crate::units::CARD_FEATS;
 
@@ -478,44 +478,6 @@ impl Lin {
     }
 }
 
-/// A cursor over one of the flat weight arrays the trainer ships.
-struct Cur<'a> {
-    v: &'a [f32],
-    at: usize,
-    what: &'static str,
-}
-
-impl<'a> Cur<'a> {
-    fn new(v: &'a [f32], what: &'static str) -> Cur<'a> {
-        Cur { v, at: 0, what }
-    }
-    fn take(&mut self, n: usize) -> Result<Vec<f32>, String> {
-        if self.at + n > self.v.len() {
-            return Err(format!(
-                "{} array too short: need {} past {}, have {}",
-                self.what,
-                n,
-                self.at,
-                self.v.len()
-            ));
-        }
-        let out = self.v[self.at..self.at + n].to_vec();
-        self.at += n;
-        Ok(out)
-    }
-    fn done(&self) -> Result<(), String> {
-        if self.at != self.v.len() {
-            return Err(format!(
-                "{} array too long: read {}, have {}",
-                self.what,
-                self.at,
-                self.v.len()
-            ));
-        }
-        Ok(())
-    }
-}
-
 /// The value network, as tower chains. See the module docs for the shape; the
 /// wiring between towers is fixed (it is the game-specific part: the card
 /// table, the set sums, the belief sums, the bilinear readout), while every
@@ -746,18 +708,9 @@ impl V3Layout {
 }
 
 impl Mlp {
-    /// Build from the flat arrays the trainer ships. Two formats load:
-    /// v3 (`dims[0] == 3`, the tower format below) and v2 (the frozen
-    /// 10-entry fixed layout). Both land in the same tower representation;
-    /// only parsing differs.
+    /// Build from the flat arrays the trainer ships.
     pub fn from_flat(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Mlp, String> {
-        if dims.first() == Some(&3) {
-            return Mlp::from_flat_v3(dims, w, b, ln);
-        }
-        if dims.len() == 10 {
-            return Mlp::from_flat_v2(dims, w, b, ln);
-        }
-        Err(format!("unrecognised dims {dims:?}"))
+        Mlp::from_flat_v3(dims, w, b, ln)
     }
 
     /// The v3 tower format:
@@ -827,107 +780,10 @@ impl Mlp {
         })
     }
 
-    /// The frozen 10-entry fixed layout, kept so `.bin` weight dumps and old
-    /// checkpoints still load. It is the v3 network with `card = [dc]`,
-    /// `pub = [hidden]`, `hmlp = []`, `slot = []`, `nres = 1`.
-    fn from_flat_v2(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Mlp, String> {
-        if dims[9] != 0 {
-            return Err(format!(
-                "encoder {} (hex) is not implemented in Rust; only 0 (flat) ships",
-                dims[9]
-            ));
-        }
-        let (h, hd, dg, rk, de, dc) = (dims[1], dims[2], dims[4], dims[5], dims[7], dims[8]);
-        let v3 = vec![3, de, dg, rk, hd, 1, 1, dc, 1, h, 0, 0];
-        // The v2 blob orders the matrices differently, so reorder rather than
-        // reparse: slice the old layout, concatenate in v3 order.
-        let seg = |lens: &[usize]| -> Vec<(usize, usize)> {
-            let mut at = 0;
-            lens.iter()
-                .map(|&n| {
-                    let s = at;
-                    at += n;
-                    (s, at)
-                })
-                .collect()
-        };
-        let (af, hf, xd) = (dims[6] + de, hfeat(de), xdim_of(de));
-        let ws = seg(&[
-            CARD_FEATS * dc,
-            dc * de,
-            crate::units::N_UNITS * de,
-            (PILE_COUNTS + de) * de,
-            xd * h,
-            h * hd,
-            2 * dg * hd,
-            hf * dg,
-            dg * dg,
-            dg * dg,
-            dg * (rk + 1),
-            hd * rk,
-            af * rk,
-            dg * rk,
-            hd * rk,
-        ]);
-        let bs = seg(&[dc, de, de, h, hd, dg, dg, dg, rk + 1, rk, rk, rk, rk]);
-        if w.len() != ws.last().unwrap().1
-            || b.len() != bs.last().unwrap().1
-            || ln.len() != 2 * h + 2 * hd
-        {
-            return Err(format!(
-                "weight sizes {}/{}/{} do not match dims {dims:?}",
-                w.len(),
-                b.len(),
-                ln.len()
-            ));
-        }
-        let wat = |i: usize| &w[ws[i].0..ws[i].1];
-        let bat = |i: usize| &b[bs[i].0..bs[i].1];
-        // v3 w order: card(wd0,wd1), wid, pile, pub(w0), pub_out(w1), wb,
-        // wu, slot_out(wc), res(wh1,wh2), wg, wq, wk, wp.
-        let w3: Vec<f32> = [
-            wat(0),
-            wat(1),
-            wat(2),
-            wat(3),
-            wat(4),
-            wat(5),
-            wat(6),
-            wat(11),
-            wat(7),
-            wat(8),
-            wat(9),
-            wat(10),
-            wat(12),
-            wat(13),
-            wat(14),
-        ]
-        .concat();
-        // v3 b order: card(bd0,bd1), pile, pub(b0), pub_out(b1), wu(bu),
-        // slot_out(bc), res(bh1,bh2), wg(bg), wq, wk, wp.
-        let b3: Vec<f32> = [
-            bat(0),
-            bat(1),
-            bat(2),
-            bat(3),
-            bat(4),
-            bat(9),
-            bat(5),
-            bat(6),
-            bat(7),
-            bat(8),
-            bat(10),
-            bat(11),
-            bat(12),
-        ]
-        .concat();
-        Mlp::from_flat_v3(&v3, &w3, &b3, ln)
-    }
-
-
     /// Read the flat weight dump `train/export_weights.py` writes:
     ///
     /// ```text
+    /// u32 encoding_version,
     /// u32 n_dims, n_dims * u32 dims,
     /// u32 n_w, n_w * f32,   u32 n_b, n_b * f32,   u32 n_ln, n_ln * f32
     /// ```
@@ -949,6 +805,16 @@ impl Mlp {
             *at += n * 4;
             v
         };
+        let version = u32_at(&raw, &mut at) as u32;
+        if version != crate::rebel::ENCODING_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "weight encoding version {version}, expected {}",
+                    crate::rebel::ENCODING_VERSION
+                ),
+            ));
+        }
         let nd = u32_at(&raw, &mut at);
         let dims: Vec<usize> = (0..nd).map(|_| u32_at(&raw, &mut at)).collect();
         let (w, b, ln) = (
@@ -967,10 +833,6 @@ impl Mlp {
 
     pub fn is_empty(&self) -> bool {
         self.dims.is_empty()
-    }
-    /// Width of the public encoding.
-    pub fn pub_dim(&self) -> usize {
-        PUBFEAT
     }
     /// Width of `h0` and of the head entry (`ln1`).
     pub fn head(&self) -> usize {
@@ -1158,7 +1020,7 @@ impl Mlp {
             let mut inp = vec![0.0f32; n * NSLOT * hf];
             for r in 0..n {
                 let p = &phi[r * cf..(r + 1) * cf];
-                let seat = p[CCOUNTS];
+                let seat = p[CPRIVATE];
                 for k in 0..NSLOT {
                     let row = &mut inp[(r * NSLOT + k) * hf..(r * NSLOT + k + 1) * hf];
                     row[0] = p[k];
@@ -1171,9 +1033,11 @@ impl Mlp {
                     // as a constant that differs by seat. That is a common-mode
                     // offset in a value that must be antisymmetric. Must match
                     // `value_net.py::holdings`.
-                    row[3] = seat - 0.5;
+                    row[3] = p[CCOUNTS + k];
+                    row[4] = p[CCOUNTS + NSLOT + k];
+                    row[5] = seat - 0.5;
                     let t = seat as usize * NSLOT + k;
-                    row[4..].copy_from_slice(&e[t * de..(t + 1) * de]);
+                    row[6..].copy_from_slice(&e[t * de..(t + 1) * de]);
                 }
             }
             let mut a = inp;
@@ -1394,9 +1258,9 @@ impl Mlp {
         }
     }
 
-    /// One value per row, for callers with no solve to amortise over: the
-    /// torch parity check and the offline tools.
-    pub fn forward(
+    /// One unprojected score per row for the Torch/Rust parity diagnostic.
+    /// Search uses `Solver::readout`, which projects both players together.
+    pub fn raw_scores(
         &self,
         xpub: &[f32],
         xbel: &[f32],
@@ -1404,7 +1268,7 @@ impl Mlp {
         ids: &[u8],
         rows: usize,
     ) -> Vec<f32> {
-        let (rk, pd) = (self.rank, self.pub_dim());
+        let (rk, pd) = (self.rank, PUBFEAT);
         let (mut sb, mut pre, mut e, mut z, mut g, mut u) = (
             Vec::new(),
             Vec::new(),
@@ -1436,13 +1300,12 @@ impl Mlp {
     }
 }
 
-/// One coin type's input to the holding tower: its three counts, the seat, and
-/// its card embedding.
+/// One coin type's input to the holding tower: its three counts, next/queued
+/// forced-play flags, the seat, and its card embedding.
 #[allow(non_snake_case)]
-/// The holding tower's input width: three counts and the seat, plus the
-/// card embedding. Named here because the GPU build has to cut the same row.
+/// Named here because the GPU build has to cut the same row.
 pub const fn hfeat(de: usize) -> usize {
-    4 + de
+    6 + de
 }
 
 /// Width of the trunk's input, once the card embeddings are spliced in: the raw
@@ -1640,7 +1503,7 @@ mod format_tests {
             let ids: Vec<u8> = (0..rows * NTYPE).map(|i| (i % 19) as u8).collect();
             let xbel = ramp(rows * net.belief_dim());
             let phi = ramp(rows * net.cfeat());
-            let out = net.forward(&xpub, &xbel, &phi, &ids, rows);
+            let out = net.raw_scores(&xpub, &xbel, &phi, &ids, rows);
             assert!(out.iter().all(|v| v.is_finite()), "{dims:?}: {out:?}");
             assert!(
                 out.iter().any(|v| v.abs() > 1e-6),
@@ -1649,30 +1512,16 @@ mod format_tests {
         }
     }
 
-    /// The frozen v2 layout must still load (old checkpoints, .bin dumps).
     #[test]
-    fn v2_still_loads() {
-        let (p, h, hd, dg, rk, de, dc) = (PUBFEAT, 96, 64, 32, 24, 16, 24);
-        let dims = vec![p, h, hd, CFEAT, dg, rk, AFEAT, de, dc, 0];
-        let (af, hf, xd) = (AFEAT + de, hfeat(de), xdim_of(de));
-        let nw = CARD_FEATS * dc
-            + dc * de
-            + crate::units::N_UNITS * de
-            + (PILE_COUNTS + de) * de
-            + xd * h
-            + h * hd
-            + 2 * dg * hd
-            + hf * dg
-            + dg * dg
-            + dg * dg
-            + dg * (rk + 1)
-            + hd * rk
-            + af * rk
-            + dg * rk
-            + hd * rk;
-        let nb = dc + de + de + h + hd + dg + dg + dg + (rk + 1) + 4 * rk;
-        let net = Mlp::from_flat(&dims, &ramp(nw), &ramp(nb), &ramp(2 * h + 2 * hd)).unwrap();
-        assert_eq!(net.head(), hd);
-        assert_eq!(net.towers(), (vec![dc, de], vec![h], hd, vec![], vec![], 1));
+    fn unversioned_weight_binary_is_rejected() {
+        let path =
+            std::env::temp_dir().join(format!("warchest-unversioned-{}.bin", std::process::id()));
+        let old = crate::rebel::ENCODING_VERSION - 1;
+        std::fs::write(&path, old.to_le_bytes()).unwrap();
+        let err = Mlp::load_flat_bin(path.to_str().unwrap()).unwrap_err();
+        std::fs::remove_file(path).unwrap();
+        assert!(err
+            .to_string()
+            .contains(&format!("weight encoding version {old}")));
     }
 }

@@ -44,13 +44,12 @@ def launch(cfg, out):
     """One training run, as its own process. Returns True if it finished."""
     os.makedirs(out, exist_ok=True)
     path = f"{out}/config.json"
-    with open(path, "w") as f:
-        json.dump(dataclasses.asdict(cfg), f, indent=1)
+    ladder.write_json(path, dataclasses.asdict(cfg))
     cmd = [sys.executable, f"{HERE}/train.py", "--config", path]
     print(f"\n=== {out} ===\n{' '.join(cmd)}", flush=True)
     t = time.time()
-    # Its own process, so a run that dies -- an out-of-memory in a CUDA lane,
-    # an early abort -- takes down only itself and the next arm still runs.
+    # Its own process, so failures have an exact return code and an incomplete
+    # arm cannot leak Python/CUDA state into the next experiment.
     with open(f"{out}/train.log", "w") as log:
         rc = subprocess.call(cmd, stdout=log, stderr=subprocess.STDOUT)
     print(f"=== {out}: {'ok' if rc == 0 else f'FAILED rc={rc}'} "
@@ -60,25 +59,41 @@ def launch(cfg, out):
     return rc == 0
 
 
-def judge(runs, games, focus_games, gpu, seed=7, labels=None):
+def comparisons_from_metadata(runs):
+    """Explicit `(control, candidate)` pairs from experiment and seed metadata."""
+    records = []
+    for run in runs:
+        with open(f"{run}/log.json") as f:
+            cfg = json.load(f).get("cfg", {})
+        records.append((run, cfg))
+    pairs = []
+    keys = sorted({(c.get("experiment", ""), c.get("seed")) for _, c in records})
+    for experiment, seed in keys:
+        group = [(r, c) for r, c in records
+                 if (c.get("experiment", ""), c.get("seed")) == (experiment, seed)]
+        controls = [r for r, c in group if c.get("is_control")]
+        if len(controls) != 1:
+            raise ValueError(
+                f"experiment {experiment!r} seed {seed}: expected one control run, "
+                f"got {controls}")
+        pairs.extend((controls[0], r) for r, c in group if not c.get("is_control"))
+    return pairs
+
+
+def judge(runs, games, comparison_games, gpu, seed=7, labels=None, fixed_draft=False):
     """Rate every arm's snapshots in one ladder, then write the page.
 
-    `labels` restricts which snapshots enter. A curve over every snapshot of
-    every arm is quadratic in the arm count and mostly pairings nobody asked
-    about: eight arms at four snapshots is 33 players and over 100 pairings.
-    `init,final` is usually the whole experiment -- where each arm started and
-    where it finished.
+    `labels` can restrict which snapshots enter; by default every checkpoint is
+    evaluated and the sparse graph remains linear in their number.
     """
-    finals = []
-    for r in runs:
-        with open(f"{r}/log.json") as f:
-            snaps = json.load(f).get("snapshots", [])
-        tag = os.path.basename(r.rstrip("/"))
-        finals += [f"{tag}.{s['label']}" for s in snaps if s["label"] == "final"]
-    ladder.run(runs, out=runs[0], games=games, focus=finals,
-               focus_games=focus_games, gpu=gpu, seed=seed, labels=labels)
+    comparisons = comparisons_from_metadata(runs)
+    result = ladder.run(runs, out=runs[0], games=games, comparisons=comparisons,
+                        comparison_games=comparison_games, gpu=gpu, seed=seed, labels=labels,
+                        random_draft=not fixed_draft)
     for r in runs:
         # Each run gets its own page, and the comparison gets one more.
+        if r != runs[0]:
+            ladder.write_json(f"{r}/ladder.json", result)
         report.write([r], f"{r}/report.html")
     if len(runs) > 1:
         common = os.path.commonprefix([os.path.basename(r.rstrip("/")) for r in runs])
@@ -92,30 +107,35 @@ def cmd_run(args):
         raise SystemExit(
             "the tree is dirty, so this run's numbers could not be reproduced from "
             "any commit. Commit first, or pass --force if you mean it.")
+    arms = config.arms(args.name)
+    # Keep a seed's control and candidates adjacent in wall-clock time. This
+    # blocks slow host drift (temperature, shared-machine load) by the same seed
+    # the direct comparison uses, instead of running every control first and
+    # every candidate hours later.
     todo = [(f"{args.name}-{lab}" + (f"-s{s}" if args.seeds > 1 else ""),
-             dataclasses.replace(cfg, seed=s))
-            for lab, cfg in config.arms(args.name)
-            for s in range(1, args.seeds + 1)]
+             dataclasses.replace(cfg, seed=s, experiment=args.name, arm=lab,
+                                 is_control=(i == 0)))
+            for s in range(1, args.seeds + 1)
+            for i, (lab, cfg) in enumerate(arms)]
     print(f"[exp] {args.name} at {sha}: {len(todo)} runs "
           f"({len(config.arms(args.name))} arms x {args.seeds} seeds)")
     for name, cfg in todo:
         print(f"  {name:<28s} {config.delta(cfg) or 'baseline'}")
     train_min = sum(c.minutes for _, c in todo)
-    # Per run: its snapshots plus `init`. Played pairings are the within-run
-    # chains, everyone against Greedy, and the finals against each other.
+    # Per run: a checkpoint chain and its two Greedy anchors. Each candidate
+    # final also plays its same-seed control final.
     n = len(todo)
     per = (config.BASELINE.snapshots + 1 if args.labels == "all"
            else len(args.labels.split(",")))
     k = n * per + 1
-    played = n * (per * (per - 1) // 2) + (k - 1) + n * (n - 1) // 2
-    ladder_games = (played - n * (n - 1) // 2) * args.games \
-        + (n * (n - 1) // 2) * args.focus_games
-    # A ceiling, not a schedule: SPRT stops a settled pairing at its first
-    # block, and most pairings in a curve are settled. Net-against-net games run
-    # about 3/s on two 3090s, measured, so the ceiling is what is priced here.
+    comparisons = (len(arms) - 1) * args.seeds
+    anchors = n * min(per, 2)
+    played = n * max(per - 1, 0) + anchors + comparisons
+    ladder_games = ((played - comparisons) * args.games
+                    + comparisons * args.comparison_games)
     print(f"[exp] {train_min:.0f} min of training, then a {k}-player ladder: "
-          f"{played} pairings, at most {ladder_games:,} games "
-          f"({ladder_games / 3 / 60:.0f} min at the ceiling)")
+          f"{played} pairings, {ladder_games:,} games "
+          f"(~{ladder_games / 3 / 60:.0f} min)")
     if args.dry_run:
         return
     done = []
@@ -123,17 +143,18 @@ def cmd_run(args):
         out = f"{RUNS}/{name}"
         cfg = dataclasses.replace(cfg, out=out,
                                   dump_buffer=f"{out}/buf.npz" if args.dump else "")
-        if launch(cfg, out):
-            done.append(out)
-    if not done:
-        raise SystemExit("[exp] every run failed; nothing to judge")
-    judge(done, args.games, args.focus_games, gpu=config.BASELINE.gpu, seed=args.seed,
-          labels=None if args.labels == "all" else args.labels.split(","))
+        if not launch(cfg, out):
+            raise SystemExit(f"[exp] {out} failed; experiment aborted")
+        done.append(out)
+    judge(done, args.games, args.comparison_games, gpu=config.BASELINE.gpu, seed=args.seed,
+          labels=None if args.labels == "all" else args.labels.split(","),
+          fixed_draft=args.fixed_draft)
 
 
 def cmd_judge(args):
-    judge(args.runs, args.games, args.focus_games, gpu=args.gpu, seed=args.seed,
-          labels=None if args.labels == "all" else args.labels.split(","))
+    judge(args.runs, args.games, args.comparison_games, gpu=args.gpu, seed=args.seed,
+          labels=None if args.labels == "all" else args.labels.split(","),
+          fixed_draft=args.fixed_draft)
 
 
 def cmd_ls(args):
@@ -189,13 +210,15 @@ def main():
     j.set_defaults(fn=cmd_judge)
 
     for p in (r, j):
-        p.add_argument("--games", type=int, default=300,
+        p.add_argument("--games", type=int, default=100,
                        help="paired games per pairing")
-        p.add_argument("--focus-games", type=int, default=2000,
+        p.add_argument("--comparison-games", type=int, default=1000,
                        help="paired games between the arms' final checkpoints")
         p.add_argument("--seed", type=int, default=7)
-        p.add_argument("--labels", default="init,final",
+        p.add_argument("--labels", default="all",
                        help="snapshot labels to rate, or 'all' for every one")
+        p.add_argument("--fixed-draft", action="store_true",
+                       help="evaluate the starter matchup instead of random drafts")
 
     l = sub.add_parser("ls", help="every run, newest first")
     l.add_argument("--limit", type=int, default=40)

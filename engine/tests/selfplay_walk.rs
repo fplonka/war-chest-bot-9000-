@@ -61,6 +61,54 @@ fn gpu_walk_uses_the_reference_sampler() {
     assert!(resumed >= 2, "the GPU walk did not cross a subgame leaf");
 }
 
+/// The actor-side path builds the same packed trees as continuous CUDA
+/// generation. Drive many random-draft games with uniform solve replies; this
+/// exercises belief/continuation transitions without spending time on CFR.
+#[test]
+fn gpu_walk_random_drafts_keep_private_state_in_lockstep() {
+    let nets = [warchest::search::Nets::default()];
+    let gc = GameCfg {
+        agents: [Agent::Rebel {
+            cfg: cfg(),
+            slot: 0,
+        }; 2],
+        collect: Collect::None,
+        explore: 1.0,
+        random_draft: true,
+        eval_mix: 0.0,
+    };
+    let games = std::env::var("WARCHEST_WALK_STRESS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    for seed in 0..games {
+        let mut game = Game::new(Rng::new(seed * 104_729 + 23), &gc);
+        loop {
+            match game.advance(Some(&[]), &nets) {
+                Step::Ended => break,
+                Step::Submitted => {
+                    let job = game.take_job().expect("submitted GPU job");
+                    let mut strategy = vec![0.0; job.tables.ncells];
+                    for bounds in job.tables.legal_off.windows(2) {
+                        let row = bounds[0] as usize..bounds[1] as usize;
+                        if !row.is_empty() {
+                            strategy[row.clone()].fill(1.0 / row.len() as f32);
+                        }
+                    }
+                    game.resume(warchest::gpu::SolveResult {
+                        strategy,
+                        root_values: Vec::new(),
+                        carries: warchest::gpu::CarryStore::empty(),
+                        weight_version: 0,
+                        oversize_route: false,
+                        card_exclusive_route: false,
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// Self-play with empty nets: the walk mechanics (build, act on the sampled
 /// iterate, advance, finish at a leaf) run with zero leaf values.
 #[test]
@@ -70,7 +118,7 @@ fn walk_serves_multiple_decisions_per_solve() {
     let mut total_rows = 0usize;
     for seed in 0..12u64 {
         for explore in [0.0, 0.25] {
-            let mut rng = Rng::new(seed * 7919 + 1);
+            let rng = Rng::new(seed * 7919 + 1);
             let mut d = Data::default();
             let gc = GameCfg {
                 agents: [
@@ -110,7 +158,7 @@ fn walk_serves_multiple_decisions_per_solve() {
 #[test]
 fn walk_in_eval_mode() {
     let nets = [warchest::search::Nets::default()];
-    let mut rng = Rng::new(0xE7A1);
+    let rng = Rng::new(0xE7A1);
     let mut d = Data::default();
     let gc = GameCfg {
         agents: [
@@ -138,7 +186,7 @@ fn walk_in_eval_mode() {
 #[test]
 fn walk_interrupted_by_non_rebel_agent() {
     let nets = [warchest::search::Nets::default()];
-    let mut rng = Rng::new(0x1DEF);
+    let rng = Rng::new(0x1DEF);
     let mut d = Data::default();
     let gc = GameCfg {
         agents: [
@@ -174,7 +222,7 @@ fn walk_never_crosses_slots() {
     let mut total_dec = 0usize;
     let mut total_rows = 0usize;
     for seed in 0..12u64 {
-        let mut rng = Rng::new(seed * 31337 + 3);
+        let rng = Rng::new(seed * 31337 + 3);
         let mut d = Data::default();
         let gc = GameCfg {
             agents: [
@@ -218,7 +266,7 @@ fn walk_with_random_drafts() {
     let mut total_dec = 0usize;
     let mut total_rows = 0usize;
     for seed in 0..20u64 {
-        let mut rng = Rng::new(seed * 104729 + 7);
+        let rng = Rng::new(seed * 104729 + 7);
         let mut d = Data::default();
         let gc = GameCfg {
             agents: [
@@ -259,7 +307,7 @@ fn walk_across_warrior_priest_draws() {
     let nets = [warchest::search::Nets::default()];
     let mut total_dec = 0usize;
     for seed in 0..16u64 {
-        let mut rng = Rng::new(seed * 65537 + 11);
+        let rng = Rng::new(seed * 65537 + 11);
         let mut d = Data::default();
         let gc = GameCfg {
             agents: [
@@ -294,7 +342,7 @@ fn capped_solves_fall_back_and_games_finish() {
     let mut total_dec = 0usize;
     let mut total_node_caps = 0usize;
     for seed in 0..10u64 {
-        let mut rng = Rng::new(seed * 7919 + 5);
+        let rng = Rng::new(seed * 7919 + 5);
         let mut d = Data::default();
         let scfg = Cfg {
             node_cap: 40,

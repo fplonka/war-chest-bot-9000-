@@ -23,6 +23,7 @@ disagree the direct record is the one that answers the experiment's question.
 import argparse
 import io
 import json
+import math
 import os
 import sys
 
@@ -43,6 +44,14 @@ JS = "plotly.min.js"        # written once into runs/, shared by every report
 RUNS_DIR = "runs"
 
 
+def write_text(path, value):
+    """Publish a complete report without exposing a partially written file."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(value)
+    os.replace(tmp, path)
+
+
 def read(run):
     """A run's log, ladder and truth score; missing pieces are None."""
     with open(f"{run}/log.json") as f:
@@ -50,7 +59,8 @@ def read(run):
     # Epochs that generated nothing are the drain at the end of a run: they
     # report loss 0 and a handful of solves, and plotting them drags every
     # curve to the floor in its final pixel.
-    out = {"name": os.path.basename(run.rstrip("/")), "cfg": log.get("cfg", {}),
+    out = {"name": os.path.basename(run.rstrip("/")), "path": run.rstrip("/"),
+           "cfg": log.get("cfg", {}),
            "epochs": [e for e in log["epochs"]
                       if e["phase"] == "rebel" and e.get("solves", 0) > 0
                       and e.get("steps", 1) > 0],
@@ -67,9 +77,13 @@ def ema(y, span=12):
     """Per-epoch values are genuinely jumpy -- each epoch trains on a fresh
     sample of a two-million-row buffer -- so the trend is the readable part and
     the scatter behind it is the honest context for it."""
-    a, out = 2.0 / (span + 1.0), []
+    a, out, prev = 2.0 / (span + 1.0), [], None
     for v in y:
-        out.append(v if not out else a * v + (1 - a) * out[-1])
+        if not math.isfinite(v):
+            out.append(None)
+            continue
+        prev = v if prev is None else a * v + (1 - a) * prev
+        out.append(prev)
     return out
 
 
@@ -131,7 +145,8 @@ def dashboard(specs, cols=2):
         else:
             # Percentile limits: one bad epoch -- a drain record, a warm-up
             # spike -- must not set the axis and flatten everything else.
-            vals = sorted(v for _, _, ys, _ in sp["series"] for v in ys)
+            vals = sorted(v for _, _, ys, _ in sp["series"] for v in ys
+                          if math.isfinite(v))
             if vals:
                 lo, hi = quantiles(vals, 0.01), quantiles(vals, 0.99)
                 pad = (hi - lo) * 0.12 or abs(hi) * 0.1 or 1.0
@@ -160,18 +175,6 @@ def dashboard(specs, cols=2):
                                    ["select2d", "lasso2d", "autoScale2d"]})
 
 
-def varies(series, rel=0.05):
-    """Did anything actually move? A panel pinned at its configured constant
-    costs a reader's attention and returns nothing."""
-    for _, _, ys, _ in series:
-        if not ys:
-            continue
-        lo, hi = min(ys), max(ys)
-        if hi - lo > rel * max(abs(hi), 1e-9):
-            return True
-    return False
-
-
 def quantiles(vals, q):
     """The q-quantile by nearest rank. No numpy: this module is imported by the
     trainer at the end of a run and should not need the scientific stack."""
@@ -179,12 +182,12 @@ def quantiles(vals, q):
     return v[min(len(v) - 1, max(0, int(q * (len(v) - 1) + 0.5)))]
 
 
-def fmt(v):
-    """Short enough to fit the gutter. Two significant figures is all a tick
-    needs; the exact numbers are in the tables below."""
-    if abs(v) >= 100 or v == int(v):
-        return f"{v:.0f}"
-    return f"{v:.2g}"
+def checkpoints(run):
+    """This run's players from a ladder shared by the whole experiment."""
+    return [p for p in run["ladder"]["players"]
+            if p["t"] is not None
+            and (p.get("run") == run["path"]
+                 or ("run" not in p and p["name"].startswith(run["name"] + ".")))]
 
 
 def panels(runs):
@@ -197,7 +200,7 @@ def panels(runs):
     for r in runs:
         if not r["ladder"]:
             continue
-        snaps = [p for p in r["ladder"]["players"] if p["t"] is not None]
+        snaps = checkpoints(r)
         if snaps:
             elo.append((tag(r) or "snapshot", [p["t"] / 60.0 for p in snaps],
                         [p["elo"] for p in snaps], False))
@@ -231,13 +234,6 @@ def panels(runs):
                      + ([("target", mins(runs[0]),
                           [e["tgt_std"] for e in runs[0]["epochs"]], True)] if one else []),
                      zero=True))
-    # Two throughput lines, and the gap between them is the information. The
-    # per-epoch rate is what the box is doing right now; the cumulative rate is
-    # total solves over total ReBeL wall time, which is the only number a run's
-    # cost can be read from -- it counts every stall, drain and optimizer step,
-    # including the ones an instantaneous reading happens to miss. A run whose
-    # instantaneous rate holds while its cumulative rate sags is losing time
-    # somewhere between the epochs.
     # Two throughput lines, and the gap between them is the information.
     #
     # Note what the trainer logs: `solves_per_s` is `rebel_solves / elapsed`,
@@ -259,6 +255,27 @@ def panels(runs):
         cum.append((f"{tag(r)} run average".strip(), mins(r),
                     [e["solves_per_s"] for e in eps], False))
     out.append(panel("Generation throughput", "solves/s", inst + cum, zero=True))
+    if any("rows_per_s" in e for r in runs for e in r["epochs"]):
+        out.append(panel("Replay generation throughput", "rows/s", [
+            (tag(r), mins(r), [e.get("rows_per_s", 0) for e in r["epochs"]], False)
+            for r in runs], zero=True))
+    if any("effective_train_ratio" in e for r in runs for e in r["epochs"]):
+        out.append(panel("Effective training ratio", "optimizer rows / generated row", [
+            (tag(r), mins(r), [e.get("effective_train_ratio", 0) for e in r["epochs"]], False)
+            for r in runs], zero=True))
+        out.append(panel("Gradient clipping", "fraction of steps", [
+            (tag(r), mins(r), [e.get("grad_clip_frac", 0) for e in r["epochs"]], True)
+            for r in runs], zero=True))
+        out.append(panel("Zero-sum residual", "max |v0 + v1|", [
+            (tag(r), mins(r), [e.get("zero_sum_max", 0) for e in r["epochs"]], True)
+            for r in runs], zero=True))
+    out.append(panel("Replay age", "seconds retained", [
+        (tag(r), mins(r), [e.get("buf_s", 0) for e in r["epochs"]], False)
+        for r in runs], zero=True))
+    out.append(panel("Node-cap frequency", "fallbacks / decision", [
+        (tag(r), mins(r), [e.get("node_caps", 0) / max(e.get("decisions", 1), 1)
+                           for e in r["epochs"]], True)
+        for r in runs], zero=True))
     # The horizon cuts a game at 256 coin plays and scores it a draw, and War
     # Chest has no draws. A rising rate means the ladder below is measuring a
     # game that is increasingly not the real one.
@@ -281,6 +298,11 @@ def health(r):
              ("dropped solves", f"{tot('dropped'):,}"),
              ("exact CPU fallbacks", f"{tot('exact_fallbacks'):,}"),
              ("games cut at horizon", f"{last['horizon_frac']:.1%}")]
+    if "effective_train_ratio" in last:
+        cells += [("effective train ratio", f"{last['effective_train_ratio']:.3f}"),
+                  ("gradient clipped", f"{last['grad_clip_frac']:.1%}"),
+                  ("max |v0+v1|", f"{last['zero_sum_max']:.2e}"),
+                  ("replay age", f"{last['buf_s'] / 60:.1f} min")]
     return "".join(f"<div><dt>{k}</dt><dd>{v}</dd></div>" for k, v in cells)
 
 
@@ -393,12 +415,10 @@ def write(runs, out=None, title=None, standalone=False):
         path = os.path.join(root, JS)
         if not os.path.exists(path):
             os.makedirs(root, exist_ok=True)
-            with open(path, "w") as f:
-                f.write(plotly.offline.get_plotlyjs())
+            write_text(path, plotly.offline.get_plotlyjs())
             print(f"[report] wrote {path}", flush=True)
         js = f'<script src="{os.path.relpath(path, outdir)}" charset="utf-8"></script>'
-    with open(out, "w") as f:
-        f.write(page(loaded, title or " · ".join(r["name"] for r in loaded), js))
+    write_text(out, page(loaded, title or " · ".join(r["name"] for r in loaded), js))
     print(f"[report] {out}", flush=True)
     return out
 

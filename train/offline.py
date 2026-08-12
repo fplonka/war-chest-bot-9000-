@@ -219,7 +219,6 @@ def main():
     torch.set_num_threads(os.cpu_count() or 8)
     dev = torch.device(args.device)
     d = Dump(args.dump)
-    d.check(warchest.PUBFEAT, warchest.CCOUNTS)
     # Solve-aligned held-out split: oldest solves train, the middle block
     # validates (checkpoint selection), the newest block tests (one
     # evaluation). All cuts snap to solve boundaries, so no solve straddles a

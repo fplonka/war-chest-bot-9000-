@@ -21,6 +21,7 @@ Run: python train/test_parity.py
 
 import sys
 import pathlib
+import tempfile
 
 import numpy as np
 import torch
@@ -28,7 +29,11 @@ import torch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import warchest  # noqa: E402
-from value_net import Mlp  # noqa: E402
+import mirror  # noqa: E402
+from dump import Dump  # noqa: E402
+from value_net import ENCODING_VERSION, Mlp  # noqa: E402
+from export_weights import load  # noqa: E402
+from train import policy_loss, public_sizes  # noqa: E402
 
 W = warchest
 
@@ -61,14 +66,71 @@ def actions_like_the_encoder(rng, na):
 
 
 def holdings(rng, n, seats):
-    """Config vectors: counts as the encoder normalises them, then the seat."""
+    """Structurally valid config vectors: counts, forced slots, then seat."""
+    forced = np.zeros((n, 2, W.NSLOT), np.float32)
+    for r in range(n):
+        depth = int(rng.integers(0, 3))
+        for q in range(depth):
+            forced[r, q, int(rng.integers(0, W.NSLOT))] = 1.0
     return np.concatenate([
         rng.integers(0, 4, (n, W.CCOUNTS)).astype(np.float32) / W.CNORM,
+        forced.reshape(n, -1),
         seats.reshape(n, 1).astype(np.float32),
     ], 1)
 
 
 def main():
+    # Future forced-play flags are categorical private state, not bag coins.
+    # Keep this at the helper boundary shared by the CPU and Triton batchers.
+    cc = np.zeros((2, W.CPRIVATE), np.uint8)
+    cc[:, 10:W.CCOUNTS] = [[1, 2, 0, 0, 0], [0, 0, 3, 0, 0]]
+    cc[0, W.CCOUNTS] = 1
+    cc[1, W.CCOUNTS + W.NSLOT + 2] = 1
+    _, _, bag = public_sizes(cc, np.asarray([0, 1], np.int64), 1)
+    assert bag.tolist() == [[3, 3]], f"forced flags leaked into bag sizes: {bag}"
+    print("private/public boundary ok: forced flags are not bag counts")
+
+    with tempfile.NamedTemporaryFile(suffix=".pt") as f:
+        for bad in ({}, {"encoding_version": ENCODING_VERSION - 1}):
+            torch.save(bad, f.name)
+            try:
+                load(f.name)
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError("unversioned or old checkpoint was accepted")
+        torch.save({"encoding_version": ENCODING_VERSION}, f.name)
+        try:
+            load(f.name)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("checkpoint without an architecture spec was accepted")
+    print("checkpoint version gate ok")
+
+    with tempfile.NamedTemporaryFile(suffix=".npz") as f:
+        np.savez(
+            f.name,
+            rows=np.empty((0, W.ROW_BYTES), np.uint8),
+            cc=np.empty((0, W.CPRIVATE), np.uint8), cp=np.empty(0, np.uint8),
+            cw=np.empty(0, np.float16), cy=np.empty(0, np.float16),
+            seg=np.empty(0, np.int64), soff=np.asarray([0], np.int64),
+            pubfeat=np.int32(W.PUBFEAT), cprivate=np.int32(W.CPRIVATE),
+            ccounts=np.int32(W.CCOUNTS),
+            cnorm=np.float32(W.CNORM), row_bytes=np.int32(W.ROW_BYTES),
+            version=np.int32(W.ROW_FORMAT_VERSION - 1),
+            rules_hash=np.uint64(W.rules_table_hash()),
+        )
+        try:
+            Dump(f.name)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("incompatible replay was accepted")
+    print("replay version gate ok")
+
+    mirror.self_check_state_oracle()
+    print("mirror parity ok: Python rows match Rust State::mirror")
     torch.manual_seed(0)
     hidden, dg, rank, de = 256, 32, 48, 16
     net = Mlp(hidden, dg, rank, de)
@@ -113,10 +175,14 @@ def main():
         w = np.tile([1.0, 1.0, 0.0], rows).astype(np.float32)
         seg = np.repeat(np.arange(rows), 3) * 2 + np.tile([0, 1, 0], rows)
         inv = torch.arange(len(allphi))
-        ref = net(tx, tids, torch.as_tensor(allphi), inv, torch.as_tensor(w),
-                  torch.as_tensor(seg), 2 * rows).numpy()[2::3]
+        args = (tx, tids, torch.as_tensor(allphi), inv, torch.as_tensor(w),
+                torch.as_tensor(seg), 2 * rows)
+        projected = net(*args).reshape(rows, 3)
+        zero_sum = float((projected[:, 0] + projected[:, 1]).abs().max())
+        assert zero_sum < 2e-6, f"TORCH ZERO-SUM FAILURE: {zero_sum:.3e}"
+        ref = net.raw_scores(*args).numpy()[2::3]
 
-    got = np.asarray(W.infer(
+    got = np.asarray(W.infer_raw(
         np.ascontiguousarray(x.ravel()),
         np.ascontiguousarray(xbel.ravel()),
         np.ascontiguousarray(phi.ravel()),
@@ -127,6 +193,7 @@ def main():
     assert ref.std() > 0.1, f"degenerate reference output (std {ref.std():.4f})"
     assert err < 2e-4, f"VALUE PARITY FAILURE: max |torch - rust| = {err:.3e}"
     print(f"value  parity ok: max |torch - rust| = {err:.3e}, output std {ref.std():.4f}")
+    print(f"torch zero-sum ok: max |belief v0 + v1| = {zero_sum:.3e}")
 
     # --- the policy seam: one node, `nc` configs and `na` actions ------------
     nc, na = 7, 11
@@ -156,6 +223,30 @@ def main():
     assert perr < 2e-4, f"POLICY PARITY FAILURE: max |torch - rust| = {perr:.3e}"
     print(f"policy parity ok: max |torch - rust| = {perr:.3e}, logit std {pref.std():.4f}")
 
+    # Arbitrary policy-label IDs must use their own probability spans. The old
+    # path always started at pp[0], which only worked when IDs began at zero.
+    d = W.gen_data(1, 123, "rebel", depth=1, iters=1, random_draft=True)
+    assert d["zero_sum_max"] < 1e-4, \
+        f"SOLVER TARGET ZERO-SUM FAILURE: {d['zero_sum_max']:.3e}"
+    coff = np.asarray(d["coff"])
+    cw = np.asarray(d["cw"])
+    cy = np.asarray(d["cy"])
+    target_residual = 0.0
+    for r in range(len(d["rows"]) // W.ROW_BYTES):
+        means = []
+        for p in range(2):
+            sl = slice(coff[2 * r + p], coff[2 * r + p + 1])
+            means.append(float(np.dot(cw[sl], cy[sl]) / cw[sl].sum()))
+        target_residual = max(target_residual, abs(sum(means)))
+    assert target_residual < 2e-6, \
+        f"PROJECTED TARGET ZERO-SUM FAILURE: {target_residual:.3e}"
+    print(f"solver targets zero-sum ok: max |belief y0 + y1| = {target_residual:.3e}")
+    ids = np.asarray([len(d["prow"]) - 1, 0])
+    assert len(d["ppoff"]) == len(d["prow"]) + 1
+    pl = policy_loss(net, d, ids, torch.device("cpu"))
+    assert torch.isfinite(pl)
+    print(f"policy offsets ok: sampled labels {ids.tolist()}")
+
     # --- head != hidden: the split widths must not be assumed equal ---------
     torch.manual_seed(1)
     net2 = Mlp(256, 32, 48, 16, head=128)
@@ -176,9 +267,10 @@ def main():
         w2 = np.tile([1.0, 1.0, 0.0], rows).astype(np.float32)
         seg2 = np.repeat(np.arange(rows), 3) * 2 + np.tile([0, 1, 0], rows)
         inv2 = torch.arange(len(allphi2))
-        ref2 = net2(tx2, tids2, torch.as_tensor(allphi2), inv2, torch.as_tensor(w2),
-                    torch.as_tensor(seg2), 2 * rows).numpy()[2::3]
-    got2 = np.asarray(W.infer(
+        ref2 = net2.raw_scores(
+            tx2, tids2, torch.as_tensor(allphi2), inv2, torch.as_tensor(w2),
+            torch.as_tensor(seg2), 2 * rows).numpy()[2::3]
+    got2 = np.asarray(W.infer_raw(
         np.ascontiguousarray(x2.ravel()),
         np.ascontiguousarray(xbel2.ravel()),
         np.ascontiguousarray(phi2.ravel()),
@@ -215,9 +307,10 @@ def main():
         w3 = np.tile([1.0, 1.0, 0.0], rows).astype(np.float32)
         seg3 = np.repeat(np.arange(rows), 3) * 2 + np.tile([0, 1, 0], rows)
         inv3 = torch.arange(len(allphi3))
-        ref3 = net3(tx3, tids3, torch.as_tensor(allphi3), inv3, torch.as_tensor(w3),
-                    torch.as_tensor(seg3), 2 * rows).numpy()[2::3]
-    got3 = np.asarray(W.infer(
+        ref3 = net3.raw_scores(
+            tx3, tids3, torch.as_tensor(allphi3), inv3, torch.as_tensor(w3),
+            torch.as_tensor(seg3), 2 * rows).numpy()[2::3]
+    got3 = np.asarray(W.infer_raw(
         np.ascontiguousarray(x3.ravel()),
         np.ascontiguousarray(xbel3.ravel()),
         np.ascontiguousarray(phi3.ravel()),

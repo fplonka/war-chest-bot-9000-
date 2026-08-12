@@ -53,8 +53,8 @@ const STARTER_BLACK: [u16; 4] = [1, 3, 8, 16]; // Archer, Cavalry, Lancer, Scout
 
 /// Draftable units. The Warrior Priest pair (ids 18 and 54) is included: their
 /// private mid-round draw puts "which coin must I now play" into the private
-/// state as `Config::pending_coin`, which the solver, belief filter and walk
-/// all carry.
+/// state as `Config`'s current/queued forced coins, which the solver, belief
+/// filter and walk all carry.
 pub const DRAFT_POOL: [u16; 19] = [
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 17, 18, 19, 52, 53, 54,
 ];
@@ -171,12 +171,13 @@ impl NodePolicy {
     fn frame(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config]) -> NodePolicy {
         let (acts, aslot, fdown) = node_actions(s, player, ctx, cfgs);
         let na = acts.len();
+        let forced = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
         let mut legal_off = Vec::with_capacity(cfgs.len() + 1);
         let mut legal_action = Vec::new();
         legal_off.push(0);
         for c in cfgs {
             for a in 0..na {
-                if action_legal(c, aslot[a]) {
+                if action_legal(c, aslot[a], forced) {
                     legal_action.push(a as u32);
                 }
             }
@@ -207,7 +208,8 @@ fn greedy_policy(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config], temp: f32) -
     let na = np.acts.len();
     let mut score = vec![f32::NEG_INFINITY; na];
     for a in 0..na {
-        let rep = cfgs.iter().find(|c| action_legal(c, np.aslot[a]));
+        let forced = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
+        let rep = cfgs.iter().find(|c| action_legal(c, np.aslot[a], forced));
         let Some(rep) = rep else { continue };
         let mut probe = s.clone();
         set_config(&mut probe, player, ctx, rep);
@@ -274,9 +276,8 @@ pub struct Data {
     /// row is expanded when a batch is made, so the stored bytes never go
     /// stale as the network changes.
     pub rows: Vec<u8>,
-    /// `[total_configs, CCOUNTS]` raw counts per config, in the arena order.
-    /// Raw rather than normalised: they are `u8`-valued, and storing them that
-    /// way is what keeps a replay row small enough to hold millions of them.
+    /// `[total_configs, CPRIVATE]` raw config values in arena order: counts and
+    /// future forced-play one-hots. Raw `u8` storage keeps millions affordable.
     pub cc: Vec<u8>,
     /// `[total_configs]` belief probability of each config.
     pub cw: Vec<f32>,
@@ -322,14 +323,14 @@ pub struct Data {
     /// `[sum nc * na]` the reference strategy: one distribution per config of
     /// the acting player, in the row's config order.
     pub pp: Vec<f32>,
+    pub ppoff: Vec<u32>,
     /// `[2 * n + 1]` arena offsets.
     pub coff: Vec<u32>,
     /// Solve starts in row space: `soff[k]` is the row at which solve k
     /// starts (first entry 0). The Python binding appends the total row count
-    /// as the trailing entry, so the buffer sees `soff[k]..soff[k+1]` as one
-    /// solve's rows. TurboReBeL produces T+1 near-duplicate rows per solve,
-    /// so the replay buffer treats the solve as its sampling unit — this
-    /// array is what lets it. Empty when no rows were collected.
+    /// as the trailing entry. Training samples the retained, log-spaced rows;
+    /// these boundaries remain useful for honest solve-level splits in replay
+    /// dumps. Empty when no rows were collected.
     pub soff: Vec<u32>,
     pub nv: usize,
     pub games: usize,
@@ -349,6 +350,10 @@ pub struct Data {
     /// thread. It is invisible in both CPU time and `gpu_wait_s`, so without
     /// it a saturated result path looks like a system with nothing saturated.
     pub merge_wait_s: f32,
+    /// Residual before the target-side numerical centring safeguard.
+    pub zero_sum_abs: f64,
+    pub zero_sum_max: f32,
+    pub zero_sum_n: usize,
 }
 
 impl Data {
@@ -356,6 +361,7 @@ impl Data {
         let base = self.cw.len() as u32;
         self.rows.extend(o.rows);
         let (row_base, act_base) = (self.nv as u32, (self.pa.len() / AFEAT) as u32);
+        let prob_base = self.pp.len() as u32;
         self.prow.extend(o.prow.iter().map(|r| r + row_base));
         self.pact.extend(o.pact);
         self.pa.extend(o.pa);
@@ -364,6 +370,9 @@ impl Data {
         self.paoff
             .extend(o.paoff.iter().skip(phead).map(|x| x + act_base));
         self.pp.extend(o.pp);
+        let pphead = if self.ppoff.is_empty() { 0 } else { 1 };
+        self.ppoff
+            .extend(o.ppoff.iter().skip(pphead).map(|x| x + prob_base));
         self.cc.extend(o.cc);
         self.cw.extend(o.cw);
         self.cy.extend(o.cy);
@@ -387,6 +396,9 @@ impl Data {
         self.draws += o.draws;
         self.gpu_wait_s += o.gpu_wait_s;
         self.merge_wait_s += o.merge_wait_s;
+        self.zero_sum_abs += o.zero_sum_abs;
+        self.zero_sum_max = self.zero_sum_max.max(o.zero_sum_max);
+        self.zero_sum_n += o.zero_sum_n;
         self.cap_hits += o.cap_hits;
         self.node_caps += o.node_caps;
         self.configs += o.configs;
@@ -402,10 +414,26 @@ impl Data {
     /// stored: the value function is a function of the config, so there is
     /// nothing to average away.
     fn push_value(&mut self, s: &State, ctx: &Ctx, bel: &[Belief; 2], y: [&[f32]; 2]) {
-        debug_assert!(
+        assert!(
             matches!(s.pending(), Cont::MainPlay),
-            "every saved value row is a normal coin-play state"
+            "value rows are taken only at normal coin-play decisions: {:?}",
+            s.pending()
         );
+        let mean = |p: usize| {
+            let mass: f32 = bel[p].p.iter().sum();
+            bel[p].p.iter().zip(y[p]).map(|(&w, &v)| w * v).sum::<f32>()
+                / mass.max(f32::MIN_POSITIVE)
+        };
+        let residual = mean(0) + mean(1);
+        assert!(
+            residual.abs() <= 1e-4,
+            "non-zero-sum value target: belief-weighted v0 + v1 = {residual}"
+        );
+        self.zero_sum_abs += residual.abs() as f64;
+        self.zero_sum_max = self.zero_sum_max.max(residual.abs());
+        self.zero_sum_n += 1;
+        let centre = 0.5 * residual;
+
         let base = self.rows.len();
         self.rows.resize(base + ROW_BYTES, 0);
         pack_row(s, ctx, &mut self.rows[base..base + ROW_BYTES]);
@@ -415,12 +443,12 @@ impl Data {
         }
         for p in 0..2 {
             let res = reserve(s, p as u8, ctx);
-            let mut cnt = [0u8; CCOUNTS];
+            let mut private = [0u8; CPRIVATE];
             for (ci, c) in bel[p].cfg.iter().enumerate() {
-                config_counts(c, &res, &mut cnt);
-                self.cc.extend_from_slice(&cnt);
+                config_private(c, &res, &mut private);
+                self.cc.extend_from_slice(&private);
                 self.cw.push(bel[p].p[ci]);
-                self.cy.push(y[p][ci]);
+                self.cy.push(y[p][ci] - centre);
             }
             self.coff.push(self.cw.len() as u32);
         }
@@ -442,6 +470,7 @@ impl Data {
         }
         if self.paoff.is_empty() {
             self.paoff.push(0);
+            self.ppoff.push(0);
         }
         let base = self.pa.len();
         self.pa.resize(base + na * AFEAT, 0.0);
@@ -463,6 +492,7 @@ impl Data {
                 self.pp[base + n.legal_action[cell] as usize] = p;
             }
         }
+        self.ppoff.push(self.pp.len() as u32);
         self.prow.push(row as u32);
         self.pact.push(player);
     }
@@ -485,6 +515,7 @@ impl Data {
         }
         if self.paoff.is_empty() {
             self.paoff.push(0);
+            self.ppoff.push(0);
         }
         let base = self.pa.len();
         self.pa.resize(base + na * AFEAT, 0.0);
@@ -507,6 +538,7 @@ impl Data {
                 self.pp[base + tree.legal_action[cell] as usize] = strat[cell];
             }
         }
+        self.ppoff.push(self.pp.len() as u32);
         self.prow.push(row as u32);
         self.pact.push(player);
     }
@@ -821,6 +853,9 @@ impl<'a> Game<'a> {
                 let wp = matches!(s.pending(), Cont::WarriorPriestDraw { .. });
                 bel[player as usize] = belief_after_draw(&bel[player as usize], &res, &fu, wp);
                 resolve_chance(s, player, rng);
+                for p in 0..2 {
+                    assert_belief_matches_state(s, p, ctx, &bel[p as usize], "draw", None);
+                }
                 // The walk spans draws now: a draw is an internal node of the
                 // subgame with one public child, so advance through it. The
                 // post-draw belief must equal the tree's post-draw config
@@ -902,10 +937,17 @@ impl<'a> Game<'a> {
                     }
                     // A pathological root falls back to a uniform policy; the
                     // policy is produced outside the walk bookkeeping below.
+                    // Its public micro-continuations must finish under the
+                    // same fallback before a new subgame starts: the value
+                    // encoding is frozen at normal coin-play boundaries.
                     let mut fallback: Option<NodePolicy> = None;
-                    if walk.is_none() {
+                    if walk.is_none() && !matches!(s.pending(), Cont::MainPlay) {
+                        carried.clear();
+                        fallback = Some(random_policy(s, ctx, player, &cfgs));
+                    }
+                    if walk.is_none() && fallback.is_none() {
                         if let Some(r) = roots_out.as_deref_mut() {
-                            r.push((s.clone(), bel.clone()));
+                            r.push((*s, bel.clone()));
                         }
                         // Start a new subgame at this decision: build the
                         // tree (Phase 1's CPU half). TurboReBeL's Phase 2 then
@@ -930,9 +972,8 @@ impl<'a> Game<'a> {
                             // Fall back to a uniform policy for this decision
                             // and drop the walk (and any carried beliefs); the
                             // next Rebel decision starts a fresh solve. No
-                            // rows are collected here, so the data keeps the
-                            // MainPlay-only invariant without a search that
-                            // never ends.
+                            // rows are collected here, so a search that never
+                            // ends cannot contaminate the replay.
                             walk.take();
                             carried.clear();
                             data.node_caps += 1;
@@ -1084,6 +1125,8 @@ impl<'a> Game<'a> {
                     sample_row(rng, &np.probs[true_row.clone()])
                 };
             let chosen = np.legal_action[chosen_cell] as usize;
+            let pending_before = *s.pending();
+            let forced = matches!(pending_before, Cont::WarriorPriestPlay { .. });
 
             // ReBeL attaches the reference-policy PBS to an off-policy sampled
             // branch. For ordinary agents, `np` is already their full behaviour
@@ -1096,13 +1139,23 @@ impl<'a> Game<'a> {
                     if obs_key(&np.acts[a]) != obs {
                         continue;
                     }
-                    if let Some(n) = advance_config(c, np.aslot[a], np.fdown[a]) {
+                    if let Some(n) = advance_config(c, np.aslot[a], np.fdown[a], forced) {
                         pairs.push((n, bel[player as usize].p[ci] * np.probs[cell]));
                     }
                 }
             }
             bel[player as usize] = Belief::from_pairs(pairs);
             s.apply_inplace(np.acts[chosen]);
+            for p in 0..2 {
+                assert_belief_matches_state(
+                    s,
+                    p,
+                    ctx,
+                    &bel[p as usize],
+                    "public action",
+                    Some(np.acts[chosen]),
+                );
+            }
             if uniform_override {
                 // Exploration picked only the public branch. Continue from a
                 // private world drawn from the reference-policy PBS attached
@@ -1113,7 +1166,9 @@ impl<'a> Game<'a> {
                 assert_eq!(
                     true_config(s, player, ctx),
                     c,
-                    "failed to instantiate the sampled reference config"
+                    "failed to instantiate the sampled reference config: player={player} before={pending_before:?} action={:?} after={:?}",
+                    np.acts[chosen],
+                    s.pending(),
                 );
             }
 
@@ -1297,19 +1352,17 @@ pub fn play_game(
     nets: &[Nets],
     gc: &GameCfg,
     data: &mut Data,
-    mut roots: Option<&mut Vec<(State, [Belief; 2])>>,
+    roots: Option<&mut Vec<(State, [Belief; 2])>>,
 ) -> f32 {
     let mut g = Game::new(rng, gc);
     if roots.is_some() {
         g.set_roots(Vec::new());
     }
-    let z = loop {
-        match g.advance(None, nets) {
-            Step::Ended => break g.finish(),
-            Step::Submitted => unreachable!("cpu path never submits"),
-        }
+    let z = match g.advance(None, nets) {
+        Step::Ended => g.finish(),
+        Step::Submitted => unreachable!("cpu path never submits"),
     };
-    if let Some(r) = roots.as_deref_mut() {
+    if let Some(r) = roots {
         r.extend(g.take_roots());
     }
     let d = g.take_data();
@@ -1438,6 +1491,55 @@ fn resolve_chance(s: &mut State, player: u8, rng: &mut Rng) {
     }
     let ai = rng.weighted_index(&w);
     s.apply_inplace(acts[ai]);
+}
+
+/// The public encoder and tree builder require every private config to be a
+/// different split of the same public counts. Check that boundary immediately
+/// after every belief transition so corruption is attributed to the action
+/// that created it rather than to an unrelated solve several decisions later.
+fn assert_belief_matches_state(
+    s: &State,
+    p: u8,
+    ctx: &Ctx,
+    b: &Belief,
+    event: &str,
+    action: Option<Action>,
+) {
+    let res = reserve(s, p, ctx);
+    let truth = true_config(s, p, ctx);
+    let forced =
+        usize::from(truth.pending_coin.is_some()) + usize::from(truth.queued_coin.is_some());
+    let hand = s.hand_size(p);
+    let fd: u8 = s.zones[p as usize][crate::state::Z_FACEDOWN]
+        .iter()
+        .copied()
+        .sum();
+    for c in &b.cfg {
+        assert_eq!(
+            c.hand_size(), hand,
+            "{event} belief changed public hand size: player={p} action={action:?} state={:?} config={c:?}",
+            s.pending()
+        );
+        assert_eq!(
+            c.fd_size(), fd,
+            "{event} belief changed public face-down size: player={p} action={action:?} state={:?} config={c:?}",
+            s.pending()
+        );
+        assert_eq!(
+            usize::from(c.pending_coin.is_some()) + usize::from(c.queued_coin.is_some()),
+            forced,
+            "{event} belief changed public forced-play depth: player={p} action={action:?} state={:?} config={c:?}",
+            s.pending()
+        );
+        for k in 0..NSLOT {
+            assert!(
+                c.hand[k] + c.fd[k] <= res[k],
+                "{event} belief exceeds reserve: player={p} slot={k} reserve={} action={action:?} state={:?} config={c:?}",
+                res[k],
+                s.pending()
+            );
+        }
+    }
 }
 
 pub(crate) fn effective_bag_count(s: &State, p: u8, unit: u8) -> u8 {
@@ -1728,147 +1830,161 @@ pub fn run_games_gpu_stream(
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let data_tx = data_tx.clone();
+            let error_tx = data_tx.clone();
             let next = &next;
             scope.spawn(move || {
-                let mut game: Vec<Option<Game>> = (0..per).map(|_| None).collect();
-                let mut busy = vec![false; per];
-                let (tx, rx) = std::sync::mpsc::channel();
-                let mut live = 0usize;
-                let mut inflight = 0usize;
-                let mut cursor = 0usize;
-                let mut merge_wait = 0.0f32;
-                loop {
-                    let stopping = stop.load(Ordering::Acquire);
-                    if stopping {
-                        for k in 0..per {
-                            if busy[k] {
-                                continue;
-                            }
-                            if let Some(mut g) = game[k].take() {
-                                let mut d = g.take_data();
-                                d.censored_games += 1;
-                                let _ = data_tx.send(Ok(d));
-                                live -= 1;
-                            }
-                        }
-                    }
-                    let mut scanned = 0usize;
-                    while !stopping && scanned < per && inflight < max_inflight {
-                        let k = cursor;
-                        cursor = (cursor + 1) % per;
-                        scanned += 1;
-                        if busy[k] {
-                            continue;
-                        }
-                        loop {
-                            if game[k].is_none() {
-                                let i = next.fetch_add(1, Ordering::Relaxed);
-                                game[k] = Some(Game::new(Rng::new(worker_seed(seed, i)), gc));
-                                live += 1;
-                            }
-                            let g = game[k].as_mut().expect("live stream game");
-                            let step = {
-                                let _t = crate::timed!(ADVANCE);
-                                g.advance(Some(gpus), nets)
-                            };
-                            match step {
-                                Step::Submitted => {
-                                    if stop.load(Ordering::Acquire) {
-                                        let mut g = game[k].take().unwrap();
-                                        let mut d = g.take_data();
-                                        d.censored_games += 1;
-                                        let _ = data_tx.send(Ok(d));
-                                        live -= 1;
-                                        break;
-                                    }
-                                    let job = g.take_job().expect("submitted stream job");
-                                    let dev = gpus
-                                        .iter()
-                                        .enumerate()
-                                        .min_by_key(|(_, gpu)| gpu.queued_work())
-                                        .map_or(0, |(i, _)| i);
-                                    if let Err(e) = gpus[dev].submit_tagged(job, k, tx.clone()) {
-                                        stop.store(true, Ordering::Release);
-                                        let _ = data_tx.send(Err(e));
-                                    } else {
-                                        busy[k] = true;
-                                        inflight += 1;
-                                    }
-                                    break;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut game: Vec<Option<Game>> = (0..per).map(|_| None).collect();
+                    let mut busy = vec![false; per];
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let mut live = 0usize;
+                    let mut inflight = 0usize;
+                    let mut cursor = 0usize;
+                    let mut merge_wait = 0.0f32;
+                    loop {
+                        let stopping = stop.load(Ordering::Acquire);
+                        if stopping {
+                            for k in 0..per {
+                                if busy[k] {
+                                    continue;
                                 }
-                                Step::Ended => {
-                                    let _ = g.finish();
+                                if let Some(mut g) = game[k].take() {
                                     let mut d = g.take_data();
-                                    d.merge_wait_s += std::mem::take(&mut merge_wait);
-                                    if data_tx.send(Ok(d)).is_err() {
-                                        stop.store(true, Ordering::Release);
-                                    }
-                                    game[k] = None;
+                                    d.censored_games += 1;
+                                    let _ = data_tx.send(Ok(d));
                                     live -= 1;
                                 }
                             }
                         }
-                    }
-                    if live == 0 && stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    if !busy.iter().any(|&x| x) {
-                        continue;
-                    }
-                    let waited = std::time::Instant::now();
-                    let Ok((k, result)) = rx.recv() else {
-                        stop.store(true, Ordering::Release);
-                        let _ = data_tx.send(Err("GPU stream completion channel closed".into()));
-                        continue;
-                    };
-                    busy[k] = false;
-                    inflight -= 1;
-                    if stop.load(Ordering::Acquire) {
+                        let mut scanned = 0usize;
+                        while !stopping && scanned < per && inflight < max_inflight {
+                            let k = cursor;
+                            cursor = (cursor + 1) % per;
+                            scanned += 1;
+                            if busy[k] {
+                                continue;
+                            }
+                            loop {
+                                if game[k].is_none() {
+                                    let i = next.fetch_add(1, Ordering::Relaxed);
+                                    game[k] = Some(Game::new(Rng::new(worker_seed(seed, i)), gc));
+                                    live += 1;
+                                }
+                                let g = game[k].as_mut().expect("live stream game");
+                                let step = {
+                                    let _t = crate::timed!(ADVANCE);
+                                    g.advance(Some(gpus), nets)
+                                };
+                                match step {
+                                    Step::Submitted => {
+                                        if stop.load(Ordering::Acquire) {
+                                            let mut g = game[k].take().unwrap();
+                                            let mut d = g.take_data();
+                                            d.censored_games += 1;
+                                            let _ = data_tx.send(Ok(d));
+                                            live -= 1;
+                                            break;
+                                        }
+                                        let job = g.take_job().expect("submitted stream job");
+                                        let dev = gpus
+                                            .iter()
+                                            .enumerate()
+                                            .min_by_key(|(_, gpu)| gpu.queued_work())
+                                            .map_or(0, |(i, _)| i);
+                                        if let Err(e) = gpus[dev].submit_tagged(job, k, tx.clone())
+                                        {
+                                            stop.store(true, Ordering::Release);
+                                            let _ = data_tx.send(Err(e));
+                                        } else {
+                                            busy[k] = true;
+                                            inflight += 1;
+                                        }
+                                        break;
+                                    }
+                                    Step::Ended => {
+                                        let _ = g.finish();
+                                        let mut d = g.take_data();
+                                        d.merge_wait_s += std::mem::take(&mut merge_wait);
+                                        if data_tx.send(Ok(d)).is_err() {
+                                            stop.store(true, Ordering::Release);
+                                        }
+                                        game[k] = None;
+                                        live -= 1;
+                                    }
+                                }
+                            }
+                        }
+                        if live == 0 && stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        if !busy.iter().any(|&x| x) {
+                            continue;
+                        }
+                        let waited = std::time::Instant::now();
+                        let Ok((k, result)) = rx.recv() else {
+                            stop.store(true, Ordering::Release);
+                            let _ =
+                                data_tx.send(Err("GPU stream completion channel closed".into()));
+                            continue;
+                        };
+                        busy[k] = false;
+                        inflight -= 1;
+                        if stop.load(Ordering::Acquire) {
+                            match result {
+                                Ok(value) => {
+                                    // Stop closes admission, not accounting. This
+                                    // solve completed while the final waves drained;
+                                    // keep its final bootstrap target, then censor
+                                    // only the unfinished public game around it.
+                                    let mut g = game[k].take().expect("draining stream game");
+                                    g.resume(value);
+                                    let mut d = g.take_data();
+                                    d.gpu_wait_s += waited.elapsed().as_secs_f32();
+                                    d.censored_games += 1;
+                                    let _ = data_tx.send(Ok(d));
+                                    live -= 1;
+                                }
+                                Err(e) => {
+                                    let _ = game[k].take();
+                                    live -= 1;
+                                    let _ = data_tx.send(Err(format!(
+                                        "GPU stream solve failed while draining: {e}"
+                                    )));
+                                }
+                            }
+                            continue;
+                        }
                         match result {
                             Ok(value) => {
-                                // Stop closes admission, not accounting. This
-                                // solve completed while the final waves drained;
-                                // keep its final bootstrap target, then censor
-                                // only the unfinished public game around it.
-                                let mut g = game[k].take().expect("draining stream game");
+                                let g = game[k].as_mut().expect("pending stream game");
                                 g.resume(value);
                                 let mut d = g.take_data();
                                 d.gpu_wait_s += waited.elapsed().as_secs_f32();
-                                d.censored_games += 1;
-                                let _ = data_tx.send(Ok(d));
-                                live -= 1;
+                                // Carries the previous handoff's block time: this
+                                // one is not known until the send returns.
+                                d.merge_wait_s += std::mem::take(&mut merge_wait);
+                                let handoff = std::time::Instant::now();
+                                let sent = data_tx.send(Ok(d));
+                                merge_wait += handoff.elapsed().as_secs_f32();
+                                if sent.is_err() {
+                                    stop.store(true, Ordering::Release);
+                                }
                             }
                             Err(e) => {
-                                let _ = game[k].take();
-                                live -= 1;
-                                let _ = data_tx.send(Err(format!(
-                                    "GPU stream solve failed while draining: {e}"
-                                )));
-                            }
-                        }
-                        continue;
-                    }
-                    match result {
-                        Ok(value) => {
-                            let g = game[k].as_mut().expect("pending stream game");
-                            g.resume(value);
-                            let mut d = g.take_data();
-                            d.gpu_wait_s += waited.elapsed().as_secs_f32();
-                            // Carries the previous handoff's block time: this
-                            // one is not known until the send returns.
-                            d.merge_wait_s += std::mem::take(&mut merge_wait);
-                            let handoff = std::time::Instant::now();
-                            let sent = data_tx.send(Ok(d));
-                            merge_wait += handoff.elapsed().as_secs_f32();
-                            if sent.is_err() {
                                 stop.store(true, Ordering::Release);
+                                let _ = data_tx.send(Err(format!("GPU stream solve failed: {e}")));
                             }
                         }
-                        Err(e) => {
-                            stop.store(true, Ordering::Release);
-                            let _ = data_tx.send(Err(format!("GPU stream solve failed: {e}")));
-                        }
                     }
+                }));
+                if let Err(panic) = result {
+                    stop.store(true, Ordering::Release);
+                    let message = panic
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| panic.downcast_ref::<&str>().copied())
+                        .unwrap_or("unknown panic");
+                    let _ = error_tx.send(Err(format!("GPU stream worker panicked: {message}")));
                 }
             });
         }

@@ -185,7 +185,10 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
             // If any leaf were non-terminal the (empty) network would silently
             // return zero and the comparison would be meaningless.
             assert!(
-                sv.nodes.iter().zip(&sv.states).all(|(n, s)| !n.leaf || s.is_terminal()),
+                sv.nodes
+                    .iter()
+                    .zip(&sv.states)
+                    .all(|(n, s)| !n.leaf || s.is_terminal()),
                 "the whole remaining game must fit inside the subgame"
             );
             if sv.nodes.len() > 8_000 {
@@ -318,7 +321,13 @@ fn cfr_iteration_count_bias() {
             },
             bel.clone(),
         );
-        if !probe.nodes.iter().zip(&probe.states).all(|(n, s)| !n.leaf || s.is_terminal()) || probe.nodes.len() > 8_000 {
+        if !probe
+            .nodes
+            .iter()
+            .zip(&probe.states)
+            .all(|(n, s)| !n.leaf || s.is_terminal())
+            || probe.nodes.len() > 8_000
+        {
             continue;
         }
         let mut o: Vec<i32> = probe
@@ -410,7 +419,6 @@ fn draw_position(seed: u64, warmup: usize, plies: u16) -> Option<State> {
             s.zones[p as usize][Z_BAG][u] += c;
             s.zones[p as usize][Z_FACEDOWN][u] = 0;
         }
-        let mut cfg = Config::default();
         // A unit whose coins are all deployed (or eliminated) has no reserve
         // left; the forced one-coin hand must fit the reserve, so use the
         // first slot that still has coins in the bag.
@@ -420,15 +428,16 @@ fn draw_position(seed: u64, warmup: usize, plies: u16) -> Option<State> {
         if hand_slot == NSLOT {
             return None;
         }
-        cfg.hand[hand_slot] = 1;
-        set_config(&mut s, p, &ctx, &cfg);
+        let unit = ctx.slots[p as usize][hand_slot] as usize;
+        s.zones[p as usize][Z_BAG][unit] -= 1;
+        s.zones[p as usize][Z_HAND][unit] = 1;
     }
     s.main_plays = MAX_MAIN_PLAYS - plies;
     Some(s)
 }
 
-/// The draw pass-through, checked structurally on real positions: a chance
-/// node must have exactly one public child, the child's config support must be
+/// The draw pass-through, checked structurally on real positions: a round-draw
+/// node has one public child, whose config support must be
 /// exactly `belief_after_draw`'s support (same list, same order — the
 /// invariant the self-play walk asserts at runtime), the idle player's support
 /// must pass through untouched, the chance-matrix rows must be proper
@@ -509,7 +518,8 @@ fn draw_pass_through_consistency() {
             for _ in 0..n.draw_steps {
                 let res = reserve(&ws, n.player, &ctx);
                 let fu = faceup_counts(&ws, n.player, &ctx);
-                b = belief_after_draw(&b, &res, &fu, false);
+                let warrior_priest = matches!(ws.pending(), Cont::WarriorPriestDraw { .. });
+                b = belief_after_draw(&b, &res, &fu, warrior_priest);
                 let acts = ws.legal_actions();
                 ws.apply_inplace(acts[0]);
             }
@@ -603,14 +613,13 @@ fn warrior_priest_draw_walks_through_the_tree() {
     use warchest::state::Z_BAG;
     let nets = Nets::default();
     // White: WP at W1, enemy at E1. Hand holds one WP coin (the trigger);
-    // the bag holds a WP coin and a Swordsman coin, so a draw can leave
-    // either of two pendings. The root belief carries two configs so the
-    // draw's children span both pendings.
+    // the bag holds the rest of the draft, so a draw can leave multiple
+    // pending forced-play coins.
     let mut s = State::blank(warchest::state::WHITE);
     s.set_unit(17, warchest::state::WHITE, WARRIOR_PRIEST, 1); // (2,3)
     s.set_unit(19, warchest::state::BLACK, FOOTMAN, 3); // (4,3)
-                                                        // Full 5-type reserve per player, as `Ctx::new` requires. Only the WP and
-                                                        // Swordsman coins are actually reachable.
+
+    // Full five-type reserve per player, as `Ctx::new` requires.
     for u in [WARRIOR_PRIEST, SWORDSMAN, PIKEMAN, CROSSBOWMAN, ROYAL_COIN] {
         s.add_zone(warchest::state::WHITE, Z_BAG, u, 1);
     }
@@ -620,17 +629,12 @@ fn warrior_priest_draw_walks_through_the_tree() {
     s.add_zone(warchest::state::WHITE, Z_HAND, WARRIOR_PRIEST, 1);
     let ctx = Ctx::new(&s);
     let wp = ctx.slot_of[0][WARRIOR_PRIEST as usize] as u8;
-    let sw = ctx.slot_of[0][SWORDSMAN as usize] as u8;
-    assert_ne!(wp, sw);
     let mut c1 = Config::default();
     c1.hand[wp as usize] = 1;
-    let mut c2 = Config::default();
-    c2.hand[wp as usize] = 1;
-    c2.hand[sw as usize] = 1;
     let bel = [
         Belief {
-            cfg: vec![c1, c2],
-            p: vec![0.5, 0.5],
+            cfg: vec![c1],
+            p: vec![1.0],
         },
         Belief::point(Config::default()),
     ];
@@ -694,7 +698,10 @@ fn warrior_priest_draw_walks_through_the_tree() {
     // The child is a WarriorPriestPlay decision node. Its actions come from
     // both pendings and its per-config legality is the pending match.
     let wpn = &sv.nodes[ch];
-    assert!(matches!(sv.states[ch].pending(), Cont::WarriorPriestPlay { .. }));
+    assert!(matches!(
+        sv.states[ch].pending(),
+        Cont::WarriorPriestPlay { .. }
+    ));
     assert!(!wpn.leaf && !wpn.chance);
     assert!(wpn.na() > 0);
     let me = wpn.player as usize;

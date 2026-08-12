@@ -17,7 +17,8 @@ mirror.
 
 Correctness
 -----------
-`self_check` asserts the properties that any indexing mistake would break:
+`self_check_state_oracle` compares packed rows against Rust's independent
+game-level `State::mirror`. `self_check` also asserts encoder properties:
 the transform is an involution, quantities that must be invariant under a
 rotation (whether a hex is a location, the round number) do not move, and
 quantities that must swap (each player's board presence, the unit ids) do.
@@ -177,11 +178,33 @@ def self_check_rows(rows, cc, cp, seg):
     # Expansion commutes: expand(mirror(rows)) == mirror_x(expand(rows)).
     from train import expand_batch, public_sizes
     n = len(rows)
-    hand, fd, bag = public_sizes(cc, cp, seg, n)
+    hand, fd, bag = public_sizes(cc, seg, n)
     hand_m = hand[:, ::-1].copy()
     fd_m = fd[:, ::-1].copy()
     bag_m = bag[:, ::-1].copy()
     a = expand_batch(mr, hand_m, fd_m, bag_m)
     b = mirror_x(expand_batch(rows, hand, fd, bag))
     assert np.allclose(a, b, atol=1e-6), "row mirror and feature mirror diverge"
+    return True
+
+
+def self_check_state_oracle(n=256, seed=0x51A7E):
+    """Check the Python augmentation against independent mirrored Rust states."""
+    original, expected, private, expected_private = warchest.mirror_rows_oracle(n, seed)
+    original = np.asarray(original, np.uint8).reshape(n, ROW_BYTES)
+    expected = np.asarray(expected, np.uint8).reshape(n, ROW_BYTES)
+    private = np.asarray(private, np.uint8).reshape(n, 2, warchest.CPRIVATE)
+    expected_private = np.asarray(expected_private, np.uint8).reshape(
+        n, 2, warchest.CPRIVATE)
+    got = mirror_rows(original)
+    # Aux labels are filled only after a game ends and are not State fields.
+    end = warchest.ROW_AUX
+    assert np.array_equal(got[:, :end], expected[:, :end]), \
+        "packed-row augmentation disagrees with State::mirror"
+    # `make_batch` leaves config bytes in place and flips their seat (`seg` and
+    # `cp`). Under the mirrored state's player ordering that is exactly a swap.
+    assert np.array_equal(private[:, ::-1], expected_private), \
+        "private-config augmentation disagrees with State::mirror"
+    assert np.any(private[:, :, warchest.CCOUNTS:]), \
+        "the State::mirror oracle did not exercise forced-coin flags"
     return True

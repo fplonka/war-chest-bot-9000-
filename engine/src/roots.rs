@@ -11,7 +11,7 @@ use crate::state::{Cont, ContStack, State, CONT_CAP, N_PLAYERS, N_ZONES};
 use crate::units::N_UNITS;
 
 pub const ROOTS_MAGIC: u32 = 0x5710_7207;
-pub const ROOTS_VERSION: u32 = 1;
+pub const ROOTS_VERSION: u32 = 2;
 
 fn w8<W: Write>(w: &mut W, x: u8) -> std::io::Result<()> {
     w.write_all(&[x])
@@ -220,6 +220,7 @@ fn write_config<W: Write>(w: &mut W, c: &Config) -> std::io::Result<()> {
         w8(w, c.fd[k])?;
     }
     w8(w, c.pending_coin.map_or(0xff, |p| p))?;
+    w8(w, c.queued_coin.map_or(0xff, |p| p))?;
     Ok(())
 }
 
@@ -233,6 +234,8 @@ fn read_config<R: Read>(r: &mut R) -> std::io::Result<Config> {
     }
     let p = r8(r)?;
     c.pending_coin = if p == 0xff { None } else { Some(p) };
+    let q = r8(r)?;
+    c.queued_coin = if q == 0xff { None } else { Some(q) };
     Ok(c)
 }
 

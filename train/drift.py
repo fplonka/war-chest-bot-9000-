@@ -40,7 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dump import Dump                              # noqa: E402
 from export_weights import load as load_checkpoint  # noqa: E402
 from offline import subset                          # noqa: E402
-from train import CCOUNTS, PUBFEAT, make_batch      # noqa: E402
+from train import make_batch                        # noqa: E402
 
 
 def predictions(path, parts, dev, rng):
@@ -64,7 +64,6 @@ def main():
     args = ap.parse_args()
 
     d = Dump(args.set)
-    d.check(PUBFEAT, CCOUNTS)
     parts = d.rows(0, len(d))
     dev, rng = torch.device(args.device), np.random.default_rng(0)
     with open(f"{args.run}/log.json") as f:

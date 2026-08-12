@@ -32,7 +32,7 @@ use warchest::rebel::*;
 use warchest::rng::Rng;
 use warchest::search::{node_actions, Cfg, Nets, Solver};
 use warchest::selfplay::make_game;
-use warchest::state::{Cont, State, Z_BAG, Z_FACEDOWN, Z_FACEUP};
+use warchest::state::{Cont, State, Z_BAG, Z_FACEDOWN, Z_FACEUP, Z_HAND};
 use warchest::units::{write_card_features, CARD_FEATS, N_UNITS};
 use warchest::Action;
 
@@ -41,7 +41,7 @@ use warchest::Action;
 fn random_net(seed: u64, hidden: usize, dg: usize) -> Mlp {
     let mut r = Rng::new(seed);
     let (de, dc, rk) = (16usize, 32usize, dg);
-    let dims = [PUBFEAT, hidden, hidden, CFEAT, dg, rk, AFEAT, de, dc, 0];
+    let dims = [3, de, dg, rk, hidden, 1, 1, dc, 1, hidden, 0, 0];
     let xd = warchest::board::N_HEXES * (HEX_FACTS + de) + 2 * de + LOOSE;
     let nw = CARD_FEATS * dc
         + dc * de
@@ -50,7 +50,7 @@ fn random_net(seed: u64, hidden: usize, dg: usize) -> Mlp {
         + xd * hidden
         + hidden * hidden
         + 2 * dg * hidden
-        + (4 + de) * dg
+        + (6 + de) * dg
         + dg * dg
         + dg * dg
         + dg * (rk + 1)
@@ -111,7 +111,8 @@ fn uniform_row(
     c: &Config,
 ) -> (Vec<Action>, Vec<i8>, Vec<bool>, Vec<f64>) {
     let (acts, aslot, fdown) = node_actions(s, p, ctx, std::slice::from_ref(c));
-    let legal: Vec<bool> = aslot.iter().map(|&k| action_legal(c, k)).collect();
+    let forced = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
+    let legal: Vec<bool> = aslot.iter().map(|&k| action_legal(c, k, forced)).collect();
     let n = legal.iter().filter(|&&x| x).count() as f64;
     let probs = legal
         .iter()
@@ -322,7 +323,8 @@ fn run_one_draft(seed: u64, white: &[u16], black: &[u16]) {
                 if cprobs[i] <= 0.0 || obs_key(a) != obs {
                     continue;
                 }
-                if let Some(n) = advance_config(c, aslot[i], fdown[i]) {
+                let forced = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
+                if let Some(n) = advance_config(c, aslot[i], fdown[i], forced) {
                     pairs.push((n, bel[p as usize].p[ci] * cprobs[i] as f32));
                 }
             }
@@ -405,7 +407,7 @@ fn compare(
 }
 
 /// The config key must stay inside the packed `u64` budget (the key shares a
-/// word with the element index in the solver's sort): 38 bits of config +
+/// word with the element index in the solver's sort): 41 bits of config +
 /// `IDX_BITS` index bits must not overflow. Also pins that the key
 /// distinguishes pendings and that hand slots never exceed the two-bit width.
 #[test]
@@ -423,6 +425,9 @@ fn config_key_packing_has_headroom() {
         } else {
             Some(r.below(NSLOT) as u8)
         };
+        if c.pending_coin.is_some() && r.next_u64() & 1 != 0 {
+            c.queued_coin = Some(r.below(NSLOT) as u8);
+        }
         let key = c.key();
         assert!(
             key < (1u64 << (64 - IDX_BITS)),
@@ -440,6 +445,15 @@ fn config_key_packing_has_headroom() {
         if c.pending_coin != d.pending_coin {
             assert_ne!(c.key(), d.key());
         }
+        d = c;
+        d.queued_coin = match c.queued_coin {
+            None => Some(0),
+            Some(p) if p + 1 < NSLOT as u8 => Some(p + 1),
+            Some(_) => None,
+        };
+        if c.queued_coin != d.queued_coin {
+            assert_ne!(c.key(), d.key());
+        }
     }
     // Explicit extreme: every slot at its maximum with a pending coin.
     let mut c = Config::default();
@@ -448,9 +462,131 @@ fn config_key_packing_has_headroom() {
         c.fd[k] = 5;
     }
     c.pending_coin = Some(NSLOT as u8 - 1);
+    c.queued_coin = Some(NSLOT as u8 - 1);
     assert!(c.key() < (1u64 << (64 - IDX_BITS)));
     // The hand width is two bits; `key`'s debug_assert is the overflow test
     // for a slot value of 4 or more (it fires in every debug test build).
+}
+
+#[test]
+fn nested_warrior_priest_plays_stay_in_the_config() {
+    let mut old = Config::default();
+    old.hand[1] = 1;
+    old.pending_coin = Some(1);
+    let drawn = belief_after_draw(&Belief::point(old), &[0, 1, 1, 0, 0], &[0; NSLOT], true);
+    assert_eq!(drawn.cfg.len(), 1);
+    assert_eq!(drawn.cfg[0].pending_coin, Some(2));
+    assert_eq!(drawn.cfg[0].queued_coin, Some(1));
+    let revealed = advance_config(&drawn.cfg[0], 2, false, true).expect("new forced play");
+    assert_eq!(revealed.pending_coin, Some(1));
+    assert_eq!(revealed.queued_coin, None);
+
+    let mut s = make_game(&mut Rng::new(9), false);
+    let ctx = Ctx::new(&s);
+    let player = 0;
+    let slot = 1usize;
+    let coin = ctx.slots[player][slot];
+    s.zones[player][Z_BAG][coin as usize] -= 2;
+    s.zones[player][Z_HAND][coin as usize] += 2;
+    s.pending = Cont::WarriorPriestPlay {
+        player: player as u8,
+        coin,
+    };
+    s.conts.clear();
+    s.conts.push(Cont::WarriorPriestPlay {
+        player: player as u8,
+        coin,
+    });
+
+    let before = true_config(&s, player as u8, &ctx);
+    assert_eq!(before.pending_coin, Some(slot as u8));
+    assert_eq!(before.queued_coin, Some(slot as u8));
+    let after = advance_config(&before, slot as i8, true, true).expect("forced play");
+    s.apply_inplace(Action::Pass { coin });
+    assert_eq!(true_config(&s, player as u8, &ctx), after);
+    assert_eq!(after.pending_coin, Some(slot as u8));
+    assert_eq!(after.queued_coin, None);
+
+    // Instantiating a sampled world changes the hidden continuation coin too,
+    // not just hand/bag/discard counts.
+    let mut sampled = after;
+    sampled.hand[slot] -= 1;
+    sampled.hand[slot + 1] += 1;
+    sampled.pending_coin = Some((slot + 1) as u8);
+    set_config(&mut s, player as u8, &ctx, &sampled);
+    assert_eq!(true_config(&s, player as u8, &ctx), sampled);
+
+    // A normal play can sit above a future forced play. It spends an ordinary
+    // hand coin and must preserve the forced identity until that continuation
+    // becomes current.
+    let mut s = make_game(&mut Rng::new(10), false);
+    let ctx = Ctx::new(&s);
+    let now_slot = 1usize;
+    let future_slot = 2usize;
+    let now_coin = ctx.slots[player][now_slot];
+    let future_coin = ctx.slots[player][future_slot];
+    for coin in [now_coin, future_coin] {
+        s.zones[player][Z_BAG][coin as usize] -= 1;
+        s.zones[player][Z_HAND][coin as usize] += 1;
+    }
+    s.active = player as u8;
+    s.pending = Cont::MainPlay;
+    s.conts.clear();
+    s.conts.push(Cont::WarriorPriestPlay {
+        player: player as u8,
+        coin: future_coin,
+    });
+
+    let before = true_config(&s, player as u8, &ctx);
+    assert_eq!(before.pending_coin, Some(future_slot as u8));
+    let reserve = reserve(&s, player as u8, &ctx);
+    let mut alternate = before;
+    alternate.pending_coin = Some(now_slot as u8);
+    let mut encoded = [[0.0; CFEAT]; 2];
+    write_config_feats(&before, &reserve, player, &mut encoded[0]);
+    write_config_feats(&alternate, &reserve, player, &mut encoded[1]);
+    assert_ne!(
+        encoded[0], encoded[1],
+        "the value input must name the future forced coin"
+    );
+    let mut private = [0; CPRIVATE];
+    config_private(&before, &reserve, &mut private);
+    assert_eq!(private[CCOUNTS + future_slot], 1);
+    assert_eq!(private[CCOUNTS..CPRIVATE].iter().sum::<u8>(), 1);
+    let (acts, aslot, fdown) = node_actions(&s, player as u8, &ctx, &[before]);
+    let action = acts
+        .iter()
+        .position(|a| *a == Action::Pass { coin: now_coin })
+        .expect("normal play from another hand coin");
+    assert!(action_legal(&before, aslot[action], false));
+    let after = advance_config(&before, aslot[action], fdown[action], false)
+        .expect("normal play above future forced play");
+    assert_eq!(after.pending_coin, before.pending_coin);
+    s.apply_inplace(acts[action]);
+    assert!(matches!(s.pending(), Cont::WarriorPriestPlay { .. }));
+    assert_eq!(true_config(&s, player as u8, &ctx), after);
+
+    // Empty-support action probing is used by fallback/shape paths. Its
+    // synthetic config must start from the world's future continuation state;
+    // a default config used to panic here after a long random-draft run.
+    let mut probe = s;
+    probe.pending = Cont::MainPlay;
+    probe.conts.clear();
+    probe.conts.push(Cont::WarriorPriestPlay {
+        player: player as u8,
+        coin: future_coin,
+    });
+    assert!(!node_actions(&probe, player as u8, &ctx, &[]).0.is_empty());
+
+    // A winning forced play leaves the consumed node in `State::pending`
+    // because resolution stops immediately. Terminal configs have no future
+    // forced action and must not preserve that stale identity.
+    let mut terminal = s;
+    terminal.winner = player as u8;
+    let done = true_config(&terminal, player as u8, &ctx);
+    assert_eq!(done.pending_coin, None);
+    assert_eq!(done.queued_coin, None);
+    set_config(&mut terminal, player as u8, &ctx, &done);
 }
 
 /// The reachable-config census, re-run with the Warrior Priests in the draft
@@ -460,7 +596,7 @@ fn config_key_packing_has_headroom() {
 fn reachable_config_census_with_warrior_priests() {
     let mut sizes: Vec<usize> = Vec::new();
     let mut rng = Rng::new(0xC0FFEE);
-    for g in 0..200u64 {
+    for _ in 0..200u64 {
         let mut s = make_game(&mut rng, true);
         let ctx = Ctx::new(&s);
         for _ in 0..300 {
@@ -670,7 +806,10 @@ fn a_subgame_of_only_terminal_leaves_solves() {
         };
         let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
         assert!(
-            sv.nodes.iter().zip(&sv.states).all(|(n, s)| !n.leaf || s.is_terminal()),
+            sv.nodes
+                .iter()
+                .zip(&sv.states)
+                .all(|(n, s)| !n.leaf || s.is_terminal()),
             "expected every leaf terminal"
         );
         sv.multistep(cfg.iters);
@@ -683,7 +822,6 @@ fn a_subgame_of_only_terminal_leaves_solves() {
     }
     assert!(checked >= 3, "only {checked} positions exercised");
 }
-
 
 /// A warm start must not move where the solve converges.
 ///
@@ -847,9 +985,9 @@ fn action_features_separate_every_action() {
     );
 }
 
-/// The counts must be the ones the name says, and the bag must be the derived
-/// one. A transposition here would be invisible to every other test: the
-/// network would happily learn whatever permutation it was given.
+/// Counts, forced slots and seat must occupy the documented feature blocks. A
+/// transposition here would be invisible to every other test: the network
+/// would happily learn whatever permutation it was given.
 #[test]
 fn config_counts_are_hand_facedown_bag() {
     let reserve = [4u8, 3, 5, 2, 1];
@@ -857,6 +995,7 @@ fn config_counts_are_hand_facedown_bag() {
         hand: [1, 0, 2, 0, 0],
         fd: [2, 1, 0, 0, 1],
         pending_coin: None,
+        queued_coin: None,
     };
     let mut cnt = [0u8; CCOUNTS];
     config_counts(&c, &reserve, &mut cnt);
@@ -868,7 +1007,8 @@ fn config_counts_are_hand_facedown_bag() {
     for k in 0..CCOUNTS {
         assert_eq!(phi[k], cnt[k] as f32 / CNORM);
     }
-    assert_eq!(phi[CCOUNTS], 1.0, "seat flag");
+    assert!(phi[CCOUNTS..CPRIVATE].iter().all(|&x| x == 0.0));
+    assert_eq!(phi[CPRIVATE], 1.0, "seat flag");
 }
 
 // ------------------------------------------------------ no leak through a solve
@@ -1089,11 +1229,13 @@ fn from_pairs_keeps_zero_weight_configs() {
         hand: [1, 0, 0, 0, 0],
         fd: [0; NSLOT],
         pending_coin: None,
+        queued_coin: None,
     };
     let c = Config {
         hand: [0; NSLOT],
         fd: [1, 0, 0, 0, 0],
         pending_coin: None,
+        queued_coin: None,
     };
     let bel = Belief::from_pairs(vec![
         (b, 0.25),
@@ -1207,7 +1349,8 @@ fn zero_weight_config_survives_the_walk_update() {
                 if obs_key(&n0.acts[a]) != obs {
                     continue;
                 }
-                if let Some(n) = advance_config(c, n0.aslot[a], n0.fdown[a]) {
+                let forced = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
+                if let Some(n) = advance_config(c, n0.aslot[a], n0.fdown[a], forced) {
                     pairs.push((n, bel[me].p[ci] * p));
                 }
             }

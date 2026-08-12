@@ -1,7 +1,13 @@
-- [ ] experimetn with turbo vs not
 - [ ] test larger cap
 - [ ] test higher ratio than 4:1
 - [ ] figure out what on earth is going on with teh v0 + v1 thing
+- [ ] aux heads
+    - [ ] what ones? are they useful?
+- [ ] policy net
+    - [ ] useful? do we even keep it? 
+    - [ ] do we use it for warming? 
+    - [ ] do we use it for pruning?
+- [ ] impact of training with higher depth, interactino with pruning
 - [ ] do ai pass for corretness / ml quality issues.
 - [ ] Validate the mirror augmentation against the engine rather than against
       invariants (a State::mirror() in Rust would make the encoder the oracle).

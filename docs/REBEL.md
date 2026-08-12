@@ -52,19 +52,18 @@ public child. The belief update is
 many-to-one map, `play_game` does the sum. A Recruit reveals which unit was taken
 and hides which coin paid.
 
-**Chance.** Round-start draws are the only chance nodes. Their outcome is
-private, so they do not branch the public tree: the PBS transition is a
-deterministic convolution of the belief with each config's draw distribution
-(`belief_after_draw`). When a bag empties the discard pile is shuffled in, which
-erases the face-down component; bag emptiness is public, so every config
-reshuffles at the same moment.
+**Chance.** Round-start and Warrior Priest draws are private, so they do not
+branch the public tree: the PBS transition is a deterministic convolution of
+the belief with each config's draw distribution (`belief_after_draw`). When a
+bag empties the discard pile is shuffled in, which erases the face-down
+component; bag emptiness is public, so every config reshuffles together.
 
 **The Warrior Priest pair (units 18 and 54) is in the draft pool.** Its
-attribute triggers a private mid-round draw, so the private state is the
-triple `(hand, facedown, pending_coin)` — which coin the forced play must use.
-The pending coin is transient: it is set by the draw, cleared when the forced
-play resolves, and is always absent at a network-query boundary, so it never
-enters a replay row or the encoding.
+attribute triggers a private mid-round draw, so the private state also carries
+the next and, under a nested trigger, queued forced-play coin. Public decisions
+can resolve above an older forced play, so these identities remain part of the
+config until their corresponding continuation resolves. They are categorical
+per-slot inputs in both replay and the value network.
 
 ## 2. Horizon
 
@@ -141,10 +140,9 @@ drop configs and fail that assert.
 * `nash` — `Σ_p (BR_p − v_p)`, what a best response to the reference strategy
   would gain. Zero exactly when the strategy is an equilibrium of the subgame it
   induces. Absolute, so it compares regret rules against each other.
-* `zero_sum` — `v_0 + v_1` at the root, which is **not** zero: the leaves are
-  network values, and nothing makes the network's value for player 0 at a leaf
-  the negative of its value for player 1. The subgame is only as zero-sum as the
-  network is antisymmetric. It vanishes when every leaf is terminal.
+* `zero_sum` — `v_0 + v_1` at the root. The network's final value layer removes
+  half the sum of the two belief-weighted means from both players, so this must
+  be zero up to floating-point error. A larger residual is a correctness failure.
 
 Both freeze the leaf values at the ones the reference strategy induces, so this
 is exploitability of the depth-limited game the reference defines, not of War
@@ -212,7 +210,7 @@ The value of a leaf is a counterfactual value **per information state**, so it i
 indexed by the config: `v̂(PBS, c) -> scalar`.
 
 ```text
-  holding tower: z(c) = sum_k relu([counts_k, seat, e_k] Wc + bc)   [dg]
+  holding tower: z(c) = sum_k relu([counts_k, next_k, queued_k, seat, e_k] Wc + bc) [dg]
                  z(c) += relu(z Wh1 + bh1) Wh2 + bh2  (residual; Wh2 starts 0)
                  g(c) = z(c) Wg + bg                                [rank + 1]
 
@@ -222,8 +220,14 @@ indexed by the config: `v̂(PBS, c) -> scalar`.
                  h    = relu(LN(hpub + [b_0; b_1] Wb + b1))  [head]
                  u    = h Wu + bu                            [rank]
 
-  value:         v(c) = <u, g(c)[..rank]> + g(c)[rank]
+  raw score:     s(c) = <u, g(c)[..rank]> + g(c)[rank]
+  centre:        m    = 1/2 (sum_c beta_0(c)s(c) + sum_c beta_1(c)s(c))
+  value:         v(c) = s(c) - m
 ```
+
+The final centring layer makes the two belief-weighted player values sum to zero
+by construction. CFR and the training loss only consume `v`; `s` is exposed only
+for numerical parity diagnostics.
 
 The holding tower rectifies *before* the sum. A sum of raw linear maps is a
 linear map of the sum, and the sum of the inputs has forgotten which count
@@ -259,10 +263,9 @@ Labels are free: the solve's own average strategy at the root. The label attache
 to the solve's live-belief row — the other rows of a solve share one public state
 and differ only in belief, so they would all carry the same strategy.
 
-Checkpoints written before the policy head loaded with `strict=False` leave these
-three matrices at their initialisation; `has_policy` records that, and anything
-reading the policy asserts on it. Checkpoints from before the card describer do
-not load at all — the trunk's input is a different width.
+Checkpoint loading is strict: the architecture spec and encoding version must
+match exactly. Older checkpoints are rejected rather than partially initialising
+new heads or silently changing the meaning of an input.
 
 ### Auxiliary heads
 
@@ -271,12 +274,13 @@ board three rounds later, whether initiative changes hands next round, and the
 result as three classes. Backfilled from a per-round timeline the game records as
 it runs. They are dense — every row gets a different answer, unlike the single
 value number — and they are never in `flat()`, so the Rust play path never sees
-them and they cost nothing at inference. `--aux`, default 0 until gated.
+them and they cost nothing at inference. The `aux` config weight remains zero
+until gated.
 
 ### Warm start
 
 `Solver::warm_start` seeds a solve from the policy head instead of from a uniform
-strategy: start CFR as though the policy had already been played for `--warm`
+strategy: start CFR as though the policy had already been played for `warm`
 iterations. One traversal under the policy gives the instantaneous regret it
 accrues, `r(a) = v(a) − Σ_a π(a) v(a)`; scaling that by the weight is the whole
 of it, and seeding the average strategy the same way keeps the two consistent.
@@ -306,10 +310,11 @@ A4 is blocked on a policy head worth more than that.
 
 Inside a solve only the beliefs move, so three things survive it: the public
 tower `hpub`, and `z(c)` and `g(c)` for every config in the tree. The config
-tower runs once per *distinct* config per solve (`Solver::intern_config`); the
-trainer deduplicates a batch the same way. What remains per iteration is one
-`2·dg -> head` matmul per leaf, one LayerNorm, and one `rank`-long dot
-product per config.
+tower runs once per *distinct* config per solve (`Solver::intern_config`). What
+remains per iteration is one `2·dg -> head` matmul per leaf, one LayerNorm, and
+one `rank`-long dot product per config. Training computes the holding tower
+directly for every sampled config; CPU deduplication cost more than the duplicate
+GPU work saved.
 
 ### Features
 
@@ -320,7 +325,7 @@ Bag, hand and face-down appear only through their public sum and their public
 sizes.
 
 Loss is a belief-weighted Huber over every config in the support, so a config the
-belief gives 1% to is worth 1% of the gradient. Targets are clipped to ±1.
+belief gives 1% to is worth 1% of the gradient.
 
 The board's 180-degree symmetry is used as augmentation: rotating the board maps
 white's starting locations onto black's, so every position can be presented a
@@ -332,15 +337,21 @@ second way with the seats swapped (`train/mirror.py`, applied per batch).
 python train/exp.py run dcfr --seeds 2
 ```
 
-**Phase 1 — greedy warm start** (`--warm-frac`). Both players are a stochastic
+**Phase 1 — greedy warm start** (`warm_minutes`). Both players are a stochastic
 one-ply greedy bot on a public evaluation. Value targets blend that evaluation,
-squashed into (-1, 1), with the realised outcome (`--eval-mix`). The network at
+squashed into (-1, 1), with the realised outcome (`eval_mix`). The network at
 the end of this phase is snapshot 0, labelled `init`.
 
 **Phase 2 — ReBeL.** Self-play with a CFR solve at every decision. Default
-`--iters 64`, `--depth 2`.
+`iters=64`, `depth=2`.
 
-**The policy head** (`--policy`, default 0 — it trains the shared trunk, so it
+The phase boundary preserves only network weights. Greedy replay is discarded,
+Adam is recreated, and the ReBeL generator and replay sampler start from a
+seed-derived RNG independent of warm-up duration. Saved checkpoints are playing
+artifacts, not training resumes; `init_weights` starts a new optimizer and
+schedule explicitly.
+
+**The policy head** (`policy`, default 0 — it trains the shared trunk, so it
 changes the value network and has to be gated as its own change) is trained on
 the fresh epoch only, never from the replay buffer. A value target is bootstrapped and gains from
 being averaged over a long history; a strategy is not, and the epoch regenerates
@@ -349,24 +360,21 @@ rows of one solve share a public state and differ only in belief, while the
 reference strategy is a single object, so labelling all of them would teach the
 head that the belief does not matter.
 
-Training runs on the rulebook's starter matchup by default;
-`--random-draft` randomises the draft.
+Training and evaluation use random drafts by default. The ladder's
+`--fixed-draft` option is the explicit starter-matchup exception.
 
-**The replay sampler.** `--recent-mix` of a batch is drawn from the newest
-`--recent-frac` of the buffer and the rest uniformly from all of it, which at the
-defaults (0.5, 0.2) draws a fresh row six times as often as an old one while
-leaving every row reachable. Old rows carry targets written by a network that has
-since moved; the per-epoch `old=`/`new=` columns report the gap.
+**The replay sampler.** `recent_mix` of a batch is drawn from the newest
+`recent_rows` rows and the rest uniformly from the whole live buffer. Keeping the
+recent slice fixed in rows lets a capacity experiment change only the amount of
+history. Old rows carry targets written by a network that has since moved; the
+per-epoch `old=`/`new=` columns report the gap.
 
-`--mc-mix` blends the realised game outcome into the value target (TD(λ)).
-Default 0.
-
-**Evaluation** is one round robin at the end, `train/ladder.py`: every snapshot
-against every other, against Greedy and against Random, fitted with
-Bradley-Terry into an Elo each, Random pinned at 0. Matches are paired — the same
-draft and random stream for both seatings — and use a full solve and the
-reference strategy. `ladder.py` accepts snapshots from several run directories so
-runs can be rated on one scale.
+**Evaluation** is one sparse graph at the end, `train/ladder.py`: consecutive
+checkpoints form each learning curve, each run's first and final checkpoints play
+Greedy, and every candidate final plays its same-seed control final. The direct
+arm comparisons get a larger fixed budget. Bradley-Terry fits all checkpoints on
+one scale with Greedy pinned at zero. Matches pair both seats on the same draft
+and random stream.
 
 Nothing is compared, promoted or selected while a run is going.
 
@@ -404,7 +412,7 @@ Nothing is compared, promoted or selected while a run is going.
   target error against a converged reference.
 * `examples/featstats.rs` — the real range of every feature.
 * `examples/cfgvalue.rs` — how far the value separates configs.
-* `train/ladder.py` — Elo over snapshots plus Greedy and Random.
+* `train/ladder.py` — sparse checkpoint graph and Bradley-Terry Elo.
 * `train/test_parity.py` — the Rust network against PyTorch, per seam.
 
 ## 9. Layout
@@ -417,7 +425,7 @@ engine/src/net.rs       batched inference (Accelerate BLAS)
 engine/src/py.rs        pyo3: set_weights / gen_data / eval_match
 train/value_net.py      the networks, shared by everything that loads one
 train/train.py          PyTorch training loop, snapshots on a timer
-train/ladder.py         round robin over snapshots -> Elo
+train/ladder.py         sparse checkpoint graph -> Elo
 train/report.py         one self-contained HTML page per run or comparison
 train/truth.py          a frozen set of solved positions; any checkpoint's error on it
 train/config.py         every knob of a run, one object; the experiments we run

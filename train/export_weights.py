@@ -1,6 +1,7 @@
 """Dump a trained checkpoint into the flat binary the Rust tools read.
 
 Layout (little-endian):
+    u32 encoding_version,
     u32 n_dims, then n_dims * u32 dims,
     u32 n_w,    then n_w    * f32 weights,
     u32 n_b,    then n_b    * f32 biases,
@@ -17,34 +18,20 @@ import numpy as np
 import torch
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from value_net import Mlp, upgrade_state_dict  # noqa: E402
+from value_net import ENCODING_VERSION, Mlp  # noqa: E402
 
 
 def load(path):
-    """A checkpoint as an `Mlp`, in the shape it was saved with.
-
-    Checkpoints from before the policy head have no `wq`/`wk`/`wp`. Those are
-    left at their initialisation and `has_policy` goes False, which is safe for
-    anything that only searches — search asks for values and never for action
-    probabilities — and is exactly what anything reading the policy must refuse.
-
-    Checkpoints from before the card describer no longer load at all: the
-    encoding they were trained with was deleted along with the last pool that
-    needed it.
-    """
+    """A checkpoint as the exact `Mlp` architecture it was saved with."""
     # Our own checkpoints; torch 2.6+ defaults to weights_only=True.
     ck = torch.load(path, map_location="cpu", weights_only=False)
-    sd = ck["value"]
-    args = (ck["hidden"], ck.get("dg", 64), ck.get("rank", 64))
-    if "wd0.weight" not in sd and "card.0.weight" not in sd:
-        raise SystemExit(f"{path}: a pre-describer checkpoint; that encoding is gone")
-    if "spec" in ck:
-        net = Mlp(**ck["spec"])
-    else:
-        net = Mlp(*args, ck.get("de", 32), head=ck.get("head", ck["hidden"]))
-    # Fixed-layout checkpoints carry the old attribute names; rename.
-    missing, _ = net.load_state_dict(upgrade_state_dict(sd), strict=False)
-    net.has_policy = not any(k.startswith(("wq.", "wk.", "wp.")) for k in missing)
+    if ck.get("encoding_version") != ENCODING_VERSION:
+        raise SystemExit(
+            f"{path}: incompatible or unversioned encoding; train a fresh checkpoint")
+    if "spec" not in ck:
+        raise SystemExit(f"{path}: checkpoint has no architecture spec; train a fresh one")
+    net = Mlp(**ck["spec"])
+    net.load_state_dict(ck["value"])
     return net
 
 
@@ -53,6 +40,7 @@ def main():
     net = load(src)
     w, b, ln = net.flat()
     with open(dst, "wb") as f:
+        f.write(struct.pack("<I", ENCODING_VERSION))
         f.write(struct.pack("<I", len(net.dims)))
         f.write(struct.pack(f"<{len(net.dims)}I", *net.dims))
         for a in (w, b, ln):

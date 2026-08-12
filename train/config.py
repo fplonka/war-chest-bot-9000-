@@ -29,20 +29,10 @@ class Cfg:
     # ------------------------------------------------------------- schedule
     minutes: float = 60.0
     # The greedy warm phase, in minutes. Its data is discarded at the handover.
-    # Measured (`runs/warm-base-s1/NOTES.md`), holding the ReBeL phase fixed at
-    # 15 minutes and varying only this: final Elo 516/517 at five minutes,
-    # 515/446 at two, 432/-124 at one, -47/-91 at half. Below two minutes runs
-    # do not just get worse, they become unstable -- one seed of the 1-minute
-    # arm collapsed outright. Five is the only setting where both seeds agree.
-    #
-    # Do not "improve" the warm phase by making its network play better. More
-    # warm-up gives a *worse* player -- init Elo -208/-154 at five minutes
-    # against -34/+42 at half -- and the arms with the strongest starting
-    # networks produced the weakest finals.
+    # The warm experiment holds the ReBeL phase at 25 minutes and varies this.
     warm_minutes: float = 5.0
-    warm_frac: float = 0.2         # used only when warm_minutes < 0
     snapshots: int = 3             # evenly spaced over the ReBeL phase, last at the end
-    init: str = ""                 # optional checkpoint to start from
+    init_weights: str = ""         # optional weights; this is not training resume
 
     # -------------------------------------------------------------- network
     hidden: int = 384
@@ -66,13 +56,13 @@ class Cfg:
     batch: int = 1024
     lr: float = 1e-3
     lr_decay_frac: str = "0.33,0.67"   # halve the lr at these fractions of the ReBeL phase
-    train_gen_ratio: float = 4.0
+    train_gen_ratio: float = 0.5    # optimizer rows per generated replay row
     recent_mix: float = 0.5        # fraction of a batch drawn from the newest slice
-    recent_frac: float = 0.2       # how big that slice is
-    # Replay capacity, in rows. Inherited from the ReBeL paper, and at this
-    # project's data rate it holds 7.7 minutes: `runs/base4h` generated 69M rows
-    # and trained on the newest 2M of them, throwing away 97%. A row costs about
-    # 1.2 KB, so 2M is 2.4 GB of the box's 125.
+    recent_rows: int = 400_000     # fixed across replay-capacity experiments
+    # Replay capacity, in rows. At 48 configs per row, the preallocated row and
+    # config arenas cost about 1.7 KB per row, so 2M uses about 3.4 GB of the
+    # box's 125. The capacity experiment converts rows to retained minutes from
+    # the chosen production run's measured data rate.
     cap: int = 2_000_000
     cfgs_per_row: int = 48
     no_augment: bool = False
@@ -104,9 +94,12 @@ class Cfg:
     rebel_games: int = 48
 
     # ------------------------------------------------------------- hardware
-    device: str = "cuda:1"         # must carry an index; set_device rejects "cuda"
+    # GPU 1 thermally throttles under sustained solves. GPU 0 holds 76-77 C
+    # with the trainer and solve service together, and generated 9% more rows
+    # than splitting those jobs across the cards in equal four-minute pilots.
+    device: str = "cuda:0"         # must carry an index; set_device rejects "cuda"
     gpu: bool = True
-    gpu_devices: str = "0,1"
+    gpu_devices: str = "0"          # GPU 1 thermally throttles under sustained solves
     gpu_workers: int = 36
     gpu_actors: int = 128
     gpu_inflight: int = 32
@@ -119,6 +112,9 @@ class Cfg:
     out: str = "runs/latest"
     seed: int = 1
     dump_buffer: str = ""          # every gate run should set this; see truth.py
+    experiment: str = ""           # exp.py metadata; never inferred from a run name
+    arm: str = ""
+    is_control: bool = False
     # Kill a run whose generation has collapsed or whose value function has gone
     # flat, rather than spending the hour finding out. See train.py::check_alive.
     abort_below_sps: float = 50.0
@@ -135,51 +131,25 @@ BASELINE = Cfg()
 # comparing an arm against a *previous* run's baseline compares two runs that
 # differ in the code as well as the config.
 EXPERIMENTS = {
+    "baseline": [{}],
     "dcfr":     [{}, {"cfr": "dcfr"}],
     "aux":      [{}, {"aux": 0.3}],
     "policy":   [{}, {"policy": 0.3}],
-    # Solve quality per unit time, not per solve. `runs/solvererr_g8` puts dcfr
-    # at T=32 slightly ahead of linear at T=64, and dcfr at T=16 still 50x
-    # inside the network's own error -- for 2-3x the solves per second.
-    "iters":    [{"minutes": 30}, {"minutes": 30, "cfr": "dcfr", "iters": 32},
+    # Solver quality per equal wall-clock budget.
+    "iters":    [{"minutes": 30, "cfr": "linear", "iters": 64},
+                 {"minutes": 30, "cfr": "dcfr", "iters": 32},
                  {"minutes": 30, "cfr": "dcfr", "iters": 16}],
-    # How much history the network trains on. `runs/base4h` plateaued after ~100
-    # minutes while its buffer held only the newest 7.7, so the question is
-    # whether the plateau is the window rather than the network. Bigger is also
-    # staler, which is the cost and is what `diagnose.py` measures.
-    #
-    # A cap only means something against how many rows the run generates, so
-    # size the arms from the log before changing them: a cap above the total
-    # never evicts, and two such arms are one arm.
-    #
-    # `recent_frac` moves with the cap to keep every arm's recent slice the
-    # same size in rows. It is a fraction of the *live* buffer, so holding it
-    # fixed would make the cap change two things at once: how much history the
-    # batch draws from, and how old "recent" is.
-    "cap":      [{"minutes": 40},
-                 {"minutes": 40, "cap": 8_000_000, "recent_frac": 0.05},
-                 {"minutes": 40, "cap": 24_000_000, "recent_frac": 0.0167}],
-    # Every arm gets the same 15 minutes of ReBeL. Only the greedy warm-up
-    # before it moves, so the totals differ: 20, 17, 16, 15.5. This asks the
-    # question directly -- with the ReBeL phase held fixed, does a longer
-    # warm-up produce a stronger network at all? If 1 minute matches 5, the
-    # extra 4 minutes are free to cut. If 5 wins, the win is what it costs.
-    #
-    # Holding the *total* fixed instead conflates two effects: a longer warm-up
-    # both changes the starting network and takes time away from ReBeL. That
-    # design cannot say which one moved the result.
-    #
-    # The logs already narrow the range. In `runs/base4h` and `runs/gpu_golden8`
-    # the warm loss falls 0.078 -> 0.018 in the first 30 seconds and is flat
-    # until minute 3.5; from 3.5 to 5.0 it keeps falling while `probe_std`
-    # collapses 0.46 -> 0.375, so the last 1.5 minutes fit the handcrafted
-    # evaluation better and make the network less expressive. But zero fails: a
-    # CPU run with no warm-up put every game into the horizon and drove the
-    # spread to 0.036, near the abort threshold.
-    "warm":     [{"minutes": 20, "warm_minutes": 5},
-                 {"minutes": 17, "warm_minutes": 2},
-                 {"minutes": 16, "warm_minutes": 1},
-                 {"minutes": 15.5, "warm_minutes": 0.5}],
+    # Replay history; resize these from the chosen production data rate.
+    "cap":      [{"minutes": 40}, {"minutes": 40, "cap": 8_000_000},
+                 {"minutes": 40, "cap": 24_000_000}],
+    # Each arm gets exactly 25 minutes of ReBeL after its warm-up.
+    "warm":     [{"minutes": 30, "warm_minutes": 5},
+                 {"minutes": 27, "warm_minutes": 2},
+                 {"minutes": 26, "warm_minutes": 1},
+                 {"minutes": 25.5, "warm_minutes": 0.5}],
+    "ratio":    [{"minutes": 30, "train_gen_ratio": 0.5},
+                 {"minutes": 30, "train_gen_ratio": 1.0},
+                 {"minutes": 30, "train_gen_ratio": 2.0}],
     # Does a short run rank changes the way a long one does? If it does, every
     # experiment above costs a quarter of what it costs today. Run this first.
     "cadence":  [{"minutes": 15}, {"minutes": 15, "cfr": "dcfr"},
@@ -220,7 +190,8 @@ def label(d):
 
 def delta(cfg):
     """What a config changes from BASELINE, ignoring per-run bookkeeping."""
-    skip = {"out", "seed", "git", "matmul_precision", "dump_buffer"}
+    skip = {"out", "seed", "git", "matmul_precision", "dump_buffer",
+            "experiment", "arm", "is_control"}
     base = dataclasses.asdict(BASELINE)
     d = cfg if isinstance(cfg, dict) else dataclasses.asdict(cfg)
     return {k: v for k, v in d.items()
@@ -256,4 +227,7 @@ def load(path):
         d = json.load(f)
     d = d.get("cfg", d)
     known = {f.name for f in dataclasses.fields(Cfg)}
-    return Cfg(**{k: v for k, v in d.items() if k in known})
+    unknown = set(d) - known
+    if unknown:
+        raise SystemExit(f"{path}: unknown config fields {sorted(unknown)}")
+    return Cfg(**d)

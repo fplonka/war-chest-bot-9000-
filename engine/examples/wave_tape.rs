@@ -43,7 +43,7 @@ fn main() {
         warm: 0.0,
         node_cap: 200_000,
         gpu_build: true,
-    keep_states: false,
+        keep_states: false,
     };
 
     let build0 = Instant::now();

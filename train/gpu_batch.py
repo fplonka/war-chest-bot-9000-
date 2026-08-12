@@ -120,16 +120,18 @@ def _expand_rows(
 
 @triton.jit
 def _expand_configs(cc, cp, out, n, CCOUNTS: tl.constexpr,
-                    CFEAT: tl.constexpr, CNORM: tl.constexpr,
+                    CPRIVATE: tl.constexpr, CFEAT: tl.constexpr, CNORM: tl.constexpr,
                     BLOCK: tl.constexpr):
     q = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     valid = q < n * CFEAT
     r = q // CFEAT
     c = q - r * CFEAT
-    ci = tl.minimum(c, CCOUNTS - 1)
-    count = tl.load(cc + r * CCOUNTS + ci, mask=valid & (c < CCOUNTS), other=0).to(tl.float32)
-    player = tl.load(cp + r, mask=valid & (c == CCOUNTS), other=0).to(tl.float32)
-    value = tl.where(c < CCOUNTS, count / CNORM, player)
+    ci = tl.minimum(c, CPRIVATE - 1)
+    private = tl.load(cc + r * CPRIVATE + ci,
+                      mask=valid & (c < CPRIVATE), other=0).to(tl.float32)
+    player = tl.load(cp + r, mask=valid & (c == CPRIVATE), other=0).to(tl.float32)
+    value = tl.where(c < CCOUNTS, private / CNORM,
+                     tl.where(c < CPRIVATE, private, player))
     tl.store(out + q, value, mask=valid)
 
 
@@ -149,7 +151,7 @@ def make_batch(parts, rng, device, augment):
 
     rows, cc, cp, cw, cy, seg = parts
     n = len(rows)
-    hand, fd, bag = public_sizes(cc, cp, seg, n)
+    hand, fd, bag = public_sizes(cc, seg, n)
     if augment:
         which = rng.random(n) < 0.5
         rows[which] = mirror.mirror_rows(rows[which])
@@ -192,6 +194,7 @@ def make_batch(parts, rng, device, augment):
     phi = torch.empty((nc, warchest.CFEAT), dtype=torch.float32, device=device)
     _expand_configs[(triton.cdiv(nc * warchest.CFEAT, 256),)](
         cc_t, cp_t, phi, n=nc, CCOUNTS=warchest.CCOUNTS,
+        CPRIVATE=warchest.CPRIVATE,
         CFEAT=warchest.CFEAT, CNORM=float(warchest.CNORM),
         BLOCK=256, num_warps=4)
 
@@ -209,7 +212,7 @@ def warmup(device):
     rows[:, warchest.ROW_HEX_OWNER:warchest.ROW_HEX_OWNER + warchest.N_HEXES] = 255
     rows[:, warchest.ROW_HEX_SLOT:warchest.ROW_HEX_SLOT + warchest.N_HEXES] = 255
     rows[:, warchest.ROW_HEX_MARKER:warchest.ROW_HEX_MARKER + warchest.N_HEXES] = 255
-    cc = np.zeros((2, warchest.CCOUNTS), np.uint8)
+    cc = np.zeros((2, warchest.CPRIVATE), np.uint8)
     parts = (rows, cc, np.asarray([0, 1], np.uint8),
              np.asarray([1.0, 1.0], np.float32), np.zeros(2, np.float32),
              np.asarray([0, 1], np.int64))

@@ -335,9 +335,11 @@ extern "C" __global__ void holding_in(const WaveDev* w, const WeightDev* wt) {
     // Must match net.rs::holdings and value_net.py::holdings -- this is the
     // third copy of that encoding and the one production actually solves with.
     out[0] = p[k]; out[1] = p[NSLOT + k]; out[2] = p[2 * NSLOT + k];
-    out[3] = seat - 0.5f;
+    out[3] = p[CCOUNTS + k];
+    out[4] = p[CCOUNTS + NSLOT + k];
+    out[5] = seat - 0.5f;
     const float* e = AP(w, A_E) + ((unsigned long long)job * NTYPE + (int)seat * NSLOT + k) * DE;
-    for (int j = 0; j < DE; j++) out[4 + j] = e[j];
+    for (int j = 0; j < DE; j++) out[6 + j] = e[j];
 }
 
 extern "C" __global__ void slot_sum(const WaveDev* w, const WeightDev* wt,
@@ -720,6 +722,25 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
     const float* ur = AP(w, A_U) + (unsigned long long)q.row * RK;
     for (int j = lane; j < RK; j += 32) us[j] = ur[j] + wt->wu_b[j];
     __syncwarp();
+    float centre = 0.0f;
+    for (int side = 0; side < 2; side++) {
+        int ns = nc_of(w, q.node, side);
+        const float* rs = AP(w, A_REACH) + reach_at(w, q.node, side, 0);
+        unsigned int cs = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + side];
+        float weighted = 0.0f, mass = 0.0f;
+        for (int c = lane; c < ns; c += 32) {
+            unsigned int cfg = TP(w, unsigned int, T_ROW_CFG)[cs + c];
+            const float* g = AP(w, A_G) + (unsigned long long)cfg * (RK + 1);
+            float raw = g[RK];
+            #pragma unroll 8
+            for (int j = 0; j < RK; j++) raw += us[j] * g[j];
+            weighted += rs[c] * raw;
+            mass += rs[c];
+        }
+        weighted = warp_sum(weighted);
+        mass = warp_sum(mass);
+        if (mass > 0.0f) centre += 0.5f * weighted / mass;
+    }
     unsigned int c0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + player];
     for (int base = 0; base < n; base += 32) {
         int c = base + lane;
@@ -729,7 +750,7 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
         float part = 0.0f;
         #pragma unroll 8
         for (int j = 0; j < RK; j++) part += us[j] * g[j];
-        out[c] = (part + g[RK]) * orc;
+        out[c] = (part + g[RK] - centre) * orc;
     }
 #else
     const float* ur = AP(w, A_U) + (unsigned long long)q.row * RK;
@@ -738,6 +759,27 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
     for (int k = 0; k < RK_CH; k++) {
         int j = (k << 5) + lane;
         u[k] = j < RK ? ur[j] + wt->wu_b[j] : 0.0f;
+    }
+    float centre = 0.0f;
+    for (int side = 0; side < 2; side++) {
+        int ns = nc_of(w, q.node, side);
+        const float* rs = AP(w, A_REACH) + reach_at(w, q.node, side, 0);
+        unsigned int cs = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + side];
+        float weighted = 0.0f, mass = 0.0f;
+        for (int c = 0; c < ns; c++) {
+            unsigned int cfg = TP(w, unsigned int, T_ROW_CFG)[cs + c];
+            const float* g = AP(w, A_G) + (unsigned long long)cfg * (RK + 1);
+            float part = 0.0f;
+            #pragma unroll
+            for (int k = 0; k < RK_CH; k++) {
+                int j = (k << 5) + lane;
+                if (j < RK) part += u[k] * g[j];
+            }
+            float raw = warp_sum(part) + g[RK];
+            weighted += rs[c] * raw;
+            mass += rs[c];
+        }
+        if (mass > 0.0f) centre += 0.5f * weighted / mass;
     }
     unsigned int c0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + player];
     for (int c = 0; c < n; c++) {
@@ -750,7 +792,7 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
             if (j < RK) part += u[k] * g[j];
         }
         part = warp_sum(part);
-        if (lane == 0) out[c] = (part + g[RK]) * orc;
+        if (lane == 0) out[c] = (part + g[RK] - centre) * orc;
     }
 #endif
 }

@@ -4,7 +4,7 @@
 use warchest::board::{board, NONE, N_HEXES};
 use warchest::rng::Rng;
 use warchest::selfplay::make_game;
-use warchest::state::{State, BLACK, WHITE};
+use warchest::state::{Cont, State, BLACK, WHITE};
 use warchest::units::{def, N_UNITS, ROYAL_COIN};
 
 const POOL: [u16; 19] = [
@@ -88,6 +88,14 @@ fn check_invariants(s: &State, init: &[[u16; N_UNITS]; 2]) {
             "hand held {} coins: a WP draw pushed it past the cap",
             s.hand_size(p)
         );
+        let queued = usize::from(matches!(s.pending(), Cont::WarriorPriestPlay {
+            player, ..
+        } if *player == p))
+            + s.conts
+                .iter()
+                .filter(|c| matches!(c, Cont::WarriorPriestPlay { player, .. } if *player == p))
+                .count();
+        assert!(queued <= 2, "player {p} has {queued} forced plays queued");
     }
     // 4. winner consistency.
     if let Some(w) = s.winner() {

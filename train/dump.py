@@ -11,7 +11,7 @@ A dump holds, oldest row first:
 
     rows  [rows, ROW_BYTES] the packed frozen row format (see `rebel::ROW_*`);
                            the network input is expanded from these
-    cc    [configs, CCOUNTS] hand, face-down and bag counts, per config
+    cc    [configs, CPRIVATE] counts and future forced-play flags, per config
     cp    [configs]         which player the config belongs to
     cw    [configs]         its belief probability
     cy    [configs]         the value the solve gave it
@@ -23,8 +23,8 @@ A dump holds, oldest row first:
 Rows are stored oldest-first so a split by recency is possible. That is the only
 honest split: rows from one epoch come from the same handful of games and are
 heavily correlated, so a random split leaks its answers into the training set.
-`version` and `rules_hash` pin the row format and the rules tables; a dump from
-a different rules build is refused.
+`version` pins the row, feature, and target semantics; `rules_hash` pins the
+rules tables. An incompatible dump is refused.
 """
 
 import numpy as np
@@ -39,6 +39,7 @@ class Dump:
         self.cw, self.cy, self.seg = d["cw"], d["cy"], d["seg"]
         self.soff = np.asarray(d.get("soff", [0, len(self.x)]), np.int64)
         self.pubfeat = int(d["pubfeat"])
+        self.cprivate = int(d.get("cprivate", 0))
         self.ccounts = int(d["ccounts"])
         self.cnorm = float(d["cnorm"])
         self.row_bytes = int(d.get("row_bytes", 0))
@@ -47,6 +48,7 @@ class Dump:
         # `seg` is emitted in row order, so a row range is a contiguous config
         # range and slicing is two binary searches rather than a scan.
         self.row_start = np.searchsorted(self.seg, 2 * np.arange(len(self.x) + 1))
+        self.check(warchest.PUBFEAT, warchest.CPRIVATE, warchest.CCOUNTS)
 
     def __len__(self):
         return len(self.x)
@@ -58,11 +60,12 @@ class Dump:
                 self.cw[a:b].astype(np.float32), self.cy[a:b].astype(np.float32),
                 self.seg[a:b] - 2 * lo)
 
-    def check(self, pubfeat, ccounts):
-        if self.pubfeat != pubfeat or self.ccounts != ccounts:
+    def check(self, pubfeat, cprivate, ccounts):
+        if (self.pubfeat, self.cprivate, self.ccounts) != (pubfeat, cprivate, ccounts):
             raise SystemExit(
-                f"dump has PUBFEAT={self.pubfeat} CCOUNTS={self.ccounts}, module has "
-                f"{pubfeat}/{ccounts} -- rebuild or redump"
+                f"dump has PUBFEAT/CPRIVATE/CCOUNTS="
+                f"{self.pubfeat}/{self.cprivate}/{self.ccounts}, module has "
+                f"{pubfeat}/{cprivate}/{ccounts} -- rebuild or redump"
             )
         if self.row_bytes != warchest.ROW_BYTES:
             raise SystemExit(

@@ -495,8 +495,8 @@ use std::sync::{OnceLock, RwLock};
 /// Independent weight slots, so a match can pit one checkpoint against another.
 /// Slot 0 is the live network the trainer generates with; the rest hold
 /// whatever checkpoints a caller wants to play off against each other, and the
-/// pool grows to fit. The Elo ladder loads one snapshot per slot and plays a
-/// round robin, which is the only reason more than one slot exists.
+/// pool grows to fit. The Elo ladder loads one snapshot per slot for its sparse
+/// checkpoint graph, which is the only reason more than one slot exists.
 /// The in-process GPU solve service (work package B). `gpu_start` spawns
 /// it; `gpu_gen_data` runs generation through it; `gpu_set_weights` forwards
 /// the trainer's publications to it. Without the `gpu` feature every call
@@ -547,7 +547,14 @@ impl GpuGenerator {
                 }
                 Err(pyo3::exceptions::PyStopIteration::new_err(()))
             }
-            Ok(Err(e)) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+            Ok(Err(e)) => {
+                self.done.store(true, std::sync::atomic::Ordering::Release);
+                self.stop.store(true, std::sync::atomic::Ordering::Release);
+                if let Some(thread) = self.thread.lock().unwrap().take() {
+                    let _ = thread.join();
+                }
+                Err(pyo3::exceptions::PyRuntimeError::new_err(e))
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
         }
     }
@@ -872,11 +879,32 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     out.set_item("configs", d.configs)?;
     out.set_item("gpu_wait_s", d.gpu_wait_s)?;
     out.set_item("merge_wait_s", d.merge_wait_s)?;
+    out.set_item(
+        "zero_sum_mean_abs",
+        d.zero_sum_abs / d.zero_sum_n.max(1) as f64,
+    )?;
+    out.set_item("zero_sum_max", d.zero_sum_max)?;
+    assert_eq!(d.zero_sum_n, d.nv, "missing zero-sum target checks");
     assert_eq!(
         d.coff.len(),
         if d.nv == 0 { 0 } else { 2 * d.nv + 1 },
         "config offsets do not match the row count"
     );
+    assert_eq!(
+        d.paoff.len(),
+        d.prow.len() + usize::from(!d.prow.is_empty())
+    );
+    assert_eq!(
+        d.ppoff.len(),
+        d.prow.len() + usize::from(!d.prow.is_empty())
+    );
+    if let Some(&end) = d.ppoff.last() {
+        assert_eq!(
+            end as usize,
+            d.pp.len(),
+            "policy offsets do not cover targets"
+        );
+    }
     // Internal `soff` holds one start per solve; the exposed array appends
     // the total row count as the trailing entry, so `len - 1` is the number
     // of solves.
@@ -897,6 +925,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     out.set_item("pa", d.pa.into_pyarray_bound(py))?;
     out.set_item("paoff", d.paoff.into_pyarray_bound(py))?;
     out.set_item("pp", d.pp.into_pyarray_bound(py))?;
+    out.set_item("ppoff", d.ppoff.into_pyarray_bound(py))?;
     out.set_item("cc", d.cc.into_pyarray_bound(py))?;
     out.set_item("cw", d.cw.into_pyarray_bound(py))?;
     out.set_item("cy", d.cy.into_pyarray_bound(py))?;
@@ -1048,15 +1077,12 @@ fn set_cap_value(v: f32) {
     crate::state::set_cap_marker_value(v);
 }
 
-/// Run the Rust value network forward: `xpub` is `rows * PUBFEAT`, `xbel` is
-/// `rows * 2*dg` and `phi` is `rows * CFEAT` — one config scored per row.
-/// Returns `rows` values. Exists so the Python side can assert that the
-/// inference path used to generate targets is numerically the same network that
-/// PyTorch trains -- a silent divergence there would corrupt every target while
-/// every other test kept passing.
+/// Unprojected Rust value scores for the Torch/Rust parity diagnostic.
+/// Production search projects both players' belief-weighted means together;
+/// one isolated config cannot perform that operation.
 #[pyfunction]
 #[pyo3(signature = (xpub, xbel, phi, unit_ids, rows, slot=0))]
-fn infer(
+fn infer_raw(
     xpub: PyReadonlyArray1<f32>,
     xbel: PyReadonlyArray1<f32>,
     phi: PyReadonlyArray1<f32>,
@@ -1067,7 +1093,7 @@ fn infer(
     check_slot(slot)?;
     let guard = nets().read().unwrap();
     let mlp = &guard[slot].value;
-    Ok(mlp.forward(
+    Ok(mlp.raw_scores(
         xpub.as_slice()?,
         xbel.as_slice()?,
         phi.as_slice()?,
@@ -1183,18 +1209,81 @@ fn hex_neighborhood() -> Vec<u32> {
 /// augmentation: every position can be presented a second way, for free.
 #[pyfunction]
 fn hex_mirror() -> Vec<u32> {
-    let bd = crate::board::board();
-    let n = crate::board::N_HEXES;
-    (0..n)
-        .map(|h| {
-            let (x, y) = bd.coord[h];
-            let t = (6 - x, 6 - y);
-            let m = (0..n)
-                .find(|&k| bd.coord[k] == t)
-                .expect("rotation stays on the board");
-            m as u32
-        })
-        .collect()
+    board().mirror.iter().map(|&h| h as u32).collect()
+}
+
+/// Real packed states and private configs, plus the same values produced after
+/// `State::mirror`. Python's augmentation is checked against this independent
+/// game-level oracle rather than another restatement of encoder indices.
+#[pyfunction]
+fn mirror_rows_oracle(n: usize, seed: u64) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    use crate::rebel::{config_private, pack_row, reserve, true_config, Ctx, CPRIVATE, ROW_BYTES};
+    use crate::rng::Rng;
+    use crate::selfplay::make_game;
+    let mut rng = Rng::new(seed);
+    let mut state = make_game(&mut rng, true);
+    let mut original = Vec::with_capacity(n * ROW_BYTES);
+    let mut mirrored = Vec::with_capacity(n * ROW_BYTES);
+    let mut private = Vec::with_capacity(n * 2 * CPRIVATE);
+    let mut mirrored_private = Vec::with_capacity(n * 2 * CPRIVATE);
+    while original.len() < n * ROW_BYTES {
+        if state.is_terminal() {
+            state = make_game(&mut rng, true);
+            continue;
+        }
+        if matches!(state.pending(), crate::state::Cont::MainPlay) {
+            let mut sample = state;
+            if original.is_empty() {
+                // Pin both categorical continuation channels in the oracle;
+                // waiting for a naturally nested Warrior Priest play would
+                // make this correctness gate probabilistic.
+                let p = sample.to_act();
+                let mut coins = Vec::new();
+                for (unit, &count) in sample.zones[p as usize][crate::state::Z_HAND]
+                    .iter()
+                    .enumerate()
+                {
+                    for _ in 0..count {
+                        coins.push(unit as u8);
+                    }
+                }
+                for &coin in coins.iter().take(2) {
+                    sample
+                        .conts
+                        .push(crate::state::Cont::WarriorPriestPlay { player: p, coin });
+                }
+                assert!(
+                    !coins.is_empty(),
+                    "a MainPlay oracle state must hold a coin"
+                );
+            }
+            let ctx = Ctx::new(&sample);
+            let mut row = [0u8; ROW_BYTES];
+            pack_row(&sample, &ctx, &mut row);
+            original.extend_from_slice(&row);
+            let ms = sample.mirror();
+            let mctx = Ctx::new(&ms);
+            pack_row(&ms, &mctx, &mut row);
+            mirrored.extend_from_slice(&row);
+            for p in 0..2u8 {
+                let mut c = [0; CPRIVATE];
+                config_private(
+                    &true_config(&sample, p, &ctx),
+                    &reserve(&sample, p, &ctx),
+                    &mut c,
+                );
+                private.extend_from_slice(&c);
+            }
+            for p in 0..2u8 {
+                let mut c = [0; CPRIVATE];
+                config_private(&true_config(&ms, p, &mctx), &reserve(&ms, p, &mctx), &mut c);
+                mirrored_private.extend_from_slice(&c);
+            }
+        }
+        let actions = state.legal_actions();
+        state = state.apply(actions[rng.below(actions.len())]);
+    }
+    (original, mirrored, private, mirrored_private)
 }
 
 /// Expand packed replay rows into the public encoding, in one batch.
@@ -1258,6 +1347,7 @@ fn expand_rows(
 #[pymodule]
 fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hex_mirror, m)?)?;
+    m.add_function(wrap_pyfunction!(mirror_rows_oracle, m)?)?;
     m.add_function(wrap_pyfunction!(hex_coords, m)?)?;
     m.add_function(wrap_pyfunction!(units_info, m)?)?;
     m.add_function(wrap_pyfunction!(card_features_table, m)?)?;
@@ -1265,10 +1355,12 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Game>()?;
     m.add_class::<crate::live::LiveGame>()?;
     m.add("MAX_MAIN_PLAYS", crate::state::MAX_MAIN_PLAYS)?;
+    m.add("ENCODING_VERSION", crate::rebel::ENCODING_VERSION)?;
     m.add("PUBFEAT", crate::rebel::PUBFEAT)?;
     m.add("CFEAT", crate::rebel::CFEAT)?;
     m.add("AFEAT", crate::rebel::AFEAT)?;
     m.add("CCOUNTS", crate::rebel::CCOUNTS)?;
+    m.add("CPRIVATE", crate::rebel::CPRIVATE)?;
     m.add("AUX", crate::selfplay::AUX)?;
     m.add("CNORM", crate::rebel::CNORM)?;
     m.add("N_HEXES", crate::board::N_HEXES)?;
@@ -1285,8 +1377,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("PILE_COUNTS", crate::rebel::PILE_COUNTS)?;
     m.add("PLAYER_SCALARS", crate::rebel::PLAYER_SCALARS)?;
     m.add("GLOBAL_SCALARS", crate::rebel::GLOBAL_SCALARS)?;
-    m.add("PEND_KINDS", crate::rebel::PEND_KINDS)?;
-    m.add("PEND_SLOT", crate::rebel::PEND_SLOT)?;
     m.add("LOOSE", crate::rebel::LOOSE)?;
     m.add("OFF_PILES", crate::rebel::OFF_PILES)?;
     m.add("OFF_CARDS", crate::rebel::OFF_CARDS)?;
@@ -1309,8 +1399,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ROW_AUX", crate::rebel::ROW_AUX)?;
     m.add("ROW_FORMAT_VERSION", crate::rebel::ROW_FORMAT_VERSION)?;
     m.add_function(wrap_pyfunction!(rules_table_hash, m)?)?;
-    m.add("CCOUNTS", crate::rebel::CCOUNTS)?;
-    m.add("AUX", crate::selfplay::AUX)?;
     m.add_function(wrap_pyfunction!(infer_policy, m)?)?;
     m.add_function(wrap_pyfunction!(hex_neighborhood, m)?)?;
     m.add_function(wrap_pyfunction!(set_weights, m)?)?;
@@ -1327,6 +1415,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(gpu_stream_start, m)?)?;
     }
     m.add_function(wrap_pyfunction!(eval_match, m)?)?;
-    m.add_function(wrap_pyfunction!(infer, m)?)?;
+    m.add_function(wrap_pyfunction!(infer_raw, m)?)?;
     Ok(())
 }

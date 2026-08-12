@@ -2,7 +2,7 @@
 
 Two phases inside one wall-clock budget:
 
-1. **Warm start** (`--warm-frac` of the budget). Both players are a stochastic
+1. **Warm start** (`warm_minutes`). Both players are a stochastic
    one-ply greedy bot on a public-information evaluation; value targets blend
    that evaluation (squashed into (-1, 1)) with the realised game outcome.
    ReBeL never plays a policy directly — every move comes out of CFR using the
@@ -51,11 +51,12 @@ import warchest
 import config
 import mirror
 from export_weights import load as load_checkpoint
-from value_net import Mlp, AUX, AFEAT
+from value_net import ENCODING_VERSION, Mlp, AUX, AFEAT
 
 PUBFEAT = warchest.PUBFEAT
 CFEAT = warchest.CFEAT
 CCOUNTS = warchest.CCOUNTS
+CPRIVATE = warchest.CPRIVATE
 CNORM = warchest.CNORM
 NTYPE = warchest.NTYPE
 ROW_BYTES = warchest.ROW_BYTES
@@ -63,16 +64,21 @@ ROW_IDS = warchest.ROW_IDS
 ROW_AUX = warchest.ROW_AUX
 
 
-def public_sizes(cc, cp, seg, n):
+def _config_sizes(cs, n):
+    """Hand/face-down/bag sizes from one config per row and player."""
+    cs = np.asarray(cs).reshape(2 * n, -1)
+    return (cs[:, :5].sum(1).astype(np.uint8).reshape(n, 2),
+            cs[:, 5:10].sum(1).astype(np.uint8).reshape(n, 2),
+            cs[:, 10:CCOUNTS].sum(1).astype(np.uint8).reshape(n, 2))
+
+
+def public_sizes(cc, seg, n):
     """Per-row per-player hand/face-down/bag sizes, from the row's config
     support. `seg` must be non-decreasing with values `2 * row + seat`; all
     configs in a support share the sizes, so the first config of each span
     decides."""
     starts = np.searchsorted(seg, np.arange(2 * n, dtype=np.int64), side="left")
-    cs = cc[starts]
-    return (cs[:, :5].sum(1).astype(np.uint8).reshape(n, 2),
-            cs[:, 5:10].sum(1).astype(np.uint8).reshape(n, 2),
-            cs[:, 10:].sum(1).astype(np.uint8).reshape(n, 2))
+    return _config_sizes(cc[starts], n)
 
 
 def expand_batch(rows, hand, fd, bag):
@@ -97,9 +103,9 @@ class Buffer:
     reference implementation runs a 2M buffer. A row is the frozen compact
     format (`ROW_BYTES` raw bytes: hex facts, piles, unit ids, scalars, aux) --
     ~223 bytes instead of the ~1.9 KB the old float encoding cost -- and the
-    network input is expanded from it when a batch is made. Counts are stored
-    as the `uint8` they are and everything else as float16, which is what makes
-    the cap affordable: a row costs `ROW_BYTES` bytes plus 20 per config.
+    network input is expanded from it when a batch is made. Counts and forced
+    slots are stored as `uint8` and probabilities/targets as float16: a row
+    costs `ROW_BYTES` bytes plus 30 per config.
 
     Preallocated and written with wraparound rather than grown by
     concatenation. The concatenate form rebuilt the whole buffer every epoch:
@@ -118,7 +124,7 @@ class Buffer:
         self.soff = np.zeros(0, np.int64)
         self.cstart = np.zeros(cap, np.int64)   # absolute arena offset
         self.clen = np.zeros((cap, 2), np.int32)
-        self.cc = np.zeros((ccap, CCOUNTS), np.uint8)
+        self.cc = np.zeros((ccap, CPRIVATE), np.uint8)
         self.cp = np.zeros(ccap, np.uint8)
         self.cw = np.zeros(ccap, np.float16)
         self.cy = np.zeros(ccap, np.float16)
@@ -174,6 +180,7 @@ class Buffer:
     def clear(self):
         self.lo = self.rows
         self.stamps.clear()
+        self.soff = np.zeros(0, np.int64)
 
     def __len__(self):
         return self.rows - self.lo
@@ -196,7 +203,7 @@ class Buffer:
         return (self.x[s], self.cc[at], self.cp[at], self.cw[at].astype(np.float32),
                 self.cy[at].astype(np.float32), seg)
 
-    def sample(self, batch, rng, recent_mix=0.0, recent_frac=0.2):
+    def sample(self, batch, rng, recent_mix=0.0, recent_rows=400_000):
         """A batch, part of it drawn from the newest rows only.
 
         Uniform sampling over a 2M-row buffer is not neutral here: the targets
@@ -208,11 +215,9 @@ class Buffer:
         away to refit a small window.
 
         So: a mixture. `recent_mix` of the batch comes from the newest
-        `recent_frac` of the buffer and the rest from all of it, which draws a
-        row in the fresh slice `1 + mix / ((1 - mix) * frac)` times as often as
-        an old one -- 6x at the defaults, or 3x the average rate -- while
-        leaving every row reachable. Two uniform draws, and no weight vector to
-        rebuild each epoch.
+        `recent_rows` rows of the buffer and the rest from all of it. The slice
+        is an absolute row count so changing replay capacity changes history,
+        not the meaning of recent.
 
         TurboReBeL's per-solve rows are thinned to the ~8 log-spaced iterates
         plus the live belief before they reach the buffer, so rows inside one
@@ -221,15 +226,17 @@ class Buffer:
         ids = rng.integers(self.lo, self.rows, size=batch)
         k = int(batch * recent_mix)
         if k > 0:
-            span = max(1, int((self.rows - self.lo) * recent_frac))
+            span = min(max(1, recent_rows), self.rows - self.lo)
             ids[:k] = rng.integers(self.rows - span, self.rows, size=k)
         return self.gather(ids)
 
-    def sample_old(self, batch, rng, recent_frac=0.2):
+    def sample_old(self, batch, rng, recent_rows=400_000):
         """A batch from outside the recent slice — the stale majority — for
         the age-bucket loss. A diagnostic, not training."""
-        span = max(1, int((self.rows - self.lo) * recent_frac))
-        hi = max(self.lo + 1, self.rows - span)
+        if self.rows - self.lo <= recent_rows:
+            raise ValueError("the replay buffer has no rows older than the recent slice")
+        span = min(max(1, recent_rows), self.rows - self.lo)
+        hi = self.rows - span
         return self.gather(rng.integers(self.lo, hi, size=batch))
 
     def ordered(self):
@@ -261,7 +268,7 @@ def make_batch(parts, rng, device, augment):
     n = len(rows)
     # Public sizes name seats, so they are read off the config support before
     # the mirror (the seat flip below would scramble `seg`'s order).
-    hand, fd, bag = public_sizes(cc, cp, seg, n)
+    hand, fd, bag = public_sizes(cc, seg, n)
     if augment:
         which = rng.random(n) < 0.5
         rows[which] = mirror.mirror_rows(rows[which])
@@ -277,7 +284,7 @@ def make_batch(parts, rng, device, augment):
     # Every config gets its own holding-tower row, duplicates included.
     #
     # This used to deduplicate: the key was the row's unit ids (post-mirror),
-    # the seat and the 15 counts, and `inv` mapped each config back to its
+    # the seat and private config bytes, and `inv` mapped each config back to its
     # representative. It removed about 32% of config rows and cost more than it
     # saved. `np.unique` over that key was ~105 ms of the ~173 ms step, on the
     # same cores the generation workers want; computing the tower for every row
@@ -285,7 +292,8 @@ def make_batch(parts, rng, device, augment):
     # running. The result is unchanged, not approximated: with `inv` the
     # identity, `crow` in `Mlp.forward` collapses to `seg // 2` and the two
     # gathers become no-ops, so the tower sees exactly the inputs it saw before.
-    phi = np.concatenate([cc.astype(np.float32) / CNORM,
+    phi = np.concatenate([cc[:, :CCOUNTS].astype(np.float32) / CNORM,
+                          cc[:, CCOUNTS:].astype(np.float32),
                           cp[:, None].astype(np.float32)], 1)
     inv = np.arange(len(cc), dtype=np.int64)
     t = lambda a, d=torch.float32: torch.as_tensor(a, dtype=d, device=device)
@@ -316,9 +324,10 @@ def policy_loss(net, d, ids, device):
     zero, so legality needs no separate mask in the loss; the solver masks by
     real legality when it reads the head.
     """
-    prow, pact, paoff, coff = d["prow"][ids], d["pact"][ids], d["paoff"], d["coff"]
+    prow, pact = d["prow"][ids], d["pact"][ids]
+    paoff, ppoff, coff = d["paoff"], d["ppoff"], d["coff"]
     pa, pp = d["pa"].reshape(-1, AFEAT), d["pp"]
-    cc, cw = d["cc"].reshape(-1, CCOUNTS), d["cw"]
+    cc, cw = d["cc"].reshape(-1, CPRIVATE), d["cw"]
     na = (paoff[ids + 1] - paoff[ids]).astype(np.int64)
     S, NA = len(ids), int(na.max())
 
@@ -334,33 +343,32 @@ def policy_loss(net, d, ids, device):
     apad = np.zeros((S, NA, AFEAT), np.float32)
     amask = np.zeros((S, NA), bool)
     tgt = np.zeros((int(nc.sum()), NA), np.float32)
-    at, ct = 0, 0
+    ct = 0
     for j, i in enumerate(ids):
         apad[j, :na[j]] = pa[paoff[i]:paoff[i] + na[j]]
         amask[j, :na[j]] = True
-        tgt[ct:ct + nc[j], :na[j]] = pp[at:at + nc[j] * na[j]].reshape(nc[j], na[j])
-        at, ct = at + nc[j] * na[j], ct + nc[j]
+        target = pp[ppoff[i]:ppoff[i + 1]]
+        tgt[ct:ct + nc[j], :na[j]] = target.reshape(nc[j], na[j])
+        ct += nc[j]
 
     t = lambda a, dt=torch.float32: torch.as_tensor(np.ascontiguousarray(a), dtype=dt, device=device)
-    phi = lambda idx, seats: t(np.concatenate(
-        [cc[idx].astype(np.float32) / CNORM, seats[:, None].astype(np.float32)], 1))
+    phi = lambda idx, seats: t(np.concatenate([
+        cc[idx, :CCOUNTS].astype(np.float32) / CNORM,
+        cc[idx, CCOUNTS:].astype(np.float32),
+        seats[:, None].astype(np.float32)], 1))
     csol = t(np.repeat(np.arange(S), nc), torch.long)
 
     # Expand the selected rows (one per solve) from the packed format.
     rows = d["rows"].reshape(-1, ROW_BYTES)[prow]
     first = np.stack([coff[2 * prow], coff[2 * prow + 1]], 1)  # [S, 2] span starts
-    cs = cc[first]
-    hand = cs[:, :, :5].sum(2).astype(np.uint8)
-    fd = cs[:, :, 5:10].sum(2).astype(np.uint8)
-    bag = cs[:, :, 10:].sum(2).astype(np.uint8)
+    hand, fd, bag = _config_sizes(cc[first], S)
     x = t(np.asarray(
         warchest.expand_rows(rows.ravel(), hand, fd, bag), np.float32).reshape(S, -1))
     e = net.cards(x, t(rows[:, ROW_IDS:ROW_IDS + NTYPE], torch.long))
     zb = net.holdings(phi(both, seg & 1), e[t(seg // 2, torch.long)])
     b = torch.zeros(2 * S, zb.shape[1], dtype=zb.dtype, device=device)
     b.index_add_(0, t(seg, torch.long), zb * t(cw[both]).unsqueeze(1))
-    h = F.relu(net.ln0(net.public_trunk(x, e)))
-    h = F.relu(net.ln1(net.w1(h) + net.wb(b.reshape(S, -1))))
+    h = net._head(net._public(x, e), b.reshape(S, -1))
 
     q = net.actions(t(apad.reshape(-1, AFEAT)),
                     e.repeat_interleave(NA, 0)).reshape(S, NA, -1)
@@ -372,7 +380,7 @@ def policy_loss(net, d, ids, device):
 
 
 def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
-                recent_mix=0.0, recent_frac=0.2, aux_weight=0.0, policy_weight=0.0,
+                recent_mix=0.0, recent_rows=400_000, aux_weight=0.0, policy_weight=0.0,
                 d=None, policy_batch=64, profile_cuda=False, batch_fn=make_batch):
     """Returns the mean value loss and the mean policy loss.
 
@@ -392,12 +400,13 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
     tot, ptot = 0.0, 0.0
     stat = {"sample_s": 0.0, "prepare_s": 0.0, "forward_wall_s": 0.0,
             "backward_wall_s": 0.0, "batch_configs": 0, "steps": steps,
-            "gpu_forward_s": 0.0, "gpu_backward_s": 0.0}
+            "gpu_forward_s": 0.0, "gpu_backward_s": 0.0,
+            "grad_norm_sum": 0.0, "grad_norm_max": 0.0, "grad_clipped": 0}
     event_pairs = []
     stream = torch.cuda.current_stream(device) if profile_cuda and device.type == "cuda" else None
     for _ in range(steps):
         ts = time.perf_counter()
-        sampled = buf.sample(batch, rng, recent_mix, recent_frac)
+        sampled = buf.sample(batch, rng, recent_mix, recent_rows)
         stat["sample_s"] += time.perf_counter() - ts
         stat["batch_configs"] += len(sampled[1])
         ts = time.perf_counter()
@@ -429,7 +438,10 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
         ts = time.perf_counter()
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        nn.utils.clip_grad_norm_(net.parameters(), 5.0)
+        grad_norm = float(nn.utils.clip_grad_norm_(net.parameters(), 5.0))
+        stat["grad_norm_sum"] += grad_norm
+        stat["grad_norm_max"] = max(stat["grad_norm_max"], grad_norm)
+        stat["grad_clipped"] += int(grad_norm > 5.0)
         opt.step()
         stat["backward_wall_s"] += time.perf_counter() - ts
         if stream is not None:
@@ -477,9 +489,15 @@ def write_log(args, epochs, snaps):
     One file, rewritten in place, so `plot.py` and `ladder.py` have a single
     thing to read and a run that is still going is readable at any moment.
     """
-    with open(f"{args.out}/log.json", "w") as f:
-        json.dump({"cfg": dataclasses.asdict(args), "epochs": epochs, "snapshots": snaps},
-                  f, indent=1)
+    path = f"{args.out}/log.json"
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"encoding_version": ENCODING_VERSION,
+                   "row_format_version": warchest.ROW_FORMAT_VERSION,
+                   "rules_hash": warchest.rules_table_hash(),
+                   "cfg": dataclasses.asdict(args), "epochs": epochs,
+                   "snapshots": snaps}, f, indent=1)
+    os.replace(tmp, path)
 
 
 def main():
@@ -547,11 +565,11 @@ def main():
                 pub=towers(args.pub), hmlp=towers(args.hmlp),
                 card=towers(args.card), slot=towers(args.slot),
                 nres=args.nres).to(dev)
-    if args.init:
-        initial = load_checkpoint(args.init)
+    if args.init_weights:
+        initial = load_checkpoint(args.init_weights)
         if list(initial.dims) != list(value.dims):
             raise ValueError(
-                f"--init shape {initial.dims} does not match requested shape {value.dims}")
+                f"initial shape {initial.dims} does not match requested shape {value.dims}")
         value.load_state_dict(initial.state_dict())
     opt = torch.optim.Adam(value.parameters(), lr=args.lr)
     # Step-decay plan: halve the lr at each listed fraction of the ReBeL phase.
@@ -578,15 +596,16 @@ def main():
 
     gen_box = None
     total = args.minutes * 60.0
-    warm = total * args.warm_frac if args.warm_minutes < 0 else args.warm_minutes * 60.0
-    warm = min(warm, total)
+    warm = args.warm_minutes * 60.0
+    if not 0.0 <= warm <= total:
+        raise SystemExit("warm_minutes must be between zero and the run length")
     t0 = time.time()
     epoch, phase, log = 0, "greedy", []
     # Fresh subgames per second over the whole ReBeL phase: the rate
     # docs/GPU_PERF_GOAL.md is about. Generation overlaps training, so
     # per-epoch `gen_s` is not it -- only cumulative solves over cumulative
     # ReBeL wall time counts every cost, including the trainer's own.
-    rebel_t0, rebel_solves = None, 0
+    rebel_t0, rebel_solves, rebel_rows = None, 0, 0
     # The marker-differential payoff at the horizon distorts the game being
     # solved, so it is annealed away as soon as horizon games become rare, and
     # evaluation always runs on the real game (value 0).
@@ -617,6 +636,7 @@ def main():
             return
         path = f"{args.out}/snap_{len(snaps):02d}.pt"
         torch.save({"value": value.state_dict(), "spec": value.spec(),
+                    "encoding_version": ENCODING_VERSION,
                     "hidden": args.hidden, "head": args.head or args.hidden,
                     "dg": args.dg, "rank": args.rank, "de": args.de, "t": round(el, 1),
                     "label": label, "git": args.git,
@@ -634,7 +654,7 @@ def main():
         pure-bootstrap configuration. Generation is backpressured by a bounded
         Rust/Python chunk queue; optimizer work is paid from exact sample debt,
         and immutable GPU weights are published on a fixed step cadence."""
-        nonlocal probe, cap_v, next_decay, next_snap, epoch, rebel_solves
+        nonlocal probe, cap_v, next_decay, next_snap, epoch, rebel_solves, rebel_rows
 
         if args.aux != 0.0 or args.policy != 0.0:
             raise ValueError("continuous GPU generation requires aux=0 policy=0")
@@ -672,27 +692,30 @@ def main():
                       loss_sum=0.0, train_steps=0, sample_s=0.0,
                       prepare_s=0.0, forward_wall_s=0.0,
                       backward_wall_s=0.0, gpu_forward_s=0.0,
-                      gpu_backward_s=0.0, batch_configs=0)
+                      gpu_backward_s=0.0, batch_configs=0,
+                      grad_norm_sum=0.0, grad_norm_max=0.0, grad_clipped=0,
+                      zero_sum_abs=0.0, zero_sum_max=0.0)
 
         def emit_report(now):
             nonlocal probe, epoch
             elapsed = max(now - rebel_t0, 1e-9)
-            debt = max(0.0, args.train_gen_ratio * rebel_solves - optimizer_rows)
+            debt = max(0.0, args.train_gen_ratio * rebel_rows - optimizer_rows)
             credit = optimizer_rows / args.train_gen_ratio
             raw_sps = rebel_solves / elapsed
-            balanced_sps = min(rebel_solves, credit) / elapsed
+            raw_rps = rebel_rows / elapsed
+            balanced_rps = min(rebel_rows, credit) / elapsed
             if probe is None and len(buf) >= 2048:
                 probe = batcher(buf.sample(2048, rng), rng, dev, False)
             with torch.no_grad():
                 probe_std = float(value(*probe[:6], probe[7]).std()) \
                     if probe is not None else float("nan")
-                if len(buf) >= args.batch:
+                if len(buf) >= args.recent_rows + args.batch:
                     old_parts = batcher(
-                        buf.sample_old(args.batch, rng, args.recent_frac), rng, dev, False)
+                        buf.sample_old(args.batch, rng, args.recent_rows), rng, dev, False)
                     loss_old = float(value_loss(value, *old_parts[:-1]))
                     new_parts = batcher(
                         buf.sample(args.batch, rng, recent_mix=1.0,
-                                   recent_frac=args.recent_frac), rng, dev, False)
+                                   recent_rows=args.recent_rows), rng, dev, False)
                     loss_new = float(value_loss(value, *new_parts[:-1]))
                 else:
                     loss_old = loss_new = float("nan")
@@ -720,6 +743,8 @@ def main():
                 "steps": window["train_steps"],
                 "optimizer_steps": optimizer_steps,
                 "optimizer_rows": optimizer_rows,
+                "generated_rows": rebel_rows,
+                "effective_train_ratio": round(optimizer_rows / max(rebel_rows, 1), 4),
                 "optimizer_debt": round(debt, 1),
                 "publications": publications,
                 "weight_age_steps": optimizer_steps % publish_steps,
@@ -734,6 +759,9 @@ def main():
                 "backward_wall_s": round(window["backward_wall_s"], 2),
                 "gpu_forward_s": round(window["gpu_forward_s"], 2),
                 "gpu_backward_s": round(window["gpu_backward_s"], 2),
+                "grad_norm": round(window["grad_norm_sum"] / max(window["train_steps"], 1), 4),
+                "grad_norm_max": round(window["grad_norm_max"], 4),
+                "grad_clip_frac": round(window["grad_clipped"] / max(window["train_steps"], 1), 4),
                 "batch_configs": round(
                     window["batch_configs"] / max(window["train_steps"], 1), 1),
                 "target_configs_per_row": round(
@@ -743,7 +771,11 @@ def main():
                 "gpu_wait_s": round(window["gpu_wait_s"], 2),
                 "buf": len(buf), "buf_s": round(buf.span_seconds(), 1),
                 "solves_per_s": round(raw_sps, 1),
-                "balanced_solves_per_s": round(balanced_sps, 1),
+                "rows_per_s": round(raw_rps, 1),
+                "balanced_rows_per_s": round(balanced_rps, 1),
+                "zero_sum_mean_abs": round(
+                    window["zero_sum_abs"] / max(window["rows"], 1), 8),
+                "zero_sum_max": round(window["zero_sum_max"], 8),
                 "lr": opt.param_groups[0]["lr"],
                 "deadline_remaining": round(max(0.0, deadline - now), 1),
             }
@@ -756,7 +788,8 @@ def main():
             write_log(args, log, snaps)
             print(
                 f"[t={rec['t']:6.1f}s] rebel stream solves={rebel_solves} "
-                f"raw={raw_sps:.0f}/s balanced={balanced_sps:.0f}/s "
+                f"solves={raw_sps:.0f}/s rows={raw_rps:.0f}/s "
+                f"balanced_rows={balanced_rps:.0f}/s "
                 f"debt={debt:.0f} rows steps={optimizer_steps} "
                 f"over={totals['oversize_routes']} card={totals['card_exclusive_routes']} "
                 f"drop={totals['dropped']} "
@@ -773,7 +806,9 @@ def main():
                          "conv_s", "add_s", "train_s", "gpu_wait_s",
                          "loss_sum", "train_steps", "sample_s", "prepare_s",
                          "forward_wall_s", "backward_wall_s", "gpu_forward_s",
-                         "gpu_backward_s", "batch_configs"):
+                         "gpu_backward_s", "batch_configs", "grad_norm_sum",
+                         "grad_norm_max", "grad_clipped", "zero_sum_abs",
+                         "zero_sum_max"):
                 window[name] = 0
 
         try:
@@ -795,9 +830,9 @@ def main():
                 if data is not None:
                     tc = time.time()
                     rows = np.asarray(data["rows"], np.uint8).reshape(-1, ROW_BYTES)
-                    cc = np.asarray(data["cc"], np.uint8).reshape(-1, CCOUNTS)
+                    cc = np.asarray(data["cc"], np.uint8).reshape(-1, CPRIVATE)
                     cw = np.asarray(data["cw"], np.float32)
-                    cy = np.clip(np.asarray(data["cy"], np.float32), -1.0, 1.0)
+                    cy = np.asarray(data["cy"], np.float32)
                     coff = np.asarray(data["coff"], np.int64)
                     soff = np.asarray(data["soff"], np.int64)
                     solves = int(data["solves"])
@@ -807,18 +842,23 @@ def main():
                         buf.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
                     window["add_s"] += time.time() - ta
                     rebel_solves += solves
+                    rebel_rows += len(rows)
                     window["solves"] += solves
                     window["rows"] += len(rows)
                     window["target_n"] += cy.size
                     window["target_sum"] += float(cy.sum(dtype=np.float64))
                     window["target_sq"] += float(np.square(cy.astype(np.float64)).sum())
+                    window["zero_sum_abs"] += (
+                        float(data.get("zero_sum_mean_abs", 0.0)) * len(rows))
+                    window["zero_sum_max"] = max(
+                        window["zero_sum_max"], float(data.get("zero_sum_max", 0.0)))
                     window["gpu_wait_s"] += float(data.get("gpu_wait_s", 0.0))
                     for name in counter_names:
                         v = int(data.get(name, 0))
                         totals[name] += v
                         window[name] += v
 
-                debt = max(0.0, args.train_gen_ratio * rebel_solves - optimizer_rows)
+                debt = max(0.0, args.train_gen_ratio * rebel_rows - optimizer_rows)
                 if debt >= args.batch and len(buf) >= args.batch:
                     until_publish = publish_steps - optimizer_steps % publish_steps
                     nsteps = min(int(debt // args.batch), until_publish)
@@ -827,7 +867,7 @@ def main():
                         value, opt, buf, nsteps, args.batch, rng, dev,
                         aux_weight=0.0, policy_weight=0.0,
                         augment=not args.no_augment,
-                        recent_mix=args.recent_mix, recent_frac=args.recent_frac,
+                        recent_mix=args.recent_mix, recent_rows=args.recent_rows,
                         profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1",
                         batch_fn=batcher)
                     window["train_s"] += time.time() - tt
@@ -835,15 +875,17 @@ def main():
                     window["train_steps"] += nsteps
                     for name in ("sample_s", "prepare_s", "forward_wall_s",
                                  "backward_wall_s", "gpu_forward_s", "gpu_backward_s",
-                                 "batch_configs"):
+                                 "batch_configs", "grad_norm_sum", "grad_clipped"):
                         window[name] += train_stat[name]
+                    window["grad_norm_max"] = max(
+                        window["grad_norm_max"], train_stat["grad_norm_max"])
                     optimizer_steps += nsteps
                     optimizer_rows += nsteps * args.batch
                     if optimizer_steps % publish_steps == 0:
                         value.push(0)
                         flat = value.flat()
-                        for i in range(len(gpu_devices)):
-                            warchest.gpu_set_weights(value.dims, *flat, device=i)
+                        for device in gpu_devices:
+                            warchest.gpu_set_weights(value.dims, *flat, device=device)
                         publications += 1
 
                 now = time.time()
@@ -865,7 +907,7 @@ def main():
                     emit_report(now)
                     next_report = now + 10.0
 
-                debt = max(0.0, args.train_gen_ratio * rebel_solves - optimizer_rows)
+                debt = max(0.0, args.train_gen_ratio * rebel_rows - optimizer_rows)
                 if done and debt < args.batch:
                     break
         finally:
@@ -881,13 +923,16 @@ def main():
         while time.time() < deadline:
             time.sleep(min(0.05, deadline - time.time()))
         elapsed = max(time.time() - rebel_t0, 1e-9)
-        debt = max(0.0, args.train_gen_ratio * rebel_solves - optimizer_rows)
+        debt = max(0.0, args.train_gen_ratio * rebel_rows - optimizer_rows)
         credit = optimizer_rows / args.train_gen_ratio
         raw_sps = rebel_solves / elapsed
-        balanced_sps = min(rebel_solves, credit) / elapsed
+        raw_rps = rebel_rows / elapsed
+        balanced_rps = min(rebel_rows, credit) / elapsed
         print(
-            f"[gpu-summary] solves={rebel_solves} optimizer_rows={optimizer_rows} "
-            f"debt={debt:.0f} raw={raw_sps:.1f}/s balanced={balanced_sps:.1f}/s "
+            f"[gpu-summary] solves={rebel_solves} rows={rebel_rows} "
+            f"optimizer_rows={optimizer_rows} ratio={optimizer_rows / max(rebel_rows, 1):.3f} "
+            f"debt={debt:.0f} solves={raw_sps:.1f}/s rows={raw_rps:.1f}/s "
+            f"balanced_rows={balanced_rps:.1f}/s "
             f"over={totals['oversize_routes']} card={totals['card_exclusive_routes']} "
             f"exact={totals['exact_fallbacks']} "
             f"censored={totals['censored_games']} dropped={totals['dropped']} "
@@ -896,11 +941,12 @@ def main():
 
     # Snapshots are a *count*, evenly spaced over the ReBeL phase with the last
     # one at the end. A count is what an experiment actually chooses: it is the
-    # number of players each run puts on the ladder, and ladder cost grows with
-    # the square of that. An interval made the count a function of the run
-    # length, so a longer run silently paid a quadratically larger ladder.
-    # `init` is saved on top of these -- it is the warm-start output, the zero
-    # of the Elo curve, and the thing `--init` resumes from.
+    # number of players each run puts on the ladder. An interval made the count
+    # a function of the run length, so a longer run silently changed the
+    # evaluation budget.
+    # `init` is saved on top of these -- it is the warm-start output and the
+    # zero of the Elo curve. Checkpoints are evaluation artifacts, not training
+    # resumes; `init_weights` explicitly starts a new optimiser and schedule.
     snap_gap = (total - warm) / max(args.snapshots, 1)
     next_snap = float("inf")
     print(f"[cfg] PUBFEAT={PUBFEAT} CFEAT={CFEAT} hidden={args.hidden} head={args.head or args.hidden} dg={args.dg} rank={args.rank} depth={args.depth} "
@@ -908,7 +954,7 @@ def main():
           f"draft={'random' if args.random_draft else 'starter'} "
           f"snapshots={args.snapshots} (every {snap_gap / 60:.1f}min) "
           f"train_gen_ratio={args.train_gen_ratio} "
-          f"recent_mix={args.recent_mix}/{args.recent_frac} "
+          f"recent_mix={args.recent_mix} recent_rows={args.recent_rows} "
           f"augment={not args.no_augment} cap={args.cap} "
           f"matmul={torch.get_float32_matmul_precision()}", flush=True)
 
@@ -926,8 +972,8 @@ def main():
             # first upload does not happen until after it returns.
             if args.gpu:
                 flat = value.flat()
-                for i in range(len(gpu_devices)):
-                    warchest.gpu_set_weights(value.dims, *flat, device=i)
+                for device in gpu_devices:
+                    warchest.gpu_set_weights(value.dims, *flat, device=device)
             next_snap = el + snap_gap
             # Drop the warm-phase data. Its job was to initialise the *network*,
             # not to serve as bootstrap targets: it comes from a different
@@ -938,9 +984,17 @@ def main():
             # network simply kept fitting greedy play (`runs/diagC`,
             # the run ended no stronger than it started).
             buf.clear()
+            # Greedy warm-up is parameter initialisation, not part of ReBeL's
+            # optimiser or random trajectory. Its moments encode a different
+            # objective, and its variable duration must not select a different
+            # ReBeL generation and replay-sampling stream.
+            opt = torch.optim.Adam(value.parameters(), lr=args.lr)
+            epoch = 0
+            rng = np.random.default_rng(args.seed * 1_000_003 + 17)
             phase = "rebel"
             rebel_t0 = time.time()
             rebel_solves = 0
+            rebel_rows = 0
             print(f"[t={el:6.1f}s] --- switching to ReBeL ---", flush=True)
             if args.gpu and args.aux == 0.0 \
                     and args.policy == 0.0 and args.warm == 0.0:
@@ -981,38 +1035,37 @@ def main():
             th.join()
             d = box["d"]
             flat = value.flat()
-            for i in range(len(gpu_devices)):
-                warchest.gpu_set_weights(value.dims, *flat, device=i)
+            for device in gpu_devices:
+                warchest.gpu_set_weights(value.dims, *flat, device=device)
             gen_box = start_gen(args.seed * 1_000_003 + epoch + 1)
         else:
             d = warchest.gen_data(args.rebel_games, args.seed * 1_000_003 + epoch, "rebel",
                                   depth=args.depth, iters=args.iters, explore=args.explore,
                                   cfr=args.cfr, warm=args.warm, **kw)
         gen_s = time.time() - tg
-        # Utilities live in [-1, 1]; so does the true value function, so clip
-        # the bootstrapped targets to that range. Rows stay packed (raw
-        # bytes); the public encoding is expanded per batch.
-        # Everything from here to `tt` used to sit in no timer at all, and it
+        # Rows stay packed (raw bytes); the public encoding is expanded per
+        # batch. Everything from here to `tt` used to sit in no timer at all, and it
         # is not small: on the 3072-game sweep it was 210-360 s of a 750-980 s
         # ReBeL phase, more than the training pass. Split it into the numpy
         # conversion and the replay insertion so the next person tunes the one
         # that costs.
         tr = time.time()
         rows = np.asarray(d["rows"], np.uint8).reshape(-1, ROW_BYTES)
-        cc = np.asarray(d["cc"], np.uint8).reshape(-1, CCOUNTS)
+        cc = np.asarray(d["cc"], np.uint8).reshape(-1, CPRIVATE)
         cw = np.asarray(d["cw"], np.float32)
-        cy = np.clip(np.asarray(d["cy"], np.float32), -1.0, 1.0)
+        cy = np.asarray(d["cy"], np.float32)
         coff = np.asarray(d["coff"], np.int64)
         soff = np.asarray(d["soff"], np.int64)
-        # TurboReBeL exposes the solve count so the train:generation ratio
-        # can count solves (the sampling unit of the data) instead of rows,
-        # which turbo multiplies by ~T for near-duplicate data.
+        # Solve count remains useful as generation throughput telemetry; the
+        # training ratio below is deliberately expressed in replay rows.
         solves = max(1, int(d["solves"]))
         if phase == "rebel":
             if rebel_t0 is None:
-                rebel_t0, rebel_solves = time.time(), 0
+                rebel_t0, rebel_solves, rebel_rows = time.time(), 0, 0
             rebel_solves += solves
+            rebel_rows += len(rows)
         sps = rebel_solves / max(time.time() - rebel_t0, 1e-9) if rebel_t0 else 0.0
+        rps = rebel_rows / max(time.time() - rebel_t0, 1e-9) if rebel_t0 else 0.0
         conv_s = time.time() - tr
         tr = time.time()
         buf.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
@@ -1025,23 +1078,15 @@ def main():
         tgt_mean, tgt_std = float(cy.mean()), float(cy.std())
 
         tt = time.time()
-        # Hold a fixed train:generation sample ratio (the reference's
-        # `train_gen_ratio: 4`) instead of a fixed step count. The step count
-        # then tracks how much fresh data the generator actually produced, which
-        # is what keeps the ratio stable across depths -- a fixed count swings
-        # the ratio by ~18x between depth 1 and depth 2, and over-trains the
-        # thin first epochs after the buffer is cleared.
-        #
-        # The sample unit is the *solve*, not the row: TurboReBeL multiplies
-        # rows per solve by ~T, and counting rows would inflate the step count
-        # by the same factor for near-duplicate data. One solve is one sample,
-        # matching the buffer's sampling unit.
-        steps = max(1, round(args.train_gen_ratio * solves / args.batch))
-        lv, lp, _ = train_steps(
+        # Literal optimizer rows per generated replay row. Turbo produces
+        # several retained rows per solve, which made the old solve-based knob
+        # overstate its effective ratio by roughly eightfold.
+        steps = max(1, round(args.train_gen_ratio * len(rows) / args.batch))
+        lv, lp, train_stat = train_steps(
             value, opt, buf, steps, args.batch, rng, dev, aux_weight=args.aux,
             policy_weight=(args.policy if phase == "rebel" else 0.0), d=d,
             augment=not args.no_augment, recent_mix=args.recent_mix,
-            recent_frac=args.recent_frac, batch_fn=batcher)
+            recent_rows=args.recent_rows, batch_fn=batcher)
         train_s = time.time() - tt
         value.push(0)
         with torch.no_grad():
@@ -1051,13 +1096,13 @@ def main():
             # versions of the net, so old rows carry stale labels. This curve
             # makes that staleness visible: if old-row loss falls while
             # fresh-row loss rises, training is overfitting the buffer.
-            if len(buf) >= args.batch:
+            if len(buf) >= args.recent_rows + args.batch:
                 old_parts = batcher(
-                    buf.sample_old(args.batch, rng, args.recent_frac), rng, dev, False)
+                    buf.sample_old(args.batch, rng, args.recent_rows), rng, dev, False)
                 loss_old = float(value_loss(value, *old_parts[:-1]))
                 new_parts = batcher(
                     buf.sample(args.batch, rng, recent_mix=1.0,
-                               recent_frac=args.recent_frac), rng, dev, False)
+                               recent_rows=args.recent_rows), rng, dev, False)
                 loss_new = float(value_loss(value, *new_parts[:-1]))
             else:
                 loss_old = loss_new = float("nan")
@@ -1103,12 +1148,20 @@ def main():
                "dropped": int(d["dropped"]),
                "configs": round(d["configs"] / dec, 1), "cap_value": round(cap_v, 4),
                "steps": steps,
+               "generated_rows": len(rows), "optimizer_rows": steps * args.batch,
+               "effective_train_ratio": round(steps * args.batch / max(len(rows), 1), 4),
+               "grad_norm": round(train_stat.get("grad_norm_sum", 0.0) / max(steps, 1), 4),
+               "grad_norm_max": round(train_stat.get("grad_norm_max", 0.0), 4),
+               "grad_clip_frac": round(train_stat.get("grad_clipped", 0) / max(steps, 1), 4),
+               "zero_sum_mean_abs": round(float(d.get("zero_sum_mean_abs", 0.0)), 8),
+               "zero_sum_max": round(float(d.get("zero_sum_max", 0.0)), 8),
                "tgt_mean": round(tgt_mean, 4), "tgt_std": round(tgt_std, 4),
                "probe_std": round(probe_std, 4),
                "gen_s": round(gen_s, 2), "train_s": round(train_s, 2),
                "conv_s": round(conv_s, 2), "add_s": round(add_s, 2), "buf": len(buf),
                "buf_s": round(buf.span_seconds(), 1),
                "solves_per_s": round(sps, 1),
+               "rows_per_s": round(rps, 1),
                "lr": opt.param_groups[0]["lr"]}
         log.append(rec)
         check_alive(args, rec, log[-2] if len(log) > 1 else None)
@@ -1145,6 +1198,8 @@ def main():
         print(f"[report] skipped: {e}", flush=True)
 
     if args.dump_buffer:
+        if not len(buf):
+            raise SystemExit("cannot dump an empty replay buffer")
         # Oldest row first, so a recency split is an honest held-out set.
         # The dump carries the frozen row format (version + rules hash) and
         # the solve offsets, so offline comparisons can split at solve
@@ -1157,7 +1212,8 @@ def main():
                                [len(rows)]])
         np.savez(args.dump_buffer, rows=rows, cc=cc, cp=cp, cw=cw, cy=cy, seg=seg,
                  soff=soff, pubfeat=np.int32(PUBFEAT), cfeat=np.int32(CFEAT),
-                 ccounts=np.int32(CCOUNTS), cnorm=np.float32(CNORM),
+                 cprivate=np.int32(CPRIVATE), ccounts=np.int32(CCOUNTS),
+                 cnorm=np.float32(CNORM),
                  row_bytes=np.int32(ROW_BYTES), version=np.int32(warchest.ROW_FORMAT_VERSION),
                  rules_hash=np.uint64(warchest.rules_table_hash()))
         print(f"dumped {len(rows)} buffer rows ({len(cy)} configs) to {args.dump_buffer}",

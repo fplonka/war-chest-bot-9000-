@@ -1,33 +1,18 @@
-"""Play one or more runs' snapshots against each other and turn the results into Elo.
+"""Evaluate a sparse checkpoint graph and turn the results into Elo.
 
     python train/ladder.py runs/mine --games 300
-    python train/ladder.py runs/a runs/b --focus a.final,b.final --focus-games 2000
+    python train/ladder.py runs/a runs/b --comparison-games 2000
 
-With several run directories the snapshots are entered as `run.label` so the
-runs' overlapping labels (`init`, `s1`, ...) do not collide, each run's
-checkpoints go into their own slots, and Greedy appears once. Rating several
-arms in one ladder is the point: every game places every player, so an arm is
-compared to its control through the whole field rather than through one match.
+Every saved checkpoint is included by default. Consecutive checkpoints within
+each run form its learning curve; the first and final checkpoints play Greedy;
+and each candidate final plays only its same-seed control final. Curve and
+anchor edges use a modest fixed budget, while those explicit arm comparisons
+use the larger budget. The graph is connected and has O(K) edges for K
+checkpoints.
 
-A training run saves the network every few minutes and does not judge the
-snapshots while it is running. This plays a full round robin between them --
-plus Greedy (the handcrafted one-ply bot) and Random -- and fits one rating per
-player, so a run's output is a curve of strength against training time rather
-than a single number of unknown provenance.
-
-Why this replaces gating. A mid-run match against a moving champion has a
-standard error near +-0.05 at any affordable number of games, which is larger
-than the improvement between two snapshots twenty minutes apart; promoting on it
-is mostly promoting noise, and it spends training time to do so. Elo from a
-round robin uses every game against every opponent to place every player, needs
-no threshold, and is measured on the finished run where the games are cheap.
-
-Cheap is not a figure of speech: a game is on the order of a hundred solves and
-generation runs above a thousand solves a second, so a 2,000-game pairing costs
-a few minutes against the hour that produced the checkpoints. Ladders here used
-to run 30 to 100 games, which resolves nothing finer than about 70 Elo -- and
-the architecture experiments this project has already run were decided, wrongly,
-inside that band.
+Games use paired seats and paired drafts. Each edge has a deterministic seed,
+so rerunning the same graph reproduces the same evaluation schedule. Random
+drafts are the default; `--fixed-draft` is the explicit exception.
 
 Ratings come from the Bradley-Terry model, which is what Elo *is*: player `i`
 beats `j` with probability `1 / (1 + 10 ** ((e_j - e_i) / 400))`. Draws count
@@ -39,7 +24,6 @@ also carried Random.
 """
 
 import argparse
-import itertools
 import json
 import math
 import os
@@ -61,6 +45,14 @@ from export_weights import load
 # this much", and a pairing with real losses in it is moved by well under 10
 # Elo.
 PRIOR = 1.0
+
+
+def write_json(path, value):
+    """Publish a complete result without exposing a partially written file."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(value, f, indent=1)
+    os.replace(tmp, path)
 
 
 def fit_elo(n, w):
@@ -122,7 +114,8 @@ def players_of(runs, refs=("greedy",), labels=None, search=None):
     Random is not in this list and should not be added back: a game against an
     opponent 400 Elo away carries a tenth of the information of a game against
     an equal, and every trained checkpoint beats Random ~30-0. Those games are
-    a foregone conclusion bought at full price. Keep the references fixed forever -- they are pure functions of the
+    a foregone conclusion bought at full price. Keep the references fixed
+    forever -- they are pure functions of the
     rules, which is what makes a rating from one ladder comparable to a rating
     from another. A pool of rotating champions was tried and removed: when the
     zero moves, old numbers stop meaning anything.
@@ -133,15 +126,17 @@ def players_of(runs, refs=("greedy",), labels=None, search=None):
     nothing downstream could tell.
     """
     ps = [{"name": r, "agent": r, "slot": 0, "t": None, "run": None,
-           "search": SEARCH} for r in refs]
+           "search": SEARCH, "endpoint": False, "final": False, "order": -1,
+           "experiment": None, "arm": None, "seed": None, "is_control": None}
+          for r in refs]
     for run in runs:
         tag = os.path.basename(run.rstrip("/"))
         with open(f"{run}/log.json") as f:
             log = json.load(f)
         cfg = log.get("cfg", {})
-        for s in log.get("snapshots", []):
-            if labels is not None and s["label"] not in labels:
-                continue
+        selected = [s for s in log.get("snapshots", [])
+                    if labels is None or s["label"] in labels]
+        for order, s in enumerate(selected):
             ck = torch.load(f"{run}/{s['file']}", map_location="cpu", weights_only=False)
             # A checkpoint older than a knob does not carry it, so fall back to
             # the run's config and then to the default.
@@ -149,117 +144,48 @@ def players_of(runs, refs=("greedy",), labels=None, search=None):
             own.update(ck.get("search") or {})
             ps.append({"name": f"{tag}.{s['label']}", "agent": "rebel",
                        "slot": len(ps), "t": s["t"], "file": s["file"],
-                       "run": run, "search": search or own})
+                       "run": run, "search": search or own, "order": order,
+                       "endpoint": order in (0, len(selected) - 1),
+                       "final": s["label"] == "final",
+                       "experiment": cfg.get("experiment"),
+                       "arm": cfg.get("arm"), "seed": cfg.get("seed"),
+                       "is_control": cfg.get("is_control")})
     return ps
 
 
 
-# ---------------------------------------------------------------- SPRT
-# Fixed sample sizes are the wrong shape for "is A better than B". Pick 2,000
-# games in advance and you either spend them proving something that was obvious
-# after 300, or spend them all and land inside the noise anyway.
-#
-# Wald's sequential probability ratio test asks the question the experiment
-# actually asks: H0 says A is no better than B; H1 says A is better by at least
-# ELO1. After each block of games the log-likelihood ratio moves, and the test
-# stops the moment it crosses a bound. Computer chess has tested engine changes
-# this way for years, at the same effect sizes we care about.
-#
-# The model is the normal approximation to the per-game score (0, 0.5, 1) with
-# the variance estimated from the games themselves -- the generalized SPRT
-# everyone actually runs. Draws need no special treatment: they are simply
-# scores of 0.5, and the horizon here manufactures a lot of them, which shows up
-# honestly as a smaller variance and therefore a faster decision.
-ELO0, ELO1 = 0.0, 15.0      # indifference band: below 15 Elo we do not care
-
-# Stopping early is what makes a full round robin affordable, and it costs
-# something: a pairing stopped at its boundary has a win rate biased slightly
-# towards that boundary, so a rating fitted from truncated pairings is not the
-# rating a fixed schedule would give. The bias is small next to the effect sizes
-# a learning curve shows, and it buys spending the games where the curve is
-# genuinely uncertain rather than on pairings settled after 100 games.
-ALPHA = BETA = 0.05
-
-
-def expected_score(elo):
-    return 1.0 / (1.0 + 10.0 ** (-elo / 400.0))
-
-
-def llr(w, l, d):
-    """Log-likelihood ratio of H1 (elo=ELO1) against H0 (elo=ELO0)."""
-    n = w + l + d
-    if n < 2:
-        return 0.0
-    total = w + 0.5 * d
-    mean = total / n
-    # Second moment of the per-game score, then the sample variance.
-    var = (w + 0.25 * d) / n - mean * mean
-    if var <= 1e-9:                      # every game identical; no information
-        return 0.0
-    m0, m1 = expected_score(ELO0), expected_score(ELO1)
-    return (m1 - m0) / var * (total - n * (m0 + m1) / 2.0)
-
-
-def sprt_verdict(w, l, d):
-    """`"H1"` (A is better), `"H0"` (it is not), or `None` for keep playing."""
-    lo = math.log(BETA / (1.0 - ALPHA))
-    hi = math.log((1.0 - BETA) / ALPHA)
-    r = llr(w, l, d)
-    return "H1" if r >= hi else ("H0" if r <= lo else None)
-
-
-def pairing_games(a, b, focus, curve_games, focus_games):
-    """How many games this pairing is worth. 0 skips it.
-
-    Three kinds of pairing, and only two of them are worth paying for:
-
-    * **Within one run** — the learning curve. Consecutive snapshots differ by
-      far more than a few hundred games can miss, so this is cheap.
-    * **Between two runs' finals** — the comparison the experiment exists to
-      make. This is where the games go.
-    * **Between one run's `s1` and another's `s2`** — nobody asked. Skipped.
-      These are most of the pairings once several arms are in one ladder, and
-      they are what turns a round robin quadratic in the snapshot count.
-
-    Everything still reaches everything through Greedy and through its own run's
-    chain, so the ratings stay on one connected graph and remain comparable.
-    """
-    if a["run"] is None or b["run"] is None:      # a fixed reference
-        return curve_games
-    if {a["name"], b["name"]} <= focus:
-        return focus_games
+def pairing_games(a, b, comparisons, curve_games, comparison_games):
+    """Budget for one edge in the fixed linear comparison graph."""
+    if a["run"] is None or b["run"] is None:
+        p = b if a["run"] is None else a
+        return curve_games if p["endpoint"] else 0
     if a["run"] == b["run"]:
-        return curve_games
-    return 0
+        return curve_games if abs(a["order"] - b["order"]) == 1 else 0
+    runs = frozenset((a["run"], b["run"]))
+    return comparison_games if a["final"] and b["final"] and runs in comparisons else 0
 
 
-SPRT_BLOCK = 100            # games between tests; small enough to stop early
+def run(runs, out=None, games=60, temp=2.0, random_draft=True, seed=7,
+        refs=("greedy",), labels=None, comparisons=(), comparison_games=0,
+        gpu=False, search=None):
+    """Evaluate the sparse comparison graph and fit Elo. Returns the ratings.
 
-
-def run(runs, out=None, games=60, temp=2.0, random_draft=False, seed=7,
-        refs=("greedy",), labels=None, focus=(), focus_games=0, gpu=False,
-        sprt=True, search=None):
-    """Round robin, Elo fit, `ladder.json`, printed table. Returns the ratings.
-
-    Games go where the information is. A round robin at one sample size spends
-    most of its games on pairings nobody asked about, and a pairing carries
-    information roughly in proportion to its game count: 100 games resolve
-    about 70 Elo, 1,000 about 22, 5,000 about 10. So `focus` names the players
-    whose comparison the experiment is actually about -- normally the arms'
-    final checkpoints -- and any pairing between two of them gets
-    `focus_games` instead of `games`. The Bradley-Terry fit does not care that
-    the counts differ.
+    Consecutive checkpoints form each learning curve, its endpoints anchor to
+    Greedy, and explicit final-vs-control comparisons get the larger budget.
+    The graph is linear in the number of checkpoints and connected.
 
     With `gpu=True` two solve services run (CUDA devices 0 and 1); each
     pairing loads side A's weights on device 0 and side B's on device 1, so
     both GPUs are busy while the ladder plays. All checkpoints must share
-    one network shape (the services are compiled for it), and v1-era
-    checkpoints cannot play on the GPU.
+    one network shape (the services are compiled for it).
     """
     if out is None:
         out = runs[0]
+    if games <= 0 or comparison_games < 0 or games % 2 or comparison_games % 2:
+        raise ValueError("game budgets must be positive paired (even) counts")
     ps = players_of(runs, refs, labels, search)
-    focus, focus_games = set(focus), focus_games or games
+    comparison_games = comparison_games or games
+    comparisons = {frozenset(x) for x in comparisons}
     nets = [p for p in ps if p["agent"] == "rebel"]
     if not nets:
         raise SystemExit(f"{runs}: no snapshots in log.json")
@@ -272,8 +198,6 @@ def run(runs, out=None, games=60, temp=2.0, random_draft=False, seed=7,
         shapes = {tuple(n.dims) for n in by_slot.values()}
         if len(shapes) != 1:
             raise SystemExit(f"--gpu needs one shared network shape, got {shapes}")
-        if next(iter(shapes))[0] != 3:
-            raise SystemExit("--gpu cannot play v1-era checkpoints")
         first = next(iter(by_slot.values()))
         warchest.gpu_start(first.dims, *first.flat(), devices=[0, 1])
     # Always the real game: the horizon's marker payoff is a training aid, and
@@ -284,27 +208,24 @@ def run(runs, out=None, games=60, temp=2.0, random_draft=False, seed=7,
     n = np.zeros((k, k))
     sc = np.zeros((k, k))
     pairs = []
-    # Pairings grow with the square of the player count, so say what this will
-    # cost before spending it. A game is on the order of a hundred solves, and
-    # the golden run generates ~1,300 solves a second.
-    plan = {(i, j): pairing_games(ps[i], ps[j], focus, games, focus_games)
-            for i, j in itertools.combinations(range(k), 2)}
+    # Say what the fixed sparse graph will cost before spending it.
+    plan = {(i, j): pairing_games(ps[i], ps[j], comparisons, games, comparison_games)
+            for i in range(k) for j in range(i + 1, k)}
     played = sum(1 for v in plan.values() if v)
     total_games = sum(plan.values())
-    # With SPRT these counts are ceilings, not schedules: a settled pairing
-    # stops at the first block. Net-against-net games run about 3/s on the two
-    # 3090s, and a game against Greedy is far cheaper.
     print(f"[ladder] {k} players, {played} of {len(plan)} pairings, "
-          f"up to {games} games each ({focus_games} between the arms' finals) "
-          f"-> at most {total_games:,} games, {total_games / 3 / 60:.0f} min",
+          f"{games} games per curve/anchor edge ({comparison_games} per comparison) "
+          f"-> {total_games:,} games, about {total_games / 3 / 60:.0f} min",
           flush=True)
-    for i, j in itertools.combinations(range(k), 2):
+    for (i, j), n_ij in plan.items():
         # A seed per pairing rather than one shared across the tournament.
         # Within a pairing the two seatings are already paired on the same
         # stream, which is where the variance reduction is worth having; making
         # the pairings share a stream too would correlate their errors, and the
         # standard errors below assume they do not.
         a, b = ps[i], ps[j]
+        if n_ij == 0:
+            continue
         if gpu:
             if a["agent"] == "rebel":
                 na = by_slot[a["slot"]]
@@ -313,9 +234,9 @@ def run(runs, out=None, games=60, temp=2.0, random_draft=False, seed=7,
                 nb = by_slot[b["slot"]]
                 warchest.gpu_set_weights(nb.dims, *nb.flat(), device=1)
         sa, sb = a["search"], b["search"]
-        n_ij = plan[(i, j)]
-        if n_ij == 0:
-            continue
+        pair_seed = seed + 1000 * i + j
+        kind = ("anchor" if a["run"] is None or b["run"] is None else
+                "curve" if a["run"] == b["run"] else "comparison")
         play = lambda n, s: warchest.eval_match(
             n, s, a["agent"], b["agent"],
             depth=sa["depth"], iters=sa["iters"], cfr=sa["cfr"], warm=sa["warm"],
@@ -324,34 +245,15 @@ def run(runs, out=None, games=60, temp=2.0, random_draft=False, seed=7,
             depth_b=sb["depth"], iters_b=sb["iters"],
             cfr_b=sb["cfr"], warm_b=sb["warm"], gpu=gpu)
 
-        verdict = None
-        if sprt:
-            # Every pairing plays in blocks and stops as soon as the evidence
-            # is conclusive, or at n_ij if it never is. A lopsided pairing is
-            # settled by the first block; the games saved there are spent on
-            # the neighbouring snapshots, which is where the curve is actually
-            # uncertain.
-            w = l = d = 0
-            for blk in range(0, n_ij, SPRT_BLOCK):
-                bw, bl, bd = play(min(SPRT_BLOCK, n_ij - blk),
-                                  seed + 1000 * i + j + 7919 * blk)
-                w, l, d = w + bw, l + bl, d + bd
-                verdict = sprt_verdict(w, l, d)
-                if verdict:
-                    break
-        else:
-            w, l, d = play(n_ij, seed + 1000 * i + j)
+        w, l, d = play(n_ij, pair_seed)
         n[i][j] = n[j][i] = w + l + d
         sc[i][j], sc[j][i] = w + 0.5 * d, l + 0.5 * d
         pairs.append({"a": a["name"], "b": b["name"], "w": w, "l": l, "d": d,
-                      "n": w + l + d, "planned": n_ij, "sprt": verdict,
-                      "llr": round(llr(w, l, d), 2),
+                      "n": w + l + d, "budget": n_ij, "seed": pair_seed,
+                      "kind": kind,
                       "score": round((w + 0.5 * d) / max(w + l + d, 1), 3)})
-        note = {"H1": f"  SPRT: better by >{ELO1:.0f} Elo",
-                "H0": f"  SPRT: not better by {ELO1:.0f} Elo",
-                None: "  (inconclusive)"}[verdict] if sprt else ""
         print(f"  {a['name']:>28s} vs {b['name']:<28s} W{w:4d} L{l:4d} D{d:4d}  "
-              f"score {pairs[-1]['score']:.3f}{note}", flush=True)
+              f"score {pairs[-1]['score']:.3f}", flush=True)
 
     npr = n + PRIOR * (1 - np.eye(k)) * (n > 0)
     spr = sc + 0.5 * PRIOR * (1 - np.eye(k)) * (n > 0)
@@ -361,17 +263,23 @@ def run(runs, out=None, games=60, temp=2.0, random_draft=False, seed=7,
     # far the value head is from the fixed point of the solved operator, and the
     # two disagreeing is itself a result.
     terr = truth.errors([f"{p['run']}/{p['file']}" for p in nets])
-    res = {"runs": list(runs), "games_per_pair": games, "focus_games": focus_games,
-           "focus": sorted(focus), "truth_set": truth.DEFAULT_SET if terr else None,
-           "players": [{"name": p["name"], "t": p["t"], "search": p["search"], "elo": round(float(e), 1),
+    res = {"runs": list(runs), "curve_games": games,
+           "comparison_games": comparison_games,
+           "schedule_seed": seed,
+           "draft_mode": "random" if random_draft else "fixed",
+           "comparisons": sorted(sorted(x) for x in comparisons),
+           "truth_set": truth.DEFAULT_SET if terr else None,
+           "players": [{"name": p["name"], "run": p["run"], "t": p["t"],
+                        "experiment": p["experiment"], "arm": p["arm"],
+                        "seed": p["seed"], "is_control": p["is_control"],
+                        "search": p["search"], "elo": round(float(e), 1),
                         "se": round(float(s), 1),
                         "truth": round(terr[f"{p['run']}/{p['file']}"][0], 6)
                                  if p.get("file") and terr else None,
                         "score": round(float(sc[i].sum() / max(n[i].sum(), 1)), 3)}
                        for i, (p, e, s) in enumerate(zip(ps, elo, se))],
            "pairs": pairs}
-    with open(f"{out}/ladder.json", "w") as f:
-        json.dump(res, f, indent=1)
+    write_json(f"{out}/ladder.json", res)
 
     zero = ps[0]["name"] if ps else "?"
     print(f"\n=== Elo ({out}, {zero} = 0) ===", flush=True)
@@ -390,13 +298,12 @@ def main():
     ap.add_argument("runs", nargs="+", help="one or more run directories")
     ap.add_argument("--out", dest="dest", default=None,
                     help="where to write ladder.json (default: the first run directory)")
-    ap.add_argument("--games", type=int, default=300, help="paired games per pairing")
-    ap.add_argument("--focus", default="",
-                    help="comma list of players whose pairings get --focus-games")
-    ap.add_argument("--focus-games", type=int, default=0,
-                    help="paired games between two focus players (default: --games)")
+    ap.add_argument("--games", type=int, default=100, help="games per curve/anchor edge")
+    ap.add_argument("--comparison-games", type=int, default=0,
+                    help="games for final-vs-control comparisons (default: --games)")
     ap.add_argument("--temp", type=float, default=2.0)
-    ap.add_argument("--random-draft", action="store_true")
+    ap.add_argument("--fixed-draft", action="store_true",
+                    help="evaluate the starter matchup instead of random drafts")
     ap.add_argument("--refs", default="greedy",
                     help="comma list of fixed reference bots, or empty for none. "
                          "The first is pinned at 0. Greedy is the only one worth "
@@ -412,11 +319,11 @@ def main():
     ap.add_argument("--gpu", action="store_true",
                     help="two solve services (CUDA 0/1), one per pairing side")
     args = ap.parse_args()
-    cfgs = [json.load(open(f"{d}/log.json")).get("cfg", {}) for d in args.runs]
+    comparisons = [(args.runs[0], r) for r in args.runs[1:]]
     run(args.runs, out=args.dest, games=args.games,
-        focus=[x for x in args.focus.split(",") if x], focus_games=args.focus_games,
+        comparisons=comparisons, comparison_games=args.comparison_games,
         temp=args.temp,
-        random_draft=args.random_draft or any(c.get("random_draft", False) for c in cfgs),
+        random_draft=not args.fixed_draft,
         seed=args.seed,
         refs=tuple(x for x in args.refs.split(",") if x),
         labels=args.labels.split(",") if args.labels else None,

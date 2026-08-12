@@ -56,7 +56,7 @@ pull)
     # of the weights.
     mkdir -p "$here/runs"
     rsync -az -e "ssh ${ssh_opts[*]}" \
-        --include '*/' --include '*.html' --include 'log.json' \
+        --include '*/' --include '*.html' --include 'plotly.min.js' --include 'log.json' \
         --include 'ladder.json' --include 'config.json' --include 'NOTES.md' \
         --exclude '*' "root@$host:$remote/runs/" "$here/runs/"
     echo "pulled reports into $here/runs"
