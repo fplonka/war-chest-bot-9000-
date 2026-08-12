@@ -29,8 +29,7 @@ class Cfg:
     # ------------------------------------------------------------- schedule
     minutes: float = 60.0
     # The greedy warm phase, in minutes. Its data is discarded at the handover.
-    # The warm experiment holds the ReBeL phase at 25 minutes and varies this.
-    warm_minutes: float = 5.0
+    warm_minutes: float = 2.0
     snapshots: int = 3             # evenly spaced over the ReBeL phase, last at the end
     init_weights: str = ""         # optional weights; this is not training resume
 
