@@ -53,11 +53,14 @@ sync)
     ;;
 pull)
     # Reports, logs and ladders: everything needed to read a result, and none
-    # of the weights.
+    # of the weights. `train.log` comes too -- it is where a crash traceback
+    # lands, and a run that died is exactly the one you cannot inspect if the
+    # only copy stays on a rented box.
     mkdir -p "$here/runs"
     rsync -az -e "ssh ${ssh_opts[*]}" \
         --include '*/' --include '*.html' --include 'plotly.min.js' --include 'log.json' \
         --include 'ladder.json' --include 'config.json' --include 'NOTES.md' \
+        --include 'train.log' \
         --exclude '*' "root@$host:$remote/runs/" "$here/runs/"
     echo "pulled reports into $here/runs"
     ;;
@@ -66,7 +69,13 @@ build)
     # dies at startup. `python` must be repeated: --features replaces the
     # pyproject list rather than adding to it, and without pyo3 maturin builds
     # a cffi module instead.
-    run_remote "cd engine && maturin develop --release --features python,gpu 2>&1 | tail -2"
+    #
+    # `rsync -a` preserves mtimes, so checking out an older commit here and
+    # syncing back leaves sources *older* than `target/` and cargo rebuilds
+    # nothing. That silently runs the previous commit's binary and reports it
+    # under this commit's sha, which is how a bisect measures the wrong thing.
+    run_remote "find engine/src engine/tests engine/examples -type f -exec touch {} +
+cd engine && maturin develop --release --features python,gpu 2>&1 | tail -2"
     ;;
 tail)
     run_remote "tail -f /workspace/logs/${2:?usage: tail <tag>}.log"

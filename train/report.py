@@ -64,7 +64,12 @@ def read(run):
            "epochs": [e for e in log["epochs"]
                       if e["phase"] == "rebel" and e.get("solves", 0) > 0
                       and e.get("steps", 1) > 0],
-           "snaps": log.get("snapshots", []), "ladder": None}
+           "snaps": log.get("snapshots", []), "ladder": None,
+           # The warm phase is not plotted -- different objective, different
+           # target scale -- but how well it fitted decides how expensive every
+           # ReBeL solve is, so its last epoch is kept for the summary.
+           "warm_end": next((e for e in reversed(log["epochs"])
+                             if e["phase"] == "greedy"), None)}
     try:
         with open(f"{run}/ladder.json") as f:
             out["ladder"] = json.load(f)
@@ -228,6 +233,17 @@ def panels(runs):
                          [(tag(r), mins(r), [e["loss"] for e in r["epochs"]], True)
                           for r in runs]))
 
+    # Raw loss is not comparable across phases or runs, because the targets it
+    # is measured against change scale: the greedy warm phase has a target std
+    # near 0.5 and ReBeL settles nearer 0.2, so a falling loss can be nothing
+    # but a shrinking target. Dividing by the target variance gives the share
+    # of that variance the network fails to explain, which is scale-free and
+    # is what says whether a phase actually fitted.
+    unexplained = lambda e: e["loss"] / max(e["tgt_std"] ** 2, 1e-9)
+    out.append(panel("Unexplained target variance", "loss / target variance",
+                     [(tag(r), mins(r), [unexplained(e) for e in r["epochs"]], True)
+                      for r in runs], zero=True))
+
     out.append(panel("Spread of predictions", "std",
                      [(tag(r) or "prediction", mins(r),
                        [e["probe_std"] for e in r["epochs"]], True) for r in runs]
@@ -296,8 +312,11 @@ def health(r):
              ("buffer", f"{last['buf']:,}"),
              ("node-cap fallbacks", f"{tot('node_caps'):,}"),
              ("dropped solves", f"{tot('dropped'):,}"),
-             ("exact CPU fallbacks", f"{tot('exact_fallbacks'):,}"),
              ("games cut at horizon", f"{last['horizon_frac']:.1%}")]
+    warm = r.get("warm_end")
+    if warm:
+        cells.append(("warm fit left over",
+                      f"{warm['loss'] / max(warm['tgt_std'] ** 2, 1e-9):.1%}"))
     if "effective_train_ratio" in last:
         cells += [("effective train ratio", f"{last['effective_train_ratio']:.3f}"),
                   ("gradient clipped", f"{last['grad_clip_frac']:.1%}"),

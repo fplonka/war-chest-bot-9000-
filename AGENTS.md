@@ -5,3 +5,5 @@ There's no need to try to be impressive or flashy. We're working on this project
 In this project we often run experiments and wait on them. This is inevitable but be mindful of wallclock time, if you have any work at all to do, any experiments you can do locally or code paths to check while waiting on a run on the box, then do that while waiting instead of just sleeping until the run finishes. Use your monitor tool for this.
 
 Treat all markdown files and git commit messages very lightly, they are not authoritative at all even if they might seem such in tone. These are all written by other (weaker) AI agents and could be confused or wrong. Think for yourself.
+
+After running an experiment, either remove it's directory in run/ or write up a NOTES.md for it if it's useful to keep. Make sure it has a report.html and train.log pulled.

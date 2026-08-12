@@ -292,9 +292,6 @@ pub struct Data {
     pub oversize_routes: usize,
     /// Oversized solves that drained and trimmed every lane on one card.
     pub card_exclusive_routes: usize,
-    /// GPU submissions retried by the exact CPU solver after an unexpected
-    /// device error. Oversize jobs normally complete on the serialized GPU path.
-    pub exact_fallbacks: usize,
     /// Live games intentionally discarded at a wall-clock deadline. This is
     /// time-censored work, not a capacity drop and never enters replay.
     pub censored_games: usize,
@@ -386,7 +383,6 @@ impl Data {
         self.dropped += o.dropped;
         self.oversize_routes += o.oversize_routes;
         self.card_exclusive_routes += o.card_exclusive_routes;
-        self.exact_fallbacks += o.exact_fallbacks;
         self.censored_games += o.censored_games;
         self.wins[0] += o.wins[0];
         self.wins[1] += o.wins[1];
@@ -1247,72 +1243,6 @@ impl<'a> Game<'a> {
         self.data.card_exclusive_routes += result.card_exclusive_route as usize;
     }
 
-    /// Rebuild and solve a pending GPU job on the verified CPU path. This is
-    /// deliberately serialized by the caller: an oversize solve is rare, but
-    /// allowing several of its multi-gigabyte arenas at once would merely move
-    /// the capacity failure from device memory to host memory.
-    #[cfg(feature = "gpu")]
-    pub fn retry_cpu(&mut self, nets: &'a [Nets]) {
-        // Release the packed GPU representation before allocating the CPU CFR
-        // arenas. The worker has normally taken `pending_job` already; keep the
-        // take here so direct callers cannot accidentally retain it.
-        self.pending_job.take();
-        self.pending_walk.take().expect("pending walk tree");
-        let roots_v = self.pending_roots.take().expect("pending roots");
-        let oversize = std::mem::take(&mut self.pending_oversize);
-        let player = self.pending_player;
-        let Agent::Rebel { cfg, slot } = self.gc.agents[player as usize] else {
-            panic!("GPU retry requested for a non-ReBeL agent");
-        };
-        let scfg = Cfg {
-            snapshots: self.gc.collect == Collect::Rebel,
-            gpu_build: false,
-            ..cfg
-        };
-        let mut sv = Solver::new(&self.s, self.ctx, &nets[slot], scfg, self.bel.clone());
-        assert!(
-            !sv.capped(),
-            "a GPU job that passed the node cap capped on its exact CPU retry"
-        );
-        sv.warm_start(scfg.warm);
-        sv.multistep(cfg.iters);
-        if self.gc.collect == Collect::Rebel {
-            self.data.begin_solve();
-            let vals = sv.value_under(&roots_v);
-            for (r, v) in roots_v.iter().zip(&vals) {
-                self.data.push_value(
-                    &self.s,
-                    &self.ctx,
-                    &[
-                        Belief {
-                            cfg: self.bel[0].cfg.clone(),
-                            p: r[0].clone(),
-                        },
-                        Belief {
-                            cfg: self.bel[1].cfg.clone(),
-                            p: r[1].clone(),
-                        },
-                    ],
-                    [&v[0], &v[1]],
-                );
-            }
-            self.data
-                .push_policy(&sv, &self.ctx, self.data.nv - 1, player);
-        }
-        self.carried.clear();
-        self.walk = Some(Walk {
-            tree: WalkState::Cpu(sv),
-            slot,
-            explorer: self.pending_explorer,
-            node: 0,
-            drawn: 0,
-            strat: Vec::new(),
-            carries: None,
-        });
-        self.data.exact_fallbacks += 1;
-        self.data.oversize_routes += oversize as usize;
-    }
-
     /// The game ended: blend the outcome into the parked targets, fill the
     /// aux heads, and return the result from White's point of view.
     pub fn finish(&mut self) -> f32 {
@@ -1657,7 +1587,6 @@ pub fn run_games_gpu_until(
     deadline: Option<std::time::Instant>,
 ) -> Data {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    static EXACT_FALLBACK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     // Live games per worker: one solving on the GPU while another builds its
     // tree on the CPU. More than two is worth it whenever the service is the
     // bottleneck — the resident live set is `workers * per`, and a bigger live
@@ -1770,14 +1699,12 @@ pub fn run_games_gpu_until(
                             out.censored_games += 1;
                             continue;
                         }
-                        match res {
-                            Ok(trip1) => game[k].as_mut().expect("pending game").resume(trip1),
-                            Err(e) => {
-                                eprintln!("gen: exact CPU retry after GPU error: {e}");
-                                let _exclusive = EXACT_FALLBACK.lock().unwrap();
-                                game[k].as_mut().expect("pending game").retry_cpu(nets);
-                            }
-                        }
+                        // A refused or failed solve is a bug in admission or in
+                        // the device, and there is no second path to hide it
+                        // behind: the exact CPU retry used to serialize the
+                        // whole run behind one multi-gigabyte rebuild.
+                        let trip1 = res.unwrap_or_else(|e| panic!("GPU solve failed: {e}"));
+                        game[k].as_mut().expect("pending game").resume(trip1);
                     }
                     out
                 })

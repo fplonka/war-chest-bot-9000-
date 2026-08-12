@@ -624,8 +624,10 @@ count alone does not describe it. Schedule by the full work vector:
 - large jobs get a lower-count large wave;
 - a whale gets an exclusive lane and explicit host/device byte credits;
 - a job too wide for the preferred compact indices uses the wide contract;
-- an exact CPU fallback is allowed only as a measured last resort and is
-  counted separately.
+- a refused or failed solve is a hard error. There is no exact CPU fallback:
+  it rebuilt multi-gigabyte arenas behind a global mutex, so the "last
+  resort" serialized the whole run, and a path that only runs when something
+  is already wrong is a path nothing measures.
 
 Capacity refusal never abandons a game. If the 200,000-node build cap is truly
 hit, preserve the existing uniform-policy fallback and count it as
@@ -715,7 +717,7 @@ At one-second and rolling-ten-second resolution, log:
   is not mistaken for an architecture regression;
 - trainer sample/expand/forward/backward/optimizer time and credit debt;
 - weight version and age in solves/seconds;
-- horizon games, real node caps, oversize routes, exact fallbacks, and drops;
+- horizon games, real node caps, oversize routes, and drops;
 - p50/p95/p99/max tree and output dimensions.
 
 No phase may remain in an unlabelled gap between `gen_s` and `train_s`.

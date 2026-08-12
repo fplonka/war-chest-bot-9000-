@@ -533,30 +533,40 @@ def main():
     # CUDA step itself needs one Python feeder thread. A contended frozen-data
     # profile held 101 ms/step with this limit, while the first integrated
     # smoke with two threads reported roughly 250 ms/step.
-    torch.set_num_threads(1 if args.gpu else (os.cpu_count() or 8))
-    if args.gpu:
-        torch.set_num_interop_threads(1)
-        # Ampere's normal high-throughput float32 GEMM path. Parameters, loss
-        # reductions, gradients, and Adam state remain FP32; only the internal
-        # matrix products may use TF32. Exact scalar-CPU last bits are not a
-        # training requirement, and this setting is recorded in log.json.
-        torch.set_float32_matmul_precision("high")
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+    # Ampere's normal high-throughput float32 GEMM path. Parameters, loss
+    # reductions, gradients, and Adam state remain FP32; only the internal
+    # matrix products may use TF32. Exact scalar-CPU last bits are not a
+    # training requirement, and this setting is recorded in log.json.
+    torch.set_float32_matmul_precision("high")
     args.matmul_precision = torch.get_float32_matmul_precision()
     rng = np.random.default_rng(args.seed)
     dev = torch.device(args.device)
-    if args.gpu and dev.type == "cuda":
-        # Triton launches on PyTorch's current device. Pin it before the Rust
-        # services create their independent contexts for both solve cards.
-        torch.cuda.set_device(dev)
-        if args.train_stream_priority > 0:
-            raise SystemExit("train_stream_priority must be zero or negative")
-        if args.train_stream_priority < 0:
-            default_stream = torch.cuda.current_stream(dev)
-            train_stream = torch.cuda.Stream(
-                device=dev, priority=args.train_stream_priority)
-            train_stream.wait_stream(default_stream)
-            torch.cuda.set_stream(train_stream)
-            print(f"[train] CUDA stream priority {args.train_stream_priority}", flush=True)
+    # There is one production path: solve lanes on the cards, ReBeL generated
+    # by the continuous stream. Anything the stream cannot do is a feature to
+    # implement on it, not a reason to fall back to a slower route.
+    if dev.type != "cuda":
+        raise SystemExit(f"device must be a CUDA device, got {args.device!r}")
+    if args.aux != 0.0 or args.policy != 0.0:
+        raise SystemExit("the aux and policy heads are not implemented on the "
+                         "GPU stream; implement them there rather than adding a path")
+    if args.warm != 0.0:
+        raise SystemExit("policy-head warm start is not implemented on the GPU stream")
+    if args.train_gen_ratio <= 0.0:
+        raise SystemExit("train_gen_ratio must be positive")
+    # Triton launches on PyTorch's current device. Pin it before the Rust
+    # services create their independent contexts for both solve cards.
+    torch.cuda.set_device(dev)
+    if args.train_stream_priority > 0:
+        raise SystemExit("train_stream_priority must be zero or negative")
+    if args.train_stream_priority < 0:
+        default_stream = torch.cuda.current_stream(dev)
+        train_stream = torch.cuda.Stream(
+            device=dev, priority=args.train_stream_priority)
+        train_stream.wait_stream(default_stream)
+        torch.cuda.set_stream(train_stream)
+        print(f"[train] CUDA stream priority {args.train_stream_priority}", flush=True)
 
     towers = lambda s: [int(x) for x in s.split(",") if x.strip()] or None
     value = Mlp(args.hidden, args.dg, args.rank, args.de,
@@ -576,24 +586,19 @@ def main():
     next_decay = 0
     value.push(0)
     gpu_devices = [int(x) for x in args.gpu_devices.split(",") if x.strip()]
-    if args.gpu:
-        dims, w, b, ln = value.dims, *value.flat()
-        warchest.gpu_start(dims, w, b, ln, devices=gpu_devices)
-        print(f"[gpu] solve services up on {gpu_devices}", flush=True)
+    dims, w, b, ln = value.dims, *value.flat()
+    warchest.gpu_start(dims, w, b, ln, devices=gpu_devices)
+    print(f"[gpu] solve services up on {gpu_devices}", flush=True)
     # Buffer capacity is the knob the data-scaling curve points at, so every
     # byte per row is a row we cannot hold. Public features are float16; counts
     # are the uint8 they already are; probabilities and targets live in [-1, 1]
     # where float16 resolves to ~0.001, a fiftieth of the network's own error.
     buf = Buffer(args.cap, args.cap * args.cfgs_per_row)
-    batcher = make_batch
-    if args.gpu:
-        # Compile the compact replay expanders before the run clock starts.
-        # CPU/offline tools keep the Rust/numpy path as an independent oracle.
-        import gpu_batch
-        gpu_batch.warmup(dev)
-        batcher = gpu_batch.make_batch
-
-    gen_box = None
+    # Compile the compact replay expanders before the run clock starts.
+    # CPU/offline tools keep the Rust/numpy path as an independent oracle.
+    import gpu_batch
+    gpu_batch.warmup(dev)
+    batcher = gpu_batch.make_batch
     total = args.minutes * 60.0
     warm = args.warm_minutes * 60.0
     if not 0.0 <= warm <= total:
@@ -655,13 +660,6 @@ def main():
         and immutable GPU weights are published on a fixed step cadence."""
         nonlocal probe, cap_v, next_decay, next_snap, epoch, rebel_solves, rebel_rows
 
-        if args.aux != 0.0 or args.policy != 0.0:
-            raise ValueError("continuous GPU generation requires aux=0 policy=0")
-        if args.warm != 0.0:
-            raise ValueError("the v5 GPU executor requires --warm 0")
-        if args.train_gen_ratio <= 0.0:
-            raise ValueError("--train-gen-ratio must be positive")
-
         gen = warchest.gpu_stream_start(
             args.seed * 1_000_003 + epoch,
             depth=args.depth, iters=args.iters, explore=args.explore,
@@ -681,7 +679,7 @@ def main():
         next_report = time.time() + 10.0
         counter_names = (
             "games", "decisions", "horizon_hits", "node_caps",
-            "oversize_routes", "card_exclusive_routes", "exact_fallbacks", "censored_games",
+            "oversize_routes", "card_exclusive_routes", "censored_games",
             "dropped", "configs")
         totals = {name: 0 for name in counter_names}
         window = {name: 0 for name in counter_names}
@@ -698,11 +696,11 @@ def main():
         def emit_report(now):
             nonlocal probe, epoch
             elapsed = max(now - rebel_t0, 1e-9)
-            debt = max(0.0, args.train_gen_ratio * rebel_rows - optimizer_rows)
+            debt = max(0.0, args.train_gen_ratio * rebel_solves - optimizer_rows)
             credit = optimizer_rows / args.train_gen_ratio
             raw_sps = rebel_solves / elapsed
             raw_rps = rebel_rows / elapsed
-            balanced_rps = min(rebel_rows, credit) / elapsed
+            balanced_sps = min(rebel_solves, credit) / elapsed
             if probe is None and len(buf) >= 2048:
                 probe = batcher(buf.sample(2048, rng), rng, dev, False)
             with torch.no_grad():
@@ -734,7 +732,6 @@ def main():
                 "node_caps": window["node_caps"],
                 "oversize_routes": window["oversize_routes"],
                 "card_exclusive_routes": window["card_exclusive_routes"],
-                "exact_fallbacks": window["exact_fallbacks"],
                 "censored_games": window["censored_games"],
                 "dropped": window["dropped"],
                 "configs": round(window["configs"] / dec, 1),
@@ -743,7 +740,7 @@ def main():
                 "optimizer_steps": optimizer_steps,
                 "optimizer_rows": optimizer_rows,
                 "generated_rows": rebel_rows,
-                "effective_train_ratio": round(optimizer_rows / max(rebel_rows, 1), 4),
+                "effective_train_ratio": round(optimizer_rows / max(rebel_solves, 1), 4),
                 "optimizer_debt": round(debt, 1),
                 "publications": publications,
                 "weight_age_steps": optimizer_steps % publish_steps,
@@ -771,7 +768,7 @@ def main():
                 "buf": len(buf), "buf_s": round(buf.span_seconds(), 1),
                 "solves_per_s": round(raw_sps, 1),
                 "rows_per_s": round(raw_rps, 1),
-                "balanced_rows_per_s": round(balanced_rps, 1),
+                "balanced_solves_per_s": round(balanced_sps, 1),
                 "zero_sum_mean_abs": round(
                     window["zero_sum_abs"] / max(window["rows"], 1), 8),
                 "zero_sum_max": round(window["zero_sum_max"], 8),
@@ -788,7 +785,7 @@ def main():
             print(
                 f"[t={rec['t']:6.1f}s] rebel stream solves={rebel_solves} "
                 f"solves={raw_sps:.0f}/s rows={raw_rps:.0f}/s "
-                f"balanced_rows={balanced_rps:.0f}/s "
+                f"balanced_solves={balanced_sps:.0f}/s "
                 f"debt={debt:.0f} rows steps={optimizer_steps} "
                 f"over={totals['oversize_routes']} card={totals['card_exclusive_routes']} "
                 f"drop={totals['dropped']} "
@@ -857,7 +854,7 @@ def main():
                         totals[name] += v
                         window[name] += v
 
-                debt = max(0.0, args.train_gen_ratio * rebel_rows - optimizer_rows)
+                debt = max(0.0, args.train_gen_ratio * rebel_solves - optimizer_rows)
                 if debt >= args.batch and len(buf) >= args.batch:
                     until_publish = publish_steps - optimizer_steps % publish_steps
                     nsteps = min(int(debt // args.batch), until_publish)
@@ -906,7 +903,7 @@ def main():
                     emit_report(now)
                     next_report = now + 10.0
 
-                debt = max(0.0, args.train_gen_ratio * rebel_rows - optimizer_rows)
+                debt = max(0.0, args.train_gen_ratio * rebel_solves - optimizer_rows)
                 if done and debt < args.batch:
                     break
         finally:
@@ -922,18 +919,17 @@ def main():
         while time.time() < deadline:
             time.sleep(min(0.05, deadline - time.time()))
         elapsed = max(time.time() - rebel_t0, 1e-9)
-        debt = max(0.0, args.train_gen_ratio * rebel_rows - optimizer_rows)
+        debt = max(0.0, args.train_gen_ratio * rebel_solves - optimizer_rows)
         credit = optimizer_rows / args.train_gen_ratio
         raw_sps = rebel_solves / elapsed
         raw_rps = rebel_rows / elapsed
-        balanced_rps = min(rebel_rows, credit) / elapsed
+        balanced_sps = min(rebel_solves, credit) / elapsed
         print(
             f"[gpu-summary] solves={rebel_solves} rows={rebel_rows} "
-            f"optimizer_rows={optimizer_rows} ratio={optimizer_rows / max(rebel_rows, 1):.3f} "
+            f"optimizer_rows={optimizer_rows} ratio={optimizer_rows / max(rebel_solves, 1):.3f} "
             f"debt={debt:.0f} solves={raw_sps:.1f}/s rows={raw_rps:.1f}/s "
-            f"balanced_rows={balanced_rps:.1f}/s "
+            f"balanced_solves={balanced_sps:.1f}/s "
             f"over={totals['oversize_routes']} card={totals['card_exclusive_routes']} "
-            f"exact={totals['exact_fallbacks']} "
             f"censored={totals['censored_games']} dropped={totals['dropped']} "
             f"overrun={max(0.0, time.time() - deadline):.2f}s",
             flush=True)
@@ -969,10 +965,9 @@ def main():
             # the warm-started weights before the first ReBeL batch; otherwise
             # that whole batch runs on the freshly initialised network and the
             # first upload does not happen until after it returns.
-            if args.gpu:
-                flat = value.flat()
-                for device in gpu_devices:
-                    warchest.gpu_set_weights(value.dims, *flat, device=device)
+            flat = value.flat()
+            for device in gpu_devices:
+                warchest.gpu_set_weights(value.dims, *flat, device=device)
             next_snap = el + snap_gap
             # Drop the warm-phase data. Its job was to initialise the *network*,
             # not to serve as bootstrap targets: it comes from a different
@@ -995,52 +990,13 @@ def main():
             rebel_solves = 0
             rebel_rows = 0
             print(f"[t={el:6.1f}s] --- switching to ReBeL ---", flush=True)
-            if args.gpu and args.aux == 0.0 \
-                    and args.policy == 0.0 and args.warm == 0.0:
-                run_gpu_stream()
-                break
+            run_gpu_stream()
+            break
 
         tg = time.time()
         kw = dict(random_draft=args.random_draft)
-
-        def start_gen(gen_seed):
-            # One background thread; gpu_gen_data releases the GIL, so GPU 0
-            # generates the next batch while this thread trains on the last.
-            box = {}
-
-            def go():
-                box["d"] = warchest.gpu_gen_data(
-                    args.rebel_games, gen_seed, "rebel",
-                    depth=args.depth, iters=args.iters, explore=args.explore,
-                    temp=args.temp, eval_mix=args.eval_mix,
-                    cfr=args.cfr, warm=args.warm, **kw)
-
-            th = threading.Thread(target=go, daemon=True)
-            th.start()
-            return th, box
-
-        if phase == "greedy":
-            d = warchest.gen_data(args.warm_games, args.seed * 1_000_003 + epoch, "greedy",
-                                  temp=args.temp, eval_mix=args.eval_mix, **kw)
-        elif args.gpu:
-            # Generation overlaps training: batch N+1 is produced (from the
-            # weights published after batch N-1's training) while batch N
-            # trains. The service drains between calls, so a publication
-            # never lands mid-solve. One batch of weight staleness, same as
-            # ReBeL's periodic publication.
-            if gen_box is None:
-                gen_box = start_gen(args.seed * 1_000_003 + epoch)
-            th, box = gen_box
-            th.join()
-            d = box["d"]
-            flat = value.flat()
-            for device in gpu_devices:
-                warchest.gpu_set_weights(value.dims, *flat, device=device)
-            gen_box = start_gen(args.seed * 1_000_003 + epoch + 1)
-        else:
-            d = warchest.gen_data(args.rebel_games, args.seed * 1_000_003 + epoch, "rebel",
-                                  depth=args.depth, iters=args.iters, explore=args.explore,
-                                  cfr=args.cfr, warm=args.warm, **kw)
+        d = warchest.gen_data(args.warm_games, args.seed * 1_000_003 + epoch, "greedy",
+                              temp=args.temp, eval_mix=args.eval_mix, **kw)
         gen_s = time.time() - tg
         # Rows stay packed (raw bytes); the public encoding is expanded per
         # batch. Everything from here to `tt` used to sit in no timer at all, and it
@@ -1058,13 +1014,6 @@ def main():
         # Solve count remains useful as generation throughput telemetry; the
         # training ratio below is deliberately expressed in replay rows.
         solves = max(1, int(d["solves"]))
-        if phase == "rebel":
-            if rebel_t0 is None:
-                rebel_t0, rebel_solves, rebel_rows = time.time(), 0, 0
-            rebel_solves += solves
-            rebel_rows += len(rows)
-        sps = rebel_solves / max(time.time() - rebel_t0, 1e-9) if rebel_t0 else 0.0
-        rps = rebel_rows / max(time.time() - rebel_t0, 1e-9) if rebel_t0 else 0.0
         conv_s = time.time() - tr
         tr = time.time()
         buf.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
@@ -1077,13 +1026,13 @@ def main():
         tgt_mean, tgt_std = float(cy.mean()), float(cy.std())
 
         tt = time.time()
-        # Literal optimizer rows per generated replay row. Turbo produces
-        # several retained rows per solve, which made the old solve-based knob
-        # overstate its effective ratio by roughly eightfold.
-        steps = max(1, round(args.train_gen_ratio * len(rows) / args.batch))
+        # This loop is the greedy warm phase; ReBeL runs in `run_gpu_stream`.
+        # Its job is to fit the network to the handcrafted evaluation well
+        # enough that CFR is not searching on noise, so it gets its own ratio.
+        steps = max(1, round(args.train_gen_ratio * solves / args.batch))
         lv, lp, train_stat = train_steps(
-            value, opt, buf, steps, args.batch, rng, dev, aux_weight=args.aux,
-            policy_weight=(args.policy if phase == "rebel" else 0.0), d=d,
+            value, opt, buf, steps, args.batch, rng, dev, aux_weight=0.0,
+            policy_weight=0.0, d=d,
             augment=not args.no_augment, recent_mix=args.recent_mix,
             recent_rows=args.recent_rows, batch_fn=batcher)
         train_s = time.time() - tt
@@ -1143,12 +1092,11 @@ def main():
                "node_caps": int(d["node_caps"]),
                "oversize_routes": int(d.get("oversize_routes", 0)),
                "card_exclusive_routes": int(d.get("card_exclusive_routes", 0)),
-               "exact_fallbacks": int(d.get("exact_fallbacks", 0)),
                "dropped": int(d["dropped"]),
                "configs": round(d["configs"] / dec, 1), "cap_value": round(cap_v, 4),
                "steps": steps,
                "generated_rows": len(rows), "optimizer_rows": steps * args.batch,
-               "effective_train_ratio": round(steps * args.batch / max(len(rows), 1), 4),
+               "effective_train_ratio": round(steps * args.batch / max(solves, 1), 4),
                "grad_norm": round(train_stat.get("grad_norm_sum", 0.0) / max(steps, 1), 4),
                "grad_norm_max": round(train_stat.get("grad_norm_max", 0.0), 4),
                "grad_clip_frac": round(train_stat.get("grad_clipped", 0) / max(steps, 1), 4),
@@ -1159,8 +1107,6 @@ def main():
                "gen_s": round(gen_s, 2), "train_s": round(train_s, 2),
                "conv_s": round(conv_s, 2), "add_s": round(add_s, 2), "buf": len(buf),
                "buf_s": round(buf.span_seconds(), 1),
-               "solves_per_s": round(sps, 1),
-               "rows_per_s": round(rps, 1),
                "lr": opt.param_groups[0]["lr"]}
         log.append(rec)
         check_alive(args, rec, log[-2] if len(log) > 1 else None)
@@ -1173,12 +1119,11 @@ def main():
               f"dec={dec:6d} rows={len(rows):6d} horizon={rec['horizon_frac']:.2f} "
               f"nodecap={rec['node_caps']} over={rec['oversize_routes']} "
               f"card={rec['card_exclusive_routes']} "
-              f"exact={rec['exact_fallbacks']} drop={rec['dropped']} "
+              f"drop={rec['dropped']} "
               f"cfgs={rec['configs']:5.1f} L={lv:.5f} P={lp:.3f} old={loss_old:.5f} new={loss_new:.5f} "
               f"tgt={tgt_mean:+.3f}/{tgt_std:.3f} pstd={probe_std:.3f} "
               f"capv={cap_v:.3f} lr={rec['lr']:.1e} gen={gen_s:.1f}s "
-              f"conv={conv_s:.1f}s add={add_s:.1f}s train={train_s:.1f}s "
-              f"sps={sps:.0f}",
+              f"conv={conv_s:.1f}s add={add_s:.1f}s train={train_s:.1f}s",
               flush=True)
         epoch += 1
 

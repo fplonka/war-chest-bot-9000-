@@ -2366,7 +2366,7 @@ fn cuda_preamble(l: &V3Layout) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "#define WAVE_BLOCK {}\n#define READOUT_LANE {}\n\
+        "#define WAVE_BLOCK {}\n\
          #define DE {}\n#define DG {}\n#define RK {}\n#define HEADW {}\n\
          #define HEADOUT {}\n#define H_STRIDE {}\n#define XD {}\n#define HF {}\n\
          #define NCARD {}\n#define NPUB {}\n#define NHMLP {}\n#define NSLOTL {}\n#define NRES {}\n\
@@ -2380,7 +2380,6 @@ fn cuda_preamble(l: &V3Layout) -> String {
          #define GR_INITIATIVE {}\n#define GR_INIT_MOVED {}\n#define GR_TO_ACT {}\n#define GR_PLIES {}\n\
          static __device__ const unsigned char HEX_LOCATION[N_HEXES] = {{{locations}}};\n",
         BLOCK,
-        u8::from(std::env::var_os("WARCHEST_READOUT_WARP").is_none()),
         l.de, l.dg, l.rank, l.head_in, l.head_out, h_stride(l), l.xdim(), l.hfeat(),
         l.card.len(), l.pub_lin.len(), l.hmlp.len(), l.slot.len(), l.res.len(),
         arr("CARDW", &card), arr("PUBW", &pubw), arr("HMLPW", &hmlp), arr("SLOTW", &slot),

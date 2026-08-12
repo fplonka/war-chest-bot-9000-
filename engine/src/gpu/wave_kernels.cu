@@ -13,7 +13,6 @@ namespace cg = cooperative_groups;
 #define NONE 0xffffffffu
 
 #define DG_CH ((DG + 31) / 32)
-#define RK_CH ((RK + 31) / 32)
 #define HEAD_CH ((HEADW + 31) / 32)
 
 typedef struct { unsigned int node, config; } Task;
@@ -682,6 +681,33 @@ extern "C" __global__ void head_act(const WaveDev* w, const WeightDev* wt,
     *x = fmaxf(*x + wt->hmlp_b[level][col], 0.0f);
 }
 
+// The opponent's belief-weighted mean leaf value. Half the sum of the two
+// seat means is the shift that makes a PBS zero-sum; this returns one of them.
+// Must match `search.rs::readout` and `value_net.py::ValueNet::forward` --
+// this is the third implementation of that arithmetic and the one production
+// solves with.
+__device__ __forceinline__ float opponent_mean(
+    const WaveDev* w, ReadTask q, int opp, const float* us) {
+    int lane = threadIdx.x & 31;
+    int nq = nc_of(w, q.node, opp);
+    const float* rq = AP(w, A_REACH) + reach_at(w, q.node, opp, 0);
+    float sq = 0.0f;
+    for (int c = lane; c < nq; c += 32) sq += rq[c];
+    sq = warp_sum(sq);
+    if (sq <= 0.0f) return 0.0f;
+    unsigned int qc0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + opp];
+    float acc = 0.0f;
+    for (int c = lane; c < nq; c += 32) {
+        unsigned int cfg = TP(w, unsigned int, T_ROW_CFG)[qc0 + c];
+        const float* g = AP(w, A_G) + (unsigned long long)cfg * (RK + 1);
+        float part = 0.0f;
+        #pragma unroll 8
+        for (int j = 0; j < RK; j++) part += us[j] * g[j];
+        acc += rq[c] * (part + g[RK]);
+    }
+    return warp_sum(acc) / sq;
+}
+
 extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
                                     int player) {
     int lane = threadIdx.x & 31;
@@ -708,7 +734,6 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
         for (int c = lane; c < n; c += 32) out[c] = u * orc;
         return;
     }
-#if READOUT_LANE
     // One config per lane, not one config per warp. The rank-64 dot used to
     // cost a five-step shuffle reduction *per config*, and a leaf carries
     // fifteen or so, so the warp spent most of its time reducing rather than
@@ -720,25 +745,13 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
     const float* ur = AP(w, A_U) + (unsigned long long)q.row * RK;
     for (int j = lane; j < RK; j += 32) us[j] = ur[j] + wt->wu_b[j];
     __syncwarp();
-    float centre = 0.0f;
-    for (int side = 0; side < 2; side++) {
-        int ns = nc_of(w, q.node, side);
-        const float* rs = AP(w, A_REACH) + reach_at(w, q.node, side, 0);
-        unsigned int cs = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + side];
-        float weighted = 0.0f, mass = 0.0f;
-        for (int c = lane; c < ns; c += 32) {
-            unsigned int cfg = TP(w, unsigned int, T_ROW_CFG)[cs + c];
-            const float* g = AP(w, A_G) + (unsigned long long)cfg * (RK + 1);
-            float raw = g[RK];
-            #pragma unroll 8
-            for (int j = 0; j < RK; j++) raw += us[j] * g[j];
-            weighted += rs[c] * raw;
-            mass += rs[c];
-        }
-        weighted = warp_sum(weighted);
-        mass = warp_sum(mass);
-        if (mass > 0.0f) centre += 0.5f * weighted / mass;
-    }
+    // Only the *opponent's* mean needs a pass of its own. This player's raw
+    // values are written to `out` below, which accumulates its own weighted
+    // sum on the way, so those rank-64 dots are paid once rather than twice.
+    // Computing both seat means up front costs a third more dots for nothing.
+    float opp_mean = opponent_mean(w, q, opp, us);
+    const float* rp = AP(w, A_REACH) + reach_at(w, q.node, player, 0);
+    float own_s = 0.0f, own_a = 0.0f;
     unsigned int c0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + player];
     for (int base = 0; base < n; base += 32) {
         int c = base + lane;
@@ -748,51 +761,14 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
         float part = 0.0f;
         #pragma unroll 8
         for (int j = 0; j < RK; j++) part += us[j] * g[j];
-        out[c] = (part + g[RK] - centre) * orc;
+        float raw = part + g[RK];
+        out[c] = raw;                 // raw for now; centred in the pass below
+        own_s += rp[c];
+        own_a += rp[c] * raw;
     }
-#else
-    const float* ur = AP(w, A_U) + (unsigned long long)q.row * RK;
-    float u[RK_CH];
-    #pragma unroll
-    for (int k = 0; k < RK_CH; k++) {
-        int j = (k << 5) + lane;
-        u[k] = j < RK ? ur[j] + wt->wu_b[j] : 0.0f;
-    }
-    float centre = 0.0f;
-    for (int side = 0; side < 2; side++) {
-        int ns = nc_of(w, q.node, side);
-        const float* rs = AP(w, A_REACH) + reach_at(w, q.node, side, 0);
-        unsigned int cs = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + side];
-        float weighted = 0.0f, mass = 0.0f;
-        for (int c = 0; c < ns; c++) {
-            unsigned int cfg = TP(w, unsigned int, T_ROW_CFG)[cs + c];
-            const float* g = AP(w, A_G) + (unsigned long long)cfg * (RK + 1);
-            float part = 0.0f;
-            #pragma unroll
-            for (int k = 0; k < RK_CH; k++) {
-                int j = (k << 5) + lane;
-                if (j < RK) part += u[k] * g[j];
-            }
-            float raw = warp_sum(part) + g[RK];
-            weighted += rs[c] * raw;
-            mass += rs[c];
-        }
-        if (mass > 0.0f) centre += 0.5f * weighted / mass;
-    }
-    unsigned int c0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + player];
-    for (int c = 0; c < n; c++) {
-        unsigned int cfg = TP(w, unsigned int, T_ROW_CFG)[c0 + c];
-        const float* g = AP(w, A_G) + (unsigned long long)cfg * (RK + 1);
-        float part = 0.0f;
-        #pragma unroll
-        for (int k = 0; k < RK_CH; k++) {
-            int j = (k << 5) + lane;
-            if (j < RK) part += u[k] * g[j];
-        }
-        part = warp_sum(part);
-        if (lane == 0) out[c] = (part + g[RK] - centre) * orc;
-    }
-#endif
+    float ss = warp_sum(own_s);
+    float centre = 0.5f * (opp_mean + (ss > 0.0f ? warp_sum(own_a) / ss : 0.0f));
+    for (int c = lane; c < n; c += 32) out[c] = (out[c] - centre) * orc;
 }
 
 // mode 0: CFR update using current strategy; mode 1: fixed final strategy.

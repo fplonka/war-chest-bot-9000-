@@ -146,7 +146,7 @@ def cmd_run(args):
         if not launch(cfg, out):
             raise SystemExit(f"[exp] {out} failed; experiment aborted")
         done.append(out)
-    judge(done, args.games, args.comparison_games, gpu=config.BASELINE.gpu, seed=args.seed,
+    judge(done, args.games, args.comparison_games, gpu=True, seed=args.seed,
           labels=None if args.labels == "all" else args.labels.split(","),
           fixed_draft=args.fixed_draft)
 

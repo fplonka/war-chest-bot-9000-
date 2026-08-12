@@ -55,7 +55,15 @@ class Cfg:
     batch: int = 1024
     lr: float = 1e-3
     lr_decay_frac: str = "0.33,0.67"   # halve the lr at these fractions of the ReBeL phase
-    train_gen_ratio: float = 0.5    # optimizer rows per generated replay row
+    # Optimizer rows per generated *solve*, in both phases. Not per replay row:
+    # ReBeL retains about eight rows per solve and the greedy warm phase
+    # retains one, so the same number in row units trains the warm phase
+    # eightfold weaker than the ReBeL phase. Solves are also the unit the
+    # throughput goal is written in. How well the warm phase fits is a
+    # throughput setting, not only a quality one -- see
+    # `docs/GPU_PERF_GOAL.md`, where an eightfold weaker warm phase costs a
+    # third of the solve rate.
+    train_gen_ratio: float = 4.0
     recent_mix: float = 0.5        # fraction of a batch drawn from the newest slice
     recent_rows: int = 400_000     # fixed across replay-capacity experiments
     # Replay capacity, in rows. At 48 configs per row, the preallocated row and
@@ -93,12 +101,13 @@ class Cfg:
     rebel_games: int = 48
 
     # ------------------------------------------------------------- hardware
-    # GPU 1 thermally throttles under sustained solves. GPU 0 holds 76-77 C
-    # with the trainer and solve service together, and generated 9% more rows
-    # than splitting those jobs across the cards in equal four-minute pilots.
-    device: str = "cuda:0"         # must carry an index; set_device rejects "cuda"
-    gpu: bool = True
-    gpu_devices: str = "0"          # GPU 1 thermally throttles under sustained solves
+    # Solve lanes on both cards, trainer on card 1. GPU 1 does run hotter (85 C
+    # against 72) and flags a power cap, but it holds 1875 MHz against card 0's
+    # 1800, so it is not the slower card. Equal six-minute pilots at 781c04e:
+    # 408 solves/s on both cards against 205 on one. Anything that proposes one
+    # card has to beat that number, not a temperature reading.
+    device: str = "cuda:1"         # must carry an index; set_device rejects "cuda"
+    gpu_devices: str = "0,1"
     gpu_workers: int = 36
     gpu_actors: int = 128
     gpu_inflight: int = 32
@@ -146,9 +155,9 @@ EXPERIMENTS = {
                  {"minutes": 27, "warm_minutes": 2},
                  {"minutes": 26, "warm_minutes": 1},
                  {"minutes": 25.5, "warm_minutes": 0.5}],
-    "ratio":    [{"minutes": 30, "train_gen_ratio": 0.5},
-                 {"minutes": 30, "train_gen_ratio": 1.0},
-                 {"minutes": 30, "train_gen_ratio": 2.0}],
+    "ratio":    [{"minutes": 30, "train_gen_ratio": 4.0},
+                 {"minutes": 30, "train_gen_ratio": 8.0},
+                 {"minutes": 30, "train_gen_ratio": 16.0}],
     # Does a short run rank changes the way a long one does? If it does, every
     # experiment above costs a quarter of what it costs today. Run this first.
     "cadence":  [{"minutes": 15}, {"minutes": 15, "cfr": "dcfr"},
