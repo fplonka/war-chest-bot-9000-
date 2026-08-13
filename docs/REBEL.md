@@ -18,11 +18,11 @@ pulls tensors back once per epoch.
 
 Two things are hidden in War Chest:
 
-* the **hand** — which coins were drawn this round;
-* the **identities of face-down discards** — the coin spent on Pass, Claim
-  Initiative or a Recruit payment is never revealed;
-* the **coin in flight** — the Warrior Priest's drawn coin, between the draw
-  and the forced play that must spend it.
+- the **hand** — which coins were drawn this round;
+- the **identities of face-down discards** — the coin spent on Pass, Claim
+Initiative or a Recruit payment is never revealed;
+- the **coin in flight** — the Warrior Priest's drawn coin, between the draw
+and the forced play that must spend it.
 
 Everything else is public, including every *count*. So a player's private state
 is exactly the triple `(hand, facedown, inflight)` — a `Config` — and the bag is
@@ -91,15 +91,18 @@ completed coin plays, so the micro-decisions inside one tactic ride free. A
 round-start draw is walked through rather than branched. Leaf values come from
 the value network.
 
-| | |
-|---|---|
-| solver | alternating-traverser CFR; the regret rule is a setting (below) |
-| leaf value | `v_net(PBS)[c] × (opponent's unnormalised reach)` — counterfactual |
-| network query | public features + both **normalised** reach vectors |
-| initial strategy | uniform; strategy sums seeded reach-weighted |
-| acting / belief propagation | the **reference strategy** — the CFR average at the end of the solve |
-| trajectory sampling | stop at a uniformly random iterate, act, then finish the solve before reading the target |
-| exploration | `random_action_prob` for a uniformly sampled player, redrawn each decision |
+
+|                             |                                                                                          |
+| --------------------------- | ---------------------------------------------------------------------------------------- |
+| solver                      | alternating-traverser CFR; the regret rule is a setting (below)                          |
+| leaf value                  | `v_net(PBS)[c] × (opponent's unnormalised reach)` — counterfactual                       |
+| network query               | public features + both **normalised** reach vectors                                      |
+| initial strategy            | uniform; strategy sums seeded reach-weighted                                             |
+| acting / belief propagation | the **reference strategy** — the CFR average at the end of the solve                     |
+| trajectory sampling         | stop at a uniformly random iterate, act, then finish the solve before reading the target |
+| exploration                 | `random_action_prob` for one explorer, drawn once per sampled subgame walk               |
+| exploratory branch          | belief propagates under the reference strategy; the true private world is never re-drawn |
+
 
 Three things differ from poker: action sets depend on the config; an action moves
 the information state (`trans` carries `(config, action) → config'`); actions are
@@ -119,13 +122,15 @@ implementations: accumulated *positive* regrets are multiplied by
 runs on `R + predict · r`, the regret just observed standing in for the one about
 to be seen.
 
-| name | alpha | beta | gamma | predict |
-|---|---|---|---|---|
-| `linear` | 1 | 1 | 1 | 0 |
-| `plus` (CFR+) | inf | -inf | 2 | 0 |
-| `dcfr` | 1.5 | 0 | 2 | 0 |
-| `pcfr` (PCFR+) | inf | -inf | 2 | 1 |
-| `sapcfr` (SAPCFR+) | inf | -inf | 2 | 1/3 |
+
+| name               | alpha | beta | gamma | predict |
+| ------------------ | ----- | ---- | ----- | ------- |
+| `linear`           | 1     | 1    | 1     | 0       |
+| `plus` (CFR+)      | inf   | -inf | 2     | 0       |
+| `dcfr`             | 1.5   | 0    | 2     | 0       |
+| `pcfr` (PCFR+)     | inf   | -inf | 2     | 1       |
+| `sapcfr` (SAPCFR+) | inf   | -inf | 2     | 1/3     |
+
 
 `beta = -inf` zeroes negative accumulated regret, which is regret matching+;
 `alpha = inf` leaves positive regret undiscounted. The default is `linear`.
@@ -139,12 +144,12 @@ drop configs and fail that assert.
 
 `Solver::nash_conv` returns two numbers.
 
-* `nash` — `Σ_p (BR_p − v_p)`, what a best response to the reference strategy
-  would gain. Zero exactly when the strategy is an equilibrium of the subgame it
-  induces. Absolute, so it compares regret rules against each other.
-* `zero_sum` — `v_0 + v_1` at the root. The network's final value layer removes
-  half the sum of the two belief-weighted means from both players, so this must
-  be zero up to floating-point error. A larger residual is a correctness failure.
+- `nash` — `Σ_p (BR_p − v_p)`, what a best response to the reference strategy
+would gain. Zero exactly when the strategy is an equilibrium of the subgame it
+induces. Absolute, so it compares regret rules against each other.
+- `zero_sum` — `v_0 + v_1` at the root. The network's final value layer removes
+half the sum of the two belief-weighted means from both players, so this must
+be zero up to floating-point error. A larger residual is a correctness failure.
 
 Both freeze the leaf values at the ones the reference strategy induces, so this
 is exploitability of the depth-limited game the reference defines, not of War
@@ -156,11 +161,11 @@ TurboReBeL's single-sample multi-iteration generation. One solve yields a
 training row per kept iterate instead of one row, all valued under the same
 reference strategy, so raising the iteration count stops costing data rate.
 
-* **Phase 1** runs the full solve.
-* **Phase 2** (`Solver::value_under`) computes the root value per config under
-  the reference strategy, once per carried belief.
-* `Solver::carried_beliefs` returns the belief at the walk's exit leaf under each
-  kept iterate; those become the next solve's roots.
+- **Phase 1** runs the full solve.
+- **Phase 2** (`Solver::value_under`) computes the root value per config under
+the reference strategy, once per carried belief.
+- `Solver::carried_beliefs` returns the belief at the walk's exit leaf under each
+kept iterate; those become the next solve's roots.
 
 Snapshots are thinned to the log-spaced iterates (0, 1, 2, 4, 8, …) plus the
 final one — the spread is in the early iterations — so a solve contributes ~9
@@ -293,10 +298,7 @@ and zero at the best action, so regret matching clamps every action to the floor
 and hands back a uniform strategy, destroying exactly what the seed exists to
 inject.
 
-`a_warm_start_does_not_move_the_fixed_point` pins the property that matters: the
-subgame's value is unique, so a warm-started solve and a cold one must agree once
-both converge. A seed that changed the answer would be biasing it rather than
-accelerating it, and a strength gate could not tell those apart.
+`a_warm_start_does_not_move_the_fixed_point` pins the property that matters: the subgame's value is unique, so a warm-started solve and a cold one must agree once both converge. A seed that changed the answer would be biasing it rather than accelerating it, and a strength gate could not telel those apart.
 
 Default 0 — off. `examples/solvererr.rs` takes a warm-start weight as its sixth
 argument and reports every regret rule cold and warm side by side; the decision
@@ -382,40 +384,44 @@ Nothing is compared, promoted or selected while a run is going.
 
 ## 7. Tests
 
-* `rebel_pbs.rs::features_do_not_leak_private_information` — swapping a player's
-  true config for any other consistent with the same public counts must not move
-  a feature.
-* `rebel_pbs.rs::a_solve_reads_only_the_beliefs` — solve the same public position
-  in two different worlds; root values and root strategy must agree bit for bit.
-* `rebel_pbs.rs::config_features_separate_every_config` and
-  `action_features_separate_every_action` — distinct configs, and distinct
-  actions, never share a feature vector.
-* `rebel_pbs.rs::the_value_function_separates_configs_sharing_a_hand` — configs
-  with the same hand and different face-down piles get different values and
-  different play.
-* `rebel_pbs.rs::belief_tracker_matches_brute_force` — the incremental tracker
-  against an exhaustive enumeration of every world consistent with the
-  observation sequence, to 1e-5 over tens of thousands of worlds. The brute-force
-  side goes through the engine only.
-* `rebel_solver.rs::subgame_solver_matches_tabular_cfr_on_micro_endgames` — the
-  solver against an independent vanilla CFR over world states, under every regret
-  rule. The game value is unique, so all must agree. Also checks NashConv is
-  non-negative, falls with iterations, and that reading a solve mid-flight leaves
-  it able to continue.
-* `train/test_parity.py` — the Rust network against PyTorch on the same weights.
-* `scenarios.rs` (36 cases) and `invariants.rs` — the engine itself.
+- `rebel_pbs.rs::features_do_not_leak_private_information` — swapping a player's
+true config for any other consistent with the same public counts must not move
+a feature.
+- `rebel_pbs.rs::a_solve_reads_only_the_beliefs` — solve the same public position
+in two different worlds; root values and root strategy must agree bit for bit.
+- `rebel_pbs.rs::config_features_separate_every_config` and
+`action_features_separate_every_action` — distinct configs, and distinct
+actions, never share a feature vector.
+- `rebel_pbs.rs::the_value_function_separates_configs_sharing_a_hand` — configs
+with the same hand and different face-down piles get different values and
+different play.
+- `rebel_pbs.rs::belief_tracker_matches_brute_force` — the incremental tracker
+against an exhaustive enumeration of every world consistent with the
+observation sequence, to 1e-5 over tens of thousands of worlds. The brute-force
+side goes through the engine only.
+- `rebel_solver.rs::subgame_solver_matches_tabular_cfr_on_micro_endgames` — the
+solver against an independent vanilla CFR over world states, under every regret
+rule. The game value is unique, so all must agree. Also checks NashConv is
+non-negative, falls with iterations, and that reading a solve mid-flight leaves
+it able to continue.
+- `train/test_parity.py` — the Rust network against PyTorch on the same weights.
+- `scenarios.rs` (36 cases) and `invariants.rs` — the engine itself.
+
+
 
 ## 8. Tools
 
-* `train/offline.py` — fits candidate architectures to a frozen replay dump.
-  Same data, same targets, so architectures compare exactly.
-* `train/diagnose.py` — how learnable a dump's targets are, model-free.
-* `examples/solvererr.rs` — regret rule × iteration count, by NashConv and by
-  target error against a converged reference.
-* `examples/featstats.rs` — the real range of every feature.
-* `examples/cfgvalue.rs` — how far the value separates configs.
-* `train/ladder.py` — sparse checkpoint graph and Bradley-Terry Elo.
-* `train/test_parity.py` — the Rust network against PyTorch, per seam.
+- `train/offline.py` — fits candidate architectures to a frozen replay dump.
+Same data, same targets, so architectures compare exactly.
+- `train/diagnose.py` — how learnable a dump's targets are, model-free.
+- `examples/solvererr.rs` — regret rule × iteration count, by NashConv and by
+target error against a converged reference.
+- `examples/featstats.rs` — the real range of every feature.
+- `examples/cfgvalue.rs` — how far the value separates configs.
+- `train/ladder.py` — sparse checkpoint graph and Bradley-Terry Elo.
+- `train/test_parity.py` — the Rust network against PyTorch, per seam.
+
+
 
 ## 9. Layout
 
@@ -433,3 +439,4 @@ train/truth.py          a frozen set of solved positions; any checkpoint's error
 train/config.py         every knob of a run, one object; the experiments we run
 train/exp.py            an experiment end to end: arms x seeds -> ladder -> report
 ```
+
