@@ -900,7 +900,10 @@ def main():
     for i in range(len(gpu_devices)):
         warchest.gpu_set_weights(value.dims, *flat, device=i)
     next_snap = (time.time() - t0) + snap_gap
+    # Warm-up initialises the network. Its Adam moments and its rows are a
+    # different objective; they must not steer ReBeL.
     buf.clear()
+    opt = torch.optim.Adam(value.parameters(), lr=args.lr)
     phase = "rebel"
     rebel_t0 = time.time()
     rebel_solves = 0
