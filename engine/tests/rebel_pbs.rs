@@ -665,11 +665,12 @@ fn a_subgame_of_only_terminal_leaves_solves() {
             depth: 2,
             iters: 8,
             snapshots: true,
+            keep_states: true,
             ..Default::default()
         };
         let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
         assert!(
-            sv.nodes.iter().all(|n| !n.leaf || n.s.is_terminal()),
+            sv.nodes.iter().zip(&sv.states).all(|(n, st)| !n.leaf || st.is_terminal()),
             "expected every leaf terminal"
         );
         sv.multistep(cfg.iters);

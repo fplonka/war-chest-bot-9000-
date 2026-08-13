@@ -177,6 +177,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
             depth: 8,
             iters: 500,
             snapshots: true,
+            keep_states: true,
             ..Default::default()
         };
         {
@@ -184,7 +185,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
             // If any leaf were non-terminal the (empty) network would silently
             // return zero and the comparison would be meaningless.
             assert!(
-                sv.nodes.iter().all(|n| !n.leaf || n.s.is_terminal()),
+                sv.nodes.iter().zip(&sv.states).all(|(n, st)| !n.leaf || st.is_terminal()),
                 "the whole remaining game must fit inside the subgame"
             );
             if sv.nodes.len() > 8_000 {
@@ -194,8 +195,9 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
             let mut outcomes: Vec<i32> = sv
                 .nodes
                 .iter()
-                .filter(|n| n.leaf && n.s.is_terminal())
-                .map(|n| (n.s.utility(0) * 1000.0) as i32)
+                .zip(&sv.states)
+                .filter(|(n, st)| n.leaf && st.is_terminal())
+                .map(|(_, st)| (st.utility(0) * 1000.0) as i32)
                 .collect();
             outcomes.sort_unstable();
             outcomes.dedup();
@@ -308,18 +310,26 @@ fn cfr_iteration_count_bias() {
                 depth: 8,
                 iters: 1,
                 snapshots: true,
+                keep_states: true,
                 ..Default::default()
             },
             bel.clone(),
         );
-        if !probe.nodes.iter().all(|n| !n.leaf || n.s.is_terminal()) || probe.nodes.len() > 8_000 {
+        if !probe
+            .nodes
+            .iter()
+            .zip(&probe.states)
+            .all(|(n, st)| !n.leaf || st.is_terminal())
+            || probe.nodes.len() > 8_000
+        {
             continue;
         }
         let mut o: Vec<i32> = probe
             .nodes
             .iter()
-            .filter(|n| n.leaf && n.s.is_terminal())
-            .map(|n| (n.s.utility(0) * 1000.0) as i32)
+            .zip(&probe.states)
+            .filter(|(n, st)| n.leaf && st.is_terminal())
+            .map(|(_, st)| (st.utility(0) * 1000.0) as i32)
             .collect();
         o.sort_unstable();
         o.dedup();
@@ -458,6 +468,7 @@ fn draw_pass_through_consistency() {
                 depth: 5,
                 iters: 80,
                 snapshots: true,
+                keep_states: true,
                 ..Default::default()
             },
             bel.clone(),
@@ -492,7 +503,7 @@ fn draw_pass_through_consistency() {
             // oracle applies `belief_after_draw` once per step, walking the
             // state alongside it.
             assert!(n.draw_steps >= 1, "a draw node covers at least one draw");
-            let mut ws = n.s.clone();
+            let mut ws = sv.states[i].clone();
             let mut b = Belief {
                 cfg: n.cfgs[me].to_vec(),
                 p: vec![1.0; n.cfgs[me].len()],
@@ -514,8 +525,8 @@ fn draw_pass_through_consistency() {
                 assert!((sum - 1.0).abs() < 1e-5, "draw row {} sums to {}", ci, sum);
             }
             assert_eq!(
-                sv.nodes[ch].s.hand_size(n.player),
-                n.s.hand_size(n.player) + n.draw_steps,
+                sv.states[ch].hand_size(n.player),
+                sv.states[i].hand_size(n.player) + n.draw_steps,
                 "each covered draw adds exactly one coin to the hand"
             );
         }
@@ -613,18 +624,11 @@ fn warrior_priest_draw_walks_through_the_tree() {
     let wp = ctx.slot_of[0][WARRIOR_PRIEST as usize] as u8;
     let sw = ctx.slot_of[0][SWORDSMAN as usize] as u8;
     assert_ne!(wp, sw);
+    // Hand size is public, so every config in the belief holds exactly the one
+    // coin the state shows. The draw's two children come from the bag.
     let mut c1 = Config::default();
     c1.hand[wp as usize] = 1;
-    let mut c2 = Config::default();
-    c2.hand[wp as usize] = 1;
-    c2.hand[sw as usize] = 1;
-    let bel = [
-        Belief {
-            cfg: vec![c1, c2],
-            p: vec![0.5, 0.5],
-        },
-        Belief::point(Config::default()),
-    ];
+    let bel = [Belief::point(c1), Belief::point(Config::default())];
     let mut sv = Solver::new(
         &s,
         ctx,
@@ -633,6 +637,7 @@ fn warrior_priest_draw_walks_through_the_tree() {
             depth: 2,
             iters: 8,
             snapshots: true,
+            keep_states: true,
             ..Default::default()
         },
         bel.clone(),
@@ -641,7 +646,7 @@ fn warrior_priest_draw_walks_through_the_tree() {
     // Find the WP draw node: a chance node whose state is a WarriorPriestDraw.
     let draws: Vec<usize> = (0..sv.nodes.len())
         .filter(|&i| {
-            sv.nodes[i].chance && matches!(sv.nodes[i].s.pending(), Cont::WarriorPriestDraw { .. })
+            sv.nodes[i].chance && matches!(sv.states[i].pending(), Cont::WarriorPriestDraw { .. })
         })
         .collect();
     assert_eq!(draws.len(), 1, "exactly one WP draw in the tree");
@@ -651,8 +656,8 @@ fn warrior_priest_draw_walks_through_the_tree() {
     assert_eq!(n.draw_steps, 1, "a WP draw is a single draw");
     // The child support must be exactly `belief_after_draw(set_pending=true)`,
     // in order — the invariant the self-play walk asserts at runtime.
-    let res = reserve(&n.s, n.player, &ctx);
-    let fu = faceup_counts(&n.s, n.player, &ctx);
+    let res = reserve(&sv.states[d], n.player, &ctx);
+    let fu = faceup_counts(&sv.states[d], n.player, &ctx);
     let oracle = belief_after_draw(
         &Belief {
             cfg: n.cfgs[n.player as usize].to_vec(),
@@ -681,7 +686,7 @@ fn warrior_priest_draw_walks_through_the_tree() {
     // The child is a WarriorPriestPlay decision node. Its actions come from
     // both in-flight coins and its per-config legality is that coin.
     let wpn = &sv.nodes[ch];
-    assert!(matches!(wpn.s.pending(), Cont::WarriorPriestPlay { .. }));
+    assert!(matches!(sv.states[ch].pending(), Cont::WarriorPriestPlay { .. }));
     assert!(!wpn.leaf && !wpn.chance);
     assert!(wpn.na() > 0);
     let me = wpn.player as usize;
@@ -717,9 +722,9 @@ fn warrior_priest_draw_walks_through_the_tree() {
 
     // Every non-terminal leaf is a MainPlay state.
     for i in 0..sv.nodes.len() {
-        if sv.nodes[i].leaf && !sv.nodes[i].s.is_terminal() {
+        if sv.nodes[i].leaf && !sv.states[i].is_terminal() {
             assert!(
-                matches!(sv.nodes[i].s.pending(), Cont::MainPlay),
+                matches!(sv.states[i].pending(), Cont::MainPlay),
                 "non-terminal leaf {} is not a MainPlay state",
                 i
             );

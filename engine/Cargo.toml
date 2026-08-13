@@ -29,6 +29,12 @@ prof = []
 # eagerly loads, even though the kernels themselves are source-compatible.
 gpu = ["dep:cudarc"]
 
+# Needs the CUDA feature; without this `cargo test` cannot even build the
+# examples, so the whole CPU suite fails on a machine with no GPU.
+[[example]]
+name = "wave_tape"
+required-features = ["gpu"]
+
 [[bin]]
 name = "bench"
 path = "src/bin/bench.rs"

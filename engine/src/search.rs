@@ -75,6 +75,13 @@ pub struct Cfg {
     /// neither allocated nor initialised — the device builds its own from
     /// the job, so doing it here too was pure allocation traffic.
     pub gpu_build: bool,
+    /// Keep each node's `State` in `Solver::states`, for tests that assert on
+    /// the tree's shape (every leaf terminal or a coin play, this node is a
+    /// Warrior Priest draw). The tree itself dropped the field because it was
+    /// 688 of a node's 1,136 bytes across 2,039 nodes for four read sites,
+    /// none in a hot loop — so this is off in every production path and the
+    /// vector stays empty there.
+    pub keep_states: bool,
 }
 
 impl Default for Cfg {
@@ -87,6 +94,7 @@ impl Default for Cfg {
             warm: 0.0,
             node_cap: 0,
             gpu_build: false,
+            keep_states: false,
         }
     }
 }
@@ -590,6 +598,8 @@ pub struct Solver<'a> {
     nets: &'a Nets,
     pub(crate) cfg: Cfg,
     pub nodes: Vec<TNode>,
+    /// Node states, parallel to `nodes`. Empty unless `Cfg::keep_states`.
+    pub states: Vec<State>,
     pub(crate) root_belief: [Belief; 2],
     /// Regrets and the current regret-matching iterate, flat by node over legal
     /// cells. Node `i` occupies `soff[i] .. soff[i + 1]`; within that range its
@@ -756,6 +766,7 @@ impl<'a> Solver<'a> {
             nets,
             cfg,
             nodes: take_nodes(),
+            states: Vec::new(),
             root_belief: belief,
             regret: Vec::new(),
             cur: Vec::new(),
@@ -983,6 +994,9 @@ impl<'a> Solver<'a> {
             leaf = mainplay;
         }
         let id = self.nodes.len();
+        if self.cfg.keep_states {
+            self.states.push(s.clone());
+        }
         let _tp = timed!(BPUSH);
         self.nodes.push(TNode {
             util: if leaf && s.is_terminal() {
