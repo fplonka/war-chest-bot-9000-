@@ -61,8 +61,8 @@ reshuffles at the same moment.
 
 **The Warrior Priest pair (units 18 and 54) is in the draft pool.** Its
 attribute triggers a private mid-round draw, so the private state is the
-triple `(hand, facedown, pending_coin)` — which coin the forced play must use.
-The pending coin is transient: it is set by the draw, cleared when the forced
+triple `(hand, facedown, inflight)` — the drawn coin waiting to be played.
+The in-flight coin is transient: it is set by the draw, cleared when the forced
 play resolves, and is always absent at a network-query boundary, so it never
 enters a replay row or the encoding.
 

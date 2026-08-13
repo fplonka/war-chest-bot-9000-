@@ -225,7 +225,7 @@ fn run_one(seed: u64) {
 }
 
 /// The same exhaustive-vs-incremental comparison on a draft with both Warrior
-/// Priests: private mid-round draws put `pending_coin` into the config, so the
+/// Priests: private mid-round draws put `inflight` into the config, so the
 /// belief update, the walk and the brute force all carry it.
 #[test]
 fn belief_tracker_matches_brute_force_with_warrior_priests() {
@@ -418,7 +418,7 @@ fn config_key_packing_has_headroom() {
             c.hand[k] = r.below(4) as u8;
             c.fd[k] = r.below(6) as u8;
         }
-        c.pending_coin = if r.next_u64() & 1 == 0 {
+        c.inflight = if r.next_u64() & 1 == 0 {
             None
         } else {
             Some(r.below(NSLOT) as u8)
@@ -432,12 +432,12 @@ fn config_key_packing_has_headroom() {
         // Same counts, different pending -> different key; equal -> equal.
         let mut d = c;
         assert_eq!(c.key(), d.key());
-        d.pending_coin = match c.pending_coin {
+        d.inflight = match c.inflight {
             None => Some(0),
             Some(p) if p + 1 < NSLOT as u8 => Some(p + 1),
             Some(_) => None,
         };
-        if c.pending_coin != d.pending_coin {
+        if c.inflight != d.inflight {
             assert_ne!(c.key(), d.key());
         }
     }
@@ -447,7 +447,7 @@ fn config_key_packing_has_headroom() {
         c.hand[k] = 3;
         c.fd[k] = 5;
     }
-    c.pending_coin = Some(NSLOT as u8 - 1);
+    c.inflight = Some(NSLOT as u8 - 1);
     assert!(c.key() < (1u64 << (64 - IDX_BITS)));
     // The hand width is two bits; `key`'s debug_assert is the overflow test
     // for a slot value of 4 or more (it fires in every debug test build).
@@ -916,7 +916,7 @@ fn config_counts_are_hand_facedown_bag() {
     let c = Config {
         hand: [1, 0, 2, 0, 0],
         fd: [2, 1, 0, 0, 1],
-        pending_coin: None,
+        inflight: None,
     };
     let mut cnt = [0u8; CCOUNTS];
     config_counts(&c, &reserve, &mut cnt);
@@ -1146,12 +1146,12 @@ fn from_pairs_keeps_zero_weight_configs() {
     let b = Config {
         hand: [1, 0, 0, 0, 0],
         fd: [0; NSLOT],
-        pending_coin: None,
+        inflight: None,
     };
     let c = Config {
         hand: [0; NSLOT],
         fd: [1, 0, 0, 0, 0],
-        pending_coin: None,
+        inflight: None,
     };
     let bel = Belief::from_pairs(vec![
         (b, 0.25),

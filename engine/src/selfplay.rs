@@ -49,7 +49,7 @@ const STARTER_BLACK: [u16; 4] = [1, 3, 8, 16]; // Archer, Cavalry, Lancer, Scout
 
 /// Draftable units. The Warrior Priest pair (ids 18 and 54) is included: their
 /// private mid-round draw puts "which coin must I now play" into the private
-/// state as `Config::pending_coin`, which the solver, belief filter and walk
+/// state as `Config::inflight`, which the solver, belief filter and walk
 /// all carry.
 pub const DRAFT_POOL: [u16; 19] = [
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 17, 18, 19, 52, 53, 54,

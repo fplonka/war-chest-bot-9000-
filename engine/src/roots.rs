@@ -11,7 +11,7 @@ use crate::state::{Cont, ContStack, State, CONT_CAP, N_PLAYERS, N_ZONES};
 use crate::units::N_UNITS;
 
 pub const ROOTS_MAGIC: u32 = 0x5710_7207;
-pub const ROOTS_VERSION: u32 = 1;
+pub const ROOTS_VERSION: u32 = 2;
 
 fn w8<W: Write>(w: &mut W, x: u8) -> std::io::Result<()> {
     w.write_all(&[x])
@@ -81,10 +81,9 @@ fn write_cont<W: Write>(w: &mut W, c: &Cont) -> std::io::Result<()> {
             w8(w, player)?;
             w8(w, rg_hex)
         }
-        WarriorPriestPlay { player, coin } => {
+        WarriorPriestPlay { player } => {
             w8(w, 10)?;
-            w8(w, player)?;
-            w8(w, coin)
+            w8(w, player)
         }
         _AttackPost { atk_hex } => {
             w8(w, 11)?;
@@ -119,7 +118,6 @@ fn read_cont<R: Read>(r: &mut R) -> std::io::Result<Cont> {
         },
         10 => WarriorPriestPlay {
             player: r8(r)?,
-            coin: r8(r)?,
         },
         11 => _AttackPost { atk_hex: r8(r)? },
         t => {
@@ -219,7 +217,7 @@ fn write_config<W: Write>(w: &mut W, c: &Config) -> std::io::Result<()> {
     for k in 0..NSLOT {
         w8(w, c.fd[k])?;
     }
-    w8(w, c.pending_coin.map_or(0xff, |p| p))?;
+    w8(w, c.inflight.map_or(0xff, |p| p))?;
     Ok(())
 }
 
@@ -232,7 +230,7 @@ fn read_config<R: Read>(r: &mut R) -> std::io::Result<Config> {
         c.fd[k] = r8(r)?;
     }
     let p = r8(r)?;
-    c.pending_coin = if p == 0xff { None } else { Some(p) };
+    c.inflight = if p == 0xff { None } else { Some(p) };
     Ok(c)
 }
 

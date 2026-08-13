@@ -668,13 +668,10 @@ fn warrior_priest_draw_walks_through_the_tree() {
         oracle.cfg,
         "post-draw support must equal belief_after_draw's, in order"
     );
-    // Every child carries a pending coin (no fizzle here: the bag is not
-    // empty), and every draw row is a proper distribution.
+    // Every child carries its drawn coin in flight (no fizzle here: the bag is
+    // not empty), and every draw row is a proper distribution.
     for c in sv.nodes[ch].cfgs[n.player as usize].iter() {
-        assert!(
-            c.pending_coin.is_some(),
-            "a WP draw child carries its pending coin"
-        );
+        assert!(c.inflight.is_some(), "a WP draw child carries its coin");
     }
     for ci in 0..n.draw.rows() {
         let sum: f32 = n.draw.row(ci).1.iter().sum();
@@ -682,14 +679,14 @@ fn warrior_priest_draw_walks_through_the_tree() {
     }
 
     // The child is a WarriorPriestPlay decision node. Its actions come from
-    // both pendings and its per-config legality is the pending match.
+    // both in-flight coins and its per-config legality is that coin.
     let wpn = &sv.nodes[ch];
     assert!(matches!(wpn.s.pending(), Cont::WarriorPriestPlay { .. }));
     assert!(!wpn.leaf && !wpn.chance);
     assert!(wpn.na() > 0);
     let me = wpn.player as usize;
     for (ci, c) in wpn.cfgs[me].iter().enumerate() {
-        let pend = c.pending_coin.expect("pending");
+        let pend = c.inflight.expect("in flight");
         for a in 0..wpn.na() {
             let legal = wpn
                 .legal_row(ci)
@@ -697,31 +694,24 @@ fn warrior_priest_draw_walks_through_the_tree() {
             assert_eq!(
                 legal,
                 wpn.aslot[a] == pend as i8,
-                "WP play legality must be the pending match"
+                "WP play legality must be the in-flight coin"
             );
         }
     }
-    // At least two distinct pendings are represented.
-    let mut pendings: Vec<u8> = wpn.cfgs[me]
-        .iter()
-        .map(|c| c.pending_coin.unwrap())
-        .collect();
-    pendings.sort_unstable();
-    pendings.dedup();
+    // At least two distinct drawn coins are represented.
+    let mut drawn: Vec<u8> = wpn.cfgs[me].iter().map(|c| c.inflight.unwrap()).collect();
+    drawn.sort_unstable();
+    drawn.dedup();
     assert!(
-        pendings.len() >= 2,
-        "expected both pendings in the support, got {:?}",
-        pendings
+        drawn.len() >= 2,
+        "expected both drawn coins in the support, got {:?}",
+        drawn
     );
 
-    // The forced play's children have no pending coin: it is cleared when the
-    // drawn coin is spent.
+    // The forced play's children hold nothing in flight: the coin is spent.
     for &c in wpn.child.iter() {
         for cc in sv.nodes[c].cfgs[me].iter() {
-            assert!(
-                cc.pending_coin.is_none(),
-                "the forced play clears the pending coin"
-            );
+            assert!(cc.inflight.is_none(), "the forced play spends the coin");
         }
     }
 

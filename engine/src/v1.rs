@@ -38,11 +38,10 @@ pub fn write_public_features_v1(s: &State, ctx: &Ctx, out: &mut [f32]) {
     // `pending_kind` below says *what kind* of trigger is open; without this it
     // does not say *whose*, and the Footman tactic can owe two at once.
     //
-    // Only the hex-valued payloads are encoded. `WarriorPriestPlay { coin }`
-    // carries a coin drawn privately, so encoding it would leak — which is the
-    // same reason `docs/REBEL.md` keeps the Warrior Priest out of the draft
-    // pool. `FootmanInstantDeploy`'s coin is public (a Recruit reveals the unit
-    // taken) and is encoded with the globals instead.
+    // Only the hex-valued payloads are encoded. The Warrior Priest's drawn coin
+    // lives in a private zone, so encoding it would leak. `FootmanInstantDeploy`'s
+    // coin is public (a Recruit reveals the unit taken) and is encoded with the
+    // globals instead.
     let mut pending_hexes = crate::state::HexSet(0);
     let mark = |h: u8, set: &mut crate::state::HexSet| {
         if (h as usize) < N_HEXES {

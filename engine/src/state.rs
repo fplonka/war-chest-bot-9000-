@@ -49,7 +49,11 @@ pub const Z_FACEUP: usize = 2;
 pub const Z_FACEDOWN: usize = 3;
 pub const Z_SUPPLY: usize = 4;
 pub const Z_ELIM: usize = 5;
-pub const N_ZONES: usize = 6;
+/// The Warrior Priest's drawn coin, between the draw and the forced play that
+/// must spend it. A one-coin private zone: its size is public (the pending
+/// node says whether a forced play is owed), its identity is not.
+pub const Z_INFLIGHT: usize = 6;
+pub const N_ZONES: usize = 7;
 
 pub const WHITE: u8 = 0;
 pub const BLACK: u8 = 1;
@@ -150,8 +154,9 @@ pub enum Cont {
     /// it, so the draw's apply re-installs the RoyalGuardChoice node.
     WarriorPriestDraw { player: u8, rg_hex: u8 },
     /// Warrior Priest forced play of the coin just drawn (any action using that
-    /// coin type; pass always legal). `coin` is the drawn unit index.
-    WarriorPriestPlay { player: u8, coin: u8 },
+    /// coin type; pass always legal). The coin itself is in `Z_INFLIGHT`, which
+    /// is where the play pays from — this node names no private information.
+    WarriorPriestPlay { player: u8 },
     /// Internal bookkeeping: after a deferred (RoyalGuard) attack resolves,
     /// queue the attacker's post-triggers. Never a decision node; consumed by
     /// advance() the instant it surfaces.
@@ -216,6 +221,11 @@ impl ContStack {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.n == 0
+    }
+    /// Continuations in resolution order (the stack's top first).
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = &Cont> {
+        self.v[..self.n as usize].iter().rev()
     }
 }
 
@@ -447,7 +457,7 @@ impl State {
         match &self.pending {
             Cont::Draw { player, .. } => *player,
             Cont::WarriorPriestDraw { player, .. } => *player,
-            Cont::WarriorPriestPlay { player, .. } => *player,
+            Cont::WarriorPriestPlay { player } => *player,
             Cont::RoyalGuardChoice { defender, .. } => *defender,
             _ => self.active,
         }

@@ -271,9 +271,9 @@ pub fn action_coin(a: &Action, s: &State) -> u8 {
 }
 
 /// The private actions available at a node, each tagged with the coin slot it
-/// spends and whether that coin goes face down. Only `MainPlay` nodes have
-/// config-dependent action sets; every other decision is public, so one call to
-/// `legal_actions` suffices there.
+/// spends and whether that coin goes face down. `MainPlay` and
+/// `WarriorPriestPlay` have config-dependent action sets; every other decision
+/// is public, so one call to `legal_actions` suffices there.
 ///
 /// Enumeration runs over the public *reserve*, which can offer a coin no config
 /// in `cfgs` actually holds; those actions are unreachable and are dropped, so
@@ -295,18 +295,31 @@ pub fn node_actions(
     // invariant, so one probe can be reconfigured for every slot instead of
     // cloning a 688-byte State per slot.
     let mut probe = *s;
-    if matches!(s.pending(), Cont::MainPlay) {
+    let forced = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
+    if matches!(s.pending(), Cont::MainPlay) || forced {
         let res = reserve(s, player, ctx);
         for k in 0..NSLOT {
             if res[k] == 0 {
                 continue;
             }
-            let mut one = Config::default();
-            one.hand[k] = 1;
-            set_config(&mut probe, player, ctx, &one);
-            if !cfgs.is_empty() && !cfgs.iter().any(|c| c.hand[k] > 0) {
+            if !cfgs.is_empty()
+                && !cfgs.iter().any(|c| {
+                    if forced {
+                        c.inflight == Some(k as u8)
+                    } else {
+                        c.hand[k] > 0
+                    }
+                })
+            {
                 continue;
             }
+            let mut one = Config::default();
+            if forced {
+                one.inflight = Some(k as u8);
+            } else {
+                one.hand[k] = 1;
+            }
+            set_config(&mut probe, player, ctx, &one);
             for a in probe.legal_actions() {
                 let key = a.encode();
                 if seen.contains(&key) {
@@ -319,44 +332,18 @@ pub fn node_actions(
                 } else {
                     ctx.slot_of[player as usize][coin as usize]
                 };
-                if slot >= 0 && !cfgs.is_empty() && !cfgs.iter().any(|c| c.hand[slot as usize] > 0)
+                if slot >= 0
+                    && !cfgs.is_empty()
+                    && !cfgs.iter().any(|c| {
+                        if forced {
+                            c.inflight == Some(slot as u8)
+                        } else {
+                            c.hand[slot as usize] > 0
+                        }
+                    })
                 {
                     continue;
                 }
-                aslot.push(slot);
-                fdown.push(is_facedown_play(&a));
-                acts.push(a);
-            }
-        }
-    } else if matches!(s.pending(), Cont::WarriorPriestPlay { .. }) {
-        // A forced play is config-dependent the same way a main play is: the
-        // legal set is a function of the config's pending coin. Probe one
-        // state per pending slot present in the support; the probe's pending
-        // node names the drawn unit so `legal_actions` lists exactly the plays
-        // of that coin.
-        for k in 0..NSLOT {
-            if !cfgs.is_empty() && !cfgs.iter().any(|c| c.pending_coin == Some(k as u8)) {
-                continue;
-            }
-            let mut one = Config::default();
-            one.hand[k] = 1;
-            set_config(&mut probe, player, ctx, &one);
-            probe.pending = Cont::WarriorPriestPlay {
-                player,
-                coin: ctx.slots[player as usize][k],
-            };
-            for a in probe.legal_actions() {
-                let key = a.encode();
-                if seen.contains(&key) {
-                    continue;
-                }
-                seen.push(key);
-                let coin = action_coin(&a, &probe);
-                let slot = if coin == NONE {
-                    -1
-                } else {
-                    ctx.slot_of[player as usize][coin as usize]
-                };
                 aslot.push(slot);
                 fdown.push(is_facedown_play(&a));
                 acts.push(a);
@@ -1112,9 +1099,6 @@ impl<'a> Solver<'a> {
         let na = acts.len();
         debug_assert!(na > 0, "a decision node must offer a reachable action");
 
-        // A Warrior Priest forced play may only spend the pending coin, so the
-        // per-config mask is the pending match rather than the hand check.
-        let wp_play = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
         let tcells = timed!(BCELLS);
         let mut legal_off = Vec::with_capacity(nc + 1);
         let mut legal_action = Vec::new();
@@ -1124,12 +1108,7 @@ impl<'a> Solver<'a> {
         legal_off.push(0);
         for (ci, c) in mine.iter().enumerate() {
             for a in 0..na {
-                let legal = if wp_play {
-                    c.pending_coin == Some(aslot[a] as u8)
-                } else {
-                    action_legal(c, aslot[a])
-                };
-                if legal {
+                if action_legal(c, aslot[a]) {
                     legal_action.push(a as u32);
                     legal_child.push(0);
                     legal_trans.push(NO_TRANS);
