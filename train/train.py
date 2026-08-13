@@ -36,6 +36,7 @@ import collections
 import dataclasses
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -437,6 +438,60 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
     return tot / steps, (ptot / steps if live else float("nan")), stat
 
 
+def physical_cpus():
+    """Lowest id in each hyperthread sibling group: one hardware thread per core."""
+    cores = set()
+    root = "/sys/devices/system/cpu"
+    if not os.path.isdir(root):
+        return cores
+    for name in os.listdir(root):
+        if not name.startswith("cpu") or not name[3:].isdigit():
+            continue
+        path = os.path.join(root, name, "topology", "thread_siblings_list")
+        try:
+            text = open(path).read().strip().replace("-", ",")
+        except OSError:
+            continue
+        ids = [int(x) for x in text.split(",") if x]
+        if ids:
+            cores.add(min(ids))
+    return cores
+
+
+def pin_one_thread_per_core():
+    if not hasattr(os, "sched_setaffinity"):
+        return
+    cores = physical_cpus()
+    if not cores:
+        return
+    os.sched_setaffinity(0, cores)
+    print(f"[cpu] pinned to {len(cores)} physical cores", flush=True)
+
+
+def refuse_if_machine_busy():
+    """Catch a second run started by accident."""
+    try:
+        raw = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used",
+             "--format=csv,noheader,nounits"], text=True, timeout=5)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        raw = ""
+    for line in raw.strip().splitlines():
+        bits = [b.strip() for b in line.split(",")]
+        if len(bits) != 3:
+            continue
+        idx, util, mem = bits[0], float(bits[1]), float(bits[2])
+        if util >= 25 or mem >= 2048:
+            raise SystemExit(
+                f"GPU {idx} is busy ({util:.0f}% util, {mem:.0f} MiB). "
+                "Another run already going?")
+    n = os.cpu_count() or 1
+    load = os.getloadavg()[0]
+    if load >= 0.5 * n:
+        raise SystemExit(
+            f"CPU load {load:.1f} on {n} CPUs. Another run already going?")
+
+
 def write_log(args, epochs, snaps):
     """The run's whole record: settings, per-epoch stats, snapshot manifest.
 
@@ -460,6 +515,7 @@ def main():
     args = dataclasses.replace(config.BASELINE, **over)
     args.git = config.git_sha()
     args.out = f"runs/{config.label(over)}"
+    refuse_if_machine_busy()
     if os.path.exists(args.out):
         raise SystemExit(f"{args.out} exists")
     os.makedirs(args.out)
@@ -475,6 +531,7 @@ def main():
             logf.flush()
     sys.stdout = sys.stderr = Tee()
     print(f"[train] {args.out} at {args.git} {over or 'baseline'}", flush=True)
+    pin_one_thread_per_core()
 
     torch.manual_seed(args.seed)
     torch.set_num_threads(1)
