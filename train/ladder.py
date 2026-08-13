@@ -1,11 +1,15 @@
-"""Play snapshots against Greedy (and each other's finals) and turn that into Elo.
+"""Rate snapshots by playing the informative pairs.
 
     python train/ladder.py runs/mine --games 100
     python train/ladder.py runs/a runs/b --games 100
 
-Every checkpoint plays Greedy. That is the curve: strength against a fixed
-bot, over training time. When several runs are named, their finals also play
-each other. Random drafts. Greedy is pinned at 0.
+A game against a much weaker opponent is almost no information (Fisher
+p(1-p) peaks at a coin flip). Consecutive snapshots start close, so they
+are the first pairings. The rest of the budget goes to whoever is closest
+in Elo right now — Swiss pairing, the same rule TrueSkill and Chatbot Arena
+use — and a pair that has already gone 80–20 is done.
+
+Greedy is pinned at 0. Random drafts.
 """
 
 import argparse
@@ -24,6 +28,7 @@ from export_weights import load
 
 PRIOR = 1.0
 SEARCH = {"depth": 2, "iters": 64, "cfr": "linear", "warm": 0.0}
+BATCH = 20  # even; eval_match plays this many as colour-swapped pairs
 
 
 def write_json(path, value):
@@ -81,20 +86,42 @@ def players_of(runs):
     return ps
 
 
-def edges(ps):
-    """Every net vs Greedy; finals vs finals when there is more than one."""
+def chain(ps):
+    """Greedy vs each run's first snapshot, then consecutive snapshots, then
+    finals across runs. The prior that nearby-in-time nets are close."""
     greedy = next(i for i, p in enumerate(ps) if p["agent"] == "greedy")
-    nets = [i for i, p in enumerate(ps) if p["agent"] == "rebel"]
-    out = [(i, greedy) for i in nets]
-    finals = [i for i in nets if ps[i]["final"]]
+    by_run = {}
+    for i, p in enumerate(ps):
+        if p["run"] is not None:
+            by_run.setdefault(p["run"], []).append(i)
+    out = []
+    for idxs in by_run.values():
+        idxs.sort(key=lambda i: ps[i]["t"] or 0)
+        out.append((greedy, idxs[0]))
+        out.extend(zip(idxs, idxs[1:]))
+    finals = [i for i, p in enumerate(ps) if p.get("final")]
     out.extend((finals[a], finals[b])
                for a in range(len(finals)) for b in range(a + 1, len(finals)))
-    return out
+    seen, uniq = set(), []
+    for i, j in out:
+        key = (min(i, j), max(i, j))
+        if i != j and key not in seen:
+            seen.add(key)
+            uniq.append((i, j))
+    return uniq
+
+
+def frozen(w, l, d):
+    n = w + l + d
+    if n < BATCH:
+        return False
+    s = (w + 0.5 * d) / n
+    return min(s, 1.0 - s) < 0.20
 
 
 def run(runs, games=100, gpu=False, seed=7):
     out = runs[0]
-    if games <= 0 or games % 2:
+    if games < 2 or games % 2:
         raise ValueError("games must be a positive even count")
     ps = players_of(runs)
     nets = [p for p in ps if p["agent"] == "rebel"]
@@ -113,16 +140,29 @@ def run(runs, games=100, gpu=False, seed=7):
         warchest.gpu_start(first.dims, *first.flat(), devices=[0, 1])
     warchest.set_cap_value(0.0)
 
-    plan = edges(ps)
-    print(f"[ladder] {len(ps)} players, {len(plan)} pairings, {games} games "
-          f"-> {len(plan) * games:,} games, about {len(plan) * games / 3 / 60:.0f} min",
-          flush=True)
-
     k = len(ps)
-    n = np.zeros((k, k))
-    sc = np.zeros((k, k))
-    pairs = []
-    for i, j in plan:
+    rec = {(i, j): [0, 0, 0] for i in range(k) for j in range(i + 1, k)}
+    budget = games * len(nets)
+    cap = games
+
+    def elo_now():
+        n = np.zeros((k, k))
+        sc = np.zeros((k, k))
+        for (i, j), (w, l, d) in rec.items():
+            if w + l + d == 0:
+                continue
+            n[i][j] = n[j][i] = w + l + d
+            sc[i][j], sc[j][i] = w + 0.5 * d, l + 0.5 * d
+        npr = n + PRIOR * (1 - np.eye(k)) * (n > 0)
+        spr = sc + 0.5 * PRIOR * (1 - np.eye(k)) * (n > 0)
+        if n.sum() == 0:
+            return np.zeros(k), n, sc
+        return fit_elo(npr, spr), n, sc
+
+    def play(i, j, n, tag):
+        n -= n % 2
+        if n < 2:
+            return 0
         a, b = ps[i], ps[j]
         if gpu:
             if a["agent"] == "rebel":
@@ -132,30 +172,62 @@ def run(runs, games=100, gpu=False, seed=7):
                 nb = by_slot[b["slot"]]
                 warchest.gpu_set_weights(nb.dims, *nb.flat(), device=1)
         sa, sb = a["search"], b["search"]
-        pair_seed = seed + 1000 * i + j
+        already = sum(rec[min(i, j), max(i, j)])
         w, l, d = warchest.eval_match(
-            games, pair_seed, a["agent"], b["agent"],
+            n, seed + 1009 * i + 101 * j + already, a["agent"], b["agent"],
             depth=sa["depth"], iters=sa["iters"], cfr=sa["cfr"], warm=sa["warm"],
-            temp=2.0, slot_a=a["slot"], slot_b=b["slot"],
-            random_draft=True,
+            temp=2.0, slot_a=a["slot"], slot_b=b["slot"], random_draft=True,
             depth_b=sb["depth"], iters_b=sb["iters"], gpu=gpu)
-        n[i][j] = n[j][i] = w + l + d
-        sc[i][j], sc[j][i] = w + 0.5 * d, l + 0.5 * d
-        pairs.append({"a": a["name"], "b": b["name"], "w": w, "l": l, "d": d,
-                      "n": w + l + d, "score": round((w + 0.5 * d) / max(w + l + d, 1), 3)})
-        print(f"  {a['name']:>28s} vs {b['name']:<28s} W{w:4d} L{l:4d} D{d:4d}  "
-              f"score {pairs[-1]['score']:.3f}", flush=True)
+        key = (min(i, j), max(i, j))
+        if i > j:
+            w, l = l, w
+        rec[key][0] += w
+        rec[key][1] += l
+        rec[key][2] += d
+        tw, tl, td = rec[key]
+        s = (tw + 0.5 * td) / (tw + tl + td)
+        print(f"  {tag:5s} {ps[key[0]]['name']:>24s} vs {ps[key[1]]['name']:<24s} "
+              f"W{w:3d} L{l:3d} D{d:3d}  n={tw + tl + td:3d}  score {s:.3f}"
+              f"{'  stop' if frozen(tw, tl, td) else ''}", flush=True)
+        return n
 
-    npr = n + PRIOR * (1 - np.eye(k)) * (n > 0)
-    spr = sc + 0.5 * PRIOR * (1 - np.eye(k)) * (n > 0)
-    elo = fit_elo(npr, spr)
-    se = elo_stderr(n, elo)
+    print(f"[ladder] {k} players, {budget} games ({BATCH}/batch, cap {cap}/pair)",
+          flush=True)
+    spent = 0
+    for i, j in chain(ps):
+        spent += play(i, j, min(BATCH, budget - spent, cap), "seed")
+        if spent >= budget:
+            break
+
+    while spent + 2 <= budget:
+        elo, _, _ = elo_now()
+        best, best_h = None, -1.0
+        for i in range(k):
+            for j in range(i + 1, k):
+                w, l, d = rec[i, j]
+                n = w + l + d
+                if n >= cap or frozen(w, l, d):
+                    continue
+                p = 1.0 / (1.0 + 10.0 ** ((elo[j] - elo[i]) / 400.0))
+                h = p * (1.0 - p)
+                if h > best_h:
+                    best, best_h = (i, j), h
+        if best is None:
+            break
+        n = min(BATCH, budget - spent, cap - sum(rec[best]))
+        spent += play(best[0], best[1], n, "swiss")
+
+    elo, nmat, sc = elo_now()
+    se = elo_stderr(nmat, elo)
+    pairs = [{"a": ps[i]["name"], "b": ps[j]["name"], "w": w, "l": l, "d": d,
+              "n": w + l + d, "score": round((w + 0.5 * d) / max(w + l + d, 1), 3)}
+             for (i, j), (w, l, d) in rec.items() if w + l + d]
     res = {"runs": list(runs), "games": games, "schedule_seed": seed,
            "draft_mode": "random",
            "players": [{"name": p["name"], "run": p["run"], "t": p["t"],
                         "search": p["search"], "elo": round(float(e), 1),
                         "se": round(float(s), 1),
-                        "score": round(float(sc[i].sum() / max(n[i].sum(), 1)), 3)}
+                        "score": round(float(sc[i].sum() / max(nmat[i].sum(), 1)), 3)}
                        for i, (p, e, s) in enumerate(zip(ps, elo, se))],
            "pairs": pairs}
     write_json(f"{out}/ladder.json", res)
