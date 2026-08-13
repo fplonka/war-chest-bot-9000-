@@ -1,0 +1,345 @@
+[train] runs/zsctl at a9b3044+dirty seed=1 {'minutes': 30.0, 'warm_minutes': 5.0, 'note': 'control: no projection, zero-sum violation instrumented'}
+[train] control: no projection, zero-sum violation instrumented
+[cpu] pinned to 36 physical cores
+[train] CUDA stream priority -1
+[gpu] solve services up on [0, 1]
+[cfg] PUBFEAT=897 CFEAT=16 hidden=384 head=384 dg=64 rank=64 depth=2 iters=64 budget=1800s warm=300s snapshot_every=6min device=cuda:1 draft=random train_gen_ratio=4.0 recent_mix=0.5/0.2 augment=True cap=2000000 matmul=high
+[t=   2.4s] greedy ep  0 games=  96 dec= 18968 rows= 18118 horizon=0.30 L=0.07957 L/var=0.34 tgt=-0.023/0.482 pstd=0.498 gen=0.1s train=2.1s
+[t=   4.2s] greedy ep  1 games=  96 dec= 18844 rows= 18051 horizon=0.33 L=0.03489 L/var=0.14 tgt=-0.058/0.494 pstd=0.498 gen=0.1s train=1.6s
+[t=   6.0s] greedy ep  2 games=  96 dec= 18181 rows= 17414 horizon=0.27 L=0.03048 L/var=0.12 tgt=-0.025/0.512 pstd=0.496 gen=0.1s train=1.6s
+[t=   7.7s] greedy ep  3 games=  96 dec= 17989 rows= 17120 horizon=0.26 L=0.02876 L/var=0.12 tgt=-0.029/0.495 pstd=0.480 gen=0.1s train=1.6s
+[t=   9.6s] greedy ep  4 games=  96 dec= 18823 rows= 18078 horizon=0.29 L=0.02304 L/var=0.10 tgt=-0.022/0.471 pstd=0.493 gen=0.1s train=1.7s
+[t=  11.5s] greedy ep  5 games=  96 dec= 18924 rows= 18146 horizon=0.33 L=0.02185 L/var=0.09 tgt=-0.029/0.496 pstd=0.501 gen=0.1s train=1.7s
+[t=  13.3s] greedy ep  6 games=  96 dec= 17615 rows= 16921 horizon=0.26 L=0.02184 L/var=0.08 tgt=-0.041/0.511 pstd=0.500 gen=0.1s train=1.6s
+[t=  15.2s] greedy ep  7 games=  96 dec= 18608 rows= 17786 horizon=0.36 L=0.01965 L/var=0.08 tgt=-0.065/0.495 pstd=0.491 gen=0.1s train=1.6s
+[t=  17.1s] greedy ep  8 games=  96 dec= 19040 rows= 18296 horizon=0.36 L=0.01765 L/var=0.08 tgt=-0.019/0.484 pstd=0.498 gen=0.1s train=1.7s
+[t=  18.9s] greedy ep  9 games=  96 dec= 18200 rows= 17459 horizon=0.27 L=0.01833 L/var=0.07 tgt=-0.034/0.513 pstd=0.506 gen=0.1s train=1.6s
+[t=  20.7s] greedy ep 10 games=  96 dec= 17927 rows= 17200 horizon=0.24 L=0.01837 L/var=0.07 tgt=-0.036/0.524 pstd=0.486 gen=0.1s train=1.6s
+[t=  22.5s] greedy ep 11 games=  96 dec= 17941 rows= 17162 horizon=0.28 L=0.01839 L/var=0.08 tgt=-0.044/0.477 pstd=0.493 gen=0.1s train=1.6s
+[t=  24.3s] greedy ep 12 games=  96 dec= 17384 rows= 16648 horizon=0.25 L=0.01864 L/var=0.07 tgt=-0.023/0.503 pstd=0.490 gen=0.1s train=1.5s
+[t=  26.1s] greedy ep 13 games=  96 dec= 18153 rows= 17377 horizon=0.28 L=0.01777 L/var=0.07 tgt=-0.027/0.502 pstd=0.486 gen=0.1s train=1.6s
+[t=  27.9s] greedy ep 14 games=  96 dec= 18097 rows= 17377 horizon=0.26 L=0.01779 L/var=0.07 tgt=-0.037/0.511 pstd=0.499 gen=0.1s train=1.6s
+[t=  29.7s] greedy ep 15 games=  96 dec= 18356 rows= 17581 horizon=0.30 L=0.01718 L/var=0.07 tgt=-0.023/0.496 pstd=0.502 gen=0.1s train=1.6s
+[t=  31.6s] greedy ep 16 games=  96 dec= 19141 rows= 18328 horizon=0.32 L=0.01638 L/var=0.07 tgt=+0.010/0.479 pstd=0.486 gen=0.1s train=1.7s
+[t=  33.5s] greedy ep 17 games=  96 dec= 18885 rows= 18173 horizon=0.30 L=0.01616 L/var=0.06 tgt=-0.054/0.508 pstd=0.483 gen=0.1s train=1.7s
+[t=  35.3s] greedy ep 18 games=  96 dec= 17886 rows= 17103 horizon=0.25 L=0.01777 L/var=0.07 tgt=-0.021/0.507 pstd=0.475 gen=0.1s train=1.6s
+[t=  37.1s] greedy ep 19 games=  96 dec= 17738 rows= 16961 horizon=0.23 L=0.01817 L/var=0.06 tgt=-0.065/0.530 pstd=0.466 gen=0.1s train=1.6s
+[t=  38.9s] greedy ep 20 games=  96 dec= 17716 rows= 17039 horizon=0.28 L=0.01699 L/var=0.06 tgt=-0.071/0.515 pstd=0.476 gen=0.1s train=1.6s
+[t=  40.7s] greedy ep 21 games=  96 dec= 17777 rows= 17032 horizon=0.23 L=0.01726 L/var=0.06 tgt=-0.051/0.520 pstd=0.490 gen=0.1s train=1.6s
+[t=  42.6s] greedy ep 22 games=  96 dec= 18472 rows= 17732 horizon=0.33 L=0.01586 L/var=0.07 tgt=-0.019/0.474 pstd=0.483 gen=0.1s train=1.6s
+[t=  44.4s] greedy ep 23 games=  96 dec= 18429 rows= 17627 horizon=0.27 L=0.01610 L/var=0.07 tgt=-0.006/0.478 pstd=0.487 gen=0.1s train=1.6s
+[t=  46.4s] greedy ep 24 games=  96 dec= 18992 rows= 18327 horizon=0.35 L=0.01760 L/var=0.07 tgt=-0.014/0.487 pstd=0.497 gen=0.1s train=1.7s
+[t=  48.2s] greedy ep 25 games=  96 dec= 18039 rows= 17262 horizon=0.23 L=0.01784 L/var=0.07 tgt=-0.025/0.517 pstd=0.489 gen=0.1s train=1.6s
+[t=  50.1s] greedy ep 26 games=  96 dec= 19627 rows= 18805 horizon=0.33 L=0.01677 L/var=0.07 tgt=-0.037/0.501 pstd=0.495 gen=0.1s train=1.7s
+[t=  52.0s] greedy ep 27 games=  96 dec= 18752 rows= 17930 horizon=0.27 L=0.01616 L/var=0.07 tgt=-0.031/0.485 pstd=0.498 gen=0.1s train=1.7s
+[t=  54.0s] greedy ep 28 games=  96 dec= 19116 rows= 18327 horizon=0.31 L=0.01641 L/var=0.07 tgt=-0.035/0.484 pstd=0.494 gen=0.1s train=1.7s
+[t=  55.8s] greedy ep 29 games=  96 dec= 18708 rows= 17952 horizon=0.27 L=0.01669 L/var=0.07 tgt=-0.051/0.503 pstd=0.499 gen=0.1s train=1.6s
+[t=  57.7s] greedy ep 30 games=  96 dec= 19066 rows= 18248 horizon=0.31 L=0.01587 L/var=0.07 tgt=-0.032/0.479 pstd=0.499 gen=0.1s train=1.7s
+[t=  59.5s] greedy ep 31 games=  96 dec= 18369 rows= 17570 horizon=0.26 L=0.01623 L/var=0.06 tgt=-0.041/0.509 pstd=0.500 gen=0.1s train=1.6s
+[t=  61.4s] greedy ep 32 games=  96 dec= 18567 rows= 17800 horizon=0.30 L=0.01619 L/var=0.07 tgt=+0.001/0.480 pstd=0.492 gen=0.1s train=1.6s
+[t=  63.2s] greedy ep 33 games=  96 dec= 18636 rows= 17813 horizon=0.31 L=0.01545 L/var=0.06 tgt=-0.002/0.514 pstd=0.467 gen=0.1s train=1.6s
+[t=  65.1s] greedy ep 34 games=  96 dec= 18664 rows= 17825 horizon=0.29 L=0.01643 L/var=0.08 tgt=+0.020/0.463 pstd=0.494 gen=0.1s train=1.6s
+[t=  66.9s] greedy ep 35 games=  96 dec= 17787 rows= 17046 horizon=0.22 L=0.01637 L/var=0.06 tgt=-0.039/0.539 pstd=0.486 gen=0.1s train=1.6s
+[t=  68.8s] greedy ep 36 games=  96 dec= 19279 rows= 18442 horizon=0.33 L=0.01633 L/var=0.07 tgt=-0.046/0.480 pstd=0.495 gen=0.1s train=1.7s
+[t=  70.6s] greedy ep 37 games=  96 dec= 18316 rows= 17468 horizon=0.32 L=0.01559 L/var=0.06 tgt=-0.034/0.532 pstd=0.501 gen=0.1s train=1.6s
+[t=  72.5s] greedy ep 38 games=  96 dec= 19158 rows= 18321 horizon=0.32 L=0.01646 L/var=0.07 tgt=-0.020/0.472 pstd=0.496 gen=0.1s train=1.7s
+[t=  74.3s] greedy ep 39 games=  96 dec= 18549 rows= 17774 horizon=0.26 L=0.01615 L/var=0.06 tgt=-0.037/0.514 pstd=0.500 gen=0.1s train=1.6s
+[t=  76.2s] greedy ep 40 games=  96 dec= 18971 rows= 18211 horizon=0.34 L=0.01649 L/var=0.08 tgt=-0.007/0.461 pstd=0.474 gen=0.1s train=1.7s
+[t=  78.0s] greedy ep 41 games=  96 dec= 18692 rows= 17843 horizon=0.28 L=0.01677 L/var=0.07 tgt=-0.044/0.507 pstd=0.485 gen=0.1s train=1.6s
+[t=  80.0s] greedy ep 42 games=  96 dec= 19162 rows= 18375 horizon=0.38 L=0.01618 L/var=0.07 tgt=-0.035/0.494 pstd=0.497 gen=0.1s train=1.7s
+[t=  82.0s] greedy ep 43 games=  96 dec= 19468 rows= 18602 horizon=0.35 L=0.01656 L/var=0.08 tgt=-0.058/0.456 pstd=0.478 gen=0.1s train=1.7s
+[t=  83.8s] greedy ep 44 games=  96 dec= 18443 rows= 17624 horizon=0.28 L=0.01569 L/var=0.07 tgt=-0.009/0.479 pstd=0.488 gen=0.1s train=1.6s
+[t=  85.6s] greedy ep 45 games=  96 dec= 17350 rows= 16706 horizon=0.25 L=0.01708 L/var=0.06 tgt=-0.084/0.527 pstd=0.491 gen=0.1s train=1.5s
+[t=  87.4s] greedy ep 46 games=  96 dec= 17993 rows= 17239 horizon=0.28 L=0.01756 L/var=0.07 tgt=-0.013/0.495 pstd=0.488 gen=0.1s train=1.6s
+[t=  89.3s] greedy ep 47 games=  96 dec= 18984 rows= 18180 horizon=0.29 L=0.01724 L/var=0.08 tgt=-0.024/0.472 pstd=0.501 gen=0.1s train=1.7s
+[t=  91.1s] greedy ep 48 games=  96 dec= 18071 rows= 17405 horizon=0.30 L=0.01661 L/var=0.06 tgt=-0.041/0.510 pstd=0.495 gen=0.1s train=1.6s
+[t=  93.1s] greedy ep 49 games=  96 dec= 19599 rows= 18844 horizon=0.40 L=0.01629 L/var=0.08 tgt=-0.000/0.457 pstd=0.479 gen=0.1s train=1.8s
+[t=  94.8s] greedy ep 50 games=  96 dec= 17856 rows= 17099 horizon=0.25 L=0.01673 L/var=0.06 tgt=-0.060/0.543 pstd=0.468 gen=0.1s train=1.6s
+[t=  96.7s] greedy ep 51 games=  96 dec= 17858 rows= 17043 horizon=0.24 L=0.01626 L/var=0.06 tgt=-0.027/0.530 pstd=0.489 gen=0.1s train=1.6s
+[t=  98.6s] greedy ep 52 games=  96 dec= 18973 rows= 18262 horizon=0.35 L=0.01658 L/var=0.08 tgt=-0.041/0.460 pstd=0.477 gen=0.1s train=1.7s
+[t= 100.4s] greedy ep 53 games=  96 dec= 17565 rows= 16777 horizon=0.19 L=0.01688 L/var=0.06 tgt=-0.031/0.511 pstd=0.474 gen=0.1s train=1.6s
+[t= 102.3s] greedy ep 54 games=  96 dec= 17835 rows= 17151 horizon=0.25 L=0.01714 L/var=0.07 tgt=-0.001/0.492 pstd=0.491 gen=0.1s train=1.6s
+[t= 104.1s] greedy ep 55 games=  96 dec= 17927 rows= 17096 horizon=0.25 L=0.01672 L/var=0.08 tgt=-0.008/0.470 pstd=0.466 gen=0.1s train=1.6s
+[t= 106.0s] greedy ep 56 games=  96 dec= 18561 rows= 17765 horizon=0.28 L=0.01694 L/var=0.07 tgt=-0.036/0.484 pstd=0.473 gen=0.1s train=1.6s
+[t= 107.8s] greedy ep 57 games=  96 dec= 18688 rows= 17872 horizon=0.25 L=0.01675 L/var=0.06 tgt=-0.014/0.515 pstd=0.480 gen=0.1s train=1.6s
+[t= 109.7s] greedy ep 58 games=  96 dec= 19251 rows= 18414 horizon=0.34 L=0.01697 L/var=0.07 tgt=-0.060/0.493 pstd=0.481 gen=0.1s train=1.7s
+[t= 111.7s] greedy ep 59 games=  96 dec= 19596 rows= 18724 horizon=0.36 L=0.01669 L/var=0.08 tgt=-0.050/0.460 pstd=0.487 gen=0.1s train=1.7s
+[t= 113.6s] greedy ep 60 games=  96 dec= 18869 rows= 17979 horizon=0.30 L=0.01687 L/var=0.07 tgt=-0.032/0.484 pstd=0.465 gen=0.1s train=1.6s
+[t= 115.4s] greedy ep 61 games=  96 dec= 18419 rows= 17673 horizon=0.25 L=0.01593 L/var=0.06 tgt=-0.009/0.517 pstd=0.475 gen=0.1s train=1.6s
+[t= 117.3s] greedy ep 62 games=  96 dec= 19032 rows= 18186 horizon=0.32 L=0.01597 L/var=0.06 tgt=-0.036/0.503 pstd=0.475 gen=0.1s train=1.7s
+[t= 119.2s] greedy ep 63 games=  96 dec= 19220 rows= 18443 horizon=0.29 L=0.01711 L/var=0.07 tgt=-0.008/0.491 pstd=0.474 gen=0.1s train=1.7s
+[t= 121.0s] greedy ep 64 games=  96 dec= 17814 rows= 17050 horizon=0.25 L=0.01667 L/var=0.06 tgt=-0.045/0.519 pstd=0.482 gen=0.1s train=1.5s
+[t= 122.8s] greedy ep 65 games=  96 dec= 18244 rows= 17509 horizon=0.28 L=0.01589 L/var=0.06 tgt=-0.026/0.503 pstd=0.492 gen=0.1s train=1.6s
+[t= 124.6s] greedy ep 66 games=  96 dec= 18182 rows= 17491 horizon=0.29 L=0.01660 L/var=0.07 tgt=-0.037/0.498 pstd=0.499 gen=0.1s train=1.6s
+[t= 126.5s] greedy ep 67 games=  96 dec= 18981 rows= 18182 horizon=0.35 L=0.01585 L/var=0.06 tgt=-0.023/0.511 pstd=0.485 gen=0.1s train=1.6s
+[t= 128.3s] greedy ep 68 games=  96 dec= 18200 rows= 17313 horizon=0.25 L=0.01581 L/var=0.06 tgt=-0.016/0.502 pstd=0.494 gen=0.1s train=1.6s
+[t= 130.1s] greedy ep 69 games=  96 dec= 18393 rows= 17591 horizon=0.28 L=0.01586 L/var=0.06 tgt=-0.053/0.510 pstd=0.472 gen=0.1s train=1.6s
+[t= 132.0s] greedy ep 70 games=  96 dec= 18464 rows= 17707 horizon=0.33 L=0.01586 L/var=0.07 tgt=-0.039/0.486 pstd=0.495 gen=0.1s train=1.6s
+[t= 133.8s] greedy ep 71 games=  96 dec= 18120 rows= 17396 horizon=0.26 L=0.01636 L/var=0.06 tgt=-0.031/0.525 pstd=0.476 gen=0.1s train=1.6s
+[t= 135.7s] greedy ep 72 games=  96 dec= 19113 rows= 18368 horizon=0.34 L=0.01588 L/var=0.06 tgt=-0.075/0.504 pstd=0.489 gen=0.1s train=1.7s
+[t= 137.5s] greedy ep 73 games=  96 dec= 17603 rows= 16838 horizon=0.20 L=0.01662 L/var=0.06 tgt=-0.037/0.525 pstd=0.480 gen=0.1s train=1.5s
+[t= 139.3s] greedy ep 74 games=  96 dec= 18477 rows= 17679 horizon=0.27 L=0.01597 L/var=0.06 tgt=-0.065/0.534 pstd=0.499 gen=0.1s train=1.6s
+[t= 141.2s] greedy ep 75 games=  96 dec= 19740 rows= 18936 horizon=0.40 L=0.01548 L/var=0.07 tgt=+0.013/0.468 pstd=0.479 gen=0.1s train=1.7s
+[t= 143.1s] greedy ep 76 games=  96 dec= 18307 rows= 17464 horizon=0.20 L=0.01671 L/var=0.07 tgt=-0.020/0.496 pstd=0.489 gen=0.1s train=1.6s
+[t= 144.9s] greedy ep 77 games=  96 dec= 18119 rows= 17313 horizon=0.25 L=0.01721 L/var=0.07 tgt=-0.031/0.501 pstd=0.496 gen=0.1s train=1.6s
+[t= 146.7s] greedy ep 78 games=  96 dec= 18056 rows= 17283 horizon=0.26 L=0.01675 L/var=0.06 tgt=-0.041/0.514 pstd=0.479 gen=0.1s train=1.6s
+[t= 148.5s] greedy ep 79 games=  96 dec= 18309 rows= 17527 horizon=0.28 L=0.01611 L/var=0.07 tgt=-0.007/0.493 pstd=0.484 gen=0.1s train=1.6s
+[t= 150.3s] greedy ep 80 games=  96 dec= 18361 rows= 17605 horizon=0.29 L=0.01577 L/var=0.06 tgt=-0.024/0.508 pstd=0.477 gen=0.1s train=1.6s
+[t= 152.0s] greedy ep 81 games=  96 dec= 17527 rows= 16734 horizon=0.25 L=0.01635 L/var=0.06 tgt=-0.020/0.532 pstd=0.486 gen=0.1s train=1.5s
+[t= 153.7s] greedy ep 82 games=  96 dec= 17529 rows= 16756 horizon=0.23 L=0.01654 L/var=0.06 tgt=-0.028/0.509 pstd=0.474 gen=0.1s train=1.5s
+[t= 155.4s] greedy ep 83 games=  96 dec= 16779 rows= 15994 horizon=0.18 L=0.01660 L/var=0.06 tgt=-0.021/0.539 pstd=0.474 gen=0.1s train=1.4s
+[t= 157.3s] greedy ep 84 games=  96 dec= 19106 rows= 18300 horizon=0.35 L=0.01757 L/var=0.08 tgt=-0.045/0.483 pstd=0.481 gen=0.1s train=1.7s
+[t= 159.2s] greedy ep 85 games=  96 dec= 18736 rows= 17960 horizon=0.29 L=0.01623 L/var=0.06 tgt=-0.044/0.501 pstd=0.480 gen=0.1s train=1.6s
+[t= 161.0s] greedy ep 86 games=  96 dec= 18107 rows= 17332 horizon=0.26 L=0.01681 L/var=0.07 tgt=-0.020/0.485 pstd=0.465 gen=0.1s train=1.6s
+[t= 162.7s] greedy ep 87 games=  96 dec= 17330 rows= 16586 horizon=0.24 L=0.01616 L/var=0.06 tgt=-0.048/0.503 pstd=0.479 gen=0.1s train=1.5s
+[t= 164.5s] greedy ep 88 games=  96 dec= 18635 rows= 17758 horizon=0.27 L=0.01619 L/var=0.06 tgt=-0.026/0.514 pstd=0.470 gen=0.1s train=1.5s
+[t= 166.3s] greedy ep 89 games=  96 dec= 17378 rows= 16633 horizon=0.24 L=0.01634 L/var=0.06 tgt=-0.051/0.525 pstd=0.461 gen=0.1s train=1.6s
+[t= 168.2s] greedy ep 90 games=  96 dec= 18682 rows= 17886 horizon=0.31 L=0.01687 L/var=0.07 tgt=-0.059/0.505 pstd=0.482 gen=0.1s train=1.7s
+[t= 170.1s] greedy ep 91 games=  96 dec= 18758 rows= 18046 horizon=0.32 L=0.01593 L/var=0.07 tgt=-0.021/0.471 pstd=0.467 gen=0.1s train=1.7s
+[t= 172.0s] greedy ep 92 games=  96 dec= 18910 rows= 18161 horizon=0.30 L=0.01635 L/var=0.07 tgt=-0.051/0.484 pstd=0.496 gen=0.1s train=1.7s
+[t= 173.9s] greedy ep 93 games=  96 dec= 18404 rows= 17653 horizon=0.34 L=0.01576 L/var=0.06 tgt=-0.078/0.496 pstd=0.471 gen=0.1s train=1.7s
+[t= 175.8s] greedy ep 94 games=  96 dec= 18792 rows= 18006 horizon=0.33 L=0.01551 L/var=0.07 tgt=-0.046/0.481 pstd=0.495 gen=0.1s train=1.7s
+[t= 177.7s] greedy ep 95 games=  96 dec= 18762 rows= 17940 horizon=0.24 L=0.01617 L/var=0.06 tgt=-0.044/0.515 pstd=0.478 gen=0.1s train=1.7s
+[t= 179.5s] greedy ep 96 games=  96 dec= 17651 rows= 16892 horizon=0.24 L=0.01650 L/var=0.06 tgt=-0.034/0.512 pstd=0.479 gen=0.1s train=1.6s
+[t= 181.3s] greedy ep 97 games=  96 dec= 17701 rows= 17006 horizon=0.27 L=0.01576 L/var=0.06 tgt=-0.034/0.509 pstd=0.461 gen=0.1s train=1.6s
+[t= 183.3s] greedy ep 98 games=  96 dec= 18691 rows= 17958 horizon=0.35 L=0.01594 L/var=0.07 tgt=-0.032/0.471 pstd=0.470 gen=0.1s train=1.7s
+[t= 185.2s] greedy ep 99 games=  96 dec= 19149 rows= 18268 horizon=0.29 L=0.01685 L/var=0.07 tgt=-0.001/0.483 pstd=0.487 gen=0.1s train=1.7s
+[t= 187.0s] greedy ep100 games=  96 dec= 17996 rows= 17268 horizon=0.27 L=0.01579 L/var=0.06 tgt=-0.027/0.517 pstd=0.494 gen=0.1s train=1.6s
+[t= 188.8s] greedy ep101 games=  96 dec= 17954 rows= 17173 horizon=0.26 L=0.01515 L/var=0.06 tgt=-0.045/0.510 pstd=0.487 gen=0.1s train=1.6s
+[t= 190.6s] greedy ep102 games=  96 dec= 17228 rows= 16426 horizon=0.19 L=0.01593 L/var=0.06 tgt=-0.074/0.531 pstd=0.474 gen=0.1s train=1.5s
+[t= 192.4s] greedy ep103 games=  96 dec= 17794 rows= 16980 horizon=0.24 L=0.01573 L/var=0.06 tgt=-0.069/0.518 pstd=0.466 gen=0.1s train=1.6s
+[t= 194.3s] greedy ep104 games=  96 dec= 18854 rows= 17982 horizon=0.26 L=0.01654 L/var=0.07 tgt=-0.026/0.499 pstd=0.468 gen=0.1s train=1.7s
+[t= 196.2s] greedy ep105 games=  96 dec= 18802 rows= 17936 horizon=0.30 L=0.01550 L/var=0.06 tgt=-0.031/0.509 pstd=0.466 gen=0.1s train=1.7s
+[t= 198.1s] greedy ep106 games=  96 dec= 18161 rows= 17476 horizon=0.27 L=0.01581 L/var=0.06 tgt=-0.050/0.503 pstd=0.477 gen=0.1s train=1.6s
+[t= 199.9s] greedy ep107 games=  96 dec= 17916 rows= 17157 horizon=0.27 L=0.01590 L/var=0.06 tgt=-0.050/0.499 pstd=0.483 gen=0.1s train=1.6s
+[t= 201.8s] greedy ep108 games=  96 dec= 18149 rows= 17352 horizon=0.26 L=0.01577 L/var=0.06 tgt=-0.012/0.500 pstd=0.484 gen=0.1s train=1.6s
+[t= 203.7s] greedy ep109 games=  96 dec= 18197 rows= 17400 horizon=0.24 L=0.01515 L/var=0.06 tgt=-0.026/0.496 pstd=0.467 gen=0.1s train=1.6s
+[t= 205.5s] greedy ep110 games=  96 dec= 17538 rows= 16803 horizon=0.24 L=0.01625 L/var=0.06 tgt=-0.056/0.526 pstd=0.478 gen=0.1s train=1.6s
+[t= 207.4s] greedy ep111 games=  96 dec= 19361 rows= 18532 horizon=0.36 L=0.01629 L/var=0.07 tgt=-0.045/0.483 pstd=0.446 gen=0.1s train=1.7s
+[t= 209.3s] greedy ep112 games=  96 dec= 18029 rows= 17317 horizon=0.30 L=0.01559 L/var=0.07 tgt=-0.018/0.483 pstd=0.459 gen=0.1s train=1.6s
+[t= 211.1s] greedy ep113 games=  96 dec= 18174 rows= 17387 horizon=0.28 L=0.01597 L/var=0.06 tgt=-0.033/0.531 pstd=0.442 gen=0.1s train=1.6s
+[t= 213.1s] greedy ep114 games=  96 dec= 19319 rows= 18518 horizon=0.36 L=0.01600 L/var=0.07 tgt=-0.034/0.490 pstd=0.449 gen=0.1s train=1.8s
+[t= 215.2s] greedy ep115 games=  96 dec= 17729 rows= 16977 horizon=0.17 L=0.01673 L/var=0.06 tgt=-0.002/0.516 pstd=0.439 gen=0.1s train=1.9s
+[t= 217.2s] greedy ep116 games=  96 dec= 18403 rows= 17543 horizon=0.28 L=0.01608 L/var=0.07 tgt=-0.022/0.494 pstd=0.425 gen=0.1s train=1.7s
+[t= 219.0s] greedy ep117 games=  96 dec= 17865 rows= 17051 horizon=0.27 L=0.01543 L/var=0.06 tgt=-0.033/0.509 pstd=0.431 gen=0.1s train=1.6s
+[t= 220.9s] greedy ep118 games=  96 dec= 18550 rows= 17822 horizon=0.36 L=0.01515 L/var=0.06 tgt=-0.095/0.506 pstd=0.440 gen=0.1s train=1.7s
+[t= 222.9s] greedy ep119 games=  96 dec= 18440 rows= 17650 horizon=0.26 L=0.01538 L/var=0.06 tgt=-0.045/0.500 pstd=0.424 gen=0.1s train=1.7s
+[t= 224.8s] greedy ep120 games=  96 dec= 18888 rows= 17947 horizon=0.27 L=0.01484 L/var=0.06 tgt=-0.039/0.484 pstd=0.425 gen=0.1s train=1.7s
+[t= 226.7s] greedy ep121 games=  96 dec= 18400 rows= 17640 horizon=0.29 L=0.01481 L/var=0.07 tgt=-0.014/0.473 pstd=0.412 gen=0.1s train=1.7s
+[t= 228.7s] greedy ep122 games=  96 dec= 19500 rows= 18715 horizon=0.40 L=0.01468 L/var=0.07 tgt=-0.048/0.473 pstd=0.416 gen=0.1s train=1.8s
+[t= 230.6s] greedy ep123 games=  96 dec= 18513 rows= 17694 horizon=0.27 L=0.01428 L/var=0.05 tgt=-0.021/0.514 pstd=0.426 gen=0.1s train=1.7s
+[t= 232.6s] greedy ep124 games=  96 dec= 18892 rows= 18073 horizon=0.33 L=0.01393 L/var=0.06 tgt=-0.059/0.481 pstd=0.422 gen=0.1s train=1.7s
+[t= 234.8s] greedy ep125 games=  96 dec= 18520 rows= 17651 horizon=0.25 L=0.01418 L/var=0.06 tgt=-0.025/0.500 pstd=0.417 gen=0.1s train=2.0s
+[t= 237.1s] greedy ep126 games=  96 dec= 19645 rows= 18833 horizon=0.36 L=0.01446 L/var=0.06 tgt=-0.015/0.474 pstd=0.403 gen=0.1s train=2.1s
+[t= 239.2s] greedy ep127 games=  96 dec= 17395 rows= 16683 horizon=0.19 L=0.01511 L/var=0.05 tgt=-0.006/0.530 pstd=0.401 gen=0.1s train=1.9s
+[t= 241.4s] greedy ep128 games=  96 dec= 19317 rows= 18624 horizon=0.38 L=0.01414 L/var=0.06 tgt=-0.039/0.471 pstd=0.396 gen=0.1s train=1.9s
+[t= 243.2s] greedy ep129 games=  96 dec= 18062 rows= 17333 horizon=0.27 L=0.01392 L/var=0.06 tgt=-0.022/0.483 pstd=0.403 gen=0.1s train=1.6s
+[t= 245.0s] greedy ep130 games=  96 dec= 17908 rows= 17168 horizon=0.25 L=0.01391 L/var=0.06 tgt=-0.041/0.492 pstd=0.395 gen=0.1s train=1.6s
+[t= 246.9s] greedy ep131 games=  96 dec= 17598 rows= 16794 horizon=0.20 L=0.01425 L/var=0.05 tgt=-0.048/0.526 pstd=0.407 gen=0.1s train=1.6s
+[t= 248.8s] greedy ep132 games=  96 dec= 18760 rows= 17930 horizon=0.29 L=0.01495 L/var=0.06 tgt=-0.019/0.485 pstd=0.399 gen=0.1s train=1.7s
+[t= 250.6s] greedy ep133 games=  96 dec= 18381 rows= 17624 horizon=0.30 L=0.01370 L/var=0.05 tgt=-0.062/0.524 pstd=0.404 gen=0.1s train=1.6s
+[t= 252.4s] greedy ep134 games=  96 dec= 17570 rows= 16816 horizon=0.25 L=0.01376 L/var=0.05 tgt=-0.013/0.504 pstd=0.406 gen=0.1s train=1.6s
+[t= 254.2s] greedy ep135 games=  96 dec= 17880 rows= 17050 horizon=0.19 L=0.01397 L/var=0.05 tgt=-0.041/0.536 pstd=0.397 gen=0.1s train=1.6s
+[t= 256.0s] greedy ep136 games=  96 dec= 17693 rows= 16931 horizon=0.20 L=0.01471 L/var=0.05 tgt=-0.051/0.536 pstd=0.407 gen=0.1s train=1.6s
+[t= 258.0s] greedy ep137 games=  96 dec= 18829 rows= 18139 horizon=0.33 L=0.01389 L/var=0.06 tgt=-0.050/0.495 pstd=0.403 gen=0.1s train=1.7s
+[t= 259.9s] greedy ep138 games=  96 dec= 18667 rows= 17798 horizon=0.27 L=0.01321 L/var=0.06 tgt=-0.006/0.489 pstd=0.397 gen=0.1s train=1.7s
+[t= 261.8s] greedy ep139 games=  96 dec= 19019 rows= 18235 horizon=0.33 L=0.01376 L/var=0.06 tgt=-0.015/0.475 pstd=0.402 gen=0.1s train=1.7s
+[t= 263.7s] greedy ep140 games=  96 dec= 18185 rows= 17445 horizon=0.30 L=0.01376 L/var=0.05 tgt=-0.071/0.507 pstd=0.385 gen=0.1s train=1.6s
+[t= 265.7s] greedy ep141 games=  96 dec= 19133 rows= 18326 horizon=0.31 L=0.01320 L/var=0.06 tgt=-0.003/0.464 pstd=0.386 gen=0.1s train=1.8s
+[t= 267.5s] greedy ep142 games=  96 dec= 18194 rows= 17427 horizon=0.24 L=0.01337 L/var=0.05 tgt=-0.061/0.518 pstd=0.374 gen=0.1s train=1.6s
+[t= 269.5s] greedy ep143 games=  96 dec= 18830 rows= 18028 horizon=0.30 L=0.01291 L/var=0.05 tgt=-0.009/0.498 pstd=0.384 gen=0.1s train=1.7s
+[t= 271.5s] greedy ep144 games=  96 dec= 18909 rows= 18097 horizon=0.32 L=0.01278 L/var=0.05 tgt=-0.061/0.499 pstd=0.373 gen=0.1s train=1.8s
+[t= 273.4s] greedy ep145 games=  96 dec= 17688 rows= 16849 horizon=0.23 L=0.01299 L/var=0.05 tgt=-0.031/0.509 pstd=0.385 gen=0.1s train=1.6s
+[t= 275.3s] greedy ep146 games=  96 dec= 18242 rows= 17520 horizon=0.29 L=0.01265 L/var=0.05 tgt=-0.012/0.490 pstd=0.382 gen=0.1s train=1.7s
+[t= 277.2s] greedy ep147 games=  96 dec= 17543 rows= 16790 horizon=0.23 L=0.01280 L/var=0.05 tgt=-0.040/0.509 pstd=0.372 gen=0.1s train=1.6s
+[t= 279.2s] greedy ep148 games=  96 dec= 18707 rows= 17901 horizon=0.26 L=0.01290 L/var=0.05 tgt=-0.039/0.534 pstd=0.377 gen=0.1s train=1.7s
+[t= 281.2s] greedy ep149 games=  96 dec= 18841 rows= 17963 horizon=0.30 L=0.01272 L/var=0.06 tgt=-0.009/0.474 pstd=0.376 gen=0.1s train=1.8s
+[t= 283.1s] greedy ep150 games=  96 dec= 18647 rows= 17871 horizon=0.29 L=0.01263 L/var=0.05 tgt=-0.037/0.502 pstd=0.380 gen=0.1s train=1.7s
+[t= 285.2s] greedy ep151 games=  96 dec= 19437 rows= 18611 horizon=0.34 L=0.01251 L/var=0.05 tgt=-0.053/0.485 pstd=0.369 gen=0.1s train=1.8s
+[t= 287.2s] greedy ep152 games=  96 dec= 18772 rows= 17991 horizon=0.31 L=0.01173 L/var=0.04 tgt=-0.046/0.512 pstd=0.373 gen=0.1s train=1.8s
+[t= 289.3s] greedy ep153 games=  96 dec= 19646 rows= 18733 horizon=0.40 L=0.01169 L/var=0.05 tgt=-0.023/0.485 pstd=0.363 gen=0.1s train=1.8s
+[t= 291.1s] greedy ep154 games=  96 dec= 17859 rows= 17126 horizon=0.26 L=0.01191 L/var=0.05 tgt=-0.034/0.509 pstd=0.380 gen=0.1s train=1.6s
+[t= 293.0s] greedy ep155 games=  96 dec= 18131 rows= 17315 horizon=0.25 L=0.01187 L/var=0.05 tgt=+0.011/0.497 pstd=0.380 gen=0.1s train=1.7s
+[t= 294.9s] greedy ep156 games=  96 dec= 17706 rows= 16969 horizon=0.27 L=0.01193 L/var=0.05 tgt=-0.007/0.497 pstd=0.373 gen=0.1s train=1.6s
+[t= 296.8s] greedy ep157 games=  96 dec= 18532 rows= 17740 horizon=0.27 L=0.01175 L/var=0.05 tgt=-0.021/0.507 pstd=0.362 gen=0.1s train=1.7s
+[t= 298.7s] greedy ep158 games=  96 dec= 18583 rows= 17821 horizon=0.26 L=0.01155 L/var=0.05 tgt=-0.058/0.506 pstd=0.360 gen=0.1s train=1.7s
+[t= 300.6s] greedy ep159 games=  96 dec= 17891 rows= 17137 horizon=0.25 L=0.01123 L/var=0.04 tgt=-0.046/0.528 pstd=0.371 gen=0.1s train=1.7s
+[t= 300.6s] --- snapshot snap_00.pt (init) ---
+[t= 300.6s] --- switching to ReBeL ---
+[t= 310.7s] rebel stream solves=16384 raw=1633/s balanced=1633/s debt=0 rows steps=64 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.02726 L/var=0.62 tgt=-0.004/0.209 cfg/b=43987 prep=0.30s gpu=0.00s conv=0.02s add=0.55s train=1.80s
+[t= 320.7s] rebel stream solves=44032 raw=2197/s balanced=2197/s debt=0 rows steps=172 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00448 L/var=0.13 tgt=-0.001/0.188 cfg/b=50569 prep=0.47s gpu=0.00s conv=0.04s add=1.02s train=2.97s
+[t= 330.9s] rebel stream solves=57344 raw=1897/s balanced=1897/s debt=0 rows steps=224 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00258 L/var=0.06 tgt=+0.009/0.207 cfg/b=32873 prep=0.26s gpu=0.00s conv=0.01s add=0.40s train=1.47s
+[t= 340.9s] rebel stream solves=71680 raw=1779/s balanced=1779/s debt=0 rows steps=280 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00215 L/var=0.05 tgt=+0.004/0.210 cfg/b=35516 prep=0.29s gpu=0.00s conv=0.01s add=0.50s train=1.62s
+[t= 351.0s] rebel stream solves=84992 raw=1688/s balanced=1688/s debt=0 rows steps=332 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00193 L/var=0.04 tgt=+0.006/0.220 cfg/b=27717 prep=0.31s gpu=0.00s conv=0.01s add=0.28s train=1.65s
+[t= 361.0s] rebel stream solves=95232 raw=1577/s balanced=1577/s debt=0 rows steps=372 horizon=0.00 games=1 over=0 card=0 drop=0 L=0.00179 L/var=0.03 tgt=+0.007/0.227 cfg/b=24238 prep=0.25s gpu=0.00s conv=0.00s add=0.21s train=1.24s
+[t= 371.1s] rebel stream solves=103424 raw=1468/s balanced=1468/s debt=0 rows steps=404 horizon=0.00 games=1 over=0 card=0 drop=0 L=0.00179 L/var=0.04 tgt=+0.006/0.224 cfg/b=23662 prep=0.23s gpu=0.00s conv=0.00s add=0.16s train=0.99s
+[t= 381.1s] rebel stream solves=111616 raw=1387/s balanced=1387/s debt=0 rows steps=436 horizon=0.00 games=5 over=0 card=0 drop=0 L=0.00181 L/var=0.03 tgt=+0.022/0.230 cfg/b=22221 prep=0.23s gpu=0.00s conv=0.00s add=0.13s train=1.07s
+[t= 391.1s] rebel stream solves=119808 raw=1325/s balanced=1325/s debt=0 rows steps=468 horizon=0.00 games=14 over=0 card=0 drop=0 L=0.00190 L/var=0.03 tgt=+0.025/0.239 cfg/b=21580 prep=0.16s gpu=0.00s conv=0.00s add=0.12s train=0.88s
+[t= 401.1s] rebel stream solves=128000 raw=1274/s balanced=1274/s debt=0 rows steps=500 horizon=0.00 games=18 over=0 card=0 drop=0 L=0.00199 L/var=0.03 tgt=+0.037/0.240 cfg/b=20000 prep=0.18s gpu=0.00s conv=0.00s add=0.12s train=0.94s
+[t= 411.1s] rebel stream solves=137216 raw=1242/s balanced=1242/s debt=0 rows steps=536 horizon=0.00 games=33 over=0 card=0 drop=0 L=0.00219 L/var=0.04 tgt=+0.045/0.243 cfg/b=19058 prep=0.21s gpu=0.00s conv=0.00s add=0.13s train=1.08s
+[t= 421.3s] rebel stream solves=146432 raw=1214/s balanced=1214/s debt=0 rows steps=572 horizon=0.00 games=53 over=0 card=0 drop=0 L=0.00249 L/var=0.04 tgt=+0.048/0.246 cfg/b=18091 prep=0.18s gpu=0.00s conv=0.00s add=0.12s train=0.99s
+[t= 431.3s] rebel stream solves=155648 raw=1191/s balanced=1191/s debt=0 rows steps=608 horizon=0.00 games=66 over=0 card=0 drop=0 L=0.00314 L/var=0.05 tgt=+0.049/0.248 cfg/b=17572 prep=0.17s gpu=0.00s conv=0.01s add=0.12s train=1.04s
+[t= 441.3s] rebel stream solves=163840 raw=1165/s balanced=1165/s debt=0 rows steps=640 horizon=0.00 games=86 over=0 card=0 drop=0 L=0.00356 L/var=0.05 tgt=+0.048/0.259 cfg/b=16716 prep=0.17s gpu=0.00s conv=0.01s add=0.11s train=0.98s
+[t= 451.3s] rebel stream solves=174080 raw=1155/s balanced=1155/s debt=0 rows steps=680 horizon=0.00 games=125 over=0 card=0 drop=0 L=0.00433 L/var=0.07 tgt=+0.050/0.254 cfg/b=16394 prep=0.18s gpu=0.00s conv=0.00s add=0.14s train=1.09s
+[t= 461.3s] rebel stream solves=183296 raw=1141/s balanced=1141/s debt=0 rows steps=716 horizon=0.00 games=145 over=0 card=0 drop=0 L=0.00578 L/var=0.09 tgt=+0.051/0.255 cfg/b=16172 prep=0.17s gpu=0.00s conv=0.01s add=0.13s train=1.02s
+[t= 471.4s] rebel stream solves=194560 raw=1139/s balanced=1139/s debt=0 rows steps=760 horizon=0.00 games=180 over=0 card=0 drop=0 L=0.00618 L/var=0.10 tgt=+0.048/0.247 cfg/b=16695 prep=0.23s gpu=0.00s conv=0.00s add=0.16s train=1.23s
+[t= 481.4s] rebel stream solves=207872 raw=1150/s balanced=1150/s debt=0 rows steps=812 horizon=0.00 games=225 over=0 card=0 drop=0 L=0.00705 L/var=0.12 tgt=+0.043/0.243 cfg/b=16644 prep=0.26s gpu=0.00s conv=0.01s add=0.25s train=1.51s
+[t= 491.4s] rebel stream solves=219136 raw=1149/s balanced=1149/s debt=0 rows steps=856 horizon=0.00 games=243 over=0 card=0 drop=0 L=0.00824 L/var=0.14 tgt=+0.040/0.245 cfg/b=16905 prep=0.30s gpu=0.00s conv=0.00s add=0.20s train=1.32s
+[t= 501.5s] rebel stream solves=231424 raw=1152/s balanced=1152/s debt=0 rows steps=904 horizon=0.00 games=265 over=0 card=0 drop=0 L=0.00862 L/var=0.15 tgt=+0.033/0.238 cfg/b=17312 prep=0.24s gpu=0.00s conv=0.01s add=0.21s train=1.34s
+[t= 511.5s] rebel stream solves=245760 raw=1165/s balanced=1165/s debt=0 rows steps=960 horizon=0.00 games=322 over=0 card=0 drop=0 L=0.00934 L/var=0.17 tgt=+0.023/0.236 cfg/b=17458 prep=0.30s gpu=0.00s conv=0.01s add=0.27s train=1.60s
+[t= 521.5s] rebel stream solves=261120 raw=1182/s balanced=1182/s debt=0 rows steps=1020 horizon=0.00 games=342 over=0 card=0 drop=0 L=0.00954 L/var=0.17 tgt=+0.024/0.239 cfg/b=17946 prep=0.31s gpu=0.00s conv=0.01s add=0.36s train=1.78s
+[t= 531.6s] rebel stream solves=274432 raw=1188/s balanced=1188/s debt=0 rows steps=1072 horizon=0.00 games=277 over=0 card=0 drop=0 L=0.00952 L/var=0.18 tgt=+0.017/0.227 cfg/b=17654 prep=0.32s gpu=0.00s conv=0.01s add=0.29s train=1.46s
+[t= 541.6s] rebel stream solves=287744 raw=1194/s balanced=1194/s debt=0 rows steps=1124 horizon=0.00 games=261 over=0 card=0 drop=0 L=0.00944 L/var=0.19 tgt=+0.018/0.226 cfg/b=17060 prep=0.29s gpu=0.00s conv=0.01s add=0.30s train=1.49s
+[t= 551.6s] rebel stream solves=297984 raw=1187/s balanced=1187/s debt=0 rows steps=1164 horizon=0.00 games=191 over=0 card=0 drop=0 L=0.00920 L/var=0.18 tgt=+0.016/0.225 cfg/b=17329 prep=0.26s gpu=0.00s conv=0.01s add=0.24s train=1.17s
+[t= 561.6s] rebel stream solves=310272 raw=1189/s balanced=1189/s debt=0 rows steps=1212 horizon=0.00 games=209 over=0 card=0 drop=0 L=0.00915 L/var=0.17 tgt=+0.013/0.229 cfg/b=17393 prep=0.22s gpu=0.00s conv=0.01s add=0.27s train=1.31s
+[t= 571.6s] rebel stream solves=320512 raw=1183/s balanced=1183/s debt=0 rows steps=1252 horizon=0.00 games=180 over=0 card=0 drop=0 L=0.00900 L/var=0.17 tgt=+0.011/0.231 cfg/b=17504 prep=0.20s gpu=0.00s conv=0.01s add=0.28s train=1.16s
+[t= 581.6s] rebel stream solves=330752 raw=1177/s balanced=1177/s debt=0 rows steps=1292 horizon=0.00 games=162 over=0 card=0 drop=0 L=0.00874 L/var=0.17 tgt=+0.014/0.226 cfg/b=17904 prep=0.20s gpu=0.00s conv=0.01s add=0.26s train=1.12s
+[t= 591.7s] rebel stream solves=340992 raw=1172/s balanced=1172/s debt=0 rows steps=1332 horizon=0.00 games=166 over=0 card=0 drop=0 L=0.00898 L/var=0.16 tgt=+0.003/0.238 cfg/b=17987 prep=0.19s gpu=0.00s conv=0.01s add=0.27s train=1.04s
+[t= 601.8s] rebel stream solves=350208 raw=1163/s balanced=1163/s debt=0 rows steps=1368 horizon=0.00 games=156 over=0 card=0 drop=0 L=0.00866 L/var=0.16 tgt=+0.005/0.235 cfg/b=18061 prep=0.17s gpu=0.00s conv=0.01s add=0.21s train=0.96s
+[t= 611.8s] rebel stream solves=360448 raw=1158/s balanced=1158/s debt=0 rows steps=1408 horizon=0.00 games=150 over=0 card=0 drop=0 L=0.00904 L/var=0.16 tgt=-0.000/0.240 cfg/b=18780 prep=0.19s gpu=0.00s conv=0.01s add=0.32s train=1.10s
+[t= 621.9s] rebel stream solves=370688 raw=1154/s balanced=1154/s debt=0 rows steps=1448 horizon=0.00 games=158 over=0 card=0 drop=0 L=0.00904 L/var=0.14 tgt=-0.006/0.255 cfg/b=19190 prep=0.21s gpu=0.00s conv=0.01s add=0.30s train=1.14s
+[t= 632.0s] rebel stream solves=380928 raw=1150/s balanced=1150/s debt=0 rows steps=1488 horizon=0.00 games=159 over=0 card=0 drop=0 L=0.00901 L/var=0.14 tgt=-0.011/0.257 cfg/b=19654 prep=0.21s gpu=0.00s conv=0.01s add=0.31s train=1.12s
+[t= 642.0s] rebel stream solves=391168 raw=1146/s balanced=1146/s debt=0 rows steps=1528 horizon=0.00 games=166 over=0 card=0 drop=0 L=0.00951 L/var=0.13 tgt=-0.011/0.267 cfg/b=20217 prep=0.18s gpu=0.00s conv=0.01s add=0.27s train=1.10s
+[t= 652.1s] rebel stream solves=403456 raw=1148/s balanced=1148/s debt=0 rows steps=1576 horizon=0.00 games=204 over=0 card=0 drop=0 L=0.00995 L/var=0.15 tgt=-0.014/0.259 cfg/b=20336 prep=0.21s gpu=0.00s conv=0.01s add=0.37s train=1.32s
+[t= 660.6s] --- snapshot snap_01.pt (s1) ---
+[t= 662.1s] rebel stream solves=414720 raw=1147/s balanced=1147/s debt=0 rows steps=1620 horizon=0.00 games=179 over=0 card=0 drop=0 L=0.00960 L/var=0.13 tgt=-0.016/0.267 cfg/b=21035 prep=0.23s gpu=0.00s conv=0.01s add=0.35s train=1.20s
+[t= 672.2s] rebel stream solves=425984 raw=1147/s balanced=1147/s debt=0 rows steps=1664 horizon=0.00 games=180 over=0 card=0 drop=0 L=0.00977 L/var=0.14 tgt=-0.010/0.266 cfg/b=21219 prep=0.21s gpu=0.00s conv=0.01s add=0.37s train=1.23s
+[t= 682.2s] rebel stream solves=437248 raw=1146/s balanced=1146/s debt=0 rows steps=1708 horizon=0.00 games=161 over=0 card=0 drop=0 L=0.00962 L/var=0.13 tgt=-0.018/0.271 cfg/b=22079 prep=0.19s gpu=0.00s conv=0.01s add=0.39s train=1.15s
+[t= 692.2s] rebel stream solves=449536 raw=1148/s balanced=1148/s debt=0 rows steps=1756 horizon=0.00 games=216 over=0 card=0 drop=0 L=0.00928 L/var=0.11 tgt=-0.018/0.289 cfg/b=22374 prep=0.26s gpu=0.00s conv=0.01s add=0.41s train=1.40s
+[t= 702.4s] rebel stream solves=462848 raw=1152/s balanced=1152/s debt=0 rows steps=1808 horizon=0.18 games=282 over=0 card=0 drop=0 L=0.00969 L/var=0.12 tgt=-0.012/0.283 cfg/b=22761 prep=0.26s gpu=0.00s conv=0.01s add=0.47s train=1.43s
+[t= 712.4s] rebel stream solves=475136 raw=1154/s balanced=1154/s debt=0 rows steps=1856 horizon=0.03 games=209 over=0 card=0 drop=0 L=0.00919 L/var=0.13 tgt=-0.008/0.268 cfg/b=23309 prep=0.23s gpu=0.00s conv=0.01s add=0.43s train=1.37s
+[t= 722.4s] rebel stream solves=488448 raw=1158/s balanced=1158/s debt=0 rows steps=1908 horizon=0.11 games=257 over=0 card=0 drop=0 L=0.00932 L/var=0.12 tgt=-0.019/0.284 cfg/b=23906 prep=0.25s gpu=0.00s conv=0.01s add=0.45s train=1.43s
+[t= 732.5s] rebel stream solves=500736 raw=1160/s balanced=1160/s debt=0 rows steps=1956 horizon=0.19 games=225 over=0 card=0 drop=0 L=0.00964 L/var=0.12 tgt=-0.020/0.280 cfg/b=24582 prep=0.21s gpu=0.00s conv=0.01s add=0.43s train=1.28s
+[t= 742.5s] rebel stream solves=512000 raw=1159/s balanced=1159/s debt=0 rows steps=2000 horizon=0.32 games=238 over=0 card=0 drop=0 L=0.00918 L/var=0.12 tgt=-0.011/0.279 cfg/b=24935 prep=0.19s gpu=0.00s conv=0.01s add=0.39s train=1.16s
+[t= 752.6s] rebel stream solves=523264 raw=1158/s balanced=1158/s debt=0 rows steps=2044 horizon=0.28 games=222 over=0 card=0 drop=0 L=0.00963 L/var=0.12 tgt=-0.014/0.284 cfg/b=25910 prep=0.21s gpu=0.00s conv=0.01s add=0.43s train=1.25s
+[t= 762.6s] rebel stream solves=533504 raw=1155/s balanced=1155/s debt=0 rows steps=2084 horizon=0.09 games=183 over=0 card=0 drop=0 L=0.00942 L/var=0.12 tgt=-0.006/0.276 cfg/b=25976 prep=0.18s gpu=0.00s conv=0.01s add=0.36s train=1.07s
+[t= 772.6s] rebel stream solves=544768 raw=1154/s balanced=1154/s debt=0 rows steps=2128 horizon=0.07 games=213 over=0 card=0 drop=0 L=0.00940 L/var=0.14 tgt=+0.002/0.263 cfg/b=26480 prep=0.23s gpu=0.00s conv=0.01s add=0.41s train=1.20s
+[t= 782.7s] rebel stream solves=555008 raw=1151/s balanced=1151/s debt=0 rows steps=2168 horizon=0.14 games=220 over=0 card=0 drop=0 L=0.00925 L/var=0.12 tgt=-0.009/0.276 cfg/b=27456 prep=0.22s gpu=0.00s conv=0.01s add=0.36s train=1.11s
+[t= 792.7s] rebel stream solves=563200 raw=1145/s balanced=1145/s debt=0 rows steps=2200 horizon=0.18 games=175 over=0 card=0 drop=0 L=0.00893 L/var=0.12 tgt=-0.001/0.270 cfg/b=27487 prep=0.15s gpu=0.00s conv=0.01s add=0.32s train=0.89s
+[t= 795.7s] --- lr -> 5.00e-04 ---
+[t= 803.1s] rebel stream solves=573440 raw=1141/s balanced=1141/s debt=0 rows steps=2240 horizon=0.03 games=158 over=0 card=0 drop=0 L=0.00926 L/var=0.12 tgt=+0.003/0.275 cfg/b=27904 prep=0.19s gpu=0.00s conv=0.01s add=0.40s train=1.12s
+[t= 813.1s] rebel stream solves=583680 raw=1139/s balanced=1139/s debt=0 rows steps=2280 horizon=0.08 games=168 over=0 card=0 drop=0 L=0.00918 L/var=0.12 tgt=-0.003/0.278 cfg/b=28807 prep=0.20s gpu=0.00s conv=0.01s add=0.42s train=1.11s
+[t= 823.2s] rebel stream solves=593920 raw=1137/s balanced=1137/s debt=0 rows steps=2320 horizon=0.06 games=174 over=0 card=0 drop=0 L=0.00864 L/var=0.11 tgt=-0.002/0.276 cfg/b=29235 prep=0.18s gpu=0.00s conv=0.01s add=0.40s train=1.07s
+[t= 833.2s] rebel stream solves=605184 raw=1136/s balanced=1136/s debt=0 rows steps=2364 horizon=0.03 games=195 over=0 card=0 drop=0 L=0.00912 L/var=0.11 tgt=-0.000/0.283 cfg/b=28758 prep=0.25s gpu=0.00s conv=0.01s add=0.46s train=1.24s
+[t= 843.2s] rebel stream solves=615424 raw=1134/s balanced=1134/s debt=0 rows steps=2404 horizon=0.05 games=184 over=0 card=0 drop=0 L=0.00917 L/var=0.11 tgt=+0.001/0.286 cfg/b=29584 prep=0.18s gpu=0.00s conv=0.01s add=0.39s train=1.09s
+[t= 853.2s] rebel stream solves=625664 raw=1132/s balanced=1132/s debt=0 rows steps=2444 horizon=0.09 games=183 over=0 card=0 drop=0 L=0.00917 L/var=0.11 tgt=+0.000/0.292 cfg/b=30356 prep=0.19s gpu=0.00s conv=0.01s add=0.40s train=1.09s
+[t= 863.3s] rebel stream solves=635904 raw=1130/s balanced=1130/s debt=0 rows steps=2484 horizon=0.08 games=157 over=0 card=0 drop=0 L=0.00935 L/var=0.11 tgt=-0.001/0.291 cfg/b=30038 prep=0.23s gpu=0.00s conv=0.01s add=0.45s train=1.14s
+[t= 873.3s] rebel stream solves=645120 raw=1127/s balanced=1127/s debt=0 rows steps=2520 horizon=0.13 games=190 over=0 card=0 drop=0 L=0.00923 L/var=0.11 tgt=+0.002/0.295 cfg/b=30362 prep=0.16s gpu=0.00s conv=0.01s add=0.37s train=1.00s
+[t= 883.3s] rebel stream solves=654336 raw=1123/s balanced=1123/s debt=0 rows steps=2556 horizon=0.13 games=200 over=0 card=0 drop=0 L=0.00967 L/var=0.11 tgt=+0.000/0.297 cfg/b=30424 prep=0.16s gpu=0.00s conv=0.01s add=0.40s train=0.97s
+[t= 893.4s] rebel stream solves=665600 raw=1123/s balanced=1123/s debt=0 rows steps=2600 horizon=0.07 games=211 over=0 card=0 drop=0 L=0.00953 L/var=0.11 tgt=+0.001/0.300 cfg/b=30868 prep=0.21s gpu=0.00s conv=0.01s add=0.44s train=1.19s
+[t= 903.5s] rebel stream solves=676864 raw=1123/s balanced=1123/s debt=0 rows steps=2644 horizon=0.04 games=198 over=0 card=0 drop=0 L=0.00989 L/var=0.11 tgt=+0.008/0.295 cfg/b=31416 prep=0.21s gpu=0.00s conv=0.01s add=0.49s train=1.23s
+[t= 913.5s] rebel stream solves=686080 raw=1119/s balanced=1119/s debt=0 rows steps=2680 horizon=0.04 games=164 over=0 card=0 drop=0 L=0.01012 L/var=0.11 tgt=+0.018/0.302 cfg/b=31455 prep=0.17s gpu=0.00s conv=0.01s add=0.39s train=0.98s
+[t= 923.7s] rebel stream solves=696320 raw=1118/s balanced=1118/s debt=0 rows steps=2720 horizon=0.03 games=161 over=0 card=0 drop=0 L=0.01001 L/var=0.11 tgt=+0.013/0.296 cfg/b=31359 prep=0.18s gpu=0.00s conv=0.01s add=0.40s train=1.11s
+[t= 933.7s] rebel stream solves=705536 raw=1115/s balanced=1115/s debt=0 rows steps=2756 horizon=0.06 games=176 over=0 card=0 drop=0 L=0.00933 L/var=0.11 tgt=+0.012/0.293 cfg/b=32019 prep=0.17s gpu=0.00s conv=0.01s add=0.38s train=1.00s
+[t= 943.7s] rebel stream solves=717824 raw=1116/s balanced=1116/s debt=0 rows steps=2804 horizon=0.05 games=232 over=0 card=0 drop=0 L=0.01012 L/var=0.11 tgt=+0.004/0.300 cfg/b=32281 prep=0.26s gpu=0.00s conv=0.01s add=0.49s train=1.38s
+[t= 953.8s] rebel stream solves=728064 raw=1115/s balanced=1115/s debt=0 rows steps=2844 horizon=0.09 games=188 over=0 card=0 drop=0 L=0.00988 L/var=0.10 tgt=+0.006/0.307 cfg/b=32514 prep=0.21s gpu=0.00s conv=0.01s add=0.44s train=1.13s
+[t= 963.8s] rebel stream solves=737280 raw=1112/s balanced=1112/s debt=0 rows steps=2880 horizon=0.03 games=168 over=0 card=0 drop=0 L=0.00972 L/var=0.11 tgt=+0.014/0.301 cfg/b=32409 prep=0.17s gpu=0.00s conv=0.01s add=0.41s train=1.01s
+[t= 973.8s] rebel stream solves=747520 raw=1110/s balanced=1110/s debt=0 rows steps=2920 horizon=0.06 games=180 over=0 card=0 drop=0 L=0.00983 L/var=0.11 tgt=+0.012/0.301 cfg/b=32913 prep=0.18s gpu=0.00s conv=0.01s add=0.43s train=1.09s
+[t= 983.8s] rebel stream solves=757760 raw=1109/s balanced=1109/s debt=0 rows steps=2960 horizon=0.07 games=170 over=0 card=0 drop=0 L=0.00972 L/var=0.10 tgt=+0.006/0.317 cfg/b=32922 prep=0.20s gpu=0.00s conv=0.01s add=0.45s train=1.11s
+[t= 993.8s] rebel stream solves=766976 raw=1106/s balanced=1106/s debt=0 rows steps=2996 horizon=0.03 games=153 over=0 card=0 drop=0 L=0.01015 L/var=0.11 tgt=+0.008/0.309 cfg/b=33286 prep=0.15s gpu=0.00s conv=0.01s add=0.44s train=0.95s
+[t=1003.8s] rebel stream solves=778240 raw=1107/s balanced=1107/s debt=0 rows steps=3040 horizon=0.03 games=203 over=0 card=0 drop=0 L=0.00976 L/var=0.10 tgt=+0.014/0.313 cfg/b=33422 prep=0.22s gpu=0.00s conv=0.01s add=0.39s train=1.21s
+[t=1013.9s] rebel stream solves=788480 raw=1105/s balanced=1105/s debt=0 rows steps=3080 horizon=0.05 games=191 over=0 card=0 drop=0 L=0.00976 L/var=0.10 tgt=+0.002/0.314 cfg/b=33607 prep=0.20s gpu=0.00s conv=0.01s add=0.39s train=1.12s
+[t=1020.7s] --- snapshot snap_02.pt (s2) ---
+[t=1023.9s] rebel stream solves=799744 raw=1106/s balanced=1106/s debt=0 rows steps=3124 horizon=0.06 games=194 over=0 card=0 drop=0 L=0.01018 L/var=0.10 tgt=+0.008/0.316 cfg/b=33813 prep=0.21s gpu=0.00s conv=0.01s add=0.51s train=1.20s
+[t=1033.9s] rebel stream solves=811008 raw=1106/s balanced=1106/s debt=0 rows steps=3168 horizon=0.07 games=165 over=0 card=0 drop=0 L=0.00983 L/var=0.09 tgt=+0.005/0.325 cfg/b=33836 prep=0.19s gpu=0.00s conv=0.01s add=0.45s train=1.17s
+[t=1043.9s] rebel stream solves=821248 raw=1105/s balanced=1105/s debt=0 rows steps=3208 horizon=0.03 games=200 over=0 card=0 drop=0 L=0.01011 L/var=0.09 tgt=-0.002/0.329 cfg/b=34255 prep=0.22s gpu=0.00s conv=0.01s add=0.44s train=1.17s
+[t=1054.0s] rebel stream solves=831488 raw=1104/s balanced=1104/s debt=0 rows steps=3248 horizon=0.08 games=183 over=0 card=0 drop=0 L=0.00965 L/var=0.09 tgt=+0.005/0.325 cfg/b=34229 prep=0.18s gpu=0.00s conv=0.01s add=0.40s train=1.07s
+[t=1064.0s] rebel stream solves=841728 raw=1103/s balanced=1103/s debt=0 rows steps=3288 horizon=0.06 games=179 over=0 card=0 drop=0 L=0.00983 L/var=0.09 tgt=+0.004/0.325 cfg/b=34391 prep=0.20s gpu=0.00s conv=0.01s add=0.46s train=1.11s
+[t=1074.0s] rebel stream solves=852992 raw=1103/s balanced=1103/s debt=0 rows steps=3332 horizon=0.05 games=226 over=0 card=0 drop=0 L=0.00989 L/var=0.09 tgt=+0.004/0.334 cfg/b=34315 prep=0.20s gpu=0.00s conv=0.01s add=0.45s train=1.18s
+[t=1084.2s] rebel stream solves=864256 raw=1103/s balanced=1103/s debt=0 rows steps=3376 horizon=0.08 games=209 over=0 card=0 drop=0 L=0.00989 L/var=0.09 tgt=+0.007/0.324 cfg/b=34161 prep=0.22s gpu=0.00s conv=0.01s add=0.52s train=1.26s
+[t=1094.3s] rebel stream solves=875520 raw=1103/s balanced=1103/s debt=0 rows steps=3420 horizon=0.07 games=216 over=0 card=0 drop=0 L=0.00993 L/var=0.09 tgt=-0.000/0.329 cfg/b=34603 prep=0.20s gpu=0.00s conv=0.01s add=0.50s train=1.20s
+[t=1104.3s] rebel stream solves=886784 raw=1103/s balanced=1103/s debt=0 rows steps=3464 horizon=0.07 games=190 over=0 card=0 drop=0 L=0.00977 L/var=0.09 tgt=+0.005/0.329 cfg/b=34908 prep=0.20s gpu=0.00s conv=0.01s add=0.46s train=1.26s
+[t=1114.3s] rebel stream solves=898048 raw=1104/s balanced=1104/s debt=0 rows steps=3508 horizon=0.09 games=186 over=0 card=0 drop=0 L=0.01007 L/var=0.09 tgt=+0.005/0.330 cfg/b=34542 prep=0.21s gpu=0.00s conv=0.01s add=0.42s train=1.20s
+[t=1124.5s] rebel stream solves=909312 raw=1104/s balanced=1104/s debt=0 rows steps=3552 horizon=0.06 games=185 over=0 card=0 drop=0 L=0.00998 L/var=0.09 tgt=-0.003/0.334 cfg/b=34650 prep=0.26s gpu=0.00s conv=0.01s add=0.45s train=1.31s
+[t=1134.5s] rebel stream solves=921600 raw=1105/s balanced=1105/s debt=0 rows steps=3600 horizon=0.04 games=200 over=0 card=0 drop=0 L=0.00973 L/var=0.09 tgt=+0.004/0.333 cfg/b=34149 prep=0.22s gpu=0.00s conv=0.01s add=0.50s train=1.29s
+[t=1144.5s] rebel stream solves=931840 raw=1104/s balanced=1104/s debt=0 rows steps=3640 horizon=0.05 games=167 over=0 card=0 drop=0 L=0.00958 L/var=0.08 tgt=+0.006/0.337 cfg/b=34395 prep=0.20s gpu=0.00s conv=0.01s add=0.45s train=1.11s
+[t=1154.6s] rebel stream solves=944128 raw=1106/s balanced=1106/s debt=0 rows steps=3688 horizon=0.05 games=205 over=0 card=0 drop=0 L=0.00970 L/var=0.08 tgt=-0.005/0.339 cfg/b=34068 prep=0.21s gpu=0.00s conv=0.01s add=0.55s train=1.29s
+[t=1164.6s] rebel stream solves=956416 raw=1107/s balanced=1107/s debt=0 rows steps=3736 horizon=0.06 games=222 over=0 card=0 drop=0 L=0.00945 L/var=0.08 tgt=-0.001/0.345 cfg/b=34561 prep=0.22s gpu=0.00s conv=0.01s add=0.56s train=1.33s
+[t=1174.7s] rebel stream solves=968704 raw=1108/s balanced=1108/s debt=0 rows steps=3784 horizon=0.07 games=217 over=0 card=0 drop=0 L=0.00940 L/var=0.08 tgt=-0.005/0.340 cfg/b=34180 prep=0.20s gpu=0.00s conv=0.01s add=0.52s train=1.31s
+[t=1184.8s] rebel stream solves=980992 raw=1110/s balanced=1110/s debt=0 rows steps=3832 horizon=0.06 games=236 over=0 card=0 drop=0 L=0.00975 L/var=0.09 tgt=+0.006/0.334 cfg/b=34062 prep=0.21s gpu=0.00s conv=0.01s add=0.53s train=1.28s
+[t=1194.8s] rebel stream solves=991232 raw=1109/s balanced=1109/s debt=0 rows steps=3872 horizon=0.05 games=186 over=0 card=0 drop=0 L=0.00968 L/var=0.08 tgt=+0.005/0.339 cfg/b=34072 prep=0.18s gpu=0.00s conv=0.01s add=0.47s train=1.10s
+[t=1204.8s] rebel stream solves=1002496 raw=1109/s balanced=1109/s debt=0 rows steps=3916 horizon=0.05 games=217 over=0 card=0 drop=0 L=0.00955 L/var=0.08 tgt=+0.003/0.337 cfg/b=34447 prep=0.19s gpu=0.00s conv=0.01s add=0.50s train=1.18s
+[t=1214.8s] rebel stream solves=1012736 raw=1108/s balanced=1108/s debt=0 rows steps=3956 horizon=0.07 games=163 over=0 card=0 drop=0 L=0.00968 L/var=0.09 tgt=+0.007/0.335 cfg/b=34597 prep=0.20s gpu=0.00s conv=0.01s add=0.46s train=1.12s
+[t=1224.9s] rebel stream solves=1022976 raw=1107/s balanced=1107/s debt=0 rows steps=3996 horizon=0.08 games=186 over=0 card=0 drop=0 L=0.00986 L/var=0.08 tgt=-0.002/0.351 cfg/b=34385 prep=0.26s gpu=0.00s conv=0.01s add=0.43s train=1.20s
+[t=1234.9s] rebel stream solves=1034240 raw=1107/s balanced=1107/s debt=0 rows steps=4040 horizon=0.06 games=222 over=0 card=0 drop=0 L=0.00974 L/var=0.08 tgt=-0.008/0.354 cfg/b=34598 prep=0.23s gpu=0.00s conv=0.01s add=0.49s train=1.27s
+[t=1244.9s] rebel stream solves=1044480 raw=1106/s balanced=1106/s debt=0 rows steps=4080 horizon=0.06 games=169 over=0 card=0 drop=0 L=0.00949 L/var=0.08 tgt=+0.011/0.349 cfg/b=34307 prep=0.18s gpu=0.00s conv=0.01s add=0.43s train=1.11s
+[t=1255.0s] rebel stream solves=1055744 raw=1106/s balanced=1106/s debt=0 rows steps=4124 horizon=0.07 games=198 over=0 card=0 drop=0 L=0.00992 L/var=0.08 tgt=+0.005/0.354 cfg/b=34583 prep=0.19s gpu=0.00s conv=0.01s add=0.50s train=1.22s
+[t=1265.0s] rebel stream solves=1065984 raw=1105/s balanced=1105/s debt=0 rows steps=4164 horizon=0.06 games=165 over=0 card=0 drop=0 L=0.00973 L/var=0.08 tgt=+0.003/0.353 cfg/b=34575 prep=0.21s gpu=0.00s conv=0.01s add=0.40s train=1.15s
+[t=1275.0s] rebel stream solves=1076224 raw=1105/s balanced=1105/s debt=0 rows steps=4204 horizon=0.04 games=180 over=0 card=0 drop=0 L=0.01000 L/var=0.08 tgt=+0.001/0.358 cfg/b=34591 prep=0.22s gpu=0.00s conv=0.01s add=0.42s train=1.14s
+[t=1285.1s] rebel stream solves=1086464 raw=1104/s balanced=1104/s debt=0 rows steps=4244 horizon=0.06 games=167 over=0 card=0 drop=0 L=0.00946 L/var=0.08 tgt=+0.007/0.354 cfg/b=34163 prep=0.20s gpu=0.00s conv=0.01s add=0.43s train=1.14s
+[t=1295.1s] rebel stream solves=1096704 raw=1103/s balanced=1103/s debt=0 rows steps=4284 horizon=0.09 games=186 over=0 card=0 drop=0 L=0.00952 L/var=0.08 tgt=+0.012/0.350 cfg/b=34671 prep=0.17s gpu=0.00s conv=0.01s add=0.45s train=1.09s
+[t=1305.1s] rebel stream solves=1106944 raw=1102/s balanced=1102/s debt=0 rows steps=4324 horizon=0.10 games=176 over=0 card=0 drop=0 L=0.00966 L/var=0.08 tgt=+0.008/0.356 cfg/b=34626 prep=0.18s gpu=0.00s conv=0.01s add=0.42s train=1.06s
+[t=1305.7s] --- lr -> 2.50e-04 ---
+[t=1315.1s] rebel stream solves=1117184 raw=1101/s balanced=1101/s debt=0 rows steps=4364 horizon=0.07 games=151 over=0 card=0 drop=0 L=0.00941 L/var=0.07 tgt=+0.005/0.369 cfg/b=35022 prep=0.28s gpu=0.00s conv=0.01s add=0.45s train=1.21s
+[t=1325.2s] rebel stream solves=1127424 raw=1100/s balanced=1100/s debt=0 rows steps=4404 horizon=0.04 games=185 over=0 card=0 drop=0 L=0.00966 L/var=0.07 tgt=+0.016/0.366 cfg/b=34859 prep=0.20s gpu=0.00s conv=0.01s add=0.41s train=1.13s
+[t=1335.2s] rebel stream solves=1137664 raw=1100/s balanced=1100/s debt=0 rows steps=4444 horizon=0.09 games=170 over=0 card=0 drop=0 L=0.00876 L/var=0.07 tgt=+0.012/0.363 cfg/b=34774 prep=0.17s gpu=0.00s conv=0.01s add=0.37s train=1.07s
+[t=1345.2s] rebel stream solves=1147904 raw=1099/s balanced=1099/s debt=0 rows steps=4484 horizon=0.05 games=205 over=0 card=0 drop=0 L=0.00941 L/var=0.07 tgt=+0.009/0.369 cfg/b=34925 prep=0.19s gpu=0.00s conv=0.01s add=0.43s train=1.14s
+[t=1355.3s] rebel stream solves=1158144 raw=1098/s balanced=1098/s debt=0 rows steps=4524 horizon=0.06 games=161 over=0 card=0 drop=0 L=0.00910 L/var=0.07 tgt=+0.010/0.365 cfg/b=35273 prep=0.20s gpu=0.00s conv=0.01s add=0.45s train=1.14s
+[t=1365.3s] rebel stream solves=1167360 raw=1096/s balanced=1096/s debt=0 rows steps=4560 horizon=0.05 games=158 over=0 card=0 drop=0 L=0.00951 L/var=0.07 tgt=+0.012/0.373 cfg/b=35142 prep=0.16s gpu=0.00s conv=0.01s add=0.39s train=1.00s
+[t=1375.3s] rebel stream solves=1176576 raw=1095/s balanced=1095/s debt=0 rows steps=4596 horizon=0.08 games=157 over=0 card=0 drop=0 L=0.00953 L/var=0.07 tgt=+0.008/0.378 cfg/b=34913 prep=0.16s gpu=0.00s conv=0.01s add=0.44s train=0.96s
+[t=1380.7s] --- snapshot snap_03.pt (s3) ---
+[t=1385.4s] rebel stream solves=1186816 raw=1094/s balanced=1094/s debt=0 rows steps=4636 horizon=0.06 games=188 over=0 card=0 drop=0 L=0.00950 L/var=0.07 tgt=+0.003/0.377 cfg/b=35246 prep=0.16s gpu=0.00s conv=0.01s add=0.45s train=1.08s
+[t=1395.5s] rebel stream solves=1196032 raw=1092/s balanced=1092/s debt=0 rows steps=4672 horizon=0.08 games=153 over=0 card=0 drop=0 L=0.00962 L/var=0.07 tgt=-0.001/0.383 cfg/b=35265 prep=0.19s gpu=0.00s conv=0.01s add=0.41s train=0.98s
+[t=1405.6s] rebel stream solves=1206272 raw=1092/s balanced=1092/s debt=0 rows steps=4712 horizon=0.07 games=163 over=0 card=0 drop=0 L=0.00944 L/var=0.06 tgt=-0.002/0.386 cfg/b=35674 prep=0.17s gpu=0.00s conv=0.01s add=0.46s train=1.12s
+[t=1415.6s] rebel stream solves=1215488 raw=1090/s balanced=1090/s debt=0 rows steps=4748 horizon=0.05 games=174 over=0 card=0 drop=0 L=0.00977 L/var=0.07 tgt=+0.013/0.378 cfg/b=35343 prep=0.22s gpu=0.00s conv=0.01s add=0.41s train=1.08s
+[t=1425.6s] rebel stream solves=1224704 raw=1089/s balanced=1089/s debt=0 rows steps=4784 horizon=0.07 games=161 over=0 card=0 drop=0 L=0.00963 L/var=0.07 tgt=+0.016/0.372 cfg/b=34964 prep=0.20s gpu=0.00s conv=0.01s add=0.43s train=1.03s
+[t=1435.6s] rebel stream solves=1234944 raw=1088/s balanced=1088/s debt=0 rows steps=4824 horizon=0.09 games=185 over=0 card=0 drop=0 L=0.00914 L/var=0.07 tgt=+0.016/0.374 cfg/b=35317 prep=0.22s gpu=0.00s conv=0.01s add=0.46s train=1.11s
+[t=1445.7s] rebel stream solves=1244160 raw=1087/s balanced=1087/s debt=0 rows steps=4860 horizon=0.06 games=176 over=0 card=0 drop=0 L=0.00928 L/var=0.06 tgt=+0.015/0.380 cfg/b=35055 prep=0.26s gpu=0.00s conv=0.01s add=0.44s train=1.07s
+[t=1455.7s] rebel stream solves=1254400 raw=1086/s balanced=1086/s debt=0 rows steps=4900 horizon=0.07 games=192 over=0 card=0 drop=0 L=0.00902 L/var=0.06 tgt=+0.024/0.375 cfg/b=35410 prep=0.17s gpu=0.00s conv=0.01s add=0.46s train=1.07s
+[t=1465.8s] rebel stream solves=1265664 raw=1086/s balanced=1086/s debt=0 rows steps=4944 horizon=0.07 games=188 over=0 card=0 drop=0 L=0.00940 L/var=0.07 tgt=+0.018/0.373 cfg/b=34482 prep=0.20s gpu=0.00s conv=0.01s add=0.47s train=1.17s
+[t=1475.9s] rebel stream solves=1276928 raw=1087/s balanced=1087/s debt=0 rows steps=4988 horizon=0.08 games=209 over=0 card=0 drop=0 L=0.00928 L/var=0.07 tgt=+0.024/0.377 cfg/b=35248 prep=0.21s gpu=0.00s conv=0.01s add=0.53s train=1.24s
+[t=1485.9s] rebel stream solves=1287168 raw=1086/s balanced=1086/s debt=0 rows steps=5028 horizon=0.09 games=166 over=0 card=0 drop=0 L=0.00910 L/var=0.06 tgt=+0.021/0.376 cfg/b=35305 prep=0.18s gpu=0.00s conv=0.01s add=0.45s train=1.09s
+[t=1495.9s] rebel stream solves=1298432 raw=1086/s balanced=1086/s debt=0 rows steps=5072 horizon=0.03 games=173 over=0 card=0 drop=0 L=0.00938 L/var=0.07 tgt=+0.012/0.379 cfg/b=35640 prep=0.21s gpu=0.00s conv=0.01s add=0.48s train=1.22s
+[t=1505.9s] rebel stream solves=1309696 raw=1087/s balanced=1087/s debt=0 rows steps=5116 horizon=0.08 games=215 over=0 card=0 drop=0 L=0.00915 L/var=0.06 tgt=+0.007/0.383 cfg/b=35698 prep=0.23s gpu=0.00s conv=0.01s add=0.47s train=1.25s
+[t=1516.0s] rebel stream solves=1320960 raw=1087/s balanced=1087/s debt=0 rows steps=5160 horizon=0.10 games=195 over=0 card=0 drop=0 L=0.00899 L/var=0.06 tgt=+0.016/0.377 cfg/b=35579 prep=0.23s gpu=0.00s conv=0.01s add=0.48s train=1.26s
+[t=1526.0s] rebel stream solves=1332224 raw=1087/s balanced=1087/s debt=0 rows steps=5204 horizon=0.07 games=207 over=0 card=0 drop=0 L=0.00920 L/var=0.07 tgt=+0.018/0.370 cfg/b=35690 prep=0.21s gpu=0.00s conv=0.01s add=0.49s train=1.22s
+[t=1536.0s] rebel stream solves=1342464 raw=1087/s balanced=1087/s debt=0 rows steps=5244 horizon=0.10 games=174 over=0 card=0 drop=0 L=0.00916 L/var=0.07 tgt=+0.015/0.375 cfg/b=35849 prep=0.20s gpu=0.00s conv=0.01s add=0.45s train=1.13s
+[t=1546.0s] rebel stream solves=1352704 raw=1086/s balanced=1086/s debt=0 rows steps=5284 horizon=0.07 games=170 over=0 card=0 drop=0 L=0.00873 L/var=0.06 tgt=+0.007/0.386 cfg/b=35450 prep=0.21s gpu=0.00s conv=0.01s add=0.46s train=1.12s
+[t=1556.0s] rebel stream solves=1362944 raw=1086/s balanced=1086/s debt=0 rows steps=5324 horizon=0.04 games=151 over=0 card=0 drop=0 L=0.00864 L/var=0.06 tgt=+0.014/0.385 cfg/b=35998 prep=0.21s gpu=0.00s conv=0.01s add=0.47s train=1.16s
+[t=1566.1s] rebel stream solves=1374208 raw=1086/s balanced=1086/s debt=0 rows steps=5368 horizon=0.04 games=200 over=0 card=0 drop=0 L=0.00902 L/var=0.06 tgt=+0.016/0.383 cfg/b=35625 prep=0.22s gpu=0.00s conv=0.01s add=0.47s train=1.22s
+[t=1576.1s] rebel stream solves=1384448 raw=1085/s balanced=1085/s debt=0 rows steps=5408 horizon=0.12 games=199 over=0 card=0 drop=0 L=0.00928 L/var=0.06 tgt=+0.014/0.382 cfg/b=35588 prep=0.22s gpu=0.00s conv=0.01s add=0.43s train=1.13s
+[t=1586.1s] rebel stream solves=1394688 raw=1085/s balanced=1085/s debt=0 rows steps=5448 horizon=0.10 games=154 over=0 card=0 drop=0 L=0.00892 L/var=0.06 tgt=+0.013/0.385 cfg/b=35747 prep=0.19s gpu=0.00s conv=0.01s add=0.44s train=1.10s
+[t=1596.1s] rebel stream solves=1405952 raw=1085/s balanced=1085/s debt=0 rows steps=5492 horizon=0.08 games=195 over=0 card=0 drop=0 L=0.00921 L/var=0.06 tgt=+0.017/0.389 cfg/b=35863 prep=0.22s gpu=0.00s conv=0.01s add=0.49s train=1.22s
+[t=1606.2s] rebel stream solves=1416192 raw=1085/s balanced=1085/s debt=0 rows steps=5532 horizon=0.05 games=190 over=0 card=0 drop=0 L=0.00929 L/var=0.06 tgt=+0.018/0.383 cfg/b=35317 prep=0.19s gpu=0.00s conv=0.01s add=0.47s train=1.13s
+[t=1616.2s] rebel stream solves=1426432 raw=1084/s balanced=1084/s debt=0 rows steps=5572 horizon=0.05 games=173 over=0 card=0 drop=0 L=0.00945 L/var=0.06 tgt=+0.021/0.387 cfg/b=35757 prep=0.19s gpu=0.00s conv=0.01s add=0.45s train=1.11s
+[t=1626.2s] rebel stream solves=1436672 raw=1084/s balanced=1084/s debt=0 rows steps=5612 horizon=0.08 games=183 over=0 card=0 drop=0 L=0.00917 L/var=0.06 tgt=+0.022/0.389 cfg/b=35855 prep=0.24s gpu=0.00s conv=0.01s add=0.50s train=1.18s
+[t=1636.2s] rebel stream solves=1446912 raw=1083/s balanced=1083/s debt=0 rows steps=5652 horizon=0.06 games=209 over=0 card=0 drop=0 L=0.00948 L/var=0.07 tgt=+0.025/0.382 cfg/b=35781 prep=0.18s gpu=0.00s conv=0.02s add=0.45s train=1.09s
+[t=1646.3s] rebel stream solves=1457152 raw=1083/s balanced=1083/s debt=0 rows steps=5692 horizon=0.06 games=145 over=0 card=0 drop=0 L=0.00936 L/var=0.06 tgt=+0.020/0.381 cfg/b=35644 prep=0.21s gpu=0.00s conv=0.01s add=0.49s train=1.13s
+[t=1656.3s] rebel stream solves=1467392 raw=1082/s balanced=1082/s debt=0 rows steps=5732 horizon=0.06 games=182 over=0 card=0 drop=0 L=0.00912 L/var=0.06 tgt=+0.017/0.397 cfg/b=35610 prep=0.21s gpu=0.00s conv=0.01s add=0.49s train=1.15s
+[t=1666.3s] rebel stream solves=1478656 raw=1083/s balanced=1083/s debt=0 rows steps=5776 horizon=0.10 games=205 over=0 card=0 drop=0 L=0.00954 L/var=0.06 tgt=+0.022/0.397 cfg/b=36050 prep=0.18s gpu=0.00s conv=0.01s add=0.46s train=1.15s
+[t=1676.3s] rebel stream solves=1488896 raw=1082/s balanced=1082/s debt=0 rows steps=5816 horizon=0.07 games=179 over=0 card=0 drop=0 L=0.00942 L/var=0.06 tgt=+0.004/0.395 cfg/b=35431 prep=0.20s gpu=0.00s conv=0.01s add=0.40s train=1.08s
+[t=1686.5s] rebel stream solves=1500160 raw=1083/s balanced=1083/s debt=0 rows steps=5860 horizon=0.09 games=204 over=0 card=0 drop=0 L=0.00963 L/var=0.06 tgt=+0.005/0.391 cfg/b=35483 prep=0.20s gpu=0.00s conv=0.01s add=0.49s train=1.17s
+[t=1696.5s] rebel stream solves=1511424 raw=1083/s balanced=1083/s debt=0 rows steps=5904 horizon=0.05 games=212 over=0 card=0 drop=0 L=0.00920 L/var=0.06 tgt=+0.004/0.401 cfg/b=35778 prep=0.18s gpu=0.00s conv=0.01s add=0.50s train=1.19s
+[t=1706.5s] rebel stream solves=1522688 raw=1083/s balanced=1083/s debt=0 rows steps=5948 horizon=0.06 games=173 over=0 card=0 drop=0 L=0.00944 L/var=0.06 tgt=+0.014/0.400 cfg/b=35927 prep=0.20s gpu=0.00s conv=0.01s add=0.52s train=1.20s
+[t=1716.5s] rebel stream solves=1534976 raw=1084/s balanced=1084/s debt=0 rows steps=5996 horizon=0.07 games=229 over=0 card=0 drop=0 L=0.00958 L/var=0.06 tgt=+0.020/0.398 cfg/b=35208 prep=0.29s gpu=0.00s conv=0.01s add=0.50s train=1.40s
+[t=1726.6s] rebel stream solves=1545216 raw=1084/s balanced=1084/s debt=0 rows steps=6036 horizon=0.07 games=183 over=0 card=0 drop=0 L=0.00952 L/var=0.06 tgt=+0.011/0.402 cfg/b=35286 prep=0.16s gpu=0.00s conv=0.01s add=0.35s train=1.06s
+[t=1736.6s] rebel stream solves=1556480 raw=1084/s balanced=1084/s debt=0 rows steps=6080 horizon=0.06 games=201 over=0 card=0 drop=0 L=0.00966 L/var=0.06 tgt=+0.015/0.395 cfg/b=35004 prep=0.21s gpu=0.00s conv=0.01s add=0.45s train=1.23s
+[t=1740.8s] --- snapshot snap_04.pt (s4) ---
+[t=1746.6s] rebel stream solves=1567744 raw=1084/s balanced=1084/s debt=0 rows steps=6124 horizon=0.04 games=221 over=0 card=0 drop=0 L=0.00988 L/var=0.06 tgt=+0.019/0.395 cfg/b=34814 prep=0.24s gpu=0.00s conv=0.01s add=0.48s train=1.24s
+[t=1756.7s] rebel stream solves=1577984 raw=1084/s balanced=1084/s debt=0 rows steps=6164 horizon=0.08 games=172 over=0 card=0 drop=0 L=0.00985 L/var=0.06 tgt=+0.017/0.400 cfg/b=34546 prep=0.20s gpu=0.00s conv=0.01s add=0.46s train=1.14s
+[t=1766.8s] rebel stream solves=1588224 raw=1083/s balanced=1083/s debt=0 rows steps=6204 horizon=0.05 games=192 over=0 card=0 drop=0 L=0.00995 L/var=0.06 tgt=+0.017/0.403 cfg/b=35126 prep=0.17s gpu=0.00s conv=0.01s add=0.42s train=1.07s
+[t=1776.8s] rebel stream solves=1598464 raw=1083/s balanced=1083/s debt=0 rows steps=6244 horizon=0.03 games=185 over=0 card=0 drop=0 L=0.00973 L/var=0.06 tgt=+0.001/0.400 cfg/b=34682 prep=0.18s gpu=0.00s conv=0.01s add=0.41s train=1.09s
+[t=1780.0s] --- stopping GPU admission; draining ---
+[t=1784.0s] rebel stream solves=1603931 raw=1081/s balanced=1081/s debt=364 rows steps=6265 horizon=0.07 games=91 over=0 card=0 drop=0 L=0.00956 L/var=0.06 tgt=+0.011/0.400 cfg/b=34430 prep=0.11s gpu=0.00s conv=0.01s add=0.24s train=0.61s
+[gpu-summary] solves=1603931 optimizer_rows=6415360 debt=364 raw=1069.7/s balanced=1069.7/s horizon=0.06 games=25826 over=0 card=0 exact=0 censored=4608 dropped=0 overrun=0.00s
+[ladder] 6 players, 200 games (20/batch, cap 40/pair)
+  seed                    greedy vs zsctl.init               W  8 L  5 D  7  n= 20  score 0.575
+  seed                    greedy vs zsctl.final              W  0 L 20 D  0  n= 20  score 0.000  stop
+  seed                zsctl.init vs zsctl.s1                 W  2 L 15 D  3  n= 20  score 0.175  stop
+  seed                  zsctl.s1 vs zsctl.s2                 W  5 L 14 D  1  n= 20  score 0.275
+  seed                  zsctl.s2 vs zsctl.s3                 W  7 L 10 D  3  n= 20  score 0.425
+  seed                  zsctl.s3 vs zsctl.final              W  6 L 14 D  0  n= 20  score 0.300
+  swiss                   greedy vs zsctl.init               W 12 L  2 D  6  n= 40  score 0.662
+  swiss                 zsctl.s2 vs zsctl.s3                 W  5 L 15 D  0  n= 40  score 0.338
+  swiss                 zsctl.s3 vs zsctl.final              W  6 L 13 D  1  n= 40  score 0.312
+  swiss                   greedy vs zsctl.s1                 W  0 L 17 D  3  n= 20  score 0.075  stop
+
+=== Elo (runs/zsctl, greedy = 0) ===
+                      player   trained     elo   95%   score
+                 zsctl.final   29.0min     671   113   0.792
+                    zsctl.s3   23.0min     539    81   0.487
+                    zsctl.s2   17.0min     427    94   0.467
+                    zsctl.s1   11.0min     270   113   0.675
+                      greedy         -       0    95   0.350
+                  zsctl.init    5.0min     -85   101   0.283
+[report] runs/zsctl/report.html
