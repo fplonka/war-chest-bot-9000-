@@ -503,7 +503,7 @@ def main():
         raise SystemExit("snapshot_every must be positive minutes")
     snap_gap = args.snapshot_every * 60.0
     t0 = time.time()
-    epoch, phase, log = 0, "greedy", []
+    epoch, log = 0, []
     # Fresh subgames per second over the whole ReBeL phase: the rate
     # docs/GPU_PERF_GOAL.md is about. Generation overlaps training, so
     # per-epoch `gen_s` is not it -- only cumulative solves over cumulative
@@ -904,7 +904,6 @@ def main():
     # different objective; they must not steer ReBeL.
     buf.clear()
     opt = torch.optim.Adam(value.parameters(), lr=args.lr)
-    phase = "rebel"
     rebel_t0 = time.time()
     rebel_solves = 0
     print(f"[t={time.time() - t0:6.1f}s] --- switching to ReBeL ---", flush=True)
