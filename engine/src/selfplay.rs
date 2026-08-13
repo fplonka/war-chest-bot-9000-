@@ -661,6 +661,16 @@ impl<'a> Walk<'a> {
     }
 }
 
+/// Whether the subgame rooted at `s` may be collected. A row's public encoding
+/// is frozen at normal coin-play states, so a subgame rooted mid-coin-play is
+/// solved for play only. A walk that ends of its own accord ends at a leaf, and
+/// a leaf is a coin play; a walk that is *dropped* — by a node cap, by the
+/// other seat playing Greedy or Random, by a slot change — leaves the next
+/// decision wherever the game stands, which can be a forced play or a soak.
+fn collects_rows(gc: &GameCfg, s: &State) -> bool {
+    gc.collect == Collect::Rebel && matches!(s.pending(), Cont::MainPlay)
+}
+
 /// End a walk: take TurboReBeL's intermediate PBSs off the solver — the
 /// beliefs at the walk's current node under each per-iterate average strategy
 /// (t = 0..T-1), from the subgame's root belief. The caller appends the live
@@ -957,7 +967,7 @@ impl<'a> Game<'a> {
                             // CPU path: the full solve, then the walk.
                             sv.warm_start(scfg.warm);
                             sv.multistep(cfg.iters);
-                            if gc.collect == Collect::Rebel {
+                            if collects_rows(gc, s) {
                                 // Phase 2: one fixed-policy value pass per
                                 // carried belief. The first level carries
                                 // nothing yet, so it values just the live
@@ -1012,6 +1022,10 @@ impl<'a> Game<'a> {
                                 // solve's own root, and the only one the
                                 // reference strategy is the exact answer for.
                                 data.push_policy(&sv, ctx, data.nv - 1, player);
+                            } else {
+                                // Nothing will ever value them: this solve is
+                                // the only one whose root they belong to.
+                                carried.clear();
                             }
                             *walk = Some(Walk {
                                 tree: WalkState::Cpu(sv),
@@ -1138,7 +1152,7 @@ impl<'a> Game<'a> {
         let player = self.pending_player;
         let roots_v = self.pending_roots.take().expect("pending roots");
         self.pending_oversize = false;
-        if gc.collect == Collect::Rebel {
+        if collects_rows(gc, &self.s) {
             self.data.begin_solve();
             for (r, v) in roots_v.iter().zip(result.root_values.iter()) {
                 self.data.push_value(
@@ -1209,7 +1223,7 @@ impl<'a> Game<'a> {
         );
         sv.warm_start(scfg.warm);
         sv.multistep(cfg.iters);
-        if self.gc.collect == Collect::Rebel {
+        if collects_rows(self.gc, &self.s) {
             self.data.begin_solve();
             let vals = sv.value_under(&roots_v);
             for (r, v) in roots_v.iter().zip(&vals) {

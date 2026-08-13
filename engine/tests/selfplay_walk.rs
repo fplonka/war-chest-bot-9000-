@@ -90,7 +90,9 @@ fn walk_in_eval_mode() {
     assert_eq!(d.nv, 0, "eval must not collect targets");
 }
 
-/// A non-ReBeL decision ends any pending walk; the pending target is kept.
+/// A non-ReBeL decision drops any pending walk, wherever the game stands — with
+/// random drafts, that includes a Warrior Priest forced play. The pending
+/// target is kept.
 #[test]
 fn walk_interrupted_by_non_rebel_agent() {
     let nets = [Nets::default()];
@@ -107,7 +109,7 @@ fn walk_interrupted_by_non_rebel_agent() {
             ],
             collect: Collect::Rebel,
             explore: 0.1,
-            random_draft: false,
+            random_draft: true,
             eval_mix: 0.0,
             mc_mix: 0.0,
         },
@@ -152,7 +154,10 @@ fn walk_with_random_drafts() {
     );
 }
 
-/// A tiny node cap: fall back to uniform, finish the game, count the cap.
+/// A capped build falls back to a uniform policy and drops the walk, so the
+/// next subgame can root mid-coin-play, where a row has no frozen encoding.
+/// A tiny node cap makes that common; the games must still finish, and the
+/// `push_value` assertion on every saved row is the oracle for the rows.
 #[test]
 fn capped_solves_fall_back_and_games_finish() {
     let nets = [Nets::default()];
@@ -165,15 +170,11 @@ fn capped_solves_fall_back_and_games_finish() {
             Agent::Rebel { cfg: scfg, slot: 0 },
             Agent::Rebel { cfg: scfg, slot: 0 },
         ],
-        collect: Collect::None,
-        explore: 0.25,
-        random_draft: true,
-        eval_mix: 0.0,
-        mc_mix: 0.0,
+        ..rebel([0, 0], 0.25, true)
     };
     let mut dec = 0;
     let mut caps = 0;
-    for i in 0..3u64 {
+    for i in 0..8u64 {
         let d = play(7919 + i, &nets, gc);
         dec += d.decisions;
         caps += d.node_caps;
