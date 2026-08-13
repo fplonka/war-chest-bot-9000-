@@ -337,6 +337,12 @@ pub struct Data {
     /// Attempted subgame builds that hit `Cfg::node_cap` and used the uniform
     /// policy fallback instead of producing a solve.
     pub node_caps: usize,
+    /// Decisions a ReBeL agent answered from the uniform fallback rather than
+    /// from a search, for any reason. A capped build costs one of these plus
+    /// the micro-continuations that finish its coin play, so this is the
+    /// honest count and `node_caps` is the cause. Evaluation must never spend
+    /// any: a ladder rates the checkpoint, not a coin flip.
+    pub unsearched: usize,
     pub configs: usize,
     /// Seconds workers spent blocked on the GPU (idle CPU), summed.
     pub gpu_wait_s: f32,
@@ -394,6 +400,7 @@ impl Data {
         self.zero_sum_n += o.zero_sum_n;
         self.cap_hits += o.cap_hits;
         self.node_caps += o.node_caps;
+        self.unsearched += o.unsearched;
         self.configs += o.configs;
     }
 
@@ -946,6 +953,7 @@ impl<'a> Game<'a> {
                         && !matches!(s.pending(), Cont::MainPlay)
                     {
                         carried.clear();
+                        data.unsearched += 1;
                         fallback = Some(random_policy(s, ctx, player, &cfgs));
                     }
                     if walk.is_none() && fallback.is_none() {
@@ -980,6 +988,7 @@ impl<'a> Game<'a> {
                             walk.take();
                             carried.clear();
                             data.node_caps += 1;
+                            data.unsearched += 1;
                             fallback = Some(random_policy(s, ctx, player, &cfgs));
                         } else if gpu.is_some() {
                             // GPU path: package the tree as one job. The

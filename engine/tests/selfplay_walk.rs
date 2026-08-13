@@ -341,6 +341,7 @@ fn capped_solves_fall_back_and_games_finish() {
     let nets = [warchest::search::Nets::default()];
     let mut total_dec = 0usize;
     let mut total_node_caps = 0usize;
+    let mut total_unsearched = 0usize;
     for seed in 0..10u64 {
         let rng = Rng::new(seed * 7919 + 5);
         let mut d = Data::default();
@@ -362,10 +363,21 @@ fn capped_solves_fall_back_and_games_finish() {
         assert!(z.is_finite());
         total_dec += d.decisions;
         total_node_caps += d.node_caps;
+        total_unsearched += d.unsearched;
     }
     assert!(total_dec > 0);
     assert!(
         total_node_caps > 0,
         "the real solver-cap counter stayed zero"
+    );
+    // `unsearched` counts decisions, `node_caps` counts refused builds. One
+    // capped build costs its own decision plus the micro-continuations that
+    // finish the coin play, so the decision count is the larger of the two and
+    // is what says how much of a run the checkpoint did not actually search.
+    assert!(
+        total_unsearched >= total_node_caps,
+        "unsearched decisions {} fewer than capped builds {}",
+        total_unsearched,
+        total_node_caps
     );
 }
