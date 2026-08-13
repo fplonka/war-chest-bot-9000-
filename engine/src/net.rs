@@ -1269,7 +1269,7 @@ impl Mlp {
                     row[0] = p[k];
                     row[1] = p[NSLOT + k];
                     row[2] = p[2 * NSLOT + k];
-                    row[3] = seat - 0.5;
+                    row[3] = seat;
                     let t = seat as usize * NSLOT + k;
                     row[4..].copy_from_slice(&e[t * de..(t + 1) * de]);
                 }

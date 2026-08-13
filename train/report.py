@@ -1,23 +1,7 @@
-"""One self-contained HTML page per run, or per comparison.
+"""One HTML page per run, or several overlaid.
 
-    python train/report.py runs/dcfr-base            # one run
-    python train/report.py runs/dcfr-* -o cmp.html   # arms overlaid
-
-`exp.py` calls this when a run finishes, so looking at a result never means
-opening a terminal, and never means a plotting window on a box that has no
-display -- which is what the matplotlib version this replaces could not do.
-
-The page carries the four things a run is read from (strength against training
-time, the value loss split by row age, the spread of the predictions, and
-generation throughput), the data-health counters the logs have always recorded
-and nobody ever saw, the ladder's own head-to-head records, and the config
-delta that says what this arm actually changed. No external files, no CDN, no
-fonts to fetch: one page that can be copied off the box and still render.
-
-The head-to-head table is not decoration. Elo assumes transitivity, and in a
-game with any rock-paper-scissors structure an arm can gain rating against the
-field while losing to the specific control it is meant to beat. When those two
-disagree the direct record is the one that answers the experiment's question.
+    python train/report.py runs/base
+    python train/report.py runs/a runs/b -o cmp.html
 """
 
 import argparse
@@ -412,7 +396,7 @@ def page(runs, title, js):
 
 
 def write_all(runs_dir=RUNS_DIR):
-    """Regenerate every run that left a log.json. `box.sh pull` calls this."""
+    """Regenerate every run that left a log.json."""
     if not os.path.isdir(runs_dir):
         return
     for name in sorted(os.listdir(runs_dir)):
@@ -425,7 +409,7 @@ def write_all(runs_dir=RUNS_DIR):
 
 
 def write(runs, out=None, title=None, standalone=False):
-    """Render `runs` (directories) to one page. The callable form exp.py uses.
+    """Render run directories to one page. Plotly lives once in runs/.
 
     The Plotly bundle is written once into `runs/` and every report links to it
     by relative path, rather than being inlined into each page. Three megabytes

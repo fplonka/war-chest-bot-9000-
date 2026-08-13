@@ -833,7 +833,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
 /// Run `games` self-play games across all cores and return the training data.
 /// `mode` is "greedy" (Monte-Carlo warm start) or "rebel".
 #[pyfunction]
-#[pyo3(signature = (games, seed, mode, depth=1, iters=16, explore=0.25, temp=2.0, random_draft=false, eval_mix=0.5, mc_mix=0.0, cfr="linear", warm=0.0))]
+#[pyo3(signature = (games, seed, mode, depth=1, iters=16, explore=0.25, temp=2.0, random_draft=true, eval_mix=0.5, mc_mix=0.0, cfr="linear", warm=0.0))]
 #[allow(clippy::too_many_arguments)]
 fn gen_data(
     py: Python<'_>,
@@ -892,7 +892,7 @@ fn gen_data(
 /// pitted against itself at different depths or iteration counts (the depth
 /// probe); they default to side A's.
 #[pyfunction]
-#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=false, depth_b=None, iters_b=None, cfr="linear", warm=0.0, gpu=false))]
+#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=true, depth_b=None, iters_b=None, cfr="linear", warm=0.0, gpu=false))]
 #[allow(clippy::too_many_arguments)]
 fn eval_match(
     py: Python<'_>,

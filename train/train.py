@@ -2,7 +2,7 @@
 
 Two phases inside one wall-clock budget:
 
-1. **Warm start** (`--warm-frac` of the budget). Both players are a stochastic
+1. **Warm start** (`warm_minutes` of the budget). Both players are a stochastic
    one-ply greedy bot on a public-information evaluation; value targets blend
    that evaluation (squashed into (-1, 1)) with the realised game outcome.
    ReBeL never plays a policy directly — every move comes out of CFR using the
@@ -24,9 +24,11 @@ exact configs in support, their probabilities, and the value the solve gave
 each. The config lists are ragged, so they live in a flat arena and a batch is
 assembled by gathering spans -- see `Buffer`.
 
-The run saves a fixed number of snapshots over the ReBeL phase and does not try
-to decide which one is best while it is training. `exp.py` rates them against
-Greedy once the run is over.
+The run snapshots every `snapshot_every` minutes of ReBeL. When training
+ends, the snapshots play Greedy (random drafts) and a report is written.
+
+    python train/train.py
+    python train/train.py minutes=6 warm_minutes=2
 """
 
 import argparse
@@ -451,31 +453,29 @@ def write_log(args, epochs, snaps):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Train one run. Settings come from a config file written by "
-                    "exp.py, or from BASELINE plus --set overrides.")
-    ap.add_argument("--config", default="", help="JSON config (see config.py)")
-    ap.add_argument("--set", nargs="*", default=[],
-                    help="knob=value overrides on top of the config")
-    ap.add_argument("--out", default="")
-    cli = ap.parse_args()
-
-    args = config.load(cli.config) if cli.config else config.BASELINE
-    over = dict(kv.split("=", 1) for kv in cli.set)
-    if cli.out:
-        over["out"] = cli.out
-    if over:
-        fields = {f.name: getattr(f.type, "__name__", f.type)
-                  for f in dataclasses.fields(config.Cfg)}
-        cast = {"int": int, "float": float,
-                "bool": lambda v: v not in ("0", "false", "False", "")}
-        unknown = set(over) - set(fields)
-        if unknown:
-            raise SystemExit(f"no such knob: {sorted(unknown)}")
-        args = dataclasses.replace(args, **{
-            k: cast.get(fields[k], str)(v) for k, v in over.items()})
+        description="Train one run, then rate its snapshots against Greedy.")
+    ap.add_argument("over", nargs="*", help="knob=value (defaults are gpu_golden8)")
+    over = config.parse(ap.parse_args().over)
+    over.pop("out", None)
+    args = dataclasses.replace(config.BASELINE, **over)
     args.git = config.git_sha()
+    args.out = f"runs/{config.label(over)}"
+    if os.path.exists(args.out):
+        raise SystemExit(f"{args.out} exists")
+    os.makedirs(args.out)
+    logf = open(f"{args.out}/train.log", "w")
 
-    os.makedirs(args.out, exist_ok=True)
+    class Tee:
+        def write(self, s):
+            sys.__stdout__.write(s)
+            logf.write(s)
+            return len(s)
+        def flush(self):
+            sys.__stdout__.flush()
+            logf.flush()
+    sys.stdout = sys.stderr = Tee()
+    print(f"[train] {args.out} at {args.git} {over or 'baseline'}", flush=True)
+
     torch.manual_seed(args.seed)
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
@@ -538,7 +538,9 @@ def main():
     warm = args.warm_minutes * 60.0
     if not 0.0 <= warm <= total:
         raise SystemExit("warm_minutes must be between zero and the run length")
-    snap_gap = (total - warm) / max(args.snapshots, 1)
+    if args.snapshot_every <= 0:
+        raise SystemExit("snapshot_every must be positive minutes")
+    snap_gap = args.snapshot_every * 60.0
     t0 = time.time()
     epoch, phase, log = 0, "greedy", []
     # Fresh subgames per second over the whole ReBeL phase: the rate
@@ -850,7 +852,7 @@ def main():
     print(f"[cfg] PUBFEAT={PUBFEAT} CFEAT={CFEAT} hidden={args.hidden} "
           f"head={args.head or args.hidden} dg={args.dg} rank={args.rank} "
           f"depth={args.depth} iters={args.iters} budget={total:.0f}s "
-          f"warm={warm:.0f}s snapshots={args.snapshots} (every {snap_gap / 60:.1f}min) "
+          f"warm={warm:.0f}s snapshot_every={args.snapshot_every:g}min "
           f"device={dev} draft={'random' if args.random_draft else 'starter'} "
           f"train_gen_ratio={args.train_gen_ratio} "
           f"recent_mix={args.recent_mix}/{args.recent_frac} "
@@ -948,30 +950,10 @@ def main():
 
     snapshot("final", time.time() - t0)
     write_log(args, log, snaps)
-    try:
-        import report
-        report.write([args.out])
-    except Exception as e:
-        print(f"[report] skipped: {e}", flush=True)
-
-    if args.dump_buffer:
-        # Oldest row first, so a recency split is an honest held-out set.
-        # The dump carries the frozen row format (version + rules hash) and
-        # the solve offsets, so offline comparisons can split at solve
-        # boundaries and refuse dumps from a different rules build.
-        rows, cc, cp, cw, cy, seg = buf.ordered()
-        # Solve boundaries in dump-row space; the oldest partial solve starts
-        # before the dump, so 0 is prepended.
-        lo = buf.lo
-        soff = np.concatenate([[0], buf.soff[(buf.soff > lo) & (buf.soff < buf.rows)] - lo,
-                               [len(rows)]])
-        np.savez(args.dump_buffer, rows=rows, cc=cc, cp=cp, cw=cw, cy=cy, seg=seg,
-                 soff=soff, pubfeat=np.int32(PUBFEAT), cfeat=np.int32(CFEAT),
-                 ccounts=np.int32(CCOUNTS), cnorm=np.float32(CNORM),
-                 row_bytes=np.int32(ROW_BYTES), version=np.int32(warchest.ROW_FORMAT_VERSION),
-                 rules_hash=np.uint64(warchest.rules_table_hash()))
-        print(f"dumped {len(rows)} buffer rows ({len(cy)} configs) to {args.dump_buffer}",
-              flush=True)
+    import ladder
+    import report
+    ladder.run([args.out], games=args.ladder_games, gpu=True)
+    report.write([args.out])
 
 
 if __name__ == "__main__":

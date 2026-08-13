@@ -6,8 +6,9 @@
 #   tools/box.sh <command...>
 #   tools/box.sh -bg <tag> <command...>
 #   tools/box.sh pull
-#   tools/box.sh follow sanity
-#   tools/box.sh go sanity
+#   tools/box.sh go
+#   tools/box.sh go minutes=6 warm_minutes=2
+#   tools/box.sh follow run
 #
 # `go` is the one to use.
 set -euo pipefail
@@ -70,12 +71,11 @@ follow)
     fi
     ;;
 go)
-    exp=${2:?usage: go <experiment> [extra exp.py args...]}
-    shift 2
+    shift
     "$0" sync
     "$0" build
-    "$0" -bg "$exp" "python train/exp.py run $exp $*"
-    "$0" follow "$exp"
+    "$0" -bg run "python train/train.py $*"
+    "$0" follow run
     ;;
 -bg)
     tag=${2:?usage: -bg <tag> <command...>}

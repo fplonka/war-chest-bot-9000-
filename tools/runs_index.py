@@ -64,6 +64,18 @@ def health(run):
         if loss is not None and std:
             bits.append(f"L/var {loss / max(std * std, 1e-9):.2f}")
     lad = load_json(os.path.join(RUNS, run, "ladder.json")) or {}
+    vs = []
+    for p in sorted((x for x in lad.get("players") or [] if x.get("t") is not None),
+                    key=lambda x: x["t"]):
+        for q in lad.get("pairs") or []:
+            if q.get("a") == p["name"] and q.get("b") == "greedy":
+                vs.append(q["score"])
+                break
+            if q.get("b") == p["name"] and q.get("a") == "greedy":
+                vs.append(1.0 - q["score"])
+                break
+    if vs:
+        bits.append("vsG " + " ".join(f"{s:.2f}" for s in vs))
     fin = next((p for p in lad.get("players") or []
                 if str(p.get("name", "")).endswith(".final")), None)
     if fin and fin.get("elo") is not None:

@@ -5,9 +5,7 @@
 
 Every checkpoint plays Greedy. That is the curve: strength against a fixed
 bot, over training time. When several runs are named, their finals also play
-each other. Random drafts are the default; `--fixed-draft` is the exception.
-
-Greedy is pinned at 0. Ratings come from Bradley-Terry / Zermelo MM.
+each other. Random drafts. Greedy is pinned at 0.
 """
 
 import argparse
@@ -64,14 +62,7 @@ def elo_stderr(n, elo):
     return out
 
 
-def parse_search(spec):
-    if not spec:
-        return None
-    cfr, _, iters = spec.partition(":")
-    return dict(SEARCH, cfr=cfr, iters=int(iters or SEARCH["iters"]))
-
-
-def players_of(runs, labels=None, search=None):
+def players_of(runs):
     ps = [{"name": "greedy", "agent": "greedy", "slot": 0, "t": None,
            "run": None, "search": SEARCH, "final": False}]
     for run in runs:
@@ -79,15 +70,13 @@ def players_of(runs, labels=None, search=None):
         with open(f"{run}/log.json") as f:
             log = json.load(f)
         cfg = log.get("cfg", {})
-        selected = [s for s in log.get("snapshots", [])
-                    if labels is None or s["label"] in labels]
-        for s in selected:
+        for s in log.get("snapshots", []):
             ck = torch.load(f"{run}/{s['file']}", map_location="cpu", weights_only=False)
             own = {k: cfg.get(k, v) for k, v in SEARCH.items()}
             own.update(ck.get("search") or {})
             ps.append({"name": f"{tag}.{s['label']}", "agent": "rebel",
                        "slot": len(ps), "t": s["t"], "file": s["file"],
-                       "run": run, "search": search or own,
+                       "run": run, "search": own,
                        "final": s["label"] == "final"})
     return ps
 
@@ -103,13 +92,11 @@ def edges(ps):
     return out
 
 
-def run(runs, out=None, games=100, temp=2.0, random_draft=True, seed=7,
-        labels=None, gpu=False, search=None):
-    if out is None:
-        out = runs[0]
+def run(runs, games=100, gpu=False, seed=7):
+    out = runs[0]
     if games <= 0 or games % 2:
         raise ValueError("games must be a positive even count")
-    ps = players_of(runs, labels, search)
+    ps = players_of(runs)
     nets = [p for p in ps if p["agent"] == "rebel"]
     if not nets:
         raise SystemExit(f"{runs}: no snapshots in log.json")
@@ -149,8 +136,8 @@ def run(runs, out=None, games=100, temp=2.0, random_draft=True, seed=7,
         w, l, d = warchest.eval_match(
             games, pair_seed, a["agent"], b["agent"],
             depth=sa["depth"], iters=sa["iters"], cfr=sa["cfr"], warm=sa["warm"],
-            temp=temp, slot_a=a["slot"], slot_b=b["slot"],
-            random_draft=random_draft,
+            temp=2.0, slot_a=a["slot"], slot_b=b["slot"],
+            random_draft=True,
             depth_b=sb["depth"], iters_b=sb["iters"], gpu=gpu)
         n[i][j] = n[j][i] = w + l + d
         sc[i][j], sc[j][i] = w + 0.5 * d, l + 0.5 * d
@@ -164,7 +151,7 @@ def run(runs, out=None, games=100, temp=2.0, random_draft=True, seed=7,
     elo = fit_elo(npr, spr)
     se = elo_stderr(n, elo)
     res = {"runs": list(runs), "games": games, "schedule_seed": seed,
-           "draft_mode": "random" if random_draft else "fixed",
+           "draft_mode": "random",
            "players": [{"name": p["name"], "run": p["run"], "t": p["t"],
                         "search": p["search"], "elo": round(float(e), 1),
                         "se": round(float(s), 1),
@@ -185,19 +172,10 @@ def run(runs, out=None, games=100, temp=2.0, random_draft=True, seed=7,
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("runs", nargs="+")
-    ap.add_argument("--out", dest="dest", default=None)
     ap.add_argument("--games", type=int, default=100)
-    ap.add_argument("--temp", type=float, default=2.0)
-    ap.add_argument("--fixed-draft", action="store_true")
-    ap.add_argument("--labels", default=None)
-    ap.add_argument("--seed", type=int, default=7)
-    ap.add_argument("--eval-search", default="")
     ap.add_argument("--gpu", action="store_true")
     args = ap.parse_args()
-    run(args.runs, out=args.dest, games=args.games, temp=args.temp,
-        random_draft=not args.fixed_draft, seed=args.seed,
-        labels=args.labels.split(",") if args.labels else None,
-        search=parse_search(args.eval_search), gpu=args.gpu)
+    run(args.runs, games=args.games, gpu=args.gpu)
 
 
 if __name__ == "__main__":
