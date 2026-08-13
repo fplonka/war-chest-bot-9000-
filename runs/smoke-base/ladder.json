@@ -1,0 +1,118 @@
+{
+ "runs": [
+  "runs/smoke-base"
+ ],
+ "games": 40,
+ "schedule_seed": 7,
+ "draft_mode": "random",
+ "players": [
+  {
+   "name": "greedy",
+   "run": null,
+   "t": null,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 0.0,
+   "se": 30.4,
+   "score": 0.312
+  },
+  {
+   "name": "smoke-base.init",
+   "run": "runs/smoke-base",
+   "t": 121.5,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 8.5,
+   "se": 55.0,
+   "score": 0.512
+  },
+  {
+   "name": "smoke-base.s1",
+   "run": "runs/smoke-base",
+   "t": 201.7,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 104.8,
+   "se": 57.5,
+   "score": 0.65
+  },
+  {
+   "name": "smoke-base.s2",
+   "run": "runs/smoke-base",
+   "t": 282.1,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 220.4,
+   "se": 66.4,
+   "score": 0.787
+  },
+  {
+   "name": "smoke-base.final",
+   "run": "runs/smoke-base",
+   "t": 360.0,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 233.0,
+   "se": 67.8,
+   "score": 0.8
+  }
+ ],
+ "pairs": [
+  {
+   "a": "smoke-base.init",
+   "b": "greedy",
+   "w": 13,
+   "l": 12,
+   "d": 15,
+   "n": 40,
+   "score": 0.512
+  },
+  {
+   "a": "smoke-base.s1",
+   "b": "greedy",
+   "w": 19,
+   "l": 7,
+   "d": 14,
+   "n": 40,
+   "score": 0.65
+  },
+  {
+   "a": "smoke-base.s2",
+   "b": "greedy",
+   "w": 28,
+   "l": 5,
+   "d": 7,
+   "n": 40,
+   "score": 0.787
+  },
+  {
+   "a": "smoke-base.final",
+   "b": "greedy",
+   "w": 27,
+   "l": 3,
+   "d": 10,
+   "n": 40,
+   "score": 0.8
+  }
+ ]
+}
