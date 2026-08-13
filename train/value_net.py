@@ -99,6 +99,37 @@ def upgrade_state_dict(sd):
     return out
 
 
+def zero_sum(v, w, seg, nseg):
+    """Project a position's values onto the zero-sum constraint the game obeys.
+
+    War Chest is zero-sum, so at one position the two players' belief-weighted
+    values must cancel. Nothing in the loss asks for that -- it is a per-config
+    regression -- and under bootstrapping a constant added to both players'
+    leaf values lands in both their targets, so the loop carries it instead of
+    correcting it. Measured on trained checkpoints at +0.025 and +0.037 against
+    a value spread of 0.4 (`runs/solvererr_g8`).
+
+    With `m_p` the belief-weighted mean of player p's raw values, this returns
+    `v - (m_0 + m_1) / 2`. Written the other way round it is
+
+        a_p(c) = v_p(c) - m_p        each player's advantages, zero-mean
+        q      = (m_0 - m_1) / 2     one antisymmetric game value
+        v_0 = a_0 + q                v_1 = a_1 - q
+
+    so every within-player difference survives and exactly one shared scalar --
+    the one a zero-sum game cannot have -- is removed. `seg` is `2 * row + seat`
+    and `w` is the belief, so the two seats of a row are neighbours.
+
+    This is DeepStack's zero-sum outer layer. It has to be the effective output
+    of training *and* search, or CFR keeps solving a game that is not zero-sum;
+    see `engine/src/net.rs` and `engine/src/gpu/wave_kernels.cu`.
+    """
+    num = torch.zeros(nseg, dtype=v.dtype, device=v.device).index_add_(0, seg, w * v)
+    den = torch.zeros(nseg, dtype=v.dtype, device=v.device).index_add_(0, seg, w)
+    m = num / den.clamp(min=1e-9)
+    return v - 0.5 * (m[0::2] + m[1::2])[seg // 2]
+
+
 class Mlp(nn.Module):
     """The value network: `v(PBS, config) -> scalar`.
 
@@ -332,9 +363,15 @@ class Mlp(nn.Module):
         pay = psi[:, AOFF_PAYS:AOFF_PAYS + NTYPE].unsqueeze(1) @ e     # [A, 1, de]
         return F.relu(self.wq(torch.cat([psi, pay.squeeze(1)], -1)))
 
-    def forward(self, xpub, unit_ids, phi, inv, w, seg, nseg):
-        """Values for every config in a ragged batch. See the docstring of the
-        original for the layout; unchanged."""
+    def forward(self, xpub, unit_ids, phi, inv, w, seg, nseg, project=True):
+        """Values for every config in a ragged batch.
+
+        `project` applies the zero-sum layer, which needs the whole support and
+        so belongs here rather than in the per-config network: `net.rs::forward`
+        returns one value for one config and has nothing to project over. Pass
+        `project=False` to compare against it raw, which is what
+        `train/test_parity.py` does.
+        """
         e = self.cards(xpub, unit_ids)
         crow = torch.zeros(phi.shape[0], dtype=torch.long, device=phi.device)
         crow.scatter_(0, inv, seg // 2)
@@ -347,7 +384,8 @@ class Mlp(nn.Module):
         u = self.wu(h)
         rk = u.shape[1]
         gc = g[inv]
-        return (u[seg // 2] * gc[:, :rk]).sum(-1) + gc[:, rk]
+        v = (u[seg // 2] * gc[:, :rk]).sum(-1) + gc[:, rk]
+        return zero_sum(v, w, seg, nseg) if project else v
 
     def flat(self):
         """The weights as the three flat arrays Rust reads, in the v3 order
