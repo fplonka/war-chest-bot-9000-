@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
-# The GPU box, in one script: send the code, run something, bring results back.
+# The GPU box: send the code, run train.py, bring reports back.
 #
+#   tools/box.sh go out=seat note="the idea"
+#   tools/box.sh follow run
+#   tools/box.sh pull
 #   tools/box.sh sync
 #   tools/box.sh build
 #   tools/box.sh <command...>
-#   tools/box.sh -bg <tag> <command...>
-#   tools/box.sh pull
-#   tools/box.sh go
-#   tools/box.sh go minutes=6 warm_minutes=2
-#   tools/box.sh follow run
-#
-# `go` is the one to use.
 set -euo pipefail
 
 host=${WARCHEST_BOX_HOST:-184.144.224.246}
@@ -47,14 +43,10 @@ pull)
         --include 'train.log' \
         --exclude '*' "root@$host:$remote/runs/" "$here/runs/"
     echo "pulled reports into $here/runs"
-    python3 "$here/tools/runs_index.py"
     ;;
 build)
     run_remote "find engine/src engine/tests engine/examples -type f -exec touch {} +
 cd engine && maturin develop --release --features python,gpu 2>&1 | tail -2"
-    ;;
-tail)
-    run_remote "tail -f /workspace/logs/${2:?usage: tail <tag>}.log"
     ;;
 follow)
     tag=${2:?usage: follow <tag>}
@@ -74,20 +66,15 @@ go)
     shift
     "$0" sync
     "$0" build
-    "$0" -bg run python train/train.py "$@"
-    "$0" follow run
-    ;;
--bg)
-    tag=${2:?usage: -bg <tag> <command...>}
-    shift 2
-    cmd=$(printf '%q ' "$@")
+    cmd=$(printf '%q ' python train/train.py "$@")
     run_remote "mkdir -p /workspace/logs
 nohup setsid bash -lc $(printf '%q' "$prelude
-echo \$\$ > /workspace/logs/$tag.pid
+echo \$\$ > /workspace/logs/run.pid
 $cmd
-echo \$? > /workspace/logs/$tag.exit") >/workspace/logs/$tag.log 2>&1 &
-echo started $tag"
+echo \$? > /workspace/logs/run.exit") >/workspace/logs/run.log 2>&1 &
+echo started run"
+    "$0" follow run
     ;;
-"")  sed -n '2,12p' "$0" ;;
+"")  sed -n '2,10p' "$0" ;;
 *)   run_remote "$*" ;;
 esac

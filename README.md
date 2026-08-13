@@ -40,8 +40,8 @@ is a commercial product, so it is not redistributed here.
 ```bash
 uv venv --python 3.12 .venv && VIRTUAL_ENV=.venv uv pip install torch numpy maturin
 cd engine && maturin develop --release && cd ..
-.venv/bin/python train/train.py --minutes 30 --out runs/mine
-.venv/bin/python train/plot.py runs/mine
+.venv/bin/python train/train.py out=mine minutes=30
+.venv/bin/python train/report.py runs/mine
 ```
 
 ## Playing against a trained agent

@@ -27,9 +27,9 @@ assembled by gathering spans -- see `Buffer`.
 The run snapshots every `snapshot_every` minutes of ReBeL. When training
 ends, the snapshots play Greedy (random drafts) and a report is written.
 
-    python train/train.py
-    python train/train.py minutes=6 warm_minutes=2
+    python train/train.py out=seat
     python train/train.py out=seat note="centre the seat bit at ±0.5"
+    python train/train.py out=smoke minutes=6 warm_minutes=2
 """
 
 import argparse
@@ -52,7 +52,7 @@ import warchest
 import config
 import mirror
 from export_weights import load as load_checkpoint
-from value_net import Mlp, AUX, AFEAT
+from value_net import Mlp, AUX
 
 PUBFEAT = warchest.PUBFEAT
 CFEAT = warchest.CFEAT
@@ -299,94 +299,13 @@ def value_loss(net, xpub, unit_ids, phi, inv, w, seg, y, nseg):
     return (per * w).sum() / w.sum().clamp(min=1e-6)
 
 
-def policy_loss(net, d, ids, device):
-    """Cross-entropy from the policy head to the solves' own reference strategy,
-    weighted by the belief -- the same weighting the value loss uses, and for the
-    same reason: a config the belief gives 1% to is worth 1% of the gradient.
-
-    Trained on the fresh epoch only, never from the replay buffer. A value target
-    is bootstrapped and gains from being averaged over a long history; a strategy
-    is not, and the epoch regenerates every one of them.
-
-    Action lists are ragged across solves, so they are padded to the widest in
-    the batch and masked. The target gives illegal actions probability exactly
-    zero, so legality needs no separate mask in the loss; the solver masks by
-    real legality when it reads the head.
-    """
-    prow, pact, paoff, coff = d["prow"][ids], d["pact"][ids], d["paoff"], d["coff"]
-    pa, pp = d["pa"].reshape(-1, AFEAT), d["pp"]
-    cc, cw = d["cc"].reshape(-1, CCOUNTS), d["cw"]
-    na = (paoff[ids + 1] - paoff[ids]).astype(np.int64)
-    S, NA = len(ids), int(na.max())
-
-    # The row's configs: both players for the belief block, the acting player's
-    # alone for the strategy, which is indexed by them.
-    both = [np.arange(coff[2 * r], coff[2 * r + 2]) for r in prow]
-    mine = [np.arange(coff[2 * r + p], coff[2 * r + p + 1]) for r, p in zip(prow, pact)]
-    nc = np.array([len(m) for m in mine])
-    seg = np.concatenate([2 * j + (np.arange(len(b)) >= coff[2 * r + 1] - coff[2 * r])
-                          for j, (b, r) in enumerate(zip(both, prow))]).astype(np.int64)
-    both, mine = np.concatenate(both), np.concatenate(mine)
-
-    apad = np.zeros((S, NA, AFEAT), np.float32)
-    amask = np.zeros((S, NA), bool)
-    tgt = np.zeros((int(nc.sum()), NA), np.float32)
-    at, ct = 0, 0
-    for j, i in enumerate(ids):
-        apad[j, :na[j]] = pa[paoff[i]:paoff[i] + na[j]]
-        amask[j, :na[j]] = True
-        tgt[ct:ct + nc[j], :na[j]] = pp[at:at + nc[j] * na[j]].reshape(nc[j], na[j])
-        at, ct = at + nc[j] * na[j], ct + nc[j]
-
-    t = lambda a, dt=torch.float32: torch.as_tensor(np.ascontiguousarray(a), dtype=dt, device=device)
-    phi = lambda idx, seats: t(np.concatenate(
-        [cc[idx].astype(np.float32) / CNORM, seats[:, None].astype(np.float32)], 1))
-    csol = t(np.repeat(np.arange(S), nc), torch.long)
-
-    # Expand the selected rows (one per solve) from the packed format.
-    rows = d["rows"].reshape(-1, ROW_BYTES)[prow]
-    first = np.stack([coff[2 * prow], coff[2 * prow + 1]], 1)  # [S, 2] span starts
-    cs = cc[first]
-    hand = cs[:, :, :5].sum(2).astype(np.uint8)
-    fd = cs[:, :, 5:10].sum(2).astype(np.uint8)
-    bag = cs[:, :, 10:].sum(2).astype(np.uint8)
-    x = t(np.asarray(
-        warchest.expand_rows(rows.ravel(), hand, fd, bag), np.float32).reshape(S, -1))
-    e = net.cards(x, t(rows[:, ROW_IDS:ROW_IDS + NTYPE], torch.long))
-    zb = net.holdings(phi(both, seg & 1), e[t(seg // 2, torch.long)])
-    b = torch.zeros(2 * S, zb.shape[1], dtype=zb.dtype, device=device)
-    b.index_add_(0, t(seg, torch.long), zb * t(cw[both]).unsqueeze(1))
-    h = F.relu(net.ln0(net.public_trunk(x, e)))
-    h = F.relu(net.ln1(net.w1(h) + net.wb(b.reshape(S, -1))))
-
-    q = net.actions(t(apad.reshape(-1, AFEAT)),
-                    e.repeat_interleave(NA, 0)).reshape(S, NA, -1)
-    k = net.wp(h)[csol] + net.wk(net.holdings(phi(mine, np.repeat(pact, nc)), e[csol]))
-    logit = (k.unsqueeze(1) * q[csol]).sum(-1).masked_fill(~t(amask, torch.bool)[csol], -1e30)
-    ce = -(t(tgt) * logit.log_softmax(-1)).sum(-1)
-    w = t(cw[mine])
-    return (ce * w).sum() / w.sum().clamp(min=1e-6)
-
-
 def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
-                recent_mix=0.0, recent_frac=0.2, aux_weight=0.0, policy_weight=0.0,
-                d=None, policy_batch=64, profile_cuda=False, batch_fn=make_batch):
-    """Returns the mean value loss and the mean policy loss.
-
-    The side tasks are summed into the same backward as the value loss, not
-    stepped separately. Adam divides a gradient by its own magnitude, so a
-    constant in front of a *standalone* step almost cancels -- a weight only
-    means anything when it sets one term's size against another's in one sum.
-    """
+                recent_mix=0.0, recent_frac=0.2, profile_cuda=False,
+                batch_fn=make_batch):
+    """Mean value loss over `steps` Adam updates."""
     if len(buf) < batch:
-        return float("nan"), float("nan"), {}
-    live = policy_weight > 0.0 and d is not None and len(d["prow"]) > 0
-    # Drawn unconditionally, and from its own stream: sampling policy labels out
-    # of `rng` would shift every later value batch, so turning the policy on
-    # would change the value batches too and any comparison against it would be
-    # measuring the sampling, not the side task.
-    prng = np.random.default_rng(rng.integers(1 << 62))
-    tot, ptot = 0.0, 0.0
+        return float("nan"), {}
+    tot = 0.0
     stat = {"sample_s": 0.0, "prepare_s": 0.0, "forward_wall_s": 0.0,
             "backward_wall_s": 0.0, "batch_configs": 0, "steps": steps,
             "gpu_forward_s": 0.0, "gpu_backward_s": 0.0}
@@ -407,22 +326,10 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
             f0.record(stream)
         ts = time.perf_counter()
         loss = value_loss(net, *parts[:-1])
-        ay = parts[-1]
-        # What is reported is the value loss alone, so the column means the same
-        # thing whether or not the side tasks are on.
         tot += loss.detach().item()
         stat["forward_wall_s"] += time.perf_counter() - ts
         if stream is not None:
             f1.record(stream)
-        # Both side tasks share the trunk and are dropped at play time, so they
-        # are extra gradient per row for nothing at inference.
-        if aux_weight > 0.0:
-            loss = loss + aux_weight * net.aux_loss(parts[0], parts[1], ay)
-        if live:
-            n = len(d["prow"])
-            pl = policy_loss(net, d, prng.choice(n, min(policy_batch, n), replace=False), device)
-            ptot += pl.detach().item()
-            loss = loss + policy_weight * pl
         ts = time.perf_counter()
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -436,7 +343,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
         torch.cuda.synchronize(device)
         stat["gpu_forward_s"] = sum(a.elapsed_time(b) for a, b, _ in event_pairs) / 1000.0
         stat["gpu_backward_s"] = sum(b.elapsed_time(c) for _, b, c in event_pairs) / 1000.0
-    return tot / steps, (ptot / steps if live else float("nan")), stat
+    return tot / steps, stat
 
 
 def physical_cpus():
@@ -513,9 +420,11 @@ def main():
     ap.add_argument("over", nargs="*", help="knob=value (defaults are gpu_golden8)")
     over = config.parse(ap.parse_args().over)
     name = over.pop("out", None)
+    if not name:
+        raise SystemExit("pass out=<name>")
     args = dataclasses.replace(config.BASELINE, **over)
     args.git = config.git_sha()
-    args.out = f"runs/{name}" if name else f"runs/{config.label(over)}"
+    args.out = name if name.startswith("runs/") else f"runs/{name}"
     refuse_if_machine_busy()
     if os.path.exists(args.out):
         raise SystemExit(f"{args.out} exists")
@@ -541,17 +450,10 @@ def main():
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
     torch.set_float32_matmul_precision("high")
-    args.matmul_precision = torch.get_float32_matmul_precision()
     rng = np.random.default_rng(args.seed)
     dev = torch.device(args.device)
     if dev.type != "cuda":
         raise SystemExit(f"device must be a CUDA device, got {args.device!r}")
-    if args.aux != 0.0:
-        raise SystemExit("the aux heads are not implemented on the GPU stream")
-    if args.warm != 0.0:
-        raise SystemExit("policy-head warm start is not implemented on the GPU stream")
-    if args.policy != 0.0:
-        raise SystemExit("the policy head is not implemented on the GPU stream")
     if args.train_gen_ratio <= 0.0:
         raise SystemExit("train_gen_ratio must be positive")
     torch.cuda.set_device(dev)
@@ -646,7 +548,7 @@ def main():
                     "dg": args.dg, "rank": args.rank, "de": args.de, "t": round(el, 1),
                     "label": label, "git": args.git,
                     "search": {"depth": args.depth, "iters": args.iters,
-                               "cfr": args.cfr, "warm": args.warm}}, path)
+                               "cfr": args.cfr, "warm": 0.0}}, path)
         snaps.append({"label": label, "t": round(el, 1),
                       "file": os.path.basename(path)})
         print(f"[t={el:6.1f}s] --- snapshot {snaps[-1]['file']} ({label}) ---", flush=True)
@@ -661,7 +563,7 @@ def main():
         gen = warchest.gpu_stream_start(
             args.seed * 1_000_003 + epoch,
             depth=args.depth, iters=args.iters, explore=args.explore,
-            random_draft=args.random_draft, cfr=args.cfr, warm=args.warm,
+            random_draft=args.random_draft, cfr=args.cfr, warm=0.0,
             eval_mix=args.eval_mix, workers=args.gpu_workers,
             actors_per_worker=args.gpu_actors,
             inflight_per_worker=args.gpu_inflight, chunk_solves=args.gpu_chunk)
@@ -721,7 +623,7 @@ def main():
                 "t": round(now - t0, 1), "epoch": epoch, "phase": "rebel",
                 "games": window["games"], "decisions": window["decisions"],
                 "rows": window["rows"], "solves": window["solves"],
-                "loss": round(lv, 5), "loss_policy": float("nan"),
+                "loss": round(lv, 5),
                 "loss_old": round(loss_old, 5), "loss_new": round(loss_new, 5),
                 "horizon_frac": round(window["horizon_hits"] / games, 3),
                 "node_caps": window["node_caps"],
@@ -836,9 +738,8 @@ def main():
                     until_publish = publish_steps - optimizer_steps % publish_steps
                     nsteps = min(int(debt // args.batch), until_publish)
                     tt = time.time()
-                    lv, _, train_stat = train_steps(
+                    lv, train_stat = train_steps(
                         value, opt, buf, nsteps, args.batch, rng, dev,
-                        aux_weight=0.0, policy_weight=0.0,
                         augment=not args.no_augment,
                         recent_mix=args.recent_mix, recent_frac=args.recent_frac,
                         profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1",
@@ -946,9 +847,9 @@ def main():
         tgt_mean, tgt_std = float(cy.mean()), float(cy.std())
         tt = time.time()
         steps = max(1, round(args.train_gen_ratio * solves / args.batch))
-        lv, lp, _ = train_steps(
-            value, opt, buf, steps, args.batch, rng, dev, aux_weight=0.0,
-            policy_weight=0.0, d=d, augment=not args.no_augment,
+        lv, _ = train_steps(
+            value, opt, buf, steps, args.batch, rng, dev,
+            augment=not args.no_augment,
             recent_mix=args.recent_mix, recent_frac=args.recent_frac,
             batch_fn=batcher)
         train_s = time.time() - tt
@@ -969,7 +870,6 @@ def main():
         dec = max(d["decisions"], 1)
         rec = {"t": round(time.time() - t0, 1), "epoch": epoch, "phase": "greedy",
                "games": d["games"], "decisions": dec, "loss": round(lv, 5),
-               "loss_policy": round(lp, 4),
                "rows": len(rows), "solves": solves,
                "loss_old": round(loss_old, 5), "loss_new": round(loss_new, 5),
                "horizon_frac": round(d["horizon_hits"] / max(d["games"], 1), 3),

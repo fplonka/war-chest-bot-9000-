@@ -24,9 +24,6 @@ class Cfg:
     card: str = ""
     slot: str = ""
 
-    policy: float = 0.0
-    aux: float = 0.0
-
     batch: int = 1024
     lr: float = 1e-3
     lr_decay_frac: str = "0.33,0.67"
@@ -40,7 +37,6 @@ class Cfg:
     depth: int = 2
     iters: int = 64
     cfr: str = "linear"
-    warm: float = 0.0
     explore: float = 0.25
     temp: float = 2.0
     eval_mix: float = 0.5
@@ -63,13 +59,10 @@ class Cfg:
     out: str = ""
     note: str = ""
     seed: int = 1
-    matmul_precision: str = ""
     git: str = ""
 
 
 BASELINE = Cfg()
-# Not part of the run's name.
-SKIP = {"out", "note", "git", "matmul_precision"}
 CAST = {"int": int, "float": float,
         "bool": lambda v: v not in ("0", "false", "False", "")}
 
@@ -82,16 +75,6 @@ def parse(kvs):
     if bad:
         raise SystemExit(f"no such knob: {sorted(bad)}")
     return {k: CAST.get(kinds[k], str)(v) for k, v in over.items()}
-
-
-def label(over):
-    parts = [str(v) if isinstance(v, str) else f"{k}{v}"
-             for k, v in sorted(over.items()) if k not in SKIP]
-    return "-".join(parts) or "base"
-
-
-def delta(cfg):
-    return {k: v for k, v, changed in knobs(cfg) if changed}
 
 
 def knobs(cfg):

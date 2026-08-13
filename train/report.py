@@ -6,7 +6,6 @@
 
 import argparse
 import html
-import io
 import json
 import math
 import os
