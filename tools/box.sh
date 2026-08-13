@@ -42,6 +42,7 @@ pull)
         --include 'ladder.json' --include 'config.json' --include 'NOTES.md' \
         --include 'train.log' \
         --exclude '*' "root@$host:$remote/runs/" "$here/runs/"
+    python3 "$here/tools/runs_index.py"
     echo "pulled reports into $here/runs"
     ;;
 build)
