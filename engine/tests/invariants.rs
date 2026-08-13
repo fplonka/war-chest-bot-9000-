@@ -77,11 +77,8 @@ fn check_invariants(s: &State, init: &[[u16; N_UNITS]; 2]) {
         assert!(on <= 6);
         assert_eq!(on + s.markers_hand[p as usize], 6, "marker count broke");
     }
-    // 3b. the hand never exceeds 3, even across Warrior Priest draws: every
-    // WP trigger is preceded, in the same play chain, by a coin play that
-    // emptied a hand slot, so the drawn coin lands in a hand of at most two.
-    // This is the census the pre-CUDA plan asks for (server traces are not in
-    // the repo; the engine itself was verified against them).
+    // 3b. the hand never exceeds 3. A Warrior Priest draw does not join the
+    // hand, so it cannot push the cap; round-start draws still can.
     for p in 0..2u8 {
         assert!(
             s.hand_size(p) <= 3,

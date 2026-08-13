@@ -12,6 +12,6 @@ pi -p --provider deepseek --model deepseek-v4-flash --thinking high \
   @PROMPT @DIFF...
 ```
 
-PROMPT asks for a hostile review (correctness, idiomaticness, simplicity), findings first with file:line, then a heading exactly `## Judgment`. No style nits unless they hide a bug.
+PROMPT asks for a hostile review (correctness, idiomaticness, simplicity), findings first with file:line. No style nits unless they hide a bug.
 
-Wake on finish: `block_until_ms: 0` and `notify_on_output` with `pattern: ## Judgment`, `reason: pi review finished`. Same for `tools/box.sh go` / `follow` with `pattern: ^JOB_DONE`, `reason: box job finished`. Ending the turn is what delivers the wake.
+Background it (`block_until_ms: 0`). Do not set `notify_on_output`. The alert is the command exiting. Same for `tools/box.sh go` / `follow`: background them and wake on process exit, not on a log line.

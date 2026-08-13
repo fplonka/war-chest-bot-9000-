@@ -333,30 +333,52 @@ pub fn set_config(s: &mut State, p: u8, ctx: &Ctx, c: &Config) {
 /// Every config consistent with the public counts. Self-play tracks the
 /// reachable support forward instead; this exists for the brute-force belief
 /// test and for sizing experiments.
-pub fn enumerate_configs(reserve: &[u8; NSLOT], hand_size: u8, fd_size: u8) -> Vec<Config> {
+/// Every config consistent with the public counts: hand size, face-down size,
+/// and whether a forced-play coin is in flight (the identity of that coin is
+/// private; its count is not). Self-play tracks the reachable support forward
+/// instead; this exists for the brute-force belief test and for sizing.
+pub fn enumerate_configs(
+    reserve: &[u8; NSLOT],
+    hand_size: u8,
+    fd_size: u8,
+    inflight: bool,
+) -> Vec<Config> {
     fn rec_fd(
         res: &[u8; NSLOT],
         hand: &[u8; NSLOT],
         fd: &mut [u8; NSLOT],
         k: usize,
         left: u8,
+        inflight: bool,
         out: &mut Vec<Config>,
     ) {
         if k == NSLOT - 1 {
             if left + hand[k] <= res[k] {
                 fd[k] = left;
-                out.push(Config {
-                    hand: *hand,
-                    fd: *fd,
-                    inflight: None,
-                });
+                if inflight {
+                    for s in 0..NSLOT {
+                        if hand[s] + fd[s] < res[s] {
+                            out.push(Config {
+                                hand: *hand,
+                                fd: *fd,
+                                inflight: Some(s as u8),
+                            });
+                        }
+                    }
+                } else {
+                    out.push(Config {
+                        hand: *hand,
+                        fd: *fd,
+                        inflight: None,
+                    });
+                }
                 fd[k] = 0;
             }
             return;
         }
         for t in 0..=left.min(res[k].saturating_sub(hand[k])) {
             fd[k] = t;
-            rec_fd(res, hand, fd, k + 1, left - t, out);
+            rec_fd(res, hand, fd, k + 1, left - t, inflight, out);
         }
         fd[k] = 0;
     }
@@ -366,26 +388,27 @@ pub fn enumerate_configs(reserve: &[u8; NSLOT], hand_size: u8, fd_size: u8) -> V
         k: usize,
         left: u8,
         fd_size: u8,
+        inflight: bool,
         out: &mut Vec<Config>,
     ) {
         if k == NSLOT - 1 {
             if left <= res[k] {
                 hand[k] = left;
                 let mut fd = [0u8; NSLOT];
-                rec_fd(res, hand, &mut fd, 0, fd_size, out);
+                rec_fd(res, hand, &mut fd, 0, fd_size, inflight, out);
                 hand[k] = 0;
             }
             return;
         }
         for t in 0..=left.min(res[k]) {
             hand[k] = t;
-            rec_hand(res, hand, k + 1, left - t, fd_size, out);
+            rec_hand(res, hand, k + 1, left - t, fd_size, inflight, out);
         }
         hand[k] = 0;
     }
     let mut out = Vec::new();
     let mut hand = [0u8; NSLOT];
-    rec_hand(reserve, &mut hand, 0, hand_size, fd_size, &mut out);
+    rec_hand(reserve, &mut hand, 0, hand_size, fd_size, inflight, &mut out);
     out
 }
 
@@ -515,8 +538,7 @@ pub fn advance_config(c: &Config, slot: i8, facedown: bool) -> Option<Config> {
 /// face-down discards into the bag and therefore *erases* them.
 ///
 /// `set_pending` marks a Warrior Priest draw: the drawn coin waits in flight
-/// for the forced play, so it does not join the hand. The hand never exceeds
-/// `HAND_CAP` — the trigger is always preceded by the coin play that fired it.
+/// for the forced play, so it does not join the hand.
 pub fn belief_after_draw(
     b: &Belief,
     reserve: &[u8; NSLOT],
@@ -1658,6 +1680,35 @@ mod draw_tests {
             cfgs.dedup();
             assert_same(&cfgs, &res, &fu, k, "fuzz");
             done += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod enumerate_tests {
+    use super::*;
+    use crate::state::{Cont, State, BLACK, WHITE, Z_BAG, Z_INFLIGHT};
+    use crate::units::{CROSSBOWMAN, PIKEMAN, ROYAL_COIN, SWORDSMAN, WARRIOR_PRIEST};
+
+    #[test]
+    fn set_config_accepts_enumerated_inflight_configs() {
+        let mut s = State::blank(WHITE);
+        for u in [WARRIOR_PRIEST, SWORDSMAN, PIKEMAN, CROSSBOWMAN, ROYAL_COIN] {
+            s.add_zone(WHITE, Z_BAG, u, 2);
+            s.add_zone(BLACK, Z_BAG, u, 2);
+        }
+        s.add_zone(WHITE, Z_INFLIGHT, WARRIOR_PRIEST, 1);
+        s.pending = Cont::WarriorPriestPlay { player: WHITE };
+        let ctx = Ctx::new(&s);
+        let res = reserve(&s, WHITE, &ctx);
+        let truth = true_config(&s, WHITE, &ctx);
+        assert!(truth.inflight.is_some());
+        let all = enumerate_configs(&res, truth.hand_size(), truth.fd_size(), true);
+        assert!(!all.is_empty());
+        assert!(all.iter().all(|c| c.inflight.is_some()));
+        for c in &all {
+            let mut w = s;
+            set_config(&mut w, WHITE, &ctx, c);
         }
     }
 }

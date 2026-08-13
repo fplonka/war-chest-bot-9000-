@@ -157,7 +157,7 @@ fn leak_check(random_draft: bool) -> (usize, usize) {
             for p in 0..2u8 {
                 let res = reserve(&s, p, &ctx);
                 let truth = true_config(&s, p, &ctx);
-                let all = enumerate_configs(&res, truth.hand_size(), truth.fd_size());
+                let all = enumerate_configs(&res, truth.hand_size(), truth.fd_size(), truth.inflight.is_some());
                 if all.len() < 2 {
                     continue;
                 }
@@ -470,7 +470,7 @@ fn reachable_config_census_with_warrior_priests() {
             for p in 0..2u8 {
                 let res = reserve(&s, p, &ctx);
                 let truth = true_config(&s, p, &ctx);
-                sizes.push(enumerate_configs(&res, truth.hand_size(), truth.fd_size()).len());
+                sizes.push(enumerate_configs(&res, truth.hand_size(), truth.fd_size(), truth.inflight.is_some()).len());
             }
             let acts = s.legal_actions();
             s.apply_inplace(acts[rng.below(acts.len())]);
@@ -599,7 +599,7 @@ fn config_features_separate_every_config() {
         let reserve: [u8; NSLOT] = std::array::from_fn(|_| r.below(6) as u8);
         for hand_size in 0..=HAND_CAP as u8 {
             for fd_size in 0..4u8 {
-                let cfgs = enumerate_configs(&reserve, hand_size, fd_size);
+                let cfgs = enumerate_configs(&reserve, hand_size, fd_size, false);
                 seen.clear();
                 for c in &cfgs {
                     for p in 0..2usize {
@@ -623,7 +623,7 @@ fn config_features_separate_every_config() {
 fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
     let res = reserve(s, p, ctx);
     let truth = true_config(s, p, ctx);
-    let cfgs = enumerate_configs(&res, truth.hand_size(), truth.fd_size());
+    let cfgs = enumerate_configs(&res, truth.hand_size(), truth.fd_size(), truth.inflight.is_some());
     let n = cfgs.len().max(1) as f32;
     Belief {
         p: vec![1.0 / n; cfgs.len()],
@@ -960,7 +960,7 @@ fn position_with_ambiguous_facedown(seed: u64) -> Option<(State, Ctx, [Belief; 2
     for p in 0..2u8 {
         let res = reserve(&s, p, &ctx);
         let truth = true_config(&s, p, &ctx);
-        let cfg = enumerate_configs(&res, truth.hand_size(), truth.fd_size());
+        let cfg = enumerate_configs(&res, truth.hand_size(), truth.fd_size(), truth.inflight.is_some());
         if cfg.is_empty() {
             return None;
         }
@@ -1110,7 +1110,7 @@ fn normalized_weights_match_belief_normalize() {
     for seed in 0..400u64 {
         let mut r = Rng::new(seed.wrapping_mul(0x9E37_79B9));
         let reserve: [u8; NSLOT] = std::array::from_fn(|_| r.below(6) as u8);
-        let cfgs = enumerate_configs(&reserve, r.below(4) as u8, r.below(4) as u8);
+        let cfgs = enumerate_configs(&reserve, r.below(4) as u8, r.below(4) as u8, false);
         if cfgs.is_empty() {
             continue;
         }
@@ -1206,7 +1206,7 @@ fn zero_weight_config_survives_the_walk_update() {
         for p in 0..2u8 {
             let res = reserve(&s, p, &ctx);
             let truth = true_config(&s, p, &ctx);
-            let cfg = enumerate_configs(&res, truth.hand_size(), truth.fd_size());
+            let cfg = enumerate_configs(&res, truth.hand_size(), truth.fd_size(), truth.inflight.is_some());
             if cfg.len() < 2 {
                 break;
             }

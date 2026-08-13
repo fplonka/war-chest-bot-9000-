@@ -23,11 +23,16 @@ Two things are hidden in War Chest:
   Initiative or a Recruit payment is never revealed.
 
 Everything else is public, including every *count*. So a player's private state
-is exactly the pair `(hand, facedown)` — a `Config` — and the bag is derived:
+is the triple `(hand, facedown, inflight)` — a `Config` — and the bag is derived:
 
 ```
-bag = reserve - hand - facedown        reserve = bag + hand + facedown  (public)
+bag = reserve - hand - facedown - inflight
+reserve = bag + hand + facedown + inflight  (public)
 ```
+
+`inflight` is the Warrior Priest's drawn coin, waiting to be played. Its size is
+public (the pending node says a forced play is owed); its identity is not. Empty
+at every MainPlay, so it never enters a training row.
 
 The reserve is public because every action either moves a coin *within* it (a
 face-down play) or out of it in full view. That invariant is what lets one public
@@ -35,9 +40,9 @@ tree carry every config, and `features_do_not_leak_private_information` checks
 it.
 
 A draft fixes 4 unit types plus the Royal Coin, so at most `NSLOT = 5` coin types
-per player; a hand holds at most 3, even across a Warrior Priest draw — the
-trigger is always preceded, in the same play chain, by the coin play that
-fired it. Over 120k positions of random play with the full draft pool the
+per player; a hand holds at most 3. The Warrior Priest's draw does not join the
+hand — it waits in flight — so it cannot push the cap. Over 120k positions of
+random play with the full draft pool the
 reachable config set has median 22, mean 57, p99 567. CFR enumerates information
 states exactly — no particle approximation.
 

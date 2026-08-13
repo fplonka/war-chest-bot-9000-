@@ -52,7 +52,7 @@ fn micro_position(seed: u64, warmup: usize, plies: u16) -> Option<State> {
 fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
     let res = reserve(s, p, ctx);
     let truth = true_config(s, p, ctx);
-    let cfgs = enumerate_configs(&res, truth.hand_size(), truth.fd_size());
+    let cfgs = enumerate_configs(&res, truth.hand_size(), truth.fd_size(), truth.inflight.is_some());
     let n = cfgs.len() as f32;
     Belief {
         p: vec![1.0 / n; cfgs.len()],
