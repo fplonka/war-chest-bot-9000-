@@ -276,8 +276,11 @@ def panels(runs):
             (tag(r), mins(r), [e.get("rows_per_s", 0) for e in r["epochs"]], False)
             for r in runs], zero=True))
     if any("effective_train_ratio" in e for r in runs for e in r["epochs"]):
-        out.append(panel("Effective training ratio", "optimizer rows / generated row", [
+        out.append(panel("Effective training ratio", "optimizer rows / solve", [
             (tag(r), mins(r), [e.get("effective_train_ratio", 0) for e in r["epochs"]], False)
+            for r in runs], zero=True))
+        out.append(panel("Passes per generated row", "optimizer rows / replay row", [
+            (tag(r), mins(r), [e.get("train_row_ratio", 0) for e in r["epochs"]], False)
             for r in runs], zero=True))
         out.append(panel("Gradient clipping", "fraction of steps", [
             (tag(r), mins(r), [e.get("grad_clip_frac", 0) for e in r["epochs"]], True)
@@ -318,7 +321,8 @@ def health(r):
         cells.append(("warm fit left over",
                       f"{warm['loss'] / max(warm['tgt_std'] ** 2, 1e-9):.1%}"))
     if "effective_train_ratio" in last:
-        cells += [("effective train ratio", f"{last['effective_train_ratio']:.3f}"),
+        cells += [("effective train ratio", f"{last['effective_train_ratio']:.3f} /solve"),
+                  ("passes per row", f"{last.get('train_row_ratio', 0):.3f}"),
                   ("gradient clipped", f"{last['grad_clip_frac']:.1%}"),
                   ("max |v0+v1|", f"{last['zero_sum_max']:.2e}"),
                   ("replay age", f"{last['buf_s'] / 60:.1f} min")]

@@ -6,4 +6,4 @@ In this project we often run experiments and wait on them. This is inevitable bu
 
 Treat all markdown files and git commit messages very lightly, they are not authoritative at all even if they might seem such in tone. These are all written by other (weaker) AI agents and could be confused or wrong. Think for yourself.
 
-After running an experiment, either remove it's directory in run/ or write up a NOTES.md for it if it's useful to keep. Make sure it has a report.html and train.log pulled.
+After running an experiment, either remove it's directory in run/ or write up a NOTES.md for it if it's useful to keep. Make sure it has a report.html and train.log pulled. Use exp.py for running experiments, adjust it as required so the process is nice and ergonomic. But KISS, no unnecssary features or abstractions.

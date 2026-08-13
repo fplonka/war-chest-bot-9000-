@@ -548,9 +548,9 @@ def main():
     # implement on it, not a reason to fall back to a slower route.
     if dev.type != "cuda":
         raise SystemExit(f"device must be a CUDA device, got {args.device!r}")
-    if args.aux != 0.0 or args.policy != 0.0:
-        raise SystemExit("the aux and policy heads are not implemented on the "
-                         "GPU stream; implement them there rather than adding a path")
+    if args.aux != 0.0:
+        raise SystemExit("the aux heads are not implemented on the GPU stream; "
+                         "implement them there rather than adding a path")
     if args.warm != 0.0:
         raise SystemExit("policy-head warm start is not implemented on the GPU stream")
     if args.train_gen_ratio <= 0.0:
@@ -691,7 +691,7 @@ def main():
                       backward_wall_s=0.0, gpu_forward_s=0.0,
                       gpu_backward_s=0.0, batch_configs=0,
                       grad_norm_sum=0.0, grad_norm_max=0.0, grad_clipped=0,
-                      zero_sum_abs=0.0, zero_sum_max=0.0)
+                      zero_sum_abs=0.0, zero_sum_max=0.0, policy_loss_sum=0.0)
 
         def emit_report(now):
             nonlocal probe, epoch
@@ -726,7 +726,10 @@ def main():
                 "t": round(now - t0, 1), "epoch": epoch, "phase": "rebel",
                 "games": window["games"], "decisions": window["decisions"],
                 "rows": window["rows"], "solves": window["solves"],
-                "loss": round(lv, 5), "loss_policy": float("nan"),
+                "loss": round(lv, 5),
+                "loss_policy": round(
+                    window["policy_loss_sum"] / max(window["train_steps"], 1), 5)
+                    if args.policy else float("nan"),
                 "loss_old": round(loss_old, 5), "loss_new": round(loss_new, 5),
                 "horizon_frac": round(window["horizon_hits"] / games, 3),
                 "node_caps": window["node_caps"],
@@ -741,6 +744,7 @@ def main():
                 "optimizer_rows": optimizer_rows,
                 "generated_rows": rebel_rows,
                 "effective_train_ratio": round(optimizer_rows / max(rebel_solves, 1), 4),
+                "train_row_ratio": round(optimizer_rows / max(rebel_rows, 1), 4),
                 "optimizer_debt": round(debt, 1),
                 "publications": publications,
                 "weight_age_steps": optimizer_steps % publish_steps,
@@ -782,6 +786,8 @@ def main():
             if not stopping:
                 check_alive(args, rec, log[-2] if len(log) > 1 else None)
             write_log(args, log, snaps)
+            pol = ("" if rec["loss_policy"] != rec["loss_policy"]
+                   else f"P={rec['loss_policy']:.3f} ")
             print(
                 f"[t={rec['t']:6.1f}s] rebel stream solves={rebel_solves} "
                 f"solves={raw_sps:.0f}/s rows={raw_rps:.0f}/s "
@@ -789,7 +795,7 @@ def main():
                 f"debt={debt:.0f} rows steps={optimizer_steps} "
                 f"over={totals['oversize_routes']} card={totals['card_exclusive_routes']} "
                 f"drop={totals['dropped']} "
-                f"L={lv:.5f} tgt={tgt_mean:+.3f}/{tgt_var ** 0.5:.3f} "
+                f"L={lv:.5f} {pol}tgt={tgt_mean:+.3f}/{tgt_var ** 0.5:.3f} "
                 f"cfg/b={rec['batch_configs']:.0f} prep={window['prepare_s']:.2f}s "
                 f"gpu={window['gpu_forward_s'] + window['gpu_backward_s']:.2f}s "
                 f"conv={window['conv_s']:.2f}s add={window['add_s']:.2f}s "
@@ -804,10 +810,11 @@ def main():
                          "forward_wall_s", "backward_wall_s", "gpu_forward_s",
                          "gpu_backward_s", "batch_configs", "grad_norm_sum",
                          "grad_norm_max", "grad_clipped", "zero_sum_abs",
-                         "zero_sum_max"):
+                         "zero_sum_max", "policy_loss_sum"):
                 window[name] = 0
 
         try:
+            last_policy = None
             while True:
                 now = time.time()
                 if not stopping and now >= stop_at:
@@ -849,6 +856,7 @@ def main():
                     window["zero_sum_max"] = max(
                         window["zero_sum_max"], float(data.get("zero_sum_max", 0.0)))
                     window["gpu_wait_s"] += float(data.get("gpu_wait_s", 0.0))
+                    last_policy = data
                     for name in counter_names:
                         v = int(data.get(name, 0))
                         totals[name] += v
@@ -859,15 +867,17 @@ def main():
                     until_publish = publish_steps - optimizer_steps % publish_steps
                     nsteps = min(int(debt // args.batch), until_publish)
                     tt = time.time()
-                    lv, _, train_stat = train_steps(
+                    lv, lp, train_stat = train_steps(
                         value, opt, buf, nsteps, args.batch, rng, dev,
-                        aux_weight=0.0, policy_weight=0.0,
+                        aux_weight=0.0, policy_weight=args.policy, d=last_policy,
                         augment=not args.no_augment,
                         recent_mix=args.recent_mix, recent_rows=args.recent_rows,
                         profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1",
                         batch_fn=batcher)
                     window["train_s"] += time.time() - tt
                     window["loss_sum"] += lv * nsteps
+                    if lp == lp:
+                        window["policy_loss_sum"] += lp * nsteps
                     window["train_steps"] += nsteps
                     for name in ("sample_s", "prepare_s", "forward_wall_s",
                                  "backward_wall_s", "gpu_forward_s", "gpu_backward_s",
@@ -1097,6 +1107,7 @@ def main():
                "steps": steps,
                "generated_rows": len(rows), "optimizer_rows": steps * args.batch,
                "effective_train_ratio": round(steps * args.batch / max(solves, 1), 4),
+               "train_row_ratio": round(steps * args.batch / max(len(rows), 1), 4),
                "grad_norm": round(train_stat.get("grad_norm_sum", 0.0) / max(steps, 1), 4),
                "grad_norm_max": round(train_stat.get("grad_norm_max", 0.0), 4),
                "grad_clip_frac": round(train_stat.get("grad_clipped", 0) / max(steps, 1), 4),
