@@ -120,9 +120,10 @@ def git_sha():
     try:
         sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
                              capture_output=True, text=True, check=True).stdout.strip()
-        dirty = subprocess.run(["git", "status", "--porcelain"],
-                               capture_output=True, text=True, check=True).stdout.strip()
-        return sha + ("+dirty" if dirty else "")
+        dirty = subprocess.run(
+            ["git", "diff-index", "--quiet", "HEAD", "--", ".", ":!runs"],
+            capture_output=True)
+        return sha + ("+dirty" if dirty.returncode != 0 else "")
     except Exception:
         try:
             with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),

@@ -33,8 +33,9 @@ sync)
         --exclude runs --exclude target --exclude .venv --exclude papers \
         --exclude __pycache__ --exclude .git --exclude data \
         "$here/" "root@$host:$remote/"
-    git -C "$here" describe --always --dirty --abbrev=7 \
-        | ssh "${ssh_opts[@]}" "root@$host" "cat > $remote/.gitsha"
+    sha=$(git -C "$here" rev-parse --short=7 HEAD)
+    git -C "$here" diff-index --quiet HEAD -- . ':!runs' || sha="${sha}+dirty"
+    echo "$sha" | ssh "${ssh_opts[@]}" "root@$host" "cat > $remote/.gitsha"
     echo "synced -> $host:$remote"
     ;;
 pull)
