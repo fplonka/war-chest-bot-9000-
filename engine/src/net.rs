@@ -49,8 +49,8 @@
 
 use crate::board::N_HEXES;
 use crate::rebel::{
-    AFEAT, AOFF_PAYS, CCOUNTS, CFEAT, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_CARDS,
-    OFF_LOOSE, OFF_PILES, PILE_COUNTS, PUBFEAT,
+    AFEAT, AOFF_PAYS, CCOUNTS, CFEAT, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_CARDS, OFF_LOOSE,
+    OFF_PILES, PILE_COUNTS, PUBFEAT,
 };
 use crate::units::CARD_FEATS;
 
@@ -478,6 +478,44 @@ impl Lin {
     }
 }
 
+/// A cursor over one of the flat weight arrays the trainer ships.
+struct Cur<'a> {
+    v: &'a [f32],
+    at: usize,
+    what: &'static str,
+}
+
+impl<'a> Cur<'a> {
+    fn new(v: &'a [f32], what: &'static str) -> Cur<'a> {
+        Cur { v, at: 0, what }
+    }
+    fn take(&mut self, n: usize) -> Result<Vec<f32>, String> {
+        if self.at + n > self.v.len() {
+            return Err(format!(
+                "{} array too short: need {} past {}, have {}",
+                self.what,
+                n,
+                self.at,
+                self.v.len()
+            ));
+        }
+        let out = self.v[self.at..self.at + n].to_vec();
+        self.at += n;
+        Ok(out)
+    }
+    fn done(&self) -> Result<(), String> {
+        if self.at != self.v.len() {
+            return Err(format!(
+                "{} array too long: read {}, have {}",
+                self.what,
+                self.at,
+                self.v.len()
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The value network, as tower chains. See the module docs for the shape; the
 /// wiring between towers is fixed (it is the game-specific part: the card
 /// table, the set sums, the belief sums, the bilinear readout), while every
@@ -503,6 +541,7 @@ impl Lin {
 pub struct Mlp {
     /// The checkpoint's shape vector, verbatim (v3: see `from_flat_v3`).
     pub dims: Vec<usize>,
+    v1: bool,
     de: usize,
     dg: usize,
     rank: usize,
@@ -708,9 +747,21 @@ impl V3Layout {
 }
 
 impl Mlp {
-    /// Build from the flat arrays the trainer ships.
+    /// Build from the flat arrays the trainer ships. Three formats load:
+    /// v3 (`dims[0] == 3`, the tower format below), v2 (the frozen 10-entry
+    /// fixed layout), and v1 (5 entries, pre-describer). All three land in
+    /// the same tower representation; only parsing differs.
     pub fn from_flat(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Mlp, String> {
-        Mlp::from_flat_v3(dims, w, b, ln)
+        if dims.len() == 5 {
+            return Mlp::from_flat_v1(dims, w, b, ln);
+        }
+        if dims.first() == Some(&3) {
+            return Mlp::from_flat_v3(dims, w, b, ln);
+        }
+        if dims.len() == 10 {
+            return Mlp::from_flat_v2(dims, w, b, ln);
+        }
+        Err(format!("unrecognised dims {dims:?}"))
     }
 
     /// The v3 tower format:
@@ -751,6 +802,7 @@ impl Mlp {
             |(g, bt): (usize, usize), n: usize| (ln[g..g + n].to_vec(), ln[bt..bt + n].to_vec());
         Ok(Mlp {
             dims: dims.to_vec(),
+            v1: false,
             de: l.de,
             dg: l.dg,
             rank: l.rank,
@@ -780,10 +832,178 @@ impl Mlp {
         })
     }
 
+    /// The frozen 10-entry fixed layout, kept so `.bin` weight dumps and old
+    /// checkpoints still load. It is the v3 network with `card = [dc]`,
+    /// `pub = [hidden]`, `hmlp = []`, `slot = []`, `nres = 1`.
+    fn from_flat_v2(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Mlp, String> {
+        if dims[9] != 0 {
+            return Err(format!(
+                "encoder {} (hex) is not implemented in Rust; only 0 (flat) ships",
+                dims[9]
+            ));
+        }
+        let (h, hd, dg, rk, de, dc) = (dims[1], dims[2], dims[4], dims[5], dims[7], dims[8]);
+        let v3 = vec![3, de, dg, rk, hd, 1, 1, dc, 1, h, 0, 0];
+        // The v2 blob orders the matrices differently, so reorder rather than
+        // reparse: slice the old layout, concatenate in v3 order.
+        let seg = |lens: &[usize]| -> Vec<(usize, usize)> {
+            let mut at = 0;
+            lens.iter()
+                .map(|&n| {
+                    let s = at;
+                    at += n;
+                    (s, at)
+                })
+                .collect()
+        };
+        let (af, hf, xd) = (dims[6] + de, hfeat(de), xdim_of(de));
+        let ws = seg(&[
+            CARD_FEATS * dc,
+            dc * de,
+            crate::units::N_UNITS * de,
+            (PILE_COUNTS + de) * de,
+            xd * h,
+            h * hd,
+            2 * dg * hd,
+            hf * dg,
+            dg * dg,
+            dg * dg,
+            dg * (rk + 1),
+            hd * rk,
+            af * rk,
+            dg * rk,
+            hd * rk,
+        ]);
+        let bs = seg(&[dc, de, de, h, hd, dg, dg, dg, rk + 1, rk, rk, rk, rk]);
+        if w.len() != ws.last().unwrap().1
+            || b.len() != bs.last().unwrap().1
+            || ln.len() != 2 * h + 2 * hd
+        {
+            return Err(format!(
+                "weight sizes {}/{}/{} do not match dims {dims:?}",
+                w.len(),
+                b.len(),
+                ln.len()
+            ));
+        }
+        let wat = |i: usize| &w[ws[i].0..ws[i].1];
+        let bat = |i: usize| &b[bs[i].0..bs[i].1];
+        // v3 w order: card(wd0,wd1), wid, pile, pub(w0), pub_out(w1), wb,
+        // wu, slot_out(wc), res(wh1,wh2), wg, wq, wk, wp.
+        let w3: Vec<f32> = [
+            wat(0),
+            wat(1),
+            wat(2),
+            wat(3),
+            wat(4),
+            wat(5),
+            wat(6),
+            wat(11),
+            wat(7),
+            wat(8),
+            wat(9),
+            wat(10),
+            wat(12),
+            wat(13),
+            wat(14),
+        ]
+        .concat();
+        // v3 b order: card(bd0,bd1), pile, pub(b0), pub_out(b1), wu(bu),
+        // slot_out(bc), res(bh1,bh2), wg(bg), wq, wk, wp.
+        let b3: Vec<f32> = [
+            bat(0),
+            bat(1),
+            bat(2),
+            bat(3),
+            bat(4),
+            bat(9),
+            bat(5),
+            bat(6),
+            bat(7),
+            bat(8),
+            bat(10),
+            bat(11),
+            bat(12),
+        ]
+        .concat();
+        Mlp::from_flat_v3(&v3, &w3, &b3, ln)
+    }
+
+    /// A pre-describer checkpoint: six matrices, the flat `v1` encoding fed
+    /// straight to the first layer, and a holding tower that is one linear
+    /// map of the counts. Loadable so the pool can still be played against.
+    fn from_flat_v1(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Mlp, String> {
+        let (p, h, cf, dg, rk) = (dims[0], dims[1], dims[2], dims[3], dims[4]);
+        let want_w = p * h + h * h + 2 * dg * h + cf * dg + dg * (rk + 1) + h * rk;
+        let want_b = h + h + dg + (rk + 1) + rk;
+        if w.len() != want_w || b.len() != want_b || ln.len() != 4 * h {
+            return Err(format!("v1 weight sizes do not match dims {dims:?}"));
+        }
+        let (mut cw, mut cb) = (Cur::new(w, "w"), Cur::new(b, "b"));
+        let lin = |cw: &mut Cur, cb: &mut Cur, i: usize, o: usize| -> Result<Lin, String> {
+            Ok(Lin {
+                w: cw.take(i * o)?,
+                b: cb.take(o)?,
+                i,
+                o,
+            })
+        };
+        // Old order: w0, w1, wb, wc, wg, wu; b0, b1, bc, bg, bu.
+        let w0 = Lin {
+            w: cw.take(p * h)?,
+            b: cb.take(h)?,
+            i: p,
+            o: h,
+        };
+        let w1w = cw.take(h * h)?;
+        let wb = cw.take(2 * dg * h)?;
+        let wcw = cw.take(cf * dg)?;
+        let b1 = cb.take(h)?;
+        let bc = cb.take(dg)?;
+        let wg = lin(&mut cw, &mut cb, dg, rk + 1)?;
+        let wu = lin(&mut cw, &mut cb, h, rk)?;
+        cw.done()?;
+        cb.done()?;
+        Ok(Mlp {
+            dims: dims.to_vec(),
+            v1: true,
+            de: 0,
+            dg,
+            rank: rk,
+            head_in: h,
+            card: Vec::new(),
+            wid: Vec::new(),
+            pile: Lin::default(),
+            pub_lin: vec![w0],
+            pub_ln: vec![(ln[..h].to_vec(), ln[h..2 * h].to_vec())],
+            pub_out: Lin {
+                w: w1w,
+                b: b1,
+                i: h,
+                o: h,
+            },
+            wb,
+            ln1: (ln[2 * h..3 * h].to_vec(), ln[3 * h..4 * h].to_vec()),
+            hmlp: Vec::new(),
+            wu,
+            slot: Vec::new(),
+            slot_out: Lin {
+                w: wcw,
+                b: bc,
+                i: cf,
+                o: dg,
+            },
+            res: Vec::new(),
+            wg,
+            wq: Lin::default(),
+            wk: Lin::default(),
+            wp: Lin::default(),
+        })
+    }
+
     /// Read the flat weight dump `train/export_weights.py` writes:
     ///
     /// ```text
-    /// u32 encoding_version,
     /// u32 n_dims, n_dims * u32 dims,
     /// u32 n_w, n_w * f32,   u32 n_b, n_b * f32,   u32 n_ln, n_ln * f32
     /// ```
@@ -805,16 +1025,6 @@ impl Mlp {
             *at += n * 4;
             v
         };
-        let version = u32_at(&raw, &mut at) as u32;
-        if version != crate::rebel::ENCODING_VERSION {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "weight encoding version {version}, expected {}",
-                    crate::rebel::ENCODING_VERSION
-                ),
-            ));
-        }
         let nd = u32_at(&raw, &mut at);
         let dims: Vec<usize> = (0..nd).map(|_| u32_at(&raw, &mut at)).collect();
         let (w, b, ln) = (
@@ -834,6 +1044,14 @@ impl Mlp {
     pub fn is_empty(&self) -> bool {
         self.dims.is_empty()
     }
+    /// Width of the public encoding.
+    pub fn pub_dim(&self) -> usize {
+        if self.v1 {
+            self.dims[0]
+        } else {
+            PUBFEAT
+        }
+    }
     /// Width of `h0` and of the head entry (`ln1`).
     pub fn head(&self) -> usize {
         self.head_in
@@ -844,7 +1062,11 @@ impl Mlp {
     }
     /// Width of one config vector.
     pub fn cfeat(&self) -> usize {
-        CFEAT
+        if self.v1 {
+            self.dims[2]
+        } else {
+            CFEAT
+        }
     }
     /// Width of a config embedding, and of one player's belief block.
     pub fn dg(&self) -> usize {
@@ -860,15 +1082,27 @@ impl Mlp {
     }
     /// Width of one stored action vector, before the paying card's embedding.
     pub fn afeat(&self) -> usize {
-        AFEAT
+        if self.v1 {
+            0
+        } else {
+            AFEAT
+        }
     }
-    /// Width of a card embedding.
+    /// Width of a card embedding. Zero for a `v1` checkpoint.
     pub fn de(&self) -> usize {
         self.de
     }
+    /// Whether this is a checkpoint from before the card describer.
+    pub fn v1(&self) -> bool {
+        self.v1
+    }
     /// Width of the trunk's input, once the card embeddings are spliced in.
     pub fn xdim(&self) -> usize {
-        xdim_of(self.de)
+        if self.v1 {
+            self.pub_dim()
+        } else {
+            xdim_of(self.de)
+        }
     }
     /// The tower shapes, for anything (the GPU service) that mirrors the
     /// chains: (card, pub widths, pub_out, hmlp widths, slot widths, nres).
@@ -913,6 +1147,10 @@ impl Mlp {
     /// `relu` chain over the rulebook facts plus the learned id embedding.
     /// Runs once per solve; every other tower reads rows of the result.
     pub fn cards(&self, xpub_row: &[f32], ids: &[u8], e: &mut Vec<f32>) {
+        if self.v1 {
+            e.clear();
+            return;
+        }
         let de = self.de;
         let cards = &xpub_row[OFF_CARDS..OFF_CARDS + NTYPE * CARD_FEATS];
         let mut cur: Vec<f32> = cards.to_vec();
@@ -942,6 +1180,7 @@ impl Mlp {
     /// for the layout rationale; the two must agree block for block.
     fn assemble(&self, xpub: &[f32], rows: usize, stride: usize, e: &[f32], x: &mut Vec<f32>) {
         let (de, xd) = (self.de, self.xdim());
+        debug_assert!(!self.v1);
         if rows == 0 {
             return;
         }
@@ -1012,7 +1251,11 @@ impl Mlp {
         let (rk, dg) = (self.rank, self.dg);
         debug_assert_eq!(phi.len(), n * self.cfeat());
         fit(z, n * dg);
-        {
+        if self.v1 {
+            let cf = self.cfeat();
+            self.slot_out.gemm(phi, n, cf, 0.0, &mut z[..n * dg]);
+            self.slot_out.bias_relu(n, z);
+        } else {
             let (de, hf) = (self.de, hfeat(self.de));
             let cf = self.cfeat();
             // The five slot rows are independent and identically shaped, so
@@ -1026,14 +1269,7 @@ impl Mlp {
                     row[0] = p[k];
                     row[1] = p[NSLOT + k];
                     row[2] = p[2 * NSLOT + k];
-                    // Centred. As a raw 0/1 this channel is inert for seat 0
-                    // and active for seat 1, and everything after it is
-                    // rectified before it is summed, so the asymmetry cannot
-                    // cancel -- it lands in the readout's per-config bias term
-                    // as a constant that differs by seat. That is a common-mode
-                    // offset in a value that must be antisymmetric. Must match
-                    // `value_net.py::holdings`.
-                    row[3] = seat - 0.5;
+                    row[3] = seat;
                     let t = seat as usize * NSLOT + k;
                     row[4..].copy_from_slice(&e[t * de..(t + 1) * de]);
                 }
@@ -1092,8 +1328,12 @@ impl Mlp {
         out: &mut Vec<f32>,
     ) {
         let mut x = Vec::new();
-        self.assemble(xpub, rows, stride, e, &mut x);
-        let (src, lda) = (&x[..], self.xdim());
+        let (src, lda) = if self.v1 {
+            (xpub, stride)
+        } else {
+            self.assemble(xpub, rows, stride, e, &mut x);
+            (&x[..], self.xdim())
+        };
         let l0 = &self.pub_lin[0];
         let mut a = std::mem::take(scratch);
         fit(&mut a, rows * l0.o);
@@ -1256,9 +1496,9 @@ impl Mlp {
         }
     }
 
-    /// One unprojected score per row for the Torch/Rust parity diagnostic.
-    /// Search uses `Solver::readout`, which projects both players together.
-    pub fn raw_scores(
+    /// One value per row, for callers with no solve to amortise over: the
+    /// torch parity check and the offline tools.
+    pub fn forward(
         &self,
         xpub: &[f32],
         xbel: &[f32],
@@ -1266,7 +1506,7 @@ impl Mlp {
         ids: &[u8],
         rows: usize,
     ) -> Vec<f32> {
-        let (rk, pd) = (self.rank, PUBFEAT);
+        let (rk, pd) = (self.rank, self.pub_dim());
         let (mut sb, mut pre, mut e, mut z, mut g, mut u) = (
             Vec::new(),
             Vec::new(),
@@ -1299,7 +1539,10 @@ impl Mlp {
 }
 
 /// One coin type's input to the holding tower: its three counts, the seat, and
-/// its card embedding. Named here because the GPU build cuts the same row.
+/// its card embedding.
+#[allow(non_snake_case)]
+/// The holding tower's input width: three counts and the seat, plus the
+/// card embedding. Named here because the GPU build has to cut the same row.
 pub const fn hfeat(de: usize) -> usize {
     4 + de
 }
@@ -1499,7 +1742,7 @@ mod format_tests {
             let ids: Vec<u8> = (0..rows * NTYPE).map(|i| (i % 19) as u8).collect();
             let xbel = ramp(rows * net.belief_dim());
             let phi = ramp(rows * net.cfeat());
-            let out = net.raw_scores(&xpub, &xbel, &phi, &ids, rows);
+            let out = net.forward(&xpub, &xbel, &phi, &ids, rows);
             assert!(out.iter().all(|v| v.is_finite()), "{dims:?}: {out:?}");
             assert!(
                 out.iter().any(|v| v.abs() > 1e-6),
@@ -1508,16 +1751,30 @@ mod format_tests {
         }
     }
 
+    /// The frozen v2 layout must still load (old checkpoints, .bin dumps).
     #[test]
-    fn unversioned_weight_binary_is_rejected() {
-        let path =
-            std::env::temp_dir().join(format!("warchest-unversioned-{}.bin", std::process::id()));
-        let old = crate::rebel::ENCODING_VERSION - 1;
-        std::fs::write(&path, old.to_le_bytes()).unwrap();
-        let err = Mlp::load_flat_bin(path.to_str().unwrap()).unwrap_err();
-        std::fs::remove_file(path).unwrap();
-        assert!(err
-            .to_string()
-            .contains(&format!("weight encoding version {old}")));
+    fn v2_still_loads() {
+        let (p, h, hd, dg, rk, de, dc) = (PUBFEAT, 96, 64, 32, 24, 16, 24);
+        let dims = vec![p, h, hd, CFEAT, dg, rk, AFEAT, de, dc, 0];
+        let (af, hf, xd) = (AFEAT + de, hfeat(de), xdim_of(de));
+        let nw = CARD_FEATS * dc
+            + dc * de
+            + crate::units::N_UNITS * de
+            + (PILE_COUNTS + de) * de
+            + xd * h
+            + h * hd
+            + 2 * dg * hd
+            + hf * dg
+            + dg * dg
+            + dg * dg
+            + dg * (rk + 1)
+            + hd * rk
+            + af * rk
+            + dg * rk
+            + hd * rk;
+        let nb = dc + de + de + h + hd + dg + dg + dg + (rk + 1) + 4 * rk;
+        let net = Mlp::from_flat(&dims, &ramp(nw), &ramp(nb), &ramp(2 * h + 2 * hd)).unwrap();
+        assert_eq!(net.head(), hd);
+        assert_eq!(net.towers(), (vec![dc, de], vec![h], hd, vec![], vec![], 1));
     }
 }

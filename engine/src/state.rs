@@ -49,11 +49,7 @@ pub const Z_FACEUP: usize = 2;
 pub const Z_FACEDOWN: usize = 3;
 pub const Z_SUPPLY: usize = 4;
 pub const Z_ELIM: usize = 5;
-/// The Warrior Priest's drawn coin, between the draw and the forced play that
-/// must spend it. A one-coin private zone: its size is public (the pending
-/// node says whether a forced play is owed), its identity is not.
-pub const Z_INFLIGHT: usize = 6;
-pub const N_ZONES: usize = 7;
+pub const N_ZONES: usize = 6;
 
 pub const WHITE: u8 = 0;
 pub const BLACK: u8 = 1;
@@ -154,9 +150,8 @@ pub enum Cont {
     /// it, so the draw's apply re-installs the RoyalGuardChoice node.
     WarriorPriestDraw { player: u8, rg_hex: u8 },
     /// Warrior Priest forced play of the coin just drawn (any action using that
-    /// coin type; pass always legal). The coin itself is in `Z_INFLIGHT`, which
-    /// is where the play pays from — this node names no private information.
-    WarriorPriestPlay { player: u8 },
+    /// coin type; pass always legal). `coin` is the drawn unit index.
+    WarriorPriestPlay { player: u8, coin: u8 },
     /// Internal bookkeeping: after a deferred (RoyalGuard) attack resolves,
     /// queue the attacker's post-triggers. Never a decision node; consumed by
     /// advance() the instant it surfaces.
@@ -222,12 +217,6 @@ impl ContStack {
     pub fn is_empty(&self) -> bool {
         self.n == 0
     }
-
-    /// Continuations in resolution order (the stack's top first).
-    #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = &Cont> {
-        self.v[..self.n as usize].iter().rev()
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -270,73 +259,6 @@ pub struct State {
 }
 
 impl State {
-    /// Rotate the board 180 degrees and exchange the two player seats.
-    /// This is an exact game symmetry and intentionally lives on `State`,
-    /// independently of the replay encoder and its Python augmentation.
-    pub fn mirror(&self) -> State {
-        let flip = |p: u8| if p < 2 { 1 - p } else { p };
-        let mh = |h: u8| {
-            if h == NONE {
-                NONE
-            } else {
-                board().mirror[h as usize]
-            }
-        };
-        let mc = |c: Cont| match c {
-            Cont::Draw { player } => Cont::Draw {
-                player: flip(player),
-            },
-            Cont::MainPlay => Cont::MainPlay,
-            Cont::RoyalGuardChoice { defender, rg_hex } => Cont::RoyalGuardChoice {
-                defender: flip(defender),
-                rg_hex: mh(rg_hex),
-            },
-            Cont::SwordsmanMove { hex } => Cont::SwordsmanMove { hex: mh(hex) },
-            Cont::BerserkerChain { hex, v2 } => Cont::BerserkerChain { hex: mh(hex), v2 },
-            Cont::FootmanManeuver { hexes } => {
-                let mut out = HexSet::default();
-                for h in hexes.iter() {
-                    out.insert(mh(h));
-                }
-                Cont::FootmanManeuver { hexes: out }
-            }
-            Cont::CavalryAttack { hex } => Cont::CavalryAttack { hex: mh(hex) },
-            Cont::MercenaryManeuver { hex } => Cont::MercenaryManeuver { hex: mh(hex) },
-            Cont::FootmanInstantDeploy { coin } => Cont::FootmanInstantDeploy { coin },
-            Cont::WarriorPriestDraw { player, rg_hex } => Cont::WarriorPriestDraw {
-                player: flip(player),
-                rg_hex: mh(rg_hex),
-            },
-            Cont::WarriorPriestPlay { player } => Cont::WarriorPriestPlay {
-                player: flip(player),
-            },
-            Cont::_AttackPost { atk_hex } => Cont::_AttackPost {
-                atk_hex: mh(atk_hex),
-            },
-        };
-
-        let mut out = *self;
-        for h in 0..N_HEXES {
-            let to = board().mirror[h] as usize;
-            out.hex_type[to] = self.hex_type[h];
-            out.hex_owner[to] = flip(self.hex_owner[h]);
-            out.hex_height[to] = self.hex_height[h];
-            out.loc_marker[to] = flip(self.loc_marker[h]);
-        }
-        out.zones.swap(0, 1);
-        out.markers_hand.swap(0, 1);
-        out.turns_taken.swap(0, 1);
-        out.initiative = flip(self.initiative);
-        out.first_player = flip(self.first_player);
-        out.active = flip(self.active);
-        out.winner = flip(self.winner);
-        out.pending = mc(self.pending);
-        for i in 0..self.conts.n as usize {
-            out.conts.v[i] = mc(self.conts.v[i]);
-        }
-        out
-    }
-
     /// Build the initial state from a draft.
     /// `white_units`/`black_units`: 4 unitTypeIds each. `first_player`: WHITE/BLACK.
     pub fn from_draft(white_units: &[u16], black_units: &[u16], first_player: u8) -> State {
@@ -658,27 +580,5 @@ mod horizon_tests {
         state.winner = BLACK;
         assert_eq!(state.utility(WHITE as usize), -1.0);
         assert_eq!(state.utility(BLACK as usize), 1.0);
-    }
-
-    #[test]
-    fn mirror_is_an_involution() {
-        let mut state = State::blank(BLACK);
-        state.set_unit(0, WHITE, 3, 2);
-        state.set_marker(board().location_hexes[4] as usize, BLACK);
-        state.add_zone(WHITE, Z_HAND, 2, 1);
-        state.add_zone(BLACK, Z_FACEUP, 4, 2);
-        state.markers_hand = [2, 5];
-        state.turns_taken = [1, 3];
-        state.initiative = WHITE;
-        state.first_player = BLACK;
-        state.pending = Cont::RoyalGuardChoice {
-            defender: WHITE,
-            rg_hex: 0,
-        };
-        state.conts.push(Cont::WarriorPriestDraw {
-            player: BLACK,
-            rg_hex: 6,
-        });
-        assert_eq!(state.mirror().mirror(), state);
     }
 }

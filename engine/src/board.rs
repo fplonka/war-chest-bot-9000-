@@ -44,8 +44,6 @@ pub struct Board {
     /// For each ordered (from, dir): the hex one step from `from` in that of
     /// the 6 axial directions, or NONE if off-board. Used for straight lines.
     pub step: [[u8; 6]; N_HEXES],
-    /// Hex reached by rotating the board 180 degrees around its centre.
-    pub mirror: [u8; N_HEXES],
 }
 
 fn valid_coord(x: i8, y: i8) -> bool {
@@ -102,11 +100,6 @@ impl Board {
                 dist[a][b] = axial_dist(coord[a], coord[b]);
             }
         }
-        let mut mirror = [NONE; N_HEXES];
-        for (h, &(x, y)) in coord.iter().enumerate() {
-            mirror[h] = index_of(6 - x, 6 - y);
-            assert_ne!(mirror[h], NONE, "board rotation stays on the board");
-        }
 
         // between[a][b]: the hex strictly between a and b when they are exactly
         // two apart along one of the 6 straight directions.
@@ -142,7 +135,6 @@ impl Board {
             location_hexes,
             between,
             step,
-            mirror,
         }
     }
 

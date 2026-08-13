@@ -11,7 +11,7 @@ A dump holds, oldest row first:
 
     rows  [rows, ROW_BYTES] the packed frozen row format (see `rebel::ROW_*`);
                            the network input is expanded from these
-    cc    [configs, CCOUNTS] hand/face-down/bag counts, per config
+    cc    [configs, CCOUNTS] hand, face-down and bag counts, per config
     cp    [configs]         which player the config belongs to
     cw    [configs]         its belief probability
     cy    [configs]         the value the solve gave it
@@ -23,8 +23,8 @@ A dump holds, oldest row first:
 Rows are stored oldest-first so a split by recency is possible. That is the only
 honest split: rows from one epoch come from the same handful of games and are
 heavily correlated, so a random split leaks its answers into the training set.
-`version` pins the row, feature, and target semantics; `rules_hash` pins the
-rules tables. An incompatible dump is refused.
+`version` and `rules_hash` pin the row format and the rules tables; a dump from
+a different rules build is refused.
 """
 
 import numpy as np
@@ -47,7 +47,6 @@ class Dump:
         # `seg` is emitted in row order, so a row range is a contiguous config
         # range and slicing is two binary searches rather than a scan.
         self.row_start = np.searchsorted(self.seg, 2 * np.arange(len(self.x) + 1))
-        self.check(warchest.PUBFEAT, warchest.CCOUNTS)
 
     def __len__(self):
         return len(self.x)
@@ -60,10 +59,10 @@ class Dump:
                 self.seg[a:b] - 2 * lo)
 
     def check(self, pubfeat, ccounts):
-        if (self.pubfeat, self.ccounts) != (pubfeat, ccounts):
+        if self.pubfeat != pubfeat or self.ccounts != ccounts:
             raise SystemExit(
-                f"dump has PUBFEAT/CCOUNTS={self.pubfeat}/{self.ccounts}, "
-                f"module has {pubfeat}/{ccounts} -- rebuild or redump"
+                f"dump has PUBFEAT={self.pubfeat} CCOUNTS={self.ccounts}, module has "
+                f"{pubfeat}/{ccounts} -- rebuild or redump"
             )
         if self.row_bytes != warchest.ROW_BYTES:
             raise SystemExit(

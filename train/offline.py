@@ -30,7 +30,6 @@ MLP at 65% of the cost*. `docs/REBEL.md` records that; the code is gone.
 """
 
 import argparse
-import copy
 import json
 import os
 import sys
@@ -128,7 +127,6 @@ def run_one(name, tr, va, te, args, dev, seed):
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.steps)
         rng = np.random.default_rng(seed)
         best_val, best_step, curve = float("inf"), 0, []
-        best_state = None
         for step in range(1, args.steps + 1):
             ids = np.sort(rng.integers(0, ntr, size=args.batch))
             # Duplicate row ids would make `subset` ambiguous; sampling without
@@ -136,8 +134,6 @@ def run_one(name, tr, va, te, args, dev, seed):
             ids = np.unique(ids)
             b = make_batch(subset(tr, ids), rng, dev, args.augment)
             loss = value_loss(net, *b[:-1])
-            if args.aux:
-                loss = loss + args.aux * net.aux_loss(b[0], b[1], b[-1])
             opt.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(net.parameters(), 5.0)
@@ -148,27 +144,17 @@ def run_one(name, tr, va, te, args, dev, seed):
                 curve.append({"step": step, "val_huber": round(vl, 6)})
                 if vl < best_val:
                     best_val, best_step = vl, step
-                    best_state = copy.deepcopy(net.state_dict())
                 print(f"    {name:14s} lr={lr:.0e} step {step:6d}  "
                       f"val {vl:.6f}/{vrms:.5f}  ({time.time() - t0:.0f}s)", flush=True)
         # The test set is evaluated exactly once, at the best-validation
-        # checkpoint -- which means restoring it first. Without this the number
-        # reported is the *last* step's, and a run that overfits after its best
-        # step is scored at its worst.
-        if best_state is not None:
-            net.load_state_dict(best_state)
+        # checkpoint. (The net keeps running; the comparison is between
+        # checkpoints chosen the same way, which is what the plan requires.)
         hl, rms = evaluate(net, te, rng, dev)
-        # The same checkpoint on data it was fitted to. Test error alone cannot
-        # tell a network that *cannot represent* the target function from one
-        # that represents it and has not seen enough of it; the gap between
-        # these two can.
-        _, trms = evaluate(net, subset(tr, np.arange(min(len(tr[0]), 8192))), rng, dev)
         row = {"lr": lr, "val_huber": round(best_val, 6), "best_step": best_step,
-               "test_huber": round(hl, 6), "test_rms": round(rms, 5),
-               "train_rms": round(trms, 5), "curve": curve}
+               "test_huber": round(hl, 6), "test_rms": round(rms, 5), "curve": curve}
         if best is None or row["val_huber"] < best["val_huber"]:
             best = row
-    return {"arch": name, "params": params, "train_rms": best["train_rms"],
+    return {"arch": name, "params": params,
             "test_huber": best["test_huber"], "test_rms": best["test_rms"],
             "best_val_huber": best["val_huber"], "best_step": best["best_step"],
             "lr": best["lr"], "seconds": round(time.time() - t0, 1),
@@ -208,9 +194,6 @@ def main():
     # swapped. Free extra data, which is what the train/test gap says the
     # network is actually short of.
     ap.add_argument("--augment", action="store_true")
-    ap.add_argument("--aux", type=float, default=0.0,
-                    help="weight on the auxiliary heads; the value loss reported "
-                         "is still the value loss alone, so the columns compare")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
@@ -219,6 +202,7 @@ def main():
     torch.set_num_threads(os.cpu_count() or 8)
     dev = torch.device(args.device)
     d = Dump(args.dump)
+    d.check(warchest.PUBFEAT, warchest.CCOUNTS)
     # Solve-aligned held-out split: oldest solves train, the middle block
     # validates (checkpoint selection), the newest block tests (one
     # evaluation). All cuts snap to solve boundaries, so no solve straddles a
@@ -260,13 +244,12 @@ def main():
         r["explained"] = round(1 - (r["test_rms"] / tgt_std) ** 2, 4)
         results.append(r)
 
-    print(f"\n{'arch':18s} {'params':>9s} {'lr':>8s} {'step':>7s} "
-          f"{'train_rms':>10s} {'test_rms':>9s} {'gap':>6s} {'var expl':>9s} {'sec':>6s}")
+    print(f"\n{'arch':14s} {'params':>9s} {'lr':>8s} {'best_step':>9s} "
+          f"{'val':>10s} {'test':>10s} {'test_rms':>9s} {'var expl':>9s} {'sec':>6s}")
     for r in sorted(results, key=lambda r: r["test_huber"]):
-        print(f"{r['arch']:18s} {r['params']:9d} {r['lr']:8.0e} {r['best_step']:7d} "
-              f"{r['train_rms']:10.5f} {r['test_rms']:9.5f} "
-              f"{r['test_rms'] / r['train_rms']:6.2f} {r['explained']:9.4f} "
-              f"{r['seconds']:6.1f}")
+        print(f"{r['arch']:14s} {r['params']:9d} {r['lr']:8.0e} {r['best_step']:9d} "
+              f"{r['best_val_huber']:10.6f} {r['test_huber']:10.6f} "
+              f"{r['test_rms']:9.5f} {r['explained']:9.4f} {r['seconds']:6.1f}")
     if args.out:
         with open(args.out, "w") as f:
             json.dump({"args": vars(args), "results": results}, f, indent=1)

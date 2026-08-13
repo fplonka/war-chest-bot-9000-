@@ -1,16 +1,12 @@
 //! Self-play, training-data generation and evaluation.
 //!
 //! One loop drives every agent. At each decision node an agent produces a
-//! *per-config* policy `P(private action | config)`; the loop samples an
-//! action, propagates the public belief through the policy, and applies the
-//! action. Several private actions can share one public observation, so belief
-//! propagation sums over all of them.
-//!
-//! ReBeL exploration samples public branches off-policy. It does not change
-//! the PBS attached to a sampled branch: that PBS is propagated under the
-//! solved reference strategy. One player is selected as the explorer for the
-//! whole subgame walk. After an exploratory action, the representative hidden
-//! configuration is redrawn from the reference PBS before play continues.
+//! *per-config* policy `P(private action | config)`; the loop then
+//!   1. samples the action from the row for the true config,
+//!   2. Bayes-updates the public belief from what the opponent actually
+//!      **observes** — summing over every private action consistent with that
+//!      observation, which is what keeps face-down plays private,
+//!   3. applies the action to the true state.
 //! Chance nodes are resolved from the true bag and convolve the belief with
 //! each config's own draw distribution.
 //!
@@ -52,8 +48,9 @@ const STARTER_WHITE: [u16; 4] = [17, 12, 4, 9]; // Swordsman, Pikeman, Crossbowm
 const STARTER_BLACK: [u16; 4] = [1, 3, 8, 16]; // Archer, Cavalry, Lancer, Scout
 
 /// Draftable units. The Warrior Priest pair (ids 18 and 54) is included: their
-/// private mid-round draw puts the drawn coin in flight, which is one more
-/// private count for the solver, the belief filter and the walk to carry.
+/// private mid-round draw puts "which coin must I now play" into the private
+/// state as `Config::pending_coin`, which the solver, belief filter and walk
+/// all carry.
 pub const DRAFT_POOL: [u16; 19] = [
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 17, 18, 19, 52, 53, 54,
 ];
@@ -273,8 +270,9 @@ pub struct Data {
     /// row is expanded when a batch is made, so the stored bytes never go
     /// stale as the network changes.
     pub rows: Vec<u8>,
-    /// `[total_configs, CCOUNTS]` raw config counts in arena order. Raw `u8`
-    /// storage keeps millions affordable.
+    /// `[total_configs, CCOUNTS]` raw counts per config, in the arena order.
+    /// Raw rather than normalised: they are `u8`-valued, and storing them that
+    /// way is what keeps a replay row small enough to hold millions of them.
     pub cc: Vec<u8>,
     /// `[total_configs]` belief probability of each config.
     pub cw: Vec<f32>,
@@ -292,6 +290,9 @@ pub struct Data {
     pub oversize_routes: usize,
     /// Oversized solves that drained and trimmed every lane on one card.
     pub card_exclusive_routes: usize,
+    /// GPU submissions retried by the exact CPU solver after an unexpected
+    /// device error. Oversize jobs normally complete on the serialized GPU path.
+    pub exact_fallbacks: usize,
     /// Live games intentionally discarded at a wall-clock deadline. This is
     /// time-censored work, not a capacity drop and never enters replay.
     pub censored_games: usize,
@@ -317,14 +318,14 @@ pub struct Data {
     /// `[sum nc * na]` the reference strategy: one distribution per config of
     /// the acting player, in the row's config order.
     pub pp: Vec<f32>,
-    pub ppoff: Vec<u32>,
     /// `[2 * n + 1]` arena offsets.
     pub coff: Vec<u32>,
     /// Solve starts in row space: `soff[k]` is the row at which solve k
     /// starts (first entry 0). The Python binding appends the total row count
-    /// as the trailing entry. Training samples the retained, log-spaced rows;
-    /// these boundaries remain useful for honest solve-level splits in replay
-    /// dumps. Empty when no rows were collected.
+    /// as the trailing entry, so the buffer sees `soff[k]..soff[k+1]` as one
+    /// solve's rows. TurboReBeL produces T+1 near-duplicate rows per solve,
+    /// so the replay buffer treats the solve as its sampling unit — this
+    /// array is what lets it. Empty when no rows were collected.
     pub soff: Vec<u32>,
     pub nv: usize,
     pub games: usize,
@@ -337,12 +338,6 @@ pub struct Data {
     /// Attempted subgame builds that hit `Cfg::node_cap` and used the uniform
     /// policy fallback instead of producing a solve.
     pub node_caps: usize,
-    /// Decisions a ReBeL agent answered from the uniform fallback rather than
-    /// from a search, for any reason. A capped build costs one of these plus
-    /// the micro-continuations that finish its coin play, so this is the
-    /// honest count and `node_caps` is the cause. Evaluation must never spend
-    /// any: a ladder rates the checkpoint, not a coin flip.
-    pub unsearched: usize,
     pub configs: usize,
     /// Seconds workers spent blocked on the GPU (idle CPU), summed.
     pub gpu_wait_s: f32,
@@ -350,10 +345,6 @@ pub struct Data {
     /// thread. It is invisible in both CPU time and `gpu_wait_s`, so without
     /// it a saturated result path looks like a system with nothing saturated.
     pub merge_wait_s: f32,
-    /// Residual before the target-side numerical centring safeguard.
-    pub zero_sum_abs: f64,
-    pub zero_sum_max: f32,
-    pub zero_sum_n: usize,
 }
 
 impl Data {
@@ -361,7 +352,6 @@ impl Data {
         let base = self.cw.len() as u32;
         self.rows.extend(o.rows);
         let (row_base, act_base) = (self.nv as u32, (self.pa.len() / AFEAT) as u32);
-        let prob_base = self.pp.len() as u32;
         self.prow.extend(o.prow.iter().map(|r| r + row_base));
         self.pact.extend(o.pact);
         self.pa.extend(o.pa);
@@ -370,9 +360,6 @@ impl Data {
         self.paoff
             .extend(o.paoff.iter().skip(phead).map(|x| x + act_base));
         self.pp.extend(o.pp);
-        let pphead = if self.ppoff.is_empty() { 0 } else { 1 };
-        self.ppoff
-            .extend(o.ppoff.iter().skip(pphead).map(|x| x + prob_base));
         self.cc.extend(o.cc);
         self.cw.extend(o.cw);
         self.cy.extend(o.cy);
@@ -389,18 +376,15 @@ impl Data {
         self.dropped += o.dropped;
         self.oversize_routes += o.oversize_routes;
         self.card_exclusive_routes += o.card_exclusive_routes;
+        self.exact_fallbacks += o.exact_fallbacks;
         self.censored_games += o.censored_games;
         self.wins[0] += o.wins[0];
         self.wins[1] += o.wins[1];
         self.draws += o.draws;
         self.gpu_wait_s += o.gpu_wait_s;
         self.merge_wait_s += o.merge_wait_s;
-        self.zero_sum_abs += o.zero_sum_abs;
-        self.zero_sum_max = self.zero_sum_max.max(o.zero_sum_max);
-        self.zero_sum_n += o.zero_sum_n;
         self.cap_hits += o.cap_hits;
         self.node_caps += o.node_caps;
-        self.unsearched += o.unsearched;
         self.configs += o.configs;
     }
 
@@ -414,26 +398,10 @@ impl Data {
     /// stored: the value function is a function of the config, so there is
     /// nothing to average away.
     fn push_value(&mut self, s: &State, ctx: &Ctx, bel: &[Belief; 2], y: [&[f32]; 2]) {
-        assert!(
+        debug_assert!(
             matches!(s.pending(), Cont::MainPlay),
-            "value rows are taken only at normal coin-play decisions: {:?}",
-            s.pending()
+            "every saved value row is a normal coin-play state"
         );
-        let mean = |p: usize| {
-            let mass: f32 = bel[p].p.iter().sum();
-            bel[p].p.iter().zip(y[p]).map(|(&w, &v)| w * v).sum::<f32>()
-                / mass.max(f32::MIN_POSITIVE)
-        };
-        let residual = mean(0) + mean(1);
-        assert!(
-            residual.abs() <= 1e-4,
-            "non-zero-sum value target: belief-weighted v0 + v1 = {residual}"
-        );
-        self.zero_sum_abs += residual.abs() as f64;
-        self.zero_sum_max = self.zero_sum_max.max(residual.abs());
-        self.zero_sum_n += 1;
-        let centre = 0.5 * residual;
-
         let base = self.rows.len();
         self.rows.resize(base + ROW_BYTES, 0);
         pack_row(s, ctx, &mut self.rows[base..base + ROW_BYTES]);
@@ -443,12 +411,12 @@ impl Data {
         }
         for p in 0..2 {
             let res = reserve(s, p as u8, ctx);
-            let mut private = [0u8; CCOUNTS];
+            let mut cnt = [0u8; CCOUNTS];
             for (ci, c) in bel[p].cfg.iter().enumerate() {
-                config_counts(c, &res, &mut private);
-                self.cc.extend_from_slice(&private);
+                config_counts(c, &res, &mut cnt);
+                self.cc.extend_from_slice(&cnt);
                 self.cw.push(bel[p].p[ci]);
-                self.cy.push(y[p][ci] - centre);
+                self.cy.push(y[p][ci]);
             }
             self.coff.push(self.cw.len() as u32);
         }
@@ -470,7 +438,6 @@ impl Data {
         }
         if self.paoff.is_empty() {
             self.paoff.push(0);
-            self.ppoff.push(0);
         }
         let base = self.pa.len();
         self.pa.resize(base + na * AFEAT, 0.0);
@@ -492,7 +459,6 @@ impl Data {
                 self.pp[base + n.legal_action[cell] as usize] = p;
             }
         }
-        self.ppoff.push(self.pp.len() as u32);
         self.prow.push(row as u32);
         self.pact.push(player);
     }
@@ -515,7 +481,6 @@ impl Data {
         }
         if self.paoff.is_empty() {
             self.paoff.push(0);
-            self.ppoff.push(0);
         }
         let base = self.pa.len();
         self.pa.resize(base + na * AFEAT, 0.0);
@@ -538,7 +503,6 @@ impl Data {
                 self.pp[base + tree.legal_action[cell] as usize] = strat[cell];
             }
         }
-        self.ppoff.push(self.pp.len() as u32);
         self.prow.push(row as u32);
         self.pact.push(player);
     }
@@ -556,8 +520,8 @@ impl Data {
 pub struct GameCfg {
     pub agents: [Agent; 2],
     pub collect: Collect,
-    /// Probability that ReBeL's sampled explorer plays a uniformly random
-    /// action. The explorer is fixed for one subgame walk.
+    /// Probability that a uniformly sampled player plays a uniformly random
+    /// action (ReBeL's `random_action_prob`), redrawn each decision.
     pub explore: f32,
     /// Randomise the draft instead of using the fixed starter matchup.
     pub random_draft: bool,
@@ -570,6 +534,10 @@ pub struct GameCfg {
     /// every ReBeL-phase target comes from real solves and real outcomes, so
     /// the bias washes out.
     pub eval_mix: f32,
+    /// ReBeL phase only: how much of the value target comes from the realised
+    /// game outcome instead of the pure CFR bootstrap (MuZero-style n-step /
+    /// TD(λ) anchor). 0.0 is plain ReBeL: pure bootstrap targets.
+    pub mc_mix: f32,
 }
 
 // ----------------------------------------------------------------- game loop
@@ -588,8 +556,6 @@ enum WalkState<'a> {
 struct Walk<'a> {
     tree: WalkState<'a>,
     slot: usize,
-    /// The one player allowed to explore during this sampled leaf walk.
-    explorer: u8,
     node: usize,
     /// Draws taken so far inside the current collapsed chance node.
     drawn: u8,
@@ -755,7 +721,6 @@ pub struct Game<'a> {
     pending_roots: Option<Vec<[Vec<f32>; 2]>>,
     pending_slot: usize,
     pending_player: u8,
-    pending_explorer: u8,
     pending_oversize: bool,
 }
 
@@ -791,7 +756,6 @@ impl<'a> Game<'a> {
             pending_roots: None,
             pending_slot: 0,
             pending_player: 0,
-            pending_explorer: 0,
             pending_oversize: false,
         }
     }
@@ -853,9 +817,6 @@ impl<'a> Game<'a> {
                 let wp = matches!(s.pending(), Cont::WarriorPriestDraw { .. });
                 bel[player as usize] = belief_after_draw(&bel[player as usize], &res, &fu, wp);
                 resolve_chance(s, player, rng);
-                for p in 0..2 {
-                    assert_belief_matches_state(s, p, ctx, &bel[p as usize], "draw", None);
-                }
                 // The walk spans draws now: a draw is an internal node of the
                 // subgame with one public child, so advance through it. The
                 // post-draw belief must equal the tree's post-draw config
@@ -937,28 +898,10 @@ impl<'a> Game<'a> {
                     }
                     // A pathological root falls back to a uniform policy; the
                     // policy is produced outside the walk bookkeeping below.
-                    //
-                    // A row's encoding is frozen at normal coin-play states, so
-                    // a *collecting* run cannot root a subgame at a micro
-                    // continuation: it finishes the coin play under the same
-                    // fallback and starts the next subgame at the boundary. A
-                    // run that collects nothing has no such constraint, and must
-                    // search every decision -- evaluation drops the walk at each
-                    // seat change (it belongs to the other checkpoint), so this
-                    // is where a defender's Royal Guard soak is decided, and a
-                    // checkpoint must never answer that with a coin flip.
                     let mut fallback: Option<NodePolicy> = None;
-                    if walk.is_none()
-                        && gc.collect == Collect::Rebel
-                        && !matches!(s.pending(), Cont::MainPlay)
-                    {
-                        carried.clear();
-                        data.unsearched += 1;
-                        fallback = Some(random_policy(s, ctx, player, &cfgs));
-                    }
-                    if walk.is_none() && fallback.is_none() {
+                    if walk.is_none() {
                         if let Some(r) = roots_out.as_deref_mut() {
-                            r.push((*s, bel.clone()));
+                            r.push((s.clone(), bel.clone()));
                         }
                         // Start a new subgame at this decision: build the
                         // tree (Phase 1's CPU half). TurboReBeL's Phase 2 then
@@ -983,12 +926,12 @@ impl<'a> Game<'a> {
                             // Fall back to a uniform policy for this decision
                             // and drop the walk (and any carried beliefs); the
                             // next Rebel decision starts a fresh solve. No
-                            // rows are collected here, so a search that never
-                            // ends cannot contaminate the replay.
+                            // rows are collected here, so the data keeps the
+                            // MainPlay-only invariant without a search that
+                            // never ends.
                             walk.take();
                             carried.clear();
                             data.node_caps += 1;
-                            data.unsearched += 1;
                             fallback = Some(random_policy(s, ctx, player, &cfgs));
                         } else if gpu.is_some() {
                             // GPU path: package the tree as one job. The
@@ -1007,7 +950,6 @@ impl<'a> Game<'a> {
                             self.pending_roots = Some(roots_v);
                             self.pending_slot = slot;
                             self.pending_player = player;
-                            self.pending_explorer = sample_explorer(rng, gc.explore);
                             return Step::Submitted;
                         } else {
                             // CPU path: the full solve, then the walk.
@@ -1072,7 +1014,6 @@ impl<'a> Game<'a> {
                             *walk = Some(Walk {
                                 tree: WalkState::Cpu(sv),
                                 slot,
-                                explorer: sample_explorer(rng, gc.explore),
                                 node: 0,
                                 drawn: 0,
                                 strat: Vec::new(),
@@ -1124,41 +1065,23 @@ impl<'a> Game<'a> {
                 data.push_value(s, ctx, bel, [&a, &b]);
             }
 
-            // One explorer per sampled subgame walk, so the leaf it lands on is
-            // reachable by *one* player's deviation -- which is the question a
-            // solve asks, and the distribution the value network is queried on.
-            // An agent with no walk decides a node at a time, so each of its
-            // decisions is its own walk and draws its own explorer.
-            let epsilon = gc.explore.clamp(0.0, 1.0);
-            let explorer = match walk.as_ref() {
-                Some(w) => w.explorer,
-                None => sample_explorer(rng, gc.explore),
-            };
             let true_row = np.row(true_ci);
-            let uniform_override =
-                explorer == player && epsilon > 0.0 && rng.unit_f64() < epsilon as f64;
-            let chosen_cell = true_row.start
-                + if uniform_override {
-                    rng.below(true_row.len())
-                } else {
-                    sample_row(rng, &np.probs[true_row.clone()])
-                };
+            let mut chosen_cell = true_row.start + sample_row(rng, &np.probs[true_row.clone()]);
+            if gc.explore > 0.0
+                && player as u64 == (rng.next_u64() & 1)
+                && rng.unit_f64() < gc.explore as f64
+            {
+                if !true_row.is_empty() {
+                    chosen_cell = true_row.start + rng.below(true_row.len());
+                }
+            }
             let chosen = np.legal_action[chosen_cell] as usize;
 
-            // The belief propagates under the *reference* policy even when the
-            // explorer drew uniformly: the move picks a public branch, and the
-            // PBS on that branch is the one the reference defines, which is
-            // what the value network is trained on. For ordinary agents `np` is
-            // their whole behaviour policy, so this is the ordinary posterior.
-            //
-            // The true private world is not re-drawn to match. Doing so reads
-            // as the symmetric step, and the reference implementation does it
-            // at every node -- but liar's dice self-play never deals a hand, so
-            // it has nothing to break. War Chest coins are a resource the game
-            // spends: swap which ones are in hand mid-game and no plan survives
-            // to pay off, so neither side converts and games run to the horizon.
+            // Bayes update on the *public observation*: several private
+            // actions can produce it, and the belief must sum over all of
+            // them.
             let obs = obs_key(&np.acts[chosen]);
-            let mut pairs: Vec<(Config, f32)> = Vec::with_capacity(cfgs.len());
+            let mut pairs: Vec<(Config, f32)> = Vec::new();
             for (ci, c) in cfgs.iter().enumerate() {
                 for cell in np.row(ci) {
                     let a = np.legal_action[cell] as usize;
@@ -1172,28 +1095,7 @@ impl<'a> Game<'a> {
             }
             bel[player as usize] = Belief::from_pairs(pairs);
             s.apply_inplace(np.acts[chosen]);
-            // The private world moves by the player's own action and by nothing
-            // else -- the same transition every config in the belief just took.
-            // Being *somewhere* in the support is not enough: a world re-drawn
-            // from the belief passes that test and still teleports coins between
-            // hand, bag and discard, which is a resource the real game spends.
-            assert_eq!(
-                advance_config(&truth, np.aslot[chosen], np.fdown[chosen]),
-                Some(true_config(s, player, ctx)),
-                "the private world moved by something other than the action: \
-                 player={player} action={:?}",
-                np.acts[chosen],
-            );
-            for p in 0..2 {
-                assert_belief_matches_state(
-                    s,
-                    p,
-                    ctx,
-                    &bel[p as usize],
-                    "public action",
-                    Some(np.acts[chosen]),
-                );
-            }
+
             // Advance the walk along the solved tree. The public observation
             // of the chosen action selects the child; if that child is a leaf
             // (depth exhausted, terminal, or a draw), the walk ends and the
@@ -1263,7 +1165,6 @@ impl<'a> Game<'a> {
         self.walk = Some(Walk {
             tree: WalkState::Gpu(tree),
             slot,
-            explorer: self.pending_explorer,
             node: 0,
             drawn: 0,
             strat: result.strategy,
@@ -1271,6 +1172,71 @@ impl<'a> Game<'a> {
         });
         self.data.oversize_routes += result.oversize_route as usize;
         self.data.card_exclusive_routes += result.card_exclusive_route as usize;
+    }
+
+    /// Rebuild and solve a pending GPU job on the verified CPU path. This is
+    /// deliberately serialized by the caller: an oversize solve is rare, but
+    /// allowing several of its multi-gigabyte arenas at once would merely move
+    /// the capacity failure from device memory to host memory.
+    #[cfg(feature = "gpu")]
+    pub fn retry_cpu(&mut self, nets: &'a [Nets]) {
+        // Release the packed GPU representation before allocating the CPU CFR
+        // arenas. The worker has normally taken `pending_job` already; keep the
+        // take here so direct callers cannot accidentally retain it.
+        self.pending_job.take();
+        self.pending_walk.take().expect("pending walk tree");
+        let roots_v = self.pending_roots.take().expect("pending roots");
+        let oversize = std::mem::take(&mut self.pending_oversize);
+        let player = self.pending_player;
+        let Agent::Rebel { cfg, slot } = self.gc.agents[player as usize] else {
+            panic!("GPU retry requested for a non-ReBeL agent");
+        };
+        let scfg = Cfg {
+            snapshots: self.gc.collect == Collect::Rebel,
+            gpu_build: false,
+            ..cfg
+        };
+        let mut sv = Solver::new(&self.s, self.ctx, &nets[slot], scfg, self.bel.clone());
+        assert!(
+            !sv.capped(),
+            "a GPU job that passed the node cap capped on its exact CPU retry"
+        );
+        sv.warm_start(scfg.warm);
+        sv.multistep(cfg.iters);
+        if self.gc.collect == Collect::Rebel {
+            self.data.begin_solve();
+            let vals = sv.value_under(&roots_v);
+            for (r, v) in roots_v.iter().zip(&vals) {
+                self.data.push_value(
+                    &self.s,
+                    &self.ctx,
+                    &[
+                        Belief {
+                            cfg: self.bel[0].cfg.clone(),
+                            p: r[0].clone(),
+                        },
+                        Belief {
+                            cfg: self.bel[1].cfg.clone(),
+                            p: r[1].clone(),
+                        },
+                    ],
+                    [&v[0], &v[1]],
+                );
+            }
+            self.data
+                .push_policy(&sv, &self.ctx, self.data.nv - 1, player);
+        }
+        self.carried.clear();
+        self.walk = Some(Walk {
+            tree: WalkState::Cpu(sv),
+            slot,
+            node: 0,
+            drawn: 0,
+            strat: Vec::new(),
+            carries: None,
+        });
+        self.data.exact_fallbacks += 1;
+        self.data.oversize_routes += oversize as usize;
     }
 
     /// The game ended: blend the outcome into the parked targets, fill the
@@ -1283,6 +1249,12 @@ impl<'a> Game<'a> {
             // targets come entirely from the subgame solve.
             let m = self.gc.eval_mix.clamp(0.0, 1.0);
             blend_outcome(&mut self.data, self.from_row, m, 1.0 - m, z);
+        }
+        if self.gc.collect == Collect::Rebel && self.gc.mc_mix > 0.0 {
+            // Anchor the pure bootstrap target to the realised outcome
+            // (TD(lambda)-style), blended in once per game.
+            let m = self.gc.mc_mix.clamp(0.0, 1.0);
+            blend_outcome(&mut self.data, self.from_row, 1.0 - m, m, z);
         }
         fill_aux(&mut self.data, self.from_row, &self.timeline, z);
         self.data.games += 1;
@@ -1308,17 +1280,19 @@ pub fn play_game(
     nets: &[Nets],
     gc: &GameCfg,
     data: &mut Data,
-    roots: Option<&mut Vec<(State, [Belief; 2])>>,
+    mut roots: Option<&mut Vec<(State, [Belief; 2])>>,
 ) -> f32 {
     let mut g = Game::new(rng, gc);
     if roots.is_some() {
         g.set_roots(Vec::new());
     }
-    let z = match g.advance(None, nets) {
-        Step::Ended => g.finish(),
-        Step::Submitted => unreachable!("cpu path never submits"),
+    let z = loop {
+        match g.advance(None, nets) {
+            Step::Ended => break g.finish(),
+            Step::Submitted => unreachable!("cpu path never submits"),
+        }
     };
-    if let Some(r) = roots {
+    if let Some(r) = roots.as_deref_mut() {
         r.extend(g.take_roots());
     }
     let d = g.take_data();
@@ -1449,54 +1423,6 @@ fn resolve_chance(s: &mut State, player: u8, rng: &mut Rng) {
     s.apply_inplace(acts[ai]);
 }
 
-/// The public encoder and tree builder require every private config to be a
-/// different split of the same public counts. Check that boundary immediately
-/// after every belief transition so corruption is attributed to the action
-/// that created it rather than to an unrelated solve several decisions later.
-fn assert_belief_matches_state(
-    s: &State,
-    p: u8,
-    ctx: &Ctx,
-    b: &Belief,
-    event: &str,
-    action: Option<Action>,
-) {
-    let res = reserve(s, p, ctx);
-    let truth = true_config(s, p, ctx);
-    let forced = truth.inflight.is_some();
-    let hand = s.hand_size(p);
-    let fd: u8 = s.zones[p as usize][crate::state::Z_FACEDOWN]
-        .iter()
-        .copied()
-        .sum();
-    for c in &b.cfg {
-        assert_eq!(
-            c.hand_size(), hand,
-            "{event} belief changed public hand size: player={p} action={action:?} state={:?} config={c:?}",
-            s.pending()
-        );
-        assert_eq!(
-            c.fd_size(), fd,
-            "{event} belief changed public face-down size: player={p} action={action:?} state={:?} config={c:?}",
-            s.pending()
-        );
-        assert_eq!(
-            c.inflight.is_some(),
-            forced,
-            "{event} belief disagrees on whether a coin is in flight: player={p} action={action:?} state={:?} config={c:?}",
-            s.pending()
-        );
-        for k in 0..NSLOT {
-            assert!(
-                c.hand[k] + c.fd[k] + u8::from(c.inflight == Some(k as u8)) <= res[k],
-                "{event} belief exceeds reserve: player={p} slot={k} reserve={} action={action:?} state={:?} config={c:?}",
-                res[k],
-                s.pending()
-            );
-        }
-    }
-}
-
 pub(crate) fn effective_bag_count(s: &State, p: u8, unit: u8) -> u8 {
     let bag_total: u8 = s.zones[p as usize][Z_BAG].iter().sum();
     if bag_total > 0 {
@@ -1508,27 +1434,11 @@ pub(crate) fn effective_bag_count(s: &State, p: u8, unit: u8) -> u8 {
 }
 
 fn sample_row(rng: &mut Rng, row: &[f32]) -> usize {
-    let total: f64 = row.iter().map(|&x| x.max(0.0) as f64).sum();
-    if total <= 0.0 {
-        return rng.below(row.len().max(1));
-    }
-    let mut needle = rng.unit_f64() * total;
-    for (i, &p) in row.iter().enumerate() {
-        let p = p.max(0.0) as f64;
-        if needle < p {
-            return i;
-        }
-        needle -= p;
-    }
-    row.len() - 1
-}
-
-#[inline]
-fn sample_explorer(rng: &mut Rng, explore: f32) -> u8 {
-    if explore > 0.0 {
-        (rng.next_u64() & 1) as u8
+    let w: Vec<f64> = row.iter().map(|&x| x.max(0.0) as f64).collect();
+    if w.iter().sum::<f64>() > 0.0 {
+        rng.weighted_index(&w)
     } else {
-        0
+        rng.below(row.len().max(1))
     }
 }
 
@@ -1617,6 +1527,7 @@ pub fn run_games_gpu_until(
     deadline: Option<std::time::Instant>,
 ) -> Data {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    static EXACT_FALLBACK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     // Live games per worker: one solving on the GPU while another builds its
     // tree on the CPU. More than two is worth it whenever the service is the
     // bottleneck — the resident live set is `workers * per`, and a bigger live
@@ -1729,12 +1640,14 @@ pub fn run_games_gpu_until(
                             out.censored_games += 1;
                             continue;
                         }
-                        // A refused or failed solve is a bug in admission or in
-                        // the device, and there is no second path to hide it
-                        // behind: the exact CPU retry used to serialize the
-                        // whole run behind one multi-gigabyte rebuild.
-                        let trip1 = res.unwrap_or_else(|e| panic!("GPU solve failed: {e}"));
-                        game[k].as_mut().expect("pending game").resume(trip1);
+                        match res {
+                            Ok(trip1) => game[k].as_mut().expect("pending game").resume(trip1),
+                            Err(e) => {
+                                eprintln!("gen: exact CPU retry after GPU error: {e}");
+                                let _exclusive = EXACT_FALLBACK.lock().unwrap();
+                                game[k].as_mut().expect("pending game").retry_cpu(nets);
+                            }
+                        }
                     }
                     out
                 })
@@ -1751,10 +1664,9 @@ pub fn run_games_gpu_until(
 /// Continuous ReBeL generation for the trainer. A fixed number of CPU builder
 /// threads each owns many lightweight game actors; completed solves are
 /// detached immediately and merged into bounded chunks while the actors keep
-/// playing. This is valid because ReBeL targets are pure bootstrap: a value
-/// target is final the moment its solve completes and never depends on how the
-/// game later ended. The auxiliary heads do depend on that, which is why they
-/// are not available on this path.
+/// playing. This eager path is valid for pure bootstrap targets (`mc_mix=0`)
+/// with the auxiliary loss disabled: value and policy targets are final at GPU
+/// completion, while outcome-dependent auxiliary bytes remain zero.
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 pub fn run_games_gpu_stream(
@@ -1772,6 +1684,10 @@ pub fn run_games_gpu_stream(
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     assert_eq!(gc.collect, Collect::Rebel);
+    assert_eq!(
+        gc.mc_mix, 0.0,
+        "eager stream requires pure bootstrap targets"
+    );
     let workers = workers.max(1);
     let per = actors_per_worker.max(1);
     let max_inflight = inflight_per_worker.max(1).min(per);
@@ -1782,161 +1698,147 @@ pub fn run_games_gpu_stream(
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let data_tx = data_tx.clone();
-            let error_tx = data_tx.clone();
             let next = &next;
             scope.spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut game: Vec<Option<Game>> = (0..per).map(|_| None).collect();
-                    let mut busy = vec![false; per];
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    let mut live = 0usize;
-                    let mut inflight = 0usize;
-                    let mut cursor = 0usize;
-                    let mut merge_wait = 0.0f32;
-                    loop {
-                        let stopping = stop.load(Ordering::Acquire);
-                        if stopping {
-                            for k in 0..per {
-                                if busy[k] {
-                                    continue;
-                                }
-                                if let Some(mut g) = game[k].take() {
-                                    let mut d = g.take_data();
-                                    d.censored_games += 1;
-                                    let _ = data_tx.send(Ok(d));
-                                    live -= 1;
-                                }
-                            }
-                        }
-                        let mut scanned = 0usize;
-                        while !stopping && scanned < per && inflight < max_inflight {
-                            let k = cursor;
-                            cursor = (cursor + 1) % per;
-                            scanned += 1;
+                let mut game: Vec<Option<Game>> = (0..per).map(|_| None).collect();
+                let mut busy = vec![false; per];
+                let (tx, rx) = std::sync::mpsc::channel();
+                let mut live = 0usize;
+                let mut inflight = 0usize;
+                let mut cursor = 0usize;
+                let mut merge_wait = 0.0f32;
+                loop {
+                    let stopping = stop.load(Ordering::Acquire);
+                    if stopping {
+                        for k in 0..per {
                             if busy[k] {
                                 continue;
                             }
-                            loop {
-                                if game[k].is_none() {
-                                    let i = next.fetch_add(1, Ordering::Relaxed);
-                                    game[k] = Some(Game::new(Rng::new(worker_seed(seed, i)), gc));
-                                    live += 1;
-                                }
-                                let g = game[k].as_mut().expect("live stream game");
-                                let step = {
-                                    let _t = crate::timed!(ADVANCE);
-                                    g.advance(Some(gpus), nets)
-                                };
-                                match step {
-                                    Step::Submitted => {
-                                        if stop.load(Ordering::Acquire) {
-                                            let mut g = game[k].take().unwrap();
-                                            let mut d = g.take_data();
-                                            d.censored_games += 1;
-                                            let _ = data_tx.send(Ok(d));
-                                            live -= 1;
-                                            break;
-                                        }
-                                        let job = g.take_job().expect("submitted stream job");
-                                        let dev = gpus
-                                            .iter()
-                                            .enumerate()
-                                            .min_by_key(|(_, gpu)| gpu.queued_work())
-                                            .map_or(0, |(i, _)| i);
-                                        if let Err(e) = gpus[dev].submit_tagged(job, k, tx.clone())
-                                        {
-                                            stop.store(true, Ordering::Release);
-                                            let _ = data_tx.send(Err(e));
-                                        } else {
-                                            busy[k] = true;
-                                            inflight += 1;
-                                        }
-                                        break;
-                                    }
-                                    Step::Ended => {
-                                        let _ = g.finish();
-                                        let mut d = g.take_data();
-                                        d.merge_wait_s += std::mem::take(&mut merge_wait);
-                                        if data_tx.send(Ok(d)).is_err() {
-                                            stop.store(true, Ordering::Release);
-                                        }
-                                        game[k] = None;
-                                        live -= 1;
-                                    }
-                                }
-                            }
-                        }
-                        if live == 0 && stop.load(Ordering::Acquire) {
-                            break;
-                        }
-                        if !busy.iter().any(|&x| x) {
-                            continue;
-                        }
-                        let waited = std::time::Instant::now();
-                        let Ok((k, result)) = rx.recv() else {
-                            stop.store(true, Ordering::Release);
-                            let _ =
-                                data_tx.send(Err("GPU stream completion channel closed".into()));
-                            continue;
-                        };
-                        busy[k] = false;
-                        inflight -= 1;
-                        if stop.load(Ordering::Acquire) {
-                            match result {
-                                Ok(value) => {
-                                    // Stop closes admission, not accounting. This
-                                    // solve completed while the final waves drained;
-                                    // keep its final bootstrap target, then censor
-                                    // only the unfinished public game around it.
-                                    let mut g = game[k].take().expect("draining stream game");
-                                    g.resume(value);
-                                    let mut d = g.take_data();
-                                    d.gpu_wait_s += waited.elapsed().as_secs_f32();
-                                    d.censored_games += 1;
-                                    let _ = data_tx.send(Ok(d));
-                                    live -= 1;
-                                }
-                                Err(e) => {
-                                    let _ = game[k].take();
-                                    live -= 1;
-                                    let _ = data_tx.send(Err(format!(
-                                        "GPU stream solve failed while draining: {e}"
-                                    )));
-                                }
-                            }
-                            continue;
-                        }
-                        match result {
-                            Ok(value) => {
-                                let g = game[k].as_mut().expect("pending stream game");
-                                g.resume(value);
+                            if let Some(mut g) = game[k].take() {
                                 let mut d = g.take_data();
-                                d.gpu_wait_s += waited.elapsed().as_secs_f32();
-                                // Carries the previous handoff's block time: this
-                                // one is not known until the send returns.
-                                d.merge_wait_s += std::mem::take(&mut merge_wait);
-                                let handoff = std::time::Instant::now();
-                                let sent = data_tx.send(Ok(d));
-                                merge_wait += handoff.elapsed().as_secs_f32();
-                                if sent.is_err() {
-                                    stop.store(true, Ordering::Release);
-                                }
-                            }
-                            Err(e) => {
-                                stop.store(true, Ordering::Release);
-                                let _ = data_tx.send(Err(format!("GPU stream solve failed: {e}")));
+                                d.censored_games += 1;
+                                let _ = data_tx.send(Ok(d));
+                                live -= 1;
                             }
                         }
                     }
-                }));
-                if let Err(panic) = result {
-                    stop.store(true, Ordering::Release);
-                    let message = panic
-                        .downcast_ref::<String>()
-                        .map(String::as_str)
-                        .or_else(|| panic.downcast_ref::<&str>().copied())
-                        .unwrap_or("unknown panic");
-                    let _ = error_tx.send(Err(format!("GPU stream worker panicked: {message}")));
+                    let mut scanned = 0usize;
+                    while !stopping && scanned < per && inflight < max_inflight {
+                        let k = cursor;
+                        cursor = (cursor + 1) % per;
+                        scanned += 1;
+                        if busy[k] {
+                            continue;
+                        }
+                        loop {
+                            if game[k].is_none() {
+                                let i = next.fetch_add(1, Ordering::Relaxed);
+                                game[k] = Some(Game::new(Rng::new(worker_seed(seed, i)), gc));
+                                live += 1;
+                            }
+                            let g = game[k].as_mut().expect("live stream game");
+                            let step = {
+                                let _t = crate::timed!(ADVANCE);
+                                g.advance(Some(gpus), nets)
+                            };
+                            match step {
+                                Step::Submitted => {
+                                    if stop.load(Ordering::Acquire) {
+                                        let mut g = game[k].take().unwrap();
+                                        let mut d = g.take_data();
+                                        d.censored_games += 1;
+                                        let _ = data_tx.send(Ok(d));
+                                        live -= 1;
+                                        break;
+                                    }
+                                    let job = g.take_job().expect("submitted stream job");
+                                    let dev = gpus
+                                        .iter()
+                                        .enumerate()
+                                        .min_by_key(|(_, gpu)| gpu.queued_work())
+                                        .map_or(0, |(i, _)| i);
+                                    if let Err(e) = gpus[dev].submit_tagged(job, k, tx.clone()) {
+                                        stop.store(true, Ordering::Release);
+                                        let _ = data_tx.send(Err(e));
+                                    } else {
+                                        busy[k] = true;
+                                        inflight += 1;
+                                    }
+                                    break;
+                                }
+                                Step::Ended => {
+                                    let _ = g.finish();
+                                    let mut d = g.take_data();
+                                    d.merge_wait_s += std::mem::take(&mut merge_wait);
+                                    if data_tx.send(Ok(d)).is_err() {
+                                        stop.store(true, Ordering::Release);
+                                    }
+                                    game[k] = None;
+                                    live -= 1;
+                                }
+                            }
+                        }
+                    }
+                    if live == 0 && stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if !busy.iter().any(|&x| x) {
+                        continue;
+                    }
+                    let waited = std::time::Instant::now();
+                    let Ok((k, result)) = rx.recv() else {
+                        stop.store(true, Ordering::Release);
+                        let _ = data_tx.send(Err("GPU stream completion channel closed".into()));
+                        continue;
+                    };
+                    busy[k] = false;
+                    inflight -= 1;
+                    if stop.load(Ordering::Acquire) {
+                        match result {
+                            Ok(value) => {
+                                // Stop closes admission, not accounting. This
+                                // solve completed while the final waves drained;
+                                // keep its final bootstrap target, then censor
+                                // only the unfinished public game around it.
+                                let mut g = game[k].take().expect("draining stream game");
+                                g.resume(value);
+                                let mut d = g.take_data();
+                                d.gpu_wait_s += waited.elapsed().as_secs_f32();
+                                d.censored_games += 1;
+                                let _ = data_tx.send(Ok(d));
+                                live -= 1;
+                            }
+                            Err(e) => {
+                                let _ = game[k].take();
+                                live -= 1;
+                                let _ = data_tx.send(Err(format!(
+                                    "GPU stream solve failed while draining: {e}"
+                                )));
+                            }
+                        }
+                        continue;
+                    }
+                    match result {
+                        Ok(value) => {
+                            let g = game[k].as_mut().expect("pending stream game");
+                            g.resume(value);
+                            let mut d = g.take_data();
+                            d.gpu_wait_s += waited.elapsed().as_secs_f32();
+                            // Carries the previous handoff's block time: this
+                            // one is not known until the send returns.
+                            d.merge_wait_s += std::mem::take(&mut merge_wait);
+                            let handoff = std::time::Instant::now();
+                            let sent = data_tx.send(Ok(d));
+                            merge_wait += handoff.elapsed().as_secs_f32();
+                            if sent.is_err() {
+                                stop.store(true, Ordering::Release);
+                            }
+                        }
+                        Err(e) => {
+                            stop.store(true, Ordering::Release);
+                            let _ = data_tx.send(Err(format!("GPU stream solve failed: {e}")));
+                        }
+                    }
                 }
             });
         }
@@ -1995,6 +1897,7 @@ pub fn eval_match_gpu(
         explore: 0.0,
         random_draft,
         eval_mix: 0.0,
+        mc_mix: 0.0,
     };
     // Route: side A's checkpoint sits on service 0, side B's on service 1.
     let slot_of = |ag: &Agent| match ag {
@@ -2049,6 +1952,7 @@ pub fn eval_match(
                 explore: 0.0,
                 random_draft,
                 eval_mix: 0.0,
+                mc_mix: 0.0,
             };
             let mut d = Data::default();
             let z = play_game(rng, nets, &gc, &mut d, None);

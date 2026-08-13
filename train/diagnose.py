@@ -59,8 +59,7 @@ def main():
     d = Dump(args.dump)
     n = min(args.max_rows, len(d))
     print(f"[data] {len(d)} rows total ({len(d.cy)} configs), scanning the first {n}")
-    print(f"[data] PUBFEAT={d.pubfeat} "
-          f"CCOUNTS={d.ccounts} ROW_BYTES={d.row_bytes}")
+    print(f"[data] PUBFEAT={d.pubfeat} CCOUNTS={d.ccounts} ROW_BYTES={d.row_bytes}")
     print(f"[data] target spread over all configs: std {d.cy.std():.4f} "
           f"mean {d.cy.mean():+.4f}")
 

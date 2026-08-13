@@ -1,18 +1,24 @@
-"""Evaluate a sparse checkpoint graph and turn the results into Elo.
+"""Play one or more runs' snapshots against each other and turn the results into Elo.
 
-    python train/ladder.py runs/mine --games 300
-    python train/ladder.py runs/a runs/b --comparison-games 2000
+    python train/ladder.py runs/mine --games 60
+    python train/ladder.py runs/a runs/b --games 100 --iters 64
 
-Every saved checkpoint is included by default. Consecutive checkpoints within
-each run form its learning curve; the first and final checkpoints play Greedy;
-and each candidate final plays only its same-seed control final. Curve and
-anchor edges use a modest fixed budget, while those explicit arm comparisons
-use the larger budget. The graph is connected and has O(K) edges for K
-checkpoints.
+With several run directories the snapshots are entered as `run.label` so the
+runs' overlapping labels (`init`, `s1`, ...) do not collide, each run's
+checkpoints go into their own slots, and Random and Greedy appear once.
 
-Games use paired seats and paired drafts. Each edge has a deterministic seed,
-so rerunning the same graph reproduces the same evaluation schedule. Random
-drafts are the default; `--fixed-draft` is the explicit exception.
+A training run saves the network every few minutes and does not judge the
+snapshots while it is running. This plays a full round robin between them --
+plus Greedy (the handcrafted one-ply bot) and Random -- and fits one rating per
+player, so a run's output is a curve of strength against training time rather
+than a single number of unknown provenance.
+
+Why this replaces gating. A mid-run match against a moving champion has a
+standard error near +-0.05 at any affordable number of games, which is larger
+than the improvement between two snapshots twenty minutes apart; promoting on it
+is mostly promoting noise, and it spends training time to do so. Elo from a
+round robin uses every game against every opponent to place every player, needs
+no threshold, and is measured on the finished run where the games are cheap.
 
 Ratings come from the Bradley-Terry model, which is what Elo *is*: player `i`
 beats `j` with probability `1 / (1 + 10 ** ((e_j - e_i) / 400))`. Draws count
@@ -24,6 +30,7 @@ also carried Random.
 """
 
 import argparse
+import itertools
 import json
 import math
 import os
@@ -34,7 +41,6 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import truth
 import warchest
 from export_weights import load
 
@@ -45,14 +51,6 @@ from export_weights import load
 # this much", and a pairing with real losses in it is moved by well under 10
 # Elo.
 PRIOR = 1.0
-
-
-def write_json(path, value):
-    """Publish a complete result without exposing a partially written file."""
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(value, f, indent=1)
-    os.replace(tmp, path)
 
 
 def fit_elo(n, w):
@@ -95,97 +93,53 @@ def elo_stderr(n, elo):
     return out
 
 
-SEARCH = {"depth": 2, "iters": 64, "cfr": "linear", "warm": 0.0}
+def players_of(runs, refs=("greedy",), labels=None, pool=None):
+    """The ladder's entrants: optionally Random and Greedy, then each run's
+    snapshots, then the pool file's entries.
 
-
-def parse_search(spec):
-    """`"dcfr:64"` -> the SEARCH dict with that rule and iteration count."""
-    if not spec:
-        return None
-    cfr, _, iters = spec.partition(":")
-    return dict(SEARCH, cfr=cfr, iters=int(iters or SEARCH["iters"]))
-
-
-def players_of(runs, refs=("greedy",), labels=None, search=None):
-    """The ladder's entrants: the fixed bots, then every run's snapshots.
-
-    The first reference is pinned at 0, so which references a ladder carries
-    decides what its zero means. Greedy is the only reference worth playing.
-    Random is not in this list and should not be added back: a game against an
-    opponent 400 Elo away carries a tenth of the information of a game against
-    an equal, and every trained checkpoint beats Random ~30-0. Those games are
-    a foregone conclusion bought at full price. Keep the references fixed
-    forever -- they are pure functions of the
-    rules, which is what makes a rating from one ladder comparable to a rating
-    from another. A pool of rotating champions was tried and removed: when the
-    zero moves, old numbers stop meaning anything.
-
-    A snapshot plays with the search settings it was *trained* with, read from
-    the checkpoint. A net trained under one regret rule and rated under another
-    is not the player the run produced, and before the settings were stored
-    nothing downstream could tell.
+    Random first because it is the fixed zero of the scale; Greedy second
+    because it is the other fixed reference. Both are pure functions of the
+    rules, so a rating measured here is comparable to one measured in any other
+    run (`--no-refs` skips them). Every run's snapshots follow, named
+    `run.label` and loaded into their own slots, so a combined ladder over
+    several runs keeps each checkpoint's provenance. The pool file (see
+    `runs/pool.json`) lists the best snapshots we have so far by explicit
+    file, so a gate ladder is `ladder.py <newrun> --pool runs/pool.json`.
     """
-    ps = [{"name": r, "agent": r, "slot": 0, "t": None, "run": None,
-           "search": SEARCH, "endpoint": False, "final": False, "order": -1,
-           "experiment": None, "arm": None, "seed": None, "is_control": None}
-          for r in refs]
+    # Fixed bots, in the order given: the first is the rating's zero. Random is
+    # off by default -- it loses to everything, so every game against it is a
+    # foregone conclusion that buys almost no information about the players.
+    ps = [{"name": r, "agent": r, "slot": 0, "t": None, "run": None} for r in refs]
     for run in runs:
         tag = os.path.basename(run.rstrip("/"))
         with open(f"{run}/log.json") as f:
             log = json.load(f)
-        cfg = log.get("cfg", {})
-        selected = [s for s in log.get("snapshots", [])
-                    if labels is None or s["label"] in labels]
-        for order, s in enumerate(selected):
-            ck = torch.load(f"{run}/{s['file']}", map_location="cpu", weights_only=False)
-            # A checkpoint older than a knob does not carry it, so fall back to
-            # the run's config and then to the default.
-            own = {k: cfg.get(k, v) for k, v in SEARCH.items()}
-            own.update(ck.get("search") or {})
+        for s in log.get("snapshots", []):
+            if labels is not None and s["label"] not in labels:
+                continue
             ps.append({"name": f"{tag}.{s['label']}", "agent": "rebel",
                        "slot": len(ps), "t": s["t"], "file": s["file"],
-                       "run": run, "search": search or own, "order": order,
-                       "endpoint": order in (0, len(selected) - 1),
-                       "final": s["label"] == "final",
-                       "experiment": cfg.get("experiment"),
-                       "arm": cfg.get("arm"), "seed": cfg.get("seed"),
-                       "is_control": cfg.get("is_control")})
+                       "run": run})
+    for e in pool or []:
+        ps.append({"name": e["name"], "agent": "rebel", "slot": len(ps),
+                   "t": e.get("t"), "file": e["file"], "run": e["run"]})
     return ps
 
 
-
-def pairing_games(a, b, comparisons, curve_games, comparison_games):
-    """Budget for one edge in the fixed linear comparison graph."""
-    if a["run"] is None or b["run"] is None:
-        p = b if a["run"] is None else a
-        return curve_games if p["endpoint"] else 0
-    if a["run"] == b["run"]:
-        return curve_games if abs(a["order"] - b["order"]) == 1 else 0
-    runs = frozenset((a["run"], b["run"]))
-    return comparison_games if a["final"] and b["final"] and runs in comparisons else 0
-
-
-def run(runs, out=None, games=60, temp=2.0, random_draft=True, seed=7,
-        refs=("greedy",), labels=None, comparisons=(), comparison_games=0,
-        gpu=False, search=None):
-    """Evaluate the sparse comparison graph and fit Elo. Returns the ratings.
-
-    Consecutive checkpoints form each learning curve, its endpoints anchor to
-    Greedy, and explicit final-vs-control comparisons get the larger budget.
-    The graph is linear in the number of checkpoints and connected.
+def run(runs, out=None, games=60, depth=2, iters=64, temp=2.0,
+        random_draft=False, seed=7, refs=("greedy",), labels=None, pool=None,
+        depth_b=0, iters_b=0, gpu=False):
+    """Round robin, Elo fit, `ladder.json`, printed table. Returns the ratings.
 
     With `gpu=True` two solve services run (CUDA devices 0 and 1); each
     pairing loads side A's weights on device 0 and side B's on device 1, so
     both GPUs are busy while the ladder plays. All checkpoints must share
-    one network shape (the services are compiled for it).
+    one network shape (the services are compiled for it), and v1-era
+    checkpoints cannot play on the GPU.
     """
     if out is None:
         out = runs[0]
-    if games <= 0 or comparison_games < 0 or games % 2 or comparison_games % 2:
-        raise ValueError("game budgets must be positive paired (even) counts")
-    ps = players_of(runs, refs, labels, search)
-    comparison_games = comparison_games or games
-    comparisons = {frozenset(x) for x in comparisons}
+    ps = players_of(runs, refs, labels, pool)
     nets = [p for p in ps if p["agent"] == "rebel"]
     if not nets:
         raise SystemExit(f"{runs}: no snapshots in log.json")
@@ -198,6 +152,8 @@ def run(runs, out=None, games=60, temp=2.0, random_draft=True, seed=7,
         shapes = {tuple(n.dims) for n in by_slot.values()}
         if len(shapes) != 1:
             raise SystemExit(f"--gpu needs one shared network shape, got {shapes}")
+        if next(iter(shapes))[0] != 3:
+            raise SystemExit("--gpu cannot play v1-era checkpoints")
         first = next(iter(by_slot.values()))
         warchest.gpu_start(first.dims, *first.flat(), devices=[0, 1])
     # Always the real game: the horizon's marker payoff is a training aid, and
@@ -208,24 +164,15 @@ def run(runs, out=None, games=60, temp=2.0, random_draft=True, seed=7,
     n = np.zeros((k, k))
     sc = np.zeros((k, k))
     pairs = []
-    # Say what the fixed sparse graph will cost before spending it.
-    plan = {(i, j): pairing_games(ps[i], ps[j], comparisons, games, comparison_games)
-            for i in range(k) for j in range(i + 1, k)}
-    played = sum(1 for v in plan.values() if v)
-    total_games = sum(plan.values())
-    print(f"[ladder] {k} players, {played} of {len(plan)} pairings, "
-          f"{games} games per curve/anchor edge ({comparison_games} per comparison) "
-          f"-> {total_games:,} games, about {total_games / 3 / 60:.0f} min",
-          flush=True)
-    for (i, j), n_ij in plan.items():
+    print(f"[ladder] {k} players, {k * (k - 1) // 2} pairings, {games} paired games each "
+          f"(depth={depth} iters={iters})", flush=True)
+    for i, j in itertools.combinations(range(k), 2):
         # A seed per pairing rather than one shared across the tournament.
         # Within a pairing the two seatings are already paired on the same
         # stream, which is where the variance reduction is worth having; making
         # the pairings share a stream too would correlate their errors, and the
         # standard errors below assume they do not.
         a, b = ps[i], ps[j]
-        if n_ij == 0:
-            continue
         if gpu:
             if a["agent"] == "rebel":
                 na = by_slot[a["slot"]]
@@ -233,24 +180,16 @@ def run(runs, out=None, games=60, temp=2.0, random_draft=True, seed=7,
             if b["agent"] == "rebel":
                 nb = by_slot[b["slot"]]
                 warchest.gpu_set_weights(nb.dims, *nb.flat(), device=1)
-        sa, sb = a["search"], b["search"]
-        pair_seed = seed + 1000 * i + j
-        kind = ("anchor" if a["run"] is None or b["run"] is None else
-                "curve" if a["run"] == b["run"] else "comparison")
-        play = lambda n, s: warchest.eval_match(
-            n, s, a["agent"], b["agent"],
-            depth=sa["depth"], iters=sa["iters"], cfr=sa["cfr"], warm=sa["warm"],
-            temp=temp, slot_a=a["slot"], slot_b=b["slot"],
-            random_draft=random_draft,
-            depth_b=sb["depth"], iters_b=sb["iters"],
-            cfr_b=sb["cfr"], warm_b=sb["warm"], gpu=gpu)
-
-        w, l, d = play(n_ij, pair_seed)
+        w, l, d = warchest.eval_match(games, seed + 1000 * i + j, a["agent"], b["agent"],
+                                      depth=depth, iters=iters, temp=temp,
+                                      slot_a=a["slot"], slot_b=b["slot"],
+                                      random_draft=random_draft,
+                                      depth_b=depth_b if depth_b > 0 else None,
+                                      iters_b=iters_b if iters_b > 0 else None,
+                                      gpu=gpu)
         n[i][j] = n[j][i] = w + l + d
         sc[i][j], sc[j][i] = w + 0.5 * d, l + 0.5 * d
         pairs.append({"a": a["name"], "b": b["name"], "w": w, "l": l, "d": d,
-                      "n": w + l + d, "budget": n_ij, "seed": pair_seed,
-                      "kind": kind,
                       "score": round((w + 0.5 * d) / max(w + l + d, 1), 3)})
         print(f"  {a['name']:>28s} vs {b['name']:<28s} W{w:4d} L{l:4d} D{d:4d}  "
               f"score {pairs[-1]['score']:.3f}", flush=True)
@@ -259,75 +198,70 @@ def run(runs, out=None, games=60, temp=2.0, random_draft=True, seed=7,
     spr = sc + 0.5 * PRIOR * (1 - np.eye(k)) * (n > 0)
     elo = fit_elo(npr, spr)
     se = elo_stderr(n, elo)
-    # The noise-free half of the same question. Elo says who wins; this says how
-    # far the value head is from the fixed point of the solved operator, and the
-    # two disagreeing is itself a result.
-    terr = truth.errors([f"{p['run']}/{p['file']}" for p in nets])
-    res = {"runs": list(runs), "curve_games": games,
-           "comparison_games": comparison_games,
-           "schedule_seed": seed,
-           "draft_mode": "random" if random_draft else "fixed",
-           "comparisons": sorted(sorted(x) for x in comparisons),
-           "truth_set": truth.DEFAULT_SET if terr else None,
-           "players": [{"name": p["name"], "run": p["run"], "t": p["t"],
-                        "experiment": p["experiment"], "arm": p["arm"],
-                        "seed": p["seed"], "is_control": p["is_control"],
-                        "search": p["search"], "elo": round(float(e), 1),
+    res = {"runs": list(runs), "games_per_pair": games, "depth": depth,
+           "iters": iters, "depth_b": depth_b, "iters_b": iters_b,
+           "players": [{"name": p["name"], "t": p["t"], "elo": round(float(e), 1),
                         "se": round(float(s), 1),
-                        "truth": round(terr[f"{p['run']}/{p['file']}"][0], 6)
-                                 if p.get("file") and terr else None,
                         "score": round(float(sc[i].sum() / max(n[i].sum(), 1)), 3)}
                        for i, (p, e, s) in enumerate(zip(ps, elo, se))],
            "pairs": pairs}
-    write_json(f"{out}/ladder.json", res)
+    with open(f"{out}/ladder.json", "w") as f:
+        json.dump(res, f, indent=1)
 
     zero = ps[0]["name"] if ps else "?"
     print(f"\n=== Elo ({out}, {zero} = 0) ===", flush=True)
-    print(f"{'player':>28s} {'trained':>9s} {'elo':>7s} {'+-':>5s} {'score':>7s} "
-          f"{'truth':>8s}", flush=True)
+    print(f"{'player':>28s} {'trained':>9s} {'elo':>7s} {'+-':>5s} {'score':>7s}", flush=True)
     for p in sorted(res["players"], key=lambda p: -p["elo"]):
         tm = f"{p['t'] / 60:.1f}min" if p["t"] is not None else "-"
         print(f"{p['name']:>28s} {tm:>9s} {p['elo']:>7.0f} {p['se']:>5.0f} "
-              f"{p['score']:>7.3f} "
-              f"{('%.5f' % p['truth']) if p['truth'] is not None else '-':>8s}", flush=True)
+              f"{p['score']:>7.3f}", flush=True)
     return res
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("runs", nargs="+", help="one or more run directories")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("out", nargs="+", help="one or more run directories")
     ap.add_argument("--out", dest="dest", default=None,
                     help="where to write ladder.json (default: the first run directory)")
-    ap.add_argument("--games", type=int, default=100, help="games per curve/anchor edge")
-    ap.add_argument("--comparison-games", type=int, default=0,
-                    help="games for final-vs-control comparisons (default: --games)")
+    ap.add_argument("--games", type=int, default=60,
+                    help="paired games per pairing")
+    ap.add_argument("--depth", type=int, default=-1)
+    ap.add_argument("--iters", type=int, default=-1)
     ap.add_argument("--temp", type=float, default=2.0)
-    ap.add_argument("--fixed-draft", action="store_true",
-                    help="evaluate the starter matchup instead of random drafts")
+    ap.add_argument("--random-draft", action="store_true")
     ap.add_argument("--refs", default="greedy",
-                    help="comma list of fixed reference bots, or empty for none. "
-                         "The first is pinned at 0. Greedy is the only one worth "
-                         "playing: see players_of.")
+                    help="comma list of fixed bots (greedy, random), or empty for none. "
+                         "The first is pinned at 0.")
+    ap.add_argument("--no-refs", action="store_true",
+                    help="skip the Random and Greedy references")
     ap.add_argument("--labels", default=None,
                     help="only these snapshot labels, comma-separated (default: all)")
+    ap.add_argument("--pool", default=None,
+                    help="json file of fixed snapshot entries (the best so far)")
+    ap.add_argument("--depth-b", type=int, default=0,
+                    help="side B's search depth (default: same as side A)")
+    ap.add_argument("--iters-b", type=int, default=0,
+                    help="side B's CFR iterations (default: same as side A)")
     ap.add_argument("--seed", type=int, default=7)
-    # Every checkpoint plays at the settings it trained with, which compares
-    # whole systems. To compare the *networks*, give them all one search: an arm
-    # trained at T=16 is otherwise charged for playing at T=16 as well.
-    ap.add_argument("--eval-search", default="",
-                    help="force one search on every checkpoint, e.g. dcfr:64")
     ap.add_argument("--gpu", action="store_true",
                     help="two solve services (CUDA 0/1), one per pairing side")
     args = ap.parse_args()
-    comparisons = [(args.runs[0], r) for r in args.runs[1:]]
-    run(args.runs, out=args.dest, games=args.games,
-        comparisons=comparisons, comparison_games=args.comparison_games,
+    # Play at the runs' own search settings unless told otherwise: a checkpoint
+    # trained at one iteration count and rated at another is a different agent.
+    # With several runs the defaults are the strongest settings any of them
+    # used, so no run is rated below the search it trained with.
+    cfgs = [json.load(open(f"{d}/log.json")).get("cfg", {}) for d in args.out]
+    depth = args.depth if args.depth > 0 else max(c.get("depth", 2) for c in cfgs)
+    iters = args.iters if args.iters > 0 else max(c.get("iters", 64) for c in cfgs)
+    pool = json.load(open(args.pool)).get("entries", []) if args.pool else None
+    run(args.out, out=args.dest, games=args.games, depth=depth, iters=iters,
         temp=args.temp,
-        random_draft=not args.fixed_draft,
+        random_draft=args.random_draft or any(c.get("random_draft", False)
+                                              for c in cfgs),
         seed=args.seed,
-        refs=tuple(x for x in args.refs.split(",") if x),
+        refs=() if args.no_refs else tuple(x for x in args.refs.split(",") if x),
         labels=args.labels.split(",") if args.labels else None,
-        search=parse_search(args.eval_search), gpu=args.gpu)
+        pool=pool, depth_b=args.depth_b, iters_b=args.iters_b, gpu=args.gpu)
 
 
 if __name__ == "__main__":

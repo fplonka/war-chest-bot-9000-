@@ -17,13 +17,10 @@ engine/          Rust crate, lib name `warchest`
   src/bin/       bench.rs (applies/sec, playouts/sec)
 webui/           play.py + index.html: browser UI for playing a trained agent
 play.sh          one-liner: build the extension, serve the UI, open the browser
-train/           config.py   every knob of a run, one object; the experiments we run
-  exp.py         run an experiment end to end: arms x seeds -> ladder -> report
-  train.py       PyTorch training loop, snapshots on a timer, judges nothing
+train/           train.py    PyTorch training loop, snapshots on a timer
   value_net.py   the value network itself, shared by every tool that loads one
-  truth.py       a frozen set of solved positions, and any checkpoint's error on it
-  ladder.py      sparse checkpoint graph with Greedy anchors -> Elo
-  report.py      one self-contained HTML page per run or comparison
+  ladder.py      round robin over a run's snapshots, plus Greedy and Random -> Elo
+  plot.py        the four panels a run is read from
   offline.py     fit architectures to a frozen replay dump (noise-free A/B)
   diagnose.py    model-free check on how learnable a dump's targets are
   dump.py        reading a dumped replay buffer
@@ -43,27 +40,9 @@ is a commercial product, so it is not redistributed here.
 ```bash
 uv venv --python 3.12 .venv && VIRTUAL_ENV=.venv uv pip install torch numpy maturin
 cd engine && maturin develop --release && cd ..
-.venv/bin/python train/exp.py run dcfr --seeds 2     # arms, seeds, ladder, report
-.venv/bin/python train/exp.py ls                     # every run, newest first
+.venv/bin/python train/train.py --minutes 30 --out runs/mine
+.venv/bin/python train/plot.py runs/mine
 ```
-
-An experiment is declared in `train/config.py` as a list of arms, and an arm is
-only its *delta* from the baseline. `exp.py` runs each arm at each seed, rates
-every resulting checkpoint in one ladder, and writes a self-contained HTML page
-— no manual step anywhere in that chain. One arm at a time is
-`train/train.py --config <json>` or `--set knob=value`.
-
-Not everything needs a training run. `train/offline.py` compares architectures
-on a frozen replay dump, and `engine/examples/solvererr.rs` answers the
-regret-rule and iteration-count questions without training anything at all. Use
-those first; a ladder is the confirmation, not the search.
-
-`train/truth.py` scores a checkpoint against a frozen set of positions solved to
-convergence — one number, seconds, no variance — but read its module docstring
-before believing it. The targets are the fixed point of the *network that built
-the set*, and measurement shows the set ranks that network's neighbourhood above
-genuinely stronger ones. It tracks one run's progress; it does not compare arms.
-Only the ladder does that.
 
 ## Playing against a trained agent
 
@@ -97,25 +76,26 @@ that the human's belief update assumes a uniform behaviour model for the human
 — the agent has no model of how a person plays, and a model that assumed
 agent-like play could drop the true config from the belief support.
 
-A run saves the network every few minutes and judges nothing while it trains:
-it produces checkpoints and stops. `train/ladder.py` rates them afterwards, so
-a measurement can be rerun at any sample size without regenerating anything.
-What a run reports is strength against minutes trained, with Greedy at 0.
-
-Sample size is the thing to get right. A pairing of 100 games resolves nothing
-finer than about 70 Elo, 1,000 games about 22, and 5,000 about 10 — while a game
-costs on the order of a hundred solves against the million a training run
-generates. The sparse ladder spends a modest fixed budget on consecutive
-checkpoints and Greedy anchors, and a larger budget only on each candidate final
-against its same-seed control final.
+A run saves the network every few minutes and judges nothing while it trains.
+When it ends, `train/ladder.py` plays every snapshot against every other one,
+against the handcrafted Greedy bot and against Random, and fits an Elo to each —
+so what a run reports is strength against minutes trained, with Random at 0.
+`train.py` runs it automatically; `python train/ladder.py runs/mine --games 200`
+reruns it with more games.
 
 War Chest turns out to be an unusually good fit for ReBeL. A player's private
-state is `(hand, face-down discards, future forced-play coins)` — the bag is
+state is `(hand, face-down discards, pending forced-play coin)` — the bag is
 derived from a public reserve — and the reachable set has median 22 and p99 567
 members with the full draft pool, so CFR enumerates information states exactly
-instead of approximating them with particles. The value network is a function
-of that exact private state, not of a summary of it: `docs/REBEL.md` §4 explains
-why the alternative is not an approximation but a different game.
+instead of approximating them with particles. The value network is a function of that exact private state, not of a
+summary of it: `docs/REBEL.md` §4 explains why the alternative is not an
+approximation but a different game.
+
+Thirty minutes on an 8-core M1 takes the agent from 356 Elo to 852, against 174
+for the handcrafted Greedy reference and 0 for random play — and shows it
+gaining almost nothing after the first seventeen (`runs/elo01`). See
+`docs/PERF.md` for how the generation loop got fast enough for that to fit in
+half an hour.
 
 ## Design
 
@@ -136,7 +116,7 @@ that way has a scenario test — see `docs/ENGINE_FIXES.md`.
 
 ```bash
 cd engine
-cargo test
+cargo test                          # 55 tests (the solver oracle takes ~85s)
 cargo run --release --bin bench     # engine throughput, ~2.8M applies/sec/core
 cargo run --release --bin rebelbench -- weights.bin   # generation throughput
 maturin develop --release           # python module `warchest` (Game)

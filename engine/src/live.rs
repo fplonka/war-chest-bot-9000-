@@ -283,9 +283,7 @@ impl LiveGame {
                 if obs_key(&sv.nodes[nid].acts[a]) != obs {
                     continue;
                 }
-                if let Some(n) =
-                    advance_config(c, sv.nodes[nid].aslot[a], sv.nodes[nid].fdown[a])
-                {
+                if let Some(n) = advance_config(c, sv.nodes[nid].aslot[a], sv.nodes[nid].fdown[a]) {
                     pairs.push((n, bel[player as usize].p[ci] * probs[cell]));
                 }
             }

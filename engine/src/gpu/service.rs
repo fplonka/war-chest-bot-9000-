@@ -90,7 +90,7 @@ fn dispatcher(
     // lanes beside it an optimizer step costs about 240 ms against 72-101 ms
     // measured alone, and that contention comes straight back out of
     // generation. `WARCHEST_WAVE_LANES=12,6` gives the free card more lanes.
-    let lanes = env_list("WARCHEST_WAVE_LANES", device, 3).clamp(1, 12);
+    let lanes = env_list("WARCHEST_WAVE_LANES", device, 2).clamp(1, 12);
     let whale_lanes = env_usize("WARCHEST_WAVE_WHALE_LANES", 1).clamp(1, lanes);
     let route_profile = std::env::var_os("WARCHEST_ROUTE_PROFILE").is_some();
     let (lane_ready_tx, lane_ready_rx) = mpsc::channel();
@@ -563,13 +563,9 @@ fn run(
     queued_work: Arc<AtomicU64>,
     lane_work: Arc<AtomicU64>,
 ) {
-    // Defaults are the measured live-wave settings from docs/PERF.md, not
-    // conservative placeholders: every consumer of the solve service wants the
-    // same big waves, and only the trainer used to set them. A ladder ran with
-    // 4x smaller waves firing every 800us and left both cards near half idle.
-    let row_target = env_usize("WARCHEST_WAVE_ROWS", 192 * 1024).max(1);
-    let max_jobs = env_usize("WARCHEST_WAVE_JOBS", 256).clamp(1, 256);
-    let latency = Duration::from_micros(env_usize("WARCHEST_WAVE_US", 75_000) as u64);
+    let row_target = env_usize("WARCHEST_WAVE_ROWS", 48 * 1024).max(1);
+    let max_jobs = env_usize("WARCHEST_WAVE_JOBS", 64).clamp(1, 256);
+    let latency = Duration::from_micros(env_usize("WARCHEST_WAVE_US", 800) as u64);
     let profile = std::env::var_os("WARCHEST_GPU_PROFILE").is_some();
     let mut current_version = 0u64;
     let mut pending = VecDeque::new();

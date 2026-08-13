@@ -20,7 +20,7 @@ use cudarc::nvrtc;
 
 use crate::gpu::client::{CarryStore, SolveResult};
 use crate::net::V3Layout;
-use crate::rebel::{CCOUNTS, CFEAT, GPU_ROW_BYTES, NSLOT, NTYPE, PILE_COUNTS};
+use crate::rebel::{CFEAT, GPU_ROW_BYTES, NSLOT, NTYPE, PILE_COUNTS};
 use crate::units::CARD_FEATS;
 
 use super::wave::Wave;
@@ -540,7 +540,7 @@ impl Executor {
         // capture+instantiation is pure overhead. Keep a direct-stream A/B path
         // while tuning that crossover; it executes the identical kernels and
         // GEMMs in the identical order.
-        let direct = std::env::var("WARCHEST_DIRECT").map_or(true, |v| v != "0");
+        let direct = std::env::var_os("WARCHEST_DIRECT").is_some();
         if !direct {
             self.stream
                 .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
@@ -2366,13 +2366,13 @@ fn cuda_preamble(l: &V3Layout) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "#define WAVE_BLOCK {}\n\
+        "#define WAVE_BLOCK {}\n#define READOUT_LANE {}\n\
          #define DE {}\n#define DG {}\n#define RK {}\n#define HEADW {}\n\
          #define HEADOUT {}\n#define H_STRIDE {}\n#define XD {}\n#define HF {}\n\
          #define NCARD {}\n#define NPUB {}\n#define NHMLP {}\n#define NSLOTL {}\n#define NRES {}\n\
          {}{}{}{}\
          #define N_HEXES {}\n#define NSLOT {}\n#define NTYPE {}\n#define HEX_FACTS {}\n\
-         #define PILE_COUNTS {}\n#define CARD_FEATS {}\n#define CCOUNTS {}\n#define CFEAT {}\n\
+         #define PILE_COUNTS {}\n#define CARD_FEATS {}\n#define CFEAT {}\n\
          #define MAX_COINS {:.1}f\n#define MAX_PLIES {:.1}f\n#define LOOSE {}\n\
          #define GPU_ROW_BYTES {}\n#define GR_HEX_OWNER {}\n#define GR_HEX_SLOT {}\n\
          #define GR_HEX_HEIGHT {}\n#define GR_HEX_MARKER {}\n#define GR_PILES {}\n\
@@ -2380,11 +2380,12 @@ fn cuda_preamble(l: &V3Layout) -> String {
          #define GR_INITIATIVE {}\n#define GR_INIT_MOVED {}\n#define GR_TO_ACT {}\n#define GR_PLIES {}\n\
          static __device__ const unsigned char HEX_LOCATION[N_HEXES] = {{{locations}}};\n",
         BLOCK,
+        u8::from(std::env::var_os("WARCHEST_READOUT_WARP").is_none()),
         l.de, l.dg, l.rank, l.head_in, l.head_out, h_stride(l), l.xdim(), l.hfeat(),
         l.card.len(), l.pub_lin.len(), l.hmlp.len(), l.slot.len(), l.res.len(),
         arr("CARDW", &card), arr("PUBW", &pubw), arr("HMLPW", &hmlp), arr("SLOTW", &slot),
         crate::board::N_HEXES, NSLOT, NTYPE, crate::rebel::HEX_FACTS,
-        PILE_COUNTS, CARD_FEATS, CCOUNTS, CFEAT, crate::rebel::MAX_COINS,
+        PILE_COUNTS, CARD_FEATS, CFEAT, crate::rebel::MAX_COINS,
         crate::state::MAX_MAIN_PLAYS as f32, crate::rebel::LOOSE,
         GPU_ROW_BYTES, crate::rebel::GPU_ROW_HEX_OWNER, crate::rebel::GPU_ROW_HEX_SLOT,
         crate::rebel::GPU_ROW_HEX_HEIGHT, crate::rebel::GPU_ROW_HEX_MARKER,

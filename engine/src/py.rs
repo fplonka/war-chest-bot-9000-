@@ -495,12 +495,12 @@ use std::sync::{OnceLock, RwLock};
 /// Independent weight slots, so a match can pit one checkpoint against another.
 /// Slot 0 is the live network the trainer generates with; the rest hold
 /// whatever checkpoints a caller wants to play off against each other, and the
-/// pool grows to fit. The Elo ladder loads one snapshot per slot for its sparse
-/// checkpoint graph, which is the only reason more than one slot exists.
+/// pool grows to fit. The Elo ladder loads one snapshot per slot and plays a
+/// round robin, which is the only reason more than one slot exists.
 /// The in-process GPU solve service (work package B). `gpu_start` spawns
-/// it; `gpu_stream_start` runs generation through it; `gpu_set_weights`
-/// forwards the trainer's publications to it. Without the `gpu` feature every
-/// call fails loudly — a misconfigured box must not silently run on the CPU.
+/// it; `gpu_gen_data` runs generation through it; `gpu_set_weights` forwards
+/// the trainer's publications to it. Without the `gpu` feature every call
+/// fails loudly — a misconfigured box must not silently run on the CPU.
 #[cfg(feature = "gpu")]
 static GPU_CLIENTS: OnceLock<std::sync::Mutex<Vec<crate::gpu::GpuClient>>> = OnceLock::new();
 
@@ -547,14 +547,7 @@ impl GpuGenerator {
                 }
                 Err(pyo3::exceptions::PyStopIteration::new_err(()))
             }
-            Ok(Err(e)) => {
-                self.done.store(true, std::sync::atomic::Ordering::Release);
-                self.stop.store(true, std::sync::atomic::Ordering::Release);
-                if let Some(thread) = self.thread.lock().unwrap().take() {
-                    let _ = thread.join();
-                }
-                Err(pyo3::exceptions::PyRuntimeError::new_err(e))
-            }
+            Ok(Err(e)) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
         }
     }
@@ -614,6 +607,7 @@ fn gpu_stream_start(
         explore,
         random_draft,
         eval_mix,
+        mc_mix: 0.0,
     };
     let nets = nets().read().unwrap().clone();
     let clients = gpu_clients().lock().unwrap().clone();
@@ -718,6 +712,85 @@ fn gpu_stop(_py: Python<'_>) -> PyResult<()> {
     Ok(())
 }
 
+/// The GPU generation call: like `gen_data` but the Rebel solves run on the
+/// GPU service. Panics at startup (here: returns an error) if the service is
+/// missing, so a misconfigured box fails loudly instead of running slow.
+#[cfg(feature = "gpu")]
+#[pyfunction]
+#[pyo3(signature = (games, seed, mode, depth, iters, explore, temp, random_draft, eval_mix, mc_mix, cfr, warm, max_seconds=0.0))]
+fn gpu_gen_data(
+    py: Python<'_>,
+    games: usize,
+    seed: u64,
+    mode: &str,
+    depth: usize,
+    iters: usize,
+    explore: f32,
+    temp: f32,
+    random_draft: bool,
+    eval_mix: f32,
+    mc_mix: f32,
+    cfr: &str,
+    warm: f32,
+    max_seconds: f64,
+) -> PyResult<PyObject> {
+    let cfg = Cfg {
+        depth,
+        iters,
+        snapshots: true,
+        cfr: cfr_of(cfr)?,
+        warm,
+        node_cap: 200_000,
+        ..Default::default()
+    };
+    let (agent, collect) = match mode {
+        "greedy" => (Agent::Greedy { temp }, Collect::Mc),
+        "rebel" => (Agent::Rebel { cfg, slot: 0 }, Collect::Rebel),
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown mode '{}'",
+                other
+            )))
+        }
+    };
+    let gc = GameCfg {
+        agents: [agent, agent],
+        collect,
+        explore,
+        random_draft,
+        eval_mix,
+        mc_mix,
+    };
+    let d = py.allow_threads(|| {
+        // A shard owns a small immutable CPU-side shape/oracle snapshot. Do
+        // not hold the global read lock for the whole game batch: the trainer
+        // must be able to publish the next version while shards are live.
+        let n = nets().read().unwrap().clone();
+        let clients = gpu_clients().lock().unwrap().clone();
+        if clients.is_empty() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "gpu service not started (gpu_start was not called)",
+            ));
+        }
+        // Each solve is the same checkpoint, but not the same amount of work.
+        // Route against the queued cost after the tree has been built so a
+        // broad-belief tail does not strand one card while the other drains.
+        let route = |_| {
+            clients
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, gpu)| gpu.queued_work())
+                .map_or(0, |(i, _)| i)
+        };
+        let deadline = (max_seconds > 0.0)
+            .then(|| std::time::Instant::now() + std::time::Duration::from_secs_f64(max_seconds));
+        Ok::<_, pyo3::PyErr>(crate::selfplay::run_games_gpu_until(
+            games, seed, &n, &gc, &clients, &route, deadline,
+        ))
+    })?;
+    data_to_dict(py, d)
+}
+
 pub(crate) fn nets() -> &'static RwLock<Vec<Nets>> {
     static NETS: OnceLock<RwLock<Vec<Nets>>> = OnceLock::new();
     NETS.get_or_init(|| RwLock::new(vec![Nets::default()]))
@@ -794,40 +867,19 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     out.set_item("cap_hits", d.cap_hits)?;
     out.set_item("horizon_hits", d.cap_hits)?;
     out.set_item("node_caps", d.node_caps)?;
-    out.set_item("unsearched", d.unsearched)?;
     out.set_item("oversize_routes", d.oversize_routes)?;
     out.set_item("card_exclusive_routes", d.card_exclusive_routes)?;
+    out.set_item("exact_fallbacks", d.exact_fallbacks)?;
     out.set_item("censored_games", d.censored_games)?;
     out.set_item("dropped", d.dropped)?;
     out.set_item("configs", d.configs)?;
     out.set_item("gpu_wait_s", d.gpu_wait_s)?;
     out.set_item("merge_wait_s", d.merge_wait_s)?;
-    out.set_item(
-        "zero_sum_mean_abs",
-        d.zero_sum_abs / d.zero_sum_n.max(1) as f64,
-    )?;
-    out.set_item("zero_sum_max", d.zero_sum_max)?;
-    assert_eq!(d.zero_sum_n, d.nv, "missing zero-sum target checks");
     assert_eq!(
         d.coff.len(),
         if d.nv == 0 { 0 } else { 2 * d.nv + 1 },
         "config offsets do not match the row count"
     );
-    assert_eq!(
-        d.paoff.len(),
-        d.prow.len() + usize::from(!d.prow.is_empty())
-    );
-    assert_eq!(
-        d.ppoff.len(),
-        d.prow.len() + usize::from(!d.prow.is_empty())
-    );
-    if let Some(&end) = d.ppoff.last() {
-        assert_eq!(
-            end as usize,
-            d.pp.len(),
-            "policy offsets do not cover targets"
-        );
-    }
     // Internal `soff` holds one start per solve; the exposed array appends
     // the total row count as the trailing entry, so `len - 1` is the number
     // of solves.
@@ -848,7 +900,6 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     out.set_item("pa", d.pa.into_pyarray_bound(py))?;
     out.set_item("paoff", d.paoff.into_pyarray_bound(py))?;
     out.set_item("pp", d.pp.into_pyarray_bound(py))?;
-    out.set_item("ppoff", d.ppoff.into_pyarray_bound(py))?;
     out.set_item("cc", d.cc.into_pyarray_bound(py))?;
     out.set_item("cw", d.cw.into_pyarray_bound(py))?;
     out.set_item("cy", d.cy.into_pyarray_bound(py))?;
@@ -861,7 +912,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
 /// Run `games` self-play games across all cores and return the training data.
 /// `mode` is "greedy" (Monte-Carlo warm start) or "rebel".
 #[pyfunction]
-#[pyo3(signature = (games, seed, mode, depth=1, iters=16, explore=0.25, temp=2.0, random_draft=false, eval_mix=0.5, cfr="linear", warm=0.0))]
+#[pyo3(signature = (games, seed, mode, depth=1, iters=16, explore=0.25, temp=2.0, random_draft=false, eval_mix=0.5, mc_mix=0.0, cfr="linear", warm=0.0))]
 #[allow(clippy::too_many_arguments)]
 fn gen_data(
     py: Python<'_>,
@@ -874,6 +925,7 @@ fn gen_data(
     temp: f32,
     random_draft: bool,
     eval_mix: f32,
+    mc_mix: f32,
     cfr: &str,
     warm: f32,
 ) -> PyResult<PyObject> {
@@ -905,6 +957,7 @@ fn gen_data(
         explore,
         random_draft,
         eval_mix,
+        mc_mix,
     };
     let d = py.allow_threads(|| {
         let n = nets().read().unwrap();
@@ -914,12 +967,11 @@ fn gen_data(
 }
 
 /// Head-to-head evaluation with alternating colours and paired drafts.
-/// `depth_b`/`iters_b`/`cfr_b`/`warm_b` override side B's search settings, so
-/// each side plays with the settings its own checkpoint was trained with, and
-/// so one net can be pitted against itself at different depths, iteration
-/// counts or regret rules. They default to side A's.
+/// `depth_b`/`iters_b` override side B's search settings, so one net can be
+/// pitted against itself at different depths or iteration counts (the depth
+/// probe); they default to side A's.
 #[pyfunction]
-#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=false, depth_b=None, iters_b=None, cfr="linear", warm=0.0, cfr_b=None, warm_b=None, gpu=false))]
+#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=false, depth_b=None, iters_b=None, cfr="linear", warm=0.0, gpu=false))]
 #[allow(clippy::too_many_arguments)]
 fn eval_match(
     py: Python<'_>,
@@ -937,8 +989,6 @@ fn eval_match(
     iters_b: Option<usize>,
     cfr: &str,
     warm: f32,
-    cfr_b: Option<&str>,
-    warm_b: Option<f32>,
     gpu: bool,
 ) -> PyResult<(usize, usize, usize)> {
     let cfg = Cfg {
@@ -953,11 +1003,6 @@ fn eval_match(
     let cfg_b = Cfg {
         iters: iters_b.unwrap_or(iters),
         depth: depth_b.unwrap_or(depth),
-        cfr: match cfr_b {
-            Some(name) => cfr_of(name)?,
-            None => cfg.cfr,
-        },
-        warm: warm_b.unwrap_or(warm),
         ..cfg
     };
     let (aa, bb) = (
@@ -980,6 +1025,59 @@ fn eval_match(
     }))
 }
 
+/// Play `games` random-draft games and write up to `cap` subgame roots
+/// (public state + both beliefs, one per solve site) to `path` — the GPU
+/// tree-sizing sample of plan section 6. Uses the pushed nets, like
+/// `gen_data`.
+#[pyfunction]
+#[pyo3(signature = (games, seed, path, cap=1000, random_draft=true))]
+fn save_roots(
+    py: Python<'_>,
+    games: usize,
+    seed: u64,
+    path: &str,
+    cap: usize,
+    random_draft: bool,
+) -> PyResult<usize> {
+    let gc = GameCfg {
+        agents: [
+            Agent::Rebel {
+                cfg: Cfg {
+                    depth: 2,
+                    iters: 64,
+                    snapshots: false,
+                    ..Default::default()
+                },
+                slot: 0,
+            },
+            Agent::Rebel {
+                cfg: Cfg {
+                    depth: 2,
+                    iters: 64,
+                    snapshots: false,
+                    ..Default::default()
+                },
+                slot: 0,
+            },
+        ],
+        collect: Collect::None,
+        explore: 0.25,
+        random_draft,
+        eval_mix: 0.0,
+        mc_mix: 0.0,
+    };
+    let roots = py.allow_threads(|| {
+        let n = nets().read().unwrap();
+        crate::selfplay::collect_roots(games, seed, &n, &gc, cap)
+    });
+    let f = std::fs::File::create(path)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+    let mut w = std::io::BufWriter::new(f);
+    crate::roots::write_roots(&mut w, &roots)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+    Ok(roots.len())
+}
+
 /// Print the generation loop's phase timers. Empty unless the extension was
 /// built with the `prof` feature; the host side of a GPU run is otherwise
 /// invisible, and it is the part that has to fit in the CPU budget.
@@ -1000,12 +1098,15 @@ fn set_cap_value(v: f32) {
     crate::state::set_cap_marker_value(v);
 }
 
-/// Unprojected Rust value scores for the Torch/Rust parity diagnostic.
-/// Production search projects both players' belief-weighted means together;
-/// one isolated config cannot perform that operation.
+/// Run the Rust value network forward: `xpub` is `rows * PUBFEAT`, `xbel` is
+/// `rows * 2*dg` and `phi` is `rows * CFEAT` — one config scored per row.
+/// Returns `rows` values. Exists so the Python side can assert that the
+/// inference path used to generate targets is numerically the same network that
+/// PyTorch trains -- a silent divergence there would corrupt every target while
+/// every other test kept passing.
 #[pyfunction]
 #[pyo3(signature = (xpub, xbel, phi, unit_ids, rows, slot=0))]
-fn infer_raw(
+fn infer(
     xpub: PyReadonlyArray1<f32>,
     xbel: PyReadonlyArray1<f32>,
     phi: PyReadonlyArray1<f32>,
@@ -1016,7 +1117,7 @@ fn infer_raw(
     check_slot(slot)?;
     let guard = nets().read().unwrap();
     let mlp = &guard[slot].value;
-    Ok(mlp.raw_scores(
+    Ok(mlp.forward(
         xpub.as_slice()?,
         xbel.as_slice()?,
         phi.as_slice()?,
@@ -1132,57 +1233,18 @@ fn hex_neighborhood() -> Vec<u32> {
 /// augmentation: every position can be presented a second way, for free.
 #[pyfunction]
 fn hex_mirror() -> Vec<u32> {
-    board().mirror.iter().map(|&h| h as u32).collect()
-}
-
-/// Real packed states and private configs, plus the same values produced after
-/// `State::mirror`. Python's augmentation is checked against this independent
-/// game-level oracle rather than another restatement of encoder indices.
-#[pyfunction]
-fn mirror_rows_oracle(n: usize, seed: u64) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
-    use crate::rebel::{config_counts, pack_row, reserve, true_config, Ctx, CCOUNTS, ROW_BYTES};
-    use crate::rng::Rng;
-    use crate::selfplay::make_game;
-    let mut rng = Rng::new(seed);
-    let mut state = make_game(&mut rng, true);
-    let mut original = Vec::with_capacity(n * ROW_BYTES);
-    let mut mirrored = Vec::with_capacity(n * ROW_BYTES);
-    let mut private = Vec::with_capacity(n * 2 * CCOUNTS);
-    let mut mirrored_private = Vec::with_capacity(n * 2 * CCOUNTS);
-    while original.len() < n * ROW_BYTES {
-        if state.is_terminal() {
-            state = make_game(&mut rng, true);
-            continue;
-        }
-        if matches!(state.pending(), crate::state::Cont::MainPlay) {
-            let sample = state;
-            let ctx = Ctx::new(&sample);
-            let mut row = [0u8; ROW_BYTES];
-            pack_row(&sample, &ctx, &mut row);
-            original.extend_from_slice(&row);
-            let ms = sample.mirror();
-            let mctx = Ctx::new(&ms);
-            pack_row(&ms, &mctx, &mut row);
-            mirrored.extend_from_slice(&row);
-            for p in 0..2u8 {
-                let mut c = [0; CCOUNTS];
-                config_counts(
-                    &true_config(&sample, p, &ctx),
-                    &reserve(&sample, p, &ctx),
-                    &mut c,
-                );
-                private.extend_from_slice(&c);
-            }
-            for p in 0..2u8 {
-                let mut c = [0; CCOUNTS];
-                config_counts(&true_config(&ms, p, &mctx), &reserve(&ms, p, &mctx), &mut c);
-                mirrored_private.extend_from_slice(&c);
-            }
-        }
-        let actions = state.legal_actions();
-        state = state.apply(actions[rng.below(actions.len())]);
-    }
-    (original, mirrored, private, mirrored_private)
+    let bd = crate::board::board();
+    let n = crate::board::N_HEXES;
+    (0..n)
+        .map(|h| {
+            let (x, y) = bd.coord[h];
+            let t = (6 - x, 6 - y);
+            let m = (0..n)
+                .find(|&k| bd.coord[k] == t)
+                .expect("rotation stays on the board");
+            m as u32
+        })
+        .collect()
 }
 
 /// Expand packed replay rows into the public encoding, in one batch.
@@ -1246,7 +1308,6 @@ fn expand_rows(
 #[pymodule]
 fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hex_mirror, m)?)?;
-    m.add_function(wrap_pyfunction!(mirror_rows_oracle, m)?)?;
     m.add_function(wrap_pyfunction!(hex_coords, m)?)?;
     m.add_function(wrap_pyfunction!(units_info, m)?)?;
     m.add_function(wrap_pyfunction!(card_features_table, m)?)?;
@@ -1254,11 +1315,11 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Game>()?;
     m.add_class::<crate::live::LiveGame>()?;
     m.add("MAX_MAIN_PLAYS", crate::state::MAX_MAIN_PLAYS)?;
-    m.add("ENCODING_VERSION", crate::rebel::ENCODING_VERSION)?;
     m.add("PUBFEAT", crate::rebel::PUBFEAT)?;
     m.add("CFEAT", crate::rebel::CFEAT)?;
     m.add("AFEAT", crate::rebel::AFEAT)?;
     m.add("CCOUNTS", crate::rebel::CCOUNTS)?;
+    m.add("PUBFEAT_V1", crate::v1::PUBFEAT_V1)?;
     m.add("AUX", crate::selfplay::AUX)?;
     m.add("CNORM", crate::rebel::CNORM)?;
     m.add("N_HEXES", crate::board::N_HEXES)?;
@@ -1275,6 +1336,8 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("PILE_COUNTS", crate::rebel::PILE_COUNTS)?;
     m.add("PLAYER_SCALARS", crate::rebel::PLAYER_SCALARS)?;
     m.add("GLOBAL_SCALARS", crate::rebel::GLOBAL_SCALARS)?;
+    m.add("PEND_KINDS", crate::rebel::PEND_KINDS)?;
+    m.add("PEND_SLOT", crate::rebel::PEND_SLOT)?;
     m.add("LOOSE", crate::rebel::LOOSE)?;
     m.add("OFF_PILES", crate::rebel::OFF_PILES)?;
     m.add("OFF_CARDS", crate::rebel::OFF_CARDS)?;
@@ -1297,11 +1360,15 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ROW_AUX", crate::rebel::ROW_AUX)?;
     m.add("ROW_FORMAT_VERSION", crate::rebel::ROW_FORMAT_VERSION)?;
     m.add_function(wrap_pyfunction!(rules_table_hash, m)?)?;
+    m.add("CCOUNTS", crate::rebel::CCOUNTS)?;
+    m.add("PUBFEAT_V1", crate::v1::PUBFEAT_V1)?;
+    m.add("AUX", crate::selfplay::AUX)?;
     m.add_function(wrap_pyfunction!(infer_policy, m)?)?;
     m.add_function(wrap_pyfunction!(hex_neighborhood, m)?)?;
     m.add_function(wrap_pyfunction!(set_weights, m)?)?;
     m.add_function(wrap_pyfunction!(set_cap_value, m)?)?;
     m.add_function(wrap_pyfunction!(prof_dump, m)?)?;
+    m.add_function(wrap_pyfunction!(save_roots, m)?)?;
     m.add_function(wrap_pyfunction!(gen_data, m)?)?;
     #[cfg(feature = "gpu")]
     {
@@ -1309,9 +1376,10 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(gpu_start, m)?)?;
         m.add_function(wrap_pyfunction!(gpu_set_weights, m)?)?;
         m.add_function(wrap_pyfunction!(gpu_stop, m)?)?;
+        m.add_function(wrap_pyfunction!(gpu_gen_data, m)?)?;
         m.add_function(wrap_pyfunction!(gpu_stream_start, m)?)?;
     }
     m.add_function(wrap_pyfunction!(eval_match, m)?)?;
-    m.add_function(wrap_pyfunction!(infer_raw, m)?)?;
+    m.add_function(wrap_pyfunction!(infer, m)?)?;
     Ok(())
 }

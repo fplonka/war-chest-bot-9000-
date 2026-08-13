@@ -75,13 +75,6 @@ pub struct Cfg {
     /// neither allocated nor initialised — the device builds its own from
     /// the job, so doing it here too was pure allocation traffic.
     pub gpu_build: bool,
-    /// Keep each node's `State` in `Solver::states`, for tests that assert on
-    /// the tree's shape (every leaf terminal, this node is a Warrior Priest
-    /// draw, that leaf's hand has the right size). The tree itself dropped the
-    /// field because it was 688 of a node's 1,136 bytes across 2,039 nodes for
-    /// four read sites, none of them in a hot loop — so this is off in every
-    /// production path and the vector stays empty there.
-    pub keep_states: bool,
 }
 
 impl Default for Cfg {
@@ -94,7 +87,6 @@ impl Default for Cfg {
             warm: 0.0,
             node_cap: 0,
             gpu_build: false,
-            keep_states: false,
         }
     }
 }
@@ -208,8 +200,15 @@ pub struct Conv {
     /// given iteration count, because unlike a distance to some other solve it
     /// is absolute.
     pub nash: f32,
-    /// `v_0 + v_1` at the root. The final value layer makes the depth-limited
-    /// game zero-sum, so this is a numerical correctness diagnostic.
+    /// `v_0 + v_1` at the root. **This is not zero**, and that is not a bug in
+    /// the solver. The subgame's leaves are network values, and nothing makes
+    /// the network's value for player 0 at a leaf the negative of its value for
+    /// player 1 there. So the depth-limited game the solver is handed is only
+    /// *approximately* zero-sum, by however far the value network is from
+    /// antisymmetric — which is what this measures, and it is a property of the
+    /// network rather than of the solve. It vanishes when every leaf is
+    /// terminal, which is the case `tests/rebel_solver.rs` pins against an
+    /// independent solver.
     pub zero_sum: f32,
 }
 
@@ -296,40 +295,18 @@ pub fn node_actions(
     // invariant, so one probe can be reconfigured for every slot instead of
     // cloning a 688-byte State per slot.
     let mut probe = *s;
-    let forced = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
-    if forced || matches!(s.pending(), Cont::MainPlay) {
-        // Both are coin plays; they differ only in which private zone pays.
-        // Probe one state per payable slot, so `legal_actions` lists exactly
-        // the plays that slot affords, and keep the union.
+    if matches!(s.pending(), Cont::MainPlay) {
         let res = reserve(s, player, ctx);
-        let holds = |c: &Config, k: usize| {
-            if forced {
-                c.inflight == Some(k as u8)
-            } else {
-                c.hand[k] > 0
-            }
-        };
         for k in 0..NSLOT {
-            let Some(one) = cfgs.iter().find(|c| holds(c, k)).copied().or_else(|| {
-                if cfgs.is_empty() && res[k] > 0 {
-                    // No support to read: synthesise a config holding slot `k`,
-                    // starting from the world's own private state so the probe
-                    // stays consistent with the public node.
-                    let mut c = true_config(s, player, ctx);
-                    if forced {
-                        c.inflight = Some(k as u8);
-                    } else {
-                        c.hand = [0; NSLOT];
-                        c.hand[k] = 1;
-                    }
-                    Some(c)
-                } else {
-                    None
-                }
-            }) else {
+            if res[k] == 0 {
                 continue;
-            };
+            }
+            let mut one = Config::default();
+            one.hand[k] = 1;
             set_config(&mut probe, player, ctx, &one);
+            if !cfgs.is_empty() && !cfgs.iter().any(|c| c.hand[k] > 0) {
+                continue;
+            }
             for a in probe.legal_actions() {
                 let key = a.encode();
                 if seen.contains(&key) {
@@ -342,9 +319,44 @@ pub fn node_actions(
                 } else {
                     ctx.slot_of[player as usize][coin as usize]
                 };
-                if slot >= 0 && !cfgs.is_empty() && !cfgs.iter().any(|c| holds(c, slot as usize)) {
+                if slot >= 0 && !cfgs.is_empty() && !cfgs.iter().any(|c| c.hand[slot as usize] > 0)
+                {
                     continue;
                 }
+                aslot.push(slot);
+                fdown.push(is_facedown_play(&a));
+                acts.push(a);
+            }
+        }
+    } else if matches!(s.pending(), Cont::WarriorPriestPlay { .. }) {
+        // A forced play is config-dependent the same way a main play is: the
+        // legal set is a function of the config's pending coin. Probe one
+        // state per pending slot present in the support; the probe's pending
+        // node names the drawn unit so `legal_actions` lists exactly the plays
+        // of that coin.
+        for k in 0..NSLOT {
+            if !cfgs.is_empty() && !cfgs.iter().any(|c| c.pending_coin == Some(k as u8)) {
+                continue;
+            }
+            let mut one = Config::default();
+            one.hand[k] = 1;
+            set_config(&mut probe, player, ctx, &one);
+            probe.pending = Cont::WarriorPriestPlay {
+                player,
+                coin: ctx.slots[player as usize][k],
+            };
+            for a in probe.legal_actions() {
+                let key = a.encode();
+                if seen.contains(&key) {
+                    continue;
+                }
+                seen.push(key);
+                let coin = action_coin(&a, &probe);
+                let slot = if coin == NONE {
+                    -1
+                } else {
+                    ctx.slot_of[player as usize][coin as usize]
+                };
                 aslot.push(slot);
                 fdown.push(is_facedown_play(&a));
                 acts.push(a);
@@ -534,8 +546,8 @@ fn give_nodes(mut v: Vec<TNode>) {
 /// The config-interning map is looked up once per leaf, per player, per config
 /// in support -- about thirty thousand times per mature solve -- and it is only
 /// ever `get` and `insert`, never iterated, so the hash is free to change. The
-/// standard hasher is SipHash, which is overkill for the compact packed private
-/// key and was most of the compact-leaf-row phase's cost. One multiply and a
+/// standard hasher is SipHash, which is overkill for a 39-bit packed count
+/// vector and was most of the compact-leaf-row phase's cost. One multiply and a
 /// shift is enough to spread a key that is already dense.
 #[derive(Default, Clone, Copy)]
 pub(crate) struct KeyHash;
@@ -591,8 +603,6 @@ pub struct Solver<'a> {
     nets: &'a Nets,
     pub(crate) cfg: Cfg,
     pub nodes: Vec<TNode>,
-    /// Node states, parallel to `nodes`. Empty unless `Cfg::keep_states`.
-    pub states: Vec<State>,
     pub(crate) root_belief: [Belief; 2],
     /// Regrets and the current regret-matching iterate, flat by node over legal
     /// cells. Node `i` occupies `soff[i] .. soff[i + 1]`; within that range its
@@ -684,7 +694,9 @@ pub struct Solver<'a> {
     vt: Vec<f32>,
     /// `rows * hidden`: the public half of the hidden layer.
     pub h0: Vec<f32>,
-    /// Width of one public row.
+    /// Width of one public row: the *net's*, not the current encoding's. A
+    /// pre-describer checkpoint reads a 972-wide row written by `v1`'s frozen
+    /// encoder, so that a gate can play the new architecture against the pool.
     pub(crate) pubfeat: usize,
     /// `rows * pubfeat`: the public encoding, filled during the build.
     pub(crate) xpub: Vec<f32>,
@@ -757,7 +769,6 @@ impl<'a> Solver<'a> {
             nets,
             cfg,
             nodes: take_nodes(),
-            states: Vec::new(),
             root_belief: belief,
             regret: Vec::new(),
             cur: Vec::new(),
@@ -789,7 +800,11 @@ impl<'a> Solver<'a> {
             ids,
             inner_rows: Vec::new(),
             vt: Vec::new(),
-            pubfeat: PUBFEAT,
+            pubfeat: if nets.value.is_empty() {
+                PUBFEAT
+            } else {
+                nets.value.pub_dim()
+            },
             h0: take_buf(R_H0),
             xpub: take_buf(R_XPUB),
             gpu_rows: Vec::new(),
@@ -981,9 +996,6 @@ impl<'a> Solver<'a> {
             leaf = mainplay;
         }
         let id = self.nodes.len();
-        if self.cfg.keep_states {
-            self.states.push(s.clone());
-        }
         let _tp = timed!(BPUSH);
         self.nodes.push(TNode {
             util: if leaf && s.is_terminal() {
@@ -1026,7 +1038,10 @@ impl<'a> Solver<'a> {
         }
 
         if draw_pass {
-            // Coin identity is private. The drawing player's configs
+            // The draw's outcome is private, so the public tree does not
+            // branch: there is exactly one child, the state after the draw.
+            // Which coin is drawn changes nothing public, so any legal
+            // DrawCoin produces the same child. The drawing player's configs
             // are convolved through the draw distribution — the chance
             // factor stays separate from both players' strategies: it enters
             // the drawing player's reach as a transition, and the idle
@@ -1041,13 +1056,15 @@ impl<'a> Solver<'a> {
             // for, which is what the self-play walk counts off.
             let td = timed!(BDRAW);
             let me = player as usize;
-            let mut cs = s.clone();
+            let mut cs = s;
+            let mut support: Vec<Config> = Vec::new();
+            let mut draw = DrawMap::default();
             // The reserve and the face-up pile are what the draws read, and a
             // draw changes neither (a refill does, and `run` accounts for it
             // internally), so both come from the state at the head of the run.
             let res = reserve(&cs, player, &self.ctx);
             let fu = faceup_counts(&cs, player, &self.ctx);
-            // A Warrior Priest draw's children hold the coin in flight.
+            // A Warrior Priest draw's children carry the forced-play coin.
             let wp = matches!(s.pending(), Cont::WarriorPriestDraw { .. });
             let mut steps = 0u8;
             loop {
@@ -1061,8 +1078,6 @@ impl<'a> Solver<'a> {
                     break;
                 }
             }
-            let mut support = Vec::new();
-            let mut draw = DrawMap::default();
             if wp {
                 debug_assert_eq!(steps, 1, "a WP draw is a single forced draw");
                 self.draw_scratch
@@ -1097,14 +1112,9 @@ impl<'a> Solver<'a> {
         let na = acts.len();
         debug_assert!(na > 0, "a decision node must offer a reachable action");
 
-        // At a forced play every config in the acting support must hold the
-        // drawn coin: that is what makes its actions legal at all.
-        assert!(
-            !matches!(s.pending(), Cont::WarriorPriestPlay { .. })
-                || mine.iter().all(|c| c.inflight.is_some()),
-            "acting support has no coin in flight at a forced play: pending={:?} support={mine:?}",
-            s.pending(),
-        );
+        // A Warrior Priest forced play may only spend the pending coin, so the
+        // per-config mask is the pending match rather than the hand check.
+        let wp_play = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
         let tcells = timed!(BCELLS);
         let mut legal_off = Vec::with_capacity(nc + 1);
         let mut legal_action = Vec::new();
@@ -1114,7 +1124,11 @@ impl<'a> Solver<'a> {
         legal_off.push(0);
         for (ci, c) in mine.iter().enumerate() {
             for a in 0..na {
-                let legal = action_legal(c, aslot[a]);
+                let legal = if wp_play {
+                    c.pending_coin == Some(aslot[a] as u8)
+                } else {
+                    action_legal(c, aslot[a])
+                };
                 if legal {
                     legal_action.push(a as u32);
                     legal_child.push(0);
@@ -1322,6 +1336,11 @@ impl<'a> Solver<'a> {
             let (pop, nop) = blk(self.nc[i], op);
             let base = self.roff[i] as usize;
             if n.chance {
+                // Draw: one public child. The idle player's reach passes
+                // through unchanged; the drawing player's configs transition
+                // through the chance matrix, so the chance factor lives in
+                // the drawing player's reach and is discarded with it when
+                // the leaf values take the counterfactual convention.
                 let c = n.child[0];
                 debug_assert!(c > i);
                 let cbase = self.roff[c] as usize;
@@ -1381,10 +1400,15 @@ impl<'a> Solver<'a> {
         &self.reach[at..at + self.nc[i][p] as usize]
     }
 
-    /// One public row.
+    /// One public row, in whichever encoding this solve's network was trained
+    /// with.
     fn encode(&mut self, s: &State, at: usize) {
         let pf = self.pubfeat;
-        write_public_features(s, &self.ctx, &mut self.xpub[at..at + pf]);
+        if self.nets.value.v1() {
+            crate::v1::write_public_features_v1(s, &self.ctx, &mut self.xpub[at..at + pf]);
+        } else {
+            write_public_features(s, &self.ctx, &mut self.xpub[at..at + pf]);
+        }
     }
 
     /// Record a leaf in the network batch. Called from `build`, while the
@@ -1447,19 +1471,19 @@ impl<'a> Solver<'a> {
 
     /// Index of one config's feature vector in `cphi`, adding it if new.
     ///
-    /// The key is the raw private vector plus the seat, so two configs share a
-    /// row exactly when their feature vectors are identical. Keying on the
-    /// `Config` alone would be wrong: the bag depends on the node's reserve,
-    /// which changes as coins leave it.
+    /// The key is the raw counts the vector is built from — hand, face-down and
+    /// bag, four bits each, plus the seat — so two configs share a row exactly
+    /// when their feature vectors are identical. Keying on the `Config` alone
+    /// would be wrong: the bag depends on the node's reserve, which changes as
+    /// coins leave it.
     fn intern_config(&mut self, c: &Config, res: &[u8; NSLOT], p: usize) -> u32 {
-        let mut private = [0u8; CCOUNTS];
-        config_counts(c, res, &mut private);
+        let mut cnt = [0u8; CCOUNTS];
+        config_counts(c, res, &mut cnt);
         let mut key = p as u64;
-        for &x in &private[..CCOUNTS] {
-            debug_assert!(x < 8, "count over the key width");
-            key = (key << 3) | x as u64;
+        for x in cnt.iter() {
+            debug_assert!(*x < 16, "count over the key width");
+            key = (key << 4) | *x as u64;
         }
-        key = (key << 3) | c.inflight.map_or(0, |k| k as u64 + 1);
         if let Some(&i) = self.cmap.get(&key) {
             return i;
         }
@@ -1470,10 +1494,7 @@ impl<'a> Solver<'a> {
             self.cphi.resize(at + 64 * CFEAT, 0.0);
         }
         for k in 0..CCOUNTS {
-            self.cphi[at + k] = private[k] as f32 / CNORM;
-        }
-        for k in CCOUNTS..CCOUNTS {
-            self.cphi[at + k] = private[k] as f32;
+            self.cphi[at + k] = cnt[k] as f32 / CNORM;
         }
         self.cphi[at + CCOUNTS] = p as f32;
         self.cmap.insert(key, i);
@@ -1516,6 +1537,7 @@ impl<'a> Solver<'a> {
             self.leaf_rows.len() + self.inner_rows.len(),
         );
         let net = &self.nets.value;
+        debug_assert_eq!(net.pub_dim(), self.pubfeat);
         debug_assert_eq!(net.cfeat(), CFEAT);
         if self.xb.len() < leaves * net.belief_dim() {
             self.xb.resize(leaves * net.belief_dim(), 0.0);
@@ -1734,23 +1756,9 @@ impl<'a> Solver<'a> {
             // belief embedding, which is what keeps the query leak-free.
             let cs = coff[2 * r + p] as usize;
             let row = &vt[r * ncfg..(r + 1) * ncfg];
-            let mut mean_sum = 0.0f32;
-            for side in 0..2 {
-                let rn = ncs[i][side] as usize;
-                let rat = roff[i] as usize + if side == 1 { ncs[i][0] as usize } else { 0 };
-                let mass: f32 = reach[rat..rat + rn].iter().sum();
-                let cat = coff[2 * r + side] as usize;
-                if mass > 0.0 {
-                    for (&w, &c) in reach[rat..rat + rn].iter().zip(&cidx[cat..cat + rn]) {
-                        let ci = c as usize;
-                        mean_sum += w / mass * (row[ci] + cg[ci * (rk + 1) + rk]);
-                    }
-                }
-            }
-            let centre = 0.5 * mean_sum;
             for (v, &c) in vals[vo..vo + n].iter_mut().zip(&cidx[cs..cs + n]) {
                 // The trailing column of `g` is the per-config bias term.
-                *v = (row[c as usize] + cg[c as usize * (rk + 1) + rk] - centre) * opp_reach;
+                *v = (row[c as usize] + cg[c as usize * (rk + 1) + rk]) * opp_reach;
             }
         }
     }

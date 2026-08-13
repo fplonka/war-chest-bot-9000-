@@ -177,7 +177,6 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
             depth: 8,
             iters: 500,
             snapshots: true,
-            keep_states: true,
             ..Default::default()
         };
         {
@@ -185,10 +184,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
             // If any leaf were non-terminal the (empty) network would silently
             // return zero and the comparison would be meaningless.
             assert!(
-                sv.nodes
-                    .iter()
-                    .zip(&sv.states)
-                    .all(|(n, s)| !n.leaf || s.is_terminal()),
+                sv.nodes.iter().all(|n| !n.leaf || n.s.is_terminal()),
                 "the whole remaining game must fit inside the subgame"
             );
             if sv.nodes.len() > 8_000 {
@@ -198,9 +194,8 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
             let mut outcomes: Vec<i32> = sv
                 .nodes
                 .iter()
-                .zip(&sv.states)
-                .filter(|(n, s)| n.leaf && s.is_terminal())
-                .map(|(_, s)| (s.utility(0) * 1000.0) as i32)
+                .filter(|n| n.leaf && n.s.is_terminal())
+                .map(|n| (n.s.utility(0) * 1000.0) as i32)
                 .collect();
             outcomes.sort_unstable();
             outcomes.dedup();
@@ -216,9 +211,6 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
         let exact = oracle_value(&s, &ctx, &bel, 100);
         for (name, rule) in Cfr::NAMED {
             let mut sv = Solver::new(&s, ctx, &nets, Cfg { cfr: rule, ..cfg }, bel.clone());
-            // Without `keep_states` the assertions below zip against an empty
-            // vector and pass vacuously, which is how a dark test looks alive.
-            assert_eq!(sv.states.len(), sv.nodes.len(), "keep_states must be on");
             // Exploitability early, before the solve has gone anywhere. Read
             // mid-flight on purpose: a fixed-policy pass must leave the solve
             // able to continue.
@@ -316,26 +308,18 @@ fn cfr_iteration_count_bias() {
                 depth: 8,
                 iters: 1,
                 snapshots: true,
-                keep_states: true,
                 ..Default::default()
             },
             bel.clone(),
         );
-        if !probe
-            .nodes
-            .iter()
-            .zip(&probe.states)
-            .all(|(n, s)| !n.leaf || s.is_terminal())
-            || probe.nodes.len() > 8_000
-        {
+        if !probe.nodes.iter().all(|n| !n.leaf || n.s.is_terminal()) || probe.nodes.len() > 8_000 {
             continue;
         }
         let mut o: Vec<i32> = probe
             .nodes
             .iter()
-            .zip(&probe.states)
-            .filter(|(n, s)| n.leaf && s.is_terminal())
-            .map(|(_, s)| (s.utility(0) * 1000.0) as i32)
+            .filter(|n| n.leaf && n.s.is_terminal())
+            .map(|n| (n.s.utility(0) * 1000.0) as i32)
             .collect();
         o.sort_unstable();
         o.dedup();
@@ -353,7 +337,6 @@ fn cfr_iteration_count_bias() {
                     depth: 8,
                     iters: t,
                     snapshots: true,
-                    keep_states: true,
                     ..Default::default()
                 },
                 bel.clone(),
@@ -419,6 +402,7 @@ fn draw_position(seed: u64, warmup: usize, plies: u16) -> Option<State> {
             s.zones[p as usize][Z_BAG][u] += c;
             s.zones[p as usize][Z_FACEDOWN][u] = 0;
         }
+        let mut cfg = Config::default();
         // A unit whose coins are all deployed (or eliminated) has no reserve
         // left; the forced one-coin hand must fit the reserve, so use the
         // first slot that still has coins in the bag.
@@ -428,16 +412,15 @@ fn draw_position(seed: u64, warmup: usize, plies: u16) -> Option<State> {
         if hand_slot == NSLOT {
             return None;
         }
-        let unit = ctx.slots[p as usize][hand_slot] as usize;
-        s.zones[p as usize][Z_BAG][unit] -= 1;
-        s.zones[p as usize][Z_HAND][unit] = 1;
+        cfg.hand[hand_slot] = 1;
+        set_config(&mut s, p, &ctx, &cfg);
     }
     s.main_plays = MAX_MAIN_PLAYS - plies;
     Some(s)
 }
 
-/// The draw pass-through, checked structurally on real positions: a round-draw
-/// node has one public child, whose config support must be
+/// The draw pass-through, checked structurally on real positions: a chance
+/// node must have exactly one public child, the child's config support must be
 /// exactly `belief_after_draw`'s support (same list, same order — the
 /// invariant the self-play walk asserts at runtime), the idle player's support
 /// must pass through untouched, the chance-matrix rows must be proper
@@ -475,7 +458,6 @@ fn draw_pass_through_consistency() {
                 depth: 5,
                 iters: 80,
                 snapshots: true,
-                keep_states: true,
                 ..Default::default()
             },
             bel.clone(),
@@ -510,7 +492,7 @@ fn draw_pass_through_consistency() {
             // oracle applies `belief_after_draw` once per step, walking the
             // state alongside it.
             assert!(n.draw_steps >= 1, "a draw node covers at least one draw");
-            let mut ws = sv.states[i].clone();
+            let mut ws = n.s.clone();
             let mut b = Belief {
                 cfg: n.cfgs[me].to_vec(),
                 p: vec![1.0; n.cfgs[me].len()],
@@ -518,8 +500,7 @@ fn draw_pass_through_consistency() {
             for _ in 0..n.draw_steps {
                 let res = reserve(&ws, n.player, &ctx);
                 let fu = faceup_counts(&ws, n.player, &ctx);
-                let warrior_priest = matches!(ws.pending(), Cont::WarriorPriestDraw { .. });
-                b = belief_after_draw(&b, &res, &fu, warrior_priest);
+                b = belief_after_draw(&b, &res, &fu, false);
                 let acts = ws.legal_actions();
                 ws.apply_inplace(acts[0]);
             }
@@ -533,8 +514,8 @@ fn draw_pass_through_consistency() {
                 assert!((sum - 1.0).abs() < 1e-5, "draw row {} sums to {}", ci, sum);
             }
             assert_eq!(
-                sv.states[ch].hand_size(n.player),
-                sv.states[i].hand_size(n.player) + n.draw_steps,
+                sv.nodes[ch].s.hand_size(n.player),
+                n.s.hand_size(n.player) + n.draw_steps,
                 "each covered draw adds exactly one coin to the hand"
             );
         }
@@ -613,13 +594,14 @@ fn warrior_priest_draw_walks_through_the_tree() {
     use warchest::state::Z_BAG;
     let nets = Nets::default();
     // White: WP at W1, enemy at E1. Hand holds one WP coin (the trigger);
-    // the bag holds the rest of the draft, so a draw can leave multiple
-    // pending forced-play coins.
+    // the bag holds a WP coin and a Swordsman coin, so a draw can leave
+    // either of two pendings. The root belief carries two configs so the
+    // draw's children span both pendings.
     let mut s = State::blank(warchest::state::WHITE);
     s.set_unit(17, warchest::state::WHITE, WARRIOR_PRIEST, 1); // (2,3)
     s.set_unit(19, warchest::state::BLACK, FOOTMAN, 3); // (4,3)
-
-    // Full five-type reserve per player, as `Ctx::new` requires.
+                                                        // Full 5-type reserve per player, as `Ctx::new` requires. Only the WP and
+                                                        // Swordsman coins are actually reachable.
     for u in [WARRIOR_PRIEST, SWORDSMAN, PIKEMAN, CROSSBOWMAN, ROYAL_COIN] {
         s.add_zone(warchest::state::WHITE, Z_BAG, u, 1);
     }
@@ -629,12 +611,17 @@ fn warrior_priest_draw_walks_through_the_tree() {
     s.add_zone(warchest::state::WHITE, Z_HAND, WARRIOR_PRIEST, 1);
     let ctx = Ctx::new(&s);
     let wp = ctx.slot_of[0][WARRIOR_PRIEST as usize] as u8;
+    let sw = ctx.slot_of[0][SWORDSMAN as usize] as u8;
+    assert_ne!(wp, sw);
     let mut c1 = Config::default();
     c1.hand[wp as usize] = 1;
+    let mut c2 = Config::default();
+    c2.hand[wp as usize] = 1;
+    c2.hand[sw as usize] = 1;
     let bel = [
         Belief {
-            cfg: vec![c1],
-            p: vec![1.0],
+            cfg: vec![c1, c2],
+            p: vec![0.5, 0.5],
         },
         Belief::point(Config::default()),
     ];
@@ -646,7 +633,6 @@ fn warrior_priest_draw_walks_through_the_tree() {
             depth: 2,
             iters: 8,
             snapshots: true,
-            keep_states: true,
             ..Default::default()
         },
         bel.clone(),
@@ -655,7 +641,7 @@ fn warrior_priest_draw_walks_through_the_tree() {
     // Find the WP draw node: a chance node whose state is a WarriorPriestDraw.
     let draws: Vec<usize> = (0..sv.nodes.len())
         .filter(|&i| {
-            sv.nodes[i].chance && matches!(sv.states[i].pending(), Cont::WarriorPriestDraw { .. })
+            sv.nodes[i].chance && matches!(sv.nodes[i].s.pending(), Cont::WarriorPriestDraw { .. })
         })
         .collect();
     assert_eq!(draws.len(), 1, "exactly one WP draw in the tree");
@@ -665,8 +651,8 @@ fn warrior_priest_draw_walks_through_the_tree() {
     assert_eq!(n.draw_steps, 1, "a WP draw is a single draw");
     // The child support must be exactly `belief_after_draw(set_pending=true)`,
     // in order — the invariant the self-play walk asserts at runtime.
-    let res = reserve(&sv.states[d], n.player, &ctx);
-    let fu = faceup_counts(&sv.states[d], n.player, &ctx);
+    let res = reserve(&n.s, n.player, &ctx);
+    let fu = faceup_counts(&n.s, n.player, &ctx);
     let oracle = belief_after_draw(
         &Belief {
             cfg: n.cfgs[n.player as usize].to_vec(),
@@ -682,10 +668,13 @@ fn warrior_priest_draw_walks_through_the_tree() {
         oracle.cfg,
         "post-draw support must equal belief_after_draw's, in order"
     );
-    // Every child carries its drawn coin in flight (no fizzle here: the bag is
-    // not empty), and every draw row is a proper distribution.
+    // Every child carries a pending coin (no fizzle here: the bag is not
+    // empty), and every draw row is a proper distribution.
     for c in sv.nodes[ch].cfgs[n.player as usize].iter() {
-        assert!(c.inflight.is_some(), "a WP draw child carries its coin");
+        assert!(
+            c.pending_coin.is_some(),
+            "a WP draw child carries its pending coin"
+        );
     }
     for ci in 0..n.draw.rows() {
         let sum: f32 = n.draw.row(ci).1.iter().sum();
@@ -693,17 +682,14 @@ fn warrior_priest_draw_walks_through_the_tree() {
     }
 
     // The child is a WarriorPriestPlay decision node. Its actions come from
-    // both in-flight coins and its per-config legality is that coin.
+    // both pendings and its per-config legality is the pending match.
     let wpn = &sv.nodes[ch];
-    assert!(matches!(
-        sv.states[ch].pending(),
-        Cont::WarriorPriestPlay { .. }
-    ));
+    assert!(matches!(wpn.s.pending(), Cont::WarriorPriestPlay { .. }));
     assert!(!wpn.leaf && !wpn.chance);
     assert!(wpn.na() > 0);
     let me = wpn.player as usize;
     for (ci, c) in wpn.cfgs[me].iter().enumerate() {
-        let pend = c.inflight.expect("in flight");
+        let pend = c.pending_coin.expect("pending");
         for a in 0..wpn.na() {
             let legal = wpn
                 .legal_row(ci)
@@ -711,32 +697,39 @@ fn warrior_priest_draw_walks_through_the_tree() {
             assert_eq!(
                 legal,
                 wpn.aslot[a] == pend as i8,
-                "WP play legality must be the in-flight coin"
+                "WP play legality must be the pending match"
             );
         }
     }
-    // At least two distinct drawn coins are represented.
-    let mut drawn: Vec<u8> = wpn.cfgs[me].iter().map(|c| c.inflight.unwrap()).collect();
-    drawn.sort_unstable();
-    drawn.dedup();
+    // At least two distinct pendings are represented.
+    let mut pendings: Vec<u8> = wpn.cfgs[me]
+        .iter()
+        .map(|c| c.pending_coin.unwrap())
+        .collect();
+    pendings.sort_unstable();
+    pendings.dedup();
     assert!(
-        drawn.len() >= 2,
-        "expected both drawn coins in the support, got {:?}",
-        drawn
+        pendings.len() >= 2,
+        "expected both pendings in the support, got {:?}",
+        pendings
     );
 
-    // The forced play's children hold nothing in flight: the coin is spent.
+    // The forced play's children have no pending coin: it is cleared when the
+    // drawn coin is spent.
     for &c in wpn.child.iter() {
         for cc in sv.nodes[c].cfgs[me].iter() {
-            assert!(cc.inflight.is_none(), "the forced play spends the coin");
+            assert!(
+                cc.pending_coin.is_none(),
+                "the forced play clears the pending coin"
+            );
         }
     }
 
     // Every non-terminal leaf is a MainPlay state.
     for i in 0..sv.nodes.len() {
-        if sv.nodes[i].leaf && !sv.states[i].is_terminal() {
+        if sv.nodes[i].leaf && !sv.nodes[i].s.is_terminal() {
             assert!(
-                matches!(sv.states[i].pending(), Cont::MainPlay),
+                matches!(sv.nodes[i].s.pending(), Cont::MainPlay),
                 "non-terminal leaf {} is not a MainPlay state",
                 i
             );
@@ -797,7 +790,6 @@ fn depth_is_spent_on_coin_plays_not_micro_choices() {
                         depth: 1,
                         iters: 4,
                         snapshots: false,
-                        keep_states: true,
                         ..Default::default()
                     },
                     bel,
@@ -817,7 +809,6 @@ fn depth_is_spent_on_coin_plays_not_micro_choices() {
                         depth: 2,
                         iters: 4,
                         snapshots: false,
-                        keep_states: true,
                         ..Default::default()
                     },
                     [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)],

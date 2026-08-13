@@ -4,7 +4,7 @@
 //! iterations of a solved subgame, plus the beliefs its Phase 2 must value.
 //! The byte format is the WCJ6 TREE.md contract (`docs/TREE.md`) and
 //! the same bytes serve three consumers: the GPU service (uploaded to the
-//! device), the GPU-versus-CPU oracles in `src/gpu/tests.rs` (the executable
+//! device), the torch CFR specification (`train/cfr_spec.py`, the executable
 //! oracle for the kernels), and the oracle tests (CPU -> bytes -> CPU).
 //!
 //! The solver's arenas (`regret`, `inst`, `cur`, `sum_strat`, `avg`, the
@@ -29,7 +29,7 @@ use std::rc::Rc;
 /// The byte format this module writes. Bump when an array changes shape or
 /// meaning (docs/TREE.md "the version bumps when any of them changes shape or
 /// meaning").
-pub const JOB_VERSION: u32 = 7;
+pub const JOB_VERSION: u32 = 6;
 const MAGIC: u32 = 0x5743_4A36; // "WCJ6"
 
 /// Runtime metadata that travels with a job (not part of the frozen tree
@@ -1146,7 +1146,7 @@ impl PackedJob {
             return Err("job: bad magic".into());
         }
         if r.u32("version")? != JOB_VERSION {
-            return Err("job: unsupported version".to_string());
+            return Err(format!("job: unsupported version"));
         }
         let meta = PackedMeta {
             depth: r.u32("depth")? as usize,
@@ -1454,6 +1454,7 @@ mod gather_tests {
             explore: 0.3,
             random_draft: true,
             eval_mix: 0.0,
+            mc_mix: 0.0,
         };
         let mut checked = 0;
         for (s, bel) in collect_roots(10, 0x9E17, &nets, &gc, 6) {

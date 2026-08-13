@@ -18,18 +18,15 @@ pulls tensors back once per epoch.
 
 Two things are hidden in War Chest:
 
-- the **hand** — which coins were drawn this round;
-- the **identities of face-down discards** — the coin spent on Pass, Claim
-Initiative or a Recruit payment is never revealed;
-- the **coin in flight** — the Warrior Priest's drawn coin, between the draw
-and the forced play that must spend it.
+* the **hand** — which coins were drawn this round;
+* the **identities of face-down discards** — the coin spent on Pass, Claim
+  Initiative or a Recruit payment is never revealed.
 
 Everything else is public, including every *count*. So a player's private state
-is exactly the triple `(hand, facedown, inflight)` — a `Config` — and the bag is
-derived:
+is exactly the pair `(hand, facedown)` — a `Config` — and the bag is derived:
 
 ```
-bag = reserve - hand - facedown - inflight            (reserve is public)
+bag = reserve - hand - facedown        reserve = bag + hand + facedown  (public)
 ```
 
 The reserve is public because every action either moves a coin *within* it (a
@@ -38,7 +35,9 @@ tree carry every config, and `features_do_not_leak_private_information` checks
 it.
 
 A draft fixes 4 unit types plus the Royal Coin, so at most `NSLOT = 5` coin types
-per player, and a hand holds at most 3. Over 120k positions of random play with the full draft pool the
+per player; a hand holds at most 3, even across a Warrior Priest draw — the
+trigger is always preceded, in the same play chain, by the coin play that
+fired it. Over 120k positions of random play with the full draft pool the
 reachable config set has median 22, mean 57, p99 567. CFR enumerates information
 states exactly — no particle approximation.
 
@@ -53,19 +52,19 @@ public child. The belief update is
 many-to-one map, `play_game` does the sum. A Recruit reveals which unit was taken
 and hides which coin paid.
 
-**Chance.** Round-start and Warrior Priest draws are private, so they do not
-branch the public tree: the PBS transition is a deterministic convolution of
-the belief with each config's draw distribution (`belief_after_draw`). When a
-bag empties the discard pile is shuffled in, which erases the face-down
-component; bag emptiness is public, so every config reshuffles together.
+**Chance.** Round-start draws are the only chance nodes. Their outcome is
+private, so they do not branch the public tree: the PBS transition is a
+deterministic convolution of the belief with each config's draw distribution
+(`belief_after_draw`). When a bag empties the discard pile is shuffled in, which
+erases the face-down component; bag emptiness is public, so every config
+reshuffles at the same moment.
 
 **The Warrior Priest pair (units 18 and 54) is in the draft pool.** Its
-attribute triggers a private mid-round draw whose coin must be played at once.
-The coin waits in `Z_INFLIGHT`, a one-coin private zone, and that is the whole
-of the rule: the forced play pays from that zone instead of the hand, and the
-public continuation says only *that* a forced play is owed, never which coin
-spends it. Nothing is in flight at a normal coin play, so the network — which
-is queried only there — never sees the zone.
+attribute triggers a private mid-round draw, so the private state is the
+triple `(hand, facedown, pending_coin)` — which coin the forced play must use.
+The pending coin is transient: it is set by the draw, cleared when the forced
+play resolves, and is always absent at a network-query boundary, so it never
+enters a replay row or the encoding.
 
 ## 2. Horizon
 
@@ -91,18 +90,15 @@ completed coin plays, so the micro-decisions inside one tactic ride free. A
 round-start draw is walked through rather than branched. Leaf values come from
 the value network.
 
-
-|                             |                                                                                          |
-| --------------------------- | ---------------------------------------------------------------------------------------- |
-| solver                      | alternating-traverser CFR; the regret rule is a setting (below)                          |
-| leaf value                  | `v_net(PBS)[c] × (opponent's unnormalised reach)` — counterfactual                       |
-| network query               | public features + both **normalised** reach vectors                                      |
-| initial strategy            | uniform; strategy sums seeded reach-weighted                                             |
-| acting / belief propagation | the **reference strategy** — the CFR average at the end of the solve                     |
-| trajectory sampling         | stop at a uniformly random iterate, act, then finish the solve before reading the target |
-| exploration                 | `random_action_prob` for one explorer, drawn once per sampled subgame walk               |
-| exploratory branch          | belief propagates under the reference strategy; the true private world is never re-drawn |
-
+| | |
+|---|---|
+| solver | alternating-traverser CFR; the regret rule is a setting (below) |
+| leaf value | `v_net(PBS)[c] × (opponent's unnormalised reach)` — counterfactual |
+| network query | public features + both **normalised** reach vectors |
+| initial strategy | uniform; strategy sums seeded reach-weighted |
+| acting / belief propagation | the **reference strategy** — the CFR average at the end of the solve |
+| trajectory sampling | stop at a uniformly random iterate, act, then finish the solve before reading the target |
+| exploration | `random_action_prob` for a uniformly sampled player, redrawn each decision |
 
 Three things differ from poker: action sets depend on the config; an action moves
 the information state (`trans` carries `(config, action) → config'`); actions are
@@ -122,15 +118,13 @@ implementations: accumulated *positive* regrets are multiplied by
 runs on `R + predict · r`, the regret just observed standing in for the one about
 to be seen.
 
-
-| name               | alpha | beta | gamma | predict |
-| ------------------ | ----- | ---- | ----- | ------- |
-| `linear`           | 1     | 1    | 1     | 0       |
-| `plus` (CFR+)      | inf   | -inf | 2     | 0       |
-| `dcfr`             | 1.5   | 0    | 2     | 0       |
-| `pcfr` (PCFR+)     | inf   | -inf | 2     | 1       |
-| `sapcfr` (SAPCFR+) | inf   | -inf | 2     | 1/3     |
-
+| name | alpha | beta | gamma | predict |
+|---|---|---|---|---|
+| `linear` | 1 | 1 | 1 | 0 |
+| `plus` (CFR+) | inf | -inf | 2 | 0 |
+| `dcfr` | 1.5 | 0 | 2 | 0 |
+| `pcfr` (PCFR+) | inf | -inf | 2 | 1 |
+| `sapcfr` (SAPCFR+) | inf | -inf | 2 | 1/3 |
 
 `beta = -inf` zeroes negative accumulated regret, which is regret matching+;
 `alpha = inf` leaves positive regret undiscounted. The default is `linear`.
@@ -144,12 +138,13 @@ drop configs and fail that assert.
 
 `Solver::nash_conv` returns two numbers.
 
-- `nash` — `Σ_p (BR_p − v_p)`, what a best response to the reference strategy
-would gain. Zero exactly when the strategy is an equilibrium of the subgame it
-induces. Absolute, so it compares regret rules against each other.
-- `zero_sum` — `v_0 + v_1` at the root. The network's final value layer removes
-half the sum of the two belief-weighted means from both players, so this must
-be zero up to floating-point error. A larger residual is a correctness failure.
+* `nash` — `Σ_p (BR_p − v_p)`, what a best response to the reference strategy
+  would gain. Zero exactly when the strategy is an equilibrium of the subgame it
+  induces. Absolute, so it compares regret rules against each other.
+* `zero_sum` — `v_0 + v_1` at the root, which is **not** zero: the leaves are
+  network values, and nothing makes the network's value for player 0 at a leaf
+  the negative of its value for player 1. The subgame is only as zero-sum as the
+  network is antisymmetric. It vanishes when every leaf is terminal.
 
 Both freeze the leaf values at the ones the reference strategy induces, so this
 is exploitability of the depth-limited game the reference defines, not of War
@@ -161,11 +156,11 @@ TurboReBeL's single-sample multi-iteration generation. One solve yields a
 training row per kept iterate instead of one row, all valued under the same
 reference strategy, so raising the iteration count stops costing data rate.
 
-- **Phase 1** runs the full solve.
-- **Phase 2** (`Solver::value_under`) computes the root value per config under
-the reference strategy, once per carried belief.
-- `Solver::carried_beliefs` returns the belief at the walk's exit leaf under each
-kept iterate; those become the next solve's roots.
+* **Phase 1** runs the full solve.
+* **Phase 2** (`Solver::value_under`) computes the root value per config under
+  the reference strategy, once per carried belief.
+* `Solver::carried_beliefs` returns the belief at the walk's exit leaf under each
+  kept iterate; those become the next solve's roots.
 
 Snapshots are thinned to the log-spaced iterates (0, 1, 2, 4, 8, …) plus the
 final one — the spread is in the early iterations — so a solve contributes ~9
@@ -217,7 +212,7 @@ The value of a leaf is a counterfactual value **per information state**, so it i
 indexed by the config: `v̂(PBS, c) -> scalar`.
 
 ```text
-  holding tower: z(c) = sum_k relu([counts_k, next_k, queued_k, seat, e_k] Wc + bc) [dg]
+  holding tower: z(c) = sum_k relu([counts_k, seat, e_k] Wc + bc)   [dg]
                  z(c) += relu(z Wh1 + bh1) Wh2 + bh2  (residual; Wh2 starts 0)
                  g(c) = z(c) Wg + bg                                [rank + 1]
 
@@ -227,14 +222,8 @@ indexed by the config: `v̂(PBS, c) -> scalar`.
                  h    = relu(LN(hpub + [b_0; b_1] Wb + b1))  [head]
                  u    = h Wu + bu                            [rank]
 
-  raw score:     s(c) = <u, g(c)[..rank]> + g(c)[rank]
-  centre:        m    = 1/2 (sum_c beta_0(c)s(c) + sum_c beta_1(c)s(c))
-  value:         v(c) = s(c) - m
+  value:         v(c) = <u, g(c)[..rank]> + g(c)[rank]
 ```
-
-The final centring layer makes the two belief-weighted player values sum to zero
-by construction. CFR and the training loss only consume `v`; `s` is exposed only
-for numerical parity diagnostics.
 
 The holding tower rectifies *before* the sum. A sum of raw linear maps is a
 linear map of the sum, and the sum of the inputs has forgotten which count
@@ -270,9 +259,10 @@ Labels are free: the solve's own average strategy at the root. The label attache
 to the solve's live-belief row — the other rows of a solve share one public state
 and differ only in belief, so they would all carry the same strategy.
 
-Checkpoint loading is strict: the architecture spec and encoding version must
-match exactly. Older checkpoints are rejected rather than partially initialising
-new heads or silently changing the meaning of an input.
+Checkpoints written before the policy head loaded with `strict=False` leave these
+three matrices at their initialisation; `has_policy` records that, and anything
+reading the policy asserts on it. Checkpoints from before the card describer do
+not load at all — the trunk's input is a different width.
 
 ### Auxiliary heads
 
@@ -281,13 +271,12 @@ board three rounds later, whether initiative changes hands next round, and the
 result as three classes. Backfilled from a per-round timeline the game records as
 it runs. They are dense — every row gets a different answer, unlike the single
 value number — and they are never in `flat()`, so the Rust play path never sees
-them and they cost nothing at inference. The `aux` config weight remains zero
-until gated.
+them and they cost nothing at inference. `--aux`, default 0 until gated.
 
 ### Warm start
 
 `Solver::warm_start` seeds a solve from the policy head instead of from a uniform
-strategy: start CFR as though the policy had already been played for `warm`
+strategy: start CFR as though the policy had already been played for `--warm`
 iterations. One traversal under the policy gives the instantaneous regret it
 accrues, `r(a) = v(a) − Σ_a π(a) v(a)`; scaling that by the weight is the whole
 of it, and seeding the average strategy the same way keeps the two consistent.
@@ -298,7 +287,10 @@ and zero at the best action, so regret matching clamps every action to the floor
 and hands back a uniform strategy, destroying exactly what the seed exists to
 inject.
 
-`a_warm_start_does_not_move_the_fixed_point` pins the property that matters: the subgame's value is unique, so a warm-started solve and a cold one must agree once both converge. A seed that changed the answer would be biasing it rather than accelerating it, and a strength gate could not telel those apart.
+`a_warm_start_does_not_move_the_fixed_point` pins the property that matters: the
+subgame's value is unique, so a warm-started solve and a cold one must agree once
+both converge. A seed that changed the answer would be biasing it rather than
+accelerating it, and a strength gate could not tell those apart.
 
 Default 0 — off. `examples/solvererr.rs` takes a warm-start weight as its sixth
 argument and reports every regret rule cold and warm side by side; the decision
@@ -310,15 +302,26 @@ That is what a *correct* seed carrying a *weak* policy looks like — this head 
 worth less than four CFR iterations, so injecting it as fifteen costs accuracy.
 A4 is blocked on a policy head worth more than that.
 
+### The pre-describer encoder
+
+`engine/src/v1.rs` and `train/value_net_v1.py` are the encoding and network a
+checkpoint from before the card describer was trained with, frozen and
+eval-only. Keyed off `dims` (five entries against the current ten); a solve
+takes its encoder from the net it was handed rather than from a constant.
+
+They exist for one reason: the describer changed the public encoding's width, and
+a gate that cannot play the new architecture against the pool cannot answer the
+only question a gate is for. Nothing here is maintained or extended — delete both
+when the pool has rotated past every checkpoint that needs them.
+
 ### What is cached
 
 Inside a solve only the beliefs move, so three things survive it: the public
 tower `hpub`, and `z(c)` and `g(c)` for every config in the tree. The config
-tower runs once per *distinct* config per solve (`Solver::intern_config`). What
-remains per iteration is one `2·dg -> head` matmul per leaf, one LayerNorm, and
-one `rank`-long dot product per config. Training computes the holding tower
-directly for every sampled config; CPU deduplication cost more than the duplicate
-GPU work saved.
+tower runs once per *distinct* config per solve (`Solver::intern_config`); the
+trainer deduplicates a batch the same way. What remains per iteration is one
+`2·dg -> head` matmul per leaf, one LayerNorm, and one `rank`-long dot
+product per config.
 
 ### Features
 
@@ -329,7 +332,7 @@ Bag, hand and face-down appear only through their public sum and their public
 sizes.
 
 Loss is a belief-weighted Huber over every config in the support, so a config the
-belief gives 1% to is worth 1% of the gradient.
+belief gives 1% to is worth 1% of the gradient. Targets are clipped to ±1.
 
 The board's 180-degree symmetry is used as augmentation: rotating the board maps
 white's starting locations onto black's, so every position can be presented a
@@ -338,24 +341,18 @@ second way with the seats swapped (`train/mirror.py`, applied per batch).
 ## 6. Training
 
 ```bash
-python train/exp.py run dcfr --seeds 2
+python train/train.py --minutes 30 --out runs/mine
 ```
 
-**Phase 1 — greedy warm start** (`warm_minutes`). Both players are a stochastic
+**Phase 1 — greedy warm start** (`--warm-frac`). Both players are a stochastic
 one-ply greedy bot on a public evaluation. Value targets blend that evaluation,
-squashed into (-1, 1), with the realised outcome (`eval_mix`). The network at
+squashed into (-1, 1), with the realised outcome (`--eval-mix`). The network at
 the end of this phase is snapshot 0, labelled `init`.
 
 **Phase 2 — ReBeL.** Self-play with a CFR solve at every decision. Default
-`iters=64`, `depth=2`.
+`--iters 64`, `--depth 2`.
 
-The phase boundary preserves only network weights. Greedy replay is discarded,
-Adam is recreated, and the ReBeL generator and replay sampler start from a
-seed-derived RNG independent of warm-up duration. Saved checkpoints are playing
-artifacts, not training resumes; `init_weights` starts a new optimizer and
-schedule explicitly.
-
-**The policy head** (`policy`, default 0 — it trains the shared trunk, so it
+**The policy head** (`--policy`, default 0 — it trains the shared trunk, so it
 changes the value network and has to be gated as its own change) is trained on
 the fresh epoch only, never from the replay buffer. A value target is bootstrapped and gains from
 being averaged over a long history; a strategy is not, and the epoch regenerates
@@ -364,64 +361,63 @@ rows of one solve share a public state and differ only in belief, while the
 reference strategy is a single object, so labelling all of them would teach the
 head that the belief does not matter.
 
-Training and evaluation use random drafts by default. The ladder's
-`--fixed-draft` option is the explicit starter-matchup exception.
+Training runs on the rulebook's starter matchup by default;
+`--random-draft` randomises the draft.
 
-**The replay sampler.** `recent_mix` of a batch is drawn from the newest
-`recent_rows` rows and the rest uniformly from the whole live buffer. Keeping the
-recent slice fixed in rows lets a capacity experiment change only the amount of
-history. Old rows carry targets written by a network that has since moved; the
-per-epoch `old=`/`new=` columns report the gap.
+**The replay sampler.** `--recent-mix` of a batch is drawn from the newest
+`--recent-frac` of the buffer and the rest uniformly from all of it, which at the
+defaults (0.5, 0.2) draws a fresh row six times as often as an old one while
+leaving every row reachable. Old rows carry targets written by a network that has
+since moved; the per-epoch `old=`/`new=` columns report the gap.
 
-**Evaluation** is one sparse graph at the end, `train/ladder.py`: consecutive
-checkpoints form each learning curve, each run's first and final checkpoints play
-Greedy, and every candidate final plays its same-seed control final. The direct
-arm comparisons get a larger fixed budget. Bradley-Terry fits all checkpoints on
-one scale with Greedy pinned at zero. Matches pair both seats on the same draft
-and random stream.
+`--mc-mix` blends the realised game outcome into the value target (TD(λ)).
+Default 0.
+
+**Evaluation** is one round robin at the end, `train/ladder.py`: every snapshot
+against every other, against Greedy and against Random, fitted with
+Bradley-Terry into an Elo each, Random pinned at 0. Matches are paired — the same
+draft and random stream for both seatings — and use a full solve and the
+reference strategy. `ladder.py` accepts snapshots from several run directories so
+runs can be rated on one scale.
 
 Nothing is compared, promoted or selected while a run is going.
 
 ## 7. Tests
 
-- `rebel_pbs.rs::features_do_not_leak_private_information` — swapping a player's
-true config for any other consistent with the same public counts must not move
-a feature.
-- `rebel_pbs.rs::a_solve_reads_only_the_beliefs` — solve the same public position
-in two different worlds; root values and root strategy must agree bit for bit.
-- `rebel_pbs.rs::config_features_separate_every_config` and
-`action_features_separate_every_action` — distinct configs, and distinct
-actions, never share a feature vector.
-- `rebel_pbs.rs::the_value_function_separates_configs_sharing_a_hand` — configs
-with the same hand and different face-down piles get different values and
-different play.
-- `rebel_pbs.rs::belief_tracker_matches_brute_force` — the incremental tracker
-against an exhaustive enumeration of every world consistent with the
-observation sequence, to 1e-5 over tens of thousands of worlds. The brute-force
-side goes through the engine only.
-- `rebel_solver.rs::subgame_solver_matches_tabular_cfr_on_micro_endgames` — the
-solver against an independent vanilla CFR over world states, under every regret
-rule. The game value is unique, so all must agree. Also checks NashConv is
-non-negative, falls with iterations, and that reading a solve mid-flight leaves
-it able to continue.
-- `train/test_parity.py` — the Rust network against PyTorch on the same weights.
-- `scenarios.rs` (36 cases) and `invariants.rs` — the engine itself.
-
-
+* `rebel_pbs.rs::features_do_not_leak_private_information` — swapping a player's
+  true config for any other consistent with the same public counts must not move
+  a feature.
+* `rebel_pbs.rs::a_solve_reads_only_the_beliefs` — solve the same public position
+  in two different worlds; root values and root strategy must agree bit for bit.
+* `rebel_pbs.rs::config_features_separate_every_config` and
+  `action_features_separate_every_action` — distinct configs, and distinct
+  actions, never share a feature vector.
+* `rebel_pbs.rs::the_value_function_separates_configs_sharing_a_hand` — configs
+  with the same hand and different face-down piles get different values and
+  different play.
+* `rebel_pbs.rs::belief_tracker_matches_brute_force` — the incremental tracker
+  against an exhaustive enumeration of every world consistent with the
+  observation sequence, to 1e-5 over tens of thousands of worlds. The brute-force
+  side goes through the engine only.
+* `rebel_solver.rs::subgame_solver_matches_tabular_cfr_on_micro_endgames` — the
+  solver against an independent vanilla CFR over world states, under every regret
+  rule. The game value is unique, so all must agree. Also checks NashConv is
+  non-negative, falls with iterations, and that reading a solve mid-flight leaves
+  it able to continue.
+* `train/test_parity.py` — the Rust network against PyTorch on the same weights.
+* `scenarios.rs` (36 cases) and `invariants.rs` — the engine itself.
 
 ## 8. Tools
 
-- `train/offline.py` — fits candidate architectures to a frozen replay dump.
-Same data, same targets, so architectures compare exactly.
-- `train/diagnose.py` — how learnable a dump's targets are, model-free.
-- `examples/solvererr.rs` — regret rule × iteration count, by NashConv and by
-target error against a converged reference.
-- `examples/featstats.rs` — the real range of every feature.
-- `examples/cfgvalue.rs` — how far the value separates configs.
-- `train/ladder.py` — sparse checkpoint graph and Bradley-Terry Elo.
-- `train/test_parity.py` — the Rust network against PyTorch, per seam.
-
-
+* `train/offline.py` — fits candidate architectures to a frozen replay dump.
+  Same data, same targets, so architectures compare exactly.
+* `train/diagnose.py` — how learnable a dump's targets are, model-free.
+* `examples/solvererr.rs` — regret rule × iteration count, by NashConv and by
+  target error against a converged reference.
+* `examples/featstats.rs` — the real range of every feature.
+* `examples/cfgvalue.rs` — how far the value separates configs.
+* `train/ladder.py` — Elo over snapshots plus Greedy and Random.
+* `train/test_parity.py` — the Rust network against PyTorch, per seam.
 
 ## 9. Layout
 
@@ -433,10 +429,6 @@ engine/src/net.rs       batched inference (Accelerate BLAS)
 engine/src/py.rs        pyo3: set_weights / gen_data / eval_match
 train/value_net.py      the networks, shared by everything that loads one
 train/train.py          PyTorch training loop, snapshots on a timer
-train/ladder.py         sparse checkpoint graph -> Elo
-train/report.py         one self-contained HTML page per run or comparison
-train/truth.py          a frozen set of solved positions; any checkpoint's error on it
-train/config.py         every knob of a run, one object; the experiments we run
-train/exp.py            an experiment end to end: arms x seeds -> ladder -> report
+train/ladder.py         round robin over snapshots -> Elo
+train/plot.py           the four panels a run is read from
 ```
-

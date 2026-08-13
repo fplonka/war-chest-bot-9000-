@@ -41,7 +41,7 @@ use warchest::Action;
 fn random_net(seed: u64, hidden: usize, dg: usize) -> Mlp {
     let mut r = Rng::new(seed);
     let (de, dc, rk) = (16usize, 32usize, dg);
-    let dims = [3, de, dg, rk, hidden, 1, 1, dc, 1, hidden, 0, 0];
+    let dims = [PUBFEAT, hidden, hidden, CFEAT, dg, rk, AFEAT, de, dc, 0];
     let xd = warchest::board::N_HEXES * (HEX_FACTS + de) + 2 * de + LOOSE;
     let nw = CARD_FEATS * dc
         + dc * de
@@ -50,7 +50,7 @@ fn random_net(seed: u64, hidden: usize, dg: usize) -> Mlp {
         + xd * hidden
         + hidden * hidden
         + 2 * dg * hidden
-        + warchest::net::hfeat(de) * dg
+        + (4 + de) * dg
         + dg * dg
         + dg * dg
         + dg * (rk + 1)
@@ -225,8 +225,8 @@ fn run_one(seed: u64) {
 }
 
 /// The same exhaustive-vs-incremental comparison on a draft with both Warrior
-/// Priests: private mid-round draws put a coin in flight, so the belief update,
-/// the walk and the brute force all carry it.
+/// Priests: private mid-round draws put `pending_coin` into the config, so the
+/// belief update, the walk and the brute force all carry it.
 #[test]
 fn belief_tracker_matches_brute_force_with_warrior_priests() {
     for seed in 0..4u64 {
@@ -407,8 +407,7 @@ fn compare(
 /// The config key must stay inside the packed `u64` budget (the key shares a
 /// word with the element index in the solver's sort): 38 bits of config +
 /// `IDX_BITS` index bits must not overflow. Also pins that the key
-/// distinguishes in-flight coins and that hand slots never exceed the two-bit
-/// width.
+/// distinguishes pendings and that hand slots never exceed the two-bit width.
 #[test]
 fn config_key_packing_has_headroom() {
     for seed in 0..200u64 {
@@ -419,7 +418,7 @@ fn config_key_packing_has_headroom() {
             c.hand[k] = r.below(4) as u8;
             c.fd[k] = r.below(6) as u8;
         }
-        c.inflight = if r.next_u64() & 1 == 0 {
+        c.pending_coin = if r.next_u64() & 1 == 0 {
             None
         } else {
             Some(r.below(NSLOT) as u8)
@@ -430,78 +429,28 @@ fn config_key_packing_has_headroom() {
             "config key must leave room for the element index: {:#x}",
             key
         );
-        // Same counts, different in-flight coin -> different key.
+        // Same counts, different pending -> different key; equal -> equal.
         let mut d = c;
         assert_eq!(c.key(), d.key());
-        d.inflight = match c.inflight {
+        d.pending_coin = match c.pending_coin {
             None => Some(0),
             Some(p) if p + 1 < NSLOT as u8 => Some(p + 1),
             Some(_) => None,
         };
-        assert_ne!(c.key(), d.key());
+        if c.pending_coin != d.pending_coin {
+            assert_ne!(c.key(), d.key());
+        }
     }
-    // Explicit extreme: every slot at its maximum with a coin in flight.
+    // Explicit extreme: every slot at its maximum with a pending coin.
     let mut c = Config::default();
     for k in 0..NSLOT {
         c.hand[k] = 3;
         c.fd[k] = 5;
     }
-    c.inflight = Some(NSLOT as u8 - 1);
+    c.pending_coin = Some(NSLOT as u8 - 1);
     assert!(c.key() < (1u64 << (64 - IDX_BITS)));
     // The hand width is two bits; `key`'s debug_assert is the overflow test
     // for a slot value of 4 or more (it fires in every debug test build).
-}
-
-#[test]
-fn a_warrior_priest_draw_puts_the_coin_in_flight() {
-    // Belief side: the drawn coin does not join the hand, it waits in flight,
-    // and the forced play spends it.
-    let mut before = Config::default();
-    before.hand[1] = 1;
-    let drawn = belief_after_draw(&Belief::point(before), &[0, 2, 1, 0, 0], &[0; NSLOT], true);
-    assert_eq!(drawn.cfg.len(), 2, "two drawable coins");
-    for c in drawn.cfg.iter() {
-        assert_eq!(c.hand, before.hand, "the hand is untouched by a WP draw");
-        let k = c.inflight.expect("a coin in flight");
-        assert_eq!(
-            advance_config(c, k as i8, false).expect("forced play").inflight,
-            None,
-            "the forced play spends the coin"
-        );
-        assert!(
-            advance_config(c, ((k + 1) % NSLOT as u8) as i8, false).is_none(),
-            "no other coin is legal"
-        );
-    }
-
-    // World side: at a real forced play the config is a plain read of the
-    // zones, and instantiating a sampled config round-trips.
-    let mut rng = Rng::new(7);
-    let mut s = make_game(&mut rng, true);
-    while !matches!(s.pending(), Cont::WarriorPriestPlay { .. }) {
-        if s.is_terminal() {
-            s = make_game(&mut rng, true);
-            continue;
-        }
-        let acts = s.legal_actions();
-        s = s.apply(acts[rng.below(acts.len())]);
-    }
-    let player = s.to_act();
-    let ctx = Ctx::new(&s);
-    let truth = true_config(&s, player, &ctx);
-    assert!(truth.inflight.is_some(), "a forced play holds its coin");
-    let mut world = s;
-    set_config(&mut world, player, &ctx, &truth);
-    assert_eq!(true_config(&world, player, &ctx), truth);
-    let (acts, aslot, _) = node_actions(&s, player, &ctx, &[truth]);
-    assert!(!acts.is_empty());
-    for (a, &slot) in acts.iter().zip(aslot.iter()) {
-        assert_eq!(
-            slot,
-            truth.inflight.unwrap() as i8,
-            "every forced action spends the drawn coin: {a:?}"
-        );
-    }
 }
 
 /// The reachable-config census, re-run with the Warrior Priests in the draft
@@ -511,7 +460,7 @@ fn a_warrior_priest_draw_puts_the_coin_in_flight() {
 fn reachable_config_census_with_warrior_priests() {
     let mut sizes: Vec<usize> = Vec::new();
     let mut rng = Rng::new(0xC0FFEE);
-    for _ in 0..200u64 {
+    for g in 0..200u64 {
         let mut s = make_game(&mut rng, true);
         let ctx = Ctx::new(&s);
         for _ in 0..300 {
@@ -716,15 +665,11 @@ fn a_subgame_of_only_terminal_leaves_solves() {
             depth: 2,
             iters: 8,
             snapshots: true,
-            keep_states: true,
             ..Default::default()
         };
         let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
         assert!(
-            sv.nodes
-                .iter()
-                .zip(&sv.states)
-                .all(|(n, s)| !n.leaf || s.is_terminal()),
+            sv.nodes.iter().all(|n| !n.leaf || n.s.is_terminal()),
             "expected every leaf terminal"
         );
         sv.multistep(cfg.iters);
@@ -736,6 +681,69 @@ fn a_subgame_of_only_terminal_leaves_solves() {
         }
     }
     assert!(checked >= 3, "only {checked} positions exercised");
+}
+
+/// A pre-describer checkpoint must still be able to play.
+///
+/// The card describer changed the public encoding's width and layout. If the
+/// pool cannot be loaded and played, no gate can ask whether the new
+/// architecture is better than what came before — which is the only question a
+/// gate exists to answer. So the old encoder and the old towers stay, keyed off
+/// the checkpoint's `dims`, and a solve picks its encoder from the net it was
+/// handed rather than from a constant.
+#[test]
+fn a_pre_describer_checkpoint_still_solves() {
+    let (hidden, dg, rank) = (64usize, 16usize, 16usize);
+    let mut r = Rng::new(3);
+    let dims = [warchest::v1::PUBFEAT_V1, hidden, CFEAT, dg, rank];
+    let nw = dims[0] * hidden
+        + hidden * hidden
+        + 2 * dg * hidden
+        + CFEAT * dg
+        + dg * (rank + 1)
+        + hidden * rank;
+    let mut draw =
+        |n: usize| -> Vec<f32> { (0..n).map(|_| (r.unit_f64() as f32 - 0.5) * 0.2).collect() };
+    let w = draw(nw);
+    let b = draw(hidden + hidden + dg + (rank + 1) + rank);
+    let mut ln = Vec::new();
+    for _ in 0..2 {
+        ln.extend(std::iter::repeat(1.0).take(hidden));
+        ln.extend(std::iter::repeat(0.0).take(hidden));
+    }
+    let net = Mlp::from_flat(&dims, &w, &b, &ln).expect("v1 net");
+    assert!(net.v1() && net.pub_dim() == warchest::v1::PUBFEAT_V1);
+
+    let nets = Nets { value: net };
+    let mut rng = Rng::new(11);
+    let mut s = make_game(&mut rng, false);
+    for _ in 0..60 {
+        if s.is_terminal() || s.is_chance() {
+            break;
+        }
+        let acts = s.legal_actions();
+        s.apply_inplace(acts[rng.below(acts.len())]);
+    }
+    let ctx = Ctx::new(&s);
+    let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
+    let cfg = Cfg {
+        depth: 2,
+        iters: 32,
+        snapshots: true,
+        ..Default::default()
+    };
+    let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
+    sv.multistep(cfg.iters);
+    let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
+    assert!(
+        vals[0][0].iter().all(|v| v.is_finite()),
+        "v1 solve produced non-finite values"
+    );
+    assert!(
+        vals[0][0].iter().any(|v| *v != 0.0),
+        "v1 solve produced all zeros"
+    );
+    assert!(sv.nash_conv().nash > -1e-3, "v1 NashConv is negative");
 }
 
 /// A warm start must not move where the solve converges.
@@ -777,7 +785,6 @@ fn a_warm_start_does_not_move_the_fixed_point() {
             depth: 2,
             iters: 400,
             snapshots: true,
-            keep_states: true,
             ..Default::default()
         };
         let mut v = Vec::new();
@@ -900,16 +907,16 @@ fn action_features_separate_every_action() {
     );
 }
 
-/// Counts, forced slots and seat must occupy the documented feature blocks. A
-/// transposition here would be invisible to every other test: the network
-/// would happily learn whatever permutation it was given.
+/// The counts must be the ones the name says, and the bag must be the derived
+/// one. A transposition here would be invisible to every other test: the
+/// network would happily learn whatever permutation it was given.
 #[test]
 fn config_counts_are_hand_facedown_bag() {
     let reserve = [4u8, 3, 5, 2, 1];
     let c = Config {
         hand: [1, 0, 2, 0, 0],
         fd: [2, 1, 0, 0, 1],
-        inflight: None,
+        pending_coin: None,
     };
     let mut cnt = [0u8; CCOUNTS];
     config_counts(&c, &reserve, &mut cnt);
@@ -921,7 +928,6 @@ fn config_counts_are_hand_facedown_bag() {
     for k in 0..CCOUNTS {
         assert_eq!(phi[k], cnt[k] as f32 / CNORM);
     }
-    assert!(phi[CCOUNTS..CCOUNTS].iter().all(|&x| x == 0.0));
     assert_eq!(phi[CCOUNTS], 1.0, "seat flag");
 }
 
@@ -988,7 +994,6 @@ fn a_solve_reads_only_the_beliefs() {
         depth: 2,
         iters: 8,
         snapshots: true,
-        keep_states: true,
         ..Default::default()
     };
     let mut checked = 0usize;
@@ -1047,7 +1052,6 @@ fn the_value_function_separates_configs_sharing_a_hand() {
         depth: 2,
         iters: 8,
         snapshots: true,
-        keep_states: true,
         ..Default::default()
     };
     let (mut positions, mut val_differs, mut strat_differs) = (0usize, 0usize, 0usize);
@@ -1142,12 +1146,12 @@ fn from_pairs_keeps_zero_weight_configs() {
     let b = Config {
         hand: [1, 0, 0, 0, 0],
         fd: [0; NSLOT],
-        inflight: None,
+        pending_coin: None,
     };
     let c = Config {
         hand: [0; NSLOT],
         fd: [1, 0, 0, 0, 0],
-        inflight: None,
+        pending_coin: None,
     };
     let bel = Belief::from_pairs(vec![
         (b, 0.25),
@@ -1229,7 +1233,6 @@ fn zero_weight_config_survives_the_walk_update() {
                 depth: 2,
                 iters: 8,
                 snapshots: false,
-                keep_states: true,
                 ..Default::default()
             },
             bel.clone(),

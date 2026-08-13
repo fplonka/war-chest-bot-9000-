@@ -21,7 +21,7 @@ fn throughput_probe() {
         let mut games = 0u64;
         let mut decisions = 0u64;
         for seed in 0..n {
-            let rng = Rng::new(seed * 31 + 5);
+            let mut rng = Rng::new(seed * 31 + 5);
             let mut d = Data::default();
             let gc = GameCfg {
                 agents: [Agent::Rebel { cfg, slot: 0 }, Agent::Rebel { cfg, slot: 0 }],
@@ -29,6 +29,7 @@ fn throughput_probe() {
                 explore: 0.0,
                 random_draft: false,
                 eval_mix: 0.0,
+                mc_mix: 0.0,
             };
             play_game(rng, &nets, &gc, &mut d, None);
             games += 1;
@@ -56,7 +57,7 @@ fn throughput_probe() {
         let t0 = Instant::now();
         let mut games = 0u64;
         for seed in 0..16u64 {
-            let rng = Rng::new(seed * 31 + 5);
+            let mut rng = Rng::new(seed * 31 + 5);
             let mut d = Data::default();
             let gc = GameCfg {
                 agents: [Agent::Rebel { cfg, slot: 0 }, Agent::Rebel { cfg, slot: 0 }],
@@ -64,6 +65,7 @@ fn throughput_probe() {
                 explore: 0.0,
                 random_draft: false,
                 eval_mix: 0.0,
+                mc_mix: 0.0,
             };
             play_game(rng, &nets, &gc, &mut d, None);
             games += 1;

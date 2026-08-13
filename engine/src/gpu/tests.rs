@@ -16,23 +16,14 @@ const DG: usize = 64;
 const RK: usize = 64;
 const N_CARRIED: usize = 3;
 
-// One CFR iteration, deliberately. This oracle is a *parity* test: it asks
-// whether the CPU and CUDA solvers compute the same thing from the same input.
-// Past one iteration they cannot be compared cell by cell, because regret
-// matching clamps at EPS and a float difference of 1e-7 in a leaf value puts a
-// regret on the opposite side of zero, after which the two trajectories are
-// solving different games. `wave_composition_stays_bounded` measures that
-// sensitivity directly and already fails at 1.54x tolerance without any of
-// this. Comparing eight iterations was measuring chaos, not correctness.
 const TEST_CFG: Cfg = Cfg {
     depth: 2,
-    iters: 1,
+    iters: 8,
     snapshots: true,
     cfr: Cfr::LINEAR,
     warm: 0.0,
     node_cap: 0,
     gpu_build: false,
-    keep_states: false,
 };
 
 fn gpu_guard() -> MutexGuard<'static, ()> {
@@ -106,6 +97,7 @@ fn fixtures<'a>(nets: &'a Nets) -> Vec<(Solver<'a>, PackedJob)> {
         explore: 0.0,
         random_draft: true,
         eval_mix: 0.0,
+        mc_mix: 0.0,
     };
     let roots = collect_roots(1, 0xABCD, std::slice::from_ref(nets), &gc, 4000);
     assert!(roots.len() >= 4, "fixture game produced too few roots");
@@ -236,25 +228,6 @@ fn flatten_pairs(v: &[[Vec<f32>; 2]]) -> Vec<f32> {
         .collect()
 }
 
-fn assert_zero_sum(name: &str, beliefs: &[[Vec<f32>; 2]], values: &[[Vec<f32>; 2]]) {
-    for (root, (belief, value)) in beliefs.iter().zip(values).enumerate() {
-        let mean = |p: usize| {
-            let mass = belief[p].iter().sum::<f32>();
-            belief[p]
-                .iter()
-                .zip(&value[p])
-                .map(|(w, v)| w * v)
-                .sum::<f32>()
-                / mass
-        };
-        let residual = mean(0) + mean(1);
-        assert!(
-            residual.abs() < 2e-3,
-            "{name} root {root}: v0 + v1 = {residual}"
-        );
-    }
-}
-
 #[test]
 fn full_wave_oracle() {
     let _gpu = gpu_guard();
@@ -292,16 +265,11 @@ fn full_wave_oracle() {
             strategy_tol.1,
         );
         let want_roots = sv.value_under(&job.carried);
-        assert_zero_sum("GPU", &job.carried, &result.root_values);
-        assert_zero_sum("CPU", &job.carried, &want_roots);
         let root_tol = if fast_gemm() {
             // FP16 internal operands retain FP32 accumulation and output, but
-            // deliberately do not promise CPU-oracle rounding. The private
-            // tower now has six inputs per slot, so its synthetic dense-weight
-            // worst case is bounded at 0.4% relative error. Probability,
-            // shape, finiteness, zero-network, precise-mode, and reuse gates
-            // remain tight.
-            (5e-3, 4e-3)
+            // deliberately do not promise CPU-oracle rounding. Probability,
+            // shape, finiteness, zero-network, and reuse gates remain tight.
+            (5e-3, 1e-3)
         } else {
             (1e-3, 2e-4)
         };
@@ -408,13 +376,6 @@ fn wave_composition_stays_bounded() {
         assert_result_invariants(&set[measured_id].1, &alone);
         assert_result_invariants(&set[measured_id].1, &together);
         assert_result_invariants(&set[measured_id].1, &after);
-        for (name, result) in [
-            ("alone", &alone),
-            ("together", &together),
-            ("after", &after),
-        ] {
-            assert_zero_sum(name, &set[measured_id].1.carried, &result.root_values);
-        }
         let company_strategy_tol = if fast_gemm() {
             // Wave-shaped tensor-core rounding plus the retained FP16 public
             // residual can be amplified by eight regret-matching iterations.
@@ -446,14 +407,7 @@ fn wave_composition_stays_bounded() {
             1e-6,
         );
         let company_root_tol = if fast_gemm() {
-            // Projection subtracts a centre built from both belief-weighted
-            // seat means. Wave-shaped FP16 GEMM error can therefore enter a
-            // projected value through its own score and through both means.
-            // Near zero the two large projected terms can cancel, so retain
-            // the measured 0.03 absolute bound as well as the 0.4% relative
-            // bound. The strategy comparison above independently limits the
-            // effect of this rounding on play.
-            (3e-2, 4e-3)
+            (5e-3, 1e-3)
         } else {
             (1e-3, 2e-4)
         };

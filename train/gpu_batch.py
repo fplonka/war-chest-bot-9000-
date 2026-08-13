@@ -127,10 +127,9 @@ def _expand_configs(cc, cp, out, n, CCOUNTS: tl.constexpr,
     r = q // CFEAT
     c = q - r * CFEAT
     ci = tl.minimum(c, CCOUNTS - 1)
-    counts = tl.load(cc + r * CCOUNTS + ci,
-                     mask=valid & (c < CCOUNTS), other=0).to(tl.float32)
+    count = tl.load(cc + r * CCOUNTS + ci, mask=valid & (c < CCOUNTS), other=0).to(tl.float32)
     player = tl.load(cp + r, mask=valid & (c == CCOUNTS), other=0).to(tl.float32)
-    value = tl.where(c < CCOUNTS, counts / CNORM, player)
+    value = tl.where(c < CCOUNTS, count / CNORM, player)
     tl.store(out + q, value, mask=valid)
 
 
@@ -150,7 +149,7 @@ def make_batch(parts, rng, device, augment):
 
     rows, cc, cp, cw, cy, seg = parts
     n = len(rows)
-    hand, fd, bag = public_sizes(cc, seg, n)
+    hand, fd, bag = public_sizes(cc, cp, seg, n)
     if augment:
         which = rng.random(n) < 0.5
         rows[which] = mirror.mirror_rows(rows[which])

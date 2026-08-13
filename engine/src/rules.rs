@@ -500,17 +500,7 @@ impl State {
 
     /// Perform a draw of `unit` for player `p`: refill first if the bag is empty,
     /// then move one `unit` coin from bag to hand.
-    /// Which private zone the current coin play pays from: the Warrior Priest's
-    /// drawn coin while a forced play is owed, the hand otherwise.
-    #[inline]
-    fn pay_zone(&self) -> usize {
-        match self.pending {
-            Cont::WarriorPriestPlay { .. } => Z_INFLIGHT,
-            _ => Z_HAND,
-        }
-    }
-
-    fn do_draw(&mut self, p: u8, unit: u8, to: usize) {
+    fn do_draw(&mut self, p: u8, unit: u8) {
         let mut bag_empty = true;
         for u in 0..N_UNITS {
             if self.zones[p as usize][Z_BAG][u] > 0 {
@@ -522,7 +512,7 @@ impl State {
             self.refill_bag(p);
         }
         debug_assert!(self.zones[p as usize][Z_BAG][unit as usize] > 0);
-        self.zmove(p, Z_BAG, to, unit);
+        self.zmove(p, Z_BAG, Z_HAND, unit);
     }
 }
 
@@ -898,11 +888,9 @@ impl State {
                 }
             }
             Tactic::RoyalGuard => {
-                // needs a Royal Coin to pay with; move up to 2 through empty
-                // hexes, ending on an empty location you control. At a Warrior
-                // Priest forced play that is the drawn coin, not the hand —
-                // which is why a drawn RG coin does not offer this tactic.
-                if self.zones[me as usize][self.pay_zone()][ROYAL_COIN as usize] == 0 {
+                // needs a Royal Coin in hand; move up to 2 through empty hexes,
+                // ending on an empty location you control.
+                if self.zones[me as usize][Z_HAND][ROYAL_COIN as usize] == 0 {
                     return;
                 }
                 // reachable in 1 or 2 steps through empty hexes.
@@ -940,16 +928,13 @@ impl State {
 // ------------------------------------------------------- main-play legal set
 
 impl State {
-    /// All coin plays available to `p` from the paying zone. On a normal turn
-    /// that is the hand; at a Warrior Priest forced play it is the single drawn
-    /// coin, which is the whole of that rule.
+    /// All coin plays available to `p` from hand on a normal turn.
     fn list_main_play(&self, p: u8, out: &mut Vec<Action>) {
-        // For each distinct coin type available, list its legal plays. Facedown
+        // For each distinct coin type in hand, list its legal plays. Facedown
         // plays (claim/recruit/pass) spend that specific coin.
         let claim_ok = self.initiative != p && !self.initiative_moved;
-        let pay = self.pay_zone();
         for u in 0..N_UNITS {
-            if self.zones[p as usize][pay][u] == 0 {
+            if self.zones[p as usize][Z_HAND][u] == 0 {
                 continue;
             }
             let unit = u as u8;
@@ -1051,8 +1036,8 @@ impl State {
             Cont::MainPlay => {
                 self.list_main_play(self.active, &mut out);
             }
-            Cont::WarriorPriestPlay { player } => {
-                self.list_main_play(player, &mut out);
+            Cont::WarriorPriestPlay { player, coin } => {
+                self.list_wp_play(player, coin, &mut out);
             }
             Cont::RoyalGuardChoice { .. } => {
                 out.push(Action::RGSoakSupply);
@@ -1116,6 +1101,70 @@ impl State {
         out
     }
 
+    /// Legal Warrior-Priest forced-play actions: any action playable with the
+    /// drawn `coin` type — the forced play must use the drawn coin — plus Pass
+    /// (always legal). If `coin == NONE`, only Pass.
+    fn list_wp_play(&self, p: u8, coin: u8, out: &mut Vec<Action>) {
+        out.push(Action::Pass { coin });
+        if coin == NONE {
+            return;
+        }
+        let claim_ok = self.initiative != p && !self.initiative_moved;
+        if claim_ok {
+            out.push(Action::ClaimInitiative { coin });
+        }
+        for r in 0..N_UNITS {
+            if self.zones[p as usize][Z_SUPPLY][r] > 0 {
+                out.push(Action::Recruit {
+                    coin,
+                    unit: r as u8,
+                });
+            }
+        }
+        let d = def(coin);
+        if !d.is_royal_coin {
+            if !self.has_deployed(p, coin) || d.two_footmen {
+                let cap = if d.two_footmen { 2 } else { 1 };
+                if (self.hexes_of(p, coin).len() as u8) < cap {
+                    let mut locs = Vec::new();
+                    self.deploy_locations(p, &mut locs);
+                    for h in locs {
+                        out.push(Action::Deploy { unit: coin, hex: h });
+                    }
+                    if d.scout {
+                        let mut sc = Vec::new();
+                        self.scout_deploy_hexes(p, &mut sc);
+                        for h in sc {
+                            out.push(Action::Deploy { unit: coin, hex: h });
+                        }
+                    }
+                }
+            }
+            for h in self.hexes_of(p, coin) {
+                out.push(Action::Bolster {
+                    unit: coin,
+                    hex: h as u8,
+                });
+            }
+            for h in self.hexes_of(p, coin) {
+                self.list_basic_maneuvers(h, ManVariant::Main, out);
+                // The Royal Guard tactic is a play of the Royal Coin, not of a
+                // drawn RG coin, and the forced play must use the drawn coin —
+                // so it is offered only when the drawn coin IS the Royal Coin
+                // (the branch below). See RULES.md.
+                if def(self.hex_type[h]).tactic != Tactic::RoyalGuard {
+                    self.list_tactics(h, out);
+                }
+            }
+        } else {
+            // Drawn Royal Coin: facedown plays plus the Royal Guard tactic.
+            for h in self.hexes_of(p, ROYAL_GUARD) {
+                self.list_tactics(h, out);
+            }
+        }
+        dedup(out);
+    }
+
     // Tactic listings restricted to the chaining/free contexts. Berserker/Merc
     // extra maneuvers may themselves invoke the unit's tactic (a tactic is a
     // maneuver). We reuse list_tactics but re-encode via the context variant is
@@ -1151,7 +1200,7 @@ impl State {
             // -------- chance: round-start draw --------
             Cont::Draw { player } => {
                 if let DrawCoin { unit } = action {
-                    self.do_draw(player, unit, Z_HAND);
+                    self.do_draw(player, unit);
                 }
                 self.finish();
                 return;
@@ -1176,17 +1225,17 @@ impl State {
                             None => self.finish(),
                         }
                     } else {
-                        // The drawn coin waits in `Z_INFLIGHT`, which is what
-                        // the forced play pays from.
-                        self.do_draw(player, unit, Z_INFLIGHT);
+                        self.do_draw(player, unit);
                         match rg_choice(self) {
                             Some(c) => {
                                 // interrupted-attack case: the defender's soak
                                 // choice resolves next; the forced play after.
-                                self.push_cont(Cont::WarriorPriestPlay { player });
+                                self.push_cont(Cont::WarriorPriestPlay { player, coin: unit });
                                 self.set_pending(c);
                             }
-                            None => self.set_pending(Cont::WarriorPriestPlay { player }),
+                            None => {
+                                self.set_pending(Cont::WarriorPriestPlay { player, coin: unit });
+                            }
                         }
                     }
                 }
@@ -1296,32 +1345,29 @@ impl State {
     /// A normal (main-play or Warrior-Priest forced) coin play by `p`.
     fn apply_main(&mut self, p: u8, action: Action) {
         use Action::*;
-        // Where the played coin comes from: the hand, or the Warrior Priest's
-        // drawn coin at a forced play. Read before any effect changes `pending`.
-        let pay = self.pay_zone();
         match action {
             Deploy { unit, hex } => {
-                self.zones[p as usize][pay][unit as usize] -= 1;
+                self.zones[p as usize][Z_HAND][unit as usize] -= 1;
                 self.place_unit(p, unit, hex as usize);
                 self.finish();
             }
             Bolster { unit, hex } => {
-                self.zones[p as usize][pay][unit as usize] -= 1;
+                self.zones[p as usize][Z_HAND][unit as usize] -= 1;
                 self.hex_height[hex as usize] += 1;
                 self.finish();
             }
             ClaimInitiative { coin } => {
-                self.zmove(p, pay, Z_FACEDOWN, coin);
+                self.zmove(p, Z_HAND, Z_FACEDOWN, coin);
                 self.initiative = p;
                 self.initiative_moved = true;
                 self.finish();
             }
             Pass { coin } => {
-                self.zmove(p, pay, Z_FACEDOWN, coin);
+                self.zmove(p, Z_HAND, Z_FACEDOWN, coin);
                 self.finish();
             }
             Recruit { coin, unit } => {
-                self.zmove(p, pay, Z_FACEDOWN, coin); // spent coin: facedown
+                self.zmove(p, Z_HAND, Z_FACEDOWN, coin); // spent coin: facedown
                                                          // recruited coin: supply -> faceup discard (public).
                 self.zones[p as usize][Z_SUPPLY][unit as usize] -= 1;
                 self.zones[p as usize][Z_FACEUP][unit as usize] += 1;
@@ -1342,33 +1388,33 @@ impl State {
                 self.finish();
             }
             Move { from, to } => {
-                self.spend_maneuver_coin(p, from as usize, pay);
+                self.spend_maneuver_coin(p, from as usize);
                 self.do_move(from as usize, to as usize);
                 self.finish();
             }
             Control { from } => {
-                self.spend_maneuver_coin(p, from as usize, pay);
+                self.spend_maneuver_coin(p, from as usize);
                 self.do_control(from as usize);
                 self.finish();
             }
             Attack { from, target } => {
-                self.spend_maneuver_coin(p, from as usize, pay);
+                self.spend_maneuver_coin(p, from as usize);
                 self.do_attack(from as usize, target as usize);
                 self.finish();
             }
             // ----- tactics -----
             TacArcher { from, target } => {
-                self.spend_maneuver_coin(p, from as usize, pay);
+                self.spend_maneuver_coin(p, from as usize);
                 self.do_attack(from as usize, target as usize);
                 self.finish();
             }
             TacCrossbow { from, target } => {
-                self.spend_maneuver_coin(p, from as usize, pay);
+                self.spend_maneuver_coin(p, from as usize);
                 self.do_attack(from as usize, target as usize);
                 self.finish();
             }
             TacCavalryMove { from, to } => {
-                self.spend_maneuver_coin(p, from as usize, pay);
+                self.spend_maneuver_coin(p, from as usize);
                 self.do_move(from as usize, to as usize);
                 // then a mandatory-if-able attack from the new hex.
                 self.push_cont(Cont::CavalryAttack { hex: to });
@@ -1383,24 +1429,24 @@ impl State {
                 // the face-up discard of an Ensign coin (a maneuver spends the
                 // played coin, which is the Ensign's own coin from hand).
                 // The played coin is the Ensign hand coin: discard it face-up.
-                self.zmove(p, pay, Z_FACEUP, ENSIGN);
+                self.zmove(p, Z_HAND, Z_FACEUP, ENSIGN);
                 self.do_move(from as usize, to as usize);
                 self.finish();
             }
             TacLancer { from, to, target } => {
-                self.spend_maneuver_coin(p, from as usize, pay);
+                self.spend_maneuver_coin(p, from as usize);
                 self.move_stack(from as usize, to as usize);
                 // Lancer attribute: none. attack from the new hex.
                 self.do_attack(to as usize, target as usize);
                 self.finish();
             }
             TacLightCav { from, to } => {
-                self.spend_maneuver_coin(p, from as usize, pay);
+                self.spend_maneuver_coin(p, from as usize);
                 self.do_move(from as usize, to as usize);
                 self.finish();
             }
             TacMarshal { unit_hex, target } => {
-                self.zmove(p, pay, Z_FACEUP, MARSHAL);
+                self.zmove(p, Z_HAND, Z_FACEUP, MARSHAL);
                 self.do_attack(unit_hex as usize, target as usize);
                 self.finish();
             }
@@ -1408,7 +1454,7 @@ impl State {
                 // discard the Royal Coin (not an RG coin) as the played coin.
                 // The tactic discard is FACE-UP (verified from server replays;
                 // only facedown *actions* hide the Royal Coin).
-                self.zmove(p, pay, Z_FACEUP, ROYAL_COIN);
+                self.zmove(p, Z_HAND, Z_FACEUP, ROYAL_COIN);
                 self.do_move(from as usize, to as usize);
                 self.finish();
             }
@@ -1417,7 +1463,7 @@ impl State {
                 // friendly Footman unit on the board, player-chosen order.
                 // BOTH versions count: a Footman coin maneuvers Footman V2
                 // units and vice versa (verified from server replays).
-                self.zmove(p, pay, Z_FACEUP, coin);
+                self.zmove(p, Z_HAND, Z_FACEUP, coin);
                 let mut hexes = crate::state::HexSet::default();
                 for u in [FOOTMAN, FOOTMAN_V2] {
                     for &h in self.hexes_of(p, u).iter() {
@@ -1439,10 +1485,10 @@ impl State {
 
     /// Spend the played coin of a maneuver: one coin of the unit-type at `hex`
     /// goes from hand to the FACE-UP discard.
-    fn spend_maneuver_coin(&mut self, p: u8, hex: usize, pay: usize) {
+    fn spend_maneuver_coin(&mut self, p: u8, hex: usize) {
         let unit = self.hex_type[hex];
         debug_assert!(unit != NONE);
-        self.zmove(p, pay, Z_FACEUP, unit);
+        self.zmove(p, Z_HAND, Z_FACEUP, unit);
     }
 }
 

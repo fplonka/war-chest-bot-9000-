@@ -12,8 +12,6 @@ import torch.nn.functional as F
 
 import warchest
 
-ENCODING_VERSION = warchest.ENCODING_VERSION
-
 PUBFEAT = warchest.PUBFEAT
 CFEAT = warchest.CFEAT
 AFEAT = warchest.AFEAT
@@ -81,6 +79,24 @@ class Res(nn.Module):
         self.b = nn.Linear(dg, dg)
         nn.init.zeros_(self.b.weight)
         nn.init.zeros_(self.b.bias)
+
+
+# Renames from the fixed-layout checkpoints to the tower layout. Everything
+# else kept its name.
+_UPGRADE = {
+    "wd0": "card.0", "wd1": "card.1",
+    "w0": "pub.0", "ln0": "pub_ln.0", "w1": "pub_out",
+    "wc": "slot_out", "wh1": "res.0.a", "wh2": "res.0.b",
+}
+
+
+def upgrade_state_dict(sd):
+    """A fixed-layout state dict, renamed into the tower layout."""
+    out = {}
+    for k, v in sd.items():
+        head, dot, rest = k.partition(".")
+        out[_UPGRADE.get(head, head) + dot + rest] = v
+    return out
 
 
 class Mlp(nn.Module):
@@ -168,15 +184,13 @@ class Mlp(nn.Module):
         self.hmlp = nn.ModuleList(
             [nn.Linear(widths[i], widths[i + 1]) for i in range(len(widths) - 1)])
         self.wu = nn.Linear(head_out, rank)
-        # The holding tower: per coin type — three counts, the centred seat and
-        # that card's embedding — through a shared chain, rectified, summed over
-        # the five slots (a sum has no order, so any draft fits), then the
-        # residual blocks.
-        hfeat = 4 + de
-        widths = [hfeat, *slot]
+        # The holding tower: per coin type through a shared chain, rectified,
+        # summed over the five slots (a sum has no order, so any draft fits),
+        # then the residual blocks.
+        widths = [4 + de, *slot]
         self.slot = nn.ModuleList(
             [nn.Linear(widths[i], widths[i + 1]) for i in range(len(widths) - 1)])
-        self.slot_out = nn.Linear(slot[-1] if slot else hfeat, dg)
+        self.slot_out = nn.Linear(slot[-1] if slot else 4 + de, dg)
         self.res = nn.ModuleList([Res(dg) for _ in range(nres)])
         self.wg = nn.Linear(dg, rank + 1)
         # The policy head: an action tower and the two halves of its readout.
@@ -189,6 +203,7 @@ class Mlp(nn.Module):
         # not dominated by random leaf values.
         nn.init.zeros_(self.wg.bias)
         nn.init.normal_(self.wg.weight, std=1e-3)
+        self.has_policy = True
 
     def spec(self):
         """Constructor arguments, for the checkpoint."""
@@ -299,9 +314,7 @@ class Mlp(nn.Module):
         counts = phi[:, :CCOUNTS].reshape(-1, 3, NSLOT).transpose(1, 2)   # [U, NSLOT, 3]
         mine = e[torch.arange(e.shape[0], device=e.device).unsqueeze(1),
                  seat.unsqueeze(1) * NSLOT + torch.arange(NSLOT, device=e.device)]
-        # Centred: see net.rs::holdings. A raw 0/1 seat is inert for seat 0 and
-        # active for seat 1, and the rectified sum below cannot cancel it.
-        s = (phi[:, CCOUNTS] - 0.5).reshape(-1, 1, 1).expand(-1, NSLOT, 1)
+        s = phi[:, CCOUNTS].reshape(-1, 1, 1).expand(-1, NSLOT, 1)
         x = torch.cat([counts, s, mine], -1)
         for lin in self.slot:
             x = F.relu(lin(x))
@@ -319,8 +332,9 @@ class Mlp(nn.Module):
         pay = psi[:, AOFF_PAYS:AOFF_PAYS + NTYPE].unsqueeze(1) @ e     # [A, 1, de]
         return F.relu(self.wq(torch.cat([psi, pay.squeeze(1)], -1)))
 
-    def raw_scores(self, xpub, unit_ids, phi, inv, w, seg, nseg):
-        """Unconstrained bilinear scores. Only parity tests should call this."""
+    def forward(self, xpub, unit_ids, phi, inv, w, seg, nseg):
+        """Values for every config in a ragged batch. See the docstring of the
+        original for the layout; unchanged."""
         e = self.cards(xpub, unit_ids)
         crow = torch.zeros(phi.shape[0], dtype=torch.long, device=phi.device)
         crow.scatter_(0, inv, seg // 2)
@@ -334,22 +348,6 @@ class Mlp(nn.Module):
         rk = u.shape[1]
         gc = g[inv]
         return (u[seg // 2] * gc[:, :rk]).sum(-1) + gc[:, rk]
-
-    def forward(self, xpub, unit_ids, phi, inv, w, seg, nseg):
-        """Zero-sum values for every config in a ragged batch.
-
-        For each PBS, subtract half the sum of the two belief-weighted seat
-        means from every score in both seats. This is the final value layer, so
-        neither CFR nor the loss can observe unconstrained scores.
-        """
-        raw = self.raw_scores(xpub, unit_ids, phi, inv, w, seg, nseg)
-        means = torch.zeros(nseg, dtype=raw.dtype, device=raw.device)
-        mass = torch.zeros(nseg, dtype=raw.dtype, device=raw.device)
-        means.index_add_(0, seg, raw * w)
-        mass.index_add_(0, seg, w)
-        means = means / mass.clamp(min=1e-12)
-        centre = 0.5 * means.reshape(-1, 2).sum(1)
-        return raw - centre[seg // 2]
 
     def flat(self):
         """The weights as the three flat arrays Rust reads, in the v3 order

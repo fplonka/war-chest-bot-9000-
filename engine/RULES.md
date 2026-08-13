@@ -154,9 +154,9 @@ ATTRIBUTES (free/triggered effects):
   play (any action; pass always legal). The forced play must use the drawn
   coin, so the Royal Guard tactic — which is a play of the Royal Coin, not of
   a drawn RG coin — is offered only when the drawn coin IS the Royal Coin
-  (adjudication, 2026; the census never separated this case). The drawn coin
-  never joins the hand: it is the coin the forced play pays with, and the
-  engine holds it in its own zone until then, so the hand cap is untouched.
+  (adjudication, 2026; the census never separated this case). The hand never
+  transiently exceeds 3: the trigger is always preceded, in the same play
+  chain, by a coin play that emptied a hand slot.
 - Warrior Priest V2: same, at most once per turn. Only V2's own trigger
   counts against the cap: a V1 trigger earlier in the turn does not block V2.
 - Footman V2 extra attribute: after you RECRUIT a Footman coin while you
