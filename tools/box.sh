@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# The GPU box: send the code, run train.py, bring reports back.
+# The GPU box: send the code, run train.py, bring one run back when it finishes.
 #
 #   tools/box.sh go out=seat note="the idea"
 #   tools/box.sh follow run
-#   tools/box.sh pull
+#   tools/box.sh pull seat
 #   tools/box.sh sync
 #   tools/box.sh build
 #   tools/box.sh <command...>
@@ -36,33 +36,31 @@ sync)
     echo "synced -> $host:$remote"
     ;;
 pull)
-    mkdir -p "$here/runs"
-    rsync -az -e "ssh ${ssh_opts[*]}" \
-        --include '*/' --include '*.html' --include 'plotly.min.js' --include 'log.json' \
-        --include 'ladder.json' --include 'config.json' --include 'NOTES.md' \
-        --include 'train.log' \
-        --exclude '*' "root@$host:$remote/runs/" "$here/runs/"
+    name=${2:?usage: pull <run>}
+    mkdir -p "$here/runs/$name"
+    rsync -az -e "ssh ${ssh_opts[*]}" --exclude '*.pt' \
+        "root@$host:$remote/runs/$name/" "$here/runs/$name/"
     python3 "$here/tools/runs_index.py"
-    echo "pulled reports into $here/runs"
+    echo "pulled $name"
     ;;
 build)
     run_remote "find engine/src engine/tests engine/examples -type f -exec touch {} +
 cd engine && maturin develop --release --features python,gpu 2>&1 | tail -2"
     ;;
 follow)
-    tag=${2:?usage: follow <tag>}
+    tag=${2:?usage: follow <tag> [run]}
     for _ in $(seq 1 40); do
         if run_remote "test -s /workspace/logs/$tag.pid"; then
             break
         fi
         sleep 0.5
     done
-    while "$0" pull >/dev/null \
-        && run_remote "kill -0 \$(cat /workspace/logs/$tag.pid) 2>/dev/null" >/dev/null 2>&1; do
+    while run_remote "kill -0 \$(cat /workspace/logs/$tag.pid) 2>/dev/null" >/dev/null 2>&1; do
+        [ -n "${3:-}" ] && "$0" pull "$3" >/dev/null
         run_remote "tail -1 /workspace/logs/$tag.log" | tail -1
         sleep "${WARCHEST_BOX_POLL:-60}"
     done
-    "$0" pull
+    [ -n "${3:-}" ] && "$0" pull "$3"
     if ! run_remote "grep -qx 0 /workspace/logs/$tag.exit"; then
         echo "JOB_DONE tag=$tag failed"
         run_remote "tail -20 /workspace/logs/$tag.log" | tail -20
@@ -72,6 +70,11 @@ follow)
     ;;
 go)
     shift
+    out=
+    for a in "$@"; do
+        case "$a" in out=*) out=${a#out=} ;; esac
+    done
+    [ -n "$out" ] || { echo "go needs out=<name>" >&2; exit 1; }
     "$0" sync
     "$0" build
     cmd=$(printf '%q ' python train/train.py "$@")
@@ -82,7 +85,7 @@ echo \$\$ > /workspace/logs/run.pid
 $cmd
 echo \$? > /workspace/logs/run.exit") >/workspace/logs/run.log 2>&1 &
 echo started run"
-    "$0" follow run
+    "$0" follow run "$out"
     ;;
 "")  sed -n '2,9p' "$0" ;;
 *)   run_remote "$*" ;;

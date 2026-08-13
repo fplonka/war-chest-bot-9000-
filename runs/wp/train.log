@@ -310,3 +310,39 @@
 [t=1655.7s] rebel stream solves=1592320 raw=1175/s balanced=1175/s debt=0 rows steps=6220 horizon=0.08 games=196 over=0 card=0 drop=0 L=0.00982 L/var=0.07 tgt=+0.023/0.368 cfg/b=34890 prep=0.22s gpu=0.00s conv=0.01s add=0.46s train=1.15s
 [t=1665.7s] rebel stream solves=1603584 raw=1175/s balanced=1175/s debt=0 rows steps=6264 horizon=0.04 games=200 over=0 card=0 drop=0 L=0.00983 L/var=0.07 tgt=+0.014/0.378 cfg/b=34664 prep=0.22s gpu=0.00s conv=0.01s add=0.45s train=1.23s
 [t=1675.7s] rebel stream solves=1614848 raw=1174/s balanced=1174/s debt=0 rows steps=6308 horizon=0.06 games=219 over=0 card=0 drop=0 L=0.00999 L/var=0.07 tgt=+0.015/0.387 cfg/b=34818 prep=0.20s gpu=0.00s conv=0.01s add=0.48s train=1.19s
+[t=1685.7s] rebel stream solves=1625088 raw=1173/s balanced=1173/s debt=0 rows steps=6348 horizon=0.08 games=208 over=0 card=0 drop=0 L=0.00964 L/var=0.07 tgt=+0.025/0.379 cfg/b=34734 prep=0.20s gpu=0.00s conv=0.01s add=0.44s train=1.10s
+[t=1695.9s] rebel stream solves=1637376 raw=1173/s balanced=1173/s debt=0 rows steps=6396 horizon=0.04 games=201 over=0 card=0 drop=0 L=0.01000 L/var=0.07 tgt=+0.019/0.377 cfg/b=34222 prep=0.22s gpu=0.00s conv=0.01s add=0.52s train=1.29s
+[t=1705.9s] rebel stream solves=1647616 raw=1172/s balanced=1172/s debt=0 rows steps=6436 horizon=0.03 games=179 over=0 card=0 drop=0 L=0.00988 L/var=0.07 tgt=+0.012/0.387 cfg/b=34390 prep=0.17s gpu=0.00s conv=0.01s add=0.45s train=1.06s
+[t=1715.9s] rebel stream solves=1658880 raw=1172/s balanced=1172/s debt=0 rows steps=6480 horizon=0.07 games=210 over=0 card=0 drop=0 L=0.00980 L/var=0.06 tgt=+0.020/0.397 cfg/b=34246 prep=0.21s gpu=0.00s conv=0.01s add=0.43s train=1.18s
+[t=1726.0s] rebel stream solves=1669120 raw=1171/s balanced=1171/s debt=0 rows steps=6520 horizon=0.05 games=201 over=0 card=0 drop=0 L=0.00963 L/var=0.06 tgt=+0.022/0.392 cfg/b=34291 prep=0.18s gpu=0.00s conv=0.01s add=0.42s train=1.09s
+[t=1736.0s] rebel stream solves=1680384 raw=1171/s balanced=1171/s debt=0 rows steps=6564 horizon=0.05 games=223 over=0 card=0 drop=0 L=0.01034 L/var=0.07 tgt=+0.005/0.391 cfg/b=34289 prep=0.18s gpu=0.00s conv=0.01s add=0.46s train=1.17s
+[t=1740.5s] --- snapshot snap_04.pt (s4) ---
+[t=1746.0s] rebel stream solves=1691648 raw=1170/s balanced=1170/s debt=0 rows steps=6608 horizon=0.07 games=210 over=0 card=0 drop=0 L=0.01029 L/var=0.07 tgt=+0.009/0.394 cfg/b=34543 prep=0.20s gpu=0.00s conv=0.01s add=0.51s train=1.22s
+[t=1756.0s] rebel stream solves=1701888 raw=1169/s balanced=1169/s debt=0 rows steps=6648 horizon=0.08 games=210 over=0 card=0 drop=0 L=0.01055 L/var=0.07 tgt=+0.009/0.400 cfg/b=34002 prep=0.20s gpu=0.00s conv=0.01s add=0.45s train=1.11s
+[t=1766.0s] rebel stream solves=1712128 raw=1168/s balanced=1168/s debt=0 rows steps=6688 horizon=0.03 games=202 over=0 card=0 drop=0 L=0.01071 L/var=0.07 tgt=+0.017/0.392 cfg/b=33840 prep=0.27s gpu=0.00s conv=0.01s add=0.45s train=1.23s
+[t=1776.1s] rebel stream solves=1722368 raw=1167/s balanced=1167/s debt=0 rows steps=6728 horizon=0.08 games=181 over=0 card=0 drop=0 L=0.01032 L/var=0.07 tgt=+0.015/0.396 cfg/b=34330 prep=0.19s gpu=0.00s conv=0.01s add=0.47s train=1.12s
+[t=1780.0s] --- stopping GPU admission; draining ---
+[t=1786.1s] rebel stream solves=1728512 raw=1163/s balanced=1163/s debt=0 rows steps=6752 horizon=0.06 games=141 over=0 card=0 drop=0 L=0.00954 L/var=0.06 tgt=+0.012/0.394 cfg/b=33896 prep=0.11s gpu=0.00s conv=0.01s add=0.26s train=0.69s
+[t=1792.5s] rebel stream solves=1728965 raw=1159/s balanced=1159/s debt=788 rows steps=6753 horizon=0.00 games=3 over=0 card=0 drop=0 L=0.00940 L/var=0.06 tgt=+0.025/0.391 cfg/b=35284 prep=0.00s gpu=0.00s conv=0.00s add=0.03s train=0.03s
+[gpu-summary] solves=1728965 optimizer_rows=6915072 debt=788 raw=1152.9/s balanced=1152.8/s horizon=0.06 games=28289 over=0 card=0 exact=0 censored=4608 dropped=0 overrun=0.00s
+[ladder] 6 players, 200 games (20/batch, cap 40/pair)
+  seed                    greedy vs wp.init                  W 13 L  1 D  6  n= 20  score 0.800  stop
+  seed                   wp.init vs wp.s1                    W  3 L 15 D  2  n= 20  score 0.200
+  seed                     wp.s1 vs wp.s2                    W  5 L 13 D  2  n= 20  score 0.300
+  seed                     wp.s2 vs wp.s3                    W  5 L 15 D  0  n= 20  score 0.250
+  seed                     wp.s3 vs wp.final                 W  3 L 15 D  2  n= 20  score 0.200
+  swiss                   greedy vs wp.s1                    W  2 L 14 D  4  n= 20  score 0.200
+  swiss                    wp.s1 vs wp.s2                    W  3 L 16 D  1  n= 40  score 0.237
+  swiss                   greedy vs wp.s1                    W  3 L 14 D  3  n= 40  score 0.212
+  swiss                    wp.s2 vs wp.s3                    W  6 L 13 D  1  n= 40  score 0.287
+  swiss                    wp.s3 vs wp.final                 W  6 L 13 D  1  n= 40  score 0.263
+
+=== Elo (runs/wp, greedy = 0) ===
+                      player   trained     elo   95%   score
+                    wp.final   29.0min     704   122   0.738
+                       wp.s3   23.0min     530    85   0.487
+                       wp.s2   17.0min     376    86   0.525
+                       wp.s1   11.0min     180    82   0.570
+                      greedy         -       0    99   0.408
+                     wp.init    5.0min    -149   134   0.200
+[report] runs/wp/report.html

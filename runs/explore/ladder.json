@@ -1,0 +1,150 @@
+{
+ "runs": [
+  "runs/explore"
+ ],
+ "games": 40,
+ "schedule_seed": 7,
+ "draft_mode": "random",
+ "players": [
+  {
+   "name": "greedy",
+   "run": null,
+   "t": null,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 0.0,
+   "se": 59.0,
+   "score": 0.688
+  },
+  {
+   "name": "explore.init",
+   "run": "runs/explore",
+   "t": 301.7,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": -133.3,
+   "se": 51.4,
+   "score": 0.258
+  },
+  {
+   "name": "explore.s1",
+   "run": "runs/explore",
+   "t": 661.9,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 146.3,
+   "se": 50.0,
+   "score": 0.525
+  },
+  {
+   "name": "explore.s2",
+   "run": "runs/explore",
+   "t": 1022.0,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 241.9,
+   "se": 36.1,
+   "score": 0.48
+  },
+  {
+   "name": "explore.s3",
+   "run": "runs/explore",
+   "t": 1382.0,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 291.7,
+   "se": 40.0,
+   "score": 0.456
+  },
+  {
+   "name": "explore.final",
+   "run": "runs/explore",
+   "t": 1742.0,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 404.3,
+   "se": 48.1,
+   "score": 0.683
+  }
+ ],
+ "pairs": [
+  {
+   "a": "greedy",
+   "b": "explore.init",
+   "w": 19,
+   "l": 4,
+   "d": 17,
+   "n": 40,
+   "score": 0.688
+  },
+  {
+   "a": "explore.init",
+   "b": "explore.s1",
+   "w": 2,
+   "l": 16,
+   "d": 2,
+   "n": 20,
+   "score": 0.15
+  },
+  {
+   "a": "explore.s1",
+   "b": "explore.s2",
+   "w": 12,
+   "l": 23,
+   "d": 5,
+   "n": 40,
+   "score": 0.362
+  },
+  {
+   "a": "explore.s2",
+   "b": "explore.s3",
+   "w": 17,
+   "l": 18,
+   "d": 5,
+   "n": 40,
+   "score": 0.487
+  },
+  {
+   "a": "explore.s2",
+   "b": "explore.final",
+   "w": 2,
+   "l": 16,
+   "d": 2,
+   "n": 20,
+   "score": 0.15
+  },
+  {
+   "a": "explore.s3",
+   "b": "explore.final",
+   "w": 13,
+   "l": 21,
+   "d": 6,
+   "n": 40,
+   "score": 0.4
+  }
+ ]
+}

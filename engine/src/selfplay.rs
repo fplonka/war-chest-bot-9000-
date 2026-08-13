@@ -520,8 +520,8 @@ impl Data {
 pub struct GameCfg {
     pub agents: [Agent; 2],
     pub collect: Collect,
-    /// Probability that a uniformly sampled player plays a uniformly random
-    /// action (ReBeL's `random_action_prob`), redrawn each decision.
+    /// Probability the walk's explorer plays uniform. Without a walk, a new
+    /// explorer is drawn each decision.
     pub explore: f32,
     /// Randomise the draft instead of using the fixed starter matchup.
     pub random_draft: bool,
@@ -556,6 +556,8 @@ enum WalkState<'a> {
 struct Walk<'a> {
     tree: WalkState<'a>,
     slot: usize,
+    /// Fixed for the walk: this player may play uniform, the other does not.
+    explorer: u8,
     node: usize,
     /// Draws taken so far inside the current collapsed chance node.
     drawn: u8,
@@ -1014,6 +1016,7 @@ impl<'a> Game<'a> {
                             *walk = Some(Walk {
                                 tree: WalkState::Cpu(sv),
                                 slot,
+                                explorer: sample_explorer(rng, gc.explore),
                                 node: 0,
                                 drawn: 0,
                                 strat: Vec::new(),
@@ -1067,13 +1070,15 @@ impl<'a> Game<'a> {
 
             let true_row = np.row(true_ci);
             let mut chosen_cell = true_row.start + sample_row(rng, &np.probs[true_row.clone()]);
+            // One explorer per walk. No walk: this decision is its own walk.
+            let explorer = walk.as_ref().map(|w| w.explorer)
+                .unwrap_or_else(|| sample_explorer(rng, gc.explore));
             if gc.explore > 0.0
-                && player as u64 == (rng.next_u64() & 1)
+                && player == explorer
                 && rng.unit_f64() < gc.explore as f64
+                && !true_row.is_empty()
             {
-                if !true_row.is_empty() {
-                    chosen_cell = true_row.start + rng.below(true_row.len());
-                }
+                chosen_cell = true_row.start + rng.below(true_row.len());
             }
             let chosen = np.legal_action[chosen_cell] as usize;
 
@@ -1165,6 +1170,7 @@ impl<'a> Game<'a> {
         self.walk = Some(Walk {
             tree: WalkState::Gpu(tree),
             slot,
+            explorer: sample_explorer(&mut self.rng, self.gc.explore),
             node: 0,
             drawn: 0,
             strat: result.strategy,
@@ -1230,6 +1236,7 @@ impl<'a> Game<'a> {
         self.walk = Some(Walk {
             tree: WalkState::Cpu(sv),
             slot,
+            explorer: sample_explorer(&mut self.rng, self.gc.explore),
             node: 0,
             drawn: 0,
             strat: Vec::new(),
@@ -1439,6 +1446,14 @@ fn sample_row(rng: &mut Rng, row: &[f32]) -> usize {
         rng.weighted_index(&w)
     } else {
         rng.below(row.len().max(1))
+    }
+}
+
+fn sample_explorer(rng: &mut Rng, explore: f32) -> u8 {
+    if explore > 0.0 {
+        (rng.next_u64() & 1) as u8
+    } else {
+        0
     }
 }
 
