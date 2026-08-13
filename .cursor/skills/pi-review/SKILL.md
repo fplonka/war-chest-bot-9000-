@@ -1,12 +1,12 @@
 ---
 name: pi-review
-description: Runs a read-only adversarial code review through `pi` (DeepSeek v4 flash) in a background terminal. Use when the user asks for a pi review, an adversarial review, or names this skill.
+description: Runs a read-only adversarial code review through `pi` (DeepSeek v4 flash) in a background terminal. Use when the user asks for a pi review, an adversarial review, or names this skill. Also use after landing a commit or starting a training run.
 disable-model-invocation: true
 ---
 
 # Pi review
 
-Launch DeepSeek v4 flash via `pi` in a background terminal. Do not use Cursor subagents for this.
+Launch DeepSeek v4 flash via `pi` in a **background** terminal. Do not use Cursor subagents for this.
 
 The reviewer has no shell. Dump the diffs and files yourself (`git show`, `git diff`) into a temp dir, write a short prompt that names those paths, and attach both with `@`.
 
@@ -16,6 +16,13 @@ pi -p --provider deepseek --model deepseek-v4-flash --thinking high \
   --name adversarial-review \
   @<prompt> @<diff...>
 ```
+
+**Wake this agent when it finishes.** Set `block_until_ms: 0` and `notify_on_output`:
+
+- `pattern`: `## Judgment`
+- `reason`: pi review finished
+
+The same rule applies to `tools/box.sh go` / `follow`: `block_until_ms: 0` and `notify_on_output` on `^JOB_DONE`. Do not start a long job and end the turn without that notify. Ending the turn is what delivers the wake; polling is not required if notify is set.
 
 Do not pass `bash`, `edit`, or `write`. If a review is already running, kill it before starting another.
 

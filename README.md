@@ -20,7 +20,7 @@ play.sh          one-liner: build the extension, serve the UI, open the browser
 train/           train.py    PyTorch training loop, snapshots on a timer
   value_net.py   the value network itself, shared by every tool that loads one
   ladder.py      round robin over a run's snapshots, plus Greedy and Random -> Elo
-  plot.py        the four panels a run is read from
+  report.py      the panels a run is read from
   offline.py     fit architectures to a frozen replay dump (noise-free A/B)
   diagnose.py    model-free check on how learnable a dump's targets are
   dump.py        reading a dumped replay buffer

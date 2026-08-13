@@ -91,12 +91,11 @@ def main():
     te = dmp.rows(split, len(dmp))
     rng = np.random.default_rng(0)
     b = make_batch(tr, rng, dev, augment=True)
-    xpub, unit_ids, phi, inv, w, seg, y, nseg, ay = b
+    xpub, unit_ids, phi, inv, w, seg, y, nseg = b
     assert xpub.shape == (len(tr[0]), PUBFEAT), xpub.shape
     assert unit_ids.shape == (len(tr[0]), warchest.NTYPE)
     assert phi.shape[1] == CFEAT
     assert seg.max() == 2 * len(tr[0]) - 1
-    assert ay.shape == (len(tr[0]), warchest.AUX)
     assert torch.isfinite(xpub).all() and torch.isfinite(y).all()
     print(f"      batch {xpub.shape} unit_ids {unit_ids.shape} phi {phi.shape}", flush=True)
 
@@ -105,7 +104,7 @@ def main():
     losses = []
     for _ in range(10):
         parts = make_batch(tr, rng, dev, augment=True)
-        loss = value_loss(net, *parts[:-1])
+        loss = value_loss(net, *parts)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()

@@ -271,7 +271,7 @@ board three rounds later, whether initiative changes hands next round, and the
 result as three classes. Backfilled from a per-round timeline the game records as
 it runs. They are dense — every row gets a different answer, unlike the single
 value number — and they are never in `flat()`, so the Rust play path never sees
-them and they cost nothing at inference. `--aux`, default 0 until gated.
+them and they cost nothing at inference. The trainer does not train them.
 
 ### Warm start
 
@@ -352,9 +352,8 @@ the end of this phase is snapshot 0, labelled `init`.
 **Phase 2 — ReBeL.** Self-play with a CFR solve at every decision. Default
 `--iters 64`, `--depth 2`.
 
-**The policy head** (`--policy`, default 0 — it trains the shared trunk, so it
-changes the value network and has to be gated as its own change) is trained on
-the fresh epoch only, never from the replay buffer. A value target is bootstrapped and gains from
+**The policy head** is not trained. The weights exist so a later gate can turn
+them on without a shape change. A value target is bootstrapped and gains from
 being averaged over a long history; a strategy is not, and the epoch regenerates
 every one of them. Its label attaches to the solve's **live-belief row** — the
 rows of one solve share a public state and differ only in belief, while the
@@ -430,5 +429,5 @@ engine/src/py.rs        pyo3: set_weights / gen_data / eval_match
 train/value_net.py      the networks, shared by everything that loads one
 train/train.py          PyTorch training loop, snapshots on a timer
 train/ladder.py         round robin over snapshots -> Elo
-train/plot.py           the four panels a run is read from
+train/report.py         the panels a run is read from
 ```

@@ -52,7 +52,7 @@ import warchest
 import config
 import mirror
 from export_weights import load as load_checkpoint
-from value_net import Mlp, AUX
+from value_net import Mlp
 
 PUBFEAT = warchest.PUBFEAT
 CFEAT = warchest.CFEAT
@@ -61,7 +61,6 @@ CNORM = warchest.CNORM
 NTYPE = warchest.NTYPE
 ROW_BYTES = warchest.ROW_BYTES
 ROW_IDS = warchest.ROW_IDS
-ROW_AUX = warchest.ROW_AUX
 
 
 def public_sizes(cc, cp, seg, n):
@@ -270,7 +269,6 @@ def make_batch(parts, rng, device, augment):
         bag[which] = bag[which][:, ::-1]
     x = expand_batch(rows, hand, fd, bag)
     unit_ids = rows[:, ROW_IDS:ROW_IDS + NTYPE]
-    ay = rows[:, ROW_AUX:ROW_AUX + 2 * AUX].view(np.float16).reshape(-1, AUX).astype(np.float32)
     # Every config gets its own holding-tower row, duplicates included.
     #
     # This used to deduplicate: the key was the row's unit ids (post-mirror),
@@ -287,7 +285,7 @@ def make_batch(parts, rng, device, augment):
     inv = np.arange(len(cc), dtype=np.int64)
     t = lambda a, d=torch.float32: torch.as_tensor(a, dtype=d, device=device)
     return (t(x), t(unit_ids, torch.long), t(phi), t(inv, torch.long), t(cw),
-            t(seg, torch.long), t(cy), 2 * len(rows), t(ay))
+            t(seg, torch.long), t(cy), 2 * len(rows))
 
 
 def value_loss(net, xpub, unit_ids, phi, inv, w, seg, y, nseg):
@@ -325,7 +323,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
             b1 = torch.cuda.Event(enable_timing=True)
             f0.record(stream)
         ts = time.perf_counter()
-        loss = value_loss(net, *parts[:-1])
+        loss = value_loss(net, *parts)
         tot += loss.detach().item()
         stat["forward_wall_s"] += time.perf_counter() - ts
         if stream is not None:
@@ -606,11 +604,11 @@ def main():
                 if len(buf) >= args.batch:
                     old_parts = batcher(
                         buf.sample_old(args.batch, rng, args.recent_frac), rng, dev, False)
-                    loss_old = float(value_loss(value, *old_parts[:-1]))
+                    loss_old = float(value_loss(value, *old_parts))
                     new_parts = batcher(
                         buf.sample(args.batch, rng, recent_mix=1.0,
                                    recent_frac=args.recent_frac), rng, dev, False)
-                    loss_new = float(value_loss(value, *new_parts[:-1]))
+                    loss_new = float(value_loss(value, *new_parts))
                 else:
                     loss_old = loss_new = float("nan")
             tn = max(window["target_n"], 1)
@@ -860,11 +858,11 @@ def main():
             if len(buf) >= args.batch:
                 old_parts = batcher(
                     buf.sample_old(args.batch, rng, args.recent_frac), rng, dev, False)
-                loss_old = float(value_loss(value, *old_parts[:-1]))
+                loss_old = float(value_loss(value, *old_parts))
                 new_parts = batcher(
                     buf.sample(args.batch, rng, recent_mix=1.0,
                                recent_frac=args.recent_frac), rng, dev, False)
-                loss_new = float(value_loss(value, *new_parts[:-1]))
+                loss_new = float(value_loss(value, *new_parts))
             else:
                 loss_old = loss_new = float("nan")
         dec = max(d["decisions"], 1)

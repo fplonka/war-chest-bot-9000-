@@ -197,10 +197,8 @@ def make_batch(parts, rng, device, augment):
 
     unit_ids = rows_t[:, warchest.ROW_IDS:warchest.ROW_IDS + warchest.NTYPE].long()
     inv = torch.arange(nc, dtype=torch.long, device=device)
-    aux = rows[:, warchest.ROW_AUX:warchest.ROW_AUX + 2 * warchest.AUX]
-    aux = aux.copy().view(np.float16).reshape(n, warchest.AUX).astype(np.float32)
     return (x, unit_ids, phi, inv, t(cw, torch.float32),
-            t(seg, torch.long), t(cy, torch.float32), 2 * n, t(aux, torch.float32))
+            t(seg, torch.long), t(cy, torch.float32), 2 * n)
 
 
 def warmup(device):

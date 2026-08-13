@@ -50,6 +50,12 @@ cd engine && maturin develop --release --features python,gpu 2>&1 | tail -2"
     ;;
 follow)
     tag=${2:?usage: follow <tag>}
+    for _ in $(seq 1 40); do
+        if run_remote "test -s /workspace/logs/$tag.pid"; then
+            break
+        fi
+        sleep 0.5
+    done
     while "$0" pull >/dev/null \
         && run_remote "kill -0 \$(cat /workspace/logs/$tag.pid) 2>/dev/null" >/dev/null 2>&1; do
         run_remote "tail -1 /workspace/logs/$tag.log" | tail -1
@@ -57,10 +63,11 @@ follow)
     done
     "$0" pull
     if ! run_remote "grep -qx 0 /workspace/logs/$tag.exit"; then
-        echo "job $tag failed; tail /workspace/logs/$tag.log"
+        echo "JOB_DONE tag=$tag failed"
         run_remote "tail -20 /workspace/logs/$tag.log" | tail -20
         exit 1
     fi
+    echo "JOB_DONE tag=$tag ok"
     ;;
 go)
     shift
@@ -68,6 +75,7 @@ go)
     "$0" build
     cmd=$(printf '%q ' python train/train.py "$@")
     run_remote "mkdir -p /workspace/logs
+rm -f /workspace/logs/run.pid /workspace/logs/run.exit
 nohup setsid bash -lc $(printf '%q' "$prelude
 echo \$\$ > /workspace/logs/run.pid
 $cmd
@@ -75,6 +83,6 @@ echo \$? > /workspace/logs/run.exit") >/workspace/logs/run.log 2>&1 &
 echo started run"
     "$0" follow run
     ;;
-"")  sed -n '2,10p' "$0" ;;
+"")  sed -n '2,9p' "$0" ;;
 *)   run_remote "$*" ;;
 esac
