@@ -2,6 +2,13 @@
 
     python train/ladder.py runs/mine --games 40
     python train/ladder.py runs/a runs/b --games 40
+    python train/ladder.py runs/a runs/b --finals --games 200 --gpu
+
+Elo does not carry between runs: Greedy loses to every trained net and so
+anchors almost nothing, and each run's ladder is over its own snapshots.
+`--finals` keeps each run's final checkpoint and Greedy, so it plays the
+finals against each other and each against Greedy — which is how one run is
+compared with another, and how "does it still beat Greedy" is answered.
 
 A game against a much weaker opponent is almost no information (Fisher
 p(1-p) peaks at a coin flip). Consecutive snapshots start close, so they
@@ -89,7 +96,7 @@ def players_of(runs):
 def chain(ps):
     """Greedy vs each run's first snapshot, then consecutive snapshots, then
     finals across runs. The prior that nearby-in-time nets are close."""
-    greedy = next(i for i, p in enumerate(ps) if p["agent"] == "greedy")
+    greedy = next((i for i, p in enumerate(ps) if p["agent"] == "greedy"), None)
     by_run = {}
     for i, p in enumerate(ps):
         if p["run"] is not None:
@@ -97,7 +104,8 @@ def chain(ps):
     out = []
     for idxs in by_run.values():
         idxs.sort(key=lambda i: ps[i]["t"] or 0)
-        out.append((greedy, idxs[0]))
+        if greedy is not None:
+            out.append((greedy, idxs[0]))
         out.extend(zip(idxs, idxs[1:]))
     finals = [i for i, p in enumerate(ps) if p.get("final")]
     out.extend((finals[a], finals[b])
@@ -119,11 +127,15 @@ def frozen(w, l, d):
     return min(s, 1.0 - s) < 0.20
 
 
-def run(runs, games=40, gpu=False, seed=7):
+def run(runs, games=40, gpu=False, seed=7, finals=False):
     out = runs[0]
     if games < 2 or games % 2:
         raise ValueError("games must be a positive even count")
     ps = players_of(runs)
+    if finals:
+        ps = [p for p in ps if p["final"] or p["agent"] == "greedy"]
+        for i, p in enumerate(ps):
+            p["slot"] = i
     nets = [p for p in ps if p["agent"] == "rebel"]
     if not nets:
         raise SystemExit(f"{runs}: no snapshots in log.json")
@@ -230,7 +242,7 @@ def run(runs, games=40, gpu=False, seed=7):
                         "score": round(float(sc[i].sum() / max(nmat[i].sum(), 1)), 3)}
                        for i, (p, e, s) in enumerate(zip(ps, elo, se))],
            "pairs": pairs}
-    write_json(f"{out}/ladder.json", res)
+    write_json(f"{out}/ladder{'_finals' if finals else ''}.json", res)
     print(f"\n=== Elo ({out}, greedy = 0) ===", flush=True)
     print(f"{'player':>28s} {'trained':>9s} {'elo':>7s} {'95%':>5s} {'score':>7s}",
           flush=True)
@@ -247,8 +259,10 @@ def main():
     ap.add_argument("runs", nargs="+")
     ap.add_argument("--games", type=int, default=40)
     ap.add_argument("--gpu", action="store_true")
+    ap.add_argument("--finals", action="store_true",
+                    help="only each run's final checkpoint, against each other")
     args = ap.parse_args()
-    run(args.runs, games=args.games, gpu=args.gpu)
+    run(args.runs, games=args.games, gpu=args.gpu, finals=args.finals)
 
 
 if __name__ == "__main__":

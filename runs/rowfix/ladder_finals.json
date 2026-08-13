@@ -1,0 +1,82 @@
+{
+ "runs": [
+  "runs/rowfix",
+  "runs/adam"
+ ],
+ "games": 200,
+ "schedule_seed": 7,
+ "draft_mode": "random",
+ "players": [
+  {
+   "name": "greedy",
+   "run": null,
+   "t": null,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 0.0,
+   "se": 180.2,
+   "score": 0.0
+  },
+  {
+   "name": "rowfix.final",
+   "run": "runs/rowfix",
+   "t": 1860.8,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 638.4,
+   "se": 24.5,
+   "score": 0.527
+  },
+  {
+   "name": "adam.final",
+   "run": "runs/adam",
+   "t": 1741.7,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 652.1,
+   "se": 24.5,
+   "score": 0.564
+  }
+ ],
+ "pairs": [
+  {
+   "a": "greedy",
+   "b": "rowfix.final",
+   "w": 0,
+   "l": 20,
+   "d": 0,
+   "n": 20,
+   "score": 0.0
+  },
+  {
+   "a": "greedy",
+   "b": "adam.final",
+   "w": 0,
+   "l": 20,
+   "d": 0,
+   "n": 20,
+   "score": 0.0
+  },
+  {
+   "a": "rowfix.final",
+   "b": "adam.final",
+   "w": 87,
+   "l": 95,
+   "d": 18,
+   "n": 200,
+   "score": 0.48
+  }
+ ]
+}
