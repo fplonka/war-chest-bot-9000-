@@ -930,11 +930,21 @@ impl<'a> Game<'a> {
                     }
                     // A pathological root falls back to a uniform policy; the
                     // policy is produced outside the walk bookkeeping below.
-                    // Its public micro-continuations must finish under the
-                    // same fallback before a new subgame starts: the value
-                    // encoding is frozen at normal coin-play boundaries.
+                    //
+                    // A row's encoding is frozen at normal coin-play states, so
+                    // a *collecting* run cannot root a subgame at a micro
+                    // continuation: it finishes the coin play under the same
+                    // fallback and starts the next subgame at the boundary. A
+                    // run that collects nothing has no such constraint, and must
+                    // search every decision -- evaluation drops the walk at each
+                    // seat change (it belongs to the other checkpoint), so this
+                    // is where a defender's Royal Guard soak is decided, and a
+                    // checkpoint must never answer that with a coin flip.
                     let mut fallback: Option<NodePolicy> = None;
-                    if walk.is_none() && !matches!(s.pending(), Cont::MainPlay) {
+                    if walk.is_none()
+                        && gc.collect == Collect::Rebel
+                        && !matches!(s.pending(), Cont::MainPlay)
+                    {
                         carried.clear();
                         fallback = Some(random_policy(s, ctx, player, &cfgs));
                     }
@@ -1105,12 +1115,19 @@ impl<'a> Game<'a> {
                 data.push_value(s, ctx, bel, [&a, &b]);
             }
 
+            // One explorer per sampled subgame walk, so the leaf it lands on is
+            // reachable by *one* player's deviation -- which is the question a
+            // solve asks, and the distribution the value network is queried on.
+            // An agent with no walk decides a node at a time, so each of its
+            // decisions is its own walk and draws its own explorer.
             let epsilon = gc.explore.clamp(0.0, 1.0);
-            let explorer = walk.as_ref().map(|w| w.explorer);
-            // A ReBeL walk fixes one explorer for the entire sampled leaf.
+            let explorer = match walk.as_ref() {
+                Some(w) => w.explorer,
+                None => sample_explorer(rng, gc.explore),
+            };
             let true_row = np.row(true_ci);
             let uniform_override =
-                explorer == Some(player) && epsilon > 0.0 && rng.unit_f64() < epsilon as f64;
+                explorer == player && epsilon > 0.0 && rng.unit_f64() < epsilon as f64;
             let chosen_cell = true_row.start
                 + if uniform_override {
                     rng.below(true_row.len())
@@ -1118,11 +1135,22 @@ impl<'a> Game<'a> {
                     sample_row(rng, &np.probs[true_row.clone()])
                 };
             let chosen = np.legal_action[chosen_cell] as usize;
-            let pending_before = *s.pending();
 
-            // ReBeL attaches the reference-policy PBS to an off-policy sampled
-            // branch. For ordinary agents, `np` is already their full behaviour
-            // policy, so this is their ordinary Bayesian posterior too.
+            // The belief is propagated under the *reference* policy even when
+            // the action was the explorer's uniform draw: an exploratory move
+            // picks the public branch, and the PBS attached to that branch is
+            // the one the reference strategy defines. That is the object the
+            // value network is trained on. For ordinary agents `np` is already
+            // their full behaviour policy, so this is their ordinary posterior.
+            //
+            // The true private world is left exactly where it is. It is the
+            // game's bookkeeping, not a training target, and re-drawing it from
+            // the belief here -- which reads as the symmetric thing to do -- is
+            // not: War Chest coins are a resource that a real game spends, so
+            // swapping which coins are in hand mid-game means no plan survives
+            // to pay off, no side converts, and games run to the horizon. The
+            // reference implementation re-draws a hand at every node because
+            // liar's dice self-play never deals one; there is nothing to break.
             let obs = obs_key(&np.acts[chosen]);
             let mut pairs: Vec<(Config, f32)> = Vec::with_capacity(cfgs.len());
             for (ci, c) in cfgs.iter().enumerate() {
@@ -1138,6 +1166,18 @@ impl<'a> Game<'a> {
             }
             bel[player as usize] = Belief::from_pairs(pairs);
             s.apply_inplace(np.acts[chosen]);
+            // The private world moves by the player's own action and by nothing
+            // else -- the same transition every config in the belief just took.
+            // Being *somewhere* in the support is not enough: a world re-drawn
+            // from the belief passes that test and still teleports coins between
+            // hand, bag and discard, which is a resource the real game spends.
+            assert_eq!(
+                advance_config(&truth, np.aslot[chosen], np.fdown[chosen]),
+                Some(true_config(s, player, ctx)),
+                "the private world moved by something other than the action: \
+                 player={player} action={:?}",
+                np.acts[chosen],
+            );
             for p in 0..2 {
                 assert_belief_matches_state(
                     s,
@@ -1148,22 +1188,6 @@ impl<'a> Game<'a> {
                     Some(np.acts[chosen]),
                 );
             }
-            if uniform_override {
-                // Exploration picked only the public branch. Continue from a
-                // private world drawn from the reference-policy PBS attached
-                // to that branch, as ReBeL's public-belief sampler requires.
-                let b = &bel[player as usize];
-                let c = b.cfg[sample_row(rng, &b.p)];
-                set_config(s, player, ctx, &c);
-                assert_eq!(
-                    true_config(s, player, ctx),
-                    c,
-                    "failed to instantiate the sampled reference config: player={player} before={pending_before:?} action={:?} after={:?}",
-                    np.acts[chosen],
-                    s.pending(),
-                );
-            }
-
             // Advance the walk along the solved tree. The public observation
             // of the chosen action selects the child; if that child is a leaf
             // (depth exhausted, terminal, or a draw), the walk ends and the

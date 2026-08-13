@@ -139,6 +139,10 @@ BASELINE = Cfg()
 # comparing an arm against a *previous* run's baseline compares two runs that
 # differ in the code as well as the config.
 EXPERIMENTS = {
+    # Not a measurement. One short arm that crosses every seam a code change can
+    # break -- warm phase, the handover, ReBeL, snapshots, the ladder -- so a
+    # change is exercised on the box before an hour of it is spent.
+    "smoke":    [{"minutes": 6, "warm_minutes": 2}],
     "baseline": [{}],
     "dcfr":     [{}, {"cfr": "dcfr"}],
     "aux":      [{}, {"aux": 0.3}],

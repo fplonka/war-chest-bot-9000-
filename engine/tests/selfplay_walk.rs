@@ -17,8 +17,8 @@ fn cfg() -> Cfg {
 }
 
 /// Exercise the actor-side GPU walk without a CUDA device. The packed solve is
-/// completed with a uniform reference strategy; `resume` must retain the
-/// walk's explorer and the same hidden-state resampling used by the CPU path.
+/// completed with a uniform reference strategy; `resume` must retain the walk's
+/// explorer, so the GPU path samples the same way the CPU path does.
 #[test]
 fn gpu_walk_uses_the_reference_sampler() {
     let nets = [warchest::search::Nets::default()];
