@@ -709,7 +709,8 @@ def main():
                 f"horizon={rec['horizon_frac']:.2f} games={rec['games']} "
                 f"over={totals['oversize_routes']} card={totals['card_exclusive_routes']} "
                 f"drop={totals['dropped']} "
-                f"L={lv:.5f} tgt={tgt_mean:+.3f}/{tgt_var ** 0.5:.3f} "
+                f"L={lv:.5f} L/σ={lv / max(tgt_var ** 0.5, 1e-9):.2f} "
+                f"tgt={tgt_mean:+.3f}/{tgt_var ** 0.5:.3f} "
                 f"cfg/b={rec['batch_configs']:.0f} prep={window['prepare_s']:.2f}s "
                 f"gpu={window['gpu_forward_s'] + window['gpu_backward_s']:.2f}s "
                 f"conv={window['conv_s']:.2f}s add={window['add_s']:.2f}s "
@@ -927,7 +928,8 @@ def main():
         write_log(args, log, snaps)
         print(f"[t={rec['t']:6.1f}s] greedy ep{epoch:3d} games={rec['games']:4d} "
               f"dec={dec:6d} rows={len(rows):6d} horizon={rec['horizon_frac']:.2f} "
-              f"L={lv:.5f} tgt={tgt_mean:+.3f}/{tgt_std:.3f} pstd={probe_std:.3f} "
+              f"L={lv:.5f} L/σ={lv / max(tgt_std, 1e-9):.2f} "
+              f"tgt={tgt_mean:+.3f}/{tgt_std:.3f} pstd={probe_std:.3f} "
               f"gen={gen_s:.1f}s train={train_s:.1f}s",
               flush=True)
         epoch += 1
