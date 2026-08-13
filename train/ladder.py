@@ -94,8 +94,16 @@ def players_of(runs):
 
 
 def chain(ps):
-    """Greedy vs each run's first snapshot, then consecutive snapshots, then
-    finals across runs. The prior that nearby-in-time nets are close."""
+    """Greedy against both ends of each run, then consecutive snapshots, then
+    finals across runs. The prior that nearby-in-time nets are close.
+
+    Greedy is the anchor every rating is quoted against, and Swiss will never
+    choose it again once a run has pulled away from it — a lopsided pair is
+    almost no information about the *difference*, which is what Swiss is for.
+    But the number that gets read is the final's rating against the anchor, and
+    that error accumulates along the chain of comparisons between them. One
+    direct link at each end costs a batch and shortens the chain to nothing.
+    A pair that goes 20-0 stops there; `frozen` sees to it."""
     greedy = next((i for i, p in enumerate(ps) if p["agent"] == "greedy"), None)
     by_run = {}
     for i, p in enumerate(ps):
@@ -106,6 +114,7 @@ def chain(ps):
         idxs.sort(key=lambda i: ps[i]["t"] or 0)
         if greedy is not None:
             out.append((greedy, idxs[0]))
+            out.append((greedy, idxs[-1]))
         out.extend(zip(idxs, idxs[1:]))
     finals = [i for i, p in enumerate(ps) if p.get("final")]
     out.extend((finals[a], finals[b])

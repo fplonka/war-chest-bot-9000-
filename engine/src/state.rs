@@ -557,6 +557,52 @@ impl State {
     pub fn pending(&self) -> &Cont {
         &self.pending
     }
+
+    /// The same position rotated 180 degrees with the two seats exchanged.
+    ///
+    /// The rotation `(x, y) -> (6 - x, 6 - y)` maps white's two starting
+    /// locations onto black's and permutes the six neutral ones, so this is an
+    /// exact symmetry of War Chest: the result is a legal position whose value
+    /// is the original's with the players' roles exchanged. It is the ground
+    /// truth for the training augmentation, which permutes packed row bytes
+    /// instead (`train/mirror.py`).
+    ///
+    /// Only defined at a normal coin play: the continuation stack names players
+    /// and would have to be rewritten, and no training row is taken anywhere
+    /// else.
+    pub fn mirror(&self) -> State {
+        assert!(
+            matches!(self.pending, Cont::MainPlay) && self.conts.is_empty(),
+            "the mirror is defined at a normal coin play"
+        );
+        let flip = |p: u8| if p == NONE { NONE } else { 1 - p };
+        let mut m = self.clone();
+        for h in 0..N_HEXES {
+            let k = mirror_hex(h);
+            m.hex_type[k] = self.hex_type[h];
+            m.hex_height[k] = self.hex_height[h];
+            m.hex_owner[k] = flip(self.hex_owner[h]);
+            m.loc_marker[k] = flip(self.loc_marker[h]);
+        }
+        m.zones.swap(0, 1);
+        m.markers_hand.swap(0, 1);
+        m.turns_taken.swap(0, 1);
+        m.initiative = flip(self.initiative);
+        m.first_player = flip(self.first_player);
+        m.active = flip(self.active);
+        m.winner = flip(self.winner);
+        m
+    }
+}
+
+/// The hex the 180-degree rotation sends `h` to. `py::hex_mirror` hands the
+/// same permutation to the training augmentation.
+pub fn mirror_hex(h: usize) -> usize {
+    let bd = board();
+    let (x, y) = bd.coord[h];
+    (0..N_HEXES)
+        .find(|&k| bd.coord[k] == (6 - x, 6 - y))
+        .expect("the rotation stays on the board")
 }
 
 #[cfg(test)]

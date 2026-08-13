@@ -1154,18 +1154,40 @@ fn hex_neighborhood() -> Vec<u32> {
 /// augmentation: every position can be presented a second way, for free.
 #[pyfunction]
 fn hex_mirror() -> Vec<u32> {
-    let bd = crate::board::board();
-    let n = crate::board::N_HEXES;
-    (0..n)
-        .map(|h| {
-            let (x, y) = bd.coord[h];
-            let t = (6 - x, 6 - y);
-            let m = (0..n)
-                .find(|&k| bd.coord[k] == t)
-                .expect("rotation stays on the board");
-            m as u32
-        })
+    (0..crate::board::N_HEXES)
+        .map(|h| crate::state::mirror_hex(h) as u32)
         .collect()
+}
+
+/// Packed rows for coin-play states off random playouts, each followed by the
+/// packed row of the same position rotated 180 degrees with the seats swapped.
+/// `State::mirror` is the engine's own answer; `train/mirror.py` permutes row
+/// bytes to get there and is checked against this.
+#[pyfunction]
+fn mirror_row_pairs(games: usize, seed: u64) -> Vec<u8> {
+    use crate::rebel::{pack_row, Ctx, ROW_BYTES};
+    let mut rng = crate::rng::Rng::new(seed);
+    let mut out = Vec::new();
+    for _ in 0..games {
+        let mut s = crate::selfplay::make_game(&mut rng, true);
+        let ctx = Ctx::new(&s);
+        while !s.is_terminal() {
+            let acts = s.legal_actions();
+            if acts.is_empty() {
+                break;
+            }
+            if matches!(s.pending(), crate::state::Cont::MainPlay) {
+                let m = s.mirror();
+                let mctx = Ctx::new(&m);
+                let at = out.len();
+                out.resize(at + 2 * ROW_BYTES, 0);
+                pack_row(&s, &ctx, &mut out[at..at + ROW_BYTES]);
+                pack_row(&m, &mctx, &mut out[at + ROW_BYTES..at + 2 * ROW_BYTES]);
+            }
+            s.apply_inplace(acts[rng.below(acts.len())]);
+        }
+    }
+    out
 }
 
 /// Expand packed replay rows into the public encoding, in one batch.
@@ -1229,6 +1251,7 @@ fn expand_rows(
 #[pymodule]
 fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hex_mirror, m)?)?;
+    m.add_function(wrap_pyfunction!(mirror_row_pairs, m)?)?;
     m.add_function(wrap_pyfunction!(hex_coords, m)?)?;
     m.add_function(wrap_pyfunction!(units_info, m)?)?;
     m.add_function(wrap_pyfunction!(card_features_table, m)?)?;

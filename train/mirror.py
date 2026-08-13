@@ -185,3 +185,24 @@ def self_check_rows(rows, cc, cp, seg):
     b = mirror_x(expand_batch(rows, hand, fd, bag))
     assert np.allclose(a, b, atol=1e-6), "row mirror and feature mirror diverge"
     return True
+
+
+def check_against_engine(games=8, seed=11):
+    """The row permutation against `State::mirror`, the engine's own rotation.
+
+    `self_check_rows` proves the permutation is self-consistent; a permutation
+    can be self-consistent and still wrong. This one compares it with the
+    position the engine says the rotation produces. Aux targets are excluded:
+    they are written when a game ends, not by `pack_row`, so the oracle's rows
+    carry none.
+    """
+    pairs = np.frombuffer(bytes(warchest.mirror_row_pairs(games, seed)), np.uint8)
+    pairs = pairs.reshape(-1, ROW_BYTES)
+    rows, want = pairs[0::2], pairs[1::2]
+    assert len(rows), "the oracle produced no coin-play states"
+    got = mirror_rows(rows.copy())[:, :warchest.ROW_AUX]
+    bad = np.flatnonzero((got != want[:, :warchest.ROW_AUX]).any(axis=1))
+    assert not len(bad), (
+        f"{len(bad)} of {len(rows)} rows disagree with State::mirror, "
+        f"first at byte {np.flatnonzero(got[bad[0]] != want[bad[0], :warchest.ROW_AUX])[0]}")
+    return len(rows)

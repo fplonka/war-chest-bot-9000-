@@ -116,6 +116,9 @@ def main():
     hl, hrms = evaluate(net, te, rng, dev)
     print(f"      test huber {hl:.6f} rms {hrms:.5f}", flush=True)
     assert np.isfinite(hl)
+    import mirror
+    print(f"row mirror matches State::mirror on {mirror.check_against_engine()} states",
+          flush=True)
     print("format test OK", flush=True)
 
 
