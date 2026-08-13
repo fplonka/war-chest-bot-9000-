@@ -566,7 +566,7 @@ fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
         } else {
             mul(rows, h_stride)
         },
-        mul(rows, l.rank + usize::from(l.odd)),
+        mul(rows, l.rank),
         roots,
         mul(carry_snaps, t.snapshot_configs).div_ceil(2),
         mul(rows, l.xdim()),
@@ -575,6 +575,7 @@ fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
         bg,
         mul(mul(rows, 2), l.rank + 1) * usize::from(l.odd),
         mul(mul(rows, 2), l.dg) * usize::from(l.odd),
+        mul(rows, 2) * usize::from(l.odd),
     ];
     // Same three-region layout as `gpu::device::arena_layout`: persistent tower
     // outputs, then one region shared by the tower scratch and the CFR state,
@@ -616,6 +617,7 @@ fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
         at(DeviceArena::Carry),
         at(DeviceArena::Gbar),
         at(DeviceArena::Xb32),
+        at(DeviceArena::Shift),
     ]);
     let floats = (persistent.saturating_add(31) & !31usize).saturating_add(tower.max(solve));
     floats
@@ -654,6 +656,8 @@ enum DeviceArena {
     Gbar,
     /// The belief means in FP32, for the shift only.
     Xb32,
+    /// One scalar per (row, seat): everything the readout needs of the mean.
+    Shift,
 }
 
 impl PackedTables {

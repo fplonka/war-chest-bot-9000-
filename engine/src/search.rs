@@ -1691,24 +1691,20 @@ impl<'a> Solver<'a> {
         self.split_head(rows);
     }
 
-    /// After the PBS head: when the readout is antisymmetric, `wu` emitted
-    /// `rank + 1` numbers per row. Move the trailing game value into `ow` and
-    /// close the gap, so `ob` stays the contiguous `rank`-wide matrix the leaf
-    /// matmul wants, and precompute the seat means the readout centres on.
+    /// After the PBS head: the antisymmetric readout needs the seat's game
+    /// value and the mean of `g` it centres on. The head's hidden layer is
+    /// still in `sb`, and the belief blocks it read are still in `xb`.
     fn split_head(&mut self, rows: usize) {
         let net = &self.nets.value;
         if !net.odd() || net.is_empty() {
             return;
         }
-        let (rk, dg) = (net.rank(), net.dg());
+        let dg = net.dg();
         self.ow.clear();
         for r in 0..rows {
-            self.ow.push(self.ob[r * (rk + 1) + rk]);
+            let h = &self.sb[r * net.head_out()..(r + 1) * net.head_out()];
+            self.ow.push(net.game_value(h));
         }
-        for r in 1..rows {
-            self.ob.copy_within(r * (rk + 1)..r * (rk + 1) + rk, r * rk);
-        }
-        self.ob.truncate(rows * rk);
         net.gbar(&self.xb[..rows * 2 * dg], rows * 2, &mut self.gb);
     }
 
@@ -1799,6 +1795,7 @@ impl<'a> Solver<'a> {
             } else {
                 (0.0, 0.0)
             };
+
             for (v, &c) in vals[vo..vo + n].iter_mut().zip(&cidx[cs..cs + n]) {
                 // The trailing column of `g` is the per-config bias term.
                 *v = (base + row[c as usize] + cg[c as usize * (rk + 1) + rk] - shift) * opp_reach;

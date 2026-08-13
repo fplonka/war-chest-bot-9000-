@@ -28,7 +28,7 @@ use super::wave::Wave;
 const BLOCK: u32 = 256;
 const GRAPH_CLASSES: usize = 4;
 const N_TABLES: usize = 51;
-const N_ARENAS: usize = 23;
+const N_ARENAS: usize = 24;
 
 #[repr(usize)]
 enum Table {
@@ -114,6 +114,8 @@ enum Arena {
     /// The belief means in FP32, for the shift only. Empty unless the readout
     /// is antisymmetric and the head runs in FP16.
     Xb32,
+    /// One scalar per (row, seat): everything the readout needs of the mean.
+    Shift,
 }
 
 #[repr(C)]
@@ -204,6 +206,8 @@ struct WeightDev {
     res_bb: [*const f32; 4],
     wg_w: *const f32,
     wg_b: *const f32,
+    wv_w: *const f32,
+    wv_b: *const f32,
 }
 
 unsafe impl cudarc::driver::DeviceRepr for WeightDev {}
@@ -246,7 +250,7 @@ kernels! {
     pack_head_static_f16,
     init_strategy, seed_reach, reach_sweep, seed_sum,
     belief_sums, belief_sums_f16, head_entry, head_entry_f16, head_act, readout, backprop_sweep,
-    head_gbar, head_gbar_f16,
+    head_shift, head_shift_f16,
     normalize_strategy, gather_carry, collect_root,
 }
 
@@ -1092,9 +1096,6 @@ impl Executor {
     ) -> Result<(), String> {
         let l = &bank.layout;
         let rows = d.host.rows as usize;
-        // `wu` emits one extra number when the readout is antisymmetric: the
-        // position's game value, which the two seats read with opposite sign.
-        let rk_out = l.rank + usize::from(l.odd);
         // Production has no extra head MLP. Retain the dynamic GEMM output and
         // static public residual in FP16, then expand them to form the residual
         // sum and all LayerNorm reductions in FP32. The following tensor-core
@@ -1125,17 +1126,18 @@ impl Executor {
             gemm_f16(
                 &self.blas,
                 rows,
-                rk_out,
+                l.rank,
                 l.head_in,
                 d.ptr(Arena::H2).cast(),
                 l.head_in,
                 bank.w16_ptr(l.wu.w),
-                rk_out,
+                l.rank,
                 d.ptr_mut(Arena::U),
-                rk_out,
+                l.rank,
             )?;
             if l.odd {
-                launch!(self, d, bank, head_gbar_f16, warps(rows * 2))?;
+                self.gbar(d, bank, rows, d.ptr(Arena::Xb32), both, traverser, true,
+                          Arena::H2 as i32, l.head_in as i32)?;
             }
             return Ok(());
         }
@@ -1199,20 +1201,64 @@ impl Executor {
         gemm(
             &self.blas,
             rows,
-            rk_out,
+            l.rank,
             src_width,
             src,
             h_stride(l),
             bank.w_ptr(l.wu.w),
-            rk_out,
+            l.rank,
             d.ptr_mut(Arena::U),
-            rk_out,
+            l.rank,
             0.0,
         )?;
         if l.odd {
-            launch!(self, d, bank, head_gbar, warps(rows * 2))?;
+            let head = if which == 0 { Arena::H } else { Arena::H2 } as i32;
+            self.gbar(d, bank, rows, d.ptr(Arena::Xb), both, traverser, false,
+                      head, h_stride(l) as i32)?;
         }
         Ok(())
+    }
+
+    /// The mean of `g` over each seat's support: `wg` applied to the belief
+    /// means the head just read. One small GEMM plus its bias, the same shape
+    /// as the config table's, rather than a hand-rolled matvec -- the matvec
+    /// walked `wg` down its columns and cost 40% of the run's throughput.
+    fn gbar(
+        &self,
+        d: &DeviceWave,
+        bank: &WeightBank,
+        rows: usize,
+        src: *const f32,
+        both: bool,
+        traverser: usize,
+        f16_head: bool,
+        head: i32,
+        head_stride: i32,
+    ) -> Result<(), String> {
+        let l = &bank.layout;
+        // `belief_sums` refreshed one seat's block unless `both`, so only that
+        // seat's mean moved. The seats interleave per row, so one seat is a
+        // strided view: `2 * dg` between rows, `dg` into the block.
+        let seats = if both { 2 } else { 1 };
+        let first = if both { 0 } else { 1 - traverser };
+        gemm(
+            &self.blas,
+            rows * seats,
+            l.rank + 1,
+            l.dg,
+            unsafe { src.add(first * l.dg) },
+            l.dg * (3 - seats),
+            bank.w_ptr(l.wg.w),
+            l.rank + 1,
+            unsafe { d.ptr_mut(Arena::Gbar).add(first * (l.rank + 1)) },
+            (l.rank + 1) * (3 - seats),
+            0.0,
+        )?;
+        if f16_head {
+            launch!(self, d, bank, head_shift_f16, warps(rows * 2), head, head_stride)
+        } else {
+            launch!(self, d, bank, head_shift, warps(rows * 2), head, head_stride)
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1416,6 +1462,10 @@ impl WeightBank {
             d.res_bb[k] = ba(b.b);
         }
         d.wg_w = wa(layout.wg.w);
+        if layout.odd {
+            d.wv_w = wa(layout.wv.w);
+            d.wv_b = ba(layout.wv.b);
+        }
         d.wg_b = ba(layout.wg.b);
         let dev = htod(stream, &[d])?;
         Ok(Self {
@@ -1881,7 +1931,7 @@ fn arena_layout(
         } else {
             rows * h_stride(l)
         },
-        rows * (l.rank + usize::from(l.odd)),
+        rows * l.rank,
         roots,
         (carry_snaps * w.snapshot_configs).div_ceil(2),
         rows * l.xdim(),
@@ -1890,6 +1940,7 @@ fn arena_layout(
         bg,
         rows * 2 * (l.rank + 1) * usize::from(l.odd),
         rows * 2 * l.dg * usize::from(l.odd),
+        rows * 2 * usize::from(l.odd),
     ];
     if std::env::var_os("WARCHEST_ARENA_PROFILE").is_some() {
         let named = [
@@ -1916,6 +1967,7 @@ fn arena_layout(
             "bg",
             "gbar",
             "xb32",
+            "shift",
         ];
         let mut top: Vec<_> = named.iter().zip(sizes.iter()).collect();
         top.sort_by_key(|(_, &n)| std::cmp::Reverse(n));
@@ -1974,7 +2026,7 @@ const PERSISTENT: [Arena; 4] = [Arena::E, Arena::Z, Arena::G, Arena::H0];
 const TOWER_SCRATCH: [Arena; 4] = [Arena::Bx, Arena::Bh, Arena::Bh2, Arena::Bg];
 
 /// State that only exists from `initialise` onwards.
-const SOLVE_STATE: [Arena; 15] = [
+const SOLVE_STATE: [Arena; 16] = [
     Arena::Reach,
     Arena::SnapReach,
     Arena::Vals,
@@ -1990,6 +2042,7 @@ const SOLVE_STATE: [Arena; 15] = [
     Arena::Carry,
     Arena::Gbar,
     Arena::Xb32,
+    Arena::Shift,
 ];
 
 fn unpack(

@@ -268,16 +268,16 @@ fn full_wave_oracle_at(tag: usize) {
         sv.multistep(TEST_CFG.iters);
         // The antisymmetric readout puts the position's game value into a
         // single scalar, straight out of the head, and every leaf value carries
-        // it whole. The same-sign readout only ever saw the head through a
+        // it whole; the same-sign readout only ever saw the head through a
         // 64-term dot, where FP16 error partly cancels. On this deliberately
         // hostile random net -- wide layers, weights uniform on +-0.3, so the
-        // head's activations are large -- that costs a factor of twelve against a
-        // tolerance calibrated for the old readout. The belief mean it centres
-        // on is kept in FP32 for the same reason (`A_XB32`); without that the
-        // factor was thirty. Nothing is relaxed on the precise path, and that
-        // is where the arithmetic is actually checked: all four oracles pass
-        // there at the tight bound, which is what says the kernel computes the
-        // same function as `search.rs::readout`.
+        // head's activations are large -- that is worth a factor of twelve on the worst fixture. The
+        // belief mean it centres on is kept in FP32 for the same reason
+        // (`A_XB32`); computing the shift off the FP16 store instead cost 5.3x
+        // the root-value tolerance. Nothing is relaxed on the precise path, and
+        // that is where the arithmetic is actually checked: all four oracles
+        // pass there at the tight bound, which is what says the kernel computes
+        // the same function as `search.rs::readout`.
         let slack = if tag == 5 && fast_gemm() { 12.0 } else { 1.0 };
         let strategy_tol = if fast_gemm() {
             // The production tensor-core path deliberately trades CPU-oracle

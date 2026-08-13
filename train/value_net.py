@@ -183,9 +183,12 @@ class Mlp(nn.Module):
         widths = [head, *hmlp]
         self.hmlp = nn.ModuleList(
             [nn.Linear(widths[i], widths[i + 1]) for i in range(len(widths) - 1)])
-        # `rank` readout directions plus one scalar: the antisymmetric game
-        # value of the position, which the two seats read with opposite sign.
-        self.wu = nn.Linear(head_out, rank + 1)
+        self.wu = nn.Linear(head_out, rank)
+        # The position's game value, which the two seats read with opposite
+        # sign. Its own head rather than a extra column of `wu`: that column
+        # made every readout matrix 65 wide, and a leading dimension that is
+        # not a multiple of eight costs the head GEMM its tensor cores.
+        self.wv = nn.Linear(head_out, 1)
         # The holding tower: per coin type through a shared chain, rectified,
         # summed over the five slots (a sum has no order, so any draft fits),
         # then the residual blocks.
@@ -364,9 +367,9 @@ class Mlp(nn.Module):
         b.index_add_(0, seg, z[inv] * w.unsqueeze(1))
         h0 = self._public(xpub, e)
         h = self._head(h0, b.reshape(xpub.shape[0], -1))
-        uw = self.wu(h)
-        rk = uw.shape[1] - 1
-        u, gv = uw[:, :rk], uw[:, rk]
+        u = self.wu(h)
+        rk = u.shape[1]
+        gv = self.wv(h).squeeze(-1)
         gc = g[inv] - self.wg(b)[seg]
         sign = 1.0 - 2.0 * (seg % 2).to(gc.dtype)
         return (sign * gv[seg // 2]
@@ -384,7 +387,7 @@ class Mlp(nn.Module):
             + [None] + list(self.hmlp) + [self.wu] + list(self.slot) + [self.slot_out]
         for blk in self.res:
             lins += [blk.a, blk.b]
-        lins += [self.wg, self.wq, self.wk, self.wp]
+        lins += [self.wg, self.wq, self.wk, self.wp, self.wv]
         w, b = [], []
         for l in lins:
             if l is None:

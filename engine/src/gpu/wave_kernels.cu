@@ -113,10 +113,14 @@ typedef struct {
 // Per (row, seat), `wg` of the seat's belief-weighted mean config embedding --
 // the vector the antisymmetric readout centres each config on.
 #define A_GBAR 21
+// One scalar per (row, seat): the seat's share of the game value, less the
+// centring term. Collapsing the mean into a scalar here keeps the readout's
+// inner loop -- the hottest loop in the system -- exactly as it was.
+#define A_SHIFT 23
 // The belief means again in FP32. The fast path stores them as FP16 for the
 // head GEMM, but the readout subtracts them from quantities of the same size.
 #define A_XB32 22
-#define N_ARENAS 23
+#define N_ARENAS 24
 
 typedef struct {
     const unsigned char* table;
@@ -136,7 +140,7 @@ typedef struct {
     const float *hmlp_w[8], *hmlp_b[8], *wu_w, *wu_b;
     const float *slot_w[8], *slot_b[8], *slot_out_w, *slot_out_b;
     const float *res_aw[4], *res_ab[4], *res_bw[4], *res_bb[4];
-    const float *wg_w, *wg_b;
+    const float *wg_w, *wg_b, *wv_w, *wv_b;
 } WeightDev;
 
 #define TP(w, ty, slot) ((const ty*)((w)->table + (w)->toff[(slot)]))
@@ -693,31 +697,46 @@ extern "C" __global__ void head_act(const WaveDev* w, const WeightDev* wt,
 }
 
 
-// `wg` of each seat's belief-weighted mean config embedding. `wg` is linear, so
-// this is the mean of `g` over the seat's support -- the vector the readout
-// subtracts from every config, leaving a deviation whose belief-weighted mean
-// is zero. Must match `search.rs::readout` and `value_net.py::forward`.
-// One warp per (row, seat).
-template <typename T, int SRC>
-__device__ __forceinline__ void head_gbar_impl(const WaveDev* w, const WeightDev* wt) {
+// Everything the antisymmetric readout needs of a (row, seat), as one number:
+//
+//     shift = s_p * W  -  <[u, 1], gbar_p>
+//
+// so a config's value is its uncentred dot plus this, and the readout's inner
+// loop -- the hottest in the system -- is untouched. `gbar` came from an FP32
+// GEMM on an FP32 copy of the belief means, which is what makes collapsing it
+// to a scalar safe: the same arithmetic on the FP16 store cost 5.3x the
+// root-value tolerance. `wg`'s bias rides in here rather than in a pass of its
+// own, and so does the game value, because this warp already owns the row.
+// Must match `search.rs::readout` and `value_net.py::forward`.
+template <typename T>
+__device__ __forceinline__ void head_shift_impl(const WaveDev* w, const WeightDev* wt,
+                                                  int arena, int stride) {
     int lane = threadIdx.x & 31;
     int task = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     if (task >= w->rows * 2) return;
-    const T* xb = reinterpret_cast<const T*>(AP(w, SRC)) + (unsigned long long)task * DG;
-    float* out = AP(w, A_GBAR) + (unsigned long long)task * (RK + 1);
-    for (int k = lane; k <= RK; k += 32) {
-        float acc = wt->wg_b[k];
-        for (int j = 0; j < DG; j++) acc += (float)xb[j] * wt->wg_w[(unsigned long long)j * (RK + 1) + k];
-        out[k] = acc;
+    const T* hh = reinterpret_cast<const T*>(AP(w, arena))
+                + (unsigned long long)(task >> 1) * stride;
+    float gv = 0.0f;
+    for (int j = lane; j < HEADW; j += 32) gv += (float)hh[j] * wt->wv_w[j];
+    gv = warp_sum(gv) + wt->wv_b[0];
+    const float* gb = AP(w, A_GBAR) + (unsigned long long)task * (RK + 1);
+    const float* ur = AP(w, A_U) + (unsigned long long)(task >> 1) * RK;
+    float acc = 0.0f;
+    for (int k = lane; k < RK; k += 32) acc += (ur[k] + wt->wu_b[k]) * (gb[k] + wt->wg_b[k]);
+    acc = warp_sum(acc);
+    if (lane == 0) {
+        AP(w, A_SHIFT)[task] = ((task & 1) == 0 ? gv : -gv) - (acc + gb[RK] + wt->wg_b[RK]);
     }
 }
 
-extern "C" __global__ void head_gbar(const WaveDev* w, const WeightDev* wt) {
-    head_gbar_impl<float, A_XB>(w, wt);
+extern "C" __global__ void head_shift(const WaveDev* w, const WeightDev* wt,
+                                        int arena, int stride) {
+    head_shift_impl<float>(w, wt, arena, stride);
 }
 
-extern "C" __global__ void head_gbar_f16(const WaveDev* w, const WeightDev* wt) {
-    head_gbar_impl<float, A_XB32>(w, wt);
+extern "C" __global__ void head_shift_f16(const WaveDev* w, const WeightDev* wt,
+                                            int arena, int stride) {
+    head_shift_impl<half>(w, wt, arena, stride);
 }
 
 extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
@@ -755,22 +774,10 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
     // under a megabyte per wave, so the lane-divergent gathers stay in L2.
     __shared__ float readout_smem[(WAVE_BLOCK / 32) * RK];
     float* us = readout_smem + (threadIdx.x >> 5) * RK;
-    const float* ur = AP(w, A_U) + (unsigned long long)q.row * (RK + ODD);
+    const float* ur = AP(w, A_U) + (unsigned long long)q.row * RK;
     for (int j = lane; j < RK; j += 32) us[j] = ur[j] + wt->wu_b[j];
     __syncwarp();
-    // Centre before the dot: `g` and its mean are both O(1) and their
-    // difference is not, so subtracting after the dot would cancel most of the
-    // FP16 head's precision away.
-    __shared__ float gbar_smem[(WAVE_BLOCK / 32) * (RK + 1)];
-    float* gb = gbar_smem + (threadIdx.x >> 5) * (RK + 1);
-    if (ODD) {
-        const float* src = AP(w, A_GBAR) + ((unsigned long long)q.row * 2 + player) * (RK + 1);
-        for (int j = lane; j <= RK; j += 32) gb[j] = src[j];
-    } else {
-        for (int j = lane; j <= RK; j += 32) gb[j] = 0.0f;
-    }
-    __syncwarp();
-    const float seat_value = ODD ? (player == 0 ? 1.0f : -1.0f) * (ur[RK] + wt->wu_b[RK]) : 0.0f;
+    const float sh = ODD ? AP(w, A_SHIFT)[2 * q.row + player] : 0.0f;
     unsigned int c0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + player];
     for (int base = 0; base < n; base += 32) {
         int c = base + lane;
@@ -779,21 +786,12 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
         const float* g = AP(w, A_G) + (unsigned long long)cfg * (RK + 1);
         float part = 0.0f;
         #pragma unroll 8
-        for (int j = 0; j < RK; j++) part += us[j] * (g[j] - gb[j]);
-        out[c] = (part + (g[RK] - gb[RK]) + seat_value) * orc;
+        for (int j = 0; j < RK; j++) part += us[j] * g[j];
+        out[c] = (part + g[RK] + sh) * orc;
     }
 #else
-    const float* ur = AP(w, A_U) + (unsigned long long)q.row * (RK + ODD);
-    __shared__ float gbar_smem[(WAVE_BLOCK / 32) * (RK + 1)];
-    float* gb = gbar_smem + (threadIdx.x >> 5) * (RK + 1);
-    if (ODD) {
-        const float* src = AP(w, A_GBAR) + ((unsigned long long)q.row * 2 + player) * (RK + 1);
-        for (int j = lane; j <= RK; j += 32) gb[j] = src[j];
-    } else {
-        for (int j = lane; j <= RK; j += 32) gb[j] = 0.0f;
-    }
-    __syncwarp();
-    const float seat_value = ODD ? (player == 0 ? 1.0f : -1.0f) * (ur[RK] + wt->wu_b[RK]) : 0.0f;
+    const float* ur = AP(w, A_U) + (unsigned long long)q.row * RK;
+    const float sh = ODD ? AP(w, A_SHIFT)[2 * q.row + player] : 0.0f;
     float u[RK_CH];
     #pragma unroll
     for (int k = 0; k < RK_CH; k++) {
@@ -808,10 +806,10 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
         #pragma unroll
         for (int k = 0; k < RK_CH; k++) {
             int j = (k << 5) + lane;
-            if (j < RK) part += u[k] * (g[j] - gb[j]);
+            if (j < RK) part += u[k] * g[j];
         }
         part = warp_sum(part);
-        if (lane == 0) out[c] = (part + (g[RK] - gb[RK]) + seat_value) * orc;
+        if (lane == 0) out[c] = (part + g[RK] + sh) * orc;
     }
 #endif
 }

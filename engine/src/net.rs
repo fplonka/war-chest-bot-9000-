@@ -560,6 +560,9 @@ pub struct Mlp {
     ln1: (Vec<f32>, Vec<f32>),
     hmlp: Vec<Lin>,
     wu: Lin,
+    /// The game-value head: one scalar per position, read with opposite sign
+    /// by the two seats. Empty unless `odd`.
+    wv: Lin,
     slot: Vec<Lin>,
     slot_out: Lin,
     res: Vec<(Lin, Lin)>,
@@ -614,6 +617,8 @@ pub struct V3Layout {
     pub wq: Span,
     pub wk: Span,
     pub wp: Span,
+    /// The game-value head. Present only when `odd`.
+    pub wv: Span,
     pub w_len: usize,
     pub b_len: usize,
     pub ln_len: usize,
@@ -707,7 +712,7 @@ impl V3Layout {
             l.hmlp.push(lin(&mut w, &mut b, prev, h));
             prev = h;
         }
-        l.wu = lin(&mut w, &mut b, prev, rank + usize::from(odd));
+        l.wu = lin(&mut w, &mut b, prev, rank);
         let mut prev = hfeat(de);
         for &h in &slot_w {
             l.slot.push(lin(&mut w, &mut b, prev, h));
@@ -723,6 +728,9 @@ impl V3Layout {
         l.wq = lin(&mut w, &mut b, AFEAT + de, rank);
         l.wk = lin(&mut w, &mut b, dg, rank);
         l.wp = lin(&mut w, &mut b, l.head_out, rank);
+        if odd {
+            l.wv = lin(&mut w, &mut b, l.head_out, 1);
+        }
         for &h in &pub_w {
             l.pub_ln.push((ln, ln + h));
             ln += 2 * h;
@@ -840,6 +848,7 @@ impl Mlp {
             wq: lin(&l.wq),
             wk: lin(&l.wk),
             wp: lin(&l.wp),
+            wv: if l.odd { lin(&l.wv) } else { Lin::default() },
         })
     }
 
@@ -1010,6 +1019,7 @@ impl Mlp {
             wq: Lin::default(),
             wk: Lin::default(),
             wp: Lin::default(),
+            wv: Lin::default(),
         })
     }
 
@@ -1336,6 +1346,15 @@ impl Mlp {
     /// `g` over a seat's support, because `wg` is linear. The antisymmetric
     /// readout subtracts it, and `Solver` already holds the means: they are
     /// the belief blocks the head reads.
+    /// The position's game value, from the head's hidden layer. Seat 0 reads it
+    /// as is and seat 1 negates it, which is what makes the two seats' mean
+    /// values cancel.
+    pub fn game_value(&self, h: &[f32]) -> f32 {
+        let mut out = vec![0.0f32; 1];
+        self.wv.gemm(&h[..self.wv.i], 1, self.wv.i, 0.0, &mut out);
+        out[0] + self.wv.b[0]
+    }
+
     pub fn gbar(&self, zmean: &[f32], n: usize, out: &mut Vec<f32>) {
         let (rk, dg) = (self.rank, self.dg);
         debug_assert_eq!(zmean.len(), n * dg);
@@ -1572,7 +1591,7 @@ impl Mlp {
                 let mut gb = Vec::new();
                 self.gbar(&xbel[r * bd + seat * self.dg..r * bd + (seat + 1) * self.dg], 1, &mut gb);
                 let s = if seat == 0 { 1.0 } else { -1.0 };
-                s * u[rk]
+                s * self.game_value(&sb)
                     + (0..rk).map(|j| u[j] * (g[j] - gb[j])).sum::<f32>()
                     + (g[rk] - gb[rk])
             })
