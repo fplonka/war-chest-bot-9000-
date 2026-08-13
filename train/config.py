@@ -33,6 +33,9 @@ class Cfg:
     cap: int = 2_000_000
     cfgs_per_row: int = 48
     no_augment: bool = False
+    # Weight on the squared zero-sum residual in the value loss. The game is
+    # zero-sum; a per-config regression never asks the network to be.
+    zero_sum_w: float = 0.0
 
     depth: int = 2
     iters: int = 64
