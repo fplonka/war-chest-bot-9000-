@@ -1145,21 +1145,18 @@ impl<'a> Game<'a> {
                 };
             let chosen = np.legal_action[chosen_cell] as usize;
 
-            // The belief is propagated under the *reference* policy even when
-            // the action was the explorer's uniform draw: an exploratory move
-            // picks the public branch, and the PBS attached to that branch is
-            // the one the reference strategy defines. That is the object the
-            // value network is trained on. For ordinary agents `np` is already
-            // their full behaviour policy, so this is their ordinary posterior.
+            // The belief propagates under the *reference* policy even when the
+            // explorer drew uniformly: the move picks a public branch, and the
+            // PBS on that branch is the one the reference defines, which is
+            // what the value network is trained on. For ordinary agents `np` is
+            // their whole behaviour policy, so this is the ordinary posterior.
             //
-            // The true private world is left exactly where it is. It is the
-            // game's bookkeeping, not a training target, and re-drawing it from
-            // the belief here -- which reads as the symmetric thing to do -- is
-            // not: War Chest coins are a resource that a real game spends, so
-            // swapping which coins are in hand mid-game means no plan survives
-            // to pay off, no side converts, and games run to the horizon. The
-            // reference implementation re-draws a hand at every node because
-            // liar's dice self-play never deals one; there is nothing to break.
+            // The true private world is not re-drawn to match. Doing so reads
+            // as the symmetric step, and the reference implementation does it
+            // at every node -- but liar's dice self-play never deals a hand, so
+            // it has nothing to break. War Chest coins are a resource the game
+            // spends: swap which ones are in hand mid-game and no plan survives
+            // to pay off, so neither side converts and games run to the horizon.
             let obs = obs_key(&np.acts[chosen]);
             let mut pairs: Vec<(Config, f32)> = Vec::with_capacity(cfgs.len());
             for (ci, c) in cfgs.iter().enumerate() {

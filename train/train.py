@@ -678,7 +678,7 @@ def main():
         done = False
         next_report = time.time() + 10.0
         counter_names = (
-            "games", "decisions", "horizon_hits", "node_caps",
+            "games", "decisions", "horizon_hits", "node_caps", "unsearched",
             "oversize_routes", "card_exclusive_routes", "censored_games",
             "dropped", "configs")
         totals = {name: 0 for name in counter_names}
@@ -733,6 +733,7 @@ def main():
                 "loss_old": round(loss_old, 5), "loss_new": round(loss_new, 5),
                 "horizon_frac": round(window["horizon_hits"] / games, 3),
                 "node_caps": window["node_caps"],
+                "unsearched": window["unsearched"],
                 "oversize_routes": window["oversize_routes"],
                 "card_exclusive_routes": window["card_exclusive_routes"],
                 "censored_games": window["censored_games"],
@@ -1100,6 +1101,7 @@ def main():
                "loss_old": round(loss_old, 5), "loss_new": round(loss_new, 5),
                "horizon_frac": round(d["horizon_hits"] / max(d["games"], 1), 3),
                "node_caps": int(d["node_caps"]),
+               "unsearched": int(d.get("unsearched", 0)),
                "oversize_routes": int(d.get("oversize_routes", 0)),
                "card_exclusive_routes": int(d.get("card_exclusive_routes", 0)),
                "dropped": int(d["dropped"]),
