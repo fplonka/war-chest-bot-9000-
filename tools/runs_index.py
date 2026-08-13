@@ -52,6 +52,8 @@ def health(run):
     git = cfg.get("git")
     if git:
         bits.append(git)
+    if cfg.get("seed") is not None:
+        bits.append(f"seed {cfg['seed']}")
     last = next((e for e in reversed(eps) if e.get("phase") == "rebel"), None) or (
         eps[-1] if eps else None)
     if last:

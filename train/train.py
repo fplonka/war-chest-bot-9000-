@@ -531,7 +531,8 @@ def main():
             sys.__stdout__.flush()
             logf.flush()
     sys.stdout = sys.stderr = Tee()
-    print(f"[train] {args.out} at {args.git} {over or 'baseline'}", flush=True)
+    print(f"[train] {args.out} at {args.git} seed={args.seed} {over or 'baseline'}",
+          flush=True)
     if args.note:
         print(f"[train] {args.note}", flush=True)
     pin_one_thread_per_core()
