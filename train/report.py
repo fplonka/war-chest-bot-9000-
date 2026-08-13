@@ -291,8 +291,12 @@ def panels(runs):
     out.append(panel("Replay age", "seconds retained", [
         (tag(r), mins(r), [e.get("buf_s", 0) for e in r["epochs"]], False)
         for r in runs], zero=True))
-    out.append(panel("Node-cap frequency", "fallbacks / decision", [
-        (tag(r), mins(r), [e.get("node_caps", 0) / max(e.get("decisions", 1), 1)
+    # `node_caps` counts refused builds; one of them costs its own decision plus
+    # the micro-continuations that finish the coin play. `unsearched` is the
+    # decision count, so it is the one that divides by decisions.
+    out.append(panel("Unsearched decisions", "fallbacks / decision", [
+        (tag(r), mins(r), [e.get("unsearched", e.get("node_caps", 0))
+                           / max(e.get("decisions", 1), 1)
                            for e in r["epochs"]], True)
         for r in runs], zero=True))
     # The horizon cuts a game at 256 coin plays and scores it a draw, and War
@@ -314,6 +318,7 @@ def health(r):
              ("solves/s", f"{last['solves_per_s']:.0f}"),
              ("buffer", f"{last['buf']:,}"),
              ("node-cap fallbacks", f"{tot('node_caps'):,}"),
+             ("unsearched decisions", f"{tot('unsearched'):,}"),
              ("dropped solves", f"{tot('dropped'):,}"),
              ("games cut at horizon", f"{last['horizon_frac']:.1%}")]
     warm = r.get("warm_end")
