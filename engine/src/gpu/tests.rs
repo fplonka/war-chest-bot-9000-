@@ -24,6 +24,7 @@ const TEST_CFG: Cfg = Cfg {
     warm: 0.0,
     node_cap: 0,
     gpu_build: false,
+    keep_states: false,
 };
 
 fn gpu_guard() -> MutexGuard<'static, ()> {
