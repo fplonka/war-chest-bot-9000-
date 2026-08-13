@@ -524,7 +524,7 @@ class Solve:
         seat = phi[:, CCOUNTS].long()
         counts = phi[:, :CCOUNTS].reshape(n, 3, NSLOT).transpose(1, 2)  # [n, 5, 3]
         mine = e[seat.unsqueeze(1) * NSLOT + torch.arange(NSLOT)]
-        s = phi[:, CCOUNTS].reshape(-1, 1, 1).expand(-1, NSLOT, 1)
+        s = (phi[:, CCOUNTS] - 0.5).reshape(-1, 1, 1).expand(-1, NSLOT, 1)
         z = F.relu(torch.cat([counts, s, mine], -1) @ self.W["wc"] + self.B["bc"]).sum(1)
         z = z + F.relu(z @ self.W["wh1"] + self.B["bh1"]) @ self.W["wh2"] + self.B["bh2"]
         g = z @ self.W["wg"] + self.B["bg"]
