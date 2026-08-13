@@ -28,7 +28,7 @@ use super::wave::Wave;
 const BLOCK: u32 = 256;
 const GRAPH_CLASSES: usize = 4;
 const N_TABLES: usize = 51;
-const N_ARENAS: usize = 21;
+const N_ARENAS: usize = 23;
 
 #[repr(usize)]
 enum Table {
@@ -109,6 +109,11 @@ enum Arena {
     Bh,
     Bh2,
     Bg,
+    /// Per (row, seat), the mean of `g` the antisymmetric readout centres on.
+    Gbar,
+    /// The belief means in FP32, for the shift only. Empty unless the readout
+    /// is antisymmetric and the head runs in FP16.
+    Xb32,
 }
 
 #[repr(C)]
@@ -241,6 +246,7 @@ kernels! {
     pack_head_static_f16,
     init_strategy, seed_reach, reach_sweep, seed_sum,
     belief_sums, belief_sums_f16, head_entry, head_entry_f16, head_act, readout, backprop_sweep,
+    head_gbar, head_gbar_f16,
     normalize_strategy, gather_carry, collect_root,
 }
 
@@ -1086,6 +1092,9 @@ impl Executor {
     ) -> Result<(), String> {
         let l = &bank.layout;
         let rows = d.host.rows as usize;
+        // `wu` emits one extra number when the readout is antisymmetric: the
+        // position's game value, which the two seats read with opposite sign.
+        let rk_out = l.rank + usize::from(l.odd);
         // Production has no extra head MLP. Retain the dynamic GEMM output and
         // static public residual in FP16, then expand them to form the residual
         // sum and all LayerNorm reductions in FP32. The following tensor-core
@@ -1116,15 +1125,18 @@ impl Executor {
             gemm_f16(
                 &self.blas,
                 rows,
-                l.rank,
+                rk_out,
                 l.head_in,
                 d.ptr(Arena::H2).cast(),
                 l.head_in,
                 bank.w16_ptr(l.wu.w),
-                l.rank,
+                rk_out,
                 d.ptr_mut(Arena::U),
-                l.rank,
+                rk_out,
             )?;
+            if l.odd {
+                launch!(self, d, bank, head_gbar_f16, warps(rows * 2))?;
+            }
             return Ok(());
         }
         launch!(
@@ -1187,16 +1199,19 @@ impl Executor {
         gemm(
             &self.blas,
             rows,
-            l.rank,
+            rk_out,
             src_width,
             src,
             h_stride(l),
             bank.w_ptr(l.wu.w),
-            l.rank,
+            rk_out,
             d.ptr_mut(Arena::U),
-            l.rank,
+            rk_out,
             0.0,
         )?;
+        if l.odd {
+            launch!(self, d, bank, head_gbar, warps(rows * 2))?;
+        }
         Ok(())
     }
 
@@ -1866,13 +1881,15 @@ fn arena_layout(
         } else {
             rows * h_stride(l)
         },
-        rows * l.rank,
+        rows * (l.rank + usize::from(l.odd)),
         roots,
         (carry_snaps * w.snapshot_configs).div_ceil(2),
         rows * l.xdim(),
         bh,
         bh,
         bg,
+        rows * 2 * (l.rank + 1) * usize::from(l.odd),
+        rows * 2 * l.dg * usize::from(l.odd),
     ];
     if std::env::var_os("WARCHEST_ARENA_PROFILE").is_some() {
         let named = [
@@ -1897,6 +1914,8 @@ fn arena_layout(
             "bh",
             "bh2",
             "bg",
+            "gbar",
+            "xb32",
         ];
         let mut top: Vec<_> = named.iter().zip(sizes.iter()).collect();
         top.sort_by_key(|(_, &n)| std::cmp::Reverse(n));
@@ -1955,7 +1974,7 @@ const PERSISTENT: [Arena; 4] = [Arena::E, Arena::Z, Arena::G, Arena::H0];
 const TOWER_SCRATCH: [Arena; 4] = [Arena::Bx, Arena::Bh, Arena::Bh2, Arena::Bg];
 
 /// State that only exists from `initialise` onwards.
-const SOLVE_STATE: [Arena; 13] = [
+const SOLVE_STATE: [Arena; 15] = [
     Arena::Reach,
     Arena::SnapReach,
     Arena::Vals,
@@ -1969,6 +1988,8 @@ const SOLVE_STATE: [Arena; 13] = [
     Arena::U,
     Arena::RootValues,
     Arena::Carry,
+    Arena::Gbar,
+    Arena::Xb32,
 ];
 
 fn unpack(
@@ -2367,7 +2388,7 @@ fn cuda_preamble(l: &V3Layout) -> String {
         .join(",");
     format!(
         "#define WAVE_BLOCK {}\n#define READOUT_LANE {}\n\
-         #define DE {}\n#define DG {}\n#define RK {}\n#define HEADW {}\n\
+         #define DE {}\n#define DG {}\n#define RK {}\n#define ODD {}\n#define HEADW {}\n\
          #define HEADOUT {}\n#define H_STRIDE {}\n#define XD {}\n#define HF {}\n\
          #define NCARD {}\n#define NPUB {}\n#define NHMLP {}\n#define NSLOTL {}\n#define NRES {}\n\
          {}{}{}{}\
@@ -2381,7 +2402,7 @@ fn cuda_preamble(l: &V3Layout) -> String {
          static __device__ const unsigned char HEX_LOCATION[N_HEXES] = {{{locations}}};\n",
         BLOCK,
         u8::from(std::env::var_os("WARCHEST_READOUT_WARP").is_none()),
-        l.de, l.dg, l.rank, l.head_in, l.head_out, h_stride(l), l.xdim(), l.hfeat(),
+        l.de, l.dg, l.rank, u8::from(l.odd), l.head_in, l.head_out, h_stride(l), l.xdim(), l.hfeat(),
         l.card.len(), l.pub_lin.len(), l.hmlp.len(), l.slot.len(), l.res.len(),
         arr("CARDW", &card), arr("PUBW", &pubw), arr("HMLPW", &hmlp), arr("SLOTW", &slot),
         crate::board::N_HEXES, NSLOT, NTYPE, crate::rebel::HEX_FACTS,

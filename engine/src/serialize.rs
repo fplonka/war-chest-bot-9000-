@@ -566,13 +566,15 @@ fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
         } else {
             mul(rows, h_stride)
         },
-        mul(rows, l.rank),
+        mul(rows, l.rank + usize::from(l.odd)),
         roots,
         mul(carry_snaps, t.snapshot_configs).div_ceil(2),
         mul(rows, l.xdim()),
         bh,
         bh,
         bg,
+        mul(mul(rows, 2), l.rank + 1) * usize::from(l.odd),
+        mul(mul(rows, 2), l.dg) * usize::from(l.odd),
     ];
     // Same three-region layout as `gpu::device::arena_layout`: persistent tower
     // outputs, then one region shared by the tower scratch and the CFR state,
@@ -612,6 +614,8 @@ fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
         at(DeviceArena::U),
         at(DeviceArena::RootValues),
         at(DeviceArena::Carry),
+        at(DeviceArena::Gbar),
+        at(DeviceArena::Xb32),
     ]);
     let floats = (persistent.saturating_add(31) & !31usize).saturating_add(tower.max(solve));
     floats
@@ -646,6 +650,10 @@ enum DeviceArena {
     Bh,
     Bh2,
     Bg,
+    /// Per (row, seat), the mean of `g` the antisymmetric readout centres on.
+    Gbar,
+    /// The belief means in FP32, for the shift only.
+    Xb32,
 }
 
 impl PackedTables {
