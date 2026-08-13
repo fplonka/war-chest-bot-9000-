@@ -314,7 +314,7 @@ class Mlp(nn.Module):
         counts = phi[:, :CCOUNTS].reshape(-1, 3, NSLOT).transpose(1, 2)   # [U, NSLOT, 3]
         mine = e[torch.arange(e.shape[0], device=e.device).unsqueeze(1),
                  seat.unsqueeze(1) * NSLOT + torch.arange(NSLOT, device=e.device)]
-        s = phi[:, CCOUNTS].reshape(-1, 1, 1).expand(-1, NSLOT, 1)
+        s = (phi[:, CCOUNTS] - 0.5).reshape(-1, 1, 1).expand(-1, NSLOT, 1)
         x = torch.cat([counts, s, mine], -1)
         for lin in self.slot:
             x = F.relu(lin(x))

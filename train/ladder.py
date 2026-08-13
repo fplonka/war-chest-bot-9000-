@@ -1,7 +1,7 @@
 """Rate snapshots by playing the informative pairs.
 
-    python train/ladder.py runs/mine --games 100
-    python train/ladder.py runs/a runs/b --games 100
+    python train/ladder.py runs/mine --games 40
+    python train/ladder.py runs/a runs/b --games 40
 
 A game against a much weaker opponent is almost no information (Fisher
 p(1-p) peaks at a coin flip). Consecutive snapshots start close, so they
@@ -119,7 +119,7 @@ def frozen(w, l, d):
     return min(s, 1.0 - s) < 0.20
 
 
-def run(runs, games=100, gpu=False, seed=7):
+def run(runs, games=40, gpu=False, seed=7):
     out = runs[0]
     if games < 2 or games % 2:
         raise ValueError("games must be a positive even count")
@@ -232,11 +232,12 @@ def run(runs, games=100, gpu=False, seed=7):
            "pairs": pairs}
     write_json(f"{out}/ladder.json", res)
     print(f"\n=== Elo ({out}, greedy = 0) ===", flush=True)
-    print(f"{'player':>28s} {'trained':>9s} {'elo':>7s} {'+-':>5s} {'score':>7s}",
+    print(f"{'player':>28s} {'trained':>9s} {'elo':>7s} {'95%':>5s} {'score':>7s}",
           flush=True)
     for p in sorted(res["players"], key=lambda p: -p["elo"]):
         tm = f"{p['t'] / 60:.1f}min" if p["t"] is not None else "-"
-        print(f"{p['name']:>28s} {tm:>9s} {p['elo']:>7.0f} {p['se']:>5.0f} "
+        ci = 1.96 * p["se"] if math.isfinite(p["se"]) else float("inf")
+        print(f"{p['name']:>28s} {tm:>9s} {p['elo']:>7.0f} {ci:>5.0f} "
               f"{p['score']:>7.3f}", flush=True)
     return res
 
@@ -244,7 +245,7 @@ def run(runs, games=100, gpu=False, seed=7):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("runs", nargs="+")
-    ap.add_argument("--games", type=int, default=100)
+    ap.add_argument("--games", type=int, default=40)
     ap.add_argument("--gpu", action="store_true")
     args = ap.parse_args()
     run(args.runs, games=args.games, gpu=args.gpu)

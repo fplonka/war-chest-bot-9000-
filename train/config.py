@@ -48,7 +48,7 @@ class Cfg:
     anneal_frac: float = 0.4
     random_draft: bool = True
     warm_games: int = 96
-    ladder_games: int = 100
+    ladder_games: int = 40
 
     device: str = "cuda:1"
     gpu_devices: str = "0,1"
@@ -61,6 +61,7 @@ class Cfg:
     train_stream_priority: int = -1
 
     out: str = ""
+    note: str = ""
     seed: int = 1
     matmul_precision: str = ""
     git: str = ""
@@ -68,7 +69,8 @@ class Cfg:
 
 BASELINE = Cfg()
 # Not part of the run's name.
-SKIP = {"out", "git", "matmul_precision"}
+SKIP = {"out", "note", "git", "matmul_precision"}
+META = {"out", "note", "git", "matmul_precision"}
 CAST = {"int": int, "float": float,
         "bool": lambda v: v not in ("0", "false", "False", "")}
 
@@ -90,10 +92,18 @@ def label(over):
 
 
 def delta(cfg):
-    base = dataclasses.asdict(BASELINE)
+    return {k: v for k, v, changed in knobs(cfg) if changed}
+
+
+def knobs(cfg):
+    """Every knob in Cfg order. `changed` is versus golden8 defaults."""
     d = cfg if isinstance(cfg, dict) else dataclasses.asdict(cfg)
-    return {k: v for k, v in d.items()
-            if k not in SKIP and k in base and base[k] != v}
+    base = dataclasses.asdict(BASELINE)
+    for f in dataclasses.fields(Cfg):
+        if f.name in META:
+            continue
+        v = d.get(f.name, base[f.name])
+        yield f.name, v, f.name in base and v != base[f.name]
 
 
 def git_sha():

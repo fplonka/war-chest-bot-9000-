@@ -43,6 +43,8 @@ def health(run):
     if not isinstance(eps, list):
         eps = []
     bits = []
+    if cfg.get("note"):
+        bits.append(cfg["note"])
     if cfg.get("minutes"):
         bits.append(f"{cfg['minutes']:g}m")
     if cfg.get("warm_minutes"):
@@ -71,7 +73,8 @@ def health(run):
     fin = next((p for p in lad.get("players") or []
                 if str(p.get("name", "")).endswith(".final")), None)
     if fin and fin.get("elo") is not None:
-        bits.append(f"{fin['elo']:+.0f}±{fin.get('se', 0):.0f} Elo")
+        se = fin.get("se") or 0
+        bits.append(f"{fin['elo']:+.0f}±{1.96 * se:.0f} (95%) Elo")
     return " · ".join(bits)
 
 

@@ -5,6 +5,7 @@
 """
 
 import argparse
+import html
 import io
 import json
 import math
@@ -26,6 +27,12 @@ INK = ["#3d8bfd", "#20a37a", "#e0709f", "#d99b28", "#9b7bd4"]
 AXIS = "#8a8a8a"
 JS = "plotly.min.js"        # written once into runs/, shared by every report
 RUNS_DIR = "runs"
+# Plot and table show 95% CIs; ladder.json stores 1σ Bradley-Terry SE.
+CI95 = 1.96
+
+
+def ci95(se):
+    return CI95 * se if isinstance(se, (int, float)) and math.isfinite(se) else 0
 
 
 def write_text(path, value):
@@ -76,7 +83,7 @@ def ema(y, span=12):
     return out
 
 
-def panel(title, ylabel, series, zero=False, hlines=(), markers=False):
+def panel(title, ylabel, series, zero=False, hlines=(), markers=False, yerr=None):
     """A panel's specification. Drawn later, into a shared subplot grid.
 
     This used to be a hand-rolled SVG emitter -- axis lines, tick placement and
@@ -87,7 +94,7 @@ def panel(title, ylabel, series, zero=False, hlines=(), markers=False):
     and hover for free.
     """
     return dict(title=title, ylabel=ylabel, series=series, zero=zero,
-                hlines=hlines, markers=markers)
+                hlines=hlines, markers=markers, yerr=yerr)
 
 
 def dashboard(specs, cols=2):
@@ -109,6 +116,7 @@ def dashboard(specs, cols=2):
                         vertical_spacing=0.11, horizontal_spacing=0.07)
     for k, sp in enumerate(specs):
         r, c = k // cols + 1, k % cols + 1
+        yerr = sp.get("yerr") or []
         for i, (label, x, y, smooth) in enumerate(sp["series"]):
             col = INK[i % len(INK)]
             if smooth:
@@ -119,12 +127,18 @@ def dashboard(specs, cols=2):
                     x=x, y=y, mode="lines", line=dict(color=col, width=1),
                     opacity=0.22, showlegend=False, hoverinfo="skip"), r, c)
                 y = ema(y)
+            err = yerr[i] if i < len(yerr) else None
             fig.add_trace(go.Scatter(
                 x=x, y=y, name=label or sp["title"],
                 mode="lines+markers" if sp["markers"] else "lines",
                 line=dict(color=col, width=1.8), marker=dict(size=6),
                 showlegend=False,
-                hovertemplate=f"{label or sp['ylabel']}: %{{y:.4g}}<extra></extra>"),
+                error_y=(dict(type="data", array=err, color=col,
+                              thickness=1, width=3) if err else None),
+                hovertemplate=(f"{label or 'elo'}: %{{y:.0f}} ± "
+                               f"%{{error_y.array:.0f}} (95% CI)<extra></extra>"
+                               if err else
+                               f"{label or sp['ylabel']}: %{{y:.4g}}<extra></extra>")),
                 r, c)
         for i, (name, v) in enumerate(sp["hlines"]):
             fig.add_hline(y=v, row=r, col=c, line=dict(
@@ -134,8 +148,15 @@ def dashboard(specs, cols=2):
         else:
             # Percentile limits: one bad epoch -- a drain record, a warm-up
             # spike -- must not set the axis and flatten everything else.
-            vals = sorted(v for _, _, ys, _ in sp["series"] for v in ys
-                          if math.isfinite(v))
+            vals = []
+            for i, (_, _, ys, _) in enumerate(sp["series"]):
+                err = yerr[i] if i < len(yerr) else None
+                for j, v in enumerate(ys):
+                    if not math.isfinite(v):
+                        continue
+                    vals.append(v)
+                    if err and j < len(err) and math.isfinite(err[j]):
+                        vals.extend((v - err[j], v + err[j]))
             if vals:
                 lo, hi = quantiles(vals, 0.01), quantiles(vals, 0.99)
                 pad = (hi - lo) * 0.12 or abs(hi) * 0.1 or 1.0
@@ -185,7 +206,7 @@ def panels(runs):
     one = len(runs) == 1
     tag = lambda r: "" if one else r["name"]
 
-    elo, hl = [], []
+    elo, elo_err, hl = [], [], []
     for r in runs:
         if not r["ladder"]:
             continue
@@ -193,12 +214,13 @@ def panels(runs):
         if snaps:
             elo.append((tag(r) or "snapshot", [p["t"] / 60.0 for p in snaps],
                         [p["elo"] for p in snaps], False))
+            elo_err.append([ci95(p.get("se")) for p in snaps])
         p = next((q for q in r["ladder"]["players"] if q["name"] == "greedy"), None)
         if p and "greedy" not in [n for n, _ in hl]:
             hl.append(("greedy", p["elo"]))
 
-    out = [panel("Strength vs training time", "elo", elo, hlines=hl,
-                 markers=True)]
+    out = [panel("Strength vs training time", "elo (95% CI)", elo, hlines=hl,
+                 markers=True, yerr=elo_err or None)]
 
     if one and "loss_old" in (runs[0]["epochs"] or [{}])[-1]:
         r = runs[0]
@@ -320,7 +342,7 @@ def ladder_table(lad):
     def prow(p):
         when = "—" if p["t"] is None else f"{p['t'] / 60:.0f} min"
         return (f"<tr><td>{p['name']}</td><td class=n>{when}</td>"
-                f"<td class=n>{p['elo']:.0f}</td><td class=n>±{p['se']:.0f}</td>"
+                f"<td class=n>{p['elo']:.0f}</td><td class=n>±{ci95(p.get('se')):.0f}</td>"
                 f"<td class=n>{p['score']:.3f}</td></tr>")
 
     rows = "".join(prow(p) for p in sorted(players, key=lambda p: -p["elo"]))
@@ -331,7 +353,7 @@ def ladder_table(lad):
         f"<td class=n>{p['score']:.3f}</td></tr>"
         for p in sorted(pairs_in, key=lambda p: -(p.get("n", 0))))
     return (f"<div class=tw><table><thead><tr><th>player<th class=n>trained"
-            f"<th class=n>elo<th class=n>±<th class=n>score"
+            f"<th class=n>elo<th class=n>95% CI<th class=n>score"
             f"</thead>{rows}</table></div>"
             f"<h3>Head to head</h3><div class=tw><table><thead><tr><th>pairing"
             f"<th class=n>W–L–D<th class=n>games<th class=n>score</thead>"
@@ -354,7 +376,9 @@ h2{font-size:12px;font-weight:700;margin:22px 0 6px;color:var(--mut)}
 h3{font-size:12px;font-weight:700;margin:16px 0 4px}
 .meta{color:var(--mut);margin:0 0 6px}
 .delta{display:flex;flex-wrap:wrap;gap:4px 16px;margin:0 0 10px;color:var(--mut)}
-.delta span{color:var(--ink)}
+.delta span{color:var(--mut)}
+.delta span.hit{color:var(--ink);font-weight:700}
+.note{margin:0 0 8px;color:var(--ink)}
 .js-plotly-plot{margin:0 0 4px}
 dl{display:flex;flex-wrap:wrap;gap:0 22px;margin:4px 0}
 dt{font-size:11px;color:var(--mut)}
@@ -370,29 +394,34 @@ footer{color:var(--mut);font-size:11px;margin-top:24px;border-top:1px solid var(
 """
 
 def page(runs, title, js):
-    d = [f"<span>{k}={v}</span>" for k, v in config.delta(runs[0]["cfg"]).items()] \
-        if len(runs) == 1 else \
-        [f"<span>{r['name']}: " + (", ".join(f"{k}={v}" for k, v in
-                                             config.delta(r["cfg"]).items()) or "baseline")
-         + "</span>" for r in runs]
     sha = runs[0]["cfg"].get("git", "")
     body = [f"<h1>{title}</h1>",
             '<p class="meta">'
             + (f"{sha} · " if sha and sha != "?" else "")
-            + f"{len(runs[0]['epochs'])} ReBeL epochs</p>",
-            f'<div class="delta">{"".join(d) or "<span>baseline</span>"}</div>',
-            dashboard(panels(runs))]
+            + f"{len(runs[0]['epochs'])} ReBeL epochs</p>"]
+    for r in runs:
+        note = (r["cfg"] or {}).get("note") or ""
+        if note:
+            body.append(f'<p class="note">{"" if len(runs) == 1 else html.escape(r["name"]) + ": "}'
+                        f"{html.escape(note)}</p>")
+        body.append(f'<div class="delta">{cfg_html(r["cfg"])}</div>')
+    body.append(dashboard(panels(runs)))
     for r in runs:
         body.append(f"<h3>{r['name']}</h3><dl>{health(r)}</dl>")
         body.append(ladder_table(r["ladder"]))
-    body.append("<footer>Generated by train/report.py. Elo error bars are per-player "
-                "placement, not a test between two players; a difference is only "
-                "resolved when the pairing between them has the games to resolve it "
-                "(≈1,000 games for 22 Elo). Unexplained variance is "
-                "loss / target-std².</footer>")
+    body.append("<footer>Generated by train/report.py. Elo error bars are 95% "
+                "confidence intervals (1.96 × Bradley-Terry standard error) on "
+                "that player's rating, with greedy fixed at 0. Unexplained "
+                "variance is loss / target-std².</footer>")
     return (f"<!doctype html><meta charset=utf-8><title>{title}</title>"
             f"{js}"
             f"<style>{CSS}</style>{''.join(body)}")
+
+
+def cfg_html(cfg):
+    return "".join(
+        f'<span{" class=hit" if changed else ""}>{html.escape(k)}={html.escape(str(v))}</span>'
+        for k, v, changed in config.knobs(cfg))
 
 
 def write_all(runs_dir=RUNS_DIR):

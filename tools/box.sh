@@ -74,16 +74,17 @@ go)
     shift
     "$0" sync
     "$0" build
-    "$0" -bg run "python train/train.py $*"
+    "$0" -bg run python train/train.py "$@"
     "$0" follow run
     ;;
 -bg)
     tag=${2:?usage: -bg <tag> <command...>}
     shift 2
+    cmd=$(printf '%q ' "$@")
     run_remote "mkdir -p /workspace/logs
 nohup setsid bash -lc $(printf '%q' "$prelude
 echo \$\$ > /workspace/logs/$tag.pid
-$*
+$cmd
 echo \$? > /workspace/logs/$tag.exit") >/workspace/logs/$tag.log 2>&1 &
 echo started $tag"
     ;;

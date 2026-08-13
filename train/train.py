@@ -29,6 +29,7 @@ ends, the snapshots play Greedy (random drafts) and a report is written.
 
     python train/train.py
     python train/train.py minutes=6 warm_minutes=2
+    python train/train.py out=seat note="centre the seat bit at ±0.5"
 """
 
 import argparse
@@ -511,10 +512,10 @@ def main():
         description="Train one run, then rate its snapshots against Greedy.")
     ap.add_argument("over", nargs="*", help="knob=value (defaults are gpu_golden8)")
     over = config.parse(ap.parse_args().over)
-    over.pop("out", None)
+    name = over.pop("out", None)
     args = dataclasses.replace(config.BASELINE, **over)
     args.git = config.git_sha()
-    args.out = f"runs/{config.label(over)}"
+    args.out = f"runs/{name}" if name else f"runs/{config.label(over)}"
     refuse_if_machine_busy()
     if os.path.exists(args.out):
         raise SystemExit(f"{args.out} exists")
@@ -531,6 +532,8 @@ def main():
             logf.flush()
     sys.stdout = sys.stderr = Tee()
     print(f"[train] {args.out} at {args.git} {over or 'baseline'}", flush=True)
+    if args.note:
+        print(f"[train] {args.note}", flush=True)
     pin_one_thread_per_core()
 
     torch.manual_seed(args.seed)
