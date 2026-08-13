@@ -189,6 +189,10 @@ class Mlp(nn.Module):
         # made every readout matrix 65 wide, and a leading dimension that is
         # not a multiple of eight costs the head GEMM its tensor cores.
         self.wv = nn.Linear(head_out, 1)
+        # False for a checkpoint saved before this head existed: it trained the
+        # same-sign readout and must keep playing under it, or a gate rates it
+        # on a function it never saw. `export_weights.load` sets it.
+        self.odd = True
         # The holding tower: per coin type through a shared chain, rectified,
         # summed over the five slots (a sum has no order, so any draft fits),
         # then the residual blocks.
@@ -225,7 +229,7 @@ class Mlp(nn.Module):
         the same network with the old same-sign one, still loadable so a gate
         can play the two against each other. A hex encoder cannot run in Rust,
         so it poisons the tag."""
-        d = [4 if self.hex_net else 5, self.de, self.dg, self.rank, self.head_in, self.nres]
+        d = [4 if self.hex_net else (5 if self.odd else 3), self.de, self.dg, self.rank, self.head_in, self.nres]
         for lst in (self.card_w, self.pub_w, self.hmlp_w, self.slot_w):
             d.append(len(lst))
             d.extend(lst)
@@ -369,6 +373,9 @@ class Mlp(nn.Module):
         h = self._head(h0, b.reshape(xpub.shape[0], -1))
         u = self.wu(h)
         rk = u.shape[1]
+        if not self.odd:
+            gc = g[inv]
+            return (u[seg // 2] * gc[:, :rk]).sum(-1) + gc[:, rk]
         gv = self.wv(h).squeeze(-1)
         gc = g[inv] - self.wg(b)[seg]
         sign = 1.0 - 2.0 * (seg % 2).to(gc.dtype)
@@ -387,7 +394,9 @@ class Mlp(nn.Module):
             + [None] + list(self.hmlp) + [self.wu] + list(self.slot) + [self.slot_out]
         for blk in self.res:
             lins += [blk.a, blk.b]
-        lins += [self.wg, self.wq, self.wk, self.wp, self.wv]
+        lins += [self.wg, self.wq, self.wk, self.wp]
+        if self.odd:
+            lins.append(self.wv)
         w, b = [], []
         for l in lins:
             if l is None:

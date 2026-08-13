@@ -290,11 +290,10 @@ def make_batch(parts, rng, device, augment):
 
 def zero_sum_residual(v, w, seg, nseg):
     """Per position, how far the two players' belief-weighted values are from
-    cancelling. War Chest is zero-sum, so this is zero for the true value
-    function. Nothing in a per-config regression asks for it, and under
-    bootstrapping a constant shared by both players lands in both their targets,
-    so the loop carries it rather than correcting it. `seg` is `2 * row + seat`,
-    so the two seats of a position are neighbours."""
+    cancelling. The readout makes this zero by construction, so it is an
+    assertion rather than a diagnostic: `probe_zs` should read float noise, and
+    anything else means one of the four readouts has drifted. `seg` is
+    `2 * row + seat`, so the two seats of a position are neighbours."""
     num = torch.zeros(nseg, dtype=v.dtype, device=v.device).index_add_(0, seg, w * v)
     den = torch.zeros(nseg, dtype=v.dtype, device=v.device).index_add_(0, seg, w)
     m = num / den.clamp(min=1e-9)
@@ -312,25 +311,18 @@ def probe_stats(net, probe):
             float(zero_sum_residual(v, probe[4], probe[5], probe[7]).pow(2).mean().sqrt()))
 
 
-def value_loss(net, xpub, unit_ids, phi, inv, w, seg, y, nseg, zero_sum_w=0.0):
+def value_loss(net, xpub, unit_ids, phi, inv, w, seg, y, nseg):
     # Belief-weighted Huber over every config in the support. Weighting by the
     # belief is what makes the loss match the distribution CFR queries: a config
     # the belief gives 1% to is worth 1% of the gradient.
     v = net(xpub, unit_ids, phi, inv, w, seg, nseg)
     per = F.smooth_l1_loss(v, y, reduction="none", beta=0.5)
-    loss = (per * w).sum() / w.sum().clamp(min=1e-6)
-    if zero_sum_w:
-        # Learn the constraint instead of projecting it on afterwards: one
-        # implementation, in the trainer, and the violation stays measurable on
-        # the raw network. The projection did the same arithmetic in three
-        # places and lost its gate (`runs/zsum`).
-        loss = loss + zero_sum_w * zero_sum_residual(v, w, seg, nseg).pow(2).mean()
-    return loss
+    return (per * w).sum() / w.sum().clamp(min=1e-6)
 
 
 def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
                 recent_mix=0.0, recent_frac=0.2, profile_cuda=False,
-                batch_fn=make_batch, zero_sum_w=0.0):
+                batch_fn=make_batch):
     """Mean value loss over `steps` Adam updates."""
     if len(buf) < batch:
         return float("nan"), {}
@@ -354,7 +346,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
             b1 = torch.cuda.Event(enable_timing=True)
             f0.record(stream)
         ts = time.perf_counter()
-        loss = value_loss(net, *parts, zero_sum_w=zero_sum_w)
+        loss = value_loss(net, *parts)
         tot += loss.detach().item()
         stat["forward_wall_s"] += time.perf_counter() - ts
         if stream is not None:
@@ -772,7 +764,7 @@ def main():
                         augment=not args.no_augment,
                         recent_mix=args.recent_mix, recent_frac=args.recent_frac,
                         profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1",
-                        batch_fn=batcher, zero_sum_w=args.zero_sum_w)
+                        batch_fn=batcher)
                     window["train_s"] += time.time() - tt
                     window["loss_sum"] += lv * nsteps
                     window["train_steps"] += nsteps
@@ -880,7 +872,7 @@ def main():
             value, opt, buf, steps, args.batch, rng, dev,
             augment=not args.no_augment,
             recent_mix=args.recent_mix, recent_frac=args.recent_frac,
-            batch_fn=batcher, zero_sum_w=args.zero_sum_w)
+            batch_fn=batcher)
         train_s = time.time() - tt
         value.push(0)
         with torch.no_grad():

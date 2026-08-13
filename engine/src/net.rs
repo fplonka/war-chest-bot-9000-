@@ -1536,17 +1536,6 @@ impl Mlp {
 
     /// The per-config readout: `v = <u, g[..rank]> + g[rank]`, for the configs
     /// `idx` names in a `g` table built by `embed`.
-    pub fn values(&self, u: &[f32], g: &[f32], idx: &[u32], out: &mut [f32]) {
-        let rk = self.rank;
-        debug_assert_eq!(idx.len(), out.len());
-        for (o, &i) in out.iter_mut().zip(idx.iter()) {
-            let row = &g[i as usize * (rk + 1)..];
-            *o = dot(u, &row[..rk]) + row[rk];
-        }
-    }
-
-    /// One value per row, for callers with no solve to amortise over: the
-    /// torch parity check and the offline tools.
     pub fn forward(
         &self,
         xpub: &[f32],

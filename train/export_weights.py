@@ -29,6 +29,10 @@ def load(path):
     exist only so a gate can play the new architecture against the pool it is
     meant to beat; nothing trains them.
 
+    Checkpoints from before the antisymmetric readout have no `wv`, and keep
+    the same-sign readout: `odd` goes False and `dims` says tag 3, so the engine
+    evaluates them the way they were trained.
+
     Checkpoints from after that but before the policy head have no
     `wq`/`wk`/`wp`. Those are left at their initialisation and `has_policy` goes
     False, which is safe for anything that only searches — search asks for values
@@ -53,6 +57,10 @@ def load(path):
     # Fixed-layout checkpoints carry the old attribute names; rename.
     missing, _ = net.load_state_dict(upgrade_state_dict(sd), strict=False)
     net.has_policy = not any(k.startswith(("wq.", "wk.", "wp.")) for k in missing)
+    # A checkpoint from before the antisymmetric readout has no game-value head.
+    # Left at its random initialisation it would shift every position's seat
+    # means, so such a net keeps the readout it was trained under.
+    net.odd = "wv.weight" in sd
     return net
 
 

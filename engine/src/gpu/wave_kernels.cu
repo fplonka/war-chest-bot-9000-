@@ -717,7 +717,9 @@ __device__ __forceinline__ void head_shift_impl(const WaveDev* w, const WeightDe
     const T* hh = reinterpret_cast<const T*>(AP(w, arena))
                 + (unsigned long long)(task >> 1) * stride;
     float gv = 0.0f;
-    for (int j = lane; j < HEADW; j += 32) gv += (float)hh[j] * wt->wv_w[j];
+    // HEADOUT, not HEADW: `wv` reads the head's *output* width, which differs
+    // from its input when the head has extra layers.
+    for (int j = lane; j < HEADOUT; j += 32) gv += (float)hh[j] * wt->wv_w[j];
     gv = warp_sum(gv) + wt->wv_b[0];
     const float* gb = AP(w, A_GBAR) + (unsigned long long)task * (RK + 1);
     const float* ur = AP(w, A_U) + (unsigned long long)(task >> 1) * RK;
