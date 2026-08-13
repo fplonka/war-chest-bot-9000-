@@ -11,3 +11,5 @@ __pycache__/
 # better fetched from their sources than redistributed here. See docs/REBEL.md
 # and engine/RULES.md for what they are and where to get them.
 papers/
+scratch/
+.DS_Store

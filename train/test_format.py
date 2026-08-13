@@ -60,6 +60,12 @@ def main():
     coff = np.asarray(d["coff"], np.int64)
     soff = np.asarray(d["soff"], np.int64)
     buf.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
+    tiny = Buffer(max(n * 2, 8), max(n * 2, 8) * 48)
+    for _ in range(8):
+        tiny.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
+    assert tiny.soff.size < tiny.rows, (tiny.soff.size, tiny.rows)
+    tiny.clear()
+    assert tiny.soff.size == 0
     dump_path = f"{out}/buffer.npz"
     got, gcc, gcp, gcw, gcy, gseg = buf.ordered()
     lo = buf.lo
