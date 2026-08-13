@@ -62,7 +62,7 @@ def health(run):
             bits.append(f"{sps:.0f}/s")
         loss, std = last.get("loss"), last.get("tgt_std")
         if loss is not None and std:
-            bits.append(f"L/σ {loss / max(std, 1e-9):.2f}")
+            bits.append(f"L/var {loss / max(std * std, 1e-9):.2f}")
     lad = load_json(os.path.join(RUNS, run, "ladder.json")) or {}
     fin = next((p for p in lad.get("players") or []
                 if str(p.get("name", "")).endswith(".final")), None)

@@ -233,12 +233,8 @@ def panels(runs):
     # of that variance the network fails to explain, which is scale-free and
     # is what says whether a phase actually fitted.
     unexplained = lambda e: e["loss"] / max(e["tgt_std"] ** 2, 1e-9)
-    ratio = lambda e: e["loss"] / max(e["tgt_std"], 1e-9)
     out.append(panel("Unexplained target variance", "loss / target variance",
                      [(tag(r), mins(r), [unexplained(e) for e in r["epochs"]], True)
-                      for r in runs], zero=True))
-    out.append(panel("Loss / target std", "loss / tgt_std",
-                     [(tag(r), mins(r), [ratio(e) for e in r["epochs"]], True)
                       for r in runs], zero=True))
 
     out.append(panel("Spread of predictions", "std",
