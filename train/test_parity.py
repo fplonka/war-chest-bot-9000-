@@ -95,7 +95,8 @@ def main():
     # shape `Mlp::forward` takes. `phi` is the scored config; `xbel` is the
     # belief embedding the solver would have accumulated, which the torch side
     # reproduces by giving each row two weight-1 configs.
-    phi = holdings(rng, rows, rng.integers(0, 2, rows))
+    seat = rng.integers(0, 2, rows)
+    phi = holdings(rng, rows, seat)
     bel = holdings(rng, 2 * rows, np.tile([0.0, 1.0], rows))
 
     tx, tphi, tbel = (torch.as_tensor(a) for a in (x, phi, bel))
@@ -111,7 +112,11 @@ def main():
         allphi = np.concatenate([bel.reshape(rows, 2, -1),
                                  phi.reshape(rows, 1, -1)], 1).reshape(3 * rows, -1)
         w = np.tile([1.0, 1.0, 0.0], rows).astype(np.float32)
-        seg = np.repeat(np.arange(rows), 3) * 2 + np.tile([0, 1, 0], rows)
+        # The scored config is read under its own seat: the readout is
+        # antisymmetric, so a config labelled seat 1 in `phi` and seat 0 in
+        # `seg` would be two different questions.
+        seg = (np.repeat(np.arange(rows), 3) * 2
+                + np.stack([np.zeros(rows), np.ones(rows), seat], 1).ravel()).astype(np.int64)
         inv = torch.arange(len(allphi))
         ref = net(tx, tids, torch.as_tensor(allphi), inv, torch.as_tensor(w),
                   torch.as_tensor(seg), 2 * rows).numpy()[2::3]
@@ -163,7 +168,8 @@ def main():
     torch.nn.init.normal_(net2.res[0].b.weight, std=0.1)
     net2.push(0)
     x2, ids2 = rows_like_the_encoder(rng, rows)
-    phi2 = holdings(rng, rows, rng.integers(0, 2, rows))
+    seat2 = rng.integers(0, 2, rows)
+    phi2 = holdings(rng, rows, seat2)
     bel2 = holdings(rng, 2 * rows, np.tile([0.0, 1.0], rows))
     tx2 = torch.as_tensor(x2)
     tids2 = torch.as_tensor(ids2, dtype=torch.long)
@@ -174,7 +180,11 @@ def main():
         allphi2 = np.concatenate([bel2.reshape(rows, 2, -1),
                                   phi2.reshape(rows, 1, -1)], 1).reshape(3 * rows, -1)
         w2 = np.tile([1.0, 1.0, 0.0], rows).astype(np.float32)
-        seg2 = np.repeat(np.arange(rows), 3) * 2 + np.tile([0, 1, 0], rows)
+        # The scored config is read under its own seat: the readout is
+        # antisymmetric, so a config labelled seat 1 in `phi` and seat 0 in
+        # `seg` would be two different questions.
+        seg2 = (np.repeat(np.arange(rows), 3) * 2
+                + np.stack([np.zeros(rows), np.ones(rows), seat2], 1).ravel()).astype(np.int64)
         inv2 = torch.arange(len(allphi2))
         ref2 = net2(tx2, tids2, torch.as_tensor(allphi2), inv2, torch.as_tensor(w2),
                     torch.as_tensor(seg2), 2 * rows).numpy()[2::3]
@@ -202,7 +212,8 @@ def main():
             torch.nn.init.normal_(lin.bias, std=0.1)
     net3.push(0)
     x3, ids3 = rows_like_the_encoder(rng, rows)
-    phi3 = holdings(rng, rows, rng.integers(0, 2, rows))
+    seat3 = rng.integers(0, 2, rows)
+    phi3 = holdings(rng, rows, seat3)
     bel3 = holdings(rng, 2 * rows, np.tile([0.0, 1.0], rows))
     tx3 = torch.as_tensor(x3)
     tids3 = torch.as_tensor(ids3, dtype=torch.long)
@@ -213,7 +224,11 @@ def main():
         allphi3 = np.concatenate([bel3.reshape(rows, 2, -1),
                                   phi3.reshape(rows, 1, -1)], 1).reshape(3 * rows, -1)
         w3 = np.tile([1.0, 1.0, 0.0], rows).astype(np.float32)
-        seg3 = np.repeat(np.arange(rows), 3) * 2 + np.tile([0, 1, 0], rows)
+        # The scored config is read under its own seat: the readout is
+        # antisymmetric, so a config labelled seat 1 in `phi` and seat 0 in
+        # `seg` would be two different questions.
+        seg3 = (np.repeat(np.arange(rows), 3) * 2
+                + np.stack([np.zeros(rows), np.ones(rows), seat3], 1).ravel()).astype(np.int64)
         inv3 = torch.arange(len(allphi3))
         ref3 = net3(tx3, tids3, torch.as_tensor(allphi3), inv3, torch.as_tensor(w3),
                     torch.as_tensor(seg3), 2 * rows).numpy()[2::3]
