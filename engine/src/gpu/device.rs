@@ -254,6 +254,102 @@ kernels! {
     normalize_strategy, gather_carry, collect_root,
 }
 
+/// Compile the wave kernels for one layout and derive the launch geometry the
+/// occupancy of those kernels implies. Split out of `Executor::new` because a
+/// shape change has to do it again: a ladder that rates a new network
+/// architecture against the pool it has to beat publishes two shapes to one
+/// card, and everything below the kernels is wave-sized and rebuilt anyway.
+fn build_kernels(
+    context: &Arc<CudaContext>,
+    layout: &V3Layout,
+) -> Result<(Kernels, u32, u32, u32), String> {
+        let (major, minor) = (
+            context
+                .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+                .map_err(|e| format!("CUDA capability: {e:?}"))?,
+            context
+                .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+                .map_err(|e| format!("CUDA capability: {e:?}"))?,
+        );
+        let arch = format!("compute_{major}{minor}");
+        let cuda_root = std::env::var("CUDA_PATH")
+            .or_else(|_| std::env::var("CUDA_HOME"))
+            .unwrap_or_else(|_| "/usr/local/cuda".into());
+        // cudarc 0.17's `use_fast_math` option only enables contraction; pass
+        // NVRTC's actual umbrella flag so division, square root and denormal
+        // handling use the native fast paths too. The production path is fast
+        // math by default; the opt-out exists only for numerical diagnosis.
+        let mut nvrtc_options = vec!["--generate-line-info".into(), "--use_fast_math".into()];
+        if std::env::var_os("WARCHEST_GPU_PRECISE_MATH").is_some() {
+            nvrtc_options.pop();
+        }
+        let source = format!(
+            "{}\n{}",
+            cuda_preamble(layout),
+            include_str!("wave_kernels.cu")
+        );
+        let ptx = nvrtc::compile_ptx_with_opts(
+            &source,
+            nvrtc::CompileOptions {
+                arch: Some(Box::leak(arch.into_boxed_str())),
+                include_paths: vec![
+                    format!("{cuda_root}/include"),
+                    format!("{cuda_root}/targets/x86_64-linux/include/cccl"),
+                ],
+                options: nvrtc_options,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| format!("v5 NVRTC: {e:?}"))?;
+        let module = context
+            .load_module(ptx)
+            .map_err(|e| format!("v5 CUDA module: {e:?}"))?;
+        let kernels = Kernels::load(&module)?;
+        let sms = context
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )
+            .map_err(|e| format!("CUDA multiprocessor count: {e:?}"))? as u32;
+        let sweep_blocks_per_sm = std::env::var("WARCHEST_SWEEP_BLOCKS_PER_SM")
+            .ok()
+            .and_then(|x| x.parse::<u32>().ok())
+            .filter(|&x| x > 0);
+        let kernel_cap = |name: &str, default: u32| {
+            std::env::var(name)
+                .ok()
+                .and_then(|x| x.parse::<u32>().ok())
+                .filter(|&x| x > 0)
+                .or(sweep_blocks_per_sm)
+                .unwrap_or(default)
+        };
+        let sweep_block = std::env::var("WARCHEST_SWEEP_BLOCK")
+            .ok()
+            .and_then(|x| x.parse::<u32>().ok())
+            .filter(|&x| (32..=1024).contains(&x) && x % 32 == 0)
+            .unwrap_or(BLOCK);
+        let backprop_blocks_per_sm = kernels
+            .backprop_sweep
+            .occupancy_max_active_blocks_per_multiprocessor(sweep_block, 0, None)
+            .map_err(|e| format!("backprop sweep occupancy: {e:?}"))?
+            // The unrestricted six-block grids overpopulate cooperative level
+            // barriers. On the heterogeneous 1,000-root tape, backprop 4 plus
+            // reach 2 averaged 709/s versus 693/s at 3/3 and 642/s at 6/6.
+            .min(kernel_cap("WARCHEST_BACKPROP_BLOCKS_PER_SM", 4));
+        let backprop_blocks = sms.saturating_mul(backprop_blocks_per_sm).max(1);
+        let reach_blocks_per_sm = kernels
+            .reach_sweep
+            .occupancy_max_active_blocks_per_multiprocessor(sweep_block, 0, None)
+            .map_err(|e| format!("reach sweep occupancy: {e:?}"))?
+            .min(kernel_cap("WARCHEST_REACH_BLOCKS_PER_SM", 2));
+        let reach_blocks = sms.saturating_mul(reach_blocks_per_sm).max(1);
+        if std::env::var_os("WARCHEST_GPU_PROFILE").is_some() {
+            eprintln!(
+                "v5_sweeps block={sweep_block} backprop_blocks_per_sm={backprop_blocks_per_sm} reach_blocks_per_sm={reach_blocks_per_sm}"
+            );
+        }
+    Ok((kernels, backprop_blocks, reach_blocks, sweep_block))
+}
+
 pub struct Executor {
     stream: Arc<CudaStream>,
     blas: CudaBlas,
@@ -376,90 +472,8 @@ impl Executor {
         let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cuBLAS: {e:?}"))?;
         let layout = V3Layout::new(&dims)?;
         validate_layout(&layout)?;
-        let (major, minor) = (
-            context
-                .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
-                .map_err(|e| format!("CUDA capability: {e:?}"))?,
-            context
-                .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
-                .map_err(|e| format!("CUDA capability: {e:?}"))?,
-        );
-        let arch = format!("compute_{major}{minor}");
-        let cuda_root = std::env::var("CUDA_PATH")
-            .or_else(|_| std::env::var("CUDA_HOME"))
-            .unwrap_or_else(|_| "/usr/local/cuda".into());
-        // cudarc 0.17's `use_fast_math` option only enables contraction; pass
-        // NVRTC's actual umbrella flag so division, square root and denormal
-        // handling use the native fast paths too. The production path is fast
-        // math by default; the opt-out exists only for numerical diagnosis.
-        let mut nvrtc_options = vec!["--generate-line-info".into(), "--use_fast_math".into()];
-        if std::env::var_os("WARCHEST_GPU_PRECISE_MATH").is_some() {
-            nvrtc_options.pop();
-        }
-        let source = format!(
-            "{}\n{}",
-            cuda_preamble(&layout),
-            include_str!("wave_kernels.cu")
-        );
-        let ptx = nvrtc::compile_ptx_with_opts(
-            &source,
-            nvrtc::CompileOptions {
-                arch: Some(Box::leak(arch.into_boxed_str())),
-                include_paths: vec![
-                    format!("{cuda_root}/include"),
-                    format!("{cuda_root}/targets/x86_64-linux/include/cccl"),
-                ],
-                options: nvrtc_options,
-                ..Default::default()
-            },
-        )
-        .map_err(|e| format!("v5 NVRTC: {e:?}"))?;
-        let module = context
-            .load_module(ptx)
-            .map_err(|e| format!("v5 CUDA module: {e:?}"))?;
-        let kernels = Kernels::load(&module)?;
-        let sms = context
-            .attribute(
-                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
-            )
-            .map_err(|e| format!("CUDA multiprocessor count: {e:?}"))? as u32;
-        let sweep_blocks_per_sm = std::env::var("WARCHEST_SWEEP_BLOCKS_PER_SM")
-            .ok()
-            .and_then(|x| x.parse::<u32>().ok())
-            .filter(|&x| x > 0);
-        let kernel_cap = |name: &str, default: u32| {
-            std::env::var(name)
-                .ok()
-                .and_then(|x| x.parse::<u32>().ok())
-                .filter(|&x| x > 0)
-                .or(sweep_blocks_per_sm)
-                .unwrap_or(default)
-        };
-        let sweep_block = std::env::var("WARCHEST_SWEEP_BLOCK")
-            .ok()
-            .and_then(|x| x.parse::<u32>().ok())
-            .filter(|&x| (32..=1024).contains(&x) && x % 32 == 0)
-            .unwrap_or(BLOCK);
-        let backprop_blocks_per_sm = kernels
-            .backprop_sweep
-            .occupancy_max_active_blocks_per_multiprocessor(sweep_block, 0, None)
-            .map_err(|e| format!("backprop sweep occupancy: {e:?}"))?
-            // The unrestricted six-block grids overpopulate cooperative level
-            // barriers. On the heterogeneous 1,000-root tape, backprop 4 plus
-            // reach 2 averaged 709/s versus 693/s at 3/3 and 642/s at 6/6.
-            .min(kernel_cap("WARCHEST_BACKPROP_BLOCKS_PER_SM", 4));
-        let backprop_blocks = sms.saturating_mul(backprop_blocks_per_sm).max(1);
-        let reach_blocks_per_sm = kernels
-            .reach_sweep
-            .occupancy_max_active_blocks_per_multiprocessor(sweep_block, 0, None)
-            .map_err(|e| format!("reach sweep occupancy: {e:?}"))?
-            .min(kernel_cap("WARCHEST_REACH_BLOCKS_PER_SM", 2));
-        let reach_blocks = sms.saturating_mul(reach_blocks_per_sm).max(1);
-        if std::env::var_os("WARCHEST_GPU_PROFILE").is_some() {
-            eprintln!(
-                "v5_sweeps block={sweep_block} backprop_blocks_per_sm={backprop_blocks_per_sm} reach_blocks_per_sm={reach_blocks_per_sm}"
-            );
-        }
+        let (kernels, backprop_blocks, reach_blocks, sweep_block) =
+            build_kernels(&context, &layout)?;
         let initial = WeightBank::upload(&stream, &dims, w, b, ln)?;
         let mut banks = HashMap::new();
         banks.insert(0, initial);
@@ -488,10 +502,28 @@ impl Executor {
         ln: Vec<f32>,
     ) -> Result<(), String> {
         if dims != self.dims {
-            return Err(format!(
-                "GPU weight shape changed from {:?} to {:?}; restart executors",
-                self.dims, dims
-            ));
+            // A shape change rebuilds the lane: new kernels for the new layout,
+            // and every wave-sized allocation and captured graph dropped. Only
+            // a ladder does this -- it rates one architecture against another
+            // on one card -- so paying an NVRTC compile per change is fine, and
+            // training never changes shape at all.
+            let layout = V3Layout::new(&dims)?;
+            validate_layout(&layout)?;
+            let context = self.stream.context().clone();
+            let (kernels, backprop_blocks, reach_blocks, sweep_block) =
+                build_kernels(&context, &layout)?;
+            self.stream
+                .synchronize()
+                .map_err(|e| format!("synchronize before GPU reshape: {e:?}"))?;
+            self.graphs.clear();
+            self.next_graph = 0;
+            self.buffers = None;
+            self.banks.clear();
+            self.kernels = kernels;
+            self.backprop_blocks = backprop_blocks;
+            self.reach_blocks = reach_blocks;
+            self.sweep_block = sweep_block;
+            self.dims = dims.clone();
         }
         let bank = WeightBank::upload(&self.stream, &dims, w, b, ln)?;
         self.banks.insert(version, bank);

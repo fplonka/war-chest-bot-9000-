@@ -154,9 +154,9 @@ def run(runs, games=40, gpu=False, seed=7, finals=False):
         net.push(p["slot"])
         by_slot[p["slot"]] = net
     if gpu:
-        shapes = {tuple(n.dims) for n in by_slot.values()}
-        if len(shapes) != 1:
-            raise SystemExit(f"--gpu needs one shared network shape, got {shapes}")
+        # Each side is published to its own card, and a card rebuilds itself if
+        # the shape changes, so a ladder can mix architectures -- which is how a
+        # new readout is rated against the pool it has to beat.
         first = next(iter(by_slot.values()))
         warchest.gpu_start(first.dims, *first.flat(), devices=[0, 1])
     warchest.set_cap_value(0.0)
