@@ -1,0 +1,159 @@
+{
+ "runs": [
+  "runs/odd"
+ ],
+ "games": 40,
+ "schedule_seed": 7,
+ "draft_mode": "random",
+ "players": [
+  {
+   "name": "greedy",
+   "run": null,
+   "t": null,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 0.0,
+   "se": 46.3,
+   "score": 0.381
+  },
+  {
+   "name": "odd.init",
+   "run": "runs/odd",
+   "t": 300.1,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": -85.9,
+   "se": 49.2,
+   "score": 0.308
+  },
+  {
+   "name": "odd.s1",
+   "run": "runs/odd",
+   "t": 660.3,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 167.1,
+   "se": 54.9,
+   "score": 0.575
+  },
+  {
+   "name": "odd.s2",
+   "run": "runs/odd",
+   "t": 1020.3,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 430.8,
+   "se": 50.4,
+   "score": 0.5
+  },
+  {
+   "name": "odd.s3",
+   "run": "runs/odd",
+   "t": 1380.3,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 549.2,
+   "se": 40.0,
+   "score": 0.562
+  },
+  {
+   "name": "odd.final",
+   "run": "runs/odd",
+   "t": 1740.4,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 578.5,
+   "se": 53.4,
+   "score": 0.692
+  }
+ ],
+ "pairs": [
+  {
+   "a": "greedy",
+   "b": "odd.init",
+   "w": 19,
+   "l": 7,
+   "d": 14,
+   "n": 40,
+   "score": 0.65
+  },
+  {
+   "a": "greedy",
+   "b": "odd.s1",
+   "w": 2,
+   "l": 14,
+   "d": 4,
+   "n": 20,
+   "score": 0.2
+  },
+  {
+   "a": "greedy",
+   "b": "odd.final",
+   "w": 0,
+   "l": 19,
+   "d": 1,
+   "n": 20,
+   "score": 0.025
+  },
+  {
+   "a": "odd.init",
+   "b": "odd.s1",
+   "w": 3,
+   "l": 14,
+   "d": 3,
+   "n": 20,
+   "score": 0.225
+  },
+  {
+   "a": "odd.s1",
+   "b": "odd.s2",
+   "w": 3,
+   "l": 17,
+   "d": 0,
+   "n": 20,
+   "score": 0.15
+  },
+  {
+   "a": "odd.s2",
+   "b": "odd.s3",
+   "w": 11,
+   "l": 25,
+   "d": 4,
+   "n": 40,
+   "score": 0.325
+  },
+  {
+   "a": "odd.s3",
+   "b": "odd.final",
+   "w": 14,
+   "l": 18,
+   "d": 8,
+   "n": 40,
+   "score": 0.45
+  }
+ ]
+}
