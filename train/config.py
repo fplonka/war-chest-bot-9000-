@@ -26,7 +26,7 @@ class Cfg:
     cfr: str = "linear"
     explore: float = 0.25
     temp: float = 2.0
-    eval_mix: float = 0.5
+    eval_mix: float = 1.0
     cap_value: float = 0.04
     anneal_frac: float = 0.4
     random_draft: bool = True

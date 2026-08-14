@@ -70,6 +70,12 @@ class Mlp(nn.Module):
         self.value = nn.Linear(JOINT, 1)
         nn.init.normal_(self.value.weight, std=1e-3)
         nn.init.zeros_(self.value.bias)
+        self.zero_private()
+
+    @torch.no_grad()
+    def zero_private(self):
+        nn.init.zeros_(self.context[0].weight[:, PUBLIC:])
+        nn.init.zeros_(self.candidate_joint.weight)
 
     def spec(self):
         return {}
@@ -115,7 +121,7 @@ class Mlp(nn.Module):
         x = gelu(self.candidate_slot(self._slots(phi, units))).sum(1)
         return gelu(self.candidate_norm(self.candidate(x)))
 
-    def forward(self, xpub, unit_ids, phi, weight, seg, nseg):
+    def forward(self, xpub, unit_ids, phi, weight, seg, nseg, public_only=False):
         """Return one value for each config in a ragged canonical-query batch.
 
         Query ``q`` is public row ``q``. Its own configs have ``seg == q`` and
@@ -123,11 +129,11 @@ class Mlp(nn.Module):
         """
         units = self.units(xpub, unit_ids)
         public = self.public_encode(xpub, units)
-        config_units = units[seg]
-
-        items = self.belief_configs(phi, config_units)
-        pooled = torch.zeros(nseg, CONFIG, dtype=items.dtype, device=items.device)
-        pooled.index_add_(0, seg, items * weight.unsqueeze(1))
+        pooled = public.new_zeros(nseg, CONFIG)
+        if not public_only:
+            config_units = units[seg]
+            items = self.belief_configs(phi, config_units)
+            pooled.index_add_(0, seg, items * weight.unsqueeze(1))
         other = torch.arange(nseg, device=seg.device) ^ 1
 
         context = torch.cat([public, pooled, pooled[other]], -1)
@@ -135,7 +141,8 @@ class Mlp(nn.Module):
             context = gelu(norm(linear(context)))
         common = self.context_joint(context)
 
-        candidate = self.candidate_joint(self.candidates(phi, config_units))
+        candidate = common.new_zeros(len(seg), JOINT) if public_only else \
+            self.candidate_joint(self.candidates(phi, config_units))
         joint = gelu(common[seg] + candidate + self.joint_bias)
         return self.value(joint).squeeze(1)
 

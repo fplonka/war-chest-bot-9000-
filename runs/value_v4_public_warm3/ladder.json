@@ -1,0 +1,109 @@
+{
+ "runs": [
+  "runs/value_v4_public_warm3"
+ ],
+ "games": 40,
+ "schedule_seed": 7,
+ "draft_mode": "random",
+ "players": [
+  {
+   "name": "greedy",
+   "run": null,
+   "t": null,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear"
+   },
+   "elo": 0.0,
+   "se": 58.9,
+   "score": 0.688
+  },
+  {
+   "name": "value_v4_public_warm3.init",
+   "run": "runs/value_v4_public_warm3",
+   "t": 180.1,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear"
+   },
+   "elo": -153.5,
+   "se": 39.8,
+   "score": 0.412
+  },
+  {
+   "name": "value_v4_public_warm3.s1",
+   "run": "runs/value_v4_public_warm3",
+   "t": 420.1,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear"
+   },
+   "elo": -132.2,
+   "se": 44.9,
+   "score": 0.508
+  },
+  {
+   "name": "value_v4_public_warm3.final",
+   "run": "runs/value_v4_public_warm3",
+   "t": 600.0,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear"
+   },
+   "elo": -107.2,
+   "se": 45.7,
+   "score": 0.483
+  }
+ ],
+ "pairs": [
+  {
+   "a": "greedy",
+   "b": "value_v4_public_warm3.init",
+   "w": 10,
+   "l": 3,
+   "d": 7,
+   "n": 20,
+   "score": 0.675
+  },
+  {
+   "a": "greedy",
+   "b": "value_v4_public_warm3.final",
+   "w": 10,
+   "l": 2,
+   "d": 8,
+   "n": 20,
+   "score": 0.7
+  },
+  {
+   "a": "value_v4_public_warm3.init",
+   "b": "value_v4_public_warm3.s1",
+   "w": 4,
+   "l": 7,
+   "d": 29,
+   "n": 40,
+   "score": 0.463
+  },
+  {
+   "a": "value_v4_public_warm3.init",
+   "b": "value_v4_public_warm3.final",
+   "w": 2,
+   "l": 6,
+   "d": 12,
+   "n": 20,
+   "score": 0.4
+  },
+  {
+   "a": "value_v4_public_warm3.s1",
+   "b": "value_v4_public_warm3.final",
+   "w": 0,
+   "l": 2,
+   "d": 18,
+   "n": 20,
+   "score": 0.45
+  }
+ ]
+}

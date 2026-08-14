@@ -261,9 +261,10 @@ def make_batch(parts, rng, device, augment):
             t(cy), 2 * n)
 
 
-def value_loss(net, xpub, unit_ids, phi, w, seg, y, nseg, stats=None):
+def value_loss(net, xpub, unit_ids, phi, w, seg, y, nseg, stats=None,
+               public_only=False):
     """Mean Huber per support, then mean across canonical queries."""
-    v = net(xpub, unit_ids, phi, w, seg, nseg)
+    v = net(xpub, unit_ids, phi, w, seg, nseg, public_only=public_only)
     if stats is not None:
         expected = torch.zeros(nseg, dtype=v.dtype, device=v.device)
         expected.index_add_(0, seg, v.detach() * w)
@@ -279,7 +280,7 @@ def value_loss(net, xpub, unit_ids, phi, w, seg, y, nseg, stats=None):
 
 def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
                 recent_mix=0.0, recent_frac=0.2, profile_cuda=False,
-                batch_fn=make_batch):
+                batch_fn=make_batch, public_only=False):
     """Mean value loss over `steps` Adam updates."""
     stat = {"sample_s": 0.0, "prepare_s": 0.0, "forward_wall_s": 0.0,
             "backward_wall_s": 0.0, "batch_configs": 0, "steps": steps,
@@ -304,7 +305,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
             b1 = torch.cuda.Event(enable_timing=True)
             f0.record(stream)
         ts = time.perf_counter()
-        loss = value_loss(net, *parts, stats=stat)
+        loss = value_loss(net, *parts, stats=stat, public_only=public_only)
         tot += loss.detach().item()
         stat["forward_wall_s"] += time.perf_counter() - ts
         if stream is not None:
@@ -453,6 +454,8 @@ def main():
             raise ValueError(
                 f"initial shape {initial.dims} does not match requested shape {value.dims}")
         value.load_state_dict(initial.state_dict())
+        if args.warm_minutes > 0:
+            value.zero_private()
     opt = torch.optim.Adam(value.parameters(), lr=args.lr)
     lr_decays = sorted(float(x) for x in args.lr_decay_frac.split(",") if x.strip())
     next_decay = 0
@@ -821,25 +824,27 @@ def main():
             probe = batcher(buf.sample(2048, rng), rng, dev, False)
         tgt_mean, tgt_std = float(cy.mean()), float(cy.std())
         tt = time.time()
-        steps = max(1, round(args.train_gen_ratio * solves / args.batch))
+        # One optimizer row per deterministic warm row; repeated fitting only
+        # reduces the number of independent games seen before ReBeL starts.
+        steps = max(1, round(solves / args.batch))
         lv, train_stat = train_steps(
             value, opt, buf, steps, args.batch, rng, dev,
             augment=False,
             recent_mix=args.recent_mix, recent_frac=args.recent_frac,
-            batch_fn=batcher)
+            batch_fn=batcher, public_only=True)
         train_s = time.time() - tt
         value.push(0)
         with torch.no_grad():
-            probe_std = float(value(*probe[:5], probe[6]).std()) \
+            probe_std = float(value(*probe[:5], probe[6], public_only=True).std()) \
                 if probe is not None else float("nan")
             if len(buf) >= args.batch:
                 old_parts = batcher(
                     buf.sample_old(args.batch, rng, args.recent_frac), rng, dev, False)
-                loss_old = float(value_loss(value, *old_parts))
+                loss_old = float(value_loss(value, *old_parts, public_only=True))
                 new_parts = batcher(
                     buf.sample(args.batch, rng, recent_mix=1.0,
                                recent_frac=args.recent_frac), rng, dev, False)
-                loss_new = float(value_loss(value, *new_parts))
+                loss_new = float(value_loss(value, *new_parts, public_only=True))
             else:
                 loss_old = loss_new = float("nan")
         dec = max(d["decisions"], 1)
@@ -881,6 +886,7 @@ def main():
     # Warm-up initialises the network. Its Adam moments and its rows are a
     # different objective; they must not steer ReBeL.
     buf.clear()
+    probe = None
     opt = torch.optim.Adam(value.parameters(), lr=args.lr)
     rebel_t0 = time.time()
     rebel_solves = 0

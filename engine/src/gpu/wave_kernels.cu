@@ -546,48 +546,65 @@ extern "C" __global__ void belief_sums(const WaveDev* w, const WeightDev* wt,
     }
 }
 
+extern "C" __global__ void add_public_context(const WaveDev* w,
+                                                const WeightDev* wt,
+                                                int traverser, int rows) {
+    (void)wt;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * CONTEXT_DIM) return;
+    int row = i / CONTEXT_DIM;
+    int j = i % CONTEXT_DIM;
+    AP(w, A_H)[i] += AP(w, A_H0)
+        [((unsigned long long)row * 2 + traverser) * CONTEXT_DIM + j];
+}
+
 extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
                                     int player) {
     int lane = threadIdx.x & 31;
-    int task = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int warp = threadIdx.x >> 5;
+    int task = blockIdx.x;
     if (task >= w->readout_n) return;
     ReadTask q = TP(w, ReadTask, T_READOUT)[task];
     int opp = 1 - player;
     int n = nc_of(w, q.node, player);
     int vbase = value_at(w, q.node, player, 0);
     float* out = AP(w, A_VALS) + vbase;
-    float orc;
-    if (q.row != NONE) {
-        orc = AP(w, player ? A_SNAP_REACH : A_VALS)[vbase];
-    } else {
-        int nop = nc_of(w, q.node, opp);
-        const float* ro = AP(w, A_REACH) + reach_at(w, q.node, opp, 0);
-        orc = 0.0f;
-        for (int c = lane; c < nop; c += 32) orc += ro[c];
-        orc = warp_sum(orc);
-    }
+    __shared__ float smem[JOINT_DIM + 1];
+
     if (q.row == NONE) {
+        if (warp == 0) {
+            int nop = nc_of(w, q.node, opp);
+            const float* ro = AP(w, A_REACH) + reach_at(w, q.node, opp, 0);
+            float orc = 0.0f;
+            for (int c = lane; c < nop; c += 32) orc += ro[c];
+            orc = warp_sum(orc);
+            if (lane == 0) smem[JOINT_DIM] = orc;
+        }
+        __syncthreads();
         float u = TP(w, float, T_NODE_UTILITY)[q.node];
         if (TP(w, unsigned char, T_NODE_PLAYER)[q.node] != player) u = -u;
-        for (int c = lane; c < n; c += 32) out[c] = u * orc;
+        for (int c = threadIdx.x; c < n; c += blockDim.x)
+            out[c] = u * smem[JOINT_DIM];
         return;
     }
-    __shared__ float readout_smem[(WAVE_BLOCK / 32) * JOINT_DIM];
-    float* common = readout_smem + (threadIdx.x >> 5) * JOINT_DIM;
-    const float* u = AP(w, A_U) + (unsigned long long)q.row * JOINT_DIM;
-    for (int j = lane; j < JOINT_DIM; j += 32) common[j] = u[j];
-    __syncwarp();
+
+    const float* common_in = AP(w, A_U) + (unsigned long long)q.row * JOINT_DIM;
+    for (int j = threadIdx.x; j < JOINT_DIM; j += blockDim.x)
+        smem[j] = common_in[j];
+    __syncthreads();
+    float orc = AP(w, player ? A_SNAP_REACH : A_VALS)[vbase];
     unsigned int c0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + player];
-    for (int base = 0; base < n; base += 32) {
-        int c = base + lane;
-        if (c >= n) break;
+    constexpr int WARPS = WAVE_BLOCK / 32;
+    for (int c = warp; c < n; c += WARPS) {
         unsigned int cfg = TP(w, unsigned int, T_ROW_CFG)[c0 + c];
         const float* candidate = AP(w, A_G) + (unsigned long long)cfg * JOINT_DIM;
-        float value = *wt->value_b;
-        #pragma unroll 8
-        for (int j = 0; j < JOINT_DIM; j++)
-            value += gelu(common[j] + candidate[j] + wt->joint_bias[j]) * wt->value_w[j];
-        out[c] = value * orc;
+        float value = 0.0f;
+        #pragma unroll
+        for (int j = lane; j < JOINT_DIM; j += 32)
+            value += gelu(smem[j] + candidate[j] + wt->joint_bias[j])
+                   * wt->value_w[j];
+        value = warp_sum(value);
+        if (lane == 0) out[c] = (value + *wt->value_b) * orc;
     }
 }
 

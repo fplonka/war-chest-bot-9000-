@@ -1,0 +1,100 @@
+{
+ "runs": [
+  "runs/value_v4_beliefw"
+ ],
+ "games": 40,
+ "schedule_seed": 7,
+ "draft_mode": "random",
+ "players": [
+  {
+   "name": "greedy",
+   "run": null,
+   "t": null,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear"
+   },
+   "elo": 0.0,
+   "se": 63.6,
+   "score": 0.762
+  },
+  {
+   "name": "value_v4_beliefw.init",
+   "run": "runs/value_v4_beliefw",
+   "t": 180.8,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear"
+   },
+   "elo": -167.2,
+   "se": 46.6,
+   "score": 0.458
+  },
+  {
+   "name": "value_v4_beliefw.s1",
+   "run": "runs/value_v4_beliefw",
+   "t": 420.9,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear"
+   },
+   "elo": -204.5,
+   "se": 39.0,
+   "score": 0.481
+  },
+  {
+   "name": "value_v4_beliefw.final",
+   "run": "runs/value_v4_beliefw",
+   "t": 606.4,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear"
+   },
+   "elo": -216.3,
+   "se": 47.3,
+   "score": 0.392
+  }
+ ],
+ "pairs": [
+  {
+   "a": "greedy",
+   "b": "value_v4_beliefw.init",
+   "w": 11,
+   "l": 2,
+   "d": 7,
+   "n": 20,
+   "score": 0.725
+  },
+  {
+   "a": "greedy",
+   "b": "value_v4_beliefw.final",
+   "w": 12,
+   "l": 0,
+   "d": 8,
+   "n": 20,
+   "score": 0.8
+  },
+  {
+   "a": "value_v4_beliefw.init",
+   "b": "value_v4_beliefw.s1",
+   "w": 6,
+   "l": 2,
+   "d": 32,
+   "n": 40,
+   "score": 0.55
+  },
+  {
+   "a": "value_v4_beliefw.s1",
+   "b": "value_v4_beliefw.final",
+   "w": 3,
+   "l": 2,
+   "d": 35,
+   "n": 40,
+   "score": 0.512
+  }
+ ]
+}

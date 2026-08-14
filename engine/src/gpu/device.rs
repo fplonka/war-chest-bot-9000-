@@ -241,7 +241,7 @@ kernels! {
     pack_cards, bias_gelu, cards_finish, assemble, norm_gelu,
     holding_in, slot_sum, add_belief_item_bias,
     init_strategy, seed_reach, reach_sweep, seed_sum,
-    belief_sums, readout, backprop_sweep,
+    belief_sums, add_public_context, readout, backprop_sweep,
     normalize_strategy, gather_carry, collect_root,
 }
 
@@ -925,6 +925,33 @@ impl Executor {
             JOINT,
             0.0,
         )?;
+
+        // The public half of the first context layer is fixed for the whole
+        // solve. Project it once here instead of repeating the same GEMM in
+        // every CFR iteration and fixed-policy root query.
+        debug_assert_eq!(PUBLIC, CONTEXT);
+        gemm(
+            &self.blas,
+            public_rows,
+            CONTEXT,
+            PUBLIC,
+            d.ptr(Arena::H0),
+            PUBLIC,
+            bank.w_ptr(l.context[0].w),
+            CONTEXT,
+            d.ptr_mut(Arena::Bx),
+            CONTEXT,
+            0.0,
+        )?;
+        unsafe {
+            result::memcpy_dtod_async(
+                d.ptr_mut(Arena::H0) as sys::CUdeviceptr,
+                d.ptr(Arena::Bx) as sys::CUdeviceptr,
+                public_rows * CONTEXT * size_of::<f32>(),
+                self.stream.cu_stream(),
+            )
+        }
+        .map_err(|e| format!("cache public context projection: {e:?}"))?;
         Ok(())
     }
 
@@ -1058,19 +1085,6 @@ impl Executor {
             &self.blas,
             rows,
             CONTEXT,
-            PUBLIC,
-            unsafe { d.ptr(Arena::H0).add(traverser * PUBLIC) },
-            2 * PUBLIC,
-            bank.w_ptr(l.context[0].w),
-            CONTEXT,
-            d.ptr_mut(Arena::H),
-            CONTEXT,
-            0.0,
-        )?;
-        gemm(
-            &self.blas,
-            rows,
-            CONTEXT,
             2 * CONFIG,
             d.ptr(Arena::Xb),
             2 * CONFIG,
@@ -1078,7 +1092,16 @@ impl Executor {
             CONTEXT,
             d.ptr_mut(Arena::H),
             CONTEXT,
-            1.0,
+            0.0,
+        )?;
+        launch!(
+            self,
+            d,
+            bank,
+            add_public_context,
+            threads_usize(rows * CONTEXT),
+            traverser as i32,
+            rows as i32
         )?;
         launch!(
             self,
@@ -1213,7 +1236,7 @@ impl Executor {
             d,
             bank,
             readout,
-            warps(d.host.readout_n as usize),
+            d.host.readout_n as u32,
             player as i32
         )
     }
