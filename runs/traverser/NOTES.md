@@ -24,3 +24,10 @@ The aggregate is 378-189-33, or 65.75%. The combined Bradley-Terry table in
 zsctl 99.5, rowfix 34.6, seat 0. All Rust, Torch/Rust parity, production CUDA,
 precise CUDA, and old-checkpoint publication gates passed. The adversarial Pi
 review returned `ACCEPT`. Gate passed.
+
+A fresh 64-game held-out set tested the final checkpoint on 24,250 unseen
+rows. Both traversers learned the value function: v0 had 0.1074 RMS error and
+0.9747 correlation; v1 had 0.1054 RMS error and 0.9751 correlation. Swapping
+the traverser input made both results worse (0.1076 and 0.1059 RMS), so the
+network uses the input in the correct direction. The small gap shows that most
+of the value function is shared, as expected.
