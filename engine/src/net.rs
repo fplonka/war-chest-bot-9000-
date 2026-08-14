@@ -542,8 +542,6 @@ pub struct Mlp {
     /// The checkpoint's shape vector, verbatim (v3: see `from_flat_v3`).
     pub dims: Vec<usize>,
     v1: bool,
-    /// The seat-antisymmetric readout (dims tag 5).
-    odd: bool,
     de: usize,
     dg: usize,
     rank: usize,
@@ -560,9 +558,6 @@ pub struct Mlp {
     ln1: (Vec<f32>, Vec<f32>),
     hmlp: Vec<Lin>,
     wu: Lin,
-    /// The game-value head: one scalar per position, read with opposite sign
-    /// by the two seats. Empty unless `odd`.
-    wv: Lin,
     slot: Vec<Lin>,
     slot_out: Lin,
     res: Vec<(Lin, Lin)>,
@@ -587,10 +582,6 @@ pub struct Span {
 /// device GEMMs at it, so the two sides cannot disagree.
 #[derive(Clone, Debug, Default)]
 pub struct V3Layout {
-    /// Tag 5: the readout is antisymmetric in the seat (`Mlp::odd`). Tag 3 is
-    /// the old same-sign readout, still loadable so a gate can play them
-    /// against each other.
-    pub odd: bool,
     pub de: usize,
     pub dg: usize,
     pub rank: usize,
@@ -617,8 +608,6 @@ pub struct V3Layout {
     pub wq: Span,
     pub wk: Span,
     pub wp: Span,
-    /// The game-value head. Present only when `odd`.
-    pub wv: Span,
     pub w_len: usize,
     pub b_len: usize,
     pub ln_len: usize,
@@ -627,11 +616,9 @@ pub struct V3Layout {
 impl V3Layout {
     /// Walk the v3 dims (see `from_flat_v3`) into spans.
     pub fn new(dims: &[usize]) -> Result<V3Layout, String> {
-        let odd = match dims.first() {
-            Some(&3) => false,
-            Some(&5) => true,
-            _ => return Err(format!("not a v3 dims vector: {dims:?}")),
-        };
+        if dims.first() != Some(&3) {
+            return Err(format!("not a v3 dims vector: {dims:?}"));
+        }
         let mut at = 1;
         let mut scalar = |name: &str| -> Result<usize, String> {
             let v = *dims.get(at).ok_or(format!("dims truncated at {name}"))?;
@@ -664,7 +651,6 @@ impl V3Layout {
             return Err("the public tower needs at least one layer".into());
         }
         let mut l = V3Layout {
-            odd,
             de,
             dg,
             rank,
@@ -728,9 +714,6 @@ impl V3Layout {
         l.wq = lin(&mut w, &mut b, AFEAT + de, rank);
         l.wk = lin(&mut w, &mut b, dg, rank);
         l.wp = lin(&mut w, &mut b, l.head_out, rank);
-        if odd {
-            l.wv = lin(&mut w, &mut b, l.head_out, 1);
-        }
         for &h in &pub_w {
             l.pub_ln.push((ln, ln + h));
             ln += 2 * h;
@@ -765,15 +748,14 @@ impl V3Layout {
 
 impl Mlp {
     /// Build from the flat arrays the trainer ships. Three formats load:
-    /// v3 (`dims[0] == 3`, or 5 for the antisymmetric readout — the tower
-    /// format below), v2 (the frozen 10-entry fixed layout), and v1 (5
-    /// entries, pre-describer). All land in the same tower representation;
-    /// only parsing differs.
+    /// v3 (`dims[0] == 3`, the tower format below), v2 (the frozen 10-entry
+    /// fixed layout), and v1 (5 entries, pre-describer). All three land in
+    /// the same tower representation; only parsing differs.
     pub fn from_flat(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Mlp, String> {
         if dims.len() == 5 {
             return Mlp::from_flat_v1(dims, w, b, ln);
         }
-        if dims.first() == Some(&3) || dims.first() == Some(&5) {
+        if dims.first() == Some(&3) {
             return Mlp::from_flat_v3(dims, w, b, ln);
         }
         if dims.len() == 10 {
@@ -821,7 +803,6 @@ impl Mlp {
         Ok(Mlp {
             dims: dims.to_vec(),
             v1: false,
-            odd: l.odd,
             de: l.de,
             dg: l.dg,
             rank: l.rank,
@@ -848,7 +829,6 @@ impl Mlp {
             wq: lin(&l.wq),
             wk: lin(&l.wk),
             wp: lin(&l.wp),
-            wv: if l.odd { lin(&l.wv) } else { Lin::default() },
         })
     }
 
@@ -987,7 +967,6 @@ impl Mlp {
         Ok(Mlp {
             dims: dims.to_vec(),
             v1: true,
-            odd: false,
             de: 0,
             dg,
             rank: rk,
@@ -1019,7 +998,6 @@ impl Mlp {
             wq: Lin::default(),
             wk: Lin::default(),
             wp: Lin::default(),
-            wv: Lin::default(),
         })
     }
 
@@ -1117,12 +1095,6 @@ impl Mlp {
     /// Whether this is a checkpoint from before the card describer.
     pub fn v1(&self) -> bool {
         self.v1
-    }
-    /// Whether the readout is antisymmetric in the seat: a config's value is
-    /// the seat's share of one antisymmetric game value plus a deviation whose
-    /// belief-weighted mean is zero. See `train/value_net.py::forward`.
-    pub fn odd(&self) -> bool {
-        self.odd
     }
     /// Width of the trunk's input, once the card embeddings are spliced in.
     pub fn xdim(&self) -> usize {
@@ -1342,27 +1314,6 @@ impl Mlp {
         self.wg.bias(n, g);
     }
 
-    /// `wg` applied to belief-weighted mean config embeddings — the mean of
-    /// `g` over a seat's support, because `wg` is linear. The antisymmetric
-    /// readout subtracts it, and `Solver` already holds the means: they are
-    /// the belief blocks the head reads.
-    /// The position's game value, from the head's hidden layer. Seat 0 reads it
-    /// as is and seat 1 negates it, which is what makes the two seats' mean
-    /// values cancel.
-    pub fn game_value(&self, h: &[f32]) -> f32 {
-        let mut out = vec![0.0f32; 1];
-        self.wv.gemm(&h[..self.wv.i], 1, self.wv.i, 0.0, &mut out);
-        out[0] + self.wv.b[0]
-    }
-
-    pub fn gbar(&self, zmean: &[f32], n: usize, out: &mut Vec<f32>) {
-        let (rk, dg) = (self.rank, self.dg);
-        debug_assert_eq!(zmean.len(), n * dg);
-        fit(out, n * (rk + 1));
-        self.wg.gemm(zmean, n, dg, 0.0, &mut out[..n * (rk + 1)]);
-        self.wg.bias(n, out);
-    }
-
     /// The public tower: every layer `relu(LN(x W + b))`, then `pub_out`
     /// projects to the head width. The result is `h0`, pre-norm — `pub_out`'s
     /// bias and `ln1` are applied at the head entry, per iteration. Computed
@@ -1536,6 +1487,17 @@ impl Mlp {
 
     /// The per-config readout: `v = <u, g[..rank]> + g[rank]`, for the configs
     /// `idx` names in a `g` table built by `embed`.
+    pub fn values(&self, u: &[f32], g: &[f32], idx: &[u32], out: &mut [f32]) {
+        let rk = self.rank;
+        debug_assert_eq!(idx.len(), out.len());
+        for (o, &i) in out.iter_mut().zip(idx.iter()) {
+            let row = &g[i as usize * (rk + 1)..];
+            *o = dot(u, &row[..rk]) + row[rk];
+        }
+    }
+
+    /// One value per row, for callers with no solve to amortise over: the
+    /// torch parity check and the offline tools.
     pub fn forward(
         &self,
         xpub: &[f32],
@@ -1570,19 +1532,7 @@ impl Mlp {
                     &mut z,
                     &mut g,
                 );
-                if !self.odd {
-                    return dot(&u[..rk], &g[..rk]) + g[rk];
-                }
-                // Antisymmetric readout: the seat's share of one game value,
-                // plus a deviation from the seat's belief-weighted mean.
-                let seat = phi[r * self.cfeat() + CCOUNTS] as usize;
-                let bd = self.belief_dim();
-                let mut gb = Vec::new();
-                self.gbar(&xbel[r * bd + seat * self.dg..r * bd + (seat + 1) * self.dg], 1, &mut gb);
-                let s = if seat == 0 { 1.0 } else { -1.0 };
-                s * self.game_value(&sb)
-                    + (0..rk).map(|j| u[j] * (g[j] - gb[j])).sum::<f32>()
-                    + (g[rk] - gb[rk])
+                dot(&u[..rk], &g[..rk]) + g[rk]
             })
             .collect()
     }

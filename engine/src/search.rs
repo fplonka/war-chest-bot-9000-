@@ -598,13 +598,6 @@ pub struct Solver<'a> {
     nets: &'a Nets,
     pub(crate) cfg: Cfg,
     pub nodes: Vec<TNode>,
-    /// Per leaf row: the antisymmetric game value `W`, split out of `ob` so the
-    /// readout's matmul keeps its contiguous `rank`-wide rows. Empty unless the
-    /// network has the antisymmetric readout.
-    ow: Vec<f32>,
-    /// Per leaf row and seat: `wg` of the seat's belief-weighted mean config
-    /// embedding — what the antisymmetric readout centres on.
-    gb: Vec<f32>,
     /// Node states, parallel to `nodes`. Empty unless `Cfg::keep_states`.
     pub states: Vec<State>,
     pub(crate) root_belief: [Belief; 2],
@@ -773,8 +766,6 @@ impl<'a> Solver<'a> {
             nets,
             cfg,
             nodes: take_nodes(),
-            ow: Vec::new(),
-            gb: Vec::new(),
             states: Vec::new(),
             root_belief: belief,
             regret: Vec::new(),
@@ -1635,7 +1626,6 @@ impl<'a> Solver<'a> {
                 &mut self.sb,
                 &mut self.ob,
             );
-            self.split_head(rows);
         }
         self.readout(traverser);
     }
@@ -1687,25 +1677,6 @@ impl<'a> Solver<'a> {
             &mut self.sb,
             &mut self.ob,
         );
-        drop(_t);
-        self.split_head(rows);
-    }
-
-    /// After the PBS head: the antisymmetric readout needs the seat's game
-    /// value and the mean of `g` it centres on. The head's hidden layer is
-    /// still in `sb`, and the belief blocks it read are still in `xb`.
-    fn split_head(&mut self, rows: usize) {
-        let net = &self.nets.value;
-        if !net.odd() || net.is_empty() {
-            return;
-        }
-        let dg = net.dg();
-        self.ow.clear();
-        for r in 0..rows {
-            let h = &self.sb[r * net.head_out()..(r + 1) * net.head_out()];
-            self.ow.push(net.game_value(h));
-        }
-        net.gbar(&self.xb[..rows * 2 * dg], rows * 2, &mut self.gb);
     }
 
     /// Per-config leaf values for player `p` — counterfactual: the network's
@@ -1752,8 +1723,7 @@ impl<'a> Solver<'a> {
                 &mut self.vt,
             );
         }
-        let odd = self.nets.value.odd();
-        let (reach, roff, ncs, voff, coff, cidx, cg, vt, vals, ob, ow, gbar) = (
+        let (reach, roff, ncs, voff, coff, cidx, cg, vt, vals) = (
             &self.reach,
             &self.roff,
             &self.nc,
@@ -1763,9 +1733,6 @@ impl<'a> Solver<'a> {
             &self.cg,
             &self.vt,
             &mut self.vals,
-            &self.ob,
-            &self.ow,
-            &self.gb,
         );
         let ncfg = self.ncfg;
         for (r, &i) in self.leaf_rows.iter().enumerate() {
@@ -1782,23 +1749,9 @@ impl<'a> Solver<'a> {
             // belief embedding, which is what keeps the query leak-free.
             let cs = coff[2 * r + p] as usize;
             let row = &vt[r * ncfg..(r + 1) * ncfg];
-            // The antisymmetric readout: the seat's share of one game value
-            // plus a deviation from the seat's belief-weighted mean, so the two
-            // seats' mean values cancel exactly. `shift` is that mean's
-            // contribution, `base` the seat's share. Both are zero for the old
-            // same-sign readout, which leaves the expression below unchanged.
-            let (base, shift) = if odd {
-                let gb = &gbar[(2 * r + p) * (rk + 1)..(2 * r + p + 1) * (rk + 1)];
-                let u = &ob[r * rk..(r + 1) * rk];
-                let d: f32 = u.iter().zip(&gb[..rk]).map(|(a, b)| a * b).sum();
-                (if p == 0 { ow[r] } else { -ow[r] }, d + gb[rk])
-            } else {
-                (0.0, 0.0)
-            };
-
             for (v, &c) in vals[vo..vo + n].iter_mut().zip(&cidx[cs..cs + n]) {
                 // The trailing column of `g` is the per-config bias term.
-                *v = (base + row[c as usize] + cg[c as usize * (rk + 1) + rk] - shift) * opp_reach;
+                *v = (row[c as usize] + cg[c as usize * (rk + 1) + rk]) * opp_reach;
             }
         }
     }

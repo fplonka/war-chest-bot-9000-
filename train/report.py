@@ -283,8 +283,8 @@ def panels(runs):
         out.append(panel("Gradient clipping", "fraction of steps", [
             (tag(r), mins(r), [e.get("grad_clip_frac", 0) for e in r["epochs"]], True)
             for r in runs], zero=True))
-        out.append(panel("Zero-sum residual", "RMS |v0 + v1| on the probe batch", [
-            (tag(r), mins(r), [e.get("probe_zs", 0) for e in r["epochs"]], True)
+        out.append(panel("Zero-sum residual", "max |v0 + v1|", [
+            (tag(r), mins(r), [e.get("zero_sum_max", 0) for e in r["epochs"]], True)
             for r in runs], zero=True))
     out.append(panel("Replay age", "seconds retained", [
         (tag(r), mins(r), [e.get("buf_s", 0) for e in r["epochs"]], False)
@@ -324,7 +324,7 @@ def health(r):
         cells += [("effective train ratio", f"{last['effective_train_ratio']:.3f} /solve"),
                   ("passes per row", f"{last.get('train_row_ratio', 0):.3f}"),
                   ("gradient clipped", f"{last['grad_clip_frac']:.1%}"),
-                  ("|v0+v1| rms", f"{last.get('probe_zs', float('nan')):.4f}"),
+                  ("max |v0+v1|", f"{last['zero_sum_max']:.2e}"),
                   ("replay age", f"{last['buf_s'] / 60:.1f} min")]
     return "".join(f"<div><dt>{k}</dt><dd>{v}</dd></div>" for k, v in cells)
 

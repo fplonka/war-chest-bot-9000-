@@ -39,16 +39,9 @@ fn fast_gemm() -> bool {
 }
 
 fn test_weights() -> (Vec<usize>, Vec<f32>, Vec<f32>, Vec<f32>) {
-    weights_of(5)
-}
-
-/// `tag` picks the readout: 5 is the antisymmetric one production trains, 3 the
-/// same-sign one old checkpoints carry. Both have to reach the device
-/// correctly, because a ladder plays them against each other.
-fn weights_of(tag: usize) -> (Vec<usize>, Vec<f32>, Vec<f32>, Vec<f32>) {
     // Production topology: card [64], public [384], no extra head or slot
     // hidden layers, one holding residual block.
-    let dims = vec![tag, 32, DG, RK, 384, 1, 1, 64, 1, 384, 0, 0];
+    let dims = vec![3, 32, DG, RK, 384, 1, 1, 64, 1, 384, 0, 0];
     let l = V3Layout::new(&dims).expect("dims");
     let mut rng = Rng::new(0xD15EA5E);
     let w = (0..l.w_len)
@@ -238,19 +231,8 @@ fn flatten_pairs(v: &[[Vec<f32>; 2]]) -> Vec<f32> {
 
 #[test]
 fn full_wave_oracle() {
-    full_wave_oracle_at(5);
-}
-
-/// The same oracle on the old same-sign readout: a ladder loads both, so both
-/// have to be the same function on the device as on the CPU.
-#[test]
-fn full_wave_oracle_same_sign_readout() {
-    full_wave_oracle_at(3);
-}
-
-fn full_wave_oracle_at(tag: usize) {
     let _gpu = gpu_guard();
-    let (dims, w, b, ln) = weights_of(tag);
+    let (dims, w, b, ln) = test_weights();
     let nets = nets(&dims, &w, &b, &ln);
     let set = fixtures(&nets);
     let gpu = spawn(0, dims, w, b, ln).expect("GPU executor");
@@ -266,26 +248,13 @@ fn full_wave_oracle_at(tag: usize) {
     for (tree, ((mut sv, job), result)) in set.into_iter().zip(got).enumerate() {
         assert_result_invariants(&job, &result);
         sv.multistep(TEST_CFG.iters);
-        // The antisymmetric readout puts the position's game value into a
-        // single scalar, straight out of the head, and every leaf value carries
-        // it whole; the same-sign readout only ever saw the head through a
-        // 64-term dot, where FP16 error partly cancels. On this deliberately
-        // hostile random net -- wide layers, weights uniform on +-0.3, so the
-        // head's activations are large -- that is worth a factor of twelve on the worst fixture. The
-        // belief mean it centres on is kept in FP32 for the same reason
-        // (`A_XB32`); computing the shift off the FP16 store instead cost 5.3x
-        // the root-value tolerance. Nothing is relaxed on the precise path, and
-        // that is where the arithmetic is actually checked: all four oracles
-        // pass there at the tight bound, which is what says the kernel computes
-        // the same function as `search.rs::readout`.
-        let slack = if tag == 5 && fast_gemm() { 12.0 } else { 1.0 };
         let strategy_tol = if fast_gemm() {
             // The production tensor-core path deliberately trades CPU-oracle
             // rounding for throughput. Two retained FP16 residual operands
             // moved the measured synthetic worst case to 0.163 after CFR
             // amplification. Keep that bounded while the precise and
             // zero-network oracles below remain tight.
-            (2e-1 * slack, 3e-3 * slack)
+            (2e-1, 3e-3)
         } else {
             (5e-3, 2e-3)
         };
@@ -301,7 +270,7 @@ fn full_wave_oracle_at(tag: usize) {
             // FP16 internal operands retain FP32 accumulation and output, but
             // deliberately do not promise CPU-oracle rounding. Probability,
             // shape, finiteness, zero-network, and reuse gates remain tight.
-            (5e-3 * slack, 1e-3 * slack)
+            (5e-3, 1e-3)
         } else {
             (1e-3, 2e-4)
         };
@@ -324,8 +293,8 @@ fn full_wave_oracle_at(tag: usize) {
             &format!("tree {tree} carried beliefs"),
             &flatten_pairs(&got_carry),
             &flatten_pairs(&want_carry),
-            5e-4 * slack,
-            5e-4 * slack,
+            5e-4,
+            5e-4,
         );
     }
 }
@@ -386,10 +355,7 @@ fn zero_network_oracle() {
 #[test]
 fn wave_composition_stays_bounded() {
     let _gpu = gpu_guard();
-    // Tag 3: this test has a long-standing failure of its own (TODO.md), and
-    // keeping it on the readout it was calibrated against means the failure
-    // keeps its meaning instead of being blamed on the new one.
-    let (dims, w, b, ln) = weights_of(3);
+    let (dims, w, b, ln) = test_weights();
     let nets = nets(&dims, &w, &b, &ln);
     let set = fixtures(&nets);
     for measured_id in 0..set.len() {

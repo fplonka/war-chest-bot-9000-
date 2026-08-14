@@ -288,29 +288,6 @@ def make_batch(parts, rng, device, augment):
             t(seg, torch.long), t(cy), 2 * len(rows))
 
 
-def zero_sum_residual(v, w, seg, nseg):
-    """Per position, how far the two players' belief-weighted values are from
-    cancelling. The readout makes this zero by construction, so it is an
-    assertion rather than a diagnostic: `probe_zs` should read float noise, and
-    anything else means one of the four readouts has drifted. `seg` is
-    `2 * row + seat`, so the two seats of a position are neighbours."""
-    num = torch.zeros(nseg, dtype=v.dtype, device=v.device).index_add_(0, seg, w * v)
-    den = torch.zeros(nseg, dtype=v.dtype, device=v.device).index_add_(0, seg, w)
-    m = num / den.clamp(min=1e-9)
-    return m[0::2] + m[1::2]
-
-
-def probe_stats(net, probe):
-    """Spread of the network's values on the fixed probe batch, and the RMS of
-    its zero-sum residual — the violation, measured on the raw network, which
-    is the only place it can be seen."""
-    if probe is None:
-        return float("nan"), float("nan")
-    v = net(*probe[:6], probe[7])
-    return (float(v.std()),
-            float(zero_sum_residual(v, probe[4], probe[5], probe[7]).pow(2).mean().sqrt()))
-
-
 def value_loss(net, xpub, unit_ids, phi, inv, w, seg, y, nseg):
     # Belief-weighted Huber over every config in the support. Weighting by the
     # belief is what makes the loss match the distribution CFR queries: a config
@@ -622,7 +599,8 @@ def main():
             if probe is None and len(buf) >= 2048:
                 probe = batcher(buf.sample(2048, rng), rng, dev, False)
             with torch.no_grad():
-                probe_std, probe_zs = probe_stats(value, probe)
+                probe_std = float(value(*probe[:6], probe[7]).std()) \
+                    if probe is not None else float("nan")
                 if len(buf) >= args.batch:
                     old_parts = batcher(
                         buf.sample_old(args.batch, rng, args.recent_frac), rng, dev, False)
@@ -663,7 +641,6 @@ def main():
                 "tgt_mean": round(tgt_mean, 4),
                 "tgt_std": round(tgt_var ** 0.5, 4),
                 "probe_std": round(probe_std, 4),
-                "probe_zs": round(probe_zs, 4),
                 "gen_s": round(elapsed, 2),
                 "train_s": round(window["train_s"], 2),
                 "sample_s": round(window["sample_s"], 2),
@@ -876,7 +853,8 @@ def main():
         train_s = time.time() - tt
         value.push(0)
         with torch.no_grad():
-            probe_std, probe_zs = probe_stats(value, probe)
+            probe_std = float(value(*probe[:6], probe[7]).std()) \
+                if probe is not None else float("nan")
             if len(buf) >= args.batch:
                 old_parts = batcher(
                     buf.sample_old(args.batch, rng, args.recent_frac), rng, dev, False)
@@ -902,7 +880,6 @@ def main():
                "steps": steps,
                "tgt_mean": round(tgt_mean, 4), "tgt_std": round(tgt_std, 4),
                "probe_std": round(probe_std, 4),
-               "probe_zs": round(probe_zs, 4),
                "gen_s": round(gen_s, 2), "train_s": round(train_s, 2),
                "conv_s": round(conv_s, 2), "add_s": round(add_s, 2), "buf": len(buf),
                "buf_s": round(buf.span_seconds(), 1),
