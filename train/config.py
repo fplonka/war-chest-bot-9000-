@@ -74,6 +74,13 @@ def knobs(cfg):
 
 
 def git_sha():
+    marker = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "..", ".gitsha")
+    try:
+        with open(marker) as f:
+            return f.read().strip() or "unknown"
+    except OSError:
+        pass
     try:
         sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
                              capture_output=True, text=True, check=True).stdout.strip()
@@ -82,9 +89,4 @@ def git_sha():
             capture_output=True)
         return sha + ("+dirty" if dirty.returncode != 0 else "")
     except Exception:
-        try:
-            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   "..", ".gitsha")) as f:
-                return f.read().strip() or "unknown"
-        except OSError:
-            return "unknown"
+        return "unknown"
