@@ -52,7 +52,12 @@ fn micro_position(seed: u64, warmup: usize, plies: u16) -> Option<State> {
 fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
     let res = reserve(s, p, ctx);
     let truth = true_config(s, p, ctx);
-    let cfgs = enumerate_configs(&res, truth.hand_size(), truth.fd_size(), truth.inflight.is_some());
+    let cfgs = enumerate_configs(
+        &res,
+        truth.hand_size(),
+        truth.fd_size(),
+        truth.inflight.is_some(),
+    );
     let n = cfgs.len() as f32;
     Belief {
         p: vec![1.0 / n; cfgs.len()],
@@ -185,7 +190,10 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
             // If any leaf were non-terminal the (empty) network would silently
             // return zero and the comparison would be meaningless.
             assert!(
-                sv.nodes.iter().zip(&sv.states).all(|(n, st)| !n.leaf || st.is_terminal()),
+                sv.nodes
+                    .iter()
+                    .zip(&sv.states)
+                    .all(|(n, st)| !n.leaf || st.is_terminal()),
                 "the whole remaining game must fit inside the subgame"
             );
             if sv.nodes.len() > 8_000 {
@@ -686,7 +694,10 @@ fn warrior_priest_draw_walks_through_the_tree() {
     // The child is a WarriorPriestPlay decision node. Its actions come from
     // both in-flight coins and its per-config legality is that coin.
     let wpn = &sv.nodes[ch];
-    assert!(matches!(sv.states[ch].pending(), Cont::WarriorPriestPlay { .. }));
+    assert!(matches!(
+        sv.states[ch].pending(),
+        Cont::WarriorPriestPlay { .. }
+    ));
     assert!(!wpn.leaf && !wpn.chance);
     assert!(wpn.na() > 0);
     let me = wpn.player as usize;

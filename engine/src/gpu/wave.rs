@@ -96,6 +96,7 @@ pub struct Wave {
     pub ids: Vec<u8>,
     pub config_job: Vec<u32>,
     pub cphi: Vec<f32>,
+    pub config_player: Vec<u8>,
     pub roots: Vec<f32>,
     pub carried: Vec<f32>,
     /// Terminal payoff in the terminal node's player perspective; zero for
@@ -183,6 +184,7 @@ impl Wave {
             ids: Vec::new(),
             config_job: Vec::new(),
             cphi: Vec::new(),
+            config_player: Vec::new(),
             roots: Vec::new(),
             carried: Vec::new(),
             node_utility: Vec::new(),
@@ -443,12 +445,8 @@ impl Wave {
         self.rvd_src.extend_from_slice(&t.rvd_src);
         self.rvd_p.extend_from_slice(&t.rvd_p);
 
-        self.row_node.extend(
-            t.leaf_rows
-                .iter()
-                .chain(&t.inner_rows)
-                .map(|&x| node0 as u32 + x),
-        );
+        self.row_node
+            .extend(t.leaf_rows.iter().map(|&x| node0 as u32 + x));
         self.row_job
             .resize(self.row_job.len() + t.rows, job_id as u32);
         self.row_cfg_off
@@ -461,6 +459,7 @@ impl Wave {
         self.config_job
             .resize(self.config_job.len() + t.ncfg, job_id as u32);
         self.cphi.extend_from_slice(&t.cphi);
+        self.config_player.extend_from_slice(&t.cplayer);
         self.roots.extend_from_slice(&job.root[0]);
         self.roots.extend_from_slice(&job.root[1]);
         for root in &job.carried {
@@ -675,6 +674,7 @@ impl Wave {
             || *self.row_cfg_off.last().unwrap() as usize != self.row_cfg.len()
             || self.raw_rows.len() != self.row_node.len() * GPU_ROW_BYTES
             || self.cphi.len() != self.config_job.len() * CFEAT
+            || self.config_player.len() != self.config_job.len()
         {
             return Err("wave network arrays disagree".into());
         }
@@ -729,7 +729,6 @@ fn same_meta(a: &PackedMeta, b: &PackedMeta) -> bool {
         && a.cfr.beta.to_bits() == b.cfr.beta.to_bits()
         && a.cfr.gamma.to_bits() == b.cfr.gamma.to_bits()
         && a.cfr.predict.to_bits() == b.cfr.predict.to_bits()
-        && a.warm.to_bits() == b.warm.to_bits()
         && a.snap_iters == b.snap_iters
         && a.net_dims == b.net_dims
 }

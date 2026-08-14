@@ -40,7 +40,6 @@ fn main() {
         iters: 64,
         snapshots: true,
         cfr: Cfr::LINEAR,
-        warm: 0.0,
         node_cap: 200_000,
         gpu_build: true,
         keep_states: false,

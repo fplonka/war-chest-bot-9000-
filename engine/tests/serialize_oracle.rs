@@ -49,7 +49,7 @@ fn real_solver_round_trips() {
         assert_eq!(back.tables.nodes, sv.nodes.len());
         assert_eq!(back.meta.iters, cfg().iters);
         assert_eq!(back.tables.nleaf, sv.leaf_rows.len());
-        assert_eq!(back.tables.rows, sv.leaf_rows.len() + sv.inner_rows.len());
+        assert_eq!(back.tables.rows, sv.leaf_rows.len());
         assert_eq!(back.tables.ncells, sv.ncells);
         assert_eq!(walk.node_kind, back.tables.node_kind);
         assert_eq!(walk.node_player, back.tables.node_player);

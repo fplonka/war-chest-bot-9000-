@@ -66,7 +66,12 @@ fn step(s: &mut State, rng: &mut Rng, greedy: bool) {
 fn open_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
     let res = reserve(s, p, ctx);
     let truth = true_config(s, p, ctx);
-    let cfg = enumerate_configs(&res, truth.hand_size(), truth.fd_size(), truth.inflight.is_some());
+    let cfg = enumerate_configs(
+        &res,
+        truth.hand_size(),
+        truth.fd_size(),
+        truth.inflight.is_some(),
+    );
     let cfg = if cfg.is_empty() {
         vec![Config::default()]
     } else {

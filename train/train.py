@@ -95,7 +95,7 @@ class Buffer:
     Bootstrapped targets are averaged over whatever history the buffer holds, so
     its length is a real algorithmic knob and not just a memory setting -- the
     reference implementation runs a 2M buffer. A row is the frozen compact
-    format (`ROW_BYTES` raw bytes: hex facts, piles, unit ids, scalars, aux) --
+    format (`ROW_BYTES` raw bytes: hex facts, piles, unit ids, and scalars) --
     ~223 bytes instead of the ~1.9 KB the old float encoding cost -- and the
     network input is expanded from it when a batch is made. Counts are stored
     as the `uint8` they are and everything else as float16, which is what makes
@@ -177,7 +177,7 @@ class Buffer:
     def gather(self, ids):
         """Assemble a batch from absolute row ids.
 
-        Returns `(rows, cc, cp, cw, cy, seg)`; the aux targets and unit ids
+        Returns `(rows, cc, cp, cw, cy, seg)`; the unit ids
         live inside the packed rows and are read out by `make_batch`.
         """
         s = ids % self.cap
@@ -239,62 +239,37 @@ class Buffer:
 
 
 def make_batch(parts, rng, device, augment):
-    """Numpy batch -> tensors, with the 180-degree mirror on a random half.
-
-    Rotating the board and swapping the seats is an exact symmetry, so every
-    row is usable twice. Measured offline on a frozen dump: held-out loss
-    0.008446 -> 0.008161 and the train/test gap shrinks 38%, because the binding
-    constraint on this network is distinct positions, not parameters. Applied
-    per batch rather than stored, so the buffer does not double.
-
-    The mirror runs on the packed rows (hex arrays permuted, owners and
-    players swapped, unit ids exchanged) and the config side is one bit: a
-    config carries the seat it belongs to as a feature, and `seg` is
-    `2 * row + seat`. The network input is then expanded from the (possibly
-    mirrored) rows by the Rust encoder.
-    """
+    """Numpy replay batch -> the two canonical player queries per row."""
+    del rng, augment
     rows, cc, cp, cw, cy, seg = parts
     n = len(rows)
-    # Public sizes name seats, so they are read off the config support before
-    # the mirror (the seat flip below would scramble `seg`'s order).
     hand, fd, bag = public_sizes(cc, cp, seg, n)
-    if augment:
-        which = rng.random(n) < 0.5
-        rows[which] = mirror.mirror_rows(rows[which])
-        flip = which[seg // 2]
-        cp = np.where(flip, 1 - cp, cp)
-        seg = np.where(flip, seg ^ 1, seg)
-        hand[which] = hand[which][:, ::-1]
-        fd[which] = fd[which][:, ::-1]
-        bag[which] = bag[which][:, ::-1]
-    x = expand_batch(rows, hand, fd, bag)
-    unit_ids = rows[:, ROW_IDS:ROW_IDS + NTYPE]
-    # Every config gets its own holding-tower row, duplicates included.
-    #
-    # This used to deduplicate: the key was the row's unit ids (post-mirror),
-    # the seat and the 15 counts, and `inv` mapped each config back to its
-    # representative. It removed about 32% of config rows and cost more than it
-    # saved. `np.unique` over that key was ~105 ms of the ~173 ms step, on the
-    # same cores the generation workers want; computing the tower for every row
-    # instead took the whole step to ~72 ms, and 228 -> 101 ms with 320 workers
-    # running. The result is unchanged, not approximated: with `inv` the
-    # identity, `crow` in `Mlp.forward` collapses to `seg // 2` and the two
-    # gathers become no-ops, so the tower sees exactly the inputs it saw before.
-    phi = np.concatenate([cc.astype(np.float32) / CNORM,
-                          cp[:, None].astype(np.float32)], 1)
-    inv = np.arange(len(cc), dtype=np.int64)
+    views = np.empty((2 * n, ROW_BYTES), np.uint8)
+    views[0::2] = rows
+    views[1::2] = mirror.mirror_rows(rows)
+    sizes = []
+    for a in (hand, fd, bag):
+        pair = np.empty((2 * n, 2), np.uint8)
+        pair[0::2] = a
+        pair[1::2] = a[:, ::-1]
+        sizes.append(pair)
+    x = expand_batch(views, *sizes)
+    unit_ids = views[:, ROW_IDS:ROW_IDS + NTYPE]
+    phi = cc.astype(np.float32) / CNORM
     t = lambda a, d=torch.float32: torch.as_tensor(a, dtype=d, device=device)
-    return (t(x), t(unit_ids, torch.long), t(phi), t(inv, torch.long), t(cw),
-            t(seg, torch.long), t(cy), 2 * len(rows))
+    return (t(x), t(unit_ids, torch.long), t(phi), t(cw), t(seg, torch.long),
+            t(cy), 2 * n)
 
 
-def value_loss(net, xpub, unit_ids, phi, inv, w, seg, y, nseg):
-    # Belief-weighted Huber over every config in the support. Weighting by the
-    # belief is what makes the loss match the distribution CFR queries: a config
-    # the belief gives 1% to is worth 1% of the gradient.
-    v = net(xpub, unit_ids, phi, inv, w, seg, nseg)
+def value_loss(net, xpub, unit_ids, phi, w, seg, y, nseg):
+    """Mean Huber per support, then mean across canonical queries."""
+    v = net(xpub, unit_ids, phi, w, seg, nseg)
     per = F.smooth_l1_loss(v, y, reduction="none", beta=0.5)
-    return (per * w).sum() / w.sum().clamp(min=1e-6)
+    total = torch.zeros(nseg, dtype=per.dtype, device=per.device)
+    count = torch.zeros(nseg, dtype=per.dtype, device=per.device)
+    total.index_add_(0, seg, per)
+    count.index_add_(0, seg, torch.ones_like(per))
+    return (total / count.clamp(min=1)).mean()
 
 
 def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
@@ -465,12 +440,7 @@ def main():
         torch.cuda.set_stream(train_stream)
         print(f"[train] CUDA stream priority {args.train_stream_priority}", flush=True)
 
-    towers = lambda s: [int(x) for x in s.split(",") if x.strip()] or None
-    value = Mlp(args.hidden, args.dg, args.rank, args.de,
-                head=(args.head or args.hidden),
-                pub=towers(args.pub), hmlp=towers(args.hmlp),
-                card=towers(args.card), slot=towers(args.slot),
-                nres=args.nres).to(dev)
+    value = Mlp().to(dev)
     if args.init_weights:
         initial = load_checkpoint(args.init_weights)
         if list(initial.dims) != list(value.dims):
@@ -541,12 +511,10 @@ def main():
             snaps[-1]["label"] = label
             return
         path = f"{args.out}/snap_{len(snaps):02d}.pt"
-        torch.save({"value": value.state_dict(), "spec": value.spec(),
-                    "hidden": args.hidden, "head": args.head or args.hidden,
-                    "dg": args.dg, "rank": args.rank, "de": args.de, "t": round(el, 1),
+        torch.save({"value": value.state_dict(), "spec": value.spec(), "t": round(el, 1),
                     "label": label, "git": args.git,
                     "search": {"depth": args.depth, "iters": args.iters,
-                               "cfr": args.cfr, "warm": 0.0}}, path)
+                               "cfr": args.cfr}}, path)
         snaps.append({"label": label, "t": round(el, 1),
                       "file": os.path.basename(path)})
         print(f"[t={el:6.1f}s] --- snapshot {snaps[-1]['file']} ({label}) ---", flush=True)
@@ -561,7 +529,7 @@ def main():
         gen = warchest.gpu_stream_start(
             args.seed * 1_000_003 + epoch,
             depth=args.depth, iters=args.iters, explore=args.explore,
-            random_draft=args.random_draft, cfr=args.cfr, warm=0.0,
+            random_draft=args.random_draft, cfr=args.cfr,
             eval_mix=args.eval_mix, workers=args.gpu_workers,
             actors_per_worker=args.gpu_actors,
             inflight_per_worker=args.gpu_inflight, chunk_solves=args.gpu_chunk)
@@ -599,7 +567,7 @@ def main():
             if probe is None and len(buf) >= 2048:
                 probe = batcher(buf.sample(2048, rng), rng, dev, False)
             with torch.no_grad():
-                probe_std = float(value(*probe[:6], probe[7]).std()) \
+                probe_std = float(value(*probe[:5], probe[6]).std()) \
                     if probe is not None else float("nan")
                 if len(buf) >= args.batch:
                     old_parts = batcher(
@@ -738,7 +706,7 @@ def main():
                     tt = time.time()
                     lv, train_stat = train_steps(
                         value, opt, buf, nsteps, args.batch, rng, dev,
-                        augment=not args.no_augment,
+                        augment=False,
                         recent_mix=args.recent_mix, recent_frac=args.recent_frac,
                         profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1",
                         batch_fn=batcher)
@@ -809,14 +777,13 @@ def main():
             flush=True)
 
     next_snap = float("inf")
-    print(f"[cfg] PUBFEAT={PUBFEAT} CFEAT={CFEAT} hidden={args.hidden} "
-          f"head={args.head or args.hidden} dg={args.dg} rank={args.rank} "
+    print(f"[cfg] PUBFEAT={PUBFEAT} CFEAT={CFEAT} architecture=v4 "
           f"depth={args.depth} iters={args.iters} budget={total:.0f}s "
           f"warm={warm:.0f}s snapshot_every={args.snapshot_every:g}min "
           f"device={dev} draft={'random' if args.random_draft else 'starter'} "
           f"train_gen_ratio={args.train_gen_ratio} "
           f"recent_mix={args.recent_mix}/{args.recent_frac} "
-          f"augment={not args.no_augment} cap={args.cap} "
+          f"canonical_views=2 cap={args.cap} "
           f"matmul={torch.get_float32_matmul_precision()}", flush=True)
 
     while True:
@@ -847,13 +814,13 @@ def main():
         steps = max(1, round(args.train_gen_ratio * solves / args.batch))
         lv, _ = train_steps(
             value, opt, buf, steps, args.batch, rng, dev,
-            augment=not args.no_augment,
+            augment=False,
             recent_mix=args.recent_mix, recent_frac=args.recent_frac,
             batch_fn=batcher)
         train_s = time.time() - tt
         value.push(0)
         with torch.no_grad():
-            probe_std = float(value(*probe[:6], probe[7]).std()) \
+            probe_std = float(value(*probe[:5], probe[6]).std()) \
                 if probe is not None else float("nan")
             if len(buf) >= args.batch:
                 old_parts = batcher(

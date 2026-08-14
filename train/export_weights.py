@@ -17,44 +17,14 @@ import numpy as np
 import torch
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from value_net import Mlp, upgrade_state_dict  # noqa: E402
-from value_net_v1 import MlpV1  # noqa: E402
+from value_net import Mlp  # noqa: E402
 
 
 def load(path):
-    """A checkpoint as an `Mlp`, in the shape it was saved with.
-
-    Checkpoints from before the card describer read the frozen `v1` encoding
-    (972 numbers, unit identities and all) and come back as an `MlpV1`. They
-    exist only so a gate can play the new architecture against the pool it is
-    meant to beat; nothing trains them.
-
-    Checkpoints from after that but before the policy head have no
-    `wq`/`wk`/`wp`. Those are left at their initialisation and `has_policy` goes
-    False, which is safe for anything that only searches — search asks for values
-    and never for action probabilities — and is exactly what anything reading the
-    policy must refuse.
-    """
-    # Our own checkpoints; torch 2.6+ defaults to weights_only=True.
+    """Load one production checkpoint. Old model formats are unsupported."""
     ck = torch.load(path, map_location="cpu", weights_only=False)
-    sd = ck["value"]
-    if "wv.weight" in sd:
-        raise SystemExit(f"{path}: antisymmetric-readout checkpoint; that readout is gone")
-    args = (ck["hidden"], ck.get("dg", 64), ck.get("rank", 64))
-    # A checkpoint with no card describer is a pre-A2 one and reads the frozen
-    # v1 encoding. Told apart by the weights themselves, not by a version field
-    # the old checkpoints never carried.
-    if "wd0.weight" not in sd and "card.0.weight" not in sd:
-        net = MlpV1(*args)
-        net.load_state_dict(sd)
-        return net
-    if "spec" in ck:
-        net = Mlp(**ck["spec"])
-    else:
-        net = Mlp(*args, ck.get("de", 32), head=ck.get("head", ck["hidden"]))
-    # Fixed-layout checkpoints carry the old attribute names; rename.
-    missing, _ = net.load_state_dict(upgrade_state_dict(sd), strict=False)
-    net.has_policy = not any(k.startswith(("wq.", "wk.", "wp.")) for k in missing)
+    net = Mlp()
+    net.load_state_dict(ck["value"])
     return net
 
 

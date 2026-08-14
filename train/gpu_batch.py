@@ -118,21 +118,6 @@ def _expand_rows(
     tl.store(out + r * PUBFEAT + j, value, mask=valid)
 
 
-@triton.jit
-def _expand_configs(cc, cp, out, n, CCOUNTS: tl.constexpr,
-                    CFEAT: tl.constexpr, CNORM: tl.constexpr,
-                    BLOCK: tl.constexpr):
-    q = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    valid = q < n * CFEAT
-    r = q // CFEAT
-    c = q - r * CFEAT
-    ci = tl.minimum(c, CCOUNTS - 1)
-    count = tl.load(cc + r * CCOUNTS + ci, mask=valid & (c < CCOUNTS), other=0).to(tl.float32)
-    player = tl.load(cp + r, mask=valid & (c == CCOUNTS), other=0).to(tl.float32)
-    value = tl.where(c < CCOUNTS, count / CNORM, player)
-    tl.store(out + q, value, mask=valid)
-
-
 @lru_cache(maxsize=None)
 def _tables(device_text):
     device = torch.device(device_text)
@@ -144,32 +129,31 @@ def _tables(device_text):
 
 
 def make_batch(parts, rng, device, augment):
-    """Compact numpy replay batch -> ordinary model tensors on ``device``."""
+    """Compact replay batch -> two canonical query rows on ``device``."""
+    del rng, augment
     from train import public_sizes
 
     rows, cc, cp, cw, cy, seg = parts
     n = len(rows)
     hand, fd, bag = public_sizes(cc, cp, seg, n)
-    if augment:
-        which = rng.random(n) < 0.5
-        rows[which] = mirror.mirror_rows(rows[which])
-        flip = which[seg // 2]
-        cp = np.where(flip, 1 - cp, cp)
-        seg = np.where(flip, seg ^ 1, seg)
-        hand[which] = hand[which][:, ::-1]
-        fd[which] = fd[which][:, ::-1]
-        bag[which] = bag[which][:, ::-1]
-
-    sizes = np.concatenate([hand, fd, bag], axis=1).astype(np.uint8, copy=False)
-    rows = np.ascontiguousarray(rows)
+    views = np.empty((2 * n, warchest.ROW_BYTES), np.uint8)
+    views[0::2] = rows
+    views[1::2] = mirror.mirror_rows(rows)
+    size_parts = []
+    for a in (hand, fd, bag):
+        pair = np.empty((2 * n, 2), np.uint8)
+        pair[0::2] = a
+        pair[1::2] = a[:, ::-1]
+        size_parts.append(pair)
+    sizes = np.concatenate(size_parts, axis=1)
+    rows = np.ascontiguousarray(views)
     cc = np.ascontiguousarray(cc)
-    cp = np.ascontiguousarray(cp)
     t = lambda a, dtype=None: torch.as_tensor(a, dtype=dtype, device=device)
     rows_t = t(rows, torch.uint8)
     sizes_t = t(sizes, torch.uint8)
     cards, locations = _tables(str(device))
-    x = torch.empty((n, warchest.PUBFEAT), dtype=torch.float32, device=device)
-    _expand_rows[(n,)](
+    x = torch.empty((2 * n, warchest.PUBFEAT), dtype=torch.float32, device=device)
+    _expand_rows[(2 * n,)](
         rows_t, sizes_t, cards, locations, x,
         ROW_BYTES=warchest.ROW_BYTES, PUBFEAT=warchest.PUBFEAT,
         N_HEXES=warchest.N_HEXES, HEX_CH=warchest.HEX_CH,
@@ -186,19 +170,11 @@ def make_batch(parts, rng, device, augment):
         ROW_PLIES=warchest.ROW_PLIES, MAX_COINS=21.0,
         MAX_PLIES=warchest.MAX_MAIN_PLAYS, BLOCK=1024, num_warps=4)
 
-    nc = len(cc)
-    cc_t = t(cc, torch.uint8)
-    cp_t = t(cp, torch.uint8)
-    phi = torch.empty((nc, warchest.CFEAT), dtype=torch.float32, device=device)
-    _expand_configs[(triton.cdiv(nc * warchest.CFEAT, 256),)](
-        cc_t, cp_t, phi, n=nc, CCOUNTS=warchest.CCOUNTS,
-        CFEAT=warchest.CFEAT, CNORM=float(warchest.CNORM),
-        BLOCK=256, num_warps=4)
+    phi = t(cc, torch.float32) / float(warchest.CNORM)
 
     unit_ids = rows_t[:, warchest.ROW_IDS:warchest.ROW_IDS + warchest.NTYPE].long()
-    inv = torch.arange(nc, dtype=torch.long, device=device)
-    return (x, unit_ids, phi, inv, t(cw, torch.float32),
-            t(seg, torch.long), t(cy, torch.float32), 2 * n)
+    return (x, unit_ids, phi, t(cw, torch.float32), t(seg, torch.long),
+            t(cy, torch.float32), 2 * n)
 
 
 def warmup(device):

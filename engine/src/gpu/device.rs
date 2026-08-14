@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::mem::{align_of, size_of, MaybeUninit};
-use std::sync::{Arc, Once, OnceLock};
+use std::sync::{Arc, Once};
 use std::time::Instant;
 
 use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
@@ -19,7 +19,7 @@ use cudarc::driver::{result, sys, CudaSlice, DevicePtr, DevicePtrMut, PushKernel
 use cudarc::nvrtc;
 
 use crate::gpu::client::{CarryStore, SolveResult};
-use crate::net::V3Layout;
+use crate::net::{V4Layout, CONFIG, CONTEXT, JOINT, PUBLIC, PUBLIC_IN, SLOT, UNIT};
 use crate::rebel::{CFEAT, GPU_ROW_BYTES, NSLOT, NTYPE, PILE_COUNTS};
 use crate::units::CARD_FEATS;
 
@@ -27,7 +27,7 @@ use super::wave::Wave;
 
 const BLOCK: u32 = 256;
 const GRAPH_CLASSES: usize = 4;
-const N_TABLES: usize = 51;
+const N_TABLES: usize = 52;
 const N_ARENAS: usize = 21;
 
 #[repr(usize)]
@@ -83,6 +83,7 @@ enum Table {
     BackLevel1,
     Readout,
     Jobs,
+    ConfigPlayer,
 }
 
 #[repr(usize)]
@@ -171,35 +172,36 @@ unsafe impl Send for WaveDev {}
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct WeightDev {
-    card_w: [*const f32; 8],
-    card_b: [*const f32; 8],
-    wid: *const f32,
-    pile_w: *const f32,
-    pile_b: *const f32,
-    pub_w: [*const f32; 8],
-    pub_b: [*const f32; 8],
-    pub_lnw: [*const f32; 8],
-    pub_lnb: [*const f32; 8],
-    pub_out_w: *const f32,
-    pub_out_b: *const f32,
-    wb: *const f32,
-    wt: *const f32,
-    ln1w: *const f32,
-    ln1b: *const f32,
-    hmlp_w: [*const f32; 8],
-    hmlp_b: [*const f32; 8],
-    wu_w: *const f32,
-    wu_b: *const f32,
-    slot_w: [*const f32; 8],
-    slot_b: [*const f32; 8],
-    slot_out_w: *const f32,
-    slot_out_b: *const f32,
-    res_aw: [*const f32; 4],
-    res_ab: [*const f32; 4],
-    res_bw: [*const f32; 4],
-    res_bb: [*const f32; 4],
-    wg_w: *const f32,
-    wg_b: *const f32,
+    rule_w: [*const f32; 2],
+    rule_b: [*const f32; 2],
+    unit_id: *const f32,
+    public_w: [*const f32; 3],
+    public_b: [*const f32; 3],
+    public_lnw: [*const f32; 3],
+    public_lnb: [*const f32; 3],
+    belief_slot_w: *const f32,
+    belief_slot_b: *const f32,
+    belief_config_w: *const f32,
+    belief_config_b: *const f32,
+    belief_config_lnw: *const f32,
+    belief_config_lnb: *const f32,
+    belief_item_w: *const f32,
+    belief_item_b: *const f32,
+    candidate_slot_w: *const f32,
+    candidate_slot_b: *const f32,
+    candidate_w: *const f32,
+    candidate_b: *const f32,
+    candidate_lnw: *const f32,
+    candidate_lnb: *const f32,
+    context_w: [*const f32; 2],
+    context_b: [*const f32; 2],
+    context_lnw: [*const f32; 2],
+    context_lnb: [*const f32; 2],
+    context_joint_w: *const f32,
+    candidate_joint_w: *const f32,
+    joint_bias: *const f32,
+    value_w: *const f32,
+    value_b: *const f32,
 }
 
 unsafe impl cudarc::driver::DeviceRepr for WeightDev {}
@@ -214,9 +216,8 @@ impl Default for WeightDev {
 }
 
 struct WeightBank {
-    layout: V3Layout,
+    layout: V4Layout,
     _w: CudaSlice<f32>,
-    _w16: CudaSlice<u16>,
     _b: CudaSlice<f32>,
     _ln: CudaSlice<f32>,
     dev: CudaSlice<WeightDev>,
@@ -237,11 +238,10 @@ macro_rules! kernels {
 }
 
 kernels! {
-    pack_cards, bias_act, cards_finish, pile_pe, pack_piles, assemble,
-    trunk_norm, holding_in, slot_sum, finish_zg,
-    pack_head_static_f16,
+    pack_cards, bias_gelu, cards_finish, assemble, norm_gelu,
+    holding_in, slot_sum, copy_bias,
     init_strategy, seed_reach, reach_sweep, seed_sum,
-    belief_sums, belief_sums_f16, head_entry, head_entry_f16, head_act, readout, backprop_sweep,
+    belief_sums, readout, backprop_sweep,
     normalize_strategy, gather_carry, collect_root,
 }
 
@@ -252,9 +252,9 @@ kernels! {
 /// card, and everything below the kernels is wave-sized and rebuilt anyway.
 fn build_kernels(
     context: &Arc<CudaContext>,
-    layout: &V3Layout,
+    layout: &V4Layout,
 ) -> Result<(Kernels, u32, u32, u32), String> {
-        let (major, minor) = (
+    let (major, minor) = (
             context
                 .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
                 .map_err(|e| format!("CUDA capability: {e:?}"))?,
@@ -262,82 +262,82 @@ fn build_kernels(
                 .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
                 .map_err(|e| format!("CUDA capability: {e:?}"))?,
         );
-        let arch = format!("compute_{major}{minor}");
-        let cuda_root = std::env::var("CUDA_PATH")
-            .or_else(|_| std::env::var("CUDA_HOME"))
-            .unwrap_or_else(|_| "/usr/local/cuda".into());
-        // cudarc 0.17's `use_fast_math` option only enables contraction; pass
-        // NVRTC's actual umbrella flag so division, square root and denormal
-        // handling use the native fast paths too. The production path is fast
-        // math by default; the opt-out exists only for numerical diagnosis.
-        let mut nvrtc_options = vec!["--generate-line-info".into(), "--use_fast_math".into()];
-        if std::env::var_os("WARCHEST_GPU_PRECISE_MATH").is_some() {
-            nvrtc_options.pop();
-        }
-        let source = format!(
-            "{}\n{}",
-            cuda_preamble(layout),
-            include_str!("wave_kernels.cu")
-        );
-        let ptx = nvrtc::compile_ptx_with_opts(
-            &source,
-            nvrtc::CompileOptions {
-                arch: Some(Box::leak(arch.into_boxed_str())),
-                include_paths: vec![
-                    format!("{cuda_root}/include"),
-                    format!("{cuda_root}/targets/x86_64-linux/include/cccl"),
-                ],
-                options: nvrtc_options,
-                ..Default::default()
-            },
+    let arch = format!("compute_{major}{minor}");
+    let cuda_root = std::env::var("CUDA_PATH")
+        .or_else(|_| std::env::var("CUDA_HOME"))
+        .unwrap_or_else(|_| "/usr/local/cuda".into());
+    // cudarc 0.17's `use_fast_math` option only enables contraction; pass
+    // NVRTC's actual umbrella flag so division, square root and denormal
+    // handling use the native fast paths too. The production path is fast
+    // math by default; the opt-out exists only for numerical diagnosis.
+    let mut nvrtc_options = vec!["--generate-line-info".into(), "--use_fast_math".into()];
+    if std::env::var_os("WARCHEST_GPU_PRECISE_MATH").is_some() {
+        nvrtc_options.pop();
+    }
+    let source = format!(
+        "{}\n{}",
+        cuda_preamble(layout),
+        include_str!("wave_kernels.cu")
+    );
+    let ptx = nvrtc::compile_ptx_with_opts(
+        &source,
+        nvrtc::CompileOptions {
+            arch: Some(Box::leak(arch.into_boxed_str())),
+            include_paths: vec![
+                format!("{cuda_root}/include"),
+                format!("{cuda_root}/targets/x86_64-linux/include/cccl"),
+            ],
+            options: nvrtc_options,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| format!("v5 NVRTC: {e:?}"))?;
+    let module = context
+        .load_module(ptx)
+        .map_err(|e| format!("v5 CUDA module: {e:?}"))?;
+    let kernels = Kernels::load(&module)?;
+    let sms = context
+        .attribute(
+            cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
         )
-        .map_err(|e| format!("v5 NVRTC: {e:?}"))?;
-        let module = context
-            .load_module(ptx)
-            .map_err(|e| format!("v5 CUDA module: {e:?}"))?;
-        let kernels = Kernels::load(&module)?;
-        let sms = context
-            .attribute(
-                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
-            )
-            .map_err(|e| format!("CUDA multiprocessor count: {e:?}"))? as u32;
-        let sweep_blocks_per_sm = std::env::var("WARCHEST_SWEEP_BLOCKS_PER_SM")
+        .map_err(|e| format!("CUDA multiprocessor count: {e:?}"))? as u32;
+    let sweep_blocks_per_sm = std::env::var("WARCHEST_SWEEP_BLOCKS_PER_SM")
+        .ok()
+        .and_then(|x| x.parse::<u32>().ok())
+        .filter(|&x| x > 0);
+    let kernel_cap = |name: &str, default: u32| {
+        std::env::var(name)
             .ok()
             .and_then(|x| x.parse::<u32>().ok())
-            .filter(|&x| x > 0);
-        let kernel_cap = |name: &str, default: u32| {
-            std::env::var(name)
-                .ok()
-                .and_then(|x| x.parse::<u32>().ok())
-                .filter(|&x| x > 0)
-                .or(sweep_blocks_per_sm)
-                .unwrap_or(default)
-        };
-        let sweep_block = std::env::var("WARCHEST_SWEEP_BLOCK")
-            .ok()
-            .and_then(|x| x.parse::<u32>().ok())
-            .filter(|&x| (32..=1024).contains(&x) && x % 32 == 0)
-            .unwrap_or(BLOCK);
-        let backprop_blocks_per_sm = kernels
-            .backprop_sweep
-            .occupancy_max_active_blocks_per_multiprocessor(sweep_block, 0, None)
-            .map_err(|e| format!("backprop sweep occupancy: {e:?}"))?
-            // The unrestricted six-block grids overpopulate cooperative level
-            // barriers. On the heterogeneous 1,000-root tape, backprop 4 plus
-            // reach 2 averaged 709/s versus 693/s at 3/3 and 642/s at 6/6.
-            .min(kernel_cap("WARCHEST_BACKPROP_BLOCKS_PER_SM", 4));
-        let backprop_blocks = sms.saturating_mul(backprop_blocks_per_sm).max(1);
-        let reach_blocks_per_sm = kernels
-            .reach_sweep
-            .occupancy_max_active_blocks_per_multiprocessor(sweep_block, 0, None)
-            .map_err(|e| format!("reach sweep occupancy: {e:?}"))?
-            .min(kernel_cap("WARCHEST_REACH_BLOCKS_PER_SM", 2));
-        let reach_blocks = sms.saturating_mul(reach_blocks_per_sm).max(1);
-        if std::env::var_os("WARCHEST_GPU_PROFILE").is_some() {
-            eprintln!(
+            .filter(|&x| x > 0)
+            .or(sweep_blocks_per_sm)
+            .unwrap_or(default)
+    };
+    let sweep_block = std::env::var("WARCHEST_SWEEP_BLOCK")
+        .ok()
+        .and_then(|x| x.parse::<u32>().ok())
+        .filter(|&x| (32..=1024).contains(&x) && x % 32 == 0)
+        .unwrap_or(BLOCK);
+    let backprop_blocks_per_sm = kernels
+        .backprop_sweep
+        .occupancy_max_active_blocks_per_multiprocessor(sweep_block, 0, None)
+        .map_err(|e| format!("backprop sweep occupancy: {e:?}"))?
+        // The unrestricted six-block grids overpopulate cooperative level
+        // barriers. On the heterogeneous 1,000-root tape, backprop 4 plus
+        // reach 2 averaged 709/s versus 693/s at 3/3 and 642/s at 6/6.
+        .min(kernel_cap("WARCHEST_BACKPROP_BLOCKS_PER_SM", 4));
+    let backprop_blocks = sms.saturating_mul(backprop_blocks_per_sm).max(1);
+    let reach_blocks_per_sm = kernels
+        .reach_sweep
+        .occupancy_max_active_blocks_per_multiprocessor(sweep_block, 0, None)
+        .map_err(|e| format!("reach sweep occupancy: {e:?}"))?
+        .min(kernel_cap("WARCHEST_REACH_BLOCKS_PER_SM", 2));
+    let reach_blocks = sms.saturating_mul(reach_blocks_per_sm).max(1);
+    if std::env::var_os("WARCHEST_GPU_PROFILE").is_some() {
+        eprintln!(
                 "v5_sweeps block={sweep_block} backprop_blocks_per_sm={backprop_blocks_per_sm} reach_blocks_per_sm={reach_blocks_per_sm}"
             );
-        }
+    }
     Ok((kernels, backprop_blocks, reach_blocks, sweep_block))
 }
 
@@ -461,8 +461,7 @@ impl Executor {
             .new_stream()
             .map_err(|e| format!("CUDA stream: {e:?}"))?;
         let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cuBLAS: {e:?}"))?;
-        let layout = V3Layout::new(&dims)?;
-        validate_layout(&layout)?;
+        let layout = V4Layout::new(&dims)?;
         let (kernels, backprop_blocks, reach_blocks, sweep_block) =
             build_kernels(&context, &layout)?;
         let initial = WeightBank::upload(&stream, &dims, w, b, ln)?;
@@ -493,28 +492,10 @@ impl Executor {
         ln: Vec<f32>,
     ) -> Result<(), String> {
         if dims != self.dims {
-            // A shape change rebuilds the lane: new kernels for the new layout,
-            // and every wave-sized allocation and captured graph dropped. Only
-            // a ladder does this -- it rates one architecture against another
-            // on one card -- so paying an NVRTC compile per change is fine, and
-            // training never changes shape at all.
-            let layout = V3Layout::new(&dims)?;
-            validate_layout(&layout)?;
-            let context = self.stream.context().clone();
-            let (kernels, backprop_blocks, reach_blocks, sweep_block) =
-                build_kernels(&context, &layout)?;
-            self.stream
-                .synchronize()
-                .map_err(|e| format!("synchronize before GPU reshape: {e:?}"))?;
-            self.graphs.clear();
-            self.next_graph = 0;
-            self.buffers = None;
-            self.banks.clear();
-            self.kernels = kernels;
-            self.backprop_blocks = backprop_blocks;
-            self.reach_blocks = reach_blocks;
-            self.sweep_block = sweep_block;
-            self.dims = dims.clone();
+            return Err(format!(
+                "cannot publish model format {dims:?}; expected {:?}",
+                self.dims
+            ));
         }
         let bank = WeightBank::upload(&self.stream, &dims, w, b, ln)?;
         self.banks.insert(version, bank);
@@ -550,12 +531,6 @@ impl Executor {
             || (std::env::var_os("WARCHEST_ROUTE_PROFILE").is_some()
                 && wave.work.requires_arena_guard_route());
         let started = Instant::now();
-        if wave.meta.warm > 0.0 {
-            return Err("v5 FP32 baseline does not yet implement policy-head warm starts".into());
-        }
-        if wave.jobs.iter().any(|j| j.rows.len() != j.network_leaves) {
-            return Err("wave has policy rows despite warm=0".into());
-        }
         let bank = self
             .banks
             .get(&version)
@@ -734,270 +709,222 @@ impl Executor {
         let cfgs = d.host.ncfg as usize;
         let jobs = d.host.jobs as usize;
 
+        let unit_rows = 2 * jobs * NTYPE;
         launch!(
             self,
             d,
             bank,
             pack_cards,
-            threads_usize(jobs * NTYPE * CARD_FEATS)
-        )?;
-        let mut src = d.ptr(Arena::Bg);
-        let mut which = 0usize;
-        for (k, layer) in l.card.iter().enumerate() {
-            let dst = d.ptr_mut(if which == 0 { Arena::Bh } else { Arena::Bh2 });
-            gemm(
-                &self.blas,
-                jobs * NTYPE,
-                layer.o,
-                layer.i,
-                src,
-                layer.i,
-                bank.w_ptr(layer.w),
-                layer.o,
-                dst,
-                layer.o,
-                0.0,
-            )?;
-            if k + 1 < l.card.len() {
-                launch!(
-                    self,
-                    d,
-                    bank,
-                    bias_act,
-                    threads_usize(jobs * NTYPE * layer.o),
-                    0i32,
-                    k as i32,
-                    (jobs * NTYPE) as i32,
-                    which as i32
-                )?;
-                src = dst;
-                which ^= 1;
-            }
-        }
-        launch!(
-            self,
-            d,
-            bank,
-            cards_finish,
-            threads_usize(jobs * NTYPE * l.de),
-            which as i32
-        )?;
-
-        launch!(self, d, bank, pile_pe, threads_usize(jobs * NTYPE * l.de))?;
-        launch!(
-            self,
-            d,
-            bank,
-            pack_piles,
-            threads_usize(rows * NTYPE * PILE_COUNTS)
+            threads_usize(unit_rows * CARD_FEATS)
         )?;
         gemm(
             &self.blas,
-            rows * NTYPE,
-            l.de,
-            PILE_COUNTS,
+            unit_rows,
+            UNIT,
+            CARD_FEATS,
             d.ptr(Arena::Bg),
-            PILE_COUNTS,
-            bank.w_ptr(l.pile.w),
-            l.de,
+            CARD_FEATS,
+            bank.w_ptr(l.rule[0].w),
+            UNIT,
             d.ptr_mut(Arena::Bh),
-            l.de,
+            UNIT,
             0.0,
         )?;
-        launch!(self, d, bank, assemble, rows as u32)?;
-
-        let mut src = d.ptr(Arena::Bx);
-        let mut which = 0usize;
-        for (k, layer) in l.pub_lin.iter().enumerate() {
-            let dst = d.ptr_mut(if which == 0 { Arena::Bh } else { Arena::Bh2 });
-            gemm(
-                &self.blas,
-                rows,
-                layer.o,
-                layer.i,
-                src,
-                layer.i,
-                bank.w_ptr(layer.w),
-                layer.o,
-                dst,
-                layer.o,
-                0.0,
-            )?;
-            launch!(
-                self,
-                d,
-                bank,
-                trunk_norm,
-                warps(rows),
-                k as i32,
-                rows as i32,
-                which as i32
-            )?;
-            src = dst;
-            which ^= 1;
-        }
-        if fast_gemm() && l.hmlp.is_empty() {
-            // The public residual is fixed for all CFR iterations. Produce it
-            // once in the idle tower scratch, fold its bias, and retain it as
-            // FP16; the dynamic residual and LayerNorm reduction remain FP32.
-            let dst = d.ptr_mut(if which == 0 { Arena::Bh } else { Arena::Bh2 });
-            gemm(
-                &self.blas,
-                rows,
-                l.head_in,
-                l.pub_out.i,
-                src,
-                l.pub_out.i,
-                bank.w_ptr(l.pub_out.w),
-                l.head_in,
-                dst,
-                l.head_in,
-                0.0,
-            )?;
-            launch!(
-                self,
-                d,
-                bank,
-                pack_head_static_f16,
-                threads_usize(rows * l.head_in),
-                which as i32
-            )?;
-        } else {
-            gemm(
-                &self.blas,
-                rows,
-                l.head_in,
-                l.pub_out.i,
-                src,
-                l.pub_out.i,
-                bank.w_ptr(l.pub_out.w),
-                l.head_in,
-                d.ptr_mut(Arena::H0),
-                l.head_in,
-                0.0,
-            )?;
-        }
-        launch!(self, d, bank, holding_in, threads_usize(cfgs * NSLOT))?;
-        let mut src = d.ptr(Arena::Bg);
-        let mut which = 0usize;
-        for (k, layer) in l.slot.iter().enumerate() {
-            let dst = d.ptr_mut(if which == 0 { Arena::Bh } else { Arena::Bh2 });
-            gemm(
-                &self.blas,
-                cfgs * NSLOT,
-                layer.o,
-                layer.i,
-                src,
-                layer.i,
-                bank.w_ptr(layer.w),
-                layer.o,
-                dst,
-                layer.o,
-                0.0,
-            )?;
-            launch!(
-                self,
-                d,
-                bank,
-                bias_act,
-                threads_usize(cfgs * NSLOT * layer.o),
-                2i32,
-                k as i32,
-                (cfgs * NSLOT) as i32,
-                which as i32
-            )?;
-            src = dst;
-            which ^= 1;
-        }
-        let dst = d.ptr_mut(if which == 0 { Arena::Bh } else { Arena::Bh2 });
+        launch!(
+            self,
+            d,
+            bank,
+            bias_gelu,
+            threads_usize(unit_rows * UNIT),
+            0i32,
+            unit_rows as i32,
+            0i32
+        )?;
         gemm(
             &self.blas,
-            cfgs * NSLOT,
-            l.dg,
-            l.slot_out.i,
-            src,
-            l.slot_out.i,
-            bank.w_ptr(l.slot_out.w),
-            l.dg,
-            dst,
-            l.dg,
+            unit_rows,
+            UNIT,
+            UNIT,
+            d.ptr(Arena::Bh),
+            UNIT,
+            bank.w_ptr(l.rule[1].w),
+            UNIT,
+            d.ptr_mut(Arena::Bh2),
+            UNIT,
             0.0,
         )?;
-        launch!(self, d, bank, slot_sum, warps(cfgs), which as i32)?;
-        let zwhich = which ^ 1;
-        for (k, (a, b)) in l.res.iter().enumerate() {
-            let z = d.ptr_mut(if zwhich == 0 { Arena::Bh } else { Arena::Bh2 });
-            let tmp = d.ptr_mut(if zwhich == 0 { Arena::Bh2 } else { Arena::Bh });
+        launch!(self, d, bank, cards_finish, threads_usize(unit_rows * UNIT))?;
+
+        let public_rows = 2 * rows;
+        launch!(self, d, bank, assemble, public_rows as u32)?;
+        let mut src = d.ptr(Arena::Bx);
+        for k in 0..3 {
+            let dst_arena = match k {
+                0 => Arena::Bh,
+                1 => Arena::Bh2,
+                _ => Arena::H0,
+            };
             gemm(
                 &self.blas,
-                cfgs,
-                l.dg,
-                l.dg,
-                z,
-                l.dg,
-                bank.w_ptr(a.w),
-                l.dg,
-                tmp,
-                l.dg,
+                public_rows,
+                PUBLIC,
+                l.public[k].i,
+                src,
+                l.public[k].i,
+                bank.w_ptr(l.public[k].w),
+                PUBLIC,
+                d.ptr_mut(dst_arena),
+                PUBLIC,
                 0.0,
             )?;
             launch!(
                 self,
                 d,
                 bank,
-                bias_act,
-                threads_usize(cfgs * l.dg),
-                3i32,
+                norm_gelu,
+                warps(public_rows),
+                0i32,
                 k as i32,
-                cfgs as i32,
-                (zwhich ^ 1) as i32
+                public_rows as i32,
+                dst_arena as i32
             )?;
-            gemm(
-                &self.blas,
-                cfgs,
-                l.dg,
-                l.dg,
-                tmp,
-                l.dg,
-                bank.w_ptr(b.w),
-                l.dg,
-                z,
-                l.dg,
-                1.0,
-            )?;
-            launch!(
-                self,
-                d,
-                bank,
-                bias_act,
-                threads_usize(cfgs * l.dg),
-                4i32,
-                k as i32,
-                cfgs as i32,
-                zwhich as i32
-            )?;
+            src = d.ptr(dst_arena);
         }
-        let z = d.ptr(if zwhich == 0 { Arena::Bh } else { Arena::Bh2 });
+
+        launch!(self, d, bank, holding_in, threads_usize(cfgs * NSLOT))?;
+        let slot_rows = cfgs * NSLOT;
+        gemm(
+            &self.blas,
+            slot_rows,
+            SLOT,
+            3 + UNIT,
+            d.ptr(Arena::Bg),
+            3 + UNIT,
+            bank.w_ptr(l.belief_slot.w),
+            SLOT,
+            d.ptr_mut(Arena::Bh),
+            SLOT,
+            0.0,
+        )?;
+        launch!(
+            self,
+            d,
+            bank,
+            bias_gelu,
+            threads_usize(slot_rows * SLOT),
+            1i32,
+            slot_rows as i32,
+            0i32
+        )?;
+        launch!(self, d, bank, slot_sum, warps(cfgs), 0i32)?;
         gemm(
             &self.blas,
             cfgs,
-            l.rank + 1,
-            l.dg,
-            z,
-            l.dg,
-            bank.w_ptr(l.wg.w),
-            l.rank + 1,
-            d.ptr_mut(Arena::G),
-            l.rank + 1,
+            CONFIG,
+            SLOT,
+            d.ptr(Arena::Bh2),
+            SLOT,
+            bank.w_ptr(l.belief_config.w),
+            CONFIG,
+            d.ptr_mut(Arena::Bh),
+            CONFIG,
             0.0,
         )?;
         launch!(
             self,
             d,
             bank,
-            finish_zg,
-            threads_usize(cfgs * (l.dg + l.rank + 1)),
-            zwhich as i32
+            norm_gelu,
+            warps(cfgs),
+            1i32,
+            0i32,
+            cfgs as i32,
+            Arena::Bh as i32
+        )?;
+        gemm(
+            &self.blas,
+            cfgs,
+            CONFIG,
+            CONFIG,
+            d.ptr(Arena::Bh),
+            CONFIG,
+            bank.w_ptr(l.belief_item.w),
+            CONFIG,
+            d.ptr_mut(Arena::Z),
+            CONFIG,
+            0.0,
+        )?;
+        launch!(
+            self,
+            d,
+            bank,
+            copy_bias,
+            threads_usize(cfgs * CONFIG),
+            0i32,
+            cfgs as i32,
+            Arena::Z as i32
+        )?;
+
+        gemm(
+            &self.blas,
+            slot_rows,
+            SLOT,
+            3 + UNIT,
+            d.ptr(Arena::Bg),
+            3 + UNIT,
+            bank.w_ptr(l.candidate_slot.w),
+            SLOT,
+            d.ptr_mut(Arena::Bh),
+            SLOT,
+            0.0,
+        )?;
+        launch!(
+            self,
+            d,
+            bank,
+            bias_gelu,
+            threads_usize(slot_rows * SLOT),
+            2i32,
+            slot_rows as i32,
+            0i32
+        )?;
+        launch!(self, d, bank, slot_sum, warps(cfgs), 0i32)?;
+        gemm(
+            &self.blas,
+            cfgs,
+            CONFIG,
+            SLOT,
+            d.ptr(Arena::Bh2),
+            SLOT,
+            bank.w_ptr(l.candidate.w),
+            CONFIG,
+            d.ptr_mut(Arena::Bh),
+            CONFIG,
+            0.0,
+        )?;
+        launch!(
+            self,
+            d,
+            bank,
+            norm_gelu,
+            warps(cfgs),
+            2i32,
+            0i32,
+            cfgs as i32,
+            Arena::Bh as i32
+        )?;
+        gemm(
+            &self.blas,
+            cfgs,
+            JOINT,
+            CONFIG,
+            d.ptr(Arena::Bh),
+            CONFIG,
+            bank.w_ptr(l.candidate_joint.w),
+            JOINT,
+            d.ptr_mut(Arena::G),
+            JOINT,
+            0.0,
         )?;
         Ok(())
     }
@@ -1114,120 +1041,91 @@ impl Executor {
         &self,
         d: &DeviceWave,
         bank: &WeightBank,
-        both: bool,
+        _both: bool,
         traverser: usize,
     ) -> Result<(), String> {
         let l = &bank.layout;
         let rows = d.host.rows as usize;
-        // Production has no extra head MLP. Retain the dynamic GEMM output and
-        // static public residual in FP16, then expand them to form the residual
-        // sum and all LayerNorm reductions in FP32. The following tensor-core
-        // GEMM consumes the post-ReLU value directly as FP16 as well.
-        if fast_gemm() && l.hmlp.is_empty() {
-            launch!(
-                self,
-                d,
-                bank,
-                belief_sums_f16,
-                warps(d.host.nleaf as usize),
-                traverser as i32,
-                both as i32
-            )?;
-            gemm_f16_to_f16(
-                &self.blas,
-                rows,
-                l.head_in,
-                2 * l.dg,
-                d.ptr(Arena::Xb).cast(),
-                2 * l.dg,
-                bank.w16_ptr(l.wb),
-                l.head_in,
-                d.ptr_mut(Arena::H).cast(),
-                l.head_in,
-            )?;
-            launch!(self, d, bank, head_entry_f16, warps(rows), traverser as i32)?;
-            gemm_f16(
-                &self.blas,
-                rows,
-                l.rank,
-                l.head_in,
-                d.ptr(Arena::H2).cast(),
-                l.head_in,
-                bank.w16_ptr(l.wu.w),
-                l.rank,
-                d.ptr_mut(Arena::U),
-                l.rank,
-            )?;
-            return Ok(());
-        }
         launch!(
             self,
             d,
             bank,
             belief_sums,
             warps(d.host.nleaf as usize),
-            traverser as i32,
-            both as i32
+            traverser as i32
         )?;
         gemm(
             &self.blas,
             rows,
-            l.head_in,
-            2 * l.dg,
-            d.ptr(Arena::Xb),
-            2 * l.dg,
-            bank.w_ptr(l.wb),
-            l.head_in,
+            CONTEXT,
+            PUBLIC,
+            unsafe { d.ptr(Arena::H0).add(traverser * PUBLIC) },
+            2 * PUBLIC,
+            bank.w_ptr(l.context[0].w),
+            CONTEXT,
             d.ptr_mut(Arena::H),
-            h_stride(l),
+            CONTEXT,
             0.0,
         )?;
-        launch!(self, d, bank, head_entry, warps(rows), traverser as i32)?;
-
-        let mut src = d.ptr(Arena::H);
-        let mut src_width = l.head_in;
-        let mut which = 0usize;
-        for (level, layer) in l.hmlp.iter().enumerate() {
-            let next = which ^ 1;
-            let dst = d.ptr_mut(if next == 0 { Arena::H } else { Arena::H2 });
-            gemm(
-                &self.blas,
-                rows,
-                layer.o,
-                src_width,
-                src,
-                h_stride(l),
-                bank.w_ptr(layer.w),
-                layer.o,
-                dst,
-                h_stride(l),
-                0.0,
-            )?;
-            launch!(
-                self,
-                d,
-                bank,
-                head_act,
-                threads_usize(rows * layer.o),
-                level as i32,
-                rows as i32,
-                next as i32
-            )?;
-            src = dst;
-            src_width = layer.o;
-            which = next;
-        }
         gemm(
             &self.blas,
             rows,
-            l.rank,
-            src_width,
-            src,
-            h_stride(l),
-            bank.w_ptr(l.wu.w),
-            l.rank,
+            CONTEXT,
+            2 * CONFIG,
+            d.ptr(Arena::Xb),
+            2 * CONFIG,
+            unsafe { bank.w_ptr(l.context[0].w).add(PUBLIC * CONTEXT) },
+            CONTEXT,
+            d.ptr_mut(Arena::H),
+            CONTEXT,
+            1.0,
+        )?;
+        launch!(
+            self,
+            d,
+            bank,
+            norm_gelu,
+            warps(rows),
+            3i32,
+            0i32,
+            rows as i32,
+            Arena::H as i32
+        )?;
+        gemm(
+            &self.blas,
+            rows,
+            CONTEXT,
+            CONTEXT,
+            d.ptr(Arena::H),
+            CONTEXT,
+            bank.w_ptr(l.context[1].w),
+            CONTEXT,
+            d.ptr_mut(Arena::H2),
+            CONTEXT,
+            0.0,
+        )?;
+        launch!(
+            self,
+            d,
+            bank,
+            norm_gelu,
+            warps(rows),
+            3i32,
+            1i32,
+            rows as i32,
+            Arena::H2 as i32
+        )?;
+        gemm(
+            &self.blas,
+            rows,
+            JOINT,
+            CONTEXT,
+            d.ptr(Arena::H2),
+            CONTEXT,
+            bank.w_ptr(l.context_joint.w),
+            JOINT,
             d.ptr_mut(Arena::U),
-            l.rank,
+            JOINT,
             0.0,
         )?;
         Ok(())
@@ -1373,8 +1271,7 @@ impl WeightBank {
         b: Vec<f32>,
         ln: Vec<f32>,
     ) -> Result<Self, String> {
-        let layout = V3Layout::new(dims)?;
-        validate_layout(&layout)?;
+        let layout = V4Layout::new(dims)?;
         if w.len() != layout.w_len || b.len() != layout.b_len || ln.len() != layout.ln_len {
             return Err(format!(
                 "GPU weight sizes {}/{}/{} do not match {:?} ({}/{}/{})",
@@ -1387,9 +1284,7 @@ impl WeightBank {
                 layout.ln_len
             ));
         }
-        let w16: Vec<u16> = w.iter().map(|&x| crate::selfplay::f32_to_f16(x)).collect();
         let wb = htod(stream, &w)?;
-        let wb16 = htod(stream, &w16)?;
         let bb = htod(stream, &b)?;
         let lb = htod(stream, &ln)?;
         let (wp, bp, lp) = (ptr(stream, &wb), ptr(stream, &bb), ptr(stream, &lb));
@@ -1397,50 +1292,46 @@ impl WeightBank {
         let wa = |x| unsafe { wp.add(x) };
         let ba = |x| unsafe { bp.add(x) };
         let la = |x| unsafe { lp.add(x) };
-        for (k, s) in layout.card.iter().enumerate() {
-            d.card_w[k] = wa(s.w);
-            d.card_b[k] = ba(s.b);
+        for k in 0..2 {
+            d.rule_w[k] = wa(layout.rule[k].w);
+            d.rule_b[k] = ba(layout.rule[k].b);
         }
-        d.wid = wa(layout.wid);
-        d.pile_w = wa(layout.pile.w);
-        d.pile_b = ba(layout.pile.b);
-        for (k, s) in layout.pub_lin.iter().enumerate() {
-            d.pub_w[k] = wa(s.w);
-            d.pub_b[k] = ba(s.b);
-            d.pub_lnw[k] = la(layout.pub_ln[k].0);
-            d.pub_lnb[k] = la(layout.pub_ln[k].1);
+        d.unit_id = wa(layout.unit_id);
+        for k in 0..3 {
+            d.public_w[k] = wa(layout.public[k].w);
+            d.public_b[k] = ba(layout.public[k].b);
+            d.public_lnw[k] = la(layout.norms[k].0);
+            d.public_lnb[k] = la(layout.norms[k].1);
         }
-        d.pub_out_w = wa(layout.pub_out.w);
-        d.pub_out_b = ba(layout.pub_out.b);
-        d.wb = wa(layout.wb);
-        d.wt = wa(layout.wt);
-        d.ln1w = la(layout.ln1.0);
-        d.ln1b = la(layout.ln1.1);
-        for (k, s) in layout.hmlp.iter().enumerate() {
-            d.hmlp_w[k] = wa(s.w);
-            d.hmlp_b[k] = ba(s.b);
+        d.belief_slot_w = wa(layout.belief_slot.w);
+        d.belief_slot_b = ba(layout.belief_slot.b);
+        d.belief_config_w = wa(layout.belief_config.w);
+        d.belief_config_b = ba(layout.belief_config.b);
+        d.belief_config_lnw = la(layout.norms[3].0);
+        d.belief_config_lnb = la(layout.norms[3].1);
+        d.belief_item_w = wa(layout.belief_item.w);
+        d.belief_item_b = ba(layout.belief_item.b);
+        d.candidate_slot_w = wa(layout.candidate_slot.w);
+        d.candidate_slot_b = ba(layout.candidate_slot.b);
+        d.candidate_w = wa(layout.candidate.w);
+        d.candidate_b = ba(layout.candidate.b);
+        d.candidate_lnw = la(layout.norms[4].0);
+        d.candidate_lnb = la(layout.norms[4].1);
+        for k in 0..2 {
+            d.context_w[k] = wa(layout.context[k].w);
+            d.context_b[k] = ba(layout.context[k].b);
+            d.context_lnw[k] = la(layout.norms[5 + k].0);
+            d.context_lnb[k] = la(layout.norms[5 + k].1);
         }
-        d.wu_w = wa(layout.wu.w);
-        d.wu_b = ba(layout.wu.b);
-        for (k, s) in layout.slot.iter().enumerate() {
-            d.slot_w[k] = wa(s.w);
-            d.slot_b[k] = ba(s.b);
-        }
-        d.slot_out_w = wa(layout.slot_out.w);
-        d.slot_out_b = ba(layout.slot_out.b);
-        for (k, (a, b)) in layout.res.iter().enumerate() {
-            d.res_aw[k] = wa(a.w);
-            d.res_ab[k] = ba(a.b);
-            d.res_bw[k] = wa(b.w);
-            d.res_bb[k] = ba(b.b);
-        }
-        d.wg_w = wa(layout.wg.w);
-        d.wg_b = ba(layout.wg.b);
+        d.context_joint_w = wa(layout.context_joint.w);
+        d.candidate_joint_w = wa(layout.candidate_joint.w);
+        d.joint_bias = ba(layout.joint_bias);
+        d.value_w = wa(layout.value.w);
+        d.value_b = ba(layout.value.b);
         let dev = htod(stream, &[d])?;
         Ok(Self {
             layout,
             _w: wb,
-            _w16: wb16,
             _b: bb,
             _ln: lb,
             dev,
@@ -1449,10 +1340,6 @@ impl WeightBank {
 
     fn w_ptr(&self, off: usize) -> *const f32 {
         unsafe { ptr(self.dev.stream(), &self._w).add(off) }
-    }
-
-    fn w16_ptr(&self, off: usize) -> *const u16 {
-        unsafe { ptr(self.dev.stream(), &self._w16).add(off) }
     }
 }
 
@@ -1474,7 +1361,7 @@ impl DeviceWave {
     fn upload(
         stream: &Arc<CudaStream>,
         w: &Wave,
-        l: &V3Layout,
+        l: &V4Layout,
         reuse: Option<DeviceBuffers>,
         staging: &mut Vec<u8>,
     ) -> Result<Self, String> {
@@ -1739,6 +1626,7 @@ macro_rules! wave_table_fields {
         $put!(BackLevel1, $w.back_level[1].as_slice());
         $put!(Readout, $w.readout.as_slice());
         $put!(Jobs, $jobs);
+        $put!(ConfigPlayer, $w.config_player.as_slice());
     };
 }
 
@@ -1832,7 +1720,7 @@ fn copy_table<T: Copy>(tables: &mut [u8], at: usize, values: &[T]) -> Result<(),
 #[allow(clippy::type_complexity)]
 fn arena_layout(
     w: &Wave,
-    l: &V3Layout,
+    _l: &V4Layout,
 ) -> Result<([u64; N_ARENAS], usize, std::ops::Range<usize>), String> {
     let rows = w.row_node.len();
     let cfgs = w.config_job.len();
@@ -1846,29 +1734,11 @@ fn arena_layout(
     } else {
         0
     };
-    let fast_head = fast_gemm() && l.hmlp.is_empty();
-    let (pubw, _, _, slotw) = l.widths();
-    // Bh/Bh2 only ever hold tower *outputs*: public layers, the head-entry
-    // projection, and the card/holding towers. The public trunk's `xdim`-wide
-    // input lives in Bx and is never written here, so including it made both
-    // buffers about four times wider than anything that lands in them.
-    let max_pub = pubw.into_iter().chain([l.head_in]).max().unwrap_or(1);
-    let slot_max = slotw
-        .into_iter()
-        .chain([l.hfeat(), l.dg])
-        .max()
-        .unwrap_or(1);
-    let card_max = l.card.iter().map(|x| x.o).max().unwrap_or(l.de);
-    let bh = (rows * max_pub)
-        .max(cfgs * NSLOT * slot_max)
-        .max(jobs * NTYPE * card_max)
-        .max(rows * NTYPE * l.de)
-        .max(cfgs * l.dg);
-    let bg = (jobs * NTYPE * CARD_FEATS)
-        .max(rows * NTYPE * PILE_COUNTS)
-        .max(rows * NTYPE * l.de + jobs * NTYPE * l.de)
-        .max(cfgs * NSLOT * l.hfeat())
-        .max(cfgs * (l.rank + 1));
+    let bh = (2 * rows * PUBLIC)
+        .max(cfgs * NSLOT * SLOT)
+        .max(cfgs * CONFIG)
+        .max(2 * jobs * NTYPE * UNIT);
+    let bg = (2 * jobs * NTYPE * CARD_FEATS).max(cfgs * NSLOT * (3 + UNIT));
     let sizes = [
         reach,
         reach.max(vals),
@@ -1877,33 +1747,17 @@ fn arena_layout(
         cells,
         cells,
         cells,
-        jobs * NTYPE * l.de,
-        cfgs * l.dg,
-        cfgs * (l.rank + 1),
-        if fast_head {
-            (rows * l.head_in).div_ceil(2)
-        } else {
-            rows * l.head_in
-        },
-        if fast_head {
-            (rows * 2 * l.dg).div_ceil(2)
-        } else {
-            rows * 2 * l.dg
-        },
-        if fast_head {
-            (rows * l.head_in).div_ceil(2)
-        } else {
-            rows * h_stride(l)
-        },
-        if fast_head {
-            (rows * l.head_in).div_ceil(2)
-        } else {
-            rows * h_stride(l)
-        },
-        rows * l.rank,
+        2 * jobs * NTYPE * UNIT,
+        cfgs * CONFIG,
+        cfgs * JOINT,
+        2 * rows * PUBLIC,
+        rows * 2 * CONFIG,
+        rows * CONTEXT,
+        rows * CONTEXT,
+        rows * JOINT,
         roots,
         (carry_snaps * w.snapshot_configs).div_ceil(2),
-        rows * l.xdim(),
+        2 * rows * PUBLIC_IN,
         bh,
         bh,
         bg,
@@ -2093,28 +1947,6 @@ fn copy_arena_f16(
     Ok(out)
 }
 
-fn validate_layout(l: &V3Layout) -> Result<(), String> {
-    if l.card.is_empty() || l.pub_lin.is_empty() {
-        return Err("v5 requires non-empty card and public towers".into());
-    }
-    if l.card.len() > 8
-        || l.pub_lin.len() > 8
-        || l.hmlp.len() > 8
-        || l.slot.len() > 8
-        || l.res.len() > 4
-    {
-        return Err("network tower exceeds v5 kernel pointer tables".into());
-    }
-    Ok(())
-}
-
-fn h_stride(l: &V3Layout) -> usize {
-    std::iter::once(l.head_in)
-        .chain(l.hmlp.iter().map(|x| x.o))
-        .max()
-        .unwrap_or(l.head_in)
-}
-
 fn factor(t: f32, p: f32) -> f32 {
     if p.is_infinite() {
         if p > 0.0 {
@@ -2195,11 +2027,6 @@ fn ptr_mut<T>(stream: &Arc<CudaStream>, value: &mut CudaSlice<T>) -> *mut T {
     p as usize as *mut T
 }
 
-fn fast_gemm() -> bool {
-    static FAST_F16: OnceLock<bool> = OnceLock::new();
-    *FAST_F16.get_or_init(|| std::env::var_os("WARCHEST_GPU_PRECISE_GEMM").is_none())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn gemm(
     blas: &CudaBlas,
@@ -2219,156 +2046,26 @@ fn gemm(
     }
     let alpha = 1.0f32;
     static LOG_MODE: Once = Once::new();
-    let fast_f16 = fast_gemm();
-    LOG_MODE.call_once(|| {
-        eprintln!(
-            "v5 GEMM compute={}",
-            if fast_f16 { "fast-f16" } else { "fp32" }
-        );
-    });
-    let result = if fast_f16 {
-        use cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F;
-        use cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP;
-        use cudarc::cublas::sys::cudaDataType_t::CUDA_R_32F;
-
-        unsafe {
-            cudarc::cublas::result::gemm_ex(
-                *blas.handle(),
-                CUBLAS_OP_N,
-                CUBLAS_OP_N,
-                n as i32,
-                m as i32,
-                k as i32,
-                (&alpha as *const f32).cast(),
-                b.cast(),
-                CUDA_R_32F,
-                ldb as i32,
-                a.cast(),
-                CUDA_R_32F,
-                lda as i32,
-                (&beta as *const f32).cast(),
-                c.cast(),
-                CUDA_R_32F,
-                ldc as i32,
-                CUBLAS_COMPUTE_32F_FAST_16F,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP,
-            )
-        }
-    } else {
-        unsafe {
-            cudarc::cublas::result::sgemm(
-                *blas.handle(),
-                CUBLAS_OP_N,
-                CUBLAS_OP_N,
-                n as i32,
-                m as i32,
-                k as i32,
-                &alpha,
-                b,
-                ldb as i32,
-                a,
-                lda as i32,
-                &beta,
-                c,
-                ldc as i32,
-            )
-        }
+    LOG_MODE.call_once(|| eprintln!("v5 GEMM compute=fp32"));
+    let result = unsafe {
+        cudarc::cublas::result::sgemm(
+            *blas.handle(),
+            CUBLAS_OP_N,
+            CUBLAS_OP_N,
+            n as i32,
+            m as i32,
+            k as i32,
+            &alpha,
+            b,
+            ldb as i32,
+            a,
+            lda as i32,
+            &beta,
+            c,
+            ldc as i32,
+        )
     };
     result.map_err(|e| format!("cuBLAS GEMM {m}x{k}x{n}: {e:?}"))?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn gemm_f16(
-    blas: &CudaBlas,
-    m: usize,
-    n: usize,
-    k: usize,
-    a: *const u16,
-    lda: usize,
-    b: *const u16,
-    ldb: usize,
-    c: *mut f32,
-    ldc: usize,
-) -> Result<(), String> {
-    if m == 0 || n == 0 || k == 0 {
-        return Ok(());
-    }
-    use cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F;
-    use cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP;
-    use cudarc::cublas::sys::cudaDataType_t::{CUDA_R_16F, CUDA_R_32F};
-    let (alpha, beta) = (1.0f32, 0.0f32);
-    unsafe {
-        cudarc::cublas::result::gemm_ex(
-            *blas.handle(),
-            CUBLAS_OP_N,
-            CUBLAS_OP_N,
-            n as i32,
-            m as i32,
-            k as i32,
-            (&alpha as *const f32).cast(),
-            b.cast(),
-            CUDA_R_16F,
-            ldb as i32,
-            a.cast(),
-            CUDA_R_16F,
-            lda as i32,
-            (&beta as *const f32).cast(),
-            c.cast(),
-            CUDA_R_32F,
-            ldc as i32,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP,
-        )
-    }
-    .map_err(|e| format!("cuBLAS FP16 GEMM {m}x{k}x{n}: {e:?}"))?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn gemm_f16_to_f16(
-    blas: &CudaBlas,
-    m: usize,
-    n: usize,
-    k: usize,
-    a: *const u16,
-    lda: usize,
-    b: *const u16,
-    ldb: usize,
-    c: *mut u16,
-    ldc: usize,
-) -> Result<(), String> {
-    if m == 0 || n == 0 || k == 0 {
-        return Ok(());
-    }
-    use cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F;
-    use cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP;
-    use cudarc::cublas::sys::cudaDataType_t::CUDA_R_16F;
-    let (alpha, beta) = (1.0f32, 0.0f32);
-    unsafe {
-        cudarc::cublas::result::gemm_ex(
-            *blas.handle(),
-            CUBLAS_OP_N,
-            CUBLAS_OP_N,
-            n as i32,
-            m as i32,
-            k as i32,
-            (&alpha as *const f32).cast(),
-            b.cast(),
-            CUDA_R_16F,
-            ldb as i32,
-            a.cast(),
-            CUDA_R_16F,
-            lda as i32,
-            (&beta as *const f32).cast(),
-            c.cast(),
-            CUDA_R_16F,
-            ldc as i32,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP,
-        )
-    }
-    .map_err(|e| format!("cuBLAS FP16-output GEMM {m}x{k}x{n}: {e:?}"))?;
     Ok(())
 }
 
@@ -2379,32 +2076,21 @@ fn i32n(x: usize, what: &str) -> Result<i32, String> {
     i32::try_from(x).map_err(|_| format!("wave {what} exceeds i32 launch range"))
 }
 
-fn cuda_preamble(l: &V3Layout) -> String {
-    let arr = |name: &str, values: &[usize]| {
-        let body = if values.is_empty() {
-            "0".into()
-        } else {
-            values
-                .iter()
-                .map(|x| x.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        format!("static __device__ const int {name}[] = {{{body}}};\n")
-    };
-    let (pubw, hmlp, card, slot) = l.widths();
+fn cuda_preamble(_l: &V4Layout) -> String {
     let locations = crate::board::board()
         .is_location
         .iter()
         .map(|&x| if x { "1" } else { "0" })
         .collect::<Vec<_>>()
         .join(",");
+    let mirrors = (0..crate::board::N_HEXES)
+        .map(|h| crate::state::mirror_hex(h).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "#define WAVE_BLOCK {}\n#define READOUT_LANE {}\n\
-         #define DE {}\n#define DG {}\n#define RK {}\n#define HEADW {}\n\
-         #define H_STRIDE {}\n#define XD {}\n#define HF {}\n\
-         #define NCARD {}\n#define NPUB {}\n#define NHMLP {}\n#define NSLOTL {}\n#define NRES {}\n\
-         {}{}{}{}\
+        "#define WAVE_BLOCK {}\n\
+         #define UNIT_DIM {}\n#define SLOT_DIM {}\n#define CONFIG_DIM {}\n\
+         #define PUBLIC_DIM {}\n#define CONTEXT_DIM {}\n#define JOINT_DIM {}\n#define PUBLIC_IN {}\n\
          #define N_HEXES {}\n#define NSLOT {}\n#define NTYPE {}\n#define HEX_FACTS {}\n\
          #define PILE_COUNTS {}\n#define CARD_FEATS {}\n#define CFEAT {}\n\
          #define MAX_COINS {:.1}f\n#define MAX_PLIES {:.1}f\n#define LOOSE {}\n\
@@ -2412,12 +2098,10 @@ fn cuda_preamble(l: &V3Layout) -> String {
          #define GR_HEX_HEIGHT {}\n#define GR_HEX_MARKER {}\n#define GR_PILES {}\n\
          #define GR_MARKERS {}\n#define GR_HAND {}\n#define GR_FD {}\n#define GR_BAG {}\n\
          #define GR_INITIATIVE {}\n#define GR_INIT_MOVED {}\n#define GR_TO_ACT {}\n#define GR_PLIES {}\n\
-         static __device__ const unsigned char HEX_LOCATION[N_HEXES] = {{{locations}}};\n",
+         static __device__ const unsigned char HEX_LOCATION[N_HEXES] = {{{locations}}};\n\
+         static __device__ const unsigned char HEX_MIRROR[N_HEXES] = {{{mirrors}}};\n",
         BLOCK,
-        u8::from(std::env::var_os("WARCHEST_READOUT_WARP").is_none()),
-        l.de, l.dg, l.rank, l.head_in, h_stride(l), l.xdim(), l.hfeat(),
-        l.card.len(), l.pub_lin.len(), l.hmlp.len(), l.slot.len(), l.res.len(),
-        arr("CARDW", &card), arr("PUBW", &pubw), arr("HMLPW", &hmlp), arr("SLOTW", &slot),
+        UNIT, SLOT, CONFIG, PUBLIC, CONTEXT, JOINT, PUBLIC_IN,
         crate::board::N_HEXES, NSLOT, NTYPE, crate::rebel::HEX_FACTS,
         PILE_COUNTS, CARD_FEATS, CFEAT, crate::rebel::MAX_COINS,
         crate::state::MAX_MAIN_PLAYS as f32, crate::rebel::LOOSE,
@@ -2441,7 +2125,7 @@ mod reservation_tests {
         job.carried.push([vec![1.0], vec![1.0]]);
         let reserved = job.work().mutable_bytes;
         let wave = Wave::pack(&[job]).expect("pack stub wave");
-        let layout = V3Layout::new(&wave.meta.net_dims).expect("network layout");
+        let layout = V4Layout::new(&wave.meta.net_dims).expect("network layout");
         let (_, floats, _) = arena_layout(&wave, &layout).expect("device arena layout");
         let allocated = floats
             .max(1)

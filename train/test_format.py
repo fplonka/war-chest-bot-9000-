@@ -22,13 +22,21 @@ import warchest
 from value_net import Mlp
 from train import Buffer, make_batch, value_loss
 from dump import Dump
-from offline import evaluate
 
 PUBFEAT = warchest.PUBFEAT
 CFEAT = warchest.CFEAT
 CCOUNTS = warchest.CCOUNTS
 CNORM = warchest.CNORM
 ROW_BYTES = warchest.ROW_BYTES
+
+
+@torch.no_grad()
+def evaluate(net, parts, rng, dev):
+    batch = make_batch(parts, rng, dev, False)
+    value = net(*batch[:5], batch[-1])
+    loss = value_loss(net, *batch)
+    rms = torch.sqrt(torch.mean((value - batch[-2]) ** 2))
+    return float(loss), float(rms)
 
 
 def main():
@@ -40,11 +48,11 @@ def main():
 
     # A small random net so generation produces real (noisy) targets; the
     # point is the plumbing, not the strength.
-    net = Mlp(128, 32, 32, 16)
+    net = Mlp()
     net.push(0)
 
     print("[1/6] generating rows (random drafts, WP included)", flush=True)
-    d = warchest.gen_data(16, 7, "rebel", depth=1, iters=8, explore=0.25,
+    d = warchest.gen_data(1, 7, "rebel", depth=1, iters=8, explore=0.25,
                           random_draft=True)
     n = len(d["rows"]) // ROW_BYTES
     assert n > 200, f"expected a few hundred rows, got {n}"
@@ -91,9 +99,9 @@ def main():
     te = dmp.rows(split, len(dmp))
     rng = np.random.default_rng(0)
     b = make_batch(tr, rng, dev, augment=True)
-    xpub, unit_ids, phi, inv, w, seg, y, nseg = b
-    assert xpub.shape == (len(tr[0]), PUBFEAT), xpub.shape
-    assert unit_ids.shape == (len(tr[0]), warchest.NTYPE)
+    xpub, unit_ids, phi, w, seg, y, nseg = b
+    assert xpub.shape == (2 * len(tr[0]), PUBFEAT), xpub.shape
+    assert unit_ids.shape == (2 * len(tr[0]), warchest.NTYPE)
     assert phi.shape[1] == CFEAT
     assert seg.max() == 2 * len(tr[0]) - 1
     assert torch.isfinite(xpub).all() and torch.isfinite(y).all()

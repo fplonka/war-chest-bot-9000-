@@ -13,17 +13,6 @@ class Cfg:
     snapshot_every: float = 6.0
     init_weights: str = ""
 
-    hidden: int = 384
-    head: int = 0
-    dg: int = 64
-    rank: int = 64
-    de: int = 32
-    nres: int = 1
-    pub: str = ""
-    hmlp: str = ""
-    card: str = ""
-    slot: str = ""
-
     batch: int = 1024
     lr: float = 1e-3
     lr_decay_frac: str = "0.33,0.67"
@@ -32,8 +21,6 @@ class Cfg:
     recent_frac: float = 0.2
     cap: int = 2_000_000
     cfgs_per_row: int = 48
-    no_augment: bool = False
-
     depth: int = 2
     iters: int = 64
     cfr: str = "linear"

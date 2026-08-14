@@ -34,7 +34,7 @@ import warchest
 from export_weights import load
 
 PRIOR = 1.0
-SEARCH = {"depth": 2, "iters": 64, "cfr": "linear", "warm": 0.0}
+SEARCH = {"depth": 2, "iters": 64, "cfr": "linear"}
 BATCH = 20  # even; eval_match plays this many as colour-swapped pairs
 
 
@@ -196,7 +196,7 @@ def run(runs, games=40, gpu=False, seed=7, finals=False):
         already = sum(rec[min(i, j), max(i, j)])
         w, l, d = warchest.eval_match(
             n, seed + 1009 * i + 101 * j + already, a["agent"], b["agent"],
-            depth=sa["depth"], iters=sa["iters"], cfr=sa["cfr"], warm=sa["warm"],
+            depth=sa["depth"], iters=sa["iters"], cfr=sa["cfr"],
             temp=2.0, slot_a=a["slot"], slot_b=b["slot"], random_draft=True,
             depth_b=sb["depth"], iters_b=sb["iters"], gpu=gpu)
         key = (min(i, j), max(i, j))

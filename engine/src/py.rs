@@ -575,7 +575,7 @@ impl Drop for GpuGenerator {
 
 #[cfg(feature = "gpu")]
 #[pyfunction]
-#[pyo3(signature = (seed, depth=2, iters=64, explore=0.25, random_draft=true, cfr="linear", warm=0.0, eval_mix=0.5, workers=36, actors_per_worker=128, inflight_per_worker=32, chunk_solves=1024))]
+#[pyo3(signature = (seed, depth=2, iters=64, explore=0.25, random_draft=true, cfr="linear", eval_mix=0.5, workers=36, actors_per_worker=128, inflight_per_worker=32, chunk_solves=1024))]
 #[allow(clippy::too_many_arguments)]
 fn gpu_stream_start(
     seed: u64,
@@ -584,7 +584,6 @@ fn gpu_stream_start(
     explore: f32,
     random_draft: bool,
     cfr: &str,
-    warm: f32,
     eval_mix: f32,
     workers: usize,
     actors_per_worker: usize,
@@ -596,7 +595,6 @@ fn gpu_stream_start(
         iters,
         snapshots: true,
         cfr: cfr_of(cfr)?,
-        warm,
         node_cap: 200_000,
         ..Default::default()
     };
@@ -816,11 +814,6 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     }
     out.set_item("rows", d.rows.into_pyarray_bound(py))?;
     out.set_item("row_bytes", crate::rebel::ROW_BYTES)?;
-    out.set_item("prow", d.prow.into_pyarray_bound(py))?;
-    out.set_item("pact", d.pact.into_pyarray_bound(py))?;
-    out.set_item("pa", d.pa.into_pyarray_bound(py))?;
-    out.set_item("paoff", d.paoff.into_pyarray_bound(py))?;
-    out.set_item("pp", d.pp.into_pyarray_bound(py))?;
     out.set_item("cc", d.cc.into_pyarray_bound(py))?;
     out.set_item("cw", d.cw.into_pyarray_bound(py))?;
     out.set_item("cy", d.cy.into_pyarray_bound(py))?;
@@ -833,7 +826,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
 /// Run `games` self-play games across all cores and return the training data.
 /// `mode` is "greedy" (Monte-Carlo warm start) or "rebel".
 #[pyfunction]
-#[pyo3(signature = (games, seed, mode, depth=1, iters=16, explore=0.25, temp=2.0, random_draft=true, eval_mix=0.5, mc_mix=0.0, cfr="linear", warm=0.0))]
+#[pyo3(signature = (games, seed, mode, depth=1, iters=16, explore=0.25, temp=2.0, random_draft=true, eval_mix=0.5, mc_mix=0.0, cfr="linear"))]
 #[allow(clippy::too_many_arguments)]
 fn gen_data(
     py: Python<'_>,
@@ -848,14 +841,12 @@ fn gen_data(
     eval_mix: f32,
     mc_mix: f32,
     cfr: &str,
-    warm: f32,
 ) -> PyResult<PyObject> {
     let cfg = Cfg {
         depth,
         iters,
         snapshots: true,
         cfr: cfr_of(cfr)?,
-        warm,
         // The tree-size tail is fat (broad random-draft beliefs at round
         // boundaries); an unbounded build hangs a worker for minutes on one
         // decision. Capped solves fall back to a uniform policy instead.
@@ -892,7 +883,7 @@ fn gen_data(
 /// pitted against itself at different depths or iteration counts (the depth
 /// probe); they default to side A's.
 #[pyfunction]
-#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=true, depth_b=None, iters_b=None, cfr="linear", warm=0.0, gpu=false))]
+#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=true, depth_b=None, iters_b=None, cfr="linear", gpu=false))]
 #[allow(clippy::too_many_arguments)]
 fn eval_match(
     py: Python<'_>,
@@ -909,7 +900,6 @@ fn eval_match(
     depth_b: Option<usize>,
     iters_b: Option<usize>,
     cfr: &str,
-    warm: f32,
     gpu: bool,
 ) -> PyResult<(usize, usize, usize)> {
     let cfg = Cfg {
@@ -917,7 +907,6 @@ fn eval_match(
         iters,
         snapshots: false,
         cfr: cfr_of(cfr)?,
-        warm,
         node_cap: 200_000,
         ..Default::default()
     };
@@ -1019,20 +1008,15 @@ fn set_cap_value(v: f32) {
     crate::state::set_cap_marker_value(v);
 }
 
-/// Run the Rust value network forward: `xpub` is `rows * PUBFEAT`, `xbel` is
-/// `rows * 2*dg` and `phi` is `rows * CFEAT` — one config scored per row.
-/// Returns `rows` values. Exists so the Python side can assert that the
-/// inference path used to generate targets is numerically the same network that
-/// PyTorch trains -- a silent divergence there would corrupt every target while
-/// every other test kept passing.
 #[pyfunction]
-#[pyo3(signature = (xpub, xbel, phi, unit_ids, rows, slot=0))]
+#[pyo3(signature = (xpub, unit_ids, phi, weight, seg, queries, slot=0))]
 fn infer(
     xpub: PyReadonlyArray1<f32>,
-    xbel: PyReadonlyArray1<f32>,
-    phi: PyReadonlyArray1<f32>,
     unit_ids: PyReadonlyArray1<u8>,
-    rows: usize,
+    phi: PyReadonlyArray1<f32>,
+    weight: PyReadonlyArray1<f32>,
+    seg: PyReadonlyArray1<u32>,
+    queries: usize,
     slot: usize,
 ) -> PyResult<Vec<f32>> {
     check_slot(slot)?;
@@ -1040,57 +1024,12 @@ fn infer(
     let mlp = &guard[slot].value;
     Ok(mlp.forward(
         xpub.as_slice()?,
-        xbel.as_slice()?,
-        phi.as_slice()?,
         unit_ids.as_slice()?,
-        rows,
+        phi.as_slice()?,
+        weight.as_slice()?,
+        seg.as_slice()?,
+        queries,
     ))
-}
-
-/// Policy logits for one node: `[nc * na]`, row-major by config. One PBS row,
-/// `nc` configs and `na` actions. The parity test's half of the policy seam.
-#[pyfunction]
-fn infer_policy(
-    xpub: PyReadonlyArray1<f32>,
-    xbel: PyReadonlyArray1<f32>,
-    phi: PyReadonlyArray1<f32>,
-    psi: PyReadonlyArray1<f32>,
-    unit_ids: PyReadonlyArray1<u8>,
-    player: usize,
-    nc: usize,
-    na: usize,
-    slot: usize,
-) -> PyResult<Vec<f32>> {
-    check_slot(slot)?;
-    let guard = nets().read().unwrap();
-    let mlp = &guard[slot].value;
-    let (mut e, mut sb, mut pre, mut z, mut g, mut q) = (
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-    );
-    let xp = xpub.as_slice()?;
-    mlp.cards(xp, unit_ids.as_slice()?, &mut e);
-    mlp.trunk(xp, 1, xp.len(), &e, &mut sb, &mut pre);
-    mlp.embed(phi.as_slice()?, nc, &e, &mut z, &mut g);
-    mlp.embed_actions(psi.as_slice()?, na, &e, &mut q);
-    let idx: Vec<u32> = (0..nc as u32).collect();
-    let mut out = vec![0.0f32; nc * na];
-    mlp.policy(
-        xbel.as_slice()?,
-        &pre,
-        player,
-        &z,
-        &idx,
-        &q,
-        na,
-        &mut sb,
-        &mut out,
-    );
-    Ok(out)
 }
 
 /// The gather a convolutional trunk needs: `N_HEXES * 7` indices, each hex
@@ -1272,10 +1211,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("MAX_MAIN_PLAYS", crate::state::MAX_MAIN_PLAYS)?;
     m.add("PUBFEAT", crate::rebel::PUBFEAT)?;
     m.add("CFEAT", crate::rebel::CFEAT)?;
-    m.add("AFEAT", crate::rebel::AFEAT)?;
     m.add("CCOUNTS", crate::rebel::CCOUNTS)?;
-    m.add("PUBFEAT_V1", crate::v1::PUBFEAT_V1)?;
-    m.add("AUX", crate::selfplay::AUX)?;
     m.add("CNORM", crate::rebel::CNORM)?;
     m.add("N_HEXES", crate::board::N_HEXES)?;
     m.add("N_UNITS", crate::units::N_UNITS)?;
@@ -1297,7 +1233,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("OFF_PILES", crate::rebel::OFF_PILES)?;
     m.add("OFF_CARDS", crate::rebel::OFF_CARDS)?;
     m.add("OFF_LOOSE", crate::rebel::OFF_LOOSE)?;
-    m.add("AOFF_PAYS", crate::rebel::AOFF_PAYS)?;
     m.add_function(wrap_pyfunction!(expand_rows, m)?)?;
     m.add("ROW_BYTES", crate::rebel::ROW_BYTES)?;
     m.add("ROW_VERSION", crate::rebel::ROW_VERSION)?;
@@ -1312,13 +1247,9 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ROW_INIT_MOVED", crate::rebel::ROW_INIT_MOVED)?;
     m.add("ROW_TO_ACT", crate::rebel::ROW_TO_ACT)?;
     m.add("ROW_PLIES", crate::rebel::ROW_PLIES)?;
-    m.add("ROW_AUX", crate::rebel::ROW_AUX)?;
     m.add("ROW_FORMAT_VERSION", crate::rebel::ROW_FORMAT_VERSION)?;
     m.add_function(wrap_pyfunction!(rules_table_hash, m)?)?;
     m.add("CCOUNTS", crate::rebel::CCOUNTS)?;
-    m.add("PUBFEAT_V1", crate::v1::PUBFEAT_V1)?;
-    m.add("AUX", crate::selfplay::AUX)?;
-    m.add_function(wrap_pyfunction!(infer_policy, m)?)?;
     m.add_function(wrap_pyfunction!(hex_neighborhood, m)?)?;
     m.add_function(wrap_pyfunction!(set_weights, m)?)?;
     m.add_function(wrap_pyfunction!(set_cap_value, m)?)?;

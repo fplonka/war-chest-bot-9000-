@@ -33,46 +33,26 @@ use warchest::rng::Rng;
 use warchest::search::{node_actions, Cfg, Nets, Solver};
 use warchest::selfplay::make_game;
 use warchest::state::{Cont, State, Z_BAG, Z_FACEDOWN, Z_FACEUP};
-use warchest::units::{write_card_features, CARD_FEATS, N_UNITS};
+use warchest::units::{write_card_features, CARD_FEATS};
 use warchest::Action;
 
 /// A network with random weights, for tests that need the value function to
 /// actually distinguish things rather than return zero.
-fn random_net(seed: u64, hidden: usize, dg: usize) -> Mlp {
+fn random_net(seed: u64, _hidden: usize, _dg: usize) -> Mlp {
     let mut r = Rng::new(seed);
-    let (de, dc, rk) = (16usize, 32usize, dg);
-    let dims = [PUBFEAT, hidden, hidden, CFEAT, dg, rk, AFEAT, de, dc, 0];
-    let xd = warchest::board::N_HEXES * (HEX_FACTS + de) + 2 * de + LOOSE;
-    let nw = CARD_FEATS * dc
-        + dc * de
-        + N_UNITS * de
-        + (PILE_COUNTS + de) * de
-        + xd * hidden
-        + hidden * hidden
-        + 2 * dg * hidden
-        + (4 + de) * dg
-        + dg * dg
-        + dg * dg
-        + dg * (rk + 1)
-        + hidden * rk
-        + (AFEAT + de) * rk
-        + dg * rk
-        + hidden * rk;
+    let dims = [4];
+    let layout = warchest::net::V4Layout::new(&dims).unwrap();
     let mut draw = |n: usize, scale: f32| -> Vec<f32> {
         (0..n)
             .map(|_| (r.unit_f64() as f32 - 0.5) * scale)
             .collect()
     };
-    let w = draw(nw, 0.2);
-    let b = draw(
-        dc + de + de + hidden + hidden + dg + dg + dg + (rk + 1) + 4 * rk,
-        0.2,
-    );
-    // LayerNorm starts at its identity, as torch does.
+    let w = draw(layout.w_len, 0.2);
+    let b = draw(layout.b_len, 0.2);
     let mut ln = Vec::new();
-    for _ in 0..2 {
-        ln.extend(std::iter::repeat(1.0).take(hidden));
-        ln.extend(std::iter::repeat(0.0).take(hidden));
+    for width in [384, 384, 384, 128, 128, 384, 384] {
+        ln.extend(std::iter::repeat_n(1.0, width));
+        ln.extend(std::iter::repeat_n(0.0, width));
     }
     Mlp::from_flat(&dims, &w, &b, &ln).expect("random net")
 }
@@ -157,7 +137,12 @@ fn leak_check(random_draft: bool) -> (usize, usize) {
             for p in 0..2u8 {
                 let res = reserve(&s, p, &ctx);
                 let truth = true_config(&s, p, &ctx);
-                let all = enumerate_configs(&res, truth.hand_size(), truth.fd_size(), truth.inflight.is_some());
+                let all = enumerate_configs(
+                    &res,
+                    truth.hand_size(),
+                    truth.fd_size(),
+                    truth.inflight.is_some(),
+                );
                 if all.len() < 2 {
                     continue;
                 }
@@ -470,7 +455,15 @@ fn reachable_config_census_with_warrior_priests() {
             for p in 0..2u8 {
                 let res = reserve(&s, p, &ctx);
                 let truth = true_config(&s, p, &ctx);
-                sizes.push(enumerate_configs(&res, truth.hand_size(), truth.fd_size(), truth.inflight.is_some()).len());
+                sizes.push(
+                    enumerate_configs(
+                        &res,
+                        truth.hand_size(),
+                        truth.fd_size(),
+                        truth.inflight.is_some(),
+                    )
+                    .len(),
+                );
             }
             let acts = s.legal_actions();
             s.apply_inplace(acts[rng.below(acts.len())]);
@@ -604,7 +597,7 @@ fn config_features_separate_every_config() {
                 for c in &cfgs {
                     for p in 0..2usize {
                         let mut phi = vec![0.0f32; CFEAT];
-                        write_config_feats(c, &reserve, p, &mut phi);
+                        write_config_feats(c, &reserve, &mut phi);
                         // Bit patterns, so this compares exactly rather than
                         // up to a tolerance chosen to make it pass.
                         let key: Vec<u32> = phi.iter().map(|x| x.to_bits()).collect();
@@ -623,7 +616,12 @@ fn config_features_separate_every_config() {
 fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
     let res = reserve(s, p, ctx);
     let truth = true_config(s, p, ctx);
-    let cfgs = enumerate_configs(&res, truth.hand_size(), truth.fd_size(), truth.inflight.is_some());
+    let cfgs = enumerate_configs(
+        &res,
+        truth.hand_size(),
+        truth.fd_size(),
+        truth.inflight.is_some(),
+    );
     let n = cfgs.len().max(1) as f32;
     Belief {
         p: vec![1.0 / n; cfgs.len()],
@@ -670,7 +668,10 @@ fn a_subgame_of_only_terminal_leaves_solves() {
         };
         let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
         assert!(
-            sv.nodes.iter().zip(&sv.states).all(|(n, st)| !n.leaf || st.is_terminal()),
+            sv.nodes
+                .iter()
+                .zip(&sv.states)
+                .all(|(n, st)| !n.leaf || st.is_terminal()),
             "expected every leaf terminal"
         );
         sv.multistep(cfg.iters);
@@ -682,141 +683,6 @@ fn a_subgame_of_only_terminal_leaves_solves() {
         }
     }
     assert!(checked >= 3, "only {checked} positions exercised");
-}
-
-/// A pre-describer checkpoint must still be able to play.
-///
-/// The card describer changed the public encoding's width and layout. If the
-/// pool cannot be loaded and played, no gate can ask whether the new
-/// architecture is better than what came before — which is the only question a
-/// gate exists to answer. So the old encoder and the old towers stay, keyed off
-/// the checkpoint's `dims`, and a solve picks its encoder from the net it was
-/// handed rather than from a constant.
-#[test]
-fn a_pre_describer_checkpoint_still_solves() {
-    let (hidden, dg, rank) = (64usize, 16usize, 16usize);
-    let mut r = Rng::new(3);
-    let dims = [warchest::v1::PUBFEAT_V1, hidden, CFEAT, dg, rank];
-    let nw = dims[0] * hidden
-        + hidden * hidden
-        + 2 * dg * hidden
-        + CFEAT * dg
-        + dg * (rank + 1)
-        + hidden * rank;
-    let mut draw =
-        |n: usize| -> Vec<f32> { (0..n).map(|_| (r.unit_f64() as f32 - 0.5) * 0.2).collect() };
-    let w = draw(nw);
-    let b = draw(hidden + hidden + dg + (rank + 1) + rank);
-    let mut ln = Vec::new();
-    for _ in 0..2 {
-        ln.extend(std::iter::repeat(1.0).take(hidden));
-        ln.extend(std::iter::repeat(0.0).take(hidden));
-    }
-    let net = Mlp::from_flat(&dims, &w, &b, &ln).expect("v1 net");
-    assert!(net.v1() && net.pub_dim() == warchest::v1::PUBFEAT_V1);
-
-    let nets = Nets { value: net };
-    let mut rng = Rng::new(11);
-    let mut s = make_game(&mut rng, false);
-    for _ in 0..60 {
-        if s.is_terminal() || s.is_chance() {
-            break;
-        }
-        let acts = s.legal_actions();
-        s.apply_inplace(acts[rng.below(acts.len())]);
-    }
-    let ctx = Ctx::new(&s);
-    let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
-    let cfg = Cfg {
-        depth: 2,
-        iters: 32,
-        snapshots: true,
-        ..Default::default()
-    };
-    let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
-    sv.multistep(cfg.iters);
-    let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
-    assert!(
-        vals[0][0].iter().all(|v| v.is_finite()),
-        "v1 solve produced non-finite values"
-    );
-    assert!(
-        vals[0][0].iter().any(|v| *v != 0.0),
-        "v1 solve produced all zeros"
-    );
-    assert!(sv.nash_conv().nash > -1e-3, "v1 NashConv is negative");
-}
-
-/// A warm start must not move where the solve converges.
-///
-/// Seeding CFR from the policy head changes the path, not the destination: the
-/// subgame's value is unique, so a warm-started solve and a cold one must agree
-/// once both have converged. If they do not, the seeded regrets are not regrets
-/// of the game being solved and the warm start is biasing the answer rather
-/// than accelerating it -- which is exactly the failure a strength gate could
-/// not distinguish from a real gain.
-///
-/// The policy here is a random network's, so it is arbitrary. That is the point:
-/// no seed, however bad, may change the fixed point.
-#[test]
-fn a_warm_start_does_not_move_the_fixed_point() {
-    let nets = Nets {
-        value: random_net(7, 96, 24),
-    };
-    let mut checked = 0usize;
-    for seed in 0..400u64 {
-        let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
-        let mut s = make_game(&mut rng, false);
-        for _ in 0..40 + seed % 120 {
-            if s.is_terminal() {
-                break;
-            }
-            let acts = s.legal_actions();
-            s.apply_inplace(acts[rng.below(acts.len())]);
-        }
-        if s.is_terminal() || s.is_chance() {
-            continue;
-        }
-        let ctx = Ctx::new(&s);
-        let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
-        if bel[0].len() > 24 || bel[1].len() > 24 {
-            continue;
-        }
-        let base = Cfg {
-            depth: 2,
-            iters: 400,
-            snapshots: true,
-            ..Default::default()
-        };
-        let mut v = Vec::new();
-        for warm in [0.0f32, 15.0] {
-            let mut sv = Solver::new(&s, ctx, &nets, Cfg { warm, ..base }, bel.clone());
-            sv.warm_start(warm);
-            sv.multistep(base.iters);
-            let root = [[bel[0].p.clone(), bel[1].p.clone()]];
-            let vals = sv.value_under(&root);
-            v.push(
-                (0..bel[0].len())
-                    .map(|c| bel[0].p[c] as f64 * vals[0][0][c] as f64)
-                    .sum::<f64>(),
-            );
-            assert!(
-                sv.nash_conv().nash > -1e-3,
-                "seed {seed}: NashConv is negative"
-            );
-        }
-        assert!(
-            (v[0] - v[1]).abs() < 0.01,
-            "seed {seed}: cold solve says {:.4}, warm says {:.4}",
-            v[0],
-            v[1]
-        );
-        checked += 1;
-        if checked >= 6 {
-            break;
-        }
-    }
-    assert!(checked >= 6, "only {checked} positions exercised");
 }
 
 /// The card describer is the whole of what makes an unseen draft readable: the
@@ -856,58 +722,6 @@ fn card_features_separate_every_draftable_unit() {
     }
 }
 
-/// The same property for actions, and it matters for the same reason: the
-/// policy head is an embedding *network* over a node-dependent action list
-/// rather than a fixed-width output vector, so two actions that share a
-/// description are two actions the head can never tell apart, and it would
-/// learn the average of what the solver wanted for each.
-///
-/// Run over the action lists real subgame nodes actually build, so it covers
-/// the tactic chains and the partially-private plays rather than a synthetic
-/// enumeration.
-#[test]
-fn action_features_separate_every_action() {
-    let mut checked = 0usize;
-    let mut kinds: HashMap<usize, usize> = HashMap::new();
-    for seed in 0..1500u64 {
-        let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
-        let mut s = make_game(&mut rng, false);
-        for _ in 0..seed % 220 {
-            if s.is_terminal() {
-                break;
-            }
-            let acts = s.legal_actions();
-            s.apply_inplace(acts[rng.below(acts.len())]);
-        }
-        if s.is_terminal() || s.is_chance() {
-            continue;
-        }
-        let ctx = Ctx::new(&s);
-        let p = s.to_act();
-        let cfgs = [true_config(&s, p, &ctx)];
-        let (acts, aslot, fdown) = node_actions(&s, p, &ctx, &cfgs);
-        let mut seen: HashMap<Vec<u32>, Action> = HashMap::new();
-        for i in 0..acts.len() {
-            let mut psi = vec![0.0f32; AFEAT];
-            write_action_feats(&acts[i], &ctx, p as usize, aslot[i], fdown[i], &mut psi);
-            *kinds.entry(acts[i].kind()).or_default() += 1;
-            // Bit patterns, so this compares exactly rather than up to a
-            // tolerance chosen to make it pass.
-            let key: Vec<u32> = psi.iter().map(|x| x.to_bits()).collect();
-            if let Some(prev) = seen.insert(key, acts[i]) {
-                assert_eq!(prev, acts[i], "two actions share a feature vector");
-            }
-            checked += 1;
-        }
-    }
-    assert!(checked > 5_000, "only {checked} action vectors exercised");
-    assert!(
-        kinds.len() >= 8,
-        "only {} action kinds exercised",
-        kinds.len()
-    );
-}
-
 /// The counts must be the ones the name says, and the bag must be the derived
 /// one. A transposition here would be invisible to every other test: the
 /// network would happily learn whatever permutation it was given.
@@ -925,11 +739,10 @@ fn config_counts_are_hand_facedown_bag() {
     assert_eq!(&cnt[NSLOT..2 * NSLOT], &c.fd, "face-down block");
     assert_eq!(&cnt[2 * NSLOT..], &[1u8, 2, 3, 2, 0], "bag block");
     let mut phi = vec![0.0f32; CFEAT];
-    write_config_feats(&c, &reserve, 1, &mut phi);
+    write_config_feats(&c, &reserve, &mut phi);
     for k in 0..CCOUNTS {
         assert_eq!(phi[k], cnt[k] as f32 / CNORM);
     }
-    assert_eq!(phi[CCOUNTS], 1.0, "seat flag");
 }
 
 // ------------------------------------------------------ no leak through a solve
@@ -961,7 +774,12 @@ fn position_with_ambiguous_facedown(seed: u64) -> Option<(State, Ctx, [Belief; 2
     for p in 0..2u8 {
         let res = reserve(&s, p, &ctx);
         let truth = true_config(&s, p, &ctx);
-        let cfg = enumerate_configs(&res, truth.hand_size(), truth.fd_size(), truth.inflight.is_some());
+        let cfg = enumerate_configs(
+            &res,
+            truth.hand_size(),
+            truth.fd_size(),
+            truth.inflight.is_some(),
+        );
         if cfg.is_empty() {
             return None;
         }
@@ -1207,7 +1025,12 @@ fn zero_weight_config_survives_the_walk_update() {
         for p in 0..2u8 {
             let res = reserve(&s, p, &ctx);
             let truth = true_config(&s, p, &ctx);
-            let cfg = enumerate_configs(&res, truth.hand_size(), truth.fd_size(), truth.inflight.is_some());
+            let cfg = enumerate_configs(
+                &res,
+                truth.hand_size(),
+                truth.fd_size(),
+                truth.inflight.is_some(),
+            );
             if cfg.len() < 2 {
                 break;
             }

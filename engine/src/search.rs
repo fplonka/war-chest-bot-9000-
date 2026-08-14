@@ -59,10 +59,6 @@ pub struct Cfg {
     pub snapshots: bool,
     /// The regret-update rule.
     pub cfr: Cfr,
-    /// Iterations the policy head's strategy is worth when a solve is seeded
-    /// from it. 0 starts uniform, which is the default until the measurement
-    /// says otherwise.
-    pub warm: f32,
     /// Max tree nodes a solve may build. 0 = unlimited. A solve that hits the
     /// cap is flagged `capped` and its caller falls back to a non-search
     /// policy for that decision: the tail of the tree-size distribution
@@ -91,7 +87,6 @@ impl Default for Cfg {
             iters: 64,
             snapshots: true,
             cfr: Cfr::LINEAR,
-            warm: 0.0,
             node_cap: 0,
             gpu_build: false,
             keep_states: false,
@@ -228,10 +223,6 @@ pub enum Back {
     /// consumed in the row where it is formed; there is no instantaneous-
     /// regret arena.
     Regret,
-    /// Policy-head warm start: form the same per-action delta as CFR and seed
-    /// accumulated regret with `weight * delta`, without regret matching away
-    /// from the policy being seeded.
-    Seed(f32),
     /// Pure value propagation under a fixed strategy — TurboReBeL's Phase 2.
     Value,
     /// The traverser maxes instead of averaging, which makes the root values a
@@ -375,7 +366,7 @@ pub fn node_actions(
 pub struct TNode {
     /// Terminal leaves only: the game's utility for `player`. The tree used to
     /// keep the whole `State` here, 688 of a node's 1,136 bytes, for four read
-    /// sites -- this, the warm start's decision rows, and two debug asserts.
+    /// sites -- this and two debug asserts.
     /// A mature subgame builds 2,039 nodes, so that was 1.4 MiB per solve
     /// written and then never looked at.
     pub util: f32,
@@ -457,21 +448,20 @@ impl TNode {
 /// The per-solve buffers, pooled *by role*: they differ in size by 5x, so a
 /// single shared pool handed each one somebody else's buffer and made it grow
 /// — and growth is the one thing that zeroes.
-const N_ROLES: usize = 8;
+const N_ROLES: usize = 7;
 const R_H0: usize = 0;
 const R_XPUB: usize = 1;
 const R_XB0: usize = 2;
 const R_OB: usize = 3;
-const R_SB: usize = 4;
-const R_CPHI: usize = 5;
-const R_CZ: usize = 6;
-const R_CG: usize = 7;
+const R_CPHI: usize = 4;
+const R_CZ: usize = 5;
+const R_CG: usize = 6;
 
 thread_local! {
     static BUFS: std::cell::RefCell<[Vec<Vec<f32>>; N_ROLES]> = const {
         std::cell::RefCell::new([
             Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(),
         ])
     };
 }
@@ -658,18 +648,10 @@ pub struct Solver<'a> {
     /// packed back to back and indexed through `leaf_coff`.
     pub(crate) leaf_cidx: Vec<u32>,
     pub(crate) leaf_coff: Vec<u32>,
-    /// The subgame's distinct config vectors, `[n * CFEAT]`, and the map that
-    /// deduplicates them. The same config recurs at hundreds of leaves — a
-    /// depth-2 subgame has a few hundred leaves over a few dozen distinct
-    /// configs — and the config tower is the one part of the network whose cost
-    /// scales with the support, so it runs once per distinct config per solve.
+    /// Distinct config vectors and their canonical owner query.
     pub(crate) cphi: Vec<f32>,
+    pub(crate) cplayer: Vec<u8>,
     pub(crate) cmap: std::collections::HashMap<u64, u32, KeyHash>,
-    /// Decision-node states, kept only for a warm start's policy rows.
-    warm_states: Vec<(usize, State)>,
-    /// Whether the root is a normal coin-play choice, which is all the policy
-    /// label's assertion needed the root's state for.
-    pub root_mainplay: bool,
     /// How many distinct configs `cphi` actually holds. Pooled buffers keep
     /// their length across solves, so the count cannot be read off `cphi.len()`.
     pub ncfg: usize,
@@ -677,25 +659,12 @@ pub struct Solver<'a> {
     /// embedding. Both survive every CFR iteration.
     pub cz: Vec<f32>,
     pub cg: Vec<f32>,
-    /// The card table `[NTYPE, de]`. The draft is fixed for the game, so this is
-    /// built once per solve and read by every tower that names a card.
+    /// Two canonical unit tables, one per player view.
     pub ce: Vec<f32>,
-    /// The draft's unit ids in player-major slot order, for the describer's
-    /// learned id embedding. Constant per solve.
-    pub(crate) ids: [u8; NTYPE],
-    /// Decision nodes in the network batch, after the leaves. Only populated
-    /// when a warm start needs the policy head at them.
-    pub inner_rows: Vec<usize>,
-    /// `[rows, ncfg]`: every leaf's PBS vector dotted with every interned config
-    /// embedding, rebuilt per readout.
-    vt: Vec<f32>,
+    pub(crate) ids: [u8; 2 * NTYPE],
     /// `rows * hidden`: the public half of the hidden layer.
     pub h0: Vec<f32>,
-    /// Width of one public row: the *net's*, not the current encoding's. A
-    /// pre-describer checkpoint reads a 972-wide row written by `v1`'s frozen
-    /// encoder, so that a gate can play the new architecture against the pool.
-    pub(crate) pubfeat: usize,
-    /// `rows * pubfeat`: the public encoding, filled during the build.
+    /// Expanded public encoding, filled during the build.
     pub(crate) xpub: Vec<f32>,
     /// Compact public rows for GPU admission. The device expands these into
     /// the same trunk input; a GPU-built solver never materialises `xpub`.
@@ -704,7 +673,6 @@ pub struct Solver<'a> {
     pub xb: Vec<f32>,
     /// `rows * hidden`: the hidden layer, rebuilt per iteration.
     pub ob: Vec<f32>,
-    sb: Vec<f32>,
     /// Normalised belief weights for one leaf's support.
     wbuf: Vec<f32>,
     batch_ready: bool,
@@ -729,7 +697,6 @@ impl Drop for Solver<'_> {
             (R_XPUB, &mut self.xpub),
             (R_XB0, &mut self.xb),
             (R_OB, &mut self.ob),
-            (R_SB, &mut self.sb),
             (R_CPHI, &mut self.cphi),
             (R_CZ, &mut self.cz),
             (R_CG, &mut self.cg),
@@ -757,9 +724,12 @@ impl<'a> Solver<'a> {
             belief[0].cfg.as_slice().into(),
             belief[1].cfg.as_slice().into(),
         ];
-        let mut ids = [0u8; NTYPE];
-        for t in 0..NTYPE {
-            ids[t] = ctx.slots[t / NSLOT][t % NSLOT];
+        let mut ids = [0u8; 2 * NTYPE];
+        for view in 0..2 {
+            for t in 0..NTYPE {
+                let physical = if view == 0 { t / NSLOT } else { 1 - t / NSLOT };
+                ids[view * NTYPE + t] = ctx.slots[physical][t % NSLOT];
+            }
         }
         let mut sv = Solver {
             ctx,
@@ -788,27 +758,18 @@ impl<'a> Solver<'a> {
             leaf_cidx: Vec::new(),
             leaf_coff: Vec::new(),
             cphi: take_buf(R_CPHI),
+            cplayer: Vec::new(),
             cmap: std::collections::HashMap::with_capacity_and_hasher(1024, KeyHash),
-            warm_states: Vec::new(),
-            root_mainplay: false,
             ncfg: 0,
             cz: take_buf(R_CZ),
             cg: take_buf(R_CG),
             ce: Vec::new(),
             ids,
-            inner_rows: Vec::new(),
-            vt: Vec::new(),
-            pubfeat: if nets.value.is_empty() {
-                PUBFEAT
-            } else {
-                nets.value.pub_dim()
-            },
             h0: take_buf(R_H0),
             xpub: take_buf(R_XPUB),
             gpu_rows: Vec::new(),
             xb: take_buf(R_XB0),
             ob: take_buf(R_OB),
-            sb: take_buf(R_SB),
             wbuf: Vec::new(),
             batch_ready: false,
             last_traverser: None,
@@ -826,7 +787,6 @@ impl<'a> Solver<'a> {
             sv.vals.reserve(640);
             sv.regret.reserve(640);
             sv.cur.reserve(640);
-            sv.root_mainplay = matches!(root.pending(), Cont::MainPlay);
             sv.build(root.clone(), cfg.depth.max(1), cfgs);
         }
         let _t = timed!(ALLOC);
@@ -1099,11 +1059,6 @@ impl<'a> Solver<'a> {
             return id;
         }
 
-        // Only a warm start needs a decision node's state after the build, and
-        // it needs them in node order, which is push order.
-        if self.cfg.warm > 0.0 {
-            self.warm_states.push((id, s));
-        }
         let me = player as usize;
         let mine = cfgs[me].clone();
         let nc = mine.len();
@@ -1393,15 +1348,15 @@ impl<'a> Solver<'a> {
         &self.reach[at..at + self.nc[i][p] as usize]
     }
 
-    /// One public row, in whichever encoding this solve's network was trained
-    /// with.
-    fn encode(&mut self, s: &State, at: usize) {
-        let pf = self.pubfeat;
-        if self.nets.value.v1() {
-            crate::v1::write_public_features_v1(s, &self.ctx, &mut self.xpub[at..at + pf]);
-        } else {
-            write_public_features(s, &self.ctx, &mut self.xpub[at..at + pf]);
-        }
+    fn encode(&mut self, s: &State, row: usize) {
+        let at = 2 * row * PUBFEAT;
+        write_public_features(s, &self.ctx, &mut self.xpub[at..at + PUBFEAT]);
+        let mirrored = s.mirror();
+        write_public_features(
+            &mirrored,
+            &self.ctx.mirrored(),
+            &mut self.xpub[at + PUBFEAT..at + 2 * PUBFEAT],
+        );
     }
 
     /// Record a leaf in the network batch. Called from `build`, while the
@@ -1418,8 +1373,7 @@ impl<'a> Solver<'a> {
     }
 
     /// One row of the network batch: its public encoding, and its configs
-    /// interned into the shared table. Leaves and — when a warm start needs
-    /// them — decision nodes go through here alike.
+    /// interned into the shared table.
     fn push_row(&mut self, _id: usize, s: &State, cfgs: &[Rc<[Config]>; 2]) {
         // The network is queried only at normal coin-play states: a subgame
         // finishes every tactic, trigger and forced play before a leaf.
@@ -1443,14 +1397,13 @@ impl<'a> Solver<'a> {
         // does not: expanding 897 floats here only to upload and immediately
         // rearrange them was its largest host and PCIe cost.
         if !self.cfg.gpu_build {
-            let pf = self.pubfeat;
-            let at = row * pf;
-            if self.xpub.len() < at + pf {
+            let at = 2 * row * PUBFEAT;
+            if self.xpub.len() < at + 2 * PUBFEAT {
                 // Grow in chunks so the zero-fill happens a handful of times
                 // per solve, and not at all once the pooled buffer is warm.
-                self.xpub.resize(at + 64 * pf, 0.0);
+                self.xpub.resize(at + 128 * PUBFEAT, 0.0);
             }
-            self.encode(s, at);
+            self.encode(s, row);
         }
         for p in 0..2 {
             let res = reserve(s, p as u8, &self.ctx);
@@ -1489,7 +1442,7 @@ impl<'a> Solver<'a> {
         for k in 0..CCOUNTS {
             self.cphi[at + k] = cnt[k] as f32 / CNORM;
         }
-        self.cphi[at + CCOUNTS] = p as f32;
+        self.cplayer.push(p as u8);
         self.cmap.insert(key, i);
         i
     }
@@ -1506,57 +1459,29 @@ impl<'a> Solver<'a> {
             self.leaf_coff.push(self.leaf_cidx.len() as u32);
             return;
         }
-        // A warm start reads the policy head at every decision node, so those
-        // nodes join the same batch as the leaves — appended after them, so a
-        // leaf's row index is still its position in `leaf_rows` and nothing on
-        // the value path moves. They then share the card table, the one public
-        // tower pass and the one config-tower pass, instead of running their own
-        // of each. Nothing is pushed when the warm start is off.
-        if self.cfg.warm > 0.0 {
-            let states = std::mem::take(&mut self.warm_states);
-            for &(i, ref st) in &states {
-                // The policy head is read only at normal coin-play choices.
-                if !matches!(st.pending(), Cont::MainPlay) {
-                    continue;
-                }
-                self.push_row(i, st, &self.nodes[i].cfgs.clone());
-                self.inner_rows.push(i);
-            }
-            self.warm_states = states;
-        }
         self.leaf_coff.push(self.leaf_cidx.len() as u32);
-        let (leaves, rows) = (
-            self.leaf_rows.len(),
-            self.leaf_rows.len() + self.inner_rows.len(),
-        );
+        let rows = self.leaf_rows.len();
         let net = &self.nets.value;
-        debug_assert_eq!(net.pub_dim(), self.pubfeat);
+        debug_assert_eq!(net.pub_dim(), PUBFEAT);
         debug_assert_eq!(net.cfeat(), CFEAT);
-        if self.xb.len() < leaves * net.belief_dim() {
-            self.xb.resize(leaves * net.belief_dim(), 0.0);
+        if self.xb.len() < rows * 2 * net.dg() {
+            self.xb.resize(rows * 2 * net.dg(), 0.0);
         }
         shape!(NCFG, self.ncfg);
         let _t = timed!(PUBNET);
         let xpub = std::mem::take(&mut self.xpub);
         // The cards in play are fixed at the draft, so every row of the subgame
         // carries the same card block and the table is built once. Everything
-        // downstream — the hex block, the pile summary, the holding tower, the
-        // action tower — reads a row of it by coin-type index.
+        // downstream reads it by canonical coin-type index.
         if rows > 0 {
-            net.cards(&xpub[..self.pubfeat], &self.ids, &mut self.ce);
+            net.units(&xpub[..2 * PUBFEAT], &self.ids, 2, &mut self.ce);
         }
-        net.trunk(
-            &xpub,
-            rows,
-            self.pubfeat,
-            &self.ce,
-            &mut self.sb,
-            &mut self.h0,
-        );
+        net.public(&xpub, &self.ce, 2 * rows, 2, &mut self.h0);
         self.xpub = xpub;
         let cphi = std::mem::take(&mut self.cphi);
         net.embed(
             &cphi[..self.ncfg * CFEAT],
+            &self.cplayer,
             self.ncfg,
             &self.ce,
             &mut self.cz,
@@ -1662,12 +1587,11 @@ impl<'a> Solver<'a> {
         }
         let _t = timed!(NET);
         let rows = self.leaf_rows.len();
-        net.pbs_head(
+        net.context(
             &self.xb[..rows * 2 * net.dg()],
             rows,
             &self.h0,
             traverser,
-            &mut self.sb,
             &mut self.ob,
         );
     }
@@ -1694,29 +1618,7 @@ impl<'a> Solver<'a> {
             let vo = self.voff[i] as usize;
             self.vals[vo..vo + n].fill(u * opp_reach);
         }
-        let rk = if empty { 0 } else { self.nets.value.rank() };
-        // The readout is a dot product of the leaf's PBS vector with each of its
-        // configs' embeddings. Done leaf by leaf it is a few thousand short
-        // vectorised dots per iteration; done as one matmul against the whole
-        // interned table it is ~7x the arithmetic but runs on the matrix
-        // coprocessor, which is worth far more than 7x. A solve interns ~160
-        // distinct configs against ~17k slots, so the table is small and the
-        // result stays in cache.
-        if !empty {
-            let _t = timed!(LEAFDOT);
-            let rows = self.leaf_rows.len();
-            crate::net::fit(&mut self.vt, rows * self.ncfg);
-            crate::net::dots(
-                &self.ob[..rows * rk],
-                rk,
-                &self.cg[..self.ncfg * (rk + 1)],
-                rk + 1,
-                rows,
-                self.ncfg,
-                &mut self.vt,
-            );
-        }
-        let (reach, roff, ncs, voff, coff, cidx, cg, vt, vals) = (
+        let (reach, roff, ncs, voff, coff, cidx, cg, vals) = (
             &self.reach,
             &self.roff,
             &self.nc,
@@ -1724,10 +1626,8 @@ impl<'a> Solver<'a> {
             &self.leaf_coff,
             &self.leaf_cidx,
             &self.cg,
-            &self.vt,
             &mut self.vals,
         );
-        let ncfg = self.ncfg;
         for (r, &i) in self.leaf_rows.iter().enumerate() {
             let ra = roff[i] as usize + if opp == 1 { ncs[i][0] as usize } else { 0 };
             let opp_reach: f32 = reach[ra..ra + ncs[i][opp] as usize].iter().sum();
@@ -1737,14 +1637,15 @@ impl<'a> Solver<'a> {
                 vals[vo..vo + n].fill(0.0);
                 continue;
             }
-            // Only the player's own configs are ever looked up here. The
-            // opponent's private state reaches this value solely through the
-            // belief embedding, which is what keeps the query leak-free.
             let cs = coff[2 * r + p] as usize;
-            let row = &vt[r * ncfg..(r + 1) * ncfg];
-            for (v, &c) in vals[vo..vo + n].iter_mut().zip(&cidx[cs..cs + n]) {
-                // The trailing column of `g` is the per-config bias term.
-                *v = (row[c as usize] + cg[c as usize * (rk + 1) + rk]) * opp_reach;
+            self.nets.value.values(
+                &self.ob[r * crate::net::JOINT..(r + 1) * crate::net::JOINT],
+                cg,
+                &cidx[cs..cs + n],
+                &mut vals[vo..vo + n],
+            );
+            for value in &mut vals[vo..vo + n] {
+                *value *= opp_reach;
             }
         }
     }
@@ -1763,7 +1664,7 @@ impl<'a> Solver<'a> {
     /// (`value_under`) and the best response (`nash_conv`). `mode` picks what
     /// the traverser's own decision nodes do with their children's values —
     /// average under `strat`, average and immediately update regret matching,
-    /// seed warm-start regret, or take the max. Regret modes use `self.cur` in
+    /// or take the max. Regret modes use `self.cur` in
     /// place; fixed-policy modes read `strat`.
     pub fn backprop(&mut self, traverser: usize, strat: &[f32], mode: Back) {
         // Regret matching floors at EPS rather than at zero, so every legal
@@ -1846,7 +1747,7 @@ impl<'a> Solver<'a> {
                         let c = n.cell_row[cell] as usize;
                         let av = cv[t as usize];
                         match mode {
-                            Back::Regret | Back::Seed(_) => vi[c] += av * self.cur[so + cell],
+                            Back::Regret => vi[c] += av * self.cur[so + cell],
                             Back::Value => vi[c] += av * strat[so + cell],
                             Back::BestResponse => vi[c] = vi[c].max(av),
                         }
@@ -1890,22 +1791,6 @@ impl<'a> Solver<'a> {
                         }
                         for x in self.sum_strat[i].iter_mut() {
                             *x *= dg;
-                        }
-                    }
-                    Back::Seed(weight) => {
-                        for c in 0..nc {
-                            let base = vi[c];
-                            for cell in n.legal_row(c) {
-                                let mut delta = 0.0f32;
-                                let t = n.legal_trans[cell];
-                                if t != NO_TRANS {
-                                    let ch = n.legal_child[cell] as usize;
-                                    let cv = self.voff[ch] as usize - self.voff[i + 1] as usize;
-                                    delta += hi[cv + t as usize];
-                                }
-                                delta -= base;
-                                self.regret[so + cell] = weight * delta;
-                            }
                         }
                     }
                     Back::BestResponse => {
@@ -2081,158 +1966,6 @@ impl<'a> Solver<'a> {
             out.push(pair);
         }
         out
-    }
-
-    /// Seed the solve from the policy head instead of from a uniform strategy:
-    /// start CFR as though the policy had already been played for `weight`
-    /// iterations. One CFR traversal under the policy gives the instantaneous
-    /// regret it accrues, `r(a) = v(a) - sum_a pi(a) v(a)`; scaling that by
-    /// `weight` is the whole of the warm start, and seeding the average
-    /// strategy the same way is what keeps the two consistent.
-    ///
-    /// The baseline has to be the value of *playing the policy*. An earlier
-    /// version used the best-response value, `v(a) - max_a v(a)`, which is
-    /// non-positive everywhere and zero at the best action — so regret matching
-    /// clamped every action to the floor and handed back a uniform strategy,
-    /// destroying exactly the information the seed exists to inject.
-    ///
-    /// This is not a handcrafted prior. It is the network's own summary of what
-    /// the solves before it converged to, and `nash_conv` measures what it does
-    /// to the answer with no noise in the measurement.
-    pub fn warm_start(&mut self, weight: f32) {
-        if weight <= 0.0 || self.nets.value.is_empty() {
-            return;
-        }
-        self.ensure_leaf_batch();
-        if !self.policy_into_cur() {
-            return;
-        }
-        self.precompute_reaches();
-        for p in 0..2usize {
-            self.leaf_values(p);
-            self.backprop(p, &[], Back::Seed(weight));
-            for i in 0..self.nodes.len() {
-                let n = &self.nodes[i];
-                if n.leaf || n.chance || n.player as usize != p {
-                    continue;
-                }
-                let nc = n.nc(p);
-                let so = self.soff[i] as usize;
-                // The average strategy starts as though the policy had been
-                // played for those iterations, which is what makes the seeded
-                // regrets and the average consistent with each other.
-                let r: Vec<f32> = self.reach_of(i, p).to_vec();
-                for c in 0..nc {
-                    for cell in n.legal_row(c) {
-                        self.sum_strat[i][cell] = weight * r[c] * self.cur[so + cell];
-                    }
-                }
-            }
-            self.steps[p] = weight as usize;
-        }
-        // The iterate-0 snapshot was taken from the uniform strategy in `new`;
-        // the solve now starts somewhere else, so it is retaken.
-        self.snaps.clear();
-        self.snap_t = 0;
-        self.avg_touched = [true; 2];
-        self.snapshot();
-    }
-
-    /// Write the policy head's distribution into `cur` at every decision node.
-    /// Returns false if the network has no usable policy.
-    fn policy_into_cur(&mut self) -> bool {
-        self.ensure_leaf_batch();
-        if self.inner_rows.is_empty() {
-            return false;
-        }
-        // Everything the head needs is already in the solve's batch: the public
-        // tower ran over these rows alongside the leaves, and their configs were
-        // interned into the same table. What is left per node is its action
-        // descriptions, its belief block, and the readout.
-        let net = &self.nets.value;
-        let (dg, h) = (net.dg(), net.head());
-        let base = self.leaf_rows.len();
-        let (mut q, mut logit, mut w, mut psi, mut sb) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        let mut xbel = vec![0.0f32; 2 * dg];
-        for k in 0..self.inner_rows.len() {
-            let (r, i) = (base + k, self.inner_rows[k]);
-            let (na, me) = (self.nodes[i].na(), self.nodes[i].player as usize);
-            // The belief the head reads is the normalised reach, as everywhere
-            // else. At this point the reaches are the uniform ones `new` left.
-            xbel.iter_mut().for_each(|x| *x = 0.0);
-            for p in 0..2usize {
-                let (lo, hi) = (
-                    self.leaf_coff[2 * r + p] as usize,
-                    self.leaf_coff[2 * r + p + 1] as usize,
-                );
-                w.resize(hi - lo, 0.0);
-                normalize_weights(self.reach_of(i, p), &mut w);
-                crate::net::accumulate(
-                    &self.cz,
-                    &self.leaf_cidx[lo..hi],
-                    &w,
-                    dg,
-                    &mut xbel[p * dg..(p + 1) * dg],
-                );
-            }
-            psi.resize(na * AFEAT, 0.0);
-            for a in 0..na {
-                let n = &self.nodes[i];
-                write_action_feats(
-                    &n.acts[a],
-                    &self.ctx,
-                    me,
-                    n.aslot[a],
-                    n.fdown[a],
-                    &mut psi[a * AFEAT..(a + 1) * AFEAT],
-                );
-            }
-            net.embed_actions(&psi, na, &self.ce, &mut q);
-            let (lo, hi) = (
-                self.leaf_coff[2 * r + me] as usize,
-                self.leaf_coff[2 * r + me + 1] as usize,
-            );
-            logit.resize((hi - lo) * na, 0.0);
-            net.policy(
-                &xbel,
-                &self.h0[r * h..],
-                me,
-                &self.cz,
-                &self.leaf_cidx[lo..hi],
-                &q,
-                na,
-                &mut sb,
-                &mut logit,
-            );
-            let idx = lo..hi;
-            // Softmax over the *legal* actions of each config, with the same
-            // floor regret matching uses, so every legal action keeps positive
-            // probability and the carried beliefs keep full support.
-            let so = self.soff[i] as usize;
-            let n = &self.nodes[i];
-            for c in 0..idx.len() {
-                let logits = &logit[c * na..(c + 1) * na];
-                let cells = n.legal_row(c);
-                let m = cells.clone().fold(f32::NEG_INFINITY, |m, cell| {
-                    m.max(logits[n.legal_action[cell] as usize])
-                });
-                let mut sum = 0.0;
-                for cell in cells.clone() {
-                    let a = n.legal_action[cell] as usize;
-                    let v = (logits[a] - m).exp();
-                    self.cur[so + cell] = v;
-                    sum += v;
-                }
-                if sum > 0.0 {
-                    for cell in cells {
-                        let x = &mut self.cur[so + cell];
-                        *x = (*x / sum).max(1e-6);
-                    }
-                }
-            }
-        }
-        true
     }
 
     /// True when the build hit the node cap and the solve must not be used.

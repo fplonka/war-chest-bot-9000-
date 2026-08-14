@@ -34,17 +34,16 @@ def main():
     d = Dump(args.dump)
     parts = d.rows(0, min(args.rows, len(d)))
     warmup(dev)
-    for augment in (False, True):
-        a = make_cpu_batch(clone(parts), np.random.default_rng(17), dev, augment)
-        b = make_gpu_batch(clone(parts), np.random.default_rng(17), dev, augment)
-        torch.cuda.synchronize(dev)
-        for i, (x, y) in enumerate(zip(a[:7] + a[8:], b[:7] + b[8:])):
-            if x.dtype.is_floating_point:
-                torch.testing.assert_close(x, y, rtol=0, atol=1e-6)
-            else:
-                torch.testing.assert_close(x, y, rtol=0, atol=0)
-        assert a[7] == b[7]
-        print(f"augment={augment}: {len(parts[0])} rows, {len(parts[1])} configs OK")
+    a = make_cpu_batch(clone(parts), np.random.default_rng(17), dev, False)
+    b = make_gpu_batch(clone(parts), np.random.default_rng(17), dev, False)
+    torch.cuda.synchronize(dev)
+    for x, y in zip(a[:-1], b[:-1]):
+        if x.dtype.is_floating_point:
+            torch.testing.assert_close(x, y, rtol=0, atol=1e-6)
+        else:
+            torch.testing.assert_close(x, y, rtol=0, atol=0)
+    assert a[-1] == b[-1]
+    print(f"{len(parts[0])} rows, {len(parts[1])} configs OK")
 
 
 if __name__ == "__main__":

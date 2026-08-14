@@ -265,8 +265,7 @@ pub enum Collect {
 /// `2 * n + 1` offsets: row `r`, player `p` spans `coff[2*r+p] .. coff[2*r+p+1]`.
 #[derive(Default)]
 pub struct Data {
-    /// `[n * ROW_BYTES]` packed replay rows: raw small integers plus the aux
-    /// targets (see `rebel::ROW_*`). The public encoding is *not* stored — a
+    /// `[n * ROW_BYTES]` packed replay rows (see `rebel::ROW_*`). The public encoding is *not* stored — a
     /// row is expanded when a batch is made, so the stored bytes never go
     /// stale as the network changes.
     pub rows: Vec<u8>,
@@ -278,10 +277,6 @@ pub struct Data {
     pub cw: Vec<f32>,
     /// `[total_configs]` the solve's value for each config.
     pub cy: Vec<f32>,
-    /// `[n]` the round each row was taken at, which is what the aux backfill
-    /// needs and what it consumes. Not shipped to Python (the aux targets
-    /// themselves live in the row).
-    round: Vec<u16>,
     /// Games abandoned because the solve service refused their subgame. Zero
     /// in every healthy run; GPU capacity is not an algorithmic game filter.
     pub dropped: usize,
@@ -297,27 +292,6 @@ pub struct Data {
     /// time-censored work, not a capacity drop and never enters replay.
     pub censored_games: usize,
 
-    // ------------------------------------------------------- policy targets
-    // One per solve, not one per row. A solve's rows share a public state and
-    // differ only in belief, while the reference strategy is a single object,
-    // so labelling every row would teach the head that the belief does not
-    // matter. The exact label belongs to the live-belief row -- the one whose
-    // belief is the solve's own root -- which `finish_solve` records.
-    //
-    // These are per epoch and never enter the replay buffer. A value target is
-    // bootstrapped and gains from being averaged over a long history; a
-    // strategy is not, and is regenerated in full every epoch.
-    /// `[s]` the row each solve's label belongs to.
-    pub prow: Vec<u32>,
-    /// `[s]` which player was to act there.
-    pub pact: Vec<u8>,
-    /// `[sum na, AFEAT]` the action descriptions, and `[s + 1]` offsets in
-    /// actions.
-    pub pa: Vec<f32>,
-    pub paoff: Vec<u32>,
-    /// `[sum nc * na]` the reference strategy: one distribution per config of
-    /// the acting player, in the row's config order.
-    pub pp: Vec<f32>,
     /// `[2 * n + 1]` arena offsets.
     pub coff: Vec<u32>,
     /// Solve starts in row space: `soff[k]` is the row at which solve k
@@ -351,15 +325,6 @@ impl Data {
     pub fn merge(&mut self, o: Data) {
         let base = self.cw.len() as u32;
         self.rows.extend(o.rows);
-        let (row_base, act_base) = (self.nv as u32, (self.pa.len() / AFEAT) as u32);
-        self.prow.extend(o.prow.iter().map(|r| r + row_base));
-        self.pact.extend(o.pact);
-        self.pa.extend(o.pa);
-        // Same leading-zero rule as `coff`: the merged arena keeps exactly one.
-        let phead = if self.paoff.is_empty() { 0 } else { 1 };
-        self.paoff
-            .extend(o.paoff.iter().skip(phead).map(|x| x + act_base));
-        self.pp.extend(o.pp);
         self.cc.extend(o.cc);
         self.cw.extend(o.cw);
         self.cy.extend(o.cy);
@@ -405,7 +370,6 @@ impl Data {
         let base = self.rows.len();
         self.rows.resize(base + ROW_BYTES, 0);
         pack_row(s, ctx, &mut self.rows[base..base + ROW_BYTES]);
-        self.round.push(s.round);
         if self.coff.is_empty() {
             self.coff.push(0);
         }
@@ -421,90 +385,6 @@ impl Data {
             self.coff.push(self.cw.len() as u32);
         }
         self.nv += 1;
-    }
-
-    /// Record the policy label for the solve just pushed: the reference
-    /// strategy at its root, and the descriptions of the actions it is over.
-    /// `row` is the live-belief row, whose belief is the solve's own root.
-    fn push_policy(&mut self, sv: &Solver, ctx: &Ctx, row: usize, player: u8) {
-        debug_assert!(
-            sv.root_mainplay,
-            "a policy label is the strategy at a normal coin-play root"
-        );
-        let n = &sv.nodes[0];
-        let (na, nc) = (n.na(), n.nc(player as usize));
-        if na == 0 || nc == 0 {
-            return;
-        }
-        if self.paoff.is_empty() {
-            self.paoff.push(0);
-        }
-        let base = self.pa.len();
-        self.pa.resize(base + na * AFEAT, 0.0);
-        for a in 0..na {
-            write_action_feats(
-                &n.acts[a],
-                ctx,
-                player as usize,
-                n.aslot[a],
-                n.fdown[a],
-                &mut self.pa[base + a * AFEAT..base + (a + 1) * AFEAT],
-            );
-        }
-        self.paoff.push((self.pa.len() / AFEAT) as u32);
-        for c in 0..nc {
-            let base = self.pp.len();
-            self.pp.resize(base + na, 0.0);
-            for (cell, &p) in n.legal_row(c).zip(sv.average_strategy(0, c).iter()) {
-                self.pp[base + n.legal_action[cell] as usize] = p;
-            }
-        }
-        self.prow.push(row as u32);
-        self.pact.push(player);
-    }
-
-    /// `push_policy` with an explicit reference strategy, for the GPU path
-    /// where the solve ran on the device: `strat` is the downloaded flat
-    /// reference strategy (`soff`-aligned legal-cell CSR).
-    fn push_policy_strat(
-        &mut self,
-        tree: &WalkTree,
-        ctx: &Ctx,
-        row: usize,
-        player: u8,
-        strat: &[f32],
-    ) {
-        let ar = tree.action_range(0);
-        let (na, nc) = (ar.len(), tree.supports[0][player as usize].len());
-        if na == 0 || nc == 0 {
-            return;
-        }
-        if self.paoff.is_empty() {
-            self.paoff.push(0);
-        }
-        let base = self.pa.len();
-        self.pa.resize(base + na * AFEAT, 0.0);
-        for a in 0..na {
-            let aa = ar.start + a;
-            write_action_feats(
-                &tree.actions[aa],
-                ctx,
-                player as usize,
-                tree.aslot[aa],
-                tree.fdown[aa],
-                &mut self.pa[base + a * AFEAT..base + (a + 1) * AFEAT],
-            );
-        }
-        self.paoff.push((self.pa.len() / AFEAT) as u32);
-        for c in 0..nc {
-            let base = self.pp.len();
-            self.pp.resize(base + na, 0.0);
-            for cell in tree.legal_row(0, c) {
-                self.pp[base + tree.legal_action[cell] as usize] = strat[cell];
-            }
-        }
-        self.prow.push(row as u32);
-        self.pact.push(player);
     }
 
     /// The config range of row `r`, player `p`, in the arena.
@@ -716,8 +596,6 @@ pub struct Game<'a> {
     /// strategies (plus the live belief), which Phase 2 values once the next
     /// solve is done. Empty means the first level.
     carried: Vec<[Vec<f32>; 2]>,
-    /// One entry per round, for the auxiliary targets.
-    timeline: Timeline,
     /// The rows this game produced; merged into the caller's `Data` by
     /// `play_game` or the GPU worker when the game ends.
     data: Data,
@@ -758,7 +636,6 @@ impl<'a> Game<'a> {
             ],
             walk: None,
             carried: Vec::new(),
-            timeline: Vec::new(),
             data: Data::default(),
             from_row: 0,
             gc,
@@ -810,18 +687,12 @@ impl<'a> Game<'a> {
             bel,
             walk,
             carried,
-            timeline,
             data,
             roots,
             ..
         } = self;
         let mut roots_out: Option<&mut Vec<(State, [Belief; 2])>> = roots.as_mut();
         while !s.is_terminal() {
-            while timeline.len() <= s.round as usize {
-                timeline.push(([s.markers_on_board(0), s.markers_on_board(1)], s.initiative));
-            }
-            let last = timeline.len() - 1;
-            timeline[last] = ([s.markers_on_board(0), s.markers_on_board(1)], s.initiative);
             let player = s.to_act();
             if s.is_chance() {
                 let res = reserve(s, player, ctx);
@@ -965,7 +836,6 @@ impl<'a> Game<'a> {
                             return Step::Submitted;
                         } else {
                             // CPU path: the full solve, then the walk.
-                            sv.warm_start(scfg.warm);
                             sv.multistep(cfg.iters);
                             if collects_rows(gc, s) {
                                 // Phase 2: one fixed-policy value pass per
@@ -1015,13 +885,6 @@ impl<'a> Game<'a> {
                                         [&v[0], &v[1]],
                                     );
                                 }
-                                // `roots` ends with the live belief —
-                                // `finish_walk` appends it last, and the first
-                                // level carries only it — so the row just
-                                // pushed is the one whose belief is this
-                                // solve's own root, and the only one the
-                                // reference strategy is the exact answer for.
-                                data.push_policy(&sv, ctx, data.nv - 1, player);
                             } else {
                                 // Nothing will ever value them: this solve is
                                 // the only one whose root they belong to.
@@ -1085,7 +948,9 @@ impl<'a> Game<'a> {
             let true_row = np.row(true_ci);
             let mut chosen_cell = true_row.start + sample_row(rng, &np.probs[true_row.clone()]);
             // One explorer per walk. No walk: this decision is its own walk.
-            let explorer = walk.as_ref().map(|w| w.explorer)
+            let explorer = walk
+                .as_ref()
+                .map(|w| w.explorer)
                 .unwrap_or_else(|| sample_explorer(rng, gc.explore));
             if gc.explore > 0.0
                 && player == explorer
@@ -1149,7 +1014,6 @@ impl<'a> Game<'a> {
         let gc = self.gc;
         let tree = self.pending_walk.take().expect("pending walk tree");
         let slot = self.pending_slot;
-        let player = self.pending_player;
         let roots_v = self.pending_roots.take().expect("pending roots");
         self.pending_oversize = false;
         if collects_rows(gc, &self.s) {
@@ -1171,14 +1035,6 @@ impl<'a> Game<'a> {
                     [&v[0], &v[1]],
                 );
             }
-            // The policy label comes from the downloaded reference strategy.
-            self.data.push_policy_strat(
-                &tree,
-                &self.ctx,
-                self.data.nv - 1,
-                player,
-                &result.strategy,
-            );
         }
         self.carried = Vec::new();
         self.walk = Some(Walk {
@@ -1221,7 +1077,6 @@ impl<'a> Game<'a> {
             !sv.capped(),
             "a GPU job that passed the node cap capped on its exact CPU retry"
         );
-        sv.warm_start(scfg.warm);
         sv.multistep(cfg.iters);
         if collects_rows(self.gc, &self.s) {
             self.data.begin_solve();
@@ -1243,8 +1098,6 @@ impl<'a> Game<'a> {
                     [&v[0], &v[1]],
                 );
             }
-            self.data
-                .push_policy(&sv, &self.ctx, self.data.nv - 1, player);
         }
         self.carried.clear();
         self.walk = Some(Walk {
@@ -1260,8 +1113,7 @@ impl<'a> Game<'a> {
         self.data.oversize_routes += oversize as usize;
     }
 
-    /// The game ended: blend the outcome into the parked targets, fill the
-    /// aux heads, and return the result from White's point of view.
+    /// The game ended: blend the outcome into parked targets and return White's result.
     pub fn finish(&mut self) -> f32 {
         let z = self.s.utility(WHITE as usize);
         if self.gc.collect == Collect::Mc {
@@ -1277,7 +1129,6 @@ impl<'a> Game<'a> {
             let m = self.gc.mc_mix.clamp(0.0, 1.0);
             blend_outcome(&mut self.data, self.from_row, 1.0 - m, m, z);
         }
-        fill_aux(&mut self.data, self.from_row, &self.timeline, z);
         self.data.games += 1;
         if self.s.main_plays >= crate::state::MAX_MAIN_PLAYS {
             self.data.cap_hits += 1;
@@ -1320,93 +1171,6 @@ pub fn play_game(
     data.merge(d);
     z
 }
-/// How many auxiliary targets a row carries. Defined with the frozen row
-/// format; see `rebel::AUX`.
-pub use crate::rebel::AUX;
-/// How far ahead the marker target looks.
-const AUX_ROUNDS: u16 = 3;
-
-/// One entry per round the game reached: each player's markers on the board,
-/// and who held the initiative. The aux targets are read off this.
-type Timeline = Vec<([u8; 2], u8)>;
-
-/// Fill in the auxiliary targets now that the game is over and the future they
-/// ask about has happened. A row taken in round `r` wants the board three rounds
-/// later; a game that ends first is asked about its final position instead,
-/// which is the true answer to "how many markers are down later on".
-/// Round-to-nearest-even f32 -> IEEE-754 binary16 bit pattern. The aux
-/// targets are stored as float16 in the frozen row; numpy reads them back
-/// with the same rounding.
-pub(crate) fn f32_to_f16(x: f32) -> u16 {
-    let b = x.to_bits();
-    let sign = ((b >> 16) & 0x8000) as u16;
-    let exp = ((b >> 23) & 0xff) as i32;
-    let man = b & 0x7f_ffff;
-    if exp == 0xff {
-        // Inf / NaN: keep the top bits (never produced by the aux targets).
-        return (sign as u32 | 0x7c00 | man >> 13) as u16;
-    }
-    let e = exp - 127 + 15;
-    if e >= 0x1f {
-        return (sign as u32 | 0x7c00) as u16; // overflow to inf
-    }
-    if e <= 0 {
-        if e < -10 {
-            return sign; // underflow to zero
-        }
-        let m = man | 0x800_000;
-        let shift = 14 - e;
-        let half = m >> shift;
-        let rem = m & ((1 << shift) - 1);
-        let round = if rem > (1 << (shift - 1)) || (rem == (1 << (shift - 1)) && (half & 1) == 1) {
-            half + 1
-        } else {
-            half
-        };
-        return (sign as u32 | round) as u16;
-    }
-    // Round-to-nearest-even; when the mantissa carries into the exponent the
-    // f16 value must become the next binade, not wrap to a subnormal.
-    let mut half = (man >> 13) as u32;
-    let rem = man & 0x1fff;
-    if rem > 0x1000 || (rem == 0x1000 && (half & 1) == 1) {
-        half += 1;
-        if half == 0x400 {
-            return (sign as u32 | ((e as u32 + 1) << 10)) as u16;
-        }
-    }
-    (sign as u32 | ((e as u32) << 10) | half) as u16
-}
-
-fn fill_aux(data: &mut Data, from_row: usize, tl: &Timeline, z: f32) {
-    if tl.is_empty() {
-        return;
-    }
-    let result = if z > 0.0 {
-        0.0
-    } else if z < 0.0 {
-        2.0
-    } else {
-        1.0
-    };
-    for r in from_row..data.nv {
-        let now = (data.round[r] as usize).min(tl.len() - 1);
-        let then = (now + AUX_ROUNDS as usize).min(tl.len() - 1);
-        let at = r * ROW_BYTES + ROW_AUX;
-        let row = &mut data.rows[at..at + 2 * AUX];
-        let vals = [
-            tl[then].0[0] as f32 / 6.0,
-            tl[then].0[1] as f32 / 6.0,
-            // Does the initiative change hands by the start of the next round?
-            (tl[(now + 1).min(tl.len() - 1)].1 != tl[now].1) as u8 as f32,
-            result,
-        ];
-        for (k, v) in vals.iter().enumerate() {
-            row[2 * k..2 * k + 2].copy_from_slice(&f32_to_f16(*v).to_le_bytes());
-        }
-    }
-}
-
 /// `y <- keep * y + mix * (+-z)` over every config of every row this game
 /// produced. The sign flips for player 1: `z` is White's outcome and the
 /// targets are per-player utilities of a zero-sum game.
@@ -1694,8 +1458,7 @@ pub fn run_games_gpu_until(
 /// threads each owns many lightweight game actors; completed solves are
 /// detached immediately and merged into bounded chunks while the actors keep
 /// playing. This eager path is valid for pure bootstrap targets (`mc_mix=0`)
-/// with the auxiliary loss disabled: value and policy targets are final at GPU
-/// completion, while outcome-dependent auxiliary bytes remain zero.
+/// with pure bootstrap targets: value targets are final at GPU completion.
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 pub fn run_games_gpu_stream(

@@ -2,7 +2,7 @@
 //! production GEMMs may down-convert internally for tensor-core throughput.
 //! These compile everywhere and execute only on a CUDA test host.
 
-use crate::net::{Mlp, V3Layout};
+use crate::net::{Mlp, V4Layout};
 use crate::rng::Rng;
 use crate::search::{Cfg, Cfr, Nets, Solver};
 use crate::selfplay::{collect_roots, Agent, Collect, GameCfg};
@@ -12,8 +12,6 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use super::client::SolveResult;
 use super::service::spawn;
 
-const DG: usize = 64;
-const RK: usize = 64;
 const N_CARRIED: usize = 3;
 
 const TEST_CFG: Cfg = Cfg {
@@ -21,7 +19,6 @@ const TEST_CFG: Cfg = Cfg {
     iters: 8,
     snapshots: true,
     cfr: Cfr::LINEAR,
-    warm: 0.0,
     node_cap: 0,
     gpu_build: false,
     keep_states: false,
@@ -34,31 +31,17 @@ fn gpu_guard() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn fast_gemm() -> bool {
-    std::env::var_os("WARCHEST_GPU_PRECISE_GEMM").is_none()
-}
-
 fn test_weights() -> (Vec<usize>, Vec<f32>, Vec<f32>, Vec<f32>) {
-    // Production topology: card [64], public [384], no extra head or slot
-    // hidden layers, one holding residual block.
-    let dims = vec![3, 32, DG, RK, 384, 1, 1, 64, 1, 384, 0, 0];
-    let l = V3Layout::new(&dims).expect("dims");
+    let dims = vec![4];
+    let l = V4Layout::new(&dims).expect("dims");
     let mut rng = Rng::new(0xD15EA5E);
-    let mut w: Vec<f32> = (0..l.w_len - l.head_in)
-        .map(|_| (rng.next_u64() as f32 / u64::MAX as f32 - 0.5) * 0.6)
+    let w: Vec<f32> = (0..l.w_len)
+        .map(|_| (rng.next_u64() as f32 / u64::MAX as f32 - 0.5) * 0.1)
         .collect();
-    let wt =
-        (0..l.head_in).map(|_| (rng.next_u64() as f32 / u64::MAX as f32 - 0.5) * 0.05);
-    w.splice(l.wt..l.wt, wt);
     let b = vec![0.0; l.b_len];
     let mut ln = vec![0.0; l.ln_len];
-    for (gain, _) in &l.pub_ln {
-        for x in &mut ln[*gain..*gain + 384] {
-            *x = 1.0;
-        }
-    }
-    for x in &mut ln[l.ln1.0..l.ln1.0 + l.head_in] {
-        *x = 1.0;
+    for ((gain, _), width) in l.norms.iter().zip([384usize, 384, 384, 128, 128, 384, 384]) {
+        ln[*gain..*gain + width].fill(1.0);
     }
     (dims, w, b, ln)
 }
@@ -251,16 +234,7 @@ fn full_wave_oracle() {
     for (tree, ((mut sv, job), result)) in set.into_iter().zip(got).enumerate() {
         assert_result_invariants(&job, &result);
         sv.multistep(TEST_CFG.iters);
-        let strategy_tol = if fast_gemm() {
-            // The production tensor-core path deliberately trades CPU-oracle
-            // rounding for throughput. Two retained FP16 residual operands
-            // moved the measured synthetic worst case to 0.163 after CFR
-            // amplification. Keep that bounded while the precise and
-            // zero-network oracles below remain tight.
-            (2e-1, 3e-3)
-        } else {
-            (5e-3, 2e-3)
-        };
+        let strategy_tol = (5e-3, 2e-3);
         cmp(
             &format!("tree {tree} strategy"),
             &result.strategy,
@@ -269,14 +243,7 @@ fn full_wave_oracle() {
             strategy_tol.1,
         );
         let want_roots = sv.value_under(&job.carried);
-        let root_tol = if fast_gemm() {
-            // FP16 internal operands retain FP32 accumulation and output, but
-            // deliberately do not promise CPU-oracle rounding. Probability,
-            // shape, finiteness, zero-network, and reuse gates remain tight.
-            (5e-3, 1e-3)
-        } else {
-            (1e-3, 2e-4)
-        };
+        let root_tol = (1e-3, 2e-4);
         cmp(
             &format!("tree {tree} root values"),
             &flatten_pairs(&result.root_values),
@@ -381,15 +348,7 @@ fn wave_composition_stays_bounded() {
         assert_result_invariants(&set[measured_id].1, &alone);
         assert_result_invariants(&set[measured_id].1, &together);
         assert_result_invariants(&set[measured_id].1, &after);
-        let company_strategy_tol = if fast_gemm() {
-            // Wave-shaped tensor-core rounding plus the retained FP16 public
-            // residual can be amplified by eight regret-matching iterations.
-            // The full CPU bound remains 0.13, while structural, probability,
-            // zero-network, precise-mode, and exact-reuse gates stay tight.
-            (1.2e-1, 3e-3)
-        } else {
-            (5e-3, 2e-3)
-        };
+        let company_strategy_tol = (5e-3, 2e-3);
         cmp(
             &format!("tree {measured_id} strategy depends on wave company"),
             &together.strategy,
@@ -411,11 +370,7 @@ fn wave_composition_stays_bounded() {
             1e-6,
             1e-6,
         );
-        let company_root_tol = if fast_gemm() {
-            (5e-3, 1e-3)
-        } else {
-            (1e-3, 2e-4)
-        };
+        let company_root_tol = (1e-3, 2e-4);
         cmp(
             &format!("tree {measured_id} root values depend on wave company"),
             &flatten_pairs(&together.root_values),

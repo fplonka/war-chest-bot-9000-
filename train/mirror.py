@@ -34,7 +34,6 @@ NTYPE = warchest.NTYPE
 NSLOT = warchest.NSLOT
 ROW_BYTES = warchest.ROW_BYTES
 PILE_COUNTS = warchest.PILE_COUNTS
-AUX = warchest.AUX
 NONE = 255
 
 HEXMAP = np.asarray(warchest.hex_mirror(), dtype=np.int64)
@@ -69,13 +68,6 @@ def mirror_rows(rows):
     # horizon do not.
     out[:, warchest.ROW_INITIATIVE] = flip(out[:, warchest.ROW_INITIATIVE])
     out[:, warchest.ROW_TO_ACT] = flip(out[:, warchest.ROW_TO_ACT])
-    # Aux targets name seats: the two marker counts swap, the result class
-    # inverts (0 = white wins, 2 = black wins, 1 = neither), the initiative
-    # flip is a flip either way.
-    aux = out[:, warchest.ROW_AUX:warchest.ROW_AUX + 2 * AUX].view(np.float16).reshape(-1, AUX)
-    aux = aux[:, [1, 0, 2, 3]].copy()
-    aux[:, 3] = 2.0 - aux[:, 3]
-    out[:, warchest.ROW_AUX:warchest.ROW_AUX + 2 * AUX] = aux.view(np.uint8).reshape(-1, 2 * AUX)
     return out
 
 
@@ -192,17 +184,15 @@ def check_against_engine(games=8, seed=11):
 
     `self_check_rows` proves the permutation is self-consistent; a permutation
     can be self-consistent and still wrong. This one compares it with the
-    position the engine says the rotation produces. Aux targets are excluded:
-    they are written when a game ends, not by `pack_row`, so the oracle's rows
-    carry none.
+    position the engine says the rotation produces.
     """
     pairs = np.frombuffer(bytes(warchest.mirror_row_pairs(games, seed)), np.uint8)
     pairs = pairs.reshape(-1, ROW_BYTES)
     rows, want = pairs[0::2], pairs[1::2]
     assert len(rows), "the oracle produced no coin-play states"
-    got = mirror_rows(rows.copy())[:, :warchest.ROW_AUX]
-    bad = np.flatnonzero((got != want[:, :warchest.ROW_AUX]).any(axis=1))
+    got = mirror_rows(rows.copy())
+    bad = np.flatnonzero((got != want).any(axis=1))
     assert not len(bad), (
         f"{len(bad)} of {len(rows)} rows disagree with State::mirror, "
-        f"first at byte {np.flatnonzero(got[bad[0]] != want[bad[0], :warchest.ROW_AUX])[0]}")
+        f"first at byte {np.flatnonzero(got[bad[0]] != want[bad[0]])[0]}")
     return len(rows)

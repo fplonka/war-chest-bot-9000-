@@ -19,9 +19,9 @@
 //! `docs/TREE.md`; see that file for the meaning of each array.
 
 use crate::actions::Action;
-use crate::net::V3Layout;
+use crate::net::V4Layout;
 use crate::rebel::Config;
-use crate::rebel::{CFEAT, GPU_ROW_BYTES, NSLOT, NTYPE, PILE_COUNTS, PUBFEAT};
+use crate::rebel::{CFEAT, GPU_ROW_BYTES, NSLOT, NTYPE};
 use crate::search::{Cfr, Solver};
 use crate::units::{write_card_features, CARD_FEATS};
 use std::rc::Rc;
@@ -29,8 +29,8 @@ use std::rc::Rc;
 /// The byte format this module writes. Bump when an array changes shape or
 /// meaning (docs/TREE.md "the version bumps when any of them changes shape or
 /// meaning").
-pub const JOB_VERSION: u32 = 6;
-const MAGIC: u32 = 0x5743_4A36; // "WCJ6"
+pub const JOB_VERSION: u32 = 7;
+const MAGIC: u32 = 0x5743_4A37; // "WCJ7"
 
 /// Runtime metadata that travels with a job (not part of the frozen tree
 /// contract — it is per-request).
@@ -41,19 +41,14 @@ pub struct PackedMeta {
     /// Keep the per-iterate average snapshots (generation) or not (evaluation).
     pub snapshots: bool,
     pub cfr: Cfr,
-    /// Iterations the policy head's strategy is worth (0 = uniform start).
-    pub warm: f32,
     /// The kept iteration numbers, in order (`Solver::snapshot_iters`).
     pub snap_iters: Vec<usize>,
-    /// Exact v3 network shape. Admission uses it to account for every device
+    /// Exact v4 network shape. Admission uses it to account for every device
     /// scratch matrix before choosing an ordinary or exclusive lane.
     pub net_dims: Vec<usize>,
 }
 
-/// Every uploaded array of the contract. `rows` is the network batch size:
-/// the non-terminal leaves, plus the decision rows the policy head reads
-/// (warm start), in batch order — leaves first, so a leaf's row index is its
-/// position in `leaf_rows`.
+/// Every uploaded array of the contract. `rows` is the non-terminal leaf batch.
 #[derive(Clone, Debug, Default)]
 pub struct PackedTables {
     pub nodes: usize,
@@ -66,11 +61,9 @@ pub struct PackedTables {
     pub nleaf: usize,
     pub nterm: usize,
     pub rows: usize,
-    pub n_inner: usize,
     pub leaf_configs: usize,
     pub nlevels: usize,
     pub ncells: usize,
-    pub pubfeat: usize,
     pub reach_len: usize,
     // -- tree structure --
     pub node_kind: Vec<u8>,
@@ -123,8 +116,6 @@ pub struct PackedTables {
     pub rvd_p: Vec<f32>,
     // -- leaves --
     pub leaf_rows: Vec<u32>,
-    /// Decision nodes in the network batch, after the leaves (warm start).
-    pub inner_rows: Vec<u32>,
     pub term_leaves: Vec<u32>,
     pub terminal_utility: Vec<f32>,
     pub leaf_coff: Vec<u32>,
@@ -139,6 +130,7 @@ pub struct PackedTables {
     pub card_feat: Vec<f32>,
     // -- config table --
     pub cphi: Vec<f32>,
+    pub cplayer: Vec<u8>,
     // -- derived: BFS level order for the sweeps --
     pub bfs_order: Vec<u32>,
     pub level_start: Vec<u32>,
@@ -211,7 +203,7 @@ impl WorkVector {
 
 /// The compact public tree retained by a game actor while and after its GPU
 /// solve runs. It contains only what the real game walk reads: public children,
-/// action metadata, config-support identity, sparse policy rows, and leaf/draw
+/// action metadata, config-support identity, sparse strategy rows, and leaf/draw
 /// markers. Search states, transitions, reverse gathers, reaches, values, and
 /// network scratch stay in `PackedJob` or die with the CPU builder.
 #[derive(Clone)]
@@ -356,7 +348,6 @@ impl PackedJob {
                 iters: sv.cfg.iters,
                 snapshots: sv.cfg.snapshots,
                 cfr: sv.cfg.cfr,
-                warm: sv.cfg.warm,
                 snap_iters: sv.snap_list.clone(),
                 net_dims: sv.network_dims().to_vec(),
             },
@@ -496,7 +487,7 @@ pub(crate) fn device_value_layout(t: &PackedTables) -> Option<([Vec<u32>; 2], us
 
 fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
     let t = &job.tables;
-    let Ok(l) = V3Layout::new(&job.meta.net_dims) else {
+    let Ok(_l) = V4Layout::new(&job.meta.net_dims) else {
         return usize::MAX;
     };
     let (rows, cfgs, cells) = (t.rows, t.ncfg, t.ncells);
@@ -509,32 +500,12 @@ fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
     } else {
         0
     };
-    let (pubw, _, cardw, slotw) = l.widths();
-    // Mirrors `gpu::device::arena_layout`: Bh/Bh2 hold tower outputs only, so
-    // the `xdim`-wide trunk input does not size them.
-    let max_pub = pubw.into_iter().chain([l.head_in]).max().unwrap_or(1);
-    let slot_max = slotw
-        .into_iter()
-        .chain([l.hfeat(), l.dg])
-        .max()
-        .unwrap_or(1);
-    let card_max = cardw.into_iter().max().unwrap_or(l.de);
     let mul = |a: usize, b: usize| a.saturating_mul(b);
-    let bh = mul(rows, max_pub)
-        .max(mul(mul(cfgs, NSLOT), slot_max))
-        .max(mul(NTYPE, card_max))
-        .max(mul(mul(rows, NTYPE), l.de))
-        .max(mul(cfgs, l.dg));
-    let bg = mul(NTYPE, CARD_FEATS)
-        .max(mul(mul(rows, NTYPE), PILE_COUNTS))
-        .max(mul(mul(rows, NTYPE), l.de).saturating_add(mul(NTYPE, l.de)))
-        .max(mul(mul(cfgs, NSLOT), l.hfeat()))
-        .max(mul(cfgs, l.rank + 1));
-    let h_stride = std::iter::once(l.head_in)
-        .chain(l.hmlp.iter().map(|x| x.o))
-        .max()
-        .unwrap_or(l.head_in);
-    let fast_head = std::env::var_os("WARCHEST_GPU_PRECISE_GEMM").is_none() && l.hmlp.is_empty();
+    let bh = mul(2 * rows, crate::net::PUBLIC)
+        .max(mul(mul(cfgs, NSLOT), crate::net::SLOT))
+        .max(mul(2 * NTYPE, crate::net::UNIT))
+        .max(mul(cfgs, crate::net::CONFIG));
+    let bg = mul(2 * NTYPE, CARD_FEATS).max(mul(mul(cfgs, NSLOT), 3 + crate::net::UNIT));
     let sizes = [
         reach,
         reach.max(vals),
@@ -543,33 +514,17 @@ fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
         cells,
         cells,
         cells,
-        mul(NTYPE, l.de),
-        mul(cfgs, l.dg),
-        mul(cfgs, l.rank + 1),
-        if fast_head {
-            mul(rows, l.head_in).div_ceil(2)
-        } else {
-            mul(rows, l.head_in)
-        },
-        if fast_head {
-            mul(mul(rows, 2), l.dg).div_ceil(2)
-        } else {
-            mul(mul(rows, 2), l.dg)
-        },
-        if fast_head {
-            mul(rows, l.head_in).div_ceil(2)
-        } else {
-            mul(rows, h_stride)
-        },
-        if fast_head {
-            mul(rows, l.head_in).div_ceil(2)
-        } else {
-            mul(rows, h_stride)
-        },
-        mul(rows, l.rank),
+        mul(2 * NTYPE, crate::net::UNIT),
+        mul(cfgs, crate::net::CONFIG),
+        mul(cfgs, crate::net::JOINT),
+        mul(2 * rows, crate::net::PUBLIC),
+        mul(2 * rows, crate::net::CONFIG),
+        mul(rows, crate::net::CONTEXT),
+        mul(rows, crate::net::CONTEXT),
+        mul(rows, crate::net::JOINT),
         roots,
         mul(carry_snaps, t.snapshot_configs).div_ceil(2),
-        mul(rows, l.xdim()),
+        mul(2 * rows, crate::net::PUBLIC_IN),
         bh,
         bh,
         bg,
@@ -650,8 +605,11 @@ enum DeviceArena {
 
 impl PackedTables {
     pub fn owned_bytes(&self) -> usize {
-        let u8s =
-            self.node_kind.len() + self.node_player.len() + self.leaf_raw.len() + self.ids.len();
+        let u8s = self.node_kind.len()
+            + self.node_player.len()
+            + self.leaf_raw.len()
+            + self.ids.len()
+            + self.cplayer.len();
         let u32s = self.node_child_start.len()
             + self.node_child.len()
             + self.obs_off.len()
@@ -680,7 +638,6 @@ impl PackedTables {
             + self.rvd_start.len()
             + self.rvd_src.len()
             + self.leaf_rows.len()
-            + self.inner_rows.len()
             + self.term_leaves.len()
             + self.leaf_coff.len()
             + self.leaf_cidx.len()
@@ -699,9 +656,9 @@ impl PackedTables {
         let nodes = sv.nodes.len();
         let mut t = PackedTables {
             nodes,
-            pubfeat: sv.pubfeat,
             ncfg: sv.ncfg,
             cphi: sv.cphi[..sv.ncfg * CFEAT].to_vec(),
+            cplayer: sv.cplayer.clone(),
             ..Default::default()
         };
         // Config support counts per node per player. Only the *leaf* configs
@@ -862,17 +819,15 @@ impl PackedTables {
         t.children = t.node_child.len();
         t.draw_entries = t.draw_to.len();
         t.reach_len = reach_at as usize;
-        t.ids = sv.ids.to_vec();
+        t.ids = sv.ids[..NTYPE].to_vec();
 
         // Leaves.
         t.nleaf = sv.leaf_rows.len();
         t.nterm = sv.term_leaves.len();
         t.leaf_rows = sv.leaf_rows.iter().map(|&i| i as u32).collect();
-        t.inner_rows = sv.inner_rows.iter().map(|&i| i as u32).collect();
         t.term_leaves = sv.term_leaves.iter().map(|&i| i as u32).collect();
         t.terminal_utility = sv.term_leaves.iter().map(|&i| sv.nodes[i].util).collect();
-        t.rows = sv.leaf_rows.len() + sv.inner_rows.len();
-        t.n_inner = sv.inner_rows.len();
+        t.rows = sv.leaf_rows.len();
         // The batch sentinel is pushed by `ensure_leaf_batch`, which runs on
         // the first network query; a fresh solver has not queried yet, so the
         // serializer appends the sentinel to make the tables canonical.
@@ -900,7 +855,7 @@ impl PackedTables {
         let raw = t.rows * GPU_ROW_BYTES;
         t.leaf_raw = sv.gpu_rows[..raw].to_vec();
         t.card_feat.resize(NTYPE * CARD_FEATS, 0.0);
-        for (slot, &id) in sv.ids.iter().enumerate() {
+        for (slot, &id) in sv.ids[..NTYPE].iter().enumerate() {
             write_card_features(
                 id,
                 &mut t.card_feat[slot * CARD_FEATS..(slot + 1) * CARD_FEATS],
@@ -1072,14 +1027,12 @@ impl PackedJob {
         w.f32(m.cfr.beta);
         w.f32(m.cfr.gamma);
         w.f32(m.cfr.predict);
-        w.f32(m.warm);
         w.u32s(&m.snap_iters.iter().map(|&x| x as u32).collect::<Vec<_>>());
         w.u32s(&m.net_dims.iter().map(|&x| x as u32).collect::<Vec<_>>());
         let t = &self.tables;
         w.u32(t.nodes as u32);
         w.u32(t.ncfg as u32);
         w.u32(t.rows as u32);
-        w.u32(t.pubfeat as u32);
         w.u32(t.ncells as u32);
         // tree
         w.u8s(&t.node_kind);
@@ -1115,7 +1068,6 @@ impl PackedJob {
         w.f32s(&t.rvd_p);
         // leaves
         w.u32s(&t.leaf_rows);
-        w.u32s(&t.inner_rows);
         w.u32s(&t.term_leaves);
         w.f32s(&t.terminal_utility);
         w.u32s(&t.leaf_coff);
@@ -1125,6 +1077,7 @@ impl PackedJob {
         w.f32s(&t.card_feat);
         // config table
         w.f32s(&t.cphi);
+        w.u8s(&t.cplayer);
         // levels
         w.u32s(&t.bfs_order);
         w.u32s(&t.level_start);
@@ -1158,20 +1111,17 @@ impl PackedJob {
                 gamma: r.f32("gamma")?,
                 predict: r.f32("predict")?,
             },
-            warm: r.f32("warm")?,
             snap_iters: r.u32s("snap_iters")?.iter().map(|&x| x as usize).collect(),
             net_dims: r.u32s("net_dims")?.iter().map(|&x| x as usize).collect(),
         };
         let nodes = r.u32("nodes")? as usize;
         let ncfg = r.u32("ncfg")? as usize;
         let rows = r.u32("rows")? as usize;
-        let pubfeat = r.u32("pubfeat")? as usize;
         let ncells = r.u32("ncells")? as usize;
         let mut t = PackedTables {
             nodes,
             ncfg,
             rows,
-            pubfeat,
             ncells,
             ..Default::default()
         };
@@ -1207,7 +1157,6 @@ impl PackedJob {
         t.rvd_src = r.u32s("rvd_src")?;
         t.rvd_p = r.f32s("rvd_p")?;
         t.leaf_rows = r.u32s("leaf_rows")?;
-        t.inner_rows = r.u32s("inner_rows")?;
         t.term_leaves = r.u32s("term_leaves")?;
         t.terminal_utility = r.f32s("terminal_utility")?;
         t.leaf_coff = r.u32s("leaf_coff")?;
@@ -1216,6 +1165,7 @@ impl PackedJob {
         t.leaf_raw = r.u8s("leaf_raw")?;
         t.card_feat = r.f32s("card_feat")?;
         t.cphi = r.f32s("cphi")?;
+        t.cplayer = r.u8s("cplayer")?;
         t.bfs_order = r.u32s("bfs_order")?;
         t.level_start = r.u32s("level_start")?;
         t.ids = r.u8s("ids")?;
@@ -1231,7 +1181,7 @@ impl PackedJob {
         rd_check(t.soff.len(), nodes + 1, "soff")?;
         rd_check(t.cfg_off.len(), 2 * nodes + 1, "cfg_off")?;
         rd_check(t.cphi.len(), ncfg * CFEAT, "cphi")?;
-        rd_check(pubfeat, PUBFEAT, "pubfeat")?;
+        rd_check(t.cplayer.len(), ncfg, "cplayer")?;
         rd_check(t.leaf_raw.len(), rows * GPU_ROW_BYTES, "leaf_raw")?;
         rd_check(t.card_feat.len(), NTYPE * CARD_FEATS, "card_feat")?;
         rd_check(t.leaf_coff.len(), 2 * rows + 1, "leaf_coff")?;
@@ -1257,7 +1207,7 @@ impl PackedJob {
         t.nterm = t.term_leaves.len();
         rd_check(t.snap_coff.len(), 2 * (t.nleaf + t.nterm) + 1, "snap_coff")?;
         t.snapshot_configs = *t.snap_coff.last().unwrap_or(&0) as usize;
-        t.n_inner = rows - t.nleaf;
+        rd_check(rows, t.nleaf, "rows")?;
         t.leaf_configs = t.leaf_cidx.len();
         t.nlevels = t.level_start.len() - 1;
         t.reach_len = *t.reach_off.last().unwrap_or(&0) as usize;
@@ -1292,15 +1242,13 @@ impl PackedJob {
                 iters: 4,
                 snapshots: true,
                 cfr: Cfr::DISCOUNTED,
-                warm: 0.0,
                 snap_iters: vec![0, 1, 2, 4],
-                net_dims: vec![3, 32, 64, 64, 384, 1, 1, 64, 1, 384, 0, 0],
+                net_dims: vec![4],
             },
             tables: PackedTables {
                 nodes: 1,
                 ncfg: 1,
                 rows: 1,
-                pubfeat: PUBFEAT,
                 ncells: 0,
                 node_kind: vec![2],
                 node_player: vec![0],
@@ -1333,6 +1281,7 @@ impl PackedJob {
                 leaf_raw: vec![0; GPU_ROW_BYTES],
                 card_feat: vec![0.0; NTYPE * CARD_FEATS],
                 cphi: vec![0.0; CFEAT],
+                cplayer: vec![0],
                 bfs_order: vec![0],
                 level_start: vec![0, 1],
                 ids: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],

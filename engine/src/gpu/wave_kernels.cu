@@ -12,9 +12,7 @@ namespace cg = cooperative_groups;
 #define SMOOTH 1e-30f
 #define NONE 0xffffffffu
 
-#define DG_CH ((DG + 31) / 32)
-#define RK_CH ((RK + 31) / 32)
-#define HEAD_CH ((HEADW + 31) / 32)
+#define CONFIG_CH ((CONFIG_DIM + 31) / 32)
 
 typedef struct { unsigned int node, config; } Task;
 typedef struct { unsigned int node, row; } ReadTask;
@@ -84,7 +82,8 @@ typedef struct {
 #define T_BACK_LEVEL1 48
 #define T_READOUT 49
 #define T_JOBS 50
-#define N_TABLES 51
+#define T_CONFIG_PLAYER 51
+#define N_TABLES 52
 
 // Mutable FP32 arena slots. Keep in lockstep with device.rs::Arena.
 #define A_REACH 0
@@ -121,14 +120,17 @@ typedef struct {
 } WaveDev;
 
 typedef struct {
-    const float *card_w[8], *card_b[8];
-    const float *wid, *pile_w, *pile_b;
-    const float *pub_w[8], *pub_b[8], *pub_lnw[8], *pub_lnb[8];
-    const float *pub_out_w, *pub_out_b, *wb, *wt, *ln1w, *ln1b;
-    const float *hmlp_w[8], *hmlp_b[8], *wu_w, *wu_b;
-    const float *slot_w[8], *slot_b[8], *slot_out_w, *slot_out_b;
-    const float *res_aw[4], *res_ab[4], *res_bw[4], *res_bb[4];
-    const float *wg_w, *wg_b;
+    const float *rule_w[2], *rule_b[2], *unit_id;
+    const float *public_w[3], *public_b[3], *public_lnw[3], *public_lnb[3];
+    const float *belief_slot_w, *belief_slot_b;
+    const float *belief_config_w, *belief_config_b;
+    const float *belief_config_lnw, *belief_config_lnb;
+    const float *belief_item_w, *belief_item_b;
+    const float *candidate_slot_w, *candidate_slot_b;
+    const float *candidate_w, *candidate_b, *candidate_lnw, *candidate_lnb;
+    const float *context_w[2], *context_b[2], *context_lnw[2], *context_lnb[2];
+    const float *context_joint_w, *candidate_joint_w, *joint_bias;
+    const float *value_w, *value_b;
 } WeightDev;
 
 #define TP(w, ty, slot) ((const ty*)((w)->table + (w)->toff[(slot)]))
@@ -163,12 +165,16 @@ __device__ __forceinline__ void norm_parts(const float* x, int n, int lane,
     if (total) *total = sum;
 }
 
-__device__ __forceinline__ void ln_relu(float* row, const float* bias,
+__device__ __forceinline__ float gelu(float x) {
+    return 0.5f * x * (1.0f + tanhf(0.7978846f * (x + 0.044715f * x * x * x)));
+}
+
+__device__ __forceinline__ void ln_gelu(float* row, const float* bias,
                                          const float* gain, const float* bt,
-                                         const float* add, int n, int lane) {
+                                         int n, int lane) {
     float sum = 0.0f;
     for (int j = lane; j < n; j += 32) {
-        float x = row[j] + bias[j] + (add ? add[j] : 0.0f);
+        float x = row[j] + bias[j];
         row[j] = x;
         sum += x;
     }
@@ -180,8 +186,7 @@ __device__ __forceinline__ void ln_relu(float* row, const float* bias,
     }
     float inv = rsqrtf(warp_sum(var) / (float)n + LN_EPS);
     for (int j = lane; j < n; j += 32) {
-        float x = (row[j] - mean) * inv * gain[j] + bt[j];
-        row[j] = x > 0.0f ? x : 0.0f;
+        row[j] = gelu((row[j] - mean) * inv * gain[j] + bt[j]);
     }
 }
 
@@ -190,136 +195,127 @@ __device__ __forceinline__ void ln_relu(float* row, const float* bias,
 extern "C" __global__ void pack_cards(const WaveDev* w, const WeightDev* wt) {
     (void)wt;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int n = w->jobs * NTYPE * CARD_FEATS;
-    if (i < n) AP(w, A_BG)[i] = TP(w, float, T_CARD_FEAT)[i];
+    int n = 2 * w->jobs * NTYPE * CARD_FEATS;
+    if (i >= n) return;
+    int row = i / CARD_FEATS;
+    int feature = i % CARD_FEATS;
+    int t = row % NTYPE;
+    int view = (row / NTYPE) & 1;
+    int job = row / (2 * NTYPE);
+    int physical_t = (view ? 1 - t / NSLOT : t / NSLOT) * NSLOT + t % NSLOT;
+    AP(w, A_BG)[i] = TP(w, float, T_CARD_FEAT)
+        [((unsigned long long)job * NTYPE + physical_t) * CARD_FEATS + feature];
 }
 
-// mode: 0 card, 1 plain public ReLU (unused), 2 slot, 3 residual A,
-// 4 residual B (bias only), 5 head MLP.
-extern "C" __global__ void bias_act(const WaveDev* w, const WeightDev* wt,
-                                     int mode, int level, int rows, int which) {
-    int width;
-    const float* bias;
-    int relu = 1;
-    if (mode == 0) { width = CARDW[level]; bias = wt->card_b[level]; }
-    else if (mode == 1) { width = PUBW[level]; bias = wt->pub_b[level]; }
-    else if (mode == 2) { width = SLOTW[level]; bias = wt->slot_b[level]; }
-    else if (mode == 3) { width = DG; bias = wt->res_ab[level]; }
-    else if (mode == 4) { width = DG; bias = wt->res_bb[level]; relu = 0; }
-    else { width = HMLPW[level]; bias = wt->hmlp_b[level]; }
-    float* x = AP(w, which ? A_BH2 : A_BH);
+extern "C" __global__ void bias_gelu(const WaveDev* w, const WeightDev* wt,
+                                      int mode, int rows, int which) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int width = mode == 0 ? UNIT_DIM : SLOT_DIM;
     if (i >= rows * width) return;
-    float v = x[i] + bias[i % width];
-    x[i] = relu && v < 0.0f ? 0.0f : v;
+    const float* bias = mode == 0 ? wt->rule_b[0]
+        : mode == 1 ? wt->belief_slot_b : wt->candidate_slot_b;
+    float* x = AP(w, which ? A_BH2 : A_BH);
+    x[i] = gelu(x[i] + bias[i % width]);
 }
 
-extern "C" __global__ void cards_finish(const WaveDev* w, const WeightDev* wt,
-                                         int which) {
+extern "C" __global__ void cards_finish(const WaveDev* w, const WeightDev* wt) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int n = w->jobs * NTYPE * DE;
+    int n = 2 * w->jobs * NTYPE * UNIT_DIM;
     if (i >= n) return;
-    int job = i / (NTYPE * DE);
-    int t = (i / DE) % NTYPE;
-    int j = i % DE;
-    int id = TP(w, unsigned char, T_IDS)[job * NTYPE + t];
-    const float* x = AP(w, which ? A_BH2 : A_BH);
-    AP(w, A_E)[i] = x[i] + wt->card_b[NCARD - 1][j] + wt->wid[id * DE + j];
-}
-
-extern "C" __global__ void pile_pe(const WaveDev* w, const WeightDev* wt) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int n = w->jobs * NTYPE * DE;
-    if (i >= n) return;
-    int j = i % DE;
-    float acc = wt->pile_b[j];
-    const float* e = AP(w, A_E) + (i / DE) * DE;
-    for (int k = 0; k < DE; k++)
-        acc += e[k] * wt->pile_w[(PILE_COUNTS + k) * DE + j];
-    AP(w, A_BG)[(unsigned long long)w->rows * NTYPE * DE + i] = acc;
-}
-
-extern "C" __global__ void pack_piles(const WaveDev* w, const WeightDev* wt) {
-    (void)wt;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int per = NTYPE * PILE_COUNTS;
-    if (i >= w->rows * per) return;
-    int row = i / per;
-    AP(w, A_BG)[i] = (float)TP(w, unsigned char, T_RAW_ROWS)
-        [(unsigned long long)row * GPU_ROW_BYTES + GR_PILES + i % per] / 5.0f;
+    int row = i / UNIT_DIM;
+    int j = i % UNIT_DIM;
+    int t = row % NTYPE;
+    int view = (row / NTYPE) & 1;
+    int job = row / (2 * NTYPE);
+    int physical_t = (view ? 1 - t / NSLOT : t / NSLOT) * NSLOT + t % NSLOT;
+    int id = TP(w, unsigned char, T_IDS)[job * NTYPE + physical_t];
+    AP(w, A_E)[i] = AP(w, A_BH2)[i] + wt->rule_b[1][j]
+        + wt->unit_id[id * UNIT_DIM + j];
 }
 
 extern "C" __global__ void assemble(const WaveDev* w, const WeightDev* wt) {
     (void)wt;
-    int row = blockIdx.x;
-    if (row >= w->rows) return;
+    int qrow = blockIdx.x;
+    if (qrow >= 2 * w->rows) return;
+    int row = qrow / 2, view = qrow & 1;
     int job = TP(w, unsigned int, T_ROW_JOB)[row];
     const unsigned char* src = TP(w, unsigned char, T_RAW_ROWS)
         + (unsigned long long)row * GPU_ROW_BYTES;
-    float* dst = AP(w, A_BX) + (unsigned long long)row * XD;
+    float* dst = AP(w, A_BX) + (unsigned long long)qrow * PUBLIC_IN;
     int hex_e = N_HEXES * HEX_FACTS;
-    int piles = hex_e + N_HEXES * DE;
-    for (int j = threadIdx.x; j < XD; j += blockDim.x) dst[j] = 0.0f;
+    int piles = hex_e + N_HEXES * UNIT_DIM;
+    for (int j = threadIdx.x; j < PUBLIC_IN; j += blockDim.x) dst[j] = 0.0f;
     __syncthreads();
     for (int h = threadIdx.x / 32; h < N_HEXES; h += blockDim.x / 32) {
         int lane = threadIdx.x & 31;
-        int owner = src[GR_HEX_OWNER + h];
-        int slot = src[GR_HEX_SLOT + h];
+        int physical_h = view ? HEX_MIRROR[h] : h;
+        int owner = src[GR_HEX_OWNER + physical_h];
+        if (view && owner < 2) owner = 1 - owner;
+        int slot = src[GR_HEX_SLOT + physical_h];
+        int marker = src[GR_HEX_MARKER + physical_h];
+        if (view && marker < 2) marker = 1 - marker;
         if (lane < HEX_FACTS) {
             float v = 0.0f;
             if (lane < 2) v = owner == lane ? 1.0f : 0.0f;
-            else if (lane == 2) v = (float)src[GR_HEX_HEIGHT + h] / 5.0f;
-            else if (lane < 5) v = src[GR_HEX_MARKER + h] == lane - 3 ? 1.0f : 0.0f;
+            else if (lane == 2) v = (float)src[GR_HEX_HEIGHT + physical_h] / 5.0f;
+            else if (lane < 5) v = marker == lane - 3 ? 1.0f : 0.0f;
             else v = (float)HEX_LOCATION[h];
             dst[h * HEX_FACTS + lane] = v;
         }
         int t = owner < 2 && slot < NSLOT ? owner * NSLOT + slot : -1;
         if (t >= 0) {
-            const float* e = AP(w, A_E) + ((unsigned long long)job * NTYPE + t) * DE;
-            for (int j = lane; j < DE; j += 32) dst[hex_e + h * DE + j] = e[j];
+            const float* e = AP(w, A_E)
+                + (((unsigned long long)job * 2 + view) * NTYPE + t) * UNIT_DIM;
+            for (int j = lane; j < UNIT_DIM; j += 32)
+                dst[hex_e + h * UNIT_DIM + j] = e[j];
         }
     }
     __syncthreads();
-    const float* ph = AP(w, A_BH) + (unsigned long long)row * NTYPE * DE;
-    const float* pe = AP(w, A_BG) + (unsigned long long)w->rows * NTYPE * DE
-        + (unsigned long long)job * NTYPE * DE;
     for (int t = 0; t < NTYPE; t++) {
-        float* out = dst + piles + (t / NSLOT) * DE;
-        for (int j = threadIdx.x; j < DE; j += blockDim.x) {
-            float v = ph[t * DE + j] + pe[t * DE + j];
-            if (v > 0.0f) out[j] += v;
-        }
-        __syncthreads();
+        int physical_t = (view ? 1 - t / NSLOT : t / NSLOT) * NSLOT + t % NSLOT;
+        float* out = dst + piles + t * (PILE_COUNTS + UNIT_DIM);
+        for (int j = threadIdx.x; j < PILE_COUNTS; j += blockDim.x)
+            out[j] = (float)src[GR_PILES + physical_t * PILE_COUNTS + j] / 5.0f;
+        const float* e = AP(w, A_E)
+            + (((unsigned long long)job * 2 + view) * NTYPE + t) * UNIT_DIM;
+        for (int j = threadIdx.x; j < UNIT_DIM; j += blockDim.x)
+            out[PILE_COUNTS + j] = e[j];
     }
-    float* loose = dst + piles + 2 * DE;
+    float* loose = dst + piles + NTYPE * (PILE_COUNTS + UNIT_DIM);
     for (int j = threadIdx.x; j < LOOSE; j += blockDim.x) {
         float v;
         if (j < 12) {
             int p = j / 6, k = j % 6;
-            int markers = src[GR_MARKERS + p];
+            int physical_p = view ? 1 - p : p;
+            int markers = src[GR_MARKERS + physical_p];
             if (k == 0) v = (float)markers / 6.0f;
             else if (k == 1) v = (float)(6 - markers) / 6.0f;
-            else if (k == 2) v = (float)src[GR_HAND + p] / 3.0f;
-            else if (k == 3) v = (float)src[GR_FD + p] / MAX_COINS;
-            else if (k == 4) v = (float)src[GR_BAG + p] / MAX_COINS;
-            else v = src[GR_INITIATIVE] == p ? 1.0f : 0.0f;
+            else if (k == 2) v = (float)src[GR_HAND + physical_p] / 3.0f;
+            else if (k == 3) v = (float)src[GR_FD + physical_p] / MAX_COINS;
+            else if (k == 4) v = (float)src[GR_BAG + physical_p] / MAX_COINS;
+            else v = src[GR_INITIATIVE] == physical_p ? 1.0f : 0.0f;
         } else if (j == 12) {
             int plies = src[GR_PLIES] | ((int)src[GR_PLIES + 1] << 8);
             v = (float)plies / MAX_PLIES;
         } else if (j == 13) v = src[GR_INIT_MOVED] ? 1.0f : 0.0f;
-        else v = src[GR_TO_ACT] == 0 ? 1.0f : 0.0f;
+        else v = src[GR_TO_ACT] == (view ? 1 : 0) ? 1.0f : 0.0f;
         loose[j] = v;
     }
 }
 
-extern "C" __global__ void trunk_norm(const WaveDev* w, const WeightDev* wt,
-                                       int level, int rows, int which) {
+extern "C" __global__ void norm_gelu(const WaveDev* w, const WeightDev* wt,
+                                      int mode, int level, int rows, int arena) {
     int lane = threadIdx.x & 31;
     int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     if (row >= rows) return;
-    int width = PUBW[level];
-    float* x = AP(w, which ? A_BH2 : A_BH) + (unsigned long long)row * width;
-    ln_relu(x, wt->pub_b[level], wt->pub_lnw[level], wt->pub_lnb[level], 0, width, lane);
+    int width = mode == 0 ? PUBLIC_DIM : mode < 3 ? CONFIG_DIM : CONTEXT_DIM;
+    const float *bias, *gain, *bt;
+    if (mode == 0) { bias = wt->public_b[level]; gain = wt->public_lnw[level]; bt = wt->public_lnb[level]; }
+    else if (mode == 1) { bias = wt->belief_config_b; gain = wt->belief_config_lnw; bt = wt->belief_config_lnb; }
+    else if (mode == 2) { bias = wt->candidate_b; gain = wt->candidate_lnw; bt = wt->candidate_lnb; }
+    else { bias = wt->context_b[level]; gain = wt->context_lnw[level]; bt = wt->context_lnb[level]; }
+    float* x = AP(w, arena) + (unsigned long long)row * width;
+    ln_gelu(x, bias, gain, bt, width, lane);
 }
 
 extern "C" __global__ void holding_in(const WaveDev* w, const WeightDev* wt) {
@@ -329,12 +325,12 @@ extern "C" __global__ void holding_in(const WaveDev* w, const WeightDev* wt) {
     int cfg = i / NSLOT, k = i % NSLOT;
     int job = TP(w, unsigned int, T_CONFIG_JOB)[cfg];
     const float* p = TP(w, float, T_CPHI) + (unsigned long long)cfg * CFEAT;
-    float seat = p[CFEAT - 1];
-    float* out = AP(w, A_BG) + (unsigned long long)i * HF;
+    int player = TP(w, unsigned char, T_CONFIG_PLAYER)[cfg];
+    float* out = AP(w, A_BG) + (unsigned long long)i * (3 + UNIT_DIM);
     out[0] = p[k]; out[1] = p[NSLOT + k]; out[2] = p[2 * NSLOT + k];
-    out[3] = seat - 0.5f;
-    const float* e = AP(w, A_E) + ((unsigned long long)job * NTYPE + (int)seat * NSLOT + k) * DE;
-    for (int j = 0; j < DE; j++) out[4 + j] = e[j];
+    const float* e = AP(w, A_E)
+        + (((unsigned long long)job * 2 + player) * NTYPE + k) * UNIT_DIM;
+    for (int j = 0; j < UNIT_DIM; j++) out[3 + j] = e[j];
 }
 
 extern "C" __global__ void slot_sum(const WaveDev* w, const WeightDev* wt,
@@ -343,40 +339,21 @@ extern "C" __global__ void slot_sum(const WaveDev* w, const WeightDev* wt,
     int cfg = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     if (cfg >= w->ncfg) return;
     const float* src = AP(w, which ? A_BH2 : A_BH);
-    float* out = AP(w, which ? A_BH : A_BH2) + (unsigned long long)cfg * DG;
-    for (int j = lane; j < DG; j += 32) {
+    float* out = AP(w, which ? A_BH : A_BH2) + (unsigned long long)cfg * SLOT_DIM;
+    for (int j = lane; j < SLOT_DIM; j += 32) {
         float v = 0.0f;
         for (int k = 0; k < NSLOT; k++)
-            v += fmaxf(src[((unsigned long long)cfg * NSLOT + k) * DG + j]
-                       + wt->slot_out_b[j], 0.0f);
+            v += src[((unsigned long long)cfg * NSLOT + k) * SLOT_DIM + j];
         out[j] = v;
     }
 }
 
-extern "C" __global__ void finish_zg(const WaveDev* w, const WeightDev* wt,
-                                      int zwhich) {
+extern "C" __global__ void copy_bias(const WaveDev* w, const WeightDev* wt,
+                                      int mode, int rows, int arena) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = DG + RK + 1;
-    if (i >= w->ncfg * stride) return;
-    int cfg = i / stride, j = i % stride;
-    if (j < DG) {
-        const float* z = AP(w, zwhich ? A_BH2 : A_BH);
-        AP(w, A_Z)[(unsigned long long)cfg * DG + j] = z[(unsigned long long)cfg * DG + j];
-    } else {
-        int k = j - DG;
-        AP(w, A_G)[(unsigned long long)cfg * (RK + 1) + k] += wt->wg_b[k];
-    }
-}
-
-extern "C" __global__ void pack_head_static_f16(const WaveDev* w,
-                                                  const WeightDev* wt,
-                                                  int which) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= w->rows * HEADW) return;
-    int col = i % HEADW;
-    const float* src = AP(w, which ? A_BH2 : A_BH);
-    half* dst = reinterpret_cast<half*>(AP(w, A_H0));
-    dst[i] = __float2half_rn(src[i] + wt->pub_out_b[col]);
+    if (i >= rows * CONFIG_DIM) return;
+    const float* bias = mode == 0 ? wt->belief_item_b : wt->candidate_b;
+    AP(w, arena)[i] += bias[i % CONFIG_DIM];
 }
 
 // --------------------------------------------------------------- CFR state
@@ -517,14 +494,13 @@ extern "C" __global__ void seed_sum(const WaveDev* w, const WeightDev* wt,
 // ------------------------------------------------------------ value network
 
 extern "C" __global__ void belief_sums(const WaveDev* w, const WeightDev* wt,
-                                        int traverser, int both) {
+                                        int traverser) {
     (void)wt;
     int lane = threadIdx.x & 31;
     int task = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     if (task >= w->nleaf) return;
     ReadTask q = TP(w, ReadTask, T_READOUT)[task];
-    for (int side = 0; side < (both ? 2 : 1); side++) {
-        int p = both ? side : 1 - traverser;
+    for (int p = 0; p < 2; p++) {
         int n = nc_of(w, q.node, p);
         const float* r = AP(w, A_REACH) + reach_at(w, q.node, p, 0);
         float scale, flat, total;
@@ -536,153 +512,29 @@ extern "C" __global__ void belief_sums(const WaveDev* w, const WeightDev* wt,
             AP(w, p ? A_VALS : A_SNAP_REACH)
                 [value_at(w, q.node, 1 - p, 0)] = total;
         }
-        float acc[DG_CH];
+        float acc[CONFIG_CH];
         #pragma unroll
-        for (int z = 0; z < DG_CH; z++) acc[z] = 0.0f;
+        for (int z = 0; z < CONFIG_CH; z++) acc[z] = 0.0f;
         unsigned int c0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + p];
         for (int c = 0; c < n; c++) {
             unsigned int cfg = TP(w, unsigned int, T_ROW_CFG)[c0 + c];
             float wc = r[c] * scale + flat;
-            const float* z = AP(w, A_Z) + (unsigned long long)cfg * DG;
+            const float* z = AP(w, A_Z) + (unsigned long long)cfg * CONFIG_DIM;
             #pragma unroll
-            for (int k = 0; k < DG_CH; k++) {
+            for (int k = 0; k < CONFIG_CH; k++) {
                 int x = (k << 5) + lane;
-                if (x < DG) acc[k] += wc * z[x];
+                if (x < CONFIG_DIM) acc[k] += wc * z[x];
             }
         }
-        float* out = AP(w, A_XB) + ((unsigned long long)q.row * 2 + p) * DG;
+        int side = p == traverser ? 0 : 1;
+        float* out = AP(w, A_XB)
+            + ((unsigned long long)q.row * 2 + side) * CONFIG_DIM;
         #pragma unroll
-        for (int k = 0; k < DG_CH; k++) {
+        for (int k = 0; k < CONFIG_CH; k++) {
             int x = (k << 5) + lane;
-            if (x < DG) out[x] = acc[k];
+            if (x < CONFIG_DIM) out[x] = acc[k];
         }
     }
-}
-
-extern "C" __global__ void belief_sums_f16(const WaveDev* w, const WeightDev* wt,
-                                             int traverser, int both) {
-    (void)wt;
-    int lane = threadIdx.x & 31;
-    int task = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-    if (task >= w->nleaf) return;
-    ReadTask q = TP(w, ReadTask, T_READOUT)[task];
-    for (int side = 0; side < (both ? 2 : 1); side++) {
-        int p = both ? side : 1 - traverser;
-        int n = nc_of(w, q.node, p);
-        const float* r = AP(w, A_REACH) + reach_at(w, q.node, p, 0);
-        float scale, flat, total;
-        norm_parts(r, n, lane, &scale, &flat, &total);
-        if (lane == 0) {
-            AP(w, p ? A_VALS : A_SNAP_REACH)
-                [value_at(w, q.node, 1 - p, 0)] = total;
-        }
-        float acc[DG_CH];
-        #pragma unroll
-        for (int z = 0; z < DG_CH; z++) acc[z] = 0.0f;
-        unsigned int c0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + p];
-        for (int c = 0; c < n; c++) {
-            unsigned int cfg = TP(w, unsigned int, T_ROW_CFG)[c0 + c];
-            float wc = r[c] * scale + flat;
-            const float* z = AP(w, A_Z) + (unsigned long long)cfg * DG;
-            #pragma unroll
-            for (int k = 0; k < DG_CH; k++) {
-                int x = (k << 5) + lane;
-                if (x < DG) acc[k] += wc * z[x];
-            }
-        }
-        half* out = reinterpret_cast<half*>(AP(w, A_XB))
-            + ((unsigned long long)q.row * 2 + p) * DG;
-        #pragma unroll
-        for (int k = 0; k < DG_CH; k++) {
-            int x = (k << 5) + lane;
-            if (x < DG) out[x] = __float2half_rn(acc[k]);
-        }
-    }
-}
-
-extern "C" __global__ void head_entry(const WaveDev* w, const WeightDev* wt,
-                                        int traverser) {
-    int lane = threadIdx.x & 31;
-    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-    if (row >= w->rows) return;
-    float* dst = AP(w, A_H) + (unsigned long long)row * H_STRIDE;
-    const float* add = AP(w, A_H0) + (unsigned long long)row * HEADW;
-    float x[HEAD_CH], sum = 0.0f;
-    #pragma unroll
-    for (int k = 0; k < HEAD_CH; k++) {
-        int j = (k << 5) + lane;
-        float v = j < HEADW
-            ? dst[j] + wt->pub_out_b[j] + add[j]
-                + ((float)traverser - 0.5f) * wt->wt[j]
-            : 0.0f;
-        x[k] = v;
-        if (j < HEADW) sum += v;
-    }
-    float mean = warp_sum(sum) / (float)HEADW, var = 0.0f;
-    #pragma unroll
-    for (int k = 0; k < HEAD_CH; k++) {
-        int j = (k << 5) + lane;
-        if (j < HEADW) { float d = x[k] - mean; var += d * d; }
-    }
-    float inv = rsqrtf(warp_sum(var) / (float)HEADW + LN_EPS);
-    #pragma unroll
-    for (int k = 0; k < HEAD_CH; k++) {
-        int j = (k << 5) + lane;
-        if (j < HEADW) {
-            float v = (x[k] - mean) * inv * wt->ln1w[j] + wt->ln1b[j];
-            dst[j] = v > 0.0f ? v : 0.0f;
-        }
-    }
-}
-
-extern "C" __global__ void head_entry_f16(const WaveDev* w, const WeightDev* wt,
-                                            int traverser) {
-    int lane = threadIdx.x & 31;
-    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-    if (row >= w->rows) return;
-    const half* src = reinterpret_cast<const half*>(AP(w, A_H))
-        + (unsigned long long)row * HEADW;
-    half* dst = reinterpret_cast<half*>(AP(w, A_H2))
-        + (unsigned long long)row * HEADW;
-    const half* add = reinterpret_cast<const half*>(AP(w, A_H0))
-        + (unsigned long long)row * HEADW;
-    float x[HEAD_CH], sum = 0.0f;
-    #pragma unroll
-    for (int k = 0; k < HEAD_CH; k++) {
-        int j = (k << 5) + lane;
-        float v = j < HEADW
-            ? __half2float(src[j]) + __half2float(add[j])
-                + ((float)traverser - 0.5f) * wt->wt[j]
-            : 0.0f;
-        x[k] = v;
-        if (j < HEADW) sum += v;
-    }
-    float mean = warp_sum(sum) / (float)HEADW, var = 0.0f;
-    #pragma unroll
-    for (int k = 0; k < HEAD_CH; k++) {
-        int j = (k << 5) + lane;
-        if (j < HEADW) { float d = x[k] - mean; var += d * d; }
-    }
-    float inv = rsqrtf(warp_sum(var) / (float)HEADW + LN_EPS);
-    #pragma unroll
-    for (int k = 0; k < HEAD_CH; k++) {
-        int j = (k << 5) + lane;
-        if (j < HEADW) {
-            float v = (x[k] - mean) * inv * wt->ln1w[j] + wt->ln1b[j];
-            dst[j] = __float2half_rn(v > 0.0f ? v : 0.0f);
-        }
-    }
-}
-
-extern "C" __global__ void head_act(const WaveDev* w, const WeightDev* wt,
-                                     int level, int rows, int which) {
-    int width = HMLPW[level];
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * width) return;
-    int row = i / width, col = i % width;
-    float* x = AP(w, which ? A_H2 : A_H)
-        + (unsigned long long)row * H_STRIDE + col;
-    *x = fmaxf(*x + wt->hmlp_b[level][col], 0.0f);
 }
 
 extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
@@ -711,51 +563,23 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
         for (int c = lane; c < n; c += 32) out[c] = u * orc;
         return;
     }
-#if READOUT_LANE
-    // One config per lane, not one config per warp. The rank-64 dot used to
-    // cost a five-step shuffle reduction *per config*, and a leaf carries
-    // fifteen or so, so the warp spent most of its time reducing rather than
-    // multiplying. The row's projection goes to shared memory once and each
-    // lane then walks a whole config on its own. The config table is well
-    // under a megabyte per wave, so the lane-divergent gathers stay in L2.
-    __shared__ float readout_smem[(WAVE_BLOCK / 32) * RK];
-    float* us = readout_smem + (threadIdx.x >> 5) * RK;
-    const float* ur = AP(w, A_U) + (unsigned long long)q.row * RK;
-    for (int j = lane; j < RK; j += 32) us[j] = ur[j] + wt->wu_b[j];
+    __shared__ float readout_smem[(WAVE_BLOCK / 32) * JOINT_DIM];
+    float* common = readout_smem + (threadIdx.x >> 5) * JOINT_DIM;
+    const float* u = AP(w, A_U) + (unsigned long long)q.row * JOINT_DIM;
+    for (int j = lane; j < JOINT_DIM; j += 32) common[j] = u[j];
     __syncwarp();
     unsigned int c0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + player];
     for (int base = 0; base < n; base += 32) {
         int c = base + lane;
         if (c >= n) break;
         unsigned int cfg = TP(w, unsigned int, T_ROW_CFG)[c0 + c];
-        const float* g = AP(w, A_G) + (unsigned long long)cfg * (RK + 1);
-        float part = 0.0f;
+        const float* candidate = AP(w, A_G) + (unsigned long long)cfg * JOINT_DIM;
+        float value = *wt->value_b;
         #pragma unroll 8
-        for (int j = 0; j < RK; j++) part += us[j] * g[j];
-        out[c] = (part + g[RK]) * orc;
+        for (int j = 0; j < JOINT_DIM; j++)
+            value += gelu(common[j] + candidate[j] + wt->joint_bias[j]) * wt->value_w[j];
+        out[c] = value * orc;
     }
-#else
-    const float* ur = AP(w, A_U) + (unsigned long long)q.row * RK;
-    float u[RK_CH];
-    #pragma unroll
-    for (int k = 0; k < RK_CH; k++) {
-        int j = (k << 5) + lane;
-        u[k] = j < RK ? ur[j] + wt->wu_b[j] : 0.0f;
-    }
-    unsigned int c0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + player];
-    for (int c = 0; c < n; c++) {
-        unsigned int cfg = TP(w, unsigned int, T_ROW_CFG)[c0 + c];
-        const float* g = AP(w, A_G) + (unsigned long long)cfg * (RK + 1);
-        float part = 0.0f;
-        #pragma unroll
-        for (int k = 0; k < RK_CH; k++) {
-            int j = (k << 5) + lane;
-            if (j < RK) part += u[k] * g[j];
-        }
-        part = warp_sum(part);
-        if (lane == 0) out[c] = (part + g[RK]) * orc;
-    }
-#endif
 }
 
 // mode 0: CFR update using current strategy; mode 1: fixed final strategy.

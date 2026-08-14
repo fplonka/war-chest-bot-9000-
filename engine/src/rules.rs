@@ -1322,7 +1322,7 @@ impl State {
             }
             Recruit { coin, unit } => {
                 self.zmove(p, pay, Z_FACEDOWN, coin); // spent coin: facedown
-                                                         // recruited coin: supply -> faceup discard (public).
+                                                      // recruited coin: supply -> faceup discard (public).
                 self.zones[p as usize][Z_SUPPLY][unit as usize] -= 1;
                 self.zones[p as usize][Z_FACEUP][unit as usize] += 1;
                 // Attribute triggers on recruit:

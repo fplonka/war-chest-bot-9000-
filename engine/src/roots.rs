@@ -116,9 +116,7 @@ fn read_cont<R: Read>(r: &mut R) -> std::io::Result<Cont> {
             player: r8(r)?,
             rg_hex: r8(r)?,
         },
-        10 => WarriorPriestPlay {
-            player: r8(r)?,
-        },
+        10 => WarriorPriestPlay { player: r8(r)? },
         11 => _AttackPost { atk_hex: r8(r)? },
         t => {
             return Err(std::io::Error::new(

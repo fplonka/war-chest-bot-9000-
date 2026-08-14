@@ -52,9 +52,11 @@
 //! agent could not act on coins it had buried itself — a restriction of the
 //! strategy space, i.e. a different game. `docs/REBEL.md` records what it cost.
 
-use crate::actions::{Action, N_KINDS};
+use crate::actions::Action;
 use crate::board::{board, NONE, N_HEXES};
-use crate::state::{Cont, State, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP, Z_HAND, Z_INFLIGHT, Z_SUPPLY};
+use crate::state::{
+    Cont, State, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP, Z_HAND, Z_INFLIGHT, Z_SUPPLY,
+};
 use crate::units::{write_card_features, CARD_FEATS, N_UNITS};
 
 /// Distinct coin types a player can own: 4 drafted units + the Royal Coin.
@@ -66,11 +68,9 @@ pub const HAND_CAP: usize = 3;
 
 /// Raw counts describing one config: hand, face-down, bag, in slot order.
 pub const CCOUNTS: usize = 3 * NSLOT;
-/// The config vector the network reads: `CCOUNTS` counts plus a flag saying
-/// whose config it is. Player 0's and player 1's slots mean different units, and
-/// the value asked for is "this player's counterfactual value", so the seat has
-/// to be part of the argument.
-pub const CFEAT: usize = CCOUNTS + 1;
+/// The config vector is only hand, face-down, and derived bag counts. The
+/// canonical query supplies the player's unit table.
+pub const CFEAT: usize = CCOUNTS;
 /// Divisor for every count. A player owns at most 5 coins of any one type, so
 /// every count lands in `[0, 1]` and one constant serves all three zones.
 pub const CNORM: f32 = 5.0;
@@ -102,6 +102,13 @@ impl Ctx {
             assert_eq!(n, NSLOT, "expected exactly {} coin types per player", NSLOT);
         }
         Ctx { slots, slot_of }
+    }
+
+    pub fn mirrored(self) -> Ctx {
+        Ctx {
+            slots: [self.slots[1], self.slots[0]],
+            slot_of: [self.slot_of[1], self.slot_of[0]],
+        }
     }
 }
 
@@ -185,89 +192,14 @@ pub fn config_counts(c: &Config, reserve: &[u8; NSLOT], out: &mut [u8; CCOUNTS])
     }
 }
 
-/// The config vector the network reads. `player` is the seat the config belongs
-/// to — the value asked for is that player's counterfactual value.
 #[inline]
-pub fn write_config_feats(c: &Config, reserve: &[u8; NSLOT], player: usize, out: &mut [f32]) {
+pub fn write_config_feats(c: &Config, reserve: &[u8; NSLOT], out: &mut [f32]) {
     debug_assert_eq!(out.len(), CFEAT);
     let mut cnt = [0u8; CCOUNTS];
     config_counts(c, reserve, &mut cnt);
     for k in 0..CCOUNTS {
         out[k] = cnt[k] as f32 / CNORM;
     }
-    out[CCOUNTS] = player as f32;
-}
-
-// ------------------------------------------------------------ action features
-
-/// The action vector the policy head reads: what kind of action it is, the
-/// three squares it names, which of the player's coin slots pays for it, which
-/// slot a Recruit takes, and whether the coin goes face down.
-///
-/// One-hot throughout, and every field of the action is in there, so two
-/// distinct actions never share a description — the same property
-/// `config_features_separate_every_config` pins for the private state, for the
-/// same reason. It is what lets the policy head be an embedding *network* over
-/// a node-dependent action list rather than a fixed-width output vector, which
-/// War Chest's hex-indexed actions could never fit.
-///
-/// The `+ 1` on each one-hot is the "absent" slot: most actions name no square
-/// at all, and a plain zero block would be indistinguishable from a square the
-/// board does not have.
-pub const AFEAT: usize = N_KINDS + 3 * (N_HEXES + 1) + 2 * (NTYPE + 1) + 1;
-
-/// Where the paying coin type's one-hot starts. The action tower gathers that
-/// card's embedding from it, the same way the hex block does.
-pub const AOFF_PAYS: usize = N_KINDS + 3 * (N_HEXES + 1);
-
-/// `slot` is the coin slot the action spends (`-1` for the micro-decisions
-/// inside a tactic, which spend nothing) and `fdown` whether it goes face down;
-/// the solver has both per action already, so they are passed rather than
-/// re-derived.
-pub fn write_action_feats(
-    a: &Action,
-    ctx: &Ctx,
-    player: usize,
-    slot: i8,
-    fdown: bool,
-    out: &mut [f32],
-) {
-    debug_assert_eq!(out.len(), AFEAT);
-    out.fill(0.0);
-    let mut at = 0usize;
-    let mut hot = |i: usize, n: usize, out: &mut [f32]| {
-        out[at + i] = 1.0;
-        at += n;
-    };
-    // A coin type index, or `NTYPE` for "this action pays nothing" / "this is
-    // not a recruit" — the same indexing the hex and pile blocks use.
-    let ty = |k: i8| {
-        if k < 0 {
-            NTYPE
-        } else {
-            player * NSLOT + k as usize
-        }
-    };
-    hot(a.kind(), N_KINDS, out);
-    for h in a.hexes() {
-        hot(
-            if h == NONE { N_HEXES } else { h as usize },
-            N_HEXES + 1,
-            out,
-        );
-    }
-    hot(ty(slot), NTYPE + 1, out);
-    let r = a.recruited();
-    hot(
-        ty(if r == NONE {
-            -1
-        } else {
-            ctx.slot_of[player][r as usize]
-        }),
-        NTYPE + 1,
-        out,
-    );
-    out[at] = fdown as u8 as f32;
 }
 
 /// `reserve[k] = bag[k] + hand[k] + facedown[k] + inflight[k]` — public, and
@@ -408,7 +340,9 @@ pub fn enumerate_configs(
     }
     let mut out = Vec::new();
     let mut hand = [0u8; NSLOT];
-    rec_hand(reserve, &mut hand, 0, hand_size, fd_size, inflight, &mut out);
+    rec_hand(
+        reserve, &mut hand, 0, hand_size, fd_size, inflight, &mut out,
+    );
     out
 }
 
@@ -1021,11 +955,7 @@ pub const LOOSE: usize = 2 * PLAYER_SCALARS + GLOBAL_SCALARS;
 /// 211 u8   initiative_moved
 /// 212 u8   player_to_act
 /// 213 u16  main_plays_remaining
-/// 215 f16  aux_targets[4]
 /// ```
-/// How many auxiliary targets a row carries (markers per side three rounds
-/// on, the initiative flip, the result class). Part of the frozen row.
-pub const AUX: usize = 4;
 
 pub const ROW_VERSION: usize = 0;
 pub const ROW_HASH: usize = 4;
@@ -1039,8 +969,7 @@ pub const ROW_INITIATIVE: usize = ROW_PILES + 2 * NSLOT * PILE_COUNTS;
 pub const ROW_INIT_MOVED: usize = ROW_INITIATIVE + 1;
 pub const ROW_TO_ACT: usize = ROW_INIT_MOVED + 1;
 pub const ROW_PLIES: usize = ROW_TO_ACT + 1;
-pub const ROW_AUX: usize = ROW_PLIES + 2;
-pub const ROW_BYTES: usize = ROW_AUX + 2 * AUX;
+pub const ROW_BYTES: usize = ROW_PLIES + 2;
 
 // ---------------------------------------------------------- GPU public rows
 //
@@ -1328,8 +1257,7 @@ pub fn write_public_features_raw(
     debug_assert_eq!(i, PUBFEAT);
 }
 
-/// Pack one replay row from a live state. The aux targets are backfilled
-/// later (`fill_aux`); everything else is final here.
+/// Pack one replay row from a live state.
 pub fn pack_row(s: &State, ctx: &Ctx, out: &mut [u8]) {
     debug_assert_eq!(out.len(), ROW_BYTES);
     out[ROW_VERSION..ROW_VERSION + 4].copy_from_slice(&ROW_FORMAT_VERSION.to_le_bytes());
@@ -1363,7 +1291,6 @@ pub fn pack_row(s: &State, ctx: &Ctx, out: &mut [u8]) {
     out[ROW_TO_ACT] = s.to_act();
     let plies = crate::state::MAX_MAIN_PLAYS - s.main_plays.min(crate::state::MAX_MAIN_PLAYS);
     out[ROW_PLIES..ROW_PLIES + 2].copy_from_slice(&plies.to_le_bytes());
-    // Aux bytes stay zero until `fill_aux` patches them.
 }
 
 /// Pack the public part of a solver network row without expanding it to
