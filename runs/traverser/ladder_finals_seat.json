@@ -1,0 +1,82 @@
+{
+ "runs": [
+  "runs/traverser",
+  "runs/seat"
+ ],
+ "games": 200,
+ "schedule_seed": 7,
+ "draft_mode": "random",
+ "players": [
+  {
+   "name": "greedy",
+   "run": null,
+   "t": null,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 0.0,
+   "se": 148.5,
+   "score": 0.013
+  },
+  {
+   "name": "traverser.final",
+   "run": "runs/traverser",
+   "t": 1741.5,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 668.2,
+   "se": 27.0,
+   "score": 0.741
+  },
+  {
+   "name": "seat.final",
+   "run": "runs/seat",
+   "t": 1741.6,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 509.6,
+   "se": 26.9,
+   "score": 0.348
+  }
+ ],
+ "pairs": [
+  {
+   "a": "greedy",
+   "b": "traverser.final",
+   "w": 0,
+   "l": 20,
+   "d": 0,
+   "n": 20,
+   "score": 0.0
+  },
+  {
+   "a": "greedy",
+   "b": "seat.final",
+   "w": 0,
+   "l": 19,
+   "d": 1,
+   "n": 20,
+   "score": 0.025
+  },
+  {
+   "a": "traverser.final",
+   "b": "seat.final",
+   "w": 138,
+   "l": 52,
+   "d": 10,
+   "n": 200,
+   "score": 0.715
+  }
+ ]
+}

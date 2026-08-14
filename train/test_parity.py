@@ -80,6 +80,7 @@ def main():
         torch.nn.init.normal_(n.bias, std=0.2)
     torch.nn.init.normal_(net.wg.weight, std=0.05)
     torch.nn.init.normal_(net.wg.bias, std=0.05)
+    torch.nn.init.normal_(net.wt.weight, std=0.2)
     # Move the holding residual off its zeroed initialisation, or the parity
     # check would never exercise it.
     torch.nn.init.normal_(net.res[0].a.weight, std=0.1)
@@ -111,7 +112,8 @@ def main():
         allphi = np.concatenate([bel.reshape(rows, 2, -1),
                                  phi.reshape(rows, 1, -1)], 1).reshape(3 * rows, -1)
         w = np.tile([1.0, 1.0, 0.0], rows).astype(np.float32)
-        seg = np.repeat(np.arange(rows), 3) * 2 + np.tile([0, 1, 0], rows)
+        seg = np.repeat(np.arange(rows), 3) * 2 + np.stack([
+            np.zeros(rows), np.ones(rows), phi[:, W.CCOUNTS]], 1).astype(np.int64).ravel()
         inv = torch.arange(len(allphi))
         ref = net(tx, tids, torch.as_tensor(allphi), inv, torch.as_tensor(w),
                   torch.as_tensor(seg), 2 * rows).numpy()[2::3]
@@ -139,7 +141,7 @@ def main():
         z = net.holdings(tc, e1.expand(nc, -1, -1))
         # The node's own belief: uniform over its configs, both players alike.
         bl = (z.mean(0).repeat(2)).reshape(1, 2 * dg)
-        h = net._head(net._public(txr, e1), bl)
+        h = net._head(net._public(txr, e1), bl, torch.zeros(1))
         q = net.actions(tpsi, e1.expand(na, -1, -1))
         pref = ((net.wp(h) + net.wk(z)).unsqueeze(1) * q.unsqueeze(0)).sum(-1).numpy()
 
@@ -149,7 +151,7 @@ def main():
         np.ascontiguousarray(cphi.ravel()),
         np.ascontiguousarray(psi.ravel()),
         np.ascontiguousarray(row_ids.ravel()),
-        nc, na, 0), np.float32).reshape(nc, na)
+        0, nc, na, 0), np.float32).reshape(nc, na)
 
     perr = float(np.abs(pref - pgot).max())
     assert pref.std() > 0.1, f"degenerate reference logits (std {pref.std():.4f})"

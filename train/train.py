@@ -913,7 +913,8 @@ def main():
     write_log(args, log, snaps)
     import ladder
     import report
-    ladder.run([args.out], games=args.ladder_games, gpu=True)
+    if args.ladder_games:
+        ladder.run([args.out], games=args.ladder_games, gpu=True)
     report.write([args.out])
 
 

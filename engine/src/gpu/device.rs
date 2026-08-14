@@ -183,6 +183,7 @@ struct WeightDev {
     pub_out_w: *const f32,
     pub_out_b: *const f32,
     wb: *const f32,
+    wt: *const f32,
     ln1w: *const f32,
     ln1b: *const f32,
     hmlp_w: [*const f32; 8],
@@ -623,8 +624,8 @@ impl Executor {
                     root as i32
                 )?;
                 self.full_reach(&device, bank, false, true)?;
-                self.run_head(&device, bank, true, 0)?;
                 for p in 0..2 {
+                    self.run_head(&device, bank, true, p)?;
                     self.launch_readout(&device, bank, p)?;
                     self.launch_backprop_sweep(&device, bank, p, true, 0.0, 0.0, 0.0, 0.0)?;
                     launch!(
@@ -1144,7 +1145,7 @@ impl Executor {
                 d.ptr_mut(Arena::H).cast(),
                 l.head_in,
             )?;
-            launch!(self, d, bank, head_entry_f16, warps(rows))?;
+            launch!(self, d, bank, head_entry_f16, warps(rows), traverser as i32)?;
             gemm_f16(
                 &self.blas,
                 rows,
@@ -1181,7 +1182,7 @@ impl Executor {
             h_stride(l),
             0.0,
         )?;
-        launch!(self, d, bank, head_entry, warps(rows))?;
+        launch!(self, d, bank, head_entry, warps(rows), traverser as i32)?;
 
         let mut src = d.ptr(Arena::H);
         let mut src_width = l.head_in;
@@ -1412,6 +1413,7 @@ impl WeightBank {
         d.pub_out_w = wa(layout.pub_out.w);
         d.pub_out_b = ba(layout.pub_out.b);
         d.wb = wa(layout.wb);
+        d.wt = wa(layout.wt);
         d.ln1w = la(layout.ln1.0);
         d.ln1b = la(layout.ln1.1);
         for (k, s) in layout.hmlp.iter().enumerate() {

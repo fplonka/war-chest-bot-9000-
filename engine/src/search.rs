@@ -1568,7 +1568,6 @@ impl<'a> Solver<'a> {
     /// Fill `vals` at every leaf with the traverser's counterfactual values.
     pub fn leaf_values(&mut self, traverser: usize) {
         self.ensure_leaf_batch();
-        let rows = self.leaf_rows.len();
         let empty = self.nets.value.is_empty();
         let dg = if empty { 0 } else { self.nets.value.dg() };
         // Only one player's beliefs have moved since the previous query: the
@@ -1616,28 +1615,14 @@ impl<'a> Solver<'a> {
                 }
             }
         }
-        if !empty {
-            let _t = timed!(NET);
-            let net = &self.nets.value;
-            net.pbs_head(
-                &self.xb[..rows * 2 * dg],
-                rows,
-                &self.h0,
-                &mut self.sb,
-                &mut self.ob,
-            );
-        }
+        self.pbs_head(traverser);
         self.readout(traverser);
     }
 
-    /// Refresh *both* players' belief blocks and run the PBS head once. The
-    /// fixed-policy passes of TurboReBeL's Phase 2 seed a different root
-    /// belief per pass, so both blocks move and the alternating-traverser
-    /// cache of `leaf_values` does not apply. The per-config readout is left
-    /// to `readout`, which may run twice off the same `ob`.
-    fn leaf_values_both(&mut self) {
+    /// Refresh both belief blocks for a fixed-policy pass. Each traverser then
+    /// gets its own PBS-head query over these same beliefs.
+    fn leaf_beliefs_both(&mut self) {
         self.ensure_leaf_batch();
-        let rows = self.leaf_rows.len();
         let empty = self.nets.value.is_empty();
         let dg = if empty { 0 } else { self.nets.value.dg() };
         self.last_traverser = None;
@@ -1668,12 +1653,20 @@ impl<'a> Solver<'a> {
                 crate::net::accumulate(cz, &cidx[cs..cs + n], &wbuf[..n], dg, &mut xb[at..at + dg]);
             }
         }
-        let _t = timed!(NET);
+    }
+
+    fn pbs_head(&mut self, traverser: usize) {
         let net = &self.nets.value;
+        if net.is_empty() {
+            return;
+        }
+        let _t = timed!(NET);
+        let rows = self.leaf_rows.len();
         net.pbs_head(
-            &self.xb[..rows * 2 * dg],
+            &self.xb[..rows * 2 * net.dg()],
             rows,
             &self.h0,
+            traverser,
             &mut self.sb,
             &mut self.ob,
         );
@@ -1682,7 +1675,7 @@ impl<'a> Solver<'a> {
     /// Per-config leaf values for player `p` — counterfactual: the network's
     /// value for that exact config times the opponent's unnormalised reach
     /// into the leaf. Runs off the `ob` left by the last `leaf_values` /
-    /// `leaf_values_both`, so two players can be read off one PBS-head pass.
+    /// `pbs_head` query.
     pub fn readout(&mut self, p: usize) {
         let _t = timed!(LEAFPOST);
         let empty = self.nets.value.is_empty();
@@ -1991,9 +1984,10 @@ impl<'a> Solver<'a> {
         for root in roots {
             let _t = timed!(P2);
             self.propagate(&reference, [&root[0], &root[1]]);
-            self.leaf_values_both();
+            self.leaf_beliefs_both();
             let mut pair = [Vec::new(), Vec::new()];
             for p in 0..2usize {
+                self.pbs_head(p);
                 self.readout(p);
                 self.backprop(p, &reference, Back::Value);
                 let n = self.nc[0][p] as usize;
@@ -2021,9 +2015,10 @@ impl<'a> Solver<'a> {
         let reference = self.reference();
         let root = [self.root_belief[0].p.clone(), self.root_belief[1].p.clone()];
         self.propagate(&reference, [&root[0], &root[1]]);
-        self.leaf_values_both();
+        self.leaf_beliefs_both();
         let (mut nash, mut zero_sum) = (0.0, 0.0);
         for p in 0..2usize {
+            self.pbs_head(p);
             // One `readout` serves both passes: `backprop` skips leaves, so the
             // leaf values it left are still there for the second walk.
             self.readout(p);
@@ -2202,6 +2197,7 @@ impl<'a> Solver<'a> {
             net.policy(
                 &xbel,
                 &self.h0[r * h..],
+                me,
                 &self.cz,
                 &self.leaf_cidx[lo..hi],
                 &q,

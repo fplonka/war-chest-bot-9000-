@@ -531,8 +531,8 @@ impl<'a> Cur<'a> {
 ///   norm — its bias is applied at the head entry, inside `ln1`. That split
 ///   is what lets a solve cache `h0` and re-run only the head per iteration.
 /// * `hmlp` + `wu`: the per-iteration head. Entry:
-///   `relu(LN1(h0 + [b_me|b_opp] Wb))`, then plain ReLU layers, then the
-///   readout `u`.
+///   `relu(LN1(h0 + [b_0|b_1] Wb + (p-.5) Wt))`, then plain ReLU layers,
+///   then the traverser's readout `u_p`.
 /// * `slot` + `slot_out`: the holding tower, per coin-type row, rectified and
 ///   summed over the five slots; `res` blocks refine the sum
 ///   (`z += B(relu(A z))`); `wg` reads out `[rank + 1]`.
@@ -555,6 +555,8 @@ pub struct Mlp {
     pub_out: Lin,
     /// `[2 * dg, head_in]`, no bias — it feeds a layer that already has one.
     wb: Vec<f32>,
+    /// Traverser projection `[head_in]`.
+    wt: Vec<f32>,
     ln1: (Vec<f32>, Vec<f32>),
     hmlp: Vec<Lin>,
     wu: Lin,
@@ -598,6 +600,8 @@ pub struct V3Layout {
     pub pub_out: Span,
     /// `[2 * dg, head_in]`, weights only.
     pub wb: usize,
+    /// Traverser projection `[head_in]`, weights only.
+    pub wt: usize,
     pub ln1: (usize, usize),
     pub hmlp: Vec<Span>,
     pub wu: Span,
@@ -693,6 +697,8 @@ impl V3Layout {
         l.pub_out = lin(&mut w, &mut b, prev, head_in);
         l.wb = w;
         w += 2 * dg * head_in;
+        l.wt = w;
+        w += head_in;
         let mut prev = head_in;
         for &h in &hmlp_w {
             l.hmlp.push(lin(&mut w, &mut b, prev, h));
@@ -775,9 +781,9 @@ impl Mlp {
     /// ```
     ///
     /// Weight blob order (each matrix row-major `[in, out]`): card layers,
-    /// wid, pile, pub layers, pub_out, wb, hmlp layers, wu, slot layers,
+    /// wid, pile, pub layers, pub_out, wb, wt, hmlp layers, wu, slot layers,
     /// slot_out, res pairs, wg, wq, wk, wp. Biases in the same order (wid and
-    /// wb have none). LayerNorms: one (gain, bias) pair per pub layer, then
+    /// wb and wt have none). LayerNorms: one (gain, bias) pair per pub layer, then
     /// ln1. `train/value_net.py::flat` writes this and nothing else knows it.
     fn from_flat_v3(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Mlp, String> {
         let l = V3Layout::new(dims)?;
@@ -819,6 +825,7 @@ impl Mlp {
                 .collect(),
             pub_out: lin(&l.pub_out),
             wb: w[l.wb..l.wb + 2 * l.dg * l.head_in].to_vec(),
+            wt: w[l.wt..l.wt + l.head_in].to_vec(),
             ln1: norm(l.ln1, l.head_in),
             hmlp: l.hmlp.iter().map(&lin).collect(),
             wu: lin(&l.wu),
@@ -889,7 +896,8 @@ impl Mlp {
         let wat = |i: usize| &w[ws[i].0..ws[i].1];
         let bat = |i: usize| &b[bs[i].0..bs[i].1];
         // v3 w order: card(wd0,wd1), wid, pile, pub(w0), pub_out(w1), wb,
-        // wu, slot_out(wc), res(wh1,wh2), wg, wq, wk, wp.
+        // wt, wu, slot_out(wc), res(wh1,wh2), wg, wq, wk, wp.
+        let wt = vec![0.0; hd];
         let w3: Vec<f32> = [
             wat(0),
             wat(1),
@@ -898,6 +906,7 @@ impl Mlp {
             wat(4),
             wat(5),
             wat(6),
+            &wt,
             wat(11),
             wat(7),
             wat(8),
@@ -983,6 +992,7 @@ impl Mlp {
                 o: h,
             },
             wb,
+            wt: vec![0.0; h],
             ln1: (ln[2 * h..3 * h].to_vec(), ln[3 * h..4 * h].to_vec()),
             hmlp: Vec::new(),
             wu,
@@ -1373,17 +1383,24 @@ impl Mlp {
         xbel: &[f32],
         rows: usize,
         pre: &[f32],
+        traverser: usize,
         scratch: &mut Vec<f32>,
         out: &mut Vec<f32>,
     ) {
-        self.hidden_layer(xbel, rows, pre, scratch);
+        self.hidden_layer(xbel, rows, pre, traverser, scratch);
         self.readout(scratch, rows, &self.wu, out);
     }
 
-    /// The head: `relu(LN1(h0 + xbel Wb))`, then the extra head layers. Both
-    /// readouts start here — the value's runs every CFR iteration, the
-    /// policy's once per solve.
-    fn hidden_layer(&self, xbel: &[f32], rows: usize, pre: &[f32], out: &mut Vec<f32>) {
+    /// The head: `relu(LN1(h0 + xbel Wb + (p-.5) Wt))`, then the extra head
+    /// layers. Both readouts start here.
+    fn hidden_layer(
+        &self,
+        xbel: &[f32],
+        rows: usize,
+        pre: &[f32],
+        traverser: usize,
+        out: &mut Vec<f32>,
+    ) {
         let (hd, bd) = (self.head_in, self.belief_dim());
         debug_assert_eq!(xbel.len(), rows * bd);
         fit(out, rows * hd);
@@ -1399,6 +1416,12 @@ impl Mlp {
             &mut out[..rows * hd],
             hd,
         );
+        let t = traverser as f32 - 0.5;
+        for row in out[..rows * hd].chunks_exact_mut(hd) {
+            for (x, &w) in row.iter_mut().zip(&self.wt) {
+                *x += t * w;
+            }
+        }
         self.ln_relu(
             rows,
             hd,
@@ -1457,6 +1480,7 @@ impl Mlp {
         &self,
         xbel: &[f32],
         pre: &[f32],
+        player: usize,
         z: &[f32],
         cidx: &[u32],
         q: &[f32],
@@ -1466,7 +1490,7 @@ impl Mlp {
     ) {
         let (dg, rk, nc) = (self.dg, self.rank, cidx.len());
         debug_assert_eq!(out.len(), nc * na);
-        self.hidden_layer(xbel, 1, pre, scratch);
+        self.hidden_layer(xbel, 1, pre, player, scratch);
         let mut upi = Vec::new();
         self.readout(scratch, 1, &self.wp, &mut upi);
         // `k(c) = u_pi + z(c) Wk + bk`, then every logit is a dot of a `k`
@@ -1524,7 +1548,15 @@ impl Mlp {
                 );
                 self.trunk(&xpub[r * pd..], 1, pd, &e, &mut sb, &mut pre);
                 let bd = self.belief_dim();
-                self.pbs_head(&xbel[r * bd..(r + 1) * bd], 1, &pre, &mut sb, &mut u);
+                let traverser = phi[r * self.cfeat() + CCOUNTS] as usize;
+                self.pbs_head(
+                    &xbel[r * bd..(r + 1) * bd],
+                    1,
+                    &pre,
+                    traverser,
+                    &mut sb,
+                    &mut u,
+                );
                 self.embed(
                     &phi[r * self.cfeat()..(r + 1) * self.cfeat()],
                     1,
@@ -1653,6 +1685,7 @@ mod format_tests {
             + pw
             + ow
             + 2 * dg * hd
+            + hd
             + hw
             + sw
             + nres * 2 * dg * dg

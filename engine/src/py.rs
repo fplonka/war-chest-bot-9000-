@@ -1056,6 +1056,7 @@ fn infer_policy(
     phi: PyReadonlyArray1<f32>,
     psi: PyReadonlyArray1<f32>,
     unit_ids: PyReadonlyArray1<u8>,
+    player: usize,
     nc: usize,
     na: usize,
     slot: usize,
@@ -1078,7 +1079,17 @@ fn infer_policy(
     mlp.embed_actions(psi.as_slice()?, na, &e, &mut q);
     let idx: Vec<u32> = (0..nc as u32).collect();
     let mut out = vec![0.0f32; nc * na];
-    mlp.policy(xbel.as_slice()?, &pre, &z, &idx, &q, na, &mut sb, &mut out);
+    mlp.policy(
+        xbel.as_slice()?,
+        &pre,
+        player,
+        &z,
+        &idx,
+        &q,
+        na,
+        &mut sb,
+        &mut out,
+    );
     Ok(out)
 }
 

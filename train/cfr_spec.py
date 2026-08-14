@@ -253,6 +253,7 @@ def load_weights(path):
     W["w0"] = take(xd * h).reshape(xd, h)
     W["w1"] = take(h * hd).reshape(h, hd)
     W["wb"] = take(2 * dg * hd).reshape(2 * dg, hd)
+    W["wt"] = np.zeros(hd, np.float32)
     W["wc"] = take(hf * dg).reshape(hf, dg)
     W["wh1"] = take(dg * dg).reshape(dg, dg)
     W["wh2"] = take(dg * dg).reshape(dg, dg)
@@ -325,6 +326,7 @@ def _slice_v3(dims, w, b, ln):
     W["w0"] = take(xd * h).reshape(xd, h)
     W["w1"] = take(h * hd).reshape(h, hd)
     W["wb"] = take(2 * dg * hd).reshape(2 * dg, hd)
+    W["wt"] = take(hd)
     W["wu"] = take(hd * rk).reshape(hd, rk)
     W["wc"] = take(hf * dg).reshape(hf, dg)
     W["wh1"] = take(dg * dg).reshape(dg, dg)
@@ -537,10 +539,10 @@ class Solve:
 
     # ------------------------------------------------------- phases
 
-    def head(self, rows, xbel):
+    def head(self, rows, xbel, traverser):
         """xbel [rows, 2dg] -> u [rows, rk]; ports Mlp::pbs_head."""
         out = xbel @ self.W["wb"]
-        out = out + self.h0[:rows]
+        out = out + self.h0[:rows] + (traverser - 0.5) * self.W["wt"]
         out = F.relu(F.layer_norm(out + self.B["b1"], [self.hd],
                                   self.L["ln1w"], self.L["ln1b"]))
         return out @ self.W["wu"] + self.B["bu"]
@@ -581,7 +583,7 @@ class Solve:
         """Phase 3: per-leaf per-config values. Ports Solver::readout."""
         j = self.j
         opp = 1 - p
-        u = self.head(j.rows, self.xb)
+        u = self.head(j.rows, self.xb, p)
         for k, leaf in enumerate(j.term_leaves):
             leaf = int(leaf)
             u_term = float(j.terminal_utility[k])
@@ -865,7 +867,7 @@ class Solve:
                 xbel[p * self.dg:(p + 1) * self.dg] = (w[:, None] * self.z[idx]).sum(0)
             q = self.q[i]
             out = xbel @ self.W["wb"]
-            out = out + self.h0[r]
+            out = out + self.h0[r] + (me - 0.5) * self.W["wt"]
             hid = F.relu(F.layer_norm(out + self.B["b1"], [self.hd],
                                       self.L["ln1w"], self.L["ln1b"]))
             upi = hid @ self.W["wp"] + self.B["bp"]

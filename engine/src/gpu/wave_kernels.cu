@@ -124,7 +124,7 @@ typedef struct {
     const float *card_w[8], *card_b[8];
     const float *wid, *pile_w, *pile_b;
     const float *pub_w[8], *pub_b[8], *pub_lnw[8], *pub_lnb[8];
-    const float *pub_out_w, *pub_out_b, *wb, *ln1w, *ln1b;
+    const float *pub_out_w, *pub_out_b, *wb, *wt, *ln1w, *ln1b;
     const float *hmlp_w[8], *hmlp_b[8], *wu_w, *wu_b;
     const float *slot_w[8], *slot_b[8], *slot_out_w, *slot_out_b;
     const float *res_aw[4], *res_ab[4], *res_bw[4], *res_bb[4];
@@ -600,7 +600,8 @@ extern "C" __global__ void belief_sums_f16(const WaveDev* w, const WeightDev* wt
     }
 }
 
-extern "C" __global__ void head_entry(const WaveDev* w, const WeightDev* wt) {
+extern "C" __global__ void head_entry(const WaveDev* w, const WeightDev* wt,
+                                        int traverser) {
     int lane = threadIdx.x & 31;
     int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     if (row >= w->rows) return;
@@ -610,7 +611,10 @@ extern "C" __global__ void head_entry(const WaveDev* w, const WeightDev* wt) {
     #pragma unroll
     for (int k = 0; k < HEAD_CH; k++) {
         int j = (k << 5) + lane;
-        float v = j < HEADW ? dst[j] + wt->pub_out_b[j] + add[j] : 0.0f;
+        float v = j < HEADW
+            ? dst[j] + wt->pub_out_b[j] + add[j]
+                + ((float)traverser - 0.5f) * wt->wt[j]
+            : 0.0f;
         x[k] = v;
         if (j < HEADW) sum += v;
     }
@@ -631,7 +635,8 @@ extern "C" __global__ void head_entry(const WaveDev* w, const WeightDev* wt) {
     }
 }
 
-extern "C" __global__ void head_entry_f16(const WaveDev* w, const WeightDev* wt) {
+extern "C" __global__ void head_entry_f16(const WaveDev* w, const WeightDev* wt,
+                                            int traverser) {
     int lane = threadIdx.x & 31;
     int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     if (row >= w->rows) return;
@@ -647,6 +652,7 @@ extern "C" __global__ void head_entry_f16(const WaveDev* w, const WeightDev* wt)
         int j = (k << 5) + lane;
         float v = j < HEADW
             ? __half2float(src[j]) + __half2float(add[j])
+                + ((float)traverser - 0.5f) * wt->wt[j]
             : 0.0f;
         x[k] = v;
         if (j < HEADW) sum += v;

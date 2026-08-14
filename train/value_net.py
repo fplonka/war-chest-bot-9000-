@@ -110,9 +110,9 @@ class Mlp(nn.Module):
         g(c) = z(c) Wg + bg                                 [rank + 1]
         e_p  = sum_c beta_p(c) z(c)                         [dg]
         h0   = public tower (h0 is pre-norm)                [head]
-        h    = head: relu(LN1(h0 + [e_0|e_1] Wb)), extras   [head_out]
-        u    = h Wu + bu                                    [rank]
-        v(c) = <u, g(c)[:rank]> + g(c)[rank]
+        h_p  = head: relu(LN1(h0 + [e_0|e_1] Wb + t_p Wt))  [head_out]
+        u_p  = h_p Wu + bu                                  [rank]
+        v_p(c) = <u_p, g(c)[:rank]> + g(c)[rank]
 
     The *wiring* is fixed — card table, set sums, belief sums, bilinear
     readout; it is the game-specific part. Every tower's depth and width is a
@@ -179,6 +179,10 @@ class Mlp(nn.Module):
         # The belief's connection into the head. No bias: it is added to a
         # layer that already has one (pub_out's, folded into ln1's pass).
         self.wb = nn.Linear(2 * dg, head, bias=False)
+        # ReBeL queries one traverser at a time. Old checkpoints have no `wt`;
+        # zero initialization preserves their function exactly when loaded.
+        self.wt = nn.Linear(1, head, bias=False)
+        nn.init.zeros_(self.wt.weight)
         self.ln1 = nn.LayerNorm(head)
         widths = [head, *hmlp]
         self.hmlp = nn.ModuleList(
@@ -298,9 +302,12 @@ class Mlp(nn.Module):
             t = F.relu(ln(lin(t)))
         return self.pub_out(t)
 
-    def _head(self, h0, b):
-        """The per-iteration head: entry norm plus the extra ReLU layers."""
-        t = F.relu(self.ln1(h0 + self.wb(b)))
+    def _head(self, h0, b, traverser=None):
+        """The per-iteration head for one traverser per row."""
+        t = h0 + self.wb(b)
+        if traverser is not None:
+            t = t + self.wt(traverser.to(t.dtype).reshape(-1, 1) - 0.5)
+        t = F.relu(self.ln1(t))
         for lin in self.hmlp:
             t = F.relu(lin(t))
         return t
@@ -342,12 +349,14 @@ class Mlp(nn.Module):
         g = self.wg(z)
         b = torch.zeros(nseg, z.shape[1], dtype=z.dtype, device=z.device)
         b.index_add_(0, seg, z[inv] * w.unsqueeze(1))
-        h0 = self._public(xpub, e)
-        h = self._head(h0, b.reshape(xpub.shape[0], -1))
+        h0 = self._public(xpub, e).repeat_interleave(2, 0)
+        belief = b.reshape(xpub.shape[0], -1).repeat_interleave(2, 0)
+        traverser = torch.arange(nseg, device=b.device) % 2
+        h = self._head(h0, belief, traverser)
         u = self.wu(h)
         rk = u.shape[1]
         gc = g[inv]
-        return (u[seg // 2] * gc[:, :rk]).sum(-1) + gc[:, rk]
+        return (u[seg] * gc[:, :rk]).sum(-1) + gc[:, rk]
 
     def flat(self):
         """The weights as the three flat arrays Rust reads, in the v3 order
@@ -370,8 +379,9 @@ class Mlp(nn.Module):
             b.append(bias(l))
         # wid after the card chain, wb after pub_out — weights only, no bias.
         w.insert(len(self.card), self.wid.weight.detach().cpu().contiguous().numpy().ravel())
-        w.insert(len(self.card) + 2 + len(self.pub) + 1,
-                 self.wb.weight.detach().cpu().t().contiguous().numpy().ravel())
+        head_at = len(self.card) + len(self.pub) + 3
+        w.insert(head_at, self.wb.weight.detach().cpu().t().contiguous().numpy().ravel())
+        w.insert(head_at + 1, self.wt.weight.detach().cpu().t().contiguous().numpy().ravel())
         ln = []
         for n in list(self.pub_ln) + [self.ln1]:
             ln += [n.weight.detach().cpu().numpy().ravel(), n.bias.detach().cpu().numpy().ravel()]
