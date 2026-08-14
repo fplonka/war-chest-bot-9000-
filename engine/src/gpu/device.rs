@@ -239,7 +239,7 @@ macro_rules! kernels {
 
 kernels! {
     pack_cards, bias_gelu, cards_finish, assemble, norm_gelu,
-    holding_in, slot_sum, copy_bias,
+    holding_in, slot_sum, add_belief_item_bias,
     init_strategy, seed_reach, reach_sweep, seed_sum,
     belief_sums, readout, backprop_sweep,
     normalize_strategy, gather_carry, collect_root,
@@ -858,9 +858,8 @@ impl Executor {
             self,
             d,
             bank,
-            copy_bias,
+            add_belief_item_bias,
             threads_usize(cfgs * CONFIG),
-            0i32,
             cfgs as i32,
             Arena::Z as i32
         )?;
@@ -1041,7 +1040,7 @@ impl Executor {
         &self,
         d: &DeviceWave,
         bank: &WeightBank,
-        _both: bool,
+        both: bool,
         traverser: usize,
     ) -> Result<(), String> {
         let l = &bank.layout;
@@ -1052,7 +1051,8 @@ impl Executor {
             bank,
             belief_sums,
             warps(d.host.nleaf as usize),
-            traverser as i32
+            traverser as i32,
+            both as i32
         )?;
         gemm(
             &self.blas,

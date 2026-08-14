@@ -348,12 +348,12 @@ extern "C" __global__ void slot_sum(const WaveDev* w, const WeightDev* wt,
     }
 }
 
-extern "C" __global__ void copy_bias(const WaveDev* w, const WeightDev* wt,
-                                      int mode, int rows, int arena) {
+extern "C" __global__ void add_belief_item_bias(const WaveDev* w,
+                                                  const WeightDev* wt,
+                                                  int rows, int arena) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * CONFIG_DIM) return;
-    const float* bias = mode == 0 ? wt->belief_item_b : wt->candidate_b;
-    AP(w, arena)[i] += bias[i % CONFIG_DIM];
+    AP(w, arena)[i] += wt->belief_item_b[i % CONFIG_DIM];
 }
 
 // --------------------------------------------------------------- CFR state
@@ -494,13 +494,22 @@ extern "C" __global__ void seed_sum(const WaveDev* w, const WeightDev* wt,
 // ------------------------------------------------------------ value network
 
 extern "C" __global__ void belief_sums(const WaveDev* w, const WeightDev* wt,
-                                        int traverser) {
+                                        int traverser, int both) {
     (void)wt;
     int lane = threadIdx.x & 31;
     int task = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     if (task >= w->nleaf) return;
     ReadTask q = TP(w, ReadTask, T_READOUT)[task];
-    for (int p = 0; p < 2; p++) {
+    // XB is [traverser, other]. Between alternating CFR iterations the old
+    // other becomes the new traverser; keep it and recompute only the reach
+    // block changed by the preceding update.
+    if (!both) {
+        float* xb = AP(w, A_XB) + (unsigned long long)q.row * 2 * CONFIG_DIM;
+        for (int x = lane; x < CONFIG_DIM; x += 32) xb[x] = xb[CONFIG_DIM + x];
+        __syncwarp();
+    }
+    for (int side = 0; side < (both ? 2 : 1); side++) {
+        int p = both ? side : 1 - traverser;
         int n = nc_of(w, q.node, p);
         const float* r = AP(w, A_REACH) + reach_at(w, q.node, p, 0);
         float scale, flat, total;
@@ -526,9 +535,9 @@ extern "C" __global__ void belief_sums(const WaveDev* w, const WeightDev* wt,
                 if (x < CONFIG_DIM) acc[k] += wc * z[x];
             }
         }
-        int side = p == traverser ? 0 : 1;
+        int dst = p == traverser ? 0 : 1;
         float* out = AP(w, A_XB)
-            + ((unsigned long long)q.row * 2 + side) * CONFIG_DIM;
+            + ((unsigned long long)q.row * 2 + dst) * CONFIG_DIM;
         #pragma unroll
         for (int k = 0; k < CONFIG_CH; k++) {
             int x = (k << 5) + lane;

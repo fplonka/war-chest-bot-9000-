@@ -449,7 +449,7 @@ impl Mlp {
         out[..rows * PUBLIC].copy_from_slice(&a[..rows * PUBLIC]);
     }
 
-    fn config_slots(&self, phi: &[f32], owner: &[u8], units: &[f32], n: usize) -> Vec<f32> {
+    fn config_slots(&self, phi: &[f32], owner: &[u32], units: &[f32], n: usize) -> Vec<f32> {
         let width = 3 + UNIT;
         let mut out = vec![0.0; n * NSLOT * width];
         for c in 0..n {
@@ -470,7 +470,7 @@ impl Mlp {
     pub fn embed(
         &self,
         phi: &[f32],
-        owner: &[u8],
+        owner: &[u32],
         n: usize,
         units: &[f32],
         belief: &mut Vec<f32>,
@@ -583,9 +583,8 @@ impl Mlp {
         self.units(xpub, ids, queries, &mut units);
         let mut public = Vec::new();
         self.public(xpub, &units, queries, queries, &mut public);
-        let owner: Vec<u8> = seg.iter().map(|&x| x as u8).collect();
         let (mut items, mut private) = (Vec::new(), Vec::new());
-        self.embed(phi, &owner, configs, &units, &mut items, &mut private);
+        self.embed(phi, seg, configs, &units, &mut items, &mut private);
         let mut pooled = vec![0.0; queries * CONFIG];
         for c in 0..configs {
             let q = seg[c] as usize;
@@ -622,5 +621,14 @@ mod tests {
     fn old_formats_are_rejected() {
         assert!(V4Layout::new(&[3]).is_err());
         assert!(V4Layout::new(&[4, 1]).is_err());
+    }
+
+    #[test]
+    fn config_owner_does_not_wrap() {
+        let queries = 257;
+        let mut units = vec![0.0; queries * NTYPE * UNIT];
+        units[256 * NTYPE * UNIT] = 7.0;
+        let slots = Mlp::default().config_slots(&vec![0.0; 2 * CFEAT], &[0, 256], &units, 2);
+        assert_eq!(slots[NSLOT * (3 + UNIT) + 3], 7.0);
     }
 }

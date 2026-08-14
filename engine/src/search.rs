@@ -1479,9 +1479,10 @@ impl<'a> Solver<'a> {
         net.public(&xpub, &self.ce, 2 * rows, 2, &mut self.h0);
         self.xpub = xpub;
         let cphi = std::mem::take(&mut self.cphi);
+        let config_owner: Vec<u32> = self.cplayer.iter().map(|&p| p as u32).collect();
         net.embed(
             &cphi[..self.ncfg * CFEAT],
-            &self.cplayer,
+            &config_owner,
             self.ncfg,
             &self.ce,
             &mut self.cz,
