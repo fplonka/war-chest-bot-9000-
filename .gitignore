@@ -12,4 +12,5 @@ __pycache__/
 # and engine/RULES.md for what they are and where to get them.
 papers/
 scratch/
+/temp/
 .DS_Store
