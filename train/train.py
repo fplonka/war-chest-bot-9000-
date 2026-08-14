@@ -261,9 +261,14 @@ def make_batch(parts, rng, device, augment):
             t(cy), 2 * n)
 
 
-def value_loss(net, xpub, unit_ids, phi, w, seg, y, nseg):
+def value_loss(net, xpub, unit_ids, phi, w, seg, y, nseg, stats=None):
     """Mean Huber per support, then mean across canonical queries."""
     v = net(xpub, unit_ids, phi, w, seg, nseg)
+    if stats is not None:
+        expected = torch.zeros(nseg, dtype=v.dtype, device=v.device)
+        expected.index_add_(0, seg, v.detach() * w)
+        residual = (expected[0::2] + expected[1::2]).abs().max().item()
+        stats["zero_sum_max"] = max(stats["zero_sum_max"], residual)
     per = F.smooth_l1_loss(v, y, reduction="none", beta=0.5)
     total = torch.zeros(nseg, dtype=per.dtype, device=per.device)
     count = torch.zeros(nseg, dtype=per.dtype, device=per.device)
@@ -276,12 +281,13 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
                 recent_mix=0.0, recent_frac=0.2, profile_cuda=False,
                 batch_fn=make_batch):
     """Mean value loss over `steps` Adam updates."""
-    if len(buf) < batch:
-        return float("nan"), {}
-    tot = 0.0
     stat = {"sample_s": 0.0, "prepare_s": 0.0, "forward_wall_s": 0.0,
             "backward_wall_s": 0.0, "batch_configs": 0, "steps": steps,
-            "gpu_forward_s": 0.0, "gpu_backward_s": 0.0}
+            "gpu_forward_s": 0.0, "gpu_backward_s": 0.0,
+            "zero_sum_max": 0.0}
+    if len(buf) < batch:
+        return float("nan"), stat
+    tot = 0.0
     event_pairs = []
     stream = torch.cuda.current_stream(device) if profile_cuda and device.type == "cuda" else None
     for _ in range(steps):
@@ -298,7 +304,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
             b1 = torch.cuda.Event(enable_timing=True)
             f0.record(stream)
         ts = time.perf_counter()
-        loss = value_loss(net, *parts)
+        loss = value_loss(net, *parts, stats=stat)
         tot += loss.detach().item()
         stat["forward_wall_s"] += time.perf_counter() - ts
         if stream is not None:
@@ -555,7 +561,8 @@ def main():
                       loss_sum=0.0, train_steps=0, sample_s=0.0,
                       prepare_s=0.0, forward_wall_s=0.0,
                       backward_wall_s=0.0, gpu_forward_s=0.0,
-                      gpu_backward_s=0.0, batch_configs=0)
+                      gpu_backward_s=0.0, batch_configs=0,
+                      zero_sum_max=0.0)
 
         def emit_report(now):
             nonlocal probe, epoch
@@ -591,6 +598,7 @@ def main():
                 "rows": window["rows"], "solves": window["solves"],
                 "loss": round(lv, 5),
                 "loss_old": round(loss_old, 5), "loss_new": round(loss_new, 5),
+                "zero_sum_max": round(window["zero_sum_max"], 5),
                 "horizon_frac": round(window["horizon_hits"] / games, 3),
                 "node_caps": window["node_caps"],
                 "oversize_routes": window["oversize_routes"],
@@ -654,7 +662,7 @@ def main():
                          "conv_s", "add_s", "train_s", "gpu_wait_s",
                          "loss_sum", "train_steps", "sample_s", "prepare_s",
                          "forward_wall_s", "backward_wall_s", "gpu_forward_s",
-                         "gpu_backward_s", "batch_configs"):
+                         "gpu_backward_s", "batch_configs", "zero_sum_max"):
                 window[name] = 0
 
         try:
@@ -717,6 +725,8 @@ def main():
                                  "backward_wall_s", "gpu_forward_s", "gpu_backward_s",
                                  "batch_configs"):
                         window[name] += train_stat[name]
+                    window["zero_sum_max"] = max(
+                        window["zero_sum_max"], train_stat["zero_sum_max"])
                     optimizer_steps += nsteps
                     optimizer_rows += nsteps * args.batch
                     if optimizer_steps % publish_steps == 0:
@@ -812,7 +822,7 @@ def main():
         tgt_mean, tgt_std = float(cy.mean()), float(cy.std())
         tt = time.time()
         steps = max(1, round(args.train_gen_ratio * solves / args.batch))
-        lv, _ = train_steps(
+        lv, train_stat = train_steps(
             value, opt, buf, steps, args.batch, rng, dev,
             augment=False,
             recent_mix=args.recent_mix, recent_frac=args.recent_frac,
@@ -837,6 +847,7 @@ def main():
                "games": d["games"], "decisions": dec, "loss": round(lv, 5),
                "rows": len(rows), "solves": solves,
                "loss_old": round(loss_old, 5), "loss_new": round(loss_new, 5),
+               "zero_sum_max": round(train_stat["zero_sum_max"], 5),
                "horizon_frac": round(d["horizon_hits"] / max(d["games"], 1), 3),
                "node_caps": int(d["node_caps"]),
                "oversize_routes": int(d.get("oversize_routes", 0)),
