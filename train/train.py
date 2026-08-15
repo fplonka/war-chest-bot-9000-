@@ -553,6 +553,8 @@ def main():
         next_report = time.time() + 10.0
         counter_names = (
             "games", "decisions", "horizon_hits", "node_caps",
+            "plays_attack", "plays_pass", "plays_deploy", "plays_bolster",
+            "plays_maneuver", "plays_recruit",
             "oversize_routes", "card_exclusive_routes", "exact_fallbacks", "censored_games",
             "dropped", "configs")
         totals = {name: 0 for name in counter_names}
@@ -603,6 +605,9 @@ def main():
                 "zero_sum_max": round(window["zero_sum_max"], 5),
                 "horizon_frac": round(window["horizon_hits"] / games, 3),
                 "node_caps": window["node_caps"],
+                "plays": {k: window[f"plays_{k}"]
+                          for k in ("attack", "pass", "deploy", "bolster",
+                                    "maneuver", "recruit")},
                 "oversize_routes": window["oversize_routes"],
                 "card_exclusive_routes": window["card_exclusive_routes"],
                 "exact_fallbacks": window["exact_fallbacks"],
@@ -854,6 +859,12 @@ def main():
                "zero_sum_max": round(train_stat["zero_sum_max"], 5),
                "horizon_frac": round(d["horizon_hits"] / max(d["games"], 1), 3),
                "node_caps": int(d["node_caps"]),
+               "plays_attack": int(d.get("plays_attack", 0)),
+               "plays_pass": int(d.get("plays_pass", 0)),
+               "plays_deploy": int(d.get("plays_deploy", 0)),
+               "plays_bolster": int(d.get("plays_bolster", 0)),
+               "plays_maneuver": int(d.get("plays_maneuver", 0)),
+               "plays_recruit": int(d.get("plays_recruit", 0)),
                "oversize_routes": int(d.get("oversize_routes", 0)),
                "card_exclusive_routes": int(d.get("card_exclusive_routes", 0)),
                "exact_fallbacks": int(d.get("exact_fallbacks", 0)),

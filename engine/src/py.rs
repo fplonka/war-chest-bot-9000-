@@ -793,6 +793,12 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     out.set_item("cap_hits", d.cap_hits)?;
     out.set_item("horizon_hits", d.cap_hits)?;
     out.set_item("node_caps", d.node_caps)?;
+    out.set_item("plays_attack", d.plays[0])?;
+    out.set_item("plays_pass", d.plays[1])?;
+    out.set_item("plays_deploy", d.plays[2])?;
+    out.set_item("plays_bolster", d.plays[3])?;
+    out.set_item("plays_maneuver", d.plays[4])?;
+    out.set_item("plays_recruit", d.plays[5])?;
     out.set_item("oversize_routes", d.oversize_routes)?;
     out.set_item("card_exclusive_routes", d.card_exclusive_routes)?;
     out.set_item("exact_fallbacks", d.exact_fallbacks)?;

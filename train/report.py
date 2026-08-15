@@ -301,6 +301,17 @@ def panels(runs):
     out.append(panel("Games cut at horizon", "fraction",
                      [(tag(r), mins(r), [e["horizon_frac"] for e in r["epochs"]], True)
                       for r in runs], zero=True))
+    # What the policy spends its decisions on. The mix is the cheapest read on a
+    # phase shift in strategy: a run that stops passing and starts attacking has
+    # changed what it thinks the game is about, and that shows here before it
+    # shows in Elo.
+    if any(e.get("plays") for r in runs for e in r["epochs"]):
+        for kind in ("attack", "maneuver", "deploy", "bolster", "recruit", "pass"):
+            out.append(panel(f"Moves that {kind}", "fraction of decisions", [
+                (tag(r), mins(r),
+                 [e.get("plays", {}).get(kind, 0) / max(e.get("decisions", 1), 1)
+                  for e in r["epochs"]], True)
+                for r in runs], zero=True))
     return out
 
 

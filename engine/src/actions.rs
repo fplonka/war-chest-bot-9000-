@@ -55,6 +55,22 @@ pub const N_KINDS: usize = 39;
 
 use crate::board::NONE;
 
+/// Coarse move classes for run telemetry. What a policy spends its decisions on
+/// is what shifts between the phases of a game, and four counters make that
+/// visible in the run report without touching the search.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Play {
+    Attack,
+    Pass,
+    Deploy,
+    Bolster,
+    /// Moves a unit or takes control of a hex, however the coin paid for it.
+    Maneuver,
+    /// A facedown coin spent on the economy rather than the board.
+    Recruit,
+    Other,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     // --- main coin plays ---
@@ -484,6 +500,43 @@ impl std::fmt::Display for Action {
                 write!(out, "Granted attack {}->{}", h(from), h(target))
             }
             GrantControl { from } => write!(out, "Granted control @ {}", h(from)),
+        }
+    }
+}
+
+impl Action {
+    /// Which coarse class this decision belongs to. Every action that removes an
+    /// enemy unit counts as an attack, whether it came from the plain action or
+    /// from a card's tactic.
+    pub fn play(self) -> Play {
+        match self {
+            Action::Deploy { .. } => Play::Deploy,
+            Action::Bolster { .. } => Play::Bolster,
+            Action::Pass { .. } => Play::Pass,
+            Action::Attack { .. }
+            | Action::TacArcher { .. }
+            | Action::TacCavalryAttack { .. }
+            | Action::TacCrossbow { .. }
+            | Action::TacLancer { .. }
+            | Action::TacMarshal { .. }
+            | Action::FootAttack { .. }
+            | Action::BerserkAttack { .. }
+            | Action::MercAttack { .. } => Play::Attack,
+            Action::Move { .. }
+            | Action::Control { .. }
+            | Action::TacCavalryMove { .. }
+            | Action::TacEnsign { .. }
+            | Action::TacLightCav { .. }
+            | Action::TacRoyalGuard { .. }
+            | Action::FootMove { .. }
+            | Action::FootControl { .. }
+            | Action::BerserkMove { .. }
+            | Action::BerserkControl { .. }
+            | Action::MercMove { .. }
+            | Action::MercControl { .. }
+            | Action::SwordsmanMove { .. } => Play::Maneuver,
+            Action::Recruit { .. } | Action::ClaimInitiative { .. } => Play::Recruit,
+            _ => Play::Other,
         }
     }
 }

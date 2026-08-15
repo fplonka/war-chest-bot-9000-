@@ -31,7 +31,7 @@
 //!   * `Collect::Rebel` — the ReBeL loop proper: value targets are the CFR
 //!     subgame root values, one per config in each player's belief support.
 
-use crate::actions::Action;
+use crate::actions::{Action, Play};
 use crate::board::{board, NONE, N_HEXES};
 use crate::gpu::GpuClient;
 use crate::rebel::*;
@@ -288,6 +288,8 @@ pub struct Data {
     /// GPU submissions retried by the exact CPU solver after an unexpected
     /// device error. Oversize jobs normally complete on the serialized GPU path.
     pub exact_fallbacks: usize,
+    /// Decisions by coarse move class, for the run report's strategy mix.
+    pub plays: [usize; 6],
     /// Live games intentionally discarded at a wall-clock deadline. This is
     /// time-censored work, not a capacity drop and never enters replay.
     pub censored_games: usize,
@@ -338,6 +340,9 @@ impl Data {
         self.nv += o.nv;
         self.games += o.games;
         self.decisions += o.decisions;
+        for (a, b) in self.plays.iter_mut().zip(o.plays) {
+            *a += b;
+        }
         self.dropped += o.dropped;
         self.oversize_routes += o.oversize_routes;
         self.card_exclusive_routes += o.card_exclusive_routes;
@@ -978,6 +983,17 @@ impl<'a> Game<'a> {
                 }
             }
             bel[player as usize] = Belief::from_pairs(pairs);
+            if let Some(slot) = match np.acts[chosen].play() {
+                Play::Attack => Some(0),
+                Play::Pass => Some(1),
+                Play::Deploy => Some(2),
+                Play::Bolster => Some(3),
+                Play::Maneuver => Some(4),
+                Play::Recruit => Some(5),
+                Play::Other => None,
+            } {
+                data.plays[slot] += 1;
+            }
             s.apply_inplace(np.acts[chosen]);
 
             // Advance the walk along the solved tree. The public observation

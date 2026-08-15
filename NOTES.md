@@ -110,6 +110,42 @@ which are `22.6%` of GPU time and sit exactly at DRAM peak in FP32 -- half
 storage halves them -- and the reach and backprop sweeps at `14.3%`, which walk
 their reverse-gather rows one thread per row and so read uncoalesced.
 
+A from-scratch depth-two bootstrap collapses at some seeds and not others. Seed
+96 collapses on the FP32 build -- target spread falls to `0.001` by the second
+ReBeL epoch and stays -- while seed 95 recovers (`0.038` to `0.004` and back up).
+The readout race fix was briefly blamed for this and is exonerated: an isolation
+run at seed 95 on the fixed build bootstraps with the same shape as before the
+fix. The mechanism is almost certainly the value target, not the search. `TODO.md`
+records it and the reference confirms it: `subgame_solving.cc:577-590` takes the
+target as a linear-weighted running mean of the per-iteration counterfactual root
+values, accumulated inside `step()`, and floors every belief through
+`normalize_probabilities_safe(reaches, kReachSmoothingEps)`. We instead take one
+extra fixed-policy pass (`value_under`) under the final average strategy, and
+where an information set was never reached both `normalize_strategy` and
+`norm_parts` substitute a *uniform* strategy -- so those rows are labelled with
+the value of random play. A flat warm network produces many unreached configs, so
+a large share of early labels are all roughly the same wrong number, which pulls
+the network toward a constant and keeps it there. A trained initialisation has
+informative strategies, few unreached configs, and trains through it, which is
+exactly the observed split. Fixing this is a win on both axes: the labels become
+the reference's, and the whole Phase-2 pass -- two head evaluations per carried
+root, `14` of the `78` per solve -- disappears.
+
+Half-precision head *activations* were then tried and reverted, and this one is
+worth keeping written down. Holding Xb, H and H2 as halves -- feeding the tensor
+cores their operands in the form they already multiply in -- is worth `+12.7%`,
+`599.1` against `531.6 solves/s`, and it passes every oracle: root values still
+track the exact CPU solve to `1.9e-4`. It nevertheless destroys the ReBeL
+bootstrap. From a five-minute warm start the target spread collapses from
+`0.091` to `0.001` within two ReBeL epochs and never recovers, at both seeds
+tried, where the FP32 build at seed 95 does not. A warm network's within-support value spread is a few percent of its
+across-query spread, so the differences CFR needs are near the half grid at the
+start of the bootstrap, and quantising them away leaves the search nothing to
+differentiate. Starting from an already-trained checkpoint hides this completely,
+which is why the four-minute controls looked healthy. The lesson generalises: a
+solve accuracy bound measured against a converged network says nothing about
+whether the bootstrap can get there.
+
 ## Architecture comparison
 
 The corrected full-network run, `value_v4_fullwarm30`, completed 30 minutes and generated `652,807` solves. In a 600-game direct match its final checkpoint beat Greedy `591-4-5`. The legacy `odd` final, evaluated with its own stable pre-refactor engine under the same seed and search settings, beat Greedy `567-3-30`. This anchor does not show an architecture regression.
