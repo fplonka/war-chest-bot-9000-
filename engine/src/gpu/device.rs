@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::mem::{align_of, size_of, MaybeUninit};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Once, OnceLock};
 use std::time::Instant;
 
 use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
@@ -21,11 +21,15 @@ use cudarc::nvrtc;
 use crate::gpu::client::{CarryStore, SolveResult};
 use crate::net::{V4Layout, CONFIG, CONTEXT, JOINT, PUBLIC, PUBLIC_IN, SLOT, UNIT};
 use crate::rebel::{CFEAT, GPU_ROW_BYTES, NSLOT, NTYPE, PILE_COUNTS};
+use crate::serialize::TOWER_CHUNK_ROWS;
 use crate::units::CARD_FEATS;
 
 use super::wave::Wave;
 
 const BLOCK: u32 = 256;
+/// Leaf tasks a single `readout` block values. Its blocks share the candidate
+/// pool through L1, so a tile turns repeat candidate reads into cache hits.
+const READOUT_TILE: usize = 4;
 const GRAPH_CLASSES: usize = 4;
 const N_TABLES: usize = 52;
 const N_ARENAS: usize = 21;
@@ -755,40 +759,67 @@ impl Executor {
         )?;
         launch!(self, d, bank, cards_finish, threads_usize(unit_rows * UNIT))?;
 
+        // The public tower is a pure per-row map, so it runs in row chunks.
+        // Its input buffer is the widest thing in a wave -- `PUBLIC_IN` floats
+        // per canonical view -- and sizing it for the whole wave is what used
+        // to push mature waves onto the exclusive one-job route.
         let public_rows = 2 * rows;
-        launch!(self, d, bank, assemble, public_rows as u32)?;
-        let mut src = d.ptr(Arena::Bx);
-        for k in 0..3 {
-            let dst_arena = match k {
-                0 => Arena::Bh,
-                1 => Arena::Bh2,
-                _ => Arena::H0,
-            };
+        for start in (0..public_rows).step_by(TOWER_CHUNK_ROWS) {
+            let n = TOWER_CHUNK_ROWS.min(public_rows - start);
+            launch!(self, d, bank, assemble, n as u32, start as i32)?;
+            let mut src = d.ptr(Arena::Bx);
+            for k in 0..3 {
+                // The third layer lands back in Bx: its assembled input died
+                // with the first GEMM, and reusing it keeps the projection
+                // below a plain GEMM into H0 instead of a GEMM and a copy.
+                let dst_arena = match k {
+                    0 => Arena::Bh,
+                    1 => Arena::Bh2,
+                    _ => Arena::Bx,
+                };
+                gemm(
+                    &self.blas,
+                    n,
+                    PUBLIC,
+                    l.public[k].i,
+                    src,
+                    l.public[k].i,
+                    bank.w_ptr(l.public[k].w),
+                    PUBLIC,
+                    d.ptr_mut(dst_arena),
+                    PUBLIC,
+                    0.0,
+                )?;
+                launch!(
+                    self,
+                    d,
+                    bank,
+                    norm_gelu,
+                    warps(n),
+                    0i32,
+                    k as i32,
+                    n as i32,
+                    dst_arena as i32
+                )?;
+                src = d.ptr(dst_arena);
+            }
+            // The public half of the first context layer is fixed for the
+            // whole solve. Project it once here instead of repeating the same
+            // GEMM in every CFR iteration and fixed-policy root query.
+            debug_assert_eq!(PUBLIC, CONTEXT);
             gemm(
                 &self.blas,
-                public_rows,
+                n,
+                CONTEXT,
                 PUBLIC,
-                l.public[k].i,
                 src,
-                l.public[k].i,
-                bank.w_ptr(l.public[k].w),
                 PUBLIC,
-                d.ptr_mut(dst_arena),
-                PUBLIC,
+                bank.w_ptr(l.context[0].w),
+                CONTEXT,
+                unsafe { d.ptr_mut(Arena::H0).add(start * CONTEXT) },
+                CONTEXT,
                 0.0,
             )?;
-            launch!(
-                self,
-                d,
-                bank,
-                norm_gelu,
-                warps(public_rows),
-                0i32,
-                k as i32,
-                public_rows as i32,
-                dst_arena as i32
-            )?;
-            src = d.ptr(dst_arena);
         }
 
         launch!(self, d, bank, holding_in, threads_usize(cfgs * NSLOT))?;
@@ -925,33 +956,6 @@ impl Executor {
             JOINT,
             0.0,
         )?;
-
-        // The public half of the first context layer is fixed for the whole
-        // solve. Project it once here instead of repeating the same GEMM in
-        // every CFR iteration and fixed-policy root query.
-        debug_assert_eq!(PUBLIC, CONTEXT);
-        gemm(
-            &self.blas,
-            public_rows,
-            CONTEXT,
-            PUBLIC,
-            d.ptr(Arena::H0),
-            PUBLIC,
-            bank.w_ptr(l.context[0].w),
-            CONTEXT,
-            d.ptr_mut(Arena::Bx),
-            CONTEXT,
-            0.0,
-        )?;
-        unsafe {
-            result::memcpy_dtod_async(
-                d.ptr_mut(Arena::H0) as sys::CUdeviceptr,
-                d.ptr(Arena::Bx) as sys::CUdeviceptr,
-                public_rows * CONTEXT * size_of::<f32>(),
-                self.stream.cu_stream(),
-            )
-        }
-        .map_err(|e| format!("cache public context projection: {e:?}"))?;
         Ok(())
     }
 
@@ -1225,7 +1229,7 @@ impl Executor {
             d,
             bank,
             readout,
-            d.host.readout_n as u32,
+            (d.host.readout_n as usize).div_ceil(READOUT_TILE) as u32,
             player as i32
         )
     }
@@ -1746,7 +1750,8 @@ fn arena_layout(
     } else {
         0
     };
-    let bh = (2 * rows * PUBLIC)
+    let tower_rows = (2 * rows).min(TOWER_CHUNK_ROWS);
+    let bh = (tower_rows * PUBLIC)
         .max(cfgs * NSLOT * SLOT)
         .max(cfgs * CONFIG)
         .max(2 * jobs * NTYPE * UNIT);
@@ -1769,7 +1774,7 @@ fn arena_layout(
         rows * JOINT,
         roots,
         (carry_snaps * w.snapshot_configs).div_ceil(2),
-        2 * rows * PUBLIC_IN,
+        tower_rows * PUBLIC_IN,
         bh,
         bh,
         bg,
@@ -2039,6 +2044,20 @@ fn ptr_mut<T>(stream: &Arc<CudaStream>, value: &mut CudaSlice<T>) -> *mut T {
     p as usize as *mut T
 }
 
+/// GEMM math mode, fixed once per process. The value head is the whole cost of
+/// a deep solve, and `fast` runs its GEMMs on the tensor cores: FP16 multiplies
+/// with FP32 accumulation, which is four times the card's FP32 rate. `precise`
+/// restores plain SGEMM and is what the CPU-oracle tests compare against.
+fn fast_gemm() -> bool {
+    static FAST: OnceLock<bool> = OnceLock::new();
+    *FAST.get_or_init(|| match std::env::var_os("WARCHEST_GPU_GEMM") {
+        Some(mode) if mode == "fast" => true,
+        Some(mode) if mode == "precise" => false,
+        Some(mode) => panic!("WARCHEST_GPU_GEMM is fast or precise, not {mode:?}"),
+        None => !cfg!(test),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn gemm(
     blas: &CudaBlas,
@@ -2057,25 +2076,57 @@ fn gemm(
         return Ok(());
     }
     let alpha = 1.0f32;
+    let fast = fast_gemm();
     static LOG_MODE: Once = Once::new();
-    LOG_MODE.call_once(|| eprintln!("v5 GEMM compute=fp32"));
-    let result = unsafe {
-        cudarc::cublas::result::sgemm(
-            *blas.handle(),
-            CUBLAS_OP_N,
-            CUBLAS_OP_N,
-            n as i32,
-            m as i32,
-            k as i32,
-            &alpha,
-            b,
-            ldb as i32,
-            a,
-            lda as i32,
-            &beta,
-            c,
-            ldc as i32,
-        )
+    LOG_MODE.call_once(|| {
+        eprintln!("v5 GEMM compute={}", if fast { "fast-f16" } else { "fp32" });
+    });
+    let result = if fast {
+        use cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F;
+        use cudarc::cublas::sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+        use cudarc::cublas::sys::cudaDataType_t::CUDA_R_32F;
+        unsafe {
+            cudarc::cublas::result::gemm_ex(
+                *blas.handle(),
+                CUBLAS_OP_N,
+                CUBLAS_OP_N,
+                n as i32,
+                m as i32,
+                k as i32,
+                (&alpha as *const f32).cast(),
+                b.cast(),
+                CUDA_R_32F,
+                ldb as i32,
+                a.cast(),
+                CUDA_R_32F,
+                lda as i32,
+                (&beta as *const f32).cast(),
+                c.cast(),
+                CUDA_R_32F,
+                ldc as i32,
+                CUBLAS_COMPUTE_32F_FAST_16F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            )
+        }
+    } else {
+        unsafe {
+            cudarc::cublas::result::sgemm(
+                *blas.handle(),
+                CUBLAS_OP_N,
+                CUBLAS_OP_N,
+                n as i32,
+                m as i32,
+                k as i32,
+                &alpha,
+                b,
+                ldb as i32,
+                a,
+                lda as i32,
+                &beta,
+                c,
+                ldc as i32,
+            )
+        }
     };
     result.map_err(|e| format!("cuBLAS GEMM {m}x{k}x{n}: {e:?}"))?;
     Ok(())
@@ -2100,7 +2151,7 @@ fn cuda_preamble(_l: &V4Layout) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "#define WAVE_BLOCK {}\n\
+        "#define WAVE_BLOCK {}\n#define READOUT_TILE {}\n\
          #define UNIT_DIM {}\n#define SLOT_DIM {}\n#define CONFIG_DIM {}\n\
          #define PUBLIC_DIM {}\n#define CONTEXT_DIM {}\n#define JOINT_DIM {}\n#define PUBLIC_IN {}\n\
          #define N_HEXES {}\n#define NSLOT {}\n#define NTYPE {}\n#define HEX_FACTS {}\n\
@@ -2113,6 +2164,7 @@ fn cuda_preamble(_l: &V4Layout) -> String {
          static __device__ const unsigned char HEX_LOCATION[N_HEXES] = {{{locations}}};\n\
          static __device__ const unsigned char HEX_MIRROR[N_HEXES] = {{{mirrors}}};\n",
         BLOCK,
+        READOUT_TILE,
         UNIT, SLOT, CONFIG, PUBLIC, CONTEXT, JOINT, PUBLIC_IN,
         crate::board::N_HEXES, NSLOT, NTYPE, crate::rebel::HEX_FACTS,
         PILE_COUNTS, CARD_FEATS, CFEAT, crate::rebel::MAX_COINS,

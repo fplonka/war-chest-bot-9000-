@@ -485,6 +485,12 @@ pub(crate) fn device_value_layout(t: &PackedTables) -> Option<([Vec<u32>; 2], us
     Some((base, lengths[0].max(lengths[1])))
 }
 
+/// The public tower is a per-row map, so the device runs it in chunks of this
+/// many canonical view rows. Its input row is `PUBLIC_IN` floats wide -- by far
+/// the widest thing a wave touches -- and chunking is what keeps a mature
+/// wave's arena off the exclusive one-job route.
+pub const TOWER_CHUNK_ROWS: usize = 16 * 1024;
+
 fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
     let t = &job.tables;
     let Ok(_l) = V4Layout::new(&job.meta.net_dims) else {
@@ -501,7 +507,8 @@ fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
         0
     };
     let mul = |a: usize, b: usize| a.saturating_mul(b);
-    let bh = mul(2 * rows, crate::net::PUBLIC)
+    let tower_rows = mul(2, rows).min(TOWER_CHUNK_ROWS);
+    let bh = mul(tower_rows, crate::net::PUBLIC)
         .max(mul(mul(cfgs, NSLOT), crate::net::SLOT))
         .max(mul(2 * NTYPE, crate::net::UNIT))
         .max(mul(cfgs, crate::net::CONFIG));
@@ -524,7 +531,7 @@ fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
         mul(rows, crate::net::JOINT),
         roots,
         mul(carry_snaps, t.snapshot_configs).div_ceil(2),
-        mul(2 * rows, crate::net::PUBLIC_IN),
+        mul(tower_rows, crate::net::PUBLIC_IN),
         bh,
         bh,
         bg,

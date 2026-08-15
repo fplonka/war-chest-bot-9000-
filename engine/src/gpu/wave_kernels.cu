@@ -169,25 +169,38 @@ __device__ __forceinline__ float gelu(float x) {
     return 0.5f * x * (1.0f + tanhf(0.7978846f * (x + 0.044715f * x * x * x)));
 }
 
+// The widest row any LayerNorm sees, as warp channels. One warp owns a row,
+// so a channel is one register.
+#define LN_WIDTH (PUBLIC_DIM > CONTEXT_DIM ? PUBLIC_DIM : CONTEXT_DIM)
+#define LN_CH ((LN_WIDTH + 31) / 32)
+
+/// LayerNorm and GELU over one row, in place. The row is held in registers
+/// across the mean and variance passes: reloading it from the arena twice
+/// costs more than the whole arithmetic.
 __device__ __forceinline__ void ln_gelu(float* row, const float* bias,
                                          const float* gain, const float* bt,
                                          const float* add, int n, int lane) {
+    float x[LN_CH];
     float sum = 0.0f;
-    for (int j = lane; j < n; j += 32) {
-        float x = add ? row[j] + add[j] : row[j];
-        x += bias[j];
-        row[j] = x;
-        sum += x;
+    #pragma unroll
+    for (int k = 0; k < LN_CH; k++) {
+        int j = (k << 5) + lane;
+        x[k] = j < n ? (add ? row[j] + add[j] : row[j]) + bias[j] : 0.0f;
+        sum += x[k];
     }
     float mean = warp_sum(sum) / (float)n;
     float var = 0.0f;
-    for (int j = lane; j < n; j += 32) {
-        float d = row[j] - mean;
+    #pragma unroll
+    for (int k = 0; k < LN_CH; k++) {
+        int j = (k << 5) + lane;
+        float d = j < n ? x[k] - mean : 0.0f;
         var += d * d;
     }
     float inv = rsqrtf(warp_sum(var) / (float)n + LN_EPS);
-    for (int j = lane; j < n; j += 32) {
-        row[j] = gelu((row[j] - mean) * inv * gain[j] + bt[j]);
+    #pragma unroll
+    for (int k = 0; k < LN_CH; k++) {
+        int j = (k << 5) + lane;
+        if (j < n) row[j] = gelu((x[k] - mean) * inv * gain[j] + bt[j]);
     }
 }
 
@@ -234,15 +247,19 @@ extern "C" __global__ void cards_finish(const WaveDev* w, const WeightDev* wt) {
         + wt->unit_id[id * UNIT_DIM + j];
 }
 
-extern "C" __global__ void assemble(const WaveDev* w, const WeightDev* wt) {
+/// Expand the raw public rows `[qrow0, qrow0 + gridDim.x)` into the Bx
+/// scratch, whose row 0 is `qrow0`. The public tower runs in row chunks so
+/// that its widest buffer does not scale with the whole wave.
+extern "C" __global__ void assemble(const WaveDev* w, const WeightDev* wt,
+                                    int qrow0) {
     (void)wt;
-    int qrow = blockIdx.x;
+    int qrow = qrow0 + blockIdx.x;
     if (qrow >= 2 * w->rows) return;
     int row = qrow / 2, view = qrow & 1;
     int job = TP(w, unsigned int, T_ROW_JOB)[row];
     const unsigned char* src = TP(w, unsigned char, T_RAW_ROWS)
         + (unsigned long long)row * GPU_ROW_BYTES;
-    float* dst = AP(w, A_BX) + (unsigned long long)qrow * PUBLIC_IN;
+    float* dst = AP(w, A_BX) + (unsigned long long)(qrow - qrow0) * PUBLIC_IN;
     int hex_e = N_HEXES * HEX_FACTS;
     int piles = hex_e + N_HEXES * UNIT_DIM;
     for (int j = threadIdx.x; j < PUBLIC_IN; j += blockDim.x) dst[j] = 0.0f;
@@ -406,23 +423,27 @@ __device__ __forceinline__ void reach_task(
     float* reach = AP(w, snap ? A_SNAP_REACH : A_REACH);
     const float* strat = AP(w, strat_snap ? A_SNAP_STRAT : A_CUR);
     float value = 0.0f;
+    // Both table bases are loop-invariant, but a store through the arena can
+    // alias `w` as far as the compiler knows, so it reloads them on every
+    // iteration unless they are named here.
     unsigned int rr = TP(w, unsigned int, T_REV_ROW_OF)[node];
+    int base = reach_at(w, parent, player, 0);
     if (rr != NONE) {
         unsigned int row = rr + c;
         unsigned int lo = TP(w, unsigned int, T_REV_START)[row];
         unsigned int hi = TP(w, unsigned int, T_REV_START)[row + 1];
-        int base = reach_at(w, parent, player, 0);
+        const unsigned int* src = TP(w, unsigned int, T_REV_SRC);
+        const unsigned int* cell = TP(w, unsigned int, T_REV_CELL);
         for (unsigned int x = lo; x < hi; x++)
-            value += reach[base + TP(w, unsigned int, T_REV_SRC)[x]]
-                   * strat[TP(w, unsigned int, T_REV_CELL)[x]];
+            value += reach[base + src[x]] * strat[cell[x]];
     } else {
         unsigned int row = TP(w, unsigned int, T_RVD_ROW_OF)[node] + c;
         unsigned int lo = TP(w, unsigned int, T_RVD_START)[row];
         unsigned int hi = TP(w, unsigned int, T_RVD_START)[row + 1];
-        int base = reach_at(w, parent, player, 0);
+        const unsigned int* src = TP(w, unsigned int, T_RVD_SRC);
+        const float* p = TP(w, float, T_RVD_P);
         for (unsigned int x = lo; x < hi; x++)
-            value += reach[base + TP(w, unsigned int, T_RVD_SRC)[x]]
-                   * TP(w, float, T_RVD_P)[x];
+            value += reach[base + src[x]] * p[x];
     }
     reach[reach_at(w, node, player, c)] = value;
 }
@@ -468,14 +489,18 @@ extern "C" __global__ void reach_sweep(
     // forward task. Accumulate every decision row in one flat pass after the
     // final reach barrier, including the root and aliased decision nodes.
     const Task* decisions = TP(w, Task, player ? T_DECISION1 : T_DECISION0);
-    for (int i = thread; i < w->decision_n[player]; i += stride) {
+    const unsigned int* row_of = TP(w, unsigned int, T_LEGAL_ROW_OF);
+    const unsigned int* legal = TP(w, unsigned int, T_LEGAL_OFF);
+    const float* reach = AP(w, A_REACH);
+    const float* cur = AP(w, A_CUR);
+    float* sum = AP(w, A_SUM);
+    int decisions_n = w->decision_n[player];
+    for (int i = thread; i < decisions_n; i += stride) {
         Task q = decisions[i];
-        unsigned int row = TP(w, unsigned int, T_LEGAL_ROW_OF)[q.node] + q.config;
-        unsigned int lo = TP(w, unsigned int, T_LEGAL_OFF)[row];
-        unsigned int hi = TP(w, unsigned int, T_LEGAL_OFF)[row + 1];
-        float r = AP(w, A_REACH)[reach_at(w, q.node, player, q.config)];
-        for (unsigned int x = lo; x < hi; x++)
-            AP(w, A_SUM)[x] += r * AP(w, A_CUR)[x];
+        unsigned int row = row_of[q.node] + q.config;
+        float r = reach[reach_at(w, q.node, player, q.config)];
+        for (unsigned int x = legal[row]; x < legal[row + 1]; x++)
+            sum[x] += r * cur[x];
     }
 }
 
@@ -486,10 +511,12 @@ extern "C" __global__ void seed_sum(const WaveDev* w, const WeightDev* wt,
     if (i >= w->decision_n[player]) return;
     const Task q = TP(w, Task, player ? T_DECISION1 : T_DECISION0)[i];
     unsigned int row = TP(w, unsigned int, T_LEGAL_ROW_OF)[q.node] + q.config;
-    unsigned int lo = TP(w, unsigned int, T_LEGAL_OFF)[row];
-    unsigned int hi = TP(w, unsigned int, T_LEGAL_OFF)[row + 1];
+    const unsigned int* legal = TP(w, unsigned int, T_LEGAL_OFF);
+    const float* cur = AP(w, A_CUR);
+    float* sum = AP(w, A_SUM);
     float r = AP(w, A_REACH)[reach_at(w, q.node, player, q.config)];
-    for (unsigned int x = lo; x < hi; x++) AP(w, A_SUM)[x] = r * AP(w, A_CUR)[x];
+    for (unsigned int x = legal[row]; x < legal[row + 1]; x++)
+        sum[x] = r * cur[x];
 }
 
 // ------------------------------------------------------------ value network
@@ -525,11 +552,15 @@ extern "C" __global__ void belief_sums(const WaveDev* w, const WeightDev* wt,
         float acc[CONFIG_CH];
         #pragma unroll
         for (int z = 0; z < CONFIG_CH; z++) acc[z] = 0.0f;
-        unsigned int c0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + p];
+        // The config list and the embedding table are loop-invariant; the
+        // reduction below writes through the arena, so the compiler will not
+        // hoist them on its own.
+        const unsigned int* cfgs = TP(w, unsigned int, T_ROW_CFG)
+            + TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + p];
+        const float* embed = AP(w, A_Z);
         for (int c = 0; c < n; c++) {
-            unsigned int cfg = TP(w, unsigned int, T_ROW_CFG)[c0 + c];
+            const float* z = embed + (unsigned long long)cfgs[c] * CONFIG_DIM;
             float wc = r[c] * scale + flat;
-            const float* z = AP(w, A_Z) + (unsigned long long)cfg * CONFIG_DIM;
             #pragma unroll
             for (int k = 0; k < CONFIG_CH; k++) {
                 int x = (k << 5) + lane;
@@ -560,55 +591,80 @@ extern "C" __global__ void context_norm_gelu(const WaveDev* w,
             public_context, CONTEXT_DIM, lane);
 }
 
+/// One block values `READOUT_TILE` consecutive leaf tasks. Consecutive tasks
+/// are neighbouring leaves of the same subgame and draw their candidates from
+/// the same interned pool, so tiling them turns most of the candidate stream
+/// into L1 hits. The tile also gives each task fewer, fuller warp rounds than
+/// one block per task did.
 extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
                                     int player) {
+    constexpr int WPT = (WAVE_BLOCK / 32) / READOUT_TILE;
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
-    int task = blockIdx.x;
-    if (task >= w->readout_n) return;
-    ReadTask q = TP(w, ReadTask, T_READOUT)[task];
-    int opp = 1 - player;
-    int n = nc_of(w, q.node, player);
-    int vbase = value_at(w, q.node, player, 0);
-    float* out = AP(w, A_VALS) + vbase;
-    __shared__ float smem[JOINT_DIM + 1];
+    int slot = warp / WPT, sub = warp % WPT;
+    int task = blockIdx.x * READOUT_TILE + slot;
+    // Everything a configuration does not vary over is block-resident: the
+    // context row with the joint bias already folded in, and the output
+    // weights. Only the candidate row is then read per configuration.
+    __shared__ float common[READOUT_TILE][JOINT_DIM];
+    __shared__ float weight[JOINT_DIM];
+    __shared__ float opp_reach[READOUT_TILE];
 
-    if (q.row == NONE) {
-        if (warp == 0) {
-            int nop = nc_of(w, q.node, opp);
+    // Every thread reaches the one barrier below, live task or not.
+    bool live = task < w->readout_n;
+    ReadTask q = live ? TP(w, ReadTask, T_READOUT)[task] : ReadTask{0, NONE};
+    int n = live ? nc_of(w, q.node, player) : 0;
+    for (int j = threadIdx.x; j < JOINT_DIM; j += blockDim.x)
+        weight[j] = wt->value_w[j];
+    if (live && q.row == NONE) {
+        if (sub == 0) {
+            int opp = 1 - player;
             const float* ro = AP(w, A_REACH) + reach_at(w, q.node, opp, 0);
+            int nop = nc_of(w, q.node, opp);
             float orc = 0.0f;
             for (int c = lane; c < nop; c += 32) orc += ro[c];
             orc = warp_sum(orc);
-            if (lane == 0) smem[JOINT_DIM] = orc;
+            if (lane == 0) opp_reach[slot] = orc;
         }
-        __syncthreads();
+    } else if (live) {
+        const float* context = AP(w, A_U) + (unsigned long long)q.row * JOINT_DIM;
+        for (int j = sub * 32 + lane; j < JOINT_DIM; j += WPT * 32)
+            common[slot][j] = context[j] + wt->joint_bias[j];
+    }
+    __syncthreads();
+    if (!live) return;
+
+    int vbase = value_at(w, q.node, player, 0);
+    float* out = AP(w, A_VALS) + vbase;
+    if (q.row == NONE) {
         float u = TP(w, float, T_NODE_UTILITY)[q.node];
         if (TP(w, unsigned char, T_NODE_PLAYER)[q.node] != player) u = -u;
-        for (int c = threadIdx.x; c < n; c += blockDim.x)
-            out[c] = u * smem[JOINT_DIM];
+        float orc = opp_reach[slot];
+        for (int c = sub * 32 + lane; c < n; c += WPT * 32) out[c] = u * orc;
         return;
     }
 
-    const float* common = AP(w, A_U) + (unsigned long long)q.row * JOINT_DIM;
-    for (int j = threadIdx.x; j < JOINT_DIM; j += blockDim.x)
-        smem[j] = common[j];
-    __syncthreads();
     float orc = AP(w, player ? A_SNAP_REACH : A_VALS)[vbase];
-    unsigned int c0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + player];
-    constexpr int WARPS = WAVE_BLOCK / 32;
-    for (int c = warp; c < n; c += WARPS) {
-        unsigned int cfg = TP(w, unsigned int, T_ROW_CFG)[c0 + c];
-        const float* candidate = AP(w, A_G)
-            + (unsigned long long)cfg * JOINT_DIM;
+    float bias = *wt->value_b;
+    const unsigned int* cfgs = TP(w, unsigned int, T_ROW_CFG)
+        + TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + player];
+    const float* candidates = AP(w, A_G);
+    const float* row = common[slot];
+    for (int c = sub; c < n; c += WPT) {
+        const float4* candidate = reinterpret_cast<const float4*>(
+            candidates + (unsigned long long)cfgs[c] * JOINT_DIM);
         float value = 0.0f;
         #pragma unroll
-        for (int j = lane; j < JOINT_DIM; j += 32) {
-            value += gelu(smem[j] + candidate[j] + wt->joint_bias[j])
-                   * wt->value_w[j];
+        for (int j = lane; j < JOINT_DIM / 4; j += 32) {
+            float4 g = candidate[j];
+            int b = 4 * j;
+            value += gelu(row[b] + g.x) * weight[b]
+                   + gelu(row[b + 1] + g.y) * weight[b + 1]
+                   + gelu(row[b + 2] + g.z) * weight[b + 2]
+                   + gelu(row[b + 3] + g.w) * weight[b + 3];
         }
         value = warp_sum(value);
-        if (lane == 0) out[c] = (value + *wt->value_b) * orc;
+        if (lane == 0) out[c] = (value + bias) * orc;
     }
 }
 
@@ -631,11 +687,12 @@ __device__ __forceinline__ void backprop_task(
             unsigned int rb = TP(w, unsigned int, T_DRAW_ROW_OFF)[node];
             unsigned int lo = TP(w, unsigned int, T_DRAW_ROW_START)[rb + c];
             unsigned int hi = TP(w, unsigned int, T_DRAW_ROW_START)[rb + c + 1];
+            const float* draw_p = TP(w, float, T_DRAW_P) + d0;
+            const unsigned int* draw_to = TP(w, unsigned int, T_DRAW_TO) + d0;
+            unsigned int cbase = value_at(w, child, player, 0);
             float v = 0.0f;
             for (unsigned int x = lo + lane; x < hi; x += 32)
-                v += TP(w, float, T_DRAW_P)[d0 + x]
-                   * vals[value_at(w, child, player,
-                                   TP(w, unsigned int, T_DRAW_TO)[d0 + x])];
+                v += draw_p[x] * vals[cbase + draw_to[x]];
             v = warp_sum(v);
             if (lane == 0) vals[vbase + c] = v;
         }
@@ -645,8 +702,9 @@ __device__ __forceinline__ void backprop_task(
         float v = 0.0f;
         const unsigned int* cs = TP(w, unsigned int, T_NODE_CHILD_START);
         const unsigned int* ch = TP(w, unsigned int, T_NODE_CHILD);
+        const unsigned int* vbases = TP(w, unsigned int, T_VALS_BASE);
         for (unsigned int x = cs[node] + lane; x < cs[node + 1]; x += 32)
-            v += vals[value_at(w, ch[x], player, c)];
+            v += vals[vbases[2 * ch[x] + player] + c];
         v = warp_sum(v);
         if (lane == 0) vals[vbase + c] = v;
         return;
@@ -654,33 +712,37 @@ __device__ __forceinline__ void backprop_task(
     unsigned int row = TP(w, unsigned int, T_LEGAL_ROW_OF)[node] + c;
     unsigned int lo = TP(w, unsigned int, T_LEGAL_OFF)[row];
     unsigned int hi = TP(w, unsigned int, T_LEGAL_OFF)[row + 1];
+    const unsigned int* cell = TP(w, unsigned int, T_LEGAL_VALUE);
     const float* strat = AP(w, mode ? A_SNAP_STRAT : A_CUR);
     float base = 0.0f;
     for (unsigned int x = lo + lane; x < hi; x += 32) {
-        unsigned int value = TP(w, unsigned int, T_LEGAL_VALUE)[x];
+        unsigned int value = cell[x];
         if (value != NONE) base += vals[value] * strat[x];
     }
     base = warp_sum(base);
     if (lane == 0) vals[vbase + c] = base;
     if (mode) return;
+    // The three strategy arenas are indexed by the same cell and written back
+    // in this loop; naming them keeps their bases out of the load stream.
+    float* regret = AP(w, A_REGRET);
+    float* cur = AP(w, A_CUR);
+    float* sum = AP(w, A_SUM);
     float total = 0.0f;
     for (unsigned int x = lo + lane; x < hi; x += 32) {
-        float delta = 0.0f;
-        unsigned int value = TP(w, unsigned int, T_LEGAL_VALUE)[x];
-        if (value != NONE) delta += vals[value];
-        delta -= base;
-        float old = AP(w, A_REGRET)[x];
+        unsigned int value = cell[x];
+        float delta = (value != NONE ? vals[value] : 0.0f) - base;
+        float old = regret[x];
         float r = old * (old > 0.0f ? da : db) + delta;
-        AP(w, A_REGRET)[x] = r;
+        regret[x] = r;
         float v = fmaxf(r + predict * delta, EPS);
-        AP(w, A_CUR)[x] = v;
+        cur[x] = v;
         total += v;
-        AP(w, A_SUM)[x] *= ds;
+        sum[x] *= ds;
     }
     total = warp_sum(total);
     if (total > 0.0f) {
         float inv = 1.0f / total;
-        for (unsigned int x = lo + lane; x < hi; x += 32) AP(w, A_CUR)[x] *= inv;
+        for (unsigned int x = lo + lane; x < hi; x += 32) cur[x] *= inv;
     }
 }
 

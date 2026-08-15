@@ -34,6 +34,44 @@ The optimizer ratio returns to 4. The legacy successful run used 4, while 12 tra
 
 The production configuration exceeds the `800 solves/s` requirement by `9.0x` over a full 30-minute run. It generated `75,136,466` replay rows from `10,835,186` solves, admitted only three oversize routes, and dropped no work. The independently evaluated checkpoints strengthen monotonically from 5 through 29 minutes; the final beat the 23-minute checkpoint with an aggregate score of `0.545` over 200 games.
 
+## Depth-two, 64-iteration DCFR throughput
+
+A deep solve is a different machine from a depth-one solve. At steady state a
+depth-two subgame carries `2,181` leaf rows against roughly `180` for the
+shallow default, and the head runs `78` times per solve: `64` CFR iterations
+plus one fixed-policy pass per player for each of the seven carried root
+beliefs that `snapshot_iters(64)` produces. That is `1.17e11` FLOP of head GEMM
+per solve, so `800 solves/s` needs `93.7 TFLOP/s` sustained. Two RTX 3090s
+offer `71.2 TFLOP/s` of FP32, which is why the FP32 path cannot reach the
+target and the tensor cores are not optional.
+
+Controlled four-minute runs, depth 2, 64 DCFR iterations, seed 101, 32 actors
+per worker so games complete and the solve-size mixture settles:
+
+| build | solves/s | solves | exclusive routes |
+|---|---:|---:|---:|
+| before | `294.9` | `70,761` | `44` |
+| chunked public tower and kernel traffic | `328.0` | `78,716` | `0` |
+| tensor-core head GEMMs | `531.6` | `127,565` | `0` |
+
+The public tower is a per-row map, so it now runs in row chunks. Its input row
+is `PUBLIC_IN` floats wide and sizing that buffer for a whole wave made a
+mature wave reserve over four gibibytes, which routed it to the exclusive
+one-job lane; chunking removed every such route and the redundant device copy
+that used to cache the public context projection. LayerNorm now holds its row
+in registers across the mean and variance passes instead of reloading it from
+the arena twice, which brought `context_norm_gelu` and `norm_gelu` to `937
+GB/s` -- DRAM peak, so they are done. The readout keeps the context row with
+the joint bias folded in, and the output weights, in shared memory, reads
+candidates as `float4`, and values four leaves per block so that neighbouring
+leaves share their candidate pool through L1. The sweeps name their arena and
+table bases once instead of reloading them through `w` after every store.
+
+With the tensor-core GEMMs the mix is `40.4%` GEMM, `12.8%`
+`context_norm_gelu`, `11.0%` readout, `9.8%` `norm_gelu`, `8.1%`
+`belief_sums`, `7.6%` reach sweep, `6.7%` backprop sweep. The remaining
+non-GEMM half is stream-bound on FP32 activations.
+
 ## Architecture comparison
 
 The corrected full-network run, `value_v4_fullwarm30`, completed 30 minutes and generated `652,807` solves. In a 600-game direct match its final checkpoint beat Greedy `591-4-5`. The legacy `odd` final, evaluated with its own stable pre-refactor engine under the same seed and search settings, beat Greedy `567-3-30`. This anchor does not show an architecture regression.
