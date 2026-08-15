@@ -241,7 +241,7 @@ kernels! {
     pack_cards, bias_gelu, cards_finish, assemble, norm_gelu,
     holding_in, slot_sum, add_belief_item_bias,
     init_strategy, seed_reach, reach_sweep, seed_sum,
-    belief_sums, add_public_context, readout, backprop_sweep,
+    belief_sums, context_norm_gelu, readout, backprop_sweep,
     normalize_strategy, gather_carry, collect_root,
 }
 
@@ -1098,21 +1098,10 @@ impl Executor {
             self,
             d,
             bank,
-            add_public_context,
-            threads_usize(rows * CONTEXT),
+            context_norm_gelu,
+            warps(rows),
             traverser as i32,
             rows as i32
-        )?;
-        launch!(
-            self,
-            d,
-            bank,
-            norm_gelu,
-            warps(rows),
-            3i32,
-            0i32,
-            rows as i32,
-            Arena::H as i32
         )?;
         gemm(
             &self.blas,

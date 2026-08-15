@@ -1,4 +1,4 @@
-"""Knobs of a training run. Defaults are gpu_golden8."""
+"""Production training knobs."""
 
 import dataclasses
 import os
@@ -21,7 +21,7 @@ class Cfg:
     recent_frac: float = 0.2
     cap: int = 2_000_000
     cfgs_per_row: int = 48
-    depth: int = 2
+    depth: int = 1
     iters: int = 32
     cfr: str = "linear"
     explore: float = 0.25

@@ -397,7 +397,7 @@ def write_log(args, epochs, snaps):
 def main():
     ap = argparse.ArgumentParser(
         description="Train one run, then rate its snapshots against Greedy.")
-    ap.add_argument("over", nargs="*", help="knob=value (defaults are gpu_golden8)")
+    ap.add_argument("over", nargs="*", help="knob=value (production defaults)")
     over = config.parse(ap.parse_args().over)
     name = over.pop("out", None)
     if not name:

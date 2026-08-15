@@ -171,10 +171,11 @@ __device__ __forceinline__ float gelu(float x) {
 
 __device__ __forceinline__ void ln_gelu(float* row, const float* bias,
                                          const float* gain, const float* bt,
-                                         int n, int lane) {
+                                         const float* add, int n, int lane) {
     float sum = 0.0f;
     for (int j = lane; j < n; j += 32) {
-        float x = row[j] + bias[j];
+        float x = add ? row[j] + add[j] : row[j];
+        x += bias[j];
         row[j] = x;
         sum += x;
     }
@@ -315,7 +316,7 @@ extern "C" __global__ void norm_gelu(const WaveDev* w, const WeightDev* wt,
     else if (mode == 2) { bias = wt->candidate_b; gain = wt->candidate_lnw; bt = wt->candidate_lnb; }
     else { bias = wt->context_b[level]; gain = wt->context_lnw[level]; bt = wt->context_lnb[level]; }
     float* x = AP(w, arena) + (unsigned long long)row * width;
-    ln_gelu(x, bias, gain, bt, width, lane);
+    ln_gelu(x, bias, gain, bt, nullptr, width, lane);
 }
 
 extern "C" __global__ void holding_in(const WaveDev* w, const WeightDev* wt) {
@@ -546,16 +547,17 @@ extern "C" __global__ void belief_sums(const WaveDev* w, const WeightDev* wt,
     }
 }
 
-extern "C" __global__ void add_public_context(const WaveDev* w,
-                                                const WeightDev* wt,
-                                                int traverser, int rows) {
-    (void)wt;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * CONTEXT_DIM) return;
-    int row = i / CONTEXT_DIM;
-    int j = i % CONTEXT_DIM;
-    AP(w, A_H)[i] += AP(w, A_H0)
-        [((unsigned long long)row * 2 + traverser) * CONTEXT_DIM + j];
+extern "C" __global__ void context_norm_gelu(const WaveDev* w,
+                                              const WeightDev* wt,
+                                              int traverser, int rows) {
+    int lane = threadIdx.x & 31;
+    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (row >= rows) return;
+    float* x = AP(w, A_H) + (unsigned long long)row * CONTEXT_DIM;
+    const float* public_context = AP(w, A_H0)
+        + ((unsigned long long)row * 2 + traverser) * CONTEXT_DIM;
+    ln_gelu(x, wt->context_b[0], wt->context_lnw[0], wt->context_lnb[0],
+            public_context, CONTEXT_DIM, lane);
 }
 
 extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
@@ -588,21 +590,23 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
         return;
     }
 
-    const float* common_in = AP(w, A_U) + (unsigned long long)q.row * JOINT_DIM;
+    const float* common = AP(w, A_U) + (unsigned long long)q.row * JOINT_DIM;
     for (int j = threadIdx.x; j < JOINT_DIM; j += blockDim.x)
-        smem[j] = common_in[j];
+        smem[j] = common[j];
     __syncthreads();
     float orc = AP(w, player ? A_SNAP_REACH : A_VALS)[vbase];
     unsigned int c0 = TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + player];
     constexpr int WARPS = WAVE_BLOCK / 32;
     for (int c = warp; c < n; c += WARPS) {
         unsigned int cfg = TP(w, unsigned int, T_ROW_CFG)[c0 + c];
-        const float* candidate = AP(w, A_G) + (unsigned long long)cfg * JOINT_DIM;
+        const float* candidate = AP(w, A_G)
+            + (unsigned long long)cfg * JOINT_DIM;
         float value = 0.0f;
         #pragma unroll
-        for (int j = lane; j < JOINT_DIM; j += 32)
+        for (int j = lane; j < JOINT_DIM; j += 32) {
             value += gelu(smem[j] + candidate[j] + wt->joint_bias[j])
                    * wt->value_w[j];
+        }
         value = warp_sum(value);
         if (lane == 0) out[c] = (value + *wt->value_b) * orc;
     }
