@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crate::serialize::{PackedJob, WorkVector};
 
 use super::client::{Cmd, GpuClient, SolveResult};
-use super::device::Executor;
+use super::device::{Blas, Executor};
 use super::wave::Wave;
 
 pub struct Service;
@@ -48,12 +48,16 @@ enum RouteCmd {
     Shutdown,
 }
 
+/// Start one device's wave service. `precise` forces plain SGEMM instead of
+/// the tensor-core head: the CPU-oracle tests need exact math to compare
+/// against, production wants the four-times rate.
 pub fn spawn(
     device: usize,
     dims: Vec<usize>,
     w: Vec<f32>,
     b: Vec<f32>,
     ln: Vec<f32>,
+    precise: bool,
 ) -> Result<GpuClient, String> {
     let (tx, rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
@@ -61,7 +65,7 @@ pub fn spawn(
     let service_work = queued_work.clone();
     let thread = std::thread::Builder::new()
         .name(format!("warchest-dispatch-{device}"))
-        .spawn(move || dispatcher(device, dims, w, b, ln, rx, ready_tx, service_work))
+        .spawn(move || dispatcher(device, dims, w, b, ln, precise, rx, ready_tx, service_work))
         .map_err(|e| format!("start GPU wave executor: {e}"))?;
     match ready_rx.recv() {
         Ok(Ok(())) => Ok(GpuClient::new(tx, thread, queued_work)),
@@ -82,6 +86,7 @@ fn dispatcher(
     w: Vec<f32>,
     b: Vec<f32>,
     ln: Vec<f32>,
+    precise: bool,
     rx: mpsc::Receiver<Cmd>,
     ready: mpsc::Sender<Result<(), String>>,
     queued_work: Arc<AtomicU64>,
@@ -106,13 +111,15 @@ fn dispatcher(
         let (ldims, lw, lb, lln) = (dims.clone(), w.clone(), b.clone(), ln.clone());
         match std::thread::Builder::new()
             .name(format!("warchest-wave-{device}-{lane}"))
-            .spawn(move || match Executor::new(device, ldims, lw, lb, lln) {
-                Ok(exec) => {
-                    let _ = lane_ready.send(Ok(()));
-                    run(device, lane, lane_rx, exec, global, local_run);
-                }
-                Err(e) => {
-                    let _ = lane_ready.send(Err(e));
+            .spawn(move || {
+                match Executor::new(device, ldims, lw, lb, lln, |h| Blas::new(h, precise)) {
+                    Ok(exec) => {
+                        let _ = lane_ready.send(Ok(()));
+                        run(device, lane, lane_rx, exec, global, local_run);
+                    }
+                    Err(e) => {
+                        let _ = lane_ready.send(Err(e));
+                    }
                 }
             }) {
             Ok(join) => {

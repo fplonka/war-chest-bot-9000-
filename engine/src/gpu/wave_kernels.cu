@@ -630,21 +630,25 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
         const float* context = AP(w, A_U) + (unsigned long long)q.row * JOINT_DIM;
         for (int j = sub * 32 + lane; j < JOINT_DIM; j += WPT * 32)
             common[slot][j] = context[j] + wt->joint_bias[j];
+        // `belief_sums` parked the opponent reach mass in the value slot this
+        // kernel is about to overwrite, so it has to be read before any warp
+        // starts writing. The barrier below is that ordering.
+        if (sub == 0 && lane == 0)
+            opp_reach[slot] = AP(w, player ? A_SNAP_REACH : A_VALS)
+                [value_at(w, q.node, player, 0)];
     }
     __syncthreads();
     if (!live) return;
 
-    int vbase = value_at(w, q.node, player, 0);
-    float* out = AP(w, A_VALS) + vbase;
+    float* out = AP(w, A_VALS) + value_at(w, q.node, player, 0);
+    float orc = opp_reach[slot];
     if (q.row == NONE) {
         float u = TP(w, float, T_NODE_UTILITY)[q.node];
         if (TP(w, unsigned char, T_NODE_PLAYER)[q.node] != player) u = -u;
-        float orc = opp_reach[slot];
         for (int c = sub * 32 + lane; c < n; c += WPT * 32) out[c] = u * orc;
         return;
     }
 
-    float orc = AP(w, player ? A_SNAP_REACH : A_VALS)[vbase];
     float bias = *wt->value_b;
     const unsigned int* cfgs = TP(w, unsigned int, T_ROW_CFG)
         + TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + player];

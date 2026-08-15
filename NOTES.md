@@ -69,8 +69,46 @@ table bases once instead of reloading them through `w` after every store.
 
 With the tensor-core GEMMs the mix is `40.4%` GEMM, `12.8%`
 `context_norm_gelu`, `11.0%` readout, `9.8%` `norm_gelu`, `8.1%`
-`belief_sums`, `7.6%` reach sweep, `6.7%` backprop sweep. The remaining
-non-GEMM half is stream-bound on FP32 activations.
+`belief_sums`, `7.6%` reach sweep, `6.7%` backprop sweep.
+
+Tiling the readout exposed a race that predated it. `belief_sums` parks the
+opponent reach mass in the value slot the readout is about to overwrite, and
+the readout read it with no barrier between the warps that read and the warps
+that write. Whether a leaf got the reach mass or a leaf value depended on warp
+timing; the reuse-invariance check caught it intermittently, at up to `0.30`
+absolute in a single action probability. The read now happens before the
+block's one barrier.
+
+Holding the candidate, belief and public-context embeddings as halves was tried
+and reverted: `522.5` against `531.6 solves/s`. The readout is instruction-bound
+on GELU, not byte-bound -- `tanhf` already compiles to one `tanh.approx.f32`, so
+`96` of its `130` inner instructions are the nonlinearity -- and the extra
+`__half22float2` conversions cost more than the halved loads saved. Only
+`context_norm_gelu` was genuinely at DRAM peak, and it holds one of three
+streams. Precision was not worth spending there.
+
+The oracle contract splits along the same line. `Blas` carries the math mode, so
+the three CPU-oracle tests build a precise executor and keep their original
+tolerances against exact math, while `tensor_core_head_tracks_exact_math` runs
+the production path and bounds it against that same exact solve: root values,
+which are what training consumes, agree to `1.9e-4`, and a regret-matched action
+probability -- a ratio of differences between leaf values, so two orders more
+sensitive -- to `4.8e-2`.
+
+The verified 30-minute run, `value_v4_d2i64dcfr_30`, sustained `522.2 solves/s`
+at production defaults: `783,039` solves, `3,131,392` optimizer rows, `14,161`
+games, no exclusive route, no dropped work, no exact fallback. DCFR trains well
+at this depth -- ladder Elo against Greedy went init `-49`, s1 `+193`, s2 `+498`,
+s3 `+638`, final `+681`, and the final beat Greedy `20-0-0` in its seeding pair.
+That is `1.77x` the pre-optimization rate and `65%` of the `800 solves/s` target.
+
+CUDA Graphs and larger waves were both tested and rejected: graph capture cannot
+reuse an executable across the shapes a live stream produces, so it measured
+`466.1` against `531.6 solves/s`. Reaching `800` from here needs the non-GEMM
+half cut by about `2.4x`. The two places that can give it are the LayerNorms,
+which are `22.6%` of GPU time and sit exactly at DRAM peak in FP32 -- half
+storage halves them -- and the reach and backprop sweeps at `14.3%`, which walk
+their reverse-gather rows one thread per row and so read uncoalesced.
 
 ## Architecture comparison
 

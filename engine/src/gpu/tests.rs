@@ -221,7 +221,7 @@ fn full_wave_oracle() {
     let (dims, w, b, ln) = test_weights();
     let nets = nets(&dims, &w, &b, &ln);
     let set = fixtures(&nets);
-    let gpu = spawn(0, dims, w, b, ln).expect("GPU executor");
+    let gpu = spawn(0, dims, w, b, ln, true).expect("GPU executor");
     let pending: Vec<_> = set
         .iter()
         .map(|(_, j)| gpu.submit(j.clone()).expect("submit"))
@@ -277,7 +277,7 @@ fn zero_network_oracle() {
     w.fill(0.0);
     let nets = nets(&dims, &w, &b, &ln);
     let set = fixtures(&nets);
-    let gpu = spawn(0, dims, w, b, ln).expect("GPU executor");
+    let gpu = spawn(0, dims, w, b, ln, true).expect("GPU executor");
     let pending: Vec<_> = set
         .iter()
         .map(|(_, j)| gpu.submit(j.clone()).expect("submit"))
@@ -331,7 +331,7 @@ fn wave_composition_stays_bounded() {
     let set = fixtures(&nets);
     for measured_id in 0..set.len() {
         let job = set[measured_id].1.clone();
-        let gpu = spawn(0, dims.clone(), w.clone(), b.clone(), ln.clone()).expect("GPU");
+        let gpu = spawn(0, dims.clone(), w.clone(), b.clone(), ln.clone(), true).expect("GPU");
         let alone = gpu.submit(job.clone()).unwrap().wait().unwrap();
         let mut pending: Vec<_> = (0..15)
             .map(|i| gpu.submit(set[i % set.len()].1.clone()).unwrap())
@@ -356,19 +356,20 @@ fn wave_composition_stays_bounded() {
             company_strategy_tol.0,
             company_strategy_tol.1,
         );
+        let reuse_tol = (1e-6, 1e-6);
         cmp(
             &format!("tree {measured_id} strategy depends on reused capacity"),
             &after.strategy,
             &alone.strategy,
-            1e-6,
-            1e-6,
+            reuse_tol.0,
+            reuse_tol.1,
         );
         cmp(
             &format!("tree {measured_id} root values depend on reused capacity"),
             &flatten_pairs(&after.root_values),
             &flatten_pairs(&alone.root_values),
-            1e-6,
-            1e-6,
+            reuse_tol.0,
+            reuse_tol.1,
         );
         let company_root_tol = (1e-3, 2e-4);
         cmp(
@@ -377,6 +378,51 @@ fn wave_composition_stays_bounded() {
             &flatten_pairs(&alone.root_values),
             company_root_tol.0,
             company_root_tol.1,
+        );
+    }
+}
+
+/// The production head multiplies in FP16 on the tensor cores, so it is a
+/// different numerical machine from the exact path the oracles above pin. What
+/// training consumes is the root value; bound that against exact math, and
+/// require the same structural invariants. The strategy is a ratio of
+/// differences between leaf values and magnifies the same rounding by two
+/// orders, which is what the looser bound here records.
+#[test]
+fn tensor_core_head_tracks_exact_math() {
+    let _gpu = gpu_guard();
+    let (dims, w, b, ln) = test_weights();
+    let nets = nets(&dims, &w, &b, &ln);
+    let set = fixtures(&nets);
+    let solve = |precise: bool| {
+        let gpu = spawn(0, dims.clone(), w.clone(), b.clone(), ln.clone(), precise)
+            .expect("GPU executor");
+        let pending: Vec<_> = set
+            .iter()
+            .map(|(_, j)| gpu.submit(j.clone()).expect("submit"))
+            .collect();
+        pending
+            .into_iter()
+            .map(|h| h.wait().expect("solve"))
+            .collect::<Vec<_>>()
+    };
+    let exact = solve(true);
+    let fast = solve(false);
+    for (tree, ((_, job), got)) in set.iter().zip(&fast).enumerate() {
+        assert_result_invariants(job, got);
+        cmp(
+            &format!("tree {tree} fast root values"),
+            &flatten_pairs(&got.root_values),
+            &flatten_pairs(&exact[tree].root_values),
+            2e-3,
+            2e-3,
+        );
+        cmp(
+            &format!("tree {tree} fast strategy"),
+            &got.strategy,
+            &exact[tree].strategy,
+            8e-2,
+            4e-2,
         );
     }
 }

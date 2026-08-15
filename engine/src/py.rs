@@ -668,8 +668,15 @@ fn gpu_start(
         let mut clients = Vec::new();
         for d in devices {
             clients.push(
-                crate::gpu::service::spawn(d, dims.clone(), w.clone(), b.clone(), ln.clone())
-                    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?,
+                crate::gpu::service::spawn(
+                    d,
+                    dims.clone(),
+                    w.clone(),
+                    b.clone(),
+                    ln.clone(),
+                    false,
+                )
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?,
             );
         }
         *gpu_clients().lock() = clients;

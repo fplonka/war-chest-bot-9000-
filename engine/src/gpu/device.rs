@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::mem::{align_of, size_of, MaybeUninit};
-use std::sync::{Arc, Once, OnceLock};
+use std::sync::{Arc, Once};
 use std::time::Instant;
 
 use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
@@ -345,9 +345,38 @@ fn build_kernels(
     Ok((kernels, backprop_blocks, reach_blocks, sweep_block))
 }
 
+/// The cuBLAS handle together with the math mode its GEMMs run in. `fast` puts
+/// the value head on the tensor cores -- FP16 multiplies with FP32
+/// accumulation, four times the card's FP32 rate -- which is what a depth-two
+/// solve needs and what production runs. The CPU-oracle tests build a precise
+/// executor so that they still compare exact math.
+pub struct Blas {
+    handle: CudaBlas,
+    fast: bool,
+}
+
+impl Blas {
+    /// `precise` pins plain SGEMM. Otherwise `WARCHEST_GPU_GEMM=precise` can
+    /// still pin it for a whole run, which is how a production build is
+    /// A/B'd against exact math.
+    pub fn new(handle: CudaBlas, precise: bool) -> Result<Self, String> {
+        let fast = match std::env::var_os("WARCHEST_GPU_GEMM") {
+            Some(mode) if mode == "fast" => true,
+            Some(mode) if mode == "precise" => false,
+            Some(mode) => {
+                return Err(format!(
+                    "WARCHEST_GPU_GEMM is fast or precise, not {mode:?}"
+                ))
+            }
+            None => !precise,
+        };
+        Ok(Self { handle, fast })
+    }
+}
+
 pub struct Executor {
     stream: Arc<CudaStream>,
-    blas: CudaBlas,
+    blas: Blas,
     kernels: Kernels,
     dims: Vec<usize>,
     banks: HashMap<u64, WeightBank>,
@@ -455,6 +484,7 @@ impl Executor {
         w: Vec<f32>,
         b: Vec<f32>,
         ln: Vec<f32>,
+        blas: impl FnOnce(CudaBlas) -> Result<Blas, String>,
     ) -> Result<Self, String> {
         let context =
             CudaContext::new(device).map_err(|e| format!("cuda device {device}: {e:?}"))?;
@@ -464,7 +494,7 @@ impl Executor {
         let stream = context
             .new_stream()
             .map_err(|e| format!("CUDA stream: {e:?}"))?;
-        let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cuBLAS: {e:?}"))?;
+        let blas = blas(CudaBlas::new(stream.clone()).map_err(|e| format!("cuBLAS: {e:?}"))?)?;
         let layout = V4Layout::new(&dims)?;
         let (kernels, backprop_blocks, reach_blocks, sweep_block) =
             build_kernels(&context, &layout)?;
@@ -552,7 +582,8 @@ impl Executor {
         // capture+instantiation is pure overhead. Keep a direct-stream A/B path
         // while tuning that crossover; it executes the identical kernels and
         // GEMMs in the identical order.
-        let direct = std::env::var_os("WARCHEST_DIRECT").is_some();
+        // `WARCHEST_DIRECT=0` puts the wave back on CUDA Graphs.
+        let direct = std::env::var_os("WARCHEST_DIRECT").is_some_and(|x| x != "0");
         if !direct {
             self.stream
                 .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
@@ -2044,23 +2075,9 @@ fn ptr_mut<T>(stream: &Arc<CudaStream>, value: &mut CudaSlice<T>) -> *mut T {
     p as usize as *mut T
 }
 
-/// GEMM math mode, fixed once per process. The value head is the whole cost of
-/// a deep solve, and `fast` runs its GEMMs on the tensor cores: FP16 multiplies
-/// with FP32 accumulation, which is four times the card's FP32 rate. `precise`
-/// restores plain SGEMM and is what the CPU-oracle tests compare against.
-fn fast_gemm() -> bool {
-    static FAST: OnceLock<bool> = OnceLock::new();
-    *FAST.get_or_init(|| match std::env::var_os("WARCHEST_GPU_GEMM") {
-        Some(mode) if mode == "fast" => true,
-        Some(mode) if mode == "precise" => false,
-        Some(mode) => panic!("WARCHEST_GPU_GEMM is fast or precise, not {mode:?}"),
-        None => !cfg!(test),
-    })
-}
-
 #[allow(clippy::too_many_arguments)]
 fn gemm(
-    blas: &CudaBlas,
+    blas: &Blas,
     m: usize,
     n: usize,
     k: usize,
@@ -2076,7 +2093,7 @@ fn gemm(
         return Ok(());
     }
     let alpha = 1.0f32;
-    let fast = fast_gemm();
+    let fast = blas.fast;
     static LOG_MODE: Once = Once::new();
     LOG_MODE.call_once(|| {
         eprintln!("v5 GEMM compute={}", if fast { "fast-f16" } else { "fp32" });
@@ -2087,7 +2104,7 @@ fn gemm(
         use cudarc::cublas::sys::cudaDataType_t::CUDA_R_32F;
         unsafe {
             cudarc::cublas::result::gemm_ex(
-                *blas.handle(),
+                *blas.handle.handle(),
                 CUBLAS_OP_N,
                 CUBLAS_OP_N,
                 n as i32,
@@ -2111,7 +2128,7 @@ fn gemm(
     } else {
         unsafe {
             cudarc::cublas::result::sgemm(
-                *blas.handle(),
+                *blas.handle.handle(),
                 CUBLAS_OP_N,
                 CUBLAS_OP_N,
                 n as i32,
