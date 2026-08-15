@@ -454,8 +454,7 @@ def main():
             raise ValueError(
                 f"initial shape {initial.dims} does not match requested shape {value.dims}")
         value.load_state_dict(initial.state_dict())
-        if args.warm_minutes > 0:
-            value.zero_private()
+        args.warm_minutes = 0.0
     opt = torch.optim.Adam(value.parameters(), lr=args.lr)
     lr_decays = sorted(float(x) for x in args.lr_decay_frac.split(",") if x.strip())
     next_decay = 0
@@ -831,20 +830,20 @@ def main():
             value, opt, buf, steps, args.batch, rng, dev,
             augment=False,
             recent_mix=args.recent_mix, recent_frac=args.recent_frac,
-            batch_fn=batcher, public_only=True)
+            batch_fn=batcher)
         train_s = time.time() - tt
         value.push(0)
         with torch.no_grad():
-            probe_std = float(value(*probe[:5], probe[6], public_only=True).std()) \
+            probe_std = float(value(*probe[:5], probe[6]).std()) \
                 if probe is not None else float("nan")
             if len(buf) >= args.batch:
                 old_parts = batcher(
                     buf.sample_old(args.batch, rng, args.recent_frac), rng, dev, False)
-                loss_old = float(value_loss(value, *old_parts, public_only=True))
+                loss_old = float(value_loss(value, *old_parts))
                 new_parts = batcher(
                     buf.sample(args.batch, rng, recent_mix=1.0,
                                recent_frac=args.recent_frac), rng, dev, False)
-                loss_new = float(value_loss(value, *new_parts, public_only=True))
+                loss_new = float(value_loss(value, *new_parts))
             else:
                 loss_old = loss_new = float("nan")
         dec = max(d["decisions"], 1)

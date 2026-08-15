@@ -1,0 +1,4 @@
+[train] runs/perf_v4_baseline at d47dc82+dirty seed=11 {'minutes': 2.0, 'warm_minutes': 0.0, 'snapshot_every': 0.0, 'ladder_games': 0, 'train_gen_ratio': 0.0, 'init_weights': 'runs/value_v4_clean30/snap_06.pt', 'seed': 11, 'note': 'production-generation-throughput-baseline'}
+[train] production-generation-throughput-baseline
+[cpu] pinned to 36 physical cores
+train_gen_ratio must be positive

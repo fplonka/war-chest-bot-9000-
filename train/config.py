@@ -22,7 +22,7 @@ class Cfg:
     cap: int = 2_000_000
     cfgs_per_row: int = 48
     depth: int = 2
-    iters: int = 64
+    iters: int = 32
     cfr: str = "linear"
     explore: float = 0.25
     temp: float = 2.0
