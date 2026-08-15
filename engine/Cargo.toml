@@ -15,6 +15,7 @@ pyo3 = { version = "0.21", features = ["abi3-py39", "extension-module"], optiona
 numpy = { version = "0.21", optional = true }
 rayon = "1.10"
 matrixmultiply = "0.3"
+parking_lot = "0.12"
 cudarc = { version = "0.17", optional = true, default-features = false, features = ["cuda-version-from-build-system", "dynamic-loading", "driver", "nvrtc", "cublas"] }
 
 [features]

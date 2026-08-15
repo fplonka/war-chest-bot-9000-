@@ -385,6 +385,7 @@ dependencies = [
  "cudarc",
  "matrixmultiply",
  "numpy",
+ "parking_lot",
  "pyo3",
  "rayon",
 ]

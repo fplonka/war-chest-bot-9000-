@@ -36,3 +36,11 @@ The optimizer ratio returns to 4. The legacy successful run used 4, while 12 tra
 The corrected full-network run, `value_v4_fullwarm30`, completed 30 minutes and generated `652,807` solves. In a 600-game direct match its final checkpoint beat Greedy `591-4-5`. The legacy `odd` final, evaluated with its own stable pre-refactor engine under the same seed and search settings, beat Greedy `567-3-30`. This anchor does not show an architecture regression.
 
 Checkpoint-to-checkpoint results are strongly non-transitive. `value_v4_fullwarm30.final` tied its post-warm checkpoint `294-296-10`; `odd.final` also tied or slightly lost to `odd.init` (`262-274-64`) even though their Greedy results differed sharply. Elo chains and one opponent can therefore diagnose gross failure, but not rank close policies. The refactored readout is not the current blocker: deterministic full-network warm-up already produces a strong policy, and later self-play changes behavior without a stable matched-policy gain.
+
+The direct cross-engine ladder removes the Greedy anchor. The current final beat
+`odd.final` 349-218-33 over 600 games (score `0.6092`, `+77.1` Elo). The
+colour-swapped pair test was 116-48-136 (`p=1.12e-7`, two-sided), and each of
+three independent 200-game shards favored the current checkpoint. This rules
+out an architecture regression in the trained stack. It does not isolate
+architecture from training trajectory; that would require matched-data
+training runs for both readouts.

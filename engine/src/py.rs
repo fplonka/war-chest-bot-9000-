@@ -502,11 +502,11 @@ use std::sync::{OnceLock, RwLock};
 /// the trainer's publications to it. Without the `gpu` feature every call
 /// fails loudly — a misconfigured box must not silently run on the CPU.
 #[cfg(feature = "gpu")]
-static GPU_CLIENTS: OnceLock<std::sync::Mutex<Vec<crate::gpu::GpuClient>>> = OnceLock::new();
+static GPU_CLIENTS: OnceLock<parking_lot::Mutex<Vec<crate::gpu::GpuClient>>> = OnceLock::new();
 
 #[cfg(feature = "gpu")]
-pub(crate) fn gpu_clients() -> &'static std::sync::Mutex<Vec<crate::gpu::GpuClient>> {
-    GPU_CLIENTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+pub(crate) fn gpu_clients() -> &'static parking_lot::Mutex<Vec<crate::gpu::GpuClient>> {
+    GPU_CLIENTS.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
 }
 
 /// Python-side handle for the continuous Rust actor/build/GPU pipeline. `next`
@@ -608,7 +608,7 @@ fn gpu_stream_start(
         mc_mix: 0.0,
     };
     let nets = nets().read().unwrap().clone();
-    let clients = gpu_clients().lock().unwrap().clone();
+    let clients = gpu_clients().lock().clone();
     if clients.is_empty() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "gpu service not started (gpu_start was not called)",
@@ -672,7 +672,7 @@ fn gpu_start(
                     .map_err(pyo3::exceptions::PyRuntimeError::new_err)?,
             );
         }
-        *gpu_clients().lock().unwrap() = clients;
+        *gpu_clients().lock() = clients;
         Ok(())
     })
 }
@@ -688,7 +688,7 @@ fn gpu_set_weights(
     ln: PyReadonlyArray1<f32>,
     device: usize,
 ) -> PyResult<()> {
-    let clients = gpu_clients().lock().unwrap();
+    let clients = gpu_clients().lock();
     let c = clients.get(device).ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(
             "gpu service not started (gpu_start was not called)",
@@ -706,7 +706,7 @@ fn gpu_set_weights(
 #[cfg(feature = "gpu")]
 #[pyfunction]
 fn gpu_stop(_py: Python<'_>) -> PyResult<()> {
-    gpu_clients().lock().unwrap().clear();
+    gpu_clients().lock().clear();
     Ok(())
 }
 
@@ -923,7 +923,7 @@ fn eval_match(
     if gpu {
         return Ok(py.allow_threads(|| {
             let n = nets().read().unwrap();
-            let clients = gpu_clients().lock().unwrap().clone();
+            let clients = gpu_clients().lock().clone();
             crate::selfplay::eval_match_gpu(games, seed, &n, aa, bb, random_draft, &clients)
         }));
     }
