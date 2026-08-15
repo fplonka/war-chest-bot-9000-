@@ -148,6 +148,25 @@ whether the bootstrap can get there.
 
 ## Architecture comparison
 
+Against the `traverser` final -- the last checkpoint of the pre-refactor
+parameterised architecture, run on its own engine revision through the
+cross-engine relay at matched search (depth 2, 64 iterations, colour-swapped
+pairs, every state cross-checked between the two engines):
+
+| new checkpoint | W-L-D | score | Elo | paired | paired p |
+|---|---:|---:|---:|---:|---:|
+| `value_v4_depth1_precise30.final` | `178-17-5` | `0.9025` | `+386.6` | `84-3-13` | `1.4e-21` |
+| `value_v4_d2i64dcfr_final.final` | `177-18-5` | `0.8975` | `+376.9` | `82-0-18` | `4.1e-25` |
+
+The first row is the fair comparison: both sides are thirty minutes from scratch
+on their own revision. The second starts from the first, so it measures the deep
+run's checkpoint, not thirty minutes of deep training from nothing -- and it is
+slightly *behind* its own initialisation, which the run's own ladder also shows
+(init `544`, six minutes `407`, thirty minutes `499`). Training on depth-two
+targets moves the network off the depth-one optimum and `828k` solves is not
+enough to get back.
+
+
 The corrected full-network run, `value_v4_fullwarm30`, completed 30 minutes and generated `652,807` solves. In a 600-game direct match its final checkpoint beat Greedy `591-4-5`. The legacy `odd` final, evaluated with its own stable pre-refactor engine under the same seed and search settings, beat Greedy `567-3-30`. This anchor does not show an architecture regression.
 
 Checkpoint-to-checkpoint results are strongly non-transitive. `value_v4_fullwarm30.final` tied its post-warm checkpoint `294-296-10`; `odd.final` also tied or slightly lost to `odd.init` (`262-274-64`) even though their Greedy results differed sharply. Elo chains and one opponent can therefore diagnose gross failure, but not rank close policies. The refactored readout is not the current blocker: deterministic full-network warm-up already produces a strong policy, and later self-play changes behavior without a stable matched-policy gain.
