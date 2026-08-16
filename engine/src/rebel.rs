@@ -54,9 +54,7 @@
 
 use crate::actions::Action;
 use crate::board::{board, NONE, N_HEXES};
-use crate::state::{
-    Cont, State, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP, Z_HAND, Z_INFLIGHT, Z_SUPPLY,
-};
+use crate::state::{State, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP, Z_HAND, Z_INFLIGHT, Z_SUPPLY};
 use crate::units::{write_card_features, CARD_FEATS, N_UNITS};
 
 /// Distinct coin types a player can own: 4 drafted units + the Royal Coin.
@@ -884,8 +882,6 @@ pub fn obs_key(a: &Action) -> u32 {
 /// divisor for those features rather than an estimate.
 pub const MAX_COINS: f32 = 4.0 * 5.0 + 1.0;
 
-pub const PEND_KINDS: usize = 12;
-
 /// The coin types in play: each player's `NSLOT` slots, player-major, so type
 /// `p * NSLOT + k` is player `p`'s slot `k`. Everywhere the encoding refers to a
 /// card — on a hex, in a pile, in a holding, paying for an action — it refers to
@@ -918,10 +914,6 @@ pub const PILE_COUNTS: usize = 4;
 pub const PLAYER_SCALARS: usize = 6;
 /// Shared: plies remaining, initiative moved, the player to act.
 pub const GLOBAL_SCALARS: usize = 3;
-/// Slot one-hot for the coin a Footman-V2 instant deploy is holding. Public:
-/// a Recruit reveals which unit was taken. Kept for the frozen `v1` encoder;
-/// the current encoding never sees continuation state.
-pub const PEND_SLOT: usize = NSLOT;
 
 pub const OFF_PILES: usize = HEX_BLOCK;
 /// The rulebook facts of each coin type in play — the card describer's input.
@@ -976,8 +968,8 @@ pub const ROW_BYTES: usize = ROW_PLIES + 2;
 // A solve can have hundreds of thousands of network rows. Uploading the
 // expanded `PUBFEAT` f32 vector for every one repeats one-hots, card facts and
 // normalised byte counts, so the GPU contract keeps only the public small
-// integers and expands them while assembling the trunk input. Card ids are
-// solve-wide (`PackedTables::ids`) and therefore do not appear per row.
+// integers and expands them while assembling the trunk input. The printed card
+// facts are solve-wide (`PackedTables::card_feat`) and never appear per row.
 pub const GPU_ROW_HEX_OWNER: usize = 0;
 pub const GPU_ROW_HEX_SLOT: usize = GPU_ROW_HEX_OWNER + N_HEXES;
 pub const GPU_ROW_HEX_HEIGHT: usize = GPU_ROW_HEX_SLOT + N_HEXES;
@@ -1041,8 +1033,8 @@ pub fn rules_table_hash() -> u64 {
 /// that contained it would hold whichever weights were live when the row was
 /// written, go stale as training moved them, and pass no gradient back to the
 /// describer. So the row keeps raw facts and one-hots, and the network does the
-/// lookup itself — `Mlp::trunk` turns the per-hex type one-hots into
-/// `[N_HEXES, de]` with one matmul against the card table.
+/// lookup itself — `Net::cards` builds the coin-type tokens once and
+/// `Net::board` gathers them onto the hexes the one-hots name.
 pub const PUBFEAT: usize = OFF_LOOSE + LOOSE;
 
 /// Round divisor. Measured on the starter draft (`examples/featstats.rs`):
@@ -1051,23 +1043,6 @@ pub const PUBFEAT: usize = OFF_LOOSE + LOOSE;
 /// The previous divisor of 40 left this feature pinned at 1.0 for most of
 /// essentially every game.
 pub const MAX_ROUND: f32 = 128.0;
-
-pub fn pending_kind(s: &State) -> usize {
-    match s.pending() {
-        Cont::Draw { .. } => 0,
-        Cont::MainPlay => 1,
-        Cont::RoyalGuardChoice { .. } => 2,
-        Cont::SwordsmanMove { .. } => 3,
-        Cont::BerserkerChain { .. } => 4,
-        Cont::FootmanManeuver { .. } => 5,
-        Cont::CavalryAttack { .. } => 6,
-        Cont::MercenaryManeuver { .. } => 7,
-        Cont::FootmanInstantDeploy { .. } => 8,
-        Cont::WarriorPriestDraw { .. } => 9,
-        Cont::WarriorPriestPlay { .. } => 10,
-        Cont::_AttackPost { .. } => 11,
-    }
-}
 
 /// Belief weights, normalised the way the network consumes them. `w` is the
 /// caller's *unnormalised* reach; normalisation matches `Belief::normalize`,

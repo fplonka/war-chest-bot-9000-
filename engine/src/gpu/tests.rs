@@ -2,7 +2,7 @@
 //! production GEMMs may down-convert internally for tensor-core throughput.
 //! These compile everywhere and execute only on a CUDA test host.
 
-use crate::net::{Mlp, V4Layout};
+use crate::net::{Net, V5Layout};
 use crate::rng::Rng;
 use crate::search::{Cfg, Cfr, Nets, Solver};
 use crate::selfplay::{collect_roots, Agent, Collect, GameCfg};
@@ -32,23 +32,24 @@ fn gpu_guard() -> MutexGuard<'static, ()> {
 }
 
 fn test_weights() -> (Vec<usize>, Vec<f32>, Vec<f32>, Vec<f32>) {
-    let dims = vec![4];
-    let l = V4Layout::new(&dims).expect("dims");
+    let dims = crate::net::MODEL_TAG.to_vec();
+    let l = V5Layout::new(&dims).expect("dims");
     let mut rng = Rng::new(0xD15EA5E);
     let w: Vec<f32> = (0..l.w_len)
         .map(|_| (rng.next_u64() as f32 / u64::MAX as f32 - 0.5) * 0.1)
         .collect();
     let b = vec![0.0; l.b_len];
     let mut ln = vec![0.0; l.ln_len];
-    for ((gain, _), width) in l.norms.iter().zip([384usize, 384, 384, 128, 128, 384, 384]) {
-        ln[*gain..*gain + width].fill(1.0);
+    // A norm's `(gamma, beta)` offsets are adjacent, so their gap is its width.
+    for &(gain, shift) in &l.norms {
+        ln[gain..shift].fill(1.0);
     }
     (dims, w, b, ln)
 }
 
 fn nets(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Nets {
     Nets {
-        value: Mlp::from_flat(dims, w, b, ln).expect("test weights"),
+        value: Net::from_flat(dims, w, b, ln).expect("test weights"),
     }
 }
 

@@ -29,7 +29,7 @@ the box.
 The current WIP starts a solve service on both cards and runs PyTorch on GPU 1:
 
 ```bash
-python train/train.py --gpu --gpu-devices 0,1 --device cuda:1 ...
+python train/train.py gpu_devices=0,1 device=cuda:1 ...
 ```
 
 ## Exact target
@@ -41,8 +41,8 @@ The timed ReBeL phase uses:
 - 64 linear-CFR iterations;
 - real, changing production-network weights;
 - optimizer batch size 1,024 and four optimizer samples per fresh solve;
-- unchanged replay rows, targets, mirror augmentation, snapshot iterations,
-  200,000-node safety cap, and horizon-payoff schedule.
+- unchanged replay rows, targets, both canonical seat views of every row,
+  snapshot iterations, 200,000-node safety cap, and horizon-payoff schedule.
 
 An actual solve is one freshly completed subgame represented by a `Data.soff`
 entry. It is not a game decision and it is not each of the roughly eight
@@ -73,8 +73,8 @@ whatever arithmetic the hardware is fastest at: FP16 or BF16 inputs, TF32,
 tensor cores, fused multiply-add, `--use_fast_math`, a reassociated reduction, a
 different GEMM tile for a different batch shape. The production path already
 runs FP16-input GEMMs with FP32 accumulation and NVRTC fast math, and the
-readout's rank-64 dot changed summation order when it was rewritten one config
-per lane.
+readout's `D`-wide dot product changed summation order when it was rewritten
+one config per lane.
 
 What *is* required is that the answers stay right, which is a different claim
 and is established a different way:
@@ -102,27 +102,30 @@ measurable end-to-end throughput, revert it for that reason alone, as the two
 TF32 experiments were.
 
 Unless an explicit algorithm experiment says otherwise, the golden run is
-seed 1 with the ordinary network and optimizer settings:
+seed 1 with the ordinary network and optimizer settings. Knobs are `key=value`
+fields of `train/config.py::Cfg`; the network has no shape knobs left, since v5
+is one fixed architecture:
 
 ```bash
-python train/train.py --minutes 30 --warm-minutes 5 --warm-games 96 \
-  --random-draft \
-  --depth 2 --iters 64 --cfr linear --warm 0 \
-  --hidden 384 --head 0 --dg 64 --rank 64 --de 32 --nres 1 \
-  --batch 1024 --train-gen-ratio 4 --lr 0.001 \
-  --lr-decay-frac 0.33,0.67 \
-  --recent-mix 0.5 --recent-frac 0.2 --policy 0 --aux 0 --mc-mix 0 \
-  --explore 0.25 --temp 2 --eval-mix 0.5 \
-  --cap-value 0.04 --anneal-frac 0.4 --snapshot-every 6 \
-  --cap 2000000 --cfgs-per-row 48 \
-  --gpu --gpu-devices 0,1 --device cuda:1 --seed 1 \
-  --ladder-games 0 --out runs/gpu_golden
+python train/train.py out=gpu_golden minutes=30 warm_minutes=5 warm_games=96 \
+  random_draft=1 depth=2 iters=64 cfr=linear \
+  batch=1024 train_gen_ratio=4 lr=0.001 lr_decay_frac=0.33,0.67 \
+  recent_mix=0.5 recent_frac=0.2 aux_weight=0.15 \
+  explore=0.25 temp=2 eval_mix=1.0 \
+  cap_value=0.04 anneal_frac=0.4 snapshot_every=6 \
+  cap=2000000 cfgs_per_row=48 \
+  gpu_devices=0,1 device=cuda:1 seed=1 ladder_games=0
 ```
+
+Every throughput number on this page was measured before the v5 network, on
+runs that used `cfr=linear`, `eval_mix=0.5` and the old 384-wide value stack.
+The scheduling workload is the same; the network is not, and nothing here has
+been re-measured. `cfr=dcfr` is now the default.
 
 Generation concurrency and wave sizes are implementation parameters, not part
 of the algorithmic workload. The solve-rate clock covers the ReBeL interval
 after the five-minute warm start; the whole process still has the stated
-30-minute wall-clock budget. In this command `--cap 2000000` is the replay-row
+30-minute wall-clock budget. In this command `cap=2000000` is the replay-row
 capacity; the separate solver safety cap remains 200,000 tree nodes.
 
 ## The old cap claim was wrong
@@ -209,7 +212,7 @@ monotone in training time, with the final checkpoint beating Greedy 30-0.
 
 Nothing about the workload moved: random drafts, depth 2, 64 linear-CFR
 iterations, batch 1,024 at a four-to-one ratio, the same replay rows, targets,
-mirror augmentation, snapshot schedule and horizon-payoff schedule. What changed
+mirror canonicalisation, snapshot schedule and horizon-payoff schedule. What changed
 is where the work runs and what it costs; `runs/gpu_golden8/NOTES.md` has the
 order it was found in, which matters more than the sizes.
 
@@ -245,12 +248,11 @@ anyway. It only pays once both are fixed.
 ## Showing that it trained
 
 Throughput is only half the goal: a run that generates fast and learns nothing
-has not helped. The golden command carries `--ladder-games 0`, so the strength
+has not helped. The golden command carries `ladder_games=0`, so the strength
 check is a separate step over the snapshots the run saved:
 
 ```bash
-python train/ladder.py runs/gpu_golden8 --games 30 --random-draft --gpu \
-  --refs greedy,random
+python train/ladder.py runs/gpu_golden8 --games 30 --gpu
 ```
 
 That is a round robin between every snapshot, Greedy and Random, fitted to one
@@ -280,7 +282,7 @@ and memory work.
 
 **`tools/v5_steady.sh`** — nine minutes of real `train.py` with the real
 trainer, but no Greedy warm-up, initialised from a late checkpoint, and
-`--cap-value 0`, so the expensive workload is present from about ninety seconds
+`cap_value=0`, so the expensive workload is present from about ninety seconds
 in instead of after ten minutes. This is the one that predicts a golden run.
 Repeats agree within about 2% at equal cumulative solves. Its own ladder:
 

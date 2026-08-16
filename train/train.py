@@ -22,7 +22,9 @@ weights down and pulls tensors back once per epoch.
 A training row is a public state plus, for each player, the whole belief: the
 exact configs in support, their probabilities, and the value the solve gave
 each. The config lists are ragged, so they live in a flat arena and a batch is
-assembled by gathering spans -- see `Buffer`.
+assembled by gathering spans -- see `Buffer`. Each row also carries who owned
+each of the ten locations when its game ended, backfilled by the engine: the
+auxiliary target, which shapes the trunk and costs nothing at inference.
 
 The run snapshots every `snapshot_every` minutes of ReBeL. When training
 ends, the snapshots play Greedy (random drafts) and a report is written.
@@ -52,15 +54,14 @@ import warchest
 import config
 import mirror
 from export_weights import load as load_checkpoint
-from value_net import Mlp
+from value_net import AUX, Net
 
 PUBFEAT = warchest.PUBFEAT
 CFEAT = warchest.CFEAT
 CCOUNTS = warchest.CCOUNTS
 CNORM = warchest.CNORM
-NTYPE = warchest.NTYPE
+N_LOCATIONS = warchest.N_LOCATIONS
 ROW_BYTES = warchest.ROW_BYTES
-ROW_IDS = warchest.ROW_IDS
 
 
 def public_sizes(cc, cp, seg, n):
@@ -99,7 +100,8 @@ class Buffer:
     ~223 bytes instead of the ~1.9 KB the old float encoding cost -- and the
     network input is expanded from it when a batch is made. Counts are stored
     as the `uint8` they are and everything else as float16, which is what makes
-    the cap affordable: a row costs `ROW_BYTES` bytes plus 20 per config.
+    the cap affordable: a row costs `ROW_BYTES` bytes plus one per location for
+    the auxiliary target, plus 20 per config.
 
     Preallocated and written with wraparound rather than grown by
     concatenation. The concatenate form rebuilt the whole buffer every epoch:
@@ -115,6 +117,9 @@ class Buffer:
     def __init__(self, cap, ccap):
         self.cap, self.ccap = cap, ccap
         self.x = np.zeros((cap, ROW_BYTES), np.uint8)
+        # Who owned each location when the row's game ended: the auxiliary
+        # target, backfilled by the engine and one byte per location.
+        self.aux = np.zeros((cap, N_LOCATIONS), np.uint8)
         self.soff = np.zeros(0, np.int64)
         self.cstart = np.zeros(cap, np.int64)   # absolute arena offset
         self.clen = np.zeros((cap, 2), np.int32)
@@ -128,7 +133,7 @@ class Buffer:
         self.cfgs = 0   # configs ever written
         self.lo = 0     # oldest row whose configs are still in the arena
 
-    def add(self, x, cc, cw, cy, coff, soff):
+    def add(self, x, aux, cc, cw, cy, coff, soff):
         n = len(x)
         lens = np.diff(coff).reshape(n, 2)
         cp = np.repeat(np.tile([0, 1], n).astype(np.uint8), lens.ravel())
@@ -138,6 +143,7 @@ class Buffer:
             j = min(i + 4096, n)
             sl = np.arange(i, j) + base
             self.x[sl % self.cap] = x[i:j]
+            self.aux[sl % self.cap] = aux[i:j]
             self.cstart[sl % self.cap] = starts[i:j]
             self.clen[sl % self.cap] = lens[i:j]
         m = len(cw)
@@ -177,8 +183,7 @@ class Buffer:
     def gather(self, ids):
         """Assemble a batch from absolute row ids.
 
-        Returns `(rows, cc, cp, cw, cy, seg)`; the unit ids
-        live inside the packed rows and are read out by `make_batch`.
+        Returns `(rows, aux, cc, cp, cw, cy, seg)`.
         """
         s = ids % self.cap
         lens = self.clen[s].sum(1).astype(np.int64)
@@ -189,8 +194,8 @@ class Buffer:
             np.concatenate([[0], np.cumsum(lens)[:-1]]), lens)
         at = (base + within) % self.ccap
         seg = 2 * np.repeat(np.arange(len(ids), dtype=np.int64), lens) + self.cp[at]
-        return (self.x[s], self.cc[at], self.cp[at], self.cw[at].astype(np.float32),
-                self.cy[at].astype(np.float32), seg)
+        return (self.x[s], self.aux[s], self.cc[at], self.cp[at],
+                self.cw[at].astype(np.float32), self.cy[at].astype(np.float32), seg)
 
     def sample(self, batch, rng, recent_mix=0.0, recent_frac=0.2):
         """A batch, part of it drawn from the newest rows only.
@@ -238,15 +243,20 @@ class Buffer:
         return self.gather(np.arange(self.lo, self.rows))
 
 
-def make_batch(parts, rng, device, augment):
+def make_batch(parts, rng, device):
     """Numpy replay batch -> the two canonical player queries per row."""
-    del rng, augment
-    rows, cc, cp, cw, cy, seg = parts
+    del rng
+    rows, aux, cc, cp, cw, cy, seg = parts
     n = len(rows)
     hand, fd, bag = public_sizes(cc, cp, seg, n)
     views = np.empty((2 * n, ROW_BYTES), np.uint8)
     views[0::2] = rows
     views[1::2] = mirror.mirror_rows(rows)
+    # The auxiliary target is a property of the row, so the mirrored view needs
+    # it with the locations permuted and the two owners exchanged.
+    owner = np.empty((2 * n, N_LOCATIONS), np.uint8)
+    owner[0::2] = aux
+    owner[1::2] = mirror.mirror_aux(aux)
     sizes = []
     for a in (hand, fd, bag):
         pair = np.empty((2 * n, 2), np.uint8)
@@ -254,17 +264,26 @@ def make_batch(parts, rng, device, augment):
         pair[1::2] = a[:, ::-1]
         sizes.append(pair)
     x = expand_batch(views, *sizes)
-    unit_ids = views[:, ROW_IDS:ROW_IDS + NTYPE]
     phi = cc.astype(np.float32) / CNORM
     t = lambda a, d=torch.float32: torch.as_tensor(a, dtype=d, device=device)
-    return (t(x), t(unit_ids, torch.long), t(phi), t(cw), t(seg, torch.long),
-            t(cy), 2 * n)
+    return (t(x), t(phi), t(cw), t(seg, torch.long), t(cy),
+            t(owner, torch.long), 2 * n)
 
 
-def value_loss(net, xpub, unit_ids, phi, w, seg, y, nseg, stats=None,
-               public_only=False):
-    """Mean Huber per support, then mean across canonical queries."""
-    v = net(xpub, unit_ids, phi, w, seg, nseg, public_only=public_only)
+def forward_values(net, parts):
+    """Just the values, for the diagnostics that do not want the aux head."""
+    return net(*parts[:4], parts[-1])[0]
+
+
+def losses(net, xpub, phi, w, seg, y, aux, nseg, stats=None):
+    """Value Huber (mean per belief support, then across canonical queries),
+    the auxiliary ownership cross-entropy, and that head's accuracy.
+
+    The three are returned apart rather than summed: the value figure has to
+    stay comparable across runs that weight the auxiliary head differently,
+    and the aux pair is what says whether the trunk learned anything from it.
+    """
+    v, logits = net(xpub, phi, w, seg, nseg)
     if stats is not None:
         expected = torch.zeros(nseg, dtype=v.dtype, device=v.device)
         expected.index_add_(0, seg, v.detach() * w)
@@ -275,17 +294,36 @@ def value_loss(net, xpub, unit_ids, phi, w, seg, y, nseg, stats=None,
     count = torch.zeros(nseg, dtype=per.dtype, device=per.device)
     total.index_add_(0, seg, per)
     count.index_add_(0, seg, torch.ones_like(per))
-    return (total / count.clamp(min=1)).mean()
+    flat, want = logits.reshape(-1, AUX), aux.reshape(-1)
+    ce = F.cross_entropy(flat, want)
+    acc = (flat.detach().argmax(1) == want).to(v.dtype).mean()
+    return (total / count.clamp(min=1)).mean(), ce, acc
 
 
-def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
+@torch.no_grad()
+def diagnostics(net, buf, probe, batch, rng, device, batch_fn, recent_frac):
+    """The spread of predictions on a fixed probe batch, and the value loss on
+    stale rows against the freshest slice — the gap between the two is how far
+    the bootstrapped targets have drifted under the network."""
+    nan = float("nan")
+    spread = float(forward_values(net, probe).std()) if probe is not None else nan
+    if len(buf) < batch:
+        return spread, nan, nan
+    old = batch_fn(buf.sample_old(batch, rng, recent_frac), rng, device)
+    new = batch_fn(buf.sample(batch, rng, recent_mix=1.0, recent_frac=recent_frac),
+                   rng, device)
+    return spread, float(losses(net, *old)[0]), float(losses(net, *new)[0])
+
+
+def train_steps(net, opt, buf, steps, batch, rng, device, aux_weight,
                 recent_mix=0.0, recent_frac=0.2, profile_cuda=False,
-                batch_fn=make_batch, public_only=False):
-    """Mean value loss over `steps` Adam updates."""
+                batch_fn=make_batch):
+    """Mean *value* loss over `steps` Adam updates; the auxiliary head's loss
+    and accuracy come back in `stat`, summed over the steps."""
     stat = {"sample_s": 0.0, "prepare_s": 0.0, "forward_wall_s": 0.0,
             "backward_wall_s": 0.0, "batch_configs": 0, "steps": steps,
             "gpu_forward_s": 0.0, "gpu_backward_s": 0.0,
-            "zero_sum_max": 0.0}
+            "zero_sum_max": 0.0, "aux_loss": 0.0, "aux_acc": 0.0}
     if len(buf) < batch:
         return float("nan"), stat
     tot = 0.0
@@ -295,9 +333,9 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
         ts = time.perf_counter()
         sampled = buf.sample(batch, rng, recent_mix, recent_frac)
         stat["sample_s"] += time.perf_counter() - ts
-        stat["batch_configs"] += len(sampled[1])
+        stat["batch_configs"] += len(sampled[-1])
         ts = time.perf_counter()
-        parts = batch_fn(sampled, rng, device, augment)
+        parts = batch_fn(sampled, rng, device)
         stat["prepare_s"] += time.perf_counter() - ts
         if stream is not None:
             f0 = torch.cuda.Event(enable_timing=True)
@@ -305,8 +343,11 @@ def train_steps(net, opt, buf, steps, batch, rng, device, augment=True,
             b1 = torch.cuda.Event(enable_timing=True)
             f0.record(stream)
         ts = time.perf_counter()
-        loss = value_loss(net, *parts, stats=stat, public_only=public_only)
-        tot += loss.detach().item()
+        value, ce, acc = losses(net, *parts, stats=stat)
+        loss = value + aux_weight * ce
+        tot += value.detach().item()
+        stat["aux_loss"] += ce.detach().item()
+        stat["aux_acc"] += acc.item()
         stat["forward_wall_s"] += time.perf_counter() - ts
         if stream is not None:
             f1.record(stream)
@@ -383,8 +424,9 @@ def refuse_if_machine_busy():
 def write_log(args, epochs, snaps):
     """The run's whole record: settings, per-epoch stats, snapshot manifest.
 
-    One file, rewritten in place, so `report.py` and `ladder.py` have a single
-    thing to read and a run that is still going is readable at any moment.
+    One file, rewritten in place, so `ladder.py` and `tools/monitor.py` have a
+    single thing to read and a run that is still going is readable at any
+    moment.
     """
     path = f"{args.out}/log.json"
     tmp = path + ".tmp"
@@ -447,7 +489,7 @@ def main():
         torch.cuda.set_stream(train_stream)
         print(f"[train] CUDA stream priority {args.train_stream_priority}", flush=True)
 
-    value = Mlp().to(dev)
+    value = Net().to(dev)
     if args.init_weights:
         initial = load_checkpoint(args.init_weights)
         if list(initial.dims) != list(value.dims):
@@ -519,7 +561,7 @@ def main():
             snaps[-1]["label"] = label
             return
         path = f"{args.out}/snap_{len(snaps):02d}.pt"
-        torch.save({"value": value.state_dict(), "spec": value.spec(), "t": round(el, 1),
+        torch.save({"value": value.state_dict(), "dims": value.dims, "t": round(el, 1),
                     "label": label, "git": args.git,
                     "search": {"depth": args.depth, "iters": args.iters,
                                "cfr": args.cfr}}, path)
@@ -565,7 +607,7 @@ def main():
                       prepare_s=0.0, forward_wall_s=0.0,
                       backward_wall_s=0.0, gpu_forward_s=0.0,
                       gpu_backward_s=0.0, batch_configs=0,
-                      zero_sum_max=0.0)
+                      zero_sum_max=0.0, aux_loss=0.0, aux_acc=0.0)
 
         def emit_report(now):
             nonlocal probe, epoch
@@ -575,32 +617,24 @@ def main():
             raw_sps = rebel_solves / elapsed
             balanced_sps = min(rebel_solves, credit) / elapsed
             if probe is None and len(buf) >= 2048:
-                probe = batcher(buf.sample(2048, rng), rng, dev, False)
-            with torch.no_grad():
-                probe_std = float(value(*probe[:5], probe[6]).std()) \
-                    if probe is not None else float("nan")
-                if len(buf) >= args.batch:
-                    old_parts = batcher(
-                        buf.sample_old(args.batch, rng, args.recent_frac), rng, dev, False)
-                    loss_old = float(value_loss(value, *old_parts))
-                    new_parts = batcher(
-                        buf.sample(args.batch, rng, recent_mix=1.0,
-                                   recent_frac=args.recent_frac), rng, dev, False)
-                    loss_new = float(value_loss(value, *new_parts))
-                else:
-                    loss_old = loss_new = float("nan")
+                probe = batcher(buf.sample(2048, rng), rng, dev)
+            probe_std, loss_old, loss_new = diagnostics(
+                value, buf, probe, args.batch, rng, dev, batcher, args.recent_frac)
             tn = max(window["target_n"], 1)
             tgt_mean = window["target_sum"] / tn
             tgt_var = max(0.0, window["target_sq"] / tn - tgt_mean * tgt_mean)
             dec = max(window["decisions"], 1)
             games = max(window["games"], 1)
             lv = window["loss_sum"] / max(window["train_steps"], 1)
+            steps_done = max(window["train_steps"], 1)
             rec = {
                 "t": round(now - t0, 1), "epoch": epoch, "phase": "rebel",
                 "games": window["games"], "decisions": window["decisions"],
                 "rows": window["rows"], "solves": window["solves"],
                 "loss": round(lv, 5),
                 "loss_old": round(loss_old, 5), "loss_new": round(loss_new, 5),
+                "aux_loss": round(window["aux_loss"] / steps_done, 5),
+                "aux_acc": round(window["aux_acc"] / steps_done, 4),
                 "zero_sum_max": round(window["zero_sum_max"], 5),
                 "horizon_frac": round(window["horizon_hits"] / games, 3),
                 "node_caps": window["node_caps"],
@@ -656,6 +690,7 @@ def main():
                 f"drop={totals['dropped']} "
                 f"L={lv:.5f} L/var={lv / max(tgt_var, 1e-9):.2f} "
                 f"tgt={tgt_mean:+.3f}/{tgt_var ** 0.5:.3f} "
+                f"aux={rec['aux_loss']:.4f}/{rec['aux_acc']:.3f} "
                 f"cfg/b={rec['batch_configs']:.0f} prep={window['prepare_s']:.2f}s "
                 f"gpu={window['gpu_forward_s'] + window['gpu_backward_s']:.2f}s "
                 f"conv={window['conv_s']:.2f}s add={window['add_s']:.2f}s "
@@ -668,7 +703,8 @@ def main():
                          "conv_s", "add_s", "train_s", "gpu_wait_s",
                          "loss_sum", "train_steps", "sample_s", "prepare_s",
                          "forward_wall_s", "backward_wall_s", "gpu_forward_s",
-                         "gpu_backward_s", "batch_configs", "zero_sum_max"):
+                         "gpu_backward_s", "batch_configs", "zero_sum_max",
+                         "aux_loss", "aux_acc"):
                 window[name] = 0
 
         try:
@@ -690,6 +726,7 @@ def main():
                 if data is not None:
                     tc = time.time()
                     rows = np.asarray(data["rows"], np.uint8).reshape(-1, ROW_BYTES)
+                    aux = np.asarray(data["aux"], np.uint8).reshape(-1, N_LOCATIONS)
                     cc = np.asarray(data["cc"], np.uint8).reshape(-1, CCOUNTS)
                     cw = np.asarray(data["cw"], np.float32)
                     cy = np.clip(np.asarray(data["cy"], np.float32), -1.0, 1.0)
@@ -699,7 +736,8 @@ def main():
                     window["conv_s"] += time.time() - tc
                     ta = time.time()
                     if len(rows) > 0:
-                        buf.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
+                        buf.add(rows, aux, cc, cw.astype(np.float16),
+                                cy.astype(np.float16), coff, soff)
                     window["add_s"] += time.time() - ta
                     rebel_solves += solves
                     window["solves"] += solves
@@ -720,7 +758,7 @@ def main():
                     tt = time.time()
                     lv, train_stat = train_steps(
                         value, opt, buf, nsteps, args.batch, rng, dev,
-                        augment=False,
+                        args.aux_weight,
                         recent_mix=args.recent_mix, recent_frac=args.recent_frac,
                         profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1",
                         batch_fn=batcher)
@@ -729,7 +767,7 @@ def main():
                     window["train_steps"] += nsteps
                     for name in ("sample_s", "prepare_s", "forward_wall_s",
                                  "backward_wall_s", "gpu_forward_s", "gpu_backward_s",
-                                 "batch_configs"):
+                                 "batch_configs", "aux_loss", "aux_acc"):
                         window[name] += train_stat[name]
                     window["zero_sum_max"] = max(
                         window["zero_sum_max"], train_stat["zero_sum_max"])
@@ -793,13 +831,13 @@ def main():
             flush=True)
 
     next_snap = float("inf")
-    print(f"[cfg] PUBFEAT={PUBFEAT} CFEAT={CFEAT} architecture=v4 "
+    print(f"[cfg] PUBFEAT={PUBFEAT} CFEAT={CFEAT} architecture=v5 "
           f"depth={args.depth} iters={args.iters} budget={total:.0f}s "
           f"warm={warm:.0f}s snapshot_every={args.snapshot_every:g}min "
           f"device={dev} draft={'random' if args.random_draft else 'starter'} "
           f"train_gen_ratio={args.train_gen_ratio} "
           f"recent_mix={args.recent_mix}/{args.recent_frac} "
-          f"canonical_views=2 cap={args.cap} "
+          f"canonical_views=2 cap={args.cap} aux_weight={args.aux_weight} "
           f"matmul={torch.get_float32_matmul_precision()}", flush=True)
 
     while True:
@@ -813,6 +851,7 @@ def main():
         gen_s = time.time() - tg
         tr = time.time()
         rows = np.asarray(d["rows"], np.uint8).reshape(-1, ROW_BYTES)
+        aux = np.asarray(d["aux"], np.uint8).reshape(-1, N_LOCATIONS)
         cc = np.asarray(d["cc"], np.uint8).reshape(-1, CCOUNTS)
         cw = np.asarray(d["cw"], np.float32)
         cy = np.clip(np.asarray(d["cy"], np.float32), -1.0, 1.0)
@@ -821,40 +860,30 @@ def main():
         solves = max(1, int(d["solves"]))
         conv_s = time.time() - tr
         tr = time.time()
-        buf.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
+        buf.add(rows, aux, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
         add_s = time.time() - tr
         if probe is None and len(buf) >= 2048:
-            probe = batcher(buf.sample(2048, rng), rng, dev, False)
+            probe = batcher(buf.sample(2048, rng), rng, dev)
         tgt_mean, tgt_std = float(cy.mean()), float(cy.std())
         tt = time.time()
         # One optimizer row per deterministic warm row; repeated fitting only
         # reduces the number of independent games seen before ReBeL starts.
         steps = max(1, round(solves / args.batch))
         lv, train_stat = train_steps(
-            value, opt, buf, steps, args.batch, rng, dev,
-            augment=False,
+            value, opt, buf, steps, args.batch, rng, dev, args.aux_weight,
             recent_mix=args.recent_mix, recent_frac=args.recent_frac,
             batch_fn=batcher)
         train_s = time.time() - tt
         value.push(0)
-        with torch.no_grad():
-            probe_std = float(value(*probe[:5], probe[6]).std()) \
-                if probe is not None else float("nan")
-            if len(buf) >= args.batch:
-                old_parts = batcher(
-                    buf.sample_old(args.batch, rng, args.recent_frac), rng, dev, False)
-                loss_old = float(value_loss(value, *old_parts))
-                new_parts = batcher(
-                    buf.sample(args.batch, rng, recent_mix=1.0,
-                               recent_frac=args.recent_frac), rng, dev, False)
-                loss_new = float(value_loss(value, *new_parts))
-            else:
-                loss_old = loss_new = float("nan")
+        probe_std, loss_old, loss_new = diagnostics(
+            value, buf, probe, args.batch, rng, dev, batcher, args.recent_frac)
         dec = max(d["decisions"], 1)
         rec = {"t": round(time.time() - t0, 1), "epoch": epoch, "phase": "greedy",
                "games": d["games"], "decisions": dec, "loss": round(lv, 5),
                "rows": len(rows), "solves": solves,
                "loss_old": round(loss_old, 5), "loss_new": round(loss_new, 5),
+               "aux_loss": round(train_stat["aux_loss"] / steps, 5),
+               "aux_acc": round(train_stat["aux_acc"] / steps, 4),
                "zero_sum_max": round(train_stat["zero_sum_max"], 5),
                "horizon_frac": round(d["horizon_hits"] / max(d["games"], 1), 3),
                "node_caps": int(d["node_caps"]),
@@ -883,6 +912,7 @@ def main():
               f"dec={dec:6d} rows={len(rows):6d} horizon={rec['horizon_frac']:.2f} "
               f"L={lv:.5f} L/var={lv / max(tgt_std ** 2, 1e-9):.2f} "
               f"tgt={tgt_mean:+.3f}/{tgt_std:.3f} pstd={probe_std:.3f} "
+              f"aux={rec['aux_loss']:.4f}/{rec['aux_acc']:.3f} "
               f"gen={gen_s:.1f}s train={train_s:.1f}s",
               flush=True)
         epoch += 1
@@ -904,11 +934,9 @@ def main():
 
     snapshot("final", time.time() - t0)
     write_log(args, log, snaps)
-    import ladder
-    import report
     if args.ladder_games:
+        import ladder
         ladder.run([args.out], games=args.ladder_games, gpu=True)
-    report.write([args.out])
 
 
 if __name__ == "__main__":

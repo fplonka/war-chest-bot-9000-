@@ -42,7 +42,6 @@ pull)
     # find it replaced, and exit 24 mid-run.
     rsync -az -e "ssh ${ssh_opts[*]}" --exclude '*.pt' --exclude '*.tmp' \
         "root@$host:$remote/runs/$name/" "$here/runs/$name/"
-    python3 "$here/tools/runs_index.py"
     echo "pulled $name"
     ;;
 build)

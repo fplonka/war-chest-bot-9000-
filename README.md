@@ -12,23 +12,27 @@ engine/          Rust crate, lib name `warchest`
   src/           rebel, search, selfplay, net  (the ReBeL agent)
   tests/         36 scenario tests, playout invariants, PBS correctness tests
   examples/      coords.rs (hex dump), featstats.rs (feature ranges),
-                 solvererr.rs (CFR target error vs iteration count),
-                 cfgvalue.rs (how far the value separates configs)
+                 cfgvalue.rs (how far the value separates configs),
+                 treesize.rs (subgame shape), wave_tape.rs (GPU throughput gate)
   src/bin/       bench.rs (applies/sec, playouts/sec)
 webui/           play.py + index.html: browser UI for playing a trained agent
 play.sh          one-liner: build the extension, serve the UI, open the browser
 train/           train.py    PyTorch training loop, snapshots on a timer
   value_net.py   the value network itself, shared by every tool that loads one
+  mirror.py      the board's 180-degree rotation, which is how the second
+                 canonical seat view of a row is produced
   ladder.py      round robin over a run's snapshots, plus Greedy and Random -> Elo
-  report.py      the panels a run is read from
-  offline.py     fit architectures to a frozen replay dump (noise-free A/B)
   diagnose.py    model-free check on how learnable a dump's targets are
   dump.py        reading a dumped replay buffer
-  mirror.py      the board's 180-degree symmetry, as a data augmentation
+  gpu_batch.py   replay rows -> canonical query batch, expanded on the device
+tools/           box.sh      the GPU box: sync, build, run, pull a run back
+  monitor.py     live dashboard over runs/, served from disk, no build step
 docs/
   ENGINE_FIXES.md  rule corrections found by replaying 1,112 real games
-  REBEL.md         the ReBeL agent: PBS design, CFR solver, deviations
+  REBEL.md         the ReBeL agent: PBS design, CFR solver, the value network
   PERF.md          how the generation loop got ~10x faster, and what didn't work
+  TREE.md          the CPU-to-GPU job contract
+  GPU_ARCHITECTURE.md, GPU_PERF_GOAL.md  the wave executor and its target
 ```
 
 Not in the repo: `papers/` (gitignored) is where the AEG rulebook, the ReBeL
@@ -41,20 +45,21 @@ is a commercial product, so it is not redistributed here.
 uv venv --python 3.12 .venv && VIRTUAL_ENV=.venv uv pip install torch numpy maturin
 cd engine && maturin develop --release && cd ..
 .venv/bin/python train/train.py out=mine minutes=30
-.venv/bin/python train/report.py runs/mine
+python3 tools/monitor.py       # watch it live at http://127.0.0.1:8420
 ```
 
 ## Playing against a trained agent
 
 ```bash
 ./play.sh                      # newest final checkpoint, opens the browser
-./play.sh --ckpt runs/t64_h384_dg64_s11/snap_05.pt
+./play.sh --ckpt runs/mine/snap_05.pt
 ```
 
 The default is the newest `runs/*/ckpt_final.pt`, falling back to the newest
 `runs/*/snap_*.pt` final snapshot (the long runs save `snap_XX.pt`); pass
-`--ckpt` to pick a specific checkpoint. `--depth`/`--iters` default to the
-training configuration (2/16).
+`--ckpt` to pick a specific checkpoint. `--depth`/`--iters` default to 2 and
+16, which is no longer what training uses (`train/config.py` is depth 1, 64
+iterations); pass them explicitly to play the agent at its training search.
 
 You play white with the rulebook's starter army (Swordsman, Pikeman,
 Crossbowman, Light Cavalry) against the fixed black army (Archer, Cavalry,
@@ -87,11 +92,11 @@ War Chest turns out to be an unusually good fit for ReBeL. A player's private
 state is `(hand, face-down discards, pending forced-play coin)` — the bag is
 derived from a public reserve — and the reachable set has median 22 and p99 567
 members with the full draft pool, so CFR enumerates information states exactly
-instead of approximating them with particles. The value network is a function of that exact private state, not of a
-summary of it: `docs/REBEL.md` §4 explains why the alternative is not an
-approximation but a different game.
+instead of approximating them with particles. The value network is a function of
+that exact private state, not of a summary of it: `docs/REBEL.md` §5 explains
+why the alternative is not an approximation but a different game.
 
-Thirty minutes on an 8-core M1 takes the agent from 356 Elo to 852, against 174
+Thirty minutes on an 8-core M1 took the v4 agent from 356 Elo to 852, against 174
 for the handcrafted Greedy reference and 0 for random play — and shows it
 gaining almost nothing after the first seventeen (`runs/elo01`). See
 `docs/PERF.md` for how the generation loop got fast enough for that to fit in
@@ -116,7 +121,7 @@ that way has a scenario test — see `docs/ENGINE_FIXES.md`.
 
 ```bash
 cd engine
-cargo test                          # 55 tests (the solver oracle takes ~85s)
+cargo test                          # 85 tests (the solver oracle takes ~85s)
 cargo run --release --bin bench     # engine throughput, ~2.8M applies/sec/core
 cargo run --release --bin rebelbench -- weights.bin   # generation throughput
 maturin develop --release           # python module `warchest` (Game)

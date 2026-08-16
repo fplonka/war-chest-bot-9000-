@@ -415,7 +415,7 @@ impl LiveGame {
         };
         let mut s = self.s;
         let mut bel = self.bel.clone();
-        let guard = nets().read().unwrap();
+        let guard = nets().read();
         let mut sv = Solver::new(&s, self.ctx, &guard[self.slot], scfg, bel.clone());
         if sv.capped() {
             let acts = self.s.legal_actions();

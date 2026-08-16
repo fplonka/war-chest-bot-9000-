@@ -93,7 +93,6 @@ pub struct Wave {
     pub row_cfg: Vec<u32>,
     pub raw_rows: Vec<u8>,
     pub card_feat: Vec<f32>,
-    pub ids: Vec<u8>,
     pub config_job: Vec<u32>,
     pub cphi: Vec<f32>,
     pub config_player: Vec<u8>,
@@ -181,7 +180,6 @@ impl Wave {
             row_cfg: Vec::new(),
             raw_rows: Vec::new(),
             card_feat: Vec::new(),
-            ids: Vec::new(),
             config_job: Vec::new(),
             cphi: Vec::new(),
             config_player: Vec::new(),
@@ -275,7 +273,6 @@ impl Wave {
         reserve!(row_cfg, table_len!(leaf_cidx));
         reserve!(raw_rows, table_len!(leaf_raw));
         reserve!(card_feat, table_len!(card_feat));
-        reserve!(ids, table_len!(ids));
         reserve!(config_job, cfgs);
         reserve!(cphi, table_len!(cphi));
         reserve!(
@@ -455,7 +452,6 @@ impl Wave {
             .extend(t.leaf_cidx.iter().map(|&x| config0 as u32 + x));
         self.raw_rows.extend_from_slice(&t.leaf_raw);
         self.card_feat.extend_from_slice(&t.card_feat);
-        self.ids.extend_from_slice(&t.ids);
         self.config_job
             .resize(self.config_job.len() + t.ncfg, job_id as u32);
         self.cphi.extend_from_slice(&t.cphi);

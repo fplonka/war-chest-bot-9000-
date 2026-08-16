@@ -18,10 +18,11 @@ use cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCA
 use cudarc::driver::{result, sys, CudaSlice, DevicePtr, DevicePtrMut, PushKernelArg};
 use cudarc::nvrtc;
 
+use crate::board::N_HEXES;
 use crate::gpu::client::{CarryStore, SolveResult};
-use crate::net::{V4Layout, CONFIG, CONTEXT, JOINT, PUBLIC, PUBLIC_IN, SLOT, UNIT};
-use crate::rebel::{CFEAT, GPU_ROW_BYTES, NSLOT, NTYPE, PILE_COUNTS};
-use crate::serialize::TOWER_CHUNK_ROWS;
+use crate::net::{V5Layout, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW, POOL, TYPE};
+use crate::rebel::{CFEAT, GPU_ROW_BYTES, LOOSE, NSLOT, NTYPE, PILE_COUNTS};
+use crate::serialize::TRUNK_CHUNK_ROWS;
 use crate::units::CARD_FEATS;
 
 use super::wave::Wave;
@@ -31,8 +32,8 @@ const BLOCK: u32 = 256;
 /// pool through L1, so a tile turns repeat candidate reads into cache hits.
 const READOUT_TILE: usize = 4;
 const GRAPH_CLASSES: usize = 4;
-const N_TABLES: usize = 52;
-const N_ARENAS: usize = 21;
+const N_TABLES: usize = 51;
+const N_ARENAS: usize = 31;
 
 #[repr(usize)]
 enum Table {
@@ -67,7 +68,6 @@ enum Table {
     RowCfg,
     RawRows,
     CardFeat,
-    Ids,
     ConfigJob,
     Cphi,
     Roots,
@@ -93,6 +93,7 @@ enum Table {
 #[repr(usize)]
 #[derive(Clone, Copy)]
 enum Arena {
+    // CFR state, from `initialise` onwards.
     Reach,
     SnapReach,
     Vals,
@@ -100,20 +101,37 @@ enum Arena {
     Cur,
     Sum,
     SnapStrat,
-    E,
-    Z,
+    // Built once per wave and read by every iteration.
+    Cards,
+    Bag,
+    F,
     G,
-    H0,
-    Xb,
+    P,
+    Jp,
+    // The per-iteration join.
+    Pooled,
+    Jin,
+    Z,
+    Jt,
     H,
-    H2,
-    U,
+    // Results.
     RootValues,
     Carry,
-    Bx,
-    Bh,
-    Bh2,
-    Bg,
+    // Trunk and encoder scratch, dead before the first iteration. `A` carries
+    // one zero hex per row for the neighbour gather, and is written over by
+    // the mix GEMM's output; `Mix` is written over by the block output. Both
+    // are rebuilt from the residual stream at the top of the next block.
+    Tok,
+    Ts,
+    X,
+    A,
+    Mix,
+    Pool,
+    Gb,
+    Board,
+    Pack,
+    Hidden,
+    Cfg,
 }
 
 #[repr(C)]
@@ -173,39 +191,43 @@ unsafe impl cudarc::driver::DeviceRepr for WaveDev {}
 unsafe impl cudarc::driver::ValidAsZeroBits for WaveDev {}
 unsafe impl Send for WaveDev {}
 
+/// Only what device code dereferences: biases, LayerNorm pairs, the two
+/// embeddings, and the three matrices narrow enough that a kernel applies them
+/// itself instead of paying for a pack buffer and a tiny-K GEMM. Every other
+/// matrix reaches cuBLAS as a raw offset into the weight blob.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct WeightDev {
-    rule_w: [*const f32; 2],
-    rule_b: [*const f32; 2],
-    unit_id: *const f32,
-    public_w: [*const f32; 3],
-    public_b: [*const f32; 3],
-    public_lnw: [*const f32; 3],
-    public_lnb: [*const f32; 3],
-    belief_slot_w: *const f32,
-    belief_slot_b: *const f32,
-    belief_config_w: *const f32,
-    belief_config_b: *const f32,
-    belief_config_lnw: *const f32,
-    belief_config_lnb: *const f32,
-    belief_item_w: *const f32,
-    belief_item_b: *const f32,
-    candidate_slot_w: *const f32,
-    candidate_slot_b: *const f32,
-    candidate_w: *const f32,
-    candidate_b: *const f32,
-    candidate_lnw: *const f32,
-    candidate_lnb: *const f32,
-    context_w: [*const f32; 2],
-    context_b: [*const f32; 2],
-    context_lnw: [*const f32; 2],
-    context_lnb: [*const f32; 2],
-    context_joint_w: *const f32,
-    candidate_joint_w: *const f32,
-    joint_bias: *const f32,
-    value_w: *const f32,
-    value_b: *const f32,
+    card_b: [*const f32; 2],
+    pile_w: *const f32,
+    seat: *const f32,
+    hex_stem_w: *const f32,
+    hex_stem_b: *const f32,
+    pos: *const f32,
+    glob_stem_w: *const f32,
+    mix_b: [*const f32; BLOCKS],
+    pool_b: [*const f32; BLOCKS],
+    out_b: [*const f32; BLOCKS],
+    pre_lnw: [*const f32; BLOCKS + 1],
+    pre_lnb: [*const f32; BLOCKS + 1],
+    mid_lnw: [*const f32; BLOCKS],
+    mid_lnb: [*const f32; BLOCKS],
+    board_b: *const f32,
+    cfg1_b: *const f32,
+    cfg_lnw: *const f32,
+    cfg_lnb: *const f32,
+    cfg_f_b: *const f32,
+    cfg_g_b: *const f32,
+    join_b_b: *const f32,
+    join_w_b: [*const f32; JBLOCKS],
+    join_lnw: [*const f32; JBLOCKS],
+    join_lnb: [*const f32; JBLOCKS],
+    jout_lnw: *const f32,
+    jout_lnb: *const f32,
+    join_out_b: *const f32,
+    h_lnw: *const f32,
+    h_lnb: *const f32,
+    value_bias: *const f32,
 }
 
 unsafe impl cudarc::driver::DeviceRepr for WeightDev {}
@@ -220,7 +242,7 @@ impl Default for WeightDev {
 }
 
 struct WeightBank {
-    layout: V4Layout,
+    layout: V5Layout,
     _w: CudaSlice<f32>,
     _b: CudaSlice<f32>,
     _ln: CudaSlice<f32>,
@@ -242,11 +264,12 @@ macro_rules! kernels {
 }
 
 kernels! {
-    pack_cards, bias_gelu, cards_finish, assemble, norm_gelu,
-    holding_in, slot_sum, add_belief_item_bias,
+    pack_cards, bias_gelu, cards_finish, tokens, stem,
+    trunk_norm, gather_mix, hex_pool, block_mid, block_out,
+    board_pool, board_bias, config_pack, slot_sum, config_finish, norm,
     init_strategy, seed_reach, reach_sweep, seed_sum,
-    belief_sums, context_norm_gelu, readout, backprop_sweep,
-    normalize_strategy, gather_carry, collect_root,
+    belief_sums, join_input, join_block, join_finish, readout,
+    backprop_sweep, normalize_strategy, gather_carry, collect_root,
 }
 
 /// Compile the wave kernels for one layout and derive the launch geometry the
@@ -254,10 +277,7 @@ kernels! {
 /// shape change has to do it again: a ladder that rates a new network
 /// architecture against the pool it has to beat publishes two shapes to one
 /// card, and everything below the kernels is wave-sized and rebuilt anyway.
-fn build_kernels(
-    context: &Arc<CudaContext>,
-    layout: &V4Layout,
-) -> Result<(Kernels, u32, u32, u32), String> {
+fn build_kernels(context: &Arc<CudaContext>) -> Result<(Kernels, u32, u32, u32), String> {
     let (major, minor) = (
             context
                 .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
@@ -278,11 +298,7 @@ fn build_kernels(
     if std::env::var_os("WARCHEST_GPU_PRECISE_MATH").is_some() {
         nvrtc_options.pop();
     }
-    let source = format!(
-        "{}\n{}",
-        cuda_preamble(layout),
-        include_str!("wave_kernels.cu")
-    );
+    let source = format!("{}\n{}", cuda_preamble(), include_str!("wave_kernels.cu"));
     let ptx = nvrtc::compile_ptx_with_opts(
         &source,
         nvrtc::CompileOptions {
@@ -495,9 +511,7 @@ impl Executor {
             .new_stream()
             .map_err(|e| format!("CUDA stream: {e:?}"))?;
         let blas = blas(CudaBlas::new(stream.clone()).map_err(|e| format!("cuBLAS: {e:?}"))?)?;
-        let layout = V4Layout::new(&dims)?;
-        let (kernels, backprop_blocks, reach_blocks, sweep_block) =
-            build_kernels(&context, &layout)?;
+        let (kernels, backprop_blocks, reach_blocks, sweep_block) = build_kernels(&context)?;
         let initial = WeightBank::upload(&stream, &dims, w, b, ln)?;
         let mut banks = HashMap::new();
         banks.insert(0, initial);
@@ -572,7 +586,6 @@ impl Executor {
         let mut device = DeviceWave::upload(
             &self.stream,
             &wave,
-            &bank.layout,
             self.buffers.take(),
             &mut self.staging,
         )?;
@@ -590,7 +603,7 @@ impl Executor {
                 .map_err(|e| format!("begin v5 CUDA Graph: {e:?}"))?;
         }
         let queued = (|| -> Result<(), String> {
-            self.build_towers(&device, bank)?;
+            self.build_network(&device, bank)?;
             device.clear_solve_state(&self.stream)?;
             self.initialise(&device, bank, &wave)?;
 
@@ -738,31 +751,31 @@ impl Executor {
         self.collect(f)?.unpack()
     }
 
-    fn build_towers(&self, d: &DeviceWave, bank: &WeightBank) -> Result<(), String> {
+    /// Everything that does not move between CFR iterations: the card
+    /// describer, the trunk, the board vector and its cached join projection,
+    /// and the config encoder.
+    fn build_network(&self, d: &DeviceWave, bank: &WeightBank) -> Result<(), String> {
         let l = &bank.layout;
         let rows = d.host.rows as usize;
         let cfgs = d.host.ncfg as usize;
         let jobs = d.host.jobs as usize;
+        let queries = 2 * rows;
 
-        let unit_rows = 2 * jobs * NTYPE;
-        launch!(
-            self,
-            d,
-            bank,
-            pack_cards,
-            threads_usize(unit_rows * CARD_FEATS)
-        )?;
+        // The printed-card tokens: two canonical views per solve, reused by the
+        // trunk stem and by every config in the subgame.
+        let cards = 2 * jobs * NTYPE;
+        launch!(self, d, bank, pack_cards, threads_usize(cards * CARD_FEATS))?;
         gemm(
             &self.blas,
-            unit_rows,
-            UNIT,
+            cards,
+            TYPE,
             CARD_FEATS,
-            d.ptr(Arena::Bg),
+            d.ptr(Arena::Pack),
             CARD_FEATS,
-            bank.w_ptr(l.rule[0].w),
-            UNIT,
-            d.ptr_mut(Arena::Bh),
-            UNIT,
+            bank.w_ptr(l.card[0].w),
+            TYPE,
+            d.ptr_mut(Arena::Hidden),
+            TYPE,
             0.0,
         )?;
         launch!(
@@ -770,224 +783,258 @@ impl Executor {
             d,
             bank,
             bias_gelu,
-            threads_usize(unit_rows * UNIT),
+            threads_usize(cards * TYPE),
             0i32,
-            unit_rows as i32,
-            0i32
+            cards as i32
         )?;
         gemm(
             &self.blas,
-            unit_rows,
-            UNIT,
-            UNIT,
-            d.ptr(Arena::Bh),
-            UNIT,
-            bank.w_ptr(l.rule[1].w),
-            UNIT,
-            d.ptr_mut(Arena::Bh2),
-            UNIT,
+            cards,
+            TYPE,
+            TYPE,
+            d.ptr(Arena::Hidden),
+            TYPE,
+            bank.w_ptr(l.card[1].w),
+            TYPE,
+            d.ptr_mut(Arena::Cards),
+            TYPE,
             0.0,
         )?;
-        launch!(self, d, bank, cards_finish, threads_usize(unit_rows * UNIT))?;
+        launch!(self, d, bank, cards_finish, threads_usize(cards * TYPE))?;
+        // The count-weighted half of `g`, one row per card token.
+        gemm(
+            &self.blas,
+            cards,
+            3 * POOL,
+            TYPE,
+            d.ptr(Arena::Cards),
+            TYPE,
+            bank.w_ptr(l.cfg_m.w),
+            3 * POOL,
+            d.ptr_mut(Arena::Bag),
+            3 * POOL,
+            0.0,
+        )?;
 
-        // The public tower is a pure per-row map, so it runs in row chunks.
-        // Its input buffer is the widest thing in a wave -- `PUBLIC_IN` floats
-        // per canonical view -- and sizing it for the whole wave is what used
-        // to push mature waves onto the exclusive one-job route.
-        let public_rows = 2 * rows;
-        for start in (0..public_rows).step_by(TOWER_CHUNK_ROWS) {
-            let n = TOWER_CHUNK_ROWS.min(public_rows - start);
-            launch!(self, d, bank, assemble, n as u32, start as i32)?;
-            let mut src = d.ptr(Arena::Bx);
-            for k in 0..3 {
-                // The third layer lands back in Bx: its assembled input died
-                // with the first GEMM, and reusing it keeps the projection
-                // below a plain GEMM into H0 instead of a GEMM and a copy.
-                let dst_arena = match k {
-                    0 => Arena::Bh,
-                    1 => Arena::Bh2,
-                    _ => Arena::Bx,
-                };
-                gemm(
-                    &self.blas,
-                    n,
-                    PUBLIC,
-                    l.public[k].i,
-                    src,
-                    l.public[k].i,
-                    bank.w_ptr(l.public[k].w),
-                    PUBLIC,
-                    d.ptr_mut(dst_arena),
-                    PUBLIC,
-                    0.0,
-                )?;
-                launch!(
-                    self,
-                    d,
-                    bank,
-                    norm_gelu,
-                    warps(n),
-                    0i32,
-                    k as i32,
-                    n as i32,
-                    dst_arena as i32
-                )?;
-                src = d.ptr(dst_arena);
-            }
-            // The public half of the first context layer is fixed for the
-            // whole solve. Project it once here instead of repeating the same
-            // GEMM in every CFR iteration and fixed-policy root query.
-            debug_assert_eq!(PUBLIC, CONTEXT);
+        // The trunk is a per-row map, and one row carries 37 hex tokens through
+        // eight residual blocks. Running it in row chunks is what keeps its
+        // working tensors -- most of a wave's memory -- off the exclusive
+        // one-job route.
+        for start in (0..queries).step_by(TRUNK_CHUNK_ROWS) {
+            let n = TRUNK_CHUNK_ROWS.min(queries - start);
+            self.trunk(d, bank, start, n)?;
+        }
+        // Projecting the board vector into the join's first layer once per
+        // solve is the whole reason that vector is allowed to be wide.
+        gemm(
+            &self.blas,
+            queries,
+            JW,
+            D,
+            d.ptr(Arena::P),
+            D,
+            bank.w_ptr(l.join_p.w),
+            JW,
+            d.ptr_mut(Arena::Jp),
+            JW,
+            0.0,
+        )?;
+
+        let slots = cfgs * NSLOT;
+        launch!(self, d, bank, config_pack, threads_usize(slots))?;
+        gemm(
+            &self.blas,
+            slots,
+            CFGH,
+            3 + TYPE,
+            d.ptr(Arena::Pack),
+            3 + TYPE,
+            bank.w_ptr(l.cfg1.w),
+            CFGH,
+            d.ptr_mut(Arena::Hidden),
+            CFGH,
+            0.0,
+        )?;
+        launch!(
+            self,
+            d,
+            bank,
+            bias_gelu,
+            threads_usize(slots * CFGH),
+            1i32,
+            slots as i32
+        )?;
+        launch!(self, d, bank, slot_sum, warps(cfgs))?;
+        launch!(self, d, bank, norm, warps(cfgs), 0i32, cfgs as i32)?;
+        gemm(
+            &self.blas,
+            cfgs,
+            D,
+            CFGH,
+            d.ptr(Arena::Cfg),
+            CFGH,
+            bank.w_ptr(l.cfg_f.w),
+            D,
+            d.ptr_mut(Arena::F),
+            D,
+            0.0,
+        )?;
+        gemm(
+            &self.blas,
+            cfgs,
+            POOL,
+            CFGH,
+            d.ptr(Arena::Cfg),
+            CFGH,
+            bank.w_ptr(l.cfg_g.w),
+            POOL,
+            d.ptr_mut(Arena::G),
+            POOL,
+            0.0,
+        )?;
+        launch!(self, d, bank, config_finish, threads_usize(cfgs * (D + POOL)))?;
+        Ok(())
+    }
+
+    /// One chunk of canonical view rows through the trunk, ending in that
+    /// chunk's rows of the board vector `P`.
+    fn trunk(
+        &self,
+        d: &DeviceWave,
+        bank: &WeightBank,
+        start: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        let l = &bank.layout;
+        let cells = n * N_HEXES;
+        launch!(
+            self,
+            d,
+            bank,
+            tokens,
+            threads_usize(n * NTYPE * TYPE),
+            start as i32,
+            n as i32
+        )?;
+        gemm(
+            &self.blas,
+            n * NTYPE,
+            C,
+            TYPE,
+            d.ptr(Arena::Tok),
+            TYPE,
+            bank.w_ptr(l.tok_stem.w),
+            C,
+            d.ptr_mut(Arena::Ts),
+            C,
+            0.0,
+        )?;
+        launch!(self, d, bank, stem, n as u32, start as i32)?;
+        for (i, blk) in l.blocks.iter().enumerate() {
+            launch!(
+                self,
+                d,
+                bank,
+                trunk_norm,
+                warps(n * (N_HEXES + 1)),
+                i as i32,
+                n as i32
+            )?;
+            launch!(self, d, bank, gather_mix, threads_usize(cells * C), cells as i32)?;
+            launch!(self, d, bank, hex_pool, threads_usize(n * C), n as i32)?;
             gemm(
                 &self.blas,
                 n,
-                CONTEXT,
-                PUBLIC,
-                src,
-                PUBLIC,
-                bank.w_ptr(l.context[0].w),
-                CONTEXT,
-                unsafe { d.ptr_mut(Arena::H0).add(start * CONTEXT) },
-                CONTEXT,
+                C,
+                2 * C,
+                d.ptr(Arena::Pool),
+                2 * C,
+                bank.w_ptr(blk.pool.w),
+                C,
+                d.ptr_mut(Arena::Gb),
+                C,
                 0.0,
             )?;
+            // `y` lands over the activations it consumed; the next block's
+            // `trunk_norm` rebuilds the whole padded tensor from `x`.
+            gemm(
+                &self.blas,
+                cells,
+                C,
+                2 * C,
+                d.ptr(Arena::Mix),
+                2 * C,
+                bank.w_ptr(blk.mix.w),
+                C,
+                d.ptr_mut(Arena::A),
+                C,
+                0.0,
+            )?;
+            launch!(self, d, bank, block_mid, warps(cells), i as i32, cells as i32)?;
+            gemm(
+                &self.blas,
+                cells,
+                C,
+                C,
+                d.ptr(Arena::A),
+                C,
+                bank.w_ptr(blk.out.w),
+                C,
+                d.ptr_mut(Arena::Mix),
+                C,
+                0.0,
+            )?;
+            launch!(
+                self,
+                d,
+                bank,
+                block_out,
+                threads_usize(cells * C),
+                i as i32,
+                cells as i32
+            )?;
         }
-
-        launch!(self, d, bank, holding_in, threads_usize(cfgs * NSLOT))?;
-        let slot_rows = cfgs * NSLOT;
+        launch!(
+            self,
+            d,
+            bank,
+            trunk_norm,
+            warps(n * (N_HEXES + 1)),
+            BLOCKS as i32,
+            n as i32
+        )?;
+        let width = 2 * C + LOOSE;
+        launch!(
+            self,
+            d,
+            bank,
+            board_pool,
+            threads_usize(n * width),
+            start as i32,
+            n as i32
+        )?;
         gemm(
             &self.blas,
-            slot_rows,
-            SLOT,
-            3 + UNIT,
-            d.ptr(Arena::Bg),
-            3 + UNIT,
-            bank.w_ptr(l.belief_slot.w),
-            SLOT,
-            d.ptr_mut(Arena::Bh),
-            SLOT,
+            n,
+            D,
+            width,
+            d.ptr(Arena::Board),
+            width,
+            bank.w_ptr(l.board_out.w),
+            D,
+            unsafe { d.ptr_mut(Arena::P).add(start * D) },
+            D,
             0.0,
         )?;
         launch!(
             self,
             d,
             bank,
-            bias_gelu,
-            threads_usize(slot_rows * SLOT),
-            1i32,
-            slot_rows as i32,
-            0i32
-        )?;
-        launch!(self, d, bank, slot_sum, warps(cfgs), 0i32)?;
-        gemm(
-            &self.blas,
-            cfgs,
-            CONFIG,
-            SLOT,
-            d.ptr(Arena::Bh2),
-            SLOT,
-            bank.w_ptr(l.belief_config.w),
-            CONFIG,
-            d.ptr_mut(Arena::Bh),
-            CONFIG,
-            0.0,
-        )?;
-        launch!(
-            self,
-            d,
-            bank,
-            norm_gelu,
-            warps(cfgs),
-            1i32,
-            0i32,
-            cfgs as i32,
-            Arena::Bh as i32
-        )?;
-        gemm(
-            &self.blas,
-            cfgs,
-            CONFIG,
-            CONFIG,
-            d.ptr(Arena::Bh),
-            CONFIG,
-            bank.w_ptr(l.belief_item.w),
-            CONFIG,
-            d.ptr_mut(Arena::Z),
-            CONFIG,
-            0.0,
-        )?;
-        launch!(
-            self,
-            d,
-            bank,
-            add_belief_item_bias,
-            threads_usize(cfgs * CONFIG),
-            cfgs as i32,
-            Arena::Z as i32
-        )?;
-
-        gemm(
-            &self.blas,
-            slot_rows,
-            SLOT,
-            3 + UNIT,
-            d.ptr(Arena::Bg),
-            3 + UNIT,
-            bank.w_ptr(l.candidate_slot.w),
-            SLOT,
-            d.ptr_mut(Arena::Bh),
-            SLOT,
-            0.0,
-        )?;
-        launch!(
-            self,
-            d,
-            bank,
-            bias_gelu,
-            threads_usize(slot_rows * SLOT),
-            2i32,
-            slot_rows as i32,
-            0i32
-        )?;
-        launch!(self, d, bank, slot_sum, warps(cfgs), 0i32)?;
-        gemm(
-            &self.blas,
-            cfgs,
-            CONFIG,
-            SLOT,
-            d.ptr(Arena::Bh2),
-            SLOT,
-            bank.w_ptr(l.candidate.w),
-            CONFIG,
-            d.ptr_mut(Arena::Bh),
-            CONFIG,
-            0.0,
-        )?;
-        launch!(
-            self,
-            d,
-            bank,
-            norm_gelu,
-            warps(cfgs),
-            2i32,
-            0i32,
-            cfgs as i32,
-            Arena::Bh as i32
-        )?;
-        gemm(
-            &self.blas,
-            cfgs,
-            JOINT,
-            CONFIG,
-            d.ptr(Arena::Bh),
-            CONFIG,
-            bank.w_ptr(l.candidate_joint.w),
-            JOINT,
-            d.ptr_mut(Arena::G),
-            JOINT,
-            0.0,
-        )?;
-        Ok(())
+            board_bias,
+            threads_usize(n * D),
+            start as i32,
+            n as i32
+        )
     }
 
     fn initialise(&self, d: &DeviceWave, bank: &WeightBank, w: &Wave) -> Result<(), String> {
@@ -1098,6 +1145,10 @@ impl Executor {
         Ok(())
     }
 
+    /// The only per-iteration path: pool the beliefs, then run the join. `both`
+    /// re-pools both players, which only the first iteration and the
+    /// fixed-policy root queries need; otherwise the player whose strategy just
+    /// moved is the only block that changed.
     fn run_head(
         &self,
         d: &DeviceWave,
@@ -1107,75 +1158,69 @@ impl Executor {
     ) -> Result<(), String> {
         let l = &bank.layout;
         let rows = d.host.rows as usize;
+        let t = traverser as i32;
         launch!(
             self,
             d,
             bank,
             belief_sums,
             warps(d.host.nleaf as usize),
-            traverser as i32,
+            t,
             both as i32
-        )?;
-        gemm(
-            &self.blas,
-            rows,
-            CONTEXT,
-            2 * CONFIG,
-            d.ptr(Arena::Xb),
-            2 * CONFIG,
-            unsafe { bank.w_ptr(l.context[0].w).add(PUBLIC * CONTEXT) },
-            CONTEXT,
-            d.ptr_mut(Arena::H),
-            CONTEXT,
-            0.0,
         )?;
         launch!(
             self,
             d,
             bank,
-            context_norm_gelu,
-            warps(rows),
-            traverser as i32,
+            join_input,
+            threads_usize(rows * (JOIN_IN + JW)),
+            t,
             rows as i32
         )?;
         gemm(
             &self.blas,
             rows,
-            CONTEXT,
-            CONTEXT,
-            d.ptr(Arena::H),
-            CONTEXT,
-            bank.w_ptr(l.context[1].w),
-            CONTEXT,
-            d.ptr_mut(Arena::H2),
-            CONTEXT,
-            0.0,
+            JW,
+            JOIN_IN,
+            d.ptr(Arena::Jin),
+            JOIN_IN,
+            bank.w_ptr(l.join_b.w),
+            JW,
+            d.ptr_mut(Arena::Z),
+            JW,
+            1.0,
         )?;
-        launch!(
-            self,
-            d,
-            bank,
-            norm_gelu,
-            warps(rows),
-            3i32,
-            1i32,
-            rows as i32,
-            Arena::H2 as i32
-        )?;
+        for (i, span) in l.join_w.iter().enumerate() {
+            launch!(self, d, bank, join_block, warps(rows), i as i32, rows as i32)?;
+            gemm(
+                &self.blas,
+                rows,
+                JW,
+                JW,
+                d.ptr(Arena::Jt),
+                JW,
+                bank.w_ptr(span.w),
+                JW,
+                d.ptr_mut(Arena::Z),
+                JW,
+                1.0,
+            )?;
+        }
+        launch!(self, d, bank, join_finish, warps(rows), t, rows as i32)?;
         gemm(
             &self.blas,
             rows,
-            JOINT,
-            CONTEXT,
-            d.ptr(Arena::H2),
-            CONTEXT,
-            bank.w_ptr(l.context_joint.w),
-            JOINT,
-            d.ptr_mut(Arena::U),
-            JOINT,
-            0.0,
+            D,
+            JW,
+            d.ptr(Arena::Z),
+            JW,
+            bank.w_ptr(l.join_out.w),
+            D,
+            d.ptr_mut(Arena::H),
+            D,
+            1.0,
         )?;
-        Ok(())
+        launch!(self, d, bank, norm, warps(rows), 1i32, rows as i32)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1318,7 +1363,7 @@ impl WeightBank {
         b: Vec<f32>,
         ln: Vec<f32>,
     ) -> Result<Self, String> {
-        let layout = V4Layout::new(dims)?;
+        let layout = V5Layout::new(dims)?;
         if w.len() != layout.w_len || b.len() != layout.b_len || ln.len() != layout.ln_len {
             return Err(format!(
                 "GPU weight sizes {}/{}/{} do not match {:?} ({}/{}/{})",
@@ -1338,43 +1383,43 @@ impl WeightBank {
         let mut d = WeightDev::default();
         let wa = |x| unsafe { wp.add(x) };
         let ba = |x| unsafe { bp.add(x) };
-        let la = |x| unsafe { lp.add(x) };
+        let ln_pair = |i: usize| {
+            let (g, bt) = layout.norms[i];
+            (unsafe { lp.add(g) }, unsafe { lp.add(bt) })
+        };
         for k in 0..2 {
-            d.rule_w[k] = wa(layout.rule[k].w);
-            d.rule_b[k] = ba(layout.rule[k].b);
+            d.card_b[k] = ba(layout.card[k].b);
         }
-        d.unit_id = wa(layout.unit_id);
-        for k in 0..3 {
-            d.public_w[k] = wa(layout.public[k].w);
-            d.public_b[k] = ba(layout.public[k].b);
-            d.public_lnw[k] = la(layout.norms[k].0);
-            d.public_lnb[k] = la(layout.norms[k].1);
+        d.pile_w = wa(layout.pile.w);
+        d.seat = wa(layout.seat);
+        d.hex_stem_w = wa(layout.hex_stem.w);
+        d.hex_stem_b = ba(layout.hex_stem.b);
+        d.pos = wa(layout.pos);
+        d.glob_stem_w = wa(layout.glob_stem.w);
+        for (i, blk) in layout.blocks.iter().enumerate() {
+            d.mix_b[i] = ba(blk.mix.b);
+            d.pool_b[i] = ba(blk.pool.b);
+            d.out_b[i] = ba(blk.out.b);
+            (d.pre_lnw[i], d.pre_lnb[i]) = ln_pair(2 * i);
+            (d.mid_lnw[i], d.mid_lnb[i]) = ln_pair(2 * i + 1);
         }
-        d.belief_slot_w = wa(layout.belief_slot.w);
-        d.belief_slot_b = ba(layout.belief_slot.b);
-        d.belief_config_w = wa(layout.belief_config.w);
-        d.belief_config_b = ba(layout.belief_config.b);
-        d.belief_config_lnw = la(layout.norms[3].0);
-        d.belief_config_lnb = la(layout.norms[3].1);
-        d.belief_item_w = wa(layout.belief_item.w);
-        d.belief_item_b = ba(layout.belief_item.b);
-        d.candidate_slot_w = wa(layout.candidate_slot.w);
-        d.candidate_slot_b = ba(layout.candidate_slot.b);
-        d.candidate_w = wa(layout.candidate.w);
-        d.candidate_b = ba(layout.candidate.b);
-        d.candidate_lnw = la(layout.norms[4].0);
-        d.candidate_lnb = la(layout.norms[4].1);
-        for k in 0..2 {
-            d.context_w[k] = wa(layout.context[k].w);
-            d.context_b[k] = ba(layout.context[k].b);
-            d.context_lnw[k] = la(layout.norms[5 + k].0);
-            d.context_lnb[k] = la(layout.norms[5 + k].1);
+        // The norms run in application order, so the trunk's final one follows
+        // the blocks and the config encoder's follows that.
+        (d.pre_lnw[BLOCKS], d.pre_lnb[BLOCKS]) = ln_pair(2 * BLOCKS);
+        (d.cfg_lnw, d.cfg_lnb) = ln_pair(2 * BLOCKS + 1);
+        d.board_b = ba(layout.board_out.b);
+        d.cfg1_b = ba(layout.cfg1.b);
+        d.cfg_f_b = ba(layout.cfg_f.b);
+        d.cfg_g_b = ba(layout.cfg_g.b);
+        d.join_b_b = ba(layout.join_b.b);
+        for (i, span) in layout.join_w.iter().enumerate() {
+            d.join_w_b[i] = ba(span.b);
+            (d.join_lnw[i], d.join_lnb[i]) = ln_pair(2 * BLOCKS + 2 + i);
         }
-        d.context_joint_w = wa(layout.context_joint.w);
-        d.candidate_joint_w = wa(layout.candidate_joint.w);
-        d.joint_bias = ba(layout.joint_bias);
-        d.value_w = wa(layout.value.w);
-        d.value_b = ba(layout.value.b);
+        (d.jout_lnw, d.jout_lnb) = ln_pair(2 * BLOCKS + 2 + JBLOCKS);
+        (d.h_lnw, d.h_lnb) = ln_pair(2 * BLOCKS + 3 + JBLOCKS);
+        d.join_out_b = ba(layout.join_out.b);
+        d.value_bias = ba(layout.value_bias);
         let dev = htod(stream, &[d])?;
         Ok(Self {
             layout,
@@ -1408,13 +1453,12 @@ impl DeviceWave {
     fn upload(
         stream: &Arc<CudaStream>,
         w: &Wave,
-        l: &V4Layout,
         reuse: Option<DeviceBuffers>,
         staging: &mut Vec<u8>,
     ) -> Result<Self, String> {
         let jobs = job_devices(w)?;
         let (toff, table_len) = table_layout(w, &jobs)?;
-        let (aoff, arena_len, solve_state) = arena_layout(w, l)?;
+        let (aoff, arena_len, solve_state) = arena_layout(w)?;
         // Before a multi-GiB growth, drop both old allocations so neither is
         // live while the other grows. Once a lane has paid for a whale-sized
         // pair, retain it for later waves instead of reallocating every whale.
@@ -1653,7 +1697,6 @@ macro_rules! wave_table_fields {
         $put!(RowCfg, $w.row_cfg.as_slice());
         $put!(RawRows, $w.raw_rows.as_slice());
         $put!(CardFeat, $w.card_feat.as_slice());
-        $put!(Ids, $w.ids.as_slice());
         $put!(ConfigJob, $w.config_job.as_slice());
         $put!(Cphi, $w.cphi.as_slice());
         $put!(Roots, $w.roots.as_slice());
@@ -1763,12 +1806,9 @@ fn copy_table<T: Copy>(tables: &mut [u8], at: usize, values: &[T]) -> Result<(),
 }
 
 /// Returns the per-arena offsets, the total float count, and the span that
-/// `clear_solve_state` must re-zero once the towers are built.
+/// `clear_solve_state` must re-zero once the network is built.
 #[allow(clippy::type_complexity)]
-fn arena_layout(
-    w: &Wave,
-    _l: &V4Layout,
-) -> Result<([u64; N_ARENAS], usize, std::ops::Range<usize>), String> {
+fn arena_layout(w: &Wave) -> Result<([u64; N_ARENAS], usize, std::ops::Range<usize>), String> {
     let rows = w.row_node.len();
     let cfgs = w.config_job.len();
     let jobs = w.jobs.len();
@@ -1781,12 +1821,11 @@ fn arena_layout(
     } else {
         0
     };
-    let tower_rows = (2 * rows).min(TOWER_CHUNK_ROWS);
-    let bh = (tower_rows * PUBLIC)
-        .max(cfgs * NSLOT * SLOT)
-        .max(cfgs * CONFIG)
-        .max(2 * jobs * NTYPE * UNIT);
-    let bg = (2 * jobs * NTYPE * CARD_FEATS).max(cfgs * NSLOT * (3 + UNIT));
+    let queries = 2 * rows;
+    let chunk = queries.min(TRUNK_CHUNK_ROWS);
+    let cards = 2 * jobs * NTYPE * TYPE;
+    let hidden = cards.max(cfgs * NSLOT * CFGH);
+    let pack = (2 * jobs * NTYPE * CARD_FEATS).max(cfgs * NSLOT * (3 + TYPE));
     let sizes = [
         reach,
         reach.max(vals),
@@ -1795,20 +1834,30 @@ fn arena_layout(
         cells,
         cells,
         cells,
-        2 * jobs * NTYPE * UNIT,
-        cfgs * CONFIG,
-        cfgs * JOINT,
-        2 * rows * PUBLIC,
-        rows * 2 * CONFIG,
-        rows * CONTEXT,
-        rows * CONTEXT,
-        rows * JOINT,
+        cards,
+        2 * jobs * NTYPE * 3 * POOL,
+        cfgs * D,
+        cfgs * POOL,
+        queries * D,
+        queries * JW,
+        queries * POOL,
+        rows * JOIN_IN,
+        rows * JW,
+        rows * JW,
+        rows * D,
         roots,
         (carry_snaps * w.snapshot_configs).div_ceil(2),
-        tower_rows * PUBLIC_IN,
-        bh,
-        bh,
-        bg,
+        chunk * NTYPE * TYPE,
+        chunk * NTYPE * C,
+        chunk * N_HEXES * C,
+        chunk * (N_HEXES + 1) * C,
+        chunk * N_HEXES * 2 * C,
+        chunk * 2 * C,
+        chunk * C,
+        chunk * (2 * C + LOOSE),
+        pack,
+        hidden,
+        cfgs * CFGH,
     ];
     if std::env::var_os("WARCHEST_ARENA_PROFILE").is_some() {
         let named = [
@@ -1819,20 +1868,30 @@ fn arena_layout(
             "cur",
             "sum",
             "snap_strat",
-            "e",
-            "z",
+            "cards",
+            "bag",
+            "f",
             "g",
-            "h0",
-            "xb",
+            "p",
+            "jp",
+            "pooled",
+            "jin",
+            "z",
+            "jt",
             "h",
-            "h2",
-            "u",
             "root_values",
             "carry",
-            "bx",
-            "bh",
-            "bh2",
-            "bg",
+            "tok",
+            "ts",
+            "x",
+            "a",
+            "mix",
+            "pool",
+            "gb",
+            "board",
+            "pack",
+            "hidden",
+            "cfg",
         ];
         let mut top: Vec<_> = named.iter().zip(sizes.iter()).collect();
         top.sort_by_key(|(_, &n)| std::cmp::Reverse(n));
@@ -1863,35 +1922,52 @@ fn arena_layout(
     for a in PERSISTENT {
         place(&mut off, &mut at, a)?;
     }
-    // The four tower buffers are scratch for `build_towers` and are dead
-    // before `initialise` touches any CFR state, so the two phases share one
-    // region and `clear_solve_state` re-zeroes the CFR side between them.
-    // Bx alone is `rows * xdim`, which is most of a wave's memory; keeping it
-    // alive beside the whole solve is what pushed mature waves over the
-    // four-gibibyte exclusive-route boundary.
+    // The trunk buffers are scratch for `build_network` and are dead before
+    // `initialise` touches any CFR state, so the two phases share one region
+    // and `clear_solve_state` re-zeroes the CFR side between them. The mix
+    // input alone is 37 hexes by `2 * C` per row, which is most of a wave's
+    // memory; keeping it alive beside the whole solve is what pushed mature
+    // waves over the four-gibibyte exclusive-route boundary.
     let base = at
         .checked_add(31)
         .ok_or("wave FP32 arena alignment overflow")?
         & !31;
-    let mut tower = base;
-    for a in TOWER_SCRATCH {
-        place(&mut off, &mut tower, a)?;
+    let mut trunk = base;
+    for a in TRUNK_SCRATCH {
+        place(&mut off, &mut trunk, a)?;
     }
     let mut solve = base;
     for a in SOLVE_STATE {
         place(&mut off, &mut solve, a)?;
     }
-    Ok((off, tower.max(solve), base..solve))
+    Ok((off, trunk.max(solve), base..solve))
 }
 
-/// Arenas that `build_towers` produces and the CFR iterations then read.
-const PERSISTENT: [Arena; 4] = [Arena::E, Arena::Z, Arena::G, Arena::H0];
+/// Arenas that `build_network` produces and the CFR iterations then read.
+const PERSISTENT: [Arena; 4] = [Arena::F, Arena::G, Arena::P, Arena::Jp];
 
-/// Scratch that only exists while the towers are being built.
-const TOWER_SCRATCH: [Arena; 4] = [Arena::Bx, Arena::Bh, Arena::Bh2, Arena::Bg];
+/// Scratch that only exists while the network is being built. The card table
+/// and its count-weighted embeddings belong here and not above: the trunk stem
+/// and the config encoder are the only things that read them, and both run
+/// before the first iteration.
+const TRUNK_SCRATCH: [Arena; 13] = [
+    Arena::Cards,
+    Arena::Bag,
+    Arena::Tok,
+    Arena::Ts,
+    Arena::X,
+    Arena::A,
+    Arena::Mix,
+    Arena::Pool,
+    Arena::Gb,
+    Arena::Board,
+    Arena::Pack,
+    Arena::Hidden,
+    Arena::Cfg,
+];
 
 /// State that only exists from `initialise` onwards.
-const SOLVE_STATE: [Arena; 13] = [
+const SOLVE_STATE: [Arena; 14] = [
     Arena::Reach,
     Arena::SnapReach,
     Arena::Vals,
@@ -1899,10 +1975,11 @@ const SOLVE_STATE: [Arena; 13] = [
     Arena::Cur,
     Arena::Sum,
     Arena::SnapStrat,
-    Arena::Xb,
+    Arena::Pooled,
+    Arena::Jin,
+    Arena::Z,
+    Arena::Jt,
     Arena::H,
-    Arena::H2,
-    Arena::U,
     Arena::RootValues,
     Arena::Carry,
 ];
@@ -2156,36 +2233,57 @@ fn i32n(x: usize, what: &str) -> Result<i32, String> {
     i32::try_from(x).map_err(|_| format!("wave {what} exceeds i32 launch range"))
 }
 
-fn cuda_preamble(_l: &V4Layout) -> String {
-    let locations = crate::board::board()
+fn cuda_preamble() -> String {
+    let bd = crate::board::board();
+    let locations = bd
         .is_location
         .iter()
         .map(|&x| if x { "1" } else { "0" })
         .collect::<Vec<_>>()
         .join(",");
-    let mirrors = (0..crate::board::N_HEXES)
+    let mirrors = (0..N_HEXES)
         .map(|h| crate::state::mirror_hex(h).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    // A missing neighbour is `N_HEXES`, which addresses the zero hex the
+    // activation tensor pads every row with, so the gather never branches.
+    let neighbours = bd
+        .neighbors
+        .iter()
+        .flatten()
+        .map(|&n| {
+            if n == crate::board::NONE {
+                N_HEXES
+            } else {
+                n as usize
+            }
+            .to_string()
+        })
         .collect::<Vec<_>>()
         .join(",");
     format!(
         "#define WAVE_BLOCK {}\n#define READOUT_TILE {}\n\
-         #define UNIT_DIM {}\n#define SLOT_DIM {}\n#define CONFIG_DIM {}\n\
-         #define PUBLIC_DIM {}\n#define CONTEXT_DIM {}\n#define JOINT_DIM {}\n#define PUBLIC_IN {}\n\
+         #define TYPE {}\n#define C {}\n#define BLOCKS {}\n#define D {}\n\
+         #define POOL {}\n#define CFGH {}\n#define JW {}\n#define JBLOCKS {}\n\
+         #define JOIN_IN {}\n#define N_LOCATIONS {}\n\
          #define N_HEXES {}\n#define NSLOT {}\n#define NTYPE {}\n#define HEX_FACTS {}\n\
          #define PILE_COUNTS {}\n#define CARD_FEATS {}\n#define CFEAT {}\n\
-         #define MAX_COINS {:.1}f\n#define MAX_PLIES {:.1}f\n#define LOOSE {}\n\
+         #define CNORM {:.1}f\n#define MAX_COINS {:.1}f\n#define MAX_PLIES {:.1}f\n\
+         #define LOOSE {}\n\
          #define GPU_ROW_BYTES {}\n#define GR_HEX_OWNER {}\n#define GR_HEX_SLOT {}\n\
          #define GR_HEX_HEIGHT {}\n#define GR_HEX_MARKER {}\n#define GR_PILES {}\n\
          #define GR_MARKERS {}\n#define GR_HAND {}\n#define GR_FD {}\n#define GR_BAG {}\n\
          #define GR_INITIATIVE {}\n#define GR_INIT_MOVED {}\n#define GR_TO_ACT {}\n#define GR_PLIES {}\n\
          static __device__ const unsigned char HEX_LOCATION[N_HEXES] = {{{locations}}};\n\
-         static __device__ const unsigned char HEX_MIRROR[N_HEXES] = {{{mirrors}}};\n",
+         static __device__ const unsigned char HEX_MIRROR[N_HEXES] = {{{mirrors}}};\n\
+         static __device__ const unsigned char HEX_NEIGHBOUR[N_HEXES * 6] = {{{neighbours}}};\n",
         BLOCK,
         READOUT_TILE,
-        UNIT, SLOT, CONFIG, PUBLIC, CONTEXT, JOINT, PUBLIC_IN,
-        crate::board::N_HEXES, NSLOT, NTYPE, crate::rebel::HEX_FACTS,
-        PILE_COUNTS, CARD_FEATS, CFEAT, crate::rebel::MAX_COINS,
-        crate::state::MAX_MAIN_PLAYS as f32, crate::rebel::LOOSE,
+        TYPE, C, BLOCKS, D, POOL, CFGH, JW, JBLOCKS, JOIN_IN,
+        bd.location_hexes.len(),
+        N_HEXES, NSLOT, NTYPE, crate::rebel::HEX_FACTS,
+        PILE_COUNTS, CARD_FEATS, CFEAT, crate::rebel::CNORM, crate::rebel::MAX_COINS,
+        crate::state::MAX_MAIN_PLAYS as f32, LOOSE,
         GPU_ROW_BYTES, crate::rebel::GPU_ROW_HEX_OWNER, crate::rebel::GPU_ROW_HEX_SLOT,
         crate::rebel::GPU_ROW_HEX_HEIGHT, crate::rebel::GPU_ROW_HEX_MARKER,
         crate::rebel::GPU_ROW_PILES, crate::rebel::GPU_ROW_MARKERS,
@@ -2206,8 +2304,7 @@ mod reservation_tests {
         job.carried.push([vec![1.0], vec![1.0]]);
         let reserved = job.work().mutable_bytes;
         let wave = Wave::pack(&[job]).expect("pack stub wave");
-        let layout = V4Layout::new(&wave.meta.net_dims).expect("network layout");
-        let (_, floats, _) = arena_layout(&wave, &layout).expect("device arena layout");
+        let (_, floats, _) = arena_layout(&wave).expect("device arena layout");
         let allocated = floats
             .max(1)
             .checked_next_power_of_two()

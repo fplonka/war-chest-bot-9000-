@@ -128,17 +128,22 @@ def _tables(device_text):
     return cards, locations
 
 
-def make_batch(parts, rng, device, augment):
+def make_batch(parts, rng, device):
     """Compact replay batch -> two canonical query rows on ``device``."""
-    del rng, augment
+    del rng
     from train import public_sizes
 
-    rows, cc, cp, cw, cy, seg = parts
+    rows, aux, cc, cp, cw, cy, seg = parts
     n = len(rows)
     hand, fd, bag = public_sizes(cc, cp, seg, n)
     views = np.empty((2 * n, warchest.ROW_BYTES), np.uint8)
     views[0::2] = rows
     views[1::2] = mirror.mirror_rows(rows)
+    # The auxiliary target follows the row: the mirrored view sees the locations
+    # permuted and the two owners exchanged.
+    owner = np.empty((2 * n, warchest.N_LOCATIONS), np.uint8)
+    owner[0::2] = aux
+    owner[1::2] = mirror.mirror_aux(aux)
     size_parts = []
     for a in (hand, fd, bag):
         pair = np.empty((2 * n, 2), np.uint8)
@@ -171,21 +176,20 @@ def make_batch(parts, rng, device, augment):
         MAX_PLIES=warchest.MAX_MAIN_PLAYS, BLOCK=1024, num_warps=4)
 
     phi = t(cc, torch.float32) / float(warchest.CNORM)
-
-    unit_ids = rows_t[:, warchest.ROW_IDS:warchest.ROW_IDS + warchest.NTYPE].long()
-    return (x, unit_ids, phi, t(cw, torch.float32), t(seg, torch.long),
-            t(cy, torch.float32), 2 * n)
+    return (x, phi, t(cw, torch.float32), t(seg, torch.long),
+            t(cy, torch.float32), t(owner, torch.int64), 2 * n)
 
 
 def warmup(device):
-    """Compile both kernels before the run's wall-clock starts."""
+    """Compile the expansion kernel before the run's wall-clock starts."""
     rows = np.zeros((1, warchest.ROW_BYTES), np.uint8)
     rows[:, warchest.ROW_HEX_OWNER:warchest.ROW_HEX_OWNER + warchest.N_HEXES] = 255
     rows[:, warchest.ROW_HEX_SLOT:warchest.ROW_HEX_SLOT + warchest.N_HEXES] = 255
     rows[:, warchest.ROW_HEX_MARKER:warchest.ROW_HEX_MARKER + warchest.N_HEXES] = 255
     cc = np.zeros((2, warchest.CCOUNTS), np.uint8)
-    parts = (rows, cc, np.asarray([0, 1], np.uint8),
+    aux = np.zeros((1, warchest.N_LOCATIONS), np.uint8)
+    parts = (rows, aux, cc, np.asarray([0, 1], np.uint8),
              np.asarray([1.0, 1.0], np.float32), np.zeros(2, np.float32),
              np.asarray([0, 1], np.int64))
-    make_batch(parts, np.random.default_rng(0), device, False)
+    make_batch(parts, np.random.default_rng(0), device)
     torch.cuda.synchronize(device)

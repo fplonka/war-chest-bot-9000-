@@ -1,0 +1,274 @@
+<!doctype html><meta charset=utf-8><title>warchest runs</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#fff;--ink:#111;--mut:#666;--line:#ddd}
+@media (prefers-color-scheme:dark){:root{--bg:#111;--ink:#e8e8e8;--mut:#999;--line:#333}}
+*{box-sizing:border-box}
+body{margin:0;display:flex;height:100vh;background:var(--bg);color:var(--ink);
+ font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+ font-variant-numeric:tabular-nums}
+aside{width:250px;flex:none;overflow-y:auto;border-right:1px solid var(--line);padding:8px}
+main{flex:1;overflow-y:auto;padding:14px 16px 40px}
+button{display:block;width:100%;text-align:left;background:none;color:var(--ink);
+ border:0;border-radius:3px;padding:4px 6px;margin-bottom:1px;font:inherit;cursor:pointer}
+button:hover{background:var(--line)}
+button.on{background:var(--line);font-weight:700}
+.sub{display:block;color:var(--mut);font-size:11px;font-weight:400}
+.live{color:#20a37a}
+h1{font-size:14px;margin:0 0 2px}
+h2{font-size:12px;margin:22px 0 6px;color:var(--mut)}
+.meta,.none{color:var(--mut);margin:0 0 6px}
+.note{margin:0 0 8px}
+.delta{display:flex;flex-wrap:wrap;gap:2px 16px;color:var(--mut);margin-bottom:12px}
+.delta .hit{color:var(--ink);font-weight:700}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:10px 18px}
+.panel canvas{width:100%;height:190px;display:block}
+.ph{font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ax{color:var(--mut)}
+dl{display:flex;flex-wrap:wrap;gap:0 22px;margin:4px 0}
+dt{font-size:11px;color:var(--mut)}
+dd{margin:0 0 4px}
+table{border-collapse:collapse;margin:4px 0 10px}
+th,td{text-align:right;padding:1px 14px 1px 0;white-space:nowrap}
+th{color:var(--mut);font-weight:400;border-bottom:1px solid var(--line)}
+th:first-child,td:first-child{text-align:left}
+pre{max-height:340px;overflow:auto;margin:4px 0;font:inherit;white-space:pre-wrap}
+#loglink{margin-left:8px;font-size:11px;color:#3d8bfd}
+#tip{position:fixed;display:none;z-index:2;pointer-events:none;white-space:pre;
+ padding:5px 7px;background:var(--bg);border:1px solid var(--line);box-shadow:0 2px 8px #0004}
+</style>
+<aside id=list></aside>
+<main>
+ <h1><span id=title></span><a id=loglink target=_blank>train.log</a></h1>
+ <p class=meta id=meta></p><p class=note id=note></p>
+ <div class=delta id=cfg></div>
+ <div class=grid id=panels></div>
+ <dl id=health></dl>
+ <div id=ladders></div>
+ <div id=text></div>
+</main>
+<div id=tip></div>
+<script>
+// Colours from the old report: mid-tone and saturated, so one rendering reads
+// against a light page and a dark one.
+const INK = ["#3d8bfd", "#20a37a", "#e0709f", "#d99b28", "#9b7bd4"], AXIS = "#8a8a8a";
+const $ = id => document.getElementById(id);
+const E = (tag, cls, text) => { const n = document.createElement(tag);
+  if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
+let sel = decodeURIComponent(location.hash.slice(1)) || null, shape = "", last = null;
+
+const api = async u => { try { const r = await fetch(u); return r.ok ? r.json() : null; }
+                         catch (e) { return null; } };
+
+// Per-epoch values are jumpy -- every epoch trains on a fresh sample of a large
+// buffer -- so the trend is the readable part and the scatter is its context.
+function ema(y, span = 12) {
+  const a = 2 / (span + 1); let p = null;
+  return y.map(v => v == null ? null : (p = p == null ? v : a * v + (1 - a) * p));
+}
+
+const quant = (v, q) => v[Math.min(v.length - 1, Math.max(0, Math.round(q * (v.length - 1))))];
+const fmt = v => Math.abs(v) >= 1e5 || (v && Math.abs(v) < 1e-3)
+  ? v.toExponential(0) : String(+v.toPrecision(3));
+
+function ticks(lo, hi, n) {
+  const raw = (hi - lo) / n, mag = Math.pow(10, Math.floor(Math.log10(raw || 1)));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(m => raw <= m) || 10 * mag, out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step / 1e3; v += step) out.push(v);
+  return out;
+}
+
+function draw(cv, p, snaps) {
+  const dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, W, H);
+  const L = 46, R = 6, T = 6, B = 16;
+  const ss = p.s.map(s => ({ ...s, v: s.sm ? ema(s.y) : s.y }));
+  const xs = [].concat(...ss.map(s => s.x)); if (!xs.length) return;
+  const x0 = Math.min(...xs), x1 = Math.max(...xs) || 1;
+  const vals = [];
+  ss.forEach(s => s.v.forEach((v, i) => { if (v == null) return; vals.push(v);
+    const e = s.e && s.e[i]; if (e) vals.push(v - e, v + e); }));
+  p.h.forEach(h => vals.push(h[1]));
+  if (!vals.length) return;
+  vals.sort((a, b) => a - b);
+  // One bad epoch -- a warm-up spike, a drain record -- must not set the axis
+  // and flatten everything else, so the limits are percentiles.
+  let lo = p.zero ? Math.min(0, vals[0]) : quant(vals, 0.01), hi = quant(vals, 0.99);
+  const pad = (hi - lo) * 0.12 || Math.abs(hi) * 0.1 || 1;
+  hi += pad; if (!p.zero) lo -= pad;
+  const X = v => L + (v - x0) / ((x1 - x0) || 1) * (W - L - R);
+  const Y = v => T + (1 - (v - lo) / ((hi - lo) || 1)) * (H - T - B);
+  cv._plot = {L, R, W, x0, x1, ss};
+
+  g.font = "10px ui-monospace,Menlo,monospace"; g.strokeStyle = AXIS; g.fillStyle = AXIS;
+  g.lineWidth = 1;
+  for (const t of ticks(lo, hi, 4)) {
+    const y = Math.round(Y(t)) + 0.5;
+    g.strokeStyle = "rgba(138,138,138,0.20)";
+    g.beginPath(); g.moveTo(L, y); g.lineTo(W - R, y); g.stroke();
+    g.fillText(fmt(t), 2, y + 3);
+  }
+  for (const t of ticks(x0, x1, 5)) g.fillText(fmt(t), X(t) - 6, H - 4);
+  // Where the ladder's players were taken from.
+  g.strokeStyle = "rgba(138,138,138,0.35)"; g.setLineDash([2, 3]);
+  for (const t of snaps || []) { if (t < x0 || t > x1) continue;
+    const x = Math.round(X(t)) + 0.5;
+    g.beginPath(); g.moveTo(x, T); g.lineTo(x, H - B); g.stroke(); }
+  g.setLineDash([]);
+
+  ss.forEach((s, i) => {
+    const col = INK[i % INK.length];
+    const line = (y, w, alpha) => { g.globalAlpha = alpha; g.strokeStyle = col;
+      g.lineWidth = w; g.beginPath(); let on = false;
+      y.forEach((v, k) => { if (v == null) { on = false; return; }
+        on ? g.lineTo(X(s.x[k]), Y(v)) : g.moveTo(X(s.x[k]), Y(v)); on = true; });
+      g.stroke(); g.globalAlpha = 1; };
+    if (s.sm) line(s.y, 1, 0.22);          // raw behind, trend in front
+    line(s.v, 1.6, 1);
+    if (s.e) { g.strokeStyle = col;
+      s.e.forEach((e, k) => { if (!e || s.v[k] == null) return;
+        g.beginPath(); g.moveTo(X(s.x[k]), Y(s.v[k] - e));
+        g.lineTo(X(s.x[k]), Y(s.v[k] + e)); g.stroke(); }); }
+    if (p.marks) { g.fillStyle = col;
+      s.v.forEach((v, k) => { if (v == null) return;
+        g.beginPath(); g.arc(X(s.x[k]), Y(v), 2.5, 0, 7); g.fill(); }); }
+  });
+  g.setLineDash([4, 4]);
+  p.h.forEach((h, i) => { g.strokeStyle = INK[(i + 1) % INK.length];
+    g.beginPath(); g.moveTo(L, Y(h[1])); g.lineTo(W - R, Y(h[1])); g.stroke(); });
+  g.setLineDash([]);
+}
+
+function hover(e) {
+  const q = e.currentTarget._plot, tip = $("tip");
+  if (!q) { tip.style.display = "none"; return; }
+  const r = e.currentTarget.getBoundingClientRect(), px = e.clientX - r.left;
+  if (px < q.L || px > q.W - q.R) { tip.style.display = "none"; return; }
+  const x = q.x0 + (px - q.L) / (q.W - q.L - q.R) * (q.x1 - q.x0);
+  const rows = ["time " + fmt(x) + " min"];
+  q.ss.forEach(s => {
+    let at = -1, dist = Infinity;
+    s.x.forEach((v, i) => { const d = Math.abs(v - x);
+      if (s.y[i] != null && d < dist) { at = i; dist = d; } });
+    if (at >= 0) rows.push((s.n || "value") + " " + fmt(s.y[at]));
+  });
+  tip.textContent = rows.join("\n"); tip.style.display = "block";
+  tip.style.left = Math.min(innerWidth - tip.offsetWidth - 8, e.clientX + 12) + "px";
+  tip.style.top = Math.min(innerHeight - tip.offsetHeight - 8, e.clientY + 12) + "px";
+}
+
+function head(p) {
+  // Series are named in the panel title, so colours never have to be matched
+  // across panels and there is no legend to draw.
+  const h = E("div", "ph"); h.appendChild(E("b", null, p.t));
+  p.s.forEach((s, i) => { if (!s.n) return;
+    const n = E("span", null, " " + s.n); n.style.color = INK[i % INK.length];
+    h.appendChild(n); });
+  p.h.forEach((x, i) => { const n = E("span", null, " " + x[0]);
+    n.style.color = INK[(i + 1) % INK.length]; h.appendChild(n); });
+  h.appendChild(E("span", "ax", " · " + p.y));
+  return h;
+}
+
+function table(head, rows) {
+  const t = E("table"), hr = E("tr");
+  head.forEach(c => hr.appendChild(E("th", null, c)));
+  t.appendChild(hr);
+  rows.forEach(r => { const tr = E("tr");
+    r.forEach(c => tr.appendChild(E("td", null, c))); t.appendChild(tr); });
+  return t;
+}
+
+// Scroll position is the whole point of redrawing in place, so a <pre> that the
+// user has scrolled keeps its offset unless it was already following the tail.
+function setText(el, s) {
+  if (el.textContent === s) return;
+  const at = el.scrollTop, bottom = at + el.clientHeight >= el.scrollHeight - 4;
+  el.textContent = s;
+  el.scrollTop = bottom ? el.scrollHeight : at;
+}
+
+function render(d) {
+  last = d;
+  $("title").textContent = d.name;
+  $("meta").textContent = [d.git, d.epochs + " ReBeL epochs"].filter(Boolean).join(" · ");
+  $("note").textContent = d.note || "";
+  const log = $("loglink");
+  log.href = "/run/" + encodeURIComponent(d.name) + "/train.log";
+  log.style.display = d.log ? "" : "none";
+  const cfg = $("cfg"); cfg.textContent = "";
+  d.cfg.forEach(([k, v, changed]) =>
+    cfg.appendChild(E("span", changed ? "hit" : null, k + "=" + v)));
+
+  const grid = $("panels"), key = d.panels.map(p => p.t).join("|");
+  if (key !== shape) {                       // only the panel set rebuilds
+    shape = key; grid.textContent = "";
+    d.panels.forEach(p => { const box = E("div", "panel"), cv = E("canvas");
+      cv.onmousemove = hover; cv.onmouseleave = () => $("tip").style.display = "none";
+      box.appendChild(head(p)); box.appendChild(cv); grid.appendChild(box); });
+  }
+  const cvs = grid.querySelectorAll("canvas");
+  d.panels.forEach((p, i) => draw(cvs[i], p, d.snaps));
+
+  const hl = $("health"); hl.textContent = "";
+  d.health.forEach(([k, v]) => { hl.appendChild(E("dt", null, k));
+    hl.appendChild(E("dd", null, v)); });
+
+  const box = $("ladders"); box.textContent = "";
+  Object.entries(d.ladders || {}).forEach(([name, l]) => {
+    box.appendChild(E("h2", null, name + " · elo, 95% CI = 1.96 × Bradley-Terry SE"));
+    box.appendChild(table(["player", "trained", "elo", "95% CI", "score"],
+      (l.players || []).filter(p => p.name !== "random")
+        .sort((a, b) => b.elo - a.elo)
+        .map(p => [p.name, p.t == null ? "—" : (p.t / 60).toFixed(0) + " min",
+                   p.elo.toFixed(0), "±" + (1.96 * (p.se || 0)).toFixed(0),
+                   p.score.toFixed(3)])));
+    box.appendChild(table(["pairing", "W–L–D", "games", "score"],
+      (l.pairs || []).filter(p => p.a !== "random" && p.b !== "random")
+        .sort((a, b) => (b.n || 0) - (a.n || 0))
+        .map(p => [p.a + " vs " + p.b, `${p.w}–${p.l}–${p.d}`,
+                   p.n ?? p.w + p.l + p.d, p.score.toFixed(3)])));
+  });
+
+  const text = $("text");
+  if (!text.firstChild) ["notes", "train.log"].forEach(h => {
+    text.appendChild(E("h2", null, h)); text.appendChild(E("pre")); });
+  [d.notes || "", (d.log || "").split("\n").slice(-300).join("\n")].forEach((s, i) => {
+    const head = text.children[2 * i], pre = text.children[2 * i + 1];
+    head.style.display = pre.style.display = s ? "" : "none";
+    setText(pre, s); });
+}
+
+function list(runs) {
+  const a = $("list"), at = a.scrollTop;
+  a.textContent = "";
+  runs.forEach(r => {
+    const b = E("button", r.name === sel ? "on" : null);
+    b.appendChild(E("span", null, r.name));
+    const sub = E("span", "sub");
+    if (r.running) { const dot = E("span", "live", "● "); sub.appendChild(dot); }
+    sub.appendChild(document.createTextNode(
+      [r.epochs + " ep", r.minutes + "m", r.phase, r.note].filter(Boolean).join(" · ")));
+    b.appendChild(sub);
+    b.onclick = () => { sel = r.name; location.hash = encodeURIComponent(r.name);
+                        shape = ""; poll(); };
+    a.appendChild(b);
+  });
+  a.scrollTop = at;
+}
+
+async function poll() {
+  const runs = await api("/api/runs");
+  if (runs) { if (!sel && runs.length) sel = runs[0].name; list(runs); }
+  if (!sel) return;
+  const d = await api("/api/run/" + encodeURIComponent(sel));
+  if (d) render(d);
+}
+
+addEventListener("resize", () => last && render(last));
+addEventListener("hashchange", () => {   // the hash is the deep link, so honour Back
+  sel = decodeURIComponent(location.hash.slice(1)) || sel; shape = ""; poll(); });
+setInterval(poll, 3000);
+poll();
+</script>

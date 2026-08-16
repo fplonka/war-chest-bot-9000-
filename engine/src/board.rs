@@ -6,6 +6,9 @@
 //! Everything downstream keys off the hex index; coords are only for I/O.
 
 pub const N_HEXES: usize = 37;
+/// The 10 control locations. The auxiliary ownership target has one head per
+/// location, so the trainer needs this count as well as the hex indices.
+pub const N_LOCATIONS: usize = 10;
 pub const NONE: u8 = 255;
 
 /// Neighbor offsets in axial coords (matches the site's neighbor definition).
@@ -13,7 +16,7 @@ const NEIGHBOR_OFFSETS: [(i8, i8); 6] = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, -
 
 /// The 10 location (base) coords, in the order used by the site data.
 /// Indices 0,1 = white starts; 2,3 = black starts; 4..10 = neutral bases.
-pub const LOCATION_COORDS: [(i8, i8); 10] = [
+pub const LOCATION_COORDS: [(i8, i8); N_LOCATIONS] = [
     (4, 0),
     (6, 1), // white starts
     (0, 5),
@@ -36,7 +39,7 @@ pub struct Board {
     /// true if the hex is one of the 10 control locations.
     pub is_location: [bool; N_HEXES],
     /// the 10 location hex indices (parallel to LOCATION_COORDS).
-    pub location_hexes: [u8; 10],
+    pub location_hexes: [u8; N_LOCATIONS],
     /// For each ordered pair (a,b): the single hex strictly between them iff
     /// they are exactly 2 apart in a straight line, else NONE. Used by
     /// Crossbowman / Archer / Lancer straight-line reasoning.
@@ -119,7 +122,7 @@ impl Board {
         }
 
         let mut is_location = [false; N_HEXES];
-        let mut location_hexes = [NONE; 10];
+        let mut location_hexes = [NONE; N_LOCATIONS];
         for (li, (x, y)) in LOCATION_COORDS.iter().enumerate() {
             let h = index_of(*x, *y);
             assert!(h != NONE, "location coord must be on board");
@@ -166,4 +169,25 @@ static BOARD: OnceLock<Board> = OnceLock::new();
 /// Shared immutable board geometry. Built once.
 pub fn board() -> &'static Board {
     BOARD.get_or_init(Board::new)
+}
+
+/// The trunk's neighbour gather: `[N_HEXES * 6]`, hex-major, in the fixed
+/// axial direction order of `NEIGHBOR_OFFSETS`.
+///
+/// A missing neighbour is written as `N_HEXES`, not `NONE`: both Rust and torch
+/// gather from a feature map padded to `N_HEXES + 1` rows whose last row is
+/// zero, so an edge hex sums zeros in the directions it has no neighbour in and
+/// nothing needs a mask. Direction order is preserved, which is what lets a
+/// stack of blocks express the straight-line relations the unit cards are full
+/// of.
+pub fn neighbour_gather() -> Vec<u8> {
+    let bd = board();
+    let mut out = Vec::with_capacity(N_HEXES * 6);
+    for h in 0..N_HEXES {
+        for d in 0..6 {
+            let n = bd.neighbors[h][d];
+            out.push(if n == NONE { N_HEXES as u8 } else { n });
+        }
+    }
+    out
 }

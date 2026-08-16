@@ -97,12 +97,13 @@ h = x_pub · W_pub  +  x_bel · W_bel
 With `FEAT = 812` and a 132-wide belief block that is 84% of the widest layer,
 computed once per leaf instead of eight times.
 
-The network has since been rebuilt around the config rather than the hand
-(`docs/REBEL.md` §4) and this split survived it unchanged — it is now
-`Mlp::trunk` plus `Mlp::pbs_head`, and the config tower is cached the same way,
-once per *distinct* config per solve. The one new hot loop, accumulating the
-belief embedding, needed the same hand-vectorisation as the LayerNorm below:
-scalar it was 41% of all CPU, vectorised it is 9%.
+The network has since been rebuilt twice — first around the config rather than
+the hand, then into v5's trunk/config/join split (`docs/REBEL.md` §5) — and this
+split survived both. It is now `Net::board` and `Net::join_cache` once per leaf
+against `Net::join` and `Net::values` per iteration, and the config encoder is
+cached the same way, once per *distinct* config per solve. The one new hot loop,
+accumulating the belief embedding, needed the same hand-vectorisation as the
+LayerNorm below: scalar it was 41% of all CPU, vectorised it is 9%.
 
 Together with §1: **262 → 550 decisions/s** (trained-agent positions).
 
@@ -131,7 +132,7 @@ Same parameter count, same depth — the belief block is simply wired into layer
 instead of layer 1. What that buys is that the *whole* public tower becomes a
 function of the leaf's public state alone, so a subgame computes it once per
 leaf and only the belief projection and the output head run per iteration.
-Per-iteration matmul work drops 2.6x. See `docs/REBEL.md` §4.
+Per-iteration matmul work drops 2.6x. See `docs/REBEL.md` §5.
 
 This is the one change that alters the model, so it was gated on a full training
 run: it took final-vs-Greedy from 0.965 to **1.000** and final-vs-initial from
@@ -219,6 +220,10 @@ hardware's limit rather than the code's: the matmuls run near peak and the
 aggregate rate across 8 threads sits at the M1's shared-AMX ceiling. Cutting it
 further means cutting floating-point operations, not overhead.
 
+These shares are **v4's**, measured on v4's shapes — a three-layer 384-wide flat
+MLP over the board and a 384-wide belief-conditioned path — so the phase names
+are v4's too:
+
 | phase | share |
 |---|---|
 | value network, per iteration | 32% |
@@ -229,26 +234,34 @@ further means cutting floating-point operations, not overhead.
 | backward pass | 6% |
 | everything else | 5% |
 
-The obvious next lever is the draw transitions: a run of *k* draws is currently
-composed step by step over intermediate supports that grow by ~5x each time,
-where the multivariate hypergeometric gives the same answer directly from the
-parent support in roughly a third of the entries. It needs a fallback for the
-mid-run reshuffle case, and an oracle against the step-by-step chain.
+v5 moves that balance rather than the total. Its trunk carries **63%** of the
+network's multiply-accumulates against 1.7% for v4's board encoder, and the
+per-iteration path falls from 96.4% to 33% — the whole point of paying for a
+trunk that runs once per leaf. Projected, 48.9 GMAC per depth-2 `T=64` solve
+against v4's 58.0, and 0.95M parameters against 1.55M. Nothing on this page has
+been re-measured on v5.
 
-## A second pass, after the card describer and the policy head
+The draw transitions were the next lever and have since been taken. A run of
+*k* draws used to be composed step by step over intermediate supports that grow
+by ~5x each time, where the multivariate hypergeometric gives the same answer
+directly from the parent support in roughly a third of the entries.
+`rebel.rs::DrawScratch::run` now produces it in one shot per source config, and
+`run_matches_composition` pins it against the step-by-step chain it replaced.
 
-Those two added new per-solve work, and it was all written as scalar triple
-loops sitting next to matmuls that run at ~1.3 Tflop/s. Fixing that, and moving
-one older loop onto the coprocessor as well, is **+8.9%** end to end on the
-generation benchmark, with bit-identical trajectories — the same 3731 decisions
-and 14448 targets either side, so no sampled action moved.
+## A second pass, after the card describer (v4)
+
+The describer and v4's per-config towers added new per-solve work, and it was
+all written as scalar triple loops sitting next to matmuls that run at ~1.3
+Tflop/s. Fixing that, and moving one older loop onto the coprocessor as well, is
+**+8.9%** end to end on the generation benchmark, with bit-identical
+trajectories — the same 3731 decisions and 14448 targets either side, so no
+sampled action moved.
 
 | | |
 |---|---|
-| holding tower | one matmul over `[n * NSLOT, hf]` plus a segmented sum |
+| holding tower (v4's config tower) | one matmul over `[n * NSLOT, hf]` plus a segmented sum |
 | pile summary | the card half is constant across a solve, so it folds into the bias; what is left is four counts wide |
 | per-config readout | `[rows, rank] x [ncfg, rank]^T` instead of ~8.5k short NEON dots per iteration |
-| policy logits | same shape, same new `gemm_nt` |
 
 The readout is the interesting one: it is **~7x the arithmetic** — a leaf carries
 ~18 configs and a solve interns ~160 — and still wins, because AMX against NEON
@@ -281,5 +294,6 @@ The first pass's warning about a busy machine was understated. Single runs here
 vary by 12%, and sequential A/B — build one, measure, build the other, measure —
 gave the *wrong sign* on two of these three. Every number above is
 **interleaved** (A, B, A, B, ...) and best-of-N, which is the only way a 3%
-effect is separable from drift on a laptop. `rebelbench` takes a warm-start
-weight as its sixth argument so the policy path can be profiled too.
+effect is separable from drift on a laptop. `rebelbench` takes
+`weights games depth iters threads`, so a comparison is only a comparison with
+all four pinned.

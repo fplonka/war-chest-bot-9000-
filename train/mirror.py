@@ -9,11 +9,12 @@ with the two players' roles exchanged.
 That makes every training row usable twice, for free and with no cost at
 generation time.
 
-Applied on the fly to a fraction of each batch rather than stored, so the
+Applied to the second canonical view of every row rather than stored, so the
 replay buffer does not double. The transform permutes the frozen row fields
 (`warchest.ROW_*` byte slices) directly; the network input is expanded from
 the mirrored row afterwards, so the encoder itself never has to know about the
-mirror.
+mirror. The auxiliary ownership target rides along: its ten bytes are indexed
+by location, so they permute with the locations and their owners swap seats.
 
 Correctness
 -----------
@@ -37,6 +38,21 @@ PILE_COUNTS = warchest.PILE_COUNTS
 NONE = 255
 
 HEXMAP = np.asarray(warchest.hex_mirror(), dtype=np.int64)
+LOCATIONS = np.asarray(warchest.location_hexes(), dtype=np.int64)
+# The auxiliary target is indexed by location, not by hex, so the row mirror
+# needs the location permutation the hex permutation induces. It exists only
+# because the rotation maps the location set onto itself — assert that rather
+# than trust it, since a board edit could break it silently.
+_AT = np.full(N_HEXES, -1, np.int64)
+_AT[LOCATIONS] = np.arange(len(LOCATIONS))
+LOCMAP = _AT[HEXMAP[LOCATIONS]]
+assert (LOCMAP >= 0).all(), "the location set is not closed under the board mirror"
+
+
+def _flip_seat(v):
+    """Owner bytes swap seats; anything else (255, or `neither`) is fixed."""
+    return np.where(v == 0, 1, np.where(v == 1, 0, v))
+
 
 def _swap(a, lo, width):
     """Two consecutive per-player blocks of `width` exchange places."""
@@ -56,19 +72,22 @@ def mirror_rows(rows):
     # seats (0 <-> 1, NONE stays).
     for (lo, w) in [(o, N_HEXES), (s, N_HEXES), (h, N_HEXES), (m, N_HEXES)]:
         out[:, lo:lo + w] = rows[:, lo + HEXMAP]
-    def flip(v):
-        return np.where(v == 0, 1, np.where(v == 1, 0, v))
-    out[:, o:o + N_HEXES] = flip(out[:, o:o + N_HEXES])
-    out[:, m:m + N_HEXES] = flip(out[:, m:m + N_HEXES])
+    out[:, o:o + N_HEXES] = _flip_seat(out[:, o:o + N_HEXES])
+    out[:, m:m + N_HEXES] = _flip_seat(out[:, m:m + N_HEXES])
     # Player-major blocks swap halves: unit ids (NSLOT per player), piles
     # (NSLOT * PILE_COUNTS per player).
     _swap(out, warchest.ROW_IDS, NSLOT)
     _swap(out, warchest.ROW_PILES, NSLOT * PILE_COUNTS)
     # Initiative holder and the player to act swap; initiative-moved and the
     # horizon do not.
-    out[:, warchest.ROW_INITIATIVE] = flip(out[:, warchest.ROW_INITIATIVE])
-    out[:, warchest.ROW_TO_ACT] = flip(out[:, warchest.ROW_TO_ACT])
+    out[:, warchest.ROW_INITIATIVE] = _flip_seat(out[:, warchest.ROW_INITIATIVE])
+    out[:, warchest.ROW_TO_ACT] = _flip_seat(out[:, warchest.ROW_TO_ACT])
     return out
+
+
+def mirror_aux(aux):
+    """Mirror the auxiliary ownership target. `aux` is `[n, N_LOCATIONS]` u8."""
+    return _flip_seat(aux[:, LOCMAP])
 
 
 # The feature-level mirror of the *expanded* encoding, kept only as the
@@ -155,17 +174,29 @@ def self_check(vx, n=512):
     return True
 
 
-def self_check_rows(rows, cc, cp, seg):
-    """The row-level checks: involution, and expansion commutes with the
-    feature mirror. `rows` may be a leading slice of the batch; the config
-    arrays are the full batch's, so sizes are read from the first config of
-    each span as usual."""
+def self_check_rows(rows, aux, cc, cp, seg):
+    """The row-level checks: involution, the auxiliary permutation, and
+    expansion commuting with the feature mirror. `rows` and `aux` may be a
+    leading slice of the batch; the config arrays are the full batch's, so
+    sizes are read from the first config of each span as usual."""
     mr = mirror_rows(rows)
     assert np.array_equal(mirror_rows(mr), rows), "row mirror is not an involution"
     # Unit ids swap players; piles swap players.
     ids = rows[:, warchest.ROW_IDS:warchest.ROW_IDS + NTYPE]
     mids = mr[:, warchest.ROW_IDS:warchest.ROW_IDS + NTYPE]
     assert np.array_equal(ids[:, :NSLOT], mids[:, NSLOT:]), "unit ids did not swap"
+    # The aux bytes are location-indexed, so they are checked twice: once for
+    # the involution, and once against the *hex*-indexed permutation the rows
+    # themselves use, which is an independent route to LOCMAP and catches an
+    # inverted composition that a self-consistent involution would not.
+    assert len(aux) == len(rows), (len(aux), len(rows))
+    assert np.isin(aux, (0, 1, 2)).all(), "aux is not a three-way owner label"
+    ma = mirror_aux(aux)
+    assert np.array_equal(mirror_aux(ma), aux), "aux mirror is not an involution"
+    hexed = np.full((len(aux), N_HEXES), NONE, np.uint8)
+    hexed[:, LOCATIONS] = aux
+    want = _flip_seat(hexed[:, HEXMAP])[:, LOCATIONS]
+    assert np.array_equal(ma, want), "the aux mirror is not the hex permutation"
     # Expansion commutes: expand(mirror(rows)) == mirror_x(expand(rows)).
     from train import expand_batch, public_sizes
     n = len(rows)

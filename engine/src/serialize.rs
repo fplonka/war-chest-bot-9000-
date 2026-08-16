@@ -19,9 +19,10 @@
 //! `docs/TREE.md`; see that file for the meaning of each array.
 
 use crate::actions::Action;
-use crate::net::V4Layout;
+use crate::board::N_HEXES;
+use crate::net::{V5Layout, C, CFGH, D, JOIN_IN, JW, POOL, TYPE};
 use crate::rebel::Config;
-use crate::rebel::{CFEAT, GPU_ROW_BYTES, NSLOT, NTYPE};
+use crate::rebel::{CFEAT, GPU_ROW_BYTES, LOOSE, NSLOT, NTYPE};
 use crate::search::{Cfr, Solver};
 use crate::units::{write_card_features, CARD_FEATS};
 use std::rc::Rc;
@@ -29,8 +30,8 @@ use std::rc::Rc;
 /// The byte format this module writes. Bump when an array changes shape or
 /// meaning (docs/TREE.md "the version bumps when any of them changes shape or
 /// meaning").
-pub const JOB_VERSION: u32 = 7;
-const MAGIC: u32 = 0x5743_4A37; // "WCJ7"
+pub const JOB_VERSION: u32 = 8;
+const MAGIC: u32 = 0x5743_4A38; // "WCJ8"
 
 /// Runtime metadata that travels with a job (not part of the frozen tree
 /// contract — it is per-request).
@@ -134,8 +135,6 @@ pub struct PackedTables {
     // -- derived: BFS level order for the sweeps --
     pub bfs_order: Vec<u32>,
     pub level_start: Vec<u32>,
-    // -- the draft's unit ids in player-major slot order --
-    pub ids: Vec<u8>,
 }
 
 /// One solve job: the tree tables, the root beliefs, and the previous solve's
@@ -485,15 +484,16 @@ pub(crate) fn device_value_layout(t: &PackedTables) -> Option<([Vec<u32>; 2], us
     Some((base, lengths[0].max(lengths[1])))
 }
 
-/// The public tower is a per-row map, so the device runs it in chunks of this
-/// many canonical view rows. Its input row is `PUBLIC_IN` floats wide -- by far
-/// the widest thing a wave touches -- and chunking is what keeps a mature
-/// wave's arena off the exclusive one-job route.
-pub const TOWER_CHUNK_ROWS: usize = 16 * 1024;
+/// The trunk is a per-row map, so the device runs it in chunks of this many
+/// canonical view rows. A row carries 37 hex tokens through eight residual
+/// blocks, which is ~85 KiB of working tensors per row -- by far the widest
+/// thing a wave touches -- and chunking is what keeps a mature wave's arena
+/// off the exclusive one-job route.
+pub const TRUNK_CHUNK_ROWS: usize = 512;
 
 fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
     let t = &job.tables;
-    let Ok(_l) = V4Layout::new(&job.meta.net_dims) else {
+    let Ok(_l) = V5Layout::new(&job.meta.net_dims) else {
         return usize::MAX;
     };
     let (rows, cfgs, cells) = (t.rows, t.ncfg, t.ncells);
@@ -507,12 +507,11 @@ fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
         0
     };
     let mul = |a: usize, b: usize| a.saturating_mul(b);
-    let tower_rows = mul(2, rows).min(TOWER_CHUNK_ROWS);
-    let bh = mul(tower_rows, crate::net::PUBLIC)
-        .max(mul(mul(cfgs, NSLOT), crate::net::SLOT))
-        .max(mul(2 * NTYPE, crate::net::UNIT))
-        .max(mul(cfgs, crate::net::CONFIG));
-    let bg = mul(2 * NTYPE, CARD_FEATS).max(mul(mul(cfgs, NSLOT), 3 + crate::net::UNIT));
+    let queries = mul(2, rows);
+    let chunk = queries.min(TRUNK_CHUNK_ROWS);
+    let cards = mul(2 * NTYPE, TYPE);
+    let hidden = cards.max(mul(mul(cfgs, NSLOT), CFGH));
+    let pack = mul(2 * NTYPE, CARD_FEATS).max(mul(mul(cfgs, NSLOT), 3 + TYPE));
     let sizes = [
         reach,
         reach.max(vals),
@@ -521,24 +520,34 @@ fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
         cells,
         cells,
         cells,
-        mul(2 * NTYPE, crate::net::UNIT),
-        mul(cfgs, crate::net::CONFIG),
-        mul(cfgs, crate::net::JOINT),
-        mul(2 * rows, crate::net::PUBLIC),
-        mul(2 * rows, crate::net::CONFIG),
-        mul(rows, crate::net::CONTEXT),
-        mul(rows, crate::net::CONTEXT),
-        mul(rows, crate::net::JOINT),
+        cards,
+        mul(2 * NTYPE, 3 * POOL),
+        mul(cfgs, D),
+        mul(cfgs, POOL),
+        mul(queries, D),
+        mul(queries, JW),
+        mul(queries, POOL),
+        mul(rows, JOIN_IN),
+        mul(rows, JW),
+        mul(rows, JW),
+        mul(rows, D),
         roots,
         mul(carry_snaps, t.snapshot_configs).div_ceil(2),
-        mul(tower_rows, crate::net::PUBLIC_IN),
-        bh,
-        bh,
-        bg,
+        mul(chunk, NTYPE * TYPE),
+        mul(chunk, NTYPE * C),
+        mul(chunk, N_HEXES * C),
+        mul(chunk, (N_HEXES + 1) * C),
+        mul(chunk, N_HEXES * 2 * C),
+        mul(chunk, 2 * C),
+        mul(chunk, C),
+        mul(chunk, 2 * C + LOOSE),
+        pack,
+        hidden,
+        mul(cfgs, CFGH),
     ];
-    // Same three-region layout as `gpu::device::arena_layout`: persistent tower
-    // outputs, then one region shared by the tower scratch and the CFR state,
-    // which are never live at the same time.
+    // Same three-region layout as `gpu::device::arena_layout`: persistent
+    // network outputs, then one region shared by the trunk scratch and the CFR
+    // state, which are never live at the same time.
     let span = |group: &[usize]| {
         let mut floats = 0usize;
         for &n in group {
@@ -549,16 +558,25 @@ fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
     };
     let at = |a: DeviceArena| sizes[a as usize];
     let persistent = span(&[
-        at(DeviceArena::E),
-        at(DeviceArena::Z),
+        at(DeviceArena::F),
         at(DeviceArena::G),
-        at(DeviceArena::H0),
+        at(DeviceArena::P),
+        at(DeviceArena::Jp),
     ]);
-    let tower = span(&[
-        at(DeviceArena::Bx),
-        at(DeviceArena::Bh),
-        at(DeviceArena::Bh2),
-        at(DeviceArena::Bg),
+    let trunk = span(&[
+        at(DeviceArena::Cards),
+        at(DeviceArena::Bag),
+        at(DeviceArena::Tok),
+        at(DeviceArena::Ts),
+        at(DeviceArena::X),
+        at(DeviceArena::A),
+        at(DeviceArena::Mix),
+        at(DeviceArena::Pool),
+        at(DeviceArena::Gb),
+        at(DeviceArena::Board),
+        at(DeviceArena::Pack),
+        at(DeviceArena::Hidden),
+        at(DeviceArena::Cfg),
     ]);
     let solve = span(&[
         at(DeviceArena::Reach),
@@ -568,14 +586,15 @@ fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
         at(DeviceArena::Cur),
         at(DeviceArena::Sum),
         at(DeviceArena::SnapStrat),
-        at(DeviceArena::Xb),
+        at(DeviceArena::Pooled),
+        at(DeviceArena::Jin),
+        at(DeviceArena::Z),
+        at(DeviceArena::Jt),
         at(DeviceArena::H),
-        at(DeviceArena::H2),
-        at(DeviceArena::U),
         at(DeviceArena::RootValues),
         at(DeviceArena::Carry),
     ]);
-    let floats = (persistent.saturating_add(31) & !31usize).saturating_add(tower.max(solve));
+    let floats = (persistent.saturating_add(31) & !31usize).saturating_add(trunk.max(solve));
     floats
         .checked_next_power_of_two()
         .unwrap_or(floats)
@@ -594,20 +613,30 @@ enum DeviceArena {
     Cur,
     Sum,
     SnapStrat,
-    E,
-    Z,
+    Cards,
+    Bag,
+    F,
     G,
-    H0,
-    Xb,
+    P,
+    Jp,
+    Pooled,
+    Jin,
+    Z,
+    Jt,
     H,
-    H2,
-    U,
     RootValues,
     Carry,
-    Bx,
-    Bh,
-    Bh2,
-    Bg,
+    Tok,
+    Ts,
+    X,
+    A,
+    Mix,
+    Pool,
+    Gb,
+    Board,
+    Pack,
+    Hidden,
+    Cfg,
 }
 
 impl PackedTables {
@@ -615,7 +644,6 @@ impl PackedTables {
         let u8s = self.node_kind.len()
             + self.node_player.len()
             + self.leaf_raw.len()
-            + self.ids.len()
             + self.cplayer.len();
         let u32s = self.node_child_start.len()
             + self.node_child.len()
@@ -826,7 +854,6 @@ impl PackedTables {
         t.children = t.node_child.len();
         t.draw_entries = t.draw_to.len();
         t.reach_len = reach_at as usize;
-        t.ids = sv.ids[..NTYPE].to_vec();
 
         // Leaves.
         t.nleaf = sv.leaf_rows.len();
@@ -1088,7 +1115,6 @@ impl PackedJob {
         // levels
         w.u32s(&t.bfs_order);
         w.u32s(&t.level_start);
-        w.u8s(&t.ids);
         // beliefs
         w.f32s(&self.root[0]);
         w.f32s(&self.root[1]);
@@ -1175,7 +1201,6 @@ impl PackedJob {
         t.cplayer = r.u8s("cplayer")?;
         t.bfs_order = r.u32s("bfs_order")?;
         t.level_start = r.u32s("level_start")?;
-        t.ids = r.u8s("ids")?;
         // sanity checks
         rd_check(t.node_kind.len(), nodes, "node_kind")?;
         rd_check(t.node_player.len(), nodes, "node_player")?;
@@ -1250,7 +1275,7 @@ impl PackedJob {
                 snapshots: true,
                 cfr: Cfr::DISCOUNTED,
                 snap_iters: vec![0, 1, 2, 4],
-                net_dims: vec![4],
+                net_dims: crate::net::MODEL_TAG.to_vec(),
             },
             tables: PackedTables {
                 nodes: 1,
@@ -1291,7 +1316,6 @@ impl PackedJob {
                 cplayer: vec![0],
                 bfs_order: vec![0],
                 level_start: vec![0, 1],
-                ids: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
                 ..Default::default()
             },
             root: [vec![1.0], vec![1.0]],

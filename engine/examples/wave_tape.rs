@@ -17,7 +17,7 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use warchest::gpu::client::PreparedJob;
-use warchest::net::Mlp;
+use warchest::net::Net;
 use warchest::rebel::Ctx;
 use warchest::roots;
 use warchest::search::{Cfg, Cfr, Nets, Solver};
@@ -30,8 +30,8 @@ fn main() {
     let root_limit = arg(&args, 3, 256);
     let seconds = arg(&args, 4, 30);
 
-    let (dims, w, b, ln) = Mlp::load_flat_bin(weights).expect("weights");
-    let net = Mlp::from_flat(&dims, &w, &b, &ln).expect("network");
+    let (dims, w, b, ln) = Net::load_flat_bin(weights).expect("weights");
+    let net = Net::from_flat(&dims, &w, &b, &ln).expect("network");
     let nets = Nets { value: net };
     let root_file = std::fs::File::open(roots_path).expect("roots file");
     let roots = roots::read_roots(&mut BufReader::new(root_file)).expect("roots");
@@ -75,8 +75,17 @@ fn main() {
     let gpus: Vec<_> = devices
         .iter()
         .map(|&device| {
-            warchest::gpu::service::spawn(device, dims.clone(), w.clone(), b.clone(), ln.clone())
-                .expect("GPU executor")
+            // Production GEMM path: the tape measures what training runs, not
+            // the oracle-comparison SGEMM.
+            warchest::gpu::service::spawn(
+                device,
+                dims.clone(),
+                w.clone(),
+                b.clone(),
+                ln.clone(),
+                false,
+            )
+            .expect("GPU executor")
         })
         .collect();
     // Warm up cuBLAS, NVRTC, graph creation, and the allocator outside the

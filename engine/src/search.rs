@@ -39,7 +39,7 @@
 
 use crate::actions::Action;
 use crate::board::NONE;
-use crate::net::Mlp;
+use crate::net::Net;
 use crate::rebel::*;
 use crate::state::{Cont, State};
 use crate::units::{ENSIGN, MARSHAL, ROYAL_COIN};
@@ -233,7 +233,7 @@ pub enum Back {
 /// The value network: `(PBS, config) -> counterfactual value`.
 #[derive(Clone, Default)]
 pub struct Nets {
-    pub value: Mlp,
+    pub value: Net,
 }
 
 impl Nets {
@@ -448,20 +448,21 @@ impl TNode {
 /// The per-solve buffers, pooled *by role*: they differ in size by 5x, so a
 /// single shared pool handed each one somebody else's buffer and made it grow
 /// — and growth is the one thing that zeroes.
-const N_ROLES: usize = 7;
-const R_H0: usize = 0;
+const N_ROLES: usize = 8;
+const R_PB: usize = 0;
 const R_XPUB: usize = 1;
-const R_XB0: usize = 2;
-const R_OB: usize = 3;
+const R_XB: usize = 2;
+const R_H: usize = 3;
 const R_CPHI: usize = 4;
-const R_CZ: usize = 5;
+const R_CF: usize = 5;
 const R_CG: usize = 6;
+const R_JP: usize = 7;
 
 thread_local! {
     static BUFS: std::cell::RefCell<[Vec<Vec<f32>>; N_ROLES]> = const {
         std::cell::RefCell::new([
             Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
         ])
     };
 }
@@ -639,7 +640,9 @@ pub struct Solver<'a> {
     // ---------------------------------------------------------- leaf batch
     // Built once per solve. Everything here is a property of the leaf's public
     // state or its config support, so it survives every CFR iteration; only
-    // `xb` (the belief blocks) is rewritten per iteration.
+    // the belief block `xb` and the join output `h` are rewritten
+    // per iteration. That split is the whole architecture: the trunk runs
+    // ~2,000 times a solve and the join ~158,000.
     /// Non-terminal leaves in node order — the rows of the network batch.
     pub leaf_rows: Vec<usize>,
     /// Terminal leaves, scored from the game instead of the network.
@@ -655,24 +658,28 @@ pub struct Solver<'a> {
     /// How many distinct configs `cphi` actually holds. Pooled buffers keep
     /// their length across solves, so the count cannot be read off `cphi.len()`.
     pub ncfg: usize,
-    /// `embed` output for `cphi`: the belief embedding and the readout
-    /// embedding. Both survive every CFR iteration.
-    pub cz: Vec<f32>,
+    /// `[ncfg, D]` readout rows `f(c)` and `[ncfg, POOL]` pooling vectors
+    /// `g(c)`. Both survive every CFR iteration.
+    pub cf: Vec<f32>,
     pub cg: Vec<f32>,
-    /// Two canonical unit tables, one per player view.
-    pub ce: Vec<f32>,
+    /// `[2, NTYPE, TYPE]`: the printed-card tokens, one table per player view.
+    /// The draft is fixed for the solve, so this is built once.
+    pub cards: Vec<f32>,
     pub(crate) ids: [u8; 2 * NTYPE],
-    /// `rows * hidden`: the public half of the hidden layer.
-    pub h0: Vec<f32>,
+    /// `[2 * rows, D]` board vectors, and their `[2 * rows, JW]` projection
+    /// into the join's first layer. Neither moves between CFR iterations.
+    pub pb: Vec<f32>,
+    pub jp: Vec<f32>,
     /// Expanded public encoding, filled during the build.
     pub(crate) xpub: Vec<f32>,
     /// Compact public rows for GPU admission. The device expands these into
     /// the same trunk input; a GPU-built solver never materialises `xpub`.
     pub(crate) gpu_rows: Vec<u8>,
-    /// `rows * 2 * dg`: both players' belief embeddings.
+    /// `[2 * rows, POOL]` pooled belief embeddings — the one thing the join
+    /// reads that moves between CFR iterations.
     pub xb: Vec<f32>,
-    /// `rows * hidden`: the hidden layer, rebuilt per iteration.
-    pub ob: Vec<f32>,
+    /// `[rows, D]`: the join output for the last traverser queried.
+    pub h: Vec<f32>,
     /// Normalised belief weights for one leaf's support.
     wbuf: Vec<f32>,
     batch_ready: bool,
@@ -693,12 +700,13 @@ pub struct Solver<'a> {
 impl Drop for Solver<'_> {
     fn drop(&mut self) {
         for (role, v) in [
-            (R_H0, &mut self.h0),
+            (R_PB, &mut self.pb),
+            (R_JP, &mut self.jp),
             (R_XPUB, &mut self.xpub),
-            (R_XB0, &mut self.xb),
-            (R_OB, &mut self.ob),
+            (R_XB, &mut self.xb),
+            (R_H, &mut self.h),
             (R_CPHI, &mut self.cphi),
-            (R_CZ, &mut self.cz),
+            (R_CF, &mut self.cf),
             (R_CG, &mut self.cg),
         ] {
             give_buf(role, std::mem::take(v));
@@ -761,15 +769,16 @@ impl<'a> Solver<'a> {
             cplayer: Vec::new(),
             cmap: std::collections::HashMap::with_capacity_and_hasher(1024, KeyHash),
             ncfg: 0,
-            cz: take_buf(R_CZ),
+            cf: take_buf(R_CF),
             cg: take_buf(R_CG),
-            ce: Vec::new(),
+            cards: Vec::new(),
             ids,
-            h0: take_buf(R_H0),
+            pb: take_buf(R_PB),
+            jp: take_buf(R_JP),
             xpub: take_buf(R_XPUB),
             gpu_rows: Vec::new(),
-            xb: take_buf(R_XB0),
-            ob: take_buf(R_OB),
+            xb: take_buf(R_XB),
+            h: take_buf(R_H),
             wbuf: Vec::new(),
             batch_ready: false,
             last_traverser: None,
@@ -1448,98 +1457,104 @@ impl<'a> Solver<'a> {
     }
 
     /// Everything about the batch that does not move between CFR iterations:
-    /// the public tower, and the config tower over every distinct config in the
-    /// tree. Both are pure functions of the subgame, so this runs once.
+    /// the card tokens, the board trunk, the projection of its output into the
+    /// join, and the config encoder over every distinct config in the tree.
+    /// All four are pure functions of the subgame, so this runs once — which
+    /// is what buys the trunk its depth.
     fn ensure_leaf_batch(&mut self) {
         if self.batch_ready {
             return;
         }
         self.batch_ready = true;
+        self.leaf_coff.push(self.leaf_cidx.len() as u32);
         if self.nets.value.is_empty() {
-            self.leaf_coff.push(self.leaf_cidx.len() as u32);
             return;
         }
-        self.leaf_coff.push(self.leaf_cidx.len() as u32);
         let rows = self.leaf_rows.len();
         let net = &self.nets.value;
         debug_assert_eq!(net.pub_dim(), PUBFEAT);
         debug_assert_eq!(net.cfeat(), CFEAT);
-        if self.xb.len() < rows * 2 * net.dg() {
-            self.xb.resize(rows * 2 * net.dg(), 0.0);
-        }
+        crate::net::fit(&mut self.xb, 2 * rows * crate::net::POOL);
         shape!(NCFG, self.ncfg);
         let _t = timed!(PUBNET);
         let xpub = std::mem::take(&mut self.xpub);
         // The cards in play are fixed at the draft, so every row of the subgame
-        // carries the same card block and the table is built once. Everything
-        // downstream reads it by canonical coin-type index.
+        // carries the same card block and the table is built once, one view per
+        // seat. Everything downstream reads it by canonical coin-type index.
         if rows > 0 {
-            net.units(&xpub[..2 * PUBFEAT], &self.ids, 2, &mut self.ce);
+            net.cards(&xpub[..2 * PUBFEAT], 2, &mut self.cards);
         }
-        net.public(&xpub, &self.ce, 2 * rows, 2, &mut self.h0);
+        net.board(&xpub, &self.cards, 2 * rows, 2, &mut self.pb);
+        net.join_cache(&self.pb, 2 * rows, &mut self.jp);
         self.xpub = xpub;
         let cphi = std::mem::take(&mut self.cphi);
         let config_owner: Vec<u32> = self.cplayer.iter().map(|&p| p as u32).collect();
-        net.embed(
+        net.configs(
             &cphi[..self.ncfg * CFEAT],
             &config_owner,
             self.ncfg,
-            &self.ce,
-            &mut self.cz,
+            &self.cards,
+            &mut self.cf,
             &mut self.cg,
         );
         self.cphi = cphi;
     }
 
+    /// Rewrite the pooled belief block the join reads, per row per player.
+    /// `only` restricts the work to one player — between two CFR queries just
+    /// one player's strategy has moved, so the other block is still exactly
+    /// what it was.
+    ///
+    /// The belief the network reads is the normalised reach, as in the
+    /// reference, pooled over the same `g(c)` the readout's `f(c)` comes from,
+    /// so a config is described to the network exactly one way. `g` has a
+    /// linear card-weighted half, which is what makes this pooled vector carry
+    /// the belief's exact expected holding of each card rather than an average
+    /// of nonlinearities.
+    fn belief_blocks(&mut self, only: Option<usize>) {
+        let _t = timed!(BELFEAT);
+        let (reach, roff, nc, coff, cidx, cg, wbuf, xb) = (
+            &self.reach,
+            &self.roff,
+            &self.nc,
+            &self.leaf_coff,
+            &self.leaf_cidx,
+            &self.cg,
+            &mut self.wbuf,
+            &mut self.xb,
+        );
+        let pool = crate::net::POOL;
+        for (r, &i) in self.leaf_rows.iter().enumerate() {
+            for p in 0..2 {
+                if only.is_some_and(|l| l != p) {
+                    continue;
+                }
+                let n = nc[i][p] as usize;
+                let ra = roff[i] as usize + if p == 1 { nc[i][0] as usize } else { 0 };
+                if wbuf.len() < n {
+                    wbuf.resize(n, 0.0);
+                }
+                normalize_weights(&reach[ra..ra + n], &mut wbuf[..n]);
+                let q = 2 * r + p;
+                let cs = coff[q] as usize;
+                crate::net::accumulate(
+                    cg,
+                    &cidx[cs..cs + n],
+                    &wbuf[..n],
+                    pool,
+                    &mut xb[q * pool..(q + 1) * pool],
+                );
+            }
+        }
+    }
+
     /// Fill `vals` at every leaf with the traverser's counterfactual values.
     pub fn leaf_values(&mut self, traverser: usize) {
         self.ensure_leaf_batch();
-        let empty = self.nets.value.is_empty();
-        let dg = if empty { 0 } else { self.nets.value.dg() };
-        // Only one player's beliefs have moved since the previous query: the
-        // one whose strategy regret matching updated at the end of the last
-        // step. The other player's embedding is still exactly what it was, so
-        // it is not rewritten.
         let redo = self.last_traverser;
         self.last_traverser = Some(traverser);
-        if !empty {
-            let _t = timed!(BELFEAT);
-            let (reach, roff, nc, coff, cidx, cz, wbuf, xb) = (
-                &self.reach,
-                &self.roff,
-                &self.nc,
-                &self.leaf_coff,
-                &self.leaf_cidx,
-                &self.cz,
-                &mut self.wbuf,
-                &mut self.xb,
-            );
-            for (r, &i) in self.leaf_rows.iter().enumerate() {
-                for p in 0..2 {
-                    if redo.is_some_and(|l| l != p) {
-                        continue;
-                    }
-                    let n = nc[i][p] as usize;
-                    let ra = roff[i] as usize + if p == 1 { nc[i][0] as usize } else { 0 };
-                    // The belief the network reads is the normalised reach, as
-                    // in the reference -- but as a weighted sum of the same
-                    // config embeddings the value readout uses, so a config is
-                    // described to the network exactly one way.
-                    if wbuf.len() < n {
-                        wbuf.resize(n, 0.0);
-                    }
-                    normalize_weights(&reach[ra..ra + n], &mut wbuf[..n]);
-                    let at = r * 2 * dg + p * dg;
-                    let cs = coff[2 * r + p] as usize;
-                    crate::net::accumulate(
-                        cz,
-                        &cidx[cs..cs + n],
-                        &wbuf[..n],
-                        dg,
-                        &mut xb[at..at + dg],
-                    );
-                }
-            }
+        if !self.nets.value.is_empty() {
+            self.belief_blocks(redo);
         }
         self.pbs_head(traverser);
         self.readout(traverser);
@@ -1549,38 +1564,14 @@ impl<'a> Solver<'a> {
     /// gets its own PBS-head query over these same beliefs.
     fn leaf_beliefs_both(&mut self) {
         self.ensure_leaf_batch();
-        let empty = self.nets.value.is_empty();
-        let dg = if empty { 0 } else { self.nets.value.dg() };
         self.last_traverser = None;
-        if empty {
+        if self.nets.value.is_empty() {
             return;
         }
-        let _t = timed!(BELFEAT);
-        let (reach, roff, nc, coff, cidx, cz, wbuf, xb) = (
-            &self.reach,
-            &self.roff,
-            &self.nc,
-            &self.leaf_coff,
-            &self.leaf_cidx,
-            &self.cz,
-            &mut self.wbuf,
-            &mut self.xb,
-        );
-        for (r, &i) in self.leaf_rows.iter().enumerate() {
-            for p in 0..2 {
-                let n = nc[i][p] as usize;
-                let ra = roff[i] as usize + if p == 1 { nc[i][0] as usize } else { 0 };
-                if wbuf.len() < n {
-                    wbuf.resize(n, 0.0);
-                }
-                normalize_weights(&reach[ra..ra + n], &mut wbuf[..n]);
-                let at = r * 2 * dg + p * dg;
-                let cs = coff[2 * r + p] as usize;
-                crate::net::accumulate(cz, &cidx[cs..cs + n], &wbuf[..n], dg, &mut xb[at..at + dg]);
-            }
-        }
+        self.belief_blocks(None);
     }
 
+    /// The one path CFR pays for on every iteration.
     fn pbs_head(&mut self, traverser: usize) {
         let net = &self.nets.value;
         if net.is_empty() {
@@ -1588,19 +1579,13 @@ impl<'a> Solver<'a> {
         }
         let _t = timed!(NET);
         let rows = self.leaf_rows.len();
-        net.context(
-            &self.xb[..rows * 2 * net.dg()],
-            rows,
-            &self.h0,
-            traverser,
-            &mut self.ob,
-        );
+        net.join(&self.pb, &self.jp, &self.xb, rows, traverser, &mut self.h);
     }
 
     /// Per-config leaf values for player `p` — counterfactual: the network's
     /// value for that exact config times the opponent's unnormalised reach
-    /// into the leaf. Runs off the `ob` left by the last `leaf_values` /
-    /// `pbs_head` query.
+    /// into the leaf. Runs off the `h` left by the last `pbs_head` query, and
+    /// is one dot product per config.
     pub fn readout(&mut self, p: usize) {
         let _t = timed!(LEAFPOST);
         let empty = self.nets.value.is_empty();
@@ -1619,14 +1604,15 @@ impl<'a> Solver<'a> {
             let vo = self.voff[i] as usize;
             self.vals[vo..vo + n].fill(u * opp_reach);
         }
-        let (reach, roff, ncs, voff, coff, cidx, cg, vals) = (
+        let d = crate::net::D;
+        let (reach, roff, ncs, voff, coff, cidx, cf, vals) = (
             &self.reach,
             &self.roff,
             &self.nc,
             &self.voff,
             &self.leaf_coff,
             &self.leaf_cidx,
-            &self.cg,
+            &self.cf,
             &mut self.vals,
         );
         for (r, &i) in self.leaf_rows.iter().enumerate() {
@@ -1640,8 +1626,8 @@ impl<'a> Solver<'a> {
             }
             let cs = coff[2 * r + p] as usize;
             self.nets.value.values(
-                &self.ob[r * crate::net::JOINT..(r + 1) * crate::net::JOINT],
-                cg,
+                &self.h[r * d..(r + 1) * d],
+                cf,
                 &cidx[cs..cs + n],
                 &mut vals[vo..vo + n],
             );

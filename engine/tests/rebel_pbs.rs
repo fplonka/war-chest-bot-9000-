@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 
-use warchest::net::Mlp;
+use warchest::net::Net;
 use warchest::rebel::*;
 use warchest::rng::Rng;
 use warchest::search::{node_actions, Cfg, Nets, Solver};
@@ -37,11 +37,12 @@ use warchest::units::{write_card_features, CARD_FEATS};
 use warchest::Action;
 
 /// A network with random weights, for tests that need the value function to
-/// actually distinguish things rather than return zero.
-fn random_net(seed: u64, _hidden: usize, _dg: usize) -> Mlp {
+/// actually distinguish things rather than return zero. LayerNorms start at the
+/// identity (gamma = 1, beta = 0); everything else is small and uniform.
+fn random_net(seed: u64) -> Net {
     let mut r = Rng::new(seed);
-    let dims = [4];
-    let layout = warchest::net::V4Layout::new(&dims).unwrap();
+    let dims = warchest::net::MODEL_TAG;
+    let layout = warchest::net::V5Layout::new(&dims).unwrap();
     let mut draw = |n: usize, scale: f32| -> Vec<f32> {
         (0..n)
             .map(|_| (r.unit_f64() as f32 - 0.5) * scale)
@@ -49,12 +50,11 @@ fn random_net(seed: u64, _hidden: usize, _dg: usize) -> Mlp {
     };
     let w = draw(layout.w_len, 0.2);
     let b = draw(layout.b_len, 0.2);
-    let mut ln = Vec::new();
-    for width in [384, 384, 384, 128, 128, 384, 384] {
-        ln.extend(std::iter::repeat_n(1.0, width));
-        ln.extend(std::iter::repeat_n(0.0, width));
+    let mut ln = vec![0.0; layout.ln_len];
+    for &(gamma, beta) in &layout.norms {
+        ln[gamma..beta].fill(1.0);
     }
-    Mlp::from_flat(&dims, &w, &b, &ln).expect("random net")
+    Net::from_flat(&dims, &w, &b, &ln).expect("random net")
 }
 
 /// Instantiate a world from the shared public state plus both configs.
@@ -639,7 +639,7 @@ fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
 #[test]
 fn a_subgame_of_only_terminal_leaves_solves() {
     let nets = Nets {
-        value: random_net(5, 64, 16),
+        value: random_net(5),
     };
     let mut checked = 0usize;
     for seed in 0..600u64 {
@@ -808,7 +808,7 @@ fn position_with_ambiguous_facedown(seed: u64) -> Option<(State, Ctx, [Belief; 2
 #[test]
 fn a_solve_reads_only_the_beliefs() {
     let mut nets = Nets::default();
-    nets.value = random_net(0xA11CE, 64, 16);
+    nets.value = random_net(0xA11CE);
     let cfg = Cfg {
         depth: 2,
         iters: 8,
@@ -866,7 +866,7 @@ fn a_solve_reads_only_the_beliefs() {
 #[test]
 fn the_value_function_separates_configs_sharing_a_hand() {
     let mut nets = Nets::default();
-    nets.value = random_net(0xBEEF, 64, 16);
+    nets.value = random_net(0xBEEF);
     let cfg = Cfg {
         depth: 2,
         iters: 8,

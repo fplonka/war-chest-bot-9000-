@@ -9,7 +9,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use crate::actions::Action;
-use crate::board::{board, NONE, N_HEXES};
+use crate::board::{board, N_HEXES, N_LOCATIONS, NONE};
 use crate::state::*;
 use crate::units::{def, index_of_id, write_card_features, CARD_FEATS, N_UNITS};
 
@@ -486,11 +486,12 @@ impl Game {
 // solve and every network evaluation runs here: Python only ships weights down
 // and pulls tensors back once per epoch.
 
-use crate::net::Mlp;
+use crate::net::Net;
 use crate::search::{Cfg, Cfr, Nets};
 use crate::selfplay::{eval_match as rs_eval_match, run_games, Agent, Collect, Data, GameCfg};
 use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2};
-use std::sync::{OnceLock, RwLock};
+use parking_lot::RwLock;
+use std::sync::LazyLock;
 
 /// Independent weight slots, so a match can pit one checkpoint against another.
 /// Slot 0 is the live network the trainer generates with; the rest hold
@@ -502,11 +503,12 @@ use std::sync::{OnceLock, RwLock};
 /// the trainer's publications to it. Without the `gpu` feature every call
 /// fails loudly — a misconfigured box must not silently run on the CPU.
 #[cfg(feature = "gpu")]
-static GPU_CLIENTS: OnceLock<parking_lot::Mutex<Vec<crate::gpu::GpuClient>>> = OnceLock::new();
+static GPU_CLIENTS: LazyLock<parking_lot::Mutex<Vec<crate::gpu::GpuClient>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(Vec::new()));
 
 #[cfg(feature = "gpu")]
 pub(crate) fn gpu_clients() -> &'static parking_lot::Mutex<Vec<crate::gpu::GpuClient>> {
-    GPU_CLIENTS.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+    &GPU_CLIENTS
 }
 
 /// Python-side handle for the continuous Rust actor/build/GPU pipeline. `next`
@@ -606,7 +608,7 @@ fn gpu_stream_start(
         eval_mix,
         mc_mix: 0.0,
     };
-    let nets = nets().read().unwrap().clone();
+    let nets = nets().read().clone();
     let clients = gpu_clients().lock().clone();
     if clients.is_empty() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -715,13 +717,16 @@ fn gpu_stop(_py: Python<'_>) -> PyResult<()> {
     Ok(())
 }
 
+/// The live weight slots. Slot 0 is `Nets::default()` until the trainer pushes
+/// weights: the greedy warm phase plays with no network at all.
+static NETS: LazyLock<RwLock<Vec<Nets>>> = LazyLock::new(|| RwLock::new(vec![Nets::default()]));
+
 pub(crate) fn nets() -> &'static RwLock<Vec<Nets>> {
-    static NETS: OnceLock<RwLock<Vec<Nets>>> = OnceLock::new();
-    NETS.get_or_init(|| RwLock::new(vec![Nets::default()]))
+    &NETS
 }
 
 fn check_slot(slot: usize) -> PyResult<()> {
-    let n = nets().read().unwrap();
+    let n = nets().read();
     if slot >= n.len() || n[slot].value.is_empty() {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "no weights in slot {}",
@@ -731,9 +736,9 @@ fn check_slot(slot: usize) -> PyResult<()> {
     Ok(())
 }
 
-/// Install value-network weights, growing the slot pool to fit. `dims` is
-/// `[pub, hidden, cfeat, dg]`; `w`, `b` and `ln` are the flat arrays
-/// `Mlp::from_flat` documents.
+/// Install value-network weights, growing the slot pool to fit. `dims` is the
+/// model tag (`net::MODEL_TAG`); `w`, `b` and `ln` are the flat arrays
+/// `Net::from_flat` documents.
 #[pyfunction]
 #[pyo3(signature = (dims, w, b, ln, slot=0))]
 fn set_weights(
@@ -743,13 +748,13 @@ fn set_weights(
     ln: PyReadonlyArray1<f32>,
     slot: usize,
 ) -> PyResult<()> {
-    let mlp = Mlp::from_flat(&dims, w.as_slice()?, b.as_slice()?, ln.as_slice()?)
+    let net = Net::from_flat(&dims, w.as_slice()?, b.as_slice()?, ln.as_slice()?)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    let mut n = nets().write().unwrap();
+    let mut n = nets().write();
     if slot >= n.len() {
         n.resize(slot + 1, Nets::default());
     }
-    n[slot].value = mlp;
+    n[slot].value = net;
     Ok(())
 }
 
@@ -810,6 +815,11 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
         if d.nv == 0 { 0 } else { 2 * d.nv + 1 },
         "config offsets do not match the row count"
     );
+    assert_eq!(
+        d.aux.len(),
+        d.nv * N_LOCATIONS,
+        "auxiliary owners do not match the row count"
+    );
     // Internal `soff` holds one start per solve; the exposed array appends
     // the total row count as the trailing entry, so `len - 1` is the number
     // of solves.
@@ -824,6 +834,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
         );
     }
     out.set_item("rows", d.rows.into_pyarray_bound(py))?;
+    out.set_item("aux", d.aux.into_pyarray_bound(py))?;
     out.set_item("row_bytes", crate::rebel::ROW_BYTES)?;
     out.set_item("cc", d.cc.into_pyarray_bound(py))?;
     out.set_item("cw", d.cw.into_pyarray_bound(py))?;
@@ -883,7 +894,7 @@ fn gen_data(
         mc_mix,
     };
     let d = py.allow_threads(|| {
-        let n = nets().read().unwrap();
+        let n = nets().read();
         run_games(games, seed, &n, &gc)
     });
     data_to_dict(py, d)
@@ -933,7 +944,7 @@ fn eval_match(
     #[cfg(feature = "gpu")]
     if gpu {
         return Ok(py.allow_threads(|| {
-            let n = nets().read().unwrap();
+            let n = nets().read();
             let clients = gpu_clients().lock().clone();
             crate::selfplay::eval_match_gpu(games, seed, &n, aa, bb, random_draft, &clients)
         }));
@@ -941,7 +952,7 @@ fn eval_match(
     #[cfg(not(feature = "gpu"))]
     let _ = gpu;
     Ok(py.allow_threads(|| {
-        let n = nets().read().unwrap();
+        let n = nets().read();
         rs_eval_match(games, seed, &n, aa, bb, random_draft)
     }))
 }
@@ -988,7 +999,7 @@ fn save_roots(
         mc_mix: 0.0,
     };
     let roots = py.allow_threads(|| {
-        let n = nets().read().unwrap();
+        let n = nets().read();
         crate::selfplay::collect_roots(games, seed, &n, &gc, cap)
     });
     let f = std::fs::File::create(path)
@@ -1020,10 +1031,9 @@ fn set_cap_value(v: f32) {
 }
 
 #[pyfunction]
-#[pyo3(signature = (xpub, unit_ids, phi, weight, seg, queries, slot=0))]
+#[pyo3(signature = (xpub, phi, weight, seg, queries, slot=0))]
 fn infer(
     xpub: PyReadonlyArray1<f32>,
-    unit_ids: PyReadonlyArray1<u8>,
     phi: PyReadonlyArray1<f32>,
     weight: PyReadonlyArray1<f32>,
     seg: PyReadonlyArray1<u32>,
@@ -1031,11 +1041,9 @@ fn infer(
     slot: usize,
 ) -> PyResult<Vec<f32>> {
     check_slot(slot)?;
-    let guard = nets().read().unwrap();
-    let mlp = &guard[slot].value;
-    Ok(mlp.forward(
+    let guard = nets().read();
+    Ok(guard[slot].value.forward(
         xpub.as_slice()?,
-        unit_ids.as_slice()?,
         phi.as_slice()?,
         weight.as_slice()?,
         seg.as_slice()?,
@@ -1043,14 +1051,6 @@ fn infer(
     ))
 }
 
-/// The gather a convolutional trunk needs: `N_HEXES * 7` indices, each hex
-/// followed by its six axial neighbours in a fixed direction order.
-///
-/// Off-board neighbours are `N_HEXES` itself, which indexes a zero row in a
-/// feature map padded to `N_HEXES + 1` — so an edge hex reads zeros in the
-/// missing directions instead of needing a mask. Direction order is preserved,
-/// which is what lets a stack of these express the straight-line and
-/// exactly-two-away relations the unit cards are full of.
 /// All 37 hexes' axial coords, indexed by hex. The browser UI's board
 /// geometry; mirrors `Board::coord`.
 #[pyfunction]
@@ -1082,28 +1082,27 @@ fn card_features_table() -> Vec<f32> {
     out
 }
 
+/// Which hexes are control locations, as a `[N_HEXES]` 0/1 mask.
 #[pyfunction]
 fn hex_location_flags() -> Vec<u8> {
     board().is_location.iter().map(|&x| x as u8).collect()
 }
 
+/// The trunk's neighbour gather: `[N_HEXES * 6]`, hex-major, fixed direction
+/// order, a missing neighbour written as `N_HEXES` so torch can gather from a
+/// zero-padded 38th row without a mask. `board::neighbour_gather` is the
+/// definition; the Rust trunk reads the same table.
 #[pyfunction]
-fn hex_neighborhood() -> Vec<u32> {
-    let bd = crate::board::board();
-    let n = crate::board::N_HEXES;
-    let mut out = Vec::with_capacity(n * 7);
-    for h in 0..n {
-        out.push(h as u32);
-        for d in 0..6 {
-            let x = bd.neighbors[h][d];
-            out.push(if x == crate::board::NONE {
-                n as u32
-            } else {
-                x as u32
-            });
-        }
-    }
-    out
+fn hex_neighbours() -> Vec<u8> {
+    crate::board::neighbour_gather()
+}
+
+/// The `N_LOCATIONS` location hex indices, in the order the auxiliary
+/// ownership head's outputs are laid out — and the order of every row's `aux`
+/// bytes.
+#[pyfunction]
+fn location_hexes() -> Vec<u8> {
+    board().location_hexes.to_vec()
 }
 
 /// `N_HEXES` indices: where each hex lands under a 180-degree rotation of the
@@ -1225,6 +1224,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CCOUNTS", crate::rebel::CCOUNTS)?;
     m.add("CNORM", crate::rebel::CNORM)?;
     m.add("N_HEXES", crate::board::N_HEXES)?;
+    m.add("N_LOCATIONS", crate::board::N_LOCATIONS)?;
     m.add("N_UNITS", crate::units::N_UNITS)?;
     m.add("NSLOT", crate::rebel::NSLOT)?;
     m.add("CARD_FEATS", crate::units::CARD_FEATS)?;
@@ -1238,8 +1238,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("PILE_COUNTS", crate::rebel::PILE_COUNTS)?;
     m.add("PLAYER_SCALARS", crate::rebel::PLAYER_SCALARS)?;
     m.add("GLOBAL_SCALARS", crate::rebel::GLOBAL_SCALARS)?;
-    m.add("PEND_KINDS", crate::rebel::PEND_KINDS)?;
-    m.add("PEND_SLOT", crate::rebel::PEND_SLOT)?;
     m.add("LOOSE", crate::rebel::LOOSE)?;
     m.add("OFF_PILES", crate::rebel::OFF_PILES)?;
     m.add("OFF_CARDS", crate::rebel::OFF_CARDS)?;
@@ -1260,8 +1258,8 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ROW_PLIES", crate::rebel::ROW_PLIES)?;
     m.add("ROW_FORMAT_VERSION", crate::rebel::ROW_FORMAT_VERSION)?;
     m.add_function(wrap_pyfunction!(rules_table_hash, m)?)?;
-    m.add("CCOUNTS", crate::rebel::CCOUNTS)?;
-    m.add_function(wrap_pyfunction!(hex_neighborhood, m)?)?;
+    m.add_function(wrap_pyfunction!(hex_neighbours, m)?)?;
+    m.add_function(wrap_pyfunction!(location_hexes, m)?)?;
     m.add_function(wrap_pyfunction!(set_weights, m)?)?;
     m.add_function(wrap_pyfunction!(set_cap_value, m)?)?;
     m.add_function(wrap_pyfunction!(prof_dump, m)?)?;

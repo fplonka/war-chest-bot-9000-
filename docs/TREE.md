@@ -1,6 +1,6 @@
 # The CPU-to-GPU tree contract
 
-Version 6 (`WCJ6`). Rules, public-tree construction, and live belief tracking
+Version 8 (`WCJ8`). Rules, public-tree construction, and live belief tracking
 stay on the CPU. A GPU request contains one completed sparse tree, its root
 beliefs, the previous solve's carried beliefs, and enough network-shape metadata
 to reserve the complete device arena before admission. There is no older job
@@ -13,10 +13,17 @@ The version changes whenever a field changes shape or meaning.
 ## Runtime metadata
 
 Each request carries depth, iteration count, whether intermediate snapshots are
-kept, the four CFR parameters, policy warm-start weight, kept snapshot iteration
-numbers, and the exact v3 network dimension vector. The dimension vector is an
-admission input: it makes the host reservation include the trunk, holding, head,
-and temporary GEMM matrices rather than only the CFR state.
+kept, the four CFR parameters, the kept snapshot iteration numbers, and the
+network's `dims`, which is `MODEL_TAG = [5]` and nothing else. `dims` is an
+admission input rather than a shape: the arena reservation is computed from the
+v5 constants and the job's own counts, in the three regions
+`serialize::device_arena_bytes` and `gpu::device::arena_layout` agree on —
+persistent network outputs (`f`, `g`, `P`, `join_p(P)`), then one region shared
+by the trunk scratch and the CFR state, which are never live at the same time.
+The trunk runs in chunks of `TRUNK_CHUNK_ROWS = 512` canonical rows, because a
+row carries 37 hex tokens through eight residual blocks — about 85 KiB of
+working tensors — and sizing that for a whole wave is what used to route mature
+waves onto the exclusive one-job lane.
 
 ## Conventions
 
@@ -101,13 +108,12 @@ are not serialized per job.
 | array | dtype | meaning |
 |---|---|---|
 | `leaf_rows` | u32 | non-terminal leaves, first in network batch order |
-| `inner_rows` | u32 | decision rows used by a policy warm start |
 | `term_leaves`, `terminal_utility` | u32, f32 | terminal leaves and acting-player utility |
 | `leaf_coff`, `leaf_cidx` | u32 | network-row/player spans into interned configs |
 | `snap_coff` | u32 | both-player config spans for every possible walk exit |
 | `leaf_raw` | u8 | compact public rows, expanded on the GPU |
-| `card_feat`, `cphi` | f32 | printed-card facts and interned config features |
-| `ids` | u8 | draft unit ids in player-major slot order |
+| `card_feat` | f32 | the solve-wide printed-card facts, `NTYPE * CARD_FEATS` |
+| `cphi`, `cplayer` | f32, u8 | interned config counts, and which player owns each — the config encoder reads that player's five card tokens |
 
 The serialized tail is the two root belief vectors followed by zero or more
 pairs of carried-root vectors.

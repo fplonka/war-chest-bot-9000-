@@ -1,6 +1,6 @@
 // v5 contiguous-wave kernels. The generated preamble supplies the network
-// shape and feature geometry. Every tree/config/cell address below is already
-// wave-global; kernels never recover a solve owner in their hot loops.
+// shape and the board's geometry. Every tree/config/cell address below is
+// already wave-global; kernels never recover a solve owner in their hot loops.
 
 #include <cooperative_groups.h>
 #include <cuda_fp16.h>
@@ -12,7 +12,14 @@ namespace cg = cooperative_groups;
 #define SMOOTH 1e-30f
 #define NONE 0xffffffffu
 
-#define CONFIG_CH ((CONFIG_DIM + 31) / 32)
+/// The trunk activation tensor carries one zero hex per row so the neighbour
+/// gather can address a missing neighbour as hex `N_HEXES` and stay
+/// branch-free.
+#define HEX_STRIDE (N_HEXES + 1)
+
+static_assert(JOIN_IN == 2 * POOL, "the join input is the two pooled beliefs");
+static_assert(HEX_FACTS == 6, "hex_facts writes the six frozen per-hex facts");
+static_assert(LOOSE == 15, "loose_feature writes two player blocks and three globals");
 
 typedef struct { unsigned int node, config; } Task;
 typedef struct { unsigned int node, row; } ReadTask;
@@ -62,28 +69,27 @@ typedef struct {
 #define T_ROW_CFG 28
 #define T_RAW_ROWS 29
 #define T_CARD_FEAT 30
-#define T_IDS 31
-#define T_CONFIG_JOB 32
-#define T_CPHI 33
-#define T_ROOTS 34
-#define T_CARRIED 35
-#define T_NODE_UTILITY 36
-#define T_EXIT_NODES 37
-#define T_EXIT_COFF 38
-#define T_DECISION0 39
-#define T_DECISION1 40
-#define T_REACH_TASK0 41
-#define T_REACH_TASK1 42
-#define T_REACH_LEVEL0 43
-#define T_REACH_LEVEL1 44
-#define T_BACK_TASK0 45
-#define T_BACK_TASK1 46
-#define T_BACK_LEVEL0 47
-#define T_BACK_LEVEL1 48
-#define T_READOUT 49
-#define T_JOBS 50
-#define T_CONFIG_PLAYER 51
-#define N_TABLES 52
+#define T_CONFIG_JOB 31
+#define T_CPHI 32
+#define T_ROOTS 33
+#define T_CARRIED 34
+#define T_NODE_UTILITY 35
+#define T_EXIT_NODES 36
+#define T_EXIT_COFF 37
+#define T_DECISION0 38
+#define T_DECISION1 39
+#define T_REACH_TASK0 40
+#define T_REACH_TASK1 41
+#define T_REACH_LEVEL0 42
+#define T_REACH_LEVEL1 43
+#define T_BACK_TASK0 44
+#define T_BACK_TASK1 45
+#define T_BACK_LEVEL0 46
+#define T_BACK_LEVEL1 47
+#define T_READOUT 48
+#define T_JOBS 49
+#define T_CONFIG_PLAYER 50
+#define N_TABLES 51
 
 // Mutable FP32 arena slots. Keep in lockstep with device.rs::Arena.
 #define A_REACH 0
@@ -93,21 +99,31 @@ typedef struct {
 #define A_CUR 4
 #define A_SUM 5
 #define A_SNAP_STRAT 6
-#define A_E 7
-#define A_Z 8
-#define A_G 9
-#define A_H0 10
-#define A_XB 11
-#define A_H 12
-#define A_H2 13
-#define A_U 14
-#define A_ROOT_VALUES 15
-#define A_CARRY 16
-#define A_BX 17
-#define A_BH 18
-#define A_BH2 19
-#define A_BG 20
-#define N_ARENAS 21
+#define A_CARDS 7
+#define A_BAG 8
+#define A_F 9
+#define A_G 10
+#define A_P 11
+#define A_JP 12
+#define A_POOLED 13
+#define A_JIN 14
+#define A_Z 15
+#define A_JT 16
+#define A_H 17
+#define A_ROOT_VALUES 18
+#define A_CARRY 19
+#define A_TOK 20
+#define A_TS 21
+#define A_X 22
+#define A_A 23
+#define A_MIX 24
+#define A_POOL 25
+#define A_GB 26
+#define A_BOARD 27
+#define A_PACK 28
+#define A_HIDDEN 29
+#define A_CFG 30
+#define N_ARENAS 31
 
 typedef struct {
     const unsigned char* table;
@@ -119,18 +135,43 @@ typedef struct {
     int decision_n[2], reach_task_n[2], back_task_n[2], readout_n;
 } WaveDev;
 
+/// Only what device code dereferences: biases, LayerNorm pairs, the two
+/// embeddings, and the three matrices small enough that a kernel applies them
+/// itself instead of paying for a pack buffer and a tiny-K GEMM. Every other
+/// matrix reaches cuBLAS as a raw offset from the host.
 typedef struct {
-    const float *rule_w[2], *rule_b[2], *unit_id;
-    const float *public_w[3], *public_b[3], *public_lnw[3], *public_lnb[3];
-    const float *belief_slot_w, *belief_slot_b;
-    const float *belief_config_w, *belief_config_b;
-    const float *belief_config_lnw, *belief_config_lnb;
-    const float *belief_item_w, *belief_item_b;
-    const float *candidate_slot_w, *candidate_slot_b;
-    const float *candidate_w, *candidate_b, *candidate_lnw, *candidate_lnb;
-    const float *context_w[2], *context_b[2], *context_lnw[2], *context_lnb[2];
-    const float *context_joint_w, *candidate_joint_w, *joint_bias;
-    const float *value_w, *value_b;
+    const float* card_b[2];
+    const float* pile_w;
+    const float* seat;
+    const float* hex_stem_w;
+    const float* hex_stem_b;
+    const float* pos;
+    const float* glob_stem_w;
+    const float* mix_b[BLOCKS];
+    const float* pool_b[BLOCKS];
+    const float* out_b[BLOCKS];
+    // `pre` runs on the residual stream (index `BLOCKS` is the trunk's final
+    // normalisation); `mid` runs between a block's two halves.
+    const float* pre_lnw[BLOCKS + 1];
+    const float* pre_lnb[BLOCKS + 1];
+    const float* mid_lnw[BLOCKS];
+    const float* mid_lnb[BLOCKS];
+    const float* board_b;
+    const float* cfg1_b;
+    const float* cfg_lnw;
+    const float* cfg_lnb;
+    const float* cfg_f_b;
+    const float* cfg_g_b;
+    const float* join_b_b;
+    const float* join_w_b[JBLOCKS];
+    const float* join_lnw[JBLOCKS];
+    const float* join_lnb[JBLOCKS];
+    const float* jout_lnw;
+    const float* jout_lnb;
+    const float* join_out_b;
+    const float* h_lnw;
+    const float* h_lnb;
+    const float* value_bias;
 } WeightDev;
 
 #define TP(w, ty, slot) ((const ty*)((w)->table + (w)->toff[(slot)]))
@@ -154,6 +195,16 @@ __device__ __forceinline__ int value_at(const WaveDev* w, int node, int p, int c
     return (int)TP(w, unsigned int, T_VALS_BASE)[2 * node + p] + c;
 }
 
+__device__ __forceinline__ const unsigned char* raw_row(const WaveDev* w, int row) {
+    return TP(w, unsigned char, T_RAW_ROWS) + (unsigned long long)row * GPU_ROW_BYTES;
+}
+
+/// Physical coin-type index of view `view`'s token `t`: a view's first `NSLOT`
+/// tokens are always its own seat's coins.
+__device__ __forceinline__ int physical_type(int view, int t) {
+    return (view ? 1 - t / NSLOT : t / NSLOT) * NSLOT + t % NSLOT;
+}
+
 __device__ __forceinline__ void norm_parts(const float* x, int n, int lane,
                                             float* scale, float* flat,
                                             float* total) {
@@ -169,209 +220,372 @@ __device__ __forceinline__ float gelu(float x) {
     return 0.5f * x * (1.0f + tanhf(0.7978846f * (x + 0.044715f * x * x * x)));
 }
 
-// The widest row any LayerNorm sees, as warp channels. One warp owns a row,
-// so a channel is one register.
-#define LN_WIDTH (PUBLIC_DIM > CONTEXT_DIM ? PUBLIC_DIM : CONTEXT_DIM)
-#define LN_CH ((LN_WIDTH + 31) / 32)
-
-/// LayerNorm and GELU over one row, in place. The row is held in registers
-/// across the mean and variance passes: reloading it from the arena twice
-/// costs more than the whole arithmetic.
-__device__ __forceinline__ void ln_gelu(float* row, const float* bias,
-                                         const float* gain, const float* bt,
-                                         const float* add, int n, int lane) {
-    float x[LN_CH];
+/// LayerNorm over one `N`-channel row owned by one warp. `load(j)` supplies the
+/// pre-norm value, so a caller can fold in a bias or a broadcast term without
+/// a separate pass; the row stays in registers across both reductions because
+/// reloading it from the arena costs more than the whole arithmetic. `ACT`
+/// appends the GELU every pre-activation block wants -- the readout
+/// normalisation is the one place that does not.
+template <int N, bool ACT, class Load>
+__device__ __forceinline__ void norm_row(Load load, float* dst,
+                                          const float* gain, const float* bt,
+                                          int lane) {
+    constexpr int CH = N / 32;
+    float x[CH];
     float sum = 0.0f;
     #pragma unroll
-    for (int k = 0; k < LN_CH; k++) {
-        int j = (k << 5) + lane;
-        x[k] = j < n ? (add ? row[j] + add[j] : row[j]) + bias[j] : 0.0f;
+    for (int k = 0; k < CH; k++) {
+        x[k] = load((k << 5) + lane);
         sum += x[k];
     }
-    float mean = warp_sum(sum) / (float)n;
+    float mean = warp_sum(sum) / (float)N;
     float var = 0.0f;
     #pragma unroll
-    for (int k = 0; k < LN_CH; k++) {
-        int j = (k << 5) + lane;
-        float d = j < n ? x[k] - mean : 0.0f;
-        var += d * d;
-    }
-    float inv = rsqrtf(warp_sum(var) / (float)n + LN_EPS);
+    for (int k = 0; k < CH; k++) var += (x[k] - mean) * (x[k] - mean);
+    float inv = rsqrtf(warp_sum(var) / (float)N + LN_EPS);
     #pragma unroll
-    for (int k = 0; k < LN_CH; k++) {
+    for (int k = 0; k < CH; k++) {
         int j = (k << 5) + lane;
-        if (j < n) row[j] = gelu((x[k] - mean) * inv * gain[j] + bt[j]);
+        float v = (x[k] - mean) * inv * gain[j] + bt[j];
+        dst[j] = ACT ? gelu(v) : v;
     }
 }
 
-// ---------------------------------------------------------- one-time towers
+// ------------------------------------------------------ public row expansion
+
+/// The `HEX_FACTS` raw facts of one hex, in `write_public_features` order:
+/// occupant owner one-hot, stack height, location-marker owner one-hot, and
+/// whether the hex is a location. `view` mirrors the board and swaps seats.
+/// `occupant` is the coin-type token standing there, or -1 for an empty hex.
+__device__ __forceinline__ void hex_facts(const unsigned char* src, int view,
+                                           int h, float* out, int* occupant) {
+    int ph = view ? HEX_MIRROR[h] : h;
+    int owner = src[GR_HEX_OWNER + ph];
+    if (view && owner < 2) owner = 1 - owner;
+    int marker = src[GR_HEX_MARKER + ph];
+    if (view && marker < 2) marker = 1 - marker;
+    int slot = src[GR_HEX_SLOT + ph];
+    out[0] = owner == 0 ? 1.0f : 0.0f;
+    out[1] = owner == 1 ? 1.0f : 0.0f;
+    out[2] = (float)src[GR_HEX_HEIGHT + ph] / CNORM;
+    out[3] = marker == 0 ? 1.0f : 0.0f;
+    out[4] = marker == 1 ? 1.0f : 0.0f;
+    out[5] = (float)HEX_LOCATION[h];
+    *occupant = owner < 2 && slot < NSLOT ? owner * NSLOT + slot : -1;
+}
+
+/// Scalar `j` of the `LOOSE` block: two six-wide player blocks, then plies,
+/// whether initiative has moved, and whether this view is to act.
+__device__ __forceinline__ float loose_feature(const unsigned char* src,
+                                                int view, int j) {
+    if (j < 12) {
+        int p = j / 6, k = j % 6;
+        int pp = view ? 1 - p : p;
+        int markers = src[GR_MARKERS + pp];
+        if (k == 0) return (float)markers / 6.0f;
+        if (k == 1) return (float)(6 - markers) / 6.0f;
+        if (k == 2) return (float)src[GR_HAND + pp] / 3.0f;
+        if (k == 3) return (float)src[GR_FD + pp] / MAX_COINS;
+        if (k == 4) return (float)src[GR_BAG + pp] / MAX_COINS;
+        return src[GR_INITIATIVE] == pp ? 1.0f : 0.0f;
+    }
+    if (j == 12) {
+        int plies = src[GR_PLIES] | ((int)src[GR_PLIES + 1] << 8);
+        return (float)plies / MAX_PLIES;
+    }
+    if (j == 13) return src[GR_INIT_MOVED] ? 1.0f : 0.0f;
+    return src[GR_TO_ACT] == (view ? 1 : 0) ? 1.0f : 0.0f;
+}
+
+// ------------------------------------------------------------- card describer
 
 extern "C" __global__ void pack_cards(const WaveDev* w, const WeightDev* wt) {
     (void)wt;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int n = 2 * w->jobs * NTYPE * CARD_FEATS;
-    if (i >= n) return;
-    int row = i / CARD_FEATS;
+    if (i >= 2 * w->jobs * NTYPE * CARD_FEATS) return;
     int feature = i % CARD_FEATS;
+    int row = i / CARD_FEATS;
     int t = row % NTYPE;
     int view = (row / NTYPE) & 1;
     int job = row / (2 * NTYPE);
-    int physical_t = (view ? 1 - t / NSLOT : t / NSLOT) * NSLOT + t % NSLOT;
-    AP(w, A_BG)[i] = TP(w, float, T_CARD_FEAT)
-        [((unsigned long long)job * NTYPE + physical_t) * CARD_FEATS + feature];
+    AP(w, A_PACK)[i] = TP(w, float, T_CARD_FEAT)
+        [((unsigned long long)job * NTYPE + physical_type(view, t)) * CARD_FEATS
+         + feature];
 }
 
+/// mode 0: the card describer's hidden layer; mode 1: the config encoder's.
 extern "C" __global__ void bias_gelu(const WaveDev* w, const WeightDev* wt,
-                                      int mode, int rows, int which) {
+                                      int mode, int rows) {
+    int width = mode == 0 ? TYPE : CFGH;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int width = mode == 0 ? UNIT_DIM : SLOT_DIM;
     if (i >= rows * width) return;
-    const float* bias = mode == 0 ? wt->rule_b[0]
-        : mode == 1 ? wt->belief_slot_b : wt->candidate_slot_b;
-    float* x = AP(w, which ? A_BH2 : A_BH);
+    const float* bias = mode == 0 ? wt->card_b[0] : wt->cfg1_b;
+    float* x = AP(w, A_HIDDEN);
     x[i] = gelu(x[i] + bias[i % width]);
 }
 
 extern "C" __global__ void cards_finish(const WaveDev* w, const WeightDev* wt) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int n = 2 * w->jobs * NTYPE * UNIT_DIM;
-    if (i >= n) return;
-    int row = i / UNIT_DIM;
-    int j = i % UNIT_DIM;
-    int t = row % NTYPE;
-    int view = (row / NTYPE) & 1;
-    int job = row / (2 * NTYPE);
-    int physical_t = (view ? 1 - t / NSLOT : t / NSLOT) * NSLOT + t % NSLOT;
-    int id = TP(w, unsigned char, T_IDS)[job * NTYPE + physical_t];
-    AP(w, A_E)[i] = AP(w, A_BH2)[i] + wt->rule_b[1][j]
-        + wt->unit_id[id * UNIT_DIM + j];
+    if (i >= 2 * w->jobs * NTYPE * TYPE) return;
+    AP(w, A_CARDS)[i] += wt->card_b[1][i % TYPE];
 }
 
-/// Expand the raw public rows `[qrow0, qrow0 + gridDim.x)` into the Bx
-/// scratch, whose row 0 is `qrow0`. The public tower runs in row chunks so
-/// that its widest buffer does not scale with the whole wave.
-extern "C" __global__ void assemble(const WaveDev* w, const WeightDev* wt,
-                                    int qrow0) {
-    (void)wt;
-    int qrow = qrow0 + blockIdx.x;
-    if (qrow >= 2 * w->rows) return;
-    int row = qrow / 2, view = qrow & 1;
+// -------------------------------------------------------------------- trunk
+
+/// One coin-type token per view row: the printed card, this row's pile counts,
+/// and the owning seat. `pile` is four inputs wide, so applying it here is
+/// cheaper than packing a buffer for cuBLAS.
+extern "C" __global__ void tokens(const WaveDev* w, const WeightDev* wt,
+                                  int qrow0, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * NTYPE * TYPE) return;
+    int j = i % TYPE;
+    int t = (i / TYPE) % NTYPE;
+    int qrow = qrow0 + i / (NTYPE * TYPE);
+    int row = qrow >> 1, view = qrow & 1;
     int job = TP(w, unsigned int, T_ROW_JOB)[row];
-    const unsigned char* src = TP(w, unsigned char, T_RAW_ROWS)
-        + (unsigned long long)row * GPU_ROW_BYTES;
-    float* dst = AP(w, A_BX) + (unsigned long long)(qrow - qrow0) * PUBLIC_IN;
-    int hex_e = N_HEXES * HEX_FACTS;
-    int piles = hex_e + N_HEXES * UNIT_DIM;
-    for (int j = threadIdx.x; j < PUBLIC_IN; j += blockDim.x) dst[j] = 0.0f;
+    const unsigned char* pile =
+        raw_row(w, row) + GR_PILES + physical_type(view, t) * PILE_COUNTS;
+    float v = AP(w, A_CARDS)
+            [(((unsigned long long)job * 2 + view) * NTYPE + t) * TYPE + j]
+        + wt->seat[(t / NSLOT) * TYPE + j];
+    #pragma unroll
+    for (int f = 0; f < PILE_COUNTS; f++)
+        v += wt->pile_w[f * TYPE + j] * ((float)pile[f] / CNORM);
+    AP(w, A_TOK)[i] = v;
+}
+
+/// The trunk stem, one block per canonical view row: hex facts, the occupant's
+/// projected token, the position embedding and the global bias.
+extern "C" __global__ void stem(const WaveDev* w, const WeightDev* wt,
+                                 int qrow0) {
+    int local = blockIdx.x;
+    int qrow = qrow0 + local;
+    int row = qrow >> 1, view = qrow & 1;
+    const unsigned char* src = raw_row(w, row);
+    __shared__ float facts[N_HEXES * HEX_FACTS];
+    __shared__ int occupant[N_HEXES];
+    __shared__ float glob[C];
+    __shared__ float loose[LOOSE];
+    for (int h = threadIdx.x; h < N_HEXES; h += blockDim.x)
+        hex_facts(src, view, h, &facts[h * HEX_FACTS], &occupant[h]);
+    for (int f = threadIdx.x; f < LOOSE; f += blockDim.x)
+        loose[f] = loose_feature(src, view, f);
     __syncthreads();
-    for (int h = threadIdx.x / 32; h < N_HEXES; h += blockDim.x / 32) {
-        int lane = threadIdx.x & 31;
-        int physical_h = view ? HEX_MIRROR[h] : h;
-        int owner = src[GR_HEX_OWNER + physical_h];
-        if (view && owner < 2) owner = 1 - owner;
-        int slot = src[GR_HEX_SLOT + physical_h];
-        int marker = src[GR_HEX_MARKER + physical_h];
-        if (view && marker < 2) marker = 1 - marker;
-        if (lane < HEX_FACTS) {
-            float v = 0.0f;
-            if (lane < 2) v = owner == lane ? 1.0f : 0.0f;
-            else if (lane == 2) v = (float)src[GR_HEX_HEIGHT + physical_h] / 5.0f;
-            else if (lane < 5) v = marker == lane - 3 ? 1.0f : 0.0f;
-            else v = (float)HEX_LOCATION[h];
-            dst[h * HEX_FACTS + lane] = v;
-        }
-        int t = owner < 2 && slot < NSLOT ? owner * NSLOT + slot : -1;
-        if (t >= 0) {
-            const float* e = AP(w, A_E)
-                + (((unsigned long long)job * 2 + view) * NTYPE + t) * UNIT_DIM;
-            for (int j = lane; j < UNIT_DIM; j += 32)
-                dst[hex_e + h * UNIT_DIM + j] = e[j];
-        }
+    for (int j = threadIdx.x; j < C; j += blockDim.x) {
+        float v = 0.0f;
+        for (int f = 0; f < LOOSE; f++) v += wt->glob_stem_w[f * C + j] * loose[f];
+        glob[j] = v;
     }
     __syncthreads();
-    for (int t = 0; t < NTYPE; t++) {
-        int physical_t = (view ? 1 - t / NSLOT : t / NSLOT) * NSLOT + t % NSLOT;
-        float* out = dst + piles + t * (PILE_COUNTS + UNIT_DIM);
-        for (int j = threadIdx.x; j < PILE_COUNTS; j += blockDim.x)
-            out[j] = (float)src[GR_PILES + physical_t * PILE_COUNTS + j] / 5.0f;
-        const float* e = AP(w, A_E)
-            + (((unsigned long long)job * 2 + view) * NTYPE + t) * UNIT_DIM;
-        for (int j = threadIdx.x; j < UNIT_DIM; j += blockDim.x)
-            out[PILE_COUNTS + j] = e[j];
-    }
-    float* loose = dst + piles + NTYPE * (PILE_COUNTS + UNIT_DIM);
-    for (int j = threadIdx.x; j < LOOSE; j += blockDim.x) {
-        float v;
-        if (j < 12) {
-            int p = j / 6, k = j % 6;
-            int physical_p = view ? 1 - p : p;
-            int markers = src[GR_MARKERS + physical_p];
-            if (k == 0) v = (float)markers / 6.0f;
-            else if (k == 1) v = (float)(6 - markers) / 6.0f;
-            else if (k == 2) v = (float)src[GR_HAND + physical_p] / 3.0f;
-            else if (k == 3) v = (float)src[GR_FD + physical_p] / MAX_COINS;
-            else if (k == 4) v = (float)src[GR_BAG + physical_p] / MAX_COINS;
-            else v = src[GR_INITIATIVE] == physical_p ? 1.0f : 0.0f;
-        } else if (j == 12) {
-            int plies = src[GR_PLIES] | ((int)src[GR_PLIES + 1] << 8);
-            v = (float)plies / MAX_PLIES;
-        } else if (j == 13) v = src[GR_INIT_MOVED] ? 1.0f : 0.0f;
-        else v = src[GR_TO_ACT] == (view ? 1 : 0) ? 1.0f : 0.0f;
-        loose[j] = v;
+    float* x = AP(w, A_X) + (unsigned long long)local * N_HEXES * C;
+    for (int i = threadIdx.x; i < N_HEXES * C; i += blockDim.x) {
+        int h = i / C, j = i % C;
+        float v = wt->hex_stem_b[j] + wt->pos[h * C + j] + glob[j];
+        #pragma unroll
+        for (int f = 0; f < HEX_FACTS; f++)
+            v += wt->hex_stem_w[f * C + j] * facts[h * HEX_FACTS + f];
+        int t = occupant[h];
+        if (t >= 0)
+            v += AP(w, A_TS)[((unsigned long long)local * NTYPE + t) * C + j];
+        x[i] = v;
     }
 }
 
-extern "C" __global__ void norm_gelu(const WaveDev* w, const WeightDev* wt,
-                                      int mode, int level, int rows, int arena) {
+/// `a = gelu(ln(x))` into the padded activation tensor. `block` selects the
+/// block's first normalisation, or the trunk's final one at index `BLOCKS`.
+/// The grid covers the pad hex too: the previous block's output was written
+/// over this tensor, so the pad has to be zeroed again before the gather runs.
+extern "C" __global__ void trunk_norm(const WaveDev* w, const WeightDev* wt,
+                                       int block, int n) {
     int lane = threadIdx.x & 31;
-    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-    if (row >= rows) return;
-    int width = mode == 0 ? PUBLIC_DIM : mode < 3 ? CONFIG_DIM : CONTEXT_DIM;
-    const float *bias, *gain, *bt;
-    if (mode == 0) { bias = wt->public_b[level]; gain = wt->public_lnw[level]; bt = wt->public_lnb[level]; }
-    else if (mode == 1) { bias = wt->belief_config_b; gain = wt->belief_config_lnw; bt = wt->belief_config_lnb; }
-    else if (mode == 2) { bias = wt->candidate_b; gain = wt->candidate_lnw; bt = wt->candidate_lnb; }
-    else { bias = wt->context_b[level]; gain = wt->context_lnw[level]; bt = wt->context_lnb[level]; }
-    float* x = AP(w, arena) + (unsigned long long)row * width;
-    ln_gelu(x, bias, gain, bt, nullptr, width, lane);
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int r = i / HEX_STRIDE, h = i - r * HEX_STRIDE;
+    if (r >= n) return;
+    float* dst = AP(w, A_A) + (unsigned long long)i * C;
+    if (h == N_HEXES) {
+        for (int j = lane; j < C; j += 32) dst[j] = 0.0f;
+        return;
+    }
+    const float* src = AP(w, A_X) + ((unsigned long long)r * N_HEXES + h) * C;
+    norm_row<C, true>([&](int j) { return src[j]; }, dst, wt->pre_lnw[block],
+                      wt->pre_lnb[block], lane);
 }
 
-extern "C" __global__ void holding_in(const WaveDev* w, const WeightDev* wt) {
+/// The mix input: a hex's own activation, then the sum over its neighbours.
+/// A missing neighbour is hex `N_HEXES`, whose row is zero, so no lane branches.
+extern "C" __global__ void gather_mix(const WaveDev* w, const WeightDev* wt,
+                                       int cells) {
+    (void)wt;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= cells * C) return;
+    int j = i % C, cell = i / C;
+    int r = cell / N_HEXES, h = cell - r * N_HEXES;
+    const float* a = AP(w, A_A) + (unsigned long long)r * HEX_STRIDE * C + j;
+    float sum = 0.0f;
+    #pragma unroll
+    for (int d = 0; d < 6; d++) sum += a[HEX_NEIGHBOUR[h * 6 + d] * C];
+    float* dst = AP(w, A_MIX) + (unsigned long long)cell * 2 * C + j;
+    dst[0] = a[h * C];
+    dst[C] = sum;
+}
+
+/// Mean and max of the activations over a row's hexes -- the global-pooling
+/// bias's input.
+extern "C" __global__ void hex_pool(const WaveDev* w, const WeightDev* wt,
+                                    int n) {
+    (void)wt;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * C) return;
+    int j = i % C, r = i / C;
+    const float* a = AP(w, A_A) + (unsigned long long)r * HEX_STRIDE * C + j;
+    float sum = 0.0f, top = -INFINITY;
+    for (int h = 0; h < N_HEXES; h++) {
+        float v = a[h * C];
+        sum += v;
+        top = fmaxf(top, v);
+    }
+    float* out = AP(w, A_POOL) + (unsigned long long)r * 2 * C + j;
+    out[0] = sum / (float)N_HEXES;
+    out[C] = top;
+}
+
+/// Broadcast the pooling bias over the row's hexes, then normalise and
+/// activate. Both linear biases land here because cuBLAS left them out.
+extern "C" __global__ void block_mid(const WaveDev* w, const WeightDev* wt,
+                                     int block, int cells) {
+    int lane = threadIdx.x & 31;
+    int cell = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (cell >= cells) return;
+    float* y = AP(w, A_A) + (unsigned long long)cell * C;
+    const float* gb = AP(w, A_GB) + (unsigned long long)(cell / N_HEXES) * C;
+    const float* mb = wt->mix_b[block];
+    const float* pb = wt->pool_b[block];
+    norm_row<C, true>([&](int j) { return y[j] + gb[j] + mb[j] + pb[j]; }, y,
+                      wt->mid_lnw[block], wt->mid_lnb[block], lane);
+}
+
+extern "C" __global__ void block_out(const WaveDev* w, const WeightDev* wt,
+                                     int block, int cells) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= cells * C) return;
+    AP(w, A_X)[i] += AP(w, A_MIX)[i] + wt->out_b[block][i % C];
+}
+
+/// The board readout's input: mean and max over the normalised trunk output,
+/// then the row's loose scalars.
+extern "C" __global__ void board_pool(const WaveDev* w, const WeightDev* wt,
+                                       int qrow0, int n) {
+    (void)wt;
+    int width = 2 * C + LOOSE;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * width) return;
+    int j = i % width, r = i / width;
+    float v;
+    if (j < 2 * C) {
+        const float* a =
+            AP(w, A_A) + (unsigned long long)r * HEX_STRIDE * C + j % C;
+        float sum = 0.0f, top = -INFINITY;
+        for (int h = 0; h < N_HEXES; h++) {
+            float x = a[h * C];
+            sum += x;
+            top = fmaxf(top, x);
+        }
+        v = j < C ? sum / (float)N_HEXES : top;
+    } else {
+        int qrow = qrow0 + r;
+        v = loose_feature(raw_row(w, qrow >> 1), qrow & 1, j - 2 * C);
+    }
+    AP(w, A_BOARD)[i] = v;
+}
+
+extern "C" __global__ void board_bias(const WaveDev* w, const WeightDev* wt,
+                                       int qrow0, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * D) return;
+    AP(w, A_P)[(unsigned long long)qrow0 * D + i] += wt->board_b[i % D];
+}
+
+// ----------------------------------------------------------- config encoder
+
+/// One slot token per config: its three zone counts and the printed card of
+/// that slot, read from the owning seat's view of the card table.
+extern "C" __global__ void config_pack(const WaveDev* w, const WeightDev* wt) {
     (void)wt;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= w->ncfg * NSLOT) return;
     int cfg = i / NSLOT, k = i % NSLOT;
     int job = TP(w, unsigned int, T_CONFIG_JOB)[cfg];
-    const float* p = TP(w, float, T_CPHI) + (unsigned long long)cfg * CFEAT;
-    int player = TP(w, unsigned char, T_CONFIG_PLAYER)[cfg];
-    float* out = AP(w, A_BG) + (unsigned long long)i * (3 + UNIT_DIM);
-    out[0] = p[k]; out[1] = p[NSLOT + k]; out[2] = p[2 * NSLOT + k];
-    const float* e = AP(w, A_E)
-        + (((unsigned long long)job * 2 + player) * NTYPE + k) * UNIT_DIM;
-    for (int j = 0; j < UNIT_DIM; j++) out[3 + j] = e[j];
+    int owner = TP(w, unsigned char, T_CONFIG_PLAYER)[cfg];
+    const float* phi = TP(w, float, T_CPHI) + (unsigned long long)cfg * CFEAT;
+    float* out = AP(w, A_PACK) + (unsigned long long)i * (3 + TYPE);
+    out[0] = phi[k];
+    out[1] = phi[NSLOT + k];
+    out[2] = phi[2 * NSLOT + k];
+    const float* card = AP(w, A_CARDS)
+        + (((unsigned long long)job * 2 + owner) * NTYPE + k) * TYPE;
+    for (int j = 0; j < TYPE; j++) out[3 + j] = card[j];
 }
 
-extern "C" __global__ void slot_sum(const WaveDev* w, const WeightDev* wt,
-                                     int which) {
+/// The config encoder is a sum over slot tokens, which is what makes it
+/// invariant to the order the draft put the coins in.
+extern "C" __global__ void slot_sum(const WaveDev* w, const WeightDev* wt) {
+    (void)wt;
     int lane = threadIdx.x & 31;
     int cfg = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     if (cfg >= w->ncfg) return;
-    const float* src = AP(w, which ? A_BH2 : A_BH);
-    float* out = AP(w, which ? A_BH : A_BH2) + (unsigned long long)cfg * SLOT_DIM;
-    for (int j = lane; j < SLOT_DIM; j += 32) {
+    const float* src = AP(w, A_HIDDEN) + (unsigned long long)cfg * NSLOT * CFGH;
+    float* out = AP(w, A_CFG) + (unsigned long long)cfg * CFGH;
+    for (int j = lane; j < CFGH; j += 32) {
         float v = 0.0f;
-        for (int k = 0; k < NSLOT; k++)
-            v += src[((unsigned long long)cfg * NSLOT + k) * SLOT_DIM + j];
+        for (int k = 0; k < NSLOT; k++) v += src[k * CFGH + j];
         out[j] = v;
     }
 }
 
-extern "C" __global__ void add_belief_item_bias(const WaveDev* w,
-                                                  const WeightDev* wt,
-                                                  int rows, int arena) {
+/// mode 0: the config encoder's hidden normalisation; mode 1: the readout
+/// vector's, which is the one LayerNorm with no activation after it.
+extern "C" __global__ void norm(const WaveDev* w, const WeightDev* wt,
+                                int mode, int rows) {
+    int lane = threadIdx.x & 31;
+    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (row >= rows) return;
+    if (mode == 0) {
+        float* x = AP(w, A_CFG) + (unsigned long long)row * CFGH;
+        norm_row<CFGH, true>([&](int j) { return x[j]; }, x, wt->cfg_lnw,
+                             wt->cfg_lnb, lane);
+    } else {
+        float* x = AP(w, A_H) + (unsigned long long)row * D;
+        norm_row<D, false>([&](int j) { return x[j]; }, x, wt->h_lnw, wt->h_lnb,
+                           lane);
+    }
+}
+
+/// Finish both config outputs. `f` only wants its bias; `g` also gets the
+/// count-weighted sum of per-zone card embeddings, which is linear in the
+/// counts and therefore survives the belief pooling as the expected holding of
+/// every card, bound to that card rather than to a slot position.
+extern "C" __global__ void config_finish(const WaveDev* w, const WeightDev* wt) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * CONFIG_DIM) return;
-    AP(w, arena)[i] += wt->belief_item_b[i % CONFIG_DIM];
+    if (i >= w->ncfg * (D + POOL)) return;
+    int j = i % (D + POOL), cfg = i / (D + POOL);
+    if (j < D) {
+        AP(w, A_F)[(unsigned long long)cfg * D + j] += wt->cfg_f_b[j];
+        return;
+    }
+    j -= D;
+    int job = TP(w, unsigned int, T_CONFIG_JOB)[cfg];
+    int owner = TP(w, unsigned char, T_CONFIG_PLAYER)[cfg];
+    const float* phi = TP(w, float, T_CPHI) + (unsigned long long)cfg * CFEAT;
+    const float* bag = AP(w, A_BAG)
+        + ((unsigned long long)job * 2 + owner) * NTYPE * 3 * POOL + j;
+    float v = wt->cfg_g_b[j];
+    for (int k = 0; k < NSLOT; k++) {
+        const float* zone = bag + (unsigned long long)k * 3 * POOL;
+        #pragma unroll
+        for (int z = 0; z < 3; z++) v += phi[z * NSLOT + k] * zone[z * POOL];
+    }
+    AP(w, A_G)[(unsigned long long)cfg * POOL + j] += v;
 }
 
 // --------------------------------------------------------------- CFR state
@@ -519,8 +733,11 @@ extern "C" __global__ void seed_sum(const WaveDev* w, const WeightDev* wt,
         sum[x] = r * cur[x];
 }
 
-// ------------------------------------------------------------ value network
+// ---------------------------------------------------------------- the join
 
+/// The belief-weighted pooled config embedding of every canonical query,
+/// indexed by `2 * row + player`. This and the reach mass are all the network
+/// reads that move between CFR iterations.
 extern "C" __global__ void belief_sums(const WaveDev* w, const WeightDev* wt,
                                         int traverser, int both) {
     (void)wt;
@@ -528,14 +745,9 @@ extern "C" __global__ void belief_sums(const WaveDev* w, const WeightDev* wt,
     int task = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     if (task >= w->nleaf) return;
     ReadTask q = TP(w, ReadTask, T_READOUT)[task];
-    // XB is [traverser, other]. Between alternating CFR iterations the old
-    // other becomes the new traverser; keep it and recompute only the reach
-    // block changed by the preceding update.
-    if (!both) {
-        float* xb = AP(w, A_XB) + (unsigned long long)q.row * 2 * CONFIG_DIM;
-        for (int x = lane; x < CONFIG_DIM; x += 32) xb[x] = xb[CONFIG_DIM + x];
-        __syncwarp();
-    }
+    // Query indexing means a side's block is still exactly what it was, so
+    // between alternating iterations only the player whose strategy just moved
+    // has to be summed again.
     for (int side = 0; side < (both ? 2 : 1); side++) {
         int p = both ? side : 1 - traverser;
         int n = nc_of(w, q.node, p);
@@ -549,53 +761,84 @@ extern "C" __global__ void belief_sums(const WaveDev* w, const WeightDev* wt,
             AP(w, p ? A_VALS : A_SNAP_REACH)
                 [value_at(w, q.node, 1 - p, 0)] = total;
         }
-        float acc[CONFIG_CH];
+        float acc[POOL / 32];
         #pragma unroll
-        for (int z = 0; z < CONFIG_CH; z++) acc[z] = 0.0f;
+        for (int z = 0; z < POOL / 32; z++) acc[z] = 0.0f;
         // The config list and the embedding table are loop-invariant; the
         // reduction below writes through the arena, so the compiler will not
         // hoist them on its own.
         const unsigned int* cfgs = TP(w, unsigned int, T_ROW_CFG)
             + TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + p];
-        const float* embed = AP(w, A_Z);
+        const float* embed = AP(w, A_G);
         for (int c = 0; c < n; c++) {
-            const float* z = embed + (unsigned long long)cfgs[c] * CONFIG_DIM;
+            const float* g = embed + (unsigned long long)cfgs[c] * POOL;
             float wc = r[c] * scale + flat;
             #pragma unroll
-            for (int k = 0; k < CONFIG_CH; k++) {
-                int x = (k << 5) + lane;
-                if (x < CONFIG_DIM) acc[k] += wc * z[x];
-            }
+            for (int k = 0; k < POOL / 32; k++) acc[k] += wc * g[(k << 5) + lane];
         }
-        int dst = p == traverser ? 0 : 1;
-        float* out = AP(w, A_XB)
-            + ((unsigned long long)q.row * 2 + dst) * CONFIG_DIM;
+        float* out = AP(w, A_POOLED) + (unsigned long long)(2 * q.row + p) * POOL;
         #pragma unroll
-        for (int k = 0; k < CONFIG_CH; k++) {
-            int x = (k << 5) + lane;
-            if (x < CONFIG_DIM) out[x] = acc[k];
-        }
+        for (int k = 0; k < POOL / 32; k++) out[(k << 5) + lane] = acc[k];
     }
 }
 
-extern "C" __global__ void context_norm_gelu(const WaveDev* w,
-                                              const WeightDev* wt,
-                                              int traverser, int rows) {
+/// Both operands of the join's first layer: the moving input, and the seed
+/// `z` = cached `join_p(P)` plus the layer's bias, which the GEMM then
+/// accumulates onto.
+extern "C" __global__ void join_input(const WaveDev* w, const WeightDev* wt,
+                                       int traverser, int rows) {
+    int width = JOIN_IN + JW;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * width) return;
+    int j = i % width, r = i / width;
+    int q = 2 * r + traverser;
+    if (j < JOIN_IN) {
+        int side = j < POOL ? q : q ^ 1;
+        AP(w, A_JIN)[(unsigned long long)r * JOIN_IN + j] =
+            AP(w, A_POOLED)[(unsigned long long)side * POOL + j % POOL];
+        return;
+    }
+    j -= JOIN_IN;
+    AP(w, A_Z)[(unsigned long long)r * JW + j] =
+        AP(w, A_JP)[(unsigned long long)q * JW + j] + wt->join_b_b[j];
+}
+
+/// One join residual block's pre-activation. The block's bias does not depend
+/// on the GEMM, so it goes onto the residual stream here and the GEMM
+/// accumulates straight onto `z`.
+extern "C" __global__ void join_block(const WaveDev* w, const WeightDev* wt,
+                                       int block, int rows) {
     int lane = threadIdx.x & 31;
     int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     if (row >= rows) return;
-    float* x = AP(w, A_H) + (unsigned long long)row * CONTEXT_DIM;
-    const float* public_context = AP(w, A_H0)
-        + ((unsigned long long)row * 2 + traverser) * CONTEXT_DIM;
-    ln_gelu(x, wt->context_b[0], wt->context_lnw[0], wt->context_lnb[0],
-            public_context, CONTEXT_DIM, lane);
+    float* z = AP(w, A_Z) + (unsigned long long)row * JW;
+    float* t = AP(w, A_JT) + (unsigned long long)row * JW;
+    norm_row<JW, true>([&](int j) { return z[j]; }, t, wt->join_lnw[block],
+                       wt->join_lnb[block], lane);
+    const float* bias = wt->join_w_b[block];
+    for (int j = lane; j < JW; j += 32) z[j] += bias[j];
+}
+
+/// The last join normalisation, and the seed of `h` = `P[q]` plus the output
+/// layer's bias. Both sit between the final residual block and the output
+/// GEMM, and both are one row per query.
+extern "C" __global__ void join_finish(const WaveDev* w, const WeightDev* wt,
+                                        int traverser, int rows) {
+    int lane = threadIdx.x & 31;
+    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (row >= rows) return;
+    float* z = AP(w, A_Z) + (unsigned long long)row * JW;
+    norm_row<JW, true>([&](int j) { return z[j]; }, z, wt->jout_lnw,
+                       wt->jout_lnb, lane);
+    const float* p = AP(w, A_P) + (unsigned long long)(2 * row + traverser) * D;
+    float* h = AP(w, A_H) + (unsigned long long)row * D;
+    for (int j = lane; j < D; j += 32) h[j] = p[j] + wt->join_out_b[j];
 }
 
 /// One block values `READOUT_TILE` consecutive leaf tasks. Consecutive tasks
-/// are neighbouring leaves of the same subgame and draw their candidates from
-/// the same interned pool, so tiling them turns most of the candidate stream
-/// into L1 hits. The tile also gives each task fewer, fuller warp rounds than
-/// one block per task did.
+/// are neighbouring leaves of the same subgame and draw their configs from the
+/// same interned pool, so tiling them turns most of the readout stream into L1
+/// hits. The value itself is one dot product: `<f(c), h> + bias`.
 extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
                                     int player) {
     constexpr int WPT = (WAVE_BLOCK / 32) / READOUT_TILE;
@@ -603,19 +846,15 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
     int warp = threadIdx.x >> 5;
     int slot = warp / WPT, sub = warp % WPT;
     int task = blockIdx.x * READOUT_TILE + slot;
-    // Everything a configuration does not vary over is block-resident: the
-    // context row with the joint bias already folded in, and the output
-    // weights. Only the candidate row is then read per configuration.
-    __shared__ float common[READOUT_TILE][JOINT_DIM];
-    __shared__ float weight[JOINT_DIM];
+    // The one thing a configuration does not vary over is the query's readout
+    // vector, so it is block-resident and only `f(c)` is read per config.
+    __shared__ float common[READOUT_TILE][D];
     __shared__ float opp_reach[READOUT_TILE];
 
     // Every thread reaches the one barrier below, live task or not.
     bool live = task < w->readout_n;
     ReadTask q = live ? TP(w, ReadTask, T_READOUT)[task] : ReadTask{0, NONE};
     int n = live ? nc_of(w, q.node, player) : 0;
-    for (int j = threadIdx.x; j < JOINT_DIM; j += blockDim.x)
-        weight[j] = wt->value_w[j];
     if (live && q.row == NONE) {
         if (sub == 0) {
             int opp = 1 - player;
@@ -627,9 +866,9 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
             if (lane == 0) opp_reach[slot] = orc;
         }
     } else if (live) {
-        const float* context = AP(w, A_U) + (unsigned long long)q.row * JOINT_DIM;
-        for (int j = sub * 32 + lane; j < JOINT_DIM; j += WPT * 32)
-            common[slot][j] = context[j] + wt->joint_bias[j];
+        const float* h = AP(w, A_H) + (unsigned long long)q.row * D;
+        for (int j = sub * 32 + lane; j < D; j += WPT * 32)
+            common[slot][j] = h[j];
         // `belief_sums` parked the opponent reach mass in the value slot this
         // kernel is about to overwrite, so it has to be read before any warp
         // starts writing. The barrier below is that ordering.
@@ -649,23 +888,21 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
         return;
     }
 
-    float bias = *wt->value_b;
+    float bias = *wt->value_bias;
     const unsigned int* cfgs = TP(w, unsigned int, T_ROW_CFG)
         + TP(w, unsigned int, T_ROW_CFG_OFF)[2 * q.row + player];
-    const float* candidates = AP(w, A_G);
-    const float* row = common[slot];
+    const float* readouts = AP(w, A_F);
+    const float* h = common[slot];
     for (int c = sub; c < n; c += WPT) {
-        const float4* candidate = reinterpret_cast<const float4*>(
-            candidates + (unsigned long long)cfgs[c] * JOINT_DIM);
+        const float4* f = reinterpret_cast<const float4*>(
+            readouts + (unsigned long long)cfgs[c] * D);
         float value = 0.0f;
         #pragma unroll
-        for (int j = lane; j < JOINT_DIM / 4; j += 32) {
-            float4 g = candidate[j];
+        for (int j = lane; j < D / 4; j += 32) {
+            float4 row = f[j];
             int b = 4 * j;
-            value += gelu(row[b] + g.x) * weight[b]
-                   + gelu(row[b + 1] + g.y) * weight[b + 1]
-                   + gelu(row[b + 2] + g.z) * weight[b + 2]
-                   + gelu(row[b + 3] + g.w) * weight[b + 3];
+            value += row.x * h[b] + row.y * h[b + 1]
+                   + row.z * h[b + 2] + row.w * h[b + 3];
         }
         value = warp_sum(value);
         if (lane == 0) out[c] = (value + bias) * orc;

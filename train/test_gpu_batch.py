@@ -34,8 +34,8 @@ def main():
     d = Dump(args.dump)
     parts = d.rows(0, min(args.rows, len(d)))
     warmup(dev)
-    a = make_cpu_batch(clone(parts), np.random.default_rng(17), dev, False)
-    b = make_gpu_batch(clone(parts), np.random.default_rng(17), dev, False)
+    a = make_cpu_batch(clone(parts), np.random.default_rng(17), dev)
+    b = make_gpu_batch(clone(parts), np.random.default_rng(17), dev)
     torch.cuda.synchronize(dev)
     for x, y in zip(a[:-1], b[:-1]):
         if x.dtype.is_floating_point:
@@ -43,7 +43,7 @@ def main():
         else:
             torch.testing.assert_close(x, y, rtol=0, atol=0)
     assert a[-1] == b[-1]
-    print(f"{len(parts[0])} rows, {len(parts[1])} configs OK")
+    print(f"{len(parts[0])} rows, {len(parts[-1])} configs OK")
 
 
 if __name__ == "__main__":

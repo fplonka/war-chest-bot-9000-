@@ -32,7 +32,7 @@
 //!     subgame root values, one per config in each player's belief support.
 
 use crate::actions::{Action, Play};
-use crate::board::{board, NONE, N_HEXES};
+use crate::board::{board, N_HEXES, N_LOCATIONS, NONE};
 use crate::gpu::GpuClient;
 use crate::rebel::*;
 use crate::rng::Rng;
@@ -269,6 +269,13 @@ pub struct Data {
     /// row is expanded when a batch is made, so the stored bytes never go
     /// stale as the network changes.
     pub rows: Vec<u8>,
+    /// `[n * N_LOCATIONS]` the auxiliary ownership target: who owns each
+    /// control location when the game the row came from ends, `0`/`1` for the
+    /// player and `2` for neither. Written at the solve site from the state
+    /// there and overwritten by `backfill_owners` when the game finishes, so a
+    /// row detached before its game ended carries the last state reached
+    /// rather than a sentinel. Training-only: the engine never predicts it.
+    pub aux: Vec<u8>,
     /// `[total_configs, CCOUNTS]` raw counts per config, in the arena order.
     /// Raw rather than normalised: they are `u8`-valued, and storing them that
     /// way is what keeps a replay row small enough to hold millions of them.
@@ -327,6 +334,7 @@ impl Data {
     pub fn merge(&mut self, o: Data) {
         let base = self.cw.len() as u32;
         self.rows.extend(o.rows);
+        self.aux.extend(o.aux);
         self.cc.extend(o.cc);
         self.cw.extend(o.cw);
         self.cy.extend(o.cy);
@@ -375,6 +383,7 @@ impl Data {
         let base = self.rows.len();
         self.rows.resize(base + ROW_BYTES, 0);
         pack_row(s, ctx, &mut self.rows[base..base + ROW_BYTES]);
+        self.aux.extend_from_slice(&location_owners(s));
         if self.coff.is_empty() {
             self.coff.push(0);
         }
@@ -1129,7 +1138,8 @@ impl<'a> Game<'a> {
         self.data.oversize_routes += oversize as usize;
     }
 
-    /// The game ended: blend the outcome into parked targets and return White's result.
+    /// The game ended: blend the outcome into parked targets, stamp the final
+    /// location ownership onto them, and return White's result.
     pub fn finish(&mut self) -> f32 {
         let z = self.s.utility(WHITE as usize);
         if self.gc.collect == Collect::Mc {
@@ -1145,6 +1155,9 @@ impl<'a> Game<'a> {
             let m = self.gc.mc_mix.clamp(0.0, 1.0);
             blend_outcome(&mut self.data, self.from_row, 1.0 - m, m, z);
         }
+        // The auxiliary target is a property of the finished game, not of the
+        // row's own state, so it is backfilled here exactly as the outcome is.
+        backfill_owners(&mut self.data, self.from_row, &self.s);
         self.data.games += 1;
         if self.s.main_plays >= crate::state::MAX_MAIN_PLAYS {
             self.data.cap_hits += 1;
@@ -1199,6 +1212,27 @@ fn blend_outcome(data: &mut Data, from_row: usize, keep: f32, mix: f32, z: f32) 
             }
         }
     }
+}
+
+/// Stamp the final owner of every control location onto every row this game
+/// produced, overwriting what the solve site wrote. Reaching the horizon
+/// counts as an ending: the ownership then is the ownership the game got to.
+fn backfill_owners(data: &mut Data, from_row: usize, s: &State) {
+    let owners = location_owners(s);
+    for r in from_row..data.nv {
+        data.aux[r * N_LOCATIONS..(r + 1) * N_LOCATIONS].copy_from_slice(&owners);
+    }
+}
+
+/// Who owns each control location: `0`/`1` for the player holding its control
+/// marker, `2` for neither. The auxiliary head's target, in `location_hexes`
+/// order.
+fn location_owners(s: &State) -> [u8; N_LOCATIONS] {
+    let loc = &board().location_hexes;
+    std::array::from_fn(|i| match s.loc_marker[loc[i] as usize] {
+        NONE => 2,
+        p => p,
+    })
 }
 
 fn resolve_chance(s: &mut State, player: u8, rng: &mut Rng) {

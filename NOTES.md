@@ -1,3 +1,113 @@
+# Value v5 — the architecture rebuild
+
+## What was wrong with v4
+
+v4 spent its compute in the wrong place, and the accounting is not close. CFR
+re-asks every leaf on every iteration, so at depth two, `T=64` a solve makes
+~2,030 board evaluations against ~158,000 belief-conditioned ones. v4 put a
+three-layer 384-wide flat MLP on the board and two 384-wide LayerNorm layers on
+the per-iteration path:
+
+| | v4 | v5 |
+|---|---:|---:|
+| board encoder | `1.7%` of network MAC | **`63%`** |
+| per-iteration path | `96.4%` | `33%` |
+| total | `58.0` GMAC/solve | `48.9` |
+| projected throughput | `522` solves/s (measured) | `~620` |
+| parameters | `1.55M` | `0.95M` |
+
+DeepStack, ReBeL, TurboReBeL and Student of Games all avoid this by making the
+infoset an **output index**: one tower per public leaf emits every infoset
+value as one row of the output matrix, so an infoset costs 500-1536 MAC. v4
+charged 33,000 MAC of GEMM plus a GELU per config. We cannot table the output
+rows — the config set is variable, median 22 and p99 567 — so v5 *generates*
+them from a config encoder and reads out with a dot product. That is the only
+structural novelty, and it is the standard open-vocabulary output layer.
+
+## The shape
+
+```
+public state ─► TRUNK (8 hex residual blocks, global pooling) ─► P   once/leaf
+config c ─────► CONFIG ENCODER ─► f(c) readout, g(c) pooling         once/config
+     [Σβ_own g, Σβ_opp g] ─► JOIN (3 blocks, 128 wide) ─► h          every iteration
+                        v(c) = <f(c), h> + bias
+```
+
+Widths: `TYPE=64, C=128, BLOCKS=8, D=256, POOL=64, CFGH=128, JW=128,
+JBLOCKS=3`. The trunk is KataGo-shaped — pre-activation residual blocks over
+the board's own hex adjacency with a global-pooling bias in *every* block
+(pooling is KataGo's second-largest measured ablation at `1.60x`, and it costs
+`1.8%` of a block). `join_p(P)` is cached once per solve, which is what lets
+the board vector be wide.
+
+### The central bet to test
+
+Unlike DeepStack, ReBeL and Student of Games, v5 keeps the trunk public-only
+and injects both beliefs in the join. This is deliberate: at depth two the
+public trunk runs about 2,030 times per solve while the belief-conditioned path
+runs about 158,000 times. It is also an expressivity tradeoff. The hex features
+cannot be recomputed after learning that the opponent probably lacks a given
+coin. Treat this split as an experiment, not settled literature. The first
+architecture ablation should move one narrow hex block after belief injection
+and measure strength at matched solver throughput.
+
+## Slot-permutation equivariance, and the bug it caught
+
+Which slot index the draft assigns a unit is a pure relabelling, so the network
+must be exactly invariant to permuting each player's five slots. v4 was not:
+`value_net.py:100` flattened the ten `[pile counts ‖ token]` blocks in slot
+order into a dense layer, so the same unit got different weights depending on
+the draft. That partly undid the card describer built to avoid exactly this.
+
+v5 treats the ten coin types as a set of tokens described by their printed card
+facts, with no unit-identity embedding at all. The first draft of v5 still
+failed the check — measured `2.1e-2` against a value spread of `4.2e-2`, half
+the signal — because the belief's raw count marginals were fed to the join as
+30 numbers through a dense layer with per-slot weights.
+
+The fix removes them and makes the pooling vector carry them instead:
+
+    g(c) = cfg_g(u(c)) + Σ_k Σ_{zone} count[c][k][zone] · V[k][zone]
+
+with `V[k] = cfg_m(card_k)` a per-zone embedding of the *card*. `cfg_m` is
+linear in the counts, so `Σ_c β(c) g(c)` carries the belief's exact expected
+holding of every card, bound to that card — "they almost certainly cannot play
+an Archer this turn" arrives as a marginal rather than as an average of GELUs.
+`V` depends only on the card table, so it costs two rows per solve and fifteen
+accumulations per config. The join input shrank from 158 to 128 in the process.
+
+With that, permutation error is `7.5e-8` against a `4.2e-2` spread — exact to
+float32. TurboReBeL's largest architecture-free win was its `24x` isomorphic
+augmentation; this is the same kind of symmetry, taken by construction instead
+of by augmentation.
+
+## Auxiliary head
+
+Per location hex, a 3-way logit over the final owner of that location at the
+end of the game the row came from. This is Go ownership, which is KataGo's
+largest measured ablation (`1.65x` with score), and it is a genuine
+decomposition of the outcome here: you win by getting all six markers down.
+Training only — it is not in the weight blob and the engine never runs it.
+
+## Deliberately not done
+
+* **Zero-sum enforcement.** Three v4 attempts lost. `odd` showed the
+  reparameterised readout learns fine (residual `0.0006`, ladder `+578`) and
+  died on throughput (`844` against `1081` solves/s). The game is zero-sum; a
+  correct architecture should learn that, and forcing it has only ever cost
+  strength here. Left as a diagnostic.
+* **Policy head.** The v4 measurement (`arch_policy`, `646` against `663` and
+  `696`) tested it as an auxiliary loss only; the warm-start run that was its
+  actual justification was killed before producing a number. Worth revisiting
+  as a search change, not as a loss term.
+* **Direction-aware message passing.** The trunk sums its six neighbours with
+  one shared weight, so it sees adjacency and distance but not *heading*.
+  Crossbowman and Lancer need a straight line, and lines of advance matter
+  generally. Per-direction taps cost `2.7x` the trunk; three axis pairs cost
+  `1.67x` and would still express a line. This is the first trunk experiment to
+  run once the box is free.
+
+
 # Value v4 runs
 
 ## Main finding

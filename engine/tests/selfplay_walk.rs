@@ -3,6 +3,8 @@
 //! staying in lockstep with the game's Bayes-filtered belief. A desync trips
 //! the hard assertion in `play_game` and fails the test.
 
+use std::collections::HashSet;
+use warchest::board::N_LOCATIONS;
 use warchest::rng::Rng;
 use warchest::search::{Cfg, Nets};
 use warchest::selfplay::{play_game, Agent, Collect, Data, GameCfg};
@@ -181,4 +183,34 @@ fn capped_solves_fall_back_and_games_finish() {
     }
     assert!(dec > 0);
     assert!(caps > 0, "the real solver-cap counter stayed zero");
+}
+
+/// The auxiliary ownership target. It is a fact about the *finished* game, so
+/// it is backfilled onto every row the game produced when the game ends: the
+/// rows of one game must therefore all carry the same ten owners. Values are
+/// `0`, `1` or `2` — a `NONE` marker leaking through as 255 would index past
+/// the head's three classes.
+#[test]
+fn every_row_carries_the_finished_games_location_owners() {
+    let nets = [Nets::default()];
+    let mut seen = HashSet::new();
+    for i in 0..8u64 {
+        let d = play(0x5EED + i, &nets, rebel([0, 0], 0.25, true));
+        assert!(d.nv > 0, "no rows collected");
+        assert_eq!(
+            d.aux.len(),
+            d.nv * N_LOCATIONS,
+            "aux is not in lockstep with rows"
+        );
+        let owners = &d.aux[..N_LOCATIONS];
+        for (r, row) in d.aux.chunks_exact(N_LOCATIONS).enumerate() {
+            assert!(
+                row.iter().all(|&o| o <= 2),
+                "row {r}: {row:?} is not an owner label"
+            );
+            assert_eq!(row, owners, "row {r} kept its solve-site ownership");
+        }
+        seen.insert(owners.to_vec());
+    }
+    assert!(seen.len() > 1, "the ownership label is the same in every game");
 }

@@ -29,7 +29,7 @@
 //!
 //! `cargo run --release --example cfgvalue -- weights.bin [positions] [iters]`
 
-use warchest::net::Mlp;
+use warchest::net::Net;
 use warchest::rebel::{enumerate_configs, reserve, true_config, Belief, Config, Ctx, NSLOT};
 use warchest::rng::Rng;
 use warchest::search::{Cfg, Nets, Solver};
@@ -116,7 +116,7 @@ fn main() {
     let skip: usize = a.get(5).and_then(|x| x.parse().ok()).unwrap_or(20);
 
     let mut nets = Nets::default();
-    nets.value = Mlp::load_bin(&path).expect("weights file");
+    nets.value = Net::load_bin(&path).expect("weights file");
     warchest::state::set_cap_marker_value(0.0);
     println!(
         "dims {:?}, T={iters}, positions from {} play, sampled {}-{} plies in",

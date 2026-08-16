@@ -103,11 +103,13 @@ The golden run is a real 30-minute `train.py` run on the two-RTX-3090 box, not
 disabled. The ReBeL phase uses the production settings:
 
 - random drafts;
-- depth 2 and 64 linear-CFR iterations;
-- the production 384/64/64 network and changing real weights;
+- depth 2 and 64 CFR iterations;
+- the production v5 network — an 8-block hex trunk, the config encoder and the
+  128-wide join (`docs/REBEL.md` §5) — and changing real weights;
 - optimizer batch size 1,024 and four optimizer samples per fresh solve;
-- the current compact replay rows, mirror augmentation, target construction,
-  snapshot schedule, 200,000-node safety cap, and horizon-payoff schedule.
+- the current compact replay rows, both canonical seat views of every row,
+  target construction, snapshot schedule, 200,000-node safety cap, and
+  horizon-payoff schedule.
 
 The headline counter is:
 
@@ -220,10 +222,12 @@ current `make_batch`; only about 14 ms was forward, backward, clipping, and
 Adam. `np.unique` over the config key took about 105 ms and packed-row
 expansion about 58 ms. The deduplication removed roughly 32% of config rows.
 
-Computing the holding tower for every config row instead--with `inv` equal to
-`arange`--is algebraically equivalent. Despite doing more GPU arithmetic, it
-reduced the full step to 72 ms. With 320 generation workers active, the same
-comparison was 228 ms with CPU deduplication versus 101 ms without it. The
+Computing the config tower for every config row instead — with `inv` equal to
+`arange` — is algebraically equivalent. Despite doing more GPU arithmetic, it
+reduced the full step to 72 ms. (The measurement is v4's, when that tower was
+called the holding tower; v5's config encoder sits in the same place.) With 320
+generation workers active, the same comparison was 228 ms with CPU
+deduplication versus 101 ms without it. The
 1,200 target permits 213 ms per optimizer step; the 2,000 target permits 128
 ms. Removing the sort is therefore both simpler and faster, and moving replay
 sampling/expansion to the device provides the needed margin.
@@ -404,9 +408,11 @@ large, and exclusive--and each is bounded in every work-vector dimension.
 
 The dispatcher packs the oldest compatible jobs until a row/work target or a
 short latency deadline is reached. A starting target of 32,000--64,000 network
-rows per wave is large enough for the 384x64 GEMMs on a 3090. Jobs in one wave
-share network shape, CFR rule, iteration count, snapshot list, and weight
-version. Their arrays are concatenated once and local offsets are patched to
+rows per wave keeps the trunk's `[rows * 37, 256] x [256, 128]` block GEMMs and
+the join's `[rows, 128] x [128, 128]` GEMMs large enough to be worth a 3090.
+Jobs in one wave share network shape, CFR rule, iteration count, snapshot list,
+and weight version. Their arrays are concatenated once and local offsets are
+patched to
 wave-global offsets.
 
 Cost buckets prevent one giant tree from setting the shape or latency of a
@@ -436,8 +442,10 @@ the reference path.
 
 For each iteration:
 
-1. form belief embeddings and run the two head GEMMs as large wave matrices;
-2. read out leaf/config values;
+1. pool `g(c)` into each query's belief vector, then run the join as wave-wide
+   matrices: `join_b` added onto the cached `join_p(P)`, three residual blocks,
+   `join_out` back onto `P`, and a LayerNorm;
+2. read the values out as one `<f(c), h> + bias` dot product per config;
 3. sweep levels backward;
 4. at an acting decision row, compute action values and the node value, then
    update discounted regret and the next current strategy in the same kernel;
@@ -537,7 +545,7 @@ it. This exceptional lane must not occupy or fragment the ordinary wave pools.
 The 2-million-row replay is small relative to a 24 GiB card in its packed
 form. Put the primary training ring on GPU 1:
 
-- packed 223-byte public rows;
+- packed 215-byte public rows (`warchest.ROW_BYTES`);
 - per-row absolute config start and two support lengths;
 - `uint8[15]` config counts;
 - `uint8` player id;
@@ -559,16 +567,14 @@ committed. A dropped or deadline-censored game invalidates its provisional
 segments. Pending bytes participate in backpressure, and only committed solves
 enter the headline and optimizer-credit counters. This preserves the existing
 targets without retaining every game's large `Data` arenas on the host.
-Fresh-only policy labels ride the same commit into a bounded transient queue
-when the policy loss is enabled; with its production weight of zero, their
-payload need not cross to the trainer.
 
 A custom CUDA batch operator then:
 
 1. samples row ids with the current uniform/recent mixture;
 2. scans their two ragged support lengths into a fixed batch arena;
 3. gathers packed rows and config records;
-4. chooses mirror bits and applies the exact row/config/seat symmetry;
+4. builds both canonical seat views of every gathered row, applying the exact
+   row/config/seat symmetry to the second one;
 5. expands the public encoding from the frozen packed format;
 6. forms one config feature per gathered config and sets `inv = arange`.
 

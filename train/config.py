@@ -16,6 +16,10 @@ class Cfg:
     batch: int = 1024
     lr: float = 1e-3
     lr_decay_frac: str = "0.33,0.67"
+    # Weight on the auxiliary final-ownership cross-entropy. KataGo's own
+    # auxiliary heads carry weights in the 0.15--0.25 range: enough to shape
+    # the trunk, small enough that the value head still owns the gradient.
+    aux_weight: float = 0.15
     train_gen_ratio: float = 4.0
     recent_mix: float = 0.5
     recent_frac: float = 0.2

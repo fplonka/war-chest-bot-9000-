@@ -10,7 +10,7 @@
 //! Usage: `rebelbench <weights.bin> [games] [depth] [iters] [threads]`
 
 use std::time::Instant;
-use warchest::net::Mlp;
+use warchest::net::Net;
 use warchest::search::{Cfg, Nets};
 use warchest::selfplay::{run_games, Agent, Collect, GameCfg};
 
@@ -29,10 +29,10 @@ fn main() {
     }
 
     let mut nets = vec![Nets::default(), Nets::default()];
-    let mlp = Mlp::load_bin(&path).expect("weights file");
-    println!("dims {:?}", mlp.dims);
-    nets[0].value = mlp.clone();
-    nets[1].value = mlp;
+    let net = Net::load_bin(&path).expect("weights file");
+    println!("dims {:?}", net.dims);
+    nets[0].value = net.clone();
+    nets[1].value = net;
     warchest::state::set_cap_marker_value(0.0);
 
     let cfg = Cfg {
