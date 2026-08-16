@@ -273,7 +273,7 @@ macro_rules! kernels {
 
 kernels! {
     pack_cards, bias_gelu, cards_finish, tokens, stem,
-    trunk_norm, gather_mix, hex_pool, block_mid, block_out,
+    trunk_gather_pool, block_mid, block_out,
     board_pool, board_bias, config_pack, slot_sum, config_finish, config_norm,
     init_strategy, seed_reach, reach_sweep, seed_sum,
     belief_sums, join_input, join_block, join_finish, readout,
@@ -1017,20 +1017,11 @@ impl Executor {
                 self,
                 d,
                 bank,
-                trunk_norm,
-                warps(n * (N_HEXES + 1)),
+                trunk_gather_pool,
+                n as u32,
                 i as i32,
                 n as i32
             )?;
-            launch!(
-                self,
-                d,
-                bank,
-                gather_mix,
-                threads_usize(cells * C),
-                cells as i32
-            )?;
-            launch!(self, d, bank, hex_pool, threads_usize(n * C), n as i32)?;
             gemm(
                 &self.blas,
                 n,
@@ -1044,8 +1035,8 @@ impl Executor {
                 C,
                 0.0,
             )?;
-            // `y` lands over the activations it consumed; the next block's
-            // `trunk_norm` rebuilds the whole padded tensor from `x`.
+            // `y` lands over the activations it consumed. The next block
+            // normalises `x` into shared memory before gathering.
             gemm(
                 &self.blas,
                 cells,
@@ -1091,22 +1082,13 @@ impl Executor {
                 cells as i32
             )?;
         }
-        launch!(
-            self,
-            d,
-            bank,
-            trunk_norm,
-            warps(n * (N_HEXES + 1)),
-            BLOCKS as i32,
-            n as i32
-        )?;
         let width = 2 * C + LOOSE;
         launch!(
             self,
             d,
             bank,
             board_pool,
-            threads_usize(n * width),
+            n as u32,
             start as i32,
             n as i32
         )?;

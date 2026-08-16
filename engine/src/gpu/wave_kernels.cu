@@ -392,62 +392,52 @@ extern "C" __global__ void stem(const WaveDev* w, const WeightDev* wt,
     }
 }
 
-/// `a = gelu(ln(x))` into the padded activation tensor. `block` selects the
-/// block's first normalisation, or the trunk's final one at index `BLOCKS`.
-/// The grid covers the pad hex too: the previous block's output was written
-/// over this tensor, so the pad has to be zeroed again before the gather runs.
-extern "C" __global__ void trunk_norm(const WaveDev* w, const WeightDev* wt,
-                                       int block, int n) {
+/// Normalise one board row into shared memory, then build both inputs consumed
+/// by the block. Keeping the normalised tokens on chip avoids writing them to
+/// global memory and reading each token again for six neighbours and pooling.
+extern "C" __global__ void trunk_gather_pool(const WaveDev* w,
+                                              const WeightDev* wt,
+                                              int block, int n) {
+    __shared__ float a[HEX_STRIDE * C];
     int lane = threadIdx.x & 31;
-    int i = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-    int r = i / HEX_STRIDE, h = i - r * HEX_STRIDE;
+    int warp = threadIdx.x >> 5;
+    int warps = blockDim.x >> 5;
+    int r = blockIdx.x;
     if (r >= n) return;
-    float* dst = AP(w, A_A) + (unsigned long long)i * C;
-    if (h == N_HEXES) {
-        for (int j = lane; j < C; j += 32) dst[j] = 0.0f;
-        return;
-    }
-    const float* src = AP(w, A_X) + ((unsigned long long)r * N_HEXES + h) * C;
-    norm_row<C, true>([&](int j) { return src[j]; }, dst, wt->pre_lnw[block],
-                      wt->pre_lnb[block], lane);
-}
 
-/// The mix input: a hex's own activation, then the sum over its neighbours.
-/// A missing neighbour is hex `N_HEXES`, whose row is zero, so no lane branches.
-extern "C" __global__ void gather_mix(const WaveDev* w, const WeightDev* wt,
-                                       int cells) {
-    (void)wt;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= cells * C) return;
-    int j = i % C, cell = i / C;
-    int r = cell / N_HEXES, h = cell - r * N_HEXES;
-    const float* a = AP(w, A_A) + (unsigned long long)r * HEX_STRIDE * C + j;
-    float sum = 0.0f;
-    #pragma unroll
-    for (int d = 0; d < 6; d++) sum += a[HEX_NEIGHBOUR[h * 6 + d] * C];
-    float* dst = AP(w, A_MIX) + (unsigned long long)cell * 2 * C + j;
-    dst[0] = a[h * C];
-    dst[C] = sum;
-}
-
-/// Mean and max of the activations over a row's hexes -- the global-pooling
-/// bias's input.
-extern "C" __global__ void hex_pool(const WaveDev* w, const WeightDev* wt,
-                                    int n) {
-    (void)wt;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n * C) return;
-    int j = i % C, r = i / C;
-    const float* a = AP(w, A_A) + (unsigned long long)r * HEX_STRIDE * C + j;
-    float sum = a[0], top = a[0];
-    for (int h = 1; h < N_HEXES; h++) {
-        float v = a[h * C];
-        sum += v;
-        top = fmaxf(top, v);
+    const float* x = AP(w, A_X) + (unsigned long long)r * N_HEXES * C;
+    for (int h = warp; h < N_HEXES; h += warps) {
+        norm_row<C, true>([&](int j) { return x[h * C + j]; }, a + h * C,
+                          wt->pre_lnw[block], wt->pre_lnb[block], lane);
     }
-    float* out = AP(w, A_POOL) + (unsigned long long)r * 2 * C + j;
-    out[0] = sum / (float)N_HEXES;
-    out[C] = top;
+    for (int j = threadIdx.x; j < C; j += blockDim.x) {
+        a[N_HEXES * C + j] = 0.0f;
+    }
+    __syncthreads();
+
+    float* mix = AP(w, A_MIX) + (unsigned long long)r * N_HEXES * 2 * C;
+    for (int i = threadIdx.x; i < N_HEXES * C; i += blockDim.x) {
+        int h = i / C, j = i - h * C;
+        float sum = 0.0f;
+        #pragma unroll
+        for (int d = 0; d < 6; d++) {
+            sum += a[HEX_NEIGHBOUR[h * 6 + d] * C + j];
+        }
+        mix[(unsigned long long)h * 2 * C + j] = a[h * C + j];
+        mix[(unsigned long long)h * 2 * C + C + j] = sum;
+    }
+
+    float* pool = AP(w, A_POOL) + (unsigned long long)r * 2 * C;
+    for (int j = threadIdx.x; j < C; j += blockDim.x) {
+        float sum = a[j], top = a[j];
+        for (int h = 1; h < N_HEXES; h++) {
+            float v = a[h * C + j];
+            sum += v;
+            top = fmaxf(top, v);
+        }
+        pool[j] = sum / (float)N_HEXES;
+        pool[C + j] = top;
+    }
 }
 
 /// Broadcast the pooling bias over the row's hexes, then normalise and
@@ -472,31 +462,40 @@ extern "C" __global__ void block_out(const WaveDev* w, const WeightDev* wt,
     AP(w, A_X)[i] += AP(w, A_MIX)[i] + wt->out_b[block][i % C];
 }
 
-/// The board readout's input: mean and max over the normalised trunk output,
-/// then the row's loose scalars.
+/// Normalise the final trunk output in shared memory and pool it directly.
 extern "C" __global__ void board_pool(const WaveDev* w, const WeightDev* wt,
-                                       int qrow0, int n) {
-    (void)wt;
-    int width = 2 * C + LOOSE;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n * width) return;
-    int j = i % width, r = i / width;
-    float v;
-    if (j < 2 * C) {
-        const float* a =
-            AP(w, A_A) + (unsigned long long)r * HEX_STRIDE * C + j % C;
-        float sum = a[0], top = a[0];
-        for (int h = 1; h < N_HEXES; h++) {
-            float x = a[h * C];
-            sum += x;
-            top = fmaxf(top, x);
-        }
-        v = j < C ? sum / (float)N_HEXES : top;
-    } else {
-        int qrow = qrow0 + r;
-        v = loose_feature(raw_row(w, qrow >> 1), qrow & 1, j - 2 * C);
+                                      int qrow0, int n) {
+    __shared__ float a[N_HEXES * C];
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps = blockDim.x >> 5;
+    int r = blockIdx.x;
+    if (r >= n) return;
+
+    const float* x = AP(w, A_X) + (unsigned long long)r * N_HEXES * C;
+    for (int h = warp; h < N_HEXES; h += warps) {
+        norm_row<C, true>([&](int j) { return x[h * C + j]; }, a + h * C,
+                          wt->pre_lnw[BLOCKS], wt->pre_lnb[BLOCKS], lane);
     }
-    AP(w, A_BOARD)[i] = v;
+    __syncthreads();
+
+    int width = 2 * C + LOOSE;
+    float* out = AP(w, A_BOARD) + (unsigned long long)r * width;
+    for (int j = threadIdx.x; j < width; j += blockDim.x) {
+        if (j < 2 * C) {
+            int c = j % C;
+            float sum = a[c], top = a[c];
+            for (int h = 1; h < N_HEXES; h++) {
+                float v = a[h * C + c];
+                sum += v;
+                top = fmaxf(top, v);
+            }
+            out[j] = j < C ? sum / (float)N_HEXES : top;
+        } else {
+            int qrow = qrow0 + r;
+            out[j] = loose_feature(raw_row(w, qrow >> 1), qrow & 1, j - 2 * C);
+        }
+    }
 }
 
 extern "C" __global__ void board_bias(const WaveDev* w, const WeightDev* wt,

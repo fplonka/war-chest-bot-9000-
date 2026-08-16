@@ -487,9 +487,9 @@ pub(crate) fn device_value_layout(t: &PackedTables) -> Option<([Vec<u32>; 2], us
 /// The trunk is a per-row map, so the device runs it in chunks of this many
 /// canonical view rows. A row carries 37 hex tokens through eight residual
 /// blocks, which is ~85 KiB of working tensors per row -- by far the widest
-/// thing a wave touches -- and chunking is what keeps a mature wave's arena
-/// off the exclusive one-job route.
-pub const TRUNK_CHUNK_ROWS: usize = 512;
+/// thing a wave touches. 4,096 rows amortises the 54 launches in each chunk
+/// while adding 305 MiB per lane over the old 512-row chunk.
+pub const TRUNK_CHUNK_ROWS: usize = 4096;
 
 fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
     let t = &job.tables;
