@@ -49,9 +49,12 @@ pre{max-height:340px;overflow:auto;margin:4px 0;font:inherit;white-space:pre-wra
 </main>
 <div id=tip></div>
 <script>
-// Colours from the old report: mid-tone and saturated, so one rendering reads
-// against a light page and a dark one.
-const INK = ["#3d8bfd", "#20a37a", "#e0709f", "#d99b28", "#9b7bd4"], AXIS = "#8a8a8a";
+// Okabe-Ito-derived palettes keep every series distinct under common colour
+// vision deficiencies and retain contrast on both supported backgrounds.
+const palette = () => matchMedia("(prefers-color-scheme:dark)").matches
+  ? ["#56b4e9", "#e69f00", "#40c99a", "#f08080", "#cc79a7"]
+  : ["#0072b2", "#d55e00", "#009e73", "#cc3311", "#aa4499"];
+const AXIS = "#8a8a8a";
 const $ = id => document.getElementById(id);
 const E = (tag, cls, text) => { const n = document.createElement(tag);
   if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
@@ -117,8 +120,9 @@ function draw(cv, p, snaps) {
     g.beginPath(); g.moveTo(x, T); g.lineTo(x, H - B); g.stroke(); }
   g.setLineDash([]);
 
+  const ink = palette();
   ss.forEach((s, i) => {
-    const col = INK[i % INK.length];
+    const col = ink[i % ink.length];
     const line = (y, w, alpha) => { g.globalAlpha = alpha; g.strokeStyle = col;
       g.lineWidth = w; g.beginPath(); let on = false;
       y.forEach((v, k) => { if (v == null) { on = false; return; }

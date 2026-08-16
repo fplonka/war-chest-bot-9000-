@@ -1472,8 +1472,6 @@ impl<'a> Solver<'a> {
         }
         let rows = self.leaf_rows.len();
         let net = &self.nets.value;
-        debug_assert_eq!(net.pub_dim(), PUBFEAT);
-        debug_assert_eq!(net.cfeat(), CFEAT);
         crate::net::fit(&mut self.xb, 2 * rows * crate::net::POOL);
         shape!(NCFG, self.ncfg);
         let _t = timed!(PUBNET);

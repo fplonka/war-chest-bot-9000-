@@ -543,22 +543,15 @@ extern "C" __global__ void slot_sum(const WaveDev* w, const WeightDev* wt) {
     }
 }
 
-/// mode 0: the config encoder's hidden normalisation; mode 1: the readout
-/// vector's, which is the one LayerNorm with no activation after it.
-extern "C" __global__ void norm(const WaveDev* w, const WeightDev* wt,
-                                int mode, int rows) {
+/// Config encoder hidden normalisation.
+extern "C" __global__ void config_norm(const WaveDev* w, const WeightDev* wt,
+                                       int rows) {
     int lane = threadIdx.x & 31;
     int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     if (row >= rows) return;
-    if (mode == 0) {
-        float* x = AP(w, A_CFG) + (unsigned long long)row * CFGH;
-        norm_row<CFGH, true>([&](int j) { return x[j]; }, x, wt->cfg_lnw,
-                             wt->cfg_lnb, lane);
-    } else {
-        float* x = AP(w, A_H) + (unsigned long long)row * D;
-        norm_row<D, false>([&](int j) { return x[j]; }, x, wt->h_lnw, wt->h_lnb,
-                           lane);
-    }
+    float* x = AP(w, A_CFG) + (unsigned long long)row * CFGH;
+    norm_row<CFGH, true>([&](int j) { return x[j]; }, x, wt->cfg_lnw,
+                         wt->cfg_lnb, lane);
 }
 
 /// Finish both config outputs. `f` only wants its bias; `g` also gets the
@@ -846,8 +839,8 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
     int warp = threadIdx.x >> 5;
     int slot = warp / WPT, sub = warp % WPT;
     int task = blockIdx.x * READOUT_TILE + slot;
-    // The one thing a configuration does not vary over is the query's readout
-    // vector, so it is block-resident and only `f(c)` is read per config.
+    // The readout is H's only consumer, so its final LayerNorm lands directly
+    // in block-resident storage instead of taking a separate global round trip.
     __shared__ float common[READOUT_TILE][D];
     __shared__ float opp_reach[READOUT_TILE];
 
@@ -867,8 +860,9 @@ extern "C" __global__ void readout(const WaveDev* w, const WeightDev* wt,
         }
     } else if (live) {
         const float* h = AP(w, A_H) + (unsigned long long)q.row * D;
-        for (int j = sub * 32 + lane; j < D; j += WPT * 32)
-            common[slot][j] = h[j];
+        if (sub == 0)
+            norm_row<D, false>([&](int j) { return h[j]; }, common[slot],
+                               wt->h_lnw, wt->h_lnb, lane);
         // `belief_sums` parked the opponent reach mass in the value slot this
         // kernel is about to overwrite, so it has to be read before any warp
         // starts writing. The barrier below is that ordering.

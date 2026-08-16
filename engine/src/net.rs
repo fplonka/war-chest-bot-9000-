@@ -10,14 +10,14 @@
 //! * the **config encoder** runs once per distinct config in the subgame and
 //!   produces `f(c)` (the readout row) and `g(c)` (the pooling vector);
 //! * the **join** runs on every CFR iteration and is the only per-iteration
-//!   path: it modulates `P` by the two pooled beliefs and their marginals.
+//!   path: it modulates `P` by the two pooled beliefs.
 //!
 //! The readout is then one dot product, `v(c) = <f(c), h> + bias`.
 
-use crate::board::{board, N_HEXES, NONE};
+use crate::board::{board, NONE, N_HEXES};
 use crate::rebel::{
-    CFEAT, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_CARDS, OFF_LOOSE, OFF_PILES,
-    PILE_COUNTS, PUBFEAT,
+    CFEAT, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_CARDS, OFF_LOOSE, OFF_PILES, PILE_COUNTS,
+    PUBFEAT,
 };
 use crate::units::CARD_FEATS;
 
@@ -61,6 +61,7 @@ extern "C" {
         c: *mut f32,
         ldc: i32,
     );
+    fn vvtanhf(y: *mut f32, x: *const f32, n: *const i32);
 }
 
 /// `c[m,n] = a[m,k] * b[k,n] + beta * c[m,n]`, all row-major.
@@ -83,8 +84,20 @@ pub fn gemm(
     #[cfg(target_vendor = "apple")]
     unsafe {
         cblas_sgemm(
-            101, 111, 111, m as i32, n as i32, k as i32, 1.0, a.as_ptr(), lda as i32, b.as_ptr(),
-            ldb as i32, beta, c.as_mut_ptr(), ldc as i32,
+            101,
+            111,
+            111,
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0,
+            a.as_ptr(),
+            lda as i32,
+            b.as_ptr(),
+            ldb as i32,
+            beta,
+            c.as_mut_ptr(),
+            ldc as i32,
         );
         return;
     }
@@ -115,6 +128,30 @@ pub fn gemm(
 pub fn gelu(x: f32) -> f32 {
     let inner = 0.797_884_56 * (x + 0.044_715 * x * x * x);
     0.5 * x * (1.0 + inner.tanh())
+}
+
+/// Batched GELU. Scalar `tanhf` consumed 90% of the M1 inference profile;
+/// vForce evaluates bounded chunks without making model-sized scratch copies.
+fn gelu_all(x: &mut [f32], arg: &mut Vec<f32>, th: &mut Vec<f32>) {
+    #[cfg(target_vendor = "apple")]
+    {
+        for x in x.chunks_mut(1 << 16) {
+            let n = x.len();
+            fit(arg, n);
+            fit(th, n);
+            for (a, &v) in arg[..n].iter_mut().zip(x.iter()) {
+                *a = 0.797_884_56 * (v + 0.044_715 * v * v * v);
+            }
+            let n = n as i32;
+            unsafe { vvtanhf(th.as_mut_ptr(), arg.as_ptr(), &n) };
+            for (v, &t) in x.iter_mut().zip(th.iter()) {
+                *v *= 0.5 * (1.0 + t);
+            }
+        }
+        return;
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    x.iter_mut().for_each(|v| *v = gelu(*v));
 }
 
 pub fn fit(v: &mut Vec<f32>, n: usize) {
@@ -342,16 +379,18 @@ struct Norm {
 
 impl Norm {
     /// LayerNorm then GELU, in place.
-    fn apply(&self, x: &mut [f32], rows: usize) {
+    fn apply(&self, x: &mut [f32], rows: usize, arg: &mut Vec<f32>, th: &mut Vec<f32>) {
         let width = self.g.len();
-        for row in x[..rows * width].chunks_exact_mut(width) {
+        let x = &mut x[..rows * width];
+        for row in x.chunks_exact_mut(width) {
             let mean = row.iter().sum::<f32>() / width as f32;
             let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / width as f32;
             let inv = 1.0 / (var + 1e-5).sqrt();
             for j in 0..width {
-                row[j] = gelu((row[j] - mean) * inv * self.g[j] + self.b[j]);
+                row[j] = (row[j] - mean) * inv * self.g[j] + self.b[j];
             }
         }
+        gelu_all(x, arg, th);
     }
 
     /// LayerNorm alone, in place. Only the readout normalisation needs this.
@@ -467,7 +506,9 @@ impl Net {
         })
     }
 
-    pub fn load_flat_bin(path: &str) -> std::io::Result<(Vec<usize>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+    pub fn load_flat_bin(
+        path: &str,
+    ) -> std::io::Result<(Vec<usize>, Vec<f32>, Vec<f32>, Vec<f32>)> {
         let raw = std::fs::read(path)?;
         let mut at = 0;
         let u32_at = |at: &mut usize| {
@@ -497,12 +538,6 @@ impl Net {
     pub fn is_empty(&self) -> bool {
         self.dims.is_empty()
     }
-    pub fn pub_dim(&self) -> usize {
-        PUBFEAT
-    }
-    pub fn cfeat(&self) -> usize {
-        CFEAT
-    }
 
     // ---------------------------------------------------------------- pieces
 
@@ -516,9 +551,8 @@ impl Net {
         }
         let mut hidden = Vec::new();
         self.card[0].run(&facts, rows * NTYPE, &mut hidden);
-        hidden[..rows * NTYPE * TYPE]
-            .iter_mut()
-            .for_each(|x| *x = gelu(*x));
+        let (mut arg, mut th) = (Vec::new(), Vec::new());
+        gelu_all(&mut hidden[..rows * NTYPE * TYPE], &mut arg, &mut th);
         self.card[1].run(&hidden, rows * NTYPE, out);
     }
 
@@ -590,9 +624,10 @@ impl Net {
         let mut mixed = vec![0.0; cells * 2 * C];
         let mut pooled = vec![0.0; rows * 2 * C];
         let (mut y, mut gb, mut z) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut arg, mut th) = (Vec::new(), Vec::new());
         for (i, blk) in self.blocks.iter().enumerate() {
             a.copy_from_slice(&x[..cells * C]);
-            self.norms[ln_block(i, 0)].apply(&mut a, cells);
+            self.norms[ln_block(i, 0)].apply(&mut a, cells, &mut arg, &mut th);
             for cell in 0..cells {
                 let h = cell % N_HEXES;
                 let (self_part, neigh) = mixed[cell * 2 * C..(cell + 1) * 2 * C].split_at_mut(C);
@@ -628,13 +663,13 @@ impl Net {
                     *o += v;
                 }
             }
-            self.norms[ln_block(i, 1)].apply(&mut y, cells);
+            self.norms[ln_block(i, 1)].apply(&mut y, cells, &mut arg, &mut th);
             blk.out.run(&y, cells, &mut z);
             for (o, &v) in x[..cells * C].iter_mut().zip(&z[..cells * C]) {
                 *o += v;
             }
         }
-        self.norms[LN_TRUNK].apply(&mut x, cells);
+        self.norms[LN_TRUNK].apply(&mut x, cells, &mut arg, &mut th);
         x
     }
 
@@ -695,14 +730,14 @@ impl Net {
                 row[0] = phi[c * CFEAT + k];
                 row[1] = phi[c * CFEAT + NSLOT + k];
                 row[2] = phi[c * CFEAT + 2 * NSLOT + k];
-                row[3..].copy_from_slice(&cards[(q * NTYPE + k) * TYPE..(q * NTYPE + k + 1) * TYPE]);
+                row[3..]
+                    .copy_from_slice(&cards[(q * NTYPE + k) * TYPE..(q * NTYPE + k + 1) * TYPE]);
             }
         }
         let mut hidden = Vec::new();
         self.cfg1.run(&slots, n * NSLOT, &mut hidden);
-        hidden[..n * NSLOT * CFGH]
-            .iter_mut()
-            .for_each(|x| *x = gelu(*x));
+        let (mut arg, mut th) = (Vec::new(), Vec::new());
+        gelu_all(&mut hidden[..n * NSLOT * CFGH], &mut arg, &mut th);
         let mut u = vec![0.0; n * CFGH];
         for c in 0..n {
             for k in 0..NSLOT {
@@ -711,7 +746,7 @@ impl Net {
                 }
             }
         }
-        self.norms[LN_CFG].apply(&mut u, n);
+        self.norms[LN_CFG].apply(&mut u, n, &mut arg, &mut th);
         self.cfg_f.run(&u, n, f_out);
         self.cfg_g.run(&u, n, g_out);
         // The linear half of `g`: a count-weighted sum of per-zone card
@@ -764,16 +799,17 @@ impl Net {
         }
         self.join_b.add(&input, rows, &mut z);
         self.join_b.bias(&mut z, rows);
-        let (mut t, mut d) = (vec![0.0; rows * JW], Vec::new());
+        let (mut t, mut d, mut arg, mut th) =
+            (vec![0.0; rows * JW], Vec::new(), Vec::new(), Vec::new());
         for i in 0..JBLOCKS {
             t.copy_from_slice(&z);
-            self.norms[LN_JOIN + i].apply(&mut t, rows);
+            self.norms[LN_JOIN + i].apply(&mut t, rows, &mut arg, &mut th);
             self.join_w[i].run(&t, rows, &mut d);
             for (o, &v) in z.iter_mut().zip(&d[..rows * JW]) {
                 *o += v;
             }
         }
-        self.norms[LN_JOUT].apply(&mut z, rows);
+        self.norms[LN_JOUT].apply(&mut z, rows, &mut arg, &mut th);
         fit(out, rows * D);
         for r in 0..rows {
             let src = &p[(2 * r + player) * D..(2 * r + player + 1) * D];

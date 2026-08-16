@@ -249,6 +249,12 @@ struct WeightBank {
     dev: CudaSlice<WeightDev>,
 }
 
+enum BeliefPool {
+    Cached,
+    Moved,
+    Both,
+}
+
 macro_rules! kernels {
     ($($name:ident),* $(,)?) => {
         struct Kernels { $($name: CudaFunction,)* }
@@ -266,7 +272,7 @@ macro_rules! kernels {
 kernels! {
     pack_cards, bias_gelu, cards_finish, tokens, stem,
     trunk_norm, gather_mix, hex_pool, block_mid, block_out,
-    board_pool, board_bias, config_pack, slot_sum, config_finish, norm,
+    board_pool, board_bias, config_pack, slot_sum, config_finish, config_norm,
     init_strategy, seed_reach, reach_sweep, seed_sum,
     belief_sums, join_input, join_block, join_finish, readout,
     backprop_sweep, normalize_strategy, gather_carry, collect_root,
@@ -583,12 +589,8 @@ impl Executor {
             .banks
             .get(&version)
             .ok_or_else(|| format!("GPU weight version {version} is unavailable"))?;
-        let mut device = DeviceWave::upload(
-            &self.stream,
-            &wave,
-            self.buffers.take(),
-            &mut self.staging,
-        )?;
+        let mut device =
+            DeviceWave::upload(&self.stream, &wave, self.buffers.take(), &mut self.staging)?;
         let uploaded = Instant::now();
         // Arbitrary live waves often make cuBLAS choose a different captured
         // topology, in which case graph update cannot reuse the executable and
@@ -612,7 +614,16 @@ impl Executor {
             }
             for t in 0..wave.meta.iters {
                 let p = t & 1;
-                self.run_head(&device, bank, t == 0, p)?;
+                self.run_head(
+                    &device,
+                    bank,
+                    if t == 0 {
+                        BeliefPool::Both
+                    } else {
+                        BeliefPool::Moved
+                    },
+                    p,
+                )?;
                 self.launch_readout(&device, bank, p)?;
                 let m = (t / 2 + 1) as f32;
                 let cfr = wave.meta.cfr;
@@ -648,7 +659,12 @@ impl Executor {
                 )?;
                 self.full_reach(&device, bank, false, true)?;
                 for p in 0..2 {
-                    self.run_head(&device, bank, true, p)?;
+                    let pool = if p == 0 {
+                        BeliefPool::Both
+                    } else {
+                        BeliefPool::Cached
+                    };
+                    self.run_head(&device, bank, pool, p)?;
                     self.launch_readout(&device, bank, p)?;
                     self.launch_backprop_sweep(&device, bank, p, true, 0.0, 0.0, 0.0, 0.0)?;
                     launch!(
@@ -865,7 +881,7 @@ impl Executor {
             slots as i32
         )?;
         launch!(self, d, bank, slot_sum, warps(cfgs))?;
-        launch!(self, d, bank, norm, warps(cfgs), 0i32, cfgs as i32)?;
+        launch!(self, d, bank, config_norm, warps(cfgs), cfgs as i32)?;
         gemm(
             &self.blas,
             cfgs,
@@ -892,7 +908,13 @@ impl Executor {
             POOL,
             0.0,
         )?;
-        launch!(self, d, bank, config_finish, threads_usize(cfgs * (D + POOL)))?;
+        launch!(
+            self,
+            d,
+            bank,
+            config_finish,
+            threads_usize(cfgs * (D + POOL))
+        )?;
         Ok(())
     }
 
@@ -940,7 +962,14 @@ impl Executor {
                 i as i32,
                 n as i32
             )?;
-            launch!(self, d, bank, gather_mix, threads_usize(cells * C), cells as i32)?;
+            launch!(
+                self,
+                d,
+                bank,
+                gather_mix,
+                threads_usize(cells * C),
+                cells as i32
+            )?;
             launch!(self, d, bank, hex_pool, threads_usize(n * C), n as i32)?;
             gemm(
                 &self.blas,
@@ -970,7 +999,15 @@ impl Executor {
                 C,
                 0.0,
             )?;
-            launch!(self, d, bank, block_mid, warps(cells), i as i32, cells as i32)?;
+            launch!(
+                self,
+                d,
+                bank,
+                block_mid,
+                warps(cells),
+                i as i32,
+                cells as i32
+            )?;
             gemm(
                 &self.blas,
                 cells,
@@ -1145,29 +1182,34 @@ impl Executor {
         Ok(())
     }
 
-    /// The only per-iteration path: pool the beliefs, then run the join. `both`
-    /// re-pools both players, which only the first iteration and the
-    /// fixed-policy root queries need; otherwise the player whose strategy just
-    /// moved is the only block that changed.
+    /// The only per-iteration path: update the changed belief pools, then run
+    /// the join.
     fn run_head(
         &self,
         d: &DeviceWave,
         bank: &WeightBank,
-        both: bool,
+        pool: BeliefPool,
         traverser: usize,
     ) -> Result<(), String> {
         let l = &bank.layout;
         let rows = d.host.rows as usize;
         let t = traverser as i32;
-        launch!(
-            self,
-            d,
-            bank,
-            belief_sums,
-            warps(d.host.nleaf as usize),
-            t,
-            both as i32
-        )?;
+        let both = match pool {
+            BeliefPool::Cached => None,
+            BeliefPool::Moved => Some(0i32),
+            BeliefPool::Both => Some(1i32),
+        };
+        if let Some(both) = both {
+            launch!(
+                self,
+                d,
+                bank,
+                belief_sums,
+                warps(d.host.nleaf as usize),
+                t,
+                both
+            )?;
+        }
         launch!(
             self,
             d,
@@ -1191,7 +1233,15 @@ impl Executor {
             1.0,
         )?;
         for (i, span) in l.join_w.iter().enumerate() {
-            launch!(self, d, bank, join_block, warps(rows), i as i32, rows as i32)?;
+            launch!(
+                self,
+                d,
+                bank,
+                join_block,
+                warps(rows),
+                i as i32,
+                rows as i32
+            )?;
             gemm(
                 &self.blas,
                 rows,
@@ -1220,7 +1270,7 @@ impl Executor {
             D,
             1.0,
         )?;
-        launch!(self, d, bank, norm, warps(rows), 1i32, rows as i32)
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
