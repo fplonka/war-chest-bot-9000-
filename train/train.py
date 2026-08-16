@@ -503,7 +503,7 @@ def main():
     value.push(0)
     gpu_devices = [int(x) for x in args.gpu_devices.split(",") if x.strip()]
     os.environ.setdefault("WARCHEST_DIRECT", "1")
-    os.environ.setdefault("WARCHEST_WAVE_LANES", "3")
+    os.environ.setdefault("WARCHEST_WAVE_LANES", "4")
     os.environ.setdefault("WARCHEST_WAVE_ROWS", "196608")
     os.environ.setdefault("WARCHEST_WAVE_JOBS", "256")
     os.environ.setdefault("WARCHEST_WAVE_US", "75000")
