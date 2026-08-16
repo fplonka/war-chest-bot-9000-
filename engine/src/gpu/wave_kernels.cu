@@ -439,8 +439,8 @@ extern "C" __global__ void hex_pool(const WaveDev* w, const WeightDev* wt,
     if (i >= n * C) return;
     int j = i % C, r = i / C;
     const float* a = AP(w, A_A) + (unsigned long long)r * HEX_STRIDE * C + j;
-    float sum = 0.0f, top = -INFINITY;
-    for (int h = 0; h < N_HEXES; h++) {
+    float sum = a[0], top = a[0];
+    for (int h = 1; h < N_HEXES; h++) {
         float v = a[h * C];
         sum += v;
         top = fmaxf(top, v);
@@ -485,8 +485,8 @@ extern "C" __global__ void board_pool(const WaveDev* w, const WeightDev* wt,
     if (j < 2 * C) {
         const float* a =
             AP(w, A_A) + (unsigned long long)r * HEX_STRIDE * C + j % C;
-        float sum = 0.0f, top = -INFINITY;
-        for (int h = 0; h < N_HEXES; h++) {
+        float sum = a[0], top = a[0];
+        for (int h = 1; h < N_HEXES; h++) {
             float x = a[h * C];
             sum += x;
             top = fmaxf(top, x);
