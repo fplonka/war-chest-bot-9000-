@@ -139,7 +139,7 @@ function draw(cv, p, snaps) {
         g.beginPath(); g.arc(X(s.x[k]), Y(v), 2.5, 0, 7); g.fill(); }); }
   });
   g.setLineDash([4, 4]);
-  p.h.forEach((h, i) => { g.strokeStyle = INK[(i + 1) % INK.length];
+  p.h.forEach((h, i) => { g.strokeStyle = ink[(i + 1) % ink.length];
     g.beginPath(); g.moveTo(L, Y(h[1])); g.lineTo(W - R, Y(h[1])); g.stroke(); });
   g.setLineDash([]);
 }

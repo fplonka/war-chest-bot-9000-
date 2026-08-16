@@ -171,13 +171,19 @@ def health(eps, warm):
     if not eps:
         return []
     last, tot = eps[-1], lambda k: sum(e.get(k, 0) for e in eps)
+    # The last window of a run drains with no games in it, so its horizon
+    # fraction is 0.0 by definition; the run-level figure is the cumulative
+    # fraction, the same number train.py prints in its gpu-summary line.
+    horizon_games = max(tot("games"), 1)
+    horizon = 100 * sum(e.get("horizon_frac", 0) * e.get("games", 0)
+                        for e in eps) / horizon_games
     out = [("wall clock", f"{last.get('t', 0) / 60:.0f} min"),
            ("solves", f"{tot('solves'):,}"),
            ("solves/s", f"{last.get('solves_per_s', 0):.0f}"),
            ("buffer", f"{last.get('buf', 0):,}"),
            ("node-cap fallbacks", f"{tot('node_caps'):,}"),
            ("dropped solves", f"{tot('dropped'):,}"),
-           ("games cut at horizon", f"{last.get('horizon_frac', 0):.1%}")]
+           ("games cut at horizon", f"{horizon:.1f}%")]
     # The warm phase is not plotted -- different objective, different target
     # scale -- but how well it fitted decides what every ReBeL solve costs.
     if warm:
