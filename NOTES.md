@@ -273,3 +273,47 @@ percent, meaning the optimizer keeps pace exactly. The criterion travels. If
 kernels get faster or solves get deeper the ceiling moves, and the same
 debt-at-ceiling reading will name the new ratio; `4` is the answer for depth two
 at `T=64` on two 3090s, which is where the default already sat.
+
+## Depth one against depth two, and what the Greedy anchor hides
+
+At matched search -- both sides playing depth two, 64 iterations, through the
+relay with colour-swapped pairs -- the depth-one thirty-minute run beats the
+depth-two thirty-minute run `139-56-5`. That is `0.2925` to depth two,
+`-153.4` Elo, `p=2.5e-9`, and `51-7-42` on the pairs. The two runs are
+otherwise the same experiment: thirty minutes from scratch, seed 95, same
+architecture, differing in the recipe they train under (`depth 1/T=32` against
+`depth 2/T=64`).
+
+The per-run ladders say the opposite. On its own Greedy-anchored ladder the
+depth-two run finishes at `+610.7` and the depth-one run at `+561.8` -- depth
+two ahead by `49` where direct play puts it behind by `153`. This is worse than
+the imprecision already noted in this file: the anchor *misorders* them. Both
+nets beat Greedy far too easily for the margin to carry information, so the
+rating saturates and what is left is noise around a ceiling. Run reports and
+ladder Elo can show that a run learned; they cannot choose between two recipes.
+Every recipe decision here was settled by direct play for that reason.
+
+Depth two was still improving at thirty minutes, so the question is whether it
+crosses over later. Measured against a fixed yardstick -- the depth-one final,
+matched search, 200 games each -- it does not look like it:
+
+| depth-two checkpoint | trained | Elo vs the depth-one final |
+|---|---:|---:|
+| s2 | 17min | `-354.5` |
+| s3 | 23min | `-217.3` |
+| final | 29min | `-153.4` |
+
+The gap closes by `+137.2` and then `+63.9` per six minutes. Reading the first
+of those alone predicts a crossover at about `43` minutes; the second says the
+approach is geometric, decaying by `0.466` every six minutes, `tau = 7.9min`,
+with an asymptote `97.7` Elo *short* of the depth-one final -- and the depth-one
+final is itself only a thirty-minute checkpoint that would keep moving. Three
+points fitted across the tail of a bootstrap transient is a weak extrapolation
+and does not prove an asymptote, but it does rule out the near-term crossover,
+which is the claim that would have justified depth two for the long run.
+
+So the recipe for a long run is depth one on this evidence, and the reason is
+arithmetic rather than subtle: depth two buys better targets at `12.6x` the
+price per target, and nothing measured here shows the quality repaying the
+count. The case for depth two now needs a run long enough for depth one to
+actually saturate against a fixed opponent, which thirty minutes is not.
