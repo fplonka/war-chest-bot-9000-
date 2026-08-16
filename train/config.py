@@ -22,8 +22,8 @@ class Cfg:
     cap: int = 2_000_000
     cfgs_per_row: int = 48
     depth: int = 1
-    iters: int = 32
-    cfr: str = "linear"
+    iters: int = 64
+    cfr: str = "dcfr"
     explore: float = 0.25
     temp: float = 2.0
     eval_mix: float = 1.0
