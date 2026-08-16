@@ -239,3 +239,37 @@ three independent 200-game shards favored the current checkpoint. This rules
 out an architecture regression in the trained stack. It does not isolate
 architecture from training trajectory; that would require matched-data
 training runs for both readouts.
+
+## The train-to-generate ratio
+
+Four twenty-minute runs at seed 95, depth two, 64 iterations, identical but for
+`train_gen_ratio`, then their finals played directly against each other rather
+than compared through separate Greedy-anchored ladders, which this file has
+already found cannot rank close policies:
+
+| ratio | solves | optimizer rows | balanced | games | direct score vs `4` |
+|---|---:|---:|---:|---:|---:|
+| 2 | `582,367` | `1,164,288` | `647.0/s` | `10,058` | `0.302` over 200 |
+| **4** | `577,507` | `2,309,120` | `641.5/s` | `12,550` | -- |
+| 8 | `491,968` | `3,935,232` | `546.8/s` | `7,818` | `0.150` over 20 |
+| 16 | `367,542` | `5,879,808` | `408.4/s` | `6,312` | `0.050` over 20 |
+
+Joint ratings put `4` at `731` against `2` at `587`, and `930` against `643` for
+`16` and `541` for `8`. The margins are `p=2e-8`, `4e-5` and `2.6e-3`. Four wins,
+and the reason it wins is legible in the two columns beside the result.
+
+Generation saturates near `645 solves/s`. Ratios `2` and `4` both reach it --
+`582,367` and `577,507` solves are the same number -- so dropping to `2` buys no
+extra data and merely halves the passes taken over data already in hand. Above
+`4` the throttle engages the other way: the optimizer holds generation back to
+keep its ratio, and `16` pays `36%` of its solves for passes over rows the
+network has already moved past. Since ReBeL's targets are induced by the current
+network, re-fitting stale rows harder is chasing a distribution that has left.
+
+So the right ratio is the largest one that does not throttle generation, and
+that is identifiable without playing a single game: run at the ceiling and read
+`debt` -- at `4` it is `908` rows against `2,309,120`, four hundredths of one
+percent, meaning the optimizer keeps pace exactly. The criterion travels. If
+kernels get faster or solves get deeper the ceiling moves, and the same
+debt-at-ceiling reading will name the new ratio; `4` is the answer for depth two
+at `T=64` on two 3090s, which is where the default already sat.
