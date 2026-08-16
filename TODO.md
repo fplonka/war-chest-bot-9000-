@@ -40,3 +40,16 @@
       pinned to the old composition by test.
 - [ ] Validate the mirror augmentation against the engine rather than against
       invariants (a State::mirror() in Rust would make the encoder the oracle).
+- [x] **The value target estimator was checked and is right.** The claim that
+      it should be the per-iteration mean inside the CFR loop compares us to
+      vanilla ReBeL. We implement TurboReBeL, whose Phase 2 (paper Algorithm 2,
+      line 13) specifies `v^σ(β_{s,t}) ← UpdateCFV(S′, σ)` -- backpropagate
+      under the *fixed final* reference strategy, for each intermediate PBS.
+      That is exactly `value_under`, and Phase 2 is what earns the T+1 rows
+      per decision that `selfplay_walk.rs` pins.
+- [x] **The zero-reach uniform fallback does not fire.** Measured over a
+      depth-2/64-iteration solve under a flat network -- the warm-start
+      condition it was suspected to spoil -- across 114,585 reach rows and
+      64,822 strategy rows: no reach exactly zero, none below 1e-30, no
+      strategy sum zero. The 1e-80 floor the reference uses is not even
+      representable in the f32 arena. Left alone deliberately.

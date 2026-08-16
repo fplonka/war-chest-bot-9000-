@@ -539,7 +539,6 @@ def main():
             depth=args.depth, iters=args.iters, explore=args.explore,
             random_draft=args.random_draft, cfr=args.cfr,
             eval_mix=args.eval_mix, workers=args.gpu_workers,
-            actors_per_worker=args.gpu_actors,
             inflight_per_worker=args.gpu_inflight, chunk_solves=args.gpu_chunk)
         deadline = t0 + total
         drain = max(0.0, min(args.gpu_drain_seconds, total - warm))

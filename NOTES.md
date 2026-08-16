@@ -110,26 +110,54 @@ which are `22.6%` of GPU time and sit exactly at DRAM peak in FP32 -- half
 storage halves them -- and the reach and backprop sweeps at `14.3%`, which walk
 their reverse-gather rows one thread per row and so read uncoalesced.
 
-A from-scratch depth-two bootstrap collapses at some seeds and not others. Seed
-96 collapses on the FP32 build -- target spread falls to `0.001` by the second
-ReBeL epoch and stays -- while seed 95 recovers (`0.038` to `0.004` and back up).
-The readout race fix was briefly blamed for this and is exonerated: an isolation
-run at seed 95 on the fixed build bootstraps with the same shape as before the
-fix. The mechanism is almost certainly the value target, not the search. `TODO.md`
-records it and the reference confirms it: `subgame_solving.cc:577-590` takes the
-target as a linear-weighted running mean of the per-iteration counterfactual root
-values, accumulated inside `step()`, and floors every belief through
-`normalize_probabilities_safe(reaches, kReachSmoothingEps)`. We instead take one
-extra fixed-policy pass (`value_under`) under the final average strategy, and
-where an information set was never reached both `normalize_strategy` and
-`norm_parts` substitute a *uniform* strategy -- so those rows are labelled with
-the value of random play. A flat warm network produces many unreached configs, so
-a large share of early labels are all roughly the same wrong number, which pulls
-the network toward a constant and keeps it there. A trained initialisation has
-informative strategies, few unreached configs, and trains through it, which is
-exactly the observed split. Fixing this is a win on both axes: the labels become
-the reference's, and the whole Phase-2 pass -- two head evaluations per carried
-root, `14` of the `78` per solve -- disappears.
+## The from-scratch depth-two collapse
+
+The bootstrap collapse was a recipe defect, not a search or estimator defect,
+and the variable is the size of the live game set. Four seeds, seven minutes
+each, five of them warm, everything else identical:
+
+| seed | live 1152 (spread, games) | live 4608 (spread, games) |
+|---|---|---|
+| 95 | `0.097` -> `0.136`, 61-185 | `0.001`, 0 |
+| 96 | `0.104` -> `0.165`, 94-263 | `0.049` -> `0.056`, 0 |
+| 97 | `0.199` -> `0.241`, 131-245 | `0.001`, 0 |
+| 98 | `0.102` -> `0.144`, 46-220 | `0.067` -> `0.077`, 0 |
+
+Four of four train at `1152`; none of four train at `4608`, and not one of them
+completes a single game in any ten-second window. That is the mechanism. A
+depth-two solve costs about `550/s` against `7,900/s` at depth one, so with
+`4608` games resident each one advances `0.12` decisions a second and a
+hundred-decision game needs some `19` minutes to finish. Until a game finishes,
+no terminal outcome has entered the replay buffer, so every label the network
+trains on was produced by the network itself. `network -> CFR -> network` has no
+shortage of fixed points when nothing anchors it, and any constant is one; the
+runs at `0.049` and `0.067` are caught drifting monotonically toward theirs.
+
+This also explains the seed lottery it was mistaken for. The `19` minutes are
+comparable to a thirty-minute run, so a long run does eventually start finishing
+games -- `value_v4_d2i64dcfr_30` finished `14,161` of them -- but only after its
+target scale has already degenerated, which is why that run ends up *below* its
+own initialisation (init `544`, six minutes `407`, thirty minutes `499`). Short
+runs and short-lived seeds never get there at all. Sizing the live set removes
+the lottery rather than improving the odds.
+
+The fix is one knob instead of two. A worker now holds exactly as many live
+games as it can have solves in flight (`gpu_inflight`), because a game held
+beyond that can never be worked on sooner and only takes longer to finish;
+`gpu_actors` is deleted. It is also faster, not a trade: `596 solves/s` against
+the `390-522` the oversized set managed, since games that finish concentrate
+beliefs and keep subsequent solves small.
+
+Two hypotheses recorded in `TODO.md` were measured and both are refuted. The
+value target is not the wrong estimator: we implement TurboReBeL, whose Phase 2
+(Algorithm 2, line 13) specifies exactly `v^s(b) <- UpdateCFV(S', s)`, the
+backpropagation under the fixed final reference strategy that `value_under`
+performs, and that Phase 2 is what earns the `T+1` rows per decision
+`selfplay_walk.rs` pins. The zero-reach uniform fallback never fires: over a
+depth-two, 64-iteration solve under a flat network -- precisely the warm-start
+condition it was suspected to spoil -- no reach among `114,585` rows is zero or
+even below `1e-30`, and no strategy sum among `64,822` is zero. The reference's
+`1e-80` floor is not representable in an `f32` arena in any case.
 
 Half-precision head *activations* were then tried and reverted, and this one is
 worth keeping written down. Holding Xb, H and H2 as halves -- feeding the tensor
@@ -145,6 +173,39 @@ differentiate. Starting from an already-trained checkpoint hides this completely
 which is why the four-minute controls looked healthy. The lesson generalises: a
 solve accuracy bound measured against a converged network says nothing about
 whether the bootstrap can get there.
+
+## The verified depth-two run
+
+`d2t64_fixed_30`, thirty minutes from scratch at seed 95 with the live set
+sized to inflight, is the first depth-two bootstrap here that learns
+monotonically: `861,850` solves, `19,022` completed games, `horizon=0.01`, so
+the games end in real outcomes rather than at the draw cap.
+
+| checkpoint | trained | Elo vs Greedy |
+|---|---:|---:|
+| init | 5min | `-86` |
+| s1 | 11min | `+373` |
+| s2 | 17min | `+474` |
+| s3 | 23min | `+563` |
+| final | 29min | `+611` |
+
+Against `value_v4_d2i64dcfr_30`, the old-recipe thirty-minute run at the same
+seed, depth and iteration count, its final won `125-70-5` over 200 games --
+score `0.637`, `+98` Elo, `z=3.9`, `p=1e-4`. Against the pre-refactor
+`traverser` final on the cross-engine relay at matched search it won
+`130-66-4`: score `0.66`, `+115.2` Elo, `p=5.7e-6` decisive and `1.9e-5` on
+the colour-swapped pairs. Sustained throughput rose from `522.0` to
+`574.6 solves/s`; the `850-988/s` of the early windows is not sustainable,
+since trees grow as the policy sharpens.
+
+What this does *not* show is depth two beating depth one at thirty minutes. It
+does not: `value_v4_depth1_precise30` scores `+386.6` against the same
+traverser where this run scores `+115.2`, because in the same wall-clock it
+buys `10,835,186` solves against `861,850` -- a factor of `12.6`. The case for
+depth two rests on the target quality per solve paying for that factor over a
+run long enough to show a crossover, and thirty minutes is not that run. What
+is settled is that depth two now trains at all, reliably, and that its own
+curve no longer bends downward.
 
 ## Architecture comparison
 

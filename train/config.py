@@ -36,7 +36,6 @@ class Cfg:
     device: str = "cuda:1"
     gpu_devices: str = "0,1"
     gpu_workers: int = 36
-    gpu_actors: int = 128
     gpu_inflight: int = 32
     gpu_chunk: int = 1024
     gpu_drain_seconds: float = 20.0

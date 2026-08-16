@@ -1,0 +1,140 @@
+{
+ "runs": [
+  "runs/ratio_8"
+ ],
+ "games": 200,
+ "schedule_seed": 7,
+ "draft_mode": "random",
+ "players": [
+  {
+   "name": "greedy",
+   "run": null,
+   "t": null,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear"
+   },
+   "elo": 0.0,
+   "se": 23.8,
+   "score": 0.504
+  },
+  {
+   "name": "ratio_8.init",
+   "run": "runs/ratio_8",
+   "t": 300.4,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "dcfr"
+   },
+   "elo": -57.5,
+   "se": 24.3,
+   "score": 0.391
+  },
+  {
+   "name": "ratio_8.s1",
+   "run": "runs/ratio_8",
+   "t": 600.5,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "dcfr"
+   },
+   "elo": 254.5,
+   "se": 19.6,
+   "score": 0.374
+  },
+  {
+   "name": "ratio_8.s2",
+   "run": "runs/ratio_8",
+   "t": 900.5,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "dcfr"
+   },
+   "elo": 354.2,
+   "se": 18.0,
+   "score": 0.511
+  },
+  {
+   "name": "ratio_8.final",
+   "run": "runs/ratio_8",
+   "t": 1200.0,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "dcfr"
+   },
+   "elo": 437.2,
+   "se": 20.0,
+   "score": 0.685
+  }
+ ],
+ "pairs": [
+  {
+   "a": "greedy",
+   "b": "ratio_8.init",
+   "w": 73,
+   "l": 37,
+   "d": 90,
+   "n": 200,
+   "score": 0.59
+  },
+  {
+   "a": "greedy",
+   "b": "ratio_8.s1",
+   "w": 1,
+   "l": 16,
+   "d": 3,
+   "n": 20,
+   "score": 0.125
+  },
+  {
+   "a": "greedy",
+   "b": "ratio_8.final",
+   "w": 0,
+   "l": 19,
+   "d": 1,
+   "n": 20,
+   "score": 0.025
+  },
+  {
+   "a": "ratio_8.init",
+   "b": "ratio_8.s1",
+   "w": 3,
+   "l": 15,
+   "d": 2,
+   "n": 20,
+   "score": 0.2
+  },
+  {
+   "a": "ratio_8.s1",
+   "b": "ratio_8.s2",
+   "w": 66,
+   "l": 119,
+   "d": 15,
+   "n": 200,
+   "score": 0.367
+  },
+  {
+   "a": "ratio_8.s1",
+   "b": "ratio_8.final",
+   "w": 33,
+   "l": 103,
+   "d": 4,
+   "n": 140,
+   "score": 0.25
+  },
+  {
+   "a": "ratio_8.s2",
+   "b": "ratio_8.final",
+   "w": 74,
+   "l": 118,
+   "d": 8,
+   "n": 200,
+   "score": 0.39
+  }
+ ]
+}

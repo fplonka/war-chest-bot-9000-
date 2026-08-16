@@ -1483,7 +1483,6 @@ pub fn run_games_gpu_stream(
     gc: &GameCfg,
     gpus: &[crate::gpu::GpuClient],
     workers: usize,
-    actors_per_worker: usize,
     inflight_per_worker: usize,
     chunk_solves: usize,
     stop: &std::sync::atomic::AtomicBool,
@@ -1497,8 +1496,12 @@ pub fn run_games_gpu_stream(
         "eager stream requires pure bootstrap targets"
     );
     let workers = workers.max(1);
-    let per = actors_per_worker.max(1);
-    let max_inflight = inflight_per_worker.max(1).min(per);
+    // A worker holds exactly as many live games as it can have solves in
+    // flight. Holding more only delays how long a game takes to finish, and a
+    // bootstrap that never finishes a game has no terminal outcome to anchor
+    // its value targets against.
+    let per = inflight_per_worker.max(1);
+    let max_inflight = per;
     let chunk_solves = chunk_solves.max(1);
     let next = AtomicUsize::new(0);
     let (data_tx, data_rx) = std::sync::mpsc::sync_channel(workers * 4);

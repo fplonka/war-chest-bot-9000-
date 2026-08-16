@@ -1,0 +1,79 @@
+{
+ "runs": [
+  "runs/d2t64_fixed_30",
+  "runs/value_v4_d2i64dcfr_30"
+ ],
+ "games": 200,
+ "schedule_seed": 7,
+ "draft_mode": "random",
+ "players": [
+  {
+   "name": "greedy",
+   "run": null,
+   "t": null,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear"
+   },
+   "elo": 0.0,
+   "se": 148.2,
+   "score": 0.013
+  },
+  {
+   "name": "d2t64_fixed_30.final",
+   "run": "runs/d2t64_fixed_30",
+   "t": 1741.0,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "dcfr"
+   },
+   "elo": 627.7,
+   "se": 25.4,
+   "score": 0.67
+  },
+  {
+   "name": "value_v4_d2i64dcfr_30.final",
+   "run": "runs/value_v4_d2i64dcfr_30",
+   "t": 1740.7,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "dcfr"
+   },
+   "elo": 530.0,
+   "se": 25.3,
+   "score": 0.418
+  }
+ ],
+ "pairs": [
+  {
+   "a": "greedy",
+   "b": "d2t64_fixed_30.final",
+   "w": 0,
+   "l": 20,
+   "d": 0,
+   "n": 20,
+   "score": 0.0
+  },
+  {
+   "a": "greedy",
+   "b": "value_v4_d2i64dcfr_30.final",
+   "w": 0,
+   "l": 19,
+   "d": 1,
+   "n": 20,
+   "score": 0.025
+  },
+  {
+   "a": "d2t64_fixed_30.final",
+   "b": "value_v4_d2i64dcfr_30.final",
+   "w": 125,
+   "l": 70,
+   "d": 5,
+   "n": 200,
+   "score": 0.637
+  }
+ ]
+}

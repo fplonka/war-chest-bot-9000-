@@ -1,0 +1,167 @@
+{
+ "runs": [
+  "runs/ratio_16"
+ ],
+ "games": 200,
+ "schedule_seed": 7,
+ "draft_mode": "random",
+ "players": [
+  {
+   "name": "greedy",
+   "run": null,
+   "t": null,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear"
+   },
+   "elo": 0.0,
+   "se": 23.9,
+   "score": 0.487
+  },
+  {
+   "name": "ratio_16.init",
+   "run": "runs/ratio_16",
+   "t": 300.2,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "dcfr"
+   },
+   "elo": -75.4,
+   "se": 24.2,
+   "score": 0.313
+  },
+  {
+   "name": "ratio_16.s1",
+   "run": "runs/ratio_16",
+   "t": 600.3,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "dcfr"
+   },
+   "elo": 249.1,
+   "se": 25.1,
+   "score": 0.354
+  },
+  {
+   "name": "ratio_16.s2",
+   "run": "runs/ratio_16",
+   "t": 900.3,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "dcfr"
+   },
+   "elo": 413.8,
+   "se": 19.1,
+   "score": 0.54
+  },
+  {
+   "name": "ratio_16.final",
+   "run": "runs/ratio_16",
+   "t": 1200.0,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "dcfr"
+   },
+   "elo": 580.8,
+   "se": 26.4,
+   "score": 0.779
+  }
+ ],
+ "pairs": [
+  {
+   "a": "greedy",
+   "b": "ratio_16.init",
+   "w": 75,
+   "l": 25,
+   "d": 100,
+   "n": 200,
+   "score": 0.625
+  },
+  {
+   "a": "greedy",
+   "b": "ratio_16.s1",
+   "w": 0,
+   "l": 17,
+   "d": 3,
+   "n": 20,
+   "score": 0.075
+  },
+  {
+   "a": "greedy",
+   "b": "ratio_16.s2",
+   "w": 0,
+   "l": 20,
+   "d": 0,
+   "n": 20,
+   "score": 0.0
+  },
+  {
+   "a": "greedy",
+   "b": "ratio_16.final",
+   "w": 0,
+   "l": 20,
+   "d": 0,
+   "n": 20,
+   "score": 0.0
+  },
+  {
+   "a": "ratio_16.init",
+   "b": "ratio_16.s1",
+   "w": 0,
+   "l": 15,
+   "d": 5,
+   "n": 20,
+   "score": 0.125
+  },
+  {
+   "a": "ratio_16.init",
+   "b": "ratio_16.s2",
+   "w": 1,
+   "l": 17,
+   "d": 2,
+   "n": 20,
+   "score": 0.1
+  },
+  {
+   "a": "ratio_16.init",
+   "b": "ratio_16.final",
+   "w": 1,
+   "l": 17,
+   "d": 2,
+   "n": 20,
+   "score": 0.1
+  },
+  {
+   "a": "ratio_16.s1",
+   "b": "ratio_16.s2",
+   "w": 52,
+   "l": 142,
+   "d": 6,
+   "n": 200,
+   "score": 0.275
+  },
+  {
+   "a": "ratio_16.s1",
+   "b": "ratio_16.final",
+   "w": 1,
+   "l": 19,
+   "d": 0,
+   "n": 20,
+   "score": 0.05
+  },
+  {
+   "a": "ratio_16.s2",
+   "b": "ratio_16.final",
+   "w": 51,
+   "l": 142,
+   "d": 7,
+   "n": 200,
+   "score": 0.273
+  }
+ ]
+}
