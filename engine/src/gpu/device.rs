@@ -12,7 +12,9 @@ use std::time::Instant;
 
 use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
 use cudarc::cublas::CudaBlas;
-use cudarc::driver::safe::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig};
+use cudarc::driver::safe::{
+    CudaContext, CudaEvent, CudaFunction, CudaModule, CudaStream, LaunchConfig,
+};
 use cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY;
 use cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL;
 use cudarc::driver::{result, sys, CudaSlice, DevicePtr, DevicePtrMut, PushKernelArg};
@@ -425,6 +427,7 @@ pub struct InFlight {
     captured: Instant,
     direct: bool,
     graph_reused: bool,
+    events: Option<Vec<CudaEvent>>,
 }
 
 /// A finished wave's raw device output, still to be turned into per-job
@@ -444,6 +447,7 @@ pub struct Harvest {
     completed: Instant,
     direct: bool,
     graph_reused: bool,
+    stage_ms: Option<[f32; 6]>,
 }
 
 impl Harvest {
@@ -461,8 +465,14 @@ impl Harvest {
         if self.profile {
             let unpacked = Instant::now();
             let (direct, reused) = (self.direct, self.graph_reused);
+            let stage = self.stage_ms.map_or(String::new(), |x| {
+                format!(
+                    " build_ms={:.2} head_ms={:.2} read_ms={:.2} back_ms={:.2} reach_ms={:.2} roots_ms={:.2}",
+                    x[0], x[1], x[2], x[3], x[4], x[5],
+                )
+            });
             eprintln!(
-                "v5_device jobs={jobs} rows={rows} cells={cells} direct={direct} graph_reused={reused} upload_ms={:.2} capture_ms={:.2} queue_ms={:.2} gpu_ms={:.2} unpack_ms={:.2} total_ms={:.2}",
+                "v5_device jobs={jobs} rows={rows} cells={cells} direct={direct} graph_reused={reused} upload_ms={:.2} capture_ms={:.2} queue_ms={:.2} gpu_ms={:.2} unpack_ms={:.2} total_ms={:.2}{stage}",
                 1e3 * (self.uploaded - self.started).as_secs_f64(),
                 1e3 * (self.captured - self.uploaded).as_secs_f64(),
                 1e3 * (self.queued_output - self.captured).as_secs_f64(),
@@ -604,10 +614,31 @@ impl Executor {
                 .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
                 .map_err(|e| format!("begin v5 CUDA Graph: {e:?}"))?;
         }
+        let mut events = if profile && direct {
+            Some(Vec::with_capacity(4 * wave.meta.iters + 3))
+        } else {
+            None
+        };
+        let mark = |events: &mut Option<Vec<CudaEvent>>| -> Result<(), String> {
+            if let Some(events) = events {
+                let event = self
+                    .stream
+                    .context()
+                    .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                    .map_err(|e| format!("create GPU profile event: {e:?}"))?;
+                event
+                    .record(&self.stream)
+                    .map_err(|e| format!("record GPU profile event: {e:?}"))?;
+                events.push(event);
+            }
+            Ok(())
+        };
+        mark(&mut events)?;
         let queued = (|| -> Result<(), String> {
             self.build_network(&device, bank)?;
             device.clear_solve_state(&self.stream)?;
             self.initialise(&device, bank, &wave)?;
+            mark(&mut events)?;
 
             if wave.meta.iters == 0 {
                 self.materialize(&device, bank, &wave, [false, false])?;
@@ -624,7 +655,9 @@ impl Executor {
                     },
                     p,
                 )?;
+                mark(&mut events)?;
                 self.launch_readout(&device, bank, p)?;
+                mark(&mut events)?;
                 let m = (t / 2 + 1) as f32;
                 let cfr = wave.meta.cfr;
                 let (da, db, ds) = (
@@ -633,6 +666,7 @@ impl Executor {
                     (m / (m + 1.0)).powf(cfr.gamma),
                 );
                 self.launch_backprop_sweep(&device, bank, p, false, da, db, ds, cfr.predict)?;
+                mark(&mut events)?;
                 self.launch_reach_sweep(&device, bank, p, false, false, true)?;
 
                 let completed = t + 1;
@@ -644,6 +678,7 @@ impl Executor {
                         }
                     }
                 }
+                mark(&mut events)?;
             }
 
             let max_roots = wave.jobs.iter().map(|j| j.nroots).max().unwrap_or(0);
@@ -678,6 +713,7 @@ impl Executor {
                     )?;
                 }
             }
+            mark(&mut events)?;
             Ok(())
         })();
         let graph = if direct {
@@ -710,6 +746,7 @@ impl Executor {
             captured,
             direct,
             graph_reused: graph.is_some_and(|(_, reused)| reused),
+            events,
         })
     }
 
@@ -727,6 +764,7 @@ impl Executor {
             captured,
             direct,
             graph_reused,
+            events,
         } = f;
         let strategy = copy_arena(
             &self.stream,
@@ -744,6 +782,27 @@ impl Executor {
             .synchronize()
             .map_err(|e| format!("GPU wave completion: {e:?}"))?;
         let completed = Instant::now();
+        let stage_ms = if let Some(events) = events {
+            let mut out = [0.0; 6];
+            out[0] = events[0]
+                .elapsed_ms(&events[1])
+                .map_err(|e| format!("GPU build timing: {e:?}"))?;
+            let mut at = 1;
+            for _ in 0..wave.meta.iters {
+                for stage in 0..4 {
+                    out[stage + 1] += events[at]
+                        .elapsed_ms(&events[at + 1])
+                        .map_err(|e| format!("GPU iteration timing: {e:?}"))?;
+                    at += 1;
+                }
+            }
+            out[5] = events[at]
+                .elapsed_ms(&events[at + 1])
+                .map_err(|e| format!("GPU root timing: {e:?}"))?;
+            Some(out)
+        } else {
+            None
+        };
         self.buffers = Some(device.into_buffers());
         Ok(Harvest {
             wave,
@@ -759,6 +818,7 @@ impl Executor {
             completed,
             direct,
             graph_reused,
+            stage_ms,
         })
     }
 
