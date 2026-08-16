@@ -38,7 +38,9 @@ sync)
 pull)
     name=${2:?usage: pull <run>}
     mkdir -p "$here/runs/$name"
-    rsync -az -e "ssh ${ssh_opts[*]}" --exclude '*.pt' \
+    # `*.tmp` is a live run writing log.json atomically; rsync would list it,
+    # find it replaced, and exit 24 mid-run.
+    rsync -az -e "ssh ${ssh_opts[*]}" --exclude '*.pt' --exclude '*.tmp' \
         "root@$host:$remote/runs/$name/" "$here/runs/$name/"
     python3 "$here/tools/runs_index.py"
     echo "pulled $name"
