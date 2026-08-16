@@ -10,7 +10,7 @@ from dataclasses import dataclass
 class Cfg:
     minutes: float = 30.0
     warm_minutes: float = 5.0
-    snapshot_every: float = 6.0
+    snapshot_every: float = 15.0
     init_weights: str = ""
 
     batch: int = 1024
