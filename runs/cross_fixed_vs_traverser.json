@@ -1,4 +1,3 @@
-[32mActivated conda/uv virtual environment at [36m/venv/main[0m
 {
   "new": "runs/d2t64_fixed_30/snap_04.pt",
   "old": "runs/traverser/snap_04.pt",
