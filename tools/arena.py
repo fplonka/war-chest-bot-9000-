@@ -521,10 +521,12 @@ def tablebase(bot_path, suite_dir, out_path, device=-1, concurrent=32):
         "questions": n, "held": len(kept),
         "rate": round(len(kept) / max(n, 1), 4),
         "by_depth": {str(d): slice_of(lambda q, d=d: q["depth"] == d) for d in depths},
-        # How many of the legal moves kept the win. One is a position with a
-        # single answer, and that is what separates bots.
-        "by_answers": {str(w): slice_of(lambda q, w=w: min(q["wins"], 4) == w)
-                       for w in (1, 2, 3, 4)},
+        # What share of the legal moves kept the win. This is the hardness
+        # axis: three right moves out of four is an easy position and three
+        # out of thirty is not, so the count alone says little.
+        "by_share": {name: slice_of(lambda q, lo=lo, hi=hi:
+                                    lo < q["wins"] / q["moves"] <= hi)
+                     for name, lo, hi in SHARES},
         "hidden": slice_of(lambda q: q["range"] > 1),
         "known": slice_of(lambda q: q["range"] == 1),
         "blundered": blundered[:40],
@@ -532,8 +534,7 @@ def tablebase(bot_path, suite_dir, out_path, device=-1, concurrent=32):
     write_json(out_path, result)
     print(f"\n{name}: kept the win in {len(kept)}/{n} proven positions "
           f"({100 * result['rate']:.1f}%)")
-    buckets("winning moves", [("4+" if w == 4 else w, result["by_answers"][str(w)])
-                              for w in (1, 2, 3, 4)])
+    buckets("moves that win", [(n, result["by_share"][n]) for n, _, _ in SHARES])
     buckets("plies to win", [(d, result["by_depth"][str(d)]) for d in depths])
     buckets("hidden hands", [("none", result["known"]), ("some", result["hidden"])])
     print(f"wrote {out_path}")
@@ -581,6 +582,13 @@ def name(bot_dir):
 
 def devices(spec):
     return [int(d) for d in spec.split(",")]
+
+
+#: Hardness bands, by the share of legal moves that keep the win. A position
+#: where one move in ten is right is a different question from one where half
+#: of them are, however deep the win is.
+SHARES = [("under 10%", 0.0, 0.10), ("10-25%", 0.10, 0.25),
+          ("25-50%", 0.25, 0.50), ("over 50%", 0.50, 1.0)]
 
 
 def buckets(title, rows):

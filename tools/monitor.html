@@ -264,8 +264,8 @@ function renderArena(d) {
       `(${(100 * d.rate).toFixed(1)}%)`;
     // Sharpness, not depth, is what separates bots: a position with one right
     // move is hard however few plies are left in it.
-    bars(box, "kept the win, by winning moves available",
-         [1, 2, 3, 4].map(w => [w === 4 ? "4+" : String(w), d.by_answers[w]]));
+    bars(box, "kept the win, by share of moves that win",
+         Object.entries(d.by_share));
     bars(box, "kept the win, by plies to the win",
          Object.entries(d.by_depth));
     bars(box, "kept the win, by hidden information",
