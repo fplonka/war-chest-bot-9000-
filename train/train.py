@@ -39,6 +39,7 @@ import collections
 import dataclasses
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import time
@@ -55,6 +56,8 @@ import config
 import mirror
 from export_weights import load as load_checkpoint
 from value_net import AUX, Net
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 PUBFEAT = warchest.PUBFEAT
 CFEAT = warchest.CFEAT
@@ -421,7 +424,7 @@ def refuse_if_machine_busy():
 def write_log(args, epochs, snaps):
     """The run's whole record: settings, per-epoch stats, snapshot manifest.
 
-    One file, rewritten in place, so `ladder.py` and `tools/monitor.py` have a
+    One file, rewritten in place, so `tools/arena.py` and `tools/monitor.py` have a
     single thing to read and a run that is still going is readable at any
     moment.
     """
@@ -497,7 +500,7 @@ def main():
     opt = torch.optim.Adam(value.parameters(), lr=args.lr)
     lr_decays = sorted(float(x) for x in args.lr_decay_frac.split(",") if x.strip())
     next_decay = 0
-    value.push(0)
+    value.push()
     gpu_devices = [int(x) for x in args.gpu_devices.split(",") if x.strip()]
     os.environ.setdefault("WARCHEST_DIRECT", "1")
     os.environ.setdefault("WARCHEST_WAVE_LANES", "4")
@@ -771,7 +774,7 @@ def main():
                     optimizer_steps += nsteps
                     optimizer_rows += nsteps * args.batch
                     if optimizer_steps % publish_steps == 0:
-                        value.push(0)
+                        value.push()
                         flat = value.flat()
                         for i in range(len(gpu_devices)):
                             warchest.gpu_set_weights(value.dims, *flat, device=i)
@@ -871,7 +874,7 @@ def main():
             recent_mix=args.recent_mix, recent_frac=args.recent_frac,
             batch_fn=batcher)
         train_s = time.time() - tt
-        value.push(0)
+        value.push()
         probe_std, loss_old, loss_new = diagnostics(
             value, buf, probe, args.batch, rng, dev, batcher, args.recent_frac)
         dec = max(d["decisions"], 1)
@@ -932,8 +935,22 @@ def main():
     snapshot("final", time.time() - t0)
     write_log(args, log, snaps)
     if args.ladder_games:
-        import ladder
-        ladder.run([args.out], games=args.ladder_games, gpu=True)
+        # Rating a run's own progress is the same operation as rating one
+        # architecture against another: every snapshot becomes a bot, and the
+        # arena plays them. The bots want both cards, which this process holds
+        # until it lets go.
+        warchest.gpu_stop()
+        arena = [sys.executable, str(ROOT / "tools" / "arena.py")]
+        subprocess.run(arena + ["pack", args.out], check=True)
+        tag = pathlib.Path(args.out).name
+        bots = sorted(str(p) for p in (ROOT / "bots").glob(f"{tag}.*"))
+        # Greedy first, so ratings are quoted against the one reference that
+        # means the same thing from one run to the next.
+        greedy = ROOT / "bots" / "greedy"
+        anchor = [str(greedy)] if (greedy / "bot.json").exists() else []
+        subprocess.run(arena + ["ladder", *anchor, *bots,
+                                "--games", str(args.ladder_games),
+                                "--out", f"{args.out}/ladder.json"], check=True)
 
 
 if __name__ == "__main__":

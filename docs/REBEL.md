@@ -443,12 +443,12 @@ defaults (0.5, 0.2) draws a fresh row six times as often as an old one while
 leaving every row reachable. Old rows carry targets written by a network that has
 since moved; the per-epoch `old=`/`new=` columns report the gap.
 
-**Evaluation** is one round robin at the end, `train/ladder.py`: every snapshot
-against every other, against Greedy and against Random, fitted with
-Bradley-Terry into an Elo each, Random pinned at 0. Matches are paired — the same
-draft and random stream for both seatings — and use a full solve and the
-reference strategy. `ladder.py` accepts snapshots from several run directories so
-runs can be rated on one scale.
+**Evaluation** is one round robin at the end, `tools/arena.py`: every snapshot
+is archived as a bot and plays every other, and Greedy, fitted with
+Bradley-Terry into an Elo each. Matches are paired — the same draft for both
+seatings — and use a full solve and the reference strategy. Because a bot
+carries the binary that can play it, snapshots from revisions that no longer
+share a value network can be rated on one scale. See `docs/ARENA.md`.
 
 Nothing is compared, promoted or selected while a run is going.
 
@@ -493,8 +493,8 @@ only on the box and nothing runnable here verifies it.
   executor: production roots, full work distribution, then timing.
 * `examples/featstats.rs` — the real range of every feature.
 * `examples/cfgvalue.rs` — how far the value separates configs.
-* `train/ladder.py` — Elo over snapshots plus Greedy and Random;
-  `train/cross_ladder.py` rates checkpoints from incompatible revisions on one
+* `tools/arena.py` — the ladder: archived bots, a referee, and Elo. It rates
+  checkpoints from incompatible revisions on one
   scale.
 * `train/export_weights.py` — the flat blob that `rebelbench` and the GPU
   service load.
@@ -508,11 +508,14 @@ engine/src/selfplay.rs  self-play loop, belief filter, data collection, greedy b
 engine/src/net.rs       the value network (Accelerate BLAS)
 engine/src/serialize.rs the CPU-to-GPU job contract (docs/TREE.md)
 engine/src/gpu/         the wave executor and its CUDA kernels
-engine/src/py.rs        pyo3: set_weights / gen_data / eval_match
+engine/src/py.rs        pyo3: set_weights / gen_data
+engine/src/arena.rs     the referee and the bot protocol
+engine/src/bot.rs       one bot's side of an arena game
+engine/src/policy.rs    a node's policy, and the belief filter over it
 train/value_net.py      the network in torch, and the blob both sides agree on
 train/mirror.py         the 180-degree rotation that makes the second seat view
 train/gpu_batch.py      replay rows -> canonical query batch on the device
 train/train.py          PyTorch training loop, snapshots on a timer
-train/ladder.py         round robin over snapshots -> Elo
+tools/arena.py          the ladder: bots, referee, Elo
 tools/monitor.py        the panels a run is read from, served live from runs/
 ```

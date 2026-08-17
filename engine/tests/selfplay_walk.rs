@@ -17,25 +17,16 @@ fn cfg() -> Cfg {
     }
 }
 
-fn play(seed: u64, nets: &[Nets], gc: GameCfg) -> Data {
+fn play(seed: u64, nets: &Nets, gc: GameCfg) -> Data {
     let mut d = Data::default();
     let z = play_game(Rng::new(seed), nets, &gc, &mut d, None);
     assert!(z.is_finite());
     d
 }
 
-fn rebel(slots: [usize; 2], explore: f32, random_draft: bool) -> GameCfg {
+fn rebel(explore: f32, random_draft: bool) -> GameCfg {
     GameCfg {
-        agents: [
-            Agent::Rebel {
-                cfg: cfg(),
-                slot: slots[0],
-            },
-            Agent::Rebel {
-                cfg: cfg(),
-                slot: slots[1],
-            },
-        ],
+        agents: [Agent::Rebel { cfg: cfg() }; 2],
         collect: Collect::Rebel,
         explore,
         random_draft,
@@ -49,11 +40,11 @@ fn rebel(slots: [usize; 2], explore: f32, random_draft: bool) -> GameCfg {
 /// decisions, so rows must exceed decisions overall.
 #[test]
 fn walk_serves_multiple_decisions_per_solve() {
-    let nets = [Nets::default()];
+    let nets = Nets::default();
     let mut dec = 0;
     let mut rows = 0;
     for (i, explore) in [0.0, 0.25].into_iter().enumerate() {
-        let d = play(7919 + i as u64, &nets, rebel([0, 0], explore, false));
+        let d = play(7919 + i as u64, &nets, rebel(explore, false));
         assert!(d.nv > 0, "no targets collected");
         dec += d.decisions;
         rows += d.nv;
@@ -67,21 +58,12 @@ fn walk_serves_multiple_decisions_per_solve() {
 /// Eval mode: full solve up front, walk acts on the average strategy.
 #[test]
 fn walk_in_eval_mode() {
-    let nets = [Nets::default()];
+    let nets = Nets::default();
     let d = play(
         0xE7A1,
         &nets,
         GameCfg {
-            agents: [
-                Agent::Rebel {
-                    cfg: cfg(),
-                    slot: 0,
-                },
-                Agent::Rebel {
-                    cfg: cfg(),
-                    slot: 0,
-                },
-            ],
+            agents: [Agent::Rebel { cfg: cfg() }, Agent::Rebel { cfg: cfg() }],
             collect: Collect::None,
             explore: 0.0,
             random_draft: false,
@@ -97,18 +79,12 @@ fn walk_in_eval_mode() {
 /// target is kept.
 #[test]
 fn walk_interrupted_by_non_rebel_agent() {
-    let nets = [Nets::default()];
+    let nets = Nets::default();
     let d = play(
         0x1DEF,
         &nets,
         GameCfg {
-            agents: [
-                Agent::Rebel {
-                    cfg: cfg(),
-                    slot: 0,
-                },
-                Agent::Greedy { temp: 1.0 },
-            ],
+            agents: [Agent::Rebel { cfg: cfg() }, Agent::Greedy { temp: 1.0 }],
             collect: Collect::Rebel,
             explore: 0.1,
             random_draft: true,
@@ -119,33 +95,15 @@ fn walk_interrupted_by_non_rebel_agent() {
     assert!(d.nv > 0, "interrupted walks must still yield their target");
 }
 
-/// A walk built by one checkpoint must not serve the other player's nodes.
-#[test]
-fn walk_never_crosses_slots() {
-    let nets = [Nets::default(), Nets::default()];
-    let mut dec = 0;
-    let mut rows = 0;
-    for i in 0..2u64 {
-        let d = play(31337 + i, &nets, rebel([0, 1], 0.1, false));
-        assert!(d.nv > 0);
-        dec += d.decisions;
-        rows += d.nv;
-    }
-    assert!(
-        rows < dec * 3,
-        "rows/decisions = {rows}/{dec} — a walk crossed slot boundaries"
-    );
-}
-
 /// Random drafts (Warrior Priest included) must stay in lockstep. The hard
 /// desync asserts in `play_game` are the test.
 #[test]
 fn walk_with_random_drafts() {
-    let nets = [Nets::default()];
+    let nets = Nets::default();
     let mut dec = 0;
     let mut rows = 0;
     for i in 0..4u64 {
-        let d = play(104729 + i, &nets, rebel([0, 0], 0.25, true));
+        let d = play(104729 + i, &nets, rebel(0.25, true));
         assert!(d.nv > 0);
         dec += d.decisions;
         rows += d.nv;
@@ -162,17 +120,14 @@ fn walk_with_random_drafts() {
 /// `push_value` assertion on every saved row is the oracle for the rows.
 #[test]
 fn capped_solves_fall_back_and_games_finish() {
-    let nets = [Nets::default()];
+    let nets = Nets::default();
     let scfg = Cfg {
         node_cap: 40,
         ..cfg()
     };
     let gc = GameCfg {
-        agents: [
-            Agent::Rebel { cfg: scfg, slot: 0 },
-            Agent::Rebel { cfg: scfg, slot: 0 },
-        ],
-        ..rebel([0, 0], 0.25, true)
+        agents: [Agent::Rebel { cfg: scfg }; 2],
+        ..rebel(0.25, true)
     };
     let mut dec = 0;
     let mut caps = 0;
@@ -192,10 +147,10 @@ fn capped_solves_fall_back_and_games_finish() {
 /// the head's three classes.
 #[test]
 fn every_row_carries_the_finished_games_location_owners() {
-    let nets = [Nets::default()];
+    let nets = Nets::default();
     let mut seen = HashSet::new();
     for i in 0..8u64 {
-        let d = play(0x5EED + i, &nets, rebel([0, 0], 0.25, true));
+        let d = play(0x5EED + i, &nets, rebel(0.25, true));
         assert!(d.nv > 0, "no rows collected");
         assert_eq!(
             d.aux.len(),

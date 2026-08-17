@@ -24,7 +24,7 @@ def main():
     args = ap.parse_args()
     if args.ckpt:
         net = load(args.ckpt)
-        net.push(0)
+        net.push()
         print(f"pushed {args.ckpt} (dims {net.dims})")
     n = warchest.save_roots(args.games, args.seed, args.out, args.cap, True)
     print(f"saved {n} roots to {args.out}")

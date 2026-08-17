@@ -757,7 +757,7 @@ fn depth_is_spent_on_coin_plays_not_micro_choices() {
     // budget inside one tactic — zero opponent moves in the tree. Find a
     // position where the acting player has a free micro-choice available and
     // check that depth is not consumed by it.
-    let nets = [Nets::default(), Nets::default()];
+    let nets = Nets::default();
     let mut rng = Rng::new(1234);
     for _ in 0..400 {
         let mut s = make_game(&mut rng, false);
@@ -791,7 +791,7 @@ fn depth_is_spent_on_coin_plays_not_micro_choices() {
                 let mut sv = Solver::new(
                     &s,
                     ctx,
-                    &nets[0],
+                    &nets,
                     Cfg {
                         depth: 1,
                         iters: 4,
@@ -810,7 +810,7 @@ fn depth_is_spent_on_coin_plays_not_micro_choices() {
                 let mut sv = Solver::new(
                     &s,
                     ctx,
-                    &nets[0],
+                    &nets,
                     Cfg {
                         depth: 2,
                         iters: 4,

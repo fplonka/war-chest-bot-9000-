@@ -252,7 +252,8 @@ has not helped. The golden command carries `ladder_games=0`, so the strength
 check is a separate step over the snapshots the run saved:
 
 ```bash
-python train/ladder.py runs/gpu_golden8 --games 30 --gpu
+python tools/arena.py pack runs/gpu_golden8 && \
+    python tools/arena.py ladder bots/gpu_golden8.* --games 30
 ```
 
 That is a round robin between every snapshot, Greedy and Random, fitted to one

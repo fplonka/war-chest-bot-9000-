@@ -17,6 +17,7 @@ button.on{background:var(--line);font-weight:700}
 .live{color:#20a37a}
 h1{font-size:14px;margin:0 0 2px}
 h2{font-size:12px;margin:22px 0 6px;color:var(--mut)}
+#list h2{margin:10px 0 2px;padding:0 10px;font-size:10px;letter-spacing:.08em;text-transform:uppercase}
 .meta,.none{color:var(--mut);margin:0 0 6px}
 .note{margin:0 0 8px}
 .delta{display:flex;flex-wrap:wrap;gap:2px 16px;color:var(--mut);margin-bottom:12px}
@@ -32,6 +33,8 @@ table{border-collapse:collapse;margin:4px 0 10px}
 th,td{text-align:right;padding:1px 14px 1px 0;white-space:nowrap}
 th{color:var(--mut);font-weight:400;border-bottom:1px solid var(--line)}
 th:first-child,td:first-child{text-align:left}
+.bar{display:inline-block;height:9px;min-width:1px;background:#3d8bfd;vertical-align:middle}
+td:last-child{text-align:left;width:220px}
 pre{max-height:340px;overflow:auto;margin:4px 0;font:inherit;white-space:pre-wrap}
 #loglink{margin-left:8px;font-size:11px;color:#3d8bfd}
 #tip{position:fixed;display:none;z-index:2;pointer-events:none;white-space:pre;
@@ -193,8 +196,96 @@ function setText(el, s) {
   el.scrollTop = bottom ? el.scrollHeight : at;
 }
 
+// A ladder, as read: ratings against the anchor, then every pairing with the
+// paired sign test — games come in colour-swapped pairs over a shared draft, so
+// the pair is the independent trial and its p-value is the verdict.
+function ladder(box, name, l) {
+  box.appendChild(E("h2", null,
+    name + " · elo vs " + (l.anchor || "anchor") + ", 95% CI = 1.96 × SE"));
+  const num = (v, f) => v == null ? "—" : f(v);
+  box.appendChild(table(["bot", "trained", "elo", "95% CI", "games", "score"],
+    (l.players || []).slice().sort((a, b) => (b.elo ?? -1e9) - (a.elo ?? -1e9))
+      .map(p => [p.name, num(p.minutes, v => v.toFixed(0) + " min"),
+                 num(p.elo, v => v.toFixed(0)),
+                 num(p.se, v => "±" + (1.96 * v).toFixed(0)),
+                 p.games ?? "—", p.score.toFixed(3)])));
+  box.appendChild(table(["pairing", "W–L–D", "score", "pairs", "p"],
+    (l.pairs || []).slice().sort((a, b) => b.score - a.score)
+      .map(p => [p.a + " vs " + p.b, `${p.w}–${p.l}–${p.d}`, p.score.toFixed(3),
+                 `${p.paired_w}–${p.paired_l}`,
+                 p.paired_p == null ? "—" : p.paired_p.toPrecision(2)])));
+}
+
+// A probe or a suite is one bot and a handful of numbers, so it renders as a
+// list of them rather than as tables.
+function facts(box, title, rows) {
+  box.appendChild(E("h2", null, title));
+  const dl = E("dl");
+  rows.forEach(([k, v]) => { dl.appendChild(E("dt", null, k));
+                             dl.appendChild(E("dd", null, v)); });
+  box.appendChild(dl);
+}
+
+// A rate per bucket, with the count it rests on: a bucket of nine says less
+// than a bucket of ninety and the bar alone would not show it.
+function bars(box, title, rows) {
+  box.appendChild(E("h2", null, title));
+  const t = E("table");
+  rows.filter(([, r]) => r && r.n).forEach(([label, r]) => {
+    const tr = E("tr");
+    tr.appendChild(E("td", null, label));
+    tr.appendChild(E("td", null, `${r.held}/${r.n}`));
+    const cell = E("td");
+    const bar = E("div", "bar");
+    bar.style.width = `${(100 * r.rate).toFixed(1)}%`;
+    cell.appendChild(bar);
+    cell.appendChild(E("span", null, ` ${(100 * r.rate).toFixed(1)}%`));
+    tr.appendChild(cell);
+    t.appendChild(tr);
+  });
+  box.appendChild(t);
+}
+
+function renderArena(d) {
+  last = null;
+  $("title").textContent = d.name;
+  ["note", "cfg", "panels", "health", "text", "ladders"]
+    .forEach(id => $(id).textContent = "");
+  $("loglink").style.display = "none";
+  shape = "";
+  const box = $("ladders");
+  if (d.kind === "ladder") {
+    $("meta").textContent = `${d.players.length} bots · ${d.games} games per pairing`;
+    return ladder(box, d.name, d);
+  }
+  if (d.kind === "tablebase") {
+    $("meta").textContent =
+      `${d.bot} · ${d.held}/${d.questions} proven wins kept ` +
+      `(${(100 * d.rate).toFixed(1)}%)`;
+    // Sharpness, not depth, is what separates bots: a position with one right
+    // move is hard however few plies are left in it.
+    bars(box, "kept the win, by winning moves available",
+         [1, 2, 3, 4].map(w => [w === 4 ? "4+" : String(w), d.by_answers[w]]));
+    bars(box, "kept the win, by plies to the win",
+         Object.entries(d.by_depth));
+    bars(box, "kept the win, by hidden information",
+         [["none left", d.known], ["some left", d.hidden]]);
+    return;
+  }
+  $("meta").textContent =
+    `${d.bot} against ${d.probe} · ${d.games} games each way`;
+  facts(box, "what the strategy is worth", [
+    ["probe blind", d.blind.score.toFixed(3)],
+    ["probe sees the strategy", d.peeking.score.toFixed(3)],
+    ["gain (lower bound on exploitability)", d.gain.toFixed(3)],
+    ["paired, peeking", `${d.peeking.paired_w}–${d.peeking.paired_l}` +
+                        ` (p=${d.peeking.paired_p})`],
+  ]);
+}
+
 function render(d) {
   last = d;
+  $("loglink").style.display = "";
   $("title").textContent = d.name;
   $("meta").textContent = [d.git, d.epochs + " ReBeL epochs"].filter(Boolean).join(" · ");
   $("note").textContent = d.note || "";
@@ -221,20 +312,7 @@ function render(d) {
     hl.appendChild(E("dd", null, v)); });
 
   const box = $("ladders"); box.textContent = "";
-  Object.entries(d.ladders || {}).forEach(([name, l]) => {
-    box.appendChild(E("h2", null, name + " · elo, 95% CI = 1.96 × Bradley-Terry SE"));
-    box.appendChild(table(["player", "trained", "elo", "95% CI", "score"],
-      (l.players || []).filter(p => p.name !== "random")
-        .sort((a, b) => b.elo - a.elo)
-        .map(p => [p.name, p.t == null ? "—" : (p.t / 60).toFixed(0) + " min",
-                   p.elo.toFixed(0), "±" + (1.96 * (p.se || 0)).toFixed(0),
-                   p.score.toFixed(3)])));
-    box.appendChild(table(["pairing", "W–L–D", "games", "score"],
-      (l.pairs || []).filter(p => p.a !== "random" && p.b !== "random")
-        .sort((a, b) => (b.n || 0) - (a.n || 0))
-        .map(p => [p.a + " vs " + p.b, `${p.w}–${p.l}–${p.d}`,
-                   p.n ?? p.w + p.l + p.d, p.score.toFixed(3)])));
-  });
+  Object.entries(d.ladders || {}).forEach(([name, l]) => ladder(box, name, l));
 
   const text = $("text");
   if (!text.firstChild) ["notes", "train.log"].forEach(h => {
@@ -245,30 +323,48 @@ function render(d) {
     setText(pre, s); });
 }
 
-function list(runs) {
+// One entry, in whichever group it belongs to. `sel` is "runs/<name>" or
+// "arena/<name>", which is also the hash, so a deep link picks out either.
+function entry(a, kind, name, sub, live) {
+  const key = kind + "/" + name;
+  const b = E("button", key === sel ? "on" : null);
+  b.appendChild(E("span", null, name));
+  const line = E("span", "sub");
+  if (live) line.appendChild(E("span", "live", "● "));
+  line.appendChild(document.createTextNode(sub));
+  b.appendChild(line);
+  b.onclick = () => { sel = key; location.hash = encodeURIComponent(key);
+                      shape = ""; poll(); };
+  a.appendChild(b);
+}
+
+function list(runs, arenas) {
   const a = $("list"), at = a.scrollTop;
   a.textContent = "";
-  runs.forEach(r => {
-    const b = E("button", r.name === sel ? "on" : null);
-    b.appendChild(E("span", null, r.name));
-    const sub = E("span", "sub");
-    if (r.running) { const dot = E("span", "live", "● "); sub.appendChild(dot); }
-    sub.appendChild(document.createTextNode(
-      [r.epochs + " ep", r.minutes + "m", r.phase, r.note].filter(Boolean).join(" · ")));
-    b.appendChild(sub);
-    b.onclick = () => { sel = r.name; location.hash = encodeURIComponent(r.name);
-                        shape = ""; poll(); };
-    a.appendChild(b);
-  });
+  if (arenas.length) a.appendChild(E("h2", null, "arena"));
+  arenas.forEach(l => entry(a, "arena", l.name, l.sub));
+  if (arenas.length) a.appendChild(E("h2", null, "runs"));
+  runs.forEach(r => entry(a, "runs", r.name,
+    [r.epochs + " ep", r.minutes + "m", r.phase, r.note].filter(Boolean).join(" · "),
+    r.running));
   a.scrollTop = at;
 }
 
 async function poll() {
-  const runs = await api("/api/runs");
-  if (runs) { if (!sel && runs.length) sel = runs[0].name; list(runs); }
+  const [runs, arenas] = await Promise.all([api("/api/runs"), api("/api/arena")]);
+  if (runs) {
+    if (!sel && runs.length) sel = "runs/" + runs[0].name;
+    list(runs, arenas || []);
+  }
   if (!sel) return;
-  const d = await api("/api/run/" + encodeURIComponent(sel));
-  if (d) render(d);
+  const name = sel.slice(sel.indexOf("/") + 1);
+  if (sel.startsWith("arena/")) {
+    const d = await api("/api/arena/" + encodeURIComponent(name));
+    if (d) renderArena({...d, name});
+  } else {
+    const d = await api("/api/run/" + encodeURIComponent(name));
+    if (d) render(d);
+  }
 }
 
 addEventListener("resize", () => last && render(last));

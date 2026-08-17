@@ -6,8 +6,8 @@ Layout (little-endian):
     u32 n_b,    then n_b    * f32 biases,
     u32 n_ln,   then n_ln   * f32 layernorm weight/bias per hidden layer.
 
-Same ordering as `Net.push`, so a benchmark or an example measures exactly the
-network the trainer ships to the workers.
+Same ordering as `Net.push`, so a benchmark or a bot measures exactly the
+network the trainer shipped.
 """
 
 import struct
@@ -28,18 +28,20 @@ def load(path):
     return net
 
 
-def main():
-    src, dst = sys.argv[1], sys.argv[2]
-    net = load(src)
-    w, b, ln = net.flat()
-    with open(dst, "wb") as f:
+def write_bin(net, path):
+    with open(path, "wb") as f:
         f.write(struct.pack("<I", len(net.dims)))
         f.write(struct.pack(f"<{len(net.dims)}I", *net.dims))
-        for a in (w, b, ln):
+        for a in net.flat():
             a = np.ascontiguousarray(a, np.float32)
             f.write(struct.pack("<I", a.size))
             f.write(a.tobytes())
-    print(f"wrote {dst}: dims={net.dims}")
+    return net.dims
+
+
+def main():
+    src, dst = sys.argv[1], sys.argv[2]
+    print(f"wrote {dst}: dims={write_bin(load(src), dst)}")
 
 
 if __name__ == "__main__":

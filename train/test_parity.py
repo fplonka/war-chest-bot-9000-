@@ -214,7 +214,7 @@ def offboard_pile_visibility(net, rng):
 def main():
     rng = np.random.default_rng(11)
     net = random_net(7)
-    net.push(0)
+    net.push()
     blob_parity(net, rng)
     slot_invariance(net, rng)
     offboard_pile_visibility(net, rng)

@@ -7,9 +7,13 @@
 //! replay can force observed draws.
 
 pub mod actions;
+pub mod arena;
+pub mod args;
 pub mod board;
+pub mod bot;
 pub mod gpu;
 pub mod net;
+pub mod policy;
 pub mod prof;
 pub mod rebel;
 pub mod rng;
@@ -24,7 +28,5 @@ pub mod units;
 pub use actions::Action;
 pub use state::{State, BLACK, WHITE};
 
-#[cfg(feature = "python")]
-mod live;
 #[cfg(feature = "python")]
 mod py;

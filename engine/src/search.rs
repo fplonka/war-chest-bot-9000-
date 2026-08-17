@@ -1908,10 +1908,12 @@ impl<'a> Solver<'a> {
     /// The strategy the fixed-policy passes run under: the CFR average at the
     /// end of the solve.
     fn reference(&self) -> Vec<f32> {
+        // `avg_block` always retains the final average, whether or not the
+        // intermediate ones were asked for, so this is here after any solve.
         self.snaps
             .last()
             .cloned()
-            .expect("a fixed-policy pass needs per-iterate snapshots (Cfg::snapshots)")
+            .expect("a fixed-policy pass needs a finished solve")
     }
 
     /// Put the reaches back under `cur` after a fixed-policy pass has

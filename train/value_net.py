@@ -261,5 +261,5 @@ class Net(nn.Module):
         f = lambda xs: np.ascontiguousarray(np.concatenate(xs), np.float32)
         return f(w), f(b), f(ln)
 
-    def push(self, slot):
-        warchest.set_weights(self.dims, *self.flat(), slot)
+    def push(self):
+        warchest.set_weights(self.dims, *self.flat())

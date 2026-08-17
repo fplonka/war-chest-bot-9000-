@@ -28,11 +28,10 @@ fn main() {
             .unwrap();
     }
 
-    let mut nets = vec![Nets::default(), Nets::default()];
+    let mut nets = Nets::default();
     let net = Net::load_bin(&path).expect("weights file");
     println!("dims {:?}", net.dims);
-    nets[0].value = net.clone();
-    nets[1].value = net;
+    nets.value = net;
     warchest::state::set_cap_marker_value(0.0);
 
     let cfg = Cfg {
@@ -41,7 +40,7 @@ fn main() {
         snapshots: true,
         ..Default::default()
     };
-    let agent = Agent::Rebel { cfg, slot: 0 };
+    let agent = Agent::Rebel { cfg };
     let gc = GameCfg {
         agents: [agent, agent],
         collect: Collect::Rebel,

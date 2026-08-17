@@ -11,7 +11,7 @@ use crate::state::{Cont, ContStack, State, CONT_CAP, N_PLAYERS, N_ZONES};
 use crate::units::N_UNITS;
 
 pub const ROOTS_MAGIC: u32 = 0x5710_7207;
-pub const ROOTS_VERSION: u32 = 2;
+pub const ROOTS_VERSION: u32 = 3;
 
 fn w8<W: Write>(w: &mut W, x: u8) -> std::io::Result<()> {
     w.write_all(&[x])
@@ -26,6 +26,14 @@ fn r8<R: Read>(r: &mut R) -> std::io::Result<u8> {
     let mut b = [0u8; 1];
     r.read_exact(&mut b)?;
     Ok(b[0])
+}
+fn wu64<W: Write>(w: &mut W, x: u64) -> std::io::Result<()> {
+    w.write_all(&x.to_le_bytes())
+}
+fn ru64<R: Read>(r: &mut R) -> std::io::Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_le_bytes(b))
 }
 fn ru32<R: Read>(r: &mut R) -> std::io::Result<u32> {
     let mut b = [0u8; 4];
@@ -62,7 +70,10 @@ fn write_cont<W: Write>(w: &mut W, c: &Cont) -> std::io::Result<()> {
         }
         FootmanManeuver { hexes } => {
             w8(w, 5)?;
-            wu32(w, hexes.0 as u32)
+            // The set is one bit per hex and there are more than thirty-two of
+            // them, so this is a u64 and writing it as a u32 silently drops
+            // every hex from thirty-two up.
+            wu64(w, hexes.0)
         }
         CavalryAttack { hex } => {
             w8(w, 6)?;
@@ -107,7 +118,7 @@ fn read_cont<R: Read>(r: &mut R) -> std::io::Result<Cont> {
             v2: r8(r)? != 0,
         },
         5 => FootmanManeuver {
-            hexes: crate::state::HexSet(ru32(r)? as u64),
+            hexes: crate::state::HexSet(ru64(r)?),
         },
         6 => CavalryAttack { hex: r8(r)? },
         7 => MercenaryManeuver { hex: r8(r)? },
@@ -298,4 +309,59 @@ pub fn read_roots<R: Read>(r: &mut R) -> std::io::Result<Vec<(State, [Belief; 2]
         out.push(read_root(r)?);
     }
     Ok(out)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rebel::{Belief, Config};
+    use crate::state::{Cont, HexSet, WHITE};
+
+    /// Every continuation survives a round trip, payload included.
+    ///
+    /// `HexSet` is one bit per hex over more than thirty-two hexes, and it was
+    /// written as a `u32` for a long time: the position came back with every
+    /// hex from thirty-two up missing, which turned a node with four legal
+    /// moves into a node with none. Nothing caught it because a truncated set
+    /// is still a valid set.
+    #[test]
+    fn a_continuation_survives_a_round_trip() {
+        let wide = HexSet((1 << 3) | (1 << 33) | (1 << 36));
+        let conts = [
+            Cont::MainPlay,
+            Cont::Draw { player: WHITE },
+            Cont::FootmanManeuver { hexes: wide },
+            Cont::BerserkerChain { hex: 12, v2: true },
+            Cont::WarriorPriestDraw {
+                player: WHITE,
+                rg_hex: 9,
+            },
+        ];
+        for c in conts {
+            let mut raw = Vec::new();
+            write_cont(&mut raw, &c).unwrap();
+            let back = read_cont(&mut raw.as_slice()).unwrap();
+            assert_eq!(format!("{:?}", back), format!("{:?}", c));
+        }
+    }
+
+    /// A whole root survives, so a position handed to a bot is the position
+    /// that was written down.
+    #[test]
+    fn a_root_survives_a_round_trip() {
+        let mut state = State::from_draft(&[17, 12, 4, 9], &[1, 3, 8, 16], WHITE);
+        state.pending = Cont::FootmanManeuver {
+            hexes: HexSet((1 << 2) | (1 << 35)),
+        };
+        let bel = [
+            Belief::point(Config::default()),
+            Belief::from_pairs(vec![(Config::default(), 1.0)]),
+        ];
+        let mut raw = Vec::new();
+        write_root(&mut raw, &state, &bel).unwrap();
+        let (back, bel_back) = read_root(&mut raw.as_slice()).unwrap();
+        assert_eq!(back, state);
+        assert_eq!(bel_back[0].cfg, bel[0].cfg);
+    }
 }

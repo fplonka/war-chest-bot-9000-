@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# One-liner: build the extension (if needed) and open the browser UI against
-# the newest trained checkpoint.
+# One-liner: build the extension (if needed) and open the browser UI against a
+# packed bot.
 #
-#   ./play.sh                 # newest runs/*/ckpt_final.pt
-#   ./play.sh --ckpt runs/cfgvalue01/ckpt_final.pt
+#   ./play.sh                 # the newest bot under bots/
+#   ./play.sh bots/v5-2h
 #   ./play.sh --port 9000
 #
 # Extra arguments are passed through to webui/play.py.

@@ -68,17 +68,18 @@ def panel(title, ylabel, ss, zero=False, hlines=(), marks=False):
 
 
 def elo_panel(lad, name):
-    """This run's snapshots on a ladder shared by the whole experiment."""
+    """This run's snapshots on a ladder that may also hold other bots. A
+    snapshot bot is named `<run>.<label>` and carries the minutes it trained
+    for; anything else on the ladder is a reference, not a point on the curve."""
     if not lad:
         return None
     ps = sorted((p for p in lad.get("players", [])
-                 if p.get("t") is not None
-                 and (os.path.basename(p.get("run") or "") == name
-                      or ("run" not in p and p["name"].startswith(name + ".")))),
-                key=lambda p: p["t"])
+                 if p.get("minutes") is not None
+                 and p["name"].startswith(name + ".")),
+                key=lambda p: p["minutes"])
     greedy = next((p for p in lad.get("players", []) if p["name"] == "greedy"), None)
     return panel("Strength vs training time", "elo (95% CI)",
-                 [series("snapshot", [p["t"] / 60.0 for p in ps],
+                 [series("snapshot", [p["minutes"] for p in ps],
                          [p["elo"] for p in ps],
                          err=[CI95 * (p.get("se") or 0) for p in ps])],
                  hlines=[("greedy", greedy["elo"])] if greedy else (), marks=True)
@@ -236,9 +237,12 @@ def detail(runs_dir, name):
            if e.get("phase") == "rebel" and e.get("solves", 0) > 0
            and e.get("steps", 1) > 0]
     cfg = log.get("cfg") or {}
+    # Only ladders in the current format. Older runs kept a `ladder.json`
+    # written by code that no longer exists; the file is history, not something
+    # to render.
     lads = {os.path.basename(p)[:-5]: read_json(p)
             for p in sorted(glob.glob(os.path.join(path, "ladder*.json")))}
-    lads = {k: v for k, v in lads.items() if v}
+    lads = {k: v for k, v in lads.items() if v and v.get("kind") == "ladder"}
     warm = next((e for e in reversed(log.get("epochs") or [])
                  if e.get("phase") == "greedy"), None)
     out = {"name": name, "epochs": len(eps),
@@ -255,6 +259,32 @@ def detail(runs_dir, name):
     return out
 
 
+def arena_summary(report):
+    """The one line that says what a report found, whichever kind it is."""
+    if report["kind"] == "ladder":
+        players = report.get("players") or [{"name": "?"}]
+        best = max(players, key=lambda p: p.get("elo") or -1e9)
+        return f"{len(players)} bots · {report.get('games')} games · top {best['name']}"
+    if report["kind"] == "tablebase":
+        return (f"{report['bot']} · kept {report['held']}/{report['questions']} "
+                f"proven wins")
+    return f"{report['bot']} · gives away {report.get('gain', 0):+.3f}"
+
+
+def arena_index(arena_dir):
+    """One line per report in arena/, newest first."""
+    out = []
+    for path in glob.glob(os.path.join(arena_dir, "*.json")):
+        report = read_json(path)
+        if not report or report.get("kind") not in ("ladder", "probe", "tablebase"):
+            continue
+        out.append({"name": os.path.basename(path)[:-5],
+                    "mtime": os.path.getmtime(path),
+                    "kind": report["kind"],
+                    "sub": arena_summary(report)})
+    return sorted(out, key=lambda a: -a["mtime"])
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         route = self.path.split("?")[0]
@@ -263,6 +293,15 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/runs":
             return self.body(json.dumps(index(self.server.runs)).encode(),
                              "application/json")
+        if route == "/api/arena":
+            return self.body(json.dumps(arena_index(self.server.arena)).encode(),
+                             "application/json")
+        if route.startswith("/api/arena/"):
+            name = unquote(route[len("/api/arena/"):])
+            got = self.safe_name(name) and read_json(
+                os.path.join(self.server.arena, name + ".json"))
+            return (self.body(json.dumps(got).encode(), "application/json")
+                    if got else self.send_error(404))
         if route.startswith("/api/run/"):
             name = unquote(route[len("/api/run/"):])
             if not self.safe_name(name):
@@ -313,6 +352,7 @@ def puller(src, dest, every=30):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--runs", default=os.path.join(HERE, "runs"))
+    ap.add_argument("--arena", default=os.path.join(HERE, "arena"))
     ap.add_argument("--port", type=int, default=8420)
     ap.add_argument("--pull", metavar="SRC", help="rsync source copied into --runs "
                     "every 30s; RSYNC_RSH carries the box's ssh options")
@@ -322,6 +362,7 @@ def main():
                          daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     srv.runs = os.path.abspath(args.runs)
+    srv.arena = os.path.abspath(args.arena)
     print(f"[monitor] http://127.0.0.1:{args.port} · {srv.runs}", flush=True)
     srv.serve_forever()
 

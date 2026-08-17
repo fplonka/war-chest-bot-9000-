@@ -1426,9 +1426,9 @@ mod gather_tests {
             snapshots: true,
             ..Default::default()
         };
-        let nets = [Nets::default()];
+        let nets = Nets::default();
         let gc = GameCfg {
-            agents: [Agent::Rebel { cfg, slot: 0 }; 2],
+            agents: [Agent::Rebel { cfg }; 2],
             collect: Collect::Rebel,
             explore: 0.3,
             random_draft: true,
@@ -1438,7 +1438,7 @@ mod gather_tests {
         let mut checked = 0;
         for (s, bel) in collect_roots(10, 0x9E17, &nets, &gc, 6) {
             let ctx = crate::rebel::Ctx::new(&s);
-            let sv = crate::search::Solver::new(&s, ctx, &nets[0], cfg, bel);
+            let sv = crate::search::Solver::new(&s, ctx, &nets, cfg, bel);
             if sv.capped() {
                 continue;
             }

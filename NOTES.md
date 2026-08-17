@@ -1,3 +1,177 @@
+# The arena, and the four architectures on one ladder
+
+Evaluation is now one system: a bot is a directory holding a frozen binary, its
+weights and a manifest; a referee owns the true game and speaks to two of them
+over pipes in public information only. `docs/ARENA.md` describes it. What it
+replaced was three overlapping paths — a snapshot round robin, a two-process
+cross-revision relay, and a one-off script — which could not be compared with
+each other. The browser UI is the same referee with a person in one seat, so
+the agent you play is the agent the ladder rated, down to the binary.
+
+## The ladder
+
+200 games per pairing, colour-swapped pairs over random drafts from the whole
+pool, each bot at the search its own checkpoint trained with.
+
+| bot | trained | Elo (greedy = 0) | 95% | score |
+|---|---:|---:|---:|---:|
+| `v5-2h` | 125 min | `1313` | `36` | `0.833` |
+| `v4-12h` | 725 min | `1265` | `34` | `0.782` |
+| `v4-2h` | 125 min | `1060` | `34` | `0.556` |
+| `v3-trav` | 29 min | `817` | `45` | `0.328` |
+| `greedy` | — | `0` | `217` | `0.001` |
+
+The pairings, with the sign test over colour-swapped pairs:
+
+| pairing | W-L-D | score | pairs | p |
+|---|---:|---:|---:|---:|
+| `v5-2h` over `v4-12h` | `111-88-1` | `0.557` | `30-18` | `0.11` |
+| `v5-2h` over `v4-2h` | `161-38-1` | `0.807` | `66-2` | `1.6e-17` |
+| `v4-12h` over `v4-2h` | `155-45-0` | `0.775` | `57-2` | `6.1e-15` |
+| `v4-2h` over `v3-trav` | `161-38-1` | `0.807` | `66-3` | `1.9e-16` |
+| `v5-2h` over `v3-trav` | `193-6-1` | `0.967` | `94-0` | `1e-28` |
+
+**v5 at two hours is level with or ahead of v4 at twelve, but the gap is not
+resolved at 200 games.** An earlier run of the same match came out `130-69`
+(`p = 1.5e-4`) and this one `111-88` (`p = 0.11`); the seeding changed between
+them, so they are two honest samples of a difference that sits near what 200
+games can see. Everything else on the ladder separates cleanly. Take the
+ordering; do not quote the v5/v4-12h margin without more games.
+
+The `v5-2h` against `v4-2h` score of `0.807` is the same measurement the
+retired cross-engine relay put at `0.8225`, under a different belief model and
+a different protocol. Two independent implementations landing that close is the
+reason to believe either.
+
+Greedy loses 800 games to 1 across the field, so it anchors the scale and
+nothing else. The pairing table is what to read.
+
+## The tablebase, and two wrong turns before it
+
+There is now an objective benchmark: positions where one side wins **whatever
+the other does**, proven over the rules with no value network anywhere. A bot
+plays the winning seat, makes one move, and the move is right exactly when the
+win is still forced afterwards. No opponent, no sampling, no network — the same
+questions and the same marking for any bot ever built.
+
+Generation is nearly free: 3,000 games cost 182 CPU-seconds, so ten hours on
+the box would be forty million games. It is not the constraint and never was.
+Scoring is one solve per question — the position is shipped rather than
+replayed into — so that is not the constraint either. What bounds a useful set
+is statistics: a binary outcome at `n = 400` per bucket is `±5%` at 95%, and
+past that the extra questions buy nothing.
+
+So the set is **stratified**: a quota per bucket. Left alone the set fills with
+easy positions, which are far more common than hard ones.
+
+### Positions come from bots playing, not from a hard-coded policy
+
+The generator watches two *bots* play and asks the referee, at each late
+position, whether the result is already decided. That the players are bots is
+the point: a bot is a frozen binary behind a protocol, so an architecture
+change cannot break the generator — which matters, because the whole purpose of
+the set is to survive architecture changes. It also makes the source of
+positions a choice rather than a policy baked into a tool:
+
+* `bots/random` on both sides gives positions from flailing. Cheap — six games
+  a second on the box, so every quota fills in minutes — and mildly *out of
+  distribution* for a net trained on self-play, which makes the set a
+  generalisation test as much as a tactical one.
+* A trained pair gives positions a real game reaches. Slower per game, and
+  strong players leave fewer wins lying around, which is exactly why those
+  positions are worth more.
+
+The proof quantifies over the **whole opponent range**, not the hand they
+happen to hold. A plan that only beats the actual hand is not forced, because
+the winner cannot see it. This was briefly lost when generation moved from a
+standalone binary into the arena, and it costs about five per cent of the
+questions when it is put back — small enough to be easy to miss and large
+enough to matter.
+
+### A serialisation bug that had been silently corrupting positions
+
+Found by the tablebase, and it predates it. `HexSet` is one bit per hex over
+thirty-seven hexes, so a `u64` — and `roots.rs` wrote it as a `u32`. A position
+saved at a `FootmanManeuver` came back with every hex from thirty-two up
+missing, which turned a node with four legal moves into a node with none.
+Nothing caught it because a truncated set is still a valid set, and the only
+prior consumer of `roots.rs` was GPU tree sizing, where a slightly wrong tree
+is a slightly wrong number rather than a crash.
+
+It surfaced here because a question that round-trips into an unanswerable
+position is a hard failure. Both directions now have a round-trip test with a
+hex above thirty-two in it, and `ROOTS_VERSION` is bumped.
+
+### The ply count is not a difficulty scale
+
+The first real result, and it was not what was expected. Greedy, by plies to
+win:
+
+| plies | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| kept the win | `0.13` | `0.24` | `0.24` | `0.39` | `0.44` | `0.41` | `0.58` |
+
+Deeper mates are *easier*, not harder. A win eight plies out usually has
+several moves that hold it; a win in two often has exactly one. Mate in one is
+free — take the marker — and is excluded from the set entirely, because every
+bot answers it.
+
+So the honest difficulty axis is **how many of the legal moves keep the win**,
+which the generator measures directly:
+
+| winning moves | 1 | 2 | 3 | 4 or more |
+|---|---:|---:|---:|---:|
+| kept the win | `0.21` | `0.38` | `0.29` | `0.73` |
+
+and the set is stratified on that. The other axis that matters is whether any
+hidden information is left: greedy keeps `0.43` of the wins where the
+opponent's hand is already pinned down and `0.19` where it is not. A benchmark
+that did not separate those two would have hidden its most interesting number.
+
+### The two wrong turns
+
+**Searching the whole game.** The first plan was endgames brute-forced to
+terminal. The public tree multiplies by about twenty per ply:
+
+| plies | nodes |
+|---|---:|
+| 1 | ~20 |
+| 2 | ~500 |
+| 3 | ~10,000 |
+| 4 | ~150,000 |
+| 6 | > 400,000 |
+
+and a game runs for hundreds of plies, so that is `20^16` and change. True, and
+it led to the wrong conclusion, because the measurement was taken on *positions
+sampled from full-draft play* and then generalised to the game. A tablebase is
+never sampled — it is constructed, or in this case *selected*: the question is
+not "can this position be searched to the end" but "is this position already
+decided", and those are very different sizes.
+
+**Deep search as a stand-in for truth.** The fallback was to search each
+position deeper than a bot can afford and score the bot's move against that. It
+was built, run, and deleted. A deeper search puts the same value network at its
+leaves, so it inherits that network's errors: it measures whether a bot agrees
+with itself given more time. And it has to be built with *some* net, which
+biases it towards that architecture — precisely the comparison it existed to
+make neutral. A benchmark that flatters one family is worse than none.
+
+### What the tablebase does not measure
+
+The tail of a game, and only positions that happen to be forced. A bot can
+convert every won endgame and still play a poor opening. It is a floor and a
+check, not a verdict; read it beside the ladder.
+
+## What a ladder costs
+
+Two 3090s, `0.88` games/sec: a five-bot round robin at 200 games a pairing is
+`2,000` games in `38` minutes. Two things got it there. The request and reply
+streams were decoupled, so neither side waits for the other's slowest game.
+And the referee stopped re-asking a bot to model the *same* position over and
+over while its opponent thought — a bot models its opponent by solving their
+node, and that solve was being repeated on every poll. That one fix took a
+CPU-only ladder from about `1,000` to `8,500` games a minute.
+
 # Value v5 — the architecture rebuild
 
 ## What was wrong with v4
@@ -565,3 +739,41 @@ arithmetic rather than subtle: depth two buys better targets at `12.6x` the
 price per target, and nothing measured here shows the quality repaying the
 count. The case for depth two now needs a run long enough for depth one to
 actually saturate against a fixed opponent, which thirty minutes is not.
+
+## What made the endgame generator fast
+
+Generating proven positions was, measured, 95% one thing: the forced-win
+search. It ran once per position from Python, on one core, holding the
+interpreter lock, and it was asked the same question about seven times over.
+
+Four changes, in order of what they were worth.
+
+**Return the distance, not a yes or no.** Asking "settled in two? in three? in
+four?" ran a fresh search per depth. One search that returns the *least* number
+of plies answers all of them, and a win found at some distance tightens the cap
+on every branch still to be tried. The count of moves that keep the win falls
+out of the same root scan, so sharpness stopped being a second search.
+
+**Prove in bulk, inside the referee.** The referee now records every decision
+node its games pass through, and the sweep drains that queue across every core
+with the interpreter lock released. Driven a position at a time from Python
+there were rarely more than three positions in hand and the cores sat idle.
+
+**Cut the node budget.** This was the surprise. The budget never lets an
+unproven position through — it only decides which are cheap enough to settle —
+and the few positions it gives up on cost more than all the others together.
+400,000 to 25,000 loses 1.5% of positions and runs 2.6 times faster, and the
+losses are spread evenly over depth rather than concentrated in the deep ones.
+Interpreted: the cost distribution has a tail so heavy that one position was
+serialising a whole parallel sweep.
+
+**Reuse the action buffer.** One vector per ply of depth instead of one per
+node.
+
+Together: 300 random-play games went from `65.3s` to `5.3s`, for 1.4% fewer
+positions — `12.3x`. Under self-play the search is no longer the limit; the
+cards are, which is where the cost belongs.
+
+One thing that did *not* work: ordering moves by the control-marker swing, to
+find refutations sooner. It made the run 1.8 times *slower*. The ordering needs
+a full apply per child at every node, and that costs more than the cut saves.

@@ -34,9 +34,10 @@
 use crate::actions::{Action, Play};
 use crate::board::{board, NONE, N_HEXES, N_LOCATIONS};
 use crate::gpu::GpuClient;
+use crate::policy::{self, NodePolicy};
 use crate::rebel::*;
 use crate::rng::Rng;
-use crate::search::{node_actions, Cfg, Nets, Solver};
+use crate::search::{Cfg, Nets, Solver};
 use crate::serialize::{PackedJob, WalkTree};
 use crate::state::{Cont, State, BLACK, WHITE, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP};
 use rayon::prelude::*;
@@ -149,99 +150,7 @@ pub enum Agent {
     /// Uniform over legal actions: the weakest reference on the Elo ladder.
     Random,
     /// ReBeL: solve the depth-limited subgame, act on the CFR strategy.
-    Rebel { cfg: Cfg, slot: usize },
-}
-
-/// A decision node's policy: private actions plus one probability per legal
-/// config/action cell, in config-major CSR order.
-struct NodePolicy {
-    acts: Vec<Action>,
-    aslot: Vec<i8>,
-    fdown: Vec<bool>,
-    legal_off: Vec<u32>,
-    legal_action: Vec<u32>,
-    probs: Vec<f32>,
-}
-
-impl NodePolicy {
-    fn frame(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config]) -> NodePolicy {
-        let (acts, aslot, fdown) = node_actions(s, player, ctx, cfgs);
-        let na = acts.len();
-        let mut legal_off = Vec::with_capacity(cfgs.len() + 1);
-        let mut legal_action = Vec::new();
-        legal_off.push(0);
-        for c in cfgs {
-            for a in 0..na {
-                if action_legal(c, aslot[a]) {
-                    legal_action.push(a as u32);
-                }
-            }
-            legal_off.push(legal_action.len() as u32);
-        }
-        let cells = legal_action.len();
-        NodePolicy {
-            acts,
-            aslot,
-            fdown,
-            legal_off,
-            legal_action,
-            probs: vec![0.0; cells],
-        }
-    }
-
-    #[inline]
-    fn row(&self, c: usize) -> std::ops::Range<usize> {
-        self.legal_off[c] as usize..self.legal_off[c + 1] as usize
-    }
-}
-
-/// One-ply greedy. An action's score is a property of the successor's public
-/// state, so it is evaluated once per action and shared across configs; only
-/// the legal set differs between them.
-fn greedy_policy(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config], temp: f32) -> NodePolicy {
-    let mut np = NodePolicy::frame(s, ctx, player, cfgs);
-    let na = np.acts.len();
-    let mut score = vec![f32::NEG_INFINITY; na];
-    for a in 0..na {
-        let rep = cfgs.iter().find(|c| action_legal(c, np.aslot[a]));
-        let Some(rep) = rep else { continue };
-        let mut probe = s.clone();
-        set_config(&mut probe, player, ctx, rep);
-        probe.apply_inplace(np.acts[a]);
-        score[a] = eval_static(&probe, player) / temp;
-    }
-    for ci in 0..cfgs.len() {
-        let cells = np.row(ci);
-        let best = cells.clone().fold(f32::NEG_INFINITY, |best, cell| {
-            best.max(score[np.legal_action[cell] as usize])
-        });
-        let mut sum = 0.0;
-        for cell in cells.clone() {
-            let a = np.legal_action[cell] as usize;
-            let e = (score[a] - best).exp();
-            np.probs[cell] = e;
-            sum += e;
-        }
-        // A little uniform mass keeps the belief filter from collapsing and
-        // keeps warm-start games diverse.
-        let k = cells.len() as f32;
-        for cell in cells {
-            np.probs[cell] = 0.95 * np.probs[cell] / sum + 0.05 / k;
-        }
-    }
-    np
-}
-
-fn random_policy(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config]) -> NodePolicy {
-    let mut np = NodePolicy::frame(s, ctx, player, cfgs);
-    for ci in 0..cfgs.len() {
-        let row = np.row(ci);
-        let k = row.len() as f32;
-        for cell in row {
-            np.probs[cell] = 1.0 / k;
-        }
-    }
-    np
+    Rebel { cfg: Cfg },
 }
 
 // -------------------------------------------------------------- data records
@@ -436,8 +345,8 @@ pub struct GameCfg {
 
 // ----------------------------------------------------------------- game loop
 
-/// A live ReBeL walk: the solver for the current subgame, the checkpoint
-/// slot it was built with, and the tree node the game is currently at.
+/// A live ReBeL walk: the solver for the current subgame, and the tree node
+/// the game is currently at.
 ///
 enum WalkState<'a> {
     Cpu(Solver<'a>),
@@ -449,7 +358,6 @@ enum WalkState<'a> {
 /// possible exit belief arrive in the one solve completion.
 struct Walk<'a> {
     tree: WalkState<'a>,
-    slot: usize,
     /// Fixed for the walk: this player may play uniform, the other does not.
     explorer: u8,
     node: usize,
@@ -522,35 +430,8 @@ impl<'a> Walk<'a> {
 
     fn policy(&self, node: usize) -> NodePolicy {
         match &self.tree {
-            WalkState::Cpu(sv) => {
-                let n = &sv.nodes[node];
-                NodePolicy {
-                    acts: n.acts.clone(),
-                    aslot: n.aslot.clone(),
-                    fdown: n.fdown.clone(),
-                    legal_off: n.legal_off.clone(),
-                    legal_action: n.legal_action.clone(),
-                    probs: vec![0.0; n.legal_action.len()],
-                }
-            }
-            WalkState::Gpu(tree) => {
-                let ar = tree.action_range(node);
-                let row0 = tree.legal_row_of[node] as usize;
-                let nc = tree.supports[node][tree.node_player[node] as usize].len();
-                let cell0 = tree.legal_off[row0];
-                let cell1 = tree.legal_off[row0 + nc];
-                NodePolicy {
-                    acts: tree.actions[ar.clone()].to_vec(),
-                    aslot: tree.aslot[ar.clone()].to_vec(),
-                    fdown: tree.fdown[ar].to_vec(),
-                    legal_off: tree.legal_off[row0..=row0 + nc]
-                        .iter()
-                        .map(|&x| x - cell0)
-                        .collect(),
-                    legal_action: tree.legal_action[cell0 as usize..cell1 as usize].to_vec(),
-                    probs: vec![0.0; (cell1 - cell0) as usize],
-                }
-            }
+            WalkState::Cpu(sv) => policy::cpu_frame(sv, node),
+            WalkState::Gpu(tree) => policy::wave_frame(tree, node, tree.node_player[node] as usize),
         }
     }
 }
@@ -623,7 +504,6 @@ pub struct Game<'a> {
     pending_job: Option<crate::serialize::PackedJob>,
     pending_walk: Option<WalkTree>,
     pending_roots: Option<Vec<[Vec<f32>; 2]>>,
-    pending_slot: usize,
     pending_player: u8,
     pending_oversize: bool,
 }
@@ -657,7 +537,6 @@ impl<'a> Game<'a> {
             pending_job: None,
             pending_walk: None,
             pending_roots: None,
-            pending_slot: 0,
             pending_player: 0,
             pending_oversize: false,
         }
@@ -676,11 +555,6 @@ impl<'a> Game<'a> {
         self.pending_job.take()
     }
 
-    /// The nets slot of the pending solve, for routing to a service.
-    pub fn pending_slot(&self) -> usize {
-        self.pending_slot
-    }
-
     /// The rows produced so far (the worker takes them when a game ends).
     pub fn take_data(&mut self) -> Data {
         std::mem::take(&mut self.data)
@@ -692,7 +566,7 @@ impl<'a> Game<'a> {
     }
 
     /// Play until a GPU solve is submitted or the game ends.
-    pub fn advance(&mut self, gpu: Option<&[GpuClient]>, nets: &'a [Nets]) -> Step {
+    pub fn advance(&mut self, gpu: Option<&[GpuClient]>, nets: &'a Nets) -> Step {
         let gc = self.gc;
         let Game {
             rng,
@@ -776,23 +650,14 @@ impl<'a> Game<'a> {
                     // to the state the walk ended at).
                     walk.take();
                     carried.clear();
-                    greedy_policy(s, ctx, player, &cfgs, temp)
+                    policy::greedy(s, ctx, player, &cfgs, temp)
                 }
                 Agent::Random => {
                     walk.take();
                     carried.clear();
-                    random_policy(s, ctx, player, &cfgs)
+                    policy::uniform(s, ctx, player, &cfgs)
                 }
-                Agent::Rebel { cfg, slot } => {
-                    // A walk belongs to the checkpoint that built it. Playing
-                    // a decision on another slot's solver would make that
-                    // player act with the wrong network — the Elo ladder pits
-                    // one snapshot's slot against another's — so end a walk
-                    // built by a different slot before starting a new one.
-                    if walk.as_ref().is_some_and(|w| w.slot != slot) {
-                        walk.take();
-                        carried.clear();
-                    }
+                Agent::Rebel { cfg } => {
                     // A pathological root falls back to a uniform policy; the
                     // policy is produced outside the walk bookkeeping below.
                     let mut fallback: Option<NodePolicy> = None;
@@ -815,7 +680,7 @@ impl<'a> Game<'a> {
                             gpu_build: gpu.is_some(),
                             ..cfg
                         };
-                        let mut sv = Solver::new(s, *ctx, &nets[slot], scfg, bel.clone());
+                        let mut sv = Solver::new(s, *ctx, nets, scfg, bel.clone());
                         if sv.capped() {
                             // The tree-size tail is fat (broad random-draft
                             // beliefs at round boundaries); an unbounded build
@@ -829,7 +694,7 @@ impl<'a> Game<'a> {
                             walk.take();
                             carried.clear();
                             data.node_caps += 1;
-                            fallback = Some(random_policy(s, ctx, player, &cfgs));
+                            fallback = Some(policy::uniform(s, ctx, player, &cfgs));
                         } else if gpu.is_some() {
                             // GPU path: package the tree as one job. The
                             // carried roots (or the live belief, for the
@@ -845,7 +710,6 @@ impl<'a> Game<'a> {
                             self.pending_job = Some(job);
                             self.pending_walk = Some(walk_tree);
                             self.pending_roots = Some(roots_v);
-                            self.pending_slot = slot;
                             self.pending_player = player;
                             return Step::Submitted;
                         } else {
@@ -906,7 +770,6 @@ impl<'a> Game<'a> {
                             }
                             *walk = Some(Walk {
                                 tree: WalkState::Cpu(sv),
-                                slot,
                                 explorer: sample_explorer(rng, gc.explore),
                                 node: 0,
                                 drawn: 0,
@@ -960,7 +823,7 @@ impl<'a> Game<'a> {
             }
 
             let true_row = np.row(true_ci);
-            let mut chosen_cell = true_row.start + sample_row(rng, &np.probs[true_row.clone()]);
+            let mut chosen_cell = np.sample(rng, true_ci);
             // One explorer per walk. No walk: this decision is its own walk.
             let explorer = walk
                 .as_ref()
@@ -973,25 +836,12 @@ impl<'a> Game<'a> {
             {
                 chosen_cell = true_row.start + rng.below(true_row.len());
             }
-            let chosen = np.legal_action[chosen_cell] as usize;
+            let chosen = np.action_at(chosen_cell);
 
             // Bayes update on the *public observation*: several private
             // actions can produce it, and the belief must sum over all of
             // them.
-            let obs = obs_key(&np.acts[chosen]);
-            let mut pairs: Vec<(Config, f32)> = Vec::new();
-            for (ci, c) in cfgs.iter().enumerate() {
-                for cell in np.row(ci) {
-                    let a = np.legal_action[cell] as usize;
-                    if obs_key(&np.acts[a]) != obs {
-                        continue;
-                    }
-                    if let Some(n) = advance_config(c, np.aslot[a], np.fdown[a]) {
-                        pairs.push((n, bel[player as usize].p[ci] * np.probs[cell]));
-                    }
-                }
-            }
-            bel[player as usize] = Belief::from_pairs(pairs);
+            bel[player as usize] = np.posterior(&bel[player as usize], obs_key(&np.acts[chosen]));
             if let Some(slot) = match np.acts[chosen].play() {
                 Play::Attack => Some(0),
                 Play::Pass => Some(1),
@@ -1038,7 +888,6 @@ impl<'a> Game<'a> {
     pub fn resume(&mut self, result: crate::gpu::SolveResult) {
         let gc = self.gc;
         let tree = self.pending_walk.take().expect("pending walk tree");
-        let slot = self.pending_slot;
         let roots_v = self.pending_roots.take().expect("pending roots");
         self.pending_oversize = false;
         if collects_rows(gc, &self.s) {
@@ -1064,7 +913,6 @@ impl<'a> Game<'a> {
         self.carried = Vec::new();
         self.walk = Some(Walk {
             tree: WalkState::Gpu(tree),
-            slot,
             explorer: sample_explorer(&mut self.rng, self.gc.explore),
             node: 0,
             drawn: 0,
@@ -1080,7 +928,7 @@ impl<'a> Game<'a> {
     /// allowing several of its multi-gigabyte arenas at once would merely move
     /// the capacity failure from device memory to host memory.
     #[cfg(feature = "gpu")]
-    pub fn retry_cpu(&mut self, nets: &'a [Nets]) {
+    pub fn retry_cpu(&mut self, nets: &'a Nets) {
         // Release the packed GPU representation before allocating the CPU CFR
         // arenas. The worker has normally taken `pending_job` already; keep the
         // take here so direct callers cannot accidentally retain it.
@@ -1089,7 +937,7 @@ impl<'a> Game<'a> {
         let roots_v = self.pending_roots.take().expect("pending roots");
         let oversize = std::mem::take(&mut self.pending_oversize);
         let player = self.pending_player;
-        let Agent::Rebel { cfg, slot } = self.gc.agents[player as usize] else {
+        let Agent::Rebel { cfg } = self.gc.agents[player as usize] else {
             panic!("GPU retry requested for a non-ReBeL agent");
         };
         let scfg = Cfg {
@@ -1097,7 +945,7 @@ impl<'a> Game<'a> {
             gpu_build: false,
             ..cfg
         };
-        let mut sv = Solver::new(&self.s, self.ctx, &nets[slot], scfg, self.bel.clone());
+        let mut sv = Solver::new(&self.s, self.ctx, nets, scfg, self.bel.clone());
         assert!(
             !sv.capped(),
             "a GPU job that passed the node cap capped on its exact CPU retry"
@@ -1127,7 +975,6 @@ impl<'a> Game<'a> {
         self.carried.clear();
         self.walk = Some(Walk {
             tree: WalkState::Cpu(sv),
-            slot,
             explorer: sample_explorer(&mut self.rng, self.gc.explore),
             node: 0,
             drawn: 0,
@@ -1178,7 +1025,7 @@ impl<'a> Game<'a> {
 /// site and nothing when `None`.
 pub fn play_game(
     rng: Rng,
-    nets: &[Nets],
+    nets: &Nets,
     gc: &GameCfg,
     data: &mut Data,
     mut roots: Option<&mut Vec<(State, [Belief; 2])>>,
@@ -1235,7 +1082,7 @@ fn location_owners(s: &State) -> [u8; N_LOCATIONS] {
     })
 }
 
-fn resolve_chance(s: &mut State, player: u8, rng: &mut Rng) {
+pub(crate) fn resolve_chance(s: &mut State, player: u8, rng: &mut Rng) -> Action {
     debug_assert!(matches!(
         s.pending(),
         Cont::Draw { .. } | Cont::WarriorPriestDraw { .. }
@@ -1254,8 +1101,9 @@ fn resolve_chance(s: &mut State, player: u8, rng: &mut Rng) {
     if !any {
         w.iter_mut().for_each(|x| *x = 1.0);
     }
-    let ai = rng.weighted_index(&w);
-    s.apply_inplace(acts[ai]);
+    let drawn = acts[rng.weighted_index(&w)];
+    s.apply_inplace(drawn);
+    drawn
 }
 
 pub(crate) fn effective_bag_count(s: &State, p: u8, unit: u8) -> u8 {
@@ -1265,15 +1113,6 @@ pub(crate) fn effective_bag_count(s: &State, p: u8, unit: u8) -> u8 {
     } else {
         s.zones[p as usize][Z_FACEUP][unit as usize]
             + s.zones[p as usize][Z_FACEDOWN][unit as usize]
-    }
-}
-
-fn sample_row(rng: &mut Rng, row: &[f32]) -> usize {
-    let w: Vec<f64> = row.iter().map(|&x| x.max(0.0) as f64).collect();
-    if w.iter().sum::<f64>() > 0.0 {
-        rng.weighted_index(&w)
-    } else {
-        rng.below(row.len().max(1))
     }
 }
 
@@ -1296,7 +1135,7 @@ fn worker_seed(seed: u64, i: usize) -> u64 {
 pub fn collect_roots(
     games: usize,
     seed: u64,
-    nets: &[Nets],
+    nets: &Nets,
     gc: &GameCfg,
     cap: usize,
 ) -> Vec<(State, [Belief; 2])> {
@@ -1341,179 +1180,11 @@ pub fn gen_workers_per() -> usize {
 /// game's solve answers first: trip-1 replies are tagged onto one channel
 /// per worker, so a slow solve never blocks a finished one behind it.
 ///
-/// `gpus` is one client per service and `route` maps a solve's nets slot to
-/// a service index: training routes everything to service 0, a GPU ladder
-/// splits the two checkpoints between two devices.
-#[cfg(feature = "gpu")]
-pub fn run_games_gpu(
-    games: usize,
-    seed: u64,
-    nets: &[Nets],
-    gc: &GameCfg,
-    gpus: &[crate::gpu::GpuClient],
-    route: &(dyn Fn(usize) -> usize + Sync),
-) -> Data {
-    run_games_gpu_until(games, seed, nets, gc, gpus, route, None)
-}
-
-/// Deadline-aware form used by the streaming trainer. At the deadline no new
-/// game or solve is admitted; already-submitted waves drain, and unfinished
-/// games are reported as time-censored rather than silently counted as drops.
-#[cfg(feature = "gpu")]
-pub fn run_games_gpu_until(
-    games: usize,
-    seed: u64,
-    nets: &[Nets],
-    gc: &GameCfg,
-    gpus: &[crate::gpu::GpuClient],
-    route: &(dyn Fn(usize) -> usize + Sync),
-    deadline: Option<std::time::Instant>,
-) -> Data {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static EXACT_FALLBACK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    // Live games per worker: one solving on the GPU while another builds its
-    // tree on the CPU. More than two is worth it whenever the service is the
-    // bottleneck — the resident live set is `workers * per`, and a bigger live
-    // set is what fills the tick's grids — so it is a knob, not a constant.
-    let per = gen_workers_per();
-    // Workers spend most of their time blocked on a solve, not running, so
-    // the useful count is not the core count: it is whatever keeps the
-    // service's live set full. `WARCHEST_GEN_WORKERS` overrides the
-    // one-per-core default for exactly that reason.
-    let workers = std::env::var("WARCHEST_GEN_WORKERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get().saturating_sub(2).max(1))
-                .unwrap_or(8)
-        })
-        .min(games.div_ceil(per).max(1));
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                let (gc, nets, gpus, next, route) = (gc, nets, gpus, &next, route);
-                scope.spawn(move || {
-                    let mut out = Data::default();
-                    let mut game: Vec<Option<Game>> = (0..per).map(|_| None).collect();
-                    let mut busy = vec![false; per];
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    let mut live = 0usize;
-                    loop {
-                        let expired = deadline.is_some_and(|x| std::time::Instant::now() >= x);
-                        // Advance every idle game to its next solve (or its
-                        // end), starting fresh games while any remain.
-                        for k in 0..per {
-                            if busy[k] {
-                                continue;
-                            }
-                            if expired {
-                                if game[k].take().is_some() {
-                                    live -= 1;
-                                    out.censored_games += 1;
-                                }
-                                continue;
-                            }
-                            loop {
-                                if game[k].is_none() {
-                                    let i = next.fetch_add(1, Ordering::Relaxed);
-                                    if i >= games {
-                                        break;
-                                    }
-                                    game[k] = Some(Game::new(Rng::new(worker_seed(seed, i)), gc));
-                                    live += 1;
-                                }
-                                let g = game[k].as_mut().unwrap();
-                                let step = {
-                                    let _t = crate::timed!(ADVANCE);
-                                    g.advance(Some(gpus), nets)
-                                };
-                                match step {
-                                    Step::Submitted => {
-                                        if deadline.is_some_and(|x| std::time::Instant::now() >= x)
-                                        {
-                                            game[k] = None;
-                                            live -= 1;
-                                            out.censored_games += 1;
-                                            break;
-                                        }
-                                        let job = g.take_job().expect("submitted job");
-                                        let dev = route(g.pending_slot()) % gpus.len();
-                                        gpus[dev]
-                                            .submit_tagged(job, k, tx.clone())
-                                            .expect("gpu submit");
-                                        busy[k] = true;
-                                        break;
-                                    }
-                                    Step::Ended => {
-                                        if deadline.is_some_and(|x| std::time::Instant::now() >= x)
-                                        {
-                                            game[k] = None;
-                                            live -= 1;
-                                            out.censored_games += 1;
-                                            break;
-                                        }
-                                        let _ = g.finish();
-                                        out.merge(g.take_data());
-                                        game[k] = None;
-                                        live -= 1;
-                                    }
-                                }
-                            }
-                        }
-                        if live == 0 {
-                            break;
-                        }
-                        if !busy.iter().any(|&b| b) {
-                            continue;
-                        }
-                        // Resume whichever game answered first.
-                        let t0 = std::time::Instant::now();
-                        let (k, res) = {
-                            let _t = crate::timed!(TRIP1);
-                            rx.recv().expect("gpu trip 1")
-                        };
-                        out.gpu_wait_s += t0.elapsed().as_secs_f32();
-                        busy[k] = false;
-                        if deadline.is_some_and(|x| std::time::Instant::now() >= x) {
-                            game[k] = None;
-                            live -= 1;
-                            out.censored_games += 1;
-                            continue;
-                        }
-                        match res {
-                            Ok(trip1) => game[k].as_mut().expect("pending game").resume(trip1),
-                            Err(e) => {
-                                eprintln!("gen: exact CPU retry after GPU error: {e}");
-                                let _exclusive = EXACT_FALLBACK.lock().unwrap();
-                                game[k].as_mut().expect("pending game").retry_cpu(nets);
-                            }
-                        }
-                    }
-                    out
-                })
-            })
-            .collect();
-        let mut merged = Data::default();
-        for h in handles {
-            merged.merge(h.join().expect("gpu worker"));
-        }
-        merged
-    })
-}
-
-/// Continuous ReBeL generation for the trainer. A fixed number of CPU builder
-/// threads each owns many lightweight game actors; completed solves are
-/// detached immediately and merged into bounded chunks while the actors keep
-/// playing. This eager path is valid for pure bootstrap targets (`mc_mix=0`)
-/// with pure bootstrap targets: value targets are final at GPU completion.
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 pub fn run_games_gpu_stream(
     seed: u64,
-    nets: &[Nets],
+    nets: &Nets,
     gc: &GameCfg,
     gpus: &[crate::gpu::GpuClient],
     workers: usize,
@@ -1723,45 +1394,7 @@ pub fn run_games_gpu_stream(
     });
 }
 
-/// A GPU evaluation match: the same paired-seating scheme as `eval_match`,
-/// as two batches (seats swapped in the second) over the same seed stream.
-/// Weights live on the services; `a` and `b` route by their nets slots.
-#[cfg(feature = "gpu")]
-pub fn eval_match_gpu(
-    games: usize,
-    seed: u64,
-    nets: &[Nets],
-    a: Agent,
-    b: Agent,
-    random_draft: bool,
-    gpus: &[crate::gpu::GpuClient],
-) -> (usize, usize, usize) {
-    let mk = |agents: [Agent; 2]| GameCfg {
-        agents,
-        collect: Collect::None,
-        explore: 0.0,
-        random_draft,
-        eval_mix: 0.0,
-        mc_mix: 0.0,
-    };
-    // Route: side A's checkpoint sits on service 0, side B's on service 1.
-    let slot_of = |ag: &Agent| match ag {
-        Agent::Rebel { slot, .. } => *slot,
-        _ => usize::MAX,
-    };
-    let (sa, _sb) = (slot_of(&a), slot_of(&b));
-    let route = move |slot: usize| usize::from(slot != sa);
-    let pairs = games / 2;
-    let d1 = run_games_gpu(pairs, seed.wrapping_add(7), nets, &mk([a, b]), gpus, &route);
-    let d2 = run_games_gpu(pairs, seed.wrapping_add(7), nets, &mk([b, a]), gpus, &route);
-    (
-        d1.wins[0] + d2.wins[1],
-        d1.wins[1] + d2.wins[0],
-        d1.draws + d2.draws,
-    )
-}
-
-pub fn run_games(games: usize, seed: u64, nets: &[Nets], gc: &GameCfg) -> Data {
+pub fn run_games(games: usize, seed: u64, nets: &Nets, gc: &GameCfg) -> Data {
     (0..games)
         .into_par_iter()
         .fold(Data::default, |mut acc, i| {
@@ -1773,42 +1406,4 @@ pub fn run_games(games: usize, seed: u64, nets: &[Nets], gc: &GameCfg) -> Data {
             a.merge(b);
             a
         })
-}
-
-/// Head-to-head match, colours alternating on paired seeds (same draft and the
-/// same random stream for both seatings — a large variance reduction).
-/// Returns `(wins_for_a, wins_for_b, draws)`.
-pub fn eval_match(
-    games: usize,
-    seed: u64,
-    nets: &[Nets],
-    a: Agent,
-    b: Agent,
-    random_draft: bool,
-) -> (usize, usize, usize) {
-    (0..games)
-        .into_par_iter()
-        .map(|i| {
-            let rng = Rng::new(worker_seed(seed.wrapping_add(7), i / 2));
-            let swap = i % 2 == 1;
-            let gc = GameCfg {
-                agents: if swap { [b, a] } else { [a, b] },
-                collect: Collect::None,
-                explore: 0.0,
-                random_draft,
-                eval_mix: 0.0,
-                mc_mix: 0.0,
-            };
-            let mut d = Data::default();
-            let z = play_game(rng, nets, &gc, &mut d, None);
-            let za = if swap { -z } else { z };
-            if za > 1e-6 {
-                (1, 0, 0)
-            } else if za < -1e-6 {
-                (0, 1, 0)
-            } else {
-                (0, 0, 1)
-            }
-        })
-        .reduce(|| (0, 0, 0), |x, y| (x.0 + y.0, x.1 + y.1, x.2 + y.2))
 }

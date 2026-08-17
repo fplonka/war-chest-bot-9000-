@@ -52,7 +52,7 @@ def main():
     # A small random net so generation produces real (noisy) targets; the
     # point is the plumbing, not the strength.
     net = Net()
-    net.push(0)
+    net.push()
 
     print("[1/6] generating rows (random drafts, WP included)", flush=True)
     d = warchest.gen_data(1, 7, "rebel", depth=1, iters=8, explore=0.25,

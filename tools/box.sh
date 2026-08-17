@@ -27,7 +27,8 @@ $*"; }
 case "${1:-}" in
 sync)
     rsync -az --delete -e "ssh ${ssh_opts[*]}" \
-        --exclude runs --exclude target --exclude .venv --exclude papers \
+        --exclude runs --exclude bots --exclude arena --exclude suites \
+        --exclude target --exclude .venv --exclude papers \
         --exclude __pycache__ --exclude .git --exclude data \
         "$here/" "root@$host:$remote/"
     sha=$(git -C "$here" rev-parse --short=7 HEAD)
@@ -46,7 +47,8 @@ pull)
     ;;
 build)
     run_remote "find engine/src engine/tests engine/examples -type f -exec touch {} +
-cd engine && maturin develop --release --features python,gpu 2>&1 | tail -2"
+cd engine && maturin develop --release --features python,gpu 2>&1 | tail -2
+cargo build --release --bin bot --features gpu 2>&1 | tail -1"
     ;;
 follow)
     tag=${2:?usage: follow <tag> [run]}

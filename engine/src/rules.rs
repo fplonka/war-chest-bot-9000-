@@ -1009,7 +1009,7 @@ impl State {
                 self.list_tactics(h, out);
             }
         }
-        dedup(out);
+        dedup(&mut *out);
     }
 }
 
@@ -1026,8 +1026,16 @@ impl State {
     /// All legal actions for whoever is to act (including chance draws).
     pub fn legal_actions(&self) -> Vec<Action> {
         let mut out = Vec::new();
+        self.legal_actions_into(&mut out);
+        out
+    }
+
+    /// The same list, into a buffer the caller owns. A search visits millions
+    /// of nodes and would otherwise allocate a vector at every one of them.
+    pub fn legal_actions_into(&self, out: &mut Vec<Action>) {
+        out.clear();
         if self.winner != NONE {
-            return out;
+            return;
         }
         match self.pending {
             Cont::Draw { player } => {
@@ -1049,10 +1057,10 @@ impl State {
                 }
             }
             Cont::MainPlay => {
-                self.list_main_play(self.active, &mut out);
+                self.list_main_play(self.active, out);
             }
             Cont::WarriorPriestPlay { player } => {
-                self.list_main_play(player, &mut out);
+                self.list_main_play(player, out);
             }
             Cont::RoyalGuardChoice { .. } => {
                 out.push(Action::RGSoakSupply);
@@ -1074,25 +1082,25 @@ impl State {
                 };
                 // The chain costs a bolstered coin; it is only reachable with
                 // stack >= 2, so all listed maneuvers are payable.
-                self.list_basic_maneuvers(hex as usize, variant, &mut out);
-                self.list_berserker_tactics(hex as usize, v2, &mut out);
+                self.list_basic_maneuvers(hex as usize, variant, out);
+                self.list_berserker_tactics(hex as usize, v2, out);
                 out.push(Action::BerserkStop);
             }
             Cont::MercenaryManeuver { hex } => {
-                self.list_basic_maneuvers(hex as usize, ManVariant::Merc, &mut out);
-                self.list_merc_tactics(hex as usize, &mut out);
+                self.list_basic_maneuvers(hex as usize, ManVariant::Merc, out);
+                self.list_merc_tactics(hex as usize, out);
                 out.push(Action::MercDecline);
             }
             Cont::FootmanManeuver { hexes } => {
                 // The player chooses which remaining footman maneuvers next
                 // (order is free; verified against replays).
                 for h in hexes.iter() {
-                    self.list_basic_maneuvers(h as usize, ManVariant::Footman, &mut out);
+                    self.list_basic_maneuvers(h as usize, ManVariant::Footman, out);
                 }
                 // Mandatory if any option exists; advance() skips it otherwise.
             }
             Cont::CavalryAttack { hex } => {
-                self.list_basic_maneuvers(hex as usize, ManVariant::CavalryAtk, &mut out);
+                self.list_basic_maneuvers(hex as usize, ManVariant::CavalryAtk, out);
                 // Mandatory attack if a target exists; else skipped by advance().
             }
             Cont::FootmanInstantDeploy { coin } => {
@@ -1112,8 +1120,7 @@ impl State {
                 // Never a decision node; advance() consumes it. Defensive: empty.
             }
         }
-        dedup(&mut out);
-        out
+        dedup(out);
     }
 
     // Tactic listings restricted to the chaining/free contexts. Berserker/Merc

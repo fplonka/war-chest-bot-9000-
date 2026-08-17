@@ -488,7 +488,7 @@ impl Game {
 
 use crate::net::Net;
 use crate::search::{Cfg, Cfr, Nets};
-use crate::selfplay::{eval_match as rs_eval_match, run_games, Agent, Collect, Data, GameCfg};
+use crate::selfplay::{run_games, Agent, Collect, Data, GameCfg};
 use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2};
 use parking_lot::RwLock;
 use std::sync::LazyLock;
@@ -599,7 +599,7 @@ fn gpu_stream_start(
         node_cap: 200_000,
         ..Default::default()
     };
-    let agent = Agent::Rebel { cfg, slot: 0 };
+    let agent = Agent::Rebel { cfg };
     let gc = GameCfg {
         agents: [agent, agent],
         collect: Collect::Rebel,
@@ -717,45 +717,73 @@ fn gpu_stop(_py: Python<'_>) -> PyResult<()> {
     Ok(())
 }
 
-/// The live weight slots. Slot 0 is `Nets::default()` until the trainer pushes
-/// weights: the greedy warm phase plays with no network at all.
-static NETS: LazyLock<RwLock<Vec<Nets>>> = LazyLock::new(|| RwLock::new(vec![Nets::default()]));
+/// The live network. Empty until the trainer pushes weights: the greedy warm
+/// phase plays with no network at all. One process holds one network — two
+/// checkpoints meet each other as two arena bots, not as two slots here.
+static NETS: LazyLock<RwLock<Nets>> = LazyLock::new(|| RwLock::new(Nets::default()));
 
-pub(crate) fn nets() -> &'static RwLock<Vec<Nets>> {
+pub(crate) fn nets() -> &'static RwLock<Nets> {
     &NETS
 }
 
-fn check_slot(slot: usize) -> PyResult<()> {
-    let n = nets().read();
-    if slot >= n.len() || n[slot].value.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "no weights in slot {}",
-            slot
-        )));
+fn check_nets() -> PyResult<()> {
+    if nets().read().value.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err("no weights pushed"));
     }
     Ok(())
 }
 
-/// Install value-network weights, growing the slot pool to fit. `dims` is the
-/// model tag (`net::MODEL_TAG`); `w`, `b` and `ln` are the flat arrays
-/// `Net::from_flat` documents.
+/// Install value-network weights. `dims` is the model tag (`net::MODEL_TAG`);
+/// `w`, `b` and `ln` are the flat arrays `Net::from_flat` documents.
 #[pyfunction]
-#[pyo3(signature = (dims, w, b, ln, slot=0))]
 fn set_weights(
     dims: Vec<usize>,
     w: PyReadonlyArray1<f32>,
     b: PyReadonlyArray1<f32>,
     ln: PyReadonlyArray1<f32>,
-    slot: usize,
 ) -> PyResult<()> {
-    let net = Net::from_flat(&dims, w.as_slice()?, b.as_slice()?, ln.as_slice()?)
+    nets().write().value = Net::from_flat(&dims, w.as_slice()?, b.as_slice()?, ln.as_slice()?)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    let mut n = nets().write();
-    if slot >= n.len() {
-        n.resize(slot + 1, Nets::default());
-    }
-    n[slot].value = net;
     Ok(())
+}
+
+/// Install the weights a bot directory carries. The binary format is the one
+/// `train/export_weights.py` writes, so anything that can play a bot loads it
+/// the same way and nothing needs torch to do it.
+#[pyfunction]
+fn set_weights_bin(path: &str) -> PyResult<()> {
+    nets().write().value = Net::load_bin(path)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}: {}", path, e)))?;
+    Ok(())
+}
+
+/// An action's own name, for a player describing their own move.
+#[pyfunction]
+fn action_label(code: u32) -> PyResult<String> {
+    Action::decode(code)
+        .map(|a| format!("{}", a))
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("no action {}", code)))
+}
+
+/// What an *observation* looks like to the player who did not make it.
+///
+/// `obs_key` drops the coin behind a face-down play, so the code it leaves
+/// decodes to an action naming some arbitrary coin. Rendering that would put a
+/// private coin on the screen, so the three plays that hide one are described
+/// by what was actually seen and nothing more.
+#[pyfunction]
+fn obs_label(key: u32) -> String {
+    use crate::actions::Action::*;
+    match Action::decode(key) {
+        Some(Pass { .. }) => "passes with a face-down coin".into(),
+        Some(ClaimInitiative { .. }) => "claims initiative with a face-down coin".into(),
+        Some(Recruit { unit, .. }) => format!(
+            "recruits {} with a face-down coin",
+            crate::units::def(unit).name
+        ),
+        Some(a) => format!("{}", a),
+        None => "plays a face-down coin".into(),
+    }
 }
 
 fn cfr_of(name: &str) -> PyResult<Cfr> {
@@ -765,23 +793,6 @@ fn cfr_of(name: &str) -> PyResult<Cfr> {
             name,
             Cfr::NAMED.map(|(n, _)| n).join(", ")
         ))
-    })
-}
-
-fn agent_of(name: &str, cfg: Cfg, temp: f32, slot: usize) -> PyResult<Agent> {
-    Ok(match name {
-        "greedy" => Agent::Greedy { temp },
-        "random" => Agent::Random,
-        "rebel" => {
-            check_slot(slot)?;
-            Agent::Rebel { cfg, slot }
-        }
-        other => {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown agent '{}'",
-                other
-            )))
-        }
     })
 }
 
@@ -877,7 +888,7 @@ fn gen_data(
     };
     let (agent, collect) = match mode {
         "greedy" => (Agent::Greedy { temp }, Collect::Mc),
-        "rebel" => (Agent::Rebel { cfg, slot: 0 }, Collect::Rebel),
+        "rebel" => (Agent::Rebel { cfg }, Collect::Rebel),
         other => {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "unknown mode '{}'",
@@ -900,67 +911,6 @@ fn gen_data(
     data_to_dict(py, d)
 }
 
-/// Head-to-head evaluation with alternating colours and paired drafts.
-/// `depth_b`/`iters_b` override side B's search settings, so one net can be
-/// pitted against itself at different depths or iteration counts (the depth
-/// probe); they default to side A's.
-#[pyfunction]
-#[pyo3(signature = (games, seed, a, b, depth=1, iters=16, temp=2.0, slot_a=0, slot_b=1, random_draft=true, depth_b=None, iters_b=None, cfr="linear", gpu=false))]
-#[allow(clippy::too_many_arguments)]
-fn eval_match(
-    py: Python<'_>,
-    games: usize,
-    seed: u64,
-    a: &str,
-    b: &str,
-    depth: usize,
-    iters: usize,
-    temp: f32,
-    slot_a: usize,
-    slot_b: usize,
-    random_draft: bool,
-    depth_b: Option<usize>,
-    iters_b: Option<usize>,
-    cfr: &str,
-    gpu: bool,
-) -> PyResult<(usize, usize, usize)> {
-    let cfg = Cfg {
-        depth,
-        iters,
-        snapshots: false,
-        cfr: cfr_of(cfr)?,
-        node_cap: 200_000,
-        ..Default::default()
-    };
-    let cfg_b = Cfg {
-        iters: iters_b.unwrap_or(iters),
-        depth: depth_b.unwrap_or(depth),
-        ..cfg
-    };
-    let (aa, bb) = (
-        agent_of(a, cfg, temp, slot_a)?,
-        agent_of(b, cfg_b, temp, slot_b)?,
-    );
-    #[cfg(feature = "gpu")]
-    if gpu {
-        return Ok(py.allow_threads(|| {
-            let n = nets().read();
-            let clients = gpu_clients().lock().clone();
-            crate::selfplay::eval_match_gpu(games, seed, &n, aa, bb, random_draft, &clients)
-        }));
-    }
-    #[cfg(not(feature = "gpu"))]
-    let _ = gpu;
-    Ok(py.allow_threads(|| {
-        let n = nets().read();
-        rs_eval_match(games, seed, &n, aa, bb, random_draft)
-    }))
-}
-
-/// Play `games` random-draft games and write up to `cap` subgame roots
-/// (public state + both beliefs, one per solve site) to `path` — the GPU
-/// tree-sizing sample of plan section 6. Uses the pushed nets, like
-/// `gen_data`.
 #[pyfunction]
 #[pyo3(signature = (games, seed, path, cap=1000, random_draft=true))]
 fn save_roots(
@@ -980,7 +930,6 @@ fn save_roots(
                     snapshots: false,
                     ..Default::default()
                 },
-                slot: 0,
             },
             Agent::Rebel {
                 cfg: Cfg {
@@ -989,7 +938,6 @@ fn save_roots(
                     snapshots: false,
                     ..Default::default()
                 },
-                slot: 0,
             },
         ],
         collect: Collect::None,
@@ -1031,18 +979,16 @@ fn set_cap_value(v: f32) {
 }
 
 #[pyfunction]
-#[pyo3(signature = (xpub, phi, weight, seg, queries, slot=0))]
 fn infer(
     xpub: PyReadonlyArray1<f32>,
     phi: PyReadonlyArray1<f32>,
     weight: PyReadonlyArray1<f32>,
     seg: PyReadonlyArray1<u32>,
     queries: usize,
-    slot: usize,
 ) -> PyResult<Vec<f32>> {
-    check_slot(slot)?;
+    check_nets()?;
     let guard = nets().read();
-    Ok(guard[slot].value.forward(
+    Ok(guard.value.forward(
         xpub.as_slice()?,
         phi.as_slice()?,
         weight.as_slice()?,
@@ -1217,7 +1163,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(card_features_table, m)?)?;
     m.add_function(wrap_pyfunction!(hex_location_flags, m)?)?;
     m.add_class::<Game>()?;
-    m.add_class::<crate::live::LiveGame>()?;
+    m.add_class::<crate::arena::PyTable>()?;
     m.add("MAX_MAIN_PLAYS", crate::state::MAX_MAIN_PLAYS)?;
     m.add("PUBFEAT", crate::rebel::PUBFEAT)?;
     m.add("CFEAT", crate::rebel::CFEAT)?;
@@ -1261,6 +1207,9 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hex_neighbours, m)?)?;
     m.add_function(wrap_pyfunction!(location_hexes, m)?)?;
     m.add_function(wrap_pyfunction!(set_weights, m)?)?;
+    m.add_function(wrap_pyfunction!(set_weights_bin, m)?)?;
+    m.add_function(wrap_pyfunction!(action_label, m)?)?;
+    m.add_function(wrap_pyfunction!(obs_label, m)?)?;
     m.add_function(wrap_pyfunction!(set_cap_value, m)?)?;
     m.add_function(wrap_pyfunction!(prof_dump, m)?)?;
     m.add_function(wrap_pyfunction!(save_roots, m)?)?;
@@ -1273,7 +1222,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(gpu_stop, m)?)?;
         m.add_function(wrap_pyfunction!(gpu_stream_start, m)?)?;
     }
-    m.add_function(wrap_pyfunction!(eval_match, m)?)?;
     m.add_function(wrap_pyfunction!(infer, m)?)?;
     Ok(())
 }

@@ -21,12 +21,9 @@ fn cfg() -> Cfg {
 /// re-serialization.
 #[test]
 fn real_solver_round_trips() {
-    let nets = [Nets::default()];
+    let nets = Nets::default();
     let gc = GameCfg {
-        agents: [Agent::Rebel {
-            cfg: cfg(),
-            slot: 0,
-        }; 2],
+        agents: [Agent::Rebel { cfg: cfg() }; 2],
         collect: Collect::Rebel,
         explore: 0.0,
         random_draft: true,
@@ -38,7 +35,7 @@ fn real_solver_round_trips() {
     let mut checked = 0;
     for (s, bel) in roots {
         let ctx = warchest::rebel::Ctx::new(&s);
-        let sv = Solver::new(&s, ctx, &nets[0], cfg(), bel);
+        let sv = Solver::new(&s, ctx, &nets, cfg(), bel);
         if sv.capped() {
             continue;
         }
@@ -84,12 +81,9 @@ fn real_solver_round_trips() {
 /// CSR spans, config spans, soff monotonicity, BFS order covering all nodes.
 #[test]
 fn tables_are_consistent() {
-    let nets = [Nets::default()];
+    let nets = Nets::default();
     let gc = GameCfg {
-        agents: [Agent::Rebel {
-            cfg: cfg(),
-            slot: 0,
-        }; 2],
+        agents: [Agent::Rebel { cfg: cfg() }; 2],
         collect: Collect::Rebel,
         explore: 0.0,
         random_draft: true,
@@ -99,7 +93,7 @@ fn tables_are_consistent() {
     let roots = collect_roots(12, 0xABCD, &nets, &gc, 6);
     for (s, bel) in roots {
         let ctx = warchest::rebel::Ctx::new(&s);
-        let sv = Solver::new(&s, ctx, &nets[0], cfg(), bel);
+        let sv = Solver::new(&s, ctx, &nets, cfg(), bel);
         if sv.capped() {
             continue;
         }
@@ -201,16 +195,13 @@ fn tables_are_consistent() {
 /// not need weights.
 #[test]
 fn starter_draft_round_trips() {
-    let nets = [Nets::default()];
+    let nets = Nets::default();
     let mut rng = Rng::new(99);
     let mut checked = 0;
     for seed in 0..10u64 {
         let mut rng = Rng::new(seed.wrapping_mul(31) + 7);
         let gc = GameCfg {
-            agents: [Agent::Rebel {
-                cfg: cfg(),
-                slot: 0,
-            }; 2],
+            agents: [Agent::Rebel { cfg: cfg() }; 2],
             collect: Collect::Rebel,
             explore: 0.5,
             random_draft: seed % 2 == 0,
@@ -220,7 +211,7 @@ fn starter_draft_round_trips() {
         let roots = collect_roots(3, seed, &nets, &gc, 2);
         for (s, bel) in roots {
             let ctx = warchest::rebel::Ctx::new(&s);
-            let sv = Solver::new(&s, ctx, &nets[0], cfg(), bel);
+            let sv = Solver::new(&s, ctx, &nets, cfg(), bel);
             if sv.capped() {
                 continue;
             }

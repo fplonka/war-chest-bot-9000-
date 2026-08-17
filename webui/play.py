@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """Play a trained ReBeL agent in the browser.
 
-    ./play.sh [--ckpt PATH] [--port 8765] [--depth 2] [--iters 16] [--seed N]
+    ./play.sh [BOT] [--port 8765] [--seed N]
 
-The checkpoint defaults to the most recent run under `runs/` that has a
-`ckpt_final.pt`. The draft is the fixed starter matchup (STARTER_WHITE /
-STARTER_BLACK in engine/src/selfplay.rs, the rulebook's recommended armies);
-you play white, the agent plays black. Round-start draws and the agent's
-moves happen automatically; every decision that is yours appears in the UI as
-a legal-action button.
+`BOT` is a bot directory — the same thing the arena ladders (`docs/ARENA.md`),
+and it plays here exactly as it plays there: the same binary, the same search,
+the same beliefs. This process is the referee, and you are the other seat.
+It defaults to the most recently packed bot.
+
+The draft is the fixed starter matchup (STARTER_WHITE / STARTER_BLACK in
+engine/src/selfplay.rs, the rulebook's recommended armies); you play white, the
+agent plays black. Round-start draws and the agent's moves happen
+automatically; every decision that is yours appears in the UI as a
+legal-action button.
 
 The agent's private information (hand, bag composition, face-down discards)
 is withheld from the snapshot the browser sees; only its public counts are
 shown. Your own hand is visible because it is yours.
 
-Only stdlib is used beyond the repo's own dependencies (torch to read the
-checkpoint, the built `warchest` extension).
+Only stdlib is used beyond the built `warchest` extension.
 """
 
 import argparse
 import json
+import queue
 import random
 import sys
 import threading
@@ -30,12 +34,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 WEBUI = Path(__file__).resolve().parent
 
-# The repo's tools load `train.py` by putting train/ itself on sys.path
-# (`import train` then resolves to train/train.py).
-sys.path.insert(0, str(ROOT / "train"))
+sys.path.insert(0, str(ROOT / "tools"))
 
 import warchest  # noqa: E402
-from export_weights import load as load_ckpt  # noqa: E402
+from arena import Bot  # noqa: E402
 
 # Fixed starter matchup, mirroring engine/src/selfplay.rs.
 STARTER_WHITE = [17, 12, 4, 9]  # Swordsman, Pikeman, Crossbowman, Light Cavalry
@@ -49,17 +51,23 @@ LOCATION_COORDS = [(4, 0), (6, 1), (0, 5), (2, 6),
 class Session:
     """One game, its agent, and the browser-facing view of it."""
 
-    def __init__(self, ckpt: Path, depth: int, iters: int, seed: int | None):
-        self.ckpt = ckpt
-        self.depth = depth
-        self.iters = iters
+    #: The human always plays white, the bot black.
+    HUMAN, AGENT = 0, 1
+
+    def __init__(self, bot: Path, seed: int | None):
+        self.spec = json.loads((bot / "bot.json").read_text())
+        self.name = self.spec.get("name", bot.name)
+        self.search = self.spec.get("search", {})
         self.seed = seed
         self.units = {uid: (name, coins) for uid, name, coins in warchest.units_info()}
         self.geometry = self._geometry()
-        net = load_ckpt(str(ckpt))
-        net.push(0)
-        # The real game's terminal payoff: the horizon marker bonus is a
-        # training-time device, annealed to zero, and evaluation runs at zero.
+        self.replies = queue.Queue()
+        # The bot is the same process the arena runs, spoken to over the same
+        # protocol. Nothing here knows how it thinks.
+        self.agent = Bot(bot, self.AGENT, -1, self.replies)
+        self.log = []
+        # The referee scores a game that hit the play horizon as a draw, so the
+        # horizon marker is worth nothing to either side.
         warchest.set_cap_value(0.0)
         self.new_game()
 
@@ -78,7 +86,7 @@ class Session:
 
     def check_geometry(self):
         """Verify our hex indexing against the engine's coord strings."""
-        snap = self.game.snapshot()
+        snap = self.snapshot()
         for occ in snap["board"]:
             assert self.geometry["hex_of"][occ["coord"]] == occ["hex"], occ
         for coord in snap["markers"]:
@@ -86,16 +94,71 @@ class Session:
 
     def new_game(self):
         seed = self.seed if self.seed is not None else random.getrandbits(63)
-        draft = {
-            "white_units": STARTER_WHITE,
-            "black_units": STARTER_BLACK,
-            "first_player": "white",
-        }
-        self.game = warchest.LiveGame(draft, 1, 0, self.depth, self.iters, seed)
-        self.game_id = random.getrandbits(32)
+        self.game_id = random.getrandbits(31)
+        self.log = []
+        self.table = warchest.Table()
+        self.table.start(self.game_id, STARTER_WHITE, STARTER_BLACK, 0,
+                         [self.HUMAN, self.AGENT], seed)
+        self.advance()
+
+    def advance(self):
+        """Resolve draws and the bot's replies until it is your move again."""
+        while True:
+            self.table.settle()
+            if self.table.reap():
+                return
+            request = self.table.request(self.AGENT)
+            if request:
+                self.agent.send(request)
+                _, line = self.replies.get()
+                if isinstance(line, SystemExit):
+                    raise line
+                self.table.reply(self.AGENT, line)
+                continue
+            # Nothing left for the bot: whatever remains is yours. Taking the
+            # human's request is what hands us the observations to narrate.
+            request = self.table.request(self.HUMAN)
+            if request:
+                self.narrate(json.loads(request))
+            return
+
+    def narrate(self, request):
+        """Turn this seat's observations into the browser's event log.
+
+        The log is built from what the referee tells *your* seat and nothing
+        else, so it cannot show you what the game does not: the agent's draws
+        are counted but not named, and a coin it spends face down stays a coin
+        it spent face down."""
+        for ask in request.get("go", []) + request.get("watch", []):
+            for obs in ask.get("obs", []):
+                if obs["kind"] == "draw":
+                    if obs["player"] != self.HUMAN:
+                        self.log.append("Agent draws (hidden)")
+                    else:
+                        self.log.append(f"You draw {self.label(obs['code'])}")
+                else:
+                    seen = warchest.obs_label(obs["key"])
+                    self.log.append(f"Agent: {seen[0].lower()}{seen[1:]}")
+
+    @staticmethod
+    def label(code):
+        """Your own action or draw, named in full: it is yours to see."""
+        return warchest.action_label(code).replace("Draw ", "").lower()
+
+    def human_move(self, code):
+        """Your move goes back to the referee the way a bot's does — this seat
+        is not a special case, it just happens to think in a browser."""
+        self.table.reply(self.HUMAN, json.dumps(
+            {"done": [{"id": self.game_id, "action": code}]}))
+        # Your own move never comes back as an observation — the referee only
+        # tells the other seat about it — so the log records it here.
+        self.log.append(f"You: {self.label(code)}")
+        self.advance()
 
     def snapshot(self):
-        snap = self.game.snapshot()
+        snap = self.table.view(self.game_id)
+        snap["human"], snap["agent"] = self.HUMAN, self.AGENT
+        snap["log"] = self.log
         return sanitize(snap)
 
 
@@ -162,9 +225,8 @@ class Handler(BaseHTTPRequestHandler):
                 },
                 "human_seat": 0,
                 "agent_seat": 1,
-                "ckpt": str(s.ckpt),
-                "depth": s.depth,
-                "iters": s.iters,
+                "bot": s.name,
+                "search": s.search,
             })
         else:
             send_json(self, {"error": "not found"}, 404)
@@ -175,11 +237,12 @@ class Handler(BaseHTTPRequestHandler):
             req = read_json(self)
             with LOCK:
                 try:
-                    snap = SESSION.game.human_move({"code": int(req["code"])})
+                    SESSION.human_move(int(req["code"]))
+                    snap = SESSION.snapshot()
                 except Exception as e:  # illegal action / not your turn
                     send_json(self, {"error": str(e)}, 400)
                     return
-                send_json(self, sanitize(snap))
+                send_json(self, snap)
         elif path == "/api/new":
             with LOCK:
                 SESSION.new_game()
@@ -188,41 +251,36 @@ class Handler(BaseHTTPRequestHandler):
             send_json(self, {"error": "not found"}, 404)
 
 
-def latest_checkpoint() -> Path:
-    """The newest final checkpoint: `ckpt_final.pt`, else the newest
-    `snap_XX.pt` (the long runs save snapshots under that name)."""
-    final = sorted((ROOT / "runs").glob("*/ckpt_final.pt"),
-                   key=lambda p: p.stat().st_mtime, reverse=True)
-    if final:
-        return final[0]
-    snaps = sorted((ROOT / "runs").glob("*/snap_*.pt"),
-                   key=lambda p: p.stat().st_mtime, reverse=True)
-    if not snaps:
-        raise SystemExit("no runs/*/ckpt_final.pt or runs/*/snap_*.pt found — pass --ckpt explicitly")
-    return snaps[0]
+def latest_bot() -> Path:
+    """The most recently packed bot that carries weights."""
+    bots = sorted((p.parent for p in (ROOT / "bots").glob("*/weights.bin")),
+                  key=lambda p: p.stat().st_mtime, reverse=True)
+    if not bots:
+        raise SystemExit(
+            "no bots found. Pack one:\n"
+            "  python tools/arena.py pack runs/<run> --snapshot final --name mine")
+    return bots[0]
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ckpt", type=Path, default=None,
-                    help="checkpoint .pt file (default: newest runs/*/ckpt_final.pt)")
+    ap.add_argument("bot", type=Path, nargs="?", default=None,
+                    help="bot directory (default: the newest under bots/)")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--depth", type=int, default=2, help="public-tree depth (train cfg)")
-    ap.add_argument("--iters", type=int, default=16, help="CFR iterations (train cfg)")
     ap.add_argument("--seed", type=int, default=None, help="fixed RNG seed for draws")
     ap.add_argument("--no-browser", action="store_true")
     args = ap.parse_args()
 
     global SESSION
-    ckpt = args.ckpt or latest_checkpoint()
-    print(f"checkpoint: {ckpt}")
-    SESSION = Session(ckpt, args.depth, args.iters, args.seed)
+    bot = args.bot or latest_bot()
+    SESSION = Session(bot, args.seed)
     SESSION.check_geometry()
+    print(f"bot: {SESSION.name} ({bot})")
     print(f"you: {', '.join(SESSION.units[u][0] for u in STARTER_WHITE)}")
     print(f"agent: {', '.join(SESSION.units[u][0] for u in STARTER_BLACK)} (black)")
-    print(f"agent cfg: depth={args.depth} iters={args.iters}")
+    print(f"agent search: {SESSION.search}")
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f"http://{args.host}:{args.port}/"

@@ -998,7 +998,7 @@ fn zero_weight_config_survives_the_walk_update() {
     // support to equal the tree child's config list element for element — the
     // invariant the desync assert protects: support is reachability, never
     // weight.
-    let nets = [Nets::default(), Nets::default()];
+    let nets = Nets::default();
     let mut rng = Rng::new(777);
     for _ in 0..200 {
         let mut s = make_game(&mut rng, false);
@@ -1052,7 +1052,7 @@ fn zero_weight_config_survives_the_walk_update() {
         let mut sv = Solver::new(
             &s,
             ctx,
-            &nets[0],
+            &nets,
             Cfg {
                 depth: 2,
                 iters: 8,
