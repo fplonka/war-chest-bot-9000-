@@ -332,6 +332,34 @@ fn opponent_range(s: &State, them: u8, ctx: &Ctx) -> Vec<Config> {
     out
 }
 
+/// Can `winner` force a win from here within `depth`, against *every* hand
+/// the loser could be holding?
+///
+/// Quantifying over the range is the whole claim. Proving it against the
+/// hand they actually hold would be proving something about a game nobody
+/// is playing: the winner cannot see that hand, so a plan that only works
+/// against it is not forced.
+///
+/// The distance returned is therefore the *worst* over the range: the
+/// number of plies that holds against every hand at once.
+pub fn settled(s: &State, winner: u8, cap: usize, budget: usize) -> Option<usize> {
+    // Against the hand they actually hold first: one cheap search, and it
+    // fails for almost every position, so the range is rarely walked.
+    let mut left = budget;
+    distance(s, winner, cap, &mut left)?;
+    let ctx = Ctx::new(s);
+    opponent_range(s, 1 - winner, &ctx)
+        .par_iter()
+        .map(|c| {
+            let mut probe = *s;
+            crate::rebel::set_config(&mut probe, 1 - winner, &ctx, c);
+            let mut left = budget;
+            distance(&probe, winner, cap, &mut left)
+        })
+        .try_reduce(|| 0, |a, b| Some(a.max(b)))
+}
+
+
 /// How many of the legal moves here keep a win that is `plies` away, and how
 /// many there are. Sharpness — how many of the moves are right — is the axis
 /// that actually separates bots, far more than how deep the win is.
@@ -566,39 +594,12 @@ impl Table {
         std::mem::take(&mut self.done)
     }
 
-    /// Can `winner` force a win from here within `depth`, against *every* hand
-    /// the loser could be holding?
-    ///
-    /// Quantifying over the range is the whole claim. Proving it against the
-    /// hand they actually hold would be proving something about a game nobody
-    /// is playing: the winner cannot see that hand, so a plan that only works
-    /// against it is not forced.
-    ///
-    /// The distance returned is therefore the *worst* over the range: the
-    /// number of plies that holds against every hand at once.
-    fn settled(s: &State, winner: u8, cap: usize, budget: usize) -> Option<usize> {
-        // Against the hand they actually hold first: one cheap search, and it
-        // fails for almost every position, so the range is rarely walked.
-        let mut left = budget;
-        distance(s, winner, cap, &mut left)?;
-        let ctx = Ctx::new(s);
-        opponent_range(s, 1 - winner, &ctx)
-            .par_iter()
-            .map(|c| {
-                let mut probe = *s;
-                crate::rebel::set_config(&mut probe, 1 - winner, &ctx, c);
-                let mut left = budget;
-                distance(&probe, winner, cap, &mut left)
-            })
-            .try_reduce(|| 0, |a, b| Some(a.max(b)))
-    }
-
     pub fn forced(&self, id: u32, winner: u8, depth: usize, budget: usize) -> Result<bool, String> {
         let b = self
             .bouts
             .get(&id)
             .ok_or_else(|| format!("game {} is not live", id))?;
-        Ok(Self::settled(&b.s, winner, depth, budget).is_some())
+        Ok(settled(&b.s, winner, depth, budget).is_some())
     }
 
     /// Every live game whose result is already forced, proven and described.
@@ -628,7 +629,7 @@ impl Table {
             .filter(|(_, s)| (0..2).any(|p| s.markers_on_board(p) >= min_markers))
             .filter_map(|(id, s)| {
                 let winner = s.to_act();
-                let plies = Self::settled(&s, winner, cap, budget)?;
+                let plies = settled(&s, winner, cap, budget)?;
                 // A win already available in fewer plies is a different and
                 // easier question, and `min_plies` exists to exclude it.
                 if plies < min_plies {
