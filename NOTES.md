@@ -130,6 +130,42 @@ sustained `680.8` balanced depth-two solves/s with no dropped or exclusive
 work; CPU/Torch blob parity is `1.83e-6` relative and slot permutation changes
 values by at most `6.68e-6`.
 
+## The depth-two baseline, and what it beats
+
+`v5_d2_125m`: 125 minutes from scratch at seed 95, five Greedy minutes,
+snapshots every 25 so the checkpoints land on the two anchors worth playing.
+`2,657,646` solves, `57,928` games, `369.2` balanced solves/s over the whole
+run, three oversize routes and no dropped work. It learns monotonically by
+every internal measure: target SD `0.083 -> 0.648` across the six checkpoints
+while loss over target variance falls `1.68 -> 0.031`.
+
+Its own ladder, over all six checkpoints with Greedy pinned at zero, is
+monotone and had not flattened: `-50`, `+371`, `+638`, `+692`, `+721`, `+743`.
+Ladder Elo cannot rank close policies -- this file has found that twice -- but
+it can say a run kept learning, and this one did.
+
+Against the two architectures it replaces, on the cross-engine relay at matched
+search (depth 2, `T=64`, colour-swapped pairs, every state cross-checked
+between the two builds):
+
+| new | old | W-L-D | score | Elo | paired | paired p |
+|---|---|---:|---:|---:|---:|---:|
+| `v5 @ 30min` | `traverser` final (v3, 29min) | `157-42-1` | `0.7875` | `+227.6` | `62-4-34` | `2.1e-14` |
+| `v5 @ 125min` | `d2t64_long12h.s1` (v4, 125min) | `164-35-1` | `0.8225` | `+266.4` | `69-4-27` | `2.4e-16` |
+
+Both are like-for-like on wall clock: the same minutes of training on the same
+two cards, each side running its own engine revision. v4's own ladder put that
+`s1` checkpoint at `+501` against Greedy, which is the scale these Elo numbers
+sit on.
+
+The weights say where the late learning happens. From 30 to 125 minutes the
+config encoder and the join move most -- `cfg_f` by `145%` of its own RMS,
+`join_b` `64%`, `cfg_g` `61%`, the join blocks `56%` -- while the trunk's stems
+move `18%` and the position embedding `5%`. Board geometry settles early; the
+belief-conditioned path is what keeps improving. Read that beside the device
+profile below, where the repeated path is already the larger cost, before
+deciding which side to widen.
+
 ## Throughput
 
 The depth-two baseline, thirty minutes from scratch at seed 95 with a five-minute
@@ -137,6 +173,9 @@ Greedy warm-up, sustains **`543.6` balanced solves/s**: `815,276` solves,
 `16,556` games, no dropped work, no exclusive route, `debt` `688` of `3.26M`
 optimizer rows. A mature six-minute stream from that final checkpoint with the
 horizon payoff at zero runs at `453.3/s`, which is the number to A/B against.
+The rate falls with run length rather than with anything in the code: a
+125-minute run averages `369/s`, because mature games sit in midgame states
+whose belief supports are three times the opening's.
 
 Both cards are `90-92%` busy with a mean resident-thread occupancy near `100%`,
 so this is device-bound, not host-bound. Where the device time goes, over 45
