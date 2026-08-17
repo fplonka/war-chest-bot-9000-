@@ -108,6 +108,48 @@ sustained `680.8` balanced depth-two solves/s with no dropped or exclusive
 work; CPU/Torch blob parity is `1.83e-6` relative and slot permutation changes
 values by at most `6.68e-6`.
 
+## Throughput
+
+The depth-two baseline, thirty minutes from scratch at seed 95 with a five-minute
+Greedy warm-up, sustains **`543.6` balanced solves/s**: `815,276` solves,
+`16,556` games, no dropped work, no exclusive route, `debt` `688` of `3.26M`
+optimizer rows. A mature six-minute stream from that final checkpoint with the
+horizon payoff at zero runs at `453.3/s`, which is the number to A/B against.
+
+Both cards are `90-92%` busy with a mean resident-thread occupancy near `100%`,
+so this is device-bound, not host-bound. Where the device time goes, over 45
+seconds of a mature stream:
+
+| | share |
+|---|---:|
+| `trunk_row` (the whole board trunk) | `30.3%` |
+| join GEMMs (cuBLAS, tensor cores) | `~16%` |
+| `join_block` / `join_finish` / `join_input` | `9.3 / 5.4 / 4.3%` |
+| `readout` | `8.1%` |
+| `reach_sweep` / `backprop_sweep` | `6.5 / 5.3%` |
+| `belief_sums` | `4.2%` |
+
+The per-iteration join path is therefore the larger half at about `46%`, and a
+third of the device's time sits in five kernels that only move `128`-wide rows
+in and out of the arena.
+
+### The fused trunk, measured and reverted
+
+The eight residual blocks used to run as six kernels each, moving about `1.4 MB`
+per row through the arena. One kernel per row, with the residual stream in
+registers and the normalised hexes and their neighbour sums in shared memory,
+does the same arithmetic with no DRAM traffic at all: it cut the build stage
+from `277` to `154 ms` on a `57k`-row wave and passed every oracle, including
+`full_wave_oracle` and the exact-math head comparison.
+
+It is nevertheless *slower* end to end -- `429.5` against `453.3 solves/s` on
+the matched six-minute stream -- and the reason is the two shared buffers. At
+`33 KB` per block only three blocks fit an SM, which is `50%` thread residency,
+and they leave nothing for the other three lanes of the same device, so the
+saved arithmetic never reaches the stream. Reverted. The obvious next attempt is
+to hold both buffers as halves: that is what the old path fed the mix GEMM
+anyway, and `17 KB` per block would let the kernel share an SM.
+
 ## Deliberately not done
 
 * **Zero-sum enforcement.** Three v4 attempts lost. `odd` showed the
