@@ -212,5 +212,8 @@ fn every_row_carries_the_finished_games_location_owners() {
         }
         seen.insert(owners.to_vec());
     }
-    assert!(seen.len() > 1, "the ownership label is the same in every game");
+    assert!(
+        seen.len() > 1,
+        "the ownership label is the same in every game"
+    );
 }

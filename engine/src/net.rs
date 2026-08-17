@@ -1,18 +1,16 @@
-//! The fixed production value network. `train/value_net.py` is the same
-//! network in torch and `flat()` there writes exactly the blob `V5Layout`
-//! reads; the two must be changed together.
+//! The fixed production value network. `train/value_net.py` writes the blob
+//! that `NetLayout` reads; the two must be changed together.
 //!
 //! Three pieces, split by how often CFR runs them:
 //!
-//! * the **trunk** — 37 hex tokens through `BLOCKS` pre-activation residual
-//!   blocks over the board's own adjacency, each with a global-pooling bias —
-//!   runs once per leaf per solve and produces the board vector `P`;
-//! * the **config encoder** runs once per distinct config in the subgame and
-//!   produces `f(c)` (the readout row) and `g(c)` (the pooling vector);
-//! * the **join** runs on every CFR iteration and is the only per-iteration
-//!   path: it modulates `P` by the two pooled beliefs.
+//! * the **trunk** — one physical board per leaf through `BLOCKS`
+//!   pre-activation residual blocks over the board's adjacency;
+//! * the **config encoder** — one `f(c)` readout and one `g(c)` pooling vector
+//!   per distinct private config;
+//! * the **join** — the per-iteration path, conditioned on the two beliefs and
+//!   the queried physical seat.
 //!
-//! The readout is then one dot product, `v(c) = <f(c), h> + bias`.
+//! The readout is one dot product, `v(c) = <f(c), h> + bias`.
 
 use crate::board::{board, NONE, N_HEXES};
 use crate::rebel::{
@@ -24,7 +22,7 @@ use crate::units::CARD_FEATS;
 /// Coin-type token width.
 pub const TYPE: usize = 64;
 /// Hex channel width.
-pub const C: usize = 128;
+pub const C: usize = 96;
 /// Trunk residual blocks.
 pub const BLOCKS: usize = 8;
 /// Board vector and readout width.
@@ -37,9 +35,9 @@ pub const CFGH: usize = 128;
 pub const JW: usize = 128;
 /// Join residual blocks.
 pub const JBLOCKS: usize = 3;
-/// The join input that moves between CFR iterations: both pooled beliefs.
-pub const JOIN_IN: usize = 2 * POOL;
-/// The model format tag `V5Layout` accepts.
+/// Both pooled beliefs and the queried physical seat.
+pub const JOIN_IN: usize = 2 * POOL + 1;
+/// The model format tag `NetLayout` accepts.
 pub const MODEL_TAG: [usize; 1] = [5];
 
 #[cfg(target_vendor = "apple")]
@@ -192,7 +190,7 @@ pub struct BlockSpan {
 /// Offsets of every array in the flat blob. The order here is the contract
 /// with `value_net.py::flat`.
 #[derive(Clone, Debug)]
-pub struct V5Layout {
+pub struct NetLayout {
     pub card: [Span; 2],
     pub pile: Span,
     pub seat: usize,
@@ -259,7 +257,7 @@ impl Cursor {
     }
 }
 
-impl V5Layout {
+impl NetLayout {
     pub fn new(dims: &[usize]) -> Result<Self, String> {
         if dims != MODEL_TAG {
             return Err(format!(
@@ -443,7 +441,7 @@ const LN_H: usize = LN_JOUT + 1;
 
 impl Net {
     pub fn from_flat(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Self, String> {
-        let l = V5Layout::new(dims)?;
+        let l = NetLayout::new(dims)?;
         if (w.len(), b.len(), ln.len()) != (l.w_len, l.b_len, l.ln_len) {
             return Err(format!(
                 "weight sizes {}/{}/{} do not match v5 {}/{}/{}",
@@ -579,12 +577,22 @@ impl Net {
         out
     }
 
-    /// The trunk stem: hex facts, the occupant's token, position, globals.
+    /// The trunk stem: hex facts, the occupant's projected token, position,
+    /// globals, and a nonlinear pool over every drafted coin type.
     fn stem(&self, xpub: &[f32], tokens: &[f32], rows: usize) -> Vec<f32> {
         let mut facts = vec![0.0; rows * N_HEXES * HEX_FACTS];
-        let mut occ = vec![0.0; rows * N_HEXES * TYPE];
+        let mut occ = vec![0.0; rows * N_HEXES * C];
         let mut loose = vec![0.0; rows * LOOSE];
+        let mut projected = Vec::new();
+        self.tok_stem.run(tokens, rows * NTYPE, &mut projected);
+        let mut type_pool = vec![0.0; rows * C];
         for r in 0..rows {
+            for t in 0..NTYPE {
+                let token = &projected[(r * NTYPE + t) * C..(r * NTYPE + t + 1) * C];
+                for j in 0..C {
+                    type_pool[r * C + j] += gelu(token[j]) / NTYPE as f32;
+                }
+            }
             let src = &xpub[r * PUBFEAT..(r + 1) * PUBFEAT];
             loose[r * LOOSE..(r + 1) * LOOSE].copy_from_slice(&src[OFF_LOOSE..OFF_LOOSE + LOOSE]);
             for h in 0..N_HEXES {
@@ -592,22 +600,23 @@ impl Net {
                 let at = (r * N_HEXES + h) * HEX_FACTS;
                 facts[at..at + HEX_FACTS].copy_from_slice(&hex[..HEX_FACTS]);
                 if let Some(t) = hex[HEX_FACTS..].iter().position(|&v| v != 0.0) {
-                    let src = &tokens[(r * NTYPE + t) * TYPE..(r * NTYPE + t + 1) * TYPE];
-                    let at = (r * N_HEXES + h) * TYPE;
-                    occ[at..at + TYPE].copy_from_slice(src);
+                    let src = &projected[(r * NTYPE + t) * C..(r * NTYPE + t + 1) * C];
+                    let at = (r * N_HEXES + h) * C;
+                    occ[at..at + C].copy_from_slice(src);
                 }
             }
         }
         let mut x = Vec::new();
         self.hex_stem.run(&facts, rows * N_HEXES, &mut x);
-        self.tok_stem.add(&occ, rows * N_HEXES, &mut x);
         let mut glob = Vec::new();
         self.glob_stem.run(&loose, rows, &mut glob);
         for r in 0..rows {
             for h in 0..N_HEXES {
                 let dst = &mut x[(r * N_HEXES + h) * C..(r * N_HEXES + h + 1) * C];
+                let occupant = &occ[(r * N_HEXES + h) * C..(r * N_HEXES + h + 1) * C];
                 for j in 0..C {
-                    dst[j] += self.pos[h * C + j] + glob[r * C + j];
+                    dst[j] +=
+                        occupant[j] + self.pos[h * C + j] + glob[r * C + j] + type_pool[r * C + j];
                 }
             }
         }
@@ -673,7 +682,8 @@ impl Net {
         x
     }
 
-    /// The board vector `P`, one row per canonical query.
+    /// One board vector per physical row. `xpub` contains paired canonical
+    /// queries; the trunk reads the even, physical-seat-zero rows.
     pub fn board(
         &self,
         xpub: &[f32],
@@ -682,8 +692,17 @@ impl Net {
         card_rows: usize,
         out: &mut Vec<f32>,
     ) {
-        let tokens = self.tokens(xpub, cards, rows, card_rows);
-        let x = self.trunk(xpub, &tokens, rows);
+        let mut physical = vec![0.0; rows * PUBFEAT];
+        let mut physical_cards = vec![0.0; rows * NTYPE * TYPE];
+        for r in 0..rows {
+            physical[r * PUBFEAT..(r + 1) * PUBFEAT]
+                .copy_from_slice(&xpub[2 * r * PUBFEAT..(2 * r + 1) * PUBFEAT]);
+            let cr = (2 * r) % card_rows;
+            physical_cards[r * NTYPE * TYPE..(r + 1) * NTYPE * TYPE]
+                .copy_from_slice(&cards[cr * NTYPE * TYPE..(cr + 1) * NTYPE * TYPE]);
+        }
+        let tokens = self.tokens(&physical, &physical_cards, rows, rows);
+        let x = self.trunk(&physical, &tokens, rows);
         let width = 2 * C + LOOSE;
         let mut input = vec![0.0; rows * width];
         for r in 0..rows {
@@ -697,8 +716,9 @@ impl Net {
                     dst[C + j] = dst[C + j].max(src[j]);
                 }
             }
-            dst[2 * C..]
-                .copy_from_slice(&xpub[r * PUBFEAT + OFF_LOOSE..r * PUBFEAT + OFF_LOOSE + LOOSE]);
+            dst[2 * C..].copy_from_slice(
+                &physical[r * PUBFEAT + OFF_LOOSE..r * PUBFEAT + OFF_LOOSE + LOOSE],
+            );
         }
         self.board_out.run(&input, rows, out);
     }
@@ -776,9 +796,8 @@ impl Net {
         }
     }
 
-    /// The per-iteration path. `p`, `jp` and `pooled` are all indexed by
-    /// canonical query `2 * row + player`; `out` is `[rows, D]` for the one
-    /// traverser asked for.
+    /// The board projection is shared by a physical row. Belief order and the
+    /// seat scalar select the queried player's value.
     pub fn join(
         &self,
         p: &[f32],
@@ -794,8 +813,9 @@ impl Net {
             let (q, o) = (2 * r + player, 2 * r + 1 - player);
             let dst = &mut input[r * JOIN_IN..(r + 1) * JOIN_IN];
             dst[..POOL].copy_from_slice(&pooled[q * POOL..(q + 1) * POOL]);
-            dst[POOL..].copy_from_slice(&pooled[o * POOL..(o + 1) * POOL]);
-            z[r * JW..(r + 1) * JW].copy_from_slice(&jp[q * JW..(q + 1) * JW]);
+            dst[POOL..2 * POOL].copy_from_slice(&pooled[o * POOL..(o + 1) * POOL]);
+            dst[2 * POOL] = if player == 0 { -1.0 } else { 1.0 };
+            z[r * JW..(r + 1) * JW].copy_from_slice(&jp[r * JW..(r + 1) * JW]);
         }
         self.join_b.add(&input, rows, &mut z);
         self.join_b.bias(&mut z, rows);
@@ -812,7 +832,7 @@ impl Net {
         self.norms[LN_JOUT].apply(&mut z, rows, &mut arg, &mut th);
         fit(out, rows * D);
         for r in 0..rows {
-            let src = &p[(2 * r + player) * D..(2 * r + player + 1) * D];
+            let src = &p[r * D..(r + 1) * D];
             out[r * D..(r + 1) * D].copy_from_slice(src);
         }
         self.join_out.add(&z, rows, &mut out[..rows * D]);
@@ -846,9 +866,10 @@ impl Net {
         let n = weight.len();
         let mut cards = Vec::new();
         self.cards(xpub, queries, &mut cards);
+        let rows = queries / 2;
         let (mut p, mut jp) = (Vec::new(), Vec::new());
-        self.board(xpub, &cards, queries, queries, &mut p);
-        self.join_cache(&p, queries, &mut jp);
+        self.board(xpub, &cards, rows, queries, &mut p);
+        self.join_cache(&p, rows, &mut jp);
         let (mut f, mut g) = (Vec::new(), Vec::new());
         self.configs(phi, seg, n, &cards, &mut f, &mut g);
         let mut pooled = vec![0.0; queries * POOL];
@@ -861,7 +882,6 @@ impl Net {
         // `join` reads query `2 * row + player`, which is how the solver lays
         // its rows out; a flat query batch is the same thing with one row per
         // pair, so it is driven twice, once per seat.
-        let rows = queries / 2;
         let mut out = vec![0.0; n];
         let mut h = Vec::new();
         for player in 0..2 {

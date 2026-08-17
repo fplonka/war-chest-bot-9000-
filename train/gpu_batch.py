@@ -139,11 +139,8 @@ def make_batch(parts, rng, device):
     views = np.empty((2 * n, warchest.ROW_BYTES), np.uint8)
     views[0::2] = rows
     views[1::2] = mirror.mirror_rows(rows)
-    # The auxiliary target follows the row: the mirrored view sees the locations
-    # permuted and the two owners exchanged.
-    owner = np.empty((2 * n, warchest.N_LOCATIONS), np.uint8)
-    owner[0::2] = aux
-    owner[1::2] = mirror.mirror_aux(aux)
+    # The trunk and its ownership head run once in physical seat-0 space.
+    owner = aux
     size_parts = []
     for a in (hand, fd, bag):
         pair = np.empty((2 * n, 2), np.uint8)

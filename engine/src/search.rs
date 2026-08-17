@@ -1482,8 +1482,8 @@ impl<'a> Solver<'a> {
         if rows > 0 {
             net.cards(&xpub[..2 * PUBFEAT], 2, &mut self.cards);
         }
-        net.board(&xpub, &self.cards, 2 * rows, 2, &mut self.pb);
-        net.join_cache(&self.pb, 2 * rows, &mut self.jp);
+        net.board(&xpub, &self.cards, rows, 2, &mut self.pb);
+        net.join_cache(&self.pb, rows, &mut self.jp);
         self.xpub = xpub;
         let cphi = std::mem::take(&mut self.cphi);
         let config_owner: Vec<u32> = self.cplayer.iter().map(|&p| p as u32).collect();

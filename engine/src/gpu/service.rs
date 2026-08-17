@@ -1,9 +1,10 @@
-//! Cost-bucketed dispatcher for one v5 CUDA device and its reusable lanes.
+//! Cost-bucketed dispatcher for one CUDA device and its reusable lanes.
 
+use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::serialize::{PackedJob, WorkVector};
@@ -316,7 +317,7 @@ fn dispatcher(
     let _ = route_tx.send(RouteCmd::Shutdown);
     let _ = route_join.join();
     {
-        let mut state = lane_state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = lane_state.lock();
         state.blocked.fill(false);
         state.route_refs.fill(0);
         state.guard_refs.fill(0);
@@ -357,7 +358,7 @@ fn flush_deferred(
             }
         };
         let lane = {
-            let state = lane_state.lock().unwrap_or_else(|e| e.into_inner());
+            let state = lane_state.lock();
             let end = if whale {
                 whale_lanes.min(lane_work.len())
             } else {
@@ -394,7 +395,7 @@ fn claim_route_target(
     lane_state: &Arc<Mutex<LaneState>>,
     whale_lanes: usize,
 ) -> usize {
-    let mut state = lane_state.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = lane_state.lock();
     let end = whale_lanes.min(lane_work.len()).max(1);
     let target = (0..end)
         .min_by_key(|&lane| {
@@ -410,7 +411,7 @@ fn claim_route_target(
 }
 
 fn release_route_target(lane_state: &Arc<Mutex<LaneState>>, target: usize) {
-    let mut state = lane_state.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = lane_state.lock();
     state.route_refs[target] = state.route_refs[target].saturating_sub(1);
     state.blocked[target] = state.route_refs[target] != 0 || state.guard_refs[target] != 0;
 }
@@ -418,28 +419,9 @@ fn release_route_target(lane_state: &Arc<Mutex<LaneState>>, target: usize) {
 fn claim_guard_lanes(
     lane_work: &[Arc<AtomicU64>],
     lane_state: &Arc<Mutex<LaneState>>,
-    target: usize,
-    card: bool,
 ) -> Vec<usize> {
-    let mut state = lane_state.lock().unwrap_or_else(|e| e.into_inner());
-    let mut guarded = if card {
-        (0..lane_work.len()).collect::<Vec<_>>()
-    } else {
-        let helper = (0..lane_work.len())
-            .filter(|&lane| lane != target && !state.blocked[lane])
-            .min_by_key(|&lane| lane_work[lane].load(Ordering::Relaxed))
-            .or_else(|| {
-                (0..lane_work.len())
-                    .filter(|&lane| lane != target)
-                    .min_by_key(|&lane| lane_work[lane].load(Ordering::Relaxed))
-            });
-        let mut lanes = vec![target];
-        if let Some(helper) = helper {
-            lanes.push(helper);
-        }
-        lanes
-    };
-    guarded.sort_unstable();
+    let guarded = (0..lane_work.len()).collect::<Vec<_>>();
+    let mut state = lane_state.lock();
     for &lane in &guarded {
         state.guard_refs[lane] += 1;
         state.blocked[lane] = true;
@@ -448,7 +430,7 @@ fn claim_guard_lanes(
 }
 
 fn release_guard_lanes(lane_state: &Arc<Mutex<LaneState>>, guarded: &[usize]) {
-    let mut state = lane_state.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = lane_state.lock();
     for &lane in guarded {
         state.guard_refs[lane] = state.guard_refs[lane].saturating_sub(1);
         state.blocked[lane] = state.route_refs[lane] != 0 || state.guard_refs[lane] != 0;
@@ -486,10 +468,9 @@ fn run_routes(
         } = ticket;
         let card = work.requires_card_exclusive_route();
         let route_started = Instant::now();
-        // The target has been blocked since submission. Claim the remaining
-        // memory guard now, then keep dispatching on every unguarded lane while
-        // these lanes finish their already-accounted work.
-        let guarded = claim_guard_lanes(&lane_work, &lane_state, target, card);
+        // A guarded allocation is larger than one ordinary lane's budget.
+        // Drain and trim the whole card before admitting it.
+        let guarded = claim_guard_lanes(&lane_work, &lane_state);
         if held_ready.recv().is_err() {
             release_guard_lanes(&lane_state, &guarded);
             release_route_target(&lane_state, target);
@@ -1032,15 +1013,15 @@ mod tests {
         let first = claim_route_target(&lanes, &state, 1);
         let second = claim_route_target(&lanes, &state, 1);
         assert_eq!((first, second), (0, 0));
-        let guarded = claim_guard_lanes(&lanes, &state, first, false);
-        assert_eq!(guarded, vec![0, 1]);
-        assert_eq!(state.lock().unwrap().blocked, vec![true, true, false]);
+        let guarded = claim_guard_lanes(&lanes, &state);
+        assert_eq!(guarded, vec![0, 1, 2]);
+        assert_eq!(state.lock().blocked, vec![true, true, true]);
 
         release_guard_lanes(&state, &guarded);
         release_route_target(&state, first);
-        assert_eq!(state.lock().unwrap().blocked, vec![true, false, false]);
+        assert_eq!(state.lock().blocked, vec![true, false, false]);
         release_route_target(&state, second);
-        assert_eq!(state.lock().unwrap().blocked, vec![false, false, false]);
+        assert_eq!(state.lock().blocked, vec![false, false, false]);
     }
 }
 

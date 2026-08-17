@@ -234,12 +234,11 @@ are v4's too:
 | backward pass | 6% |
 | everything else | 5% |
 
-v5 moves that balance rather than the total. Its trunk carries **63%** of the
-network's multiply-accumulates against 1.7% for v4's board encoder, and the
-per-iteration path falls from 96.4% to 33% — the whole point of paying for a
-trunk that runs once per leaf. Projected, 48.9 GMAC per depth-2 `T=64` solve
-against v4's 58.0, and 0.95M parameters against 1.55M. Nothing on this page has
-been re-measured on v5.
+v5 moves that balance rather than the total. Most of its multiply-accumulates
+sit in the trunk, against 1.7% for v4's board encoder, and the per-iteration
+path falls from 96.4% to a small fraction — the whole point of paying for a
+trunk that runs once per physical leaf. The blob is `641,505` weights against
+v4's `1.55M`. Nothing on this page has been re-measured on v5.
 
 The draw transitions were the next lever and have since been taken. A run of
 *k* draws used to be composed step by step over intermediate supports that grow

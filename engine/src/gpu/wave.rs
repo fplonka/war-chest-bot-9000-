@@ -1,4 +1,4 @@
-//! Host packing for one immutable v5 wave.
+//! Host packing for one immutable GPU wave.
 //!
 //! Every solve-local offset is patched once into wave-global SoA space. Hot
 //! kernels consume direct `(node, config)` task records; they never search a

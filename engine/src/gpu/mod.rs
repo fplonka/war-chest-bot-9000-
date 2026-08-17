@@ -1,4 +1,4 @@
-//! The v5 GPU wave executor. Packed sparse solves are cost-bucketed into
+//! The GPU wave executor. Packed sparse solves are cost-bucketed into
 //! contiguous waves; a completion contains everything the actor needs and no
 //! solve remains resident while the public game walks its tree.
 

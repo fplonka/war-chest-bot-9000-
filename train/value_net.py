@@ -16,11 +16,11 @@ the output matrix. We cannot table those rows — the config set is variable
 (median 22, p99 567) — so we *generate* them from a config encoder and read
 out with a dot product.
 
-    public state ─► TRUNK (8 hex residual blocks, global pooling) ─► P
+    physical state ─► TRUNK (8 hex residual blocks, global pooling) ─► P
                                                                     │  once/leaf
     config c ─────► CONFIG ENCODER ─► f(c) [readout] , g(c) [pool]  │  once/config
                                                                     ▼
-           [P, Σβ_own g, Σβ_opp g] ─────────────► JOIN ─► h          every iteration
+ [P, Σβ_own g, Σβ_opp g, seat] ────────────────► JOIN ─► h          every iteration
                                                                     │
                                         v(c) = <f(c), h> + b  ──────┘
 
@@ -56,7 +56,7 @@ LOOSE = warchest.LOOSE
 N_LOCATIONS = warchest.N_LOCATIONS
 
 TYPE = 64      # coin-type token width
-C = 128        # hex channel width
+C = 96         # hex channel width
 BLOCKS = 8     # trunk residual blocks
 D = 256        # board vector / readout width
 POOL = 64      # pooled config embedding width
@@ -65,7 +65,7 @@ JW = 128       # join width
 JBLOCKS = 3    # join residual blocks
 AUX = 3        # final owner of a location: us / them / neither
 
-JOIN_IN = 2 * POOL      # the join input that moves between CFR iterations
+JOIN_IN = 2 * POOL + 1  # both beliefs and the queried physical seat
 MODEL_TAG = [5]
 
 
@@ -74,7 +74,7 @@ def gelu(x):
 
 
 class Net(nn.Module):
-    """One fixed architecture shared by both canonical player views."""
+    """A physical-state trunk with player-conditioned value queries."""
 
     def __init__(self):
         super().__init__()
@@ -154,15 +154,18 @@ class Net(nn.Module):
         return cards + self.pile(piles) + self.seat(self.seat_of)
 
     def trunk(self, xpub, tokens):
-        """37 hex tokens through BLOCKS residual blocks; returns the tokens."""
+        """37 physical hex tokens through BLOCKS residual blocks."""
         batch = xpub.shape[0]
         hexes = xpub[:, :N_HEXES * HEX_CH].reshape(batch, N_HEXES, HEX_CH)
-        occupant = hexes[:, :, HEX_FACTS:] @ tokens
+        projected = self.tok_stem(tokens)
+        occupant = hexes[:, :, HEX_FACTS:] @ projected
+        type_pool = gelu(projected).mean(1)
         loose = xpub[:, OFF_LOOSE:OFF_LOOSE + LOOSE]
         x = (self.hex_stem(hexes[:, :, :HEX_FACTS])
-             + self.tok_stem(occupant)
+             + occupant
              + self.pos.weight
-             + self.glob_stem(loose).unsqueeze(1))
+             + self.glob_stem(loose).unsqueeze(1)
+             + type_pool.unsqueeze(1))
         for i in range(BLOCKS):
             a = gelu(self.ln1[i](x))
             pad = F.pad(a, (0, 0, 0, 1))
@@ -172,7 +175,7 @@ class Net(nn.Module):
         return gelu(self.ln_trunk(x))
 
     def board(self, xpub, tokens):
-        """The board vector P, and the per-hex auxiliary logits."""
+        """One physical board vector and the per-hex auxiliary logits."""
         x = self.trunk(xpub, tokens)
         loose = xpub[:, OFF_LOOSE:OFF_LOOSE + LOOSE]
         p = self.board_out(torch.cat([x.mean(1), x.amax(1), loose], -1))
@@ -194,9 +197,9 @@ class Net(nn.Module):
         bag = self.cfg_m(own).reshape(-1, NSLOT, 3, POOL)[seg]
         return self.cfg_f(u), self.cfg_g(u) + (counts.unsqueeze(-1) * bag).sum((1, 2))
 
-    def join(self, p, pooled):
-        """The per-iteration path: beliefs modulate the cached board vector."""
-        z = self.join_p(p) + self.join_b(pooled)
+    def join(self, p, pooled, seat):
+        """The per-iteration path: beliefs and queried seat modulate the board."""
+        z = self.join_p(p) + self.join_b(torch.cat([pooled, seat], -1))
         for i in range(JBLOCKS):
             z = z + self.joinw[i](gelu(self.ln_join[i](z)))
         return self.ln_h(p + self.join_out(gelu(self.ln_jout(z))))
@@ -204,20 +207,23 @@ class Net(nn.Module):
     # --------------------------------------------------------------- forward
 
     def forward(self, xpub, phi, weight, seg, nseg):
-        """Values for a ragged canonical-query batch, and the aux logits.
+        """Values for paired physical-state queries, and physical aux logits.
 
-        Query ``q`` is public row ``q``; its own configs have ``seg == q`` and
-        its opponent's belief is query ``q ^ 1`` from the same physical row.
+        Query ``q`` owns configs with ``seg == q``. Queries ``q`` and ``q ^ 1``
+        share one physical board trunk and differ by belief order and seat.
         """
         cards = self.cards(xpub)
-        p, aux = self.board(xpub, self.tokens(xpub, cards))
+        physical = xpub[0::2]
+        p, aux = self.board(physical, self.tokens(physical, cards[0::2]))
 
         f, g = self.configs(phi, cards[:, :NSLOT], seg)
         pooled = p.new_zeros(nseg, POOL)
         pooled.index_add_(0, seg, g * weight.unsqueeze(1))
 
         other = torch.arange(nseg, device=seg.device) ^ 1
-        h = self.join(p, torch.cat([pooled, pooled[other]], -1))
+        pair = torch.cat([pooled, pooled[other]], -1)
+        seat = p.new_tensor([-1.0, 1.0]).repeat(p.shape[0]).unsqueeze(1)
+        h = self.join(p.repeat_interleave(2, 0), pair, seat)
         return (f * h[seg]).sum(1) + self.value_bias, aux
 
     # ------------------------------------------------------------ weight blob

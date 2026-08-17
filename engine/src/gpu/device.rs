@@ -22,7 +22,7 @@ use cudarc::nvrtc;
 
 use crate::board::N_HEXES;
 use crate::gpu::client::{CarryStore, SolveResult};
-use crate::net::{V5Layout, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW, POOL, TYPE};
+use crate::net::{NetLayout, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW, POOL, TYPE};
 use crate::rebel::{CFEAT, GPU_ROW_BYTES, LOOSE, NSLOT, NTYPE, PILE_COUNTS};
 use crate::serialize::TRUNK_CHUNK_ROWS;
 use crate::units::CARD_FEATS;
@@ -244,7 +244,7 @@ impl Default for WeightDev {
 }
 
 struct WeightBank {
-    layout: V5Layout,
+    layout: NetLayout,
     _w: CudaSlice<f32>,
     _b: CudaSlice<f32>,
     _ln: CudaSlice<f32>,
@@ -319,10 +319,10 @@ fn build_kernels(context: &Arc<CudaContext>) -> Result<(Kernels, u32, u32, u32),
             ..Default::default()
         },
     )
-    .map_err(|e| format!("v5 NVRTC: {e:?}"))?;
+    .map_err(|e| format!("NVRTC: {e:?}"))?;
     let module = context
         .load_module(ptx)
-        .map_err(|e| format!("v5 CUDA module: {e:?}"))?;
+        .map_err(|e| format!("CUDA module: {e:?}"))?;
     let kernels = Kernels::load(&module)?;
     let sms = context
         .attribute(
@@ -612,7 +612,7 @@ impl Executor {
         if !direct {
             self.stream
                 .begin_capture(CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-                .map_err(|e| format!("begin v5 CUDA Graph: {e:?}"))?;
+                .map_err(|e| format!("begin CUDA Graph: {e:?}"))?;
         }
         let mut events = if profile && direct {
             Some(Vec::with_capacity(4 * wave.meta.iters + 3))
@@ -721,10 +721,10 @@ impl Executor {
             None
         } else {
             let graph = unsafe { result::stream::end_capture(self.stream.cu_stream()) }
-                .map_err(|e| format!("end v5 CUDA Graph capture: {e:?}"))?;
+                .map_err(|e| format!("end CUDA Graph capture: {e:?}"))?;
             queued?;
             if graph.is_null() {
-                return Err("v5 CUDA Graph capture produced no graph".into());
+                return Err("CUDA Graph capture produced no graph".into());
             }
             let graph = CapturedGraph(graph);
             let (slot, reused) = update_graph(&mut self.graphs, &mut self.next_graph, graph.0)?;
@@ -733,7 +733,7 @@ impl Executor {
         let captured = Instant::now();
         if let Some((slot, _)) = graph {
             unsafe { result::graph::launch(self.graphs[slot].raw, self.stream.cu_stream()) }
-                .map_err(|e| format!("launch v5 CUDA Graph: {e:?}"))?;
+                .map_err(|e| format!("launch CUDA Graph: {e:?}"))?;
         }
 
         Ok(InFlight {
@@ -835,10 +835,8 @@ impl Executor {
         let rows = d.host.rows as usize;
         let cfgs = d.host.ncfg as usize;
         let jobs = d.host.jobs as usize;
-        let queries = 2 * rows;
-
-        // The printed-card tokens: two canonical views per solve, reused by the
-        // trunk stem and by every config in the subgame.
+        // Card descriptions keep both canonical orderings for the config
+        // encoder. The board trunk itself runs only in physical seat-0 space.
         let cards = 2 * jobs * NTYPE;
         launch!(self, d, bank, pack_cards, threads_usize(cards * CARD_FEATS))?;
         gemm(
@@ -892,19 +890,15 @@ impl Executor {
             0.0,
         )?;
 
-        // The trunk is a per-row map, and one row carries 37 hex tokens through
-        // eight residual blocks. Running it in row chunks is what keeps its
-        // working tensors -- most of a wave's memory -- off the exclusive
-        // one-job route.
-        for start in (0..queries).step_by(TRUNK_CHUNK_ROWS) {
-            let n = TRUNK_CHUNK_ROWS.min(queries - start);
+        // One physical row carries 37 hex tokens through the residual trunk.
+        for start in (0..rows).step_by(TRUNK_CHUNK_ROWS) {
+            let n = TRUNK_CHUNK_ROWS.min(rows - start);
             self.trunk(d, bank, start, n)?;
         }
-        // Projecting the board vector into the join's first layer once per
-        // solve is the whole reason that vector is allowed to be wide.
+        // Project the one physical board vector once per solve row.
         gemm(
             &self.blas,
-            queries,
+            rows,
             JW,
             D,
             d.ptr(Arena::P),
@@ -998,7 +992,7 @@ impl Executor {
             start as i32,
             n as i32
         )?;
-        gemm(
+        gemm_exact(
             &self.blas,
             n * NTYPE,
             C,
@@ -1083,15 +1077,7 @@ impl Executor {
             )?;
         }
         let width = 2 * C + LOOSE;
-        launch!(
-            self,
-            d,
-            bank,
-            board_pool,
-            n as u32,
-            start as i32,
-            n as i32
-        )?;
+        launch!(self, d, bank, board_pool, n as u32, start as i32, n as i32)?;
         gemm(
             &self.blas,
             n,
@@ -1434,7 +1420,7 @@ fn update_graph(
     }
     let raw =
         unsafe { result::graph::instantiate(graph, CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY) }
-            .map_err(|e| format!("instantiate v5 CUDA Graph: {e:?}"))?;
+            .map_err(|e| format!("instantiate CUDA Graph: {e:?}"))?;
     let at = if slots.len() < GRAPH_CLASSES {
         slots.push(GraphExec { raw });
         slots.len() - 1
@@ -1455,7 +1441,7 @@ impl WeightBank {
         b: Vec<f32>,
         ln: Vec<f32>,
     ) -> Result<Self, String> {
-        let layout = V5Layout::new(dims)?;
+        let layout = NetLayout::new(dims)?;
         if w.len() != layout.w_len || b.len() != layout.b_len || ln.len() != layout.ln_len {
             return Err(format!(
                 "GPU weight sizes {}/{}/{} do not match {:?} ({}/{}/{})",
@@ -1651,7 +1637,7 @@ impl DeviceWave {
         };
         if std::env::var_os("WARCHEST_GPU_DEBUG").is_some() {
             eprintln!(
-                "v5 wave jobs={} rows={} cfgs={} cells={} arena={} floats offsets={:?} arena_ptr={:p} dev_ptr={:p}",
+                "wave jobs={} rows={} cfgs={} cells={} arena={} floats offsets={:?} arena_ptr={:p} dev_ptr={:p}",
                 host.jobs,
                 host.rows,
                 host.ncfg,
@@ -1914,7 +1900,7 @@ fn arena_layout(w: &Wave) -> Result<([u64; N_ARENAS], usize, std::ops::Range<usi
         0
     };
     let queries = 2 * rows;
-    let chunk = queries.min(TRUNK_CHUNK_ROWS);
+    let chunk = rows.min(TRUNK_CHUNK_ROWS);
     let cards = 2 * jobs * NTYPE * TYPE;
     let hidden = cards.max(cfgs * NSLOT * CFGH);
     let pack = (2 * jobs * NTYPE * CARD_FEATS).max(cfgs * NSLOT * (3 + TYPE));
@@ -1930,8 +1916,8 @@ fn arena_layout(w: &Wave) -> Result<([u64; N_ARENAS], usize, std::ops::Range<usi
         2 * jobs * NTYPE * 3 * POOL,
         cfgs * D,
         cfgs * POOL,
-        queries * D,
-        queries * JW,
+        rows * D,
+        rows * JW,
         queries * POOL,
         rows * JOIN_IN,
         rows * JW,
@@ -2258,14 +2244,51 @@ fn gemm(
     ldc: usize,
     beta: f32,
 ) -> Result<(), String> {
+    gemm_mode(blas, m, n, k, a, lda, b, ldb, c, ldc, beta, blas.fast)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemm_exact(
+    blas: &Blas,
+    m: usize,
+    n: usize,
+    k: usize,
+    a: *const f32,
+    lda: usize,
+    b: *const f32,
+    ldb: usize,
+    c: *mut f32,
+    ldc: usize,
+    beta: f32,
+) -> Result<(), String> {
+    gemm_mode(blas, m, n, k, a, lda, b, ldb, c, ldc, beta, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemm_mode(
+    blas: &Blas,
+    m: usize,
+    n: usize,
+    k: usize,
+    a: *const f32,
+    lda: usize,
+    b: *const f32,
+    ldb: usize,
+    c: *mut f32,
+    ldc: usize,
+    beta: f32,
+    fast: bool,
+) -> Result<(), String> {
     if m == 0 || n == 0 || k == 0 {
         return Ok(());
     }
     let alpha = 1.0f32;
-    let fast = blas.fast;
     static LOG_MODE: Once = Once::new();
     LOG_MODE.call_once(|| {
-        eprintln!("v5 GEMM compute={}", if fast { "fast-f16" } else { "fp32" });
+        eprintln!(
+            "GEMM compute={}",
+            if blas.fast { "fast-f16" } else { "fp32" }
+        );
     });
     let result = if fast {
         use cudarc::cublas::sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F;

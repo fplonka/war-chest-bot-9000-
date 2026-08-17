@@ -9,7 +9,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use crate::actions::Action;
-use crate::board::{board, N_HEXES, N_LOCATIONS, NONE};
+use crate::board::{board, NONE, N_HEXES, N_LOCATIONS};
 use crate::state::*;
 use crate::units::{def, index_of_id, write_card_features, CARD_FEATS, N_UNITS};
 

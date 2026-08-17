@@ -1,4 +1,4 @@
-//! Actor-side handle for the v5 wave executor.
+//! Actor-side handle for the GPU wave executor.
 //!
 //! A submission has one completion. The result already owns the final sparse
 //! strategy, Phase-2 root values, and every retained snapshot belief at every

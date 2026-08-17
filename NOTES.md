@@ -2,43 +2,43 @@
 
 ## What was wrong with v4
 
-v4 spent its compute in the wrong place, and the accounting is not close. CFR
-re-asks every leaf on every iteration, so at depth two, `T=64` a solve makes
-~2,030 board evaluations against ~158,000 belief-conditioned ones. v4 put a
-three-layer 384-wide flat MLP on the board and two 384-wide LayerNorm layers on
-the per-iteration path:
+v4 spent its compute in the wrong place. CFR re-asks every leaf on every
+iteration: at depth two, `T=64` gives about 2,030 physical leaf rows and
+158,000 belief-conditioned row-passes. v4 flattened the 37 hexes into a
+three-layer 384-wide MLP, then put two more 384-wide layers on the repeated
+path. It also assigned dense weights to draft-slot positions, although those
+positions are arbitrary.
 
 | | v4 | v5 |
 |---|---:|---:|
-| board encoder | `1.7%` of network MAC | **`63%`** |
-| per-iteration path | `96.4%` | `33%` |
-| total | `58.0` GMAC/solve | `48.9` |
-| projected throughput | `522` solves/s (measured) | `~620` |
-| parameters | `1.55M` | `0.95M` |
+| parameters | `1,550,177` | `641,796` (`641,505` in the weight blob) |
+| public board | flat, `3 x 384` | 37 tokens, `8 x C96` residual GNN |
+| paired player views | two public trunks | one shared physical trunk |
+| repeated join | `2 x 384`, then per-config MLP | `3 x 128`, then dot product |
+| depth-2 balanced generation | `574.6/s` mature run | `680.8/s` six-minute smoke |
 
 DeepStack, ReBeL, TurboReBeL and Student of Games all avoid this by making the
 infoset an **output index**: one tower per public leaf emits every infoset
 value as one row of the output matrix, so an infoset costs 500-1536 MAC. v4
 charged 33,000 MAC of GEMM plus a GELU per config. We cannot table the output
-rows — the config set is variable, median 22 and p99 567 — so v5 *generates*
-them from a config encoder and reads out with a dot product. That is the only
-structural novelty, and it is the standard open-vocabulary output layer.
+rows — the config set is variable, median 22 and p99 567 — so v5 generates
+them from a config encoder and reads out with a dot product. This keeps the
+output-index economics without assuming a fixed support.
 
 ## The shape
 
 ```
-public state ─► TRUNK (8 hex residual blocks, global pooling) ─► P   once/leaf
-config c ─────► CONFIG ENCODER ─► f(c) readout, g(c) pooling         once/config
-     [Σβ_own g, Σβ_opp g] ─► JOIN (3 blocks, 128 wide) ─► h          every iteration
-                        v(c) = <f(c), h> + bias
+physical state ─► TRUNK (8 hex residual blocks, global pooling) ─► P   once/leaf
+config c ───────► CONFIG ENCODER ─► f(c) readout, g(c) pooling      once/config
+ [Σβ_own g, Σβ_opp g, seat] ─► JOIN (3 blocks, 128 wide) ─► h       every iteration
+                             v(c) = <f(c), h> + bias
 ```
 
-Widths: `TYPE=64, C=128, BLOCKS=8, D=256, POOL=64, CFGH=128, JW=128,
-JBLOCKS=3`. The trunk is KataGo-shaped — pre-activation residual blocks over
-the board's own hex adjacency with a global-pooling bias in *every* block
-(pooling is KataGo's second-largest measured ablation at `1.60x`, and it costs
-`1.8%` of a block). `join_p(P)` is cached once per solve, which is what lets
-the board vector be wide.
+Widths: `TYPE=64, C=96, BLOCKS=8, D=256, POOL=64, CFGH=128, JW=128,
+JBLOCKS=3`. The trunk is KataGo-shaped: pre-activation residual blocks over
+the board's own hex adjacency, with a global-pooling bias in every block.
+`join_p(P)` is cached once per physical leaf, which keeps the repeated path
+small while the board vector stays wide.
 
 ### The central bet to test
 
@@ -60,7 +60,7 @@ order into a dense layer, so the same unit got different weights depending on
 the draft. That partly undid the card describer built to avoid exactly this.
 
 v5 treats the ten coin types as a set of tokens described by their printed card
-facts, with no unit-identity embedding at all. The first draft of v5 still
+facts, with no unit-identity embedding at all. The first draft still
 failed the check — measured `2.1e-2` against a value spread of `4.2e-2`, half
 the signal — because the belief's raw count marginals were fed to the join as
 30 numbers through a dense layer with per-slot weights.
@@ -88,6 +88,25 @@ end of the game the row came from. This is Go ownership, which is KataGo's
 largest measured ablation (`1.65x` with score), and it is a genuine
 decomposition of the outcome here: you win by getting all six markers down.
 Training only — it is not in the weight blob and the engine never runs it.
+
+## Trained-weight audit
+
+The twelve-hour v4 checkpoint has no dead input group or frozen layer. The
+first public matrix gives comparable RMS weight to hex facts (`0.186`) and unit
+tokens (`0.188`); the repeated context gives comparable weight to public state
+(`0.160`), own belief (`0.166`) and opponent belief (`0.148`). Its public
+matrices still have effective ranks `337`, `240`, `195`, and every major matrix
+moved another `0.006-0.033` RMS in the final two hours. The plateau is
+therefore not a dropped input, rank collapse or stopped optimiser. It is the
+cost and sample inefficiency of relearning board geometry through a flat map,
+while bootstrapped targets keep moving.
+
+After four ReBeL minutes, every v5 spatial block has moved from its warm
+checkpoint. Their effective ranks are `74-86` of 96; all three join blocks are
+`98-99` of 128. The depth is active rather than decorative. The same smoke
+sustained `680.8` balanced depth-two solves/s with no dropped or exclusive
+work; CPU/Torch blob parity is `1.83e-6` relative and slot permutation changes
+values by at most `6.68e-6`.
 
 ## Deliberately not done
 

@@ -1,4 +1,4 @@
-// v5 contiguous-wave kernels. The generated preamble supplies the network
+// Contiguous-wave CUDA kernels. The generated preamble supplies the network
 // shape and the board's geometry. Every tree/config/cell address below is
 // already wave-global; kernels never recover a solve owner in their hot loops.
 
@@ -17,7 +17,7 @@ namespace cg = cooperative_groups;
 /// branch-free.
 #define HEX_STRIDE (N_HEXES + 1)
 
-static_assert(JOIN_IN == 2 * POOL, "the join input is the two pooled beliefs");
+static_assert(JOIN_IN == 2 * POOL + 1, "join input is two beliefs and one seat");
 static_assert(HEX_FACTS == 6, "hex_facts writes the six frozen per-hex facts");
 static_assert(LOOSE == 15, "loose_feature writes two player blocks and three globals");
 
@@ -332,22 +332,19 @@ extern "C" __global__ void cards_finish(const WaveDev* w, const WeightDev* wt) {
 
 // -------------------------------------------------------------------- trunk
 
-/// One coin-type token per view row: the printed card, this row's pile counts,
-/// and the owning seat. `pile` is four inputs wide, so applying it here is
-/// cheaper than packing a buffer for cuBLAS.
+/// One coin-type token per physical row: printed card, pile counts and seat.
 extern "C" __global__ void tokens(const WaveDev* w, const WeightDev* wt,
-                                  int qrow0, int n) {
+                                  int row0, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n * NTYPE * TYPE) return;
     int j = i % TYPE;
     int t = (i / TYPE) % NTYPE;
-    int qrow = qrow0 + i / (NTYPE * TYPE);
-    int row = qrow >> 1, view = qrow & 1;
+    int row = row0 + i / (NTYPE * TYPE);
     int job = TP(w, unsigned int, T_ROW_JOB)[row];
     const unsigned char* pile =
-        raw_row(w, row) + GR_PILES + physical_type(view, t) * PILE_COUNTS;
+        raw_row(w, row) + GR_PILES + physical_type(0, t) * PILE_COUNTS;
     float v = AP(w, A_CARDS)
-            [(((unsigned long long)job * 2 + view) * NTYPE + t) * TYPE + j]
+            [((unsigned long long)job * 2 * NTYPE + t) * TYPE + j]
         + wt->seat[(t / NSLOT) * TYPE + j];
     #pragma unroll
     for (int f = 0; f < PILE_COUNTS; f++)
@@ -355,26 +352,28 @@ extern "C" __global__ void tokens(const WaveDev* w, const WeightDev* wt,
     AP(w, A_TOK)[i] = v;
 }
 
-/// The trunk stem, one block per canonical view row: hex facts, the occupant's
-/// projected token, the position embedding and the global bias.
+/// The trunk stem, one block per physical row. The global term pools every
+/// projected type token, so piles remain visible before a unit reaches board.
 extern "C" __global__ void stem(const WaveDev* w, const WeightDev* wt,
-                                 int qrow0) {
+                                 int row0) {
     int local = blockIdx.x;
-    int qrow = qrow0 + local;
-    int row = qrow >> 1, view = qrow & 1;
+    int row = row0 + local;
     const unsigned char* src = raw_row(w, row);
     __shared__ float facts[N_HEXES * HEX_FACTS];
     __shared__ int occupant[N_HEXES];
     __shared__ float glob[C];
     __shared__ float loose[LOOSE];
     for (int h = threadIdx.x; h < N_HEXES; h += blockDim.x)
-        hex_facts(src, view, h, &facts[h * HEX_FACTS], &occupant[h]);
+        hex_facts(src, 0, h, &facts[h * HEX_FACTS], &occupant[h]);
     for (int f = threadIdx.x; f < LOOSE; f += blockDim.x)
-        loose[f] = loose_feature(src, view, f);
+        loose[f] = loose_feature(src, 0, f);
     __syncthreads();
     for (int j = threadIdx.x; j < C; j += blockDim.x) {
         float v = 0.0f;
         for (int f = 0; f < LOOSE; f++) v += wt->glob_stem_w[f * C + j] * loose[f];
+        for (int t = 0; t < NTYPE; t++)
+            v += gelu(AP(w, A_TS)[((unsigned long long)local * NTYPE + t) * C + j])
+               / (float)NTYPE;
         glob[j] = v;
     }
     __syncthreads();
@@ -464,7 +463,7 @@ extern "C" __global__ void block_out(const WaveDev* w, const WeightDev* wt,
 
 /// Normalise the final trunk output in shared memory and pool it directly.
 extern "C" __global__ void board_pool(const WaveDev* w, const WeightDev* wt,
-                                      int qrow0, int n) {
+                                      int row0, int n) {
     __shared__ float a[N_HEXES * C];
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
@@ -492,17 +491,17 @@ extern "C" __global__ void board_pool(const WaveDev* w, const WeightDev* wt,
             }
             out[j] = j < C ? sum / (float)N_HEXES : top;
         } else {
-            int qrow = qrow0 + r;
-            out[j] = loose_feature(raw_row(w, qrow >> 1), qrow & 1, j - 2 * C);
+            int row = row0 + r;
+            out[j] = loose_feature(raw_row(w, row), 0, j - 2 * C);
         }
     }
 }
 
 extern "C" __global__ void board_bias(const WaveDev* w, const WeightDev* wt,
-                                       int qrow0, int n) {
+                                       int row0, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n * D) return;
-    AP(w, A_P)[(unsigned long long)qrow0 * D + i] += wt->board_b[i % D];
+    AP(w, A_P)[(unsigned long long)row0 * D + i] += wt->board_b[i % D];
 }
 
 // ----------------------------------------------------------- config encoder
@@ -784,15 +783,20 @@ extern "C" __global__ void join_input(const WaveDev* w, const WeightDev* wt,
     if (i >= rows * width) return;
     int j = i % width, r = i / width;
     int q = 2 * r + traverser;
-    if (j < JOIN_IN) {
+    if (j < 2 * POOL) {
         int side = j < POOL ? q : q ^ 1;
         AP(w, A_JIN)[(unsigned long long)r * JOIN_IN + j] =
             AP(w, A_POOLED)[(unsigned long long)side * POOL + j % POOL];
         return;
     }
+    if (j < JOIN_IN) {
+        AP(w, A_JIN)[(unsigned long long)r * JOIN_IN + j] =
+            traverser ? 1.0f : -1.0f;
+        return;
+    }
     j -= JOIN_IN;
     AP(w, A_Z)[(unsigned long long)r * JW + j] =
-        AP(w, A_JP)[(unsigned long long)q * JW + j] + wt->join_b_b[j];
+        AP(w, A_JP)[(unsigned long long)r * JW + j] + wt->join_b_b[j];
 }
 
 /// One join residual block's pre-activation. The block's bias does not depend
@@ -822,7 +826,7 @@ extern "C" __global__ void join_finish(const WaveDev* w, const WeightDev* wt,
     float* z = AP(w, A_Z) + (unsigned long long)row * JW;
     norm_row<JW, true>([&](int j) { return z[j]; }, z, wt->jout_lnw,
                        wt->jout_lnb, lane);
-    const float* p = AP(w, A_P) + (unsigned long long)(2 * row + traverser) * D;
+    const float* p = AP(w, A_P) + (unsigned long long)row * D;
     float* h = AP(w, A_H) + (unsigned long long)row * D;
     for (int j = lane; j < D; j += 32) h[j] = p[j] + wt->join_out_b[j];
 }

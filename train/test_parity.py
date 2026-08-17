@@ -1,9 +1,7 @@
-"""Parity between the PyTorch and Rust v5 forwards, and the slot invariance
-both of them owe the draft.
+"""Parity between the PyTorch and Rust forwards, slot invariance, and complete
+public-input coverage.
 
-Two tests, both on random weights so that neither can pass by accident:
-
-* **Blob parity.** `Net.flat()` writes the flat weight blob and `V5Layout::new`
+* **Blob parity.** `Net.flat()` writes the flat weight blob and `NetLayout::new`
   reads it back, so its ordering is a contract between two independent
   implementations. A transposed matrix, a bias attached to the wrong layer or a
   LayerNorm applied out of turn shows up here and nowhere else until a training
@@ -20,6 +18,10 @@ Two tests, both on random weights so that neither can pass by accident:
   that caught raw belief marginals entering the join through a per-slot dense
   layer, which cost half the value signal. It runs against torch only: parity
   above carries it over to Rust.
+
+* **Off-board piles.** A drafted unit's public piles matter before its first
+  deployment. Changing those counts must move the value even when no matching
+  coin occupies a hex.
 
     python train/test_parity.py
 """
@@ -191,6 +193,23 @@ def slot_invariance(net, rng, perms=6):
     print(f"slot invariance ok: worst {worst:.3e}, {worst / spread:.1e} of the "
           f"value spread ({spread:.3e})")
 
+def offboard_pile_visibility(net, rng):
+    """Every type's public piles reach the trunk, occupied or not."""
+    sizes = [1, 1]
+    xpub = public_rows(rng, len(sizes))
+    hexes = xpub[:, :N_HEXES * HEX_CH].reshape(len(sizes), N_HEXES, HEX_CH)
+    hexes[:, :, HEX_FACTS] = 0.0
+    seg, phi, weight = belief(rng, sizes)
+    base, base_aux = run(net, xpub, phi, weight, seg, len(sizes))
+    changed = xpub.copy()
+    pile = OFF_PILES
+    changed[0, pile:pile + PILE_COUNTS] += 2.0
+    got, got_aux = run(net, changed, phi, weight, seg, len(sizes))
+    movement = max(float(np.max(np.abs(got - base))),
+                   float(np.max(np.abs(got_aux - base_aux))))
+    assert movement > 1e-5, "an off-board unit's piles are invisible"
+    print(f"off-board pile visibility ok: movement {movement:.3e}")
+
 
 def main():
     rng = np.random.default_rng(11)
@@ -198,6 +217,7 @@ def main():
     net.push(0)
     blob_parity(net, rng)
     slot_invariance(net, rng)
+    offboard_pile_visibility(net, rng)
 
 
 if __name__ == "__main__":

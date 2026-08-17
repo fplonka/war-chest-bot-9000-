@@ -32,7 +32,7 @@
 //!     subgame root values, one per config in each player's belief support.
 
 use crate::actions::{Action, Play};
-use crate::board::{board, N_HEXES, N_LOCATIONS, NONE};
+use crate::board::{board, NONE, N_HEXES, N_LOCATIONS};
 use crate::gpu::GpuClient;
 use crate::rebel::*;
 use crate::rng::Rng;

@@ -176,25 +176,26 @@ solves.
 ## 5. The value network
 
 `train/value_net.py` defines it; `engine/src/net.rs` runs it. The shape is
-fixed: `dims` is `MODEL_TAG = [5]` and `V5Layout::new` refuses anything else, so
+fixed: `dims` is `MODEL_TAG = [5]` and `NetLayout::new` refuses anything else, so
 the job contract carries it as a version tag rather than as a set of widths,
 and there is no checkpoint from another architecture to accommodate.
 `Net.flat()` writes the flat arrays that `set_weights` and
-`export_weights.py` ship, `V5Layout::new` reads them back, and
+`export_weights.py` ship, `NetLayout::new` reads them back, and
 `train/test_parity.py` holds the two implementations to the same answers.
 
 ### The pieces, split by how often CFR runs them
 
 CFR re-asks every leaf of the subgame on every iteration. At depth 2 and `T=64`
-a solve has ~1,015 leaves — 2,030 canonical rows, two seat views of each — and
-runs the join 78 times, so ~2,030 board evaluations against ~158,000
-belief-conditioned ones. Capacity goes where it is amortised and the
-per-iteration path stays thin.
+a solve has ~1,015 leaves and runs the join 78 times for each of the two seat
+views, so ~1,015 board evaluations against ~158,000 belief-conditioned ones.
+Capacity goes where it is amortised and the per-iteration path stays thin. The
+trunk sees the physical board, which is the same for both seats; what makes a
+view is the belief order and the seat scalar the join reads.
 
 | piece | runs | produces |
 |---|---|---|
 | card describer, `Net::cards` | twice per solve | one token per coin type |
-| trunk, `Net::board` | once per leaf per solve | the board vector `P` |
+| trunk, `Net::board` | once per physical leaf per solve | the board vector `P` |
 | config encoder, `Net::configs` | once per distinct config | `f(c)`, `g(c)` |
 | join, `Net::join` | every CFR iteration | `h` |
 | readout, `Net::values` | every CFR iteration | `v(c) = <f(c), h> + bias` |
@@ -207,18 +208,18 @@ the readout is a dot product. That is the only structural novelty, and it is the
 standard open-vocabulary output layer.
 
 `join_p(P)` does not move between iterations, so it is projected once per leaf
-(`Net::join_cache`); that is what pays for a wide board vector. 63% of the
-network's multiply-accumulates sit in the trunk, which runs once per leaf, and
-33% on the per-iteration path. The whole network is 0.95M parameters and a
-projected 48.9 GMAC per depth-2 `T=64` solve.
+(`Net::join_cache`); that is what pays for a wide board vector. Most of the
+network's multiply-accumulates sit in the trunk, which runs once per physical
+leaf, and the rest on the per-iteration path. The blob is `641,505` weights;
+the training-only ownership head adds `291` more.
 
 ```text
 TYPE    64   coin-type token width    D        256  board vector, readout width
-C       128  hex channel width        POOL     64   pooled config embedding
+C       96   hex channel width        POOL     64   pooled config embedding
 BLOCKS  8    trunk residual blocks    CFGH     128  config encoder hidden width
 JW      128  join width               JBLOCKS  3    join residual blocks
-JOIN_IN = 2 * POOL = 128  the only thing that moves between iterations
-MODEL_TAG = [5]           the only accepted `dims`
+JOIN_IN = 2 * POOL + 1 = 129  both beliefs and the seat, per iteration
+MODEL_TAG = [5]               the only accepted `dims`
 ```
 
 ### The card describer
@@ -319,7 +320,7 @@ other seat is `q ^ 1`.
   v(c) = <f(c), h> + value_bias
 ```
 
-Everything a belief does to a value happens in those `JOIN_IN = 128` numbers and
+Everything a belief does to a value happens in those `JOIN_IN = 129` numbers and
 three 128-wide blocks. A dot-product readout has no output matrix to shrink, so
 the small initialisation lands on the config side instead: `cfg_f` starts at
 `std 1e-3` and every value starts at the bias.
@@ -336,7 +337,7 @@ beliefs internally — only the network's view of it.
 
 ### The flat blob
 
-`V5Layout::new` is the definition and `Net.flat()` writes it. Linear matrices are
+`NetLayout::new` is the definition and `Net.flat()` writes it. Linear matrices are
 `[in, out]` row-major, embeddings `[n, width]`.
 
 ```text

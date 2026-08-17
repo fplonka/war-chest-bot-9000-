@@ -1,7 +1,7 @@
 //! Invariant test: many seeded random playouts, checking conservation and
 //! structural invariants after every action.
 
-use warchest::board::{board, N_HEXES, N_LOCATIONS, NONE};
+use warchest::board::{board, NONE, N_HEXES, N_LOCATIONS};
 use warchest::rng::Rng;
 use warchest::selfplay::make_game;
 use warchest::state::{Cont, State, BLACK, WHITE, Z_INFLIGHT};

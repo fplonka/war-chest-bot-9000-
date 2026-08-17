@@ -42,7 +42,7 @@ use warchest::Action;
 fn random_net(seed: u64) -> Net {
     let mut r = Rng::new(seed);
     let dims = warchest::net::MODEL_TAG;
-    let layout = warchest::net::V5Layout::new(&dims).unwrap();
+    let layout = warchest::net::NetLayout::new(&dims).unwrap();
     let mut draw = |n: usize, scale: f32| -> Vec<f32> {
         (0..n)
             .map(|_| (r.unit_f64() as f32 - 0.5) * scale)

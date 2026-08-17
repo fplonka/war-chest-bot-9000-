@@ -20,7 +20,7 @@
 
 use crate::actions::Action;
 use crate::board::N_HEXES;
-use crate::net::{V5Layout, C, CFGH, D, JOIN_IN, JW, POOL, TYPE};
+use crate::net::{NetLayout, C, CFGH, D, JOIN_IN, JW, POOL, TYPE};
 use crate::rebel::Config;
 use crate::rebel::{CFEAT, GPU_ROW_BYTES, LOOSE, NSLOT, NTYPE};
 use crate::search::{Cfr, Solver};
@@ -484,16 +484,15 @@ pub(crate) fn device_value_layout(t: &PackedTables) -> Option<([Vec<u32>; 2], us
     Some((base, lengths[0].max(lengths[1])))
 }
 
-/// The trunk is a per-row map, so the device runs it in chunks of this many
-/// canonical view rows. A row carries 37 hex tokens through eight residual
-/// blocks, which is ~85 KiB of working tensors per row -- by far the widest
-/// thing a wave touches. 4,096 rows amortises the 54 launches in each chunk
-/// while adding 305 MiB per lane over the old 512-row chunk.
+/// The trunk runs physical rows in chunks. Its 37 hex tokens and eight
+/// residual blocks need about 64 KiB of scratch per row, by far the widest
+/// live part of a wave. 4,096 rows amortises its 51 launches while adding
+/// about 224 MiB per lane over a 512-row chunk.
 pub const TRUNK_CHUNK_ROWS: usize = 4096;
 
 fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
     let t = &job.tables;
-    let Ok(_l) = V5Layout::new(&job.meta.net_dims) else {
+    let Ok(_l) = NetLayout::new(&job.meta.net_dims) else {
         return usize::MAX;
     };
     let (rows, cfgs, cells) = (t.rows, t.ncfg, t.ncells);

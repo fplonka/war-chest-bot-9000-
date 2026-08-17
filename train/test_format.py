@@ -106,14 +106,14 @@ def main():
     b = make_batch(tr, rng, dev)
     xpub, phi, w, seg, y, owner, nseg = b
     assert xpub.shape == (2 * len(tr[0]), PUBFEAT), xpub.shape
-    assert owner.shape == (2 * len(tr[0]), N_LOCATIONS), owner.shape
+    assert owner.shape == (len(tr[0]), N_LOCATIONS), owner.shape
     assert (owner < 3).all(), "the auxiliary target is not a three-way label"
     assert phi.shape[1] == CFEAT
     assert seg.max() == 2 * len(tr[0]) - 1
     assert nseg == 2 * len(tr[0])
     assert torch.isfinite(xpub).all() and torch.isfinite(y).all()
-    trows, taux, tcc, tcp = tr[:4]
-    mirror.self_check_rows(trows, taux, tcc, tcp, tr[-1])
+    trows, tcc, tcp = tr[0], tr[2], tr[3]
+    mirror.self_check_rows(trows, tcc, tcp, tr[-1])
     mirror.self_check(xpub[0::2].numpy())
     print(f"      batch {xpub.shape} aux {owner.shape} phi {phi.shape}", flush=True)
 
