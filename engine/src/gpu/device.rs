@@ -221,7 +221,6 @@ struct WeightDev {
     cfg_f_b: *const f32,
     cfg_g_b: *const f32,
     join_b_b: *const f32,
-    join_w_b: [*const f32; JBLOCKS],
     join_lnw: [*const f32; JBLOCKS],
     join_lnb: [*const f32; JBLOCKS],
     jout_lnw: *const f32,
@@ -248,6 +247,10 @@ struct WeightBank {
     _w: CudaSlice<f32>,
     _b: CudaSlice<f32>,
     _ln: CudaSlice<f32>,
+    /// The join blocks' matrices with their bias appended as a `JW + 1`-th
+    /// row. The pre-activation carries a constant `1`, so the GEMM adds the
+    /// bias and the residual stream is written once per block.
+    _join_w: CudaSlice<f32>,
     dev: CudaSlice<WeightDev>,
 }
 
@@ -1260,7 +1263,7 @@ impl Executor {
             JW,
             1.0,
         )?;
-        for (i, span) in l.join_w.iter().enumerate() {
+        for i in 0..JBLOCKS {
             launch!(
                 self,
                 d,
@@ -1274,10 +1277,10 @@ impl Executor {
                 &self.blas,
                 rows,
                 JW,
-                JW,
+                JW + 1,
                 d.ptr(Arena::Jt),
-                JW,
-                bank.w_ptr(span.w),
+                JW + 1,
+                bank.join_w_ptr(i),
                 JW,
                 d.ptr_mut(Arena::Z),
                 JW,
@@ -1490,26 +1493,36 @@ impl WeightBank {
         d.cfg_f_b = ba(layout.cfg_f.b);
         d.cfg_g_b = ba(layout.cfg_g.b);
         d.join_b_b = ba(layout.join_b.b);
-        for (i, span) in layout.join_w.iter().enumerate() {
-            d.join_w_b[i] = ba(span.b);
+        for i in 0..JBLOCKS {
             (d.join_lnw[i], d.join_lnb[i]) = ln_pair(2 * BLOCKS + 2 + i);
         }
         (d.jout_lnw, d.jout_lnb) = ln_pair(2 * BLOCKS + 2 + JBLOCKS);
         (d.h_lnw, d.h_lnb) = ln_pair(2 * BLOCKS + 3 + JBLOCKS);
         d.join_out_b = ba(layout.join_out.b);
         d.value_bias = ba(layout.value_bias);
+        let mut join_w = Vec::with_capacity(JBLOCKS * (JW + 1) * JW);
+        for span in &layout.join_w {
+            join_w.extend_from_slice(&w[span.w..span.w + JW * JW]);
+            join_w.extend_from_slice(&b[span.b..span.b + JW]);
+        }
+        let jw = htod(stream, &join_w)?;
         let dev = htod(stream, &[d])?;
         Ok(Self {
             layout,
             _w: wb,
             _b: bb,
             _ln: lb,
+            _join_w: jw,
             dev,
         })
     }
 
     fn w_ptr(&self, off: usize) -> *const f32 {
         unsafe { ptr(self.dev.stream(), &self._w).add(off) }
+    }
+
+    fn join_w_ptr(&self, block: usize) -> *const f32 {
+        unsafe { ptr(self.dev.stream(), &self._join_w).add(block * (JW + 1) * JW) }
     }
 }
 
@@ -1921,7 +1934,7 @@ fn arena_layout(w: &Wave) -> Result<([u64; N_ARENAS], usize, std::ops::Range<usi
         queries * POOL,
         rows * JOIN_IN,
         rows * JW,
-        rows * JW,
+        rows * (JW + 1),
         rows * D,
         roots,
         (carry_snaps * w.snapshot_configs).div_ceil(2),

@@ -507,7 +507,7 @@ fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
     };
     let mul = |a: usize, b: usize| a.saturating_mul(b);
     let queries = mul(2, rows);
-    let chunk = queries.min(TRUNK_CHUNK_ROWS);
+    let chunk = rows.min(TRUNK_CHUNK_ROWS);
     let cards = mul(2 * NTYPE, TYPE);
     let hidden = cards.max(mul(mul(cfgs, NSLOT), CFGH));
     let pack = mul(2 * NTYPE, CARD_FEATS).max(mul(mul(cfgs, NSLOT), 3 + TYPE));
@@ -523,12 +523,12 @@ fn device_arena_bytes(job: &PackedJob, vals: usize, reach: usize) -> usize {
         mul(2 * NTYPE, 3 * POOL),
         mul(cfgs, D),
         mul(cfgs, POOL),
-        mul(queries, D),
-        mul(queries, JW),
+        mul(rows, D),
+        mul(rows, JW),
         mul(queries, POOL),
         mul(rows, JOIN_IN),
         mul(rows, JW),
-        mul(rows, JW),
+        mul(rows, JW + 1),
         mul(rows, D),
         roots,
         mul(carry_snaps, t.snapshot_configs).div_ceil(2),

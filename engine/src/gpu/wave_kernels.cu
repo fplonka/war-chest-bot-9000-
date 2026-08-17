@@ -163,7 +163,6 @@ typedef struct {
     const float* cfg_f_b;
     const float* cfg_g_b;
     const float* join_b_b;
-    const float* join_w_b[JBLOCKS];
     const float* join_lnw[JBLOCKS];
     const float* join_lnb[JBLOCKS];
     const float* jout_lnw;
@@ -799,20 +798,19 @@ extern "C" __global__ void join_input(const WaveDev* w, const WeightDev* wt,
         AP(w, A_JP)[(unsigned long long)r * JW + j] + wt->join_b_b[j];
 }
 
-/// One join residual block's pre-activation. The block's bias does not depend
-/// on the GEMM, so it goes onto the residual stream here and the GEMM
-/// accumulates straight onto `z`.
+/// One join residual block's pre-activation. The block's bias is the last row
+/// of the matrix the GEMM then applies, so the activation carries a constant
+/// `1` and the residual stream is written once instead of twice.
 extern "C" __global__ void join_block(const WaveDev* w, const WeightDev* wt,
                                        int block, int rows) {
     int lane = threadIdx.x & 31;
     int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     if (row >= rows) return;
-    float* z = AP(w, A_Z) + (unsigned long long)row * JW;
-    float* t = AP(w, A_JT) + (unsigned long long)row * JW;
+    const float* z = AP(w, A_Z) + (unsigned long long)row * JW;
+    float* t = AP(w, A_JT) + (unsigned long long)row * (JW + 1);
     norm_row<JW, true>([&](int j) { return z[j]; }, t, wt->join_lnw[block],
                        wt->join_lnb[block], lane);
-    const float* bias = wt->join_w_b[block];
-    for (int j = lane; j < JW; j += 32) z[j] += bias[j];
+    if (lane == 0) t[JW] = 1.0f;
 }
 
 /// The last join normalisation, and the seed of `h` = `P[q]` plus the output

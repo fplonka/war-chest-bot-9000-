@@ -242,7 +242,7 @@ impl LiveGame {
             relay,
         };
         if !relay {
-            g.auto_advance()?;
+            g.auto_advance(draft.py())?;
         }
         Ok(g)
     }
@@ -273,7 +273,7 @@ impl LiveGame {
     fn human_move(&mut self, py: Python<'_>, action: &Bound<'_, PyDict>) -> PyResult<PyObject> {
         let a = action_from_dict(action)?;
         self.human_decide(a)?;
-        self.auto_advance()?;
+        self.auto_advance(py)?;
         self.snapshot(py)
     }
 
@@ -293,7 +293,7 @@ impl LiveGame {
         if self.s.is_terminal() || self.s.is_chance() || self.s.to_act() != self.agent {
             return err("the relay is not at its agent decision");
         }
-        let action = self.agent_decide()?;
+        let action = self.agent_decide(py)?;
         let out = PyDict::new_bound(py);
         out.set_item("code", action.encode())?;
         out.set_item("belief", belief_rows(&self.bel[self.agent as usize]))?;
@@ -386,7 +386,7 @@ impl LiveGame {
 
     /// Solve the subgame at the current PBS and act with the CFR average
     /// strategy, exactly as evaluation does in `selfplay::play_game`.
-    fn agent_decide(&mut self) -> PyResult<Action> {
+    fn agent_decide(&mut self, py: Python<'_>) -> PyResult<Action> {
         let player = self.agent;
         let cfgs = self.bel[player as usize].cfg.clone();
         let truth = true_config(&self.s, player, &self.ctx);
@@ -427,7 +427,10 @@ impl LiveGame {
         let policy = if let Some(client) = client {
             let roots = vec![[bel[0].p.clone(), bel[1].p.clone()]];
             let (job, tree) = crate::serialize::PackedJob::from_solver_with_walk(&sv, &roots);
-            match client.submit(job).and_then(|handle| handle.wait()) {
+            // The service batches every other relay game that submits while
+            // this one waits, so the GIL must be released: a hundred games in
+            // flight is what turns a relayed ladder from serial into a wave.
+            match py.allow_threads(|| client.submit(job).and_then(|handle| handle.wait())) {
                 Ok(result) => RootPolicy::from_gpu(tree, result, player as usize),
                 Err(error) => {
                     eprintln!("GPU relay solve failed; retrying on CPU: {error}");
@@ -513,7 +516,7 @@ impl LiveGame {
 
     /// Resolve pending draws and play the agent's decisions until the next
     /// decision belongs to the human, or the game ends.
-    fn auto_advance(&mut self) -> PyResult<()> {
+    fn auto_advance(&mut self, py: Python<'_>) -> PyResult<()> {
         loop {
             if self.s.is_terminal() {
                 return Ok(());
@@ -523,7 +526,7 @@ impl LiveGame {
                 continue;
             }
             if self.s.to_act() == self.agent {
-                self.agent_decide()?;
+                self.agent_decide(py)?;
                 continue;
             }
             return Ok(());
