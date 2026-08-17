@@ -194,6 +194,22 @@ The per-iteration join path is therefore the larger half at about `46%`, and a
 third of the device's time sits in five kernels that only move `128`-wide rows
 in and out of the arena.
 
+### What paid, and what is left
+
+The join blocks' bias moved into the matrix the GEMM already applies, as its
+`JW + 1`-th row against a constant `1` in the pre-activation: `471.5` against
+`453.3 solves/s` on the matched stream, `+4.0%`, which is the second write of
+the residual stream per block disappearing. The same trick fits `join_input`
+and `join_finish` and is worth about as much again.
+
+What is left after that is the two sweeps at `11.8%`, which walk their
+reverse-gather rows one thread per row and so read uncoalesced, and the readout
+at `8.1%`, which re-reads `f(c)` per leaf and per config where the interned pool
+would allow one batched GEMM per support. Beyond those, `600/s` at depth two
+wants the network cheaper rather than the kernels tighter -- the trunk does
+`8.3` MMAC per leaf row against v3's `0.8`, which is exactly why v3 ran at
+`1200/s`.
+
 ### The fused trunk, measured and reverted
 
 The eight residual blocks used to run as six kernels each, moving about `1.4 MB`
