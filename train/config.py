@@ -25,7 +25,7 @@ class Cfg:
     recent_frac: float = 0.2
     cap: int = 2_000_000
     cfgs_per_row: int = 48
-    depth: int = 1
+    depth: int = 2
     iters: int = 64
     cfr: str = "dcfr"
     explore: float = 0.25
