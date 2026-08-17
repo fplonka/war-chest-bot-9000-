@@ -267,7 +267,10 @@ fast; those it loses are spread evenly over depth, not concentrated in the deep
 ones. Spend the time on more games instead.
 
 Together these took generation from 300 random games in 65 seconds to the same
-300 in 5.3 seconds, for 1.4% fewer positions.
+300 in 5.3 seconds, for 1.4% fewer positions. On the box, where the sweep has
+seventy-two cores to spread over instead of eight, random play generates about
+`107` games a second — 8,000 games, and the 2,149 positions worth keeping out
+of them, in 75 seconds.
 
 Under self-play the proof is no longer the limit at all: the cards are, which
 is where the cost belongs. There the dial that matters is how many games are in
