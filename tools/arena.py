@@ -341,8 +341,10 @@ def generate(paths, games, seed, concurrent, devices, out_dir,
 
     A position is kept when the side to move wins whatever the other does —
     within `depth` plies, and against every hand the opponent could be holding.
-    The quota per difficulty bucket stops the set filling with the easy ones,
-    which are far more common than the hard ones.
+    The quota is per hardness band — what share of the legal moves keep the win,
+    crossed with whether any hidden information is left — because without one
+    the set fills with positions where most moves win, and those are far more
+    common than the sharp ones and tell you much less.
 
     `budget` caps the nodes one proof may build. It never lets an unproven
     position through — it only decides which positions are cheap enough to
@@ -385,7 +387,7 @@ def generate(paths, games, seed, concurrent, devices, out_dir,
         for _, winner, plies, wins, moves, size, position in table.harvest(
                 batch, min_plies, depth, WIN_MARKERS - 2, budget):
             proven += 1
-            key = (min(wins, 4), size > 1)
+            key = (band(wins, moves), size > 1)
             if position in seen or taken.get(key, 0) >= per_bucket:
                 continue
             seen.add(position)
@@ -431,11 +433,11 @@ def generate(paths, games, seed, concurrent, devices, out_dir,
     publish()
     print(f"\n{len(questions)} questions from {games} games between "
           f"{' and '.join(b.name for b in bots)}")
-    print(f"{'winning moves':>14} {'known':>7} {'hidden':>7}")
-    for w in (1, 2, 3, 4):
-        k, h = taken.get((w, False), 0), taken.get((w, True), 0)
+    print(f"{'moves that win':>14} {'known':>7} {'hidden':>7}")
+    for name, _, _ in SHARES:
+        k, h = taken.get((name, False), 0), taken.get((name, True), 0)
         if k or h:
-            print(f"{'4+' if w == 4 else w:>14} {k:>7} {h:>7}")
+            print(f"{name:>14} {k:>7} {h:>7}")
     plies = collections.Counter(q["depth"] for q in questions)
     print(f"{'plies to win':>14} {'count':>7}")
     for d in sorted(plies):
@@ -589,6 +591,12 @@ def devices(spec):
 #: of them are, however deep the win is.
 SHARES = [("under 10%", 0.0, 0.10), ("10-25%", 0.10, 0.25),
           ("25-50%", 0.25, 0.50), ("over 50%", 0.50, 1.0)]
+
+
+def band(wins, moves):
+    """Which hardness band a position falls in."""
+    share = wins / moves
+    return next(n for n, lo, hi in SHARES if lo < share <= hi)
 
 
 def buckets(title, rows):
