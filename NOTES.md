@@ -89,6 +89,28 @@ largest measured ablation (`1.65x` with score), and it is a genuine
 decomposition of the outcome here: you win by getting all six markers down.
 Training only — it is not in the weight blob and the engine never runs it.
 
+**It is dead in the ReBeL phase, and the logs say so plainly.** Through the
+Greedy warm-up the head learns: cross-entropy `0.90 -> 0.45`, accuracy
+`0.62 -> 0.80`. Ten seconds into ReBeL it reads `0.029/0.986`, and from the next
+epoch to the end of a thirty-minute run it reads `0.00013` at accuracy exactly
+`1.000`, every epoch.
+
+The cause is where the label comes from. `selfplay.rs::push_row` writes the
+ownership *at the solve site* and `backfill_owners` replaces it with the
+finished game's ownership only if that game ends before its rows are detached.
+Greedy warm-up generates whole games, so its labels are the real end state and
+the target is a real prediction. A streaming depth-two ReBeL game takes minutes,
+so its rows are detached mid-game and keep the solve-site label — and each
+location's current marker owner is a *raw input feature* of the row the head
+reads. The head learns the identity map, and `aux_weight = 0.15` of the loss
+buys nothing for the whole run that matters.
+
+The cheap fix is a per-row bit set by `backfill_owners`, with the auxiliary loss
+masked to the rows that carry it; the honest fix is to write the label back into
+the replay buffer when the game finishes. Either way the KataGo justification
+does not currently apply to the ReBeL phase, so treat the head as untested
+rather than as an established win.
+
 ## Trained-weight audit
 
 The twelve-hour v4 checkpoint has no dead input group or frozen layer. The
