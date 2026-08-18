@@ -224,11 +224,18 @@ from flailing; a trained pair gives positions a real game reaches. Same code.
 
 Which to use is a real trade. Random play is far cheaper per game and yields
 far more wins, so every quota fills in minutes; self-play is slower and yields
-fewer, because strong players leave fewer wins lying around. That scarcity is
-the argument for it, not against it. Random play is also mildly *out of
-distribution* for a net trained on self-play, so a set built from it is a
-generalisation test as much as a tactical one. The two measure different
-things; build both.
+fewer, because strong players leave fewer wins lying around.
+
+That scarcity is the argument for it. Random play mostly stumbles into
+positions where half the moves win and every bot converts them; self-play
+reaches the sharp ones. Measured over the same bands, positions with fewer
+than one winning move in ten are `15%` of a random-play set and `36%` of a
+self-play one — more than double the share of the only positions that
+discriminate.
+
+Random play is also mildly *out of distribution* for a net trained on
+self-play, so a set built from it is a generalisation test as much as a
+tactical one. The two measure different things; build both.
 
 A long run publishes as it goes, so a night's work is never one crash from
 nothing.
