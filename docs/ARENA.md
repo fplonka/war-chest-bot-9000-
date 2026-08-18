@@ -120,25 +120,24 @@ tools/arena.py probe  bots/v5-2h --probe bots/lbr --games 200
 tools/arena.py tablebase bots/v5-2h --suite suites/forced
 ```
 
-**probe** — local best response, and what knowing a bot's actual strategy is
-worth against it. The probe plays the same bot over the same games twice; the
-second time the referee shows it the strategy behind every move. Nothing else
-differs, so the change in score is what that knowledge bought.
+**probe** — local best response: how much a best-responder wins against a bot,
+which is a lower bound on how exploitable it is.
 
-The probe carries no network. It chooses its move by playing the rest of the
-game out under random play and taking the action that scores best, averaged
-over the hands its belief says the opponent might hold. That is crude, and
-deliberately so: a probe built on a trained value function would measure that
-function as much as the bot under test, and the same bot would come out more
-or less exploitable depending on which network the probe happened to carry.
-Rollouts are crude in the same way for everyone, which is what an instrument
-needs. It is the construction Lisý and Bowling describe.
+The probe is shown the strategy behind every move the bot makes, keeps a
+belief over its hand from that, and answers with the action it believes is
+worth most. It carries no network: it finds that action by playing forward and
+reading the position, enumerating every hand its belief allows. A probe built
+on a trained value function would measure that function as much as the bot
+under test, and would rate the same bot differently depending on which network
+it happened to carry. This is the construction Lisý and Bowling describe.
 
-What it reports is a *lower* bound. A real best response would take at least
-as much, so a gain of zero means this probe found no leak — never that there
-is none. Read it with its error bar: over a few hundred games the noise is
-comparable to the gains actually seen, and a gain worth believing has to clear
-twice its own standard error.
+The number is what the probe wins per game. Colours are swapped over shared
+drafts, so a bot giving nothing away would hold the probe to the value of the
+game, which is zero; whatever the probe wins above that, the bot is at least
+that exploitable. Read it with its error bar — a value worth believing clears
+twice its own standard error — and read it as a floor: a real best response
+would take at least as much, so zero means this probe found no leak, never
+that there is none.
 
 A reported strategy is a self-report, so the referee checks the one thing it
 can: that the move actually played is one the report gave weight to. A bot

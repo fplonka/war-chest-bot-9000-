@@ -291,20 +291,20 @@ def ratings(names, records):
 # ----------------------------------------------------------------- the probe
 
 def probe(bot_path, probe_path, games, seed, concurrent, devices, out_path):
-    """What knowing the opponent's actual strategy is worth.
+    """How much a best response wins against this bot: local best response.
 
-    The same probe plays the same bot over the same games twice. The second
-    time the referee shows it the strategy behind every move; nothing else
-    differs, so the change in score is what that knowledge bought.
-
-    The probe carries no network: it picks its move by playing the rest of the
-    game out under random play, averaged over the hands its belief allows. A
-    probe built on a trained value function would measure that function as
-    much as the bot under test, and would rate the same bot differently
+    The probe is shown the strategy behind every move the bot makes, keeps a
+    belief over its hand from that, and answers with the action it believes is
+    worth most — found by playing forward, since it carries no network of its
+    own. A probe leaning on a trained value function would measure that
+    function as much as the bot, and would rate the same bot differently
     depending on which network it happened to carry.
 
-    What comes back is a *lower* bound on exploitability. A real best response
-    would take at least as much, so a gain of zero means this probe found no
+    What comes back is what the probe wins per game. Colours are swapped over
+    shared drafts, so a bot that gave nothing away would hold the probe to the
+    value of the game, which is zero; whatever the probe wins above that, the
+    bot is at least that exploitable. It is a *lower* bound — a real best
+    response would take at least as much — so zero means this probe found no
     leak, never that there is none."""
     replies = queue.Queue()
     spec = json.loads((Path(bot_path) / "bot.json").read_text())
@@ -312,45 +312,30 @@ def probe(bot_path, probe_path, games, seed, concurrent, devices, out_path):
     pairs = drafts(seed, games // 2)
     subject = Bot(bot_path, 0, devices[0], replies)
     prober = Bot(probe_path, 1, devices[1], replies)
-    rows, scored = {}, {}
     try:
-        for peeking in (False, True):
-            points = match((subject, prober), pairs, replies, seed, concurrent,
-                           lambda *a: None, probe=1 if peeking else None)
-            key = "peeking" if peeking else "blind"
-            # `match` scores the subject; the probe's score is the other side.
-            scored[key] = [(1 - p) / 2 for p in points]
-            rows[key] = summarize("probe", name, [-p for p in points])
-            print(f"  probe {'sees' if peeking else 'does not see'} the "
-                  f"strategy: scores {rows[key]['score']:.3f}", flush=True)
+        points = match((subject, prober), pairs, replies, seed, concurrent,
+                       lambda *a: None, probe=1)
     finally:
         subject.close()
         prober.close()
 
-    gain = rows["peeking"]["score"] - rows["blind"]["score"]
-    # The two matches share drafts and seeds, so the gain is a paired
-    # difference and its error is the error of the differences -- much
-    # tighter than treating the two scores as independent. Without this the
-    # number invites being read as real when it is noise: a gain worth
-    # believing has to clear its own error bar.
-    diff = [a - b for a, b in zip(scored["peeking"], scored["blind"])]
-    spread = statistics.pstdev(diff) if len(diff) > 1 else 0.0
-    se = spread / math.sqrt(len(diff)) if diff else float("inf")
+    # `match` scores the subject, so the probe's take is the other side. A
+    # colour-swapped pair is the independent trial, not a game.
+    won = [-(points[i] + points[i + 1]) / 2 for i in range(0, len(points) - 1, 2)]
+    value = statistics.fmean(won)
+    se = (statistics.pstdev(won) / math.sqrt(len(won))) if len(won) > 1 else float("inf")
     result = {"kind": "probe", "bot": name, "probe": prober.name,
               "games": games, "seed": seed,
-              "blind": rows["blind"], "peeking": rows["peeking"],
-              "gain": round(gain, 4), "gain_se": round(se, 4)}
+              "value": round(value, 4), "se": round(se, 4),
+              "pairs": len(won)}
     write_json(out_path, result)
-    # `summarize` scored the probe, so the subject's share is what is left.
-    print(f"\n{name} scores {1 - rows['blind']['score']:.3f} against "
-          f"{prober.name} playing blind and "
-          f"{1 - rows['peeking']['score']:.3f} once {prober.name} is shown "
-          f"its strategy.")
-    verdict = "clears" if abs(gain) > 2 * se else "does not clear"
-    print(f"{name}: that knowledge is worth {gain:+.3f} +/- {se:.3f} of a "
-          f"game to the probe, which {verdict} twice its own error. A lower "
-          f"bound on exploitability: finding nothing means this probe found "
-          f"nothing, not that there is nothing to find.")
+    verdict = "clears" if value > 2 * se else "does not clear"
+    print(f"\n{prober.name} wins {value:+.3f} +/- {se:.3f} per game against "
+          f"{name} over {len(won)} colour-swapped pairs, which {verdict} twice "
+          f"its own error.")
+    print(f"{name} is exploitable by at least that much. A lower bound: "
+          f"finding nothing means this probe found nothing, not that there is "
+          f"nothing to find.")
     print(f"wrote {out_path}")
     return result
 

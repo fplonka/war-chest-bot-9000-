@@ -192,9 +192,10 @@ pub fn greedy(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config], temp: f32) -> N
 /// opponent, which is what a measuring instrument needs.
 ///
 /// `belief` is the range the probe holds over the *other* seat, kept current
-/// from the strategy the referee reveals to it. Each rollout draws one hand
-/// from that range, so the value of an action is averaged over the hands the
-/// opponent might actually be holding.
+/// from the strategy the referee reveals to it. Every hand in it is tried and
+/// weighted by its probability, rather than sampled: the ranges here run to
+/// tens of hands, so enumerating them costs little and removes a whole source
+/// of noise from the estimate.
 pub fn lbr(
     s: &State,
     ctx: &Ctx,
@@ -214,18 +215,22 @@ pub fn lbr(
         let cells = np.row(ci);
         let mut best = (cells.start, f32::NEG_INFINITY);
         for cell in cells.clone() {
-            let mut total = 0.0;
-            for _ in 0..rounds {
-                let mut probe = *s;
-                set_config(&mut probe, player, ctx, &cfgs[ci]);
-                if !belief.cfg.is_empty() {
-                    let k = rng.below(belief.cfg.len());
-                    set_config(&mut probe, them, ctx, &belief.cfg[k]);
+            let (mut total, mut mass) = (0.0, 0.0);
+            for (k, hand) in belief.cfg.iter().enumerate() {
+                let w = belief.p.get(k).copied().unwrap_or(1.0);
+                if w <= 0.0 {
+                    continue;
                 }
-                probe.apply_inplace(np.acts[np.action_at(cell)]);
-                total += playout(&mut probe, player, rng);
+                for _ in 0..rounds {
+                    let mut probe = *s;
+                    set_config(&mut probe, player, ctx, &cfgs[ci]);
+                    set_config(&mut probe, them, ctx, hand);
+                    probe.apply_inplace(np.acts[np.action_at(cell)]);
+                    total += w * playout(&mut probe, player, rng);
+                    mass += w;
+                }
             }
-            let mean = total / rounds as f32;
+            let mean = if mass > 0.0 { total / mass } else { 0.0 };
             if mean > best.1 {
                 best = (cell, mean);
             }

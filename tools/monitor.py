@@ -268,7 +268,7 @@ def arena_summary(report):
     if report["kind"] == "tablebase":
         return (f"{report['bot']} · kept {report['held']}/{report['questions']} "
                 f"proven wins")
-    return f"{report['bot']} · gives away {report.get('gain', 0):+.3f}"
+    return f"{report['bot']} · exploited for {report.get('value', 0):+.3f}/game"
 
 
 def arena_index(arena_dir):

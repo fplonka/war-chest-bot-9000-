@@ -32,7 +32,9 @@ use crate::rng::Rng;
 
 /// Playouts per action per hand. Enough to order the actions, cheap enough
 /// that a probe keeps up with the bot it is measuring.
-const LBR_ROLLOUTS: usize = 8;
+/// Playouts per hand per action. The hands are enumerated, so this only
+/// has to average out the noise in a playout, not the noise in a range.
+const LBR_ROLLOUTS: usize = 2;
 use crate::search::{Cfg, Nets, Solver};
 use crate::state::{Cont, State};
 

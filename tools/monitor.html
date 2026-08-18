@@ -273,13 +273,12 @@ function renderArena(d) {
     return;
   }
   $("meta").textContent =
-    `${d.bot} against ${d.probe} · ${d.games} games each way`;
-  facts(box, "what the strategy is worth", [
-    ["probe blind", d.blind.score.toFixed(3)],
-    ["probe sees the strategy", d.peeking.score.toFixed(3)],
-    ["gain (lower bound on exploitability)", d.gain.toFixed(3)],
-    ["paired, peeking", `${d.peeking.paired_w}–${d.peeking.paired_l}` +
-                        ` (p=${d.peeking.paired_p})`],
+    `${d.bot} against ${d.probe} · ${d.pairs} colour-swapped pairs`;
+  facts(box, "how much a best response wins", [
+    [`${d.probe} wins per game`, `${d.value >= 0 ? "+" : ""}${d.value.toFixed(3)}`],
+    ["standard error", d.se.toFixed(3)],
+    ["exploitable by at least",
+     d.value > 2 * d.se ? d.value.toFixed(3) : "nothing this probe could find"],
   ]);
 }
 
