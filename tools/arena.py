@@ -29,6 +29,7 @@ import math
 import os
 import queue
 import random
+import statistics
 import subprocess
 import sys
 import threading
@@ -296,13 +297,14 @@ def probe(bot_path, probe_path, games, seed, concurrent, devices, out_path):
     pairs = drafts(seed, games // 2)
     subject = Bot(bot_path, 0, devices[0], replies)
     prober = Bot(probe_path, 1, devices[1], replies)
-    rows = {}
+    rows, scored = {}, {}
     try:
         for peeking in (False, True):
             points = match((subject, prober), pairs, replies, seed, concurrent,
                            lambda *a: None, probe=1 if peeking else None)
             key = "peeking" if peeking else "blind"
             # `match` scores the subject; the probe's score is the other side.
+            scored[key] = [(1 - p) / 2 for p in points]
             rows[key] = summarize("probe", name, [-p for p in points])
             print(f"  probe {'sees' if peeking else 'does not see'} the "
                   f"strategy: scores {rows[key]['score']:.3f}", flush=True)
@@ -311,17 +313,26 @@ def probe(bot_path, probe_path, games, seed, concurrent, devices, out_path):
         prober.close()
 
     gain = rows["peeking"]["score"] - rows["blind"]["score"]
+    # The two matches share drafts and seeds, so the gain is a paired
+    # difference and its error is the error of the differences -- much
+    # tighter than treating the two scores as independent. Without this the
+    # number invites being read as real when it is noise: a gain worth
+    # believing has to clear its own error bar.
+    diff = [a - b for a, b in zip(scored["peeking"], scored["blind"])]
+    spread = statistics.pstdev(diff) if len(diff) > 1 else 0.0
+    se = spread / math.sqrt(len(diff)) if diff else float("inf")
     result = {"kind": "probe", "bot": name, "probe": prober.name,
               "games": games, "seed": seed,
               "blind": rows["blind"], "peeking": rows["peeking"],
-              "gain": round(gain, 4)}
+              "gain": round(gain, 4), "gain_se": round(se, 4)}
     write_json(out_path, result)
     print(f"\n{name} scores {-rows['blind']['score']:+.3f} against "
           f"{prober.name} playing blind, {-rows['peeking']['score']:+.3f} "
           f"once {prober.name} is shown its strategy.")
-    print(f"{name}: that knowledge is worth {gain:+.3f} of a game to the "
-          f"probe (a lower bound on exploitability; zero is what a copy of "
-          f"itself should score).")
+    verdict = "clears" if abs(gain) > 2 * se else "does not clear"
+    print(f"{name}: that knowledge is worth {gain:+.3f} +/- {se:.3f} of a "
+          f"game to the probe, which {verdict} twice its own error. A lower "
+          f"bound on exploitability; zero is what a copy of itself scores.")
     print(f"wrote {out_path}")
     return result
 
