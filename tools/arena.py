@@ -67,9 +67,7 @@ class Bot:
         self.replies = replies
         self.spec = json.loads((self.dir / "bot.json").read_text())
         self.name = self.spec.get("name", self.dir.name)
-        self.device = device
-        binary = self.dir / "bot"
-        argv = [str(binary), "--name", self.name,
+        argv = [str(self.dir / "bot"), "--name", self.name,
                 "--mind", self.spec.get("mind", "rebel"),
                 "--device", str(device)]
         if self.spec.get("weights"):
@@ -250,8 +248,7 @@ def summarize(a, b, points):
     return {"a": a, "b": b, "w": w, "l": len(points) - w - d, "d": d,
             "n": len(points), "score": round((w + 0.5 * d) / len(points), 4),
             "paired_w": won, "paired_l": lost,
-            "paired_p": float(f"{sign_test(won, lost):.4g}"),
-            "points": points}
+            "paired_p": float(f"{sign_test(won, lost):.4g}")}
 
 
 def ratings(names, records):
