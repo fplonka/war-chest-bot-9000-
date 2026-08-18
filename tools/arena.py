@@ -338,9 +338,11 @@ def probe(bot_path, probe_path, games, seed, concurrent, devices, out_path):
               "blind": rows["blind"], "peeking": rows["peeking"],
               "gain": round(gain, 4), "gain_se": round(se, 4)}
     write_json(out_path, result)
-    print(f"\n{name} scores {-rows['blind']['score']:+.3f} against "
-          f"{prober.name} playing blind, {-rows['peeking']['score']:+.3f} "
-          f"once {prober.name} is shown its strategy.")
+    # `summarize` scored the probe, so the subject's share is what is left.
+    print(f"\n{name} scores {1 - rows['blind']['score']:.3f} against "
+          f"{prober.name} playing blind and "
+          f"{1 - rows['peeking']['score']:.3f} once {prober.name} is shown "
+          f"its strategy.")
     verdict = "clears" if abs(gain) > 2 * se else "does not clear"
     print(f"{name}: that knowledge is worth {gain:+.3f} +/- {se:.3f} of a "
           f"game to the probe, which {verdict} twice its own error. A lower "
