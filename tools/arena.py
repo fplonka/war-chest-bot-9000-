@@ -23,6 +23,7 @@ one where both bots played in the same run.
 
 import argparse
 import collections
+import hashlib
 import itertools
 import json
 import math
@@ -68,6 +69,17 @@ class Bot:
         self.replies = replies
         self.spec = json.loads((self.dir / "bot.json").read_text())
         self.name = self.spec.get("name", self.dir.name)
+        # A bot directory is only self-contained if the binary in it is the
+        # one its weights were trained against. Copying a newer build over an
+        # archived bot leaves it running weights from one revision on an
+        # engine from another, which does not crash -- it just plays badly,
+        # and quietly makes a wrong measurement.
+        want = self.spec.get("binary")
+        if want and want != digest(self.dir / "bot"):
+            raise SystemExit(
+                f"{self.name}: the binary in {self.dir} is not the one packed "
+                f"with these weights. Rebuild it from sha "
+                f"{self.spec.get('sha', '?')} rather than copying one in.")
         argv = [str(self.dir / "bot"), "--name", self.name,
                 "--mind", self.spec.get("mind", "rebel"),
                 "--device", str(device)]
@@ -637,6 +649,11 @@ def buckets(title, rows):
             print(f"{label:>14} {row['n']:>6} {row['held']:>6} {row['rate']:>7.3f}")
 
 
+def digest(path):
+    """A file's identity, short enough to read."""
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:12]
+
+
 def report_path(given, stem):
     """Where a report lands. Reports go to `arena/` so the dashboard finds
     them without being told."""
@@ -765,6 +782,7 @@ def pack(run, binary, out_dir, snapshot=None, name=None):
         (directory / "bot.json").write_text(json.dumps({
             "name": bot,
             "sha": checkpoint.get("git", ""),
+            "binary": digest(directory / "bot"),
             "mind": "rebel",
             "weights": "weights.bin",
             "search": {k: v for k, v in search.items()
