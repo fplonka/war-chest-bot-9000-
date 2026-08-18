@@ -216,8 +216,8 @@ function ladder(box, name, l) {
                  p.paired_p == null ? "—" : p.paired_p.toPrecision(2)])));
 }
 
-// A probe or a suite is one bot and a handful of numbers, so it renders as a
-// list of them rather than as tables.
+// A suite result is one bot and a handful of numbers, so it renders as a list
+// of them rather than as a table.
 function facts(box, title, rows) {
   box.appendChild(E("h2", null, title));
   const dl = E("dl");
@@ -272,14 +272,6 @@ function renderArena(d) {
          [["none left", d.known], ["some left", d.hidden]]);
     return;
   }
-  $("meta").textContent =
-    `${d.bot} against ${d.probe} · ${d.pairs} colour-swapped pairs`;
-  facts(box, "how much a best response wins", [
-    [`${d.probe} wins per game`, `${d.value >= 0 ? "+" : ""}${d.value.toFixed(3)}`],
-    ["standard error", d.se.toFixed(3)],
-    ["exploitable by at least",
-     d.value > 2 * d.se ? d.value.toFixed(3) : "nothing this probe could find"],
-  ]);
 }
 
 function render(d) {

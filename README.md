@@ -26,7 +26,7 @@ train/           train.py    PyTorch training loop, snapshots on a timer
   dump.py        reading a dumped replay buffer
   gpu_batch.py   replay rows -> canonical query batch, expanded on the device
 tools/           box.sh      the GPU box: sync, build, run, pull a run back
-  arena.py       archive bots; ladder, probe and score them on proven endgames
+  arena.py       archive bots; ladder them, and score them on proven endgames
   monitor.py     live dashboard over runs/ and arena/, served from disk
 docs/
   ENGINE_FIXES.md  rule corrections found by replaying 1,112 real games
@@ -92,8 +92,7 @@ python tools/arena.py ladder bots/mine.* bots/greedy --games 200
 
 The same command rates one architecture against another, because a bot built at
 an old revision keeps playing after the source that produced it has been
-rewritten. One more command asks what a ladder cannot: `probe`, for a lower bound on how
-exploitable a bot is. See `docs/ARENA.md`.
+rewritten. See `docs/ARENA.md`.
 
 War Chest turns out to be an unusually good fit for ReBeL. A player's private
 state is `(hand, face-down discards, pending forced-play coin)` — the bag is

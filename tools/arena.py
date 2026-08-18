@@ -2,7 +2,6 @@
 """Play archived bots against each other.
 
     tools/arena.py ladder bots/v5-2h bots/v4-12h bots/greedy --games 200
-    tools/arena.py probe  bots/v5-2h --probe bots/lbr --games 200
     tools/arena.py pack   runs/v5_d2_125m --snapshot final --name v5-2h
 
 A bot is a directory holding a binary, its weights and a `bot.json`. The
@@ -30,7 +29,6 @@ import math
 import os
 import queue
 import random
-import statistics
 import subprocess
 import sys
 import threading
@@ -158,7 +156,7 @@ def apply_reply(table, reply):
     table.reply(seat, line)
 
 
-def match(bots, pairs, replies, seed, concurrent, report, probe=None):
+def match(bots, pairs, replies, seed, concurrent, report):
     """Play every draft twice with the colours swapped, and return A's score in
     each game. Colour-swapped pairs over a shared draft remove most of the
     variance that comes from the draft itself.
@@ -169,8 +167,6 @@ def match(bots, pairs, replies, seed, concurrent, report, probe=None):
     mixture of games — some being built on its cores, some being solved on its
     device — instead of swinging between the two."""
     table = warchest.Table()
-    if probe is not None:
-        table.probe(probe)
     todo = deque(range(2 * len(pairs)))
     scores = {}
     started = time.time()
@@ -286,58 +282,6 @@ def ratings(names, records):
              "games": int(n[i].sum()),
              "score": round(float(score[i].sum() / max(n[i].sum(), 1)), 3)}
             for i in range(k)]
-
-
-# ----------------------------------------------------------------- the probe
-
-def probe(bot_path, probe_path, games, seed, concurrent, devices, out_path):
-    """How much a best response wins against this bot: local best response.
-
-    The probe is shown the strategy behind every move the bot makes, keeps a
-    belief over its hand from that, and answers with the action it believes is
-    worth most — found by playing forward, since it carries no network of its
-    own. A probe leaning on a trained value function would measure that
-    function as much as the bot, and would rate the same bot differently
-    depending on which network it happened to carry.
-
-    What comes back is what the probe wins per game. Colours are swapped over
-    shared drafts, so a bot that gave nothing away would hold the probe to the
-    value of the game, which is zero; whatever the probe wins above that, the
-    bot is at least that exploitable. It is a *lower* bound — a real best
-    response would take at least as much — so zero means this probe found no
-    leak, never that there is none."""
-    replies = queue.Queue()
-    spec = json.loads((Path(bot_path) / "bot.json").read_text())
-    name = spec.get("name", Path(bot_path).name)
-    pairs = drafts(seed, games // 2)
-    subject = Bot(bot_path, 0, devices[0], replies)
-    prober = Bot(probe_path, 1, devices[1], replies)
-    try:
-        points = match((subject, prober), pairs, replies, seed, concurrent,
-                       lambda *a: None, probe=1)
-    finally:
-        subject.close()
-        prober.close()
-
-    # `match` scores the subject, so the probe's take is the other side. A
-    # colour-swapped pair is the independent trial, not a game.
-    won = [-(points[i] + points[i + 1]) / 2 for i in range(0, len(points) - 1, 2)]
-    value = statistics.fmean(won)
-    se = (statistics.pstdev(won) / math.sqrt(len(won))) if len(won) > 1 else float("inf")
-    result = {"kind": "probe", "bot": name, "probe": prober.name,
-              "games": games, "seed": seed,
-              "value": round(value, 4), "se": round(se, 4),
-              "pairs": len(won)}
-    write_json(out_path, result)
-    verdict = "clears" if value > 2 * se else "does not clear"
-    print(f"\n{prober.name} wins {value:+.3f} +/- {se:.3f} per game against "
-          f"{name} over {len(won)} colour-swapped pairs, which {verdict} twice "
-          f"its own error.")
-    print(f"{name} is exploitable by at least that much. A lower bound: "
-          f"finding nothing means this probe found nothing, not that there is "
-          f"nothing to find.")
-    print(f"wrote {out_path}")
-    return result
 
 
 # ------------------------------------------------------------- the tablebase
@@ -484,7 +428,7 @@ def generate(paths, games, seed, concurrent, devices, out_dir,
     print(f"wrote {out_dir / 'suite.json'}")
 
 
-def tablebase(bot_path, suite_dir, out_path, device=-1, concurrent=32):
+def score(bot_path, suite_dir, out_path, device, concurrent):
     """Ask a bot the questions whose answers are proven.
 
     Each question is a position in which one side wins whatever the other
@@ -585,6 +529,33 @@ def tablebase(bot_path, suite_dir, out_path, device=-1, concurrent=32):
     buckets("hidden hands", [("none", result["known"]), ("some", result["hidden"])])
     print(f"wrote {out_path}")
     return result
+
+
+def tablebase(bot_paths, suite_dir, out_dir, device=-1, concurrent=32):
+    """Score every bot on the same questions, and lay the answers side by
+    side. One suite, one table: what separates bots is how they do on the
+    hard questions, and that is only readable next to each other."""
+    got = [score(b, suite_dir, Path(out_dir) / f"tablebase_{name(b)}.json",
+                 device, concurrent)
+           for b in bot_paths]
+    if len(got) < 2:
+        return got
+    got.sort(key=lambda r: r["rate"])
+    bands = [n for n, _, _ in SHARES]
+    print(f"\n{'':>14}" + "".join(f"{r['bot']:>11}" for r in got))
+    print(f"{'overall':>14}" + "".join(f"{100 * r['rate']:>10.1f}%" for r in got))
+    print()
+    for b in bands:
+        n = got[0]["by_share"][b]["n"]
+        if n:
+            print(f"{b + f' (n={n})':>14}"
+                  + "".join(f"{100 * r['by_share'][b]['rate']:>10.1f}%" for r in got))
+    for k in ("known", "hidden"):
+        n = got[0][k]["n"]
+        if n:
+            print(f"{k + f' (n={n})':>14}"
+                  + "".join(f"{100 * r[k]['rate']:>10.1f}%" for r in got))
+    return got
 
 
 # ---------------------------------------------------------------- the ladder
@@ -816,17 +787,6 @@ def main():
                      help="the two sides' CUDA devices; use 0,0 for one card")
     lad.add_argument("--out", default="")
 
-    pr = sub.add_parser(
-        "probe", help="what knowing a bot's actual strategy is worth")
-    pr.add_argument("bot")
-    pr.add_argument("--probe", default="bots/lbr",
-                    help="the probing bot directory")
-    pr.add_argument("--games", type=int, default=200)
-    pr.add_argument("--seed", type=int, default=83)
-    pr.add_argument("--concurrent", type=int, default=96)
-    pr.add_argument("--devices", default="0,1")
-    pr.add_argument("--out", default="")
-
     gen = sub.add_parser("generate",
                          help="find positions with proven answers, by watching bots play")
     gen.add_argument("bots", nargs=2,
@@ -844,8 +804,8 @@ def main():
     gen.add_argument("--out", default="suites/forced")
 
     tb = sub.add_parser("tablebase",
-                        help="score a bot on positions with proven answers")
-    tb.add_argument("bot")
+                        help="score bots on positions with proven answers")
+    tb.add_argument("bots", nargs="+")
     tb.add_argument("--suite", default="suites/forced")
     tb.add_argument("--device", type=int, default=-1)
     tb.add_argument("--concurrent", type=int, default=32)
@@ -869,15 +829,10 @@ def main():
                         devices(args.devices), args.out, args.depth,
                         args.per_bucket, args.min_plies, args.budget)
     if args.command == "tablebase":
-        return tablebase(args.bot, args.suite,
-                         report_path(args.out, f"tablebase_{name(args.bot)}"),
+        return tablebase(args.bots, args.suite, args.out or "arena",
                          args.device, args.concurrent)
     if len(devices(args.devices)) != 2:
         ap.error("--devices takes exactly two device ids")
-    if args.command == "probe":
-        return probe(args.bot, args.probe, args.games, args.seed,
-                     args.concurrent, devices(args.devices),
-                     report_path(args.out, f"probe_{name(args.bot)}"))
     stem = "_vs_".join(name(b) for b in args.bots[:3])
     ladder(args.bots, args.games, args.seed, args.concurrent,
            devices(args.devices), report_path(args.out, stem))

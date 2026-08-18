@@ -94,18 +94,7 @@ pub enum Obs {
     /// it — and the whole action when it goes back to the actor, which happens
     /// when a recorded game is replayed and a seat has to re-make its own
     /// moves to rebuild the beliefs it played under.
-    ///
-    /// `policy` is the actor's whole strategy at that node, and is present
-    /// only for a seat the referee was told is a probe. No ordinary opponent
-    /// is ever sent it: how the other side actually plays is the one thing a
-    /// real game never shows you, and measuring what that knowledge is worth
-    /// is the whole point of a probe.
-    Act {
-        player: u8,
-        key: u32,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        policy: Option<Vec<f32>>,
-    },
+    Act { player: u8, key: u32 },
 }
 
 /// A position in the language of the game rather than of this build's memory.
@@ -356,15 +345,6 @@ pub struct Ask {
     pub at: Option<Placed>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub obs: Vec<Obs>,
-    /// Report the whole strategy, not just the move it sampled.
-    ///
-    /// A bot computes a probability for every action of every private config
-    /// it might hold and then samples one row, so the rest is already in hand
-    /// and costs nothing to send. Nothing in a ladder asks for it: it is how
-    /// the exploitability probe and the endgame suite see what a bot would
-    /// actually do, rather than what one sample of it did.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub policy: bool,
 }
 
 /// Unknown fields are refused rather than ignored. A bot binary is frozen at
@@ -396,12 +376,6 @@ pub struct Done {
     pub id: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<u32>,
-    /// The acting player's strategy, config-major over the node's legal cells,
-    /// present when the ask set `policy`. The cell layout follows from the
-    /// public position and the config support, both of which the asker can
-    /// rebuild, so the probabilities travel alone.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy: Option<Vec<f32>>,
 }
 
 /// Games the bot has finished with. A reply need not cover a whole request:
@@ -629,8 +603,6 @@ pub struct Table {
     queued: Vec<(u32, State, Draft)>,
     done: Vec<(u32, [usize; 2], f32)>,
     dropped: BTreeMap<usize, Vec<u32>>,
-    /// Bots that see their opponent's strategy. Empty in a ladder.
-    probes: Vec<usize>,
 }
 
 impl Table {
@@ -640,11 +612,6 @@ impl Table {
 
     /// Let `bot` see the strategy its opponents play, which makes every result
     /// it produces a measurement rather than a game.
-    pub fn probe(&mut self, bot: usize) {
-        if !self.probes.contains(&bot) {
-            self.probes.push(bot);
-        }
-    }
 
     /// Games still being played. A decided game waiting for its last ack does
     /// not count.
@@ -762,7 +729,7 @@ impl Table {
     /// Apply a bot's move to the true position and tell the other seat what it
     /// saw. An illegal move is an error, not a loss: it means the bot has lost
     /// track of the game.
-    pub fn play(&mut self, id: u32, code: u32, policy: Option<Vec<f32>>) -> Result<(), String> {
+    pub fn play(&mut self, id: u32, code: u32) -> Result<(), String> {
         let b = self
             .bouts
             .get_mut(&id)
@@ -773,33 +740,6 @@ impl Table {
             return Err(format!("game {}: illegal action {}", id, action));
         }
         let player = b.s.to_act();
-        // A reported strategy is a self-report, and the one thing the referee
-        // can check about it is that the move actually played is a move the
-        // report said was possible. Without that, a peek is worth exactly as
-        // much as the peeked-at bot's honesty; with it, a bot that publishes
-        // one strategy and plays another is caught here rather than quietly
-        // deflating whatever the probe measured.
-        if let Some(p) = policy.as_deref() {
-            let ctx = Ctx::new(&b.s);
-            let cfgs = &[true_config(&b.s, player, &ctx)];
-            let np = crate::policy::NodePolicy::frame(&b.s, &ctx, player, cfgs);
-            let played = np.row(0).find(|&cell| np.acts[np.action_at(cell)] == action);
-            match played {
-                Some(cell) if p.get(cell).copied().unwrap_or(0.0) > 0.0 => {}
-                Some(_) => {
-                    return Err(format!(
-                        "game {}: {} was played but the reported strategy gives it no weight",
-                        id, action
-                    ))
-                }
-                None => {
-                    return Err(format!(
-                        "game {}: {} is not a move the reported strategy covers",
-                        id, action
-                    ))
-                }
-            }
-        }
         b.s.apply_inplace(action);
         b.watched = [false, false];
         // A move that leaves a decision node is a position to prove; one that
@@ -809,7 +749,6 @@ impl Table {
         b.pending[1 - player as usize].push(Obs::Act {
             player,
             key: crate::rebel::obs_key(&action),
-            policy,
         });
         self.queued.extend(reached);
         Ok(())
@@ -915,12 +854,8 @@ impl Table {
                 start: b.start[seat].take(),
                 at: None,
                 obs: std::mem::take(&mut b.pending[seat]),
-                policy: false,
             };
             if acting {
-                // A probe is watching, so this move must come back with the
-                // strategy behind it.
-                ask.policy = self.probes.contains(&b.bots[1 - seat]);
                 go.push(ask);
             } else {
                 b.watched[seat] = true;
@@ -947,7 +882,7 @@ impl Table {
                 }
             }
             if let Some(action) = done.action {
-                self.play(done.id, action, done.policy)?;
+                self.play(done.id, action)?;
             }
         }
         self.retire();
@@ -1002,11 +937,6 @@ impl PyTable {
         self.0.settle()
     }
 
-    /// Let `bot` see the strategy its opponents play. A ladder never calls
-    /// this; the exploitability probe is the only thing that does.
-    fn probe(&mut self, bot: usize) {
-        self.0.probe(bot)
-    }
 
     fn live(&self) -> usize {
         self.0.live()

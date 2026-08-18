@@ -265,10 +265,8 @@ def arena_summary(report):
         players = report.get("players") or [{"name": "?"}]
         best = max(players, key=lambda p: p.get("elo") or -1e9)
         return f"{len(players)} bots · {report.get('games')} games · top {best['name']}"
-    if report["kind"] == "tablebase":
-        return (f"{report['bot']} · kept {report['held']}/{report['questions']} "
-                f"proven wins")
-    return f"{report['bot']} · exploited for {report.get('value', 0):+.3f}/game"
+    return (f"{report['bot']} · kept {report['held']}/{report['questions']} "
+            f"proven wins")
 
 
 def arena_index(arena_dir):
@@ -276,7 +274,7 @@ def arena_index(arena_dir):
     out = []
     for path in glob.glob(os.path.join(arena_dir, "*.json")):
         report = read_json(path)
-        if not report or report.get("kind") not in ("ladder", "probe", "tablebase"):
+        if not report or report.get("kind") not in ("ladder", "tablebase"):
             continue
         out.append({"name": os.path.basename(path)[:-5],
                     "mtime": os.path.getmtime(path),

@@ -32,9 +32,6 @@ use crate::rng::Rng;
 
 /// Playouts per action per hand. Enough to order the actions, cheap enough
 /// that a probe keeps up with the bot it is measuring.
-/// Playouts per hand per action. The hands are enumerated, so this only
-/// has to average out the noise in a playout, not the noise in a range.
-const LBR_ROLLOUTS: usize = 2;
 use crate::search::{Cfg, Nets, Solver};
 use crate::state::{Cont, State};
 
@@ -47,21 +44,6 @@ pub enum Mind {
     Greedy { temp: f32 },
     /// Uniform over legal actions.
     Random,
-    /// The exploitability probe: local best response.
-    ///
-    /// It takes its opponent's strategy from the referee rather than guessing
-    /// at it, and answers with the best reply it can find rather than an
-    /// equilibrium one. It finds that reply by playing the rest of the game
-    /// out under random play, and carries no network at all — a probe that
-    /// leant on a trained value function would measure that function as much
-    /// as the bot under test, and its verdict would change with whichever
-    /// network it happened to be built around.
-    ///
-    /// What it wins is a *lower* bound on how exploitable the opponent is: a
-    /// real best response would take at least as much, so finding nothing
-    /// means this probe found nothing, never that there is nothing to find.
-    /// A measuring instrument, not a player; it never belongs in a ladder.
-    Lbr,
 }
 
 /// Everything a bot brings to every game it plays: how it thinks, what it
@@ -85,10 +67,6 @@ impl Brain {
         match self.mind {
             Mind::Greedy { temp } => return policy::greedy(s, ctx, player, cfgs, temp),
             Mind::Random => return policy::uniform(s, ctx, player, cfgs),
-            // A probe holds no model of its opponent worth the name: it is
-            // *told* their strategy, and where it is not told it assumes
-            // nothing. Its own move is chosen in `decide`, by rollout.
-            Mind::Lbr => return policy::uniform(s, ctx, player, cfgs),
             Mind::Rebel => {}
         }
         #[cfg(feature = "gpu")]
@@ -207,11 +185,7 @@ impl Session {
     pub fn observe(&mut self, obs: &Obs, brain: &Brain) -> Result<(), String> {
         match *obs {
             Obs::Draw { player, code } => self.drew(player, code),
-            Obs::Act {
-                player,
-                key,
-                ref policy,
-            } => self.acted(player, key, policy.as_deref(), brain),
+            Obs::Act { player, key } => self.acted(player, key, brain),
         }
     }
 
@@ -245,36 +219,17 @@ impl Session {
     /// The opponent was seen to make an observation. Model their strategy at
     /// the node, filter it on what was seen, and step the public position with
     /// a private action consistent with it.
-    fn acted(
-        &mut self,
-        player: u8,
-        key: u32,
-        revealed: Option<&[f32]>,
-        brain: &Brain,
-    ) -> Result<(), String> {
+    fn acted(&mut self, player: u8, key: u32, brain: &Brain) -> Result<(), String> {
         if self.s.is_terminal() || self.s.is_chance() || self.s.to_act() != player {
             return Err(format!("player {} is not to act", player));
         }
         if player == self.seat {
             return Err("a bot is told its own moves back".into());
         }
-        // A probe is handed the strategy that was actually played, so its
-        // belief becomes the truth rather than a model of it.
-        let mut np = match self.modelled.take() {
+        let np = match self.modelled.take() {
             Some(np) => np,
             None => brain.policy(&self.s, &self.ctx, player, &self.bel),
         };
-        if let Some(revealed) = revealed {
-            if revealed.len() != np.probs.len() {
-                return Err(format!(
-                    "revealed strategy has {} cells, this node has {}",
-                    revealed.len(),
-                    np.probs.len()
-                ));
-            }
-            np.probs.copy_from_slice(revealed);
-        }
-        let np = np;
         let (ci, cell) = np
             .cell_for(key)
             .ok_or_else(|| format!("observation {} is unreachable from this belief", key))?;
@@ -292,13 +247,8 @@ impl Session {
     }
 
     /// Choose a move, update what the opponent now knows about this seat, and
-    /// return the action's encoding — with the whole strategy it sampled from
-    /// when `report` asks for it.
-    pub fn decide(
-        &mut self,
-        brain: &Brain,
-        report: bool,
-    ) -> Result<(u32, Option<Vec<f32>>), String> {
+    /// return the action's encoding.
+    pub fn decide(&mut self, brain: &Brain) -> Result<u32, String> {
         if self.s.is_terminal() || self.s.is_chance() || self.s.to_act() != self.seat {
             return Err("the bot was asked to move out of turn".into());
         }
@@ -307,7 +257,7 @@ impl Session {
         let ci = self.bel[self.seat as usize]
             .index_of(&truth)
             .ok_or("the belief filter dropped this seat's own config")?;
-        let mut np = brain.policy(&self.s, &self.ctx, self.seat, &self.bel);
+        let np = brain.policy(&self.s, &self.ctx, self.seat, &self.bel);
         if np.row(ci).is_empty() {
             // The node's actions are enumerated over the public reserve and
             // then filtered per hand. A hand with no row cannot move, which
@@ -317,34 +267,12 @@ impl Session {
                 np.acts.len()
             ));
         }
-        // A probe answers with the best reply it can find, not a mixed one:
-        // the question it exists to ask is how much the opponent's strategy
-        // gives away, and an equilibrium answer would not collect it. It
-        // finds that reply by playing the rest out, so that the number it
-        // produces measures the bot under test rather than whatever network
-        // the probe was carrying.
-        let cell = match brain.mind {
-            Mind::Lbr => {
-                np = policy::lbr(
-                    &self.s,
-                    &self.ctx,
-                    self.seat,
-                    &self.bel[self.seat as usize].cfg,
-                    ci,
-                    &self.bel[1 - self.seat as usize],
-                    LBR_ROLLOUTS,
-                    &mut self.rng,
-                );
-                np.best(ci)
-            }
-            _ => np.sample(&mut self.rng, ci),
-        };
+        let cell = np.sample(&mut self.rng, ci);
         let action = np.acts[np.action_at(cell)];
-        let policy = report.then(|| np.probs.clone());
         self.bel[self.seat as usize] =
             np.posterior(&self.bel[self.seat as usize], obs_key(&action));
         self.s.apply_inplace(action);
-        Ok((action.encode(), policy))
+        Ok(action.encode())
     }
 
 }
@@ -410,7 +338,6 @@ mod tests {
                     done.push(Done {
                         id: ask.id,
                         action: None,
-                        policy: None,
                     });
                 }
                 for ask in request.go {
@@ -421,8 +348,7 @@ mod tests {
                     inspect(&seats[bot]);
                     done.push(Done {
                         id: ask.id,
-                        action: Some(seats[bot].decide(&brain, false).unwrap().0),
-                        policy: None,
+                        action: Some(seats[bot].decide(&brain).unwrap()),
                     });
                 }
                 for entry in &done {
@@ -485,7 +411,7 @@ mod tests {
                         seats[bot].observe(obs, &brain).unwrap();
                     }
                     seats[bot].watch(&brain);
-                    done.push(Done { id: ask.id, action: None, policy: None });
+                    done.push(Done { id: ask.id, action: None });
                 }
                 for ask in request.go {
                     for obs in &ask.obs {
@@ -499,8 +425,8 @@ mod tests {
                             caught = Some((at, seats[bot].s, seats[bot].bel.clone(), bot as u8));
                         }
                     }
-                    let (action, _) = seats[bot].decide(&brain, false).unwrap();
-                    done.push(Done { id: ask.id, action: Some(action), policy: None });
+                    let action = seats[bot].decide(&brain).unwrap();
+                    done.push(Done { id: ask.id, action: Some(action) });
                 }
                 table.accept(bot, Reply { done, error: None }).unwrap();
             }
@@ -599,19 +525,17 @@ mod tests {
                         seats[bot].observe(obs, &brain).unwrap();
                     }
                     if acting {
-                        let (action, _) = seats[bot].decide(&brain, false).unwrap();
+                        let action = seats[bot].decide(&brain).unwrap();
                         done.push(Done {
                             id: ask.id,
                             action: Some(action),
-                            policy: None,
-                        });
+                            });
                     } else {
                         seats[bot].watch(&brain);
                         done.push(Done {
                             id: ask.id,
                             action: None,
-                            policy: None,
-                        });
+                            });
                     }
                 }
                 table.accept(bot, Reply { done, error: None }).unwrap();

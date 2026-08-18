@@ -25,9 +25,8 @@ replacement actually better than what it replaced".
  "note": "d2t64_long12h final"}
 ```
 
-`mind` is `rebel`, `greedy`, `random` or `lbr`; one binary serves them all, so
-the handcrafted reference, the floor and the exploitability probe are bots like
-any other. `minutes` is how
+`mind` is `rebel`, `greedy` or `random`; one binary serves them all, so the
+handcrafted reference and the floor are bots like any other. `minutes` is how
 long the checkpoint trained, and is what the run dashboard plots against.
 
 Bots are build products, not source: `bots/` is not in git.
@@ -61,7 +60,7 @@ bot     -> {"done":  [{"id": 7, "action": 8452}]}
 * `policy` — on an ask, "send the whole strategy, not just the move". A bot
   works out a probability for every action of every hand it might hold and then
   samples one row, so the rest is already in hand. Nothing in a ladder asks for
-  it; the probe and the suite do.
+  it; the suite does.
 
 The two directions are not in step. The referee sends work for any game it is
 not already waiting on, and the bot answers each game as that game is ready, so
@@ -109,45 +108,16 @@ referee asks for it while the opponent is still thinking. Both bots then work at
 the same time, one card each, instead of taking turns. Without it a ladder runs
 at roughly half the speed.
 
-## Three reports, one mechanism
+## Two reports, one mechanism
 
-The ladder answers "which of these is better". Two other commands answer
-questions a ladder cannot, both on the same protocol.
+The ladder answers "which of these is better". The tablebase answers what a
+ladder cannot: whether a bot plays a position *correctly*, where correct is
+decided by the rules rather than by the field.
 
 ```bash
 tools/arena.py ladder bots/greedy bots/v4-12h bots/v5-2h --games 200
-tools/arena.py probe  bots/v5-2h --probe bots/lbr --games 200
-tools/arena.py tablebase bots/v5-2h --suite suites/forced
+tools/arena.py tablebase bots/v5-2h bots/v4-12h --suite suites/random-play
 ```
-
-**probe** — local best response: how much a best-responder wins against a bot,
-which is a lower bound on how exploitable it is.
-
-The probe is shown the strategy behind every move the bot makes, keeps a
-belief over its hand from that, and answers with the action it believes is
-worth most. It carries no network: it finds that action by playing forward and
-reading the position, enumerating every hand its belief allows. A probe built
-on a trained value function would measure that function as much as the bot
-under test, and would rate the same bot differently depending on which network
-it happened to carry. This is the construction Lisý and Bowling describe.
-
-The number is what the probe wins per game. Colours are swapped over shared
-drafts, so a bot giving nothing away would hold the probe to the value of the
-game, which is zero; whatever the probe wins above that, the bot is at least
-that exploitable. Read it with its error bar — a value worth believing clears
-twice its own standard error — and read it as a floor: a real best response
-would take at least as much, so zero means this probe found no leak, never
-that there is none.
-
-A reported strategy is a self-report, so the referee checks the one thing it
-can: that the move actually played is one the report gave weight to. A bot
-that publishes one strategy and plays another is stopped there.
-
-The probe is a measuring instrument, not a player. Put it in a ladder and it
-would beat everyone by reading their hand, and drag every other rating with it.
-
-**tablebase** — whether a bot converts a position whose answer is proven. See
-below.
 
 ## The tablebase: questions with proven answers
 

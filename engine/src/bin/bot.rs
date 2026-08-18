@@ -64,7 +64,6 @@ fn brain(o: &Options) -> Result<Brain, String> {
         "rebel" => Mind::Rebel,
         "greedy" => Mind::Greedy { temp: o.temp },
         "random" => Mind::Random,
-        "lbr" => Mind::Lbr,
         other => return Err(format!("unknown mind {}", other)),
     };
     let cfr = Cfr::named(&o.cfr).ok_or_else(|| format!("unknown cfr rule {}", o.cfr))?;
@@ -126,19 +125,14 @@ fn work(ask: &Ask, table: &Table, brain: &Brain, act: bool) -> Result<Done, Stri
     for obs in &ask.obs {
         session.observe(obs, brain)?;
     }
-    let (action, policy) = if act {
-        let (action, policy) = session.decide(brain, ask.policy)?;
-        (Some(action), policy)
+    let action = if act {
+        Some(session.decide(brain)?)
     } else {
         session.watch(brain);
-        (None, None)
+        None
     };
     table.lock().unwrap().insert(ask.id, session);
-    Ok(Done {
-        id: ask.id,
-        action,
-        policy,
-    })
+    Ok(Done { id: ask.id, action })
 }
 
 /// A game the bot could not follow ends the run. Half a ladder from a bot that
