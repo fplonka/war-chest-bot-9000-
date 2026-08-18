@@ -777,3 +777,52 @@ cards are, which is where the cost belongs.
 One thing that did *not* work: ordering moves by the control-marker swing, to
 find refutations sooner. It made the run 1.8 times *slower*. The ordering needs
 a full apply per child at every node, and that costs more than the cut saves.
+
+## The proven-endgame benchmark, and what it says about five bots
+
+A position is kept only if the side to move wins whatever the other side does,
+within eight plies, *against every hand the opponent could be holding*. The
+rules decide that, not a network, so the same 2,149 questions mean the same
+thing to any bot ever built. 8,000 random-play games produced them in 75
+seconds.
+
+Bucketed by the share of legal moves that keep the win, which is the axis that
+actually separates bots:
+
+| moves that win | n | random | greedy | v4-2h | v5-2h | v4-12h |
+|---|---:|---:|---:|---:|---:|---:|
+| under 10% | 314 | 1.3% | 27.1% | 51.3% | 59.6% | 57.3% |
+| 10-25% | 639 | 7.0% | 20.2% | 61.0% | 61.4% | 70.3% |
+| 25-50% | 229 | 34.9% | 34.5% | 62.5% | 63.3% | 65.5% |
+| over 50% | 967 | 95.1% | 95.9% | 94.0% | 92.9% | 93.0% |
+| **overall** | 2,149 | 48.8% | 56.8% | 74.6% | 75.5% | 78.1% |
+
+Four things worth reading off this.
+
+**The easy band is worthless.** Where more than half the moves win, everything
+scores 93-96% *including uniform random play*. Those positions are 45% of the
+set and separate nothing. They are why the generator's quota now bands by
+share: without one the suite fills with them.
+
+**The sharp band is the whole measurement.** Where fewer than one move in ten
+wins, random gets 1.3% and the nets get 51-60%. That is a fortyfold gap on
+exactly the positions where a plan is needed rather than a shrug.
+
+**Greedy is worse than random in one band and far better in another.** At
+10-25% it scores 20.2% against random's 7.0%, but at 25-50% it scores 34.5%
+against random's 34.9%. A one-ply static evaluation has a systematic blind
+spot, not a uniform weakness, which is what makes it a poor anchor.
+
+**Depth is not difficulty.** Every bot is *best* at two plies and shows no
+trend after: v4-12h runs 88.6, 76.2, 77.6, 76.6, 75.6, 72.0, 76.9 from two
+plies to eight. An eight-ply forced win with many winning moves is easier than
+a two-ply one with a single answer. Sharpness is the hardness axis; ply count
+is close to noise.
+
+Hidden information barely moves any of them (v5-2h: 73.4% known, 79.5%
+hidden). The positions are late and the ranges are small by then.
+
+The ordering — v4-2h `74.6`, v5-2h `75.5`, v4-12h `78.1` — is worth less than
+it looks. All three are within a few points, and this measures endgame
+conversion only. A bot can convert every won endgame and still play a poor
+opening. Read it beside the ladder, not instead of it.
