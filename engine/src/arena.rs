@@ -28,13 +28,19 @@ use crate::actions::Action;
 use crate::rebel::{reserve, true_config, Config, Ctx, NSLOT};
 use crate::rng::Rng;
 use crate::selfplay::resolve_chance;
-use crate::state::{State, BLACK, WHITE};
+use crate::rebel::Belief;
+use crate::state::{
+    Cont, ContStack, State, BLACK, N_ZONES, WHITE, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP, Z_HAND,
+    Z_SUPPLY,
+};
+use crate::board::{NONE, N_HEXES};
+use crate::units::{N_UNITS, UNITS};
 use crate::units::index_of_id;
 
 /// Bumped whenever a message changes shape. A bot announces the version it
 /// was built against and the referee refuses to play a mismatch, because a
 /// frozen binary can never be taught a new one.
-pub const PROTOCOL: u32 = 5;
+pub const PROTOCOL: u32 = 6;
 
 /// A bot's first line on stdout, before it reads anything.
 #[derive(Serialize, Deserialize, Debug)]
@@ -102,35 +108,230 @@ pub enum Obs {
     },
 }
 
-/// A position on the wire: the public state and both ranges, hex-encoded in
-/// the versioned form `roots.rs` defines.
+/// A position in the language of the game rather than of this build's memory.
 ///
-/// A *game* never carries this — forming a belief is the bot's own job, and
-/// shipping one would be shipping half its thinking. A *benchmark question*
-/// does, because a question has to be identical for every bot that answers it,
-/// and because the range a position is proven against is part of the claim.
-pub fn encode_position(state: &State, belief: &[crate::rebel::Belief; 2]) -> String {
-    let mut raw = Vec::new();
-    crate::roots::write_root(&mut raw, state, belief).expect("a vector never fails to write");
-    raw.iter().map(|b| format!("{:02x}", b)).collect()
+/// Units are named by the id the rules give them and hexes by index, so a bot
+/// compiled against a different internal state reads one and fills in its own.
+/// The alternative — writing this build's `State` out field by field — is a
+/// memcpy with extra steps, and it silently stops meaning anything the moment
+/// a zone is added.
+///
+/// It carries exactly what the player to move can see: the board, the public
+/// counts, and its own coins. The other side's hand is a *size*, not a list,
+/// because which of its unseen coins sit in hand rather than bag is precisely
+/// the hidden thing — and the range of hands consistent with that size is
+/// something every correct bot derives for itself from the same public facts.
+///
+/// A *game* never carries one of these: forming a belief is the bot's own job.
+/// A *benchmark question* is a position by definition, and has to mean the
+/// same thing to every bot that answers it.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct Position {
+    pub draft: Draft,
+    /// `[hex, unit id, owner, height]` for each occupied hex.
+    pub units: Vec<[u16; 4]>,
+    /// `[hex, owner]` for each control marker.
+    pub marks: Vec<[u16; 2]>,
+    /// `[player, zone, unit id, count]` for every coin off the board, the
+    /// zone being one of the codes below.
+    pub coins: Vec<[u16; 4]>,
+    /// The hands each player may be holding, as the public record has it,
+    /// each hand a list of `[unit id, count]`. Both sides, not just the
+    /// hidden one: the player to move knows its own hand, but its *opponent*
+    /// does not, and a solve that was told otherwise would be solving a game
+    /// where one side plays with its coins face up.
+    ///
+    /// Carried rather than derived, because a question has to be quantified
+    /// over exactly the set the proof was.
+    pub ranges: [Vec<Vec<[u16; 2]>>; 2],
+    pub markers: [u8; 2],
+    pub initiative: u8,
+    pub moved: bool,
+    pub round: u16,
+    pub first: u8,
+    pub active: u8,
+    pub turns: [u8; 2],
+    pub plays: u16,
+    pub priest: bool,
 }
 
-pub fn decode_position(hex: &str) -> Result<(State, [crate::rebel::Belief; 2]), String> {
-    if hex.len() % 2 != 0 {
-        return Err("a position is an even number of hex digits".into());
+/// Zone codes this notation defines, and where they live in *this* build.
+/// They are deliberately not the engine's own numbering: a build numbers its
+/// zones however it likes, and mapping these onto them is the reader's job.
+const ZONES: [(u16, usize); 6] = [
+    (0, Z_BAG),
+    (1, Z_HAND),
+    (2, Z_FACEUP),
+    (3, Z_FACEDOWN),
+    (4, Z_SUPPLY),
+    (5, Z_ELIM),
+];
+
+impl Position {
+    /// The position as the player to move sees it. Only meaningful at a coin
+    /// play: mid-turn there is a continuation stack to be in the middle of,
+    /// and a benchmark question has no business being half way through a
+    /// maneuver.
+    pub fn of(s: &State, draft: &Draft, ranges: [&[Config]; 2]) -> Result<Position, String> {
+        if !matches!(s.pending, Cont::MainPlay) || s.conts.len() > 0 {
+            return Err("a position is written at a coin play, not mid-turn".into());
+        }
+        let mover = s.to_act();
+        let ctx = Ctx::new(s);
+        let mut units = Vec::new();
+        let mut marks = Vec::new();
+        for h in 0..N_HEXES {
+            if s.hex_type[h] != NONE {
+                units.push([
+                    h as u16,
+                    UNITS[s.hex_type[h] as usize].id,
+                    s.hex_owner[h] as u16,
+                    s.hex_height[h] as u16,
+                ]);
+            }
+            if s.loc_marker[h] != NONE {
+                marks.push([h as u16, s.loc_marker[h] as u16]);
+            }
+        }
+        let mut coins = Vec::new();
+        for p in 0..2usize {
+            for (code, z) in ZONES {
+                for u in 0..N_UNITS {
+                    // The side not to move reports bag and hand as one pool.
+                    let n = match (p as u8 != mover, z) {
+                        (true, Z_BAG) => s.zones[p][Z_BAG][u] + s.zones[p][Z_HAND][u],
+                        (true, Z_HAND) => 0,
+                        _ => s.zones[p][z][u],
+                    };
+                    if n > 0 {
+                        coins.push([p as u16, code, UNITS[u].id, n as u16]);
+                    }
+                }
+            }
+        }
+        Ok(Position {
+            draft: draft.clone(),
+            units,
+            marks,
+            coins,
+            ranges: [0, 1].map(|p| {
+                ranges[p]
+                    .iter()
+                    .map(|c| {
+                        (0..NSLOT)
+                            .filter(|&k| c.hand[k] > 0)
+                            .map(|k| [UNITS[ctx.slots[p][k] as usize].id, c.hand[k] as u16])
+                            .collect()
+                    })
+                    .collect()
+            }),
+            markers: s.markers_hand,
+            initiative: s.initiative,
+            moved: s.initiative_moved,
+            round: s.round,
+            first: s.first_player,
+            active: s.active,
+            turns: s.turns_taken,
+            plays: s.main_plays,
+            priest: s.wp_v2_triggered,
+        })
     }
-    let raw: Result<Vec<u8>, _> = (0..hex.len() / 2)
-        .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16))
-        .collect();
-    let raw = raw.map_err(|_| "a position is hex".to_string())?;
-    crate::roots::read_root(&mut raw.as_slice()).map_err(|e| e.to_string())
+
+    /// The state this describes, and the ranges it implies: a point mass on
+    /// the mover's own coins, and for the other side every hand its public
+    /// counts allow. Which hand the carrier state happens to hold is
+    /// arbitrary and never read — the proof quantifies over all of them, and
+    /// the bot is given the range, not the truth.
+    pub fn state(&self) -> Result<(State, [Belief; 2]), String> {
+        let mut s = self.draft.state()?;
+        for p in 0..2 {
+            for z in 0..N_ZONES {
+                s.zones[p][z] = [0; N_UNITS];
+            }
+        }
+        for &[p, code, id, n] in &self.coins {
+            let (_, z) = ZONES
+                .iter()
+                .find(|&&(c, _)| c == code)
+                .ok_or_else(|| format!("zone {} is not in this notation", code))?;
+            let u = index_of_id(id).ok_or_else(|| format!("unitTypeId {} is out of scope", id))?;
+            s.zones[p as usize][*z][u as usize] += n as u8;
+        }
+        s.hex_type = [NONE; N_HEXES];
+        s.hex_owner = [NONE; N_HEXES];
+        s.hex_height = [0; N_HEXES];
+        s.loc_marker = [NONE; N_HEXES];
+        for &[h, id, owner, height] in &self.units {
+            let u = index_of_id(id).ok_or_else(|| format!("unitTypeId {} is out of scope", id))?;
+            s.hex_type[h as usize] = u;
+            s.hex_owner[h as usize] = owner as u8;
+            s.hex_height[h as usize] = height as u8;
+        }
+        for &[h, owner] in &self.marks {
+            s.loc_marker[h as usize] = owner as u8;
+        }
+        s.markers_hand = self.markers;
+        s.initiative = self.initiative;
+        s.initiative_moved = self.moved;
+        s.round = self.round;
+        s.first_player = self.first;
+        s.active = self.active;
+        s.turns_taken = self.turns;
+        s.main_plays = self.plays;
+        s.wp_v2_triggered = self.priest;
+        s.winner = NONE;
+        s.adjudicated_draw = false;
+        s.interrupt = false;
+        s.pending = Cont::MainPlay;
+        s.conts = ContStack::default();
+
+        // Deal the side not to move the first of the hands it might hold.
+        // Which one the carrier state ends up with is arbitrary and never
+        // read: the proof quantifies over all of them, and the bot is handed
+        // the range rather than the truth.
+        let them = 1 - s.to_act() as usize;
+        for &[id, n] in self.ranges[them]
+            .first()
+            .ok_or("a position needs the range each side may hold")?
+        {
+            let u = index_of_id(id).ok_or_else(|| format!("unitTypeId {} is out of scope", id))?
+                as usize;
+            if s.zones[them][Z_BAG][u] < n as u8 {
+                return Err("a hand asks for coins the pool does not have".into());
+            }
+            s.zones[them][Z_BAG][u] -= n as u8;
+            s.zones[them][Z_HAND][u] += n as u8;
+        }
+
+        let ctx = Ctx::new(&s);
+        let mut belief = [Belief::default(), Belief::default()];
+        for p in 0..2 {
+            let mut out = Vec::with_capacity(self.ranges[p].len());
+            for hand in &self.ranges[p] {
+                let mut c = true_config(&s, p as u8, &ctx);
+                c.hand = [0; NSLOT];
+                for &[id, n] in hand {
+                    let u = index_of_id(id)
+                        .ok_or_else(|| format!("unitTypeId {} is out of scope", id))?;
+                    let k = (0..NSLOT)
+                        .find(|&k| ctx.slots[p][k] == u)
+                        .ok_or("a hand names a coin that side never drafted")?;
+                    c.hand[k] = n as u8;
+                }
+                out.push((c, 1.0));
+            }
+            belief[p] = Belief::from_pairs(out);
+        }
+        Ok((s, belief))
+    }
 }
 
 /// What a bot is told when a game first reaches it.
 /// A position handed to a bot directly, rather than played into.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Placed {
-    pub position: String,
+    pub position: Position,
     pub seat: u8,
     pub seed: u64,
 }
@@ -389,7 +590,7 @@ pub struct Question {
     /// How many hands the loser could hold. One means the position has no
     /// hidden information left in it.
     pub range: usize,
-    pub position: String,
+    pub position: Position,
 }
 
 /// The referee's view of one game.
@@ -398,6 +599,8 @@ struct Bout {
     rng: Rng,
     /// Which bot plays which seat.
     bots: [usize; 2],
+    /// The armies, so a position can name its units.
+    draft: Draft,
     /// What each seat has not been told yet.
     pending: [Vec<Obs>; 2],
     start: [Option<Start>; 2],
@@ -423,7 +626,7 @@ pub struct Table {
     /// sweep. Proving one is expensive and proving many is the same work
     /// spread over every core, so positions are collected and swept in bulk
     /// rather than examined one at a time as they arrive.
-    queued: Vec<(u32, State)>,
+    queued: Vec<(u32, State, Draft)>,
     done: Vec<(u32, [usize; 2], f32)>,
     dropped: BTreeMap<usize, Vec<u32>>,
     /// Bots that see their opponent's strategy. Empty in a ladder.
@@ -471,6 +674,7 @@ impl Table {
                 s,
                 rng: Rng::new(seed),
                 bots,
+                draft: draft.clone(),
                 pending: [Vec::new(), Vec::new()],
                 start: [start(WHITE), start(BLACK)],
                 asked: [false, false],
@@ -484,21 +688,15 @@ impl Table {
     /// Seat a game at a benchmark position rather than at a draft. The
     /// referee needs the same position the bot was handed, so that it can say
     /// whether the win still stands after the bot has moved.
-    pub fn start_at(
-        &mut self,
-        id: u32,
-        state: State,
-        belief: [crate::rebel::Belief; 2],
-        bots: [usize; 2],
-        seed: u64,
-    ) {
-        let _ = belief;
+    pub fn start_at(&mut self, id: u32, at: &Position, bots: [usize; 2], seed: u64) -> Result<(), String> {
+        let (state, _) = at.state()?;
         self.bouts.insert(
             id,
             Bout {
                 s: state,
                 rng: Rng::new(seed),
                 bots,
+                draft: at.draft.clone(),
                 pending: [Vec::new(), Vec::new()],
                 start: [None, None],
                 asked: [false, false],
@@ -506,6 +704,7 @@ impl Table {
                 over: false,
             },
         );
+        Ok(())
     }
 
     /// Resolve every pending draw and retire every finished game, so that each
@@ -535,7 +734,7 @@ impl Table {
                 ended.push((id, b.bots, b.s.utility(WHITE as usize)));
             } else if drew {
                 // Only a game that just moved is a new position to prove.
-                fresh.push((id, b.s));
+                fresh.push((id, b.s, b.draft.clone()));
             }
         }
         self.queued.append(&mut fresh);
@@ -578,7 +777,8 @@ impl Table {
         b.watched = [false, false];
         // A move that leaves a decision node is a position to prove; one that
         // leaves a draw belongs to `settle`, which records it once resolved.
-        let reached = (!b.s.is_terminal() && !b.s.is_chance()).then_some((id, b.s));
+        let reached =
+            (!b.s.is_terminal() && !b.s.is_chance()).then_some((id, b.s, b.draft.clone()));
         b.pending[1 - player as usize].push(Obs::Act {
             player,
             key: crate::rebel::obs_key(&action),
@@ -626,8 +826,8 @@ impl Table {
         }
         std::mem::take(&mut self.queued)
             .into_par_iter()
-            .filter(|(_, s)| (0..2).any(|p| s.markers_on_board(p) >= min_markers))
-            .filter_map(|(id, s)| {
+            .filter(|(_, s, _)| (0..2).any(|p| s.markers_on_board(p) >= min_markers))
+            .filter_map(|(id, s, draft)| {
                 let winner = s.to_act();
                 let plies = settled(&s, winner, cap, budget)?;
                 // A win already available in fewer plies is a different and
@@ -638,6 +838,12 @@ impl Table {
                 let (wins, moves) = sharpness(&s, winner, plies, budget);
                 let ctx = Ctx::new(&s);
                 let range = opponent_range(&s, 1 - winner, &ctx);
+                let ours = opponent_range(&s, winner, &ctx);
+                let ranges = if winner == WHITE {
+                    [&ours[..], &range[..]]
+                } else {
+                    [&range[..], &ours[..]]
+                };
                 let mine = crate::rebel::Belief::point(true_config(&s, winner, &ctx));
                 let theirs =
                     crate::rebel::Belief::from_pairs(range.iter().map(|&c| (c, 1.0)).collect());
@@ -653,7 +859,7 @@ impl Table {
                     wins,
                     moves,
                     range: range.len(),
-                    position: encode_position(&s, &belief),
+                    position: Position::of(&s, &draft, ranges).ok()?,
                 })
             })
             .collect()
@@ -788,9 +994,11 @@ impl PyTable {
 
     /// Seat a game at a benchmark position, given on the wire.
     fn start_at(&mut self, id: u32, position: &str, bots: [usize; 2], seed: u64) -> pyo3::PyResult<()> {
-        let (state, belief) =
-            decode_position(position).map_err(pyo3::exceptions::PyValueError::new_err)?;
-        self.0.start_at(id, state, belief, bots, seed);
+        let at: Position = serde_json::from_str(position)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.0
+            .start_at(id, &at, bots, seed)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
         Ok(())
     }
 
@@ -812,7 +1020,11 @@ impl PyTable {
             self.0
                 .harvest(batch, min_plies, cap, min_markers, budget)
                 .into_iter()
-                .map(|q| (q.id, q.winner, q.plies, q.wins, q.moves, q.range, q.position))
+                .map(|q| {
+                    let at = serde_json::to_string(&q.position)
+                        .expect("a position always serialises");
+                    (q.id, q.winner, q.plies, q.wins, q.moves, q.range, at)
+                })
                 .collect()
         })
     }

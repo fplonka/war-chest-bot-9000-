@@ -48,7 +48,7 @@ import warchest  # noqa: E402
 # of it, so a rating is strength across the pool rather than on one army.
 DRAFT_POOL = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 17, 18, 19, 52, 53, 54]
 
-PROTOCOL = 5
+PROTOCOL = 6
 
 # A game is won by controlling this many locations.
 WIN_MARKERS = 6
@@ -414,7 +414,9 @@ def generate(paths, games, seed, concurrent, devices, out_dir,
             seen.add(position)
             taken[key] = taken.get(key, 0) + 1
             questions.append({
-                "position": position, "winner": winner, "depth": plies,
+                # The referee hands it over as text; the suite keeps it as an
+                # object so the file stays something a person can read.
+                "position": json.loads(position), "winner": winner, "depth": plies,
                 "wins": wins, "moves": moves, "range": size,
             })
 
@@ -494,7 +496,8 @@ def tablebase(bot_path, suite_dir, out_path, device=-1, concurrent=32):
     def ask(i):
         q = questions[i]
         # Our bot takes the winning seat; nothing plays the other one.
-        table.start_at(i, q["position"], [0, 1] if q["winner"] == 0 else [1, 0], 1)
+        table.start_at(i, json.dumps(q["position"]),
+                       [0, 1] if q["winner"] == 0 else [1, 0], 1)
         return {"id": i, "at": {"position": q["position"], "seat": q["winner"],
                                 "seed": 1}}
 

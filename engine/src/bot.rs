@@ -436,8 +436,11 @@ mod tests {
             Session::new(&draft(), 0, 41).unwrap(),
             Session::new(&draft(), 1, 42).unwrap(),
         ];
-        // Play a while, so the ranges are something other than a point mass.
-        for _ in 0..14 {
+        // A seat stands exactly where a question would put it in the instant
+        // before it moves: at a coin play of its own, holding a range. Catch
+        // it there, because that is the only shape a question ever takes.
+        let mut caught = None;
+        for _ in 0..40 {
             table.settle();
             if !table.reap().is_empty() {
                 break;
@@ -456,19 +459,53 @@ mod tests {
                     for obs in &ask.obs {
                         seats[bot].observe(obs, &brain).unwrap();
                     }
+                    if caught.is_none() && seats[bot].bel[1 - bot].cfg.len() > 1 {
+                        let (a, b) = (seats[bot].bel[0].cfg.clone(), seats[bot].bel[1].cfg.clone());
+                        if let Ok(at) =
+                            crate::arena::Position::of(&seats[bot].s, &draft(), [&a, &b])
+                        {
+                            caught = Some((at, seats[bot].s, seats[bot].bel.clone(), bot as u8));
+                        }
+                    }
                     let (action, _) = seats[bot].decide(&brain, false).unwrap();
                     done.push(Done { id: ask.id, action: Some(action), policy: None });
                 }
                 table.accept(bot, Reply { done, error: None }).unwrap();
             }
+            if caught.is_some() {
+                break;
+            }
         }
-        let seat = seats[0].seat;
-        let wire = crate::arena::encode_position(&seats[0].s, &seats[0].bel);
-        let (state, belief) = crate::arena::decode_position(&wire).unwrap();
+        let (at, was, bel, seat) = caught.expect("no seat reached a coin play of its own");
+
+        let wire = serde_json::to_string(&at).unwrap();
+        let back: crate::arena::Position = serde_json::from_str(&wire).unwrap();
+        let (state, belief) = back.state().unwrap();
         let placed = Session::at(state, belief, seat, 7).unwrap();
-        assert_eq!(placed.s, seats[0].s, "the position moved");
+
+        // What the notation promises: every public fact survives, the mover
+        // keeps its own coins, and both ranges come out the same. It does not
+        // promise the other side's actual hand, which it never carried -- a
+        // question tells you only what you may know, and the range is what
+        // you may know.
+        assert_eq!(placed.s.hex_type, was.hex_type, "the board moved");
+        assert_eq!(placed.s.hex_owner, was.hex_owner, "the board moved");
+        assert_eq!(placed.s.loc_marker, was.loc_marker, "the markers moved");
+        assert_eq!(placed.s.markers_hand, was.markers_hand, "the markers moved");
+        assert_eq!(placed.s.round, was.round, "the round moved");
+        assert_eq!(placed.s.active, was.active, "the turn moved");
+        assert_eq!(placed.s.initiative, was.initiative, "initiative moved");
+        assert_eq!(
+            placed.s.zones[seat as usize], was.zones[seat as usize],
+            "the mover's own coins moved"
+        );
+        // As sets: a range is the hands that are possible, and the order a
+        // build happens to list them in is its own business.
         for p in 0..2 {
-            assert_eq!(placed.bel[p].cfg, seats[0].bel[p].cfg, "range {} moved", p);
+            let (mut got, mut want) = (placed.bel[p].cfg.clone(), bel[p].cfg.clone());
+            got.sort_unstable_by_key(|c| c.hand);
+            want.sort_unstable_by_key(|c| c.hand);
+            assert_eq!(got, want, "range {} moved", p);
         }
     }
 

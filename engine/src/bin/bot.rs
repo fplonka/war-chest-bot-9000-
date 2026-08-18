@@ -113,7 +113,7 @@ fn work(ask: &Ask, table: &Table, brain: &Brain, act: bool) -> Result<Done, Stri
     let mut session = match (&ask.start, &ask.at) {
         (Some(start), None) => Session::new(&start.draft, start.seat, start.seed)?,
         (None, Some(at)) => {
-            let (state, belief) = warchest::arena::decode_position(&at.position)?;
+            let (state, belief) = at.position.state()?;
             Session::at(state, belief, at.seat, at.seed)?
         }
         (Some(_), Some(_)) => return Err("a game starts one way or the other".into()),
