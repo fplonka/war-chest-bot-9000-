@@ -357,6 +357,10 @@ def generate(paths, games, seed, concurrent, devices, out_dir,
     the set fills with positions where most moves win, and those are far more
     common than the sharp ones and tell you much less.
 
+    `per_bucket` caps how many of the easy positions are kept, in each of the
+    two hidden-information cases. Nothing else is capped: the sharp positions
+    are the measurement and there is no such thing as too many.
+
     `budget` caps the nodes one proof may build. It never lets an unproven
     position through — it only decides which positions are cheap enough to
     settle — and the few it gives up on cost far more than the rest put
@@ -399,7 +403,13 @@ def generate(paths, games, seed, concurrent, devices, out_dir,
                 batch, min_plies, depth, WIN_MARKERS - 2, budget):
             proven += 1
             key = (band(wins, moves), size > 1)
-            if position in seen or taken.get(key, 0) >= per_bucket:
+            # The quota exists to stop the set filling with positions that
+            # separate nothing, and exactly one band does that: where more
+            # than half the legal moves win, uniform random play scores 95%
+            # and beats every trained net. Every other band discriminates
+            # hugely -- under 10%, random gets 1.3% and the nets 51-60% -- so
+            # capping those was throwing away the only positions worth having.
+            if position in seen or (key[0] == EASY and taken.get(key, 0) >= per_bucket):
                 continue
             seen.add(position)
             taken[key] = taken.get(key, 0) + 1
@@ -604,6 +614,9 @@ def devices(spec):
 #: of them are, however deep the win is.
 SHARES = [("under 10%", 0.0, 0.10), ("10-25%", 0.10, 0.25),
           ("25-50%", 0.25, 0.50), ("over 50%", 0.50, 1.0)]
+
+#: The one band that separates nothing, and so the only one worth capping.
+EASY = SHARES[-1][0]
 
 
 def band(wins, moves):

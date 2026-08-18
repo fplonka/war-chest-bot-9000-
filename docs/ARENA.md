@@ -290,6 +290,16 @@ What it does not measure: this is the tail of a game, and only positions that
 happen to be forced. A bot can convert every won endgame and still play a poor
 opening. It is a floor and a check, not a verdict — read it beside the ladder.
 
+There is a boundary on which bots can be asked at all. A benchmark question
+carries an encoded position, so a bot has to be able to *read* one — and the
+state representation is not frozen across architectures. Between v3 and v4 the
+drawn coin moved out of the continuation and into a zone of its own, so a v3
+binary reads a v5-encoded position one zone short and every byte after it lands
+in the wrong field. That is not a rename and no graft fixes it honestly: a
+translation that guessed would produce scores, and wrong ones. Such a bot is
+still fully comparable on the *ladder*, which starts from a draft and needs no
+position decoding. Rate it there.
+
 One weakness is worth naming, because it is fixable. A bot answers each
 question with one *sampled* move, so a bot that finds the win 51% of the time
 and one that finds it 99% of the time both look like coin flips on any single
