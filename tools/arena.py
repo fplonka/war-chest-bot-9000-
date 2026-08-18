@@ -508,9 +508,9 @@ def tablebase(bot_path, suite_dir, out_path, device=-1, concurrent=32):
 
     n = len(kept) + len(blundered)
     held = set(kept)
-    # Broken out by how deep the win is and whether any hidden information is
-    # left, because those are the two things that make a question hard and a
-    # single average hides both.
+
+    # A single average hides everything that matters here, because the set
+    # deliberately spans questions of very different hardness.
     def slice_of(pick):
         idx = [i for i, q in enumerate(questions) if pick(q)]
         got = sum(1 for i in idx if i in held)
@@ -531,7 +531,6 @@ def tablebase(bot_path, suite_dir, out_path, device=-1, concurrent=32):
                      for name, lo, hi in SHARES},
         "hidden": slice_of(lambda q: q["range"] > 1),
         "known": slice_of(lambda q: q["range"] == 1),
-        "blundered": blundered[:40],
     }
     write_json(out_path, result)
     print(f"\n{name}: kept the win in {len(kept)}/{n} proven positions "
