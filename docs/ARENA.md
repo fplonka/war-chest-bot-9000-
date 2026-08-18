@@ -256,9 +256,15 @@ that player, and a poor yardstick for anyone else. It showed up as a bot
 scoring worst of all the nets on positions from its own games and mid-field on
 positions from random play.
 
-Which is the general warning: a suite is only as neutral as its source. For
-comparing bots, generate from random play or from a bot that is not under
-test.
+Which is the general warning, and it is stronger than it looks: **never rank
+bots on a suite one of them generated.** Measured over three sets, each
+generator gives up seventeen or eighteen points on its own positions and none
+anywhere else -- `v4-12h` leads every set but its own, where it comes fourth.
+One question per game does not repair it, because the deeper cause is not
+counting: a forced win survives in the record largely *because* the player to
+move failed to take it, so the positions are selected for being invisible to
+whoever generated them. Use random play, or a generator that is not in the
+field.
 
 The proof itself is pure rules recursion with no network in it, so it wants
 cores and not a card — the GPU is for batching network evaluations, and there

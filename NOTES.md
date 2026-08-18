@@ -856,9 +856,35 @@ converted wins are not. A self-play set is therefore concentrated on its own
 author's blind spots.
 
 That makes it an excellent adversarial probe of the bot that generated it, and
-a poor yardstick for anyone else. The fix is one question per game, which
-removes the amplification at the source; the standing advice is to generate
-comparison sets from random play, or from a bot that is not under test.
+a poor yardstick for anyone else.
+
+A third set settles it. Generating from `v4-12h` self-play instead, and
+scoring everyone on all three:
+
+| bot | random play | v5-2h self-play | v4-12h self-play |
+|---|---:|---:|---:|
+| random | `48.8%` | `34.1%` | `37.8%` |
+| greedy | `56.8%` | `46.8%` | `52.3%` |
+| v3-trav | -- | `58.9%` | `51.7%` |
+| v4-2h | `74.6%` | `65.6%` | `69.4%` |
+| v5-2h | `75.5%` | **`57.0%`** | `66.8%` |
+| v4-12h | `78.1%` | `71.2%` | **`61.1%`** |
+
+Each generator collapses on its own set and nowhere else, by almost the same
+amount: `v5-2h` gives up `18.5` points on its own positions, `v4-12h` gives up
+`17.0` on its own. On each other's sets both are fine. `v4-12h` leads every
+other column and comes *fourth* in its own.
+
+One question per game does not fix it -- the `v4-12h` set was generated with
+that already in place. So the amplification is not the whole mechanism, and
+the deeper one cannot be fixed by counting: a forced win survives in the
+record largely *because* the player to move failed to take it, since taking it
+would have ended the game. The positions a self-play set contains are
+therefore selected for being invisible to the player who generated them,
+however few of them are kept per game.
+
+The rule that follows is simple and absolute: **never rank bots on a suite one
+of them generated.** Use random play, or a generator that is not in the field.
 
 Two things this does *not* explain, and they are worth keeping separate. The
 first is that `v5-2h` tops the ladder at `1313` Elo against `v4-2h`'s `1060`
