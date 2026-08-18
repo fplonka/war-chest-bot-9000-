@@ -240,6 +240,19 @@ tactical one. The two measure different things; build both.
 A long run publishes as it goes, so a night's work is never one crash from
 nothing.
 
+Only one question is kept per game, and the reason is not thrift. A won
+position a player *converts* ends the game and yields one or two positions; one
+it *misses* stays won ply after ply and yields a dozen, every one of them from
+a line that player is misplaying. Keeping them all builds a set oversampled
+exactly where whoever generated it is weak — an excellent adversarial probe of
+that player, and a poor yardstick for anyone else. It showed up as a bot
+scoring worst of all the nets on positions from its own games and mid-field on
+positions from random play.
+
+Which is the general warning: a suite is only as neutral as its source. For
+comparing bots, generate from random play or from a bot that is not under
+test.
+
 The proof itself is pure rules recursion with no network in it, so it wants
 cores and not a card — the GPU is for batching network evaluations, and there
 are none. It also quantifies over the *whole* opponent range: a plan that only

@@ -387,7 +387,7 @@ def generate(paths, games, seed, concurrent, devices, out_dir,
     # Enough positions to keep every core busy for a sweep; the proof is the
     # only expensive thing here and it parallelises across positions.
     batch = 8 * (os.cpu_count() or 8)
-    taken, questions, seen = {}, [], set()
+    taken, questions, seen, asked = {}, [], set(), set()
     proven = 0
     published = 0
     started = time.time()
@@ -411,9 +411,19 @@ def generate(paths, games, seed, concurrent, devices, out_dir,
         the referee, over all live games at once and off the interpreter
         lock. What is left here is bookkeeping."""
         nonlocal proven
-        for _, winner, plies, wins, moves, size, position in table.harvest(
+        for gid, winner, plies, wins, moves, size, position in table.harvest(
                 batch, min_plies, depth, WIN_MARKERS - 2, budget):
             proven += 1
+            # One question per game. A won position a player *converts* ends
+            # the game and yields one or two; one it *misses* keeps being won
+            # ply after ply and yields a dozen, every one of them from a line
+            # that player is misplaying. Taking them all makes a set that is
+            # oversampled exactly where whoever generated it is weak, which is
+            # a fine adversarial probe of that player and a poor yardstick for
+            # anyone else.
+            if gid in asked:
+                continue
+            asked.add(gid)
             key = (band(wins, moves), size > 1)
             # The quota exists to stop the set filling with positions that
             # separate nothing, and exactly one band does that: where more
