@@ -492,7 +492,10 @@ def tablebase(bot_path, suite_dir, out_path, device=-1, concurrent=32):
             answered = [d["id"] for d in reply["done"]]
             for i in answered:
                 # One ply has gone, so a correct move leaves the win forced in
-                # one ply fewer.
+                # one ply fewer. The marking runs at the default budget, which
+                # is far above the one generation used: a move must never be
+                # called a blunder because the prover ran out of nodes, and
+                # erring high can only ever credit a move that really wins.
                 q = questions[i]
                 (kept if table.forced(i, q["winner"], max(q["depth"] - 1, 0))
                  else blundered).append(i)
