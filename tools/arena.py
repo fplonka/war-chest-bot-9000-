@@ -428,7 +428,7 @@ def generate(paths, games, seed, concurrent, devices, out_dir,
     print(f"wrote {out_dir / 'suite.json'}")
 
 
-def score(bot_path, suite_dir, out_path, device, concurrent):
+def score(bot_path, questions, wire, device, concurrent):
     """Ask a bot the questions whose answers are proven.
 
     Each question is a position in which one side wins whatever the other
@@ -442,9 +442,10 @@ def score(bot_path, suite_dir, out_path, device, concurrent):
     same questions and the same marking for any bot ever built.
 
     Questions are independent, so many are in flight at once; a searching bot
-    that answered them one at a time would leave its card idle between each."""
-    meta = json.loads((Path(suite_dir) / "suite.json").read_text())
-    questions = meta["questions"]
+    that answered them one at a time would leave its card idle between each.
+
+    `wire` is the questions already serialised, since every bot is handed the
+    same ones and the suite can run to thousands of positions."""
     spec = json.loads((Path(bot_path) / "bot.json").read_text())
     name = spec.get("name", Path(bot_path).name)
 
@@ -456,7 +457,7 @@ def score(bot_path, suite_dir, out_path, device, concurrent):
     def ask(i):
         q = questions[i]
         # Our bot takes the winning seat; nothing plays the other one.
-        table.start_at(i, json.dumps(q["position"]),
+        table.start_at(i, wire[i],
                        [0, 1] if q["winner"] == 0 else [1, 0], 1)
         return {"id": i, "at": {"position": q["position"], "seat": q["winner"],
                                 "seed": 1}}
@@ -506,8 +507,7 @@ def score(bot_path, suite_dir, out_path, device, concurrent):
 
     depths = sorted({q["depth"] for q in questions})
     result = {
-        "kind": "tablebase", "bot": name, "suite": str(suite_dir),
-        "source": meta.get("source", "?"),
+        "bot": name,
         "questions": n, "held": len(kept),
         "rate": round(len(kept) / max(n, 1), 4),
         "by_depth": {str(d): slice_of(lambda q, d=d: q["depth"] == d) for d in depths},
@@ -520,42 +520,40 @@ def score(bot_path, suite_dir, out_path, device, concurrent):
         "hidden": slice_of(lambda q: q["range"] > 1),
         "known": slice_of(lambda q: q["range"] == 1),
     }
-    write_json(out_path, result)
-    print(f"\n{name}: kept the win in {len(kept)}/{n} proven positions "
-          f"({100 * result['rate']:.1f}%)")
-    print(f"  positions from {result['source']}")
-    buckets("moves that win", [(n, result["by_share"][n]) for n, _, _ in SHARES])
-    buckets("plies to win", [(d, result["by_depth"][str(d)]) for d in depths])
-    buckets("hidden hands", [("none", result["known"]), ("some", result["hidden"])])
-    print(f"wrote {out_path}")
     return result
 
 
-def tablebase(bot_paths, suite_dir, out_dir, device=-1, concurrent=32):
-    """Score every bot on the same questions, and lay the answers side by
-    side. One suite, one table: what separates bots is how they do on the
-    hard questions, and that is only readable next to each other."""
-    got = [score(b, suite_dir, Path(out_dir) / f"tablebase_{name(b)}.json",
-                 device, concurrent)
-           for b in bot_paths]
-    if len(got) < 2:
-        return got
-    got.sort(key=lambda r: r["rate"])
-    bands = [n for n, _, _ in SHARES]
-    print(f"\n{'':>14}" + "".join(f"{r['bot']:>11}" for r in got))
-    print(f"{'overall':>14}" + "".join(f"{100 * r['rate']:>10.1f}%" for r in got))
-    print()
-    for b in bands:
-        n = got[0]["by_share"][b]["n"]
-        if n:
-            print(f"{b + f' (n={n})':>14}"
-                  + "".join(f"{100 * r['by_share'][b]['rate']:>10.1f}%" for r in got))
-    for k in ("known", "hidden"):
-        n = got[0][k]["n"]
-        if n:
-            print(f"{k + f' (n={n})':>14}"
-                  + "".join(f"{100 * r[k]['rate']:>10.1f}%" for r in got))
-    return got
+def tablebase(bot_paths, suite_dir, out_path, device=-1, concurrent=32):
+    """Score every bot on the same questions and report them together.
+
+    One invocation, one report — the same shape the ladder writes — because
+    the question being asked is how these bots compare, and a rate means
+    little until it sits beside another. The suite is read once and the
+    positions serialised once: every bot is handed the identical bytes."""
+    meta = json.loads((Path(suite_dir) / "suite.json").read_text())
+    questions = meta["questions"]
+    wire = [json.dumps(q["position"]) for q in questions]
+    bots = sorted((score(b, questions, wire, device, concurrent)
+                   for b in bot_paths),
+                  key=lambda r: r["rate"])
+    result = {"kind": "tablebase", "suite": str(suite_dir),
+              "source": meta.get("source", "?"),
+              "questions": len(questions), "bots": bots}
+    write_json(out_path, result)
+
+    names = [r["bot"] for r in bots]
+    depths = sorted(bots[0]["by_depth"], key=int)
+    print(f"\n{len(questions)} proven positions from {result['source']}")
+    buckets("overall", names, [("kept the win",
+                               [{"n": r["questions"], "rate": r["rate"]} for r in bots])])
+    buckets("moves that win", names,
+            [(b, [r["by_share"][b] for r in bots]) for b, _, _ in SHARES])
+    buckets("plies to win", names,
+            [(d, [r["by_depth"][d] for r in bots]) for d in depths])
+    buckets("hidden hands", names,
+            [(k, [r[k] for r in bots]) for k in ("known", "hidden")])
+    print(f"wrote {out_path}")
+    return result
 
 
 # ---------------------------------------------------------------- the ladder
@@ -617,13 +615,15 @@ def band(wins, moves):
     return next(n for n, lo, hi in SHARES if lo < share <= hi)
 
 
-def buckets(title, rows):
-    """One rate per bucket, with the count it rests on. A rate over nine
-    questions says less than the same rate over ninety."""
-    print(f"{title:>14} {'n':>6} {'held':>6} {'rate':>7}")
-    for label, row in rows:
-        if row["n"]:
-            print(f"{label:>14} {row['n']:>6} {row['held']:>6} {row['rate']:>7.3f}")
+def buckets(title, names, rows):
+    """One rate per bucket per bot, with the count each rests on. A rate over
+    nine questions says less than the same rate over ninety, and a rate says
+    little at all until it sits beside another bot's."""
+    print(f"\n{title:>14} {'n':>6}" + "".join(f"{x:>11}" for x in names))
+    for label, cells in rows:
+        if cells[0]["n"]:
+            print(f"{label:>14} {cells[0]['n']:>6}"
+                  + "".join(f"{100 * c['rate']:>10.1f}%" for c in cells))
 
 
 def digest(path):
@@ -829,7 +829,8 @@ def main():
                         devices(args.devices), args.out, args.depth,
                         args.per_bucket, args.min_plies, args.budget)
     if args.command == "tablebase":
-        return tablebase(args.bots, args.suite, args.out or "arena",
+        stem = "tablebase_" + "_".join(name(b) for b in args.bots[:3])
+        return tablebase(args.bots, args.suite, report_path(args.out, stem),
                          args.device, args.concurrent)
     if len(devices(args.devices)) != 2:
         ap.error("--devices takes exactly two device ids")

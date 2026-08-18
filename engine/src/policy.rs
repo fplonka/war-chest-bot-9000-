@@ -91,14 +91,6 @@ impl NodePolicy {
             }
     }
 
-    /// The most likely cell of config `c`'s row. Ties go to the first, so the
-    /// choice is a property of the position rather than of the run.
-    pub fn best(&self, c: usize) -> usize {
-        let row = self.row(c);
-        row.clone()
-            .max_by(|&a, &b| self.probs[a].total_cmp(&self.probs[b]))
-            .unwrap_or(row.start)
-    }
 
     /// The belief over the actor's private config after they were seen to make
     /// the observation `obs`. `prior` must be the belief this node was framed

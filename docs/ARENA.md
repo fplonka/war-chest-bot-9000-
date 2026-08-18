@@ -57,10 +57,6 @@ bot     -> {"done":  [{"id": 7, "action": 8452}]}
   bot was asked to move in. A watch is acknowledged without an action, which is
   how the referee knows the bot is ready for what happens next.
 * `drop` — these games are over; forget them.
-* `policy` — on an ask, "send the whole strategy, not just the move". A bot
-  works out a probability for every action of every hand it might hold and then
-  samples one row, so the rest is already in hand. Nothing in a ladder asks for
-  it; the suite does.
 
 The two directions are not in step. The referee sends work for any game it is
 not already waiting on, and the bot answers each game as that game is ready, so
@@ -295,16 +291,11 @@ translation that guessed would produce scores, and wrong ones. Such a bot is
 still fully comparable on the *ladder*, which starts from a draft and needs no
 position decoding. Rate it there.
 
-One weakness is worth naming, because it is fixable. A bot answers each
-question with one *sampled* move, so a bot that finds the win 51% of the time
-and one that finds it 99% of the time both look like coin flips on any single
-question, and only the average over thousands separates them. The bot already
-computes a probability for every move it might make, and `policy` on the ask
-already returns it. Marking the probability mass that fell on winning moves,
-rather than whether one sample of it did, would measure the same thing with a
-fraction of the variance — the referee would have to prove every legal move at
-the question rather than only the one played, which is what generation already
-does to compute sharpness.
+A bot answers each question with one *sampled* move, so a bot that finds the
+win half the time and one that finds it almost always look alike on any single
+question, and only the average over thousands separates them. That is why the
+suites run to thousands: more questions, rather than a cleverer score, is how
+the chess test suites handle the same thing.
 
 ## Running one
 

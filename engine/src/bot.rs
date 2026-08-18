@@ -30,8 +30,6 @@ use crate::rebel::{
 };
 use crate::rng::Rng;
 
-/// Playouts per action per hand. Enough to order the actions, cheap enough
-/// that a probe keeps up with the bot it is measuring.
 use crate::search::{Cfg, Nets, Solver};
 use crate::state::{Cont, State};
 
@@ -274,7 +272,6 @@ impl Session {
         self.s.apply_inplace(action);
         Ok(action.encode())
     }
-
 }
 
 #[cfg(test)]
@@ -507,7 +504,7 @@ mod tests {
                                     checked += 1;
                                 }
                             }
-                            Obs::Act { player, key, .. } => {
+                            Obs::Act { player, key } => {
                                 // A play that hides its coin must not arrive
                                 // with one: the key has to differ from the
                                 // action that produced it.

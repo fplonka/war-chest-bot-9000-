@@ -265,8 +265,9 @@ def arena_summary(report):
         players = report.get("players") or [{"name": "?"}]
         best = max(players, key=lambda p: p.get("elo") or -1e9)
         return f"{len(players)} bots · {report.get('games')} games · top {best['name']}"
-    return (f"{report['bot']} · kept {report['held']}/{report['questions']} "
-            f"proven wins")
+    best = max(report["bots"], key=lambda b: b["rate"])
+    return (f"{len(report['bots'])} bots · {report['questions']} proven "
+            f"positions · top {best['bot']}")
 
 
 def arena_index(arena_dir):

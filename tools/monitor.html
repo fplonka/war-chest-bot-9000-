@@ -33,8 +33,9 @@ table{border-collapse:collapse;margin:4px 0 10px}
 th,td{text-align:right;padding:1px 14px 1px 0;white-space:nowrap}
 th{color:var(--mut);font-weight:400;border-bottom:1px solid var(--line)}
 th:first-child,td:first-child{text-align:left}
-.bar{display:inline-block;height:9px;min-width:1px;background:#3d8bfd;vertical-align:middle}
-td:last-child{text-align:left;width:220px}
+.track{display:inline-block;width:64px;height:9px;background:var(--line);vertical-align:middle;margin-right:5px}
+.bar{height:9px;min-width:1px;background:#3d8bfd}
+td.rate{text-align:left;width:118px}
 pre{max-height:340px;overflow:auto;margin:4px 0;font:inherit;white-space:pre-wrap}
 #loglink{margin-left:8px;font-size:11px;color:#3d8bfd}
 #tip{position:fixed;display:none;z-index:2;pointer-events:none;white-space:pre;
@@ -216,31 +217,31 @@ function ladder(box, name, l) {
                  p.paired_p == null ? "—" : p.paired_p.toPrecision(2)])));
 }
 
-// A suite result is one bot and a handful of numbers, so it renders as a list
-// of them rather than as a table.
-function facts(box, title, rows) {
-  box.appendChild(E("h2", null, title));
-  const dl = E("dl");
-  rows.forEach(([k, v]) => { dl.appendChild(E("dt", null, k));
-                             dl.appendChild(E("dd", null, v)); });
-  box.appendChild(dl);
-}
-
-// A rate per bucket, with the count it rests on: a bucket of nine says less
-// than a bucket of ninety and the bar alone would not show it.
-function bars(box, title, rows) {
+// A rate per bucket per bot, with the count each rests on: a bucket of nine
+// says less than a bucket of ninety and the bar alone would not show it, and
+// a rate says little at all until it sits beside another bot's.
+function bars(box, title, names, rows) {
   box.appendChild(E("h2", null, title));
   const t = E("table");
-  rows.filter(([, r]) => r && r.n).forEach(([label, r]) => {
+  const head = E("tr");
+  head.appendChild(E("th", null, ""));
+  head.appendChild(E("th", null, "n"));
+  names.forEach(n => head.appendChild(E("th", null, n)));
+  t.appendChild(head);
+  rows.filter(([, cells]) => cells[0] && cells[0].n).forEach(([label, cells]) => {
     const tr = E("tr");
     tr.appendChild(E("td", null, label));
-    tr.appendChild(E("td", null, `${r.held}/${r.n}`));
-    const cell = E("td");
-    const bar = E("div", "bar");
-    bar.style.width = `${(100 * r.rate).toFixed(1)}%`;
-    cell.appendChild(bar);
-    cell.appendChild(E("span", null, ` ${(100 * r.rate).toFixed(1)}%`));
-    tr.appendChild(cell);
+    tr.appendChild(E("td", null, String(cells[0].n)));
+    cells.forEach(c => {
+      const cell = E("td", "rate");
+      const track = E("div", "track");
+      const bar = E("div", "bar");
+      bar.style.width = `${(100 * c.rate).toFixed(1)}%`;
+      track.appendChild(bar);
+      cell.appendChild(track);
+      cell.appendChild(E("span", null, `${(100 * c.rate).toFixed(1)}%`));
+      tr.appendChild(cell);
+    });
     t.appendChild(tr);
   });
   box.appendChild(t);
@@ -259,18 +260,21 @@ function renderArena(d) {
     return ladder(box, d.name, d);
   }
   if (d.kind === "tablebase") {
+    const bots = d.bots;
+    const names = bots.map(b => b.bot);
     $("meta").textContent =
-      `${d.bot} · ${d.held}/${d.questions} proven wins kept ` +
-      `(${(100 * d.rate).toFixed(1)}%)`;
+      `${names.length} bots · ${d.questions} proven positions from ${d.source}`;
+    const col = (pick) => bots.map(pick);
+    bars(box, "kept the win", names,
+         [["overall", col(b => ({n: b.questions, rate: b.rate}))]]);
     // Sharpness, not depth, is what separates bots: a position with one right
     // move is hard however few plies are left in it.
-    bars(box, "kept the win, by share of moves that win",
-         Object.entries(d.by_share));
-    bars(box, "kept the win, by plies to the win",
-         Object.entries(d.by_depth));
-    bars(box, "kept the win, by hidden information",
-         [["none left", d.known], ["some left", d.hidden]]);
-    return;
+    bars(box, "by share of moves that win", names,
+         Object.keys(bots[0].by_share).map(k => [k, col(b => b.by_share[k])]));
+    bars(box, "by plies to the win", names,
+         Object.keys(bots[0].by_depth).map(k => [k, col(b => b.by_depth[k])]));
+    bars(box, "by hidden information", names,
+         [["none left", col(b => b.known)], ["some left", col(b => b.hidden)]]);
   }
 }
 

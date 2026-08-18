@@ -810,14 +810,6 @@ impl Table {
                 } else {
                     [&range[..], &ours[..]]
                 };
-                let mine = crate::rebel::Belief::point(true_config(&s, winner, &ctx));
-                let theirs =
-                    crate::rebel::Belief::from_pairs(range.iter().map(|&c| (c, 1.0)).collect());
-                let belief = if winner == WHITE {
-                    [mine, theirs]
-                } else {
-                    [theirs, mine]
-                };
                 Some(Question {
                     id,
                     winner,
@@ -849,7 +841,7 @@ impl Table {
                 continue;
             }
             b.asked[seat] = true;
-            let mut ask = Ask {
+            let ask = Ask {
                 id,
                 start: b.start[seat].take(),
                 at: None,
