@@ -180,10 +180,12 @@ pub struct Data {
     pub rows: Vec<u8>,
     /// `[n * N_LOCATIONS]` the auxiliary ownership target: who owns each
     /// control location when the game the row came from ends, `0`/`1` for the
-    /// player and `2` for neither. Written at the solve site from the state
-    /// there and overwritten by `backfill_owners` when the game finishes, so a
-    /// row detached before its game ended carries the last state reached
-    /// rather than a sentinel. Training-only: the engine never predicts it.
+    /// player and `2` for neither. `push_value` reserves the space and
+    /// `backfill_owners` writes it at `finish`, which is why no row leaves a
+    /// worker before its game has ended: the ownership at the solve site is a
+    /// raw input feature of the same row, so a row shipped early would teach
+    /// this head to copy its own input. Training-only: the engine never
+    /// predicts it.
     pub aux: Vec<u8>,
     /// `[total_configs, CCOUNTS]` raw counts per config, in the arena order.
     /// Raw rather than normalised: they are `u8`-valued, and storing them that
@@ -292,7 +294,13 @@ impl Data {
         let base = self.rows.len();
         self.rows.resize(base + ROW_BYTES, 0);
         pack_row(s, ctx, &mut self.rows[base..base + ROW_BYTES]);
-        self.aux.extend_from_slice(&location_owners(s));
+        // Reserved, not written: the auxiliary target is a property of the
+        // finished game and `backfill_owners` fills it at `finish`. The
+        // sentinel is not a valid class, so a row that ever reached training
+        // without its label would fail the cross-entropy instead of quietly
+        // teaching the head to copy an input feature -- which is exactly what
+        // happened for as long as rows left a worker mid-game.
+        self.aux.resize(self.aux.len() + N_LOCATIONS, AUX_UNSET);
         if self.coff.is_empty() {
             self.coff.push(0);
         }
@@ -555,8 +563,19 @@ impl<'a> Game<'a> {
         self.pending_job.take()
     }
 
-    /// The rows produced so far (the worker takes them when a game ends).
+    /// This game's rows, which it gives up only once it has ended.
+    ///
+    /// The guard is the whole reason the auxiliary target works: its label is
+    /// the finished game's location ownership, written by `finish`, and a row
+    /// handed over before then would instead carry the ownership at its own
+    /// solve site — which is one of that row's own input features. The GPU
+    /// stream used to take rows after every solve, and no test caught it
+    /// because the tests drive `play_game`, which never did.
     pub fn take_data(&mut self) -> Data {
+        assert!(
+            self.s.is_terminal(),
+            "a game gives up its rows only once it has ended"
+        );
         std::mem::take(&mut self.data)
     }
 
@@ -1061,15 +1080,35 @@ fn blend_outcome(data: &mut Data, from_row: usize, keep: f32, mix: f32, z: f32) 
     }
 }
 
+/// A game cut off when the run stops contributes its census and nothing else.
+///
+/// Its solves were real and its bootstrapped values are sound, but the targets
+/// that are properties of the finished game — the blended outcome anchor and
+/// the final location ownership — were never written, and the ownership a row
+/// would otherwise carry is one of that row's own input features. Rather than
+/// mark such rows and mask them in two languages, they are dropped: censoring
+/// happens only while a run drains, and `censored_games` says how many.
+#[cfg(feature = "gpu")]
+fn censored() -> Data {
+    Data {
+        censored_games: 1,
+        ..Default::default()
+    }
+}
+
 /// Stamp the final owner of every control location onto every row this game
-/// produced, overwriting what the solve site wrote. Reaching the horizon
-/// counts as an ending: the ownership then is the ownership the game got to.
+/// produced. Reaching the horizon counts as an ending: the ownership then is
+/// the ownership the game got to.
 fn backfill_owners(data: &mut Data, from_row: usize, s: &State) {
     let owners = location_owners(s);
     for r in from_row..data.nv {
         data.aux[r * N_LOCATIONS..(r + 1) * N_LOCATIONS].copy_from_slice(&owners);
     }
 }
+
+/// Not one of the three ownership classes: the value an auxiliary target holds
+/// between the row being written and its game ending.
+const AUX_UNSET: u8 = 3;
 
 /// Who owns each control location: `0`/`1` for the player holding its control
 /// marker, `2` for neither. The auxiliary head's target, in `location_hexes`
@@ -1230,10 +1269,8 @@ pub fn run_games_gpu_stream(
                             if busy[k] {
                                 continue;
                             }
-                            if let Some(mut g) = game[k].take() {
-                                let mut d = g.take_data();
-                                d.censored_games += 1;
-                                let _ = data_tx.send(Ok(d));
+                            if game[k].take().is_some() {
+                                let _ = data_tx.send(Ok(censored()));
                                 live -= 1;
                             }
                         }
@@ -1260,10 +1297,8 @@ pub fn run_games_gpu_stream(
                             match step {
                                 Step::Submitted => {
                                     if stop.load(Ordering::Acquire) {
-                                        let mut g = game[k].take().unwrap();
-                                        let mut d = g.take_data();
-                                        d.censored_games += 1;
-                                        let _ = data_tx.send(Ok(d));
+                                        game[k] = None;
+                                        let _ = data_tx.send(Ok(censored()));
                                         live -= 1;
                                         break;
                                     }
@@ -1283,10 +1318,20 @@ pub fn run_games_gpu_stream(
                                     break;
                                 }
                                 Step::Ended => {
+                                    // The only place a finished game's rows
+                                    // leave the worker. Their outcome-shaped
+                                    // targets -- the blended value anchor and
+                                    // the final location ownership -- exist
+                                    // only once `finish` has run, so a row
+                                    // shipped before this point could not
+                                    // carry them.
                                     let _ = g.finish();
                                     let mut d = g.take_data();
                                     d.merge_wait_s += std::mem::take(&mut merge_wait);
-                                    if data_tx.send(Ok(d)).is_err() {
+                                    let handoff = std::time::Instant::now();
+                                    let sent = data_tx.send(Ok(d));
+                                    merge_wait += handoff.elapsed().as_secs_f32();
+                                    if sent.is_err() {
                                         stop.store(true, Ordering::Release);
                                     }
                                     game[k] = None;
@@ -1310,23 +1355,17 @@ pub fn run_games_gpu_stream(
                     busy[k] = false;
                     inflight -= 1;
                     if stop.load(Ordering::Acquire) {
+                        // Stop closes admission, and this solve finished while
+                        // the last waves drained. Its row would still be a row
+                        // of an unfinished game, so it goes with the rest of
+                        // them; only the census survives.
+                        game[k] = None;
+                        live -= 1;
                         match result {
-                            Ok(value) => {
-                                // Stop closes admission, not accounting. This
-                                // solve completed while the final waves drained;
-                                // keep its final bootstrap target, then censor
-                                // only the unfinished public game around it.
-                                let mut g = game[k].take().expect("draining stream game");
-                                g.resume(value);
-                                let mut d = g.take_data();
-                                d.gpu_wait_s += waited.elapsed().as_secs_f32();
-                                d.censored_games += 1;
-                                let _ = data_tx.send(Ok(d));
-                                live -= 1;
+                            Ok(_) => {
+                                let _ = data_tx.send(Ok(censored()));
                             }
                             Err(e) => {
-                                let _ = game[k].take();
-                                live -= 1;
                                 let _ = data_tx.send(Err(format!(
                                     "GPU stream solve failed while draining: {e}"
                                 )));
@@ -1338,17 +1377,7 @@ pub fn run_games_gpu_stream(
                         Ok(value) => {
                             let g = game[k].as_mut().expect("pending stream game");
                             g.resume(value);
-                            let mut d = g.take_data();
-                            d.gpu_wait_s += waited.elapsed().as_secs_f32();
-                            // Carries the previous handoff's block time: this
-                            // one is not known until the send returns.
-                            d.merge_wait_s += std::mem::take(&mut merge_wait);
-                            let handoff = std::time::Instant::now();
-                            let sent = data_tx.send(Ok(d));
-                            merge_wait += handoff.elapsed().as_secs_f32();
-                            if sent.is_err() {
-                                stop.store(true, Ordering::Release);
-                            }
+                            g.data.gpu_wait_s += waited.elapsed().as_secs_f32();
                         }
                         Err(e) => {
                             stop.store(true, Ordering::Release);
