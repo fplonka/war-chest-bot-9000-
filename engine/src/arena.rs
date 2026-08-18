@@ -773,6 +773,33 @@ impl Table {
             return Err(format!("game {}: illegal action {}", id, action));
         }
         let player = b.s.to_act();
+        // A reported strategy is a self-report, and the one thing the referee
+        // can check about it is that the move actually played is a move the
+        // report said was possible. Without that, a peek is worth exactly as
+        // much as the peeked-at bot's honesty; with it, a bot that publishes
+        // one strategy and plays another is caught here rather than quietly
+        // deflating whatever the probe measured.
+        if let Some(p) = policy.as_deref() {
+            let ctx = Ctx::new(&b.s);
+            let cfgs = &[true_config(&b.s, player, &ctx)];
+            let np = crate::policy::NodePolicy::frame(&b.s, &ctx, player, cfgs);
+            let played = np.row(0).find(|&cell| np.acts[np.action_at(cell)] == action);
+            match played {
+                Some(cell) if p.get(cell).copied().unwrap_or(0.0) > 0.0 => {}
+                Some(_) => {
+                    return Err(format!(
+                        "game {}: {} was played but the reported strategy gives it no weight",
+                        id, action
+                    ))
+                }
+                None => {
+                    return Err(format!(
+                        "game {}: {} is not a move the reported strategy covers",
+                        id, action
+                    ))
+                }
+            }
+        }
         b.s.apply_inplace(action);
         b.watched = [false, false];
         // A move that leaves a decision node is a position to prove; one that

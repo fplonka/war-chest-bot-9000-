@@ -29,6 +29,10 @@ use crate::rebel::{
     Ctx,
 };
 use crate::rng::Rng;
+
+/// Playouts per action per hand. Enough to order the actions, cheap enough
+/// that a probe keeps up with the bot it is measuring.
+const LBR_ROLLOUTS: usize = 8;
 use crate::search::{Cfg, Nets, Solver};
 use crate::state::{Cont, State};
 
@@ -41,13 +45,20 @@ pub enum Mind {
     Greedy { temp: f32 },
     /// Uniform over legal actions.
     Random,
-    /// The exploitability probe. Plays ReBeL, but takes its opponent's
-    /// strategy from the referee instead of guessing at it, and answers with
-    /// the best reply rather than an equilibrium one.
+    /// The exploitability probe: local best response.
     ///
-    /// What it wins above a plain bot is a lower bound on how exploitable the
-    /// opponent is: a real best response would take at least as much. It is a
-    /// measuring instrument, not a player, and never belongs in a ladder.
+    /// It takes its opponent's strategy from the referee rather than guessing
+    /// at it, and answers with the best reply it can find rather than an
+    /// equilibrium one. It finds that reply by playing the rest of the game
+    /// out under random play, and carries no network at all — a probe that
+    /// leant on a trained value function would measure that function as much
+    /// as the bot under test, and its verdict would change with whichever
+    /// network it happened to be built around.
+    ///
+    /// What it wins is a *lower* bound on how exploitable the opponent is: a
+    /// real best response would take at least as much, so finding nothing
+    /// means this probe found nothing, never that there is nothing to find.
+    /// A measuring instrument, not a player; it never belongs in a ladder.
     Lbr,
 }
 
@@ -72,7 +83,11 @@ impl Brain {
         match self.mind {
             Mind::Greedy { temp } => return policy::greedy(s, ctx, player, cfgs, temp),
             Mind::Random => return policy::uniform(s, ctx, player, cfgs),
-            Mind::Rebel | Mind::Lbr => {}
+            // A probe holds no model of its opponent worth the name: it is
+            // *told* their strategy, and where it is not told it assumes
+            // nothing. Its own move is chosen in `decide`, by rollout.
+            Mind::Lbr => return policy::uniform(s, ctx, player, cfgs),
+            Mind::Rebel => {}
         }
         #[cfg(feature = "gpu")]
         let cfg = Cfg {
@@ -290,7 +305,7 @@ impl Session {
         let ci = self.bel[self.seat as usize]
             .index_of(&truth)
             .ok_or("the belief filter dropped this seat's own config")?;
-        let np = brain.policy(&self.s, &self.ctx, self.seat, &self.bel);
+        let mut np = brain.policy(&self.s, &self.ctx, self.seat, &self.bel);
         if np.row(ci).is_empty() {
             // The node's actions are enumerated over the public reserve and
             // then filtered per hand. A hand with no row cannot move, which
@@ -300,11 +315,26 @@ impl Session {
                 np.acts.len()
             ));
         }
-        // A probe answers with the best reply it can see, not a mixed one: the
-        // question it exists to ask is how much the opponent's strategy gives
-        // away, and an equilibrium answer would not collect it.
+        // A probe answers with the best reply it can find, not a mixed one:
+        // the question it exists to ask is how much the opponent's strategy
+        // gives away, and an equilibrium answer would not collect it. It
+        // finds that reply by playing the rest out, so that the number it
+        // produces measures the bot under test rather than whatever network
+        // the probe was carrying.
         let cell = match brain.mind {
-            Mind::Lbr => np.best(ci),
+            Mind::Lbr => {
+                np = policy::lbr(
+                    &self.s,
+                    &self.ctx,
+                    self.seat,
+                    &self.bel[self.seat as usize].cfg,
+                    ci,
+                    &self.bel[1 - self.seat as usize],
+                    LBR_ROLLOUTS,
+                    &mut self.rng,
+                );
+                np.best(ci)
+            }
             _ => np.sample(&mut self.rng, ci),
         };
         let action = np.acts[np.action_at(cell)];

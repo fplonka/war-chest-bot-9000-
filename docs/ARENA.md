@@ -120,25 +120,32 @@ tools/arena.py probe  bots/v5-2h --probe bots/lbr --games 200
 tools/arena.py tablebase bots/v5-2h --suite suites/forced
 ```
 
-**probe** — what knowing the opponent's actual strategy is worth. The same
-probe plays the same bot over the same games twice; the second time the referee
-shows it the strategy behind every move. Nothing else differs, so the change in
-score is what that knowledge bought.
+**probe** — local best response, and what knowing a bot's actual strategy is
+worth against it. The probe plays the same bot over the same games twice; the
+second time the referee shows it the strategy behind every move. Nothing else
+differs, so the change in score is what that knowledge bought.
 
-Be precise about what that is. A bot with no other information models its
-opponent as a copy of itself — that is how it moves its belief over their hand
-(see above). The probe replaces that model with the truth. So the number is the
-cost of *the modelling assumption*, and it is a lower bound on exploitability
-rather than a measure of it: a bot probed by a copy of itself scores exactly
-zero, because its assumption was already right, and that says nothing about how
-a real best response would do against it. It is most informative aimed at a bot
-the probe does not resemble.
+The probe carries no network. It chooses its move by playing the rest of the
+game out under random play and taking the action that scores best, averaged
+over the hands its belief says the opponent might hold. That is crude, and
+deliberately so: a probe built on a trained value function would measure that
+function as much as the bot under test, and the same bot would come out more
+or less exploitable depending on which network the probe happened to carry.
+Rollouts are crude in the same way for everyone, which is what an instrument
+needs. It is the construction Lisý and Bowling describe.
 
-The zero is worth having as a check: if a probe built on a bot's own weights
-ever showed a gain against it, something in the belief filter would be wrong.
+What it reports is a *lower* bound. A real best response would take at least
+as much, so a gain of zero means this probe found no leak — never that there
+is none. Read it with its error bar: over a few hundred games the noise is
+comparable to the gains actually seen, and a gain worth believing has to clear
+twice its own standard error.
+
+A reported strategy is a self-report, so the referee checks the one thing it
+can: that the move actually played is one the report gave weight to. A bot
+that publishes one strategy and plays another is stopped there.
 
 The probe is a measuring instrument, not a player. Put it in a ladder and it
-would beat everyone by cheating, and drag every other rating with it.
+would beat everyone by reading their hand, and drag every other rating with it.
 
 **tablebase** — whether a bot converts a position whose answer is proven. See
 below.

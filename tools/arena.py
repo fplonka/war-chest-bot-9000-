@@ -297,12 +297,15 @@ def probe(bot_path, probe_path, games, seed, concurrent, devices, out_path):
     time the referee shows it the strategy behind every move; nothing else
     differs, so the change in score is what that knowledge bought.
 
-    A bot models its opponent as a copy of itself, and this replaces that model
-    with the truth — so the number is the cost of the modelling assumption. It
-    is a lower bound on exploitability, not a measure of it: a bot probed by a
-    copy of itself scores zero, which is a check on the belief filter rather
-    than a verdict on the bot. Aim it at something the probe does not
-    resemble."""
+    The probe carries no network: it picks its move by playing the rest of the
+    game out under random play, averaged over the hands its belief allows. A
+    probe built on a trained value function would measure that function as
+    much as the bot under test, and would rate the same bot differently
+    depending on which network it happened to carry.
+
+    What comes back is a *lower* bound on exploitability. A real best response
+    would take at least as much, so a gain of zero means this probe found no
+    leak, never that there is none."""
     replies = queue.Queue()
     spec = json.loads((Path(bot_path) / "bot.json").read_text())
     name = spec.get("name", Path(bot_path).name)
@@ -346,7 +349,8 @@ def probe(bot_path, probe_path, games, seed, concurrent, devices, out_path):
     verdict = "clears" if abs(gain) > 2 * se else "does not clear"
     print(f"{name}: that knowledge is worth {gain:+.3f} +/- {se:.3f} of a "
           f"game to the probe, which {verdict} twice its own error. A lower "
-          f"bound on exploitability; zero is what a copy of itself scores.")
+          f"bound on exploitability: finding nothing means this probe found "
+          f"nothing, not that there is nothing to find.")
     print(f"wrote {out_path}")
     return result
 
@@ -402,7 +406,10 @@ def generate(paths, games, seed, concurrent, devices, out_dir,
             "kind": "tablebase", "games": games, "depth": depth, "seed": seed,
             "min_plies": min_plies, "per_bucket": per_bucket,
             "budget": budget,
-            "players": [b.name for b in bots],
+            # Who played the games these came from. A suite is only as
+            # neutral as its source, and the source is not recoverable from
+            # the positions, so it travels with them.
+            "source": " vs ".join(b.name for b in bots),
             "proven": proven, "questions": questions,
         })
 
@@ -571,6 +578,7 @@ def tablebase(bot_path, suite_dir, out_path, device=-1, concurrent=32):
     depths = sorted({q["depth"] for q in questions})
     result = {
         "kind": "tablebase", "bot": name, "suite": str(suite_dir),
+        "source": meta.get("source", "?"),
         "questions": n, "held": len(kept),
         "rate": round(len(kept) / max(n, 1), 4),
         "by_depth": {str(d): slice_of(lambda q, d=d: q["depth"] == d) for d in depths},
@@ -586,6 +594,7 @@ def tablebase(bot_path, suite_dir, out_path, device=-1, concurrent=32):
     write_json(out_path, result)
     print(f"\n{name}: kept the win in {len(kept)}/{n} proven positions "
           f"({100 * result['rate']:.1f}%)")
+    print(f"  positions from {result['source']}")
     buckets("moves that win", [(n, result["by_share"][n]) for n, _, _ in SHARES])
     buckets("plies to win", [(d, result["by_depth"][str(d)]) for d in depths])
     buckets("hidden hands", [("none", result["known"]), ("some", result["hidden"])])

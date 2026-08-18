@@ -71,7 +71,7 @@ fn brain(o: &Options) -> Result<Brain, String> {
     let mut nets = Nets::default();
     #[cfg(feature = "gpu")]
     let mut gpu = None;
-    if matches!(mind, Mind::Rebel | Mind::Lbr) {
+    if matches!(mind, Mind::Rebel) {
         let (dims, w, b, ln) =
             Net::load_flat_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
         nets.value = Net::from_flat(&dims, &w, &b, &ln)?;
