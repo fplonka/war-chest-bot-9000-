@@ -290,6 +290,17 @@ What it does not measure: this is the tail of a game, and only positions that
 happen to be forced. A bot can convert every won endgame and still play a poor
 opening. It is a floor and a check, not a verdict — read it beside the ladder.
 
+One weakness is worth naming, because it is fixable. A bot answers each
+question with one *sampled* move, so a bot that finds the win 51% of the time
+and one that finds it 99% of the time both look like coin flips on any single
+question, and only the average over thousands separates them. The bot already
+computes a probability for every move it might make, and `policy` on the ask
+already returns it. Marking the probability mass that fell on winning moves,
+rather than whether one sample of it did, would measure the same thing with a
+fraction of the variance — the referee would have to prove every legal move at
+the question rather than only the one played, which is what generation already
+does to compute sharpness.
+
 ## Running one
 
 ```bash
