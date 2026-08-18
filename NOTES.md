@@ -826,3 +826,45 @@ The ordering — v4-2h `74.6`, v5-2h `75.5`, v4-12h `78.1` — is worth less tha
 it looks. All three are within a few points, and this measures endgame
 conversion only. A bot can convert every won endgame and still play a poor
 opening. Read it beside the ladder, not instead of it.
+
+## A benchmark is only as neutral as the games it came from
+
+The same six bots, marked the same way, on two sets of proven endgame
+positions. One set came from random play, the other from `v5-2h` playing
+itself. Overall, and on the sharp band where fewer than one legal move in ten
+keeps the win:
+
+| | random-play set | v5 self-play set |
+|---|---:|---:|
+| v4-2h overall | `74.6%` | `65.6%` |
+| v5-2h overall | `75.5%` | `57.0%` |
+| v4-2h, under 10% | `51.3%` | `58.1%` |
+| v5-2h, under 10% | `59.6%` | `48.9%` |
+
+On random-play positions v5-2h beats v4-2h. On v5's own positions v4-2h beats
+it by ten points, and v5 falls to last of the nets -- below `v3-trav`, three
+architectures older. Same binaries, same 90-test build, same proof.
+
+The cause is a selection effect in how positions are harvested, and it is
+worth stating carefully because it is easy to get backwards. A position is
+kept when the side to move has a proven forced win. If that player *converts*
+the win, the game ends and the line yields one or two positions. If it
+*misses*, the position stays won ply after ply and the line yields a dozen --
+each a different position, so deduplication does not catch them, and every one
+of them drawn from a line that player is misplaying. Missed wins are amplified;
+converted wins are not. A self-play set is therefore concentrated on its own
+author's blind spots.
+
+That makes it an excellent adversarial probe of the bot that generated it, and
+a poor yardstick for anyone else. The fix is one question per game, which
+removes the amplification at the source; the standing advice is to generate
+comparison sets from random play, or from a bot that is not under test.
+
+Two things this does *not* explain, and they are worth keeping separate. The
+first is that `v5-2h` tops the ladder at `1313` Elo against `v4-2h`'s `1060`
+while converting fewer proven endgames on every set -- winning games and
+finishing won positions are different skills, and a yardstick that collapsed
+them would be hiding something rather than showing it. The second is that
+`v4-12h` leads everywhere, on both sets and in every band, which is the least
+surprising result here: it is trained six times longer than anything else in
+the field.
