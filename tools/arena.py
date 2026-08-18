@@ -319,9 +319,12 @@ def probe(bot_path, probe_path, games, seed, concurrent, devices, out_path):
               "blind": rows["blind"], "peeking": rows["peeking"],
               "gain": round(gain, 4)}
     write_json(out_path, result)
-    print(f"\n{name}: showing {prober.name} its strategy is worth "
-          f"{gain:+.3f} of a game (a lower bound on exploitability; zero is "
-          f"what a copy of itself should score).")
+    print(f"\n{name} scores {-rows['blind']['score']:+.3f} against "
+          f"{prober.name} playing blind, {-rows['peeking']['score']:+.3f} "
+          f"once {prober.name} is shown its strategy.")
+    print(f"{name}: that knowledge is worth {gain:+.3f} of a game to the "
+          f"probe (a lower bound on exploitability; zero is what a copy of "
+          f"itself should score).")
     print(f"wrote {out_path}")
     return result
 
