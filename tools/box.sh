@@ -46,9 +46,15 @@ pull)
     echo "pulled $name"
     ;;
 build)
+    # No pipe on the build itself: a pipeline exits with `tail`'s status, so a
+    # failed build used to look like a success and leave the old module in
+    # place — which is how a run started without the `gpu` feature.
     run_remote "find engine/src engine/tests engine/examples -type f -exec touch {} +
-cd engine && maturin develop --release --features python,gpu 2>&1 | tail -2
-cargo build --release --bin bot 2>&1 | tail -1"
+cd engine
+maturin develop --release --features python,gpu >/tmp/maturin.log 2>&1 || { tail -40 /tmp/maturin.log; exit 1; }
+tail -2 /tmp/maturin.log
+cargo build --release --bin bot >/tmp/bot.log 2>&1 || { tail -40 /tmp/bot.log; exit 1; }
+tail -1 /tmp/bot.log"
     ;;
 follow)
     tag=${2:?usage: follow <tag> [run]}

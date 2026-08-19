@@ -708,6 +708,7 @@ impl SolveFarm {
         dict.set_item("rounds", self.farm.rounds)?;
         dict.set_item("round_calls", self.farm.round_calls)?;
         dict.set_item("round_rows", self.farm.round_rows)?;
+        dict.set_item("round_nanos", self.farm.round_nanos)?;
         Ok(out)
     }
 }

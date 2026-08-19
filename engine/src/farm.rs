@@ -369,6 +369,9 @@ pub struct Farm {
     pub rounds: u64,
     pub round_rows: u64,
     pub round_calls: u64,
+    /// Time inside the backend. Against wall clock this says how much of a
+    /// round is the batch and how much is everything around it.
+    pub round_nanos: u64,
 }
 
 impl Farm {
@@ -421,6 +424,7 @@ impl Farm {
             rounds: 0,
             round_rows: 0,
             round_calls: 0,
+            round_nanos: 0,
         }
     }
 
@@ -451,14 +455,19 @@ impl Farm {
             // solves and is not parked while it does; blocking on a round here
             // would sit behind rows that are already finished.
             let backend = &self.backend;
+            let mut spent = Duration::ZERO;
             match self.gate.round_before(PATIENCE, |calls| {
                 calls_seen = calls.len();
-                backend.run(calls)
+                let at = std::time::Instant::now();
+                let replies = backend.run(calls);
+                spent = at.elapsed();
+                replies
             }) {
                 Round::Ran(rows) => {
                     self.rounds += 1;
                     self.round_rows += rows as u64;
                     self.round_calls += calls_seen as u64;
+                    self.round_nanos += spent.as_nanos() as u64;
                 }
                 Round::Empty => {}
             }
