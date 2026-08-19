@@ -67,6 +67,7 @@ fn main() {
 
     let mut rng = Rng::new(0x67CF);
     let (mut stop_sum, mut stopped, mut node_iters, mut static_iters) = (0usize, 0usize, 0u64, 0u64);
+    let mut conc = 0.0f64;
     for (n, (s, belief)) in positions.iter().enumerate() {
         let ctx = warchest::rebel::Ctx::new(s);
         let mut sv = Solver::new(s, ctx, &nets, cfg, belief.clone());
@@ -87,10 +88,13 @@ fn main() {
             }
         }
         println!(
-            "  root {n:2}: {:6} nodes, growth stopped at iteration {:?}",
+            "  root {n:2}: {:6} nodes, growth stopped at iteration {:?}, \
+             visit concentration {:.3}",
             sv.nodes.len(),
-            stop
+            stop,
+            sv.visit_concentration(),
         );
+        conc += sv.visit_concentration() as f64;
         if let Some(at) = stop {
             stop_sum += at;
             stopped += 1;
@@ -108,5 +112,9 @@ fn main() {
     println!(
         "{:.0}% of node-iterations run on a tree that never changes again",
         100.0 * static_iters as f64 / node_iters.max(1) as f64
+    );
+    println!(
+        "mean visit concentration {:.3} (uniform over k actions would be 1/k)",
+        conc / positions.len().max(1) as f64
     );
 }

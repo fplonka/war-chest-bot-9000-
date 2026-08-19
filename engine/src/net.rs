@@ -989,16 +989,28 @@ impl Net {
     /// described in the position rather than in the abstract. A node's actions
     /// are public, so this runs once per node and every config at it reads the
     /// result.
-    pub fn actions(&self, feat: &[f32], board: &[f32], n: usize, out: &mut Vec<f32>) {
+    pub fn actions(
+        &self,
+        feat: &[f32],
+        boards: &[f32],
+        board_of: &[u32],
+        n: usize,
+        out: &mut Vec<f32>,
+    ) {
         debug_assert_eq!(feat.len(), n * AFEAT);
-        debug_assert_eq!(board.len(), D);
+        debug_assert_eq!(board_of.len(), n);
+        let rows = boards.len() / D;
         let mut z = scratch(0);
         self.act_in.run(feat, n, &mut z);
-        // One board, every action: project it once and add it to each row.
+        // Every board once, then each action adds the one it belongs to. A
+        // batch spans nodes, so which board an action reads is an index rather
+        // than a property of the call — the same convention the device uses
+        // for everything else that was per-call and is now per-row.
         let mut proj = scratch(0);
-        self.act_board.run(board, 1, &mut proj);
+        self.act_board.run(boards, rows, &mut proj);
         for r in 0..n {
-            for (o, &v) in z[r * AW..(r + 1) * AW].iter_mut().zip(&proj[..AW]) {
+            let at = board_of[r] as usize * AW;
+            for (o, &v) in z[r * AW..(r + 1) * AW].iter_mut().zip(&proj[at..at + AW]) {
                 *o += v;
             }
         }
@@ -1147,7 +1159,8 @@ impl Net {
             if mine.is_empty() {
                 continue;
             }
-            self.actions(feat, &p[r * D..(r + 1) * D], na, &mut e);
+            let board_of = vec![0u32; na];
+            self.actions(feat, &p[r * D..(r + 1) * D], &board_of, na, &mut e);
             let (c, a): (Vec<u32>, Vec<u32>) =
                 mine.iter().map(|&k| (cfg[k], act[k])).unzip();
             let mut got = vec![0.0; mine.len()];

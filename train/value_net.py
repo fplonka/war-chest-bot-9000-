@@ -199,11 +199,16 @@ class Net(nn.Module):
                 self.cfg_g(u) + (counts.unsqueeze(-1) * bag).sum((1, 2)),
                 self.cfg_p(u))
 
-    def actions(self, feat, board):
-        """``e(a)`` for actions described by ``feat`` ``[n, AFEAT]`` on the
-        board vectors ``board`` ``[n, D]``."""
-        z = self.act_in(feat) + self.act_board(board)
-        return self.act_out(gelu(self.ln_act(z)))
+    def actions(self, feat, boards, board_of=None):
+        """``e(a)`` for actions ``feat`` ``[n, AFEAT]``.
+
+        ``boards`` is ``[rows, D]`` and ``board_of`` says which row each action
+        is played on, so one batch may span nodes.
+        """
+        proj = self.act_board(boards)
+        if board_of is not None:
+            proj = proj[board_of]
+        return self.act_out(gelu(self.ln_act(self.act_in(feat) + proj)))
 
     def join(self, p, pooled, seat):
         """The per-iteration path: beliefs and queried seat modulate the board."""

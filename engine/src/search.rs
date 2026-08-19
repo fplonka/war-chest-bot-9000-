@@ -70,6 +70,14 @@ pub struct Cfg {
     /// is spent discovering that. Set it far enough above `nodes` that a
     /// healthy tree never reaches it, and no further.
     pub node_cap: usize,
+    /// PUCT's exploration constant, weighting the prior against the search's
+    /// own action values during the expansion phase.
+    pub puct: f32,
+    /// Softmax temperature on the policy head's logits where they are read as
+    /// the PUCT prior. Above one this flattens the prior, which Student of
+    /// Games notes "can decrease weight of the prior in some games and
+    /// encourage more exploration in the search phase".
+    pub prior_temp: f32,
     /// Maximum combined belief support at a self-play root. Broad round-start
     /// beliefs have a fat cost tail before the first tree node can be grown;
     /// callers skip those solves instead of stalling every other worker.
@@ -86,6 +94,8 @@ impl Default for Cfg {
             // the budget this replaces, spent by growth instead of evenly.
             nodes: 1024,
             cfr: Cfr::LINEAR,
+            puct: 1.5,
+            prior_temp: 1.0,
             node_cap: 16 * 1024,
             config_cap: 256,
         }
@@ -731,6 +741,18 @@ pub struct Solver<'a> {
     /// where it is.
     pub(crate) regret: Vec<f32>,
     pub cur: Vec<f32>,
+    /// The expansion phase's own statistics, laid out exactly like `cur`.
+    ///
+    /// `prior` is the policy head's `softmax(logit(c, a) / prior_temp)` over a
+    /// config's legal row, filled once when the node is expanded. `visits` are
+    /// PUCT's counts, accumulated over every expansion phase of the search and
+    /// incremented as a trajectory passes — which is also the virtual loss,
+    /// since later simulations of the same phase then see the earlier ones.
+    /// `qval` is the action value the last backprop formed, before it was
+    /// turned into a regret.
+    pub(crate) prior: Vec<f32>,
+    pub(crate) visits: Vec<f32>,
+    pub(crate) qval: Vec<f32>,
     pub(crate) soff: Vec<u32>,
     /// The reach-weighted running strategy sum, per node. Per node rather than
     /// flat, because a node is given its cells when it is expanded and a
@@ -758,6 +780,14 @@ pub struct Solver<'a> {
     /// `vals[voff[i] .. voff[i] + max(nc0, nc1)]`.
     pub vals: Vec<f32>,
     pub(crate) voff: Vec<u32>,
+    /// `[node]` -> its row in the network batch, or `u32::MAX` for a node that
+    /// carries none. The policy head needs a node's own board vector, which
+    /// lives in `pb` at that row.
+    pub(crate) row_of: Vec<u32>,
+    /// Whether a node's `prior` has been filled. A node is expanded before the
+    /// batch that holds its board vector has necessarily run, so the prior is
+    /// computed at the next expansion phase rather than inside `grow`.
+    pub(crate) primed: Vec<bool>,
     /// `[node]` -> config counts per player, so the hot loops never chase the
     /// `Rc` to ask how long a support is.
     pub(crate) nc: Vec<[u32; 2]>,
@@ -867,6 +897,11 @@ impl<'a> Solver<'a> {
             root_belief: belief,
             regret: Vec::new(),
             cur: Vec::new(),
+            prior: Vec::new(),
+            visits: Vec::new(),
+            qval: Vec::new(),
+            row_of: Vec::new(),
+            primed: Vec::new(),
             soff: Vec::new(),
             sum_strat: Vec::new(),
             avg: Vec::new(),
@@ -971,11 +1006,14 @@ impl<'a> Solver<'a> {
         self.voff.push(self.vals.len() as u32);
         self.vals.resize(self.vals.len() + c0.max(c1), 0.0);
         self.sum_strat.push(Vec::new());
+        self.primed.push(false);
+        self.row_of.push(u32::MAX);
         // Only a coin play carries a network row. Everything between two coin
         // plays is grown through immediately and never stays a leaf.
         if terminal {
             self.term_leaves.push(id);
         } else if matches!(s.pending(), Cont::MainPlay) {
+            self.row_of[id] = (self.leaf_coff.len() / 2) as u32;
             self.push_row(id, &s, &cfgs);
             self.leaf_rows.push(id);
         }
@@ -1047,12 +1085,17 @@ impl<'a> Solver<'a> {
         self.roff.truncate(m.nodes);
         self.voff.truncate(m.nodes);
         self.sum_strat.truncate(m.nodes);
+        self.primed.truncate(m.nodes);
+        self.row_of.truncate(m.nodes);
         self.leaf_rows.truncate(m.leaf_rows);
         self.term_leaves.truncate(m.term_leaves);
         self.leaf_coff.truncate(m.leaf_coff);
         self.leaf_cidx.truncate(m.leaf_cidx);
         self.regret.truncate(m.ncells);
         self.cur.truncate(m.ncells);
+        self.prior.truncate(m.ncells);
+        self.visits.truncate(m.ncells);
+        self.qval.truncate(m.ncells);
         self.ncells = m.ncells;
         // `cphi` is written by index and reused, so only the count and the
         // interning map name configs that no longer exist.
@@ -1072,6 +1115,8 @@ impl<'a> Solver<'a> {
         self.soff[id] = self.ncells as u32;
         self.ncells += cells;
         self.regret.resize(self.ncells, 0.0);
+        self.visits.resize(self.ncells, 0.0);
+        self.qval.resize(self.ncells, 0.0);
         let n = &self.nodes[id];
         let nc = n.nc(n.player as usize);
         let mut u = vec![0.0f32; cells];
@@ -1083,6 +1128,9 @@ impl<'a> Solver<'a> {
             }
         }
         self.cur.extend_from_slice(&u);
+        // Until the policy head has spoken the prior is the uniform strategy,
+        // which is what CFR starts from too.
+        self.prior.extend_from_slice(&u);
         self.sum_strat[id] = vec![0.0; cells];
     }
 
@@ -1918,6 +1966,10 @@ impl<'a> Solver<'a> {
                                     let cv = self.voff[ch] as usize - self.voff[i + 1] as usize;
                                     delta += hi[cv + t as usize];
                                 }
+                                // The action value itself, which the expansion
+                                // phase reads as PUCT's Q. It is formed here
+                                // either way; only keeping it is new.
+                                self.qval[so + cell] = delta;
                                 delta -= base;
                                 let at = so + cell;
                                 let old = self.regret[at];
@@ -2039,6 +2091,10 @@ impl<'a> Solver<'a> {
                 break;
             }
             self.step();
+            // The expansion phase reads the prior at every node it walks
+            // through, and `step` has just run the batch that any node grown
+            // last iteration was waiting for.
+            self.refresh_priors();
             let mut grew = false;
             for _ in 0..self.cfg.expand {
                 if self.nodes.len() >= self.cfg.nodes || !self.expand_once(rng) {
@@ -2054,6 +2110,138 @@ impl<'a> Solver<'a> {
         }
         if !self.capped {
             self.finish();
+        }
+    }
+
+    /// The cell PUCT would take from one config's legal row.
+    ///
+    /// `Q + c_puct * P * sqrt(sum N) / (1 + N)`, with `Q` the counterfactual
+    /// action value divided by the opponent's reach mass at this node. That
+    /// division is what Student of Games means by "normalized by the sum of
+    /// the opponent's reach probability at `s_i` to resemble state-conditional
+    /// action values": the raw value carries the opponent's reach as a factor,
+    /// so without it a node deep behind an unlikely opponent line would look
+    /// worthless next to its own siblings rather than being compared with
+    /// them.
+    fn puct_choice(&self, node: usize, row: std::ops::Range<usize>, opp: usize) -> usize {
+        let so = self.soff[node] as usize;
+        let mass: f32 = self.reach_of(node, opp).iter().sum();
+        let scale = if mass > 1e-30 { 1.0 / mass } else { 0.0 };
+        let total: f32 = row.clone().map(|cell| self.visits[so + cell]).sum();
+        let explore = self.cfg.puct * total.max(0.0).sqrt();
+        let mut best = row.start;
+        let mut best_score = f32::NEG_INFINITY;
+        for cell in row {
+            let at = so + cell;
+            let score = self.qval[at] * scale
+                + explore * self.prior[at] / (1.0 + self.visits[at]);
+            if score > best_score {
+                best_score = score;
+                best = cell;
+            }
+        }
+        best
+    }
+
+    /// Fill the policy prior of every decision node that does not have one.
+    ///
+    /// Deferred rather than done inside `grow` because a node is expanded
+    /// before the batch carrying its board vector has necessarily run — the
+    /// root most of all, which `Solver::new` expands before any network call.
+    /// Deferring also makes this one batched pass per expansion phase instead
+    /// of one small call per node.
+    ///
+    /// Only nodes that get expanded need a prior. A leaf has no action list and
+    /// an expansion trajectory stops there, so this is exactly Student of
+    /// Games' "the prior policy `p` obtained from the queries", asked for at
+    /// the moment it first has a use.
+    fn refresh_priors(&mut self) {
+        if self.nets.value.is_empty() {
+            return;
+        }
+        let want: Vec<usize> = (0..self.nodes.len())
+            .filter(|&i| {
+                !self.primed[i]
+                    && !self.nodes[i].leaf
+                    && !self.nodes[i].chance
+                    && self.row_of[i] != u32::MAX
+                    && (self.row_of[i] as usize) < self.batch_rows
+            })
+            .collect();
+        if want.is_empty() {
+            return;
+        }
+        // One description per (node, action), and the board each is played on.
+        let mut feat = Vec::new();
+        let mut board_of: Vec<u32> = Vec::new();
+        let mut base = Vec::with_capacity(want.len());
+        for &i in &want {
+            base.push(board_of.len() as u32);
+            let n = &self.nodes[i];
+            for a in 0..n.na() {
+                let at = feat.len();
+                feat.resize(at + crate::net::AFEAT, 0.0);
+                Net::action_feats(
+                    n.acts[a].kind(),
+                    n.aslot[a],
+                    n.acts[a].hexes(),
+                    &mut feat[at..],
+                );
+                board_of.push(self.row_of[i]);
+            }
+        }
+        let na = board_of.len();
+        let mut e = Vec::new();
+        self.nets.value.actions(
+            &feat,
+            &self.pb[..self.batch_rows * crate::net::D],
+            &board_of,
+            na,
+            &mut e,
+        );
+
+        // `logit(c, a) = <f_p(c), e(a)>` over the node's own legal cells, then
+        // a softmax across each config's row.
+        let mut logit = Vec::new();
+        for (k, &i) in want.iter().enumerate() {
+            let me = self.nodes[i].player as usize;
+            let q = 2 * self.row_of[i] as usize + me;
+            let cs = self.leaf_coff[q] as usize;
+            let n = &self.nodes[i];
+            let cells = n.legal_action.len();
+            logit.clear();
+            logit.resize(cells, 0.0);
+            let cfg: Vec<u32> = (0..cells)
+                .map(|cell| self.leaf_cidx[cs + n.cell_row[cell] as usize])
+                .collect();
+            let act: Vec<u32> = (0..cells)
+                .map(|cell| base[k] + n.legal_action[cell])
+                .collect();
+            self.nets.value.policy(&self.cp, &e, &cfg, &act, &mut logit);
+            let so = self.soff[i] as usize;
+            let inv_t = 1.0 / self.cfg.prior_temp.max(1e-6);
+            for c in 0..n.nc(me) {
+                let row = n.legal_row(c);
+                let top = row
+                    .clone()
+                    .map(|cell| logit[cell])
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let mut total = 0.0;
+                for cell in row.clone() {
+                    let v = ((logit[cell] - top) * inv_t).exp();
+                    self.prior[so + cell] = v;
+                    total += v;
+                }
+                let scale = if total > 0.0 {
+                    1.0 / total
+                } else {
+                    1.0 / row.len().max(1) as f32
+                };
+                for cell in row {
+                    self.prior[so + cell] *= scale;
+                }
+            }
+            self.primed[i] = true;
         }
     }
 
@@ -2157,12 +2345,22 @@ impl<'a> Solver<'a> {
             if row.is_empty() {
                 return None;
             }
-            let cell = if self.sum_strat[node][row.clone()].iter().any(|&x| x > 0.0) {
+            // Student of Games selects by half PUCT and half the search's own
+            // average: `pi_select = 1/2 pi_PUCT + 1/2 pi_CFR`. PUCT is a
+            // maximisation, so its half is a point mass on the argmax, and
+            // sampling the mixture is a coin flip between the two.
+            let so = self.soff[node] as usize;
+            let cell = if rng.unit_f64() < 0.5 {
+                self.puct_choice(node, row.clone(), 1 - me)
+            } else if self.sum_strat[node][row.clone()].iter().any(|&x| x > 0.0) {
                 row.start + pick(&self.sum_strat[node][row.clone()], rng)
             } else {
-                let so = self.soff[node] as usize;
                 row.start + pick(&self.cur[so + row.start..so + row.end], rng)
             };
+            // Counted as the trajectory passes, which is also the virtual loss
+            // Student of Games adds across the simulations of one iteration:
+            // a later simulation of the same phase sees this one's visit.
+            self.visits[so + cell] += 1.0;
             let trans = self.nodes[node].legal_trans[cell];
             if trans == NO_TRANS {
                 return None;
@@ -2269,6 +2467,45 @@ impl<'a> Solver<'a> {
     fn restore(&mut self) {
         self.precompute_reaches();
         self.last_traverser = None;
+    }
+
+    /// How concentrated the expansion phase's visits are, as the share of them
+    /// that went to each config's most-visited action, averaged over the
+    /// decision nodes that were visited at all.
+    ///
+    /// Uniform selection over a row of `k` actions gives `1/k`; a search that
+    /// commits to a line gives a number near one. It says whether the
+    /// expansion phase is being guided or is wandering, which no test of the
+    /// solve's output can show.
+    pub fn visit_concentration(&self) -> f32 {
+        let (mut total, mut rows) = (0.0f32, 0usize);
+        for i in 0..self.nodes.len() {
+            let n = &self.nodes[i];
+            if n.leaf || n.chance {
+                continue;
+            }
+            let so = self.soff[i] as usize;
+            for c in 0..n.nc(n.player as usize) {
+                let row = n.legal_row(c);
+                if row.len() < 2 {
+                    continue;
+                }
+                let sum: f32 = row.clone().map(|cell| self.visits[so + cell]).sum();
+                if sum <= 0.0 {
+                    continue;
+                }
+                let top = row
+                    .map(|cell| self.visits[so + cell])
+                    .fold(0.0f32, f32::max);
+                total += top / sum;
+                rows += 1;
+            }
+        }
+        if rows == 0 {
+            0.0
+        } else {
+            total / rows as f32
+        }
     }
 
     /// True when the build hit the node cap and the solve must not be used.
