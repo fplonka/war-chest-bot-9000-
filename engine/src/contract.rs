@@ -145,20 +145,27 @@ impl Contract {
             }
             c.child_off.push(c.child.len() as u32);
 
-            // Legal cells, config-major. A leaf and a draw own none.
+            // Legal cells. The offsets stay node-local, exactly as the node
+            // holds them, and the cell arrays are indexed the way `cur` and
+            // `regret` are — `soff[node] + cell` — so a task that has found
+            // its cell has found its strategy entry too, with no second
+            // mapping to carry. A leaf and a draw own no cells.
             c.legal_base.push(if t.leaf || t.chance {
                 NO_ROW
             } else {
                 let base = c.legal_off.len() as u32;
                 let me = t.player as usize;
-                for ci in 0..=t.nc(me) {
-                    c.legal_off.push(t.legal_off[ci] + c.legal_child.len() as u32);
+                c.legal_off.extend_from_slice(&t.legal_off[..=t.nc(me)]);
+                let at = sv.soff[i] as usize;
+                let end = at + t.legal_action.len();
+                if c.legal_child.len() < end {
+                    c.legal_child.resize(end, 0);
+                    c.legal_trans.resize(end, NO_TRANS);
+                    c.cell_row.resize(end, 0);
                 }
-                for cell in 0..t.legal_action.len() {
-                    c.legal_child.push(t.legal_child[cell]);
-                    c.legal_trans.push(t.legal_trans[cell]);
-                    c.cell_row.push(t.cell_row[cell]);
-                }
+                c.legal_child[at..end].copy_from_slice(&t.legal_child);
+                c.legal_trans[at..end].copy_from_slice(&t.legal_trans);
+                c.cell_row[at..end].copy_from_slice(&t.cell_row);
                 base
             });
 
@@ -354,6 +361,125 @@ impl Contract {
     fn block(&self, node: usize, p: usize) -> usize {
         self.roff[node] as usize + if p == 1 { self.nc[node][0] as usize } else { 0 }
     }
+
+    /// One traverser's value backpropagation and regret update, level by level
+    /// from the leaves up.
+    ///
+    /// Unlike the reach sweep this needs no transpose: a config reads its own
+    /// legal row, and the row is stored action-ordered, so a thread per
+    /// (node, config) sums the same products in the same order as
+    /// `Solver::backprop`'s action-major walk. Leaf values must already be in
+    /// `vals`; this fills every interior node and leaves `cur` holding the
+    /// fresh regret-matching iterate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn backprop(
+        &self,
+        traverser: usize,
+        cfr: crate::search::Cfr,
+        factors: (f32, f32, f32),
+        vals: &mut [f32],
+        cur: &mut [f32],
+        regret: &mut [f32],
+        sum: &mut [f32],
+    ) {
+        const EPS: f32 = 1e-6;
+        let (da, db, dg) = factors;
+        for level in (0..self.levels()).rev() {
+            let lo = self.level_start[level] as usize;
+            let hi = self.level_start[level + 1] as usize;
+            for &node_u in &self.level_node[lo..hi] {
+                let i = node_u as usize;
+                if self.kind[i] == KIND_LEAF {
+                    continue;
+                }
+                let me = self.player[i] as usize;
+                let nc = self.nc[i][traverser] as usize;
+                let vi = self.voff[i] as usize;
+                if self.kind[i] == KIND_CHANCE {
+                    let ch = self.child[self.child_off[i] as usize] as usize;
+                    let cv = self.voff[ch] as usize;
+                    if me == traverser {
+                        // The chance factor is a real factor of the value,
+                        // unlike the traverser's own strategy, which the
+                        // counterfactual convention discards.
+                        let base = self.draw_base[i] as usize;
+                        for c in 0..nc {
+                            let (a, b) = (
+                                self.draw_start[base + c] as usize,
+                                self.draw_start[base + c + 1] as usize,
+                            );
+                            let mut v = 0.0;
+                            for k in a..b {
+                                v += self.draw_p[k] * vals[cv + self.draw_to[k] as usize];
+                            }
+                            vals[vi + c] = v;
+                        }
+                    } else {
+                        vals.copy_within(cv..cv + nc, vi);
+                    }
+                    continue;
+                }
+                if me != traverser {
+                    // The traverser's information state is unchanged across an
+                    // opponent decision, and the opponent's strategy is already
+                    // in the reaches the leaf values carry.
+                    vals[vi..vi + nc].fill(0.0);
+                    for k in self.child_off[i] as usize..self.child_off[i + 1] as usize {
+                        let cv = self.voff[self.child[k] as usize] as usize;
+                        for c in 0..nc {
+                            vals[vi + c] += vals[cv + c];
+                        }
+                    }
+                    continue;
+                }
+                let so = self.soff[i] as usize;
+                let lb = self.legal_base[i] as usize;
+                for c in 0..nc {
+                    let (a, b) = (
+                        self.legal_off[lb + c] as usize,
+                        self.legal_off[lb + c + 1] as usize,
+                    );
+                    let mut base = 0.0f32;
+                    for cell in a..b {
+                        if self.legal_trans[so + cell] == NO_TRANS {
+                            continue;
+                        }
+                        let cv = self.voff[self.legal_child[so + cell] as usize] as usize;
+                        base += vals[cv + self.legal_trans[so + cell] as usize] * cur[so + cell];
+                    }
+                    vals[vi + c] = base;
+                    let mut total = 0.0f32;
+                    for cell in a..b {
+                        // Re-formed rather than retained: starting at +0 and
+                        // adding keeps the arithmetic identical to the CPU's,
+                        // including a cell with no successor.
+                        let mut delta = 0.0f32;
+                        if self.legal_trans[so + cell] != NO_TRANS {
+                            let cv = self.voff[self.legal_child[so + cell] as usize] as usize;
+                            delta += vals[cv + self.legal_trans[so + cell] as usize];
+                        }
+                        delta -= base;
+                        let old = regret[so + cell];
+                        let r = old * if old > 0.0 { da } else { db } + delta;
+                        regret[so + cell] = r;
+                        let v = (r + cfr.predict * delta).max(EPS);
+                        cur[so + cell] = v;
+                        total += v;
+                    }
+                    if total > 0.0 {
+                        let inv = 1.0 / total;
+                        for cell in a..b {
+                            cur[so + cell] *= inv;
+                        }
+                    }
+                }
+                let cells = self.legal_off[lb + nc] as usize;
+                for x in sum[so..so + cells].iter_mut() {
+                    *x *= dg;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -448,5 +574,146 @@ mod tests {
             }
         }
         assert!(checked >= 8, "only {checked} comparisons");
+    }
+
+    /// `t^p / (t^p + 1)`, with the infinities that name "do not discount" and
+    /// "discard entirely" evaluated rather than computed. A copy of the
+    /// solver's own, which is private to it.
+    fn factor(t: f32, p: f32) -> f32 {
+        if p.is_infinite() {
+            return if p > 0.0 { 1.0 } else { 0.0 };
+        }
+        let x = t.powf(p);
+        x / (x + 1.0)
+    }
+
+    /// The contract's backpropagation and regret update must reproduce
+    /// `Solver::backprop` exactly. A per-config gather over an action-ordered
+    /// legal row sums the same products in the same order as the CPU's
+    /// action-major walk, so again this is `to_bits` equality and not a
+    /// tolerance.
+    #[test]
+    fn the_gathered_backprop_reproduces_the_scatter_exactly() {
+        use crate::search::Back;
+        let nets = Nets {
+            value: random_net(0x5EED),
+            gate: None,
+        };
+        let cfg = Cfg {
+            nodes: 512,
+            expand: 4,
+            iters: 8,
+            ..Default::default()
+        };
+        let gc = GameCfg {
+            agents: [Agent::Rebel {
+                cfg: Cfg { nodes: 64, expand: 1, iters: 4, ..cfg },
+            }; 2],
+            collect: Collect::Rebel,
+            explore: 0.1,
+            random_draft: true,
+            eval_mix: 1.0,
+            mc_mix: 0.0,
+            query_rate: 0.9,
+            recursive_rate: 0.1,
+        };
+        let roots = collect_roots(3, 11, &nets, &gc, 3);
+        assert!(!roots.is_empty(), "no roots to test against");
+
+        let mut rng = Rng::new(0xB4CC);
+        let mut checked = 0usize;
+        for (s, belief) in &roots {
+            let ctx = crate::rebel::Ctx::new(s);
+            let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
+            for t in 0..cfg.iters {
+                // Run whole iterations first, so the regrets and the running
+                // strategy sum are both non-trivial before anything is
+                // compared: a comparison against all-zero state proves nothing
+                // about the discount factors.
+                sv.step(t % 2);
+                for _ in 0..cfg.expand {
+                    if sv.nodes.len() >= cfg.nodes || !sv.expand_once(&mut rng) {
+                        break;
+                    }
+                }
+                sv.precompute_reaches();
+                if t < 2 {
+                    continue;
+                }
+
+                let traverser = t % 2;
+                sv.leaf_values(traverser);
+                let snap = (
+                    sv.vals.clone(),
+                    sv.cur.clone(),
+                    sv.regret.clone(),
+                    sv.sum_strat.clone(),
+                );
+                let k = sv.cfg.cfr;
+                let m = sv.steps[traverser] as f32 + 1.0;
+                let fs = (
+                    factor(m, k.alpha),
+                    factor(m, k.beta),
+                    (m / (m + 1.0)).powf(k.gamma),
+                );
+
+                sv.backprop(traverser, &[], Back::Regret);
+                let want = (
+                    sv.vals.clone(),
+                    sv.cur.clone(),
+                    sv.regret.clone(),
+                    sv.sum_strat.clone(),
+                );
+
+                // Put the solver back and run the contract over the same state.
+                sv.vals = snap.0;
+                sv.cur = snap.1;
+                sv.regret = snap.2;
+                sv.sum_strat = snap.3;
+                let c = Contract::of(&sv);
+                let mut sum = vec![0.0f32; sv.ncells];
+                for i in 0..sv.nodes.len() {
+                    let so = sv.soff[i] as usize;
+                    let row = &sv.sum_strat[i];
+                    sum[so..so + row.len()].copy_from_slice(row);
+                }
+                let (mut vals, mut cur, mut regret) =
+                    (sv.vals.clone(), sv.cur.clone(), sv.regret.clone());
+                c.backprop(traverser, k, fs, &mut vals, &mut cur, &mut regret, &mut sum);
+
+                let same = |got: &[f32], want: &[f32], what: &str| {
+                    assert_eq!(got.len(), want.len(), "{what} length at iteration {t}");
+                    for (i, (a, b)) in got.iter().zip(want).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "{what}[{i}] {a} vs {b} at iteration {t}, {} nodes",
+                            c.nodes()
+                        );
+                    }
+                };
+                same(&vals, &want.0, "vals");
+                same(&cur, &want.1, "cur");
+                same(&regret, &want.2, "regret");
+                for i in 0..sv.nodes.len() {
+                    let so = sv.soff[i] as usize;
+                    let row = &want.3[i];
+                    same(&sum[so..so + row.len()], row, "sum_strat");
+                }
+                // Restore what the comparison consumed, so the next iteration
+                // continues the same solve rather than a diverged one.
+                sv.vals = vals;
+                sv.cur = cur;
+                sv.regret = regret;
+                for i in 0..sv.nodes.len() {
+                    let so = sv.soff[i] as usize;
+                    let n = sv.sum_strat[i].len();
+                    sv.sum_strat[i].copy_from_slice(&sum[so..so + n]);
+                }
+                sv.steps[traverser] += 1;
+                checked += 1;
+            }
+        }
+        assert!(checked >= 6, "only {checked} comparisons");
     }
 }
