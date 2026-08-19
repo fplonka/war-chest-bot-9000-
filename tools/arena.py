@@ -9,11 +9,9 @@ binary is built once, at the revision that trained the weights, and never
 rebuilt — which is the only way to keep playing an architecture after the
 source that produced it has been rewritten.
 
-The referee owns the true position and the dice and speaks to each bot over a
-pipe, in public information only. Neither side waits for the other's slowest
-game: a bot answers each game as that game is ready, so it always holds a
-mixture of games and both its cores and its device stay busy. `docs/ARENA.md`
-has the protocol.
+The referee owns the true position and speaks to each bot over a pipe, in
+public information only. Games advance independently, so finished work returns
+without waiting for the slowest game.
 
 Ratings are Bradley-Terry, quoted against the first bot on the command line.
 Elo does not carry between separate ladders, so a comparison worth trusting is
@@ -58,7 +56,7 @@ WIN_MARKERS = 6
 class Bot:
     """One bot process, and the manifest that describes it."""
 
-    def __init__(self, path, seat, device, replies):
+    def __init__(self, path, seat, replies, threads=0):
         self.dir = Path(path)
         self.seat = seat
         self.closing = False
@@ -79,15 +77,19 @@ class Bot:
                 f"with these weights. Rebuild it from sha "
                 f"{self.spec.get('sha', '?')} rather than copying one in.")
         argv = [str(self.dir / "bot"), "--name", self.name,
-                "--mind", self.spec.get("mind", "rebel"),
-                "--device", str(device)]
+                "--mind", self.spec.get("mind", "rebel")]
         if self.spec.get("weights"):
             argv += ["--weights", str(self.dir / self.spec["weights"])]
-        for key, flag in (("depth", "--depth"), ("iters", "--iters"),
-                          ("cfr", "--cfr"), ("temp", "--temp"),
-                          ("node_cap", "--node-cap")):
-            if key in self.spec.get("search", {}):
-                argv += [flag, str(self.spec["search"][key])]
+        search = self.spec.get("search", {})
+        for key, flag in (
+                ("depth", "--depth"), ("nodes", "--nodes"),
+                ("expand", "--expand"), ("iters", "--iters"),
+                ("cfr", "--cfr"), ("temp", "--temp"),
+                ("node_cap", "--node-cap")):
+            if key in search:
+                argv += [flag, str(search[key])]
+        if threads and "nodes" in search:
+            argv += ["--threads", str(threads)]
         self.proc = subprocess.Popen(
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
             bufsize=1)
@@ -161,11 +163,9 @@ def match(bots, pairs, replies, seed, concurrent, report):
     each game. Colour-swapped pairs over a shared draft remove most of the
     variance that comes from the draft itself.
 
-    Nothing here waits for a batch. Both bots are handed every game they are
-    not already thinking about, and whichever game either of them finishes
-    first is carried forward at once. That is what keeps each bot holding a
-    mixture of games — some being built on its cores, some being solved on its
-    device — instead of swinging between the two."""
+    Games advance independently. A completed game is carried forward without
+    waiting for unrelated searches.
+    """
     table = warchest.Table()
     todo = deque(range(2 * len(pairs)))
     scores = {}
@@ -286,8 +286,8 @@ def ratings(names, records):
 
 # ------------------------------------------------------------- the tablebase
 
-def generate(paths, games, seed, concurrent, devices, out_dir,
-             depth=8, per_bucket=400, min_plies=2, budget=25_000):
+def generate(paths, games, seed, concurrent, out_dir, depth=8,
+             per_bucket=400, min_plies=2, budget=25_000):
     """Find positions whose result is proven, by watching bots play.
 
     Positions come from games between *bots*, which is what stops this rotting:
@@ -314,8 +314,8 @@ def generate(paths, games, seed, concurrent, devices, out_dir,
     together. Raising it to 400,000 finds 1.5% more positions and takes 2.6
     times as long, so the time is better spent on more games."""
     replies = queue.Queue()
-    bots = tuple(Bot(p, i, devices[i % len(devices)], replies)
-                 for i, p in enumerate(paths))
+    threads = max(1, (os.cpu_count() or 2) // len(paths))
+    bots = tuple(Bot(p, i, replies, threads) for i, p in enumerate(paths))
     table = warchest.Table()
     pairs = drafts(seed, (games + 1) // 2)
     todo = deque(range(games))
@@ -428,7 +428,7 @@ def generate(paths, games, seed, concurrent, devices, out_dir,
     print(f"wrote {out_dir / 'suite.json'}")
 
 
-def score(bot_path, questions, wire, device, concurrent):
+def score(bot_path, questions, wire, concurrent):
     """Ask a bot the questions whose answers are proven.
 
     Each question is a position in which one side wins whatever the other
@@ -441,8 +441,7 @@ def score(bot_path, questions, wire, device, concurrent):
     So this is the one measurement here that is true rather than relative: the
     same questions and the same marking for any bot ever built.
 
-    Questions are independent, so many are in flight at once; a searching bot
-    that answered them one at a time would leave its card idle between each.
+    Questions are independent, so many are in flight at once.
 
     `wire` is the questions already serialised, since every bot is handed the
     same ones and the suite can run to thousands of positions."""
@@ -450,7 +449,7 @@ def score(bot_path, questions, wire, device, concurrent):
     name = spec.get("name", Path(bot_path).name)
 
     replies = queue.Queue()
-    bot = Bot(bot_path, 0, device, replies)
+    bot = Bot(bot_path, 0, replies, os.cpu_count() or 1)
     table = warchest.Table()
     kept, blundered = [], []
 
@@ -523,7 +522,7 @@ def score(bot_path, questions, wire, device, concurrent):
     return result
 
 
-def tablebase(bot_paths, suite_dir, out_path, device=-1, concurrent=32):
+def tablebase(bot_paths, suite_dir, out_path, concurrent=32):
     """Score every bot on the same questions and report them together.
 
     One invocation, one report — the same shape the ladder writes — because
@@ -533,8 +532,7 @@ def tablebase(bot_paths, suite_dir, out_path, device=-1, concurrent=32):
     meta = json.loads((Path(suite_dir) / "suite.json").read_text())
     questions = meta["questions"]
     wire = [json.dumps(q["position"]) for q in questions]
-    bots = sorted((score(b, questions, wire, device, concurrent)
-                   for b in bot_paths),
+    bots = sorted((score(b, questions, wire, concurrent) for b in bot_paths),
                   key=lambda r: r["rate"])
     result = {"kind": "tablebase", "suite": str(suite_dir),
               "source": meta.get("source", "?"),
@@ -595,8 +593,6 @@ def name(bot_dir):
     return Path(bot_dir).name
 
 
-def devices(spec):
-    return [int(d) for d in spec.split(",")]
 
 
 #: Hardness bands, by the share of legal moves that keep the win. A position
@@ -646,7 +642,7 @@ def write_json(path, value):
     os.replace(tmp, path)
 
 
-def ladder(paths, games, seed, concurrent, devices, out_path):
+def ladder(paths, games, seed, concurrent, out_path):
     if games < 2 or games % 2:
         raise SystemExit("--games must be a positive even number")
     specs = [json.loads((Path(p) / "bot.json").read_text()) for p in paths]
@@ -659,13 +655,13 @@ def ladder(paths, games, seed, concurrent, devices, out_path):
     replies = queue.Queue()
 
     def bot_on(seat, index):
-        """The bot seated at `seat`, started on that seat's device if it is not
-        already the one sitting there."""
+        """Start the requested bot in this seat if it is not already there."""
         if running.get(seat) and running[seat][0] == index:
             return running[seat][1]
         if running.get(seat):
             running[seat][1].close()
-        running[seat] = (index, Bot(paths[index], seat, devices[seat], replies))
+        threads = max(1, (os.cpu_count() or 2) // 2)
+        running[seat] = (index, Bot(paths[index], seat, replies, threads))
         return running[seat][1]
 
     try:
@@ -748,9 +744,10 @@ def pack(run, binary, out_dir, snapshot=None, name=None):
     for snap in snaps:
         checkpoint = torch.load(run / snap["file"], map_location="cpu",
                                 weights_only=False)
-        search = {"depth": cfg.get("depth", 2), "iters": cfg.get("iters", 64),
+        search = {"nodes": cfg.get("nodes", 1024),
+                  "expand": cfg.get("expand", 1),
+                  "iters": cfg.get("iters", 64),
                   "cfr": cfg.get("cfr", "dcfr")}
-        search.update(checkpoint.get("search") or {})
         bot = name or f"{run.name}.{snap['label']}"
         directory = out_dir / bot
         directory.mkdir(parents=True, exist_ok=True)
@@ -763,7 +760,7 @@ def pack(run, binary, out_dir, snapshot=None, name=None):
             "mind": "rebel",
             "weights": "weights.bin",
             "search": {k: v for k, v in search.items()
-                       if k in ("depth", "iters", "cfr")},
+                       if k in ("nodes", "expand", "iters", "cfr")},
             "minutes": round(snap["t"] / 60.0, 1),
             "note": f"{run.name} {snap['label']}, {snap['t'] / 60:.0f} min",
         }, indent=1) + "\n")
@@ -782,9 +779,7 @@ def main():
                      help="games per pairing, split evenly between colours")
     lad.add_argument("--seed", type=int, default=83)
     lad.add_argument("--concurrent", type=int, default=128,
-                     help="games in flight; this is what fills the device")
-    lad.add_argument("--devices", default="0,1",
-                     help="the two sides' CUDA devices; use 0,0 for one card")
+                     help="games in flight")
     lad.add_argument("--out", default="")
 
     gen = sub.add_parser("generate",
@@ -800,14 +795,12 @@ def main():
                      help="a win available sooner is a different, easier question")
     gen.add_argument("--concurrent", type=int, default=192,
                      help="games in flight; measured best on two cards")
-    gen.add_argument("--devices", default="-1,-1")
     gen.add_argument("--out", default="suites/forced")
 
     tb = sub.add_parser("tablebase",
                         help="score bots on positions with proven answers")
     tb.add_argument("bots", nargs="+")
     tb.add_argument("--suite", default="suites/forced")
-    tb.add_argument("--device", type=int, default=-1)
     tb.add_argument("--concurrent", type=int, default=32)
     tb.add_argument("--out", default="")
 
@@ -826,17 +819,15 @@ def main():
                     args.snapshot, args.name)
     if args.command == "generate":
         return generate(args.bots, args.games, args.seed, args.concurrent,
-                        devices(args.devices), args.out, args.depth,
-                        args.per_bucket, args.min_plies, args.budget)
+                        args.out, args.depth, args.per_bucket,
+                        args.min_plies, args.budget)
     if args.command == "tablebase":
         stem = "tablebase_" + "_".join(name(b) for b in args.bots[:3])
         return tablebase(args.bots, args.suite, report_path(args.out, stem),
-                         args.device, args.concurrent)
-    if len(devices(args.devices)) != 2:
-        ap.error("--devices takes exactly two device ids")
+                         args.concurrent)
     stem = "_vs_".join(name(b) for b in args.bots[:3])
     ladder(args.bots, args.games, args.seed, args.concurrent,
-           devices(args.devices), report_path(args.out, stem))
+           report_path(args.out, stem))
 
 
 if __name__ == "__main__":

@@ -12,19 +12,17 @@ Two phases inside one wall-clock budget:
    snapshot 0, labelled `init`: where ReBeL started, and the zero point the Elo
    curve is read against.
 
-2. **ReBeL** (the rest). Self-play where every decision solves a depth-limited
-   CFR subgame over public belief states; the targets are the CFR root values,
-   one per config in each player's belief support.
+2. **GT-CFR** (the rest). Self-play where every decision grows a search tree
+   along trajectories sampled from its changing strategy. Interior search
+   queries become value targets, one value per config in each player's belief.
 
-Everything except the gradient step runs in Rust across all cores; Python ships
-weights down and pulls tensors back once per epoch.
+Generation runs in Rust across all CPU cores while the previous batch trains
+on the GPU. Python publishes weights between generation batches.
 
 A training row is a public state plus, for each player, the whole belief: the
 exact configs in support, their probabilities, and the value the solve gave
 each. The config lists are ragged, so they live in a flat arena and a batch is
-assembled by gathering spans -- see `Buffer`. Each row also carries who owned
-each of the ten locations when its game ended, backfilled by the engine: the
-auxiliary target, which shapes the trunk and costs nothing at inference.
+assembled by gathering spans -- see `Buffer`.
 
 The run snapshots every `snapshot_every` minutes of ReBeL. When training
 ends, the snapshots play Greedy (random drafts) and a report is written.
@@ -55,7 +53,7 @@ import warchest
 import config
 import mirror
 from export_weights import load as load_checkpoint
-from value_net import AUX, Net
+from value_net import Net
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -63,7 +61,6 @@ PUBFEAT = warchest.PUBFEAT
 CFEAT = warchest.CFEAT
 CCOUNTS = warchest.CCOUNTS
 CNORM = warchest.CNORM
-N_LOCATIONS = warchest.N_LOCATIONS
 ROW_BYTES = warchest.ROW_BYTES
 
 
@@ -103,8 +100,7 @@ class Buffer:
     ~223 bytes instead of the ~1.9 KB the old float encoding cost -- and the
     network input is expanded from it when a batch is made. Counts are stored
     as the `uint8` they are and everything else as float16, which is what makes
-    the cap affordable: a row costs `ROW_BYTES` bytes plus one per location for
-    the auxiliary target, plus 20 per config.
+    the cap affordable: a row costs `ROW_BYTES` bytes plus 20 per config.
 
     Preallocated and written with wraparound rather than grown by
     concatenation. The concatenate form rebuilt the whole buffer every epoch:
@@ -120,9 +116,6 @@ class Buffer:
     def __init__(self, cap, ccap):
         self.cap, self.ccap = cap, ccap
         self.x = np.zeros((cap, ROW_BYTES), np.uint8)
-        # Who owned each location when the row's game ended: the auxiliary
-        # target, backfilled by the engine and one byte per location.
-        self.aux = np.zeros((cap, N_LOCATIONS), np.uint8)
         self.soff = np.zeros(0, np.int64)
         self.cstart = np.zeros(cap, np.int64)   # absolute arena offset
         self.clen = np.zeros((cap, 2), np.int32)
@@ -136,7 +129,7 @@ class Buffer:
         self.cfgs = 0   # configs ever written
         self.lo = 0     # oldest row whose configs are still in the arena
 
-    def add(self, x, aux, cc, cw, cy, coff, soff):
+    def add(self, x, cc, cw, cy, coff, soff):
         n = len(x)
         lens = np.diff(coff).reshape(n, 2)
         cp = np.repeat(np.tile([0, 1], n).astype(np.uint8), lens.ravel())
@@ -146,7 +139,6 @@ class Buffer:
             j = min(i + 4096, n)
             sl = np.arange(i, j) + base
             self.x[sl % self.cap] = x[i:j]
-            self.aux[sl % self.cap] = aux[i:j]
             self.cstart[sl % self.cap] = starts[i:j]
             self.clen[sl % self.cap] = lens[i:j]
         m = len(cw)
@@ -186,7 +178,7 @@ class Buffer:
     def gather(self, ids):
         """Assemble a batch from absolute row ids.
 
-        Returns `(rows, aux, cc, cp, cw, cy, seg)`.
+        Returns `(rows, cc, cp, cw, cy, seg)`.
         """
         s = ids % self.cap
         lens = self.clen[s].sum(1).astype(np.int64)
@@ -197,7 +189,7 @@ class Buffer:
             np.concatenate([[0], np.cumsum(lens)[:-1]]), lens)
         at = (base + within) % self.ccap
         seg = 2 * np.repeat(np.arange(len(ids), dtype=np.int64), lens) + self.cp[at]
-        return (self.x[s], self.aux[s], self.cc[at], self.cp[at],
+        return (self.x[s], self.cc[at], self.cp[at],
                 self.cw[at].astype(np.float32), self.cy[at].astype(np.float32), seg)
 
     def sample(self, batch, rng, recent_mix=0.0, recent_frac=0.2):
@@ -218,9 +210,6 @@ class Buffer:
         leaving every row reachable. Two uniform draws, and no weight vector to
         rebuild each epoch.
 
-        TurboReBeL's per-solve rows are thinned to the ~8 log-spaced iterates
-        plus the live belief before they reach the buffer, so rows inside one
-        solve are not near-duplicates and plain row sampling is unbiased.
         """
         ids = rng.integers(self.lo, self.rows, size=batch)
         k = int(batch * recent_mix)
@@ -249,14 +238,12 @@ class Buffer:
 def make_batch(parts, rng, device):
     """Numpy replay batch -> the two canonical player queries per row."""
     del rng
-    rows, aux, cc, cp, cw, cy, seg = parts
+    rows, cc, cp, cw, cy, seg = parts
     n = len(rows)
     hand, fd, bag = public_sizes(cc, cp, seg, n)
     views = np.empty((2 * n, ROW_BYTES), np.uint8)
     views[0::2] = rows
     views[1::2] = mirror.mirror_rows(rows)
-    # The trunk runs once in physical seat-0 coordinates.
-    owner = aux
     sizes = []
     for a in (hand, fd, bag):
         pair = np.empty((2 * n, 2), np.uint8)
@@ -266,24 +253,16 @@ def make_batch(parts, rng, device):
     x = expand_batch(views, *sizes)
     phi = cc.astype(np.float32) / CNORM
     t = lambda a, d=torch.float32: torch.as_tensor(a, dtype=d, device=device)
-    return (t(x), t(phi), t(cw), t(seg, torch.long), t(cy),
-            t(owner, torch.long), 2 * n)
+    return (t(x), t(phi), t(cw), t(seg, torch.long), t(cy), 2 * n)
 
 
 def forward_values(net, parts):
-    """Just the values, for the diagnostics that do not want the aux head."""
-    return net(*parts[:4], parts[-1])[0]
+    return net(*parts[:4], parts[-1])
 
 
-def losses(net, xpub, phi, w, seg, y, aux, nseg, stats=None):
-    """Value Huber (mean per belief support, then across canonical queries),
-    the auxiliary ownership cross-entropy, and that head's accuracy.
-
-    The three are returned apart rather than summed: the value figure has to
-    stay comparable across runs that weight the auxiliary head differently,
-    and the aux pair is what says whether the trunk learned anything from it.
-    """
-    v, logits = net(xpub, phi, w, seg, nseg)
+def losses(net, xpub, phi, w, seg, y, nseg, stats=None):
+    """Value Huber, mean per belief support and then across queries."""
+    v = net(xpub, phi, w, seg, nseg)
     if stats is not None:
         expected = torch.zeros(nseg, dtype=v.dtype, device=v.device)
         expected.index_add_(0, seg, v.detach() * w)
@@ -294,10 +273,7 @@ def losses(net, xpub, phi, w, seg, y, aux, nseg, stats=None):
     count = torch.zeros(nseg, dtype=per.dtype, device=per.device)
     total.index_add_(0, seg, per)
     count.index_add_(0, seg, torch.ones_like(per))
-    flat, want = logits.reshape(-1, AUX), aux.reshape(-1)
-    ce = F.cross_entropy(flat, want)
-    acc = (flat.detach().argmax(1) == want).to(v.dtype).mean()
-    return (total / count.clamp(min=1)).mean(), ce, acc
+    return (total / count.clamp(min=1)).mean()
 
 
 @torch.no_grad()
@@ -312,18 +288,17 @@ def diagnostics(net, buf, probe, batch, rng, device, batch_fn, recent_frac):
     old = batch_fn(buf.sample_old(batch, rng, recent_frac), rng, device)
     new = batch_fn(buf.sample(batch, rng, recent_mix=1.0, recent_frac=recent_frac),
                    rng, device)
-    return spread, float(losses(net, *old)[0]), float(losses(net, *new)[0])
+    return spread, float(losses(net, *old)), float(losses(net, *new))
 
 
-def train_steps(net, opt, buf, steps, batch, rng, device, aux_weight,
+def train_steps(net, opt, buf, steps, batch, rng, device,
                 recent_mix=0.0, recent_frac=0.2, profile_cuda=False,
                 batch_fn=make_batch):
-    """Mean *value* loss over `steps` Adam updates; the auxiliary head's loss
-    and accuracy come back in `stat`, summed over the steps."""
+    """Mean value loss over `steps` Adam updates."""
     stat = {"sample_s": 0.0, "prepare_s": 0.0, "forward_wall_s": 0.0,
             "backward_wall_s": 0.0, "batch_configs": 0, "steps": steps,
             "gpu_forward_s": 0.0, "gpu_backward_s": 0.0,
-            "zero_sum_max": 0.0, "aux_loss": 0.0, "aux_acc": 0.0}
+            "zero_sum_max": 0.0, "grad_clipped": 0}
     if len(buf) < batch:
         return float("nan"), stat
     tot = 0.0
@@ -343,18 +318,16 @@ def train_steps(net, opt, buf, steps, batch, rng, device, aux_weight,
             b1 = torch.cuda.Event(enable_timing=True)
             f0.record(stream)
         ts = time.perf_counter()
-        value, ce, acc = losses(net, *parts, stats=stat)
-        loss = value + aux_weight * ce
+        value = losses(net, *parts, stats=stat)
         tot += value.detach().item()
-        stat["aux_loss"] += ce.detach().item()
-        stat["aux_acc"] += acc.item()
         stat["forward_wall_s"] += time.perf_counter() - ts
         if stream is not None:
             f1.record(stream)
         ts = time.perf_counter()
         opt.zero_grad(set_to_none=True)
-        loss.backward()
-        nn.utils.clip_grad_norm_(net.parameters(), 5.0)
+        value.backward()
+        grad_norm = nn.utils.clip_grad_norm_(net.parameters(), 5.0)
+        stat["grad_clipped"] += int(grad_norm > 5.0)
         opt.step()
         stat["backward_wall_s"] += time.perf_counter() - ts
         if stream is not None:
@@ -367,35 +340,24 @@ def train_steps(net, opt, buf, steps, batch, rng, device, aux_weight,
     return tot / steps, stat
 
 
+
+
 def physical_cpus():
-    """Lowest id in each hyperthread sibling group: one hardware thread per core."""
-    cores = set()
+    """Return one Linux hardware thread from each physical core."""
+    cpus = set()
     root = "/sys/devices/system/cpu"
     if not os.path.isdir(root):
-        return cores
+        return []
     for name in os.listdir(root):
         if not name.startswith("cpu") or not name[3:].isdigit():
             continue
         path = os.path.join(root, name, "topology", "thread_siblings_list")
         try:
-            text = open(path).read().strip().replace("-", ",")
-        except OSError:
-            continue
-        ids = [int(x) for x in text.split(",") if x]
-        if ids:
-            cores.add(min(ids))
-    return cores
-
-
-def pin_one_thread_per_core():
-    if not hasattr(os, "sched_setaffinity"):
-        return
-    cores = physical_cpus()
-    if not cores:
-        return
-    os.sched_setaffinity(0, cores)
-    print(f"[cpu] pinned to {len(cores)} physical cores", flush=True)
-
+            first = open(path).read().strip().split(",", 1)[0].split("-", 1)[0]
+            cpus.add(int(first))
+        except (OSError, ValueError):
+            pass
+    return sorted(cpus)
 
 def refuse_if_machine_busy():
     """Catch a second run started by accident."""
@@ -466,7 +428,13 @@ def main():
           flush=True)
     if args.note:
         print(f"[train] {args.note}", flush=True)
-    pin_one_thread_per_core()
+    if args.gen_workers == 0:
+        cores = physical_cpus()
+        args.gen_workers = len(cores) or (
+            len(os.sched_getaffinity(0))
+            if hasattr(os, "sched_getaffinity")
+            else (os.cpu_count() or 1)
+        )
 
     torch.manual_seed(args.seed)
     torch.set_num_threads(1)
@@ -476,8 +444,12 @@ def main():
     dev = torch.device(args.device)
     if dev.type != "cuda":
         raise SystemExit(f"device must be a CUDA device, got {args.device!r}")
-    if args.train_gen_ratio <= 0.0:
-        raise SystemExit("train_gen_ratio must be positive")
+    if args.replay_ratio <= 0.0:
+        raise SystemExit("replay_ratio must be positive")
+    if args.target_every <= 0.0:
+        raise SystemExit("target_every must be positive minutes")
+    if args.gen_solves <= 0 or args.gen_workers <= 0:
+        raise SystemExit("gen_solves and resolved gen_workers must be positive")
     torch.cuda.set_device(dev)
     if args.train_stream_priority > 0:
         raise SystemExit("train_stream_priority must be zero or negative")
@@ -491,29 +463,17 @@ def main():
 
     value = Net().to(dev)
     if args.init_weights:
-        initial = load_checkpoint(args.init_weights)
-        if list(initial.dims) != list(value.dims):
-            raise ValueError(
-                f"initial shape {initial.dims} does not match requested shape {value.dims}")
-        value.load_state_dict(initial.state_dict())
+        value.load_state_dict(load_checkpoint(args.init_weights).state_dict())
         args.warm_minutes = 0.0
     opt = torch.optim.Adam(value.parameters(), lr=args.lr)
     lr_decays = sorted(float(x) for x in args.lr_decay_frac.split(",") if x.strip())
     next_decay = 0
     value.push()
-    gpu_devices = [int(x) for x in args.gpu_devices.split(",") if x.strip()]
-    os.environ.setdefault("WARCHEST_DIRECT", "1")
-    os.environ.setdefault("WARCHEST_WAVE_LANES", "4")
-    os.environ.setdefault("WARCHEST_WAVE_ROWS", "196608")
-    os.environ.setdefault("WARCHEST_WAVE_JOBS", "256")
-    os.environ.setdefault("WARCHEST_WAVE_US", "75000")
-    dims, w, b, ln = value.dims, *value.flat()
-    warchest.gpu_start(dims, w, b, ln, devices=gpu_devices)
-    print(f"[gpu] solve services up on {gpu_devices}", flush=True)
     buf = Buffer(args.cap, args.cap * args.cfgs_per_row)
     import gpu_batch
     gpu_batch.warmup(dev)
     batcher = gpu_batch.make_batch
+    print("[train] search inference on CPU", flush=True)
 
     total = args.minutes * 60.0
     warm = args.warm_minutes * 60.0
@@ -561,283 +521,268 @@ def main():
             snaps[-1]["label"] = label
             return
         path = f"{args.out}/snap_{len(snaps):02d}.pt"
-        torch.save({"value": value.state_dict(), "dims": value.dims, "t": round(el, 1),
+        torch.save({"value": value.state_dict(), "t": round(el, 1),
                     "label": label, "git": args.git,
-                    "search": {"depth": args.depth, "iters": args.iters,
-                               "cfr": args.cfr}}, path)
+                    "search": {"nodes": args.nodes, "expand": args.expand,
+                               "iters": args.iters, "cfr": args.cfr,
+                               "config_cap": args.config_cap}}, path)
         snaps.append({"label": label, "t": round(el, 1),
                       "file": os.path.basename(path)})
         print(f"[t={el:6.1f}s] --- snapshot {snaps[-1]['file']} ({label}) ---", flush=True)
 
-    def run_gpu_stream():
-        """Continuous solve -> replay -> optimizer pipeline for the production
-        pure-bootstrap configuration. Generation is backpressured by a bounded
-        Rust/Python chunk queue; optimizer work is paid from exact sample debt,
-        and immutable GPU weights are published on a fixed step cadence."""
+    def run_search_pipeline():
+        """Overlap small GT-CFR batches with each other and with training."""
         nonlocal probe, cap_v, next_decay, next_snap, epoch, rebel_solves
 
-        gen = warchest.gpu_stream_start(
-            args.seed * 1_000_003 + epoch,
-            depth=args.depth, iters=args.iters, explore=args.explore,
-            random_draft=args.random_draft, cfr=args.cfr,
-            eval_mix=args.eval_mix, workers=args.gpu_workers,
-            inflight_per_worker=args.gpu_inflight, chunk_solves=args.gpu_chunk)
         deadline = t0 + total
-        drain = max(0.0, min(args.gpu_drain_seconds, total - warm))
-        stop_at = deadline - drain
-        publish_steps = max(1, args.gpu_publish_steps)
+        # One process, many solver threads, one forward pass per round. A
+        # process per core could not batch inference at all: the solves have to
+        # share an address space for their leaf rows to end up in one batch.
+        farm = warchest.SolveFarm(
+            args.seed,
+            args.gen_workers,
+            nodes=args.nodes,
+            expand=args.expand,
+            iters=args.iters,
+            explore=args.explore,
+            random_draft=args.random_draft,
+            cfr=args.cfr,
+            config_cap=args.config_cap,
+            query_rate=args.query_rate,
+            recursive_rate=args.recursive_rate,
+            devices=[int(d) for d in args.gen_devices.split(",")])
+
         optimizer_rows = 0
         optimizer_steps = 0
-        publications = 0
-        stopping = False
-        done = False
+        generated_rows = 0
+        window = collections.Counter()
+        totals = collections.Counter()
         next_report = time.time() + 10.0
-        counter_names = (
-            "games", "decisions", "horizon_hits", "node_caps",
-            "plays_attack", "plays_pass", "plays_deploy", "plays_bolster",
-            "plays_maneuver", "plays_recruit",
-            "oversize_routes", "card_exclusive_routes", "exact_fallbacks", "censored_games",
-            "dropped", "configs")
-        totals = {name: 0 for name in counter_names}
-        window = {name: 0 for name in counter_names}
-        window.update(rows=0, solves=0, target_n=0, target_sum=0.0,
-                      target_sq=0.0, conv_s=0.0, add_s=0.0,
-                      train_s=0.0, gpu_wait_s=0.0,
-                      loss_sum=0.0, train_steps=0, sample_s=0.0,
-                      prepare_s=0.0, forward_wall_s=0.0,
-                      backward_wall_s=0.0, gpu_forward_s=0.0,
-                      gpu_backward_s=0.0, batch_configs=0,
-                      zero_sum_max=0.0, aux_loss=0.0, aux_acc=0.0)
+        next_target = rebel_t0 + args.target_every * 60.0
 
-        def emit_report(now):
-            nonlocal probe, epoch
-            elapsed = max(now - rebel_t0, 1e-9)
-            debt = max(0.0, args.train_gen_ratio * rebel_solves - optimizer_rows)
-            credit = optimizer_rows / args.train_gen_ratio
-            raw_sps = rebel_solves / elapsed
-            balanced_sps = min(rebel_solves, credit) / elapsed
+        while True:
+            now = time.time()
+            if now >= deadline:
+                break
+            gen_t = time.time()
+            data = farm.collect(args.gen_solves)
+            gen_s = time.time() - gen_t
+
+            tc = time.time()
+            rows = np.asarray(data["rows"], np.uint8).reshape(-1, ROW_BYTES)
+            cc = np.asarray(data["cc"], np.uint8).reshape(-1, CCOUNTS)
+            cw = np.asarray(data["cw"], np.float32)
+            cy = np.clip(np.asarray(data["cy"], np.float32), -1.0, 1.0)
+            coff = np.asarray(data["coff"], np.int64)
+            soff = np.asarray(data["soff"], np.int64)
+            conv_s = time.time() - tc
+            ta = time.time()
+            if len(rows):
+                buf.add(rows, cc, cw.astype(np.float16),
+                        cy.astype(np.float16), coff, soff)
+            add_s = time.time() - ta
+
+            solves = int(data["solves"])
+            rebel_solves += solves
+            generated_rows += len(rows)
+            window["results"] += 1
+            window["rows"] += len(rows)
+            window["solves"] += solves
+            window["target_n"] += cy.size
+            window["target_sum"] += float(cy.sum(dtype=np.float64))
+            window["target_square_sum"] += float(
+                np.square(cy.astype(np.float64)).sum())
+            window["gen_s"] += gen_s
+            window["conv_s"] += conv_s
+            window["add_s"] += add_s
+            for name in (
+                    "games", "decisions", "horizon_hits", "node_caps",
+                    "plays_attack", "plays_pass", "plays_deploy",
+                    "plays_bolster", "plays_maneuver", "plays_recruit",
+                    "configs", "query_rows"):
+                amount = int(data.get(name, 0))
+                totals[name] += amount
+                window[name] += amount
+
+            debt = max(0.0, args.replay_ratio * generated_rows - optimizer_rows)
+            nsteps = int(debt // args.batch) if len(buf) >= args.batch else 0
+            train_s = 0.0
+            lv = 0.0
+            train_stat = {
+                name: 0.0 for name in (
+                    "sample_s", "prepare_s", "forward_wall_s",
+                    "backward_wall_s", "gpu_forward_s", "gpu_backward_s",
+                    "batch_configs", "zero_sum_max", "grad_clipped")
+            }
+            if nsteps:
+                tt = time.time()
+                lv, train_stat = train_steps(
+                    value, opt, buf, nsteps, args.batch, rng, dev,
+                    recent_mix=args.recent_mix,
+                    recent_frac=args.recent_frac,
+                    profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1",
+                    batch_fn=batcher)
+                train_s = time.time() - tt
+                optimizer_steps += nsteps
+                optimizer_rows += nsteps * args.batch
+                window["loss_sum"] += lv * nsteps
+                window["train_steps"] += nsteps
+                window["batch_configs"] += train_stat["batch_configs"]
+                window["gpu_forward_s"] += train_stat["gpu_forward_s"]
+                window["gpu_backward_s"] += train_stat["gpu_backward_s"]
+                window["grad_clipped"] += train_stat["grad_clipped"]
+                window["zero_sum_max"] = max(
+                    window["zero_sum_max"], train_stat["zero_sum_max"])
+            window["train_s"] += train_s
+
+            now = time.time()
+            if now >= next_target:
+                # `push` bumps the version the farm watches; its threads
+                # pick the new weights up at their next chunk.
+                value.push()
+                print(
+                    f"[t={now - t0:6.1f}s] --- target network refresh ---",
+                    flush=True)
+                while next_target <= now:
+                    next_target += args.target_every * 60.0
+            rebel_elapsed = max(0.0, now - rebel_t0)
+            span = max(args.anneal_frac * (total - warm), 1.0)
+            cap_v = args.cap_value * max(0.0, 1.0 - rebel_elapsed / span)
+            warchest.set_cap_value(cap_v)
+            while next_decay < len(lr_decays) and \
+                    rebel_elapsed >= lr_decays[next_decay] * (total - warm):
+                for pg in opt.param_groups:
+                    pg["lr"] /= 2
+                print(
+                    f"[t={now - t0:6.1f}s] --- lr -> "
+                    f"{opt.param_groups[0]['lr']:.2e} ---",
+                    flush=True)
+                next_decay += 1
+            if now - t0 >= next_snap:
+                snapshot(f"s{len(snaps)}", now - t0)
+                next_snap = now - t0 + snap_gap
+
+            if now < next_report:
+                epoch += 1
+                continue
+            next_report = now + 10.0
+            steps = int(window["train_steps"])
+            lv = window["loss_sum"] / max(steps, 1)
             if probe is None and len(buf) >= 2048:
                 probe = batcher(buf.sample(2048, rng), rng, dev)
             probe_std, loss_old, loss_new = diagnostics(
-                value, buf, probe, args.batch, rng, dev, batcher, args.recent_frac)
-            tn = max(window["target_n"], 1)
-            tgt_mean = window["target_sum"] / tn
-            tgt_var = max(0.0, window["target_sq"] / tn - tgt_mean * tgt_mean)
-            dec = max(window["decisions"], 1)
-            games = max(window["games"], 1)
-            lv = window["loss_sum"] / max(window["train_steps"], 1)
-            steps_done = max(window["train_steps"], 1)
+                value, buf, probe, args.batch, rng, dev, batcher,
+                args.recent_frac)
+            target_n = max(int(window["target_n"]), 1)
+            target_mean = window["target_sum"] / target_n
+            target_var = max(
+                0.0,
+                window["target_square_sum"] / target_n
+                - target_mean * target_mean)
+            dec = max(int(window["decisions"]), 1)
+            games = max(int(window["games"]), 1)
+            raw_sps = rebel_solves / max(rebel_elapsed, 1e-9)
+            gen_s = window["gen_s"] / max(window["results"], 1)
+            train_s = window["train_s"]
             rec = {
-                "t": round(now - t0, 1), "epoch": epoch, "phase": "rebel",
-                "games": window["games"], "decisions": window["decisions"],
-                "rows": window["rows"], "solves": window["solves"],
+                "t": round(now - t0, 1),
+                "epoch": epoch,
+                "phase": "rebel",
+                "games": int(window["games"]),
+                "decisions": int(window["decisions"]),
+                "rows": int(window["rows"]),
+                "solves": int(window["solves"]),
                 "loss": round(lv, 5),
-                "loss_old": round(loss_old, 5), "loss_new": round(loss_new, 5),
-                "aux_loss": round(window["aux_loss"] / steps_done, 5),
-                "aux_acc": round(window["aux_acc"] / steps_done, 4),
+                "loss_old": round(loss_old, 5),
+                "loss_new": round(loss_new, 5),
                 "zero_sum_max": round(window["zero_sum_max"], 5),
+                "grad_clip_frac": round(
+                    window["grad_clipped"] / max(steps, 1), 4),
                 "horizon_frac": round(window["horizon_hits"] / games, 3),
-                "node_caps": window["node_caps"],
-                "plays": {k: window[f"plays_{k}"]
-                          for k in ("attack", "pass", "deploy", "bolster",
-                                    "maneuver", "recruit")},
-                "oversize_routes": window["oversize_routes"],
-                "card_exclusive_routes": window["card_exclusive_routes"],
-                "exact_fallbacks": window["exact_fallbacks"],
-                "censored_games": window["censored_games"],
-                "dropped": window["dropped"],
+                "node_caps": int(window["node_caps"]),
+                # How many solves shared a forward pass. It should sit near the
+                # thread count; well below means the round is waiting on
+                # stragglers instead of batching them.
+                "calls_per_round": round(
+                    int(data["round_calls"]) / max(int(data["rounds"]), 1), 2),
+                "rows_per_round": round(
+                    int(data["round_rows"]) / max(int(data["rounds"]), 1), 1),
+                # Rows the query solver produced, i.e. targets taken off
+                # the line of play. Zero means the coverage path is dead.
+                "query_rows": int(window["query_rows"]),
+                "plays": {
+                    name: int(window[f"plays_{name}"])
+                    for name in (
+                        "attack", "pass", "deploy", "bolster",
+                        "maneuver", "recruit")
+                },
                 "configs": round(window["configs"] / dec, 1),
                 "cap_value": round(cap_v, 4),
-                "steps": window["train_steps"],
+                "steps": steps,
                 "optimizer_steps": optimizer_steps,
                 "optimizer_rows": optimizer_rows,
-                "optimizer_debt": round(debt, 1),
-                "publications": publications,
-                "weight_age_steps": optimizer_steps % publish_steps,
-                "tgt_mean": round(tgt_mean, 4),
-                "tgt_std": round(tgt_var ** 0.5, 4),
+                "optimizer_debt": round(
+                    max(0.0, args.replay_ratio * generated_rows
+                        - optimizer_rows), 1),
+                "replay_rows": generated_rows,
+                "rows_per_s": round(
+                    generated_rows / max(rebel_elapsed, 1e-9), 1),
+                "effective_train_ratio": round(
+                    optimizer_rows / max(rebel_solves, 1), 3),
+                "train_row_ratio": round(
+                    optimizer_rows / max(generated_rows, 1), 3),
+                "tgt_mean": round(target_mean, 4),
+                "tgt_std": round(target_var ** 0.5, 4),
                 "probe_std": round(probe_std, 4),
-                "gen_s": round(elapsed, 2),
-                "train_s": round(window["train_s"], 2),
-                "sample_s": round(window["sample_s"], 2),
-                "prepare_s": round(window["prepare_s"], 2),
-                "forward_wall_s": round(window["forward_wall_s"], 2),
-                "backward_wall_s": round(window["backward_wall_s"], 2),
+                "gen_s": round(gen_s, 2),
+                "train_s": round(train_s, 2),
+                "conv_s": round(window["conv_s"], 2),
+                "add_s": round(window["add_s"], 2),
                 "gpu_forward_s": round(window["gpu_forward_s"], 2),
                 "gpu_backward_s": round(window["gpu_backward_s"], 2),
                 "batch_configs": round(
-                    window["batch_configs"] / max(window["train_steps"], 1), 1),
-                "target_configs_per_row": round(
-                    window["target_n"] / max(window["rows"], 1), 1),
-                "conv_s": round(window["conv_s"], 2),
-                "add_s": round(window["add_s"], 2),
-                "gpu_wait_s": round(window["gpu_wait_s"], 2),
+                    window["batch_configs"] / max(steps, 1), 1),
                 "buf": len(buf),
                 "buf_s": round(buf.span_seconds(), 1),
                 "solves_per_s": round(raw_sps, 1),
-                "balanced_solves_per_s": round(balanced_sps, 1),
                 "lr": opt.param_groups[0]["lr"],
-                "deadline_remaining": round(max(0.0, deadline - now), 1),
             }
             log.append(rec)
             write_log(args, log, snaps)
             print(
-                f"[t={rec['t']:6.1f}s] rebel stream solves={rebel_solves} "
-                f"raw={raw_sps:.0f}/s balanced={balanced_sps:.0f}/s "
-                f"debt={debt:.0f} rows steps={optimizer_steps} "
-                f"horizon={rec['horizon_frac']:.2f} games={rec['games']} "
-                f"over={totals['oversize_routes']} card={totals['card_exclusive_routes']} "
-                f"drop={totals['dropped']} "
-                f"L={lv:.5f} L/var={lv / max(tgt_var, 1e-9):.2f} "
-                f"tgt={tgt_mean:+.3f}/{tgt_var ** 0.5:.3f} "
-                f"aux={rec['aux_loss']:.4f}/{rec['aux_acc']:.3f} "
-                f"cfg/b={rec['batch_configs']:.0f} prep={window['prepare_s']:.2f}s "
-                f"gpu={window['gpu_forward_s'] + window['gpu_backward_s']:.2f}s "
-                f"conv={window['conv_s']:.2f}s add={window['add_s']:.2f}s "
-                f"train={window['train_s']:.2f}s",
+                f"[t={rec['t']:6.1f}s] GT-CFR solves={rebel_solves} "
+                f"rate={raw_sps:.1f}/s rows={rec['rows']} "
+                f"games={rec['games']} qrows={rec['query_rows']} "
+                f"caps={totals['node_caps']} "
+                f"L={lv:.5f} L/var={lv / max(target_var, 1e-9):.2f} "
+                f"tgt={target_mean:+.3f}/{target_var ** 0.5:.3f} "
+                f"gen={gen_s:.2f}s train={train_s:.2f}s "
+                f"gpu={window['gpu_forward_s'] + window['gpu_backward_s']:.2f}s",
                 flush=True)
+            window.clear()
             epoch += 1
-            for name in counter_names:
-                window[name] = 0
-            for name in ("rows", "solves", "target_n", "target_sum", "target_sq",
-                         "conv_s", "add_s", "train_s", "gpu_wait_s",
-                         "loss_sum", "train_steps", "sample_s", "prepare_s",
-                         "forward_wall_s", "backward_wall_s", "gpu_forward_s",
-                         "gpu_backward_s", "batch_configs", "zero_sum_max",
-                         "aux_loss", "aux_acc"):
-                window[name] = 0
+        # Dropping the farm stops its threads once they finish the solve they
+        # are in, which is also what flushes their last rows.
+        del farm
 
-        try:
-            while True:
-                now = time.time()
-                if not stopping and now >= stop_at:
-                    gen.stop()
-                    stopping = True
-                    print(f"[t={now - t0:6.1f}s] --- stopping GPU admission; draining ---",
-                          flush=True)
-
-                data = None
-                if not done:
-                    try:
-                        data = gen.next(timeout=0.05)
-                    except StopIteration:
-                        done = True
-
-                if data is not None:
-                    tc = time.time()
-                    rows = np.asarray(data["rows"], np.uint8).reshape(-1, ROW_BYTES)
-                    aux = np.asarray(data["aux"], np.uint8).reshape(-1, N_LOCATIONS)
-                    cc = np.asarray(data["cc"], np.uint8).reshape(-1, CCOUNTS)
-                    cw = np.asarray(data["cw"], np.float32)
-                    cy = np.clip(np.asarray(data["cy"], np.float32), -1.0, 1.0)
-                    coff = np.asarray(data["coff"], np.int64)
-                    soff = np.asarray(data["soff"], np.int64)
-                    solves = int(data["solves"])
-                    window["conv_s"] += time.time() - tc
-                    ta = time.time()
-                    if len(rows) > 0:
-                        buf.add(rows, aux, cc, cw.astype(np.float16),
-                                cy.astype(np.float16), coff, soff)
-                    window["add_s"] += time.time() - ta
-                    rebel_solves += solves
-                    window["solves"] += solves
-                    window["rows"] += len(rows)
-                    window["target_n"] += cy.size
-                    window["target_sum"] += float(cy.sum(dtype=np.float64))
-                    window["target_sq"] += float(np.square(cy.astype(np.float64)).sum())
-                    window["gpu_wait_s"] += float(data.get("gpu_wait_s", 0.0))
-                    for name in counter_names:
-                        v = int(data.get(name, 0))
-                        totals[name] += v
-                        window[name] += v
-
-                debt = max(0.0, args.train_gen_ratio * rebel_solves - optimizer_rows)
-                if debt >= args.batch and len(buf) >= args.batch:
-                    until_publish = publish_steps - optimizer_steps % publish_steps
-                    nsteps = min(int(debt // args.batch), until_publish)
-                    tt = time.time()
-                    lv, train_stat = train_steps(
-                        value, opt, buf, nsteps, args.batch, rng, dev,
-                        args.aux_weight,
-                        recent_mix=args.recent_mix, recent_frac=args.recent_frac,
-                        profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1",
-                        batch_fn=batcher)
-                    window["train_s"] += time.time() - tt
-                    window["loss_sum"] += lv * nsteps
-                    window["train_steps"] += nsteps
-                    for name in ("sample_s", "prepare_s", "forward_wall_s",
-                                 "backward_wall_s", "gpu_forward_s", "gpu_backward_s",
-                                 "batch_configs", "aux_loss", "aux_acc"):
-                        window[name] += train_stat[name]
-                    window["zero_sum_max"] = max(
-                        window["zero_sum_max"], train_stat["zero_sum_max"])
-                    optimizer_steps += nsteps
-                    optimizer_rows += nsteps * args.batch
-                    if optimizer_steps % publish_steps == 0:
-                        value.push()
-                        flat = value.flat()
-                        for i in range(len(gpu_devices)):
-                            warchest.gpu_set_weights(value.dims, *flat, device=i)
-                        publications += 1
-
-                now = time.time()
-                rebel_elapsed = max(0.0, now - rebel_t0)
-                span = max(args.anneal_frac * (total - warm), 1.0)
-                cap_v = args.cap_value * max(0.0, 1.0 - rebel_elapsed / span)
-                warchest.set_cap_value(cap_v)
-                while next_decay < len(lr_decays) and \
-                        rebel_elapsed >= lr_decays[next_decay] * (total - warm):
-                    for pg in opt.param_groups:
-                        pg["lr"] /= 2
-                    print(f"[t={now - t0:6.1f}s] --- lr -> {opt.param_groups[0]['lr']:.2e} ---",
-                          flush=True)
-                    next_decay += 1
-                if now - t0 >= next_snap:
-                    snapshot(f"s{len(snaps)}", now - t0)
-                    next_snap = now - t0 + snap_gap
-                if now >= next_report:
-                    emit_report(now)
-                    next_report = now + 10.0
-
-                debt = max(0.0, args.train_gen_ratio * rebel_solves - optimizer_rows)
-                if done and debt < args.batch:
-                    break
-        finally:
-            if not stopping:
-                gen.stop()
-
-        now = time.time()
-        if any(window[name] for name in ("solves", "games", "decisions", "train_steps")):
-            emit_report(now)
-        # The run's denominator is the fixed ReBeL wall-clock interval, not an
-        # early exit made flattering by a short drain. Usually this is only a
-        # few seconds of reserve left after all submitted waves have completed.
-        while time.time() < deadline:
-            time.sleep(min(0.05, deadline - time.time()))
-        elapsed = max(time.time() - rebel_t0, 1e-9)
-        debt = max(0.0, args.train_gen_ratio * rebel_solves - optimizer_rows)
-        credit = optimizer_rows / args.train_gen_ratio
-        raw_sps = rebel_solves / elapsed
-        balanced_sps = min(rebel_solves, credit) / elapsed
+        elapsed = max(deadline - rebel_t0, 1e-9)
         print(
-            f"[gpu-summary] solves={rebel_solves} optimizer_rows={optimizer_rows} "
-            f"debt={debt:.0f} raw={raw_sps:.1f}/s balanced={balanced_sps:.1f}/s "
+            f"[GT-CFR-summary] solves={rebel_solves} "
+            f"optimizer_rows={optimizer_rows} "
+            f"rate={rebel_solves / elapsed:.1f}/s "
             f"horizon={totals['horizon_hits'] / max(totals['games'], 1):.2f} "
-            f"games={totals['games']} "
-            f"over={totals['oversize_routes']} card={totals['card_exclusive_routes']} "
-            f"exact={totals['exact_fallbacks']} "
-            f"censored={totals['censored_games']} dropped={totals['dropped']} "
-            f"overrun={max(0.0, time.time() - deadline):.2f}s",
+            f"games={totals['games']} caps={totals['node_caps']}",
             flush=True)
 
     next_snap = float("inf")
-    print(f"[cfg] PUBFEAT={PUBFEAT} CFEAT={CFEAT} architecture=v5 "
-          f"depth={args.depth} iters={args.iters} budget={total:.0f}s "
-          f"warm={warm:.0f}s snapshot_every={args.snapshot_every:g}min "
-          f"device={dev} draft={'random' if args.random_draft else 'starter'} "
-          f"train_gen_ratio={args.train_gen_ratio} "
+    print(f"[cfg] PUBFEAT={PUBFEAT} CFEAT={CFEAT} architecture=gt-cfr "
+          f"nodes={args.nodes} expand={args.expand} iters={args.iters} "
+          f"budget={total:.0f}s warm={warm:.0f}s "
+          f"snapshot_every={args.snapshot_every:g}min device={dev} "
+          f"draft={'random' if args.random_draft else 'starter'} "
+          f"replay_ratio={args.replay_ratio} "
           f"recent_mix={args.recent_mix}/{args.recent_frac} "
-          f"canonical_views=2 cap={args.cap} aux_weight={args.aux_weight} "
+          f"canonical_views=2 cap={args.cap} "
           f"matmul={torch.get_float32_matmul_precision()}", flush=True)
 
     while True:
@@ -851,7 +796,6 @@ def main():
         gen_s = time.time() - tg
         tr = time.time()
         rows = np.asarray(d["rows"], np.uint8).reshape(-1, ROW_BYTES)
-        aux = np.asarray(d["aux"], np.uint8).reshape(-1, N_LOCATIONS)
         cc = np.asarray(d["cc"], np.uint8).reshape(-1, CCOUNTS)
         cw = np.asarray(d["cw"], np.float32)
         cy = np.clip(np.asarray(d["cy"], np.float32), -1.0, 1.0)
@@ -860,7 +804,7 @@ def main():
         solves = max(1, int(d["solves"]))
         conv_s = time.time() - tr
         tr = time.time()
-        buf.add(rows, aux, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
+        buf.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
         add_s = time.time() - tr
         if probe is None and len(buf) >= 2048:
             probe = batcher(buf.sample(2048, rng), rng, dev)
@@ -870,7 +814,7 @@ def main():
         # reduces the number of independent games seen before ReBeL starts.
         steps = max(1, round(solves / args.batch))
         lv, train_stat = train_steps(
-            value, opt, buf, steps, args.batch, rng, dev, args.aux_weight,
+            value, opt, buf, steps, args.batch, rng, dev,
             recent_mix=args.recent_mix, recent_frac=args.recent_frac,
             batch_fn=batcher)
         train_s = time.time() - tt
@@ -882,8 +826,6 @@ def main():
                "games": d["games"], "decisions": dec, "loss": round(lv, 5),
                "rows": len(rows), "solves": solves,
                "loss_old": round(loss_old, 5), "loss_new": round(loss_new, 5),
-               "aux_loss": round(train_stat["aux_loss"] / steps, 5),
-               "aux_acc": round(train_stat["aux_acc"] / steps, 4),
                "zero_sum_max": round(train_stat["zero_sum_max"], 5),
                "horizon_frac": round(d["horizon_hits"] / max(d["games"], 1), 3),
                "node_caps": int(d["node_caps"]),
@@ -893,10 +835,6 @@ def main():
                "plays_bolster": int(d.get("plays_bolster", 0)),
                "plays_maneuver": int(d.get("plays_maneuver", 0)),
                "plays_recruit": int(d.get("plays_recruit", 0)),
-               "oversize_routes": int(d.get("oversize_routes", 0)),
-               "card_exclusive_routes": int(d.get("card_exclusive_routes", 0)),
-               "exact_fallbacks": int(d.get("exact_fallbacks", 0)),
-               "dropped": int(d["dropped"]),
                "configs": round(d["configs"] / dec, 1), "cap_value": round(cap_v, 4),
                "steps": steps,
                "tgt_mean": round(tgt_mean, 4), "tgt_std": round(tgt_std, 4),
@@ -912,15 +850,11 @@ def main():
               f"dec={dec:6d} rows={len(rows):6d} horizon={rec['horizon_frac']:.2f} "
               f"L={lv:.5f} L/var={lv / max(tgt_std ** 2, 1e-9):.2f} "
               f"tgt={tgt_mean:+.3f}/{tgt_std:.3f} pstd={probe_std:.3f} "
-              f"aux={rec['aux_loss']:.4f}/{rec['aux_acc']:.3f} "
               f"gen={gen_s:.1f}s train={train_s:.1f}s",
               flush=True)
         epoch += 1
 
     snapshot("init", time.time() - t0)
-    flat = value.flat()
-    for i in range(len(gpu_devices)):
-        warchest.gpu_set_weights(value.dims, *flat, device=i)
     next_snap = (time.time() - t0) + snap_gap
     # Warm-up initialises the network. Its Adam moments and its rows are a
     # different objective; they must not steer ReBeL.
@@ -929,17 +863,13 @@ def main():
     opt = torch.optim.Adam(value.parameters(), lr=args.lr)
     rebel_t0 = time.time()
     rebel_solves = 0
-    print(f"[t={time.time() - t0:6.1f}s] --- switching to ReBeL ---", flush=True)
-    run_gpu_stream()
+    print(f"[t={time.time() - t0:6.1f}s] --- switching to GT-CFR ---", flush=True)
+    run_search_pipeline()
 
     snapshot("final", time.time() - t0)
     write_log(args, log, snaps)
     if args.ladder_games:
-        # Rating a run's own progress is the same operation as rating one
-        # architecture against another: every snapshot becomes a bot, and the
-        # arena plays them. The bots want both cards, which this process holds
-        # until it lets go.
-        warchest.gpu_stop()
+        # Every snapshot becomes an immutable CPU bot for the ladder.
         arena = [sys.executable, str(ROOT / "tools" / "arena.py")]
         subprocess.run(arena + ["pack", args.out], check=True)
         tag = pathlib.Path(args.out).name

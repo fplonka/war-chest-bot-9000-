@@ -1,30 +1,21 @@
-//! Depth-limited CFR over public belief states — the search half of ReBeL
-//! (Brown, Bakhtin, Lerer & Gong 2020), specialised to War Chest.
+//! Growing-tree CFR over public belief states, specialised to War Chest.
 //!
 //! The subgame rooted at a PBS is unrolled over **public observations**. A node
-//! is a leaf when it is terminal or when the depth limit is reached. A round-
-//! start draw is *walked through*: its outcome is private, so the public tree
-//! does not branch — the one child is the post-draw state, and the drawing
-//! player's configs are convolved through the draw distribution. Leaf values
+//! is a leaf when it is terminal or when it is a coin play the tree has not
+//! grown through yet. A round-start draw is passed through: its private outcome
+//! does not branch the public tree. The one child is the post-draw state, and the
+//! drawing player's configs are convolved through the draw distribution. Leaf values
 //! come from the value network.
 //!
 //! Conventions follow the reference implementation (`csrc/liars_dice` of
-//! `facebookresearch/rebel`), with TurboReBeL's reorganisation of the data
-//! generation:
+//! `facebookresearch/rebel`), with Student of Games' growing tree
+//! (Schmid et al. 2023) in place of a fixed depth limit:
 //!   * alternating-traverser linear CFR,
 //!   * leaf values are *counterfactual* — the network's value for that exact
 //!     config, scaled by the opponent's unnormalised reach into that leaf,
 //!   * the network is queried with normalised reaches as the beliefs,
-//!   * the value target is the root value under the **fixed reference
-//!     strategy** — the CFR average at the end of the solve — computed by a
-//!     fixed-policy pass (no regrets) per root belief (`value_under`), one for
-//!     every belief the walk carries in (`carried_beliefs`);
-//!   * acting and belief propagation use the CFR average strategy.
-//!
-//! That is TurboReBeL's single-sample multi-iteration generation (ICLR 2026,
-//! "Turbo ReBeL"): one solve yields T+1 training rows instead of one, all
-//! valued under the same reference strategy, so a higher iteration count stops
-//! costing data rate. See docs/REBEL.md.
+//!   * acting and belief propagation use the final CFR average;
+//!   * training rows are solved interior search queries.
 //! Three things differ from poker, all consequences of War Chest's observation
 //! structure:
 //!
@@ -39,24 +30,32 @@
 
 use crate::actions::Action;
 use crate::board::NONE;
+use crate::farm::{self, Call, Gate, Reply};
 use crate::net::Net;
+use crate::rng::Rng;
 use crate::rebel::*;
 use crate::state::{Cont, State};
 use crate::units::{ENSIGN, MARSHAL, ROYAL_COIN};
-use crate::{shape, timed};
+use crate::timed;
 use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Clone, Copy)]
 pub struct Cfg {
-    /// Public-tree depth. 1 means "the root's children are leaves".
-    pub depth: usize,
     /// CFR iterations (alternating, so each player is traversed iters/2 times).
     pub iters: usize,
-    /// Snapshot the CFR average strategy at every iteration. Generation needs
-    /// the per-iterate averages for TurboReBeL's carried beliefs (`value_under`
-    /// and `carried_beliefs`); evaluation acts on the solved tree and never
-    /// looks at an intermediate iterate, so it turns them off.
-    pub snapshots: bool,
+    /// Expansions per regret update — Student of Games' `c`. Their total
+    /// expansion count `s` is `iters * expand`, and one expansion adds one
+    /// public state together with all of its children, which is their
+    /// `k = infinity` for imperfect-information games.
+    pub expand: usize,
+    /// Ceiling on public-tree nodes. The tree is grown towards it while CFR
+    /// runs, rather than built to a uniform depth up front: a fixed depth
+    /// spends the budget evenly over a tree that branches about twenty ways a
+    /// ply, so one more ply costs twenty times as much everywhere, including
+    /// down lines nobody plays. Growing puts the nodes where the strategy
+    /// actually goes.
+    pub nodes: usize,
     /// The regret-update rule.
     pub cfr: Cfr,
     /// Max tree nodes a solve may build. 0 = unlimited. A solve that hits the
@@ -66,47 +65,26 @@ pub struct Cfg {
     /// enough that an unbounded build hangs training for minutes on one
     /// decision.
     pub node_cap: usize,
-    /// Build for the GPU service: the tree, features and offsets only. The
-    /// CFR arenas (regrets, strategies, reaches, values, snapshots) are
-    /// neither allocated nor initialised — the device builds its own from
-    /// the job, so doing it here too was pure allocation traffic.
-    pub gpu_build: bool,
-    /// Keep each node's `State` in `Solver::states`, for tests that assert on
-    /// the tree's shape (every leaf terminal or a coin play, this node is a
-    /// Warrior Priest draw). The tree itself dropped the field because it was
-    /// 688 of a node's 1,136 bytes across 2,039 nodes for four read sites,
-    /// none in a hot loop — so this is off in every production path and the
-    /// vector stays empty there.
-    pub keep_states: bool,
+    /// Maximum combined belief support at a self-play root. Broad round-start
+    /// beliefs have a fat cost tail before the first tree node can be grown;
+    /// callers skip those solves instead of stalling every other worker.
+    /// Zero disables the limit.
+    pub config_cap: usize,
 }
 
 impl Default for Cfg {
     fn default() -> Self {
         Cfg {
-            depth: 1,
             iters: 64,
-            snapshots: true,
+            expand: 1,
+            // A depth-2 uniform tree ran to about a thousand nodes, which is
+            // the budget this replaces, spent by growth instead of evenly.
+            nodes: 1024,
             cfr: Cfr::LINEAR,
-            node_cap: 0,
-            gpu_build: false,
-            keep_states: false,
+            node_cap: 200_000,
+            config_cap: 256,
         }
     }
-}
-
-/// The exact iterations the per-iterate average strategy is kept at:
-/// log-spaced early (0, 1, 2, 4, 8, ...) plus the final one. This list is
-/// the runtime metadata of the tree contract — the GPU must not assume
-/// powers of two, and any list including 0 and the final iteration is a
-/// legal request.
-pub fn snapshot_iters(iters: usize) -> Vec<usize> {
-    let mut out = Vec::new();
-    for t in 0..=iters {
-        if t == 0 || t.is_power_of_two() || t == iters {
-            out.push(t);
-        }
-    }
-    out
 }
 
 /// Which CFR the solver runs.
@@ -206,8 +184,8 @@ pub struct Conv {
     /// `v_0 + v_1` at the root. **This is not zero**, and that is not a bug in
     /// the solver. The subgame's leaves are network values, and nothing makes
     /// the network's value for player 0 at a leaf the negative of its value for
-    /// player 1 there. So the depth-limited game the solver is handed is only
-    /// *approximately* zero-sum, by however far the value network is from
+    /// player 1 there. So the finite search game is only *approximately*
+    /// zero-sum, by however far the value network is from
     /// antisymmetric — which is what this measures, and it is a property of the
     /// network rather than of the solve. It vanishes when every leaf is
     /// terminal, which is the case `tests/rebel_solver.rs` pins against an
@@ -223,7 +201,7 @@ pub enum Back {
     /// consumed in the row where it is formed; there is no instantaneous-
     /// regret arena.
     Regret,
-    /// Pure value propagation under a fixed strategy — TurboReBeL's Phase 2.
+    /// Pure value propagation under a fixed strategy.
     Value,
     /// The traverser maxes instead of averaging, which makes the root values a
     /// best response to whatever the opponent's reaches were built under.
@@ -234,11 +212,99 @@ pub enum Back {
 #[derive(Clone, Default)]
 pub struct Nets {
     pub value: Net,
+    /// When set, network calls are gathered with every other solver thread's
+    /// and run as one batch. Without it a solve evaluates its own rows alone,
+    /// which is what the tests and the single-game tools want.
+    pub gate: Option<Arc<Gate>>,
 }
 
 impl Nets {
     pub fn ready(&self) -> bool {
         !self.value.is_empty()
+    }
+
+    /// The trunk over fresh leaves: board vectors and the join cache.
+    fn trunk(&self, xpub: &[f32], cards: &[f32], rows: usize, pb: &mut Vec<f32>, jp: &mut Vec<f32>) {
+        match &self.gate {
+            None => {
+                self.value.board(xpub, cards, rows, farm::CARD_ROWS, pb);
+                self.value.join_cache(pb, rows, jp);
+            }
+            Some(g) => {
+                let r = self.submit(
+                    g,
+                    Call::Trunk {
+                        xpub: xpub.to_vec(),
+                        cards: cards.to_vec(),
+                        rows,
+                    },
+                );
+                (*pb, *jp) = (r.a, r.b);
+            }
+        }
+    }
+
+    /// The config encoder over fresh configs: `f(c)` and `g(c)`.
+    fn encode(
+        &self,
+        phi: &[f32],
+        owner: &[u32],
+        n: usize,
+        cards: &[f32],
+        f: &mut Vec<f32>,
+        g_out: &mut Vec<f32>,
+    ) {
+        match &self.gate {
+            None => self.value.configs(phi, owner, n, cards, f, g_out),
+            Some(g) => {
+                let r = self.submit(
+                    g,
+                    Call::Configs {
+                        phi: phi.to_vec(),
+                        owner: owner.to_vec(),
+                        cards: cards.to_vec(),
+                        n,
+                    },
+                );
+                (*f, *g_out) = (r.a, r.b);
+            }
+        }
+    }
+
+    /// The belief-conditioned head, which every CFR iteration pays for.
+    fn head(
+        &self,
+        p: &[f32],
+        jp: &[f32],
+        pooled: &[f32],
+        rows: usize,
+        player: usize,
+        h: &mut Vec<f32>,
+    ) {
+        match &self.gate {
+            None => self.value.join(p, jp, pooled, rows, player, h),
+            Some(g) => {
+                let r = self.submit(
+                    g,
+                    Call::Join {
+                        p: p.to_vec(),
+                        jp: jp.to_vec(),
+                        pooled: pooled.to_vec(),
+                        rows,
+                        player,
+                    },
+                );
+                *h = r.a;
+            }
+        }
+    }
+
+    /// A closed gate means the farm is shutting down under a running solve.
+    /// There is nothing sensible to return, and the farm joins its threads, so
+    /// unwinding here is how the thread stops.
+    fn submit(&self, gate: &Gate, call: Call) -> Reply {
+        gate.submit(call)
+            .expect("the inference gate closed while a solve was still running")
     }
 }
 
@@ -423,6 +489,42 @@ pub struct TNode {
 
 pub const NO_TRANS: u32 = u32::MAX;
 
+/// What a finished solve gives back.
+///
+/// `value` is the root's counterfactual value per config, and only the root's.
+/// The opposing range is normalised there, so the number is on the game's own
+/// scale. An interior node's range is not normalised — it carries the reach
+/// that led to it, so its value shrinks with depth and shrinks again as the
+/// strategy sharpens — and a node beside the frontier would hand back little
+/// more than the network's own leaf output. ReBeL adds `{beta_r, v(beta_r)}`
+/// and nothing else to its value set; Student of Games re-solves every query
+/// from scratch and stores that solve's root.
+///
+/// `queries` are public belief states this search asked the network about.
+/// They are not targets. They are roots for later solves, which is how the
+/// value function becomes accurate away from the line of play.
+pub struct Solved {
+    pub value: [Vec<f32>; 2],
+    pub queries: Vec<(State, [Belief; 2])>,
+}
+
+/// Draw an index from non-negative weights without allocating. A row whose
+/// weights have all underflowed is drawn uniformly rather than dropped.
+fn pick(w: &[f32], rng: &mut Rng) -> usize {
+    let total: f64 = w.iter().map(|&x| x.max(0.0) as f64).sum();
+    if total == 0.0 {
+        return rng.below(w.len().max(1));
+    }
+    let mut needle = rng.unit_f64() * total;
+    for (i, &weight) in w.iter().enumerate() {
+        needle -= weight.max(0.0) as f64;
+        if needle < 0.0 {
+            return i;
+        }
+    }
+    w.len() - 1
+}
+
 impl TNode {
     #[inline]
     pub fn na(&self) -> usize {
@@ -465,33 +567,6 @@ thread_local! {
             Vec::new(), Vec::new(), Vec::new(), Vec::new(),
         ])
     };
-}
-
-// The per-solve snapshot arena is a `Vec<Vec<f32>>` (one flat normalised copy
-// of the running strategy sums per retained iterate), so it pools separately
-// from the flat buffers above.
-thread_local! {
-    static SNAP_POOL: std::cell::RefCell<Vec<Vec<Vec<f32>>>> = const {
-        std::cell::RefCell::new(Vec::new())
-    };
-}
-
-fn take_snaps() -> Vec<Vec<f32>> {
-    let mut v = SNAP_POOL.with(|p| p.borrow_mut().pop().unwrap_or_default());
-    v.clear();
-    v
-}
-
-fn give_snaps(v: Vec<Vec<f32>>) {
-    if v.is_empty() {
-        return;
-    }
-    SNAP_POOL.with(|p| {
-        let mut p = p.borrow_mut();
-        if p.len() < 2 {
-            p.push(v);
-        }
-    });
 }
 
 thread_local! {
@@ -571,8 +646,8 @@ fn give_buf(role: usize, v: Vec<f32>) {
     if v.capacity() == 0 {
         return;
     }
-    // Kept at length, not cleared: every user grows on demand and overwrites
-    // what it reads, so a cleared buffer would just have to be re-zeroed.
+    // Point-written workspaces retain their length. Append-only cache arenas
+    // are cleared by `Solver::new` before their first extension.
     BUFS.with(|b| {
         let mut b = b.borrow_mut();
         if b[role].len() < 2 {
@@ -582,45 +657,41 @@ fn give_buf(role: usize, v: Vec<f32>) {
 }
 
 pub struct Solver<'a> {
-    /// Owned (it is `Copy`): the walk holds a solver across a whole subgame,
-    /// and the GPU path keeps one around while the solve runs on the device,
-    /// so the solver cannot borrow a builder-local context.
+    /// Owned because a solver retains its context for its full solve.
     pub(crate) ctx: Ctx,
     nets: &'a Nets,
     pub(crate) cfg: Cfg,
     pub nodes: Vec<TNode>,
-    /// Node states, parallel to `nodes`. Empty unless `Cfg::keep_states`.
+    /// Node states, parallel to `nodes`. A leaf can only be expanded later if
+    /// the solver still knows the position it stands for, so a growing tree
+    /// keeps every one of them.
     pub states: Vec<State>,
     pub(crate) root_belief: [Belief; 2],
     /// Regrets and the current regret-matching iterate, flat by node over legal
-    /// cells. Node `i` occupies `soff[i] .. soff[i + 1]`; within that range its
-    /// config rows are described by `TNode::legal_off`.
+    /// cells. Node `i` occupies `soff[i] ..` for as many cells as its
+    /// `legal_action` holds; within that range its config rows are described by
+    /// `TNode::legal_off`. `soff` is *not* sorted: a node is born a leaf with
+    /// no cells and is given its region when it is expanded, which is what lets
+    /// the arena grow by appending while every regret already accumulated stays
+    /// where it is.
     pub(crate) regret: Vec<f32>,
     pub cur: Vec<f32>,
     pub(crate) soff: Vec<u32>,
-    /// The reach-weighted running strategy sum, per node. The normalised
-    /// average exists only in retained snapshots; keeping a second persistent
-    /// arena here doubled the strategy traffic for no useful information.
+    /// The reach-weighted running strategy sum, per node. Per node rather than
+    /// flat, because a node is given its cells when it is expanded and a
+    /// ragged vector grows there without disturbing anything already summed.
     pub sum_strat: Vec<Vec<f32>>,
-    /// One flat normalised copy of `sum_strat` (per-node regions in node order,
-    /// aligned with `soff`) at retained iterations. Snapshot `t` is the average
-    /// strategy at iterate t, and the last is the reference strategy
-    /// `value_under` and the walk act on. Evaluation retains only the final
-    /// copy; generation also retains the requested intermediate copies.
-    pub snaps: Vec<Vec<f32>>,
-    /// Which snapshot the next `snapshot()` call is (0 = the pre-iteration
-    /// average). Drives the log-spaced thinning: the carried beliefs are one
-    /// per *kept* iterate, and the spread is in the early ones.
-    pub(crate) snap_t: usize,
-    /// The kept iteration numbers (`snapshot_iters`); the GPU contract
-    /// uploads this list verbatim.
-    pub(crate) snap_list: Vec<usize>,
+    /// The reference strategy: one flat normalised copy of `sum_strat`, laid
+    /// out exactly like `cur`. Materialised by `finish` once the tree has
+    /// stopped growing, and read by everything that acts, filters a belief or
+    /// values a node.
+    pub avg: Vec<f32>,
     /// Whether each player's running sum has been normalised at least once.
     /// Until then the historical average is the literal initial iterate, not
     /// a multiply-then-divide reconstruction of it.
     pub(crate) avg_touched: [bool; 2],
-    /// Total legal strategy cells across decision nodes, so the
-    /// snapshot arenas are reserved to size instead of grown.
+    /// Total legal strategy cells across decision nodes: the length of `cur`,
+    /// `regret` and `avg`, and where the next expanded node's region starts.
     pub ncells: usize,
     /// Reach per config, flat: node `i`'s two players occupy
     /// `reach[roff[i] .. roff[i] + nc0 + nc1]`, player 0 first. One arena
@@ -658,6 +729,12 @@ pub struct Solver<'a> {
     /// How many distinct configs `cphi` actually holds. Pooled buffers keep
     /// their length across solves, so the count cannot be read off `cphi.len()`.
     pub ncfg: usize,
+    /// How many leaf rows and how many distinct configs the batch below has
+    /// already been built for. Everything in it is a pure function of the
+    /// subgame and none of it moves when the tree grows, so a growth round
+    /// only ever runs the network on what it just added.
+    batch_rows: usize,
+    batch_cfgs: usize,
     /// `[ncfg, D]` readout rows `f(c)` and `[ncfg, POOL]` pooling vectors
     /// `g(c)`. Both survive every CFR iteration.
     pub cf: Vec<f32>,
@@ -665,16 +742,12 @@ pub struct Solver<'a> {
     /// `[2, NTYPE, TYPE]`: the printed-card tokens, one table per player view.
     /// The draft is fixed for the solve, so this is built once.
     pub cards: Vec<f32>,
-    pub(crate) ids: [u8; 2 * NTYPE],
     /// `[2 * rows, D]` board vectors, and their `[2 * rows, JW]` projection
     /// into the join's first layer. Neither moves between CFR iterations.
     pub pb: Vec<f32>,
     pub jp: Vec<f32>,
     /// Expanded public encoding, filled during the build.
     pub(crate) xpub: Vec<f32>,
-    /// Compact public rows for GPU admission. The device expands these into
-    /// the same trunk input; a GPU-built solver never materialises `xpub`.
-    pub(crate) gpu_rows: Vec<u8>,
     /// `[2 * rows, POOL]` pooled belief embeddings — the one thing the join
     /// reads that moves between CFR iterations.
     pub xb: Vec<f32>,
@@ -682,7 +755,6 @@ pub struct Solver<'a> {
     pub h: Vec<f32>,
     /// Normalised belief weights for one leaf's support.
     wbuf: Vec<f32>,
-    batch_ready: bool,
     /// Traverser of the previous leaf query, i.e. whose beliefs have moved
     /// since. `None` before the first query of a solve.
     last_traverser: Option<usize>,
@@ -711,15 +783,11 @@ impl Drop for Solver<'_> {
         ] {
             give_buf(role, std::mem::take(v));
         }
-        give_snaps(std::mem::take(&mut self.snaps));
         give_nodes(std::mem::take(&mut self.nodes));
     }
 }
 
 impl<'a> Solver<'a> {
-    pub(crate) fn network_dims(&self) -> &[usize] {
-        &self.nets.value.dims
-    }
 
     pub fn new(
         root: &State,
@@ -732,13 +800,6 @@ impl<'a> Solver<'a> {
             belief[0].cfg.as_slice().into(),
             belief[1].cfg.as_slice().into(),
         ];
-        let mut ids = [0u8; 2 * NTYPE];
-        for view in 0..2 {
-            for t in 0..NTYPE {
-                let physical = if view == 0 { t / NSLOT } else { 1 - t / NSLOT };
-                ids[view * NTYPE + t] = ctx.slots[physical][t % NSLOT];
-            }
-        }
         let mut sv = Solver {
             ctx,
             nets,
@@ -750,9 +811,7 @@ impl<'a> Solver<'a> {
             cur: Vec::new(),
             soff: Vec::new(),
             sum_strat: Vec::new(),
-            snaps: take_snaps(),
-            snap_t: 0,
-            snap_list: snapshot_iters(cfg.iters),
+            avg: Vec::new(),
             avg_touched: [false; 2],
             ncells: 0,
             reach: Vec::new(),
@@ -769,212 +828,60 @@ impl<'a> Solver<'a> {
             cplayer: Vec::new(),
             cmap: std::collections::HashMap::with_capacity_and_hasher(1024, KeyHash),
             ncfg: 0,
+            batch_rows: 0,
+            batch_cfgs: 0,
             cf: take_buf(R_CF),
             cg: take_buf(R_CG),
             cards: Vec::new(),
-            ids,
             pb: take_buf(R_PB),
             jp: take_buf(R_JP),
             xpub: take_buf(R_XPUB),
-            gpu_rows: Vec::new(),
             xb: take_buf(R_XB),
             h: take_buf(R_H),
             wbuf: Vec::new(),
-            batch_ready: false,
             last_traverser: None,
             capped: false,
             draw_scratch: DrawScratch::default(),
             cell_order: Vec::new(),
         };
+        sv.cf.clear();
+        sv.cg.clear();
+        sv.pb.clear();
+        sv.jp.clear();
         {
             let _t = timed!(BUILD);
-            // A depth-2 subgame runs to roughly 550 nodes, so this is one
-            // allocation each instead of a doubling sequence. Sizing it larger
-            // measures no better: the allocator handles the churn.
+            // The root is born a leaf like every other node; `solve` grows it.
             sv.nodes.reserve(640);
             sv.reach.reserve(640);
             sv.vals.reserve(640);
             sv.regret.reserve(640);
             sv.cur.reserve(640);
-            sv.build(root.clone(), cfg.depth.max(1), cfgs);
-        }
-        let _t = timed!(ALLOC);
-        for i in 0..sv.nodes.len() {
-            let n = &sv.nodes[i];
-            let p = n.player as usize;
-            let nc = n.nc(p);
-            let (c0, c1) = (n.nc(0), n.nc(1));
-            sv.nc.push([c0 as u32, c1 as u32]);
-            sv.soff.push(sv.ncells as u32);
-            let cells = n.legal_action.len();
-            sv.ncells += cells;
-            if cfg.gpu_build {
-                // The device owns the arenas; the walk after trip 1 reads
-                // only the tree, the features and `soff`.
-                continue;
-            }
-            sv.roff.push(sv.reach.len() as u32);
-            sv.reach.resize(sv.reach.len() + c0 + c1, 0.0);
-            sv.voff.push(sv.vals.len() as u32);
-            sv.vals.resize(sv.vals.len() + c0.max(c1), 0.0);
-            sv.regret.resize(sv.ncells, 0.0);
-            sv.sum_strat.push(vec![0.0; cells]);
-            // CFR starts from a uniform strategy over the legal actions, as in
-            // the reference. No heuristic prior is injected here: the greedy
-            // knowledge enters through the pretrained value network, which is
-            // what CFR actually consumes.
-            let mut u = vec![0.0f32; cells];
-            if cells > 0 {
-                for c in 0..nc {
-                    let row = n.legal_row(c);
-                    let k = row.len() as f32;
-                    for cell in row {
-                        u[cell] = 1.0 / k;
-                    }
-                }
-            }
-            sv.cur.extend_from_slice(&u);
-        }
-        sv.soff.push(sv.ncells as u32);
-        drop(_t);
-        shape!(SOLVES, 1);
-        shape!(NODES, sv.nodes.len());
-        #[cfg(feature = "prof")]
-        for n in &sv.nodes {
-            if n.leaf {
-                shape!(LEAVES, 1);
-            } else {
-                shape!(INNER_CA, n.na() * n.nc(n.player as usize));
-                if n.chance {
-                    shape!(CHANCE, 1);
-                }
-            }
-            shape!(CFGSUM, n.nc(0) + n.nc(1));
-        }
-        if !cfg.gpu_build {
+            let root = sv.push_node(root.clone(), cfgs);
+            // A root that is a coin play would otherwise stay a leaf with no
+            // strategy to read, so the first expansion is unconditional.
+            sv.grow(root);
+            // The first CFR update and every expansion trajectory require
+            // reaches for the tree that now exists.
             sv.precompute_reaches();
-            // Seed the strategy sums with one reach-weighted uniform strategy,
-            // as `get_uniform_reach_weigted_strategy` does in the reference.
-            for i in 0..sv.nodes.len() {
-                if sv.nodes[i].leaf || sv.nodes[i].chance || sv.nodes[i].legal_action.is_empty() {
-                    continue;
-                }
-                let p = sv.nodes[i].player as usize;
-                let so = sv.soff[i] as usize;
-                for c in 0..sv.nodes[i].nc(p) {
-                    let r = sv.reach_of(i, p)[c];
-                    for cell in sv.nodes[i].legal_row(c) {
-                        sv.sum_strat[i][cell] += r * sv.cur[so + cell];
-                    }
-                }
-            }
-            // Snapshot 0: the average before any iteration, i.e. the uniform
-            // policy — the t = 0 member of the carried-belief set.
-            sv.snapshot_initial();
         }
         sv
     }
 
-    /// Retain the literal initial iterate. Its running sum is reach weighted;
-    /// normalising that sum is mathematically uniform too, but the multiply
-    /// and divide need not round back to the exact same `f32`. The frozen CPU
-    /// trajectory contract uses the literal iterate at t = 0.
-    fn snapshot_initial(&mut self) {
-        debug_assert_eq!(self.snap_t, 0);
-        self.snap_t = 1;
-        if self.cfg.snapshots || self.cfg.iters == 0 {
-            self.snaps.push(self.cur.clone());
-        }
-    }
-
-    /// Materialise one flat normalised copy of `sum_strat`, aligned with
-    /// `soff`: snapshot `t` is the average strategy at iterate t.
+    /// Push a node for `s`, as a leaf, and give it its slice of every arena.
     ///
-    /// Thinning: the carried beliefs are one per *kept* iterate, and the
-    /// spread is in the early iterations — the late ones all repeat the final
-    /// average — so only the log-spaced iterates (0, 1, 2, 4, 8, ...) plus the
-    /// final one are stored. The final one is the reference strategy Phase 2
-    /// and the walk act on (`value_under` reads `snaps.last()`), so it is kept
-    /// however many iterations actually run.
-    fn snapshot(&mut self) {
-        let t = self.snap_t;
-        self.snap_t += 1;
-        let keep = if self.cfg.snapshots {
-            self.snap_list.contains(&t)
-        } else {
-            // Evaluation does not carry intermediate beliefs, but acting still
-            // needs the final average. No persistent `avg` arena is kept just
-            // to bridge the iterations before it exists.
-            t == self.cfg.iters
-        };
-        if !keep {
-            return;
-        }
-        // `cur` still contains the literal initial policy for a player that has
-        // not traversed yet. Start there so their historical average stays
-        // byte-identical; overwrite every player whose sum has been updated.
-        let mut snap = self.cur.clone();
-        for i in 0..self.nodes.len() {
-            let n = &self.nodes[i];
-            if n.leaf || n.chance || !self.avg_touched[n.player as usize] {
-                continue;
-            }
-            let so = self.soff[i] as usize;
-            let nc = n.nc(n.player as usize);
-            for c in 0..nc {
-                let row = n.legal_row(c);
-                let sum: f32 = self.sum_strat[i][row.clone()].iter().sum();
-                let k = row.len().max(1) as f32;
-                for cell in row {
-                    snap[so + cell] = if sum > 0.0 {
-                        self.sum_strat[i][cell] / sum
-                    } else {
-                        1.0 / k
-                    };
-                }
-            }
-        }
-        self.snaps.push(snap);
-    }
-
-    // ------------------------------------------------------------ tree build
-
-    fn build(&mut self, s: State, depth: usize, cfgs: [Rc<[Config]>; 2]) -> usize {
+    /// Every node is born a leaf. `grow` turns one into a decision node later,
+    /// which is when it is given its strategy cells — so a node's reach and
+    /// value rows are laid out in node order while its cells are not, and both
+    /// are found through their own offset table.
+    fn push_node(&mut self, s: State, cfgs: [Rc<[Config]>; 2]) -> usize {
         let player = s.to_act();
-        // A draw is walked through (one public child, no depth cost): the
-        // outcome is private, so the public tree does not branch. Round-start
-        // draws collapse over a whole run; a Warrior Priest draw is a single
-        // chance node whose children carry the pending forced-play coin.
-        // Depth-0 nodes and terminals are leaves.
-        let draw_pass = matches!(
-            s.pending(),
-            Cont::Draw { .. } | Cont::WarriorPriestDraw { .. }
-        );
-        // Depth counts completed coin plays. A main-play node spends exactly
-        // one coin per legal action and every micro node's actions spend
-        // nothing, so "is this a main play?" is the whole story: a micro
-        // node at depth 0 (cavalry: move, then choose the attack) rides free,
-        // a main-play node at depth 0 is a leaf. Without this, "depth 2"
-        // would sometimes contain zero opponent moves, because a compound
-        // tactic is several decision nodes for one coin.
-        let mainplay = matches!(s.pending(), Cont::MainPlay);
-        let mut leaf = s.is_terminal() || (!draw_pass && s.is_chance());
-        if !leaf && !draw_pass && depth == 0 {
-            leaf = mainplay;
-        }
+        let terminal = s.is_terminal();
         let id = self.nodes.len();
-        if self.cfg.keep_states {
-            self.states.push(s.clone());
-        }
         let _tp = timed!(BPUSH);
         self.nodes.push(TNode {
-            util: if leaf && s.is_terminal() {
-                s.utility(player as usize)
-            } else {
-                0.0
-            },
+            util: if terminal { s.utility(player as usize) } else { 0.0 },
             player,
-            leaf,
+            leaf: true,
             chance: false,
             draw: DrawMap::default(),
             draw_steps: 0,
@@ -995,18 +902,133 @@ impl<'a> Solver<'a> {
             cell_row: Vec::new(),
         });
         drop(_tp);
-        if self.cfg.node_cap > 0 && self.nodes.len() >= self.cfg.node_cap {
-            // Pathological root: stop expanding. The node stays a stub (no
-            // actions, no children); the caller checks `capped` and falls
-            // back to a non-search policy, so nothing here is ever walked.
-            self.capped = true;
-            return id;
+        let (c0, c1) = (cfgs[0].len(), cfgs[1].len());
+        self.nc.push([c0 as u32, c1 as u32]);
+        // No cells yet: a leaf has no strategy. `grow` appends its region.
+        self.soff.push(self.ncells as u32);
+        self.roff.push(self.reach.len() as u32);
+        self.reach.resize(self.reach.len() + c0 + c1, 0.0);
+        self.voff.push(self.vals.len() as u32);
+        self.vals.resize(self.vals.len() + c0.max(c1), 0.0);
+        self.sum_strat.push(Vec::new());
+        // Only a coin play carries a network row. Everything between two coin
+        // plays is grown through immediately and never stays a leaf.
+        if terminal {
+            self.term_leaves.push(id);
+        } else if matches!(s.pending(), Cont::MainPlay) {
+            self.push_row(id, &s, &cfgs);
+            self.leaf_rows.push(id);
         }
-        if leaf {
-            self.push_leaf(id, &s, &cfgs);
-            return id;
-        }
+        self.states.push(s);
+        id
+    }
 
+    /// Push a child and, unless it is somewhere the search may stop, grow it.
+    ///
+    /// A leaf always stands for a coin play or a terminal, because the value
+    /// network is defined only at a coin play. A round-start draw run, the
+    /// micro-decisions inside a tactic and a Warrior Priest's forced play are
+    /// none of those, so they ride free here exactly as they used to ride free
+    /// inside a depth unit.
+    fn push_child(&mut self, s: State, cfgs: [Rc<[Config]>; 2]) -> usize {
+        let stop = s.is_terminal() || matches!(s.pending(), Cont::MainPlay);
+        let ch = self.push_node(s, cfgs);
+        if !stop {
+            self.grow(ch);
+        }
+        ch
+    }
+
+    /// Give an expanded node its strategy cells, at the end of the arenas.
+    ///
+    /// CFR starts from a uniform strategy over the legal actions, as in the
+    /// reference. No heuristic prior is injected here: what the network knows
+    /// enters through the leaf values, which is what CFR actually consumes.
+    fn alloc_cells(&mut self, id: usize) {
+        let cells = self.nodes[id].legal_action.len();
+        self.soff[id] = self.ncells as u32;
+        self.ncells += cells;
+        self.regret.resize(self.ncells, 0.0);
+        let n = &self.nodes[id];
+        let nc = n.nc(n.player as usize);
+        let mut u = vec![0.0f32; cells];
+        for c in 0..nc {
+            let row = n.legal_row(c);
+            let k = row.len() as f32;
+            for cell in row {
+                u[cell] = 1.0 / k;
+            }
+        }
+        self.cur.extend_from_slice(&u);
+        self.sum_strat[id] = vec![0.0; cells];
+    }
+
+    /// Materialise the reference strategy: the normalised CFR average, laid
+    /// out exactly like `cur`.
+    ///
+    /// It is built once, when the tree has stopped growing and the iterations
+    /// are done, because that is the only moment at which one flat array can
+    /// describe the whole tree. Everything that acts, filters a belief or
+    /// values a node reads it afterwards.
+    pub fn finish(&mut self) {
+        // `cur` still holds the literal initial policy for a player that has
+        // not traversed yet, so start there and overwrite every player whose
+        // running sum has moved. Their historical average is then byte-exact
+        // rather than a multiply and divide that need not round back.
+        self.avg.clear();
+        self.avg.extend_from_slice(&self.cur);
+        for i in 0..self.nodes.len() {
+            let n = &self.nodes[i];
+            if n.leaf || n.chance || !self.avg_touched[n.player as usize] {
+                continue;
+            }
+            let so = self.soff[i] as usize;
+            let nc = n.nc(n.player as usize);
+            for c in 0..nc {
+                let row = n.legal_row(c);
+                let sum: f32 = self.sum_strat[i][row.clone()].iter().sum();
+                let k = row.len().max(1) as f32;
+                for cell in row {
+                    self.avg[so + cell] = if sum > 0.0 {
+                        self.sum_strat[i][cell] / sum
+                    } else {
+                        1.0 / k
+                    };
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ tree build
+
+    /// Turn leaf `id` into a decision node, its children pushed as leaves.
+    ///
+    /// This is the whole of tree growth. It is the old fixed-depth build with
+    /// the depth counter taken out: one call adds exactly one coin play, and
+    /// the search decides how many calls to make and where, rather than
+    /// spending the same budget evenly over every line.
+    fn grow(&mut self, id: usize) {
+        debug_assert!(self.nodes[id].leaf, "only a leaf can be grown");
+        let s = self.states[id].clone();
+        debug_assert!(!s.is_terminal(), "a terminal has nothing to grow");
+        let cfgs = self.nodes[id].cfgs.clone();
+        self.nodes[id].leaf = false;
+        // The node keeps its row in the network batch, which is now spent on a
+        // value nobody reads: `backprop` decides leafhood from the node and
+        // recomputes an interior node from its children, so the stale readout
+        // is overwritten. Retiring the row would mean compacting the batch or
+        // carrying a liveness mask through every per-iteration loop, to save
+        // the interior-node share of the rows -- about one in twenty at this
+        // branching factor. Not worth either.
+        let player = s.to_act();
+        // A draw is walked through: the outcome is private, so the public tree
+        // does not branch. Round-start draws collapse over a whole run; a
+        // Warrior Priest draw is a single chance node whose children carry the
+        // pending forced-play coin.
+        let draw_pass = matches!(
+            s.pending(),
+            Cont::Draw { .. } | Cont::WarriorPriestDraw { .. }
+        );
         if draw_pass {
             // The draw's outcome is private, so the public tree does not
             // branch: there is exactly one child, the state after the draw.
@@ -1015,9 +1037,6 @@ impl<'a> Solver<'a> {
             // are convolved through the draw distribution — the chance
             // factor stays separate from both players' strategies: it enters
             // the drawing player's reach as a transition, and the idle
-            // player's reach passes through untouched. The depth is not
-            // consumed: a draw is not a decision, and spending depth here is
-            // what stops subgames from spanning a round boundary.
             //
             // A round start queues up to three draws in a row for the same
             // player. None of them branches and none of them is a decision, so
@@ -1026,7 +1045,12 @@ impl<'a> Solver<'a> {
             // for, which is what the self-play walk counts off.
             let td = timed!(BDRAW);
             let me = player as usize;
+            // A Warrior Priest draw's children carry the forced-play coin.
+            let wp = matches!(s.pending(), Cont::WarriorPriestDraw { .. });
             let mut cs = s;
+            // The stored world is only a public-state carrier. Materialise a
+            // belief member before any rule helper reads private zones.
+            set_config(&mut cs, player, &self.ctx, &cfgs[me][0]);
             let mut support: Vec<Config> = Vec::new();
             let mut draw = DrawMap::default();
             // The reserve and the face-up pile are what the draws read, and a
@@ -1034,8 +1058,6 @@ impl<'a> Solver<'a> {
             // internally), so both come from the state at the head of the run.
             let res = reserve(&cs, player, &self.ctx);
             let fu = faceup_counts(&cs, player, &self.ctx);
-            // A Warrior Priest draw's children carry the forced-play coin.
-            let wp = matches!(s.pending(), Cont::WarriorPriestDraw { .. });
             let mut steps = 0u8;
             loop {
                 // `drawable` is order-preserving and this is its first entry;
@@ -1059,13 +1081,13 @@ impl<'a> Solver<'a> {
             drop(td);
             let mut cc = cfgs;
             cc[me] = support.as_slice().into();
-            let ch = self.build(cs, depth, cc);
+            let ch = self.push_child(cs, cc);
             let n = &mut self.nodes[id];
             n.chance = true;
             n.child = vec![ch];
             n.draw = draw;
             n.draw_steps = steps;
-            return id;
+            return;
         }
 
         let me = player as usize;
@@ -1212,23 +1234,7 @@ impl<'a> Solver<'a> {
             drop(tb);
             let mut cc = cfgs.clone();
             cc[me] = std::mem::take(&mut child_cfgs[ch]).into();
-            // One depth unit per *completed coin play*, not per decision node.
-            // A main-play node spends exactly one coin and consumes a depth
-            // unit; a Warrior Priest forced play also spends a coin but rides
-            // free (the chain belongs to the coin play that triggered it);
-            // every micro node spends nothing. The node-level structural test
-            // decides the whole observation group, and the debug assertion
-            // keeps it honest against `action_coin`.
-            let spends = matches!(s.pending(), Cont::MainPlay);
-            debug_assert_eq!(
-                matches!(s.pending(), Cont::MainPlay)
-                    || matches!(s.pending(), Cont::WarriorPriestPlay { .. }),
-                obs_act[obs_start[ch] as usize..obs_start[ch + 1] as usize]
-                    .iter()
-                    .any(|&au| action_coin(&acts[au as usize], &s) != NONE),
-                "structural mainplay test diverged from action_coin"
-            );
-            child.push(self.build(cs, depth - usize::from(spends), cc));
+            child.push(self.push_child(cs, cc));
         }
 
         let n = &mut self.nodes[id];
@@ -1249,7 +1255,7 @@ impl<'a> Solver<'a> {
         n.action_off = action_off;
         n.action_cell = action_cell;
         n.cell_row = cell_row;
-        id
+        self.alloc_cells(id);
     }
 
     // -------------------------------------------------------------- CFR core
@@ -1262,21 +1268,19 @@ impl<'a> Solver<'a> {
     /// heap allocations per node per pass.
     pub fn precompute_reaches(&mut self) {
         let cur = std::mem::take(&mut self.cur);
-        let root = [self.root_belief[0].p.clone(), self.root_belief[1].p.clone()];
-        self.propagate(&cur, [&root[0], &root[1]]);
+        self.propagate(&cur);
         self.cur = cur;
     }
 
-    /// Push reach probabilities down the tree under `strat` (a flat arena in
-    /// the same per-node layout as `cur` and the snapshots, aligned with
-    /// `soff`), from the given root beliefs.
-    fn propagate(&mut self, strat: &[f32], root: [&[f32]; 2]) {
+    /// Push reach probabilities down the tree under `strat`, from the root
+    /// beliefs.
+    fn propagate(&mut self, strat: &[f32]) {
         let _t = timed!(REACH);
         self.reach.fill(0.0);
         for p in 0..2 {
             let at = self.roff[0] as usize + if p == 1 { self.nc[0][0] as usize } else { 0 };
             let n = self.nc[0][p] as usize;
-            self.reach[at..at + n].copy_from_slice(root[p]);
+            self.reach[at..at + n].copy_from_slice(&self.root_belief[p].p);
         }
         for i in 0..self.nodes.len() {
             let n = &self.nodes[i];
@@ -1368,19 +1372,6 @@ impl<'a> Solver<'a> {
         );
     }
 
-    /// Record a leaf in the network batch. Called from `build`, while the
-    /// leaf's state is still the one just constructed and therefore still in
-    /// cache — walking the finished node array to do this instead meant
-    /// re-reading a 700-byte state per leaf out of a half-megabyte tree.
-    fn push_leaf(&mut self, id: usize, s: &State, cfgs: &[Rc<[Config]>; 2]) {
-        if s.is_terminal() {
-            self.term_leaves.push(id);
-            return;
-        }
-        self.push_row(id, s, cfgs);
-        self.leaf_rows.push(id);
-    }
-
     /// One row of the network batch: its public encoding, and its configs
     /// interned into the shared table.
     fn push_row(&mut self, _id: usize, s: &State, cfgs: &[Rc<[Config]>; 2]) {
@@ -1392,28 +1383,13 @@ impl<'a> Solver<'a> {
         );
         let _t = timed!(PUBFEAT);
         let row = self.leaf_coff.len() / 2;
-        let raw_at = row * crate::rebel::GPU_ROW_BYTES;
-        if self.gpu_rows.len() < raw_at + crate::rebel::GPU_ROW_BYTES {
-            self.gpu_rows
-                .resize(raw_at + 64 * crate::rebel::GPU_ROW_BYTES, 0);
+        let at = 2 * row * PUBFEAT;
+        if self.xpub.len() < at + 2 * PUBFEAT {
+            // Grow in chunks so the zero-fill happens a handful of times per
+            // solve, and not at all once the pooled buffer is warm.
+            self.xpub.resize(at + 128 * PUBFEAT, 0.0);
         }
-        crate::rebel::pack_gpu_row(
-            s,
-            &self.ctx,
-            &mut self.gpu_rows[raw_at..raw_at + crate::rebel::GPU_ROW_BYTES],
-        );
-        // The CPU solver needs the expanded public feature batch. A GPU solve
-        // does not: expanding 897 floats here only to upload and immediately
-        // rearrange them was its largest host and PCIe cost.
-        if !self.cfg.gpu_build {
-            let at = 2 * row * PUBFEAT;
-            if self.xpub.len() < at + 2 * PUBFEAT {
-                // Grow in chunks so the zero-fill happens a handful of times
-                // per solve, and not at all once the pooled buffer is warm.
-                self.xpub.resize(at + 128 * PUBFEAT, 0.0);
-            }
-            self.encode(s, row);
-        }
+        self.encode(s, row);
         for p in 0..2 {
             let res = reserve(s, p as u8, &self.ctx);
             self.leaf_coff.push(self.leaf_cidx.len() as u32);
@@ -1459,43 +1435,77 @@ impl<'a> Solver<'a> {
     /// Everything about the batch that does not move between CFR iterations:
     /// the card tokens, the board trunk, the projection of its output into the
     /// join, and the config encoder over every distinct config in the tree.
-    /// All four are pure functions of the subgame, so this runs once — which
-    /// is what buys the trunk its depth.
-    fn ensure_leaf_batch(&mut self) {
-        if self.batch_ready {
-            return;
-        }
-        self.batch_ready = true;
-        self.leaf_coff.push(self.leaf_cidx.len() as u32);
-        if self.nets.value.is_empty() {
-            return;
-        }
+    ///
+    /// All of it is a pure function of the subgame, so growth never invalidates
+    /// any of it — a leaf's board vector is the same board vector after the
+    /// tree around it has changed. This therefore runs the trunk once per leaf
+    /// *ever created*, which is what a fixed-depth solve of the final tree
+    /// would have cost. Growing is free on this path; only the CFR iterations
+    /// see a bigger tree, and the early ones see a smaller one.
+    fn extend_leaf_batch(&mut self) {
         let rows = self.leaf_rows.len();
+        if rows > self.batch_rows {
+            // New rows have no cached belief block for either player.
+            self.last_traverser = None;
+        }
+        if rows == self.batch_rows && self.ncfg == self.batch_cfgs {
+            return;
+        }
+        if self.nets.value.is_empty() {
+            self.batch_rows = rows;
+            self.batch_cfgs = self.ncfg;
+            return;
+        }
         let net = &self.nets.value;
         crate::net::fit(&mut self.xb, 2 * rows * crate::net::POOL);
-        shape!(NCFG, self.ncfg);
         let _t = timed!(PUBNET);
         let xpub = std::mem::take(&mut self.xpub);
-        // The cards in play are fixed at the draft, so every row of the subgame
-        // carries the same card block and the table is built once, one view per
-        // seat. Everything downstream reads it by canonical coin-type index.
-        if rows > 0 {
-            net.cards(&xpub[..2 * PUBFEAT], 2, &mut self.cards);
+        if rows > self.batch_rows {
+            // The cards in play are fixed at the draft, so every row of the
+            // subgame carries the same card block and the table is built once,
+            // one view per seat. Everything downstream reads it by canonical
+            // coin-type index.
+            if self.cards.is_empty() {
+                net.cards(&xpub[..2 * PUBFEAT], 2, &mut self.cards);
+            }
+            let fresh = rows - self.batch_rows;
+            let at = 2 * self.batch_rows * PUBFEAT;
+            let (mut pb, mut jp) = (Vec::new(), Vec::new());
+            // Exactly the fresh rows. `xpub` is a grown scratch buffer, so an
+            // open-ended slice would carry whatever the last, larger subgame
+            // left behind — invisible to a solve evaluating alone, and wrong
+            // the moment the farm concatenates this call with another.
+            let end = at + 2 * fresh * PUBFEAT;
+            self.nets
+                .trunk(&xpub[at..end], &self.cards, fresh, &mut pb, &mut jp);
+            crate::prof::work(fresh, 0, 0, 0);
+            self.pb.extend_from_slice(&pb);
+            self.jp.extend_from_slice(&jp);
+            self.batch_rows = rows;
         }
-        net.board(&xpub, &self.cards, rows, 2, &mut self.pb);
-        net.join_cache(&self.pb, rows, &mut self.jp);
         self.xpub = xpub;
-        let cphi = std::mem::take(&mut self.cphi);
-        let config_owner: Vec<u32> = self.cplayer.iter().map(|&p| p as u32).collect();
-        net.configs(
-            &cphi[..self.ncfg * CFEAT],
-            &config_owner,
-            self.ncfg,
-            &self.cards,
-            &mut self.cf,
-            &mut self.cg,
-        );
-        self.cphi = cphi;
+        if self.ncfg > self.batch_cfgs {
+            let fresh = self.ncfg - self.batch_cfgs;
+            let cphi = std::mem::take(&mut self.cphi);
+            let owner: Vec<u32> = self.cplayer[self.batch_cfgs..]
+                .iter()
+                .map(|&p| p as u32)
+                .collect();
+            let (mut cf, mut cg) = (Vec::new(), Vec::new());
+            self.nets.encode(
+                &cphi[self.batch_cfgs * CFEAT..self.ncfg * CFEAT],
+                &owner,
+                fresh,
+                &self.cards,
+                &mut cf,
+                &mut cg,
+            );
+            crate::prof::work(0, fresh, 0, 0);
+            self.cphi = cphi;
+            self.cf.extend_from_slice(&cf);
+            self.cg.extend_from_slice(&cg);
+            self.batch_cfgs = self.ncfg;
+        }
     }
 
     /// Rewrite the pooled belief block the join reads, per row per player.
@@ -1548,7 +1558,7 @@ impl<'a> Solver<'a> {
 
     /// Fill `vals` at every leaf with the traverser's counterfactual values.
     pub fn leaf_values(&mut self, traverser: usize) {
-        self.ensure_leaf_batch();
+        self.extend_leaf_batch();
         let redo = self.last_traverser;
         self.last_traverser = Some(traverser);
         if !self.nets.value.is_empty() {
@@ -1561,7 +1571,7 @@ impl<'a> Solver<'a> {
     /// Refresh both belief blocks for a fixed-policy pass. Each traverser then
     /// gets its own PBS-head query over these same beliefs.
     fn leaf_beliefs_both(&mut self) {
-        self.ensure_leaf_batch();
+        self.extend_leaf_batch();
         self.last_traverser = None;
         if self.nets.value.is_empty() {
             return;
@@ -1577,7 +1587,17 @@ impl<'a> Solver<'a> {
         }
         let _t = timed!(NET);
         let rows = self.leaf_rows.len();
-        net.join(&self.pb, &self.jp, &self.xb, rows, traverser, &mut self.h);
+        crate::prof::work(0, 0, rows, 0);
+        // `xb` is grown by `fit` and never shrinks, so a subgame smaller than
+        // an earlier one would otherwise hand the batch a trailing tail.
+        self.nets.head(
+            &self.pb[..rows * crate::net::D],
+            &self.jp[..rows * crate::net::JW],
+            &self.xb[..2 * rows * crate::net::POOL],
+            rows,
+            traverser,
+            &mut self.h,
+        );
     }
 
     /// Per-config leaf values for player `p` — counterfactual: the network's
@@ -1587,6 +1607,12 @@ impl<'a> Solver<'a> {
     pub fn readout(&mut self, p: usize) {
         let _t = timed!(LEAFPOST);
         let empty = self.nets.value.is_empty();
+        let readout_configs = self
+            .leaf_rows
+            .iter()
+            .map(|&i| self.nc[i][p] as usize)
+            .sum();
+        crate::prof::work(0, 0, 0, readout_configs);
         let opp = 1 - p;
         for k in 0..self.term_leaves.len() {
             let i = self.term_leaves[k];
@@ -1644,13 +1670,10 @@ impl<'a> Solver<'a> {
         self.backprop(traverser, &[], Back::Regret);
     }
 
-    /// One value backpropagation over the tree for `traverser`: the shared walk
-    /// behind CFR (`update_regrets`), TurboReBeL's fixed-policy passes
-    /// (`value_under`) and the best response (`nash_conv`). `mode` picks what
-    /// the traverser's own decision nodes do with their children's values —
-    /// average under `strat`, average and immediately update regret matching,
-    /// or take the max. Regret modes use `self.cur` in
-    /// place; fixed-policy modes read `strat`.
+    /// One value backpropagation over the tree for `traverser`. `mode` chooses
+    /// whether the traverser's decision nodes average under `strat`, average
+    /// and update regret matching, or take the max. Regret mode uses
+    /// `self.cur`; fixed-policy modes read `strat`.
     pub fn backprop(&mut self, traverser: usize, strat: &[f32], mode: Back) {
         // Regret matching floors at EPS rather than at zero, so every legal
         // action keeps positive probability and carried beliefs keep their
@@ -1809,12 +1832,11 @@ impl<'a> Solver<'a> {
         // strategy accumulation below.
         self.precompute_reaches();
         self.avg_block(traverser);
-        self.snapshot();
         self.steps[traverser] += 1;
     }
 
     /// Add the fresh reach-weighted iterate to the running strategy sum.
-    /// Normalisation is deferred until a retained snapshot is materialised.
+    /// Normalisation is deferred to `finish`.
     pub fn avg_block(&mut self, traverser: usize) {
         let _t = timed!(AVG);
         self.avg_touched[traverser] = true;
@@ -1840,34 +1862,192 @@ impl<'a> Solver<'a> {
         }
     }
 
-    /// TurboReBeL Phase 2: for each root belief, the per-config root values
-    /// under the fixed reference strategy — the CFR average at the end of the
-    /// solve (the last snapshot). Reach is propagated under the reference and
-    /// values backed up under it; no regrets move and nothing is learned.
+    /// Run the solve: Student of Games' GT-CFR.
     ///
-    /// `roots` are probability vectors over the root support, per player, in
-    /// the root belief's config order. Returns the per-player per-config root
-    /// values for each member, in the same order.
-    pub fn value_under(&mut self, roots: &[[Vec<f32>; 2]]) -> Vec<[Vec<f32>; 2]> {
-        let reference = self.reference();
-        let mut out = Vec::with_capacity(roots.len());
-        for root in roots {
-            let _t = timed!(P2);
-            self.propagate(&reference, [&root[0], &root[1]]);
-            self.leaf_beliefs_both();
-            let mut pair = [Vec::new(), Vec::new()];
-            for p in 0..2usize {
-                self.pbs_head(p);
-                self.readout(p);
-                self.backprop(p, &reference, Back::Value);
-                let n = self.nc[0][p] as usize;
-                let vo = self.voff[0] as usize;
-                pair[p] = self.vals[vo..vo + n].to_vec();
+    /// One round is one regret update followed by `expand` expansion
+    /// simulations, which is their `GT-CFR(L, beta, s, c)` with `c = expand`
+    /// and `s = iters * expand`. Growing and solving interleave rather than
+    /// staging, which is the point: the strategy decides where the tree goes,
+    /// and the tree decides what the strategy is worth.
+    pub fn solve(&mut self, rng: &mut Rng) {
+        for t in 0..self.cfg.iters {
+            self.step(t % 2);
+            let mut grew = false;
+            for _ in 0..self.cfg.expand {
+                if self.nodes.len() >= self.cfg.nodes {
+                    break;
+                }
+                if self.cfg.node_cap > 0 && self.nodes.len() >= self.cfg.node_cap {
+                    self.capped = true;
+                    break;
+                }
+                let Some(leaf) = self.sample_leaf(rng) else {
+                    break;
+                };
+                self.grow(leaf);
+                grew = true;
+                if self.cfg.node_cap > 0 && self.nodes.len() > self.cfg.node_cap {
+                    self.capped = true;
+                    break;
+                }
             }
-            out.push(pair);
+            if grew {
+                // Growth appended reach rows after `step` propagated the old
+                // tree. The next regret update must see the new leaves.
+                self.precompute_reaches();
+            }
+            if self.capped {
+                break;
+            }
         }
+        self.finish();
+    }
+
+    /// Grow the whole subgame, to the node budget or until nothing is left to
+    /// expand.
+    ///
+    /// Production never does this — the point of growing is to *not* build the
+    /// whole tree. It exists for the tests and sizing tools that need the
+    /// complete subgame of a small endgame, which is what the old fixed depth
+    /// limit gave them when the limit was larger than the game.
+    pub fn grow_full(&mut self) {
+        let mut at = 0usize;
+        while at < self.nodes.len() {
+            if self.nodes.len() >= self.cfg.nodes
+                || (self.cfg.node_cap > 0 && self.nodes.len() >= self.cfg.node_cap)
+            {
+                self.capped = true;
+                return;
+            }
+            if self.nodes[at].leaf && !self.states[at].is_terminal() {
+                self.grow(at);
+            }
+            at += 1;
+        }
+    }
+
+    /// The root's per-config values under the reference strategy — the target
+    /// a solve at this position produces for itself.
+    pub fn root_values(&mut self) -> [Vec<f32>; 2] {
+        let out = self.value_pass();
         self.restore();
         out
+    }
+
+    /// Value every node under the reference strategy and return the root's
+    /// slice. Leaves the reference reaches in place so a caller can read
+    /// beliefs off the tree; it must `restore` when it is done.
+    fn value_pass(&mut self) -> [Vec<f32>; 2] {
+        let reference = self.reference();
+        self.propagate(&reference);
+        self.leaf_beliefs_both();
+        let mut out = [Vec::new(), Vec::new()];
+        for p in 0..2usize {
+            self.pbs_head(p);
+            self.readout(p);
+            // `backprop` for the second player overwrites the first's values,
+            // so the root slice is taken before the next pass runs.
+            self.backprop(p, &reference, Back::Value);
+            let n = self.nc[0][p] as usize;
+            let vo = self.voff[0] as usize;
+            out[p] = self.vals[vo..vo + n].to_vec();
+        }
+        out
+    }
+
+    /// One expansion simulation: sample a world from the root beliefs, walk
+    /// down under the current average strategy, and return the leaf it reaches.
+    ///
+    /// Sampling rather than taking the most-reached leaf is what the paper does
+    /// and what its convergence result wants: an optimal policy here is often
+    /// mixed, and a greedy rule can starve a line the average strategy still
+    /// gives weight to. Their selection rule is half PUCT and half the CFR
+    /// average; with no prior to compute PUCT from, this is the half that
+    /// exists.
+    fn sample_leaf(&mut self, rng: &mut Rng) -> Option<usize> {
+        // One private config per player forms the sampled world.
+        let mut c = [
+            pick(&self.root_belief[0].p, rng),
+            pick(&self.root_belief[1].p, rng),
+        ];
+        let mut node = 0usize;
+        loop {
+            if self.nodes[node].leaf {
+                return (!self.states[node].is_terminal()).then_some(node);
+            }
+            let me = self.nodes[node].player as usize;
+            if self.nodes[node].chance {
+                let (idx, prob) = self.nodes[node].draw.row(c[me]);
+                let k = pick(prob, rng);
+                c[me] = idx[k] as usize;
+                node = self.nodes[node].child[0];
+                continue;
+            }
+            let row = self.nodes[node].legal_row(c[me]);
+            if row.is_empty() {
+                return None;
+            }
+            let cell = if self.sum_strat[node][row.clone()].iter().any(|&x| x > 0.0) {
+                row.start + pick(&self.sum_strat[node][row.clone()], rng)
+            } else {
+                let so = self.soff[node] as usize;
+                row.start + pick(&self.cur[so + row.start..so + row.end], rng)
+            };
+            let trans = self.nodes[node].legal_trans[cell];
+            if trans == NO_TRANS {
+                return None;
+            }
+            c[me] = trans as usize;
+            node = self.nodes[node].legal_child[cell] as usize;
+        }
+    }
+
+
+    /// The interior search queries this solve produced.
+    ///
+    /// Student of Games trains on the public belief states whose trees supplied
+    /// a better value than the network leaf they replaced.
+    ///
+    /// Only interior coin plays are taken. A leaf's value would be the
+    /// network's own answer, so training on it would teach the network what it
+    /// already said; an interior node's value comes from the subtree beneath
+    /// it, which is the bootstrap the whole method rests on.
+    pub fn harvest(&mut self, rng: &mut Rng, queries: usize) -> Solved {
+        let value = self.value_pass();
+        let queries = self.sample_queries(rng, queries);
+        self.restore();
+        Solved { value, queries }
+    }
+
+    /// Uniform draws from the leaves this solve queried the network at.
+    ///
+    /// Those leaves are where the value function's error enters the solve, so
+    /// they are the belief states worth solving in their own right. Every one
+    /// of them is a coin play, which is both what the network is defined on
+    /// and what a training row can carry, so no filtering is needed here.
+    fn sample_queries(&self, rng: &mut Rng, want: usize) -> Vec<(State, [Belief; 2])> {
+        if self.leaf_rows.is_empty() {
+            return Vec::new();
+        }
+        (0..want)
+            .map(|_| {
+                let i = self.leaf_rows[rng.below(self.leaf_rows.len())];
+                (self.states[i].clone(), self.belief_at(i))
+            })
+            .collect()
+    }
+
+    /// Node `i`'s belief for each player, under whichever reaches are
+    /// currently propagated.
+    fn belief_at(&self, i: usize) -> [Belief; 2] {
+        std::array::from_fn(|p| {
+            let mut w = vec![0.0; self.nc[i][p] as usize];
+            normalize_weights(self.reach_of(i, p), &mut w);
+            Belief {
+                cfg: self.nodes[i].cfgs[p].to_vec(),
+                p: w,
+            }
+        })
     }
 
     /// How well the solve came out, for the reference strategy — the CFR
@@ -1876,15 +2056,12 @@ impl<'a> Solver<'a> {
     ///
     /// **The leaf values are frozen** at the ones the reference strategy
     /// induces. They are a function of the beliefs at the leaf, so a real
-    /// deviation would move them, and this is therefore the exploitability of
-    /// the depth-limited game the reference *defines* rather than of the true
-    /// continuation. That is the usual convention in depth-limited solving, and
-    /// it is exactly the fixed-point question ReBeL iterates — but it is not
-    /// the exploitability of War Chest and must not be reported as if it were.
+    /// deviation would move them, so this measures exploitability of the
+    /// finite search game, not of the true War Chest continuation.
     pub fn nash_conv(&mut self) -> Conv {
         let reference = self.reference();
         let root = [self.root_belief[0].p.clone(), self.root_belief[1].p.clone()];
-        self.propagate(&reference, [&root[0], &root[1]]);
+        self.propagate(&reference);
         self.leaf_beliefs_both();
         let (mut nash, mut zero_sum) = (0.0, 0.0);
         for p in 0..2usize {
@@ -1905,15 +2082,13 @@ impl<'a> Solver<'a> {
         Conv { nash, zero_sum }
     }
 
-    /// The strategy the fixed-policy passes run under: the CFR average at the
-    /// end of the solve.
+    /// The strategy the fixed-policy passes run under.
     fn reference(&self) -> Vec<f32> {
-        // `avg_block` always retains the final average, whether or not the
-        // intermediate ones were asked for, so this is here after any solve.
-        self.snaps
-            .last()
-            .cloned()
-            .expect("a fixed-policy pass needs a finished solve")
+        assert!(
+            !self.avg.is_empty(),
+            "a fixed-policy pass needs `finish` to have materialised the average"
+        );
+        self.avg.clone()
     }
 
     /// Put the reaches back under `cur` after a fixed-policy pass has
@@ -1926,62 +2101,20 @@ impl<'a> Solver<'a> {
         self.last_traverser = None;
     }
 
-    /// The beliefs at tree node `leaf` under each per-iterate average strategy
-    /// (t = 0..T-1), from the solve's root belief — TurboReBeL's intermediate
-    /// PBSs. The caller appends the walk's live belief as the t = T member.
-    ///
-    /// Every iterate's average gives every legal action positive probability
-    /// (regret matching clamps at 1e-6), so each belief has the same support
-    /// as the node's own — the caller asserts that against the live belief
-    /// before consuming the set.
-    pub fn carried_beliefs(&mut self, leaf: usize) -> Vec<[Vec<f32>; 2]> {
-        let root = [self.root_belief[0].p.clone(), self.root_belief[1].p.clone()];
-        let n = self.snaps.len().saturating_sub(1);
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            let snap = self.snaps[i].clone();
-            self.propagate(&snap, [&root[0], &root[1]]);
-            let mut pair = [Vec::new(), Vec::new()];
-            for p in 0..2usize {
-                let ra =
-                    self.roff[leaf] as usize + if p == 1 { self.nc[leaf][0] as usize } else { 0 };
-                let n = self.nc[leaf][p] as usize;
-                let mut w = vec![0.0; n];
-                normalize_weights(&self.reach[ra..ra + n], &mut w);
-                pair[p] = w;
-            }
-            out.push(pair);
-        }
-        out
-    }
-
     /// True when the build hit the node cap and the solve must not be used.
     pub fn capped(&self) -> bool {
         self.capped
     }
 
-    /// How many per-iterate snapshots the solve kept. Part of the tree-size
-    /// contract.
-    pub fn snapshot_count(&self) -> usize {
-        self.snaps.len()
-    }
-
-    /// The exact kept iteration numbers, in order — the contract's
-    /// `snap_iters` array.
-    pub fn snapshot_iterations(&self) -> &[usize] {
-        &self.snap_list
-    }
-
     /// The CFR average strategy: the approximate equilibrium of the subgame.
-    /// Acting and belief propagation use it — the reference strategy of
-    /// TurboReBeL's Phase 2 and of the walk through the solved tree.
+    /// Acting and belief propagation use it.
     pub fn average_strategy(&self, node: usize, c: usize) -> &[f32] {
         let so = self.soff[node] as usize;
         let row = self.nodes[node].legal_row(c);
-        &self
-            .snaps
-            .last()
-            .expect("the configured solve must finish before its average is read")
-            [so + row.start..so + row.end]
+        assert!(
+            !self.avg.is_empty(),
+            "the solve must `finish` before its average is read"
+        );
+        &self.avg[so + row.start..so + row.end]
     }
 }

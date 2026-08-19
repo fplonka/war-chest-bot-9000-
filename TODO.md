@@ -2,9 +2,6 @@
 
 ## Open
 
-- [ ] The CPU solver's node cap is 200k in generation; the GPU pool sizing
-      (docs/TREE.md) must budget the same tail, and the GPU build should
-      receive the cap as metadata.
 - [ ] **Zero-sum is a diagnostic, not a constraint.** The subgame's leaves are
       network values and nothing makes `v_1 = -v_0`. Three v4 attempts at
       enforcing it lost: `odd` showed the reparameterised readout learns fine

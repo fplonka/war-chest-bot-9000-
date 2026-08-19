@@ -79,16 +79,19 @@ impl NodePolicy {
     /// underflowed is played uniformly rather than dropped.
     pub fn sample(&self, rng: &mut Rng, c: usize) -> usize {
         let row = self.row(c);
-        let w: Vec<f64> = self.probs[row.clone()]
-            .iter()
-            .map(|&x| x.max(0.0) as f64)
-            .collect();
-        row.start
-            + if w.iter().sum::<f64>() > 0.0 {
-                rng.weighted_index(&w)
-            } else {
-                rng.below(w.len().max(1))
+        let weights = &self.probs[row.clone()];
+        let total: f64 = weights.iter().map(|&x| x.max(0.0) as f64).sum();
+        if total == 0.0 {
+            return row.start + rng.below(row.len().max(1));
+        }
+        let mut needle = rng.unit_f64() * total;
+        for (i, &weight) in weights.iter().enumerate() {
+            needle -= weight.max(0.0) as f64;
+            if needle < 0.0 {
+                return row.start + i;
             }
+        }
+        row.end - 1
     }
 
 
@@ -186,48 +189,12 @@ pub fn cpu_frame(sv: &Solver<'_>, node: usize) -> NodePolicy {
     }
 }
 
-/// A node's shape, read off a packed tree. The packed offsets span the whole
-/// tree, so they are rebased onto this node's own cells.
-pub fn wave_frame(tree: &crate::serialize::WalkTree, node: usize, player: usize) -> NodePolicy {
-    let actions = tree.action_range(node);
-    let row0 = tree.legal_row_of[node] as usize;
-    let configs = tree.supports[node][player].len();
-    let cell0 = tree.legal_off[row0];
-    let cell1 = tree.legal_off[row0 + configs];
-    NodePolicy {
-        acts: tree.actions[actions.clone()].to_vec(),
-        aslot: tree.aslot[actions.clone()].to_vec(),
-        fdown: tree.fdown[actions].to_vec(),
-        legal_off: tree.legal_off[row0..=row0 + configs]
-            .iter()
-            .map(|&offset| offset - cell0)
-            .collect(),
-        legal_action: tree.legal_action[cell0 as usize..cell1 as usize].to_vec(),
-        probs: vec![0.0; (cell1 - cell0) as usize],
-    }
-}
-
-/// The CFR average strategy at a solved subgame's root.
-pub fn solved(sv: &mut Solver<'_>, iters: usize, configs: usize) -> NodePolicy {
-    sv.multistep(iters);
-    let mut np = cpu_frame(sv, 0);
+/// The CFR average strategy at a node of a finished solve.
+pub fn at_node(sv: &Solver<'_>, node: usize, configs: usize) -> NodePolicy {
+    let mut np = cpu_frame(sv, node);
     for config in 0..configs {
         let row = np.row(config);
-        np.probs[row].copy_from_slice(sv.average_strategy(0, config));
+        np.probs[row].copy_from_slice(sv.average_strategy(node, config));
     }
-    np
-}
-
-/// The same strategy, read off a wave solve's downloaded root rows.
-pub fn from_wave(
-    tree: &crate::serialize::WalkTree,
-    result: &crate::gpu::SolveResult,
-    player: usize,
-) -> NodePolicy {
-    let mut np = wave_frame(tree, 0, player);
-    let cell0 = tree.legal_off[tree.legal_row_of[0] as usize] as usize;
-    let cells = np.probs.len();
-    np.probs
-        .copy_from_slice(&result.strategy[cell0..cell0 + cells]);
     np
 }

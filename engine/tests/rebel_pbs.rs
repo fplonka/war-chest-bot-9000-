@@ -31,7 +31,7 @@ use warchest::net::Net;
 use warchest::rebel::*;
 use warchest::rng::Rng;
 use warchest::search::{node_actions, Cfg, Nets, Solver};
-use warchest::selfplay::make_game;
+use warchest::selfplay::{make_game, Agent, Collect, GameCfg, GameStream};
 use warchest::state::{Cont, State, Z_BAG, Z_FACEDOWN, Z_FACEUP};
 use warchest::units::{write_card_features, CARD_FEATS};
 use warchest::Action;
@@ -41,8 +41,7 @@ use warchest::Action;
 /// identity (gamma = 1, beta = 0); everything else is small and uniform.
 fn random_net(seed: u64) -> Net {
     let mut r = Rng::new(seed);
-    let dims = warchest::net::MODEL_TAG;
-    let layout = warchest::net::NetLayout::new(&dims).unwrap();
+    let layout = warchest::net::NetLayout::new();
     let mut draw = |n: usize, scale: f32| -> Vec<f32> {
         (0..n)
             .map(|_| (r.unit_f64() as f32 - 0.5) * scale)
@@ -51,10 +50,10 @@ fn random_net(seed: u64) -> Net {
     let w = draw(layout.w_len, 0.2);
     let b = draw(layout.b_len, 0.2);
     let mut ln = vec![0.0; layout.ln_len];
-    for &(gamma, beta) in &layout.norms {
-        ln[gamma..beta].fill(1.0);
+    for n in &layout.norms {
+        ln[n.g..n.g + n.width].fill(1.0);
     }
-    Net::from_flat(&dims, &w, &b, &ln).expect("random net")
+    Net::from_flat(&w, &b, &ln).expect("random net")
 }
 
 /// Instantiate a world from the shared public state plus both configs.
@@ -210,8 +209,8 @@ fn run_one(seed: u64) {
 }
 
 /// The same exhaustive-vs-incremental comparison on a draft with both Warrior
-/// Priests: private mid-round draws put `inflight` into the config, so the
-/// belief update, the walk and the brute force all carry it.
+/// Priests: private mid-round draws put `inflight` into the config, so belief
+/// updates and brute-force enumeration must both carry it.
 #[test]
 fn belief_tracker_matches_brute_force_with_warrior_priests() {
     for seed in 0..4u64 {
@@ -445,7 +444,7 @@ fn config_key_packing_has_headroom() {
 fn reachable_config_census_with_warrior_priests() {
     let mut sizes: Vec<usize> = Vec::new();
     let mut rng = Rng::new(0xC0FFEE);
-    for g in 0..200u64 {
+    for _ in 0..200u64 {
         let mut s = make_game(&mut rng, true);
         let ctx = Ctx::new(&s);
         for _ in 0..300 {
@@ -479,8 +478,8 @@ fn reachable_config_census_with_warrior_priests() {
     );
 }
 
-/// A subgame root survives the roots-file round trip: state, both beliefs
-/// and every continuation. The GPU sizing tools read this format.
+/// A subgame root survives the roots-file round trip: state, both beliefs and
+/// every continuation.
 #[test]
 fn roots_round_trip() {
     for seed in 0..30u64 {
@@ -595,17 +594,15 @@ fn config_features_separate_every_config() {
                 let cfgs = enumerate_configs(&reserve, hand_size, fd_size, false);
                 seen.clear();
                 for c in &cfgs {
-                    for p in 0..2usize {
-                        let mut phi = vec![0.0f32; CFEAT];
-                        write_config_feats(c, &reserve, &mut phi);
-                        // Bit patterns, so this compares exactly rather than
-                        // up to a tolerance chosen to make it pass.
-                        let key: Vec<u32> = phi.iter().map(|x| x.to_bits()).collect();
-                        if let Some(prev) = seen.insert(key, *c) {
-                            assert_eq!(prev, *c, "two configs share a feature vector");
-                        }
-                        checked += 1;
+                    let mut phi = vec![0.0f32; CFEAT];
+                    write_config_feats(c, &reserve, &mut phi);
+                    // Bit patterns, so this compares exactly rather than
+                    // up to a tolerance chosen to make it pass.
+                    let key: Vec<u32> = phi.iter().map(|x| x.to_bits()).collect();
+                    if let Some(prev) = seen.insert(key, *c) {
+                        assert_eq!(prev, *c, "two configs share a feature vector");
                     }
+                    checked += 1;
                 }
             }
         }
@@ -639,6 +636,7 @@ fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
 #[test]
 fn a_subgame_of_only_terminal_leaves_solves() {
     let nets = Nets {
+        gate: None,
         value: random_net(5),
     };
     let mut checked = 0usize;
@@ -660,10 +658,8 @@ fn a_subgame_of_only_terminal_leaves_solves() {
         let ctx = Ctx::new(&s);
         let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
         let cfg = Cfg {
-            depth: 2,
+            nodes: 200_000,
             iters: 8,
-            snapshots: true,
-            keep_states: true,
             ..Default::default()
         };
         let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
@@ -674,8 +670,8 @@ fn a_subgame_of_only_terminal_leaves_solves() {
                 .all(|(n, st)| !n.leaf || st.is_terminal()),
             "expected every leaf terminal"
         );
-        sv.multistep(cfg.iters);
-        let v = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
+        sv.solve(&mut rng);
+        let v = vec![sv.root_values()];
         assert!(v[0][0].iter().all(|x| x.is_finite()));
         checked += 1;
         if checked >= 3 {
@@ -810,9 +806,8 @@ fn a_solve_reads_only_the_beliefs() {
     let mut nets = Nets::default();
     nets.value = random_net(0xA11CE);
     let cfg = Cfg {
-        depth: 2,
+        nodes: 200_000,
         iters: 8,
-        snapshots: true,
         ..Default::default()
     };
     let mut checked = 0usize;
@@ -831,8 +826,9 @@ fn a_solve_reads_only_the_beliefs() {
                 set_config(&mut w, p as u8, &ctx, &c);
             }
             let mut sv = Solver::new(&w, ctx, &nets, cfg, bel.clone());
-            sv.multistep(cfg.iters);
-            let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
+            let mut solve_rng = Rng::new(seed ^ 0x51A7_EE);
+            sv.solve(&mut solve_rng);
+            let vals = vec![sv.root_values()];
             let strat: Vec<f32> = (0..bel[w.to_act() as usize].cfg.len())
                 .flat_map(|c| sv.average_strategy(0, c).to_vec())
                 .collect();
@@ -868,9 +864,8 @@ fn the_value_function_separates_configs_sharing_a_hand() {
     let mut nets = Nets::default();
     nets.value = random_net(0xBEEF);
     let cfg = Cfg {
-        depth: 2,
+            nodes: 200_000,
         iters: 8,
-        snapshots: true,
         ..Default::default()
     };
     let (mut positions, mut val_differs, mut strat_differs) = (0usize, 0usize, 0usize);
@@ -880,8 +875,9 @@ fn the_value_function_separates_configs_sharing_a_hand() {
         };
         let me = s.to_act() as usize;
         let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
-        sv.multistep(cfg.iters);
-        let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
+        let mut solve_rng = Rng::new(seed ^ 0xC0FF_EE);
+        sv.solve(&mut solve_rng);
+        let vals = vec![sv.root_values()];
         let v = &vals[0][me];
         for i in 0..bel[me].cfg.len() {
             for j in 0..i {
@@ -916,6 +912,179 @@ fn the_value_function_separates_configs_sharing_a_hand() {
         "only {:.0}% of same-hand config pairs got distinct play",
         sf * 100.0
     );
+}
+
+#[test]
+fn game_stream_yields_one_complete_solve_at_a_time() {
+    let nets = Nets {
+        gate: None,
+        value: random_net(0x57EA),
+    };
+    let cfg = Cfg {
+        nodes: 64,
+        expand: 1,
+        iters: 8,
+        ..Default::default()
+    };
+    let gc = GameCfg {
+        agents: [Agent::Rebel { cfg }; 2],
+        collect: Collect::Rebel,
+        explore: 0.25,
+        random_draft: false,
+        eval_mix: 1.0,
+        mc_mix: 0.0,
+        query_rate: 0.0,
+        recursive_rate: 0.0,
+    };
+    let mut stream = GameStream::new(7, gc);
+    for _ in 0..2 {
+        let data = stream.generate(&nets, 1);
+        assert_eq!(data.soff.len(), 1);
+        assert!(data.nv > 0);
+        assert_eq!(data.coff.len(), 2 * data.nv + 1);
+    }
+}
+
+/// Routing the network through the batch gate must not change a single value.
+///
+/// The gate exists to make the *shape* of inference better, never its result:
+/// the same solve, gated and ungated, has to produce the same rows, the same
+/// beliefs and the same targets, bit for bit. Anything else means the batch is
+/// answering a different question than the solve asked.
+#[test]
+fn a_gated_solve_matches_an_ungated_one_exactly() {
+    use std::sync::Arc;
+    use warchest::farm::Gate;
+
+    let cfg = Cfg {
+        nodes: 96,
+        expand: 1,
+        iters: 12,
+        ..Default::default()
+    };
+    let gc = GameCfg {
+        agents: [Agent::Rebel { cfg }; 2],
+        collect: Collect::Rebel,
+        explore: 0.1,
+        random_draft: true,
+        eval_mix: 1.0,
+        mc_mix: 0.0,
+        query_rate: 0.9,
+        recursive_rate: 0.25,
+    };
+    const SOLVES: usize = 16;
+
+    let plain = {
+        let nets = Nets {
+            gate: None,
+            value: random_net(0x6A7E),
+        };
+        GameStream::new(3, gc).generate(&nets, SOLVES)
+    };
+
+    let gated = {
+        let gate = Arc::new(Gate::default());
+        let nets = Arc::new(Nets {
+            gate: Some(Arc::clone(&gate)),
+            value: random_net(0x6A7E),
+        });
+        let worker = {
+            let (gate, nets) = (Arc::clone(&gate), Arc::clone(&nets));
+            std::thread::spawn(move || {
+                let _member = gate.enter();
+                GameStream::new(3, gc).generate(&nets, SOLVES)
+            })
+        };
+        let driver = {
+            let (gate, nets) = (Arc::clone(&gate), Arc::clone(&nets));
+            std::thread::spawn(move || {
+                while gate
+                    .round(|calls| calls.iter().map(|c| c.run(&nets.value)).collect())
+                    .is_some()
+                {}
+            })
+        };
+        let out = worker.join().expect("gated worker");
+        gate.close();
+        driver.join().expect("driver");
+        out
+    };
+
+    assert_eq!(plain.nv, gated.nv, "row counts differ");
+    assert_eq!(plain.rows, gated.rows, "packed rows differ");
+    assert_eq!(plain.coff, gated.coff, "config offsets differ");
+    assert_eq!(plain.cw, gated.cw, "beliefs differ");
+    assert_eq!(plain.cy, gated.cy, "targets differ");
+    assert_eq!(plain.queries, gated.queries, "query row counts differ");
+}
+
+/// A solve stores its root and nothing else.
+///
+/// This is the target convention, and it is worth pinning: the tempting bug is
+/// to also keep the interior nodes the grown tree valued on the way. Those are
+/// not targets. An interior node's opposing range still carries the reach that
+/// led to it, so its value is on no fixed scale and shrinks as the strategy
+/// sharpens; and a node beside the frontier only hands back the network's own
+/// leaf output, which trains the network on itself.
+///
+/// Note what is *not* asserted here: that the two seats' values cancel. With a
+/// real value function at the leaves that is a property of the network, not of
+/// the targets — nothing constrains the network to be antisymmetric — so it
+/// belongs in the run report as a diagnostic, not in this test.
+#[test]
+fn a_solve_stores_its_root_and_nothing_else() {
+    let nets = Nets {
+        gate: None,
+        value: random_net(0x51DE),
+    };
+    let cfg = Cfg {
+        nodes: 96,
+        expand: 1,
+        iters: 12,
+        ..Default::default()
+    };
+    let gc = GameCfg {
+        agents: [Agent::Rebel { cfg }; 2],
+        collect: Collect::Rebel,
+        explore: 0.25,
+        random_draft: true,
+        eval_mix: 1.0,
+        mc_mix: 0.0,
+        // Exercise the query solver too: its rows go through the same path.
+        query_rate: 1.0,
+        recursive_rate: 0.25,
+    };
+    let mut stream = GameStream::new(11, gc);
+    let data = stream.generate(&nets, 24);
+    assert_eq!(
+        data.nv,
+        data.soff.len(),
+        "a solve must store exactly one row: {} rows from {} solves",
+        data.nv,
+        data.soff.len()
+    );
+    assert!(
+        data.queries > 0,
+        "the query solver produced no rows at all"
+    );
+    assert!(
+        data.queries < data.nv,
+        "every row came from the query solver; self-play stored none"
+    );
+    // Every row carries a full belief for both seats, and the weights are a
+    // distribution — this is what makes the value a conditional expectation
+    // rather than a reach-scaled quantity.
+    for r in 0..data.nv {
+        for p in 0..2 {
+            let span = data.row_span(r, p);
+            assert!(!span.is_empty(), "row {r} seat {p} has an empty support");
+            let mass: f32 = span.map(|c| data.cw[c]).sum();
+            assert!(
+                (mass - 1.0).abs() < 1e-3,
+                "row {r} seat {p} belief sums to {mass:.5}, not 1"
+            );
+        }
+    }
 }
 
 /// `normalize_weights` is what turns a reach vector into the belief the network
@@ -959,8 +1128,7 @@ fn from_pairs_keeps_zero_weight_configs() {
     // one strategy probability per decision; regret matching floors those at
     // 1e-6, so after enough of them a reachable config's weight reaches
     // exactly 0.0 in f32. Dropping it would shift every later strategy row
-    // index by one — the walk-desync panic that killed
-    // runs/t256_h384_dg64_s12 at epoch 168.
+    // index by one.
     let a = Config::default();
     let b = Config {
         hand: [1, 0, 0, 0, 0],
@@ -1054,14 +1222,13 @@ fn zero_weight_config_survives_the_walk_update() {
             ctx,
             &nets,
             Cfg {
-                depth: 2,
+            nodes: 200_000,
                 iters: 8,
-                snapshots: false,
                 ..Default::default()
             },
             bel.clone(),
         );
-        sv.multistep(8);
+        sv.solve(&mut rng);
         let n0 = &sv.nodes[0];
         // An action the underflowed config can actually play, so the tree's
         // child support includes it.
@@ -1078,7 +1245,7 @@ fn zero_weight_config_survives_the_walk_update() {
             // pre-draw update does not model; keep searching.
             continue;
         }
-        // The walk's Bayes update on the public observation of `chosen`.
+        // Bayes-update the belief on the public observation of `chosen`.
         let obs = obs_key(&n0.acts[chosen]);
         let mut pairs = Vec::new();
         for (ci, c) in bel[me].cfg.iter().enumerate() {

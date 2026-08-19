@@ -48,7 +48,7 @@ pull)
 build)
     run_remote "find engine/src engine/tests engine/examples -type f -exec touch {} +
 cd engine && maturin develop --release --features python,gpu 2>&1 | tail -2
-cargo build --release --bin bot --features gpu 2>&1 | tail -1"
+cargo build --release --bin bot 2>&1 | tail -1"
     ;;
 follow)
     tag=${2:?usage: follow <tag> [run]}

@@ -10,8 +10,10 @@ pub mod actions;
 pub mod arena;
 pub mod args;
 pub mod board;
+#[cfg(feature = "gpu")]
+pub mod cuda;
+pub mod farm;
 pub mod bot;
-pub mod gpu;
 pub mod net;
 pub mod policy;
 pub mod prof;
@@ -21,7 +23,6 @@ pub mod roots;
 pub mod rules;
 pub mod search;
 pub mod selfplay;
-pub mod serialize;
 pub mod state;
 pub mod units;
 

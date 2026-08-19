@@ -379,10 +379,8 @@ impl Belief {
         let mut cfg: Vec<Config> = Vec::with_capacity(pairs.len());
         let mut p: Vec<f32> = Vec::with_capacity(pairs.len());
         for (c, w) in pairs {
-            // Support is reachability, not weight. The subgame tree keeps every
-            // reachable config and the walk indexes its strategy rows by
-            // position in this list, so a weight that underflowed to zero must
-            // not delete a row.
+            // Support is reachability, not weight. Tree strategy rows index
+            // this list, so an underflowed zero must not delete a row.
             if w < 0.0 {
                 continue;
             }
@@ -924,9 +922,9 @@ pub const LOOSE: usize = 2 * PLAYER_SCALARS + GLOBAL_SCALARS;
 
 // --------------------------------------------------------------- replay rows
 //
-// The frozen compact row format. A row is raw small integers (plus the four
-// float16 aux targets) — never floats of a learned encoding — and the network
-// input is rebuilt from it when a batch is made (`expand_row`). Board
+// The frozen compact row format contains raw small integers, never floats of a
+// learned encoding. The network input is rebuilt from it when a batch is made
+// (`expand_row`). Board
 // coordinates, location hexes and card facts are constants and are not stored
 // per row. Rows carry a format version and a hash of the rules tables so a
 // dump written by a different rules build fails loudly instead of training on
@@ -963,27 +961,6 @@ pub const ROW_TO_ACT: usize = ROW_INIT_MOVED + 1;
 pub const ROW_PLIES: usize = ROW_TO_ACT + 1;
 pub const ROW_BYTES: usize = ROW_PLIES + 2;
 
-// ---------------------------------------------------------- GPU public rows
-//
-// A solve can have hundreds of thousands of network rows. Uploading the
-// expanded `PUBFEAT` f32 vector for every one repeats one-hots, card facts and
-// normalised byte counts, so the GPU contract keeps only the public small
-// integers and expands them while assembling the trunk input. The printed card
-// facts are solve-wide (`PackedTables::card_feat`) and never appear per row.
-pub const GPU_ROW_HEX_OWNER: usize = 0;
-pub const GPU_ROW_HEX_SLOT: usize = GPU_ROW_HEX_OWNER + N_HEXES;
-pub const GPU_ROW_HEX_HEIGHT: usize = GPU_ROW_HEX_SLOT + N_HEXES;
-pub const GPU_ROW_HEX_MARKER: usize = GPU_ROW_HEX_HEIGHT + N_HEXES;
-pub const GPU_ROW_PILES: usize = GPU_ROW_HEX_MARKER + N_HEXES;
-pub const GPU_ROW_MARKERS: usize = GPU_ROW_PILES + NTYPE * PILE_COUNTS;
-pub const GPU_ROW_HAND: usize = GPU_ROW_MARKERS + 2;
-pub const GPU_ROW_FD: usize = GPU_ROW_HAND + 2;
-pub const GPU_ROW_BAG: usize = GPU_ROW_FD + 2;
-pub const GPU_ROW_INITIATIVE: usize = GPU_ROW_BAG + 2;
-pub const GPU_ROW_INIT_MOVED: usize = GPU_ROW_INITIATIVE + 1;
-pub const GPU_ROW_TO_ACT: usize = GPU_ROW_INIT_MOVED + 1;
-pub const GPU_ROW_PLIES: usize = GPU_ROW_TO_ACT + 1;
-pub const GPU_ROW_BYTES: usize = GPU_ROW_PLIES + 2;
 
 /// The current row format version. Bump when the layout or the expanded
 /// feature layout changes; dumps carry it and refuse to load otherwise.
@@ -1268,82 +1245,6 @@ pub fn pack_row(s: &State, ctx: &Ctx, out: &mut [u8]) {
     out[ROW_PLIES..ROW_PLIES + 2].copy_from_slice(&plies.to_le_bytes());
 }
 
-/// Pack the public part of a solver network row without expanding it to
-/// floats. This is deliberately parallel to `expand_gpu_row`; their oracle
-/// test compares the result with `write_public_features` for real states.
-pub fn pack_gpu_row(s: &State, ctx: &Ctx, out: &mut [u8]) {
-    debug_assert_eq!(out.len(), GPU_ROW_BYTES);
-    for h in 0..N_HEXES {
-        out[GPU_ROW_HEX_OWNER + h] = s.hex_owner[h];
-        out[GPU_ROW_HEX_SLOT + h] = if s.hex_owner[h] == NONE {
-            NONE
-        } else {
-            ctx.slot_of[s.hex_owner[h] as usize][s.hex_type[h] as usize] as u8
-        };
-        out[GPU_ROW_HEX_HEIGHT + h] = s.hex_height[h];
-        out[GPU_ROW_HEX_MARKER + h] = s.loc_marker[h];
-    }
-    for p in 0..2usize {
-        let res = reserve(s, p as u8, ctx);
-        for k in 0..NSLOT {
-            let u = ctx.slots[p][k] as usize;
-            let at = GPU_ROW_PILES + (p * NSLOT + k) * PILE_COUNTS;
-            out[at] = res[k];
-            out[at + 1] = s.zones[p][Z_FACEUP][u];
-            out[at + 2] = s.zones[p][Z_SUPPLY][u];
-            out[at + 3] = s.zones[p][Z_ELIM][u];
-        }
-        out[GPU_ROW_MARKERS + p] = s.markers_hand[p];
-        out[GPU_ROW_HAND + p] = s.hand_size(p as u8);
-        out[GPU_ROW_FD + p] = s.zones[p][Z_FACEDOWN].iter().sum();
-        out[GPU_ROW_BAG + p] = s.bag_size(p as u8);
-    }
-    out[GPU_ROW_INITIATIVE] = s.initiative;
-    out[GPU_ROW_INIT_MOVED] = s.initiative_moved as u8;
-    out[GPU_ROW_TO_ACT] = s.to_act();
-    let plies = crate::state::MAX_MAIN_PLAYS - s.main_plays.min(crate::state::MAX_MAIN_PLAYS);
-    out[GPU_ROW_PLIES..GPU_ROW_PLIES + 2].copy_from_slice(&plies.to_le_bytes());
-}
-
-/// Host reference for the device's packed-row expansion. Keeping this in the
-/// shared encoder module makes changes to public features fail an ordinary
-/// Rust test instead of silently drifting between inference paths.
-pub fn expand_gpu_row(row: &[u8], ids: &[u8; NTYPE], out: &mut [f32]) {
-    debug_assert_eq!(row.len(), GPU_ROW_BYTES);
-    let mut hex_owner = [NONE; N_HEXES];
-    let mut hex_slot = [NONE; N_HEXES];
-    let mut hex_height = [0u8; N_HEXES];
-    let mut hex_marker = [NONE; N_HEXES];
-    hex_owner.copy_from_slice(&row[GPU_ROW_HEX_OWNER..GPU_ROW_HEX_OWNER + N_HEXES]);
-    hex_slot.copy_from_slice(&row[GPU_ROW_HEX_SLOT..GPU_ROW_HEX_SLOT + N_HEXES]);
-    hex_height.copy_from_slice(&row[GPU_ROW_HEX_HEIGHT..GPU_ROW_HEX_HEIGHT + N_HEXES]);
-    hex_marker.copy_from_slice(&row[GPU_ROW_HEX_MARKER..GPU_ROW_HEX_MARKER + N_HEXES]);
-    let mut markers = [0u8; 2];
-    let mut hand = [0u8; 2];
-    let mut fd = [0u8; 2];
-    let mut bag = [0u8; 2];
-    markers.copy_from_slice(&row[GPU_ROW_MARKERS..GPU_ROW_MARKERS + 2]);
-    hand.copy_from_slice(&row[GPU_ROW_HAND..GPU_ROW_HAND + 2]);
-    fd.copy_from_slice(&row[GPU_ROW_FD..GPU_ROW_FD + 2]);
-    bag.copy_from_slice(&row[GPU_ROW_BAG..GPU_ROW_BAG + 2]);
-    write_public_features_raw(
-        &hex_owner,
-        &hex_slot,
-        &hex_height,
-        &hex_marker,
-        &row[GPU_ROW_PILES..GPU_ROW_PILES + NTYPE * PILE_COUNTS],
-        ids,
-        &markers,
-        &hand,
-        &fd,
-        &bag,
-        row[GPU_ROW_INITIATIVE],
-        row[GPU_ROW_INIT_MOVED] != 0,
-        row[GPU_ROW_TO_ACT],
-        u16::from_le_bytes([row[GPU_ROW_PLIES], row[GPU_ROW_PLIES + 1]]),
-        out,
-    );
-}
 
 /// Expand a stored replay row into the public encoding, in place.
 ///

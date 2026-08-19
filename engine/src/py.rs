@@ -9,7 +9,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use crate::actions::Action;
-use crate::board::{board, NONE, N_HEXES, N_LOCATIONS};
+use crate::board::{board, NONE, N_HEXES};
 use crate::state::*;
 use crate::units::{def, index_of_id, write_card_features, CARD_FEATS, N_UNITS};
 
@@ -487,242 +487,22 @@ impl Game {
 // and pulls tensors back once per epoch.
 
 use crate::net::Net;
+use crate::farm::{Backend, Farm};
 use crate::search::{Cfg, Cfr, Nets};
-use crate::selfplay::{run_games, Agent, Collect, Data, GameCfg};
+use crate::selfplay::{run_games, Agent, Collect, Data, GameCfg, GameStream};
 use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2};
 use parking_lot::RwLock;
-use std::sync::LazyLock;
-
-/// Independent weight slots, so a match can pit one checkpoint against another.
-/// Slot 0 is the live network the trainer generates with; the rest hold
-/// whatever checkpoints a caller wants to play off against each other, and the
-/// pool grows to fit. The Elo ladder loads one snapshot per slot and plays a
-/// round robin, which is the only reason more than one slot exists.
-/// The in-process GPU solve service. `gpu_start` spawns it;
-/// `gpu_stream_start` runs generation through it; `gpu_set_weights` forwards
-/// the trainer's publications to it. Without the `gpu` feature every call
-/// fails loudly — a misconfigured box must not silently run on the CPU.
-#[cfg(feature = "gpu")]
-static GPU_CLIENTS: LazyLock<parking_lot::Mutex<Vec<crate::gpu::GpuClient>>> =
-    LazyLock::new(|| parking_lot::Mutex::new(Vec::new()));
-
-#[cfg(feature = "gpu")]
-pub(crate) fn gpu_clients() -> &'static parking_lot::Mutex<Vec<crate::gpu::GpuClient>> {
-    &GPU_CLIENTS
-}
-
-/// Python-side handle for the continuous Rust actor/build/GPU pipeline. `next`
-/// yields one solve-complete replay chunk, returns `None` on a polling timeout,
-/// and raises `StopIteration` once a requested stop has fully drained.
-#[cfg(feature = "gpu")]
-#[pyclass]
-struct GpuGenerator {
-    rx: std::sync::Mutex<std::sync::mpsc::Receiver<Result<Option<crate::selfplay::Data>, String>>>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
-    done: std::sync::atomic::AtomicBool,
-}
-
-#[cfg(feature = "gpu")]
-#[pymethods]
-impl GpuGenerator {
-    #[pyo3(signature = (timeout=0.1))]
-    fn next(&self, py: Python<'_>, timeout: f64) -> PyResult<Option<PyObject>> {
-        if self.done.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(pyo3::exceptions::PyStopIteration::new_err(()));
-        }
-        let event = py.allow_threads(|| {
-            let rx = self.rx.lock().unwrap();
-            if timeout < 0.0 {
-                rx.recv()
-                    .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
-            } else {
-                rx.recv_timeout(std::time::Duration::from_secs_f64(timeout.max(0.0)))
-            }
-        });
-        match event {
-            Ok(Ok(Some(data))) => data_to_dict(py, data).map(Some),
-            Ok(Ok(None)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                self.done.store(true, std::sync::atomic::Ordering::Release);
-                if let Some(thread) = self.thread.lock().unwrap().take() {
-                    let _ = thread.join();
-                }
-                Err(pyo3::exceptions::PyStopIteration::new_err(()))
-            }
-            Ok(Err(e)) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
-        }
-    }
-
-    fn stop(&self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    fn is_done(&self) -> bool {
-        self.done.load(std::sync::atomic::Ordering::Acquire)
-    }
-}
-
-#[cfg(feature = "gpu")]
-impl Drop for GpuGenerator {
-    fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Release);
-        if self.done.load(std::sync::atomic::Ordering::Acquire) {
-            if let Some(thread) = self.thread.get_mut().unwrap().take() {
-                let _ = thread.join();
-            }
-        }
-    }
-}
-
-#[cfg(feature = "gpu")]
-#[pyfunction]
-#[pyo3(signature = (seed, depth=2, iters=64, explore=0.25, random_draft=true, cfr="linear", eval_mix=0.5, workers=36, inflight_per_worker=32, chunk_solves=1024))]
-#[allow(clippy::too_many_arguments)]
-fn gpu_stream_start(
-    seed: u64,
-    depth: usize,
-    iters: usize,
-    explore: f32,
-    random_draft: bool,
-    cfr: &str,
-    eval_mix: f32,
-    workers: usize,
-    inflight_per_worker: usize,
-    chunk_solves: usize,
-) -> PyResult<GpuGenerator> {
-    let cfg = Cfg {
-        depth,
-        iters,
-        snapshots: true,
-        cfr: cfr_of(cfr)?,
-        node_cap: 200_000,
-        ..Default::default()
-    };
-    let agent = Agent::Rebel { cfg };
-    let gc = GameCfg {
-        agents: [agent, agent],
-        collect: Collect::Rebel,
-        explore,
-        random_draft,
-        eval_mix,
-        mc_mix: 0.0,
-    };
-    let nets = nets().read().clone();
-    let clients = gpu_clients().lock().clone();
-    if clients.is_empty() {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "gpu service not started (gpu_start was not called)",
-        ));
-    }
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let run_stop = stop.clone();
-    // Bound complete replay chunks as well as Rust's worker-to-merger queue.
-    // If conversion/training falls behind, backpressure reaches actor resume
-    // instead of retaining an unbounded number of multi-megabyte Python arrays.
-    let (tx, rx) = std::sync::mpsc::sync_channel(4);
-    let thread = std::thread::Builder::new()
-        .name("warchest-gpu-stream".into())
-        .spawn(move || {
-            crate::selfplay::run_games_gpu_stream(
-                seed,
-                &nets,
-                &gc,
-                &clients,
-                workers,
-                inflight_per_worker,
-                chunk_solves,
-                &run_stop,
-                tx,
-            );
-        })
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("start GPU stream: {e}")))?;
-    Ok(GpuGenerator {
-        rx: std::sync::Mutex::new(rx),
-        stop,
-        thread: std::sync::Mutex::new(Some(thread)),
-        done: std::sync::atomic::AtomicBool::new(false),
-    })
-}
-
-/// Start one solve service per listed CUDA device (typically `[0]` for
-/// training; the ladder starts one per device and pits weights against each
-/// other). Call once; a shape change needs a fresh process.
-#[cfg(feature = "gpu")]
-#[pyfunction]
-#[pyo3(signature = (dims, w, b, ln, devices=vec![0]))]
-fn gpu_start(
-    py: Python<'_>,
-    dims: Vec<usize>,
-    w: PyReadonlyArray1<f32>,
-    b: PyReadonlyArray1<f32>,
-    ln: PyReadonlyArray1<f32>,
-    devices: Vec<usize>,
-) -> PyResult<()> {
-    let (w, b, ln) = (
-        w.as_slice()?.to_vec(),
-        b.as_slice()?.to_vec(),
-        ln.as_slice()?.to_vec(),
-    );
-    py.allow_threads(move || {
-        let mut clients = Vec::new();
-        for d in devices {
-            clients.push(
-                crate::gpu::service::spawn(
-                    d,
-                    dims.clone(),
-                    w.clone(),
-                    b.clone(),
-                    ln.clone(),
-                    false,
-                )
-                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?,
-            );
-        }
-        *gpu_clients().lock() = clients;
-        Ok(())
-    })
-}
-
-#[cfg(feature = "gpu")]
-#[pyfunction]
-#[pyo3(signature = (dims, w, b, ln, device=0))]
-fn gpu_set_weights(
-    _py: Python<'_>,
-    dims: Vec<usize>,
-    w: PyReadonlyArray1<f32>,
-    b: PyReadonlyArray1<f32>,
-    ln: PyReadonlyArray1<f32>,
-    device: usize,
-) -> PyResult<()> {
-    let clients = gpu_clients().lock();
-    let c = clients.get(device).ok_or_else(|| {
-        pyo3::exceptions::PyRuntimeError::new_err(
-            "gpu service not started (gpu_start was not called)",
-        )
-    })?;
-    c.set_weights(
-        dims,
-        w.as_slice()?.to_vec(),
-        b.as_slice()?.to_vec(),
-        ln.as_slice()?.to_vec(),
-    );
-    Ok(())
-}
-
-#[cfg(feature = "gpu")]
-#[pyfunction]
-fn gpu_stop(_py: Python<'_>) -> PyResult<()> {
-    gpu_clients().lock().clear();
-    Ok(())
-}
+use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The live network. Empty until the trainer pushes weights: the greedy warm
 /// phase plays with no network at all. One process holds one network — two
 /// checkpoints meet each other as two arena bots, not as two slots here.
-static NETS: LazyLock<RwLock<Nets>> = LazyLock::new(|| RwLock::new(Nets::default()));
+static NETS: LazyLock<RwLock<Arc<Nets>>> =
+    LazyLock::new(|| RwLock::new(Arc::new(Nets::default())));
+static NET_VERSION: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn nets() -> &'static RwLock<Nets> {
+pub(crate) fn nets() -> &'static RwLock<Arc<Nets>> {
     &NETS
 }
 
@@ -733,17 +513,17 @@ fn check_nets() -> PyResult<()> {
     Ok(())
 }
 
-/// Install value-network weights. `dims` is the model tag (`net::MODEL_TAG`);
-/// `w`, `b` and `ln` are the flat arrays `Net::from_flat` documents.
+/// Install value-network weights: the flat arrays `Net::from_flat` documents.
 #[pyfunction]
 fn set_weights(
-    dims: Vec<usize>,
     w: PyReadonlyArray1<f32>,
     b: PyReadonlyArray1<f32>,
     ln: PyReadonlyArray1<f32>,
 ) -> PyResult<()> {
-    nets().write().value = Net::from_flat(&dims, w.as_slice()?, b.as_slice()?, ln.as_slice()?)
+    let value = Net::from_flat(w.as_slice()?, b.as_slice()?, ln.as_slice()?)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    *nets().write() = Arc::new(Nets { value, gate: None });
+    NET_VERSION.fetch_add(1, Ordering::Release);
     Ok(())
 }
 
@@ -752,8 +532,10 @@ fn set_weights(
 /// the same way and nothing needs torch to do it.
 #[pyfunction]
 fn set_weights_bin(path: &str) -> PyResult<()> {
-    nets().write().value = Net::load_bin(path)
+    let value = Net::load_bin(path)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}: {}", path, e)))?;
+    *nets().write() = Arc::new(Nets { value, gate: None });
+    NET_VERSION.fetch_add(1, Ordering::Release);
     Ok(())
 }
 
@@ -807,29 +589,18 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     out.set_item("cap_hits", d.cap_hits)?;
     out.set_item("horizon_hits", d.cap_hits)?;
     out.set_item("node_caps", d.node_caps)?;
+    out.set_item("configs", d.configs)?;
+    out.set_item("query_rows", d.queries)?;
     out.set_item("plays_attack", d.plays[0])?;
     out.set_item("plays_pass", d.plays[1])?;
     out.set_item("plays_deploy", d.plays[2])?;
     out.set_item("plays_bolster", d.plays[3])?;
     out.set_item("plays_maneuver", d.plays[4])?;
     out.set_item("plays_recruit", d.plays[5])?;
-    out.set_item("oversize_routes", d.oversize_routes)?;
-    out.set_item("card_exclusive_routes", d.card_exclusive_routes)?;
-    out.set_item("exact_fallbacks", d.exact_fallbacks)?;
-    out.set_item("censored_games", d.censored_games)?;
-    out.set_item("dropped", d.dropped)?;
-    out.set_item("configs", d.configs)?;
-    out.set_item("gpu_wait_s", d.gpu_wait_s)?;
-    out.set_item("merge_wait_s", d.merge_wait_s)?;
     assert_eq!(
         d.coff.len(),
         if d.nv == 0 { 0 } else { 2 * d.nv + 1 },
         "config offsets do not match the row count"
-    );
-    assert_eq!(
-        d.aux.len(),
-        d.nv * N_LOCATIONS,
-        "auxiliary owners do not match the row count"
     );
     // Internal `soff` holds one start per solve; the exposed array appends
     // the total row count as the trailing entry, so `len - 1` is the number
@@ -845,7 +616,6 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
         );
     }
     out.set_item("rows", d.rows.into_pyarray_bound(py))?;
-    out.set_item("aux", d.aux.into_pyarray_bound(py))?;
     out.set_item("row_bytes", crate::rebel::ROW_BYTES)?;
     out.set_item("cc", d.cc.into_pyarray_bound(py))?;
     out.set_item("cw", d.cw.into_pyarray_bound(py))?;
@@ -856,17 +626,119 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     Ok(out.into())
 }
 
+/// Many solves in flight in one process, sharing one forward pass.
+///
+/// This replaces the process-per-core generator: threads are cheap, a network
+/// replica per core was not, and inference only batches if the solves are in
+/// the same address space.
+#[pyclass]
+struct SolveFarm {
+    farm: Farm,
+    net_version: u64,
+    devices: Vec<usize>,
+}
+
+#[pymethods]
+impl SolveFarm {
+    #[new]
+    #[pyo3(signature = (seed, threads, nodes=256, expand=4, iters=16, explore=0.1, random_draft=true, cfr="dcfr", config_cap=256, query_rate=0.9, recursive_rate=0.1, devices=vec![0]))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        seed: u64,
+        threads: usize,
+        nodes: usize,
+        expand: usize,
+        iters: usize,
+        explore: f32,
+        random_draft: bool,
+        cfr: &str,
+        config_cap: usize,
+        query_rate: f32,
+        recursive_rate: f32,
+        devices: Vec<usize>,
+    ) -> PyResult<SolveFarm> {
+        let cfg = Cfg {
+            nodes,
+            expand,
+            iters,
+            cfr: cfr_of(cfr)?,
+            node_cap: 200_000,
+            config_cap,
+            ..Default::default()
+        };
+        let gc = GameCfg {
+            agents: [Agent::Rebel { cfg }; 2],
+            collect: Collect::Rebel,
+            explore,
+            random_draft,
+            eval_mix: 1.0,
+            mc_mix: 0.0,
+            query_rate,
+            recursive_rate,
+        };
+        let version = NET_VERSION.load(Ordering::Acquire);
+        let backend = backend_for(&devices, (**nets().read()).value.clone())?;
+        Ok(SolveFarm {
+            farm: Farm::new(seed, threads, gc, backend),
+            net_version: version,
+            devices,
+        })
+    }
+
+    /// Run rounds until at least `solves` rows are ready, then hand them over.
+    #[pyo3(signature = (solves=1))]
+    fn collect(&mut self, py: Python<'_>, solves: usize) -> PyResult<PyObject> {
+        if solves == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "solves must be positive",
+            ));
+        }
+        check_nets()?;
+        let version = NET_VERSION.load(Ordering::Acquire);
+        if self.net_version != version {
+            let backend = backend_for(&self.devices, (**nets().read()).value.clone())?;
+            self.farm.publish(backend);
+            self.net_version = version;
+        }
+        let d = py.allow_threads(|| self.farm.drive(solves));
+        let out = data_to_dict(py, d)?;
+        let dict = out.bind(py).downcast::<PyDict>()?.clone();
+        // How well the batching is working: calls per round is how many solves
+        // shared a forward pass.
+        dict.set_item("rounds", self.farm.rounds)?;
+        dict.set_item("round_calls", self.farm.round_calls)?;
+        dict.set_item("round_rows", self.farm.round_rows)?;
+        Ok(out)
+    }
+}
+
+/// The devices. There is no CPU fallback on purpose: a run that cannot reach a
+/// GPU is two orders of magnitude off and should say so rather than crawl.
+fn backend_for(_devices: &[usize], _value: crate::net::Net) -> PyResult<Backend> {
+    #[cfg(feature = "gpu")]
+    {
+        return crate::cuda::Device::new(_devices, _value)
+            .map(Backend::Cuda)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err);
+    }
+    #[cfg(not(feature = "gpu"))]
+    Err(pyo3::exceptions::PyRuntimeError::new_err(
+        "built without the `gpu` feature: there is no CPU inference path",
+    ))
+}
+
 /// Run `games` self-play games across all cores and return the training data.
 /// `mode` is "greedy" (Monte-Carlo warm start) or "rebel".
 #[pyfunction]
-#[pyo3(signature = (games, seed, mode, depth=1, iters=16, explore=0.25, temp=2.0, random_draft=true, eval_mix=0.5, mc_mix=0.0, cfr="linear"))]
+#[pyo3(signature = (games, seed, mode, nodes=1024, expand=1, iters=64, explore=0.25, temp=2.0, random_draft=true, eval_mix=0.5, mc_mix=0.0, cfr="linear"))]
 #[allow(clippy::too_many_arguments)]
 fn gen_data(
     py: Python<'_>,
     games: usize,
     seed: u64,
     mode: &str,
-    depth: usize,
+    nodes: usize,
+    expand: usize,
     iters: usize,
     explore: f32,
     temp: f32,
@@ -876,9 +748,9 @@ fn gen_data(
     cfr: &str,
 ) -> PyResult<PyObject> {
     let cfg = Cfg {
-        depth,
+        nodes,
+        expand,
         iters,
-        snapshots: true,
         cfr: cfr_of(cfr)?,
         // The tree-size tail is fat (broad random-draft beliefs at round
         // boundaries); an unbounded build hangs a worker for minutes on one
@@ -903,11 +775,13 @@ fn gen_data(
         random_draft,
         eval_mix,
         mc_mix,
+        // The warm start and the batch generator take a row at every decision
+        // already; the query solver belongs to the streaming generator.
+        query_rate: 0.0,
+        recursive_rate: 0.0,
     };
-    let d = py.allow_threads(|| {
-        let n = nets().read();
-        run_games(games, seed, &n, &gc)
-    });
+    let n = Arc::clone(&nets().read());
+    let d = py.allow_threads(|| run_games(games, seed, &n, &gc));
     data_to_dict(py, d)
 }
 
@@ -925,17 +799,11 @@ fn save_roots(
         agents: [
             Agent::Rebel {
                 cfg: Cfg {
-                    depth: 2,
-                    iters: 64,
-                    snapshots: false,
                     ..Default::default()
                 },
             },
             Agent::Rebel {
                 cfg: Cfg {
-                    depth: 2,
-                    iters: 64,
-                    snapshots: false,
                     ..Default::default()
                 },
             },
@@ -945,11 +813,13 @@ fn save_roots(
         random_draft,
         eval_mix: 0.0,
         mc_mix: 0.0,
+        // The roots this tool wants *are* the queries.
+        query_rate: 1.0,
+        recursive_rate: 0.0,
     };
-    let roots = py.allow_threads(|| {
-        let n = nets().read();
-        crate::selfplay::collect_roots(games, seed, &n, &gc, cap)
-    });
+    let n = Arc::clone(&nets().read());
+    let roots =
+        py.allow_threads(|| crate::selfplay::collect_roots(games, seed, &n, &gc, cap));
     let f = std::fs::File::create(path)
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
     let mut w = std::io::BufWriter::new(f);
@@ -958,9 +828,8 @@ fn save_roots(
     Ok(roots.len())
 }
 
-/// Print the generation loop's phase timers. Empty unless the extension was
-/// built with the `prof` feature; the host side of a GPU run is otherwise
-/// invisible, and it is the part that has to fit in the CPU budget.
+/// Print generation phase timers. Empty unless the extension was built with
+/// the `prof` feature.
 #[pyfunction]
 fn prof_dump() {
     eprintln!(
@@ -968,7 +837,6 @@ fn prof_dump() {
         std::mem::size_of::<crate::search::TNode>(),
         std::mem::size_of::<crate::State>(),
     );
-    crate::prof::dump_shape();
     crate::prof::dump();
 }
 
@@ -1043,9 +911,7 @@ fn hex_neighbours() -> Vec<u8> {
     crate::board::neighbour_gather()
 }
 
-/// The `N_LOCATIONS` location hex indices, in the order the auxiliary
-/// ownership head's outputs are laid out — and the order of every row's `aux`
-/// bytes.
+/// The control-location hex indices used by the public feature encoder.
 #[pyfunction]
 fn location_hexes() -> Vec<u8> {
     board().location_hexes.to_vec()
@@ -1163,6 +1029,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(card_features_table, m)?)?;
     m.add_function(wrap_pyfunction!(hex_location_flags, m)?)?;
     m.add_class::<Game>()?;
+    m.add_class::<SolveFarm>()?;
     m.add_class::<crate::arena::PyTable>()?;
     m.add("MAX_MAIN_PLAYS", crate::state::MAX_MAIN_PLAYS)?;
     m.add("PUBFEAT", crate::rebel::PUBFEAT)?;
@@ -1214,14 +1081,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(prof_dump, m)?)?;
     m.add_function(wrap_pyfunction!(save_roots, m)?)?;
     m.add_function(wrap_pyfunction!(gen_data, m)?)?;
-    #[cfg(feature = "gpu")]
-    {
-        m.add_class::<GpuGenerator>()?;
-        m.add_function(wrap_pyfunction!(gpu_start, m)?)?;
-        m.add_function(wrap_pyfunction!(gpu_set_weights, m)?)?;
-        m.add_function(wrap_pyfunction!(gpu_stop, m)?)?;
-        m.add_function(wrap_pyfunction!(gpu_stream_start, m)?)?;
-    }
-    m.add_function(wrap_pyfunction!(infer, m)?)?;
+        m.add_function(wrap_pyfunction!(infer, m)?)?;
     Ok(())
 }

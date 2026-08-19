@@ -13,8 +13,8 @@ Applied to the second canonical view of every row rather than stored, so the
 replay buffer does not double. The transform permutes the frozen row fields
 (`warchest.ROW_*` byte slices) directly; the network input is expanded from
 the mirrored row afterwards, so the encoder itself never has to know about the
-mirror. The board trunk and its ownership head run in physical seat-0 space,
-so only the config side of a query needs the mirrored row.
+mirror. The board trunk runs in physical seat-0 space, so only the config side
+of a query needs the mirrored row.
 
 Correctness
 -----------

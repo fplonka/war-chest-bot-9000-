@@ -11,8 +11,6 @@ A dump holds, oldest row first:
 
     rows  [rows, ROW_BYTES] the packed frozen row format (see `rebel::ROW_*`);
                            the network input is expanded from these
-    aux   [rows, N_LOCATIONS] who owned each location when the row's game
-                           ended: 0 player 0, 1 player 1, 2 neither
     cc    [configs, CCOUNTS] hand, face-down and bag counts, per config
     cp    [configs]         which player the config belongs to
     cw    [configs]         its belief probability
@@ -37,7 +35,7 @@ import warchest
 class Dump:
     def __init__(self, path):
         d = np.load(path)
-        self.x, self.aux = d["rows"], d["aux"]
+        self.x = d["rows"]
         self.cc, self.cp = d["cc"], d["cp"]
         self.cw, self.cy, self.seg = d["cw"], d["cy"], d["seg"]
         self.soff = np.asarray(d.get("soff", [0, len(self.x)]), np.int64)
@@ -57,7 +55,7 @@ class Dump:
     def rows(self, lo, hi):
         """Rows `[lo, hi)` as a self-contained batch, `seg` renumbered from 0."""
         a, b = int(self.row_start[lo]), int(self.row_start[hi])
-        return (self.x[lo:hi], self.aux[lo:hi], self.cc[a:b], self.cp[a:b],
+        return (self.x[lo:hi], self.cc[a:b], self.cp[a:b],
                 self.cw[a:b].astype(np.float32), self.cy[a:b].astype(np.float32),
                 self.seg[a:b] - 2 * lo)
 
@@ -90,11 +88,11 @@ class Dump:
 
 def subset(parts, ids):
     """Pick a set of rows out of an assembled batch, renumbering `seg`."""
-    rows, aux, cc, cp, cw, cy, seg = parts
+    rows, cc, cp, cw, cy, seg = parts
     row = seg // 2
     keep = np.isin(row, ids)
     # `ids` must be sorted for the renumbering below to stay in row order.
     newid = np.full(len(rows), -1, np.int64)
     newid[ids] = np.arange(len(ids))
-    return (rows[ids], aux[ids], cc[keep], cp[keep], cw[keep], cy[keep],
+    return (rows[ids], cc[keep], cp[keep], cw[keep], cy[keep],
             2 * newid[row[keep]] + (seg[keep] & 1))

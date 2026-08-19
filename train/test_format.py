@@ -19,7 +19,6 @@ import numpy as np
 import torch
 
 import warchest
-import config
 import mirror
 from value_net import Net
 from train import Buffer, forward_values, losses, make_batch
@@ -30,16 +29,14 @@ CFEAT = warchest.CFEAT
 CCOUNTS = warchest.CCOUNTS
 CNORM = warchest.CNORM
 ROW_BYTES = warchest.ROW_BYTES
-N_LOCATIONS = warchest.N_LOCATIONS
-AUX_WEIGHT = config.BASELINE.aux_weight
 
 
 @torch.no_grad()
 def evaluate(net, parts, rng, dev):
     batch = make_batch(parts, rng, dev)
-    value, aux, _ = losses(net, *batch)
+    value = losses(net, *batch)
     rms = torch.sqrt(torch.mean((forward_values(net, batch) - batch[4]) ** 2))
-    return float(value + AUX_WEIGHT * aux), float(rms)
+    return float(value), float(rms)
 
 
 def main():
@@ -55,8 +52,8 @@ def main():
     net.push()
 
     print("[1/6] generating rows (random drafts, WP included)", flush=True)
-    d = warchest.gen_data(1, 7, "rebel", depth=1, iters=8, explore=0.25,
-                          random_draft=True)
+    d = warchest.gen_data(1, 7, "rebel", nodes=1024, expand=1, iters=8,
+                          explore=0.25, random_draft=True)
     n = len(d["rows"]) // ROW_BYTES
     assert n > 200, f"expected a few hundred rows, got {n}"
     print(f"      {n} rows, {len(d['cc']) // CCOUNTS} configs, "
@@ -65,26 +62,24 @@ def main():
     print("[2/6] dumping through the real Buffer path", flush=True)
     buf = Buffer(200_000, 200_000 * 48)
     rows = np.asarray(d["rows"], np.uint8).reshape(-1, ROW_BYTES)
-    aux = np.asarray(d["aux"], np.uint8).reshape(-1, N_LOCATIONS)
     cc = np.asarray(d["cc"], np.uint8).reshape(-1, CCOUNTS)
     cw = np.asarray(d["cw"], np.float32)
     cy = np.clip(np.asarray(d["cy"], np.float32), -1.0, 1.0)
     coff = np.asarray(d["coff"], np.int64)
     soff = np.asarray(d["soff"], np.int64)
-    buf.add(rows, aux, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
+    buf.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
     tiny = Buffer(max(n * 2, 8), max(n * 2, 8) * 48)
     for _ in range(8):
-        tiny.add(rows, aux, cc, cw.astype(np.float16), cy.astype(np.float16),
-                 coff, soff)
+        tiny.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
     assert tiny.soff.size < tiny.rows, (tiny.soff.size, tiny.rows)
     tiny.clear()
     assert tiny.soff.size == 0
     dump_path = f"{out}/buffer.npz"
-    got, gaux, gcc, gcp, gcw, gcy, gseg = buf.ordered()
+    got, gcc, gcp, gcw, gcy, gseg = buf.ordered()
     lo = buf.lo
     gsoff = np.concatenate([[0], buf.soff[(buf.soff > lo) & (buf.soff < buf.rows)] - lo,
                             [len(got)]])
-    np.savez(dump_path, rows=got, aux=gaux, cc=gcc, cp=gcp, cw=gcw, cy=gcy, seg=gseg,
+    np.savez(dump_path, rows=got, cc=gcc, cp=gcp, cw=gcw, cy=gcy, seg=gseg,
              soff=gsoff, pubfeat=np.int32(PUBFEAT), cfeat=np.int32(CFEAT),
              ccounts=np.int32(CCOUNTS), cnorm=np.float32(CNORM),
              row_bytes=np.int32(ROW_BYTES), version=np.int32(warchest.ROW_FORMAT_VERSION),
@@ -104,33 +99,29 @@ def main():
     te = dmp.rows(split, len(dmp))
     rng = np.random.default_rng(0)
     b = make_batch(tr, rng, dev)
-    xpub, phi, w, seg, y, owner, nseg = b
+    xpub, phi, w, seg, y, nseg = b
     assert xpub.shape == (2 * len(tr[0]), PUBFEAT), xpub.shape
-    assert owner.shape == (len(tr[0]), N_LOCATIONS), owner.shape
-    assert (owner < 3).all(), "the auxiliary target is not a three-way label"
     assert phi.shape[1] == CFEAT
     assert seg.max() == 2 * len(tr[0]) - 1
     assert nseg == 2 * len(tr[0])
     assert torch.isfinite(xpub).all() and torch.isfinite(y).all()
-    trows, tcc, tcp = tr[0], tr[2], tr[3]
+    trows, tcc, tcp = tr[0], tr[1], tr[2]
     mirror.self_check_rows(trows, tcc, tcp, tr[-1])
     mirror.self_check(xpub[0::2].numpy())
-    print(f"      batch {xpub.shape} aux {owner.shape} phi {phi.shape}", flush=True)
+    print(f"      batch {xpub.shape} phi {phi.shape}", flush=True)
 
     print("[5/6] ten offline training steps", flush=True)
     opt = torch.optim.Adam(net.parameters(), lr=1e-3)
     seen = []
     for _ in range(10):
         parts = make_batch(tr, rng, dev)
-        value, aux_ce, aux_acc = losses(net, *parts)
-        loss = value + AUX_WEIGHT * aux_ce
+        value = losses(net, *parts)
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        value.backward()
         opt.step()
-        seen.append((float(value.detach()), float(aux_ce.detach()), float(aux_acc)))
-    assert all(np.isfinite(x) for row in seen for x in row), seen
-    print("      value/aux/acc: "
-          + " ".join(f"{v:.3f}/{a:.3f}/{q:.2f}" for v, a, q in seen), flush=True)
+        seen.append(float(value.detach()))
+    assert all(np.isfinite(x) for x in seen), seen
+    print("      value: " + " ".join(f"{v:.3f}" for v in seen), flush=True)
 
     print("[6/6] validation loss on the held-out solve block", flush=True)
     hl, hrms = evaluate(net, te, rng, dev)

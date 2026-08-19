@@ -1,5 +1,4 @@
-//! Throughput probe (run with `-- --ignored --nocapture`): ReBeL generation
-//! games/s at depth 2 with the trajectory walk.
+//! GT-CFR generation throughput probe (run with `-- --ignored --nocapture`).
 use std::time::Instant;
 use warchest::rng::Rng;
 use warchest::search::{Cfg, Nets};
@@ -11,9 +10,8 @@ fn throughput_probe() {
     for iters in [16usize, 8] {
         let nets = Nets::default();
         let cfg = Cfg {
-            depth: 2,
+            nodes: 200_000,
             iters,
-            snapshots: false,
             ..Default::default()
         };
         let n = 8;
@@ -21,7 +19,7 @@ fn throughput_probe() {
         let mut games = 0u64;
         let mut decisions = 0u64;
         for seed in 0..n {
-            let mut rng = Rng::new(seed * 31 + 5);
+            let rng = Rng::new(seed * 31 + 5);
             let mut d = Data::default();
             let gc = GameCfg {
                 agents: [Agent::Rebel { cfg }, Agent::Rebel { cfg }],
@@ -30,6 +28,8 @@ fn throughput_probe() {
                 random_draft: false,
                 eval_mix: 0.0,
                 mc_mix: 0.0,
+                query_rate: 0.0,
+                recursive_rate: 0.0,
             };
             play_game(rng, &nets, &gc, &mut d, None);
             games += 1;
@@ -37,7 +37,7 @@ fn throughput_probe() {
         }
         let secs = t0.elapsed().as_secs_f64();
         eprintln!(
-            "depth2 iters={} walk: {:.2} games/s, {:.0} decisions/s ({} games, {:.2}s)",
+            "GT-CFR iters={}: {:.2} games/s, {:.0} decisions/s ({} games, {:.2}s)",
             iters,
             games as f64 / secs,
             decisions as f64 / secs,
@@ -49,15 +49,14 @@ fn throughput_probe() {
     {
         let nets = Nets::default();
         let cfg = Cfg {
-            depth: 2,
+            nodes: 200_000,
             iters: 16,
-            snapshots: false,
             ..Default::default()
         };
         let t0 = Instant::now();
         let mut games = 0u64;
         for seed in 0..16u64 {
-            let mut rng = Rng::new(seed * 31 + 5);
+            let rng = Rng::new(seed * 31 + 5);
             let mut d = Data::default();
             let gc = GameCfg {
                 agents: [Agent::Rebel { cfg }, Agent::Rebel { cfg }],
@@ -66,11 +65,13 @@ fn throughput_probe() {
                 random_draft: false,
                 eval_mix: 0.0,
                 mc_mix: 0.0,
+                query_rate: 0.0,
+                recursive_rate: 0.0,
             };
             play_game(rng, &nets, &gc, &mut d, None);
             games += 1;
         }
         let secs = t0.elapsed().as_secs_f64();
-        eprintln!("depth2 iters=16 walk: {:.2} games/s", games as f64 / secs);
+        eprintln!("GT-CFR iters=16: {:.2} games/s", games as f64 / secs);
     }
 }

@@ -36,7 +36,9 @@ use warchest::search::{Cfg, Nets, Solver};
 use warchest::selfplay::{eval_static, make_game};
 use warchest::state::{Cont, State, Z_HAND};
 
-const DEPTHS: [usize; 4] = [1, 2, 3, 4];
+/// Node budgets to sweep. The old sweep was over depth limits; a grown tree
+/// has no depth to sweep, so the axis is the budget it grows to.
+const BUDGETS: [usize; 4] = [64, 256, 1024, 4096];
 
 /// One-ply greedy on the public evaluation, to reach realistic mid-game
 /// positions. Chance nodes resolve uniformly over the listed draws.
@@ -119,8 +121,7 @@ fn main() {
     nets.value = Net::load_bin(&path).expect("weights file");
     warchest::state::set_cap_marker_value(0.0);
     println!(
-        "dims {:?}, T={iters}, positions from {} play, sampled {}-{} plies in",
-        nets.value.dims,
+        "T={iters}, positions from {} play, sampled {}-{} plies in",
         if greedy { "greedy" } else { "random" },
         skip,
         skip + 60
@@ -128,10 +129,10 @@ fn main() {
 
     // Per depth: value residual (all positions / only those spanning a draw),
     // and the count in each bucket.
-    let mut vres = [0.0f64; DEPTHS.len()];
-    let mut vres_draw = [0.0f64; DEPTHS.len()];
-    let mut n_all = [0usize; DEPTHS.len()];
-    let mut n_draw = [0usize; DEPTHS.len()];
+    let mut vres = [0.0f64; BUDGETS.len()];
+    let mut vres_draw = [0.0f64; BUDGETS.len()];
+    let mut n_all = [0usize; BUDGETS.len()];
+    let mut n_draw = [0usize; BUDGETS.len()];
     // Value scale, to read the residual against.
     let (mut ref_sum, mut ref_sq, mut ref_n) = (0.0f64, 0.0f64, 0usize);
     // The information at stake: bag composition spread within a hand group.
@@ -204,9 +205,8 @@ fn main() {
         // function that held everywhere except at a round-start draw.
         {
             let cfg = Cfg {
-                depth: 2,
+            nodes: 200_000,
                 iters,
-                snapshots: true,
                 ..Default::default()
             };
             let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
@@ -234,17 +234,16 @@ fn main() {
             pol_worst = pol_worst.max(worst);
         }
 
-        // ---- value residual at each depth.
-        for (di, &d) in DEPTHS.iter().enumerate() {
+        // ---- value residual at each node budget.
+        for (di, &d) in BUDGETS.iter().enumerate() {
             let cfg = Cfg {
-                depth: d,
+                nodes: d,
                 iters,
-                snapshots: true,
                 ..Default::default()
             };
             let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
-            sv.multistep(iters);
-            let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
+            sv.solve(&mut rng);
+            let vals = vec![sv.root_values()];
             for p in 0..2 {
                 let v = &vals[0][p];
                 let (r, _) = within_hand(&bel[p].cfg, &bel[p].p, v);
@@ -313,7 +312,7 @@ fn main() {
         "{:>6}  {:>14}  {:>16}  {:>10}",
         "depth", "all positions", "spans a draw", "n(draw)"
     );
-    for (di, d) in DEPTHS.iter().enumerate() {
+    for (di, d) in BUDGETS.iter().enumerate() {
         let all = vres[di] / n_all[di].max(1) as f64;
         let dr = vres_draw[di] / n_draw[di].max(1) as f64;
         println!("{d:>6}  {all:>14.5}  {dr:>16.5}  {:>10}", n_draw[di]);

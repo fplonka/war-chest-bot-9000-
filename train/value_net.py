@@ -2,21 +2,18 @@
 
 Shape, and why it is this shape
 -------------------------------
-CFR re-asks every leaf of the subgame on every iteration, so the network is
-called in two very different regimes:
+Growing-tree CFR calls the network in two different regimes:
 
-* once per leaf per solve — the public state does not move inside a solve;
-* once per leaf **per CFR iteration** — the beliefs do (78 times at T=64).
+* once when a public leaf is created — that physical state never changes;
+* once per traversal — the beliefs and queried player do.
 
-At depth two that is ~2,030 rows against ~158,000 row-passes. So the capacity
-goes where it is amortised (the board trunk) and the belief-conditioned path
-stays thin. This is the same split DeepStack and ReBeL get for free: their
-tower runs once per public leaf and emits every infoset value as one row of
-the output matrix. We cannot table those rows — the config set is variable
-(median 22, p99 567) — so we *generate* them from a config encoder and read
-out with a dot product.
+The solver therefore caches the board trunk and every config encoding for the
+life of the tree. Capacity goes in that amortised path; the repeated
+belief-conditioned join stays thin. This is the same split DeepStack and ReBeL
+get from a public-state tower. War Chest's config set is variable, so the
+network generates one readout row per config instead of using a fixed table.
 
-    physical state ─► TRUNK (8 hex residual blocks, global pooling) ─► P
+    physical state ─► TRUNK (hex residual blocks, global pooling) ─► P
                                                                     │  once/leaf
     config c ─────► CONFIG ENCODER ─► f(c) [readout] , g(c) [pool]  │  once/config
                                                                     ▼
@@ -25,8 +22,7 @@ out with a dot product.
                                         v(c) = <f(c), h> + b  ──────┘
 
 The trunk is a KataGo-shaped pre-activation ResNet over the 37 hexes with the
-board's own adjacency, plus a global-pooling bias in every block, plus a
-per-hex auxiliary head predicting who owns each location when the game ends.
+board's own adjacency, plus a global-pooling bias in every block.
 
 Everything that indexes a coin type is permutation-equivariant over the slots:
 the ten types are a *set* of tokens described by their printed card facts, so
@@ -53,7 +49,6 @@ OFF_PILES = warchest.OFF_PILES
 OFF_CARDS = warchest.OFF_CARDS
 OFF_LOOSE = warchest.OFF_LOOSE
 LOOSE = warchest.LOOSE
-N_LOCATIONS = warchest.N_LOCATIONS
 
 TYPE = 64      # coin-type token width
 C = 96         # hex channel width
@@ -63,10 +58,8 @@ POOL = 64      # pooled config embedding width
 CFGH = 128     # config encoder hidden width
 JW = 128       # join width
 JBLOCKS = 3    # join residual blocks
-AUX = 3        # final owner of a location: us / them / neither
 
 JOIN_IN = 2 * POOL + 1  # both beliefs and the queried physical seat
-MODEL_TAG = [5]
 
 
 def gelu(x):
@@ -99,7 +92,6 @@ class Net(nn.Module):
         self.ln_trunk = nn.LayerNorm(C)
 
         self.board_out = nn.Linear(2 * C + LOOSE, D)
-        self.aux = nn.Linear(C, AUX)          # training only; never exported
 
         # -- config encoder --
         # Two paths into the pooling vector. The nonlinear one binds a slot's
@@ -131,14 +123,8 @@ class Net(nn.Module):
 
         nb = torch.as_tensor(warchest.hex_neighbours(), dtype=torch.long)
         self.register_buffer("nb", nb.view(N_HEXES, 6), persistent=False)
-        loc = torch.as_tensor(warchest.location_hexes(), dtype=torch.long)
-        self.register_buffer("loc", loc, persistent=False)
         self.register_buffer("seat_of", torch.arange(NTYPE) // NSLOT,
                              persistent=False)
-
-    @property
-    def dims(self):
-        return MODEL_TAG
 
     # ---------------------------------------------------------------- pieces
 
@@ -175,11 +161,10 @@ class Net(nn.Module):
         return gelu(self.ln_trunk(x))
 
     def board(self, xpub, tokens):
-        """One physical board vector and the per-hex auxiliary logits."""
+        """One physical board vector."""
         x = self.trunk(xpub, tokens)
         loose = xpub[:, OFF_LOOSE:OFF_LOOSE + LOOSE]
-        p = self.board_out(torch.cat([x.mean(1), x.amax(1), loose], -1))
-        return p, self.aux(x[:, self.loc])
+        return self.board_out(torch.cat([x.mean(1), x.amax(1), loose], -1))
 
     def configs(self, phi, own, seg):
         """Readout vector `f(c)` and pooling vector `g(c)` for each config.
@@ -207,14 +192,14 @@ class Net(nn.Module):
     # --------------------------------------------------------------- forward
 
     def forward(self, xpub, phi, weight, seg, nseg):
-        """Values for paired physical-state queries, and physical aux logits.
+        """Values for paired physical-state queries.
 
         Query ``q`` owns configs with ``seg == q``. Queries ``q`` and ``q ^ 1``
         share one physical board trunk and differ by belief order and seat.
         """
         cards = self.cards(xpub)
         physical = xpub[0::2]
-        p, aux = self.board(physical, self.tokens(physical, cards[0::2]))
+        p = self.board(physical, self.tokens(physical, cards[0::2]))
 
         f, g = self.configs(phi, cards[:, :NSLOT], seg)
         pooled = p.new_zeros(nseg, POOL)
@@ -224,16 +209,15 @@ class Net(nn.Module):
         pair = torch.cat([pooled, pooled[other]], -1)
         seat = p.new_tensor([-1.0, 1.0]).repeat(p.shape[0]).unsqueeze(1)
         h = self.join(p.repeat_interleave(2, 0), pair, seat)
-        return (f * h[seg]).sum(1) + self.value_bias, aux
+        return (f * h[seg]).sum(1) + self.value_bias
 
     # ------------------------------------------------------------ weight blob
 
     def flat(self):
-        """The fixed v5 blob read by Rust and CUDA.
+        """The fixed v11 blob read by Rust.
 
         Order is the contract. Linear matrices are stored ``[in, out]``
-        row-major, embeddings ``[n, width]``. The auxiliary head is
-        training-only and is deliberately absent: the engine never runs it.
+        row-major, embeddings ``[n, width]``.
         """
         blocks = [m for i in range(BLOCKS)
                   for m in (self.blk1[i], self.blkg[i], self.blk2[i])]
@@ -262,4 +246,4 @@ class Net(nn.Module):
         return f(w), f(b), f(ln)
 
     def push(self):
-        warchest.set_weights(self.dims, *self.flat())
+        warchest.set_weights(*self.flat())

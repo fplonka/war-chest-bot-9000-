@@ -18,6 +18,7 @@ use crate::rebel::{
     PUBFEAT,
 };
 use crate::units::CARD_FEATS;
+use std::cell::RefCell;
 
 /// Coin-type token width.
 pub const TYPE: usize = 64;
@@ -37,8 +38,6 @@ pub const JW: usize = 128;
 pub const JBLOCKS: usize = 3;
 /// Both pooled beliefs and the queried physical seat.
 pub const JOIN_IN: usize = 2 * POOL + 1;
-/// The model format tag `NetLayout` accepts.
-pub const MODEL_TAG: [usize; 1] = [5];
 
 #[cfg(target_vendor = "apple")]
 #[link(name = "Accelerate", kind = "framework")]
@@ -101,21 +100,20 @@ pub fn gemm(
     }
     #[cfg(not(target_vendor = "apple"))]
     {
-        for i in 0..m {
-            let row = &mut c[i * ldc..i * ldc + n];
+        for row in 0..m {
+            let out = &mut c[row * ldc..row * ldc + n];
             if beta == 0.0 {
-                row.fill(0.0);
+                out.fill(0.0);
             } else if beta != 1.0 {
-                row.iter_mut().for_each(|x| *x *= beta);
+                out.iter_mut().for_each(|value| *value *= beta);
             }
-            for p in 0..k {
-                let av = a[i * lda + p];
-                if av == 0.0 {
-                    continue;
-                }
-                let brow = &b[p * ldb..p * ldb + n];
-                for (o, &bv) in row.iter_mut().zip(brow) {
-                    *o += av * bv;
+            let input = &a[row * lda..row * lda + k];
+            for (&value, weights) in input
+                .iter()
+                .zip(b.chunks_exact(ldb))
+            {
+                for (dst, &weight) in out.iter_mut().zip(&weights[..n]) {
+                    *dst = value.mul_add(weight, *dst);
                 }
             }
         }
@@ -128,8 +126,6 @@ pub fn gelu(x: f32) -> f32 {
     0.5 * x * (1.0 + inner.tanh())
 }
 
-/// Batched GELU. Scalar `tanhf` consumed 90% of the M1 inference profile;
-/// vForce evaluates bounded chunks without making model-sized scratch copies.
 fn gelu_all(x: &mut [f32], arg: &mut Vec<f32>, th: &mut Vec<f32>) {
     #[cfg(target_vendor = "apple")]
     {
@@ -150,6 +146,22 @@ fn gelu_all(x: &mut [f32], arg: &mut Vec<f32>, th: &mut Vec<f32>) {
     }
     #[cfg(not(target_vendor = "apple"))]
     x.iter_mut().for_each(|v| *v = gelu(*v));
+}
+thread_local! {
+    static SCRATCH: RefCell<Vec<Vec<f32>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn scratch(n: usize) -> Vec<f32> {
+    let mut out = SCRATCH.with(|pool| pool.borrow_mut().pop().unwrap_or_default());
+    out.resize(n, 0.0);
+    out[..n].fill(0.0);
+    out.truncate(n);
+    out
+}
+
+fn recycle(mut value: Vec<f32>) {
+    value.clear();
+    SCRATCH.with(|pool| pool.borrow_mut().push(value));
 }
 
 pub fn fit(v: &mut Vec<f32>, n: usize) {
@@ -177,6 +189,14 @@ pub struct Span {
     pub b: usize,
     pub i: usize,
     pub o: usize,
+}
+
+/// One LayerNorm: where its scale and shift live, and how wide it is.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NormSpan {
+    pub g: usize,
+    pub b: usize,
+    pub width: usize,
 }
 
 /// One trunk block: the neighbour mix, the global-pooling bias, the output.
@@ -209,8 +229,8 @@ pub struct NetLayout {
     pub join_w: [Span; JBLOCKS],
     pub join_out: Span,
     pub value_bias: usize,
-    /// `(gamma, beta)` offsets, in the order the norms are applied.
-    pub norms: Vec<(usize, usize)>,
+    /// The norms in the order they are applied; `LN_*` index into this.
+    pub norms: Vec<NormSpan>,
     pub w_len: usize,
     pub b_len: usize,
     pub ln_len: usize,
@@ -258,12 +278,7 @@ impl Cursor {
 }
 
 impl NetLayout {
-    pub fn new(dims: &[usize]) -> Result<Self, String> {
-        if dims != MODEL_TAG {
-            return Err(format!(
-                "unsupported model format {dims:?}; expected {MODEL_TAG:?}"
-            ));
-        }
+    pub fn new() -> Self {
         let mut c = Cursor::default();
         let card = [c.lin(CARD_FEATS, TYPE, true), c.lin(TYPE, TYPE, true)];
         let pile = c.lin(PILE_COUNTS, TYPE, false);
@@ -291,12 +306,16 @@ impl NetLayout {
         let norms = norm_widths()
             .into_iter()
             .map(|width| {
-                let pair = (c.ln, c.ln + width);
+                let s = NormSpan {
+                    g: c.ln,
+                    b: c.ln + width,
+                    width,
+                };
                 c.ln += 2 * width;
-                pair
+                s
             })
             .collect();
-        Ok(Self {
+        Self {
             card,
             pile,
             seat,
@@ -319,7 +338,7 @@ impl NetLayout {
             w_len: c.w,
             b_len: c.b,
             ln_len: c.ln,
-        })
+        }
     }
 }
 
@@ -405,9 +424,19 @@ impl Norm {
     }
 }
 
+/// The weights exactly as they arrived, for a backend that indexes them with
+/// `NetLayout` instead of unpacking them into layers. Shared, so cloning a
+/// `Net` — which happens on every publish — does not copy them.
+#[derive(Default)]
+pub struct Flat {
+    pub w: Vec<f32>,
+    pub b: Vec<f32>,
+    pub ln: Vec<f32>,
+}
+
 #[derive(Clone, Default)]
 pub struct Net {
-    pub dims: Vec<usize>,
+    flat: std::sync::Arc<Flat>,
     card: [Lin; 2],
     pile: Lin,
     seat: Vec<f32>,
@@ -428,23 +457,22 @@ pub struct Net {
     value_bias: f32,
     norms: Vec<Norm>,
 }
-
 /// Index of the LayerNorm applied after a trunk block's first / second stage.
-const fn ln_block(i: usize, half: usize) -> usize {
+pub const fn ln_block(i: usize, half: usize) -> usize {
     2 * i + half
 }
-const LN_TRUNK: usize = 2 * BLOCKS;
-const LN_CFG: usize = LN_TRUNK + 1;
-const LN_JOIN: usize = LN_CFG + 1;
-const LN_JOUT: usize = LN_JOIN + JBLOCKS;
-const LN_H: usize = LN_JOUT + 1;
+pub const LN_TRUNK: usize = 2 * BLOCKS;
+pub const LN_CFG: usize = LN_TRUNK + 1;
+pub const LN_JOIN: usize = LN_CFG + 1;
+pub const LN_JOUT: usize = LN_JOIN + JBLOCKS;
+pub const LN_H: usize = LN_JOUT + 1;
 
 impl Net {
-    pub fn from_flat(dims: &[usize], w: &[f32], b: &[f32], ln: &[f32]) -> Result<Self, String> {
-        let l = NetLayout::new(dims)?;
+    pub fn from_flat(w: &[f32], b: &[f32], ln: &[f32]) -> Result<Self, String> {
+        let l = NetLayout::new();
         if (w.len(), b.len(), ln.len()) != (l.w_len, l.b_len, l.ln_len) {
             return Err(format!(
-                "weight sizes {}/{}/{} do not match v5 {}/{}/{}",
+                "weight sizes {}/{}/{} do not match the network's {}/{}/{}",
                 w.len(),
                 b.len(),
                 ln.len(),
@@ -466,14 +494,17 @@ impl Net {
         let norms = l
             .norms
             .iter()
-            .zip(norm_widths())
-            .map(|(&(g, bt), width)| Norm {
-                g: ln[g..g + width].to_vec(),
-                b: ln[bt..bt + width].to_vec(),
+            .map(|s| Norm {
+                g: ln[s.g..s.g + s.width].to_vec(),
+                b: ln[s.b..s.b + s.width].to_vec(),
             })
             .collect();
         Ok(Self {
-            dims: dims.to_vec(),
+            flat: std::sync::Arc::new(Flat {
+                w: w.to_vec(),
+                b: b.to_vec(),
+                ln: ln.to_vec(),
+            }),
             card: l.card.map(layer),
             pile: layer(l.pile),
             seat: w[l.seat..l.seat + 2 * TYPE].to_vec(),
@@ -506,7 +537,7 @@ impl Net {
 
     pub fn load_flat_bin(
         path: &str,
-    ) -> std::io::Result<(Vec<usize>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+    ) -> std::io::Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         let raw = std::fs::read(path)?;
         let mut at = 0;
         let u32_at = |at: &mut usize| {
@@ -514,8 +545,6 @@ impl Net {
             *at += 4;
             v
         };
-        let nd = u32_at(&mut at);
-        let dims = (0..nd).map(|_| u32_at(&mut at)).collect();
         let mut floats = || {
             let n = u32_at(&mut at);
             let out = (0..n)
@@ -524,17 +553,24 @@ impl Net {
             at += 4 * n;
             out
         };
-        Ok((dims, floats(), floats(), floats()))
+        Ok((floats(), floats(), floats()))
     }
 
     pub fn load_bin(path: &str) -> std::io::Result<Self> {
-        let (dims, w, b, ln) = Self::load_flat_bin(path)?;
-        Self::from_flat(&dims, &w, &b, &ln)
+        let (w, b, ln) = Self::load_flat_bin(path)?;
+        Self::from_flat(&w, &b, &ln)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
+    /// A default-constructed `Net` has no weights, and every caller treats
+    /// that as "no value function yet".
     pub fn is_empty(&self) -> bool {
-        self.dims.is_empty()
+        self.board_out.w.is_empty()
+    }
+
+    /// The weights as they arrived, for the device backend.
+    pub fn flat(&self) -> &Flat {
+        &self.flat
     }
 
     // ---------------------------------------------------------------- pieces
@@ -542,27 +578,31 @@ impl Net {
     /// `[rows, NTYPE, TYPE]` printed-card tokens. Fixed for a whole solve, so
     /// the solver runs this on the two canonical views only.
     pub fn cards(&self, xpub: &[f32], rows: usize, out: &mut Vec<f32>) {
-        let mut facts = vec![0.0; rows * NTYPE * CARD_FEATS];
+        let mut facts = scratch(rows * NTYPE * CARD_FEATS);
         for r in 0..rows {
             let src = &xpub[r * PUBFEAT + OFF_CARDS..r * PUBFEAT + OFF_CARDS + NTYPE * CARD_FEATS];
             facts[r * NTYPE * CARD_FEATS..(r + 1) * NTYPE * CARD_FEATS].copy_from_slice(src);
         }
-        let mut hidden = Vec::new();
+        let mut hidden = scratch(0);
         self.card[0].run(&facts, rows * NTYPE, &mut hidden);
-        let (mut arg, mut th) = (Vec::new(), Vec::new());
+        let (mut arg, mut th) = (scratch(0), scratch(0));
         gelu_all(&mut hidden[..rows * NTYPE * TYPE], &mut arg, &mut th);
         self.card[1].run(&hidden, rows * NTYPE, out);
+        recycle(facts);
+        recycle(hidden);
+        recycle(arg);
+        recycle(th);
     }
 
     /// Card tokens plus this row's pile counts and the owner's seat.
     fn tokens(&self, xpub: &[f32], cards: &[f32], rows: usize, card_rows: usize) -> Vec<f32> {
-        let mut piles = vec![0.0; rows * NTYPE * PILE_COUNTS];
+        let mut piles = scratch(rows * NTYPE * PILE_COUNTS);
         let n = NTYPE * PILE_COUNTS;
         for r in 0..rows {
             piles[r * n..(r + 1) * n]
                 .copy_from_slice(&xpub[r * PUBFEAT + OFF_PILES..r * PUBFEAT + OFF_PILES + n]);
         }
-        let mut out = vec![0.0; rows * NTYPE * TYPE];
+        let mut out = scratch(rows * NTYPE * TYPE);
         self.pile.add(&piles, rows * NTYPE, &mut out);
         for r in 0..rows {
             let card = &cards[(r % card_rows) * NTYPE * TYPE..(r % card_rows + 1) * NTYPE * TYPE];
@@ -574,18 +614,19 @@ impl Net {
                 }
             }
         }
+        recycle(piles);
         out
     }
 
     /// The trunk stem: hex facts, the occupant's projected token, position,
     /// globals, and a nonlinear pool over every drafted coin type.
     fn stem(&self, xpub: &[f32], tokens: &[f32], rows: usize) -> Vec<f32> {
-        let mut facts = vec![0.0; rows * N_HEXES * HEX_FACTS];
-        let mut occ = vec![0.0; rows * N_HEXES * C];
-        let mut loose = vec![0.0; rows * LOOSE];
-        let mut projected = Vec::new();
+        let mut facts = scratch(rows * N_HEXES * HEX_FACTS);
+        let mut occ = scratch(rows * N_HEXES * C);
+        let mut loose = scratch(rows * LOOSE);
+        let mut projected = scratch(0);
         self.tok_stem.run(tokens, rows * NTYPE, &mut projected);
-        let mut type_pool = vec![0.0; rows * C];
+        let mut type_pool = scratch(rows * C);
         for r in 0..rows {
             for t in 0..NTYPE {
                 let token = &projected[(r * NTYPE + t) * C..(r * NTYPE + t + 1) * C];
@@ -606,9 +647,9 @@ impl Net {
                 }
             }
         }
-        let mut x = Vec::new();
+        let mut x = scratch(0);
         self.hex_stem.run(&facts, rows * N_HEXES, &mut x);
-        let mut glob = Vec::new();
+        let mut glob = scratch(0);
         self.glob_stem.run(&loose, rows, &mut glob);
         for r in 0..rows {
             for h in 0..N_HEXES {
@@ -621,6 +662,12 @@ impl Net {
             }
         }
         x.truncate(rows * N_HEXES * C);
+        recycle(facts);
+        recycle(occ);
+        recycle(loose);
+        recycle(projected);
+        recycle(type_pool);
+        recycle(glob);
         x
     }
 
@@ -629,11 +676,11 @@ impl Net {
         let bd = board();
         let cells = rows * N_HEXES;
         let mut x = self.stem(xpub, tokens, rows);
-        let mut a = vec![0.0; cells * C];
-        let mut mixed = vec![0.0; cells * 2 * C];
-        let mut pooled = vec![0.0; rows * 2 * C];
-        let (mut y, mut gb, mut z) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut arg, mut th) = (Vec::new(), Vec::new());
+        let mut a = scratch(cells * C);
+        let mut mixed = scratch(cells * 2 * C);
+        let mut pooled = scratch(rows * 2 * C);
+        let (mut y, mut gb, mut z) = (scratch(0), scratch(0), scratch(0));
+        let (mut arg, mut th) = (scratch(0), scratch(0));
         for (i, blk) in self.blocks.iter().enumerate() {
             a.copy_from_slice(&x[..cells * C]);
             self.norms[ln_block(i, 0)].apply(&mut a, cells, &mut arg, &mut th);
@@ -679,6 +726,14 @@ impl Net {
             }
         }
         self.norms[LN_TRUNK].apply(&mut x, cells, &mut arg, &mut th);
+        recycle(a);
+        recycle(mixed);
+        recycle(pooled);
+        recycle(y);
+        recycle(gb);
+        recycle(z);
+        recycle(arg);
+        recycle(th);
         x
     }
 
@@ -692,8 +747,8 @@ impl Net {
         card_rows: usize,
         out: &mut Vec<f32>,
     ) {
-        let mut physical = vec![0.0; rows * PUBFEAT];
-        let mut physical_cards = vec![0.0; rows * NTYPE * TYPE];
+        let mut physical = scratch(rows * PUBFEAT);
+        let mut physical_cards = scratch(rows * NTYPE * TYPE);
         for r in 0..rows {
             physical[r * PUBFEAT..(r + 1) * PUBFEAT]
                 .copy_from_slice(&xpub[2 * r * PUBFEAT..(2 * r + 1) * PUBFEAT]);
@@ -704,7 +759,7 @@ impl Net {
         let tokens = self.tokens(&physical, &physical_cards, rows, rows);
         let x = self.trunk(&physical, &tokens, rows);
         let width = 2 * C + LOOSE;
-        let mut input = vec![0.0; rows * width];
+        let mut input = scratch(rows * width);
         for r in 0..rows {
             let dst = &mut input[r * width..(r + 1) * width];
             dst[..C].fill(0.0);
@@ -721,6 +776,11 @@ impl Net {
             );
         }
         self.board_out.run(&input, rows, out);
+        recycle(physical);
+        recycle(physical_cards);
+        recycle(tokens);
+        recycle(x);
+        recycle(input);
     }
 
     /// The half of the join's first layer that does not move between CFR
@@ -742,7 +802,7 @@ impl Net {
         g_out: &mut Vec<f32>,
     ) {
         let width = 3 + TYPE;
-        let mut slots = vec![0.0; n * NSLOT * width];
+        let mut slots = scratch(n * NSLOT * width);
         for c in 0..n {
             let q = owner[c] as usize;
             for k in 0..NSLOT {
@@ -754,11 +814,11 @@ impl Net {
                     .copy_from_slice(&cards[(q * NTYPE + k) * TYPE..(q * NTYPE + k + 1) * TYPE]);
             }
         }
-        let mut hidden = Vec::new();
+        let mut hidden = scratch(0);
         self.cfg1.run(&slots, n * NSLOT, &mut hidden);
-        let (mut arg, mut th) = (Vec::new(), Vec::new());
+        let (mut arg, mut th) = (scratch(0), scratch(0));
         gelu_all(&mut hidden[..n * NSLOT * CFGH], &mut arg, &mut th);
-        let mut u = vec![0.0; n * CFGH];
+        let mut u = scratch(n * CFGH);
         for c in 0..n {
             for k in 0..NSLOT {
                 for j in 0..CFGH {
@@ -774,7 +834,7 @@ impl Net {
         // carries the belief's exact expected holding of every card, bound to
         // that card. `bag` depends only on the card table, so it costs two
         // rows per solve and fifteen accumulations per config.
-        let mut bag = Vec::new();
+        let mut bag = scratch(0);
         let views = cards.len() / (NTYPE * TYPE);
         self.cfg_m.run(cards, views * NTYPE, &mut bag);
         let stride = 3 * POOL;
@@ -794,6 +854,12 @@ impl Net {
                 }
             }
         }
+        recycle(slots);
+        recycle(hidden);
+        recycle(arg);
+        recycle(th);
+        recycle(u);
+        recycle(bag);
     }
 
     /// The board projection is shared by a physical row. Belief order and the
@@ -807,8 +873,8 @@ impl Net {
         player: usize,
         out: &mut Vec<f32>,
     ) {
-        let mut z = vec![0.0; rows * JW];
-        let mut input = vec![0.0; rows * JOIN_IN];
+        let mut z = scratch(rows * JW);
+        let mut input = scratch(rows * JOIN_IN);
         for r in 0..rows {
             let (q, o) = (2 * r + player, 2 * r + 1 - player);
             let dst = &mut input[r * JOIN_IN..(r + 1) * JOIN_IN];
@@ -820,7 +886,7 @@ impl Net {
         self.join_b.add(&input, rows, &mut z);
         self.join_b.bias(&mut z, rows);
         let (mut t, mut d, mut arg, mut th) =
-            (vec![0.0; rows * JW], Vec::new(), Vec::new(), Vec::new());
+            (scratch(rows * JW), scratch(0), scratch(0), scratch(0));
         for i in 0..JBLOCKS {
             t.copy_from_slice(&z);
             self.norms[LN_JOIN + i].apply(&mut t, rows, &mut arg, &mut th);
@@ -838,17 +904,49 @@ impl Net {
         self.join_out.add(&z, rows, &mut out[..rows * D]);
         self.join_out.bias(out, rows);
         self.norms[LN_H].plain(out, rows);
+        recycle(z);
+        recycle(input);
+        recycle(t);
+        recycle(d);
+        recycle(arg);
+        recycle(th);
     }
 
     /// `v(c) = <f(c), h> + bias` for each config index in `idx`.
     pub fn values(&self, h: &[f32], f: &[f32], idx: &[u32], out: &mut [f32]) {
-        for (o, &c) in out.iter_mut().zip(idx) {
-            let row = &f[c as usize * D..(c as usize + 1) * D];
-            let mut v = self.value_bias;
-            for j in 0..D {
-                v += row[j] * h[j];
+        let mut lo = 0;
+        while lo < idx.len() {
+            let first = idx[lo] as usize;
+            let mut hi = lo + 1;
+            while hi < idx.len() && idx[hi] as usize == first + hi - lo {
+                hi += 1;
             }
-            *o = v;
+            if hi - lo >= 8 {
+                gemm(
+                    hi - lo,
+                    1,
+                    D,
+                    &f[first * D..],
+                    D,
+                    h,
+                    1,
+                    0.0,
+                    &mut out[lo..hi],
+                    1,
+                );
+                for value in &mut out[lo..hi] {
+                    *value += self.value_bias;
+                }
+            } else {
+                for (value, &c) in out[lo..hi].iter_mut().zip(&idx[lo..hi]) {
+                    let row = &f[c as usize * D..(c as usize + 1) * D];
+                    *value = row
+                        .iter()
+                        .zip(h)
+                        .fold(self.value_bias, |sum, (&x, &y)| sum + x * y);
+                }
+            }
+            lo = hi;
         }
     }
 

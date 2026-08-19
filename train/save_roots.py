@@ -1,7 +1,5 @@
-"""Save the plan section 6 root sample: `cap` complete solver roots
-(state + both beliefs) from random-draft self-play, for GPU tree sizing.
-Optionally push a checkpoint first so the sample matches the trained
-agent's positions (the dump run's own game distribution).
+"""Save complete solver roots (state plus both beliefs) from random-draft
+self-play. A checkpoint makes the sample follow that agent's positions.
 
     python train/save_roots.py --ckpt runs/pre_cuda_random/snap_03.pt \
         --games 300 --cap 1000 --out runs/pre_cuda_random/roots.bin
@@ -23,9 +21,8 @@ def main():
     ap.add_argument("--out", default="roots.bin")
     args = ap.parse_args()
     if args.ckpt:
-        net = load(args.ckpt)
-        net.push()
-        print(f"pushed {args.ckpt} (dims {net.dims})")
+        load(args.ckpt).push()
+        print(f"pushed {args.ckpt}")
     n = warchest.save_roots(args.games, args.seed, args.out, args.cap, True)
     print(f"saved {n} roots to {args.out}")
 

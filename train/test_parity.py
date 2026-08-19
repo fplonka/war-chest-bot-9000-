@@ -13,8 +13,8 @@ public-input coverage.
 * **Slot permutation.** Which slot the draft put a unit in is a pure
   relabelling — the ten coin types are described by their printed card facts,
   not by an identity embedding — so permuting the five slots of each player
-  must leave every value and every auxiliary logit exactly where it was, as
-  long as every place a slot index appears moves together. This is the check
+  must leave every value exactly where it was, as long as every place a slot
+  index appears moves together. This is the check
   that caught raw belief marginals entering the join through a per-slot dense
   layer, which cost half the value signal. It runs against torch only: parity
   above carries it over to Rust.
@@ -116,13 +116,13 @@ def belief(rng, sizes, zero_counts=False):
 
 
 def run(net, xpub, phi, weight, seg, queries):
-    """The torch forward on numpy inputs: values and auxiliary logits."""
+    """The torch forward on numpy inputs."""
     with torch.no_grad():
-        v, aux = net(torch.from_numpy(np.ascontiguousarray(xpub)),
-                     torch.from_numpy(np.ascontiguousarray(phi)),
-                     torch.from_numpy(weight),
-                     torch.from_numpy(seg.astype(np.int64)), queries)
-    return v.numpy(), aux.numpy()
+        v = net(torch.from_numpy(np.ascontiguousarray(xpub)),
+                torch.from_numpy(np.ascontiguousarray(phi)),
+                torch.from_numpy(weight),
+                torch.from_numpy(seg.astype(np.int64)), queries)
+    return v.numpy()
 
 
 def slot_permutation(perm):
@@ -150,7 +150,7 @@ def blob_parity(net, rng):
         queries = len(sizes)
         xpub = public_rows(rng, queries)
         seg, phi, weight = belief(rng, sizes, zero)
-        want, _ = run(net, xpub, phi, weight, seg, queries)
+        want = run(net, xpub, phi, weight, seg, queries)
         got = np.asarray(warchest.infer(
             xpub.ravel(), phi.ravel(), weight, seg, queries), np.float32)
         assert got.shape == want.shape, f"{name}: {got.shape} vs {want.shape}"
@@ -170,7 +170,7 @@ def slot_invariance(net, rng, perms=6):
     queries = len(sizes)
     xpub = public_rows(rng, queries)
     seg, phi, weight = belief(rng, sizes)
-    base, base_aux = run(net, xpub, phi, weight, seg, queries)
+    base = run(net, xpub, phi, weight, seg, queries)
     spread = float(base.std())
     assert spread > 1e-3, "degenerate invariance inputs"
     worst = 0.0
@@ -178,11 +178,10 @@ def slot_invariance(net, rng, perms=6):
         perm = rng.permutation(NSLOT)
         px = xpub[:, slot_permutation(perm)]
         pphi = phi.reshape(-1, 3, NSLOT)[:, :, perm].reshape(-1, CCOUNTS)
-        got, got_aux = run(net, px, pphi, weight, seg, queries)
+        got = run(net, px, pphi, weight, seg, queries)
         dv = float(np.max(np.abs(got - base)))
-        da = float(np.max(np.abs(got_aux - base_aux)))
-        worst = max(worst, dv, da)
-        print(f"  slots {perm}  values {dv:.2e}  aux {da:.2e}")
+        worst = max(worst, dv)
+        print(f"  slots {perm}  values {dv:.2e}")
     # Relative to the size of the values, because these random weights put them
     # in the tens and an absolute 1e-5 would be two float32 ulps away. The
     # defect this guards against was half the value spread, so the margin is
@@ -200,13 +199,12 @@ def offboard_pile_visibility(net, rng):
     hexes = xpub[:, :N_HEXES * HEX_CH].reshape(len(sizes), N_HEXES, HEX_CH)
     hexes[:, :, HEX_FACTS] = 0.0
     seg, phi, weight = belief(rng, sizes)
-    base, base_aux = run(net, xpub, phi, weight, seg, len(sizes))
+    base = run(net, xpub, phi, weight, seg, len(sizes))
     changed = xpub.copy()
     pile = OFF_PILES
     changed[0, pile:pile + PILE_COUNTS] += 2.0
-    got, got_aux = run(net, changed, phi, weight, seg, len(sizes))
-    movement = max(float(np.max(np.abs(got - base))),
-                   float(np.max(np.abs(got_aux - base_aux))))
+    got = run(net, changed, phi, weight, seg, len(sizes))
+    movement = float(np.max(np.abs(got - base)))
     assert movement > 1e-5, "an off-board unit's piles are invisible"
     print(f"off-board pile visibility ok: movement {movement:.3e}")
 

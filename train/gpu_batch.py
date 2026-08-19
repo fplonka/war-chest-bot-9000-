@@ -133,14 +133,12 @@ def make_batch(parts, rng, device):
     del rng
     from train import public_sizes
 
-    rows, aux, cc, cp, cw, cy, seg = parts
+    rows, cc, cp, cw, cy, seg = parts
     n = len(rows)
     hand, fd, bag = public_sizes(cc, cp, seg, n)
     views = np.empty((2 * n, warchest.ROW_BYTES), np.uint8)
     views[0::2] = rows
     views[1::2] = mirror.mirror_rows(rows)
-    # The trunk and its ownership head run once in physical seat-0 space.
-    owner = aux
     size_parts = []
     for a in (hand, fd, bag):
         pair = np.empty((2 * n, 2), np.uint8)
@@ -174,7 +172,7 @@ def make_batch(parts, rng, device):
 
     phi = t(cc, torch.float32) / float(warchest.CNORM)
     return (x, phi, t(cw, torch.float32), t(seg, torch.long),
-            t(cy, torch.float32), t(owner, torch.int64), 2 * n)
+            t(cy, torch.float32), 2 * n)
 
 
 def warmup(device):
@@ -184,8 +182,7 @@ def warmup(device):
     rows[:, warchest.ROW_HEX_SLOT:warchest.ROW_HEX_SLOT + warchest.N_HEXES] = 255
     rows[:, warchest.ROW_HEX_MARKER:warchest.ROW_HEX_MARKER + warchest.N_HEXES] = 255
     cc = np.zeros((2, warchest.CCOUNTS), np.uint8)
-    aux = np.zeros((1, warchest.N_LOCATIONS), np.uint8)
-    parts = (rows, aux, cc, np.asarray([0, 1], np.uint8),
+    parts = (rows, cc, np.asarray([0, 1], np.uint8),
              np.asarray([1.0, 1.0], np.float32), np.zeros(2, np.float32),
              np.asarray([0, 1], np.int64))
     make_batch(parts, np.random.default_rng(0), device)

@@ -478,36 +478,27 @@ Nothing is compared, promoted or selected while a run is going.
   invariance both of them owe the draft.
 * `scenarios.rs` (36 cases) and `invariants.rs` — the engine itself.
 
-The 85 Rust tests cover the CPU network and the job contract. The CUDA path is
-not among them: it compiles nowhere locally, so `engine/src/gpu/` is exercised
-only on the box and nothing runnable here verifies it.
+The Rust tests cover the engine, the PBS, the solver and the CPU network.
 
 ## 8. Tools
 
 * `train/diagnose.py` — how learnable a dump's targets are, model-free.
 * `train/dump.py` — reading a dumped replay buffer as a supervised dataset.
 * `train/save_roots.py` — freeze a root sample from real self-play, for sizing.
-* `examples/treesize.rs` — depth-2/3/4 tree shape over a frozen root sample,
-  which is what the GPU pools are sized from.
-* `examples/wave_tape.rs` — the deterministic throughput gate for the wave
-  executor: production roots, full work distribution, then timing.
 * `examples/featstats.rs` — the real range of every feature.
 * `examples/cfgvalue.rs` — how far the value separates configs.
 * `tools/arena.py` — the ladder: archived bots, a referee, and Elo. It rates
   checkpoints from incompatible revisions on one
   scale.
-* `train/export_weights.py` — the flat blob that `rebelbench` and the GPU
-  service load.
+* `train/export_weights.py` — the flat blob `rebelbench` loads.
 
 ## 9. Layout
 
 ```
 engine/src/rebel.rs     PBS: configs, beliefs, observations, features
-engine/src/search.rs    depth-limited CFR subgame solver
+engine/src/search.rs    growing-tree CFR subgame solver
 engine/src/selfplay.rs  self-play loop, belief filter, data collection, greedy bot, eval
 engine/src/net.rs       the value network (Accelerate BLAS)
-engine/src/serialize.rs the CPU-to-GPU job contract (docs/TREE.md)
-engine/src/gpu/         the wave executor and its CUDA kernels
 engine/src/py.rs        pyo3: set_weights / gen_data
 engine/src/arena.rs     the referee and the bot protocol
 engine/src/bot.rs       one bot's side of an arena game

@@ -100,11 +100,8 @@ def panels(eps, elo):
     else:
         out.append(panel("Value loss", "huber", [series("", m, col("loss"), True)]))
 
-    # The auxiliary head predicts who owns each location when the game ends. It
-    # is not what the run is for, but it is the cheapest read on whether the
-    # trunk understands the position at all: a supervised label with no
-    # bootstrap in it cannot fall by drifting, the way the value loss can.
-    # Chance is one in three, and early on "neither" is the majority class.
+    # Historical runs may carry the ablated ownership head's metrics. Keep
+    # rendering their recorded data; current runs simply omit these keys.
     if has("aux_loss"):
         out.append(panel("Auxiliary ownership loss", "cross-entropy",
                          [series("", m, col("aux_loss"), True)], zero=True))

@@ -7,13 +7,11 @@
 //!
 //! It reads requests from stdin and writes each game back as that game is
 //! ready, in the JSON `warchest::arena` defines. Games are worked on
-//! independently and in parallel, so at any moment some are having their
-//! subgame built on the cores while others are being solved on the device;
-//! nothing waits for a batch to finish. The referee sends work for any game it
-//! is not already waiting on, which keeps that mixture topped up.
+//! independently and in parallel. The referee sends work for any game it is
+//! not already waiting on, which keeps the cores busy.
 //!
 //! ```text
-//! bot --name v5-2h --weights weights.bin --depth 2 --iters 64 --cfr dcfr --device 0
+//! bot --name v5-2h --weights weights.bin --nodes 1024 --expand 1 --iters 64 --cfr dcfr
 //! ```
 
 use std::collections::HashMap;
@@ -31,31 +29,31 @@ struct Options {
     name: String,
     weights: String,
     mind: String,
-    depth: usize,
+    nodes: usize,
+    expand: usize,
     iters: usize,
     cfr: String,
     temp: f32,
     node_cap: usize,
-    device: i32,
-    inflight: usize,
+    threads: usize,
 }
 
 fn options() -> Result<Options, String> {
     let a = Args::parse(&[
-        "name", "weights", "mind", "depth", "iters", "cfr", "temp", "node-cap", "device",
-        "inflight",
+        "name", "weights", "mind", "nodes", "expand", "iters", "cfr", "temp",
+        "node-cap", "threads",
     ])?;
     Ok(Options {
         name: a.text("name", "bot"),
         weights: a.text("weights", ""),
         mind: a.text("mind", "rebel"),
         cfr: a.text("cfr", "dcfr"),
-        depth: a.num("depth", 2)?,
+        nodes: a.num("nodes", 1024)?,
+        expand: a.num("expand", 1)?,
         iters: a.num("iters", 64)?,
         temp: a.num("temp", 2.0)?,
         node_cap: a.num("node-cap", 200_000)?,
-        device: a.num("device", -1)?,
-        inflight: a.num("inflight", 0)?,
+        threads: a.num("threads", 0)?,
     })
 }
 
@@ -68,37 +66,20 @@ fn brain(o: &Options) -> Result<Brain, String> {
     };
     let cfr = Cfr::named(&o.cfr).ok_or_else(|| format!("unknown cfr rule {}", o.cfr))?;
     let mut nets = Nets::default();
-    #[cfg(feature = "gpu")]
-    let mut gpu = None;
     if matches!(mind, Mind::Rebel) {
-        let (dims, w, b, ln) =
-            Net::load_flat_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
-        nets.value = Net::from_flat(&dims, &w, &b, &ln)?;
-        #[cfg(feature = "gpu")]
-        if o.device >= 0 {
-            gpu = Some(warchest::gpu::service::spawn(
-                o.device as usize,
-                dims,
-                w,
-                b,
-                ln,
-                false,
-            )?);
-        }
+        nets.value = Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
     }
     Ok(Brain {
         mind,
         nets,
         cfg: Cfg {
-            depth: o.depth,
+            nodes: o.nodes,
+            expand: o.expand,
             iters: o.iters,
             cfr,
-            snapshots: false,
             node_cap: o.node_cap,
             ..Default::default()
         },
-        #[cfg(feature = "gpu")]
-        gpu,
     })
 }
 
@@ -160,14 +141,10 @@ fn main() {
         eprintln!("{}", e);
         std::process::exit(2);
     }));
-    // A solve blocks its thread until the device answers, so a bot on a device
-    // wants far more threads than cores: the threads are how many solves can be
-    // in flight for the wave to merge. A bot solving on the CPU wants one per
-    // core.
-    let threads = match (options.inflight, options.device >= 0) {
-        (0, false) => std::thread::available_parallelism().map_or(8, |n| n.get()),
-        (0, true) => 512,
-        (n, _) => n,
+    let threads = if options.threads == 0 {
+        std::thread::available_parallelism().map_or(8, |n| n.get())
+    } else {
+        options.threads
     };
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
@@ -197,8 +174,7 @@ fn main() {
             table.lock().unwrap().remove(id);
         }
         // One task per game rather than per request: a game answered early
-        // gets more work from the referee immediately, which is what keeps
-        // both the cores and the device busy.
+        // gets more work from the referee immediately, keeping the cores busy.
         for (ask, act) in request
             .go
             .into_iter()

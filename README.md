@@ -13,8 +13,7 @@ engine/          Rust crate, lib name `warchest`
   src/           arena, bot, policy  (the referee, a bot, and a node's policy)
   tests/         36 scenario tests, playout invariants, PBS correctness tests
   examples/      coords.rs (hex dump), featstats.rs (feature ranges),
-                 cfgvalue.rs (how far the value separates configs),
-                 treesize.rs (subgame shape), wave_tape.rs (GPU throughput gate)
+                 cfgvalue.rs (how far the value separates configs)
   src/bin/       bench.rs (applies/sec, playouts/sec), bot.rs (an arena bot)
 webui/           play.py + index.html: browser UI for playing a trained agent
 play.sh          one-liner: build the extension, serve the UI, open the browser
@@ -32,14 +31,14 @@ docs/
   ENGINE_FIXES.md  rule corrections found by replaying 1,112 real games
   REBEL.md         the ReBeL agent: PBS design, CFR solver, the value network
   PERF.md          how the generation loop got ~10x faster, and what didn't work
-  TREE.md          the CPU-to-GPU job contract
   ARENA.md         bots, the referee protocol, and how a ladder is run
-  GPU_ARCHITECTURE.md, GPU_PERF_GOAL.md  the wave executor and its target
 ```
 
-Not in the repo: `papers/` (gitignored) is where the AEG rulebook, the ReBeL
-paper (arXiv:2007.13544) and the TurboReBeL paper are kept locally. The rulebook
-is a commercial product, so it is not redistributed here.
+Not in the repo: `papers/` (gitignored) is where the AEG rulebook and the
+reference papers are kept locally — ReBeL (arXiv:2007.13544), Student of Games
+(arXiv:2112.03178) and DeepStack (arXiv:1701.01724) are the three the value
+target convention comes from. The rulebook is a commercial product, so it is
+not redistributed here.
 
 ## Training
 
@@ -66,10 +65,10 @@ You play white with the rulebook's starter army (Swordsman, Pikeman,
 Crossbowman, Light Cavalry) against the fixed black army (Archer, Cavalry,
 Lancer, Scout). Round-start draws and the agent's moves resolve automatically;
 every decision that is yours — including triggered follow-ups like the
-Swordsman's free move — appears as a clickable legal action. The agent solves
-the depth-limited subgame at each of its decisions with the same CFR-average
-configuration evaluation uses, so it plays like the checkpoint's `eval.json`
-says it plays. The agent's hand, bag and face-down discards are hidden from
+Swordsman's free move — appears as a clickable legal action. At each decision
+the agent grows a GT-CFR tree along its sampled strategy and plays from the
+final CFR average, with the same node and iteration budgets the arena uses.
+The agent's hand, bag and face-down discards are hidden from
 the browser — including the coin it spends face-down on Pass / Claim
 initiative / Recruit, which the game log never reveals — and only public
 counts are shown.
@@ -127,7 +126,7 @@ that way has a scenario test — see `docs/ENGINE_FIXES.md`.
 
 ```bash
 cd engine
-cargo test                          # 85 tests (the solver oracle takes ~85s)
+cargo test                          # solver and engine tests
 cargo run --release --bin bench     # engine throughput, ~2.8M applies/sec/core
 cargo run --release --bin rebelbench -- weights.bin   # generation throughput
 maturin develop --release           # python module `warchest` (Game)
@@ -135,15 +134,10 @@ maturin develop --release           # python module `warchest` (Game)
 
 `rebelbench` runs the ReBeL generation loop without Python, on weights exported
 by `train/export_weights.py`, and is what `docs/PERF.md`'s numbers come from.
-The v5 GPU executor's deterministic throughput gate is
-`examples/wave_tape.rs`; it uses production roots and reports the complete work
-distribution before timing. `docs/GPU_PERF_GOAL.md` defines the real training
-target and corrected baseline; `docs/GPU_ARCHITECTURE.md` describes the active
-replacement architecture and verification runbook.
 
-Build it with `--features prof` for a per-phase breakdown. Its `games depth
-iters threads` arguments default to the trainer's settings, so a throughput
-number is only comparable to another taken at the same ones — `iters` in
-particular is most of the cost.
+Build it with `--features prof` for a per-phase breakdown. Its `games nodes
+expand iters threads` arguments default to the trainer's settings. Throughput
+is only comparable at identical search budgets; `iters` and `expand` change
+the work represented by one solve.
 
 The `python` feature is off by default; the pure-Rust API needs no pyo3.

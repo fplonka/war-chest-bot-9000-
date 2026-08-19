@@ -6,8 +6,7 @@
 //! Everything downstream keys off the hex index; coords are only for I/O.
 
 pub const N_HEXES: usize = 37;
-/// The 10 control locations. The auxiliary ownership target has one head per
-/// location, so the trainer needs this count as well as the hex indices.
+/// The 10 control locations.
 pub const N_LOCATIONS: usize = 10;
 pub const NONE: u8 = 255;
 

@@ -1,8 +1,5 @@
-//! Serialization for subgame roots: a public `State` plus both beliefs, as
-//! collected during a training run for GPU tree sizing. A tool-only format —
-//! explicit field-by-field little-endian writes, no dependencies, and a magic
-//! + version so a mismatched reader fails loudly.
-
+//! Tool-only serialization for a public `State` plus both beliefs. Explicit
+//! field-by-field little-endian writes and a versioned magic reject mismatches.
 use std::io::{Read, Write};
 
 use crate::board::N_HEXES;

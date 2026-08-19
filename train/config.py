@@ -16,19 +16,29 @@ class Cfg:
     batch: int = 1024
     lr: float = 1e-3
     lr_decay_frac: str = "0.33,0.67"
-    # Weight on the auxiliary final-ownership cross-entropy. KataGo's own
-    # auxiliary heads carry weights in the 0.15--0.25 range: enough to shape
-    # the trunk, small enough that the value head still owns the gradient.
-    aux_weight: float = 0.15
-    train_gen_ratio: float = 4.0
+    # Gradient updates per generated row — Student of Games' "max grad updates
+    # per example", which it runs at 10 for poker and 5 for Scotland Yard. A
+    # solve yields one row now, so this is also updates per solve.
+    replay_ratio: float = 8.0
+    target_every: float = 5.0
     recent_mix: float = 0.5
     recent_frac: float = 0.2
-    cap: int = 2_000_000
+    # Rows, and one row per solve. Student of Games holds 1M for both of its
+    # imperfect-information games.
+    cap: int = 1_000_000
     cfgs_per_row: int = 48
-    depth: int = 2
-    iters: int = 64
+    nodes: int = 256
+    expand: int = 4
+    iters: int = 16
+    config_cap: int = 256
+    # Student of Games' q_search and q_recursive: leaves drawn from each solve
+    # and queued to be re-solved as roots of their own. This is the only way a
+    # target is ever taken off the line of play.
+    query_rate: float = 0.9
+    recursive_rate: float = 0.1
     cfr: str = "dcfr"
-    explore: float = 0.25
+    # ReBeL's and Student of Games' off-policy exploration rate; both run 0.1.
+    explore: float = 0.1
     temp: float = 2.0
     eval_mix: float = 1.0
     cap_value: float = 0.04
@@ -38,18 +48,18 @@ class Cfg:
     ladder_games: int = 40
 
     device: str = "cuda:1"
-    gpu_devices: str = "0,1"
-    gpu_workers: int = 36
-    gpu_inflight: int = 32
-    gpu_chunk: int = 1024
-    gpu_drain_seconds: float = 20.0
-    gpu_publish_steps: int = 16
+    # Cards the solve farm evaluates on. A round is split across them by call,
+    # so each builds and runs a self-contained batch.
+    gen_devices: str = "0,1"
+    gen_solves: int = 8
+    # Zero uses every physical CPU core.
+    gen_workers: int = 0
     train_stream_priority: int = -1
 
     out: str = ""
-    note: str = ""
     seed: int = 1
     git: str = ""
+    note: str = ""
 
 
 BASELINE = Cfg()

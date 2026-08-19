@@ -44,15 +44,12 @@ pub enum Mind {
     Random,
 }
 
-/// Everything a bot brings to every game it plays: how it thinks, what it
-/// thinks with, and the device it thinks on. Shared across all live games, and
-/// read-only, so games can be stepped in parallel.
+/// Everything a bot brings to every game it plays: how it thinks and the
+/// network it thinks with. Shared across all live games and read-only.
 pub struct Brain {
     pub mind: Mind,
     pub nets: Nets,
     pub cfg: Cfg,
-    #[cfg(feature = "gpu")]
-    pub gpu: Option<crate::gpu::GpuClient>,
 }
 
 impl Brain {
@@ -60,51 +57,29 @@ impl Brain {
     /// hold. Used both to choose the bot's own move and to model its
     /// opponent's, which is why it takes the player rather than assuming the
     /// bot's own seat.
-    pub fn policy(&self, s: &State, ctx: &Ctx, player: u8, bel: &[Belief; 2]) -> NodePolicy {
+    pub fn policy(
+        &self,
+        s: &State,
+        ctx: &Ctx,
+        player: u8,
+        bel: &[Belief; 2],
+        rng: &mut Rng,
+    ) -> NodePolicy {
         let cfgs = &bel[player as usize].cfg;
         match self.mind {
             Mind::Greedy { temp } => return policy::greedy(s, ctx, player, cfgs, temp),
             Mind::Random => return policy::uniform(s, ctx, player, cfgs),
             Mind::Rebel => {}
         }
-        #[cfg(feature = "gpu")]
-        let cfg = Cfg {
-            snapshots: false,
-            gpu_build: self.gpu.is_some(),
-            ..self.cfg
-        };
-        #[cfg(not(feature = "gpu"))]
-        let cfg = Cfg {
-            snapshots: false,
-            ..self.cfg
-        };
-        let mut sv = Solver::new(s, *ctx, &self.nets, cfg, bel.clone());
-        // A subgame too large to build is played uniformly. The tail of the
-        // tree-size distribution is fat enough that an unbounded build would
-        // stall a whole batch on one decision.
+        let mut sv = Solver::new(s, *ctx, &self.nets, self.cfg, bel.clone());
+        sv.solve(rng);
         if sv.capped() {
-            return policy::uniform(s, ctx, player, cfgs);
+            // The hard node cap protects the tail of the tree-size
+            // distribution. A partial solve has no valid reference strategy.
+            policy::uniform(s, ctx, player, cfgs)
+        } else {
+            policy::at_node(&sv, 0, cfgs.len())
         }
-        #[cfg(feature = "gpu")]
-        if let Some(client) = self.gpu.as_ref() {
-            let roots = vec![[bel[0].p.clone(), bel[1].p.clone()]];
-            let (job, tree) = crate::serialize::PackedJob::from_solver_with_walk(&sv, &roots);
-            match client.submit(job).and_then(|handle| handle.wait()) {
-                Ok(result) => return policy::from_wave(&tree, &result, player as usize),
-                Err(error) => eprintln!("wave solve failed, falling back to the CPU: {error}"),
-            }
-            sv = Solver::new(
-                s,
-                *ctx,
-                &self.nets,
-                Cfg {
-                    gpu_build: false,
-                    ..cfg
-                },
-                bel.clone(),
-            );
-        }
-        policy::solved(&mut sv, cfg.iters, cfgs.len())
     }
 }
 
@@ -176,7 +151,7 @@ impl Session {
     pub fn watch(&mut self, brain: &Brain) {
         if !self.s.is_terminal() && !self.s.is_chance() && self.s.to_act() != self.seat {
             let player = self.s.to_act();
-            self.modelled = Some(brain.policy(&self.s, &self.ctx, player, &self.bel));
+            self.modelled = Some(brain.policy(&self.s, &self.ctx, player, &self.bel, &mut self.rng));
         }
     }
 
@@ -226,7 +201,7 @@ impl Session {
         }
         let np = match self.modelled.take() {
             Some(np) => np,
-            None => brain.policy(&self.s, &self.ctx, player, &self.bel),
+            None => brain.policy(&self.s, &self.ctx, player, &self.bel, &mut self.rng),
         };
         let (ci, cell) = np
             .cell_for(key)
@@ -255,7 +230,7 @@ impl Session {
         let ci = self.bel[self.seat as usize]
             .index_of(&truth)
             .ok_or("the belief filter dropped this seat's own config")?;
-        let np = brain.policy(&self.s, &self.ctx, self.seat, &self.bel);
+        let np = brain.policy(&self.s, &self.ctx, self.seat, &self.bel, &mut self.rng);
         if np.row(ci).is_empty() {
             // The node's actions are enumerated over the public reserve and
             // then filtered per hand. A hand with no row cannot move, which
@@ -294,8 +269,6 @@ mod tests {
             mind: Mind::Random,
             nets: Nets::default(),
             cfg: Cfg::default(),
-            #[cfg(feature = "gpu")]
-            gpu: None,
         }
     }
 

@@ -15,10 +15,9 @@
 
 use std::collections::HashMap;
 
-use warchest::board::NONE;
 use warchest::rebel::*;
 use warchest::rng::Rng;
-use warchest::search::{action_coin, node_actions, snapshot_iters, Cfg, Cfr, Nets, Solver};
+use warchest::search::{node_actions, Cfg, Cfr, Nets, Solver};
 use warchest::selfplay::make_game;
 use warchest::state::{Cont, State, MAX_MAIN_PLAYS, Z_BAG, Z_FACEDOWN, Z_HAND};
 use warchest::units::{
@@ -179,14 +178,13 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
         }
 
         let cfg = Cfg {
-            depth: 8,
+            nodes: 200_000,
             iters: 500,
-            snapshots: true,
-            keep_states: true,
             ..Default::default()
         };
         {
-            let sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
+            let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
+            sv.grow_full();
             // If any leaf were non-terminal the (empty) network would silently
             // return zero and the comparison would be meaningless.
             assert!(
@@ -221,15 +219,18 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
         let exact = oracle_value(&s, &ctx, &bel, 100);
         for (name, rule) in Cfr::NAMED {
             let mut sv = Solver::new(&s, ctx, &nets, Cfg { cfr: rule, ..cfg }, bel.clone());
+            sv.grow_full();
             // Exploitability early, before the solve has gone anywhere. Read
             // mid-flight on purpose: a fixed-policy pass must leave the solve
             // able to continue.
             sv.multistep(2);
+            sv.finish();
             let early = sv.nash_conv().nash as f64;
             sv.multistep(cfg.iters - 2);
+            sv.finish();
             let late = sv.nash_conv().nash as f64;
 
-            let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
+            let vals = vec![sv.root_values()];
             let v0: f64 = (0..bel[0].len())
                 .map(|c| bel[0].p[c] as f64 * vals[0][0][c] as f64)
                 .sum();
@@ -310,19 +311,18 @@ fn cfr_iteration_count_bias() {
         if bel[0].len() * bel[1].len() > 64 {
             continue;
         }
-        let probe = Solver::new(
+        let mut probe = Solver::new(
             &s,
             ctx,
             &nets,
             Cfg {
-                depth: 8,
+                nodes: 200_000,
                 iters: 1,
-                snapshots: true,
-                keep_states: true,
                 ..Default::default()
             },
             bel.clone(),
         );
+        probe.grow_full();
         if !probe
             .nodes
             .iter()
@@ -352,15 +352,16 @@ fn cfr_iteration_count_bias() {
                 ctx,
                 &nets,
                 Cfg {
-                    depth: 8,
+                    nodes: 200_000,
                     iters: t,
-                    snapshots: true,
                     ..Default::default()
                 },
                 bel.clone(),
             );
+            sv.grow_full();
             sv.multistep(t);
-            let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
+            sv.finish();
+            let vals = vec![sv.root_values()];
             let v0: f64 = (0..bel[0].len())
                 .map(|c| bel[0].p[c] as f64 * vals[0][0][c] as f64)
                 .sum();
@@ -473,14 +474,14 @@ fn draw_pass_through_consistency() {
             ctx,
             &nets,
             Cfg {
-                depth: 5,
+                nodes: 20_000,
+                node_cap: 20_000,
                 iters: 80,
-                snapshots: true,
-                keep_states: true,
                 ..Default::default()
             },
             bel.clone(),
         );
+        sv.grow_full();
         if sv.nodes.len() > 20_000 {
             cnt[2] += 1;
             continue;
@@ -539,7 +540,8 @@ fn draw_pass_through_consistency() {
             );
         }
         sv.multistep(80);
-        let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
+        sv.finish();
+        let vals = vec![sv.root_values()];
         let v0: f64 = (0..bel[0].len())
             .map(|c| bel[0].p[c] as f64 * vals[0][0][c] as f64)
             .sum();
@@ -572,34 +574,6 @@ fn draw_pass_through_consistency() {
     assert!(checked >= 4, "only {} draw positions exercised", checked);
 }
 
-/// The kept-iterate list: log-spaced plus the final, always starting at 0
-/// and always containing the last iteration — the exact list the GPU
-/// contract uploads.
-#[test]
-fn snapshot_iterations_are_log_spaced_plus_final() {
-    for iters in [1usize, 2, 8, 64, 512] {
-        let v = snapshot_iters(iters);
-        assert_eq!(v[0], 0, "iter 0 is always kept");
-        assert_eq!(
-            *v.last().unwrap(),
-            iters,
-            "the final iteration is always kept"
-        );
-        assert_eq!(v, {
-            let mut w = Vec::new();
-            for t in 0..=iters {
-                if t == 0 || t.is_power_of_two() || t == iters {
-                    w.push(t);
-                }
-            }
-            w
-        });
-        assert!(
-            v.windows(2).all(|x| x[0] < x[1]),
-            "kept iterations are increasing"
-        );
-    }
-}
 
 /// A Warrior Priest draw inside a subgame: the private mid-round draw is a
 /// chance node like a round-start draw, but its children carry the pending
@@ -642,14 +616,14 @@ fn warrior_priest_draw_walks_through_the_tree() {
         ctx,
         &nets,
         Cfg {
-            depth: 2,
+            nodes: 20_000,
+            node_cap: 20_000,
             iters: 8,
-            snapshots: true,
-            keep_states: true,
             ..Default::default()
         },
         bel.clone(),
     );
+    sv.grow_full();
 
     // Find the WP draw node: a chance node whose state is a WarriorPriestDraw.
     let draws: Vec<usize> = (0..sv.nodes.len())
@@ -657,7 +631,7 @@ fn warrior_priest_draw_walks_through_the_tree() {
             sv.nodes[i].chance && matches!(sv.states[i].pending(), Cont::WarriorPriestDraw { .. })
         })
         .collect();
-    assert_eq!(draws.len(), 1, "exactly one WP draw in the tree");
+    assert!(!draws.is_empty(), "expected a WP draw in the grown tree");
     let d = draws[0];
     let n = &sv.nodes[d];
     assert_eq!(n.child.len(), 1, "a draw has exactly one public child");
@@ -742,94 +716,64 @@ fn warrior_priest_draw_walks_through_the_tree() {
         }
     }
 
-    // The solve runs to completion and Phase 2 agrees with itself.
+    // The solve runs to completion and the final fixed-policy pass is finite.
     sv.multistep(8);
-    let vals = sv.value_under(&[[bel[0].p.clone(), bel[1].p.clone()]]);
+    sv.finish();
+    let vals = vec![sv.root_values()];
     assert!(vals[0][0].iter().all(|v| v.is_finite()));
     assert!(vals[0][1].iter().all(|v| v.is_finite()));
 }
 
 #[test]
-fn depth_is_spent_on_coin_plays_not_micro_choices() {
-    // "depth 2" means "my coin play, then yours". A compound tactic
-    // (cavalry: move, then choose the attack) is several decision nodes for
-    // one coin, and charging a depth unit per decision node would exhaust the
-    // budget inside one tactic — zero opponent moves in the tree. Find a
-    // position where the acting player has a free micro-choice available and
-    // check that depth is not consumed by it.
+fn growing_a_coin_play_finishes_its_micro_decisions() {
     let nets = Nets::default();
     let mut rng = Rng::new(1234);
     for _ in 0..400 {
         let mut s = make_game(&mut rng, false);
         while !s.is_terminal() {
-            if s.is_chance() {
-                let acts = s.legal_actions();
-                s.apply_inplace(acts[rng.below(acts.len())]);
-                continue;
-            }
             let acts = s.legal_actions();
-            // A free action whose child is a plain decision node: a draw
-            // or terminal child would be a leaf/expanded under both countings
-            // and the test would not discriminate the fix.
-            let free = acts.iter().any(|a| action_coin(a, &s) == NONE);
-            if free
+            if matches!(s.pending(), Cont::MainPlay)
                 && acts.iter().any(|a| {
-                    action_coin(a, &s) == NONE && {
-                        let mut cs = s.clone();
-                        cs.apply_inplace(*a);
-                        !cs.is_terminal() && !cs.is_chance()
-                    }
+                    let mut child = s.clone();
+                    child.apply_inplace(*a);
+                    !child.is_terminal()
+                        && !matches!(child.pending(), Cont::MainPlay | Cont::Draw { .. })
                 })
             {
                 let ctx = Ctx::new(&s);
                 let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
-                let root_player = s.to_act();
-                // Depth 1: the micro-choice (the root's free child) rides
-                // free, so it is still expanded even though the root sits at
-                // the depth limit. Under the old counting every child of the
-                // root was a leaf and this assertion failed.
-                let mut sv = Solver::new(
+                let sv = Solver::new(
                     &s,
                     ctx,
                     &nets,
                     Cfg {
-                        depth: 1,
-                        iters: 4,
-                        snapshots: false,
+                        nodes: 200_000,
                         ..Default::default()
                     },
                     bel,
                 );
-                sv.multistep(4);
                 assert!(
-                    sv.nodes.iter().skip(1).any(|n| !n.leaf),
-                    "depth 1 was consumed by a tactic micro-choice: nothing expanded below the root"
+                    sv.nodes
+                        .iter()
+                        .zip(&sv.states)
+                        .skip(1)
+                        .any(|(n, state)| {
+                            !n.leaf && !matches!(state.pending(), Cont::MainPlay)
+                        }),
+                    "the compound play's micro-decision was not grown"
                 );
-                // Depth 2: the opponent's first main play is reached after
-                // one completed coin play, so it must be expanded, not a leaf.
-                let mut sv = Solver::new(
-                    &s,
-                    ctx,
-                    &nets,
-                    Cfg {
-                        depth: 2,
-                        iters: 4,
-                        snapshots: false,
-                        ..Default::default()
-                    },
-                    [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)],
+                assert!(
+                    sv.nodes.iter().zip(&sv.states).all(|(n, state)| {
+                        !n.leaf
+                            || state.is_terminal()
+                            || matches!(state.pending(), Cont::MainPlay)
+                    }),
+                    "a micro-decision remained as a value leaf"
                 );
-                sv.multistep(4);
-                if sv.nodes.iter().any(|n| n.player != root_player) {
-                    assert!(
-                        sv.nodes.iter().any(|n| n.player != root_player && !n.leaf),
-                        "depth 2 contained only leaf opponent nodes: the opponent's move never got expanded"
-                    );
-                }
                 return;
             }
             s.apply_inplace(acts[rng.below(acts.len())]);
         }
     }
-    panic!("no position with a free micro-choice found in 400 random games");
+    panic!("no compound play found in 400 random games");
 }

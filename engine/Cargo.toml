@@ -14,29 +14,21 @@ crate-type = ["cdylib", "rlib"]
 pyo3 = { version = "0.21", features = ["abi3-py39", "extension-module"], optional = true }
 numpy = { version = "0.21", optional = true }
 rayon = "1.10"
-matrixmultiply = "0.3"
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# Dynamic loading means no CUDA toolkit at build time, and NVRTC compiles the
+# kernels at startup, so the crate still builds where there is no GPU.
 cudarc = { version = "0.17", optional = true, default-features = false, features = ["cuda-version-from-build-system", "dynamic-loading", "driver", "nvrtc", "cublas"] }
+serde_json = "1"
 
 [features]
 default = []
 python = ["pyo3", "numpy"]
 # Phase timers inside the generation loop; adds ~5% overhead.
 prof = []
-# The CUDA solve service (work package B). Dynamic-loading cudarc needs no
-# CUDA toolkit at build time; the kernels are compiled by NVRTC at startup.
-# Bind to the toolkit on the machine that builds the GPU feature. This matters
-# for NVRTC's versioned API: CUDA 13 removed symbols that a CUDA-12 binding
-# eagerly loads, even though the kernels themselves are source-compatible.
+# The CUDA inference backend. Built on the box; everything else builds without
+# it and falls back to the CPU network, which is also the parity reference.
 gpu = ["dep:cudarc"]
-
-# Needs the CUDA feature; without this `cargo test` cannot even build the
-# examples, so the whole CPU suite fails on a machine with no GPU.
-[[example]]
-name = "wave_tape"
-required-features = ["gpu"]
 
 [[bin]]
 name = "bench"
