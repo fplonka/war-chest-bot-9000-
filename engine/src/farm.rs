@@ -107,19 +107,26 @@ pub enum Round {
     Empty,
 }
 
+// The mailbox this thread reads its answers from, set for as long as it is a
+// member of the gate. A solver reaches `submit` through the shared `Nets`,
+// which cannot carry anything per-thread.
+thread_local! {
+    static SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
 #[derive(Default)]
 struct Pending {
     /// Threads currently running a solve, so currently able to park.
     live: usize,
     parked: usize,
-    calls: Vec<Option<Call>>,
-    replies: Vec<Option<Reply>>,
-    /// Bumped when the driver publishes replies, which is what a parked
-    /// thread waits on rather than on a flag it could miss.
-    epoch: u64,
-    /// Answers published and not yet picked up. The next round may not start
-    /// while this is non-zero.
-    uncollected: usize,
+    /// Submitted and not yet taken by a round, each with the mailbox to answer.
+    calls: Vec<(usize, Call)>,
+    /// One mailbox per member. A thread reads only its own, so the driver may
+    /// publish the next round's answers while this one is still waking up —
+    /// which is the whole reason mailboxes are per thread and not per round.
+    mail: Vec<Option<Reply>>,
+    /// Mailboxes of members that have left, to be handed out again.
+    free: Vec<usize>,
     /// Set when the farm is winding down: parked threads wake and get nothing.
     closed: bool,
 }
@@ -143,44 +150,39 @@ impl Default for Gate {
 }
 
 impl Gate {
-    /// Join the round count for as long as the returned guard lives.
+    /// Join the round count, and take a mailbox, for as long as the returned
+    /// guard lives.
     pub fn enter(&self) -> Member<'_> {
         let mut g = self.round.lock();
         g.live += 1;
-        Member { gate: self }
+        let slot = g.free.pop().unwrap_or_else(|| {
+            g.mail.push(None);
+            g.mail.len() - 1
+        });
+        SLOT.with(|s| s.set(slot));
+        Member { gate: self, slot }
     }
 
-    /// Submit one call and park until the driver has run the round.
+    /// Submit one call and park until the driver has answered it.
     ///
     /// Returns `None` only when the farm is closing, which is the one case a
     /// caller cannot serve and must unwind from.
     pub fn submit(&self, call: Call) -> Option<Reply> {
+        let slot = SLOT.with(|s| s.get());
+        assert_ne!(slot, usize::MAX, "submitting from a thread that never entered");
         let mut g = self.round.lock();
         if g.closed {
             return None;
         }
-        let epoch = g.epoch;
-        let ticket = g.calls.len();
-        g.calls.push(Some(call));
+        g.calls.push((slot, call));
         g.parked += 1;
         if g.parked == g.live {
             self.full.notify_one();
         }
-        while g.epoch == epoch && !g.closed {
+        while g.mail[slot].is_none() && !g.closed {
             self.done.wait(&mut g);
         }
-        if g.epoch == epoch {
-            return None; // closed under us
-        }
-        let reply = g.replies.get_mut(ticket).and_then(|r| r.take());
-        // Our round has been answered, and the driver holds the next one back
-        // until every answer of this one is collected — so this slot is still
-        // ours however late we woke.
-        g.uncollected -= 1;
-        if g.uncollected == 0 {
-            self.full.notify_one();
-        }
-        reply
+        g.mail[slot].take()
     }
 
     /// Wait for a full round, hand the calls to `eval`, publish what it
@@ -223,17 +225,8 @@ impl Gate {
     where
         F: FnOnce(&[Call]) -> Vec<Reply>,
     {
-        let mut g = self.round.lock();
-        // Publishing a round's answers overwrites the last round's. A thread
-        // that woke late would then read this round's reply at its own ticket
-        // — another solve's answer, of another solve's size, with nothing to
-        // say it is wrong. So the previous round is not finished until every
-        // answer has been picked up. That costs a lock and a move per thread,
-        // not a solve, so it is not the straggler stall the patience avoids.
-        while !g.closed && g.uncollected > 0 {
-            self.full.wait(&mut g);
-        }
         let deadline = patience.map(|p| std::time::Instant::now() + p);
+        let mut g = self.round.lock();
         while !g.closed && (g.live == 0 || g.parked < g.live) {
             if exit_when_idle && g.live == 0 {
                 return None;
@@ -255,21 +248,19 @@ impl Gate {
         if g.closed {
             return None;
         }
-        let calls: Vec<Call> = g.calls.drain(..).map(|c| c.expect("a filled slot")).collect();
+        let (slots, calls): (Vec<usize>, Vec<Call>) = g.calls.drain(..).unzip();
 
-        // The lock is held across `eval` on purpose. Every live thread is
-        // parked on `done`, so none of them wants it; the only thread that
-        // could take it is one just entering, and letting it in here would
-        // give it ticket zero of a round that is already being answered. It
-        // waits and joins the next round instead.
+        // The lock is held across `eval` on purpose: every live thread is
+        // parked on `done`, so none of them wants it, and a thread just
+        // entering would otherwise take a mailbox this round is about to fill.
         let rows = calls.iter().map(Call::rows).sum();
         let replies = eval(&calls);
         assert_eq!(replies.len(), calls.len(), "one reply per call");
 
-        g.replies = replies.into_iter().map(Some).collect();
-        g.uncollected = g.replies.len();
+        for (slot, reply) in slots.into_iter().zip(replies) {
+            g.mail[slot] = Some(reply);
+        }
         g.parked = 0;
-        g.epoch += 1;
         self.done.notify_all();
         Some(rows)
     }
@@ -292,12 +283,16 @@ impl Gate {
 /// for, or the last round of a run never fills.
 pub struct Member<'a> {
     gate: &'a Gate,
+    slot: usize,
 }
 
 impl Drop for Member<'_> {
     fn drop(&mut self) {
         let mut g = self.gate.round.lock();
         g.live -= 1;
+        g.mail[self.slot] = None;
+        g.free.push(self.slot);
+        SLOT.with(|s| s.set(usize::MAX));
         // The thread that just left may have been the one the round was
         // waiting on — and if it was the last one out, a drain waiting for the
         // count to reach zero has to be told, or it waits for ever.

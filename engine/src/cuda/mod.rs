@@ -114,6 +114,22 @@ impl LaunchUnit for LaunchArgs<'_> {
     }
 }
 
+/// `launch!(self, kernel, elements, args...)` — one kernel over `elements`
+/// work items. The builder is the same nine lines every time, and spelling it
+/// out buries the arithmetic it is there to express.
+macro_rules! launch {
+    ($card:expr, $kernel:ident, $n:expr, $($arg:expr),+ $(,)?) => {{
+        let n = $n;
+        unsafe {
+            $card.stream
+                .launch_builder(&$card.k.$kernel)
+                $(.arg($arg))+
+                .launch_unit(spread(n))
+        }
+        .map_err(err)
+    }};
+}
+
 /// Threads per block for the elementwise kernels.
 const THREADS: u32 = 256;
 
@@ -319,16 +335,7 @@ impl Card {
         }
         let bias = self.b.slice(s.b..s.b + s.o);
         let (rows, width) = (rows as i32, s.o as i32);
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.bias)
-                .arg(out)
-                .arg(&bias)
-                .arg(&rows)
-                .arg(&width)
-                .launch_unit(spread(rows as usize * s.o))
-        }
-        .map_err(err)
+        launch!(self, bias, rows as usize * s.o, out, &bias, &rows, &width)
     }
 
     /// `Lin::run`: the GEMM and then the bias.
@@ -367,15 +374,7 @@ impl Card {
 
     fn add(&self, x: &mut CudaSlice<f32>, y: &CudaSlice<f32>, n: usize) -> Res<()> {
         let n_i = n as i32;
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.add)
-                .arg(x)
-                .arg(y)
-                .arg(&n_i)
-                .launch_unit(spread(n))
-        }
-        .map_err(err)
+        launch!(self, add, n, x, y, &n_i)
     }
 
     fn alloc(&self, n: usize) -> Res<CudaSlice<f32>> {
@@ -429,105 +428,31 @@ impl Card {
         // Tokens: projected pile counts, then the card token and seat on top.
         let mut piles = self.alloc(rows * NTYPE * PILE_COUNTS)?;
         let (off, width) = (OFF_PILES as i32, (NTYPE * PILE_COUNTS) as i32);
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.window)
-                .arg(&xpub)
-                .arg(&mut piles)
-                .arg(&rows_i)
-                .arg(&stride)
-                .arg(&off)
-                .arg(&width)
-                .launch_unit(spread(rows * NTYPE * PILE_COUNTS))
-        }
-        .map_err(err)?;
+        launch!(self, window, rows * NTYPE * PILE_COUNTS, &xpub, &mut piles, &rows_i, &stride, &off, &width)?;
         let mut tokens = self.alloc(rows * NTYPE * TYPE)?;
         self.lin(l.pile, &piles, rows * NTYPE, 0.0, &mut tokens)?;
         let seat = self.w.slice(l.seat..l.seat + 2 * TYPE);
         let type_i = TYPE as i32;
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.tokens)
-                .arg(&cards)
-                .arg(&card_of_row)
-                .arg(&seat)
-                .arg(&mut tokens)
-                .arg(&rows_i)
-                .arg(&ntype)
-                .arg(&type_i)
-                .arg(&nslot)
-                .launch_unit(spread(rows * NTYPE * TYPE))
-        }
-        .map_err(err)?;
+        launch!(self, tokens, rows * NTYPE * TYPE, &cards, &card_of_row, &seat, &mut tokens, &rows_i, &ntype, &type_i, &nslot)?;
 
         // Stem.
         let mut projected = self.alloc(rows * NTYPE * C)?;
         self.run(l.tok_stem, &tokens, rows * NTYPE, &mut projected)?;
         let mut type_pool = self.alloc(rows * C)?;
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.type_pool)
-                .arg(&projected)
-                .arg(&mut type_pool)
-                .arg(&rows_i)
-                .arg(&ntype)
-                .arg(&chan)
-                .launch_unit(spread(rows * C))
-        }
-        .map_err(err)?;
+        launch!(self, type_pool, rows * C, &projected, &mut type_pool, &rows_i, &ntype, &chan)?;
         let mut loose = self.alloc(rows * LOOSE)?;
         let (off, width) = (OFF_LOOSE as i32, LOOSE as i32);
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.window)
-                .arg(&xpub)
-                .arg(&mut loose)
-                .arg(&rows_i)
-                .arg(&stride)
-                .arg(&off)
-                .arg(&width)
-                .launch_unit(spread(rows * LOOSE))
-        }
-        .map_err(err)?;
+        launch!(self, window, rows * LOOSE, &xpub, &mut loose, &rows_i, &stride, &off, &width)?;
         let mut glob = self.alloc(rows * C)?;
         self.run(l.glob_stem, &loose, rows, &mut glob)?;
         let mut facts = self.alloc(cells * HEX_FACTS)?;
         let mut occupant = self.stream.alloc_zeros::<i32>(cells.max(1)).map_err(err)?;
         let (hex_ch, hex_facts) = (HEX_CH as i32, HEX_FACTS as i32);
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.hex_facts)
-                .arg(&xpub)
-                .arg(&mut facts)
-                .arg(&mut occupant)
-                .arg(&rows_i)
-                .arg(&stride)
-                .arg(&nhex)
-                .arg(&hex_ch)
-                .arg(&hex_facts)
-                .arg(&ntype)
-                .launch_unit(spread(cells))
-        }
-        .map_err(err)?;
+        launch!(self, hex_facts, cells, &xpub, &mut facts, &mut occupant, &rows_i, &stride, &nhex, &hex_ch, &hex_facts, &ntype)?;
         let mut x = self.alloc(cells * C)?;
         self.run(l.hex_stem, &facts, cells, &mut x)?;
         let pos = self.w.slice(l.pos..l.pos + N_HEXES * C);
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.stem)
-                .arg(&mut x)
-                .arg(&projected)
-                .arg(&occupant)
-                .arg(&pos)
-                .arg(&glob)
-                .arg(&type_pool)
-                .arg(&cells_i)
-                .arg(&nhex)
-                .arg(&ntype)
-                .arg(&chan)
-                .launch_unit(spread(cells * C))
-        }
-        .map_err(err)?;
+        launch!(self, stem, cells * C, &mut x, &projected, &occupant, &pos, &glob, &type_pool, &cells_i, &nhex, &ntype, &chan)?;
 
         // Residual blocks over the board's adjacency.
         let mut a = self.alloc(cells * C)?;
@@ -541,42 +466,11 @@ impl Card {
                 .memcpy_dtod(&x.slice(0..cells * C), &mut a)
                 .map_err(err)?;
             self.norm(l.norms[ln_block(i, 0)], cells, true, &mut a)?;
-            unsafe {
-                self.stream
-                    .launch_builder(&self.k.neighbour_mix)
-                    .arg(&a)
-                    .arg(&self.nb)
-                    .arg(&mut mixed)
-                    .arg(&cells_i)
-                    .arg(&nhex)
-                    .arg(&chan)
-                    .launch_unit(spread(cells * C))
-            }
-            .map_err(err)?;
+            launch!(self, neighbour_mix, cells * C, &a, &self.nb, &mut mixed, &cells_i, &nhex, &chan)?;
             self.run(blk.mix, &mixed, cells, &mut y)?;
-            unsafe {
-                self.stream
-                    .launch_builder(&self.k.pool)
-                    .arg(&a)
-                    .arg(&mut pooled)
-                    .arg(&rows_i)
-                    .arg(&nhex)
-                    .arg(&chan)
-                    .launch_unit(spread(rows * C))
-            }
-            .map_err(err)?;
+            launch!(self, pool, rows * C, &a, &mut pooled, &rows_i, &nhex, &chan)?;
             self.run(blk.pool, &pooled, rows, &mut gb)?;
-            unsafe {
-                self.stream
-                    .launch_builder(&self.k.group_bias)
-                    .arg(&mut y)
-                    .arg(&gb)
-                    .arg(&cells_i)
-                    .arg(&chan)
-                    .arg(&nhex)
-                    .launch_unit(spread(cells * C))
-            }
-            .map_err(err)?;
+            launch!(self, group_bias, cells * C, &mut y, &gb, &cells_i, &chan, &nhex)?;
             self.norm(l.norms[ln_block(i, 1)], cells, true, &mut y)?;
             self.run(blk.out, &y, cells, &mut z)?;
             self.add(&mut x, &z, cells * C)?;
@@ -588,21 +482,7 @@ impl Card {
         let width = 2 * C + LOOSE;
         let mut input = self.alloc(rows * width)?;
         let (off, loose_i) = (OFF_LOOSE as i32, LOOSE as i32);
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.board_input)
-                .arg(&x)
-                .arg(&xpub)
-                .arg(&mut input)
-                .arg(&rows_i)
-                .arg(&nhex)
-                .arg(&chan)
-                .arg(&stride)
-                .arg(&off)
-                .arg(&loose_i)
-                .launch_unit(spread(rows * width))
-        }
-        .map_err(err)?;
+        launch!(self, board_input, rows * width, &x, &xpub, &mut input, &rows_i, &nhex, &chan, &stride, &off, &loose_i)?;
         let mut p = self.alloc(rows * D)?;
         self.run(l.board_out, &input, rows, &mut p)?;
         let mut jp = self.alloc(rows * JW)?;
@@ -657,45 +537,14 @@ impl Card {
 
         let width = 3 + TYPE;
         let mut slots = self.alloc(n * NSLOT * width)?;
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.cfg_slots)
-                .arg(&phi)
-                .arg(&owner)
-                .arg(&cards)
-                .arg(&mut slots)
-                .arg(&n_i)
-                .arg(&nslot)
-                .arg(&cfeat)
-                .arg(&ntype)
-                .arg(&type_i)
-                .launch_unit(spread(n * NSLOT * width))
-        }
-        .map_err(err)?;
+        launch!(self, cfg_slots, n * NSLOT * width, &phi, &owner, &cards, &mut slots, &n_i, &nslot, &cfeat, &ntype, &type_i)?;
         let mut hidden = self.alloc(n * NSLOT * CFGH)?;
         self.run(l.cfg1, &slots, n * NSLOT, &mut hidden)?;
         let hid = (n * NSLOT * CFGH) as i32;
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.gelu)
-                .arg(&mut hidden)
-                .arg(&hid)
-                .launch_unit(spread(n * NSLOT * CFGH))
-        }
-        .map_err(err)?;
+        launch!(self, gelu, n * NSLOT * CFGH, &mut hidden, &hid)?;
         let mut u = self.alloc(n * CFGH)?;
         let cfgh = CFGH as i32;
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.sum_slots)
-                .arg(&hidden)
-                .arg(&mut u)
-                .arg(&n_i)
-                .arg(&nslot)
-                .arg(&cfgh)
-                .launch_unit(spread(n * CFGH))
-        }
-        .map_err(err)?;
+        launch!(self, sum_slots, n * CFGH, &hidden, &mut u, &n_i, &nslot, &cfgh)?;
         self.norm(l.norms[LN_CFG], n, true, &mut u)?;
         let mut f = self.alloc(n * D)?;
         let mut g = self.alloc(n * POOL)?;
@@ -705,21 +554,7 @@ impl Card {
         // The linear half of `g`, which pooling carries exactly.
         let mut bag = self.alloc(views * NTYPE * 3 * POOL)?;
         self.run(l.cfg_m, &cards, views * NTYPE, &mut bag)?;
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.bag)
-                .arg(&bag)
-                .arg(&phi)
-                .arg(&owner)
-                .arg(&mut g)
-                .arg(&n_i)
-                .arg(&nslot)
-                .arg(&ntype)
-                .arg(&cfeat)
-                .arg(&pool_i)
-                .launch_unit(spread(n * POOL))
-        }
-        .map_err(err)?;
+        launch!(self, bag, n * POOL, &bag, &phi, &owner, &mut g, &n_i, &nslot, &ntype, &cfeat, &pool_i)?;
 
         let (f, g) = (self.down(&f, n * D)?, self.down(&g, n * POOL)?);
         let mut at = 0;
@@ -770,17 +605,7 @@ impl Card {
         let player = self.up(&player)?;
 
         let mut input = self.alloc(rows * JOIN_IN)?;
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.join_input)
-                .arg(&pooled)
-                .arg(&player)
-                .arg(&mut input)
-                .arg(&rows_i)
-                .arg(&pool_i)
-                .launch_unit(spread(rows * JOIN_IN))
-        }
-        .map_err(err)?;
+        launch!(self, join_input, rows * JOIN_IN, &pooled, &player, &mut input, &rows_i, &pool_i)?;
 
         let mut z = self.alloc(rows * JW)?;
         self.stream
