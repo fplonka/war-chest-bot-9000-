@@ -10,6 +10,7 @@ pub mod actions;
 pub mod arena;
 pub mod args;
 pub mod board;
+pub mod contract;
 #[cfg(feature = "gpu")]
 pub mod cuda;
 pub mod farm;
