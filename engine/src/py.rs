@@ -621,6 +621,14 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     out.set_item("cw", d.cw.into_pyarray_bound(py))?;
     out.set_item("cy", d.cy.into_pyarray_bound(py))?;
     out.set_item("coff", d.coff.into_pyarray_bound(py))?;
+    // The policy target: the root's actions per row, and per config the legal
+    // cells with their probability.
+    out.set_item("pa", d.pa.into_pyarray_bound(py))?;
+    out.set_item("paoff", d.paoff.into_pyarray_bound(py))?;
+    out.set_item("pcoff", d.pcoff.into_pyarray_bound(py))?;
+    out.set_item("pci", d.pci.into_pyarray_bound(py))?;
+    out.set_item("pcell", d.pcell.into_pyarray_bound(py))?;
+    out.set_item("pprob", d.pprob.into_pyarray_bound(py))?;
     out.set_item("soff", soff.into_pyarray_bound(py))?;
     out.set_item("solves", n_solves)?;
     Ok(out.into())
@@ -1071,6 +1079,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("N_UNITS", crate::units::N_UNITS)?;
     m.add("NSLOT", crate::rebel::NSLOT)?;
     m.add("N_KINDS", crate::actions::N_KINDS)?;
+    m.add("ACT_BYTES", crate::search::ACT_BYTES)?;
     m.add("CARD_FEATS", crate::units::CARD_FEATS)?;
     // Block offsets in the public half of the encoding. Exported so the
     // training side can build the mirror permutation from one source of truth

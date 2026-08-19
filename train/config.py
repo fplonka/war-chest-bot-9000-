@@ -49,6 +49,10 @@ class Cfg:
     # policy averaging, against simultaneous updates. `Solver::step` supplies
     # the simultaneous half.
     cfr: str = "sog"
+    # Student of Games weights the two heads, `wv * huber + wp * cross_entropy`.
+    # The value head is what CFR consumes, so it keeps weight one and the
+    # policy -- which only steers the expansion phase -- comes in under it.
+    policy_w: float = 0.5
     # ReBeL's and Student of Games' off-policy exploration rate; both run 0.1.
     explore: float = 0.1
     temp: float = 2.0

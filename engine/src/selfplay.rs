@@ -197,9 +197,13 @@ pub struct Data {
     /// described the way the policy head reads one. `paoff` bounds a row.
     pub pa: Vec<u8>,
     pub paoff: Vec<u32>,
-    /// `[total_configs + 1]` offsets into the cell arrays below.
+    /// `[n + 1]` offsets into the cell arrays below, by row.
     pub pcoff: Vec<u32>,
-    /// Per cell: which of the row's actions it is, and its target probability.
+    /// Per cell: which config it belongs to, as an index into the row's own
+    /// configs *across both players*, which of the row's actions it is, and the
+    /// target probability. Indexed within the row rather than within the acting
+    /// support so a batch never has to know which seat acted.
+    pub pci: Vec<u16>,
     pub pcell: Vec<u8>,
     pub pprob: Vec<f32>,
     /// Decisions by coarse move class, for the run report's strategy mix.
@@ -247,6 +251,7 @@ impl Data {
             self.pcell.len() as u32,
         );
         self.pa.extend(o.pa);
+        self.pci.extend(o.pci);
         self.pcell.extend(o.pcell);
         self.pprob.extend(o.pprob);
         self.paoff.extend(o.paoff.iter().skip(tail).map(|x| x + ab));
@@ -306,6 +311,7 @@ impl Data {
             self.pa.extend_from_slice(a);
         }
         self.paoff.push((self.pa.len() / crate::search::ACT_BYTES) as u32);
+        self.pcoff.push(0); // rewritten below, once the cells are known
         for p in 0..2 {
             let res = reserve(s, p as u8, ctx);
             let mut cnt = [0u8; CCOUNTS];
@@ -316,13 +322,16 @@ impl Data {
                 self.cy.push(y[p][ci]);
                 if usable && p == actor {
                     let row = policy.off[ci] as usize..policy.off[ci + 1] as usize;
+                    let within = if actor == 0 { ci } else { bel[0].len() + ci };
+                    self.pci
+                        .extend(std::iter::repeat(within as u16).take(row.len()));
                     self.pcell.extend_from_slice(&policy.act[row.clone()]);
                     self.pprob.extend_from_slice(&policy.p[row]);
                 }
-                self.pcoff.push(self.pcell.len() as u32);
             }
             self.coff.push(self.cw.len() as u32);
         }
+        *self.pcoff.last_mut().expect("row offset") = self.pcell.len() as u32;
         self.nv += 1;
     }
 
@@ -690,12 +699,17 @@ impl GameStream {
         let want = draw_count(&mut self.rng, self.gc.recursive_rate);
         let solved = sv.harvest(&mut self.rng, want);
         out.begin_solve();
+        // Value only. Student of Games assembles policy targets from "the
+        // searches started at public states along the main line of episodes";
+        // a query solve is off that line, and its job is coverage of the value
+        // function. Its policy would also be trained against, and so reinforce,
+        // states self-play never actually reaches.
         out.push_value(
             &s,
             &ctx,
             &bel,
             [&solved.value[0], &solved.value[1]],
-            &solved.policy,
+            &Default::default(),
         );
         out.queries += 1;
         self.enqueue(solved.queries);
@@ -914,16 +928,21 @@ mod policy_target_tests {
             assert!(na > 0, "a solved root must offer actions");
             assert_eq!(na, sv.nodes[0].na(), "action count");
 
-            for (k, ci) in span.enumerate() {
-                let row = d.pcoff[ci] as usize..d.pcoff[ci + 1] as usize;
+            let cells = d.pcoff[0] as usize..d.pcoff[1] as usize;
+            let shift = if actor == 0 { 0 } else { bel[0].len() };
+            for k in 0..span.len() {
+                let mine: Vec<usize> = cells
+                    .clone()
+                    .filter(|&cell| d.pci[cell] as usize == k + shift)
+                    .collect();
                 let want = sv.average_strategy(0, k);
-                assert_eq!(row.len(), want.len(), "config {k}: cell count");
-                let total: f32 = d.pprob[row.clone()].iter().sum();
+                assert_eq!(mine.len(), want.len(), "config {k}: cell count");
+                let total: f32 = mine.iter().map(|&cell| d.pprob[cell]).sum();
                 assert!(
                     (total - 1.0).abs() < 1e-4,
                     "config {k}: policy sums to {total}"
                 );
-                for (j, cell) in row.enumerate() {
+                for (j, &cell) in mine.iter().enumerate() {
                     assert_eq!(
                         d.pprob[cell], want[j],
                         "config {k} cell {j}: stored policy differs"
@@ -931,13 +950,12 @@ mod policy_target_tests {
                     assert!((d.pcell[cell] as usize) < na, "action index out of range");
                 }
             }
-            // The idle player's configs carry no policy.
-            for ci in d.row_span(0, 1 - actor) {
-                assert_eq!(
-                    d.pcoff[ci], d.pcoff[ci + 1],
-                    "the idle player must carry no policy row"
-                );
-            }
+            let total = bel[0].len() + bel[1].len();
+            assert_eq!(
+                d.pci.iter().filter(|&&c| c as usize >= total).count(),
+                0,
+                "a cell names a config outside the row"
+            );
             checked += 1;
         }
         assert!(checked > 0, "no uncapped solve to check");

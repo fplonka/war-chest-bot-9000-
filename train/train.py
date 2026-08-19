@@ -53,7 +53,7 @@ import warchest
 import config
 import mirror
 from export_weights import load as load_checkpoint
-from value_net import Net
+from value_net import AFEAT, Net
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -62,6 +62,31 @@ CFEAT = warchest.CFEAT
 CCOUNTS = warchest.CCOUNTS
 CNORM = warchest.CNORM
 ROW_BYTES = warchest.ROW_BYTES
+ACT_BYTES = warchest.ACT_BYTES
+N_KINDS = warchest.N_KINDS
+NSLOT = warchest.NSLOT
+N_HEXES = warchest.N_HEXES
+
+
+def action_feats(pa):
+    """The five stored bytes of each action into the head's one-hot input.
+
+    The layout is the contract with `Net::action_feats`: kind, the coin slot it
+    spends with the last column meaning none, then the three squares it names
+    with the last column meaning no square.
+    """
+    feat = np.zeros((len(pa), AFEAT), np.float32)
+    if not len(pa):
+        return feat
+    idx = np.arange(len(pa))
+    feat[idx, pa[:, 0]] = 1.0
+    feat[idx, N_KINDS + pa[:, 1]] = 1.0
+    at = N_KINDS + NSLOT + 1
+    for k in range(3):
+        h = np.where(pa[:, 2 + k] == 255, N_HEXES, pa[:, 2 + k].astype(np.int64))
+        feat[idx, at + h] = 1.0
+        at += N_HEXES + 1
+    return feat
 
 
 def public_sizes(cc, cp, seg, n):
@@ -123,13 +148,28 @@ class Buffer:
         self.cp = np.zeros(ccap, np.uint8)
         self.cw = np.zeros(ccap, np.float16)
         self.cy = np.zeros(ccap, np.float16)
+        # The policy target, per row: the root's actions, and the legal cells
+        # with their probability. Only main-line rows carry one, so both arenas
+        # are sized off the row cap rather than the config cap.
+        self.pastart = np.zeros(cap, np.int64)
+        self.palen = np.zeros(cap, np.int32)
+        self.pcstart = np.zeros(cap, np.int64)
+        self.pclen = np.zeros(cap, np.int32)
+        self.acap = cap * 24
+        self.pcap = cap * 96
+        self.pa = np.zeros((self.acap, ACT_BYTES), np.uint8)
+        self.pci = np.zeros(self.pcap, np.uint16)
+        self.pact = np.zeros(self.pcap, np.uint8)
+        self.pp = np.zeros(self.pcap, np.float16)
+        self.acts = 0
+        self.cells = 0
         self.rows = 0   # rows ever written
         # (rows written, when) at each insertion, trimmed to the live window.
         self.stamps = collections.deque()
         self.cfgs = 0   # configs ever written
         self.lo = 0     # oldest row whose configs are still in the arena
 
-    def add(self, x, cc, cw, cy, coff, soff):
+    def add(self, x, cc, cw, cy, coff, soff, pol=None):
         n = len(x)
         lens = np.diff(coff).reshape(n, 2)
         cp = np.repeat(np.tile([0, 1], n).astype(np.uint8), lens.ravel())
@@ -144,6 +184,23 @@ class Buffer:
         m = len(cw)
         sl = (np.arange(m) + self.cfgs) % self.ccap
         self.cc[sl], self.cp[sl], self.cw[sl], self.cy[sl] = cc, cp, cw, cy
+        if pol is not None:
+            pa, paoff, pcoff, pci, pact, pprob = pol
+            alen = np.diff(paoff).astype(np.int32)
+            clen = np.diff(pcoff).astype(np.int32)
+            for i in range(0, n, 4096):
+                j = min(i + 4096, n)
+                sl = (np.arange(i, j) + base) % self.cap
+                self.pastart[sl] = self.acts + paoff[i:j]
+                self.palen[sl] = alen[i:j]
+                self.pcstart[sl] = self.cells + pcoff[i:j]
+                self.pclen[sl] = clen[i:j]
+            na, nc = len(pa), len(pci)
+            self.pa[(np.arange(na) + self.acts) % self.acap] = pa
+            at = (np.arange(nc) + self.cells) % self.pcap
+            self.pci[at], self.pact[at], self.pp[at] = pci, pact, pprob
+            self.acts += na
+            self.cells += nc
         self.rows += n
         self.cfgs += m
         # Solve offsets in absolute row space (first entry 0, trailing count).
@@ -189,8 +246,32 @@ class Buffer:
             np.concatenate([[0], np.cumsum(lens)[:-1]]), lens)
         at = (base + within) % self.ccap
         seg = 2 * np.repeat(np.arange(len(ids), dtype=np.int64), lens) + self.cp[at]
+        # The policy target, remapped onto the batch. A row with no target
+        # contributes no cells, which is how a query solve and the warm start
+        # drop out of the policy loss without a mask.
+        alen, clen = self.palen[s].astype(np.int64), self.pclen[s].astype(np.int64)
+        ai = (np.repeat(self.pastart[s], alen)
+              + (np.arange(int(alen.sum()), dtype=np.int64)
+                 - np.repeat(np.concatenate([[0], np.cumsum(alen)[:-1]]), alen)))
+        ci = (np.repeat(self.pcstart[s], clen)
+              + (np.arange(int(clen.sum()), dtype=np.int64)
+                 - np.repeat(np.concatenate([[0], np.cumsum(clen)[:-1]]), clen)))
+        # An action's index becomes batch-global, and a cell names the query
+        # (row, acting config) it belongs to.
+        abase = np.concatenate([[0], np.cumsum(alen)[:-1]])
+        cellrow = np.repeat(np.arange(len(ids), dtype=np.int64), clen)
+        # A cell names its config within its own row; the batch arena puts that
+        # row's configs at `rowbase`, so the two add to an arena index.
+        rowbase = np.concatenate([[0], np.cumsum(lens)[:-1]])
+        pol = (self.pa[ai % self.acap],
+               np.repeat(abase, clen) + self.pact[ci % self.pcap],
+               cellrow,
+               np.repeat(rowbase, clen) + self.pci[ci % self.pcap].astype(np.int64),
+               self.pp[ci % self.pcap].astype(np.float32),
+               np.repeat(np.arange(len(ids), dtype=np.int64), alen))
         return (self.x[s], self.cc[at], self.cp[at],
-                self.cw[at].astype(np.float32), self.cy[at].astype(np.float32), seg)
+                self.cw[at].astype(np.float32), self.cy[at].astype(np.float32),
+                seg, pol)
 
     def sample(self, batch, rng, recent_mix=0.0, recent_frac=0.2):
         """A batch, part of it drawn from the newest rows only.
@@ -238,7 +319,7 @@ class Buffer:
 def make_batch(parts, rng, device):
     """Numpy replay batch -> the two canonical player queries per row."""
     del rng
-    rows, cc, cp, cw, cy, seg = parts
+    rows, cc, cp, cw, cy, seg, pol = parts
     n = len(rows)
     hand, fd, bag = public_sizes(cc, cp, seg, n)
     views = np.empty((2 * n, ROW_BYTES), np.uint8)
@@ -253,15 +334,21 @@ def make_batch(parts, rng, device):
     x = expand_batch(views, *sizes)
     phi = cc.astype(np.float32) / CNORM
     t = lambda a, d=torch.float32: torch.as_tensor(a, dtype=d, device=device)
-    return (t(x), t(phi), t(cw), t(seg, torch.long), t(cy), 2 * n)
+    pa, pact, pcrow, pcfg, pprob, parow = pol
+    policy = (t(action_feats(pa)), t(parow, torch.long), t(pact, torch.long),
+              t(pcrow, torch.long), t(pcfg, torch.long), t(pprob))
+    return (t(x), t(phi), t(cw), t(seg, torch.long), t(cy), 2 * n, policy)
 
 
 def forward_values(net, parts):
-    return net(*parts[:4], parts[-1])
+    # `nseg` is the sixth element, not the last one: a batch carries the policy
+    # target after it.
+    return net(*parts[:4], parts[5])
 
 
-def losses(net, xpub, phi, w, seg, y, nseg, stats=None):
-    """Value Huber, mean per belief support and then across queries."""
+def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0, stats=None):
+    """Value Huber, mean per belief support and then across queries, plus the
+    policy cross-entropy Student of Games trains the second head with."""
     v = net(xpub, phi, w, seg, nseg)
     if stats is not None:
         expected = torch.zeros(nseg, dtype=v.dtype, device=v.device)
@@ -273,7 +360,53 @@ def losses(net, xpub, phi, w, seg, y, nseg, stats=None):
     count = torch.zeros(nseg, dtype=per.dtype, device=per.device)
     total.index_add_(0, seg, per)
     count.index_add_(0, seg, torch.ones_like(per))
-    return (total / count.clamp(min=1)).mean()
+    loss = (total / count.clamp(min=1)).mean()
+    # `L` and `L/var` are the *value* loss, as they were before the policy head
+    # existed, so the run report still compares with every run before it. The
+    # policy term is reported beside them, never folded into them.
+    if stats is not None:
+        stats["value_loss"] = float(loss.detach())
+    if policy is not None and wp > 0.0:
+        pl = policy_loss(net, xpub, phi, seg, nseg, policy)
+        if pl is not None:
+            if stats is not None:
+                stats["policy_loss"] = float(pl)
+            loss = loss + wp * pl
+    return loss
+
+
+def policy_loss(net, xpub, phi, seg, nseg, policy):
+    """Cross entropy of the policy head against the search's root average.
+
+    The head scores a `(config, action)` cell as `<f_p(c), e(a)>`, so the batch
+    is exactly the cells the solves stored. Each cell's softmax runs over its
+    own `(row, config)` group, which is one information state.
+    """
+    feat, parow, pact, _pcrow, pcfg, target = policy
+    if feat.shape[0] == 0 or pact.shape[0] == 0:
+        return None
+    cards = net.cards(xpub)
+    physical = xpub[0::2]
+    board = net.board(physical, net.tokens(physical, cards[0::2]))
+    _f, _g, fp = net.configs(phi, cards[:, :NSLOT], seg)
+    e = net.actions(feat, board, parow)
+
+    # `pcfg` is already an index into the batch's own config arena, so the cell
+    # reads its config vector directly.
+    logit = (fp[pcfg] * e[pact]).sum(1)
+
+    # One softmax per information state, over its own cells. `pcfg` is already
+    # unique across the batch, so it alone names the group.
+    group = pcfg
+    uniq, inv = torch.unique(group, return_inverse=True)
+    top = torch.full((len(uniq),), -1e30, device=logit.device)
+    top = top.scatter_reduce(0, inv, logit, reduce="amax")
+    ex = (logit - top[inv]).exp()
+    tot = torch.zeros(len(uniq), device=ex.device).index_add_(0, inv, ex)
+    logp = (logit - top[inv]) - tot[inv].clamp(min=1e-30).log()
+    per = -(target * logp)
+    out = torch.zeros(len(uniq), device=per.device).index_add_(0, inv, per)
+    return out.mean()
 
 
 @torch.no_grad()
@@ -288,17 +421,21 @@ def diagnostics(net, buf, probe, batch, rng, device, batch_fn, recent_frac):
     old = batch_fn(buf.sample_old(batch, rng, recent_frac), rng, device)
     new = batch_fn(buf.sample(batch, rng, recent_mix=1.0, recent_frac=recent_frac),
                    rng, device)
-    return spread, float(losses(net, *old)), float(losses(net, *new))
+    return (spread,
+            float(losses(net, *old, wp=0.0)),
+            float(losses(net, *new, wp=0.0)))
 
 
 def train_steps(net, opt, buf, steps, batch, rng, device,
                 recent_mix=0.0, recent_frac=0.2, profile_cuda=False,
-                batch_fn=make_batch):
-    """Mean value loss over `steps` Adam updates."""
+                batch_fn=make_batch, policy_w=0.0):
+    """Mean loss over `steps` Adam updates -- value, plus the policy head's
+    cross entropy at weight `policy_w`."""
     stat = {"sample_s": 0.0, "prepare_s": 0.0, "forward_wall_s": 0.0,
             "backward_wall_s": 0.0, "batch_configs": 0, "steps": steps,
             "gpu_forward_s": 0.0, "gpu_backward_s": 0.0,
-            "zero_sum_max": 0.0, "grad_clipped": 0}
+            "zero_sum_max": 0.0, "grad_clipped": 0,
+            "policy_loss": 0.0, "value_loss": 0.0, "policy_sum": 0.0}
     if len(buf) < batch:
         return float("nan"), stat
     tot = 0.0
@@ -318,8 +455,9 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
             b1 = torch.cuda.Event(enable_timing=True)
             f0.record(stream)
         ts = time.perf_counter()
-        value = losses(net, *parts, stats=stat)
-        tot += value.detach().item()
+        value = losses(net, *parts, wp=policy_w, stats=stat)
+        tot += stat.get("value_loss", float(value.detach()))
+        stat["policy_sum"] += stat.get("policy_loss", 0.0)
         stat["forward_wall_s"] += time.perf_counter() - ts
         if stream is not None:
             f1.record(stream)
@@ -581,8 +719,14 @@ def main():
             conv_s = time.time() - tc
             ta = time.time()
             if len(rows):
+                pol = (np.asarray(data["pa"], np.uint8).reshape(-1, ACT_BYTES),
+                       np.asarray(data["paoff"], np.int64),
+                       np.asarray(data["pcoff"], np.int64),
+                       np.asarray(data["pci"], np.uint16),
+                       np.asarray(data["pcell"], np.uint8),
+                       np.asarray(data["pprob"], np.float16))
                 buf.add(rows, cc, cw.astype(np.float16),
-                        cy.astype(np.float16), coff, soff)
+                        cy.astype(np.float16), coff, soff, pol)
             add_s = time.time() - ta
 
             solves = int(data["solves"])
@@ -624,11 +768,12 @@ def main():
                     recent_mix=args.recent_mix,
                     recent_frac=args.recent_frac,
                     profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1",
-                    batch_fn=batcher)
+                    batch_fn=batcher, policy_w=args.policy_w)
                 train_s = time.time() - tt
                 optimizer_steps += nsteps
                 optimizer_rows += nsteps * args.batch
                 window["loss_sum"] += lv * nsteps
+                window["policy_sum"] += train_stat["policy_sum"]
                 window["train_steps"] += nsteps
                 window["batch_configs"] += train_stat["batch_configs"]
                 window["gpu_forward_s"] += train_stat["gpu_forward_s"]
@@ -754,6 +899,7 @@ def main():
                 "buf_s": round(buf.span_seconds(), 1),
                 "solves_per_s": round(raw_sps, 1),
                 "lr": opt.param_groups[0]["lr"],
+                "policy_loss": window["policy_sum"] / max(window["train_steps"], 1),
             }
             log.append(rec)
             write_log(args, log, snaps)
@@ -763,6 +909,7 @@ def main():
                 f"games={rec['games']} qrows={rec['query_rows']} "
                 f"caps={totals['node_caps']} "
                 f"L={lv:.5f} L/var={lv / max(target_var, 1e-9):.2f} "
+                f"Lp={rec['policy_loss']:.3f} "
                 f"tgt={target_mean:+.3f}/{target_var ** 0.5:.3f} "
                 f"gen={gen_s:.2f}s train={train_s:.2f}s "
                 f"gpu={window['gpu_forward_s'] + window['gpu_backward_s']:.2f}s",
