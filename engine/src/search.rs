@@ -1975,13 +1975,9 @@ impl<'a> Solver<'a> {
             self.step(t % 2);
             let mut grew = false;
             for _ in 0..self.cfg.expand {
-                if self.nodes.len() >= self.cfg.nodes || self.over_cap() {
+                if self.nodes.len() >= self.cfg.nodes || !self.expand_once(rng) {
                     break;
                 }
-                let Some(leaf) = self.sample_leaf(rng) else {
-                    break;
-                };
-                self.grow(leaf);
                 grew = true;
             }
             if grew && !self.capped {
@@ -1993,6 +1989,24 @@ impl<'a> Solver<'a> {
         if !self.capped {
             self.finish();
         }
+    }
+
+    /// One expansion simulation, and the growth it produces: sample a world
+    /// from the root beliefs, walk down under the average strategy, and grow
+    /// the leaf it reaches. The counterpart to `step` — a GT-CFR iteration is
+    /// one `step` followed by `expand` of these.
+    ///
+    /// False when nothing grew, which is a spent budget, a trajectory that ran
+    /// into a terminal, or a config with no legal action there.
+    pub fn expand_once(&mut self, rng: &mut Rng) -> bool {
+        if self.over_cap() {
+            return false;
+        }
+        let Some(leaf) = self.sample_leaf(rng) else {
+            return false;
+        };
+        self.grow(leaf);
+        !self.capped
     }
 
     /// Grow the whole subgame, to the node budget or until nothing is left to
