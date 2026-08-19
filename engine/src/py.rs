@@ -641,7 +641,7 @@ struct SolveFarm {
 #[pymethods]
 impl SolveFarm {
     #[new]
-    #[pyo3(signature = (seed, threads, nodes=256, expand=4, iters=16, explore=0.1, random_draft=true, cfr="dcfr", config_cap=256, query_rate=0.9, recursive_rate=0.1, devices=vec![0]))]
+    #[pyo3(signature = (seed, threads, nodes=256, expand=4, iters=16, explore=0.1, random_draft=true, cfr="dcfr", node_cap=16 * 1024, config_cap=256, query_rate=0.9, recursive_rate=0.1, devices=vec![0]))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         seed: u64,
@@ -652,6 +652,7 @@ impl SolveFarm {
         explore: f32,
         random_draft: bool,
         cfr: &str,
+        node_cap: usize,
         config_cap: usize,
         query_rate: f32,
         recursive_rate: f32,
@@ -662,7 +663,7 @@ impl SolveFarm {
             expand,
             iters,
             cfr: cfr_of(cfr)?,
-            node_cap: 200_000,
+            node_cap,
             config_cap,
             ..Default::default()
         };
@@ -753,10 +754,6 @@ fn gen_data(
         expand,
         iters,
         cfr: cfr_of(cfr)?,
-        // The tree-size tail is fat (broad random-draft beliefs at round
-        // boundaries); an unbounded build hangs a worker for minutes on one
-        // decision. Capped solves fall back to a uniform policy instead.
-        node_cap: 200_000,
         ..Default::default()
     };
     let (agent, collect) = match mode {
@@ -839,6 +836,9 @@ fn prof_dump() {
         std::mem::size_of::<crate::State>(),
     );
     crate::prof::dump();
+    // Rows by kind, which is what says whether the trunk or the join is worth
+    // optimising: a trunk row is two orders of magnitude the work of a join.
+    crate::prof::dump_work();
 }
 
 /// Set the horizon payoff per marker of lead. The trainer anneals it to 0.

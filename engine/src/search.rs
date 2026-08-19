@@ -64,6 +64,11 @@ pub struct Cfg {
     /// (random-draft roots with broad beliefs at round boundaries) is fat
     /// enough that an unbounded build hangs training for minutes on one
     /// decision.
+    ///
+    /// It is a multiple of `nodes`, not an absolute ceiling, because a capped
+    /// solve is thrown away: the only thing the number buys is how much work
+    /// is spent discovering that. Set it far enough above `nodes` that a
+    /// healthy tree never reaches it, and no further.
     pub node_cap: usize,
     /// Maximum combined belief support at a self-play root. Broad round-start
     /// beliefs have a fat cost tail before the first tree node can be grown;
@@ -81,7 +86,7 @@ impl Default for Cfg {
             // the budget this replaces, spent by growth instead of evenly.
             nodes: 1024,
             cfr: Cfr::LINEAR,
-            node_cap: 200_000,
+            node_cap: 16 * 1024,
             config_cap: 256,
         }
     }
@@ -489,6 +494,19 @@ pub struct TNode {
 
 pub const NO_TRANS: u32 = u32::MAX;
 
+/// The length of every append-only arena a `grow` extends, so an abandoned one
+/// can put them all back. See `Solver::rewind`.
+#[derive(Clone, Copy)]
+struct Mark {
+    nodes: usize,
+    ncells: usize,
+    ncfg: usize,
+    leaf_rows: usize,
+    term_leaves: usize,
+    leaf_coff: usize,
+    leaf_cidx: usize,
+}
+
 /// What a finished solve gives back.
 ///
 /// `value` is the root's counterfactual value per config, and only the root's.
@@ -580,10 +598,12 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Retired arrays above this many nodes are dropped rather than kept: one
-/// pathological subgame near the 200,000-node cap should not pin hundreds of
-/// megabytes per builder thread for the rest of the run.
-const NODE_POOL_CAP: usize = 1 << 16;
+/// Retired arrays above this many nodes are dropped rather than kept. The
+/// number tracks a *healthy* tree, not `Cfg::node_cap`: pooling exists to stop
+/// the common case reallocating, and holding one pathological subgame's array
+/// per thread costs more memory than every reallocation it saves — which is
+/// what decides how many solver threads fit in a box.
+const NODE_POOL_CAP: usize = 4096;
 
 fn take_nodes() -> Vec<TNode> {
     NODE_POOL.with(|b| b.borrow_mut().pop().unwrap_or_default())
@@ -939,6 +959,69 @@ impl<'a> Solver<'a> {
         ch
     }
 
+    /// Whether the build has spent its node budget, flagging the solve if so.
+    ///
+    /// The budget has to bite *inside* the grow-through recursion. One
+    /// expansion of a coin play grows through every draw, tactic and forced
+    /// play beneath it before it reaches the next coin play, and that walk
+    /// branches — so checking only between expansions bounded a solve by one
+    /// `grow`, which is not a bound at all: against a 256-node growth budget,
+    /// single expansions were building two hundred thousand nodes.
+    fn over_cap(&mut self) -> bool {
+        if self.cfg.node_cap > 0 && self.nodes.len() >= self.cfg.node_cap {
+            self.capped = true;
+        }
+        self.capped
+    }
+
+    /// Where every append-only arena stands.
+    fn mark(&self) -> Mark {
+        Mark {
+            nodes: self.nodes.len(),
+            ncells: self.ncells,
+            ncfg: self.ncfg,
+            leaf_rows: self.leaf_rows.len(),
+            term_leaves: self.term_leaves.len(),
+            leaf_coff: self.leaf_coff.len(),
+            leaf_cidx: self.leaf_cidx.len(),
+        }
+    }
+
+    /// Undo everything an abandoned `grow` appended, and make `id` a leaf
+    /// again.
+    ///
+    /// Growth is all-or-nothing so that a tree is a tree at every moment a
+    /// caller can see one: every non-terminal leaf stands for a coin play,
+    /// which is the only place the value network is defined. Stopping halfway
+    /// would leave a leaf in the middle of a tactic, whose value nothing
+    /// defines and which reads as zero. An inner abandon unwinds through every
+    /// enclosing `grow`, so the whole expansion is undone up to the coin play
+    /// it started from.
+    fn rewind(&mut self, id: usize, m: Mark) {
+        self.reach.truncate(self.roff[m.nodes] as usize);
+        self.vals.truncate(self.voff[m.nodes] as usize);
+        self.nodes.truncate(m.nodes);
+        self.states.truncate(m.nodes);
+        self.nc.truncate(m.nodes);
+        self.soff.truncate(m.nodes);
+        self.roff.truncate(m.nodes);
+        self.voff.truncate(m.nodes);
+        self.sum_strat.truncate(m.nodes);
+        self.leaf_rows.truncate(m.leaf_rows);
+        self.term_leaves.truncate(m.term_leaves);
+        self.leaf_coff.truncate(m.leaf_coff);
+        self.leaf_cidx.truncate(m.leaf_cidx);
+        self.regret.truncate(m.ncells);
+        self.cur.truncate(m.ncells);
+        self.ncells = m.ncells;
+        // `cphi` is written by index and reused, so only the count and the
+        // interning map name configs that no longer exist.
+        self.cplayer.truncate(m.ncfg);
+        self.cmap.retain(|_, &mut i| (i as usize) < m.ncfg);
+        self.ncfg = m.ncfg;
+        self.nodes[id].leaf = true;
+    }
+
     /// Give an expanded node its strategy cells, at the end of the arenas.
     ///
     /// CFR starts from a uniform strategy over the legal actions, as in the
@@ -1009,6 +1092,10 @@ impl<'a> Solver<'a> {
     /// spending the same budget evenly over every line.
     fn grow(&mut self, id: usize) {
         debug_assert!(self.nodes[id].leaf, "only a leaf can be grown");
+        if self.over_cap() {
+            return;
+        }
+        let mark = self.mark();
         let s = self.states[id].clone();
         debug_assert!(!s.is_terminal(), "a terminal has nothing to grow");
         let cfgs = self.nodes[id].cfgs.clone();
@@ -1082,6 +1169,10 @@ impl<'a> Solver<'a> {
             let mut cc = cfgs;
             cc[me] = support.as_slice().into();
             let ch = self.push_child(cs, cc);
+            if self.capped {
+                self.rewind(id, mark);
+                return;
+            }
             let n = &mut self.nodes[id];
             n.chance = true;
             n.child = vec![ch];
@@ -1235,6 +1326,10 @@ impl<'a> Solver<'a> {
             let mut cc = cfgs.clone();
             cc[me] = std::mem::take(&mut child_cfgs[ch]).into();
             child.push(self.push_child(cs, cc));
+            if self.capped {
+                self.rewind(id, mark);
+                return;
+            }
         }
 
         let n = &mut self.nodes[id];
@@ -1871,14 +1966,16 @@ impl<'a> Solver<'a> {
     /// and the tree decides what the strategy is worth.
     pub fn solve(&mut self, rng: &mut Rng) {
         for t in 0..self.cfg.iters {
+            // A capped tree is retired by its caller, so every iteration after
+            // the cap is struck is work nobody reads. `Solver::new` can strike
+            // it on the root's own expansion.
+            if self.capped {
+                break;
+            }
             self.step(t % 2);
             let mut grew = false;
             for _ in 0..self.cfg.expand {
-                if self.nodes.len() >= self.cfg.nodes {
-                    break;
-                }
-                if self.cfg.node_cap > 0 && self.nodes.len() >= self.cfg.node_cap {
-                    self.capped = true;
+                if self.nodes.len() >= self.cfg.nodes || self.over_cap() {
                     break;
                 }
                 let Some(leaf) = self.sample_leaf(rng) else {
@@ -1886,21 +1983,16 @@ impl<'a> Solver<'a> {
                 };
                 self.grow(leaf);
                 grew = true;
-                if self.cfg.node_cap > 0 && self.nodes.len() > self.cfg.node_cap {
-                    self.capped = true;
-                    break;
-                }
             }
-            if grew {
+            if grew && !self.capped {
                 // Growth appended reach rows after `step` propagated the old
                 // tree. The next regret update must see the new leaves.
                 self.precompute_reaches();
             }
-            if self.capped {
-                break;
-            }
         }
-        self.finish();
+        if !self.capped {
+            self.finish();
+        }
     }
 
     /// Grow the whole subgame, to the node budget or until nothing is left to
@@ -1913,9 +2005,7 @@ impl<'a> Solver<'a> {
     pub fn grow_full(&mut self) {
         let mut at = 0usize;
         while at < self.nodes.len() {
-            if self.nodes.len() >= self.cfg.nodes
-                || (self.cfg.node_cap > 0 && self.nodes.len() >= self.cfg.node_cap)
-            {
+            if self.nodes.len() >= self.cfg.nodes || self.over_cap() {
                 self.capped = true;
                 return;
             }

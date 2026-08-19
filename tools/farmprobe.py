@@ -84,6 +84,10 @@ def main():
     devices = [int(d) for d in args.devices.split(",")]
     for threads in (int(t) for t in args.threads.split(",")):
         probe(devices, threads, args.seconds, args)
+    # Only says anything if the module was built with the `prof` feature. NET
+    # is the time a solver spends inside `submit`, so it is the device plus the
+    # wait for the round, not the device alone.
+    warchest.prof_dump()
 
 
 if __name__ == "__main__":
