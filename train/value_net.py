@@ -58,6 +58,11 @@ POOL = 64      # pooled config embedding width
 CFGH = 128     # config encoder hidden width
 JW = 128       # join width
 JBLOCKS = 3    # join residual blocks
+AW = 128       # action encoder hidden width
+N_KINDS = warchest.N_KINDS
+# What the policy head reads off an action: its kind, the coin slot it spends
+# (or none), and the three squares it can name.
+AFEAT = N_KINDS + (NSLOT + 1) + 3 * (N_HEXES + 1)
 
 JOIN_IN = 2 * POOL + 1  # both beliefs and the queried physical seat
 
@@ -105,6 +110,16 @@ class Net(nn.Module):
         self.cfg_f = nn.Linear(CFGH, D)
         self.cfg_g = nn.Linear(CFGH, POOL)
         self.cfg_m = nn.Linear(TYPE, 3 * POOL, bias=False)
+        # -- policy head --
+        # Student of Games' network is value *and policy*. The second readout
+        # has the same shape as the first: a config vector dotted with a
+        # situation vector, `logit(c, a) = <cfg_p(c), e(a)>`, where `e(a)`
+        # describes one action against the board it is played on.
+        self.cfg_p = nn.Linear(CFGH, D)
+        self.act_in = nn.Linear(AFEAT, AW)
+        self.act_board = nn.Linear(D, AW, bias=False)
+        self.ln_act = nn.LayerNorm(AW)
+        self.act_out = nn.Linear(AW, D)
 
         # -- join (the only per-iteration path) --
         self.join_p = nn.Linear(D, JW, bias=False)
@@ -180,7 +195,15 @@ class Net(nn.Module):
         u = gelu(self.cfg1(torch.cat([counts, own[seg]], -1))).sum(1)
         u = gelu(self.ln_cfg(u))
         bag = self.cfg_m(own).reshape(-1, NSLOT, 3, POOL)[seg]
-        return self.cfg_f(u), self.cfg_g(u) + (counts.unsqueeze(-1) * bag).sum((1, 2))
+        return (self.cfg_f(u),
+                self.cfg_g(u) + (counts.unsqueeze(-1) * bag).sum((1, 2)),
+                self.cfg_p(u))
+
+    def actions(self, feat, board):
+        """``e(a)`` for actions described by ``feat`` ``[n, AFEAT]`` on the
+        board vectors ``board`` ``[n, D]``."""
+        z = self.act_in(feat) + self.act_board(board)
+        return self.act_out(gelu(self.ln_act(z)))
 
     def join(self, p, pooled, seat):
         """The per-iteration path: beliefs and queried seat modulate the board."""
@@ -201,7 +224,7 @@ class Net(nn.Module):
         physical = xpub[0::2]
         p = self.board(physical, self.tokens(physical, cards[0::2]))
 
-        f, g = self.configs(phi, cards[:, :NSLOT], seg)
+        f, g, _fp = self.configs(phi, cards[:, :NSLOT], seg)
         pooled = p.new_zeros(nseg, POOL)
         pooled.index_add_(0, seg, g * weight.unsqueeze(1))
 
@@ -227,11 +250,12 @@ class Net(nn.Module):
             *blocks,
             self.board_out,
             self.cfg1, self.cfg_f, self.cfg_g, self.cfg_m,
+            self.cfg_p, self.act_in, self.act_board, self.act_out,
             self.join_p, self.join_b, *self.joinw, self.join_out,
         ]
         norms = [n for i in range(BLOCKS) for n in (self.ln1[i], self.ln2[i])]
         norms += [self.ln_trunk, self.ln_cfg, *self.ln_join,
-                  self.ln_jout, self.ln_h]
+                  self.ln_jout, self.ln_h, self.ln_act]
 
         def raw(t):
             return t.detach().cpu().contiguous().numpy().ravel()

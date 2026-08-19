@@ -48,13 +48,14 @@ pub enum Call {
     },
 }
 
-/// What a call gives back. Two vectors covers all three: the trunk returns the
-/// board vector and its join cache, the encoder returns `f` and `g`, and the
-/// join returns `h` alone.
+/// What a call gives back. The trunk returns the board vector and its join
+/// cache, the encoder returns `f`, `g` and the policy's `f_p`, and the join
+/// returns `h` alone.
 #[derive(Default)]
 pub struct Reply {
     pub a: Vec<f32>,
     pub b: Vec<f32>,
+    pub c: Vec<f32>,
 }
 
 impl Call {
@@ -70,7 +71,7 @@ impl Call {
                 net.join_cache(&r.a, *rows, &mut r.b);
             }
             Call::Configs { phi, owner, cards, n } => {
-                net.configs(phi, owner, *n, cards, &mut r.a, &mut r.b);
+                net.configs(phi, owner, *n, cards, &mut r.a, &mut r.b, &mut r.c);
             }
             Call::Join { p, jp, pooled, rows, player } => {
                 net.join(p, jp, pooled, *rows, *player, &mut r.a);
@@ -600,7 +601,7 @@ mod tests {
             std::thread::spawn(move || {
                 let mut rounds = 0usize;
                 while gate
-                    .round(|calls| calls.iter().map(|c| Reply { a: vec![tag_of(c)], b: Vec::new() }).collect())
+                    .round(|calls| calls.iter().map(|c| Reply { a: vec![tag_of(c)], ..Default::default() }).collect())
                     .is_some()
                 {
                     rounds += 1;
@@ -661,7 +662,7 @@ mod tests {
                     gate.round_before(Duration::from_micros(200), |calls| {
                         calls
                             .iter()
-                            .map(|c| Reply { a: vec![tag_of(c)], b: Vec::new() })
+                            .map(|c| Reply { a: vec![tag_of(c)], ..Default::default() })
                             .collect()
                     });
                 }

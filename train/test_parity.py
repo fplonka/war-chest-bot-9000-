@@ -36,7 +36,7 @@ import torch.nn as nn
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import warchest  # noqa: E402
-from value_net import Net  # noqa: E402
+from value_net import AFEAT, Net  # noqa: E402
 
 PUBFEAT = warchest.PUBFEAT
 N_HEXES = warchest.N_HEXES
@@ -47,6 +47,7 @@ NSLOT = warchest.NSLOT
 PILE_COUNTS = warchest.PILE_COUNTS
 CARD_FEATS = warchest.CARD_FEATS
 CCOUNTS = warchest.CCOUNTS
+N_KINDS = warchest.N_KINDS
 CNORM = warchest.CNORM
 OFF_PILES = warchest.OFF_PILES
 OFF_CARDS = warchest.OFF_CARDS
@@ -164,6 +165,60 @@ def blob_parity(net, rng):
     print(f"blob parity ok: worst relative error {worst:.3e}")
 
 
+def policy_parity(net, rng):
+    """The policy readout through both implementations of the same weights.
+
+    `logit(c, a) = <cfg_p(c), e(a)>`, so this exercises the third config head
+    and the action encoder — the two layers the value parity above cannot
+    reach, and the two whose place in the weight blob nothing else pins.
+    """
+    sizes = [4, 3, 6, 2]
+    queries = len(sizes)
+    na = 7
+    xpub = public_rows(rng, queries)
+    seg, phi, _weight = belief(rng, sizes)
+    n = len(seg)
+
+    # One-hot blocks exactly as `Net::action_feats` writes them: kind, the coin
+    # slot spent (the last column meaning none), then the three squares.
+    feat = np.zeros((na, AFEAT), np.float32)
+    for a in range(na):
+        feat[a, rng.integers(N_KINDS)] = 1.0
+        feat[a, N_KINDS + rng.integers(NSLOT + 1)] = 1.0
+        at = N_KINDS + NSLOT + 1
+        for _ in range(3):
+            feat[a, at + rng.integers(N_HEXES + 1)] = 1.0
+            at += N_HEXES + 1
+
+    cfg = rng.integers(0, n, size=24).astype(np.uint32)
+    act = rng.integers(0, na, size=24).astype(np.uint32)
+
+    with torch.no_grad():
+        cards = net.cards(torch.from_numpy(np.ascontiguousarray(xpub)))
+        physical = torch.from_numpy(np.ascontiguousarray(xpub))[0::2]
+        board = net.board(physical, net.tokens(physical, cards[0::2]))
+        _f, _g, fp = net.configs(torch.from_numpy(np.ascontiguousarray(phi)),
+                                 cards[:, :NSLOT],
+                                 torch.from_numpy(seg.astype(np.int64)))
+        want = np.zeros(len(cfg), np.float32)
+        for k in range(len(cfg)):
+            row = int(seg[cfg[k]]) // 2
+            e = net.actions(torch.from_numpy(feat[act[k]:act[k] + 1]),
+                            board[row:row + 1])
+            want[k] = float((fp[cfg[k]] * e[0]).sum())
+
+    got = np.asarray(warchest.infer_policy(
+        xpub.ravel(), phi.ravel(), seg, feat.ravel(), cfg, act, queries),
+        np.float32)
+    assert got.shape == want.shape, f"policy: {got.shape} vs {want.shape}"
+    scale = max(1.0, float(np.abs(want).max()))
+    assert float(np.abs(want).max()) > 1e-2, "policy logits are all zero"
+    err = float(np.max(np.abs(want - got)))
+    assert err < 1e-4 * scale, f"policy parity failure: {err:.3e}"
+    print(f"policy parity ok: {len(cfg)} cells over {na} actions, "
+          f"|logit|<={scale:.2f}, max err {err:.3e}")
+
+
 def slot_invariance(net, rng, perms=6):
     """Relabel the draft six ways; nothing the network says may move."""
     sizes = [4, 3, 6, 2, 5, 5]
@@ -214,6 +269,7 @@ def main():
     net = random_net(7)
     net.push()
     blob_parity(net, rng)
+    policy_parity(net, rng)
     slot_invariance(net, rng)
     offboard_pile_visibility(net, rng)
 

@@ -867,6 +867,34 @@ fn infer(
     ))
 }
 
+/// The policy readout for one node: `logit(c, a) = <f_p(c), e(a)>` over the
+/// `(config, action)` cells named by `cfg` and `act`.
+///
+/// The counterpart of `infer` for the policy head, so `test_parity.py` holds
+/// both readouts to torch through the same door.
+#[pyfunction]
+fn infer_policy(
+    xpub: PyReadonlyArray1<f32>,
+    phi: PyReadonlyArray1<f32>,
+    seg: PyReadonlyArray1<u32>,
+    feat: PyReadonlyArray1<f32>,
+    cfg: PyReadonlyArray1<u32>,
+    act: PyReadonlyArray1<u32>,
+    queries: usize,
+) -> PyResult<Vec<f32>> {
+    check_nets()?;
+    let guard = nets().read();
+    Ok(guard.value.forward_policy(
+        xpub.as_slice()?,
+        phi.as_slice()?,
+        seg.as_slice()?,
+        feat.as_slice()?,
+        cfg.as_slice()?,
+        act.as_slice()?,
+        queries,
+    ))
+}
+
 /// All 37 hexes' axial coords, indexed by hex. The browser UI's board
 /// geometry; mirrors `Board::coord`.
 #[pyfunction]
@@ -1042,6 +1070,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("N_LOCATIONS", crate::board::N_LOCATIONS)?;
     m.add("N_UNITS", crate::units::N_UNITS)?;
     m.add("NSLOT", crate::rebel::NSLOT)?;
+    m.add("N_KINDS", crate::actions::N_KINDS)?;
     m.add("CARD_FEATS", crate::units::CARD_FEATS)?;
     // Block offsets in the public half of the encoding. Exported so the
     // training side can build the mirror permutation from one source of truth
@@ -1084,5 +1113,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(save_roots, m)?)?;
     m.add_function(wrap_pyfunction!(gen_data, m)?)?;
         m.add_function(wrap_pyfunction!(infer, m)?)?;
+        m.add_function(wrap_pyfunction!(infer_policy, m)?)?;
     Ok(())
 }

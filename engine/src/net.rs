@@ -11,7 +11,16 @@
 //!   the queried physical seat.
 //!
 //! The readout is one dot product, `v(c) = <f(c), h> + bias`.
+//!
+//! Student of Games' network is a counterfactual value-**and-policy** network,
+//! `f(beta) = (v, p)`, so there is a second readout of the same shape:
+//! `logit(c, a) = <f_p(c), e(a)>`. `f_p` is a third head off the same config
+//! encoder that produces `f` and `g`, and `e(a)` describes one action against
+//! the board it is played on. Both readouts are a config vector dotted with a
+//! situation vector, which is what lets the policy reuse the `(config, action)`
+//! cells CFR already indexes rather than needing a table of its own.
 
+use crate::actions::N_KINDS;
 use crate::board::{board, NONE, N_HEXES};
 use crate::rebel::{
     CFEAT, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_CARDS, OFF_LOOSE, OFF_PILES, PILE_COUNTS,
@@ -38,6 +47,16 @@ pub const JW: usize = 128;
 pub const JBLOCKS: usize = 3;
 /// Both pooled beliefs and the queried physical seat.
 pub const JOIN_IN: usize = 2 * POOL + 1;
+/// Action encoder hidden width.
+pub const AW: usize = 128;
+/// How an action is described to the policy head: what kind it is, which coin
+/// slot it spends (or none), and the three squares it can name — where the
+/// acting piece stands, where it ends up, and what it strikes.
+///
+/// Every one of these is public, which is what lets one description serve every
+/// config at a node: an action's private content is *whether it is legal*, and
+/// the tree already carries that as the legal cells.
+pub const AFEAT: usize = N_KINDS + (NSLOT + 1) + 3 * (N_HEXES + 1);
 
 #[cfg(target_vendor = "apple")]
 #[link(name = "Accelerate", kind = "framework")]
@@ -224,6 +243,13 @@ pub struct NetLayout {
     pub cfg_f: Span,
     pub cfg_g: Span,
     pub cfg_m: Span,
+    /// The policy readout's config vector, beside `cfg_f`'s value one.
+    pub cfg_p: Span,
+    /// The action encoder: the action's own description, the board it is
+    /// played on, and the projection out to the readout's width.
+    pub act_in: Span,
+    pub act_board: Span,
+    pub act_out: Span,
     pub join_p: Span,
     pub join_b: Span,
     pub join_w: [Span; JBLOCKS],
@@ -244,6 +270,7 @@ fn norm_widths() -> Vec<usize> {
     v.extend(std::iter::repeat(JW).take(JBLOCKS));
     v.push(JW); // join output
     v.push(D); // h
+    v.push(AW); // action encoder
     v
 }
 
@@ -297,6 +324,10 @@ impl NetLayout {
         let cfg_f = c.lin(CFGH, D, true);
         let cfg_g = c.lin(CFGH, POOL, true);
         let cfg_m = c.lin(TYPE, 3 * POOL, false);
+        let cfg_p = c.lin(CFGH, D, true);
+        let act_in = c.lin(AFEAT, AW, true);
+        let act_board = c.lin(D, AW, false);
+        let act_out = c.lin(AW, D, true);
         let join_p = c.lin(D, JW, false);
         let join_b = c.lin(JOIN_IN, JW, true);
         let join_w = std::array::from_fn(|_| c.lin(JW, JW, true));
@@ -329,6 +360,10 @@ impl NetLayout {
             cfg_f,
             cfg_g,
             cfg_m,
+            cfg_p,
+            act_in,
+            act_board,
+            act_out,
             join_p,
             join_b,
             join_w,
@@ -450,6 +485,10 @@ pub struct Net {
     cfg_f: Lin,
     cfg_g: Lin,
     cfg_m: Lin,
+    cfg_p: Lin,
+    act_in: Lin,
+    act_board: Lin,
+    act_out: Lin,
     join_p: Lin,
     join_b: Lin,
     join_w: Vec<Lin>,
@@ -466,6 +505,7 @@ pub const LN_CFG: usize = LN_TRUNK + 1;
 pub const LN_JOIN: usize = LN_CFG + 1;
 pub const LN_JOUT: usize = LN_JOIN + JBLOCKS;
 pub const LN_H: usize = LN_JOUT + 1;
+pub const LN_ACT: usize = LN_H + 1;
 
 impl Net {
     pub fn from_flat(w: &[f32], b: &[f32], ln: &[f32]) -> Result<Self, String> {
@@ -526,6 +566,10 @@ impl Net {
             cfg_f: layer(l.cfg_f),
             cfg_g: layer(l.cfg_g),
             cfg_m: layer(l.cfg_m),
+            cfg_p: layer(l.cfg_p),
+            act_in: layer(l.act_in),
+            act_board: layer(l.act_board),
+            act_out: layer(l.act_out),
             join_p: layer(l.join_p),
             join_b: layer(l.join_b),
             join_w: l.join_w.iter().map(|&s| layer(s)).collect(),
@@ -800,6 +844,7 @@ impl Net {
         cards: &[f32],
         f_out: &mut Vec<f32>,
         g_out: &mut Vec<f32>,
+        p_out: &mut Vec<f32>,
     ) {
         let width = 3 + TYPE;
         let mut slots = scratch(n * NSLOT * width);
@@ -829,6 +874,9 @@ impl Net {
         self.norms[LN_CFG].apply(&mut u, n, &mut arg, &mut th);
         self.cfg_f.run(&u, n, f_out);
         self.cfg_g.run(&u, n, g_out);
+        // The policy's config vector, from the same encoding the value's comes
+        // from: one description of a config, two readouts of it.
+        self.cfg_p.run(&u, n, p_out);
         // The linear half of `g`: a count-weighted sum of per-zone card
         // embeddings. Pooling is linear over it, so `sum_c beta(c) g(c)`
         // carries the belief's exact expected holding of every card, bound to
@@ -912,6 +960,72 @@ impl Net {
         recycle(th);
     }
 
+    /// One action's description, as the policy head reads it.
+    ///
+    /// `slot` is the coin slot the action spends, or `-1` for the
+    /// micro-decisions that spend nothing; it comes from the node's own
+    /// `aslot`, so nothing here has to re-derive it. `hexes` is
+    /// `Action::hexes`. The layout is the contract with `value_net.py`.
+    pub fn action_feats(kind: usize, slot: i8, hexes: [u8; 3], out: &mut [f32]) {
+        debug_assert_eq!(out.len(), AFEAT);
+        out.fill(0.0);
+        out[kind] = 1.0;
+        // `-1` lands in the slot past the last, which is the "spends nothing"
+        // column rather than a wrap.
+        out[N_KINDS + if slot < 0 { NSLOT } else { slot as usize }] = 1.0;
+        let mut at = N_KINDS + NSLOT + 1;
+        for h in hexes {
+            out[at + if h == NONE { N_HEXES } else { h as usize }] = 1.0;
+            at += N_HEXES + 1;
+        }
+        debug_assert_eq!(at, AFEAT);
+    }
+
+    /// `e(a)` for every action at one node: what the action is, against the
+    /// board it is played on.
+    ///
+    /// `feat` is `[n, AFEAT]`, and `board` is that node's own board vector —
+    /// the same `D` numbers the value readout dots against, so the action is
+    /// described in the position rather than in the abstract. A node's actions
+    /// are public, so this runs once per node and every config at it reads the
+    /// result.
+    pub fn actions(&self, feat: &[f32], board: &[f32], n: usize, out: &mut Vec<f32>) {
+        debug_assert_eq!(feat.len(), n * AFEAT);
+        debug_assert_eq!(board.len(), D);
+        let mut z = scratch(0);
+        self.act_in.run(feat, n, &mut z);
+        // One board, every action: project it once and add it to each row.
+        let mut proj = scratch(0);
+        self.act_board.run(board, 1, &mut proj);
+        for r in 0..n {
+            for (o, &v) in z[r * AW..(r + 1) * AW].iter_mut().zip(&proj[..AW]) {
+                *o += v;
+            }
+        }
+        let (mut arg, mut th) = (scratch(0), scratch(0));
+        self.norms[LN_ACT].apply(&mut z[..n * AW], n, &mut arg, &mut th);
+        self.act_out.run(&z, n, out);
+        recycle(z);
+        recycle(proj);
+        recycle(arg);
+        recycle(th);
+    }
+
+    /// `logit(c, a) = <f_p(c), e(a)>` over the legal cells of one node.
+    ///
+    /// `cfg` and `act` name, per cell, which config and which action it stands
+    /// for — the arrays the tree already keeps to index its strategy, so the
+    /// policy needs no table of its own.
+    pub fn policy(&self, fp: &[f32], e: &[f32], cfg: &[u32], act: &[u32], out: &mut [f32]) {
+        debug_assert_eq!(cfg.len(), out.len());
+        debug_assert_eq!(act.len(), out.len());
+        for (k, o) in out.iter_mut().enumerate() {
+            let f = &fp[cfg[k] as usize * D..(cfg[k] as usize + 1) * D];
+            let a = &e[act[k] as usize * D..(act[k] as usize + 1) * D];
+            *o = f.iter().zip(a).map(|(x, y)| x * y).sum();
+        }
+    }
+
     /// `v(c) = <f(c), h> + bias` for each config index in `idx`.
     pub fn values(&self, h: &[f32], f: &[f32], idx: &[u32], out: &mut [f32]) {
         let mut lo = 0;
@@ -968,8 +1082,8 @@ impl Net {
         let (mut p, mut jp) = (Vec::new(), Vec::new());
         self.board(xpub, &cards, rows, queries, &mut p);
         self.join_cache(&p, rows, &mut jp);
-        let (mut f, mut g) = (Vec::new(), Vec::new());
-        self.configs(phi, seg, n, &cards, &mut f, &mut g);
+        let (mut f, mut g, mut fp) = (Vec::new(), Vec::new(), Vec::new());
+        self.configs(phi, seg, n, &cards, &mut f, &mut g, &mut fp);
         let mut pooled = vec![0.0; queries * POOL];
         for c in 0..n {
             let q = seg[c] as usize;
@@ -991,6 +1105,55 @@ impl Net {
                 }
                 let r = q / 2;
                 self.values(&h[r * D..(r + 1) * D], &f, &[c as u32], &mut out[c..c + 1]);
+            }
+        }
+        out
+    }
+
+    /// The policy readout over one query's `(config, action)` cells.
+    ///
+    /// The board trunk and the config encoder are the same ones `forward`
+    /// runs; only the readout differs. Every cell here belongs to query
+    /// `seg[cfg[k]]`, and an action's embedding is built against that query's
+    /// board vector, so a batch may span queries.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_policy(
+        &self,
+        xpub: &[f32],
+        phi: &[f32],
+        seg: &[u32],
+        feat: &[f32],
+        cfg: &[u32],
+        act: &[u32],
+        queries: usize,
+    ) -> Vec<f32> {
+        let n = seg.len();
+        let na = feat.len() / AFEAT;
+        let mut cards = Vec::new();
+        self.cards(xpub, queries, &mut cards);
+        let rows = queries / 2;
+        let mut p = Vec::new();
+        self.board(xpub, &cards, rows, queries, &mut p);
+        let (mut f, mut g, mut fp) = (Vec::new(), Vec::new(), Vec::new());
+        self.configs(phi, seg, n, &cards, &mut f, &mut g, &mut fp);
+        // An action belongs to the physical row of its cells' query, and the
+        // paired seat views share that row.
+        let mut e = Vec::new();
+        let mut out = vec![0.0; cfg.len()];
+        for r in 0..rows.max(1) {
+            let mine: Vec<usize> = (0..cfg.len())
+                .filter(|&k| seg[cfg[k] as usize] as usize / 2 == r)
+                .collect();
+            if mine.is_empty() {
+                continue;
+            }
+            self.actions(feat, &p[r * D..(r + 1) * D], na, &mut e);
+            let (c, a): (Vec<u32>, Vec<u32>) =
+                mine.iter().map(|&k| (cfg[k], act[k])).unzip();
+            let mut got = vec![0.0; mine.len()];
+            self.policy(&fp, &e, &c, &a, &mut got);
+            for (k, v) in mine.into_iter().zip(got) {
+                out[k] = v;
             }
         }
         out

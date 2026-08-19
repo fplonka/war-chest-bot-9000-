@@ -519,6 +519,7 @@ impl Card {
                 Reply {
                     a: p[at * D..(at + n) * D].to_vec(),
                     b: jp[at * JW..(at + n) * JW].to_vec(),
+                    c: Vec::new(),
                 },
             ));
             at += n;
@@ -570,15 +571,22 @@ impl Card {
         self.norm(l.norms[LN_CFG], n, true, &mut u)?;
         let mut f = self.alloc(n * D)?;
         let mut g = self.alloc(n * POOL)?;
+        let mut fp = self.alloc(n * D)?;
         self.run(l.cfg_f, &u, n, &mut f)?;
         self.run(l.cfg_g, &u, n, &mut g)?;
+        // The policy's config vector, off the same encoding as the value's.
+        self.run(l.cfg_p, &u, n, &mut fp)?;
 
         // The linear half of `g`, which pooling carries exactly.
         let mut bag = self.alloc(views * NTYPE * 3 * POOL)?;
         self.run(l.cfg_m, &cards, views * NTYPE, &mut bag)?;
         launch!(self, bag, n * POOL, &bag, &phi, &owner, &mut g, &n_i, &nslot, &ntype, &cfeat, &pool_i)?;
 
-        let (f, g) = (self.down(&f, n * D)?, self.down(&g, n * POOL)?);
+        let (f, g, fp) = (
+            self.down(&f, n * D)?,
+            self.down(&g, n * POOL)?,
+            self.down(&fp, n * D)?,
+        );
         let mut at = 0;
         for &i in mine {
             let k = calls[i].rows();
@@ -587,6 +595,7 @@ impl Card {
                 Reply {
                     a: f[at * D..(at + k) * D].to_vec(),
                     b: g[at * POOL..(at + k) * POOL].to_vec(),
+                    c: fp[at * D..(at + k) * D].to_vec(),
                 },
             ));
             at += k;
@@ -664,7 +673,7 @@ impl Card {
                 i,
                 Reply {
                     a: h[at * D..(at + n) * D].to_vec(),
-                    b: Vec::new(),
+                    ..Default::default()
                 },
             ));
             at += n;

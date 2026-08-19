@@ -273,6 +273,7 @@ impl Nets {
     }
 
     /// The config encoder over fresh configs: `f(c)` and `g(c)`.
+    #[allow(clippy::too_many_arguments)]
     fn encode(
         &self,
         phi: &[f32],
@@ -281,9 +282,10 @@ impl Nets {
         cards: &[f32],
         f: &mut Vec<f32>,
         g_out: &mut Vec<f32>,
+        p_out: &mut Vec<f32>,
     ) {
         match &self.gate {
-            None => self.value.configs(phi, owner, n, cards, f, g_out),
+            None => self.value.configs(phi, owner, n, cards, f, g_out, p_out),
             Some(g) => {
                 let r = self.submit(
                     g,
@@ -294,7 +296,7 @@ impl Nets {
                         n,
                     },
                 );
-                (*f, *g_out) = (r.a, r.b);
+                (*f, *g_out, *p_out) = (r.a, r.b, r.c);
             }
         }
     }
@@ -591,7 +593,7 @@ impl TNode {
 /// The per-solve buffers, pooled *by role*: they differ in size by 5x, so a
 /// single shared pool handed each one somebody else's buffer and made it grow
 /// — and growth is the one thing that zeroes.
-const N_ROLES: usize = 8;
+const N_ROLES: usize = 9;
 const R_PB: usize = 0;
 const R_XPUB: usize = 1;
 const R_XB: usize = 2;
@@ -600,12 +602,14 @@ const R_CPHI: usize = 4;
 const R_CF: usize = 5;
 const R_CG: usize = 6;
 const R_JP: usize = 7;
+const R_CP: usize = 8;
 
 thread_local! {
     static BUFS: std::cell::RefCell<[Vec<Vec<f32>>; N_ROLES]> = const {
         std::cell::RefCell::new([
             Vec::new(), Vec::new(), Vec::new(), Vec::new(),
             Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(),
         ])
     };
 }
@@ -621,19 +625,27 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Retired arrays above this many nodes are dropped rather than kept. The
-/// number tracks a *healthy* tree, not `Cfg::node_cap`: pooling exists to stop
-/// the common case reallocating, and holding one pathological subgame's array
-/// per thread costs more memory than every reallocation it saves — which is
-/// what decides how many solver threads fit in a box.
-const NODE_POOL_CAP: usize = 4096;
+/// How much of a retired node array is worth keeping, as a multiple of the
+/// growth budget.
+///
+/// Pooling exists to stop the common case reallocating, and the common case is
+/// a tree that grew to `Cfg::nodes`. So the ceiling has to move with that
+/// budget rather than be a number: a constant chosen for a 256-node tree
+/// discards *every* array once the budget is 8,192, which is precisely when
+/// the reallocation is worth avoiding. The headroom is for the overshoot a
+/// grow-through produces — an expansion adds a coin play and everything under
+/// it, so a tree passes its budget rather than landing on it.
+///
+/// Anything larger is a capped subgame, and holding one of those per thread
+/// costs more memory than every reallocation it saves.
+const NODE_POOL_SLACK: usize = 2;
 
 fn take_nodes() -> Vec<TNode> {
     NODE_POOL.with(|b| b.borrow_mut().pop().unwrap_or_default())
 }
 
-fn give_nodes(mut v: Vec<TNode>) {
-    if v.capacity() == 0 || v.capacity() > NODE_POOL_CAP {
+fn give_nodes(mut v: Vec<TNode>, budget: usize) {
+    if v.capacity() == 0 || v.capacity() > NODE_POOL_SLACK * budget {
         return;
     }
     // Cleared, not kept at length: the elements own heap of their own, and a
@@ -782,6 +794,8 @@ pub struct Solver<'a> {
     /// `g(c)`. Both survive every CFR iteration.
     pub cf: Vec<f32>,
     pub cg: Vec<f32>,
+    /// `[ncfg, D]` policy readout rows `f_p(c)`, beside the value's `f(c)`.
+    pub cp: Vec<f32>,
     /// `[2, NTYPE, TYPE]`: the printed-card tokens, one table per player view.
     /// The draft is fixed for the solve, so this is built once.
     pub cards: Vec<f32>,
@@ -823,10 +837,11 @@ impl Drop for Solver<'_> {
             (R_CPHI, &mut self.cphi),
             (R_CF, &mut self.cf),
             (R_CG, &mut self.cg),
+            (R_CP, &mut self.cp),
         ] {
             give_buf(role, std::mem::take(v));
         }
-        give_nodes(std::mem::take(&mut self.nodes));
+        give_nodes(std::mem::take(&mut self.nodes), self.cfg.nodes);
     }
 }
 
@@ -875,6 +890,7 @@ impl<'a> Solver<'a> {
             batch_cfgs: 0,
             cf: take_buf(R_CF),
             cg: take_buf(R_CG),
+            cp: take_buf(R_CP),
             cards: Vec::new(),
             pb: take_buf(R_PB),
             jp: take_buf(R_JP),
@@ -889,6 +905,7 @@ impl<'a> Solver<'a> {
         };
         sv.cf.clear();
         sv.cg.clear();
+        sv.cp.clear();
         sv.pb.clear();
         sv.jp.clear();
         {
@@ -1609,7 +1626,7 @@ impl<'a> Solver<'a> {
                 .iter()
                 .map(|&p| p as u32)
                 .collect();
-            let (mut cf, mut cg) = (Vec::new(), Vec::new());
+            let (mut cf, mut cg, mut cp) = (Vec::new(), Vec::new(), Vec::new());
             self.nets.encode(
                 &cphi[self.batch_cfgs * CFEAT..self.ncfg * CFEAT],
                 &owner,
@@ -1617,11 +1634,13 @@ impl<'a> Solver<'a> {
                 &self.cards,
                 &mut cf,
                 &mut cg,
+                &mut cp,
             );
             crate::prof::work(0, fresh, 0, 0);
             self.cphi = cphi;
             self.cf.extend_from_slice(&cf);
             self.cg.extend_from_slice(&cg);
+            self.cp.extend_from_slice(&cp);
             self.batch_cfgs = self.ncfg;
         }
     }
