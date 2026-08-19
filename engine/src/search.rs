@@ -152,13 +152,36 @@ impl Cfr {
         predict: 1.0 / 3.0,
     };
 
-    /// The five named variants, for the tools that sweep them.
-    pub const NAMED: [(&'static str, Cfr); 5] = [
+    /// What Student of Games runs in its regret update phase, verbatim:
+    /// "simultaneous updates, regret-matching+, and linearly-weighted policy
+    /// averaging".
+    ///
+    /// Regret matching+ is `alpha = inf, beta = -inf` — accumulated positive
+    /// regret is undiscounted and negative accumulated regret is floored at
+    /// zero, which is `Q_t(s,a) = (Q_{t-1}(s,a) + r_t(s,a))^+`.
+    ///
+    /// The averaging weight needs care. A running sum multiplied by
+    /// `(t / (t + 1))^gamma` before each iterate is added gives iterate `j` a
+    /// weight proportional to `(j + 1)^gamma` at the end, so *linear*
+    /// weighting is `gamma = 1` and not the 2 that `PLUS` carries.
+    ///
+    /// Simultaneous updates are not in this constant — they are `Solver::step`
+    /// traversing both players against one reach profile.
+    pub const SOG: Cfr = Cfr {
+        alpha: f32::INFINITY,
+        beta: f32::NEG_INFINITY,
+        gamma: 1.0,
+        predict: 0.0,
+    };
+
+    /// The named variants, for the tools that sweep them.
+    pub const NAMED: [(&'static str, Cfr); 6] = [
         ("linear", Cfr::LINEAR),
         ("plus", Cfr::PLUS),
         ("dcfr", Cfr::DISCOUNTED),
         ("pcfr", Cfr::PREDICTIVE),
         ("sapcfr", Cfr::SIMPLE_ASYM),
+        ("sog", Cfr::SOG),
     ];
 
     pub fn named(name: &str) -> Option<Cfr> {
@@ -1920,7 +1943,9 @@ impl<'a> Solver<'a> {
         }
     }
 
-    pub fn step(&mut self, traverser: usize) {
+    /// One regret update for `traverser` alone, against the reaches as they
+    /// stand. `step` runs both players' and is what a solve uses.
+    pub fn half_step(&mut self, traverser: usize) {
         self.update_regrets(traverser);
         // Restore the reach probabilities under the strategy just computed:
         // the next iteration's traversal reads them, and so does the average
@@ -1928,6 +1953,28 @@ impl<'a> Solver<'a> {
         self.precompute_reaches();
         self.avg_block(traverser);
         self.steps[traverser] += 1;
+    }
+
+    /// One iteration of the regret update phase: **simultaneous updates**, as
+    /// Student of Games specifies.
+    ///
+    /// Both players are traversed against the same reach profile, so each of
+    /// them best-responds to the strategy the other held at the start of the
+    /// iteration rather than to a strategy the same iteration already moved.
+    /// The two traversals do not interfere: values are per traverser, and a
+    /// player's regret matching writes only its own decision nodes.
+    ///
+    /// This is twice the work of an alternating half-iteration and twice the
+    /// updates, so a solve of `iters` iterations now gives each player `iters`
+    /// updates rather than `iters / 2`.
+    pub fn step(&mut self) {
+        self.update_regrets(0);
+        self.update_regrets(1);
+        self.precompute_reaches();
+        self.avg_block(0);
+        self.avg_block(1);
+        self.steps[0] += 1;
+        self.steps[1] += 1;
     }
 
     /// Add the fresh reach-weighted iterate to the running strategy sum.
@@ -1952,8 +1999,8 @@ impl<'a> Solver<'a> {
     }
 
     pub fn multistep(&mut self, iters: usize) {
-        for i in 0..iters {
-            self.step(i % 2);
+        for _ in 0..iters {
+            self.step();
         }
     }
 
@@ -1972,7 +2019,7 @@ impl<'a> Solver<'a> {
             if self.capped {
                 break;
             }
-            self.step(t % 2);
+            self.step();
             let mut grew = false;
             for _ in 0..self.cfg.expand {
                 if self.nodes.len() >= self.cfg.nodes || !self.expand_once(rng) {

@@ -543,7 +543,7 @@ mod tests {
             let ctx = crate::rebel::Ctx::new(s);
             let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
             for t in 0..cfg.iters {
-                sv.step(t % 2);
+                sv.step();
                 for _ in 0..cfg.expand {
                     if sv.nodes.len() >= cfg.nodes || !sv.expand_once(&mut rng) {
                         break;
@@ -630,7 +630,7 @@ mod tests {
                 // strategy sum are both non-trivial before anything is
                 // compared: a comparison against all-zero state proves nothing
                 // about the discount factors.
-                sv.step(t % 2);
+                sv.step();
                 for _ in 0..cfg.expand {
                     if sv.nodes.len() >= cfg.nodes || !sv.expand_once(&mut rng) {
                         break;

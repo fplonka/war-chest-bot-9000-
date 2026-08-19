@@ -72,7 +72,7 @@ fn main() {
         let mut sv = Solver::new(s, ctx, &nets, cfg, belief.clone());
         let mut stop = None;
         for t in 0..cfg.iters {
-            sv.step(t % 2);
+            sv.step();
             for _ in 0..cfg.expand {
                 if sv.nodes.len() >= cfg.nodes || !sv.expand_once(&mut rng) {
                     break;

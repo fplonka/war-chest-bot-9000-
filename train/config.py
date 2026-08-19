@@ -45,7 +45,10 @@ class Cfg:
     # target is ever taken off the line of play.
     query_rate: float = 0.9
     recursive_rate: float = 0.1
-    cfr: str = "dcfr"
+    # What Student of Games runs: regret-matching+ with linearly-weighted
+    # policy averaging, against simultaneous updates. `Solver::step` supplies
+    # the simultaneous half.
+    cfr: str = "sog"
     # ReBeL's and Student of Games' off-policy exploration rate; both run 0.1.
     explore: float = 0.1
     temp: float = 2.0
