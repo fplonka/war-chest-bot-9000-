@@ -339,6 +339,20 @@ impl Backend {
             Backend::Cuda(d) => d.net(),
         }
     }
+
+    /// Evaluate with new weights from here on. The backend itself survives:
+    /// rebuilding it would tear down a CUDA context and recompile every kernel
+    /// for a change that touches three arrays.
+    pub fn set_net(&mut self, net: Net) -> Result<(), String> {
+        match self {
+            Backend::Reference(old) => {
+                *old = net;
+                Ok(())
+            }
+            #[cfg(feature = "gpu")]
+            Backend::Cuda(d) => d.set_weights(net),
+        }
+    }
 }
 
 // ------------------------------------------------------------------- the farm
@@ -426,12 +440,13 @@ impl Farm {
     /// Install new weights, in the backend and in the copy the solver threads
     /// keep for the readout. Threads pick them up at their next chunk, so a
     /// solve is never evaluated against two different networks.
-    pub fn publish(&mut self, backend: Backend) {
+    pub fn publish(&mut self, net: Net) -> Result<(), String> {
+        self.backend.set_net(net.clone())?;
         *self.nets.write() = Arc::new(crate::search::Nets {
-            value: backend.net().clone(),
+            value: net,
             gate: Some(Arc::clone(&self.gate)),
         });
-        self.backend = backend;
+        Ok(())
     }
 
     /// Run rounds until the threads have produced at least `solves` rows, then

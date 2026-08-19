@@ -526,6 +526,7 @@ def main():
                     "label": label, "git": args.git,
                     "search": {"nodes": args.nodes, "expand": args.expand,
                                "iters": args.iters, "cfr": args.cfr,
+                               "node_cap": args.node_cap,
                                "config_cap": args.config_cap}}, path)
         snaps.append({"label": label, "t": round(el, 1),
                       "file": os.path.basename(path)})
@@ -548,6 +549,7 @@ def main():
             explore=args.explore,
             random_draft=args.random_draft,
             cfr=args.cfr,
+            node_cap=args.node_cap,
             config_cap=args.config_cap,
             query_rate=args.query_rate,
             recursive_rate=args.recursive_rate,

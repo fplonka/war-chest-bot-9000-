@@ -36,6 +36,7 @@ def probe(devices, threads, seconds, args):
         explore=0.1,
         random_draft=True,
         cfr="dcfr",
+        node_cap=args.node_cap,
         config_cap=256,
         query_rate=0.9,
         recursive_rate=0.1,
@@ -75,9 +76,10 @@ def main():
     p.add_argument("--devices", default="0")
     p.add_argument("--seconds", type=float, default=30)
     p.add_argument("--window", type=float, default=30)
-    p.add_argument("--nodes", type=int, default=256)
-    p.add_argument("--expand", type=int, default=4)
-    p.add_argument("--iters", type=int, default=16)
+    p.add_argument("--nodes", type=int, default=8192)
+    p.add_argument("--expand", type=int, default=8)
+    p.add_argument("--iters", type=int, default=64)
+    p.add_argument("--node-cap", type=int, default=65536)
     args = p.parse_args()
 
     Net().push()

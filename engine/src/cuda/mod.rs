@@ -199,6 +199,28 @@ impl Device {
         &self.net
     }
 
+    /// Point the cards at new weights.
+    ///
+    /// A publish used to build a whole new `Device`: a CUDA context per card
+    /// and an NVRTC compile of every kernel, for a change that only ever
+    /// touches three arrays. Nothing else about a card depends on the weights,
+    /// and once a solve keeps state on the device the context cannot be torn
+    /// down under it anyway.
+    pub fn set_weights(&mut self, net: Net) -> Res<()> {
+        if net.is_empty() {
+            return Err("cannot publish empty weights to the device".into());
+        }
+        let flat = net.flat();
+        for card in &mut self.cards {
+            card.stream.context().bind_to_thread().map_err(err)?;
+            card.stream.memcpy_htod(&flat.w, &mut card.w).map_err(err)?;
+            card.stream.memcpy_htod(&flat.b, &mut card.b).map_err(err)?;
+            card.stream.memcpy_htod(&flat.ln, &mut card.ln).map_err(err)?;
+        }
+        self.net = net;
+        Ok(())
+    }
+
     /// Evaluate a round. A device error is not recoverable and not worth
     /// limping past, so it stops the run.
     pub fn run(&self, calls: &[Call]) -> Vec<Reply> {

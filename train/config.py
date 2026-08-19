@@ -27,9 +27,18 @@ class Cfg:
     # imperfect-information games.
     cap: int = 1_000_000
     cfgs_per_row: int = 48
-    nodes: int = 256
-    expand: int = 4
-    iters: int = 16
+    # The growing tree's budget. A round is six coin plays, so a tree has to
+    # reach depth six to see the round boundary where beliefs reset — and at
+    # about twenty actions a decision, only selective growth gets there. The
+    # previous 256 nodes stopped growth after three of sixteen iterations,
+    # which spent a growing-tree solver as a depth-one one.
+    nodes: int = 8192
+    expand: int = 8
+    iters: int = 64
+    # Far enough above `nodes` that a healthy tree never reaches it. A solve
+    # that does is thrown away, so the number only buys how much work is spent
+    # discovering that.
+    node_cap: int = 65536
     config_cap: int = 256
     # Student of Games' q_search and q_recursive: leaves drawn from each solve
     # and queued to be re-solved as roots of their own. This is the only way a

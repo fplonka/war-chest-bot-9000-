@@ -697,8 +697,9 @@ impl SolveFarm {
         check_nets()?;
         let version = NET_VERSION.load(Ordering::Acquire);
         if self.net_version != version {
-            let backend = backend_for(&self.devices, (**nets().read()).value.clone())?;
-            self.farm.publish(backend);
+            self.farm
+                .publish((**nets().read()).value.clone())
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
             self.net_version = version;
         }
         let d = py.allow_threads(|| self.farm.drive(solves));
