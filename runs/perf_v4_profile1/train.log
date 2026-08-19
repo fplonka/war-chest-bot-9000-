@@ -1,0 +1,22 @@
+[train] runs/perf_v4_profile1 at d47dc82+dirty seed=12 {'minutes': 1.5, 'warm_minutes': 0.0, 'snapshot_every': 5.0, 'ladder_games': 0, 'train_gen_ratio': 0.001, 'init_weights': 'runs/value_v4_clean30/snap_06.pt', 'seed': 12, 'note': 'profile-production-generation'}
+[train] profile-production-generation
+[cpu] pinned to 36 physical cores
+[train] CUDA stream priority -1
+[gpu] solve services up on [0, 1]
+[cfg] PUBFEAT=897 CFEAT=15 architecture=v4 depth=2 iters=64 budget=90s warm=0s snapshot_every=5min device=cuda:1 draft=random train_gen_ratio=0.001 recent_mix=0.5/0.2 canonical_views=2 cap=2000000 matmul=high
+[t=   0.0s] --- snapshot snap_00.pt (init) ---
+[t=   0.0s] --- switching to ReBeL ---
+[t=  10.1s] rebel stream solves=10240 raw=1020/s balanced=0/s debt=10 rows steps=0 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00000 L/var=0.00 tgt=+0.045/0.024 cfg/b=0 prep=0.00s gpu=0.00s conv=0.02s add=0.38s train=0.00s
+[t=  20.1s] rebel stream solves=15360 raw=765/s balanced=0/s debt=15 rows steps=0 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00000 L/var=0.00 tgt=+0.054/0.027 cfg/b=0 prep=0.00s gpu=0.00s conv=0.01s add=0.44s train=0.00s
+[t=  29.7s] --- lr -> 5.00e-04 ---
+[t=  30.1s] rebel stream solves=23552 raw=783/s balanced=0/s debt=24 rows steps=0 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00000 L/var=0.00 tgt=+0.057/0.030 cfg/b=0 prep=0.00s gpu=0.00s conv=0.05s add=1.03s train=0.00s
+[t=  40.1s] rebel stream solves=37888 raw=945/s balanced=0/s debt=38 rows steps=0 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00000 L/var=0.00 tgt=+0.060/0.033 cfg/b=0 prep=0.00s gpu=0.00s conv=0.02s add=0.50s train=0.00s
+[t=  50.2s] rebel stream solves=44032 raw=878/s balanced=0/s debt=44 rows steps=0 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00000 L/var=0.00 tgt=+0.083/0.034 cfg/b=0 prep=0.00s gpu=0.00s conv=0.00s add=0.14s train=0.00s
+[t=  60.2s] rebel stream solves=47104 raw=783/s balanced=0/s debt=47 rows steps=0 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00000 L/var=0.00 tgt=+0.086/0.034 cfg/b=0 prep=0.00s gpu=0.00s conv=0.00s add=0.13s train=0.00s
+[t=  60.4s] --- lr -> 2.50e-04 ---
+[t=  70.0s] --- stopping GPU admission; draining ---
+[t=  70.2s] rebel stream solves=50176 raw=715/s balanced=0/s debt=50 rows steps=0 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00000 L/var=0.00 tgt=+0.087/0.036 cfg/b=0 prep=0.00s gpu=0.00s conv=0.01s add=0.15s train=0.00s
+[t=  75.4s] rebel stream solves=51552 raw=684/s balanced=0/s debt=52 rows steps=0 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00000 L/var=0.00 tgt=+0.089/0.036 cfg/b=0 prep=0.00s gpu=0.00s conv=0.00s add=0.06s train=0.00s
+[gpu-summary] solves=51552 optimizer_rows=0 debt=52 raw=573.0/s balanced=0.0/s horizon=0.00 games=0 over=0 card=0 exact=0 censored=4608 dropped=0 overrun=0.00s
+[t=  90.0s] --- snapshot snap_01.pt (final) ---
+[report] runs/perf_v4_profile1/report.html

@@ -1,0 +1,18 @@
+Traceback (most recent call last):
+  File "/workspace/warchest-v5/train/stream_bench.py", line 19, in <module>
+    from export_weights import load  # noqa: E402
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/warchest-v5/train/export_weights.py", line 17, in <module>
+    import torch
+  File "/venv/main/lib/python3.12/site-packages/torch/__init__.py", line 443, in <module>
+    _load_global_deps()
+  File "/venv/main/lib/python3.12/site-packages/torch/__init__.py", line 401, in _load_global_deps
+    _preload_cuda_deps(err)
+  File "/venv/main/lib/python3.12/site-packages/torch/__init__.py", line 357, in _preload_cuda_deps
+    raise err
+  File "/venv/main/lib/python3.12/site-packages/torch/__init__.py", line 379, in _load_global_deps
+    ctypes.CDLL(global_deps_lib_path, mode=ctypes.RTLD_GLOBAL)
+  File "/venv/main/lib/python3.12/ctypes/__init__.py", line 379, in __init__
+    self._handle = _dlopen(self._name, mode)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: /venv/main/lib/python3.12/site-packages/torch/lib/libgomp.so.1: cannot allocate memory in static TLS block

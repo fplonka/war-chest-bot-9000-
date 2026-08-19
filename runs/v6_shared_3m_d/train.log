@@ -1,0 +1,19 @@
+[train] runs/v6_shared_3m_d at ea3238e+dirty seed=212 {'minutes': 3.0, 'warm_minutes': 0.0, 'init_weights': '/tmp/v6_shared_init.pt', 'snapshot_every': 15.0, 'depth': 2, 'iters': 64, 'cfr': 'dcfr', 'ladder_games': 0, 'gpu_drain_seconds': 5.0, 'seed': 212}
+[cpu] pinned to 36 physical cores
+[train] CUDA stream priority -1
+[gpu] solve services up on [0, 1]
+[cfg] PUBFEAT=897 CFEAT=15 architecture=v6 depth=2 iters=64 budget=180s warm=0s snapshot_every=15min device=cuda:1 draft=random train_gen_ratio=4.0 recent_mix=0.5/0.2 canonical_views=2 cap=2000000 aux_weight=0.15 matmul=high
+[t=   0.0s] --- snapshot snap_00.pt (init) ---
+[t=   0.0s] --- switching to ReBeL ---
+[t=  10.1s] rebel stream solves=7168 raw=715/s balanced=715/s debt=0 rows steps=28 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.02087 L/var=15.85 tgt=+0.081/0.036 aux=0.0015/1.000 cfg/b=137344 prep=0.37s gpu=0.00s conv=0.06s add=0.78s train=6.39s
+[t=  20.1s] rebel stream solves=13312 raw=664/s balanced=664/s debt=0 rows steps=52 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00093 L/var=1.82 tgt=+0.078/0.023 aux=0.0004/1.000 cfg/b=82970 prep=0.21s gpu=0.00s conv=0.02s add=0.35s train=1.80s
+[t=  30.1s] rebel stream solves=15360 raw=511/s balanced=511/s debt=0 rows steps=60 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00044 L/var=2.01 tgt=+0.096/0.015 aux=0.0002/1.000 cfg/b=212046 prep=0.19s gpu=0.00s conv=0.06s add=0.73s train=0.90s
+Traceback (most recent call last):
+  File "/workspace/warchest-engine/train/train.py", line 940, in <module>
+    main()
+  File "/workspace/warchest-engine/train/train.py", line 930, in main
+    run_gpu_stream()
+  File "/workspace/warchest-engine/train/train.py", line 719, in run_gpu_stream
+    data = gen.next(timeout=0.05)
+           ^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: GPU stream solve failed: wave arena allocation (268435456 elements): DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")

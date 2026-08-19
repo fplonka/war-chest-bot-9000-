@@ -1,0 +1,30 @@
+[train] runs/gt_process36x8 at 1feb485+dirty seed=1 {'minutes': 1.0, 'warm_minutes': 0.2, 'snapshot_every': 1.0, 'ladder_games': 0, 'nodes': 64, 'expand': 1, 'iters': 8, 'config_cap': 256, 'gen_workers': 36, 'gen_solves': 8, 'gpu_inference': False, 'note': 'v11-process-36-eight-solves'}
+[train] v11-process-36-eight-solves
+[train] CUDA stream priority -1
+[train] search inference on CPU
+[cfg] PUBFEAT=897 CFEAT=15 architecture=gt-cfr nodes=64 expand=1 iters=8 budget=60s warm=12s snapshot_every=1min device=cuda:1 draft=random train_gen_ratio=64.0 recent_mix=0.5/0.2 canonical_views=2 cap=2000000 matmul=high
+[t=   1.3s] greedy ep  0 games=  96 dec= 18968 rows= 18118 horizon=0.30 L=0.34058 L/var=2.31 tgt=-0.065/0.384 pstd=0.038 gen=0.1s train=1.1s
+[t=   2.0s] greedy ep  1 games=  96 dec= 18844 rows= 18051 horizon=0.33 L=0.20454 L/var=1.18 tgt=-0.083/0.417 pstd=0.086 gen=0.1s train=0.6s
+[t=   2.7s] greedy ep  2 games=  96 dec= 18181 rows= 17414 horizon=0.27 L=0.21842 L/var=1.38 tgt=-0.076/0.397 pstd=0.160 gen=0.1s train=0.5s
+[t=   3.5s] greedy ep  3 games=  96 dec= 17989 rows= 17120 horizon=0.26 L=0.18505 L/var=1.22 tgt=-0.077/0.389 pstd=0.282 gen=0.1s train=0.6s
+[t=   4.4s] greedy ep  4 games=  96 dec= 18823 rows= 18078 horizon=0.29 L=0.12280 L/var=0.80 tgt=-0.064/0.392 pstd=0.362 gen=0.1s train=0.7s
+[t=   5.3s] greedy ep  5 games=  96 dec= 18924 rows= 18146 horizon=0.33 L=0.07887 L/var=0.53 tgt=-0.051/0.384 pstd=0.360 gen=0.1s train=0.7s
+[t=   6.1s] greedy ep  6 games=  96 dec= 17615 rows= 16921 horizon=0.26 L=0.05486 L/var=0.34 tgt=-0.082/0.402 pstd=0.349 gen=0.1s train=0.6s
+[t=   6.9s] greedy ep  7 games=  96 dec= 18608 rows= 17786 horizon=0.36 L=0.07234 L/var=0.42 tgt=-0.092/0.417 pstd=0.281 gen=0.1s train=0.6s
+[t=   7.7s] greedy ep  8 games=  96 dec= 19040 rows= 18296 horizon=0.36 L=0.04511 L/var=0.28 tgt=-0.064/0.398 pstd=0.365 gen=0.1s train=0.6s
+[t=   8.6s] greedy ep  9 games=  96 dec= 18200 rows= 17459 horizon=0.27 L=0.02991 L/var=0.18 tgt=-0.090/0.411 pstd=0.378 gen=0.1s train=0.6s
+[t=   9.4s] greedy ep 10 games=  96 dec= 17927 rows= 17200 horizon=0.24 L=0.02575 L/var=0.16 tgt=-0.082/0.404 pstd=0.370 gen=0.1s train=0.6s
+[t=  10.2s] greedy ep 11 games=  96 dec= 17941 rows= 17162 horizon=0.28 L=0.02269 L/var=0.14 tgt=-0.100/0.400 pstd=0.372 gen=0.1s train=0.6s
+[t=  11.0s] greedy ep 12 games=  96 dec= 17384 rows= 16648 horizon=0.25 L=0.02092 L/var=0.15 tgt=-0.053/0.370 pstd=0.378 gen=0.1s train=0.6s
+[t=  11.8s] greedy ep 13 games=  96 dec= 18153 rows= 17377 horizon=0.28 L=0.01895 L/var=0.12 tgt=-0.090/0.400 pstd=0.376 gen=0.1s train=0.6s
+[t=  12.6s] greedy ep 14 games=  96 dec= 18097 rows= 17377 horizon=0.26 L=0.01625 L/var=0.11 tgt=-0.061/0.388 pstd=0.379 gen=0.1s train=0.6s
+[t=  12.6s] --- snapshot snap_00.pt (init) ---
+[t=  12.6s] --- switching to GT-CFR ---
+[t=  22.9s] GT-CFR solves=3392 rate=331.9/s rows=30 games=0 caps=29 L=0.03707 L/var=0.48 tgt=-0.106/0.278 gen=0.10s train=0.03s gpu=0.00s
+[t=  28.5s] --- lr -> 5.00e-04 ---
+[t=  32.9s] GT-CFR solves=8096 rate=400.1/s rows=72 games=0 caps=40 L=0.03866 L/var=0.05 tgt=+0.142/0.867 gen=0.04s train=0.04s gpu=0.00s
+[t=  42.9s] GT-CFR solves=13024 rate=430.6/s rows=60 games=0 caps=84 L=0.04345 L/var=0.17 tgt=-0.120/0.505 gen=0.05s train=0.03s gpu=0.00s
+[t=  44.8s] --- lr -> 2.50e-04 ---
+[t=  52.9s] GT-CFR solves=17744 rate=440.5/s rows=59 games=0 caps=85 L=0.04164 L/var=1.15 tgt=-0.045/0.190 gen=0.07s train=0.03s gpu=0.00s
+[GT-CFR-summary] solves=21488 optimizer_rows=1375232 rate=401.2/s horizon=0.53 games=88 caps=101
+[t=  66.2s] --- snapshot snap_01.pt (final) ---

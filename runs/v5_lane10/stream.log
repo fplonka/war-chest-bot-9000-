@@ -1,0 +1,21 @@
+v5 GEMM compute=fast-f16
+{"phase": "live", "seconds": 10.182, "solves": 20480, "solves_per_s": 2011.5, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.443, "merge_frac": 0.003}
+{"phase": "live", "seconds": 20.072, "solves": 47104, "solves_per_s": 2346.7, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.439, "merge_frac": 0.002}
+{"phase": "live", "seconds": 30.12, "solves": 54272, "solves_per_s": 1801.9, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.322, "merge_frac": 0.001}
+{"phase": "live", "seconds": 40.036, "solves": 61440, "solves_per_s": 1534.6, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.321, "merge_frac": 0.001}
+{"phase": "live", "seconds": 50.014, "solves": 69632, "solves_per_s": 1392.3, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.299, "merge_frac": 0.001}
+{"phase": "live", "seconds": 60.048, "solves": 78848, "solves_per_s": 1313.1, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.281, "merge_frac": 0.001}
+{"phase": "live", "seconds": 70.139, "solves": 86016, "solves_per_s": 1226.4, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.25, "merge_frac": 0.001}
+{"phase": "live", "seconds": 80.172, "solves": 93184, "solves_per_s": 1162.3, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.23, "merge_frac": 0.001}
+{"phase": "live", "seconds": 90.084, "solves": 100352, "solves_per_s": 1114.0, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.209, "merge_frac": 0.001}
+{"phase": "live", "seconds": 100.004, "solves": 106496, "solves_per_s": 1064.9, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.19, "merge_frac": 0.001}
+{"phase": "live", "seconds": 110.112, "solves": 114688, "solves_per_s": 1041.6, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.18, "merge_frac": 0.0}
+{"phase": "live", "seconds": 120.077, "solves": 122880, "solves_per_s": 1023.3, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.171, "merge_frac": 0.0}
+{"phase": "live", "seconds": 130.15, "solves": 131072, "solves_per_s": 1007.1, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.163, "merge_frac": 0.0}
+Traceback (most recent call last):
+  File "/workspace/warchest-v5/train/stream_bench.py", line 142, in <module>
+    main()
+  File "/workspace/warchest-v5/train/stream_bench.py", line 94, in main
+    data = gen.next(timeout=0.2)
+           ^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: GPU stream solve failed: wave arena allocation (536870912 elements): DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")

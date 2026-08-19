@@ -1,0 +1,235 @@
+{
+ "runs": [
+  "runs/zsloss",
+  "runs/rowfix",
+  "runs/adam",
+  "runs/wp",
+  "runs/seat"
+ ],
+ "games": 200,
+ "schedule_seed": 7,
+ "draft_mode": "random",
+ "players": [
+  {
+   "name": "greedy",
+   "run": null,
+   "t": null,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 0.0,
+   "se": 96.9,
+   "score": 0.01
+  },
+  {
+   "name": "zsloss.final",
+   "run": "runs/zsloss",
+   "t": 1740.5,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 522.3,
+   "se": 35.0,
+   "score": 0.483
+  },
+  {
+   "name": "rowfix.final",
+   "run": "runs/rowfix",
+   "t": 1860.8,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 594.5,
+   "se": 16.6,
+   "score": 0.513
+  },
+  {
+   "name": "adam.final",
+   "run": "runs/adam",
+   "t": 1741.7,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 620.3,
+   "se": 21.5,
+   "score": 0.546
+  },
+  {
+   "name": "wp.final",
+   "run": "runs/wp",
+   "t": 1740.5,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 626.4,
+   "se": 14.5,
+   "score": 0.557
+  },
+  {
+   "name": "seat.final",
+   "run": "runs/seat",
+   "t": 1741.6,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear",
+    "warm": 0.0
+   },
+   "elo": 580.7,
+   "se": 17.0,
+   "score": 0.494
+  }
+ ],
+ "pairs": [
+  {
+   "a": "greedy",
+   "b": "zsloss.final",
+   "w": 0,
+   "l": 18,
+   "d": 2,
+   "n": 20,
+   "score": 0.05
+  },
+  {
+   "a": "greedy",
+   "b": "rowfix.final",
+   "w": 0,
+   "l": 20,
+   "d": 0,
+   "n": 20,
+   "score": 0.0
+  },
+  {
+   "a": "greedy",
+   "b": "adam.final",
+   "w": 0,
+   "l": 20,
+   "d": 0,
+   "n": 20,
+   "score": 0.0
+  },
+  {
+   "a": "greedy",
+   "b": "wp.final",
+   "w": 0,
+   "l": 20,
+   "d": 0,
+   "n": 20,
+   "score": 0.0
+  },
+  {
+   "a": "greedy",
+   "b": "seat.final",
+   "w": 0,
+   "l": 20,
+   "d": 0,
+   "n": 20,
+   "score": 0.0
+  },
+  {
+   "a": "zsloss.final",
+   "b": "rowfix.final",
+   "w": 6,
+   "l": 11,
+   "d": 3,
+   "n": 20,
+   "score": 0.375
+  },
+  {
+   "a": "zsloss.final",
+   "b": "adam.final",
+   "w": 6,
+   "l": 13,
+   "d": 1,
+   "n": 20,
+   "score": 0.325
+  },
+  {
+   "a": "zsloss.final",
+   "b": "wp.final",
+   "w": 8,
+   "l": 10,
+   "d": 2,
+   "n": 20,
+   "score": 0.45
+  },
+  {
+   "a": "zsloss.final",
+   "b": "seat.final",
+   "w": 12,
+   "l": 20,
+   "d": 8,
+   "n": 40,
+   "score": 0.4
+  },
+  {
+   "a": "rowfix.final",
+   "b": "adam.final",
+   "w": 5,
+   "l": 10,
+   "d": 5,
+   "n": 20,
+   "score": 0.375
+  },
+  {
+   "a": "rowfix.final",
+   "b": "wp.final",
+   "w": 87,
+   "l": 101,
+   "d": 12,
+   "n": 200,
+   "score": 0.465
+  },
+  {
+   "a": "rowfix.final",
+   "b": "seat.final",
+   "w": 94,
+   "l": 88,
+   "d": 18,
+   "n": 200,
+   "score": 0.515
+  },
+  {
+   "a": "adam.final",
+   "b": "wp.final",
+   "w": 90,
+   "l": 98,
+   "d": 12,
+   "n": 200,
+   "score": 0.48
+  },
+  {
+   "a": "adam.final",
+   "b": "seat.final",
+   "w": 11,
+   "l": 9,
+   "d": 0,
+   "n": 20,
+   "score": 0.55
+  },
+  {
+   "a": "wp.final",
+   "b": "seat.final",
+   "w": 89,
+   "l": 64,
+   "d": 7,
+   "n": 160,
+   "score": 0.578
+  }
+ ]
+}

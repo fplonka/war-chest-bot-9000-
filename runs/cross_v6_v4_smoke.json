@@ -1,0 +1,30 @@
+{
+  "new": "runs/v6_c96_d1_30m_final/snap_02.pt",
+  "old": "runs/value_v4_depth1_precise30/snap_04.pt",
+  "games": 2,
+  "seed": 901,
+  "depth": 1,
+  "iters": 64,
+  "paired_random_drafts": true,
+  "complete": true,
+  "points": [
+    1.0,
+    1.0
+  ],
+  "pair_points": [
+    2.0
+  ],
+  "result": {
+    "wins": 2,
+    "losses": 0,
+    "draws": 0,
+    "score": 1.0,
+    "elo": Infinity,
+    "decisive_two_sided_p": 0.5,
+    "paired_wins": 1,
+    "paired_losses": 0,
+    "paired_ties": 0,
+    "paired_two_sided_p": 1.0,
+    "superior": "inconclusive"
+  }
+}

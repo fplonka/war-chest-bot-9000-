@@ -1,0 +1,109 @@
+{
+ "runs": [
+  "runs/value_v4_gate10"
+ ],
+ "games": 40,
+ "schedule_seed": 7,
+ "draft_mode": "random",
+ "players": [
+  {
+   "name": "greedy",
+   "run": null,
+   "t": null,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear"
+   },
+   "elo": 0.0,
+   "se": 59.4,
+   "score": 0.7
+  },
+  {
+   "name": "value_v4_gate10.init",
+   "run": "runs/value_v4_gate10",
+   "t": 180.6,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear"
+   },
+   "elo": -143.4,
+   "se": 46.1,
+   "score": 0.433
+  },
+  {
+   "name": "value_v4_gate10.s1",
+   "run": "runs/value_v4_gate10",
+   "t": 420.6,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear"
+   },
+   "elo": -154.9,
+   "se": 44.9,
+   "score": 0.475
+  },
+  {
+   "name": "value_v4_gate10.final",
+   "run": "runs/value_v4_gate10",
+   "t": 600.0,
+   "search": {
+    "depth": 2,
+    "iters": 64,
+    "cfr": "linear"
+   },
+   "elo": -135.4,
+   "se": 39.6,
+   "score": 0.469
+  }
+ ],
+ "pairs": [
+  {
+   "a": "greedy",
+   "b": "value_v4_gate10.init",
+   "w": 12,
+   "l": 5,
+   "d": 3,
+   "n": 20,
+   "score": 0.675
+  },
+  {
+   "a": "greedy",
+   "b": "value_v4_gate10.final",
+   "w": 10,
+   "l": 1,
+   "d": 9,
+   "n": 20,
+   "score": 0.725
+  },
+  {
+   "a": "value_v4_gate10.init",
+   "b": "value_v4_gate10.s1",
+   "w": 4,
+   "l": 2,
+   "d": 14,
+   "n": 20,
+   "score": 0.55
+  },
+  {
+   "a": "value_v4_gate10.init",
+   "b": "value_v4_gate10.final",
+   "w": 2,
+   "l": 5,
+   "d": 13,
+   "n": 20,
+   "score": 0.425
+  },
+  {
+   "a": "value_v4_gate10.s1",
+   "b": "value_v4_gate10.final",
+   "w": 1,
+   "l": 2,
+   "d": 37,
+   "n": 40,
+   "score": 0.487
+  }
+ ]
+}

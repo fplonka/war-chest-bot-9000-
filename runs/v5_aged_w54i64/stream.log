@@ -1,0 +1,16 @@
+v5 GEMM compute=fast-f16
+{"phase": "live", "seconds": 10.035, "solves": 17408, "solves_per_s": 1734.7, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.587, "merge_frac": 0.0}
+{"phase": "live", "seconds": 20.196, "solves": 44032, "solves_per_s": 2180.2, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.584, "merge_frac": 0.0}
+{"phase": "live", "seconds": 30.048, "solves": 52224, "solves_per_s": 1738.0, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.558, "merge_frac": 0.0}
+{"phase": "live", "seconds": 40.082, "solves": 58368, "solves_per_s": 1456.2, "oversize_routes": 2, "card_exclusive_routes": 0, "wait_frac": 0.588, "merge_frac": 0.0}
+{"phase": "live", "seconds": 50.097, "solves": 65536, "solves_per_s": 1308.2, "oversize_routes": 3, "card_exclusive_routes": 0, "wait_frac": 0.596, "merge_frac": 0.0}
+{"phase": "live", "seconds": 60.036, "solves": 72704, "solves_per_s": 1211.0, "oversize_routes": 6, "card_exclusive_routes": 0, "wait_frac": 0.6, "merge_frac": 0.0}
+{"phase": "live", "seconds": 70.169, "solves": 80896, "solves_per_s": 1152.9, "oversize_routes": 12, "card_exclusive_routes": 0, "wait_frac": 0.604, "merge_frac": 0.0}
+Traceback (most recent call last):
+  File "/workspace/warchest-v5/train/stream_bench.py", line 142, in <module>
+    main()
+  File "/workspace/warchest-v5/train/stream_bench.py", line 94, in main
+    data = gen.next(timeout=0.2)
+           ^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: GPU stream solve failed: wave arena allocation (2147483648 elements): DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")
+corrupted double-linked list

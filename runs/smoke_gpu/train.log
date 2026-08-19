@@ -1,0 +1,287 @@
+[train] runs/smoke_gpu at 1feb485+dirty seed=1 {'minutes': 4.0, 'warm_minutes': 1.5, 'snapshot_every': 2.0, 'ladder_games': 8, 'warm_games': 24, 'note': 'cuda driver smoke'}
+[train] cuda driver smoke
+[train] CUDA stream priority -1
+[train] search inference on CPU
+[cfg] PUBFEAT=897 CFEAT=15 architecture=gt-cfr nodes=256 expand=4 iters=16 budget=240s warm=90s snapshot_every=2min device=cuda:1 draft=random replay_ratio=8.0 recent_mix=0.5/0.2 canonical_views=2 cap=1000000 matmul=high
+[t=   1.0s] greedy ep  0 games=  24 dec=  4585 rows=  4424 horizon=0.38 L=3.10612 L/var=18.67 tgt=-0.066/0.408 pstd=0.081 gen=0.0s train=0.8s
+[t=   1.2s] greedy ep  1 games=  24 dec=  4454 rows=  4264 horizon=0.21 L=2.34257 L/var=14.02 tgt=-0.092/0.409 pstd=0.098 gen=0.0s train=0.2s
+[t=   1.6s] greedy ep  2 games=  24 dec=  4033 rows=  3834 horizon=0.12 L=1.66234 L/var=10.70 tgt=-0.063/0.394 pstd=0.101 gen=0.0s train=0.2s
+[t=   1.9s] greedy ep  3 games=  24 dec=  4732 rows=  4482 horizon=0.38 L=2.46897 L/var=22.11 tgt=-0.043/0.334 pstd=0.209 gen=0.0s train=0.2s
+[t=   2.3s] greedy ep  4 games=  24 dec=  4857 rows=  4661 horizon=0.33 L=0.74883 L/var=4.90 tgt=-0.058/0.391 pstd=0.134 gen=0.0s train=0.3s
+[t=   2.6s] greedy ep  5 games=  24 dec=  4634 rows=  4437 horizon=0.25 L=1.05415 L/var=7.61 tgt=-0.013/0.372 pstd=0.072 gen=0.0s train=0.2s
+[t=   2.9s] greedy ep  6 games=  24 dec=  4406 rows=  4242 horizon=0.21 L=0.49263 L/var=2.81 tgt=-0.097/0.418 pstd=0.054 gen=0.0s train=0.2s
+[t=   3.2s] greedy ep  7 games=  24 dec=  4014 rows=  3810 horizon=0.17 L=0.68207 L/var=3.50 tgt=-0.072/0.441 pstd=0.052 gen=0.0s train=0.2s
+[t=   3.5s] greedy ep  8 games=  24 dec=  4648 rows=  4493 horizon=0.38 L=0.41958 L/var=3.31 tgt=-0.058/0.356 pstd=0.035 gen=0.0s train=0.2s
+[t=   3.9s] greedy ep  9 games=  24 dec=  4224 rows=  4068 horizon=0.21 L=0.50637 L/var=2.78 tgt=-0.089/0.426 pstd=0.039 gen=0.0s train=0.2s
+[t=   4.2s] greedy ep 10 games=  24 dec=  4694 rows=  4500 horizon=0.33 L=0.37921 L/var=2.54 tgt=-0.083/0.386 pstd=0.041 gen=0.0s train=0.2s
+[t=   4.5s] greedy ep 11 games=  24 dec=  4281 rows=  4083 horizon=0.21 L=0.39825 L/var=2.33 tgt=-0.122/0.413 pstd=0.028 gen=0.0s train=0.2s
+[t=   4.8s] greedy ep 12 games=  24 dec=  4462 rows=  4292 horizon=0.33 L=0.36317 L/var=2.68 tgt=-0.054/0.368 pstd=0.034 gen=0.0s train=0.2s
+[t=   5.2s] greedy ep 13 games=  24 dec=  4903 rows=  4698 horizon=0.38 L=0.36470 L/var=2.31 tgt=-0.076/0.398 pstd=0.028 gen=0.0s train=0.3s
+[t=   5.5s] greedy ep 14 games=  24 dec=  4497 rows=  4305 horizon=0.29 L=0.31995 L/var=2.29 tgt=-0.053/0.374 pstd=0.033 gen=0.0s train=0.2s
+[t=   5.8s] greedy ep 15 games=  24 dec=  4353 rows=  4171 horizon=0.33 L=0.32934 L/var=2.36 tgt=-0.061/0.374 pstd=0.038 gen=0.0s train=0.2s
+[t=   6.2s] greedy ep 16 games=  24 dec=  4666 rows=  4480 horizon=0.25 L=0.30630 L/var=2.30 tgt=-0.072/0.365 pstd=0.043 gen=0.0s train=0.2s
+[t=   6.6s] greedy ep 17 games=  24 dec=  4897 rows=  4712 horizon=0.33 L=0.32703 L/var=1.76 tgt=-0.064/0.431 pstd=0.043 gen=0.0s train=0.3s
+[t=   6.9s] greedy ep 18 games=  24 dec=  4196 rows=  3987 horizon=0.17 L=0.25877 L/var=1.89 tgt=-0.079/0.370 pstd=0.050 gen=0.0s train=0.2s
+[t=   7.2s] greedy ep 19 games=  24 dec=  4244 rows=  4042 horizon=0.17 L=0.32278 L/var=2.07 tgt=-0.074/0.394 pstd=0.050 gen=0.0s train=0.2s
+[t=   7.5s] greedy ep 20 games=  24 dec=  4687 rows=  4514 horizon=0.38 L=0.24667 L/var=1.26 tgt=-0.079/0.442 pstd=0.048 gen=0.0s train=0.2s
+[t=   7.9s] greedy ep 21 games=  24 dec=  4597 rows=  4387 horizon=0.25 L=0.30838 L/var=2.00 tgt=-0.091/0.392 pstd=0.043 gen=0.0s train=0.2s
+[t=   8.2s] greedy ep 22 games=  24 dec=  4886 rows=  4691 horizon=0.38 L=0.23901 L/var=1.45 tgt=-0.051/0.406 pstd=0.040 gen=0.0s train=0.3s
+[t=   8.6s] greedy ep 23 games=  24 dec=  4478 rows=  4309 horizon=0.25 L=0.30496 L/var=1.84 tgt=-0.082/0.407 pstd=0.038 gen=0.0s train=0.2s
+[t=   9.0s] greedy ep 24 games=  24 dec=  5001 rows=  4835 horizon=0.46 L=0.24441 L/var=1.54 tgt=-0.094/0.399 pstd=0.039 gen=0.0s train=0.3s
+[t=   9.3s] greedy ep 25 games=  24 dec=  5033 rows=  4801 horizon=0.29 L=0.27457 L/var=1.56 tgt=-0.056/0.419 pstd=0.055 gen=0.0s train=0.3s
+[t=   9.7s] greedy ep 26 games=  24 dec=  5146 rows=  4908 horizon=0.38 L=0.28683 L/var=2.03 tgt=-0.023/0.376 pstd=0.054 gen=0.0s train=0.3s
+[t=  10.1s] greedy ep 27 games=  24 dec=  4909 rows=  4657 horizon=0.33 L=0.24370 L/var=1.44 tgt=-0.053/0.411 pstd=0.055 gen=0.0s train=0.3s
+[t=  10.5s] greedy ep 28 games=  24 dec=  5094 rows=  4908 horizon=0.38 L=0.32275 L/var=2.20 tgt=-0.073/0.383 pstd=0.045 gen=0.0s train=0.2s
+[t=  10.8s] greedy ep 29 games=  24 dec=  4173 rows=  4028 horizon=0.17 L=0.26299 L/var=1.33 tgt=-0.081/0.445 pstd=0.042 gen=0.0s train=0.2s
+[t=  11.1s] greedy ep 30 games=  24 dec=  4146 rows=  3959 horizon=0.04 L=0.28353 L/var=1.85 tgt=-0.119/0.391 pstd=0.050 gen=0.0s train=0.2s
+[t=  11.4s] greedy ep 31 games=  24 dec=  4279 rows=  4112 horizon=0.12 L=0.25684 L/var=1.79 tgt=-0.071/0.379 pstd=0.048 gen=0.0s train=0.2s
+[t=  11.8s] greedy ep 32 games=  24 dec=  4663 rows=  4436 horizon=0.33 L=0.25905 L/var=1.52 tgt=-0.066/0.412 pstd=0.051 gen=0.0s train=0.2s
+[t=  12.1s] greedy ep 33 games=  24 dec=  4559 rows=  4354 horizon=0.33 L=0.25129 L/var=1.34 tgt=-0.073/0.434 pstd=0.049 gen=0.0s train=0.2s
+[t=  12.4s] greedy ep 34 games=  24 dec=  4522 rows=  4313 horizon=0.25 L=0.24877 L/var=1.71 tgt=-0.077/0.381 pstd=0.048 gen=0.0s train=0.2s
+[t=  12.7s] greedy ep 35 games=  24 dec=  4397 rows=  4255 horizon=0.25 L=0.25232 L/var=1.55 tgt=-0.095/0.404 pstd=0.051 gen=0.0s train=0.2s
+[t=  13.1s] greedy ep 36 games=  24 dec=  4777 rows=  4569 horizon=0.29 L=0.24480 L/var=1.46 tgt=-0.089/0.410 pstd=0.054 gen=0.0s train=0.2s
+[t=  13.4s] greedy ep 37 games=  24 dec=  4962 rows=  4760 horizon=0.50 L=0.25334 L/var=1.33 tgt=-0.076/0.436 pstd=0.058 gen=0.0s train=0.3s
+[t=  13.8s] greedy ep 38 games=  24 dec=  4692 rows=  4444 horizon=0.29 L=0.24974 L/var=1.63 tgt=-0.052/0.392 pstd=0.055 gen=0.0s train=0.2s
+[t=  14.2s] greedy ep 39 games=  24 dec=  5001 rows=  4792 horizon=0.33 L=0.24973 L/var=1.25 tgt=-0.061/0.448 pstd=0.049 gen=0.0s train=0.3s
+[t=  14.5s] greedy ep 40 games=  24 dec=  5429 rows=  5237 horizon=0.58 L=0.24217 L/var=1.60 tgt=-0.042/0.389 pstd=0.041 gen=0.0s train=0.3s
+[t=  14.9s] greedy ep 41 games=  24 dec=  4524 rows=  4347 horizon=0.25 L=0.22934 L/var=1.42 tgt=-0.053/0.401 pstd=0.042 gen=0.0s train=0.2s
+[t=  15.2s] greedy ep 42 games=  24 dec=  4668 rows=  4445 horizon=0.33 L=0.25399 L/var=1.30 tgt=-0.062/0.442 pstd=0.047 gen=0.0s train=0.2s
+[t=  15.6s] greedy ep 43 games=  24 dec=  4952 rows=  4738 horizon=0.42 L=0.23720 L/var=1.60 tgt=-0.084/0.385 pstd=0.048 gen=0.0s train=0.3s
+[t=  15.9s] greedy ep 44 games=  24 dec=  4553 rows=  4400 horizon=0.25 L=0.24399 L/var=2.17 tgt=-0.053/0.335 pstd=0.051 gen=0.0s train=0.2s
+[t=  16.2s] greedy ep 45 games=  24 dec=  4620 rows=  4434 horizon=0.29 L=0.23611 L/var=1.57 tgt=-0.070/0.388 pstd=0.051 gen=0.0s train=0.2s
+[t=  16.6s] greedy ep 46 games=  24 dec=  4981 rows=  4787 horizon=0.33 L=0.24998 L/var=1.62 tgt=-0.087/0.393 pstd=0.045 gen=0.0s train=0.3s
+[t=  16.9s] greedy ep 47 games=  24 dec=  4782 rows=  4566 horizon=0.29 L=0.23947 L/var=1.29 tgt=-0.086/0.430 pstd=0.043 gen=0.0s train=0.2s
+[t=  17.2s] greedy ep 48 games=  24 dec=  4693 rows=  4484 horizon=0.33 L=0.24780 L/var=1.53 tgt=-0.067/0.403 pstd=0.049 gen=0.0s train=0.2s
+[t=  17.6s] greedy ep 49 games=  24 dec=  5286 rows=  5075 horizon=0.54 L=0.25520 L/var=1.19 tgt=-0.081/0.464 pstd=0.051 gen=0.0s train=0.3s
+[t=  18.0s] greedy ep 50 games=  24 dec=  4373 rows=  4164 horizon=0.21 L=0.25499 L/var=1.49 tgt=-0.108/0.414 pstd=0.057 gen=0.0s train=0.2s
+[t=  18.3s] greedy ep 51 games=  24 dec=  4336 rows=  4127 horizon=0.21 L=0.24735 L/var=1.17 tgt=-0.092/0.459 pstd=0.052 gen=0.0s train=0.2s
+[t=  18.6s] greedy ep 52 games=  24 dec=  4629 rows=  4440 horizon=0.33 L=0.24334 L/var=1.71 tgt=-0.077/0.377 pstd=0.055 gen=0.0s train=0.2s
+[t=  18.9s] greedy ep 53 games=  24 dec=  4194 rows=  3987 horizon=0.12 L=0.24371 L/var=1.42 tgt=-0.076/0.415 pstd=0.055 gen=0.0s train=0.2s
+[t=  19.3s] greedy ep 54 games=  24 dec=  4394 rows=  4238 horizon=0.25 L=0.23759 L/var=1.72 tgt=-0.038/0.371 pstd=0.050 gen=0.0s train=0.2s
+[t=  19.6s] greedy ep 55 games=  24 dec=  4925 rows=  4712 horizon=0.29 L=0.23548 L/var=1.42 tgt=-0.066/0.408 pstd=0.062 gen=0.0s train=0.3s
+[t=  20.0s] greedy ep 56 games=  24 dec=  5082 rows=  4846 horizon=0.38 L=0.23257 L/var=1.93 tgt=-0.060/0.347 pstd=0.070 gen=0.0s train=0.3s
+[t=  20.4s] greedy ep 57 games=  24 dec=  4855 rows=  4657 horizon=0.38 L=0.24120 L/var=1.49 tgt=-0.120/0.402 pstd=0.069 gen=0.0s train=0.3s
+[t=  20.8s] greedy ep 58 games=  24 dec=  4897 rows=  4695 horizon=0.38 L=0.23511 L/var=1.34 tgt=-0.104/0.420 pstd=0.072 gen=0.0s train=0.3s
+[t=  21.1s] greedy ep 59 games=  24 dec=  5522 rows=  5318 horizon=0.67 L=0.22475 L/var=1.38 tgt=-0.062/0.404 pstd=0.089 gen=0.0s train=0.3s
+[t=  21.5s] greedy ep 60 games=  24 dec=  4837 rows=  4616 horizon=0.33 L=0.24245 L/var=1.49 tgt=-0.101/0.404 pstd=0.084 gen=0.0s train=0.3s
+[t=  21.9s] greedy ep 61 games=  24 dec=  4508 rows=  4274 horizon=0.25 L=0.23506 L/var=1.28 tgt=-0.113/0.429 pstd=0.082 gen=0.0s train=0.2s
+[t=  22.2s] greedy ep 62 games=  24 dec=  4538 rows=  4351 horizon=0.21 L=0.23762 L/var=1.40 tgt=-0.078/0.412 pstd=0.087 gen=0.0s train=0.2s
+[t=  22.5s] greedy ep 63 games=  24 dec=  4711 rows=  4518 horizon=0.25 L=0.23708 L/var=1.29 tgt=-0.087/0.429 pstd=0.093 gen=0.0s train=0.2s
+[t=  22.8s] greedy ep 64 games=  24 dec=  4660 rows=  4427 horizon=0.33 L=0.24010 L/var=1.34 tgt=-0.052/0.423 pstd=0.072 gen=0.0s train=0.2s
+[t=  23.2s] greedy ep 65 games=  24 dec=  4203 rows=  4030 horizon=0.17 L=0.22473 L/var=1.97 tgt=-0.055/0.338 pstd=0.070 gen=0.0s train=0.2s
+[t=  23.5s] greedy ep 66 games=  24 dec=  4198 rows=  4048 horizon=0.17 L=0.22768 L/var=1.14 tgt=-0.061/0.447 pstd=0.065 gen=0.0s train=0.2s
+[t=  23.9s] greedy ep 67 games=  24 dec=  5029 rows=  4803 horizon=0.42 L=0.22235 L/var=1.30 tgt=-0.084/0.414 pstd=0.067 gen=0.0s train=0.3s
+[t=  24.2s] greedy ep 68 games=  24 dec=  4887 rows=  4650 horizon=0.33 L=0.22244 L/var=1.37 tgt=-0.039/0.404 pstd=0.072 gen=0.0s train=0.3s
+[t=  24.6s] greedy ep 69 games=  24 dec=  4302 rows=  4132 horizon=0.17 L=0.21788 L/var=1.20 tgt=-0.079/0.426 pstd=0.070 gen=0.0s train=0.2s
+[t=  24.9s] greedy ep 70 games=  24 dec=  4715 rows=  4528 horizon=0.38 L=0.21921 L/var=1.10 tgt=-0.108/0.447 pstd=0.073 gen=0.0s train=0.2s
+[t=  25.2s] greedy ep 71 games=  24 dec=  4673 rows=  4505 horizon=0.25 L=0.21779 L/var=1.39 tgt=-0.055/0.396 pstd=0.086 gen=0.0s train=0.2s
+[t=  25.6s] greedy ep 72 games=  24 dec=  4627 rows=  4438 horizon=0.42 L=0.21255 L/var=1.15 tgt=-0.077/0.430 pstd=0.102 gen=0.0s train=0.2s
+[t=  25.9s] greedy ep 73 games=  24 dec=  4338 rows=  4160 horizon=0.25 L=0.21897 L/var=1.09 tgt=-0.098/0.448 pstd=0.088 gen=0.0s train=0.2s
+[t=  26.2s] greedy ep 74 games=  24 dec=  4592 rows=  4378 horizon=0.29 L=0.21152 L/var=1.16 tgt=-0.049/0.427 pstd=0.081 gen=0.0s train=0.2s
+[t=  26.6s] greedy ep 75 games=  24 dec=  4942 rows=  4748 horizon=0.46 L=0.21572 L/var=1.51 tgt=-0.042/0.379 pstd=0.106 gen=0.0s train=0.3s
+[t=  26.9s] greedy ep 76 games=  24 dec=  4601 rows=  4384 horizon=0.25 L=0.21104 L/var=1.48 tgt=-0.067/0.377 pstd=0.117 gen=0.0s train=0.2s
+[t=  27.3s] greedy ep 77 games=  24 dec=  4524 rows=  4295 horizon=0.25 L=0.21247 L/var=1.21 tgt=-0.111/0.420 pstd=0.117 gen=0.0s train=0.2s
+[t=  27.6s] greedy ep 78 games=  24 dec=  4611 rows=  4445 horizon=0.42 L=0.21220 L/var=1.65 tgt=-0.073/0.359 pstd=0.116 gen=0.0s train=0.2s
+[t=  27.9s] greedy ep 79 games=  24 dec=  4475 rows=  4257 horizon=0.29 L=0.20679 L/var=1.07 tgt=-0.029/0.439 pstd=0.133 gen=0.0s train=0.2s
+[t=  28.3s] greedy ep 80 games=  24 dec=  4902 rows=  4716 horizon=0.38 L=0.21169 L/var=1.25 tgt=-0.066/0.411 pstd=0.159 gen=0.0s train=0.3s
+[t=  28.6s] greedy ep 81 games=  24 dec=  4395 rows=  4212 horizon=0.25 L=0.20713 L/var=1.23 tgt=-0.009/0.411 pstd=0.146 gen=0.0s train=0.2s
+[t=  28.9s] greedy ep 82 games=  24 dec=  4109 rows=  3907 horizon=0.12 L=0.21216 L/var=1.49 tgt=-0.076/0.377 pstd=0.128 gen=0.0s train=0.2s
+[t=  29.3s] greedy ep 83 games=  24 dec=  4580 rows=  4320 horizon=0.17 L=0.20248 L/var=1.75 tgt=-0.024/0.340 pstd=0.150 gen=0.0s train=0.2s
+[t=  29.6s] greedy ep 84 games=  24 dec=  5008 rows=  4803 horizon=0.42 L=0.20522 L/var=1.33 tgt=-0.054/0.393 pstd=0.137 gen=0.0s train=0.3s
+[t=  30.0s] greedy ep 85 games=  24 dec=  5053 rows=  4810 horizon=0.38 L=0.20179 L/var=1.36 tgt=-0.105/0.385 pstd=0.123 gen=0.0s train=0.3s
+[t=  30.4s] greedy ep 86 games=  24 dec=  4286 rows=  4085 horizon=0.17 L=0.20862 L/var=1.25 tgt=-0.092/0.408 pstd=0.152 gen=0.0s train=0.2s
+[t=  30.7s] greedy ep 87 games=  24 dec=  4267 rows=  4088 horizon=0.25 L=0.20930 L/var=1.11 tgt=-0.077/0.435 pstd=0.159 gen=0.0s train=0.2s
+[t=  31.0s] greedy ep 88 games=  24 dec=  4564 rows=  4395 horizon=0.33 L=0.20616 L/var=1.71 tgt=-0.061/0.347 pstd=0.132 gen=0.0s train=0.2s
+[t=  31.3s] greedy ep 89 games=  24 dec=  4330 rows=  4137 horizon=0.29 L=0.20471 L/var=1.04 tgt=-0.096/0.444 pstd=0.144 gen=0.0s train=0.2s
+[t=  31.7s] greedy ep 90 games=  24 dec=  4637 rows=  4424 horizon=0.33 L=0.19868 L/var=1.00 tgt=-0.121/0.446 pstd=0.149 gen=0.0s train=0.2s
+[t=  32.0s] greedy ep 91 games=  24 dec=  4931 rows=  4763 horizon=0.42 L=0.20817 L/var=1.30 tgt=-0.076/0.400 pstd=0.142 gen=0.0s train=0.3s
+[t=  32.4s] greedy ep 92 games=  24 dec=  4262 rows=  4072 horizon=0.21 L=0.20712 L/var=1.49 tgt=-0.065/0.373 pstd=0.152 gen=0.0s train=0.2s
+[t=  32.7s] greedy ep 93 games=  24 dec=  4399 rows=  4210 horizon=0.29 L=0.19818 L/var=1.16 tgt=-0.091/0.414 pstd=0.136 gen=0.0s train=0.2s
+[t=  33.0s] greedy ep 94 games=  24 dec=  4651 rows=  4484 horizon=0.33 L=0.20046 L/var=1.13 tgt=-0.078/0.421 pstd=0.138 gen=0.0s train=0.2s
+[t=  33.3s] greedy ep 95 games=  24 dec=  4556 rows=  4293 horizon=0.21 L=0.19717 L/var=1.24 tgt=-0.100/0.399 pstd=0.156 gen=0.0s train=0.2s
+[t=  33.7s] greedy ep 96 games=  24 dec=  4252 rows=  4086 horizon=0.17 L=0.19630 L/var=1.22 tgt=-0.071/0.401 pstd=0.141 gen=0.0s train=0.2s
+[t=  34.0s] greedy ep 97 games=  24 dec=  3988 rows=  3833 horizon=0.17 L=0.20024 L/var=1.28 tgt=-0.083/0.396 pstd=0.130 gen=0.0s train=0.2s
+[t=  34.3s] greedy ep 98 games=  24 dec=  4470 rows=  4296 horizon=0.29 L=0.19914 L/var=1.88 tgt=-0.044/0.325 pstd=0.143 gen=0.0s train=0.2s
+[t=  34.6s] greedy ep 99 games=  24 dec=  4730 rows=  4521 horizon=0.25 L=0.20105 L/var=1.18 tgt=-0.110/0.413 pstd=0.144 gen=0.0s train=0.2s
+[t=  35.0s] greedy ep100 games=  24 dec=  4597 rows=  4387 horizon=0.25 L=0.19423 L/var=1.02 tgt=-0.057/0.437 pstd=0.146 gen=0.1s train=0.2s
+[t=  35.3s] greedy ep101 games=  24 dec=  4286 rows=  4079 horizon=0.21 L=0.19973 L/var=1.16 tgt=-0.123/0.416 pstd=0.152 gen=0.0s train=0.2s
+[t=  35.6s] greedy ep102 games=  24 dec=  4423 rows=  4249 horizon=0.25 L=0.20055 L/var=1.15 tgt=-0.114/0.418 pstd=0.137 gen=0.0s train=0.2s
+[t=  36.0s] greedy ep103 games=  24 dec=  4470 rows=  4233 horizon=0.25 L=0.19964 L/var=1.35 tgt=-0.083/0.385 pstd=0.167 gen=0.0s train=0.2s
+[t=  36.3s] greedy ep104 games=  24 dec=  4773 rows=  4543 horizon=0.33 L=0.21064 L/var=1.39 tgt=-0.076/0.390 pstd=0.104 gen=0.0s train=0.2s
+[t=  36.6s] greedy ep105 games=  24 dec=  4804 rows=  4594 horizon=0.33 L=0.20728 L/var=1.10 tgt=-0.140/0.434 pstd=0.136 gen=0.0s train=0.2s
+[t=  37.0s] greedy ep106 games=  24 dec=  4991 rows=  4819 horizon=0.42 L=0.20409 L/var=1.31 tgt=-0.081/0.394 pstd=0.145 gen=0.0s train=0.3s
+[t=  37.4s] greedy ep107 games=  24 dec=  4436 rows=  4189 horizon=0.21 L=0.21681 L/var=1.19 tgt=-0.075/0.427 pstd=0.131 gen=0.0s train=0.2s
+[t=  37.7s] greedy ep108 games=  24 dec=  4229 rows=  4044 horizon=0.25 L=0.22597 L/var=1.69 tgt=-0.063/0.366 pstd=0.157 gen=0.0s train=0.2s
+[t=  38.0s] greedy ep109 games=  24 dec=  4311 rows=  4144 horizon=0.21 L=0.20657 L/var=1.02 tgt=-0.092/0.449 pstd=0.158 gen=0.0s train=0.2s
+[t=  38.4s] greedy ep110 games=  24 dec=  4131 rows=  3983 horizon=0.17 L=0.20936 L/var=1.54 tgt=-0.071/0.369 pstd=0.204 gen=0.0s train=0.2s
+[t=  38.7s] greedy ep111 games=  24 dec=  5068 rows=  4845 horizon=0.33 L=0.23693 L/var=1.41 tgt=-0.081/0.410 pstd=0.098 gen=0.0s train=0.3s
+[t=  39.1s] greedy ep112 games=  24 dec=  4767 rows=  4582 horizon=0.42 L=0.28581 L/var=1.82 tgt=-0.064/0.396 pstd=0.105 gen=0.0s train=0.2s
+[t=  39.4s] greedy ep113 games=  24 dec=  4530 rows=  4301 horizon=0.17 L=0.28320 L/var=2.02 tgt=-0.061/0.374 pstd=0.113 gen=0.0s train=0.2s
+[t=  39.7s] greedy ep114 games=  24 dec=  4611 rows=  4439 horizon=0.29 L=0.26577 L/var=1.64 tgt=-0.098/0.403 pstd=0.084 gen=0.0s train=0.2s
+[t=  40.1s] greedy ep115 games=  24 dec=  4547 rows=  4378 horizon=0.21 L=0.24045 L/var=1.05 tgt=-0.082/0.478 pstd=0.099 gen=0.0s train=0.2s
+[t=  40.4s] greedy ep116 games=  24 dec=  5220 rows=  4930 horizon=0.46 L=0.21922 L/var=1.38 tgt=-0.053/0.399 pstd=0.112 gen=0.0s train=0.3s
+[t=  40.8s] greedy ep117 games=  24 dec=  4292 rows=  4066 horizon=0.25 L=0.22270 L/var=1.41 tgt=-0.054/0.397 pstd=0.113 gen=0.0s train=0.2s
+[t=  41.2s] greedy ep118 games=  24 dec=  4846 rows=  4678 horizon=0.38 L=0.21735 L/var=1.14 tgt=-0.119/0.437 pstd=0.095 gen=0.0s train=0.3s
+[t=  41.5s] greedy ep119 games=  24 dec=  4188 rows=  4000 horizon=0.17 L=0.22685 L/var=1.38 tgt=-0.091/0.406 pstd=0.101 gen=0.0s train=0.2s
+[t=  41.8s] greedy ep120 games=  24 dec=  4702 rows=  4503 horizon=0.38 L=0.22795 L/var=1.52 tgt=-0.083/0.388 pstd=0.104 gen=0.0s train=0.2s
+[t=  42.1s] greedy ep121 games=  24 dec=  4118 rows=  3949 horizon=0.17 L=0.20767 L/var=1.62 tgt=-0.050/0.358 pstd=0.114 gen=0.0s train=0.2s
+[t=  42.5s] greedy ep122 games=  24 dec=  5389 rows=  5169 horizon=0.58 L=0.21017 L/var=1.49 tgt=-0.062/0.375 pstd=0.137 gen=0.0s train=0.3s
+[t=  42.8s] greedy ep123 games=  24 dec=  4418 rows=  4208 horizon=0.21 L=0.20866 L/var=1.08 tgt=-0.060/0.440 pstd=0.147 gen=0.0s train=0.2s
+[t=  43.2s] greedy ep124 games=  24 dec=  4764 rows=  4565 horizon=0.38 L=0.21682 L/var=1.43 tgt=-0.110/0.389 pstd=0.131 gen=0.0s train=0.2s
+[t=  43.5s] greedy ep125 games=  24 dec=  4568 rows=  4374 horizon=0.25 L=0.20406 L/var=1.42 tgt=-0.062/0.380 pstd=0.130 gen=0.0s train=0.2s
+[t=  43.9s] greedy ep126 games=  24 dec=  5168 rows=  4934 horizon=0.42 L=0.20582 L/var=1.17 tgt=-0.067/0.420 pstd=0.135 gen=0.0s train=0.2s
+[t=  44.2s] greedy ep127 games=  24 dec=  4107 rows=  3944 horizon=0.12 L=0.20123 L/var=1.52 tgt=-0.051/0.364 pstd=0.160 gen=0.0s train=0.2s
+[t=  44.6s] greedy ep128 games=  24 dec=  5144 rows=  4982 horizon=0.46 L=0.20577 L/var=1.20 tgt=-0.056/0.414 pstd=0.130 gen=0.0s train=0.3s
+[t=  45.0s] greedy ep129 games=  24 dec=  4645 rows=  4463 horizon=0.38 L=0.19974 L/var=1.33 tgt=-0.097/0.387 pstd=0.160 gen=0.0s train=0.2s
+[t=  45.4s] greedy ep130 games=  24 dec=  4627 rows=  4425 horizon=0.29 L=0.20035 L/var=1.55 tgt=-0.058/0.360 pstd=0.140 gen=0.0s train=0.2s
+[t=  45.7s] greedy ep131 games=  24 dec=  4148 rows=  3970 horizon=0.12 L=0.18697 L/var=1.13 tgt=-0.103/0.407 pstd=0.161 gen=0.0s train=0.2s
+[t=  46.1s] greedy ep132 games=  24 dec=  4650 rows=  4479 horizon=0.29 L=0.20228 L/var=1.41 tgt=-0.010/0.379 pstd=0.131 gen=0.0s train=0.2s
+[t=  46.5s] greedy ep133 games=  24 dec=  4305 rows=  4138 horizon=0.25 L=0.21016 L/var=1.23 tgt=-0.073/0.413 pstd=0.745 gen=0.0s train=0.2s
+[t=  46.8s] greedy ep134 games=  24 dec=  4350 rows=  4181 horizon=0.21 L=0.58472 L/var=4.23 tgt=-0.072/0.372 pstd=0.073 gen=0.0s train=0.2s
+[t=  47.2s] greedy ep135 games=  24 dec=  4867 rows=  4624 horizon=0.21 L=0.24837 L/var=1.32 tgt=-0.096/0.434 pstd=0.077 gen=0.0s train=0.3s
+[t=  47.5s] greedy ep136 games=  24 dec=  4405 rows=  4211 horizon=0.12 L=0.26022 L/var=1.43 tgt=-0.090/0.427 pstd=0.100 gen=0.0s train=0.2s
+[t=  47.8s] greedy ep137 games=  24 dec=  4515 rows=  4341 horizon=0.25 L=0.23835 L/var=1.40 tgt=-0.111/0.412 pstd=0.091 gen=0.0s train=0.2s
+[t=  48.2s] greedy ep138 games=  24 dec=  4616 rows=  4413 horizon=0.25 L=0.25673 L/var=1.99 tgt=-0.117/0.359 pstd=0.093 gen=0.0s train=0.2s
+[t=  48.5s] greedy ep139 games=  24 dec=  4607 rows=  4439 horizon=0.33 L=0.22627 L/var=1.30 tgt=-0.073/0.418 pstd=0.095 gen=0.0s train=0.2s
+[t=  48.8s] greedy ep140 games=  24 dec=  4498 rows=  4288 horizon=0.29 L=0.21505 L/var=1.46 tgt=-0.054/0.383 pstd=0.117 gen=0.0s train=0.2s
+[t=  49.2s] greedy ep141 games=  24 dec=  4916 rows=  4709 horizon=0.38 L=0.20455 L/var=1.20 tgt=-0.090/0.412 pstd=0.145 gen=0.0s train=0.3s
+[t=  49.5s] greedy ep142 games=  24 dec=  4216 rows=  4042 horizon=0.21 L=0.18811 L/var=1.07 tgt=-0.123/0.420 pstd=0.153 gen=0.0s train=0.2s
+[t=  49.9s] greedy ep143 games=  24 dec=  4664 rows=  4452 horizon=0.25 L=0.19868 L/var=1.33 tgt=-0.072/0.386 pstd=0.164 gen=0.0s train=0.2s
+[t=  50.2s] greedy ep144 games=  24 dec=  4568 rows=  4375 horizon=0.25 L=0.18814 L/var=1.18 tgt=-0.047/0.398 pstd=0.192 gen=0.0s train=0.2s
+[t=  50.5s] greedy ep145 games=  24 dec=  4085 rows=  3905 horizon=0.12 L=0.19531 L/var=1.05 tgt=-0.082/0.431 pstd=0.185 gen=0.0s train=0.2s
+[t=  50.9s] greedy ep146 games=  24 dec=  4580 rows=  4349 horizon=0.25 L=0.21975 L/var=0.97 tgt=-0.098/0.477 pstd=0.095 gen=0.0s train=0.2s
+[t=  51.2s] greedy ep147 games=  24 dec=  4582 rows=  4385 horizon=0.33 L=0.20215 L/var=1.21 tgt=-0.081/0.408 pstd=0.108 gen=0.0s train=0.2s
+[t=  51.5s] greedy ep148 games=  24 dec=  4625 rows=  4453 horizon=0.29 L=0.20343 L/var=1.15 tgt=-0.064/0.420 pstd=0.173 gen=0.0s train=0.2s
+[t=  51.8s] greedy ep149 games=  24 dec=  4701 rows=  4493 horizon=0.33 L=0.20805 L/var=1.36 tgt=-0.070/0.392 pstd=0.171 gen=0.0s train=0.2s
+[t=  52.2s] greedy ep150 games=  24 dec=  4775 rows=  4597 horizon=0.33 L=0.20424 L/var=1.38 tgt=-0.046/0.384 pstd=0.141 gen=0.0s train=0.2s
+[t=  52.5s] greedy ep151 games=  24 dec=  4653 rows=  4398 horizon=0.21 L=0.22861 L/var=0.95 tgt=-0.150/0.491 pstd=0.119 gen=0.0s train=0.2s
+[t=  52.8s] greedy ep152 games=  24 dec=  4403 rows=  4211 horizon=0.29 L=0.28524 L/var=1.73 tgt=-0.058/0.406 pstd=0.147 gen=0.0s train=0.2s
+[t=  53.2s] greedy ep153 games=  24 dec=  4794 rows=  4576 horizon=0.33 L=0.23827 L/var=1.27 tgt=-0.090/0.433 pstd=0.114 gen=0.0s train=0.2s
+[t=  53.6s] greedy ep154 games=  24 dec=  4147 rows=  3973 horizon=0.25 L=0.22071 L/var=1.57 tgt=-0.038/0.375 pstd=0.135 gen=0.0s train=0.2s
+[t=  53.9s] greedy ep155 games=  24 dec=  4369 rows=  4176 horizon=0.21 L=0.21082 L/var=1.53 tgt=-0.060/0.371 pstd=0.135 gen=0.0s train=0.2s
+[t=  54.2s] greedy ep156 games=  24 dec=  4587 rows=  4387 horizon=0.33 L=0.20399 L/var=1.37 tgt=-0.084/0.385 pstd=0.148 gen=0.0s train=0.2s
+[t=  54.6s] greedy ep157 games=  24 dec=  4496 rows=  4291 horizon=0.25 L=0.19968 L/var=1.29 tgt=-0.042/0.393 pstd=0.170 gen=0.0s train=0.2s
+[t=  54.9s] greedy ep158 games=  24 dec=  4614 rows=  4448 horizon=0.25 L=0.18769 L/var=1.54 tgt=-0.069/0.349 pstd=0.184 gen=0.0s train=0.2s
+[t=  55.2s] greedy ep159 games=  24 dec=  4125 rows=  3924 horizon=0.12 L=0.16820 L/var=0.87 tgt=-0.082/0.440 pstd=0.236 gen=0.0s train=0.2s
+[t=  55.5s] greedy ep160 games=  24 dec=  4269 rows=  4079 horizon=0.12 L=0.20322 L/var=1.28 tgt=-0.067/0.398 pstd=0.309 gen=0.0s train=0.2s
+[t=  55.9s] greedy ep161 games=  24 dec=  4396 rows=  4172 horizon=0.21 L=0.29883 L/var=1.69 tgt=-0.076/0.420 pstd=0.160 gen=0.0s train=0.2s
+[t=  56.2s] greedy ep162 games=  24 dec=  4790 rows=  4582 horizon=0.42 L=0.30222 L/var=1.77 tgt=-0.079/0.413 pstd=0.091 gen=0.0s train=0.2s
+[t=  56.5s] greedy ep163 games=  24 dec=  4363 rows=  4217 horizon=0.29 L=0.23651 L/var=1.63 tgt=-0.075/0.381 pstd=0.078 gen=0.0s train=0.2s
+[t=  56.9s] greedy ep164 games=  24 dec=  4701 rows=  4520 horizon=0.33 L=0.23275 L/var=1.33 tgt=-0.071/0.418 pstd=0.073 gen=0.0s train=0.2s
+[t=  57.2s] greedy ep165 games=  24 dec=  4308 rows=  4130 horizon=0.25 L=0.21572 L/var=1.57 tgt=-0.069/0.371 pstd=0.128 gen=0.0s train=0.2s
+[t=  57.5s] greedy ep166 games=  24 dec=  4345 rows=  4170 horizon=0.25 L=0.20836 L/var=1.08 tgt=-0.097/0.440 pstd=0.172 gen=0.0s train=0.2s
+[t=  57.9s] greedy ep167 games=  24 dec=  4573 rows=  4397 horizon=0.25 L=0.18805 L/var=1.17 tgt=-0.076/0.402 pstd=0.193 gen=0.0s train=0.2s
+[t=  58.2s] greedy ep168 games=  24 dec=  4693 rows=  4510 horizon=0.38 L=0.17718 L/var=1.14 tgt=-0.044/0.395 pstd=0.282 gen=0.0s train=0.2s
+[t=  58.5s] greedy ep169 games=  24 dec=  4345 rows=  4188 horizon=0.21 L=0.12646 L/var=0.82 tgt=-0.018/0.392 pstd=0.656 gen=0.0s train=0.2s
+[t=  58.9s] greedy ep170 games=  24 dec=  4836 rows=  4621 horizon=0.38 L=0.22430 L/var=1.26 tgt=-0.080/0.421 pstd=0.305 gen=0.0s train=0.3s
+[t=  59.2s] greedy ep171 games=  24 dec=  4297 rows=  4081 horizon=0.25 L=0.12668 L/var=0.92 tgt=-0.046/0.370 pstd=0.317 gen=0.0s train=0.2s
+[t=  59.6s] greedy ep172 games=  24 dec=  4829 rows=  4589 horizon=0.38 L=0.12144 L/var=0.96 tgt=-0.058/0.356 pstd=0.287 gen=0.0s train=0.2s
+[t=  59.9s] greedy ep173 games=  24 dec=  4270 rows=  4128 horizon=0.21 L=0.08605 L/var=0.54 tgt=-0.108/0.400 pstd=0.329 gen=0.0s train=0.2s
+[t=  60.2s] greedy ep174 games=  24 dec=  4711 rows=  4517 horizon=0.21 L=0.06153 L/var=0.32 tgt=-0.140/0.441 pstd=0.372 gen=0.0s train=0.2s
+[t=  60.5s] greedy ep175 games=  24 dec=  4227 rows=  4043 horizon=0.08 L=0.05004 L/var=0.27 tgt=-0.010/0.428 pstd=0.359 gen=0.0s train=0.2s
+[t=  60.9s] greedy ep176 games=  24 dec=  4695 rows=  4478 horizon=0.29 L=0.11272 L/var=0.78 tgt=-0.051/0.380 pstd=0.228 gen=0.0s train=0.2s
+[t=  61.2s] greedy ep177 games=  24 dec=  4587 rows=  4414 horizon=0.29 L=0.08866 L/var=0.44 tgt=-0.074/0.449 pstd=0.523 gen=0.0s train=0.2s
+[t=  61.5s] greedy ep178 games=  24 dec=  4453 rows=  4268 horizon=0.17 L=0.10418 L/var=0.73 tgt=-0.063/0.378 pstd=0.359 gen=0.0s train=0.2s
+[t=  61.9s] greedy ep179 games=  24 dec=  4731 rows=  4532 horizon=0.33 L=0.10112 L/var=0.70 tgt=-0.086/0.380 pstd=0.248 gen=0.0s train=0.2s
+[t=  62.2s] greedy ep180 games=  24 dec=  4386 rows=  4190 horizon=0.21 L=0.06803 L/var=0.40 tgt=-0.045/0.410 pstd=0.411 gen=0.0s train=0.2s
+[t=  62.5s] greedy ep181 games=  24 dec=  4532 rows=  4338 horizon=0.25 L=0.06307 L/var=0.49 tgt=-0.036/0.360 pstd=0.289 gen=0.0s train=0.2s
+[t=  62.9s] greedy ep182 games=  24 dec=  5051 rows=  4831 horizon=0.46 L=0.05175 L/var=0.31 tgt=-0.063/0.409 pstd=0.355 gen=0.0s train=0.3s
+[t=  63.3s] greedy ep183 games=  24 dec=  4970 rows=  4708 horizon=0.29 L=0.04155 L/var=0.26 tgt=-0.053/0.402 pstd=0.389 gen=0.0s train=0.3s
+[t=  63.6s] greedy ep184 games=  24 dec=  4497 rows=  4274 horizon=0.21 L=0.04022 L/var=0.24 tgt=-0.089/0.412 pstd=0.349 gen=0.0s train=0.2s
+[t=  64.0s] greedy ep185 games=  24 dec=  4904 rows=  4678 horizon=0.21 L=0.04005 L/var=0.27 tgt=-0.099/0.383 pstd=0.425 gen=0.0s train=0.3s
+[t=  64.3s] greedy ep186 games=  24 dec=  4714 rows=  4474 horizon=0.29 L=0.04015 L/var=0.25 tgt=-0.077/0.397 pstd=0.379 gen=0.0s train=0.2s
+[t=  64.7s] greedy ep187 games=  24 dec=  4645 rows=  4453 horizon=0.29 L=0.03652 L/var=0.24 tgt=-0.061/0.392 pstd=0.382 gen=0.0s train=0.2s
+[t=  65.0s] greedy ep188 games=  24 dec=  4958 rows=  4739 horizon=0.46 L=0.03584 L/var=0.20 tgt=-0.100/0.421 pstd=0.390 gen=0.0s train=0.3s
+[t=  65.4s] greedy ep189 games=  24 dec=  4421 rows=  4220 horizon=0.25 L=0.03725 L/var=0.24 tgt=-0.067/0.395 pstd=0.377 gen=0.0s train=0.2s
+[t=  65.7s] greedy ep190 games=  24 dec=  4438 rows=  4226 horizon=0.21 L=0.03527 L/var=0.24 tgt=-0.072/0.385 pstd=0.393 gen=0.0s train=0.2s
+[t=  66.0s] greedy ep191 games=  24 dec=  4715 rows=  4500 horizon=0.38 L=0.03279 L/var=0.22 tgt=-0.082/0.385 pstd=0.382 gen=0.0s train=0.2s
+[t=  66.4s] greedy ep192 games=  24 dec=  4710 rows=  4527 horizon=0.33 L=0.03556 L/var=0.27 tgt=-0.040/0.361 pstd=0.377 gen=0.0s train=0.2s
+[t=  66.7s] greedy ep193 games=  24 dec=  4734 rows=  4554 horizon=0.33 L=0.03391 L/var=0.22 tgt=-0.086/0.397 pstd=0.382 gen=0.0s train=0.2s
+[t=  67.1s] greedy ep194 games=  24 dec=  4664 rows=  4467 horizon=0.29 L=0.03650 L/var=0.25 tgt=-0.043/0.379 pstd=0.376 gen=0.0s train=0.2s
+[t=  67.4s] greedy ep195 games=  24 dec=  4396 rows=  4193 horizon=0.29 L=0.03408 L/var=0.23 tgt=-0.074/0.385 pstd=0.378 gen=0.0s train=0.2s
+[t=  67.8s] greedy ep196 games=  24 dec=  5126 rows=  4916 horizon=0.50 L=0.03365 L/var=0.31 tgt=-0.062/0.329 pstd=0.403 gen=0.0s train=0.3s
+[t=  68.1s] greedy ep197 games=  24 dec=  4661 rows=  4456 horizon=0.38 L=0.03123 L/var=0.20 tgt=-0.086/0.399 pstd=0.406 gen=0.0s train=0.2s
+[t=  68.5s] greedy ep198 games=  24 dec=  4855 rows=  4686 horizon=0.38 L=0.03464 L/var=0.27 tgt=-0.086/0.358 pstd=0.378 gen=0.0s train=0.3s
+[t=  68.8s] greedy ep199 games=  24 dec=  4273 rows=  4108 horizon=0.25 L=0.03242 L/var=0.22 tgt=-0.070/0.380 pstd=0.373 gen=0.0s train=0.2s
+[t=  69.2s] greedy ep200 games=  24 dec=  4264 rows=  4082 horizon=0.12 L=0.03189 L/var=0.22 tgt=-0.093/0.383 pstd=0.379 gen=0.0s train=0.2s
+[t=  69.5s] greedy ep201 games=  24 dec=  4926 rows=  4715 horizon=0.38 L=0.03537 L/var=0.22 tgt=-0.054/0.400 pstd=0.356 gen=0.0s train=0.3s
+[t=  69.9s] greedy ep202 games=  24 dec=  4635 rows=  4430 horizon=0.38 L=0.03590 L/var=0.30 tgt=-0.073/0.343 pstd=0.364 gen=0.0s train=0.2s
+[t=  70.2s] greedy ep203 games=  24 dec=  4510 rows=  4366 horizon=0.29 L=0.03539 L/var=0.20 tgt=-0.120/0.419 pstd=0.430 gen=0.0s train=0.2s
+[t=  70.6s] greedy ep204 games=  24 dec=  4678 rows=  4522 horizon=0.33 L=0.03387 L/var=0.27 tgt=-0.039/0.356 pstd=0.392 gen=0.0s train=0.2s
+[t=  70.9s] greedy ep205 games=  24 dec=  4717 rows=  4566 horizon=0.42 L=0.02983 L/var=0.19 tgt=-0.063/0.397 pstd=0.378 gen=0.0s train=0.2s
+[t=  71.3s] greedy ep206 games=  24 dec=  4825 rows=  4613 horizon=0.33 L=0.02726 L/var=0.22 tgt=-0.040/0.353 pstd=0.416 gen=0.0s train=0.3s
+[t=  71.7s] greedy ep207 games=  24 dec=  4866 rows=  4629 horizon=0.33 L=0.02799 L/var=0.20 tgt=-0.089/0.372 pstd=0.372 gen=0.0s train=0.3s
+[t=  72.0s] greedy ep208 games=  24 dec=  5199 rows=  4934 horizon=0.38 L=0.02509 L/var=0.12 tgt=-0.128/0.465 pstd=0.379 gen=0.0s train=0.3s
+[t=  72.4s] greedy ep209 games=  24 dec=  4085 rows=  3881 horizon=0.17 L=0.02325 L/var=0.17 tgt=-0.066/0.366 pstd=0.384 gen=0.0s train=0.2s
+[t=  72.8s] greedy ep210 games=  24 dec=  5237 rows=  5047 horizon=0.42 L=0.01987 L/var=0.16 tgt=-0.052/0.353 pstd=0.405 gen=0.0s train=0.3s
+[t=  73.1s] greedy ep211 games=  24 dec=  4280 rows=  4086 horizon=0.25 L=0.01718 L/var=0.11 tgt=-0.081/0.395 pstd=0.393 gen=0.0s train=0.2s
+[t=  73.4s] greedy ep212 games=  24 dec=  4618 rows=  4444 horizon=0.29 L=0.02868 L/var=0.22 tgt=-0.078/0.365 pstd=0.339 gen=0.0s train=0.2s
+[t=  73.8s] greedy ep213 games=  24 dec=  4725 rows=  4528 horizon=0.29 L=0.03333 L/var=0.20 tgt=-0.056/0.409 pstd=0.339 gen=0.0s train=0.2s
+[t=  74.1s] greedy ep214 games=  24 dec=  4425 rows=  4220 horizon=0.17 L=0.02825 L/var=0.20 tgt=-0.072/0.372 pstd=0.399 gen=0.0s train=0.2s
+[t=  74.4s] greedy ep215 games=  24 dec=  4715 rows=  4531 horizon=0.38 L=0.02253 L/var=0.14 tgt=-0.052/0.400 pstd=0.349 gen=0.0s train=0.2s
+[t=  74.8s] greedy ep216 games=  24 dec=  4421 rows=  4192 horizon=0.17 L=0.01820 L/var=0.09 tgt=-0.120/0.442 pstd=0.380 gen=0.0s train=0.2s
+[t=  75.1s] greedy ep217 games=  24 dec=  4739 rows=  4548 horizon=0.38 L=0.01571 L/var=0.09 tgt=-0.115/0.416 pstd=0.395 gen=0.0s train=0.2s
+[t=  75.5s] greedy ep218 games=  24 dec=  4701 rows=  4514 horizon=0.29 L=0.01156 L/var=0.07 tgt=-0.053/0.421 pstd=0.385 gen=0.0s train=0.2s
+[t=  75.8s] greedy ep219 games=  24 dec=  4435 rows=  4218 horizon=0.29 L=0.01023 L/var=0.07 tgt=-0.071/0.383 pstd=0.402 gen=0.0s train=0.2s
+[t=  76.1s] greedy ep220 games=  24 dec=  4853 rows=  4601 horizon=0.33 L=0.01043 L/var=0.06 tgt=-0.113/0.412 pstd=0.376 gen=0.0s train=0.2s
+[t=  76.5s] greedy ep221 games=  24 dec=  4237 rows=  4086 horizon=0.21 L=0.00937 L/var=0.06 tgt=-0.075/0.397 pstd=0.412 gen=0.0s train=0.2s
+[t=  76.8s] greedy ep222 games=  24 dec=  4598 rows=  4427 horizon=0.33 L=0.00840 L/var=0.06 tgt=-0.085/0.380 pstd=0.392 gen=0.0s train=0.2s
+[t=  77.2s] greedy ep223 games=  24 dec=  4811 rows=  4614 horizon=0.29 L=0.00706 L/var=0.05 tgt=-0.069/0.382 pstd=0.404 gen=0.0s train=0.3s
+[t=  77.6s] greedy ep224 games=  24 dec=  4606 rows=  4386 horizon=0.33 L=0.00728 L/var=0.04 tgt=-0.067/0.404 pstd=0.415 gen=0.0s train=0.2s
+[t=  77.9s] greedy ep225 games=  24 dec=  4518 rows=  4360 horizon=0.25 L=0.00764 L/var=0.06 tgt=-0.058/0.348 pstd=0.387 gen=0.0s train=0.2s
+[t=  78.2s] greedy ep226 games=  24 dec=  4651 rows=  4467 horizon=0.38 L=0.00842 L/var=0.06 tgt=-0.055/0.390 pstd=0.403 gen=0.0s train=0.2s
+[t=  78.6s] greedy ep227 games=  24 dec=  4927 rows=  4767 horizon=0.42 L=0.00596 L/var=0.04 tgt=-0.069/0.405 pstd=0.403 gen=0.0s train=0.3s
+[t=  78.9s] greedy ep228 games=  24 dec=  4700 rows=  4510 horizon=0.38 L=0.00542 L/var=0.03 tgt=-0.080/0.404 pstd=0.399 gen=0.0s train=0.2s
+[t=  79.3s] greedy ep229 games=  24 dec=  4530 rows=  4350 horizon=0.25 L=0.00514 L/var=0.04 tgt=-0.066/0.363 pstd=0.399 gen=0.0s train=0.2s
+[t=  79.6s] greedy ep230 games=  24 dec=  4598 rows=  4439 horizon=0.33 L=0.00542 L/var=0.04 tgt=-0.049/0.375 pstd=0.409 gen=0.0s train=0.2s
+[t=  79.9s] greedy ep231 games=  24 dec=  4411 rows=  4202 horizon=0.29 L=0.00667 L/var=0.04 tgt=-0.100/0.411 pstd=0.404 gen=0.0s train=0.2s
+[t=  80.3s] greedy ep232 games=  24 dec=  4436 rows=  4229 horizon=0.25 L=0.00533 L/var=0.03 tgt=-0.104/0.428 pstd=0.400 gen=0.0s train=0.2s
+[t=  80.6s] greedy ep233 games=  24 dec=  4711 rows=  4471 horizon=0.29 L=0.00614 L/var=0.04 tgt=-0.025/0.376 pstd=0.386 gen=0.0s train=0.2s
+[t=  81.0s] greedy ep234 games=  24 dec=  4115 rows=  3931 horizon=0.08 L=0.01051 L/var=0.06 tgt=-0.111/0.415 pstd=0.396 gen=0.0s train=0.2s
+[t=  81.3s] greedy ep235 games=  24 dec=  4739 rows=  4554 horizon=0.33 L=0.00748 L/var=0.04 tgt=-0.142/0.417 pstd=0.401 gen=0.0s train=0.2s
+[t=  81.6s] greedy ep236 games=  24 dec=  4813 rows=  4606 horizon=0.33 L=0.00504 L/var=0.04 tgt=-0.079/0.376 pstd=0.401 gen=0.0s train=0.2s
+[t=  82.0s] greedy ep237 games=  24 dec=  4795 rows=  4637 horizon=0.42 L=0.00515 L/var=0.03 tgt=-0.062/0.399 pstd=0.404 gen=0.0s train=0.2s
+[t=  82.4s] greedy ep238 games=  24 dec=  4745 rows=  4556 horizon=0.25 L=0.00617 L/var=0.03 tgt=-0.107/0.464 pstd=0.411 gen=0.0s train=0.2s
+[t=  82.7s] greedy ep239 games=  24 dec=  4523 rows=  4348 horizon=0.25 L=0.00588 L/var=0.03 tgt=-0.082/0.411 pstd=0.391 gen=0.0s train=0.2s
+[t=  83.0s] greedy ep240 games=  24 dec=  4207 rows=  4054 horizon=0.21 L=0.00684 L/var=0.04 tgt=-0.082/0.391 pstd=0.405 gen=0.0s train=0.2s
+[t=  83.3s] greedy ep241 games=  24 dec=  4344 rows=  4161 horizon=0.17 L=0.00498 L/var=0.03 tgt=-0.075/0.407 pstd=0.398 gen=0.0s train=0.2s
+[t=  83.7s] greedy ep242 games=  24 dec=  4536 rows=  4312 horizon=0.29 L=0.00560 L/var=0.04 tgt=-0.054/0.394 pstd=0.398 gen=0.0s train=0.2s
+[t=  84.0s] greedy ep243 games=  24 dec=  4565 rows=  4392 horizon=0.25 L=0.00595 L/var=0.04 tgt=-0.044/0.388 pstd=0.400 gen=0.0s train=0.2s
+[t=  84.4s] greedy ep244 games=  24 dec=  4835 rows=  4647 horizon=0.33 L=0.00483 L/var=0.03 tgt=-0.080/0.432 pstd=0.397 gen=0.0s train=0.3s
+[t=  84.8s] greedy ep245 games=  24 dec=  5013 rows=  4832 horizon=0.42 L=0.00444 L/var=0.03 tgt=-0.075/0.405 pstd=0.394 gen=0.0s train=0.3s
+[t=  85.1s] greedy ep246 games=  24 dec=  4177 rows=  4005 horizon=0.12 L=0.00469 L/var=0.03 tgt=-0.046/0.406 pstd=0.408 gen=0.0s train=0.2s
+[t=  85.4s] greedy ep247 games=  24 dec=  4435 rows=  4272 horizon=0.33 L=0.00328 L/var=0.02 tgt=-0.057/0.401 pstd=0.398 gen=0.0s train=0.2s
+[t=  85.8s] greedy ep248 games=  24 dec=  4637 rows=  4452 horizon=0.38 L=0.00360 L/var=0.02 tgt=-0.058/0.380 pstd=0.399 gen=0.0s train=0.2s
+[t=  86.1s] greedy ep249 games=  24 dec=  4455 rows=  4325 horizon=0.29 L=0.00320 L/var=0.02 tgt=-0.045/0.400 pstd=0.400 gen=0.0s train=0.2s
+[t=  86.4s] greedy ep250 games=  24 dec=  4676 rows=  4442 horizon=0.25 L=0.00318 L/var=0.02 tgt=-0.073/0.454 pstd=0.403 gen=0.0s train=0.2s
+[t=  86.8s] greedy ep251 games=  24 dec=  4440 rows=  4227 horizon=0.17 L=0.00600 L/var=0.04 tgt=-0.037/0.382 pstd=0.388 gen=0.0s train=0.2s
+[t=  87.1s] greedy ep252 games=  24 dec=  5317 rows=  5092 horizon=0.42 L=0.00555 L/var=0.03 tgt=-0.095/0.405 pstd=0.397 gen=0.0s train=0.3s
+[t=  87.5s] greedy ep253 games=  24 dec=  4386 rows=  4237 horizon=0.33 L=0.00473 L/var=0.02 tgt=-0.087/0.441 pstd=0.417 gen=0.0s train=0.2s
+[t=  87.8s] greedy ep254 games=  24 dec=  4709 rows=  4553 horizon=0.38 L=0.00523 L/var=0.03 tgt=-0.090/0.413 pstd=0.394 gen=0.0s train=0.2s
+[t=  88.2s] greedy ep255 games=  24 dec=  5221 rows=  4971 horizon=0.38 L=0.00587 L/var=0.03 tgt=-0.118/0.468 pstd=0.392 gen=0.0s train=0.3s
+[t=  88.6s] greedy ep256 games=  24 dec=  5210 rows=  4993 horizon=0.50 L=0.00390 L/var=0.02 tgt=-0.072/0.417 pstd=0.401 gen=0.0s train=0.3s
+[t=  89.0s] greedy ep257 games=  24 dec=  5010 rows=  4831 horizon=0.46 L=0.00338 L/var=0.02 tgt=-0.051/0.416 pstd=0.414 gen=0.0s train=0.3s
+[t=  89.3s] greedy ep258 games=  24 dec=  5103 rows=  4857 horizon=0.46 L=0.00323 L/var=0.03 tgt=-0.056/0.353 pstd=0.412 gen=0.0s train=0.2s
+[t=  89.7s] greedy ep259 games=  24 dec=  4381 rows=  4178 horizon=0.25 L=0.00286 L/var=0.02 tgt=-0.065/0.364 pstd=0.400 gen=0.0s train=0.2s
+[t=  90.0s] greedy ep260 games=  24 dec=  4428 rows=  4265 horizon=0.25 L=0.00274 L/var=0.02 tgt=-0.082/0.401 pstd=0.413 gen=0.1s train=0.2s
+[t=  90.0s] --- snapshot snap_00.pt (init) ---
+[t=  90.1s] --- switching to GT-CFR ---
+[t= 100.4s] GT-CFR solves=592 rate=57.1/s rows=592 games=0 qrows=269 caps=42 L=0.00000 L/var=0.00 tgt=-0.022/0.133 gen=0.14s train=0.00s gpu=0.00s
+[t= 110.5s] GT-CFR solves=1416 rate=69.2/s rows=824 games=0 qrows=399 caps=44 L=0.04051 L/var=1.68 tgt=-0.024/0.155 gen=0.10s train=0.77s gpu=0.00s
+[t= 120.6s] GT-CFR solves=2232 rate=73.2/s rows=816 games=0 qrows=402 caps=54 L=0.04928 L/var=0.70 tgt=-0.080/0.265 gen=0.09s train=0.53s gpu=0.00s
+[t= 130.6s] GT-CFR solves=3000 rate=74.1/s rows=768 games=0 qrows=374 caps=54 L=0.07508 L/var=0.37 tgt=-0.230/0.452 gen=0.10s train=0.51s gpu=0.00s
+[t= 139.7s] --- lr -> 5.00e-04 ---
+[t= 140.6s] GT-CFR solves=3768 rate=74.6/s rows=768 games=1 qrows=381 caps=54 L=0.07234 L/var=0.29 tgt=-0.081/0.496 gen=0.10s train=0.51s gpu=0.00s
+[t= 150.6s] GT-CFR solves=4512 rate=74.5/s rows=744 games=1 qrows=364 caps=54 L=0.04737 L/var=0.17 tgt=-0.163/0.527 gen=0.11s train=0.51s gpu=0.00s
+[t= 160.6s] GT-CFR solves=5192 rate=73.6/s rows=680 games=0 qrows=336 caps=57 L=0.03595 L/var=0.16 tgt=-0.025/0.474 gen=0.12s train=0.40s gpu=0.00s
+[t= 170.7s] GT-CFR solves=5872 rate=72.9/s rows=680 games=0 qrows=336 caps=57 L=0.02915 L/var=0.09 tgt=-0.044/0.567 gen=0.12s train=0.40s gpu=0.00s
+[t= 180.9s] GT-CFR solves=6544 rate=72.0/s rows=672 games=0 qrows=333 caps=57 L=0.01734 L/var=0.05 tgt=-0.005/0.576 gen=0.13s train=0.49s gpu=0.00s
+[t= 190.6s] --- lr -> 2.50e-04 ---
+[t= 191.0s] GT-CFR solves=7208 rate=71.4/s rows=664 games=3 qrows=327 caps=57 L=0.01425 L/var=0.06 tgt=+0.033/0.500 gen=0.12s train=0.41s gpu=0.00s
+[t= 201.4s] GT-CFR solves=7992 rate=71.8/s rows=784 games=1 qrows=383 caps=64 L=0.01488 L/var=0.08 tgt=+0.032/0.425 gen=0.10s train=0.49s gpu=0.00s
+[t= 210.1s] --- snapshot snap_01.pt (s1) ---
+[t= 211.5s] GT-CFR solves=8680 rate=71.5/s rows=688 games=4 qrows=342 caps=64 L=0.01534 L/var=0.09 tgt=+0.005/0.420 gen=0.12s train=0.38s gpu=0.00s
+[t= 221.5s] GT-CFR solves=9384 rate=71.4/s rows=704 games=2 qrows=352 caps=64 L=0.01335 L/var=0.11 tgt=-0.043/0.345 gen=0.12s train=0.52s gpu=0.00s
+[t= 231.6s] GT-CFR solves=10128 rate=71.6/s rows=744 games=1 qrows=369 caps=64 L=0.01277 L/var=0.07 tgt=-0.073/0.417 gen=0.11s train=0.51s gpu=0.00s
+[GT-CFR-summary] solves=10880 optimizer_rows=87040 rate=72.6/s horizon=0.00 games=13 caps=69
+[t= 242.8s] --- snapshot snap_02.pt (final) ---

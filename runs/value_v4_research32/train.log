@@ -569,3 +569,4 @@
   swiss   value_v4_research32.s2 vs value_v4_research32.final W 11 L  6 D  3  n= 20  score 0.625
   swiss                   greedy vs value_v4_research32.init W  5 L  4 D 11  n= 40  score 0.525
   swiss                   greedy vs value_v4_research32.init W 10 L  4 D  6  n= 60  score 0.567
+  swiss   value_v4_research32.s2 vs value_v4_research32.s4   W  8 L  7 D  5  n= 20  score 0.525

@@ -1,0 +1,51 @@
+[train] runs/trav_smoke at a9b3044+dirty seed=1 {'minutes': 2.0, 'warm_minutes': 0.5, 'snapshot_every': 0.5, 'ladder_games': 0, 'gpu_drain_seconds': 10.0, 'note': 'traverser-head production smoke'}
+[train] traverser-head production smoke
+[cpu] pinned to 36 physical cores
+[train] CUDA stream priority -1
+[gpu] solve services up on [0, 1]
+[cfg] PUBFEAT=897 CFEAT=16 hidden=384 head=384 dg=64 rank=64 depth=2 iters=64 budget=120s warm=30s snapshot_every=0.5min device=cuda:1 draft=random train_gen_ratio=4.0 recent_mix=0.5/0.2 augment=True cap=2000000 matmul=high
+[t=   2.3s] greedy ep  0 games=  96 dec= 18968 rows= 18118 horizon=0.30 L=0.09642 L/var=0.42 tgt=-0.023/0.482 pstd=0.484 gen=0.1s train=2.1s
+[t=   4.1s] greedy ep  1 games=  96 dec= 18844 rows= 18051 horizon=0.33 L=0.03684 L/var=0.15 tgt=-0.058/0.494 pstd=0.502 gen=0.1s train=1.6s
+[t=   6.0s] greedy ep  2 games=  96 dec= 18181 rows= 17414 horizon=0.27 L=0.03231 L/var=0.12 tgt=-0.025/0.512 pstd=0.499 gen=0.1s train=1.6s
+[t=   7.8s] greedy ep  3 games=  96 dec= 17989 rows= 17120 horizon=0.26 L=0.02855 L/var=0.12 tgt=-0.029/0.495 pstd=0.489 gen=0.1s train=1.6s
+[t=   9.7s] greedy ep  4 games=  96 dec= 18823 rows= 18078 horizon=0.29 L=0.02410 L/var=0.11 tgt=-0.022/0.471 pstd=0.500 gen=0.1s train=1.7s
+[t=  11.6s] greedy ep  5 games=  96 dec= 18924 rows= 18146 horizon=0.33 L=0.02254 L/var=0.09 tgt=-0.029/0.496 pstd=0.500 gen=0.1s train=1.7s
+[t=  13.4s] greedy ep  6 games=  96 dec= 17615 rows= 16921 horizon=0.26 L=0.02223 L/var=0.08 tgt=-0.041/0.511 pstd=0.501 gen=0.1s train=1.6s
+[t=  15.3s] greedy ep  7 games=  96 dec= 18608 rows= 17786 horizon=0.36 L=0.01979 L/var=0.08 tgt=-0.065/0.495 pstd=0.505 gen=0.1s train=1.7s
+[t=  17.5s] greedy ep  8 games=  96 dec= 19040 rows= 18296 horizon=0.36 L=0.01882 L/var=0.08 tgt=-0.019/0.484 pstd=0.495 gen=0.1s train=2.0s
+[t=  19.6s] greedy ep  9 games=  96 dec= 18200 rows= 17459 horizon=0.27 L=0.01969 L/var=0.07 tgt=-0.034/0.513 pstd=0.507 gen=0.1s train=2.0s
+[t=  21.8s] greedy ep 10 games=  96 dec= 17927 rows= 17200 horizon=0.24 L=0.01828 L/var=0.07 tgt=-0.036/0.524 pstd=0.481 gen=0.1s train=1.9s
+[t=  23.9s] greedy ep 11 games=  96 dec= 17941 rows= 17162 horizon=0.28 L=0.01835 L/var=0.08 tgt=-0.044/0.477 pstd=0.487 gen=0.1s train=1.9s
+[t=  26.0s] greedy ep 12 games=  96 dec= 17384 rows= 16648 horizon=0.25 L=0.01833 L/var=0.07 tgt=-0.023/0.503 pstd=0.500 gen=0.1s train=1.9s
+[t=  28.2s] greedy ep 13 games=  96 dec= 18153 rows= 17377 horizon=0.28 L=0.01769 L/var=0.07 tgt=-0.027/0.502 pstd=0.498 gen=0.1s train=2.0s
+[t=  30.2s] greedy ep 14 games=  96 dec= 18097 rows= 17377 horizon=0.26 L=0.01749 L/var=0.07 tgt=-0.037/0.511 pstd=0.486 gen=0.1s train=1.8s
+[t=  30.2s] --- snapshot snap_00.pt (init) ---
+[t=  30.2s] --- switching to ReBeL ---
+[t=  40.2s] rebel stream solves=15360 raw=1533/s balanced=1533/s debt=0 rows steps=60 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.02763 L/var=0.90 tgt=+0.058/0.175 cfg/b=44214 prep=0.26s gpu=0.00s conv=0.02s add=0.56s train=1.76s
+[t=  50.3s] rebel stream solves=39936 raw=1987/s balanced=1987/s debt=0 rows steps=156 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00296 L/var=0.14 tgt=+0.096/0.146 cfg/b=70380 prep=0.42s gpu=0.00s conv=0.07s add=1.37s train=2.91s
+[t=  59.9s] --- lr -> 5.00e-04 ---
+[t=  60.2s] --- snapshot snap_01.pt (s1) ---
+[t=  60.3s] rebel stream solves=51200 raw=1700/s balanced=1700/s debt=0 rows steps=200 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00183 L/var=0.09 tgt=+0.155/0.141 cfg/b=39860 prep=0.19s gpu=0.00s conv=0.01s add=0.49s train=1.19s
+[t=  70.4s] rebel stream solves=56320 raw=1402/s balanced=1402/s debt=0 rows steps=220 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00149 L/var=0.07 tgt=+0.174/0.143 cfg/b=51592 prep=0.08s gpu=0.00s conv=0.01s add=0.41s train=0.54s
+[t=  80.4s] rebel stream solves=62464 raw=1245/s balanced=1245/s debt=0 rows steps=244 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00133 L/var=0.07 tgt=+0.175/0.141 cfg/b=73764 prep=0.10s gpu=0.00s conv=0.06s add=0.79s train=0.70s
+[t=  90.2s] --- snapshot snap_02.pt (s2) ---
+[t=  90.4s] rebel stream solves=69632 raw=1157/s balanced=1157/s debt=0 rows steps=272 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00132 L/var=0.06 tgt=+0.194/0.143 cfg/b=83900 prep=0.19s gpu=0.00s conv=0.02s add=0.52s train=0.94s
+[t=  90.5s] --- lr -> 2.50e-04 ---
+[t= 100.4s] rebel stream solves=76800 raw=1094/s balanced=1094/s debt=0 rows steps=300 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00124 L/var=0.06 tgt=+0.207/0.140 cfg/b=69495 prep=0.18s gpu=0.00s conv=0.02s add=0.53s train=0.90s
+[t= 110.1s] --- stopping GPU admission; draining ---
+[t= 110.4s] rebel stream solves=81920 raw=1021/s balanced=1021/s debt=0 rows steps=320 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00119 L/var=0.06 tgt=+0.224/0.140 cfg/b=59819 prep=0.15s gpu=0.00s conv=0.01s add=0.26s train=0.65s
+[t= 120.2s] --- snapshot snap_03.pt (s3) ---
+[t= 120.4s] rebel stream solves=82944 raw=919/s balanced=919/s debt=0 rows steps=324 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00120 L/var=0.06 tgt=+0.230/0.138 cfg/b=59246 prep=0.02s gpu=0.00s conv=0.00s add=0.08s train=0.13s
+[t= 130.5s] rebel stream solves=82944 raw=827/s balanced=827/s debt=0 rows steps=324 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00000 L/var=0.00 tgt=+0.000/0.000 cfg/b=0 prep=0.00s gpu=0.00s conv=0.00s add=0.00s train=0.00s
+[t= 140.5s] rebel stream solves=82944 raw=752/s balanced=752/s debt=0 rows steps=324 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00000 L/var=0.00 tgt=+0.000/0.000 cfg/b=0 prep=0.00s gpu=0.00s conv=0.00s add=0.00s train=0.00s
+[t= 141.4s] rebel stream solves=83169 raw=748/s balanced=746/s debt=900 rows steps=324 horizon=0.00 games=0 over=0 card=0 drop=0 L=0.00000 L/var=0.00 tgt=+0.245/0.125 cfg/b=0 prep=0.00s gpu=0.00s conv=0.00s add=0.02s train=0.00s
+[gpu-summary] solves=83169 optimizer_rows=331776 debt=900 raw=747.7/s balanced=745.7/s horizon=0.00 games=0 over=0 card=0 exact=0 censored=4608 dropped=0 overrun=21.43s
+[t= 141.4s] --- snapshot snap_04.pt (final) ---
+Traceback (most recent call last):
+  File "/workspace/warchest-engine/train/train.py", line 921, in <module>
+    main()
+  File "/workspace/warchest-engine/train/train.py", line 916, in main
+    ladder.run([args.out], games=args.ladder_games, gpu=True)
+  File "/workspace/warchest-engine/train/ladder.py", line 142, in run
+    raise ValueError("games must be a positive even count")
+ValueError: games must be a positive even count

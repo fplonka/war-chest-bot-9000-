@@ -19,3 +19,10 @@
 [t= 100.6s] rebel stream solves=74752 raw=744/s balanced=744/s debt=0 rows steps=292 horizon=0.00 games=0 over=7 card=0 drop=0 L=0.00000 L/var=2.98 tgt=+0.014/0.001 cfg/b=84724 prep=0.10s gpu=0.00s conv=0.02s add=0.36s train=0.52s
 [t= 110.6s] rebel stream solves=77824 raw=704/s balanced=704/s debt=0 rows steps=304 horizon=0.00 games=0 over=8 card=0 drop=0 L=0.00000 L/var=0.31 tgt=+0.014/0.003 cfg/b=93570 prep=0.12s gpu=0.00s conv=0.02s add=0.37s train=0.53s
 [t= 120.6s] rebel stream solves=79872 raw=662/s balanced=662/s debt=0 rows steps=312 horizon=0.00 games=0 over=10 card=0 drop=0 L=0.00000 L/var=2.75 tgt=+0.014/0.001 cfg/b=95414 prep=0.06s gpu=0.00s conv=0.01s add=0.19s train=0.35s
+[t= 130.7s] rebel stream solves=81920 raw=627/s balanced=627/s debt=0 rows steps=320 horizon=0.00 games=0 over=10 card=0 drop=0 L=0.00000 L/var=3.37 tgt=+0.014/0.001 cfg/b=96302 prep=0.13s gpu=0.00s conv=0.01s add=0.16s train=0.43s
+[t= 140.7s] rebel stream solves=83968 raw=597/s balanced=597/s debt=0 rows steps=328 horizon=0.00 games=0 over=12 card=0 drop=0 L=0.00006 L/var=97.99 tgt=+0.014/0.001 cfg/b=99408 prep=0.07s gpu=0.00s conv=0.03s add=0.28s train=0.36s
+[t= 150.8s] rebel stream solves=86016 raw=571/s balanced=571/s debt=0 rows steps=336 horizon=0.00 games=0 over=16 card=0 drop=0 L=0.00000 L/var=8.67 tgt=+0.014/0.001 cfg/b=111927 prep=0.08s gpu=0.00s conv=0.02s add=0.37s train=0.41s
+[t= 160.8s] rebel stream solves=88064 raw=548/s balanced=548/s debt=0 rows steps=344 horizon=0.00 games=0 over=17 card=0 drop=0 L=0.00003 L/var=58.48 tgt=+0.014/0.001 cfg/b=117653 prep=0.05s gpu=0.00s conv=0.02s add=0.27s train=0.33s
+[t= 161.2s] --- lr -> 2.50e-04 ---
+[t= 170.8s] rebel stream solves=90112 raw=528/s balanced=528/s debt=0 rows steps=352 horizon=0.00 games=0 over=18 card=0 drop=0 L=0.00000 L/var=4.26 tgt=+0.014/0.001 cfg/b=124524 prep=0.10s gpu=0.00s conv=0.01s add=0.26s train=0.44s
+[t= 180.8s] rebel stream solves=91136 raw=504/s balanced=504/s debt=0 rows steps=356 horizon=0.00 games=0 over=19 card=1 drop=0 L=0.00000 L/var=0.01 tgt=+0.014/0.013 cfg/b=123904 prep=0.10s gpu=0.00s conv=0.00s add=0.13s train=0.28s

@@ -1,0 +1,51 @@
+v5 GEMM compute=fast-f16
+{"phase": "live", "seconds": 10.182, "solves": 23552, "solves_per_s": 2313.0, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.509, "merge_frac": 0.002}
+{"phase": "live", "seconds": 20.037, "solves": 49152, "solves_per_s": 2453.0, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.469, "merge_frac": 0.007}
+{"phase": "live", "seconds": 30.057, "solves": 56320, "solves_per_s": 1873.8, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.381, "merge_frac": 0.004}
+{"phase": "live", "seconds": 40.155, "solves": 64512, "solves_per_s": 1606.6, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.397, "merge_frac": 0.003}
+{"phase": "live", "seconds": 50.049, "solves": 73728, "solves_per_s": 1473.1, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.384, "merge_frac": 0.003}
+{"phase": "live", "seconds": 60.013, "solves": 81920, "solves_per_s": 1365.0, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.363, "merge_frac": 0.002}
+{"phase": "live", "seconds": 70.125, "solves": 90112, "solves_per_s": 1285.0, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.337, "merge_frac": 0.002}
+{"phase": "live", "seconds": 80.167, "solves": 96256, "solves_per_s": 1200.7, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.312, "merge_frac": 0.002}
+{"phase": "live", "seconds": 90.044, "solves": 103424, "solves_per_s": 1148.6, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.285, "merge_frac": 0.002}
+{"phase": "live", "seconds": 100.156, "solves": 111616, "solves_per_s": 1114.4, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.272, "merge_frac": 0.001}
+{"phase": "live", "seconds": 110.163, "solves": 118784, "solves_per_s": 1078.3, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.251, "merge_frac": 0.001}
+{"phase": "live", "seconds": 120.178, "solves": 125952, "solves_per_s": 1048.0, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.231, "merge_frac": 0.001}
+{"phase": "prestop", "wait_frac": 0.234, "merge_frac": 0.001, "solves": 125952, "games": 315, "decisions": 396584, "oversize_routes": 0, "card_exclusive_routes": 0, "exact_fallbacks": 0, "censored_games": 0, "dropped": 0, "node_caps": 74, "seconds": 120.17802566802129, "solves_per_s": 1048.0}
+  BUILD        2510071 cpu-ms
+  BACTS         107165 cpu-ms
+  BDRAW         358843 cpu-ms
+  BCELLS        176120 cpu-ms
+  BOBS           49476 cpu-ms
+  BSUP          195257 cpu-ms
+  DGEN          149295 cpu-ms
+  DSORT          88380 cpu-ms
+  DCOMP              0 cpu-ms
+  BAPPLY         49476 cpu-ms
+  BPUSH         806365 cpu-ms
+  ALLOC          41095 cpu-ms
+  SERIAL        479957 cpu-ms
+  REACH              0 cpu-ms
+  PUBFEAT       424514 cpu-ms
+  PUBNET             0 cpu-ms
+  BELFEAT            0 cpu-ms
+  NET                0 cpu-ms
+  LEAFDOT            0 cpu-ms
+  LEAFPOST           0 cpu-ms
+  BACK               0 cpu-ms
+  RM                 0 cpu-ms
+  AVG                0 cpu-ms
+  WALK               0 cpu-ms
+  SNAP               0 cpu-ms
+  P2                 0 cpu-ms
+  ADVANCE      3439924 cpu-ms
+  TRIP1              0 cpu-ms
+  TRIP2              0 cpu-ms
+  DLIDLE             0 cpu-ms
+  DLSYNC             0 cpu-ms
+  DLBUSY             0 cpu-ms
+  SVCTICK            0 cpu-ms
+  SVCHDR             0 cpu-ms
+  SVCADMIT           0 cpu-ms
+  SVCFENCE           0 cpu-ms
+{"phase": "drained", "solves": 127896, "games": 361, "decisions": 410713, "oversize_routes": 0, "card_exclusive_routes": 0, "exact_fallbacks": 0, "censored_games": 4608, "dropped": 0, "node_caps": 346, "seconds": 143.237, "solves_per_s": 892.9}
