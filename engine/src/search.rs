@@ -559,7 +559,29 @@ struct Mark {
 pub struct Solved {
     pub value: [Vec<f32>; 2],
     pub queries: Vec<(State, [Belief; 2])>,
+    /// The root's average policy — Student of Games' policy target, "the
+    /// output policies for all information states within the root public
+    /// state, computed in the regret update phase".
+    ///
+    /// `acts` describes each of the root's actions the way the policy head
+    /// reads one, so a stored row can rebuild `e(a)` without keeping a whole
+    /// `State`. `off`, `act` and `p` are the acting player's configs in
+    /// belief order, each with its legal cells and their probability.
+    pub policy: Policy,
 }
+
+/// One public state's action list and the average policy over it.
+#[derive(Default, Clone)]
+pub struct Policy {
+    pub acts: Vec<[u8; ACT_BYTES]>,
+    pub off: Vec<u32>,
+    pub act: Vec<u8>,
+    pub p: Vec<f32>,
+}
+
+/// How an action is stored in a replay row: kind, the coin slot it spends
+/// (offset by one so `-1` is zero), and the three squares it names.
+pub const ACT_BYTES: usize = 5;
 
 /// Draw an index from non-negative weights without allocating. A row whose
 /// weights have all underflowed is drawn uniformly rather than dropped.
@@ -2383,8 +2405,52 @@ impl<'a> Solver<'a> {
     pub fn harvest(&mut self, rng: &mut Rng, queries: usize) -> Solved {
         let value = self.value_pass();
         let queries = self.sample_queries(rng, queries);
+        let policy = self.root_policy();
         self.restore();
-        Solved { value, queries }
+        Solved {
+            value,
+            queries,
+            policy,
+        }
+    }
+
+    /// The root's action list and its average policy, per acting config.
+    ///
+    /// Read off `avg`, which `finish` materialised — so this is the reference
+    /// strategy the solve acts under, not the last iterate. A capped or
+    /// unexpanded root has no cells and gives an empty policy, which a caller
+    /// stores as "no target here" rather than as a uniform one.
+    fn root_policy(&self) -> Policy {
+        let n = &self.nodes[0];
+        if n.leaf || n.chance || self.avg.is_empty() {
+            return Policy::default();
+        }
+        let me = n.player as usize;
+        let mut out = Policy {
+            acts: (0..n.na())
+                .map(|a| {
+                    let h = n.acts[a].hexes();
+                    [
+                        n.acts[a].kind() as u8,
+                        (n.aslot[a] + 1) as u8,
+                        h[0],
+                        h[1],
+                        h[2],
+                    ]
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let so = self.soff[0] as usize;
+        out.off.push(0);
+        for c in 0..n.nc(me) {
+            for cell in n.legal_row(c) {
+                out.act.push(n.legal_action[cell] as u8);
+                out.p.push(self.avg[so + cell]);
+            }
+            out.off.push(out.act.len() as u32);
+        }
+        out
     }
 
     /// Uniform draws from the leaves this solve queried the network at.

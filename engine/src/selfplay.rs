@@ -186,6 +186,22 @@ pub struct Data {
     pub cw: Vec<f32>,
     /// `[total_configs]` the solve's value for each config.
     pub cy: Vec<f32>,
+
+    // ------------------------------------------------- the policy target
+    // Student of Games trains the policy head on the root's average policy.
+    // It is per (config, legal action), so it is a second ragged level under
+    // the config arena, and it exists only for the acting player's configs --
+    // the other player's rows are empty, which is also what a row with no
+    // policy at all looks like.
+    /// `[n * ACT_BYTES]` per row: how many actions the root offered, and each
+    /// described the way the policy head reads one. `paoff` bounds a row.
+    pub pa: Vec<u8>,
+    pub paoff: Vec<u32>,
+    /// `[total_configs + 1]` offsets into the cell arrays below.
+    pub pcoff: Vec<u32>,
+    /// Per cell: which of the row's actions it is, and its target probability.
+    pub pcell: Vec<u8>,
+    pub pprob: Vec<f32>,
     /// Decisions by coarse move class, for the run report's strategy mix.
     pub plays: [usize; 6],
 
@@ -224,6 +240,17 @@ impl Data {
         // row after the join is read with somebody else's configs.
         let tail = if self.coff.is_empty() { 0 } else { 1 };
         self.coff.extend(o.coff.iter().skip(tail).map(|x| x + base));
+        // The policy arenas join the same way: one leading zero between them,
+        // and each side's offsets shifted onto the merged arrays.
+        let (ab, cb) = (
+            (self.pa.len() / crate::search::ACT_BYTES) as u32,
+            self.pcell.len() as u32,
+        );
+        self.pa.extend(o.pa);
+        self.pcell.extend(o.pcell);
+        self.pprob.extend(o.pprob);
+        self.paoff.extend(o.paoff.iter().skip(tail).map(|x| x + ab));
+        self.pcoff.extend(o.pcoff.iter().skip(tail).map(|x| x + cb));
         let rb = self.nv as u32;
         self.soff.extend(o.soff.iter().map(|x| x + rb));
         self.nv += o.nv;
@@ -250,7 +277,14 @@ impl Data {
     /// `y[p]` holds one value per *config* in `bel[p]`. Every one of them is
     /// stored: the value function is a function of the config, so there is
     /// nothing to average away.
-    fn push_value(&mut self, s: &State, ctx: &Ctx, bel: &[Belief; 2], y: [&[f32]; 2]) {
+    fn push_value(
+        &mut self,
+        s: &State,
+        ctx: &Ctx,
+        bel: &[Belief; 2],
+        y: [&[f32]; 2],
+        policy: &crate::search::Policy,
+    ) {
         debug_assert!(
             matches!(s.pending(), Cont::MainPlay),
             "every saved value row is a normal coin-play state"
@@ -260,7 +294,18 @@ impl Data {
         pack_row(s, ctx, &mut self.rows[base..base + ROW_BYTES]);
         if self.coff.is_empty() {
             self.coff.push(0);
+            self.paoff.push(0);
+            self.pcoff.push(0);
         }
+        // The policy belongs to whoever acts at the root; the other player's
+        // configs carry an empty row, as does every config of a row that has
+        // no policy at all.
+        let actor = s.to_act() as usize;
+        let usable = !policy.acts.is_empty() && policy.off.len() == bel[actor].len() + 1;
+        for a in policy.acts.iter().take(if usable { usize::MAX } else { 0 }) {
+            self.pa.extend_from_slice(a);
+        }
+        self.paoff.push((self.pa.len() / crate::search::ACT_BYTES) as u32);
         for p in 0..2 {
             let res = reserve(s, p as u8, ctx);
             let mut cnt = [0u8; CCOUNTS];
@@ -269,6 +314,12 @@ impl Data {
                 self.cc.extend_from_slice(&cnt);
                 self.cw.push(bel[p].p[ci]);
                 self.cy.push(y[p][ci]);
+                if usable && p == actor {
+                    let row = policy.off[ci] as usize..policy.off[ci + 1] as usize;
+                    self.pcell.extend_from_slice(&policy.act[row.clone()]);
+                    self.pprob.extend_from_slice(&policy.p[row]);
+                }
+                self.pcoff.push(self.pcell.len() as u32);
             }
             self.coff.push(self.cw.len() as u32);
         }
@@ -454,7 +505,13 @@ impl Game {
                         let want = draw_count(rng, gc.query_rate);
                         let solved = sv.harvest(rng, want);
                         data.begin_solve();
-                        data.push_value(s, ctx, bel, [&solved.value[0], &solved.value[1]]);
+                        data.push_value(
+                            s,
+                            ctx,
+                            bel,
+                            [&solved.value[0], &solved.value[1]],
+                            &solved.policy,
+                        );
                         queries.extend(solved.queries);
                     }
                     policy::at_node(&sv, 0, cfgs.len())
@@ -470,7 +527,8 @@ impl Game {
                 let e = eval_squashed(s, 0);
                 let (a, b) = (vec![e; bel[0].len()], vec![-e; bel[1].len()]);
                 data.begin_solve();
-                data.push_value(s, ctx, bel, [&a, &b]);
+                // The warm start has no search, so no policy target.
+                data.push_value(s, ctx, bel, [&a, &b], &Default::default());
             }
 
             let true_row = np.row(true_ci);
@@ -632,7 +690,13 @@ impl GameStream {
         let want = draw_count(&mut self.rng, self.gc.recursive_rate);
         let solved = sv.harvest(&mut self.rng, want);
         out.begin_solve();
-        out.push_value(&s, &ctx, &bel, [&solved.value[0], &solved.value[1]]);
+        out.push_value(
+            &s,
+            &ctx,
+            &bel,
+            [&solved.value[0], &solved.value[1]],
+            &solved.policy,
+        );
         out.queries += 1;
         self.enqueue(solved.queries);
     }
@@ -769,4 +833,113 @@ pub fn run_games(games: usize, seed: u64, nets: &Nets, gc: &GameCfg) -> Data {
             a.merge(b);
             a
         })
+}
+
+#[cfg(test)]
+mod policy_target_tests {
+    use super::*;
+    use crate::search::{Cfg, Solver};
+
+    fn random_net(seed: u64) -> crate::net::Net {
+        let mut r = Rng::new(seed);
+        let l = crate::net::NetLayout::new();
+        let mut draw = |n: usize| -> Vec<f32> {
+            (0..n).map(|_| (r.unit_f64() as f32 - 0.5) * 0.2).collect()
+        };
+        let (w, b) = (draw(l.w_len), draw(l.b_len));
+        let mut ln = vec![0.0; l.ln_len];
+        for n in &l.norms {
+            ln[n.g..n.g + n.width].fill(1.0);
+        }
+        crate::net::Net::from_flat(&w, &b, &ln).expect("random net")
+    }
+
+    /// A stored row's policy target must be the solve's own root average: one
+    /// row per acting config, summing to one, over the actions that config can
+    /// actually play.
+    ///
+    /// The arena is ragged twice over — configs under rows, cells under
+    /// configs — so an off-by-one in either offset array silently pairs a
+    /// config with somebody else's policy. That is invisible in training
+    /// except as a loss that will not fall, which is why it is pinned here.
+    #[test]
+    fn a_stored_row_carries_the_root_average_policy() {
+        let nets = Nets {
+            value: random_net(0x5EED),
+            gate: None,
+        };
+        let cfg = Cfg {
+            nodes: 256,
+            expand: 4,
+            iters: 8,
+            ..Default::default()
+        };
+        let gc = GameCfg {
+            agents: [Agent::Rebel { cfg }; 2],
+            collect: Collect::Rebel,
+            explore: 0.1,
+            random_draft: true,
+            eval_mix: 1.0,
+            mc_mix: 0.0,
+            query_rate: 0.9,
+            recursive_rate: 0.1,
+        };
+        let roots = collect_roots(2, 3, &nets, &gc, 3);
+        assert!(!roots.is_empty(), "no roots to test against");
+
+        let mut rng = Rng::new(0x9017);
+        let mut checked = 0usize;
+        for (s, bel) in &roots {
+            let ctx = Ctx::new(s);
+            let mut sv = Solver::new(s, ctx, &nets, cfg, bel.clone());
+            sv.solve(&mut rng);
+            if sv.capped() {
+                continue;
+            }
+            let solved = sv.harvest(&mut rng, 0);
+            let mut d = Data::default();
+            d.begin_solve();
+            d.push_value(
+                s,
+                &ctx,
+                bel,
+                [&solved.value[0], &solved.value[1]],
+                &solved.policy,
+            );
+
+            let actor = s.to_act() as usize;
+            let span = d.row_span(0, actor);
+            assert_eq!(span.len(), bel[actor].len(), "acting config count");
+            let na = (d.paoff[1] - d.paoff[0]) as usize;
+            assert!(na > 0, "a solved root must offer actions");
+            assert_eq!(na, sv.nodes[0].na(), "action count");
+
+            for (k, ci) in span.enumerate() {
+                let row = d.pcoff[ci] as usize..d.pcoff[ci + 1] as usize;
+                let want = sv.average_strategy(0, k);
+                assert_eq!(row.len(), want.len(), "config {k}: cell count");
+                let total: f32 = d.pprob[row.clone()].iter().sum();
+                assert!(
+                    (total - 1.0).abs() < 1e-4,
+                    "config {k}: policy sums to {total}"
+                );
+                for (j, cell) in row.enumerate() {
+                    assert_eq!(
+                        d.pprob[cell], want[j],
+                        "config {k} cell {j}: stored policy differs"
+                    );
+                    assert!((d.pcell[cell] as usize) < na, "action index out of range");
+                }
+            }
+            // The idle player's configs carry no policy.
+            for ci in d.row_span(0, 1 - actor) {
+                assert_eq!(
+                    d.pcoff[ci], d.pcoff[ci + 1],
+                    "the idle player must carry no policy row"
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no uncapped solve to check");
+    }
 }
