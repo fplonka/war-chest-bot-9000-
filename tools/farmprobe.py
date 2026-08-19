@@ -1,20 +1,29 @@
-"""What the farm gets through, per device set.
+"""What the farm gets through, and where the time goes.
 
-Reports solves/s and the batching shape — calls per round is how many solves
-shared a forward pass, and it should sit at the thread count.
+Solves per second is the headline. The rest says why it is what it is:
 
-    python tools/farmprobe.py [--threads 36] [--seconds 20]
+* `calls/round` is how many solves shared a forward pass. It cannot exceed the
+  thread count, and well below it means rounds are firing on patience with
+  most threads still in CFR.
+* `device` is the share of wall clock spent inside the backend — the batch
+  itself, plus the concatenation and the split around it. The remainder is CFR
+  on the cores.
+
+    python tools/farmprobe.py --threads 36,54,72 --devices 0,1
+
+Each thread count is timed in its own process-lifetime farm, so the pools and
+the kernel compile are warm before anything is measured.
 """
+
 import argparse
 import sys
 import time
 
-
-
-
 sys.path.insert(0, "train")
 import warchest  # noqa: E402
 from value_net import Net  # noqa: E402
+
+KEYS = ("rounds", "round_calls", "round_rows", "round_nanos")
 
 
 def probe(devices, threads, seconds, args):
@@ -32,44 +41,49 @@ def probe(devices, threads, seconds, args):
         recursive_rate=0.1,
         devices=devices,
     )
-    # One collect to warm the pools and the kernel compile before timing.
     warm = farm.collect(solves=threads)
-    keys = ("rounds", "round_calls", "round_rows")
-    base = [int(warm[k]) for k in keys]
+    base = [int(warm[k]) for k in KEYS]
 
-    solves, start = 0, time.time()
+    # Windows, because the rate is not constant: a farm can start fast and
+    # decay, and an average over the whole probe hides that entirely.
+    start = time.time()
+    mark, solves = start, 0
     while time.time() - start < seconds:
         d = farm.collect(solves=4 * threads)
         solves += int(d["solves"])
-    dt = time.time() - start
-    rounds, calls, rows = (int(d[k]) - b for k, b in zip(keys, base))
-    print(
-        f"devices={devices} threads={threads}: "
-        f"{solves / dt:7.1f} solves/s  "
-        f"{rounds / dt:6.1f} rounds/s  "
-        f"{calls / max(rounds, 1):5.2f} calls/round  "
-        f"{rows / max(rounds, 1):7.0f} rows/round",
-        flush=True,
-    )
-    return solves / dt
+        now = time.time()
+        if now - mark < args.window:
+            continue
+        dt = now - mark
+        rounds, calls, rows, nanos = (int(d[k]) - b for k, b in zip(KEYS, base))
+        base = [int(d[k]) for k in KEYS]
+        print(
+            f"devices={devices} threads={threads:3d} t={now - start:5.0f}s: "
+            f"{solves / dt:7.1f} solves/s  "
+            f"{rounds / dt:6.1f} rounds/s  "
+            f"{calls / max(rounds, 1):5.2f} calls/round  "
+            f"{rows / max(rounds, 1):7.0f} rows/round  "
+            f"device {1e-9 * nanos / dt:4.0%}",
+            flush=True,
+        )
+        mark, solves = now, 0
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--threads", type=int, default=36)
+    p.add_argument("--threads", default="36")
     p.add_argument("--devices", default="0")
-    p.add_argument("--seconds", type=float, default=20)
+    p.add_argument("--seconds", type=float, default=30)
+    p.add_argument("--window", type=float, default=30)
     p.add_argument("--nodes", type=int, default=256)
     p.add_argument("--expand", type=int, default=4)
     p.add_argument("--iters", type=int, default=16)
     args = p.parse_args()
 
-    net = Net()
-    net.push()
-    print(f"params {sum(p.numel() for p in net.parameters())}", flush=True)
-
-    probe([int(d) for d in args.devices.split(",")], args.threads, args.seconds, args)
-    print("probe done; anything below here is shutdown", flush=True)
+    Net().push()
+    devices = [int(d) for d in args.devices.split(",")]
+    for threads in (int(t) for t in args.threads.split(",")):
+        probe(devices, threads, args.seconds, args)
 
 
 if __name__ == "__main__":

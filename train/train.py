@@ -473,7 +473,8 @@ def main():
     import gpu_batch
     gpu_batch.warmup(dev)
     batcher = gpu_batch.make_batch
-    print("[train] search inference on CPU", flush=True)
+    print(f"[train] search inference on cuda:{args.gen_devices}, "
+          f"training on {dev}", flush=True)
 
     total = args.minutes * 60.0
     warm = args.warm_minutes * 60.0
@@ -707,6 +708,11 @@ def main():
                     int(data["round_calls"]) / max(int(data["rounds"]), 1), 2),
                 "rows_per_round": round(
                     int(data["round_rows"]) / max(int(data["rounds"]), 1), 1),
+                # Milliseconds a round spends inside the device backend — the
+                # batch plus the concatenation and split around it. The rest of
+                # a round is CFR on the cores.
+                "device_ms_per_round": round(
+                    1e-6 * int(data["round_nanos"]) / max(int(data["rounds"]), 1), 2),
                 # Rows the query solver produced, i.e. targets taken off
                 # the line of play. Zero means the coverage path is dead.
                 "query_rows": int(window["query_rows"]),
