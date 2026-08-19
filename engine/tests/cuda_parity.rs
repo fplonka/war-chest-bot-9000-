@@ -209,7 +209,7 @@ fn a_call_answers_the_same_whatever_it_is_batched_with() {
 fn the_device_matches_the_cpu_network_on_real_rounds() {
     let net = random_net(0x9E37_79B9);
     let rounds = capture(&net, 6, 12);
-    let reference = Backend::Reference(net.clone());
+    let reference = Backend::Reference(net.clone(), Default::default());
     let device = Device::new(&[0], net).expect("cuda device 0");
     let (seen, top) = compare(&device, &reference, &rounds);
     assert!(
@@ -231,7 +231,7 @@ fn two_cards_match_the_cpu_network_as_well() {
     }
     let net = random_net(0x1234_5677);
     let rounds = capture(&net, 6, 8);
-    let reference = Backend::Reference(net.clone());
+    let reference = Backend::Reference(net.clone(), Default::default());
     let device = Device::new(&[0, 1], net).expect("cuda devices 0 and 1");
     let (seen, top) = compare(&device, &reference, &rounds);
     assert!(

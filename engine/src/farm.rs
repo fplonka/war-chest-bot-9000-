@@ -35,13 +35,27 @@ use rayon::prelude::*;
 #[derive(Clone)]
 pub enum Call {
     /// New leaves: physical rows in, board vectors and the join cache out.
-    Trunk { xpub: Vec<f32>, cards: Vec<f32>, rows: usize },
+    ///
+    /// `solve` names the solve these rows belong to and `at` the row they
+    /// start at, so `at == 0` is a fresh solve and anything else extends one.
+    /// Both exist because the board vectors and the join cache are properties
+    /// of a leaf rather than of an iteration: the backend keeps them, and the
+    /// sixty-four join calls that follow do not carry them again.
+    Trunk {
+        solve: usize,
+        at: usize,
+        xpub: Vec<f32>,
+        cards: Vec<f32>,
+        rows: usize,
+    },
     /// New configs: `f(c)` for the readout and `g(c)` for the pooling.
     Configs { phi: Vec<f32>, owner: Vec<u32>, cards: Vec<f32>, n: usize },
     /// Every leaf, every iteration: the belief-conditioned head.
+    ///
+    /// The board vectors and the join cache are not here: the trunk left them
+    /// with the backend, which is the whole reason this call is small.
     Join {
-        p: Vec<f32>,
-        jp: Vec<f32>,
+        solve: usize,
         pooled: Vec<f32>,
         rows: usize,
         player: usize,
@@ -64,7 +78,7 @@ impl Call {
     pub fn run(&self, net: &Net) -> Reply {
         let mut r = Reply::default();
         match self {
-            Call::Trunk { xpub, cards, rows } => {
+            Call::Trunk { xpub, cards, rows, .. } => {
                 // Two seat views per leaf in `xpub`, and one card table per
                 // solve — `board` reads the physical view of each.
                 net.board(xpub, cards, *rows, CARD_ROWS, &mut r.a);
@@ -73,9 +87,7 @@ impl Call {
             Call::Configs { phi, owner, cards, n } => {
                 net.configs(phi, owner, *n, cards, &mut r.a, &mut r.b, &mut r.c);
             }
-            Call::Join { p, jp, pooled, rows, player } => {
-                net.join(p, jp, pooled, *rows, *player, &mut r.a);
-            }
+            Call::Join { .. } => unreachable!("a join needs the resident board vectors"),
         }
         r
     }
@@ -87,6 +99,16 @@ impl Call {
             Call::Trunk { .. } => 0,
             Call::Configs { .. } => 1,
             Call::Join { .. } => 2,
+        }
+    }
+
+    /// Which solve raised this call. A backend keeps a solve's board vectors
+    /// between its iterations, so every call of one solve must reach the same
+    /// backend — which is what a round shards on.
+    pub fn solve(&self) -> usize {
+        match self {
+            Call::Trunk { solve, .. } | Call::Join { solve, .. } => *solve,
+            Call::Configs { .. } => usize::MAX,
         }
     }
 
@@ -162,6 +184,12 @@ impl Gate {
         });
         SLOT.with(|s| s.set(slot));
         Member { gate: self, slot }
+    }
+
+    /// Which mailbox this thread holds, which is also the solve it is running
+    /// for as long as it is running one.
+    pub fn slot() -> usize {
+        SLOT.with(|s| s.get())
     }
 
     /// Submit one call and park until the driver has answered it.
@@ -317,7 +345,52 @@ pub const CARD_ROWS: usize = 2;
 pub enum Backend {
     #[cfg(feature = "gpu")]
     Cuda(crate::cuda::Device),
-    Reference(Net),
+    Reference(Net, Resident),
+}
+
+/// What a backend keeps for a solve between its iterations.
+///
+/// A leaf's board vector and its projection into the join are computed once by
+/// the trunk and read by every one of the sixty-four join calls that follow.
+/// Sending them each time was 87% of what crossed the bus, and on a device
+/// they were being sent back to the card that had just produced them.
+///
+/// Keyed by the gate slot, which is a solve while that solve is in flight. A
+/// trunk call at row zero starts a new one and drops whatever was there.
+#[derive(Default)]
+pub struct Resident {
+    slots: Mutex<Vec<Board>>,
+}
+
+#[derive(Default, Clone)]
+struct Board {
+    p: Vec<f32>,
+    jp: Vec<f32>,
+}
+
+impl Resident {
+    fn keep(&self, solve: usize, at: usize, p: &[f32], jp: &[f32]) {
+        let mut g = self.slots.lock();
+        if g.len() <= solve {
+            g.resize(solve + 1, Board::default());
+        }
+        let b = &mut g[solve];
+        // Written at the row it names rather than appended, so replaying a
+        // round -- which the parity test does, once alone and once batched --
+        // leaves the same state instead of stacking it up.
+        let (d, jw) = (crate::net::D, crate::net::JW);
+        let want = (at + p.len() / d) * d;
+        if b.p.len() < want {
+            b.p.resize(want, 0.0);
+            b.jp.resize(want / d * jw, 0.0);
+        }
+        b.p[at * d..want].copy_from_slice(p);
+        b.jp[at * jw..want / d * jw].copy_from_slice(jp);
+    }
+
+    fn board(&self, solve: usize) -> Board {
+        self.slots.lock()[solve].clone()
+    }
 }
 
 impl Backend {
@@ -325,7 +398,23 @@ impl Backend {
         match self {
             // Every call in a round is independent, and the solver threads
             // that raised them are all parked, so the cores are free.
-            Backend::Reference(net) => calls.par_iter().map(|c| c.run(net)).collect(),
+            Backend::Reference(net, res) => calls
+                .par_iter()
+                .map(|c| match c {
+                    Call::Trunk { solve, at, .. } => {
+                        let r = c.run(net);
+                        res.keep(*solve, *at, &r.a, &r.b);
+                        r
+                    }
+                    Call::Join { solve, pooled, rows, player } => {
+                        let b = res.board(*solve);
+                        let mut r = Reply::default();
+                        net.join(&b.p, &b.jp, pooled, *rows, *player, &mut r.a);
+                        r
+                    }
+                    _ => c.run(net),
+                })
+                .collect(),
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.run(calls),
         }
@@ -335,7 +424,7 @@ impl Backend {
     /// still does itself.
     pub fn net(&self) -> &Net {
         match self {
-            Backend::Reference(net) => net,
+            Backend::Reference(net, _) => net,
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.net(),
         }
@@ -346,7 +435,7 @@ impl Backend {
     /// for a change that touches three arrays.
     pub fn set_net(&mut self, net: Net) -> Result<(), String> {
         match self {
-            Backend::Reference(old) => {
+            Backend::Reference(old, _) => {
                 *old = net;
                 Ok(())
             }
@@ -555,9 +644,8 @@ mod tests {
     /// tell its own answer from anybody else's.
     fn tagged(tag: usize) -> Call {
         Call::Join {
-            p: vec![tag as f32],
-            jp: Vec::new(),
-            pooled: Vec::new(),
+            solve: 0,
+            pooled: vec![tag as f32],
             rows: tag,
             player: 0,
         }
@@ -565,7 +653,7 @@ mod tests {
 
     fn tag_of(c: &Call) -> f32 {
         match c {
-            Call::Join { p, .. } => p[0],
+            Call::Join { pooled, .. } => pooled[0],
             _ => unreachable!(),
         }
     }
@@ -699,7 +787,7 @@ mod tests {
             query_rate: 0.9,
             recursive_rate: 0.1,
         };
-        let mut farm = Farm::new(5, THREADS, gc, Backend::Reference(small_net(0x2E57)));
+        let mut farm = Farm::new(5, THREADS, gc, Backend::Reference(small_net(0x2E57), Default::default()));
         let data = farm.drive(48);
         assert!(data.soff.len() >= 48, "only {} solves", data.soff.len());
         assert_eq!(data.nv, data.soff.len(), "a solve must store one row");

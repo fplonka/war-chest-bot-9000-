@@ -269,4 +269,52 @@ __global__ void k_join_input(const float* pooled, const int* player, float* out,
     else out[i] = p == 0 ? -1.0f : 1.0f;
 }
 
+// The belief block the join reads: `sum_c beta(c) g(c)` over one query's
+// support. `coff` bounds a query's configs in `cidx`, which names each one's
+// row in the resident `g`, and `w` is the normalised reach.
+//
+// This ran on the host, which meant `g` had to come back off the card and the
+// block had to go up again every iteration. One query per thread block, one
+// output channel per thread.
+__global__ void k_belief_pool(const float* g, const unsigned int* cidx,
+                              const unsigned int* coff, const float* w,
+                              float* out, int queries, int pool) {
+    int q = blockIdx.x;
+    if (q >= queries) return;
+    unsigned int lo = coff[q], hi = coff[q + 1];
+    for (int j = threadIdx.x; j < pool; j += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned int k = lo; k < hi; ++k)
+            acc += w[k] * g[(size_t)cidx[k] * pool + j];
+        out[(size_t)q * pool + j] = acc;
+    }
+}
+
+// `v(c) = (<f(c), h_row> + bias) * opp_reach[row]`, for every config of the
+// queried player at every row of the batch.
+//
+// One config per thread block so the D-wide dot product is a block reduction;
+// `blockDim.x` must be a power of two.
+__global__ void k_readout(const float* f, const float* h, const float* cf_bias,
+                          const unsigned int* cidx, const unsigned int* coff,
+                          const unsigned int* row_of, const float* opp,
+                          float* out, int cells, int d) {
+    extern __shared__ float red[];
+    int cell = blockIdx.x;
+    if (cell >= cells) return;
+    int r = row_of[cell];
+    const float* fr = f + (size_t)cidx[cell] * d;
+    const float* hr = h + (size_t)r * d;
+    float acc = 0.0f;
+    for (int j = threadIdx.x; j < d; j += blockDim.x) acc += fr[j] * hr[j];
+    red[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[cell] = (red[0] + *cf_bias) * opp[r];
+    (void)coff;
+}
+
 }  // extern "C"

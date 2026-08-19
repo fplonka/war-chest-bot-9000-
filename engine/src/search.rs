@@ -262,7 +262,16 @@ impl Nets {
     }
 
     /// The trunk over fresh leaves: board vectors and the join cache.
-    fn trunk(&self, xpub: &[f32], cards: &[f32], rows: usize, pb: &mut Vec<f32>, jp: &mut Vec<f32>) {
+    #[allow(clippy::too_many_arguments)]
+    fn trunk(
+        &self,
+        at: usize,
+        xpub: &[f32],
+        cards: &[f32],
+        rows: usize,
+        pb: &mut Vec<f32>,
+        jp: &mut Vec<f32>,
+    ) {
         match &self.gate {
             None => {
                 self.value.board(xpub, cards, rows, farm::CARD_ROWS, pb);
@@ -272,6 +281,8 @@ impl Nets {
                 let r = self.submit(
                     g,
                     Call::Trunk {
+                        solve: Gate::slot(),
+                        at,
                         xpub: xpub.to_vec(),
                         cards: cards.to_vec(),
                         rows,
@@ -324,11 +335,11 @@ impl Nets {
         match &self.gate {
             None => self.value.join(p, jp, pooled, rows, player, h),
             Some(g) => {
+                // No `p` and no `jp`: the trunk left them with the backend.
                 let r = self.submit(
                     g,
                     Call::Join {
-                        p: p.to_vec(),
-                        jp: jp.to_vec(),
+                        solve: Gate::slot(),
                         pooled: pooled.to_vec(),
                         rows,
                         player,
@@ -1681,8 +1692,14 @@ impl<'a> Solver<'a> {
             // left behind — invisible to a solve evaluating alone, and wrong
             // the moment the farm concatenates this call with another.
             let end = at + 2 * fresh * PUBFEAT;
-            self.nets
-                .trunk(&xpub[at..end], &self.cards, fresh, &mut pb, &mut jp);
+            self.nets.trunk(
+                self.batch_rows,
+                &xpub[at..end],
+                &self.cards,
+                fresh,
+                &mut pb,
+                &mut jp,
+            );
             crate::prof::work(fresh, 0, 0, 0);
             self.pb.extend_from_slice(&pb);
             self.jp.extend_from_slice(&jp);

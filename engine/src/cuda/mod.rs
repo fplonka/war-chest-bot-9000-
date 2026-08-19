@@ -69,6 +69,8 @@ struct Kernels {
     sum_slots: CudaFunction,
     bag: CudaFunction,
     join_input: CudaFunction,
+    belief_pool: CudaFunction,
+    readout: CudaFunction,
 }
 
 impl Kernels {
@@ -95,6 +97,8 @@ impl Kernels {
             sum_slots: get("k_sum_slots")?,
             bag: get("k_bag")?,
             join_input: get("k_join_input")?,
+            belief_pool: get("k_belief_pool")?,
+            readout: get("k_readout")?,
         })
     }
 }
@@ -161,10 +165,30 @@ pub struct Device {
     net: Net,
 }
 
+/// A solve's board vectors, kept on the card that produced them.
+///
+/// The trunk runs once per leaf and the join runs once per leaf per iteration,
+/// so these are read sixty-four times for every time they are written. Sending
+/// them from the host each time was most of what crossed the bus, and it sent
+/// the card back the very numbers it had just computed.
+#[derive(Default)]
+struct Boards {
+    p: Option<CudaSlice<f32>>,
+    jp: Option<CudaSlice<f32>>,
+    /// Rows the buffers can hold, not rows written. It only ever grows, and it
+    /// is bounded by the solve's node budget, so a slot settles at about
+    /// twelve megabytes and stays there — which is the point. The architecture
+    /// this replaces let a lane grow to the largest tree it had ever served
+    /// and never give it back, and that filled a 24 GiB card.
+    cap: usize,
+}
+
 struct Card {
     stream: Arc<CudaStream>,
     blas: CudaBlas,
     k: Kernels,
+    /// Indexed by solve, which is the gate slot the call came from.
+    boards: parking_lot::Mutex<Vec<Boards>>,
     /// The weights exactly as `NetLayout` describes them.
     w: CudaSlice<f32>,
     b: CudaSlice<f32>,
@@ -231,18 +255,22 @@ impl Device {
     }
 
     fn try_run(&self, calls: &[Call]) -> Res<Vec<Reply>> {
-        // Deal each kind round-robin, so the cards get the same mix of work
-        // and not, say, every trunk on one of them.
+        // A solve's board vectors stay on the card that produced them, so a
+        // solve is pinned to a card and cannot be dealt round-robin. Solves
+        // are gate slots and there are many more of them than cards, so this
+        // still splits a round about evenly. Config calls belong to no solve
+        // and are dealt to keep both cards busy.
         let n = self.cards.len();
         let mut shards: Vec<Vec<usize>> = vec![Vec::new(); n];
-        for kind in 0..3 {
-            let mut at = 0;
-            for (i, c) in calls.iter().enumerate() {
-                if c.kind() == kind {
-                    shards[at % n].push(i);
-                    at += 1;
-                }
-            }
+        let mut spare = 0;
+        for (i, c) in calls.iter().enumerate() {
+            let card = if c.solve() == usize::MAX {
+                spare += 1;
+                (spare - 1) % n
+            } else {
+                c.solve() % n
+            };
+            shards[card].push(i);
         }
         let mut out: Vec<Reply> = (0..calls.len()).map(|_| Reply::default()).collect();
         let done = self
@@ -295,6 +323,7 @@ impl Card {
             stream,
             blas,
             k,
+            boards: parking_lot::Mutex::new(Vec::new()),
             layout: NetLayout::new(),
         })
     }
@@ -399,6 +428,61 @@ impl Card {
         launch!(self, add, n, x, y, &n_i)
     }
 
+    /// Keep `n` rows of a trunk batch as solve `solve`'s board vectors,
+    /// starting at row `row0` of that solve. Row zero starts a fresh solve.
+    ///
+    /// The buffer is grown to the solve's whole node budget on first use
+    /// rather than reallocated per growth step: a lane that grows its buffers
+    /// to the largest tree it has ever served and never gives them back is
+    /// what filled a 24 GiB card in the architecture this replaces, so the
+    /// size is bounded by the budget and reused rather than left to climb.
+    fn keep(
+        &self,
+        solve: usize,
+        row0: usize,
+        n: usize,
+        p: &CudaSlice<f32>,
+        jp: &CudaSlice<f32>,
+        from: usize,
+    ) -> Res<()> {
+        let mut g = self.boards.lock();
+        if g.len() <= solve {
+            g.resize_with(solve + 1, Boards::default);
+        }
+        let want = row0 + n;
+        let b = &mut g[solve];
+        if b.cap < want {
+            let cap = want.next_power_of_two();
+            let mut np = self.stream.alloc_zeros::<f32>(cap * D).map_err(err)?;
+            let mut nj = self.stream.alloc_zeros::<f32>(cap * JW).map_err(err)?;
+            if row0 > 0 {
+                if let (Some(op), Some(oj)) = (b.p.as_ref(), b.jp.as_ref()) {
+                    let mut dp = np.slice_mut(0..row0 * D);
+                    self.stream
+                        .memcpy_dtod(&op.slice(0..row0 * D), &mut dp)
+                        .map_err(err)?;
+                    let mut dj = nj.slice_mut(0..row0 * JW);
+                    self.stream
+                        .memcpy_dtod(&oj.slice(0..row0 * JW), &mut dj)
+                        .map_err(err)?;
+                }
+            }
+            b.p = Some(np);
+            b.jp = Some(nj);
+            b.cap = cap;
+        }
+        let (dst_p, dst_j) = (b.p.as_mut().unwrap(), b.jp.as_mut().unwrap());
+        let mut dp = dst_p.slice_mut(row0 * D..want * D);
+        self.stream
+            .memcpy_dtod(&p.slice(from * D..(from + n) * D), &mut dp)
+            .map_err(err)?;
+        let mut dj = dst_j.slice_mut(row0 * JW..want * JW);
+        self.stream
+            .memcpy_dtod(&jp.slice(from * JW..(from + n) * JW), &mut dj)
+            .map_err(err)?;
+        Ok(())
+    }
+
     fn alloc(&self, n: usize) -> Res<CudaSlice<f32>> {
         self.stream.alloc_zeros::<f32>(n.max(1)).map_err(err)
     }
@@ -423,7 +507,7 @@ impl Card {
         let (mut xpub, mut cards, mut card_of_row) = (Vec::new(), Vec::new(), Vec::new());
         let mut rows = 0usize;
         for &i in mine {
-            let Call::Trunk { xpub: xp, cards: cd, rows: n } = &calls[i] else {
+            let Call::Trunk { xpub: xp, cards: cd, rows: n, .. } = &calls[i] else {
                 unreachable!("trunk shard holds only trunk calls")
             };
             // Concatenation only works if a call carries exactly its own rows.
@@ -510,16 +594,22 @@ impl Card {
         let mut jp = self.alloc(rows * JW)?;
         self.run(l.join_p, &p, rows, &mut jp)?;
 
-        let (p, jp) = (self.down(&p, rows * D)?, self.down(&jp, rows * JW)?);
+        // Keep them, per solve, for the join calls that follow. The host still
+        // takes `p` back: the policy head builds its action embeddings against
+        // a node's own board vector, and that runs there.
+        let host_p = self.down(&p, rows * D)?;
         let mut at = 0;
         for &i in mine {
             let n = calls[i].rows();
+            let Call::Trunk { solve, at: row0, .. } = &calls[i] else {
+                unreachable!("trunk shard holds only trunk calls")
+            };
+            self.keep(*solve, *row0, n, &p, &jp, at)?;
             out.push((
                 i,
                 Reply {
-                    a: p[at * D..(at + n) * D].to_vec(),
-                    b: jp[at * JW..(at + n) * JW].to_vec(),
-                    c: Vec::new(),
+                    a: host_p[at * D..(at + n) * D].to_vec(),
+                    ..Default::default()
                 },
             ));
             at += n;
@@ -611,18 +701,13 @@ impl Card {
         if mine.is_empty() {
             return Ok(());
         }
-        let (mut p, mut jp, mut pooled, mut player) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut pooled, mut player) = (Vec::new(), Vec::new());
         let mut rows = 0usize;
         for &i in mine {
-            let Call::Join { p: pv, jp: jv, pooled: bv, rows: n, player: q } = &calls[i] else {
+            let Call::Join { pooled: bv, rows: n, player: q, .. } = &calls[i] else {
                 unreachable!("join shard holds only join calls")
             };
-            assert_eq!(pv.len(), n * D, "join board vectors");
-            assert_eq!(jv.len(), n * JW, "join cache");
             assert_eq!(bv.len(), 2 * n * POOL, "join pooled beliefs");
-            p.extend_from_slice(pv);
-            jp.extend_from_slice(jv);
             pooled.extend_from_slice(bv);
             player.extend(std::iter::repeat(*q as i32).take(*n));
             rows += n;
@@ -630,8 +715,36 @@ impl Card {
         let l = &self.layout;
         let (rows_i, pool_i) = (rows as i32, POOL as i32);
 
-        let p = self.up(&p)?;
-        let jp = self.up(&jp)?;
+        // The board vectors never left the card. Gather this round's join
+        // calls out of their solves' resident buffers.
+        let mut p = self.alloc(rows * D)?;
+        let mut jp = self.alloc(rows * JW)?;
+        {
+            let g = self.boards.lock();
+            let mut at = 0usize;
+            for &i in mine {
+                let n = calls[i].rows();
+                // A solve's trunk always runs before its joins -- the first
+                // iteration of a solve has new leaves by construction -- so a
+                // missing board is a routing fault, not a race.
+                let b = g
+                    .get(calls[i].solve())
+                    .filter(|b| b.cap >= n && b.p.is_some())
+                    .ok_or_else(|| {
+                        format!("solve {} has no resident board", calls[i].solve())
+                    })?;
+                let (src_p, src_j) = (b.p.as_ref().unwrap(), b.jp.as_ref().unwrap());
+                let mut dp = p.slice_mut(at * D..(at + n) * D);
+                self.stream
+                    .memcpy_dtod(&src_p.slice(0..n * D), &mut dp)
+                    .map_err(err)?;
+                let mut dj = jp.slice_mut(at * JW..(at + n) * JW);
+                self.stream
+                    .memcpy_dtod(&src_j.slice(0..n * JW), &mut dj)
+                    .map_err(err)?;
+                at += n;
+            }
+        }
         let pooled = self.up(&pooled)?;
         let player = self.up(&player)?;
 
