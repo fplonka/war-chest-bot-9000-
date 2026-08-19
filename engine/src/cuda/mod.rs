@@ -175,12 +175,15 @@ pub struct Device {
 struct Boards {
     p: Option<CudaSlice<f32>>,
     jp: Option<CudaSlice<f32>>,
-    /// Rows the buffers can hold, not rows written. It only ever grows, and it
-    /// is bounded by the solve's node budget, so a slot settles at about
-    /// twelve megabytes and stays there — which is the point. The architecture
-    /// this replaces let a lane grow to the largest tree it had ever served
-    /// and never give it back, and that filled a 24 GiB card.
-    cap: usize,
+    /// `f(c)` and `g(c)`, and the belief index that names them. All of it is
+    /// read every iteration and written once.
+    f: Option<CudaSlice<f32>>,
+    g: Option<CudaSlice<f32>>,
+    cidx: Option<CudaSlice<u32>>,
+    coff: Option<CudaSlice<u32>>,
+    /// Elements each buffer can hold, one per buffer. They only grow, and each
+    /// is bounded by the solve's budget, so a slot settles and stays there.
+    caps: [usize; 6],
 }
 
 struct Card {
@@ -339,7 +342,7 @@ impl Card {
         let mut out = Vec::with_capacity(mine.len());
         self.trunk(calls, &pick(0), &mut out)?;
         self.configs(calls, &pick(1), &mut out)?;
-        self.join(calls, &pick(2), &mut out)?;
+        self.leaf(calls, &pick(2), &mut out)?;
         Ok(out)
     }
 
@@ -449,37 +452,81 @@ impl Card {
         if g.len() <= solve {
             g.resize_with(solve + 1, Boards::default);
         }
-        let want = row0 + n;
         let b = &mut g[solve];
-        if b.cap < want {
+        let (mut pc, mut jc) = (b.caps[0], b.caps[1]);
+        self.stash(&mut b.p, &mut pc, row0, p, from, n, D)?;
+        self.stash(&mut b.jp, &mut jc, row0, jp, from, n, JW)?;
+        b.caps[0] = pc;
+        b.caps[1] = jc;
+        Ok(())
+    }
+
+    /// Grow `slot` to hold `want` elements and write `src[from..from+n]` at
+    /// `at`. One helper for every resident array, since they differ only in
+    /// width.
+    fn stash<T: cudarc::driver::DeviceRepr + Default>(
+        &self,
+        slot: &mut Option<CudaSlice<T>>,
+        have: &mut usize,
+        at: usize,
+        src: &CudaSlice<T>,
+        from: usize,
+        n: usize,
+        width: usize,
+    ) -> Res<()> {
+        let want = (at + n) * width;
+        if *have < want {
             let cap = want.next_power_of_two();
-            let mut np = self.stream.alloc_zeros::<f32>(cap * D).map_err(err)?;
-            let mut nj = self.stream.alloc_zeros::<f32>(cap * JW).map_err(err)?;
-            if row0 > 0 {
-                if let (Some(op), Some(oj)) = (b.p.as_ref(), b.jp.as_ref()) {
-                    let mut dp = np.slice_mut(0..row0 * D);
-                    self.stream
-                        .memcpy_dtod(&op.slice(0..row0 * D), &mut dp)
-                        .map_err(err)?;
-                    let mut dj = nj.slice_mut(0..row0 * JW);
-                    self.stream
-                        .memcpy_dtod(&oj.slice(0..row0 * JW), &mut dj)
-                        .map_err(err)?;
+            let mut fresh = self.stream.alloc_zeros::<T>(cap).map_err(err)?;
+            if let Some(old) = slot.as_ref() {
+                if *have > 0 {
+                    let keep = (*have).min(at * width);
+                    if keep > 0 {
+                        let mut d = fresh.slice_mut(0..keep);
+                        self.stream
+                            .memcpy_dtod(&old.slice(0..keep), &mut d)
+                            .map_err(err)?;
+                    }
                 }
             }
-            b.p = Some(np);
-            b.jp = Some(nj);
-            b.cap = cap;
+            *slot = Some(fresh);
+            *have = cap;
         }
-        let (dst_p, dst_j) = (b.p.as_mut().unwrap(), b.jp.as_mut().unwrap());
-        let mut dp = dst_p.slice_mut(row0 * D..want * D);
+        let dst = slot.as_mut().expect("just allocated");
+        let mut d = dst.slice_mut(at * width..want);
         self.stream
-            .memcpy_dtod(&p.slice(from * D..(from + n) * D), &mut dp)
+            .memcpy_dtod(&src.slice(from * width..(from + n) * width), &mut d)
             .map_err(err)?;
-        let mut dj = dst_j.slice_mut(row0 * JW..want * JW);
-        self.stream
-            .memcpy_dtod(&jp.slice(from * JW..(from + n) * JW), &mut dj)
-            .map_err(err)?;
+        Ok(())
+    }
+
+    /// The belief index of the queries the trunk just made, appended to the
+    /// solve's. `coff` arrives relative to this call's own `cidx`, so it is
+    /// shifted onto the resident one before it is stored.
+    fn keep_index(&self, solve: usize, row0: usize, cidx: &[u32], coff: &[u32]) -> Res<()> {
+        let mut g = self.boards.lock();
+        if g.len() <= solve {
+            g.resize_with(solve + 1, Boards::default);
+        }
+        let b = &mut g[solve];
+        let base = if row0 == 0 { 0 } else { b.cells as u32 };
+        if row0 == 0 {
+            b.cells = 0;
+            b.queries = 0;
+        }
+        let shifted: Vec<u32> = coff.iter().map(|x| x + base).collect();
+        let up_i = self.up(cidx)?;
+        let up_o = self.up(&shifted)?;
+        let (mut ic, mut oc) = (b.caps[4], b.caps[5]);
+        self.stash(&mut b.cidx, &mut ic, b.cells, &up_i, 0, cidx.len(), 1)?;
+        // `coff` has one more entry than it has queries; row zero writes the
+        // leading zero and every later call overwrites it with its own first
+        // offset, which is the same number.
+        self.stash(&mut b.coff, &mut oc, b.queries, &up_o, 0, shifted.len(), 1)?;
+        b.caps[4] = ic;
+        b.caps[5] = oc;
+        b.cells += cidx.len();
+        b.queries += shifted.len() - 1;
         Ok(())
     }
 
@@ -601,10 +648,11 @@ impl Card {
         let mut at = 0;
         for &i in mine {
             let n = calls[i].rows();
-            let Call::Trunk { solve, at: row0, .. } = &calls[i] else {
+            let Call::Trunk { solve, at: row0, cidx, coff, .. } = &calls[i] else {
                 unreachable!("trunk shard holds only trunk calls")
             };
             self.keep(*solve, *row0, n, &p, &jp, at)?;
+            self.keep_index(*solve, *row0, cidx, coff)?;
             out.push((
                 i,
                 Reply {
@@ -672,20 +720,38 @@ impl Card {
         self.run(l.cfg_m, &cards, views * NTYPE, &mut bag)?;
         launch!(self, bag, n * POOL, &bag, &phi, &owner, &mut g, &n_i, &nslot, &ntype, &cfeat, &pool_i)?;
 
-        let (f, g, fp) = (
-            self.down(&f, n * D)?,
-            self.down(&g, n * POOL)?,
-            self.down(&fp, n * D)?,
-        );
+        // `f` and `g` stay: the readout and the belief pooling both run here
+        // now, so neither has a reader on the host. `f_p` goes back, because
+        // the policy prior is built there.
+        let host_fp = self.down(&fp, n * D)?;
+        let mut at = 0;
+        {
+            let mut boards = self.boards.lock();
+            for &i in mine {
+                let k = calls[i].rows();
+                let Call::Configs { solve, at: base, .. } = &calls[i] else {
+                    unreachable!("config shard holds only config calls")
+                };
+                if boards.len() <= *solve {
+                    boards.resize_with(solve + 1, Boards::default);
+                }
+                let b = &mut boards[*solve];
+                let (mut fc, mut gc) = (b.caps[2], b.caps[3]);
+                self.stash(&mut b.f, &mut fc, *base, &f, at, k, D)?;
+                self.stash(&mut b.g, &mut gc, *base, &g, at, k, POOL)?;
+                b.caps[2] = fc;
+                b.caps[3] = gc;
+                at += k;
+            }
+        }
         let mut at = 0;
         for &i in mine {
             let k = calls[i].rows();
             out.push((
                 i,
                 Reply {
-                    a: f[at * D..(at + k) * D].to_vec(),
-                    b: g[at * POOL..(at + k) * POOL].to_vec(),
-                    c: fp[at * D..(at + k) * D].to_vec(),
+                    c: host_fp[at * D..(at + k) * D].to_vec(),
+                    ..Default::default()
                 },
             ));
             at += k;
@@ -693,30 +759,108 @@ impl Card {
         Ok(())
     }
 
-    // ------------------------------------------------------------------ join
+    // ------------------------------------------------------------------ leaf
 
-    /// The per-iteration head. Every leaf of every solve in the round shares
-    /// one pass; the queried seat varies by row because the solves do.
-    fn join(&self, calls: &[Call], mine: &[usize], out: &mut Vec<(usize, Reply)>) -> Res<()> {
+    /// One CFR iteration for every solve in the round.
+    ///
+    /// Pooling the beliefs, the join and the readout are one pass. The two
+    /// intermediates -- the pooled block and the head -- are produced and
+    /// consumed on the card, which is what makes the round's traffic the
+    /// beliefs in and the values out and nothing else.
+    fn leaf(&self, calls: &[Call], mine: &[usize], out: &mut Vec<(usize, Reply)>) -> Res<()> {
         if mine.is_empty() {
             return Ok(());
         }
-        let (mut pooled, mut player) = (Vec::new(), Vec::new());
+        let (mut w, mut opp, mut player) = (Vec::new(), Vec::new(), Vec::new());
         let mut rows = 0usize;
         for &i in mine {
-            let Call::Join { pooled: bv, rows: n, player: q, .. } = &calls[i] else {
-                unreachable!("join shard holds only join calls")
+            let Call::Leaf { w: wv, opp: ov, rows: n, player: q, .. } = &calls[i] else {
+                unreachable!("leaf shard holds only leaf calls")
             };
-            assert_eq!(bv.len(), 2 * n * POOL, "join pooled beliefs");
-            pooled.extend_from_slice(bv);
+            assert_eq!(ov.len(), *n, "one opponent reach mass a leaf");
+            w.extend_from_slice(wv);
+            opp.extend_from_slice(ov);
             player.extend(std::iter::repeat(*q as i32).take(*n));
             rows += n;
         }
         let l = &self.layout;
         let (rows_i, pool_i) = (rows as i32, POOL as i32);
+        let queries = 2 * rows;
 
-        // The board vectors never left the card. Gather this round's join
-        // calls out of their solves' resident buffers.
+        // Concatenate the round's beliefs, and with them the index arrays each
+        // solve keeps, shifted onto the batch.
+        let w_d = self.up(&w)?;
+        let opp_d = self.up(&opp)?;
+        let player_d = self.up(&player)?;
+        let mut cidx = self.stream.alloc_zeros::<u32>(w.len().max(1)).map_err(err)?;
+        let mut coff: Vec<u32> = Vec::with_capacity(queries + 1);
+        coff.push(0);
+        let mut rowbase: Vec<u32> = Vec::with_capacity(rows);
+        {
+            let g = self.boards.lock();
+            let (mut cell, mut row) = (0usize, 0usize);
+            for &i in mine {
+                let n = calls[i].rows();
+                let b = g
+                    .get(calls[i].solve())
+                    .filter(|b| b.cidx.is_some() && b.queries >= 2 * n)
+                    .ok_or_else(|| format!("solve {} has no resident belief index", calls[i].solve()))?;
+                let host = self.stream.memcpy_dtov(&b.coff.as_ref().unwrap().slice(0..2 * n + 1)).map_err(err)?;
+                let take = host[2 * n] as usize;
+                let mut d = cidx.slice_mut(cell..cell + take);
+                self.stream
+                    .memcpy_dtod(&b.cidx.as_ref().unwrap().slice(0..take), &mut d)
+                    .map_err(err)?;
+                for q in 1..=2 * n {
+                    coff.push(host[q] + cell as u32);
+                }
+                for _ in 0..n {
+                    rowbase.push(row as u32);
+                    row += 1;
+                }
+                cell += take;
+            }
+        }
+        let coff_d = self.up(&coff)?;
+
+        // The belief block, from the resident `g`.
+        let mut pooled = self.alloc(queries * POOL)?;
+        {
+            let mut fs = Vec::new();
+            let g = self.boards.lock();
+            let mut base = 0usize;
+            for &i in mine {
+                let n = calls[i].rows();
+                let b = &g[calls[i].solve()];
+                fs.push((base, 2 * n, b.g.as_ref().unwrap().clone(), b.f.as_ref().unwrap().clone()));
+                base += 2 * n;
+            }
+            drop(g);
+            for (q0, nq, gbuf, _) in &fs {
+                let off = self.up(&coff[*q0..*q0 + *nq + 1].to_vec())?;
+                let mut slice = pooled.slice_mut(*q0 * POOL..(*q0 + *nq) * POOL);
+                let nq_i = *nq as i32;
+                unsafe {
+                    self.stream
+                        .launch_builder(&self.k.belief_pool)
+                        .arg(gbuf)
+                        .arg(&cidx)
+                        .arg(&off)
+                        .arg(&w_d)
+                        .arg(&mut slice)
+                        .arg(&nq_i)
+                        .arg(&pool_i)
+                        .launch_unit(LaunchConfig {
+                            grid_dim: ((*nq).max(1) as u32, 1, 1),
+                            block_dim: (64, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                }
+                .map_err(err)?;
+            }
+        }
+
+        // The join, exactly as before, over the resident board vectors.
         let mut p = self.alloc(rows * D)?;
         let mut jp = self.alloc(rows * JW)?;
         {
@@ -724,72 +868,107 @@ impl Card {
             let mut at = 0usize;
             for &i in mine {
                 let n = calls[i].rows();
-                // A solve's trunk always runs before its joins -- the first
-                // iteration of a solve has new leaves by construction -- so a
-                // missing board is a routing fault, not a race.
-                let b = g
-                    .get(calls[i].solve())
-                    .filter(|b| b.cap >= n && b.p.is_some())
-                    .ok_or_else(|| {
-                        format!("solve {} has no resident board", calls[i].solve())
-                    })?;
-                let (src_p, src_j) = (b.p.as_ref().unwrap(), b.jp.as_ref().unwrap());
+                let b = &g[calls[i].solve()];
                 let mut dp = p.slice_mut(at * D..(at + n) * D);
                 self.stream
-                    .memcpy_dtod(&src_p.slice(0..n * D), &mut dp)
+                    .memcpy_dtod(&b.p.as_ref().unwrap().slice(0..n * D), &mut dp)
                     .map_err(err)?;
                 let mut dj = jp.slice_mut(at * JW..(at + n) * JW);
                 self.stream
-                    .memcpy_dtod(&src_j.slice(0..n * JW), &mut dj)
+                    .memcpy_dtod(&b.jp.as_ref().unwrap().slice(0..n * JW), &mut dj)
                     .map_err(err)?;
                 at += n;
             }
         }
-        let pooled = self.up(&pooled)?;
-        let player = self.up(&player)?;
 
         let mut input = self.alloc(rows * JOIN_IN)?;
-        launch!(self, join_input, rows * JOIN_IN, &pooled, &player, &mut input, &rows_i, &pool_i)?;
-
+        launch!(self, join_input, rows * JOIN_IN, &pooled, &player_d, &mut input, &rows_i, &pool_i)?;
         let mut z = self.alloc(rows * JW)?;
-        self.stream
-            .memcpy_dtod(&jp.slice(0..rows * JW), &mut z)
-            .map_err(err)?;
+        self.stream.memcpy_dtod(&jp.slice(0..rows * JW), &mut z).map_err(err)?;
         self.lin(l.join_b, &input, rows, 1.0, &mut z)?;
         self.bias(l.join_b, rows, &mut z)?;
-
         let mut t = self.alloc(rows * JW)?;
         let mut d = self.alloc(rows * JW)?;
         for i in 0..JBLOCKS {
-            self.stream
-                .memcpy_dtod(&z.slice(0..rows * JW), &mut t)
-                .map_err(err)?;
+            self.stream.memcpy_dtod(&z.slice(0..rows * JW), &mut t).map_err(err)?;
             self.norm(l.norms[LN_JOIN + i], rows, true, &mut t)?;
             self.run(l.join_w[i], &t, rows, &mut d)?;
             self.add(&mut z, &d, rows * JW)?;
         }
         self.norm(l.norms[LN_JOUT], rows, true, &mut z)?;
-
         let mut h = self.alloc(rows * D)?;
-        self.stream
-            .memcpy_dtod(&p.slice(0..rows * D), &mut h)
-            .map_err(err)?;
+        self.stream.memcpy_dtod(&p.slice(0..rows * D), &mut h).map_err(err)?;
         self.lin(l.join_out, &z, rows, 1.0, &mut h)?;
         self.bias(l.join_out, rows, &mut h)?;
         self.norm(l.norms[LN_H], rows, false, &mut h)?;
 
-        let h = self.down(&h, rows * D)?;
-        let mut at = 0;
-        for &i in mine {
-            let n = calls[i].rows();
-            out.push((
-                i,
-                Reply {
-                    a: h[at * D..(at + n) * D].to_vec(),
-                    ..Default::default()
-                },
-            ));
-            at += n;
+        // The readout, per config of the queried player. `cell_row` says which
+        // leaf each cell belongs to and `cell_cfg` which config vector it
+        // reads, both built against the batch rather than a solve.
+        let (mut cell_row, mut cell_cfg, mut spans) = (Vec::new(), Vec::new(), Vec::new());
+        {
+            let g = self.boards.lock();
+            let mut fbuf: Vec<CudaSlice<f32>> = Vec::new();
+            let mut at = 0usize;
+            for &i in mine {
+                let n = calls[i].rows();
+                let Call::Leaf { player: q, .. } = &calls[i] else { unreachable!() };
+                let b = &g[calls[i].solve()];
+                fbuf.push(b.f.as_ref().unwrap().clone());
+                let start = cell_row.len();
+                for r in 0..n {
+                    let query = 2 * (at + r) + q;
+                    let (lo, hi) = (coff[query] as usize, coff[query + 1] as usize);
+                    for k in lo..hi {
+                        cell_row.push((at + r) as u32);
+                        cell_cfg.push(k as u32);
+                    }
+                }
+                spans.push((start, cell_row.len(), fbuf.len() - 1));
+                at += n;
+            }
+            drop(g);
+            let cells = cell_row.len();
+            let mut vals = self.alloc(cells.max(1))?;
+            let row_d = self.up(&cell_row)?;
+            let sel_d = self.up(&cell_cfg)?;
+            let d_i = D as i32;
+            let bias = self.b.slice(l.value_bias..l.value_bias + 1);
+            for (lo, hi, fi) in &spans {
+                if hi == lo {
+                    continue;
+                }
+                let n = hi - lo;
+                let mut slice = vals.slice_mut(*lo..*hi);
+                let sub_row = row_d.slice(*lo..*hi);
+                let sub_sel = sel_d.slice(*lo..*hi);
+                let n_i = n as i32;
+                unsafe {
+                    self.stream
+                        .launch_builder(&self.k.readout)
+                        .arg(&fbuf[*fi])
+                        .arg(&h)
+                        .arg(&bias)
+                        .arg(&cidx)
+                        .arg(&sub_sel)
+                        .arg(&sub_row)
+                        .arg(&opp_d)
+                        .arg(&mut slice)
+                        .arg(&n_i)
+                        .arg(&d_i)
+                        .launch_unit(LaunchConfig {
+                            grid_dim: (n as u32, 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 4 * 128,
+                        })
+                }
+                .map_err(err)?;
+            }
+            let host = self.down(&vals, cells.max(1))?;
+            for (k, &i) in mine.iter().enumerate() {
+                let (lo, hi, _) = spans[k];
+                out.push((i, Reply { a: host[lo..hi].to_vec(), ..Default::default() }));
+            }
         }
         Ok(())
     }

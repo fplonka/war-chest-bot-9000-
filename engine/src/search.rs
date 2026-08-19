@@ -268,6 +268,8 @@ impl Nets {
         at: usize,
         xpub: &[f32],
         cards: &[f32],
+        cidx: &[u32],
+        coff: &[u32],
         rows: usize,
         pb: &mut Vec<f32>,
         jp: &mut Vec<f32>,
@@ -285,6 +287,8 @@ impl Nets {
                         at,
                         xpub: xpub.to_vec(),
                         cards: cards.to_vec(),
+                        cidx: cidx.to_vec(),
+                        coff: coff.to_vec(),
                         rows,
                     },
                 );
@@ -297,6 +301,7 @@ impl Nets {
     #[allow(clippy::too_many_arguments)]
     fn encode(
         &self,
+        at: usize,
         phi: &[f32],
         owner: &[u32],
         n: usize,
@@ -311,6 +316,8 @@ impl Nets {
                 let r = self.submit(
                     g,
                     Call::Configs {
+                        solve: Gate::slot(),
+                        at,
                         phi: phi.to_vec(),
                         owner: owner.to_vec(),
                         cards: cards.to_vec(),
@@ -332,22 +339,31 @@ impl Nets {
         player: usize,
         h: &mut Vec<f32>,
     ) {
-        match &self.gate {
-            None => self.value.join(p, jp, pooled, rows, player, h),
-            Some(g) => {
-                // No `p` and no `jp`: the trunk left them with the backend.
-                let r = self.submit(
-                    g,
-                    Call::Join {
-                        solve: Gate::slot(),
-                        pooled: pooled.to_vec(),
-                        rows,
-                        player,
-                    },
-                );
-                *h = r.a;
-            }
-        }
+        self.value.join(p, jp, pooled, rows, player, h);
+    }
+
+    /// Whether network calls are gathered with every other solver thread's.
+    /// A batched backend keeps a solve's state, so it answers a whole leaf
+    /// query rather than the join alone.
+    fn batched(&self) -> bool {
+        self.gate.is_some()
+    }
+
+    /// One CFR iteration's whole question: the beliefs in, the counterfactual
+    /// values out.
+    fn leaf(&self, w: &[f32], opp: &[f32], rows: usize, player: usize) -> Vec<f32> {
+        let g = self.gate.as_ref().expect("a leaf query needs the gate");
+        self.submit(
+            g,
+            Call::Leaf {
+                solve: Gate::slot(),
+                w: w.to_vec(),
+                opp: opp.to_vec(),
+                rows,
+                player,
+            },
+        )
+        .a
     }
 
     /// A closed gate means the farm is shutting down under a running solve.
@@ -875,6 +891,10 @@ pub struct Solver<'a> {
     pub h: Vec<f32>,
     /// Normalised belief weights for one leaf's support.
     wbuf: Vec<f32>,
+    /// The batched query's two arguments: every query's normalised belief, in
+    /// `leaf_coff` order, and the opponent's reach mass at each leaf.
+    wbelief: Vec<f32>,
+    wopp: Vec<f32>,
     /// Traverser of the previous leaf query, i.e. whose beliefs have moved
     /// since. `None` before the first query of a solve.
     last_traverser: Option<usize>,
@@ -966,6 +986,8 @@ impl<'a> Solver<'a> {
             xb: take_buf(R_XB),
             h: take_buf(R_H),
             wbuf: Vec::new(),
+            wbelief: Vec::new(),
+            wopp: Vec::new(),
             last_traverser: None,
             capped: false,
             draw_scratch: DrawScratch::default(),
@@ -1692,10 +1714,25 @@ impl<'a> Solver<'a> {
             // left behind — invisible to a solve evaluating alone, and wrong
             // the moment the farm concatenates this call with another.
             let end = at + 2 * fresh * PUBFEAT;
+            // The belief index of exactly the rows this call makes. A leaf's
+            // support is fixed when the leaf is, so it travels with the trunk
+            // and never again.
+            // `leaf_coff` holds a query's *start* and nothing else — a
+            // length comes from `nc` — so the terminator a CSR range needs is
+            // appended here rather than assumed.
+            let q0 = 2 * self.batch_rows;
+            let cs = self.leaf_coff[q0] as usize;
+            let mut coff: Vec<u32> = self.leaf_coff[q0..]
+                .iter()
+                .map(|x| x - cs as u32)
+                .collect();
+            coff.push((self.leaf_cidx.len() - cs) as u32);
             self.nets.trunk(
                 self.batch_rows,
                 &xpub[at..end],
                 &self.cards,
+                &self.leaf_cidx[cs..],
+                &coff,
                 fresh,
                 &mut pb,
                 &mut jp,
@@ -1715,6 +1752,7 @@ impl<'a> Solver<'a> {
                 .collect();
             let (mut cf, mut cg, mut cp) = (Vec::new(), Vec::new(), Vec::new());
             self.nets.encode(
+                self.batch_cfgs,
                 &cphi[self.batch_cfgs * CFEAT..self.ncfg * CFEAT],
                 &owner,
                 fresh,
@@ -1783,6 +1821,14 @@ impl<'a> Solver<'a> {
     /// Fill `vals` at every leaf with the traverser's counterfactual values.
     pub fn leaf_values(&mut self, traverser: usize) {
         self.extend_leaf_batch();
+        if !self.nets.value.is_empty() && self.nets.batched() {
+            // The backend holds this solve's board vectors and config
+            // vectors, so pooling, the join and the readout happen there and
+            // only the beliefs and the values cross.
+            self.last_traverser = None;
+            self.fused_leaf(traverser);
+            return;
+        }
         let redo = self.last_traverser;
         self.last_traverser = Some(traverser);
         if !self.nets.value.is_empty() {
@@ -1790,6 +1836,55 @@ impl<'a> Solver<'a> {
         }
         self.pbs_head(traverser);
         self.readout(traverser);
+    }
+
+    /// The batched leaf query: normalise every belief, take the opponent's
+    /// reach mass at each leaf, and scatter what comes back into `vals`.
+    fn fused_leaf(&mut self, traverser: usize) {
+        let _t = timed!(NET);
+        let rows = self.leaf_rows.len();
+        let opp = 1 - traverser;
+        let total = self.leaf_cidx.len();
+        crate::net::fit(&mut self.wbelief, total);
+        self.wopp.clear();
+        for (r, &i) in self.leaf_rows.iter().enumerate() {
+            for p in 0..2 {
+                let n = self.nc[i][p] as usize;
+                let ra = self.roff[i] as usize + if p == 1 { self.nc[i][0] as usize } else { 0 };
+                let cs = self.leaf_coff[2 * r + p] as usize;
+                normalize_weights(&self.reach[ra..ra + n], &mut self.wbelief[cs..cs + n]);
+                if p == opp {
+                    self.wopp.push(self.reach[ra..ra + n].iter().sum());
+                }
+            }
+        }
+        crate::prof::work(0, 0, rows, total / 2);
+        let got = self
+            .nets
+            .leaf(&self.wbelief[..total], &self.wopp, rows, traverser);
+
+        // Terminals are scored from the game, not the network, and the backend
+        // never saw them.
+        for k in 0..self.term_leaves.len() {
+            let i = self.term_leaves[k];
+            let mass: f32 = self.reach_of(i, opp).iter().sum();
+            let u = if traverser == self.nodes[i].player as usize {
+                self.nodes[i].util
+            } else {
+                -self.nodes[i].util
+            };
+            let n = self.nc[i][traverser] as usize;
+            let vo = self.voff[i] as usize;
+            self.vals[vo..vo + n].fill(u * mass);
+        }
+        let mut at = 0;
+        for &i in self.leaf_rows.iter() {
+            let n = self.nc[i][traverser] as usize;
+            let vo = self.voff[i] as usize;
+            self.vals[vo..vo + n].copy_from_slice(&got[at..at + n]);
+            at += n;
+        }
+        debug_assert_eq!(at, got.len(), "the backend answered the wrong shape");
     }
 
     /// Refresh both belief blocks for a fixed-policy pass. Each traverser then
@@ -2337,11 +2432,12 @@ impl<'a> Solver<'a> {
     fn value_pass(&mut self) -> [Vec<f32>; 2] {
         let reference = self.reference();
         self.propagate(&reference);
-        self.leaf_beliefs_both();
         let mut out = [Vec::new(), Vec::new()];
         for p in 0..2usize {
-            self.pbs_head(p);
-            self.readout(p);
+            // One entry point for a leaf query, so a batched backend -- which
+            // holds this solve's board and config vectors and therefore leaves
+            // the host's copies empty -- is not bypassed here.
+            self.leaf_values(p);
             // `backprop` for the second player overwrites the first's values,
             // so the root slice is taken before the next pass runs.
             self.backprop(p, &reference, Back::Value);
@@ -2513,13 +2609,11 @@ impl<'a> Solver<'a> {
         let reference = self.reference();
         let root = [self.root_belief[0].p.clone(), self.root_belief[1].p.clone()];
         self.propagate(&reference);
-        self.leaf_beliefs_both();
         let (mut nash, mut zero_sum) = (0.0, 0.0);
         for p in 0..2usize {
-            self.pbs_head(p);
-            // One `readout` serves both passes: `backprop` skips leaves, so the
-            // leaf values it left are still there for the second walk.
-            self.readout(p);
+            // One query serves both walks below: `backprop` skips leaves, so
+            // the leaf values it left are still there for the second.
+            self.leaf_values(p);
             let vo = self.voff[0] as usize;
             let nc = self.nc[0][p] as usize;
             let expect = |v: &[f32]| -> f32 { (0..nc).map(|c| root[p][c] * v[vo + c]).sum() };

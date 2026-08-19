@@ -46,17 +46,41 @@ pub enum Call {
         at: usize,
         xpub: Vec<f32>,
         cards: Vec<f32>,
+        /// The belief index of exactly these rows: which config each query's
+        /// support names, and where each query's span starts. A leaf's support
+        /// is fixed when the leaf is made, so it travels once, here.
+        cidx: Vec<u32>,
+        coff: Vec<u32>,
         rows: usize,
     },
-    /// New configs: `f(c)` for the readout and `g(c)` for the pooling.
-    Configs { phi: Vec<f32>, owner: Vec<u32>, cards: Vec<f32>, n: usize },
+    /// New configs: `f(c)` for the readout and `g(c)` for the pooling. Both
+    /// stay with the backend for the same reason the board vectors do — they
+    /// are properties of a config, and every iteration reads them.
+    Configs {
+        solve: usize,
+        at: usize,
+        phi: Vec<f32>,
+        owner: Vec<u32>,
+        cards: Vec<f32>,
+        n: usize,
+    },
     /// Every leaf, every iteration: the belief-conditioned head.
     ///
-    /// The board vectors and the join cache are not here: the trunk left them
-    /// with the backend, which is the whole reason this call is small.
-    Join {
+    /// The whole of what a CFR iteration asks the network.
+    ///
+    /// Everything else the query needs is already with the backend, so this
+    /// carries only what actually changed: `w`, the normalised belief over
+    /// every query's configs, and `opp`, the opponent's reach mass at each
+    /// leaf. What comes back is the counterfactual value per config of the
+    /// queried player — not the head, not the board vectors, not `f` or `g`.
+    ///
+    /// Pooling the beliefs, running the join and reading the values out were
+    /// three steps with two round trips between them. They are one step here
+    /// because the two intermediates never had a reader on the host.
+    Leaf {
         solve: usize,
-        pooled: Vec<f32>,
+        w: Vec<f32>,
+        opp: Vec<f32>,
         rows: usize,
         player: usize,
     },
@@ -84,10 +108,10 @@ impl Call {
                 net.board(xpub, cards, *rows, CARD_ROWS, &mut r.a);
                 net.join_cache(&r.a, *rows, &mut r.b);
             }
-            Call::Configs { phi, owner, cards, n } => {
+            Call::Configs { phi, owner, cards, n, .. } => {
                 net.configs(phi, owner, *n, cards, &mut r.a, &mut r.b, &mut r.c);
             }
-            Call::Join { .. } => unreachable!("a join needs the resident board vectors"),
+            Call::Leaf { .. } => unreachable!("a leaf query needs the resident state"),
         }
         r
     }
@@ -98,7 +122,7 @@ impl Call {
         match self {
             Call::Trunk { .. } => 0,
             Call::Configs { .. } => 1,
-            Call::Join { .. } => 2,
+            Call::Leaf { .. } => 2,
         }
     }
 
@@ -107,8 +131,9 @@ impl Call {
     /// backend — which is what a round shards on.
     pub fn solve(&self) -> usize {
         match self {
-            Call::Trunk { solve, .. } | Call::Join { solve, .. } => *solve,
-            Call::Configs { .. } => usize::MAX,
+            Call::Trunk { solve, .. }
+            | Call::Configs { solve, .. }
+            | Call::Leaf { solve, .. } => *solve,
         }
     }
 
@@ -117,7 +142,7 @@ impl Call {
         match self {
             Call::Trunk { rows, .. } => *rows,
             Call::Configs { n, .. } => *n,
-            Call::Join { rows, .. } => *rows,
+            Call::Leaf { rows, .. } => *rows,
         }
     }
 }
@@ -308,6 +333,42 @@ impl Gate {
     }
 }
 
+/// Pool the beliefs, run the join, read the values out — the CPU reference for
+/// `Call::Leaf`, and the oracle the device kernels are held to.
+///
+/// The two intermediates never leave: `pooled` and the head `h` are produced
+/// and consumed here, which is what makes the call small at both ends.
+fn leaf(net: &Net, b: &Board, w: &[f32], opp: &[f32], rows: usize, player: usize) -> Reply {
+    let queries = 2 * rows;
+    let mut pooled = vec![0.0f32; queries * POOL];
+    for q in 0..queries {
+        let (lo, hi) = (b.coff[q] as usize, b.coff[q + 1] as usize);
+        crate::net::accumulate(
+            &b.g,
+            &b.cidx[lo..hi],
+            &w[lo..hi],
+            POOL,
+            &mut pooled[q * POOL..(q + 1) * POOL],
+        );
+    }
+    let mut h = Vec::new();
+    net.join(&b.p, &b.jp, &pooled, rows, player, &mut h);
+    // One value per config of the queried player, counterfactual: the
+    // network's value for that config times the opponent's reach into the leaf.
+    let mut out = Vec::new();
+    for r in 0..rows {
+        let q = 2 * r + player;
+        let (lo, hi) = (b.coff[q] as usize, b.coff[q + 1] as usize);
+        let at = out.len();
+        out.resize(at + (hi - lo), 0.0);
+        net.values(&h[r * D..(r + 1) * D], &b.f, &b.cidx[lo..hi], &mut out[at..]);
+        for v in &mut out[at..] {
+            *v *= opp[r];
+        }
+    }
+    Reply { a: out, ..Default::default() }
+}
+
 /// Membership in the round count. A thread that leaves must stop being waited
 /// for, or the last round of a run never fills.
 pub struct Member<'a> {
@@ -366,9 +427,37 @@ pub struct Resident {
 struct Board {
     p: Vec<f32>,
     jp: Vec<f32>,
+    /// `f(c)` and `g(c)` for every distinct config the solve has interned.
+    f: Vec<f32>,
+    g: Vec<f32>,
+    /// Which config each query's support names, and where a query's span
+    /// starts. Written by the trunk, since a leaf's support is fixed when the
+    /// leaf is made.
+    cidx: Vec<u32>,
+    coff: Vec<u32>,
 }
 
 impl Resident {
+    fn slot(&self, solve: usize) -> parking_lot::MappedMutexGuard<'_, Board> {
+        let mut g = self.slots.lock();
+        if g.len() <= solve {
+            g.resize(solve + 1, Board::default());
+        }
+        parking_lot::MutexGuard::map(g, |v| &mut v[solve])
+    }
+
+    fn keep_configs(&self, solve: usize, at: usize, f: &[f32], g_: &[f32]) {
+        let mut b = self.slot(solve);
+        let (d, pool) = (crate::net::D, crate::net::POOL);
+        let want = (at + f.len() / d) * d;
+        if b.f.len() < want {
+            b.f.resize(want, 0.0);
+            b.g.resize(want / d * pool, 0.0);
+        }
+        b.f[at * d..want].copy_from_slice(f);
+        b.g[at * pool..want / d * pool].copy_from_slice(g_);
+    }
+
     fn keep(&self, solve: usize, at: usize, p: &[f32], jp: &[f32]) {
         let mut g = self.slots.lock();
         if g.len() <= solve {
@@ -388,6 +477,19 @@ impl Resident {
         b.jp[at * jw..want / d * jw].copy_from_slice(jp);
     }
 
+    /// The belief index arrays, appended for the queries the trunk just made.
+    fn keep_index(&self, solve: usize, at: usize, cidx: &[u32], coff: &[u32]) {
+        let mut b = self.slot(solve);
+        if at == 0 {
+            b.cidx.clear();
+            b.coff.clear();
+            b.coff.push(0);
+        }
+        let base = b.cidx.len() as u32;
+        b.cidx.extend_from_slice(cidx);
+        b.coff.extend(coff.iter().skip(1).map(|x| x + base));
+    }
+
     fn board(&self, solve: usize) -> Board {
         self.slots.lock()[solve].clone()
     }
@@ -401,18 +503,20 @@ impl Backend {
             Backend::Reference(net, res) => calls
                 .par_iter()
                 .map(|c| match c {
-                    Call::Trunk { solve, at, .. } => {
+                    Call::Trunk { solve, at, cidx, coff, .. } => {
                         let r = c.run(net);
                         res.keep(*solve, *at, &r.a, &r.b);
-                        r
+                        res.keep_index(*solve, *at, cidx, coff);
+                        Reply { a: r.a, ..Default::default() }
                     }
-                    Call::Join { solve, pooled, rows, player } => {
-                        let b = res.board(*solve);
-                        let mut r = Reply::default();
-                        net.join(&b.p, &b.jp, pooled, *rows, *player, &mut r.a);
-                        r
+                    Call::Configs { solve, at, .. } => {
+                        let r = c.run(net);
+                        res.keep_configs(*solve, *at, &r.a, &r.b);
+                        Reply { c: r.c, ..Default::default() }
                     }
-                    _ => c.run(net),
+                    Call::Leaf { solve, w, opp, rows, player } => {
+                        leaf(net, &res.board(*solve), w, opp, *rows, *player)
+                    }
                 })
                 .collect(),
             #[cfg(feature = "gpu")]
@@ -643,9 +747,10 @@ mod tests {
     /// A call whose reply is a function of its own contents, so a thread can
     /// tell its own answer from anybody else's.
     fn tagged(tag: usize) -> Call {
-        Call::Join {
+        Call::Leaf {
             solve: 0,
-            pooled: vec![tag as f32],
+            w: vec![tag as f32],
+            opp: Vec::new(),
             rows: tag,
             player: 0,
         }
@@ -653,7 +758,7 @@ mod tests {
 
     fn tag_of(c: &Call) -> f32 {
         match c {
-            Call::Join { pooled, .. } => pooled[0],
+            Call::Leaf { w, .. } => w[0],
             _ => unreachable!(),
         }
     }
