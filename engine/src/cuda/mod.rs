@@ -52,9 +52,11 @@ type Res<T> = Result<T, String>;
 /// that ends the round. The rest are device stages, and are only filled when
 /// `WARCHEST_STAGES` is set -- separating them means synchronising after each,
 /// which changes the thing being measured, so it is off by default.
-pub const STAGES: [&str; 11] = [
+pub const STAGES: [&str; 17] = [
     "marshal", "upload", "launch", "download",
     "reach", "beliefs", "join", "readout", "terminals", "backprop", "expand",
+    "trunk", "configs", "tree",
+    "t-marshal", "t-upload", "t-down",
 ];
 
 pub static LEAF_NS: [std::sync::atomic::AtomicU64; STAGES.len()] =
@@ -488,6 +490,12 @@ struct Card {
     k: Kernels,
     /// Indexed by solve, which is the gate slot the call came from.
     solves: parking_lot::Mutex<Vec<Solve>>,
+    /// Host staging for a round's batches, kept between rounds for the same
+    /// reason the device scratch is: a round concatenates sixteen megabytes of
+    /// public encodings, and building that from an empty `Vec` every time is
+    /// twenty-odd reallocations and four thousand first-touch page faults --
+    /// which measured at a quarter of the whole round.
+    host: parking_lot::Mutex<Stage>,
     /// Scratch for one pass, kept between rounds.
     ///
     /// A round's intermediates are hundreds of megabytes -- four hundred
@@ -632,6 +640,7 @@ impl Card {
             blas,
             k,
             solves: parking_lot::Mutex::new(Vec::new()),
+            host: parking_lot::Mutex::new(Stage::default()),
             scratch: parking_lot::Mutex::new(Scratch::default()),
             layout: NetLayout::new(),
         })
@@ -651,9 +660,12 @@ impl Card {
         fn at(stage: &'static str) -> impl Fn(String) -> String {
             move |e| format!("{stage}: {e}")
         }
-        self.trunk(calls, &pick(0), &mut out).map_err(at("trunk"))?;
-        self.configs(calls, &pick(1), &mut out).map_err(at("configs"))?;
-        self.tree(calls, &pick(2)).map_err(at("tree"))?;
+        // These three are always timed. They are host work as much as device
+        // work -- the trunk marshals a batch, the tree copies a description --
+        // and a stage nobody times is where the round's time turns out to be.
+        self.wall(11, || self.trunk(calls, &pick(0), &mut out)).map_err(at("trunk"))?;
+        self.wall(12, || self.configs(calls, &pick(1), &mut out)).map_err(at("configs"))?;
+        self.wall(13, || self.tree(calls, &pick(2))).map_err(at("tree"))?;
         self.iterate(calls, &pick(3), &mut out).map_err(at("iterate"))?;
         self.read(calls, &pick(4), &mut out).map_err(at("read"))?;
         Ok(out)
@@ -813,7 +825,12 @@ impl Card {
         }
         // Concatenate. `card_of_row` is what replaces `board`'s modulo: a leaf
         // reads the physical view of the card table its own solve drafted.
-        let (mut xpub, mut cards, mut card_of_row) = (Vec::new(), Vec::new(), Vec::new());
+        let mark = std::time::Instant::now();
+        let mut stage = self.host.lock();
+        let Stage { xpub, cards, card_of_row, .. } = &mut *stage;
+        xpub.clear();
+        cards.clear();
+        card_of_row.clear();
         let mut rows = 0usize;
         for &i in mine {
             let Call::Trunk { xpub: xp, cards: cd, rows: n, .. } = &calls[i] else {
@@ -836,9 +853,13 @@ impl Card {
         let (nhex, ntype, chan, nslot) = (N_HEXES as i32, NTYPE as i32, C as i32, NSLOT as i32);
         let l = &self.layout;
 
-        let xpub = self.up(&xpub)?;
-        let cards = self.up(&cards)?;
-        let card_of_row = self.up(&card_of_row)?;
+        LEAF_NS[14].fetch_add(mark.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let mark = std::time::Instant::now();
+        let xpub = self.up(xpub)?;
+        let cards = self.up(cards)?;
+        let card_of_row = self.up(card_of_row)?;
+        drop(stage);
+        LEAF_NS[15].fetch_add(mark.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 
         // Tokens: projected pile counts, then the card token and seat on top.
         let mut piles = self.alloc(rows * NTYPE * PILE_COUNTS)?;
@@ -907,7 +928,9 @@ impl Card {
         // Keep them, per solve, for the iterations that follow. The host still
         // takes `p` back: the policy head builds its action embeddings against
         // a node's own board vector, and that runs there.
+        let mark = std::time::Instant::now();
         let host_p = self.down(&p, rows * D)?;
+        LEAF_NS[16].fetch_add(mark.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let mut at = 0;
         let mut g = self.solves.lock();
         for &i in mine {
@@ -965,7 +988,11 @@ impl Card {
         if mine.is_empty() {
             return Ok(());
         }
-        let (mut phi, mut owner, mut cards) = (Vec::new(), Vec::new(), Vec::new());
+        let mut stage = self.host.lock();
+        let Stage { phi, owner, cards, .. } = &mut *stage;
+        phi.clear();
+        owner.clear();
+        cards.clear();
         let mut n = 0usize;
         for &i in mine {
             let Call::Configs { phi: ph, owner: ow, cards: cd, n: k, .. } = &calls[i] else {
@@ -984,9 +1011,10 @@ impl Card {
         let (n_i, nslot, cfeat) = (n as i32, NSLOT as i32, CFEAT as i32);
         let (ntype, type_i, pool_i) = (NTYPE as i32, TYPE as i32, POOL as i32);
 
-        let phi = self.up(&phi)?;
-        let owner = self.up(&owner)?;
-        let cards = self.up(&cards)?;
+        let phi = self.up(phi)?;
+        let owner = self.up(owner)?;
+        let cards = self.up(cards)?;
+        drop(stage);
 
         let width = 3 + TYPE;
         let mut slots = self.alloc(n * NSLOT * width)?;
@@ -1129,8 +1157,14 @@ impl Card {
 
     /// Lay a set of solves out as one batch.
     fn lay(&self, solves: &[usize]) -> Res<Batch> {
-        let (mut desc, mut coff) = (Vec::with_capacity(solves.len() * DESC), vec![0u32]);
-        let (mut part_of_row, mut local_row, mut base) = (Vec::new(), Vec::new(), Vec::new());
+        let mut stage = self.host.lock();
+        let Stage { desc, coff, part_of_row, local_row, base, .. } = &mut *stage;
+        desc.clear();
+        coff.clear();
+        coff.push(0);
+        part_of_row.clear();
+        local_row.clear();
+        base.clear();
         let (mut rows, mut cells, mut nterm) = (0usize, 0u32, 0usize);
         let mut wide: Vec<u32> = Vec::new();
         {
@@ -1157,11 +1191,11 @@ impl Card {
             }
         }
         Ok(Batch {
-            trees: self.up(&desc)?,
-            coff: self.up(&coff)?,
-            part: self.up(&part_of_row)?,
-            local: self.up(&local_row)?,
-            base: self.up(&base)?,
+            trees: self.up(desc)?,
+            coff: self.up(coff)?,
+            part: self.up(part_of_row)?,
+            local: self.up(local_row)?,
+            base: self.up(base)?,
             wide,
             parts: solves.len() as u32,
             rows,
@@ -1179,6 +1213,19 @@ impl Card {
         self.network(b)?;
         self.terminals(&b.trees, b.nterm, b.parts)?;
         self.backprop(&b.trees, &b.wide, b.parts, 1, (0.0, 0.0, 0.0, 0.0))
+    }
+
+    /// Time a stage's wall clock, always. No synchronise: what these cost is
+    /// the host work in them, and the launches they queue are paid for by
+    /// whichever stage synchronises next.
+    fn wall<T>(&self, slot: usize, f: impl FnOnce() -> Res<T>) -> Res<T> {
+        let mark = std::time::Instant::now();
+        let got = f()?;
+        LEAF_NS[slot].fetch_add(
+            mark.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(got)
     }
 
     /// Time one device stage, when `WARCHEST_STAGES` asks for it. The
@@ -1603,6 +1650,21 @@ impl Card {
         Ok(())
     }
 
+}
+
+/// The host-side concatenation buffers of a round, by role.
+#[derive(Default)]
+struct Stage {
+    xpub: Vec<f32>,
+    cards: Vec<f32>,
+    card_of_row: Vec<i32>,
+    phi: Vec<f32>,
+    owner: Vec<u32>,
+    desc: Vec<u64>,
+    coff: Vec<u32>,
+    part_of_row: Vec<i32>,
+    local_row: Vec<i32>,
+    base: Vec<i32>,
 }
 
 /// The intermediates of one pass, by role. Each is fully written before it is

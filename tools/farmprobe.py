@@ -102,7 +102,8 @@ def main():
         # own four are all there is.
         names = ("marshal", "upload", "launch", "download",
                  "reach", "beliefs", "join", "readout", "terminals",
-                 "backprop", "expand")
+                 "backprop", "expand", "trunk", "configs", "tree",
+                 "t-marshal", "t-upload", "t-down")
         print("iteration, ms: " +
               "  ".join(f"{n}={v:.0f}" for n, v in zip(names, b) if v > 0))
 
