@@ -664,17 +664,20 @@ impl Card {
         // work -- the trunk marshals a batch, the tree copies a description --
         // and a stage nobody times is where the round's time turns out to be.
         let trunk = self.wall(11, || self.trunk(calls, &pick(0))).map_err(at("trunk"))?;
-        self.wall(12, || self.configs(calls, &pick(1), &mut out)).map_err(at("configs"))?;
+        let cfg = self.wall(12, || self.configs(calls, &pick(1))).map_err(at("configs"))?;
         self.wall(13, || self.tree(calls, &pick(2))).map_err(at("tree"))?;
         self.iterate(calls, &pick(3), &mut out).map_err(at("iterate"))?;
         self.read(calls, &pick(4), &mut out).map_err(at("read"))?;
-        // Last, because it is the one thing a round hands back that nothing on
-        // the card is waiting for. Taking it where it is produced would
-        // synchronise in the middle of the round, and the host would stand
-        // still through the trunk's own kernels instead of spending them
-        // describing the trees the iteration is about to read.
-        self.wall(16, || self.finish_trunk(trunk, calls, &pick(0), &mut out))
-            .map_err(at("trunk-down"))?;
+        // Last, and together: these are the only things a round hands back
+        // that nothing on the card is waiting for. Taking either where it is
+        // produced synchronises in the middle of the round, and the host then
+        // stands still through kernels it could have spent describing the
+        // trees the iteration is about to read.
+        self.wall(16, || {
+            self.back(trunk, calls, &pick(0), D, &mut out, |a| &mut a.a)?;
+            self.back(cfg, calls, &pick(1), D, &mut out, |a| &mut a.c)
+        })
+        .map_err(at("hand-back"))?;
         Ok(out)
     }
 
@@ -977,28 +980,29 @@ impl Card {
         Ok(Some(p))
     }
 
-    /// The board vectors, back on the host.
+    /// One `[rows, width]` result back on the host, split by call.
     ///
-    /// The policy head builds its action embeddings against a node's own board
-    /// vector and that runs there, so this is the one thing a round hands back
-    /// that nothing on the card is waiting for.
-    fn finish_trunk(
+    /// The board vectors and the policy's `f_p` come back this way: the policy
+    /// head builds its action embeddings on the host, so those two are what a
+    /// round owes its callers and everything else stays.
+    fn back(
         &self,
-        p: Option<CudaSlice<f32>>,
+        d: Option<CudaSlice<f32>>,
         calls: &[Call],
         mine: &[usize],
+        width: usize,
         out: &mut Vec<(usize, Reply)>,
+        field: impl Fn(&mut Reply) -> &mut Vec<f32>,
     ) -> Res<()> {
-        let Some(p) = p else { return Ok(()) };
+        let Some(d) = d else { return Ok(()) };
         let rows: usize = mine.iter().map(|&i| calls[i].rows()).sum();
-        let host = self.down(&p, rows * D)?;
+        let host = self.down(&d, rows * width)?;
         let mut at = 0;
         for &i in mine {
             let n = calls[i].rows();
-            out.push((
-                i,
-                Reply { a: host[at * D..(at + n) * D].to_vec(), ..Default::default() },
-            ));
+            let mut reply = Reply::default();
+            *field(&mut reply) = host[at * width..(at + n) * width].to_vec();
+            out.push((i, reply));
             at += n;
         }
         Ok(())
@@ -1008,9 +1012,9 @@ impl Card {
 
     /// `f(c)` for the readout and `g(c)` for the pooling, for every config the
     /// round asked about.
-    fn configs(&self, calls: &[Call], mine: &[usize], out: &mut Vec<(usize, Reply)>) -> Res<()> {
+    fn configs(&self, calls: &[Call], mine: &[usize]) -> Res<Option<CudaSlice<f32>>> {
         if mine.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let mut stage = self.host.lock();
         let Stage { phi, owner, cards, .. } = &mut *stage;
@@ -1067,7 +1071,6 @@ impl Card {
         // `f` and `g` stay: the readout and the belief pooling both run here
         // now, so neither has a reader on the host. `f_p` goes back, because
         // the policy prior is built there.
-        let host_fp = self.down(&fp, n * D)?;
         let mut at = 0;
         {
             let mut solves = self.solves.lock();
@@ -1082,19 +1085,7 @@ impl Card {
                 at += k;
             }
         }
-        let mut at = 0;
-        for &i in mine {
-            let k = calls[i].rows();
-            out.push((
-                i,
-                Reply {
-                    c: host_fp[at * D..(at + k) * D].to_vec(),
-                    ..Default::default()
-                },
-            ));
-            at += k;
-        }
-        Ok(())
+        Ok(Some(fp))
     }
 
     // ------------------------------------------------------------ the CFR loop
