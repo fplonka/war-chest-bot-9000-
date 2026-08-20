@@ -64,8 +64,23 @@ not worth doing at all. `k_reach_sweep` and `k_backprop_sweep` transcribe the
 two, one block per (node, player) with threads over that node's configs, so
 neither needs a task list.
 
-What remains is the driver — uploading a description, walking the levels — and
-`cuda_parity` over the result. **None of the CUDA has been compiled.**
+`Device::keep_tree` and `Device::sweep` drive them: reach forward from level
+one, backpropagation backward, one launch a level. **None of the CUDA has been
+compiled.**
+
+**But the sweeps cannot move on their own, and this is the thing to settle
+first.** `sample_leaf` — the expansion phase — runs on the host and reads
+exactly the arenas the sweeps write: `cur`, `sum_strat`, `qval`, `visits`,
+`prior`, `reach`. Bringing those back is ~2.2 MB an iteration against the 0.7 MB
+the whole leaf query now costs, so device-side sweeps would *add* about three
+times the traffic they save. Making the arenas resident and leaving expansion
+where it is makes throughput worse, not better.
+
+Two ways out. Move the expansion phase to the device as well, which is what the
+architecture at `f5f4c05^` did — its trajectories and PUCT statistics were
+device-side, and nothing came back per iteration. Or leave the sweeps on the
+host and accept the ceiling they impose, ~146 solves/s, which is below the
+target. There is no version where the sweeps move alone.
 
 A sweep must hand back `qval` as well as the values. The expansion phase reads
 it as PUCT's Q, and a sweep that computes each action value and drops it leaves
