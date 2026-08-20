@@ -65,8 +65,28 @@ two, one block per (node, player) with threads over that node's configs, so
 neither needs a task list.
 
 `Device::keep_tree` and `Device::sweep` drive them: reach forward from level
-one, backpropagation backward, one launch a level. **None of the CUDA has been
-compiled.**
+one, backpropagation backward, one launch a level. The sweeps are compiled but
+not yet wired into a solve.
+
+**Where it stands, measured.** The fused leaf pass agrees with the CPU network
+to 2.6e-6 on one card and on two, with batch invariance holding. Row throughput
+went from 380k/s before the fusion to **1.1M/s** after — but it is still a
+wall: 36, 72 and 144 threads all land there, at a constant **0.9 µs a row**,
+while the cards sit at **14–27%** utilisation and the host waits inside
+`Backend::run` for 91% of wall clock.
+
+0.9 µs a row is ~330 GFLOP/s against the ~71 TFLOP/s the two cards have. Half a
+percent of peak. Whatever costs that time, it is not arithmetic. The leading
+suspect is that every `up()` copies from a pageable `Vec`, which makes each
+host-to-device transfer synchronous and serialises the stream; a leaf pass does
+roughly a dozen of them plus two launches and two device-to-device copies per
+solve. Pinned host buffers and fewer, larger transfers are the next thing to
+try, and the next thing to *measure* — the last four guesses in this file were
+all wrong.
+
+At the frozen budget this is **1.5 solves/s**, against 1.4 before. The fusion's
+2.9x in rows/s was spent exactly, and only, on the doubling of rows a solve that
+simultaneous updates brought.
 
 **But the sweeps cannot move on their own, and this is the thing to settle
 first.** `sample_leaf` — the expansion phase — runs on the host and reads
