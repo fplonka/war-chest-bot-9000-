@@ -280,6 +280,20 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
         stream.memcpy_dtod(&src.slice(from..from + n), &mut d).map_err(err)
     }
 
+    /// Grow to `want` without preserving or zeroing what is there. For the
+    /// pass intermediates, every one of which is fully written before it is
+    /// read.
+    ///
+    /// # Safety
+    /// The caller must write every element it then reads.
+    fn room(&mut self, stream: &Arc<CudaStream>, want: usize) -> Res<&mut CudaSlice<T>> {
+        if self.cap < want {
+            self.cap = want.next_power_of_two().max(1);
+            self.buf = Some(unsafe { stream.alloc::<T>(self.cap) }.map_err(err)?);
+        }
+        Ok(self.buf.as_mut().expect("a capacity implies a buffer"))
+    }
+
     /// Give the buffer back.
     ///
     /// A gate slot is reused by the next solve, and a solve's cost varies
@@ -450,6 +464,15 @@ struct Card {
     k: Kernels,
     /// Indexed by solve, which is the gate slot the call came from.
     solves: parking_lot::Mutex<Vec<Solve>>,
+    /// Scratch for one pass, kept between rounds.
+    ///
+    /// A round's intermediates are hundreds of megabytes -- four hundred
+    /// thousand join rows at `D` wide is four hundred of them for the head
+    /// alone -- and allocating and freeing that every round is work the driver
+    /// does instead of the arithmetic. They are grown by role and reused, for
+    /// the same reason `docs/PERF.md` pools the host's five big buffers by
+    /// role rather than from one shared pool.
+    scratch: parking_lot::Mutex<Scratch>,
     /// The weights exactly as `NetLayout` describes them.
     w: CudaSlice<f32>,
     b: CudaSlice<f32>,
@@ -585,6 +608,7 @@ impl Card {
             blas,
             k,
             solves: parking_lot::Mutex::new(Vec::new()),
+            scratch: parking_lot::Mutex::new(Scratch::default()),
             layout: NetLayout::new(),
         })
     }
@@ -728,8 +752,18 @@ impl Card {
         &mut g[solve]
     }
 
+    /// Scratch for one pass.
+    ///
+    /// Uninitialised, not zeroed. Every buffer this hands out is fully written
+    /// by the kernel that follows, and at four hundred thousand rows a round
+    /// the zeroing alone was a gigabyte of writes an iteration -- the same
+    /// mistake `docs/PERF.md` records fixing on the host, where `clear()` then
+    /// `resize()` was a memset per layer per call.
+    ///
+    /// # Safety
+    /// The caller must write every element before reading one.
     fn alloc(&self, n: usize) -> Res<CudaSlice<f32>> {
-        self.stream.alloc_zeros::<f32>(n.max(1)).map_err(err)
+        unsafe { self.stream.alloc::<f32>(n.max(1)) }.map_err(err)
     }
 
     fn up<T: cudarc::driver::DeviceRepr>(&self, host: &[T]) -> Res<CudaSlice<T>> {
@@ -797,7 +831,8 @@ impl Card {
         let mut glob = self.alloc(rows * C)?;
         self.run(l.glob_stem, &loose, rows, &mut glob)?;
         let mut facts = self.alloc(cells * HEX_FACTS)?;
-        let mut occupant = self.stream.alloc_zeros::<i32>(cells.max(1)).map_err(err)?;
+        // Fully written by `k_hex_facts`, one entry a cell.
+        let mut occupant = unsafe { self.stream.alloc::<i32>(cells.max(1)) }.map_err(err)?;
         let (hex_ch, hex_facts) = (HEX_CH as i32, HEX_FACTS as i32);
         launch!(self, hex_facts, cells, &xpub, &mut facts, &mut occupant, &rows_i, &stride, &nhex, &hex_ch, &hex_facts, &ntype)?;
         let mut x = self.alloc(cells * C)?;
@@ -1111,8 +1146,7 @@ impl Card {
     /// targets are read off.
     fn value_pass(&self, b: &Batch) -> Res<()> {
         self.reaches(&b.trees, &b.wide, b.parts, 1, false)?;
-        let (mut w, mut mass) = (self.alloc(b.cells)?, self.alloc(2 * b.rows)?);
-        self.network(b, &mut w, &mut mass)?;
+        self.network(b)?;
         self.terminals(&b.trees, b.nterm, b.parts)?;
         self.backprop(&b.trees, &b.wide, b.parts, 1, (0.0, 0.0, 0.0, 0.0))
     }
@@ -1166,10 +1200,9 @@ impl Card {
         let (da, db, dg) = *factors;
         let (predict, puct, expand) = (*predict, *puct, *expand);
 
-        let (mut w, mut mass) = (self.alloc(b.cells)?, self.alloc(2 * b.rows)?);
         self.stage(4, || self.reaches(&b.trees, &b.wide, b.parts, 0, false))
             .map_err(at("reach"))?;
-        self.network(&b, &mut w, &mut mass).map_err(at("net"))?;
+        self.network(&b).map_err(at("net"))?;
         self.stage(8, || self.terminals(&b.trees, b.nterm, b.parts)).map_err(at("terminals"))?;
         self.stage(9, || self.backprop(&b.trees, &b.wide, b.parts, 0, (da, db, dg, predict)))
             .map_err(at("backprop"))?;
@@ -1177,12 +1210,11 @@ impl Card {
         // next iteration reads are stale until they are pushed down again --
         // and the average strategy is accumulated against those fresh ones.
         self.stage(4, || self.reaches(&b.trees, &b.wide, b.parts, 0, true)).map_err(at("avg"))?;
-        let leaves = self
-            .stage(10, || self.expand(&b.trees, b.parts, expand, puct))
-            .map_err(at("expand"))?;
         let t_launch = mark.elapsed();
         let mark = std::time::Instant::now();
-        let host = self.down_u32(&leaves, b.parts as usize * expand)?;
+        let host = self
+            .stage(10, || self.expand(&b.trees, b.parts, expand, puct))
+            .map_err(at("expand"))?;
         let t_down = mark.elapsed();
         for (slot, n) in [t_marshal, t_up, t_launch, t_down].iter().enumerate() {
             LEAF_NS[slot].fetch_add(n.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1360,20 +1392,33 @@ impl Card {
     /// on which seat is asking, so they run once; the join and the readout do,
     /// and run over a batch of twice the rows rather than twice.
     #[allow(clippy::too_many_arguments)]
-    fn network(&self, b: &Batch, w: &mut CudaSlice<f32>, mass: &mut CudaSlice<f32>) -> Res<()> {
+    fn network(&self, b: &Batch) -> Res<()> {
         let (trees, part_d, local_d, base_d, coff_d) =
             (&b.trees, &b.part, &b.local, &b.base, &b.coff);
         let stride = b.rows;
         if stride == 0 {
             return Ok(());
         }
+        let mut sc = self.scratch.lock();
         let l = &self.layout;
         let rows = 2 * stride;
         let (rows_i, stride_i) = (rows as i32, stride as i32);
         let (pool_i, d_i) = (POOL as i32, D as i32);
 
         let queries = 2 * stride;
-        let mut pooled = self.alloc(queries * POOL)?;
+        let s = &self.stream;
+        sc.w.room(s, b.cells)?;
+        sc.mass.room(s, 2 * stride)?;
+        sc.pooled.room(s, queries * POOL)?;
+        sc.h.room(s, rows * D)?;
+        sc.z.room(s, rows * JW)?;
+        sc.input.room(s, rows * JOIN_IN)?;
+        sc.t.room(s, rows * JW)?;
+        let Scratch { w, mass, pooled, h, z, input, t, .. } = &mut *sc;
+        let (w, mass) = (w.buf.as_mut().unwrap(), mass.buf.as_mut().unwrap());
+        let pooled = pooled.buf.as_mut().unwrap();
+        let (h, z) = (h.buf.as_mut().unwrap(), z.buf.as_mut().unwrap());
+        let (input, t) = (input.buf.as_mut().unwrap(), t.buf.as_mut().unwrap());
         self.stage(5, || {
             let queries_i = queries as i32;
             unsafe {
@@ -1392,7 +1437,7 @@ impl Card {
                 self.stream
                     .launch_builder(&self.k.belief_pool)
                     .arg(trees).arg(part_d).arg(base_d).arg(coff_d).arg(&*w)
-                    .arg(&mut pooled).arg(&queries_i).arg(&pool_i)
+                    .arg(&mut *pooled).arg(&queries_i).arg(&pool_i)
                     .launch_unit(LaunchConfig {
                         grid_dim: (queries as u32, 1, 1),
                         block_dim: (64, 1, 1),
@@ -1405,30 +1450,26 @@ impl Card {
         // The board vectors and the join cache, gathered out of the solves --
         // straight into the buffers the residual chain accumulates onto, so
         // neither needs a copy of its own.
-        let mut h = self.alloc(rows * D)?;
-        let mut z = self.alloc(rows * JW)?;
-        let mut input = self.alloc(rows * JOIN_IN)?;
-        let mut t = self.alloc(rows * JW)?;
         self.stage(6, || {
             let (zero, one, jw_i) = (0i32, 1i32, JW as i32);
-            launch!(self, gather, rows * D, trees, part_d, local_d, &zero, &mut h, &rows_i, &d_i, &stride_i)?;
-            launch!(self, gather, rows * JW, trees, part_d, local_d, &one, &mut z, &rows_i, &jw_i, &stride_i)?;
-            launch!(self, join_input, rows * JOIN_IN, &pooled, &mut input, &rows_i, &pool_i, &stride_i)?;
-            self.lin(l.join_b, &input, rows, 1.0, &mut z)?;
-            self.bias(l.join_b, rows, &mut z)?;
+            launch!(self, gather, rows * D, trees, part_d, local_d, &zero, &mut *h, &rows_i, &d_i, &stride_i)?;
+            launch!(self, gather, rows * JW, trees, part_d, local_d, &one, &mut *z, &rows_i, &jw_i, &stride_i)?;
+            launch!(self, join_input, rows * JOIN_IN, &*pooled, &mut *input, &rows_i, &pool_i, &stride_i)?;
+            self.lin(l.join_b, &*input, rows, 1.0, &mut *z)?;
+            self.bias(l.join_b, rows, z)?;
             // A residual block is a norm, a multiply and an add. The norm reads
             // `z` and writes the scratch in one pass rather than four, and the
             // multiply accumulates straight back into `z` -- so a block costs
             // two passes over `[rows, JW]` where it used to cost nine.
             for i in 0..JBLOCKS {
-                self.norm_to(l.norms[LN_JOIN + i], rows, true, &z, &mut t)?;
-                self.lin(l.join_w[i], &t, rows, 1.0, &mut z)?;
-                self.bias(l.join_w[i], rows, &mut z)?;
+                self.norm_to(l.norms[LN_JOIN + i], rows, true, z, t)?;
+                self.lin(l.join_w[i], &*t, rows, 1.0, &mut *z)?;
+                self.bias(l.join_w[i], rows, z)?;
             }
-            self.norm_to(l.norms[LN_JOUT], rows, true, &z, &mut t)?;
-            self.lin(l.join_out, &t, rows, 1.0, &mut h)?;
-            self.bias(l.join_out, rows, &mut h)?;
-            self.norm(l.norms[LN_H], rows, false, &mut h)
+            self.norm_to(l.norms[LN_JOUT], rows, true, z, t)?;
+            self.lin(l.join_out, &*t, rows, 1.0, &mut *h)?;
+            self.bias(l.join_out, rows, h)?;
+            self.norm(l.norms[LN_H], rows, false, h)
         })?;
 
         let bias = self.b.slice(l.value_bias..l.value_bias + 1);
@@ -1437,7 +1478,7 @@ impl Card {
                 self.stream
                     .launch_builder(&self.k.readout)
                     .arg(trees).arg(part_d).arg(local_d).arg(coff_d)
-                    .arg(&h).arg(&bias).arg(&*mass).arg(&rows_i).arg(&stride_i).arg(&d_i)
+                    .arg(&*h).arg(&bias).arg(&*mass).arg(&rows_i).arg(&stride_i).arg(&d_i)
                     .launch_unit(LaunchConfig {
                         grid_dim: (rows as u32, 1, 1),
                         block_dim: (32, 8, 1),
@@ -1470,14 +1511,15 @@ impl Card {
     /// reached. The simulations of one phase run in order, because each counts
     /// the visits it passes and the next is meant to see them.
     fn expand(&self, trees: &CudaSlice<u64>, parts: u32, sims: usize, puct: f32)
-        -> Res<CudaSlice<u32>> {
+        -> Res<Vec<u32>> {
         let n = (parts as usize * sims).max(1);
-        let mut out = self.stream.alloc_zeros::<u32>(n).map_err(err)?;
+        let mut sc = self.scratch.lock();
+        let out = sc.leaves.room(&self.stream, n)?;
         let (parts_i, sims_i) = (parts as i32, sims as i32);
         unsafe {
             self.stream
                 .launch_builder(&self.k.expand)
-                .arg(trees).arg(&mut out).arg(&parts_i).arg(&sims_i).arg(&puct)
+                .arg(trees).arg(&mut *out).arg(&parts_i).arg(&sims_i).arg(&puct)
                 .launch_unit(LaunchConfig {
                     grid_dim: (parts.max(1), 1, 1),
                     block_dim: (32, 1, 1),
@@ -1485,7 +1527,9 @@ impl Card {
                 })
         }
         .map_err(err)?;
-        Ok(out)
+        // The download is what ends the round: nothing else the iteration
+        // produced has a reader on the host.
+        self.stream.memcpy_dtov(&out.slice(0..n)).map_err(err)
     }
 
     /// The reference strategy, once the tree has stopped growing.
@@ -1509,9 +1553,25 @@ impl Card {
         Ok(())
     }
 
-    fn down_u32(&self, d: &CudaSlice<u32>, n: usize) -> Res<Vec<u32>> {
-        self.stream.memcpy_dtov(&d.slice(0..n)).map_err(err)
-    }
+}
+
+/// The intermediates of one pass, by role. Each is fully written before it is
+/// read, so they are grown rather than cleared.
+#[derive(Default)]
+struct Scratch {
+    /// `[cells]` normalised beliefs, and `[2, rows]` reach mass per player.
+    w: Arr<f32>,
+    mass: Arr<f32>,
+    /// `[2 * rows, POOL]` the pooled belief block.
+    pooled: Arr<f32>,
+    /// `[rows, D]` the head, `[rows, JW]` the residual stream, and the two
+    /// buffers the join's input and its per-block scratch need.
+    h: Arr<f32>,
+    z: Arr<f32>,
+    input: Arr<f32>,
+    t: Arr<f32>,
+    /// `[parts * sims]` the leaves an expansion phase sampled.
+    leaves: Arr<u32>,
 }
 
 /// A solve's tree, as the CFR kernels read it. Every array is `contract.rs`
