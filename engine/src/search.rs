@@ -2148,7 +2148,7 @@ impl<'a> Solver<'a> {
         // the next iteration's traversal reads them, and so does the average
         // strategy accumulation below.
         self.precompute_reaches();
-        self.avg_block(traverser);
+        self.avg_block();
         self.steps[traverser] += 1;
     }
 
@@ -2168,26 +2168,31 @@ impl<'a> Solver<'a> {
         self.update_regrets(0);
         self.update_regrets(1);
         self.precompute_reaches();
-        self.avg_block(0);
-        self.avg_block(1);
+        self.avg_block();
         self.steps[0] += 1;
         self.steps[1] += 1;
     }
 
     /// Add the fresh reach-weighted iterate to the running strategy sum.
     /// Normalisation is deferred to `finish`.
-    pub fn avg_block(&mut self, traverser: usize) {
+    /// Both players in one walk. A decision node belongs to exactly one of
+    /// them, so a per-player call skipped half the nodes and paid the whole
+    /// traversal twice -- which was right while CFR alternated traversers and
+    /// only one player's sum moved per iteration, and is not now that `step`
+    /// updates both.
+    pub fn avg_block(&mut self) {
         let _t = timed!(AVG);
-        self.avg_touched[traverser] = true;
+        self.avg_touched = [true; 2];
         for i in 0..self.nodes.len() {
             let n = &self.nodes[i];
-            if n.leaf || n.chance || n.player as usize != traverser {
+            if n.leaf || n.chance {
                 continue;
             }
-            let nc = n.nc(traverser);
+            let me = n.player as usize;
+            let nc = n.nc(me);
             let so = self.soff[i] as usize;
             for c in 0..nc {
-                let r = self.reach_of(i, traverser)[c];
+                let r = self.reach_of(i, me)[c];
                 for cell in n.legal_row(c) {
                     self.sum_strat[i][cell] += r * self.cur[so + cell];
                 }
