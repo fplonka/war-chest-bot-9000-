@@ -2178,7 +2178,47 @@ impl<'a> Solver<'a> {
             }
         }
         if !self.capped {
+            // The reference strategy, and the root's slice of it. Every solve
+            // needs that much: the agent acts on it whether or not the solve
+            // is collected. What a collected solve needs on top -- the root's
+            // values and the beliefs it harvests -- is a second read, because
+            // the value pass under the reference is most of a CFR iteration
+            // and a solve that nobody collects should not pay for it.
             self.extend_leaf_batch();
+            let tree = self.tree_call();
+            let read = self.read_call(true, [(0, 0); 2], Vec::new());
+            let mut replies = self.nets.grew(vec![tree, read]);
+            self.avg = vec![0.0; self.ncells];
+            let (at, cells) = self.root_cells();
+            self.avg[at..at + cells].copy_from_slice(&replies[1].b);
+            std::mem::take(&mut replies[1]);
+        }
+    }
+
+    /// Where the root's strategy cells are, or nothing when it has none.
+    fn root_cells(&self) -> (usize, usize) {
+        let n = &self.nodes[0];
+        if n.leaf || n.chance {
+            (0, 0)
+        } else {
+            (self.soff[0] as usize, n.legal_action.len())
+        }
+    }
+
+    fn read_call(
+        &self,
+        finish: bool,
+        vals_at: [(u32, u32); 2],
+        reach_at: Vec<(u32, u32)>,
+    ) -> Call {
+        let (at, cells) = self.root_cells();
+        Call::Read {
+            solve: Gate::slot(),
+            touched: self.avg_touched,
+            finish,
+            vals_at,
+            policy_at: if finish { (at as u32, cells as u32) } else { (0, 0) },
+            reach_at,
         }
     }
 
@@ -2555,37 +2595,23 @@ impl<'a> Solver<'a> {
                 .map(|_| self.leaf_rows[rng.below(self.leaf_rows.len())])
                 .collect()
         };
-        let n = &self.nodes[0];
-        let policy_at = if n.leaf || n.chance {
-            (0, 0)
-        } else {
-            (self.soff[0], n.legal_action.len() as u32)
-        };
-        let read = Call::Read {
-            solve: Gate::slot(),
-            touched: self.avg_touched,
-            vals_at: [
+        // The card holds one value arena per traverser, so the second player's
+        // root row sits a whole arena past the first's.
+        let nvals = self.vals.len() as u32;
+        let read = self.read_call(
+            false,
+            [
                 (self.voff[0], self.nc[0][0]),
-                (self.voff[0], self.nc[0][1]),
+                (nvals + self.voff[0], self.nc[0][1]),
             ],
-            policy_at,
-            reach_at: picks
+            picks
                 .iter()
                 .map(|&i| (self.roff[i], self.nc[i][0] + self.nc[i][1]))
                 .collect(),
-        };
-        // The tree grew after the last iteration described it, so it travels
-        // once more before anything reads a value off it.
-        let tree = self.tree_call();
-        let mut replies = self.nets.grew(vec![tree, read]);
-        let r = replies.remove(1);
+        );
+        let r = self.nets.grew(vec![read]).remove(0);
         let n0 = self.nc[0][0] as usize;
         let value = [r.a[..n0].to_vec(), r.a[n0..].to_vec()];
-        // `average_strategy` and `root_policy` read `avg`, and only ever at the
-        // root, so only the root's slice comes back.
-        self.avg = vec![0.0; self.ncells];
-        let at = policy_at.0 as usize;
-        self.avg[at..at + r.b.len()].copy_from_slice(&r.b);
         let policy = self.root_policy();
         let mut queries = Vec::with_capacity(picks.len());
         let mut cut = 0;

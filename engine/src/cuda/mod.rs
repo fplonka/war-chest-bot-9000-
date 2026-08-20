@@ -76,6 +76,7 @@ struct Kernels {
     group_bias: CudaFunction,
     window: CudaFunction,
     gather: CudaFunction,
+    scatter: CudaFunction,
     seed_reach: CudaFunction,
     avg_block: CudaFunction,
     beliefs: CudaFunction,
@@ -113,6 +114,7 @@ impl Kernels {
             group_bias: get("k_group_bias")?,
             window: get("k_window")?,
             gather: get("k_gather")?,
+            scatter: get("k_scatter")?,
             seed_reach: get("k_seed_reach")?,
             avg_block: get("k_avg_block")?,
             beliefs: get("k_beliefs")?,
@@ -235,6 +237,14 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
         Ok(())
     }
 
+    /// Reserve room for `n` elements at `at` and hand back where they go. The
+    /// write itself happens later, packed with every other one in the round.
+    fn plan(&mut self, stream: &Arc<CudaStream>, at: usize, n: usize) -> Res<u64> {
+        self.fit(stream, at + n)?;
+        self.len = at + n;
+        Ok(self.ptr(stream))
+    }
+
     /// Grow to hold `at + host.len()` elements and write `host` at `at`.
     fn put(&mut self, stream: &Arc<CudaStream>, at: usize, host: &[T]) -> Res<()> {
         self.fit(stream, at + host.len())?;
@@ -319,15 +329,67 @@ struct Solve {
     leaf_node: Arr<u32>,
     term: Arr<u32>,
     nterm: usize,
+    /// Values per traverser: the arena holds both, so one launch backpropagates
+    /// both.
+    nvals: usize,
     /// Level bounds, on the host, because they drive the launch loop.
     level_start: Vec<u32>,
     /// The expansion's own random stream, seeded once by the solver.
     seed: Arr<u64>,
 }
 
+/// Every write a round makes to its solves' arrays, gathered to be sent as one.
+///
+/// The pieces are small and there are a thousand of them; concatenated they are
+/// one upload and one kernel. `start` is the prefix sum, which is what lets a
+/// thread of `k_scatter` find the piece it belongs to.
+#[derive(Default)]
+struct Pack {
+    blob: Vec<u32>,
+    dst: Vec<u64>,
+    at: Vec<u32>,
+    start: Vec<u32>,
+}
+
+impl Pack {
+    fn u32(&mut self, a: &mut Arr<u32>, s: &Arc<CudaStream>, at: usize, host: &[u32]) -> Res<()> {
+        let dst = a.plan(s, at, host.len())?;
+        self.piece(dst, at, host.iter().copied())
+    }
+
+    fn f32(&mut self, a: &mut Arr<f32>, s: &Arc<CudaStream>, at: usize, host: &[f32]) -> Res<()> {
+        let dst = a.plan(s, at, host.len())?;
+        self.piece(dst, at, host.iter().map(|x| x.to_bits()))
+    }
+
+    /// Whatever the card has not been told about yet. A rewind shortens `host`,
+    /// which drops the tail and lets it be written again.
+    fn tail(&mut self, a: &mut Arr<u32>, s: &Arc<CudaStream>, host: &[u32]) -> Res<()> {
+        let at = a.len.min(host.len());
+        self.u32(a, s, at, &host[at..])
+    }
+
+    fn tail_f32(&mut self, a: &mut Arr<f32>, s: &Arc<CudaStream>, host: &[f32]) -> Res<()> {
+        let at = a.len.min(host.len());
+        self.f32(a, s, at, &host[at..])
+    }
+
+    fn piece(&mut self, dst: u64, at: usize, src: impl Iterator<Item = u32>) -> Res<()> {
+        let before = self.blob.len();
+        self.blob.extend(src);
+        if self.blob.len() == before {
+            return Ok(());
+        }
+        self.start.push(before as u32);
+        self.dst.push(dst);
+        self.at.push(at as u32);
+        Ok(())
+    }
+}
+
 /// Fields of `struct Tree` in `kernels.cu`, in order. Every one is eight bytes
 /// wide, so the descriptor is positional and needs no packing rules.
-const DESC: usize = 51;
+const DESC: usize = 52;
 
 impl Solve {
     fn describe(&self, s: &Arc<CudaStream>) -> [u64; DESC] {
@@ -350,6 +412,7 @@ impl Solve {
             self.leaf_node.ptr(s), self.term.ptr(s), self.seed.ptr(s),
             self.level_start.len().saturating_sub(1) as u64,
             self.nterm as u64,
+            self.nvals as u64,
         ]
     }
 }
@@ -863,7 +926,11 @@ impl Card {
     /// the game rules, so it turns the sampled leaves into decision nodes and
     /// describes them. Everything the description feeds stays here.
     fn tree(&self, calls: &[Call], mine: &[usize]) -> Res<()> {
+        if mine.is_empty() {
+            return Ok(());
+        }
         let mut g = self.solves.lock();
+        let mut pack = Pack::default();
         for &i in mine {
             let Call::Tree {
                 solve, contract, from, fresh, ncells, nreach, nvals,
@@ -876,36 +943,53 @@ impl Card {
             if *fresh {
                 // Regrets, visits and the strategy sum accumulate over a
                 // solve, so the next solve to take this slot must not inherit
-                // them. The rest is written before it is read.
+                // them. Everything else is written before it is read.
                 b.regret.clear(s)?;
                 b.sum.clear(s)?;
                 b.visits.clear(s)?;
                 b.qval.clear(s)?;
             }
-            b.tree.extend(s, contract, *from, *fresh)?;
+            b.tree.extend(s, &mut pack, contract, *from, *fresh)?;
             b.level_start.clear();
             b.level_start.extend_from_slice(&contract.level_start);
             b.nterm = term.len();
-            b.leaf_node.put(s, 0, leaf_node)?;
-            b.term.put(s, 0, term)?;
+            pack.u32(&mut b.leaf_node, s, 0, leaf_node)?;
+            pack.u32(&mut b.term, s, 0, term)?;
             if !rootb.is_empty() {
-                b.rootb.put(s, 0, rootb)?;
+                pack.f32(&mut b.rootb, s, 0, rootb)?;
                 b.seed.put(s, 0, &[*seed])?;
             }
             // A node is given its cells when it is expanded, uniform over its
             // legal row, and until the policy head has spoken the prior is that
             // same uniform strategy.
-            b.cur.put(s, *ncells - cur.len(), cur)?;
-            b.prior.put(s, *prior_at, prior)?;
+            pack.f32(&mut b.cur, s, *ncells - cur.len(), cur)?;
+            pack.f32(&mut b.prior, s, *prior_at, prior)?;
             b.regret.fit(s, *ncells)?;
             b.sum.fit(s, *ncells)?;
             b.qval.fit(s, *ncells)?;
             b.visits.fit(s, *ncells)?;
             b.avg.fit(s, *ncells)?;
             b.reach.fit(s, *nreach)?;
-            b.vals.fit(s, *nvals)?;
+            b.nvals = *nvals;
+            b.vals.fit(s, 2 * *nvals)?;
         }
-        Ok(())
+        drop(g);
+        self.scatter(pack)
+    }
+
+    /// Send a round's writes: one buffer up, one kernel to place the pieces.
+    fn scatter(&self, mut pack: Pack) -> Res<()> {
+        let total = pack.blob.len();
+        if total == 0 {
+            return Ok(());
+        }
+        pack.start.push(total as u32);
+        let blob = self.up(&pack.blob)?;
+        let dst = self.up(&pack.dst)?;
+        let at = self.up(&pack.at)?;
+        let start = self.up(&pack.start)?;
+        let (pieces, total_i) = (pack.dst.len() as i32, total as i32);
+        launch!(self, scatter, total, &blob, &dst, &at, &start, &pieces, &total_i)
     }
 
     /// One CFR iteration and one expansion phase, for every solve in the round.
@@ -973,14 +1057,12 @@ impl Card {
         let (predict, puct, expand) = (*predict, *puct, *expand);
 
         self.reaches(&trees, &wide, parts, 0, false).map_err(at("reach"))?;
-        let (mut w, mut oppmass) = (self.alloc(cells as usize)?, self.alloc(rows)?);
-        for traverser in 0..2usize {
-            self.network(&trees, &part_d, &local_d, &base_d, &coff_d,
-                         &mut w, &mut oppmass, rows, traverser).map_err(at("net"))?;
-            self.terminals(&trees, nterm, parts, traverser).map_err(at("terminals"))?;
-            self.backprop(&trees, &wide, parts, traverser, 0, (da, db, dg, predict))
-                .map_err(at("backprop"))?;
-        }
+        let (mut w, mut mass) = (self.alloc(cells as usize)?, self.alloc(2 * rows)?);
+        self.network(&trees, &part_d, &local_d, &base_d, &coff_d, &mut w, &mut mass, rows)
+            .map_err(at("net"))?;
+        self.terminals(&trees, nterm, parts).map_err(at("terminals"))?;
+        self.backprop(&trees, &wide, parts, 0, (da, db, dg, predict))
+            .map_err(at("backprop"))?;
         // The regret update moved both players' strategies, so the reaches the
         // next iteration reads are stale until they are pushed down again --
         // and the average strategy is accumulated against those fresh ones.
@@ -1017,7 +1099,7 @@ impl Card {
             return Ok(());
         }
         for &i in mine {
-            let Call::Read { solve, touched, vals_at, policy_at, reach_at } = &calls[i] else {
+            let Call::Read { solve, touched, finish, vals_at, policy_at, reach_at } = &calls[i] else {
                 unreachable!("read shard holds only read calls")
             };
             let (desc, wide, rows, cells, coff, nterm) = {
@@ -1035,22 +1117,22 @@ impl Card {
             let part_d = self.up(&vec![0i32; rows])?;
             let local_d = self.up(&(0..rows as i32).collect::<Vec<i32>>())?;
             let base_d = self.up(&[0i32])?;
-            let touched = (touched[0] as i32) | ((touched[1] as i32) << 1);
-            self.finish(&trees, &wide, 1, touched)?;
-            self.reaches(&trees, &wide, 1, 1, false)?;
-            let (mut w, mut oppmass) = (self.alloc(cells)?, self.alloc(rows)?);
+            if *finish {
+                let touched = (touched[0] as i32) | ((touched[1] as i32) << 1);
+                self.finish(&trees, &wide, 1, touched)?;
+            }
             let mut root = Vec::new();
-            for traverser in 0..2usize {
-                self.network(&trees, &part_d, &local_d, &base_d, &coff_d,
-                             &mut w, &mut oppmass, rows, traverser)?;
-                self.terminals(&trees, nterm, 1, traverser)?;
-                self.backprop(&trees, &wide, 1, traverser, 1, (0.0, 0.0, 0.0, 0.0))?;
-                // Backpropagating for the second player overwrites the first's
-                // values, so the root's row is taken before the next pass runs.
+            if vals_at[0].1 > 0 || vals_at[1].1 > 0 {
+                self.reaches(&trees, &wide, 1, 1, false)?;
+                let (mut w, mut mass) = (self.alloc(cells)?, self.alloc(2 * rows)?);
+                self.network(&trees, &part_d, &local_d, &base_d, &coff_d, &mut w, &mut mass, rows)?;
+                self.terminals(&trees, nterm, 1)?;
+                self.backprop(&trees, &wide, 1, 1, (0.0, 0.0, 0.0, 0.0))?;
                 let g = self.solves.lock();
                 let s = &g[*solve];
-                let (at, n) = vals_at[traverser];
-                root.extend(self.slice(&s.vals, at as usize, n as usize)?);
+                for &(at, n) in vals_at {
+                    root.extend(self.slice(&s.vals, at as usize, n as usize)?);
+                }
             }
             let g = self.solves.lock();
             let s = &g[*solve];
@@ -1099,6 +1181,7 @@ impl Card {
                 })
         }
         .map_err(err)?;
+        let sum = also_avg as i32;
         for level in 1..wide.len() {
             if wide[level] == 0 {
                 continue;
@@ -1107,25 +1190,22 @@ impl Card {
             unsafe {
                 self.stream
                     .launch_builder(&self.k.reach_sweep)
-                    .arg(trees).arg(&level_i).arg(&avg)
+                    .arg(trees).arg(&level_i).arg(&avg).arg(&sum)
                     .launch_unit(Self::grid(wide[level], parts))
             }
             .map_err(err)?;
         }
-        if also_avg {
-            for level in 0..wide.len() {
-                if wide[level] == 0 {
-                    continue;
-                }
-                let level_i = level as i32;
-                unsafe {
-                    self.stream
-                        .launch_builder(&self.k.avg_block)
-                        .arg(trees).arg(&level_i)
-                        .launch_unit(Self::grid(wide[level], parts))
-                }
-                .map_err(err)?;
+        // The root's own row. It is not a child of anything, so the sweep never
+        // reaches it and its share of the sum is a launch of its own.
+        if also_avg && !wide.is_empty() {
+            let level_i = 0i32;
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.avg_block)
+                    .arg(trees).arg(&level_i)
+                    .launch_unit(Self::grid(wide[0], parts))
             }
+            .map_err(err)?;
         }
         Ok(())
     }
@@ -1138,31 +1218,35 @@ impl Card {
         trees: &CudaSlice<u64>,
         wide: &[u32],
         parts: u32,
-        traverser: usize,
         avg: i32,
         f: (f32, f32, f32, f32),
     ) -> Res<()> {
-        let (tr, (da, db, dg, predict)) = (traverser as i32, f);
+        let (da, db, dg, predict) = f;
         for level in (0..wide.len()).rev() {
             if wide[level] == 0 {
                 continue;
             }
             let level_i = level as i32;
+            let mut cfg = Self::grid(wide[level], parts);
+            cfg.grid_dim.2 = 2;
             unsafe {
                 self.stream
                     .launch_builder(&self.k.backprop_sweep)
-                    .arg(trees).arg(&level_i).arg(&tr).arg(&avg)
+                    .arg(trees).arg(&level_i).arg(&avg)
                     .arg(&da).arg(&db).arg(&dg).arg(&predict)
-                    .launch_unit(Self::grid(wide[level], parts))
+                    .launch_unit(cfg)
             }
             .map_err(err)?;
         }
         Ok(())
     }
 
-    /// The network at every leaf of the round, for one traverser: normalise the
-    /// beliefs, pool them, run the join, read the values out into each solve's
-    /// own value arena. Nothing here touches the host.
+    /// The network at every leaf of the round, for both traversers at once.
+    ///
+    /// Normalise the beliefs, pool them, run the join, read the values out into
+    /// each solve's own value arena. The beliefs and the pooling do not depend
+    /// on which seat is asking, so they run once; the join and the readout do,
+    /// and run over a batch of twice the rows rather than twice.
     #[allow(clippy::too_many_arguments)]
     fn network(
         &self,
@@ -1172,30 +1256,31 @@ impl Card {
         base_d: &CudaSlice<i32>,
         coff_d: &CudaSlice<u32>,
         w: &mut CudaSlice<f32>,
-        oppmass: &mut CudaSlice<f32>,
-        rows: usize,
-        traverser: usize,
+        mass: &mut CudaSlice<f32>,
+        stride: usize,
     ) -> Res<()> {
-        if rows == 0 {
+        if stride == 0 {
             return Ok(());
         }
         let l = &self.layout;
-        let (rows_i, pool_i, d_i) = (rows as i32, POOL as i32, D as i32);
-        let (queries, tr) = (2 * rows, traverser as i32);
+        let rows = 2 * stride;
+        let (rows_i, stride_i) = (rows as i32, stride as i32);
+        let (pool_i, d_i, jw_i) = (POOL as i32, D as i32, JW as i32);
 
         unsafe {
             self.stream
                 .launch_builder(&self.k.beliefs)
                 .arg(trees).arg(part_d).arg(local_d).arg(coff_d)
-                .arg(&tr).arg(&mut *w).arg(&mut *oppmass).arg(&rows_i)
+                .arg(&mut *w).arg(&mut *mass).arg(&stride_i)
                 .launch_unit(LaunchConfig {
-                    grid_dim: (rows as u32, 2, 1),
+                    grid_dim: (stride as u32, 2, 1),
                     block_dim: (32, 1, 1),
                     shared_mem_bytes: 0,
                 })
         }
         .map_err(err)?;
 
+        let queries = 2 * stride;
         let mut pooled = self.alloc(queries * POOL)?;
         let queries_i = queries as i32;
         unsafe {
@@ -1214,13 +1299,12 @@ impl Card {
         // The board vectors and the join cache, gathered out of the solves.
         let mut p = self.alloc(rows * D)?;
         let mut jp = self.alloc(rows * JW)?;
-        let (jw_i, zero, one) = (JW as i32, 0i32, 1i32);
-        launch!(self, gather, rows * D, trees, part_d, local_d, &zero, &mut p, &rows_i, &d_i)?;
-        launch!(self, gather, rows * JW, trees, part_d, local_d, &one, &mut jp, &rows_i, &jw_i)?;
+        let (zero, one) = (0i32, 1i32);
+        launch!(self, gather, rows * D, trees, part_d, local_d, &zero, &mut p, &rows_i, &d_i, &stride_i)?;
+        launch!(self, gather, rows * JW, trees, part_d, local_d, &one, &mut jp, &rows_i, &jw_i, &stride_i)?;
 
         let mut input = self.alloc(rows * JOIN_IN)?;
-        let seat = self.up(&vec![tr; rows])?;
-        launch!(self, join_input, rows * JOIN_IN, &pooled, &seat, &mut input, &rows_i, &pool_i)?;
+        launch!(self, join_input, rows * JOIN_IN, &pooled, &mut input, &rows_i, &pool_i, &stride_i)?;
         let mut z = self.alloc(rows * JW)?;
         self.stream.memcpy_dtod(&jp.slice(0..rows * JW), &mut z).map_err(err)?;
         self.lin(l.join_b, &input, rows, 1.0, &mut z)?;
@@ -1245,7 +1329,7 @@ impl Card {
             self.stream
                 .launch_builder(&self.k.readout)
                 .arg(trees).arg(part_d).arg(local_d).arg(coff_d)
-                .arg(&h).arg(&bias).arg(&*oppmass).arg(&tr).arg(&rows_i).arg(&d_i)
+                .arg(&h).arg(&bias).arg(&*mass).arg(&rows_i).arg(&stride_i).arg(&d_i)
                 .launch_unit(LaunchConfig {
                     grid_dim: (rows as u32, 1, 1),
                     block_dim: (32, 8, 1),
@@ -1256,18 +1340,16 @@ impl Card {
     }
 
     /// Terminal leaves, scored from the game rather than from the network.
-    fn terminals(&self, trees: &CudaSlice<u64>, most: usize, parts: u32, traverser: usize)
-        -> Res<()> {
+    fn terminals(&self, trees: &CudaSlice<u64>, most: usize, parts: u32) -> Res<()> {
         if most == 0 {
             return Ok(());
         }
-        let tr = traverser as i32;
         unsafe {
             self.stream
                 .launch_builder(&self.k.terminals)
-                .arg(trees).arg(&tr)
+                .arg(trees)
                 .launch_unit(LaunchConfig {
-                    grid_dim: (most.div_ceil(8) as u32, parts, 1),
+                    grid_dim: (most.div_ceil(8) as u32, parts, 2),
                     block_dim: (32, 8, 1),
                     shared_mem_bytes: 0,
                 })
@@ -1288,7 +1370,7 @@ impl Card {
                 .launch_builder(&self.k.expand)
                 .arg(trees).arg(&mut out).arg(&parts_i).arg(&sims_i).arg(&puct)
                 .launch_unit(LaunchConfig {
-                    grid_dim: (parts.div_ceil(32).max(1), 1, 1),
+                    grid_dim: (parts.max(1), 1, 1),
                     block_dim: (32, 1, 1),
                     shared_mem_bytes: 0,
                 })
@@ -1364,10 +1446,10 @@ struct Tree {
 impl Tree {
     /// Bring the description up to date with `c`. `from` is the first node
     /// whose row may have changed — the earliest leaf this growth expanded.
-    fn extend(&mut self, s: &Arc<CudaStream>, c: &crate::contract::Contract, from: usize,
-              fresh: bool) -> Res<()> {
+    fn extend(&mut self, s: &Arc<CudaStream>, p: &mut Pack, c: &crate::contract::Contract,
+              from: usize, fresh: bool) -> Res<()> {
         if fresh {
-            // The slot held another solve until a moment ago. `append` sends
+            // The slot held another solve until a moment ago. `tail` sends
             // whatever a pool has grown by, so a pool that starts shorter than
             // the last solve's would send nothing at all and the card would go
             // on reading the tree before it.
@@ -1378,41 +1460,41 @@ impl Tree {
             self.draw_p.len = 0;
         }
         let wide: Vec<u32> = c.kind[from..].iter().map(|&x| x as u32).collect();
-        self.kind.put(s, from, &wide)?;
+        p.u32(&mut self.kind, s, from, &wide)?;
         let wide: Vec<u32> = c.player[from..].iter().map(|&x| x as u32).collect();
-        self.player.put(s, from, &wide)?;
+        p.u32(&mut self.player, s, from, &wide)?;
         let wide: Vec<u32> = c.nc[from..].iter().flatten().copied().collect();
-        self.nc.put(s, 2 * from, &wide)?;
-        self.parent.put(s, from, &c.parent[from..])?;
-        self.roff.put(s, from, &c.roff[from..])?;
-        self.voff.put(s, from, &c.voff[from..])?;
-        self.soff.put(s, from, &c.soff[from..])?;
-        self.util.put(s, from, &c.util[from..])?;
-        self.child_at.put(s, from, &c.child_at[from..])?;
-        self.child_n.put(s, from, &c.child_n[from..])?;
-        self.legal_base.put(s, from, &c.legal_base[from..])?;
-        self.rev_base.put(s, from, &c.rev_base[from..])?;
-        self.rvd_base.put(s, from, &c.rvd_base[from..])?;
-        self.draw_base.put(s, from, &c.draw_base[from..])?;
+        p.u32(&mut self.nc, s, 2 * from, &wide)?;
+        p.u32(&mut self.parent, s, from, &c.parent[from..])?;
+        p.u32(&mut self.roff, s, from, &c.roff[from..])?;
+        p.u32(&mut self.voff, s, from, &c.voff[from..])?;
+        p.u32(&mut self.soff, s, from, &c.soff[from..])?;
+        p.f32(&mut self.util, s, from, &c.util[from..])?;
+        p.u32(&mut self.child_at, s, from, &c.child_at[from..])?;
+        p.u32(&mut self.child_n, s, from, &c.child_n[from..])?;
+        p.u32(&mut self.legal_base, s, from, &c.legal_base[from..])?;
+        p.u32(&mut self.rev_base, s, from, &c.rev_base[from..])?;
+        p.u32(&mut self.rvd_base, s, from, &c.rvd_base[from..])?;
+        p.u32(&mut self.draw_base, s, from, &c.draw_base[from..])?;
         // The pools only ever grow, so their tail is the whole of the update.
-        self.child.append(s, &c.child)?;
-        self.legal_off.append(s, &c.legal_off)?;
-        self.legal_child.append(s, &c.legal_child)?;
-        self.legal_trans.append(s, &c.legal_trans)?;
-        self.cell_row.append(s, &c.cell_row)?;
-        self.rev_start.append(s, &c.rev_start)?;
-        self.rev_src.append(s, &c.rev_src)?;
-        self.rev_cell.append(s, &c.rev_cell)?;
-        self.rvd_start.append(s, &c.rvd_start)?;
-        self.rvd_src.append(s, &c.rvd_src)?;
-        self.rvd_p.append(s, &c.rvd_p)?;
-        self.draw_start.append(s, &c.draw_start)?;
-        self.draw_to.append(s, &c.draw_to)?;
-        self.draw_p.append(s, &c.draw_p)?;
+        p.tail(&mut self.child, s, &c.child)?;
+        p.tail(&mut self.legal_off, s, &c.legal_off)?;
+        p.tail(&mut self.legal_child, s, &c.legal_child)?;
+        p.tail(&mut self.legal_trans, s, &c.legal_trans)?;
+        p.tail(&mut self.cell_row, s, &c.cell_row)?;
+        p.tail(&mut self.rev_start, s, &c.rev_start)?;
+        p.tail(&mut self.rev_src, s, &c.rev_src)?;
+        p.tail(&mut self.rev_cell, s, &c.rev_cell)?;
+        p.tail(&mut self.rvd_start, s, &c.rvd_start)?;
+        p.tail(&mut self.rvd_src, s, &c.rvd_src)?;
+        p.tail_f32(&mut self.rvd_p, s, &c.rvd_p)?;
+        p.tail(&mut self.draw_start, s, &c.draw_start)?;
+        p.tail(&mut self.draw_to, s, &c.draw_to)?;
+        p.tail_f32(&mut self.draw_p, s, &c.draw_p)?;
         // Levels are recomputed whenever the tree grows, so they travel whole.
         // It is two entries a node between them.
-        self.level_start.put(s, 0, &c.level_start)?;
-        self.level_node.put(s, 0, &c.level_node)?;
+        p.u32(&mut self.level_start, s, 0, &c.level_start)?;
+        p.u32(&mut self.level_node, s, 0, &c.level_node)?;
         Ok(())
     }
 

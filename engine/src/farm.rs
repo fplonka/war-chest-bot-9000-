@@ -117,10 +117,17 @@ pub enum Call {
     Read {
         solve: usize,
         touched: [bool; 2],
+        /// Materialise the reference strategy first. A solve does this once,
+        /// as its last act; a harvest that follows reads what it left.
+        finish: bool,
         /// Slices of the device arenas the host wants back: the root's value
         /// row per player, the root's strategy cells, and the reach at each
         /// leaf the caller sampled. The host knows every offset from its own
         /// copy of the tree, so nothing here has to be looked up on the card.
+        ///
+        /// An empty value row means the caller wants no values, and the value
+        /// pass under the reference strategy does not run. Every solve reads
+        /// its root policy; only a solve that is collected reads targets.
         vals_at: [(u32, u32); 2],
         policy_at: (u32, u32),
         reach_at: Vec<(u32, u32)>,
