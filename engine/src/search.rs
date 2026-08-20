@@ -2033,6 +2033,14 @@ impl<'a> Solver<'a> {
             // there is put back to zero below. Every other node accumulates.
             let br = mode == Back::BestResponse && me == traverser;
             self.vals[vbase..vbase + nc].fill(if br { f32::NEG_INFINITY } else { 0.0 });
+            if mode == Back::Regret && me == traverser {
+                // A cell whose action has no successor information state is
+                // never visited by the pass that fills these, and must read
+                // zero when the regret pass gets to it.
+                let so = self.soff[i] as usize;
+                let cells = self.nodes[i].legal_action.len();
+                self.qval[so..so + cells].fill(0.0);
+            }
             if me == traverser {
                 let n = &self.nodes[i];
                 let so = self.soff[i] as usize;
@@ -2055,7 +2063,16 @@ impl<'a> Solver<'a> {
                         let c = n.cell_row[cell] as usize;
                         let av = cv[t as usize];
                         match mode {
-                            Back::Regret => vi[c] += av * self.cur[so + cell],
+                            Back::Regret => {
+                                // Kept, not re-gathered. The regret pass below
+                                // needs this same number, and finding it again
+                                // means another random hop into a child's value
+                                // row -- the cache-hostile part of the sweep,
+                                // paid twice per cell for nothing. The
+                                // expansion phase reads it as PUCT's Q.
+                                self.qval[so + cell] = av;
+                                vi[c] += av * self.cur[so + cell];
+                            }
                             Back::Value => vi[c] += av * strat[so + cell],
                             Back::BestResponse => vi[c] = vi[c].max(av),
                         }
@@ -2074,18 +2091,12 @@ impl<'a> Solver<'a> {
                                 // Starting at +0 and adding preserves the old
                                 // `inst[cell] += av` FP32 operation exactly,
                                 // including an explicit no-successor cell.
-                                let mut delta = 0.0f32;
-                                let t = n.legal_trans[cell];
-                                if t != NO_TRANS {
-                                    let ch = n.legal_child[cell] as usize;
-                                    let cv = self.voff[ch] as usize - self.voff[i + 1] as usize;
-                                    delta += hi[cv + t as usize];
-                                }
-                                // The action value itself, which the expansion
-                                // phase reads as PUCT's Q. It is formed here
-                                // either way; only keeping it is new.
-                                self.qval[so + cell] = delta;
-                                delta -= base;
+                                // The action value the pass above kept. A cell
+                                // with no successor was skipped there and
+                                // still reads the zero this node's cells were
+                                // cleared to, which is what re-forming it from
+                                // +0 used to produce.
+                                let delta = self.qval[so + cell] - base;
                                 let at = so + cell;
                                 let old = self.regret[at];
                                 let r = old * if old > 0.0 { da } else { db } + delta;
