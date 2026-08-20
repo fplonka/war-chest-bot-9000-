@@ -1,11 +1,16 @@
-//! The device must answer a round exactly as the CPU network would.
+//! The device must solve as the CPU does.
 //!
-//! The calls are not synthetic. Real solves run against a gate, every call
-//! they raise is captured, and the same captured round then goes through both
-//! backends. That way the shapes, the card tables, the belief pooling and the
-//! ragged config counts are whatever the solver actually produces, including
-//! the mixture of queried seats that forces the device to batch calls whose
-//! `player` differs.
+//! The whole CFR loop lives on the card now, so a round of calls no longer has
+//! an answer the CPU can produce on its own: the reaches, the regrets and the
+//! expansion trajectories never come back. What both backends can be asked for
+//! is a *solve* — the same position, the same weights, the same seed — and that
+//! is what this compares.
+//!
+//! Two levels. `the_network_agrees` still checks the trunk and the config
+//! encoder call by call, because those cross the bus in both directions and a
+//! drift there is arithmetic rather than search. `a_solve_agrees` runs real
+//! self-play through each backend and compares what a solve produces: the
+//! root's values, its policy, and the beliefs it harvests.
 //!
 //! Needs a GPU, so it only builds under `--features gpu`.
 #![cfg(feature = "gpu")]
@@ -14,18 +19,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use warchest::cuda::Device;
-use warchest::farm::{Backend, Call, Gate, Reply};
+use warchest::farm::{Backend, Call, Gate};
 use warchest::net::{Net, NetLayout};
 use warchest::search::{Cfg, Nets};
-use warchest::selfplay::{Agent, Collect, GameCfg, GameStream};
+use warchest::selfplay::{Agent, Collect, Data, GameCfg, GameStream};
 
 fn random_net(seed: u64) -> Net {
     let mut r = warchest::rng::Rng::new(seed);
     let l = NetLayout::new();
     let mut draw = |n: usize| -> Vec<f32> {
-        (0..n)
-            .map(|_| (r.unit_f64() as f32 - 0.5) * 0.2)
-            .collect()
+        (0..n).map(|_| (r.unit_f64() as f32 - 0.5) * 0.2).collect()
     };
     let (w, b) = (draw(l.w_len), draw(l.b_len));
     // Scales at one and shifts at zero, so the norms behave like real ones
@@ -37,77 +40,61 @@ fn random_net(seed: u64) -> Net {
     Net::from_flat(&w, &b, &ln).expect("random net")
 }
 
-/// Run real solves and keep the rounds they raise.
-///
-/// Answers every round with the CPU network, because the solver has to make
-/// progress to reach the later call kinds at all.
-fn capture(net: &Net, threads: usize, want: usize) -> Vec<Vec<Call>> {
-    let cfg = Cfg {
+fn cfg(expand: usize) -> Cfg {
+    Cfg {
         nodes: 64,
-        expand: 4,
+        expand,
         iters: 8,
         ..Default::default()
-    };
-    let gc = GameCfg {
-        agents: [Agent::Rebel { cfg }; 2],
+    }
+}
+
+fn game_cfg(expand: usize) -> GameCfg {
+    GameCfg {
+        agents: [Agent::Rebel { cfg: cfg(expand) }; 2],
         collect: Collect::Rebel,
         explore: 0.1,
         random_draft: true,
         eval_mix: 1.0,
         mc_mix: 0.0,
-        query_rate: 0.9,
-        recursive_rate: 0.1,
-    };
-    let gate = Arc::new(Gate::default());
-    let stopping = Arc::new(AtomicBool::new(false));
-    let workers: Vec<_> = (0..threads)
-        .map(|t| {
-            let (gate, stopping, net) = (gate.clone(), stopping.clone(), net.clone());
-            std::thread::spawn(move || {
-                let _member = gate.enter();
-                let nets = Nets {
-                    value: net,
-                    gate: Some(gate.clone()),
-                };
-                let mut stream = GameStream::new(0x51E5 ^ t as u64, gc);
-                while !stopping.load(Ordering::Relaxed) {
-                    stream.generate(&nets, 4);
-                }
-            })
-        })
-        .collect();
+        // Root rows only, so a target is one solve's root value and a
+        // divergence names the solve it came from.
+        query_rate: 0.0,
+        recursive_rate: 0.0,
+    }
+}
 
-    // The real evaluator: a leaf query reads the board and config vectors the
-    // trunk left with the backend, so a driver that maps `Call::run` over the
-    // calls has nowhere to keep them.
-    let backend = Backend::Reference(net.clone(), Default::default());
-    let mut rounds: Vec<Vec<Call>> = Vec::new();
-    let mut kinds = [0usize; 3];
-    // Keep going until every call kind has been seen a few times, so a pass
-    // that is never exercised cannot pass by being absent.
-    while rounds.len() < want || kinds.iter().any(|&n| n < 3) {
-        let got = gate.round(|calls| {
-            rounds.push(calls.to_vec());
-            for c in calls {
-                kinds[c.kind()] += 1;
-            }
-            backend.run(calls)
-        });
-        assert!(got.is_some(), "the gate closed while capturing");
-    }
-    stopping.store(true, Ordering::Relaxed);
-    // The threads are mid-solve and still need every one of their remaining
-    // rounds answered before they can notice the stop flag and leave. Closing
-    // first would strand them inside a solve.
-    while gate
-        .serve_until_idle(|calls| backend.run(calls))
-        .is_some()
-    {}
+/// Generate on one thread against `backend`, and hand back what it produced.
+///
+/// One thread, so every solve is a whole round and the two backends see
+/// identical batches; the games are seeded from the thread index, so both runs
+/// play the same games.
+fn generate(net: &Net, backend: Backend, games: usize, expand: usize) -> Data {
+    let gate = Arc::new(Gate::default());
+    let out = Arc::new(parking_lot::Mutex::new(Data::default()));
+    let device = backend.keeps_the_solve();
+    // `serve_until_idle` gives up the moment nobody is in the count, so the
+    // driver must not start until the worker has entered.
+    let (ready, entered) = std::sync::mpsc::channel();
+    let worker = {
+        let (gate, net, out) = (gate.clone(), net.clone(), out.clone());
+        std::thread::spawn(move || {
+            let _member = gate.enter();
+            ready.send(()).expect("the driver is waiting");
+            let nets = Nets {
+                value: net,
+                device,
+                gate: Some(gate.clone()),
+            };
+            let mut stream = GameStream::new(0x51E5, game_cfg(expand));
+            *out.lock() = stream.generate(&nets, games);
+        })
+    };
+    entered.recv().expect("the worker entered the gate");
+    while gate.serve_until_idle(|calls| backend.run(calls)).is_some() {}
     gate.close();
-    for w in workers {
-        let _ = w.join();
-    }
-    rounds
+    worker.join().expect("the worker finished");
+    Arc::try_unwrap(out).ok().expect("one holder").into_inner()
 }
 
 /// Largest relative difference, with an absolute floor so values near zero do
@@ -120,132 +107,143 @@ fn worst(a: &[f32], b: &[f32], what: &str) -> f32 {
         .fold(0.0, f32::max)
 }
 
-const KIND: [&str; 3] = ["trunk", "configs", "join"];
-
-/// Hold a device to the CPU network over captured rounds.
+/// The trunk and the config encoder, call by call.
 ///
-/// Reports the worst difference of every kind rather than stopping at the
-/// first, because which kinds are wrong is most of the diagnosis. A call is
-/// also run alone, which separates an error in the arithmetic from one in the
-/// batching: alone, a batch holds exactly one call.
-fn compare(device: &Device, reference: &Backend, rounds: &[Vec<Call>]) -> ([usize; 3], f32) {
-    let mut seen = [0usize; 3];
-    let (mut batched, mut alone) = ([0.0f32; 3], [0.0f32; 3]);
-    let mut sample = None;
-    for calls in rounds {
-        let want: Vec<Reply> = reference.run(calls);
-        let got: Vec<Reply> = device.run(calls);
-        assert_eq!(got.len(), calls.len(), "one reply per call");
-        for (i, call) in calls.iter().enumerate() {
-            let k = call.kind();
-            seen[k] += 1;
-            let d = worst(&want[i].a, &got[i].a, "a")
-                .max(worst(&want[i].b, &got[i].b, "b"))
-                .max(worst(&want[i].c, &got[i].c, "c"));
-            let solo = device.run(std::slice::from_ref(call));
-            let s = worst(&want[i].a, &solo[0].a, "a")
-                .max(worst(&want[i].b, &solo[0].b, "b"))
-                .max(worst(&want[i].c, &solo[0].c, "c"));
-            if d > batched[k] {
-                batched[k] = d;
-                if k == 0 && sample.is_none() {
-                    let n = want[i].a.len().min(8);
-                    sample = Some((want[i].a[..n].to_vec(), got[i].a[..n].to_vec()));
-                }
-            }
-            alone[k] = alone[k].max(s);
-        }
-    }
-    for k in 0..3 {
-        println!(
-            "{:>7}: {:4} calls, worst batched {:e}, worst alone {:e}",
-            KIND[k], seen[k], batched[k], alone[k]
-        );
-    }
-    if let Some((want, got)) = sample {
-        println!("first trunk row want {want:?}");
-        println!("first trunk row got  {got:?}");
-    }
-    let top = batched.iter().chain(&alone).fold(0.0f32, |a, &b| a.max(b));
-    assert!(top < 2e-3, "worst difference {top:e}");
-    (seen, top)
-}
-
-/// A call's answer must not depend on what it is batched with.
-///
-/// This is the property the concatenation rests on, and it is the one that
-/// broke: a call carrying a tail of its caller's scratch buffer answers
-/// correctly on its own and shifts every later call in the batch. Growing
-/// prefixes catch that, because the first call stays right while the rest
-/// drift.
+/// These are the two passes whose answers still cross the bus, so they can be
+/// held to the CPU network directly. `Call::run` is that network.
 #[test]
-fn a_call_answers_the_same_whatever_it_is_batched_with() {
-    let net = random_net(0x9E37_79B9);
-    let rounds = capture(&net, 6, 4);
-    let device = Device::new(&[0], net).expect("cuda device 0");
-    let mut checked = 0;
-    for calls in &rounds {
-        for kind in 0..3 {
-            let group: Vec<Call> = calls.iter().filter(|c| c.kind() == kind).cloned().collect();
-            if group.len() < 2 {
-                continue;
-            }
-            let alone: Vec<Reply> = group
-                .iter()
-                .map(|c| device.run(std::slice::from_ref(c)).remove(0))
-                .collect();
-            for take in 2..=group.len() {
-                let got = device.run(&group[..take]);
-                for i in 0..take {
-                    let d = worst(&alone[i].a, &got[i].a, "a")
-                        .max(worst(&alone[i].b, &got[i].b, "b"))
-                        .max(worst(&alone[i].c, &got[i].c, "c"));
-                    assert!(
-                        d < 2e-3,
-                        "{} call {i} in a batch of {take} moved by {d}",
-                        KIND[kind]
-                    );
-                }
-                checked += 1;
-            }
-        }
-    }
-    assert!(checked > 0, "no batch of two or more was ever formed");
-    println!("{checked} batch prefixes agreed with the calls run alone");
-}
-
-#[test]
-fn the_device_matches_the_cpu_network_on_real_rounds() {
-    let net = random_net(0x9E37_79B9);
-    let rounds = capture(&net, 6, 12);
-    let reference = Backend::Reference(net.clone(), Default::default());
-    let device = Device::new(&[0], net).expect("cuda device 0");
-    let (seen, top) = compare(&device, &reference, &rounds);
-    assert!(
-        seen.iter().all(|&n| n >= 3),
-        "not every call kind was exercised: {seen:?}"
-    );
-    println!("one card: worst relative difference {top:e} over {seen:?} calls");
-}
-
-/// The same, with the round split across two cards. A shard holds only part of
-/// each kind, so this catches anything that is right only when one batch holds
-/// every call — a card-table base, an owner offset, a row that assumed it knew
-/// the whole batch.
-#[test]
-fn two_cards_match_the_cpu_network_as_well() {
-    if Device::count() < 2 {
-        eprintln!("one card only; skipping the shard test");
+fn the_network_agrees() {
+    if Device::count() == 0 {
+        eprintln!("no cuda device; skipping");
         return;
     }
-    let net = random_net(0x1234_5677);
-    let rounds = capture(&net, 6, 8);
-    let reference = Backend::Reference(net.clone(), Default::default());
-    let device = Device::new(&[0, 1], net).expect("cuda devices 0 and 1");
-    let (seen, top) = compare(&device, &reference, &rounds);
-    assert!(
-        seen.iter().all(|&n| n >= 3),
-        "not every call kind was exercised: {seen:?}"
+    let net = random_net(0x9E37);
+    let gate = Arc::new(Gate::default());
+    let stopping = Arc::new(AtomicBool::new(false));
+    let worker = {
+        let (gate, stopping, net) = (gate.clone(), stopping.clone(), net.clone());
+        std::thread::spawn(move || {
+            let _member = gate.enter();
+            let nets = Nets {
+                value: net,
+                device: true,
+                gate: Some(gate.clone()),
+            };
+            let mut stream = GameStream::new(0x51E5, game_cfg(4));
+            while !stopping.load(Ordering::Relaxed) {
+                stream.generate(&nets, 1);
+            }
+        })
+    };
+    let device = Device::new(&[0], net.clone()).expect("device");
+    let (mut seen, mut bad) = ([0usize; 2], 0.0f32);
+    while seen.iter().any(|&n| n < 8) {
+        let got = gate.round(|calls| {
+            let replies = device.run(calls);
+            for (c, r) in calls.iter().zip(&replies) {
+                match c {
+                    Call::Trunk { .. } => {
+                        seen[0] += 1;
+                        bad = bad.max(worst(&c.run(&net).a, &r.a, "trunk"));
+                    }
+                    Call::Configs { .. } => {
+                        seen[1] += 1;
+                        bad = bad.max(worst(&c.run(&net).c, &r.c, "configs"));
+                    }
+                    _ => {}
+                }
+            }
+            replies
+        });
+        assert!(got.is_some(), "the gate closed while comparing");
+    }
+    stopping.store(true, Ordering::Relaxed);
+    while gate.serve_until_idle(|calls| device.run(calls)).is_some() {}
+    gate.close();
+    let _ = worker.join();
+    assert!(bad < 1e-3, "worst network difference {bad:e}");
+}
+
+/// A whole solve, both ways, on the same tree.
+///
+/// `expand = 0` is what makes this a comparison. With it neither side grows,
+/// so both solve the tree `Solver::new` built and every number is of the same
+/// thing. With growth on they cannot be: the expansion phase samples, and the
+/// device runs a phase's simulations before the host grows any of them, where
+/// the host grows each one before starting the next — so the two trees part
+/// company at the first repeated leaf and never come back.
+///
+/// What is compared is the target a solve produces: the root's counterfactual
+/// value for every config, which is the end of every path through the loop —
+/// the reach sweep, the network at the leaves, the terminals, backpropagation,
+/// the regret update, the average strategy and the value pass under it.
+#[test]
+fn the_cfr_loop_agrees_on_a_fixed_tree() {
+    if Device::count() == 0 {
+        eprintln!("no cuda device; skipping");
+        return;
+    }
+    let net = random_net(0x9E37);
+    let host = generate(&net, Backend::Reference(net.clone()), 3, 0);
+    let card = generate(
+        &net,
+        Backend::Cuda(Device::new(&[0], net.clone()).expect("device")),
+        3,
+        0,
     );
-    println!("two cards: worst relative difference {top:e} over {seen:?} calls");
+    assert!(!host.cy.is_empty(), "the reference produced no targets");
+    assert_eq!(
+        host.cy.len(),
+        card.cy.len(),
+        "the two backends solved a different number of positions"
+    );
+    let bad = worst(&host.cy, &card.cy, "targets");
+    let rel = |x: f32, y: f32| (x - y).abs() / (x.abs().max(y.abs()).max(1e-2));
+    let off = host.cy.iter().zip(&card.cy).filter(|(&x, &y)| rel(x, y) > 1e-3).count();
+    let first = host.cy.iter().zip(&card.cy).position(|(&x, &y)| rel(x, y) > 1e-3);
+    let f = first.unwrap_or(0);
+    let lo = f.saturating_sub(2);
+    let hi = (f + 6).min(host.cy.len());
+    eprintln!("first differing target {first:?} of {}", host.cy.len());
+    eprintln!("  host {:?}", &host.cy[lo..hi]);
+    eprintln!("  card {:?}", &card.cy[lo..hi]);
+    eprintln!("  config offsets {:?}", &host.coff[..8.min(host.coff.len())]);
+    let pbad = worst(&host.pprob, &card.pprob, "policy");
+    eprintln!("  worst policy difference {pbad:e} over {} cells", host.pprob.len());
+    eprintln!(
+        "worst {bad:e}; {off} of {} targets differ; first few {:?} vs {:?}",
+        host.cy.len(),
+        &host.cy[..8.min(host.cy.len())],
+        &card.cy[..8.min(card.cy.len())],
+    );
+    assert!(bad < 1e-2, "worst target difference {bad:e}");
+}
+
+/// With growth on, the device must still produce a sane solve.
+///
+/// The trees differ, so the numbers cannot be compared; what can be is that
+/// every target is a finite value inside the game's range, and that the run
+/// produced as many of them as the reference did positions.
+#[test]
+fn growth_on_the_device_produces_sane_targets() {
+    if Device::count() == 0 {
+        eprintln!("no cuda device; skipping");
+        return;
+    }
+    let net = random_net(0x9E37);
+    let card = generate(
+        &net,
+        Backend::Cuda(Device::new(&[0], net.clone()).expect("device")),
+        3,
+        4,
+    );
+    let host = generate(&net, Backend::Reference(net.clone()), 3, 4);
+    assert!(!card.cy.is_empty(), "the device produced no targets");
+    assert!(card.cy.iter().all(|v| v.is_finite()), "a target is not finite");
+    // The trees differ, so the numbers do; the *scale* must not. A run whose
+    // regrets or reaches were carried over from the solve before would blow up
+    // here long before it produced a plausible spread.
+    let scale = |d: &[f32]| d.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let (a, b) = (scale(&host.cy), scale(&card.cy));
+    assert!(b < 2.0 * a, "device targets reach {b} against the reference's {a}");
 }

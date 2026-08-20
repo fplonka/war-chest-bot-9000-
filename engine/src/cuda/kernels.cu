@@ -280,76 +280,6 @@ __global__ void k_join_input(const float* pooled, const int* player, float* out,
 // that solve's cells start in the round's `coff` and `w`, so a part-relative
 // belief index and a round-relative offset table can be read together.
 
-// Gather each solve's resident rows into the round's layout. `local_row` is the
-// row's index inside its own solve.
-__global__ void k_gather(const float* const* src, const int* part_of_row,
-                         const int* local_row, float* out, int rows, int width) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * width) return;
-    int r = i / width, j = i % width;
-    out[i] = src[part_of_row[r]][(size_t)local_row[r] * width + j];
-}
-
-// The belief block the join reads: `sum_c beta(c) g(c)` over one query's
-// support. `coff` bounds a query's cells, `cidx` names each cell's row in its
-// solve's `g`, and `w` is the normalised reach.
-//
-// This ran on the host, which meant `g` had to come back off the card and the
-// block had to go up again every iteration. One query per thread block, one
-// output channel per thread.
-__global__ void k_belief_pool(const float* const* gp, const unsigned int* const* cip,
-                              const int* part_of_row, const int* base_of_part,
-                              const unsigned int* coff, const float* w,
-                              float* out, int queries, int pool) {
-    int q = blockIdx.x;
-    if (q >= queries) return;
-    int part = part_of_row[q >> 1];
-    const float* g = gp[part];
-    const unsigned int* cidx = cip[part];
-    unsigned int base = base_of_part[part], lo = coff[q], hi = coff[q + 1];
-    for (int j = threadIdx.x; j < pool; j += blockDim.x) {
-        float acc = 0.0f;
-        for (unsigned int k = lo; k < hi; ++k)
-            acc += w[k] * g[(size_t)cidx[k - base] * pool + j];
-        out[(size_t)q * pool + j] = acc;
-    }
-}
-
-// `v(c) = (<f(c), h_row> + bias) * opp_reach[row]`, for every config of the
-// queried player at every row of the batch.
-//
-// One block per row, one config per warp, and the row's head vector staged in
-// shared memory so it is read once for the row rather than once for each of its
-// hundred-odd configs. A row's cells are the span its own query already names
-// in `coff`, so nothing here needs a list of cells: building one cost the host
-// twelve million pushes a round, which was three quarters of the whole pass.
-__global__ void k_readout(const float* const* fp, const unsigned int* const* cip,
-                          const int* part_of_row, const int* base_of_part,
-                          const float* h, const float* cf_bias,
-                          const unsigned int* coff, const unsigned int* vlo,
-                          const int* player, const float* opp,
-                          float* out, int rows, int d) {
-    extern __shared__ float hs[];
-    int r = blockIdx.x;
-    if (r >= rows) return;
-    for (int j = threadIdx.x + 32 * threadIdx.y; j < d; j += 32 * blockDim.y)
-        hs[j] = h[(size_t)r * d + j];
-    __syncthreads();
-    int part = part_of_row[r];
-    const float* f = fp[part];
-    const unsigned int* cidx = cip[part];
-    unsigned int base = base_of_part[part];
-    unsigned int q = 2 * r + player[r], lo = coff[q], hi = coff[q + 1];
-    float bias = *cf_bias, scale = opp[r];
-    unsigned int at = vlo[r];
-    for (unsigned int k = lo + threadIdx.y; k < hi; k += blockDim.y) {
-        const float* fr = f + (size_t)cidx[k - base] * d;
-        float acc = 0.0f;
-        for (int j = threadIdx.x; j < d; j += 32) acc += fr[j] * hs[j];
-        for (int s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xffffffff, acc, s);
-        if (threadIdx.x == 0) out[at + k - lo] = (acc + bias) * scale;
-    }
-}
 
 // ------------------------------------------------------------- the CFR loop
 //
@@ -406,11 +336,22 @@ struct Tree {
     float* qval;
     float* visits;
     float* prior;
+    float* avg;
     const float* rootb;
+    // The network state that outlives an iteration: board vectors, the join
+    // cache, the config readout and pooling rows, and the belief index.
+    const float* p;
+    const float* jp;
+    const float* f;
+    const float* g;
+    const unsigned int* cidx;
+    const unsigned int* coff;
     // Batch row -> node, for the leaves the network answers for.
     const unsigned int* leaf_node;
+    const unsigned int* term;
+    unsigned long long* seed;
     unsigned long long levels;
-    unsigned long long rows;
+    unsigned long long nterm;
 };
 
 #define NO_ROW 0xffffffffu
@@ -442,9 +383,12 @@ __global__ void k_seed_reach(const Tree* trees) {
         t.reach[t.roff[0] + c] = t.rootb[c];
 }
 
-// Reach probabilities for one level, both players.
-__global__ void k_reach_sweep(const Tree* trees, int level) {
+// Reach probabilities for one level, both players. `avg` picks the reference
+// strategy over the regret-matching iterate, which is what the value pass that
+// produces a solve's targets propagates under.
+__global__ void k_reach_sweep(const Tree* trees, int level, int avg) {
     const Tree& t = trees[blockIdx.y];
+    const float* strat = avg ? t.avg : t.cur;
     unsigned int node;
     if (!level_task(t, level, blockIdx.x, &node)) return;
     unsigned int par = t.parent[node];
@@ -465,7 +409,7 @@ __global__ void k_reach_sweep(const Tree* trees, int level) {
             if (rb != NO_ROW) {
                 unsigned int a = t.rev_start[rb + c], b = t.rev_start[rb + c + 1];
                 for (unsigned int k = a; k < b; ++k)
-                    v += t.reach[src + t.rev_src[k]] * t.cur[t.rev_cell[k]];
+                    v += t.reach[src + t.rev_src[k]] * strat[t.rev_cell[k]];
             } else {
                 unsigned int db = t.rvd_base[node];
                 if (db != NO_ROW) {
@@ -479,8 +423,10 @@ __global__ void k_reach_sweep(const Tree* trees, int level) {
     }
 }
 
-// Value backpropagation and the regret update for one level, one traverser.
-__global__ void k_backprop_sweep(const Tree* trees, int level, int traverser,
+// Value backpropagation for one level, one traverser. `avg` averages under the
+// reference strategy and leaves regrets alone -- the value pass a solve's
+// targets come from; otherwise this is the regret update itself.
+__global__ void k_backprop_sweep(const Tree* trees, int level, int traverser, int avg,
                                  float da, float db, float dg, float predict) {
     const float EPS = 1e-6f;
     const Tree& t = trees[blockIdx.y];
@@ -523,6 +469,19 @@ __global__ void k_backprop_sweep(const Tree* trees, int level, int traverser,
     }
 
     unsigned int so = t.soff[node], lb = t.legal_base[node];
+    if (avg) {
+        for (unsigned int c = threadIdx.x; c < n; c += blockDim.x) {
+            unsigned int a = t.legal_off[lb + c], b = t.legal_off[lb + c + 1];
+            float base = 0.0f;
+            for (unsigned int cell = a; cell < b; ++cell) {
+                if (t.legal_trans[so + cell] == NO_TRANS) continue;
+                float av = t.vals[t.voff[t.legal_child[so + cell]] + t.legal_trans[so + cell]];
+                base += av * t.avg[so + cell];
+            }
+            t.vals[vi + c] = base;
+        }
+        return;
+    }
     // The expansion phase reads these as PUCT's Q. A sweep that computes the
     // action values and drops them leaves selection blind, and the tree it
     // grows is a different tree -- which is a wrong answer no shape check
@@ -578,7 +537,7 @@ __global__ void k_avg_block(const Tree* trees, int level) {
 
 // Every leaf's normalised belief, and the opponent's reach mass there. One
 // block per (row, player); `w` and `oppmass` are what the network reads.
-__global__ void k_beliefs(const Tree* trees, const int* row_of_part, const int* part_of_row,
+__global__ void k_beliefs(const Tree* trees, const int* part_of_row,
                           const int* local_row, const unsigned int* coff, int traverser,
                           float* w, float* oppmass, int rows) {
     int r = blockIdx.x;
@@ -598,7 +557,71 @@ __global__ void k_beliefs(const Tree* trees, const int* row_of_part, const int* 
     for (unsigned int c = threadIdx.x; c < n; c += 32)
         w[lo + c] = acc > 0.0f ? t.reach[ra + c] * inv : inv;
     if (threadIdx.x == 0 && p == 1 - traverser) oppmass[r] = acc;
-    (void)row_of_part;
+}
+
+// Gather each solve's resident board vectors into the round's layout, so the
+// join is one chain of large GEMMs over every solve in flight.
+__global__ void k_gather(const Tree* trees, const int* part_of_row,
+                         const int* local_row, int which, float* out,
+                         int rows, int width) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * width) return;
+    int r = i / width, j = i % width;
+    const Tree& t = trees[part_of_row[r]];
+    const float* src = which == 0 ? t.p : t.jp;
+    out[i] = src[(size_t)local_row[r] * width + j];
+}
+
+// The belief block the join reads: `sum_c beta(c) g(c)` over one query's
+// support. `coff` bounds a query's cells in the round's `w`, `cidx` names each
+// cell's row in its own solve's `g`.
+__global__ void k_belief_pool(const Tree* trees, const int* part_of_row,
+                              const int* base_of_part, const unsigned int* coff,
+                              const float* w, float* out, int queries, int pool) {
+    int q = blockIdx.x;
+    if (q >= queries) return;
+    int part = part_of_row[q >> 1];
+    const Tree& t = trees[part];
+    unsigned int base = base_of_part[part], lo = coff[q], hi = coff[q + 1];
+    for (int j = threadIdx.x; j < pool; j += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned int k = lo; k < hi; ++k)
+            acc += w[k] * t.g[(size_t)t.cidx[k - base] * pool + j];
+        out[(size_t)q * pool + j] = acc;
+    }
+}
+
+// `v(c) = (<f(c), h_row> + bias) * opp_reach[row]`, for every config of the
+// queried player at every leaf of the batch, written straight into that
+// solve's own value arena.
+//
+// One block per row, one config per warp, and the row's head vector staged in
+// shared memory so it is read once for the row rather than once for each of its
+// hundred-odd configs.
+__global__ void k_readout(const Tree* trees, const int* part_of_row,
+                          const int* local_row, const unsigned int* coff,
+                          const float* h, const float* cf_bias, const float* opp,
+                          int traverser, int rows, int d) {
+    extern __shared__ float hs[];
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    for (int j = threadIdx.x + 32 * threadIdx.y; j < d; j += 32 * blockDim.y)
+        hs[j] = h[(size_t)r * d + j];
+    __syncthreads();
+    int part = part_of_row[r];
+    const Tree& t = trees[part];
+    unsigned int node = t.leaf_node[local_row[r]];
+    unsigned int lo = coff[2 * r + traverser], hi = coff[2 * r + traverser + 1];
+    unsigned int cs = t.coff[2 * local_row[r] + traverser];
+    float bias = *cf_bias, scale = opp[r];
+    unsigned int vo = t.voff[node];
+    for (unsigned int k = lo + threadIdx.y; k < hi; k += blockDim.y) {
+        const float* fr = t.f + (size_t)t.cidx[cs + (k - lo)] * d;
+        float acc = 0.0f;
+        for (int j = threadIdx.x; j < d; j += 32) acc += fr[j] * hs[j];
+        for (int s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xffffffff, acc, s);
+        if (threadIdx.x == 0) t.vals[vo + (k - lo)] = (acc + bias) * scale;
+    }
 }
 
 // ------------------------------------------------------------ the expansion
@@ -669,11 +692,12 @@ __device__ int puct_choice(const Tree& t, unsigned int node, unsigned int a,
 // The simulations of one phase are run in order by a single thread, not in
 // parallel: each increments the visits it passes, which is the paper's virtual
 // loss, and a later simulation of the same phase is meant to see it.
-__global__ void k_expand(const Tree* trees, unsigned long long* seed,
-                         unsigned int* out, int sims, float c_puct) {
+__global__ void k_expand(const Tree* trees, unsigned int* out, int parts,
+                         int sims, float c_puct) {
     int part = blockIdx.x * blockDim.x + threadIdx.x;
+    if (part >= parts) return;
     const Tree& t = trees[part];
-    unsigned long long s = seed[part];
+    unsigned long long s = *t.seed;
     unsigned int n0 = t.nc[0], n1 = t.nc[1];
     for (int sim = 0; sim < sims; ++sim) {
         int c[2];
@@ -716,17 +740,16 @@ __global__ void k_expand(const Tree* trees, unsigned long long* seed,
         }
         out[part * sims + sim] = found;
     }
-    seed[part] = s;
+    *t.seed = s;
 }
 
-// Terminal leaves are scored from the game, not the network, so the backend
-// never saw them. One block per terminal, listed per solve.
-__global__ void k_terminals(const Tree* trees, const unsigned int* term,
-                            const unsigned int* term_at, int traverser, int most) {
+// Terminal leaves are scored from the game, not the network, so the batch never
+// carried them. One warp per terminal.
+__global__ void k_terminals(const Tree* trees, int traverser) {
     const Tree& t = trees[blockIdx.y];
-    unsigned int a = term_at[blockIdx.y], b = term_at[blockIdx.y + 1];
-    if (blockIdx.x >= b - a || (int)blockIdx.x >= most) return;
-    unsigned int node = term[a + blockIdx.x];
+    unsigned int k = blockIdx.x * blockDim.y + threadIdx.y;
+    if (k >= t.nterm) return;
+    unsigned int node = t.term[k];
     int opp = 1 - traverser;
     unsigned int n = t.nc[2 * node + opp], ra = rbase(t, node, opp);
     float acc = 0.0f;
@@ -736,6 +759,34 @@ __global__ void k_terminals(const Tree* trees, const unsigned int* term,
     float u = t.player[node] == (unsigned)traverser ? t.util[node] : -t.util[node];
     unsigned int m = t.nc[2 * node + traverser], vo = t.voff[node];
     for (unsigned int c = threadIdx.x; c < m; c += 32) t.vals[vo + c] = u * acc;
+}
+
+// The reference strategy: the normalised running sum, laid out exactly like
+// `cur`. Built once, when the tree has stopped growing.
+//
+// `cur` still holds the literal initial policy for a player that has not
+// traversed yet, so a row whose sum has not moved keeps it rather than being
+// reconstructed by a multiply and a divide that need not round back.
+__global__ void k_finish(const Tree* trees, int level, int touched) {
+    const Tree& t = trees[blockIdx.y];
+    unsigned int node;
+    if (!level_task(t, level, blockIdx.x, &node)) return;
+    if (t.kind[node] != 0) return;
+    unsigned int me = t.player[node], so = t.soff[node], lb = t.legal_base[node];
+    unsigned int n = t.nc[2 * node + me];
+    bool moved = (touched >> me) & 1;
+    for (unsigned int c = threadIdx.x; c < n; c += blockDim.x) {
+        unsigned int a = t.legal_off[lb + c], b = t.legal_off[lb + c + 1];
+        if (!moved) {
+            for (unsigned int cell = a; cell < b; ++cell) t.avg[so + cell] = t.cur[so + cell];
+            continue;
+        }
+        float sum = 0.0f;
+        for (unsigned int cell = a; cell < b; ++cell) sum += t.sum[so + cell];
+        float k = (float)max(b - a, 1u);
+        for (unsigned int cell = a; cell < b; ++cell)
+            t.avg[so + cell] = sum > 0.0f ? t.sum[so + cell] / sum : 1.0f / k;
+    }
 }
 
 }  // extern "C"

@@ -64,25 +64,66 @@ pub enum Call {
         cards: Vec<f32>,
         n: usize,
     },
-    /// Every leaf, every iteration: the belief-conditioned head.
+    /// The tree, brought up to date with the host's.
     ///
-    /// The whole of what a CFR iteration asks the network.
-    ///
-    /// Everything else the query needs is already with the backend, so this
-    /// carries only what actually changed: `w`, the normalised belief over
-    /// every query's configs, and `opp`, the opponent's reach mass at each
-    /// leaf. What comes back is the counterfactual value per config of the
-    /// queried player — not the head, not the board vectors, not `f` or `g`.
-    ///
-    /// Pooling the beliefs, running the join and reading the values out were
-    /// three steps with two round trips between them. They are one step here
-    /// because the two intermediates never had a reader on the host.
-    Leaf {
+    /// Growth is the only part of a solve the host still runs: it holds the
+    /// game rules, so it turns the leaves an expansion sampled into decision
+    /// nodes and describes them. `Contract` is append-only apart from the rows
+    /// of those leaves, so `from` says where the rewriting starts.
+    Tree {
         solve: usize,
-        w: Vec<f32>,
-        opp: Vec<f32>,
-        rows: usize,
-        player: usize,
+        contract: std::sync::Arc<crate::contract::Contract>,
+        from: usize,
+        /// The first call of a solve. A gate slot is reused, so this is what
+        /// tells the backend to forget the solve that held it before.
+        fresh: bool,
+        /// Arena lengths, so the device can fit what it holds.
+        ncells: usize,
+        nreach: usize,
+        nvals: usize,
+        /// Non-terminal leaves in batch-row order, and the terminals.
+        leaf_node: Vec<u32>,
+        term: Vec<u32>,
+        /// Sent once, when the solve starts: the root beliefs and the seed of
+        /// the expansion's own random stream.
+        rootb: Vec<f32>,
+        seed: u64,
+        /// The cells this growth appended: uniform over each legal row, which
+        /// is where CFR starts and what the prior is until the policy head has
+        /// spoken. A later `Iterate` overwrites the prior once it has.
+        cur: Vec<f32>,
+        /// The prior starts where the appended cells do unless the policy head
+        /// has since rewritten an older node's row, which it does one iteration
+        /// after that node was given its cells.
+        prior_at: usize,
+        prior: Vec<f32>,
+    },
+    /// One CFR iteration and one expansion phase.
+    ///
+    /// The whole of what a GT-CFR round asks of the device: reach forward, the
+    /// network at every leaf, backpropagation and the regret update for both
+    /// players, the average strategy, and the trajectories that say where the
+    /// tree grows next. What comes back is the sampled leaves and nothing else.
+    Iterate {
+        solve: usize,
+        /// The regret-matching decay factors and the predictive term.
+        factors: (f32, f32, f32),
+        predict: f32,
+        expand: usize,
+        puct: f32,
+    },
+    /// What the host needs back once the solve is done: the reference
+    /// strategy at the nodes it asks about, and their values and beliefs.
+    Read {
+        solve: usize,
+        touched: [bool; 2],
+        /// Slices of the device arenas the host wants back: the root's value
+        /// row per player, the root's strategy cells, and the reach at each
+        /// leaf the caller sampled. The host knows every offset from its own
+        /// copy of the tree, so nothing here has to be looked up on the card.
+        vals_at: [(u32, u32); 2],
+        policy_at: (u32, u32),
+        reach_at: Vec<(u32, u32)>,
     },
 }
 
@@ -94,6 +135,9 @@ pub struct Reply {
     pub a: Vec<f32>,
     pub b: Vec<f32>,
     pub c: Vec<f32>,
+    /// The leaves an expansion phase sampled, or `NO_ROW` where a trajectory
+    /// ran into a terminal or a config with no legal action there.
+    pub leaves: Vec<u32>,
 }
 
 impl Call {
@@ -111,7 +155,9 @@ impl Call {
             Call::Configs { phi, owner, cards, n, .. } => {
                 net.configs(phi, owner, *n, cards, &mut r.a, &mut r.b, &mut r.c);
             }
-            Call::Leaf { .. } => unreachable!("a leaf query needs the resident state"),
+            Call::Tree { .. } | Call::Iterate { .. } | Call::Read { .. } => {
+                unreachable!("the CFR loop needs the resident state")
+            }
         }
         r
     }
@@ -122,7 +168,9 @@ impl Call {
         match self {
             Call::Trunk { .. } => 0,
             Call::Configs { .. } => 1,
-            Call::Leaf { .. } => 2,
+            Call::Tree { .. } => 2,
+            Call::Iterate { .. } => 3,
+            Call::Read { .. } => 4,
         }
     }
 
@@ -133,7 +181,9 @@ impl Call {
         match self {
             Call::Trunk { solve, .. }
             | Call::Configs { solve, .. }
-            | Call::Leaf { solve, .. } => *solve,
+            | Call::Tree { solve, .. }
+            | Call::Iterate { solve, .. }
+            | Call::Read { solve, .. } => *solve,
         }
     }
 
@@ -142,7 +192,8 @@ impl Call {
         match self {
             Call::Trunk { rows, .. } => *rows,
             Call::Configs { n, .. } => *n,
-            Call::Leaf { rows, .. } => *rows,
+            Call::Tree { leaf_node, .. } => leaf_node.len(),
+            Call::Iterate { .. } | Call::Read { .. } => 0,
         }
     }
 }
@@ -172,7 +223,7 @@ struct Pending {
     /// One mailbox per member. A thread reads only its own, so the driver may
     /// publish the next round's answers while this one is still waking up —
     /// which is the whole reason mailboxes are per thread and not per round.
-    mail: Vec<Option<Reply>>,
+    mail: Vec<Option<Vec<Reply>>>,
     /// Mailboxes of members that have left, to be handed out again.
     free: Vec<usize>,
     /// Set when the farm is winding down: parked threads wake and get nothing.
@@ -222,13 +273,25 @@ impl Gate {
     /// Returns `None` only when the farm is closing, which is the one case a
     /// caller cannot serve and must unwind from.
     pub fn submit(&self, call: Call) -> Option<Reply> {
+        self.submit_all(vec![call]).map(|mut r| r.remove(0))
+    }
+
+    /// Submit several calls in one round.
+    ///
+    /// A GT-CFR iteration is two of these: the trunk and the config encoder
+    /// over what the last growth added, and then the tree and the iteration
+    /// itself. Parking twice an iteration rather than four times is the
+    /// difference between the barrier costing a tenth of a round and a fifth.
+    pub fn submit_all(&self, calls: Vec<Call>) -> Option<Vec<Reply>> {
         let slot = SLOT.with(|s| s.get());
         assert_ne!(slot, usize::MAX, "submitting from a thread that never entered");
         let mut g = self.round.lock();
         if g.closed {
             return None;
         }
-        g.calls.push((slot, call));
+        for call in calls {
+            g.calls.push((slot, call));
+        }
         g.parked += 1;
         if g.parked == g.live {
             self.full.notify_one();
@@ -311,8 +374,10 @@ impl Gate {
         let replies = eval(&calls);
         assert_eq!(replies.len(), calls.len(), "one reply per call");
 
+        // A thread may raise several calls in one round; its mailbox holds
+        // them in the order it submitted them.
         for (slot, reply) in slots.into_iter().zip(replies) {
-            g.mail[slot] = Some(reply);
+            g.mail[slot].get_or_insert_with(Vec::new).push(reply);
         }
         g.parked = 0;
         self.done.notify_all();
@@ -331,42 +396,6 @@ impl Gate {
         self.full.notify_all();
         self.done.notify_all();
     }
-}
-
-/// Pool the beliefs, run the join, read the values out — the CPU reference for
-/// `Call::Leaf`, and the oracle the device kernels are held to.
-///
-/// The two intermediates never leave: `pooled` and the head `h` are produced
-/// and consumed here, which is what makes the call small at both ends.
-fn leaf(net: &Net, b: &Board, w: &[f32], opp: &[f32], rows: usize, player: usize) -> Reply {
-    let queries = 2 * rows;
-    let mut pooled = vec![0.0f32; queries * POOL];
-    for q in 0..queries {
-        let (lo, hi) = (b.coff[q] as usize, b.coff[q + 1] as usize);
-        crate::net::accumulate(
-            &b.g,
-            &b.cidx[lo..hi],
-            &w[lo..hi],
-            POOL,
-            &mut pooled[q * POOL..(q + 1) * POOL],
-        );
-    }
-    let mut h = Vec::new();
-    net.join(&b.p, &b.jp, &pooled, rows, player, &mut h);
-    // One value per config of the queried player, counterfactual: the
-    // network's value for that config times the opponent's reach into the leaf.
-    let mut out = Vec::new();
-    for r in 0..rows {
-        let q = 2 * r + player;
-        let (lo, hi) = (b.coff[q] as usize, b.coff[q + 1] as usize);
-        let at = out.len();
-        out.resize(at + (hi - lo), 0.0);
-        net.values(&h[r * D..(r + 1) * D], &b.f, &b.cidx[lo..hi], &mut out[at..]);
-        for v in &mut out[at..] {
-            *v *= opp[r];
-        }
-    }
-    Reply { a: out, ..Default::default() }
 }
 
 /// Membership in the round count. A thread that leaves must stop being waited
@@ -406,93 +435,7 @@ pub const CARD_ROWS: usize = 2;
 pub enum Backend {
     #[cfg(feature = "gpu")]
     Cuda(crate::cuda::Device),
-    Reference(Net, Resident),
-}
-
-/// What a backend keeps for a solve between its iterations.
-///
-/// A leaf's board vector and its projection into the join are computed once by
-/// the trunk and read by every one of the sixty-four join calls that follow.
-/// Sending them each time was 87% of what crossed the bus, and on a device
-/// they were being sent back to the card that had just produced them.
-///
-/// Keyed by the gate slot, which is a solve while that solve is in flight. A
-/// trunk call at row zero starts a new one and drops whatever was there.
-#[derive(Default)]
-pub struct Resident {
-    slots: Mutex<Vec<Board>>,
-}
-
-#[derive(Default, Clone)]
-struct Board {
-    p: Vec<f32>,
-    jp: Vec<f32>,
-    /// `f(c)` and `g(c)` for every distinct config the solve has interned.
-    f: Vec<f32>,
-    g: Vec<f32>,
-    /// Which config each query's support names, and where a query's span
-    /// starts. Written by the trunk, since a leaf's support is fixed when the
-    /// leaf is made.
-    cidx: Vec<u32>,
-    coff: Vec<u32>,
-}
-
-impl Resident {
-    fn slot(&self, solve: usize) -> parking_lot::MappedMutexGuard<'_, Board> {
-        let mut g = self.slots.lock();
-        if g.len() <= solve {
-            g.resize(solve + 1, Board::default());
-        }
-        parking_lot::MutexGuard::map(g, |v| &mut v[solve])
-    }
-
-    fn keep_configs(&self, solve: usize, at: usize, f: &[f32], g_: &[f32]) {
-        let mut b = self.slot(solve);
-        let (d, pool) = (crate::net::D, crate::net::POOL);
-        let want = (at + f.len() / d) * d;
-        if b.f.len() < want {
-            b.f.resize(want, 0.0);
-            b.g.resize(want / d * pool, 0.0);
-        }
-        b.f[at * d..want].copy_from_slice(f);
-        b.g[at * pool..want / d * pool].copy_from_slice(g_);
-    }
-
-    fn keep(&self, solve: usize, at: usize, p: &[f32], jp: &[f32]) {
-        let mut g = self.slots.lock();
-        if g.len() <= solve {
-            g.resize(solve + 1, Board::default());
-        }
-        let b = &mut g[solve];
-        // Written at the row it names rather than appended, so replaying a
-        // round -- which the parity test does, once alone and once batched --
-        // leaves the same state instead of stacking it up.
-        let (d, jw) = (crate::net::D, crate::net::JW);
-        let want = (at + p.len() / d) * d;
-        if b.p.len() < want {
-            b.p.resize(want, 0.0);
-            b.jp.resize(want / d * jw, 0.0);
-        }
-        b.p[at * d..want].copy_from_slice(p);
-        b.jp[at * jw..want / d * jw].copy_from_slice(jp);
-    }
-
-    /// The belief index arrays, appended for the queries the trunk just made.
-    fn keep_index(&self, solve: usize, at: usize, cidx: &[u32], coff: &[u32]) {
-        let mut b = self.slot(solve);
-        if at == 0 {
-            b.cidx.clear();
-            b.coff.clear();
-            b.coff.push(0);
-        }
-        let base = b.cidx.len() as u32;
-        b.cidx.extend_from_slice(cidx);
-        b.coff.extend(coff.iter().skip(1).map(|x| x + base));
-    }
-
-    fn board(&self, solve: usize) -> Board {
-        self.slots.lock()[solve].clone()
-    }
+    Reference(Net),
 }
 
 impl Backend {
@@ -500,27 +443,19 @@ impl Backend {
         match self {
             // Every call in a round is independent, and the solver threads
             // that raised them are all parked, so the cores are free.
-            Backend::Reference(net, res) => calls
-                .par_iter()
-                .map(|c| match c {
-                    Call::Trunk { solve, at, cidx, coff, .. } => {
-                        let r = c.run(net);
-                        res.keep(*solve, *at, &r.a, &r.b);
-                        res.keep_index(*solve, *at, cidx, coff);
-                        Reply { a: r.a, ..Default::default() }
-                    }
-                    Call::Configs { solve, at, .. } => {
-                        let r = c.run(net);
-                        res.keep_configs(*solve, *at, &r.a, &r.b);
-                        Reply { c: r.c, ..Default::default() }
-                    }
-                    Call::Leaf { solve, w, opp, rows, player } => {
-                        leaf(net, &res.board(*solve), w, opp, *rows, *player)
-                    }
-                })
-                .collect(),
+            Backend::Reference(net) => calls.par_iter().map(|c| c.run(net)).collect(),
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.run(calls),
+        }
+    }
+
+    /// Whether this backend runs the CFR loop itself rather than answering
+    /// network calls alone.
+    pub fn keeps_the_solve(&self) -> bool {
+        match self {
+            Backend::Reference(_) => false,
+            #[cfg(feature = "gpu")]
+            Backend::Cuda(_) => true,
         }
     }
 
@@ -528,7 +463,7 @@ impl Backend {
     /// still does itself.
     pub fn net(&self) -> &Net {
         match self {
-            Backend::Reference(net, _) => net,
+            Backend::Reference(net) => net,
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.net(),
         }
@@ -539,7 +474,7 @@ impl Backend {
     /// for a change that touches three arrays.
     pub fn set_net(&mut self, net: Net) -> Result<(), String> {
         match self {
-            Backend::Reference(old, _) => {
+            Backend::Reference(old) => {
                 *old = net;
                 Ok(())
             }
@@ -584,8 +519,10 @@ impl Farm {
         assert!(threads > 0, "a farm needs at least one thread");
         let value = backend.net().clone();
         let gate = Arc::new(Gate::default());
+        let device = backend.keeps_the_solve();
         let nets = Arc::new(RwLock::new(Arc::new(crate::search::Nets {
             value,
+            device,
             gate: Some(Arc::clone(&gate)),
         })));
         let collected = Arc::new(Mutex::new(Vec::new()));
@@ -638,6 +575,7 @@ impl Farm {
         self.backend.set_net(net.clone())?;
         *self.nets.write() = Arc::new(crate::search::Nets {
             value: net,
+            device: self.backend.keeps_the_solve(),
             gate: Some(Arc::clone(&self.gate)),
         });
         Ok(())
@@ -747,18 +685,19 @@ mod tests {
     /// A call whose reply is a function of its own contents, so a thread can
     /// tell its own answer from anybody else's.
     fn tagged(tag: usize) -> Call {
-        Call::Leaf {
+        Call::Configs {
             solve: 0,
-            w: vec![tag as f32],
-            opp: Vec::new(),
-            rows: tag,
-            player: 0,
+            at: tag,
+            phi: Vec::new(),
+            owner: Vec::new(),
+            cards: Vec::new(),
+            n: tag,
         }
     }
 
     fn tag_of(c: &Call) -> f32 {
         match c {
-            Call::Leaf { w, .. } => w[0],
+            Call::Configs { at, .. } => *at as f32,
             _ => unreachable!(),
         }
     }
@@ -892,7 +831,7 @@ mod tests {
             query_rate: 0.9,
             recursive_rate: 0.1,
         };
-        let mut farm = Farm::new(5, THREADS, gc, Backend::Reference(small_net(0x2E57), Default::default()));
+        let mut farm = Farm::new(5, THREADS, gc, Backend::Reference(small_net(0x2E57)));
         let data = farm.drive(48);
         assert!(data.soff.len() >= 48, "only {} solves", data.soff.len());
         assert_eq!(data.nv, data.soff.len(), "a solve must store one row");

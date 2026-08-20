@@ -43,6 +43,7 @@ fn main() {
     // here. An empty net would send every agent down the greedy path instead.
     let nets = Nets {
         value: random_net(0x5EED),
+        device: false,
         gate: None,
     };
     let small = Cfg { nodes: 64, expand: 1, iters: 4, ..cfg };

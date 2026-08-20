@@ -637,6 +637,7 @@ mod tests {
     fn the_transposed_reach_reproduces_the_scatter_exactly() {
         let nets = Nets {
             value: random_net(0x5EED),
+            device: false,
             gate: None,
         };
         let cfg = Cfg {
@@ -712,6 +713,7 @@ mod tests {
     fn a_solve_driven_from_the_description_reaches_the_same_strategy() {
         let nets = Nets {
             value: random_net(0x5EED),
+            device: false,
             gate: None,
         };
         let cfg = Cfg {
@@ -828,6 +830,7 @@ mod tests {
     fn a_level_never_depends_on_itself() {
         let nets = Nets {
             value: random_net(0x5EED),
+            device: false,
             gate: None,
         };
         let cfg = Cfg {
@@ -904,6 +907,7 @@ mod tests {
     fn extending_a_contract_equals_rebuilding_it() {
         let nets = Nets {
             value: random_net(0x5EED),
+            device: false,
             gate: None,
         };
         let cfg = Cfg {
@@ -1032,6 +1036,7 @@ mod tests {
         use crate::search::Back;
         let nets = Nets {
             value: random_net(0x5EED),
+            device: false,
             gate: None,
         };
         let cfg = Cfg {

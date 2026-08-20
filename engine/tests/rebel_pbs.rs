@@ -637,6 +637,7 @@ fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
 fn a_subgame_of_only_terminal_leaves_solves() {
     let nets = Nets {
         gate: None,
+        device: false,
         value: random_net(5),
     };
     let mut checked = 0usize;
@@ -918,6 +919,7 @@ fn the_value_function_separates_configs_sharing_a_hand() {
 fn game_stream_yields_one_complete_solve_at_a_time() {
     let nets = Nets {
         gate: None,
+        device: false,
         value: random_net(0x57EA),
     };
     let cfg = Cfg {
@@ -977,6 +979,7 @@ fn a_gated_solve_matches_an_ungated_one_exactly() {
     let plain = {
         let nets = Nets {
             gate: None,
+            device: false,
             value: random_net(0x6A7E),
         };
         GameStream::new(3, gc).generate(&nets, SOLVES)
@@ -986,16 +989,14 @@ fn a_gated_solve_matches_an_ungated_one_exactly() {
         let gate = Arc::new(Gate::default());
         let nets = Arc::new(Nets {
             gate: Some(Arc::clone(&gate)),
+            device: false,
             value: random_net(0x6A7E),
         });
         // The real evaluator, not a hand-rolled one: a batched backend keeps a
         // solve's board and config vectors between iterations, so a driver
         // that maps `Call::run` over the calls has nowhere to put them and is
         // not the thing production runs.
-        let backend = Arc::new(warchest::farm::Backend::Reference(
-            random_net(0x6A7E),
-            Default::default(),
-        ));
+        let backend = Arc::new(warchest::farm::Backend::Reference(random_net(0x6A7E)));
         let worker = {
             let (gate, nets) = (Arc::clone(&gate), Arc::clone(&nets));
             std::thread::spawn(move || {
@@ -1040,6 +1041,7 @@ fn a_gated_solve_matches_an_ungated_one_exactly() {
 fn a_solve_stores_its_root_and_nothing_else() {
     let nets = Nets {
         gate: None,
+        device: false,
         value: random_net(0x51DE),
     };
     let cfg = Cfg {

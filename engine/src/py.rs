@@ -522,7 +522,7 @@ fn set_weights(
 ) -> PyResult<()> {
     let value = Net::from_flat(w.as_slice()?, b.as_slice()?, ln.as_slice()?)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    *nets().write() = Arc::new(Nets { value, gate: None });
+    *nets().write() = Arc::new(Nets { value, device: false, gate: None });
     NET_VERSION.fetch_add(1, Ordering::Release);
     Ok(())
 }
@@ -534,7 +534,7 @@ fn set_weights(
 fn set_weights_bin(path: &str) -> PyResult<()> {
     let value = Net::load_bin(path)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}: {}", path, e)))?;
-    *nets().write() = Arc::new(Nets { value, gate: None });
+    *nets().write() = Arc::new(Nets { value, device: false, gate: None });
     NET_VERSION.fetch_add(1, Ordering::Release);
     Ok(())
 }

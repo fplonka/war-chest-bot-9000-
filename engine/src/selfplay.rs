@@ -880,6 +880,7 @@ mod policy_target_tests {
     fn a_stored_row_carries_the_root_average_policy() {
         let nets = Nets {
             value: random_net(0x5EED),
+            device: false,
             gate: None,
         };
         let cfg = Cfg {
