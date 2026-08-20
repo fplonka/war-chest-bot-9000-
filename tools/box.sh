@@ -53,7 +53,7 @@ build)
 cd engine
 maturin develop --release --features python,gpu >/tmp/maturin.log 2>&1 || { tail -40 /tmp/maturin.log; exit 1; }
 tail -2 /tmp/maturin.log
-cargo build --release --bin bot >/tmp/bot.log 2>&1 || { tail -40 /tmp/bot.log; exit 1; }
+cargo build --release --features gpu --bin bot >/tmp/bot.log 2>&1 || { tail -40 /tmp/bot.log; exit 1; }
 tail -1 /tmp/bot.log"
     ;;
 follow)

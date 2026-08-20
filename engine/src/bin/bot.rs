@@ -37,13 +37,12 @@ struct Options {
     temp: f32,
     node_cap: usize,
     threads: usize,
-    devices: String,
 }
 
 fn options() -> Result<Options, String> {
     let a = Args::parse(&[
         "name", "weights", "mind", "nodes", "expand", "iters", "cfr", "temp",
-        "node-cap", "threads", "devices",
+        "node-cap", "threads",
     ])?;
     Ok(Options {
         name: a.text("name", "bot"),
@@ -56,7 +55,6 @@ fn options() -> Result<Options, String> {
         temp: a.num("temp", 2.0)?,
         node_cap: a.num("node-cap", 200_000)?,
         threads: a.num("threads", 0)?,
-        devices: a.text("devices", ""),
     })
 }
 
@@ -240,27 +238,26 @@ fn main() {
     }
 }
 
-/// The backend a solve evaluates on, or `None` for the CPU network.
+/// The backend a solve evaluates on: every card the driver can see.
 ///
-/// A bot is archived per experiment and replayed long after, so this is a flag
-/// rather than a default: a bot built before the device path existed must still
-/// play exactly as it did.
+/// Not a flag. A bot solves at the training budget, so on a machine with cards
+/// it belongs on them, and there is nothing a caller could usefully decide
+/// here. The CPU network answers when there are no cards, which is what makes
+/// a bot runnable on a laptop -- and it is the oracle `cuda_parity` holds the
+/// device to, so it is not going anywhere.
 fn devices(o: &Options) -> Option<Backend> {
-    let want: Vec<usize> = o
-        .devices
-        .split(',')
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    if want.is_empty() || !matches!(o.mind.as_str(), "rebel") {
+    if !matches!(o.mind.as_str(), "rebel") {
         return None;
     }
     #[cfg(feature = "gpu")]
     {
-        let net = Net::load_bin(&o.weights).ok()?;
-        match warchest::cuda::Device::new(&want, net) {
-            Ok(d) => return Some(Backend::Cuda(d)),
-            Err(e) => eprintln!("no device backend: {e}"),
+        let n = warchest::cuda::Device::count();
+        if n > 0 {
+            let net = Net::load_bin(&o.weights).ok()?;
+            match warchest::cuda::Device::new(&(0..n).collect::<Vec<_>>(), net) {
+                Ok(d) => return Some(Backend::Cuda(d)),
+                Err(e) => eprintln!("no device backend: {e}"),
+            }
         }
     }
     None

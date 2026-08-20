@@ -56,7 +56,7 @@ WIN_MARKERS = 6
 class Bot:
     """One bot process, and the manifest that describes it."""
 
-    def __init__(self, path, seat, replies, threads=0, devices=""):
+    def __init__(self, path, seat, replies, threads=0):
         self.dir = Path(path)
         self.seat = seat
         self.closing = False
@@ -90,11 +90,6 @@ class Bot:
                 argv += [flag, str(search[key])]
         if threads and "nodes" in search:
             argv += ["--threads", str(threads)]
-        # A ladder is thousands of solves at the same budget a training run
-        # uses, so it belongs on the same cards. A bot built before the device
-        # path existed ignores the flag and plays on the CPU exactly as it did.
-        if devices and "nodes" in search:
-            argv += ["--devices", devices]
         self.proc = subprocess.Popen(
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
             bufsize=1)
@@ -291,7 +286,7 @@ def ratings(names, records):
 
 # ------------------------------------------------------------- the tablebase
 
-def generate(paths, games, seed, concurrent, out_dir, devices="", depth=8,
+def generate(paths, games, seed, concurrent, out_dir, depth=8,
              per_bucket=400, min_plies=2, budget=25_000):
     """Find positions whose result is proven, by watching bots play.
 
@@ -320,7 +315,7 @@ def generate(paths, games, seed, concurrent, out_dir, devices="", depth=8,
     times as long, so the time is better spent on more games."""
     replies = queue.Queue()
     threads = max(1, (os.cpu_count() or 2) // len(paths))
-    bots = tuple(Bot(p, i, replies, threads, devices) for i, p in enumerate(paths))
+    bots = tuple(Bot(p, i, replies, threads) for i, p in enumerate(paths))
     table = warchest.Table()
     pairs = drafts(seed, (games + 1) // 2)
     todo = deque(range(games))
@@ -647,7 +642,7 @@ def write_json(path, value):
     os.replace(tmp, path)
 
 
-def ladder(paths, games, seed, concurrent, out_path, devices=""):
+def ladder(paths, games, seed, concurrent, out_path):
     if games < 2 or games % 2:
         raise SystemExit("--games must be a positive even number")
     specs = [json.loads((Path(p) / "bot.json").read_text()) for p in paths]
@@ -666,7 +661,7 @@ def ladder(paths, games, seed, concurrent, out_path, devices=""):
         if running.get(seat):
             running[seat][1].close()
         threads = max(1, (os.cpu_count() or 2) // 2)
-        running[seat] = (index, Bot(paths[index], seat, replies, threads, devices))
+        running[seat] = (index, Bot(paths[index], seat, replies, threads))
         return running[seat][1]
 
     try:
@@ -786,8 +781,6 @@ def main():
     lad.add_argument("--concurrent", type=int, default=128,
                      help="games in flight")
     lad.add_argument("--out", default="")
-    lad.add_argument("--devices", default="",
-                     help="cards a bot's solves run on, e.g. 0,1")
 
     gen = sub.add_parser("generate",
                          help="find positions with proven answers, by watching bots play")
@@ -834,7 +827,7 @@ def main():
                          args.concurrent)
     stem = "_vs_".join(name(b) for b in args.bots[:3])
     ladder(args.bots, args.games, args.seed, args.concurrent,
-           report_path(args.out, stem), args.devices)
+           report_path(args.out, stem))
 
 
 if __name__ == "__main__":

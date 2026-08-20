@@ -1024,11 +1024,10 @@ def main():
     snapshot("final", time.time() - t0)
     write_log(args, log, snaps)
     if args.ladder_games:
-        # Every snapshot becomes an immutable bot for the ladder. It plays on
-        # the same cards the run generated on: a ladder is thousands of solves
-        # at the training budget, and on the CPU that is an hour a run --
-        # which is far too dear for the thing that says whether the run
-        # learned anything.
+        # Every snapshot becomes an immutable bot for the ladder, and a bot
+        # solves on whatever cards it finds. A ladder is thousands of solves at
+        # the training budget; on the CPU that was an hour a run, which is far
+        # too dear for the thing that says whether the run learned anything.
         arena = [sys.executable, str(ROOT / "tools" / "arena.py")]
         subprocess.run(arena + ["pack", args.out], check=True)
         tag = pathlib.Path(args.out).name
@@ -1039,7 +1038,6 @@ def main():
         anchor = [str(greedy)] if (greedy / "bot.json").exists() else []
         subprocess.run(arena + ["ladder", *anchor, *bots,
                                 "--games", str(args.ladder_games),
-                                "--devices", args.gen_devices,
                                 "--out", f"{args.out}/ladder.json"], check=True)
 
 
