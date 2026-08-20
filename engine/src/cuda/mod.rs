@@ -213,6 +213,18 @@ pub struct Device {
     net: Net,
 }
 
+/// How much room to take when an array has to grow.
+///
+/// A quarter over, not the next power of two. A solve's cell arenas run to tens
+/// of megabytes and a card holds one per gate slot, so doubling on every growth
+/// meant the card held twice what the solves were using -- which at a hundred
+/// and forty-four slots is the whole of a 24 GB card. The headroom still has to
+/// be geometric, or a tree that grows by one node a step reallocates every
+/// step.
+fn grow_to(want: usize) -> usize {
+    (want + want / 4).max(1024)
+}
+
 /// One device array of a solve's state.
 ///
 /// It grows geometrically and keeps what it holds: regrets, visit counts and
@@ -236,7 +248,7 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
         if self.buf.is_some() && self.cap >= want {
             return Ok(());
         }
-        let cap = want.next_power_of_two().max(1);
+        let cap = grow_to(want);
         let mut fresh = stream.alloc_zeros::<T>(cap).map_err(err)?;
         if self.cap > 0 {
             let old = self.buf.as_ref().expect("a capacity implies a buffer");
@@ -288,7 +300,7 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
     /// The caller must write every element it then reads.
     fn room(&mut self, stream: &Arc<CudaStream>, want: usize) -> Res<&mut CudaSlice<T>> {
         if self.cap < want {
-            self.cap = want.next_power_of_two().max(1);
+            self.cap = grow_to(want);
             self.buf = Some(unsafe { stream.alloc::<T>(self.cap) }.map_err(err)?);
         }
         Ok(self.buf.as_mut().expect("a capacity implies a buffer"))
