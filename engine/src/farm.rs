@@ -73,7 +73,11 @@ pub enum Call {
     Tree {
         solve: usize,
         contract: std::sync::Arc<crate::contract::Contract>,
+        /// Where the appended tail starts, and the rows of already-described
+        /// nodes this growth rewrote -- the leaves it turned into decision
+        /// nodes. Together those are everything that moved.
         from: usize,
+        rewrite: Vec<u32>,
         /// The first call of a solve. A gate slot is reused, so this is what
         /// tells the backend to forget the solve that held it before.
         fresh: bool,
@@ -92,11 +96,11 @@ pub enum Call {
         /// is where CFR starts and what the prior is until the policy head has
         /// spoken. A later `Iterate` overwrites the prior once it has.
         cur: Vec<f32>,
-        /// The prior starts where the appended cells do unless the policy head
-        /// has since rewritten an older node's row, which it does one iteration
-        /// after that node was given its cells.
-        prior_at: usize,
-        prior: Vec<f32>,
+        /// The prior, as the spans that moved: the rows the policy head has
+        /// just written, and the tail this growth appended. Sending everything
+        /// from the lowest of them sends the whole arena whenever the root is
+        /// among them, and the arena runs to a million cells.
+        prior: Vec<(u32, Vec<f32>)>,
     },
     /// One CFR iteration and one expansion phase.
     ///

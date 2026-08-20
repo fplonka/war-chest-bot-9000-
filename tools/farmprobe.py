@@ -103,7 +103,7 @@ def main():
         names = ("marshal", "upload", "launch", "download",
                  "reach", "beliefs", "join", "readout", "terminals",
                  "backprop", "expand", "trunk", "configs", "tree",
-                 "t-marshal", "t-upload", "t-down")
+                 "t-marshal", "t-upload", "trunk-down")
         print("iteration, ms: " +
               "  ".join(f"{n}={v:.0f}" for n, v in zip(names, b) if v > 0))
 

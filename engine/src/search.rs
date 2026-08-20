@@ -839,13 +839,18 @@ pub struct Solver<'a> {
     /// The first node whose row the card has yet to be told about, and how many
     /// strategy cells it has been given. Growth only ever appends past these.
     sent_from: usize,
+    /// Rows of already-described nodes that this growth rewrote: the leaves it
+    /// turned into decision nodes.
+    rewrite: Vec<u32>,
     sent_cells: usize,
     /// The expansion's random stream, which lives on the card once seeded.
     seed: u64,
-    /// The lowest strategy cell whose prior the policy head has rewritten since
-    /// the card last saw it. A node is primed an iteration after its cells are
-    /// appended, so the appended tail alone would leave the prior behind.
-    primed_from: usize,
+    /// The cells whose prior the policy head has rewritten since the card last
+    /// saw them, as `(start, length)` per node. A node is primed an iteration
+    /// after its cells are appended, so the appended tail alone would leave the
+    /// prior behind -- and sending everything from the lowest of them sends the
+    /// whole arena when the root is among them.
+    primed_spans: Vec<(u32, u32)>,
 }
 
 impl Drop for Solver<'_> {
@@ -931,9 +936,10 @@ impl<'a> Solver<'a> {
             cell_order: Vec::new(),
             contract: Arc::new(crate::contract::Contract::default()),
             sent_from: 0,
+            rewrite: Vec::new(),
             sent_cells: 0,
             seed: 0,
-            primed_from: usize::MAX,
+            primed_spans: Vec::new(),
         };
         sv.cf.clear();
         sv.cg.clear();
@@ -2287,6 +2293,7 @@ impl<'a> Solver<'a> {
             solve: Gate::slot(),
             contract: Arc::clone(&self.contract),
             from: self.sent_from,
+            rewrite: self.rewrite.clone(),
             fresh: first,
             ncells: self.ncells,
             nreach: self.reach.len(),
@@ -2300,30 +2307,44 @@ impl<'a> Solver<'a> {
             },
             seed: self.seed,
             cur: self.cur[sent..].to_vec(),
-            prior_at: self.primed_from.min(sent),
-            prior: self.prior[self.primed_from.min(sent)..].to_vec(),
+            // The rows the policy head has just written, and the tail this
+            // growth appended. Anything else the card already has.
+            prior: {
+                // The appended tail first. A span is planned by taking the
+                // buffer's address, and a later span that grows the buffer
+                // would move it out from under the earlier one's pointer --
+                // the tail is the only span that can grow it.
+                let mut spans = vec![(sent as u32, (self.ncells - sent) as u32)];
+                spans.append(&mut self.primed_spans);
+                spans
+                    .iter()
+                    .map(|&(at, n)| {
+                        (at, self.prior[at as usize..(at + n) as usize].to_vec())
+                    })
+                    .collect()
+            },
         };
         self.sent_from = self.nodes.len();
-        self.primed_from = usize::MAX;
         call
     }
 
-    /// Describe whatever the tree has grown since the last call. `sent_from`
-    /// is the earliest node whose row moved: `Contract` is append-only apart
-    /// from the leaves this growth turned into decision nodes.
+    /// Describe whatever the tree has grown since the last call.
+    ///
+    /// `Contract` is append-only apart from the leaves this growth turned into
+    /// decision nodes, so what moved is exactly those rows and the tail. Taking
+    /// the lowest of them and sending everything after it sends most of the
+    /// tree whenever one shallow leaf is expanded, which is a few hundred
+    /// kilobytes a solve an iteration for a handful of rows.
     fn contract_extend(&mut self) {
         let _t = timed!(CONTRACT);
         let grown = std::mem::take(&mut self.grown);
-        let from = grown
-            .iter()
-            .map(|&g| g as usize)
-            .chain(std::iter::once(self.contract.built))
-            .min()
-            .unwrap_or(0);
+        self.sent_from = self.contract.built;
+        self.rewrite.clear();
+        self.rewrite
+            .extend(grown.iter().copied().filter(|&g| (g as usize) < self.sent_from));
         let mut c = std::mem::take(&mut self.contract);
         Arc::make_mut(&mut c).extend(self, &grown);
         self.contract = c;
-        self.sent_from = from;
     }
 
     /// The cell PUCT would take from one config's legal row.
@@ -2461,7 +2482,7 @@ impl<'a> Solver<'a> {
                 }
             }
             self.primed[i] = true;
-            self.primed_from = self.primed_from.min(so);
+            self.primed_spans.push((so as u32, cells as u32));
         }
     }
 

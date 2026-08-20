@@ -663,11 +663,18 @@ impl Card {
         // These three are always timed. They are host work as much as device
         // work -- the trunk marshals a batch, the tree copies a description --
         // and a stage nobody times is where the round's time turns out to be.
-        self.wall(11, || self.trunk(calls, &pick(0), &mut out)).map_err(at("trunk"))?;
+        let trunk = self.wall(11, || self.trunk(calls, &pick(0))).map_err(at("trunk"))?;
         self.wall(12, || self.configs(calls, &pick(1), &mut out)).map_err(at("configs"))?;
         self.wall(13, || self.tree(calls, &pick(2))).map_err(at("tree"))?;
         self.iterate(calls, &pick(3), &mut out).map_err(at("iterate"))?;
         self.read(calls, &pick(4), &mut out).map_err(at("read"))?;
+        // Last, because it is the one thing a round hands back that nothing on
+        // the card is waiting for. Taking it where it is produced would
+        // synchronise in the middle of the round, and the host would stand
+        // still through the trunk's own kernels instead of spending them
+        // describing the trees the iteration is about to read.
+        self.wall(16, || self.finish_trunk(trunk, calls, &pick(0), &mut out))
+            .map_err(at("trunk-down"))?;
         Ok(out)
     }
 
@@ -819,9 +826,9 @@ impl Card {
     // ----------------------------------------------------------------- trunk
 
     /// Every new leaf in the round: the board vector and the join cache.
-    fn trunk(&self, calls: &[Call], mine: &[usize], out: &mut Vec<(usize, Reply)>) -> Res<()> {
+    fn trunk(&self, calls: &[Call], mine: &[usize]) -> Res<Option<CudaSlice<f32>>> {
         if mine.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         // Concatenate. `card_of_row` is what replaces `board`'s modulo: a leaf
         // reads the physical view of the card table its own solve drafted.
@@ -928,9 +935,6 @@ impl Card {
         // Keep them, per solve, for the iterations that follow. The host still
         // takes `p` back: the policy head builds its action embeddings against
         // a node's own board vector, and that runs there.
-        let mark = std::time::Instant::now();
-        let host_p = self.down(&p, rows * D)?;
-        LEAF_NS[16].fetch_add(mark.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let mut at = 0;
         let mut g = self.solves.lock();
         for &i in mine {
@@ -968,12 +972,32 @@ impl Card {
             b.coff.put(&self.stream, 2 * row0, &shifted)?;
             b.cells += cidx.len();
             b.rows = row0 + n;
+            at += n;
+        }
+        Ok(Some(p))
+    }
+
+    /// The board vectors, back on the host.
+    ///
+    /// The policy head builds its action embeddings against a node's own board
+    /// vector and that runs there, so this is the one thing a round hands back
+    /// that nothing on the card is waiting for.
+    fn finish_trunk(
+        &self,
+        p: Option<CudaSlice<f32>>,
+        calls: &[Call],
+        mine: &[usize],
+        out: &mut Vec<(usize, Reply)>,
+    ) -> Res<()> {
+        let Some(p) = p else { return Ok(()) };
+        let rows: usize = mine.iter().map(|&i| calls[i].rows()).sum();
+        let host = self.down(&p, rows * D)?;
+        let mut at = 0;
+        for &i in mine {
+            let n = calls[i].rows();
             out.push((
                 i,
-                Reply {
-                    a: host_p[at * D..(at + n) * D].to_vec(),
-                    ..Default::default()
-                },
+                Reply { a: host[at * D..(at + n) * D].to_vec(), ..Default::default() },
             ));
             at += n;
         }
@@ -1088,8 +1112,8 @@ impl Card {
         let mut pack = Pack::default();
         for &i in mine {
             let Call::Tree {
-                solve, contract, from, fresh, ncells, nreach, nvals,
-                leaf_node, term, rootb, cur, prior_at, prior, seed,
+                solve, contract, from, rewrite, fresh, ncells, nreach, nvals,
+                leaf_node, term, rootb, cur, prior, seed,
             } = &calls[i] else {
                 unreachable!("tree shard holds only tree calls")
             };
@@ -1112,7 +1136,7 @@ impl Card {
                     a.reset();
                 }
             }
-            b.tree.extend(s, &mut pack, contract, *from)?;
+            b.tree.extend(s, &mut pack, contract, *from, rewrite)?;
             b.level_start.clear();
             b.level_start.extend_from_slice(&contract.level_start);
             b.nterm = term.len();
@@ -1126,7 +1150,9 @@ impl Card {
             // legal row, and until the policy head has spoken the prior is that
             // same uniform strategy.
             pack.f32(&mut b.cur, s, *ncells - cur.len(), cur)?;
-            pack.f32(&mut b.prior, s, *prior_at, prior)?;
+            for (at, rows) in prior {
+                pack.f32(&mut b.prior, s, *at as usize, rows)?;
+            }
             b.regret.fit(s, *ncells)?;
             b.sum.fit(s, *ncells)?;
             b.qval.fit(s, *ncells)?;
@@ -1731,24 +1757,32 @@ impl Tree {
     /// Bring the description up to date with `c`. `from` is the first node
     /// whose row may have changed — the earliest leaf this growth expanded.
     fn extend(&mut self, s: &Arc<CudaStream>, p: &mut Pack, c: &crate::contract::Contract,
-              from: usize) -> Res<()> {
-        let wide: Vec<u32> = c.kind[from..].iter().map(|&x| x as u32).collect();
-        p.u32(&mut self.kind, s, from, &wide)?;
-        let wide: Vec<u32> = c.player[from..].iter().map(|&x| x as u32).collect();
-        p.u32(&mut self.player, s, from, &wide)?;
-        let wide: Vec<u32> = c.nc[from..].iter().flatten().copied().collect();
-        p.u32(&mut self.nc, s, 2 * from, &wide)?;
-        p.u32(&mut self.parent, s, from, &c.parent[from..])?;
-        p.u32(&mut self.roff, s, from, &c.roff[from..])?;
-        p.u32(&mut self.voff, s, from, &c.voff[from..])?;
-        p.u32(&mut self.soff, s, from, &c.soff[from..])?;
-        p.f32(&mut self.util, s, from, &c.util[from..])?;
-        p.u32(&mut self.child_at, s, from, &c.child_at[from..])?;
-        p.u32(&mut self.child_n, s, from, &c.child_n[from..])?;
-        p.u32(&mut self.legal_base, s, from, &c.legal_base[from..])?;
-        p.u32(&mut self.rev_base, s, from, &c.rev_base[from..])?;
-        p.u32(&mut self.rvd_base, s, from, &c.rvd_base[from..])?;
-        p.u32(&mut self.draw_base, s, from, &c.draw_base[from..])?;
+              from: usize, rewrite: &[u32]) -> Res<()> {
+        // The appended tail first, then the handful of rows a growth rewrote
+        // in place. Everything else the card already holds. The tail leads
+        // because a span is planned by taking the buffer's address, and it is
+        // the only one that can grow the buffer and move it.
+        let mut spans: Vec<(usize, usize)> = vec![(from, c.nodes() - from)];
+        spans.extend(rewrite.iter().map(|&g| (g as usize, 1)));
+        for &(at, n) in &spans {
+            let wide: Vec<u32> = c.kind[at..at + n].iter().map(|&x| x as u32).collect();
+            p.u32(&mut self.kind, s, at, &wide)?;
+            let wide: Vec<u32> = c.player[at..at + n].iter().map(|&x| x as u32).collect();
+            p.u32(&mut self.player, s, at, &wide)?;
+            let wide: Vec<u32> = c.nc[at..at + n].iter().flatten().copied().collect();
+            p.u32(&mut self.nc, s, 2 * at, &wide)?;
+            p.u32(&mut self.parent, s, at, &c.parent[at..at + n])?;
+            p.u32(&mut self.roff, s, at, &c.roff[at..at + n])?;
+            p.u32(&mut self.voff, s, at, &c.voff[at..at + n])?;
+            p.u32(&mut self.soff, s, at, &c.soff[at..at + n])?;
+            p.f32(&mut self.util, s, at, &c.util[at..at + n])?;
+            p.u32(&mut self.child_at, s, at, &c.child_at[at..at + n])?;
+            p.u32(&mut self.child_n, s, at, &c.child_n[at..at + n])?;
+            p.u32(&mut self.legal_base, s, at, &c.legal_base[at..at + n])?;
+            p.u32(&mut self.rev_base, s, at, &c.rev_base[at..at + n])?;
+            p.u32(&mut self.rvd_base, s, at, &c.rvd_base[at..at + n])?;
+            p.u32(&mut self.draw_base, s, at, &c.draw_base[at..at + n])?;
+        }
         // The pools only ever grow, so their tail is the whole of the update.
         p.tail(&mut self.child, s, &c.child)?;
         p.tail(&mut self.legal_off, s, &c.legal_off)?;
