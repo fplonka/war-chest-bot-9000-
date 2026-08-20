@@ -895,9 +895,6 @@ pub struct Solver<'a> {
     /// `leaf_coff` order, and the opponent's reach mass at each leaf.
     wbelief: Vec<f32>,
     wopp: Vec<f32>,
-    /// Traverser of the previous leaf query, i.e. whose beliefs have moved
-    /// since. `None` before the first query of a solve.
-    last_traverser: Option<usize>,
     /// The build hit `Cfg::node_cap`: the tree is incomplete and the caller
     /// must not solve or walk it.
     capped: bool,
@@ -988,7 +985,6 @@ impl<'a> Solver<'a> {
             wbuf: Vec::new(),
             wbelief: Vec::new(),
             wopp: Vec::new(),
-            last_traverser: None,
             capped: false,
             draw_scratch: DrawScratch::default(),
             cell_order: Vec::new(),
@@ -1684,7 +1680,6 @@ impl<'a> Solver<'a> {
         let rows = self.leaf_rows.len();
         if rows > self.batch_rows {
             // New rows have no cached belief block for either player.
-            self.last_traverser = None;
         }
         if rows == self.batch_rows && self.ncfg == self.batch_cfgs {
             return;
@@ -1771,9 +1766,12 @@ impl<'a> Solver<'a> {
     }
 
     /// Rewrite the pooled belief block the join reads, per row per player.
-    /// `only` restricts the work to one player — between two CFR queries just
-    /// one player's strategy has moved, so the other block is still exactly
-    /// what it was.
+    ///
+    /// Both players, every time. This used to refresh only the player whose
+    /// strategy had just moved, which was sound while CFR alternated
+    /// traversers. Student of Games updates both players against one reach
+    /// profile, so both blocks go stale together and the shortcut silently
+    /// pooled one of them under last iteration's belief.
     ///
     /// The belief the network reads is the normalised reach, as in the
     /// reference, pooled over the same `g(c)` the readout's `f(c)` comes from,
@@ -1781,7 +1779,7 @@ impl<'a> Solver<'a> {
     /// linear card-weighted half, which is what makes this pooled vector carry
     /// the belief's exact expected holding of each card rather than an average
     /// of nonlinearities.
-    fn belief_blocks(&mut self, only: Option<usize>) {
+    fn belief_blocks(&mut self) {
         let _t = timed!(BELFEAT);
         let (reach, roff, nc, coff, cidx, cg, wbuf, xb) = (
             &self.reach,
@@ -1796,9 +1794,6 @@ impl<'a> Solver<'a> {
         let pool = crate::net::POOL;
         for (r, &i) in self.leaf_rows.iter().enumerate() {
             for p in 0..2 {
-                if only.is_some_and(|l| l != p) {
-                    continue;
-                }
                 let n = nc[i][p] as usize;
                 let ra = roff[i] as usize + if p == 1 { nc[i][0] as usize } else { 0 };
                 if wbuf.len() < n {
@@ -1825,14 +1820,11 @@ impl<'a> Solver<'a> {
             // The backend holds this solve's board vectors and config
             // vectors, so pooling, the join and the readout happen there and
             // only the beliefs and the values cross.
-            self.last_traverser = None;
             self.fused_leaf(traverser);
             return;
         }
-        let redo = self.last_traverser;
-        self.last_traverser = Some(traverser);
         if !self.nets.value.is_empty() {
-            self.belief_blocks(redo);
+            self.belief_blocks();
         }
         self.pbs_head(traverser);
         self.readout(traverser);
@@ -1885,17 +1877,6 @@ impl<'a> Solver<'a> {
             at += n;
         }
         debug_assert_eq!(at, got.len(), "the backend answered the wrong shape");
-    }
-
-    /// Refresh both belief blocks for a fixed-policy pass. Each traverser then
-    /// gets its own PBS-head query over these same beliefs.
-    fn leaf_beliefs_both(&mut self) {
-        self.extend_leaf_batch();
-        self.last_traverser = None;
-        if self.nets.value.is_empty() {
-            return;
-        }
-        self.belief_blocks(None);
     }
 
     /// The one path CFR pays for on every iteration.
@@ -2643,7 +2624,6 @@ impl<'a> Solver<'a> {
     /// harness does — would resume from another strategy's reaches.
     fn restore(&mut self) {
         self.precompute_reaches();
-        self.last_traverser = None;
     }
 
     /// How concentrated the expansion phase's visits are, as the share of them

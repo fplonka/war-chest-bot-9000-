@@ -988,6 +988,14 @@ fn a_gated_solve_matches_an_ungated_one_exactly() {
             gate: Some(Arc::clone(&gate)),
             value: random_net(0x6A7E),
         });
+        // The real evaluator, not a hand-rolled one: a batched backend keeps a
+        // solve's board and config vectors between iterations, so a driver
+        // that maps `Call::run` over the calls has nowhere to put them and is
+        // not the thing production runs.
+        let backend = Arc::new(warchest::farm::Backend::Reference(
+            random_net(0x6A7E),
+            Default::default(),
+        ));
         let worker = {
             let (gate, nets) = (Arc::clone(&gate), Arc::clone(&nets));
             std::thread::spawn(move || {
@@ -996,12 +1004,9 @@ fn a_gated_solve_matches_an_ungated_one_exactly() {
             })
         };
         let driver = {
-            let (gate, nets) = (Arc::clone(&gate), Arc::clone(&nets));
+            let (gate, backend) = (Arc::clone(&gate), Arc::clone(&backend));
             std::thread::spawn(move || {
-                while gate
-                    .round(|calls| calls.iter().map(|c| c.run(&nets.value)).collect())
-                    .is_some()
-                {}
+                while gate.round(|calls| backend.run(calls)).is_some() {}
             })
         };
         let out = worker.join().expect("gated worker");
