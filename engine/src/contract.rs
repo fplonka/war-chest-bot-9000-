@@ -700,6 +700,83 @@ mod tests {
         assert!(checked >= 8, "only {checked} comparisons");
     }
 
+    /// Every node of a level must have its parent in an earlier one.
+    ///
+    /// This is the property that makes a level's work independent, and it is
+    /// the only reason a device may run a whole level's tasks at once. Nothing
+    /// else checks it: a sweep over a mis-levelled tree still produces numbers,
+    /// they are just read before they are written, and the answer is wrong in a
+    /// way no downstream assertion notices.
+    #[test]
+    fn a_level_never_depends_on_itself() {
+        let nets = Nets {
+            value: random_net(0x5EED),
+            gate: None,
+        };
+        let cfg = Cfg {
+            nodes: 512,
+            expand: 4,
+            iters: 8,
+            ..Default::default()
+        };
+        let gc = GameCfg {
+            agents: [Agent::Rebel {
+                cfg: Cfg { nodes: 64, expand: 1, iters: 4, ..cfg },
+            }; 2],
+            collect: Collect::Rebel,
+            explore: 0.1,
+            random_draft: true,
+            eval_mix: 1.0,
+            mc_mix: 0.0,
+            query_rate: 0.9,
+            recursive_rate: 0.1,
+        };
+        let roots = collect_roots(2, 31, &nets, &gc, 2);
+        assert!(!roots.is_empty(), "no roots to test against");
+
+        let mut rng = Rng::new(0x1E4E);
+        let mut deepest = 0usize;
+        for (s, belief) in &roots {
+            let ctx = crate::rebel::Ctx::new(s);
+            let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
+            for _ in 0..cfg.iters {
+                sv.step();
+                for _ in 0..cfg.expand {
+                    if sv.nodes.len() >= cfg.nodes || !sv.expand_once(&mut rng) {
+                        break;
+                    }
+                }
+            }
+            let c = Contract::of(&sv);
+            assert!(c.levels() > 1, "a solved tree has more than one level");
+            deepest = deepest.max(c.levels());
+
+            let mut seen = vec![false; c.nodes()];
+            for level in 0..c.levels() {
+                let (lo, hi) = (c.level_start[level] as usize, c.level_start[level + 1] as usize);
+                assert!(hi > lo, "level {level} is empty");
+                for &node in &c.level_node[lo..hi] {
+                    let i = node as usize;
+                    assert_eq!(c.level[i] as usize, level, "node {i} is in the wrong bucket");
+                    let p = c.parent[i];
+                    if p == NO_ROW {
+                        assert_eq!(level, 0, "only the root has no parent");
+                    } else {
+                        assert!(
+                            seen[p as usize],
+                            "node {i} at level {level} has parent {p} in the same level or later"
+                        );
+                    }
+                }
+                for &node in &c.level_node[lo..hi] {
+                    seen[node as usize] = true;
+                }
+            }
+            assert!(seen.iter().all(|&x| x), "a node belongs to no level");
+        }
+        println!("levels check ok, deepest tree {deepest} levels");
+    }
+
     /// An incrementally extended description must equal one built from
     /// scratch, field for field.
     ///
