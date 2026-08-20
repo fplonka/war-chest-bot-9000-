@@ -517,6 +517,8 @@ pub struct Farm {
     /// Time inside the backend. Against wall clock this says how much of a
     /// round is the batch and how much is everything around it.
     pub round_nanos: u64,
+    /// How long the driver waits for a round to fill: what the last one cost.
+    patience: Duration,
 }
 
 impl Farm {
@@ -572,6 +574,7 @@ impl Farm {
             round_rows: 0,
             round_calls: 0,
             round_nanos: 0,
+            patience: PATIENCE_MIN,
         }
     }
 
@@ -605,7 +608,7 @@ impl Farm {
             // would sit behind rows that are already finished.
             let backend = &self.backend;
             let mut spent = Duration::ZERO;
-            match self.gate.round_before(PATIENCE, |calls| {
+            match self.gate.round_before(self.patience, |calls| {
                 calls_seen = calls.len();
                 let at = std::time::Instant::now();
                 let replies = backend.run(calls);
@@ -617,6 +620,7 @@ impl Farm {
                     self.round_rows += rows as u64;
                     self.round_calls += calls_seen as u64;
                     self.round_nanos += spent.as_nanos() as u64;
+                    self.patience = spent.clamp(PATIENCE_MIN, PATIENCE_MAX);
                 }
                 Round::Empty => {}
             }
@@ -649,10 +653,21 @@ impl Drop for Farm {
 /// network. Small enough that a publish is never more than this stale.
 const CHUNK_SOLVES: usize = 8;
 
-/// How long a driver waits for a round to fill before looking at what the
-/// threads have already finished. Short next to the CFR work between rounds,
-/// so a round that is genuinely coming is never missed by it.
-const PATIENCE: Duration = Duration::from_millis(2);
+/// How long a driver waits for a round to fill before running with whoever is
+/// there.
+///
+/// It cannot be a small constant. A thread woken by a round does its share of
+/// the host work -- growing the leaves the expansion sampled -- before it can
+/// park again, and that is milliseconds. A patience shorter than it fires the
+/// next round with only the threads whose work happened to be trivial, so a
+/// round of seventy-two threads carried twenty-seven and the cards saw a
+/// batch a third of the size they should.
+///
+/// So it tracks what a round costs instead. Waiting for a full round can never
+/// cost more than running a partial one did, and when the host work is short
+/// the wait ends early anyway because everyone has parked.
+const PATIENCE_MIN: Duration = Duration::from_millis(2);
+const PATIENCE_MAX: Duration = Duration::from_millis(50);
 
 /// Shapes the driver needs to lay a batch out. Kept here so the device code
 /// and the CPU reference agree on them by construction.

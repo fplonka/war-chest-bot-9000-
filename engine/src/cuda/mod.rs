@@ -47,21 +47,30 @@ use crate::rebel::{
 
 type Res<T> = Result<T, String>;
 
-/// Where a leaf pass spends its wall clock: host marshalling, the uploads, the
-/// launches, the one download. Cards are 20% busy while the host waits inside
-/// this call, so which of these four it is decides everything.
-pub static LEAF_NS: [std::sync::atomic::AtomicU64; 4] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
+/// Where an iteration spends its wall clock, by stage. The first four are the
+/// host's own: marshalling, the uploads, issuing the launches, the download
+/// that ends the round. The rest are device stages, and are only filled when
+/// `WARCHEST_STAGES` is set -- separating them means synchronising after each,
+/// which changes the thing being measured, so it is off by default.
+pub const STAGES: [&str; 11] = [
+    "marshal", "upload", "launch", "download",
+    "reach", "beliefs", "join", "readout", "terminals", "backprop", "expand",
 ];
 
+pub static LEAF_NS: [std::sync::atomic::AtomicU64; STAGES.len()] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; STAGES.len()];
+
 /// Report and reset.
-pub fn leaf_breakdown() -> [f64; 4] {
+pub fn leaf_breakdown() -> [f64; STAGES.len()] {
     std::array::from_fn(|i| {
         LEAF_NS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
     })
+}
+
+/// Whether to time the device stages, which costs a stream synchronise apiece.
+fn timing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WARCHEST_STAGES").is_some())
 }
 
 const KERNELS: &str = include_str!("kernels.cu");
@@ -1103,9 +1112,26 @@ impl Card {
     fn value_pass(&self, b: &Batch) -> Res<()> {
         self.reaches(&b.trees, &b.wide, b.parts, 1, false)?;
         let (mut w, mut mass) = (self.alloc(b.cells)?, self.alloc(2 * b.rows)?);
-        self.network(&b.trees, &b.part, &b.local, &b.base, &b.coff, &mut w, &mut mass, b.rows)?;
+        self.network(b, &mut w, &mut mass)?;
         self.terminals(&b.trees, b.nterm, b.parts)?;
         self.backprop(&b.trees, &b.wide, b.parts, 1, (0.0, 0.0, 0.0, 0.0))
+    }
+
+    /// Time one device stage, when `WARCHEST_STAGES` asks for it. The
+    /// synchronise is the measurement: without it a launch returns before the
+    /// kernel has run and every stage but the last reads as free.
+    fn stage<T>(&self, slot: usize, f: impl FnOnce() -> Res<T>) -> Res<T> {
+        if !timing() {
+            return f();
+        }
+        let mark = std::time::Instant::now();
+        let got = f()?;
+        self.stream.synchronize().map_err(err)?;
+        LEAF_NS[slot].fetch_add(
+            mark.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(got)
     }
 
     /// One CFR iteration and one expansion phase, for every solve in the round.
@@ -1140,18 +1166,20 @@ impl Card {
         let (da, db, dg) = *factors;
         let (predict, puct, expand) = (*predict, *puct, *expand);
 
-        self.reaches(&b.trees, &b.wide, b.parts, 0, false).map_err(at("reach"))?;
         let (mut w, mut mass) = (self.alloc(b.cells)?, self.alloc(2 * b.rows)?);
-        self.network(&b.trees, &b.part, &b.local, &b.base, &b.coff, &mut w, &mut mass, b.rows)
-            .map_err(at("net"))?;
-        self.terminals(&b.trees, b.nterm, b.parts).map_err(at("terminals"))?;
-        self.backprop(&b.trees, &b.wide, b.parts, 0, (da, db, dg, predict))
+        self.stage(4, || self.reaches(&b.trees, &b.wide, b.parts, 0, false))
+            .map_err(at("reach"))?;
+        self.network(&b, &mut w, &mut mass).map_err(at("net"))?;
+        self.stage(8, || self.terminals(&b.trees, b.nterm, b.parts)).map_err(at("terminals"))?;
+        self.stage(9, || self.backprop(&b.trees, &b.wide, b.parts, 0, (da, db, dg, predict)))
             .map_err(at("backprop"))?;
         // The regret update moved both players' strategies, so the reaches the
         // next iteration reads are stale until they are pushed down again --
         // and the average strategy is accumulated against those fresh ones.
-        self.reaches(&b.trees, &b.wide, b.parts, 0, true).map_err(at("avg"))?;
-        let leaves = self.expand(&b.trees, b.parts, expand, puct).map_err(at("expand"))?;
+        self.stage(4, || self.reaches(&b.trees, &b.wide, b.parts, 0, true)).map_err(at("avg"))?;
+        let leaves = self
+            .stage(10, || self.expand(&b.trees, b.parts, expand, puct))
+            .map_err(at("expand"))?;
         let t_launch = mark.elapsed();
         let mark = std::time::Instant::now();
         let host = self.down_u32(&leaves, b.parts as usize * expand)?;
@@ -1332,17 +1360,10 @@ impl Card {
     /// on which seat is asking, so they run once; the join and the readout do,
     /// and run over a batch of twice the rows rather than twice.
     #[allow(clippy::too_many_arguments)]
-    fn network(
-        &self,
-        trees: &CudaSlice<u64>,
-        part_d: &CudaSlice<i32>,
-        local_d: &CudaSlice<i32>,
-        base_d: &CudaSlice<i32>,
-        coff_d: &CudaSlice<u32>,
-        w: &mut CudaSlice<f32>,
-        mass: &mut CudaSlice<f32>,
-        stride: usize,
-    ) -> Res<()> {
+    fn network(&self, b: &Batch, w: &mut CudaSlice<f32>, mass: &mut CudaSlice<f32>) -> Res<()> {
+        let (trees, part_d, local_d, base_d, coff_d) =
+            (&b.trees, &b.part, &b.local, &b.base, &b.coff);
+        let stride = b.rows;
         if stride == 0 {
             return Ok(());
         }
@@ -1351,76 +1372,80 @@ impl Card {
         let (rows_i, stride_i) = (rows as i32, stride as i32);
         let (pool_i, d_i) = (POOL as i32, D as i32);
 
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.beliefs)
-                .arg(trees).arg(part_d).arg(local_d).arg(coff_d)
-                .arg(&mut *w).arg(&mut *mass).arg(&stride_i)
-                .launch_unit(LaunchConfig {
-                    grid_dim: (stride as u32, 2, 1),
-                    block_dim: (32, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-        }
-        .map_err(err)?;
-
         let queries = 2 * stride;
         let mut pooled = self.alloc(queries * POOL)?;
-        let queries_i = queries as i32;
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.belief_pool)
-                .arg(trees).arg(part_d).arg(base_d).arg(coff_d).arg(&*w)
-                .arg(&mut pooled).arg(&queries_i).arg(&pool_i)
-                .launch_unit(LaunchConfig {
-                    grid_dim: (queries as u32, 1, 1),
-                    block_dim: (64, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-        }
-        .map_err(err)?;
+        self.stage(5, || {
+            let queries_i = queries as i32;
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.beliefs)
+                    .arg(trees).arg(part_d).arg(local_d).arg(coff_d)
+                    .arg(&mut *w).arg(&mut *mass).arg(&stride_i)
+                    .launch_unit(LaunchConfig {
+                        grid_dim: (stride as u32, 2, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+            }
+            .map_err(err)?;
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.belief_pool)
+                    .arg(trees).arg(part_d).arg(base_d).arg(coff_d).arg(&*w)
+                    .arg(&mut pooled).arg(&queries_i).arg(&pool_i)
+                    .launch_unit(LaunchConfig {
+                        grid_dim: (queries as u32, 1, 1),
+                        block_dim: (64, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+            }
+            .map_err(err)
+        })?;
 
         // The board vectors and the join cache, gathered out of the solves --
         // straight into the buffers the residual chain accumulates onto, so
         // neither needs a copy of its own.
         let mut h = self.alloc(rows * D)?;
         let mut z = self.alloc(rows * JW)?;
-        let (zero, one, jw_i) = (0i32, 1i32, JW as i32);
-        launch!(self, gather, rows * D, trees, part_d, local_d, &zero, &mut h, &rows_i, &d_i, &stride_i)?;
-        launch!(self, gather, rows * JW, trees, part_d, local_d, &one, &mut z, &rows_i, &jw_i, &stride_i)?;
-
         let mut input = self.alloc(rows * JOIN_IN)?;
-        launch!(self, join_input, rows * JOIN_IN, &pooled, &mut input, &rows_i, &pool_i, &stride_i)?;
-        self.lin(l.join_b, &input, rows, 1.0, &mut z)?;
-        self.bias(l.join_b, rows, &mut z)?;
-        // A residual block is a norm, a multiply and an add. The norm reads
-        // `z` and writes the scratch in one pass rather than four, and the
-        // multiply accumulates straight back into `z` — so the block costs two
-        // passes over `[rows, JW]` where it used to cost nine.
         let mut t = self.alloc(rows * JW)?;
-        for i in 0..JBLOCKS {
-            self.norm_to(l.norms[LN_JOIN + i], rows, true, &z, &mut t)?;
-            self.lin(l.join_w[i], &t, rows, 1.0, &mut z)?;
-            self.bias(l.join_w[i], rows, &mut z)?;
-        }
-        self.norm_to(l.norms[LN_JOUT], rows, true, &z, &mut t)?;
-        self.lin(l.join_out, &t, rows, 1.0, &mut h)?;
-        self.bias(l.join_out, rows, &mut h)?;
-        self.norm(l.norms[LN_H], rows, false, &mut h)?;
+        self.stage(6, || {
+            let (zero, one, jw_i) = (0i32, 1i32, JW as i32);
+            launch!(self, gather, rows * D, trees, part_d, local_d, &zero, &mut h, &rows_i, &d_i, &stride_i)?;
+            launch!(self, gather, rows * JW, trees, part_d, local_d, &one, &mut z, &rows_i, &jw_i, &stride_i)?;
+            launch!(self, join_input, rows * JOIN_IN, &pooled, &mut input, &rows_i, &pool_i, &stride_i)?;
+            self.lin(l.join_b, &input, rows, 1.0, &mut z)?;
+            self.bias(l.join_b, rows, &mut z)?;
+            // A residual block is a norm, a multiply and an add. The norm reads
+            // `z` and writes the scratch in one pass rather than four, and the
+            // multiply accumulates straight back into `z` -- so a block costs
+            // two passes over `[rows, JW]` where it used to cost nine.
+            for i in 0..JBLOCKS {
+                self.norm_to(l.norms[LN_JOIN + i], rows, true, &z, &mut t)?;
+                self.lin(l.join_w[i], &t, rows, 1.0, &mut z)?;
+                self.bias(l.join_w[i], rows, &mut z)?;
+            }
+            self.norm_to(l.norms[LN_JOUT], rows, true, &z, &mut t)?;
+            self.lin(l.join_out, &t, rows, 1.0, &mut h)?;
+            self.bias(l.join_out, rows, &mut h)?;
+            self.norm(l.norms[LN_H], rows, false, &mut h)
+        })?;
 
         let bias = self.b.slice(l.value_bias..l.value_bias + 1);
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.readout)
-                .arg(trees).arg(part_d).arg(local_d).arg(coff_d)
-                .arg(&h).arg(&bias).arg(&*mass).arg(&rows_i).arg(&stride_i).arg(&d_i)
-                .launch_unit(LaunchConfig {
-                    grid_dim: (rows as u32, 1, 1),
-                    block_dim: (32, 8, 1),
-                    shared_mem_bytes: 4 * D as u32,
-                })
-        }
-        .map_err(err)
+        self.stage(7, || {
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.readout)
+                    .arg(trees).arg(part_d).arg(local_d).arg(coff_d)
+                    .arg(&h).arg(&bias).arg(&*mass).arg(&rows_i).arg(&stride_i).arg(&d_i)
+                    .launch_unit(LaunchConfig {
+                        grid_dim: (rows as u32, 1, 1),
+                        block_dim: (32, 8, 1),
+                        shared_mem_bytes: 4 * D as u32,
+                    })
+            }
+            .map_err(err)
+        })
     }
 
     /// Terminal leaves, scored from the game rather than from the network.

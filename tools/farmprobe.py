@@ -97,9 +97,14 @@ def main():
     warchest.prof_dump()
     b = warchest.leaf_breakdown()
     if b:
-        names = ("marshal", "upload", "launch", "download")
-        print("device leaf pass, ms: " +
-              "  ".join(f"{n}={v:.0f}" for n, v in zip(names, b)))
+        # The device stages are only filled under WARCHEST_STAGES, which costs
+        # a stream synchronise apiece; without it they read zero and the host's
+        # own four are all there is.
+        names = ("marshal", "upload", "launch", "download",
+                 "reach", "beliefs", "join", "readout", "terminals",
+                 "backprop", "expand")
+        print("iteration, ms: " +
+              "  ".join(f"{n}={v:.0f}" for n, v in zip(names, b) if v > 0))
 
 
 if __name__ == "__main__":
