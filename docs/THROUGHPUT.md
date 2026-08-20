@@ -10,7 +10,8 @@ implemented faithfully. The algorithm is in. What is left is throughput.
 |---|---|---:|
 | run `gpucfr2` | real 30-min train.py | 9.8 |
 | run `cohorts10` | real 30-min train.py | **21.8** |
-| after the sweep and trunk work | `farmprobe`, 366 s mean | **28.0** |
+| after the sweep and trunk work | `farmprobe`, 366 s mean | 28.0 |
+| after power-of-two arenas | `farmprobe`, 240 s mean | **32.5** |
 
 **Take the run, not the probe, and never take one probe window.** A solve's
 cost varies twenty-six fold with how far into a game its root sits, so a short
@@ -232,6 +233,20 @@ driver -- it returns them to a pool, where a block can only serve a request it
 is large enough for -- so the pool holds both, and keeps holding, until it has
 the sum of every size any slot ever wanted. Rounding to a power of two costs
 the same average slack and makes every block interchangeable.
+
+**Measured.** Peak memory went from 24,027 MiB pinned at the ceiling to a peak
+of 17,969 settling near 16,000, and the rate from a 28.0 mean to **32.5**.
+`held` now reads 17,212 MB against the same 16-18 GB nvidia-smi sees, so what
+the cards hold is live arenas and not pool residue: **47.8 MB a solve**, where
+it was above seventy. The windows also stopped swinging -- 30.0 and 35.3, where
+the run before read 44.8, 5.3, 40.1, 27.3, 23.1, 26.8. That is the signature of
+an allocator that was reclaiming inside a round.
+
+Two traps this exposed, both worth remembering. A probe killed by dropping its
+ssh leaves the python holding the cards, and the next run dies with
+`CUDA_ERROR_OUT_OF_MEMORY` at startup while nvidia-smi still reads 24 GB --
+launch box work under `setsid nohup` and kill it by name. And a memory reading
+taken during that teardown is not a measurement of anything.
 
 ## What is left, in order
 
