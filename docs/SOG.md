@@ -1,0 +1,79 @@
+# Student of Games, and where the device port stands
+
+The engine follows Student of Games (`papers/SoG_2112.03178.pdf`), not ReBeL.
+Four things the paper specifies; three are in and verified, the fourth is half
+done.
+
+## What the paper asks for, and what answers it
+
+**A counterfactual value-and-policy network**, `f(β) = (v, p)`. The second
+readout has the same shape as the first: value is a config vector dotted with a
+situation vector, `v(c) = <f(c), h>`, and policy is `logit(c, a) = <f_p(c),
+e(a)>`. `f_p` is a third head off the config encoder that already produces `f`
+and `g`; `e(a)` describes one action — its kind, the coin slot it spends, the
+three squares it names — against the board it is played on. Both land on the
+`(config, action)` cells the tree already indexes for its strategy, so the
+policy needs no table of its own and costs one dot product per cell.
+
+An action's private content is *whether it is legal*, and the tree carries that
+as the legal cells, which is what lets one public description serve every
+config at a node. `train/test_parity.py::policy_parity` is the only thing that
+pins `cfg_p` and the action encoder's place in the weight blob.
+
+**Expansion by `π_select = ½·π_PUCT + ½·π_CFR`.** PUCT is a maximisation, so
+its half is a point mass on the argmax and sampling the mixture is a coin flip.
+Three arenas laid out like `cur` carry it: `prior`, `visits` (incremented as a
+trajectory passes, which is also the paper's virtual loss), and `qval`, the
+action value `backprop` already forms. Q is divided by the opponent's reach
+mass at the node — without it a node behind an unlikely opponent line looks
+worthless beside its own siblings instead of being compared with them.
+
+The prior is filled at the start of an expansion phase, not inside `grow`: a
+node is expanded before the batch carrying its board vector has run. Only
+expanded nodes ever need one, because a leaf has no action list and a
+trajectory stops there.
+
+**The regret update phase**: "simultaneous updates, regret-matching+, and
+linearly-weighted policy averaging". `Cfr::SOG` is `alpha = inf, beta = -inf,
+gamma = 1`. The gamma needs care — a sum decayed by `(t/(t+1))^gamma` weights
+iterate `j` by `(j+1)^gamma`, so *linear* is 1, not the 2 `Cfr::PLUS` carries.
+`step` traverses both players against one reach profile.
+
+**The CFR loop on the device.** Half done. See below.
+
+## The device
+
+The wall was never arithmetic. Throughput pinned at ~380k network rows/s
+whatever the thread count, with the CPUs at 13% and the cards at 20%: ~3 KB
+crossed the bus per join row per iteration and 87% of it was data the card had
+just produced. So a solve's board vectors, `f`, `g` and belief index stay with
+the backend, a round shards by *solve* so every call of one reaches the backend
+holding its state, and `Call::Leaf` is a whole CFR iteration — beliefs in,
+counterfactual values out. The pooled block and the head never leave.
+
+`farm::leaf` is the CPU reference and the oracle the kernels answer to.
+`a_gated_solve_matches_an_ungated_one_exactly` holds the batched and unbatched
+paths to byte equality on packed rows, beliefs and targets.
+
+**Not done:** the CFR sweeps themselves. `contract.rs` describes the tree as
+flat arrays with the reach transition transposed from a scatter into a gather,
+and both sweeps reproduce the solver bit for bit. `Contract::extend` keeps that
+description current for 49 cpu-ms per three solves where a rebuild cost 1651 —
+the tax that made the port not worth doing. What remains is the kernels and
+their parity.
+
+## Numbers to size against
+
+Measured at `nodes=8192, expand=8, iters=64` over real roots.
+
+* An expansion adds ~17 nodes, so tree size is set by `iters × expand` and the
+  `nodes` budget barely binds; growth finishes near iteration 38 of 64.
+* Per solve: 10,175 trunk rows, 422k join row-queries, 41.9M readout configs =
+  312 GFLOP. **150 solves/s is 47 TFLOP/s** against ~71 of FP32 across two
+  3090s, so it needs the tensor cores.
+* The network is 93% of a solve — but the CFR sweeps are 73% of what is *left*
+  once it moves, and that residual caps the host near **146 solves/s** until
+  they move too. Both ends are tight at 150.
+* The flat gather is *slower* than the tree walk on a CPU (0.7x). It buys
+  parallelism with work and there is nobody on a host to spend it, so both
+  implementations stay.
