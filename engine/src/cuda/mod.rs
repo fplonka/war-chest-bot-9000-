@@ -71,6 +71,8 @@ struct Kernels {
     join_input: CudaFunction,
     belief_pool: CudaFunction,
     readout: CudaFunction,
+    reach_sweep: CudaFunction,
+    backprop_sweep: CudaFunction,
 }
 
 impl Kernels {
@@ -99,6 +101,8 @@ impl Kernels {
             join_input: get("k_join_input")?,
             belief_pool: get("k_belief_pool")?,
             readout: get("k_readout")?,
+            reach_sweep: get("k_reach_sweep")?,
+            backprop_sweep: get("k_backprop_sweep")?,
         })
     }
 }

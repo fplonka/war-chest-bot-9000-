@@ -317,4 +317,145 @@ __global__ void k_readout(const float* f, const float* h, const float* cf_bias,
     (void)coff;
 }
 
+// ---------------------------------------------------------------- CFR sweeps
+//
+// The arithmetic is `contract.rs`, which reproduces the solver's own walk bit
+// for bit. One block per (node, player) and threads striding over that node's
+// configs, so neither sweep needs a task list -- building one per level would
+// cost what flattening the tree already cost, which is the thing that made
+// this port worth doing only once it was incremental.
+//
+// A level's nodes never depend on each other (`a_level_never_depends_on_itself`
+// pins it), so a whole level launches at once and the host walks the levels.
+
+// Reach probabilities for one level. `NO_ROW` marks a node whose parent is not
+// of the kind that gather applies to.
+__global__ void k_reach_sweep(const unsigned int* level_node, int lo,
+                              const unsigned int* parent, const unsigned char* player,
+                              const unsigned int* nc, const unsigned int* roff,
+                              const unsigned int* rev_base, const unsigned int* rev_start,
+                              const unsigned int* rev_src, const unsigned int* rev_cell,
+                              const unsigned int* rvd_base, const unsigned int* rvd_start,
+                              const unsigned int* rvd_src, const float* rvd_p,
+                              const float* cur, float* reach, int nodes) {
+    int node = level_node[lo + blockIdx.x];
+    int p = blockIdx.y;
+    int par = parent[node];
+    if (par == 0xffffffffu) return;
+    int me = player[par];
+    int n = nc[2 * node + p];
+    // Where each player's block starts inside a node's reach region.
+    int dst = roff[node] + (p == 1 ? nc[2 * node] : 0);
+    int src = roff[par] + (p == 1 ? nc[2 * par] : 0);
+    for (int c = threadIdx.x; c < n; c += blockDim.x) {
+        if (p != me) {
+            // The idle player's information state does not move, and the
+            // child's support for them is the same list.
+            reach[dst + c] = reach[src + c];
+            continue;
+        }
+        float v = 0.0f;
+        unsigned int rb = rev_base[node];
+        if (rb != 0xffffffffu) {
+            unsigned int a = rev_start[rb + c], b = rev_start[rb + c + 1];
+            for (unsigned int k = a; k < b; ++k)
+                v += reach[src + rev_src[k]] * cur[rev_cell[k]];
+        } else {
+            unsigned int db = rvd_base[node];
+            if (db != 0xffffffffu) {
+                unsigned int a = rvd_start[db + c], b = rvd_start[db + c + 1];
+                for (unsigned int k = a; k < b; ++k)
+                    v += reach[src + rvd_src[k]] * rvd_p[k];
+            }
+        }
+        reach[dst + c] = v;
+    }
+    (void)nodes;
+}
+
+// Value backpropagation and the regret update for one level, one traverser.
+// `kind` is 0 decision, 1 chance, 2 leaf.
+__global__ void k_backprop_sweep(const unsigned int* level_node, int lo,
+                                 const unsigned char* kind, const unsigned char* player,
+                                 const unsigned int* nc, const unsigned int* voff,
+                                 const unsigned int* soff,
+                                 const unsigned int* child_at, const unsigned int* child_n,
+                                 const unsigned int* child,
+                                 const unsigned int* legal_base, const unsigned int* legal_off,
+                                 const unsigned int* legal_child, const unsigned int* legal_trans,
+                                 const unsigned int* draw_base, const unsigned int* draw_start,
+                                 const unsigned int* draw_to, const float* draw_p,
+                                 float* vals, float* cur, float* regret, float* sum,
+                                 int traverser, float da, float db, float dg, float predict) {
+    const float EPS = 1e-6f;
+    const unsigned int NO_TRANS = 0xffffffffu;
+    int node = level_node[lo + blockIdx.x];
+    if (kind[node] == 2) return;
+    int me = player[node];
+    int n = nc[2 * node + traverser];
+    int vi = voff[node];
+
+    if (kind[node] == 1) {
+        int ch = child[child_at[node]];
+        int cv = voff[ch];
+        if (me == traverser) {
+            unsigned int base = draw_base[node];
+            for (int c = threadIdx.x; c < n; c += blockDim.x) {
+                unsigned int a = draw_start[base + c], b = draw_start[base + c + 1];
+                float v = 0.0f;
+                for (unsigned int k = a; k < b; ++k) v += draw_p[k] * vals[cv + draw_to[k]];
+                vals[vi + c] = v;
+            }
+        } else {
+            for (int c = threadIdx.x; c < n; c += blockDim.x) vals[vi + c] = vals[cv + c];
+        }
+        return;
+    }
+
+    if (me != traverser) {
+        // The traverser's information state is unchanged across an opponent
+        // decision, and the opponent's strategy is already in the reaches the
+        // leaf values carry.
+        unsigned int a = child_at[node], k = child_n[node];
+        for (int c = threadIdx.x; c < n; c += blockDim.x) {
+            float v = 0.0f;
+            for (unsigned int j = a; j < a + k; ++j) v += vals[voff[child[j]] + c];
+            vals[vi + c] = v;
+        }
+        return;
+    }
+
+    unsigned int so = soff[node], lb = legal_base[node];
+    for (int c = threadIdx.x; c < n; c += blockDim.x) {
+        unsigned int a = legal_off[lb + c], b = legal_off[lb + c + 1];
+        float base = 0.0f;
+        for (unsigned int cell = a; cell < b; ++cell) {
+            if (legal_trans[so + cell] == NO_TRANS) continue;
+            base += vals[voff[legal_child[so + cell]] + legal_trans[so + cell]]
+                  * cur[so + cell];
+        }
+        vals[vi + c] = base;
+        float total = 0.0f;
+        for (unsigned int cell = a; cell < b; ++cell) {
+            float delta = 0.0f;
+            if (legal_trans[so + cell] != NO_TRANS)
+                delta += vals[voff[legal_child[so + cell]] + legal_trans[so + cell]];
+            delta -= base;
+            float old = regret[so + cell];
+            float r = old * (old > 0.0f ? da : db) + delta;
+            regret[so + cell] = r;
+            float v = fmaxf(r + predict * delta, EPS);
+            cur[so + cell] = v;
+            total += v;
+        }
+        if (total > 0.0f) {
+            float inv = 1.0f / total;
+            for (unsigned int cell = a; cell < b; ++cell) cur[so + cell] *= inv;
+        }
+    }
+    __syncthreads();
+    unsigned int cells = legal_off[lb + n];
+    for (unsigned int k = threadIdx.x; k < cells; k += blockDim.x) sum[so + k] *= dg;
+}
+
 }  // extern "C"
