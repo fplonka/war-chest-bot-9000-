@@ -780,7 +780,7 @@ pub struct Solver<'a> {
     /// the solver still knows the position it stands for, so a growing tree
     /// keeps every one of them.
     pub states: Vec<State>,
-    pub(crate) root_belief: [Belief; 2],
+    pub root_belief: [Belief; 2],
     /// Regrets and the current regret-matching iterate, flat by node over legal
     /// cells. Node `i` occupies `soff[i] ..` for as many cells as its
     /// `legal_action` holds; within that range its config rows are described by

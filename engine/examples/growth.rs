@@ -97,6 +97,31 @@ fn main() {
                 static_iters += sv.nodes.len() as u64;
             }
         }
+        // The same two sweeps, walked over the tree and gathered over the flat
+        // description, on the tree as it finally stands. Which is faster
+        // decides whether the flat form should simply replace the walk on the
+        // host, quite apart from any device.
+        {
+            let reps = 20;
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                sv.precompute_reaches();
+            }
+            let walk_reach = t0.elapsed().as_secs_f64() / reps as f64;
+            let root = [&sv.root_belief[0].p[..], &sv.root_belief[1].p[..]];
+            let mut out = vec![0.0f32; sv.reach.len()];
+            let t1 = std::time::Instant::now();
+            for _ in 0..reps {
+                contract.reach(root, &sv.cur, &mut out);
+            }
+            let flat_reach = t1.elapsed().as_secs_f64() / reps as f64;
+            println!(
+                "  reach: walk {:.2} ms, flat {:.2} ms  ({:.2}x)",
+                1e3 * walk_reach,
+                1e3 * flat_reach,
+                walk_reach / flat_reach
+            );
+        }
         println!(
             "  root {n:2}: {:6} nodes, growth stopped at iteration {:?}, \
              visit concentration {:.3}",
