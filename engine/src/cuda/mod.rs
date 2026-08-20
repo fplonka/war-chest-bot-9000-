@@ -185,6 +185,10 @@ struct Boards {
     g: Option<CudaSlice<f32>>,
     cidx: Option<CudaSlice<u32>>,
     coff: Option<CudaSlice<u32>>,
+    /// Cells and queries actually written, as against `caps`, which is what
+    /// the buffers could hold.
+    cells: usize,
+    queries: usize,
     /// The same offsets on the host. A round has to know where each solve's
     /// queries start to lay the batch out, and reading that back off the card
     /// would sync the stream once per solve per iteration — which is the cost
@@ -479,7 +483,7 @@ impl Card {
     /// Grow `slot` to hold `want` elements and write `src[from..from+n]` at
     /// `at`. One helper for every resident array, since they differ only in
     /// width.
-    fn stash<T: cudarc::driver::DeviceRepr + Default>(
+    fn stash<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default>(
         &self,
         slot: &mut Option<CudaSlice<T>>,
         have: &mut usize,
@@ -823,7 +827,7 @@ impl Card {
         let (mut phi, mut owner, mut cards) = (Vec::new(), Vec::new(), Vec::new());
         let mut n = 0usize;
         for &i in mine {
-            let Call::Configs { phi: ph, owner: ow, cards: cd, n: k } = &calls[i] else {
+            let Call::Configs { phi: ph, owner: ow, cards: cd, n: k, .. } = &calls[i] else {
                 unreachable!("config shard holds only config calls")
             };
             assert_eq!(ph.len(), k * CFEAT, "config phi is not one row a config");

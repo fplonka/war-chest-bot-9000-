@@ -295,15 +295,18 @@ __global__ void k_belief_pool(const float* g, const unsigned int* cidx,
 //
 // One config per thread block so the D-wide dot product is a block reduction;
 // `blockDim.x` must be a power of two.
+// `at` is where this cell sits in the *batch's* `cidx`; `cell` only numbers
+// the span this launch covers. Reading `cidx[cell]` instead reads another
+// solve's config, which is a wrong answer with the right shape.
 __global__ void k_readout(const float* f, const float* h, const float* cf_bias,
-                          const unsigned int* cidx, const unsigned int* coff,
+                          const unsigned int* cidx, const unsigned int* at,
                           const unsigned int* row_of, const float* opp,
                           float* out, int cells, int d) {
     extern __shared__ float red[];
     int cell = blockIdx.x;
     if (cell >= cells) return;
     int r = row_of[cell];
-    const float* fr = f + (size_t)cidx[cell] * d;
+    const float* fr = f + (size_t)cidx[at[cell]] * d;
     const float* hr = h + (size_t)r * d;
     float acc = 0.0f;
     for (int j = threadIdx.x; j < d; j += blockDim.x) acc += fr[j] * hr[j];
@@ -314,7 +317,6 @@ __global__ void k_readout(const float* f, const float* h, const float* cf_bias,
         __syncthreads();
     }
     if (threadIdx.x == 0) out[cell] = (red[0] + *cf_bias) * opp[r];
-    (void)coff;
 }
 
 // ---------------------------------------------------------------- CFR sweeps

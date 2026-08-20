@@ -77,6 +77,10 @@ fn capture(net: &Net, threads: usize, want: usize) -> Vec<Vec<Call>> {
         })
         .collect();
 
+    // The real evaluator: a leaf query reads the board and config vectors the
+    // trunk left with the backend, so a driver that maps `Call::run` over the
+    // calls has nowhere to keep them.
+    let backend = Backend::Reference(net.clone(), Default::default());
     let mut rounds: Vec<Vec<Call>> = Vec::new();
     let mut kinds = [0usize; 3];
     // Keep going until every call kind has been seen a few times, so a pass
@@ -87,7 +91,7 @@ fn capture(net: &Net, threads: usize, want: usize) -> Vec<Vec<Call>> {
             for c in calls {
                 kinds[c.kind()] += 1;
             }
-            calls.iter().map(|c| c.run(net)).collect()
+            backend.run(calls)
         });
         assert!(got.is_some(), "the gate closed while capturing");
     }
@@ -96,7 +100,7 @@ fn capture(net: &Net, threads: usize, want: usize) -> Vec<Vec<Call>> {
     // rounds answered before they can notice the stop flag and leave. Closing
     // first would strand them inside a solve.
     while gate
-        .serve_until_idle(|calls| calls.iter().map(|c| c.run(net)).collect())
+        .serve_until_idle(|calls| backend.run(calls))
         .is_some()
     {}
     gate.close();
@@ -135,9 +139,13 @@ fn compare(device: &Device, reference: &Backend, rounds: &[Vec<Call>]) -> ([usiz
         for (i, call) in calls.iter().enumerate() {
             let k = call.kind();
             seen[k] += 1;
-            let d = worst(&want[i].a, &got[i].a, "a").max(worst(&want[i].b, &got[i].b, "b"));
+            let d = worst(&want[i].a, &got[i].a, "a")
+                .max(worst(&want[i].b, &got[i].b, "b"))
+                .max(worst(&want[i].c, &got[i].c, "c"));
             let solo = device.run(std::slice::from_ref(call));
-            let s = worst(&want[i].a, &solo[0].a, "a").max(worst(&want[i].b, &solo[0].b, "b"));
+            let s = worst(&want[i].a, &solo[0].a, "a")
+                .max(worst(&want[i].b, &solo[0].b, "b"))
+                .max(worst(&want[i].c, &solo[0].c, "c"));
             if d > batched[k] {
                 batched[k] = d;
                 if k == 0 && sample.is_none() {
@@ -190,7 +198,8 @@ fn a_call_answers_the_same_whatever_it_is_batched_with() {
                 let got = device.run(&group[..take]);
                 for i in 0..take {
                     let d = worst(&alone[i].a, &got[i].a, "a")
-                        .max(worst(&alone[i].b, &got[i].b, "b"));
+                        .max(worst(&alone[i].b, &got[i].b, "b"))
+                        .max(worst(&alone[i].c, &got[i].c, "c"));
                     assert!(
                         d < 2e-3,
                         "{} call {i} in a batch of {take} moved by {d}",
