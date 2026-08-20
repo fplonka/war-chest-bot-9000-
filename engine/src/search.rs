@@ -1625,31 +1625,46 @@ impl<'a> Solver<'a> {
     /// would have cost. Growing is free on this path; only the CFR iterations
     /// see a bigger tree, and the early ones see a smaller one.
     fn extend_leaf_batch(&mut self) {
-        let rows = self.leaf_rows.len();
-        if rows > self.batch_rows {
-            // New rows have no cached belief block for either player.
-        }
-        if rows == self.batch_rows && self.ncfg == self.batch_cfgs {
+        let calls = self.growth_calls();
+        if calls.is_empty() {
             return;
+        }
+        let replies = self.nets.grew(calls);
+        self.absorb(&replies);
+    }
+
+    /// The network calls the last growth made necessary: the trunk over fresh
+    /// leaves, the encoder over fresh configs. Empty when nothing grew.
+    ///
+    /// Handed back rather than submitted, because on the device path they ride
+    /// in the same round as the iteration that needs them — the backend runs a
+    /// round's stages in order, so the resident state they write is there
+    /// before the iteration reads it. Parking once an iteration rather than
+    /// twice is the difference between a solve costing sixty-four barriers and
+    /// a hundred and twenty-eight.
+    fn growth_calls(&mut self) -> Vec<Call> {
+        let rows = self.leaf_rows.len();
+        if rows == self.batch_rows && self.ncfg == self.batch_cfgs {
+            return Vec::new();
         }
         if self.nets.value.is_empty() {
             self.batch_rows = rows;
             self.batch_cfgs = self.ncfg;
-            return;
+            return Vec::new();
         }
-        let net = &self.nets.value;
         crate::net::fit(&mut self.xb, 2 * rows * crate::net::POOL);
         let _t = timed!(PUBNET);
-        let xpub = std::mem::take(&mut self.xpub);
         let mut calls = Vec::with_capacity(2);
-        let fresh_rows = rows.saturating_sub(self.batch_rows);
+        let fresh_rows = rows - self.batch_rows;
         if fresh_rows > 0 {
             // The cards in play are fixed at the draft, so every row of the
             // subgame carries the same card block and the table is built once,
             // one view per seat. Everything downstream reads it by canonical
             // coin-type index.
             if self.cards.is_empty() {
-                net.cards(&xpub[..2 * PUBFEAT], 2, &mut self.cards);
+                let xpub = std::mem::take(&mut self.xpub);
+                self.nets.value.cards(&xpub[..2 * PUBFEAT], 2, &mut self.cards);
+                self.xpub = xpub;
             }
             // Exactly the fresh rows. `xpub` is a grown scratch buffer, so an
             // open-ended slice would carry whatever the last, larger subgame
@@ -1669,7 +1684,7 @@ impl<'a> Solver<'a> {
             calls.push(Call::Trunk {
                 solve: Gate::slot(),
                 at: self.batch_rows,
-                xpub: xpub[at..end].to_vec(),
+                xpub: self.xpub[at..end].to_vec(),
                 cards: self.cards.clone(),
                 cidx: self.leaf_cidx[cs..].to_vec(),
                 coff,
@@ -1677,8 +1692,7 @@ impl<'a> Solver<'a> {
             });
             crate::prof::work(fresh_rows, 0, 0, 0);
         }
-        self.xpub = xpub;
-        let fresh_cfgs = self.ncfg.saturating_sub(self.batch_cfgs);
+        let fresh_cfgs = self.ncfg - self.batch_cfgs;
         if fresh_cfgs > 0 {
             calls.push(Call::Configs {
                 solve: Gate::slot(),
@@ -1690,16 +1704,22 @@ impl<'a> Solver<'a> {
             });
             crate::prof::work(0, fresh_cfgs, 0, 0);
         }
-        let replies = self.nets.grew(calls);
+        calls
+    }
+
+    /// Take in what `growth_calls` asked for. The host keeps the board vectors
+    /// because the policy head builds its action embeddings against them, and
+    /// `f_p` for the same reason.
+    fn absorb(&mut self, replies: &[Reply]) {
         let mut at = 0;
-        if fresh_rows > 0 {
+        if self.leaf_rows.len() > self.batch_rows {
             let r = &replies[at];
             self.pb.extend_from_slice(&r.a);
             self.jp.extend_from_slice(&r.b);
-            self.batch_rows = rows;
+            self.batch_rows = self.leaf_rows.len();
             at += 1;
         }
-        if fresh_cfgs > 0 {
+        if self.ncfg > self.batch_cfgs {
             let r = &replies[at];
             self.cf.extend_from_slice(&r.a);
             self.cg.extend_from_slice(&r.b);
@@ -2161,12 +2181,27 @@ impl<'a> Solver<'a> {
             if self.capped {
                 break;
             }
-            // The network over what the last growth added, then the priors it
-            // makes possible, then the iteration itself.
-            self.extend_leaf_batch();
+            // The priors of whatever the *last* round's trunk answered for.
+            // A node is expanded before the batch carrying its board vector
+            // has run, so its prior was always an iteration behind; computing
+            // it here rather than between two rounds keeps that lag and buys
+            // the whole iteration one barrier instead of two.
             self.refresh_priors();
-            for leaf in self.iterate_on_device() {
-                if leaf == crate::contract::NO_ROW || self.nodes.len() >= self.cfg.nodes || self.over_cap() {
+            let mut calls = self.growth_calls();
+            let growth = calls.len();
+            // The iteration's decay factors read the step count as it stands,
+            // so both calls are built before it advances.
+            calls.push(self.tree_call());
+            calls.push(self.iterate_call());
+            self.steps = [self.steps[0] + 1, self.steps[1] + 1];
+            self.avg_touched = [true; 2];
+            let replies = self.nets.grew(calls);
+            self.absorb(&replies[..growth]);
+            for &leaf in &replies[growth + 1].leaves.clone() {
+                if leaf == crate::contract::NO_ROW
+                    || self.nodes.len() >= self.cfg.nodes
+                    || self.over_cap()
+                {
                     continue;
                 }
                 let leaf = leaf as usize;
@@ -2184,14 +2219,31 @@ impl<'a> Solver<'a> {
             // values and the beliefs it harvests -- is a second read, because
             // the value pass under the reference is most of a CFR iteration
             // and a solve that nobody collects should not pay for it.
-            self.extend_leaf_batch();
-            let tree = self.tree_call();
-            let read = self.read_call(true, [(0, 0); 2], Vec::new());
-            let mut replies = self.nets.grew(vec![tree, read]);
+            let mut calls = self.growth_calls();
+            let growth = calls.len();
+            calls.push(self.tree_call());
+            calls.push(self.read_call(true, [(0, 0); 2], Vec::new()));
+            let replies = self.nets.grew(calls);
+            self.absorb(&replies[..growth]);
             self.avg = vec![0.0; self.ncells];
             let (at, cells) = self.root_cells();
-            self.avg[at..at + cells].copy_from_slice(&replies[1].b);
-            std::mem::take(&mut replies[1]);
+            self.avg[at..at + cells].copy_from_slice(&replies[growth + 1].b);
+        }
+    }
+
+    fn iterate_call(&self) -> Call {
+        let k = self.cfg.cfr;
+        let m = self.steps[0] as f32 + 1.0;
+        Call::Iterate {
+            solve: Gate::slot(),
+            factors: (
+                Cfr::factor(m, k.alpha),
+                Cfr::factor(m, k.beta),
+                (m / (m + 1.0)).powf(k.gamma),
+            ),
+            predict: k.predict,
+            expand: self.cfg.expand,
+            puct: self.cfg.puct,
         }
     }
 
@@ -2220,31 +2272,6 @@ impl<'a> Solver<'a> {
             policy_at: if finish { (at as u32, cells as u32) } else { (0, 0) },
             reach_at,
         }
-    }
-
-    /// One GT-CFR iteration on the card: the tree brought up to date, then the
-    /// iteration and its expansion phase. What comes back is the leaves.
-    fn iterate_on_device(&mut self) -> Vec<u32> {
-        let k = self.cfg.cfr;
-        let m = self.steps[0] as f32 + 1.0;
-        let calls = vec![
-            self.tree_call(),
-            Call::Iterate {
-                solve: Gate::slot(),
-                factors: (
-                    Cfr::factor(m, k.alpha),
-                    Cfr::factor(m, k.beta),
-                    (m / (m + 1.0)).powf(k.gamma),
-                ),
-                predict: k.predict,
-                expand: self.cfg.expand,
-                puct: self.cfg.puct,
-            },
-        ];
-        self.steps = [self.steps[0] + 1, self.steps[1] + 1];
-        self.avg_touched = [true; 2];
-        let mut replies = self.nets.grew(calls);
-        std::mem::take(&mut replies[1].leaves)
     }
 
     /// Everything the card has yet to be told about the tree: the description

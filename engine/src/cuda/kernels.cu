@@ -253,9 +253,96 @@ __global__ void k_bag(const float* bag, const float* phi,
     g[i] += acc;
 }
 
+// A norm that reads one buffer and writes another.
+//
+// The residual blocks of the join normalise a copy of `z` and leave `z` alone,
+// which as `memcpy` then `k_layernorm` is four passes over `[rows, width]` for
+// what is two. `blockDim.x` must be a power of two for the reduction.
+__global__ void k_norm_to(const float* src, float* dst, const float* gamma,
+                          const float* beta, int rows, int width, int act) {
+    extern __shared__ float sh[];
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    const float* row = src + (size_t)r * width;
+    float sum = 0.0f;
+    for (int j = threadIdx.x; j < width; j += blockDim.x) sum += row[j];
+    sh[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    float mean = sh[0] / width;
+    __syncthreads();
+    float var = 0.0f;
+    for (int j = threadIdx.x; j < width; j += blockDim.x) {
+        float d = row[j] - mean;
+        var += d * d;
+    }
+    sh[threadIdx.x] = var;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv = rsqrtf(sh[0] / width + 1e-5f);
+    for (int j = threadIdx.x; j < width; j += blockDim.x) {
+        float v = (row[j] - mean) * inv * gamma[j] + beta[j];
+        dst[(size_t)r * width + j] = act ? gelu1(v) : v;
+    }
+}
+
 // `[own pooled | opponent pooled | seat]`, the join's belief-dependent input.
 // The queried seat is per row because a round joins solves that are asking
 // about different players.
+// One residual block of the join, fused.
+//
+// A block is a norm, a 128-wide matrix multiply and an add. Written as four
+// kernels that is nine passes over `[rows, width]` for a multiply whose own
+// traffic is two — and at this width the multiply already sits at the card's
+// flop-per-byte balance, so what the block costs is the elementwise work around
+// it rather than the arithmetic. One thread block a row keeps the row in shared
+// memory and touches `z` once each way; the weights come out of L2, where every
+// block in flight is reading the same 64 KB.
+//
+// `blockDim.x` is the width, which is `JW`.
+__global__ void k_join_block(float* z, const float* gamma, const float* beta,
+                             const float* w, const float* bias, int rows, int width) {
+    extern __shared__ float sh[];
+    __shared__ float red[32];
+    float* row = sh;
+    float* t = sh + width;
+    int r = blockIdx.x, j = threadIdx.x;
+    if (r >= rows) return;
+    float v = z[(size_t)r * width + j];
+    row[j] = v;
+
+    // Mean, then variance, both over the row.
+    for (int pass = 0; pass < 2; ++pass) {
+        float x = pass == 0 ? v : (v - red[0]) * (v - red[0]);
+        for (int k = 16; k > 0; k >>= 1) x += __shfl_down_sync(0xffffffff, x, k);
+        if ((j & 31) == 0) red[j >> 5] = x;
+        __syncthreads();
+        if (j == 0) {
+            float tot = 0.0f;
+            for (int k = 0; k < blockDim.x / 32; ++k) tot += red[k];
+            red[0] = tot / width;
+        }
+        __syncthreads();
+        if (pass == 0) v = row[j];
+    }
+    float inv = rsqrtf(red[0] + 1e-5f);
+    // `red[0]` is the variance here and the mean on the pass before, so the
+    // mean is taken from the row again rather than kept across the barrier.
+    __syncthreads();
+    t[j] = gelu1((row[j] - (0.0f)) * inv * gamma[j] + beta[j]);
+    __syncthreads();
+
+    float acc = bias[j];
+    for (int k = 0; k < width; ++k) acc += t[k] * w[(size_t)k * width + j];
+    z[(size_t)r * width + j] = row[j] + acc;
+}
+
 // `[own pooled | opponent pooled | seat]`, the join's belief-dependent input.
 //
 // The batch is both traversers back to back -- rows `0..stride` ask about
@@ -839,14 +926,16 @@ __global__ void k_terminals(const Tree* trees) {
 // `cur` still holds the literal initial policy for a player that has not
 // traversed yet, so a row whose sum has not moved keeps it rather than being
 // reconstructed by a multiply and a divide that need not round back.
-__global__ void k_finish(const Tree* trees, int level, int touched) {
+__global__ void k_finish(const Tree* trees, int level, const int* touched) {
+    int mask = touched[blockIdx.y];
+    if (mask < 0) return;
     const Tree& t = trees[blockIdx.y];
     unsigned int node;
     if (!level_task(t, level, blockIdx.x, &node)) return;
     if (t.kind[node] != 0) return;
     unsigned int me = t.player[node], so = t.soff[node], lb = t.legal_base[node];
     unsigned int n = t.nc[2 * node + me];
-    bool moved = (touched >> me) & 1;
+    bool moved = (mask >> me) & 1;
     for (unsigned int c = threadIdx.x; c < n; c += blockDim.x) {
         unsigned int a = t.legal_off[lb + c], b = t.legal_off[lb + c + 1];
         if (!moved) {

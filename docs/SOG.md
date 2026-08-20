@@ -1,8 +1,8 @@
 # Student of Games, and where the device port stands
 
 The engine follows Student of Games (`papers/SoG_2112.03178.pdf`), not ReBeL.
-Four things the paper specifies; three are in and verified, the fourth is half
-done.
+Four things the paper specifies. All four are in and held to the CPU solver by
+test.
 
 ## What the paper asks for, and what answers it
 
@@ -39,100 +39,107 @@ gamma = 1`. The gamma needs care — a sum decayed by `(t/(t+1))^gamma` weights
 iterate `j` by `(j+1)^gamma`, so *linear* is 1, not the 2 `Cfr::PLUS` carries.
 `step` traverses both players against one reach profile.
 
-**The CFR loop on the device.** Half done. See below.
+**The CFR loop on the device.** Done. See below: a solve's tree, its arenas
+and its network state stay on the card, and one call is a whole GT-CFR
+iteration -- the sweeps, the network, the regret update, the average strategy
+and the expansion trajectories. The host keeps growth, which is the game rules.
 
 ## The device
 
-The wall was never arithmetic. Throughput pinned at ~380k network rows/s
+**The wall was never arithmetic.** Throughput pinned at ~380k network rows/s
 whatever the thread count, with the CPUs at 13% and the cards at 20%: ~3 KB
 crossed the bus per join row per iteration and 87% of it was data the card had
 just produced. So a solve's board vectors, `f`, `g` and belief index stay with
 the backend, a round shards by *solve* so every call of one reaches the backend
-holding its state, and `Call::Leaf` is a whole CFR iteration — beliefs in,
-counterfactual values out. The pooled block and the head never leave.
+holding its state, and the pooled block and the head never leave.
 
-`farm::leaf` is the CPU reference and the oracle the kernels answer to.
-`a_gated_solve_matches_an_ungated_one_exactly` holds the batched and unbatched
-paths to byte equality on packed rows, beliefs and targets.
+That fixed the traffic and left three further walls, each smaller than the last
+and each a different shape.
 
-**The CFR sweeps.** `contract.rs` describes the tree as flat arrays with the
-reach transition transposed from a scatter into a gather; both sweeps reproduce
-the solver bit for bit, and a whole solve driven from the description reaches a
-byte-identical strategy. `Contract::extend` keeps the description current for 49
-cpu-ms per three solves where a rebuild cost 1651 — the tax that made the port
-not worth doing at all. `k_reach_sweep` and `k_backprop_sweep` transcribe the
-two, one block per (node, player) with threads over that node's configs, so
-neither needs a task list.
+**A round is the unit, not a solve.** Three stages of the leaf pass launched
+once per solve, because `f`, `g`, `p` and `jp` are resident per solve. A round
+holds thirty-odd of them, so the cards idled between thousands of small kernels
+a second: 61% of the pass was launches, at ~52 µs a call against the 5-10 µs a
+launch normally takes. The solves' arrays travel as an array of device pointers
+now and every stage is one launch. Two things hid inside that number.
+`CudaSlice::clone` allocates and copies *on the device*, so the per-solve part
+list had been duplicating every resident `f` and `g` once per CFR iteration.
+And the readout took a list of cells, which the host built at twelve million
+entries a round to say what the offsets in `coff` already said.
 
-`Device::keep_tree` and `Device::sweep` drive them: reach forward from level
-one, backpropagation backward, one launch a level. The sweeps are compiled but
-not yet wired into a solve.
+**The whole CFR loop moved.** The arenas an iteration reads — reach, values,
+regrets, the iterate, the strategy sum, the action values, the visit counts —
+are 4.9 to 33 MB over three real solves. Copying them for an expansion phase
+that runs on the host is 153 GB/s at the target rate against roughly 50 across
+two PCIe links, so the sweeps could never move on their own: either the
+expansion went with them or neither did.
 
-**Where it stands, measured.** The fused leaf pass agrees with the CPU network
-to 2.6e-6 on one card and on two, with batch invariance holding. Row throughput
-went from 380k/s before the fusion to **1.1M/s** after — but it is still a
-wall: 36, 72 and 144 threads all land there, at a constant **0.9 µs a row**,
-while the cards sit at **14–27%** utilisation and the host waits inside
-`Backend::run` for 91% of wall clock.
+Both went. A solve keeps its tree, its arenas and its network state on the card,
+and one call runs a whole GT-CFR iteration there: reach forward from the root
+beliefs, the network at every leaf, the terminals, backpropagation and the
+regret update for both players, the average strategy, and the expansion
+trajectories. What crosses per iteration is the handful of leaves the expansion
+sampled.
 
-0.9 µs a row is ~330 GFLOP/s against the ~71 TFLOP/s the two cards have. Half a
-percent of peak. Whatever costs that time, it is not arithmetic.
+The host still grows, because growth is the game rules. Two rounds an iteration
+carry that: the trunk and the config encoder over what the last growth added,
+then the tree delta and the iteration. `Gate::submit_all` is what lets a thread
+raise both calls of a round at once.
 
-Timed inside the leaf pass, over a 120 s probe on two cards:
+A level's nodes never depend on each other and neither do two solves, so one
+launch covers a level of the whole round — `blockIdx.y` is the solve, and a
+solve with a shallower tree simply has no work at the deeper levels. Each
+solve's forty-odd arrays reach the kernels through one descriptor rather than
+forty arrays of pointers; the field order is `Card::describe` against `struct
+Tree` in `kernels.cu`, positional because every field is eight bytes wide.
 
-| | ms | share |
-|---|---:|---:|
-| host marshalling | 13,851 | 24% |
-| uploads | 3,505 | 6% |
-| launches | 35,696 | **61%** |
-| the one download | 5,523 | 9% |
+**Fewer, larger launches.** What was left was the round doing in many launches
+what it can do in one. A growth touches a tail of each of thirty arrays and a
+round holds thirty-odd solves, which is a thousand stream operations a round —
+more host time than every kernel of the iteration together; they travel
+concatenated now, one buffer up and one kernel to place the pieces. The two
+traversers were two passes over everything and are one: the beliefs and the
+pooling do not depend on which seat is asking, the join and the readout run
+over a batch of twice the rows rather than twice over one, and value
+backpropagation runs both at once off `blockIdx.z`. The average strategy folded
+into the reach sweep, which is where the reach it needs already is. And the
+expansion is a warp a solve rather than a thread — a trajectory is sequential,
+but each step sums an opponent's whole reach and scans a legal row.
 
-The guess above — pageable uploads serialising the stream — was wrong. Uploads
-are 6%. **Launches are 61%, and they cost ~52 µs a call**, against the 5–10 µs
-a launch normally takes.
+**A slot gives its pages back.** A gate slot is reused by whichever solve takes
+it next, and a solve's cost varies twenty-six fold, so a slot that kept the
+largest tree it had ever served needed the worst case in every slot at once
+rather than what is in flight. At 144 threads that filled a 24 GB card.
+Allocation is stream-ordered, so releasing returns the pages to a pool the
+other slots draw from.
 
-The cause is structural rather than a tuning error. `g` and `f` are resident
-*per solve*, so the pooling and the readout cannot be one launch over the round
-— they are one launch per solve, twice, and a round holds thirty-odd solves.
-Small kernels, thousands a second, and the cards idle between them.
+### Two differences from the host loop, both deliberate
 
-The fix is the layout the architecture at `f5f4c05^` used and this one dropped:
-one card-wide arena with each solve occupying a slice of it, so a stage is a
-single launch over the whole round with per-query base offsets, rather than one
-launch a solve. That is the next thing to build, and it is the same shape as
-every other finding here — the traffic and the launches both come from treating
-a solve as the unit when the round is.
+An expansion phase's simulations all run before the host grows any of them, so
+two can land on the same leaf and the second is dropped. On the host each
+simulation grows its leaf before the next starts, so a later one can walk
+*through* what an earlier added. The visit counts a trajectory leaves behind —
+the paper's virtual loss — are what makes the collision rare rather than usual.
 
-At the frozen budget this is **1.5 solves/s**, against 1.4 before. The fusion's
-2.9x in rows/s was spent exactly, and only, on the doubling of rows a solve that
-simultaneous updates brought.
+And a device solve's random stream is read off the game's rather than drawn
+from it. The host spends draws inside `sample_leaf`; if the device spent one
+too, the two paths would sample different actions afterwards even when told to
+grow nothing, and nothing could be compared.
 
-**But the sweeps cannot move on their own, and this is the thing to settle
-first.** `sample_leaf` — the expansion phase — runs on the host and reads
-exactly the arenas the sweeps write: `cur`, `sum_strat`, `qval`, `visits`,
-`prior`, `reach`.
+### What holds it honest
 
-Measured, those arenas are **4.9, 9.7 and 33.1 MB** over three real solves — a
-mean of 16 MB a round trip, not the 2 MB a rough estimate suggested. Over 64
-iterations that is **1 GB a solve**, and at 150 solves/s **153 GB/s**, against
-roughly 50 GB/s across two PCIe 4.0 x16 links. Three times over the bus, before
-any of the network's own traffic. Making the arenas resident and leaving
-expansion on the host is not slow, it is impossible.
-
-Walking the trajectory from the host instead of bulk-copying does not rescue
-it: a trajectory is data-dependent and sequential, so it becomes ~160 tiny
-round trips an iteration, and latency replaces bandwidth as the wall.
-
-So either the expansion phase moves to the device with the sweeps — which is
-what the architecture at `f5f4c05^` did, trajectories and PUCT statistics on the
-card, nothing returning per iteration — or the sweeps stay on the host at the
-~146 solves/s ceiling they impose. There is no version where they move alone.
-
-A sweep must hand back `qval` as well as the values. The expansion phase reads
-it as PUCT's Q, and a sweep that computes each action value and drops it leaves
-selection blind: the numbers stay right and the search grows a different tree.
-Per-iteration comparisons cannot see this, because each one starts from a tree
-the walk advanced. Only driving a whole solve from the description shows it.
+`cuda_parity` has three tests. `the_network_agrees` checks the trunk and the
+config encoder call by call against the CPU network, because those are the two
+passes whose answers still cross the bus. `the_cfr_loop_agrees_on_a_fixed_tree`
+runs real self-play through both backends with `expand = 0` — neither side
+grows, so both solve the tree `Solver::new` built and every number is of the
+same thing. Over eight iterations the targets agree to `9.8e-6` and the policy
+to `5.2e-3`. With growth on the trees part company at the first repeated leaf,
+so `growth_on_the_device_produces_sane_targets` checks the scale instead: a run
+whose regrets or reaches were carried over from the solve before blows up there
+long before it produces a plausible spread. That test is what caught the two
+real bugs of the port, both the same shape — a slot reused without being
+forgotten.
 
 ## Numbers to size against
 

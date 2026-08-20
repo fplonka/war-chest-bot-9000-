@@ -894,3 +894,70 @@ them would be hiding something rather than showing it. The second is that
 `v4-12h` leads everywhere, on both sets and in every band, which is the least
 surprising result here: it is trained six times longer than anything else in
 the field.
+
+
+## The CFR loop is not something a host can keep
+
+The device port stalled for a long time on a question that reads like a
+scheduling detail and is not: whether the CFR sweeps could move to the card on
+their own, leaving the expansion phase where it was.
+
+They could not, and the reason is worth stating in one line. The expansion
+phase reads exactly the arenas the sweeps write -- the current iterate, the
+strategy sum, the action values, the visit counts, the priors and the reaches.
+Measured over three real solves those are 4.9, 9.7 and 33.1 MB, a mean of 16 MB
+a round trip. Over sixty-four iterations that is a gigabyte a solve, and at a
+hundred and fifty solves a second, 153 GB/s against roughly 50 across two PCIe
+4.0 x16 links. Three times over the bus before any of the network's own
+traffic.
+
+Walking the trajectory from the host instead of bulk-copying does not rescue
+it. A trajectory is data-dependent and sequential, so it becomes about a
+hundred and sixty tiny round trips an iteration and latency replaces bandwidth
+as the wall.
+
+So the choice was never "which half moves". Either the expansion went with the
+sweeps or neither did, and the host stayed at the ceiling its own passes
+imposed.
+
+Both moved. What is left on the host is growth, because growth is the game
+rules: the card samples the leaves and the host turns them into decision nodes
+and describes them. Two rounds an iteration carry that -- the network over what
+the last growth added, then the tree delta and the iteration itself.
+
+### What the port cost, and what it kept
+
+Three walls fell in order, and each was a different shape.
+
+**Traffic.** A solve's board vectors, `f`, `g` and belief index stay with the
+backend, so a round shards by solve and the pooled block and the head never
+leave. That took row throughput from 380k/s to 1.1M/s.
+
+**Launches.** Three stages of the leaf pass launched once per solve, because
+those resident arrays are per solve. A round holds thirty-odd of them, and the
+cards idled between thousands of small kernels a second. The arrays travel as
+an array of device pointers now and a stage is one launch. Hidden inside that:
+`CudaSlice::clone` allocates and copies *on the device*, so the per-solve part
+list had been duplicating every resident `f` and `g` once per CFR iteration.
+
+**Marshalling.** With the launches gone, three quarters of the pass was the
+host building a twelve-million-entry list of cells for the readout -- to say
+what the offsets it already had said. A row's cells are the span its own query
+names in `coff`; nothing needs a list.
+
+### Two bugs, one shape
+
+Both real bugs of the port were the same mistake. A gate slot is reused by
+whichever solve takes it next, and the first version left the previous solve's
+state in it: the tree pools, because the append tracked a length that was
+another tree's; and the regrets, the visit counts and the strategy sum, because
+they accumulate and nothing zeroed them. The symptom was clean and misleading
+-- the first decision of every game agreed with the CPU exactly, and the second
+did not, because the first solve to take a slot always finds it empty.
+
+The fix for the second is also what makes the card hold more solves at once. A
+solve's cost varies twenty-six fold, so a slot that kept the largest tree it
+had ever served needed the worst case in every slot rather than what is in
+flight. Releasing between solves returns the pages to a pool the other slots
+draw from, which is the difference between filling a 24 GB card at 144 threads
+and sitting at a third of it.
