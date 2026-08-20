@@ -55,12 +55,23 @@ counterfactual values out. The pooled block and the head never leave.
 `a_gated_solve_matches_an_ungated_one_exactly` holds the batched and unbatched
 paths to byte equality on packed rows, beliefs and targets.
 
-**Not done:** the CFR sweeps themselves. `contract.rs` describes the tree as
-flat arrays with the reach transition transposed from a scatter into a gather,
-and both sweeps reproduce the solver bit for bit. `Contract::extend` keeps that
-description current for 49 cpu-ms per three solves where a rebuild cost 1651 —
-the tax that made the port not worth doing. What remains is the kernels and
-their parity.
+**The CFR sweeps.** `contract.rs` describes the tree as flat arrays with the
+reach transition transposed from a scatter into a gather; both sweeps reproduce
+the solver bit for bit, and a whole solve driven from the description reaches a
+byte-identical strategy. `Contract::extend` keeps the description current for 49
+cpu-ms per three solves where a rebuild cost 1651 — the tax that made the port
+not worth doing at all. `k_reach_sweep` and `k_backprop_sweep` transcribe the
+two, one block per (node, player) with threads over that node's configs, so
+neither needs a task list.
+
+What remains is the driver — uploading a description, walking the levels — and
+`cuda_parity` over the result. **None of the CUDA has been compiled.**
+
+A sweep must hand back `qval` as well as the values. The expansion phase reads
+it as PUCT's Q, and a sweep that computes each action value and drops it leaves
+selection blind: the numbers stay right and the search grows a different tree.
+Per-iteration comparisons cannot see this, because each one starts from a tree
+the walk advanced. Only driving a whole solve from the description shows it.
 
 ## Numbers to size against
 
