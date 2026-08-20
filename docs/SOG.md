@@ -76,13 +76,32 @@ while the cards sit at **14–27%** utilisation and the host waits inside
 `Backend::run` for 91% of wall clock.
 
 0.9 µs a row is ~330 GFLOP/s against the ~71 TFLOP/s the two cards have. Half a
-percent of peak. Whatever costs that time, it is not arithmetic. The leading
-suspect is that every `up()` copies from a pageable `Vec`, which makes each
-host-to-device transfer synchronous and serialises the stream; a leaf pass does
-roughly a dozen of them plus two launches and two device-to-device copies per
-solve. Pinned host buffers and fewer, larger transfers are the next thing to
-try, and the next thing to *measure* — the last four guesses in this file were
-all wrong.
+percent of peak. Whatever costs that time, it is not arithmetic.
+
+Timed inside the leaf pass, over a 120 s probe on two cards:
+
+| | ms | share |
+|---|---:|---:|
+| host marshalling | 13,851 | 24% |
+| uploads | 3,505 | 6% |
+| launches | 35,696 | **61%** |
+| the one download | 5,523 | 9% |
+
+The guess above — pageable uploads serialising the stream — was wrong. Uploads
+are 6%. **Launches are 61%, and they cost ~52 µs a call**, against the 5–10 µs
+a launch normally takes.
+
+The cause is structural rather than a tuning error. `g` and `f` are resident
+*per solve*, so the pooling and the readout cannot be one launch over the round
+— they are one launch per solve, twice, and a round holds thirty-odd solves.
+Small kernels, thousands a second, and the cards idle between them.
+
+The fix is the layout the architecture at `f5f4c05^` used and this one dropped:
+one card-wide arena with each solve occupying a slice of it, so a stage is a
+single launch over the whole round with per-query base offsets, rather than one
+launch a solve. That is the next thing to build, and it is the same shape as
+every other finding here — the traffic and the launches both come from treating
+a solve as the unit when the round is.
 
 At the frozen budget this is **1.5 solves/s**, against 1.4 before. The fusion's
 2.9x in rows/s was spent exactly, and only, on the doubling of rows a solve that

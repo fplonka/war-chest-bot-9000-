@@ -47,6 +47,23 @@ use crate::rebel::{
 
 type Res<T> = Result<T, String>;
 
+/// Where a leaf pass spends its wall clock: host marshalling, the uploads, the
+/// launches, the one download. Cards are 20% busy while the host waits inside
+/// this call, so which of these four it is decides everything.
+pub static LEAF_NS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Report and reset.
+pub fn leaf_breakdown() -> [f64; 4] {
+    std::array::from_fn(|i| {
+        LEAF_NS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
+    })
+}
+
 const KERNELS: &str = include_str!("kernels.cu");
 
 /// Everything in `kernels.cu`, resolved once at startup so a name that does not
@@ -926,6 +943,7 @@ impl Card {
         if mine.is_empty() {
             return Ok(());
         }
+        let mark = std::time::Instant::now();
         let (mut w, mut opp, mut player) = (Vec::new(), Vec::new(), Vec::new());
         let mut rows = 0usize;
         for &i in mine {
@@ -978,10 +996,14 @@ impl Card {
                 row += n;
             }
         }
+        let t_marshal = mark.elapsed();
+        let mark = std::time::Instant::now();
         let w_d = self.up(&w)?;
         let opp_d = self.up(&opp)?;
         let player_d = self.up(&player)?;
         let coff_d = self.up(&coff)?;
+        let t_up = mark.elapsed();
+        let mark = std::time::Instant::now();
 
         // The belief block, from each solve's resident `g`.
         let mut pooled = self.alloc(queries * POOL)?;
@@ -1098,7 +1120,14 @@ impl Card {
             }
             .map_err(err)?;
         }
+        let t_launch = mark.elapsed();
+        let mark = std::time::Instant::now();
         let host = self.down(&vals, cells.max(1))?;
+        let t_down = mark.elapsed();
+        LEAF_NS[0].fetch_add(t_marshal.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        LEAF_NS[1].fetch_add(t_up.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        LEAF_NS[2].fetch_add(t_launch.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        LEAF_NS[3].fetch_add(t_down.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         for (&i, &(lo, hi)) in mine.iter().zip(&spans) {
             out.push((i, Reply { a: host[lo..hi].to_vec(), ..Default::default() }));
         }

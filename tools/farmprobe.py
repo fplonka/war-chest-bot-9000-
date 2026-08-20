@@ -90,6 +90,11 @@ def main():
     # is the time a solver spends inside `submit`, so it is the device plus the
     # wait for the round, not the device alone.
     warchest.prof_dump()
+    b = warchest.leaf_breakdown()
+    if b:
+        names = ("marshal", "upload", "launch", "download")
+        print("device leaf pass, ms: " +
+              "  ".join(f"{n}={v:.0f}" for n, v in zip(names, b)))
 
 
 if __name__ == "__main__":

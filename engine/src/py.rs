@@ -903,6 +903,18 @@ fn infer_policy(
     ))
 }
 
+/// Where the device's leaf pass spends its wall clock, in ms since the last
+/// call: host marshalling, uploads, launches, the download.
+#[pyfunction]
+fn leaf_breakdown() -> Vec<f64> {
+    #[cfg(feature = "gpu")]
+    {
+        return crate::cuda::leaf_breakdown().to_vec();
+    }
+    #[cfg(not(feature = "gpu"))]
+    Vec::new()
+}
+
 /// All 37 hexes' axial coords, indexed by hex. The browser UI's board
 /// geometry; mirrors `Board::coord`.
 #[pyfunction]
@@ -1123,5 +1135,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gen_data, m)?)?;
         m.add_function(wrap_pyfunction!(infer, m)?)?;
         m.add_function(wrap_pyfunction!(infer_policy, m)?)?;
+        m.add_function(wrap_pyfunction!(leaf_breakdown, m)?)?;
     Ok(())
 }
