@@ -72,10 +72,17 @@ __global__ void k_layernorm(float* x, const float* gamma, const float* beta,
     }
 }
 
-// `out[r, j] += b[j]` — the per-column bias a GEMM does not carry.
+// `out[r, j] += b[j]` -- the per-column bias a GEMM does not carry.
+//
+// Row down `blockIdx.x`, column across the block. A flat index would need
+// `i / width` and `i % width`, and an integer division is twenty-odd cycles
+// against the one add this kernel exists to do: over a round's four hundred
+// thousand join rows that was a hundred and thirty million divisions.
 __global__ void k_bias(float* out, const float* b, int rows, int width) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < rows * width) out[i] += b[i % width];
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    float* row = out + (size_t)r * width;
+    for (int j = threadIdx.x; j < width; j += blockDim.x) row[j] += b[j];
 }
 
 // `out[cell, j] += bias[cell / span, j]` — a per-row vector broadcast down a
@@ -352,15 +359,18 @@ __global__ void k_join_block(float* z, const float* gamma, const float* beta,
 // the launches.
 __global__ void k_join_input(const float* pooled, float* out, int rows, int pool,
                              int stride) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int r = blockIdx.x;
+    if (r >= rows) return;
     int width = 2 * pool + 1;
-    if (i >= rows * width) return;
-    int r = i / width, j = i % width;
     int p = r / stride, q = r % stride;
-    if (j < pool) out[i] = pooled[((size_t)2 * q + p) * pool + j];
-    else if (j < 2 * pool)
-        out[i] = pooled[((size_t)2 * q + 1 - p) * pool + j - pool];
-    else out[i] = p == 0 ? -1.0f : 1.0f;
+    const float* mine = pooled + ((size_t)2 * q + p) * pool;
+    const float* theirs = pooled + ((size_t)2 * q + 1 - p) * pool;
+    float* dst = out + (size_t)r * width;
+    for (int j = threadIdx.x; j < pool; j += blockDim.x) {
+        dst[j] = mine[j];
+        dst[pool + j] = theirs[j];
+    }
+    if (threadIdx.x == 0) dst[2 * pool] = p == 0 ? -1.0f : 1.0f;
 }
 
 // ------------------------------------------------------ a round of solves
@@ -698,12 +708,13 @@ __global__ void k_beliefs(const Tree* trees, const int* part_of_row,
 __global__ void k_gather(const Tree* trees, const int* part_of_row,
                          const int* local_row, int which, float* out,
                          int rows, int width, int stride) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * width) return;
-    int r = (i / width) % stride, j = i % width;
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    int r = row % stride;
     const Tree& t = trees[part_of_row[r]];
-    const float* src = which == 0 ? t.p : t.jp;
-    out[i] = src[(size_t)local_row[r] * width + j];
+    const float* src = (which == 0 ? t.p : t.jp) + (size_t)local_row[r] * width;
+    float* dst = out + (size_t)row * width;
+    for (int j = threadIdx.x; j < width; j += blockDim.x) dst[j] = src[j];
 }
 
 // The belief block the join reads: `sum_c beta(c) g(c)` over one query's

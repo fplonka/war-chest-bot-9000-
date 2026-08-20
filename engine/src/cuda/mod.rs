@@ -193,8 +193,20 @@ fn spread(n: usize) -> LaunchConfig {
     }
 }
 
-/// One block per row, and a power-of-two block width so the reduction inside
-/// `k_layernorm` halves cleanly.
+/// One block per row, threads across the row. What every kernel that walks a
+/// `[rows, width]` matrix wants: a flat index would need a division and a
+/// modulo per element, which is twenty-odd cycles against the one operation
+/// the kernel is there to do.
+fn rows_of(rows: usize, width: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (rows.max(1) as u32, 1, 1),
+        block_dim: (width.next_power_of_two().clamp(32, 256) as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// The same, with room for `k_layernorm`'s reduction. Its block width must be a
+/// power of two so the halving is clean.
 fn per_row(rows: usize, width: usize) -> LaunchConfig {
     let threads = width.next_power_of_two().clamp(32, 256) as u32;
     LaunchConfig {
@@ -689,8 +701,14 @@ impl Card {
             return Ok(());
         }
         let bias = self.b.slice(s.b..s.b + s.o);
-        let (rows, width) = (rows as i32, s.o as i32);
-        launch!(self, bias, rows as usize * s.o, out, &bias, &rows, &width)
+        let (rows_i, width) = (rows as i32, s.o as i32);
+        unsafe {
+            self.stream
+                .launch_builder(&self.k.bias)
+                .arg(out).arg(&bias).arg(&rows_i).arg(&width)
+                .launch_unit(rows_of(rows, s.o))
+        }
+        .map_err(err)
     }
 
     /// `Lin::run`: the GEMM and then the bias.
@@ -1464,9 +1482,29 @@ impl Card {
         // neither needs a copy of its own.
         self.stage(6, || {
             let (zero, one, jw_i) = (0i32, 1i32, JW as i32);
-            launch!(self, gather, rows * D, trees, part_d, local_d, &zero, &mut *h, &rows_i, &d_i, &stride_i)?;
-            launch!(self, gather, rows * JW, trees, part_d, local_d, &one, &mut *z, &rows_i, &jw_i, &stride_i)?;
-            launch!(self, join_input, rows * JOIN_IN, &*pooled, &mut *input, &rows_i, &pool_i, &stride_i)?;
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.gather)
+                    .arg(trees).arg(part_d).arg(local_d).arg(&zero)
+                    .arg(&mut *h).arg(&rows_i).arg(&d_i).arg(&stride_i)
+                    .launch_unit(rows_of(rows, D))
+            }
+            .map_err(err)?;
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.gather)
+                    .arg(trees).arg(part_d).arg(local_d).arg(&one)
+                    .arg(&mut *z).arg(&rows_i).arg(&jw_i).arg(&stride_i)
+                    .launch_unit(rows_of(rows, JW))
+            }
+            .map_err(err)?;
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.join_input)
+                    .arg(&*pooled).arg(&mut *input).arg(&rows_i).arg(&pool_i).arg(&stride_i)
+                    .launch_unit(rows_of(rows, POOL))
+            }
+            .map_err(err)?;
             self.lin(l.join_b, &*input, rows, 1.0, &mut *z)?;
             self.bias(l.join_b, rows, z)?;
             // A residual block is a norm, a multiply and an add. The norm reads
