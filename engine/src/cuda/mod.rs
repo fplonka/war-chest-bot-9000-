@@ -245,6 +245,42 @@ pub struct Device {
 }
 
 /// The running sums of the join's biases, in the order its norms read them.
+/// The trunk's two square matrices a block, permuted so that one lane's three
+/// channels of a weight row are four floats side by side.
+///
+/// `k_trunk` reads `m[k * c + lane + 32 * q]` for `q` in nought to two. Stored
+/// as the net stores it that is three loads a row, and the inner product's
+/// twelve multiplies then cost seven loads -- which leaves the kernel issuing
+/// addresses rather than multiplying. Here the row is `TRUNK_LD` wide and a
+/// lane's channels are at `4 * lane + q`: one sixteen-byte load, still five
+/// hundred and twelve contiguous bytes across the warp. The fourth slot is
+/// what makes the address a multiple of sixteen; it is never read.
+///
+/// Returns the buffer and where each matrix starts, mix then out, block by
+/// block.
+fn lanewise(l: &NetLayout, w: &[f32]) -> (Vec<f32>, Vec<usize>) {
+    let mut out = Vec::new();
+    let mut at = Vec::new();
+    for blk in &l.blocks {
+        for s in [blk.mix, blk.out] {
+            assert_eq!(s.o, C, "the trunk's matrices are square in the channels");
+            at.push(out.len());
+            let base = out.len();
+            out.resize(base + s.i * TRUNK_LD, 0.0);
+            for k in 0..s.i {
+                for j in 0..s.o {
+                    out[base + k * TRUNK_LD + 4 * (j % 32) + j / 32] = w[s.w + k * s.o + j];
+                }
+            }
+        }
+    }
+    (out, at)
+}
+
+/// A lanewise weight row, wide enough that a lane's four floats start on a
+/// sixteen-byte boundary.
+const TRUNK_LD: usize = 128;
+
 fn owed_by_the_join(l: &NetLayout, b: &[f32]) -> Vec<f32> {
     let mut out = Vec::with_capacity((JBLOCKS + 1) * JW + D);
     let mut run = vec![0.0f32; JW];
@@ -755,6 +791,18 @@ struct Card {
     scratch: parking_lot::Mutex<Scratch>,
     /// The weights exactly as `NetLayout` describes them.
     w: CudaSlice<f32>,
+    /// The two square matrices of every trunk block, laid out the way a lane
+    /// reads them.
+    ///
+    /// `k_trunk` gives a thread the three channels `lane, lane + 32, lane + 64`
+    /// of one weight row, and reading them where the net stores them is three
+    /// loads. Here they are four floats side by side -- three used, one for the
+    /// alignment a sixteen-byte load needs -- so a row is one load, and a warp
+    /// still reads five hundred contiguous bytes. That and the same treatment
+    /// of the board turn twelve multiplies per seven loads into forty-eight per
+    /// eight, which is the difference between an issue-bound kernel and an
+    /// arithmetic-bound one.
+    wt: CudaSlice<f32>,
     b: CudaSlice<f32>,
     ln: CudaSlice<f32>,
     /// Hex adjacency, `NONE` folded to `-1`.
@@ -827,6 +875,8 @@ impl Device {
         for card in &mut self.cards {
             card.stream.context().bind_to_thread().map_err(err)?;
             card.stream.memcpy_htod(&flat.w, &mut card.w).map_err(err)?;
+            let (lw, _) = lanewise(&card.layout, &flat.w);
+            card.stream.memcpy_htod(&lw, &mut card.wt).map_err(err)?;
             card.stream.memcpy_htod(&flat.b, &mut card.b).map_err(err)?;
             card.stream.memcpy_htod(&flat.ln, &mut card.ln).map_err(err)?;
             let owed = owed_by_the_join(&card.layout, &flat.b);
@@ -918,11 +968,13 @@ impl Card {
             .map(|&n| if n == NONE { -1 } else { n as i32 })
             .collect();
         let layout = NetLayout::new();
+        let (lanewise, lanes) = lanewise(&layout, &flat.w);
         let mut plan: Vec<i32> = Vec::new();
         for (i, blk) in layout.blocks.iter().enumerate() {
             let (n0, n1) = (layout.norms[ln_block(i, 0)], layout.norms[ln_block(i, 1)]);
             plan.extend([blk.mix.w, blk.mix.b, blk.pool.w, blk.pool.b, blk.out.w,
                          blk.out.b, n0.g, n0.b, n1.g, n1.b].map(|x| x as i32));
+            plan.extend([lanes[2 * i], lanes[2 * i + 1]].map(|x| x as i32));
         }
         let t = layout.norms[LN_TRUNK];
         plan.extend([t.g as i32, t.b as i32]);
@@ -931,6 +983,7 @@ impl Card {
             plan: stream.memcpy_stod(&plan).map_err(err)?,
             owed: stream.memcpy_stod(&owed).map_err(err)?,
             w: stream.memcpy_stod(&flat.w).map_err(err)?,
+            wt: stream.memcpy_stod(&lanewise).map_err(err)?,
             b: stream.memcpy_stod(&flat.b).map_err(err)?,
             ln: stream.memcpy_stod(&flat.ln).map_err(err)?,
             nb: stream.memcpy_stod(&nb).map_err(err)?,
@@ -1270,7 +1323,8 @@ impl Card {
         unsafe {
             self.stream
                 .launch_builder(&self.k.trunk)
-                .arg(&x).arg(&self.nb).arg(&self.w).arg(&self.b).arg(&self.ln)
+                .arg(&x).arg(&self.nb).arg(&self.w).arg(&self.wt)
+                .arg(&self.b).arg(&self.ln)
                 .arg(&self.plan).arg(xpub).arg(&mut input)
                 .arg(&rows_i).arg(&nhex).arg(&chan).arg(&blocks_i)
                 .arg(&stride).arg(&off).arg(&loose_i)

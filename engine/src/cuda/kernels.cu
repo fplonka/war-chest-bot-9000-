@@ -211,7 +211,10 @@ __global__ void k_stem(float* x, const float* projected, const int* occupant,
 // `off` is the weight plan, `TRUNK_OFF` entries a block and two after them:
 //   0 mix.w  1 mix.b  2 pool.w  3 pool.b  4 out.w  5 out.b
 //   6 ln0.g  7 ln0.b  8 ln1.g  9 ln1.b     then trunk.ln.g, trunk.ln.b
-#define TRUNK_OFF 10
+#define TRUNK_OFF 12
+// A lanewise weight row: one lane's three channels side by side, padded to
+// four so a sixteen-byte load is aligned.
+#define TRUNK_LD 128
 // A thread owns this many channels, and this many hexes at most.
 //
 // One channel a thread meant one shared-memory load for every fused multiply,
@@ -248,14 +251,46 @@ __device__ __forceinline__ void row_stats(const float* v, int c, float* mean,
     *inv = rsqrtf(t / c + 1e-5f);
 }
 
-// `__launch_bounds__` with a minimum of one block an SM, because the default
-// is the opposite bargain: the compiler caps registers to fit more blocks and
-// spills what will not fit, and an accumulator in local memory costs a matrix
-// multiply an order of magnitude. Shared memory already holds this to one or
-// two blocks an SM, so there is nothing to trade away.
-__global__ __launch_bounds__(32 * TRUNK_SPAN, 1)
+/// One residual block's inner product, accumulated onto `acc`.
+///
+/// `a` is the board in shared memory, `c` channels to a hex row; `m` is a
+/// lanewise weight matrix, `TRUNK_LD` floats to a row with this lane's three
+/// channels at `4 * lane`. Four rows of the matrix and four channels of every
+/// hex are taken together: eight sixteen-byte loads, forty-eight multiplies.
+/// Done a channel at a time it was seven loads for twelve, and the kernel ran
+/// at a tenth of the card because it was issuing addresses.
+__device__ __forceinline__ void inner(const float* a, const float* m,
+                                      const int (&hex)[TRUNK_MAXH], int lane, int c,
+                                      float (&acc)[TRUNK_MAXH][TRUNK_Q]) {
+    for (int k = 0; k < c; k += 4) {
+        float4 av[TRUNK_MAXH];
+#pragma unroll
+        for (int t = 0; t < TRUNK_MAXH; ++t)
+            av[t] = *(const float4*)(a + hex[t] * c + k);
+#pragma unroll
+        for (int kk = 0; kk < 4; ++kk) {
+            float4 wv = *(const float4*)(m + (size_t)(k + kk) * TRUNK_LD + 4 * lane);
+            const float wq[TRUNK_Q] = {wv.x, wv.y, wv.z};
+#pragma unroll
+            for (int t = 0; t < TRUNK_MAXH; ++t) {
+                float av1 = kk == 0 ? av[t].x : kk == 1 ? av[t].y
+                          : kk == 2 ? av[t].z : av[t].w;
+#pragma unroll
+                for (int q = 0; q < TRUNK_Q; ++q) acc[t][q] += av1 * wq[q];
+            }
+        }
+    }
+}
+
+// Two blocks an SM, said out loud, which is what shared memory allows anyway.
+// Left to itself the compiler spends ninety-six registers a thread here and
+// fits one block, giving back in warps what the vectorised loop saved in
+// loads. Naming the block count fixes the register budget at eighty, and it is
+// still far enough above what an accumulator in local memory would cost.
+__global__ __launch_bounds__(32 * TRUNK_SPAN, 2)
 void k_trunk(const float* x0, const int* nb, const float* __restrict__ w,
-             const float* __restrict__ bias, const float* __restrict__ ln,
+             const float* __restrict__ wt, const float* __restrict__ bias,
+             const float* __restrict__ ln,
              const int* __restrict__ off, const float* xpub, float* out,
              int rows, int nhex, int c, int blocks, int stride, int off_loose,
              int loose) {
@@ -314,22 +349,10 @@ void k_trunk(const float* x0, const int* nb, const float* __restrict__ w,
 #pragma unroll
         for (int t = 0; t < TRUNK_MAXH; ++t)
             for (int q = 0; q < TRUNK_Q; ++q) acc[t][q] = 0.0f;
-        // Unrolled, because the weights come from L2: the boards take 43 KB of
-        // the 128 KB an SM splits between shared memory and L1, so two blocks
-        // leave forty for a cache the residual block streams 180 KB through.
-        // Four rounds of loads in flight is what covers that latency.
-#pragma unroll 4
-        for (int k = 0; k < c; ++k) {
-            float wv[TRUNK_Q];
-#pragma unroll
-            for (int q = 0; q < TRUNK_Q; ++q)
-                wv[q] = w[o[0] + (size_t)(c + k) * c + lane + 32 * q];
-#pragma unroll
-            for (int t = 0; t < TRUNK_MAXH; ++t) {
-                float av = a[hex[t] * c + k];
-                for (int q = 0; q < TRUNK_Q; ++q) acc[t][q] += av * wv[q];
-            }
-        }
+        // Four channels of the board and one lanewise weight row at a time.
+        // Both operands are then one sixteen-byte load apiece, so eight loads
+        // carry forty-eight multiplies where seven used to carry twelve.
+        inner(a, wt + o[10] + (size_t)c * TRUNK_LD, hex, lane, c, acc);
         // The pooled global bias: mean and max over the hexes, projected once
         // for the whole board.
         if (slot == 0) {
@@ -369,18 +392,7 @@ void k_trunk(const float* x0, const int* nb, const float* __restrict__ w,
                 int j = lane + 32 * q;
                 acc[t][q] = bias[o[1] + j] + gb[j];
             }
-#pragma unroll 4
-        for (int k = 0; k < c; ++k) {
-            float wv[TRUNK_Q];
-#pragma unroll
-            for (int q = 0; q < TRUNK_Q; ++q)
-                wv[q] = w[o[0] + (size_t)k * c + lane + 32 * q];
-#pragma unroll
-            for (int t = 0; t < TRUNK_MAXH; ++t) {
-                float av = a[hex[t] * c + k];
-                for (int q = 0; q < TRUNK_Q; ++q) acc[t][q] += av * wv[q];
-            }
-        }
+        inner(a, wt + o[10], hex, lane, c, acc);
 #pragma unroll
         for (int t = 0; t < TRUNK_MAXH; ++t)
             for (int k = 0; k < 6; ++k) {
@@ -412,18 +424,7 @@ void k_trunk(const float* x0, const int* nb, const float* __restrict__ w,
 #pragma unroll
         for (int t = 0; t < TRUNK_MAXH; ++t)
             for (int q = 0; q < TRUNK_Q; ++q) acc[t][q] = bias[o[5] + lane + 32 * q];
-#pragma unroll 4
-        for (int k = 0; k < c; ++k) {
-            float wv[TRUNK_Q];
-#pragma unroll
-            for (int q = 0; q < TRUNK_Q; ++q)
-                wv[q] = w[o[4] + (size_t)k * c + lane + 32 * q];
-#pragma unroll
-            for (int t = 0; t < TRUNK_MAXH; ++t) {
-                float av = a[hex[t] * c + k];
-                for (int q = 0; q < TRUNK_Q; ++q) acc[t][q] += av * wv[q];
-            }
-        }
+        inner(a, wt + o[11], hex, lane, c, acc);
 #pragma unroll
         for (int t = 0; t < TRUNK_MAXH; ++t)
             if (live[t])
