@@ -75,6 +75,7 @@ struct Kernels {
     bias: CudaFunction,
     group_bias: CudaFunction,
     window: CudaFunction,
+    gather: CudaFunction,
     tokens: CudaFunction,
     hex_facts: CudaFunction,
     type_pool: CudaFunction,
@@ -105,6 +106,7 @@ impl Kernels {
             bias: get("k_bias")?,
             group_bias: get("k_group_bias")?,
             window: get("k_window")?,
+            gather: get("k_gather")?,
             tokens: get("k_tokens")?,
             hex_facts: get("k_hex_facts")?,
             type_pool: get("k_type_pool")?,
@@ -706,6 +708,13 @@ impl Card {
         self.stream.memcpy_stod(host).map_err(err)
     }
 
+    /// A resident buffer's device address, for the pointer arrays that let a
+    /// stage over a whole round reach every solve's own arrays in one launch.
+    /// Event tracking is off, so the guard `device_ptr` returns records nothing.
+    fn ptr<T>(&self, s: &CudaSlice<T>) -> u64 {
+        s.device_ptr(&self.stream).0
+    }
+
     fn down(&self, d: &CudaSlice<f32>, n: usize) -> Res<Vec<f32>> {
         self.stream.memcpy_dtov(&d.slice(0..n)).map_err(err)
     }
@@ -945,6 +954,7 @@ impl Card {
         }
         let mark = std::time::Instant::now();
         let (mut w, mut opp, mut player) = (Vec::new(), Vec::new(), Vec::new());
+        let mut player_of_call: Vec<usize> = Vec::with_capacity(mine.len());
         let mut rows = 0usize;
         for &i in mine {
             let Call::Leaf { w: wv, opp: ov, rows: n, player: q, .. } = &calls[i] else {
@@ -954,101 +964,108 @@ impl Card {
             w.extend_from_slice(wv);
             opp.extend_from_slice(ov);
             player.extend(std::iter::repeat(*q as i32).take(*n));
+            player_of_call.push(*q);
             rows += n;
         }
         let l = &self.layout;
         let (rows_i, pool_i, d_i) = (rows as i32, POOL as i32, D as i32);
         let queries = 2 * rows;
 
-        // Lay the round out: each solve's belief index shifted onto the batch,
-        // and the per-solve buffers it will be read against.
+        // Lay the round out. A solve's arrays stay where they are and travel as
+        // pointers: cloning a `CudaSlice` allocates and copies on the device, so
+        // the old per-part `Part { g, f }` duplicated every resident `f` and `g`
+        // once per CFR iteration.
         let mut coff: Vec<u32> = Vec::with_capacity(queries + 1);
         coff.push(0);
-        let mut parts: Vec<Part> = Vec::with_capacity(mine.len());
-        let mut cidx = self.stream.alloc_zeros::<u32>(w.len().max(1)).map_err(err)?;
+        let mut part_of_row: Vec<i32> = Vec::with_capacity(rows);
+        let mut local_row: Vec<i32> = Vec::with_capacity(rows);
+        let mut base: Vec<i32> = Vec::with_capacity(mine.len());
+        let (mut gp, mut fp, mut cip, mut pp, mut jpp) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(mine.len());
         {
             let boards = self.boards.lock();
-            let (mut cell, mut q0, mut row) = (0usize, 0usize, 0usize);
-            for &i in mine {
+            let mut cell = 0usize;
+            for (part, &i) in mine.iter().enumerate() {
                 let n = calls[i].rows();
                 let solve = calls[i].solve();
                 let b = boards
                     .get(solve)
                     .filter(|b| b.cidx.is_some() && b.f.is_some() && b.host_coff.len() > 2 * n)
                     .ok_or_else(|| format!("solve {solve} has nothing resident"))?;
-                let take = b.host_coff[2 * n] as usize;
-                if take > 0 {
-                    let mut dst = cidx.slice_mut(cell..cell + take);
-                    self.stream
-                        .memcpy_dtod(&b.cidx.as_ref().unwrap().slice(0..take), &mut dst)
-                        .map_err(err)?;
-                }
                 coff.extend(b.host_coff[1..=2 * n].iter().map(|x| x + cell as u32));
-                parts.push(Part {
-                    q0,
-                    row,
-                    rows: n,
-                    g: b.g.as_ref().unwrap().clone(),
-                    f: b.f.as_ref().unwrap().clone(),
-                });
-                cell += take;
-                q0 += 2 * n;
-                row += n;
+                part_of_row.extend(std::iter::repeat(part as i32).take(n));
+                local_row.extend(0..n as i32);
+                base.push(cell as i32);
+                gp.push(self.ptr(b.g.as_ref().unwrap()));
+                fp.push(self.ptr(b.f.as_ref().unwrap()));
+                cip.push(self.ptr(b.cidx.as_ref().unwrap()));
+                pp.push(self.ptr(b.p.as_ref().unwrap()));
+                jpp.push(self.ptr(b.jp.as_ref().unwrap()));
+                cell += b.host_coff[2 * n] as usize;
             }
         }
+        // Where each row's values land. A leaf call asks about one player, so a
+        // row contributes exactly that player's configs, and the row's own
+        // query in `coff` already bounds them.
+        let mut vlo: Vec<u32> = Vec::with_capacity(rows + 1);
+        let mut cells = 0u32;
+        let mut row0 = 0usize;
+        for (&i, &q) in mine.iter().zip(&player_of_call) {
+            let start = cells;
+            for r in row0..row0 + calls[i].rows() {
+                vlo.push(cells);
+                let query = 2 * r + q;
+                cells += coff[query + 1] - coff[query];
+            }
+            spans.push((start as usize, cells as usize));
+            row0 += calls[i].rows();
+        }
+        vlo.push(cells);
+        let cells = cells as usize;
         let t_marshal = mark.elapsed();
         let mark = std::time::Instant::now();
         let w_d = self.up(&w)?;
         let opp_d = self.up(&opp)?;
         let player_d = self.up(&player)?;
         let coff_d = self.up(&coff)?;
+        let part_d = self.up(&part_of_row)?;
+        let local_d = self.up(&local_row)?;
+        let base_d = self.up(&base)?;
+        let (gp, fp, cip, pp, jpp) = (
+            self.up(&gp)?,
+            self.up(&fp)?,
+            self.up(&cip)?,
+            self.up(&pp)?,
+            self.up(&jpp)?,
+        );
+        let vlo_d = self.up(&vlo)?;
         let t_up = mark.elapsed();
         let mark = std::time::Instant::now();
 
         // The belief block, from each solve's resident `g`.
         let mut pooled = self.alloc(queries * POOL)?;
-        for part in &parts {
-            let nq = 2 * part.rows;
-            let off = coff_d.slice(part.q0..part.q0 + nq + 1);
-            let mut dst = pooled.slice_mut(part.q0 * POOL..(part.q0 + nq) * POOL);
-            let nq_i = nq as i32;
-            unsafe {
-                self.stream
-                    .launch_builder(&self.k.belief_pool)
-                    .arg(&part.g)
-                    .arg(&cidx)
-                    .arg(&off)
-                    .arg(&w_d)
-                    .arg(&mut dst)
-                    .arg(&nq_i)
-                    .arg(&pool_i)
-                    .launch_unit(LaunchConfig {
-                        grid_dim: (nq.max(1) as u32, 1, 1),
-                        block_dim: (64, 1, 1),
-                        shared_mem_bytes: 0,
-                    })
-            }
-            .map_err(err)?;
+        let queries_i = queries as i32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.k.belief_pool)
+                .arg(&gp).arg(&cip).arg(&part_d).arg(&base_d)
+                .arg(&coff_d).arg(&w_d).arg(&mut pooled)
+                .arg(&queries_i).arg(&pool_i)
+                .launch_unit(LaunchConfig {
+                    grid_dim: (queries.max(1) as u32, 1, 1),
+                    block_dim: (64, 1, 1),
+                    shared_mem_bytes: 0,
+                })
         }
+        .map_err(err)?;
 
         // The join, over the resident board vectors.
         let mut p = self.alloc(rows * D)?;
         let mut jp = self.alloc(rows * JW)?;
-        {
-            let boards = self.boards.lock();
-            for (part, &i) in parts.iter().zip(mine) {
-                let b = &boards[calls[i].solve()];
-                let n = part.rows;
-                let mut dp = p.slice_mut(part.row * D..(part.row + n) * D);
-                self.stream
-                    .memcpy_dtod(&b.p.as_ref().unwrap().slice(0..n * D), &mut dp)
-                    .map_err(err)?;
-                let mut dj = jp.slice_mut(part.row * JW..(part.row + n) * JW);
-                self.stream
-                    .memcpy_dtod(&b.jp.as_ref().unwrap().slice(0..n * JW), &mut dj)
-                    .map_err(err)?;
-            }
-        }
+        let jw_i = JW as i32;
+        launch!(self, gather, rows * D, &pp, &part_d, &local_d, &mut p, &rows_i, &d_i)?;
+        launch!(self, gather, rows * JW, &jpp, &part_d, &local_d, &mut jp, &rows_i, &jw_i)?;
 
         let mut input = self.alloc(rows * JOIN_IN)?;
         launch!(self, join_input, rows * JOIN_IN, &pooled, &player_d, &mut input, &rows_i, &pool_i)?;
@@ -1071,55 +1088,24 @@ impl Card {
         self.bias(l.join_out, rows, &mut h)?;
         self.norm(l.norms[LN_H], rows, false, &mut h)?;
 
-        // The readout, one cell per config of the queried player.
-        let (mut cell_row, mut cell_at, mut spans) = (Vec::new(), Vec::new(), Vec::new());
-        for (part, &i) in parts.iter().zip(mine) {
-            let Call::Leaf { player: q, .. } = &calls[i] else { unreachable!() };
-            let start = cell_row.len();
-            for r in 0..part.rows {
-                let query = part.q0 + 2 * r + q;
-                for k in coff[query]..coff[query + 1] {
-                    cell_row.push((part.row + r) as u32);
-                    cell_at.push(k);
-                }
-            }
-            spans.push((start, cell_row.len()));
-        }
-        let cells = cell_row.len();
+        // The readout: one block a row, one warp a config of the queried
+        // player, the row's head vector staged once in shared memory.
         let mut vals = self.alloc(cells.max(1))?;
-        let row_d = self.up(&cell_row)?;
-        let at_d = self.up(&cell_at)?;
         let bias = self.b.slice(l.value_bias..l.value_bias + 1);
-        for (part, &(lo, hi)) in parts.iter().zip(&spans) {
-            if hi == lo {
-                continue;
-            }
-            let n = hi - lo;
-            let mut dst = vals.slice_mut(lo..hi);
-            let sub_at = at_d.slice(lo..hi);
-            let sub_row = row_d.slice(lo..hi);
-            let n_i = n as i32;
-            unsafe {
-                self.stream
-                    .launch_builder(&self.k.readout)
-                    .arg(&part.f)
-                    .arg(&h)
-                    .arg(&bias)
-                    .arg(&cidx)
-                    .arg(&sub_at)
-                    .arg(&sub_row)
-                    .arg(&opp_d)
-                    .arg(&mut dst)
-                    .arg(&n_i)
-                    .arg(&d_i)
-                    .launch_unit(LaunchConfig {
-                        grid_dim: (n as u32, 1, 1),
-                        block_dim: (128, 1, 1),
-                        shared_mem_bytes: 4 * 128,
-                    })
-            }
-            .map_err(err)?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.k.readout)
+                .arg(&fp).arg(&cip).arg(&part_d).arg(&base_d)
+                .arg(&h).arg(&bias).arg(&coff_d).arg(&vlo_d)
+                .arg(&player_d).arg(&opp_d)
+                .arg(&mut vals).arg(&rows_i).arg(&d_i)
+                .launch_unit(LaunchConfig {
+                    grid_dim: (rows.max(1) as u32, 1, 1),
+                    block_dim: (32, 8, 1),
+                    shared_mem_bytes: 4 * D as u32,
+                })
         }
+        .map_err(err)?;
         let t_launch = mark.elapsed();
         let mark = std::time::Instant::now();
         let host = self.down(&vals, cells.max(1))?;
@@ -1168,15 +1154,6 @@ struct Tree {
     draw_p: CudaSlice<f32>,
     level_node: CudaSlice<u32>,
     level_start: Vec<u32>,
-}
-
-/// Where one solve's slice of a round sits, and the buffers it is read against.
-struct Part {
-    q0: usize,
-    row: usize,
-    rows: usize,
-    g: CudaSlice<f32>,
-    f: CudaSlice<f32>,
 }
 
 /// The driver and cuBLAS error types are `Debug` only.

@@ -269,23 +269,48 @@ __global__ void k_join_input(const float* pooled, const int* player, float* out,
     else out[i] = p == 0 ? -1.0f : 1.0f;
 }
 
+// ------------------------------------------------------ a round of solves
+//
+// `f`, `g`, `p`, `jp` and the belief index belong to a solve, not to the round
+// that batches it. A stage that launched once per solve to reach them cost the
+// round more in launch latency than the arithmetic inside, so every stage below
+// takes the solves' pointers as an array instead and launches once.
+//
+// `part_of_row` names the solve a batch row came from; `base_of_part` is where
+// that solve's cells start in the round's `coff` and `w`, so a part-relative
+// belief index and a round-relative offset table can be read together.
+
+// Gather each solve's resident rows into the round's layout. `local_row` is the
+// row's index inside its own solve.
+__global__ void k_gather(const float* const* src, const int* part_of_row,
+                         const int* local_row, float* out, int rows, int width) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * width) return;
+    int r = i / width, j = i % width;
+    out[i] = src[part_of_row[r]][(size_t)local_row[r] * width + j];
+}
+
 // The belief block the join reads: `sum_c beta(c) g(c)` over one query's
-// support. `coff` bounds a query's configs in `cidx`, which names each one's
-// row in the resident `g`, and `w` is the normalised reach.
+// support. `coff` bounds a query's cells, `cidx` names each cell's row in its
+// solve's `g`, and `w` is the normalised reach.
 //
 // This ran on the host, which meant `g` had to come back off the card and the
 // block had to go up again every iteration. One query per thread block, one
 // output channel per thread.
-__global__ void k_belief_pool(const float* g, const unsigned int* cidx,
+__global__ void k_belief_pool(const float* const* gp, const unsigned int* const* cip,
+                              const int* part_of_row, const int* base_of_part,
                               const unsigned int* coff, const float* w,
                               float* out, int queries, int pool) {
     int q = blockIdx.x;
     if (q >= queries) return;
-    unsigned int lo = coff[q], hi = coff[q + 1];
+    int part = part_of_row[q >> 1];
+    const float* g = gp[part];
+    const unsigned int* cidx = cip[part];
+    unsigned int base = base_of_part[part], lo = coff[q], hi = coff[q + 1];
     for (int j = threadIdx.x; j < pool; j += blockDim.x) {
         float acc = 0.0f;
         for (unsigned int k = lo; k < hi; ++k)
-            acc += w[k] * g[(size_t)cidx[k] * pool + j];
+            acc += w[k] * g[(size_t)cidx[k - base] * pool + j];
         out[(size_t)q * pool + j] = acc;
     }
 }
@@ -293,176 +318,424 @@ __global__ void k_belief_pool(const float* g, const unsigned int* cidx,
 // `v(c) = (<f(c), h_row> + bias) * opp_reach[row]`, for every config of the
 // queried player at every row of the batch.
 //
-// One config per thread block so the D-wide dot product is a block reduction;
-// `blockDim.x` must be a power of two.
-// `at` is where this cell sits in the *batch's* `cidx`; `cell` only numbers
-// the span this launch covers. Reading `cidx[cell]` instead reads another
-// solve's config, which is a wrong answer with the right shape.
-__global__ void k_readout(const float* f, const float* h, const float* cf_bias,
-                          const unsigned int* cidx, const unsigned int* at,
-                          const unsigned int* row_of, const float* opp,
-                          float* out, int cells, int d) {
-    extern __shared__ float red[];
-    int cell = blockIdx.x;
-    if (cell >= cells) return;
-    int r = row_of[cell];
-    const float* fr = f + (size_t)cidx[at[cell]] * d;
-    const float* hr = h + (size_t)r * d;
-    float acc = 0.0f;
-    for (int j = threadIdx.x; j < d; j += blockDim.x) acc += fr[j] * hr[j];
-    red[threadIdx.x] = acc;
+// One block per row, one config per warp, and the row's head vector staged in
+// shared memory so it is read once for the row rather than once for each of its
+// hundred-odd configs. A row's cells are the span its own query already names
+// in `coff`, so nothing here needs a list of cells: building one cost the host
+// twelve million pushes a round, which was three quarters of the whole pass.
+__global__ void k_readout(const float* const* fp, const unsigned int* const* cip,
+                          const int* part_of_row, const int* base_of_part,
+                          const float* h, const float* cf_bias,
+                          const unsigned int* coff, const unsigned int* vlo,
+                          const int* player, const float* opp,
+                          float* out, int rows, int d) {
+    extern __shared__ float hs[];
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    for (int j = threadIdx.x + 32 * threadIdx.y; j < d; j += 32 * blockDim.y)
+        hs[j] = h[(size_t)r * d + j];
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
-        __syncthreads();
+    int part = part_of_row[r];
+    const float* f = fp[part];
+    const unsigned int* cidx = cip[part];
+    unsigned int base = base_of_part[part];
+    unsigned int q = 2 * r + player[r], lo = coff[q], hi = coff[q + 1];
+    float bias = *cf_bias, scale = opp[r];
+    unsigned int at = vlo[r];
+    for (unsigned int k = lo + threadIdx.y; k < hi; k += blockDim.y) {
+        const float* fr = f + (size_t)cidx[k - base] * d;
+        float acc = 0.0f;
+        for (int j = threadIdx.x; j < d; j += 32) acc += fr[j] * hs[j];
+        for (int s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xffffffff, acc, s);
+        if (threadIdx.x == 0) out[at + k - lo] = (acc + bias) * scale;
     }
-    if (threadIdx.x == 0) out[cell] = (red[0] + *cf_bias) * opp[r];
 }
 
-// ---------------------------------------------------------------- CFR sweeps
+// ------------------------------------------------------------- the CFR loop
 //
 // The arithmetic is `contract.rs`, which reproduces the solver's own walk bit
-// for bit. One block per (node, player) and threads striding over that node's
-// configs, so neither sweep needs a task list -- building one per level would
-// cost what flattening the tree already cost, which is the thing that made
-// this port worth doing only once it was incremental.
+// for bit. A level's nodes never depend on each other
+// (`a_level_never_depends_on_itself` pins it), so one launch covers a whole
+// level -- of *every* solve in the round, since solves do not depend on each
+// other either. `blockIdx.y` is the solve, `blockIdx.x` the node within its
+// level, and a solve with a shallower tree simply has no work at the deeper
+// levels.
 //
-// A level's nodes never depend on each other (`a_level_never_depends_on_itself`
-// pins it), so a whole level launches at once and the host walks the levels.
+// Everything a solve's iteration reads or writes is named by one descriptor, so
+// a stage takes one array of them rather than thirty arrays of pointers. The
+// field order below is `Card::describe` in `cuda/mod.rs`; every field is eight
+// bytes wide so the layout is positional and nothing needs packing rules.
 
-// Reach probabilities for one level. `NO_ROW` marks a node whose parent is not
-// of the kind that gather applies to.
-__global__ void k_reach_sweep(const unsigned int* level_node, int lo,
-                              const unsigned int* parent, const unsigned char* player,
-                              const unsigned int* nc, const unsigned int* roff,
-                              const unsigned int* rev_base, const unsigned int* rev_start,
-                              const unsigned int* rev_src, const unsigned int* rev_cell,
-                              const unsigned int* rvd_base, const unsigned int* rvd_start,
-                              const unsigned int* rvd_src, const float* rvd_p,
-                              const float* cur, float* reach, int nodes) {
-    int node = level_node[lo + blockIdx.x];
-    int p = blockIdx.y;
-    int par = parent[node];
-    if (par == 0xffffffffu) return;
-    int me = player[par];
-    int n = nc[2 * node + p];
-    // Where each player's block starts inside a node's reach region.
-    int dst = roff[node] + (p == 1 ? nc[2 * node] : 0);
-    int src = roff[par] + (p == 1 ? nc[2 * par] : 0);
-    for (int c = threadIdx.x; c < n; c += blockDim.x) {
-        if (p != me) {
-            // The idle player's information state does not move, and the
-            // child's support for them is the same list.
-            reach[dst + c] = reach[src + c];
-            continue;
-        }
-        float v = 0.0f;
-        unsigned int rb = rev_base[node];
-        if (rb != 0xffffffffu) {
-            unsigned int a = rev_start[rb + c], b = rev_start[rb + c + 1];
-            for (unsigned int k = a; k < b; ++k)
-                v += reach[src + rev_src[k]] * cur[rev_cell[k]];
-        } else {
-            unsigned int db = rvd_base[node];
-            if (db != 0xffffffffu) {
-                unsigned int a = rvd_start[db + c], b = rvd_start[db + c + 1];
-                for (unsigned int k = a; k < b; ++k)
-                    v += reach[src + rvd_src[k]] * rvd_p[k];
+struct Tree {
+    const unsigned int* kind;
+    const unsigned int* player;
+    const unsigned int* nc;
+    const unsigned int* parent;
+    const unsigned int* roff;
+    const unsigned int* voff;
+    const unsigned int* soff;
+    const float* util;
+    const unsigned int* child_at;
+    const unsigned int* child_n;
+    const unsigned int* child;
+    const unsigned int* legal_base;
+    const unsigned int* legal_off;
+    const unsigned int* legal_child;
+    const unsigned int* legal_trans;
+    const unsigned int* cell_row;
+    const unsigned int* rev_base;
+    const unsigned int* rev_start;
+    const unsigned int* rev_src;
+    const unsigned int* rev_cell;
+    const unsigned int* rvd_base;
+    const unsigned int* rvd_start;
+    const unsigned int* rvd_src;
+    const float* rvd_p;
+    const unsigned int* draw_base;
+    const unsigned int* draw_start;
+    const unsigned int* draw_to;
+    const float* draw_p;
+    const unsigned int* level_start;
+    const unsigned int* level_node;
+    // The solve's own arenas, laid out exactly as `Solver` lays them out.
+    float* reach;
+    float* vals;
+    float* cur;
+    float* regret;
+    float* sum;
+    float* qval;
+    float* visits;
+    float* prior;
+    const float* rootb;
+    // Batch row -> node, for the leaves the network answers for.
+    const unsigned int* leaf_node;
+    unsigned long long levels;
+    unsigned long long rows;
+};
+
+#define NO_ROW 0xffffffffu
+#define NO_TRANS 0xffffffffu
+#define KIND_LEAF 2u
+#define KIND_CHANCE 1u
+
+// The nodes of one level of one solve, or none when this solve is shallower.
+__device__ __forceinline__ bool level_task(const Tree& t, int level, int slot,
+                                           unsigned int* node) {
+    if ((unsigned)level + 1 >= t.levels + 1) return false;
+    unsigned int lo = t.level_start[level], hi = t.level_start[level + 1];
+    if ((unsigned)slot >= hi - lo) return false;
+    *node = t.level_node[lo + slot];
+    return true;
+}
+
+// Where player `p`'s block starts inside node `i`'s reach region.
+__device__ __forceinline__ unsigned int rbase(const Tree& t, unsigned int i, int p) {
+    return t.roff[i] + (p == 1 ? t.nc[2 * i] : 0);
+}
+
+// The root beliefs, before the first level of the sweep reads them.
+__global__ void k_seed_reach(const Tree* trees) {
+    const Tree& t = trees[blockIdx.y];
+    unsigned int n = t.nc[0] + t.nc[1];
+    for (unsigned int c = blockIdx.x * blockDim.x + threadIdx.x; c < n;
+         c += gridDim.x * blockDim.x)
+        t.reach[t.roff[0] + c] = t.rootb[c];
+}
+
+// Reach probabilities for one level, both players.
+__global__ void k_reach_sweep(const Tree* trees, int level) {
+    const Tree& t = trees[blockIdx.y];
+    unsigned int node;
+    if (!level_task(t, level, blockIdx.x, &node)) return;
+    unsigned int par = t.parent[node];
+    if (par == NO_ROW) return;
+    unsigned int me = t.player[par];
+    for (int p = 0; p < 2; ++p) {
+        unsigned int n = t.nc[2 * node + p];
+        unsigned int dst = rbase(t, node, p), src = rbase(t, par, p);
+        for (unsigned int c = threadIdx.x; c < n; c += blockDim.x) {
+            if ((unsigned)p != me) {
+                // The idle player's information state does not move, and the
+                // child's support for them is the same list.
+                t.reach[dst + c] = t.reach[src + c];
+                continue;
             }
+            float v = 0.0f;
+            unsigned int rb = t.rev_base[node];
+            if (rb != NO_ROW) {
+                unsigned int a = t.rev_start[rb + c], b = t.rev_start[rb + c + 1];
+                for (unsigned int k = a; k < b; ++k)
+                    v += t.reach[src + t.rev_src[k]] * t.cur[t.rev_cell[k]];
+            } else {
+                unsigned int db = t.rvd_base[node];
+                if (db != NO_ROW) {
+                    unsigned int a = t.rvd_start[db + c], b = t.rvd_start[db + c + 1];
+                    for (unsigned int k = a; k < b; ++k)
+                        v += t.reach[src + t.rvd_src[k]] * t.rvd_p[k];
+                }
+            }
+            t.reach[dst + c] = v;
         }
-        reach[dst + c] = v;
     }
-    (void)nodes;
 }
 
 // Value backpropagation and the regret update for one level, one traverser.
-// `kind` is 0 decision, 1 chance, 2 leaf.
-__global__ void k_backprop_sweep(const unsigned int* level_node, int lo,
-                                 const unsigned char* kind, const unsigned char* player,
-                                 const unsigned int* nc, const unsigned int* voff,
-                                 const unsigned int* soff,
-                                 const unsigned int* child_at, const unsigned int* child_n,
-                                 const unsigned int* child,
-                                 const unsigned int* legal_base, const unsigned int* legal_off,
-                                 const unsigned int* legal_child, const unsigned int* legal_trans,
-                                 const unsigned int* draw_base, const unsigned int* draw_start,
-                                 const unsigned int* draw_to, const float* draw_p,
-                                 float* vals, float* cur, float* regret, float* sum,
-                                 float* qval, int traverser,
+__global__ void k_backprop_sweep(const Tree* trees, int level, int traverser,
                                  float da, float db, float dg, float predict) {
     const float EPS = 1e-6f;
-    const unsigned int NO_TRANS = 0xffffffffu;
-    int node = level_node[lo + blockIdx.x];
-    if (kind[node] == 2) return;
-    int me = player[node];
-    int n = nc[2 * node + traverser];
-    int vi = voff[node];
+    const Tree& t = trees[blockIdx.y];
+    unsigned int node;
+    if (!level_task(t, level, blockIdx.x, &node)) return;
+    if (t.kind[node] == KIND_LEAF) return;
+    unsigned int me = t.player[node];
+    unsigned int n = t.nc[2 * node + traverser];
+    unsigned int vi = t.voff[node];
 
-    if (kind[node] == 1) {
-        int ch = child[child_at[node]];
-        int cv = voff[ch];
-        if (me == traverser) {
-            unsigned int base = draw_base[node];
-            for (int c = threadIdx.x; c < n; c += blockDim.x) {
-                unsigned int a = draw_start[base + c], b = draw_start[base + c + 1];
+    if (t.kind[node] == KIND_CHANCE) {
+        unsigned int cv = t.voff[t.child[t.child_at[node]]];
+        if (me == (unsigned)traverser) {
+            unsigned int base = t.draw_base[node];
+            for (unsigned int c = threadIdx.x; c < n; c += blockDim.x) {
+                unsigned int a = t.draw_start[base + c], b = t.draw_start[base + c + 1];
                 float v = 0.0f;
-                for (unsigned int k = a; k < b; ++k) v += draw_p[k] * vals[cv + draw_to[k]];
-                vals[vi + c] = v;
+                for (unsigned int k = a; k < b; ++k)
+                    v += t.draw_p[k] * t.vals[cv + t.draw_to[k]];
+                t.vals[vi + c] = v;
             }
         } else {
-            for (int c = threadIdx.x; c < n; c += blockDim.x) vals[vi + c] = vals[cv + c];
+            for (unsigned int c = threadIdx.x; c < n; c += blockDim.x)
+                t.vals[vi + c] = t.vals[cv + c];
         }
         return;
     }
 
-    if (me != traverser) {
+    if (me != (unsigned)traverser) {
         // The traverser's information state is unchanged across an opponent
         // decision, and the opponent's strategy is already in the reaches the
         // leaf values carry.
-        unsigned int a = child_at[node], k = child_n[node];
-        for (int c = threadIdx.x; c < n; c += blockDim.x) {
+        unsigned int a = t.child_at[node], k = t.child_n[node];
+        for (unsigned int c = threadIdx.x; c < n; c += blockDim.x) {
             float v = 0.0f;
-            for (unsigned int j = a; j < a + k; ++j) v += vals[voff[child[j]] + c];
-            vals[vi + c] = v;
+            for (unsigned int j = a; j < a + k; ++j) v += t.vals[t.voff[t.child[j]] + c];
+            t.vals[vi + c] = v;
         }
         return;
     }
 
-    unsigned int so = soff[node], lb = legal_base[node];
+    unsigned int so = t.soff[node], lb = t.legal_base[node];
     // The expansion phase reads these as PUCT's Q. A sweep that computes the
     // action values and drops them leaves selection blind, and the tree it
     // grows is a different tree -- which is a wrong answer no shape check
     // would catch.
-    unsigned int ncells = legal_off[lb + n];
-    for (unsigned int k = threadIdx.x; k < ncells; k += blockDim.x) qval[so + k] = 0.0f;
+    unsigned int ncells = t.legal_off[lb + n];
+    for (unsigned int k = threadIdx.x; k < ncells; k += blockDim.x) t.qval[so + k] = 0.0f;
     __syncthreads();
-    for (int c = threadIdx.x; c < n; c += blockDim.x) {
-        unsigned int a = legal_off[lb + c], b = legal_off[lb + c + 1];
+    for (unsigned int c = threadIdx.x; c < n; c += blockDim.x) {
+        unsigned int a = t.legal_off[lb + c], b = t.legal_off[lb + c + 1];
         float base = 0.0f;
         for (unsigned int cell = a; cell < b; ++cell) {
-            if (legal_trans[so + cell] == NO_TRANS) continue;
-            float av = vals[voff[legal_child[so + cell]] + legal_trans[so + cell]];
-            qval[so + cell] = av;
-            base += av * cur[so + cell];
+            if (t.legal_trans[so + cell] == NO_TRANS) continue;
+            float av = t.vals[t.voff[t.legal_child[so + cell]] + t.legal_trans[so + cell]];
+            t.qval[so + cell] = av;
+            base += av * t.cur[so + cell];
         }
-        vals[vi + c] = base;
+        t.vals[vi + c] = base;
         float total = 0.0f;
         for (unsigned int cell = a; cell < b; ++cell) {
-            float delta = qval[so + cell] - base;
-            float old = regret[so + cell];
+            float delta = t.qval[so + cell] - base;
+            float old = t.regret[so + cell];
             float r = old * (old > 0.0f ? da : db) + delta;
-            regret[so + cell] = r;
+            t.regret[so + cell] = r;
             float v = fmaxf(r + predict * delta, EPS);
-            cur[so + cell] = v;
+            t.cur[so + cell] = v;
             total += v;
         }
         if (total > 0.0f) {
             float inv = 1.0f / total;
-            for (unsigned int cell = a; cell < b; ++cell) cur[so + cell] *= inv;
+            for (unsigned int cell = a; cell < b; ++cell) t.cur[so + cell] *= inv;
         }
     }
     __syncthreads();
-    for (unsigned int k = threadIdx.x; k < ncells; k += blockDim.x) sum[so + k] *= dg;
+    for (unsigned int k = threadIdx.x; k < ncells; k += blockDim.x) t.sum[so + k] *= dg;
+}
+
+// The reach-weighted iterate, added to the running strategy sum. Both players
+// in one pass: a decision node belongs to exactly one of them.
+__global__ void k_avg_block(const Tree* trees, int level) {
+    const Tree& t = trees[blockIdx.y];
+    unsigned int node;
+    if (!level_task(t, level, blockIdx.x, &node)) return;
+    if (t.kind[node] != 0) return;
+    unsigned int me = t.player[node];
+    unsigned int n = t.nc[2 * node + me], so = t.soff[node], lb = t.legal_base[node];
+    unsigned int ra = rbase(t, node, me);
+    for (unsigned int c = threadIdx.x; c < n; c += blockDim.x) {
+        float r = t.reach[ra + c];
+        for (unsigned int cell = t.legal_off[lb + c]; cell < t.legal_off[lb + c + 1]; ++cell)
+            t.sum[so + cell] += r * t.cur[so + cell];
+    }
+}
+
+// Every leaf's normalised belief, and the opponent's reach mass there. One
+// block per (row, player); `w` and `oppmass` are what the network reads.
+__global__ void k_beliefs(const Tree* trees, const int* row_of_part, const int* part_of_row,
+                          const int* local_row, const unsigned int* coff, int traverser,
+                          float* w, float* oppmass, int rows) {
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    int part = part_of_row[r];
+    const Tree& t = trees[part];
+    unsigned int node = t.leaf_node[local_row[r]];
+    int p = blockIdx.y;
+    unsigned int n = t.nc[2 * node + p], ra = rbase(t, node, p);
+    unsigned int lo = coff[2 * r + p];
+    // One warp: the support is tens of configs, and the sum has to be seen by
+    // every thread that then divides by it.
+    float acc = 0.0f;
+    for (unsigned int c = threadIdx.x; c < n; c += 32) acc += t.reach[ra + c];
+    for (int s = 16; s > 0; s >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, s);
+    float inv = acc > 0.0f ? 1.0f / acc : 1.0f / (float)max(n, 1u);
+    for (unsigned int c = threadIdx.x; c < n; c += 32)
+        w[lo + c] = acc > 0.0f ? t.reach[ra + c] * inv : inv;
+    if (threadIdx.x == 0 && p == 1 - traverser) oppmass[r] = acc;
+    (void)row_of_part;
+}
+
+// ------------------------------------------------------------ the expansion
+//
+// `xorshift64*` and the two draws built on it, transcribed from `rng.rs` and
+// `search.rs::pick` so a device trajectory and a host one from the same seed
+// take the same turns.
+
+__device__ __forceinline__ unsigned long long rng_next(unsigned long long* s) {
+    unsigned long long x = *s;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *s = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+
+__device__ __forceinline__ double rng_unit(unsigned long long* s) {
+    return (double)(rng_next(s) >> 11) * (1.0 / 9007199254740992.0);
+}
+
+// Draw an index from non-negative weights. A row whose weights have all
+// underflowed is drawn uniformly rather than dropped.
+__device__ int pick(const float* w, int n, unsigned long long* s) {
+    double total = 0.0;
+    for (int i = 0; i < n; ++i) total += (double)fmaxf(w[i], 0.0f);
+    if (total == 0.0) return n > 0 ? (int)(rng_next(s) % (unsigned long long)n) : 0;
+    double needle = rng_unit(s) * total;
+    for (int i = 0; i < n; ++i) {
+        needle -= (double)fmaxf(w[i], 0.0f);
+        if (needle < 0.0) return i;
+    }
+    return n - 1;
+}
+
+// The cell PUCT would take from one config's legal row.
+//
+// `Q + c_puct * P * sqrt(sum N) / (1 + N)`, with `Q` divided by the opponent's
+// reach mass at the node -- without it a node behind an unlikely opponent line
+// looks worthless beside its siblings instead of being compared with them.
+__device__ int puct_choice(const Tree& t, unsigned int node, unsigned int a,
+                           unsigned int b, int opp, float c_puct) {
+    unsigned int so = t.soff[node], ra = rbase(t, node, opp);
+    float mass = 0.0f;
+    for (unsigned int c = 0; c < t.nc[2 * node + opp]; ++c) mass += t.reach[ra + c];
+    float scale = mass > 1e-30f ? 1.0f / mass : 0.0f;
+    float total = 0.0f;
+    for (unsigned int cell = a; cell < b; ++cell) total += t.visits[so + cell];
+    float explore = c_puct * sqrtf(fmaxf(total, 0.0f));
+    int best = (int)a;
+    float best_score = neg_inf();
+    for (unsigned int cell = a; cell < b; ++cell) {
+        float score = t.qval[so + cell] * scale
+                    + explore * t.prior[so + cell] / (1.0f + t.visits[so + cell]);
+        if (score > best_score) {
+            best_score = score;
+            best = (int)cell;
+        }
+    }
+    return best;
+}
+
+// One expansion phase: `sims` trajectories for every solve in the round, each
+// sampling a world from the root beliefs and walking down under
+// `pi_select = 1/2 pi_PUCT + 1/2 pi_CFR`. PUCT is a maximisation, so its half
+// is a point mass on the argmax and sampling the mixture is a coin flip.
+//
+// The simulations of one phase are run in order by a single thread, not in
+// parallel: each increments the visits it passes, which is the paper's virtual
+// loss, and a later simulation of the same phase is meant to see it.
+__global__ void k_expand(const Tree* trees, unsigned long long* seed,
+                         unsigned int* out, int sims, float c_puct) {
+    int part = blockIdx.x * blockDim.x + threadIdx.x;
+    const Tree& t = trees[part];
+    unsigned long long s = seed[part];
+    unsigned int n0 = t.nc[0], n1 = t.nc[1];
+    for (int sim = 0; sim < sims; ++sim) {
+        int c[2];
+        c[0] = pick(t.rootb, (int)n0, &s);
+        c[1] = pick(t.rootb + n0, (int)n1, &s);
+        unsigned int node = 0;
+        unsigned int found = NO_ROW;
+        for (;;) {
+            unsigned int k = t.kind[node];
+            if (k == KIND_LEAF) {
+                found = node;
+                break;
+            }
+            unsigned int me = t.player[node];
+            if (k == KIND_CHANCE) {
+                unsigned int base = t.draw_base[node];
+                unsigned int a = t.draw_start[base + c[me]], b = t.draw_start[base + c[me] + 1];
+                int j = pick(t.draw_p + a, (int)(b - a), &s);
+                c[me] = (int)t.draw_to[a + j];
+                node = t.child[t.child_at[node]];
+                continue;
+            }
+            unsigned int lb = t.legal_base[node], so = t.soff[node];
+            unsigned int a = t.legal_off[lb + c[me]], b = t.legal_off[lb + c[me] + 1];
+            if (a == b) break;
+            int cell;
+            if (rng_unit(&s) < 0.5) {
+                cell = puct_choice(t, node, a, b, 1 - me, c_puct);
+            } else {
+                bool any = false;
+                for (unsigned int q = a; q < b; ++q) any |= t.sum[so + q] > 0.0f;
+                const float* row = any ? t.sum + so + a : t.cur + so + a;
+                cell = (int)a + pick(row, (int)(b - a), &s);
+            }
+            t.visits[so + cell] += 1.0f;
+            unsigned int trans = t.legal_trans[so + cell];
+            if (trans == NO_TRANS) break;
+            c[me] = (int)trans;
+            node = t.legal_child[so + cell];
+        }
+        out[part * sims + sim] = found;
+    }
+    seed[part] = s;
+}
+
+// Terminal leaves are scored from the game, not the network, so the backend
+// never saw them. One block per terminal, listed per solve.
+__global__ void k_terminals(const Tree* trees, const unsigned int* term,
+                            const unsigned int* term_at, int traverser, int most) {
+    const Tree& t = trees[blockIdx.y];
+    unsigned int a = term_at[blockIdx.y], b = term_at[blockIdx.y + 1];
+    if (blockIdx.x >= b - a || (int)blockIdx.x >= most) return;
+    unsigned int node = term[a + blockIdx.x];
+    int opp = 1 - traverser;
+    unsigned int n = t.nc[2 * node + opp], ra = rbase(t, node, opp);
+    float acc = 0.0f;
+    for (unsigned int c = threadIdx.x; c < n; c += 32) acc += t.reach[ra + c];
+    for (int s = 16; s > 0; s >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, s);
+    // Zero-sum by construction, so one stored utility serves both seats.
+    float u = t.player[node] == (unsigned)traverser ? t.util[node] : -t.util[node];
+    unsigned int m = t.nc[2 * node + traverser], vo = t.voff[node];
+    for (unsigned int c = threadIdx.x; c < m; c += 32) t.vals[vo + c] = u * acc;
 }
 
 }  // extern "C"

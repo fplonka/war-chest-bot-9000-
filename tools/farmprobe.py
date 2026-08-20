@@ -50,7 +50,7 @@ def probe(devices, threads, seconds, args):
     start = time.time()
     mark, solves = start, 0
     while time.time() - start < seconds:
-        d = farm.collect(solves=4 * threads)
+        d = farm.collect(solves=args.chunk or threads)
         solves += int(d["solves"])
         now = time.time()
         if now - mark < args.window:
@@ -76,6 +76,9 @@ def main():
     p.add_argument("--devices", default="0")
     p.add_argument("--seconds", type=float, default=30)
     p.add_argument("--window", type=float, default=30)
+    # A window can only close when a collect returns, so a big chunk hides the
+    # rate behind minutes of silence when the rate is what is being measured.
+    p.add_argument("--chunk", type=int, default=0, help="solves per collect")
     p.add_argument("--nodes", type=int, default=8192)
     p.add_argument("--expand", type=int, default=8)
     p.add_argument("--iters", type=int, default=64)
