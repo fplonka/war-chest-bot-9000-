@@ -117,4 +117,8 @@ fn main() {
         "mean visit concentration {:.3} (uniform over k actions would be 1/k)",
         conc / positions.len().max(1) as f64
     );
+    // Where a solve's CPU time goes, which is what the device has to absorb.
+    // Only says anything with `--features prof`.
+    warchest::prof::dump();
+    warchest::prof::dump_work();
 }
