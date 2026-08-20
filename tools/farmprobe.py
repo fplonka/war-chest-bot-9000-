@@ -48,10 +48,11 @@ def probe(devices, threads, seconds, args):
     # Windows, because the rate is not constant: a farm can start fast and
     # decay, and an average over the whole probe hides that entirely.
     start = time.time()
-    mark, solves = start, 0
+    mark, solves, done = start, 0, 0
     while time.time() - start < seconds:
         d = farm.collect(solves=args.chunk or threads)
         solves += int(d["solves"])
+        done += int(d["solves"])
         now = time.time()
         if now - mark < args.window:
             continue
@@ -61,6 +62,7 @@ def probe(devices, threads, seconds, args):
         print(
             f"devices={devices} threads={threads:3d} t={now - start:5.0f}s: "
             f"{solves / dt:7.1f} solves/s  "
+            f"({done / (now - start):5.1f} mean)  "
             f"{rounds / dt:6.1f} rounds/s  "
             f"{calls / max(rounds, 1):5.2f} calls/round  "
             f"{rows / max(rounds, 1):7.0f} rows/round  "

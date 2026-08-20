@@ -276,14 +276,18 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
         stream.memcpy_dtod(&src.slice(from..from + n), &mut d).map_err(err)
     }
 
-    /// Forget everything: a gate slot is reused by the next solve, and what
-    /// the last one left in it is another tree's arithmetic.
-    fn clear(&mut self, stream: &Arc<CudaStream>) -> Res<()> {
+    /// Give the buffer back.
+    ///
+    /// A gate slot is reused by the next solve, and a solve's cost varies
+    /// twenty-six fold. A slot that kept the largest tree it ever served would
+    /// hold that much for the rest of the run, so the card would need the worst
+    /// case times the number of slots rather than what is actually in flight.
+    /// Allocation is stream-ordered, so this returns the pages to a pool the
+    /// other slots draw from and costs about what a launch does.
+    fn reset(&mut self) {
+        self.buf = None;
+        self.cap = 0;
         self.len = 0;
-        if let Some(b) = self.buf.as_mut() {
-            stream.memset_zeros(b).map_err(err)?;
-        }
-        Ok(())
     }
 
     fn ptr(&self, stream: &Arc<CudaStream>) -> u64 {
@@ -800,17 +804,28 @@ impl Card {
                 unreachable!("trunk shard holds only trunk calls")
             };
             let b = self.slot(&mut g, *solve);
+            if *row0 == 0 {
+                // A fresh solve in this slot. Everything the last one left is
+                // another tree's, and the pages are worth more to whichever
+                // slot is holding a large solve now. This comes before the
+                // writes below, not after them.
+                b.cells = 0;
+                b.host_coff.clear();
+                b.host_coff.push(0);
+                for a in [&mut b.p, &mut b.jp, &mut b.f, &mut b.g] {
+                    a.reset();
+                }
+                b.cidx.reset();
+                b.coff.reset();
+                b.leaf_node.reset();
+                b.term.reset();
+            }
             b.p.copy(&self.stream, row0 * D, &p, at * D, n * D)?;
             b.jp.copy(&self.stream, row0 * JW, &jp, at * JW, n * JW)?;
             // `coff` arrives relative to this call's own `cidx`, so it is
             // shifted onto the resident index before it is stored. Row zero
-            // starts a fresh solve and writes the leading zero; every later
-            // call overwrites it with its own first offset, the same number.
-            if *row0 == 0 {
-                b.cells = 0;
-                b.host_coff.clear();
-                b.host_coff.push(0);
-            }
+            // writes the leading zero; every later call overwrites it with its
+            // own first offset, the same number.
             let base = b.cells as u32;
             let shifted: Vec<u32> = coff.iter().map(|x| x + base).collect();
             b.host_coff.extend(shifted.iter().skip(1));
@@ -941,15 +956,23 @@ impl Card {
             let b = self.slot(&mut g, *solve);
             let s = &self.stream;
             if *fresh {
-                // Regrets, visits and the strategy sum accumulate over a
-                // solve, so the next solve to take this slot must not inherit
-                // them. Everything else is written before it is read.
-                b.regret.clear(s)?;
-                b.sum.clear(s)?;
-                b.visits.clear(s)?;
-                b.qval.clear(s)?;
+                // Regrets, visits and the strategy sum accumulate over a solve,
+                // so the next solve to take this slot must not inherit them.
+                // The tree's own arrays go back too: `Tree::extend` rewinds
+                // what it tracks, and holding the pages would cost the card the
+                // worst case in every slot at once.
+                for a in b.tree.pools() {
+                    a.reset();
+                }
+                b.tree.rvd_p.reset();
+                b.tree.draw_p.reset();
+                for a in [&mut b.reach, &mut b.vals, &mut b.cur, &mut b.regret,
+                          &mut b.sum, &mut b.qval, &mut b.visits, &mut b.prior,
+                          &mut b.avg] {
+                    a.reset();
+                }
             }
-            b.tree.extend(s, &mut pack, contract, *from, *fresh)?;
+            b.tree.extend(s, &mut pack, contract, *from)?;
             b.level_start.clear();
             b.level_start.extend_from_slice(&contract.level_start);
             b.nterm = term.len();
@@ -1447,18 +1470,7 @@ impl Tree {
     /// Bring the description up to date with `c`. `from` is the first node
     /// whose row may have changed — the earliest leaf this growth expanded.
     fn extend(&mut self, s: &Arc<CudaStream>, p: &mut Pack, c: &crate::contract::Contract,
-              from: usize, fresh: bool) -> Res<()> {
-        if fresh {
-            // The slot held another solve until a moment ago. `tail` sends
-            // whatever a pool has grown by, so a pool that starts shorter than
-            // the last solve's would send nothing at all and the card would go
-            // on reading the tree before it.
-            for a in self.pools() {
-                a.len = 0;
-            }
-            self.rvd_p.len = 0;
-            self.draw_p.len = 0;
-        }
+              from: usize) -> Res<()> {
         let wide: Vec<u32> = c.kind[from..].iter().map(|&x| x as u32).collect();
         p.u32(&mut self.kind, s, from, &wide)?;
         let wide: Vec<u32> = c.player[from..].iter().map(|&x| x as u32).collect();
