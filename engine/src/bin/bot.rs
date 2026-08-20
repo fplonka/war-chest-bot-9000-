@@ -151,7 +151,7 @@ fn main() {
             // itself; it stops when the gate closes, which is when stdin ends.
             let driver = std::thread::spawn(move || {
                 while !mine.round_closed() {
-                    mine.serve_until_idle(|calls| backend.run(calls));
+                    mine.serve_until_idle(|calls| backend.run(calls, 0));
                     std::thread::sleep(std::time::Duration::from_micros(200));
                 }
             });
@@ -254,7 +254,7 @@ fn devices(o: &Options) -> Option<Backend> {
         let n = warchest::cuda::Device::count();
         if n > 0 {
             let net = Net::load_bin(&o.weights).ok()?;
-            match warchest::cuda::Device::new(&(0..n).collect::<Vec<_>>(), net) {
+            match warchest::cuda::Device::new(&(0..n).collect::<Vec<_>>(), net, 1) {
                 Ok(d) => return Some(Backend::Cuda(d)),
                 Err(e) => eprintln!("no device backend: {e}"),
             }

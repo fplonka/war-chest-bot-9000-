@@ -9,17 +9,22 @@
 #   tools/box.sh <command...>
 set -euo pipefail
 
-host=${WARCHEST_BOX_HOST:-184.144.224.246}
-port=${WARCHEST_BOX_PORT:-40588}
+host=${WARCHEST_BOX_HOST:-ssh1.vast.ai}
+port=${WARCHEST_BOX_PORT:-26778}
 key=${WARCHEST_BOX_KEY:-$HOME/.ssh/id_ed25519_warchest_vast}
 remote=${WARCHEST_BOX_DIR:-/workspace/warchest-engine}
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 
 ssh_opts=(-i "$key" -p "$port" -o StrictHostKeyChecking=no -o ServerAliveInterval=30)
+# jemalloc and the image's virtualenv are both nice to have and neither is
+# guaranteed by the image, so neither is allowed to stop a command.
 prelude="export PATH=/root/.cargo/bin:/usr/local/cuda/bin:\$PATH
-export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+# maturin insists on knowing which environment it is installing into, and the
+# image's python is a conda root rather than a virtualenv.
+export CONDA_PREFIX=\${CONDA_PREFIX:-/opt/conda}
+[ -f /usr/lib/x86_64-linux-gnu/libjemalloc.so.2 ] && export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
 source /venv/main/bin/activate 2>/dev/null || true
-cd $remote"
+mkdir -p $remote && cd $remote"
 
 run_remote() { ssh "${ssh_opts[@]}" "root@$host" "$prelude
 $*"; }

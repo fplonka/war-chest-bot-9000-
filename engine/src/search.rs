@@ -30,7 +30,7 @@
 
 use crate::actions::Action;
 use crate::board::NONE;
-use crate::farm::{Call, Gate, Reply};
+use crate::farm::{Call, Dst, Gate, Reply, Writes};
 use crate::net::Net;
 use crate::rng::Rng;
 use crate::rebel::*;
@@ -56,6 +56,19 @@ pub struct Cfg {
     /// down lines nobody plays. Growing puts the nodes where the strategy
     /// actually goes.
     pub nodes: usize,
+    /// CFR iterations the device runs before waking the host to grow.
+    ///
+    /// A GT-CFR iteration wakes the host for one reason: to turn the leaves an
+    /// expansion phase sampled into decision nodes, which is the game's rules
+    /// and lives there. At one iteration a wake that barrier is most of what a
+    /// solve costs. Running several phases against a tree that has not grown
+    /// between them is an approximation -- but it is the same one the device
+    /// already makes *within* a phase, where eight simulations run before any
+    /// of them is grown and the visit counts a trajectory leaves behind are
+    /// what keep them apart. This widens that window rather than opening a new
+    /// one. It is off by default because it changes the search, not just its
+    /// speed, and belongs to a ladder rather than a probe.
+    pub grow_every: usize,
     /// The regret-update rule.
     pub cfr: Cfr,
     /// Max tree nodes a solve may build. 0 = unlimited. A solve that hits the
@@ -90,6 +103,7 @@ impl Default for Cfg {
         Cfg {
             iters: 64,
             expand: 1,
+            grow_every: 1,
             // A depth-2 uniform tree ran to about a thousand nodes, which is
             // the budget this replaces, spent by growth instead of evenly.
             nodes: 1024,
@@ -851,6 +865,8 @@ pub struct Solver<'a> {
     /// prior behind -- and sending everything from the lowest of them sends the
     /// whole arena when the root is among them.
     primed_spans: Vec<(u32, u32)>,
+    /// How much of each of the card's arrays it has already been told about.
+    sent: crate::contract::Sent,
 }
 
 impl Drop for Solver<'_> {
@@ -940,6 +956,7 @@ impl<'a> Solver<'a> {
             sent_cells: 0,
             seed: 0,
             primed_spans: Vec::new(),
+            sent: Default::default(),
         };
         sv.cf.clear();
         sv.cg.clear();
@@ -2179,6 +2196,8 @@ impl<'a> Solver<'a> {
     /// dropped. The visit counts a trajectory leaves behind — the paper's
     /// virtual loss — are what makes that rare rather than usual.
     fn solve_on_device(&mut self, rng: &mut Rng) {
+        /// Iterations a solve may take in one round once its tree is full.
+        const TAIL: usize = 8;
         // Read off the game's stream rather than drawn from it. The host path
         // spends draws inside `sample_leaf`; if this spent one too, the two
         // paths would sample different actions afterwards even when they are
@@ -2193,7 +2212,23 @@ impl<'a> Solver<'a> {
             // remaining iterations needs the host and they all ride in one
             // round. Growth finishes around iteration thirty-eight of
             // sixty-four, so this is most of the barriers a solve pays.
-            let done = if self.nodes.len() >= self.cfg.nodes { left } else { 1 };
+            //
+            // The obvious objection is that those extra iterations run over one
+            // solve's leaves rather than the round's thirty-six, which is the
+            // batch size an accelerator is least interested in. Measured, that
+            // does not matter and the barrier does: taking it out moved
+            // rounds a solve from 48 to 79 and the rate from 15.1 to 9.6.
+            //
+            // What does matter is that a round runs as many iterations as its
+            // longest tail asks for, and each of them issues a hundred-odd
+            // launches from the one driver thread. `TAIL` bounds that: a tail
+            // of twenty-six taken eight at a time costs four rounds instead of
+            // one, against forty-two rounds a solve rather than thirty-nine.
+            let done = if self.nodes.len() >= self.cfg.nodes {
+                left.min(TAIL)
+            } else {
+                left.min(self.cfg.grow_every.max(1))
+            };
             // The priors of whatever the *last* round's trunk answered for.
             // A node is expanded before the batch carrying its board vector
             // has run, so its prior was always an iteration behind; computing
@@ -2248,21 +2283,12 @@ impl<'a> Solver<'a> {
     /// One call asking for `steps` iterations, and an expansion phase after
     /// them unless the tree has nothing left to grow.
     fn iterate_call(&self, steps: usize, expand: usize) -> Call {
-        let k = self.cfg.cfr;
         Call::Iterate {
             solve: Gate::slot(),
-            factors: (0..steps)
-                .map(|j| {
-                    let m = (self.steps[0] + j) as f32 + 1.0;
-                    (
-                        Cfr::factor(m, k.alpha),
-                        Cfr::factor(m, k.beta),
-                        (m / (m + 1.0)).powf(k.gamma),
-                    )
-                })
-                .collect(),
-            predict: k.predict,
+            step: self.steps[0],
+            iters: steps,
             expand,
+            cfr: self.cfg.cfr,
             puct: self.cfg.puct,
         }
     }
@@ -2302,40 +2328,38 @@ impl<'a> Solver<'a> {
         let sent = self.sent_cells;
         self.sent_cells = self.ncells;
         let first = self.steps[0] == 0 && self.sent_from == 0;
+        if first {
+            self.sent = Default::default();
+        }
+        // Built here rather than in the backend. The driver has one thread a
+        // card and every solver thread is parked while it runs, so a round's
+        // marshalling belongs on the cores that have nothing else to do.
+        let mut w = Writes::default();
+        self.contract.write_into(&mut w, &mut self.sent, self.sent_from, &self.rewrite);
+        w.u32s(Dst::LeafNode, 0, &self.leaf_rows.iter().map(|&i| i as u32).collect::<Vec<_>>());
+        w.u32s(Dst::Term, 0, &self.term_leaves.iter().map(|&i| i as u32).collect::<Vec<_>>());
+        if first {
+            let b = [&self.root_belief[0].p[..], &self.root_belief[1].p[..]].concat();
+            w.f32s(Dst::Rootb, 0, &b);
+        }
+        // The tail this growth appended, which `cur` and `prior` both start at,
+        // and then the rows the policy head has just written. The tail leads
+        // because a run is placed by taking the buffer's address, and it is the
+        // only one that can grow the buffer and move it.
+        w.f32s_both(Dst::Cur, Dst::Prior, sent, &self.cur[sent..]);
+        for (at, n) in std::mem::take(&mut self.primed_spans) {
+            w.f32s(Dst::Prior, at as usize, &self.prior[at as usize..(at + n) as usize]);
+        }
         let call = Call::Tree {
             solve: Gate::slot(),
-            contract: Arc::clone(&self.contract),
-            from: self.sent_from,
-            rewrite: self.rewrite.clone(),
+            writes: w,
             fresh: first,
             ncells: self.ncells,
             nreach: self.reach.len(),
             nvals: self.vals.len(),
-            leaf_node: self.leaf_rows.iter().map(|&i| i as u32).collect(),
-            term: self.term_leaves.iter().map(|&i| i as u32).collect(),
-            rootb: if first {
-                [&self.root_belief[0].p[..], &self.root_belief[1].p[..]].concat()
-            } else {
-                Vec::new()
-            },
-            seed: self.seed,
-            cur: self.cur[sent..].to_vec(),
-            // The rows the policy head has just written, and the tail this
-            // growth appended. Anything else the card already has.
-            prior: {
-                // The appended tail first. A span is planned by taking the
-                // buffer's address, and a later span that grows the buffer
-                // would move it out from under the earlier one's pointer --
-                // the tail is the only span that can grow it.
-                let mut spans = vec![(sent as u32, (self.ncells - sent) as u32)];
-                spans.append(&mut self.primed_spans);
-                spans
-                    .iter()
-                    .map(|&(at, n)| {
-                        (at, self.prior[at as usize..(at + n) as usize].to_vec())
-                    })
-                    .collect()
-            },
+            levels: self.contract.level_start.clone(),
+            nterm: self.term_leaves.len(),
+            seed: first.then_some(self.seed),
         };
         self.sent_from = self.nodes.len();
         call

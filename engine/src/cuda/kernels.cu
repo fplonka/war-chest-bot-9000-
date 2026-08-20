@@ -19,6 +19,11 @@ extern "C" {
 // NVRTC compiles without the C headers, so `INFINITY` does not exist here.
 __device__ __forceinline__ float neg_inf() { return __int_as_float(0xff800000); }
 
+__device__ __forceinline__ float warp_sum(float v) {
+    for (int s = 16; s > 0; s >>= 1) v += __shfl_xor_sync(0xffffffff, v, s);
+    return v;
+}
+
 __device__ __forceinline__ float gelu1(float x) {
     // tanh approximation, matching `net::gelu`.
     const float k = 0.7978845608028654f;
@@ -40,40 +45,59 @@ __global__ void k_gelu(float* x, int n) {
 //
 // `act` folds in the GELU, which is `Norm::apply`; without it this is
 // `Norm::plain`.
+// `add` is the bias of whichever matrix multiply produced `src`, folded in
+// here rather than paid for with a pass of its own. A residual stream is added
+// to, so the bias a block owes it is never actually stored: `add` carries the
+// running sum of every bias the stream has been owed so far, and the norm is
+// the only thing that reads the stream.
+//
+// Rows are ninety-six to two hundred and fifty-six wide, so one row is one
+// **warp**, not one block: a block-wide reduction spends its time in
+// `__syncthreads` for a sum a warp shuffles in five steps.
 __device__ __forceinline__ void norm_row(const float* src, float* dst,
                                          const float* gamma, const float* beta,
-                                         int rows, int width, int act) {
+                                         const float* add, int has, int rows,
+                                         int width, int act) {
     int r = blockIdx.x * blockDim.y + threadIdx.y;
     if (r >= rows) return;
     const float* in = src + (size_t)r * width;
     float* out = dst + (size_t)r * width;
+    // At most eight values a lane, so the row is read once and kept.
+    float v[8];
+    int n = 0;
     float sum = 0.0f;
-    for (int j = threadIdx.x; j < width; j += 32) sum += in[j];
+    for (int j = threadIdx.x; j < width; j += 32) {
+        float x = in[j] + (has ? add[j] : 0.0f);
+        v[n++] = x;
+        sum += x;
+    }
     for (int s = 16; s > 0; s >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, s);
     float mean = sum / width;
     float var = 0.0f;
-    for (int j = threadIdx.x; j < width; j += 32) {
-        float d = in[j] - mean;
+    for (int k = 0; k < n; ++k) {
+        float d = v[k] - mean;
         var += d * d;
     }
     for (int s = 16; s > 0; s >>= 1) var += __shfl_xor_sync(0xffffffff, var, s);
     float inv = rsqrtf(var / width + 1e-5f);
+    n = 0;
     for (int j = threadIdx.x; j < width; j += 32) {
-        float v = (in[j] - mean) * inv * gamma[j] + beta[j];
-        out[j] = act ? gelu1(v) : v;
+        float y = (v[n++] - mean) * inv * gamma[j] + beta[j];
+        out[j] = act ? gelu1(y) : y;
     }
 }
 
 __global__ void k_norm(const float* src, float* dst, const float* gamma,
-                       const float* beta, int rows, int width, int act) {
-    norm_row(src, dst, gamma, beta, rows, width, act);
+                       const float* beta, const float* add, int has, int rows,
+                       int width, int act) {
+    norm_row(src, dst, gamma, beta, add, has, rows, width, act);
 }
 
 // The same, in place. A separate entry only because one buffer cannot be
 // handed to a launch as both an argument to read and an argument to write.
 __global__ void k_norm_ip(float* x, const float* gamma, const float* beta,
-                          int rows, int width, int act) {
-    norm_row(x, x, gamma, beta, rows, width, act);
+                          const float* add, int has, int rows, int width, int act) {
+    norm_row(x, x, gamma, beta, add, has, rows, width, act);
 }
 
 // `out[r, j] += b[j]` -- the per-column bias a GEMM does not carry.
@@ -89,15 +113,6 @@ __global__ void k_bias(float* out, const float* b, int rows, int width) {
     for (int j = threadIdx.x; j < width; j += blockDim.x) row[j] += b[j];
 }
 
-// `out[cell, j] += bias[cell / span, j]` — a per-row vector broadcast down a
-// group of cells, which is how the pooled global bias reaches every hex.
-__global__ void k_group_bias(float* out, const float* bias, int cells,
-                             int width, int span) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= cells * width) return;
-    int cell = i / width, j = i % width;
-    out[i] += bias[(size_t)(cell / span) * width + j];
-}
 
 // A contiguous window out of each source row, into a packed matrix. Pile counts
 // and the loose scalars both reach their GEMM this way; `stride` is `2 *
@@ -165,58 +180,290 @@ __global__ void k_stem(float* x, const float* projected, const int* occupant,
     x[i] += acc;
 }
 
-// `[self | sum of neighbours]` per hex, the input to a block's mix.
-__global__ void k_neighbour_mix(const float* a, const int* nb, float* mixed,
-                                int cells, int nhex, int c) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= cells * c) return;
-    int cell = i / c, j = i % c;
-    int h = cell % nhex, base = cell - h;
-    mixed[(size_t)cell * 2 * c + j] = a[i];
-    float acc = 0.0f;
-    for (int k = 0; k < 6; ++k) {
-        int n = nb[(size_t)h * 6 + k];
-        if (n >= 0) acc += a[((size_t)base + n) * c + j];
+
+
+
+// The trunk's eight residual blocks, with the board resident in shared memory.
+//
+// This is the kernel that decides whether the throughput target is reachable.
+// Written as separate launches a block is eighteen passes over `[37 hexes, 96
+// channels]` of global memory -- two norms, a neighbour mix, two matrix
+// multiplies, a pool, a group bias and an accumulate, each reading and writing
+// the whole board. That is about two megabytes per leaf over eight blocks, and
+// at a hundred and fifty solves a second with ~5,700 leaves apiece it comes to
+// 1.75 TB/s against the 1.87 the two cards have.
+//
+// A whole board is 37 x 96 x 4 = 14.2 KB. Three of them fit in shared memory,
+// so the board is read once, worked on eight times where it sits, and handed
+// back as the pooled row the head wants -- about eight hundred bytes. The
+// weights are the same for every leaf and come to 1.5 MB over the eight
+// blocks, which L2 holds.
+//
+// One CUDA block is one leaf. `threadIdx.x` is the channel and there are
+// exactly `c` of them, so a thread owns one number of every row it touches;
+// `threadIdx.y` sweeps the hexes.
+//
+// The neighbour half of the mix is folded rather than gathered: the mix is
+// linear, so summing the neighbours' *projections* is the same as projecting
+// their sum, and the projection is a row every hex needs for itself anyway.
+// That is what keeps this to three boards instead of four.
+//
+// `off` is the weight plan, `TRUNK_OFF` entries a block and two after them:
+//   0 mix.w  1 mix.b  2 pool.w  3 pool.b  4 out.w  5 out.b
+//   6 ln0.g  7 ln0.b  8 ln1.g  9 ln1.b     then trunk.ln.g, trunk.ln.b
+#define TRUNK_OFF 10
+// A thread owns this many channels, and this many hexes at most.
+//
+// One channel a thread meant one shared-memory load for every fused multiply,
+// and the SM issues one instruction per clock per partition against thirty-two
+// lanes of arithmetic -- so half the machine went on addressing. Three channels
+// a thread turns that into three loads for twelve multiplies. Thirty-two
+// threads a hex also makes a row exactly one warp wide, so a LayerNorm is a
+// shuffle with no barrier in it.
+#define TRUNK_Q 3
+// Hexes a thread owns, and warps in a block. Both are compile-time, and that
+// is the whole point: a loop whose trip count the compiler cannot see forces
+// the accumulators into local memory, and a matrix multiply whose accumulator
+// lives in memory runs at a few per cent of the card. `37 = 3*12 + 1`, so one
+// warp holds four hexes and the rest hold three; the fourth is masked rather
+// than skipped, because a runtime bound is the thing being avoided.
+#define TRUNK_SPAN 12
+#define TRUNK_MAXH 4
+
+// Mean and inverse standard deviation of one hex's row, held `TRUNK_Q` values
+// to a lane across one warp. Two passes, as `norm_row` does, because the
+// one-pass form loses the difference between two nearly equal sums.
+__device__ __forceinline__ void row_stats(const float* v, int c, float* mean,
+                                          float* inv) {
+    float s = 0.0f;
+    for (int q = 0; q < TRUNK_Q; ++q) s += v[q];
+    s = warp_sum(s);
+    float m = s / c, t = 0.0f;
+    for (int q = 0; q < TRUNK_Q; ++q) {
+        float d = v[q] - m;
+        t += d * d;
     }
-    mixed[(size_t)cell * 2 * c + c + j] = acc;
+    t = warp_sum(t);
+    *mean = m;
+    *inv = rsqrtf(t / c + 1e-5f);
 }
 
-// Mean and max over a row's hexes, side by side.
-__global__ void k_pool(const float* a, float* pooled, int rows, int nhex,
-                       int c) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * c) return;
-    int r = i / c, j = i % c;
-    float mean = 0.0f, mx = neg_inf();
-    for (int h = 0; h < nhex; ++h) {
-        float v = a[((size_t)r * nhex + h) * c + j];
-        mean += v / nhex;
-        mx = fmaxf(mx, v);
-    }
-    pooled[(size_t)r * 2 * c + j] = mean;
-    pooled[(size_t)r * 2 * c + c + j] = mx;
-}
+// `__launch_bounds__` with a minimum of one block an SM, because the default
+// is the opposite bargain: the compiler caps registers to fit more blocks and
+// spills what will not fit, and an accumulator in local memory costs a matrix
+// multiply an order of magnitude. Shared memory already holds this to one or
+// two blocks an SM, so there is nothing to trade away.
+__global__ __launch_bounds__(32 * TRUNK_SPAN, 1)
+void k_trunk(const float* x0, const int* nb, const float* __restrict__ w,
+             const float* __restrict__ bias, const float* __restrict__ ln,
+             const int* __restrict__ off, const float* xpub, float* out,
+             int rows, int nhex, int c, int blocks, int stride, int off_loose,
+             int loose) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    extern __shared__ float sm[];
+    float* x = sm;                    // [nhex, c] the residual stream
+    float* a = x + nhex * c;          // [nhex, c] the normalised board
+    float* u = a + nhex * c;          // [nhex, c] each hex's neighbour projection
+    float* pooled = u + nhex * c;     // [2c]
+    float* gb = pooled + 2 * c;       // [c]
 
-// The board head's input: pooled mean and max, then the loose scalars.
-__global__ void k_board_input(const float* x, const float* xpub, float* out,
-                              int rows, int nhex, int c, int stride,
-                              int off_loose, int loose) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int lane = threadIdx.x, slot = threadIdx.y;
+    // Channels `lane, lane + 32, lane + 64`: consecutive lanes read consecutive
+    // weights, so every load of a weight row is one transaction. `hex[t]` is
+    // this thread's hexes, clamped so a masked one still reads in bounds.
+    int hex[TRUNK_MAXH];
+    bool live[TRUNK_MAXH];
+#pragma unroll
+    for (int t = 0; t < TRUNK_MAXH; ++t) {
+        int h = slot + t * TRUNK_SPAN;
+        live[t] = h < nhex;
+        hex[t] = live[t] ? h : 0;
+    }
+    float acc[TRUNK_MAXH][TRUNK_Q];
+    float cur[TRUNK_Q];
+
+#pragma unroll
+    for (int t = 0; t < TRUNK_MAXH; ++t)
+        if (live[t])
+            for (int q = 0; q < TRUNK_Q; ++q)
+                x[hex[t] * c + lane + 32 * q] =
+                    x0[((size_t)row * nhex + hex[t]) * c + lane + 32 * q];
+    __syncthreads();
+
+    for (int blk = 0; blk < blocks; ++blk) {
+        const int* o = off + blk * TRUNK_OFF;
+        // a = gelu(norm(x)).
+#pragma unroll
+        for (int t = 0; t < TRUNK_MAXH; ++t) {
+            for (int q = 0; q < TRUNK_Q; ++q) cur[q] = x[hex[t] * c + lane + 32 * q];
+            float mean, inv;
+            row_stats(cur, c, &mean, &inv);
+            if (live[t])
+                for (int q = 0; q < TRUNK_Q; ++q) {
+                    int j = lane + 32 * q;
+                    a[hex[t] * c + j] =
+                        gelu1((cur[q] - mean) * inv * ln[o[6] + j] + ln[o[7] + j]);
+                }
+        }
+        __syncthreads();
+        // Each hex's own projection through the neighbour half of the mix. The
+        // mix is linear, so summing the neighbours' projections is the same as
+        // projecting their sum -- and the projection is a row every hex needs
+        // for itself anyway. That is what keeps this to three boards.
+#pragma unroll
+        for (int t = 0; t < TRUNK_MAXH; ++t)
+            for (int q = 0; q < TRUNK_Q; ++q) acc[t][q] = 0.0f;
+        // Unrolled, because the weights come from L2: the boards take 43 KB of
+        // the 128 KB an SM splits between shared memory and L1, so two blocks
+        // leave forty for a cache the residual block streams 180 KB through.
+        // Four rounds of loads in flight is what covers that latency.
+#pragma unroll 4
+        for (int k = 0; k < c; ++k) {
+            float wv[TRUNK_Q];
+#pragma unroll
+            for (int q = 0; q < TRUNK_Q; ++q)
+                wv[q] = w[o[0] + (size_t)(c + k) * c + lane + 32 * q];
+#pragma unroll
+            for (int t = 0; t < TRUNK_MAXH; ++t) {
+                float av = a[hex[t] * c + k];
+                for (int q = 0; q < TRUNK_Q; ++q) acc[t][q] += av * wv[q];
+            }
+        }
+        // The pooled global bias: mean and max over the hexes, projected once
+        // for the whole board.
+        if (slot == 0) {
+            for (int q = 0; q < TRUNK_Q; ++q) {
+                int j = lane + 32 * q;
+                float sum = 0.0f, mx = neg_inf();
+                for (int h = 0; h < nhex; ++h) {
+                    float v = a[h * c + j];
+                    sum += v;
+                    mx = fmaxf(mx, v);
+                }
+                pooled[j] = sum / nhex;
+                pooled[c + j] = mx;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int t = 0; t < TRUNK_MAXH; ++t)
+            if (live[t])
+                for (int q = 0; q < TRUNK_Q; ++q)
+                    u[hex[t] * c + lane + 32 * q] = acc[t][q];
+        if (slot == 0) {
+            for (int q = 0; q < TRUNK_Q; ++q) {
+                int j = lane + 32 * q;
+                float sv = bias[o[3] + j];
+                for (int k = 0; k < 2 * c; ++k) sv += pooled[k] * w[o[2] + (size_t)k * c + j];
+                gb[j] = sv;
+            }
+        }
+        __syncthreads();
+        // The mix proper. `a` is read only at this hex, so the answer can go
+        // back into it -- but not before every thread of every hex has read
+        // what it needs, hence the barrier below.
+#pragma unroll
+        for (int t = 0; t < TRUNK_MAXH; ++t)
+            for (int q = 0; q < TRUNK_Q; ++q) {
+                int j = lane + 32 * q;
+                acc[t][q] = bias[o[1] + j] + gb[j];
+            }
+#pragma unroll 4
+        for (int k = 0; k < c; ++k) {
+            float wv[TRUNK_Q];
+#pragma unroll
+            for (int q = 0; q < TRUNK_Q; ++q)
+                wv[q] = w[o[0] + (size_t)k * c + lane + 32 * q];
+#pragma unroll
+            for (int t = 0; t < TRUNK_MAXH; ++t) {
+                float av = a[hex[t] * c + k];
+                for (int q = 0; q < TRUNK_Q; ++q) acc[t][q] += av * wv[q];
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < TRUNK_MAXH; ++t)
+            for (int k = 0; k < 6; ++k) {
+                int n = nb[hex[t] * 6 + k];
+                if (n >= 0)
+                    for (int q = 0; q < TRUNK_Q; ++q) acc[t][q] += u[n * c + lane + 32 * q];
+            }
+        __syncthreads();
+#pragma unroll
+        for (int t = 0; t < TRUNK_MAXH; ++t)
+            if (live[t])
+                for (int q = 0; q < TRUNK_Q; ++q)
+                    a[hex[t] * c + lane + 32 * q] = acc[t][q];
+        __syncthreads();
+        // gelu(norm(.)), then the output projection accumulated onto x.
+#pragma unroll
+        for (int t = 0; t < TRUNK_MAXH; ++t) {
+            for (int q = 0; q < TRUNK_Q; ++q) cur[q] = a[hex[t] * c + lane + 32 * q];
+            float mean, inv;
+            row_stats(cur, c, &mean, &inv);
+            if (live[t])
+                for (int q = 0; q < TRUNK_Q; ++q) {
+                    int j = lane + 32 * q;
+                    a[hex[t] * c + j] =
+                        gelu1((cur[q] - mean) * inv * ln[o[8] + j] + ln[o[9] + j]);
+                }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int t = 0; t < TRUNK_MAXH; ++t)
+            for (int q = 0; q < TRUNK_Q; ++q) acc[t][q] = bias[o[5] + lane + 32 * q];
+#pragma unroll 4
+        for (int k = 0; k < c; ++k) {
+            float wv[TRUNK_Q];
+#pragma unroll
+            for (int q = 0; q < TRUNK_Q; ++q)
+                wv[q] = w[o[4] + (size_t)k * c + lane + 32 * q];
+#pragma unroll
+            for (int t = 0; t < TRUNK_MAXH; ++t) {
+                float av = a[hex[t] * c + k];
+                for (int q = 0; q < TRUNK_Q; ++q) acc[t][q] += av * wv[q];
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < TRUNK_MAXH; ++t)
+            if (live[t])
+                for (int q = 0; q < TRUNK_Q; ++q)
+                    x[hex[t] * c + lane + 32 * q] += acc[t][q];
+        __syncthreads();
+    }
+
+    // The trunk norm, and the head's input: pooled mean and max, then the
+    // loose scalars straight off the public encoding.
+    const int* tn = off + blocks * TRUNK_OFF;
+#pragma unroll
+    for (int t = 0; t < TRUNK_MAXH; ++t) {
+        for (int q = 0; q < TRUNK_Q; ++q) cur[q] = x[hex[t] * c + lane + 32 * q];
+        float mean, inv;
+        row_stats(cur, c, &mean, &inv);
+        if (live[t])
+            for (int q = 0; q < TRUNK_Q; ++q) {
+                int j = lane + 32 * q;
+                x[hex[t] * c + j] =
+                    gelu1((cur[q] - mean) * inv * ln[tn[0] + j] + ln[tn[1] + j]);
+            }
+    }
+    __syncthreads();
     int width = 2 * c + loose;
-    if (i >= rows * width) return;
-    int r = i / width, j = i % width;
-    if (j < c) {
-        float acc = 0.0f;
-        for (int h = 0; h < nhex; ++h) acc += x[((size_t)r * nhex + h) * c + j];
-        out[i] = acc / nhex;
-    } else if (j < 2 * c) {
-        float mx = neg_inf();
-        for (int h = 0; h < nhex; ++h)
-            mx = fmaxf(mx, x[((size_t)r * nhex + h) * c + j - c]);
-        out[i] = mx;
-    } else {
-        out[i] = xpub[(size_t)r * stride + off_loose + j - 2 * c];
+    if (slot == 0) {
+        for (int q = 0; q < TRUNK_Q; ++q) {
+            int j = lane + 32 * q;
+            float sum = 0.0f, mx = neg_inf();
+            for (int h = 0; h < nhex; ++h) {
+                float v = x[h * c + j];
+                sum += v;
+                mx = fmaxf(mx, v);
+            }
+            out[(size_t)row * width + j] = sum / nhex;
+            out[(size_t)row * width + c + j] = mx;
+        }
     }
+    for (int k = lane + 32 * slot; k < loose; k += 32 * TRUNK_SPAN)
+        out[(size_t)row * width + 2 * c + k] = xpub[(size_t)row * stride + off_loose + k];
 }
 
 // One slot row per (config, slot): three counts then that slot's card token.
@@ -264,56 +511,6 @@ __global__ void k_bag(const float* bag, const float* phi,
     g[i] += acc;
 }
 
-// `[own pooled | opponent pooled | seat]`, the join's belief-dependent input.
-// The queried seat is per row because a round joins solves that are asking
-// about different players.
-// One residual block of the join, fused.
-//
-// A block is a norm, a 128-wide matrix multiply and an add. Written as four
-// kernels that is nine passes over `[rows, width]` for a multiply whose own
-// traffic is two — and at this width the multiply already sits at the card's
-// flop-per-byte balance, so what the block costs is the elementwise work around
-// it rather than the arithmetic. One thread block a row keeps the row in shared
-// memory and touches `z` once each way; the weights come out of L2, where every
-// block in flight is reading the same 64 KB.
-//
-// `blockDim.x` is the width, which is `JW`.
-__global__ void k_join_block(float* z, const float* gamma, const float* beta,
-                             const float* w, const float* bias, int rows, int width) {
-    extern __shared__ float sh[];
-    __shared__ float red[32];
-    float* row = sh;
-    float* t = sh + width;
-    int r = blockIdx.x, j = threadIdx.x;
-    if (r >= rows) return;
-    float v = z[(size_t)r * width + j];
-    row[j] = v;
-
-    // Mean, then variance, both over the row.
-    for (int pass = 0; pass < 2; ++pass) {
-        float x = pass == 0 ? v : (v - red[0]) * (v - red[0]);
-        for (int k = 16; k > 0; k >>= 1) x += __shfl_down_sync(0xffffffff, x, k);
-        if ((j & 31) == 0) red[j >> 5] = x;
-        __syncthreads();
-        if (j == 0) {
-            float tot = 0.0f;
-            for (int k = 0; k < blockDim.x / 32; ++k) tot += red[k];
-            red[0] = tot / width;
-        }
-        __syncthreads();
-        if (pass == 0) v = row[j];
-    }
-    float inv = rsqrtf(red[0] + 1e-5f);
-    // `red[0]` is the variance here and the mean on the pass before, so the
-    // mean is taken from the row again rather than kept across the barrier.
-    __syncthreads();
-    t[j] = gelu1((row[j] - (0.0f)) * inv * gamma[j] + beta[j]);
-    __syncthreads();
-
-    float acc = bias[j];
-    for (int k = 0; k < width; ++k) acc += t[k] * w[(size_t)k * width + j];
-    z[(size_t)r * width + j] = row[j] + acc;
-}
 
 // `[own pooled | opponent pooled | seat]`, the join's belief-dependent input.
 //
@@ -323,11 +520,13 @@ __global__ void k_join_block(float* z, const float* gamma, const float* beta,
 // so running it once over twice the rows costs the same arithmetic and half
 // the launches.
 __global__ void k_join_input(const float* pooled, float* out, int rows, int pool,
-                             int stride) {
+                             int tile) {
     int r = blockIdx.x;
     if (r >= rows) return;
     int width = 2 * pool + 1;
-    int p = r / stride, q = r % stride;
+    // The tile holds `tile` leaves and both of their seats, seat-major, so a
+    // leaf's two pooled rows are adjacent whichever seat is asking.
+    int p = r / tile, q = r % tile;
     const float* mine = pooled + ((size_t)2 * q + p) * pool;
     const float* theirs = pooled + ((size_t)2 * q + 1 - p) * pool;
     float* dst = out + (size_t)r * width;
@@ -358,17 +557,23 @@ __global__ void k_join_input(const float* pooled, float* out, int rows, int pool
 // together. They travel concatenated instead: one buffer, and this to put each
 // piece where it belongs. `start` is the prefix sum of the pieces, so a thread
 // finds its own by bisection.
+// `sum` is the prefix sum of the piece lengths, so a thread can find which
+// piece it belongs to; `src` says where that piece's words are in the blob.
+// The two are separate because one run of words can land in two arrays -- the
+// tail a growth appends is both the starting strategy and the prior -- and
+// then the same words are read twice.
 __global__ void k_scatter(const unsigned int* blob, unsigned int* const* dst,
-                          const unsigned int* at, const unsigned int* start,
-                          int pieces, int total) {
+                          const unsigned int* at, const unsigned int* src,
+                          const unsigned int* sum, int pieces, int total) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
     int lo = 0, hi = pieces;
     while (lo + 1 < hi) {
         int mid = (lo + hi) >> 1;
-        if ((int)start[mid] <= i) lo = mid; else hi = mid;
+        if ((int)sum[mid] <= i) lo = mid; else hi = mid;
     }
-    dst[lo][at[lo] + (i - start[lo])] = blob[i];
+    int k = i - (int)sum[lo];
+    dst[lo][at[lo] + k] = blob[src[lo] + k];
 }
 
 // ------------------------------------------------------------- the CFR loop
@@ -403,6 +608,7 @@ struct Tree {
     const unsigned int* legal_child;
     const unsigned int* legal_trans;
     const unsigned int* cell_row;
+    const unsigned int* cell_val;
     const unsigned int* rev_base;
     const unsigned int* rev_start;
     const unsigned int* rev_src;
@@ -444,7 +650,25 @@ struct Tree {
     unsigned long long nterm;
     /// One value arena per traverser, so both can be backpropagated at once.
     unsigned long long nvals;
+    // A round holds solves at different points of their own sixty-four
+    // iterations, and a CFR iterate is weighted by how many came before it. So
+    // the decay factors are a function of *this* solve's step count and are
+    // computed here rather than passed in: one number for the whole batch
+    // would be some other solve's weights.
+    unsigned long long step;
+    /// Iterations this call asks of this solve, and expansion trajectories
+    /// after them. Both differ across a round once a solve's tree is full.
+    unsigned long long todo;
+    unsigned long long nexpand;
 };
+
+// `Cfr::factor` in search.rs: an infinite exponent is the CFR+ limit, which
+// keeps positive regrets whole and drops negative ones outright.
+__device__ __forceinline__ float cfr_factor(float t, float p) {
+    if (isinf(p)) return p > 0.0f ? 1.0f : 0.0f;
+    float x = powf(t, p);
+    return x / (x + 1.0f);
+}
 
 #define NO_ROW 0xffffffffu
 #define NO_TRANS 0xffffffffu
@@ -467,8 +691,9 @@ __device__ __forceinline__ unsigned int rbase(const Tree& t, unsigned int i, int
 }
 
 // The root beliefs, before the first level of the sweep reads them.
-__global__ void k_seed_reach(const Tree* trees) {
+__global__ void k_seed_reach(const Tree* trees, int iter) {
     const Tree& t = trees[blockIdx.y];
+    if ((unsigned long long)iter >= t.todo) return;
     unsigned int n = t.nc[0] + t.nc[1];
     for (unsigned int c = blockIdx.x * blockDim.x + threadIdx.x; c < n;
          c += gridDim.x * blockDim.x)
@@ -478,8 +703,9 @@ __global__ void k_seed_reach(const Tree* trees) {
 // Reach probabilities for one level, both players. `avg` picks the reference
 // strategy over the regret-matching iterate, which is what the value pass that
 // produces a solve's targets propagates under.
-__global__ void k_reach_sweep(const Tree* trees, int level, int avg, int also_sum) {
+__global__ void k_reach_sweep(const Tree* trees, int level, int avg, int also_sum, int iter) {
     const Tree& t = trees[blockIdx.y];
+    if ((unsigned long long)iter >= t.todo) return;
     const float* strat = avg ? t.avg : t.cur;
     unsigned int node;
     if (!level_task(t, level, blockIdx.x, &node)) return;
@@ -514,6 +740,11 @@ __global__ void k_reach_sweep(const Tree* trees, int level, int avg, int also_su
         }
     }
     if (!also_sum || t.kind[node] != 0) return;
+    // The accumulation below reads the reach this sweep has just written, and
+    // it reads it by *cell* where the sweep wrote it by *config* -- so a lane
+    // reads an address another warp of this block owns. Both early returns
+    // above are block-uniform, so every thread reaches this.
+    __syncthreads();
     // The reach-weighted iterate, added to the running strategy sum. The reach
     // it needs is the one the loop above has just made current, and the thread
     // that owns a config there owns it here, so this costs a level of launches
@@ -521,20 +752,29 @@ __global__ void k_reach_sweep(const Tree* trees, int level, int avg, int also_su
     unsigned int actor = t.player[node];
     unsigned int an = t.nc[2 * node + actor], so = t.soff[node], lb = t.legal_base[node];
     unsigned int ra = rbase(t, node, actor);
-    for (unsigned int c = threadIdx.x; c < an; c += blockDim.x) {
-        float r = t.reach[ra + c];
-        for (unsigned int cell = t.legal_off[lb + c]; cell < t.legal_off[lb + c + 1]; ++cell)
-            t.sum[so + cell] += r * t.cur[so + cell];
-    }
+    // Flat over the node's cells, not over its configs. A config owns a
+    // contiguous run of them, so a thread that walked its own config's run made
+    // one memory transaction per lane per step; over `sum` and `cur`, which are
+    // the largest arrays a solve holds, that is the difference between a
+    // coalesced read and thirty-two scattered ones. `cell_row` says which
+    // config a cell belongs to, and the reach it needs is a small gather.
+    unsigned int lo = t.legal_off[lb], hi = t.legal_off[lb + an];
+    for (unsigned int cell = lo + threadIdx.x; cell < hi; cell += blockDim.x)
+        t.sum[so + cell] += t.reach[ra + t.cell_row[so + cell]] * t.cur[so + cell];
 }
 
 // Value backpropagation for one level, one traverser. `avg` averages under the
 // reference strategy and leaves regrets alone -- the value pass a solve's
 // targets come from; otherwise this is the regret update itself.
-__global__ void k_backprop_sweep(const Tree* trees, int level, int avg,
-                                 float da, float db, float dg, float predict) {
+__global__ void k_backprop_sweep(const Tree* trees, int level, int avg, int iter,
+                                 float alpha, float beta, float gamma, float predict) {
     const float EPS = 1e-6f;
     const Tree& t = trees[blockIdx.y];
+    if ((unsigned long long)iter >= t.todo) return;
+    // This solve's own iterate index, not the round's.
+    float m = (float)(t.step + (unsigned long long)iter) + 1.0f;
+    float da = cfr_factor(m, alpha), db = cfr_factor(m, beta);
+    float dg = powf(m / (m + 1.0f), gamma);
     // The two traversers write disjoint cells and read disjoint value arenas,
     // so they are one launch rather than two.
     int traverser = blockIdx.z;
@@ -578,38 +818,44 @@ __global__ void k_backprop_sweep(const Tree* trees, int level, int avg,
     }
 
     unsigned int so = t.soff[node], lb = t.legal_base[node];
+    // A warp to a config, lanes across its cells. A thread that owned a config
+    // walked that config's own contiguous run, so thirty-two lanes made
+    // thirty-two separate transactions per step over `cur`, `regret`, `qval`
+    // and `sum` -- the largest arrays a solve holds. The reductions a config
+    // needs are warp shuffles rather than serial sums.
+    unsigned int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
     if (avg) {
-        for (unsigned int c = threadIdx.x; c < n; c += blockDim.x) {
+        for (unsigned int c = warp; c < n; c += warps) {
             unsigned int a = t.legal_off[lb + c], b = t.legal_off[lb + c + 1];
             float base = 0.0f;
-            for (unsigned int cell = a; cell < b; ++cell) {
-                if (t.legal_trans[so + cell] == NO_TRANS) continue;
-                float av = vals[t.voff[t.legal_child[so + cell]] + t.legal_trans[so + cell]];
-                base += av * t.avg[so + cell];
+            for (unsigned int cell = a + lane; cell < b; cell += 32) {
+                unsigned int vc = t.cell_val[so + cell];
+                if (vc != NO_ROW) base += vals[vc] * t.avg[so + cell];
             }
-            vals[vi + c] = base;
+            base = warp_sum(base);
+            if (lane == 0) vals[vi + c] = base;
         }
         return;
     }
-    // The expansion phase reads these as PUCT's Q. A sweep that computes the
+    // The expansion phase reads `qval` as PUCT's Q. A sweep that computes the
     // action values and drops them leaves selection blind, and the tree it
     // grows is a different tree -- which is a wrong answer no shape check
-    // would catch.
+    // would catch. Every cell is written here, illegal ones as zero, so the
+    // pass that used to clear them first is gone.
     unsigned int ncells = t.legal_off[lb + n];
-    for (unsigned int k = threadIdx.x; k < ncells; k += blockDim.x) t.qval[so + k] = 0.0f;
-    __syncthreads();
-    for (unsigned int c = threadIdx.x; c < n; c += blockDim.x) {
+    for (unsigned int c = warp; c < n; c += warps) {
         unsigned int a = t.legal_off[lb + c], b = t.legal_off[lb + c + 1];
         float base = 0.0f;
-        for (unsigned int cell = a; cell < b; ++cell) {
-            if (t.legal_trans[so + cell] == NO_TRANS) continue;
-            float av = vals[t.voff[t.legal_child[so + cell]] + t.legal_trans[so + cell]];
+        for (unsigned int cell = a + lane; cell < b; cell += 32) {
+            unsigned int vc = t.cell_val[so + cell];
+            float av = vc == NO_ROW ? 0.0f : vals[vc];
             t.qval[so + cell] = av;
             base += av * t.cur[so + cell];
         }
-        vals[vi + c] = base;
+        base = warp_sum(base);
+        if (lane == 0) vals[vi + c] = base;
         float total = 0.0f;
-        for (unsigned int cell = a; cell < b; ++cell) {
+        for (unsigned int cell = a + lane; cell < b; cell += 32) {
             float delta = t.qval[so + cell] - base;
             float old = t.regret[so + cell];
             float r = old * (old > 0.0f ? da : db) + delta;
@@ -618,9 +864,10 @@ __global__ void k_backprop_sweep(const Tree* trees, int level, int avg,
             t.cur[so + cell] = v;
             total += v;
         }
+        total = warp_sum(total);
         if (total > 0.0f) {
             float inv = 1.0f / total;
-            for (unsigned int cell = a; cell < b; ++cell) t.cur[so + cell] *= inv;
+            for (unsigned int cell = a + lane; cell < b; cell += 32) t.cur[so + cell] *= inv;
         }
     }
     __syncthreads();
@@ -629,19 +876,24 @@ __global__ void k_backprop_sweep(const Tree* trees, int level, int avg,
 
 // The reach-weighted iterate, added to the running strategy sum. Both players
 // in one pass: a decision node belongs to exactly one of them.
-__global__ void k_avg_block(const Tree* trees, int level) {
+__global__ void k_avg_block(const Tree* trees, int level, int iter) {
     const Tree& t = trees[blockIdx.y];
+    if ((unsigned long long)iter >= t.todo) return;
     unsigned int node;
     if (!level_task(t, level, blockIdx.x, &node)) return;
     if (t.kind[node] != 0) return;
     unsigned int actor = t.player[node];
     unsigned int an = t.nc[2 * node + actor], so = t.soff[node], lb = t.legal_base[node];
     unsigned int ra = rbase(t, node, actor);
-    for (unsigned int c = threadIdx.x; c < an; c += blockDim.x) {
-        float r = t.reach[ra + c];
-        for (unsigned int cell = t.legal_off[lb + c]; cell < t.legal_off[lb + c + 1]; ++cell)
-            t.sum[so + cell] += r * t.cur[so + cell];
-    }
+    // Flat over the node's cells, not over its configs. A config owns a
+    // contiguous run of them, so a thread that walked its own config's run made
+    // one memory transaction per lane per step; over `sum` and `cur`, which are
+    // the largest arrays a solve holds, that is the difference between a
+    // coalesced read and thirty-two scattered ones. `cell_row` says which
+    // config a cell belongs to, and the reach it needs is a small gather.
+    unsigned int lo = t.legal_off[lb], hi = t.legal_off[lb + an];
+    for (unsigned int cell = lo + threadIdx.x; cell < hi; cell += blockDim.x)
+        t.sum[so + cell] += t.reach[ra + t.cell_row[so + cell]] * t.cur[so + cell];
 }
 
 // Every leaf's normalised belief, and the opponent's reach mass there. One
@@ -649,7 +901,10 @@ __global__ void k_avg_block(const Tree* trees, int level) {
 __global__ void k_beliefs(const Tree* trees, const int* part_of_row,
                           const int* local_row, const unsigned int* coff, float* w,
                           float* mass, int rows) {
-    int r = blockIdx.x;
+    // A warp to a query, eight warps to a block. One warp per block left an SM
+    // holding sixteen of them and a quarter of its lanes busy, on a kernel that
+    // is nothing but dependent gathers and wants every warp it can get.
+    int r = blockIdx.x * blockDim.y + threadIdx.y;
     if (r >= rows) return;
     int part = part_of_row[r];
     const Tree& t = trees[part];
@@ -672,10 +927,10 @@ __global__ void k_beliefs(const Tree* trees, const int* part_of_row,
 // join is one chain of large GEMMs over every solve in flight.
 __global__ void k_gather(const Tree* trees, const int* part_of_row,
                          const int* local_row, int which, float* out,
-                         int rows, int width, int stride) {
+                         int rows, int width, int q0, int tile) {
     int row = blockIdx.x;
     if (row >= rows) return;
-    int r = row % stride;
+    int r = q0 + row % tile;
     const Tree& t = trees[part_of_row[r]];
     const float* src = (which == 0 ? t.p : t.jp) + (size_t)local_row[r] * width;
     float* dst = out + (size_t)row * width;
@@ -685,19 +940,33 @@ __global__ void k_gather(const Tree* trees, const int* part_of_row,
 // The belief block the join reads: `sum_c beta(c) g(c)` over one query's
 // support. `coff` bounds a query's cells in the round's `w`, `cidx` names each
 // cell's row in its own solve's `g`.
+// The belief-weighted pooling of a query's configs.
+//
+// `threadIdx.y` splits the support, because that is where the parallelism is:
+// the row is only `pool` wide and the sum runs over a hundred-odd configs, each
+// a dependent gather. One thread per output channel walked the whole support
+// serially and left the block waiting on memory.
 __global__ void k_belief_pool(const Tree* trees, const int* part_of_row,
                               const int* base_of_part, const unsigned int* coff,
-                              const float* w, float* out, int queries, int pool) {
-    int q = blockIdx.x;
-    if (q >= queries) return;
+                              const float* w, float* out, int q0, int queries,
+                              int pool) {
+    extern __shared__ float part_acc[];
+    int mine = blockIdx.x;
+    if (mine >= queries) return;
+    int q = q0 + mine;
     int part = part_of_row[q >> 1];
     const Tree& t = trees[part];
     unsigned int base = base_of_part[part], lo = coff[q], hi = coff[q + 1];
-    for (int j = threadIdx.x; j < pool; j += blockDim.x) {
-        float acc = 0.0f;
-        for (unsigned int k = lo; k < hi; ++k)
-            acc += w[k] * t.g[(size_t)t.cidx[k - base] * pool + j];
-        out[(size_t)q * pool + j] = acc;
+    int j = threadIdx.x, y = threadIdx.y, ny = blockDim.y;
+    float acc = 0.0f;
+    for (unsigned int k = lo + y; k < hi; k += ny)
+        acc += w[k] * t.g[(size_t)t.cidx[k - base] * pool + j];
+    part_acc[y * pool + j] = acc;
+    __syncthreads();
+    if (y == 0) {
+        float total = 0.0f;
+        for (int i = 0; i < ny; ++i) total += part_acc[i * pool + j];
+        out[(size_t)mine * pool + j] = total;
     }
 }
 
@@ -711,14 +980,49 @@ __global__ void k_belief_pool(const Tree* trees, const int* part_of_row,
 __global__ void k_readout(const Tree* trees, const int* part_of_row,
                           const int* local_row, const unsigned int* coff,
                           const float* h, const float* cf_bias, const float* mass,
-                          int rows, int stride, int d) {
+                          const float* add, const float* gamma, const float* beta,
+                          int rows, int stride, int d, int q0, int tile) {
     extern __shared__ float hs[];
+    __shared__ float red[8];
     int row = blockIdx.x;
     if (row >= rows) return;
-    for (int j = threadIdx.x + 32 * threadIdx.y; j < d; j += 32 * blockDim.y)
-        hs[j] = h[(size_t)row * d + j];
+    // `row` indexes this tile's join rows; `traverser` and `r` are the round's.
+    int traverser = row / tile, r = q0 + row % tile;
+    int tid = threadIdx.x + 32 * threadIdx.y, nt = 32 * blockDim.y;
+    // The head's own LayerNorm, done here rather than in a pass of its own.
+    // This is the only reader of `h`, and it stages the row in shared memory
+    // anyway, so normalising it costs one reduction instead of a read and a
+    // write of every head vector in the round.
+    // The head's residual seed is this leaf's board vector, added here rather
+    // than copied into `h` by a gather of its own -- `h` is written once by the
+    // join's last multiply and read once, here.
+    const float* seed = trees[part_of_row[r]].p + (size_t)local_row[r] * d;
+    float sum = 0.0f;
+    for (int j = tid; j < d; j += nt) {
+        float x = h[(size_t)row * d + j] + seed[j] + add[j];
+        hs[j] = x;
+        sum += x;
+    }
+    for (int s = 16; s > 0; s >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, s);
+    if (threadIdx.x == 0) red[threadIdx.y] = sum;
     __syncthreads();
-    int traverser = row / stride, r = row % stride;
+    float total = 0.0f;
+    for (int k = 0; k < blockDim.y; ++k) total += red[k];
+    float mean = total / d, var = 0.0f;
+    for (int j = tid; j < d; j += nt) {
+        float dv = hs[j] - mean;
+        var += dv * dv;
+    }
+    for (int s = 16; s > 0; s >>= 1) var += __shfl_xor_sync(0xffffffff, var, s);
+    __syncthreads();
+    if (threadIdx.x == 0) red[threadIdx.y] = var;
+    __syncthreads();
+    total = 0.0f;
+    for (int k = 0; k < blockDim.y; ++k) total += red[k];
+    float inv = rsqrtf(total / d + 1e-5f);
+    __syncthreads();
+    for (int j = tid; j < d; j += nt) hs[j] = (hs[j] - mean) * inv * gamma[j] + beta[j];
+    __syncthreads();
     const Tree& t = trees[part_of_row[r]];
     unsigned int node = t.leaf_node[local_row[r]];
     unsigned int lo = coff[2 * r + traverser], hi = coff[2 * r + traverser + 1];
@@ -752,11 +1056,6 @@ __device__ __forceinline__ unsigned long long rng_next(unsigned long long* s) {
 
 __device__ __forceinline__ double rng_unit(unsigned long long* s) {
     return (double)(rng_next(s) >> 11) * (1.0 / 9007199254740992.0);
-}
-
-__device__ __forceinline__ float warp_sum(float v) {
-    for (int s = 16; s > 0; s >>= 1) v += __shfl_xor_sync(0xffffffff, v, s);
-    return v;
 }
 
 // Draw an index from non-negative weights. A row whose weights have all
@@ -816,13 +1115,26 @@ __device__ int puct_choice(const Tree& t, unsigned int node, unsigned int a,
 }
 
 __global__ void k_expand(const Tree* trees, unsigned int* out, int parts,
-                         int sims, float c_puct) {
+                         int sims, float c_puct, int iter) {
     int part = blockIdx.x;
     if (part >= parts) return;
     const Tree& t = trees[part];
+    // A round runs as many iterations as its longest member asked for, and a
+    // solve that has had its share must not be given another phase.
+    if ((unsigned long long)iter >= t.todo) {
+        for (int sim = threadIdx.x; sim < sims; sim += 32)
+            out[part * sims + sim] = NO_ROW;
+        return;
+    }
+    // A solve whose tree has spent its budget asks for no trajectories, and a
+    // round holds both kinds. The row is `sims` wide either way so the host can
+    // slice it; what this solve did not sample reads as nothing.
+    for (int sim = (int)t.nexpand + threadIdx.x; sim < sims; sim += 32)
+        out[part * sims + sim] = NO_ROW;
+    if (t.nexpand == 0) return;
     unsigned long long s = *t.seed;
     unsigned int n0 = t.nc[0], n1 = t.nc[1];
-    for (int sim = 0; sim < sims; ++sim) {
+    for (int sim = 0; sim < (int)t.nexpand; ++sim) {
         int c[2];
         c[0] = pick(t.rootb, (int)n0, &s);
         c[1] = pick(t.rootb + n0, (int)n1, &s);

@@ -25,6 +25,7 @@
 //! that node's own row and appends the rest — which is what lets a growing tree
 //! ship a delta per iteration rather than itself.
 
+use crate::farm::{Dst, Writes};
 use crate::search::{Solver, NO_TRANS};
 
 /// What a node is, for a device that cannot afford a branch per field.
@@ -71,6 +72,12 @@ pub struct Contract {
     /// The parent config each cell belongs to, which the average-strategy
     /// accumulation reads and the reverse gather does not.
     pub cell_row: Vec<u32>,
+    /// The value slot each cell's child holds for the acting player, or
+    /// `NO_ROW` where the cell has no transition. The backward sweep used to
+    /// find it with `voff[legal_child[cell]] + legal_trans[cell]`: three loads
+    /// deep, the middle one scattered, for every cell of every iteration. Tree
+    /// shape only moves when the tree grows, so it is resolved once here.
+    pub cell_val: Vec<u32>,
 
     // --------------------------- the reach transition, transposed, per node
     /// Where this node's `nc + 1` offsets start in `rev_start`, or `NO_ROW`
@@ -101,9 +108,88 @@ pub struct Contract {
     pub built: usize,
 }
 
+/// How much of each append-only pool the card has already been told about.
+///
+/// The host owns this now. It used to live on the device side, where the
+/// driver looked at how long each of its buffers was -- which meant the driver
+/// had to be the one to walk the contract, on the one thread the round could
+/// least afford.
+#[derive(Default, Clone)]
+pub struct Sent {
+    /// Nodes described, in `Contract`'s own order.
+    pub nodes: usize,
+    pools: [usize; 15],
+}
+
 impl Contract {
     pub fn nodes(&self) -> usize {
         self.kind.len()
+    }
+
+    /// Everything the card has yet to be told about this tree.
+    ///
+    /// `from` is the first node whose row may have changed -- the earliest leaf
+    /// this growth expanded -- and `rewrite` the handful of already-described
+    /// rows it turned into decision nodes. Everything else the card holds.
+    ///
+    /// The appended tail leads because a run is placed by taking the buffer's
+    /// address, and it is the only one that can grow the buffer and move it.
+    pub fn write_into(&self, w: &mut Writes, sent: &mut Sent, from: usize, rewrite: &[u32]) {
+        let n = self.nodes();
+        let mut spans: Vec<(usize, usize)> = vec![(from, n - from)];
+        spans.extend(rewrite.iter().map(|&g| (g as usize, 1)));
+        for &(at, k) in &spans {
+            w.u8s(Dst::Kind, at, &self.kind[at..at + k]);
+            w.u8s(Dst::Player, at, &self.player[at..at + k]);
+            let nc: Vec<u32> = self.nc[at..at + k].iter().flatten().copied().collect();
+            w.u32s(Dst::Nc, 2 * at, &nc);
+            w.u32s(Dst::Parent, at, &self.parent[at..at + k]);
+            w.u32s(Dst::Roff, at, &self.roff[at..at + k]);
+            w.u32s(Dst::Voff, at, &self.voff[at..at + k]);
+            w.u32s(Dst::Soff, at, &self.soff[at..at + k]);
+            w.f32s(Dst::Util, at, &self.util[at..at + k]);
+            w.u32s(Dst::ChildAt, at, &self.child_at[at..at + k]);
+            w.u32s(Dst::ChildN, at, &self.child_n[at..at + k]);
+            w.u32s(Dst::LegalBase, at, &self.legal_base[at..at + k]);
+            w.u32s(Dst::RevBase, at, &self.rev_base[at..at + k]);
+            w.u32s(Dst::RvdBase, at, &self.rvd_base[at..at + k]);
+            w.u32s(Dst::DrawBase, at, &self.draw_base[at..at + k]);
+        }
+        sent.nodes = n;
+        // The pools only ever grow, apart from a rewind, so their tail is the
+        // whole of the update.
+        let words: [(Dst, &[u32]); 13] = [
+            (Dst::Child, &self.child),
+            (Dst::LegalOff, &self.legal_off),
+            (Dst::LegalChild, &self.legal_child),
+            (Dst::LegalTrans, &self.legal_trans),
+            (Dst::CellRow, &self.cell_row),
+            (Dst::CellVal, &self.cell_val),
+            (Dst::RevStart, &self.rev_start),
+            (Dst::RevSrc, &self.rev_src),
+            (Dst::RevCell, &self.rev_cell),
+            (Dst::RvdStart, &self.rvd_start),
+            (Dst::RvdSrc, &self.rvd_src),
+            (Dst::DrawStart, &self.draw_start),
+            (Dst::DrawTo, &self.draw_to),
+        ];
+        for (i, (d, v)) in words.into_iter().enumerate() {
+            let at = sent.pools[i].min(v.len());
+            w.u32s(d, at, &v[at..]);
+            sent.pools[i] = v.len();
+        }
+        for (i, (d, v)) in [(Dst::RvdP, &self.rvd_p), (Dst::DrawP, &self.draw_p)]
+            .into_iter()
+            .enumerate()
+        {
+            let at = sent.pools[13 + i].min(v.len());
+            w.f32s(d, at, &v[at..]);
+            sent.pools[13 + i] = v.len();
+        }
+        // Levels are recomputed whenever the tree grows, so they travel whole.
+        // It is two entries a node between them.
+        w.u32s(Dst::LevelStart, 0, &self.level_start);
+        w.u32s(Dst::LevelNode, 0, &self.level_node);
     }
 
     pub fn levels(&self) -> usize {
@@ -272,10 +358,19 @@ impl Contract {
                     c.legal_child.resize(end, 0);
                     c.legal_trans.resize(end, NO_TRANS);
                     c.cell_row.resize(end, 0);
+                    c.cell_val.resize(end, NO_ROW);
                 }
                 c.legal_child[at..end].copy_from_slice(&t.legal_child);
                 c.legal_trans[at..end].copy_from_slice(&t.legal_trans);
                 c.cell_row[at..end].copy_from_slice(&t.cell_row);
+                for cell in 0..t.legal_action.len() {
+                    let tr = t.legal_trans[cell];
+                    c.cell_val[at + cell] = if tr == NO_TRANS {
+                        NO_ROW
+                    } else {
+                        sv.voff[t.legal_child[cell] as usize] + tr
+                    };
+                }
                 base
             });
 
@@ -903,7 +998,104 @@ mod tests {
     /// This is the whole safety of the append-only form. A description that
     /// drifts from the tree it claims to describe produces a sweep that is
     /// quietly solving a different game, and nothing downstream would say so.
+    /// What the card ends up holding must be what the contract says.
+    ///
+    /// The description is sent as a delta -- the tail each growth appended and
+    /// the handful of rows it rewrote -- so a wrong offset shows up not as a
+    /// missing array but as a stale one, and only after the growth that should
+    /// have replaced it. This mirrors the card: apply every run to plain
+    /// vectors, exactly as the scatter kernel does, and require the result to
+    /// equal the contract at every step.
     #[test]
+    fn the_runs_a_solve_sends_rebuild_its_contract() {
+        let nets = Nets { value: random_net(0x5EED), device: false, gate: None };
+        let cfg = Cfg { nodes: 512, expand: 4, iters: 10, ..Default::default() };
+        let gc = GameCfg {
+            agents: [Agent::Rebel { cfg: Cfg { nodes: 64, expand: 1, iters: 4, ..cfg } }; 2],
+            collect: Collect::Rebel,
+            explore: 0.1,
+            random_draft: true,
+            eval_mix: 1.0,
+            mc_mix: 0.0,
+            query_rate: 0.9,
+            recursive_rate: 0.1,
+        };
+        let roots = collect_roots(3, 23, &nets, &gc, 3);
+        assert!(!roots.is_empty(), "no roots to test against");
+        let mut rng = Rng::new(0xE47E);
+        let mut checked = 0usize;
+        for (s, belief) in &roots {
+            let ctx = crate::rebel::Ctx::new(s);
+            let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
+            let mut inc = Contract::of(&sv);
+            sv.grown.clear();
+            // What the card holds, one vector an array.
+            let mut card: Vec<Vec<u32>> = vec![Vec::new(); 35];
+            let mut sent = Sent::default();
+            let mut from = 0usize;
+            let mut rewrite: Vec<u32> = Vec::new();
+            for _ in 0..cfg.iters {
+                let mut w = Writes::default();
+                inc.write_into(&mut w, &mut sent, from, &rewrite);
+                for r in &w.runs {
+                    let v = &mut card[r.dst as usize];
+                    let end = (r.at + r.len) as usize;
+                    if v.len() < end {
+                        v.resize(end, 0);
+                    }
+                    let src = r.start as usize;
+                    v[r.at as usize..end].copy_from_slice(&w.blob[src..src + r.len as usize]);
+                }
+                let got = |d: Dst| &card[d as usize];
+                let wide = |v: &[u8]| v.iter().map(|&x| x as u32).collect::<Vec<u32>>();
+                assert_eq!(got(Dst::Kind), &wide(&inc.kind), "kind");
+                assert_eq!(got(Dst::Player), &wide(&inc.player), "player");
+                assert_eq!(got(Dst::Nc), &inc.nc.iter().flatten().copied().collect::<Vec<u32>>(), "nc");
+                assert_eq!(got(Dst::Parent), &inc.parent, "parent");
+                assert_eq!(got(Dst::Roff), &inc.roff, "roff");
+                assert_eq!(got(Dst::Voff), &inc.voff, "voff");
+                assert_eq!(got(Dst::Soff), &inc.soff, "soff");
+                assert_eq!(got(Dst::Util), &inc.util.iter().map(|x| x.to_bits()).collect::<Vec<u32>>(), "util");
+                assert_eq!(got(Dst::ChildAt), &inc.child_at, "child_at");
+                assert_eq!(got(Dst::ChildN), &inc.child_n, "child_n");
+                assert_eq!(got(Dst::Child), &inc.child, "child");
+                assert_eq!(got(Dst::LegalBase), &inc.legal_base, "legal_base");
+                assert_eq!(got(Dst::LegalOff), &inc.legal_off, "legal_off");
+                assert_eq!(got(Dst::LegalChild), &inc.legal_child, "legal_child");
+                assert_eq!(got(Dst::LegalTrans), &inc.legal_trans, "legal_trans");
+                assert_eq!(got(Dst::CellRow), &inc.cell_row, "cell_row");
+                assert_eq!(got(Dst::CellVal), &inc.cell_val, "cell_val");
+                assert_eq!(got(Dst::RevBase), &inc.rev_base, "rev_base");
+                assert_eq!(got(Dst::RevStart), &inc.rev_start, "rev_start");
+                assert_eq!(got(Dst::RevSrc), &inc.rev_src, "rev_src");
+                assert_eq!(got(Dst::RevCell), &inc.rev_cell, "rev_cell");
+                assert_eq!(got(Dst::RvdBase), &inc.rvd_base, "rvd_base");
+                assert_eq!(got(Dst::RvdStart), &inc.rvd_start, "rvd_start");
+                assert_eq!(got(Dst::RvdSrc), &inc.rvd_src, "rvd_src");
+                assert_eq!(got(Dst::DrawBase), &inc.draw_base, "draw_base");
+                assert_eq!(got(Dst::DrawStart), &inc.draw_start, "draw_start");
+                assert_eq!(got(Dst::DrawTo), &inc.draw_to, "draw_to");
+                assert_eq!(got(Dst::LevelStart), &inc.level_start, "level_start");
+                assert_eq!(got(Dst::LevelNode), &inc.level_node, "level_node");
+                checked += 1;
+
+                sv.step();
+                for _ in 0..cfg.expand {
+                    if sv.nodes.len() >= cfg.nodes || !sv.expand_once(&mut rng) {
+                        break;
+                    }
+                }
+                let grown = std::mem::take(&mut sv.grown);
+                from = inc.built;
+                rewrite = grown.iter().copied().filter(|&g| (g as usize) < from).collect();
+                inc.extend(&sv, &grown);
+            }
+        }
+        assert!(checked > 10, "only {checked} descriptions compared");
+    }
+
+    #[test]
+
     fn extending_a_contract_equals_rebuilding_it() {
         let nets = Nets {
             value: random_net(0x5EED),

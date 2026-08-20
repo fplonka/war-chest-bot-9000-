@@ -22,8 +22,10 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::net::{Net, C, CFGH, D, JW, POOL, TYPE};
-use crate::rebel::{CFEAT, LOOSE, NSLOT, NTYPE, PUBFEAT};
-use crate::selfplay::{Data, GameCfg, GameStream};
+use crate::rebel::{Belief, CFEAT, LOOSE, NSLOT, NTYPE, PUBFEAT};
+use crate::search::{Cfg, Cfr};
+use crate::selfplay::{solve_root, Data, GameCfg, GameStream};
+use crate::state::State;
 use rayon::prelude::*;
 
 /// One thread's network work for this round.
@@ -72,12 +74,9 @@ pub enum Call {
     /// of those leaves, so `from` says where the rewriting starts.
     Tree {
         solve: usize,
-        contract: std::sync::Arc<crate::contract::Contract>,
-        /// Where the appended tail starts, and the rows of already-described
-        /// nodes this growth rewrote -- the leaves it turned into decision
-        /// nodes. Together those are everything that moved.
-        from: usize,
-        rewrite: Vec<u32>,
+        /// Everything the card has yet to be told about this solve, already in
+        /// the shape the wire wants.
+        writes: Writes,
         /// The first call of a solve. A gate slot is reused, so this is what
         /// tells the backend to forget the solve that held it before.
         fresh: bool,
@@ -85,22 +84,14 @@ pub enum Call {
         ncells: usize,
         nreach: usize,
         nvals: usize,
-        /// Non-terminal leaves in batch-row order, and the terminals.
-        leaf_node: Vec<u32>,
-        term: Vec<u32>,
-        /// Sent once, when the solve starts: the root beliefs and the seed of
-        /// the expansion's own random stream.
-        rootb: Vec<f32>,
-        seed: u64,
-        /// The cells this growth appended: uniform over each legal row, which
-        /// is where CFR starts and what the prior is until the policy head has
-        /// spoken. A later `Iterate` overwrites the prior once it has.
-        cur: Vec<f32>,
-        /// The prior, as the spans that moved: the rows the policy head has
-        /// just written, and the tail this growth appended. Sending everything
-        /// from the lowest of them sends the whole arena whenever the root is
-        /// among them, and the arena runs to a million cells.
-        prior: Vec<(u32, Vec<f32>)>,
+        /// Where each level of the tree starts. The launch loop walks levels,
+        /// so the host needs this as well as the card.
+        levels: Vec<u32>,
+        /// How many terminal leaves the solve holds, for the grid that scores
+        /// them.
+        nterm: usize,
+        /// The seed of the expansion's own random stream, sent once.
+        seed: Option<u64>,
     },
     /// One CFR iteration and one expansion phase.
     ///
@@ -110,16 +101,19 @@ pub enum Call {
     /// tree grows next. What comes back is the sampled leaves and nothing else.
     Iterate {
         solve: usize,
-        /// The decay factors, one triple per iteration this call runs. A CFR
-        /// iterate is weighted by how many came before it, so they differ per
-        /// step; the host computes them because it owns the step count.
-        factors: Vec<(f32, f32, f32)>,
-        predict: f32,
+        /// Where this solve's iterate count stands, and how many iterations to
+        /// run from there. A CFR iterate is weighted by how many came before
+        /// it, and a round holds solves at different points of their own
+        /// sixty-four, so the weights are the solve's and the backend computes
+        /// them per solve rather than taking one set for the batch.
+        step: usize,
+        iters: usize,
         /// Expansion simulations after the last iteration. Zero once the tree
         /// has spent its node budget, which is what lets every remaining
         /// iteration ride in one call: the host has nothing left to do for
         /// them, so it should not be woken between them.
         expand: usize,
+        cfr: Cfr,
         puct: f32,
     },
     /// What the host needs back once the solve is done: the reference
@@ -142,6 +136,103 @@ pub enum Call {
         policy_at: (u32, u32),
         reach_at: Vec<(u32, u32)>,
     },
+}
+
+/// One of a solve's resident arrays, as a run of the round's blob names it.
+///
+/// The order is the vocabulary the solver and the backend share and nothing
+/// else depends on it; `Solve::plan` in the device driver is the other half.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dst {
+    Kind, Player, Nc, Parent, Roff, Voff, Soff, Util,
+    ChildAt, ChildN, Child,
+    LegalBase, LegalOff, LegalChild, LegalTrans, CellRow, CellVal,
+    RevBase, RevStart, RevSrc, RevCell,
+    RvdBase, RvdStart, RvdSrc, RvdP,
+    DrawBase, DrawStart, DrawTo, DrawP,
+    LevelStart, LevelNode,
+    Cur, Prior, LeafNode, Term, Rootb,
+}
+
+/// Everything one solve tells the card to write this round, concatenated.
+///
+/// The backend used to build this itself: it held an `Arc<Contract>`, walked
+/// it, widened bytes into words and copied every run into one buffer -- all on
+/// the single driver thread, while every solver thread sat parked with nothing
+/// to do. That was a third of a round. A thread builds its own now, on a core
+/// that is otherwise idle, and the driver is left with what only it can do:
+/// say where each run lands on the card.
+///
+/// Floats travel as their bits, because the scatter kernel moves words and
+/// does not care which they are.
+#[derive(Clone, Default)]
+pub struct Writes {
+    pub blob: Vec<u32>,
+    pub runs: Vec<Run>,
+}
+
+/// One run: where it goes, and where its words are. `start` is explicit rather
+/// than implied by order, so two arrays can be given the same words.
+#[derive(Clone, Copy)]
+pub struct Run {
+    pub dst: Dst,
+    pub at: u32,
+    pub len: u32,
+    pub start: u32,
+}
+
+impl Writes {
+    pub fn u32s(&mut self, d: Dst, at: usize, src: &[u32]) {
+        self.run(d, at, src.iter().copied(), src.len());
+    }
+
+    pub fn f32s(&mut self, d: Dst, at: usize, src: &[f32]) {
+        self.run(d, at, src.iter().map(|x| x.to_bits()), src.len());
+    }
+
+    /// Bytes the card holds as words. `Contract` keeps a node's kind and
+    /// player in one byte each; the device reads them as `unsigned int`.
+    pub fn u8s(&mut self, d: Dst, at: usize, src: &[u8]) {
+        self.run(d, at, src.iter().map(|&x| x as u32), src.len());
+    }
+
+    /// The same words into two arrays. The tail a growth appends is uniform
+    /// over each legal row, which is where CFR starts *and* what the prior is
+    /// until the policy head has spoken -- so `cur` and `prior` hold the same
+    /// numbers there and there is no reason to carry them twice.
+    ///
+    /// One call, not two, because an empty tail must add nothing to either: a
+    /// round that grew no cells would otherwise hand the second array whatever
+    /// run happened to be last.
+    pub fn f32s_both(&mut self, a: Dst, b: Dst, at: usize, src: &[f32]) {
+        self.f32s(a, at, src);
+        if !src.is_empty() {
+            let last = *self.runs.last().expect("a non-empty run was just pushed");
+            self.runs.push(Run { dst: b, ..last });
+        }
+    }
+
+    fn run(&mut self, d: Dst, at: usize, src: impl Iterator<Item = u32>, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let start = self.blob.len() as u32;
+        self.blob.extend(src);
+        // The scatter kernel places every run at once, so two runs that reach
+        // the same array must not touch the same words -- a thing a host-side
+        // replay in run order would not notice.
+        debug_assert!(
+            !self.runs.iter().any(|r| {
+                r.dst == d && (at as u32) < r.at + r.len && r.at < (at + n) as u32
+            }),
+            "two runs of one round overlap in the same array"
+        );
+        self.runs.push(Run { dst: d, at: at as u32, len: n as u32, start });
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
 }
 
 /// What a call gives back. The trunk returns the board vector and its join
@@ -209,8 +300,7 @@ impl Call {
         match self {
             Call::Trunk { rows, .. } => *rows,
             Call::Configs { n, .. } => *n,
-            Call::Tree { leaf_node, .. } => leaf_node.len(),
-            Call::Iterate { .. } | Call::Read { .. } => 0,
+            Call::Tree { .. } | Call::Iterate { .. } | Call::Read { .. } => 0,
         }
     }
 }
@@ -456,13 +546,22 @@ pub enum Backend {
 }
 
 impl Backend {
-    pub fn run(&self, calls: &[Call]) -> Vec<Reply> {
+    pub fn run(&self, calls: &[Call], #[allow(unused)] lane: usize) -> Vec<Reply> {
         match self {
             // Every call in a round is independent, and the solver threads
             // that raised them are all parked, so the cores are free.
             Backend::Reference(net) => calls.par_iter().map(|c| c.run(net)).collect(),
             #[cfg(feature = "gpu")]
-            Backend::Cuda(d) => d.run(calls),
+            Backend::Cuda(d) => d.run(calls, lane),
+        }
+    }
+
+    /// How many cohorts of solves this backend serves at once.
+    pub fn lanes(&self) -> usize {
+        match self {
+            Backend::Reference(_) => 1,
+            #[cfg(feature = "gpu")]
+            Backend::Cuda(d) => d.lanes(),
         }
     }
 
@@ -503,6 +602,26 @@ impl Backend {
 
 // ------------------------------------------------------------------- the farm
 
+/// What a solver thread does with its turn.
+///
+/// `Play` is the run: threads play games forward and keep the rows. `Roots`
+/// is the bench, and it exists because the run cannot be measured. A solve's
+/// cost varies twenty-six fold with how far into a game its root sits, so a
+/// probe's rate moves by two-fold with nothing but which phase its threads
+/// happened to reach — 16.6, 16.2, 12.1 and 8.0 solves/s were measured across
+/// consecutive probes of one build. Cycling a corpus of roots sampled from a
+/// real run holds the *mix* of costs in flight stationary, which is the one
+/// property that makes two builds comparable in seconds rather than in half
+/// an hour.
+pub enum Work {
+    Play(GameCfg),
+    Roots {
+        roots: Arc<Vec<(State, [Belief; 2])>>,
+        cfg: Cfg,
+        recursive_rate: f32,
+    },
+}
+
 /// Many solves in flight in one process, and one thing that evaluates for all
 /// of them.
 ///
@@ -511,101 +630,128 @@ impl Backend {
 /// would make that worse rather than better. What the parked cores cost is the
 /// batch itself, which is short next to the CFR work between rounds.
 pub struct Farm {
-    gate: Arc<Gate>,
-    backend: Backend,
-    /// Swapped when the trainer publishes; workers re-read it per chunk.
-    nets: Arc<RwLock<Arc<crate::search::Nets>>>,
+    /// One gate a cohort. A cohort's threads all park together and its round
+    /// runs on its own lane of the device, so while one cohort's kernels are in
+    /// flight the other's threads are awake growing trees and its driver is
+    /// marshalling. The driver is busy about ninety per cent of a round and
+    /// only a third of that is waiting for the card; two cohorts let each fill
+    /// the other's gap.
+    gates: Vec<Arc<Gate>>,
+    /// Shared because every cohort evaluates against it, and locked because a
+    /// publish rewrites the weights under them.
+    backend: Arc<RwLock<Backend>>,
+    /// One per cohort: a thread has to be told its own gate.
+    nets: Vec<Arc<RwLock<Arc<crate::search::Nets>>>>,
     collected: Arc<Mutex<Vec<Data>>>,
     workers: Vec<JoinHandle<()>>,
+    drivers: Vec<JoinHandle<()>>,
     stopping: Arc<AtomicBool>,
-    /// What the rounds carried, for the utilisation report. Calls per round is
-    /// the number that matters: it is how many solves shared a forward pass,
-    /// and it should sit at the thread count.
-    pub rounds: u64,
-    pub round_rows: u64,
-    pub round_calls: u64,
+    stats: Arc<Stats>,
+}
+
+/// What the rounds carried, for the utilisation report. Calls per round is the
+/// number that matters: it is how many solves shared a forward pass, and it
+/// should sit at the cohort's thread count.
+#[derive(Default)]
+pub struct Stats {
+    pub rounds: std::sync::atomic::AtomicU64,
+    pub rows: std::sync::atomic::AtomicU64,
+    pub calls: std::sync::atomic::AtomicU64,
     /// Time inside the backend. Against wall clock this says how much of a
     /// round is the batch and how much is everything around it.
-    pub round_nanos: u64,
-    /// How long the driver waits for a round to fill: what the last one cost.
-    patience: Duration,
+    pub nanos: std::sync::atomic::AtomicU64,
 }
 
 impl Farm {
-    /// Start `threads` solver threads. They block on the first round until
-    /// `drive` is called, so nothing runs until the caller asks for rows.
-    pub fn new(seed: u64, threads: usize, gc: GameCfg, backend: Backend) -> Farm {
+    /// Start `threads` solver threads in each of the backend's lanes. They
+    /// block on their first round until rows are asked for.
+    pub fn new(seed: u64, threads: usize, work: Work, backend: Backend) -> Farm {
         assert!(threads > 0, "a farm needs at least one thread");
+        let cohorts = backend.lanes();
+        let work = Arc::new(work);
         let value = backend.net().clone();
-        let gate = Arc::new(Gate::default());
         let device = backend.keeps_the_solve();
-        let nets = Arc::new(RwLock::new(Arc::new(crate::search::Nets {
-            value,
-            device,
-            gate: Some(Arc::clone(&gate)),
-        })));
+        let gates: Vec<Arc<Gate>> = (0..cohorts).map(|_| Arc::new(Gate::default())).collect();
+        let nets: Vec<_> = gates
+            .iter()
+            .map(|g| {
+                Arc::new(RwLock::new(Arc::new(crate::search::Nets {
+                    value: value.clone(),
+                    device,
+                    gate: Some(Arc::clone(g)),
+                })))
+            })
+            .collect();
         let collected = Arc::new(Mutex::new(Vec::new()));
         let stopping = Arc::new(AtomicBool::new(false));
-        let workers = (0..threads)
-            .map(|t| {
-                let (gate, nets, collected, stopping) = (
-                    Arc::clone(&gate),
-                    Arc::clone(&nets),
+        let stats = Arc::new(Stats::default());
+        let backend = Arc::new(RwLock::new(backend));
+        let workers = (0..cohorts * threads)
+            .map(|i| {
+                let (c, t) = (i / threads, i % threads);
+                let (gate, nets, collected, stopping, work) = (
+                    Arc::clone(&gates[c]),
+                    Arc::clone(&nets[c]),
                     Arc::clone(&collected),
                     Arc::clone(&stopping),
+                    Arc::clone(&work),
                 );
+                let seed = seed.wrapping_mul(0x9E37_79B9) ^ i as u64;
                 std::thread::Builder::new()
-                    .name(format!("solve-{t}"))
+                    .name(format!("solve-{c}-{t}"))
                     .spawn(move || {
                         let _member = gate.enter();
-                        let mut stream =
-                            GameStream::new(seed.wrapping_mul(0x9E37_79B9) ^ t as u64, gc);
+                        let mut source = Source::new(&work, seed, i, cohorts * threads);
                         while !stopping.load(Ordering::Relaxed) {
                             // One chunk is small so a `drive` call can end
                             // near the row count it was asked for, and so a
                             // publish lands between chunks rather than inside
                             // a solve.
                             let n = Arc::clone(&*nets.read());
-                            let d = stream.generate(&n, CHUNK_SOLVES);
+                            let d = source.chunk(&work, &n);
                             collected.lock().push(d);
                         }
                     })
                     .expect("spawn solver thread")
             })
             .collect();
-        Farm {
-            gate,
-            backend,
-            nets,
-            collected,
-            workers,
-            stopping,
-            rounds: 0,
-            round_rows: 0,
-            round_calls: 0,
-            round_nanos: 0,
-            patience: PATIENCE_MIN,
-        }
+        let drivers = (0..cohorts)
+            .map(|c| {
+                let (gate, backend, stats, stopping) = (
+                    Arc::clone(&gates[c]),
+                    Arc::clone(&backend),
+                    Arc::clone(&stats),
+                    Arc::clone(&stopping),
+                );
+                std::thread::Builder::new()
+                    .name(format!("round-{c}"))
+                    .spawn(move || drive_cohort(&gate, &backend, c, &stats, &stopping))
+                    .expect("spawn driver thread")
+            })
+            .collect();
+        Farm { gates, backend, nets, collected, workers, drivers, stopping, stats }
     }
 
     /// Install new weights, in the backend and in the copy the solver threads
-    /// keep for the readout. Threads pick them up at their next chunk, so a
-    /// solve is never evaluated against two different networks.
+    /// keep for the readout. The write lock waits for every cohort's round in
+    /// flight, so no solve is ever evaluated against two different networks.
     pub fn publish(&mut self, net: Net) -> Result<(), String> {
-        self.backend.set_net(net.clone())?;
-        *self.nets.write() = Arc::new(crate::search::Nets {
-            value: net,
-            device: self.backend.keeps_the_solve(),
-            gate: Some(Arc::clone(&self.gate)),
-        });
+        self.backend.write().set_net(net.clone())?;
+        let device = self.backend.read().keeps_the_solve();
+        for (n, g) in self.nets.iter().zip(&self.gates) {
+            *n.write() = Arc::new(crate::search::Nets {
+                value: net.clone(),
+                device,
+                gate: Some(Arc::clone(g)),
+            });
+        }
         Ok(())
     }
 
-    /// Run rounds until the threads have produced at least `solves` rows, then
-    /// return everything they produced. `eval` runs one batch.
+    /// Wait until the cohorts have produced at least `solves` rows, then hand
+    /// over everything they produced. The rounds run on their own threads.
     pub fn drive(&mut self, solves: usize) -> Data {
         let mut out = Data::default();
-        let mut calls_seen = 0usize;
         loop {
             for d in self.collected.lock().drain(..) {
                 out.merge(d);
@@ -613,48 +759,123 @@ impl Farm {
             if out.soff.len() >= solves {
                 return out;
             }
-            // Bounded, because a thread hands its chunk over between two
-            // solves and is not parked while it does; blocking on a round here
-            // would sit behind rows that are already finished.
-            let backend = &self.backend;
-            let mut spent = Duration::ZERO;
-            match self.gate.round_before(self.patience, |calls| {
-                calls_seen = calls.len();
-                let at = std::time::Instant::now();
-                let replies = backend.run(calls);
-                spent = at.elapsed();
-                replies
-            }) {
-                Round::Ran(rows) => {
-                    self.rounds += 1;
-                    self.round_rows += rows as u64;
-                    self.round_calls += calls_seen as u64;
-                    self.round_nanos += spent.as_nanos() as u64;
-                    self.patience = spent.clamp(PATIENCE_MIN, PATIENCE_MAX);
-                }
-                Round::Empty => {}
-            }
+            // Parked, not spinning. With a cohort a lane and the solver threads
+            // outnumbering the cores several times over, a caller busy-waiting
+            // here is a core taken from the work it is waiting for.
+            std::thread::sleep(Duration::from_micros(200));
         }
     }
 
-    /// The network the driver evaluates with.
+    pub fn stats(&self) -> &Stats {
+        &self.stats
+    }
+
+    /// The network the drivers evaluate with.
     pub fn value(&self) -> Arc<crate::search::Nets> {
-        Arc::clone(&*self.nets.read())
+        Arc::clone(&*self.nets[0].read())
+    }
+}
+
+/// One cohort's rounds, until the farm winds down.
+fn drive_cohort(
+    gate: &Gate,
+    backend: &RwLock<Backend>,
+    lane: usize,
+    stats: &Stats,
+    stopping: &AtomicBool,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut patience = PATIENCE_MIN;
+    loop {
+        if stopping.load(Relaxed) {
+            // Threads finishing their last chunk still need their rounds
+            // answered; once they have all left there is nothing to wait for.
+            let b = backend.read();
+            if gate.serve_until_idle(|calls| b.run(calls, lane)).is_none() {
+                return;
+            }
+            continue;
+        }
+        let (mut spent, mut seen) = (Duration::ZERO, 0usize);
+        let ran = {
+            let b = backend.read();
+            gate.round_before(patience, |calls| {
+                seen = calls.len();
+                let at = std::time::Instant::now();
+                let replies = b.run(calls, lane);
+                spent = at.elapsed();
+                replies
+            })
+        };
+        if let Round::Ran(rows) = ran {
+            stats.rounds.fetch_add(1, Relaxed);
+            stats.rows.fetch_add(rows as u64, Relaxed);
+            stats.calls.fetch_add(seen as u64, Relaxed);
+            stats.nanos.fetch_add(spent.as_nanos() as u64, Relaxed);
+            patience = spent.clamp(PATIENCE_MIN, PATIENCE_MAX);
+        }
     }
 }
 
 impl Drop for Farm {
     fn drop(&mut self) {
-        // Ask the threads to stop, then keep answering rounds until they have
-        // all finished the chunk they were in and left the count. Closing the
-        // gate first would strand whoever was parked, and they would unwind
-        // out of a solve instead of ending one.
+        // Ask the threads to stop; the drivers keep answering rounds until
+        // every thread has finished the chunk it was in and left the count.
+        // Closing a gate first would strand whoever was parked, and they would
+        // unwind out of a solve instead of ending one.
         self.stopping.store(true, Ordering::Relaxed);
-        let backend = &self.backend;
-        while self.gate.serve_until_idle(|calls| backend.run(calls)).is_some() {}
-        self.gate.close();
         for w in self.workers.drain(..) {
             let _ = w.join();
+        }
+        for g in &self.gates {
+            g.close();
+        }
+        for d in self.drivers.drain(..) {
+            let _ = d.join();
+        }
+    }
+}
+
+/// One thread's side of `Work`: the state it carries between chunks.
+enum Source {
+    Play(GameStream),
+    /// Where in the corpus this thread is, and its own random stream. Threads
+    /// are interleaved and the corpus cycles, so the set of roots in flight is
+    /// the same at every moment of a bench and the same between two builds.
+    Roots { at: usize, step: usize, rng: crate::rng::Rng },
+}
+
+impl Source {
+    fn new(work: &Work, seed: u64, t: usize, threads: usize) -> Source {
+        match work {
+            Work::Play(gc) => Source::Play(GameStream::new(seed, *gc)),
+            Work::Roots { .. } => Source::Roots {
+                at: t,
+                step: threads,
+                rng: crate::rng::Rng::new(seed),
+            },
+        }
+    }
+
+    fn chunk(&mut self, work: &Work, nets: &crate::search::Nets) -> Data {
+        match (self, work) {
+            (Source::Play(stream), _) => stream.generate(nets, CHUNK_SOLVES),
+            (Source::Roots { at, step, rng }, Work::Roots { roots, cfg, recursive_rate }) => {
+                let mut out = Data::default();
+                // Bounded by attempts, not by rows: a root whose belief is over
+                // the config cap yields nothing, and a corpus of those would
+                // otherwise spin here for ever.
+                for _ in 0..2 * CHUNK_SOLVES {
+                    if out.soff.len() >= CHUNK_SOLVES {
+                        break;
+                    }
+                    let (s, bel) = &roots[*at % roots.len()];
+                    *at += *step;
+                    solve_root(nets, *cfg, *recursive_rate, s, bel, rng, &mut out);
+                }
+                out
+            }
+            (Source::Roots { .. }, Work::Play(_)) => unreachable!("a source matches its work"),
         }
     }
 }
@@ -863,20 +1084,22 @@ mod tests {
             query_rate: 0.9,
             recursive_rate: 0.1,
         };
-        let mut farm = Farm::new(5, THREADS, gc, Backend::Reference(small_net(0x2E57)));
+        let mut farm = Farm::new(5, THREADS, Work::Play(gc), Backend::Reference(small_net(0x2E57)));
         let data = farm.drive(48);
         assert!(data.soff.len() >= 48, "only {} solves", data.soff.len());
         assert_eq!(data.nv, data.soff.len(), "a solve must store one row");
         assert_eq!(data.coff.len(), 2 * data.nv + 1, "ragged arena is malformed");
-        assert!(farm.rounds > 0, "no round ever ran");
+        let read = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed) as f64;
+        let s = farm.stats();
+        assert!(read(&s.rounds) > 0.0, "no round ever ran");
         // The whole point: a round is one forward pass shared by every thread
         // that is running a solve, not one pass per solve.
-        let calls = farm.round_calls as f64 / farm.rounds as f64;
+        let calls = read(&s.calls) / read(&s.rounds);
         assert!(
             calls > (THREADS as f64) * 0.5,
             "rounds averaged only {calls:.1} calls for {THREADS} threads"
         );
-        assert!(farm.round_rows > 0, "rounds carried no rows");
+        assert!(read(&s.rows) > 0.0, "rounds carried no rows");
     }
 
     /// Closing the gate must release a thread that is already parked, rather

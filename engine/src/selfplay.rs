@@ -392,6 +392,48 @@ pub struct Game {
 }
 
 /// A rate like "0.9 queries per search", drawn into a whole number.
+/// Solve one belief state as a root and keep its row. Returns the roots the
+/// harvest sampled, for whoever wants to queue them.
+///
+/// Value only. Student of Games assembles policy targets from "the searches
+/// started at public states along the main line of episodes"; a query solve is
+/// off that line, and its job is coverage of the value function. Its policy
+/// would also be trained against, and so reinforce, states self-play never
+/// actually reaches.
+pub fn solve_root(
+    nets: &Nets,
+    cfg: Cfg,
+    recursive_rate: f32,
+    s: &State,
+    bel: &[Belief; 2],
+    rng: &mut Rng,
+    out: &mut Data,
+) -> Vec<(State, [Belief; 2])> {
+    if cfg.config_cap > 0 && bel[0].len() + bel[1].len() > cfg.config_cap {
+        out.node_caps += 1;
+        return Vec::new();
+    }
+    let ctx = Ctx::new(s);
+    let mut sv = Solver::new(s, ctx, nets, cfg, bel.clone());
+    sv.solve(rng);
+    if sv.capped() {
+        out.node_caps += 1;
+        return Vec::new();
+    }
+    let want = draw_count(rng, recursive_rate);
+    let solved = sv.harvest(rng, want);
+    out.begin_solve();
+    out.push_value(
+        s,
+        &ctx,
+        bel,
+        [&solved.value[0], &solved.value[1]],
+        &Default::default(),
+    );
+    out.queries += 1;
+    solved.queries
+}
+
 fn draw_count(rng: &mut Rng, rate: f32) -> usize {
     let whole = rate.max(0.0).floor();
     whole as usize + (rng.unit_f64() < (rate - whole) as f64) as usize
@@ -685,34 +727,8 @@ impl GameStream {
         let Agent::Rebel { cfg } = self.gc.agents[s.to_act() as usize] else {
             return;
         };
-        if cfg.config_cap > 0 && bel[0].len() + bel[1].len() > cfg.config_cap {
-            out.node_caps += 1;
-            return;
-        }
-        let ctx = Ctx::new(&s);
-        let mut sv = Solver::new(&s, ctx, nets, cfg, bel.clone());
-        sv.solve(&mut self.rng);
-        if sv.capped() {
-            out.node_caps += 1;
-            return;
-        }
-        let want = draw_count(&mut self.rng, self.gc.recursive_rate);
-        let solved = sv.harvest(&mut self.rng, want);
-        out.begin_solve();
-        // Value only. Student of Games assembles policy targets from "the
-        // searches started at public states along the main line of episodes";
-        // a query solve is off that line, and its job is coverage of the value
-        // function. Its policy would also be trained against, and so reinforce,
-        // states self-play never actually reaches.
-        out.push_value(
-            &s,
-            &ctx,
-            &bel,
-            [&solved.value[0], &solved.value[1]],
-            &Default::default(),
-        );
-        out.queries += 1;
-        self.enqueue(solved.queries);
+        let more = solve_root(nets, cfg, self.gc.recursive_rate, &s, &bel, &mut self.rng, out);
+        self.enqueue(more);
     }
 
     fn enqueue(&mut self, qs: Vec<(State, [Belief; 2])>) {
@@ -819,16 +835,20 @@ pub fn collect_roots(
     gc: &GameCfg,
     cap: usize,
 ) -> Vec<(State, [Belief; 2])> {
-    let mut out: Vec<(State, [Belief; 2])> = Vec::new();
-    for i in 0..games {
-        if out.len() >= cap {
-            break;
-        }
-        let rng = Rng::new(worker_seed(seed, i));
-        let mut d = Data::default();
-        play_game(rng, nets, gc, &mut d, Some(&mut out));
-        out.truncate(cap);
-    }
+    let mut out: Vec<(State, [Belief; 2])> = (0..games)
+        .into_par_iter()
+        .fold(Vec::new, |mut acc, i| {
+            let rng = Rng::new(worker_seed(seed, i));
+            let mut d = Data::default();
+            play_game(rng, nets, gc, &mut d, Some(&mut acc));
+            acc
+        })
+        .reduce(Vec::new, |mut a, mut b| {
+            a.append(&mut b);
+            a
+        });
+    out.truncate(cap);
+    assert!(!out.is_empty(), "no roots: a game collected none");
     out
 }
 

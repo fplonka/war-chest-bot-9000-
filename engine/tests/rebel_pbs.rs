@@ -1007,7 +1007,7 @@ fn a_gated_solve_matches_an_ungated_one_exactly() {
         let driver = {
             let (gate, backend) = (Arc::clone(&gate), Arc::clone(&backend));
             std::thread::spawn(move || {
-                while gate.round(|calls| backend.run(calls)).is_some() {}
+                while gate.round(|calls| backend.run(calls, 0)).is_some() {}
             })
         };
         let out = worker.join().expect("gated worker");

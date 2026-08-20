@@ -487,9 +487,9 @@ impl Game {
 // and pulls tensors back once per epoch.
 
 use crate::net::Net;
-use crate::farm::{Backend, Farm};
+use crate::farm::{Backend, Farm, Work};
 use crate::search::{Cfg, Cfr, Nets};
-use crate::selfplay::{run_games, Agent, Collect, Data, GameCfg, GameStream};
+use crate::selfplay::{run_games, Agent, Collect, Data, GameCfg};
 use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2};
 use parking_lot::RwLock;
 use std::sync::{Arc, LazyLock};
@@ -643,13 +643,12 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
 struct SolveFarm {
     farm: Farm,
     net_version: u64,
-    devices: Vec<usize>,
 }
 
 #[pymethods]
 impl SolveFarm {
     #[new]
-    #[pyo3(signature = (seed, threads, nodes=256, expand=4, iters=16, explore=0.1, random_draft=true, cfr="dcfr", node_cap=16 * 1024, config_cap=256, query_rate=0.9, recursive_rate=0.1, devices=vec![0]))]
+    #[pyo3(signature = (seed, threads, nodes=256, expand=4, iters=16, explore=0.1, random_draft=true, cfr="dcfr", node_cap=16 * 1024, config_cap=256, query_rate=0.9, recursive_rate=0.1, devices=vec![0], roots=None, cohorts=2, grow_every=1))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         seed: u64,
@@ -665,32 +664,53 @@ impl SolveFarm {
         query_rate: f32,
         recursive_rate: f32,
         devices: Vec<usize>,
+        roots: Option<&str>,
+        cohorts: usize,
+        grow_every: usize,
     ) -> PyResult<SolveFarm> {
         let cfg = Cfg {
             nodes,
             expand,
             iters,
+            grow_every,
             cfr: cfr_of(cfr)?,
             node_cap,
             config_cap,
             ..Default::default()
         };
-        let gc = GameCfg {
-            agents: [Agent::Rebel { cfg }; 2],
-            collect: Collect::Rebel,
-            explore,
-            random_draft,
-            eval_mix: 1.0,
-            mc_mix: 0.0,
-            query_rate,
-            recursive_rate,
+        // A corpus makes this a bench rather than a run: the same roots in the
+        // same order, so the mix of solve costs in flight does not drift.
+        let work = match roots {
+            None => Work::Play(GameCfg {
+                agents: [Agent::Rebel { cfg }; 2],
+                collect: Collect::Rebel,
+                explore,
+                random_draft,
+                eval_mix: 1.0,
+                mc_mix: 0.0,
+                query_rate,
+                recursive_rate,
+            }),
+            Some(path) => {
+                let f = std::fs::File::open(path)
+                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{path}: {e}")))?;
+                let roots = crate::roots::read_roots(&mut std::io::BufReader::new(f))
+                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+                if roots.is_empty() {
+                    return Err(pyo3::exceptions::PyValueError::new_err("empty root corpus"));
+                }
+                Work::Roots {
+                    roots: Arc::new(roots),
+                    cfg,
+                    recursive_rate,
+                }
+            }
         };
         let version = NET_VERSION.load(Ordering::Acquire);
-        let backend = backend_for(&devices, (**nets().read()).value.clone())?;
+        let backend = backend_for(&devices, (**nets().read()).value.clone(), cohorts)?;
         Ok(SolveFarm {
-            farm: Farm::new(seed, threads, gc, backend),
+            farm: Farm::new(seed, threads, work, backend),
             net_version: version,
-            devices,
         })
     }
 
@@ -715,20 +735,22 @@ impl SolveFarm {
         let dict = out.bind(py).downcast::<PyDict>()?.clone();
         // How well the batching is working: calls per round is how many solves
         // shared a forward pass.
-        dict.set_item("rounds", self.farm.rounds)?;
-        dict.set_item("round_calls", self.farm.round_calls)?;
-        dict.set_item("round_rows", self.farm.round_rows)?;
-        dict.set_item("round_nanos", self.farm.round_nanos)?;
+        let s = self.farm.stats();
+        let read = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+        dict.set_item("rounds", read(&s.rounds))?;
+        dict.set_item("round_calls", read(&s.calls))?;
+        dict.set_item("round_rows", read(&s.rows))?;
+        dict.set_item("round_nanos", read(&s.nanos))?;
         Ok(out)
     }
 }
 
 /// The devices. There is no CPU fallback on purpose: a run that cannot reach a
 /// GPU is two orders of magnitude off and should say so rather than crawl.
-fn backend_for(_devices: &[usize], _value: crate::net::Net) -> PyResult<Backend> {
+fn backend_for(_devices: &[usize], _value: crate::net::Net, _lanes: usize) -> PyResult<Backend> {
     #[cfg(feature = "gpu")]
     {
-        return crate::cuda::Device::new(_devices, _value)
+        return crate::cuda::Device::new(_devices, _value, _lanes)
             .map(Backend::Cuda)
             .map_err(pyo3::exceptions::PyRuntimeError::new_err);
     }
@@ -792,8 +814,17 @@ fn gen_data(
     data_to_dict(py, d)
 }
 
+/// Collect subgame roots from self-play, for the tools that need a fixed
+/// workload.
+///
+/// The search here decides which positions arise, not what a root *is*: a
+/// belief support comes from the draw history and the config cap. So this runs
+/// a cheap search by default -- the corpus is generated on the cores, and a
+/// sixty-four iteration solve at every decision of every game takes the better
+/// part of an hour where eight take a minute.
 #[pyfunction]
-#[pyo3(signature = (games, seed, path, cap=1000, random_draft=true))]
+#[pyo3(signature = (games, seed, path, cap=1000, random_draft=true, nodes=512, iters=8, expand=1))]
+#[allow(clippy::too_many_arguments)]
 fn save_roots(
     py: Python<'_>,
     games: usize,
@@ -801,26 +832,25 @@ fn save_roots(
     path: &str,
     cap: usize,
     random_draft: bool,
+    nodes: usize,
+    iters: usize,
+    expand: usize,
 ) -> PyResult<usize> {
+    let cfg = Cfg {
+        nodes,
+        iters,
+        expand,
+        ..Default::default()
+    };
     let gc = GameCfg {
-        agents: [
-            Agent::Rebel {
-                cfg: Cfg {
-                    ..Default::default()
-                },
-            },
-            Agent::Rebel {
-                cfg: Cfg {
-                    ..Default::default()
-                },
-            },
-        ],
-        collect: Collect::None,
+        agents: [Agent::Rebel { cfg }; 2],
+        // The roots this tool wants are the queries a search nominates, and
+        // those are only harvested where a row is collected.
+        collect: Collect::Rebel,
         explore: 0.25,
         random_draft,
         eval_mix: 0.0,
         mc_mix: 0.0,
-        // The roots this tool wants *are* the queries.
         query_rate: 1.0,
         recursive_rate: 0.0,
     };
@@ -901,6 +931,19 @@ fn infer_policy(
         act.as_slice()?,
         queries,
     ))
+}
+
+/// What `leaf_breakdown` returns, in order. The last two are megabytes; the
+/// rest are milliseconds. Exposed so a reporting tool cannot drift from the
+/// engine's own list, which is how two of them came to be mislabelled.
+#[pyfunction]
+fn stage_names() -> Vec<String> {
+    #[cfg(feature = "gpu")]
+    {
+        return crate::cuda::STAGES.iter().map(|s| s.to_string()).collect();
+    }
+    #[cfg(not(feature = "gpu"))]
+    Vec::new()
 }
 
 /// Where the device's leaf pass spends its wall clock, in ms since the last
@@ -1136,5 +1179,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(infer, m)?)?;
         m.add_function(wrap_pyfunction!(infer_policy, m)?)?;
         m.add_function(wrap_pyfunction!(leaf_breakdown, m)?)?;
+        m.add_function(wrap_pyfunction!(stage_names, m)?)?;
     Ok(())
 }

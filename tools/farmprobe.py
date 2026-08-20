@@ -41,6 +41,8 @@ def probe(devices, threads, seconds, args):
         query_rate=0.9,
         recursive_rate=0.1,
         devices=devices,
+        cohorts=args.cohorts,
+        grow_every=args.grow_every,
     )
     warm = farm.collect(solves=threads)
     base = [int(warm[k]) for k in KEYS]
@@ -75,6 +77,10 @@ def probe(devices, threads, seconds, args):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--threads", default="36")
+    p.add_argument("--grow-every", type=int, default=1,
+                   help="CFR iterations a solve runs before waking the host to grow")
+    p.add_argument("--cohorts", type=int, default=2,
+                   help="independent cohorts of solves; one lane of the card each")
     p.add_argument("--devices", default="0")
     p.add_argument("--seconds", type=float, default=30)
     p.add_argument("--window", type=float, default=30)
@@ -99,16 +105,11 @@ def main():
     if b:
         # The device stages are only filled under WARCHEST_STAGES, which costs
         # a stream synchronise apiece; without it they read zero and the host's
-        # own four are all there is.
-        names = ("marshal", "upload", "launch", "download",
-                 "reach", "beliefs", "join", "readout", "terminals",
-                 "backprop", "expand", "trunk", "configs", "tree",
-                 "t-marshal", "t-upload", "hand-back")
-        print("iteration, ms: " +
-              "  ".join(f"{n}={v:.0f}" for n, v in zip(names, b) if v > 0))
-        # The last two are byte counts the same accumulator carries, so they
-        # come back scaled by 1e6 and are already megabytes.
-        print(f"traffic: sent={b[17]:.0f} MB  regrown={b[18]:.0f} MB")
+        # own are all there is. The engine owns the names.
+        names = warchest.stage_names()
+        print("stages, ms: "
+              + "  ".join(f"{n}={v:.0f}" for n, v in zip(names[:-3], b) if v > 0))
+        print("  ".join(f"{n}={v:.0f} MB" for n, v in zip(names[-3:], b[-3:])))
 
 
 if __name__ == "__main__":
