@@ -110,9 +110,15 @@ pub enum Call {
     /// tree grows next. What comes back is the sampled leaves and nothing else.
     Iterate {
         solve: usize,
-        /// The regret-matching decay factors and the predictive term.
-        factors: (f32, f32, f32),
+        /// The decay factors, one triple per iteration this call runs. A CFR
+        /// iterate is weighted by how many came before it, so they differ per
+        /// step; the host computes them because it owns the step count.
+        factors: Vec<(f32, f32, f32)>,
         predict: f32,
+        /// Expansion simulations after the last iteration. Zero once the tree
+        /// has spent its node budget, which is what lets every remaining
+        /// iteration ride in one call: the host has nothing left to do for
+        /// them, so it should not be woken between them.
         expand: usize,
         puct: f32,
     },

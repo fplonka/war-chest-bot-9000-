@@ -30,46 +30,50 @@ __global__ void k_gelu(float* x, int n) {
     if (i < n) x[i] = gelu1(x[i]);
 }
 
-__global__ void k_add(float* x, const float* y, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) x[i] += y[i];
-}
-
-// One row per block: mean and variance over `width`, then scale and shift.
+// LayerNorm, `src` to `dst`; the two may be the same buffer.
+//
+// One row per **warp**, not per block. The rows here are 96 to 256 wide, so a
+// block-wide reduction spends most of its time in `__syncthreads` for a sum a
+// warp can shuffle in five steps -- and at 96 wide a 128-thread block leaves a
+// quarter of its lanes idle throughout. Measured at a third of all device
+// time, it was the largest kernel in the profile.
+//
 // `act` folds in the GELU, which is `Norm::apply`; without it this is
-// `Norm::plain`. `blockDim.x` must be a power of two for the reduction.
-__global__ void k_layernorm(float* x, const float* gamma, const float* beta,
-                            int rows, int width, int act) {
-    extern __shared__ float sh[];
-    int r = blockIdx.x;
+// `Norm::plain`.
+__device__ __forceinline__ void norm_row(const float* src, float* dst,
+                                         const float* gamma, const float* beta,
+                                         int rows, int width, int act) {
+    int r = blockIdx.x * blockDim.y + threadIdx.y;
     if (r >= rows) return;
-    float* row = x + (size_t)r * width;
+    const float* in = src + (size_t)r * width;
+    float* out = dst + (size_t)r * width;
     float sum = 0.0f;
-    for (int j = threadIdx.x; j < width; j += blockDim.x) sum += row[j];
-    sh[threadIdx.x] = sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
-        __syncthreads();
-    }
-    float mean = sh[0] / width;
-    __syncthreads();
+    for (int j = threadIdx.x; j < width; j += 32) sum += in[j];
+    for (int s = 16; s > 0; s >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, s);
+    float mean = sum / width;
     float var = 0.0f;
-    for (int j = threadIdx.x; j < width; j += blockDim.x) {
-        float d = row[j] - mean;
+    for (int j = threadIdx.x; j < width; j += 32) {
+        float d = in[j] - mean;
         var += d * d;
     }
-    sh[threadIdx.x] = var;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
-        __syncthreads();
+    for (int s = 16; s > 0; s >>= 1) var += __shfl_xor_sync(0xffffffff, var, s);
+    float inv = rsqrtf(var / width + 1e-5f);
+    for (int j = threadIdx.x; j < width; j += 32) {
+        float v = (in[j] - mean) * inv * gamma[j] + beta[j];
+        out[j] = act ? gelu1(v) : v;
     }
-    float inv = rsqrtf(sh[0] / width + 1e-5f);
-    for (int j = threadIdx.x; j < width; j += blockDim.x) {
-        float v = (row[j] - mean) * inv * gamma[j] + beta[j];
-        row[j] = act ? gelu1(v) : v;
-    }
+}
+
+__global__ void k_norm(const float* src, float* dst, const float* gamma,
+                       const float* beta, int rows, int width, int act) {
+    norm_row(src, dst, gamma, beta, rows, width, act);
+}
+
+// The same, in place. A separate entry only because one buffer cannot be
+// handed to a launch as both an argument to read and an argument to write.
+__global__ void k_norm_ip(float* x, const float* gamma, const float* beta,
+                          int rows, int width, int act) {
+    norm_row(x, x, gamma, beta, rows, width, act);
 }
 
 // `out[r, j] += b[j]` -- the per-column bias a GEMM does not carry.
@@ -258,45 +262,6 @@ __global__ void k_bag(const float* bag, const float* phi,
             if (count != 0.0f) acc += count * v[((size_t)k * 3 + zone) * pool + j];
         }
     g[i] += acc;
-}
-
-// A norm that reads one buffer and writes another.
-//
-// The residual blocks of the join normalise a copy of `z` and leave `z` alone,
-// which as `memcpy` then `k_layernorm` is four passes over `[rows, width]` for
-// what is two. `blockDim.x` must be a power of two for the reduction.
-__global__ void k_norm_to(const float* src, float* dst, const float* gamma,
-                          const float* beta, int rows, int width, int act) {
-    extern __shared__ float sh[];
-    int r = blockIdx.x;
-    if (r >= rows) return;
-    const float* row = src + (size_t)r * width;
-    float sum = 0.0f;
-    for (int j = threadIdx.x; j < width; j += blockDim.x) sum += row[j];
-    sh[threadIdx.x] = sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
-        __syncthreads();
-    }
-    float mean = sh[0] / width;
-    __syncthreads();
-    float var = 0.0f;
-    for (int j = threadIdx.x; j < width; j += blockDim.x) {
-        float d = row[j] - mean;
-        var += d * d;
-    }
-    sh[threadIdx.x] = var;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
-        __syncthreads();
-    }
-    float inv = rsqrtf(sh[0] / width + 1e-5f);
-    for (int j = threadIdx.x; j < width; j += blockDim.x) {
-        float v = (row[j] - mean) * inv * gamma[j] + beta[j];
-        dst[(size_t)r * width + j] = act ? gelu1(v) : v;
-    }
 }
 
 // `[own pooled | opponent pooled | seat]`, the join's belief-dependent input.

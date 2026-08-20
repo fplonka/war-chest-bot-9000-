@@ -2184,10 +2184,16 @@ impl<'a> Solver<'a> {
         // paths would sample different actions afterwards even when they are
         // told to grow nothing, and nothing could be compared.
         self.seed = Rng::new(rng.0).0;
-        for _ in 0..self.cfg.iters {
+        let mut left = self.cfg.iters;
+        while left > 0 {
             if self.capped {
                 break;
             }
+            // Once the budget is spent the tree cannot grow, so nothing in the
+            // remaining iterations needs the host and they all ride in one
+            // round. Growth finishes around iteration thirty-eight of
+            // sixty-four, so this is most of the barriers a solve pays.
+            let done = if self.nodes.len() >= self.cfg.nodes { left } else { 1 };
             // The priors of whatever the *last* round's trunk answered for.
             // A node is expanded before the batch carrying its board vector
             // has run, so its prior was always an iteration behind; computing
@@ -2199,9 +2205,10 @@ impl<'a> Solver<'a> {
             // The iteration's decay factors read the step count as it stands,
             // so both calls are built before it advances.
             calls.push(self.tree_call());
-            calls.push(self.iterate_call());
-            self.steps = [self.steps[0] + 1, self.steps[1] + 1];
+            calls.push(self.iterate_call(done, if done == left { 0 } else { self.cfg.expand }));
+            self.steps = [self.steps[0] + done, self.steps[1] + done];
             self.avg_touched = [true; 2];
+            left -= done;
             let replies = self.nets.grew(calls);
             self.absorb(&replies[..growth]);
             for &leaf in &replies[growth + 1].leaves.clone() {
@@ -2238,18 +2245,24 @@ impl<'a> Solver<'a> {
         }
     }
 
-    fn iterate_call(&self) -> Call {
+    /// One call asking for `steps` iterations, and an expansion phase after
+    /// them unless the tree has nothing left to grow.
+    fn iterate_call(&self, steps: usize, expand: usize) -> Call {
         let k = self.cfg.cfr;
-        let m = self.steps[0] as f32 + 1.0;
         Call::Iterate {
             solve: Gate::slot(),
-            factors: (
-                Cfr::factor(m, k.alpha),
-                Cfr::factor(m, k.beta),
-                (m / (m + 1.0)).powf(k.gamma),
-            ),
+            factors: (0..steps)
+                .map(|j| {
+                    let m = (self.steps[0] + j) as f32 + 1.0;
+                    (
+                        Cfr::factor(m, k.alpha),
+                        Cfr::factor(m, k.beta),
+                        (m / (m + 1.0)).powf(k.gamma),
+                    )
+                })
+                .collect(),
             predict: k.predict,
-            expand: self.cfg.expand,
+            expand,
             puct: self.cfg.puct,
         }
     }

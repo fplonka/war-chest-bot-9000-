@@ -103,9 +103,12 @@ def main():
         names = ("marshal", "upload", "launch", "download",
                  "reach", "beliefs", "join", "readout", "terminals",
                  "backprop", "expand", "trunk", "configs", "tree",
-                 "t-marshal", "t-upload", "trunk-down")
+                 "t-marshal", "t-upload", "hand-back")
         print("iteration, ms: " +
               "  ".join(f"{n}={v:.0f}" for n, v in zip(names, b) if v > 0))
+        # The last two are byte counts the same accumulator carries, so they
+        # come back scaled by 1e6 and are already megabytes.
+        print(f"traffic: sent={b[17]:.0f} MB  regrown={b[18]:.0f} MB")
 
 
 if __name__ == "__main__":

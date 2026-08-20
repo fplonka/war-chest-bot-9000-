@@ -81,14 +81,13 @@ const KERNELS: &str = include_str!("kernels.cu");
 /// exist is an error there rather than a wrong answer later.
 struct Kernels {
     gelu: CudaFunction,
-    add: CudaFunction,
-    layernorm: CudaFunction,
+    norm: CudaFunction,
+    norm_ip: CudaFunction,
     bias: CudaFunction,
     group_bias: CudaFunction,
     window: CudaFunction,
     gather: CudaFunction,
     scatter: CudaFunction,
-    norm_to: CudaFunction,
     seed_reach: CudaFunction,
     avg_block: CudaFunction,
     beliefs: CudaFunction,
@@ -120,14 +119,13 @@ impl Kernels {
         };
         Ok(Kernels {
             gelu: get("k_gelu")?,
-            add: get("k_add")?,
-            layernorm: get("k_layernorm")?,
+            norm: get("k_norm")?,
+            norm_ip: get("k_norm_ip")?,
             bias: get("k_bias")?,
             group_bias: get("k_group_bias")?,
             window: get("k_window")?,
             gather: get("k_gather")?,
             scatter: get("k_scatter")?,
-            norm_to: get("k_norm_to")?,
             seed_reach: get("k_seed_reach")?,
             avg_block: get("k_avg_block")?,
             beliefs: get("k_beliefs")?,
@@ -207,14 +205,15 @@ fn rows_of(rows: usize, width: usize) -> LaunchConfig {
     }
 }
 
-/// The same, with room for `k_layernorm`'s reduction. Its block width must be a
-/// power of two so the halving is clean.
-fn per_row(rows: usize, width: usize) -> LaunchConfig {
-    let threads = width.next_power_of_two().clamp(32, 256) as u32;
+/// One row per warp, eight warps to a block. What `k_norm` wants: its rows are
+/// a hundred-odd wide, which one warp reduces in five shuffles where a block
+/// spends the same time in barriers.
+fn warp_rows(rows: usize) -> LaunchConfig {
+    const WARPS: u32 = 8;
     LaunchConfig {
-        grid_dim: (rows.max(1) as u32, 1, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: 4 * threads,
+        grid_dim: ((rows as u32).div_ceil(WARPS).max(1), 1, 1),
+        block_dim: (32, WARPS, 1),
+        shared_mem_bytes: 0,
     }
 }
 
@@ -268,6 +267,10 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
             let old = self.buf.as_ref().expect("a capacity implies a buffer");
             let mut d = fresh.slice_mut(0..self.cap);
             stream.memcpy_dtod(&old.slice(0..self.cap), &mut d).map_err(err)?;
+            LEAF_NS[18].fetch_add(
+                (self.cap * std::mem::size_of::<T>()) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         self.buf = Some(fresh);
         self.cap = cap;
@@ -745,29 +748,8 @@ impl Card {
         self.bias(s, rows, out)
     }
 
-    /// `Norm::apply` when `act`, `Norm::plain` when not.
-    fn norm(&self, s: NormSpan, rows: usize, act: bool, x: &mut CudaSlice<f32>) -> Res<()> {
-        if rows == 0 {
-            return Ok(());
-        }
-        let g = self.ln.slice(s.g..s.g + s.width);
-        let b = self.ln.slice(s.b..s.b + s.width);
-        let (rows_i, width, act) = (rows as i32, s.width as i32, act as i32);
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.layernorm)
-                .arg(x)
-                .arg(&g)
-                .arg(&b)
-                .arg(&rows_i)
-                .arg(&width)
-                .arg(&act)
-                .launch_unit(per_row(rows, s.width))
-        }
-        .map_err(err)
-    }
-
-    /// `Norm::apply` from one buffer into another.
+    /// `Norm::apply` when `act`, `Norm::plain` when not, from `src` into `dst`.
+    /// The two may be the same buffer, which is what a norm in place is.
     fn norm_to(
         &self,
         s: NormSpan,
@@ -784,17 +766,30 @@ impl Card {
         let (rows_i, width, act) = (rows as i32, s.width as i32, act as i32);
         unsafe {
             self.stream
-                .launch_builder(&self.k.norm_to)
+                .launch_builder(&self.k.norm)
                 .arg(src).arg(dst).arg(&g).arg(&b).arg(&rows_i).arg(&width).arg(&act)
-                .launch_unit(per_row(rows, s.width))
+                .launch_unit(warp_rows(rows))
         }
         .map_err(err)
     }
 
-    fn add(&self, x: &mut CudaSlice<f32>, y: &CudaSlice<f32>, n: usize) -> Res<()> {
-        let n_i = n as i32;
-        launch!(self, add, n, x, y, &n_i)
+    /// The same, in place.
+    fn norm(&self, s: NormSpan, rows: usize, act: bool, x: &mut CudaSlice<f32>) -> Res<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let g = self.ln.slice(s.g..s.g + s.width);
+        let b = self.ln.slice(s.b..s.b + s.width);
+        let (rows_i, width, act) = (rows as i32, s.width as i32, act as i32);
+        unsafe {
+            self.stream
+                .launch_builder(&self.k.norm_ip)
+                .arg(x).arg(&g).arg(&b).arg(&rows_i).arg(&width).arg(&act)
+                .launch_unit(warp_rows(rows))
+        }
+        .map_err(err)
     }
+
 
     /// Reach the state of solve `solve`, creating it if this is its first call.
     fn slot<'g>(&self, g: &'g mut Vec<Solve>, solve: usize) -> &'g mut Solve {
@@ -907,20 +902,21 @@ impl Card {
         let mut y = self.alloc(cells * C)?;
         let mut pooled = self.alloc(rows * 2 * C)?;
         let mut gb = self.alloc(rows * C)?;
-        let mut z = self.alloc(cells * C)?;
+        // A residual block: norm, mix, pool, norm, out, add. The first norm
+        // reads `x` and writes the scratch rather than copying and normalising
+        // in place, and the last multiply accumulates straight back into `x` --
+        // so the block costs two passes over `[cells, C]` fewer than it did,
+        // and the `z` it used to need is gone.
         for (i, blk) in l.blocks.iter().enumerate() {
-            self.stream
-                .memcpy_dtod(&x.slice(0..cells * C), &mut a)
-                .map_err(err)?;
-            self.norm(l.norms[ln_block(i, 0)], cells, true, &mut a)?;
+            self.norm_to(l.norms[ln_block(i, 0)], cells, true, &x, &mut a)?;
             launch!(self, neighbour_mix, cells * C, &a, &self.nb, &mut mixed, &cells_i, &nhex, &chan)?;
             self.run(blk.mix, &mixed, cells, &mut y)?;
             launch!(self, pool, rows * C, &a, &mut pooled, &rows_i, &nhex, &chan)?;
             self.run(blk.pool, &pooled, rows, &mut gb)?;
             launch!(self, group_bias, cells * C, &mut y, &gb, &cells_i, &chan, &nhex)?;
             self.norm(l.norms[ln_block(i, 1)], cells, true, &mut y)?;
-            self.run(blk.out, &y, cells, &mut z)?;
-            self.add(&mut x, &z, cells * C)?;
+            self.lin(blk.out, &y, cells, 1.0, &mut x)?;
+            self.bias(blk.out, cells, &mut x)?;
         }
         self.norm(l.norms[LN_TRUNK], cells, true, &mut x)?;
 
@@ -1164,6 +1160,7 @@ impl Card {
             return Ok(());
         }
         pack.start.push(total as u32);
+        LEAF_NS[17].fetch_add(4 * total as u64, std::sync::atomic::Ordering::Relaxed);
         let blob = self.up(&pack.blob)?;
         let dst = self.up(&pack.dst)?;
         let at = self.up(&pack.at)?;
@@ -1291,24 +1288,34 @@ impl Card {
         let Call::Iterate { factors, predict, expand, puct, .. } = &calls[mine[0]] else {
             unreachable!("iterate shard holds only iterate calls")
         };
-        let (da, db, dg) = *factors;
         let (predict, puct, expand) = (*predict, *puct, *expand);
 
-        self.stage(4, || self.reaches(&b.trees, &b.wide, b.parts, 0, false))
-            .map_err(at("reach"))?;
-        self.network(&b).map_err(at("net"))?;
-        self.stage(8, || self.terminals(&b.trees, b.nterm, b.parts)).map_err(at("terminals"))?;
-        self.stage(9, || self.backprop(&b.trees, &b.wide, b.parts, 0, (da, db, dg, predict)))
-            .map_err(at("backprop"))?;
-        // The regret update moved both players' strategies, so the reaches the
-        // next iteration reads are stale until they are pushed down again --
-        // and the average strategy is accumulated against those fresh ones.
-        self.stage(4, || self.reaches(&b.trees, &b.wide, b.parts, 0, true)).map_err(at("avg"))?;
+        // Every iteration this call was asked for, back to back. Only the
+        // expansion phase needs the host, so once the tree has stopped growing
+        // there is nothing to wake it for and the whole tail rides in one
+        // round -- growth finishes around iteration thirty-eight of sixty-four.
+        for &(da, db, dg) in factors {
+            self.stage(4, || self.reaches(&b.trees, &b.wide, b.parts, 0, false))
+                .map_err(at("reach"))?;
+            self.network(&b).map_err(at("net"))?;
+            self.stage(8, || self.terminals(&b.trees, b.nterm, b.parts))
+                .map_err(at("terminals"))?;
+            self.stage(9, || self.backprop(&b.trees, &b.wide, b.parts, 0, (da, db, dg, predict)))
+                .map_err(at("backprop"))?;
+            // The regret update moved both players' strategies, so the reaches
+            // the next iteration reads are stale until they are pushed down
+            // again -- and the average strategy accumulates against those.
+            self.stage(4, || self.reaches(&b.trees, &b.wide, b.parts, 0, true))
+                .map_err(at("avg"))?;
+        }
         let t_launch = mark.elapsed();
         let mark = std::time::Instant::now();
-        let host = self
-            .stage(10, || self.expand(&b.trees, b.parts, expand, puct))
-            .map_err(at("expand"))?;
+        let host = if expand == 0 {
+            Vec::new()
+        } else {
+            self.stage(10, || self.expand(&b.trees, b.parts, expand, puct))
+                .map_err(at("expand"))?
+        };
         let t_down = mark.elapsed();
         for (slot, n) in [t_marshal, t_up, t_launch, t_down].iter().enumerate() {
             LEAF_NS[slot].fetch_add(n.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
