@@ -106,6 +106,22 @@ fn main() {
             sv.ncells as f64 / sv.nodes.len() as f64,
         );
         cellv.push(sv.ncells);
+        // Does the support really grow away from the root, or is the cost
+        // somewhere else? `config_cap` bounds the root and nothing else.
+        let root_sup = sv.nc[0][0] + sv.nc[0][1];
+        let mut worst = 0u32;
+        let mut deep = 0u32;
+        for i in 0..sv.nodes.len() {
+            let t = sv.nc[i][0] + sv.nc[i][1];
+            if t > worst {
+                worst = t;
+                deep = i as u32;
+            }
+        }
+        println!(
+            "  support: root {root_sup}, worst {worst} at node {deep} ({:.1}x)",
+            worst as f64 / root_sup.max(1) as f64
+        );
         // The same two sweeps, walked over the tree and gathered over the flat
         // description, on the tree as it finally stands. Which is faster
         // decides whether the flat form should simply replace the walk on the

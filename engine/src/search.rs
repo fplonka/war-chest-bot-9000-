@@ -843,7 +843,7 @@ pub struct Solver<'a> {
     pub(crate) primed: Vec<bool>,
     /// `[node]` -> config counts per player, so the hot loops never chase the
     /// `Rc` to ask how long a support is.
-    pub(crate) nc: Vec<[u32; 2]>,
+    pub nc: Vec<[u32; 2]>,
     pub(crate) steps: [usize; 2],
 
     // ---------------------------------------------------------- leaf batch

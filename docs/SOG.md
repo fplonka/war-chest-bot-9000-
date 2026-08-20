@@ -122,3 +122,12 @@ Measured at `nodes=8192, expand=8, iters=64` over real roots.
   large solve and thirty-five small ones is as slow as its largest member. The
   architecture at `f5f4c05^` learned the same lesson twice — reserved lanes for
   oversized work, and returning outsized buffers rather than retaining them.
+* **A solve's cost cannot be predicted from its root.** The obvious way to feed
+  reserved lanes is to route by root belief size. It does not work: three solves
+  with an identical root support of 124 came to 203k, 1.32M and 1.73M cells, an
+  8.5x spread, while the *largest* root of the eight (278) produced middling
+  trees. Supports do grow away from the root — up to 10.7x, so `config_cap`
+  bounding the root bounds nothing else — but where they grow depends on which
+  lines the search chooses to follow, which is not known when the solve starts.
+  A scheduler therefore has to react to cost as it accrues, not sort by it up
+  front.
