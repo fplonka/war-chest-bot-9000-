@@ -193,6 +193,12 @@ struct Boards {
     /// Elements each buffer can hold, one per buffer. They only grow, and each
     /// is bounded by the solve's budget, so a slot settles and stays there.
     caps: [usize; 6],
+    /// The flat description the CFR sweeps read. Uploaded whole when it grows
+    /// rather than incrementally: it is a few megabytes against the tens the
+    /// sweeps then run over without touching the bus again, and an incremental
+    /// upload would have to mirror `Contract::extend`'s layout rules on both
+    /// sides of the bus for no measured gain.
+    tree: Option<Tree>,
 }
 
 struct Card {
@@ -541,6 +547,133 @@ impl Card {
         b.caps[5] = oc;
         b.cells += cidx.len();
         b.queries += shifted.len() - 1;
+        Ok(())
+    }
+
+    /// Put a solve's tree description on the card.
+    ///
+    /// Whole, not incremental. It is a few megabytes against the tens of
+    /// megabytes of sweep traffic it then saves, and mirroring
+    /// `Contract::extend`'s layout rules across the bus would buy nothing
+    /// measured.
+    pub fn keep_tree(&self, solve: usize, c: &crate::contract::Contract) -> Res<()> {
+        let t = Tree {
+            parent: self.up(&c.parent)?,
+            player: self.up(&c.player)?,
+            kind: self.up(&c.kind)?,
+            nc: self.up(&c.nc.iter().flatten().copied().collect::<Vec<u32>>())?,
+            roff: self.up(&c.roff)?,
+            voff: self.up(&c.voff)?,
+            soff: self.up(&c.soff)?,
+            child_at: self.up(&c.child_at)?,
+            child_n: self.up(&c.child_n)?,
+            child: self.up(&c.child)?,
+            legal_base: self.up(&c.legal_base)?,
+            legal_off: self.up(&c.legal_off)?,
+            legal_child: self.up(&c.legal_child)?,
+            legal_trans: self.up(&c.legal_trans)?,
+            rev_base: self.up(&c.rev_base)?,
+            rev_start: self.up(&c.rev_start)?,
+            rev_src: self.up(&c.rev_src)?,
+            rev_cell: self.up(&c.rev_cell)?,
+            rvd_base: self.up(&c.rvd_base)?,
+            rvd_start: self.up(&c.rvd_start)?,
+            rvd_src: self.up(&c.rvd_src)?,
+            rvd_p: self.up(&c.rvd_p)?,
+            draw_base: self.up(&c.draw_base)?,
+            draw_start: self.up(&c.draw_start)?,
+            draw_to: self.up(&c.draw_to)?,
+            draw_p: self.up(&c.draw_p)?,
+            level_node: self.up(&c.level_node)?,
+            level_start: c.level_start.clone(),
+        };
+        let mut g = self.boards.lock();
+        if g.len() <= solve {
+            g.resize_with(solve + 1, Boards::default);
+        }
+        g[solve].tree = Some(t);
+        Ok(())
+    }
+
+    /// One CFR iteration's two sweeps, on the card.
+    ///
+    /// Reach walks the levels forward from level one -- the root's reach is
+    /// the root belief and is seeded by the caller -- and backpropagation
+    /// walks them backward. A level's nodes never depend on each other, which
+    /// is what lets each level be one launch; `a_level_never_depends_on_itself`
+    /// is what says so.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sweep(
+        &self,
+        solve: usize,
+        traverser: usize,
+        cfr: crate::search::Cfr,
+        factors: (f32, f32, f32),
+        cur: &mut CudaSlice<f32>,
+        reach: &mut CudaSlice<f32>,
+        vals: &mut CudaSlice<f32>,
+        regret: &mut CudaSlice<f32>,
+        sum: &mut CudaSlice<f32>,
+        qval: &mut CudaSlice<f32>,
+    ) -> Res<()> {
+        let g = self.boards.lock();
+        let t = g
+            .get(solve)
+            .and_then(|b| b.tree.as_ref())
+            .ok_or_else(|| format!("solve {solve} has no resident tree"))?;
+        let levels = t.level_start.len().saturating_sub(1);
+        let (da, db, dg) = factors;
+
+        for level in 1..levels {
+            let (lo, hi) = (t.level_start[level], t.level_start[level + 1]);
+            let (lo_i, nodes) = (lo as i32, (hi - lo) as usize);
+            if nodes == 0 {
+                continue;
+            }
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.reach_sweep)
+                    .arg(&t.level_node).arg(&lo_i)
+                    .arg(&t.parent).arg(&t.player).arg(&t.nc).arg(&t.roff)
+                    .arg(&t.rev_base).arg(&t.rev_start).arg(&t.rev_src).arg(&t.rev_cell)
+                    .arg(&t.rvd_base).arg(&t.rvd_start).arg(&t.rvd_src).arg(&t.rvd_p)
+                    .arg(&*cur).arg(&mut *reach).arg(&(nodes as i32))
+                    .launch_unit(LaunchConfig {
+                        grid_dim: (nodes as u32, 2, 1),
+                        block_dim: (64, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+            }
+            .map_err(err)?;
+        }
+
+        let (tr, predict) = (traverser as i32, cfr.predict);
+        for level in (0..levels).rev() {
+            let (lo, hi) = (t.level_start[level], t.level_start[level + 1]);
+            let (lo_i, nodes) = (lo as i32, (hi - lo) as usize);
+            if nodes == 0 {
+                continue;
+            }
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.backprop_sweep)
+                    .arg(&t.level_node).arg(&lo_i)
+                    .arg(&t.kind).arg(&t.player).arg(&t.nc).arg(&t.voff).arg(&t.soff)
+                    .arg(&t.child_at).arg(&t.child_n).arg(&t.child)
+                    .arg(&t.legal_base).arg(&t.legal_off)
+                    .arg(&t.legal_child).arg(&t.legal_trans)
+                    .arg(&t.draw_base).arg(&t.draw_start).arg(&t.draw_to).arg(&t.draw_p)
+                    .arg(&mut *vals).arg(&mut *cur).arg(&mut *regret)
+                    .arg(&mut *sum).arg(&mut *qval)
+                    .arg(&tr).arg(&da).arg(&db).arg(&dg).arg(&predict)
+                    .launch_unit(LaunchConfig {
+                        grid_dim: (nodes as u32, 1, 1),
+                        block_dim: (64, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+            }
+            .map_err(err)?;
+        }
         Ok(())
     }
 
@@ -967,6 +1100,41 @@ impl Card {
         }
         Ok(())
     }
+}
+
+/// A solve's tree, as the sweep kernels read it.
+///
+/// Every array here is `contract.rs` verbatim. The host keeps the level table
+/// because it drives the launch loop, and reading it back would sync.
+struct Tree {
+    parent: CudaSlice<u32>,
+    player: CudaSlice<u8>,
+    kind: CudaSlice<u8>,
+    nc: CudaSlice<u32>,
+    roff: CudaSlice<u32>,
+    voff: CudaSlice<u32>,
+    soff: CudaSlice<u32>,
+    child_at: CudaSlice<u32>,
+    child_n: CudaSlice<u32>,
+    child: CudaSlice<u32>,
+    legal_base: CudaSlice<u32>,
+    legal_off: CudaSlice<u32>,
+    legal_child: CudaSlice<u32>,
+    legal_trans: CudaSlice<u32>,
+    rev_base: CudaSlice<u32>,
+    rev_start: CudaSlice<u32>,
+    rev_src: CudaSlice<u32>,
+    rev_cell: CudaSlice<u32>,
+    rvd_base: CudaSlice<u32>,
+    rvd_start: CudaSlice<u32>,
+    rvd_src: CudaSlice<u32>,
+    rvd_p: CudaSlice<f32>,
+    draw_base: CudaSlice<u32>,
+    draw_start: CudaSlice<u32>,
+    draw_to: CudaSlice<u32>,
+    draw_p: CudaSlice<f32>,
+    level_node: CudaSlice<u32>,
+    level_start: Vec<u32>,
 }
 
 /// Where one solve's slice of a round sits, and the buffers it is read against.
