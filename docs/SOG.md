@@ -110,3 +110,15 @@ Measured at `nodes=8192, expand=8, iters=64` over real roots.
 * The flat gather is *slower* than the tree walk on a CPU (0.7x). It buys
   parallelism with work and there is nobody on a host to spend it, so both
   implementations stay.
+* **A solve's cost varies 26x.** Strategy cells per solve run 67k to 1.73M over
+  eight real roots — 8 to 227 cells a node — and the single largest solve of the
+  eight carries 40% of all the cells. `config_cap` bounds the *root* belief;
+  interior supports still multiply through every draw, so a tree that reaches
+  past a round boundary explodes where a shallow one does not.
+
+  Two consequences for the device. Memory: 35 MB of cell arenas for the largest
+  solve, ~390 MB for thirty-six at the mean but 1.2 GB if they are all large,
+  on a 24 GB card. And load: the sweeps are O(cells), so a round holding one
+  large solve and thirty-five small ones is as slow as its largest member. The
+  architecture at `f5f4c05^` learned the same lesson twice — reserved lanes for
+  oversized work, and returning outsized buffers rather than retaining them.

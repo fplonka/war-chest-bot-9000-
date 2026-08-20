@@ -68,6 +68,7 @@ fn main() {
     let mut rng = Rng::new(0x67CF);
     let (mut stop_sum, mut stopped, mut node_iters, mut static_iters) = (0usize, 0usize, 0u64, 0u64);
     let mut conc = 0.0f64;
+    let mut cellv: Vec<usize> = Vec::new();
     let mut contract_ns = 0u64;
     for (n, (s, belief)) in positions.iter().enumerate() {
         let ctx = warchest::rebel::Ctx::new(s);
@@ -97,6 +98,14 @@ fn main() {
                 static_iters += sv.nodes.len() as u64;
             }
         }
+        println!(
+            "  arenas: {:8} cells {:8} reach   {:6.2} MB   cells/node {:5.1}",
+            sv.ncells,
+            sv.reach.len(),
+            4.0 * (5.0 * sv.ncells as f64 + sv.reach.len() as f64) / 1e6,
+            sv.ncells as f64 / sv.nodes.len() as f64,
+        );
+        cellv.push(sv.ncells);
         // The same two sweeps, walked over the tree and gathered over the flat
         // description, on the tree as it finally stands. Which is faster
         // decides whether the flat form should simply replace the walk on the
@@ -159,6 +168,19 @@ fn main() {
         contract_ns as f64 / 1e6,
         positions.len()
     );
+    cellv.sort_unstable();
+    if !cellv.is_empty() {
+        let sum: usize = cellv.iter().sum();
+        println!(
+            "cells per solve: min {} median {} max {} -- the max is {:.1}x the median, \
+             and carries {:.0}% of all cells",
+            cellv[0],
+            cellv[cellv.len() / 2],
+            cellv[cellv.len() - 1],
+            cellv[cellv.len() - 1] as f64 / cellv[cellv.len() / 2] as f64,
+            100.0 * cellv[cellv.len() - 1] as f64 / sum as f64,
+        );
+    }
     warchest::prof::dump();
     warchest::prof::dump_work();
 }
