@@ -812,6 +812,10 @@ pub struct Solver<'a> {
     /// stopped growing, and read by everything that acts, filters a belief or
     /// values a node.
     pub avg: Vec<f32>,
+    /// Leaves that have become decision or chance nodes since a reader last
+    /// looked. A flat description of the tree is append-only apart from these,
+    /// so they are what an incremental update needs to be told.
+    pub grown: Vec<u32>,
     /// Whether each player's running sum has been normalised at least once.
     /// Until then the historical average is the literal initial iterate, not
     /// a multiply-then-divide reconstruction of it.
@@ -955,6 +959,7 @@ impl<'a> Solver<'a> {
             soff: Vec::new(),
             sum_strat: Vec::new(),
             avg: Vec::new(),
+            grown: Vec::new(),
             avg_touched: [false; 2],
             ncells: 0,
             reach: Vec::new(),
@@ -1153,6 +1158,7 @@ impl<'a> Solver<'a> {
         self.cplayer.truncate(m.ncfg);
         self.cmap.retain(|_, &mut i| (i as usize) < m.ncfg);
         self.ncfg = m.ncfg;
+        self.grown.retain(|&g| (g as usize) < m.nodes && g != id as u32);
         self.nodes[id].leaf = true;
     }
 
@@ -1317,6 +1323,7 @@ impl<'a> Solver<'a> {
             n.child = vec![ch];
             n.draw = draw;
             n.draw_steps = steps;
+            self.grown.push(id as u32);
             return;
         }
 
@@ -1490,6 +1497,7 @@ impl<'a> Solver<'a> {
         n.action_cell = action_cell;
         n.cell_row = cell_row;
         self.alloc_cells(id);
+        self.grown.push(id as u32);
     }
 
     // -------------------------------------------------------------- CFR core

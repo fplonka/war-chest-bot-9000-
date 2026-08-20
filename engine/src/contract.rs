@@ -53,8 +53,13 @@ pub struct Contract {
     /// Terminal utility, for the player to act there.
     pub util: Vec<f32>,
 
-    // -------------------------------------------------------- children, CSR
-    pub child_off: Vec<u32>,
+    // ------------------------------------------------------------- children
+    /// Where a node's children start in `child`, and how many. Not CSR: a leaf
+    /// that is grown gets its children appended at the end, long after its
+    /// neighbours already have theirs, so the starts are not monotone and a
+    /// single offset array cannot bracket them.
+    pub child_at: Vec<u32>,
+    pub child_n: Vec<u32>,
     pub child: Vec<u32>,
 
     // ------------------------------- legal cells, CSR by the acting config
@@ -91,6 +96,9 @@ pub struct Contract {
     // ------------------------------------------------------------- levels
     pub level_start: Vec<u32>,
     pub level_node: Vec<u32>,
+    /// Nodes already described. Growth only ever appends past this, and
+    /// re-describes the one leaf it turned into a decision node.
+    pub built: usize,
 }
 
 impl Contract {
@@ -119,12 +127,113 @@ impl Contract {
             voff: Vec::with_capacity(n),
             soff: Vec::with_capacity(n),
             util: Vec::with_capacity(n),
-            child_off: Vec::with_capacity(n + 1),
+            child_at: Vec::with_capacity(n),
+            child_n: Vec::with_capacity(n),
             ..Default::default()
         };
-        c.child_off.push(0);
 
         for i in 0..n {
+            c.describe(sv, i);
+        }
+        c.parent = vec![NO_ROW; n];
+        for i in 0..n {
+            c.link(i);
+        }
+        c.levels_from(sv);
+        c.transpose(sv);
+        c.built = n;
+        c
+    }
+
+    /// Bring a description up to date with a tree that has grown.
+    ///
+    /// `grown` names the leaves that became decision or chance nodes since the
+    /// last call. Everything else is append: the children they gained, and the
+    /// nodes those children pulled in behind them.
+    ///
+    /// Rebuilding instead costs 2.2x the CFR sweeps this description exists to
+    /// feed, measured at the frozen budget — so a rebuild per iteration is not
+    /// a cadence that can pay for itself at any tree size.
+    pub fn extend(&mut self, sv: &Solver, grown: &[u32]) {
+        // A node can be created and grown between two calls -- `push_child`
+        // grows through a draw or a tactic the moment it makes it -- and the
+        // append below describes those in full. Only a leaf that was already
+        // described needs its row rewritten.
+        for &g in grown {
+            let i = g as usize;
+            if i < self.built {
+                self.redescribe(sv, i);
+            }
+        }
+        for i in self.built..sv.nodes.len() {
+            self.parent.push(NO_ROW);
+            self.level.push(0);
+            self.rev_base.push(NO_ROW);
+            self.rvd_base.push(NO_ROW);
+            self.describe(sv, i);
+        }
+        let first = self.built;
+        self.built = sv.nodes.len();
+        // A node's parent is whoever listed it as a child, which is either a
+        // node just grown or one just appended.
+        for &g in grown {
+            self.link(g as usize);
+        }
+        for i in first..self.built {
+            self.link(i);
+        }
+        self.levels_from(sv);
+        for &g in grown {
+            self.transpose_children(sv, g as usize);
+        }
+        for i in first..self.built {
+            self.transpose_children(sv, i);
+        }
+    }
+
+    /// Point a node's children back at it.
+    fn link(&mut self, i: usize) {
+        let (a, n) = (self.child_at[i] as usize, self.child_n[i] as usize);
+        for k in a..a + n {
+            self.parent[self.child[k] as usize] = i as u32;
+        }
+    }
+
+    /// Rewrite the row of a leaf that has become a decision or chance node.
+    /// Everything it now owns is appended, so its old row's variable-length
+    /// parts -- of which a leaf has none -- are simply orphaned.
+    fn redescribe(&mut self, sv: &Solver, i: usize) {
+        let at = self.kind.len();
+        self.describe(sv, i);
+        let moved = |v: &mut Vec<u32>| {
+            v[i] = v[at];
+            v.truncate(at);
+        };
+        self.kind[i] = self.kind[at];
+        self.kind.truncate(at);
+        self.player[i] = self.player[at];
+        self.player.truncate(at);
+        self.nc[i] = self.nc[at];
+        self.nc.truncate(at);
+        self.util[i] = self.util[at];
+        self.util.truncate(at);
+        moved(&mut self.roff);
+        moved(&mut self.voff);
+        moved(&mut self.soff);
+        moved(&mut self.child_at);
+        moved(&mut self.child_n);
+        moved(&mut self.legal_base);
+        moved(&mut self.draw_base);
+    }
+
+    /// Describe node `i`, appending everything it owns.
+    ///
+    /// Every array a node writes into is either indexed by the node (one push)
+    /// or reached through a base this records, so nothing a previous node wrote
+    /// moves. That is what lets a grown leaf be re-described in place later.
+    fn describe(&mut self, sv: &Solver, i: usize) {
+        let c = self;
+        {
             let t = &sv.nodes[i];
             c.kind.push(if t.leaf {
                 KIND_LEAF
@@ -139,11 +248,12 @@ impl Contract {
             c.voff.push(sv.voff[i]);
             c.soff.push(sv.soff[i]);
             c.util.push(t.util);
-            for &ch in &t.child {
-                c.child.push(ch as u32);
-                c.parent[ch] = i as u32;
-            }
-            c.child_off.push(c.child.len() as u32);
+            c.child_at.push(c.child.len() as u32);
+            c.child_n.push(t.child.len() as u32);
+            // The children are listed but not linked back: a node grown after
+            // its neighbours names children that do not exist yet, so `link`
+            // runs once every node is present.
+            c.child.extend(t.child.iter().map(|&ch| ch as u32));
 
             // Legal cells. The offsets stay node-local, exactly as the node
             // holds them, and the cell arrays are indexed the way `cur` and
@@ -171,6 +281,7 @@ impl Contract {
 
             // The draw transition, as the node stores it: parent config to
             // child config, with the chance factor.
+            let _ = &t;
             c.draw_base.push(if t.chance {
                 let base = c.draw_start.len() as u32;
                 for r in 0..=t.draw.rows() {
@@ -183,9 +294,15 @@ impl Contract {
                 NO_ROW
             });
         }
+    }
 
-        // Children are always built after their parent, so node order is
-        // already topological and one pass fixes every level.
+    /// Depth from the root for every node, and the nodes bucketed by it.
+    ///
+    /// Children are always built after their parent, so node order is already
+    /// topological and one forward pass fixes every level.
+    fn levels_from(&mut self, sv: &Solver) {
+        let c = self;
+        let n = sv.nodes.len();
         for i in 1..n {
             let p = c.parent[i];
             c.level[i] = if p == NO_ROW { 0 } else { c.level[p as usize] + 1 };
@@ -206,8 +323,6 @@ impl Contract {
             count[l] += 1;
         }
 
-        c.transpose(sv);
-        c
     }
 
     /// Build the reverse of both transitions, which is the only part of the
@@ -216,13 +331,21 @@ impl Contract {
         let n = self.nodes();
         self.rev_base = vec![NO_ROW; n];
         self.rvd_base = vec![NO_ROW; n];
-        // Counting pass per parent, then a fill pass, so each child's rows land
-        // contiguously and in parent-cell order — which keeps the sum's
-        // floating-point order the same as the scatter it replaces.
         for i in 0..n {
+            self.transpose_children(sv, i);
+        }
+    }
+
+    /// The reverse transition into each of node `i`'s children.
+    ///
+    /// A counting pass then a fill pass, so a child's rows land contiguously
+    /// and in parent-cell order — which keeps the sum's floating-point order
+    /// the same as the scatter it replaces.
+    fn transpose_children(&mut self, sv: &Solver, i: usize) {
+        {
             let t = &sv.nodes[i];
             if t.leaf {
-                continue;
+                return;
             }
             let me = t.player as usize;
             if t.chance {
@@ -252,7 +375,7 @@ impl Contract {
                         count[to[k] as usize] += 1;
                     }
                 }
-                continue;
+                return;
             }
             // A decision node: bucket its cells by the child config each one
             // reaches. The fill walks the child's observations and then its
@@ -396,7 +519,7 @@ impl Contract {
                 let nc = self.nc[i][traverser] as usize;
                 let vi = self.voff[i] as usize;
                 if self.kind[i] == KIND_CHANCE {
-                    let ch = self.child[self.child_off[i] as usize] as usize;
+                    let ch = self.child[self.child_at[i] as usize] as usize;
                     let cv = self.voff[ch] as usize;
                     if me == traverser {
                         // The chance factor is a real factor of the value,
@@ -424,7 +547,8 @@ impl Contract {
                     // opponent decision, and the opponent's strategy is already
                     // in the reaches the leaf values carry.
                     vals[vi..vi + nc].fill(0.0);
-                    for k in self.child_off[i] as usize..self.child_off[i + 1] as usize {
+                    let (a, n) = (self.child_at[i] as usize, self.child_n[i] as usize);
+                    for k in a..a + n {
                         let cv = self.voff[self.child[k] as usize] as usize;
                         for c in 0..nc {
                             vals[vi + c] += vals[cv + c];
@@ -574,6 +698,122 @@ mod tests {
             }
         }
         assert!(checked >= 8, "only {checked} comparisons");
+    }
+
+    /// An incrementally extended description must equal one built from
+    /// scratch, field for field.
+    ///
+    /// This is the whole safety of the append-only form. A description that
+    /// drifts from the tree it claims to describe produces a sweep that is
+    /// quietly solving a different game, and nothing downstream would say so.
+    #[test]
+    fn extending_a_contract_equals_rebuilding_it() {
+        let nets = Nets {
+            value: random_net(0x5EED),
+            gate: None,
+        };
+        let cfg = Cfg {
+            nodes: 512,
+            expand: 4,
+            iters: 10,
+            ..Default::default()
+        };
+        let gc = GameCfg {
+            agents: [Agent::Rebel {
+                cfg: Cfg { nodes: 64, expand: 1, iters: 4, ..cfg },
+            }; 2],
+            collect: Collect::Rebel,
+            explore: 0.1,
+            random_draft: true,
+            eval_mix: 1.0,
+            mc_mix: 0.0,
+            query_rate: 0.9,
+            recursive_rate: 0.1,
+        };
+        let roots = collect_roots(3, 23, &nets, &gc, 3);
+        assert!(!roots.is_empty(), "no roots to test against");
+
+        let mut rng = Rng::new(0xE47E);
+        let mut checked = 0usize;
+        for (s, belief) in &roots {
+            let ctx = crate::rebel::Ctx::new(s);
+            let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
+            let mut inc = Contract::of(&sv);
+            sv.grown.clear();
+            for t in 0..cfg.iters {
+                sv.step();
+                for _ in 0..cfg.expand {
+                    if sv.nodes.len() >= cfg.nodes || !sv.expand_once(&mut rng) {
+                        break;
+                    }
+                }
+                let grown = std::mem::take(&mut sv.grown);
+                inc.extend(&sv, &grown);
+                let full = Contract::of(&sv);
+
+                // The layout is deliberately not compared. An extended
+                // description appends a grown node's children at the end of
+                // `child`, where a rebuild lays them in node order, so the
+                // offsets differ while the meaning does not. What must agree
+                // is what the description is *for*: the sweeps it drives.
+                macro_rules! same {
+                    ($($f:ident),*) => {$(
+                        assert_eq!(
+                            inc.$f, full.$f,
+                            concat!(stringify!($f), " differs at iteration {}"),
+                            t
+                        );
+                    )*};
+                }
+                same!(kind, player, nc, parent, level, roff, voff, soff, util);
+                same!(child_n, level_start, level_node);
+                assert_eq!(inc.built, full.built, "built differs");
+                for i in 0..full.nodes() {
+                    let kids = |c: &Contract| {
+                        let (a, n) = (c.child_at[i] as usize, c.child_n[i] as usize);
+                        c.child[a..a + n].to_vec()
+                    };
+                    assert_eq!(kids(&inc), kids(&full), "node {i}'s children differ");
+                }
+
+                let root = [&sv.root_belief[0].p[..], &sv.root_belief[1].p[..]];
+                let (mut ra, mut rb) = (vec![0.0; sv.reach.len()], vec![0.0; sv.reach.len()]);
+                inc.reach(root, &sv.cur, &mut ra);
+                full.reach(root, &sv.cur, &mut rb);
+                for (k, (x, y)) in ra.iter().zip(&rb).enumerate() {
+                    assert_eq!(x.to_bits(), y.to_bits(), "reach[{k}] differs at iteration {t}");
+                }
+
+                let k = sv.cfg.cfr;
+                let fs = (factor(2.0, k.alpha), factor(2.0, k.beta), 0.5);
+                let mut sum = vec![0.0f32; sv.ncells];
+                let run = |c: &Contract| {
+                    let (mut v, mut cu, mut rg, mut sm) =
+                        (sv.vals.clone(), sv.cur.clone(), sv.regret.clone(), sum.clone());
+                    c.backprop(0, k, fs, &mut v, &mut cu, &mut rg, &mut sm);
+                    (v, cu, rg, sm)
+                };
+                let (va, ca, ga, sa) = run(&inc);
+                let (vb, cb, gb, sb) = run(&full);
+                for (name, x, y) in [
+                    ("vals", &va, &vb),
+                    ("cur", &ca, &cb),
+                    ("regret", &ga, &gb),
+                    ("sum", &sa, &sb),
+                ] {
+                    for (k, (p, q)) in x.iter().zip(y.iter()).enumerate() {
+                        assert_eq!(
+                            p.to_bits(),
+                            q.to_bits(),
+                            "{name}[{k}] differs at iteration {t}"
+                        );
+                    }
+                }
+                sum.clear();
+                checked += 1;
+            }
+        }
+        assert!(checked >= 10, "only {checked} comparisons");
     }
 
     /// `t^p / (t^p + 1)`, with the infinities that name "do not discount" and

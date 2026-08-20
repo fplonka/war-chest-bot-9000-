@@ -73,6 +73,8 @@ fn main() {
         let ctx = warchest::rebel::Ctx::new(s);
         let mut sv = Solver::new(s, ctx, &nets, cfg, belief.clone());
         let mut stop = None;
+        let mut contract = warchest::contract::Contract::of(&sv);
+        sv.grown.clear();
         for t in 0..cfg.iters {
             sv.step();
             for _ in 0..cfg.expand {
@@ -84,9 +86,10 @@ fn main() {
             // What describing the tree for a device costs, against the sweeps
             // that description exists to feed.
             let tc = std::time::Instant::now();
-            let c = warchest::contract::Contract::of(&sv);
+            let grown = std::mem::take(&mut sv.grown);
+            contract.extend(&sv, &grown);
             contract_ns += tc.elapsed().as_nanos() as u64;
-            std::hint::black_box(c.nodes());
+            std::hint::black_box(contract.nodes());
             if stop.is_none() && sv.nodes.len() >= cfg.nodes {
                 stop = Some(t + 1);
             }
@@ -127,7 +130,7 @@ fn main() {
     // Where a solve's CPU time goes, which is what the device has to absorb.
     // Only says anything with `--features prof`.
     println!(
-        "contract rebuilds: {:.0} cpu-ms total over {} solves",
+        "contract updates: {:.0} cpu-ms total over {} solves",
         contract_ns as f64 / 1e6,
         positions.len()
     );
