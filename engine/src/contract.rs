@@ -504,6 +504,7 @@ impl Contract {
         cur: &mut [f32],
         regret: &mut [f32],
         sum: &mut [f32],
+        qval: &mut [f32],
     ) {
         const EPS: f32 = 1e-6;
         let (da, db, dg) = factors;
@@ -558,6 +559,11 @@ impl Contract {
                 }
                 let so = self.soff[i] as usize;
                 let lb = self.legal_base[i] as usize;
+                // The expansion phase reads these as PUCT's Q. A sweep that
+                // computes the values but drops them leaves selection blind,
+                // and the tree it grows is a different tree.
+                let cells = self.legal_off[lb + nc] as usize;
+                qval[so..so + cells].fill(0.0);
                 for c in 0..nc {
                     let (a, b) = (
                         self.legal_off[lb + c] as usize,
@@ -569,20 +575,14 @@ impl Contract {
                             continue;
                         }
                         let cv = self.voff[self.legal_child[so + cell] as usize] as usize;
-                        base += vals[cv + self.legal_trans[so + cell] as usize] * cur[so + cell];
+                        let av = vals[cv + self.legal_trans[so + cell] as usize];
+                        qval[so + cell] = av;
+                        base += av * cur[so + cell];
                     }
                     vals[vi + c] = base;
                     let mut total = 0.0f32;
                     for cell in a..b {
-                        // Re-formed rather than retained: starting at +0 and
-                        // adding keeps the arithmetic identical to the CPU's,
-                        // including a cell with no successor.
-                        let mut delta = 0.0f32;
-                        if self.legal_trans[so + cell] != NO_TRANS {
-                            let cv = self.voff[self.legal_child[so + cell] as usize] as usize;
-                            delta += vals[cv + self.legal_trans[so + cell] as usize];
-                        }
-                        delta -= base;
+                        let delta = qval[so + cell] - base;
                         let old = regret[so + cell];
                         let r = old * if old > 0.0 { da } else { db } + delta;
                         regret[so + cell] = r;
@@ -597,7 +597,6 @@ impl Contract {
                         }
                     }
                 }
-                let cells = self.legal_off[lb + nc] as usize;
                 for x in sum[so..so + cells].iter_mut() {
                     *x *= dg;
                 }
@@ -698,6 +697,124 @@ mod tests {
             }
         }
         assert!(checked >= 8, "only {checked} comparisons");
+    }
+
+    /// A whole solve driven through the flat description must reach the same
+    /// strategy as one driven by the tree walk.
+    ///
+    /// The per-iteration tests pin the two sweeps against each other on a tree
+    /// that the *walk* advanced. This drives the solve from the description
+    /// instead, so an error in the sequencing -- extending too late, missing a
+    /// growth, feeding a stale level table -- compounds across sixty-four
+    /// iterations rather than being corrected by the next comparison. That is
+    /// the failure a device would actually have.
+    #[test]
+    fn a_solve_driven_from_the_description_reaches_the_same_strategy() {
+        let nets = Nets {
+            value: random_net(0x5EED),
+            gate: None,
+        };
+        let cfg = Cfg {
+            nodes: 384,
+            expand: 4,
+            iters: 12,
+            ..Default::default()
+        };
+        let gc = GameCfg {
+            agents: [Agent::Rebel {
+                cfg: Cfg { nodes: 64, expand: 1, iters: 4, ..cfg },
+            }; 2],
+            collect: Collect::Rebel,
+            explore: 0.1,
+            random_draft: true,
+            eval_mix: 1.0,
+            mc_mix: 0.0,
+            query_rate: 0.9,
+            recursive_rate: 0.1,
+        };
+        let roots = collect_roots(2, 47, &nets, &gc, 2);
+        assert!(!roots.is_empty(), "no roots to test against");
+
+        let mut checked = 0usize;
+        for (s, belief) in &roots {
+            let ctx = crate::rebel::Ctx::new(s);
+            // The same solve twice, from the same seed, so the expansion
+            // trajectories match and only the sweep differs.
+            let run = |flat: bool| {
+                let mut rng = Rng::new(0xD12E);
+                let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
+                let mut c = Contract::of(&sv);
+                sv.grown.clear();
+                for t in 0..cfg.iters {
+                    if flat {
+                        let grown = std::mem::take(&mut sv.grown);
+                        c.extend(&sv, &grown);
+                        let k = sv.cfg.cfr;
+                        for p in 0..2 {
+                            let m = sv.steps[p] as f32 + 1.0;
+                            let fs = (
+                                factor(m, k.alpha),
+                                factor(m, k.beta),
+                                (m / (m + 1.0)).powf(k.gamma),
+                            );
+                            sv.leaf_values(p);
+                            let (mut vals, mut cur, mut regret) =
+                                (sv.vals.clone(), sv.cur.clone(), sv.regret.clone());
+                            let mut sum = vec![0.0f32; sv.ncells];
+                            for i in 0..sv.nodes.len() {
+                                let so = sv.soff[i] as usize;
+                                let row = &sv.sum_strat[i];
+                                sum[so..so + row.len()].copy_from_slice(row);
+                            }
+                            let mut qv = sv.qval.clone();
+                            c.backprop(
+                                p, k, fs, &mut vals, &mut cur, &mut regret, &mut sum, &mut qv,
+                            );
+                            sv.vals = vals;
+                            sv.cur = cur;
+                            sv.regret = regret;
+                            sv.qval = qv;
+                            for i in 0..sv.nodes.len() {
+                                let so = sv.soff[i] as usize;
+                                let n = sv.sum_strat[i].len();
+                                sv.sum_strat[i].copy_from_slice(&sum[so..so + n]);
+                            }
+                        }
+                        let root = [&sv.root_belief[0].p[..], &sv.root_belief[1].p[..]];
+                        let mut out = vec![0.0f32; sv.reach.len()];
+                        c.reach(root, &sv.cur, &mut out);
+                        sv.reach = out;
+                        sv.avg_block();
+                        sv.steps[0] += 1;
+                        sv.steps[1] += 1;
+                    } else {
+                        sv.step();
+                    }
+                    for _ in 0..cfg.expand {
+                        if sv.nodes.len() >= cfg.nodes || !sv.expand_once(&mut rng) {
+                            break;
+                        }
+                    }
+                    let _ = t;
+                }
+                sv.finish();
+                (sv.avg.clone(), sv.cur.clone(), sv.regret.clone())
+            };
+            let (a_avg, a_cur, a_reg) = run(false);
+            let (b_avg, b_cur, b_reg) = run(true);
+            for (name, x, y) in [
+                ("avg", &a_avg, &b_avg),
+                ("cur", &a_cur, &b_cur),
+                ("regret", &a_reg, &b_reg),
+            ] {
+                assert_eq!(x.len(), y.len(), "{name} length differs");
+                for (k, (p, q)) in x.iter().zip(y.iter()).enumerate() {
+                    assert_eq!(p.to_bits(), q.to_bits(), "{name}[{k}] differs");
+                }
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no solve compared");
     }
 
     /// Every node of a level must have its parent in an earlier one.
@@ -867,7 +984,8 @@ mod tests {
                 let run = |c: &Contract| {
                     let (mut v, mut cu, mut rg, mut sm) =
                         (sv.vals.clone(), sv.cur.clone(), sv.regret.clone(), sum.clone());
-                    c.backprop(0, k, fs, &mut v, &mut cu, &mut rg, &mut sm);
+                    let mut qv = vec![0.0f32; sv.ncells];
+                    c.backprop(0, k, fs, &mut v, &mut cu, &mut rg, &mut sm, &mut qv);
                     (v, cu, rg, sm)
                 };
                 let (va, ca, ga, sa) = run(&inc);
@@ -996,7 +1114,10 @@ mod tests {
                 }
                 let (mut vals, mut cur, mut regret) =
                     (sv.vals.clone(), sv.cur.clone(), sv.regret.clone());
-                c.backprop(traverser, k, fs, &mut vals, &mut cur, &mut regret, &mut sum);
+                let mut qv = vec![0.0f32; sv.ncells];
+                c.backprop(
+                    traverser, k, fs, &mut vals, &mut cur, &mut regret, &mut sum, &mut qv,
+                );
 
                 let same = |got: &[f32], want: &[f32], what: &str| {
                     assert_eq!(got.len(), want.len(), "{what} length at iteration {t}");

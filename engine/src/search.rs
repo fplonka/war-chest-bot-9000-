@@ -801,7 +801,7 @@ pub struct Solver<'a> {
     /// turned into a regret.
     pub(crate) prior: Vec<f32>,
     pub(crate) visits: Vec<f32>,
-    pub(crate) qval: Vec<f32>,
+    pub qval: Vec<f32>,
     pub(crate) soff: Vec<u32>,
     /// The reach-weighted running strategy sum, per node. Per node rather than
     /// flat, because a node is given its cells when it is expanded and a

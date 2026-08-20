@@ -386,7 +386,8 @@ __global__ void k_backprop_sweep(const unsigned int* level_node, int lo,
                                  const unsigned int* draw_base, const unsigned int* draw_start,
                                  const unsigned int* draw_to, const float* draw_p,
                                  float* vals, float* cur, float* regret, float* sum,
-                                 int traverser, float da, float db, float dg, float predict) {
+                                 float* qval, int traverser,
+                                 float da, float db, float dg, float predict) {
     const float EPS = 1e-6f;
     const unsigned int NO_TRANS = 0xffffffffu;
     int node = level_node[lo + blockIdx.x];
@@ -426,21 +427,26 @@ __global__ void k_backprop_sweep(const unsigned int* level_node, int lo,
     }
 
     unsigned int so = soff[node], lb = legal_base[node];
+    // The expansion phase reads these as PUCT's Q. A sweep that computes the
+    // action values and drops them leaves selection blind, and the tree it
+    // grows is a different tree -- which is a wrong answer no shape check
+    // would catch.
+    unsigned int ncells = legal_off[lb + n];
+    for (unsigned int k = threadIdx.x; k < ncells; k += blockDim.x) qval[so + k] = 0.0f;
+    __syncthreads();
     for (int c = threadIdx.x; c < n; c += blockDim.x) {
         unsigned int a = legal_off[lb + c], b = legal_off[lb + c + 1];
         float base = 0.0f;
         for (unsigned int cell = a; cell < b; ++cell) {
             if (legal_trans[so + cell] == NO_TRANS) continue;
-            base += vals[voff[legal_child[so + cell]] + legal_trans[so + cell]]
-                  * cur[so + cell];
+            float av = vals[voff[legal_child[so + cell]] + legal_trans[so + cell]];
+            qval[so + cell] = av;
+            base += av * cur[so + cell];
         }
         vals[vi + c] = base;
         float total = 0.0f;
         for (unsigned int cell = a; cell < b; ++cell) {
-            float delta = 0.0f;
-            if (legal_trans[so + cell] != NO_TRANS)
-                delta += vals[voff[legal_child[so + cell]] + legal_trans[so + cell]];
-            delta -= base;
+            float delta = qval[so + cell] - base;
             float old = regret[so + cell];
             float r = old * (old > 0.0f ? da : db) + delta;
             regret[so + cell] = r;
@@ -454,8 +460,7 @@ __global__ void k_backprop_sweep(const unsigned int* level_node, int lo,
         }
     }
     __syncthreads();
-    unsigned int cells = legal_off[lb + n];
-    for (unsigned int k = threadIdx.x; k < cells; k += blockDim.x) sum[so + k] *= dg;
+    for (unsigned int k = threadIdx.x; k < ncells; k += blockDim.x) sum[so + k] *= dg;
 }
 
 }  // extern "C"
