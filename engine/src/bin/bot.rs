@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use warchest::arena::{Ask, Done, Hello, Reply, Request, PROTOCOL};
 use warchest::args::Args;
 use warchest::bot::{Brain, Mind, Session};
+use warchest::farm::{Backend, Gate};
 use warchest::net::Net;
 use warchest::rebel::rules_table_hash;
 use warchest::search::{Cfg, Cfr, Nets};
@@ -36,12 +37,13 @@ struct Options {
     temp: f32,
     node_cap: usize,
     threads: usize,
+    devices: String,
 }
 
 fn options() -> Result<Options, String> {
     let a = Args::parse(&[
         "name", "weights", "mind", "nodes", "expand", "iters", "cfr", "temp",
-        "node-cap", "threads",
+        "node-cap", "threads", "devices",
     ])?;
     Ok(Options {
         name: a.text("name", "bot"),
@@ -54,10 +56,11 @@ fn options() -> Result<Options, String> {
         temp: a.num("temp", 2.0)?,
         node_cap: a.num("node-cap", 200_000)?,
         threads: a.num("threads", 0)?,
+        devices: a.text("devices", ""),
     })
 }
 
-fn brain(o: &Options) -> Result<Brain, String> {
+fn brain(o: &Options, gate: Option<Arc<Gate>>, device: bool) -> Result<Brain, String> {
     let mind = match o.mind.as_str() {
         "rebel" => Mind::Rebel,
         "greedy" => Mind::Greedy { temp: o.temp },
@@ -65,7 +68,7 @@ fn brain(o: &Options) -> Result<Brain, String> {
         other => return Err(format!("unknown mind {}", other)),
     };
     let cfr = Cfr::named(&o.cfr).ok_or_else(|| format!("unknown cfr rule {}", o.cfr))?;
-    let mut nets = Nets::default();
+    let mut nets = Nets { gate, device, ..Nets::default() };
     if matches!(mind, Mind::Rebel) {
         nets.value = Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
     }
@@ -137,10 +140,32 @@ fn main() {
     // Evaluation scores a game that hit the play horizon as a draw, so the
     // horizon marker is worth nothing to either side.
     warchest::state::set_cap_marker_value(0.0);
-    let brain = Arc::new(brain(&options).unwrap_or_else(|e| {
-        eprintln!("{}", e);
-        std::process::exit(2);
-    }));
+    // The cards, if there are any. A ladder is a few thousand solves at the
+    // same budget a training run uses, so it belongs on the same machinery:
+    // without this a forty-game ladder is an hour of CPU, which is too dear to
+    // be the thing that checks whether a run learned anything.
+    let (gate, driver) = match devices(&options) {
+        None => (None, None),
+        Some(backend) => {
+            let gate = Arc::new(Gate::default());
+            let mine = gate.clone();
+            // The driver holds no gate slot of its own, so it never waits on
+            // itself; it stops when the gate closes, which is when stdin ends.
+            let driver = std::thread::spawn(move || {
+                while !mine.round_closed() {
+                    mine.serve_until_idle(|calls| backend.run(calls));
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+            });
+            (Some(gate), Some(driver))
+        }
+    };
+    let brain = Arc::new(
+        brain(&options, gate.clone(), gate.is_some()).unwrap_or_else(|e| {
+            eprintln!("{}", e);
+            std::process::exit(2);
+        }),
+    );
     let threads = if options.threads == 0 {
         std::thread::available_parallelism().map_or(8, |n| n.get())
     } else {
@@ -148,6 +173,17 @@ fn main() {
     };
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
+        // Every worker is a gate member for its whole life, so a round is
+        // exactly the games in flight and a thread that is between games does
+        // not hold the others up.
+        .start_handler({
+            let gate = gate.clone();
+            move |_| {
+                if let Some(g) = &gate {
+                    std::mem::forget(g.enter());
+                }
+            }
+        })
         .build()
         .expect("thread pool");
 
@@ -196,4 +232,36 @@ fn main() {
             });
         }
     }
+    if let Some(gate) = gate {
+        gate.close();
+    }
+    if let Some(driver) = driver {
+        let _ = driver.join();
+    }
+}
+
+/// The backend a solve evaluates on, or `None` for the CPU network.
+///
+/// A bot is archived per experiment and replayed long after, so this is a flag
+/// rather than a default: a bot built before the device path existed must still
+/// play exactly as it did.
+fn devices(o: &Options) -> Option<Backend> {
+    let want: Vec<usize> = o
+        .devices
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    if want.is_empty() || !matches!(o.mind.as_str(), "rebel") {
+        return None;
+    }
+    #[cfg(feature = "gpu")]
+    {
+        let net = Net::load_bin(&o.weights).ok()?;
+        match warchest::cuda::Device::new(&want, net) {
+            Ok(d) => return Some(Backend::Cuda(d)),
+            Err(e) => eprintln!("no device backend: {e}"),
+        }
+    }
+    None
 }
