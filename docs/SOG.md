@@ -71,16 +71,23 @@ compiled.**
 **But the sweeps cannot move on their own, and this is the thing to settle
 first.** `sample_leaf` — the expansion phase — runs on the host and reads
 exactly the arenas the sweeps write: `cur`, `sum_strat`, `qval`, `visits`,
-`prior`, `reach`. Bringing those back is ~2.2 MB an iteration against the 0.7 MB
-the whole leaf query now costs, so device-side sweeps would *add* about three
-times the traffic they save. Making the arenas resident and leaving expansion
-where it is makes throughput worse, not better.
+`prior`, `reach`.
 
-Two ways out. Move the expansion phase to the device as well, which is what the
-architecture at `f5f4c05^` did — its trajectories and PUCT statistics were
-device-side, and nothing came back per iteration. Or leave the sweeps on the
-host and accept the ceiling they impose, ~146 solves/s, which is below the
-target. There is no version where the sweeps move alone.
+Measured, those arenas are **4.9, 9.7 and 33.1 MB** over three real solves — a
+mean of 16 MB a round trip, not the 2 MB a rough estimate suggested. Over 64
+iterations that is **1 GB a solve**, and at 150 solves/s **153 GB/s**, against
+roughly 50 GB/s across two PCIe 4.0 x16 links. Three times over the bus, before
+any of the network's own traffic. Making the arenas resident and leaving
+expansion on the host is not slow, it is impossible.
+
+Walking the trajectory from the host instead of bulk-copying does not rescue
+it: a trajectory is data-dependent and sequential, so it becomes ~160 tiny
+round trips an iteration, and latency replaces bandwidth as the wall.
+
+So either the expansion phase moves to the device with the sweeps — which is
+what the architecture at `f5f4c05^` did, trajectories and PUCT statistics on the
+card, nothing returning per iteration — or the sweeps stay on the host at the
+~146 solves/s ceiling they impose. There is no version where they move alone.
 
 A sweep must hand back `qval` as well as the values. The expansion phase reads
 it as PUCT's Q, and a sweep that computes each action value and drops it leaves
