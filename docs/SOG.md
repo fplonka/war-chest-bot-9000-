@@ -1,8 +1,21 @@
 # Student of Games, and where the device port stands
 
-The engine follows Student of Games (`papers/SoG_2112.03178.pdf`), not ReBeL.
-Four things the paper specifies. All four are in and held to the CPU solver by
-test.
+The engine follows Student of Games (`papers/SoG_2112.03178.pdf`), not ReBeL,
+in four of the things the paper specifies. The fifth is not in, and the
+throughput work has not touched it either way.
+
+**Sound re-solving is absent.** The paper's re-solving guarantee comes from a
+gadget that constrains the opponent's counterfactual values at the root of each
+re-solve: the opponent may terminate and take the value the previous search
+promised them, which is what stops a fresh solve from exploiting information the
+previous one had. There is no gadget here. Beliefs are carried forward
+correctly, but every decision builds a solver with zeroed regrets and nothing
+retained, which is ReBeL-style unsafe re-solving. So the paper's bound does not
+apply to this agent, whatever the four mechanisms below do.
+
+What follows is what *is* in. The first two are held to the CPU solver by
+`cuda_parity`; the mixture, the simultaneity and the averaging weight are not
+pinned by any test.
 
 ## What the paper asks for, and what answers it
 
@@ -20,7 +33,8 @@ as the legal cells, which is what lets one public description serve every
 config at a node. `train/test_parity.py::policy_parity` is the only thing that
 pins `cfg_p` and the action encoder's place in the weight blob.
 
-**Expansion by `π_select = ½·π_PUCT + ½·π_CFR`.** PUCT is a maximisation, so
+**Expansion by `π_select = ½·π_PUCT + ½·π_CFR`,** where `π_CFR` is the
+average strategy rather than the current iterate, as the paper says. PUCT is a maximisation, so
 its half is a point mass on the argmax and sampling the mixture is a coin flip.
 Three arenas laid out like `cur` carry it: `prior`, `visits` (incremented as a
 trajectory passes, which is also the paper's virtual loss), and `qval`, the

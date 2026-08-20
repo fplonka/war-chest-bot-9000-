@@ -507,6 +507,16 @@ pub const LN_JOUT: usize = LN_JOIN + JBLOCKS;
 pub const LN_H: usize = LN_JOUT + 1;
 pub const LN_ACT: usize = LN_H + 1;
 
+/// The physical row of each leaf, out of a buffer that holds both seat views.
+/// Only the reference path keeps both: it builds a card table per seat view.
+fn physical_rows(xpub: &[f32], rows: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(rows * PUBFEAT);
+    for r in 0..rows {
+        out.extend_from_slice(&xpub[2 * r * PUBFEAT..(2 * r + 1) * PUBFEAT]);
+    }
+    out
+}
+
 impl Net {
     pub fn from_flat(w: &[f32], b: &[f32], ln: &[f32]) -> Result<Self, String> {
         let l = NetLayout::new();
@@ -791,17 +801,18 @@ impl Net {
         card_rows: usize,
         out: &mut Vec<f32>,
     ) {
-        let mut physical = scratch(rows * PUBFEAT);
+        // `xpub` is one row a leaf: the board is a public thing and the trunk
+        // never looked at the mirrored seat view, which this used to gather
+        // past. The card table still holds both views, and a leaf takes the
+        // physical one.
         let mut physical_cards = scratch(rows * NTYPE * TYPE);
         for r in 0..rows {
-            physical[r * PUBFEAT..(r + 1) * PUBFEAT]
-                .copy_from_slice(&xpub[2 * r * PUBFEAT..(2 * r + 1) * PUBFEAT]);
             let cr = (2 * r) % card_rows;
             physical_cards[r * NTYPE * TYPE..(r + 1) * NTYPE * TYPE]
                 .copy_from_slice(&cards[cr * NTYPE * TYPE..(cr + 1) * NTYPE * TYPE]);
         }
-        let tokens = self.tokens(&physical, &physical_cards, rows, rows);
-        let x = self.trunk(&physical, &tokens, rows);
+        let tokens = self.tokens(xpub, &physical_cards, rows, rows);
+        let x = self.trunk(xpub, &tokens, rows);
         let width = 2 * C + LOOSE;
         let mut input = scratch(rows * width);
         for r in 0..rows {
@@ -816,11 +827,10 @@ impl Net {
                 }
             }
             dst[2 * C..].copy_from_slice(
-                &physical[r * PUBFEAT + OFF_LOOSE..r * PUBFEAT + OFF_LOOSE + LOOSE],
+                &xpub[r * PUBFEAT + OFF_LOOSE..r * PUBFEAT + OFF_LOOSE + LOOSE],
             );
         }
         self.board_out.run(&input, rows, out);
-        recycle(physical);
         recycle(physical_cards);
         recycle(tokens);
         recycle(x);
@@ -1091,8 +1101,9 @@ impl Net {
         let mut cards = Vec::new();
         self.cards(xpub, queries, &mut cards);
         let rows = queries / 2;
+        let phys = physical_rows(xpub, rows);
         let (mut p, mut jp) = (Vec::new(), Vec::new());
-        self.board(xpub, &cards, rows, queries, &mut p);
+        self.board(&phys, &cards, rows, queries, &mut p);
         self.join_cache(&p, rows, &mut jp);
         let (mut f, mut g, mut fp) = (Vec::new(), Vec::new(), Vec::new());
         self.configs(phi, seg, n, &cards, &mut f, &mut g, &mut fp);
@@ -1144,8 +1155,9 @@ impl Net {
         let mut cards = Vec::new();
         self.cards(xpub, queries, &mut cards);
         let rows = queries / 2;
+        let phys = physical_rows(xpub, rows);
         let mut p = Vec::new();
-        self.board(xpub, &cards, rows, queries, &mut p);
+        self.board(&phys, &cards, rows, queries, &mut p);
         let (mut f, mut g, mut fp) = (Vec::new(), Vec::new(), Vec::new());
         self.configs(phi, seg, n, &cards, &mut f, &mut g, &mut fp);
         // An action belongs to the physical row of its cells' query, and the

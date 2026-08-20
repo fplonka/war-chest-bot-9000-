@@ -828,6 +828,8 @@ pub struct Solver<'a> {
     pub jp: Vec<f32>,
     /// Expanded public encoding, filled during the build.
     pub(crate) xpub: Vec<f32>,
+    /// The mirrored view of the first leaf, which is all the card table wants.
+    mirror0: Vec<f32>,
     /// `[2 * rows, POOL]` pooled belief embeddings — the one thing the join
     /// reads that moves between CFR iterations.
     pub xb: Vec<f32>,
@@ -944,6 +946,7 @@ impl<'a> Solver<'a> {
             pb: take_buf(R_PB),
             jp: take_buf(R_JP),
             xpub: take_buf(R_XPUB),
+            mirror0: Vec::new(),
             xb: take_buf(R_XB),
             h: take_buf(R_H),
             wbuf: Vec::new(),
@@ -1567,15 +1570,20 @@ impl<'a> Solver<'a> {
         &self.reach[at..at + self.nc[i][p] as usize]
     }
 
+    /// One leaf's public encoding.
+    ///
+    /// A row, not two. The board is public and the trunk reads the physical
+    /// view only -- the mirrored one was written for every leaf, carried
+    /// through the call, and gathered past by everything that read it. What
+    /// still wants it is the card table, which holds a view a seat and is
+    /// built once a solve off the first row; that one mirror is kept here.
     fn encode(&mut self, s: &State, row: usize) {
-        let at = 2 * row * PUBFEAT;
+        let at = row * PUBFEAT;
         write_public_features(s, &self.ctx, &mut self.xpub[at..at + PUBFEAT]);
-        let mirrored = s.mirror();
-        write_public_features(
-            &mirrored,
-            &self.ctx.mirrored(),
-            &mut self.xpub[at + PUBFEAT..at + 2 * PUBFEAT],
-        );
+        if row == 0 {
+            self.mirror0.resize(PUBFEAT, 0.0);
+            write_public_features(&s.mirror(), &self.ctx.mirrored(), &mut self.mirror0);
+        }
     }
 
     /// One row of the network batch: its public encoding, and its configs
@@ -1589,8 +1597,8 @@ impl<'a> Solver<'a> {
         );
         let _t = timed!(PUBFEAT);
         let row = self.leaf_coff.len() / 2;
-        let at = 2 * row * PUBFEAT;
-        if self.xpub.len() < at + 2 * PUBFEAT {
+        let at = row * PUBFEAT;
+        if self.xpub.len() < at + PUBFEAT {
             // Grow in chunks so the zero-fill happens a handful of times per
             // solve, and not at all once the pooled buffer is warm.
             self.xpub.resize(at + 128 * PUBFEAT, 0.0);
@@ -1686,16 +1694,15 @@ impl<'a> Solver<'a> {
             // one view per seat. Everything downstream reads it by canonical
             // coin-type index.
             if self.cards.is_empty() {
-                let xpub = std::mem::take(&mut self.xpub);
-                self.nets.value.cards(&xpub[..2 * PUBFEAT], 2, &mut self.cards);
-                self.xpub = xpub;
+                let both = [&self.xpub[..PUBFEAT], &self.mirror0[..]].concat();
+                self.nets.value.cards(&both, 2, &mut self.cards);
             }
             // Exactly the fresh rows. `xpub` is a grown scratch buffer, so an
             // open-ended slice would carry whatever the last, larger subgame
             // left behind — invisible to a solve evaluating alone, and wrong
             // the moment the farm concatenates this call with another.
-            let at = 2 * self.batch_rows * PUBFEAT;
-            let end = at + 2 * fresh_rows * PUBFEAT;
+            let at = self.batch_rows * PUBFEAT;
+            let end = at + fresh_rows * PUBFEAT;
             // The belief index of exactly the rows this call makes. A leaf's
             // support is fixed when the leaf is, so it travels with the trunk
             // and never again. `leaf_coff` holds a query's *start* and nothing

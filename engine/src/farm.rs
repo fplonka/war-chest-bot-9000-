@@ -255,8 +255,8 @@ impl Call {
         let mut r = Reply::default();
         match self {
             Call::Trunk { xpub, cards, rows, .. } => {
-                // Two seat views per leaf in `xpub`, and one card table per
-                // solve — `board` reads the physical view of each.
+                // One row a leaf in `xpub`, and one card table per solve --
+                // `board` reads the physical view of that.
                 net.board(xpub, cards, *rows, CARD_ROWS, &mut r.a);
                 net.join_cache(&r.a, *rows, &mut r.b);
             }

@@ -70,8 +70,12 @@ pub const STAGES: [&str; 22] = [
     "held",
 ];
 
-/// Device bytes held by solve arenas, which `leaf_breakdown` reports as a
-/// level rather than resetting.
+/// Device bytes the solve arenas hold right now -- a level, which
+/// `leaf_breakdown` reports without resetting.
+///
+/// Solves in flight is what the rate is linear in, and this is the ceiling on
+/// it: at ten cohorts of thirty-six both cards read 24,027 MiB of 24,576, and
+/// a full pool is where the rate stops being a function of anything else.
 pub static HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub static LEAF_NS: [std::sync::atomic::AtomicU64; STAGES.len()] =
@@ -313,8 +317,18 @@ const TILE: usize = 16384;
 /// Not more than twice, even though four times is faster still: with several
 /// cohorts of solves in flight the card's memory is what bounds how many, and
 /// headroom nobody is using is a cohort that does not fit.
+/// The capacity an array of `want` elements takes.
+///
+/// A power of two, so that every block a slot gives back fits every request
+/// another slot makes. Allocation is stream-ordered: a freed buffer stays in a
+/// pool rather than going back to the driver, and it can only be reused by a
+/// request the block is large enough for. Doubling an arbitrary `want` gives
+/// arbitrary sizes -- one solve returns 260,002 floats and the next asks for
+/// 259,884 -- so the pool ends up holding both, and it grew until both cards
+/// read 24,027 MiB of 24,576. Rounding to a size class costs the same average
+/// slack and makes the blocks interchangeable.
 fn grow_to(want: usize) -> usize {
-    (2 * want).max(4096)
+    want.next_power_of_two().max(4096)
 }
 
 /// One device array of a solve's state.
@@ -522,6 +536,10 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
     /// Allocation is stream-ordered, so this returns the pages to a pool the
     /// other slots draw from and costs about what a launch does.
     fn reset(&mut self) {
+        HELD.fetch_sub(
+            (self.cap * std::mem::size_of::<T>()) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         self.buf = None;
         self.cap = 0;
         self.len = 0;
@@ -1220,24 +1238,20 @@ impl Card {
             let Call::Trunk { xpub, cards, rows, .. } = &calls[i] else {
                 unreachable!("trunk shard holds only trunk calls")
             };
-            assert_eq!(xpub.len(), 2 * rows * PUBFEAT, "trunk xpub is not 2 rows a leaf");
+            assert_eq!(xpub.len(), rows * PUBFEAT, "trunk xpub is not one row a leaf");
             assert_eq!(cards.len(), CARD_ROWS * NTYPE * TYPE, "trunk card table");
             (xpub, cards, *rows)
         };
-        // Only the physical row of each leaf. A call carries both seat views
-        // because the CPU network wants them side by side, but every kernel
-        // downstream reads the physical one and strides past the other -- so
-        // half of what used to be copied into page-locked memory and sent over
-        // the bus was never looked at.
+        // A call carries one row a leaf, so a call is one copy. This used to
+        // gather the physical row out of a pair, a leaf at a time, on the one
+        // thread a card has -- and it was the largest single piece of a round
+        // that was not the device.
         stage.xpub.put(s, rows * PUBFEAT, |dst| {
             let mut at = 0;
             for &i in mine {
-                let (xp, _, n) = each(i);
-                for r in 0..n {
-                    dst[at..at + PUBFEAT]
-                        .copy_from_slice(&xp[2 * r * PUBFEAT..(2 * r + 1) * PUBFEAT]);
-                    at += PUBFEAT;
-                }
+                let (xp, _, _) = each(i);
+                dst[at..at + xp.len()].copy_from_slice(xp);
+                at += xp.len();
             }
             at
         })?;
