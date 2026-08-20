@@ -295,6 +295,7 @@ impl Nets {
     /// There is nothing sensible to return, and the farm joins its threads, so
     /// unwinding here is how the thread stops.
     fn submit(&self, gate: &Gate, calls: Vec<Call>) -> Vec<Reply> {
+        let _t = timed!(WAIT);
         gate.submit_all(calls)
             .expect("the inference gate closed while a solve was still running")
     }
@@ -2311,6 +2312,7 @@ impl<'a> Solver<'a> {
     /// is the earliest node whose row moved: `Contract` is append-only apart
     /// from the leaves this growth turned into decision nodes.
     fn contract_extend(&mut self) {
+        let _t = timed!(CONTRACT);
         let grown = std::mem::take(&mut self.grown);
         let from = grown
             .iter()
@@ -2370,6 +2372,7 @@ impl<'a> Solver<'a> {
         if self.nets.value.is_empty() {
             return;
         }
+        let _t = timed!(PRIOR);
         let want: Vec<usize> = (0..self.nodes.len())
             .filter(|&i| {
                 !self.primed[i]
@@ -2383,11 +2386,22 @@ impl<'a> Solver<'a> {
             return;
         }
         // One description per (node, action), and the board each is played on.
+        //
+        // Only the boards these nodes stand on, packed. `Net::actions`
+        // projects every board row it is handed, and handing it the whole leaf
+        // batch meant projecting a couple of thousand of them to reach the
+        // handful just expanded -- which measured at thirty-one cpu-ms an
+        // iteration per thread, more than every other host phase together.
+        let d = crate::net::D;
+        let mut boards = Vec::with_capacity(want.len() * d);
         let mut feat = Vec::new();
         let mut board_of: Vec<u32> = Vec::new();
         let mut base = Vec::with_capacity(want.len());
         for &i in &want {
             base.push(board_of.len() as u32);
+            let at = self.row_of[i] as usize * d;
+            let mine = (boards.len() / d) as u32;
+            boards.extend_from_slice(&self.pb[at..at + d]);
             let n = &self.nodes[i];
             for a in 0..n.na() {
                 let at = feat.len();
@@ -2398,18 +2412,12 @@ impl<'a> Solver<'a> {
                     n.acts[a].hexes(),
                     &mut feat[at..],
                 );
-                board_of.push(self.row_of[i]);
+                board_of.push(mine);
             }
         }
         let na = board_of.len();
         let mut e = Vec::new();
-        self.nets.value.actions(
-            &feat,
-            &self.pb[..self.batch_rows * crate::net::D],
-            &board_of,
-            na,
-            &mut e,
-        );
+        self.nets.value.actions(&feat, &boards, &board_of, na, &mut e);
 
         // `logit(c, a) = <f_p(c), e(a)>` over the node's own legal cells, then
         // a softmax across each config's row.

@@ -23,6 +23,10 @@ mod imp {
     counters!(
         BUILD, BACTS, BDRAW, BCELLS, BOBS, BSUP, DGEN, DSORT, DCOMP, BAPPLY,
         BPUSH, REACH, PUBFEAT, PUBNET, BELFEAT, NET, LEAFPOST, BACK, AVG,
+        // The device path's own host work: describing the tree the card reads,
+        // the policy prior the expansion phase walks under, and the wait for
+        // the round itself.
+        CONTRACT, PRIOR, WAIT,
     );
 
     pub static PUBLIC_ROWS: AtomicU64 = AtomicU64::new(0);
