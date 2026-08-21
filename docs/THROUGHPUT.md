@@ -355,21 +355,43 @@ come down together: at 150 solves/s the card must do a solve's device work in
    allows roughly double what is in flight now -- 144 solves held 10.9 GB, so
    about 76 MB each -- and no more.
 
-## `grow_every`, and why it bought nothing
+## `grow_every`, which now buys a great deal
 
 `rounds_per_solve` is about forty-two, and a round exists for one reason: the
 host has to turn the leaves an expansion phase sampled into decision nodes,
 because that is the game's rules. `Cfg::grow_every` lets a solve run several
 iterations, and several expansion phases, before the host is woken.
 
-Measured: **21.7 solves/s at two, against 21.8 at one** -- nothing, and the
-grow_every run had younger games, which should have favoured it. The reason is
-worth keeping. A barrier only costs anything while the card sits idle through
-it, and a cohort's host work now overlaps another cohort's kernels. Halving the
-wakes also doubles the device work each round carries, so
-`rate = in_flight / (rounds x round_time)` is unchanged. **Cohorts already took
-what this was for.** Its `L/var` also rose from 0.2 to 5.5, so the coarser
-growth may cost target quality as well. Left in, defaulted to one.
+Measured at ten cohorts of thirty-six, on cards verified free between points:
+
+| `grow_every` | solves/s | rounds/s | rows/round | device |
+|---:|---:|---:|---:|---:|
+| 1 | 28.6 | 55.2 | 3,568 | 723% |
+| 2 | 33.3 | 37.1 | 5,313 | 792% |
+| 4 | **47.4** | 26.4 | 9,324 | 849% |
+
+**This was measured as worth nothing before, and the earlier reasoning was
+sound at the time:** halving the wakes doubles the device work a round
+carries, so `rate = in_flight / (rounds x round_time)` is unchanged. That holds
+when the device is saturated. It is not -- it is busy about 55%, and
+`tools/gaps.py` says 41% of the idle is the host turnaround after `k_expand`
+and `k_bag`. Fewer turnarounds is fewer 4.6 ms holes, and the secondary
+numbers say exactly that: rounds a second fall, rows a round rise, device
+occupancy climbs.
+
+**It is not free, and it must not be adopted on the rate alone.** A round of
+`k` iterations runs `k` expansion phases against a tree the host has not grown
+in between, so the second and later phases select from a stale tree and can
+sample the same leaf twice. The tree GT-CFR builds is a different tree. The
+earlier note also recorded `L/var` rising from 0.2 to 5.5 at two, which is a
+hint that the targets get noisier.
+
+The gate this needs is search quality, not Elo: `Solver::nash_conv` already
+measures exploitability of the finite search game, and `tests/rebel_solver.rs`
+already holds solves to it. What is missing is that the host solve loop
+ignores `grow_every` -- it grows every iteration -- so the host cannot yet
+reproduce the device's semantics to be measured against them. That is the next
+piece of work before the default moves.
 
 ## What was tried and abandoned
 
