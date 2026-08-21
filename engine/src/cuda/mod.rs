@@ -1200,9 +1200,12 @@ impl Card {
         // wherever it is planned, travels as one buffer and one kernel.
         let mut pack = self.pack.lock();
         pack.clear();
+        // The tree first: it carries the flag that says a solve is new, and
+        // everything a slot's last occupant left has to go before the stages
+        // below write into it.
+        self.wall(17, || self.tree(calls, &pick(2), &mut pack)).map_err(at("tree"))?;
         self.wall(11, || self.trunk(calls, &pick(0), &mut pack)).map_err(at("trunk"))?;
         self.wall(12, || self.configs(calls, &pick(1))).map_err(at("configs"))?;
-        self.wall(17, || self.tree(calls, &pick(2), &mut pack)).map_err(at("tree"))?;
         self.wall(18, || self.scatter(&mut pack)).map_err(at("scatter"))?;
         drop(pack);
         // After the scatter, which lays the uniform prior down over the cells
@@ -1506,22 +1509,6 @@ impl Card {
                 unreachable!("trunk shard holds only trunk calls")
             };
             let b = self.slot(&mut g, *solve);
-            if *row0 == 0 {
-                // A fresh solve in this slot. Everything the last one left is
-                // another tree's, and the pages are worth more to whichever
-                // slot is holding a large solve now. This comes before the
-                // writes below, not after them.
-                b.cells = 0;
-                b.host_coff.clear();
-                b.host_coff.push(0);
-                for a in [&mut b.p, &mut b.jp, &mut b.f, &mut b.g, &mut b.fp] {
-                    a.reset();
-                }
-                b.cidx.reset();
-                b.coff.reset();
-                b.leaf_node.reset();
-                b.term.reset();
-            }
             b.p.copy(&self.stream, row0 * D, &p, at * D, n * D)?;
             b.jp.copy(&self.stream, row0 * JW, &jp, at * JW, n * JW)?;
             // `coff` arrives relative to this call's own `cidx`, so it is
@@ -1776,20 +1763,34 @@ impl Card {
             let b = self.slot(&mut g, *solve);
             let s = &self.stream;
             if *fresh {
-                // Regrets, visits and the strategy sum accumulate over a solve,
-                // so the next solve to take this slot must not inherit them.
-                // The tree's own arrays go back too: the caller rewinds what it
-                // has told the card about, and holding the pages would cost the
-                // card the worst case in every slot at once.
+                // Everything the slot's last occupant left. Regrets, visits and
+                // the strategy sum accumulate over a solve, so the next solve
+                // must not inherit them; the tree and the leaf batch go back
+                // too, because the caller rewinds what it has told the card
+                // about and holding the pages would cost the card the worst
+                // case in every slot at once.
+                //
+                // Here rather than with the leaf batch it clears, because a
+                // subgame whose every leaf is terminal raises no trunk call at
+                // all -- and a slot it took over would keep the last solve's
+                // rows and be laid out as if they were its own.
                 for a in b.tree.pools() {
                     a.reset();
                 }
                 b.tree.rvd_p.reset();
                 b.tree.draw_p.reset();
                 for a in [&mut b.reach, &mut b.vals, &mut b.cur, &mut b.regret,
-                          &mut b.sum, &mut b.qval, &mut b.visits, &mut b.prior] {
+                          &mut b.sum, &mut b.qval, &mut b.visits, &mut b.prior,
+                          &mut b.p, &mut b.jp, &mut b.f, &mut b.g, &mut b.fp] {
                     a.reset();
                 }
+                for a in [&mut b.cidx, &mut b.coff, &mut b.leaf_node, &mut b.term] {
+                    a.reset();
+                }
+                b.cells = 0;
+                b.rows = 0;
+                b.host_coff.clear();
+                b.host_coff.push(0);
             }
             // One copy of the solve's words, then a piece per run saying where
             // inside them each destination reads.
