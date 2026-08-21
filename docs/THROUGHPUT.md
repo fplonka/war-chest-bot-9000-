@@ -493,13 +493,35 @@ all. Large tile, ruinous padding; small tile, many launches. There is no
 setting where the trade comes out ahead, and tensor cores on the join could
 only give back about seven points against the fifteen this costs.
 
-**So the FP16 precondition is still open, and both cheap routes are closed.**
-What is left is narrower than it looked: the summation order only moves
-because cuBLAS may split the `k` loop, and whether it does is a function of
-the shape. An explicitly chosen non-split-`k` algorithm would fix the order
-without fixing the shape -- `cublasGemmEx` takes an algorithm rather than a
-heuristic. That is one parameter and one parity run, and it is the next thing
-to try before anyone writes a tiled GEMM by hand.
+**Naming the algorithm does not work either: cuBLAS ignores it.** All eight
+tensor-op algorithms, swept through `cublasGemmEx`, return results identical
+to the last decimal place -- 5.3884834e-2 on the board vector and 1.4436794e-3
+of batch movement, every time. Eight algorithms do not agree to eight
+significant figures; the parameter is deprecated on Ampere and the heuristic
+runs regardless.
+
+So all three cheap routes to a deterministic multiply are closed by
+measurement:
+
+| route | deterministic? | cost |
+|---|---|---|
+| our own kernel, a warp a row | yes | 22.2% of device against 19%, rate 25.9 |
+| a constant `n`, tiles padded | yes | 15%, in launches not padding |
+| an explicitly named algorithm | -- | the parameter is ignored |
+
+What is left is a properly tiled GEMM of our own, staging weights in shared
+memory and reusing them across many rows the way cuBLAS does. That is real
+work, and it is now the known price of the FP16 programme rather than a
+guess.
+
+**And there is a second question waiting behind it.** Half precision costs
+5.39e-2 on the board vector against a 1e-3 tolerance -- fifty-four times, and
+that is the *inputs* being rounded, not the accumulation, so a deterministic
+kernel would not fix it. Whether that matters is a search-quality question
+rather than a numerical one, and
+`growing_less_often_searches_worse` shows the shape of the answer:
+`nash_conv` over a corpus of micro-endgames, half precision against single.
+Do that before building the kernel, not after.
 
 ## What is left, in order
 
