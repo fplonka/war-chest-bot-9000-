@@ -1,7 +1,9 @@
 """The farm at a fixed workload: solves/s, and the three numbers that set it.
 
 `rate = threads / (rounds_per_solve * round_time)`. Every driver change moves
-one of those three, so the bench reports all three and not only the rate.
+one of those three, so the bench reports the round time beside the rate. Rounds
+per solve is not one of the farm's counters -- a solve makes two to four calls
+a round -- so what stands in for it is calls per solve.
 
 The workload is a corpus of roots sampled from real play. `farmprobe` plays
 games forward instead, and a solve's cost varies twenty-six fold with how far
@@ -68,7 +70,7 @@ def bench(args, devices, threads):
         print(
             f"workers={threads:3d} t={now - start:5.0f}s: "
             f"{rate:7.1f} solves/s | "
-            f"rounds/solve {rounds * per_round / max(solves, 1):5.1f}  "
+            f"calls/solve {calls / max(solves, 1):5.1f}  "
             f"round {1e3 * dt / max(rounds, 1):6.1f} ms | "
             f"{per_round:5.1f} calls/round  {rows / max(rounds, 1):7.0f} rows/round  "
             f"device {1e-9 * nanos / dt:4.0%}",
