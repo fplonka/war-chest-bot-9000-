@@ -433,6 +433,36 @@ roughly halving *all* of them:
 That is a coordinated programme across six kernels, not a find. It is worth
 saying plainly rather than discovering it one disappointment at a time.
 
+### And it has one precondition: a GEMM that does not depend on the round
+
+The cheapest route to the arithmetic looked like `CUBLAS_COMPUTE_32F_FAST_16F`
+-- tensor cores with the data left in single precision, operands and result
+untouched, only the multiply-accumulate rounded. Nothing stored as half, so
+nothing for the encoder to amplify. One parameter.
+
+It fails both parity tests:
+
+```
+the_network_agrees                          5.39e-2  against 1e-3
+a_solve_does_not_depend_on_the_round_it_rides_in
+                          targets moved     1.44e-3  against 1e-4
+```
+
+The second is the one that matters. cuBLAS chooses among tensor-op algorithms
+by shape, and a round's `n` is however many solves shared it, so the summation
+order -- and any split-k reduction -- changes with the batch. That is the same
+wall that half-precision `f` and `g` hit, reached from the other side, and it
+says the obstacle was never the storage width. **It is that a library picks
+its own summation order.**
+
+So the precondition for the whole FP16 programme is a matrix multiply whose
+arithmetic is fixed by us: our own kernel, where the order over `k` is written
+down and a round's composition cannot reach it. That also settles the join.
+Fusing it does not beat cuBLAS on FP32 -- the traffic works out about even --
+but it is the only way to have tensor cores at all, and it removes the five
+norms and the intermediate round trips as well. **Write the join's GEMM before
+trying to make anything half precision.**
+
 ## What is left, in order
 
 There is no single item worth more than about 1.2x left. The profile is flat on
