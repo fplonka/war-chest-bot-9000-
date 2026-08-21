@@ -17,7 +17,7 @@
 //! is asked of the card.
 
 use parking_lot::{Condvar, Mutex, RwLock};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -427,10 +427,6 @@ impl Backend {
 }
 
 
-/// Solves a job runs before it hands its rows over. Small enough that a
-/// publish is never more than this stale.
-const CHUNK_SOLVES: usize = 8;
-
 /// Solves one card will hold, however small they turn out to be. The real
 /// bound is `Backend::has_room`, which is bytes; this is the last resort.
 const MAX_IN_FLIGHT: usize = 1024;
@@ -439,9 +435,44 @@ const MAX_IN_FLIGHT: usize = 1024;
 /// there is no level to measure and nothing but a count to bound it by.
 const REFERENCE_IN_FLIGHT: usize = 64;
 
-/// Solves one card admits between two of its rounds, once it has the credit.
-/// Only a bound on how far a single check can overshoot.
-const ADMIT_PER_ROUND: usize = 8;
+/// Whether the process has room in *host* memory for another solve.
+///
+/// A solve costs host bytes as well as device bytes, and more of them: the
+/// tree, the states its nodes stand on and the description the card reads are
+/// all here too. A farm that admitted on the card's level alone filled the host
+/// instead, and the run was killed with no message but the exit code.
+///
+/// The whole process, not the farm's share of it. The replay buffer and the
+/// trainer are in this address space as well, and they grow over a run.
+#[cfg(target_os = "linux")]
+fn host_room() -> bool {
+    /// Tenths of the machine's memory this process may hold before it stops
+    /// admitting.
+    ///
+    /// The rest is headroom, and most of it is for the solves already admitted:
+    /// they are still growing when admission stops, and measured, they take the
+    /// figure about seventy per cent past where it stopped. The replay buffer,
+    /// which grows over a run, and the allocator's own retained pages, which
+    /// inflate what this reads, are inside the same margin.
+    const SHARE: u64 = 4;
+    let field = |path: &str, at: usize| -> Option<u64> {
+        std::fs::read_to_string(path)
+            .ok()?
+            .split_whitespace()
+            .nth(at)?
+            .parse()
+            .ok()
+    };
+    // `statm` is in pages and `meminfo`'s first field is `MemTotal:` in kB.
+    let rss = field("/proc/self/statm", 1).unwrap_or(0) * 4096;
+    let total = field("/proc/meminfo", 1).unwrap_or(u64::MAX / 1024) * 1024;
+    rss < total / 10 * SHARE
+}
+
+#[cfg(not(target_os = "linux"))]
+fn host_room() -> bool {
+    true
+}
 
 /// A queue with parked consumers, closed once when the farm winds down.
 struct Queue<T> {
@@ -649,26 +680,24 @@ impl Farm {
         let collected = Arc::new(Mutex::new(Vec::new()));
         let stopping = Arc::new(AtomicBool::new(false));
         let broken = Arc::new(AtomicBool::new(false));
-        let done: Vec<Arc<AtomicUsize>> = (0..cards).map(|_| Arc::new(AtomicUsize::new(0))).collect();
         let stats = Arc::new(Stats::default());
         let backend = Arc::new(RwLock::new(backend));
 
         let hands: Vec<JoinHandle<()>> = (0..workers)
             .map(|t| {
-                let (ready, device, nets, collected, work, stopping, done) = (
+                let (ready, device, nets, collected, work, stopping) = (
                     Arc::clone(&ready),
                     device.clone(),
                     Arc::clone(&nets),
                     Arc::clone(&collected),
                     Arc::clone(&work),
                     Arc::clone(&stopping),
-                    done.clone(),
                 );
                 std::thread::Builder::new()
                     .name(format!("host-{t}"))
                     .spawn(move || {
                         while let Some(job) = ready.pop() {
-                            advance_job(job, &device, &nets, &work, &collected, &stopping, &done);
+                            advance_job(job, &device, &nets, &work, &collected, &stopping);
                         }
                     })
                     .expect("spawn host thread")
@@ -677,7 +706,7 @@ impl Farm {
 
         let drivers = (0..cards)
             .map(|c| {
-                let (queue, ready, backend, nets, work, stats, broken, done) = (
+                let (queue, ready, backend, nets, work, stats, broken) = (
                     Arc::clone(&device[c]),
                     Arc::clone(&ready),
                     Arc::clone(&backend),
@@ -685,7 +714,6 @@ impl Farm {
                     Arc::clone(&work),
                     Arc::clone(&stats),
                     Arc::clone(&broken),
-                    Arc::clone(&done[c]),
                 );
                 let seed = seed.wrapping_mul(0x9E37_79B9) ^ c as u64;
                 std::thread::Builder::new()
@@ -693,7 +721,7 @@ impl Farm {
                     .spawn(move || {
                         drive_card(
                             c, cards, seed, &queue, &ready, &backend, &nets, &work, &stats,
-                            &broken, &done,
+                            &broken,
                         )
                     })
                     .expect("spawn driver thread")
@@ -795,18 +823,18 @@ fn advance_job(
     work: &Work,
     collected: &Mutex<Vec<Data>>,
     stopping: &AtomicBool,
-    done: &[Arc<AtomicUsize>],
 ) {
     let mut replies = std::mem::take(&mut job.replies);
     loop {
         match job.solver.advance(&replies) {
             Step::Calls(calls) => return device[job.card].push((job, calls)),
             Step::Done(solved) => {
-                done[job.card].fetch_add(1, Ordering::Relaxed);
                 job.source.take(&job.solver, solved, &mut job.data);
-                if stopping.load(Ordering::Relaxed) || job.data.soff.len() >= CHUNK_SOLVES {
-                    collected.lock().push(std::mem::take(&mut job.data));
-                }
+                // Every solve, not every eighth. A job re-reads the network
+                // between two solves anyway, so there is nothing a batch of
+                // them buys -- and holding eight back per job is eight times
+                // the solves in flight before a caller sees its first row.
+                collected.lock().push(std::mem::take(&mut job.data));
                 if stopping.load(Ordering::Relaxed) {
                     return;
                 }
@@ -833,47 +861,37 @@ fn drive_card(
     work: &Work,
     stats: &Stats,
     broken: &AtomicBool,
-    done: &AtomicUsize,
 ) {
     let mut live = 0usize;
     loop {
-        // Solves this card has room for, admitted between rounds and never
-        // retired. A solve's cost varies twenty-six fold with how far into a
-        // game its root sits, so how many fit is a question about bytes and the
-        // card is the only thing that can answer it.
+        // One solve admitted a round, and never retired. A solve's cost varies
+        // twenty-six fold with how far into a game its root sits, so how many
+        // fit is a question about bytes; what a card holds and what the process
+        // holds are both measured, and either one stops admission.
         //
-        // Paced one for one against the solves this card has *finished*. A
-        // fresh solve's arenas are nearly empty, so the level says nothing
-        // about a population that has not grown yet -- admitting on it while
-        // everything in flight is still a seedling fills the card and then the
-        // host's memory, several thousand solves later. Every admission being
-        // paid for by a solve that ran to the end means the level is always one
-        // that has been measured, and the count still reaches its equilibrium
-        // in a second or two: completions arrive at a rate the population sets,
-        // so the growth is exponential.
+        // One at a time because the levels lag. A solve's arenas fill over its
+        // whole run, so what the population holds now is what a younger one
+        // held, and admitting faster than they mature overshoots by whatever
+        // the growth was in the meantime. At one a round the overshoot is the
+        // rounds a solve lives for -- a fifth of the population -- and the ramp
+        // still takes seconds, because a round is milliseconds.
         //
         // Nothing new once the farm is winding down. The solves in flight have
         // to finish before a worker can leave, and a fresh one would be a whole
         // solve of that wait for rows nobody will collect.
-        let paid = live <= done.load(Ordering::Relaxed);
-        let room = paid && live < MAX_IN_FLIGHT && backend.read().has_room(card, live);
+        let room = live < MAX_IN_FLIGHT && host_room() && backend.read().has_room(card, live);
         if !ready.closed() && (live == 0 || room) {
-            for _ in 0..ADMIT_PER_ROUND {
-                if live > done.load(Ordering::Relaxed) || live >= MAX_IN_FLIGHT {
-                    break;
-                }
-                let mut source = Source::new(
-                    work,
-                    seed ^ (live as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-                    live * cards + card,
-                );
-                let mut data = Data::default();
-                let n = Arc::clone(&*nets.read());
-                let mut solver = source.next(work, &n, &mut data);
-                solver.pin(live);
-                ready.push(Job { source, solver, card, slot: live, replies: Vec::new(), data });
-                live += 1;
-            }
+            let mut source = Source::new(
+                work,
+                seed ^ (live as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                live * cards + card,
+            );
+            let mut data = Data::default();
+            let n = Arc::clone(&*nets.read());
+            let mut solver = source.next(work, &n, &mut data);
+            solver.pin(live);
+            ready.push(Job { source, solver, card, slot: live, replies: Vec::new(), data });
+            live += 1;
         }
         let batch = queue.drain();
         if batch.is_empty() {

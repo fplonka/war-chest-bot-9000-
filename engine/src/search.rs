@@ -988,6 +988,14 @@ pub struct Solver {
     sent: crate::contract::Sent,
 }
 
+/// A solve moves between the worker that grows it and the card that evaluates
+/// it, so it must be `Send`. The farm's queues need it anyway; this says so
+/// where the type is, and fails here rather than three files away.
+const _: () = {
+    const fn is_send<T: Send>() {}
+    is_send::<Solver>();
+};
+
 impl Drop for Solver {
     fn drop(&mut self) {
         for (role, v) in [
