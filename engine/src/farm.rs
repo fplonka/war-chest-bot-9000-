@@ -16,7 +16,7 @@
 //! never waits on a thread that is gone.
 
 use parking_lot::{Condvar, Mutex, RwLock};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -318,6 +318,26 @@ pub enum Round {
 // which cannot carry anything per-thread.
 thread_local! {
     static SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    /// When this thread last came back from the gate. The span from there to
+    /// its next submission is its share of the host turnaround -- the thing a
+    /// round waits for, and the thing the cards are idle through.
+    static WOKE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Nanoseconds solver threads spent between waking and parking again, and how
+/// many spans that is. A round waits for the slowest of them, so the mean and
+/// the count together say whether the wait is work or a tail.
+pub static AWAKE_NS: AtomicU64 = AtomicU64::new(0);
+pub static AWAKE_N: AtomicU64 = AtomicU64::new(0);
+pub static AWAKE_MAX: AtomicU64 = AtomicU64::new(0);
+
+/// Report and reset: total nanoseconds, spans, and the longest single one.
+pub fn awake() -> (u64, u64, u64) {
+    (
+        AWAKE_NS.swap(0, Ordering::Relaxed),
+        AWAKE_N.swap(0, Ordering::Relaxed),
+        AWAKE_MAX.swap(0, Ordering::Relaxed),
+    )
 }
 
 #[derive(Default)]
@@ -390,6 +410,12 @@ impl Gate {
     /// itself. Parking twice an iteration rather than four times is the
     /// difference between the barrier costing a tenth of a round and a fifth.
     pub fn submit_all(&self, calls: Vec<Call>) -> Option<Vec<Reply>> {
+        if let Some(woke) = WOKE.with(|w| w.take()) {
+            let ns = woke.elapsed().as_nanos() as u64;
+            AWAKE_NS.fetch_add(ns, Ordering::Relaxed);
+            AWAKE_N.fetch_add(1, Ordering::Relaxed);
+            AWAKE_MAX.fetch_max(ns, Ordering::Relaxed);
+        }
         let slot = SLOT.with(|s| s.get());
         assert_ne!(slot, usize::MAX, "submitting from a thread that never entered");
         let mut g = self.round.lock();
@@ -406,7 +432,9 @@ impl Gate {
         while g.mail[slot].is_none() && !g.closed {
             self.done.wait(&mut g);
         }
-        g.mail[slot].take()
+        let got = g.mail[slot].take();
+        WOKE.with(|w| w.set(Some(std::time::Instant::now())));
+        got
     }
 
     /// Wait for a full round, hand the calls to `eval`, publish what it

@@ -981,6 +981,16 @@ fn solve_census() -> Vec<(String, usize)> {
     Vec::new()
 }
 
+/// What solver threads do between waking and parking again: total
+/// milliseconds, how many spans, and the longest one. A round waits for the
+/// slowest thread, so the mean and the maximum together say whether the wait
+/// is work spread evenly or one straggler holding thirty-five others.
+#[pyfunction]
+fn awake() -> (f64, u64, f64) {
+    let (ns, n, mx) = crate::farm::awake();
+    (ns as f64 / 1e6, n, mx as f64 / 1e6)
+}
+
 /// All 37 hexes' axial coords, indexed by hex. The browser UI's board
 /// geometry; mirrors `Board::coord`.
 #[pyfunction]
@@ -1204,5 +1214,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(leaf_breakdown, m)?)?;
         m.add_function(wrap_pyfunction!(stage_names, m)?)?;
         m.add_function(wrap_pyfunction!(solve_census, m)?)?;
+        m.add_function(wrap_pyfunction!(awake, m)?)?;
     Ok(())
 }

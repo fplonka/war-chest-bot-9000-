@@ -285,6 +285,32 @@ and the reasoning was that halving the wakes doubles the device work a round
 carries. That holds only when the device is saturated, and it is not: fewer
 host turnarounds is fewer 4.6 ms holes.
 
+## What a solver thread does between rounds
+
+`warchest.awake()` times each thread from coming back through the gate to
+submitting again -- its share of the host turnaround. Measured:
+
+```
+solver threads awake: 16.33 ms mean over 15,835 spans, longest 173.2 ms
+```
+
+**The mean is the finding.** Sixteen milliseconds a thread a round is real
+work -- growing the tree, rebuilding the contract delta, building the writes --
+not a scheduling artifact, and not one straggler holding thirty-five others.
+The tail matters too: a round waits for the slowest of thirty-six draws from a
+distribution whose maximum is 173 ms, and the expected maximum of thirty-six
+such draws is comfortably over a hundred, which is the wait a round shows.
+
+So there are two separable attacks, and the first is the one with headroom:
+
+* **Make the mean smaller.** Sixteen milliseconds against a round of 364 is
+  where the host cost lives. `describe` and `t-marshal` are the named pieces.
+* **Stop waiting for the tail.** `round_before` already lets a thread miss a
+  round and join the next, and `PATIENCE_MAX` is 50 ms, so in principle the
+  tail is already cut off. That it does not appear to be is worth chasing:
+  a round is 364 ms of which about 135 is `eval`, and 50 ms of patience does
+  not account for the rest.
+
 ## What the memory actually is
 
 `tools/farmprobe.py` prints the fattest solve a card held, array by array, off

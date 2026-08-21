@@ -110,6 +110,10 @@ def main():
         print("stages, ms: "
               + "  ".join(f"{n}={v:.0f}" for n, v in zip(names[:-3], b) if v > 0))
         print("  ".join(f"{n}={v:.0f} MB" for n, v in zip(names[-3:], b[-3:])))
+    ns, n, mx = getattr(warchest, "awake", lambda: (0.0, 0, 0.0))()
+    if n:
+        print(f"solver threads awake: {ns / n:.2f} ms mean over {n} spans, "
+              f"longest {mx:.1f} ms")
     census = getattr(warchest, "solve_census", lambda: [])()
     if census:
         total = sum(b for _, b in census)
