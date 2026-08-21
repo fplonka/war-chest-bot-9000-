@@ -374,11 +374,9 @@ impl Backend {
 
     /// Whether this card has room for another solve in flight.
     ///
-    /// On a card that is the measured level of its solve arenas against what it
-    /// had free before any of them were admitted. A solve's cost varies
-    /// twenty-six fold with how far into a game its root sits, so how many fit
-    /// is a question about bytes and the card is the only thing that can answer
-    /// it.
+    /// A solve's cost varies twenty-six fold with how far into a game its root
+    /// sits, so how many fit is a question about bytes and the card is the only
+    /// thing that can answer it. See `Device::room_for`.
     ///
     /// The reference backend keeps nothing resident -- a solve it serves lives
     /// entirely in host memory -- so it has no such level, and a plain count is
@@ -387,7 +385,7 @@ impl Backend {
         match self {
             Backend::Reference(_) => live < REFERENCE_IN_FLIGHT,
             #[cfg(feature = "gpu")]
-            Backend::Cuda(d) => d.held(card) < d.budget(card),
+            Backend::Cuda(d) => d.room_for(card, live),
         }
     }
 
@@ -427,10 +425,6 @@ impl Backend {
 }
 
 
-/// Solves one card will hold, however small they turn out to be. The real
-/// bound is `Backend::has_room`, which is bytes; this is the last resort.
-const MAX_IN_FLIGHT: usize = 1024;
-
 /// Solves the CPU reference serves at once. It keeps nothing on a card, so
 /// there is no level to measure and nothing but a count to bound it by.
 const REFERENCE_IN_FLIGHT: usize = 64;
@@ -442,21 +436,28 @@ const REFERENCE_IN_FLIGHT: usize = 64;
 /// all here too. A farm that admitted on the card's level alone filled the host
 /// instead, and the run was killed with no message but the exit code.
 ///
-/// The whole process, not the farm's share of it. The replay buffer and the
-/// trainer are in this address space as well, and they grow over a run.
+/// The card can project -- it knows what one solve's arenas come to, so it can
+/// ask what the population will hold rather than what it holds (see
+/// `Device::room_for`). The host cannot: a solve's cost here is spread over the
+/// tree, the states and a shared contract, and there is no cheap figure for it.
+/// So this bounds the overshoot instead of measuring it. Admission is paced one
+/// solve per solve finished, and a population that grows by its own size over
+/// one solve's life passes the level it stopped admitting at by a factor of
+/// `e` -- so stopping at `SOLVE_SHARE / e` ends at `SOLVE_SHARE`.
 #[cfg(target_os = "linux")]
 fn host_room() -> bool {
-    /// Tenths of the machine's memory this process may hold before it stops
-    /// admitting.
+    /// How much of the machine the solves in flight may grow into.
     ///
-    /// The rest is headroom, and most of it is for the solves already
-    /// admitted: they are still growing when admission stops, and a population
-    /// paced by its own completions passes the figure it stopped on by a factor
-    /// of `e`. The replay buffer, which grows over a run, and the allocator's
-    /// own retained pages, which inflate what this reads, are inside the same
-    /// margin. Measured on a 62 GB box, two tenths admits until the process
-    /// holds 12 GB and the population settles around 34.
-    const SHARE: u64 = 2;
+    /// The only number in this bound, and it says what it means: half the
+    /// memory is for the search, and the other half is for the trainer, the
+    /// replay buffer, the allocator's retained pages and whatever else shares
+    /// the box.
+    ///
+    /// What would make it wrong is anything that takes more than the other
+    /// half. The replay buffer at its cap is the one that grows over a run,
+    /// and it is a few gigabytes; a second training process on the same box is
+    /// the one that would not show up here at all.
+    const SOLVE_SHARE: f64 = 0.5;
     let field = |path: &str, at: usize| -> Option<u64> {
         std::fs::read_to_string(path)
             .ok()?
@@ -468,7 +469,7 @@ fn host_room() -> bool {
     // `statm` is in pages and `meminfo`'s first field is `MemTotal:` in kB.
     let rss = field("/proc/self/statm", 1).unwrap_or(0) * 4096;
     let total = field("/proc/meminfo", 1).unwrap_or(u64::MAX / 1024) * 1024;
-    rss < total / 10 * SHARE
+    (rss as f64) * std::f64::consts::E < SOLVE_SHARE * total as f64
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -893,8 +894,7 @@ fn drive_card(
         // to finish before a worker can leave, and a fresh one would be a whole
         // solve of that wait for rows nobody will collect.
         let paid = live <= done.load(Ordering::Relaxed);
-        let room =
-            paid && live < MAX_IN_FLIGHT && host_room() && backend.read().has_room(card, live);
+        let room = paid && host_room() && backend.read().has_room(card, live);
         if !ready.closed() && (live == 0 || room) {
             let mut source = Source::new(
                 work,

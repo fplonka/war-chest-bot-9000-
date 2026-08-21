@@ -318,9 +318,21 @@ fn owed_by_the_join(l: &NetLayout, b: &[f32]) -> Vec<f32> {
     out
 }
 
-/// What a round's own intermediates and the allocator's spare blocks take,
-/// beside the solve arenas a card's budget counts. Every stream of an ordinal
-/// has its own set of them.
+/// Card memory that is never admitted against, per ordinal.
+///
+/// Two things live in it. A round's own intermediates -- hundreds of megabytes,
+/// four hundred of them for the join head alone at a large round -- which every
+/// stream of an ordinal has its own set of. And the blocks the stream-ordered
+/// allocator keeps back between one solve and the next, which is the larger
+/// half and the reason this cannot be measured instead: a freed arena goes to a
+/// pool rather than to the driver, so `mem_get_info` reports the pool as taken
+/// and the card as full while most of it is available to the next solve.
+///
+/// What would make it wrong: a round whose intermediates grow -- a wider join
+/// head, a larger `TILE`, more streams an ordinal -- or a pool that fragments
+/// worse than `grow_to`'s size classes allow, so that blocks pile up unusable.
+/// Both show in `leaf_breakdown`'s census: the card's free memory falls while
+/// the solve arenas do not.
 const ROUND_RESERVE: u64 = 6 << 30;
 
 /// Leaf rows a pass works on at once.
@@ -926,15 +938,17 @@ struct Card {
     nb: CudaSlice<i32>,
     /// Device bytes this card's solve arenas may hold.
     ///
-    /// Whatever it had free when the backend came up, less a reserve for the
-    /// round's own intermediates -- hundreds of megabytes, four hundred of them
-    /// for the join head alone at a large round -- and for the blocks the
-    /// stream-ordered allocator keeps back between one solve and the next.
+    /// Whatever it had free when the backend came up, less `ROUND_RESERVE`,
+    /// shared out between the streams of its ordinal.
     ///
     /// Measured rather than configured. A solve's cost varies twenty-six fold
     /// with how far into a game its root sits, so no count of threads describes
     /// what fits, and a run that guesses either wastes the card or fills it.
     budget: u64,
+    /// The most any one solve on this card has ever held. `room_for` projects
+    /// the population at it, which is what keeps admission from lagging behind
+    /// arenas that are still filling.
+    peak: std::sync::atomic::AtomicU64,
     /// What the join's residual stream is owed.
     ///
     /// Every block of the join adds its matrix multiply's bias to the same
@@ -978,18 +992,24 @@ impl Device {
         self.cards.len()
     }
 
-    /// Device bytes this card's solve arenas hold right now.
+    /// Whether this card can take another solve beside the `live` it holds.
     ///
-    /// A level rather than a rate. How many solves are in flight is what the
-    /// generation rate is linear in, and this is the ceiling on it: a full card
-    /// is where the rate stops being a function of anything else.
-    pub fn held(&self, card: usize) -> u64 {
-        self.cards[card].solves.lock().iter().map(|s| s.bytes() as u64).sum()
-    }
-
-    /// What one card's solve arenas may hold.
-    pub fn budget(&self, card: usize) -> u64 {
-        self.cards[card].budget
+    /// Not the level against the ceiling. A solve's arenas fill over its whole
+    /// run, so what a population holds now is what a younger one held, and
+    /// admitting on that overshoots by whatever the solves already in flight
+    /// grow in the meantime. This projects instead: every solve in flight, and
+    /// the one being asked about, at the largest a solve on this card has ever
+    /// reached. Nothing that is already admitted can then surprise it.
+    ///
+    /// The peak is nought until the first solve has grown, and the answer is
+    /// yes until it has. What makes that safe is the farm's pacing: it admits
+    /// one solve per solve *finished*, so the second is admitted only once the
+    /// first has run its whole life and the peak is a real one.
+    pub fn room_for(&self, card: usize, live: usize) -> bool {
+        let c = &self.cards[card];
+        let widest = c.solves.lock().iter().map(|s| s.bytes() as u64).max().unwrap_or(0);
+        let peak = widest.max(c.peak.fetch_max(widest, std::sync::atomic::Ordering::Relaxed));
+        (live as u64 + 1) * peak <= c.budget
     }
 
     /// How many cards the driver can see.
@@ -1159,6 +1179,7 @@ impl Card {
             blas,
             k,
             budget,
+            peak: std::sync::atomic::AtomicU64::new(0),
             solves: parking_lot::Mutex::new(Vec::new()),
             host: parking_lot::Mutex::new(Stage::default()),
             pack: parking_lot::Mutex::new(Pack::default()),
