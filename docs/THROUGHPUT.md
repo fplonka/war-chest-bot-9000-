@@ -394,6 +394,45 @@ consequences for what gets searched:
   it could hold the *mean* rather than the maximum. It also decides which
   solves run when, so it needs care not to bias what the trainer sees.
 
+## The arithmetic that decides whether 150 is reachable
+
+nsys puts kernel-busy at 1.32 card-seconds a wall second, and the farm at 32
+solves a second. So **a solve costs 41 ms of card time**. At 150 solves a
+second that is 6.15 card-seconds a second, and two 3090s supply two.
+
+> Device work a solve has to reach **13.3 ms** -- a factor of 3.1 -- before
+> 150 is arithmetically possible, whatever the host does.
+
+That is the constraint. Everything host-side in this ledger is necessary and
+none of it is sufficient.
+
+**And the device profile is flat, which is the hard part.** `k_trunk` is the
+largest single kernel at 24%, so an ablation says how much of it is worth
+attacking: with its three inner products skipped it runs 1,488 us against
+3,557. The matrix multiplies are 58% of it and the elementwise half -- norms,
+gelu, the pooled reduction, the group bias, the neighbour gather and the
+barriers between them -- is the other 42%, and no amount of tensor core
+touches that. Perfect FP16 GEMMs take the trunk from 24% of device time to
+about 13.5, and a solve from 41 ms to 37.
+
+So there is no single change that gets 3.1x. The table after the trunk is
+`k_readout` 20%, `k_backprop_sweep` 18%, the join's `ampere_sgemm` 13%,
+`k_belief_pool` 12%, `k_reach_sweep` 9%, `k_norm` 6%. Reaching 13.3 ms means
+roughly halving *all* of them:
+
+* the two gathers (32%) are at two thirds of the card's bandwidth and want
+  half-precision storage, which is blocked on making the config encoder
+  deterministic -- see the abandoned note;
+* the join (19% with its norms) wants fusing and then FP16, and fusing it is
+  also what makes it batch-independent enough for FP16 to be safe;
+* the sweeps (27%) are forty-four times off their bandwidth roof and want
+  fewer dependent loads a cell;
+* the trunk (24%) wants FP16 for its GEMMs and something better than
+  barriers for its elementwise half.
+
+That is a coordinated programme across six kernels, not a find. It is worth
+saying plainly rather than discovering it one disappointment at a time.
+
 ## What is left, in order
 
 There is no single item worth more than about 1.2x left. The profile is flat on
