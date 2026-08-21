@@ -258,6 +258,36 @@ ssh leaves the python holding the cards, and the next run dies with
 launch box work under `setsid nohup` and kill it by name. And a memory reading
 taken during that teardown is not a measurement of anything.
 
+## What the memory actually is
+
+`tools/farmprobe.py` prints the fattest solve a card held, array by array, off
+`warchest.solve_census()`. Two captures at ten and twelve cohorts:
+
+```
+179.2 MB: vals=16.8  p=8.4  f=8.4  cidx=8.4  reach=8.4  cur=8.4  regret=8.4 ...
+354.8 MB: reach=33.6 vals=33.6 f=16.8 cidx=16.8 cur=16.8 regret=16.8 ...
+```
+
+Against a mean of 65 MB. **The ceiling is set by the tail, and the tail is
+five-fold.** It is not waste: `reach` and `vals` are per (node, player, config)
+and per (node, config, traverser), so what makes a solve fat is the *width of
+its belief*, which `config_cap` bounds at 256 a player a node. The comment in
+the gate already said it -- "a round-start position with a broad belief is
+worth many ordinary ones" -- and this is the same fact costing memory rather
+than time.
+
+So there are two ways to raise solves in flight, and only the second is free of
+consequences for what gets searched:
+
+* Narrower arrays. The eight float arenas are 168 MB of that 355. Half of them
+  accumulate across a solve's sixty-four iterations -- `sum`, `regret` -- so
+  half precision is a question about CFR convergence, not just about bytes.
+* Admission control. Every slot is equal today, so one slot drawing a broad
+  root costs eight ordinary ones, and the card has to be sized for all of them
+  drawing one at once. A farm that knew a solve's belief width before admitting
+  it could hold the *mean* rather than the maximum. It also decides which
+  solves run when, so it needs care not to bias what the trainer sees.
+
 ## What is left, in order
 
 There is no single item worth more than about 1.2x left. The profile is flat on
