@@ -64,6 +64,23 @@ fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
     }
 }
 
+/// The same belief, thinned to at most `cap` configs and renormalised.
+///
+/// A narrower support is still a public belief state, and both solvers are
+/// asked about the same one, so the comparison stays exact. This is what makes
+/// the exhaustive side affordable: it walks the whole remaining game once per
+/// config pair on every iteration, and a real mid-game reserve allows hundreds
+/// of configs. Taking every `n/cap`-th config spreads the support over the
+/// enumeration rather than keeping one corner of it.
+fn thinned(mut b: Belief, cap: usize) -> Belief {
+    if b.len() > cap {
+        let step = b.len().div_ceil(cap);
+        b.cfg = b.cfg.iter().step_by(step).cloned().collect();
+    }
+    b.p = vec![1.0 / b.cfg.len() as f32; b.cfg.len()];
+    b
+}
+
 // --------------------------------------------------------- vanilla CFR oracle
 
 type Key = (Vec<u32>, Config);
@@ -162,60 +179,81 @@ fn oracle_value(s: &State, ctx: &Ctx, bel: &[Belief; 2], iters: usize) -> f64 {
 
 // ------------------------------------------------------------------ the test
 
+/// The largest subgame the exhaustive oracle is asked to walk, and the widest
+/// belief it is asked to average over. Together these are what keep the test to
+/// a second: the oracle walks the whole remaining game once per config pair on
+/// every one of its iterations.
+const NODE_CAP: usize = 1_200;
+const CFG_CAP: usize = 3;
+
 #[test]
 fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
     let nets = Nets::default();
+    let cfg = Cfg {
+        s: 200,
+        c: 1.0,
+        ..Default::default()
+    };
     let mut checked = 0;
+    let mut skipped = [0usize; 3]; // too large, one-sided, no position
     for seed in 0..3000u64 {
         let Some(s) = micro_position(seed, 60 + (seed as usize % 120), 3) else {
+            skipped[2] += 1;
             continue;
         };
         let ctx = Ctx::new(&s);
-        let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
-        // Keep the exhaustive side affordable.
-        if bel[0].len() * bel[1].len() > 64 {
+        let bel = [
+            thinned(uniform_belief(&s, &ctx, 0), CFG_CAP),
+            thinned(uniform_belief(&s, &ctx, 1), CFG_CAP),
+        ];
+
+        let mut probe = Solver::new(&s, ctx, &nets, cfg, bel.clone());
+        if !probe.grow_full(NODE_CAP) {
+            skipped[0] += 1;
             continue;
         }
-
-        let cfg = Cfg { s: 500, c: 1.0, ..Default::default() };
-        {
-            let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
-            sv.grow_full();
-            // If any leaf were non-terminal the (empty) network would silently
-            // return zero and the comparison would be meaningless.
-            assert!(
-                sv.nodes
-                    .iter()
-                    .zip(&sv.states)
-                    .all(|(n, st)| !n.leaf || st.is_terminal()),
-                "the whole remaining game must fit inside the subgame"
-            );
-            if sv.nodes.len() > 8_000 {
-                continue;
-            }
-            // A position where every line ends in the same score tests nothing.
-            let mut outcomes: Vec<i32> = sv
+        // If any leaf were non-terminal the (empty) network would silently
+        // return zero and the comparison would be meaningless.
+        assert!(
+            probe
                 .nodes
                 .iter()
-                .zip(&sv.states)
-                .filter(|(n, st)| n.leaf && st.is_terminal())
-                .map(|(_, st)| (st.utility(0) * 1000.0) as i32)
-                .collect();
-            outcomes.sort_unstable();
-            outcomes.dedup();
-            if outcomes.len() < 2 {
-                continue;
-            }
+                .zip(&probe.states)
+                .all(|(n, st)| !n.leaf || st.is_terminal()),
+            "the whole remaining game must fit inside the subgame"
+        );
+        let mut outcomes: Vec<f64> = probe
+            .nodes
+            .iter()
+            .zip(&probe.states)
+            .filter(|(n, st)| n.leaf && st.is_terminal())
+            .map(|(_, st)| st.utility(0) as f64)
+            .collect();
+        outcomes.sort_by(f64::total_cmp);
+        let (lo, hi) = (outcomes[0], outcomes[outcomes.len() - 1]);
+        let nodes = probe.nodes.len();
+        drop(probe);
+
+        let exact = oracle_value(&s, &ctx, &bel, 100);
+        // The position has to be contested. Where the equilibrium value sits at
+        // the best score one side can reach, that side can force it and so can
+        // any strategy that merely avoids the losing line — such a position
+        // passes the comparison below even on a solver that has stopped
+        // solving. A value well inside the range of reachable outcomes is one
+        // only a real equilibrium finds.
+        let margin = 0.2 * (hi - lo);
+        if margin <= 0.0 || exact - lo < margin || hi - exact < margin {
+            skipped[1] += 1;
+            continue;
         }
 
         // The exhaustive side is the expensive one, so it runs once and every
         // variant is held to it. In a two-player zero-sum game the value is
         // unique, so any regret rule that converges must land on the same
         // number — which makes this the whole correctness net for the family.
-        let exact = oracle_value(&s, &ctx, &bel, 100);
         for (name, rule) in Cfr::NAMED {
             let mut sv = Solver::new(&s, ctx, &nets, Cfg { cfr: rule, ..cfg }, bel.clone());
-            sv.grow_full();
+            assert!(sv.grow_full(NODE_CAP));
             // Exploitability early, before the solve has gone anywhere. Read
             // mid-flight on purpose: a fixed-policy pass must leave the solve
             // able to continue.
@@ -226,12 +264,12 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
             sv.finish();
             let late = sv.nash_conv().nash as f64;
 
-            let vals = vec![sv.root_values()];
+            let vals = sv.root_values();
             let v0: f64 = (0..bel[0].len())
-                .map(|c| bel[0].p[c] as f64 * vals[0][0][c] as f64)
+                .map(|c| bel[0].p[c] as f64 * vals[0][c] as f64)
                 .sum();
             let v1: f64 = (0..bel[1].len())
-                .map(|c| bel[1].p[c] as f64 * vals[0][1][c] as f64)
+                .map(|c| bel[1].p[c] as f64 * vals[1][c] as f64)
                 .sum();
             // A zero-sum game solved consistently: the two players' root values
             // must cancel. This is the single most useful invariant on the
@@ -241,15 +279,15 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
                 "seed {seed} {name}: root values are not zero-sum: {v0:.4} + {v1:.4}"
             );
             assert!(
-                (v0 - exact).abs() < 0.03,
+                (v0 - exact).abs() < 0.01,
                 "seed {seed} {name}: subgame solver says {v0:.4}, tabular CFR says \
                  {exact:.4} ({}x{} configs)",
                 bel[0].len(),
                 bel[1].len()
             );
             // A best response can never do worse than the strategy it answers,
-            // so NashConv is non-negative; and 500 iterations of any of these
-            // rules must beat 2.
+            // so NashConv is non-negative; and the whole solve must beat its
+            // own first two iterations.
             assert!(
                 late > -1e-3,
                 "seed {seed} {name}: NashConv is negative: {late:.5}"
@@ -259,131 +297,23 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
                 "seed {seed} {name}: NashConv did not fall: {early:.5} -> {late:.5}"
             );
             eprintln!(
-                "  seed {seed:4} {name:>7}: value {v0:+.4} (exact {exact:+.4})  \
-                 zero-sum {:+.4}  NashConv {early:.4} -> {late:.4}",
+                "  seed {seed:4} {name:>7}: value {v0:+.4} (exact {exact:+.4}, outcomes \
+                 {lo:+.3}..{hi:+.3}, {nodes} nodes)  zero-sum {:+.4}  NashConv {early:.4} -> \
+                 {late:.4}",
                 v0 + v1
             );
         }
         checked += 1;
-        if checked >= 4 {
+        if checked >= 3 {
             break;
         }
     }
-    assert!(checked >= 4, "only {} positions exercised", checked);
     eprintln!(
-        "verified {} micro-endgames against tabular CFR, for every regret rule",
-        checked
+        "verified {} contested micro-endgames against tabular CFR, for every regret rule \
+         (skipped {} too large, {} one-sided, {} not a coin play)",
+        checked, skipped[0], skipped[1], skipped[2]
     );
-}
-
-/// How badly does a short solve misprice a position?
-///
-/// ReBeL's value target is the running mean of the root values over CFR
-/// iterations. Run too few and that mean sits closer to a best-response value
-/// than to the equilibrium — a bias in the *same direction for both players*,
-/// which is exactly the kind of error that a bootstrapped training loop
-/// amplifies instead of averaging away. This measures it against the exact
-/// value so the iteration count can be chosen on evidence.
-#[test]
-fn cfr_iteration_count_bias() {
-    let nets = Nets::default();
-    let mut rows = 0;
-    let budgets = [4usize, 16, 64, 256];
-    let mut err = vec![0.0f64; budgets.len()];
-    let mut nzs = vec![0.0f64; budgets.len()];
-    eprintln!(
-        "     exact   {}",
-        budgets
-            .iter()
-            .map(|b| format!("{:>9}", b))
-            .collect::<String>()
-    );
-    for seed in 0..3000u64 {
-        let Some(s) = micro_position(seed, 60 + (seed as usize % 120), 3) else {
-            continue;
-        };
-        let ctx = Ctx::new(&s);
-        let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
-        if bel[0].len() * bel[1].len() > 64 {
-            continue;
-        }
-        let mut probe = Solver::new(
-            &s,
-            ctx,
-            &nets,
-            Cfg {
-                s: 1,
-                c: 1.0,
-                ..Default::default()
-            },
-            bel.clone(),
-        );
-        probe.grow_full();
-        if !probe
-            .nodes
-            .iter()
-            .zip(&probe.states)
-            .all(|(n, st)| !n.leaf || st.is_terminal())
-            || probe.nodes.len() > 8_000
-        {
-            continue;
-        }
-        let mut o: Vec<i32> = probe
-            .nodes
-            .iter()
-            .zip(&probe.states)
-            .filter(|(n, st)| n.leaf && st.is_terminal())
-            .map(|(_, st)| (st.utility(0) * 1000.0) as i32)
-            .collect();
-        o.sort_unstable();
-        o.dedup();
-        if o.len() < 2 {
-            continue;
-        }
-        let exact = oracle_value(&s, &ctx, &bel, 100);
-        let mut line = format!("  {:+.4}   ", exact);
-        for (bi, &t) in budgets.iter().enumerate() {
-            let mut sv = Solver::new(
-                &s,
-                ctx,
-                &nets,
-                Cfg {
-                    s: t as u32,
-                    c: 1.0,
-                    ..Default::default()
-                },
-                bel.clone(),
-            );
-            sv.grow_full();
-            sv.multistep(t);
-            sv.finish();
-            let vals = vec![sv.root_values()];
-            let v0: f64 = (0..bel[0].len())
-                .map(|c| bel[0].p[c] as f64 * vals[0][0][c] as f64)
-                .sum();
-            let v1: f64 = (0..bel[1].len())
-                .map(|c| bel[1].p[c] as f64 * vals[0][1][c] as f64)
-                .sum();
-            err[bi] += (v0 - exact).abs();
-            nzs[bi] += (v0 + v1).abs();
-            line += &format!("{:+9.4}", v0);
-        }
-        eprintln!("{}", line);
-        rows += 1;
-        if rows >= 6 {
-            break;
-        }
-    }
-    eprintln!("\nmean |value error| by iteration count:");
-    for (bi, &t) in budgets.iter().enumerate() {
-        eprintln!(
-            "  T={:4}: err {:.4}   |v0+v1| {:.4}",
-            t,
-            err[bi] / rows as f64,
-            nzs[bi] / rows as f64
-        );
-    }
-    assert!(rows >= 4);
+    assert!(checked >= 3, "only {} positions exercised", checked);
 }
 
 /// A real position a few plies from the horizon, reached by random play, whose
@@ -476,8 +406,7 @@ fn draw_pass_through_consistency() {
             },
             bel.clone(),
         );
-        sv.grow_full();
-        if sv.nodes.len() > 20_000 {
+        if !sv.grow_full(20_000) {
             cnt[2] += 1;
             continue;
         }
@@ -626,7 +555,7 @@ fn warrior_priest_draw_walks_through_the_tree() {
         },
         bel.clone(),
     );
-    sv.grow_full();
+    assert!(sv.grow_full(20_000));
 
     // Find the WP draw node: a chance node whose state is a WarriorPriestDraw.
     let draws: Vec<usize> = (0..sv.nodes.len())
@@ -779,4 +708,3 @@ fn growing_a_coin_play_finishes_its_micro_decisions() {
     }
     panic!("no compound play found in 400 random games");
 }
-

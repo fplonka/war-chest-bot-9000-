@@ -475,9 +475,10 @@ pub struct TNode {
     pub player: u8,
     pub leaf: bool,
     /// Whether growth may still turn this leaf into a decision node. False
-    /// past the draw that starts the next round, and false for a leaf whose
-    /// own expansion was abandoned. Such a leaf is priced by the value
-    /// network, which is what every other leaf gets anyway.
+    /// past the draw that starts the next round, false for a leaf whose own
+    /// expansion was abandoned, and false for a terminal, which has nothing to
+    /// grow. Such a leaf is priced by the value network -- or, at a terminal,
+    /// by the game -- which is what every other leaf gets anyway.
     pub expandable: bool,
     /// Draw pass-through node: the public tree does not branch, there is one
     /// public child, and the drawing player's configs transition through the
@@ -1061,7 +1062,7 @@ impl<'a> Solver<'a> {
             util: if terminal { s.utility(player as usize) } else { 0.0 },
             player,
             leaf: true,
-            expandable: true,
+            expandable: !terminal,
             chance: false,
             draw: DrawMap::default(),
             draw_steps: 0,
@@ -2642,20 +2643,26 @@ impl<'a> Solver<'a> {
         !self.nodes[leaf].leaf
     }
 
-    /// Grow the whole subgame, until nothing is left to expand.
+    /// Grow the whole subgame, and say whether it fitted in `cap` nodes.
     ///
     /// Production never does this — the point of growing is to *not* build the
     /// whole tree. It exists for the tests and sizing tools that need the
-    /// complete subgame of a small endgame, which is what the old fixed depth
-    /// limit gave them when the limit was larger than the game.
-    pub fn grow_full(&mut self) {
+    /// complete subgame of a small endgame. A real mid-game position is not
+    /// one of those and its subgame runs to millions of nodes, so the bound is
+    /// the caller's way of asking for the subgame only if it is small: a
+    /// `false` means the tree it now holds is a partial one.
+    pub fn grow_full(&mut self, cap: usize) -> bool {
         let mut at = 0usize;
         while at < self.nodes.len() {
+            if self.nodes.len() > cap {
+                return false;
+            }
             if self.nodes[at].leaf && self.nodes[at].expandable {
                 self.expand(at);
             }
             at += 1;
         }
+        true
     }
 
     /// The root's per-config values under the reference strategy — the target

@@ -762,6 +762,51 @@ mod policy_target_tests {
         crate::net::Net::from_flat(&w, &b, &ln).expect("random net")
     }
 
+    /// The uniform belief over every config a seat could be holding.
+    fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
+        let truth = true_config(s, p, ctx);
+        let cfg = enumerate_configs(
+            &reserve(s, p, ctx),
+            truth.hand_size(),
+            truth.fd_size(),
+            truth.inflight.is_some(),
+        );
+        let n = cfg.len() as f32;
+        Belief { p: vec![1.0 / n; cfg.len()], cfg }
+    }
+
+    /// A few real coin plays, reached by random play, each with the uniform
+    /// belief over both seats.
+    ///
+    /// Taking roots from self-play instead would play whole games to keep three
+    /// of their queries, and a game is up to 256 plies with a solve at each.
+    /// What this test checks is how a solved root is stored, so any real root
+    /// will do.
+    fn positions(seed: u64, want: usize) -> Vec<(State, [Belief; 2])> {
+        let mut out = Vec::new();
+        for i in 0..64 {
+            if out.len() == want {
+                break;
+            }
+            let mut rng = Rng::new(seed + i);
+            let mut s = make_game(&mut rng, true);
+            for _ in 0..8 {
+                if s.is_terminal() {
+                    break;
+                }
+                let acts = s.legal_actions();
+                s.apply_inplace(acts[rng.below(acts.len())]);
+            }
+            if s.is_terminal() || s.is_chance() || !matches!(s.pending(), Cont::MainPlay) {
+                continue;
+            }
+            let ctx = Ctx::new(&s);
+            let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
+            out.push((s, bel));
+        }
+        out
+    }
+
     /// A stored row's policy target must be the solve's own root average: one
     /// row per acting config, summing to one, over the actions that config can
     /// actually play.
@@ -778,16 +823,7 @@ mod policy_target_tests {
             gate: None,
         };
         let cfg = Cfg { s: 32, c: 4.0, ..Default::default() };
-        let gc = GameCfg {
-            agents: [Agent::Sog { cfg }; 2],
-            collect: Collect::Sog,
-            explore: 0.1,
-            random_draft: true,
-            p_td1: 0.0,
-            query_rate: 0.9,
-            recursive_rate: 0.1,
-        };
-        let roots = collect_roots(2, 3, &nets, &gc, 3);
+        let roots = positions(0x5EED, 3);
         assert!(!roots.is_empty(), "no roots to test against");
 
         let mut rng = Rng::new(0x9017);
