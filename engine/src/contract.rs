@@ -131,6 +131,44 @@ impl Contract {
         self.kind.len()
     }
 
+    /// Host bytes this description holds. The farm admits solves against it.
+    pub fn bytes(&self) -> usize {
+        let u = |v: &Vec<u32>| v.capacity() * 4;
+        self.nc.capacity() * 8
+            + self.kind.capacity()
+            + self.player.capacity()
+            + u(&self.parent)
+            + u(&self.exhausted)
+            + u(&self.level)
+            + u(&self.roff)
+            + u(&self.voff)
+            + u(&self.soff)
+            + self.util.capacity() * 4
+            + u(&self.child_at)
+            + u(&self.child_n)
+            + u(&self.child)
+            + u(&self.legal_base)
+            + u(&self.legal_off)
+            + u(&self.legal_child)
+            + u(&self.legal_trans)
+            + u(&self.cell_row)
+            + u(&self.cell_val)
+            + u(&self.rev_base)
+            + u(&self.rev_start)
+            + u(&self.rev_src)
+            + u(&self.rev_cell)
+            + u(&self.draw_base)
+            + u(&self.draw_start)
+            + u(&self.draw_to)
+            + self.draw_p.capacity() * 4
+            + u(&self.rvd_base)
+            + u(&self.rvd_start)
+            + u(&self.rvd_src)
+            + self.rvd_p.capacity() * 4
+            + u(&self.level_start)
+            + u(&self.level_node)
+    }
+
     /// Everything the card has yet to be told about this tree.
     ///
     /// `from` is the first node whose row may have changed -- the earliest leaf
@@ -774,15 +812,15 @@ mod tests {
                 // straight after re-propagating the tree as it now stands.
                 sv.precompute_reaches();
                 let c = Contract::of(&sv);
-                let mut got = vec![0.0f32; sv.reach.len()];
+                let mut got = vec![0.0f32; sv.cfr().reach.len()];
                 let root = [&sv.root_belief[0].p[..], &sv.root_belief[1].p[..]];
                 c.reach(root, &sv.cur, &mut got);
                 assert_eq!(
                     got.len(),
-                    sv.reach.len(),
+                    sv.cfr().reach.len(),
                     "reach arena length disagrees at iteration {t}"
                 );
-                for (i, (a, b)) in got.iter().zip(sv.reach.iter()).enumerate() {
+                for (i, (a, b)) in got.iter().zip(sv.cfr().reach.iter()).enumerate() {
                     assert_eq!(
                         a.to_bits(),
                         b.to_bits(),
@@ -852,31 +890,31 @@ mod tests {
                             sv.catch_up();
                             sv.leaf_values(p);
                             let (mut vals, mut cur, mut regret) =
-                                (sv.vals.clone(), sv.cur.clone(), sv.regret.clone());
+                                (sv.cfr().vals.clone(), sv.cur.clone(), sv.cfr().regret.clone());
                             let mut sum = vec![0.0f32; sv.ncells];
                             for i in 0..sv.nodes.len() {
                                 let so = sv.soff[i] as usize;
-                                let row = &sv.sum_strat[i];
+                                let row = &sv.cfr().sum_strat[i];
                                 sum[so..so + row.len()].copy_from_slice(row);
                             }
-                            let mut qv = sv.qval.clone();
+                            let mut qv = sv.cfr().qval.clone();
                             c.backprop(
                                 p, k, fs, &mut vals, &mut cur, &mut regret, &mut sum, &mut qv,
                             );
-                            sv.vals = vals;
+                            sv.cfr_mut().vals = vals;
                             sv.cur = cur;
-                            sv.regret = regret;
-                            sv.qval = qv;
+                            sv.cfr_mut().regret = regret;
+                            sv.cfr_mut().qval = qv;
                             for i in 0..sv.nodes.len() {
                                 let so = sv.soff[i] as usize;
-                                let n = sv.sum_strat[i].len();
-                                sv.sum_strat[i].copy_from_slice(&sum[so..so + n]);
+                                let n = sv.cfr().sum_strat[i].len();
+                                sv.cfr_mut().sum_strat[i].copy_from_slice(&sum[so..so + n]);
                             }
                         }
                         let root = [&sv.root_belief[0].p[..], &sv.root_belief[1].p[..]];
-                        let mut out = vec![0.0f32; sv.reach.len()];
+                        let mut out = vec![0.0f32; sv.cfr().reach.len()];
                         c.reach(root, &sv.cur, &mut out);
-                        sv.reach = out;
+                        sv.cfr_mut().reach = out;
                         sv.avg_block();
                         sv.steps[0] += 1;
                         sv.steps[1] += 1;
@@ -892,7 +930,7 @@ mod tests {
                     let _ = t;
                 }
                 sv.finish();
-                (sv.avg.clone(), sv.cur.clone(), sv.regret.clone())
+                (sv.avg.clone(), sv.cur.clone(), sv.cfr().regret.clone())
             };
             let (a_avg, a_cur, a_reg) = run(false);
             let (b_avg, b_cur, b_reg) = run(true);
@@ -1228,7 +1266,7 @@ mod tests {
                 }
 
                 let root = [&sv.root_belief[0].p[..], &sv.root_belief[1].p[..]];
-                let (mut ra, mut rb) = (vec![0.0; sv.reach.len()], vec![0.0; sv.reach.len()]);
+                let (mut ra, mut rb) = (vec![0.0; sv.cfr().reach.len()], vec![0.0; sv.cfr().reach.len()]);
                 inc.reach(root, &sv.cur, &mut ra);
                 full.reach(root, &sv.cur, &mut rb);
                 for (k, (x, y)) in ra.iter().zip(&rb).enumerate() {
@@ -1240,7 +1278,7 @@ mod tests {
                 let mut sum = vec![0.0f32; sv.ncells];
                 let run = |c: &Contract| {
                     let (mut v, mut cu, mut rg, mut sm) =
-                        (sv.vals.clone(), sv.cur.clone(), sv.regret.clone(), sum.clone());
+                        (sv.cfr().vals.clone(), sv.cur.clone(), sv.cfr().regret.clone(), sum.clone());
                     let mut qv = vec![0.0f32; sv.ncells];
                     c.backprop(0, k, fs, &mut v, &mut cu, &mut rg, &mut sm, &mut qv);
                     (v, cu, rg, sm)
@@ -1332,10 +1370,10 @@ mod tests {
                 sv.catch_up();
                 sv.leaf_values(traverser);
                 let snap = (
-                    sv.vals.clone(),
+                    sv.cfr().vals.clone(),
                     sv.cur.clone(),
-                    sv.regret.clone(),
-                    sv.sum_strat.clone(),
+                    sv.cfr().regret.clone(),
+                    sv.cfr().sum_strat.clone(),
                 );
                 let k = sv.cfg.cfr;
                 let m = sv.steps[traverser] as f32 + 1.0;
@@ -1347,26 +1385,26 @@ mod tests {
 
                 sv.backprop(traverser, &[], Back::Regret);
                 let want = (
-                    sv.vals.clone(),
+                    sv.cfr().vals.clone(),
                     sv.cur.clone(),
-                    sv.regret.clone(),
-                    sv.sum_strat.clone(),
+                    sv.cfr().regret.clone(),
+                    sv.cfr().sum_strat.clone(),
                 );
 
                 // Put the solver back and run the contract over the same state.
-                sv.vals = snap.0;
+                sv.cfr_mut().vals = snap.0;
                 sv.cur = snap.1;
-                sv.regret = snap.2;
-                sv.sum_strat = snap.3;
+                sv.cfr_mut().regret = snap.2;
+                sv.cfr_mut().sum_strat = snap.3;
                 let c = Contract::of(&sv);
                 let mut sum = vec![0.0f32; sv.ncells];
                 for i in 0..sv.nodes.len() {
                     let so = sv.soff[i] as usize;
-                    let row = &sv.sum_strat[i];
+                    let row = &sv.cfr().sum_strat[i];
                     sum[so..so + row.len()].copy_from_slice(row);
                 }
                 let (mut vals, mut cur, mut regret) =
-                    (sv.vals.clone(), sv.cur.clone(), sv.regret.clone());
+                    (sv.cfr().vals.clone(), sv.cur.clone(), sv.cfr().regret.clone());
                 let mut qv = vec![0.0f32; sv.ncells];
                 c.backprop(
                     traverser, k, fs, &mut vals, &mut cur, &mut regret, &mut sum, &mut qv,
@@ -1393,13 +1431,13 @@ mod tests {
                 }
                 // Restore what the comparison consumed, so the next iteration
                 // continues the same solve rather than a diverged one.
-                sv.vals = vals;
+                sv.cfr_mut().vals = vals;
                 sv.cur = cur;
-                sv.regret = regret;
+                sv.cfr_mut().regret = regret;
                 for i in 0..sv.nodes.len() {
                     let so = sv.soff[i] as usize;
-                    let n = sv.sum_strat[i].len();
-                    sv.sum_strat[i].copy_from_slice(&sum[so..so + n]);
+                    let n = sv.cfr().sum_strat[i].len();
+                    sv.cfr_mut().sum_strat[i].copy_from_slice(&sum[so..so + n]);
                 }
                 sv.steps[traverser] += 1;
                 checked += 1;

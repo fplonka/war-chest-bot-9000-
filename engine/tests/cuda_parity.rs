@@ -393,7 +393,7 @@ fn growth_is_the_same_rule_as_the_reference() {
                 "solve {i}: the reference and the card sampled different leaves"
             );
             assert_eq!(
-                &live[i].visits[..got.visits.len()],
+                &live[i].cfr().visits[..got.visits.len()],
                 &got.visits[..],
                 "solve {i}: the trajectories passed through different cells"
             );
@@ -746,7 +746,7 @@ fn the_resident_state_agrees_with_the_cpu_network() {
         ("f(c)", &host.cf[..], &got.f[..]),
         ("g(c)", &host.cg[..], &got.g[..]),
         ("f_p(c)", &host.cp[..], &got.fp[..]),
-        ("prior", &host.prior[..cells], &got.prior[..cells]),
+        ("prior", &host.cfr().prior[..cells], &got.prior[..cells]),
     ] {
         let bad = worst(h, c, what);
         eprintln!("{what}: worst {bad:e} over {} values", h.len());

@@ -518,6 +518,11 @@ pub struct DrawMap {
 }
 
 impl DrawMap {
+    /// Host bytes this transition holds.
+    pub fn bytes(&self) -> usize {
+        (self.start.capacity() + self.to.capacity() + self.p.capacity()) * 4
+    }
+
     #[inline]
     pub fn row(&self, ci: usize) -> (&[u32], &[f32]) {
         let (a, b) = (self.start[ci] as usize, self.start[ci + 1] as usize);
@@ -556,6 +561,15 @@ pub struct DrawScratch {
 }
 
 impl DrawScratch {
+    /// Host bytes this scratch holds.
+    pub fn bytes(&self) -> usize {
+        self.kid.capacity() * std::mem::size_of::<Config>()
+            + (self.prob.capacity() + self.acc.capacity()) * 4
+            + self.order.capacity() * 8
+            + self.hit.capacity()
+            + self.touched.capacity() * 4
+    }
+
     /// The chance transition of one draw: for each config in `cfg`, which
     /// configs it can become (one per drawable coin type, reshuffling first if
     /// its bag is empty) and with what probability. Writes the sorted-deduped

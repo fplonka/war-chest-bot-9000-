@@ -676,6 +676,30 @@ fn pick(w: &[f32], rng: &mut Rng) -> usize {
 }
 
 impl TNode {
+    /// Host bytes this node's own lists hold, beside the struct itself.
+    ///
+    /// The config supports are shared between a node and its children, so they
+    /// are not counted here: charging every node for an `Arc` most of its
+    /// siblings hold too would make a tree look several times its size.
+    fn bytes(&self) -> usize {
+        let u = |v: &Vec<u32>| v.capacity() * 4;
+        self.draw.bytes()
+            + self.acts.capacity() * std::mem::size_of::<Action>()
+            + self.aslot.capacity()
+            + self.fdown.capacity()
+            + self.obs_child.capacity() * 8
+            + u(&self.obs_start)
+            + u(&self.obs_act)
+            + self.child.capacity() * 8
+            + u(&self.legal_off)
+            + u(&self.legal_action)
+            + u(&self.legal_child)
+            + u(&self.legal_trans)
+            + u(&self.action_off)
+            + u(&self.action_cell)
+            + u(&self.cell_row)
+    }
+
     #[inline]
     pub fn na(&self) -> usize {
         self.acts.len()
@@ -855,6 +879,50 @@ pub enum Step {
     Done(Option<Solved>),
 }
 
+/// Everything the CFR loop works in, when the loop runs on this host.
+///
+/// The device path allocates none of it. The card holds its own regret, visit,
+/// Q, prior, strategy-sum, reach and value arenas, advances all of them itself,
+/// and `farm::Dst` has no variant that could carry one back — so a solve driven
+/// on a card that grew these here would fill tens of megabytes of host memory
+/// with zeroes and read them never. `Solver::host` is `None` there, and every
+/// reader below goes through `Solver::cfr`, which says so rather than handing
+/// out a uniform start that looks like an answer.
+const HOST_PATH: &str = "the CFR arenas belong to the host path";
+
+#[derive(Default)]
+pub struct HostCfr {
+    /// Accumulated regret, laid out exactly like `Solver::cur`.
+    pub regret: Vec<f32>,
+    /// The expansion phase's own statistics, in the same layout.
+    ///
+    /// `prior` is the policy head's `softmax(logit(c, a) / prior_temp)` over a
+    /// config's legal row, filled once when the node is expanded. `visits` are
+    /// PUCT's counts, accumulated over every expansion phase of the search and
+    /// incremented as a trajectory passes — which is also the virtual loss,
+    /// since later simulations of the same phase then see the earlier ones.
+    /// `qval` is the action value the last backprop formed, before it was
+    /// turned into a regret. The device keeps no such array -- it holds a
+    /// value arena per traverser, so `k_expand` re-forms Q out of `cell_val`
+    /// where it selects. Here there is one arena and each traverser's pass
+    /// overwrites it, so the number has to be kept as it is made.
+    pub prior: Vec<f32>,
+    pub visits: Vec<f32>,
+    pub qval: Vec<f32>,
+    /// The reach-weighted running strategy sum, per node. Per node rather than
+    /// flat, because a node is given its cells when it is expanded and a
+    /// ragged vector grows there without disturbing anything already summed.
+    pub sum_strat: Vec<Vec<f32>>,
+    /// Reach per config, flat: node `i`'s two players occupy
+    /// `reach[roff[i] .. roff[i] + nc0 + nc1]`, player 0 first. One arena
+    /// rather than `Vec<Vec<f32>>` — the CFR passes touch every node, and two
+    /// pointer hops per node is what they were spending their time on.
+    pub reach: Vec<f32>,
+    /// The traverser's counterfactual value per config, flat the same way:
+    /// `vals[voff[i] .. voff[i] + max(nc0, nc1)]`.
+    pub vals: Vec<f32>,
+}
+
 pub struct Solver {
     /// Owned because a solver retains its context for its full solve.
     pub(crate) ctx: Ctx,
@@ -893,40 +961,24 @@ pub struct Solver {
     /// because sealing a leaf can seal a whole chain of its ancestors.
     resealed: Vec<u32>,
     pub root_belief: [Belief; 2],
-    /// Regrets and the current regret-matching iterate, flat by node over legal
-    /// cells. Node `i` occupies `soff[i] ..` for as many cells as its
-    /// `legal_action` holds; within that range its config rows are described by
+    /// The current regret-matching iterate, flat by node over legal cells.
+    /// Node `i` occupies `soff[i] ..` for as many cells as its `legal_action`
+    /// holds; within that range its config rows are described by
     /// `TNode::legal_off`. `soff` is *not* sorted: a node is born a leaf with
     /// no cells and is given its region when it is expanded, which is what lets
-    /// the arena grow by appending while every regret already accumulated stays
+    /// the arena grow by appending while everything already accumulated stays
     /// where it is.
-    pub(crate) regret: Vec<f32>,
     pub cur: Vec<f32>,
-    /// The expansion phase's own statistics, laid out exactly like `cur`.
-    ///
-    /// `prior` is the policy head's `softmax(logit(c, a) / prior_temp)` over a
-    /// config's legal row, filled once when the node is expanded. `visits` are
-    /// PUCT's counts, accumulated over every expansion phase of the search and
-    /// incremented as a trajectory passes — which is also the virtual loss,
-    /// since later simulations of the same phase then see the earlier ones.
-    /// `qval` is the action value the last backprop formed, before it was
-    /// turned into a regret. The device keeps no such array -- it holds a
-    /// value arena per traverser, so `k_expand` re-forms Q out of `cell_val`
-    /// where it selects. Here there is one arena and each traverser's pass
-    /// overwrites it, so the number has to be kept as it is made.
-    pub prior: Vec<f32>,
-    pub visits: Vec<f32>,
-    pub qval: Vec<f32>,
     pub(crate) soff: Vec<u32>,
-    /// The reach-weighted running strategy sum, per node. Per node rather than
-    /// flat, because a node is given its cells when it is expanded and a
-    /// ragged vector grows there without disturbing anything already summed.
-    pub sum_strat: Vec<Vec<f32>>,
-    /// The reference strategy: one flat normalised copy of `sum_strat`, laid
-    /// out exactly like `cur`. Materialised by `finish` once the tree has
-    /// stopped growing, and read by everything that acts, filters a belief or
-    /// values a node.
+    /// The reference strategy: one flat normalised copy of the running
+    /// strategy sum, laid out exactly like `cur`. The host materialises the
+    /// whole of it in `finish`; the device path reads the root's row and
+    /// nothing else, so `read_back` sizes it to that row alone.
     pub avg: Vec<f32>,
+    /// The CFR arenas, when this solve runs its own CFR loop. `None` on the
+    /// device path: the card owns equivalents of every one of them and
+    /// advances them itself, and not one ever crosses back.
+    host: Option<HostCfr>,
     /// Leaves that have become decision or chance nodes since a reader last
     /// looked. A flat description of the tree is append-only apart from these,
     /// so they are what an incremental update needs to be told.
@@ -938,15 +990,13 @@ pub struct Solver {
     /// Total legal strategy cells across decision nodes: the length of `cur`,
     /// `regret` and `avg`, and where the next expanded node's region starts.
     pub ncells: usize,
-    /// Reach per config, flat: node `i`'s two players occupy
-    /// `reach[roff[i] .. roff[i] + nc0 + nc1]`, player 0 first. One arena
-    /// rather than `Vec<Vec<f32>>` — the CFR passes touch every node, and two
-    /// pointer hops per node is what they were spending their time on.
-    pub reach: Vec<f32>,
+    /// Reach and value cells the tree has: the lengths `HostCfr::reach` and
+    /// `HostCfr::vals` are held at, and the sizes the card fits its own two
+    /// arenas to. Counted rather than read off a `Vec`, because on the device
+    /// path there is no `Vec` to read them off.
+    pub nreach: usize,
+    pub nvals: usize,
     pub(crate) roff: Vec<u32>,
-    /// The traverser's counterfactual value per config, flat the same way:
-    /// `vals[voff[i] .. voff[i] + max(nc0, nc1)]`.
-    pub vals: Vec<f32>,
     pub(crate) voff: Vec<u32>,
     /// `[node]` -> its row in the network batch, or `u32::MAX` for a node that
     /// carries none. The policy head needs a node's own board vector, which
@@ -1123,6 +1173,7 @@ impl Solver {
             belief[0].cfg.as_slice().into(),
             belief[1].cfg.as_slice().into(),
         ];
+        let device = nets.device;
         let mut sv = Solver {
             ctx,
             nets,
@@ -1138,23 +1189,19 @@ impl Solver {
             parent: Vec::new(),
             resealed: Vec::new(),
             root_belief: belief,
-            regret: Vec::new(),
             cur: Vec::new(),
-            prior: Vec::new(),
-            visits: Vec::new(),
-            qval: Vec::new(),
             row_of: Vec::new(),
             primed: Vec::new(),
             wants_prior: Vec::new(),
             soff: Vec::new(),
-            sum_strat: Vec::new(),
             avg: Vec::new(),
+            host: (!device).then(HostCfr::default),
             grown: Vec::new(),
             avg_touched: [false; 2],
             ncells: 0,
-            reach: Vec::new(),
+            nreach: 0,
+            nvals: 0,
             roff: Vec::new(),
-            vals: Vec::new(),
             voff: Vec::new(),
             nc: Vec::new(),
             steps: [0, 0],
@@ -1209,10 +1256,12 @@ impl Solver {
             // bound below is on how much of the *expansion budget* one leaf may
             // take, and the root spends none of it.
             sv.nodes.reserve(640);
-            sv.reach.reserve(640);
-            sv.vals.reserve(640);
-            sv.regret.reserve(640);
             sv.cur.reserve(640);
+            if let Some(h) = &mut sv.host {
+                h.reach.reserve(640);
+                h.vals.reserve(640);
+                h.regret.reserve(640);
+            }
             // The expansion's stream lives on the card once it is seeded, so
             // it is drawn here rather than by the round that sends it.
             sv.seed = Rng::new(sv.rng.next_u64()).0;
@@ -1222,10 +1271,31 @@ impl Solver {
             sv.grow(root);
             sv.seal(root, 1);
             // The first CFR update and every expansion trajectory require
-            // reaches for the tree that now exists.
-            sv.precompute_reaches();
+            // reaches for the tree that now exists. The card seeds and sweeps
+            // its own, from the root beliefs the first tree call carries, so
+            // on that path this pass would be redone before it was ever read.
+            if sv.host.is_some() {
+                sv.precompute_reaches();
+            }
         }
         sv
+    }
+
+    /// The CFR arenas this solve works in.
+    ///
+    /// A solve on the device path has none. Nothing there reads one — the card
+    /// runs the loop — so reaching for them is a mistake about which backend is
+    /// driving, and it says so here rather than returning the zeroes an
+    /// unallocated arena would.
+    pub fn cfr(&self) -> &HostCfr {
+        self.host.as_ref().expect(HOST_PATH)
+    }
+
+    /// The same arenas, to write. Only the oracles want this: they run a
+    /// contract's arithmetic beside the solver's and put the result back.
+    #[doc(hidden)]
+    pub fn cfr_mut(&mut self) -> &mut HostCfr {
+        self.host.as_mut().expect(HOST_PATH)
     }
 
     /// Pin this solve to one of a card's solve slots.
@@ -1310,11 +1380,15 @@ impl Solver {
         self.nc.push([c0 as u32, c1 as u32]);
         // No cells yet: a leaf has no strategy. `grow` appends its region.
         self.soff.push(self.ncells as u32);
-        self.roff.push(self.reach.len() as u32);
-        self.reach.resize(self.reach.len() + c0 + c1, 0.0);
-        self.voff.push(self.vals.len() as u32);
-        self.vals.resize(self.vals.len() + c0.max(c1), 0.0);
-        self.sum_strat.push(Vec::new());
+        self.roff.push(self.nreach as u32);
+        self.voff.push(self.nvals as u32);
+        self.nreach += c0 + c1;
+        self.nvals += c0.max(c1);
+        if let Some(h) = &mut self.host {
+            h.reach.resize(self.nreach, 0.0);
+            h.vals.resize(self.nvals, 0.0);
+            h.sum_strat.push(Vec::new());
+        }
         self.primed.push(false);
         self.row_of.push(u32::MAX);
         // Only a coin play carries a network row. Everything between two coin
@@ -1443,8 +1517,8 @@ impl Solver {
     /// enclosing `grow`, so the whole expansion is undone up to the coin play
     /// it started from.
     fn rewind(&mut self, id: usize, m: Mark) {
-        self.reach.truncate(self.roff[m.nodes] as usize);
-        self.vals.truncate(self.voff[m.nodes] as usize);
+        self.nreach = self.roff[m.nodes] as usize;
+        self.nvals = self.voff[m.nodes] as usize;
         self.nodes.truncate(m.nodes);
         self.states.truncate(m.nodes);
         self.parent.truncate(m.nodes);
@@ -1453,7 +1527,6 @@ impl Solver {
         self.soff.truncate(m.nodes);
         self.roff.truncate(m.nodes);
         self.voff.truncate(m.nodes);
-        self.sum_strat.truncate(m.nodes);
         self.primed.truncate(m.nodes);
         self.wants_prior.retain(|&i| (i as usize) < m.nodes);
         self.row_of.truncate(m.nodes);
@@ -1467,12 +1540,17 @@ impl Solver {
         self.term_leaves.truncate(m.term_leaves);
         self.leaf_coff.truncate(m.leaf_coff);
         self.leaf_cidx.truncate(m.leaf_cidx);
-        self.regret.truncate(m.ncells);
         self.cur.truncate(m.ncells);
-        self.prior.truncate(m.ncells);
-        self.visits.truncate(m.ncells);
-        self.qval.truncate(m.ncells);
         self.ncells = m.ncells;
+        if let Some(h) = &mut self.host {
+            h.reach.truncate(self.nreach);
+            h.vals.truncate(self.nvals);
+            h.sum_strat.truncate(m.nodes);
+            h.regret.truncate(m.ncells);
+            h.prior.truncate(m.ncells);
+            h.visits.truncate(m.ncells);
+            h.qval.truncate(m.ncells);
+        }
         // `cphi` is written by index and reused, so only the count and the
         // interning map name configs that no longer exist.
         self.cplayer.truncate(m.ncfg);
@@ -1491,9 +1569,6 @@ impl Solver {
         let cells = self.nodes[id].legal_action.len();
         self.soff[id] = self.ncells as u32;
         self.ncells += cells;
-        self.regret.resize(self.ncells, 0.0);
-        self.visits.resize(self.ncells, 0.0);
-        self.qval.resize(self.ncells, 0.0);
         let n = &self.nodes[id];
         let nc = n.nc(n.player as usize);
         let mut u = vec![0.0f32; cells];
@@ -1505,10 +1580,16 @@ impl Solver {
             }
         }
         self.cur.extend_from_slice(&u);
-        // Until the policy head has spoken the prior is the uniform strategy,
-        // which is what CFR starts from too.
-        self.prior.extend_from_slice(&u);
-        self.sum_strat[id] = vec![0.0; cells];
+        let ncells = self.ncells;
+        if let Some(h) = &mut self.host {
+            h.regret.resize(ncells, 0.0);
+            h.visits.resize(ncells, 0.0);
+            h.qval.resize(ncells, 0.0);
+            // Until the policy head has spoken the prior is the uniform
+            // strategy, which is what CFR starts from too.
+            h.prior.extend_from_slice(&u);
+            h.sum_strat[id] = vec![0.0; cells];
+        }
     }
 
     /// Materialise the reference strategy: the normalised CFR average, laid
@@ -1525,6 +1606,7 @@ impl Solver {
         // rather than a multiply and divide that need not round back.
         self.avg.clear();
         self.avg.extend_from_slice(&self.cur);
+        let sum_strat = &self.host.as_ref().expect(HOST_PATH).sum_strat;
         for i in 0..self.nodes.len() {
             let n = &self.nodes[i];
             if n.leaf || n.chance || !self.avg_touched[n.player as usize] {
@@ -1534,11 +1616,11 @@ impl Solver {
             let nc = n.nc(n.player as usize);
             for c in 0..nc {
                 let row = n.legal_row(c);
-                let sum: f32 = self.sum_strat[i][row.clone()].iter().sum();
+                let sum: f32 = sum_strat[i][row.clone()].iter().sum();
                 let k = row.len().max(1) as f32;
                 for cell in row {
                     self.avg[so + cell] = if sum > 0.0 {
-                        self.sum_strat[i][cell] / sum
+                        sum_strat[i][cell] / sum
                     } else {
                         1.0 / k
                     };
@@ -1851,11 +1933,12 @@ impl Solver {
     /// beliefs.
     fn propagate(&mut self, strat: &[f32]) {
         let _t = timed!(REACH);
-        self.reach.fill(0.0);
+        let reach = &mut self.host.as_mut().expect(HOST_PATH).reach;
+        reach.fill(0.0);
         for p in 0..2 {
             let at = self.roff[0] as usize + if p == 1 { self.nc[0][0] as usize } else { 0 };
             let n = self.nc[0][p] as usize;
-            self.reach[at..at + n].copy_from_slice(&self.root_belief[p].p);
+            reach[at..at + n].copy_from_slice(&self.root_belief[p].p);
         }
         for i in 0..self.nodes.len() {
             let n = &self.nodes[i];
@@ -1882,7 +1965,7 @@ impl Solver {
                 let cbase = self.roff[c] as usize;
                 let (cme, _) = blk(self.nc[c], me);
                 let (cop, _) = blk(self.nc[c], op);
-                let (lo, hi) = self.reach.split_at_mut(cbase);
+                let (lo, hi) = reach.split_at_mut(cbase);
                 let (src, dst) = (&lo[base..], &mut hi[..]);
                 dst[cop..cop + nop].copy_from_slice(&src[pop..pop + nop]);
                 for ci in 0..nme {
@@ -1904,7 +1987,7 @@ impl Solver {
                 let cbase = self.roff[c] as usize;
                 let (cme, _) = blk(self.nc[c], me);
                 let (cop, _) = blk(self.nc[c], op);
-                let (lo, hi) = self.reach.split_at_mut(cbase);
+                let (lo, hi) = reach.split_at_mut(cbase);
                 let (src, dst) = (&lo[base..], &mut hi[..]);
                 // The idle player's information state is untouched, and the
                 // child's support for them is the same list.
@@ -1933,7 +2016,7 @@ impl Solver {
     #[inline]
     fn reach_of(&self, i: usize, p: usize) -> &[f32] {
         let at = self.roff[i] as usize + if p == 1 { self.nc[i][0] as usize } else { 0 };
-        &self.reach[at..at + self.nc[i][p] as usize]
+        &self.cfr().reach[at..at + self.nc[i][p] as usize]
     }
 
     /// One leaf's public encoding, interned: the board it reads.
@@ -2079,7 +2162,6 @@ impl Solver {
             self.batch_cfgs = self.ncfg;
             return Vec::new();
         }
-        crate::net::fit(&mut self.xb, 2 * rows * crate::net::POOL);
         let _t = timed!(PUBNET);
         let mut calls = Vec::with_capacity(2);
         let fresh_rows = rows - self.batch_rows;
@@ -2174,8 +2256,12 @@ impl Solver {
     /// of nonlinearities.
     fn belief_blocks(&mut self) {
         let _t = timed!(BELFEAT);
+        // Sized where it is written. Growth used to do it, which fitted a
+        // megabyte of pooled belief per solve on the device path -- where the
+        // card pools its own and nothing here ever reads a row of it.
+        crate::net::fit(&mut self.xb, 2 * self.leaf_rows.len() * crate::net::POOL);
         let (reach, roff, nc, coff, cidx, cg, wbuf, xb) = (
-            &self.reach,
+            &self.host.as_ref().expect(HOST_PATH).reach,
             &self.roff,
             &self.nc,
             &self.leaf_coff,
@@ -2265,18 +2351,18 @@ impl Solver {
             let vo = self.voff[i] as usize;
             // A terminal leaf's value is the game's, not the network's, but
             // it travels the same arithmetic afterwards.
-            self.vals[vo..vo + n].fill(u * opp_reach);
+            self.host.as_mut().expect(HOST_PATH).vals[vo..vo + n].fill(u * opp_reach);
         }
         let d = crate::net::D;
-        let (reach, roff, ncs, voff, coff, cidx, cf, vals) = (
-            &self.reach,
+        let cfr = self.host.as_mut().expect(HOST_PATH);
+        let (reach, vals) = (&cfr.reach, &mut cfr.vals);
+        let (roff, ncs, voff, coff, cidx, cf) = (
             &self.roff,
             &self.nc,
             &self.voff,
             &self.leaf_coff,
             &self.leaf_cidx,
             &self.cf,
-            &mut self.vals,
         );
         for (r, &i) in self.leaf_rows.iter().enumerate() {
             let ra = roff[i] as usize + if opp == 1 { ncs[i][0] as usize } else { 0 };
@@ -2331,6 +2417,7 @@ impl Solver {
             None
         };
         let _t = timed!(BACK);
+        let cfr = self.host.as_mut().expect(HOST_PATH);
         for i in (0..self.nodes.len()).rev() {
             if self.nodes[i].leaf {
                 continue;
@@ -2349,7 +2436,7 @@ impl Solver {
                 let ch = self.nodes[i].child[0];
                 debug_assert!(ch > i);
                 let (vi, vc) = (self.voff[i] as usize, self.voff[ch] as usize);
-                let (lo, hi) = self.vals.split_at_mut(vc);
+                let (lo, hi) = cfr.vals.split_at_mut(vc);
                 let (dst, src) = (&mut lo[vi..], &hi[..]);
                 if me == traverser {
                     let n = &self.nodes[i];
@@ -2371,21 +2458,21 @@ impl Solver {
             // those start below every candidate; a config with no legal action
             // there is put back to zero below. Every other node accumulates.
             let br = mode == Back::BestResponse && me == traverser;
-            self.vals[vbase..vbase + nc].fill(if br { f32::NEG_INFINITY } else { 0.0 });
+            cfr.vals[vbase..vbase + nc].fill(if br { f32::NEG_INFINITY } else { 0.0 });
             if mode == Back::Regret && me == traverser {
                 // A cell whose action has no successor information state is
                 // never visited by the pass that fills these, and must read
                 // zero when the regret pass gets to it.
                 let so = self.soff[i] as usize;
                 let cells = self.nodes[i].legal_action.len();
-                self.qval[so..so + cells].fill(0.0);
+                cfr.qval[so..so + cells].fill(0.0);
             }
             if me == traverser {
                 let n = &self.nodes[i];
                 let so = self.soff[i] as usize;
                 // Children are built after their parent, so the parent's value
                 // row and every child's are disjoint slices of one arena.
-                let (lo, hi) = self.vals.split_at_mut(self.voff[i + 1] as usize);
+                let (lo, hi) = cfr.vals.split_at_mut(self.voff[i + 1] as usize);
                 let vi = &mut lo[vbase..];
                 for a in 0..na {
                     let ch = n.child[n.obs_child[a]];
@@ -2409,7 +2496,7 @@ impl Solver {
                                 // row -- the cache-hostile part of the sweep,
                                 // paid twice per cell for nothing. The
                                 // expansion phase reads it as PUCT's Q.
-                                self.qval[so + cell] = av;
+                                cfr.qval[so + cell] = av;
                                 vi[c] += av * self.cur[so + cell];
                             }
                             Back::Value => vi[c] += av * strat[so + cell],
@@ -2435,11 +2522,11 @@ impl Solver {
                                 // still reads the zero this node's cells were
                                 // cleared to, which is what re-forming it from
                                 // +0 used to produce.
-                                let delta = self.qval[so + cell] - base;
+                                let delta = cfr.qval[so + cell] - base;
                                 let at = so + cell;
-                                let old = self.regret[at];
+                                let old = cfr.regret[at];
                                 let r = old * if old > 0.0 { da } else { db } + delta;
-                                self.regret[at] = r;
+                                cfr.regret[at] = r;
                                 let v = (r + k.predict * delta).max(EPS);
                                 self.cur[at] = v;
                                 sum += v;
@@ -2451,7 +2538,7 @@ impl Solver {
                                 }
                             }
                         }
-                        for x in self.sum_strat[i].iter_mut() {
+                        for x in cfr.sum_strat[i].iter_mut() {
                             *x *= dg;
                         }
                     }
@@ -2472,7 +2559,7 @@ impl Solver {
                     let c_id = self.nodes[i].child[ch];
                     let cv = self.voff[c_id] as usize;
                     for c in 0..nc {
-                        self.vals[vbase + c] += self.vals[cv + c];
+                        cfr.vals[vbase + c] += cfr.vals[cv + c];
                     }
                 }
             }
@@ -2515,6 +2602,7 @@ impl Solver {
     pub fn avg_block(&mut self) {
         let _t = timed!(AVG);
         self.avg_touched = [true; 2];
+        let cfr = self.host.as_mut().expect(HOST_PATH);
         for i in 0..self.nodes.len() {
             let n = &self.nodes[i];
             if n.leaf || n.chance {
@@ -2523,10 +2611,11 @@ impl Solver {
             let me = n.player as usize;
             let nc = n.nc(me);
             let so = self.soff[i] as usize;
+            let ra = self.roff[i] as usize + if me == 1 { self.nc[i][0] as usize } else { 0 };
             for c in 0..nc {
-                let r = self.reach_of(i, me)[c];
+                let r = cfr.reach[ra + c];
                 for cell in n.legal_row(c) {
-                    self.sum_strat[i][cell] += r * self.cur[so + cell];
+                    cfr.sum_strat[i][cell] += r * self.cur[so + cell];
                 }
             }
         }
@@ -2776,7 +2865,7 @@ impl Solver {
         };
         // The card holds one value arena per traverser, so the second player's
         // root row sits a whole arena past the first's.
-        let nvals = self.vals.len() as u32;
+        let nvals = self.nvals as u32;
         let vals_at = match self.collect {
             None => [(0, 0); 2],
             Some(_) => [
@@ -2807,8 +2896,11 @@ impl Solver {
     /// The arenas stay where they are. Everything else the value pass touches
     /// is tens of megabytes and has no reader here.
     fn read_back(&mut self, r: &Reply) -> Option<Solved> {
-        self.avg = vec![0.0; self.ncells];
+        // The root's row and nothing after it. The card holds the whole average
+        // and the round carries back only this slice, so an arena of `ncells`
+        // would be a megabyte of zeroes with `at + cells` real numbers in it.
         let (at, cells) = self.root_cells();
+        self.avg = vec![0.0; at + cells];
         self.avg[at..at + cells].copy_from_slice(&r.b);
         self.collect?;
         let n0 = self.nc[0][0] as usize;
@@ -2873,8 +2965,8 @@ impl Solver {
             writes: w,
             fresh: first,
             ncells: self.ncells,
-            nreach: self.reach.len(),
-            nvals: self.vals.len(),
+            nreach: self.nreach,
+            nvals: self.nvals,
             levels: self.contract.level_start.clone(),
             nterm: self.term_leaves.len(),
             seed: first.then_some(self.seed),
@@ -2923,7 +3015,8 @@ impl Solver {
         let reach = self.reach_of(node, opp);
         let [mass] = warp32_sum(reach.len(), |i| [reach[i]]);
         let scale = if mass > 1e-30 { 1.0 / mass } else { 0.0 };
-        let [total] = warp32_sum(row.len(), |i| [self.visits[so + row.start + i]]);
+        let cfr = self.cfr();
+        let [total] = warp32_sum(row.len(), |i| [cfr.visits[so + row.start + i]]);
         let explore = self.cfg.puct * total.max(0.0).sqrt();
         let mut best = None;
         let mut best_score = f32::NEG_INFINITY;
@@ -2932,8 +3025,8 @@ impl Solver {
                 continue;
             }
             let at = so + cell;
-            let score = self.qval[at] * scale
-                + explore * self.prior[at] / (1.0 + self.visits[at]);
+            let score = cfr.qval[at] * scale
+                + explore * cfr.prior[at] / (1.0 + cfr.visits[at]);
             if score > best_score {
                 best_score = score;
                 best = Some(cell);
@@ -3072,6 +3165,7 @@ impl Solver {
         // `logit(c, a) = <f_p(c), e(a)>` over the node's own legal cells, then
         // a softmax across each config's row.
         let mut logit = Vec::new();
+        let prior = &mut self.host.as_mut().expect(HOST_PATH).prior;
         for (k, &i) in want.iter().enumerate() {
             let me = self.nodes[i].player as usize;
             let q = 2 * self.row_of[i] as usize + me;
@@ -3098,7 +3192,7 @@ impl Solver {
                 let mut total = 0.0;
                 for cell in row.clone() {
                     let v = ((logit[cell] - top) * inv_t).exp();
-                    self.prior[so + cell] = v;
+                    prior[so + cell] = v;
                     total += v;
                 }
                 let scale = if total > 0.0 {
@@ -3107,7 +3201,7 @@ impl Solver {
                     1.0 / row.len().max(1) as f32
                 };
                 for cell in row {
-                    self.prior[so + cell] *= scale;
+                    prior[so + cell] *= scale;
                 }
             }
             self.primed[i] = true;
@@ -3176,7 +3270,7 @@ impl Solver {
             self.backprop(p, &reference, Back::Value);
             let n = self.nc[0][p] as usize;
             let vo = self.voff[0] as usize;
-            out[p] = self.vals[vo..vo + n].to_vec();
+            out[p] = self.cfr().vals[vo..vo + n].to_vec();
         }
         out
     }
@@ -3232,8 +3326,8 @@ impl Solver {
             let live = |cell: usize| self.live_cell(node, cell);
             let cell = if rng.unit_f64() < 0.5 {
                 self.puct_choice(node, row.clone(), 1 - me)
-            } else if self.sum_strat[node][row.clone()].iter().any(|&x| x > 0.0) {
-                pick_live(&self.sum_strat[node][row.clone()], |i| live(row.start + i), rng)
+            } else if self.cfr().sum_strat[node][row.clone()].iter().any(|&x| x > 0.0) {
+                pick_live(&self.cfr().sum_strat[node][row.clone()], |i| live(row.start + i), rng)
                     .map(|i| row.start + i)
             } else {
                 pick_live(&self.cur[so + row.start..so + row.end], |i| live(row.start + i), rng)
@@ -3243,7 +3337,7 @@ impl Solver {
             // Counted as the trajectory passes, which is also the virtual loss
             // Student of Games adds across the simulations of one iteration:
             // a later simulation of the same phase sees this one's visit.
-            self.visits[so + cell] += 1.0;
+            self.host.as_mut().expect(HOST_PATH).visits[so + cell] += 1.0;
             c[me] = self.nodes[node].legal_trans[cell] as usize;
             node = self.nodes[node].legal_child[cell] as usize;
         }
@@ -3263,21 +3357,29 @@ impl Solver {
     /// `visits` is the one arena the phase writes, so a caller comparing a
     /// phase must hand over the state as it stood before that phase ran.
     ///
-    /// Not part of the engine's interface: it overwrites this solve's arenas
-    /// with `a` and advances `seed` by the draws the phase makes.
+    /// Not part of the engine's interface: it gives this solve the arenas in
+    /// `a` and advances `seed` by the draws the phase makes.
     #[doc(hidden)]
     pub fn replay_expansion(&mut self, a: &Arenas, sims: usize) -> Vec<Option<usize>> {
-        self.cur.copy_from_slice(&a.cur[..self.ncells]);
-        self.qval.copy_from_slice(&a.qval[..self.ncells]);
-        self.visits.copy_from_slice(&a.visits[..self.ncells]);
-        self.prior.copy_from_slice(&a.prior[..self.ncells]);
-        let nreach = self.reach.len();
-        self.reach.copy_from_slice(&a.reach[..nreach]);
-        for i in 0..self.nodes.len() {
-            let so = self.soff[i] as usize;
-            let n = self.sum_strat[i].len();
-            self.sum_strat[i].copy_from_slice(&a.sum[so..so + n]);
-        }
+        let cells = self.ncells;
+        self.cur.copy_from_slice(&a.cur[..cells]);
+        // A device solve has no arenas of its own, which is the whole point:
+        // the rule is being run on the card's numbers, not on numbers the host
+        // made. So the arenas it reads are built here, out of `a`.
+        self.host = Some(HostCfr {
+            regret: Vec::new(),
+            prior: a.prior[..cells].to_vec(),
+            visits: a.visits[..cells].to_vec(),
+            qval: a.qval[..cells].to_vec(),
+            sum_strat: (0..self.nodes.len())
+                .map(|i| {
+                    let (so, n) = (self.soff[i] as usize, self.nodes[i].legal_action.len());
+                    a.sum[so..so + n].to_vec()
+                })
+                .collect(),
+            reach: a.reach[..self.nreach].to_vec(),
+            vals: Vec::new(),
+        });
         self.with_expand_rng(|sv, rng| (0..sims).map(|_| sv.sample_leaf(rng)).collect())
     }
 
@@ -3389,9 +3491,9 @@ impl Solver {
             let nc = self.nc[0][p] as usize;
             let expect = |v: &[f32]| -> f32 { (0..nc).map(|c| root[p][c] * v[vo + c]).sum() };
             self.backprop(p, &reference, Back::Value);
-            let v = expect(&self.vals);
+            let v = expect(&self.cfr().vals);
             self.backprop(p, &reference, Back::BestResponse);
-            nash += expect(&self.vals) - v;
+            nash += expect(&self.cfr().vals) - v;
             zero_sum += v;
         }
         self.restore();
@@ -3427,6 +3529,104 @@ impl Solver {
     /// row per iteration, the readout and the pooling once per belief-index
     /// entry per iteration, and the two sweeps once per cell per iteration --
     /// so a search budget can be priced without running the farm.
+    /// What this solve holds in host memory, group by group.
+    ///
+    /// The mirror of `cuda::Solve::census`, and it exists for the same reason:
+    /// the farm admits the next solve against what the population *will* hold,
+    /// so it needs a figure for one solve that is a projection and not a level.
+    /// Every term is a capacity already recorded, so the walk is over nodes and
+    /// nothing deeper.
+    pub fn host_census(&self) -> Vec<(&'static str, usize)> {
+        let f = |v: &Vec<f32>| v.capacity() * 4;
+        let u = |v: &Vec<u32>| v.capacity() * 4;
+        let z = |v: &Vec<usize>| v.capacity() * 8;
+        let cfg_bytes = std::mem::size_of::<Config>();
+        let mut v = vec![
+            (
+                "nodes",
+                self.nodes.capacity() * std::mem::size_of::<TNode>()
+                    + self.nodes.iter().map(TNode::bytes).sum::<usize>(),
+            ),
+            ("states", self.states.capacity() * std::mem::size_of::<State>()),
+            ("contract", self.contract.bytes()),
+            (
+                "tree",
+                u(&self.parent)
+                    + u(&self.soff)
+                    + u(&self.roff)
+                    + u(&self.voff)
+                    + u(&self.row_of)
+                    + u(&self.grown)
+                    + u(&self.resealed)
+                    + u(&self.wants_prior)
+                    + u(&self.rewrite)
+                    + u(&self.resent)
+                    + self.nc.capacity() * 8
+                    + self.primed.capacity()
+                    + z(&self.leaf_rows)
+                    + z(&self.term_leaves)
+                    + z(&self.picks),
+            ),
+            ("cur", f(&self.cur)),
+            ("avg", f(&self.avg)),
+            (
+                "batch",
+                u(&self.leaf_cidx)
+                    + u(&self.leaf_coff)
+                    + u(&self.board_of)
+                    + f(&self.cphi)
+                    + f(&self.xpub)
+                    + f(&self.mirror0)
+                    + f(&self.cards)
+                    + self.cplayer.capacity(),
+            ),
+            (
+                "readout",
+                f(&self.pb) + f(&self.jp) + f(&self.cf) + f(&self.cg) + f(&self.cp)
+                    + f(&self.xb)
+                    + f(&self.h)
+                    + f(&self.wbuf),
+            ),
+            (
+                "interning",
+                (self.cmap.capacity() + self.bmap.capacity()) * 16,
+            ),
+            (
+                "scratch",
+                self.draw_scratch.bytes() + self.cell_order.capacity() * 16,
+            ),
+            (
+                "beliefs",
+                self.root_belief
+                    .iter()
+                    .map(|b| b.cfg.capacity() * cfg_bytes + b.p.capacity() * 4)
+                    .sum(),
+            ),
+        ];
+        if let Some(h) = &self.host {
+            v.extend([
+                ("regret", f(&h.regret)),
+                ("prior", f(&h.prior)),
+                ("visits", f(&h.visits)),
+                ("qval", f(&h.qval)),
+                (
+                    "sum",
+                    h.sum_strat.capacity() * 24
+                        + h.sum_strat.iter().map(|r| r.capacity() * 4).sum::<usize>(),
+                ),
+                ("reach", f(&h.reach)),
+                ("vals", f(&h.vals)),
+            ]);
+        }
+        v.sort_by_key(|&(_, b)| std::cmp::Reverse(b));
+        v
+    }
+
+    /// Host bytes this solve holds, all of them together.
+    pub fn host_bytes(&self) -> usize {
+        self.host_census().iter().map(|&(_, b)| b).sum()
+    }
+
     pub fn shape(&self) -> Shape {
         let mut depth = vec![0u32; self.nodes.len()];
         let mut worst = 0;
