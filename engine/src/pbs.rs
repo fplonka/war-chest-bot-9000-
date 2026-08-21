@@ -810,18 +810,6 @@ impl DrawScratch {
     }
 }
 
-/// One draw's transition, allocating. For tests and one-off callers; the
-/// subgame builder goes through `DrawScratch` so it can reuse its buffers.
-pub fn draw_transition(
-    cfg: &[Config],
-    reserve: &[u8; NSLOT],
-    faceup: &[u8; NSLOT],
-    set_pending: bool,
-) -> (Vec<Config>, DrawMap) {
-    let (mut support, mut map) = (Vec::new(), DrawMap::default());
-    DrawScratch::default().transition(cfg, reserve, faceup, &mut support, &mut map, set_pending);
-    (support, map)
-}
 
 /// What a config draws from, and what it looks like after any reshuffle:
 /// normally the bag, but when the bag is empty the whole discard pile is

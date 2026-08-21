@@ -144,22 +144,6 @@ impl Board {
         let (x, y) = self.coord[hex];
         format!("{},{}", x, y)
     }
-
-    /// Parse "x,y" into a hex index, or None if off-board / malformed.
-    pub fn hex_of_coord(&self, s: &str) -> Option<usize> {
-        let mut it = s.split(',');
-        let x: i8 = it.next()?.trim().parse().ok()?;
-        let y: i8 = it.next()?.trim().parse().ok()?;
-        if it.next().is_some() {
-            return None;
-        }
-        for i in 0..N_HEXES {
-            if self.coord[i] == (x, y) {
-                return Some(i);
-            }
-        }
-        None
-    }
 }
 
 use std::sync::OnceLock;

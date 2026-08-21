@@ -473,9 +473,6 @@ impl State {
 
     /// Coins physically in a stack on the board at `hex` (unit's coin count).
     #[inline]
-    pub fn stack_height(&self, hex: usize) -> u8 {
-        self.hex_height[hex]
-    }
 
     /// Total coins of a type a player currently holds across all zones + board.
     /// Used by invariant checks.
