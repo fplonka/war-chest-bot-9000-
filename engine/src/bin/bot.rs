@@ -11,7 +11,7 @@
 //! not already waiting on, which keeps the cores busy.
 //!
 //! ```text
-//! bot --name v5-2h --weights weights.bin --nodes 1024 --expand 1 --iters 64 --cfr dcfr
+//! bot --name v5-2h --weights weights.bin --s 512 --c 8 --cfr sog
 //! ```
 
 use std::collections::HashMap;
@@ -30,30 +30,25 @@ struct Options {
     name: String,
     weights: String,
     mind: String,
-    nodes: usize,
-    expand: usize,
-    iters: usize,
+    s: u32,
+    c: f32,
     cfr: String,
     temp: f32,
-    node_cap: usize,
     threads: usize,
 }
 
 fn options() -> Result<Options, String> {
     let a = Args::parse(&[
-        "name", "weights", "mind", "nodes", "expand", "iters", "cfr", "temp",
-        "node-cap", "threads",
+        "name", "weights", "mind", "s", "c", "cfr", "temp", "threads",
     ])?;
     Ok(Options {
         name: a.text("name", "bot"),
         weights: a.text("weights", ""),
         mind: a.text("mind", "rebel"),
-        cfr: a.text("cfr", "dcfr"),
-        nodes: a.num("nodes", 1024)?,
-        expand: a.num("expand", 1)?,
-        iters: a.num("iters", 64)?,
+        cfr: a.text("cfr", "sog"),
+        s: a.num("s", 512)?,
+        c: a.num("c", 8.0)?,
         temp: a.num("temp", 2.0)?,
-        node_cap: a.num("node-cap", 200_000)?,
         threads: a.num("threads", 0)?,
     })
 }
@@ -73,14 +68,7 @@ fn brain(o: &Options, gate: Option<Arc<Gate>>, device: bool) -> Result<Brain, St
     Ok(Brain {
         mind,
         nets,
-        cfg: Cfg {
-            nodes: o.nodes,
-            expand: o.expand,
-            iters: o.iters,
-            cfr,
-            node_cap: o.node_cap,
-            ..Default::default()
-        },
+        cfg: Cfg { s: o.s, c: o.c, cfr, ..Default::default() },
     })
 }
 

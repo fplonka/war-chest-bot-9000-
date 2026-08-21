@@ -1125,12 +1125,7 @@ mod tests {
     fn a_farm_batches_many_threads_into_one_round() {
         use crate::selfplay::{Agent, Collect};
         const THREADS: usize = 6;
-        let cfg = crate::search::Cfg {
-            nodes: 64,
-            expand: 1,
-            iters: 8,
-            ..Default::default()
-        };
+        let cfg = crate::search::Cfg { s: 8, c: 1.0, ..Default::default() };
         let gc = crate::selfplay::GameCfg {
             agents: [Agent::Rebel { cfg }; 2],
             collect: Collect::Rebel,

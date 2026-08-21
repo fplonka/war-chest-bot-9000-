@@ -1,8 +1,7 @@
 //! What a search budget costs, in the units the cards charge for.
 //!
 //! `SoG(s, c)` is the paper's notation: `s` total expansion simulations at `c`
-//! per regret update, so `iters = s / c`. This engine runs `expand` simulations
-//! per iteration, so `expand` is `c` and `iters * expand` is `s`.
+//! per regret update, so the solve runs `ceil(s / c)` regret updates.
 //!
 //! The device's kernel table is a handful of terms in a solve's shape:
 //!
@@ -55,7 +54,6 @@ struct Cost {
     plies: f64,
     /// Share of solves whose tree reaches a round-start draw at all.
     crossed: f64,
-    capped: f64,
 }
 
 impl Cost {
@@ -73,7 +71,6 @@ impl Cost {
         self.biggest += o.biggest;
         self.plies += o.plies;
         self.crossed += o.crossed;
-        self.capped += o.capped;
     }
 }
 
@@ -91,7 +88,7 @@ fn main() {
     // Roots off real play under the same net, at a cheap budget. What a solve
     // costs varies twenty-six fold with how far into a game its root sits, so
     // the corpus has to be a sample of play and not of one phase.
-    let small = Cfg { nodes: 256, expand: 4, iters: 8, cfr: Cfr::SOG, ..Default::default() };
+    let small = Cfg { s: 32, c: 4.0, cfr: Cfr::SOG, ..Default::default() };
     let gc = GameCfg {
         agents: [Agent::Rebel { cfg: small }; 2],
         collect: Collect::Rebel,
@@ -124,42 +121,25 @@ fn main() {
     // `s` total expansions and `c` per regret update, the paper's axes.
     // Student of Games trains chess and Go at (400, 1) and poker at (10, 0.01);
     // this engine's default is (512, 8).
-    // The third number is the node ceiling. It is not decoration: at the
-    // production budget growth stops around iteration thirty-eight because the
-    // tree strikes 8,192 nodes, so `(512, 8)` never runs its five hundred and
-    // twelfth expansion. A ceiling out of the way is what a budget *asks* for;
-    // 8,192 is what it gets.
-    let budgets: Vec<(usize, usize, usize)> = vec![
-        (512, 8, 8192),
-        (512, 8, 1 << 20),
-        (512, 4, 8192),
-        (512, 1, 8192),
-        (256, 2, 1 << 20),
-        (256, 1, 1 << 20),
-        (128, 1, 1 << 20),
-        (64, 1, 1 << 20),
+    let budgets: Vec<(u32, f32)> = vec![
+        (512, 8.0),
+        (512, 4.0),
+        (512, 1.0),
+        (256, 2.0),
+        (256, 1.0),
+        (128, 1.0),
+        (64, 1.0),
     ];
 
     println!(
-        "{:>12} {:>6} {:>6} {:>7} {:>6} {:>6} {:>5} | {:>9} {:>10} {:>10} | {:>7} {:>6}",
+        "{:>12} {:>6} {:>6} {:>7} {:>6} {:>6} {:>5} | {:>9} {:>10} {:>10} | {:>7}",
         "SoG(s,c)", "iters", "nodes", "rows", "ncfg", "dist%", "depth",
-        "joinrows", "readouts", "sweepcell", "f MB", "cap%"
+        "joinrows", "readouts", "sweepcell", "f MB"
     );
     let mut base: Option<Cost> = None;
-    for &(s, c, cap) in &budgets {
-        let iters = s / c;
-        let cfg = Cfg {
-            // The budget under study is `s` expansions, so the node ceiling is
-            // set out of the way: what a solve builds is then `s` expansions of
-            // whatever the rules cost, not a truncation of them.
-            nodes: cap,
-            node_cap: 8 * cap,
-            expand: c,
-            iters,
-            grow_every: 1,
-            cfr: Cfr::SOG,
-            ..Default::default()
-        };
+    for &(s, c) in &budgets {
+        let cfg = Cfg { s, c, cfr: Cfr::SOG, ..Default::default() };
+        let iters = cfg.iters();
         let t0 = std::time::Instant::now();
         // Per solve, not only the mean: cost varies twenty-six fold with how
         // far into a game a root sits, and it is the tail that fills a card.
@@ -183,7 +163,6 @@ fn main() {
                 one.rows = sh.rows as f64;
                 one.ncfg = sh.ncfg as f64;
                 one.depth = sh.depth as f64;
-                one.capped = sv.capped() as u8 as f64;
                 // How many of the rows stand on a board the trunk has already
                 // seen. A public state is the board, the piles and the flags,
                 // which is exactly what the row encoding holds.
@@ -230,8 +209,8 @@ fn main() {
         // `f` is `[ncfg, D]` in half precision: the readout's working set.
         let fmb = tot.ncfg / n * warchest::net::D as f64 * 2.0 / 1e6;
         let line = format!(
-            "{:>12} {:>6} {:>6.0} {:>7.0} {:>6.0} {:>5.0}% {:>5.1} | {:>9.0} {:>10.0} {:>10.0} | {:>7.2} {:>5.0}%",
-            format!("({s},{c}){}", if cap < 1 << 20 { "*" } else { "" }),
+            "{:>12} {:>6} {:>6.0} {:>7.0} {:>6.0} {:>5.0}% {:>5.1} | {:>9.0} {:>10.0} {:>10.0} | {:>7.2}",
+            format!("({s},{c})"),
             iters,
             tot.nodes / n,
             tot.rows / n,
@@ -242,7 +221,6 @@ fn main() {
             tot.cidx_iters / n,
             tot.cell_iters / n,
             fmb,
-            100.0 * tot.capped / n,
         );
         let line = format!(
             "{line}  sup {:.0} ({:.1} q each, max {:.0})  plies {:.1} cross {:.0}%",

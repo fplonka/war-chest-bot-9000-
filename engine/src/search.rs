@@ -42,47 +42,21 @@ use std::sync::Arc;
 
 #[derive(Clone, Copy)]
 pub struct Cfg {
-    /// CFR iterations (alternating, so each player is traversed iters/2 times).
-    pub iters: usize,
-    /// Expansions per regret update — Student of Games' `c`. Their total
-    /// expansion count `s` is `iters * expand`, and one expansion adds one
-    /// public state together with all of its children, which is their
-    /// `k = infinity` for imperfect-information games.
-    pub expand: usize,
-    /// Ceiling on public-tree nodes. The tree is grown towards it while CFR
-    /// runs, rather than built to a uniform depth up front: a fixed depth
-    /// spends the budget evenly over a tree that branches about twenty ways a
-    /// ply, so one more ply costs twenty times as much everywhere, including
-    /// down lines nobody plays. Growing puts the nodes where the strategy
-    /// actually goes.
-    pub nodes: usize,
-    /// CFR iterations the device runs before waking the host to grow.
+    /// Expansion simulations the whole solve runs — Student of Games' `s`.
     ///
-    /// A GT-CFR iteration wakes the host for one reason: to turn the leaves an
-    /// expansion phase sampled into decision nodes, which is the game's rules
-    /// and lives there. At one iteration a wake that barrier is most of what a
-    /// solve costs. Running several phases against a tree that has not grown
-    /// between them is an approximation -- but it is the same one the device
-    /// already makes *within* a phase, where eight simulations run before any
-    /// of them is grown and the visit counts a trajectory leaves behind are
-    /// what keep them apart. This widens that window rather than opening a new
-    /// one. It is off by default because it changes the search, not just its
-    /// speed, and belongs to a ladder rather than a probe.
-    pub grow_every: usize,
+    /// One simulation walks to a leaf and expands it, and an expansion adds one
+    /// public state together with *every* one of its public children. That is
+    /// their `k = infinity`, which is what both of their imperfect-information
+    /// games use and is not a budget choice: CFR needs a counterfactual value
+    /// at every action of a decision node, so a partially expanded node has no
+    /// regret to update.
+    pub s: u32,
+    /// Expansions per regret update — Student of Games' `c`. Below one it is
+    /// several regret updates per expansion, which is the same schedule read
+    /// the other way round.
+    pub c: f32,
     /// The regret-update rule.
     pub cfr: Cfr,
-    /// Max tree nodes a solve may build. 0 = unlimited. A solve that hits the
-    /// cap is flagged `capped` and its caller falls back to a non-search
-    /// policy for that decision: the tail of the tree-size distribution
-    /// (random-draft roots with broad beliefs at round boundaries) is fat
-    /// enough that an unbounded build hangs training for minutes on one
-    /// decision.
-    ///
-    /// It is a multiple of `nodes`, not an absolute ceiling, because a capped
-    /// solve is thrown away: the only thing the number buys is how much work
-    /// is spent discovering that. Set it far enough above `nodes` that a
-    /// healthy tree never reaches it, and no further.
-    pub node_cap: usize,
     /// PUCT's exploration constant, weighting the prior against the search's
     /// own action values during the expansion phase.
     pub puct: f32,
@@ -91,28 +65,45 @@ pub struct Cfg {
     /// Games notes "can decrease weight of the prior in some games and
     /// encourage more exploration in the search phase".
     pub prior_temp: f32,
-    /// Maximum combined belief support at a self-play root. Broad round-start
-    /// beliefs have a fat cost tail before the first tree node can be grown;
-    /// callers skip those solves instead of stalling every other worker.
-    /// Zero disables the limit.
-    pub config_cap: usize,
 }
 
 impl Default for Cfg {
     fn default() -> Self {
         Cfg {
-            iters: 64,
-            expand: 1,
-            grow_every: 1,
-            // A depth-2 uniform tree ran to about a thousand nodes, which is
-            // the budget this replaces, spent by growth instead of evenly.
-            nodes: 1024,
-            cfr: Cfr::LINEAR,
+            s: 512,
+            c: 8.0,
+            cfr: Cfr::SOG,
             puct: 1.5,
             prior_temp: 1.0,
-            node_cap: 16 * 1024,
-            config_cap: 256,
         }
+    }
+}
+
+impl Cfg {
+    /// Regret updates the solve runs: `ceil(s / c)`, never stored.
+    ///
+    /// `c = 0` is the degenerate schedule that never expands, and then `s` is
+    /// read as the update count. Nothing in a run sets it; the device parity
+    /// tests do, because comparing two backends needs both to solve the same
+    /// tree and a sampled expansion is where they would part company.
+    pub fn iters(&self) -> usize {
+        if self.c <= 0.0 {
+            return self.s as usize;
+        }
+        (self.s as f32 / self.c).ceil() as usize
+    }
+
+    /// Expansions the solve owes after its `i`-th regret update, one-based.
+    ///
+    /// `floor(i * c)` expansions have been earned by then, capped at `s`, so
+    /// this is the difference between two of those. It spreads `c` over the
+    /// iterations whether `c` is above one or below it.
+    fn expansions_at(&self, i: usize) -> usize {
+        if self.c <= 0.0 {
+            return 0;
+        }
+        let earned = |k: usize| (self.s as usize).min((k as f32 * self.c).floor() as usize);
+        earned(i) - earned(i - 1)
     }
 }
 
@@ -483,6 +474,11 @@ pub struct TNode {
     pub util: f32,
     pub player: u8,
     pub leaf: bool,
+    /// Whether growth may still turn this leaf into a decision node. False
+    /// past the draw that starts the next round, and false for a leaf whose
+    /// own expansion was abandoned. Such a leaf is priced by the value
+    /// network, which is what every other leaf gets anyway.
+    pub expandable: bool,
     /// Draw pass-through node: the public tree does not branch, there is one
     /// public child, and the drawing player's configs transition through the
     /// `draw` chance map.
@@ -662,27 +658,30 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// How much of a retired node array is worth keeping, as a multiple of the
-/// growth budget.
+/// Nodes one expansion may add before it is abandoned.
 ///
-/// Pooling exists to stop the common case reallocating, and the common case is
-/// a tree that grew to `Cfg::nodes`. So the ceiling has to move with that
-/// budget rather than be a number: a constant chosen for a 256-node tree
-/// discards *every* array once the budget is 8,192, which is precisely when
-/// the reallocation is worth avoiding. The headroom is for the overshoot a
-/// grow-through produces — an expansion adds a coin play and everything under
-/// it, so a tree passes its budget rather than landing on it.
-///
-/// Anything larger is a capped subgame, and holding one of those per thread
-/// costs more memory than every reallocation it saves.
-const NODE_POOL_SLACK: usize = 2;
+/// An expansion adds a coin play and everything beneath it up to the next coin
+/// plays, and that walk recurses through draws, tactics and forced plays. It
+/// usually costs about seventeen nodes, but one that branches through several
+/// tactics at once has been measured building two hundred thousand. Abandoning
+/// that single expansion through `rewind` leaves the rest of the solve intact,
+/// which a ceiling on the whole tree could not do.
+const EXPANSION_CAP: usize = 4096;
+
+/// Nodes a healthy solve of `s` expansions builds, with room to spare: what a
+/// retired node array may hold and still be worth pooling. Larger arrays came
+/// from a pathological tree and holding one per thread costs more memory than
+/// every reallocation it saves.
+fn pool_budget(cfg: &Cfg) -> usize {
+    32 * cfg.s as usize
+}
 
 fn take_nodes() -> Vec<TNode> {
     NODE_POOL.with(|b| b.borrow_mut().pop().unwrap_or_default())
 }
 
 fn give_nodes(mut v: Vec<TNode>, budget: usize) {
-    if v.capacity() == 0 || v.capacity() > NODE_POOL_SLACK * budget {
+    if v.capacity() == 0 || v.capacity() > budget {
         return;
     }
     // Cleared, not kept at length: the elements own heap of their own, and a
@@ -890,9 +889,11 @@ pub struct Solver<'a> {
     pub h: Vec<f32>,
     /// Normalised belief weights for one leaf's support.
     wbuf: Vec<f32>,
-    /// The build hit `Cfg::node_cap`: the tree is incomplete and the caller
-    /// must not solve or walk it.
-    capped: bool,
+    /// The expansion in flight has passed its bound and is unwinding.
+    abandon: bool,
+    /// Node count at which the expansion in flight gives up. The bound is on
+    /// one expansion, not on the tree.
+    limit: usize,
     /// Working memory for the chance transitions, reused across the tree.
     draw_scratch: DrawScratch,
     /// `(config key, legal cell)` scratch for ordering a public child's
@@ -939,7 +940,7 @@ impl Drop for Solver<'_> {
         ] {
             give_buf(role, std::mem::take(v));
         }
-        give_nodes(std::mem::take(&mut self.nodes), self.cfg.nodes);
+        give_nodes(std::mem::take(&mut self.nodes), pool_budget(&self.cfg));
     }
 }
 
@@ -1005,7 +1006,8 @@ impl<'a> Solver<'a> {
             xb: take_buf(R_XB),
             h: take_buf(R_H),
             wbuf: Vec::new(),
-            capped: false,
+            abandon: false,
+            limit: usize::MAX,
             draw_scratch: DrawScratch::default(),
             cell_order: Vec::new(),
             contract: Arc::new(crate::contract::Contract::default()),
@@ -1024,6 +1026,10 @@ impl<'a> Solver<'a> {
         {
             let _t = timed!(BUILD);
             // The root is born a leaf like every other node; `solve` grows it.
+            // Its own expansion is unbounded, because a root that stayed a leaf
+            // would leave the solve with no strategy to act on at all. The
+            // bound below is on how much of the *expansion budget* one leaf may
+            // take, and the root spends none of it.
             sv.nodes.reserve(640);
             sv.reach.reserve(640);
             sv.vals.reserve(640);
@@ -1055,6 +1061,7 @@ impl<'a> Solver<'a> {
             util: if terminal { s.utility(player as usize) } else { 0.0 },
             player,
             leaf: true,
+            expandable: true,
             chance: false,
             draw: DrawMap::default(),
             draw_steps: 0,
@@ -1115,19 +1122,28 @@ impl<'a> Solver<'a> {
         ch
     }
 
-    /// Whether the build has spent its node budget, flagging the solve if so.
+    /// One expansion of leaf `id`, abandoned whole if it runs away.
     ///
-    /// The budget has to bite *inside* the grow-through recursion. One
-    /// expansion of a coin play grows through every draw, tactic and forced
-    /// play beneath it before it reaches the next coin play, and that walk
-    /// branches — so checking only between expansions bounded a solve by one
-    /// `grow`, which is not a bound at all: against a 256-node growth budget,
-    /// single expansions were building two hundred thousand nodes.
-    fn over_cap(&mut self) -> bool {
-        if self.cfg.node_cap > 0 && self.nodes.len() >= self.cfg.node_cap {
-            self.capped = true;
+    /// The bound has to bite *inside* the grow-through recursion, because one
+    /// expansion grows through every draw, tactic and forced play beneath the
+    /// coin play it starts from and that walk branches. An abandoned expansion
+    /// leaves `id` a leaf that growth will not try again; the solve carries on
+    /// with the tree it already had.
+    fn expand(&mut self, id: usize) {
+        self.limit = self.nodes.len() + EXPANSION_CAP;
+        self.grow(id);
+        if self.abandon {
+            self.abandon = false;
+            self.nodes[id].expandable = false;
         }
-        self.capped
+    }
+
+    /// Whether the expansion in flight has spent its bound.
+    fn runaway(&mut self) -> bool {
+        if self.nodes.len() >= self.limit {
+            self.abandon = true;
+        }
+        self.abandon
     }
 
     /// Where every append-only arena stands.
@@ -1265,7 +1281,7 @@ impl<'a> Solver<'a> {
         if self.row_of[id] != u32::MAX {
             self.wants_prior.push(id as u32);
         }
-        if self.over_cap() {
+        if self.runaway() {
             return;
         }
         let mark = self.mark();
@@ -1342,9 +1358,17 @@ impl<'a> Solver<'a> {
             let mut cc = cfgs;
             cc[me] = support.as_slice().into();
             let ch = self.push_child(cs, cc);
-            if self.capped {
+            if self.abandon {
                 self.rewind(id, mark);
                 return;
+            }
+            if !wp {
+                // The round boundary. Everything this draw put into the tree
+                // lies past it and stays a leaf, priced by the value network.
+                // `TODO.md` records why, and when to reassess it.
+                for n in &mut self.nodes[mark.nodes..] {
+                    n.expandable = false;
+                }
             }
             let n = &mut self.nodes[id];
             n.chance = true;
@@ -1500,7 +1524,7 @@ impl<'a> Solver<'a> {
             let mut cc = cfgs.clone();
             cc[me] = std::mem::take(&mut child_cfgs[ch]).into();
             child.push(self.push_child(cs, cc));
-            if self.capped {
+            if self.abandon {
                 self.rewind(id, mark);
                 return;
             }
@@ -2213,70 +2237,47 @@ impl<'a> Solver<'a> {
 
     /// Run the solve: Student of Games' GT-CFR.
     ///
-    /// One round is one regret update followed by `expand` expansion
-    /// simulations, which is their `GT-CFR(L, beta, s, c)` with `c = expand`
-    /// and `s = iters * expand`. Growing and solving interleave rather than
-    /// staging, which is the point: the strategy decides where the tree goes,
-    /// and the tree decides what the strategy is worth.
+    /// `SoG(s, c)`: `s` expansion simulations in total, `c` of them after each
+    /// regret update, so the solve runs `ceil(s / c)` updates. Growing and
+    /// solving interleave rather than staging, which is the point: the strategy
+    /// decides where the tree goes, and the tree decides what the strategy is
+    /// worth.
     pub fn solve(&mut self, rng: &mut Rng) {
         if self.nets.device {
             return self.solve_on_device(rng);
         }
-        // `grow_every` iterations to a round, because that is what the device
-        // does: the host is woken once a round, and every expansion phase in
-        // between selects from the tree as it stood when the round began. Run
-        // one at a time this is the old loop exactly.
-        let per = self.cfg.grow_every.max(1);
-        let mut left = self.cfg.iters;
-        while left > 0 {
-            // A capped tree is retired by its caller, so every iteration after
-            // the cap is struck is work nobody reads. `Solver::new` can strike
-            // it on the root's own expansion.
-            if self.capped {
-                break;
-            }
-            let batch = left.min(per);
+        let iters = self.cfg.iters();
+        for i in 1..=iters {
+            self.step();
+            // The expansion phase reads the prior at every node it walks
+            // through, and `step` has just run the batch that any node grown
+            // last round was waiting for.
+            self.refresh_priors();
+            // Every simulation of one phase runs before any of them is grown,
+            // which is what the device does. Two of them can then land on the
+            // same leaf and the second is dropped; the visit counts a
+            // trajectory leaves behind are what make that rare.
             let mut sampled: Vec<usize> = Vec::new();
-            for _ in 0..batch {
-                self.step();
-                // The expansion phase reads the prior at every node it walks
-                // through, and `step` has just run the batch that any node
-                // grown last round was waiting for.
-                self.refresh_priors();
-                for _ in 0..self.cfg.expand {
-                    if self.nodes.len() + sampled.len() >= self.cfg.nodes {
-                        break;
-                    }
-                    match self.sample_leaf(rng) {
-                        Some(leaf) => sampled.push(leaf),
-                        None => break,
-                    }
+            for _ in 0..self.cfg.expansions_at(i) {
+                match self.sample_leaf(rng) {
+                    Some(leaf) => sampled.push(leaf),
+                    None => break,
                 }
             }
             let mut grew = false;
             for leaf in sampled {
-                if self.over_cap() || self.nodes.len() >= self.cfg.nodes {
-                    break;
-                }
-                // Two trajectories of a round can land on the same leaf, and
-                // the second finds it is no longer one. The device drops it
-                // the same way; the visit counts a trajectory leaves behind
-                // are what make that rare rather than usual.
-                if self.nodes[leaf].leaf && !self.states[leaf].is_terminal() {
-                    self.grow(leaf);
+                if self.nodes[leaf].leaf && self.nodes[leaf].expandable {
+                    self.expand(leaf);
                     grew = true;
                 }
             }
-            if grew && !self.capped {
+            if grew {
                 // Growth appended reach rows after `step` propagated the old
                 // tree. The next regret update must see the new leaves.
                 self.precompute_reaches();
             }
-            left -= batch;
         }
-        if !self.capped {
-            self.finish();
-        }
+        self.finish();
     }
 
     /// The same search, with the CFR loop on the backend.
@@ -2297,38 +2298,32 @@ impl<'a> Solver<'a> {
     /// dropped. The visit counts a trajectory leaves behind — the paper's
     /// virtual loss — are what makes that rare rather than usual.
     fn solve_on_device(&mut self, rng: &mut Rng) {
-        /// Iterations a solve may take in one round once its tree is full.
+        /// Iterations a round may carry when none of them owes an expansion.
+        ///
+        /// Each iteration issues a hundred-odd dependent launches from the one
+        /// driver thread, and a round runs as many as its longest member asks
+        /// for, so letting a whole tail ride in one round makes every other
+        /// solve in the round wait for it.
         const TAIL: usize = 8;
         // Read off the game's stream rather than drawn from it. The host path
         // spends draws inside `sample_leaf`; if this spent one too, the two
         // paths would sample different actions afterwards even when they are
         // told to grow nothing, and nothing could be compared.
         self.seed = Rng::new(rng.0).0;
-        let mut left = self.cfg.iters;
-        while left > 0 {
-            if self.capped {
-                break;
-            }
-            // Once the budget is spent the tree cannot grow, so nothing in the
-            // remaining iterations needs the host and they all ride in one
-            // round. Growth finishes around iteration thirty-eight of
-            // sixty-four, so this is most of the barriers a solve pays.
-            //
-            // The obvious objection is that those extra iterations run over one
-            // solve's leaves rather than the round's thirty-six, which is the
-            // batch size an accelerator is least interested in. Measured, that
-            // does not matter and the barrier does: taking it out moved
-            // rounds a solve from 48 to 79 and the rate from 15.1 to 9.6.
-            //
-            // What does matter is that a round runs as many iterations as its
-            // longest tail asks for, and each of them issues a hundred-odd
-            // launches from the one driver thread. `TAIL` bounds that: a tail
-            // of twenty-six taken eight at a time costs four rounds instead of
-            // one, against forty-two rounds a solve rather than thirty-nine.
-            let done = if self.nodes.len() >= self.cfg.nodes {
-                left.min(TAIL)
-            } else {
-                left.min(self.cfg.grow_every.max(1))
+        let iters = self.cfg.iters();
+        let mut at = 0usize;
+        while at < iters {
+            // Everything up to and including the next iteration that owes an
+            // expansion rides in one round: the host has nothing to do for the
+            // ones before it, so it should not be woken between them.
+            let next = (at + 1..=iters).find(|&k| self.cfg.expansions_at(k) > 0);
+            let done = match next {
+                Some(k) => (k - at).min(TAIL),
+                None => (iters - at).min(TAIL),
+            };
+            let expand = match next {
+                Some(k) if k - at == done => self.cfg.expansions_at(k),
+                _ => 0,
             };
             // The priors of whatever the *last* round's trunk answered for.
             // A node is expanded before the batch carrying its board vector
@@ -2341,44 +2336,39 @@ impl<'a> Solver<'a> {
             // The iteration's decay factors read the step count as it stands,
             // so both calls are built before it advances.
             calls.push(self.tree_call());
-            calls.push(self.iterate_call(done, if done == left { 0 } else { self.cfg.expand }));
+            calls.push(self.iterate_call(done, expand));
             self.steps = [self.steps[0] + done, self.steps[1] + done];
             self.avg_touched = [true; 2];
-            left -= done;
+            at += done;
             let replies = self.nets.grew(calls);
             self.absorb(&replies[..growth]);
             for &leaf in &replies[growth + 1].leaves.clone() {
-                if leaf == crate::contract::NO_ROW
-                    || self.nodes.len() >= self.cfg.nodes
-                    || self.over_cap()
-                {
+                if leaf == crate::contract::NO_ROW {
                     continue;
                 }
                 let leaf = leaf as usize;
                 // An earlier simulation of this same phase may have taken it.
-                if !self.nodes[leaf].leaf || self.states[leaf].is_terminal() {
+                if !self.nodes[leaf].leaf || !self.nodes[leaf].expandable {
                     continue;
                 }
-                self.grow(leaf);
+                self.expand(leaf);
             }
         }
-        if !self.capped {
-            // The reference strategy, and the root's slice of it. Every solve
-            // needs that much: the agent acts on it whether or not the solve
-            // is collected. What a collected solve needs on top -- the root's
-            // values and the beliefs it harvests -- is a second read, because
-            // the value pass under the reference is most of a CFR iteration
-            // and a solve that nobody collects should not pay for it.
-            let mut calls = self.growth_calls();
-            let growth = calls.len();
-            calls.push(self.tree_call());
-            calls.push(self.read_call(true, [(0, 0); 2], Vec::new()));
-            let replies = self.nets.grew(calls);
-            self.absorb(&replies[..growth]);
-            self.avg = vec![0.0; self.ncells];
-            let (at, cells) = self.root_cells();
-            self.avg[at..at + cells].copy_from_slice(&replies[growth + 1].b);
-        }
+        // The reference strategy, and the root's slice of it. Every solve
+        // needs that much: the agent acts on it whether or not the solve is
+        // collected. What a collected solve needs on top -- the root's values
+        // and the beliefs it harvests -- is a second read, because the value
+        // pass under the reference is most of a CFR iteration and a solve that
+        // nobody collects should not pay for it.
+        let mut calls = self.growth_calls();
+        let growth = calls.len();
+        calls.push(self.tree_call());
+        calls.push(self.read_call(true, [(0, 0); 2], Vec::new()));
+        let replies = self.nets.grew(calls);
+        self.absorb(&replies[..growth]);
+        self.avg = vec![0.0; self.ncells];
+        let (at, cells) = self.root_cells();
+        self.avg[at..at + cells].copy_from_slice(&replies[growth + 1].b);
     }
 
     /// One call asking for `steps` iterations, and an expansion phase after
@@ -2642,18 +2632,17 @@ impl<'a> Solver<'a> {
     /// False when nothing grew, which is a spent budget, a trajectory that ran
     /// into a terminal, or a config with no legal action there.
     pub fn expand_once(&mut self, rng: &mut Rng) -> bool {
-        if self.over_cap() {
-            return false;
-        }
         let Some(leaf) = self.sample_leaf(rng) else {
             return false;
         };
-        self.grow(leaf);
-        !self.capped
+        if !self.nodes[leaf].expandable {
+            return false;
+        }
+        self.expand(leaf);
+        !self.nodes[leaf].leaf
     }
 
-    /// Grow the whole subgame, to the node budget or until nothing is left to
-    /// expand.
+    /// Grow the whole subgame, until nothing is left to expand.
     ///
     /// Production never does this — the point of growing is to *not* build the
     /// whole tree. It exists for the tests and sizing tools that need the
@@ -2662,12 +2651,8 @@ impl<'a> Solver<'a> {
     pub fn grow_full(&mut self) {
         let mut at = 0usize;
         while at < self.nodes.len() {
-            if self.nodes.len() >= self.cfg.nodes || self.over_cap() {
-                self.capped = true;
-                return;
-            }
-            if self.nodes[at].leaf && !self.states[at].is_terminal() {
-                self.grow(at);
+            if self.nodes[at].leaf && self.nodes[at].expandable {
+                self.expand(at);
             }
             at += 1;
         }
@@ -2835,9 +2820,9 @@ impl<'a> Solver<'a> {
     /// The root's action list and its average policy, per acting config.
     ///
     /// Read off `avg`, which `finish` materialised — so this is the reference
-    /// strategy the solve acts under, not the last iterate. A capped or
-    /// unexpanded root has no cells and gives an empty policy, which a caller
-    /// stores as "no target here" rather than as a uniform one.
+    /// strategy the solve acts under, not the last iterate. An unexpanded root
+    /// has no cells and gives an empty policy, which a caller stores as "no
+    /// target here" rather than as a uniform one.
     fn root_policy(&self) -> Policy {
         let n = &self.nodes[0];
         if n.leaf || n.chance || self.avg.is_empty() {
@@ -3015,11 +3000,6 @@ impl<'a> Solver<'a> {
             cidx: self.leaf_cidx.len(),
             depth: worst as usize,
         }
-    }
-
-    /// True when the build hit the node cap and the solve must not be used.
-    pub fn capped(&self) -> bool {
-        self.capped
     }
 
     /// The CFR average strategy: the approximate equilibrium of the subgame.

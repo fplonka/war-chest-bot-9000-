@@ -588,7 +588,6 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     out.set_item("draws", d.draws)?;
     out.set_item("cap_hits", d.cap_hits)?;
     out.set_item("horizon_hits", d.cap_hits)?;
-    out.set_item("node_caps", d.node_caps)?;
     out.set_item("configs", d.configs)?;
     out.set_item("query_rows", d.queries)?;
     out.set_item("plays_attack", d.plays[0])?;
@@ -648,36 +647,23 @@ struct SolveFarm {
 #[pymethods]
 impl SolveFarm {
     #[new]
-    #[pyo3(signature = (seed, threads, nodes=256, expand=4, iters=16, explore=0.1, random_draft=true, cfr="dcfr", node_cap=16 * 1024, config_cap=256, query_rate=0.9, recursive_rate=0.1, devices=vec![0], roots=None, cohorts=2, grow_every=1))]
+    #[pyo3(signature = (seed, threads, s=512, c=8.0, explore=0.1, random_draft=true, cfr="sog", query_rate=0.9, recursive_rate=0.1, devices=vec![0], roots=None, cohorts=2))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         seed: u64,
         threads: usize,
-        nodes: usize,
-        expand: usize,
-        iters: usize,
+        s: u32,
+        c: f32,
         explore: f32,
         random_draft: bool,
         cfr: &str,
-        node_cap: usize,
-        config_cap: usize,
         query_rate: f32,
         recursive_rate: f32,
         devices: Vec<usize>,
         roots: Option<&str>,
         cohorts: usize,
-        grow_every: usize,
     ) -> PyResult<SolveFarm> {
-        let cfg = Cfg {
-            nodes,
-            expand,
-            iters,
-            grow_every,
-            cfr: cfr_of(cfr)?,
-            node_cap,
-            config_cap,
-            ..Default::default()
-        };
+        let cfg = Cfg { s, c, cfr: cfr_of(cfr)?, ..Default::default() };
         // A corpus makes this a bench rather than a run: the same roots in the
         // same order, so the mix of solve costs in flight does not drift.
         let work = match roots {
@@ -770,16 +756,15 @@ fn backend_for(_devices: &[usize], _value: crate::net::Net, _lanes: usize) -> Py
 /// Run `games` self-play games across all cores and return the training data.
 /// `mode` is "greedy" (Monte-Carlo warm start) or "rebel".
 #[pyfunction]
-#[pyo3(signature = (games, seed, mode, nodes=1024, expand=1, iters=64, explore=0.25, temp=2.0, random_draft=true, eval_mix=0.5, mc_mix=0.0, cfr="linear"))]
+#[pyo3(signature = (games, seed, mode, s=512, c=8.0, explore=0.25, temp=2.0, random_draft=true, eval_mix=0.5, mc_mix=0.0, cfr="sog"))]
 #[allow(clippy::too_many_arguments)]
 fn gen_data(
     py: Python<'_>,
     games: usize,
     seed: u64,
     mode: &str,
-    nodes: usize,
-    expand: usize,
-    iters: usize,
+    s: u32,
+    c: f32,
     explore: f32,
     temp: f32,
     random_draft: bool,
@@ -787,13 +772,7 @@ fn gen_data(
     mc_mix: f32,
     cfr: &str,
 ) -> PyResult<PyObject> {
-    let cfg = Cfg {
-        nodes,
-        expand,
-        iters,
-        cfr: cfr_of(cfr)?,
-        ..Default::default()
-    };
+    let cfg = Cfg { s, c, cfr: cfr_of(cfr)?, ..Default::default() };
     let (agent, collect) = match mode {
         "greedy" => (Agent::Greedy { temp }, Collect::Mc),
         "rebel" => (Agent::Rebel { cfg }, Collect::Rebel),
@@ -825,12 +804,12 @@ fn gen_data(
 /// workload.
 ///
 /// The search here decides which positions arise, not what a root *is*: a
-/// belief support comes from the draw history and the config cap. So this runs
-/// a cheap search by default -- the corpus is generated on the cores, and a
-/// sixty-four iteration solve at every decision of every game takes the better
-/// part of an hour where eight take a minute.
+/// belief support comes from the draw history. So this runs a cheap search by
+/// default -- the corpus is generated on the cores, and a full-budget solve at
+/// every decision of every game takes the better part of an hour where a
+/// thirty-two expansion one takes a minute.
 #[pyfunction]
-#[pyo3(signature = (games, seed, path, cap=1000, random_draft=true, nodes=512, iters=8, expand=1))]
+#[pyo3(signature = (games, seed, path, cap=1000, random_draft=true, s=32, c=4.0))]
 #[allow(clippy::too_many_arguments)]
 fn save_roots(
     py: Python<'_>,
@@ -839,16 +818,10 @@ fn save_roots(
     path: &str,
     cap: usize,
     random_draft: bool,
-    nodes: usize,
-    iters: usize,
-    expand: usize,
+    s: u32,
+    c: f32,
 ) -> PyResult<usize> {
-    let cfg = Cfg {
-        nodes,
-        iters,
-        expand,
-        ..Default::default()
-    };
+    let cfg = Cfg { s, c, ..Default::default() };
     let gc = GameCfg {
         agents: [Agent::Rebel { cfg }; 2],
         // The roots this tool wants are the queries a search nominates, and

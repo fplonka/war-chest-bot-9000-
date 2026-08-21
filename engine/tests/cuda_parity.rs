@@ -40,18 +40,13 @@ fn random_net(seed: u64) -> Net {
     Net::from_flat(&w, &b, &ln).expect("random net")
 }
 
-fn cfg(expand: usize, iters: usize) -> Cfg {
-    Cfg {
-        nodes: 64,
-        expand,
-        iters,
-        ..Default::default()
-    }
+fn cfg(s: u32, c: f32) -> Cfg {
+    Cfg { s, c, ..Default::default() }
 }
 
-fn game_cfg(expand: usize, iters: usize) -> GameCfg {
+fn game_cfg(s: u32, c: f32) -> GameCfg {
     GameCfg {
-        agents: [Agent::Rebel { cfg: cfg(expand, iters) }; 2],
+        agents: [Agent::Rebel { cfg: cfg(s, c) }; 2],
         collect: Collect::Rebel,
         explore: 0.1,
         random_draft: true,
@@ -64,7 +59,7 @@ fn game_cfg(expand: usize, iters: usize) -> GameCfg {
     }
 }
 
-/// Run one game stream per `(seed, iters)` against `backend`, all in one gate,
+/// Run one game stream per `(seed, s)` against `backend`, all in one gate,
 /// and hand back what each produced.
 ///
 /// A stream's games are a function of its seed alone, so the same seed run
@@ -73,9 +68,9 @@ fn game_cfg(expand: usize, iters: usize) -> GameCfg {
 fn generate(
     net: &Net,
     backend: Backend,
-    streams: &[(u64, usize)],
+    streams: &[(u64, u32)],
     games: usize,
-    expand: usize,
+    c: f32,
 ) -> Vec<Data> {
     let gate = Arc::new(Gate::default());
     let out: Vec<_> = streams
@@ -89,7 +84,7 @@ fn generate(
     let workers: Vec<_> = streams
         .iter()
         .zip(&out)
-        .map(|(&(seed, iters), slot)| {
+        .map(|(&(seed, s), slot)| {
             let (gate, net, slot, ready) =
                 (gate.clone(), net.clone(), slot.clone(), ready.clone());
             std::thread::spawn(move || {
@@ -100,7 +95,7 @@ fn generate(
                     device,
                     gate: Some(gate.clone()),
                 };
-                let mut stream = GameStream::new(seed, game_cfg(expand, iters));
+                let mut stream = GameStream::new(seed, game_cfg(s, c));
                 *slot.lock() = stream.generate(&nets, games);
             })
         })
@@ -120,8 +115,8 @@ fn generate(
 }
 
 /// One stream, which is what a comparison against the CPU wants.
-fn generate_one(net: &Net, backend: Backend, games: usize, expand: usize) -> Data {
-    generate(net, backend, &[(0x51E5, 8)], games, expand)
+fn generate_one(net: &Net, backend: Backend, games: usize, s: u32, c: f32) -> Data {
+    generate(net, backend, &[(0x51E5, s)], games, c)
         .pop()
         .expect("one stream")
 }
@@ -195,12 +190,11 @@ fn the_network_agrees() {
 
 /// A whole solve, both ways, on the same tree.
 ///
-/// `expand = 0` is what makes this a comparison. With it neither side grows,
-/// so both solve the tree `Solver::new` built and every number is of the same
-/// thing. With growth on they cannot be: the expansion phase samples, and the
-/// device runs a phase's simulations before the host grows any of them, where
-/// the host grows each one before starting the next — so the two trees part
-/// company at the first repeated leaf and never come back.
+/// `c = 0` is what makes this a comparison. With it neither side grows, so both
+/// solve the tree `Solver::new` built and every number is of the same thing.
+/// With growth on they cannot be: the expansion phase samples, and the last
+/// bits of a regret decide which leaf a trajectory takes — so the two trees
+/// part company at the first such choice and never come back.
 ///
 /// What is compared is the target a solve produces: the root's counterfactual
 /// value for every config, which is the end of every path through the loop —
@@ -213,12 +207,13 @@ fn the_cfr_loop_agrees_on_a_fixed_tree() {
         return;
     }
     let net = random_net(0x9E37);
-    let host = generate_one(&net, Backend::Reference(net.clone()), 3, 0);
+    let host = generate_one(&net, Backend::Reference(net.clone()), 3, 8, 0.0);
     let card = generate_one(
         &net,
         Backend::Cuda(Device::new(&[0], net.clone(), 1).expect("device")),
         3,
-        0,
+        8,
+        0.0,
     );
     assert!(!host.cy.is_empty(), "the reference produced no targets");
     assert_eq!(
@@ -264,9 +259,10 @@ fn growth_on_the_device_produces_sane_targets() {
         &net,
         Backend::Cuda(Device::new(&[0], net.clone(), 1).expect("device")),
         3,
-        4,
+        32,
+        4.0,
     );
-    let host = generate_one(&net, Backend::Reference(net.clone()), 3, 4);
+    let host = generate_one(&net, Backend::Reference(net.clone()), 3, 32, 4.0);
     assert!(!card.cy.is_empty(), "the device produced no targets");
     assert!(card.cy.iter().all(|v| v.is_finite()), "a target is not finite");
     // The trees differ, so the numbers do; the *scale* must not. A run whose
@@ -288,8 +284,8 @@ fn growth_on_the_device_produces_sane_targets() {
 ///
 /// The streams are given different iteration counts so their step counts drift
 /// apart; with equal counts the gate keeps them in lockstep and the same
-/// mistake reads as correct. `expand = 0` fixes the trees, so a stream's
-/// numbers are a function of its seed alone.
+/// mistake reads as correct. `c = 0` fixes the trees, so a stream's numbers are
+/// a function of its seed alone.
 #[test]
 fn a_solve_does_not_depend_on_the_round_it_rides_in() {
     if Device::count() == 0 {
@@ -297,17 +293,17 @@ fn a_solve_does_not_depend_on_the_round_it_rides_in() {
         return;
     }
     let net = random_net(0x9E37);
-    let streams = [(0x51E5u64, 8usize), (0x0A13, 11), (0x77C1, 13), (0x2E57, 17)];
+    let streams = [(0x51E5u64, 8u32), (0x0A13, 11), (0x77C1, 13), (0x2E57, 17)];
     let device = || Backend::Cuda(Device::new(&[0], net.clone(), 1).expect("device"));
-    let together = generate(&net, device(), &streams, 3, 0);
+    let together = generate(&net, device(), &streams, 3, 0.0);
     // A shared round must not move a solve at all, so the same run twice is
     // the control: whatever this reports is the floor the comparison sits on.
-    let twice = generate(&net, device(), &streams, 3, 0);
+    let twice = generate(&net, device(), &streams, 3, 0.0);
     let rel = |x: f32, y: f32| (x - y).abs() / (x.abs().max(y.abs()).max(1e-2));
     let count = |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(&x, &y)| rel(x, y) > 1e-3).count();
     let mut bad = 0.0f32;
     for (i, &s) in streams.iter().enumerate() {
-        let alone = generate(&net, device(), &[s], 3, 0).pop().expect("one stream");
+        let alone = generate(&net, device(), &[s], 3, 0.0).pop().expect("one stream");
         assert_eq!(
             alone.cy.len(),
             together[i].cy.len(),

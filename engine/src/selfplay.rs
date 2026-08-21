@@ -223,9 +223,6 @@ pub struct Data {
     /// Completed games that reached `MAX_MAIN_PLAYS`. This is the game horizon,
     /// not the solver's tree-node cap.
     pub cap_hits: usize,
-    /// Attempted subgame builds that hit `Cfg::node_cap` and used the uniform
-    /// policy fallback instead of producing a solve.
-    pub node_caps: usize,
     pub configs: usize,
     /// Rows that came from the query solver rather than from a self-play
     /// decision. Off the line of play, so this is the coverage term.
@@ -268,7 +265,6 @@ impl Data {
         self.wins[1] += o.wins[1];
         self.draws += o.draws;
         self.cap_hits += o.cap_hits;
-        self.node_caps += o.node_caps;
         self.configs += o.configs;
         self.queries += o.queries;
     }
@@ -409,17 +405,9 @@ pub fn solve_root(
     rng: &mut Rng,
     out: &mut Data,
 ) -> Vec<(State, [Belief; 2])> {
-    if cfg.config_cap > 0 && bel[0].len() + bel[1].len() > cfg.config_cap {
-        out.node_caps += 1;
-        return Vec::new();
-    }
     let ctx = Ctx::new(s);
     let mut sv = Solver::new(s, ctx, nets, cfg, bel.clone());
     sv.solve(rng);
-    if sv.capped() {
-        out.node_caps += 1;
-        return Vec::new();
-    }
     let want = draw_count(rng, recursive_rate);
     let solved = sv.harvest(rng, want);
     out.begin_solve();
@@ -534,24 +522,12 @@ impl Game {
             let np = match gc.agents[player as usize] {
                 Agent::Greedy { temp } => policy::greedy(s, ctx, player, &cfgs, temp),
                 Agent::Random => policy::uniform(s, ctx, player, &cfgs),
-                Agent::Rebel { cfg } => 'solve: {
-                    if cfg.config_cap > 0
-                        && bel[0].len() + bel[1].len() > cfg.config_cap
-                    {
-                        data.node_caps += 1;
-                        break 'solve policy::uniform(s, ctx, player, &cfgs);
-                    }
+                Agent::Rebel { cfg } => {
                     // Student of Games re-solves from scratch at every
                     // decision. The solve gives this state its value and
                     // nominates leaves to be solved in their own right.
                     let mut sv = Solver::new(s, *ctx, nets, cfg, bel.clone());
                     sv.solve(rng);
-                    if sv.capped() {
-                        // A resource cap was hit. Play uniformly and collect
-                        // nothing rather than stalling the generation stream.
-                        data.node_caps += 1;
-                        break 'solve policy::uniform(s, ctx, player, &cfgs);
-                    }
                     if collects_rows(gc, s) {
                         let want = draw_count(rng, gc.query_rate);
                         let solved = sv.harvest(rng, want);
@@ -903,12 +879,7 @@ mod policy_target_tests {
             device: false,
             gate: None,
         };
-        let cfg = Cfg {
-            nodes: 256,
-            expand: 4,
-            iters: 8,
-            ..Default::default()
-        };
+        let cfg = Cfg { s: 32, c: 4.0, ..Default::default() };
         let gc = GameCfg {
             agents: [Agent::Rebel { cfg }; 2],
             collect: Collect::Rebel,
@@ -928,9 +899,6 @@ mod policy_target_tests {
             let ctx = Ctx::new(s);
             let mut sv = Solver::new(s, ctx, &nets, cfg, bel.clone());
             sv.solve(&mut rng);
-            if sv.capped() {
-                continue;
-            }
             let solved = sv.harvest(&mut rng, 0);
             let mut d = Data::default();
             d.begin_solve();
@@ -979,6 +947,6 @@ mod policy_target_tests {
             );
             checked += 1;
         }
-        assert!(checked > 0, "no uncapped solve to check");
+        assert!(checked > 0, "no solve to check");
     }
 }

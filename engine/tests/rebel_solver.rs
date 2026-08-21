@@ -177,11 +177,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
             continue;
         }
 
-        let cfg = Cfg {
-            nodes: 200_000,
-            iters: 500,
-            ..Default::default()
-        };
+        let cfg = Cfg { s: 500, c: 1.0, ..Default::default() };
         {
             let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
             sv.grow_full();
@@ -226,7 +222,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
             sv.multistep(2);
             sv.finish();
             let early = sv.nash_conv().nash as f64;
-            sv.multistep(cfg.iters - 2);
+            sv.multistep(cfg.iters() - 2);
             sv.finish();
             let late = sv.nash_conv().nash as f64;
 
@@ -316,8 +312,8 @@ fn cfr_iteration_count_bias() {
             ctx,
             &nets,
             Cfg {
-                nodes: 200_000,
-                iters: 1,
+                s: 1,
+                c: 1.0,
                 ..Default::default()
             },
             bel.clone(),
@@ -352,8 +348,8 @@ fn cfr_iteration_count_bias() {
                 ctx,
                 &nets,
                 Cfg {
-                    nodes: 200_000,
-                    iters: t,
+                    s: t as u32,
+                    c: 1.0,
                     ..Default::default()
                 },
                 bel.clone(),
@@ -474,9 +470,8 @@ fn draw_pass_through_consistency() {
             ctx,
             &nets,
             Cfg {
-                nodes: 20_000,
-                node_cap: 20_000,
-                iters: 80,
+                s: 80,
+                c: 1.0,
                 ..Default::default()
             },
             bel.clone(),
@@ -601,24 +596,32 @@ fn warrior_priest_draw_walks_through_the_tree() {
     for u in [FOOTMAN, ARCHER, CAVALRY, LANCER, ROYAL_COIN] {
         s.add_zone(warchest::state::BLACK, Z_BAG, u, 1);
     }
+    // Two coins in White's hand and one in Black's, so the round does not end
+    // the moment White plays the trigger: a solve stops growing at the draw
+    // that starts the next round, so a mid-round draw is only in the tree when
+    // the round has plays left in it.
     s.add_zone(warchest::state::WHITE, Z_HAND, WARRIOR_PRIEST, 1);
+    s.add_zone(warchest::state::WHITE, Z_HAND, PIKEMAN, 1);
+    s.add_zone(warchest::state::BLACK, Z_HAND, FOOTMAN, 1);
     let ctx = Ctx::new(&s);
     let wp = ctx.slot_of[0][WARRIOR_PRIEST as usize] as u8;
     let sw = ctx.slot_of[0][SWORDSMAN as usize] as u8;
     assert_ne!(wp, sw);
-    // Hand size is public, so every config in the belief holds exactly the one
-    // coin the state shows. The draw's two children come from the bag.
+    // Hand size is public, so every config in the belief holds exactly the
+    // coins the state shows. The draw's children come from the bag.
     let mut c1 = Config::default();
     c1.hand[wp as usize] = 1;
-    let bel = [Belief::point(c1), Belief::point(Config::default())];
+    c1.hand[ctx.slot_of[0][PIKEMAN as usize] as usize] = 1;
+    let mut c2 = Config::default();
+    c2.hand[ctx.slot_of[1][FOOTMAN as usize] as usize] = 1;
+    let bel = [Belief::point(c1), Belief::point(c2)];
     let mut sv = Solver::new(
         &s,
         ctx,
         &nets,
         Cfg {
-            nodes: 20_000,
-            node_cap: 20_000,
-            iters: 8,
+            s: 8,
+            c: 1.0,
             ..Default::default()
         },
         bel.clone(),
@@ -747,7 +750,6 @@ fn growing_a_coin_play_finishes_its_micro_decisions() {
                     ctx,
                     &nets,
                     Cfg {
-                        nodes: 200_000,
                         ..Default::default()
                     },
                     bel,
@@ -778,90 +780,3 @@ fn growing_a_coin_play_finishes_its_micro_decisions() {
     panic!("no compound play found in 400 random games");
 }
 
-/// Growing less often searches worse, and this is what it costs.
-///
-/// `grow_every` runs several iterations between host wakes. On the farm that
-/// is worth a great deal -- 28.6 solves a second at one, 33.3 at two, 47.4 at
-/// four -- because the cards are idle through every host turnaround it
-/// removes. It is a search knob all the same: the second and later expansion
-/// phases of a round select from a tree the host has not grown, so GT-CFR
-/// builds a different tree, and the rate cannot say whether it is a worse one.
-///
-/// `nash_conv` can. It is the exploitability of the finite search game, so it
-/// says whether the strategy the solve arrives at is nearer equilibrium. Same
-/// roots, same iteration count, same node budget, same random stream; only the
-/// size of a round differs. Over forty-six micro-endgames:
-///
-/// ```text
-/// every=1 0.01598   every=2 0.02048 (+28%)   every=4 0.02641 (+65%)
-/// ```
-///
-/// So it is not free at any setting, and the default stays at one. A dozen
-/// roots had said two was free -- it is worth knowing that a sample that size
-/// will say that.
-#[test]
-fn growing_less_often_searches_worse() {
-    let nets = Nets::default();
-    let (mut sum, mut checked) = ([0.0f64; 3], 0usize);
-    const EVERY: [usize; 3] = [1, 2, 4];
-    for seed in 0..20000u64 {
-        let Some(s) = micro_position(seed, 60 + (seed as usize % 120), 3) else {
-            continue;
-        };
-        let ctx = Ctx::new(&s);
-        let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
-        if bel[0].len() * bel[1].len() > 64 {
-            continue;
-        }
-        let mut conv = [0.0f64; 3];
-        for (i, &every) in EVERY.iter().enumerate() {
-            // Sized so the solve finishes rather than striking the node cap:
-            // `iters * expand` expansions of about seventeen nodes each.
-            let cfg = Cfg {
-                nodes: 3_000,
-                iters: 32,
-                expand: 4,
-                grow_every: every,
-                ..Default::default()
-            };
-            let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
-            // The same stream for every variant, so what differs is the size
-            // of a round and not the draws.
-            let mut rng = warchest::rng::Rng::new(0x51D5 ^ seed);
-            sv.solve(&mut rng);
-            if sv.capped() {
-                conv = [f64::NAN; 3];
-                break;
-            }
-            conv[i] = sv.nash_conv().nash as f64;
-        }
-        if conv.iter().any(|c| c.is_nan()) {
-            continue;
-        }
-        for i in 0..3 {
-            sum[i] += conv[i];
-        }
-        checked += 1;
-        if checked == 60 {
-            break;
-        }
-    }
-    assert!(checked >= 30, "only {checked} positions were solvable");
-    let mean: Vec<f64> = sum.iter().map(|v| v / checked as f64).collect();
-    println!(
-        "NashConv over {checked} roots: every=1 {:.5}  every=2 {:.5}  every=4 {:.5}",
-        mean[0], mean[1], mean[2]
-    );
-    // The ordering is the finding, and it is what a change to the search
-    // would disturb. If growing less often ever stops costing exploitability,
-    // the farm can have its 1.66x and this test should be the thing that says
-    // so.
-    assert!(
-        mean[0] < mean[1] && mean[1] < mean[2],
-        "growing less often no longer costs exploitability: {:.5} {:.5} {:.5} \
-         -- re-measure the farm, `grow_every` may be worth taking now",
-        mean[0],
-        mean[1],
-        mean[2]
-    );
-}

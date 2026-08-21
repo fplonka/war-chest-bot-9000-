@@ -10,8 +10,8 @@ fn throughput_probe() {
     for iters in [16usize, 8] {
         let nets = Nets::default();
         let cfg = Cfg {
-            nodes: 200_000,
-            iters,
+            s: iters as u32,
+            c: 1.0,
             ..Default::default()
         };
         let n = 8;
@@ -49,8 +49,8 @@ fn throughput_probe() {
     {
         let nets = Nets::default();
         let cfg = Cfg {
-            nodes: 200_000,
-            iters: 16,
+            s: 16,
+            c: 1.0,
             ..Default::default()
         };
         let t0 = Instant::now();

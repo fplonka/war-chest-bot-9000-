@@ -73,13 +73,7 @@ impl Brain {
         }
         let mut sv = Solver::new(s, *ctx, &self.nets, self.cfg, bel.clone());
         sv.solve(rng);
-        if sv.capped() {
-            // The hard node cap protects the tail of the tree-size
-            // distribution. A partial solve has no valid reference strategy.
-            policy::uniform(s, ctx, player, cfgs)
-        } else {
-            policy::at_node(&sv, 0, cfgs.len())
-        }
+        policy::at_node(&sv, 0, cfgs.len())
     }
 }
 

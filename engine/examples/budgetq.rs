@@ -37,24 +37,15 @@ fn root_target(sv: &mut Solver) -> [f32; 2] {
     out
 }
 
-fn cfg_of(s: usize, c: usize) -> Cfg {
+fn cfg_of(s: u32, c: f32) -> Cfg {
     cfg_temp(s, c, 1.0)
 }
 
 /// The same, with the policy prior flattened. `prior_temp` divides the policy
 /// head's logits before the softmax, so a large one is a uniform prior -- which
 /// is the whole policy path switched off without touching it.
-fn cfg_temp(s: usize, c: usize, prior_temp: f32) -> Cfg {
-    Cfg {
-        prior_temp,
-        nodes: 1 << 20,
-        node_cap: 1 << 21,
-        expand: c,
-        iters: s / c,
-        grow_every: 1,
-        cfr: Cfr::SOG,
-        ..Default::default()
-    }
+fn cfg_temp(s: u32, c: f32, prior_temp: f32) -> Cfg {
+    Cfg { s, c, prior_temp, cfr: Cfr::SOG, ..Default::default() }
 }
 
 fn main() {
@@ -68,7 +59,7 @@ fn main() {
         device: false,
         gate: None,
     };
-    let small = Cfg { nodes: 256, expand: 4, iters: 8, cfr: Cfr::SOG, ..Default::default() };
+    let small = Cfg { s: 32, c: 4.0, cfr: Cfr::SOG, ..Default::default() };
     let gc = GameCfg {
         agents: [Agent::Rebel { cfg: small }; 2],
         collect: Collect::Rebel,
@@ -108,12 +99,9 @@ fn main() {
         .enumerate()
         .map(|(i, (st, bel))| {
             let ctx = warchest::rebel::Ctx::new(st);
-            let mut sv = Solver::new(st, ctx, &nets, cfg_of(512, 8), bel.clone());
+            let mut sv = Solver::new(st, ctx, &nets, cfg_of(512, 8.0), bel.clone());
             let mut rng = Rng::new(0x51D5 ^ i as u64);
             sv.solve(&mut rng);
-            if sv.capped() {
-                return Vec::new();
-            }
             let mut out = Vec::new();
             let mut done = 0usize;
             for &e in &EXTRA {
@@ -142,9 +130,9 @@ fn main() {
     }
 
     // ---- does a cheaper budget move the value target?
-    let budgets: Vec<(usize, usize)> = vec![
-        (512, 8), (512, 4), (256, 4), (256, 2), (256, 1),
-        (128, 2), (128, 1), (64, 1), (32, 1),
+    let budgets: Vec<(u32, f32)> = vec![
+        (512, 8.0), (512, 4.0), (256, 4.0), (256, 2.0), (256, 1.0),
+        (128, 2.0), (128, 1.0), (64, 1.0), (32, 1.0),
     ];
     // The reference: the same tree the production budget builds, solved far
     // past where its own exploitability stops moving. It is not ground truth --
@@ -156,12 +144,9 @@ fn main() {
         .enumerate()
         .map(|(i, (st, bel))| {
             let ctx = warchest::rebel::Ctx::new(st);
-            let mut sv = Solver::new(st, ctx, &nets, cfg_of(512, 2), bel.clone());
+            let mut sv = Solver::new(st, ctx, &nets, cfg_of(512, 2.0), bel.clone());
             let mut rng = Rng::new(0x51D5 ^ i as u64);
             sv.solve(&mut rng);
-            if sv.capped() {
-                return None;
-            }
             sv.multistep(768);
             sv.finish();
             Some(root_target(&mut sv))
@@ -180,9 +165,6 @@ fn main() {
                 let mut sv = Solver::new(st, ctx, &nets, cfg_of(s, c), bel.clone());
                 let mut rng = Rng::new(0x51D5 ^ i as u64);
                 sv.solve(&mut rng);
-                if sv.capped() {
-                    return (0.0, 0.0, 0.0);
-                }
                 let t = root_target(&mut sv);
                 (
                     ((t[0] - r[0]).abs() + (t[1] - r[1]).abs()) as f64 / 2.0,
@@ -195,7 +177,7 @@ fn main() {
         println!(
             "{:>12} {:>10} {:>12.5} {:>12.5}",
             format!("({s},{c})"),
-            s / c,
+            cfg_of(s, c).iters(),
             err / k,
             zs / k
         );
@@ -218,12 +200,9 @@ fn main() {
             .map(|(i, (st, bel))| {
                 let Some(r) = refs[i] else { return (0.0, 0.0, 0.0) };
                 let ctx = warchest::rebel::Ctx::new(st);
-                let mut sv = Solver::new(st, ctx, &nets, cfg_temp(512, 8, temp), bel.clone());
+                let mut sv = Solver::new(st, ctx, &nets, cfg_temp(512, 8.0, temp), bel.clone());
                 let mut rng = Rng::new(0x51D5 ^ i as u64);
                 sv.solve(&mut rng);
-                if sv.capped() {
-                    return (0.0, 0.0, 0.0);
-                }
                 let t = root_target(&mut sv);
                 let c = sv.nash_conv();
                 (

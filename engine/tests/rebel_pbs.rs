@@ -659,8 +659,8 @@ fn a_subgame_of_only_terminal_leaves_solves() {
         let ctx = Ctx::new(&s);
         let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
         let cfg = Cfg {
-            nodes: 200_000,
-            iters: 8,
+            s: 8,
+            c: 1.0,
             ..Default::default()
         };
         let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
@@ -807,8 +807,8 @@ fn a_solve_reads_only_the_beliefs() {
     let mut nets = Nets::default();
     nets.value = random_net(0xA11CE);
     let cfg = Cfg {
-        nodes: 200_000,
-        iters: 8,
+        s: 8,
+        c: 1.0,
         ..Default::default()
     };
     let mut checked = 0usize;
@@ -865,8 +865,8 @@ fn the_value_function_separates_configs_sharing_a_hand() {
     let mut nets = Nets::default();
     nets.value = random_net(0xBEEF);
     let cfg = Cfg {
-            nodes: 200_000,
-        iters: 8,
+        s: 8,
+        c: 1.0,
         ..Default::default()
     };
     let (mut positions, mut val_differs, mut strat_differs) = (0usize, 0usize, 0usize);
@@ -923,9 +923,8 @@ fn game_stream_yields_one_complete_solve_at_a_time() {
         value: random_net(0x57EA),
     };
     let cfg = Cfg {
-        nodes: 64,
-        expand: 1,
-        iters: 8,
+        s: 8,
+        c: 1.0,
         ..Default::default()
     };
     let gc = GameCfg {
@@ -959,9 +958,8 @@ fn a_gated_solve_matches_an_ungated_one_exactly() {
     use warchest::farm::Gate;
 
     let cfg = Cfg {
-        nodes: 96,
-        expand: 1,
-        iters: 12,
+        s: 12,
+        c: 1.0,
         ..Default::default()
     };
     let gc = GameCfg {
@@ -1045,9 +1043,8 @@ fn a_solve_stores_its_root_and_nothing_else() {
         value: random_net(0x51DE),
     };
     let cfg = Cfg {
-        nodes: 96,
-        expand: 1,
-        iters: 12,
+        s: 12,
+        c: 1.0,
         ..Default::default()
     };
     let gc = GameCfg {
@@ -1229,8 +1226,8 @@ fn zero_weight_config_survives_the_walk_update() {
             ctx,
             &nets,
             Cfg {
-            nodes: 200_000,
-                iters: 8,
+                s: 8,
+                c: 1.0,
                 ..Default::default()
             },
             bel.clone(),

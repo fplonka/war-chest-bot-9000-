@@ -735,15 +735,10 @@ mod tests {
             device: false,
             gate: None,
         };
-        let cfg = Cfg {
-            nodes: 512,
-            expand: 4,
-            iters: 8,
-            ..Default::default()
-        };
+        let cfg = Cfg { s: 32, c: 4.0, ..Default::default() };
         let gc = GameCfg {
             agents: [Agent::Rebel {
-                cfg: Cfg { nodes: 64, expand: 1, iters: 4, ..cfg },
+                cfg: Cfg { s: 4, c: 1.0, ..cfg },
             }; 2],
             collect: Collect::Rebel,
             explore: 0.1,
@@ -761,10 +756,10 @@ mod tests {
         for (s, belief) in &roots {
             let ctx = crate::rebel::Ctx::new(s);
             let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
-            for t in 0..cfg.iters {
+            for t in 0..cfg.iters() {
                 sv.step();
-                for _ in 0..cfg.expand {
-                    if sv.nodes.len() >= cfg.nodes || !sv.expand_once(&mut rng) {
+                for _ in 0..4 {
+                    if !sv.expand_once(&mut rng) {
                         break;
                     }
                 }
@@ -812,14 +807,13 @@ mod tests {
             gate: None,
         };
         let cfg = Cfg {
-            nodes: 384,
-            expand: 4,
-            iters: 12,
+            s: 48,
+            c: 4.0,
             ..Default::default()
         };
         let gc = GameCfg {
             agents: [Agent::Rebel {
-                cfg: Cfg { nodes: 64, expand: 1, iters: 4, ..cfg },
+                cfg: Cfg { s: 4, c: 1.0, ..cfg },
             }; 2],
             collect: Collect::Rebel,
             explore: 0.1,
@@ -842,7 +836,7 @@ mod tests {
                 let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
                 let mut c = Contract::of(&sv);
                 sv.grown.clear();
-                for t in 0..cfg.iters {
+                for t in 0..cfg.iters() {
                     if flat {
                         let grown = std::mem::take(&mut sv.grown);
                         c.extend(&sv, &grown);
@@ -887,8 +881,8 @@ mod tests {
                     } else {
                         sv.step();
                     }
-                    for _ in 0..cfg.expand {
-                        if sv.nodes.len() >= cfg.nodes || !sv.expand_once(&mut rng) {
+                    for _ in 0..4 {
+                        if !sv.expand_once(&mut rng) {
                             break;
                         }
                     }
@@ -929,14 +923,13 @@ mod tests {
             gate: None,
         };
         let cfg = Cfg {
-            nodes: 512,
-            expand: 4,
-            iters: 8,
+            s: 32,
+            c: 4.0,
             ..Default::default()
         };
         let gc = GameCfg {
             agents: [Agent::Rebel {
-                cfg: Cfg { nodes: 64, expand: 1, iters: 4, ..cfg },
+                cfg: Cfg { s: 4, c: 1.0, ..cfg },
             }; 2],
             collect: Collect::Rebel,
             explore: 0.1,
@@ -954,10 +947,10 @@ mod tests {
         for (s, belief) in &roots {
             let ctx = crate::rebel::Ctx::new(s);
             let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
-            for _ in 0..cfg.iters {
+            for _ in 0..cfg.iters() {
                 sv.step();
-                for _ in 0..cfg.expand {
-                    if sv.nodes.len() >= cfg.nodes || !sv.expand_once(&mut rng) {
+                for _ in 0..4 {
+                    if !sv.expand_once(&mut rng) {
                         break;
                     }
                 }
@@ -1009,9 +1002,9 @@ mod tests {
     #[test]
     fn the_runs_a_solve_sends_rebuild_its_contract() {
         let nets = Nets { value: random_net(0x5EED), device: false, gate: None };
-        let cfg = Cfg { nodes: 512, expand: 4, iters: 10, ..Default::default() };
+        let cfg = Cfg { s: 40, c: 4.0, ..Default::default() };
         let gc = GameCfg {
-            agents: [Agent::Rebel { cfg: Cfg { nodes: 64, expand: 1, iters: 4, ..cfg } }; 2],
+            agents: [Agent::Rebel { cfg: Cfg { s: 4, c: 1.0, ..cfg } }; 2],
             collect: Collect::Rebel,
             explore: 0.1,
             random_draft: true,
@@ -1034,7 +1027,7 @@ mod tests {
             let mut sent = Sent::default();
             let mut from = 0usize;
             let mut rewrite: Vec<u32> = Vec::new();
-            for _ in 0..cfg.iters {
+            for _ in 0..cfg.iters() {
                 let mut w = Writes::default();
                 inc.write_into(&mut w, &mut sent, from, &rewrite);
                 for r in &w.runs {
@@ -1080,8 +1073,8 @@ mod tests {
                 checked += 1;
 
                 sv.step();
-                for _ in 0..cfg.expand {
-                    if sv.nodes.len() >= cfg.nodes || !sv.expand_once(&mut rng) {
+                for _ in 0..4 {
+                    if !sv.expand_once(&mut rng) {
                         break;
                     }
                 }
@@ -1103,14 +1096,13 @@ mod tests {
             gate: None,
         };
         let cfg = Cfg {
-            nodes: 512,
-            expand: 4,
-            iters: 10,
+            s: 40,
+            c: 4.0,
             ..Default::default()
         };
         let gc = GameCfg {
             agents: [Agent::Rebel {
-                cfg: Cfg { nodes: 64, expand: 1, iters: 4, ..cfg },
+                cfg: Cfg { s: 4, c: 1.0, ..cfg },
             }; 2],
             collect: Collect::Rebel,
             explore: 0.1,
@@ -1130,10 +1122,10 @@ mod tests {
             let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
             let mut inc = Contract::of(&sv);
             sv.grown.clear();
-            for t in 0..cfg.iters {
+            for t in 0..cfg.iters() {
                 sv.step();
-                for _ in 0..cfg.expand {
-                    if sv.nodes.len() >= cfg.nodes || !sv.expand_once(&mut rng) {
+                for _ in 0..4 {
+                    if !sv.expand_once(&mut rng) {
                         break;
                     }
                 }
@@ -1232,14 +1224,13 @@ mod tests {
             gate: None,
         };
         let cfg = Cfg {
-            nodes: 512,
-            expand: 4,
-            iters: 8,
+            s: 32,
+            c: 4.0,
             ..Default::default()
         };
         let gc = GameCfg {
             agents: [Agent::Rebel {
-                cfg: Cfg { nodes: 64, expand: 1, iters: 4, ..cfg },
+                cfg: Cfg { s: 4, c: 1.0, ..cfg },
             }; 2],
             collect: Collect::Rebel,
             explore: 0.1,
@@ -1257,14 +1248,14 @@ mod tests {
         for (s, belief) in &roots {
             let ctx = crate::rebel::Ctx::new(s);
             let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
-            for t in 0..cfg.iters {
+            for t in 0..cfg.iters() {
                 // Run whole iterations first, so the regrets and the running
                 // strategy sum are both non-trivial before anything is
                 // compared: a comparison against all-zero state proves nothing
                 // about the discount factors.
                 sv.step();
-                for _ in 0..cfg.expand {
-                    if sv.nodes.len() >= cfg.nodes || !sv.expand_once(&mut rng) {
+                for _ in 0..4 {
+                    if !sv.expand_once(&mut rng) {
                         break;
                     }
                 }
