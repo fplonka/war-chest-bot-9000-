@@ -58,10 +58,6 @@ pub const N_ZONES: usize = 7;
 pub const WHITE: u8 = 0;
 pub const BLACK: u8 = 1;
 
-/// A queued micro-decision or forced follow-up. The stack is LIFO: `pending`
-/// (below) is the item currently being decided; `conts` holds items to resolve
-/// after it. Every variant that requires a player choice becomes a decision
-/// node; forced steps are executed inline by `apply` without a node.
 /// A set of board hexes as a bitmask (`N_HEXES <= 64`), iterating in ascending
 /// hex order.
 ///
@@ -118,6 +114,10 @@ impl Iterator for HexSetIter {
     }
 }
 
+/// A queued micro-decision or forced follow-up. The stack is LIFO: `pending`
+/// is the item currently being decided; `conts` holds items to resolve after
+/// it. Every variant that requires a player choice becomes a decision node;
+/// forced steps are executed inline by `apply` without a node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cont {
     /// A chance node: `player` draws one coin from their bag (refill applies).

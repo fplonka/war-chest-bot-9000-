@@ -264,7 +264,6 @@ pub struct Device {
     net: Net,
 }
 
-/// The running sums of the join's biases, in the order its norms read them.
 /// The trunk's two square matrices a block, permuted so that one lane's three
 /// channels of a weight row are four floats side by side.
 ///
@@ -301,6 +300,8 @@ fn lanewise(l: &NetLayout, w: &[f32]) -> (Vec<f32>, Vec<usize>) {
 /// sixteen-byte boundary.
 const TRUNK_LD: usize = 128;
 
+/// The running sums of the join's biases, in the order its norms read them.
+/// See `Card::owed`, which is where they are kept and why.
 fn owed_by_the_join(l: &NetLayout, b: &[f32]) -> Vec<f32> {
     let mut out = Vec::with_capacity((JBLOCKS + 1) * JW + D);
     let mut run = vec![0.0f32; JW];

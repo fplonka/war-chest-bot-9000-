@@ -302,10 +302,6 @@ impl Nets {
     }
 }
 
-/// `x` with a half-precision mantissa: ten bits kept, the rest rounded to
-/// nearest even. The exponent range is not modelled because leaf values are of
-/// order one and nowhere near half precision's limits; what is being measured
-/// is the lost mantissa.
 /// Which coin leaves the acting player's hand when `a` is played. Derived from
 /// the rules rather than from the engine's action listing: the Royal Guard
 /// tactic is offered whenever a Royal Guard is deployed, but it always spends
@@ -2372,6 +2368,7 @@ impl Solver {
 
     /// Add the fresh reach-weighted iterate to the running strategy sum.
     /// Normalisation is deferred to `finish`.
+    ///
     /// Both players in one walk. A decision node belongs to exactly one of
     /// them, so a per-player call skipped half the nodes and paid the whole
     /// traversal twice -- which was right while CFR alternated traversers and
