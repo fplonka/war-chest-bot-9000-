@@ -245,10 +245,6 @@ fn warp_rows(rows: usize) -> LaunchConfig {
     }
 }
 
-/// The GPUs a run evaluates on.
-///
-/// A round is split across the cards by call, so each card builds and runs a
-/// self-contained batch and nothing crosses the bus between them.
 /// Independent streams a GPU is fed by.
 ///
 /// Each is a whole copy of a card's working state -- its own stream, staging,
@@ -343,18 +339,13 @@ const ROUND_RESERVE: u64 = 6 << 30;
 /// card costs ninety megabytes and a handful of extra launches.
 const TILE: usize = 16384;
 
-/// How much room to take when an array has to grow.
-///
-/// Twice. An arena that grows by a quarter reallocates
-/// `log(final/first)/log(1.25)` times over a solve and copies everything it
-/// holds each time -- five times its final size in device-to-device traffic
-/// and, worse, three driver calls per growth on the one thread a round can
-/// least afford. Doubling takes the reallocations to a third of that.
-///
-/// Not more than twice, even though four times is faster still: with several
-/// cohorts of solves in flight the card's memory is what bounds how many, and
-/// headroom nobody is using is a cohort that does not fit.
 /// The capacity an array of `want` elements takes: a power of two.
+///
+/// Doubling rather than a quarter at a time. An arena that grows by a quarter
+/// reallocates `log(final/first)/log(1.25)` times over a solve and copies
+/// everything it holds each time -- five times its final size in
+/// device-to-device traffic and, worse, three driver calls per growth on the
+/// one thread a round can least afford.
 ///
 /// Allocation is stream-ordered, so a freed buffer goes back to a pool rather
 /// than to the driver, and it can only serve a request it is large enough for.
@@ -399,11 +390,6 @@ mod grow {
     }
 }
 
-/// One device array of a solve's state.
-///
-/// It grows geometrically and keeps what it holds: regrets, visit counts and
-/// the strategy sum accumulate across a solve's iterations, so a reallocation
-/// that dropped them would silently restart the search.
 /// Fill a staging buffer with exactly `src`.
 fn copy<T: Copy>(src: &[T]) -> impl FnOnce(&mut [T]) -> usize + '_ {
     move |dst: &mut [T]| {
@@ -506,6 +492,11 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default +
     }
 }
 
+/// One device array of a solve's state.
+///
+/// It grows geometrically and keeps what it holds: regrets, visit counts and
+/// the strategy sum accumulate across a solve's iterations, so a reallocation
+/// that dropped them would silently restart the search.
 struct Arr<T> {
     buf: Option<CudaSlice<T>>,
     cap: usize,

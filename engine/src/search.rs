@@ -801,9 +801,6 @@ pub struct Solver {
     collect: Option<usize>,
     /// Iterations run. `advance` picks up from here every time it is called.
     at: usize,
-    /// How many of the last round's calls were growth calls, so `advance`
-    /// knows where the iteration's own reply sits.
-    growth: usize,
     /// Which round, if any, is in flight.
     phase: Phase,
     /// The leaves the last round was asked for the reach at, in the order the
@@ -940,8 +937,8 @@ pub struct Solver {
     /// `[2, NTYPE, TYPE]`: the printed-card tokens, one table per player view.
     /// The draft is fixed for the solve, so this is built once.
     pub cards: Vec<f32>,
-    /// `[2 * rows, D]` board vectors, and their `[2 * rows, JW]` projection
-    /// into the join's first layer. Neither moves between CFR iterations.
+    /// `[rows, D]` board vectors, and their `[rows, JW]` projection into the
+    /// join's first layer. Neither moves between CFR iterations.
     pub pb: Vec<f32>,
     pub jp: Vec<f32>,
     /// Expanded public encoding, filled during the build.
@@ -1039,7 +1036,6 @@ impl Solver {
             slot: 0,
             collect: None,
             at: 0,
-            growth: 0,
             phase: Phase::Fresh,
             picks: Vec::new(),
             cfg,
@@ -2349,18 +2345,6 @@ impl Solver {
         }
     }
 
-    /// One regret update for `traverser` alone, against the reaches as they
-    /// stand. `step` runs both players' and is what a solve uses.
-    pub fn half_step(&mut self, traverser: usize) {
-        self.update_regrets(traverser);
-        // Restore the reach probabilities under the strategy just computed:
-        // the next iteration's traversal reads them, and so does the average
-        // strategy accumulation below.
-        self.precompute_reaches();
-        self.avg_block();
-        self.steps[traverser] += 1;
-    }
-
     /// One iteration of the regret update phase: **simultaneous updates**, as
     /// Student of Games specifies.
     ///
@@ -2464,14 +2448,13 @@ impl Solver {
     /// reads, run inline on the core the solve is already on.
     fn advance_on_host(&mut self, replies: &[Reply]) -> Step {
         if self.phase == Phase::Iterating {
-            self.absorb(&replies[..self.growth]);
+            self.absorb(replies);
         }
         let iters = self.cfg.iters();
         loop {
             // Whatever the last growth added, before the iteration reads it.
             let calls = self.growth_calls();
             if !calls.is_empty() {
-                self.growth = calls.len();
                 self.phase = Phase::Iterating;
                 return Step::Calls(calls);
             }
@@ -2538,8 +2521,9 @@ impl Solver {
         match self.phase {
             Phase::Fresh => {}
             Phase::Iterating => {
-                self.absorb(&replies[..self.growth]);
-                for &leaf in &replies[self.growth + 1].leaves.clone() {
+                self.absorb(replies);
+                let last = replies.last().expect("a round answers every call it was given");
+                for &leaf in &last.leaves.clone() {
                     if leaf == crate::contract::NO_ROW {
                         continue;
                     }
@@ -2553,9 +2537,10 @@ impl Solver {
                 }
             }
             Phase::Reading => {
-                self.absorb(&replies[..self.growth]);
+                self.absorb(replies);
                 self.phase = Phase::Done;
-                return Step::Done(self.read_back(&replies[self.growth + 1]));
+                let last = replies.last().expect("a round answers every call it was given");
+                return Step::Done(self.read_back(last));
             }
             Phase::Done => unreachable!("a finished solve is not advanced again"),
         }
@@ -2591,13 +2576,19 @@ impl Solver {
             _ => 0,
         };
         let mut calls = self.growth_calls();
-        self.growth = calls.len();
         // The iteration's decay factors read the step count as it stands, so
         // both calls are built before it advances. The tree call also names the
         // nodes whose prior the card is to fill, which it does between the
         // scatter and the iteration that reads it.
         calls.push(self.tree_call());
-        calls.push(self.iterate_call(done, expand));
+        calls.push(Call::Iterate {
+            solve: self.slot,
+            step: self.steps[0],
+            iters: done,
+            expand,
+            cfr: self.cfg.cfr,
+            puct: self.cfg.puct,
+        });
         self.steps = [self.steps[0] + done, self.steps[1] + done];
         self.avg_touched = [true; 2];
         self.at += done;
@@ -2615,7 +2606,6 @@ impl Solver {
     /// iteration, does not run for it.
     fn read_round(&mut self) -> Vec<Call> {
         let mut calls = self.growth_calls();
-        self.growth = calls.len();
         calls.push(self.tree_call());
         self.picks = match self.collect {
             None => Vec::new(),
@@ -2641,7 +2631,14 @@ impl Solver {
             .iter()
             .map(|&i| (self.roff[i], self.nc[i][0] + self.nc[i][1]))
             .collect();
-        calls.push(self.read_call(vals_at, reach_at));
+        let (at, cells) = self.root_cells();
+        calls.push(Call::Read {
+            solve: self.slot,
+            touched: self.avg_touched,
+            vals_at,
+            policy_at: (at as u32, cells as u32),
+            reach_at,
+        });
         calls
     }
 
@@ -2674,19 +2671,6 @@ impl Solver {
         Some(Solved { value, queries, policy })
     }
 
-    /// One call asking for `steps` iterations, and an expansion phase after
-    /// them unless the tree has nothing left to grow.
-    fn iterate_call(&self, steps: usize, expand: usize) -> Call {
-        Call::Iterate {
-            solve: self.slot,
-            step: self.steps[0],
-            iters: steps,
-            expand,
-            cfr: self.cfg.cfr,
-            puct: self.cfg.puct,
-        }
-    }
-
     /// Where the root's strategy cells are, or nothing when it has none.
     fn root_cells(&self) -> (usize, usize) {
         let n = &self.nodes[0];
@@ -2694,17 +2678,6 @@ impl Solver {
             (0, 0)
         } else {
             (self.soff[0] as usize, n.legal_action.len())
-        }
-    }
-
-    fn read_call(&self, vals_at: [(u32, u32); 2], reach_at: Vec<(u32, u32)>) -> Call {
-        let (at, cells) = self.root_cells();
-        Call::Read {
-            solve: self.slot,
-            touched: self.avg_touched,
-            vals_at,
-            policy_at: (at as u32, cells as u32),
-            reach_at,
         }
     }
 
@@ -3257,41 +3230,6 @@ impl Solver {
     /// that went to each config's most-visited action, averaged over the
     /// decision nodes that were visited at all.
     ///
-    /// Uniform selection over a row of `k` actions gives `1/k`; a search that
-    /// commits to a line gives a number near one. It says whether the
-    /// expansion phase is being guided or is wandering, which no test of the
-    /// solve's output can show.
-    pub fn visit_concentration(&self) -> f32 {
-        let (mut total, mut rows) = (0.0f32, 0usize);
-        for i in 0..self.nodes.len() {
-            let n = &self.nodes[i];
-            if n.leaf || n.chance {
-                continue;
-            }
-            let so = self.soff[i] as usize;
-            for c in 0..n.nc(n.player as usize) {
-                let row = n.legal_row(c);
-                if row.len() < 2 {
-                    continue;
-                }
-                let sum: f32 = row.clone().map(|cell| self.visits[so + cell]).sum();
-                if sum <= 0.0 {
-                    continue;
-                }
-                let top = row
-                    .map(|cell| self.visits[so + cell])
-                    .fold(0.0f32, f32::max);
-                total += top / sum;
-                rows += 1;
-            }
-        }
-        if rows == 0 {
-            0.0
-        } else {
-            total / rows as f32
-        }
-    }
-
     /// The counters a solve's device cost is proportional to.
     ///
     /// Diagnostics: nothing in a run reads this. The kernel table is a handful
