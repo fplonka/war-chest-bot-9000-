@@ -67,6 +67,17 @@ class Cfg:
     # Cards the solve farm evaluates on. A round is split across them by call,
     # so each builds and runs a self-contained batch.
     gen_devices: str = "0,1"
+    # Independent cohorts of solves, one lane of each card apiece. A cohort's
+    # threads park together while its round runs, so with one cohort the cards
+    # stand idle through every barrier; with eight they fill each other's gaps.
+    # Thirty-odd solves a round is the shape: fewer and the batch stops being
+    # worth an accelerator, more and the barrier costs too much.
+    gen_cohorts: int = 10
+    # CFR iterations a solve runs before waking the host to grow its tree. One
+    # is what Student of Games describes. More is faster and coarser: the extra
+    # phases sample a tree that has not grown between them, which is the same
+    # approximation a single phase already makes across its own simulations.
+    grow_every: int = 1
     gen_solves: int = 8
     # Zero uses every physical CPU core.
     gen_workers: int = 0

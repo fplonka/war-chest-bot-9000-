@@ -458,3 +458,12 @@
 [t=2099.6s] GT-CFR solves=99512 rate=55.3/s rows=736 games=5 qrows=367 caps=139 L=0.01230 L/var=0.08 tgt=-0.000/0.392 gen=0.10s train=0.49s gpu=0.00s
 [GT-CFR-summary] solves=99544 optimizer_rows=795648 rate=55.3/s horizon=0.06 games=463 caps=139
 [t=2104.2s] --- snapshot snap_03.pt (final) ---
+Traceback (most recent call last):
+  File "/workspace/warchest-engine/train/train.py", line 887, in <module>
+    subprocess.run(arena + ["ladder", *anchor, *bots,
+^^^^^^
+  File "/workspace/warchest-engine/train/train.py", line 881, in main
+    tag = pathlib.Path(args.out).name
+  File "/venv/main/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['/venv/main/bin/python', '/workspace/warchest-engine/tools/arena.py', 'ladder', '/workspace/warchest-engine/bots/greedy', '/workspace/warchest-engine/bots/gt30.final', '/workspace/warchest-engine/bots/gt30.init', '/workspace/warchest-engine/bots/gt30.s1', '/workspace/warchest-engine/bots/gt30.s2', '--games', '40', '--out', 'runs/gt30/ladder.json']' died with <Signals.SIGTERM: 15>.

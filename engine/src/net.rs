@@ -139,6 +139,33 @@ pub fn gemm(
     }
 }
 
+/// `x` as it comes back from a half.
+///
+/// The trunk's matrices and the activations they multiply are half precision
+/// on the card, so the reference here is only a reference if it rounds the
+/// same way. Ten mantissa bits, to nearest with ties to even, and a half's
+/// exponent range with it: below `2^-14` the steps stop shrinking and stay at
+/// `2^-24`, and above 65,520 there is only infinity. That is `__float2half`.
+///
+/// A tolerance loosened to a tenth would hide an implementation mistake as
+/// readily as it hides this; a reference that models the arithmetic keeps the
+/// bound where it can still catch one.
+#[inline]
+pub fn half(x: f32) -> f32 {
+    let m = x.abs();
+    if !(m < 65520.0) {
+        // Infinity, a NaN, or a magnitude a half cannot hold.
+        return if m.is_nan() { x } else { f32::INFINITY.copysign(x) };
+    }
+    if m < 6.103_515_6e-5 {
+        const STEP: f32 = 5.960_464_5e-8;
+        return (x / STEP).round_ties_even() * STEP;
+    }
+    let b = x.to_bits();
+    let tie = (b >> 13) & 1;
+    f32::from_bits(((b + 0x0FFF + tie) >> 13) << 13)
+}
+
 #[inline]
 pub fn gelu(x: f32) -> f32 {
     let inner = 0.797_884_56 * (x + 0.044_715 * x * x * x);
@@ -541,6 +568,15 @@ impl Net {
             i: s.i,
             o: s.o,
         };
+        // The trunk's mix and out matrices are half precision on the card, so
+        // they are half precision here. `flat` keeps what arrived, which is
+        // what the card is given and what it rounds for itself, so the two
+        // sides round the same numbers rather than one rounding the other's.
+        let halved = |s: Span| {
+            let mut lin = layer(s);
+            lin.w.iter_mut().for_each(|v| *v = half(*v));
+            lin
+        };
         let norms = l
             .norms
             .iter()
@@ -566,9 +602,9 @@ impl Net {
                 .blocks
                 .iter()
                 .map(|s| Block {
-                    mix: layer(s.mix),
+                    mix: halved(s.mix),
                     pool: layer(s.pool),
-                    out: layer(s.out),
+                    out: halved(s.out),
                 })
                 .collect(),
             board_out: layer(l.board_out),
@@ -738,6 +774,10 @@ impl Net {
         for (i, blk) in self.blocks.iter().enumerate() {
             a.copy_from_slice(&x[..cells * C]);
             self.norms[ln_block(i, 0)].apply(&mut a, cells, &mut arg, &mut th);
+            // Everything a trunk matrix multiplies is half precision, so
+            // everything a trunk matrix multiplies is rounded here. The pooled
+            // statistics below read `a` after this, as the card does.
+            a[..cells * C].iter_mut().for_each(|v| *v = half(*v));
             for cell in 0..cells {
                 let h = cell % N_HEXES;
                 let (self_part, neigh) = mixed[cell * 2 * C..(cell + 1) * 2 * C].split_at_mut(C);
@@ -752,6 +792,7 @@ impl Net {
                         *o += v;
                     }
                 }
+                neigh.iter_mut().for_each(|v| *v = half(*v));
             }
             blk.mix.run(&mixed, cells, &mut y);
             for r in 0..rows {
@@ -761,10 +802,12 @@ impl Net {
                 for h in 0..N_HEXES {
                     let src = &a[(r * N_HEXES + h) * C..(r * N_HEXES + h + 1) * C];
                     for j in 0..C {
-                        mean[j] += src[j] / N_HEXES as f32;
+                        mean[j] += src[j];
                         max[j] = max[j].max(src[j]);
                     }
                 }
+                // Summed and then divided, which is the order the card sums in.
+                mean.iter_mut().for_each(|v| *v /= N_HEXES as f32);
             }
             blk.pool.run(&pooled, rows, &mut gb);
             for cell in 0..cells {
@@ -774,6 +817,7 @@ impl Net {
                 }
             }
             self.norms[ln_block(i, 1)].apply(&mut y, cells, &mut arg, &mut th);
+            y[..cells * C].iter_mut().for_each(|v| *v = half(*v));
             blk.out.run(&y, cells, &mut z);
             for (o, &v) in x[..cells * C].iter_mut().zip(&z[..cells * C]) {
                 *o += v;
@@ -822,10 +866,12 @@ impl Net {
             for h in 0..N_HEXES {
                 let src = &x[(r * N_HEXES + h) * C..(r * N_HEXES + h + 1) * C];
                 for j in 0..C {
-                    dst[j] += src[j] / N_HEXES as f32;
+                    dst[j] += src[j];
                     dst[C + j] = dst[C + j].max(src[j]);
                 }
             }
+            // Summed and then divided, which is the order the card sums in.
+            dst[..C].iter_mut().for_each(|v| *v /= N_HEXES as f32);
             dst[2 * C..].copy_from_slice(
                 &xpub[r * PUBFEAT + OFF_LOOSE..r * PUBFEAT + OFF_LOOSE + LOOSE],
             );

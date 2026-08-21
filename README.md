@@ -27,10 +27,14 @@ train/           train.py    PyTorch training loop, snapshots on a timer
 tools/           box.sh      the GPU box: sync, build, run, pull a run back
   arena.py       archive bots; ladder them, and score them on proven endgames
   monitor.py     live dashboard over runs/ and arena/, served from disk
+  farmbench.py   solves/s on a fixed corpus, for ranking builds
+  genrate.sh     solves/s in a real short run, which is the number that counts
+  probe.sh       the card and host profiles behind docs/REDESIGN.md
+  netablate.py   what each part of the value network costs, and buys
 docs/
   ENGINE_FIXES.md  rule corrections found by replaying 1,112 real games
   REBEL.md         the ReBeL agent: PBS design, CFR solver, the value network
-  PERF.md          how the generation loop got ~10x faster, and what didn't work
+  REDESIGN.md      what a solve costs, what binds, and what to rip out
   ARENA.md         bots, the referee protocol, and how a ladder is run
 ```
 
@@ -103,9 +107,7 @@ why the alternative is not an approximation but a different game.
 
 Thirty minutes on an 8-core M1 took the v4 agent from 356 Elo to 852, against 174
 for the handcrafted Greedy reference and 0 for random play — and shows it
-gaining almost nothing after the first seventeen (`runs/elo01`). See
-`docs/PERF.md` for how the generation loop got fast enough for that to fit in
-half an hour.
+gaining almost nothing after the first seventeen (`runs/elo01`).
 
 ## Design
 
@@ -128,16 +130,11 @@ that way has a scenario test — see `docs/ENGINE_FIXES.md`.
 cd engine
 cargo test                          # solver and engine tests
 cargo run --release --bin bench     # engine throughput, ~2.8M applies/sec/core
-cargo run --release --bin rebelbench -- weights.bin   # generation throughput
 maturin develop --release           # python module `warchest` (Game)
 ```
 
-`rebelbench` runs the ReBeL generation loop without Python, on weights exported
-by `train/export_weights.py`, and is what `docs/PERF.md`'s numbers come from.
-
-Build it with `--features prof` for a per-phase breakdown. Its `games nodes
-expand iters threads` arguments default to the trainer's settings. Throughput
-is only comparable at identical search budgets; `iters` and `expand` change
-the work represented by one solve.
+Generation throughput is `tools/farmbench.py` against a fixed corpus, and
+`tools/genrate.sh` in a real short run. Throughput is only comparable at
+identical search budgets.
 
 The `python` feature is off by default; the pure-Rust API needs no pyo3.

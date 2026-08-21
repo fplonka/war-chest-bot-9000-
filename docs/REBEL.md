@@ -490,7 +490,7 @@ The Rust tests cover the engine, the PBS, the solver and the CPU network.
 * `tools/arena.py` — the ladder: archived bots, a referee, and Elo. It rates
   checkpoints from incompatible revisions on one
   scale.
-* `train/export_weights.py` — the flat blob `rebelbench` loads.
+* `train/export_weights.py` — the flat blob the Rust tools load.
 
 ## 9. Layout
 

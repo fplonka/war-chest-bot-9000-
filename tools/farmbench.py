@@ -70,6 +70,13 @@ def bench(args, devices, threads):
         base = [int(d[k]) for k in KEYS]
         rate = solves / dt
         per_round = calls / max(rounds, 1)
+        # A round waits for the slowest thread in its cohort, so what a solver
+        # thread does between rounds is the round's floor. With more threads
+        # than cores this is queueing as much as work, which is the whole
+        # question about the thread-per-solve shape.
+        # `awake()` reports milliseconds already.
+        ms, spans, longest = warchest.awake()
+        awake = ms / max(spans, 1)
         print(
             f"threads={threads:3d} t={now - start:5.0f}s: "
             f"{rate:7.1f} solves/s | "
@@ -77,7 +84,8 @@ def bench(args, devices, threads):
             f"rounds/solve {rounds * per_round / max(solves, 1):5.1f}  "
             f"round {1e3 * dt / max(rounds, 1):6.1f} ms | "
             f"{per_round:5.1f} calls/round  {rows / max(rounds, 1):7.0f} rows/round  "
-            f"device {1e-9 * nanos / dt:4.0%}",
+            f"device {1e-9 * nanos / dt:4.0%}  "
+            f"awake {awake:5.1f}/{longest:6.1f} ms",
             flush=True,
         )
         mark, solves = now, 0

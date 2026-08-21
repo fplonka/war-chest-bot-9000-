@@ -691,6 +691,8 @@ def main():
             config_cap=args.config_cap,
             query_rate=args.query_rate,
             recursive_rate=args.recursive_rate,
+            cohorts=args.gen_cohorts,
+            grow_every=args.grow_every,
             devices=[int(d) for d in args.gen_devices.split(",")])
 
         optimizer_rows = 0

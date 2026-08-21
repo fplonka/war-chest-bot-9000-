@@ -84,16 +84,16 @@
   {
    "name": "greedy",
    "elo": 0.0,
-   "se": 50.9,
-   "games": 120,
-   "score": 0.133
+   "se": 48.9,
+   "games": 160,
+   "score": 0.103
   },
   {
    "name": "gt30.final",
-   "elo": 568.2,
-   "se": 146.3,
-   "games": 40,
-   "score": 0.975,
+   "elo": 624.4,
+   "se": 52.7,
+   "games": 80,
+   "score": 0.775,
    "minutes": 35.1
   },
   {
@@ -114,10 +114,10 @@
   },
   {
    "name": "gt30.s2",
-   "elo": null,
-   "se": null,
-   "games": 0,
-   "score": 0.0,
+   "elo": 580.2,
+   "se": 52.0,
+   "games": 80,
+   "score": 0.706,
    "minutes": 25.0
   }
  ],
@@ -157,6 +157,30 @@
    "paired_w": 0,
    "paired_l": 20,
    "paired_p": 1.907e-06
+  },
+  {
+   "a": "greedy",
+   "b": "gt30.s2",
+   "w": 0,
+   "l": 39,
+   "d": 1,
+   "n": 40,
+   "score": 0.0125,
+   "paired_w": 0,
+   "paired_l": 20,
+   "paired_p": 1.907e-06
+  },
+  {
+   "a": "gt30.final",
+   "b": "gt30.s2",
+   "w": 23,
+   "l": 17,
+   "d": 0,
+   "n": 40,
+   "score": 0.575,
+   "paired_w": 7,
+   "paired_l": 4,
+   "paired_p": 0.5488
   }
  ]
 }

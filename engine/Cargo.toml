@@ -34,9 +34,6 @@ gpu = ["dep:cudarc"]
 name = "bench"
 path = "src/bin/bench.rs"
 
-[[bin]]
-name = "rebelbench"
-path = "src/bin/rebelbench.rs"
 
 # The arena bot. Archived per experiment, so it is built on its own and copied
 # into the bot's directory rather than run from `target/`.

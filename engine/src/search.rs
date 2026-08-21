@@ -31,7 +31,7 @@
 use crate::actions::Action;
 use crate::board::NONE;
 use crate::farm::{Call, Dst, Gate, Reply, Writes};
-use crate::net::Net;
+use crate::net::{half, Net};
 use crate::rng::Rng;
 use crate::rebel::*;
 use crate::state::{Cont, State};
@@ -233,6 +233,40 @@ impl Cfr {
     }
 }
 
+/// The same units, summed over the iterations that ran on them.
+///
+/// The device charges per iteration for the join, the readout, the pooling and
+/// the two sweeps, and a growing tree is a different size at every one, so a
+/// final `Shape` prices none of them. `Solver::step` adds a term.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct Trace {
+    pub iters: u64,
+    pub row_iters: u64,
+    pub cidx_iters: u64,
+    pub cell_iters: u64,
+}
+
+/// What a solve built, in the units the device charges for. See `Solver::shape`.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct Shape {
+    pub nodes: usize,
+    /// Network rows: one per decision node at a coin play, ever created. The
+    /// trunk runs once per row; the join runs over all of them every iteration,
+    /// including the rows of nodes that growth has since made interior.
+    pub rows: usize,
+    pub cells: usize,
+    /// Distinct configs the solve interned. `f` is `[ncfg, D]` and the readout
+    /// gathers rows of it, so this is the working set that decides whether the
+    /// gather hits L2 or memory.
+    pub ncfg: usize,
+    /// Belief-index entries over the rows: one per (row, player, config in
+    /// support). The readout and the belief pooling each run once per entry
+    /// per iteration.
+    pub cidx: usize,
+    pub depth: usize,
+}
+
+
 /// How well a solve came out, in two numbers that are read together.
 #[derive(Clone, Copy, Debug)]
 pub struct Conv {
@@ -329,14 +363,6 @@ impl Nets {
 /// nearest even. The exponent range is not modelled because leaf values are of
 /// order one and nowhere near half precision's limits; what is being measured
 /// is the lost mantissa.
-fn half_precision(x: f32) -> f32 {
-    let b = x.to_bits();
-    // Round to nearest, ties to even, on the thirteen bits half precision does
-    // not have.
-    let round = (b >> 13) & 1;
-    f32::from_bits(((b + 0x0FFF + round) >> 13) << 13)
-}
-
 /// Which coin leaves the acting player's hand when `a` is played. Derived from
 /// the rules rather than from the engine's action listing: the Royal Guard
 /// tactic is offered whenever a Royal Guard is deployed, but it always spends
@@ -760,7 +786,10 @@ pub struct Solver<'a> {
     /// incremented as a trajectory passes — which is also the virtual loss,
     /// since later simulations of the same phase then see the earlier ones.
     /// `qval` is the action value the last backprop formed, before it was
-    /// turned into a regret.
+    /// turned into a regret. The device keeps no such array -- it holds a
+    /// value arena per traverser, so `k_expand` re-forms Q out of `cell_val`
+    /// where it selects. Here there is one arena and each traverser's pass
+    /// overwrites it, so the number has to be kept as it is made.
     pub(crate) prior: Vec<f32>,
     pub(crate) visits: Vec<f32>,
     pub qval: Vec<f32>,
@@ -825,6 +854,9 @@ pub struct Solver<'a> {
     // ~2,000 times a solve and the join ~158,000.
     /// Non-terminal leaves in node order — the rows of the network batch.
     pub leaf_rows: Vec<usize>,
+    /// Diagnostics: the per-iteration work this solve has done so far. Nothing
+    /// in a run reads it; the budget study prices a search with it.
+    pub trace: Trace,
     /// Terminal leaves, scored from the game instead of the network.
     pub(crate) term_leaves: Vec<usize>,
     /// Per row, per player: an index into `cphi` for every config in support,
@@ -962,6 +994,7 @@ impl<'a> Solver<'a> {
             nc: Vec::new(),
             steps: [0, 0],
             leaf_rows: Vec::new(),
+            trace: Trace::default(),
             term_leaves: Vec::new(),
             leaf_cidx: Vec::new(),
             leaf_coff: Vec::new(),
@@ -1909,10 +1942,10 @@ impl<'a> Solver<'a> {
             // rounds nothing at all.
             let v = u * opp_reach;
             self.vals[vo..vo + n]
-                .fill(if self.cfg.half_leaves { half_precision(v) } else { v });
+                .fill(if self.cfg.half_leaves { half(v) } else { v });
         }
         let d = crate::net::D;
-        let half = self.cfg.half_leaves;
+        let rounding = self.cfg.half_leaves;
         let (reach, roff, ncs, voff, coff, cidx, cf, vals) = (
             &self.reach,
             &self.roff,
@@ -1941,8 +1974,8 @@ impl<'a> Solver<'a> {
             );
             for value in &mut vals[vo..vo + n] {
                 *value *= opp_reach;
-                if half {
-                    *value = half_precision(*value);
+                if rounding {
+                    *value = half(*value);
                 }
             }
         }
@@ -2152,6 +2185,10 @@ impl<'a> Solver<'a> {
     /// updates, so a solve of `iters` iterations now gives each player `iters`
     /// updates rather than `iters / 2`.
     pub fn step(&mut self) {
+        self.trace.iters += 1;
+        self.trace.row_iters += self.leaf_rows.len() as u64;
+        self.trace.cidx_iters += self.leaf_cidx.len() as u64;
+        self.trace.cell_iters += self.ncells as u64;
         self.update_regrets(0);
         self.update_regrets(1);
         self.precompute_reaches();
@@ -2968,6 +3005,34 @@ impl<'a> Solver<'a> {
             0.0
         } else {
             total / rows as f32
+        }
+    }
+
+    /// The counters a solve's device cost is proportional to.
+    ///
+    /// Diagnostics: nothing in a run reads this. The kernel table is a handful
+    /// of terms in these -- the trunk runs once per row, the join twice per
+    /// row per iteration, the readout and the pooling once per belief-index
+    /// entry per iteration, and the two sweeps once per cell per iteration --
+    /// so a search budget can be priced without running the farm.
+    pub fn shape(&self) -> Shape {
+        let mut depth = vec![0u32; self.nodes.len()];
+        let mut worst = 0;
+        for i in 0..self.nodes.len() {
+            for &ch in &self.nodes[i].child {
+                if ch > i {
+                    depth[ch] = depth[i] + 1;
+                    worst = worst.max(depth[ch]);
+                }
+            }
+        }
+        Shape {
+            nodes: self.nodes.len(),
+            rows: self.leaf_rows.len(),
+            cells: self.ncells,
+            ncfg: self.ncfg,
+            cidx: self.leaf_cidx.len(),
+            depth: worst as usize,
         }
     }
 
