@@ -69,6 +69,15 @@ pub struct Cfg {
     /// one. It is off by default because it changes the search, not just its
     /// speed, and belongs to a ladder rather than a probe.
     pub grow_every: usize,
+    /// Round every leaf value to half precision before CFR sees it.
+    ///
+    /// Not a production setting: it is how the cost of a half-precision
+    /// network is measured *in the units that matter*. The device network's
+    /// arithmetic on tensor cores moves the board vector by 5.39e-2 against a
+    /// 1e-3 parity bound, which sounds fatal and says nothing about whether
+    /// the search that reads it is any worse. `nash_conv` says that, and this
+    /// is the switch it compares across.
+    pub half_leaves: bool,
     /// The regret-update rule.
     pub cfr: Cfr,
     /// Max tree nodes a solve may build. 0 = unlimited. A solve that hits the
@@ -104,6 +113,7 @@ impl Default for Cfg {
             iters: 64,
             expand: 1,
             grow_every: 1,
+            half_leaves: false,
             // A depth-2 uniform tree ran to about a thousand nodes, which is
             // the budget this replaces, spent by growth instead of evenly.
             nodes: 1024,
@@ -313,6 +323,18 @@ impl Nets {
         gate.submit_all(calls)
             .expect("the inference gate closed while a solve was still running")
     }
+}
+
+/// `x` with a half-precision mantissa: ten bits kept, the rest rounded to
+/// nearest even. The exponent range is not modelled because leaf values are of
+/// order one and nowhere near half precision's limits; what is being measured
+/// is the lost mantissa.
+fn half_precision(x: f32) -> f32 {
+    let b = x.to_bits();
+    // Round to nearest, ties to even, on the thirteen bits half precision does
+    // not have.
+    let round = (b >> 13) & 1;
+    f32::from_bits(((b + 0x0FFF + round) >> 13) << 13)
 }
 
 /// Which coin leaves the acting player's hand when `a` is played. Derived from
@@ -1880,9 +1902,17 @@ impl<'a> Solver<'a> {
             };
             let n = self.nc[i][p] as usize;
             let vo = self.voff[i] as usize;
-            self.vals[vo..vo + n].fill(u * opp_reach);
+            // A terminal leaf's value is the game's, not the network's, but it
+            // travels the same arithmetic afterwards -- and in an endgame that
+            // fits entirely inside the subgame it is *all* the leaf values
+            // there are, so the half-precision probe has to round it too or it
+            // rounds nothing at all.
+            let v = u * opp_reach;
+            self.vals[vo..vo + n]
+                .fill(if self.cfg.half_leaves { half_precision(v) } else { v });
         }
         let d = crate::net::D;
+        let half = self.cfg.half_leaves;
         let (reach, roff, ncs, voff, coff, cidx, cf, vals) = (
             &self.reach,
             &self.roff,
@@ -1911,6 +1941,9 @@ impl<'a> Solver<'a> {
             );
             for value in &mut vals[vo..vo + n] {
                 *value *= opp_reach;
+                if half {
+                    *value = half_precision(*value);
+                }
             }
         }
     }

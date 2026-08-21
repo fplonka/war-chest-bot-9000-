@@ -514,14 +514,37 @@ memory and reusing them across many rows the way cuBLAS does. That is real
 work, and it is now the known price of the FP16 programme rather than a
 guess.
 
-**And there is a second question waiting behind it.** Half precision costs
-5.39e-2 on the board vector against a 1e-3 tolerance -- fifty-four times, and
-that is the *inputs* being rounded, not the accumulation, so a deterministic
-kernel would not fix it. Whether that matters is a search-quality question
-rather than a numerical one, and
-`growing_less_often_searches_worse` shows the shape of the answer:
-`nash_conv` over a corpus of micro-endgames, half precision against single.
-Do that before building the kernel, not after.
+**The question waiting behind it is now answered, and the answer is go.**
+Half precision moves the board vector 5.39e-2 against a 1e-3 parity bound --
+fifty-four times over, which sounds fatal. But a parity bound is a statement
+about agreeing with the CPU reference, not about searching well.
+`half_precision_leaves_cost_the_search_this_much` asks the second question:
+the same roots, iterations and stream, leaf values rounded to ten mantissa
+bits before CFR reads them.
+
+```
+NashConv over 46 roots: single 0.01598   half 0.01627   ratio 1.018
+```
+
+**1.8%.** For comparison, `grow_every` at two costs 28% and at four 65%, for
+less throughput than the tensor cores would return. So the 5.39e-2 is a
+tolerance to re-justify -- with an exact path for the oracle and a bounded
+fast-versus-exact check, the way the pre-SoG code did it -- and not a reason
+to abandon half precision. **The tiled GEMM is worth building.**
+
+One caution about this measurement. The micro-endgames it runs on fit
+entirely inside the subgame, so every leaf is terminal and its value comes
+from the game rather than the network; what is rounded is the utility times
+the opponent's reach. That is the same arithmetic a network value travels
+afterwards, so it is a fair probe of the search's sensitivity, but it is not
+the network's own error. Repeat it against a trained net before trusting the
+1.8% precisely.
+
+A first run of this reported a ratio of exactly 1.000, which was the probe
+doing nothing: `Nets::default()` is empty, `readout` fills zero and returns
+before the rounding, and in an all-terminal tree the values come from a branch
+the probe had not touched. **Two arms of an experiment agreeing to five
+decimals is evidence of a broken experiment, not a result.**
 
 ## What is left, in order
 
