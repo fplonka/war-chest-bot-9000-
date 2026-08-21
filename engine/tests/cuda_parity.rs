@@ -19,20 +19,12 @@
 //! regret update and the value pass under the average — so a drift in any of
 //! them lands there.
 //!
-//! Both of those compare against the CPU, so both build the device in
-//! `Math::Fp32`. Production runs `Math::Tf32`, which rounds every GEMM operand
-//! to ten mantissa bits: a real gain on the card and a real disagreement with
-//! an f32 reference, so an oracle in that mode would only be measuring its own
-//! tolerance. The two tests that compare the device with itself -- growth, and
-//! a solve riding in a shared round -- run `Tf32`, because there the question
-//! is about the shape a run actually has.
-//!
 //! Needs a GPU, so it only builds under `--features gpu`.
 #![cfg(feature = "gpu")]
 
 use std::sync::Arc;
 
-use warchest::cuda::{Device, Math};
+use warchest::cuda::Device;
 use warchest::farm::{Backend, Call, Reply};
 use warchest::net::{Net, NetLayout};
 use warchest::pbs::{enumerate_configs, reserve, true_config, Belief, Ctx};
@@ -203,7 +195,7 @@ fn the_cfr_loop_agrees_on_a_fixed_tree() {
     let host = generate_one(&net, Backend::Reference(net.clone()), 3, 8, 0.0);
     let card = generate_one(
         &net,
-        Backend::Cuda(Device::new(&[0], net.clone(), Math::Fp32).expect("device")),
+        Backend::Cuda(Device::new(&[0], net.clone()).expect("device")),
         3,
         8,
         0.0,
@@ -254,7 +246,7 @@ fn growth_on_the_device_produces_sane_targets() {
     let net = random_net(0x9E37);
     let card = generate_one(
         &net,
-        Backend::Cuda(Device::new(&[0], net.clone(), Math::Tf32).expect("device")),
+        Backend::Cuda(Device::new(&[0], net.clone()).expect("device")),
         3,
         32,
         4.0,
@@ -291,7 +283,7 @@ fn a_solve_does_not_depend_on_the_round_it_rides_in() {
     }
     let net = random_net(0x9E37);
     let streams = [(0x51E5u64, 8u32), (0x0A13, 11), (0x77C1, 13), (0x2E57, 17)];
-    let device = || Backend::Cuda(Device::new(&[0], net.clone(), Math::Tf32).expect("device"));
+    let device = || Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
     let together = generate(&net, device(), &streams, 3, 0.0);
     // A shared round must not move a solve at all, so the same run twice is
     // the control: whatever this reports is the floor the comparison sits on.
@@ -363,7 +355,7 @@ fn the_resident_state_agrees_with_the_cpu_network() {
     }
     let net = random_net(0x9E37);
     let host = one_solve(&net, &Backend::Reference(net.clone()), 8, 0.0);
-    let device = Backend::Cuda(Device::new(&[0], net.clone(), Math::Fp32).expect("device"));
+    let device = Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
     let card = one_solve(&net, &device, 8, 0.0);
     let Backend::Cuda(d) = &device else { unreachable!("just built") };
     let got = d.resident(0, 0).expect("the card gave its solve back");
@@ -409,7 +401,7 @@ fn a_subgame_scored_from_the_game_agrees_with_the_cpu() {
     let net = random_net(0x9E37);
     let nets = Arc::new(Nets { value: net.clone(), device: true });
     let host_nets = Arc::new(Nets { value: net.clone(), device: false });
-    let backend = Backend::Cuda(Device::new(&[0], net.clone(), Math::Fp32).expect("device"));
+    let backend = Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
     let host = Backend::Reference(net.clone());
     let uniform = |s: &State, ctx: &Ctx, p: u8| {
         let truth = true_config(s, p, ctx);

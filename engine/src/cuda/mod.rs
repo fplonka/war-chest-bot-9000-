@@ -26,9 +26,8 @@
 
 use std::sync::Arc;
 
-use cudarc::cublas::sys::cublasMath_t;
 use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
-use cudarc::cublas::{result::CublasError, CudaBlas, Gemm, GemmConfig};
+use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
     DriverError, LaunchArgs, LaunchConfig, PushKernelArg,
@@ -257,35 +256,6 @@ fn warp_rows(rows: usize) -> LaunchConfig {
 /// budget, generation runs at 21 solves/s with one stream a card and 75 to 86
 /// with ten.
 const STREAMS: usize = 10;
-
-/// How a card is allowed to multiply.
-///
-/// Every GEMM in the network goes through one cuBLAS handle a stream, and the
-/// handle's math mode decides whether the multiply runs on the tensor cores.
-/// `Tf32` rounds each operand to ten mantissa bits and accumulates in single
-/// precision, which is what an Ampere card does at twice its plain rate; `Fp32`
-/// is the plain multiply.
-///
-/// Production is `Tf32`. `Fp32` exists for one caller: `tests/cuda_parity`
-/// holds the card's resident arrays to the CPU network at 2e-4, and that bound
-/// is a statement about the arithmetic being the same arithmetic. Ten mantissa
-/// bits are not, so an oracle that ran in `Tf32` would be testing the tolerance
-/// rather than the code. Whether the *search* minds the rounding is a different
-/// question, and `tests/sog_solver` asks it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Math {
-    Tf32,
-    Fp32,
-}
-
-impl Math {
-    fn mode(self) -> cublasMath_t {
-        match self {
-            Math::Tf32 => cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
-            Math::Fp32 => cublasMath_t::CUBLAS_DEFAULT_MATH,
-        }
-    }
-}
 
 pub struct Device {
     /// One entry per stream, `STREAMS` of them per ordinal. Each is driven by
@@ -994,7 +964,7 @@ struct Card {
 
 impl Device {
     /// Bring up one card per ordinal and upload the weights to each.
-    pub fn new(ordinals: &[usize], net: Net, math: Math) -> Res<Device> {
+    pub fn new(ordinals: &[usize], net: Net) -> Res<Device> {
         if ordinals.is_empty() {
             return Err("no cuda device ordinals given".into());
         }
@@ -1007,7 +977,7 @@ impl Device {
         let cards = ordinals
             .iter()
             .flat_map(|&o| (0..STREAMS).map(move |k| (o, k)))
-            .map(|(o, k)| Card::new(o, &net, k > 0, math))
+            .map(|(o, k)| Card::new(o, &net, k > 0))
             .collect::<Res<Vec<_>>>()?;
         Ok(Device { cards, net })
     }
@@ -1137,7 +1107,7 @@ pub struct Resident {
 }
 
 impl Card {
-    fn new(ordinal: usize, net: &Net, own_stream: bool, math: Math) -> Res<Card> {
+    fn new(ordinal: usize, net: &Net, own_stream: bool) -> Res<Card> {
         let ctx = CudaContext::new(ordinal).map_err(|e| format!("device {ordinal}: {e:?}"))?;
         // One stream per context and no sharing between them, so the read/write
         // events cudarc would otherwise create on every allocation buy nothing
@@ -1167,9 +1137,6 @@ impl Card {
         let module = ctx.load_module(ptx).map_err(err)?;
         let k = Kernels::load(&module)?;
         let blas = CudaBlas::new(stream.clone()).map_err(err)?;
-        unsafe { cudarc::cublas::sys::cublasSetMathMode(*blas.handle(), math.mode()) }
-            .result()
-            .map_err(|e: CublasError| format!("math mode: {e:?}"))?;
         let flat = net.flat();
         let nb: Vec<i32> = board()
             .neighbors

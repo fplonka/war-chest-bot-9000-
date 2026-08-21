@@ -211,8 +211,7 @@ fn devices(o: &Options) -> Option<Backend> {
         let n = warchest::cuda::Device::count();
         if n > 0 {
             let net = Net::load_bin(&o.weights).ok()?;
-            let all: Vec<usize> = (0..n).collect();
-            match warchest::cuda::Device::new(&all, net, warchest::cuda::Math::Tf32) {
+            match warchest::cuda::Device::new(&(0..n).collect::<Vec<_>>(), net) {
                 Ok(d) => return Some(Backend::Cuda(d)),
                 Err(e) => eprintln!("no device backend: {e}"),
             }
