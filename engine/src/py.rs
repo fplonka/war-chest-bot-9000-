@@ -741,7 +741,7 @@ impl SolveFarm {
 fn backend_for(_devices: &[usize], _value: crate::net::Net) -> PyResult<Backend> {
     #[cfg(feature = "gpu")]
     {
-        return crate::cuda::Device::new(_devices, _value)
+        return crate::cuda::Device::new(_devices, _value, crate::cuda::Math::Tf32)
             .map(Backend::Cuda)
             .map_err(pyo3::exceptions::PyRuntimeError::new_err);
     }
