@@ -17,7 +17,7 @@
 //! is asked of the card.
 
 use parking_lot::{Condvar, Mutex, RwLock};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -449,12 +449,14 @@ fn host_room() -> bool {
     /// Tenths of the machine's memory this process may hold before it stops
     /// admitting.
     ///
-    /// The rest is headroom, and most of it is for the solves already admitted:
-    /// they are still growing when admission stops, and measured, they take the
-    /// figure about seventy per cent past where it stopped. The replay buffer,
-    /// which grows over a run, and the allocator's own retained pages, which
-    /// inflate what this reads, are inside the same margin.
-    const SHARE: u64 = 4;
+    /// The rest is headroom, and most of it is for the solves already
+    /// admitted: they are still growing when admission stops, and a population
+    /// paced by its own completions passes the figure it stopped on by a factor
+    /// of `e`. The replay buffer, which grows over a run, and the allocator's
+    /// own retained pages, which inflate what this reads, are inside the same
+    /// margin. Measured on a 62 GB box, two tenths admits until the process
+    /// holds 12 GB and the population settles around 34.
+    const SHARE: u64 = 2;
     let field = |path: &str, at: usize| -> Option<u64> {
         std::fs::read_to_string(path)
             .ok()?
@@ -680,24 +682,27 @@ impl Farm {
         let collected = Arc::new(Mutex::new(Vec::new()));
         let stopping = Arc::new(AtomicBool::new(false));
         let broken = Arc::new(AtomicBool::new(false));
+        // Solves each stream has finished, which is what paces its admissions.
+        let done: Vec<Arc<AtomicUsize>> = (0..cards).map(|_| Arc::new(AtomicUsize::new(0))).collect();
         let stats = Arc::new(Stats::default());
         let backend = Arc::new(RwLock::new(backend));
 
         let hands: Vec<JoinHandle<()>> = (0..workers)
             .map(|t| {
-                let (ready, device, nets, collected, work, stopping) = (
+                let (ready, device, nets, collected, work, stopping, done) = (
                     Arc::clone(&ready),
                     device.clone(),
                     Arc::clone(&nets),
                     Arc::clone(&collected),
                     Arc::clone(&work),
                     Arc::clone(&stopping),
+                    done.clone(),
                 );
                 std::thread::Builder::new()
                     .name(format!("host-{t}"))
                     .spawn(move || {
                         while let Some(job) = ready.pop() {
-                            advance_job(job, &device, &nets, &work, &collected, &stopping);
+                            advance_job(job, &device, &nets, &work, &collected, &stopping, &done);
                         }
                     })
                     .expect("spawn host thread")
@@ -706,7 +711,7 @@ impl Farm {
 
         let drivers = (0..cards)
             .map(|c| {
-                let (queue, ready, backend, nets, work, stats, broken) = (
+                let (queue, ready, backend, nets, work, stats, broken, done) = (
                     Arc::clone(&device[c]),
                     Arc::clone(&ready),
                     Arc::clone(&backend),
@@ -714,6 +719,7 @@ impl Farm {
                     Arc::clone(&work),
                     Arc::clone(&stats),
                     Arc::clone(&broken),
+                    Arc::clone(&done[c]),
                 );
                 let seed = seed.wrapping_mul(0x9E37_79B9) ^ c as u64;
                 std::thread::Builder::new()
@@ -721,7 +727,7 @@ impl Farm {
                     .spawn(move || {
                         drive_card(
                             c, cards, seed, &queue, &ready, &backend, &nets, &work, &stats,
-                            &broken,
+                            &broken, &done,
                         )
                     })
                     .expect("spawn driver thread")
@@ -823,12 +829,14 @@ fn advance_job(
     work: &Work,
     collected: &Mutex<Vec<Data>>,
     stopping: &AtomicBool,
+    done: &[Arc<AtomicUsize>],
 ) {
     let mut replies = std::mem::take(&mut job.replies);
     loop {
         match job.solver.advance(&replies) {
             Step::Calls(calls) => return device[job.card].push((job, calls)),
             Step::Done(solved) => {
+                done[job.card].fetch_add(1, Ordering::Relaxed);
                 job.source.take(&job.solver, solved, &mut job.data);
                 // Every solve, not every eighth. A job re-reads the network
                 // between two solves anyway, so there is nothing a batch of
@@ -861,25 +869,32 @@ fn drive_card(
     work: &Work,
     stats: &Stats,
     broken: &AtomicBool,
+    done: &AtomicUsize,
 ) {
     let mut live = 0usize;
     loop {
-        // One solve admitted a round, and never retired. A solve's cost varies
-        // twenty-six fold with how far into a game its root sits, so how many
-        // fit is a question about bytes; what a card holds and what the process
-        // holds are both measured, and either one stops admission.
+        // Solves this stream has room for, admitted between rounds and never
+        // retired. A solve's cost varies twenty-six fold with how far into a
+        // game its root sits, so how many fit is a question about bytes; what
+        // the card holds and what the process holds are both measured, and
+        // either one stops admission.
         //
-        // One at a time because the levels lag. A solve's arenas fill over its
-        // whole run, so what the population holds now is what a younger one
-        // held, and admitting faster than they mature overshoots by whatever
-        // the growth was in the meantime. At one a round the overshoot is the
-        // rounds a solve lives for -- a fifth of the population -- and the ramp
-        // still takes seconds, because a round is milliseconds.
+        // Both levels lag. A solve's arenas fill over its whole run, so what a
+        // population holds now is what a younger one held, and admission
+        // overshoots by whatever it grew in the meantime. Pacing it one for one
+        // against the solves this stream has *finished* makes that factor `e`
+        // and nothing else -- the population grows by its own size over one
+        // solve's life however many streams there are -- which is why the share
+        // below is well under what actually fits. A count of rounds does not
+        // have that property: it is ten times faster with ten streams, and it
+        // filled the host.
         //
         // Nothing new once the farm is winding down. The solves in flight have
         // to finish before a worker can leave, and a fresh one would be a whole
         // solve of that wait for rows nobody will collect.
-        let room = live < MAX_IN_FLIGHT && host_room() && backend.read().has_room(card, live);
+        let paid = live <= done.load(Ordering::Relaxed);
+        let room =
+            paid && live < MAX_IN_FLIGHT && host_room() && backend.read().has_room(card, live);
         if !ready.closed() && (live == 0 || room) {
             let mut source = Source::new(
                 work,

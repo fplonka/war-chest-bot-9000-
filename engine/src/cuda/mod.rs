@@ -249,10 +249,21 @@ fn warp_rows(rows: usize) -> LaunchConfig {
 ///
 /// A round is split across the cards by call, so each card builds and runs a
 /// self-contained batch and nothing crosses the bus between them.
+/// Independent streams a GPU is fed by.
+///
+/// Each is a whole copy of a card's working state -- its own stream, staging,
+/// scratch and solve table -- and the farm drives each with a thread of its
+/// own. One is not enough: a driver spends about three fifths of a round
+/// issuing launches rather than waiting for the card, so a single stream leaves
+/// the GPU idle through most of it. Measured on two 3090s at the production
+/// budget, generation runs at 21 solves/s with one stream a card and 75 to 86
+/// with ten.
+const STREAMS: usize = 10;
+
 pub struct Device {
-    /// One entry per card, each with its own stream, staging and solve table.
-    /// A card is driven by one thread, which is what makes a round a batch:
-    /// everything that thread found waiting goes in together.
+    /// One entry per stream, `STREAMS` of them per ordinal. Each is driven by
+    /// one thread, which is what makes a round a batch: everything that thread
+    /// found waiting goes in together.
     cards: Vec<Card>,
     net: Net,
 }
@@ -308,7 +319,8 @@ fn owed_by_the_join(l: &NetLayout, b: &[f32]) -> Vec<f32> {
 }
 
 /// What a round's own intermediates and the allocator's spare blocks take,
-/// beside the solve arenas a card's budget counts.
+/// beside the solve arenas a card's budget counts. Every stream of an ordinal
+/// has its own set of them.
 const ROUND_RESERVE: u64 = 6 << 30;
 
 /// Leaf rows a pass works on at once.
@@ -948,9 +960,13 @@ impl Device {
         if net.is_empty() {
             return Err("cannot start the device backend without weights".into());
         }
+        // Only the context is shared between an ordinal's streams; the
+        // weights are duplicated because they are a few megabytes against the
+        // rounds they serve.
         let cards = ordinals
             .iter()
-            .map(|&o| Card::new(o, &net))
+            .flat_map(|&o| (0..STREAMS).map(move |k| (o, k)))
+            .map(|(o, k)| Card::new(o, &net, k > 0))
             .collect::<Res<Vec<_>>>()?;
         Ok(Device { cards, net })
     }
@@ -1036,7 +1052,7 @@ impl Device {
 }
 
 impl Card {
-    fn new(ordinal: usize, net: &Net) -> Res<Card> {
+    fn new(ordinal: usize, net: &Net, own_stream: bool) -> Res<Card> {
         let ctx = CudaContext::new(ordinal).map_err(|e| format!("device {ordinal}: {e:?}"))?;
         // One stream per context and no sharing between them, so the read/write
         // events cudarc would otherwise create on every allocation buy nothing
@@ -1056,7 +1072,13 @@ impl Card {
             },
         )
         .map_err(|e| format!("nvrtc: {e:?}"))?;
-        let stream = ctx.default_stream();
+        // A stream past the first needs one of its own, or the two drivers
+        // serialise on the card they are meant to be filling in turn.
+        let stream = if own_stream {
+            ctx.new_stream().map_err(err)?
+        } else {
+            ctx.default_stream()
+        };
         let module = ctx.load_module(ptx).map_err(err)?;
         let k = Kernels::load(&module)?;
         let blas = CudaBlas::new(stream.clone()).map_err(err)?;
@@ -1079,10 +1101,12 @@ impl Card {
         let t = layout.norms[LN_TRUNK];
         plan.extend([t.g as i32, t.b as i32]);
         let owed = owed_by_the_join(&layout, &flat.b);
-        // After the weights are up and before any solve is admitted. The box is
-        // shared, so what another process already holds is simply not free.
+        // After the weights are up and before any solve is admitted. The box
+        // is shared, so what another process already holds is simply not free.
+        // Every stream of an ordinal reads the same figure and takes a share of
+        // it, because they are all spending the one card's memory.
         let free = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
-        let budget = free.saturating_sub(ROUND_RESERVE);
+        let budget = free.saturating_sub(ROUND_RESERVE) / STREAMS as u64;
         Ok(Card {
             plan: stream.memcpy_stod(&plan).map_err(err)?,
             owed: stream.memcpy_stod(&owed).map_err(err)?,
