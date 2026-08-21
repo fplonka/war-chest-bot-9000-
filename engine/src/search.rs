@@ -2155,30 +2155,57 @@ impl<'a> Solver<'a> {
         if self.nets.device {
             return self.solve_on_device(rng);
         }
-        for _ in 0..self.cfg.iters {
+        // `grow_every` iterations to a round, because that is what the device
+        // does: the host is woken once a round, and every expansion phase in
+        // between selects from the tree as it stood when the round began. Run
+        // one at a time this is the old loop exactly.
+        let per = self.cfg.grow_every.max(1);
+        let mut left = self.cfg.iters;
+        while left > 0 {
             // A capped tree is retired by its caller, so every iteration after
             // the cap is struck is work nobody reads. `Solver::new` can strike
             // it on the root's own expansion.
             if self.capped {
                 break;
             }
-            self.step();
-            // The expansion phase reads the prior at every node it walks
-            // through, and `step` has just run the batch that any node grown
-            // last iteration was waiting for.
-            self.refresh_priors();
+            let batch = left.min(per);
+            let mut sampled: Vec<usize> = Vec::new();
+            for _ in 0..batch {
+                self.step();
+                // The expansion phase reads the prior at every node it walks
+                // through, and `step` has just run the batch that any node
+                // grown last round was waiting for.
+                self.refresh_priors();
+                for _ in 0..self.cfg.expand {
+                    if self.nodes.len() + sampled.len() >= self.cfg.nodes {
+                        break;
+                    }
+                    match self.sample_leaf(rng) {
+                        Some(leaf) => sampled.push(leaf),
+                        None => break,
+                    }
+                }
+            }
             let mut grew = false;
-            for _ in 0..self.cfg.expand {
-                if self.nodes.len() >= self.cfg.nodes || !self.expand_once(rng) {
+            for leaf in sampled {
+                if self.over_cap() || self.nodes.len() >= self.cfg.nodes {
                     break;
                 }
-                grew = true;
+                // Two trajectories of a round can land on the same leaf, and
+                // the second finds it is no longer one. The device drops it
+                // the same way; the visit counts a trajectory leaves behind
+                // are what make that rare rather than usual.
+                if self.nodes[leaf].leaf && !self.states[leaf].is_terminal() {
+                    self.grow(leaf);
+                    grew = true;
+                }
             }
             if grew && !self.capped {
                 // Growth appended reach rows after `step` propagated the old
                 // tree. The next regret update must see the new leaves.
                 self.precompute_reaches();
             }
+            left -= batch;
         }
         if !self.capped {
             self.finish();

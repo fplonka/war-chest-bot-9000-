@@ -395,6 +395,34 @@ piece of work before the default moves.
 
 ## What was tried and abandoned
 
+**Everything that raises memory pressure costs rate, and nothing else about
+the allocator matters.** Three measurements say the same thing:
+
+| change | effect on memory | solves/s |
+|---|---|---:|
+| arbitrary sizes (`2 * want`) | pool holds every size ever asked | 28.0 |
+| a power-of-two class | pool reuses; peak 24,027 -> 17,969 MiB | **32.5** |
+| eight classes an octave | eight times fewer blocks fit a request | out of memory |
+| `RELEASE_THRESHOLD` at max | pool never gives pages back | 24.8 |
+
+Holding the pool was meant to stop the driver re-mapping pages, which is
+device-wide and would stall every lane. It made things worse, and `held` went
+from 17.2 GB to 25.9. So the allocator is not a hidden serialiser; it is a
+*memory* effect throughout, and bytes a solve is the lever.
+
+Worth correcting an error that motivated that experiment: the probe's `device`
+percentage is wall time inside `eval`, which includes waiting on the card, and
+is **not** kernel time. Reading it as kernel time suggests the cards should be
+97% busy against nsys's 66% and invents a serialiser to explain the gap. There
+is no gap. The cards are 66% busy because that is the work 360 solves make.
+
+**Parallelising the trunk's single-warp sections.** The pooled reduction and
+the group-bias projection ran on one warp of twelve, the latter six hundred
+multiplies and six hundred loads a lane. Spreading them over the block and
+reducing in shared measured 2.68 us a row against 2.65 -- neutral -- so it is
+not worth four barriers and 4.6 KB of shared.
+
+
 **Half precision for `f` and `g`.** The config readout is gathered a row at a
 time, once per config per leaf per iteration -- about 43 GB a solve out of L2,
 the largest byte flow in the design -- so storing it as half looked obvious.

@@ -18,6 +18,7 @@ rows = db.execute("""
 # as none.
 after = collections.Counter()
 count = collections.Counter()
+pair = collections.Counter()
 by_dev = collections.defaultdict(list)
 for st, en, dev, name in rows:
     by_dev[dev].append((st, en, name.split("(")[0]))
@@ -27,10 +28,18 @@ for ks in by_dev.values():
         if end is not None and prev is not None and st > end:
             after[prev] += st - end
             count[prev] += 1
+            pair[(prev, name)] += st - end
         end = en if end is None else max(end, en)
         prev = name
 total = sum(after.values())
 print(f"idle after a kernel: {total / 1e9:.2f}s")
-for name, ns in after.most_common(10):
+for name, ns in after.most_common(8):
     print(f"  {ns / 1e6:9.1f} ms  {100 * ns / total:5.1f}%  {count[name]:7d} gaps  "
           f"{ns / max(count[name], 1) / 1e3:8.1f} us each  {name}")
+
+# What the card went on to run. A gap between two of the same kernel is the
+# queue running dry; a gap before a different one is waiting for a dependency.
+print("\nthe biggest (before -> after) pairs:")
+for (a, b), ns in pair.most_common(10):
+    same = "  (same kernel: the queue ran dry)" if a == b else ""
+    print(f"  {ns / 1e6:9.1f} ms  {a} -> {b}{same}")
