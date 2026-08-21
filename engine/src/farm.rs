@@ -413,7 +413,7 @@ impl Gate {
     /// returns. Returns the rows the round carried, or `None` once closed.
     pub fn round<F>(&self, eval: F) -> Option<usize>
     where
-        F: FnOnce(&[Call]) -> Vec<Reply>,
+        F: FnOnce(&[Call]) -> Option<Vec<Reply>>,
     {
         self.serve(eval, false, None)
     }
@@ -424,7 +424,7 @@ impl Gate {
     /// for.
     pub fn serve_until_idle<F>(&self, eval: F) -> Option<usize>
     where
-        F: FnOnce(&[Call]) -> Vec<Reply>,
+        F: FnOnce(&[Call]) -> Option<Vec<Reply>>,
     {
         self.serve(eval, true, None)
     }
@@ -439,15 +439,21 @@ impl Gate {
     /// A thread that misses a round simply joins the next one.
     pub fn round_before<F>(&self, patience: Duration, eval: F) -> Round
     where
-        F: FnOnce(&[Call]) -> Vec<Reply>,
+        F: FnOnce(&[Call]) -> Option<Vec<Reply>>,
     {
         self.serve(eval, false, Some(patience))
             .map_or(Round::Empty, Round::Ran)
     }
 
+    /// `eval` returns `None` when the round could not be answered at all --
+    /// the card is out of memory, or the driver is gone. Every thread in the
+    /// cohort is parked on this round, so there is no answer to give them and
+    /// no later round that will: the gate closes and they unwind. It used to
+    /// panic here instead, inside the lock and with the mailboxes unfilled,
+    /// which left the whole cohort parked for ever on an idle card.
     fn serve<F>(&self, eval: F, exit_when_idle: bool, patience: Option<Duration>) -> Option<usize>
     where
-        F: FnOnce(&[Call]) -> Vec<Reply>,
+        F: FnOnce(&[Call]) -> Option<Vec<Reply>>,
     {
         let deadline = patience.map(|p| std::time::Instant::now() + p);
         let mut g = self.round.lock();
@@ -478,7 +484,12 @@ impl Gate {
         // parked on `done`, so none of them wants it, and a thread just
         // entering would otherwise take a mailbox this round is about to fill.
         let rows = calls.iter().map(Call::rows).sum();
-        let replies = eval(&calls);
+        let Some(replies) = eval(&calls) else {
+            g.closed = true;
+            self.done.notify_all();
+            self.full.notify_all();
+            return None;
+        };
         assert_eq!(replies.len(), calls.len(), "one reply per call");
 
         // A thread may raise several calls in one round; its mailbox holds
@@ -546,11 +557,11 @@ pub enum Backend {
 }
 
 impl Backend {
-    pub fn run(&self, calls: &[Call], #[allow(unused)] lane: usize) -> Vec<Reply> {
+    pub fn run(&self, calls: &[Call], #[allow(unused)] lane: usize) -> Option<Vec<Reply>> {
         match self {
             // Every call in a round is independent, and the solver threads
             // that raised them are all parked, so the cores are free.
-            Backend::Reference(net) => calls.par_iter().map(|c| c.run(net)).collect(),
+            Backend::Reference(net) => Some(calls.par_iter().map(|c| c.run(net)).collect()),
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.run(calls, lane),
         }
@@ -986,7 +997,7 @@ mod tests {
             std::thread::spawn(move || {
                 let mut rounds = 0usize;
                 while gate
-                    .round(|calls| calls.iter().map(|c| Reply { a: vec![tag_of(c)], ..Default::default() }).collect())
+                    .round(|calls| Some(calls.iter().map(|c| Reply { a: vec![tag_of(c)], ..Default::default() }).collect()))
                     .is_some()
                 {
                     rounds += 1;
@@ -1045,10 +1056,12 @@ mod tests {
             std::thread::spawn(move || {
                 while !gate.round_closed() {
                     gate.round_before(Duration::from_micros(200), |calls| {
-                        calls
-                            .iter()
-                            .map(|c| Reply { a: vec![tag_of(c)], ..Default::default() })
-                            .collect()
+                        Some(
+                            calls
+                                .iter()
+                                .map(|c| Reply { a: vec![tag_of(c)], ..Default::default() })
+                                .collect(),
+                        )
                     });
                 }
             })

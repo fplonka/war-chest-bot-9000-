@@ -70,6 +70,14 @@ pub const STAGES: [&str; 22] = [
     "held",
 ];
 
+/// The bytes each of a solve's arrays holds, largest first.
+///
+/// `held` says solves in flight is memory-bound; this says which array to
+/// argue with. Reported for the largest solve a card holds, because the mean
+/// is not what fills the pool.
+pub static CENSUS: parking_lot::Mutex<Vec<(&'static str, usize)>> =
+    parking_lot::Mutex::new(Vec::new());
+
 /// Device bytes the solve arenas hold right now -- a level, which
 /// `leaf_breakdown` reports without resetting.
 ///
@@ -317,18 +325,54 @@ const TILE: usize = 16384;
 /// Not more than twice, even though four times is faster still: with several
 /// cohorts of solves in flight the card's memory is what bounds how many, and
 /// headroom nobody is using is a cohort that does not fit.
-/// The capacity an array of `want` elements takes.
+/// The capacity an array of `want` elements takes: a size class.
 ///
-/// A power of two, so that every block a slot gives back fits every request
-/// another slot makes. Allocation is stream-ordered: a freed buffer stays in a
-/// pool rather than going back to the driver, and it can only be reused by a
-/// request the block is large enough for. Doubling an arbitrary `want` gives
-/// arbitrary sizes -- one solve returns 260,002 floats and the next asks for
-/// 259,884 -- so the pool ends up holding both, and it grew until both cards
-/// read 24,027 MiB of 24,576. Rounding to a size class costs the same average
-/// slack and makes the blocks interchangeable.
+/// Allocation is stream-ordered, so a freed buffer goes back to a pool rather
+/// than to the driver, and it can only serve a request it is large enough for.
+/// Doubling an arbitrary `want` gives arbitrary sizes -- one solve returns
+/// 260,002 floats and the next asks for 259,884 -- so the pool held both and
+/// grew until it had every size any slot had ever wanted, which is how both
+/// cards came to read 24,027 MiB of 24,576.
+///
+/// A class fixes that, but the class has to be fine. Rounding to a power of
+/// two made every block interchangeable and left the fattest solve holding
+/// 179 MB, nine of its arrays at exactly 2^21 floats -- up to half of it
+/// slack. Eight classes to an octave keeps a small, shared set of sizes and
+/// bounds the slack at an eighth.
 fn grow_to(want: usize) -> usize {
-    want.next_power_of_two().max(4096)
+    let want = want.max(4096);
+    // The step is an eighth of the octave `want` sits in, so the classes are
+    // 8, 9, 10 ... 16 times a power of two.
+    let octave = usize::BITS - 1 - want.leading_zeros();
+    let step = 1usize << octave.saturating_sub(3);
+    want.div_ceil(step) * step
+}
+
+#[cfg(test)]
+mod grow {
+    use super::grow_to;
+
+    #[test]
+    fn a_size_class_is_never_smaller_and_never_an_eighth_larger() {
+        for want in (1..1 << 22).step_by(9_973) {
+            let got = grow_to(want);
+            assert!(got >= want, "{want} -> {got} is smaller");
+            assert!(
+                got <= 4096.max(want + want / 8 + 1),
+                "{want} -> {got} is more than an eighth of slack"
+            );
+        }
+    }
+
+    #[test]
+    fn the_classes_are_a_small_shared_set() {
+        // What makes a freed block usable by another solve: two nearby
+        // requests land on the same size, not on two sizes that differ by a
+        // hundred elements.
+        let sizes: std::collections::BTreeSet<usize> =
+            (1 << 20..1 << 21).step_by(97).map(grow_to).collect();
+        assert!(sizes.len() <= 9, "an octave holds {} classes", sizes.len());
+    }
 }
 
 /// One device array of a solve's state.
@@ -708,6 +752,37 @@ impl Pack {
 const DESC: usize = 56;
 
 impl Solve {
+    /// What this solve holds, array by array.
+    fn census(&self) -> Vec<(&'static str, usize)> {
+        let t = &self.tree;
+        let f = std::mem::size_of::<f32>();
+        let u = std::mem::size_of::<u32>();
+        let mut v = vec![
+            ("p", self.p.cap * f), ("jp", self.jp.cap * f),
+            ("f", self.f.cap * f), ("g", self.g.cap * f),
+            ("cidx", self.cidx.cap * u), ("coff", self.coff.cap * u),
+            ("reach", self.reach.cap * f), ("vals", self.vals.cap * f),
+            ("cur", self.cur.cap * f), ("regret", self.regret.cap * f),
+            ("sum", self.sum.cap * f), ("qval", self.qval.cap * f),
+            ("visits", self.visits.cap * f), ("prior", self.prior.cap * f),
+            ("rootb", self.rootb.cap * f),
+            ("leaf_node", self.leaf_node.cap * u), ("term", self.term.cap * u),
+            ("legal_child", t.legal_child.cap * u),
+            ("legal_trans", t.legal_trans.cap * u),
+            ("cell_row", t.cell_row.cap * u), ("cell_val", t.cell_val.cap * u),
+            ("legal_off", t.legal_off.cap * u), ("child", t.child.cap * u),
+            ("rev_start", t.rev_start.cap * u), ("rev_src", t.rev_src.cap * u),
+            ("rev_cell", t.rev_cell.cap * u),
+            ("rvd_start", t.rvd_start.cap * u), ("rvd_src", t.rvd_src.cap * u),
+            ("rvd_p", t.rvd_p.cap * f),
+            ("draw_start", t.draw_start.cap * u), ("draw_to", t.draw_to.cap * u),
+            ("draw_p", t.draw_p.cap * f),
+            ("level_node", t.level_node.cap * u),
+        ];
+        v.sort_by_key(|&(_, b)| std::cmp::Reverse(b));
+        v
+    }
+
     /// Where a run of the round's blob lands. The match is the other half of
     /// `farm::Dst`, and the only place the two vocabularies meet.
     fn plan(&mut self, s: &Arc<CudaStream>, d: Dst, at: usize, n: usize) -> Res<u64> {
@@ -906,10 +981,16 @@ impl Device {
 
     /// Evaluate a round. A device error is not recoverable and not worth
     /// limping past, so it stops the run.
-    pub fn run(&self, calls: &[Call], lane: usize) -> Vec<Reply> {
+    /// `None` when the round could not be answered. The caller closes its
+    /// gate on that, so the cohort unwinds instead of parking on a card that
+    /// is never going to reply.
+    pub fn run(&self, calls: &[Call], lane: usize) -> Option<Vec<Reply>> {
         match self.try_run(calls, lane) {
-            Ok(replies) => replies,
-            Err(e) => panic!("cuda: {e}"),
+            Ok(replies) => Some(replies),
+            Err(e) => {
+                eprintln!("cuda: lane {lane}: {e}");
+                None
+            }
         }
     }
 
@@ -1830,6 +1911,23 @@ impl Card {
         let t_down = mark.elapsed();
         for (slot, n) in [t_marshal, t_up, t_launch, t_down].iter().enumerate() {
             LEAF_NS[slot].fetch_add(n.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        // The fattest solve this round held, array by array. `held` says the
+        // rate is memory-bound; this says which array to argue with.
+        {
+            let solves = self.solves.lock();
+            if let Some(c) = solves
+                .iter()
+                .map(Solve::census)
+                .max_by_key(|c| c.iter().map(|&(_, b)| b).sum::<usize>())
+            {
+                let mut best = CENSUS.lock();
+                if c.iter().map(|&(_, b)| b).sum::<usize>()
+                    > best.iter().map(|&(_, b)| b).sum::<usize>()
+                {
+                    *best = c;
+                }
+            }
         }
         for (part, &i) in order.iter().enumerate() {
             let (iters, want) = Self::asked(&calls[i]);

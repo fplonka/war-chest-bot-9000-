@@ -958,6 +958,22 @@ fn leaf_breakdown() -> Vec<f64> {
     Vec::new()
 }
 
+/// What the fattest solve on a card holds, array by array, in bytes. Solves
+/// in flight is memory-bound, so this is the list of things to argue with.
+#[pyfunction]
+fn solve_census() -> Vec<(String, usize)> {
+    #[cfg(feature = "gpu")]
+    {
+        return crate::cuda::CENSUS
+            .lock()
+            .iter()
+            .map(|&(n, b)| (n.to_string(), b))
+            .collect();
+    }
+    #[cfg(not(feature = "gpu"))]
+    Vec::new()
+}
+
 /// All 37 hexes' axial coords, indexed by hex. The browser UI's board
 /// geometry; mirrors `Board::coord`.
 #[pyfunction]
@@ -1180,5 +1196,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(infer_policy, m)?)?;
         m.add_function(wrap_pyfunction!(leaf_breakdown, m)?)?;
         m.add_function(wrap_pyfunction!(stage_names, m)?)?;
+        m.add_function(wrap_pyfunction!(solve_census, m)?)?;
     Ok(())
 }
