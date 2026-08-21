@@ -731,6 +731,13 @@ impl SolveFarm {
             self.net_version = version;
         }
         let d = py.allow_threads(|| self.farm.drive(solves));
+        if self.farm.broken() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "a cohort's gate closed: a round could not be answered. The \
+                 driver prints the reason -- out of memory is the usual one, \
+                 and fewer cohorts is the usual answer.",
+            ));
+        }
         let out = data_to_dict(py, d)?;
         let dict = out.bind(py).downcast::<PyDict>()?.clone();
         // How well the batching is working: calls per round is how many solves

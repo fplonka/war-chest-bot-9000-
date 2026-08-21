@@ -325,27 +325,25 @@ const TILE: usize = 16384;
 /// Not more than twice, even though four times is faster still: with several
 /// cohorts of solves in flight the card's memory is what bounds how many, and
 /// headroom nobody is using is a cohort that does not fit.
-/// The capacity an array of `want` elements takes: a size class.
+/// The capacity an array of `want` elements takes: a power of two.
 ///
 /// Allocation is stream-ordered, so a freed buffer goes back to a pool rather
 /// than to the driver, and it can only serve a request it is large enough for.
 /// Doubling an arbitrary `want` gives arbitrary sizes -- one solve returns
 /// 260,002 floats and the next asks for 259,884 -- so the pool held both and
 /// grew until it had every size any slot had ever wanted, which is how both
-/// cards came to read 24,027 MiB of 24,576.
+/// cards came to read 24,027 MiB of 24,576. A size class fixes that.
 ///
-/// A class fixes that, but the class has to be fine. Rounding to a power of
-/// two made every block interchangeable and left the fattest solve holding
-/// 179 MB, nine of its arrays at exactly 2^21 floats -- up to half of it
-/// slack. Eight classes to an octave keeps a small, shared set of sizes and
-/// bounds the slack at an eighth.
+/// The class has to be *coarse*, which is the part that is not obvious. A
+/// power of two leaves up to half the array as slack, and the census says
+/// that is real: the fattest solve holds 179 MB with nine of its arrays at
+/// exactly 2^21 floats. Eight classes to an octave cuts the slack to an
+/// eighth -- and ran the cards out of memory at twelve cohorts, where powers
+/// of two had held. What a retained pool cares about is not how much slack a
+/// block has but whether some other slot can use it, and eight times as many
+/// classes is eight times fewer blocks that fit. Reuse beats slack.
 fn grow_to(want: usize) -> usize {
-    let want = want.max(4096);
-    // The step is an eighth of the octave `want` sits in, so the classes are
-    // 8, 9, 10 ... 16 times a power of two.
-    let octave = usize::BITS - 1 - want.leading_zeros();
-    let step = 1usize << octave.saturating_sub(3);
-    want.div_ceil(step) * step
+    want.next_power_of_two().max(4096)
 }
 
 #[cfg(test)]
@@ -353,25 +351,22 @@ mod grow {
     use super::grow_to;
 
     #[test]
-    fn a_size_class_is_never_smaller_and_never_an_eighth_larger() {
+    fn a_size_class_is_never_smaller_and_never_twice_as_large() {
         for want in (1..1 << 22).step_by(9_973) {
             let got = grow_to(want);
             assert!(got >= want, "{want} -> {got} is smaller");
-            assert!(
-                got <= 4096.max(want + want / 8 + 1),
-                "{want} -> {got} is more than an eighth of slack"
-            );
+            assert!(got <= 4096.max(2 * want), "{want} -> {got} is more than double");
         }
     }
 
     #[test]
-    fn the_classes_are_a_small_shared_set() {
-        // What makes a freed block usable by another solve: two nearby
-        // requests land on the same size, not on two sizes that differ by a
-        // hundred elements.
+    fn an_octave_holds_one_class() {
+        // What makes a freed block usable by another solve: every request in
+        // an octave lands on the same size, not on eight nearby ones. This is
+        // the property, and it is worth more than the slack it costs.
         let sizes: std::collections::BTreeSet<usize> =
-            (1 << 20..1 << 21).step_by(97).map(grow_to).collect();
-        assert!(sizes.len() <= 9, "an octave holds {} classes", sizes.len());
+            ((1 << 20) + 1..1 << 21).step_by(97).map(grow_to).collect();
+        assert_eq!(sizes.len(), 1, "an octave holds {} classes", sizes.len());
     }
 }
 

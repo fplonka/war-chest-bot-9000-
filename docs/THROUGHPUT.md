@@ -234,6 +234,16 @@ is large enough for -- so the pool holds both, and keeps holding, until it has
 the sum of every size any slot ever wanted. Rounding to a power of two costs
 the same average slack and makes every block interchangeable.
 
+**The class has to be coarse, and that is not obvious.** A power of two leaves
+up to half an array as slack, and the census says that is real: the fattest
+solve holds 179 MB with nine of its arrays at exactly 2^21 floats. Eight
+classes to an octave bounds the slack at an eighth -- and ran both cards out of
+memory at twelve cohorts, where powers of two had held. A retained pool does
+not care how much slack a block carries; it cares whether some other slot can
+use it, and eight times as many classes is eight times fewer blocks that fit.
+**Reuse beats slack.** The test to keep is not that the slack is small but that
+an octave holds exactly one class.
+
 **Measured.** Peak memory went from 24,027 MiB pinned at the ceiling to a peak
 of 17,969 settling near 16,000, and the rate from a 28.0 mean to **32.5**.
 `held` now reads 17,212 MB against the same 16-18 GB nvidia-smi sees, so what

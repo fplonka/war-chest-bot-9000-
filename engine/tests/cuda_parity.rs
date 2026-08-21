@@ -168,7 +168,7 @@ fn the_network_agrees() {
     let (mut seen, mut bad) = ([0usize; 2], 0.0f32);
     while seen.iter().any(|&n| n < 8) {
         let got = gate.round(|calls| {
-            let replies = device.run(calls, 0);
+            let replies = device.run(calls, 0)?;
             for (c, r) in calls.iter().zip(&replies) {
                 match c {
                     Call::Trunk { .. } => {
@@ -182,7 +182,7 @@ fn the_network_agrees() {
                     _ => {}
                 }
             }
-            replies
+            Some(replies)
         });
         assert!(got.is_some(), "the gate closed while comparing");
     }

@@ -770,11 +770,27 @@ impl Farm {
             if out.soff.len() >= solves {
                 return out;
             }
+            // A gate closes when a round could not be answered: the card is
+            // out of memory, or gone. Its cohort's solves die with it, so
+            // waiting for them is waiting for ever -- which is what a run did
+            // when a card filled, silently, with the panic printed to a log
+            // nobody was reading.
+            if self.stopping.load(Ordering::Relaxed)
+                || self.gates.iter().all(|g| g.round_closed())
+            {
+                return out;
+            }
             // Parked, not spinning. With a cohort a lane and the solver threads
             // outnumbering the cores several times over, a caller busy-waiting
             // here is a core taken from the work it is waiting for.
             std::thread::sleep(Duration::from_micros(200));
         }
+    }
+
+    /// Whether a cohort has lost its gate, which only happens when a round
+    /// could not be answered at all.
+    pub fn broken(&self) -> bool {
+        self.gates.iter().any(|g| g.round_closed())
     }
 
     pub fn stats(&self) -> &Stats {
