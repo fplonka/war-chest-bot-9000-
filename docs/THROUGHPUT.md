@@ -311,6 +311,48 @@ So there are two separable attacks, and the first is the one with headroom:
   a round is 364 ms of which about 135 is `eval`, and 50 ms of patience does
   not account for the rest.
 
+## Where the host time goes
+
+A `prof` build attributes it. Excluding `WAIT`, which is a thread parked at
+the gate:
+
+| stage | cpu-ms | share |
+|---|---:|---:|
+| **PRIOR** | 162,870 | **65%** |
+| PUBFEAT | 23,369 | 9% |
+| CONTRACT | 19,489 | 8% |
+| BSUP | 10,570 | 4% |
+| BCELLS | 7,061 | 3% |
+| BDRAW | 6,959 | 3% |
+
+Two thirds of it is `refresh_priors`, not tree growth -- which is what the
+shape of the round had suggested twice, wrongly.
+
+Half of that had a structural cause. `refresh_priors` opened with a scan of
+every node, every iteration, looking for the handful just grown: eight
+thousand nodes by sixty-four iterations is half a million filter tests over
+four scattered arrays, and it grew with the tree. Growth knows which nodes it
+made, so it queues them and the refresh drains the queue.
+
+What that bought, on eight threads and one card:
+
+| | before | after |
+|---|---:|---:|
+| solves/s | 10.7 | **13.3** |
+| a thread awake, mean | 11.34 ms | 9.56 ms |
+| a thread awake, **longest** | 175.3 ms | **58.4 ms** |
+
+The maximum is the number that matters: a round waits for the slowest of
+thirty-six threads, so a tail cut by two thirds is worth more than the mean
+being cut by a sixth.
+
+**`PRIOR` is still the largest item afterwards, and now it is all network.**
+What is left inside it is `Net::actions` and `Net::policy` -- the action head
+and a dot product per legal cell, run *on the host*, for every grown node,
+every iteration. The device already computes the config half and ships `f_p`
+back for this. Moving the whole prior onto the card is the next large piece of
+host work to remove, and unlike `grow_every` it changes no answers.
+
 ## What the memory actually is
 
 `tools/farmprobe.py` prints the fattest solve a card held, array by array, off

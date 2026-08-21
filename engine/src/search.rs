@@ -781,6 +781,15 @@ pub struct Solver<'a> {
     /// batch that holds its board vector has necessarily run, so the prior is
     /// computed at the next expansion phase rather than inside `grow`.
     pub(crate) primed: Vec<bool>,
+    /// Nodes that still want a policy prior: decision nodes whose network row
+    /// the batch has not reached yet, plus whatever `grow` has just made.
+    ///
+    /// This used to be a scan of every node an iteration, looking for the
+    /// handful just grown. A solve holds eight thousand nodes and runs
+    /// sixty-four iterations, so that is half a million filter tests over four
+    /// scattered arrays -- and `refresh_priors` measured at two thirds of all
+    /// host work outside the gate. Growth knows exactly which nodes it made.
+    wants_prior: Vec<u32>,
     /// `[node]` -> config counts per player, so the hot loops never chase the
     /// `Rc` to ask how long a support is.
     pub nc: Vec<[u32; 2]>,
@@ -917,6 +926,7 @@ impl<'a> Solver<'a> {
             qval: Vec::new(),
             row_of: Vec::new(),
             primed: Vec::new(),
+            wants_prior: Vec::new(),
             soff: Vec::new(),
             sum_strat: Vec::new(),
             avg: Vec::new(),
@@ -1109,6 +1119,7 @@ impl<'a> Solver<'a> {
         self.voff.truncate(m.nodes);
         self.sum_strat.truncate(m.nodes);
         self.primed.truncate(m.nodes);
+        self.wants_prior.retain(|&i| (i as usize) < m.nodes);
         self.row_of.truncate(m.nodes);
         self.leaf_rows.truncate(m.leaf_rows);
         self.term_leaves.truncate(m.term_leaves);
@@ -1204,6 +1215,11 @@ impl<'a> Solver<'a> {
     /// spending the same budget evenly over every line.
     fn grow(&mut self, id: usize) {
         debug_assert!(self.nodes[id].leaf, "only a leaf can be grown");
+        // It is a decision node from here, so it wants a policy prior as soon
+        // as the batch reaches its row.
+        if self.row_of[id] != u32::MAX {
+            self.wants_prior.push(id as u32);
+        }
         if self.over_cap() {
             return;
         }
@@ -2465,15 +2481,25 @@ impl<'a> Solver<'a> {
             return;
         }
         let _t = timed!(PRIOR);
-        let want: Vec<usize> = (0..self.nodes.len())
-            .filter(|&i| {
-                !self.primed[i]
-                    && !self.nodes[i].leaf
-                    && !self.nodes[i].chance
-                    && self.row_of[i] != u32::MAX
-                    && (self.row_of[i] as usize) < self.batch_rows
-            })
-            .collect();
+        // Whoever is ready: a decision node the batch has now reached. The
+        // rest stay queued for the round that reaches them.
+        let mut want: Vec<usize> = Vec::new();
+        let mut queue = std::mem::take(&mut self.wants_prior);
+        queue.retain(|&i| {
+            let i = i as usize;
+            if self.primed[i] || self.nodes[i].leaf || self.nodes[i].chance {
+                return false;
+            }
+            if self.row_of[i] == u32::MAX {
+                return false;
+            }
+            if (self.row_of[i] as usize) < self.batch_rows {
+                want.push(i);
+                return false;
+            }
+            true
+        });
+        self.wants_prior = queue;
         if want.is_empty() {
             return;
         }
