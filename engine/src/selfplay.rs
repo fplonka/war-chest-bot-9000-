@@ -683,24 +683,13 @@ impl GameStream {
 }
 
 /// Play one game to the end. Returns the result from White's point of view.
-///
-/// Any belief states the searches queued are appended to `queries`.
-pub fn play_game(
-    rng: Rng,
-    nets: &Arc<Nets>,
-    gc: &GameCfg,
-    data: &mut Data,
-    queries: Option<&mut Vec<(State, [Belief; 2])>>,
-) -> f32 {
+pub fn play_game(rng: Rng, nets: &Arc<Nets>, gc: &GameCfg, data: &mut Data) -> f32 {
     let mut g = Game::new(rng, gc);
     while let Some(mut sv) = g.next_solve(nets) {
         let solved = sv.run_alone();
         g.play_solved(&sv, solved);
     }
     let z = g.finish();
-    if let Some(q) = queries {
-        q.extend(g.take_queries());
-    }
     let d = g.take_data();
     data.merge(d);
     z
@@ -760,10 +749,19 @@ fn worker_seed(seed: u64, i: usize) -> u64 {
     seed.wrapping_mul(0x9E3779B97F4A7C15) ^ (i as u64).wrapping_mul(0xD1B54A32D192ED03)
 }
 
-/// Collect subgame roots from random-draft games, for the tree-sizing tools.
+/// Collect the roots of the solves a run would run, for the tools that need a
+/// fixed workload.
 ///
-/// These are the belief states the searches queued, so they are drawn from the
-/// leaf distribution the value network is actually queried on.
+/// A run alternates a self-play solve and a solve of a leaf an earlier search
+/// nominated, and the two cost very different amounts: a self-play root sits on
+/// the line of play with a wide belief, where a query root is a leaf. So the
+/// corpus is taken from `GameStream`, which is the same thing a run drives, and
+/// it holds whatever mix of the two the configured rates produce.
+///
+/// One game a stream, and the roots are shuffled before they are returned: they
+/// arise in ply order, and a tool that walks the file forward would otherwise
+/// have all its jobs march up that ordering together and see the workload
+/// deepen as it ran.
 pub fn collect_roots(
     games: usize,
     seed: u64,
@@ -774,29 +772,41 @@ pub fn collect_roots(
     let mut out: Vec<(State, [Belief; 2])> = (0..games)
         .into_par_iter()
         .fold(Vec::new, |mut acc, i| {
-            let rng = Rng::new(worker_seed(seed, i));
+            let mut st = GameStream::new(worker_seed(seed, i), *gc);
             let mut d = Data::default();
-            play_game(rng, nets, gc, &mut d, Some(&mut acc));
+            loop {
+                let mut sv = st.next_solve(nets, &mut d);
+                // The stream rolls straight into the next game, and that game's
+                // solves are another sample of the same distribution.
+                if st.game_index > 1 {
+                    break;
+                }
+                acc.push((sv.states[0], sv.root_belief.clone()));
+                let solved = sv.run_alone();
+                st.keep(&sv, solved, &mut d);
+            }
             acc
         })
         .reduce(Vec::new, |mut a, mut b| {
             a.append(&mut b);
             a
         });
-    out.truncate(cap);
     assert!(!out.is_empty(), "no roots: a game collected none");
+    let mut rng = Rng::new(0x0057_1E5E);
+    for i in (1..out.len()).rev() {
+        out.swap(i, rng.below(i + 1));
+    }
+    out.truncate(cap);
     out
 }
 
 /// Play `games` games in parallel, returning merged data and statistics.
-
-
 pub fn run_games(games: usize, seed: u64, nets: &Arc<Nets>, gc: &GameCfg) -> Data {
     (0..games)
         .into_par_iter()
         .fold(Data::default, |mut acc, i| {
             let rng = Rng::new(worker_seed(seed, i));
-            play_game(rng, nets, gc, &mut acc, None);
+            play_game(rng, nets, gc, &mut acc);
             acc
         })
         .reduce(Data::default, |mut a, b| {

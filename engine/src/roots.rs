@@ -8,7 +8,7 @@ use crate::state::{Cont, ContStack, State, CONT_CAP, N_PLAYERS, N_ZONES};
 use crate::units::N_UNITS;
 
 pub const ROOTS_MAGIC: u32 = 0x5710_7207;
-pub const ROOTS_VERSION: u32 = 3;
+pub const ROOTS_VERSION: u32 = 4;
 
 fn w8<W: Write>(w: &mut W, x: u8) -> std::io::Result<()> {
     w.write_all(&[x])

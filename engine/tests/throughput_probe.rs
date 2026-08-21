@@ -31,7 +31,7 @@ fn throughput_probe() {
                 query_rate: 0.0,
                 recursive_rate: 0.0,
             };
-            play_game(rng, &nets, &gc, &mut d, None);
+            play_game(rng, &nets, &gc, &mut d);
             games += 1;
             decisions += d.decisions as u64;
         }
@@ -67,7 +67,7 @@ fn throughput_probe() {
                 query_rate: 0.0,
                 recursive_rate: 0.0,
             };
-            play_game(rng, &nets, &gc, &mut d, None);
+            play_game(rng, &nets, &gc, &mut d);
             games += 1;
         }
         let secs = t0.elapsed().as_secs_f64();

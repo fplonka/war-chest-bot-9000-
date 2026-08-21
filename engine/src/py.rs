@@ -784,8 +784,11 @@ fn gen_data(
     data_to_dict(py, d)
 }
 
-/// Collect subgame roots from self-play, for the tools that need a fixed
-/// workload.
+/// Write a corpus of solve roots for the tools that need a fixed workload.
+///
+/// The rates belong to the caller because the corpus is only worth anything if
+/// it is the mix a real run solves: pass the run's own `query_rate` and
+/// `recursive_rate`, not a convenient number.
 ///
 /// The search here decides which positions arise, not what a root *is*: a
 /// belief support comes from the draw history. So this runs a cheap search by
@@ -793,7 +796,8 @@ fn gen_data(
 /// every decision of every game takes the better part of an hour where a
 /// thirty-two expansion one takes a minute.
 #[pyfunction]
-#[pyo3(signature = (games, seed, path, cap=1000, random_draft=true, s=32, c=4.0))]
+#[pyo3(signature = (games, seed, path, cap=4096, random_draft=true, s=32, c=4.0,
+                    explore=0.1, query_rate=0.9, recursive_rate=0.1))]
 #[allow(clippy::too_many_arguments)]
 fn save_roots(
     py: Python<'_>,
@@ -804,18 +808,19 @@ fn save_roots(
     random_draft: bool,
     s: u32,
     c: f32,
+    explore: f32,
+    query_rate: f32,
+    recursive_rate: f32,
 ) -> PyResult<usize> {
     let cfg = Cfg { s, c, ..Default::default() };
     let gc = GameCfg {
         agents: [Agent::Sog { cfg }; 2],
-        // The roots this tool wants are the queries a search nominates, and
-        // those are only harvested where a row is collected.
         collect: Collect::Sog,
-        explore: 0.25,
+        explore,
         random_draft,
         p_td1: 0.0,
-        query_rate: 1.0,
-        recursive_rate: 0.0,
+        query_rate,
+        recursive_rate,
     };
     let n = Arc::clone(&nets().read());
     let roots =
