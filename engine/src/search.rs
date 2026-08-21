@@ -480,6 +480,14 @@ pub struct TNode {
     /// grow. Such a leaf is priced by the value network -- or, at a terminal,
     /// by the game -- which is what every other leaf gets anyway.
     pub expandable: bool,
+    /// Whether the subtree under this node holds no expandable leaf at all.
+    ///
+    /// Growth only ever takes it away, never gives it back, so the flag
+    /// spreads towards the root and never retreats. The expansion phase reads
+    /// it: a trajectory that walked into an exhausted subtree could only end
+    /// on a leaf nothing may grow, and the simulation would be spent for
+    /// nothing. See `Solver::seal`.
+    pub exhausted: bool,
     /// Draw pass-through node: the public tree does not branch, there is one
     /// public child, and the drawing player's configs transition through the
     /// `draw` chance map.
@@ -584,6 +592,49 @@ pub struct Policy {
 /// How an action is stored in a replay row: kind, the coin slot it spends
 /// (offset by one so `-1` is zero), and the three squares it names.
 pub const ACT_BYTES: usize = 5;
+
+/// Draw an index from non-negative weights, over the entries `live` accepts
+/// and no others. A row whose live weights have all underflowed is drawn
+/// uniformly over them rather than dropped; a row with no live entry at all
+/// gives nothing back.
+fn pick_live(w: &[f32], live: impl Fn(usize) -> bool, rng: &mut Rng) -> Option<usize> {
+    let mut total = 0.0f64;
+    let mut n = 0usize;
+    for (i, &x) in w.iter().enumerate() {
+        if live(i) {
+            total += x.max(0.0) as f64;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    let mut last = None;
+    if total == 0.0 {
+        let mut k = rng.below(n);
+        for i in 0..w.len() {
+            if live(i) {
+                if k == 0 {
+                    return Some(i);
+                }
+                k -= 1;
+            }
+        }
+        unreachable!("a live entry was counted");
+    }
+    let mut needle = rng.unit_f64() * total;
+    for (i, &weight) in w.iter().enumerate() {
+        if !live(i) {
+            continue;
+        }
+        last = Some(i);
+        needle -= weight.max(0.0) as f64;
+        if needle < 0.0 {
+            return Some(i);
+        }
+    }
+    last
+}
 
 /// Draw an index from non-negative weights without allocating. A row whose
 /// weights have all underflowed is drawn uniformly rather than dropped.
@@ -758,6 +809,14 @@ pub struct Solver<'a> {
     /// the solver still knows the position it stands for, so a growing tree
     /// keeps every one of them.
     pub states: Vec<State>,
+    /// Whoever listed each node as a child, `NO_ROW` at the root. Exhaustion
+    /// travels up it, and the device's flat description takes its own parent
+    /// array straight from here.
+    pub parent: Vec<u32>,
+    /// Nodes whose `exhausted` flag has changed since the card last saw it.
+    /// Every other node property is append-only under growth; this one is not,
+    /// because sealing a leaf can seal a whole chain of its ancestors.
+    resealed: Vec<u32>,
     pub root_belief: [Belief; 2],
     /// Regrets and the current regret-matching iterate, flat by node over legal
     /// cells. Node `i` occupies `soff[i] ..` for as many cells as its
@@ -913,6 +972,9 @@ pub struct Solver<'a> {
     /// Rows of already-described nodes that this growth rewrote: the leaves it
     /// turned into decision nodes.
     rewrite: Vec<u32>,
+    /// Rows whose `exhausted` flag moved in the growth being described, so the
+    /// card is told about the ones it already holds.
+    resent: Vec<u32>,
     sent_cells: usize,
     /// The expansion's random stream, which lives on the card once seeded.
     seed: u64,
@@ -964,6 +1026,8 @@ impl<'a> Solver<'a> {
             cfg,
             nodes: take_nodes(),
             states: Vec::new(),
+            parent: Vec::new(),
+            resealed: Vec::new(),
             root_belief: belief,
             regret: Vec::new(),
             cur: Vec::new(),
@@ -1014,6 +1078,7 @@ impl<'a> Solver<'a> {
             contract: Arc::new(crate::contract::Contract::default()),
             sent_from: 0,
             rewrite: Vec::new(),
+            resent: Vec::new(),
             sent_cells: 0,
             seed: 0,
             primed_spans: Vec::new(),
@@ -1036,10 +1101,11 @@ impl<'a> Solver<'a> {
             sv.vals.reserve(640);
             sv.regret.reserve(640);
             sv.cur.reserve(640);
-            let root = sv.push_node(root.clone(), cfgs);
+            let root = sv.push_node(crate::contract::NO_ROW, root.clone(), cfgs);
             // A root that is a coin play would otherwise stay a leaf with no
             // strategy to read, so the first expansion is unconditional.
             sv.grow(root);
+            sv.seal(root, 1);
             // The first CFR update and every expansion trajectory require
             // reaches for the tree that now exists.
             sv.precompute_reaches();
@@ -1053,7 +1119,7 @@ impl<'a> Solver<'a> {
     /// which is when it is given its strategy cells — so a node's reach and
     /// value rows are laid out in node order while its cells are not, and both
     /// are found through their own offset table.
-    fn push_node(&mut self, s: State, cfgs: [Rc<[Config]>; 2]) -> usize {
+    fn push_node(&mut self, parent: u32, s: State, cfgs: [Rc<[Config]>; 2]) -> usize {
         let player = s.to_act();
         let terminal = s.is_terminal();
         let id = self.nodes.len();
@@ -1063,6 +1129,9 @@ impl<'a> Solver<'a> {
             player,
             leaf: true,
             expandable: !terminal,
+            // Set for the whole fresh subtree by `seal` once the expansion
+            // that made it has either finished or been abandoned.
+            exhausted: false,
             chance: false,
             draw: DrawMap::default(),
             draw_steps: 0,
@@ -1083,6 +1152,7 @@ impl<'a> Solver<'a> {
             cell_row: Vec::new(),
         });
         drop(_tp);
+        self.parent.push(parent);
         let (c0, c1) = (cfgs[0].len(), cfgs[1].len());
         self.nc.push([c0 as u32, c1 as u32]);
         // No cells yet: a leaf has no strategy. `grow` appends its region.
@@ -1114,9 +1184,9 @@ impl<'a> Solver<'a> {
     /// micro-decisions inside a tactic and a Warrior Priest's forced play are
     /// none of those, so they ride free here exactly as they used to ride free
     /// inside a depth unit.
-    fn push_child(&mut self, s: State, cfgs: [Rc<[Config]>; 2]) -> usize {
+    fn push_child(&mut self, parent: usize, s: State, cfgs: [Rc<[Config]>; 2]) -> usize {
         let stop = s.is_terminal() || matches!(s.pending(), Cont::MainPlay);
-        let ch = self.push_node(s, cfgs);
+        let ch = self.push_node(parent as u32, s, cfgs);
         if !stop {
             self.grow(ch);
         }
@@ -1131,12 +1201,60 @@ impl<'a> Solver<'a> {
     /// leaves `id` a leaf that growth will not try again; the solve carries on
     /// with the tree it already had.
     fn expand(&mut self, id: usize) {
-        self.limit = self.nodes.len() + EXPANSION_CAP;
+        let fresh = self.nodes.len();
+        self.limit = fresh + EXPANSION_CAP;
         self.grow(id);
         if self.abandon {
             self.abandon = false;
             self.nodes[id].expandable = false;
         }
+        self.seal(id, fresh);
+    }
+
+    /// Settle `exhausted` after an expansion of `id` that appended the nodes
+    /// from `fresh` on.
+    ///
+    /// A leaf is exhausted when growth may not turn it into a decision node --
+    /// past the round boundary, at a terminal, or where its own expansion ran
+    /// away. An interior node is exhausted when every child is. The fresh
+    /// subtree is settled deepest first, which one reverse pass gives because
+    /// a child is always built after its parent; the flag then travels up from
+    /// `id` as far as it keeps turning on. It never turns off, so the walk
+    /// stops at the first ancestor that still has somewhere to grow.
+    fn seal(&mut self, id: usize, fresh: usize) {
+        for i in (fresh..self.nodes.len()).rev() {
+            self.set_exhausted(i);
+        }
+        let mut at = id;
+        loop {
+            if !self.set_exhausted(at) {
+                return;
+            }
+            match self.parent[at] {
+                crate::contract::NO_ROW => return,
+                p => at = p as usize,
+            }
+        }
+    }
+
+    /// Recompute one node's flag, and say whether it now holds.
+    fn set_exhausted(&mut self, i: usize) -> bool {
+        let n = &self.nodes[i];
+        let e = if n.leaf {
+            !n.expandable
+        } else {
+            n.child.iter().all(|&c| self.nodes[c].exhausted)
+        };
+        if e != self.nodes[i].exhausted {
+            self.nodes[i].exhausted = e;
+            self.resealed.push(i as u32);
+        }
+        e
+    }
+
+    /// The nodes whose `exhausted` flag has moved since the last call.
+    pub(crate) fn take_resealed(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.resealed)
     }
 
     /// Whether the expansion in flight has spent its bound.
@@ -1175,6 +1293,8 @@ impl<'a> Solver<'a> {
         self.vals.truncate(self.voff[m.nodes] as usize);
         self.nodes.truncate(m.nodes);
         self.states.truncate(m.nodes);
+        self.parent.truncate(m.nodes);
+        self.resealed.retain(|&i| (i as usize) < m.nodes);
         self.nc.truncate(m.nodes);
         self.soff.truncate(m.nodes);
         self.roff.truncate(m.nodes);
@@ -1358,7 +1478,7 @@ impl<'a> Solver<'a> {
             drop(td);
             let mut cc = cfgs;
             cc[me] = support.as_slice().into();
-            let ch = self.push_child(cs, cc);
+            let ch = self.push_child(id, cs, cc);
             if self.abandon {
                 self.rewind(id, mark);
                 return;
@@ -1524,7 +1644,7 @@ impl<'a> Solver<'a> {
             drop(tb);
             let mut cc = cfgs.clone();
             cc[me] = std::mem::take(&mut child_cfgs[ch]).into();
-            child.push(self.push_child(cs, cc));
+            child.push(self.push_child(id, cs, cc));
             if self.abandon {
                 self.rewind(id, mark);
                 return;
@@ -2259,7 +2379,7 @@ impl<'a> Solver<'a> {
             // same leaf and the second is dropped; the visit counts a
             // trajectory leaves behind are what make that rare.
             let mut sampled: Vec<usize> = Vec::new();
-            for _ in 0..self.cfg.expansions_at(i) {
+            for _ in 0..self.expansions_at(i) {
                 match self.sample_leaf(rng) {
                     Some(leaf) => sampled.push(leaf),
                     None => break,
@@ -2267,6 +2387,7 @@ impl<'a> Solver<'a> {
             }
             let mut grew = false;
             for leaf in sampled {
+                // An earlier simulation of this same phase may have taken it.
                 if self.nodes[leaf].leaf && self.nodes[leaf].expandable {
                     self.expand(leaf);
                     grew = true;
@@ -2279,6 +2400,20 @@ impl<'a> Solver<'a> {
             }
         }
         self.finish();
+    }
+
+    /// Expansion simulations owed by iteration `i`, and none once the tree has
+    /// nowhere left to grow.
+    ///
+    /// Without that second clause the rest of `s` is spent sampling
+    /// trajectories that end on leaves growth may not touch, which is exactly
+    /// the failure the deleted node ceiling used to cause.
+    fn expansions_at(&self, i: usize) -> usize {
+        if self.nodes[0].exhausted {
+            0
+        } else {
+            self.cfg.expansions_at(i)
+        }
     }
 
     /// The same search, with the CFR loop on the backend.
@@ -2317,13 +2452,13 @@ impl<'a> Solver<'a> {
             // Everything up to and including the next iteration that owes an
             // expansion rides in one round: the host has nothing to do for the
             // ones before it, so it should not be woken between them.
-            let next = (at + 1..=iters).find(|&k| self.cfg.expansions_at(k) > 0);
+            let next = (at + 1..=iters).find(|&k| self.expansions_at(k) > 0);
             let done = match next {
                 Some(k) => (k - at).min(TAIL),
                 None => (iters - at).min(TAIL),
             };
             let expand = match next {
-                Some(k) if k - at == done => self.cfg.expansions_at(k),
+                Some(k) if k - at == done => self.expansions_at(k),
                 _ => 0,
             };
             // The priors of whatever the *last* round's trunk answered for.
@@ -2427,7 +2562,9 @@ impl<'a> Solver<'a> {
         // card and every solver thread is parked while it runs, so a round's
         // marshalling belongs on the cores that have nothing else to do.
         let mut w = Writes::default();
-        self.contract.write_into(&mut w, &mut self.sent, self.sent_from, &self.rewrite);
+        let resent = std::mem::take(&mut self.resent);
+        self.contract
+            .write_into(&mut w, &mut self.sent, self.sent_from, &self.rewrite, &resent);
         w.u32s(Dst::LeafNode, 0, &self.leaf_rows.iter().map(|&i| i as u32).collect::<Vec<_>>());
         w.u32s(Dst::Term, 0, &self.term_leaves.iter().map(|&i| i as u32).collect::<Vec<_>>());
         if first {
@@ -2467,13 +2604,15 @@ impl<'a> Solver<'a> {
     fn contract_extend(&mut self) {
         let _t = timed!(CONTRACT);
         let grown = std::mem::take(&mut self.grown);
+        let resealed = self.take_resealed();
         self.sent_from = self.contract.built;
         self.rewrite.clear();
         self.rewrite
             .extend(grown.iter().copied().filter(|&g| (g as usize) < self.sent_from));
         let mut c = std::mem::take(&mut self.contract);
-        Arc::make_mut(&mut c).extend(self, &grown);
+        Arc::make_mut(&mut c).extend(self, &grown, &resealed);
         self.contract = c;
+        self.resent = resealed;
     }
 
     /// The cell PUCT would take from one config's legal row.
@@ -2486,24 +2625,39 @@ impl<'a> Solver<'a> {
     /// so without it a node deep behind an unlikely opponent line would look
     /// worthless next to its own siblings rather than being compared with
     /// them.
-    fn puct_choice(&self, node: usize, row: std::ops::Range<usize>, opp: usize) -> usize {
+    fn puct_choice(&self, node: usize, row: std::ops::Range<usize>, opp: usize) -> Option<usize> {
         let so = self.soff[node] as usize;
         let mass: f32 = self.reach_of(node, opp).iter().sum();
         let scale = if mass > 1e-30 { 1.0 / mass } else { 0.0 };
         let total: f32 = row.clone().map(|cell| self.visits[so + cell]).sum();
         let explore = self.cfg.puct * total.max(0.0).sqrt();
-        let mut best = row.start;
+        let mut best = None;
         let mut best_score = f32::NEG_INFINITY;
         for cell in row {
+            if !self.live_cell(node, cell) {
+                continue;
+            }
             let at = so + cell;
             let score = self.qval[at] * scale
                 + explore * self.prior[at] / (1.0 + self.visits[at]);
             if score > best_score {
                 best_score = score;
-                best = cell;
+                best = Some(cell);
             }
         }
         best
+    }
+
+    /// Whether the expansion phase may descend through one legal cell: the
+    /// acting config has a successor there, and the subtree behind it still
+    /// has somewhere to grow. A trajectory into either kind of dead end can
+    /// only end on a leaf growth may not touch, and the simulation is then
+    /// spent for nothing -- which is what a mature tree does to the whole of
+    /// its remaining budget once its frontier stops being expandable.
+    fn live_cell(&self, node: usize, cell: usize) -> bool {
+        let n = &self.nodes[node];
+        n.legal_trans[cell] != NO_TRANS
+            && !self.nodes[n.legal_child[cell] as usize].exhausted
     }
 
     /// Fill the policy prior of every decision node that does not have one.
@@ -2636,9 +2790,6 @@ impl<'a> Solver<'a> {
         let Some(leaf) = self.sample_leaf(rng) else {
             return false;
         };
-        if !self.nodes[leaf].expandable {
-            return false;
-        }
         self.expand(leaf);
         !self.nodes[leaf].leaf
     }
@@ -2705,6 +2856,11 @@ impl<'a> Solver<'a> {
     /// average; with no prior to compute PUCT from, this is the half that
     /// exists.
     fn sample_leaf(&mut self, rng: &mut Rng) -> Option<usize> {
+        // A tree with nothing left to grow gets no trajectory at all, not even
+        // the draws one would spend.
+        if self.nodes[0].exhausted {
+            return None;
+        }
         // One private config per player forms the sampled world.
         let mut c = [
             pick(&self.root_belief[0].p, rng),
@@ -2713,7 +2869,11 @@ impl<'a> Solver<'a> {
         let mut node = 0usize;
         loop {
             if self.nodes[node].leaf {
-                return (!self.states[node].is_terminal()).then_some(node);
+                debug_assert!(
+                    self.nodes[node].expandable,
+                    "the descent skips subtrees with nothing to grow"
+                );
+                return Some(node);
             }
             let me = self.nodes[node].player as usize;
             if self.nodes[node].chance {
@@ -2724,30 +2884,32 @@ impl<'a> Solver<'a> {
                 continue;
             }
             let row = self.nodes[node].legal_row(c[me]);
-            if row.is_empty() {
-                return None;
-            }
             // Student of Games selects by half PUCT and half the search's own
             // average: `pi_select = 1/2 pi_PUCT + 1/2 pi_CFR`. PUCT is a
             // maximisation, so its half is a point mass on the argmax, and
             // sampling the mixture is a coin flip between the two.
+            //
+            // Both halves are restricted to the cells this world can still
+            // grow through. A config whose every legal action is a dead end
+            // ends the trajectory here; that is a property of the sampled
+            // world, not of the tree, so it does not seal anything.
             let so = self.soff[node] as usize;
+            let live = |cell: usize| self.live_cell(node, cell);
             let cell = if rng.unit_f64() < 0.5 {
                 self.puct_choice(node, row.clone(), 1 - me)
             } else if self.sum_strat[node][row.clone()].iter().any(|&x| x > 0.0) {
-                row.start + pick(&self.sum_strat[node][row.clone()], rng)
+                pick_live(&self.sum_strat[node][row.clone()], |i| live(row.start + i), rng)
+                    .map(|i| row.start + i)
             } else {
-                row.start + pick(&self.cur[so + row.start..so + row.end], rng)
+                pick_live(&self.cur[so + row.start..so + row.end], |i| live(row.start + i), rng)
+                    .map(|i| row.start + i)
             };
+            let cell = cell?;
             // Counted as the trajectory passes, which is also the virtual loss
             // Student of Games adds across the simulations of one iteration:
             // a later simulation of the same phase sees this one's visit.
             self.visits[so + cell] += 1.0;
-            let trans = self.nodes[node].legal_trans[cell];
-            if trans == NO_TRANS {
-                return None;
-            }
-            c[me] = trans as usize;
+            c[me] = self.nodes[node].legal_trans[cell] as usize;
             node = self.nodes[node].legal_child[cell] as usize;
         }
     }

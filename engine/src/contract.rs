@@ -45,6 +45,11 @@ pub struct Contract {
     /// Config counts, player-major, so a task knows its own row length.
     pub nc: Vec<[u32; 2]>,
     pub parent: Vec<u32>,
+    /// Whether the subtree under a node holds no expandable leaf. The
+    /// expansion trajectories read it, and it is the one per-node fact that is
+    /// not append-only: sealing a leaf seals a chain of its ancestors, so
+    /// `write_into` resends exactly those rows.
+    pub exhausted: Vec<u32>,
     /// Depth from the root. Nodes of one level are mutually independent.
     pub level: Vec<u32>,
     /// Bases into the solver's own arenas, which the device mirrors exactly.
@@ -134,10 +139,27 @@ impl Contract {
     ///
     /// The appended tail leads because a run is placed by taking the buffer's
     /// address, and it is the only one that can grow the buffer and move it.
-    pub fn write_into(&self, w: &mut Writes, sent: &mut Sent, from: usize, rewrite: &[u32]) {
+    pub fn write_into(
+        &self,
+        w: &mut Writes,
+        sent: &mut Sent,
+        from: usize,
+        rewrite: &[u32],
+        resealed: &[u32],
+    ) {
         let n = self.nodes();
         let mut spans: Vec<(usize, usize)> = vec![(from, n - from)];
         spans.extend(rewrite.iter().map(|&g| (g as usize, 1)));
+        // Exhaustion is the one row that changes without the node being
+        // regrown, so the appended tail carries it and every older row that
+        // moved goes on its own.
+        w.u32s(Dst::Exhausted, from, &self.exhausted[from..]);
+        let mut old: Vec<u32> = resealed.iter().copied().filter(|&i| (i as usize) < from).collect();
+        old.sort_unstable();
+        old.dedup();
+        for i in old {
+            w.u32s(Dst::Exhausted, i as usize, &self.exhausted[i as usize..i as usize + 1]);
+        }
         for &(at, k) in &spans {
             w.u8s(Dst::Kind, at, &self.kind[at..at + k]);
             w.u8s(Dst::Player, at, &self.player[at..at + k]);
@@ -207,7 +229,6 @@ impl Contract {
             kind: Vec::with_capacity(n),
             player: Vec::with_capacity(n),
             nc: Vec::with_capacity(n),
-            parent: vec![NO_ROW; n],
             level: vec![0; n],
             roff: Vec::with_capacity(n),
             voff: Vec::with_capacity(n),
@@ -220,10 +241,6 @@ impl Contract {
 
         for i in 0..n {
             c.describe(sv, i);
-        }
-        c.parent = vec![NO_ROW; n];
-        for i in 0..n {
-            c.link(i);
         }
         c.levels_from(sv);
         c.transpose(sv);
@@ -240,7 +257,7 @@ impl Contract {
     /// Rebuilding instead costs 2.2x the CFR sweeps this description exists to
     /// feed, measured at the frozen budget — so a rebuild per iteration is not
     /// a cadence that can pay for itself at any tree size.
-    pub fn extend(&mut self, sv: &Solver, grown: &[u32]) {
+    pub fn extend(&mut self, sv: &Solver, grown: &[u32], resealed: &[u32]) {
         // A node can be created and grown between two calls -- `push_child`
         // grows through a draw or a tactic the moment it makes it -- and the
         // append below describes those in full. Only a leaf that was already
@@ -252,7 +269,6 @@ impl Contract {
             }
         }
         for i in self.built..sv.nodes.len() {
-            self.parent.push(NO_ROW);
             self.level.push(0);
             self.rev_base.push(NO_ROW);
             self.rvd_base.push(NO_ROW);
@@ -260,13 +276,12 @@ impl Contract {
         }
         let first = self.built;
         self.built = sv.nodes.len();
-        // A node's parent is whoever listed it as a child, which is either a
-        // node just grown or one just appended.
-        for &g in grown {
-            self.link(g as usize);
-        }
-        for i in first..self.built {
-            self.link(i);
+        // Sealing a leaf seals its ancestors, which are described already.
+        for &r in resealed {
+            let i = r as usize;
+            if i < first {
+                self.exhausted[i] = sv.nodes[i].exhausted as u32;
+            }
         }
         self.levels_from(sv);
         for &g in grown {
@@ -274,14 +289,6 @@ impl Contract {
         }
         for i in first..self.built {
             self.transpose_children(sv, i);
-        }
-    }
-
-    /// Point a node's children back at it.
-    fn link(&mut self, i: usize) {
-        let (a, n) = (self.child_at[i] as usize, self.child_n[i] as usize);
-        for k in a..a + n {
-            self.parent[self.child[k] as usize] = i as u32;
         }
     }
 
@@ -299,6 +306,8 @@ impl Contract {
         self.kind.truncate(at);
         self.player[i] = self.player[at];
         self.player.truncate(at);
+        moved(&mut self.exhausted);
+        moved(&mut self.parent);
         self.nc[i] = self.nc[at];
         self.nc.truncate(at);
         self.util[i] = self.util[at];
@@ -329,6 +338,8 @@ impl Contract {
                 KIND_DECISION
             });
             c.player.push(t.player);
+            c.exhausted.push(t.exhausted as u32);
+            c.parent.push(sv.parent[i]);
             c.nc.push(sv.nc[i]);
             c.roff.push(sv.roff[i]);
             c.voff.push(sv.voff[i]);
@@ -336,9 +347,6 @@ impl Contract {
             c.util.push(t.util);
             c.child_at.push(c.child.len() as u32);
             c.child_n.push(t.child.len() as u32);
-            // The children are listed but not linked back: a node grown after
-            // its neighbours names children that do not exist yet, so `link`
-            // runs once every node is present.
             c.child.extend(t.child.iter().map(|&ch| ch as u32));
 
             // Legal cells. The offsets stay node-local, exactly as the node
@@ -837,7 +845,8 @@ mod tests {
                 for t in 0..cfg.iters() {
                     if flat {
                         let grown = std::mem::take(&mut sv.grown);
-                        c.extend(&sv, &grown);
+                        let resealed = sv.take_resealed();
+                        c.extend(&sv, &grown, &resealed);
                         let k = sv.cfg.cfr;
                         for p in 0..2 {
                             let m = sv.steps[p] as f32 + 1.0;
@@ -1019,13 +1028,15 @@ mod tests {
             let mut inc = Contract::of(&sv);
             sv.grown.clear();
             // What the card holds, one vector an array.
-            let mut card: Vec<Vec<u32>> = vec![Vec::new(); 35];
+            let mut card: Vec<Vec<u32>> = vec![Vec::new(); Dst::Rootb as usize + 1];
             let mut sent = Sent::default();
             let mut from = 0usize;
             let mut rewrite: Vec<u32> = Vec::new();
+            // `Contract::of` already describes the root's own expansion.
+            let mut resealed = sv.take_resealed();
             for _ in 0..cfg.iters() {
                 let mut w = Writes::default();
-                inc.write_into(&mut w, &mut sent, from, &rewrite);
+                inc.write_into(&mut w, &mut sent, from, &rewrite, &resealed);
                 for r in &w.runs {
                     let v = &mut card[r.dst as usize];
                     let end = (r.at + r.len) as usize;
@@ -1039,6 +1050,9 @@ mod tests {
                 let wide = |v: &[u8]| v.iter().map(|&x| x as u32).collect::<Vec<u32>>();
                 assert_eq!(got(Dst::Kind), &wide(&inc.kind), "kind");
                 assert_eq!(got(Dst::Player), &wide(&inc.player), "player");
+                // The one row that changes without the node being regrown, so
+                // the one the incremental write can silently leave behind.
+                assert_eq!(got(Dst::Exhausted), &inc.exhausted, "exhausted");
                 assert_eq!(got(Dst::Nc), &inc.nc.iter().flatten().copied().collect::<Vec<u32>>(), "nc");
                 assert_eq!(got(Dst::Parent), &inc.parent, "parent");
                 assert_eq!(got(Dst::Roff), &inc.roff, "roff");
@@ -1077,7 +1091,8 @@ mod tests {
                 let grown = std::mem::take(&mut sv.grown);
                 from = inc.built;
                 rewrite = grown.iter().copied().filter(|&g| (g as usize) < from).collect();
-                inc.extend(&sv, &grown);
+                resealed = sv.take_resealed();
+                inc.extend(&sv, &grown, &resealed);
             }
         }
         assert!(checked > 10, "only {checked} descriptions compared");
@@ -1125,7 +1140,8 @@ mod tests {
                     }
                 }
                 let grown = std::mem::take(&mut sv.grown);
-                inc.extend(&sv, &grown);
+                let resealed = sv.take_resealed();
+                inc.extend(&sv, &grown, &resealed);
                 let full = Contract::of(&sv);
 
                 // The layout is deliberately not compared. An extended

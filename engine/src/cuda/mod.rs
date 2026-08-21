@@ -744,7 +744,7 @@ impl Pack {
 
 /// Fields of `struct Tree` in `kernels.cu`, in order. Every one is eight bytes
 /// wide, so the descriptor is positional and needs no packing rules.
-const DESC: usize = 56;
+const DESC: usize = 57;
 
 impl Solve {
     /// What this solve holds, array by array.
@@ -785,6 +785,7 @@ impl Solve {
         match d {
             Dst::Kind => t.kind.plan(s, at, n),
             Dst::Player => t.player.plan(s, at, n),
+            Dst::Exhausted => t.exhausted.plan(s, at, n),
             Dst::Nc => t.nc.plan(s, at, n),
             Dst::Parent => t.parent.plan(s, at, n),
             Dst::Roff => t.roff.plan(s, at, n),
@@ -825,7 +826,7 @@ impl Solve {
     fn describe(&self, s: &Arc<CudaStream>) -> [u64; DESC] {
         let t = &self.tree;
         [
-            t.kind.ptr(s), t.player.ptr(s), t.nc.ptr(s), t.parent.ptr(s),
+            t.kind.ptr(s), t.player.ptr(s), t.exhausted.ptr(s), t.nc.ptr(s), t.parent.ptr(s),
             t.roff.ptr(s), t.voff.ptr(s), t.soff.ptr(s), t.util.ptr(s),
             t.child_at.ptr(s), t.child_n.ptr(s), t.child.ptr(s),
             t.legal_base.ptr(s), t.legal_off.ptr(s), t.legal_child.ptr(s),
@@ -2371,6 +2372,9 @@ struct Scratch {
 struct Tree {
     kind: Arr<u32>,
     player: Arr<u32>,
+    /// Whether the subtree under a node has no expandable leaf left. The
+    /// expansion trajectories will not descend into one.
+    exhausted: Arr<u32>,
     nc: Arr<u32>,
     parent: Arr<u32>,
     roff: Arr<u32>,

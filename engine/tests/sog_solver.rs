@@ -316,6 +316,60 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
     assert!(checked >= 3, "only {} positions exercised", checked);
 }
 
+/// A tree with nothing left to grow must stop expanding, not spin.
+///
+/// Growth stops at a terminal and at the round boundary, so a small endgame's
+/// whole frontier goes non-expandable long before a large `s` is spent. Every
+/// simulation after that samples a leaf nothing may grow and is thrown away --
+/// which is the failure the deleted node ceiling used to cause, and what
+/// `exhausted` exists to stop.
+#[test]
+fn a_solve_stops_expanding_once_the_tree_is_exhausted() {
+    let nets = Nets::default();
+    // Far more expansions than the whole subgame holds.
+    let cfg = Cfg { s: 4_000, c: 1.0, ..Default::default() };
+    let mut checked = 0;
+    for seed in 0..3000u64 {
+        let Some(s) = micro_position(seed, 60 + (seed as usize % 120), 3) else {
+            continue;
+        };
+        let ctx = Ctx::new(&s);
+        let bel = [
+            thinned(uniform_belief(&s, &ctx, 0), CFG_CAP),
+            thinned(uniform_belief(&s, &ctx, 1), CFG_CAP),
+        ];
+        let mut probe = Solver::new(&s, ctx, &nets, cfg, bel.clone());
+        if !probe.grow_full(NODE_CAP) {
+            continue;
+        }
+        let whole = probe.nodes.len();
+
+        let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
+        let mut rng = Rng::new(0x5A17 + seed);
+        sv.solve(&mut rng);
+        assert!(
+            sv.nodes[0].exhausted,
+            "seed {seed}: {} of {whole} nodes grown and the root is still open",
+            sv.nodes.len()
+        );
+        assert_eq!(
+            sv.nodes.len(),
+            whole,
+            "seed {seed}: the search sealed the root without growing the subgame"
+        );
+        // The budget that is left buys nothing and must not be spent.
+        assert!(
+            !sv.expand_once(&mut rng),
+            "seed {seed}: an exhausted tree still handed back a leaf"
+        );
+        checked += 1;
+        if checked >= 3 {
+            break;
+        }
+    }
+    assert!(checked >= 3, "only {checked} endgames exercised");
+}
+
 /// A real position a few plies from the horizon, reached by random play, whose
 /// remaining game spans a round boundary: small hands, so both players empty
 /// them within the remaining main plays and the draws happen inside the

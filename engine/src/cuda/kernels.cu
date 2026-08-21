@@ -595,6 +595,10 @@ __global__ void k_scatter(const unsigned int* blob, unsigned int* const* dst,
 struct Tree {
     const unsigned int* kind;
     const unsigned int* player;
+    // Whether the subtree under a node holds no expandable leaf. An expansion
+    // trajectory that walked into one could only end on a leaf the host may
+    // not grow, and the simulation would be spent for nothing.
+    const unsigned int* exhausted;
     const unsigned int* nc;
     const unsigned int* parent;
     const unsigned int* roff;
@@ -1079,6 +1083,46 @@ __device__ int pick(const float* w, int n, unsigned long long* s) {
     return n - 1;
 }
 
+// Whether the expansion phase may descend through one legal cell: the acting
+// config has a successor there, and the subtree behind it still has somewhere
+// to grow. Mirrors `Solver::live_cell`.
+__device__ bool live_cell(const Tree& t, unsigned int so, unsigned int cell) {
+    return t.legal_trans[so + cell] != NO_TRANS
+        && t.exhausted[t.legal_child[so + cell]] == 0u;
+}
+
+// `pick` over the live cells of `[a, b)` alone, `NO_ROW` when there are none.
+// `w` is the weight row, based at cell `a`.
+__device__ unsigned int pick_live(const Tree& t, unsigned int so, unsigned int a,
+                                  unsigned int b, const float* w,
+                                  unsigned long long* s) {
+    float total = 0.0f, n = 0.0f;
+    for (unsigned int i = a + threadIdx.x; i < b; i += 32) {
+        if (live_cell(t, so, i)) { total += fmaxf(w[i - a], 0.0f); n += 1.0f; }
+    }
+    total = warp_sum(total);
+    int live = (int)warp_sum(n);
+    if (live == 0) return NO_ROW;
+    if (!(total > 0.0f)) {
+        int k = (int)(rng_next(s) % (unsigned long long)live);
+        for (unsigned int i = a; i < b; ++i) {
+            if (!live_cell(t, so, i)) continue;
+            if (k == 0) return i;
+            --k;
+        }
+        return NO_ROW;
+    }
+    double needle = rng_unit(s) * (double)total;
+    unsigned int last = NO_ROW;
+    for (unsigned int i = a; i < b; ++i) {
+        if (!live_cell(t, so, i)) continue;
+        last = i;
+        needle -= (double)fmaxf(w[i - a], 0.0f);
+        if (needle < 0.0) return i;
+    }
+    return last;
+}
+
 // The cell PUCT would take from one config's legal row.
 //
 // `Q + c_puct * P * sqrt(sum N) / (1 + N)`, with `Q` divided by the opponent's
@@ -1087,8 +1131,8 @@ __device__ int pick(const float* w, int n, unsigned long long* s) {
 //
 // Ties go to the lowest cell, which is what a serial scan keeping the first
 // strictly greater score does.
-__device__ int puct_choice(const Tree& t, unsigned int node, unsigned int a,
-                           unsigned int b, int opp, float c_puct) {
+__device__ unsigned int puct_choice(const Tree& t, unsigned int node, unsigned int a,
+                                    unsigned int b, int opp, float c_puct) {
     unsigned int so = t.soff[node], ra = rbase(t, node, opp);
     unsigned int nc = t.nc[2 * node + opp];
     float mass = 0.0f;
@@ -1100,16 +1144,17 @@ __device__ int puct_choice(const Tree& t, unsigned int node, unsigned int a,
         total += t.visits[so + cell];
     total = warp_sum(total);
     float explore = c_puct * sqrtf(fmaxf(total, 0.0f));
-    int best = (int)a;
+    unsigned int best = NO_ROW;
     float score = neg_inf();
     for (unsigned int cell = a + threadIdx.x; cell < b; cell += 32) {
+        if (!live_cell(t, so, cell)) continue;
         float v = t.qval[so + cell] * scale
                 + explore * t.prior[so + cell] / (1.0f + t.visits[so + cell]);
-        if (v > score) { score = v; best = (int)cell; }
+        if (v > score) { score = v; best = cell; }
     }
     for (int k = 16; k > 0; k >>= 1) {
         float os = __shfl_xor_sync(0xffffffff, score, k);
-        int oc = __shfl_xor_sync(0xffffffff, best, k);
+        unsigned int oc = __shfl_xor_sync(0xffffffff, best, k);
         if (os > score || (os == score && oc < best)) { score = os; best = oc; }
     }
     return best;
@@ -1159,12 +1204,15 @@ __global__ void k_expand(const Tree* trees, unsigned int* out, int parts,
             }
             unsigned int lb = t.legal_base[node], so = t.soff[node];
             unsigned int a = t.legal_off[lb + c[me]], b = t.legal_off[lb + c[me] + 1];
-            if (a == b) break;
-            int cell;
+            unsigned int cell;
             // Student of Games selects by half PUCT and half the search's own
             // average: `pi_select = 1/2 pi_PUCT + 1/2 pi_CFR`. PUCT is a
             // maximisation, so its half is a point mass on the argmax, and
             // sampling the mixture is a coin flip between the two.
+            //
+            // Both halves are restricted to the cells this world can still
+            // grow through. A config whose every legal action is a dead end
+            // ends the trajectory here.
             if (rng_unit(&s) < 0.5) {
                 cell = puct_choice(t, node, a, b, 1 - me, c_puct);
             } else {
@@ -1173,16 +1221,15 @@ __global__ void k_expand(const Tree* trees, unsigned int* out, int parts,
                     mine |= t.sum[so + q] > 0.0f;
                 bool any = __any_sync(0xffffffff, mine);
                 const float* row = any ? t.sum + so + a : t.cur + so + a;
-                cell = (int)a + pick(row, (int)(b - a), &s);
+                cell = pick_live(t, so, a, b, row, &s);
             }
+            if (cell == NO_ROW) break;
             // Counted as the trajectory passes, which is also the virtual loss
             // Student of Games adds across the simulations of one iteration:
             // a later simulation of the same phase sees this one's visit.
             if (threadIdx.x == 0) t.visits[so + cell] += 1.0f;
             __syncwarp();
-            unsigned int trans = t.legal_trans[so + cell];
-            if (trans == NO_TRANS) break;
-            c[me] = (int)trans;
+            c[me] = (int)t.legal_trans[so + cell];
             node = t.legal_child[so + cell];
         }
         if (threadIdx.x == 0) out[part * sims + sim] = found;

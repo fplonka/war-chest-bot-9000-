@@ -144,7 +144,7 @@ pub enum Call {
 /// else depends on it; `Solve::plan` in the device driver is the other half.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Dst {
-    Kind, Player, Nc, Parent, Roff, Voff, Soff, Util,
+    Kind, Player, Exhausted, Nc, Parent, Roff, Voff, Soff, Util,
     ChildAt, ChildN, Child,
     LegalBase, LegalOff, LegalChild, LegalTrans, CellRow, CellVal,
     RevBase, RevStart, RevSrc, RevCell,
