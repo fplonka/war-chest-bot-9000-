@@ -440,24 +440,27 @@ const REFERENCE_IN_FLIGHT: usize = 64;
 /// ask what the population will hold rather than what it holds (see
 /// `Device::room_for`). The host cannot: a solve's cost here is spread over the
 /// tree, the states and a shared contract, and there is no cheap figure for it.
-/// So this bounds the overshoot instead of measuring it. Admission is paced one
-/// solve per solve finished, and a population that grows by its own size over
-/// one solve's life passes the level it stopped admitting at by a factor of
-/// `e` -- so stopping at `SOLVE_SHARE / e` ends at `SOLVE_SHARE`.
+/// So this is a level, and the one number in it carries the overshoot.
 #[cfg(target_os = "linux")]
 fn host_room() -> bool {
-    /// How much of the machine the solves in flight may grow into.
+    /// Fraction of the machine at which the process stops admitting.
     ///
-    /// The only number in this bound, and it says what it means: half the
-    /// memory is for the search, and the other half is for the trainer, the
-    /// replay buffer, the allocator's retained pages and whatever else shares
-    /// the box.
+    /// Not the fraction it ends up holding. Admission is paced one solve per
+    /// solve finished, so the population grows by its own size over one solve's
+    /// life and passes the level it stopped at by a factor of `e`: two tenths
+    /// here is about 54 per cent held. The rest of the machine is the trainer,
+    /// the replay buffer, the allocator's retained pages and whatever else
+    /// shares the box.
     ///
-    /// What would make it wrong is anything that takes more than the other
-    /// half. The replay buffer at its cap is the one that grows over a run,
-    /// and it is a few gigabytes; a second training process on the same box is
-    /// the one that would not show up here at all.
-    const SOLVE_SHARE: f64 = 0.5;
+    /// It is also the lever the generation rate sits on, because it is this
+    /// bound and not the card's that settles how many solves are in flight --
+    /// measured on a 62 GB box, two tenths admits until the process holds
+    /// 12 GB and the population settles around 34. Two things would make it
+    /// wrong. A solve that holds more of the host relative to the card than it
+    /// does today, which would fill the machine before the card noticed; and
+    /// anything outside the farm that grows past the other half, of which the
+    /// replay buffer at its cap is the only one in this process.
+    const ADMIT_SHARE: f64 = 0.2;
     let field = |path: &str, at: usize| -> Option<u64> {
         std::fs::read_to_string(path)
             .ok()?
@@ -469,7 +472,7 @@ fn host_room() -> bool {
     // `statm` is in pages and `meminfo`'s first field is `MemTotal:` in kB.
     let rss = field("/proc/self/statm", 1).unwrap_or(0) * 4096;
     let total = field("/proc/meminfo", 1).unwrap_or(u64::MAX / 1024) * 1024;
-    (rss as f64) * std::f64::consts::E < SOLVE_SHARE * total as f64
+    (rss as f64) < ADMIT_SHARE * total as f64
 }
 
 #[cfg(not(target_os = "linux"))]
