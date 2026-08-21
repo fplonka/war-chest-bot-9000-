@@ -715,6 +715,8 @@ mod tests {
     use crate::search::{Cfg, Nets};
     use std::sync::Arc;
     use crate::selfplay::{collect_roots, Agent, Collect, GameCfg};
+    use crate::board::N_HEXES;
+    use crate::pbs::NSLOT;
 
     fn random_net(seed: u64) -> crate::net::Net {
         let mut r = Rng::new(seed);
@@ -907,6 +909,75 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0, "no solve compared");
+    }
+
+    /// The action words a solve sends must rebuild the policy head's own input.
+    ///
+    /// The card runs the action encoder now, and the one thing it cannot know
+    /// is what an action *is*. The five words a node sends are a
+    /// `Net::action_feats` one-hot in the making, and a column out of place is
+    /// a policy prior that is wrong everywhere and finite everywhere.
+    #[test]
+    fn the_action_words_a_solve_sends_rebuild_its_one_hot() {
+        use crate::net::{Net, AFEAT};
+        let nets = Arc::new(Nets { value: random_net(0x5EED), device: false });
+        let cfg = Cfg { s: 24, c: 2.0, ..Default::default() };
+        let gc = GameCfg {
+            agents: [Agent::Sog { cfg }; 2],
+            collect: Collect::Sog,
+            explore: 0.1,
+            random_draft: true,
+            p_td1: 0.0,
+            query_rate: 0.9,
+            recursive_rate: 0.1,
+        };
+        let roots = collect_roots(2, 0x51E5, &nets, &gc, 2);
+        let mut checked = 0usize;
+        for (s, belief) in &roots {
+            let ctx = crate::pbs::Ctx::new(s);
+            let mut sv =
+                crate::search::Solver::new(s, ctx, Arc::clone(&nets), cfg, belief.clone(), Rng::new(0xAC75));
+            // A prior is only owed once the batch has reached the node's row,
+            // so the tree has to be grown and its calls answered first.
+            for _ in 0..cfg.iters() {
+                sv.catch_up();
+                sv.step();
+                sv.expand_once();
+            }
+            sv.catch_up();
+            let (prime, acts, cells) = sv.prime();
+            assert!(!prime.is_empty(), "no node was ready for a prior");
+            // The blocks `Net::action_feats` writes, in order: the kind, the
+            // coin slot with a column for "spends nothing", and three hexes
+            // each with a column for "names none".
+            let widths = [crate::actions::N_KINDS, NSLOT + 1, N_HEXES + 1, N_HEXES + 1, N_HEXES + 1];
+            for q in &prime {
+                let n = &sv.nodes[q.node as usize];
+                assert_eq!(q.na as usize, n.na(), "action count");
+                assert_eq!(q.nc as usize, n.nc(n.player as usize), "config count");
+                for a in 0..n.na() {
+                    let d = &acts[5 * (q.at as usize + a)..][..5];
+                    let mut got = vec![0.0f32; AFEAT];
+                    let mut at = 0;
+                    for (k, w) in widths.iter().enumerate() {
+                        got[at + d[k] as usize] = 1.0;
+                        at += w;
+                    }
+                    let mut want = vec![0.0f32; AFEAT];
+                    Net::action_feats(n.acts[a].kind(), n.aslot[a], n.acts[a].hexes(), &mut want);
+                    assert_eq!(got, want, "action {a} of node {}", q.node);
+                }
+                let at = q.cell_at as usize;
+                assert_eq!(
+                    &cells[at..at + n.legal_action.len()],
+                    &n.legal_action[..],
+                    "the cells of node {}",
+                    q.node
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 4, "only {checked} nodes described");
     }
 
     /// Every node of a level must have its parent in an earlier one.

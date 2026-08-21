@@ -17,7 +17,7 @@
 //! is asked of the card.
 
 use parking_lot::{Condvar, Mutex, RwLock};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -78,8 +78,8 @@ pub enum Call {
         /// Everything the card has yet to be told about this solve, already in
         /// the shape the wire wants.
         writes: Writes,
-        /// The first call of a solve. A gate slot is reused, so this is what
-        /// tells the backend to forget the solve that held it before.
+        /// The first call of a solve. A card's solve slot is reused, so this
+        /// is what tells the backend to forget the solve that held it before.
         fresh: bool,
         /// Arena lengths, so the device can fit what it holds.
         ncells: usize,
@@ -93,6 +93,16 @@ pub enum Call {
         nterm: usize,
         /// The seed of the expansion's own random stream, sent once.
         seed: Option<u64>,
+        /// Nodes whose policy prior the card is to fill this round, and the two
+        /// things it needs that it does not already hold.
+        prime: Vec<Prime>,
+        /// Five words an action -- kind, coin slot, three hexes -- which the
+        /// card expands into the encoder's one-hot input.
+        acts: Vec<u32>,
+        /// Which action each of a primed node's strategy cells stands for.
+        cells: Vec<u32>,
+        /// The softmax temperature the prior is formed at.
+        prior_temp: f32,
     },
     /// One CFR iteration and one expansion phase.
     ///
@@ -136,6 +146,28 @@ pub enum Call {
     },
 }
 
+/// One node whose policy prior a round is to fill.
+///
+/// The card holds everything this reads but two facts: what an action *is*, and
+/// which action each strategy cell stands for. Both are a few kilobytes a node.
+/// The host used to run the policy head itself instead, and the round
+/// downloaded a board vector per fresh leaf and a `f_p` row per fresh config so
+/// that it could — a quarter of a megabyte a solve a round, for a handful of
+/// nodes.
+#[derive(Clone, Copy)]
+pub struct Prime {
+    pub node: u32,
+    /// The node's row in this solve's leaf batch, where its board vector is.
+    pub row: u32,
+    /// Where its actions start in `acts`, and how many it offers.
+    pub at: u32,
+    pub na: u32,
+    /// Where its cells start in `cells`.
+    pub cell_at: u32,
+    /// Configs the acting player holds here, which is the grid the prior takes.
+    pub nc: u32,
+}
+
 /// One of a solve's resident arrays, as a run of the round's blob names it.
 ///
 /// The order is the vocabulary the solver and the backend share and nothing
@@ -156,10 +188,9 @@ pub enum Dst {
 ///
 /// The backend used to build this itself: it held an `Arc<Contract>`, walked
 /// it, widened bytes into words and copied every run into one buffer -- all on
-/// the single driver thread, while every solver thread sat parked with nothing
-/// to do. That was a third of a round. A thread builds its own now, on a core
-/// that is otherwise idle, and the driver is left with what only it can do:
-/// say where each run lands on the card.
+/// the one driver thread a card has. That was a third of a round. A solve
+/// builds its own now, on the worker that grew the tree, and the driver is left
+/// with what only it can do: say where each run lands on the card.
 ///
 /// Floats travel as their bits, because the scatter kernel moves words and
 /// does not care which they are.
@@ -341,23 +372,22 @@ impl Backend {
         }
     }
 
-    /// Device bytes one card's solve arenas hold right now.
-    pub fn held(&self, #[allow(unused)] card: usize) -> u64 {
+    /// Whether this card has room for another solve in flight.
+    ///
+    /// On a card that is the measured level of its solve arenas against what it
+    /// had free before any of them were admitted. A solve's cost varies
+    /// twenty-six fold with how far into a game its root sits, so how many fit
+    /// is a question about bytes and the card is the only thing that can answer
+    /// it.
+    ///
+    /// The reference backend keeps nothing resident -- a solve it serves lives
+    /// entirely in host memory -- so it has no such level, and a plain count is
+    /// all there is to bound it by.
+    pub fn has_room(&self, #[allow(unused)] card: usize, live: usize) -> bool {
         match self {
-            Backend::Reference(_) => 0,
+            Backend::Reference(_) => live < REFERENCE_IN_FLIGHT,
             #[cfg(feature = "gpu")]
-            Backend::Cuda(d) => d.held(card),
-        }
-    }
-
-    /// What they may hold. The reference keeps nothing on any card -- a solve
-    /// it serves lives entirely in host memory -- so its solves in flight are
-    /// bounded by `ADMIT_PER_ROUND` and nothing else.
-    pub fn budget(&self, #[allow(unused)] card: usize) -> u64 {
-        match self {
-            Backend::Reference(_) => 0,
-            #[cfg(feature = "gpu")]
-            Backend::Cuda(d) => d.budget(card),
+            Backend::Cuda(d) => d.held(card) < d.budget(card),
         }
     }
 
@@ -402,14 +432,15 @@ impl Backend {
 const CHUNK_SOLVES: usize = 8;
 
 /// Solves one card will hold, however small they turn out to be. The real
-/// bound is `Backend::budget`, which is bytes.
-const MAX_IN_FLIGHT: usize = 4096;
+/// bound is `Backend::has_room`, which is bytes; this is the last resort.
+const MAX_IN_FLIGHT: usize = 1024;
 
-/// Solves one card admits between two of its rounds.
-///
-/// A solve's arenas are not allocated until its first round, so the level the
-/// admission reads is always a round behind what it has just let in. Letting
-/// them in a few at a time is what lets it catch up before it overshoots.
+/// Solves the CPU reference serves at once. It keeps nothing on a card, so
+/// there is no level to measure and nothing but a count to bound it by.
+const REFERENCE_IN_FLIGHT: usize = 64;
+
+/// Solves one card admits between two of its rounds, once it has the credit.
+/// Only a bound on how far a single check can overshoot.
 const ADMIT_PER_ROUND: usize = 8;
 
 /// A queue with parked consumers, closed once when the farm winds down.
@@ -469,9 +500,13 @@ impl<T> Queue<T> {
         self.closed.store(true, Ordering::Relaxed);
         self.ready.notify_all();
     }
+
+    fn closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
+    }
 }
 
-/// What a solver thread does with its turn.
+/// Where a job's solves come from.
 ///
 /// `Play` is the run: solves come from games played forward, and their rows are
 /// kept. `Roots` is the bench, and it exists because the run cannot be
@@ -498,21 +533,18 @@ pub enum Work {
 /// a loop — the solve it is waiting on belongs to the farm, not to a thread.
 enum Source {
     Play(GameStream),
-    /// Where in the corpus this job is, and its own random stream. Jobs are
-    /// interleaved and the corpus cycles, so the set of roots in flight is the
-    /// same at every moment of a bench and the same between two builds.
-    Roots { at: usize, step: usize, rng: crate::rng::Rng },
+    /// Where in the corpus this job is, and its own random stream. Each job
+    /// starts at its own place and cycles from there, so the roots in flight
+    /// are a spread of the corpus at every moment of a bench and the same
+    /// spread between two builds.
+    Roots { at: usize, rng: crate::rng::Rng },
 }
 
 impl Source {
     fn new(work: &Work, seed: u64, i: usize) -> Source {
         match work {
             Work::Play(gc) => Source::Play(GameStream::new(seed, *gc)),
-            Work::Roots { .. } => Source::Roots {
-                at: i,
-                step: 1,
-                rng: crate::rng::Rng::new(seed),
-            },
+            Work::Roots { .. } => Source::Roots { at: i, rng: crate::rng::Rng::new(seed) },
         }
     }
 
@@ -520,9 +552,9 @@ impl Source {
     fn next(&mut self, work: &Work, nets: &Arc<crate::search::Nets>, out: &mut Data) -> Solver {
         match (self, work) {
             (Source::Play(stream), _) => stream.next_solve(nets, out),
-            (Source::Roots { at, step, rng }, Work::Roots { roots, cfg, recursive_rate }) => {
+            (Source::Roots { at, rng }, Work::Roots { roots, cfg, recursive_rate }) => {
                 let (s, bel) = &roots[*at % roots.len()];
-                *at += *step;
+                *at += 1;
                 crate::selfplay::query_solver(nets, *cfg, *recursive_rate, s, bel, rng)
             }
             (Source::Roots { .. }, Work::Play(_)) => unreachable!("a source matches its work"),
@@ -617,24 +649,26 @@ impl Farm {
         let collected = Arc::new(Mutex::new(Vec::new()));
         let stopping = Arc::new(AtomicBool::new(false));
         let broken = Arc::new(AtomicBool::new(false));
+        let done: Vec<Arc<AtomicUsize>> = (0..cards).map(|_| Arc::new(AtomicUsize::new(0))).collect();
         let stats = Arc::new(Stats::default());
         let backend = Arc::new(RwLock::new(backend));
 
         let hands: Vec<JoinHandle<()>> = (0..workers)
             .map(|t| {
-                let (ready, device, nets, collected, work, stopping) = (
+                let (ready, device, nets, collected, work, stopping, done) = (
                     Arc::clone(&ready),
                     device.clone(),
                     Arc::clone(&nets),
                     Arc::clone(&collected),
                     Arc::clone(&work),
                     Arc::clone(&stopping),
+                    done.clone(),
                 );
                 std::thread::Builder::new()
                     .name(format!("host-{t}"))
                     .spawn(move || {
                         while let Some(job) = ready.pop() {
-                            advance_job(job, &device, &nets, &work, &collected, &stopping);
+                            advance_job(job, &device, &nets, &work, &collected, &stopping, &done);
                         }
                     })
                     .expect("spawn host thread")
@@ -643,7 +677,7 @@ impl Farm {
 
         let drivers = (0..cards)
             .map(|c| {
-                let (queue, ready, backend, nets, work, stats, broken) = (
+                let (queue, ready, backend, nets, work, stats, broken, done) = (
                     Arc::clone(&device[c]),
                     Arc::clone(&ready),
                     Arc::clone(&backend),
@@ -651,12 +685,16 @@ impl Farm {
                     Arc::clone(&work),
                     Arc::clone(&stats),
                     Arc::clone(&broken),
+                    Arc::clone(&done[c]),
                 );
                 let seed = seed.wrapping_mul(0x9E37_79B9) ^ c as u64;
                 std::thread::Builder::new()
                     .name(format!("card-{c}"))
                     .spawn(move || {
-                        drive_card(c, cards, seed, &queue, &ready, &backend, &nets, &work, &stats, &broken)
+                        drive_card(
+                            c, cards, seed, &queue, &ready, &backend, &nets, &work, &stats,
+                            &broken, &done,
+                        )
                     })
                     .expect("spawn driver thread")
             })
@@ -757,12 +795,14 @@ fn advance_job(
     work: &Work,
     collected: &Mutex<Vec<Data>>,
     stopping: &AtomicBool,
+    done: &[Arc<AtomicUsize>],
 ) {
     let mut replies = std::mem::take(&mut job.replies);
     loop {
         match job.solver.advance(&replies) {
             Step::Calls(calls) => return device[job.card].push((job, calls)),
             Step::Done(solved) => {
+                done[job.card].fetch_add(1, Ordering::Relaxed);
                 job.source.take(&job.solver, solved, &mut job.data);
                 if stopping.load(Ordering::Relaxed) || job.data.soff.len() >= CHUNK_SOLVES {
                     collected.lock().push(std::mem::take(&mut job.data));
@@ -793,17 +833,33 @@ fn drive_card(
     work: &Work,
     stats: &Stats,
     broken: &AtomicBool,
+    done: &AtomicUsize,
 ) {
-    let budget = backend.read().budget(card);
     let mut live = 0usize;
     loop {
         // Solves this card has room for, admitted between rounds and never
         // retired. A solve's cost varies twenty-six fold with how far into a
-        // game its root sits, so how many fit is a question about bytes and
-        // the card is the only thing that can answer it.
-        if live == 0 || backend.read().held(card) < budget {
+        // game its root sits, so how many fit is a question about bytes and the
+        // card is the only thing that can answer it.
+        //
+        // Paced one for one against the solves this card has *finished*. A
+        // fresh solve's arenas are nearly empty, so the level says nothing
+        // about a population that has not grown yet -- admitting on it while
+        // everything in flight is still a seedling fills the card and then the
+        // host's memory, several thousand solves later. Every admission being
+        // paid for by a solve that ran to the end means the level is always one
+        // that has been measured, and the count still reaches its equilibrium
+        // in a second or two: completions arrive at a rate the population sets,
+        // so the growth is exponential.
+        //
+        // Nothing new once the farm is winding down. The solves in flight have
+        // to finish before a worker can leave, and a fresh one would be a whole
+        // solve of that wait for rows nobody will collect.
+        let paid = live <= done.load(Ordering::Relaxed);
+        let room = paid && live < MAX_IN_FLIGHT && backend.read().has_room(card, live);
+        if !ready.closed() && (live == 0 || room) {
             for _ in 0..ADMIT_PER_ROUND {
-                if live >= MAX_IN_FLIGHT {
+                if live > done.load(Ordering::Relaxed) || live >= MAX_IN_FLIGHT {
                     break;
                 }
                 let mut source = Source::new(
@@ -869,11 +925,11 @@ fn drive_card(
 /// thread that was ready at the same moment.
 pub struct Cards {
     queues: Vec<Arc<Queue<Ask>>>,
-    /// Solve slots nobody is using. A card keeps a solve's arenas while it
-    /// runs, so two solves must never share one, and the number handed out is
-    /// therefore the number of threads that solve at once.
-    free: Mutex<Vec<(usize, usize)>>,
-    next: Mutex<usize>,
+    /// Seats nobody is sitting in, and how many have ever been handed out. A
+    /// card keeps a solve's arenas while it runs, so two solves must never
+    /// share a slot, and the number in use is therefore the number of threads
+    /// solving at once.
+    seats: Mutex<(Vec<(usize, usize)>, usize)>,
     drivers: Vec<JoinHandle<()>>,
 }
 
@@ -893,7 +949,7 @@ pub struct Seat<'a> {
 
 impl Drop for Seat<'_> {
     fn drop(&mut self) {
-        self.cards.free.lock().push((self.card, self.slot));
+        self.cards.seats.lock().0.push((self.card, self.slot));
     }
 }
 
@@ -935,17 +991,17 @@ impl Cards {
                     .expect("spawn driver thread")
             })
             .collect();
-        Cards { queues, free: Mutex::new(Vec::new()), next: Mutex::new(0), drivers }
+        Cards { queues, seats: Mutex::new((Vec::new(), 0)), drivers }
     }
 
     /// Take a card and one of its solve slots for the length of one solve.
     pub fn seat(&self) -> Seat<'_> {
-        let (card, slot) = self.free.lock().pop().unwrap_or_else(|| {
-            let mut next = self.next.lock();
-            let taken = *next;
-            *next += 1;
-            (taken % self.queues.len(), taken / self.queues.len())
+        let mut seats = self.seats.lock();
+        let (card, slot) = seats.0.pop().unwrap_or_else(|| {
+            seats.1 += 1;
+            ((seats.1 - 1) % self.queues.len(), (seats.1 - 1) / self.queues.len())
         });
+        drop(seats);
         Seat { cards: self, card, slot }
     }
 

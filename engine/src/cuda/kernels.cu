@@ -645,6 +645,8 @@ struct Tree {
     const float* jp;
     const float* f;
     const float* g;
+    // The policy readout's config row, which `k_prior` dots against an action.
+    const float* fp;
     const unsigned int* cidx;
     const unsigned int* coff;
     // Batch row -> node, for the leaves the network answers for.
@@ -1158,6 +1160,98 @@ __device__ unsigned int puct_choice(const Tree& t, unsigned int node, unsigned i
         if (os > score || (os == score && oc < best)) { score = os; best = oc; }
     }
     return best;
+}
+
+// ------------------------------------------------------------ the policy prior
+//
+// `Solver::refresh_priors` used to run on the host, and the round downloaded a
+// board vector per fresh leaf and an `f_p` row per fresh config so that it
+// could. Everything it reads is here; what it needs and the card does not hold
+// is what an action *is*, which is five words an action in `desc`.
+
+// The action encoder's one-hot input, expanded from `Net::action_feats`.
+//
+// `desc` is five words an action -- kind, coin slot, three hexes -- each
+// already the column its block sets, so "spends nothing" and "names no hex"
+// arrive as the column past the last rather than as a sentinel to fold here.
+// The five blocks are `nkinds`, `nslot + 1` and three of `nhex + 1`.
+__global__ void k_act_feats(const unsigned int* desc, float* feat, int n,
+                            int nkinds, int nslot, int nhex, int afeat) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * afeat) return;
+    int col = i % afeat;
+    int at = 0, k = 0, width = nkinds;
+    while (col >= at + width) {
+        at += width;
+        ++k;
+        width = k == 1 ? nslot + 1 : nhex + 1;
+    }
+    feat[i] = col == at + (int)desc[5 * (i / afeat) + k] ? 1.0f : 0.0f;
+}
+
+// Every primed node's board vector, gathered out of its own solve's `p`.
+__global__ void k_act_boards(const Tree* trees, const unsigned int* part,
+                             const unsigned int* row, float* boards, int m, int d) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= m * d) return;
+    int k = i / d, j = i % d;
+    boards[i] = trees[part[k]].p[(size_t)row[k] * d + j];
+}
+
+// The board's projection, added to the action's. A batch spans nodes, so which
+// board an action reads is an index rather than a property of the call.
+__global__ void k_act_add(float* z, const float* proj, const unsigned int* of,
+                          int n, int width) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * width) return;
+    z[i] += proj[(size_t)of[i / width] * width + i % width];
+}
+
+// `prior(c, .) = softmax(<f_p(c), e(a)> / temp)` over one config's legal row.
+//
+// A warp to a config. The dot is the warp's, so a row of `f_p` and a row of `e`
+// are each read once and coalesced; the softmax that follows is over the cells,
+// which are few, so it takes a lane apiece and `prior` itself as its scratch.
+__global__ void k_prior(const Tree* trees, const unsigned int* part,
+                        const unsigned int* node_of, const unsigned int* row_of,
+                        const unsigned int* act_at, const unsigned int* cell_at,
+                        const unsigned int* cells, const float* e,
+                        const float* inv_t, int m, int d) {
+    int k = blockIdx.y;
+    if (k >= m) return;
+    int c = blockIdx.x * blockDim.y + threadIdx.y;
+    const Tree& t = trees[part[k]];
+    unsigned int node = node_of[k];
+    unsigned int me = t.player[node];
+    if ((unsigned)c >= t.nc[2 * node + me]) return;
+    unsigned int lb = t.legal_base[node], so = t.soff[node];
+    unsigned int a = t.legal_off[lb + c], b = t.legal_off[lb + c + 1];
+    if (a == b) return;
+    int lane = threadIdx.x;
+    unsigned int cs = t.coff[2 * row_of[k] + me];
+    const float* fp = t.fp + (size_t)t.cidx[cs + t.cell_row[so + a]] * d;
+    for (unsigned int cell = a; cell < b; ++cell) {
+        const float* ea = e + (size_t)(act_at[k] + cells[cell_at[k] + cell]) * d;
+        float acc = 0.0f;
+        for (int j = lane; j < d; j += 32) acc += fp[j] * ea[j];
+        acc = warp_sum(acc);
+        if (lane == 0) t.prior[so + cell] = acc;
+    }
+    __syncwarp();
+    float top = neg_inf();
+    for (unsigned int cell = a + lane; cell < b; cell += 32)
+        top = fmaxf(top, t.prior[so + cell]);
+    for (int s = 16; s > 0; s >>= 1)
+        top = fmaxf(top, __shfl_xor_sync(0xffffffff, top, s));
+    float mine = 0.0f;
+    for (unsigned int cell = a + lane; cell < b; cell += 32) {
+        float v = expf((t.prior[so + cell] - top) * inv_t[k]);
+        t.prior[so + cell] = v;
+        mine += v;
+    }
+    float total = warp_sum(mine);
+    float scale = total > 0.0f ? 1.0f / total : 1.0f / (float)(b - a);
+    for (unsigned int cell = a + lane; cell < b; cell += 32) t.prior[so + cell] *= scale;
 }
 
 __global__ void k_expand(const Tree* trees, unsigned int* out, int parts,

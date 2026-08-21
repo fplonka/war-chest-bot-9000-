@@ -1,16 +1,16 @@
 //! The device must solve as the CPU does.
 //!
-//! The whole CFR loop lives on the card now, so a round of calls no longer has
-//! an answer the CPU can produce on its own: the reaches, the regrets and the
-//! expansion trajectories never come back. What both backends can be asked for
-//! is a *solve* — the same position, the same weights, the same seed — and that
-//! is what this compares.
+//! The whole search lives on the card now — the CFR loop, the readout, the
+//! belief pooling and the policy head — so no single call has an answer the CPU
+//! can produce on its own. Nothing but the sampled expansion leaves and the
+//! final read crosses the bus at all. What both backends can still be asked for
+//! is a *solve*, and that is what this compares: the same position, the same
+//! weights, the same seed, and the targets it produces.
 //!
-//! Two levels. `the_network_agrees` still checks the trunk and the config
-//! encoder call by call, because those cross the bus in both directions and a
-//! drift there is arithmetic rather than search. `a_solve_agrees` runs real
-//! self-play through each backend and compares what a solve produces: the
-//! root's values, its policy, and the beliefs it harvests.
+//! That makes the fixed-tree comparison the whole net. Every pass a solve takes
+//! — the trunk, the config encoder, the reach sweep, the join, the terminals,
+//! backpropagation, the regret update and the value pass under the average — is
+//! upstream of a root value, so a drift in any of them lands there.
 //!
 //! Needs a GPU, so it only builds under `--features gpu`.
 #![cfg(feature = "gpu")]
@@ -63,16 +63,12 @@ fn game_cfg(s: u32, c: f32) -> GameCfg {
 /// A stream's games are a function of its seed alone, so the same seed run
 /// alone and run beside others plays the same games and must produce the same
 /// numbers. That is what makes batching testable.
-///
-/// `watch` sees every round before its replies are handed back, which is how
-/// the network comparison below gets at the two calls that still cross the bus.
-fn generate_with(
+fn generate(
     net: &Net,
     backend: Backend,
     streams: &[(u64, u32)],
     games: usize,
     c: f32,
-    mut watch: impl FnMut(&[Call], &[Reply]),
 ) -> Vec<Data> {
     let nets = Arc::new(Nets { value: net.clone(), device: backend.keeps_the_solve() });
     let n = streams.len();
@@ -113,9 +109,7 @@ fn generate_with(
         if calls.is_empty() {
             continue;
         }
-        let answered = backend.run(&calls, 0).expect("the backend answered the round");
-        watch(&calls, &answered);
-        let mut rest = answered;
+        let mut rest = backend.run(&calls, 0).expect("the backend answered the round");
         for (i, k) in spans.into_iter().enumerate() {
             let tail = rest.split_off(k);
             replies[i] = rest;
@@ -123,10 +117,6 @@ fn generate_with(
         }
     }
     out
-}
-
-fn generate(net: &Net, backend: Backend, streams: &[(u64, u32)], games: usize, c: f32) -> Vec<Data> {
-    generate_with(net, backend, streams, games, c, |_, _| {})
 }
 
 /// One stream, which is what a comparison against the CPU wants.
@@ -144,38 +134,6 @@ fn worst(a: &[f32], b: &[f32], what: &str) -> f32 {
         .zip(b)
         .map(|(&x, &y)| (x - y).abs() / (x.abs().max(y.abs()).max(1e-2)))
         .fold(0.0, f32::max)
-}
-
-/// The trunk and the config encoder, call by call.
-///
-/// These are the two passes whose answers still cross the bus, so they can be
-/// held to the CPU network directly. `Call::run` is that network.
-#[test]
-fn the_network_agrees() {
-    if Device::count() == 0 {
-        eprintln!("no cuda device; skipping");
-        return;
-    }
-    let net = random_net(0x9E37);
-    let device = Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
-    let (mut seen, mut bad) = ([0usize; 2], 0.0f32);
-    generate_with(&net, device, &[(0x51E5, 32)], 4, 4.0, |calls, replies| {
-        for (c, r) in calls.iter().zip(replies) {
-            match c {
-                Call::Trunk { .. } => {
-                    seen[0] += 1;
-                    bad = bad.max(worst(&c.run(&net).a, &r.a, "trunk"));
-                }
-                Call::Configs { .. } => {
-                    seen[1] += 1;
-                    bad = bad.max(worst(&c.run(&net).c, &r.c, "configs"));
-                }
-                _ => {}
-            }
-        }
-    });
-    assert!(seen.iter().all(|&n| n > 0), "saw {seen:?} of the two calls");
-    assert!(bad < 1e-3, "worst network difference {bad:e}");
 }
 
 /// A whole solve, both ways, on the same tree.

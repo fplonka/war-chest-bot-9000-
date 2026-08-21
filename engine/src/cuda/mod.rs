@@ -35,10 +35,10 @@ use cudarc::driver::{
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 
 use crate::board::{board, N_HEXES, NONE};
-use crate::farm::{Call, Dst, Reply, CARD_ROWS};
+use crate::farm::{Call, Dst, Prime, Reply, CARD_ROWS};
 use crate::net::{
-    ln_block, Net, NetLayout, NormSpan, Span, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW, LN_CFG,
-    LN_H, LN_JOIN, LN_JOUT, LN_TRUNK, POOL, TYPE,
+    ln_block, Net, NetLayout, NormSpan, Span, AFEAT, AW, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW,
+    LN_ACT, LN_CFG, LN_H, LN_JOIN, LN_JOUT, LN_TRUNK, POOL, TYPE,
 };
 use crate::pbs::{
     CFEAT, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_LOOSE, OFF_PILES, PILE_COUNTS, PUBFEAT,
@@ -60,7 +60,7 @@ pub const STAGES: [&str; 22] = [
     "marshal", "upload", "launch", "download",
     "reach", "beliefs", "join", "readout", "terminals", "backprop", "expand",
     "trunk", "configs", "tree",
-    "t-marshal", "t-upload", "hand-back",
+    "t-marshal", "t-upload", "priors",
     "describe", "scatter",
     "sent", "regrown",
     // Not a rate but a level: how much device memory every solve arena on this
@@ -120,6 +120,10 @@ struct Kernels {
     expand: CudaFunction,
     finish: CudaFunction,
     tokens: CudaFunction,
+    act_feats: CudaFunction,
+    act_boards: CudaFunction,
+    act_add: CudaFunction,
+    prior: CudaFunction,
     hex_facts: CudaFunction,
     type_pool: CudaFunction,
     stem: CudaFunction,
@@ -155,6 +159,10 @@ impl Kernels {
             expand: get("k_expand")?,
             finish: get("k_finish")?,
             tokens: get("k_tokens")?,
+            act_feats: get("k_act_feats")?,
+            act_boards: get("k_act_boards")?,
+            act_add: get("k_act_add")?,
+            prior: get("k_prior")?,
             hex_facts: get("k_hex_facts")?,
             type_pool: get("k_type_pool")?,
             stem: get("k_stem")?,
@@ -565,7 +573,7 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
 
     /// Give the buffer back.
     ///
-    /// A gate slot is reused by the next solve, and a solve's cost varies
+    /// A slot is reused by the next solve, and a solve's cost varies
     /// twenty-six fold. A slot that kept the largest tree it ever served would
     /// hold that much for the rest of the run, so the card would need the worst
     /// case times the number of slots rather than what is actually in flight.
@@ -609,6 +617,9 @@ struct Solve {
     /// policy target is not worth a tenth.
     f: Arr<f32>,
     g: Arr<f32>,
+    /// The policy readout's config row, beside the value's `f`. The policy head
+    /// runs here now, so this has no reader on the host either.
+    fp: Arr<f32>,
     cidx: Arr<u32>,
     coff: Arr<u32>,
     /// The same offsets on the host. A round has to know where each solve's
@@ -741,7 +752,7 @@ impl Pack {
 
 /// Fields of `struct Tree` in `kernels.cu`, in order. Every one is eight bytes
 /// wide, so the descriptor is positional and needs no packing rules.
-const DESC: usize = 57;
+const DESC: usize = 58;
 
 impl Solve {
     /// What this solve holds, array by array.
@@ -751,7 +762,7 @@ impl Solve {
         let u = std::mem::size_of::<u32>();
         let mut v = vec![
             ("p", self.p.cap * f), ("jp", self.jp.cap * f),
-            ("f", self.f.cap * f), ("g", self.g.cap * f),
+            ("f", self.f.cap * f), ("g", self.g.cap * f), ("fp", self.fp.cap * f),
             ("cidx", self.cidx.cap * u), ("coff", self.coff.cap * u),
             ("reach", self.reach.cap * f), ("vals", self.vals.cap * f),
             ("cur", self.cur.cap * f), ("regret", self.regret.cap * f),
@@ -845,7 +856,7 @@ impl Solve {
             // is the same array: four bytes a cell, and a solve holds up to a
             // million and a half of them.
             self.sum.ptr(s), self.rootb.ptr(s),
-            self.p.ptr(s), self.jp.ptr(s), self.f.ptr(s), self.g.ptr(s),
+            self.p.ptr(s), self.jp.ptr(s), self.f.ptr(s), self.g.ptr(s), self.fp.ptr(s),
             self.cidx.ptr(s), self.coff.ptr(s),
             self.leaf_node.ptr(s), self.term.ptr(s), self.seed.ptr(s),
             self.level_start.len().saturating_sub(1) as u64,
@@ -862,7 +873,7 @@ struct Card {
     stream: Arc<CudaStream>,
     blas: CudaBlas,
     k: Kernels,
-    /// Indexed by solve, which is the gate slot the call came from.
+    /// Indexed by solve, which is the slot the farm pinned it to.
     solves: parking_lot::Mutex<Vec<Solve>>,
     /// Host staging for a round's batches, kept between rounds for the same
     /// reason the device scratch is: a round concatenates sixteen megabytes of
@@ -1113,23 +1124,17 @@ impl Card {
         // wherever it is planned, travels as one buffer and one kernel.
         let mut pack = self.pack.lock();
         pack.clear();
-        let trunk = self.wall(11, || self.trunk(calls, &pick(0), &mut pack)).map_err(at("trunk"))?;
-        let cfg = self.wall(12, || self.configs(calls, &pick(1))).map_err(at("configs"))?;
+        self.wall(11, || self.trunk(calls, &pick(0), &mut pack)).map_err(at("trunk"))?;
+        self.wall(12, || self.configs(calls, &pick(1))).map_err(at("configs"))?;
         self.wall(17, || self.tree(calls, &pick(2), &mut pack)).map_err(at("tree"))?;
         self.wall(18, || self.scatter(&mut pack)).map_err(at("scatter"))?;
         drop(pack);
+        // After the scatter, which lays the uniform prior down over the cells
+        // this growth appended, and before the iteration, whose expansion
+        // phase reads what this writes.
+        self.wall(16, || self.priors(calls, &pick(2))).map_err(at("priors"))?;
         self.iterate(calls, &pick(3), &mut out).map_err(at("iterate"))?;
         self.read(calls, &pick(4), &mut out).map_err(at("read"))?;
-        // Last, and together: these are the only things a round hands back
-        // that nothing on the card is waiting for. Taking either where it is
-        // produced synchronises in the middle of the round, and the host then
-        // stands still through kernels it could have spent describing the
-        // trees the iteration is about to read.
-        self.wall(16, || {
-            self.back(trunk, calls, &pick(0), D, &mut out, |a| &mut a.a)?;
-            self.back(cfg, calls, &pick(1), D, &mut out, |a| &mut a.c)
-        })
-        .map_err(at("hand-back"))?;
         Ok(out)
     }
 
@@ -1197,21 +1202,10 @@ impl Card {
         self.bias(s, rows, out)
     }
 
-    /// `Norm::apply` when `act`, `Norm::plain` when not, from `src` into `dst`.
-    /// The two may be the same buffer, which is what a norm in place is.
-    fn norm_to(
-        &self,
-        s: NormSpan,
-        rows: usize,
-        act: bool,
-        src: &CudaSlice<f32>,
-        dst: &mut CudaSlice<f32>,
-    ) -> Res<()> {
-        self.norm_owed(s, rows, act, src, dst, None)
-    }
-
-    /// The same, and add what the residual stream is owed as it reads. `owed`
-    /// is an index into `Card::owed`.
+    /// `Norm::apply` when `act`, `Norm::plain` when not, from `src` into `dst`,
+    /// adding what the residual stream is owed as it reads. `owed` is an index
+    /// into `Card::owed`. The two buffers may be the same, which is what a norm
+    /// in place is.
     fn norm_owed(
         &self,
         s: NormSpan,
@@ -1288,17 +1282,12 @@ impl Card {
         unsafe { self.stream.alloc::<f32>(n.max(1)) }.map_err(err)
     }
 
-    fn down(&self, d: &CudaSlice<f32>, n: usize) -> Res<Vec<f32>> {
-        self.stream.memcpy_dtov(&d.slice(0..n)).map_err(err)
-    }
-
     // ----------------------------------------------------------------- trunk
 
     /// Every new leaf in the round: the board vector and the join cache.
-    fn trunk(&self, calls: &[Call], mine: &[usize], pack: &mut Pack)
-        -> Res<Option<CudaSlice<f32>>> {
+    fn trunk(&self, calls: &[Call], mine: &[usize], pack: &mut Pack) -> Res<()> {
         if mine.is_empty() {
-            return Ok(None);
+            return Ok(());
         }
         // Concatenate, straight into the page-locked buffers the copies read.
         // `card_of_row` is what replaces `board`'s modulo: a leaf reads the
@@ -1430,9 +1419,9 @@ impl Card {
         let mut jp = self.alloc(rows * JW)?;
         self.run(l.join_p, &p, rows, &mut jp)?;
 
-        // Keep them, per solve, for the iterations that follow. The host still
-        // takes `p` back: the policy head builds its action embeddings against
-        // a node's own board vector, and that runs there.
+        // Keep them, per solve, for the iterations that follow. Nothing goes
+        // back: the readout, the belief pooling and the policy head all run
+        // here, so a board vector has no reader on the host at all.
         let mut at = 0;
         let mut g = self.solves.lock();
         for &i in mine {
@@ -1449,7 +1438,7 @@ impl Card {
                 b.cells = 0;
                 b.host_coff.clear();
                 b.host_coff.push(0);
-                for a in [&mut b.p, &mut b.jp, &mut b.f, &mut b.g] {
+                for a in [&mut b.p, &mut b.jp, &mut b.f, &mut b.g, &mut b.fp] {
                     a.reset();
                 }
                 b.cidx.reset();
@@ -1476,34 +1465,6 @@ impl Card {
             b.rows = row0 + n;
             at += n;
         }
-        Ok(Some(p))
-    }
-
-    /// One `[rows, width]` result back on the host, split by call.
-    ///
-    /// The board vectors and the policy's `f_p` come back this way: the policy
-    /// head builds its action embeddings on the host, so those two are what a
-    /// round owes its callers and everything else stays.
-    fn back(
-        &self,
-        d: Option<CudaSlice<f32>>,
-        calls: &[Call],
-        mine: &[usize],
-        width: usize,
-        out: &mut Vec<(usize, Reply)>,
-        field: impl Fn(&mut Reply) -> &mut Vec<f32>,
-    ) -> Res<()> {
-        let Some(d) = d else { return Ok(()) };
-        let rows: usize = mine.iter().map(|&i| calls[i].rows()).sum();
-        let host = self.down(&d, rows * width)?;
-        let mut at = 0;
-        for &i in mine {
-            let n = calls[i].rows();
-            let mut reply = Reply::default();
-            *field(&mut reply) = host[at * width..(at + n) * width].to_vec();
-            out.push((i, reply));
-            at += n;
-        }
         Ok(())
     }
 
@@ -1511,9 +1472,9 @@ impl Card {
 
     /// `f(c)` for the readout and `g(c)` for the pooling, for every config the
     /// round asked about.
-    fn configs(&self, calls: &[Call], mine: &[usize]) -> Res<Option<CudaSlice<f32>>> {
+    fn configs(&self, calls: &[Call], mine: &[usize]) -> Res<()> {
         if mine.is_empty() {
-            return Ok(None);
+            return Ok(());
         }
         let each = |i: usize| -> (&[f32], &[u32], &[f32], usize) {
             let Call::Configs { phi, owner, cards, n, .. } = &calls[i] else {
@@ -1590,9 +1551,8 @@ impl Card {
         launch!(self, bag, n * POOL, &bag, phi, owner, &mut g, &n_i, &nslot, &ntype, &cfeat, &pool_i)?;
 
 
-        // `f` and `g` stay: the readout and the belief pooling both run here
-        // now, so neither has a reader on the host. `f_p` goes back, because
-        // the policy prior is built there.
+        // All three stay. The readout, the belief pooling and the policy head
+        // all run here, so none of them has a reader on the host.
         let mut at = 0;
         {
             let mut solves = self.solves.lock();
@@ -1604,10 +1564,120 @@ impl Card {
                 let b = self.slot(&mut solves, *solve);
                 b.f.copy(&self.stream, base * D, &f, at * D, k * D)?;
                 b.g.copy(&self.stream, base * POOL, &g, at * POOL, k * POOL)?;
+                b.fp.copy(&self.stream, base * D, &fp, at * D, k * D)?;
                 at += k;
             }
         }
-        Ok(Some(fp))
+        Ok(())
+    }
+
+    // ----------------------------------------------------------- the prior
+
+    /// Fill the policy prior of every node this round primed.
+    ///
+    /// The action encoder and the policy readout, against arrays the card
+    /// already holds: the node's own board vector, the config rows `f_p`, and
+    /// the tree's cells. `Solver::refresh_priors` used to run this on the host,
+    /// and the round downloaded a board vector per fresh leaf and an `f_p` row
+    /// per fresh config so that it could -- a quarter of a megabyte a solve a
+    /// round, for a handful of nodes.
+    ///
+    /// What the card does not hold is what an action *is* and which action each
+    /// strategy cell stands for. Both ride in the tree call, and both are a few
+    /// kilobytes a node.
+    fn priors(&self, calls: &[Call], mine: &[usize]) -> Res<()> {
+        let each = |i: usize| -> (&[Prime], &[u32], &[u32], f32) {
+            let Call::Tree { prime, acts, cells, prior_temp, .. } = &calls[i] else {
+                unreachable!("tree shard holds only tree calls")
+            };
+            (prime, acts, cells, *prior_temp)
+        };
+        let solves: Vec<usize> = mine
+            .iter()
+            .copied()
+            .filter(|&i| !each(i).0.is_empty())
+            .map(|i| calls[i].solve())
+            .collect();
+        if solves.is_empty() {
+            return Ok(());
+        }
+        // One upload: the six per-node arrays, then the action's own node, then
+        // the two pools. Floats travel as their bits, as everything else a
+        // round scatters does.
+        let (mut part, mut node, mut row) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut act_at, mut cell_at, mut inv_t) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut act_node, mut desc, mut cells) = (Vec::new(), Vec::new(), Vec::new());
+        let mut widest = 0u32;
+        for (p, &i) in mine.iter().filter(|&&i| !each(i).0.is_empty()).enumerate() {
+            let (prime, a, c, temp) = each(i);
+            for q in prime {
+                act_node.extend(std::iter::repeat(node.len() as u32).take(q.na as usize));
+                part.push(p as u32);
+                node.push(q.node);
+                row.push(q.row);
+                act_at.push(desc.len() as u32 / 5 + q.at);
+                cell_at.push(cells.len() as u32 + q.cell_at);
+                inv_t.push((1.0f32 / temp.max(1e-6)).to_bits());
+                widest = widest.max(q.nc);
+            }
+            desc.extend_from_slice(a);
+            cells.extend_from_slice(c);
+        }
+        let (m, na) = (node.len(), desc.len() / 5);
+        let batch = self.lay(&solves)?;
+        let flat: Vec<u32> = [
+            &part[..], &node, &row, &act_at, &cell_at, &inv_t, &act_node, &desc, &cells,
+        ]
+        .concat();
+        let dev = {
+            let mut stage = self.host.lock();
+            Self::alone(&self.stream, &mut stage.prime, &flat)?
+        };
+        let at = |k: usize, n: usize| dev.slice(k..k + n);
+        let (part_d, node_d, row_d) = (at(0, m), at(m, m), at(2 * m, m));
+        let (act_at_d, cell_at_d, inv_d) = (at(3 * m, m), at(4 * m, m), at(5 * m, m));
+        let act_node_d = at(6 * m, na);
+        let desc_d = at(6 * m + na, 5 * na);
+        let cells_d = at(6 * m + 6 * na, cells.len());
+
+        let l = &self.layout;
+        let (na_i, m_i, d_i, aw_i) = (na as i32, m as i32, D as i32, AW as i32);
+        let (nkinds, nslot, nhex, afeat) = (
+            crate::actions::N_KINDS as i32,
+            NSLOT as i32,
+            N_HEXES as i32,
+            AFEAT as i32,
+        );
+        let mut feat = self.alloc(na * AFEAT)?;
+        launch!(self, act_feats, na * AFEAT, &desc_d, &mut feat, &na_i, &nkinds, &nslot, &nhex, &afeat)?;
+        let mut z = self.alloc(na * AW)?;
+        self.run(l.act_in, &feat, na, &mut z)?;
+        let mut boards = self.alloc(m * D)?;
+        launch!(self, act_boards, m * D, &batch.trees, &part_d, &row_d, &mut boards, &m_i, &d_i)?;
+        let mut proj = self.alloc(m * AW)?;
+        self.run(l.act_board, &boards, m, &mut proj)?;
+        launch!(self, act_add, na * AW, &mut z, &proj, &act_node_d, &na_i, &aw_i)?;
+        self.norm(l.norms[LN_ACT], na, true, &mut z)?;
+        let mut e = self.alloc(na * D)?;
+        self.run(l.act_out, &z, na, &mut e)?;
+
+        // A warp to a config of a primed node: the dot is the warp's, so a row
+        // of `f_p` and a row of `e` are each read once and coalesced.
+        const WARPS: u32 = 4;
+        let cfg = LaunchConfig {
+            grid_dim: (widest.div_ceil(WARPS).max(1), m as u32, 1),
+            block_dim: (32, WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.k.prior)
+                .arg(&batch.trees).arg(&part_d).arg(&node_d).arg(&row_d)
+                .arg(&act_at_d).arg(&cell_at_d).arg(&cells_d).arg(&e)
+                .arg(&inv_d).arg(&m_i).arg(&d_i)
+                .launch_unit(cfg)
+        }
+        .map_err(err)
     }
 
     // ------------------------------------------------------------ the CFR loop
@@ -1623,7 +1693,7 @@ impl Card {
         }
         let mut g = self.solves.lock();
         for &i in mine {
-            let Call::Tree { solve, writes, fresh, ncells, nreach, nvals, levels, nterm, seed }
+            let Call::Tree { solve, writes, fresh, ncells, nreach, nvals, levels, nterm, seed, .. }
                 = &calls[i] else {
                 unreachable!("tree shard holds only tree calls")
             };
@@ -2338,6 +2408,10 @@ struct Stage {
     local_row: Host<i32>,
     base: Host<i32>,
     touched: Host<i32>,
+    /// Everything `Card::priors` sends: the per-node arrays and then the two
+    /// pools, concatenated. Floats travel as their bits, as everything else a
+    /// round scatters does.
+    prime: Host<u32>,
 }
 
 /// The intermediates of one pass, by role. Each is fully written before it is

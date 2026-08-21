@@ -29,7 +29,7 @@
 //!    belief update sums over the private actions consistent with what was seen.
 
 use crate::actions::Action;
-use crate::board::NONE;
+use crate::board::{N_HEXES, NONE};
 use crate::farm::{Call, Dst, Reply, Writes};
 use crate::net::Net;
 use crate::rng::Rng;
@@ -894,7 +894,7 @@ pub struct Solver {
     /// handful just grown. A solve holds eight thousand nodes and runs
     /// sixty-four iterations, so that is half a million filter tests over four
     /// scattered arrays -- and `refresh_priors` measured at two thirds of all
-    /// host work outside the gate. Growth knows exactly which nodes it made.
+    /// host work a solve did. Growth knows exactly which nodes it made.
     wants_prior: Vec<u32>,
     /// `[node]` -> config counts per player, so the hot loops never chase the
     /// `Rc` to ask how long a support is.
@@ -984,12 +984,6 @@ pub struct Solver {
     sent_cells: usize,
     /// The expansion's random stream, which lives on the card once seeded.
     seed: u64,
-    /// The cells whose prior the policy head has rewritten since the card last
-    /// saw them, as `(start, length)` per node. A node is primed an iteration
-    /// after its cells are appended, so the appended tail alone would leave the
-    /// prior behind -- and sending everything from the lowest of them sends the
-    /// whole arena when the root is among them.
-    primed_spans: Vec<(u32, u32)>,
     /// How much of each of the card's arrays it has already been told about.
     sent: crate::contract::Sent,
 }
@@ -1098,7 +1092,6 @@ impl Solver {
             resent: Vec::new(),
             sent_cells: 0,
             seed: 0,
-            primed_spans: Vec::new(),
             sent: Default::default(),
         };
         sv.cf.clear();
@@ -2521,10 +2514,10 @@ impl Solver {
     /// The host keeps growth and nothing else: growth is the game rules, so it
     /// turns the leaves an expansion sampled into decision nodes and describes
     /// them. Everything the description feeds — the reaches, the network at
-    /// every leaf, the regret update, the average strategy and the expansion
-    /// trajectories themselves — happens on the card, because the arenas they
-    /// read are tens of megabytes and a round trip an iteration is more traffic
-    /// than the bus has.
+    /// every leaf, the policy prior, the regret update, the average strategy
+    /// and the expansion trajectories themselves — happens on the card, because
+    /// the arenas they read are tens of megabytes and a round trip an iteration
+    /// is more traffic than the bus has.
     ///
     /// One difference from the host loop is worth naming. There, an expansion
     /// simulation grows its leaf before the next one starts, so a later
@@ -2589,16 +2582,12 @@ impl Solver {
             Some(k) if k - at == done => self.expansions_at(k),
             _ => 0,
         };
-        // The priors of whatever the *last* round's trunk answered for. A node
-        // is expanded before the batch carrying its board vector has run, so
-        // its prior was always an iteration behind; computing it here rather
-        // than between two rounds keeps that lag and buys the whole iteration
-        // one barrier instead of two.
-        self.refresh_priors();
         let mut calls = self.growth_calls();
         self.growth = calls.len();
         // The iteration's decay factors read the step count as it stands, so
-        // both calls are built before it advances.
+        // both calls are built before it advances. The tree call also names the
+        // nodes whose prior the card is to fill, which it does between the
+        // scatter and the iteration that reads it.
         calls.push(self.tree_call());
         calls.push(self.iterate_call(done, expand));
         self.steps = [self.steps[0] + done, self.steps[1] + done];
@@ -2722,9 +2711,9 @@ impl Solver {
         if first {
             self.sent = Default::default();
         }
-        // Built here rather than in the backend. The driver has one thread a
-        // card and every solver thread is parked while it runs, so a round's
-        // marshalling belongs on the cores that have nothing else to do.
+        // Built here rather than in the backend. A card has one driver thread
+        // and it is the round's bottleneck, so a solve's marshalling belongs on
+        // the worker that grew the tree.
         let mut w = Writes::default();
         let resent = std::mem::take(&mut self.resent);
         self.contract
@@ -2735,14 +2724,11 @@ impl Solver {
             let b = [&self.root_belief[0].p[..], &self.root_belief[1].p[..]].concat();
             w.f32s(Dst::Rootb, 0, &b);
         }
-        // The tail this growth appended, which `cur` and `prior` both start at,
-        // and then the rows the policy head has just written. The tail leads
-        // because a run is placed by taking the buffer's address, and it is the
-        // only one that can grow the buffer and move it.
+        // The tail this growth appended, which `cur` and `prior` both start at.
+        // The prior of a node the card primes is written there, by the policy
+        // head, after this scatter has laid the uniform start down.
         w.f32s_both(Dst::Cur, Dst::Prior, sent, &self.cur[sent..]);
-        for (at, n) in std::mem::take(&mut self.primed_spans) {
-            w.f32s(Dst::Prior, at as usize, &self.prior[at as usize..(at + n) as usize]);
-        }
+        let (prime, acts, cells) = self.prime();
         let call = Call::Tree {
             solve: self.slot,
             writes: w,
@@ -2753,6 +2739,10 @@ impl Solver {
             levels: self.contract.level_start.clone(),
             nterm: self.term_leaves.len(),
             seed: first.then_some(self.seed),
+            prime,
+            acts,
+            cells,
+            prior_temp: self.cfg.prior_temp,
         };
         self.sent_from = self.nodes.len();
         call
@@ -2824,7 +2814,8 @@ impl Solver {
             && !self.nodes[n.legal_child[cell] as usize].exhausted
     }
 
-    /// Fill the policy prior of every decision node that does not have one.
+    /// The decision nodes that are ready for a policy prior: the batch has
+    /// reached their board vector and nothing has given them one yet.
     ///
     /// Deferred rather than done inside `grow` because a node is expanded
     /// before the batch carrying its board vector has necessarily run — the
@@ -2836,13 +2827,7 @@ impl Solver {
     /// an expansion trajectory stops there, so this is exactly Student of
     /// Games' "the prior policy `p` obtained from the queries", asked for at
     /// the moment it first has a use.
-    fn refresh_priors(&mut self) {
-        if self.nets.value.is_empty() {
-            return;
-        }
-        let _t = timed!(PRIOR);
-        // Whoever is ready: a decision node the batch has now reached. The
-        // rest stay queued for the round that reaches them.
+    fn ready_for_prior(&mut self) -> Vec<usize> {
         let mut want: Vec<usize> = Vec::new();
         let mut queue = std::mem::take(&mut self.wants_prior);
         queue.retain(|&i| {
@@ -2860,6 +2845,53 @@ impl Solver {
             true
         });
         self.wants_prior = queue;
+        want
+    }
+
+    /// The same nodes, described for the card, which runs the policy head
+    /// itself. See `farm::Prime`.
+    pub(crate) fn prime(&mut self) -> (Vec<crate::farm::Prime>, Vec<u32>, Vec<u32>) {
+        let want = self.ready_for_prior();
+        let (mut prime, mut acts, mut cells) = (Vec::new(), Vec::new(), Vec::new());
+        for i in want {
+            let n = &self.nodes[i];
+            prime.push(crate::farm::Prime {
+                node: i as u32,
+                row: self.row_of[i],
+                at: (acts.len() / 5) as u32,
+                na: n.na() as u32,
+                cell_at: cells.len() as u32,
+                nc: n.nc(n.player as usize) as u32,
+            });
+            // Already the column each block of `Net::action_feats` sets, so
+            // "spends nothing" and "names no hex" cross as the column past the
+            // last rather than as a sentinel the card would have to fold.
+            for a in 0..n.na() {
+                let slot = n.aslot[a];
+                let hex = |h: u8| if h == NONE { N_HEXES as u32 } else { h as u32 };
+                let h = n.acts[a].hexes();
+                acts.extend([
+                    n.acts[a].kind() as u32,
+                    if slot < 0 { NSLOT as u32 } else { slot as u32 },
+                    hex(h[0]),
+                    hex(h[1]),
+                    hex(h[2]),
+                ]);
+            }
+            cells.extend_from_slice(&n.legal_action);
+            self.primed[i] = true;
+        }
+        (prime, acts, cells)
+    }
+
+    /// Fill the policy prior of every decision node that is ready for one, on
+    /// this host. The device path sends `prime` instead.
+    fn refresh_priors(&mut self) {
+        if self.nets.value.is_empty() {
+            return;
+        }
+        let _t = timed!(PRIOR);
+        let want = self.ready_for_prior();
         if want.is_empty() {
             return;
         }
@@ -2939,7 +2971,6 @@ impl Solver {
                 }
             }
             self.primed[i] = true;
-            self.primed_spans.push((so as u32, cells as u32));
         }
     }
 
