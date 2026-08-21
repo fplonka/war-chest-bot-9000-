@@ -2,15 +2,22 @@
 //!
 //! The whole search lives on the card now — the CFR loop, the readout, the
 //! belief pooling and the policy head — so no single call has an answer the CPU
-//! can produce on its own. Nothing but the sampled expansion leaves and the
-//! final read crosses the bus at all. What both backends can still be asked for
-//! is a *solve*, and that is what this compares: the same position, the same
-//! weights, the same seed, and the targets it produces.
+//! can produce on its own, and nothing but the sampled expansion leaves and the
+//! final read crosses the bus at all. There are two ways to hold that to the
+//! CPU network anyway.
 //!
-//! That makes the fixed-tree comparison the whole net. Every pass a solve takes
-//! — the trunk, the config encoder, the reach sweep, the join, the terminals,
-//! backpropagation, the regret update and the value pass under the average — is
-//! upstream of a root value, so a drift in any of them lands there.
+//! One is to ask a solve for the state it *keeps*. `Device::resident` copies a
+//! solve's board vectors, its three config rows and its policy prior back off
+//! the card, and every one of them has a CPU counterpart the same solver
+//! computed on the host path. That is the call-by-call comparison, and it is
+//! the only check the policy prior has: the prior steers expansion alone, so a
+//! wrong one degrades the search silently and moves no target at all.
+//!
+//! The other is the solve itself. A fixed tree gives both backends the same
+//! numbers to make, and the target a solve produces is downstream of every pass
+//! it takes — the reach sweep, the join, the terminals, backpropagation, the
+//! regret update and the value pass under the average — so a drift in any of
+//! them lands there.
 //!
 //! Needs a GPU, so it only builds under `--features gpu`.
 #![cfg(feature = "gpu")]
@@ -124,6 +131,25 @@ fn generate_one(net: &Net, backend: Backend, games: usize, s: u32, c: f32) -> Da
     generate(net, backend, &[(0x51E5, s)], games, c)
         .pop()
         .expect("one stream")
+}
+
+/// One solve of the first position a stream reaches, run to the end on
+/// `backend`, and the solver it leaves behind.
+///
+/// Pinned to slot zero of card zero, which is where `Device::resident` then
+/// looks for it.
+fn one_solve(net: &Net, backend: &Backend, s: u32, c: f32) -> Solver {
+    let nets = Arc::new(Nets { value: net.clone(), device: backend.keeps_the_solve() });
+    let mut data = Data::default();
+    let mut sv = GameStream::new(0x51E5, game_cfg(s, c)).next_solve(&nets, &mut data);
+    sv.pin(0);
+    let mut replies: Vec<Reply> = Vec::new();
+    loop {
+        match sv.advance(&replies) {
+            Step::Calls(calls) => replies = backend.run(&calls, 0).expect("the backend answered"),
+            Step::Done(_) => return sv,
+        }
+    }
 }
 
 /// Largest relative difference, with an absolute floor so values near zero do
@@ -282,4 +308,54 @@ fn a_solve_does_not_depend_on_the_round_it_rides_in() {
     // is arithmetic order and not a step count read from the wrong solve --
     // and the targets above, which is what a run trains on, are unmoved.
     assert!(bad < 5e-2, "sharing a round moved a solve's policy by {bad:e}");
+}
+
+
+/// Every array a solve keeps on the card, against the CPU network that makes
+/// the same ones on the host path.
+///
+/// `c = 0` fixes the tree, so both solvers build the same nodes in the same
+/// order and hold their arrays in the same layout. The two are then the same
+/// arithmetic twice: `k_trunk` and the board head against `Net::board`, the
+/// config encoder against `Net::configs`, and the action encoder with
+/// `k_prior` against `Solver::refresh_priors`.
+///
+/// The prior is the reason this test exists. It is read by the expansion phase
+/// and by nothing else, so a wrong one picks worse leaves to grow and leaves
+/// every target, every policy and every belief looking exactly as it should.
+#[test]
+fn the_resident_state_agrees_with_the_cpu_network() {
+    if Device::count() == 0 {
+        eprintln!("no cuda device; skipping");
+        return;
+    }
+    let net = random_net(0x9E37);
+    let host = one_solve(&net, &Backend::Reference(net.clone()), 8, 0.0);
+    let device = Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
+    let card = one_solve(&net, &device, 8, 0.0);
+    let Backend::Cuda(d) = &device else { unreachable!("just built") };
+    let got = d.resident(0, 0).expect("the card gave its solve back");
+
+    assert!(!host.pb.is_empty(), "the reference solve made no board vectors");
+    assert!(host.ncfg > 0, "the reference solve made no config rows");
+    assert_eq!(host.ncells, card.ncells, "the two backends built different trees");
+    let cells = host.ncells;
+    assert!(cells > 0, "the fixed tree has no strategy cells");
+    for (what, h, c) in [
+        ("board vectors", &host.pb[..], &got.p[..]),
+        ("join cache", &host.jp[..], &got.jp[..]),
+        ("f(c)", &host.cf[..], &got.f[..]),
+        ("g(c)", &host.cg[..], &got.g[..]),
+        ("f_p(c)", &host.cp[..], &got.fp[..]),
+        ("prior", &host.prior[..cells], &got.prior[..cells]),
+    ] {
+        let bad = worst(h, c, what);
+        eprintln!("{what}: worst {bad:e} over {} values", h.len());
+        assert!(bad < 2e-3, "{what} differ by {bad:e}");
+    }
+    // A prior that was never written would read as the uniform start the
+    // scatter lays down, and would then agree with a host that had also never
+    // written one. Both sides must actually be a policy.
+    let uniform = got.prior[..cells].windows(2).all(|w| w[0] == w[1]);
+    assert!(!uniform, "the card's prior is still the uniform start");
 }

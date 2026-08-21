@@ -845,7 +845,7 @@ pub struct Solver {
     /// value arena per traverser, so `k_expand` re-forms Q out of `cell_val`
     /// where it selects. Here there is one arena and each traverser's pass
     /// overwrites it, so the number has to be kept as it is made.
-    pub(crate) prior: Vec<f32>,
+    pub prior: Vec<f32>,
     pub(crate) visits: Vec<f32>,
     pub qval: Vec<f32>,
     pub(crate) soff: Vec<u32>,

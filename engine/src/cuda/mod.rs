@@ -497,7 +497,8 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default +
 struct Arr<T> {
     buf: Option<CudaSlice<T>>,
     cap: usize,
-    /// How much of it the card has been told about, for the append-only pools.
+    /// Elements actually written, as against `cap`, which is a size class.
+    /// `Device::resident` is what reads it.
     len: usize,
 }
 
@@ -561,6 +562,7 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
     fn copy(&mut self, stream: &Arc<CudaStream>, at: usize, src: &CudaSlice<T>, from: usize, n: usize)
         -> Res<()> {
         self.fit(stream, at + n)?;
+        self.len = at + n;
         if n == 0 {
             return Ok(());
         }
@@ -1049,6 +1051,44 @@ impl Device {
             }
         }
     }
+
+    /// Everything one solve keeps on the card that the CPU network can also
+    /// produce, copied back.
+    ///
+    /// Nothing in a run reads any of it. The trunk's board vectors, the config
+    /// encoder's three rows and the policy prior are made here and consumed
+    /// here, so a round carries none of them home -- which is exactly why the
+    /// arithmetic that makes them needs a way to be asked. The parity test is
+    /// the only caller.
+    pub fn resident(&self, card: usize, solve: usize) -> Res<Resident> {
+        let c = &self.cards[card];
+        c.stream.context().bind_to_thread().map_err(err)?;
+        let g = c.solves.lock();
+        let s = g.get(solve).ok_or_else(|| format!("solve {solve} is not resident"))?;
+        let all = |a: &Arr<f32>| c.slice(a, 0, a.len);
+        Ok(Resident {
+            p: all(&s.p)?,
+            jp: all(&s.jp)?,
+            f: all(&s.f)?,
+            g: all(&s.g)?,
+            fp: all(&s.fp)?,
+            prior: all(&s.prior)?,
+        })
+    }
+}
+
+/// What `Device::resident` hands back: one solve's network state, in the same
+/// layout `Solver` keeps it in on the host.
+pub struct Resident {
+    /// A board vector a leaf row, and the join's projection of it.
+    pub p: Vec<f32>,
+    pub jp: Vec<f32>,
+    /// The readout's `f(c)`, the pooling's `g(c)` and the policy's `f_p(c)`.
+    pub f: Vec<f32>,
+    pub g: Vec<f32>,
+    pub fp: Vec<f32>,
+    /// The PUCT prior, over every strategy cell of the tree.
+    pub prior: Vec<f32>,
 }
 
 impl Card {
