@@ -35,10 +35,11 @@ use crate::board::NONE;
 use crate::policy;
 use crate::pbs::*;
 use crate::rng::Rng;
-use crate::search::{Cfg, Nets, Solver};
+use crate::search::{Cfg, Nets, Solved, Solver};
 use crate::state::{Cont, State, BLACK, WHITE, Z_BAG, Z_FACEDOWN, Z_FACEUP};
 use rayon::prelude::*;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 /// The rulebook's recommended starter matchup. Training on one fixed matchup
 /// removes a large chunk of variance; randomised drafts are a distribution
@@ -308,43 +309,58 @@ pub struct Game {
 }
 
 /// A rate like "0.9 queries per search", drawn into a whole number.
-/// Solve one belief state as a root and keep its row. Returns the roots the
-/// harvest sampled, for whoever wants to queue them.
+fn draw_count(rng: &mut Rng, rate: f32) -> usize {
+    let whole = rate.max(0.0).floor();
+    whole as usize + (rng.unit_f64() < (rate - whole) as f64) as usize
+}
+
+/// A solve of one queued belief state, as a root in its own right.
+pub fn query_solver(
+    nets: &Arc<Nets>,
+    cfg: Cfg,
+    recursive_rate: f32,
+    s: &State,
+    bel: &[Belief; 2],
+    rng: &mut Rng,
+) -> Solver {
+    let mut sv = Solver::new(
+        s,
+        Ctx::new(s),
+        Arc::clone(nets),
+        cfg,
+        bel.clone(),
+        Rng::new(rng.next_u64()),
+    );
+    sv.collect(draw_count(rng, recursive_rate));
+    sv
+}
+
+/// Keep a query solve's root value as a training row, and hand back the roots
+/// its own harvest nominated.
 ///
 /// Value only. Student of Games assembles policy targets from "the searches
 /// started at public states along the main line of episodes"; a query solve is
 /// off that line, and its job is coverage of the value function. Its policy
 /// would also be trained against, and so reinforce, states self-play never
 /// actually reaches.
-pub fn solve_root(
-    nets: &Nets,
-    cfg: Cfg,
-    recursive_rate: f32,
-    s: &State,
-    bel: &[Belief; 2],
-    rng: &mut Rng,
+pub fn keep_query(
+    sv: &Solver,
+    solved: Option<Solved>,
     out: &mut Data,
 ) -> Vec<(State, [Belief; 2])> {
-    let ctx = Ctx::new(s);
-    let mut sv = Solver::new(s, ctx, nets, cfg, bel.clone());
-    sv.solve(rng);
-    let want = draw_count(rng, recursive_rate);
-    let solved = sv.harvest(rng, want);
+    let Some(solved) = solved else {
+        return Vec::new();
+    };
     out.begin_solve();
     out.push_value(
-        s,
-        &ctx,
-        bel,
+        &sv.states[0],
+        &sv.ctx,
+        &sv.root_belief,
         [&solved.value[0], &solved.value[1]],
         &Default::default(),
     );
     out.queries += 1;
     solved.queries
-}
-
-fn draw_count(rng: &mut Rng, rate: f32) -> usize {
-    let whole = rate.max(0.0).floor();
-    whole as usize + (rng.unit_f64() < (rate - whole) as f64) as usize
 }
 
 /// Whether a row is collected here. Only coin plays carry one, and only the
@@ -401,108 +417,113 @@ impl Game {
         self.s.is_terminal()
     }
 
-    /// Play until `max_solves` fresh training solves are available or the game
-    /// ends. This gives streaming generation a bounded unit of work.
-    pub fn advance_solves(&mut self, nets: &Nets, max_solves: usize) {
-        assert!(max_solves > 0);
-        let stop = self.data.soff.len().saturating_add(max_solves);
-        let gc = &self.gc;
-        let Game {
-            rng,
-            s,
-            ctx,
-            bel,
-            data,
-            queries,
-            ..
-        } = self;
-        while !s.is_terminal() && data.soff.len() < stop {
-            let player = s.to_act();
-            if s.is_chance() {
-                let res = reserve(s, player, ctx);
-                let fu = faceup_counts(s, player, ctx);
-                let wp = matches!(s.pending(), Cont::WarriorPriestDraw { .. });
-                bel[player as usize] = belief_after_draw(&bel[player as usize], &res, &fu, wp);
-                resolve_chance(s, player, rng);
+    /// Play forward until a solve is wanted, and hand it over. `None` once the
+    /// game has ended.
+    ///
+    /// A chance node and a random agent's decision need no search, so they are
+    /// resolved here. Everything else about a decision waits for the solve,
+    /// which is why the game is a state machine: the solve belongs to the farm
+    /// and may be run on any core, or on a card, long after this returns.
+    pub fn next_solve(&mut self, nets: &Arc<Nets>) -> Option<Solver> {
+        loop {
+            if self.s.is_terminal() {
+                return None;
+            }
+            let player = self.s.to_act();
+            if self.s.is_chance() {
+                let res = reserve(&self.s, player, &self.ctx);
+                let fu = faceup_counts(&self.s, player, &self.ctx);
+                let wp = matches!(self.s.pending(), Cont::WarriorPriestDraw { .. });
+                let me = player as usize;
+                self.bel[me] = belief_after_draw(&self.bel[me], &res, &fu, wp);
+                resolve_chance(&mut self.s, player, &mut self.rng);
                 continue;
             }
-
-            let cfgs = bel[player as usize].cfg.clone();
-            let truth = true_config(s, player, ctx);
-            let true_ci = bel[player as usize]
-                .index_of(&truth)
-                // Losing the real world would silently corrupt every target
-                // taken from here on, so fail loudly instead.
-                .expect("belief filter dropped the true config");
-            data.decisions += 1;
-            data.configs += cfgs.len();
-
-            let np = match gc.agents[player as usize] {
-                Agent::Random => policy::uniform(s, ctx, player, &cfgs),
+            self.data.decisions += 1;
+            self.data.configs += self.bel[player as usize].cfg.len();
+            match self.gc.agents[player as usize] {
+                Agent::Random => {
+                    let cfgs = self.bel[player as usize].cfg.clone();
+                    let np = policy::uniform(&self.s, &self.ctx, player, &cfgs);
+                    self.play(np);
+                }
                 Agent::Sog { cfg } => {
                     // Student of Games re-solves from scratch at every
                     // decision. The solve gives this state its value and
                     // nominates leaves to be solved in their own right.
-                    let mut sv = Solver::new(s, *ctx, nets, cfg, bel.clone());
-                    sv.solve(rng);
-                    if collects_rows(gc, s) {
-                        let want = draw_count(rng, gc.query_rate);
-                        let solved = sv.harvest(rng, want);
-                        data.begin_solve();
-                        data.push_value(
-                            s,
-                            ctx,
-                            bel,
-                            [&solved.value[0], &solved.value[1]],
-                            &solved.policy,
-                        );
-                        queries.extend(solved.queries);
+                    let mut sv = Solver::new(
+                        &self.s,
+                        self.ctx,
+                        Arc::clone(nets),
+                        cfg,
+                        self.bel.clone(),
+                        Rng::new(self.rng.next_u64()),
+                    );
+                    if collects_rows(&self.gc, &self.s) {
+                        sv.collect(draw_count(&mut self.rng, self.gc.query_rate));
                     }
-                    policy::at_node(&sv, 0, cfgs.len())
+                    return Some(sv);
                 }
-            };
-
-
-            let true_row = np.row(true_ci);
-            let mut chosen_cell = np.sample(rng, true_ci);
-            // A fresh explorer each decision, as the reference does.
-            let explorer = sample_explorer(rng, gc.explore);
-            if gc.explore > 0.0
-                && player == explorer
-                && rng.unit_f64() < gc.explore as f64
-                && !true_row.is_empty()
-            {
-                chosen_cell = true_row.start + rng.below(true_row.len());
             }
-            let chosen = np.action_at(chosen_cell);
-
-            // Bayes update on the *public observation*: several private
-            // actions can produce it, and the belief must sum over all of
-            // them.
-            bel[player as usize] = np.posterior(&bel[player as usize], obs_key(&np.acts[chosen]));
-            if let Some(slot) = match np.acts[chosen].play() {
-                Play::Attack => Some(0),
-                Play::Pass => Some(1),
-                Play::Deploy => Some(2),
-                Play::Bolster => Some(3),
-                Play::Maneuver => Some(4),
-                Play::Recruit => Some(5),
-                Play::Other => None,
-            } {
-                data.plays[slot] += 1;
-            }
-            s.apply_inplace(np.acts[chosen]);
-
         }
     }
 
-    /// Play the game to the end.
-    pub fn advance(&mut self, nets: &Nets) {
-        while !self.is_terminal() {
-            self.advance_solves(nets, usize::MAX);
+    /// Act on a finished solve: keep the row it produced, then play its move.
+    pub fn play_solved(&mut self, sv: &Solver, solved: Option<Solved>) {
+        let n = self.bel[self.s.to_act() as usize].cfg.len();
+        if let Some(solved) = solved {
+            self.data.begin_solve();
+            self.data.push_value(
+                &self.s,
+                &self.ctx,
+                &self.bel,
+                [&solved.value[0], &solved.value[1]],
+                &solved.policy,
+            );
+            self.queries.extend(solved.queries);
         }
+        let np = policy::at_node(sv, 0, n);
+        self.play(np);
     }
 
+    /// Sample the acting player's move, update the public belief from what the
+    /// opponent observes, and apply it.
+    fn play(&mut self, np: policy::NodePolicy) {
+        let me = self.s.to_act() as usize;
+        let truth = true_config(&self.s, me as u8, &self.ctx);
+        let true_ci = self.bel[me]
+            .index_of(&truth)
+            // Losing the real world would silently corrupt every target taken
+            // from here on, so fail loudly instead.
+            .expect("belief filter dropped the true config");
+        let true_row = np.row(true_ci);
+        let mut chosen_cell = np.sample(&mut self.rng, true_ci);
+        // A fresh explorer each decision, as the reference does.
+        let explorer = sample_explorer(&mut self.rng, self.gc.explore);
+        if self.gc.explore > 0.0
+            && me as u8 == explorer
+            && self.rng.unit_f64() < self.gc.explore as f64
+            && !true_row.is_empty()
+        {
+            chosen_cell = true_row.start + self.rng.below(true_row.len());
+        }
+        let chosen = np.action_at(chosen_cell);
+        // Bayes update on the *public observation*: several private actions can
+        // produce it, and the belief must sum over all of them.
+        self.bel[me] = np.posterior(&self.bel[me], obs_key(&np.acts[chosen]));
+        if let Some(slot) = match np.acts[chosen].play() {
+            Play::Attack => Some(0),
+            Play::Pass => Some(1),
+            Play::Deploy => Some(2),
+            Play::Bolster => Some(3),
+            Play::Maneuver => Some(4),
+            Play::Recruit => Some(5),
+            Play::Other => None,
+        } {
+            self.data.plays[slot] += 1;
+        }
+        self.s.apply_inplace(np.acts[chosen]);
+    }
 
     /// The game ended: blend the outcome into parked targets and return White's
     /// result.
@@ -526,8 +547,11 @@ impl Game {
     }
 }
 
-/// A resumable SoG game stream. Each chunk ends at a solved decision rather
-/// than at a game boundary, so one long game cannot stall the trainer.
+/// A resumable SoG game stream: one solve at a time, and the game around it.
+///
+/// The solve it hands out belongs to whoever runs it. That is what makes the
+/// stream a state machine — a run keeps hundreds of these in flight against a
+/// few dozen cores, so a stream cannot be a thread.
 pub struct GameStream {
     seed: u64,
     game_index: usize,
@@ -537,7 +561,17 @@ pub struct GameStream {
     /// nominated by earlier searches, each waiting to become the root of its
     /// own solve and its own training row.
     pending: VecDeque<(State, [Belief; 2])>,
+    /// What the solve in flight is for.
+    kind: Kind,
+    /// Whether the query solver has the next turn.
+    query_turn: bool,
     rng: Rng,
+}
+
+/// What the solve in flight is for: the line of play, or coverage away from it.
+enum Kind {
+    Play,
+    Query,
 }
 
 /// How many queued queries one stream will hold. At the intended rates the
@@ -554,55 +588,86 @@ impl GameStream {
             gc,
             game,
             pending: VecDeque::new(),
+            kind: Kind::Play,
+            query_turn: false,
             rng: Rng::new(worker_seed(seed, usize::MAX)),
         }
     }
 
-    pub fn generate(&mut self, nets: &Nets, solves: usize) -> Data {
+    /// The next solve this stream wants run.
+    ///
+    /// Self-play and the query solver take turns, one solve each. Each
+    /// self-play search queues `query_rate` queries and each query solve queues
+    /// `recursive_rate`, so at the reference rates a turn each leaves the queue
+    /// exactly where it started. An empty queue simply gives its turn back to
+    /// self-play.
+    pub fn next_solve(&mut self, nets: &Arc<Nets>, out: &mut Data) -> Solver {
+        if self.query_turn {
+            self.query_turn = false;
+            if let Some(sv) = self.next_query(nets) {
+                self.kind = Kind::Query;
+                return sv;
+            }
+        }
+        self.query_turn = true;
+        self.kind = Kind::Play;
+        loop {
+            if let Some(sv) = self.game.next_solve(nets) {
+                return sv;
+            }
+            self.end_game(out);
+        }
+    }
+
+    /// Run this stream on this host until it has produced `solves` rows.
+    ///
+    /// The farm runs a stream one solve at a time and answers its calls in a
+    /// round shared with every other solve in flight. This is the same stream
+    /// driven alone, which is what the single-process tools and the tests
+    /// want.
+    pub fn generate(&mut self, nets: &Arc<Nets>, solves: usize) -> Data {
         assert!(solves > 0);
         let mut out = Data::default();
-        // Self-play and the query solver take turns, one solve each. Each
-        // self-play search queues `query_rate` queries and each query solve
-        // queues `recursive_rate`, so at the reference rates a turn each
-        // leaves the queue exactly where it started. An empty queue simply
-        // gives its turn back to self-play.
         while out.soff.len() < solves {
-            self.advance_game(nets, &mut out);
-            if out.soff.len() < solves {
-                self.solve_query(nets, &mut out);
-            }
+            let mut sv = self.next_solve(nets, &mut out);
+            let solved = sv.run_alone();
+            self.keep(&sv, solved, &mut out);
         }
         out
     }
 
-    fn advance_game(&mut self, nets: &Nets, out: &mut Data) {
-        self.game.advance_solves(nets, 1);
-        let ended = self.game.is_terminal();
-        if ended {
-            self.game.finish();
-        }
-        let queued = self.game.take_queries();
-        self.enqueue(queued);
-        out.merge(self.game.take_rows());
-        if ended {
-            self.game = Game::new(
-                Rng::new(worker_seed(self.seed, self.game_index)),
-                &self.gc,
-            );
-            self.game_index += 1;
+    /// Take the finished solve back: keep its row, and let the game act on it.
+    pub fn keep(&mut self, sv: &Solver, solved: Option<Solved>, out: &mut Data) {
+        match self.kind {
+            Kind::Play => {
+                self.game.play_solved(sv, solved);
+                let queued = self.game.take_queries();
+                self.enqueue(queued);
+                out.merge(self.game.take_rows());
+            }
+            Kind::Query => {
+                let more = keep_query(sv, solved, out);
+                self.enqueue(more);
+            }
         }
     }
 
-    /// Solve one queued belief state as a root and keep its row.
-    fn solve_query(&mut self, nets: &Nets, out: &mut Data) {
-        let Some((s, bel)) = self.pending.pop_front() else {
-            return;
-        };
+    fn next_query(&mut self, nets: &Arc<Nets>) -> Option<Solver> {
+        let (s, bel) = self.pending.pop_front()?;
         let Agent::Sog { cfg } = self.gc.agents[s.to_act() as usize] else {
-            return;
+            return None;
         };
-        let more = solve_root(nets, cfg, self.gc.recursive_rate, &s, &bel, &mut self.rng, out);
-        self.enqueue(more);
+        Some(query_solver(nets, cfg, self.gc.recursive_rate, &s, &bel, &mut self.rng))
+    }
+
+    /// The game ended: score it, keep what it left, and start the next one.
+    fn end_game(&mut self, out: &mut Data) {
+        self.game.finish();
+        let queued = self.game.take_queries();
+        self.enqueue(queued);
+        out.merge(self.game.take_rows());
+        self.game = Game::new(Rng::new(worker_seed(self.seed, self.game_index)), &self.gc);
+        self.game_index += 1;
     }
 
     fn enqueue(&mut self, qs: Vec<(State, [Belief; 2])>) {
@@ -620,13 +685,16 @@ impl GameStream {
 /// Any belief states the searches queued are appended to `queries`.
 pub fn play_game(
     rng: Rng,
-    nets: &Nets,
+    nets: &Arc<Nets>,
     gc: &GameCfg,
     data: &mut Data,
     queries: Option<&mut Vec<(State, [Belief; 2])>>,
 ) -> f32 {
     let mut g = Game::new(rng, gc);
-    g.advance(nets);
+    while let Some(mut sv) = g.next_solve(nets) {
+        let solved = sv.run_alone();
+        g.play_solved(&sv, solved);
+    }
     let z = g.finish();
     if let Some(q) = queries {
         q.extend(g.take_queries());
@@ -705,7 +773,7 @@ fn worker_seed(seed: u64, i: usize) -> u64 {
 pub fn collect_roots(
     games: usize,
     seed: u64,
-    nets: &Nets,
+    nets: &Arc<Nets>,
     gc: &GameCfg,
     cap: usize,
 ) -> Vec<(State, [Belief; 2])> {
@@ -729,7 +797,7 @@ pub fn collect_roots(
 /// Play `games` games in parallel, returning merged data and statistics.
 
 
-pub fn run_games(games: usize, seed: u64, nets: &Nets, gc: &GameCfg) -> Data {
+pub fn run_games(games: usize, seed: u64, nets: &Arc<Nets>, gc: &GameCfg) -> Data {
     (0..games)
         .into_par_iter()
         .fold(Data::default, |mut acc, i| {
@@ -817,11 +885,7 @@ mod policy_target_tests {
     /// except as a loss that will not fall, which is why it is pinned here.
     #[test]
     fn a_stored_row_carries_the_root_average_policy() {
-        let nets = Nets {
-            value: random_net(0x5EED),
-            device: false,
-            gate: None,
-        };
+        let nets = Arc::new(Nets { value: random_net(0x5EED), device: false });
         let cfg = Cfg { s: 32, c: 4.0, ..Default::default() };
         let roots = positions(0x5EED, 3);
         assert!(!roots.is_empty(), "no roots to test against");
@@ -830,9 +894,16 @@ mod policy_target_tests {
         let mut checked = 0usize;
         for (s, bel) in &roots {
             let ctx = Ctx::new(s);
-            let mut sv = Solver::new(s, ctx, &nets, cfg, bel.clone());
-            sv.solve(&mut rng);
-            let solved = sv.harvest(&mut rng, 0);
+            let mut sv = Solver::new(
+                s,
+                ctx,
+                Arc::clone(&nets),
+                cfg,
+                bel.clone(),
+                Rng::new(rng.next_u64()),
+            );
+            sv.collect(0);
+            let solved = sv.run_alone().expect("a collected solve");
             let mut d = Data::default();
             d.begin_solve();
             d.push_value(

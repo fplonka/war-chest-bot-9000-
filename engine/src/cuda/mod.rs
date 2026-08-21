@@ -33,7 +33,6 @@ use cudarc::driver::{
     DriverError, LaunchArgs, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
-use rayon::prelude::*;
 
 use crate::board::{board, N_HEXES, NONE};
 use crate::farm::{Call, Dst, Reply, CARD_ROWS};
@@ -78,12 +77,9 @@ pub const STAGES: [&str; 22] = [
 pub static CENSUS: parking_lot::Mutex<Vec<(&'static str, usize)>> =
     parking_lot::Mutex::new(Vec::new());
 
-/// Device bytes the solve arenas hold right now -- a level, which
-/// `leaf_breakdown` reports without resetting.
-///
-/// Solves in flight is what the rate is linear in, and this is the ceiling on
-/// it: at ten cohorts of thirty-six both cards read 24,027 MiB of 24,576, and
-/// a full pool is where the rate stops being a function of anything else.
+/// Device bytes every card's solve arenas hold right now -- a level, which
+/// `leaf_breakdown` reports without resetting. `Device::held` is the same
+/// number per card, and is what admits a solve or holds it back.
 pub static HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub static LEAF_NS: [std::sync::atomic::AtomicU64; STAGES.len()] =
@@ -246,13 +242,10 @@ fn warp_rows(rows: usize) -> LaunchConfig {
 /// A round is split across the cards by call, so each card builds and runs a
 /// self-contained batch and nothing crosses the bus between them.
 pub struct Device {
-    /// One entry per (card, lane). A lane is a whole second copy of a card's
-    /// working state on a stream of its own, so one cohort of solves can have
-    /// its kernels running while the other cohort's round is being marshalled.
-    /// The driver thread is busy ~90% of a round and only a third of that is
-    /// waiting for the card, so the two fill each other's gaps.
+    /// One entry per card, each with its own stream, staging and solve table.
+    /// A card is driven by one thread, which is what makes a round a batch:
+    /// everything that thread found waiting goes in together.
     cards: Vec<Card>,
-    lanes: usize,
     net: Net,
 }
 
@@ -305,6 +298,10 @@ fn owed_by_the_join(l: &NetLayout, b: &[f32]) -> Vec<f32> {
     out.extend_from_slice(&b[l.join_out.b..l.join_out.b + D]);
     out
 }
+
+/// What a round's own intermediates and the allocator's spare blocks take,
+/// beside the solve arenas a card's budget counts.
+const ROUND_RESERVE: u64 = 6 << 30;
 
 /// Leaf rows a pass works on at once.
 ///
@@ -778,6 +775,12 @@ impl Solve {
         v
     }
 
+    /// Device bytes this solve's arenas hold, all of them together. What the
+    /// card admits solves against.
+    fn bytes(&self) -> usize {
+        self.census().iter().map(|&(_, b)| b).sum()
+    }
+
     /// Where a run of the round's blob lands. The match is the other half of
     /// `farm::Dst`, and the only place the two vocabularies meet.
     fn plan(&mut self, s: &Arc<CudaStream>, d: Dst, at: usize, n: usize) -> Res<u64> {
@@ -896,6 +899,17 @@ struct Card {
     ln: CudaSlice<f32>,
     /// Hex adjacency, `NONE` folded to `-1`.
     nb: CudaSlice<i32>,
+    /// Device bytes this card's solve arenas may hold.
+    ///
+    /// Whatever it had free when the backend came up, less a reserve for the
+    /// round's own intermediates -- hundreds of megabytes, four hundred of them
+    /// for the join head alone at a large round -- and for the blocks the
+    /// stream-ordered allocator keeps back between one solve and the next.
+    ///
+    /// Measured rather than configured. A solve's cost varies twenty-six fold
+    /// with how far into a game its root sits, so no count of threads describes
+    /// what fits, and a run that guesses either wastes the card or fills it.
+    budget: u64,
     /// What the join's residual stream is owed.
     ///
     /// Every block of the join adds its matrix multiply's bias to the same
@@ -916,28 +930,37 @@ struct Card {
 
 impl Device {
     /// Bring up one card per ordinal and upload the weights to each.
-    pub fn new(ordinals: &[usize], net: Net, lanes: usize) -> Res<Device> {
+    pub fn new(ordinals: &[usize], net: Net) -> Res<Device> {
         if ordinals.is_empty() {
             return Err("no cuda device ordinals given".into());
         }
         if net.is_empty() {
             return Err("cannot start the device backend without weights".into());
         }
-        assert!(lanes > 0, "a device needs at least one lane");
-        // Lane-major, so `cards[lane * n + card]` and a lane's cards are
-        // contiguous. Each holds its own stream, staging and solve table; only
-        // the context is shared, and the weights are duplicated because they
-        // are a few megabytes against the round they serve.
-        let cards = (0..lanes)
-            .flat_map(|l| ordinals.iter().map(move |&o| (o, l)))
-            .map(|(o, l)| Card::new(o, &net, l > 0))
+        let cards = ordinals
+            .iter()
+            .map(|&o| Card::new(o, &net))
             .collect::<Res<Vec<_>>>()?;
-        Ok(Device { cards, lanes, net })
+        Ok(Device { cards, net })
     }
 
-    /// How many cohorts of solves this device can serve at once.
-    pub fn lanes(&self) -> usize {
-        self.lanes
+    /// How many cards a round can be spread over.
+    pub fn cards(&self) -> usize {
+        self.cards.len()
+    }
+
+    /// Device bytes this card's solve arenas hold right now.
+    ///
+    /// A level rather than a rate. How many solves are in flight is what the
+    /// generation rate is linear in, and this is the ceiling on it: a full card
+    /// is where the rate stops being a function of anything else.
+    pub fn held(&self, card: usize) -> u64 {
+        self.cards[card].solves.lock().iter().map(|s| s.bytes() as u64).sum()
+    }
+
+    /// What one card's solve arenas may hold.
+    pub fn budget(&self, card: usize) -> u64 {
+        self.cards[card].budget
     }
 
     /// How many cards the driver can see.
@@ -980,52 +1003,29 @@ impl Device {
     /// `None` when the round could not be answered. The caller closes its
     /// gate on that, so the cohort unwinds instead of parking on a card that
     /// is never going to reply.
-    pub fn run(&self, calls: &[Call], lane: usize) -> Option<Vec<Reply>> {
-        match self.try_run(calls, lane) {
-            Ok(replies) => Some(replies),
+    pub fn run(&self, calls: &[Call], card: usize) -> Option<Vec<Reply>> {
+        // A solve's board vectors stay on the card that produced them, so every
+        // call of one solve reaches the same card. The farm pins a solve to a
+        // card for its whole life, so a round is already the calls of one.
+        let all: Vec<usize> = (0..calls.len()).collect();
+        match self.cards[card].round(calls, &all) {
+            Ok(part) => {
+                let mut out: Vec<Reply> = (0..calls.len()).map(|_| Reply::default()).collect();
+                for (i, reply) in part {
+                    out[i] = reply;
+                }
+                Some(out)
+            }
             Err(e) => {
-                eprintln!("cuda: lane {lane}: {e}");
+                eprintln!("cuda: card {card}: {e}");
                 None
             }
         }
     }
-
-    fn try_run(&self, calls: &[Call], lane: usize) -> Res<Vec<Reply>> {
-        // A solve's board vectors stay on the card that produced them, so a
-        // solve is pinned to a card and cannot be dealt round-robin. Solves
-        // are gate slots and there are many more of them than cards, so this
-        // still splits a round about evenly. Config calls belong to no solve
-        // and are dealt to keep both cards busy.
-        let n = self.cards.len() / self.lanes;
-        let mine = &self.cards[lane * n..(lane + 1) * n];
-        let mut shards: Vec<Vec<usize>> = vec![Vec::new(); n];
-        let mut spare = 0;
-        for (i, c) in calls.iter().enumerate() {
-            let card = if c.solve() == usize::MAX {
-                spare += 1;
-                (spare - 1) % n
-            } else {
-                c.solve() % n
-            };
-            shards[card].push(i);
-        }
-        let mut out: Vec<Reply> = (0..calls.len()).map(|_| Reply::default()).collect();
-        let done = mine
-            .par_iter()
-            .zip(shards)
-            .map(|(card, mine)| card.round(calls, &mine))
-            .collect::<Res<Vec<_>>>()?;
-        for part in done {
-            for (i, reply) in part {
-                out[i] = reply;
-            }
-        }
-        Ok(out)
-    }
 }
 
 impl Card {
-    fn new(ordinal: usize, net: &Net, own_stream: bool) -> Res<Card> {
+    fn new(ordinal: usize, net: &Net) -> Res<Card> {
         let ctx = CudaContext::new(ordinal).map_err(|e| format!("device {ordinal}: {e:?}"))?;
         // One stream per context and no sharing between them, so the read/write
         // events cudarc would otherwise create on every allocation buy nothing
@@ -1045,13 +1045,7 @@ impl Card {
             },
         )
         .map_err(|e| format!("nvrtc: {e:?}"))?;
-        // A lane past the first needs a stream of its own, or the two cohorts
-        // serialise on the card they are meant to be filling in turn.
-        let stream = if own_stream {
-            ctx.new_stream().map_err(err)?
-        } else {
-            ctx.default_stream()
-        };
+        let stream = ctx.default_stream();
         let module = ctx.load_module(ptx).map_err(err)?;
         let k = Kernels::load(&module)?;
         let blas = CudaBlas::new(stream.clone()).map_err(err)?;
@@ -1074,6 +1068,10 @@ impl Card {
         let t = layout.norms[LN_TRUNK];
         plan.extend([t.g as i32, t.b as i32]);
         let owed = owed_by_the_join(&layout, &flat.b);
+        // After the weights are up and before any solve is admitted. The box is
+        // shared, so what another process already holds is simply not free.
+        let free = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
+        let budget = free.saturating_sub(ROUND_RESERVE);
         Ok(Card {
             plan: stream.memcpy_stod(&plan).map_err(err)?,
             owed: stream.memcpy_stod(&owed).map_err(err)?,
@@ -1085,6 +1083,7 @@ impl Card {
             stream,
             blas,
             k,
+            budget,
             solves: parking_lot::Mutex::new(Vec::new()),
             host: parking_lot::Mutex::new(Stage::default()),
             pack: parking_lot::Mutex::new(Pack::default()),
@@ -1964,7 +1963,6 @@ impl Card {
         let touched: Vec<i32> = mine
             .iter()
             .map(|&i| match &calls[i] {
-                Call::Read { finish: false, .. } => -1,
                 Call::Read { touched, .. } => (touched[0] as i32) | ((touched[1] as i32) << 1),
                 _ => unreachable!("read shard holds only read calls"),
             })

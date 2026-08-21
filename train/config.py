@@ -58,14 +58,10 @@ class Cfg:
     # Cards the solve farm evaluates on. A round is split across them by call,
     # so each builds and runs a self-contained batch.
     gen_devices: str = "0,1"
-    # Independent cohorts of solves, one lane of each card apiece. A cohort's
-    # threads park together while its round runs, so with one cohort the cards
-    # stand idle through every barrier; with eight they fill each other's gaps.
-    # Thirty-odd solves a round is the shape: fewer and the batch stops being
-    # worth an accelerator, more and the barrier costs too much.
-    gen_cohorts: int = 10
     gen_solves: int = 8
-    # Zero uses every physical CPU core.
+    # Host threads that advance solves. Zero uses every physical CPU core. How
+    # many solves are in flight is not a knob: each card admits them as its own
+    # memory allows.
     gen_workers: int = 0
     train_stream_priority: int = -1
 

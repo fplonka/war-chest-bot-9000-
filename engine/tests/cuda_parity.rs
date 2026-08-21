@@ -15,13 +15,12 @@
 //! Needs a GPU, so it only builds under `--features gpu`.
 #![cfg(feature = "gpu")]
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use warchest::cuda::Device;
-use warchest::farm::{Backend, Call, Gate};
+use warchest::farm::{Backend, Call, Reply};
 use warchest::net::{Net, NetLayout};
-use warchest::search::{Cfg, Nets};
+use warchest::search::{Cfg, Nets, Solver, Step};
 use warchest::selfplay::{Agent, Collect, Data, GameCfg, GameStream};
 
 fn random_net(seed: u64) -> Net {
@@ -58,59 +57,76 @@ fn game_cfg(s: u32, c: f32) -> GameCfg {
     }
 }
 
-/// Run one game stream per `(seed, s)` against `backend`, all in one gate,
-/// and hand back what each produced.
+/// Run one game stream per `(seed, s)` against `backend`, every stream's calls
+/// in the same round, and hand back what each produced.
 ///
 /// A stream's games are a function of its seed alone, so the same seed run
 /// alone and run beside others plays the same games and must produce the same
 /// numbers. That is what makes batching testable.
-fn generate(
+///
+/// `watch` sees every round before its replies are handed back, which is how
+/// the network comparison below gets at the two calls that still cross the bus.
+fn generate_with(
     net: &Net,
     backend: Backend,
     streams: &[(u64, u32)],
     games: usize,
     c: f32,
+    mut watch: impl FnMut(&[Call], &[Reply]),
 ) -> Vec<Data> {
-    let gate = Arc::new(Gate::default());
-    let out: Vec<_> = streams
+    let nets = Arc::new(Nets { value: net.clone(), device: backend.keeps_the_solve() });
+    let n = streams.len();
+    let mut streams: Vec<GameStream> = streams
         .iter()
-        .map(|_| Arc::new(parking_lot::Mutex::new(Data::default())))
+        .map(|&(seed, s)| GameStream::new(seed, game_cfg(s, c)))
         .collect();
-    let device = backend.keeps_the_solve();
-    // `serve_until_idle` gives up the moment nobody is in the count, so the
-    // driver must not start until every worker has entered.
-    let (ready, entered) = std::sync::mpsc::channel();
-    let workers: Vec<_> = streams
-        .iter()
-        .zip(&out)
-        .map(|(&(seed, s), slot)| {
-            let (gate, net, slot, ready) =
-                (gate.clone(), net.clone(), slot.clone(), ready.clone());
-            std::thread::spawn(move || {
-                let _member = gate.enter();
-                ready.send(()).expect("the driver is waiting");
-                let nets = Nets {
-                    value: net,
-                    device,
-                    gate: Some(gate.clone()),
-                };
-                let mut stream = GameStream::new(seed, game_cfg(s, c));
-                *slot.lock() = stream.generate(&nets, games);
-            })
+    let mut out: Vec<Data> = (0..n).map(|_| Data::default()).collect();
+    let mut live: Vec<Option<Solver>> = (0..n)
+        .map(|i| {
+            let mut sv = streams[i].next_solve(&nets, &mut out[i]);
+            sv.pin(i);
+            Some(sv)
         })
         .collect();
-    drop(ready);
-    for _ in streams {
-        entered.recv().expect("a worker entered the gate");
+    let mut replies: Vec<Vec<Reply>> = (0..n).map(|_| Vec::new()).collect();
+    while out.iter().any(|d| d.soff.len() < games) {
+        let mut calls: Vec<Call> = Vec::new();
+        let mut spans = vec![0usize; n];
+        for i in 0..n {
+            let Some(sv) = live[i].as_mut() else { continue };
+            match sv.advance(&replies[i]) {
+                Step::Calls(cs) => {
+                    spans[i] = cs.len();
+                    calls.extend(cs);
+                }
+                Step::Done(solved) => {
+                    let sv = live[i].take().expect("a live solve");
+                    streams[i].keep(&sv, solved, &mut out[i]);
+                    if out[i].soff.len() < games {
+                        let mut next = streams[i].next_solve(&nets, &mut out[i]);
+                        next.pin(i);
+                        live[i] = Some(next);
+                    }
+                }
+            }
+        }
+        if calls.is_empty() {
+            continue;
+        }
+        let answered = backend.run(&calls, 0).expect("the backend answered the round");
+        watch(&calls, &answered);
+        let mut rest = answered;
+        for (i, k) in spans.into_iter().enumerate() {
+            let tail = rest.split_off(k);
+            replies[i] = rest;
+            rest = tail;
+        }
     }
-    while gate.serve_until_idle(|calls| backend.run(calls, 0)).is_some() {}
-    gate.close();
-    for w in workers {
-        w.join().expect("the worker finished");
-    }
-    out.into_iter()
-        .map(|s| Arc::try_unwrap(s).ok().expect("one holder").into_inner())
-        .collect()
+    out
+}
+
+fn generate(net: &Net, backend: Backend, streams: &[(u64, u32)], games: usize, c: f32) -> Vec<Data> {
+    generate_with(net, backend, streams, games, c, |_, _| {})
 }
 
 /// One stream, which is what a comparison against the CPU wants.
@@ -141,49 +157,24 @@ fn the_network_agrees() {
         return;
     }
     let net = random_net(0x9E37);
-    let gate = Arc::new(Gate::default());
-    let stopping = Arc::new(AtomicBool::new(false));
-    let worker = {
-        let (gate, stopping, net) = (gate.clone(), stopping.clone(), net.clone());
-        std::thread::spawn(move || {
-            let _member = gate.enter();
-            let nets = Nets {
-                value: net,
-                device: true,
-                gate: Some(gate.clone()),
-            };
-            let mut stream = GameStream::new(0x51E5, game_cfg(32, 4.0));
-            while !stopping.load(Ordering::Relaxed) {
-                stream.generate(&nets, 1);
-            }
-        })
-    };
-    let device = Device::new(&[0], net.clone(), 1).expect("device");
+    let device = Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
     let (mut seen, mut bad) = ([0usize; 2], 0.0f32);
-    while seen.iter().any(|&n| n < 8) {
-        let got = gate.round(|calls| {
-            let replies = device.run(calls, 0)?;
-            for (c, r) in calls.iter().zip(&replies) {
-                match c {
-                    Call::Trunk { .. } => {
-                        seen[0] += 1;
-                        bad = bad.max(worst(&c.run(&net).a, &r.a, "trunk"));
-                    }
-                    Call::Configs { .. } => {
-                        seen[1] += 1;
-                        bad = bad.max(worst(&c.run(&net).c, &r.c, "configs"));
-                    }
-                    _ => {}
+    generate_with(&net, device, &[(0x51E5, 32)], 4, 4.0, |calls, replies| {
+        for (c, r) in calls.iter().zip(replies) {
+            match c {
+                Call::Trunk { .. } => {
+                    seen[0] += 1;
+                    bad = bad.max(worst(&c.run(&net).a, &r.a, "trunk"));
                 }
+                Call::Configs { .. } => {
+                    seen[1] += 1;
+                    bad = bad.max(worst(&c.run(&net).c, &r.c, "configs"));
+                }
+                _ => {}
             }
-            Some(replies)
-        });
-        assert!(got.is_some(), "the gate closed while comparing");
-    }
-    stopping.store(true, Ordering::Relaxed);
-    while gate.serve_until_idle(|calls| device.run(calls, 0)).is_some() {}
-    gate.close();
-    let _ = worker.join();
+        }
+    });
+    assert!(seen.iter().all(|&n| n > 0), "saw {seen:?} of the two calls");
     assert!(bad < 1e-3, "worst network difference {bad:e}");
 }
 
@@ -209,7 +200,7 @@ fn the_cfr_loop_agrees_on_a_fixed_tree() {
     let host = generate_one(&net, Backend::Reference(net.clone()), 3, 8, 0.0);
     let card = generate_one(
         &net,
-        Backend::Cuda(Device::new(&[0], net.clone(), 1).expect("device")),
+        Backend::Cuda(Device::new(&[0], net.clone()).expect("device")),
         3,
         8,
         0.0,
@@ -256,7 +247,7 @@ fn growth_on_the_device_produces_sane_targets() {
     let net = random_net(0x9E37);
     let card = generate_one(
         &net,
-        Backend::Cuda(Device::new(&[0], net.clone(), 1).expect("device")),
+        Backend::Cuda(Device::new(&[0], net.clone()).expect("device")),
         3,
         32,
         4.0,
@@ -293,7 +284,7 @@ fn a_solve_does_not_depend_on_the_round_it_rides_in() {
     }
     let net = random_net(0x9E37);
     let streams = [(0x51E5u64, 8u32), (0x0A13, 11), (0x77C1, 13), (0x2E57, 17)];
-    let device = || Backend::Cuda(Device::new(&[0], net.clone(), 1).expect("device"));
+    let device = || Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
     let together = generate(&net, device(), &streams, 3, 0.0);
     // A shared round must not move a solve at all, so the same run twice is
     // the control: whatever this reports is the floor the comparison sits on.

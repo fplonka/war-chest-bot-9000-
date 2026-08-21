@@ -45,7 +45,6 @@ def bench(args, devices, threads):
         cfr=args.cfr,
         recursive_rate=args.recursive_rate,
         devices=devices,
-        cohorts=args.cohorts,
         roots=args.roots,
     )
     # Warm: the kernels compile, the pools fill, and every thread reaches its
@@ -66,22 +65,13 @@ def bench(args, devices, threads):
         base = [int(d[k]) for k in KEYS]
         rate = solves / dt
         per_round = calls / max(rounds, 1)
-        # A round waits for the slowest thread in its cohort, so what a solver
-        # thread does between rounds is the round's floor. With more threads
-        # than cores this is queueing as much as work, which is the whole
-        # question about the thread-per-solve shape.
-        # `awake()` reports milliseconds already.
-        ms, spans, longest = warchest.awake()
-        awake = ms / max(spans, 1)
         print(
-            f"threads={threads:3d} t={now - start:5.0f}s: "
+            f"workers={threads:3d} t={now - start:5.0f}s: "
             f"{rate:7.1f} solves/s | "
-            f"threads {threads:3d}  "
             f"rounds/solve {rounds * per_round / max(solves, 1):5.1f}  "
             f"round {1e3 * dt / max(rounds, 1):6.1f} ms | "
             f"{per_round:5.1f} calls/round  {rows / max(rounds, 1):7.0f} rows/round  "
-            f"device {1e-9 * nanos / dt:4.0%}  "
-            f"awake {awake:5.1f}/{longest:6.1f} ms",
+            f"device {1e-9 * nanos / dt:4.0%}",
             flush=True,
         )
         mark, solves = now, 0
@@ -95,8 +85,6 @@ def main():
     p.add_argument("--games", type=int, default=64, help="games to sample a corpus from")
     p.add_argument("--cap", type=int, default=4096, help="roots to keep")
     p.add_argument("--threads", default="72")
-    p.add_argument("--cohorts", type=int, default=2,
-                   help="independent cohorts of solves; one lane of the card each")
     p.add_argument("--devices", default="0,1")
     p.add_argument("--seconds", type=float, default=60)
     p.add_argument("--window", type=float, default=20)

@@ -26,12 +26,14 @@
 //!    never touches `Belief`, `advance_config` or `belief_after_draw`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use warchest::net::Net;
 use warchest::pbs::*;
 use warchest::rng::Rng;
-use warchest::search::{node_actions, Cfg, Nets, Solver};
-use warchest::selfplay::{make_game, Agent, Collect, GameCfg, GameStream};
+use warchest::farm::{Call, Reply};
+use warchest::search::{node_actions, Cfg, Nets, Solver, Step};
+use warchest::selfplay::{make_game, Agent, Collect, Data, GameCfg, GameStream};
 use warchest::state::{Cont, State, Z_BAG, Z_FACEDOWN, Z_FACEUP};
 use warchest::units::{write_card_features, CARD_FEATS};
 use warchest::Action;
@@ -635,11 +637,7 @@ fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
 /// combination a benchmark hit and the suite did not.
 #[test]
 fn a_subgame_of_only_terminal_leaves_solves() {
-    let nets = Nets {
-        gate: None,
-        device: false,
-        value: random_net(5),
-    };
+    let nets = Arc::new(Nets { device: false, value: random_net(5) });
     let mut checked = 0usize;
     for seed in 0..600u64 {
         let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
@@ -663,7 +661,7 @@ fn a_subgame_of_only_terminal_leaves_solves() {
             c: 1.0,
             ..Default::default()
         };
-        let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
+        let mut sv = Solver::new(&s, ctx, Arc::clone(&nets), cfg, bel.clone(), Rng::new(seed));
         assert!(
             sv.nodes
                 .iter()
@@ -671,7 +669,7 @@ fn a_subgame_of_only_terminal_leaves_solves() {
                 .all(|(n, st)| !n.leaf || st.is_terminal()),
             "expected every leaf terminal"
         );
-        sv.solve(&mut rng);
+        sv.run_alone();
         let v = vec![sv.root_values()];
         assert!(v[0][0].iter().all(|x| x.is_finite()));
         checked += 1;
@@ -804,8 +802,7 @@ fn position_with_ambiguous_facedown(seed: u64) -> Option<(State, Ctx, [Belief; 2
 /// different worlds and require the results to agree bit for bit.
 #[test]
 fn a_solve_reads_only_the_beliefs() {
-    let mut nets = Nets::default();
-    nets.value = random_net(0xA11CE);
+    let nets = Arc::new(Nets { device: false, value: random_net(0xA11CE) });
     let cfg = Cfg {
         s: 8,
         c: 1.0,
@@ -826,9 +823,15 @@ fn a_solve_reads_only_the_beliefs() {
                 let c = if pick == 0 { cs[0] } else { cs[cs.len() - 1] };
                 set_config(&mut w, p as u8, &ctx, &c);
             }
-            let mut sv = Solver::new(&w, ctx, &nets, cfg, bel.clone());
-            let mut solve_rng = Rng::new(seed ^ 0x51A7_EE);
-            sv.solve(&mut solve_rng);
+            let mut sv = Solver::new(
+                &w,
+                ctx,
+                Arc::clone(&nets),
+                cfg,
+                bel.clone(),
+                Rng::new(seed ^ 0x51A7_EE),
+            );
+            sv.run_alone();
             let vals = vec![sv.root_values()];
             let strat: Vec<f32> = (0..bel[w.to_act() as usize].cfg.len())
                 .flat_map(|c| sv.average_strategy(0, c).to_vec())
@@ -862,8 +865,7 @@ fn a_solve_reads_only_the_beliefs() {
 /// could not act on it.
 #[test]
 fn the_value_function_separates_configs_sharing_a_hand() {
-    let mut nets = Nets::default();
-    nets.value = random_net(0xBEEF);
+    let nets = Arc::new(Nets { device: false, value: random_net(0xBEEF) });
     let cfg = Cfg {
         s: 8,
         c: 1.0,
@@ -875,9 +877,15 @@ fn the_value_function_separates_configs_sharing_a_hand() {
             continue;
         };
         let me = s.to_act() as usize;
-        let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
-        let mut solve_rng = Rng::new(seed ^ 0xC0FF_EE);
-        sv.solve(&mut solve_rng);
+        let mut sv = Solver::new(
+            &s,
+            ctx,
+            Arc::clone(&nets),
+            cfg,
+            bel.clone(),
+            Rng::new(seed ^ 0xC0FF_EE),
+        );
+        sv.run_alone();
         let vals = vec![sv.root_values()];
         let v = &vals[0][me];
         for i in 0..bel[me].cfg.len() {
@@ -917,11 +925,7 @@ fn the_value_function_separates_configs_sharing_a_hand() {
 
 #[test]
 fn game_stream_yields_one_complete_solve_at_a_time() {
-    let nets = Nets {
-        gate: None,
-        device: false,
-        value: random_net(0x57EA),
-    };
+    let nets = Arc::new(Nets { device: false, value: random_net(0x57EA) });
     let cfg = Cfg {
         s: 8,
         c: 1.0,
@@ -945,22 +949,16 @@ fn game_stream_yields_one_complete_solve_at_a_time() {
     }
 }
 
-/// Routing the network through the batch gate must not change a single value.
+/// Batching several solves into one round must not change a single value.
 ///
-/// The gate exists to make the *shape* of inference better, never its result:
-/// the same solve, gated and ungated, has to produce the same rows, the same
-/// beliefs and the same targets, bit for bit. Anything else means the batch is
-/// answering a different question than the solve asked.
+/// A round exists to make the *shape* of inference better, never its result:
+/// the same stream, driven alone and driven in a round beside two others, has
+/// to produce the same rows, the same beliefs and the same targets, bit for
+/// bit. Anything else means the batch is answering a different question than
+/// the solve asked, or handing one solve another's reply.
 #[test]
-fn a_gated_solve_matches_an_ungated_one_exactly() {
-    use std::sync::Arc;
-    use warchest::farm::Gate;
-
-    let cfg = Cfg {
-        s: 12,
-        c: 1.0,
-        ..Default::default()
-    };
+fn a_batched_solve_matches_one_run_alone_exactly() {
+    let cfg = Cfg { s: 12, c: 1.0, ..Default::default() };
     let gc = GameCfg {
         agents: [Agent::Sog { cfg }; 2],
         collect: Collect::Sog,
@@ -971,53 +969,78 @@ fn a_gated_solve_matches_an_ungated_one_exactly() {
         recursive_rate: 0.25,
     };
     const SOLVES: usize = 16;
+    const SEEDS: [u64; 3] = [3, 11, 29];
+    let net = || random_net(0x6A7E);
 
-    let plain = {
-        let nets = Nets {
-            gate: None,
-            device: false,
-            value: random_net(0x6A7E),
-        };
-        GameStream::new(3, gc).generate(&nets, SOLVES)
-    };
+    let alone: Vec<_> = SEEDS
+        .iter()
+        .map(|&seed| {
+            let nets = Arc::new(Nets { device: false, value: net() });
+            GameStream::new(seed, gc).generate(&nets, SOLVES)
+        })
+        .collect();
 
-    let gated = {
-        let gate = Arc::new(Gate::default());
-        let nets = Arc::new(Nets {
-            gate: Some(Arc::clone(&gate)),
-            device: false,
-            value: random_net(0x6A7E),
-        });
-        // The real evaluator, not a hand-rolled one: a batched backend keeps a
-        // solve's board and config vectors between iterations, so a driver
-        // that maps `Call::run` over the calls has nowhere to put them and is
-        // not the thing production runs.
-        let backend = Arc::new(warchest::farm::Backend::Reference(random_net(0x6A7E)));
-        let worker = {
-            let (gate, nets) = (Arc::clone(&gate), Arc::clone(&nets));
-            std::thread::spawn(move || {
-                let _member = gate.enter();
-                GameStream::new(3, gc).generate(&nets, SOLVES)
-            })
-        };
-        let driver = {
-            let (gate, backend) = (Arc::clone(&gate), Arc::clone(&backend));
-            std::thread::spawn(move || {
-                while gate.round(|calls| backend.run(calls, 0)).is_some() {}
-            })
-        };
-        let out = worker.join().expect("gated worker");
-        gate.close();
-        driver.join().expect("driver");
-        out
-    };
+    // The real evaluator, not a hand-rolled one: a batched backend keeps a
+    // solve's board and config vectors between iterations, so a driver that
+    // maps `Call::run` over the calls has nowhere to put them and is not the
+    // thing production runs.
+    let backend = warchest::farm::Backend::Reference(net());
+    let nets = Arc::new(Nets { device: false, value: net() });
+    let mut streams: Vec<_> = SEEDS.iter().map(|&s| GameStream::new(s, gc)).collect();
+    let mut out: Vec<Data> = (0..SEEDS.len()).map(|_| Data::default()).collect();
+    let mut live: Vec<Option<Solver>> = streams
+        .iter_mut()
+        .zip(&mut out)
+        .enumerate()
+        .map(|(i, (st, o))| {
+            let mut sv = st.next_solve(&nets, o);
+            sv.pin(i);
+            Some(sv)
+        })
+        .collect();
+    let mut replies: Vec<Vec<Reply>> = (0..SEEDS.len()).map(|_| Vec::new()).collect();
+    // Every stream advances once a round, and the round carries all of their
+    // calls together — which is exactly what the farm does.
+    while out.iter().any(|d| d.soff.len() < SOLVES) {
+        let mut calls: Vec<Call> = Vec::new();
+        let mut spans = vec![0usize; SEEDS.len()];
+        for i in 0..SEEDS.len() {
+            let Some(sv) = live[i].as_mut() else { continue };
+            match sv.advance(&replies[i]) {
+                Step::Calls(cs) => {
+                    spans[i] = cs.len();
+                    calls.extend(cs);
+                }
+                Step::Done(solved) => {
+                    let sv = live[i].take().expect("a live solve");
+                    streams[i].keep(&sv, solved, &mut out[i]);
+                    if out[i].soff.len() < SOLVES {
+                        let mut next = streams[i].next_solve(&nets, &mut out[i]);
+                        next.pin(i);
+                        live[i] = Some(next);
+                    }
+                }
+            }
+        }
+        if calls.is_empty() {
+            continue;
+        }
+        let mut rest = backend.run(&calls, 0).expect("the reference answers");
+        for (i, n) in spans.into_iter().enumerate() {
+            let tail = rest.split_off(n);
+            replies[i] = rest;
+            rest = tail;
+        }
+    }
 
-    assert_eq!(plain.nv, gated.nv, "row counts differ");
-    assert_eq!(plain.rows, gated.rows, "packed rows differ");
-    assert_eq!(plain.coff, gated.coff, "config offsets differ");
-    assert_eq!(plain.cw, gated.cw, "beliefs differ");
-    assert_eq!(plain.cy, gated.cy, "targets differ");
-    assert_eq!(plain.queries, gated.queries, "query row counts differ");
+    for (i, (a, b)) in alone.iter().zip(&out).enumerate() {
+        assert_eq!(a.nv, b.nv, "stream {i}: row counts differ");
+        assert_eq!(a.rows, b.rows, "stream {i}: packed rows differ");
+        assert_eq!(a.coff, b.coff, "stream {i}: config offsets differ");
+        assert_eq!(a.cw, b.cw, "stream {i}: beliefs differ");
+        assert_eq!(a.cy, b.cy, "stream {i}: targets differ");
+        assert_eq!(a.queries, b.queries, "stream {i}: query row counts differ");
+    }
 }
 
 /// A solve stores its root and nothing else.
@@ -1035,11 +1058,7 @@ fn a_gated_solve_matches_an_ungated_one_exactly() {
 /// belongs in the run report as a diagnostic, not in this test.
 #[test]
 fn a_solve_stores_its_root_and_nothing_else() {
-    let nets = Nets {
-        gate: None,
-        device: false,
-        value: random_net(0x51DE),
-    };
+    let nets = Arc::new(Nets { device: false, value: random_net(0x51DE) });
     let cfg = Cfg {
         s: 12,
         c: 1.0,
@@ -1167,7 +1186,7 @@ fn zero_weight_config_survives_the_walk_update() {
     // support to equal the tree child's config list element for element — the
     // invariant the desync assert protects: support is reachability, never
     // weight.
-    let nets = Nets::default();
+    let nets = Arc::new(Nets::default());
     let mut rng = Rng::new(777);
     for _ in 0..200 {
         let mut s = make_game(&mut rng, false);
@@ -1221,15 +1240,12 @@ fn zero_weight_config_survives_the_walk_update() {
         let mut sv = Solver::new(
             &s,
             ctx,
-            &nets,
-            Cfg {
-                s: 8,
-                c: 1.0,
-                ..Default::default()
-            },
+            Arc::clone(&nets),
+            Cfg { s: 8, c: 1.0, ..Default::default() },
             bel.clone(),
+            Rng::new(rng.next_u64()),
         );
-        sv.solve(&mut rng);
+        sv.run_alone();
         let n0 = &sv.nodes[0];
         // An action the underflowed config can actually play, so the tree's
         // child support includes it.

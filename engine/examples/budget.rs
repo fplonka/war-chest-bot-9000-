@@ -80,11 +80,7 @@ fn main() {
     let roots: usize = a.get(2).and_then(|x| x.parse().ok()).unwrap_or(64);
     let games: usize = a.get(3).and_then(|x| x.parse().ok()).unwrap_or(24);
 
-    let nets = Nets {
-        value: warchest::net::Net::load_bin(&weights).expect("weights file"),
-        device: false,
-        gate: None,
-    };
+    let nets = std::sync::Arc::new(Nets { value: warchest::net::Net::load_bin(&weights).expect("weights file"), device: false });
     // Roots off real play under the same net, at a cheap budget. What a solve
     // costs varies twenty-six fold with how far into a game its root sits, so
     // the corpus has to be a sample of play and not of one phase.
@@ -147,13 +143,12 @@ fn main() {
             .enumerate()
             .map(|(i, (st, bel))| {
                 let ctx = warchest::pbs::Ctx::new(st);
-                let mut sv = Solver::new(st, ctx, &nets, cfg, bel.clone());
-                let mut rng = Rng::new(0x51D5 ^ i as u64);
+                let mut sv = Solver::new(st, ctx, std::sync::Arc::clone(&nets), cfg, bel.clone(), Rng::new(0x51D5 ^ i as u64));
                 let mut one = Cost { solves: 1.0, ..Default::default() };
                 // The production loop, not a transcription of it: `solve` also
                 // refreshes the policy prior between phases, and the prior is
                 // what decides where the tree goes.
-                sv.solve(&mut rng);
+                sv.run_alone();
                 let (sh, tr) = (sv.shape(), sv.trace);
                 one.row_iters = tr.row_iters as f64;
                 one.cidx_iters = tr.cidx_iters as f64;
@@ -180,7 +175,7 @@ fn main() {
                     std::collections::HashMap::new();
                 for &node in sv.leaf_rows.iter() {
                     for p in 0..2 {
-                        let key = std::rc::Rc::as_ptr(&sv.nodes[node].cfgs[p]) as *const u8 as usize;
+                        let key = std::sync::Arc::as_ptr(&sv.nodes[node].cfgs[p]) as *const u8 as usize;
                         *sup.entry(key).or_default() += 1;
                     }
                 }

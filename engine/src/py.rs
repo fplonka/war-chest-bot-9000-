@@ -522,7 +522,7 @@ fn set_weights(
 ) -> PyResult<()> {
     let value = Net::from_flat(w.as_slice()?, b.as_slice()?, ln.as_slice()?)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    *nets().write() = Arc::new(Nets { value, device: false, gate: None });
+    *nets().write() = Arc::new(Nets { value, device: false });
     NET_VERSION.fetch_add(1, Ordering::Release);
     Ok(())
 }
@@ -534,7 +534,7 @@ fn set_weights(
 fn set_weights_bin(path: &str) -> PyResult<()> {
     let value = Net::load_bin(path)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}: {}", path, e)))?;
-    *nets().write() = Arc::new(Nets { value, device: false, gate: None });
+    *nets().write() = Arc::new(Nets { value, device: false });
     NET_VERSION.fetch_add(1, Ordering::Release);
     Ok(())
 }
@@ -647,11 +647,11 @@ struct SolveFarm {
 #[pymethods]
 impl SolveFarm {
     #[new]
-    #[pyo3(signature = (seed, threads, s=512, c=8.0, explore=0.1, random_draft=true, cfr="sog", query_rate=0.9, recursive_rate=0.1, devices=vec![0], roots=None, cohorts=2))]
+    #[pyo3(signature = (seed, workers, s=512, c=8.0, explore=0.1, random_draft=true, cfr="sog", query_rate=0.9, recursive_rate=0.1, devices=vec![0], roots=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         seed: u64,
-        threads: usize,
+        workers: usize,
         s: u32,
         c: f32,
         explore: f32,
@@ -661,7 +661,6 @@ impl SolveFarm {
         recursive_rate: f32,
         devices: Vec<usize>,
         roots: Option<&str>,
-        cohorts: usize,
     ) -> PyResult<SolveFarm> {
         let cfg = Cfg { s, c, cfr: cfr_of(cfr)?, ..Default::default() };
         // A corpus makes this a bench rather than a run: the same roots in the
@@ -692,9 +691,9 @@ impl SolveFarm {
             }
         };
         let version = NET_VERSION.load(Ordering::Acquire);
-        let backend = backend_for(&devices, (**nets().read()).value.clone(), cohorts)?;
+        let backend = backend_for(&devices, (**nets().read()).value.clone())?;
         Ok(SolveFarm {
-            farm: Farm::new(seed, threads, work, backend),
+            farm: Farm::new(seed, workers, work, backend),
             net_version: version,
         })
     }
@@ -718,9 +717,9 @@ impl SolveFarm {
         let d = py.allow_threads(|| self.farm.drive(solves));
         if self.farm.broken() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "a cohort's gate closed: a round could not be answered. The \
-                 driver prints the reason -- out of memory is the usual one, \
-                 and fewer cohorts is the usual answer.",
+                "a card could not answer a round; the solves it held are gone. \
+                 The driver prints the reason, and out of memory is the usual \
+                 one.",
             ));
         }
         let out = data_to_dict(py, d)?;
@@ -739,10 +738,10 @@ impl SolveFarm {
 
 /// The devices. There is no CPU fallback on purpose: a run that cannot reach a
 /// GPU is two orders of magnitude off and should say so rather than crawl.
-fn backend_for(_devices: &[usize], _value: crate::net::Net, _lanes: usize) -> PyResult<Backend> {
+fn backend_for(_devices: &[usize], _value: crate::net::Net) -> PyResult<Backend> {
     #[cfg(feature = "gpu")]
     {
-        return crate::cuda::Device::new(_devices, _value, _lanes)
+        return crate::cuda::Device::new(_devices, _value)
             .map(Backend::Cuda)
             .map_err(pyo3::exceptions::PyRuntimeError::new_err);
     }
@@ -936,16 +935,6 @@ fn solve_census() -> Vec<(String, usize)> {
     }
     #[cfg(not(feature = "gpu"))]
     Vec::new()
-}
-
-/// What solver threads do between waking and parking again: total
-/// milliseconds, how many spans, and the longest one. A round waits for the
-/// slowest thread, so the mean and the maximum together say whether the wait
-/// is work spread evenly or one straggler holding thirty-five others.
-#[pyfunction]
-fn awake() -> (f64, u64, f64) {
-    let (ns, n, mx) = crate::farm::awake();
-    (ns as f64 / 1e6, n, mx as f64 / 1e6)
 }
 
 /// All 37 hexes' axial coords, indexed by hex. The browser UI's board
@@ -1171,6 +1160,5 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(leaf_breakdown, m)?)?;
         m.add_function(wrap_pyfunction!(stage_names, m)?)?;
         m.add_function(wrap_pyfunction!(solve_census, m)?)?;
-        m.add_function(wrap_pyfunction!(awake, m)?)?;
     Ok(())
 }

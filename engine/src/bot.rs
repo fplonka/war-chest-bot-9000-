@@ -30,7 +30,9 @@ use crate::pbs::{
 };
 use crate::rng::Rng;
 
-use crate::search::{Cfg, Nets, Solver};
+use crate::farm::Cards;
+use crate::search::{Cfg, Nets, Solver, Step};
+use std::sync::Arc;
 use crate::state::{Cont, State};
 
 /// How a bot picks its move.
@@ -46,8 +48,12 @@ pub enum Mind {
 /// network it thinks with. Shared across all live games and read-only.
 pub struct Brain {
     pub mind: Mind,
-    pub nets: Nets,
+    pub nets: Arc<Nets>,
     pub cfg: Cfg,
+    /// The cards a solve runs on, when there are any. Without them a solve is
+    /// answered by the CPU network where it is raised, which is a hundred
+    /// times slower and is why a ladder used to cost an hour of CPU.
+    pub cards: Option<Arc<Cards>>,
 }
 
 impl Brain {
@@ -68,8 +74,29 @@ impl Brain {
             Mind::Random => return policy::uniform(s, ctx, player, cfgs),
             Mind::Sog => {}
         }
-        let mut sv = Solver::new(s, *ctx, &self.nets, self.cfg, bel.clone());
-        sv.solve(rng);
+        let mut sv = Solver::new(
+            s,
+            *ctx,
+            Arc::clone(&self.nets),
+            self.cfg,
+            bel.clone(),
+            Rng::new(rng.next_u64()),
+        );
+        match &self.cards {
+            None => {
+                sv.run_alone();
+            }
+            Some(cards) => {
+                let seat = cards.seat();
+                sv.pin(seat.slot);
+                let mut replies = Vec::new();
+                while let Step::Calls(calls) = sv.advance(&replies) {
+                    replies = cards
+                        .round(seat.card, calls)
+                        .expect("a card failed while a solve was still running");
+                }
+            }
+        }
         policy::at_node(&sv, 0, cfgs.len())
     }
 }
@@ -258,8 +285,9 @@ mod tests {
     fn brain() -> Brain {
         Brain {
             mind: Mind::Random,
-            nets: Nets::default(),
+            nets: Arc::new(Nets::default()),
             cfg: Cfg::default(),
+            cards: None,
         }
     }
 

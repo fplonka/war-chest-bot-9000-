@@ -1,4 +1,5 @@
 //! GT-CFR generation throughput probe (run with `-- --ignored --nocapture`).
+use std::sync::Arc;
 use std::time::Instant;
 use warchest::rng::Rng;
 use warchest::search::{Cfg, Nets};
@@ -8,7 +9,7 @@ use warchest::selfplay::{play_game, Agent, Collect, Data, GameCfg};
 #[ignore]
 fn throughput_probe() {
     for iters in [16usize, 8] {
-        let nets = Nets::default();
+        let nets = Arc::new(Nets::default());
         let cfg = Cfg {
             s: iters as u32,
             c: 1.0,
@@ -46,7 +47,7 @@ fn throughput_probe() {
     }
     // Eval mode (avg strategy, no targets):
     {
-        let nets = Nets::default();
+        let nets = Arc::new(Nets::default());
         let cfg = Cfg {
             s: 16,
             c: 1.0,

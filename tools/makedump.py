@@ -40,7 +40,6 @@ def main():
     p.add_argument("--roots", default="")
     p.add_argument("--devices", default="0,1")
     p.add_argument("--threads", type=int, default=36)
-    p.add_argument("--cohorts", type=int, default=8)
     p.add_argument("--s", type=int, default=512)
     p.add_argument("--c", type=float, default=8.0)
     p.add_argument("--seed", type=int, default=11)
@@ -54,7 +53,6 @@ def main():
         args.seed, args.threads,
         s=args.s, c=args.c, cfr="sog",
         recursive_rate=0.1, devices=[int(d) for d in args.devices.split(",")],
-        cohorts=args.cohorts,
         roots=args.roots or None,
     )
     buf = Buffer(args.solves * 2, args.solves * 2 * 48)

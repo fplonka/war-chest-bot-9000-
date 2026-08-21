@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use warchest::arena::{Ask, Done, Hello, Reply, Request, PROTOCOL};
 use warchest::args::Args;
 use warchest::bot::{Brain, Mind, Session};
-use warchest::farm::{Backend, Gate};
+use warchest::farm::{Backend, Cards};
 use warchest::net::Net;
 use warchest::pbs::rules_table_hash;
 use warchest::search::{Cfg, Cfr, Nets};
@@ -51,21 +51,22 @@ fn options() -> Result<Options, String> {
     })
 }
 
-fn brain(o: &Options, gate: Option<Arc<Gate>>, device: bool) -> Result<Brain, String> {
+fn brain(o: &Options, cards: Option<Arc<Cards>>) -> Result<Brain, String> {
     let mind = match o.mind.as_str() {
         "sog" => Mind::Sog,
         "random" => Mind::Random,
         other => return Err(format!("unknown mind {}", other)),
     };
     let cfr = Cfr::named(&o.cfr).ok_or_else(|| format!("unknown cfr rule {}", o.cfr))?;
-    let mut nets = Nets { gate, device, ..Nets::default() };
+    let mut nets = Nets { device: cards.is_some(), ..Nets::default() };
     if matches!(mind, Mind::Sog) {
         nets.value = Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
     }
     Ok(Brain {
         mind,
-        nets,
+        nets: Arc::new(nets),
         cfg: Cfg { s: o.s, c: o.c, cfr, ..Default::default() },
+        cards,
     })
 }
 
@@ -127,24 +128,9 @@ fn main() {
     // same budget a training run uses, so it belongs on the same machinery:
     // without this a forty-game ladder is an hour of CPU, which is too dear to
     // be the thing that checks whether a run learned anything.
-    let (gate, driver) = match devices(&options) {
-        None => (None, None),
-        Some(backend) => {
-            let gate = Arc::new(Gate::default());
-            let mine = gate.clone();
-            // The driver holds no gate slot of its own, so it never waits on
-            // itself; it stops when the gate closes, which is when stdin ends.
-            let driver = std::thread::spawn(move || {
-                while !mine.round_closed() {
-                    mine.serve_until_idle(|calls| backend.run(calls, 0));
-                    std::thread::sleep(std::time::Duration::from_micros(200));
-                }
-            });
-            (Some(gate), Some(driver))
-        }
-    };
+    let cards = devices(&options).map(|backend| Arc::new(Cards::new(backend)));
     let brain = Arc::new(
-        brain(&options, gate.clone(), gate.is_some()).unwrap_or_else(|e| {
+        brain(&options, cards).unwrap_or_else(|e| {
             eprintln!("{}", e);
             std::process::exit(2);
         }),
@@ -154,19 +140,11 @@ fn main() {
     } else {
         options.threads
     };
+    // A thread's own stack is its continuation: it puts a solve's calls on a
+    // card's queue and waits for the round that carries them, which is shared
+    // with every other thread that was ready at the same moment.
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
-        // Every worker is a gate member for its whole life, so a round is
-        // exactly the games in flight and a thread that is between games does
-        // not hold the others up.
-        .start_handler({
-            let gate = gate.clone();
-            move |_| {
-                if let Some(g) = &gate {
-                    std::mem::forget(g.enter());
-                }
-            }
-        })
         .build()
         .expect("thread pool");
 
@@ -215,12 +193,6 @@ fn main() {
             });
         }
     }
-    if let Some(gate) = gate {
-        gate.close();
-    }
-    if let Some(driver) = driver {
-        let _ = driver.join();
-    }
 }
 
 /// The backend a solve evaluates on: every card the driver can see.
@@ -239,7 +211,7 @@ fn devices(o: &Options) -> Option<Backend> {
         let n = warchest::cuda::Device::count();
         if n > 0 {
             let net = Net::load_bin(&o.weights).ok()?;
-            match warchest::cuda::Device::new(&(0..n).collect::<Vec<_>>(), net, 1) {
+            match warchest::cuda::Device::new(&(0..n).collect::<Vec<_>>(), net) {
                 Ok(d) => return Some(Backend::Cuda(d)),
                 Err(e) => eprintln!("no device backend: {e}"),
             }

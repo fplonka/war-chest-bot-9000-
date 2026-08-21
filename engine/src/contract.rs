@@ -713,6 +713,7 @@ mod tests {
     use super::*;
     use crate::rng::Rng;
     use crate::search::{Cfg, Nets};
+    use std::sync::Arc;
     use crate::selfplay::{collect_roots, Agent, Collect, GameCfg};
 
     fn random_net(seed: u64) -> crate::net::Net {
@@ -738,11 +739,7 @@ mod tests {
     /// tree `Solver::new` builds would pass a static test and fail in a solve.
     #[test]
     fn the_transposed_reach_reproduces_the_scatter_exactly() {
-        let nets = Nets {
-            value: random_net(0x5EED),
-            device: false,
-            gate: None,
-        };
+        let nets = Arc::new(Nets { value: random_net(0x5EED), device: false });
         let cfg = Cfg { s: 32, c: 4.0, ..Default::default() };
         let gc = GameCfg {
             agents: [Agent::Sog {
@@ -758,15 +755,15 @@ mod tests {
         let roots = collect_roots(3, 7, &nets, &gc, 4);
         assert!(!roots.is_empty(), "no roots to test against");
 
-        let mut rng = Rng::new(0xC047);
         let mut checked = 0usize;
         for (s, belief) in &roots {
             let ctx = crate::pbs::Ctx::new(s);
-            let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
+            let mut sv = crate::search::Solver::new(s, ctx, Arc::clone(&nets), cfg, belief.clone(), Rng::new(0xD12E));
             for t in 0..cfg.iters() {
+                sv.catch_up();
                 sv.step();
                 for _ in 0..4 {
-                    if !sv.expand_once(&mut rng) {
+                    if !sv.expand_once() {
                         break;
                     }
                 }
@@ -808,11 +805,7 @@ mod tests {
     /// the failure a device would actually have.
     #[test]
     fn a_solve_driven_from_the_description_reaches_the_same_strategy() {
-        let nets = Nets {
-            value: random_net(0x5EED),
-            device: false,
-            gate: None,
-        };
+        let nets = Arc::new(Nets { value: random_net(0x5EED), device: false });
         let cfg = Cfg {
             s: 48,
             c: 4.0,
@@ -838,8 +831,7 @@ mod tests {
             // The same solve twice, from the same seed, so the expansion
             // trajectories match and only the sweep differs.
             let run = |flat: bool| {
-                let mut rng = Rng::new(0xD12E);
-                let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
+                        let mut sv = crate::search::Solver::new(s, ctx, Arc::clone(&nets), cfg, belief.clone(), Rng::new(0xD12E));
                 let mut c = Contract::of(&sv);
                 sv.grown.clear();
                 for t in 0..cfg.iters() {
@@ -855,6 +847,7 @@ mod tests {
                                 factor(m, k.beta),
                                 (m / (m + 1.0)).powf(k.gamma),
                             );
+                            sv.catch_up();
                             sv.leaf_values(p);
                             let (mut vals, mut cur, mut regret) =
                                 (sv.vals.clone(), sv.cur.clone(), sv.regret.clone());
@@ -886,10 +879,11 @@ mod tests {
                         sv.steps[0] += 1;
                         sv.steps[1] += 1;
                     } else {
+                        sv.catch_up();
                         sv.step();
                     }
                     for _ in 0..4 {
-                        if !sv.expand_once(&mut rng) {
+                        if !sv.expand_once() {
                             break;
                         }
                     }
@@ -924,11 +918,7 @@ mod tests {
     /// way no downstream assertion notices.
     #[test]
     fn a_level_never_depends_on_itself() {
-        let nets = Nets {
-            value: random_net(0x5EED),
-            device: false,
-            gate: None,
-        };
+        let nets = Arc::new(Nets { value: random_net(0x5EED), device: false });
         let cfg = Cfg {
             s: 32,
             c: 4.0,
@@ -948,15 +938,15 @@ mod tests {
         let roots = collect_roots(2, 31, &nets, &gc, 2);
         assert!(!roots.is_empty(), "no roots to test against");
 
-        let mut rng = Rng::new(0x1E4E);
         let mut deepest = 0usize;
         for (s, belief) in &roots {
             let ctx = crate::pbs::Ctx::new(s);
-            let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
+            let mut sv = crate::search::Solver::new(s, ctx, Arc::clone(&nets), cfg, belief.clone(), Rng::new(0xD12E));
             for _ in 0..cfg.iters() {
+                sv.catch_up();
                 sv.step();
                 for _ in 0..4 {
-                    if !sv.expand_once(&mut rng) {
+                    if !sv.expand_once() {
                         break;
                     }
                 }
@@ -1007,7 +997,7 @@ mod tests {
     /// equal the contract at every step.
     #[test]
     fn the_runs_a_solve_sends_rebuild_its_contract() {
-        let nets = Nets { value: random_net(0x5EED), device: false, gate: None };
+        let nets = Arc::new(Nets { value: random_net(0x5EED), device: false });
         let cfg = Cfg { s: 40, c: 4.0, ..Default::default() };
         let gc = GameCfg {
             agents: [Agent::Sog { cfg: Cfg { s: 4, c: 1.0, ..cfg } }; 2],
@@ -1020,11 +1010,10 @@ mod tests {
         };
         let roots = collect_roots(3, 23, &nets, &gc, 3);
         assert!(!roots.is_empty(), "no roots to test against");
-        let mut rng = Rng::new(0xE47E);
         let mut checked = 0usize;
         for (s, belief) in &roots {
             let ctx = crate::pbs::Ctx::new(s);
-            let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
+            let mut sv = crate::search::Solver::new(s, ctx, Arc::clone(&nets), cfg, belief.clone(), Rng::new(0xD12E));
             let mut inc = Contract::of(&sv);
             sv.grown.clear();
             // What the card holds, one vector an array.
@@ -1082,9 +1071,11 @@ mod tests {
                 assert_eq!(got(Dst::LevelNode), &inc.level_node, "level_node");
                 checked += 1;
 
+                sv.catch_up();
+
                 sv.step();
                 for _ in 0..4 {
-                    if !sv.expand_once(&mut rng) {
+                    if !sv.expand_once() {
                         break;
                     }
                 }
@@ -1101,11 +1092,7 @@ mod tests {
     #[test]
 
     fn extending_a_contract_equals_rebuilding_it() {
-        let nets = Nets {
-            value: random_net(0x5EED),
-            device: false,
-            gate: None,
-        };
+        let nets = Arc::new(Nets { value: random_net(0x5EED), device: false });
         let cfg = Cfg {
             s: 40,
             c: 4.0,
@@ -1125,17 +1112,17 @@ mod tests {
         let roots = collect_roots(3, 23, &nets, &gc, 3);
         assert!(!roots.is_empty(), "no roots to test against");
 
-        let mut rng = Rng::new(0xE47E);
         let mut checked = 0usize;
         for (s, belief) in &roots {
             let ctx = crate::pbs::Ctx::new(s);
-            let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
+            let mut sv = crate::search::Solver::new(s, ctx, Arc::clone(&nets), cfg, belief.clone(), Rng::new(0xD12E));
             let mut inc = Contract::of(&sv);
             sv.grown.clear();
             for t in 0..cfg.iters() {
+                sv.catch_up();
                 sv.step();
                 for _ in 0..4 {
-                    if !sv.expand_once(&mut rng) {
+                    if !sv.expand_once() {
                         break;
                     }
                 }
@@ -1229,11 +1216,7 @@ mod tests {
     #[test]
     fn the_gathered_backprop_reproduces_the_scatter_exactly() {
         use crate::search::Back;
-        let nets = Nets {
-            value: random_net(0x5EED),
-            device: false,
-            gate: None,
-        };
+        let nets = Arc::new(Nets { value: random_net(0x5EED), device: false });
         let cfg = Cfg {
             s: 32,
             c: 4.0,
@@ -1253,19 +1236,19 @@ mod tests {
         let roots = collect_roots(3, 11, &nets, &gc, 3);
         assert!(!roots.is_empty(), "no roots to test against");
 
-        let mut rng = Rng::new(0xB4CC);
         let mut checked = 0usize;
         for (s, belief) in &roots {
             let ctx = crate::pbs::Ctx::new(s);
-            let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
+            let mut sv = crate::search::Solver::new(s, ctx, Arc::clone(&nets), cfg, belief.clone(), Rng::new(0xD12E));
             for t in 0..cfg.iters() {
                 // Run whole iterations first, so the regrets and the running
                 // strategy sum are both non-trivial before anything is
                 // compared: a comparison against all-zero state proves nothing
                 // about the discount factors.
+                sv.catch_up();
                 sv.step();
                 for _ in 0..4 {
-                    if !sv.expand_once(&mut rng) {
+                    if !sv.expand_once() {
                         break;
                     }
                 }
@@ -1275,6 +1258,7 @@ mod tests {
                 }
 
                 let traverser = t % 2;
+                sv.catch_up();
                 sv.leaf_values(traverser);
                 let snap = (
                     sv.vals.clone(),

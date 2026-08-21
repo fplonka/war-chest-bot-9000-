@@ -14,6 +14,7 @@
 //! disagreement.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use warchest::pbs::*;
 use warchest::rng::Rng;
@@ -188,7 +189,7 @@ const CFG_CAP: usize = 3;
 
 #[test]
 fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
-    let nets = Nets::default();
+    let nets = Arc::new(Nets::default());
     let cfg = Cfg {
         s: 200,
         c: 1.0,
@@ -207,7 +208,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
             thinned(uniform_belief(&s, &ctx, 1), CFG_CAP),
         ];
 
-        let mut probe = Solver::new(&s, ctx, &nets, cfg, bel.clone());
+        let mut probe = Solver::new(&s, ctx, Arc::clone(&nets), cfg, bel.clone(), Rng::new(seed));
         if !probe.grow_full(NODE_CAP) {
             skipped[0] += 1;
             continue;
@@ -252,7 +253,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
         // unique, so any regret rule that converges must land on the same
         // number — which makes this the whole correctness net for the family.
         for (name, rule) in Cfr::NAMED {
-            let mut sv = Solver::new(&s, ctx, &nets, Cfg { cfr: rule, ..cfg }, bel.clone());
+            let mut sv = Solver::new(&s, ctx, Arc::clone(&nets), Cfg { cfr: rule, ..cfg }, bel.clone(), Rng::new(seed));
             assert!(sv.grow_full(NODE_CAP));
             // Exploitability early, before the solve has gone anywhere. Read
             // mid-flight on purpose: a fixed-policy pass must leave the solve
@@ -325,7 +326,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
 /// `exhausted` exists to stop.
 #[test]
 fn a_solve_stops_expanding_once_the_tree_is_exhausted() {
-    let nets = Nets::default();
+    let nets = Arc::new(Nets::default());
     // Far more expansions than the whole subgame holds.
     let cfg = Cfg { s: 4_000, c: 1.0, ..Default::default() };
     let mut checked = 0;
@@ -338,15 +339,21 @@ fn a_solve_stops_expanding_once_the_tree_is_exhausted() {
             thinned(uniform_belief(&s, &ctx, 0), CFG_CAP),
             thinned(uniform_belief(&s, &ctx, 1), CFG_CAP),
         ];
-        let mut probe = Solver::new(&s, ctx, &nets, cfg, bel.clone());
+        let mut probe = Solver::new(&s, ctx, Arc::clone(&nets), cfg, bel.clone(), Rng::new(seed));
         if !probe.grow_full(NODE_CAP) {
             continue;
         }
         let whole = probe.nodes.len();
 
-        let mut sv = Solver::new(&s, ctx, &nets, cfg, bel.clone());
-        let mut rng = Rng::new(0x5A17 + seed);
-        sv.solve(&mut rng);
+        let mut sv = Solver::new(
+            &s,
+            ctx,
+            Arc::clone(&nets),
+            cfg,
+            bel.clone(),
+            Rng::new(0x5A17 + seed),
+        );
+        sv.run_alone();
         assert!(
             sv.nodes[0].exhausted,
             "seed {seed}: {} of {whole} nodes grown and the root is still open",
@@ -359,7 +366,7 @@ fn a_solve_stops_expanding_once_the_tree_is_exhausted() {
         );
         // The budget that is left buys nothing and must not be spent.
         assert!(
-            !sv.expand_once(&mut rng),
+            !sv.expand_once(),
             "seed {seed}: an exhausted tree still handed back a leaf"
         );
         checked += 1;
@@ -428,7 +435,7 @@ fn draw_position(seed: u64, warmup: usize, plies: u16) -> Option<State> {
 /// brute-force enumeration in `pbs.rs`.
 #[test]
 fn draw_pass_through_consistency() {
-    let nets = Nets::default();
+    let nets = Arc::new(Nets::default());
     let mut checked = 0;
     let mut cnt = [0usize; 5]; // 0 rejected, 1 built, 2 toolarge, 3 nochance, 4 solved
     for seed in 0..4000u64 {
@@ -452,13 +459,10 @@ fn draw_pass_through_consistency() {
         let mut sv = Solver::new(
             &s,
             ctx,
-            &nets,
-            Cfg {
-                s: 80,
-                c: 1.0,
-                ..Default::default()
-            },
+            Arc::clone(&nets),
+            Cfg { s: 80, c: 1.0, ..Default::default() },
             bel.clone(),
+            Rng::new(seed),
         );
         if !sv.grow_full(20_000) {
             cnt[2] += 1;
@@ -563,7 +567,7 @@ fn draw_pass_through_consistency() {
 #[test]
 fn warrior_priest_draw_walks_through_the_tree() {
     use warchest::state::Z_BAG;
-    let nets = Nets::default();
+    let nets = Arc::new(Nets::default());
     // White: WP at W1, enemy at E1. Hand holds one WP coin (the trigger);
     // the bag holds a WP coin and a Swordsman coin, so a draw can leave
     // either of two pendings. The root belief carries two configs so the
@@ -601,13 +605,10 @@ fn warrior_priest_draw_walks_through_the_tree() {
     let mut sv = Solver::new(
         &s,
         ctx,
-        &nets,
-        Cfg {
-            s: 8,
-            c: 1.0,
-            ..Default::default()
-        },
+        Arc::clone(&nets),
+        Cfg { s: 8, c: 1.0, ..Default::default() },
         bel.clone(),
+        Rng::new(0x5EED),
     );
     assert!(sv.grow_full(20_000));
 
@@ -712,7 +713,7 @@ fn warrior_priest_draw_walks_through_the_tree() {
 
 #[test]
 fn growing_a_coin_play_finishes_its_micro_decisions() {
-    let nets = Nets::default();
+    let nets = Arc::new(Nets::default());
     let mut rng = Rng::new(1234);
     for _ in 0..400 {
         let mut s = make_game(&mut rng, false);
@@ -731,11 +732,10 @@ fn growing_a_coin_play_finishes_its_micro_decisions() {
                 let sv = Solver::new(
                     &s,
                     ctx,
-                    &nets,
-                    Cfg {
-                        ..Default::default()
-                    },
+                    Arc::clone(&nets),
+                    Cfg::default(),
                     bel,
+                    Rng::new(rng.next_u64()),
                 );
                 assert!(
                     sv.nodes

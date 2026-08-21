@@ -54,11 +54,7 @@ fn main() {
     let roots: usize = a.get(2).and_then(|x| x.parse().ok()).unwrap_or(32);
     let games: usize = a.get(3).and_then(|x| x.parse().ok()).unwrap_or(16);
 
-    let nets = Nets {
-        value: warchest::net::Net::load_bin(&weights).expect("weights file"),
-        device: false,
-        gate: None,
-    };
+    let nets = std::sync::Arc::new(Nets { value: warchest::net::Net::load_bin(&weights).expect("weights file"), device: false });
     let small = Cfg { s: 32, c: 4.0, cfr: Cfr::SOG, ..Default::default() };
     let gc = GameCfg {
         agents: [Agent::Sog { cfg: small }; 2],
@@ -98,9 +94,8 @@ fn main() {
         .enumerate()
         .map(|(i, (st, bel))| {
             let ctx = warchest::pbs::Ctx::new(st);
-            let mut sv = Solver::new(st, ctx, &nets, cfg_of(512, 8.0), bel.clone());
-            let mut rng = Rng::new(0x51D5 ^ i as u64);
-            sv.solve(&mut rng);
+            let mut sv = Solver::new(st, ctx, std::sync::Arc::clone(&nets), cfg_of(512, 8.0), bel.clone(), Rng::new(0x51D5 ^ i as u64));
+            sv.run_alone();
             let mut out = Vec::new();
             let mut done = 0usize;
             for &e in &EXTRA {
@@ -143,9 +138,8 @@ fn main() {
         .enumerate()
         .map(|(i, (st, bel))| {
             let ctx = warchest::pbs::Ctx::new(st);
-            let mut sv = Solver::new(st, ctx, &nets, cfg_of(512, 2.0), bel.clone());
-            let mut rng = Rng::new(0x51D5 ^ i as u64);
-            sv.solve(&mut rng);
+            let mut sv = Solver::new(st, ctx, std::sync::Arc::clone(&nets), cfg_of(512, 2.0), bel.clone(), Rng::new(0x51D5 ^ i as u64));
+            sv.run_alone();
             sv.multistep(768);
             sv.finish();
             Some(root_target(&mut sv))
@@ -161,9 +155,8 @@ fn main() {
             .map(|(i, (st, bel))| {
                 let Some(r) = refs[i] else { return (0.0, 0.0, 0.0) };
                 let ctx = warchest::pbs::Ctx::new(st);
-                let mut sv = Solver::new(st, ctx, &nets, cfg_of(s, c), bel.clone());
-                let mut rng = Rng::new(0x51D5 ^ i as u64);
-                sv.solve(&mut rng);
+                let mut sv = Solver::new(st, ctx, std::sync::Arc::clone(&nets), cfg_of(s, c), bel.clone(), Rng::new(0x51D5 ^ i as u64));
+                sv.run_alone();
                 let t = root_target(&mut sv);
                 (
                     ((t[0] - r[0]).abs() + (t[1] - r[1]).abs()) as f64 / 2.0,
@@ -199,9 +192,8 @@ fn main() {
             .map(|(i, (st, bel))| {
                 let Some(r) = refs[i] else { return (0.0, 0.0, 0.0) };
                 let ctx = warchest::pbs::Ctx::new(st);
-                let mut sv = Solver::new(st, ctx, &nets, cfg_temp(512, 8.0, temp), bel.clone());
-                let mut rng = Rng::new(0x51D5 ^ i as u64);
-                sv.solve(&mut rng);
+                let mut sv = Solver::new(st, ctx, std::sync::Arc::clone(&nets), cfg_temp(512, 8.0, temp), bel.clone(), Rng::new(0x51D5 ^ i as u64));
+                sv.run_alone();
                 let t = root_target(&mut sv);
                 let c = sv.nash_conv();
                 (

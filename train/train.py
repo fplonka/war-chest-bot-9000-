@@ -664,9 +664,9 @@ def main():
         nonlocal probe, cap_v, next_decay, next_snap, epoch, sog_solves
 
         deadline = t0 + total
-        # One process, many solver threads, one forward pass per round. A
-        # process per core could not batch inference at all: the solves have to
-        # share an address space for their leaf rows to end up in one batch.
+        # One process, one driver a card and a worker per core. A process per
+        # core could not batch inference at all: the solves have to share an
+        # address space for their leaf rows to end up in one batch.
         farm = warchest.SolveFarm(
             args.seed,
             args.gen_workers,
@@ -677,7 +677,6 @@ def main():
             cfr=args.cfr,
             query_rate=args.query_rate,
             recursive_rate=args.recursive_rate,
-            cohorts=args.gen_cohorts,
             devices=[int(d) for d in args.gen_devices.split(",")])
 
         optimizer_rows = 0

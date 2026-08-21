@@ -4,16 +4,17 @@
 //! of hundred rows and it wants one every CFR iteration. Student of Games says
 //! the same thing about its own actors — each runs several games at once and
 //! batches the network evaluations — so the unit of inference here is a *round*
-//! across every solve in flight, not a solve.
+//! across every solve that is ready, not a solve.
 //!
-//! The mechanism is a barrier. A solver thread submits its call and parks; when
-//! every live thread has parked, the driver takes the union as one batch, runs
-//! it, and wakes them together. A thread's own stack is its continuation, so
-//! the solver above this stays straight-line code and nothing in it knows a
-//! batch exists.
+//! A solve is a state machine, not a thread: it consumes the replies it was
+//! waiting for, does its host-side work, and says what it wants next. So it
+//! sits in one of two queues. One driver a card takes whatever is waiting on
+//! that card and runs it as one batch; a pool of workers, one per core, does
+//! the host side. Neither waits for the other, which is what lets one solve's
+//! growth overlap another's device work.
 //!
-//! Threads that leave (their solve ended) drop out of the count, so a round
-//! never waits on a thread that is gone.
+//! How many solves are in flight is a question about the card's memory, and it
+//! is asked of the card.
 
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,12 +24,12 @@ use std::time::Duration;
 
 use crate::net::{Net, C, CFGH, D, JW, POOL, TYPE};
 use crate::pbs::{Belief, CFEAT, LOOSE, NSLOT, NTYPE, PUBFEAT};
-use crate::search::{Cfg, Cfr};
-use crate::selfplay::{solve_root, Data, GameCfg, GameStream};
+use crate::search::{Cfg, Cfr, Solved, Solver, Step};
+use crate::selfplay::{Data, GameCfg, GameStream};
 use crate::state::State;
 use rayon::prelude::*;
 
-/// One thread's network work for this round.
+/// One solve's network work for this round.
 ///
 /// The three calls are the network's whole surface: the trunk over a new
 /// leaf's physical state, the encoder over a new config, and the join that
@@ -121,9 +122,6 @@ pub enum Call {
     Read {
         solve: usize,
         touched: [bool; 2],
-        /// Materialise the reference strategy first. A solve does this once,
-        /// as its last act; a harvest that follows reads what it left.
-        finish: bool,
         /// Slices of the device arenas the host wants back: the root's value
         /// row per player, the root's strategy cells, and the reach at each
         /// leaf the caller sampled. The host knows every offset from its own
@@ -305,267 +303,6 @@ impl Call {
     }
 }
 
-/// What one attempt at a round came to.
-pub enum Round {
-    /// A batch ran, carrying this many rows.
-    Ran(usize),
-    /// Nobody was ready inside the driver's patience.
-    Empty,
-}
-
-// The mailbox this thread reads its answers from, set for as long as it is a
-// member of the gate. A solver reaches `submit` through the shared `Nets`,
-// which cannot carry anything per-thread.
-thread_local! {
-    static SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
-    /// When this thread last came back from the gate. The span from there to
-    /// its next submission is its share of the host turnaround -- the thing a
-    /// round waits for, and the thing the cards are idle through.
-    static WOKE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
-}
-
-/// Nanoseconds solver threads spent between waking and parking again, and how
-/// many spans that is. A round waits for the slowest of them, so the mean and
-/// the count together say whether the wait is work or a tail.
-pub static AWAKE_NS: AtomicU64 = AtomicU64::new(0);
-pub static AWAKE_N: AtomicU64 = AtomicU64::new(0);
-pub static AWAKE_MAX: AtomicU64 = AtomicU64::new(0);
-
-/// Report and reset: total nanoseconds, spans, and the longest single one.
-pub fn awake() -> (u64, u64, u64) {
-    (
-        AWAKE_NS.swap(0, Ordering::Relaxed),
-        AWAKE_N.swap(0, Ordering::Relaxed),
-        AWAKE_MAX.swap(0, Ordering::Relaxed),
-    )
-}
-
-#[derive(Default)]
-struct Pending {
-    /// Threads currently running a solve, so currently able to park.
-    live: usize,
-    parked: usize,
-    /// Submitted and not yet taken by a round, each with the mailbox to answer.
-    calls: Vec<(usize, Call)>,
-    /// One mailbox per member. A thread reads only its own, so the driver may
-    /// publish the next round's answers while this one is still waking up —
-    /// which is the whole reason mailboxes are per thread and not per round.
-    mail: Vec<Option<Vec<Reply>>>,
-    /// Mailboxes of members that have left, to be handed out again.
-    free: Vec<usize>,
-    /// Set when the farm is winding down: parked threads wake and get nothing.
-    closed: bool,
-}
-
-pub struct Gate {
-    round: Mutex<Pending>,
-    /// Solvers to driver: everyone is parked.
-    full: Condvar,
-    /// Driver to solvers: the replies are in.
-    done: Condvar,
-}
-
-impl Default for Gate {
-    fn default() -> Self {
-        Gate {
-            round: Mutex::new(Pending::default()),
-            full: Condvar::new(),
-            done: Condvar::new(),
-        }
-    }
-}
-
-impl Gate {
-    /// Join the round count, and take a mailbox, for as long as the returned
-    /// guard lives.
-    pub fn enter(&self) -> Member<'_> {
-        let mut g = self.round.lock();
-        g.live += 1;
-        let slot = g.free.pop().unwrap_or_else(|| {
-            g.mail.push(None);
-            g.mail.len() - 1
-        });
-        SLOT.with(|s| s.set(slot));
-        Member { gate: self, slot }
-    }
-
-    /// Which mailbox this thread holds, which is also the solve it is running
-    /// for as long as it is running one.
-    pub fn slot() -> usize {
-        SLOT.with(|s| s.get())
-    }
-
-    /// Submit one call and park until the driver has answered it.
-    ///
-    /// Returns `None` only when the farm is closing, which is the one case a
-    /// caller cannot serve and must unwind from.
-    pub fn submit(&self, call: Call) -> Option<Reply> {
-        self.submit_all(vec![call]).map(|mut r| r.remove(0))
-    }
-
-    /// Submit several calls in one round.
-    ///
-    /// A GT-CFR iteration is two of these: the trunk and the config encoder
-    /// over what the last growth added, and then the tree and the iteration
-    /// itself. Parking twice an iteration rather than four times is the
-    /// difference between the barrier costing a tenth of a round and a fifth.
-    pub fn submit_all(&self, calls: Vec<Call>) -> Option<Vec<Reply>> {
-        if let Some(woke) = WOKE.with(|w| w.take()) {
-            let ns = woke.elapsed().as_nanos() as u64;
-            AWAKE_NS.fetch_add(ns, Ordering::Relaxed);
-            AWAKE_N.fetch_add(1, Ordering::Relaxed);
-            AWAKE_MAX.fetch_max(ns, Ordering::Relaxed);
-        }
-        let slot = SLOT.with(|s| s.get());
-        assert_ne!(slot, usize::MAX, "submitting from a thread that never entered");
-        let mut g = self.round.lock();
-        if g.closed {
-            return None;
-        }
-        for call in calls {
-            g.calls.push((slot, call));
-        }
-        g.parked += 1;
-        if g.parked == g.live {
-            self.full.notify_one();
-        }
-        while g.mail[slot].is_none() && !g.closed {
-            self.done.wait(&mut g);
-        }
-        let got = g.mail[slot].take();
-        WOKE.with(|w| w.set(Some(std::time::Instant::now())));
-        got
-    }
-
-    /// Wait for a full round, hand the calls to `eval`, publish what it
-    /// returns. Returns the rows the round carried, or `None` once closed.
-    pub fn round<F>(&self, eval: F) -> Option<usize>
-    where
-        F: FnOnce(&[Call]) -> Option<Vec<Reply>>,
-    {
-        self.serve(eval, false, None)
-    }
-
-    /// The same, but give up once no thread is left in the count. This is what
-    /// shutdown uses: threads finishing their last chunk still need their
-    /// rounds answered, and once they have all left there is nothing to wait
-    /// for.
-    pub fn serve_until_idle<F>(&self, eval: F) -> Option<usize>
-    where
-        F: FnOnce(&[Call]) -> Option<Vec<Reply>>,
-    {
-        self.serve(eval, true, None)
-    }
-
-    /// Wait up to `patience` for every thread to park, then run with whoever
-    /// is there.
-    ///
-    /// Waiting for all of them makes a round cost the *slowest* solve rather
-    /// than the average, and solve cost has a fat tail — a round-start
-    /// position with a broad belief is worth many ordinary ones. Measured, that
-    /// stall took generation from 100 solves/s to 49 inside ninety seconds.
-    /// A thread that misses a round simply joins the next one.
-    pub fn round_before<F>(&self, patience: Duration, eval: F) -> Round
-    where
-        F: FnOnce(&[Call]) -> Option<Vec<Reply>>,
-    {
-        self.serve(eval, false, Some(patience))
-            .map_or(Round::Empty, Round::Ran)
-    }
-
-    /// `eval` returns `None` when the round could not be answered at all --
-    /// the card is out of memory, or the driver is gone. Every thread in the
-    /// cohort is parked on this round, so there is no answer to give them and
-    /// no later round that will: the gate closes and they unwind. It used to
-    /// panic here instead, inside the lock and with the mailboxes unfilled,
-    /// which left the whole cohort parked for ever on an idle card.
-    fn serve<F>(&self, eval: F, exit_when_idle: bool, patience: Option<Duration>) -> Option<usize>
-    where
-        F: FnOnce(&[Call]) -> Option<Vec<Reply>>,
-    {
-        let deadline = patience.map(|p| std::time::Instant::now() + p);
-        let mut g = self.round.lock();
-        while !g.closed && (g.live == 0 || g.parked < g.live) {
-            if exit_when_idle && g.live == 0 {
-                return None;
-            }
-            match deadline {
-                None => self.full.wait(&mut g),
-                Some(t) => {
-                    if self.full.wait_until(&mut g, t).timed_out() {
-                        // Whoever is parked is a batch. Only give up if that
-                        // is nobody at all.
-                        if g.calls.is_empty() {
-                            return None;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-        if g.closed {
-            return None;
-        }
-        let (slots, calls): (Vec<usize>, Vec<Call>) = g.calls.drain(..).unzip();
-
-        // The lock is held across `eval` on purpose: every live thread is
-        // parked on `done`, so none of them wants it, and a thread just
-        // entering would otherwise take a mailbox this round is about to fill.
-        let rows = calls.iter().map(Call::rows).sum();
-        let Some(replies) = eval(&calls) else {
-            g.closed = true;
-            self.done.notify_all();
-            self.full.notify_all();
-            return None;
-        };
-        assert_eq!(replies.len(), calls.len(), "one reply per call");
-
-        // A thread may raise several calls in one round; its mailbox holds
-        // them in the order it submitted them.
-        for (slot, reply) in slots.into_iter().zip(replies) {
-            g.mail[slot].get_or_insert_with(Vec::new).push(reply);
-        }
-        g.parked = 0;
-        self.done.notify_all();
-        Some(rows)
-    }
-
-    /// Whether the gate has been closed, so a driver loop can stop.
-    pub fn round_closed(&self) -> bool {
-        self.round.lock().closed
-    }
-
-    /// Wake everyone and refuse further work.
-    pub fn close(&self) {
-        let mut g = self.round.lock();
-        g.closed = true;
-        self.full.notify_all();
-        self.done.notify_all();
-    }
-}
-
-/// Membership in the round count. A thread that leaves must stop being waited
-/// for, or the last round of a run never fills.
-pub struct Member<'a> {
-    gate: &'a Gate,
-    slot: usize,
-}
-
-impl Drop for Member<'_> {
-    fn drop(&mut self) {
-        let mut g = self.gate.round.lock();
-        g.live -= 1;
-        g.mail[self.slot] = None;
-        g.free.push(self.slot);
-        SLOT.with(|s| s.set(usize::MAX));
-        // The thread that just left may have been the one the round was
-        // waiting on — and if it was the last one out, a drain waiting for the
-        // count to reach zero has to be told, or it waits for ever.
-        if g.live == 0 || g.parked == g.live {
-            self.gate.full.notify_one();
-        }
-    }
-}
 
 /// A solve's card table: one row per seat view. Fixed at the draft, so it is
 /// built once per solve and every leaf of that solve reads it.
@@ -585,22 +322,42 @@ pub enum Backend {
 }
 
 impl Backend {
-    pub fn run(&self, calls: &[Call], #[allow(unused)] lane: usize) -> Option<Vec<Reply>> {
+    pub fn run(&self, calls: &[Call], #[allow(unused)] card: usize) -> Option<Vec<Reply>> {
         match self {
-            // Every call in a round is independent, and the solver threads
-            // that raised them are all parked, so the cores are free.
+            // Every call in a round is independent, and this is the only
+            // thread the reference backend has anything for.
             Backend::Reference(net) => Some(calls.par_iter().map(|c| c.run(net)).collect()),
             #[cfg(feature = "gpu")]
-            Backend::Cuda(d) => d.run(calls, lane),
+            Backend::Cuda(d) => d.run(calls, card),
         }
     }
 
-    /// How many cohorts of solves this backend serves at once.
-    pub fn lanes(&self) -> usize {
+    /// How many cards this backend has, and so how many drivers the farm runs.
+    pub fn cards(&self) -> usize {
         match self {
             Backend::Reference(_) => 1,
             #[cfg(feature = "gpu")]
-            Backend::Cuda(d) => d.lanes(),
+            Backend::Cuda(d) => d.cards(),
+        }
+    }
+
+    /// Device bytes one card's solve arenas hold right now.
+    pub fn held(&self, #[allow(unused)] card: usize) -> u64 {
+        match self {
+            Backend::Reference(_) => 0,
+            #[cfg(feature = "gpu")]
+            Backend::Cuda(d) => d.held(card),
+        }
+    }
+
+    /// What they may hold. The reference keeps nothing on any card -- a solve
+    /// it serves lives entirely in host memory -- so its solves in flight are
+    /// bounded by `ADMIT_PER_ROUND` and nothing else.
+    pub fn budget(&self, #[allow(unused)] card: usize) -> u64 {
+        match self {
+            Backend::Reference(_) => 0,
+            #[cfg(feature = "gpu")]
+            Backend::Cuda(d) => d.budget(card),
         }
     }
 
@@ -639,19 +396,92 @@ impl Backend {
     }
 }
 
-// ------------------------------------------------------------------- the farm
+
+/// Solves a job runs before it hands its rows over. Small enough that a
+/// publish is never more than this stale.
+const CHUNK_SOLVES: usize = 8;
+
+/// Solves one card will hold, however small they turn out to be. The real
+/// bound is `Backend::budget`, which is bytes.
+const MAX_IN_FLIGHT: usize = 4096;
+
+/// Solves one card admits between two of its rounds.
+///
+/// A solve's arenas are not allocated until its first round, so the level the
+/// admission reads is always a round behind what it has just let in. Letting
+/// them in a few at a time is what lets it catch up before it overshoots.
+const ADMIT_PER_ROUND: usize = 8;
+
+/// A queue with parked consumers, closed once when the farm winds down.
+struct Queue<T> {
+    q: Mutex<std::collections::VecDeque<T>>,
+    ready: Condvar,
+    closed: AtomicBool,
+}
+
+impl<T> Default for Queue<T> {
+    fn default() -> Self {
+        Queue {
+            q: Mutex::new(std::collections::VecDeque::new()),
+            ready: Condvar::new(),
+            closed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl<T> Queue<T> {
+    fn push(&self, x: T) {
+        self.q.lock().push_back(x);
+        self.ready.notify_one();
+    }
+
+    /// The oldest item, or `None` once the queue is closed and empty.
+    fn pop(&self) -> Option<T> {
+        let mut q = self.q.lock();
+        loop {
+            if let Some(x) = q.pop_front() {
+                return Some(x);
+            }
+            if self.closed.load(Ordering::Relaxed) {
+                return None;
+            }
+            self.ready.wait(&mut q);
+        }
+    }
+
+    /// Everything waiting, which is what a round is. Empty once the queue is
+    /// closed and empty.
+    fn drain(&self) -> Vec<T> {
+        let mut q = self.q.lock();
+        loop {
+            if !q.is_empty() {
+                return q.drain(..).collect();
+            }
+            if self.closed.load(Ordering::Relaxed) {
+                return Vec::new();
+            }
+            self.ready.wait(&mut q);
+        }
+    }
+
+    fn close(&self) {
+        let _held = self.q.lock();
+        self.closed.store(true, Ordering::Relaxed);
+        self.ready.notify_all();
+    }
+}
 
 /// What a solver thread does with its turn.
 ///
-/// `Play` is the run: threads play games forward and keep the rows. `Roots`
-/// is the bench, and it exists because the run cannot be measured. A solve's
-/// cost varies twenty-six fold with how far into a game its root sits, so a
-/// probe's rate moves by two-fold with nothing but which phase its threads
-/// happened to reach — 16.6, 16.2, 12.1 and 8.0 solves/s were measured across
-/// consecutive probes of one build. Cycling a corpus of roots sampled from a
-/// real run holds the *mix* of costs in flight stationary, which is the one
-/// property that makes two builds comparable in seconds rather than in half
-/// an hour.
+/// `Play` is the run: solves come from games played forward, and their rows are
+/// kept. `Roots` is the bench, and it exists because the run cannot be
+/// measured. A solve's cost varies twenty-six fold with how far into a game its
+/// root sits, so a probe's rate moves by two-fold with nothing but which phase
+/// its games happened to reach — 16.6, 16.2, 12.1 and 8.0 solves/s were
+/// measured across consecutive probes of one build. Cycling a corpus of roots
+/// sampled from a real run holds the *mix* of costs in flight stationary, which
+/// is the one property that makes two builds comparable in seconds rather than
+/// in half an hour.
 pub enum Work {
     Play(GameCfg),
     Roots {
@@ -661,134 +491,203 @@ pub enum Work {
     },
 }
 
+/// One job's side of `Work`: what it does between two solves.
+///
+/// A source hands out the next solve and takes the finished one back. What
+/// happens in between is a game, which is why this is a state machine and not
+/// a loop — the solve it is waiting on belongs to the farm, not to a thread.
+enum Source {
+    Play(GameStream),
+    /// Where in the corpus this job is, and its own random stream. Jobs are
+    /// interleaved and the corpus cycles, so the set of roots in flight is the
+    /// same at every moment of a bench and the same between two builds.
+    Roots { at: usize, step: usize, rng: crate::rng::Rng },
+}
+
+impl Source {
+    fn new(work: &Work, seed: u64, i: usize) -> Source {
+        match work {
+            Work::Play(gc) => Source::Play(GameStream::new(seed, *gc)),
+            Work::Roots { .. } => Source::Roots {
+                at: i,
+                step: 1,
+                rng: crate::rng::Rng::new(seed),
+            },
+        }
+    }
+
+    /// The next solve this source wants run.
+    fn next(&mut self, work: &Work, nets: &Arc<crate::search::Nets>, out: &mut Data) -> Solver {
+        match (self, work) {
+            (Source::Play(stream), _) => stream.next_solve(nets, out),
+            (Source::Roots { at, step, rng }, Work::Roots { roots, cfg, recursive_rate }) => {
+                let (s, bel) = &roots[*at % roots.len()];
+                *at += *step;
+                crate::selfplay::query_solver(nets, *cfg, *recursive_rate, s, bel, rng)
+            }
+            (Source::Roots { .. }, Work::Play(_)) => unreachable!("a source matches its work"),
+        }
+    }
+
+    /// Take the finished solve back and keep what it produced.
+    fn take(&mut self, sv: &Solver, solved: Option<Solved>, out: &mut Data) {
+        match self {
+            Source::Play(stream) => stream.keep(sv, solved, out),
+            // A bench root is solved for its own row and nothing follows it.
+            Source::Roots { .. } => {
+                crate::selfplay::keep_query(sv, solved, out);
+            }
+        }
+    }
+}
+
+/// One solve in flight, and everything that outlives it.
+struct Job {
+    source: Source,
+    solver: Solver,
+    /// The card that holds this solve's arenas, and which of its slots. A card
+    /// keeps a solve's board vectors between its rounds, so both are fixed for
+    /// as long as the job lives.
+    card: usize,
+    slot: usize,
+    /// What the last round gave back, waiting for the host work that reads it.
+    replies: Vec<Reply>,
+    /// Rows this job has produced since it last handed any over.
+    data: Data,
+}
+
 /// Many solves in flight in one process, and one thing that evaluates for all
 /// of them.
 ///
-/// Threads equal cores: a round runs when every one of them has parked, so a
-/// thread that is still computing holds the others up, and oversubscribing
-/// would make that worse rather than better. What the parked cores cost is the
-/// batch itself, which is short next to the CFR work between rounds.
+/// Two kinds of thread. One driver a card takes whatever solves are waiting on
+/// that card, runs their calls as one batch, and hands the replies back. A pool
+/// of workers, one per core, does the host side: growth, which is the game's
+/// rules, and the game around it. Neither ever waits for the other, so one
+/// solve's growth overlaps another's device work — which a barrier could not
+/// do, because it made a round cost whatever its slowest member cost.
 pub struct Farm {
-    /// One gate a cohort. A cohort's threads all park together and its round
-    /// runs on its own lane of the device, so while one cohort's kernels are in
-    /// flight the other's threads are awake growing trees and its driver is
-    /// marshalling. The driver is busy about ninety per cent of a round and
-    /// only a third of that is waiting for the card; two cohorts let each fill
-    /// the other's gap.
-    gates: Vec<Arc<Gate>>,
-    /// Shared because every cohort evaluates against it, and locked because a
+    /// One queue a card: solves whose next round that card must run.
+    device: Vec<Arc<Queue<(Job, Vec<Call>)>>>,
+    /// Solves whose replies are in and whose host work wants a core.
+    ready: Arc<Queue<Job>>,
+    /// Shared because every card evaluates against it, and locked because a
     /// publish rewrites the weights under them.
     backend: Arc<RwLock<Backend>>,
-    /// One per cohort: a thread has to be told its own gate.
-    nets: Vec<Arc<RwLock<Arc<crate::search::Nets>>>>,
+    /// The copy a solve reads for the work it still does itself. Replaced
+    /// whole, so a solve that has started keeps the weights it started with.
+    nets: Arc<RwLock<Arc<crate::search::Nets>>>,
     collected: Arc<Mutex<Vec<Data>>>,
     workers: Vec<JoinHandle<()>>,
     drivers: Vec<JoinHandle<()>>,
     stopping: Arc<AtomicBool>,
+    broken: Arc<AtomicBool>,
     stats: Arc<Stats>,
 }
 
 /// What the rounds carried, for the utilisation report. Calls per round is the
-/// number that matters: it is how many solves shared a forward pass, and it
-/// should sit at the cohort's thread count.
+/// number that matters: it is how many solves shared a forward pass.
 #[derive(Default)]
 pub struct Stats {
-    pub rounds: std::sync::atomic::AtomicU64,
-    pub rows: std::sync::atomic::AtomicU64,
-    pub calls: std::sync::atomic::AtomicU64,
+    pub rounds: AtomicU64,
+    pub rows: AtomicU64,
+    pub calls: AtomicU64,
     /// Time inside the backend. Against wall clock this says how much of a
     /// round is the batch and how much is everything around it.
-    pub nanos: std::sync::atomic::AtomicU64,
+    pub nanos: AtomicU64,
 }
 
 impl Farm {
-    /// Start `threads` solver threads in each of the backend's lanes. They
-    /// block on their first round until rows are asked for.
-    pub fn new(seed: u64, threads: usize, work: Work, backend: Backend) -> Farm {
-        assert!(threads > 0, "a farm needs at least one thread");
-        let cohorts = backend.lanes();
+    /// Start `workers` host threads and one driver per card.
+    ///
+    /// How many solves are in flight is not settled here. Each card admits
+    /// them as its own memory allows, which is the only bound that means
+    /// anything: a solve's cost varies twenty-six fold with how far into a game
+    /// its root sits, so no thread count describes what fits.
+    pub fn new(seed: u64, workers: usize, work: Work, backend: Backend) -> Farm {
+        assert!(workers > 0, "a farm needs at least one worker");
+        let cards = backend.cards();
         let work = Arc::new(work);
-        let value = backend.net().clone();
-        let device = backend.keeps_the_solve();
-        let gates: Vec<Arc<Gate>> = (0..cohorts).map(|_| Arc::new(Gate::default())).collect();
-        let nets: Vec<_> = gates
-            .iter()
-            .map(|g| {
-                Arc::new(RwLock::new(Arc::new(crate::search::Nets {
-                    value: value.clone(),
-                    device,
-                    gate: Some(Arc::clone(g)),
-                })))
-            })
-            .collect();
+        let nets = Arc::new(RwLock::new(Arc::new(crate::search::Nets {
+            value: backend.net().clone(),
+            device: backend.keeps_the_solve(),
+        })));
+        let ready = Arc::new(Queue::default());
+        let device: Vec<Arc<Queue<(Job, Vec<Call>)>>> =
+            (0..cards).map(|_| Arc::new(Queue::default())).collect();
         let collected = Arc::new(Mutex::new(Vec::new()));
         let stopping = Arc::new(AtomicBool::new(false));
+        let broken = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(Stats::default());
         let backend = Arc::new(RwLock::new(backend));
-        let workers = (0..cohorts * threads)
-            .map(|i| {
-                let (c, t) = (i / threads, i % threads);
-                let (gate, nets, collected, stopping, work) = (
-                    Arc::clone(&gates[c]),
-                    Arc::clone(&nets[c]),
+
+        let hands: Vec<JoinHandle<()>> = (0..workers)
+            .map(|t| {
+                let (ready, device, nets, collected, work, stopping) = (
+                    Arc::clone(&ready),
+                    device.clone(),
+                    Arc::clone(&nets),
                     Arc::clone(&collected),
-                    Arc::clone(&stopping),
                     Arc::clone(&work),
+                    Arc::clone(&stopping),
                 );
-                let seed = seed.wrapping_mul(0x9E37_79B9) ^ i as u64;
                 std::thread::Builder::new()
-                    .name(format!("solve-{c}-{t}"))
+                    .name(format!("host-{t}"))
                     .spawn(move || {
-                        let _member = gate.enter();
-                        let mut source = Source::new(&work, seed, i, cohorts * threads);
-                        while !stopping.load(Ordering::Relaxed) {
-                            // One chunk is small so a `drive` call can end
-                            // near the row count it was asked for, and so a
-                            // publish lands between chunks rather than inside
-                            // a solve.
-                            let n = Arc::clone(&*nets.read());
-                            let d = source.chunk(&work, &n);
-                            collected.lock().push(d);
+                        while let Some(job) = ready.pop() {
+                            advance_job(job, &device, &nets, &work, &collected, &stopping);
                         }
                     })
-                    .expect("spawn solver thread")
+                    .expect("spawn host thread")
             })
             .collect();
-        let drivers = (0..cohorts)
+
+        let drivers = (0..cards)
             .map(|c| {
-                let (gate, backend, stats, stopping) = (
-                    Arc::clone(&gates[c]),
+                let (queue, ready, backend, nets, work, stats, broken) = (
+                    Arc::clone(&device[c]),
+                    Arc::clone(&ready),
                     Arc::clone(&backend),
+                    Arc::clone(&nets),
+                    Arc::clone(&work),
                     Arc::clone(&stats),
-                    Arc::clone(&stopping),
+                    Arc::clone(&broken),
                 );
+                let seed = seed.wrapping_mul(0x9E37_79B9) ^ c as u64;
                 std::thread::Builder::new()
-                    .name(format!("round-{c}"))
-                    .spawn(move || drive_cohort(&gate, &backend, c, &stats, &stopping))
+                    .name(format!("card-{c}"))
+                    .spawn(move || {
+                        drive_card(c, cards, seed, &queue, &ready, &backend, &nets, &work, &stats, &broken)
+                    })
                     .expect("spawn driver thread")
             })
             .collect();
-        Farm { gates, backend, nets, collected, workers, drivers, stopping, stats }
+
+        Farm {
+            device,
+            ready,
+            backend,
+            nets,
+            collected,
+            workers: hands,
+            drivers,
+            stopping,
+            broken,
+            stats,
+        }
     }
 
-    /// Install new weights, in the backend and in the copy the solver threads
-    /// keep for the readout. The write lock waits for every cohort's round in
-    /// flight, so no solve is ever evaluated against two different networks.
+    /// Install new weights, in the backend and in the copy a solve keeps for
+    /// the work it does itself. The write lock waits for every round in flight,
+    /// so no round is ever evaluated against two different networks.
     pub fn publish(&mut self, net: Net) -> Result<(), String> {
         self.backend.write().set_net(net.clone())?;
         let device = self.backend.read().keeps_the_solve();
-        for (n, g) in self.nets.iter().zip(&self.gates) {
-            *n.write() = Arc::new(crate::search::Nets {
-                value: net.clone(),
-                device,
-                gate: Some(Arc::clone(g)),
-            });
-        }
+        *self.nets.write() = Arc::new(crate::search::Nets { value: net, device });
         Ok(())
     }
 
-    /// Wait until the cohorts have produced at least `solves` rows, then hand
-    /// over everything they produced. The rounds run on their own threads.
+    /// Wait until the farm has produced at least `solves` rows, then hand over
+    /// everything it produced.
     pub fn drive(&mut self, solves: usize) -> Data {
         let mut out = Data::default();
         loop {
@@ -798,92 +697,46 @@ impl Farm {
             if out.soff.len() >= solves {
                 return out;
             }
-            // A gate closes when a round could not be answered: the card is
-            // out of memory, or gone. Its cohort's solves die with it, so
+            // A card that could not answer a round takes its solves with it, so
             // waiting for them is waiting for ever -- which is what a run did
             // when a card filled, silently, with the panic printed to a log
             // nobody was reading.
-            if self.stopping.load(Ordering::Relaxed)
-                || self.gates.iter().all(|g| g.round_closed())
-            {
+            if self.stopping.load(Ordering::Relaxed) || self.broken.load(Ordering::Relaxed) {
                 return out;
             }
-            // Parked, not spinning. With a cohort a lane and the solver threads
-            // outnumbering the cores several times over, a caller busy-waiting
-            // here is a core taken from the work it is waiting for.
+            // Parked, not spinning: a core busy-waiting here is a core taken
+            // from the work it is waiting for.
             std::thread::sleep(Duration::from_micros(200));
         }
     }
 
-    /// Whether a cohort has lost its gate, which only happens when a round
-    /// could not be answered at all.
+    /// Whether a card failed a round, which is not recoverable.
     pub fn broken(&self) -> bool {
-        self.gates.iter().any(|g| g.round_closed())
+        self.broken.load(Ordering::Relaxed)
     }
 
     pub fn stats(&self) -> &Stats {
         &self.stats
     }
 
-    /// The network the drivers evaluate with.
+    /// The network the farm evaluates with.
     pub fn value(&self) -> Arc<crate::search::Nets> {
-        Arc::clone(&*self.nets[0].read())
-    }
-}
-
-/// One cohort's rounds, until the farm winds down.
-fn drive_cohort(
-    gate: &Gate,
-    backend: &RwLock<Backend>,
-    lane: usize,
-    stats: &Stats,
-    stopping: &AtomicBool,
-) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let mut patience = PATIENCE_MIN;
-    loop {
-        if stopping.load(Relaxed) {
-            // Threads finishing their last chunk still need their rounds
-            // answered; once they have all left there is nothing to wait for.
-            let b = backend.read();
-            if gate.serve_until_idle(|calls| b.run(calls, lane)).is_none() {
-                return;
-            }
-            continue;
-        }
-        let (mut spent, mut seen) = (Duration::ZERO, 0usize);
-        let ran = {
-            let b = backend.read();
-            gate.round_before(patience, |calls| {
-                seen = calls.len();
-                let at = std::time::Instant::now();
-                let replies = b.run(calls, lane);
-                spent = at.elapsed();
-                replies
-            })
-        };
-        if let Round::Ran(rows) = ran {
-            stats.rounds.fetch_add(1, Relaxed);
-            stats.rows.fetch_add(rows as u64, Relaxed);
-            stats.calls.fetch_add(seen as u64, Relaxed);
-            stats.nanos.fetch_add(spent.as_nanos() as u64, Relaxed);
-            patience = spent.clamp(PATIENCE_MIN, PATIENCE_MAX);
-        }
+        Arc::clone(&*self.nets.read())
     }
 }
 
 impl Drop for Farm {
     fn drop(&mut self) {
-        // Ask the threads to stop; the drivers keep answering rounds until
-        // every thread has finished the chunk it was in and left the count.
-        // Closing a gate first would strand whoever was parked, and they would
-        // unwind out of a solve instead of ending one.
+        // Close the host side first and let the cards answer whatever is still
+        // in their queues, so no worker is left parked on a round that will
+        // never come back.
         self.stopping.store(true, Ordering::Relaxed);
+        self.ready.close();
         for w in self.workers.drain(..) {
             let _ = w.join();
         }
-        for g in &self.gates {
-            g.close();
+        for q in &self.device {
+            q.close();
         }
         for d in self.drivers.drain(..) {
             let _ = d.join();
@@ -891,69 +744,230 @@ impl Drop for Farm {
     }
 }
 
-/// One thread's side of `Work`: the state it carries between chunks.
-enum Source {
-    Play(GameStream),
-    /// Where in the corpus this thread is, and its own random stream. Threads
-    /// are interleaved and the corpus cycles, so the set of roots in flight is
-    /// the same at every moment of a bench and the same between two builds.
-    Roots { at: usize, step: usize, rng: crate::rng::Rng },
-}
-
-impl Source {
-    fn new(work: &Work, seed: u64, t: usize, threads: usize) -> Source {
-        match work {
-            Work::Play(gc) => Source::Play(GameStream::new(seed, *gc)),
-            Work::Roots { .. } => Source::Roots {
-                at: t,
-                step: threads,
-                rng: crate::rng::Rng::new(seed),
-            },
-        }
-    }
-
-    fn chunk(&mut self, work: &Work, nets: &crate::search::Nets) -> Data {
-        match (self, work) {
-            (Source::Play(stream), _) => stream.generate(nets, CHUNK_SOLVES),
-            (Source::Roots { at, step, rng }, Work::Roots { roots, cfg, recursive_rate }) => {
-                let mut out = Data::default();
-                // Bounded by attempts, not by rows: a root whose belief is over
-                // the config cap yields nothing, and a corpus of those would
-                // otherwise spin here for ever.
-                for _ in 0..2 * CHUNK_SOLVES {
-                    if out.soff.len() >= CHUNK_SOLVES {
-                        break;
-                    }
-                    let (s, bel) = &roots[*at % roots.len()];
-                    *at += *step;
-                    solve_root(nets, *cfg, *recursive_rate, s, bel, rng, &mut out);
+/// One job's turn on the host: consume the last round's replies, do the growth
+/// they made possible, and hand the job to its card.
+///
+/// A solve that finishes is replaced here rather than through the queue, and a
+/// solve that wants nothing from the card -- which is every solve when there
+/// are no weights yet -- runs to its end without ever leaving this loop.
+fn advance_job(
+    mut job: Job,
+    device: &[Arc<Queue<(Job, Vec<Call>)>>],
+    nets: &RwLock<Arc<crate::search::Nets>>,
+    work: &Work,
+    collected: &Mutex<Vec<Data>>,
+    stopping: &AtomicBool,
+) {
+    let mut replies = std::mem::take(&mut job.replies);
+    loop {
+        match job.solver.advance(&replies) {
+            Step::Calls(calls) => return device[job.card].push((job, calls)),
+            Step::Done(solved) => {
+                job.source.take(&job.solver, solved, &mut job.data);
+                if stopping.load(Ordering::Relaxed) || job.data.soff.len() >= CHUNK_SOLVES {
+                    collected.lock().push(std::mem::take(&mut job.data));
                 }
-                out
+                if stopping.load(Ordering::Relaxed) {
+                    return;
+                }
+                // A publish lands between two solves rather than inside one.
+                let n = Arc::clone(&*nets.read());
+                job.solver = job.source.next(work, &n, &mut job.data);
+                job.solver.pin(job.slot);
+                replies = Vec::new();
             }
-            (Source::Roots { .. }, Work::Play(_)) => unreachable!("a source matches its work"),
         }
     }
 }
 
-/// Solves a thread runs before it hands its rows over and re-reads the
-/// network. Small enough that a publish is never more than this stale.
-const CHUNK_SOLVES: usize = 8;
+/// One card's rounds, and the solves it admits between them.
+#[allow(clippy::too_many_arguments)]
+fn drive_card(
+    card: usize,
+    cards: usize,
+    seed: u64,
+    queue: &Queue<(Job, Vec<Call>)>,
+    ready: &Queue<Job>,
+    backend: &RwLock<Backend>,
+    nets: &RwLock<Arc<crate::search::Nets>>,
+    work: &Work,
+    stats: &Stats,
+    broken: &AtomicBool,
+) {
+    let budget = backend.read().budget(card);
+    let mut live = 0usize;
+    loop {
+        // Solves this card has room for, admitted between rounds and never
+        // retired. A solve's cost varies twenty-six fold with how far into a
+        // game its root sits, so how many fit is a question about bytes and
+        // the card is the only thing that can answer it.
+        if live == 0 || backend.read().held(card) < budget {
+            for _ in 0..ADMIT_PER_ROUND {
+                if live >= MAX_IN_FLIGHT {
+                    break;
+                }
+                let mut source = Source::new(
+                    work,
+                    seed ^ (live as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                    live * cards + card,
+                );
+                let mut data = Data::default();
+                let n = Arc::clone(&*nets.read());
+                let mut solver = source.next(work, &n, &mut data);
+                solver.pin(live);
+                ready.push(Job { source, solver, card, slot: live, replies: Vec::new(), data });
+                live += 1;
+            }
+        }
+        let batch = queue.drain();
+        if batch.is_empty() {
+            return;
+        }
+        let mut jobs = Vec::with_capacity(batch.len());
+        let mut spans = Vec::with_capacity(batch.len());
+        let mut calls: Vec<Call> = Vec::new();
+        for (job, cs) in batch {
+            spans.push(cs.len());
+            calls.extend(cs);
+            jobs.push(job);
+        }
+        let at = std::time::Instant::now();
+        let answered = backend.read().run(&calls, card);
+        let spent = at.elapsed();
+        let Some(replies) = answered else {
+            // Not recoverable: the card is out of memory, or gone. Every solve
+            // it holds dies with it, so say so rather than leave the caller
+            // waiting for rows that will never come.
+            broken.store(true, Ordering::Relaxed);
+            return;
+        };
+        assert_eq!(replies.len(), calls.len(), "one reply per call");
+        stats.rounds.fetch_add(1, Ordering::Relaxed);
+        stats.rows.fetch_add(calls.iter().map(Call::rows).sum::<usize>() as u64, Ordering::Relaxed);
+        stats.calls.fetch_add(calls.len() as u64, Ordering::Relaxed);
+        stats.nanos.fetch_add(spent.as_nanos() as u64, Ordering::Relaxed);
+        let mut rest = replies;
+        for (mut job, n) in jobs.into_iter().zip(spans) {
+            let tail = rest.split_off(n);
+            job.replies = rest;
+            rest = tail;
+            ready.push(job);
+        }
+    }
+}
 
-/// How long a driver waits for a round to fill before running with whoever is
-/// there.
+
+// ---------------------------------------------------------- a blocking client
+
+/// One card's rounds, for callers that block on a whole solve.
 ///
-/// It cannot be a small constant. A thread woken by a round does its share of
-/// the host work -- growing the leaves the expansion sampled -- before it can
-/// park again, and that is milliseconds. A patience shorter than it fires the
-/// next round with only the threads whose work happened to be trivial, so a
-/// round of seventy-two threads carried twenty-seven and the cards saw a
-/// batch a third of the size they should.
-///
-/// So it tracks what a round costs instead. Waiting for a full round can never
-/// cost more than running a partial one did, and when the host work is short
-/// the wait ends early anyway because everyone has parked.
-const PATIENCE_MIN: Duration = Duration::from_millis(2);
-const PATIENCE_MAX: Duration = Duration::from_millis(50);
+/// The farm's solves are state machines because there are far more of them than
+/// there are cores. A bot is the other shape: one game per thread, nothing to
+/// remember between two solves, and a thread that is willing to wait. So the
+/// thread's own stack is its continuation — it puts its calls on a card's queue
+/// and waits for the round that carries them, which is shared with every other
+/// thread that was ready at the same moment.
+pub struct Cards {
+    queues: Vec<Arc<Queue<Ask>>>,
+    /// Solve slots nobody is using. A card keeps a solve's arenas while it
+    /// runs, so two solves must never share one, and the number handed out is
+    /// therefore the number of threads that solve at once.
+    free: Mutex<Vec<(usize, usize)>>,
+    next: Mutex<usize>,
+    drivers: Vec<JoinHandle<()>>,
+}
+
+/// One thread's calls, and where to send the replies.
+struct Ask {
+    calls: Vec<Call>,
+    back: std::sync::mpsc::Sender<Vec<Reply>>,
+}
+
+/// A card and one of its solve slots, held for one solve and given back when
+/// this is dropped.
+pub struct Seat<'a> {
+    cards: &'a Cards,
+    pub card: usize,
+    pub slot: usize,
+}
+
+impl Drop for Seat<'_> {
+    fn drop(&mut self) {
+        self.cards.free.lock().push((self.card, self.slot));
+    }
+}
+
+impl Cards {
+    pub fn new(backend: Backend) -> Cards {
+        let n = backend.cards();
+        let backend = Arc::new(backend);
+        let queues: Vec<Arc<Queue<Ask>>> = (0..n).map(|_| Arc::new(Queue::default())).collect();
+        let drivers = (0..n)
+            .map(|c| {
+                let (queue, backend) = (Arc::clone(&queues[c]), Arc::clone(&backend));
+                std::thread::Builder::new()
+                    .name(format!("card-{c}"))
+                    .spawn(move || loop {
+                        let batch = queue.drain();
+                        if batch.is_empty() {
+                            return;
+                        }
+                        let mut backs = Vec::with_capacity(batch.len());
+                        let mut spans = Vec::with_capacity(batch.len());
+                        let mut calls: Vec<Call> = Vec::new();
+                        for ask in batch {
+                            spans.push(ask.calls.len());
+                            calls.extend(ask.calls);
+                            backs.push(ask.back);
+                        }
+                        // A card that cannot answer takes its solves with it.
+                        // Dropping the senders is what tells them.
+                        let Some(replies) = backend.run(&calls, c) else {
+                            return;
+                        };
+                        let mut rest = replies;
+                        for (back, n) in backs.into_iter().zip(spans) {
+                            let tail = rest.split_off(n);
+                            let _ = back.send(rest);
+                            rest = tail;
+                        }
+                    })
+                    .expect("spawn driver thread")
+            })
+            .collect();
+        Cards { queues, free: Mutex::new(Vec::new()), next: Mutex::new(0), drivers }
+    }
+
+    /// Take a card and one of its solve slots for the length of one solve.
+    pub fn seat(&self) -> Seat<'_> {
+        let (card, slot) = self.free.lock().pop().unwrap_or_else(|| {
+            let mut next = self.next.lock();
+            let taken = *next;
+            *next += 1;
+            (taken % self.queues.len(), taken / self.queues.len())
+        });
+        Seat { cards: self, card, slot }
+    }
+
+    /// Run these calls in the next round of `card`, and wait for them.
+    /// `None` once the card is gone, which is not recoverable.
+    pub fn round(&self, card: usize, calls: Vec<Call>) -> Option<Vec<Reply>> {
+        let (back, replies) = std::sync::mpsc::channel();
+        self.queues[card].push(Ask { calls, back });
+        replies.recv().ok()
+    }
+}
+
+impl Drop for Cards {
+    fn drop(&mut self) {
+        for q in &self.queues {
+            q.close();
+        }
+        for d in self.drivers.drain(..) {
+            let _ = d.join();
+        }
+    }
+}
 
 /// Shapes the driver needs to lay a batch out. Kept here so the device code
 /// and the CPU reference agree on them by construction.
@@ -972,7 +986,7 @@ pub const CFG_HIDDEN: usize = CFGH;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use crate::selfplay::{Agent, Collect};
 
     /// Small random weights, so the network actually makes calls rather than
     /// being skipped as absent.
@@ -990,143 +1004,14 @@ mod tests {
         Net::from_flat(&w, &b, &ln).expect("small net")
     }
 
-    /// A call whose reply is a function of its own contents, so a thread can
-    /// tell its own answer from anybody else's.
-    fn tagged(tag: usize) -> Call {
-        Call::Configs {
-            solve: 0,
-            at: tag,
-            phi: Vec::new(),
-            owner: Vec::new(),
-            cards: Vec::new(),
-            n: tag,
-        }
-    }
-
-    fn tag_of(c: &Call) -> f32 {
-        match c {
-            Call::Configs { at, .. } => *at as f32,
-            _ => unreachable!(),
-        }
-    }
-
-    /// Every thread must get back the reply to its own call, round after
-    /// round, and threads that finish at different times must not strand the
-    /// ones still running.
+    /// Many solves in flight, one thing that evaluates for all of them: the
+    /// farm must produce well-formed rows, share a round between solves, and
+    /// shut down without stranding anyone.
     #[test]
-    fn a_round_answers_every_thread_with_its_own_reply() {
-        const THREADS: usize = 8;
-        let gate = Arc::new(Gate::default());
-        let workers: Vec<_> = (0..THREADS)
-            .map(|t| {
-                let gate = Arc::clone(&gate);
-                // Staggered lengths: thread `t` leaves after `t + 1` rounds,
-                // so the round count shrinks under the driver.
-                std::thread::spawn(move || {
-                    let _member = gate.enter();
-                    for r in 0..=t {
-                        let tag = 1 + t * 100 + r;
-                        let reply = gate.submit(tagged(tag)).expect("open gate");
-                        assert_eq!(
-                            reply.a[0], tag as f32,
-                            "thread {t} round {r} got another thread's reply"
-                        );
-                    }
-                })
-            })
-            .collect();
-
-        let driver = {
-            let gate = Arc::clone(&gate);
-            std::thread::spawn(move || {
-                let mut rounds = 0usize;
-                while gate
-                    .round(|calls| Some(calls.iter().map(|c| Reply { a: vec![tag_of(c)], ..Default::default() }).collect()))
-                    .is_some()
-                {
-                    rounds += 1;
-                }
-                rounds
-            })
-        };
-
-        for w in workers {
-            w.join().expect("worker");
-        }
-        gate.close();
-        let rounds = driver.join().expect("driver");
-        // The longest-lived thread submits THREADS times, and every round it
-        // takes part in is a round.
-        assert!(rounds >= THREADS, "only {rounds} rounds for {THREADS} threads");
-    }
-
-    /// The same, under the driver the farm actually uses.
-    ///
-    /// `round_before` serves whoever is parked when its patience runs out, so
-    /// rounds are partial and the ticket a thread holds means something
-    /// different from one round to the next. A thread slow to wake used to
-    /// read the *next* round's replies at its own ticket and get another
-    /// solve's answer. Uneven work between submits makes rounds partial, and
-    /// the tag says whose answer arrived.
-    #[test]
-    fn a_partial_round_still_answers_every_thread_with_its_own_reply() {
-        const THREADS: usize = 200;
-        const ROUNDS: usize = 200;
-        let gate = Arc::new(Gate::default());
-        let workers: Vec<_> = (0..THREADS)
-            .map(|t| {
-                let gate = Arc::clone(&gate);
-                std::thread::spawn(move || {
-                    let _member = gate.enter();
-                    for r in 0..ROUNDS {
-                        let tag = 1 + t * ROUNDS + r;
-                        let reply = gate.submit(tagged(tag)).expect("open gate");
-                        assert_eq!(
-                            reply.a[0], tag as f32,
-                            "thread {t} round {r} got another thread's reply"
-                        );
-                        // Different threads take different times to come back,
-                        // so the driver's patience expires on a partial round.
-                        for _ in 0..(t * 37) % 91 {
-                            std::hint::spin_loop();
-                        }
-                    }
-                })
-            })
-            .collect();
-
-        let driver = {
-            let gate = Arc::clone(&gate);
-            std::thread::spawn(move || {
-                while !gate.round_closed() {
-                    gate.round_before(Duration::from_micros(200), |calls| {
-                        Some(
-                            calls
-                                .iter()
-                                .map(|c| Reply { a: vec![tag_of(c)], ..Default::default() })
-                                .collect(),
-                        )
-                    });
-                }
-            })
-        };
-
-        for w in workers {
-            w.join().expect("worker");
-        }
-        gate.close();
-        driver.join().expect("driver");
-    }
-
-    /// Many threads, one evaluator: the farm must produce well-formed rows and
-    /// shut down without stranding anyone. Batches larger than one call are
-    /// the whole point, so the round size is checked too.
-    #[test]
-    fn a_farm_batches_many_threads_into_one_round() {
-        use crate::selfplay::{Agent, Collect};
-        const THREADS: usize = 6;
+    fn a_farm_batches_many_solves_into_one_round() {
+        const WORKERS: usize = 4;
         let cfg = crate::search::Cfg { s: 8, c: 1.0, ..Default::default() };
-        let gc = crate::selfplay::GameCfg {
+        let gc = GameCfg {
             agents: [Agent::Sog { cfg }; 2],
             collect: Collect::Sog,
             explore: 0.1,
@@ -1135,41 +1020,18 @@ mod tests {
             query_rate: 0.9,
             recursive_rate: 0.1,
         };
-        let mut farm = Farm::new(5, THREADS, Work::Play(gc), Backend::Reference(small_net(0x2E57)));
+        let mut farm = Farm::new(5, WORKERS, Work::Play(gc), Backend::Reference(small_net(0x2E57)));
         let data = farm.drive(48);
         assert!(data.soff.len() >= 48, "only {} solves", data.soff.len());
         assert_eq!(data.nv, data.soff.len(), "a solve must store one row");
         assert_eq!(data.coff.len(), 2 * data.nv + 1, "ragged arena is malformed");
-        let read = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed) as f64;
+        let read = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64;
         let s = farm.stats();
         assert!(read(&s.rounds) > 0.0, "no round ever ran");
-        // The whole point: a round is one forward pass shared by every thread
-        // that is running a solve, not one pass per solve.
-        let calls = read(&s.calls) / read(&s.rounds);
-        assert!(
-            calls > (THREADS as f64) * 0.5,
-            "rounds averaged only {calls:.1} calls for {THREADS} threads"
-        );
         assert!(read(&s.rows) > 0.0, "rounds carried no rows");
-    }
-
-    /// Closing the gate must release a thread that is already parked, rather
-    /// than leave it waiting for a round that will never fill.
-    #[test]
-    fn closing_releases_a_parked_thread() {
-        let gate = Arc::new(Gate::default());
-        let worker = {
-            let gate = Arc::clone(&gate);
-            std::thread::spawn(move || {
-                let _member = gate.enter();
-                // Two members are counted, so this round can never fill on
-                // its own and the thread parks until `close`.
-                let _phantom = gate.enter();
-                gate.submit(tagged(7)).is_none()
-            })
-        };
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        gate.close();
-        assert!(worker.join().expect("worker"), "close must hand back None");
+        // The whole point: a round is one forward pass shared by every solve
+        // that was ready, not one pass per solve.
+        let calls = read(&s.calls) / read(&s.rounds);
+        assert!(calls > 2.0, "rounds averaged only {calls:.1} calls");
     }
 }
