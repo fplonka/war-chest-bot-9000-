@@ -258,6 +258,33 @@ ssh leaves the python holding the cards, and the next run dies with
 launch box work under `setsid nohup` and kill it by name. And a memory reading
 taken during that teardown is not a measurement of anything.
 
+## What the cards wait for
+
+`tools/gaps.py` attributes every idle gap on a card to whatever kernel ran
+before it. Over a 25 s capture, **22.7 s of idle across the two cards**:
+
+| share | after | gaps | each |
+|---:|---|---:|---:|
+| 28.1% | `k_expand` | 1,394 | **4,571 us** |
+| 16.1% | `k_backprop_sweep` | 17,140 | 213 us |
+| 13.0% | `k_bag` | 1,291 | 2,292 us |
+| 7.9% | `k_finish` | 3,501 | 515 us |
+
+`k_expand` is the last kernel of a round and `k_bag` the last of the config
+encoder, so those two gaps *are* the host turnaround, measured from the card:
+**41% of all idle is the cards waiting for the host between phases.** The
+`k_backprop_sweep` entry is different in kind -- seventeen thousand gaps of
+213 us *inside* the CFR loop, between level sweeps, which is launch and
+dependency latency with nothing else queued to fill it.
+
+This is worth more than any one kernel. The cards are busy about 55% of the
+time; the whole kernel table is competing for the other half.
+
+It also reopens `grow_every`. The measurement below found it worth nothing,
+and the reasoning was that halving the wakes doubles the device work a round
+carries. That holds only when the device is saturated, and it is not: fewer
+host turnarounds is fewer 4.6 ms holes.
+
 ## What the memory actually is
 
 `tools/farmprobe.py` prints the fattest solve a card held, array by array, off

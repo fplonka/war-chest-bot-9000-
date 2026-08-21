@@ -110,6 +110,11 @@ def main():
         print("stages, ms: "
               + "  ".join(f"{n}={v:.0f}" for n, v in zip(names[:-3], b) if v > 0))
         print("  ".join(f"{n}={v:.0f} MB" for n, v in zip(names[-3:], b[-3:])))
+    census = getattr(warchest, "solve_census", lambda: [])()
+    if census:
+        total = sum(b for _, b in census)
+        print(f"fattest solve {total / 1e6:.1f} MB: "
+              + "  ".join(f"{n}={b / 1e6:.1f}" for n, b in census[:10] if b))
 
 
 if __name__ == "__main__":
