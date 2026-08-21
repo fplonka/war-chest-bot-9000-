@@ -41,9 +41,8 @@ def main():
     p.add_argument("--devices", default="0,1")
     p.add_argument("--threads", type=int, default=36)
     p.add_argument("--cohorts", type=int, default=8)
-    p.add_argument("--nodes", type=int, default=8192)
-    p.add_argument("--expand", type=int, default=8)
-    p.add_argument("--iters", type=int, default=64)
+    p.add_argument("--s", type=int, default=512)
+    p.add_argument("--c", type=float, default=8.0)
     p.add_argument("--seed", type=int, default=11)
     args = p.parse_args()
 
@@ -53,10 +52,9 @@ def main():
 
     farm = warchest.SolveFarm(
         args.seed, args.threads,
-        nodes=args.nodes, expand=args.expand, iters=args.iters,
-        cfr="sog", node_cap=65536, config_cap=256,
+        s=args.s, c=args.c, cfr="sog",
         recursive_rate=0.1, devices=[int(d) for d in args.devices.split(",")],
-        cohorts=args.cohorts, grow_every=1,
+        cohorts=args.cohorts,
         roots=args.roots or None,
     )
     buf = Buffer(args.solves * 2, args.solves * 2 * 48)

@@ -109,11 +109,11 @@ def panels(eps, elo):
                          [series("", m, col("aux_acc"), True)], zero=True,
                          hlines=[("chance", 1 / 3)]))
 
-    # Raw loss is not comparable across phases, because the targets it is
-    # measured against change scale: the greedy warm phase has a target std near
-    # 0.5 and search settles nearer 0.2, so a falling loss can be nothing but a
-    # shrinking target. The share of target variance left unexplained is
-    # scale-free, and is what says whether a phase actually fitted.
+    # Raw loss is not comparable across runs, because the targets it is
+    # measured against change scale as play improves, so a falling loss can be
+    # nothing but a shrinking target. The share of target variance left
+    # unexplained is scale-free, and is what says whether a run actually
+    # fitted.
     out.append(panel("Unexplained target variance", "loss / target variance",
                      [series("", m, [e["loss"] / max(e["tgt_std"] ** 2, 1e-9)
                                      for e in eps], True)], zero=True))
@@ -149,10 +149,6 @@ def panels(eps, elo):
         if has(key):
             out.append(panel(title, ylabel, [series("", m, col(key), smooth)], zero=True))
 
-    # A refused build is the one decision a ReBeL agent answers without a
-    # search; the micro-continuations that finish its coin play are searched.
-    out.append(panel("Unsearched decisions", "fallbacks / decision",
-                     [series("", m, per_decision("node_caps"), True)], zero=True))
     # One chart makes the policy mix directly comparable; six separate panels
     # hid the later categories below the fold.
     if any(e.get("plays") for e in eps):
@@ -165,7 +161,7 @@ def panels(eps, elo):
     return [p for p in out if p]
 
 
-def health(eps, warm):
+def health(eps):
     if not eps:
         return []
     last, tot = eps[-1], lambda k: sum(e.get(k, 0) for e in eps)
@@ -179,14 +175,8 @@ def health(eps, warm):
            ("solves", f"{tot('solves'):,}"),
            ("solves/s", f"{last.get('solves_per_s', 0):.0f}"),
            ("buffer", f"{last.get('buf', 0):,}"),
-           ("node-cap fallbacks", f"{tot('node_caps'):,}"),
            ("dropped solves", f"{tot('dropped'):,}"),
            ("games cut at horizon", f"{horizon:.1f}%")]
-    # The warm phase is not plotted -- different objective, different target
-    # scale -- but how well it fitted decides what every ReBeL solve costs.
-    if warm:
-        out.append(("warm fit left over",
-                    f"{warm['loss'] / max(warm['tgt_std'] ** 2, 1e-9):.1%}"))
     if "aux_loss" in last:
         out.append(("aux ownership ce / accuracy",
                     f"{last['aux_loss']:.3f} / {last['aux_acc']:.1%}"))
@@ -240,13 +230,11 @@ def detail(runs_dir, name):
     lads = {os.path.basename(p)[:-5]: read_json(p)
             for p in sorted(glob.glob(os.path.join(path, "ladder*.json")))}
     lads = {k: v for k, v in lads.items() if v and v.get("kind") == "ladder"}
-    warm = next((e for e in reversed(log.get("epochs") or [])
-                 if e.get("phase") == "greedy"), None)
     out = {"name": name, "epochs": len(eps),
            "cfg": [[k, str(v), ch] for k, v, ch in config.knobs(cfg)],
            "panels": panels(eps, elo_panel(lads.get("ladder")
                                            or next(iter(lads.values()), None), name)),
-           "health": health(eps, warm),
+           "health": health(eps),
            "snaps": [s.get("t", 0) / 60.0 for s in log.get("snapshots") or []]}
     for key, val in (("note", cfg.get("note")), ("git", cfg.get("git")),
                      ("ladders", lads), ("log", read_text(f"{path}/train.log")),

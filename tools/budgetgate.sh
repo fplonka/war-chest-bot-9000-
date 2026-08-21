@@ -28,25 +28,25 @@ rm -rf "$BOTS"; mkdir -p "$BOTS"
 python tools/arena.py pack "$RUN" --bin engine/target/release/bot --out "$BOTS" \
     --snapshot "$SNAP" --name base >> "$LOG" 2>&1
 
-make() {  # make <name> <expand> <iters>
+make() {  # make <name> <s> <c>
     cp -r "$BOTS/base" "$BOTS/$1"
     python - "$BOTS/$1/bot.json" "$1" "$2" "$3" <<'PY'
 import json, sys
-p, name, expand, iters = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+p, name, s, c = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
 b = json.load(open(p))
 b["name"] = name
-b["search"]["expand"] = expand
-b["search"]["iters"] = iters
-b["note"] = f"SoG({expand * iters},{expand})"
+b["search"]["s"] = s
+b["search"]["c"] = c
+b["note"] = f"SoG({s},{c:g})"
 json.dump(b, open(p, "w"), indent=1)
 PY
 }
 
-make s512c8  8 64
-make s512c1  1 512
-make s256c1  1 256
-make s128c1  1 128
-make s64c1   1 64
+make s512c8  512 8
+make s512c1  512 1
+make s256c1  256 1
+make s128c1  128 1
+make s64c1    64 1
 rm -rf "$BOTS/base"
 
 if [ ! -d "$SUITE" ]; then

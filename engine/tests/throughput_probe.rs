@@ -26,8 +26,7 @@ fn throughput_probe() {
                 collect: Collect::Sog,
                 explore: 0.0,
                 random_draft: false,
-                eval_mix: 0.0,
-                mc_mix: 0.0,
+                p_td1: 0.0,
                 query_rate: 0.0,
                 recursive_rate: 0.0,
             };
@@ -63,8 +62,7 @@ fn throughput_probe() {
                 collect: Collect::None,
                 explore: 0.0,
                 random_draft: false,
-                eval_mix: 0.0,
-                mc_mix: 0.0,
+                p_td1: 0.0,
                 query_rate: 0.0,
                 recursive_rate: 0.0,
             };

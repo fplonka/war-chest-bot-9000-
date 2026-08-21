@@ -1,20 +1,16 @@
-"""ReBeL training for War Chest.
+"""Student of Games training for War Chest.
 
-Two phases inside one wall-clock budget:
+Self-play where every decision grows a search tree along trajectories sampled
+from its changing strategy. The root of each solve becomes a value target --
+one value per config in each player's belief -- and the leaves it queried
+become roots for solves of their own, which is how the value function becomes
+accurate away from the line of play.
 
-1. **Warm start** (`warm_minutes` of the budget). Both players are a stochastic
-   one-ply greedy bot on a public-information evaluation; value targets blend
-   that evaluation (squashed into (-1, 1)) with the realised game outcome.
-   ReBeL never plays a policy directly — every move comes out of CFR using the
-   value network at the leaves — so the value network is the natural place to
-   inject a starting behaviour. Without it CFR searches on noise and no game
-   ever ends inside the horizon. The network at the end of this phase is
-   snapshot 0, labelled `init`: where ReBeL started, and the zero point the Elo
-   curve is read against.
-
-2. **GT-CFR** (the rest). Self-play where every decision grows a search tree
-   along trajectories sampled from its changing strategy. Interior search
-   queries become value targets, one value per config in each player's belief.
+There is no warm start. A game that reaches the play cap scores
+`cap_value * delta_markers`, the win condition graded rather than an invented
+evaluation, so the first solves against an untrained network still see a graded
+outcome. `anneal_frac` takes `cap_value` to zero, and evaluation always runs on
+the real game.
 
 Generation runs in Rust across all CPU cores while the previous batch trains
 on the GPU. Python publishes weights between generation batches.
@@ -24,12 +20,12 @@ exact configs in support, their probabilities, and the value the solve gave
 each. The config lists are ragged, so they live in a flat arena and a batch is
 assembled by gathering spans -- see `Buffer`.
 
-The run snapshots every `snapshot_every` minutes of ReBeL. When training
-ends, the snapshots play Greedy (random drafts) and a report is written.
+The run snapshots every `snapshot_every` minutes. When training ends, the
+snapshots play a ladder and a report is written.
 
     python train/train.py out=seat
-    python train/train.py out=seat note="centre the seat bit at ±0.5"
-    python train/train.py out=smoke minutes=6 warm_minutes=2
+    python train/train.py out=seat note="centre the seat bit at +-0.5"
+    python train/train.py out=smoke minutes=6
 """
 
 import argparse
@@ -247,8 +243,8 @@ class Buffer:
         at = (base + within) % self.ccap
         seg = 2 * np.repeat(np.arange(len(ids), dtype=np.int64), lens) + self.cp[at]
         # The policy target, remapped onto the batch. A row with no target
-        # contributes no cells, which is how a query solve and the warm start
-        # drop out of the policy loss without a mask.
+        # contributes no cells, which is how a query solve drops out of the
+        # policy loss without a mask.
         alen, clen = self.palen[s].astype(np.int64), self.pclen[s].astype(np.int64)
         ai = (np.repeat(self.pastart[s], alen)
               + (np.arange(int(alen.sum()), dtype=np.int64)
@@ -602,7 +598,6 @@ def main():
     value = Net().to(dev)
     if args.init_weights:
         value.load_state_dict(load_checkpoint(args.init_weights).state_dict())
-        args.warm_minutes = 0.0
     opt = torch.optim.Adam(value.parameters(), lr=args.lr)
     lr_decays = sorted(float(x) for x in args.lr_decay_frac.split(",") if x.strip())
     next_decay = 0
@@ -615,9 +610,6 @@ def main():
           f"training on {dev}", flush=True)
 
     total = args.minutes * 60.0
-    warm = args.warm_minutes * 60.0
-    if not 0.0 <= warm <= total:
-        raise SystemExit("warm_minutes must be between zero and the run length")
     if args.snapshot_every <= 0:
         raise SystemExit("snapshot_every must be positive minutes")
     snap_gap = args.snapshot_every * 60.0
@@ -662,10 +654,7 @@ def main():
         path = f"{args.out}/snap_{len(snaps):02d}.pt"
         torch.save({"value": value.state_dict(), "t": round(el, 1),
                     "label": label, "git": args.git,
-                    "search": {"nodes": args.nodes, "expand": args.expand,
-                               "iters": args.iters, "cfr": args.cfr,
-                               "node_cap": args.node_cap,
-                               "config_cap": args.config_cap}}, path)
+                    "search": {"s": args.s, "c": args.c, "cfr": args.cfr}}, path)
         snaps.append({"label": label, "t": round(el, 1),
                       "file": os.path.basename(path)})
         print(f"[t={el:6.1f}s] --- snapshot {snaps[-1]['file']} ({label}) ---", flush=True)
@@ -681,18 +670,14 @@ def main():
         farm = warchest.SolveFarm(
             args.seed,
             args.gen_workers,
-            nodes=args.nodes,
-            expand=args.expand,
-            iters=args.iters,
+            s=args.s,
+            c=args.c,
             explore=args.explore,
             random_draft=args.random_draft,
             cfr=args.cfr,
-            node_cap=args.node_cap,
-            config_cap=args.config_cap,
             query_rate=args.query_rate,
             recursive_rate=args.recursive_rate,
             cohorts=args.gen_cohorts,
-            grow_every=args.grow_every,
             devices=[int(d) for d in args.gen_devices.split(",")])
 
         optimizer_rows = 0
@@ -745,7 +730,7 @@ def main():
             window["conv_s"] += conv_s
             window["add_s"] += add_s
             for name in (
-                    "games", "decisions", "horizon_hits", "node_caps",
+                    "games", "decisions", "horizon_hits",
                     "plays_attack", "plays_pass", "plays_deploy",
                     "plays_bolster", "plays_maneuver", "plays_recruit",
                     "configs", "query_rows"):
@@ -796,11 +781,11 @@ def main():
                 while next_target <= now:
                     next_target += args.target_every * 60.0
             sog_elapsed = max(0.0, now - sog_t0)
-            span = max(args.anneal_frac * (total - warm), 1.0)
+            span = max(args.anneal_frac * total, 1.0)
             cap_v = args.cap_value * max(0.0, 1.0 - sog_elapsed / span)
             warchest.set_cap_value(cap_v)
             while next_decay < len(lr_decays) and \
-                    sog_elapsed >= lr_decays[next_decay] * (total - warm):
+                    sog_elapsed >= lr_decays[next_decay] * total:
                 for pg in opt.param_groups:
                     pg["lr"] /= 2
                 print(
@@ -849,7 +834,6 @@ def main():
                 "grad_clip_frac": round(
                     window["grad_clipped"] / max(steps, 1), 4),
                 "horizon_frac": round(window["horizon_hits"] / games, 3),
-                "node_caps": int(window["node_caps"]),
                 # How many solves shared a forward pass. It should sit near the
                 # thread count; well below means the round is waiting on
                 # stragglers instead of batching them.
@@ -909,7 +893,6 @@ def main():
                 f"[t={rec['t']:6.1f}s] GT-CFR solves={sog_solves} "
                 f"rate={raw_sps:.1f}/s rows={rec['rows']} "
                 f"games={rec['games']} qrows={rec['query_rows']} "
-                f"caps={totals['node_caps']} "
                 f"L={lv:.5f} L/var={lv / max(target_var, 1e-9):.2f} "
                 f"Lp={rec['policy_loss']:.3f} "
                 f"tgt={target_mean:+.3f}/{target_var ** 0.5:.3f} "
@@ -928,13 +911,12 @@ def main():
             f"optimizer_rows={optimizer_rows} "
             f"rate={sog_solves / elapsed:.1f}/s "
             f"horizon={totals['horizon_hits'] / max(totals['games'], 1):.2f} "
-            f"games={totals['games']} caps={totals['node_caps']}",
+            f"games={totals['games']}",
             flush=True)
 
-    next_snap = float("inf")
     print(f"[cfg] PUBFEAT={PUBFEAT} CFEAT={CFEAT} architecture=gt-cfr "
-          f"nodes={args.nodes} expand={args.expand} iters={args.iters} "
-          f"budget={total:.0f}s warm={warm:.0f}s "
+          f"s={args.s} c={args.c} "
+          f"budget={total:.0f}s "
           f"snapshot_every={args.snapshot_every:g}min device={dev} "
           f"draft={'random' if args.random_draft else 'starter'} "
           f"replay_ratio={args.replay_ratio} "
@@ -942,85 +924,10 @@ def main():
           f"canonical_views=2 cap={args.cap} "
           f"matmul={torch.get_float32_matmul_precision()}", flush=True)
 
-    while True:
-        el = time.time() - t0
-        if el >= warm:
-            break
-        tg = time.time()
-        d = warchest.gen_data(args.warm_games, args.seed * 1_000_003 + epoch, "greedy",
-                              temp=args.temp, eval_mix=args.eval_mix,
-                              random_draft=args.random_draft)
-        gen_s = time.time() - tg
-        tr = time.time()
-        rows = np.asarray(d["rows"], np.uint8).reshape(-1, ROW_BYTES)
-        cc = np.asarray(d["cc"], np.uint8).reshape(-1, CCOUNTS)
-        cw = np.asarray(d["cw"], np.float32)
-        cy = np.clip(np.asarray(d["cy"], np.float32), -1.0, 1.0)
-        coff = np.asarray(d["coff"], np.int64)
-        soff = np.asarray(d["soff"], np.int64)
-        solves = max(1, int(d["solves"]))
-        conv_s = time.time() - tr
-        tr = time.time()
-        buf.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
-        add_s = time.time() - tr
-        if probe is None and len(buf) >= 2048:
-            probe = batcher(buf.sample(2048, rng), rng, dev)
-        tgt_mean, tgt_std = float(cy.mean()), float(cy.std())
-        tt = time.time()
-        # One optimizer row per deterministic warm row; repeated fitting only
-        # reduces the number of independent games seen before ReBeL starts.
-        steps = max(1, round(solves / args.batch))
-        lv, train_stat = train_steps(
-            value, opt, buf, steps, args.batch, rng, dev,
-            recent_mix=args.recent_mix, recent_frac=args.recent_frac,
-            batch_fn=batcher)
-        train_s = time.time() - tt
-        value.push()
-        probe_std, loss_old, loss_new = diagnostics(
-            value, buf, probe, args.batch, rng, dev, batcher, args.recent_frac)
-        dec = max(d["decisions"], 1)
-        rec = {"t": round(time.time() - t0, 1), "epoch": epoch, "phase": "greedy",
-               "games": d["games"], "decisions": dec, "loss": round(lv, 5),
-               "rows": len(rows), "solves": solves,
-               "loss_old": round(loss_old, 5), "loss_new": round(loss_new, 5),
-               "zero_sum_max": round(train_stat["zero_sum_max"], 5),
-               "horizon_frac": round(d["horizon_hits"] / max(d["games"], 1), 3),
-               "node_caps": int(d["node_caps"]),
-               "plays_attack": int(d.get("plays_attack", 0)),
-               "plays_pass": int(d.get("plays_pass", 0)),
-               "plays_deploy": int(d.get("plays_deploy", 0)),
-               "plays_bolster": int(d.get("plays_bolster", 0)),
-               "plays_maneuver": int(d.get("plays_maneuver", 0)),
-               "plays_recruit": int(d.get("plays_recruit", 0)),
-               "configs": round(d["configs"] / dec, 1), "cap_value": round(cap_v, 4),
-               "steps": steps,
-               "tgt_mean": round(tgt_mean, 4), "tgt_std": round(tgt_std, 4),
-               "probe_std": round(probe_std, 4),
-               "gen_s": round(gen_s, 2), "train_s": round(train_s, 2),
-               "conv_s": round(conv_s, 2), "add_s": round(add_s, 2), "buf": len(buf),
-               "buf_s": round(buf.span_seconds(), 1),
-               "solves_per_s": 0.0,
-               "lr": opt.param_groups[0]["lr"]}
-        log.append(rec)
-        write_log(args, log, snaps)
-        print(f"[t={rec['t']:6.1f}s] greedy ep{epoch:3d} games={rec['games']:4d} "
-              f"dec={dec:6d} rows={len(rows):6d} horizon={rec['horizon_frac']:.2f} "
-              f"L={lv:.5f} L/var={lv / max(tgt_std ** 2, 1e-9):.2f} "
-              f"tgt={tgt_mean:+.3f}/{tgt_std:.3f} pstd={probe_std:.3f} "
-              f"gen={gen_s:.1f}s train={train_s:.1f}s",
-              flush=True)
-        epoch += 1
-
-    snapshot("init", time.time() - t0)
-    next_snap = (time.time() - t0) + snap_gap
-    # Warm-up initialises the network. Its Adam moments and its rows are a
-    # different objective; they must not steer ReBeL.
-    buf.clear()
-    probe = None
-    opt = torch.optim.Adam(value.parameters(), lr=args.lr)
+    snapshot("init", 0.0)
+    next_snap = snap_gap
     sog_t0 = time.time()
     sog_solves = 0
-    print(f"[t={time.time() - t0:6.1f}s] --- switching to GT-CFR ---", flush=True)
     run_search_pipeline()
 
     snapshot("final", time.time() - t0)

@@ -21,12 +21,12 @@ ROOTS=${ROOTS:-/workspace/roots.bin}
 W=${W:-runs/cohorts10/snap_02.pt}
 SECS=${SECS:-150}
 
-bench() {  # bench <cohorts> <threads> <expand> <iters> [env...]
-    local c=$1 t=$2 e=$3 i=$4; shift 4
-    echo "=== cohorts=$c threads=$t expand=$e iters=$i $* ===" >> "$OUT"
+bench() {  # bench <cohorts> <threads> <s> <c> [env...]
+    local co=$1 t=$2 s=$3 c=$4; shift 4
+    echo "=== cohorts=$co threads=$t s=$s c=$c $* ===" >> "$OUT"
     env "$@" setsid nohup python tools/farmbench.py \
         --roots "$ROOTS" --weights "$W" --devices 0,1 \
-        --threads "$t" --cohorts "$c" --expand "$e" --iters "$i" \
+        --threads "$t" --cohorts "$co" --s "$s" --c "$c" \
         --seconds "$SECS" --window 50 >> "$OUT" 2>&1 &
     wait $!
 }
@@ -34,11 +34,11 @@ bench() {  # bench <cohorts> <threads> <expand> <iters> [env...]
 case "${1:-}" in
 rate)
     OUT=/workspace/logs/rate.log; : > "$OUT"
-    for c in 2 4 6 8 10 12; do bench "$c" 36 8 64; done   # solves in flight
-    bench 10 2 8 64                                        # uncontended `awake`
-    for i in 128 256 512; do bench 10 36 1 "$i"; done      # the budget, at c=1
-    bench 10 36 4 128
-    bench 10 36 8 64 WARCHEST_STAGES=1                     # where a round goes
+    for c in 2 4 6 8 10 12; do bench "$c" 36 512 8; done   # solves in flight
+    bench 10 2 512 8                                       # uncontended `awake`
+    for i in 128 256 512; do bench 10 36 "$i" 1; done      # the budget, at c=1
+    bench 10 36 512 4
+    bench 10 36 512 8 WARCHEST_STAGES=1                     # where a round goes
     ;;
 device)
     OUT=/workspace/logs/device.log; : > "$OUT"
@@ -57,8 +57,8 @@ device)
 host)
     OUT=/workspace/logs/host.log; : > "$OUT"
     (cd engine && maturin develop --release --features python,gpu,prof) >> "$OUT" 2>&1
-    bench 10 36 8 64        # 360 threads on 72: turnaround plus queueing
-    bench 10 2 8 64         # 20 threads: turnaround alone
+    bench 10 36 512 8       # 360 threads on 72: turnaround plus queueing
+    bench 10 2 512 8        # 20 threads: turnaround alone
     (cd engine && maturin develop --release --features python,gpu) >> "$OUT" 2>&1
     ;;
 *)  sed -n '2,13p' "$0" ;;

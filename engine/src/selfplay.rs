@@ -25,20 +25,18 @@
 //! Each search nominates a few of the leaves it asked the network about; each
 //! of those is later solved as a root in its own right and yields its own row.
 //!
-//! Training data comes in two flavours:
-//!   * `Collect::Mc` — the greedy warm start. Value targets blend the realised
-//!     game outcome with a squashed handcrafted public-information evaluation.
-//!     Without it the value network is noise, CFR plays without purpose, and
-//!     games only ever end at the horizon.
-//!   * `Collect::Sog` — solved counterfactual values at solve roots.
+//! There is no warm start. A game that reaches the play cap scores
+//! `cap_value * delta_markers`, so the first solves against an untrained
+//! network still see a graded outcome -- the win condition, graded -- rather
+//! than a flat zero. `state::cap_marker_value` anneals it away.
 
 use crate::actions::{Action, Play};
-use crate::board::{board, NONE, N_HEXES};
+use crate::board::NONE;
 use crate::policy;
 use crate::pbs::*;
 use crate::rng::Rng;
 use crate::search::{Cfg, Nets, Solver};
-use crate::state::{Cont, State, BLACK, WHITE, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP};
+use crate::state::{Cont, State, BLACK, WHITE, Z_BAG, Z_FACEDOWN, Z_FACEUP};
 use rayon::prelude::*;
 use std::collections::VecDeque;
 
@@ -77,76 +75,10 @@ pub fn make_game(rng: &mut Rng, random: bool) -> State {
     State::from_draft(&pool[..4], &pool[4..8], first)
 }
 
-// ------------------------------------------------------------- greedy policy
-
-/// A hand-written positional evaluation from `p`'s point of view, over **public
-/// information only** — it never inspects either player's hidden coins, so it
-/// cannot teach the value network something no legal policy could achieve.
-pub fn eval_static(s: &State, p: u8) -> f32 {
-    if s.is_terminal() {
-        return s.utility(p as usize) * 1e6;
-    }
-    let bd = board();
-    let o = 1 - p;
-    let mut sc = 12.0 * (s.markers_on_board(p) as f32 - s.markers_on_board(o) as f32);
-    let (mut coins_p, mut coins_o) = (0.0f32, 0.0f32);
-    for h in 0..N_HEXES {
-        match s.hex_owner[h] {
-            x if x == p => coins_p += s.hex_height[h] as f32,
-            x if x == o => coins_o += s.hex_height[h] as f32,
-            _ => {}
-        }
-    }
-    sc += 1.5 * (coins_p - coins_o);
-    let elim = |q: u8| -> f32 {
-        s.zones[q as usize][Z_ELIM]
-            .iter()
-            .map(|&x| x as f32)
-            .sum::<f32>()
-    };
-    sc += elim(o) - elim(p);
-
-    // Coverage: for every location each side still has to take, how far its
-    // nearest unit is. Per location rather than per unit, which is what pushes
-    // units onto the map instead of shuffling on the spot.
-    let (mut cover_p, mut cover_o) = (0.0f32, 0.0f32);
-    for li in 0..10 {
-        let l = bd.location_hexes[li] as usize;
-        let (mut bp, mut bo) = (7.0f32, 7.0f32);
-        for h in 0..N_HEXES {
-            let owner = s.hex_owner[h];
-            if owner == NONE {
-                continue;
-            }
-            let d = bd.dist[h][l] as f32;
-            if owner == p {
-                bp = bp.min(d);
-            } else {
-                bo = bo.min(d);
-            }
-        }
-        if s.loc_marker[l] != p {
-            cover_p += bp;
-        }
-        if s.loc_marker[l] != o {
-            cover_o += bo;
-        }
-    }
-    sc += 0.5 * (cover_o - cover_p);
-    sc
-}
-
-/// `eval_static` squashed into (-1, 1) so it can seed the value network.
-pub fn eval_squashed(s: &State, p: u8) -> f32 {
-    (eval_static(s, p) / 25.0).tanh()
-}
-
 // -------------------------------------------------------------------- agents
 
 #[derive(Clone, Copy)]
 pub enum Agent {
-    /// Greedy one-ply search on `eval_static`, softmaxed at `temp`.
-    Greedy { temp: f32 },
     /// Uniform over legal actions: the weakest reference on the Elo ladder.
     Random,
     /// Grow and solve a GT-CFR tree, then act on its average strategy.
@@ -158,8 +90,6 @@ pub enum Agent {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Collect {
     None,
-    /// Monte-Carlo value targets from the game outcome (greedy warm start).
-    Mc,
     /// Student of Games: CFR subgame root values.
     Sog,
 }
@@ -348,19 +278,10 @@ pub struct GameCfg {
     pub explore: f32,
     /// Randomise the draft instead of using the fixed starter matchup.
     pub random_draft: bool,
-    /// Warm start only: how much of the value target comes from the squashed
-    /// handcrafted public-information evaluation rather than the realised game
-    /// outcome. The outcome is unbiased but very noisy — most of a game's
-    /// states cannot predict who wins — while the handcrafted eval is biased
-    /// but dense and low-variance, which is what makes one-ply differences
-    /// legible to CFR from the first game. Both are only a starting point:
-    /// every ReBeL-phase target comes from real solves and real outcomes, so
-    /// the bias washes out.
-    pub eval_mix: f32,
-    /// ReBeL phase only: how much of the value target comes from the realised
-    /// game outcome instead of the pure CFR bootstrap (MuZero-style n-step /
-    /// TD(λ) anchor). 0.0 is plain ReBeL: pure bootstrap targets.
-    pub mc_mix: f32,
+    /// How much of the value target comes from the realised game outcome
+    /// rather than from the CFR bootstrap -- Student of Games' `p_td1`. Zero is
+    /// the pure bootstrap, which is what the paper runs for poker.
+    pub p_td1: f32,
     /// Belief states drawn from each self-play search and queued to be solved
     /// as roots of their own — Student of Games' `q_search`. A search only
     /// tells us the value at the state it was rooted at, so this is what makes
@@ -380,7 +301,6 @@ pub struct Game {
     ctx: Ctx,
     bel: [Belief; 2],
     data: Data,
-    from_row: usize,
     gc: GameCfg,
     /// Belief states this game's searches asked the network about, waiting to
     /// be solved as roots of their own.
@@ -446,7 +366,6 @@ impl Game {
                 Belief::point(Config::default()),
             ],
             data: Data::default(),
-            from_row: 0,
             gc: *gc,
             queries: Vec::new(),
         }
@@ -473,8 +392,7 @@ impl Game {
     /// pending.
     pub fn take_rows(&mut self) -> Data {
         assert_eq!(self.gc.collect, Collect::Sog);
-        assert_eq!(self.gc.mc_mix, 0.0);
-        self.from_row = 0;
+        assert_eq!(self.gc.p_td1, 0.0);
         std::mem::take(&mut self.data)
     }
 
@@ -520,7 +438,6 @@ impl Game {
             data.configs += cfgs.len();
 
             let np = match gc.agents[player as usize] {
-                Agent::Greedy { temp } => policy::greedy(s, ctx, player, &cfgs, temp),
                 Agent::Random => policy::uniform(s, ctx, player, &cfgs),
                 Agent::Sog { cfg } => {
                     // Student of Games re-solves from scratch at every
@@ -545,18 +462,6 @@ impl Game {
                 }
             };
 
-            if gc.collect == Collect::Mc && matches!(s.pending(), Cont::MainPlay) {
-                // Park the handcrafted evaluation in the target now; the
-                // realised outcome is blended in once the game ends.
-                // `eval_static` is exactly antisymmetric, so this stays
-                // zero-sum. Rows are taken only at MainPlay states, like
-                // every other training row.
-                let e = eval_squashed(s, 0);
-                let (a, b) = (vec![e; bel[0].len()], vec![-e; bel[1].len()]);
-                data.begin_solve();
-                // The warm start has no search, so no policy target.
-                data.push_value(s, ctx, bel, [&a, &b], &Default::default());
-            }
 
             let true_row = np.row(true_ci);
             let mut chosen_cell = np.sample(rng, true_ci);
@@ -603,18 +508,11 @@ impl Game {
     /// result.
     pub fn finish(&mut self) -> f32 {
         let z = self.s.utility(WHITE as usize);
-        if self.gc.collect == Collect::Mc {
-            // The parked value is the handcrafted evaluation; blend in the
-            // realised outcome. This is the warm start only — ReBeL-phase
-            // targets come entirely from the subgame solve.
-            let m = self.gc.eval_mix.clamp(0.0, 1.0);
-            blend_outcome(&mut self.data, self.from_row, m, 1.0 - m, z);
-        }
-        if self.gc.collect == Collect::Sog && self.gc.mc_mix > 0.0 {
-            // Anchor the pure bootstrap target to the realised outcome
-            // (TD(lambda)-style), blended in once per game.
-            let m = self.gc.mc_mix.clamp(0.0, 1.0);
-            blend_outcome(&mut self.data, self.from_row, 1.0 - m, m, z);
+        if self.gc.p_td1 > 0.0 {
+            // Anchor the bootstrap target to the realised outcome, blended in
+            // once per game.
+            let m = self.gc.p_td1.clamp(0.0, 1.0);
+            blend_outcome(&mut self.data, 1.0 - m, m, z);
         }
         self.data.games += 1;
         if self.s.main_plays >= crate::state::MAX_MAIN_PLAYS {
@@ -740,8 +638,8 @@ pub fn play_game(
 /// `y <- keep * y + mix * (+-z)` over every config of every row this game
 /// produced. The sign flips for player 1: `z` is White's outcome and the
 /// targets are per-player utilities of a zero-sum game.
-fn blend_outcome(data: &mut Data, from_row: usize, keep: f32, mix: f32, z: f32) {
-    for r in from_row..data.nv {
+fn blend_outcome(data: &mut Data, keep: f32, mix: f32, z: f32) {
+    for r in 0..data.nv {
         for p in 0..2 {
             let sign = if p == 0 { 1.0 } else { -1.0 };
             for i in data.row_span(r, p) {
@@ -885,8 +783,7 @@ mod policy_target_tests {
             collect: Collect::Sog,
             explore: 0.1,
             random_draft: true,
-            eval_mix: 1.0,
-            mc_mix: 0.0,
+            p_td1: 0.0,
             query_rate: 0.9,
             recursive_rate: 0.1,
         };

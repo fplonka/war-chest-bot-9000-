@@ -52,7 +52,7 @@ def main():
     net.push()
 
     print("[1/6] generating rows (random drafts, WP included)", flush=True)
-    d = warchest.gen_data(1, 7, "sog", s=64, c=1.0,
+    d = warchest.gen_data(1, 7, s=64, c=1.0,
                           explore=0.25, random_draft=True)
     n = len(d["rows"]) // ROW_BYTES
     assert n > 200, f"expected a few hundred rows, got {n}"

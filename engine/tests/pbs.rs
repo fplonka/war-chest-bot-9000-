@@ -932,8 +932,7 @@ fn game_stream_yields_one_complete_solve_at_a_time() {
         collect: Collect::Sog,
         explore: 0.25,
         random_draft: false,
-        eval_mix: 1.0,
-        mc_mix: 0.0,
+        p_td1: 0.0,
         query_rate: 0.0,
         recursive_rate: 0.0,
     };
@@ -967,8 +966,7 @@ fn a_gated_solve_matches_an_ungated_one_exactly() {
         collect: Collect::Sog,
         explore: 0.1,
         random_draft: true,
-        eval_mix: 1.0,
-        mc_mix: 0.0,
+        p_td1: 0.0,
         query_rate: 0.9,
         recursive_rate: 0.25,
     };
@@ -1052,8 +1050,7 @@ fn a_solve_stores_its_root_and_nothing_else() {
         collect: Collect::Sog,
         explore: 0.25,
         random_draft: true,
-        eval_mix: 1.0,
-        mc_mix: 0.0,
+        p_td1: 0.0,
         // Exercise the query solver too: its rows go through the same path.
         query_rate: 1.0,
         recursive_rate: 0.25,

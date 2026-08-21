@@ -81,14 +81,10 @@ class Bot:
         if self.spec.get("weights"):
             argv += ["--weights", str(self.dir / self.spec["weights"])]
         search = self.spec.get("search", {})
-        for key, flag in (
-                ("depth", "--depth"), ("nodes", "--nodes"),
-                ("expand", "--expand"), ("iters", "--iters"),
-                ("cfr", "--cfr"), ("temp", "--temp"),
-                ("node_cap", "--node-cap")):
+        for key, flag in (("s", "--s"), ("c", "--c"), ("cfr", "--cfr")):
             if key in search:
                 argv += [flag, str(search[key])]
-        if threads and "nodes" in search:
+        if threads and "s" in search:
             argv += ["--threads", str(threads)]
         self.proc = subprocess.Popen(
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
@@ -744,10 +740,9 @@ def pack(run, binary, out_dir, snapshot=None, name=None):
     for snap in snaps:
         checkpoint = torch.load(run / snap["file"], map_location="cpu",
                                 weights_only=False)
-        search = {"nodes": cfg.get("nodes", 1024),
-                  "expand": cfg.get("expand", 1),
-                  "iters": cfg.get("iters", 64),
-                  "cfr": cfg.get("cfr", "dcfr")}
+        search = {"s": cfg.get("s", 512),
+                  "c": cfg.get("c", 8.0),
+                  "cfr": cfg.get("cfr", "sog")}
         bot = name or f"{run.name}.{snap['label']}"
         directory = out_dir / bot
         directory.mkdir(parents=True, exist_ok=True)
@@ -759,8 +754,7 @@ def pack(run, binary, out_dir, snapshot=None, name=None):
             "binary": digest(directory / "bot"),
             "mind": "sog",
             "weights": "weights.bin",
-            "search": {k: v for k, v in search.items()
-                       if k in ("nodes", "expand", "iters", "cfr")},
+            "search": search,
             "minutes": round(snap["t"] / 60.0, 1),
             "note": f"{run.name} {snap['label']}, {snap['t'] / 60:.0f} min",
         }, indent=1) + "\n")

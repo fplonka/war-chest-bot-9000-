@@ -2,8 +2,8 @@
 //!
 //! Every agent answers the same question at a decision node: for each private
 //! config the acting player might hold, how likely is each of that config's
-//! legal actions? `NodePolicy` is that answer. The solver, the one-ply greedy
-//! reference and uniform random differ only in how they fill `probs`.
+//! legal actions? `NodePolicy` is that answer. The solver and uniform random
+//! differ only in how they fill `probs`.
 //!
 //! `posterior` is what the rest of the game does with it. An action is
 //! observed by its *public* projection — a face-down play hides the coin
@@ -16,7 +16,7 @@
 use std::ops::Range;
 
 use crate::actions::Action;
-use crate::pbs::{action_legal, advance_config, obs_key, set_config, Belief, Config, Ctx};
+use crate::pbs::{action_legal, advance_config, obs_key, Belief, Config, Ctx};
 use crate::rng::Rng;
 use crate::search::{node_actions, Solver};
 use crate::state::State;
@@ -134,43 +134,6 @@ pub fn uniform(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config]) -> NodePolicy 
         let k = row.len() as f32;
         for cell in row {
             np.probs[cell] = 1.0 / k;
-        }
-    }
-    np
-}
-
-/// One-ply greedy, softmaxed at `temp`. An action's score is a property of the
-/// successor's public state, so it is evaluated once per action and shared
-/// across configs; only the legal set differs between them.
-pub fn greedy(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config], temp: f32) -> NodePolicy {
-    let mut np = NodePolicy::frame(s, ctx, player, cfgs);
-    let na = np.acts.len();
-    let mut score = vec![f32::NEG_INFINITY; na];
-    for a in 0..na {
-        let Some(rep) = cfgs.iter().find(|c| action_legal(c, np.aslot[a])) else {
-            continue;
-        };
-        let mut probe = *s;
-        set_config(&mut probe, player, ctx, rep);
-        probe.apply_inplace(np.acts[a]);
-        score[a] = crate::selfplay::eval_static(&probe, player) / temp;
-    }
-    for ci in 0..cfgs.len() {
-        let cells = np.row(ci);
-        let best = cells.clone().fold(f32::NEG_INFINITY, |best, cell| {
-            best.max(score[np.action_at(cell)])
-        });
-        let mut sum = 0.0;
-        for cell in cells.clone() {
-            let e = (score[np.action_at(cell)] - best).exp();
-            np.probs[cell] = e;
-            sum += e;
-        }
-        // A little uniform mass keeps the belief filter from collapsing and
-        // keeps warm-start games diverse.
-        let k = cells.len() as f32;
-        for cell in cells {
-            np.probs[cell] = 0.95 * np.probs[cell] / sum + 0.05 / k;
         }
     }
     np

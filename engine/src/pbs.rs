@@ -893,7 +893,7 @@ pub const NTYPE: usize = 2 * NSLOT;
 ///
 /// Every one is a raw fact about the position. A precomputed
 /// distance-to-nearest-unit map was tried and removed: it is a *derived*
-/// summary — the same quantity `eval_static`'s coverage term uses — so it
+/// summary of how far each side is from the locations it still needs — so it
 /// imports the handcrafted bot's opinion into the encoding. The pending-
 /// maneuver mask was removed with the MainPlay-only freeze: the network is
 /// queried only between normal turns, so no continuation state ever reaches

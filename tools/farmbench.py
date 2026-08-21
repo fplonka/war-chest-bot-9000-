@@ -40,16 +40,12 @@ def bench(args, devices, threads):
     farm = warchest.SolveFarm(
         args.seed,
         threads,
-        nodes=args.nodes,
-        expand=args.expand,
-        iters=args.iters,
+        s=args.s,
+        c=args.c,
         cfr=args.cfr,
-        node_cap=args.node_cap,
-        config_cap=256,
         recursive_rate=args.recursive_rate,
         devices=devices,
         cohorts=args.cohorts,
-        grow_every=args.grow_every,
         roots=args.roots,
     )
     # Warm: the kernels compile, the pools fill, and every thread reaches its
@@ -99,18 +95,16 @@ def main():
     p.add_argument("--games", type=int, default=64, help="games to sample a corpus from")
     p.add_argument("--cap", type=int, default=4096, help="roots to keep")
     p.add_argument("--threads", default="72")
-    p.add_argument("--grow-every", type=int, default=1,
-                   help="CFR iterations a solve runs before waking the host to grow")
     p.add_argument("--cohorts", type=int, default=2,
                    help="independent cohorts of solves; one lane of the card each")
     p.add_argument("--devices", default="0,1")
     p.add_argument("--seconds", type=float, default=60)
     p.add_argument("--window", type=float, default=20)
     p.add_argument("--seed", type=int, default=1234)
-    p.add_argument("--nodes", type=int, default=8192)
-    p.add_argument("--expand", type=int, default=8)
-    p.add_argument("--iters", type=int, default=64)
-    p.add_argument("--node-cap", type=int, default=65536)
+    p.add_argument("--s", type=int, default=512,
+                   help="expansion simulations a solve runs")
+    p.add_argument("--c", type=float, default=8.0,
+                   help="expansions per regret update")
     p.add_argument("--cfr", default="sog", help="the run's regret rule")
     p.add_argument("--recursive-rate", type=float, default=0.1)
     p.add_argument("--weights", help="a checkpoint to solve with, e.g. runs/NAME/snap_02.pt")

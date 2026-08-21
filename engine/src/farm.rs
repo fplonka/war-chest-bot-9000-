@@ -1131,8 +1131,7 @@ mod tests {
             collect: Collect::Sog,
             explore: 0.1,
             random_draft: true,
-            eval_mix: 1.0,
-            mc_mix: 0.0,
+            p_td1: 0.0,
             query_rate: 0.9,
             recursive_rate: 0.1,
         };

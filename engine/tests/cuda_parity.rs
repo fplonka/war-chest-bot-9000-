@@ -50,8 +50,7 @@ fn game_cfg(s: u32, c: f32) -> GameCfg {
         collect: Collect::Sog,
         explore: 0.1,
         random_draft: true,
-        eval_mix: 1.0,
-        mc_mix: 0.0,
+        p_td1: 0.0,
         // Root rows only, so a target is one solve's root value and a
         // divergence names the solve it came from.
         query_rate: 0.0,

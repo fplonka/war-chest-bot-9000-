@@ -9,7 +9,6 @@ from dataclasses import dataclass
 @dataclass
 class Cfg:
     minutes: float = 30.0
-    warm_minutes: float = 5.0
     snapshot_every: float = 15.0
     init_weights: str = ""
 
@@ -27,19 +26,10 @@ class Cfg:
     # imperfect-information games.
     cap: int = 1_000_000
     cfgs_per_row: int = 48
-    # The growing tree's budget. A round is six coin plays, so a tree has to
-    # reach depth six to see the round boundary where beliefs reset — and at
-    # about twenty actions a decision, only selective growth gets there. The
-    # previous 256 nodes stopped growth after three of sixteen iterations,
-    # which spent a growing-tree solver as a depth-one one.
-    nodes: int = 8192
-    expand: int = 8
-    iters: int = 64
-    # Far enough above `nodes` that a healthy tree never reaches it. A solve
-    # that does is thrown away, so the number only buys how much work is spent
-    # discovering that.
-    node_cap: int = 65536
-    config_cap: int = 256
+    # Student of Games' SoG(s, c): `s` expansion simulations in all, `c` of
+    # them after each regret update, so the solve runs ceil(s / c) updates.
+    s: int = 512
+    c: float = 8.0
     # Student of Games' q_search and q_recursive: leaves drawn from each solve
     # and queued to be re-solved as roots of their own. This is the only way a
     # target is ever taken off the line of play.
@@ -55,12 +45,13 @@ class Cfg:
     policy_w: float = 0.5
     # ReBeL's and Student of Games' off-policy exploration rate; both run 0.1.
     explore: float = 0.1
-    temp: float = 2.0
-    eval_mix: float = 1.0
-    cap_value: float = 0.04
+    # The horizon payoff per marker of lead. It is what carries the cold start:
+    # a game cut at the play cap scores the win condition graded, which is a
+    # real signal where a flat draw is none. `anneal_frac` takes it to zero,
+    # and evaluation always runs the real game.
+    cap_value: float = 0.15
     anneal_frac: float = 0.4
     random_draft: bool = True
-    warm_games: int = 96
     ladder_games: int = 40
 
     device: str = "cuda:1"
@@ -73,11 +64,6 @@ class Cfg:
     # Thirty-odd solves a round is the shape: fewer and the batch stops being
     # worth an accelerator, more and the barrier costs too much.
     gen_cohorts: int = 10
-    # CFR iterations a solve runs before waking the host to grow its tree. One
-    # is what Student of Games describes. More is faster and coarser: the extra
-    # phases sample a tree that has not grown between them, which is the same
-    # approximation a single phase already makes across its own simulations.
-    grow_every: int = 1
     gen_solves: int = 8
     # Zero uses every physical CPU core.
     gen_workers: int = 0

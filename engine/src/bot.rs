@@ -36,10 +36,8 @@ use crate::state::{Cont, State};
 /// How a bot picks its move.
 #[derive(Clone, Copy, Debug)]
 pub enum Mind {
-    /// Solve the depth-limited subgame, act on the CFR average strategy.
+    /// Grow and solve a GT-CFR tree, act on the CFR average strategy.
     Sog,
-    /// One-ply search on the handcrafted static evaluation.
-    Greedy { temp: f32 },
     /// Uniform over legal actions.
     Random,
 }
@@ -67,7 +65,6 @@ impl Brain {
     ) -> NodePolicy {
         let cfgs = &bel[player as usize].cfg;
         match self.mind {
-            Mind::Greedy { temp } => return policy::greedy(s, ctx, player, cfgs, temp),
             Mind::Random => return policy::uniform(s, ctx, player, cfgs),
             Mind::Sog => {}
         }

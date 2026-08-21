@@ -33,13 +33,12 @@ struct Options {
     s: u32,
     c: f32,
     cfr: String,
-    temp: f32,
     threads: usize,
 }
 
 fn options() -> Result<Options, String> {
     let a = Args::parse(&[
-        "name", "weights", "mind", "s", "c", "cfr", "temp", "threads",
+        "name", "weights", "mind", "s", "c", "cfr", "threads",
     ])?;
     Ok(Options {
         name: a.text("name", "bot"),
@@ -48,7 +47,6 @@ fn options() -> Result<Options, String> {
         cfr: a.text("cfr", "sog"),
         s: a.num("s", 512)?,
         c: a.num("c", 8.0)?,
-        temp: a.num("temp", 2.0)?,
         threads: a.num("threads", 0)?,
     })
 }
@@ -56,7 +54,6 @@ fn options() -> Result<Options, String> {
 fn brain(o: &Options, gate: Option<Arc<Gate>>, device: bool) -> Result<Brain, String> {
     let mind = match o.mind.as_str() {
         "sog" => Mind::Sog,
-        "greedy" => Mind::Greedy { temp: o.temp },
         "random" => Mind::Random,
         other => return Err(format!("unknown mind {}", other)),
     };

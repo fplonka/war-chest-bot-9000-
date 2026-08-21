@@ -495,7 +495,7 @@ use parking_lot::RwLock;
 use std::sync::{Arc, LazyLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The live network. Empty until the trainer pushes weights: the greedy warm
+/// The live network. Empty until the trainer pushes weights: the
 /// phase plays with no network at all. One process holds one network — two
 /// checkpoints meet each other as two arena bots, not as two slots here.
 static NETS: LazyLock<RwLock<Arc<Nets>>> =
@@ -672,8 +672,7 @@ impl SolveFarm {
                 collect: Collect::Sog,
                 explore,
                 random_draft,
-                eval_mix: 1.0,
-                mc_mix: 0.0,
+                p_td1: 0.0,
                 query_rate,
                 recursive_rate,
             }),
@@ -754,44 +753,30 @@ fn backend_for(_devices: &[usize], _value: crate::net::Net, _lanes: usize) -> Py
 }
 
 /// Run `games` self-play games across all cores and return the training data.
-/// `mode` is "greedy" (Monte-Carlo warm start) or "sog".
 #[pyfunction]
-#[pyo3(signature = (games, seed, mode, s=512, c=8.0, explore=0.25, temp=2.0, random_draft=true, eval_mix=0.5, mc_mix=0.0, cfr="sog"))]
+#[pyo3(signature = (games, seed, s=512, c=8.0, explore=0.25, random_draft=true, p_td1=0.0, cfr="sog"))]
 #[allow(clippy::too_many_arguments)]
 fn gen_data(
     py: Python<'_>,
     games: usize,
     seed: u64,
-    mode: &str,
     s: u32,
     c: f32,
     explore: f32,
-    temp: f32,
     random_draft: bool,
-    eval_mix: f32,
-    mc_mix: f32,
+    p_td1: f32,
     cfr: &str,
 ) -> PyResult<PyObject> {
     let cfg = Cfg { s, c, cfr: cfr_of(cfr)?, ..Default::default() };
-    let (agent, collect) = match mode {
-        "greedy" => (Agent::Greedy { temp }, Collect::Mc),
-        "sog" => (Agent::Sog { cfg }, Collect::Sog),
-        other => {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown mode '{}'",
-                other
-            )))
-        }
-    };
+    let agent = Agent::Sog { cfg };
     let gc = GameCfg {
         agents: [agent, agent],
-        collect,
+        collect: Collect::Sog,
         explore,
         random_draft,
-        eval_mix,
-        mc_mix,
-        // The warm start and the batch generator take a row at every decision
-        // already; the query solver belongs to the streaming generator.
+        p_td1,
+        // The batch generator takes a row at every decision already; the query
+        // solver belongs to the streaming generator.
         query_rate: 0.0,
         recursive_rate: 0.0,
     };
@@ -829,8 +814,7 @@ fn save_roots(
         collect: Collect::Sog,
         explore: 0.25,
         random_draft,
-        eval_mix: 0.0,
-        mc_mix: 0.0,
+        p_td1: 0.0,
         query_rate: 1.0,
         recursive_rate: 0.0,
     };
