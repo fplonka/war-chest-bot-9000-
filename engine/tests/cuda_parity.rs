@@ -326,35 +326,16 @@ fn a_solve_does_not_depend_on_the_round_it_rides_in() {
             worst(&twice[i].cy, &together[i].cy, "targets"),
             worst(&twice[i].pprob, &together[i].pprob, "policy"),
         );
-        // Loose, and the looseness is the point. What this has to catch is
-        // one solve reading another's state -- the CFR decay factors taken
-        // from the first call of a shard, which every batched run carried
-        // until it was found, and which moves a target by whole percentage
-        // points. What it must *not* catch is arithmetic order: a round of
-        // four solves and a round of one give the network's multiplies
-        // different shapes, cuBLAS sums accordingly, and in half precision two
-        // last-bit-different values round to different halves. That is jitter,
-        // not a wrong answer.
-        assert!(t < 5e-3, "stream {i}: sharing a round moved its targets by {t:e}");
+        assert!(t < 1e-4, "stream {i}: sharing a round moved its targets by {t:e}");
         bad = bad.max(p);
     }
-    // The policy is *not* asserted on, and that is a decision rather than an
-    // oversight.
-    //
-    // Regret matching is discontinuous at a tie. Where two actions have
-    // equal regret the average strategy can favour either, and the smallest
-    // difference in arithmetic order decides which -- so the policy moves by
-    // half its range while the value targets, above, move by 1e-4. Both
-    // answers are equally good, which is what a tie means, and the value is
-    // what the trainer mainly learns.
-    //
-    // Holding a bound here was costing real throughput: it is what blocked
-    // half precision for `f` and `g` and for the trunk's multiplies, and half
-    // precision costs the search 1.8% by `nash_conv`
-    // (`half_precision_leaves_cost_the_search_this_much`) against the 28% of a
-    // knob already rejected on those grounds. A reproducibility bound was
-    // buying the *appearance* of correctness at the price of the arithmetic
-    // the cards are for. Search quality is gated where it can be measured as
-    // search quality.
-    let _ = bad;
+    // The policy tolerance is loose, and deliberately so. A round of four
+    // solves and a round of one give the leaf pass different GEMM shapes, so
+    // cuBLAS sums in a different order; regret matching then turns a 1e-7
+    // difference in an accumulated regret into a visible difference in the
+    // strategy at a cell whose regrets are near zero. Running the same four
+    // streams with *matched* iteration counts gives the same 2.9e-2, so this
+    // is arithmetic order and not a step count read from the wrong solve --
+    // and the targets above, which is what a run trains on, are unmoved.
+    assert!(bad < 5e-2, "sharing a round moved a solve's policy by {bad:e}");
 }

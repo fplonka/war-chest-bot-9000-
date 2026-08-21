@@ -146,8 +146,8 @@ pub enum Call {
 pub enum Dst {
     Kind, Player, Nc, Parent, Roff, Voff, Soff, Util,
     ChildAt, ChildN, Child,
-    LegalBase, LegalOff, LegalChild, CellRow, CellVal,
-    RevBase, RevStart, RevCell,
+    LegalBase, LegalOff, LegalChild, LegalTrans, CellRow, CellVal,
+    RevBase, RevStart, RevSrc, RevCell,
     RvdBase, RvdStart, RvdSrc, RvdP,
     DrawBase, DrawStart, DrawTo, DrawP,
     LevelStart, LevelNode,

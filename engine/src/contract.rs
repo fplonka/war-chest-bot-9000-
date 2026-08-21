@@ -68,19 +68,15 @@ pub struct Contract {
     pub legal_base: Vec<u32>,
     pub legal_off: Vec<u32>,
     pub legal_child: Vec<u32>,
+    pub legal_trans: Vec<u32>,
     /// The parent config each cell belongs to, which the average-strategy
     /// accumulation reads and the reverse gather does not.
     pub cell_row: Vec<u32>,
     /// The value slot each cell's child holds for the acting player, or
-    /// `NO_ROW` where the cell has no transition. It is
-    /// `voff[legal_child[cell]] + trans`, which the backward sweep used to
-    /// form for itself: three loads deep, the middle one scattered, for every
-    /// cell of every iteration. Tree shape only moves when the tree grows, so
-    /// it is resolved once here.
-    ///
-    /// The transition comes back out of it as `cell_val - voff[legal_child]`,
-    /// which is all the expansion walk ever wanted it for, so there is no
-    /// array of transitions beside this one.
+    /// `NO_ROW` where the cell has no transition. The backward sweep used to
+    /// find it with `voff[legal_child[cell]] + legal_trans[cell]`: three loads
+    /// deep, the middle one scattered, for every cell of every iteration. Tree
+    /// shape only moves when the tree grows, so it is resolved once here.
     pub cell_val: Vec<u32>,
 
     // --------------------------- the reach transition, transposed, per node
@@ -88,9 +84,8 @@ pub struct Contract {
     /// when its parent is not a decision node.
     pub rev_base: Vec<u32>,
     pub rev_start: Vec<u32>,
-    /// The parent cell whose strategy weights this entry. Which of the
-    /// parent's configs it belongs to is `cell_row[rev_cell[k]]`, so it is not
-    /// stored twice.
+    /// Parent config, and the parent cell whose strategy weights it.
+    pub rev_src: Vec<u32>,
     pub rev_cell: Vec<u32>,
 
     // ------------------------------------ the draw transition, both ways
@@ -123,7 +118,7 @@ pub struct Contract {
 pub struct Sent {
     /// Nodes described, in `Contract`'s own order.
     pub nodes: usize,
-    pools: [usize; 13],
+    pools: [usize; 15],
 }
 
 impl Contract {
@@ -163,13 +158,15 @@ impl Contract {
         sent.nodes = n;
         // The pools only ever grow, apart from a rewind, so their tail is the
         // whole of the update.
-        let words: [(Dst, &[u32]); 11] = [
+        let words: [(Dst, &[u32]); 13] = [
             (Dst::Child, &self.child),
             (Dst::LegalOff, &self.legal_off),
             (Dst::LegalChild, &self.legal_child),
+            (Dst::LegalTrans, &self.legal_trans),
             (Dst::CellRow, &self.cell_row),
             (Dst::CellVal, &self.cell_val),
             (Dst::RevStart, &self.rev_start),
+            (Dst::RevSrc, &self.rev_src),
             (Dst::RevCell, &self.rev_cell),
             (Dst::RvdStart, &self.rvd_start),
             (Dst::RvdSrc, &self.rvd_src),
@@ -185,9 +182,9 @@ impl Contract {
             .into_iter()
             .enumerate()
         {
-            let at = sent.pools[11 + i].min(v.len());
+            let at = sent.pools[13 + i].min(v.len());
             w.f32s(d, at, &v[at..]);
-            sent.pools[11 + i] = v.len();
+            sent.pools[13 + i] = v.len();
         }
         // Levels are recomputed whenever the tree grows, so they travel whole.
         // It is two entries a node between them.
@@ -359,10 +356,12 @@ impl Contract {
                 let end = at + t.legal_action.len();
                 if c.legal_child.len() < end {
                     c.legal_child.resize(end, 0);
+                    c.legal_trans.resize(end, NO_TRANS);
                     c.cell_row.resize(end, 0);
                     c.cell_val.resize(end, NO_ROW);
                 }
                 c.legal_child[at..end].copy_from_slice(&t.legal_child);
+                c.legal_trans[at..end].copy_from_slice(&t.legal_trans);
                 c.cell_row[at..end].copy_from_slice(&t.cell_row);
                 for cell in 0..t.legal_action.len() {
                     let tr = t.legal_trans[cell];
@@ -493,8 +492,9 @@ impl Contract {
                 for k in 0..kids {
                     count[k + 1] += count[k];
                 }
-                let at = self.rev_cell.len() as u32;
+                let at = self.rev_src.len() as u32;
                 self.rev_start.extend(count.iter().map(|x| x + at));
+                self.rev_src.resize(self.rev_src.len() + count[kids] as usize, 0);
                 self.rev_cell.resize(self.rev_cell.len() + count[kids] as usize, 0);
                 let (s0, s1) = (t.obs_start[ci] as usize, t.obs_start[ci + 1] as usize);
                 for &au in &t.obs_act[s0..s1] {
@@ -508,6 +508,7 @@ impl Contract {
                         }
                         let to = t.legal_trans[cell] as usize;
                         let slot = (at + count[to]) as usize;
+                        self.rev_src[slot] = t.cell_row[cell];
                         self.rev_cell[slot] = self.soff[i] + cell as u32;
                         count[to] += 1;
                     }
@@ -561,8 +562,7 @@ impl Contract {
             let row = (self.rev_base[node] + c as u32) as usize;
             let (lo, hi) = (self.rev_start[row] as usize, self.rev_start[row + 1] as usize);
             for k in lo..hi {
-                let pc = self.rev_cell[k] as usize;
-                v += out[src + self.cell_row[pc] as usize] * cur[pc];
+                v += out[src + self.rev_src[k] as usize] * cur[self.rev_cell[k] as usize];
             }
         } else if self.rvd_base[node] != NO_ROW {
             let row = (self.rvd_base[node] + c as u32) as usize;
@@ -578,15 +578,6 @@ impl Contract {
     #[inline]
     fn block(&self, node: usize, p: usize) -> usize {
         self.roff[node] as usize + if p == 1 { self.nc[node][0] as usize } else { 0 }
-    }
-
-    /// The counterfactual value of one cell: the slot its child holds for the
-    /// acting player, or zero where the cell reaches no information state of
-    /// theirs. `action_value` in `kernels.cu` is the same three lines.
-    #[inline]
-    fn action_value(&self, vals: &[f32], cell: usize) -> f32 {
-        let vc = self.cell_val[cell];
-        if vc == NO_ROW { 0.0 } else { vals[vc as usize] }
     }
 
     /// One traverser's value backpropagation and regret update, level by level
@@ -608,6 +599,7 @@ impl Contract {
         cur: &mut [f32],
         regret: &mut [f32],
         sum: &mut [f32],
+        qval: &mut [f32],
     ) {
         const EPS: f32 = 1e-6;
         let (da, db, dg) = factors;
@@ -662,7 +654,11 @@ impl Contract {
                 }
                 let so = self.soff[i] as usize;
                 let lb = self.legal_base[i] as usize;
+                // The expansion phase reads these as PUCT's Q. A sweep that
+                // computes the values but drops them leaves selection blind,
+                // and the tree it grows is a different tree.
                 let cells = self.legal_off[lb + nc] as usize;
+                qval[so..so + cells].fill(0.0);
                 for c in 0..nc {
                     let (a, b) = (
                         self.legal_off[lb + c] as usize,
@@ -670,12 +666,18 @@ impl Contract {
                     );
                     let mut base = 0.0f32;
                     for cell in a..b {
-                        base += self.action_value(vals, so + cell) * cur[so + cell];
+                        if self.legal_trans[so + cell] == NO_TRANS {
+                            continue;
+                        }
+                        let cv = self.voff[self.legal_child[so + cell] as usize] as usize;
+                        let av = vals[cv + self.legal_trans[so + cell] as usize];
+                        qval[so + cell] = av;
+                        base += av * cur[so + cell];
                     }
                     vals[vi + c] = base;
                     let mut total = 0.0f32;
                     for cell in a..b {
-                        let delta = self.action_value(vals, so + cell) - base;
+                        let delta = qval[so + cell] - base;
                         let old = regret[so + cell];
                         let r = old * if old > 0.0 { da } else { db } + delta;
                         regret[so + cell] = r;
@@ -861,25 +863,14 @@ mod tests {
                                 let row = &sv.sum_strat[i];
                                 sum[so..so + row.len()].copy_from_slice(row);
                             }
-                            c.backprop(p, k, fs, &mut vals, &mut cur, &mut regret, &mut sum);
-                            // The solver keeps one value arena where the device
-                            // keeps one per traverser, so its expansion phase
-                            // cannot re-form Q at selection time the way
-                            // `k_expand` does. Capture it from the pass that has
-                            // just made it current.
-                            for i in 0..sv.nodes.len() {
-                                let n = &sv.nodes[i];
-                                if n.leaf || n.chance || n.player as usize != p {
-                                    continue;
-                                }
-                                let so = sv.soff[i] as usize;
-                                for cell in 0..n.legal_action.len() {
-                                    sv.qval[so + cell] = c.action_value(&vals, so + cell);
-                                }
-                            }
+                            let mut qv = sv.qval.clone();
+                            c.backprop(
+                                p, k, fs, &mut vals, &mut cur, &mut regret, &mut sum, &mut qv,
+                            );
                             sv.vals = vals;
                             sv.cur = cur;
                             sv.regret = regret;
+                            sv.qval = qv;
                             for i in 0..sv.nodes.len() {
                                 let so = sv.soff[i] as usize;
                                 let n = sv.sum_strat[i].len();
@@ -1071,10 +1062,12 @@ mod tests {
                 assert_eq!(got(Dst::LegalBase), &inc.legal_base, "legal_base");
                 assert_eq!(got(Dst::LegalOff), &inc.legal_off, "legal_off");
                 assert_eq!(got(Dst::LegalChild), &inc.legal_child, "legal_child");
+                assert_eq!(got(Dst::LegalTrans), &inc.legal_trans, "legal_trans");
                 assert_eq!(got(Dst::CellRow), &inc.cell_row, "cell_row");
                 assert_eq!(got(Dst::CellVal), &inc.cell_val, "cell_val");
                 assert_eq!(got(Dst::RevBase), &inc.rev_base, "rev_base");
                 assert_eq!(got(Dst::RevStart), &inc.rev_start, "rev_start");
+                assert_eq!(got(Dst::RevSrc), &inc.rev_src, "rev_src");
                 assert_eq!(got(Dst::RevCell), &inc.rev_cell, "rev_cell");
                 assert_eq!(got(Dst::RvdBase), &inc.rvd_base, "rvd_base");
                 assert_eq!(got(Dst::RvdStart), &inc.rvd_start, "rvd_start");
@@ -1187,7 +1180,8 @@ mod tests {
                 let run = |c: &Contract| {
                     let (mut v, mut cu, mut rg, mut sm) =
                         (sv.vals.clone(), sv.cur.clone(), sv.regret.clone(), sum.clone());
-                    c.backprop(0, k, fs, &mut v, &mut cu, &mut rg, &mut sm);
+                    let mut qv = vec![0.0f32; sv.ncells];
+                    c.backprop(0, k, fs, &mut v, &mut cu, &mut rg, &mut sm, &mut qv);
                     (v, cu, rg, sm)
                 };
                 let (va, ca, ga, sa) = run(&inc);
@@ -1317,7 +1311,10 @@ mod tests {
                 }
                 let (mut vals, mut cur, mut regret) =
                     (sv.vals.clone(), sv.cur.clone(), sv.regret.clone());
-                c.backprop(traverser, k, fs, &mut vals, &mut cur, &mut regret, &mut sum);
+                let mut qv = vec![0.0f32; sv.ncells];
+                c.backprop(
+                    traverser, k, fs, &mut vals, &mut cur, &mut regret, &mut sum, &mut qv,
+                );
 
                 let same = |got: &[f32], want: &[f32], what: &str| {
                     assert_eq!(got.len(), want.len(), "{what} length at iteration {t}");

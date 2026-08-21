@@ -31,7 +31,7 @@
 use crate::actions::Action;
 use crate::board::NONE;
 use crate::farm::{Call, Dst, Gate, Reply, Writes};
-use crate::net::{half, Net};
+use crate::net::Net;
 use crate::rng::Rng;
 use crate::rebel::*;
 use crate::state::{Cont, State};
@@ -69,15 +69,6 @@ pub struct Cfg {
     /// one. It is off by default because it changes the search, not just its
     /// speed, and belongs to a ladder rather than a probe.
     pub grow_every: usize,
-    /// Round every leaf value to half precision before CFR sees it.
-    ///
-    /// Not a production setting: it is how the cost of a half-precision
-    /// network is measured *in the units that matter*. The device network's
-    /// arithmetic on tensor cores moves the board vector by 5.39e-2 against a
-    /// 1e-3 parity bound, which sounds fatal and says nothing about whether
-    /// the search that reads it is any worse. `nash_conv` says that, and this
-    /// is the switch it compares across.
-    pub half_leaves: bool,
     /// The regret-update rule.
     pub cfr: Cfr,
     /// Max tree nodes a solve may build. 0 = unlimited. A solve that hits the
@@ -113,7 +104,6 @@ impl Default for Cfg {
             iters: 64,
             expand: 1,
             grow_every: 1,
-            half_leaves: false,
             // A depth-2 uniform tree ran to about a thousand nodes, which is
             // the budget this replaces, spent by growth instead of evenly.
             nodes: 1024,
@@ -1935,17 +1925,11 @@ impl<'a> Solver<'a> {
             };
             let n = self.nc[i][p] as usize;
             let vo = self.voff[i] as usize;
-            // A terminal leaf's value is the game's, not the network's, but it
-            // travels the same arithmetic afterwards -- and in an endgame that
-            // fits entirely inside the subgame it is *all* the leaf values
-            // there are, so the half-precision probe has to round it too or it
-            // rounds nothing at all.
-            let v = u * opp_reach;
-            self.vals[vo..vo + n]
-                .fill(if self.cfg.half_leaves { half(v) } else { v });
+            // A terminal leaf's value is the game's, not the network's, but
+            // it travels the same arithmetic afterwards.
+            self.vals[vo..vo + n].fill(u * opp_reach);
         }
         let d = crate::net::D;
-        let rounding = self.cfg.half_leaves;
         let (reach, roff, ncs, voff, coff, cidx, cf, vals) = (
             &self.reach,
             &self.roff,
@@ -1974,9 +1958,6 @@ impl<'a> Solver<'a> {
             );
             for value in &mut vals[vo..vo + n] {
                 *value *= opp_reach;
-                if rounding {
-                    *value = half(*value);
-                }
             }
         }
     }
