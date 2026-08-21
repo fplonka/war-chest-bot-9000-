@@ -47,7 +47,10 @@ fn random_net(seed: u64) -> Net {
 }
 
 fn cfg(s: u32, c: f32) -> Cfg {
-    Cfg { s, c, ..Default::default() }
+    // Not one. At `prior_temp = 1` the softmax the prior is formed at is the
+    // identity in its temperature, so a backend that ignored the number
+    // altogether would agree with one that applied it.
+    Cfg { s, c, prior_temp: 1.7, ..Default::default() }
 }
 
 fn game_cfg(s: u32, c: f32) -> GameCfg {
