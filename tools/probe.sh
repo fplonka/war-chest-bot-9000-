@@ -49,6 +49,17 @@ device)
     wait $!
     nsys export --type sqlite -o "$REP.sqlite" --force-overwrite true \
         "$REP.nsys-rep" >> "$OUT" 2>&1
+    # A host that sets `NVreg_RestrictProfilingToAdminUsers=1` denies CUPTI to
+    # the container, and nsys then writes a trace with no kernels in it instead
+    # of failing. Say so here rather than let the reports read an empty table.
+    if ! python -c "import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+q = \"select 1 from sqlite_master where name = 'CUPTI_ACTIVITY_KIND_KERNEL'\"
+sys.exit(0 if db.execute(q).fetchone() else 1)" "$REP.sqlite"; then
+        echo "$REP.sqlite holds no CUDA kernels: CUPTI is not permitted on this host" \
+            | tee -a "$OUT" >&2
+        exit 1
+    fi
     python tools/nsys_summary.py "$REP.sqlite" >> "$OUT" 2>&1 || true
     python tools/gaps.py "$REP.sqlite" >> "$OUT" 2>&1 || true
     ;;
