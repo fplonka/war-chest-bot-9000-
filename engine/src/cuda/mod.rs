@@ -2072,18 +2072,16 @@ impl Card {
         let t_up = mark.elapsed();
         let mark = std::time::Instant::now();
 
-        // Every iteration this round was asked for, back to back. Only the
-        // expansion phase needs the host, so once a tree has stopped growing
-        // there is nothing to wake it for and the whole tail rides in one
-        // round -- growth finishes around iteration thirty-eight of sixty-four.
-        // Solves drop out of the grid as they finish their share.
+        // Every iteration this round was asked for, back to back, against the
+        // tree the host handed over -- which does not change until the round
+        // ends. Solves drop out of the grid as they finish their share.
+        //
         // One reach propagation an iteration, at its end -- which is what
         // `Solver::step` does. The device used to run a second one at the top
         // of each iteration, recomputing exactly what the previous iteration's
-        // trailing sweep had left behind; `docs/PERF.md` records finding and
-        // removing the same redundancy on the host. What is left here is the
-        // one before the loop, which is not redundant: the tree grew since the
-        // last round and the new subtrees have no reaches yet.
+        // trailing sweep had left behind. What is left here is the one before
+        // the loop, which is not redundant: the tree grew since the last round
+        // and the new subtrees have no reaches yet.
         self.stage(4, || self.reaches(&b.trees, b.all(), 0, false, 0)).map_err(at("reach"))?;
         for iter in 0..rounds {
             let live = order
@@ -2464,7 +2462,9 @@ impl Card {
 
     /// The expansion phase: `sims` trajectories a solve, and the leaf each one
     /// reached. The simulations of one phase run in order, because each counts
-    /// the visits it passes and the next is meant to see them.
+    /// the visits it passes and the next is meant to see them -- and so do the
+    /// phases, which is why the round's `iters` phases share one buffer and
+    /// one download.
     fn expand(&self, trees: &CudaSlice<u64>, parts: u32, sims: usize, puct: f32,
               iter: usize, iters: usize) -> Res<()> {
         let each = parts as usize * sims;

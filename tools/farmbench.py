@@ -57,6 +57,7 @@ def bench(args, devices, threads):
         threads,
         s=args.s,
         c=args.c,
+        batch=args.batch,
         cfr=args.cfr,
         recursive_rate=args.recursive_rate,
         devices=devices,
@@ -108,6 +109,8 @@ def main():
                    help="expansion simulations a solve runs")
     p.add_argument("--c", type=float, default=PROD.c,
                    help="expansions per regret update")
+    p.add_argument("--batch", type=int, default=PROD.round_batch,
+                   help="regret updates one round of a solve carries")
     p.add_argument("--cfr", default=PROD.cfr, help="the run's regret rule")
     p.add_argument("--query-rate", type=float, default=PROD.query_rate,
                    help="leaves a self-play solve queues, when making a corpus")

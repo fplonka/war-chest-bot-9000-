@@ -65,8 +65,12 @@ fn cfg(s: u32, c: f32) -> Cfg {
 }
 
 fn game_cfg(s: u32, c: f32) -> GameCfg {
+    game_cfg_of(cfg(s, c))
+}
+
+fn game_cfg_of(cfg: Cfg) -> GameCfg {
     GameCfg {
-        agents: [Agent::Sog { cfg: cfg(s, c) }; 2],
+        agents: [Agent::Sog { cfg }; 2],
         collect: Collect::Sog,
         explore: 0.1,
         random_draft: true,
@@ -288,7 +292,15 @@ fn growth_is_the_same_rule_as_the_reference() {
     let mut data: Vec<Data> = (0..n).map(|_| Data::default()).collect();
     let mut gs: Vec<GameStream> = streams
         .iter()
-        .map(|&(seed, s, c)| GameStream::new(seed, game_cfg(s, c)))
+        .map(|&(seed, s, c)| {
+            // One expansion phase a round, deliberately. The replay reads the
+            // arenas the card holds *after* the round and calls them the ones
+            // the phase read, and that is only true when the round held one
+            // phase: a round of `batch` regret updates moves `cur`, `sum`,
+            // `qval` and `reach` between its phases, and the card hands back
+            // the last state alone. Batched growth is the next test's job.
+            GameStream::new(seed, game_cfg_of(Cfg { batch: 1, ..cfg(s, c) }))
+        })
         .collect();
 
     let mut checked = 0usize;
@@ -310,9 +322,9 @@ fn growth_is_the_same_rule_as_the_reference() {
             let Step::Calls(cs) = live[i].advance(&[]) else {
                 panic!("a fresh solve asks for a round")
             };
-            // One expanding iterate a round, and the replay leans on it: the
-            // snapshot taken afterwards is the state the phase read only if
-            // there was exactly one phase.
+            // One expanding iterate a round, which `batch = 1` guarantees:
+            // the snapshot taken afterwards is the state the phase read only
+            // if there was exactly one phase.
             let owed: Vec<usize> = cs
                 .iter()
                 .filter_map(|c| match c {

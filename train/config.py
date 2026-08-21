@@ -30,6 +30,12 @@ class Cfg:
     # them after each regret update, so the solve runs ceil(s / c) updates.
     s: int = 512
     c: float = 8.0
+    # Regret updates one round of a solve carries. The tree is frozen for the
+    # whole round and grows once at its end, from every trajectory the round
+    # sampled, so the per-round cost of re-describing an unchanged tree is paid
+    # once for the whole round instead of once each. (`batch` above is the
+    # optimizer's, which is a different thing entirely.)
+    round_batch: int = 4
     # Student of Games' q_search and q_recursive: leaves drawn from each solve
     # and queued to be re-solved as roots of their own. This is the only way a
     # target is ever taken off the line of play.

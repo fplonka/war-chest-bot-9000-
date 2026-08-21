@@ -130,10 +130,10 @@ pub enum Call {
         /// them per solve rather than taking one set for the batch.
         step: usize,
         iters: usize,
-        /// Expansion simulations after the last iteration. Zero once the tree
-        /// has spent its node budget, which is what lets every remaining
-        /// iteration ride in one call: the host has nothing left to do for
-        /// them, so it should not be woken between them.
+        /// Expansion simulations after *each* of those iterations, so the
+        /// call comes back with `iters * expand` sampled leaves. Zero once the
+        /// tree has spent its node budget, and then the round samples nothing
+        /// and the host is only woken to end the solve.
         expand: usize,
         cfr: Cfr,
         puct: f32,

@@ -647,13 +647,14 @@ struct SolveFarm {
 #[pymethods]
 impl SolveFarm {
     #[new]
-    #[pyo3(signature = (seed, workers, s=512, c=8.0, explore=0.1, random_draft=true, cfr="sog", query_rate=0.9, recursive_rate=0.1, devices=vec![0], roots=None))]
+    #[pyo3(signature = (seed, workers, s=512, c=8.0, batch=4, explore=0.1, random_draft=true, cfr="sog", query_rate=0.9, recursive_rate=0.1, devices=vec![0], roots=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         seed: u64,
         workers: usize,
         s: u32,
         c: f32,
+        batch: usize,
         explore: f32,
         random_draft: bool,
         cfr: &str,
@@ -662,7 +663,7 @@ impl SolveFarm {
         devices: Vec<usize>,
         roots: Option<&str>,
     ) -> PyResult<SolveFarm> {
-        let cfg = Cfg { s, c, cfr: cfr_of(cfr)?, ..Default::default() };
+        let cfg = Cfg { s, c, batch, cfr: cfr_of(cfr)?, ..Default::default() };
         // A corpus makes this a bench rather than a run: the same roots in the
         // same order, so the mix of solve costs in flight does not drift.
         let work = match roots {

@@ -676,6 +676,7 @@ def main():
             args.gen_workers,
             s=args.s,
             c=args.c,
+            batch=args.round_batch,
             explore=args.explore,
             random_draft=args.random_draft,
             cfr=args.cfr,
@@ -848,7 +849,11 @@ def main():
                 "horizon_frac": round(window["horizon_hits"] / games, 3),
                 # How many solves shared a forward pass. It should sit near the
                 # thread count; well below means the round is waiting on
-                # stragglers instead of batching them.
+                # stragglers instead of batching them. A round carries
+                # `round_batch` regret updates, so a solve rides in ceil(64 /
+                # round_batch) rounds rather than sixty-five, and the two
+                # figures below rise with the knob: none of the three compares
+                # across a change to it.
                 "calls_per_round": round(per_round["round_calls"], 2),
                 "rows_per_round": round(per_round["round_rows"], 1),
                 # Milliseconds a round spends inside the device backend — the

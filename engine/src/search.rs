@@ -54,6 +54,16 @@ pub struct Cfg {
     /// several regret updates per expansion, which is the same schedule read
     /// the other way round.
     pub c: f32,
+    /// Regret updates one round carries, at least one.
+    ///
+    /// A round is the unit the host and the backend trade in: the host grows
+    /// the tree, the backend runs the round's updates back to back and samples
+    /// `c` expansion trajectories after each of them, and the host grows again
+    /// from every leaf the round sampled. So the tree lags up to `batch - 1`
+    /// updates behind the trajectories that chose it, and the per-round cost
+    /// of describing a tree that did not change is paid once for `batch`
+    /// updates instead of once each.
+    pub batch: usize,
     /// The regret-update rule.
     pub cfr: Cfr,
     /// PUCT's exploration constant, weighting the prior against the search's
@@ -71,6 +81,7 @@ impl Default for Cfg {
         Cfg {
             s: 512,
             c: 8.0,
+            batch: 4,
             cfr: Cfr::SOG,
             puct: 1.5,
             prior_temp: 1.0,
@@ -2587,27 +2598,34 @@ impl Solver {
                 self.phase = Phase::Done;
                 return Step::Done(self.collect.map(|q| self.harvest(q)));
             }
-            self.at += 1;
-            self.step();
+            // The same round the device runs, on this core: `done` regret
+            // updates against a frozen tree, each sampling `want` trajectories,
+            // and one growth at the end from all of them.
+            let (done, want) = self.round_shape();
             // The expansion phase reads the prior at every node it walks
-            // through, and `step` has just run the batch that any node grown
-            // last round was waiting for.
+            // through, and growth has just run the batch that the nodes it
+            // added were waiting for. Once a round, which is where the card's
+            // policy-head stage sits.
             self.refresh_priors();
-            // Every simulation of one phase runs before any of them is grown,
-            // which is what the device does. Two of them can then land on the
-            // same leaf and the second is dropped; the visit counts a
-            // trajectory leaves behind are what make that rare.
-            let want = self.expansions_at(self.at);
+            // Every simulation of a round runs before any of them is grown.
+            // Two of them can then land on the same leaf and the second is
+            // dropped; the visit counts a trajectory leaves behind are what
+            // make that rare.
             let sampled = self.with_expand_rng(|sv, rng| {
                 let mut sampled = Vec::new();
-                for _ in 0..want {
-                    // A trajectory that runs into a dead end costs that
-                    // simulation and no more; the phase still owes the rest.
-                    // The card does the same, and a phase that ended on the
-                    // first dead end would leave the two searches drawing from
-                    // different points of the same stream ever after.
-                    if let Some(leaf) = sv.sample_leaf(rng) {
-                        sampled.push(leaf);
+                for _ in 0..done {
+                    sv.at += 1;
+                    sv.step();
+                    for _ in 0..want {
+                        // A trajectory that runs into a dead end costs that
+                        // simulation and no more; the phase still owes the
+                        // rest. The card does the same, and a phase that ended
+                        // on the first dead end would leave the two searches
+                        // drawing from different points of the same stream ever
+                        // after.
+                        if let Some(leaf) = sv.sample_leaf(rng) {
+                            sampled.push(leaf);
+                        }
                     }
                 }
                 sampled
@@ -2638,12 +2656,20 @@ impl Solver {
     /// the arenas they read are tens of megabytes and a round trip an iteration
     /// is more traffic than the bus has.
     ///
-    /// The growth rule itself is the same rule, and deliberately so: the same
-    /// stream, the same warp-shaped sums, the same per-simulation treatment of
-    /// a dead end. What the two backends cannot share is the numbers the rule
-    /// reads — a cuBLAS leaf pass and a host one part company in the last bits
-    /// — so two whole solves still build different trees. `cuda_parity` holds
-    /// the rule to the card by giving the host the card's own arenas.
+    /// The round is the one `advance_on_host` runs, iteration for iteration:
+    /// `Cfg::batch` regret updates against a frozen tree, each sampling its
+    /// own trajectories, and one growth from all of them. So two trajectories
+    /// of a round can land on the same leaf and the second is dropped. The
+    /// visit counts a trajectory leaves behind — the paper's virtual loss —
+    /// are what makes that rare rather than usual.
+    ///
+    /// The growth rule itself is the same rule on both, and deliberately so:
+    /// the same stream, the same warp-shaped sums, the same per-simulation
+    /// treatment of a dead end. What the two backends cannot share is the
+    /// numbers the rule reads — a cuBLAS leaf pass and a host one part company
+    /// in the last bits — so two whole solves still build different trees.
+    /// `cuda_parity` holds the rule to the card by giving the host the card's
+    /// own arenas.
     fn advance_on_device(&mut self, replies: &[Reply]) -> Step {
         match self.phase {
             Phase::Fresh => {}
@@ -2680,28 +2706,33 @@ impl Solver {
         }
     }
 
-    /// The next round of iterations, and the expansion phase that ends it.
-    fn iterate_round(&mut self) -> Vec<Call> {
-        /// Iterations a round may carry when none of them owes an expansion.
-        ///
-        /// Each iteration issues a hundred-odd dependent launches from the one
-        /// driver thread, and a round runs as many as its longest member asks
-        /// for, so letting a whole tail ride in one round makes every other
-        /// solve in the round wait for it.
-        const TAIL: usize = 8;
+    /// The next round: iterations it carries, and expansion trajectories each
+    /// of them samples.
+    ///
+    /// Every iteration that owes the same number of expansions rides in one
+    /// round, capped at `batch`. The tree is frozen for the whole round, so
+    /// the host has nothing to do between those iterations and should not be
+    /// woken; it grows once at the end, from every trajectory the round
+    /// sampled. The tail a solve runs once its tree can no longer grow is the
+    /// same rule with `want = 0`, not a case of its own.
+    ///
+    /// The cap is there because each iteration issues a hundred-odd dependent
+    /// launches from the one driver thread, and a round runs as many as its
+    /// longest member asks for, so an unbounded run makes every other solve in
+    /// the round wait for it.
+    fn round_shape(&self) -> (usize, usize) {
         let (iters, at) = (self.cfg.iters(), self.at);
-        // Everything up to and including the next iteration that owes an
-        // expansion rides in one round: the host has nothing to do for the
-        // ones before it, so it should not be woken between them.
-        let next = (at + 1..=iters).find(|&k| self.expansions_at(k) > 0);
-        let done = match next {
-            Some(k) => (k - at).min(TAIL),
-            None => (iters - at).min(TAIL),
-        };
-        let expand = match next {
-            Some(k) if k - at == done => self.expansions_at(k),
-            _ => 0,
-        };
+        let want = self.expansions_at(at + 1);
+        let done = (at + 1..=iters)
+            .take_while(|&k| self.expansions_at(k) == want)
+            .count()
+            .min(self.cfg.batch.max(1));
+        (done, want)
+    }
+
+    /// The next round of iterations, and the expansion phases inside it.
+    fn iterate_round(&mut self) -> Vec<Call> {
+        let (done, expand) = self.round_shape();
         let mut calls = self.growth_calls();
         // The iteration's decay factors read the step count as it stands, so
         // both calls are built before it advances. The tree call also names the
