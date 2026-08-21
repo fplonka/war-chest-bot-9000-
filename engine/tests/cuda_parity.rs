@@ -214,7 +214,11 @@ fn the_cfr_loop_agrees_on_a_fixed_tree() {
         &host.cy[..8.min(host.cy.len())],
         &card.cy[..8.min(card.cy.len())],
     );
-    assert!(bad < 1e-2, "worst target difference {bad:e}");
+    // The same bound the shared-round test holds a target to, and for the same
+    // reason: a target is an average of counterfactual values over a fixed
+    // tree, so the iterations damp the network's own f32 disagreement rather
+    // than amplifying it. Measured, the worst is 4e-6 against values near 2.5.
+    assert!(bad < 1e-4, "worst target difference {bad:e}");
 }
 
 /// With growth on, the device must still produce a sane solve.
@@ -323,6 +327,15 @@ fn a_solve_does_not_depend_on_the_round_it_rides_in() {
 /// The prior is the reason this test exists. It is read by the expansion phase
 /// and by nothing else, so a wrong one picks worse leaves to grow and leaves
 /// every target, every policy and every belief looking exactly as it should.
+///
+/// The bound is 2e-4, and it is what a forward pass can honestly be held to.
+/// None of these arrays is behind a loop -- each is one pass over the weights
+/// -- so the only thing that separates the two backends is the order f32 sums
+/// are accumulated in: cuBLAS against `Lin::run`, and a warp reduction against
+/// a serial dot. Measured, that is 5.5e-5 at worst, in the join cache, which
+/// has the longest chain of sums; the prior, which is a softmax over a handful
+/// of dots, is 2.6e-6. Four times the worst leaves room for another card's
+/// cuBLAS picking a different algorithm and none for a real drift.
 #[test]
 fn the_resident_state_agrees_with_the_cpu_network() {
     if Device::count() == 0 {
@@ -351,7 +364,7 @@ fn the_resident_state_agrees_with_the_cpu_network() {
     ] {
         let bad = worst(h, c, what);
         eprintln!("{what}: worst {bad:e} over {} values", h.len());
-        assert!(bad < 2e-3, "{what} differ by {bad:e}");
+        assert!(bad < 2e-4, "{what} differ by {bad:e}");
     }
     // A prior that was never written would read as the uniform start the
     // scatter lays down, and would then agree with a host that had also never
