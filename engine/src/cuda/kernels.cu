@@ -583,9 +583,11 @@ __global__ void k_scatter(const unsigned int* blob, unsigned int* const* dst,
 // for bit. A level's nodes never depend on each other
 // (`a_level_never_depends_on_itself` pins it), so one launch covers a whole
 // level -- of *every* solve in the round, since solves do not depend on each
-// other either. `blockIdx.y` is the solve, `blockIdx.x` the node within its
-// level, and a solve with a shallower tree simply has no work at the deeper
-// levels.
+// other either. The host lays that level out as a flat list of work items, one
+// per (solve, node), and launches exactly as many blocks as it holds:
+// `blockIdx.x` names the item and the item names the solve. A grid sized
+// instead by the widest solve in the round paid for that width at every solve,
+// and three quarters of its blocks returned at the first load.
 //
 // Everything a solve's iteration reads or writes is named by one descriptor, so
 // a stage takes one array of them rather than thirty arrays of pointers. The
@@ -657,7 +659,6 @@ struct Tree {
     const unsigned int* leaf_node;
     const unsigned int* term;
     unsigned long long* seed;
-    unsigned long long levels;
     unsigned long long nterm;
     /// One value arena per traverser, so both can be backpropagated at once.
     unsigned long long nvals;
@@ -686,14 +687,16 @@ __device__ __forceinline__ float cfr_factor(float t, float p) {
 #define KIND_LEAF 2u
 #define KIND_CHANCE 1u
 
-// The nodes of one level of one solve, or none when this solve is shallower.
-__device__ __forceinline__ bool level_task(const Tree& t, int level, int slot,
-                                           unsigned int* node) {
-    if ((unsigned)level + 1 >= t.levels + 1) return false;
-    unsigned int lo = t.level_start[level], hi = t.level_start[level + 1];
-    if ((unsigned)slot >= hi - lo) return false;
-    *node = t.level_node[lo + slot];
-    return true;
+// A work item: the solve in the high bits, the node's place inside that solve's
+// level in the low ones. `Card::lay` packs them, one per (solve, node),
+// bucketed by level and in solve order -- so the first `k` solves own a prefix
+// of a level's bucket and a round that fewer solves want is a shorter grid.
+#define WORK_BITS 20
+#define WORK_SLOT ((1u << WORK_BITS) - 1)
+
+__device__ __forceinline__ unsigned int work_node(const Tree& t, int level,
+                                                  unsigned int item) {
+    return t.level_node[t.level_start[level] + (item & WORK_SLOT)];
 }
 
 // Where player `p`'s block starts inside node `i`'s reach region.
@@ -711,23 +714,28 @@ __global__ void k_seed_reach(const Tree* trees, int iter) {
         t.reach[t.roff[0] + c] = t.rootb[c];
 }
 
-// Reach probabilities for one level, both players. `avg` picks the reference
-// strategy over the regret-matching iterate, which is what the value pass that
-// produces a solve's targets propagates under.
-__global__ void k_reach_sweep(const Tree* trees, int level, int avg, int also_sum, int iter) {
-    const Tree& t = trees[blockIdx.y];
+// Reach probabilities for one level, a block to each (node, player). `avg`
+// picks the reference strategy over the regret-matching iterate, which is what
+// the value pass that produces a solve's targets propagates under.
+__global__ void k_reach_sweep(const Tree* trees, const unsigned int* work, int at,
+                              int level, int avg, int also_sum, int iter) {
+    unsigned int item = work[at + blockIdx.x];
+    const Tree& t = trees[item >> WORK_BITS];
     if ((unsigned long long)iter >= t.todo) return;
     const float* strat = avg ? t.avg : t.cur;
-    unsigned int node;
-    if (!level_task(t, level, blockIdx.x, &node)) return;
+    unsigned int node = work_node(t, level, item);
     unsigned int par = t.parent[node];
     if (par == NO_ROW) return;
     unsigned int me = t.player[par];
-    for (int p = 0; p < 2; ++p) {
+    // A block to a player. The two write disjoint halves of the node's reach
+    // region and both read a parent the level above already finished, so the
+    // serial loop over them was parallelism left on the floor.
+    unsigned int p = blockIdx.y;
+    {
         unsigned int n = t.nc[2 * node + p];
         unsigned int dst = rbase(t, node, p), src = rbase(t, par, p);
         for (unsigned int c = threadIdx.x; c < n; c += blockDim.x) {
-            if ((unsigned)p != me) {
+            if (p != me) {
                 // The idle player's information state does not move, and the
                 // child's support for them is the same list.
                 t.reach[dst + c] = t.reach[src + c];
@@ -750,19 +758,20 @@ __global__ void k_reach_sweep(const Tree* trees, int level, int avg, int also_su
             t.reach[dst + c] = v;
         }
     }
-    if (!also_sum || t.kind[node] != 0) return;
-    // The accumulation below reads the reach this sweep has just written, and
-    // it reads it by *cell* where the sweep wrote it by *config* -- so a lane
-    // reads an address another warp of this block owns. Both early returns
-    // above are block-uniform, so every thread reaches this.
+    // The accumulation below reads the acting player's reach, which is the half
+    // this block has just written when it is that player's block -- so it is
+    // that block's alone, and still exactly one block a node.
+    if (!also_sum || t.kind[node] != 0 || p != t.player[node]) return;
+    // It reads that reach by *cell* where the sweep wrote it by *config*, so a
+    // lane reads an address another warp of this block owns. Every early return
+    // above is block-uniform, so every thread reaches this.
     __syncthreads();
     // The reach-weighted iterate, added to the running strategy sum. The reach
     // it needs is the one the loop above has just made current, and the thread
     // that owns a config there owns it here, so this costs a level of launches
     // less than a pass of its own would.
-    unsigned int actor = t.player[node];
-    unsigned int an = t.nc[2 * node + actor], so = t.soff[node], lb = t.legal_base[node];
-    unsigned int ra = rbase(t, node, actor);
+    unsigned int an = t.nc[2 * node + p], so = t.soff[node], lb = t.legal_base[node];
+    unsigned int ra = rbase(t, node, p);
     // Flat over the node's cells, not over its configs. A config owns a
     // contiguous run of them, so a thread that walked its own config's run made
     // one memory transaction per lane per step; over `sum` and `cur`, which are
@@ -777,10 +786,12 @@ __global__ void k_reach_sweep(const Tree* trees, int level, int avg, int also_su
 // Value backpropagation for one level, one traverser. `avg` averages under the
 // reference strategy and leaves regrets alone -- the value pass a solve's
 // targets come from; otherwise this is the regret update itself.
-__global__ void k_backprop_sweep(const Tree* trees, int level, int avg, int iter,
+__global__ void k_backprop_sweep(const Tree* trees, const unsigned int* work, int at,
+                                 int level, int avg, int iter,
                                  float alpha, float beta, float gamma, float predict) {
     const float EPS = 1e-6f;
-    const Tree& t = trees[blockIdx.y];
+    unsigned int item = work[at + blockIdx.x];
+    const Tree& t = trees[item >> WORK_BITS];
     if ((unsigned long long)iter >= t.todo) return;
     // This solve's own iterate index, not the round's.
     float m = (float)(t.step + (unsigned long long)iter) + 1.0f;
@@ -788,10 +799,9 @@ __global__ void k_backprop_sweep(const Tree* trees, int level, int avg, int iter
     float dg = powf(m / (m + 1.0f), gamma);
     // The two traversers write disjoint cells and read disjoint value arenas,
     // so they are one launch rather than two.
-    int traverser = blockIdx.z;
+    int traverser = blockIdx.y;
     float* vals = t.vals + traverser * t.nvals;
-    unsigned int node;
-    if (!level_task(t, level, blockIdx.x, &node)) return;
+    unsigned int node = work_node(t, level, item);
     if (t.kind[node] == KIND_LEAF) return;
     unsigned int me = t.player[node];
     unsigned int n = t.nc[2 * node + traverser];
@@ -887,11 +897,12 @@ __global__ void k_backprop_sweep(const Tree* trees, int level, int avg, int iter
 
 // The reach-weighted iterate, added to the running strategy sum. Both players
 // in one pass: a decision node belongs to exactly one of them.
-__global__ void k_avg_block(const Tree* trees, int level, int iter) {
-    const Tree& t = trees[blockIdx.y];
+__global__ void k_avg_block(const Tree* trees, const unsigned int* work, int at,
+                            int level, int iter) {
+    unsigned int item = work[at + blockIdx.x];
+    const Tree& t = trees[item >> WORK_BITS];
     if ((unsigned long long)iter >= t.todo) return;
-    unsigned int node;
-    if (!level_task(t, level, blockIdx.x, &node)) return;
+    unsigned int node = work_node(t, level, item);
     if (t.kind[node] != 0) return;
     unsigned int actor = t.player[node];
     unsigned int an = t.nc[2 * node + actor], so = t.soff[node], lb = t.legal_base[node];
@@ -1371,12 +1382,14 @@ __global__ void k_terminals(const Tree* trees) {
 // `cur` still holds the literal initial policy for a player that has not
 // traversed yet, so a row whose sum has not moved keeps it rather than being
 // reconstructed by a multiply and a divide that need not round back.
-__global__ void k_finish(const Tree* trees, int level, const int* touched) {
-    int mask = touched[blockIdx.y];
+__global__ void k_finish(const Tree* trees, const unsigned int* work, int at,
+                         int level, const int* touched) {
+    unsigned int item = work[at + blockIdx.x];
+    unsigned int part = item >> WORK_BITS;
+    int mask = touched[part];
     if (mask < 0) return;
-    const Tree& t = trees[blockIdx.y];
-    unsigned int node;
-    if (!level_task(t, level, blockIdx.x, &node)) return;
+    const Tree& t = trees[part];
+    unsigned int node = work_node(t, level, item);
     if (t.kind[node] != 0) return;
     unsigned int me = t.player[node], so = t.soff[node], lb = t.legal_base[node];
     unsigned int n = t.nc[2 * node + me];

@@ -690,11 +690,20 @@ struct Solve {
     nexpand: usize,
 }
 
+/// A work item packs the solve above the node's place inside its level. The
+/// kernels' `WORK_BITS` is the same split.
+const WORK_BITS: u32 = 20;
+
 /// A set of solves laid out as one batch, and the device arrays that describe
 /// it. Every stage of an iteration reads these, so laying them out once is what
 /// makes a round of thirty solves one launch a stage rather than thirty.
 struct Batch {
     trees: CudaSlice<u64>,
+    /// One work item per (solve, node), bucketed by level: what a level's
+    /// launch hands to its blocks. `level_at[l]` is where level `l`'s bucket
+    /// starts.
+    work: CudaSlice<u32>,
+    level_at: Vec<u32>,
     coff: CudaSlice<u32>,
     part: CudaSlice<i32>,
     local: CudaSlice<i32>,
@@ -720,9 +729,10 @@ impl Batch {
 struct Prefix {
     parts: u32,
     rows: usize,
-    /// The widest level among them, level by level: the grid a launch covering
-    /// that level needs.
-    wide: Vec<u32>,
+    /// Work items these solves own, level by level. They are the first of each
+    /// bucket, so a launch covering a level is that many blocks from
+    /// `level_at[l]`.
+    items: Vec<u32>,
     /// The most terminals any one of them holds.
     nterm: usize,
 }
@@ -782,7 +792,7 @@ impl Pack {
 
 /// Fields of `struct Tree` in `kernels.cu`, in order. Every one is eight bytes
 /// wide, so the descriptor is positional and needs no packing rules.
-const DESC: usize = 59;
+const DESC: usize = 58;
 
 impl Solve {
     /// What this solve holds, array by array.
@@ -891,7 +901,6 @@ impl Solve {
             self.f.ptr(s), self.g.ptr(s), self.fp.ptr(s),
             self.cidx.ptr(s), self.coff.ptr(s),
             self.leaf_node.ptr(s), self.term.ptr(s), self.seed.ptr(s),
-            self.level_start.len().saturating_sub(1) as u64,
             self.nterm as u64,
             self.nvals as u64,
             self.step as u64,
@@ -1925,10 +1934,14 @@ impl Card {
         let (mut part_of_row, mut local_row, mut base): (Vec<i32>, Vec<i32>, Vec<i32>) =
             (Vec::new(), Vec::new(), Vec::new());
         let (mut rows, mut cells, mut nterm) = (0usize, 0u32, 0usize);
-        let mut wide: Vec<u32> = Vec::new();
-        // `upto[k]` is the batch made of the first `k` solves. Running an
-        // iteration that only some of them want is then a matter of a shorter
-        // grid, with nothing rebuilt.
+        // One work item per (solve, node), bucketed by level, so a level's
+        // launch is exactly as many blocks as it has nodes. A grid sized by the
+        // widest solve instead paid that width at every solve of the round.
+        let (mut bucket, mut items): (Vec<Vec<u32>>, Vec<u32>) = (Vec::new(), Vec::new());
+        // `upto[k]` is the batch made of the first `k` solves. Because the
+        // items of a level are in solve order, those solves own a prefix of
+        // every bucket, so running an iteration that only some of them want is
+        // still a matter of a shorter grid with nothing rebuilt.
         let mut upto: Vec<Prefix> = vec![Prefix::default()];
         {
             let g = self.solves.lock();
@@ -1945,23 +1958,40 @@ impl Card {
                 cells += b.host_coff[2 * b.rows];
                 rows += b.rows;
                 nterm = nterm.max(b.nterm);
-                while wide.len() + 1 < b.level_start.len() {
-                    wide.push(0);
+                while bucket.len() + 1 < b.level_start.len() {
+                    bucket.push(Vec::new());
+                    items.push(0);
                 }
-                for (l, w) in b.level_start.windows(2).zip(wide.iter_mut()) {
-                    *w = (*w).max(l[1] - l[0]);
+                for (l, w) in b.level_start.windows(2).enumerate() {
+                    let n = w[1] - w[0];
+                    assert!(
+                        n <= u32::MAX >> (32 - WORK_BITS) && (part as u64) < 1 << (32 - WORK_BITS),
+                        "a round of {} solves and a level of {n} nodes overflow a work item",
+                        solves.len()
+                    );
+                    bucket[l].extend((0..n).map(|slot| (part as u32) << WORK_BITS | slot));
+                    items[l] += n;
                 }
                 upto.push(Prefix {
                     parts: part as u32 + 1,
                     rows,
-                    wide: wide.clone(),
+                    items: items.clone(),
                     nterm,
                 });
             }
         }
+        let mut level_at: Vec<u32> = Vec::with_capacity(bucket.len() + 1);
+        let mut work: Vec<u32> = Vec::new();
+        for v in &bucket {
+            level_at.push(work.len() as u32);
+            work.extend_from_slice(v);
+        }
+        level_at.push(work.len() as u32);
         let s = &self.stream;
         Ok(Batch {
             trees: Self::alone(s, &mut stage.desc, &desc)?,
+            work: Self::alone(s, &mut stage.work, &work)?,
+            level_at,
             coff: Self::alone(s, &mut stage.lcoff, &coff)?,
             part: Self::alone(s, &mut stage.part_of_row, &part_of_row)?,
             local: Self::alone(s, &mut stage.local_row, &local_row)?,
@@ -1978,10 +2008,10 @@ impl Card {
     /// targets are read off.
     fn value_pass(&self, b: &Batch) -> Res<()> {
         let all = b.all();
-        self.reaches(&b.trees, all, 1, false, 0)?;
+        self.reaches(b, all, 1, false, 0)?;
         self.network(b, all)?;
         self.terminals(&b.trees, all)?;
-        self.backprop(&b.trees, all, 1, 0, Cfr::LINEAR)
+        self.backprop(b, all, 1, 0, Cfr::LINEAR)
     }
 
     /// Time a stage's wall clock, always. No synchronise: what these cost is
@@ -2023,8 +2053,8 @@ impl Card {
     /// expansion sampled.
     ///
     /// A level's nodes never depend on each other and neither do two solves, so
-    /// one launch covers a whole level of the whole round: `blockIdx.y` is the
-    /// solve and `blockIdx.x` the node within its level.
+    /// one launch covers a whole level of the whole round: `blockIdx.x` names a
+    /// work item and the item names the solve and the node.
     fn iterate(&self, calls: &[Call], mine: &[usize], out: &mut Vec<(usize, Reply)>) -> Res<()> {
         if mine.is_empty() {
             return Ok(());
@@ -2082,7 +2112,7 @@ impl Card {
         // trailing sweep had left behind. What is left here is the one before
         // the loop, which is not redundant: the tree grew since the last round
         // and the new subtrees have no reaches yet.
-        self.stage(4, || self.reaches(&b.trees, b.all(), 0, false, 0)).map_err(at("reach"))?;
+        self.stage(4, || self.reaches(&b, b.all(), 0, false, 0)).map_err(at("reach"))?;
         for iter in 0..rounds {
             let live = order
                 .iter()
@@ -2092,11 +2122,11 @@ impl Card {
             let it = iter as i32;
             self.network(&b, p).map_err(at("net"))?;
             self.stage(8, || self.terminals(&b.trees, p)).map_err(at("terminals"))?;
-            self.stage(9, || self.backprop(&b.trees, p, 0, it, k)).map_err(at("backprop"))?;
+            self.stage(9, || self.backprop(&b, p, 0, it, k)).map_err(at("backprop"))?;
             // The regret update moved both players' strategies, so the reaches
             // the next iteration reads are stale until they are pushed down
             // again -- and the average strategy accumulates against those.
-            self.stage(4, || self.reaches(&b.trees, p, 0, true, it)).map_err(at("avg"))?;
+            self.stage(4, || self.reaches(&b, p, 0, true, it)).map_err(at("avg"))?;
             // The phase reads the Q this iteration has just formed, so it
             // belongs inside the loop: a round that runs several iterations
             // samples several times and the host grows all of them at once.
@@ -2176,7 +2206,7 @@ impl Card {
             })
             .collect();
         let touched_d = Self::alone(&self.stream, &mut self.host.lock().touched, &touched)?;
-        self.finish(&all.trees, all.all(), &touched_d)?;
+        self.finish(&all, all.all(), &touched_d)?;
 
         // Only a solve that is collected pays for the values. Those are laid
         // out as their own batch so the pass runs over them alone.
@@ -2218,12 +2248,12 @@ impl Card {
         self.stream.memcpy_dtov(&buf.slice(at..at + n)).map_err(err)
     }
 
-    /// The grid one level of one round takes: `blockIdx.x` is the node within
-    /// the level, `blockIdx.y` the solve. A solve whose tree is shallower than
-    /// another's simply has no work at the deeper levels.
-    fn grid(widest: u32, parts: u32) -> LaunchConfig {
+    /// The grid one level of one round takes: a block to each of the level's
+    /// work items, and `blockIdx.y` for whichever half the kernel splits on --
+    /// the player in the reach sweep, the traverser in backpropagation.
+    fn grid(items: u32, split: u32) -> LaunchConfig {
         LaunchConfig {
-            grid_dim: (widest, parts, 1),
+            grid_dim: (items, split, 1),
             // Four warps: the regret update gives a warp to each of a node's
             // configs, and two of them left half the block idle at every node
             // with more than two.
@@ -2235,8 +2265,9 @@ impl Card {
     /// Push the reach probabilities down from the root beliefs, level by level.
     /// `also_avg` adds the reach-weighted iterate to the running strategy sum,
     /// which needs exactly the reaches this pass has just made current.
-    fn reaches(&self, trees: &CudaSlice<u64>, p: &Prefix, avg: i32, also_avg: bool, iter: i32)
+    fn reaches(&self, b: &Batch, p: &Prefix, avg: i32, also_avg: bool, iter: i32)
         -> Res<()> {
+        let (trees, work) = (&b.trees, &b.work);
         unsafe {
             self.stream
                 .launch_builder(&self.k.seed_reach)
@@ -2249,28 +2280,28 @@ impl Card {
         }
         .map_err(err)?;
         let sum = also_avg as i32;
-        for level in 1..p.wide.len() {
-            if p.wide[level] == 0 {
+        for level in 1..p.items.len() {
+            if p.items[level] == 0 {
                 continue;
             }
-            let level_i = level as i32;
+            let (at, level_i) = (b.level_at[level] as i32, level as i32);
             unsafe {
                 self.stream
                     .launch_builder(&self.k.reach_sweep)
-                    .arg(trees).arg(&level_i).arg(&avg).arg(&sum).arg(&iter)
-                    .launch_unit(Self::grid(p.wide[level], p.parts))
+                    .arg(trees).arg(work).arg(&at).arg(&level_i).arg(&avg).arg(&sum).arg(&iter)
+                    .launch_unit(Self::grid(p.items[level], 2))
             }
             .map_err(err)?;
         }
         // The root's own row. It is not a child of anything, so the sweep never
         // reaches it and its share of the sum is a launch of its own.
-        if also_avg && !p.wide.is_empty() {
-            let level_i = 0i32;
+        if also_avg && p.items.first().is_some_and(|&n| n > 0) {
+            let (at, level_i) = (b.level_at[0] as i32, 0i32);
             unsafe {
                 self.stream
                     .launch_builder(&self.k.avg_block)
-                    .arg(trees).arg(&level_i).arg(&iter)
-                    .launch_unit(Self::grid(p.wide[0], p.parts))
+                    .arg(trees).arg(work).arg(&at).arg(&level_i).arg(&iter)
+                    .launch_unit(Self::grid(p.items[0], 1))
             }
             .map_err(err)?;
         }
@@ -2279,21 +2310,18 @@ impl Card {
 
     /// Value backpropagation up the levels, for one traverser. `avg` averages
     /// under the reference strategy and leaves the regrets alone.
-    fn backprop(&self, trees: &CudaSlice<u64>, p: &Prefix, avg: i32, iter: i32, k: Cfr)
-        -> Res<()> {
-        for level in (0..p.wide.len()).rev() {
-            if p.wide[level] == 0 {
+    fn backprop(&self, b: &Batch, p: &Prefix, avg: i32, iter: i32, k: Cfr) -> Res<()> {
+        for level in (0..p.items.len()).rev() {
+            if p.items[level] == 0 {
                 continue;
             }
-            let level_i = level as i32;
-            let mut cfg = Self::grid(p.wide[level], p.parts);
-            cfg.grid_dim.2 = 2;
+            let (at, level_i) = (b.level_at[level] as i32, level as i32);
             unsafe {
                 self.stream
                     .launch_builder(&self.k.backprop_sweep)
-                    .arg(trees).arg(&level_i).arg(&avg).arg(&iter)
+                    .arg(&b.trees).arg(&b.work).arg(&at).arg(&level_i).arg(&avg).arg(&iter)
                     .arg(&k.alpha).arg(&k.beta).arg(&k.gamma).arg(&k.predict)
-                    .launch_unit(cfg)
+                    .launch_unit(Self::grid(p.items[level], 2))
             }
             .map_err(err)?;
         }
@@ -2501,17 +2529,17 @@ impl Card {
     /// The reference strategy, once the tree has stopped growing.
     /// `touched` is per solve: which players' running sums have moved, or `-1`
     /// for a solve that is not asking for this at all.
-    fn finish(&self, trees: &CudaSlice<u64>, p: &Prefix, touched: &CudaSlice<i32>) -> Res<()> {
-        for level in 0..p.wide.len() {
-            if p.wide[level] == 0 {
+    fn finish(&self, b: &Batch, p: &Prefix, touched: &CudaSlice<i32>) -> Res<()> {
+        for level in 0..p.items.len() {
+            if p.items[level] == 0 {
                 continue;
             }
-            let level_i = level as i32;
+            let (at, level_i) = (b.level_at[level] as i32, level as i32);
             unsafe {
                 self.stream
                     .launch_builder(&self.k.finish)
-                    .arg(trees).arg(&level_i).arg(touched)
-                    .launch_unit(Self::grid(p.wide[level], p.parts))
+                    .arg(&b.trees).arg(&b.work).arg(&at).arg(&level_i).arg(touched)
+                    .launch_unit(Self::grid(p.items[level], 1))
             }
             .map_err(err)?;
         }
@@ -2543,6 +2571,7 @@ struct Stage {
     /// The batch descriptors. These take a device buffer of their own per call,
     /// because a round can hold three batches at once.
     desc: Host<u64>,
+    work: Host<u32>,
     lcoff: Host<u32>,
     part_of_row: Host<i32>,
     local_row: Host<i32>,
