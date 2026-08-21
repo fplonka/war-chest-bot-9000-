@@ -347,7 +347,9 @@ const TILE: usize = 16384;
 /// reallocates `log(final/first)/log(1.25)` times over a solve and copies
 /// everything it holds each time -- five times its final size in
 /// device-to-device traffic and, worse, three driver calls per growth on the
-/// one thread a round can least afford.
+/// one thread a round can least afford. Not four times at a time either, even
+/// though that is fewer still: headroom nobody is using is a solve that does
+/// not fit.
 ///
 /// Allocation is stream-ordered, so a freed buffer goes back to a pool rather
 /// than to the driver, and it can only serve a request it is large enough for.
