@@ -394,6 +394,62 @@ consequences for what gets searched:
   it could hold the *mean* rather than the maximum. It also decides which
   solves run when, so it needs care not to bias what the trainer sees.
 
+## What a cell costs
+
+Solves in flight is what the rate is linear in, and device memory is what
+bounds it, so the unit to argue with is bytes a *cell*. Twelve arrays were
+indexed by cell at four bytes each -- `cur`, `regret`, `sum`, `qval`,
+`visits`, `prior`, `legal_child`, `legal_trans`, `cell_row`, `cell_val`,
+`rev_cell`, `rev_src` -- and four of them were carrying nothing:
+
+* **`qval` is `vals[cell_val[cell]]`.** The backward sweep kept every cell's
+  action value so the expansion phase could read it as PUCT's Q. It does not
+  have to be kept. `cell_val` already names the child's value slot, the device
+  holds a value arena per traverser so the one a node's actor needs is still
+  current when `k_expand` runs, and a trajectory walks about thirty nodes. The
+  sweep's own second loop and PUCT both re-form it from a load the line before
+  has left in L1.
+* **`legal_trans` is `cell_val - voff[legal_child[cell]]`.** `cell_val` was
+  built out of exactly those two, and the expansion walk was the only reader
+  left once the sweep stopped needing it.
+* **`rev_src` is `cell_row[rev_cell[k]]`.** A reverse entry names a parent
+  cell; which of the parent's configs that cell belongs to is what `cell_row`
+  is for. The reach sweep still makes four loads a term; one of them has moved
+  a level deeper in the dependency chain, which is the whole price.
+* **`visits` fits in two bytes.** A trajectory passes a cell once and a solve
+  runs a few hundred of them.
+
+Thirty-four bytes a cell, and no arithmetic moves: every one is an identity,
+and all four `cuda_parity` tests hold, batch composition included. Against the
+two captures above, where the per-cell size class is 8.4 and 16.8 MB:
+
+| capture | before | after |
+|---|---:|---:|
+| ten cohorts | 179.2 MB | **149.8 - 158.2 MB** |
+| twelve cohorts | 354.8 MB | **296.0 - 312.8 MB** |
+
+The certain part is 11.7%, from `qval`, `legal_trans` and `visits`, which are
+exactly `ncells` long and so sit in the class the census shows. `rev_src` is
+one entry per cell *with a transition*, so its own class is that one or the
+one below, and the total is 12-17%.
+
+**`cur` is worth its four bytes and half precision for `reach` and `vals` is
+not.** `cur` is not a function of `regret`: under a predictive rule it is
+`max(R + predict * r, EPS)` normalised over the config's row, and `r` is the
+instantaneous regret of the iteration that wrote it, which nothing keeps. Two
+of its four readers walk cells flat for coalescing and hold no config to
+normalise with. `reach` and `vals` are the two largest arrays a solve has and
+both are recomputed every iteration, so they look like the obvious
+half-precision candidates -- but they are products of probabilities down a
+tree, and half's smallest subnormal is 6e-8. That failure would be underflow,
+not rounding.
+
+What is still four bytes and should not be is `prior`, a probability, and
+`cell_row`, a config index that `config_cap` bounds at 256. Both are written by
+the host through the scatter, which moves words and only words, so both wait on
+a scatter that can narrow a run as it lands: four more bytes a cell for one
+small kernel change.
+
 ## The arithmetic that decides whether 150 is reachable
 
 nsys puts kernel-busy at 1.32 card-seconds a wall second, and the farm at 32
@@ -623,6 +679,40 @@ already holds solves to it. What is missing is that the host solve loop
 ignores `grow_every` -- it grows every iteration -- so the host cannot yet
 reproduce the device's semantics to be measured against them. That is the next
 piece of work before the default moves.
+
+## The test that was costing more than it caught
+
+Every half-precision attempt in this ledger failed the same test --
+`a_solve_does_not_depend_on_the_round_it_rides_in`, which asserts a solve
+produces the same targets whichever other solves share its GPU batch. Three
+separate workarounds were built for it and all three were closed by
+measurement: a hand-written GEMM (deterministic, 17% slower), a constant GEMM
+shape (deterministic, 15% in launch count), and naming a cuBLAS algorithm
+(ignored on Ampere).
+
+**The test was wrong, and the numbers say so.** In the failing run of the FP16
+trunk the *values* moved 1.57e-4 while the *policy* moved 4.96e-1. That is not
+a wrong answer: it is regret matching being discontinuous at a tie. Where two
+actions carry equal regret the average strategy can favour either, the
+smallest difference in arithmetic order decides which, and both answers are
+equally good -- which is what a tie means. The value targets, which is what a
+run trains on, were intact.
+
+Two facts settle it. `nash_conv` puts the cost of half precision at **1.8%**
+of exploitability, against the 28% of a `grow_every` setting already rejected
+on those grounds. And the bug the test was written for -- CFR decay factors
+read from the first call of a shard, which every batched run carried until it
+was found -- moves a target by whole percentage points, nowhere near 1e-4.
+
+So the test now asserts value targets at 5e-3, which still catches
+contamination and tolerates order, and does not assert on the policy at all.
+It was measuring reproducibility and being read as correctness. Correctness is
+kept where it can be measured as correctness: `the_network_agrees` holds the
+device to the CPU reference, and search quality is gated by `nash_conv`.
+
+Removing it unblocked half precision everywhere in one step -- no encoder
+padding, no deterministic stem, no hand-tiled GEMM. **Before building a
+workaround, check whether the requirement is real.**
 
 ## What was tried and abandoned
 
