@@ -22,8 +22,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::net::{Net, C, CFGH, D, JW, POOL, TYPE};
-use crate::pbs::{Belief, CFEAT, LOOSE, NSLOT, NTYPE, PUBFEAT};
+use crate::net::Net;
+use crate::pbs::Belief;
 use crate::search::{Cfg, Cfr, Solved, Solver, Step};
 use crate::selfplay::{Data, GameCfg, GameStream};
 use crate::state::State;
@@ -1057,20 +1057,6 @@ impl Drop for Cards {
         }
     }
 }
-
-/// Shapes the driver needs to lay a batch out. Kept here so the device code
-/// and the CPU reference agree on them by construction.
-pub const TRUNK_IN: usize = PUBFEAT;
-pub const TRUNK_OUT: usize = D;
-pub const TRUNK_CACHE: usize = JW;
-pub const CARDS_PER_ROW: usize = NTYPE * TYPE;
-pub const CONFIG_IN: usize = CFEAT;
-pub const CONFIG_F: usize = D;
-pub const CONFIG_G: usize = POOL;
-pub const JOIN_OUT: usize = D;
-pub const BOARD_WIDTH: usize = 2 * C + LOOSE;
-pub const CFG_SLOTS: usize = NSLOT;
-pub const CFG_HIDDEN: usize = CFGH;
 
 #[cfg(test)]
 mod tests {

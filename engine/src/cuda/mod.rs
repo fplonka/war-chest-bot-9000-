@@ -52,6 +52,7 @@ type Res<T> = Result<T, String>;
 /// that ends the round. The rest are device stages, and are only filled when
 /// `WARCHEST_STAGES` is set -- separating them means synchronising after each,
 /// which changes the thing being measured, so it is off by default.
+///
 /// The last two are byte counts rather than nanoseconds. They ride the same
 /// accumulator, and `leaf_breakdown` scales everything by 1e6 -- which turns
 /// nanoseconds into milliseconds and bytes into megabytes, so both read
@@ -78,8 +79,8 @@ pub static CENSUS: parking_lot::Mutex<Vec<(&'static str, usize)>> =
     parking_lot::Mutex::new(Vec::new());
 
 /// Device bytes every card's solve arenas hold right now -- a level, which
-/// `leaf_breakdown` reports without resetting. `Device::held` is the same
-/// number per card, and is what admits a solve or holds it back.
+/// `leaf_breakdown` reports without resetting. `Device::room_for` asks the same
+/// question per card, and is what admits a solve or holds it back.
 pub static HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub static LEAF_NS: [std::sync::atomic::AtomicU64; STAGES.len()] =

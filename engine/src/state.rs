@@ -26,9 +26,9 @@ pub const MAX_MAIN_PLAYS: u16 = 256;
 /// a draw. Evaluation always runs at zero.
 pub const CAP_MARKER_VALUE_DEFAULT: f32 = 0.15;
 
-/// 0.15f32 in IEEE-754 bits (`AtomicU32` cannot be initialised from a float).
+/// The value in flight, as bits: an `AtomicF32` is not a thing.
 static CAP_MARKER_VALUE: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0x3E19_999A);
+    std::sync::atomic::AtomicU32::new(CAP_MARKER_VALUE_DEFAULT.to_bits());
 
 /// The current horizon payoff per marker of lead.
 #[inline]

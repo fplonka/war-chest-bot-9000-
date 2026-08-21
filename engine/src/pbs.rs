@@ -1002,13 +1002,6 @@ pub fn rules_table_hash() -> u64 {
 /// `Net::board` gathers them onto the hexes the one-hots name.
 pub const PUBFEAT: usize = OFF_LOOSE + LOOSE;
 
-/// Round divisor. Measured on the starter draft (`examples/featstats.rs`):
-/// rounds reach 81 under random play and 121 under one-ply greedy, because a
-/// drained reserve makes rounds short in coin plays and therefore numerous.
-/// The previous divisor of 40 left this feature pinned at 1.0 for most of
-/// essentially every game.
-pub const MAX_ROUND: f32 = 128.0;
-
 /// Belief weights, normalised the way the network consumes them. `w` is the
 /// caller's *unnormalised* reach; normalisation matches `Belief::normalize`,
 /// including its fallback to uniform when the weights have underflowed.
