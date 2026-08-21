@@ -42,7 +42,10 @@ class Cfg:
     # Student of Games weights the two heads, `wv * huber + wp * cross_entropy`.
     # The value head is what CFR consumes, so it keeps weight one and the
     # policy -- which only steers the expansion phase -- comes in under it.
-    policy_w: float = 0.5
+    # The paper's own numbers are 0.01 for poker and 0.05 for Scotland Yard,
+    # and the cross entropy here runs 60--1000x the value Huber, so 0.05 is
+    # what leaves the shared trunk answering to the value head.
+    policy_w: float = 0.05
     # ReBeL's and Student of Games' off-policy exploration rate; both run 0.1.
     explore: float = 0.1
     # The horizon payoff per marker of lead. It is what carries the cold start:
