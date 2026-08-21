@@ -37,16 +37,28 @@ use rayon::prelude::*;
 /// because a batch spans solves and each draft has its own card table.
 #[derive(Clone)]
 pub enum Call {
-    /// New leaves: physical rows in, board vectors and the join cache out.
+    /// New leaves: public states in, board vectors and the join cache out.
     ///
     /// `solve` names the solve these rows belong to and `at` the row they
     /// start at, so `at == 0` is a fresh solve and anything else extends one.
     /// Both exist because the board vectors and the join cache are properties
     /// of a leaf rather than of an iteration: the backend keeps them, and the
     /// sixty-four join calls that follow do not carry them again.
+    ///
+    /// Rows and boards are counted apart. The trunk reads the public state and
+    /// nothing else, and coin plays commute, so a sixth to a quarter of a
+    /// solve's rows repeat a public state an earlier row already carried.
+    /// `xpub` holds the distinct ones and `board_of` says which board each of
+    /// this call's rows reads.
     Trunk {
         solve: usize,
         at: usize,
+        rows: usize,
+        /// One entry per row of this call: the board it reads, indexed from
+        /// the start of the solve.
+        board_of: Vec<u32>,
+        boards_at: usize,
+        boards: usize,
         xpub: Vec<f32>,
         cards: Vec<f32>,
         /// The belief index of exactly these rows: which config each query's
@@ -54,7 +66,6 @@ pub enum Call {
         /// is fixed when the leaf is made, so it travels once, here.
         cidx: Vec<u32>,
         coff: Vec<u32>,
-        rows: usize,
     },
     /// New configs: `f(c)` for the readout and `g(c)` for the pooling. Both
     /// stay with the backend for the same reason the board vectors do — they
@@ -283,11 +294,11 @@ impl Call {
     pub fn run(&self, net: &Net) -> Reply {
         let mut r = Reply::default();
         match self {
-            Call::Trunk { xpub, cards, rows, .. } => {
-                // One row a leaf in `xpub`, and one card table per solve --
-                // `board` reads the physical view of that.
-                net.board(xpub, cards, *rows, CARD_ROWS, &mut r.a);
-                net.join_cache(&r.a, *rows, &mut r.b);
+            Call::Trunk { xpub, cards, boards, .. } => {
+                // One row a distinct public state in `xpub`, and one card
+                // table per solve -- `board` reads the physical view of that.
+                net.board(xpub, cards, *boards, CARD_ROWS, &mut r.a);
+                net.join_cache(&r.a, *boards, &mut r.b);
             }
             Call::Configs { phi, owner, cards, n, .. } => {
                 net.configs(phi, owner, *n, cards, &mut r.a, &mut r.b, &mut r.c);

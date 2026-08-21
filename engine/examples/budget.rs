@@ -17,7 +17,6 @@
 //!
 //! `cargo run --release --example budget -- <weights.bin> [roots] [games]`
 
-use std::collections::HashSet;
 
 use rayon::prelude::*;
 use warchest::rng::Rng;
@@ -157,17 +156,10 @@ fn main() {
                 one.rows = sh.rows as f64;
                 one.ncfg = sh.ncfg as f64;
                 one.depth = sh.depth as f64;
-                // How many of the rows stand on a board the trunk has already
-                // seen. A public state is the board, the piles and the flags,
-                // which is exactly what the row encoding holds.
-                let mut seen: HashSet<Vec<u8>> = HashSet::new();
-                let mut row = vec![0u8; warchest::pbs::ROW_BYTES];
-                let ctx2 = warchest::pbs::Ctx::new(st);
-                for &node in sv.leaf_rows.iter() {
-                    warchest::pbs::pack_row(&sv.states[node], &ctx2, &mut row);
-                    seen.insert(row.clone());
-                }
-                one.distinct = seen.len() as f64;
+                // How many of the rows stand on a public state the trunk has
+                // not already seen. The solver interns them, so this is what
+                // it kept.
+                one.distinct = sh.boards as f64;
                 // A node's children carry the *same* support for the idle
                 // player, and the tree shares those lists by pointer rather
                 // than copying them, so identity is the grouping.

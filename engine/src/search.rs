@@ -231,9 +231,13 @@ pub struct Trace {
 pub struct Shape {
     pub nodes: usize,
     /// Network rows: one per decision node at a coin play, ever created. The
-    /// trunk runs once per row; the join runs over all of them every iteration,
-    /// including the rows of nodes that growth has since made interior.
+    /// join runs over all of them every iteration, including the rows of nodes
+    /// that growth has since made interior.
     pub rows: usize,
+    /// Distinct public states among those rows. The trunk runs once per board,
+    /// not once per row: coin plays commute, so a tree spanning one round
+    /// reaches the same public state several ways.
+    pub boards: usize,
     pub cells: usize,
     /// Distinct configs the solve interned. `f` is `[ncfg, D]` and the readout
     /// gathers rows of it, so this is the working set that decides whether the
@@ -505,6 +509,7 @@ struct Mark {
     ncells: usize,
     ncfg: usize,
     leaf_rows: usize,
+    nboards: usize,
     term_leaves: usize,
     leaf_coff: usize,
     leaf_cidx: usize,
@@ -739,6 +744,18 @@ impl std::hash::BuildHasher for KeyHash {
     }
 }
 
+/// One public encoding, hashed. A word at a time, because the row is nine
+/// hundred floats and a byte-at-a-time hash of it would cost more than the
+/// duplicate trunk row it saves.
+fn row_key(row: &[f32]) -> u64 {
+    let mut h = 0u64;
+    for &x in row {
+        h = (x.to_bits() as u64 ^ h).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= h >> 29;
+    }
+    h
+}
+
 fn take_buf(role: usize) -> Vec<f32> {
     BUFS.with(|b| b.borrow_mut()[role].pop().unwrap_or_default())
 }
@@ -923,6 +940,7 @@ pub struct Solver {
     /// subgame and none of it moves when the tree grows, so a growth round
     /// only ever runs the network on what it just added.
     batch_rows: usize,
+    batch_boards: usize,
     batch_cfgs: usize,
     /// `[ncfg, D]` readout rows `f(c)` and `[ncfg, POOL]` pooling vectors
     /// `g(c)`. Both survive every CFR iteration.
@@ -933,11 +951,32 @@ pub struct Solver {
     /// `[2, NTYPE, TYPE]`: the printed-card tokens, one table per player view.
     /// The draft is fixed for the solve, so this is built once.
     pub cards: Vec<f32>,
-    /// `[rows, D]` board vectors, and their `[rows, JW]` projection into the
-    /// join's first layer. Neither moves between CFR iterations.
+    /// `[boards, D]` board vectors, and their `[boards, JW]` projection into
+    /// the join's first layer. Neither moves between CFR iterations.
     pub pb: Vec<f32>,
     pub jp: Vec<f32>,
-    /// Expanded public encoding, filled during the build.
+    /// `[row]` -> the board vector the row reads.
+    ///
+    /// The trunk reads the public state and nothing else, and a tree that
+    /// spans one round is full of transpositions: coin plays commute, so two
+    /// orders of the same two plays reach the same public state. A sixth to a
+    /// quarter of a solve's rows are duplicates of an earlier one, measured.
+    /// So the public encoding is interned and the trunk runs once per distinct
+    /// public state, which is one less row to encode, to marshal, to send and
+    /// to multiply.
+    ///
+    /// The belief index stays per row. Two rows that share a board sit at
+    /// different places in the tree, so their reaches and their supports are
+    /// their own.
+    pub(crate) board_of: Vec<u32>,
+    /// Hash of a public encoding -> the board that holds it. A hit is checked
+    /// against the row itself, so a collision costs a duplicate board rather
+    /// than a wrong answer.
+    bmap: std::collections::HashMap<u64, u32, KeyHash>,
+    /// Distinct public encodings `xpub` holds. Pooled buffers keep their
+    /// length across solves, so this cannot be read off `xpub.len()`.
+    pub nboards: usize,
+    /// Expanded public encoding, one row a distinct public state.
     pub(crate) xpub: Vec<f32>,
     /// The mirrored view of the first leaf, which is all the card table wants.
     mirror0: Vec<f32>,
@@ -1068,8 +1107,12 @@ impl Solver {
             cphi: take_buf(R_CPHI),
             cplayer: Vec::new(),
             cmap: std::collections::HashMap::with_capacity_and_hasher(1024, KeyHash),
+            board_of: Vec::new(),
+            bmap: std::collections::HashMap::with_capacity_and_hasher(1024, KeyHash),
+            nboards: 0,
             ncfg: 0,
             batch_rows: 0,
+            batch_boards: 0,
             batch_cfgs: 0,
             cf: take_buf(R_CF),
             cg: take_buf(R_CG),
@@ -1313,6 +1356,7 @@ impl Solver {
             ncells: self.ncells,
             ncfg: self.ncfg,
             leaf_rows: self.leaf_rows.len(),
+            nboards: self.nboards,
             term_leaves: self.term_leaves.len(),
             leaf_coff: self.leaf_coff.len(),
             leaf_cidx: self.leaf_cidx.len(),
@@ -1345,6 +1389,12 @@ impl Solver {
         self.wants_prior.retain(|&i| (i as usize) < m.nodes);
         self.row_of.truncate(m.nodes);
         self.leaf_rows.truncate(m.leaf_rows);
+        // `xpub` is written by index and reused, so only the count and the
+        // interning map name boards that no longer exist. A board an abandoned
+        // row shared with a surviving one stays, and stays right.
+        self.board_of.truncate(m.leaf_rows);
+        self.nboards = m.nboards;
+        self.bmap.retain(|_, &mut b| (b as usize) < m.nboards);
         self.term_leaves.truncate(m.term_leaves);
         self.leaf_coff.truncate(m.leaf_coff);
         self.leaf_cidx.truncate(m.leaf_cidx);
@@ -1817,20 +1867,40 @@ impl Solver {
         &self.reach[at..at + self.nc[i][p] as usize]
     }
 
-    /// One leaf's public encoding.
+    /// One leaf's public encoding, interned: the board it reads.
     ///
     /// A row, not two. The board is public and the trunk reads the physical
     /// view only -- the mirrored one was written for every leaf, carried
     /// through the call, and gathered past by everything that read it. What
     /// still wants it is the card table, which holds a view a seat and is
-    /// built once a solve off the first row; that one mirror is kept here.
-    fn encode(&mut self, s: &State, row: usize) {
-        let at = row * PUBFEAT;
+    /// built once a solve off the first board; that one mirror is kept here.
+    ///
+    /// The encoding is written where the next board would go and kept only if
+    /// no earlier board already holds it. Writing first is what makes the
+    /// comparison free: the row has to be built to be hashed either way.
+    fn encode(&mut self, s: &State) -> u32 {
+        let at = self.nboards * PUBFEAT;
+        if self.xpub.len() < at + PUBFEAT {
+            // Grow in chunks so the zero-fill happens a handful of times per
+            // solve, and not at all once the pooled buffer is warm.
+            self.xpub.resize(at + 128 * PUBFEAT, 0.0);
+        }
         write_public_features(s, &self.ctx, &mut self.xpub[at..at + PUBFEAT]);
-        if row == 0 {
+        if self.nboards == 0 {
             self.mirror0.resize(PUBFEAT, 0.0);
             write_public_features(&s.mirror(), &self.ctx.mirrored(), &mut self.mirror0);
         }
+        let key = row_key(&self.xpub[at..at + PUBFEAT]);
+        if let Some(&b) = self.bmap.get(&key) {
+            let old = b as usize * PUBFEAT;
+            if self.xpub[old..old + PUBFEAT] == self.xpub[at..at + PUBFEAT] {
+                return b;
+            }
+        }
+        let b = self.nboards as u32;
+        self.bmap.insert(key, b);
+        self.nboards += 1;
+        b
     }
 
     /// One row of the network batch: its public encoding, and its configs
@@ -1843,14 +1913,8 @@ impl Solver {
             "a network row must be a MainPlay state"
         );
         let _t = timed!(PUBFEAT);
-        let row = self.leaf_coff.len() / 2;
-        let at = row * PUBFEAT;
-        if self.xpub.len() < at + PUBFEAT {
-            // Grow in chunks so the zero-fill happens a handful of times per
-            // solve, and not at all once the pooled buffer is warm.
-            self.xpub.resize(at + 128 * PUBFEAT, 0.0);
-        }
-        self.encode(s, row);
+        let board = self.encode(s);
+        self.board_of.push(board);
         for p in 0..2 {
             let res = reserve(s, p as u8, &self.ctx);
             self.leaf_coff.push(self.leaf_cidx.len() as u32);
@@ -1959,12 +2023,12 @@ impl Solver {
                 let both = [&self.xpub[..PUBFEAT], &self.mirror0[..]].concat();
                 self.nets.value.cards(&both, 2, &mut self.cards);
             }
-            // Exactly the fresh rows. `xpub` is a grown scratch buffer, so an
-            // open-ended slice would carry whatever the last, larger subgame
-            // left behind — invisible to a solve evaluating alone, and wrong
-            // the moment the farm concatenates this call with another.
-            let at = self.batch_rows * PUBFEAT;
-            let end = at + fresh_rows * PUBFEAT;
+            // Exactly the fresh boards. `xpub` is a grown scratch buffer, so
+            // an open-ended slice would carry whatever the last, larger
+            // subgame left behind — invisible to a solve evaluating alone, and
+            // wrong the moment the farm concatenates this call with another.
+            let at = self.batch_boards * PUBFEAT;
+            let end = self.nboards * PUBFEAT;
             // The belief index of exactly the rows this call makes. A leaf's
             // support is fixed when the leaf is, so it travels with the trunk
             // and never again. `leaf_coff` holds a query's *start* and nothing
@@ -1977,11 +2041,14 @@ impl Solver {
             calls.push(Call::Trunk {
                 solve: self.slot,
                 at: self.batch_rows,
+                rows: fresh_rows,
+                board_of: self.board_of[self.batch_rows..].to_vec(),
+                boards_at: self.batch_boards,
+                boards: self.nboards - self.batch_boards,
                 xpub: self.xpub[at..end].to_vec(),
                 cards: self.cards.clone(),
                 cidx: self.leaf_cidx[cs..].to_vec(),
                 coff,
-                rows: fresh_rows,
             });
             crate::prof::work(fresh_rows, 0, 0, 0);
         }
@@ -2010,6 +2077,7 @@ impl Solver {
             self.pb.extend_from_slice(&r.a);
             self.jp.extend_from_slice(&r.b);
             self.batch_rows = self.leaf_rows.len();
+            self.batch_boards = self.nboards;
             at += 1;
         }
         if self.ncfg > self.batch_cfgs {
@@ -2090,8 +2158,9 @@ impl Solver {
         // `xb` is grown by `fit` and never shrinks, so a subgame smaller than
         // an earlier one would otherwise hand the batch a trailing tail.
         self.nets.value.join(
-            &self.pb[..rows * crate::net::D],
-            &self.jp[..rows * crate::net::JW],
+            &self.pb[..self.nboards * crate::net::D],
+            &self.jp[..self.nboards * crate::net::JW],
+            &self.board_of[..rows],
             &self.xb[..2 * rows * crate::net::POOL],
             rows,
             traverser,
@@ -2887,7 +2956,7 @@ impl Solver {
         let mut base = Vec::with_capacity(want.len());
         for &i in &want {
             base.push(board_of.len() as u32);
-            let at = self.row_of[i] as usize * d;
+            let at = self.board_of[self.row_of[i] as usize] as usize * d;
             let mine = (boards.len() / d) as u32;
             boards.extend_from_slice(&self.pb[at..at + d]);
             let n = &self.nodes[i];
@@ -3248,6 +3317,7 @@ impl Solver {
         Shape {
             nodes: self.nodes.len(),
             rows: self.leaf_rows.len(),
+            boards: self.nboards,
             cells: self.ncells,
             ncfg: self.ncfg,
             cidx: self.leaf_cidx.len(),

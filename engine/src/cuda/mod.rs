@@ -623,9 +623,13 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
 /// allows: the arenas alone are tens of megabytes a round trip.
 #[derive(Default)]
 struct Solve {
-    /// Board vectors and the join cache, once per leaf.
+    /// Board vectors and the join cache, once per distinct public state.
     p: Arr<f32>,
     jp: Arr<f32>,
+    /// `[row]` -> the board it reads. Rows outnumber boards because coin plays
+    /// commute, so a tree spanning one round holds the same public state at
+    /// several places.
+    board_of: Arr<u32>,
     /// `f(c)` and `g(c)`, and the belief index that names them.
     ///
     /// Both stay f32. Half storage would halve the largest byte flow in the
@@ -773,7 +777,7 @@ impl Pack {
 
 /// Fields of `struct Tree` in `kernels.cu`, in order. Every one is eight bytes
 /// wide, so the descriptor is positional and needs no packing rules.
-const DESC: usize = 58;
+const DESC: usize = 59;
 
 impl Solve {
     /// What this solve holds, array by array.
@@ -783,6 +787,7 @@ impl Solve {
         let u = std::mem::size_of::<u32>();
         let mut v = vec![
             ("p", self.p.cap * f), ("jp", self.jp.cap * f),
+            ("board_of", self.board_of.cap * u),
             ("f", self.f.cap * f), ("g", self.g.cap * f), ("fp", self.fp.cap * f),
             ("cidx", self.cidx.cap * u), ("coff", self.coff.cap * u),
             ("reach", self.reach.cap * f), ("vals", self.vals.cap * f),
@@ -877,7 +882,8 @@ impl Solve {
             // is the same array: four bytes a cell, and a solve holds up to a
             // million and a half of them.
             self.sum.ptr(s), self.rootb.ptr(s),
-            self.p.ptr(s), self.jp.ptr(s), self.f.ptr(s), self.g.ptr(s), self.fp.ptr(s),
+            self.p.ptr(s), self.jp.ptr(s), self.board_of.ptr(s),
+            self.f.ptr(s), self.g.ptr(s), self.fp.ptr(s),
             self.cidx.ptr(s), self.coff.ptr(s),
             self.leaf_node.ptr(s), self.term.ptr(s), self.seed.ptr(s),
             self.level_start.len().saturating_sub(1) as u64,
@@ -1373,20 +1379,22 @@ impl Card {
         // `card_of_row` is what replaces `board`'s modulo: a leaf reads the
         // physical view of the card table its own solve drafted.
         let mark = std::time::Instant::now();
-        let rows: usize = mine.iter().map(|&i| calls[i].rows()).sum();
         let s = &self.stream;
         let mut stage = self.host.lock();
         // Concatenation only works if a call carries exactly its own rows. A
         // trailing tail from a caller's scratch buffer would shift every later
         // call in the batch and is invisible when a call runs alone.
         let each = |i: usize| -> (&[f32], &[f32], usize) {
-            let Call::Trunk { xpub, cards, rows, .. } = &calls[i] else {
+            let Call::Trunk { xpub, cards, boards, .. } = &calls[i] else {
                 unreachable!("trunk shard holds only trunk calls")
             };
-            assert_eq!(xpub.len(), rows * PUBFEAT, "trunk xpub is not one row a leaf");
+            assert_eq!(xpub.len(), boards * PUBFEAT, "trunk xpub is not one row a board");
             assert_eq!(cards.len(), CARD_ROWS * NTYPE * TYPE, "trunk card table");
-            (xpub, cards, *rows)
+            (xpub, cards, *boards)
         };
+        // The trunk runs on distinct public states; everything indexed by row
+        // -- the belief index and `board_of` itself -- is counted apart.
+        let rows: usize = mine.iter().map(|&i| each(i).2).sum();
         // A call carries one row a leaf, so a call is one copy. This used to
         // gather the physical row out of a pair, a leaf at a time, on the one
         // thread a card has -- and it was the largest single piece of a round
@@ -1424,6 +1432,12 @@ impl Card {
         let cards = cards.dev.buf.as_ref().expect("staged");
         let card_of_row = card_of_row.dev.buf.as_ref().expect("staged");
 
+        // Nothing new to encode: every fresh row repeats a board the solve
+        // already holds.
+        if rows == 0 {
+            let none = self.alloc(0)?;
+            return self.keep(calls, mine, &none, &none, pack);
+        }
         let cells = rows * N_HEXES;
         let stride = PUBFEAT as i32;
         let (rows_i, cells_i) = (rows as i32, cells as i32);
@@ -1499,16 +1513,35 @@ impl Card {
         let mut jp = self.alloc(rows * JW)?;
         self.run(l.join_p, &p, rows, &mut jp)?;
 
-        // Keep them, per solve, for the iterations that follow. Nothing goes
-        // back: the readout, the belief pooling and the policy head all run
-        // here, so a board vector has no reader on the host at all.
+        self.keep(calls, mine, &p, &jp, pack)
+    }
+
+    /// Keep what the trunk made, per solve, for the iterations that follow.
+    ///
+    /// Nothing goes back: the readout, the belief pooling and the policy head
+    /// all run here, so a board vector has no reader on the host at all.
+    ///
+    /// A call whose rows were all transpositions of boards the solve already
+    /// holds contributes no boards, and then `p` and `jp` are empty and the
+    /// copies below are of nothing. Its rows still arrive: `board_of` points
+    /// them at the boards they share, and the belief index is their own.
+    fn keep(
+        &self,
+        calls: &[Call],
+        mine: &[usize],
+        p: &CudaSlice<f32>,
+        jp: &CudaSlice<f32>,
+        pack: &mut Pack,
+    ) -> Res<()> {
         let mut at = 0;
         let mut g = self.solves.lock();
         for &i in mine {
-            let n = calls[i].rows();
-            let Call::Trunk { solve, at: row0, cidx, coff, .. } = &calls[i] else {
+            let Call::Trunk {
+                solve, at: row0, rows: nrows, board_of, boards_at, boards: n, cidx, coff, ..
+            } = &calls[i] else {
                 unreachable!("trunk shard holds only trunk calls")
             };
+            let (n, nrows) = (*n, *nrows);
             let b = self.slot(&mut g, *solve);
             if *row0 == 0 {
                 // A fresh solve in this slot. Everything the last one left is
@@ -1521,13 +1554,17 @@ impl Card {
                 for a in [&mut b.p, &mut b.jp, &mut b.f, &mut b.g, &mut b.fp] {
                     a.reset();
                 }
+                b.board_of.reset();
                 b.cidx.reset();
                 b.coff.reset();
                 b.leaf_node.reset();
                 b.term.reset();
             }
-            b.p.copy(&self.stream, row0 * D, &p, at * D, n * D)?;
-            b.jp.copy(&self.stream, row0 * JW, &jp, at * JW, n * JW)?;
+            b.p.copy(&self.stream, boards_at * D, &p, at * D, n * D)?;
+            b.jp.copy(&self.stream, boards_at * JW, &jp, at * JW, n * JW)?;
+            let words = pack.words(board_of);
+            let dst = b.board_of.plan(&self.stream, *row0, nrows)?;
+            pack.piece(dst, *row0 as u32, words, nrows as u32);
             // `coff` arrives relative to this call's own `cidx`, so it is
             // shifted onto the resident index before it is stored. Row zero
             // writes the leading zero; every later call overwrites it with its
@@ -1542,7 +1579,7 @@ impl Card {
             let dst = b.coff.plan(&self.stream, 2 * row0, shifted.len())?;
             pack.piece(dst, 2 * *row0 as u32, words, shifted.len() as u32);
             b.cells += cidx.len();
-            b.rows = row0 + n;
+            b.rows = row0 + nrows;
             at += n;
         }
         Ok(())

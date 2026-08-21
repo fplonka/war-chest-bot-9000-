@@ -643,6 +643,10 @@ struct Tree {
     // cache, the config readout and pooling rows, and the belief index.
     const float* p;
     const float* jp;
+    // Row -> the board it reads. Coin plays commute, so a tree spanning one
+    // round holds the same public state at several places and the trunk runs
+    // once for all of them.
+    const unsigned int* board_of;
     const float* f;
     const float* g;
     // The policy readout's config row, which `k_prior` dots against an action.
@@ -939,7 +943,8 @@ __global__ void k_gather(const Tree* trees, const int* part_of_row,
     if (row >= rows) return;
     int r = q0 + row % tile;
     const Tree& t = trees[part_of_row[r]];
-    const float* src = (which == 0 ? t.p : t.jp) + (size_t)local_row[r] * width;
+    const float* src = (which == 0 ? t.p : t.jp)
+                     + (size_t)t.board_of[local_row[r]] * width;
     float* dst = out + (size_t)row * width;
     for (int j = threadIdx.x; j < width; j += blockDim.x) dst[j] = src[j];
 }
@@ -1003,7 +1008,8 @@ __global__ void k_readout(const Tree* trees, const int* part_of_row,
     // The head's residual seed is this leaf's board vector, added here rather
     // than copied into `h` by a gather of its own -- `h` is written once by the
     // join's last multiply and read once, here.
-    const float* seed = trees[part_of_row[r]].p + (size_t)local_row[r] * d;
+    const Tree& tr = trees[part_of_row[r]];
+    const float* seed = tr.p + (size_t)tr.board_of[local_row[r]] * d;
     float sum = 0.0f;
     for (int j = tid; j < d; j += nt) {
         float x = h[(size_t)row * d + j] + seed[j] + add[j];
@@ -1195,7 +1201,8 @@ __global__ void k_act_boards(const Tree* trees, const unsigned int* part,
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= m * d) return;
     int k = i / d, j = i % d;
-    boards[i] = trees[part[k]].p[(size_t)row[k] * d + j];
+    const Tree& t = trees[part[k]];
+    boards[i] = t.p[(size_t)t.board_of[row[k]] * d + j];
 }
 
 // The board's projection, added to the action's. A batch spans nodes, so which

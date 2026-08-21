@@ -922,10 +922,15 @@ impl Net {
 
     /// The board projection is shared by a physical row. Belief order and the
     /// seat scalar select the queried player's value.
+    ///
+    /// `board_of` names the board vector each row reads. Rows outnumber boards
+    /// because transposing coin plays reach the same public state, and the
+    /// trunk runs once per public state rather than once per row.
     pub fn join(
         &self,
         p: &[f32],
         jp: &[f32],
+        board_of: &[u32],
         pooled: &[f32],
         rows: usize,
         player: usize,
@@ -939,7 +944,8 @@ impl Net {
             dst[..POOL].copy_from_slice(&pooled[q * POOL..(q + 1) * POOL]);
             dst[POOL..2 * POOL].copy_from_slice(&pooled[o * POOL..(o + 1) * POOL]);
             dst[2 * POOL] = if player == 0 { -1.0 } else { 1.0 };
-            z[r * JW..(r + 1) * JW].copy_from_slice(&jp[r * JW..(r + 1) * JW]);
+            let b = board_of[r] as usize;
+            z[r * JW..(r + 1) * JW].copy_from_slice(&jp[b * JW..(b + 1) * JW]);
         }
         self.join_b.add(&input, rows, &mut z);
         self.join_b.bias(&mut z, rows);
@@ -956,8 +962,8 @@ impl Net {
         self.norms[LN_JOUT].apply(&mut z, rows, &mut arg, &mut th);
         fit(out, rows * D);
         for r in 0..rows {
-            let src = &p[r * D..(r + 1) * D];
-            out[r * D..(r + 1) * D].copy_from_slice(src);
+            let b = board_of[r] as usize;
+            out[r * D..(r + 1) * D].copy_from_slice(&p[b * D..(b + 1) * D]);
         }
         self.join_out.add(&z, rows, &mut out[..rows * D]);
         self.join_out.bias(out, rows);
@@ -1119,8 +1125,11 @@ impl Net {
         // pair, so it is driven twice, once per seat.
         let mut out = vec![0.0; n];
         let mut h = Vec::new();
+        // A flat query batch interns nothing, so every row has a board of its
+        // own.
+        let board_of: Vec<u32> = (0..rows as u32).collect();
         for player in 0..2 {
-            self.join(&p, &jp, &pooled, rows, player, &mut h);
+            self.join(&p, &jp, &board_of, &pooled, rows, player, &mut h);
             for c in 0..n {
                 let q = seg[c] as usize;
                 if q % 2 != player {
