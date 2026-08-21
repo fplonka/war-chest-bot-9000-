@@ -515,6 +515,141 @@ fn a_solve_does_not_depend_on_the_round_it_rides_in() {
     assert!(bad < 5e-2, "sharing a round moved a solve's policy by {bad:e}");
 }
 
+/// One round, holding every solver that still asks for one.
+///
+/// Stops at the first solver that is done and says which, without advancing
+/// the rest: a caller either is waiting for that one or has one that stopped
+/// filling the round.
+fn shared_round(
+    backend: &Backend,
+    live: &mut [Solver],
+    replies: &mut [Vec<Reply>],
+) -> Option<(usize, Option<Solved>)> {
+    let mut calls: Vec<Call> = Vec::new();
+    let mut spans = vec![0usize; live.len()];
+    for (i, sv) in live.iter_mut().enumerate() {
+        match sv.advance(&replies[i]) {
+            Step::Calls(cs) => {
+                spans[i] = cs.len();
+                calls.extend(cs);
+            }
+            Step::Done(solved) => return Some((i, solved)),
+        }
+    }
+    let mut rest = backend.run(&calls, 0).expect("the backend answered the round");
+    for (i, k) in spans.into_iter().enumerate() {
+        let tail = rest.split_off(k);
+        replies[i] = rest;
+        rest = tail;
+    }
+    None
+}
+
+/// A ragged round must not move the smallest solve in it either.
+///
+/// `a_solve_does_not_depend_on_the_round_it_rides_in` shares a round between
+/// four solves of the same shape: at `c = 0` nothing grows, so each of them is
+/// the fourteen-node tree `Solver::new` built, and every level of a launch is
+/// as wide for one member as for the next. A grid sized by the widest solve of
+/// the round is right by construction on that shape. A run's rounds are not
+/// that shape -- tree sizes there span two orders of magnitude -- and the
+/// ragged one is what the flat work list has to get right: a level's items
+/// come from solves of different depths, and the ones a shorter round drops
+/// have to leave a prefix of every level behind them.
+///
+/// So the small solve here rides beside two that were grown first, to some
+/// tens of times its size and several levels deeper, and is asked for the
+/// targets it produces alone.
+///
+/// Only the small solve is read. The partners grow, so their own numbers are
+/// not a function of their seed alone --
+/// `growth_is_the_same_rule_as_the_reference` says why -- and for that same
+/// reason no leaf either side sampled can be compared across two batch
+/// compositions. Holding the sampling is the replay's job, not this test's.
+///
+/// The bounds are the neighbouring test's, and hold for its reason: a round of
+/// three and a round of one give the leaf pass different GEMM shapes.
+#[test]
+fn a_ragged_round_does_not_move_the_small_solve() {
+    if Device::count() == 0 {
+        eprintln!("no cuda device; skipping");
+        return;
+    }
+    let net = random_net(0x9E37);
+    let nets = Arc::new(Nets { value: net.clone(), device: true });
+    // The solve under test: eight iterations over a tree that never grows, so
+    // it is one round from beginning to end and the same one every time.
+    let small = || {
+        let mut g = GameStream::new(0x51E5, game_cfg(8, 0.0));
+        let mut data = Data::default();
+        let mut sv = g.next_solve(&nets, &mut data);
+        sv.pin(0);
+        (g, data, sv)
+    };
+
+    let (alone, tiny) = {
+        let device = Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
+        let (mut g, mut data, sv) = small();
+        let (sv, solved) = run_solve(&device, sv);
+        let tiny = sv.nodes.len();
+        g.keep(&sv, solved, &mut data);
+        (data, tiny)
+    };
+
+    let device = Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
+    // Two partners, in slots of their own, grown on their own for twelve
+    // rounds. Both budgets run for more than twice that many, so neither can
+    // finish and quietly stop making the round ragged.
+    let mut big: Vec<Solver> = [(0x0A13u64, 256u32, 8.0f32), (0x77C1, 320, 13.0)]
+        .iter()
+        .enumerate()
+        .map(|(i, &(seed, s, c))| {
+            let mut data = Data::default();
+            let mut sv = GameStream::new(seed, game_cfg(s, c)).next_solve(&nets, &mut data);
+            sv.pin(i + 1);
+            sv
+        })
+        .collect();
+    let mut replies: Vec<Vec<Reply>> = big.iter().map(|_| Vec::new()).collect();
+    for _ in 0..12 {
+        if let Some((i, _)) = shared_round(&device, &mut big, &mut replies) {
+            panic!("partner {i} finished before it had grown");
+        }
+    }
+    let grown: Vec<usize> = big.iter().map(|sv| sv.nodes.len()).collect();
+    eprintln!("small solve {tiny} nodes, partners {grown:?}");
+    assert!(
+        grown.iter().all(|&n| n > 20 * tiny),
+        "the partners did not grow, so the round is not ragged: {grown:?} against {tiny}"
+    );
+
+    // The same solve again, now at the head of a round it shares with them.
+    let (mut g, mut data, sv) = small();
+    big.insert(0, sv);
+    replies.insert(0, Vec::new());
+    let solved = loop {
+        match shared_round(&device, &mut big, &mut replies) {
+            None => continue,
+            Some((0, solved)) => break solved,
+            Some((i, _)) => panic!("partner {i} finished while it was filling the round"),
+        }
+    };
+    g.keep(&big[0], solved, &mut data);
+
+    assert_eq!(
+        alone.cy.len(),
+        data.cy.len(),
+        "the ragged round solved a different number of configs"
+    );
+    let (t, p) = (
+        worst(&alone.cy, &data.cy, "targets"),
+        worst(&alone.pprob, &data.pprob, "policy"),
+    );
+    eprintln!("ragged round: targets {t:e}  policy {p:e}");
+    assert!(t < 1e-4, "a ragged round moved the small solve's targets by {t:e}");
+    assert!(p < 5e-2, "a ragged round moved the small solve's policy by {p:e}");
+}
+
 
 /// The same question with the tree growing and a round carrying several
 /// regret updates -- which is what production runs, and what none of the tests
