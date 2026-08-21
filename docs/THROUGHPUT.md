@@ -346,6 +346,17 @@ The maximum is the number that matters: a round waits for the slowest of
 thirty-six threads, so a tail cut by two thirds is worth more than the mean
 being cut by a sixth.
 
+**At ten cohorts of thirty-six it is neutral: 27.1 solves/s, inside the band
+the baseline already occupies (27.4, 28.6, 29.4, 30.6).** Eight threads on one
+card is host-bound, so a shorter turnaround shortens the round directly. Full
+scale is bound by solves in flight, which memory fixes, and a cheaper host has
+nothing to give there. The change stays -- it removes work that grew with the
+tree and costs nothing -- but it is not rate.
+
+That is the third time in this ledger a real mechanism has failed to show up
+in the headline number, and the reason is always the same: the binding
+constraint is somewhere else. Measure the constraint, not the mechanism.
+
 **`PRIOR` is still the largest item afterwards, and now it is all network.**
 What is left inside it is `Net::actions` and `Net::policy` -- the action head
 and a dot product per legal cell, run *on the host*, for every grown node,
