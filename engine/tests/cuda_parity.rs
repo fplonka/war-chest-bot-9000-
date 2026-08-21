@@ -19,17 +19,25 @@
 //! regret update and the value pass under the average — so a drift in any of
 //! them lands there.
 //!
+//! Neither of those reaches the expansion phase, and a third way is needed for
+//! it. Growth is a discrete function of the CFR arenas, so two backends whose
+//! arenas differ in the last bits build different trees however faithfully they
+//! copy each other's rule -- the comparison has to be of the rule, on one set
+//! of numbers. `Device::resident` hands the arenas back and
+//! `Solver::replay_expansion` runs the host's own trajectories against them.
+//!
 //! Needs a GPU, so it only builds under `--features gpu`.
 #![cfg(feature = "gpu")]
 
 use std::sync::Arc;
 
+use warchest::contract::NO_ROW;
 use warchest::cuda::Device;
 use warchest::farm::{Backend, Call, Reply};
 use warchest::net::{Net, NetLayout};
 use warchest::pbs::{enumerate_configs, reserve, true_config, Belief, Ctx};
 use warchest::rng::Rng;
-use warchest::search::{Cfg, Nets, Solved, Solver, Step};
+use warchest::search::{Arenas, Cfg, Nets, Solved, Solver, Step};
 use warchest::selfplay::{make_game, Agent, Collect, Data, GameCfg, GameStream};
 use warchest::state::State;
 
@@ -230,6 +238,159 @@ fn the_cfr_loop_agrees_on_a_fixed_tree() {
     // tree, so the iterations damp the network's own f32 disagreement rather
     // than amplifying it. Measured, the worst is 4e-6 against values near 2.5.
     assert!(bad < 1e-4, "worst target difference {bad:e}");
+}
+
+/// The growth rule itself, held to the card on the card's own numbers.
+///
+/// Two whole solves with growth on cannot be compared. The trees part company
+/// at the first close call, and they will have one: a cuBLAS leaf pass and a
+/// host one differ in the last bits, and growth turns that into a different
+/// node. Measured on the host alone, perturbing the network by one part in
+/// `1e7` changes the node count of a third of a run's solves, by as much as
+/// forty percent. So a test that asked two backends for the same tree would be
+/// measuring the network, not the rule.
+///
+/// What can be compared is the rule. `Device::resident` hands back the arenas
+/// an expansion phase reads, and `Solver::replay_expansion` runs the host's
+/// own `sample_leaf` against them. Given the same numbers and the same stream
+/// the two must agree simulation for simulation -- which is what holds
+/// `k_expand`, `puct_choice`, `pick_live` and `live_cell` to `sample_leaf`,
+/// `Solver::puct_choice`, `pick_live` and `Solver::live_cell`.
+///
+/// The phase compared is a solve's first, because `visits` is the one arena
+/// the phase writes and before the first phase it is known to be zero. The
+/// visits the replay leaves behind are then compared with the card's, so the
+/// agreement is over every step of every trajectory and not just its end.
+///
+/// Four solves ride the round, at four budgets and four growth rates, because
+/// the farm batches and a kernel that read a bound from the batch where it
+/// should read it from the solve is right for one member and wrong for the
+/// rest. `c` is what the phase widths come from -- a solve's first phase owes
+/// `floor(c)` trajectories -- so the four ask for 3, 5, 8 and 13 of them and
+/// the launch is a ragged one.
+#[test]
+fn growth_is_the_same_rule_as_the_reference() {
+    if Device::count() == 0 {
+        eprintln!("no cuda device; skipping");
+        return;
+    }
+    let net = random_net(0x9E37);
+    let device = Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
+    let Backend::Cuda(d) = &device else { unreachable!("just built") };
+    let nets = Arc::new(Nets { value: net.clone(), device: true });
+    let streams = [
+        (0x51E5u64, 128u32, 3.0f32),
+        (0x0A13, 192, 5.0),
+        (0x77C1, 256, 8.0),
+        (0x2E57, 320, 13.0),
+    ];
+    let n = streams.len();
+    let mut data: Vec<Data> = (0..n).map(|_| Data::default()).collect();
+    let mut gs: Vec<GameStream> = streams
+        .iter()
+        .map(|&(seed, s, c)| GameStream::new(seed, game_cfg(s, c)))
+        .collect();
+
+    let mut checked = 0usize;
+    for _ in 0..4 {
+        // One round, holding every stream's fresh solve. The first call a
+        // solve raises already owes an expansion phase: at `c = 8` every
+        // regret update earns eight trajectories.
+        let mut live: Vec<Solver> = (0..n)
+            .map(|i| {
+                let mut sv = gs[i].next_solve(&nets, &mut data[i]);
+                sv.pin(i);
+                sv
+            })
+            .collect();
+        let mut calls: Vec<Call> = Vec::new();
+        let mut spans = vec![0usize; n];
+        let mut sims = vec![0usize; n];
+        for i in 0..n {
+            let Step::Calls(cs) = live[i].advance(&[]) else {
+                panic!("a fresh solve asks for a round")
+            };
+            // One expanding iterate a round, and the replay leans on it: the
+            // snapshot taken afterwards is the state the phase read only if
+            // there was exactly one phase.
+            let owed: Vec<usize> = cs
+                .iter()
+                .filter_map(|c| match c {
+                    Call::Iterate { expand, .. } if *expand > 0 => Some(*expand),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                owed.len(),
+                1,
+                "solve {i} asked for {} expansion phases in one round",
+                owed.len()
+            );
+            sims[i] = owed[0];
+            spans[i] = cs.len();
+            calls.extend(cs);
+        }
+        let mut rest = device.run(&calls, 0).expect("the backend answered the round");
+        let mut replies: Vec<Vec<Reply>> = Vec::new();
+        for &k in &spans {
+            let tail = rest.split_off(k);
+            replies.push(rest);
+            rest = tail;
+        }
+
+        for i in 0..n {
+            assert_eq!(
+                sims[i], streams[i].2 as usize,
+                "solve {i}: the first phase owes floor(c) trajectories"
+            );
+            let got = d.resident(0, i).expect("the card gave its solve back");
+            let theirs = &replies[i].last().expect("the round answered").leaves;
+            assert_eq!(theirs.len(), sims[i], "solve {i}: the card sampled a short row");
+            // Before a solve's first phase nothing has visited anything, so
+            // the arenas the card holds now are the ones it grew from apart
+            // from the visits, which are known.
+            let zero = vec![0.0f32; got.visits.len()];
+            let mine = live[i].replay_expansion(
+                &Arenas {
+                    reach: &got.reach,
+                    cur: &got.cur,
+                    sum: &got.sum,
+                    qval: &got.qval,
+                    visits: &zero,
+                    prior: &got.prior,
+                },
+                sims[i],
+            );
+            let mine: Vec<u32> = mine
+                .iter()
+                .map(|l| l.map_or(NO_ROW, |x| x as u32))
+                .collect();
+            assert_eq!(
+                &mine, theirs,
+                "solve {i}: the reference and the card sampled different leaves"
+            );
+            assert_eq!(
+                &live[i].visits[..got.visits.len()],
+                &got.visits[..],
+                "solve {i}: the trajectories passed through different cells"
+            );
+            checked += 1;
+        }
+
+        // Finish them the ordinary way, so the next round's solves come from a
+        // played position rather than four openings.
+        for i in 0..n {
+            let mut r = std::mem::take(&mut replies[i]);
+            let solved = loop {
+                match live[i].advance(&r) {
+                    Step::Calls(cs) => r = device.run(&cs, 0).expect("the backend answered"),
+                    Step::Done(sd) => break sd,
+                }
+            };
+            gs[i].keep(&live[i], solved, &mut data[i]);
+        }
+    }
+    assert_eq!(checked, 4 * n, "every solve's first phase is compared");
 }
 
 /// With growth on, the device must still produce a sane solve.

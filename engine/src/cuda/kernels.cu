@@ -1139,6 +1139,13 @@ __device__ unsigned int pick_live(const Tree& t, unsigned int so, unsigned int a
 //
 // Ties go to the lowest cell, which is what a serial scan keeping the first
 // strictly greater score does.
+//
+// Every arithmetic operation here is written as an `_rn` intrinsic, so nvcc
+// may not contract the multiply and the add into an FMA. `Solver::puct_choice`
+// is plain Rust f32, which never fuses, and growth is discrete: one fused
+// multiply-add would round differently, flip an argmax at a close call and
+// build a different tree. The same reason the sums above are warp-shaped on
+// both sides.
 __device__ unsigned int puct_choice(const Tree& t, unsigned int node, unsigned int a,
                                     unsigned int b, int opp, float c_puct) {
     unsigned int so = t.soff[node], ra = rbase(t, node, opp);
@@ -1146,18 +1153,19 @@ __device__ unsigned int puct_choice(const Tree& t, unsigned int node, unsigned i
     float mass = 0.0f;
     for (unsigned int i = threadIdx.x; i < nc; i += 32) mass += t.reach[ra + i];
     mass = warp_sum(mass);
-    float scale = mass > 1e-30f ? 1.0f / mass : 0.0f;
+    float scale = mass > 1e-30f ? __fdiv_rn(1.0f, mass) : 0.0f;
     float total = 0.0f;
     for (unsigned int cell = a + threadIdx.x; cell < b; cell += 32)
         total += t.visits[so + cell];
     total = warp_sum(total);
-    float explore = c_puct * sqrtf(fmaxf(total, 0.0f));
+    float explore = __fmul_rn(c_puct, sqrtf(fmaxf(total, 0.0f)));
     unsigned int best = NO_ROW;
     float score = neg_inf();
     for (unsigned int cell = a + threadIdx.x; cell < b; cell += 32) {
         if (!live_cell(t, so, cell)) continue;
-        float v = t.qval[so + cell] * scale
-                + explore * t.prior[so + cell] / (1.0f + t.visits[so + cell]);
+        float u = __fdiv_rn(__fmul_rn(explore, t.prior[so + cell]),
+                            __fadd_rn(1.0f, t.visits[so + cell]));
+        float v = __fadd_rn(__fmul_rn(t.qval[so + cell], scale), u);
         if (v > score) { score = v; best = cell; }
     }
     for (int k = 16; k > 0; k >>= 1) {

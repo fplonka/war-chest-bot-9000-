@@ -671,6 +671,11 @@ struct Solve {
     /// Values per traverser: the arena holds both, so one launch backpropagates
     /// both.
     nvals: usize,
+    /// Strategy cells and reach entries. The arenas that hold them are only
+    /// ever fitted, never written from the host, so their own `len` stays at
+    /// zero and `Device::resident` reads these instead.
+    ncells: usize,
+    nreach: usize,
     /// Level bounds, on the host, because they drive the launch loop.
     level_start: Vec<u32>,
     /// The expansion's own random stream, seeded once by the solver.
@@ -1087,6 +1092,7 @@ impl Device {
         let g = c.solves.lock();
         let s = g.get(solve).ok_or_else(|| format!("solve {solve} is not resident"))?;
         let all = |a: &Arr<f32>| c.slice(a, 0, a.len);
+        let cells = |a: &Arr<f32>| c.slice(a, 0, s.ncells);
         Ok(Resident {
             p: all(&s.p)?,
             jp: all(&s.jp)?,
@@ -1094,6 +1100,11 @@ impl Device {
             g: all(&s.g)?,
             fp: all(&s.fp)?,
             prior: all(&s.prior)?,
+            cur: cells(&s.cur)?,
+            sum: cells(&s.sum)?,
+            qval: cells(&s.qval)?,
+            visits: cells(&s.visits)?,
+            reach: c.slice(&s.reach, 0, s.nreach)?,
         })
     }
 }
@@ -1110,6 +1121,16 @@ pub struct Resident {
     pub fp: Vec<f32>,
     /// The PUCT prior, over every strategy cell of the tree.
     pub prior: Vec<f32>,
+    /// The CFR arenas the expansion phase reads, in `Solver`'s own layout.
+    /// Nothing in a run reads these either: the loop that makes them is here
+    /// and so is the growth that consumes them, so a round carries none of
+    /// them home. `Solver::replay_expansion` takes them to hold the host's
+    /// growth rule to the card's on the card's own numbers.
+    pub cur: Vec<f32>,
+    pub sum: Vec<f32>,
+    pub qval: Vec<f32>,
+    pub visits: Vec<f32>,
+    pub reach: Vec<f32>,
 }
 
 impl Card {
@@ -1845,6 +1866,8 @@ impl Card {
             if let Some(sd) = seed {
                 b.seed.put(s, 0, &[*sd])?;
             }
+            b.ncells = *ncells;
+            b.nreach = *nreach;
             b.regret.fit(s, *ncells)?;
             b.sum.fit(s, *ncells)?;
             b.qval.fit(s, *ncells)?;

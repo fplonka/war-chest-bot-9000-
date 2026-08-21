@@ -556,24 +556,71 @@ pub struct Policy {
 /// (offset by one so `-1` is zero), and the three squares it names.
 pub const ACT_BYTES: usize = 5;
 
+/// The arenas one expansion phase reads, as whichever backend ran the CFR
+/// loop left them. `Solver::replay_expansion` is the only consumer.
+pub struct Arenas<'a> {
+    pub reach: &'a [f32],
+    pub cur: &'a [f32],
+    pub sum: &'a [f32],
+    pub qval: &'a [f32],
+    pub visits: &'a [f32],
+    pub prior: &'a [f32],
+}
+
+/// Sum `K` running totals over `n` terms the way a warp of thirty-two does:
+/// the lanes stride through the terms, then a butterfly folds the lanes.
+///
+/// The expansion phase runs on the card in production, and every total it
+/// forms is this shape. f32 addition is not associative, so a host that summed
+/// a row straight through would put the cell boundaries of a sampled draw a
+/// few ulps elsewhere and take a different turn often enough to build a
+/// different tree. It sums the same way instead. Growth is the one place this
+/// matters: everywhere else a few ulps stay a few ulps, and here they decide
+/// which node exists.
+///
+/// Only the lower half is folded at each step, and that is exact rather than a
+/// shortcut: IEEE addition is commutative, so `a[k] + a[k^s]` and
+/// `a[k^s] + a[k]` are the same bits and lanes `k` and `k^s` stay equal all the
+/// way down. The card's butterfly leaves every lane holding this value.
+fn warp32_sum<const K: usize>(n: usize, f: impl Fn(usize) -> [f32; K]) -> [f32; K] {
+    let mut lane = [[0.0f32; K]; 32];
+    for (t, acc) in lane.iter_mut().enumerate() {
+        let mut i = t;
+        while i < n {
+            let v = f(i);
+            for k in 0..K {
+                acc[k] += v[k];
+            }
+            i += 32;
+        }
+    }
+    let mut s = 16;
+    while s > 0 {
+        for j in 0..s {
+            for k in 0..K {
+                let other = lane[j + s][k];
+                lane[j][k] += other;
+            }
+        }
+        s >>= 1;
+    }
+    lane[0]
+}
+
 /// Draw an index from non-negative weights, over the entries `live` accepts
 /// and no others. A row whose live weights have all underflowed is drawn
 /// uniformly over them rather than dropped; a row with no live entry at all
 /// gives nothing back.
 fn pick_live(w: &[f32], live: impl Fn(usize) -> bool, rng: &mut Rng) -> Option<usize> {
-    let mut total = 0.0f64;
-    let mut n = 0usize;
-    for (i, &x) in w.iter().enumerate() {
-        if live(i) {
-            total += x.max(0.0) as f64;
-            n += 1;
-        }
-    }
+    // Weight and count in one walk, which is also how the card takes them.
+    let [total, count] =
+        warp32_sum(w.len(), |i| if live(i) { [w[i].max(0.0), 1.0] } else { [0.0, 0.0] });
+    let n = count as usize;
     if n == 0 {
         return None;
     }
     let mut last = None;
-    if total == 0.0 {
+    if !(total > 0.0) {
         let mut k = rng.below(n);
         for i in 0..w.len() {
             if live(i) {
@@ -585,7 +632,7 @@ fn pick_live(w: &[f32], live: impl Fn(usize) -> bool, rng: &mut Rng) -> Option<u
         }
         unreachable!("a live entry was counted");
     }
-    let mut needle = rng.unit_f64() * total;
+    let mut needle = rng.unit_f64() * total as f64;
     for (i, &weight) in w.iter().enumerate() {
         if !live(i) {
             continue;
@@ -600,13 +647,14 @@ fn pick_live(w: &[f32], live: impl Fn(usize) -> bool, rng: &mut Rng) -> Option<u
 }
 
 /// Draw an index from non-negative weights without allocating. A row whose
-/// weights have all underflowed is drawn uniformly rather than dropped.
+/// weights have all underflowed is drawn uniformly rather than dropped, and an
+/// empty row costs no draw at all.
 fn pick(w: &[f32], rng: &mut Rng) -> usize {
-    let total: f64 = w.iter().map(|&x| x.max(0.0) as f64).sum();
-    if total == 0.0 {
-        return rng.below(w.len().max(1));
+    let [total] = warp32_sum(w.len(), |i| [w[i].max(0.0)]);
+    if !(total > 0.0) {
+        return if w.is_empty() { 0 } else { rng.below(w.len()) };
     }
-    let mut needle = rng.unit_f64() * total;
+    let mut needle = rng.unit_f64() * total as f64;
     for (i, &weight) in w.iter().enumerate() {
         needle -= weight.max(0.0) as f64;
         if needle < 0.0 {
@@ -856,7 +904,7 @@ pub struct Solver {
     /// where it selects. Here there is one arena and each traverser's pass
     /// overwrites it, so the number has to be kept as it is made.
     pub prior: Vec<f32>,
-    pub(crate) visits: Vec<f32>,
+    pub visits: Vec<f32>,
     pub qval: Vec<f32>,
     pub(crate) soff: Vec<u32>,
     /// The reach-weighted running strategy sum, per node. Per node rather than
@@ -1194,6 +1242,16 @@ impl Solver {
         let mut rng = std::mem::replace(&mut self.rng, Rng(1));
         let out = f(self, &mut rng);
         self.rng = rng;
+        out
+    }
+
+    /// Run `f` with the expansion's own stream, which is the stream the card
+    /// runs when the CFR loop is there. Both backends draw a trajectory from
+    /// the same state of the same generator, so both take the same turns.
+    fn with_expand_rng<T>(&mut self, f: impl FnOnce(&mut Self, &mut Rng) -> T) -> T {
+        let mut rng = Rng(self.seed);
+        let out = f(self, &mut rng);
+        self.seed = rng.0;
         out
     }
 
@@ -2540,12 +2598,16 @@ impl Solver {
             // same leaf and the second is dropped; the visit counts a
             // trajectory leaves behind are what make that rare.
             let want = self.expansions_at(self.at);
-            let sampled = self.with_rng(|sv, rng| {
+            let sampled = self.with_expand_rng(|sv, rng| {
                 let mut sampled = Vec::new();
                 for _ in 0..want {
-                    match sv.sample_leaf(rng) {
-                        Some(leaf) => sampled.push(leaf),
-                        None => break,
+                    // A trajectory that runs into a dead end costs that
+                    // simulation and no more; the phase still owes the rest.
+                    // The card does the same, and a phase that ended on the
+                    // first dead end would leave the two searches drawing from
+                    // different points of the same stream ever after.
+                    if let Some(leaf) = sv.sample_leaf(rng) {
+                        sampled.push(leaf);
                     }
                 }
                 sampled
@@ -2576,13 +2638,12 @@ impl Solver {
     /// the arenas they read are tens of megabytes and a round trip an iteration
     /// is more traffic than the bus has.
     ///
-    /// One difference from the host loop is worth naming. There, an expansion
-    /// simulation grows its leaf before the next one starts, so a later
-    /// simulation of the same phase can walk *through* what an earlier one
-    /// added. Here the phase's simulations all run before the host grows
-    /// anything, so two of them can land on the same leaf and the second is
-    /// dropped. The visit counts a trajectory leaves behind — the paper's
-    /// virtual loss — are what makes that rare rather than usual.
+    /// The growth rule itself is the same rule, and deliberately so: the same
+    /// stream, the same warp-shaped sums, the same per-simulation treatment of
+    /// a dead end. What the two backends cannot share is the numbers the rule
+    /// reads — a cuBLAS leaf pass and a host one part company in the last bits
+    /// — so two whole solves still build different trees. `cuda_parity` holds
+    /// the rule to the card by giving the host the card's own arenas.
     fn advance_on_device(&mut self, replies: &[Reply]) -> Step {
         match self.phase {
             Phase::Fresh => {}
@@ -2828,9 +2889,10 @@ impl Solver {
     /// them.
     fn puct_choice(&self, node: usize, row: std::ops::Range<usize>, opp: usize) -> Option<usize> {
         let so = self.soff[node] as usize;
-        let mass: f32 = self.reach_of(node, opp).iter().sum();
+        let reach = self.reach_of(node, opp);
+        let [mass] = warp32_sum(reach.len(), |i| [reach[i]]);
         let scale = if mass > 1e-30 { 1.0 / mass } else { 0.0 };
-        let total: f32 = row.clone().map(|cell| self.visits[so + cell]).sum();
+        let [total] = warp32_sum(row.len(), |i| [self.visits[so + row.start + i]]);
         let explore = self.cfg.puct * total.max(0.0).sqrt();
         let mut best = None;
         let mut best_score = f32::NEG_INFINITY;
@@ -3029,7 +3091,7 @@ impl Solver {
     /// False when nothing grew, which is a spent budget, a trajectory that ran
     /// into a terminal, or a config with no legal action there.
     pub fn expand_once(&mut self) -> bool {
-        let Some(leaf) = self.with_rng(|sv, rng| sv.sample_leaf(rng)) else {
+        let Some(leaf) = self.with_expand_rng(|sv, rng| sv.sample_leaf(rng)) else {
             return false;
         };
         self.expand(leaf);
@@ -3156,6 +3218,37 @@ impl Solver {
         }
     }
 
+
+    /// Run one expansion phase against arenas some other backend left behind,
+    /// and hand back the leaf each simulation reached.
+    ///
+    /// The CFR loop runs on the card in production, so on that path the host's
+    /// own copies of these arenas stay at their uniform start. Given numbers
+    /// of its own the host would drift a few ulps from the card's and take a
+    /// different turn at the first close call, which measures the loop rather
+    /// than the growth rule. Given the card's own numbers the two must agree
+    /// simulation for simulation, and that is what the parity test asks.
+    ///
+    /// `visits` is the one arena the phase writes, so a caller comparing a
+    /// phase must hand over the state as it stood before that phase ran.
+    ///
+    /// Not part of the engine's interface: it overwrites this solve's arenas
+    /// with `a` and advances `seed` by the draws the phase makes.
+    #[doc(hidden)]
+    pub fn replay_expansion(&mut self, a: &Arenas, sims: usize) -> Vec<Option<usize>> {
+        self.cur.copy_from_slice(&a.cur[..self.ncells]);
+        self.qval.copy_from_slice(&a.qval[..self.ncells]);
+        self.visits.copy_from_slice(&a.visits[..self.ncells]);
+        self.prior.copy_from_slice(&a.prior[..self.ncells]);
+        let nreach = self.reach.len();
+        self.reach.copy_from_slice(&a.reach[..nreach]);
+        for i in 0..self.nodes.len() {
+            let so = self.soff[i] as usize;
+            let n = self.sum_strat[i].len();
+            self.sum_strat[i].copy_from_slice(&a.sum[so..so + n]);
+        }
+        self.with_expand_rng(|sv, rng| (0..sims).map(|_| sv.sample_leaf(rng)).collect())
+    }
 
     /// The interior search queries this solve produced.
     ///
