@@ -5,13 +5,16 @@ one of those three, so the bench reports the round time beside the rate. Rounds
 per solve is not one of the farm's counters -- a solve makes two to four calls
 a round -- so what stands in for it is calls per solve.
 
-The workload is a corpus of roots sampled from real play. `farmprobe` plays
-games forward instead, and a solve's cost varies twenty-six fold with how far
-into a game its root sits, so its rate moves two-fold with nothing but which
-phase its threads happened to reach -- 16.6, 16.2, 12.1 and 8.0 solves/s were
-measured across consecutive probes of one build. Here the threads walk one
-fixed corpus on interleaved strides and cycle it, so the mix of costs in flight
-is the same at every moment and the same between two builds.
+The workload is a corpus of roots taken from the stream a run drives, so it
+carries the run's own mix of self-play roots and query roots -- the two cost
+about two-fold different in device calls, and a corpus of only one of them
+ranks builds on a workload the run never sees. `farmprobe` plays games forward
+instead, and a solve's cost varies twenty-six fold with how far into a game its
+root sits, so its rate moves two-fold with nothing but which phase its threads
+happened to reach -- 16.6, 16.2, 12.1 and 8.0 solves/s were measured across
+consecutive probes of one build. Here the threads walk one shuffled corpus on
+interleaved strides and cycle it, so the mix of costs in flight is the same at
+every moment and the same between two builds.
 
     python tools/farmbench.py --make roots.bin --games 64
     python tools/farmbench.py --roots roots.bin --threads 72 --devices 0,1
@@ -27,6 +30,7 @@ import time
 
 sys.path.insert(0, "train")
 import warchest  # noqa: E402
+from config import BASELINE as PROD  # noqa: E402
 from export_weights import load as load_checkpoint  # noqa: E402
 from value_net import Net  # noqa: E402
 
@@ -34,7 +38,16 @@ KEYS = ("rounds", "round_calls", "round_rows", "round_nanos")
 
 
 def make(args):
-    n = warchest.save_roots(args.games, args.seed, args.make, cap=args.cap)
+    n = warchest.save_roots(
+        args.games,
+        args.seed,
+        args.make,
+        cap=args.cap,
+        random_draft=PROD.random_draft,
+        explore=PROD.explore,
+        query_rate=args.query_rate,
+        recursive_rate=args.recursive_rate,
+    )
     print(f"wrote {n} roots to {args.make}")
 
 
@@ -91,12 +104,14 @@ def main():
     p.add_argument("--seconds", type=float, default=60)
     p.add_argument("--window", type=float, default=20)
     p.add_argument("--seed", type=int, default=1234)
-    p.add_argument("--s", type=int, default=512,
+    p.add_argument("--s", type=int, default=PROD.s,
                    help="expansion simulations a solve runs")
-    p.add_argument("--c", type=float, default=8.0,
+    p.add_argument("--c", type=float, default=PROD.c,
                    help="expansions per regret update")
-    p.add_argument("--cfr", default="sog", help="the run's regret rule")
-    p.add_argument("--recursive-rate", type=float, default=0.1)
+    p.add_argument("--cfr", default=PROD.cfr, help="the run's regret rule")
+    p.add_argument("--query-rate", type=float, default=PROD.query_rate,
+                   help="leaves a self-play solve queues, when making a corpus")
+    p.add_argument("--recursive-rate", type=float, default=PROD.recursive_rate)
     p.add_argument("--weights", help="a checkpoint to solve with, e.g. runs/NAME/snap_02.pt")
     args = p.parse_args()
 
