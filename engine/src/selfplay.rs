@@ -303,6 +303,9 @@ pub struct Game {
     bel: [Belief; 2],
     data: Data,
     gc: GameCfg,
+    /// The one seat that explores in this game. Drawn once, so the other
+    /// seat's whole episode stays on policy.
+    explorer: u8,
     /// Belief states this game's searches asked the network about, waiting to
     /// be solved as roots of their own.
     queries: Vec<(State, [Belief; 2])>,
@@ -373,6 +376,7 @@ impl Game {
     pub fn new(mut rng: Rng, gc: &GameCfg) -> Game {
         let s = make_game(&mut rng, gc.random_draft);
         let ctx = Ctx::new(&s);
+        let explorer = (rng.next_u64() & 1) as u8;
         Game {
             rng,
             s,
@@ -383,6 +387,7 @@ impl Game {
             ],
             data: Data::default(),
             gc: *gc,
+            explorer,
             queries: Vec::new(),
         }
     }
@@ -498,10 +503,7 @@ impl Game {
             .expect("belief filter dropped the true config");
         let true_row = np.row(true_ci);
         let mut chosen_cell = np.sample(&mut self.rng, true_ci);
-        // A fresh explorer each decision, as the reference does.
-        let explorer = sample_explorer(&mut self.rng, self.gc.explore);
-        if self.gc.explore > 0.0
-            && me as u8 == explorer
+        if me as u8 == self.explorer
             && self.rng.unit_f64() < self.gc.explore as f64
             && !true_row.is_empty()
         {
@@ -749,14 +751,6 @@ pub(crate) fn effective_bag_count(s: &State, p: u8, unit: u8) -> u8 {
     } else {
         s.zones[p as usize][Z_FACEUP][unit as usize]
             + s.zones[p as usize][Z_FACEDOWN][unit as usize]
-    }
-}
-
-fn sample_explorer(rng: &mut Rng, explore: f32) -> u8 {
-    if explore > 0.0 {
-        (rng.next_u64() & 1) as u8
-    } else {
-        0
     }
 }
 
