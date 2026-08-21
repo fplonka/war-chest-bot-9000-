@@ -17,11 +17,16 @@
 //! one reference solve — the largest tree here, iterated far past convergence —
 //! on the same root under the same weights.
 //!
+//! **What does a bigger round cost?** `Cfg::batch` regret updates ride in one
+//! round against a frozen tree, which is what turns sixty-five host rounds a
+//! solve into nine. The sweep asks what the target pays for that, against the
+//! spread between two seeds at `batch = 1`.
+//!
 //! `cargo run --release --example budgetq -- <weights.bin> [roots] [games]`
 
 use rayon::prelude::*;
 use warchest::rng::Rng;
-use warchest::search::{Cfg, Cfr, Nets, Solver};
+use warchest::search::{Cfg, Cfr, Nets, Policy, Solver};
 use warchest::selfplay::{collect_roots, Agent, Collect, GameCfg};
 
 /// The root's counterfactual values for both players, belief-weighted into one
@@ -41,11 +46,55 @@ fn cfg_of(s: u32, c: f32) -> Cfg {
     cfg_temp(s, c, 1.0)
 }
 
+/// The same, with a chosen round size. `batch` regret updates ride in one
+/// round: the tree is frozen for all of them and grows once at the end, from
+/// every trajectory the round sampled.
+fn cfg_batch(s: u32, c: f32, batch: usize) -> Cfg {
+    Cfg { batch, ..cfg_of(s, c) }
+}
+
 /// The same, with the policy prior flattened. `prior_temp` divides the policy
 /// head's logits before the softmax, so a large one is a uniform prior -- which
 /// is the whole policy path switched off without touching it.
 fn cfg_temp(s: u32, c: f32, prior_temp: f32) -> Cfg {
     Cfg { s, c, prior_temp, cfr: Cfr::SOG, ..Default::default() }
+}
+
+/// Total variation between two root policies, averaged over the acting
+/// player's configs. Two solves of one root have the same action list and the
+/// same belief, so the layouts line up; an unexpanded root gives neither.
+fn policy_gap(a: &Policy, b: &Policy) -> Option<f64> {
+    if a.p.len() != b.p.len() || a.off.len() < 2 {
+        return None;
+    }
+    let tv: f64 = a
+        .off
+        .windows(2)
+        .map(|w| {
+            let (i, j) = (w[0] as usize, w[1] as usize);
+            0.5 * (i..j).map(|k| (a.p[k] - b.p[k]).abs() as f64).sum::<f64>()
+        })
+        .sum();
+    Some(tv / (a.off.len() - 1) as f64)
+}
+
+/// One solve run to its end, and the two halves of what its target carries.
+fn solve(
+    st: &warchest::state::State,
+    bel: &[warchest::pbs::Belief; 2],
+    nets: &std::sync::Arc<Nets>,
+    cfg: Cfg,
+    seed: u64,
+    extra: usize,
+) -> ([f32; 2], Policy, usize) {
+    let ctx = warchest::pbs::Ctx::new(st);
+    let mut sv = Solver::new(st, ctx, std::sync::Arc::clone(nets), cfg, bel.clone(), Rng::new(seed));
+    sv.run_alone();
+    if extra > 0 {
+        sv.multistep(extra);
+        sv.finish();
+    }
+    (root_target(&mut sv), sv.root_policy(), sv.shape().nodes)
 }
 
 fn main() {
@@ -133,16 +182,15 @@ fn main() {
     // the tree is finite and its leaves are network values -- but it is the
     // best answer available *on the largest tree here*, which is what a
     // cheaper budget has to be judged against.
-    let refs: Vec<Option<[f32; 2]>> = positions
+    //
+    // One iteration a round, which is the schedule this started from, so the
+    // yardstick does not move when `batch` does.
+    let refs: Vec<([f32; 2], Policy)> = positions
         .par_iter()
         .enumerate()
         .map(|(i, (st, bel))| {
-            let ctx = warchest::pbs::Ctx::new(st);
-            let mut sv = Solver::new(st, ctx, std::sync::Arc::clone(&nets), cfg_of(512, 2.0), bel.clone(), Rng::new(0x51D5 ^ i as u64));
-            sv.run_alone();
-            sv.multistep(768);
-            sv.finish();
-            Some(root_target(&mut sv))
+            let (t, p, _) = solve(st, bel, &nets, cfg_batch(512, 2.0, 1), 0x51D5 ^ i as u64, 768);
+            (t, p)
         })
         .collect();
 
@@ -153,7 +201,7 @@ fn main() {
             .par_iter()
             .enumerate()
             .map(|(i, (st, bel))| {
-                let Some(r) = refs[i] else { return (0.0, 0.0, 0.0) };
+                let r = refs[i].0;
                 let ctx = warchest::pbs::Ctx::new(st);
                 let mut sv = Solver::new(st, ctx, std::sync::Arc::clone(&nets), cfg_of(s, c), bel.clone(), Rng::new(0x51D5 ^ i as u64));
                 sv.run_alone();
@@ -175,6 +223,40 @@ fn main() {
         );
     }
 
+    // ---- what a round of several iterations costs.
+    //
+    // `batch` regret updates ride in one round against a frozen tree, so the
+    // trajectories that choose where it grows are up to `batch - 1` updates
+    // ahead of it and more of them collide on one leaf. What that buys is one
+    // host round where there were `batch`. `batch = 1` twice on two seeds is
+    // the noise floor the rest of the column is read against.
+    println!("\nround size at SoG(512,8), against the same reference:");
+    println!("{:>8} {:>10} {:>12} {:>12}", "batch", "nodes", "|dv| mean", "policy tv");
+    for (label, b, salt) in [("1", 1, 0u64), ("1'", 1, 0xA5A5), ("2", 2, 0), ("4", 4, 0), ("8", 8, 0), ("16", 16, 0)] {
+        let (err, tv, nodes, tvk, k) = positions
+            .par_iter()
+            .enumerate()
+            .map(|(i, (st, bel))| {
+                let (r, rp) = &refs[i];
+                let cfg = cfg_batch(512, 8.0, b);
+                let (t, p, n) = solve(st, bel, &nets, cfg, 0x51D5 ^ salt ^ i as u64, 0);
+                let gap = policy_gap(&p, rp);
+                (
+                    ((t[0] - r[0]).abs() + (t[1] - r[1]).abs()) as f64 / 2.0,
+                    gap.unwrap_or(0.0),
+                    n as f64,
+                    gap.is_some() as u8 as f64,
+                    1.0,
+                )
+            })
+            .reduce(
+                || (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64),
+                |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3, a.4 + b.4),
+            );
+        let (k, tvk) = (k.max(1.0), tvk.max(1.0));
+        println!("{:>8} {:>10.0} {:>12.5} {:>12.5}", label, nodes / k, err / k, tv / tvk);
+    }
+
     // ---- is the policy prior worth what it costs?
     //
     // `refresh_priors` is two thirds of the host's CPU and it is all network:
@@ -190,7 +272,7 @@ fn main() {
             .par_iter()
             .enumerate()
             .map(|(i, (st, bel))| {
-                let Some(r) = refs[i] else { return (0.0, 0.0, 0.0) };
+                let r = refs[i].0;
                 let ctx = warchest::pbs::Ctx::new(st);
                 let mut sv = Solver::new(st, ctx, std::sync::Arc::clone(&nets), cfg_temp(512, 8.0, temp), bel.clone(), Rng::new(0x51D5 ^ i as u64));
                 sv.run_alone();

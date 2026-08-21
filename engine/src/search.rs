@@ -3304,7 +3304,7 @@ impl Solver {
     /// strategy the solve acts under, not the last iterate. An unexpanded root
     /// has no cells and gives an empty policy, which a caller stores as "no
     /// target here" rather than as a uniform one.
-    fn root_policy(&self) -> Policy {
+    pub fn root_policy(&self) -> Policy {
         let n = &self.nodes[0];
         if n.leaf || n.chance || self.avg.is_empty() {
             return Policy::default();
