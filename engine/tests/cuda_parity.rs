@@ -82,8 +82,17 @@ fn game_cfg_of(cfg: Cfg) -> GameCfg {
     }
 }
 
-/// Run one game stream per `(seed, s)` against `backend`, every stream's calls
-/// in the same round, and hand back what each produced.
+/// What one stream produced: its training rows, and the size of every tree it
+/// built. The trees are the sharper signal -- a solve that read another's
+/// sampled leaves grows somewhere else entirely, where a solve that only saw a
+/// different summation order grows the same tree and moves in the last bits.
+struct Run {
+    data: Data,
+    nodes: Vec<usize>,
+}
+
+/// Run one game stream per `(seed, cfg)` against `backend`, every stream's
+/// calls in the same round, and hand back what each produced.
 ///
 /// A stream's games are a function of its seed alone, so the same seed run
 /// alone and run beside others plays the same games and must produce the same
@@ -91,15 +100,15 @@ fn game_cfg_of(cfg: Cfg) -> GameCfg {
 fn generate(
     net: &Net,
     backend: Backend,
-    streams: &[(u64, u32)],
+    streams: &[(u64, Cfg)],
     games: usize,
-    c: f32,
-) -> Vec<Data> {
+) -> Vec<Run> {
     let nets = Arc::new(Nets { value: net.clone(), device: backend.keeps_the_solve() });
     let n = streams.len();
+    let mut nodes: Vec<Vec<usize>> = (0..n).map(|_| Vec::new()).collect();
     let mut streams: Vec<GameStream> = streams
         .iter()
-        .map(|&(seed, s)| GameStream::new(seed, game_cfg(s, c)))
+        .map(|&(seed, cfg)| GameStream::new(seed, game_cfg_of(cfg)))
         .collect();
     let mut out: Vec<Data> = (0..n).map(|_| Data::default()).collect();
     let mut live: Vec<Option<Solver>> = (0..n)
@@ -122,6 +131,7 @@ fn generate(
                 }
                 Step::Done(solved) => {
                     let sv = live[i].take().expect("a live solve");
+                    nodes[i].push(sv.shape().nodes);
                     streams[i].keep(&sv, solved, &mut out[i]);
                     if out[i].soff.len() < games {
                         let mut next = streams[i].next_solve(&nets, &mut out[i]);
@@ -141,14 +151,15 @@ fn generate(
             rest = tail;
         }
     }
-    out
+    out.into_iter().zip(nodes).map(|(data, nodes)| Run { data, nodes }).collect()
 }
 
 /// One stream, which is what a comparison against the CPU wants.
 fn generate_one(net: &Net, backend: Backend, games: usize, s: u32, c: f32) -> Data {
-    generate(net, backend, &[(0x51E5, s)], games, c)
+    generate(net, backend, &[(0x51E5, cfg(s, c))], games)
         .pop()
         .expect("one stream")
+        .data
 }
 
 /// One solve of the first position a stream reaches, run to the end on
@@ -455,34 +466,40 @@ fn a_solve_does_not_depend_on_the_round_it_rides_in() {
         return;
     }
     let net = random_net(0x9E37);
-    let streams = [(0x51E5u64, 8u32), (0x0A13, 11), (0x77C1, 13), (0x2E57, 17)];
+    let streams: [(u64, Cfg); 4] = [
+        (0x51E5, cfg(8, 0.0)),
+        (0x0A13, cfg(11, 0.0)),
+        (0x77C1, cfg(13, 0.0)),
+        (0x2E57, cfg(17, 0.0)),
+    ];
     let device = || Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
-    let together = generate(&net, device(), &streams, 3, 0.0);
+    let together = generate(&net, device(), &streams, 3);
     // A shared round must not move a solve at all, so the same run twice is
     // the control: whatever this reports is the floor the comparison sits on.
-    let twice = generate(&net, device(), &streams, 3, 0.0);
+    let twice = generate(&net, device(), &streams, 3);
     let rel = |x: f32, y: f32| (x - y).abs() / (x.abs().max(y.abs()).max(1e-2));
     let count = |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(&x, &y)| rel(x, y) > 1e-3).count();
     let mut bad = 0.0f32;
     for (i, &s) in streams.iter().enumerate() {
-        let alone = generate(&net, device(), &[s], 3, 0.0).pop().expect("one stream");
+        let alone = generate(&net, device(), &[s], 3).pop().expect("one stream").data;
+        let together = &together[i].data;
         assert_eq!(
             alone.cy.len(),
-            together[i].cy.len(),
+            together.cy.len(),
             "stream {i} solved a different number of positions in a shared round"
         );
         let (t, p) = (
-            worst(&alone.cy, &together[i].cy, "targets"),
-            worst(&alone.pprob, &together[i].pprob, "policy"),
+            worst(&alone.cy, &together.cy, "targets"),
+            worst(&alone.pprob, &together.pprob, "policy"),
         );
         eprintln!(
             "stream {i} iters={}: targets {t:e} ({} of {} differ)  policy {p:e} ({} of {} differ)  \
              repeat {:e}/{:e}",
-            s.1,
-            count(&alone.cy, &together[i].cy), alone.cy.len(),
-            count(&alone.pprob, &together[i].pprob), alone.pprob.len(),
-            worst(&twice[i].cy, &together[i].cy, "targets"),
-            worst(&twice[i].pprob, &together[i].pprob, "policy"),
+            s.1.s,
+            count(&alone.cy, &together.cy), alone.cy.len(),
+            count(&alone.pprob, &together.pprob), alone.pprob.len(),
+            worst(&twice[i].data.cy, &together.cy, "targets"),
+            worst(&twice[i].data.pprob, &together.pprob, "policy"),
         );
         assert!(t < 1e-4, "stream {i}: sharing a round moved its targets by {t:e}");
         bad = bad.max(p);
@@ -496,6 +513,56 @@ fn a_solve_does_not_depend_on_the_round_it_rides_in() {
     // is arithmetic order and not a step count read from the wrong solve --
     // and the targets above, which is what a run trains on, are unmoved.
     assert!(bad < 5e-2, "sharing a round moved a solve's policy by {bad:e}");
+}
+
+
+/// The same question with the tree growing and a round carrying several
+/// regret updates -- which is what production runs, and what none of the tests
+/// above reach.
+///
+/// A round of `batch = 8` samples eight expansion phases before the host grows
+/// anything, and the card lays them out phase-major over the whole round:
+/// `at = phase * (parts * sims) + part * sims`, with `sims` the widest growth
+/// rate in the round and every solve dropping out of the grid once
+/// `iter >= t.todo`. Every one of those three is an index into a batch, so a
+/// solve that read the wrong one takes another solve's leaves and grows
+/// somewhere else. The streams are given different budgets so their rounds are
+/// ragged in both directions -- different iteration counts, different growth
+/// rates -- because a batch of equal members is the one shape where an index
+/// off by a solve still lands on the right numbers.
+///
+/// Growth makes this strictly sharper than the `c = 0` test, not weaker: a
+/// wrong index moves the tree, and a tree is discrete.
+#[test]
+fn a_growing_solve_does_not_depend_on_the_round_it_rides_in() {
+    if Device::count() == 0 {
+        eprintln!("no cuda device; skipping");
+        return;
+    }
+    let net = random_net(0x9E37);
+    let batched = |s: u32, c: f32| Cfg { batch: 8, ..cfg(s, c) };
+    let streams: [(u64, Cfg); 4] = [
+        (0x51E5, batched(32, 4.0)),
+        (0x0A13, batched(48, 3.0)),
+        (0x77C1, batched(64, 8.0)),
+        (0x2E57, batched(80, 5.0)),
+    ];
+    let device = || Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
+    let together = generate(&net, device(), &streams, 2);
+    for (i, &s) in streams.iter().enumerate() {
+        let alone = generate(&net, device(), &[s], 2).pop().expect("one stream");
+        // The trees first. They are counts, so they are equal or they are not,
+        // and an index read from the batch shows up here before it shows up
+        // anywhere else.
+        assert_eq!(
+            alone.nodes, together[i].nodes,
+            "stream {i} (s={}, c={}) built different trees alone and in company",
+            s.1.s, s.1.c
+        );
+        let t = worst(&alone.data.cy, &together[i].data.cy, "targets");
+        eprintln!("stream {i} s={} c={}: trees {:?}  targets {t:e}", s.1.s, s.1.c, alone.nodes);
+        assert!(t < 1e-3, "stream {i}: sharing a round moved its targets by {t:e}");
+    }
 }
 
 
