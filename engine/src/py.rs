@@ -733,6 +733,12 @@ impl SolveFarm {
         dict.set_item("round_calls", read(&s.calls))?;
         dict.set_item("round_rows", read(&s.rows))?;
         dict.set_item("round_nanos", read(&s.nanos))?;
+        // What the population is, rather than what it is guessed to be: solves
+        // in flight, what the host budget allowed at the last admission, and
+        // the largest a solve has grown to in host bytes.
+        dict.set_item("live", s.live())?;
+        dict.set_item("live_allowed", s.allowed())?;
+        dict.set_item("host_peak", s.host_peak())?;
         Ok(out)
     }
 }
