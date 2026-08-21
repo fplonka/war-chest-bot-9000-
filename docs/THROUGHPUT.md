@@ -473,13 +473,33 @@ its block. cuBLAS tiles across rows and reuses a weight tile from shared
 memory over far more of them. Register-residency of the *activations* cannot
 pay for re-reading the *weights*.
 
-**The cheap route to determinism is a fixed shape, not a hand-written GEMM.**
-cuBLAS picks by `(m, n, k)`, and only `n` moves -- it is the round's row
-count. Pad every network tile to a fixed number of rows and the shape is
-constant, the heuristic picks the same algorithm every time, and
-`CUBLAS_COMPUTE_32F_FAST_16F` becomes safe. At `TILE` = 16,384 the padding
-would cost about half the work; at 2,048 it costs about 5%. **That is the next
-thing to try.**
+**A fixed shape is not the cheap route either.** cuBLAS picks by `(m, n, k)`
+and only `n` moves, so running every tile at exactly `TILE` rows -- the short
+last one zero-padded -- makes the choice constant. It works: all four parity
+tests pass, batch-composition included. It costs more than it can ever save:
+
+| `TILE` | tiles a round | solves/s |
+|---:|---:|---:|
+| 16,384 (natural, `min(TILE, stride)`) | 1 | **32.1** |
+| 4,096 | 3 | 27.2 |
+| 2,048 | 6 | 25.6 |
+
+The padding is not what hurts -- it touches only the join's multiplies, an
+eighth of a fifth of the device. The tile *count* is: a round's `stride` is
+about 10,863 rows, so any tile small enough to keep the padding cheap splits
+the round several ways and multiplies the launches of `k_belief_pool`,
+`k_readout`, `k_gather` and `k_join_input`, none of which needed padding at
+all. Large tile, ruinous padding; small tile, many launches. There is no
+setting where the trade comes out ahead, and tensor cores on the join could
+only give back about seven points against the fifteen this costs.
+
+**So the FP16 precondition is still open, and both cheap routes are closed.**
+What is left is narrower than it looked: the summation order only moves
+because cuBLAS may split the `k` loop, and whether it does is a function of
+the shape. An explicitly chosen non-split-`k` algorithm would fix the order
+without fixing the shape -- `cublasGemmEx` takes an algorithm rather than a
+heuristic. That is one parameter and one parity run, and it is the next thing
+to try before anyone writes a tiled GEMM by hand.
 
 ## What is left, in order
 
