@@ -63,6 +63,10 @@ N_KINDS = warchest.N_KINDS
 NSLOT = warchest.NSLOT
 N_HEXES = warchest.N_HEXES
 
+# What `SolveFarm.collect` reports about the device rounds, cumulative
+# since the farm started. `rounds` is the denominator of the other three.
+ROUND_KEYS = ("rounds", "round_calls", "round_rows", "round_nanos")
+
 
 def action_feats(pa):
     """The five stored bytes of each action into the head's one-hot input.
@@ -684,6 +688,10 @@ def main():
         generated_rows = 0
         window = collections.Counter()
         totals = collections.Counter()
+        # The farm's round counters are cumulative, so an epoch's figures are
+        # the difference against the last report and not an average since the
+        # farm started.
+        round_at = dict.fromkeys(ROUND_KEYS, 0)
         next_report = time.time() + 10.0
         next_target = sog_t0 + args.target_every * 60.0
 
@@ -818,6 +826,11 @@ def main():
             raw_sps = sog_solves / max(sog_elapsed, 1e-9)
             gen_s = window["gen_s"] / max(window["results"], 1)
             train_s = window["train_s"]
+            now_at = {k: int(data[k]) for k in ROUND_KEYS}
+            rounds = max(now_at["rounds"] - round_at["rounds"], 1)
+            per_round = {k: (now_at[k] - round_at[k]) / rounds
+                         for k in ROUND_KEYS[1:]}
+            round_at = now_at
             rec = {
                 "t": round(now - t0, 1),
                 "epoch": epoch,
@@ -836,15 +849,13 @@ def main():
                 # How many solves shared a forward pass. It should sit near the
                 # thread count; well below means the round is waiting on
                 # stragglers instead of batching them.
-                "calls_per_round": round(
-                    int(data["round_calls"]) / max(int(data["rounds"]), 1), 2),
-                "rows_per_round": round(
-                    int(data["round_rows"]) / max(int(data["rounds"]), 1), 1),
+                "calls_per_round": round(per_round["round_calls"], 2),
+                "rows_per_round": round(per_round["round_rows"], 1),
                 # Milliseconds a round spends inside the device backend — the
                 # batch plus the concatenation and split around it. The rest of
                 # a round is CFR on the cores.
                 "device_ms_per_round": round(
-                    1e-6 * int(data["round_nanos"]) / max(int(data["rounds"]), 1), 2),
+                    1e-6 * per_round["round_nanos"], 2),
                 # Rows the query solver produced, i.e. targets taken off
                 # the line of play. Zero means the coverage path is dead.
                 "query_rows": int(window["query_rows"]),
