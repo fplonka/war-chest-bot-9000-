@@ -27,8 +27,11 @@ use std::sync::Arc;
 use warchest::cuda::Device;
 use warchest::farm::{Backend, Call, Reply};
 use warchest::net::{Net, NetLayout};
-use warchest::search::{Cfg, Nets, Solver, Step};
-use warchest::selfplay::{Agent, Collect, Data, GameCfg, GameStream};
+use warchest::pbs::{enumerate_configs, reserve, true_config, Belief, Ctx};
+use warchest::rng::Rng;
+use warchest::search::{Cfg, Nets, Solved, Solver, Step};
+use warchest::selfplay::{make_game, Agent, Collect, Data, GameCfg, GameStream};
+use warchest::state::State;
 
 fn random_net(seed: u64) -> Net {
     let mut r = warchest::rng::Rng::new(seed);
@@ -144,13 +147,18 @@ fn generate_one(net: &Net, backend: Backend, games: usize, s: u32, c: f32) -> Da
 fn one_solve(net: &Net, backend: &Backend, s: u32, c: f32) -> Solver {
     let nets = Arc::new(Nets { value: net.clone(), device: backend.keeps_the_solve() });
     let mut data = Data::default();
-    let mut sv = GameStream::new(0x51E5, game_cfg(s, c)).next_solve(&nets, &mut data);
+    let sv = GameStream::new(0x51E5, game_cfg(s, c)).next_solve(&nets, &mut data);
+    run_solve(backend, sv).0
+}
+
+/// Drive one solve to its end on `backend`, in slot zero of card zero.
+fn run_solve(backend: &Backend, mut sv: Solver) -> (Solver, Option<Solved>) {
     sv.pin(0);
     let mut replies: Vec<Reply> = Vec::new();
     loop {
         match sv.advance(&replies) {
             Step::Calls(calls) => replies = backend.run(&calls, 0).expect("the backend answered"),
-            Step::Done(_) => return sv,
+            Step::Done(solved) => return (sv, solved),
         }
     }
 }
@@ -374,4 +382,89 @@ fn the_resident_state_agrees_with_the_cpu_network() {
     // written one. Both sides must actually be a policy.
     let uniform = got.prior[..cells].windows(2).all(|w| w[0] == w[1]);
     assert!(!uniform, "the card's prior is still the uniform start");
+}
+
+
+/// A subgame scored entirely from the game, on the card.
+///
+/// One coin play from the horizon, so every leaf below the root is terminal and
+/// the only network row is the root's own. What the solve is then made of is
+/// the terminal path -- the utilities, and the backpropagation that carries
+/// them up through a chance node -- which the fixed-tree comparison barely
+/// touches, because a mid-game subgame has few terminals and they are deep.
+#[test]
+fn a_subgame_scored_from_the_game_agrees_with_the_cpu() {
+    if Device::count() == 0 {
+        eprintln!("no cuda device; skipping");
+        return;
+    }
+    let net = random_net(0x9E37);
+    let nets = Arc::new(Nets { value: net.clone(), device: true });
+    let host_nets = Arc::new(Nets { value: net.clone(), device: false });
+    let backend = Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
+    let host = Backend::Reference(net.clone());
+    let uniform = |s: &State, ctx: &Ctx, p: u8| {
+        let truth = true_config(s, p, ctx);
+        let cfg = enumerate_configs(
+            &reserve(s, p, ctx),
+            truth.hand_size(),
+            truth.fd_size(),
+            truth.inflight.is_some(),
+        );
+        let n = cfg.len().max(1) as f32;
+        Belief { p: vec![1.0 / n; cfg.len()], cfg }
+    };
+    // An ordinary solve first, so slot zero holds another tree's rows and
+    // arenas when this one takes it over.
+    one_solve(&net, &backend, 8, 1.0);
+    let mut checked = 0usize;
+    for seed in 0..600u64 {
+        let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
+        let mut s = make_game(&mut rng, false);
+        for _ in 0..60 + seed % 100 {
+            if s.is_terminal() {
+                break;
+            }
+            let acts = s.legal_actions();
+            s.apply_inplace(acts[rng.below(acts.len())]);
+        }
+        if s.is_terminal() || s.is_chance() {
+            continue;
+        }
+        s.main_plays = warchest::state::MAX_MAIN_PLAYS - 1;
+        let ctx = Ctx::new(&s);
+        let bel = [uniform(&s, &ctx, 0), uniform(&s, &ctx, 1)];
+        let mut sv = Solver::new(
+            &s,
+            ctx,
+            Arc::clone(&nets),
+            cfg(8, 1.0),
+            bel.clone(),
+            Rng::new(seed),
+        );
+        // The root itself carries a row -- it is a coin play, and a coin play
+        // is where the network is defined. Everything under it is terminal.
+        assert_eq!(sv.leaf_rows.len(), 1, "the subgame reaches the network more than once");
+        sv.collect(0);
+        let got = run_solve(&backend, sv).1.expect("a collected solve keeps a row");
+        let mut want = Solver::new(
+            &s,
+            ctx,
+            Arc::clone(&host_nets),
+            cfg(8, 1.0),
+            bel,
+            Rng::new(seed),
+        );
+        want.collect(0);
+        let want = run_solve(&host, want).1.expect("a collected solve keeps a row");
+        for p in 0..2 {
+            let bad = worst(&want.value[p], &got.value[p], "root value");
+            assert!(bad < 1e-4, "player {p}'s root value differs by {bad:e}");
+        }
+        checked += 1;
+        if checked >= 2 {
+            return;
+        }
+    }
+    panic!("only {checked} such positions were reached in 600 seeds");
 }
