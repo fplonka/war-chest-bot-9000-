@@ -737,10 +737,10 @@ mod tests {
         };
         let cfg = Cfg { s: 32, c: 4.0, ..Default::default() };
         let gc = GameCfg {
-            agents: [Agent::Rebel {
+            agents: [Agent::Sog {
                 cfg: Cfg { s: 4, c: 1.0, ..cfg },
             }; 2],
-            collect: Collect::Rebel,
+            collect: Collect::Sog,
             explore: 0.1,
             random_draft: true,
             eval_mix: 1.0,
@@ -754,7 +754,7 @@ mod tests {
         let mut rng = Rng::new(0xC047);
         let mut checked = 0usize;
         for (s, belief) in &roots {
-            let ctx = crate::rebel::Ctx::new(s);
+            let ctx = crate::pbs::Ctx::new(s);
             let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
             for t in 0..cfg.iters() {
                 sv.step();
@@ -812,10 +812,10 @@ mod tests {
             ..Default::default()
         };
         let gc = GameCfg {
-            agents: [Agent::Rebel {
+            agents: [Agent::Sog {
                 cfg: Cfg { s: 4, c: 1.0, ..cfg },
             }; 2],
-            collect: Collect::Rebel,
+            collect: Collect::Sog,
             explore: 0.1,
             random_draft: true,
             eval_mix: 1.0,
@@ -828,7 +828,7 @@ mod tests {
 
         let mut checked = 0usize;
         for (s, belief) in &roots {
-            let ctx = crate::rebel::Ctx::new(s);
+            let ctx = crate::pbs::Ctx::new(s);
             // The same solve twice, from the same seed, so the expansion
             // trajectories match and only the sweep differs.
             let run = |flat: bool| {
@@ -928,10 +928,10 @@ mod tests {
             ..Default::default()
         };
         let gc = GameCfg {
-            agents: [Agent::Rebel {
+            agents: [Agent::Sog {
                 cfg: Cfg { s: 4, c: 1.0, ..cfg },
             }; 2],
-            collect: Collect::Rebel,
+            collect: Collect::Sog,
             explore: 0.1,
             random_draft: true,
             eval_mix: 1.0,
@@ -945,7 +945,7 @@ mod tests {
         let mut rng = Rng::new(0x1E4E);
         let mut deepest = 0usize;
         for (s, belief) in &roots {
-            let ctx = crate::rebel::Ctx::new(s);
+            let ctx = crate::pbs::Ctx::new(s);
             let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
             for _ in 0..cfg.iters() {
                 sv.step();
@@ -1004,8 +1004,8 @@ mod tests {
         let nets = Nets { value: random_net(0x5EED), device: false, gate: None };
         let cfg = Cfg { s: 40, c: 4.0, ..Default::default() };
         let gc = GameCfg {
-            agents: [Agent::Rebel { cfg: Cfg { s: 4, c: 1.0, ..cfg } }; 2],
-            collect: Collect::Rebel,
+            agents: [Agent::Sog { cfg: Cfg { s: 4, c: 1.0, ..cfg } }; 2],
+            collect: Collect::Sog,
             explore: 0.1,
             random_draft: true,
             eval_mix: 1.0,
@@ -1018,7 +1018,7 @@ mod tests {
         let mut rng = Rng::new(0xE47E);
         let mut checked = 0usize;
         for (s, belief) in &roots {
-            let ctx = crate::rebel::Ctx::new(s);
+            let ctx = crate::pbs::Ctx::new(s);
             let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
             let mut inc = Contract::of(&sv);
             sv.grown.clear();
@@ -1101,10 +1101,10 @@ mod tests {
             ..Default::default()
         };
         let gc = GameCfg {
-            agents: [Agent::Rebel {
+            agents: [Agent::Sog {
                 cfg: Cfg { s: 4, c: 1.0, ..cfg },
             }; 2],
-            collect: Collect::Rebel,
+            collect: Collect::Sog,
             explore: 0.1,
             random_draft: true,
             eval_mix: 1.0,
@@ -1118,7 +1118,7 @@ mod tests {
         let mut rng = Rng::new(0xE47E);
         let mut checked = 0usize;
         for (s, belief) in &roots {
-            let ctx = crate::rebel::Ctx::new(s);
+            let ctx = crate::pbs::Ctx::new(s);
             let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
             let mut inc = Contract::of(&sv);
             sv.grown.clear();
@@ -1229,10 +1229,10 @@ mod tests {
             ..Default::default()
         };
         let gc = GameCfg {
-            agents: [Agent::Rebel {
+            agents: [Agent::Sog {
                 cfg: Cfg { s: 4, c: 1.0, ..cfg },
             }; 2],
-            collect: Collect::Rebel,
+            collect: Collect::Sog,
             explore: 0.1,
             random_draft: true,
             eval_mix: 1.0,
@@ -1246,7 +1246,7 @@ mod tests {
         let mut rng = Rng::new(0xB4CC);
         let mut checked = 0usize;
         for (s, belief) in &roots {
-            let ctx = crate::rebel::Ctx::new(s);
+            let ctx = crate::pbs::Ctx::new(s);
             let mut sv = crate::search::Solver::new(s, ctx, &nets, cfg, belief.clone());
             for t in 0..cfg.iters() {
                 // Run whole iterations first, so the regrets and the running

@@ -18,7 +18,7 @@ pub mod bot;
 pub mod net;
 pub mod policy;
 pub mod prof;
-pub mod rebel;
+pub mod pbs;
 pub mod rng;
 pub mod roots;
 pub mod rules;

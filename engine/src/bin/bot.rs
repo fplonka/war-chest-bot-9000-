@@ -23,7 +23,7 @@ use warchest::args::Args;
 use warchest::bot::{Brain, Mind, Session};
 use warchest::farm::{Backend, Gate};
 use warchest::net::Net;
-use warchest::rebel::rules_table_hash;
+use warchest::pbs::rules_table_hash;
 use warchest::search::{Cfg, Cfr, Nets};
 
 struct Options {
@@ -44,7 +44,7 @@ fn options() -> Result<Options, String> {
     Ok(Options {
         name: a.text("name", "bot"),
         weights: a.text("weights", ""),
-        mind: a.text("mind", "rebel"),
+        mind: a.text("mind", "sog"),
         cfr: a.text("cfr", "sog"),
         s: a.num("s", 512)?,
         c: a.num("c", 8.0)?,
@@ -55,14 +55,14 @@ fn options() -> Result<Options, String> {
 
 fn brain(o: &Options, gate: Option<Arc<Gate>>, device: bool) -> Result<Brain, String> {
     let mind = match o.mind.as_str() {
-        "rebel" => Mind::Rebel,
+        "sog" => Mind::Sog,
         "greedy" => Mind::Greedy { temp: o.temp },
         "random" => Mind::Random,
         other => return Err(format!("unknown mind {}", other)),
     };
     let cfr = Cfr::named(&o.cfr).ok_or_else(|| format!("unknown cfr rule {}", o.cfr))?;
     let mut nets = Nets { gate, device, ..Nets::default() };
-    if matches!(mind, Mind::Rebel) {
+    if matches!(mind, Mind::Sog) {
         nets.value = Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
     }
     Ok(Brain {
@@ -234,7 +234,7 @@ fn main() {
 /// a bot runnable on a laptop -- and it is the oracle `cuda_parity` holds the
 /// device to, so it is not going anywhere.
 fn devices(o: &Options) -> Option<Backend> {
-    if !matches!(o.mind.as_str(), "rebel") {
+    if !matches!(o.mind.as_str(), "sog") {
         return None;
     }
     #[cfg(feature = "gpu")]

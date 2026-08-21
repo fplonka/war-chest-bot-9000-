@@ -22,7 +22,7 @@
 
 use crate::actions::N_KINDS;
 use crate::board::{board, NONE, N_HEXES};
-use crate::rebel::{
+use crate::pbs::{
     CFEAT, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_CARDS, OFF_LOOSE, OFF_PILES, PILE_COUNTS,
     PUBFEAT,
 };

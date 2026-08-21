@@ -16,7 +16,7 @@
 use std::ops::Range;
 
 use crate::actions::Action;
-use crate::rebel::{action_legal, advance_config, obs_key, set_config, Belief, Config, Ctx};
+use crate::pbs::{action_legal, advance_config, obs_key, set_config, Belief, Config, Ctx};
 use crate::rng::Rng;
 use crate::search::{node_actions, Solver};
 use crate::state::State;

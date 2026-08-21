@@ -7,7 +7,7 @@
 
 There is no generated page on disk and no regeneration step: a run in progress
 is a log.json with fewer epochs in it than it will have in a minute, and it
-renders exactly like a finished one. What each panel means is in docs/REBEL.md.
+renders exactly like a finished one.
 """
 import argparse
 import glob
@@ -86,7 +86,7 @@ def elo_panel(lad, name):
 
 
 def panels(eps, elo):
-    """Every panel of the dashboard, from the ReBeL epochs logged so far."""
+    """Every panel of the dashboard, from the SoG epochs logged so far."""
     m = [e["t"] / 60.0 for e in eps]
     col = lambda k: [e.get(k, 0) for e in eps]
     has = lambda k: any(k in e for e in eps)
@@ -111,7 +111,7 @@ def panels(eps, elo):
 
     # Raw loss is not comparable across phases, because the targets it is
     # measured against change scale: the greedy warm phase has a target std near
-    # 0.5 and ReBeL settles nearer 0.2, so a falling loss can be nothing but a
+    # 0.5 and search settles nearer 0.2, so a falling loss can be nothing but a
     # shrinking target. The share of target variance left unexplained is
     # scale-free, and is what says whether a phase actually fitted.
     out.append(panel("Unexplained target variance", "loss / target variance",
@@ -231,7 +231,7 @@ def detail(runs_dir, name):
     # report loss 0 and a handful of solves, and plotting them drags every
     # curve to the floor in its final pixel.
     eps = [e for e in log.get("epochs") or []
-           if e.get("phase") == "rebel" and e.get("solves", 0) > 0
+           if e.get("phase") == "sog" and e.get("solves", 0) > 0
            and e.get("steps", 1) > 0]
     cfg = log.get("cfg") or {}
     # Only ladders in the current format. Older runs kept a `ladder.json`

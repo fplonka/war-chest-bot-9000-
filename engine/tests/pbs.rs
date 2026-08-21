@@ -1,7 +1,7 @@
 //! Correctness tests for the public belief state.
 //!
 //! Belief bookkeeping bugs do not crash — they just make the bot quietly wrong —
-//! so these are the load-bearing tests of the whole ReBeL stack.
+//! so these are the load-bearing tests of the whole SoG stack.
 //!
 //! 1. `features_do_not_leak_private_information`: the public encoding must be a
 //!    function of the public state alone. Swapping a player's true config for
@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 
 use warchest::net::Net;
-use warchest::rebel::*;
+use warchest::pbs::*;
 use warchest::rng::Rng;
 use warchest::search::{node_actions, Cfg, Nets, Solver};
 use warchest::selfplay::{make_game, Agent, Collect, GameCfg, GameStream};
@@ -928,8 +928,8 @@ fn game_stream_yields_one_complete_solve_at_a_time() {
         ..Default::default()
     };
     let gc = GameCfg {
-        agents: [Agent::Rebel { cfg }; 2],
-        collect: Collect::Rebel,
+        agents: [Agent::Sog { cfg }; 2],
+        collect: Collect::Sog,
         explore: 0.25,
         random_draft: false,
         eval_mix: 1.0,
@@ -963,8 +963,8 @@ fn a_gated_solve_matches_an_ungated_one_exactly() {
         ..Default::default()
     };
     let gc = GameCfg {
-        agents: [Agent::Rebel { cfg }; 2],
-        collect: Collect::Rebel,
+        agents: [Agent::Sog { cfg }; 2],
+        collect: Collect::Sog,
         explore: 0.1,
         random_draft: true,
         eval_mix: 1.0,
@@ -1048,8 +1048,8 @@ fn a_solve_stores_its_root_and_nothing_else() {
         ..Default::default()
     };
     let gc = GameCfg {
-        agents: [Agent::Rebel { cfg }; 2],
-        collect: Collect::Rebel,
+        agents: [Agent::Sog { cfg }; 2],
+        collect: Collect::Sog,
         explore: 0.25,
         random_draft: true,
         eval_mix: 1.0,

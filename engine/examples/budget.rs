@@ -90,8 +90,8 @@ fn main() {
     // the corpus has to be a sample of play and not of one phase.
     let small = Cfg { s: 32, c: 4.0, cfr: Cfr::SOG, ..Default::default() };
     let gc = GameCfg {
-        agents: [Agent::Rebel { cfg: small }; 2],
-        collect: Collect::Rebel,
+        agents: [Agent::Sog { cfg: small }; 2],
+        collect: Collect::Sog,
         explore: 0.1,
         random_draft: true,
         eval_mix: 1.0,
@@ -147,7 +147,7 @@ fn main() {
             .par_iter()
             .enumerate()
             .map(|(i, (st, bel))| {
-                let ctx = warchest::rebel::Ctx::new(st);
+                let ctx = warchest::pbs::Ctx::new(st);
                 let mut sv = Solver::new(st, ctx, &nets, cfg, bel.clone());
                 let mut rng = Rng::new(0x51D5 ^ i as u64);
                 let mut one = Cost { solves: 1.0, ..Default::default() };
@@ -167,10 +167,10 @@ fn main() {
                 // seen. A public state is the board, the piles and the flags,
                 // which is exactly what the row encoding holds.
                 let mut seen: HashSet<Vec<u8>> = HashSet::new();
-                let mut row = vec![0u8; warchest::rebel::ROW_BYTES];
-                let ctx2 = warchest::rebel::Ctx::new(st);
+                let mut row = vec![0u8; warchest::pbs::ROW_BYTES];
+                let ctx2 = warchest::pbs::Ctx::new(st);
                 for &node in sv.leaf_rows.iter() {
-                    warchest::rebel::pack_row(&sv.states[node], &ctx2, &mut row);
+                    warchest::pbs::pack_row(&sv.states[node], &ctx2, &mut row);
                     seen.insert(row.clone());
                 }
                 one.distinct = seen.len() as f64;

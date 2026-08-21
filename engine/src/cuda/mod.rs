@@ -41,7 +41,7 @@ use crate::net::{
     ln_block, Net, NetLayout, NormSpan, Span, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW, LN_CFG,
     LN_H, LN_JOIN, LN_JOUT, LN_TRUNK, POOL, TYPE,
 };
-use crate::rebel::{
+use crate::pbs::{
     CFEAT, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_LOOSE, OFF_PILES, PILE_COUNTS, PUBFEAT,
 };
 use crate::search::Cfr;

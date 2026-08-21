@@ -50,7 +50,7 @@
 //! keyed values by hand alone and averaged the face-down composition into a
 //! marginal; that made the strategy measurable with respect to the hand, so the
 //! agent could not act on coins it had buried itself — a restriction of the
-//! strategy space, i.e. a different game. `docs/REBEL.md` records what it cost.
+//! strategy space, i.e. a different game.
 
 use crate::actions::Action;
 use crate::board::{board, NONE, N_HEXES};

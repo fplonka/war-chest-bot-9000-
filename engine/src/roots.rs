@@ -3,7 +3,7 @@
 use std::io::{Read, Write};
 
 use crate::board::N_HEXES;
-use crate::rebel::{Belief, Config, NSLOT};
+use crate::pbs::{Belief, Config, NSLOT};
 use crate::state::{Cont, ContStack, State, CONT_CAP, N_PLAYERS, N_ZONES};
 use crate::units::N_UNITS;
 
@@ -312,7 +312,7 @@ pub fn read_roots<R: Read>(r: &mut R) -> std::io::Result<Vec<(State, [Belief; 2]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rebel::{Belief, Config};
+    use crate::pbs::{Belief, Config};
     use crate::state::{Cont, HexSet, WHITE};
 
     /// Every continuation survives a round trip, payload included.

@@ -480,7 +480,7 @@ impl Game {
     }
 }
 
-// --------------------------------------------------------------- ReBeL API
+// ----------------------------------------------------------------- SoG API
 //
 // The training loop lives in Python (PyTorch), but every game, every subgame
 // solve and every network evaluation runs here: Python only ships weights down
@@ -615,7 +615,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
         );
     }
     out.set_item("rows", d.rows.into_pyarray_bound(py))?;
-    out.set_item("row_bytes", crate::rebel::ROW_BYTES)?;
+    out.set_item("row_bytes", crate::pbs::ROW_BYTES)?;
     out.set_item("cc", d.cc.into_pyarray_bound(py))?;
     out.set_item("cw", d.cw.into_pyarray_bound(py))?;
     out.set_item("cy", d.cy.into_pyarray_bound(py))?;
@@ -668,8 +668,8 @@ impl SolveFarm {
         // same order, so the mix of solve costs in flight does not drift.
         let work = match roots {
             None => Work::Play(GameCfg {
-                agents: [Agent::Rebel { cfg }; 2],
-                collect: Collect::Rebel,
+                agents: [Agent::Sog { cfg }; 2],
+                collect: Collect::Sog,
                 explore,
                 random_draft,
                 eval_mix: 1.0,
@@ -754,7 +754,7 @@ fn backend_for(_devices: &[usize], _value: crate::net::Net, _lanes: usize) -> Py
 }
 
 /// Run `games` self-play games across all cores and return the training data.
-/// `mode` is "greedy" (Monte-Carlo warm start) or "rebel".
+/// `mode` is "greedy" (Monte-Carlo warm start) or "sog".
 #[pyfunction]
 #[pyo3(signature = (games, seed, mode, s=512, c=8.0, explore=0.25, temp=2.0, random_draft=true, eval_mix=0.5, mc_mix=0.0, cfr="sog"))]
 #[allow(clippy::too_many_arguments)]
@@ -775,7 +775,7 @@ fn gen_data(
     let cfg = Cfg { s, c, cfr: cfr_of(cfr)?, ..Default::default() };
     let (agent, collect) = match mode {
         "greedy" => (Agent::Greedy { temp }, Collect::Mc),
-        "rebel" => (Agent::Rebel { cfg }, Collect::Rebel),
+        "sog" => (Agent::Sog { cfg }, Collect::Sog),
         other => {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "unknown mode '{}'",
@@ -823,10 +823,10 @@ fn save_roots(
 ) -> PyResult<usize> {
     let cfg = Cfg { s, c, ..Default::default() };
     let gc = GameCfg {
-        agents: [Agent::Rebel { cfg }; 2],
+        agents: [Agent::Sog { cfg }; 2],
         // The roots this tool wants are the queries a search nominates, and
         // those are only harvested where a row is collected.
-        collect: Collect::Rebel,
+        collect: Collect::Sog,
         explore: 0.25,
         random_draft,
         eval_mix: 0.0,
@@ -1036,7 +1036,7 @@ fn hex_mirror() -> Vec<u32> {
 /// bytes to get there and is checked against this.
 #[pyfunction]
 fn mirror_row_pairs(games: usize, seed: u64) -> Vec<u8> {
-    use crate::rebel::{pack_row, Ctx, ROW_BYTES};
+    use crate::pbs::{pack_row, Ctx, ROW_BYTES};
     let mut rng = crate::rng::Rng::new(seed);
     let mut out = Vec::new();
     for _ in 0..games {
@@ -1063,7 +1063,7 @@ fn mirror_row_pairs(games: usize, seed: u64) -> Vec<u8> {
 
 /// Expand packed replay rows into the public encoding, in one batch.
 ///
-/// `rows` is `[n * ROW_BYTES]` u8 (see `rebel::ROW_*`); `hand`/`fd`/`bag` are
+/// `rows` is `[n * ROW_BYTES]` u8 (see `pbs::ROW_*`); `hand`/`fd`/`bag` are
 /// the public per-player hand/face-down/bag sizes, `[n, 2]` u8, read off the
 /// row's config support by the caller (every config in a support shares
 /// them) — the only part of the public state the row does not carry itself.
@@ -1071,7 +1071,7 @@ fn mirror_row_pairs(games: usize, seed: u64) -> Vec<u8> {
 /// produces for a live state.
 #[pyfunction]
 fn rules_table_hash() -> u64 {
-    crate::rebel::rules_table_hash()
+    crate::pbs::rules_table_hash()
 }
 
 #[pyfunction]
@@ -1081,7 +1081,7 @@ fn expand_rows(
     fd: PyReadonlyArray2<u8>,
     bag: PyReadonlyArray2<u8>,
 ) -> PyResult<Vec<f32>> {
-    use crate::rebel::{expand_row, PUBFEAT, ROW_BYTES};
+    use crate::pbs::{expand_row, PUBFEAT, ROW_BYTES};
     let rows = rows.as_slice()?;
     let hand = hand.as_array();
     let fd = fd.as_array();
@@ -1131,46 +1131,46 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SolveFarm>()?;
     m.add_class::<crate::arena::PyTable>()?;
     m.add("MAX_MAIN_PLAYS", crate::state::MAX_MAIN_PLAYS)?;
-    m.add("PUBFEAT", crate::rebel::PUBFEAT)?;
-    m.add("CFEAT", crate::rebel::CFEAT)?;
-    m.add("CCOUNTS", crate::rebel::CCOUNTS)?;
-    m.add("CNORM", crate::rebel::CNORM)?;
+    m.add("PUBFEAT", crate::pbs::PUBFEAT)?;
+    m.add("CFEAT", crate::pbs::CFEAT)?;
+    m.add("CCOUNTS", crate::pbs::CCOUNTS)?;
+    m.add("CNORM", crate::pbs::CNORM)?;
     m.add("N_HEXES", crate::board::N_HEXES)?;
     m.add("N_LOCATIONS", crate::board::N_LOCATIONS)?;
     m.add("N_UNITS", crate::units::N_UNITS)?;
-    m.add("NSLOT", crate::rebel::NSLOT)?;
+    m.add("NSLOT", crate::pbs::NSLOT)?;
     m.add("N_KINDS", crate::actions::N_KINDS)?;
     m.add("ACT_BYTES", crate::search::ACT_BYTES)?;
     m.add("CARD_FEATS", crate::units::CARD_FEATS)?;
     // Block offsets in the public half of the encoding. Exported so the
     // training side can build the mirror permutation from one source of truth
     // rather than restating the layout.
-    m.add("NTYPE", crate::rebel::NTYPE)?;
-    m.add("HEX_CH", crate::rebel::HEX_CH)?;
-    m.add("HEX_FACTS", crate::rebel::HEX_FACTS)?;
-    m.add("HEX_BLOCK", crate::rebel::HEX_BLOCK)?;
-    m.add("PILE_COUNTS", crate::rebel::PILE_COUNTS)?;
-    m.add("PLAYER_SCALARS", crate::rebel::PLAYER_SCALARS)?;
-    m.add("GLOBAL_SCALARS", crate::rebel::GLOBAL_SCALARS)?;
-    m.add("LOOSE", crate::rebel::LOOSE)?;
-    m.add("OFF_PILES", crate::rebel::OFF_PILES)?;
-    m.add("OFF_CARDS", crate::rebel::OFF_CARDS)?;
-    m.add("OFF_LOOSE", crate::rebel::OFF_LOOSE)?;
+    m.add("NTYPE", crate::pbs::NTYPE)?;
+    m.add("HEX_CH", crate::pbs::HEX_CH)?;
+    m.add("HEX_FACTS", crate::pbs::HEX_FACTS)?;
+    m.add("HEX_BLOCK", crate::pbs::HEX_BLOCK)?;
+    m.add("PILE_COUNTS", crate::pbs::PILE_COUNTS)?;
+    m.add("PLAYER_SCALARS", crate::pbs::PLAYER_SCALARS)?;
+    m.add("GLOBAL_SCALARS", crate::pbs::GLOBAL_SCALARS)?;
+    m.add("LOOSE", crate::pbs::LOOSE)?;
+    m.add("OFF_PILES", crate::pbs::OFF_PILES)?;
+    m.add("OFF_CARDS", crate::pbs::OFF_CARDS)?;
+    m.add("OFF_LOOSE", crate::pbs::OFF_LOOSE)?;
     m.add_function(wrap_pyfunction!(expand_rows, m)?)?;
-    m.add("ROW_BYTES", crate::rebel::ROW_BYTES)?;
-    m.add("ROW_VERSION", crate::rebel::ROW_VERSION)?;
-    m.add("ROW_HASH", crate::rebel::ROW_HASH)?;
-    m.add("ROW_IDS", crate::rebel::ROW_IDS)?;
-    m.add("ROW_HEX_OWNER", crate::rebel::ROW_HEX_OWNER)?;
-    m.add("ROW_HEX_SLOT", crate::rebel::ROW_HEX_SLOT)?;
-    m.add("ROW_HEX_HEIGHT", crate::rebel::ROW_HEX_HEIGHT)?;
-    m.add("ROW_HEX_MARKER", crate::rebel::ROW_HEX_MARKER)?;
-    m.add("ROW_PILES", crate::rebel::ROW_PILES)?;
-    m.add("ROW_INITIATIVE", crate::rebel::ROW_INITIATIVE)?;
-    m.add("ROW_INIT_MOVED", crate::rebel::ROW_INIT_MOVED)?;
-    m.add("ROW_TO_ACT", crate::rebel::ROW_TO_ACT)?;
-    m.add("ROW_PLIES", crate::rebel::ROW_PLIES)?;
-    m.add("ROW_FORMAT_VERSION", crate::rebel::ROW_FORMAT_VERSION)?;
+    m.add("ROW_BYTES", crate::pbs::ROW_BYTES)?;
+    m.add("ROW_VERSION", crate::pbs::ROW_VERSION)?;
+    m.add("ROW_HASH", crate::pbs::ROW_HASH)?;
+    m.add("ROW_IDS", crate::pbs::ROW_IDS)?;
+    m.add("ROW_HEX_OWNER", crate::pbs::ROW_HEX_OWNER)?;
+    m.add("ROW_HEX_SLOT", crate::pbs::ROW_HEX_SLOT)?;
+    m.add("ROW_HEX_HEIGHT", crate::pbs::ROW_HEX_HEIGHT)?;
+    m.add("ROW_HEX_MARKER", crate::pbs::ROW_HEX_MARKER)?;
+    m.add("ROW_PILES", crate::pbs::ROW_PILES)?;
+    m.add("ROW_INITIATIVE", crate::pbs::ROW_INITIATIVE)?;
+    m.add("ROW_INIT_MOVED", crate::pbs::ROW_INIT_MOVED)?;
+    m.add("ROW_TO_ACT", crate::pbs::ROW_TO_ACT)?;
+    m.add("ROW_PLIES", crate::pbs::ROW_PLIES)?;
+    m.add("ROW_FORMAT_VERSION", crate::pbs::ROW_FORMAT_VERSION)?;
     m.add_function(wrap_pyfunction!(rules_table_hash, m)?)?;
     m.add_function(wrap_pyfunction!(hex_neighbours, m)?)?;
     m.add_function(wrap_pyfunction!(location_hexes, m)?)?;

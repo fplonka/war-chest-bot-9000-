@@ -24,7 +24,7 @@
 use crate::actions::Action;
 use crate::arena::{Draft, Obs};
 use crate::policy::{self, NodePolicy};
-use crate::rebel::{
+use crate::pbs::{
     belief_after_draw, faceup_counts, obs_key, reserve, set_config, true_config, Belief, Config,
     Ctx,
 };
@@ -37,7 +37,7 @@ use crate::state::{Cont, State};
 #[derive(Clone, Copy, Debug)]
 pub enum Mind {
     /// Solve the depth-limited subgame, act on the CFR average strategy.
-    Rebel,
+    Sog,
     /// One-ply search on the handcrafted static evaluation.
     Greedy { temp: f32 },
     /// Uniform over legal actions.
@@ -69,7 +69,7 @@ impl Brain {
         match self.mind {
             Mind::Greedy { temp } => return policy::greedy(s, ctx, player, cfgs, temp),
             Mind::Random => return policy::uniform(s, ctx, player, cfgs),
-            Mind::Rebel => {}
+            Mind::Sog => {}
         }
         let mut sv = Solver::new(s, *ctx, &self.nets, self.cfg, bel.clone());
         sv.solve(rng);

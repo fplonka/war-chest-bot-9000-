@@ -61,8 +61,8 @@ fn main() {
     };
     let small = Cfg { s: 32, c: 4.0, cfr: Cfr::SOG, ..Default::default() };
     let gc = GameCfg {
-        agents: [Agent::Rebel { cfg: small }; 2],
-        collect: Collect::Rebel,
+        agents: [Agent::Sog { cfg: small }; 2],
+        collect: Collect::Sog,
         explore: 0.1,
         random_draft: true,
         eval_mix: 1.0,
@@ -98,7 +98,7 @@ fn main() {
         .par_iter()
         .enumerate()
         .map(|(i, (st, bel))| {
-            let ctx = warchest::rebel::Ctx::new(st);
+            let ctx = warchest::pbs::Ctx::new(st);
             let mut sv = Solver::new(st, ctx, &nets, cfg_of(512, 8.0), bel.clone());
             let mut rng = Rng::new(0x51D5 ^ i as u64);
             sv.solve(&mut rng);
@@ -143,7 +143,7 @@ fn main() {
         .par_iter()
         .enumerate()
         .map(|(i, (st, bel))| {
-            let ctx = warchest::rebel::Ctx::new(st);
+            let ctx = warchest::pbs::Ctx::new(st);
             let mut sv = Solver::new(st, ctx, &nets, cfg_of(512, 2.0), bel.clone());
             let mut rng = Rng::new(0x51D5 ^ i as u64);
             sv.solve(&mut rng);
@@ -161,7 +161,7 @@ fn main() {
             .enumerate()
             .map(|(i, (st, bel))| {
                 let Some(r) = refs[i] else { return (0.0, 0.0, 0.0) };
-                let ctx = warchest::rebel::Ctx::new(st);
+                let ctx = warchest::pbs::Ctx::new(st);
                 let mut sv = Solver::new(st, ctx, &nets, cfg_of(s, c), bel.clone());
                 let mut rng = Rng::new(0x51D5 ^ i as u64);
                 sv.solve(&mut rng);
@@ -199,7 +199,7 @@ fn main() {
             .enumerate()
             .map(|(i, (st, bel))| {
                 let Some(r) = refs[i] else { return (0.0, 0.0, 0.0) };
-                let ctx = warchest::rebel::Ctx::new(st);
+                let ctx = warchest::pbs::Ctx::new(st);
                 let mut sv = Solver::new(st, ctx, &nets, cfg_temp(512, 8.0, temp), bel.clone());
                 let mut rng = Rng::new(0x51D5 ^ i as u64);
                 sv.solve(&mut rng);

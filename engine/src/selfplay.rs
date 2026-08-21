@@ -10,7 +10,7 @@
 //! Chance nodes are resolved from the true bag and convolve the belief with
 //! each config's own draw distribution.
 //!
-//! A ReBeL decision solves its own subgame with GT-CFR and acts on the CFR
+//! A SoG decision solves its own subgame with GT-CFR and acts on the CFR
 //! average. The tree grows towards its node budget while the solve runs.
 //!
 //! **A solve yields exactly one value row: its root's.** The opposing range is
@@ -30,12 +30,12 @@
 //!     game outcome with a squashed handcrafted public-information evaluation.
 //!     Without it the value network is noise, CFR plays without purpose, and
 //!     games only ever end at the horizon.
-//!   * `Collect::Rebel` — solved counterfactual values at solve roots.
+//!   * `Collect::Sog` — solved counterfactual values at solve roots.
 
 use crate::actions::{Action, Play};
 use crate::board::{board, NONE, N_HEXES};
 use crate::policy;
-use crate::rebel::*;
+use crate::pbs::*;
 use crate::rng::Rng;
 use crate::search::{Cfg, Nets, Solver};
 use crate::state::{Cont, State, BLACK, WHITE, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP};
@@ -150,7 +150,7 @@ pub enum Agent {
     /// Uniform over legal actions: the weakest reference on the Elo ladder.
     Random,
     /// Grow and solve a GT-CFR tree, then act on its average strategy.
-    Rebel { cfg: Cfg },
+    Sog { cfg: Cfg },
 }
 
 // -------------------------------------------------------------- data records
@@ -160,8 +160,8 @@ pub enum Collect {
     None,
     /// Monte-Carlo value targets from the game outcome (greedy warm start).
     Mc,
-    /// ReBeL: CFR subgame root values.
-    Rebel,
+    /// Student of Games: CFR subgame root values.
+    Sog,
 }
 
 /// One training row is a public state plus, for each player, that player's
@@ -174,7 +174,7 @@ pub enum Collect {
 /// `2 * n + 1` offsets: row `r`, player `p` spans `coff[2*r+p] .. coff[2*r+p+1]`.
 #[derive(Default)]
 pub struct Data {
-    /// `[n * ROW_BYTES]` packed replay rows (see `rebel::ROW_*`). The public encoding is *not* stored — a
+    /// `[n * ROW_BYTES]` packed replay rows (see `pbs::ROW_*`). The public encoding is *not* stored — a
     /// row is expanded when a batch is made, so the stored bytes never go
     /// stale as the network changes.
     pub rows: Vec<u8>,
@@ -428,9 +428,9 @@ fn draw_count(rng: &mut Rng, rate: f32) -> usize {
 }
 
 /// Whether a row is collected here. Only coin plays carry one, and only the
-/// ReBeL collector takes them from a solve.
+/// SoG collector takes them from a solve.
 fn collects_rows(gc: &GameCfg, s: &State) -> bool {
-    gc.collect == Collect::Rebel && matches!(s.pending(), Cont::MainPlay)
+    gc.collect == Collect::Sog && matches!(s.pending(), Cont::MainPlay)
 }
 
 impl Game {
@@ -468,11 +468,11 @@ impl Game {
         std::mem::take(&mut self.data)
     }
 
-    /// Yield solved ReBeL rows without ending the game. Pure bootstrap targets
+    /// Yield solved SoG rows without ending the game. Pure bootstrap targets
     /// are complete when their subgame solve ends; no game outcome backfill is
     /// pending.
-    pub fn take_rebel_data(&mut self) -> Data {
-        assert_eq!(self.gc.collect, Collect::Rebel);
+    pub fn take_rows(&mut self) -> Data {
+        assert_eq!(self.gc.collect, Collect::Sog);
         assert_eq!(self.gc.mc_mix, 0.0);
         self.from_row = 0;
         std::mem::take(&mut self.data)
@@ -522,7 +522,7 @@ impl Game {
             let np = match gc.agents[player as usize] {
                 Agent::Greedy { temp } => policy::greedy(s, ctx, player, &cfgs, temp),
                 Agent::Random => policy::uniform(s, ctx, player, &cfgs),
-                Agent::Rebel { cfg } => {
+                Agent::Sog { cfg } => {
                     // Student of Games re-solves from scratch at every
                     // decision. The solve gives this state its value and
                     // nominates leaves to be solved in their own right.
@@ -610,7 +610,7 @@ impl Game {
             let m = self.gc.eval_mix.clamp(0.0, 1.0);
             blend_outcome(&mut self.data, self.from_row, m, 1.0 - m, z);
         }
-        if self.gc.collect == Collect::Rebel && self.gc.mc_mix > 0.0 {
+        if self.gc.collect == Collect::Sog && self.gc.mc_mix > 0.0 {
             // Anchor the pure bootstrap target to the realised outcome
             // (TD(lambda)-style), blended in once per game.
             let m = self.gc.mc_mix.clamp(0.0, 1.0);
@@ -628,7 +628,7 @@ impl Game {
     }
 }
 
-/// A resumable ReBeL game stream. Each chunk ends at a solved decision rather
+/// A resumable SoG game stream. Each chunk ends at a solved decision rather
 /// than at a game boundary, so one long game cannot stall the trainer.
 pub struct GameStream {
     seed: u64,
@@ -685,7 +685,7 @@ impl GameStream {
         }
         let queued = self.game.take_queries();
         self.enqueue(queued);
-        out.merge(self.game.take_rebel_data());
+        out.merge(self.game.take_rows());
         if ended {
             self.game = Game::new(
                 Rng::new(worker_seed(self.seed, self.game_index)),
@@ -700,7 +700,7 @@ impl GameStream {
         let Some((s, bel)) = self.pending.pop_front() else {
             return;
         };
-        let Agent::Rebel { cfg } = self.gc.agents[s.to_act() as usize] else {
+        let Agent::Sog { cfg } = self.gc.agents[s.to_act() as usize] else {
             return;
         };
         let more = solve_root(nets, cfg, self.gc.recursive_rate, &s, &bel, &mut self.rng, out);
@@ -881,8 +881,8 @@ mod policy_target_tests {
         };
         let cfg = Cfg { s: 32, c: 4.0, ..Default::default() };
         let gc = GameCfg {
-            agents: [Agent::Rebel { cfg }; 2],
-            collect: Collect::Rebel,
+            agents: [Agent::Sog { cfg }; 2],
+            collect: Collect::Sog,
             explore: 0.1,
             random_draft: true,
             eval_mix: 1.0,

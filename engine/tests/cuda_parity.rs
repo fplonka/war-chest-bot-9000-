@@ -46,8 +46,8 @@ fn cfg(s: u32, c: f32) -> Cfg {
 
 fn game_cfg(s: u32, c: f32) -> GameCfg {
     GameCfg {
-        agents: [Agent::Rebel { cfg: cfg(s, c) }; 2],
-        collect: Collect::Rebel,
+        agents: [Agent::Sog { cfg: cfg(s, c) }; 2],
+        collect: Collect::Sog,
         explore: 0.1,
         random_draft: true,
         eval_mix: 1.0,
@@ -153,7 +153,7 @@ fn the_network_agrees() {
                 device: true,
                 gate: Some(gate.clone()),
             };
-            let mut stream = GameStream::new(0x51E5, game_cfg(4, 8));
+            let mut stream = GameStream::new(0x51E5, game_cfg(32, 4.0));
             while !stopping.load(Ordering::Relaxed) {
                 stream.generate(&nets, 1);
             }

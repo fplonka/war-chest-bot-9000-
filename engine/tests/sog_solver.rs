@@ -1,6 +1,6 @@
 //! Ground truth for the subgame solver.
 //!
-//! The belief tests in `rebel_pbs.rs` check that the PBS is tracked correctly.
+//! The belief tests in `pbs.rs` check that the PBS is tracked correctly.
 //! This one checks that the *solver on top of it* computes the right numbers,
 //! by constructing real positions a few plies from the horizon — so the entire
 //! remaining game fits inside one subgame and the value network is never
@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use warchest::rebel::*;
+use warchest::pbs::*;
 use warchest::rng::Rng;
 use warchest::search::{node_actions, Cfg, Cfr, Nets, Solver};
 use warchest::selfplay::make_game;
@@ -441,7 +441,7 @@ fn draw_position(seed: u64, warmup: usize, plies: u16) -> Option<State> {
 /// must pass through untouched, the chance-matrix rows must be proper
 /// distributions, and the solved root values must stay zero-sum with draws
 /// inside the tree. The chance transition itself is already verified against
-/// brute-force enumeration in `rebel_pbs.rs`.
+/// brute-force enumeration in `pbs.rs`.
 #[test]
 fn draw_pass_through_consistency() {
     let nets = Nets::default();

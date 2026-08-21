@@ -77,7 +77,7 @@ class Bot:
                 f"with these weights. Rebuild it from sha "
                 f"{self.spec.get('sha', '?')} rather than copying one in.")
         argv = [str(self.dir / "bot"), "--name", self.name,
-                "--mind", self.spec.get("mind", "rebel")]
+                "--mind", self.spec.get("mind", "sog")]
         if self.spec.get("weights"):
             argv += ["--weights", str(self.dir / self.spec["weights"])]
         search = self.spec.get("search", {})
@@ -757,7 +757,7 @@ def pack(run, binary, out_dir, snapshot=None, name=None):
             "name": bot,
             "sha": checkpoint.get("git", ""),
             "binary": digest(directory / "bot"),
-            "mind": "rebel",
+            "mind": "sog",
             "weights": "weights.bin",
             "search": {k: v for k, v in search.items()
                        if k in ("nodes", "expand", "iters", "cfr")},

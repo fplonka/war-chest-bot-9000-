@@ -22,7 +22,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::net::{Net, C, CFGH, D, JW, POOL, TYPE};
-use crate::rebel::{Belief, CFEAT, LOOSE, NSLOT, NTYPE, PUBFEAT};
+use crate::pbs::{Belief, CFEAT, LOOSE, NSLOT, NTYPE, PUBFEAT};
 use crate::search::{Cfg, Cfr};
 use crate::selfplay::{solve_root, Data, GameCfg, GameStream};
 use crate::state::State;
@@ -1127,8 +1127,8 @@ mod tests {
         const THREADS: usize = 6;
         let cfg = crate::search::Cfg { s: 8, c: 1.0, ..Default::default() };
         let gc = crate::selfplay::GameCfg {
-            agents: [Agent::Rebel { cfg }; 2],
-            collect: Collect::Rebel,
+            agents: [Agent::Sog { cfg }; 2],
+            collect: Collect::Sog,
             explore: 0.1,
             random_draft: true,
             eval_mix: 1.0,

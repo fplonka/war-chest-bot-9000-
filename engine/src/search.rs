@@ -33,7 +33,7 @@ use crate::board::NONE;
 use crate::farm::{Call, Dst, Gate, Reply, Writes};
 use crate::net::Net;
 use crate::rng::Rng;
-use crate::rebel::*;
+use crate::pbs::*;
 use crate::state::{Cont, State};
 use crate::units::{ENSIGN, MARSHAL, ROYAL_COIN};
 use crate::timed;
@@ -265,7 +265,7 @@ pub struct Conv {
     /// zero-sum, by however far the value network is from
     /// antisymmetric — which is what this measures, and it is a property of the
     /// network rather than of the solve. It vanishes when every leaf is
-    /// terminal, which is the case `tests/rebel_solver.rs` pins against an
+    /// terminal, which is the case `tests/sog_solver.rs` pins against an
     /// independent solver.
     pub zero_sum: f32,
 }

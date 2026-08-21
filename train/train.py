@@ -627,7 +627,7 @@ def main():
     # docs/GPU_PERF_GOAL.md is about. Generation overlaps training, so
     # per-epoch `gen_s` is not it -- only cumulative solves over cumulative
     # ReBeL wall time counts every cost, including the trainer's own.
-    rebel_t0, rebel_solves = None, 0
+    sog_t0, sog_solves = None, 0
     # The marker-differential payoff at the horizon distorts the game being
     # solved, so it is annealed away as soon as horizon games become rare, and
     # evaluation always runs on the real game (value 0).
@@ -672,7 +672,7 @@ def main():
 
     def run_search_pipeline():
         """Overlap small GT-CFR batches with each other and with training."""
-        nonlocal probe, cap_v, next_decay, next_snap, epoch, rebel_solves
+        nonlocal probe, cap_v, next_decay, next_snap, epoch, sog_solves
 
         deadline = t0 + total
         # One process, many solver threads, one forward pass per round. A
@@ -701,7 +701,7 @@ def main():
         window = collections.Counter()
         totals = collections.Counter()
         next_report = time.time() + 10.0
-        next_target = rebel_t0 + args.target_every * 60.0
+        next_target = sog_t0 + args.target_every * 60.0
 
         while True:
             now = time.time()
@@ -732,7 +732,7 @@ def main():
             add_s = time.time() - ta
 
             solves = int(data["solves"])
-            rebel_solves += solves
+            sog_solves += solves
             generated_rows += len(rows)
             window["results"] += 1
             window["rows"] += len(rows)
@@ -795,12 +795,12 @@ def main():
                     flush=True)
                 while next_target <= now:
                     next_target += args.target_every * 60.0
-            rebel_elapsed = max(0.0, now - rebel_t0)
+            sog_elapsed = max(0.0, now - sog_t0)
             span = max(args.anneal_frac * (total - warm), 1.0)
-            cap_v = args.cap_value * max(0.0, 1.0 - rebel_elapsed / span)
+            cap_v = args.cap_value * max(0.0, 1.0 - sog_elapsed / span)
             warchest.set_cap_value(cap_v)
             while next_decay < len(lr_decays) and \
-                    rebel_elapsed >= lr_decays[next_decay] * (total - warm):
+                    sog_elapsed >= lr_decays[next_decay] * (total - warm):
                 for pg in opt.param_groups:
                     pg["lr"] /= 2
                 print(
@@ -831,13 +831,13 @@ def main():
                 - target_mean * target_mean)
             dec = max(int(window["decisions"]), 1)
             games = max(int(window["games"]), 1)
-            raw_sps = rebel_solves / max(rebel_elapsed, 1e-9)
+            raw_sps = sog_solves / max(sog_elapsed, 1e-9)
             gen_s = window["gen_s"] / max(window["results"], 1)
             train_s = window["train_s"]
             rec = {
                 "t": round(now - t0, 1),
                 "epoch": epoch,
-                "phase": "rebel",
+                "phase": "sog",
                 "games": int(window["games"]),
                 "decisions": int(window["decisions"]),
                 "rows": int(window["rows"]),
@@ -881,9 +881,9 @@ def main():
                         - optimizer_rows), 1),
                 "replay_rows": generated_rows,
                 "rows_per_s": round(
-                    generated_rows / max(rebel_elapsed, 1e-9), 1),
+                    generated_rows / max(sog_elapsed, 1e-9), 1),
                 "effective_train_ratio": round(
-                    optimizer_rows / max(rebel_solves, 1), 3),
+                    optimizer_rows / max(sog_solves, 1), 3),
                 "train_row_ratio": round(
                     optimizer_rows / max(generated_rows, 1), 3),
                 "tgt_mean": round(target_mean, 4),
@@ -906,7 +906,7 @@ def main():
             log.append(rec)
             write_log(args, log, snaps)
             print(
-                f"[t={rec['t']:6.1f}s] GT-CFR solves={rebel_solves} "
+                f"[t={rec['t']:6.1f}s] GT-CFR solves={sog_solves} "
                 f"rate={raw_sps:.1f}/s rows={rec['rows']} "
                 f"games={rec['games']} qrows={rec['query_rows']} "
                 f"caps={totals['node_caps']} "
@@ -922,11 +922,11 @@ def main():
         # are in, which is also what flushes their last rows.
         del farm
 
-        elapsed = max(deadline - rebel_t0, 1e-9)
+        elapsed = max(deadline - sog_t0, 1e-9)
         print(
-            f"[GT-CFR-summary] solves={rebel_solves} "
+            f"[GT-CFR-summary] solves={sog_solves} "
             f"optimizer_rows={optimizer_rows} "
-            f"rate={rebel_solves / elapsed:.1f}/s "
+            f"rate={sog_solves / elapsed:.1f}/s "
             f"horizon={totals['horizon_hits'] / max(totals['games'], 1):.2f} "
             f"games={totals['games']} caps={totals['node_caps']}",
             flush=True)
@@ -1018,8 +1018,8 @@ def main():
     buf.clear()
     probe = None
     opt = torch.optim.Adam(value.parameters(), lr=args.lr)
-    rebel_t0 = time.time()
-    rebel_solves = 0
+    sog_t0 = time.time()
+    sog_solves = 0
     print(f"[t={time.time() - t0:6.1f}s] --- switching to GT-CFR ---", flush=True)
     run_search_pipeline()
 

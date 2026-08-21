@@ -25,10 +25,10 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::actions::Action;
-use crate::rebel::{reserve, true_config, Config, Ctx, NSLOT};
+use crate::pbs::{reserve, true_config, Config, Ctx, NSLOT};
 use crate::rng::Rng;
 use crate::selfplay::resolve_chance;
-use crate::rebel::Belief;
+use crate::pbs::Belief;
 use crate::state::{
     Cont, ContStack, State, BLACK, N_ZONES, WHITE, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP, Z_HAND,
     Z_SUPPLY,
@@ -47,7 +47,7 @@ pub const PROTOCOL: u32 = 6;
 pub struct Hello {
     pub name: String,
     pub protocol: u32,
-    /// `rebel::rules_table_hash`. Two builds that disagree here are playing
+    /// `pbs::rules_table_hash`. Two builds that disagree here are playing
     /// different games, and any result between them would be meaningless.
     pub rules: u64,
 }
@@ -527,7 +527,7 @@ pub fn settled(s: &State, winner: u8, cap: usize, budget: usize) -> Option<usize
         .par_iter()
         .map(|c| {
             let mut probe = *s;
-            crate::rebel::set_config(&mut probe, 1 - winner, &ctx, c);
+            crate::pbs::set_config(&mut probe, 1 - winner, &ctx, c);
             let mut left = budget;
             distance(&probe, winner, cap, &mut left)
         })
@@ -748,7 +748,7 @@ impl Table {
             (!b.s.is_terminal() && !b.s.is_chance()).then_some((id, b.s, b.draft.clone()));
         b.pending[1 - player as usize].push(Obs::Act {
             player,
-            key: crate::rebel::obs_key(&action),
+            key: crate::pbs::obs_key(&action),
         });
         self.queued.extend(reached);
         Ok(())

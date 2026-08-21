@@ -1,6 +1,6 @@
 """Reading a dumped replay buffer.
 
-A dump is a *noise-free supervised dataset*: a ReBeL value target is a
+A dump is a *noise-free supervised dataset*: a solved value target is a
 deterministic function of the network's own input -- the CFR root value of the
 subgame at `(state, ctx, beliefs)`, which is exactly what the row encodes. Solve
 the same position twice with the same weights and the same number comes back. So
@@ -9,7 +9,7 @@ training runs whose headline score wanders by +-0.05 on its own.
 
 A dump holds, oldest row first:
 
-    rows  [rows, ROW_BYTES] the packed frozen row format (see `rebel::ROW_*`);
+    rows  [rows, ROW_BYTES] the packed frozen row format (see `pbs::ROW_*`);
                            the network input is expanded from these
     cc    [configs, CCOUNTS] hand, face-down and bag counts, per config
     cp    [configs]         which player the config belongs to
