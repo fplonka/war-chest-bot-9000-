@@ -456,12 +456,30 @@ says the obstacle was never the storage width. **It is that a library picks
 its own summation order.**
 
 So the precondition for the whole FP16 programme is a matrix multiply whose
-arithmetic is fixed by us: our own kernel, where the order over `k` is written
-down and a round's composition cannot reach it. That also settles the join.
-Fusing it does not beat cuBLAS on FP32 -- the traffic works out about even --
-but it is the only way to have tensor cores at all, and it removes the five
-norms and the intermediate round trips as well. **Write the join's GEMM before
-trying to make anything half precision.**
+arithmetic does not move with the batch.
+
+**Writing one by hand is not the way.** The join fused into a single kernel --
+a warp a row, the row held as four floats a lane from the seed to the head
+vector, all five multiplies and four norms inside, the loop over `k` written
+down. It passes every parity test including the batch-composition one, so the
+determinism works. It is also **slower**: `k_join` at 22.2% of device time
+against the 19% that five `ampere_sgemm` launches and five `k_norm` launches
+cost together, and the farm at 25.9 solves a second against 32.1.
+
+The reason is weight reuse, and the estimate that said "the traffic works out
+about even" was simply wrong. A warp a row re-reads all five matrices --
+about 386 KB -- for every row, sharing them only with the seven other rows in
+its block. cuBLAS tiles across rows and reuses a weight tile from shared
+memory over far more of them. Register-residency of the *activations* cannot
+pay for re-reading the *weights*.
+
+**The cheap route to determinism is a fixed shape, not a hand-written GEMM.**
+cuBLAS picks by `(m, n, k)`, and only `n` moves -- it is the round's row
+count. Pad every network tile to a fixed number of rows and the shape is
+constant, the heuristic picks the same algorithm every time, and
+`CUBLAS_COMPUTE_32F_FAST_16F` becomes safe. At `TILE` = 16,384 the padding
+would cost about half the work; at 2,048 it costs about 5%. **That is the next
+thing to try.**
 
 ## What is left, in order
 
