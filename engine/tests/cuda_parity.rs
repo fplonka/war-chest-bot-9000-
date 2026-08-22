@@ -598,9 +598,11 @@ fn a_ragged_round_does_not_move_the_small_solve() {
 
     let device = Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
     // Two partners, in slots of their own, grown on their own for twelve
-    // rounds. Both budgets run for more than twice that many, so neither can
-    // finish and quietly stop making the round ragged.
-    let mut big: Vec<Solver> = [(0x0A13u64, 256u32, 8.0f32), (0x77C1, 320, 13.0)]
+    // rounds. A round carries `Cfg::batch` regret updates, so a budget's rounds
+    // are `ceil(ceil(s / c) / 4)`: both of these run 128 updates and so 32
+    // rounds, more than twice the twelve here plus the few the small solve then
+    // takes -- neither can finish and quietly stop making the round ragged.
+    let mut big: Vec<Solver> = [(0x0A13u64, 1024u32, 8.0f32), (0x77C1, 1664, 13.0)]
         .iter()
         .enumerate()
         .map(|(i, &(seed, s, c))| {
