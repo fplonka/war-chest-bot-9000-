@@ -216,7 +216,7 @@ const BUDGET_512: Budget = Budget {
     configs: 1_074,
     cidx: 393_199,
     reach: 665_872,
-    cells: 154_716,
+    cells: 309_432,
     draws: 400_000,
 };
 

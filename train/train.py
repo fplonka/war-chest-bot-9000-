@@ -961,7 +961,7 @@ def main():
                 "shape": shape,
             }
             rec["budget_hit_rate"] = round(
-                rec["budget_hits"] / max(rec["solves"], 1), 3)
+                rec["budget_hits"] / max(len(window_shapes), rec["solves"], 1), 3)
             log.append(rec)
             write_log(args, log, snaps)
             print(
