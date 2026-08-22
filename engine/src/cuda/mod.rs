@@ -35,7 +35,7 @@ use cudarc::driver::{
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 
 use crate::board::{board, N_HEXES, NONE};
-use crate::farm::{Call, Dst, Prime, Reply, CARD_ROWS};
+use crate::farm::{Call, Prime, Reply, CARD_ROWS};
 use crate::net::{
     ln_block, Net, NetLayout, NormSpan, Span, AFEAT, AW, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW,
     LN_ACT, LN_CFG, LN_H, LN_JOIN, LN_JOUT, LN_TRUNK, POOL, TYPE,
@@ -46,7 +46,7 @@ use crate::pbs::{
 use crate::search::{Budget, Cfg, Cfr};
 
 mod slot;
-use slot::{Arr, Solve, DESC};
+use slot::{Arr, Solve};
 
 type Res<T> = Result<T, String>;
 
@@ -266,7 +266,6 @@ pub struct Device {
     /// found waiting goes in together.
     cards: Vec<Card>,
     net: Net,
-    budget: Budget,
 }
 
 /// The trunk's two square matrices a block, permuted so that one lane's three
@@ -637,10 +636,15 @@ impl Device {
             let per_stream = n / STREAMS;
             let extra = n % STREAMS;
             for (k, card) in span.iter_mut().enumerate() {
-                card.carve(per_stream + usize::from(k < extra), &cfg)?;
+                // Remainder on stream 0, not one extra on each of the first
+                // `extra` streams: a test that pins several solves on card 0
+                // must find them all there, and a small `n` would otherwise
+                // give every stream a single slot.
+                let m = per_stream + if k == 0 { extra } else { 0 };
+                card.carve(m, &cfg)?;
             }
         }
-        Ok(Device { cards, net, budget })
+        Ok(Device { cards, net })
     }
 
     /// How many cards a round can be spread over.
@@ -1030,7 +1034,8 @@ impl Card {
 
     /// The slot the farm pinned this solve to. It was allocated at carve.
     fn slot<'g>(&self, g: &'g mut Vec<Solve>, solve: usize) -> &'g mut Solve {
-        &mut g[solve]
+        let n = g.len();
+        g.get_mut(solve).unwrap_or_else(|| panic!("solve {solve} pinned to a stream that holds {n} slots"))
     }
 
     /// Scratch for one pass.
