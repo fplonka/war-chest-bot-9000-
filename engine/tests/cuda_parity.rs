@@ -149,6 +149,23 @@ fn generate(
             let tail = rest.split_off(k);
             replies[i] = rest;
             rest = tail;
+            // The tree is frozen for a whole round, so a leaf one of its phases
+            // has taken is never taken again: a phase draws until it has one
+            // the round has not. `replay_expansion` cannot see that rule -- it
+            // compares a single phase against the arenas the card holds after
+            // the round, and this is the part that spans the phases -- so the
+            // answer itself is where it is held. A solve that scanned the wrong
+            // phase, the wrong part or the wrong stride of the round's buffer
+            // hands back a repeat.
+            let mut leaves: Vec<u32> = replies[i]
+                .iter()
+                .flat_map(|r| r.leaves.iter().copied())
+                .filter(|&l| l != NO_ROW)
+                .collect();
+            let all = leaves.len();
+            leaves.sort_unstable();
+            leaves.dedup();
+            assert_eq!(leaves.len(), all, "stream {i}: a round took a leaf twice");
         }
     }
     out.into_iter().zip(nodes).map(|(data, nodes)| Run { data, nodes }).collect()

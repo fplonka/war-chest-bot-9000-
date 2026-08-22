@@ -3426,7 +3426,6 @@ impl Solver {
         });
         self.expansion_phase(want, taken)
     }
-    }
 
     /// The interior search queries this solve produced.
     ///
