@@ -200,7 +200,7 @@ impl Tree {
             rev_src: u32(c)?,
             rev_cell: u32(c)?,
             rvd_base: u32(n)?,
-            rvd_start: u32(d)?,
+            rvd_start: u32(r)?,
             rvd_src: u32(d)?,
             rvd_p: f32(d)?,
             draw_base: u32(n)?,
