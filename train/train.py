@@ -613,6 +613,7 @@ def main():
     batcher = gpu_batch.make_batch
     # One training step and one probe at the largest batch the run can make,
     # so the caching allocator holds the peak before the farm carves.
+    # 2048 is the intern-table floor: a 2048× table does not fit the encoder.
     torch.cuda.reset_peak_memory_stats(dev)
     names = tuple(warchest.ENT_NAMES)
     per = warchest.budget_for_s(args.s)[names.index("config")]

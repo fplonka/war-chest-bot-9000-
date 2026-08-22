@@ -2,7 +2,7 @@
 //!
 //! A slot is a `Solve`. Each entity is one allocation, `cap × nfields × 4`
 //! bytes; the per-field arrays the kernels read are views at `base + k × cap`.
-//! `fit` / `plan` / `put` only advance a length.
+//! `reserve` / `plan` / `put` only advance a length.
 
 use std::sync::Arc;
 
@@ -14,105 +14,153 @@ use crate::search::{Budget, Ent};
 
 use super::{err, Host, Res, HELD};
 
-/// Fields of `struct Tree` in `kernels.cu`, in order. Every one is eight bytes
-/// wide, so the descriptor is positional and needs no packing rules.
-pub const DESC: usize = 58;
-
-const fn sum(xs: &[usize]) -> usize {
-    let mut s = 0;
-    let mut i = 0;
-    while i < xs.len() {
-        s += xs[i];
-        i += 1;
-    }
-    s
+/// One column of `struct Tree` in `kernels.cu`, in that order. Width is how
+/// many lanes the entity spends; zero means the previous pointer (avg = sum).
+struct Col {
+    ent: Ent,
+    width: usize,
+    dst: Option<Dst>,
+    name: &'static str,
 }
 
-// kind player exhausted nc×2 parent roff voff soff util child_at child_n
-// legal_base rev_base rvd_base draw_base level_start level_node
-const NODE_W: [usize; 17] = [1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
-pub const NODE_FIELDS: usize = sum(&NODE_W);
-const CELL_W: [usize; 13] = [1; 13];
-pub const CELL_FIELDS: usize = sum(&CELL_W);
-// legal_off rev_start rvd_start draw_start reach vals×2
-const REACH_W: [usize; 6] = [1, 1, 1, 1, 1, 2];
-pub const REACH_FIELDS: usize = sum(&REACH_W);
-const DRAW_W: [usize; 4] = [1; 4];
-pub const DRAW_FIELDS: usize = sum(&DRAW_W);
-// board_of leaf_node term coff×2 sentinel
-const ROW_W: [usize; 5] = [1, 1, 1, 2, 1];
-pub const ROW_FIELDS: usize = sum(&ROW_W);
-pub const BOARD_FIELDS: usize = D + JW;
-pub const CONFIG_FIELDS: usize = 2 * D + POOL + 2;
-pub const CIDX_FIELDS: usize = 1;
-
-pub const FIELDS: [usize; 8] = [
-    NODE_FIELDS,
-    CELL_FIELDS,
-    REACH_FIELDS,
-    DRAW_FIELDS,
-    ROW_FIELDS,
-    BOARD_FIELDS,
-    CONFIG_FIELDS,
-    CIDX_FIELDS,
+const TABLE: [Col; 52] = [
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Kind), name: "kind" },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Player), name: "player" },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Exhausted), name: "exhausted" },
+    Col { ent: Ent::Node, width: 2, dst: Some(Dst::Nc), name: "nc" },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Parent), name: "parent" },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Roff), name: "roff" },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Voff), name: "voff" },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Soff), name: "soff" },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Util), name: "util" },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::ChildAt), name: "child_at" },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::ChildN), name: "child_n" },
+    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::Child), name: "child" },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::LegalBase), name: "legal_base" },
+    Col { ent: Ent::Reach, width: 1, dst: Some(Dst::LegalOff), name: "legal_off" },
+    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::LegalChild), name: "legal_child" },
+    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::LegalTrans), name: "legal_trans" },
+    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::CellRow), name: "cell_row" },
+    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::CellVal), name: "cell_val" },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::RevBase), name: "rev_base" },
+    Col { ent: Ent::Reach, width: 1, dst: Some(Dst::RevStart), name: "rev_start" },
+    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::RevSrc), name: "rev_src" },
+    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::RevCell), name: "rev_cell" },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::RvdBase), name: "rvd_base" },
+    Col { ent: Ent::Reach, width: 1, dst: Some(Dst::RvdStart), name: "rvd_start" },
+    Col { ent: Ent::Draw, width: 1, dst: Some(Dst::RvdSrc), name: "rvd_src" },
+    Col { ent: Ent::Draw, width: 1, dst: Some(Dst::RvdP), name: "rvd_p" },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::DrawBase), name: "draw_base" },
+    Col { ent: Ent::Reach, width: 1, dst: Some(Dst::DrawStart), name: "draw_start" },
+    Col { ent: Ent::Draw, width: 1, dst: Some(Dst::DrawTo), name: "draw_to" },
+    Col { ent: Ent::Draw, width: 1, dst: Some(Dst::DrawP), name: "draw_p" },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::LevelStart), name: "level_start" },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::LevelNode), name: "level_node" },
+    Col { ent: Ent::Reach, width: 1, dst: None, name: "reach" },
+    Col { ent: Ent::Reach, width: 2, dst: None, name: "vals" },
+    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::Cur), name: "cur" },
+    Col { ent: Ent::Cell, width: 1, dst: None, name: "regret" },
+    Col { ent: Ent::Cell, width: 1, dst: None, name: "sum" },
+    Col { ent: Ent::Cell, width: 1, dst: None, name: "qval" },
+    Col { ent: Ent::Cell, width: 1, dst: None, name: "visits" },
+    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::Prior), name: "prior" },
+    Col { ent: Ent::Cell, width: 0, dst: None, name: "avg" },
+    Col { ent: Ent::Config, width: 2, dst: Some(Dst::Rootb), name: "rootb" },
+    Col { ent: Ent::Board, width: D, dst: None, name: "p" },
+    Col { ent: Ent::Board, width: JW, dst: None, name: "jp" },
+    Col { ent: Ent::Row, width: 1, dst: None, name: "board_of" },
+    Col { ent: Ent::Config, width: D, dst: None, name: "f" },
+    Col { ent: Ent::Config, width: POOL, dst: None, name: "g" },
+    Col { ent: Ent::Config, width: D, dst: None, name: "fp" },
+    Col { ent: Ent::Cidx, width: 1, dst: None, name: "cidx" },
+    Col { ent: Ent::Row, width: 2, dst: None, name: "coff" },
+    Col { ent: Ent::Row, width: 1, dst: Some(Dst::LeafNode), name: "leaf_node" },
+    Col { ent: Ent::Row, width: 1, dst: Some(Dst::Term), name: "term" },
 ];
 
-// Field index (first lane) of each named array inside its entity.
-const N_KIND: usize = 0;
-const N_PLAYER: usize = 1;
-const N_EXHAUSTED: usize = 2;
-const N_NC: usize = 3;
-const N_PARENT: usize = 5;
-const N_ROFF: usize = 6;
-const N_VOFF: usize = 7;
-const N_SOFF: usize = 8;
-const N_UTIL: usize = 9;
-const N_CHILD_AT: usize = 10;
-const N_CHILD_N: usize = 11;
-const N_LEGAL_BASE: usize = 12;
-const N_REV_BASE: usize = 13;
-const N_RVD_BASE: usize = 14;
-const N_DRAW_BASE: usize = 15;
-const N_LEVEL_START: usize = 16;
-const N_LEVEL_NODE: usize = 17;
+pub const DESC: usize = TABLE.len() + 6;
 
-const C_CHILD: usize = 0;
-const C_LEGAL_CHILD: usize = 1;
-const C_LEGAL_TRANS: usize = 2;
-const C_CELL_ROW: usize = 3;
-const C_CELL_VAL: usize = 4;
-const C_REV_SRC: usize = 5;
-const C_REV_CELL: usize = 6;
-pub const C_CUR: usize = 7;
-const C_REGRET: usize = 8;
-pub const C_SUM: usize = 9;
-pub const C_QVAL: usize = 10;
-pub const C_VISITS: usize = 11;
-pub const C_PRIOR: usize = 12;
+const fn fields() -> [usize; 8] {
+    let mut f = [0; 8];
+    let mut i = 0;
+    while i < TABLE.len() {
+        f[TABLE[i].ent as usize] += TABLE[i].width;
+        i += 1;
+    }
+    f
+}
 
-const R_LEGAL_OFF: usize = 0;
-const R_REV_START: usize = 1;
-const R_RVD_START: usize = 2;
-const R_DRAW_START: usize = 3;
-pub const R_REACH: usize = 4;
-pub const R_VALS: usize = 5;
+pub const FIELDS: [usize; 8] = fields();
+pub const NODE_FIELDS: usize = FIELDS[Ent::Node as usize];
 
-const D_RVD_SRC: usize = 0;
-const D_RVD_P: usize = 1;
-const D_DRAW_TO: usize = 2;
-const D_DRAW_P: usize = 3;
+const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
 
-pub const Y_BOARD_OF: usize = 0;
-const Y_LEAF_NODE: usize = 1;
-const Y_TERM: usize = 2;
-pub const Y_COFF: usize = 3;
+const fn lane(e: Ent, name: &str) -> usize {
+    let mut acc = [0usize; 8];
+    let mut i = 0;
+    while i < TABLE.len() {
+        if TABLE[i].ent as usize == e as usize
+            && bytes_eq(TABLE[i].name.as_bytes(), name.as_bytes())
+        {
+            return acc[e as usize];
+        }
+        acc[TABLE[i].ent as usize] += TABLE[i].width;
+        i += 1;
+    }
+    panic!("missing column")
+}
 
-pub const B_P: usize = 0;
-pub const B_JP: usize = D;
-pub const G_F: usize = 0;
-pub const G_G: usize = D;
-pub const G_FP: usize = D + POOL;
-const G_ROOTB: usize = 2 * D + POOL;
+pub const C_CUR: usize = lane(Ent::Cell, "cur");
+pub const C_SUM: usize = lane(Ent::Cell, "sum");
+pub const C_QVAL: usize = lane(Ent::Cell, "qval");
+pub const C_VISITS: usize = lane(Ent::Cell, "visits");
+pub const C_PRIOR: usize = lane(Ent::Cell, "prior");
+pub const R_REACH: usize = lane(Ent::Reach, "reach");
+pub const R_VALS: usize = lane(Ent::Reach, "vals");
+pub const B_P: usize = lane(Ent::Board, "p");
+pub const B_JP: usize = lane(Ent::Board, "jp");
+pub const G_F: usize = lane(Ent::Config, "f");
+pub const G_G: usize = lane(Ent::Config, "g");
+pub const G_FP: usize = lane(Ent::Config, "fp");
+pub const Y_BOARD_OF: usize = lane(Ent::Row, "board_of");
+pub const Y_COFF: usize = lane(Ent::Row, "coff");
+
+const _: () = {
+    assert!(FIELDS[0] == 18);
+    assert!(FIELDS[1] == 13);
+    assert!(FIELDS[2] == 7);
+    assert!(FIELDS[3] == 4);
+    assert!(FIELDS[4] == 5);
+    assert!(FIELDS[5] == D + JW);
+    assert!(FIELDS[6] == 2 * D + POOL + 2);
+    assert!(FIELDS[7] == 1);
+    assert!(C_CUR == 7 && C_SUM == 9 && C_PRIOR == 12);
+    assert!(B_P == 0 && B_JP == D);
+    assert!(G_F == 2 && Y_COFF == 1);
+};
+
+fn dst_slot(d: Dst) -> (Ent, usize, usize) {
+    let mut acc = [0usize; 8];
+    for c in &TABLE {
+        if c.dst == Some(d) {
+            return (c.ent, acc[c.ent as usize], c.width.max(1));
+        }
+        acc[c.ent as usize] += c.width;
+    }
+    unreachable!("every Dst is a Tree column")
+}
 
 /// One device array of a round's scratch. Slot state is an `Entity`; scratch
 /// is still a typed buffer sized at TILE (or `n_slots` times a budget term).
@@ -166,7 +214,7 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
         stream.memcpy_htod(host, &mut d).map_err(err)
     }
 
-    pub fn room(&mut self, _stream: &Arc<CudaStream>, want: usize) -> Res<&mut CudaSlice<T>> {
+    pub fn room(&mut self, want: usize) -> Res<&mut CudaSlice<T>> {
         if want > self.cap {
             return Err(format!("scratch grew past its slot: {want} > {}", self.cap));
         }
@@ -181,7 +229,7 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
 
 /// One of a solve's eight allocations: `cap × nfields` words.
 pub struct Entity {
-    buf: Option<CudaSlice<u32>>,
+    arr: Arr<u32>,
     cap: usize,
     nfields: usize,
     len: usize,
@@ -190,11 +238,7 @@ pub struct Entity {
 impl Entity {
     fn with_cap(stream: &Arc<CudaStream>, cap: usize, nfields: usize) -> Res<Entity> {
         let cap = cap.max(1);
-        let words = cap * nfields;
-        let mut buf = unsafe { stream.alloc::<u32>(words) }.map_err(err)?;
-        stream.memset_zeros(&mut buf).map_err(err)?;
-        HELD.fetch_add((words * 4) as u64, std::sync::atomic::Ordering::Relaxed);
-        Ok(Entity { buf: Some(buf), cap, nfields, len: 0 })
+        Ok(Entity { arr: Arr::with_cap(stream, cap * nfields)?, cap, nfields, len: 0 })
     }
 
     fn rewind(&mut self) {
@@ -202,19 +246,15 @@ impl Entity {
     }
 
     fn zero(&mut self, stream: &Arc<CudaStream>) -> Res<()> {
-        if let Some(buf) = self.buf.as_mut() {
+        if let Some(buf) = self.arr.buf.as_mut() {
             stream.memset_zeros(buf).map_err(err)?;
         }
         self.len = 0;
         Ok(())
     }
 
-    fn base(&self, stream: &Arc<CudaStream>) -> u64 {
-        self.buf.as_ref().map_or(0, |b| b.device_ptr(stream).0)
-    }
-
     pub fn field(&self, k: usize, stream: &Arc<CudaStream>) -> u64 {
-        self.base(stream) + (k * self.cap * 4) as u64
+        self.arr.ptr(stream) + (k * self.cap * 4) as u64
     }
 
     fn bytes(&self) -> usize {
@@ -238,7 +278,7 @@ impl Entity {
             return Ok(());
         }
         let off = field * self.cap + at;
-        let dst = self.buf.as_mut().expect("a capacity implies a buffer");
+        let dst = self.arr.buf.as_mut().expect("a capacity implies a buffer");
         let mut view = dst.slice_mut(off..off + n);
         let mut fview = unsafe { view.transmute_mut::<f32>(n).expect("u32 and f32 are four bytes") };
         stream.memcpy_dtod(&src.slice(from..from + n), &mut fview).map_err(err)
@@ -256,21 +296,10 @@ impl Entity {
             return Ok(Vec::new());
         }
         let off = field * self.cap + at;
-        let buf = self.buf.as_ref().ok_or("reading an arena that was never written")?;
+        let buf = self.arr.buf.as_ref().ok_or("reading an arena that was never written")?;
         let view = buf.slice(off..off + n);
         let fview = unsafe { view.transmute::<f32>(n).expect("u32 and f32 are four bytes") };
         host.recv(stream, &fview)
-    }
-}
-
-impl Drop for Entity {
-    fn drop(&mut self) {
-        if self.buf.is_some() {
-            HELD.fetch_sub(
-                (self.cap * self.nfields * 4) as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
     }
 }
 
@@ -425,115 +454,25 @@ impl Solve {
     }
 
     pub fn describe(&self, s: &Arc<CudaStream>) -> [u64; DESC] {
-        let n = &self.ent[Ent::Node as usize];
-        let c = &self.ent[Ent::Cell as usize];
-        let r = &self.ent[Ent::Reach as usize];
-        let d = &self.ent[Ent::Draw as usize];
-        let y = &self.ent[Ent::Row as usize];
-        let b = &self.ent[Ent::Board as usize];
-        let g = &self.ent[Ent::Config as usize];
-        let x = &self.ent[Ent::Cidx as usize];
-        [
-            n.field(N_KIND, s),
-            n.field(N_PLAYER, s),
-            n.field(N_EXHAUSTED, s),
-            n.field(N_NC, s),
-            n.field(N_PARENT, s),
-            n.field(N_ROFF, s),
-            n.field(N_VOFF, s),
-            n.field(N_SOFF, s),
-            n.field(N_UTIL, s),
-            n.field(N_CHILD_AT, s),
-            n.field(N_CHILD_N, s),
-            c.field(C_CHILD, s),
-            n.field(N_LEGAL_BASE, s),
-            r.field(R_LEGAL_OFF, s),
-            c.field(C_LEGAL_CHILD, s),
-            c.field(C_LEGAL_TRANS, s),
-            c.field(C_CELL_ROW, s),
-            c.field(C_CELL_VAL, s),
-            n.field(N_REV_BASE, s),
-            r.field(R_REV_START, s),
-            c.field(C_REV_SRC, s),
-            c.field(C_REV_CELL, s),
-            n.field(N_RVD_BASE, s),
-            r.field(R_RVD_START, s),
-            d.field(D_RVD_SRC, s),
-            d.field(D_RVD_P, s),
-            n.field(N_DRAW_BASE, s),
-            r.field(R_DRAW_START, s),
-            d.field(D_DRAW_TO, s),
-            d.field(D_DRAW_P, s),
-            n.field(N_LEVEL_START, s),
-            n.field(N_LEVEL_NODE, s),
-            r.field(R_REACH, s),
-            r.field(R_VALS, s),
-            c.field(C_CUR, s),
-            c.field(C_REGRET, s),
-            c.field(C_SUM, s),
-            c.field(C_QVAL, s),
-            c.field(C_VISITS, s),
-            c.field(C_PRIOR, s),
-            c.field(C_SUM, s),
-            g.field(G_ROOTB, s),
-            b.field(B_P, s),
-            b.field(B_JP, s),
-            y.field(Y_BOARD_OF, s),
-            g.field(G_F, s),
-            g.field(G_G, s),
-            g.field(G_FP, s),
-            x.field(0, s),
-            y.field(Y_COFF, s),
-            y.field(Y_LEAF_NODE, s),
-            y.field(Y_TERM, s),
-            self.seed.ptr(s),
-            self.nterm as u64,
-            self.nvals as u64,
-            self.step as u64,
-            self.todo as u64,
-            self.nexpand as u64,
-        ]
-    }
-}
-
-fn dst_slot(d: Dst) -> (Ent, usize, usize) {
-    match d {
-        Dst::Kind => (Ent::Node, N_KIND, 1),
-        Dst::Player => (Ent::Node, N_PLAYER, 1),
-        Dst::Exhausted => (Ent::Node, N_EXHAUSTED, 1),
-        Dst::Nc => (Ent::Node, N_NC, 2),
-        Dst::Parent => (Ent::Node, N_PARENT, 1),
-        Dst::Roff => (Ent::Node, N_ROFF, 1),
-        Dst::Voff => (Ent::Node, N_VOFF, 1),
-        Dst::Soff => (Ent::Node, N_SOFF, 1),
-        Dst::Util => (Ent::Node, N_UTIL, 1),
-        Dst::ChildAt => (Ent::Node, N_CHILD_AT, 1),
-        Dst::ChildN => (Ent::Node, N_CHILD_N, 1),
-        Dst::Child => (Ent::Cell, C_CHILD, 1),
-        Dst::LegalBase => (Ent::Node, N_LEGAL_BASE, 1),
-        Dst::LegalOff => (Ent::Reach, R_LEGAL_OFF, 1),
-        Dst::LegalChild => (Ent::Cell, C_LEGAL_CHILD, 1),
-        Dst::LegalTrans => (Ent::Cell, C_LEGAL_TRANS, 1),
-        Dst::CellRow => (Ent::Cell, C_CELL_ROW, 1),
-        Dst::CellVal => (Ent::Cell, C_CELL_VAL, 1),
-        Dst::RevBase => (Ent::Node, N_REV_BASE, 1),
-        Dst::RevStart => (Ent::Reach, R_REV_START, 1),
-        Dst::RevSrc => (Ent::Cell, C_REV_SRC, 1),
-        Dst::RevCell => (Ent::Cell, C_REV_CELL, 1),
-        Dst::RvdBase => (Ent::Node, N_RVD_BASE, 1),
-        Dst::RvdStart => (Ent::Reach, R_RVD_START, 1),
-        Dst::RvdSrc => (Ent::Draw, D_RVD_SRC, 1),
-        Dst::RvdP => (Ent::Draw, D_RVD_P, 1),
-        Dst::DrawBase => (Ent::Node, N_DRAW_BASE, 1),
-        Dst::DrawStart => (Ent::Reach, R_DRAW_START, 1),
-        Dst::DrawTo => (Ent::Draw, D_DRAW_TO, 1),
-        Dst::DrawP => (Ent::Draw, D_DRAW_P, 1),
-        Dst::LevelStart => (Ent::Node, N_LEVEL_START, 1),
-        Dst::LevelNode => (Ent::Node, N_LEVEL_NODE, 1),
-        Dst::Cur => (Ent::Cell, C_CUR, 1),
-        Dst::Prior => (Ent::Cell, C_PRIOR, 1),
-        Dst::LeafNode => (Ent::Row, Y_LEAF_NODE, 1),
-        Dst::Term => (Ent::Row, Y_TERM, 1),
-        Dst::Rootb => (Ent::Config, G_ROOTB, 2),
+        let mut out = [0u64; DESC];
+        let mut acc = [0usize; 8];
+        let mut i = 0;
+        for c in &TABLE {
+            let e = c.ent as usize;
+            out[i] = if c.width == 0 {
+                self.ent[e].field(C_SUM, s)
+            } else {
+                self.ent[e].field(acc[e], s)
+            };
+            acc[e] += c.width;
+            i += 1;
+        }
+        out[i] = self.seed.ptr(s);
+        out[i + 1] = self.nterm as u64;
+        out[i + 2] = self.nvals as u64;
+        out[i + 3] = self.step as u64;
+        out[i + 4] = self.todo as u64;
+        out[i + 5] = self.nexpand as u64;
+        out
     }
 }

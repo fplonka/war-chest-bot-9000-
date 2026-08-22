@@ -164,10 +164,6 @@ pub enum Call {
 ///
 /// The card holds everything this reads but two facts: what an action *is*, and
 /// which action each strategy cell stands for. Both are a few kilobytes a node.
-/// The host used to run the policy head itself instead, and the round
-/// downloaded a board vector per fresh leaf and a `f_p` row per fresh config so
-/// that it could — a quarter of a megabyte a solve a round, for a handful of
-/// nodes.
 #[derive(Clone, Copy)]
 pub struct Prime {
     pub node: u32,
@@ -200,14 +196,9 @@ pub enum Dst {
 
 /// Everything one solve tells the card to write this round, concatenated.
 ///
-/// The backend used to build this itself: it held an `Arc<Contract>`, walked
-/// it, widened bytes into words and copied every run into one buffer -- all on
-/// the one driver thread a card has. That was a third of a round. A solve
-/// builds its own now, on the worker that grew the tree, and the driver is left
-/// with what only it can do: say where each run lands on the card.
-///
-/// Floats travel as their bits, because the scatter kernel moves words and
-/// does not care which they are.
+/// A solve builds this on the worker that grew the tree. The driver says where
+/// each run lands on the card. Floats travel as their bits, because the scatter
+/// kernel moves words and does not care which they are.
 #[derive(Clone, Default)]
 pub struct Writes {
     pub blob: Vec<u32>,

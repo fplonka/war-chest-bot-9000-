@@ -1376,9 +1376,6 @@ pub struct Solver {
     /// Node count at which the expansion in flight gives up. The bound is on
     /// one expansion, not on the tree.
     limit: usize,
-    /// The budget applies. A first expansion that would not fit is abandoned
-    /// the same way as any other, and the root stays a leaf.
-    bounded: bool,
     /// Working memory for the chance transitions, reused across the tree.
     draw_scratch: DrawScratch,
     /// `(config key, legal cell)` scratch for ordering a public child's
@@ -1514,7 +1511,6 @@ impl Solver {
             wbuf: Vec::new(),
             abandon: false,
             limit: usize::MAX,
-            bounded: true,
             draw_scratch: DrawScratch::default(),
             cell_order: Vec::new(),
             contract: Arc::new(crate::contract::Contract::default()),
@@ -1624,6 +1620,12 @@ impl Solver {
     fn push_node(&mut self, parent: u32, s: State, cfgs: [Arc<[Config]>; 2]) -> usize {
         let player = s.to_act();
         let terminal = s.is_terminal();
+        let (c0, c1) = (cfgs[0].len(), cfgs[1].len());
+        if !self.reserve(Ent::Node, self.nodes.len() + 1)
+            || !self.reserve(Ent::Reach, self.nreach + c0 + c1)
+        {
+            return parent as usize;
+        }
         let id = self.nodes.len();
         let _tp = timed!(BPUSH);
         self.nodes.push(TNode {
@@ -1655,7 +1657,6 @@ impl Solver {
         });
         drop(_tp);
         self.parent.push(parent);
-        let (c0, c1) = (cfgs[0].len(), cfgs[1].len());
         self.nc.push([c0 as u32, c1 as u32]);
         // No cells yet: a leaf has no strategy. `grow` appends its region.
         self.soff.push(self.ncells as u32);
@@ -1786,10 +1787,9 @@ impl Solver {
 
     /// Whether the expansion in flight has spent its bound.
     fn runaway(&mut self) -> bool {
-        if self.bounded && self.spent() {
-            self.abandon = true;
-            self.budget_hit = true;
-        } else if self.nodes.len() >= self.limit {
+        if self.nodes.len() >= self.limit
+            || Ent::ALL.iter().any(|&e| !self.reserve(e, self.used(e) + 1))
+        {
             self.abandon = true;
         }
         self.abandon
@@ -1802,17 +1802,11 @@ impl Solver {
 
     /// How many of this entity the solve holds.
     pub fn used(&self, e: Ent) -> usize {
-        let c = &self.contract;
         match e {
-            Ent::Node => self.nodes.len().max(c.level_start.len()).max(c.level_node.len()),
+            Ent::Node => self.nodes.len(),
             Ent::Cell => self.ncells,
-            Ent::Reach => self
-                .nreach
-                .max(c.legal_off.len())
-                .max(c.rev_start.len())
-                .max(c.rvd_start.len())
-                .max(c.draw_start.len()),
-            Ent::Draw => self.ndraws.max(c.draw_to.len()).max(c.rvd_src.len()),
+            Ent::Reach => self.nreach,
+            Ent::Draw => self.ndraws,
             Ent::Row => self.leaf_rows.len(),
             Ent::Board => self.nboards,
             Ent::Config => self.ncfg,
@@ -1827,18 +1821,13 @@ impl Solver {
 
     /// Ensure this entity can hold `n` items. The one host-side guard.
     fn reserve(&mut self, e: Ent, n: usize) -> bool {
-        if self.bounded && !self.cfg.budget.reserve(e, n) {
+        if !self.cfg.budget.reserve(e, n) {
             self.abandon = true;
             self.budget_hit = true;
             false
         } else {
             true
         }
-    }
-
-    /// Whether the solve has reached its budget in any term.
-    fn spent(&self) -> bool {
-        Ent::ALL.iter().any(|&e| !self.cfg.budget.reserve(e, self.used(e) + 1))
     }
 
     /// Where every append-only arena stands.
@@ -1867,8 +1856,10 @@ impl Solver {
     /// enclosing `grow`, so the whole expansion is undone up to the coin play
     /// it started from.
     fn rewind(&mut self, id: usize, m: Mark) {
-        self.nreach = self.roff[m.nodes] as usize;
-        self.nvals = self.voff[m.nodes] as usize;
+        if m.nodes < self.roff.len() {
+            self.nreach = self.roff[m.nodes] as usize;
+            self.nvals = self.voff[m.nodes] as usize;
+        }
         self.nodes.truncate(m.nodes);
         self.states.truncate(m.nodes);
         self.parent.truncate(m.nodes);
@@ -3421,18 +3412,6 @@ impl Solver {
         Arc::make_mut(&mut c).extend(self, &grown, &resealed);
         self.contract = c;
         self.resent = resealed;
-        let reach = self
-            .contract
-            .legal_off
-            .len()
-            .max(self.contract.rev_start.len())
-            .max(self.contract.rvd_start.len())
-            .max(self.contract.draw_start.len());
-        let draws = self.contract.draw_to.len().max(self.contract.rvd_src.len());
-        let nodes = self.contract.level_start.len().max(self.contract.level_node.len());
-        let _ = self.reserve(Ent::Reach, reach);
-        let _ = self.reserve(Ent::Draw, draws);
-        let _ = self.reserve(Ent::Node, nodes);
     }
 
     /// The cell PUCT would take from one config's legal row.

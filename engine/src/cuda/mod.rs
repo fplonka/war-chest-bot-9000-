@@ -313,10 +313,10 @@ fn owed_by_the_join(l: &NetLayout, b: &[f32]) -> Vec<f32> {
 
 /// Leaf rows a pass works on at once.
 ///
-/// The intermediates of the leaf pass are 5,640 bytes a row, so sizing them by
-/// the whole round is a gigabyte a lane. A tile large enough to fill the card
-/// costs ninety megabytes and a handful of extra launches. Scratch is allocated
-/// at this size when the card is carved, so a round cannot grow it.
+/// The intermediates of the leaf pass are 5,640 bytes a row. A tile large
+/// enough to fill the card costs ninety megabytes and a handful of extra
+/// launches. Scratch is allocated at this size when the card is carved, so a
+/// round cannot grow it.
 const TILE: usize = 16384;
 
 /// Bytes one card allocates at carve besides the slots themselves: the tiled
@@ -475,7 +475,7 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default +
     ) -> Res<()> {
         self.host.fill(stream, want, f)?;
         let n = self.host.len;
-        self.dev.room(stream, n.max(1))?;
+        self.dev.room(n.max(1))?;
         let dst = self.dev.buf.as_mut().expect("room");
         self.host.send(stream, dst)
     }
@@ -698,13 +698,13 @@ impl Device {
                 .collect::<Res<_>>()?;
             let s0 = &pair[0].stream;
             s0.context().bind_to_thread().map_err(err)?;
-            let slot = {
-                let s = Solve::at_budget(s0, &budget)?;
-                let n = s.bytes() as u64;
-                drop(s);
-                s0.synchronize().map_err(err)?;
-                n
-            };
+            let free0 = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
+            let probe = Solve::at_budget(s0, &budget)?;
+            s0.synchronize().map_err(err)?;
+            let measured = free0.saturating_sub(cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64);
+            let slot = measured.max(probe.bytes() as u64);
+            drop(probe);
+            s0.synchronize().map_err(err)?;
             if g == 0 {
                 slot_bytes = slot as usize;
             }
@@ -712,11 +712,12 @@ impl Device {
             let tile = round_bytes(0, &budget, cfg.s) as u64;
             let extra = (round_bytes(1, &budget, cfg.s) as u64).saturating_sub(tile);
             let per = slot + PIPELINE as u64 * extra;
-            // A slot is eight allocations. Packing the reported free figure to
-            // the last byte OOMs on fragmentation; keep a tenth.
             let usable = free.saturating_sub(PIPELINE as u64 * tile);
+            // Slot cost is the allocation delta. Carve is many buffers; packing
+            // free to the last byte OOMs, so a tenth stays for fragmentation.
             let fit = (usable - usable / 10) / per.max(1);
-            let n = (fit as usize).min(left);
+            let gpus_left = ordinals.len() - g;
+            let n = (fit as usize).min(left / gpus_left.max(1));
             if g == 0 && n == 0 {
                 return Err(format!(
                     "a slot of {slot} bytes does not fit in {free} bytes free"
@@ -1289,18 +1290,18 @@ impl Card {
         let (nhex, ntype, chan, nslot) = (N_HEXES as i32, NTYPE as i32, C as i32, NSLOT as i32);
         let l = &self.layout;
         let mut sc = self.scratch.lock();
-        sc.piles.room(s, n * NTYPE * PILE_COUNTS)?;
-        sc.tokens.room(s, n * NTYPE * TYPE)?;
-        sc.projected.room(s, n * NTYPE * C)?;
-        sc.type_pool.room(s, n * C)?;
-        sc.loose.room(s, n * LOOSE)?;
-        sc.glob.room(s, n * C)?;
-        sc.facts.room(s, cells * HEX_FACTS)?;
-        sc.occupant.room(s, cells)?;
-        sc.x.room(s, cells * C)?;
-        sc.input.room(s, n * (2 * C + LOOSE))?;
-        sc.h.room(s, n * D)?;
-        sc.z.room(s, n * JW)?;
+        sc.piles.room(n * NTYPE * PILE_COUNTS)?;
+        sc.tokens.room(n * NTYPE * TYPE)?;
+        sc.projected.room(n * NTYPE * C)?;
+        sc.type_pool.room(n * C)?;
+        sc.loose.room(n * LOOSE)?;
+        sc.glob.room(n * C)?;
+        sc.facts.room(cells * HEX_FACTS)?;
+        sc.occupant.room(cells)?;
+        sc.x.room(cells * C)?;
+        sc.input.room(n * (2 * C + LOOSE))?;
+        sc.h.room(n * D)?;
+        sc.z.room(n * JW)?;
         let Scratch {
             piles, tokens, projected, type_pool, loose, glob, facts, occupant, x, input, h, z, ..
         } = &mut *sc;
@@ -1451,7 +1452,7 @@ impl Card {
             let views = stage.cfg_cards.host.len / (NTYPE * TYPE);
             let cards = stage.cfg_cards.dev.buf.as_ref().expect("staged");
             let mut sc = self.scratch.lock();
-            sc.bag.room(s, views * NTYPE * 3 * POOL)?;
+            sc.bag.room(views * NTYPE * 3 * POOL)?;
             self.run(l.cfg_m, cards, views * NTYPE, sc.bag.buf.as_mut().unwrap())?;
         }
         let mut cfg0 = 0usize;
@@ -1519,12 +1520,12 @@ impl Card {
         let (ntype, type_i, pool_i) = (NTYPE as i32, TYPE as i32, POOL as i32);
         let width = 3 + TYPE;
         let mut sc = self.scratch.lock();
-        sc.tokens.room(s, k * NSLOT * width)?;
-        sc.projected.room(s, k * NSLOT * CFGH)?;
-        sc.facts.room(s, k * CFGH)?;
-        sc.h.room(s, k * D)?;
-        sc.pooled.room(s, k * POOL)?;
-        sc.z.room(s, k * D)?;
+        sc.tokens.room(k * NSLOT * width)?;
+        sc.projected.room(k * NSLOT * CFGH)?;
+        sc.facts.room(k * CFGH)?;
+        sc.h.room(k * D)?;
+        sc.pooled.room(k * POOL)?;
+        sc.z.room(k * D)?;
         let Scratch { tokens, projected, facts, h, pooled, z, bag, .. } = &mut *sc;
         let slots = tokens.buf.as_mut().unwrap();
         let hidden = projected.buf.as_mut().unwrap();
@@ -1691,10 +1692,10 @@ impl Card {
             AFEAT as i32,
         );
         let mut sc = self.scratch.lock();
-        sc.x.room(s, na * AFEAT)?;
-        sc.tokens.room(s, na * AW)?;
-        sc.h.room(s, (m * D).max(na * D))?;
-        sc.projected.room(s, m * AW)?;
+        sc.x.room(na * AFEAT)?;
+        sc.tokens.room(na * AW)?;
+        sc.h.room((m * D).max(na * D))?;
+        sc.projected.room(m * AW)?;
         let Scratch { x, tokens, h, projected, .. } = &mut *sc;
         let feat = x.buf.as_mut().unwrap();
         let z = tokens.buf.as_mut().unwrap();
@@ -2231,13 +2232,12 @@ impl Card {
         let mut sc = self.scratch.lock();
         let l = &self.layout;
         let (stride_i, pool_i, d_i) = (stride as i32, POOL as i32, D as i32);
-        let s = &self.stream;
 
         // The beliefs are normalised once for the whole round: `w` is indexed
         // by the round's own cell offsets and `mass` by its rows, so neither
         // belongs to a tile.
-        sc.w.room(s, b.cells)?;
-        sc.mass.room(s, 2 * stride)?;
+        sc.w.room(b.cells)?;
+        sc.mass.room(2 * stride)?;
         {
             let Scratch { w, mass, .. } = &mut *sc;
             let (w, mass) = (w.buf.as_mut().unwrap(), mass.buf.as_mut().unwrap());
@@ -2257,16 +2257,13 @@ impl Card {
             })?;
         }
 
-        // Everything after that is a tile of leaves at a time. The pass's
-        // intermediates are 5,640 bytes a leaf row, so sizing them by the whole
-        // round cost a gigabyte a lane -- and lanes are what solves in flight
-        // are now bounded by.
+        // Everything after that is a tile of leaves at a time.
         let tile = TILE.min(stride);
-        sc.pooled.room(s, 2 * tile * POOL)?;
-        sc.h.room(s, 2 * tile * D)?;
-        sc.z.room(s, 2 * tile * JW)?;
-        sc.input.room(s, 2 * tile * JOIN_IN)?;
-        sc.t.room(s, 2 * tile * JW)?;
+        sc.pooled.room(2 * tile * POOL)?;
+        sc.h.room(2 * tile * D)?;
+        sc.z.room(2 * tile * JW)?;
+        sc.input.room(2 * tile * JOIN_IN)?;
+        sc.t.room(2 * tile * JW)?;
         let Scratch { w, mass, pooled, h, z, input, t, .. } = &mut *sc;
         let (w, mass) = (w.buf.as_mut().unwrap(), mass.buf.as_mut().unwrap());
         let pooled = pooled.buf.as_mut().unwrap();
@@ -2384,7 +2381,7 @@ impl Card {
               iter: usize, iters: usize) -> Res<()> {
         let each = parts as usize * sims;
         let mut sc = self.scratch.lock();
-        let out = sc.leaves.room(&self.stream, (iters * each).max(1))?;
+        let out = sc.leaves.room((iters * each).max(1))?;
         let (parts_i, sims_i) = (parts as i32, sims as i32);
         unsafe {
             self.stream
@@ -2410,7 +2407,7 @@ impl Card {
             return Ok(Vec::new());
         }
         let mut sc = self.scratch.lock();
-        let out = sc.leaves.room(&self.stream, n)?;
+        let out = sc.leaves.room(n)?;
         self.down.lock().recv(&self.stream, &out.slice(0..n))
     }
 
