@@ -531,6 +531,14 @@ impl DrawMap {
     pub fn rows(&self) -> usize {
         self.start.len().saturating_sub(1)
     }
+    /// Entries: one per (parent config, child config) the draw can move mass
+    /// between. Both directions of the transition are this long.
+    pub fn len(&self) -> usize {
+        self.to.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.to.is_empty()
+    }
 }
 
 /// Reusable working memory for building draw transitions.
