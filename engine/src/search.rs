@@ -3072,7 +3072,7 @@ impl Solver {
     /// trajectories that end on leaves growth may not touch, which is exactly
     /// the failure the deleted node ceiling used to cause.
     fn expansions_at(&self, i: usize) -> usize {
-        if self.nodes[0].exhausted {
+        if self.budget_hit || self.nodes[0].exhausted {
             0
         } else {
             self.cfg.expansions_at(i)
@@ -3145,6 +3145,9 @@ impl Solver {
             }
             let grew = !taken.is_empty();
             for leaf in taken {
+                if self.budget_hit {
+                    break;
+                }
                 self.expand(leaf);
             }
             if grew {
@@ -3191,6 +3194,9 @@ impl Solver {
                 for &leaf in &last.leaves.clone() {
                     if leaf == crate::contract::NO_ROW {
                         continue;
+                    }
+                    if self.budget_hit {
+                        break;
                     }
                     self.expand(leaf as usize);
                 }
