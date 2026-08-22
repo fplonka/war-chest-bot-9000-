@@ -201,16 +201,16 @@ impl Budget {
 }
 
 /// The shape a solve at `SoG(512, 8)` is allowed: p90 of each entity count
-/// over finished solves in `runs/ent12` (epochs after t=60, max of those p90s).
+/// over finished solves in `runs/unc5` (epochs after t=60, max of those p90s).
 const BUDGET_512: Budget = Budget {
-    nodes: 21_908,
-    rows: 13_140,
-    boards: 8_514,
-    configs: 1_070,
-    cidx: 392_832,
-    reach: 597_000,
-    cells: 202_133,
-    draws: 310_826,
+    nodes: 20_022,
+    rows: 13_116,
+    boards: 9_036,
+    configs: 2_914,
+    cidx: 512_130,
+    reach: 595_774,
+    cells: 201_815,
+    draws: 307_605,
 };
 
 #[derive(Clone, Copy)]
@@ -1259,14 +1259,11 @@ pub struct Solver {
     /// Draw-transition entries over the whole tree, which the budget bounds and
     /// the device's `draw_to` / `draw_p` / `rvd_src` / `rvd_p` are sized by.
     pub ndraws: usize,
-    /// Whether any expansion of this solve was abandoned for want of budget
-    /// rather than for running away.
-    ///
-    /// The run counts these. A budget is a percentile of a measured shape, and
-    /// the count is the only thing that can argue with the percentile chosen:
-    /// it says how often the tail is being truncated, and so whether a slot is
-    /// too small for the game or four times larger than it needs to be.
-    budget_hit: bool,
+    /// Which entities this solve ran out of, bit `1 << Ent`. The run counts
+    /// them. A budget is a percentile of a measured shape, and the count is
+    /// the only thing that can argue with the percentile chosen: it says how
+    /// often the tail is being truncated, and which term is doing it.
+    budget_hit: u8,
     pub(crate) roff: Vec<u32>,
     pub(crate) voff: Vec<u32>,
     /// `[node]` -> its row in the network batch, or `u32::MAX` for a node that
@@ -1477,7 +1474,7 @@ impl Solver {
             nreach: 0,
             nvals: 0,
             ndraws: 0,
-            budget_hit: false,
+            budget_hit: 0,
             roff: Vec::new(),
             voff: Vec::new(),
             nc: Vec::new(),
@@ -1797,6 +1794,11 @@ impl Solver {
 
     /// Whether this solve ever ran out of budget. See `Solver::budget_hit`.
     pub fn budget_hit(&self) -> bool {
+        self.budget_hit != 0
+    }
+
+    /// Bit `1 << Ent` for each entity this solve ran out of.
+    pub fn hit_mask(&self) -> u8 {
         self.budget_hit
     }
 
@@ -1823,7 +1825,7 @@ impl Solver {
     fn reserve(&mut self, e: Ent, n: usize) -> bool {
         if !self.cfg.budget.reserve(e, n) {
             self.abandon = true;
-            self.budget_hit = true;
+            self.budget_hit |= 1 << (e as u8);
             false
         } else {
             true
@@ -3063,7 +3065,7 @@ impl Solver {
     /// trajectories that end on leaves growth may not touch, which is exactly
     /// the failure the deleted node ceiling used to cause.
     fn expansions_at(&self, i: usize) -> usize {
-        if self.budget_hit || self.nodes[0].exhausted {
+        if self.budget_hit() || self.nodes[0].exhausted {
             0
         } else {
             self.cfg.expansions_at(i)
@@ -3136,7 +3138,7 @@ impl Solver {
             }
             let grew = !taken.is_empty();
             for leaf in taken {
-                if self.budget_hit {
+                if self.budget_hit() {
                     break;
                 }
                 self.expand(leaf);
@@ -3186,7 +3188,7 @@ impl Solver {
                     if leaf == crate::contract::NO_ROW {
                         continue;
                     }
-                    if self.budget_hit {
+                    if self.budget_hit() {
                         break;
                     }
                     self.expand(leaf as usize);

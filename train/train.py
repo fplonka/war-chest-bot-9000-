@@ -720,6 +720,7 @@ def main():
         # the difference against the last report and not an average since the
         # farm started.
         round_at = dict.fromkeys(ROUND_KEYS, 0)
+        ent_at = [0] * 8
         next_report = time.time() + 10.0
         next_target = sog_t0 + args.target_every * 60.0
 
@@ -863,6 +864,9 @@ def main():
             hits = now_at["budget_hits"] - round_at["budget_hits"]
             round_at = now_at
             names = tuple(warchest.ENT_NAMES)
+            now_ent = [int(x) for x in (data.get("entity_hits") or [0] * 8)]
+            ent_hits = [now_ent[i] - ent_at[i] for i in range(8)]
+            ent_at = now_ent
             if window_shapes:
                 a = np.asarray(window_shapes, np.uint32)
                 def pct(col, q):
@@ -955,6 +959,7 @@ def main():
                 "lr": opt.param_groups[0]["lr"],
                 "policy_loss": window["policy_sum"] / max(window["train_steps"], 1),
                 "budget_hits": int(hits),
+                "entity_hits": {names[i]: ent_hits[i] for i in range(8)},
                 "slots": int(data.get("slots", 0)),
                 "slots_used": int(data.get("slots_used", 0)),
                 "slots_per_card": int(data.get("slots_per_card", 0)),
@@ -981,6 +986,7 @@ def main():
                 f"slot={rec['slot_bytes'] / (1 << 20):.1f}MiB "
                 f"hits={rec['budget_hits']} "
                 f"hit_rate={rec['budget_hit_rate']} "
+                f"ehits={'/'.join(str(ent_hits[i]) for i in range(8))} "
                 f"p90={'/'.join(str(shape[n]['p90']) for n in names)}",
                 flush=True)
             window.clear()

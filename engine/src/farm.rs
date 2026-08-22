@@ -689,6 +689,8 @@ pub struct Stats {
     /// Solves that hit the budget. A slot is a percentile; this is the rate
     /// that argues with it.
     budget_hits: AtomicU64,
+    /// Solves that hit each entity's cap, in `Ent::ALL` order.
+    entity_hits: [AtomicU64; 8],
     slot_bytes: AtomicU64,
     slots_per_card: AtomicU64,
     /// Finished-solve entity counts, drained by collect. Eight per solve.
@@ -715,6 +717,10 @@ impl Stats {
 
     pub fn budget_hits(&self) -> u64 {
         self.budget_hits.load(Ordering::Relaxed)
+    }
+
+    pub fn entity_hits(&self) -> [u64; 8] {
+        std::array::from_fn(|i| self.entity_hits[i].load(Ordering::Relaxed))
     }
 
     pub fn slot_bytes(&self) -> u64 {
@@ -914,8 +920,14 @@ fn advance_job(
         match job.solver.advance(&replies) {
             Step::Calls(calls) => return device[job.card].push((job, calls)),
             Step::Done(solved) => {
-                if job.solver.budget_hit() {
+                let mask = job.solver.hit_mask();
+                if mask != 0 {
                     stats.budget_hits.fetch_add(1, Ordering::Relaxed);
+                    for i in 0..8 {
+                        if mask & (1 << i) != 0 {
+                            stats.entity_hits[i].fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
                 stats.shapes.lock().push(job.solver.counts());
                 job.source.take(&job.solver, solved, &mut job.data);

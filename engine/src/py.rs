@@ -743,6 +743,7 @@ impl SolveFarm {
         dict.set_item("slots_per_card", s.slots_per_card())?;
         dict.set_item("slot_bytes", s.slot_bytes())?;
         dict.set_item("budget_hits", s.budget_hits())?;
+        dict.set_item("entity_hits", s.entity_hits())?;
         dict.set_item("shapes", s.take_shapes())?;
         Ok(out)
     }
@@ -963,6 +964,11 @@ fn solve_census() -> Vec<(String, usize)> {
 fn budget_for_s(s: u32) -> [usize; 8] {
     let b = Budget::for_s(s);
     Ent::ALL.map(|e| b.cap(e))
+}
+
+#[pyfunction]
+fn host_slot_bytes(s: u32) -> usize {
+    Budget::for_s(s).host_slot_bytes()
 }
 
 /// All 37 hexes' axial coords, indexed by hex. The browser UI's board
@@ -1190,5 +1196,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(solve_census, m)?)?;
     m.add("ENT_NAMES", Ent::NAME.iter().copied().collect::<Vec<&str>>())?;
     m.add_function(wrap_pyfunction!(budget_for_s, m)?)?;
+    m.add_function(wrap_pyfunction!(host_slot_bytes, m)?)?;
     Ok(())
 }
