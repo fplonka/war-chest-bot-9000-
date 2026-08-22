@@ -1495,7 +1495,12 @@ impl Card {
             // inside them each destination reads.
             let base = pack.words(&writes.blob);
             for r in &writes.runs {
-                let dst = b.plan(s, r.dst, r.at as usize, r.len as usize)?;
+                let dst = b.plan(s, r.dst, r.at as usize, r.len as usize).map_err(|e| {
+                    format!(
+                        "{:?} at {}+{} ncells={ncells} nreach={nreach}: {e}",
+                        r.dst, r.at, r.len
+                    )
+                })?;
                 pack.piece(dst, r.at, base + r.start, r.len);
             }
             b.level_start.clear();
@@ -1506,13 +1511,13 @@ impl Card {
             }
             b.ncells = *ncells;
             b.nreach = *nreach;
-            b.regret.fit(*ncells)?;
-            b.sum.fit(*ncells)?;
-            b.qval.fit(*ncells)?;
-            b.visits.fit(*ncells)?;
-            b.reach.fit(*nreach)?;
+            b.regret.fit(*ncells).map_err(|e| format!("regret ncells={ncells}: {e}"))?;
+            b.sum.fit(*ncells).map_err(|e| format!("sum ncells={ncells}: {e}"))?;
+            b.qval.fit(*ncells).map_err(|e| format!("qval ncells={ncells}: {e}"))?;
+            b.visits.fit(*ncells).map_err(|e| format!("visits ncells={ncells}: {e}"))?;
+            b.reach.fit(*nreach).map_err(|e| format!("reach nreach={nreach}: {e}"))?;
             b.nvals = *nvals;
-            b.vals.fit(2 * *nvals)?;
+            b.vals.fit(2 * *nvals).map_err(|e| format!("vals nvals={nvals}: {e}"))?;
         }
         Ok(())
     }
