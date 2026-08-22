@@ -628,7 +628,7 @@ def main():
         # The CUDA context and the caching allocator sit outside
         # `memory_allocated` but inside the fraction. Leave them, and a
         # training step, unpinned.
-        extra = max(0, cap - used - (1024 << 20))
+        extra = max(0, cap - used - (2048 << 20))
         if extra:
             _torch_hold = torch.empty(extra // 4, dtype=torch.float32, device=dev)
         print(f"[train] torch holds {TRAIN_FRAC:.0%} of {dev} "
