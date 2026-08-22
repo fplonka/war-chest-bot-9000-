@@ -249,12 +249,16 @@ fn warp_rows(rows: usize) -> LaunchConfig {
 }
 
 pub struct Device {
-    /// One card per ordinal. The farm drives each with a thread of its own,
-    /// and a round is every solve that thread found waiting.
+    /// `PIPELINE` cards per GPU, flattened. The farm's queues are one per GPU;
+    /// both cards of a GPU share one slot pool and pull from that queue.
     cards: Vec<Card>,
+    n_gpus: usize,
     net: Net,
     slot_bytes: usize,
 }
+
+/// Two rounds in flight: while set A grows on the host, set B iterates on the card.
+pub const PIPELINE: usize = 2;
 
 /// The trunk's two square matrices a block, permuted so that one lane's three
 /// channels of a weight row are four floats side by side.
@@ -583,9 +587,10 @@ impl Pack {
 struct Card {
     stream: Arc<CudaStream>,
     blas: CudaBlas,
-    k: Kernels,
-    /// Indexed by solve, which is the slot the farm pinned it to.
-    solves: parking_lot::Mutex<Vec<Solve>>,
+    k: Arc<Kernels>,
+    /// Indexed by solve, which is the slot the farm pinned it to. Shared by
+    /// both cards of a GPU.
+    solves: Arc<parking_lot::Mutex<Vec<Solve>>>,
     /// Host staging for a round's batches, kept between rounds for the same
     /// reason the device scratch is: a round concatenates sixteen megabytes of
     /// public encodings, and building that from an empty `Vec` every time is
@@ -654,57 +659,76 @@ impl Device {
         if net.is_empty() {
             return Err("cannot start the device backend without weights".into());
         }
-        let mut cards = ordinals
-            .iter()
-            .map(|&o| Card::new(o, &net))
-            .collect::<Res<Vec<_>>>()?;
         let budget = cfg.budget;
-        cards[0].stream.context().bind_to_thread().map_err(err)?;
-        let slot = {
-            let s = Solve::at_budget(&cards[0].stream, &budget)?;
-            let n = s.bytes() as u64;
-            drop(s);
-            cards[0].stream.synchronize().map_err(err)?;
-            n
-        };
+        let mut cards = Vec::with_capacity(ordinals.len() * PIPELINE);
         let mut left = max_slots;
-        for (o, card) in cards.iter_mut().enumerate() {
-            card.stream.context().bind_to_thread().map_err(err)?;
+        let mut slot_bytes = 0usize;
+        for (g, &o) in ordinals.iter().enumerate() {
+            let gpu = Gpu::new(o, &net)?;
+            gpu.ctx.bind_to_thread().map_err(err)?;
+            let mut pair: Vec<Card> = (0..PIPELINE)
+                .map(|_| Card::on(&gpu, &net))
+                .collect::<Res<_>>()?;
+            let s0 = &pair[0].stream;
+            s0.context().bind_to_thread().map_err(err)?;
+            let slot = {
+                let s = Solve::at_budget(s0, &budget)?;
+                let n = s.bytes() as u64;
+                drop(s);
+                s0.synchronize().map_err(err)?;
+                n
+            };
+            if g == 0 {
+                slot_bytes = slot as usize;
+            }
             let free = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
             let tile = round_bytes(0, &budget, cfg.s) as u64;
-            let per = slot + (round_bytes(1, &budget, cfg.s) as u64).saturating_sub(tile);
+            let extra = (round_bytes(1, &budget, cfg.s) as u64).saturating_sub(tile);
+            let per = slot + PIPELINE as u64 * extra;
             // A slot is eight allocations. Packing the reported free figure to
             // the last byte OOMs on fragmentation; keep a tenth.
-            let usable = free.saturating_sub(tile);
+            let usable = free.saturating_sub(PIPELINE as u64 * tile);
             let fit = (usable - usable / 10) / per.max(1);
             let n = (fit as usize).min(left);
-            if o == 0 && n == 0 {
+            if g == 0 && n == 0 {
                 return Err(format!(
                     "a slot of {slot} bytes does not fit in {free} bytes free"
                 ));
             }
             left = left.saturating_sub(n);
-            card.carve(n, &cfg).map_err(|e| {
-                format!("carve card {o} n={n} slot={slot} free={free}: {e}")
-            })?;
-            card.stream.synchronize().map_err(err)?;
+            let mut solves = Vec::with_capacity(n);
+            for _ in 0..n {
+                solves.push(Solve::at_budget(s0, &budget)?);
+            }
+            if let Some(s) = solves.first() {
+                *CENSUS.lock() = s.census();
+            }
+            let solves = Arc::new(parking_lot::Mutex::new(solves));
+            for (p, card) in pair.iter_mut().enumerate() {
+                card.solves = Arc::clone(&solves);
+                card.carve(n, &cfg).map_err(|e| {
+                    format!("carve gpu {g} pipe {p} n={n} slot={slot} free={free}: {e}")
+                })?;
+                card.stream.synchronize().map_err(err)?;
+            }
+            cards.extend(pair);
         }
-        Ok(Device { cards, net, slot_bytes: slot as usize })
+        Ok(Device { cards, n_gpus: ordinals.len(), net, slot_bytes })
     }
 
-    /// How many cards a round can be spread over.
+    /// How many GPUs a round can be spread over. Each has `PIPELINE` cards.
     pub fn cards(&self) -> usize {
-        self.cards.len()
+        self.n_gpus
     }
 
-    /// Slots this card holds. Admission is a pop from a free list of these.
-    pub fn slots(&self, card: usize) -> usize {
-        self.cards[card].solves.lock().len()
+    /// Slots this GPU holds. Admission is a pop from a free list of these.
+    pub fn slots(&self, gpu: usize) -> usize {
+        self.cards[gpu * PIPELINE].solves.lock().len()
     }
 
-    /// Slots across every card.
+    /// Slots across every GPU.
     pub fn total_slots(&self) -> usize {
-        (0..self.cards.len()).map(|c| self.slots(c)).sum()
+        (0..self.n_gpus).map(|g| self.slots(g)).sum()
     }
 
     /// Bytes one solve slot holds, summed from the arrays allocated at the budget.
@@ -712,12 +736,12 @@ impl Device {
         self.slot_bytes
     }
 
-    /// Slots one physical card holds.
+    /// Slots one physical GPU holds.
     pub fn slots_per_card(&self) -> usize {
-        if self.cards.is_empty() {
+        if self.n_gpus == 0 {
             0
         } else {
-            self.total_slots() / self.cards.len()
+            self.total_slots() / self.n_gpus
         }
     }
 
@@ -761,12 +785,12 @@ impl Device {
     /// `None` when the round could not be answered. The caller closes its
     /// gate on that, so the cohort unwinds instead of parking on a card that
     /// is never going to reply.
-    pub fn run(&self, calls: &[Call], card: usize) -> Option<Vec<Reply>> {
-        // A solve's board vectors stay on the card that produced them, so every
-        // call of one solve reaches the same card. The farm pins a solve to a
-        // card for its whole life, so a round is already the calls of one.
+    pub fn run(&self, calls: &[Call], lane: usize) -> Option<Vec<Reply>> {
+        // `lane` is `gpu * PIPELINE + pipe`. Slots are shared per GPU; the
+        // farm pins a solve to a GPU for its whole life, and either pipe of
+        // that GPU may run the round.
         let all: Vec<usize> = (0..calls.len()).collect();
-        match self.cards[card].round(calls, &all) {
+        match self.cards[lane].round(calls, &all) {
             Ok(part) => {
                 let mut out: Vec<Reply> = (0..calls.len()).map(|_| Reply::default()).collect();
                 for (i, reply) in part {
@@ -775,7 +799,7 @@ impl Device {
                 Some(out)
             }
             Err(e) => {
-                eprintln!("cuda: card {card}: {e}");
+                eprintln!("cuda: lane {lane}: {e}");
                 None
             }
         }
@@ -834,12 +858,17 @@ pub struct Resident {
     pub reach: Vec<f32>,
 }
 
-impl Card {
-    fn new(ordinal: usize, net: &Net) -> Res<Card> {
+/// One GPU's context and kernels, shared by its two cards.
+struct Gpu {
+    ctx: Arc<CudaContext>,
+    k: Arc<Kernels>,
+}
+
+impl Gpu {
+    fn new(ordinal: usize, _net: &Net) -> Res<Gpu> {
         let ctx = CudaContext::new(ordinal).map_err(|e| format!("device {ordinal}: {e:?}"))?;
-        // One stream per context and no sharing between them, so the read/write
-        // events cudarc would otherwise create on every allocation buy nothing
-        // and cost two event creations per buffer.
+        // Two streams on this context, so the read/write events cudarc would
+        // otherwise create on every allocation buy nothing.
         unsafe { ctx.disable_event_tracking() };
         let (major, minor) = ctx.compute_capability().map_err(err)?;
         let ptx = compile_ptx_with_opts(
@@ -855,9 +884,14 @@ impl Card {
             },
         )
         .map_err(|e| format!("nvrtc: {e:?}"))?;
-        let stream = ctx.default_stream();
         let module = ctx.load_module(ptx).map_err(err)?;
-        let k = Kernels::load(&module)?;
+        Ok(Gpu { ctx, k: Arc::new(Kernels::load(&module)?) })
+    }
+}
+
+impl Card {
+    fn on(gpu: &Gpu, net: &Net) -> Res<Card> {
+        let stream = gpu.ctx.new_stream().map_err(err)?;
         let blas = CudaBlas::new(stream.clone()).map_err(err)?;
         let flat = net.flat();
         let nb: Vec<i32> = board()
@@ -888,8 +922,8 @@ impl Card {
             nb: stream.memcpy_stod(&nb).map_err(err)?,
             stream,
             blas,
-            k,
-            solves: parking_lot::Mutex::new(Vec::new()),
+            k: Arc::clone(&gpu.k),
+            solves: Arc::new(parking_lot::Mutex::new(Vec::new())),
             host: parking_lot::Mutex::new(Stage::default()),
             pack: parking_lot::Mutex::new(Pack::default()),
             batch: parking_lot::Mutex::new(Batch::default()),
@@ -898,20 +932,14 @@ impl Card {
         })
     }
 
-    /// Allocate this card's slots and the scratch they share, once.
+    /// Allocate this card's TILE scratch and batch index, once. Slots live on
+    /// the GPU's shared pool.
     fn carve(&mut self, n: usize, cfg: &Cfg) -> Res<()> {
         if n == 0 {
             return Ok(());
         }
         self.stream.context().bind_to_thread().map_err(err)?;
         let b = &cfg.budget;
-        let mut solves = Vec::with_capacity(n);
-        for _ in 0..n {
-            solves.push(Solve::at_budget(&self.stream, b)?);
-        }
-        if let Some(s) = solves.first() {
-            *CENSUS.lock() = s.census();
-        }
         let mut scratch = Scratch::default();
         let s = &self.stream;
         // `w` is the round's belief weights, one per belief-index entry, so it
@@ -958,7 +986,6 @@ impl Card {
         *self.host.lock() = stage;
         *self.scratch.lock() = scratch;
         *self.batch.lock() = batch;
-        *self.solves.lock() = solves;
         Ok(())
     }
 

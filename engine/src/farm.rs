@@ -8,10 +8,10 @@
 //!
 //! A solve is a state machine, not a thread: it consumes the replies it was
 //! waiting for, does its host-side work, and says what it wants next. So it
-//! sits in one of two queues. One driver a card takes whatever is waiting on
-//! that card and runs it as one batch; a pool of workers, one per core, does
-//! the host side. Neither waits for the other, which is what lets one solve's
-//! growth overlap another's device work.
+//! sits in one of two queues. Two drivers a GPU share that GPU's queue, so
+//! one set can grow while the other iterates; a pool of workers, one per
+//! core, does the host side. Neither waits for the other, which is what lets
+//! one solve's growth overlap another's device work.
 //!
 //! How many solves are in flight is the number of slots. A slot is allocated
 //! once at the budget; admission is a pop from a free list, and a solve that
@@ -378,12 +378,21 @@ impl Backend {
         }
     }
 
-    /// How many cards this backend has, and so how many drivers the farm runs.
+    /// How many GPUs this backend has, and so how many queues the farm runs.
     pub fn cards(&self) -> usize {
         match self {
             Backend::Reference(_) => 1,
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.cards(),
+        }
+    }
+
+    /// Cards per GPU. Two, so one set can grow while the other iterates.
+    pub fn pipelines(&self) -> usize {
+        match self {
+            Backend::Reference(_) => 1,
+            #[cfg(feature = "gpu")]
+            Backend::Cuda(_) => crate::cuda::PIPELINE,
         }
     }
 
@@ -531,6 +540,27 @@ impl<T> Queue<T> {
         }
     }
 
+    /// Wait until `wave` items are ready, then take that many. Leftover items
+    /// wake the other pipe. Empty once the queue is closed and empty.
+    fn drain_wave(&self, wave: usize) -> Vec<T> {
+        let mut q = self.q.lock();
+        loop {
+            let n = q.len();
+            if n >= wave || (self.closed.load(Ordering::Relaxed) && n > 0) {
+                let take = n.min(wave);
+                let out: Vec<T> = q.drain(..take).collect();
+                if !q.is_empty() {
+                    self.ready.notify_one();
+                }
+                return out;
+            }
+            if self.closed.load(Ordering::Relaxed) {
+                return Vec::new();
+            }
+            self.ready.wait(&mut q);
+        }
+    }
+
     fn close(&self) {
         let _held = self.q.lock();
         self.closed.store(true, Ordering::Relaxed);
@@ -613,9 +643,9 @@ impl Source {
 struct Job {
     source: Source,
     solver: Solver,
-    /// The card that holds this solve's arenas, and which of its slots. A card
+    /// The card that holds this solve's arenas, and which of its slots. A GPU
     /// keeps a solve's board vectors between its rounds, so both are fixed for
-    /// as long as the job lives.
+    /// as long as the job lives. Either pipe of that GPU may run the round.
     card: usize,
     slot: usize,
     /// What the last round gave back, waiting for the host work that reads it.
@@ -627,14 +657,14 @@ struct Job {
 /// Many solves in flight in one process, and one thing that evaluates for all
 /// of them.
 ///
-/// Two kinds of thread. One driver a card takes whatever solves are waiting on
-/// that card, runs their calls as one batch, and hands the replies back. A pool
-/// of workers, one per core, does the host side: growth, which is the game's
+/// Two kinds of thread. Two drivers a GPU share one queue, so one set of solves
+/// can grow on the host while the other iterates on the card. A pool of
+/// workers, one per core, does the host side: growth, which is the game's
 /// rules, and the game around it. Neither ever waits for the other, so one
 /// solve's growth overlaps another's device work — which a barrier could not
 /// do, because it made a round cost whatever its slowest member cost.
 pub struct Farm {
-    /// One queue a card: solves whose next round that card must run.
+    /// One queue a GPU: solves whose next round either of its cards may run.
     device: Vec<Arc<Queue<(Job, Vec<Call>)>>>,
     /// Solves whose replies are in and whose host work wants a core.
     ready: Arc<Queue<Job>>,
@@ -710,17 +740,18 @@ impl Stats {
 }
 
 impl Farm {
-    /// Start `workers` host threads and one driver per card, with one job per
+    /// Start `workers` host threads and two drivers per GPU, with one job per
     /// slot. A slot is allocated at the budget; there is nothing to admit
     /// against after that.
     pub fn new(seed: u64, workers: usize, work: Work, backend: Backend) -> Farm {
         assert!(workers > 0, "a farm needs at least one worker");
-        let cards = backend.cards();
+        let gpus = backend.cards();
+        let pipes = backend.pipelines();
         let cuda = backend.keeps_the_solve();
-        let per_card: Vec<usize> = (0..cards)
-            .map(|c| if cuda { backend.slots(c) } else { workers })
+        let per_gpu: Vec<usize> = (0..gpus)
+            .map(|g| if cuda { backend.slots(g) } else { workers })
             .collect();
-        let n_slots: usize = per_card.iter().sum();
+        let n_slots: usize = per_gpu.iter().sum();
         let slot_bytes = backend.slot_bytes();
         let slots_per_card = backend.slots_per_card();
         let work = Arc::new(work);
@@ -730,7 +761,7 @@ impl Farm {
         })));
         let ready = Arc::new(Queue::default());
         let device: Vec<Arc<Queue<(Job, Vec<Call>)>>> =
-            (0..cards).map(|_| Arc::new(Queue::default())).collect();
+            (0..gpus).map(|_| Arc::new(Queue::default())).collect();
         let collected = Arc::new(Mutex::new(Vec::new()));
         let stopping = Arc::new(AtomicBool::new(false));
         let broken = Arc::new(AtomicBool::new(false));
@@ -761,10 +792,11 @@ impl Farm {
             })
             .collect();
 
-        let drivers = (0..cards)
-            .map(|c| {
+        let mut drivers = Vec::with_capacity(gpus * pipes);
+        for g in 0..gpus {
+            for p in 0..pipes {
                 let (queue, ready, backend, nets, work, stats, broken) = (
-                    Arc::clone(&device[c]),
+                    Arc::clone(&device[g]),
                     Arc::clone(&ready),
                     Arc::clone(&backend),
                     Arc::clone(&nets),
@@ -772,19 +804,22 @@ impl Farm {
                     Arc::clone(&stats),
                     Arc::clone(&broken),
                 );
-                let n = per_card[c];
-                let seed = seed.wrapping_mul(0x9E37_79B9) ^ c as u64;
-                std::thread::Builder::new()
-                    .name(format!("card-{c}"))
-                    .spawn(move || {
-                        drive_card(
-                            c, cards, n, seed, &queue, &ready, &backend, &nets, &work,
-                            &stats, &broken,
-                        )
-                    })
-                    .expect("spawn driver thread")
-            })
-            .collect();
+                let n = per_gpu[g];
+                let seed = seed.wrapping_mul(0x9E37_79B9) ^ g as u64 ^ (p as u64) << 32;
+                let lane = g * pipes + p;
+                drivers.push(
+                    std::thread::Builder::new()
+                        .name(format!("card-{g}.{p}"))
+                        .spawn(move || {
+                            drive_card(
+                                g, lane, gpus, n, p == 0, n.div_ceil(pipes.max(1)), seed,
+                                &queue, &ready, &backend, &nets, &work, &stats, &broken,
+                            )
+                        })
+                        .expect("spawn driver thread"),
+                );
+            }
+        }
 
         Farm {
             device,
@@ -907,12 +942,15 @@ fn advance_job(
     }
 }
 
-/// One card's rounds, and the solves that occupy its slots.
+/// One card's rounds, and the solves that occupy its GPU's slots.
 #[allow(clippy::too_many_arguments)]
 fn drive_card(
-    card: usize,
-    cards: usize,
+    gpu: usize,
+    lane: usize,
+    gpus: usize,
     n_slots: usize,
+    seed_slots: bool,
+    wave: usize,
     seed: u64,
     queue: &Queue<(Job, Vec<Call>)>,
     ready: &Queue<Job>,
@@ -922,24 +960,26 @@ fn drive_card(
     stats: &Stats,
     broken: &AtomicBool,
 ) {
-    for slot in 0..n_slots {
-        if ready.closed() {
-            break;
+    if seed_slots {
+        for slot in 0..n_slots {
+            if ready.closed() {
+                break;
+            }
+            stats.used.fetch_add(1, Ordering::Relaxed);
+            let mut source = Source::new(
+                work,
+                seed ^ (slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                slot * gpus + gpu,
+            );
+            let mut data = Data::default();
+            let n = Arc::clone(&*nets.read());
+            let mut solver = source.next(work, &n, &mut data);
+            solver.pin(slot);
+            ready.push(Job { source, solver, card: gpu, slot, replies: Vec::new(), data });
         }
-        stats.used.fetch_add(1, Ordering::Relaxed);
-        let mut source = Source::new(
-            work,
-            seed ^ (slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-            slot * cards + card,
-        );
-        let mut data = Data::default();
-        let n = Arc::clone(&*nets.read());
-        let mut solver = source.next(work, &n, &mut data);
-        solver.pin(slot);
-        ready.push(Job { source, solver, card, slot, replies: Vec::new(), data });
     }
     loop {
-        let batch = queue.drain();
+        let batch = queue.drain_wave(wave);
         if batch.is_empty() {
             return;
         }
@@ -952,7 +992,7 @@ fn drive_card(
             jobs.push(job);
         }
         let at = std::time::Instant::now();
-        let answered = backend.read().run(&calls, card);
+        let answered = backend.read().run(&calls, lane);
         let spent = at.elapsed();
         let Some(replies) = answered else {
             broken.store(true, Ordering::Relaxed);
@@ -1017,45 +1057,50 @@ impl Drop for Seat<'_> {
 impl Cards {
     pub fn new(backend: Backend) -> Cards {
         let n = backend.cards();
+        let pipes = backend.pipelines();
         let backend = Arc::new(backend);
         let queues: Vec<Arc<Queue<Ask>>> = (0..n).map(|_| Arc::new(Queue::default())).collect();
-        let drivers = (0..n)
-            .map(|c| {
-                let (queue, backend) = (Arc::clone(&queues[c]), Arc::clone(&backend));
-                std::thread::Builder::new()
-                    .name(format!("card-{c}"))
-                    .spawn(move || loop {
-                        let batch = queue.drain();
-                        if batch.is_empty() {
-                            return;
-                        }
-                        let mut backs = Vec::with_capacity(batch.len());
-                        let mut spans = Vec::with_capacity(batch.len());
-                        let mut calls: Vec<Call> = Vec::new();
-                        for ask in batch {
-                            spans.push(ask.calls.len());
-                            calls.extend(ask.calls);
-                            backs.push(ask.back);
-                        }
-                        // A card that cannot answer takes its solves with it.
-                        // Dropping the senders is what tells them.
-                        let Some(replies) = backend.run(&calls, c) else {
-                            return;
-                        };
-                        let mut rest = replies;
-                        for (back, n) in backs.into_iter().zip(spans) {
-                            let tail = rest.split_off(n);
-                            let _ = back.send(rest);
-                            rest = tail;
-                        }
-                    })
-                    .expect("spawn driver thread")
-            })
-            .collect();
+        let mut drivers = Vec::with_capacity(n * pipes);
+        for g in 0..n {
+            for p in 0..pipes {
+                let (queue, backend) = (Arc::clone(&queues[g]), Arc::clone(&backend));
+                let lane = g * pipes + p;
+                drivers.push(
+                    std::thread::Builder::new()
+                        .name(format!("card-{g}.{p}"))
+                        .spawn(move || loop {
+                            let batch = queue.drain();
+                            if batch.is_empty() {
+                                return;
+                            }
+                            let mut backs = Vec::with_capacity(batch.len());
+                            let mut spans = Vec::with_capacity(batch.len());
+                            let mut calls: Vec<Call> = Vec::new();
+                            for ask in batch {
+                                spans.push(ask.calls.len());
+                                calls.extend(ask.calls);
+                                backs.push(ask.back);
+                            }
+                            // A card that cannot answer takes its solves with it.
+                            // Dropping the senders is what tells them.
+                            let Some(replies) = backend.run(&calls, lane) else {
+                                return;
+                            };
+                            let mut rest = replies;
+                            for (back, n) in backs.into_iter().zip(spans) {
+                                let tail = rest.split_off(n);
+                                let _ = back.send(rest);
+                                rest = tail;
+                            }
+                        })
+                        .expect("spawn driver thread"),
+                );
+            }
+        }
         let mut free = Vec::new();
-        for c in 0..n {
-            for s in 0..backend.slots(c) {
-                free.push((c, s));
+        for g in 0..n {
+            for s in 0..backend.slots(g) {
+                free.push((g, s));
             }
         }
         Cards { queues, seats: Mutex::new(free), free: Condvar::new(), drivers }
