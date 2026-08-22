@@ -529,7 +529,17 @@ impl Game {
                 }
             }
         }
-        let np = policy::at_node(sv, 0, n);
+        let np = if sv.nodes[0].legal_off.is_empty() {
+            // A first expansion that did not fit the slot left the root a leaf.
+            policy::uniform(
+                &self.s,
+                &self.ctx,
+                self.s.to_act(),
+                &self.bel[self.s.to_act() as usize].cfg,
+            )
+        } else {
+            policy::at_node(sv, 0, n)
+        };
         self.play(np);
     }
 
