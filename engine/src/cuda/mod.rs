@@ -17,7 +17,8 @@
 //!   array.
 //!
 //! The arithmetic is `net.rs`, in the same order, and `tests/cuda_parity.rs`
-//! holds it to `Backend::Reference` on the same weights.
+//! holds it to `Backend::Reference` on the same weights. The join is one kernel;
+//! the trunk and the join multiply on the tensor cores.
 //!
 //! Scratch is allocated at carve, at `TILE` for a pass and at `n_slots` times a
 //! budget term for the rest. A round that needs more rows tiles. Nothing a
@@ -38,7 +39,7 @@ use crate::board::{board, N_HEXES, NONE};
 use crate::farm::{Call, Prime, Reply, CARD_ROWS};
 use crate::net::{
     ln_block, Net, NetLayout, NormSpan, Span, AFEAT, AW, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW,
-    LN_ACT, LN_CFG, LN_H, LN_JOIN, LN_JOUT, LN_TRUNK, POOL, TYPE,
+    LN_ACT, LN_CFG, LN_H, LN_JOIN, LN_TRUNK, POOL, TYPE,
 };
 use crate::pbs::{
     CFEAT, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_LOOSE, OFF_PILES, PILE_COUNTS, PUBFEAT,
@@ -111,15 +112,12 @@ const KERNELS: &str = include_str!("kernels.cu");
 /// exist is an error there rather than a wrong answer later.
 struct Kernels {
     gelu: CudaFunction,
-    norm: CudaFunction,
     norm_ip: CudaFunction,
     bias: CudaFunction,
     window: CudaFunction,
-    gather: CudaFunction,
     scatter: CudaFunction,
     seed_reach: CudaFunction,
     avg_block: CudaFunction,
-    beliefs: CudaFunction,
     terminals: CudaFunction,
     expand: CudaFunction,
     finish: CudaFunction,
@@ -135,7 +133,7 @@ struct Kernels {
     cfg_slots: CudaFunction,
     sum_slots: CudaFunction,
     bag: CudaFunction,
-    join_input: CudaFunction,
+    join: CudaFunction,
     belief_pool: CudaFunction,
     readout: CudaFunction,
     reach_sweep: CudaFunction,
@@ -150,15 +148,12 @@ impl Kernels {
         };
         Ok(Kernels {
             gelu: get("k_gelu")?,
-            norm: get("k_norm")?,
             norm_ip: get("k_norm_ip")?,
             bias: get("k_bias")?,
             window: get("k_window")?,
-            gather: get("k_gather")?,
             scatter: get("k_scatter")?,
             seed_reach: get("k_seed_reach")?,
             avg_block: get("k_avg_block")?,
-            beliefs: get("k_beliefs")?,
             terminals: get("k_terminals")?,
             expand: get("k_expand")?,
             finish: get("k_finish")?,
@@ -174,7 +169,7 @@ impl Kernels {
             cfg_slots: get("k_cfg_slots")?,
             sum_slots: get("k_sum_slots")?,
             bag: get("k_bag")?,
-            join_input: get("k_join_input")?,
+            join: get("k_join")?,
             belief_pool: get("k_belief_pool")?,
             readout: get("k_readout")?,
             reach_sweep: get("k_reach_sweep")?,
@@ -237,9 +232,9 @@ fn rows_of(rows: usize, width: usize) -> LaunchConfig {
     }
 }
 
-/// One row per warp, eight warps to a block. What `k_norm` wants: its rows are
-/// a hundred-odd wide, which one warp reduces in five shuffles where a block
-/// spends the same time in barriers.
+/// One row per warp, eight warps to a block. What `k_norm_ip` wants: its rows
+/// are a hundred-odd wide, which one warp reduces in five shuffles where a
+/// block spends the same time in barriers.
 fn warp_rows(rows: usize) -> LaunchConfig {
     const WARPS: u32 = 8;
     LaunchConfig {
@@ -275,18 +270,42 @@ fn tf32(v: f32) -> f32 {
     f32::from_bits(u.wrapping_add(0x1000) & 0xFFFF_E000)
 }
 
+/// JOIN_IN padded to a whole `mma.m16n8k8` k-tile. Seven zero columns, 5 %.
+const JOIN_K: usize = JOIN_IN.next_multiple_of(8);
+const _: () = assert!(JOIN_K == 136 && JOIN_IN == 129);
+
+/// One matrix in the order a warp of `mma.sync.m16n8k8` reads it.
+///
+/// Lane `l` holds `w[k + l % 4][n + l / 4]` and the value four rows below it.
+/// Stored as the net stores it that is eight thirty-two-byte transactions a
+/// fragment; here the fragment is written out lane by lane, so it is one
+/// eight-byte load a lane. `k_pad` may exceed `k_real`: the extra rows are
+/// zero, which is how JOIN_IN = 129 becomes a 136-deep tile.
+fn pack_mma(w: &[f32], base: usize, k_real: usize, k_pad: usize, n: usize, out: &mut Vec<f32>) {
+    assert_eq!(k_pad % 8, 0, "a packed matrix is whole fragments deep");
+    assert_eq!(n % 8, 0, "a packed matrix is whole fragments across");
+    for kt in 0..k_pad / 8 {
+        for nt in 0..n / 8 {
+            for lane in 0..32 {
+                let (g, t) = (lane / 4, lane % 4);
+                let at = |k: usize| {
+                    let row = 8 * kt + k;
+                    if row >= k_real {
+                        0.0
+                    } else {
+                        tf32(w[base + row * n + 8 * nt + g])
+                    }
+                };
+                out.push(at(t));
+                out.push(at(t + 4));
+            }
+        }
+    }
+}
+
 /// The trunk's two matrices a block, laid out in the order the tensor cores
-/// read them.
-///
-/// `k_trunk` multiplies with `mma.sync.m16n8k8`, which wants an eight by eight
-/// slab of the weight spread over a warp: lane `l` holds `w[k + l % 4][n +
-/// l / 4]` and the value four rows below it. Stored as the net stores it that
-/// is eight thirty-two-byte transactions a fragment. Here the fragment is
-/// written out lane by lane, so it is one eight-byte load a lane and two
-/// hundred and fifty-six contiguous bytes across the warp.
-///
-/// Returns the buffer and where each matrix starts, mix then out, block by
-/// block.
+/// read them. Returns the buffer and where each matrix starts, mix then out,
+/// block by block.
 fn fragwise(l: &NetLayout, w: &[f32]) -> (Vec<f32>, Vec<usize>) {
     let mut out = Vec::new();
     let mut at = Vec::new();
@@ -295,19 +314,29 @@ fn fragwise(l: &NetLayout, w: &[f32]) -> (Vec<f32>, Vec<usize>) {
             assert_eq!(s.o, C, "the trunk's matrices are the channel width across");
             assert_eq!(s.i % 8, 0, "the trunk's matrices are whole fragments deep");
             at.push(out.len());
-            for kt in 0..s.i / 8 {
-                for nt in 0..C / 8 {
-                    for lane in 0..32 {
-                        let (g, t) = (lane / 4, lane % 4);
-                        let at = |k: usize| tf32(w[s.w + (8 * kt + k) * s.o + 8 * nt + g]);
-                        out.push(at(t));
-                        out.push(at(t + 4));
-                    }
-                }
-            }
+            pack_mma(w, s.w, s.i, s.i, s.o, &mut out);
         }
     }
     (out, at)
+}
+
+/// `join_b`, the three `join_w`, then `join_out`, each packed the way `k_join`
+/// indexes them. `join_b` is padded to `JOIN_K`.
+fn join_pack(l: &NetLayout, w: &[f32]) -> Vec<f32> {
+    let mut out = Vec::new();
+    assert_eq!(l.join_b.i, JOIN_IN, "join_b is JOIN_IN deep");
+    assert_eq!(l.join_b.o, JW, "join_b is JW across");
+    pack_mma(w, l.join_b.w, l.join_b.i, JOIN_K, l.join_b.o, &mut out);
+    for s in l.join_w {
+        assert_eq!(s.i, JW, "a join residual is JW deep");
+        assert_eq!(s.o, JW, "a join residual is JW across");
+        pack_mma(w, s.w, s.i, s.i, s.o, &mut out);
+    }
+    let o = l.join_out;
+    assert_eq!(o.i, JW, "join_out is JW deep");
+    assert_eq!(o.o, D, "join_out is D across");
+    pack_mma(w, o.w, o.i, o.i, o.o, &mut out);
+    out
 }
 
 /// The board rounded up to whole sixteen-row `mma` tiles, and the shared row
@@ -338,18 +367,28 @@ fn owed_by_the_join(l: &NetLayout, b: &[f32]) -> Vec<f32> {
 
 /// Leaf rows a pass works on at once.
 ///
-/// The intermediates of the leaf pass are 5,640 bytes a row. A tile large
-/// enough to fill the card costs ninety megabytes and a handful of extra
-/// launches. Scratch is allocated at this size when the card is carved, so a
-/// round cannot grow it.
+/// The intermediates of the leaf pass are 2,560 bytes a row -- the pooled
+/// belief block and the head, since the join keeps its residual stream in
+/// registers -- so a tile large enough to fill the card costs forty-two
+/// megabytes and a handful of extra launches. Scratch is allocated at this
+/// size when the card is carved, so a round cannot grow it.
 const TILE: usize = 16384;
+
+/// Join rows one block of `k_join` holds.
+///
+/// Shared is `JROWS * (JOIN_K + 4) * 4` = 35,840 B, so two blocks fit an SM.
+/// Sixteen warps, `__launch_bounds__(512, 3)`, caps registers at 42 a thread,
+/// and two resident blocks are 66 % of the file. Two cards share a GPU and
+/// the sweeps that run beside this need somewhere to put a block.
+const JROWS: usize = 64;
+const _: () = assert!(JROWS <= JW && JROWS % 16 == 0);
 
 /// Bytes one card allocates at carve besides the slots themselves: the tiled
 /// leaf pass, the tiled trunk/config/prior intermediates, the scratch that
 /// scales with how many slots the card holds, and the batch index `lay` fills.
 fn round_bytes(n_slots: usize, b: &Budget, s: u32) -> usize {
     let f = 4;
-    let leaf = 2 * TILE * (POOL + D + JW + JOIN_IN + JW) * f;
+    let leaf = 2 * TILE * (POOL + D) * f;
     let trunk = (TILE * NTYPE * PILE_COUNTS
         + TILE * NTYPE * TYPE
         + TILE * NTYPE * C
@@ -357,10 +396,11 @@ fn round_bytes(n_slots: usize, b: &Budget, s: u32) -> usize {
         + TILE * LOOSE
         + TILE * C
         + TILE * N_HEXES * HEX_FACTS
-        + TILE * N_HEXES * C)
+        + TILE * N_HEXES * C
+        + TILE * D
+        + TILE * (2 * C + LOOSE))
         * f
         + TILE * N_HEXES * 4;
-    let w = n_slots * b.cidx * f;
     let mass = 2 * n_slots * b.rows * f;
     let leaves = n_slots * s.max(1) as usize * f;
     let bag = n_slots * CARD_ROWS * NTYPE * 3 * POOL * f;
@@ -379,7 +419,7 @@ fn round_bytes(n_slots: usize, b: &Budget, s: u32) -> usize {
         + n_slots * 4
         + n_slots * 4
         + (12 * TILE + n_slots * b.cells) * 4;
-    leaf + trunk + w + mass + leaves + bag + stage + batch
+    leaf + trunk + mass + leaves + bag + stage + batch
 }
 
 /// Fill a staging buffer with exactly `src`.
@@ -667,6 +707,8 @@ struct Card {
     /// The two square matrices of every trunk block, laid out the way a warp
     /// of `mma.sync.m16n8k8` reads them. See `fragwise`.
     wt: CudaSlice<f32>,
+    /// The join's five matrices, packed the same way. See `join_pack`.
+    jw: CudaSlice<f32>,
     b: CudaSlice<f32>,
     ln: CudaSlice<f32>,
     /// Hex adjacency, `NONE` folded to `-1`.
@@ -815,6 +857,9 @@ impl Device {
             card.stream.memcpy_htod(&flat.w, &mut card.w).map_err(err)?;
             let (lw, _) = fragwise(&card.layout, &flat.w);
             card.stream.memcpy_htod(&lw, &mut card.wt).map_err(err)?;
+            card.stream
+                .memcpy_htod(&join_pack(&card.layout, &flat.w), &mut card.jw)
+                .map_err(err)?;
             card.stream.memcpy_htod(&flat.b, &mut card.b).map_err(err)?;
             card.stream.memcpy_htod(&flat.ln, &mut card.ln).map_err(err)?;
             let owed = owed_by_the_join(&card.layout, &flat.b);
@@ -919,7 +964,15 @@ impl Gpu {
         let ptx = compile_ptx_with_opts(
             KERNELS,
             CompileOptions {
-                options: vec![format!("--gpu-architecture=compute_{major}{minor}")],
+                options: vec![
+                    format!("--gpu-architecture=compute_{major}{minor}"),
+                    format!("-DJ_ROWS={JROWS}"),
+                    format!("-DJ_W={JW}"),
+                    format!("-DJ_IN={JOIN_K}"),
+                    format!("-DJ_POOL={POOL}"),
+                    format!("-DJ_D={D}"),
+                    format!("-DJ_BLOCKS={JBLOCKS}"),
+                ],
                 // `cuda_fp16.h`, for the half-precision config readout.
                 include_paths: vec![
                     "/usr/local/cuda/include".into(),
@@ -966,11 +1019,27 @@ impl Card {
         let t = layout.norms[LN_TRUNK];
         plan.extend([t.g as i32, t.b as i32]);
         let owed = owed_by_the_join(&layout, &flat.b);
+        // `k_join` reads the join's weights and norms as one run each, so the
+        // fused kernel takes three slices rather than thirteen. `NetLayout`
+        // lays them down back to back; this is where that is a requirement and
+        // not a coincidence.
+        let mut at = layout.join_b.w + JOIN_IN * JW;
+        for span in layout.join_w {
+            assert_eq!(span.w, at, "the join's weights are not one run");
+            at += JW * JW;
+        }
+        assert_eq!(layout.join_out.w, at, "the join's weights are not one run");
+        for i in 0..=JBLOCKS {
+            let n = layout.norms[LN_JOIN + i];
+            assert_eq!(n.g, layout.norms[LN_JOIN].g + 2 * i * JW, "the join's norms are not one run");
+            assert_eq!(n.b, n.g + JW, "a join norm's shift does not follow its scale");
+        }
         Ok(Card {
             plan: stream.memcpy_stod(&plan).map_err(err)?,
             owed: stream.memcpy_stod(&owed).map_err(err)?,
             w: stream.memcpy_stod(&flat.w).map_err(err)?,
             wt: stream.memcpy_stod(&fragwise).map_err(err)?,
+            jw: stream.memcpy_stod(&join_pack(&layout, &flat.w)).map_err(err)?,
             b: stream.memcpy_stod(&flat.b).map_err(err)?,
             ln: stream.memcpy_stod(&flat.ln).map_err(err)?,
             nb: stream.memcpy_stod(&nb).map_err(err)?,
@@ -998,15 +1067,11 @@ impl Card {
         let b = &cfg.budget;
         let mut scratch = Scratch::default();
         let s = &self.stream;
-        // `w` is the round's belief weights, one per belief-index entry, so it
-        // is `cidx` a slot, not `cells`.
-        scratch.w = Arr::with_cap(s, n * b.cidx)?;
         scratch.mass = Arr::with_cap(s, 2 * n * b.rows)?;
         scratch.pooled = Arr::with_cap(s, 2 * TILE * POOL)?;
         scratch.h = Arr::with_cap(s, 2 * TILE * D)?;
-        scratch.z = Arr::with_cap(s, 2 * TILE * JW)?;
-        scratch.input = Arr::with_cap(s, 2 * TILE * JOIN_IN)?;
-        scratch.t = Arr::with_cap(s, 2 * TILE * JW)?;
+        scratch.z = Arr::with_cap(s, TILE * D)?;
+        scratch.input = Arr::with_cap(s, TILE * (2 * C + LOOSE))?;
         scratch.leaves = Arr::with_cap(s, n * cfg.s.max(1) as usize)?;
         scratch.piles = Arr::with_cap(s, TILE * NTYPE * PILE_COUNTS)?;
         scratch.tokens = Arr::with_cap(s, TILE * NTYPE * TYPE)?;
@@ -1144,57 +1209,19 @@ impl Card {
         self.bias(s, rows, out)
     }
 
-    /// `Norm::apply` when `act`, `Norm::plain` when not, from `src` into `dst`,
-    /// adding what the residual stream is owed as it reads. `owed` is an index
-    /// into `Card::owed`. The two buffers may be the same, which is what a norm
-    /// in place is.
-    fn norm_owed(
-        &self,
-        s: NormSpan,
-        rows: usize,
-        act: bool,
-        src: &CudaSlice<f32>,
-        dst: &mut CudaSlice<f32>,
-        owed: Option<usize>,
-    ) -> Res<()> {
-        if rows == 0 {
-            return Ok(());
-        }
-        let g = self.ln.slice(s.g..s.g + s.width);
-        let b = self.ln.slice(s.b..s.b + s.width);
-        let add = match owed {
-            Some(at) => self.owed.slice(at..at + s.width),
-            // A launch cannot take a null pointer through the builder, so a
-            // norm with nothing owed reads the first sum and is told to ignore
-            // it by `has`.
-            None => self.owed.slice(0..s.width.min(JW)),
-        };
-        let (rows_i, width, act) = (rows as i32, s.width as i32, act as i32);
-        let has = owed.is_some() as i32;
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.norm)
-                .arg(src).arg(dst).arg(&g).arg(&b).arg(&add).arg(&has)
-                .arg(&rows_i).arg(&width).arg(&act)
-                .launch_unit(warp_rows(rows))
-        }
-        .map_err(err)
-    }
-
-    /// The same, in place.
+    /// `Norm::apply` when `act`, `Norm::plain` when not, in place. The join's
+    /// own four norms are inside `k_join`; this serves everything else.
     fn norm(&self, s: NormSpan, rows: usize, act: bool, x: &mut CudaSlice<f32>) -> Res<()> {
         if rows == 0 {
             return Ok(());
         }
         let g = self.ln.slice(s.g..s.g + s.width);
         let b = self.ln.slice(s.b..s.b + s.width);
-        let add = self.owed.slice(0..s.width.min(JW));
         let (rows_i, width, act) = (rows as i32, s.width as i32, act as i32);
-        let has = 0i32;
         unsafe {
             self.stream
                 .launch_builder(&self.k.norm_ip)
-                .arg(x).arg(&g).arg(&b).arg(&add).arg(&has)
+                .arg(x).arg(&g).arg(&b)
                 .arg(&rows_i).arg(&width).arg(&act)
                 .launch_unit(warp_rows(rows))
         }
@@ -2242,10 +2269,8 @@ impl Card {
 
     /// The network at every leaf of the round, for both traversers at once.
     ///
-    /// Normalise the beliefs, pool them, run the join, read the values out into
-    /// each solve's own value arena. The beliefs and the pooling do not depend
-    /// on which seat is asking, so they run once; the join and the readout do,
-    /// and run over a batch of twice the rows rather than twice.
+    /// Pool the normalised beliefs, run the join, read the values out into each
+    /// solve's own value arena. Three launches a tile, one stage each.
     #[allow(clippy::too_many_arguments)]
     fn network(&self, b: &Batch, p: &Prefix) -> Res<()> {
         let (trees, part_d, local_d, base_d, coff_d) =
@@ -2261,42 +2286,27 @@ impl Card {
         let l = &self.layout;
         let (stride_i, pool_i, d_i) = (stride as i32, POOL as i32, D as i32);
 
-        // The beliefs are normalised once for the whole round: `w` is indexed
-        // by the round's own cell offsets and `mass` by its rows, so neither
-        // belongs to a tile.
-        sc.w.room(b.cells)?;
+        // `mass` is indexed by the round's rows, so it belongs to the round
+        // rather than to a tile; the reach mass of both seats of a leaf is
+        // written by the tile that leaf falls in, and read by the same tile's
+        // readout.
         sc.mass.room(2 * stride)?;
-        {
-            let Scratch { w, mass, .. } = &mut *sc;
-            let (w, mass) = (w.buf.as_mut().unwrap(), mass.buf.as_mut().unwrap());
-            self.stage(5, || {
-                unsafe {
-                    self.stream
-                        .launch_builder(&self.k.beliefs)
-                        .arg(trees).arg(part_d).arg(local_d).arg(coff_d)
-                        .arg(&mut *w).arg(&mut *mass).arg(&stride_i)
-                        .launch_unit(LaunchConfig {
-                            grid_dim: ((stride as u32).div_ceil(8).max(1), 2, 1),
-                            block_dim: (32, 8, 1),
-                            shared_mem_bytes: 0,
-                        })
-                }
-                .map_err(err)
-            })?;
-        }
 
-        // Everything after that is a tile of leaves at a time.
         let tile = TILE.min(stride);
         sc.pooled.room(2 * tile * POOL)?;
         sc.h.room(2 * tile * D)?;
-        sc.z.room(2 * tile * JW)?;
-        sc.input.room(2 * tile * JOIN_IN)?;
-        sc.t.room(2 * tile * JW)?;
-        let Scratch { w, mass, pooled, h, z, input, t, .. } = &mut *sc;
-        let (w, mass) = (w.buf.as_mut().unwrap(), mass.buf.as_mut().unwrap());
+        let Scratch { mass, pooled, h, .. } = &mut *sc;
+        let mass = mass.buf.as_mut().unwrap();
         let pooled = pooled.buf.as_mut().unwrap();
-        let (h, z) = (h.buf.as_mut().unwrap(), z.buf.as_mut().unwrap());
-        let (input, t) = (input.buf.as_mut().unwrap(), t.buf.as_mut().unwrap());
+        let h = h.buf.as_mut().unwrap();
+
+        // `k_join` walks the join's five packed matrices, its four norms and
+        // the biases they are owed as three runs rather than as thirteen
+        // slices. `NetLayout` hands the unpacked weights out in that order,
+        // which `Card::on` checks once so this does not have to.
+        let ln = l.norms[LN_JOIN];
+        let join_ln = self.ln.slice(ln.g..ln.g + 2 * (JBLOCKS + 1) * JW);
+        let join_owed = self.owed.slice(0..(JBLOCKS + 1) * JW);
 
         let mut q0 = 0usize;
         while q0 < stride {
@@ -2304,13 +2314,13 @@ impl Card {
             let (q0_i, n_i) = (q0 as i32, n as i32);
             let rows = 2 * n;
             let (rows_i, queries_i) = (rows as i32, rows as i32);
-            let jw_i = JW as i32;
             self.stage(5, || {
                 unsafe {
                     self.stream
                         .launch_builder(&self.k.belief_pool)
-                        .arg(trees).arg(part_d).arg(base_d).arg(coff_d).arg(&*w)
-                        .arg(&mut *pooled).arg(&(2 * q0_i)).arg(&queries_i).arg(&pool_i)
+                        .arg(trees).arg(part_d).arg(local_d).arg(base_d).arg(coff_d)
+                        .arg(&mut *pooled).arg(&mut *mass)
+                        .arg(&(2 * q0_i)).arg(&queries_i).arg(&stride_i).arg(&pool_i)
                         .launch_unit(LaunchConfig {
                             grid_dim: (rows as u32, 1, 1),
                             block_dim: (POOL as u32, 8, 1),
@@ -2320,37 +2330,20 @@ impl Card {
                 .map_err(err)
             })?;
 
-            // The join cache, gathered out of the solves straight into the
-            // buffer the residual chain accumulates onto.
             self.stage(6, || {
-                let one = 1i32;
                 unsafe {
                     self.stream
-                        .launch_builder(&self.k.gather)
-                        .arg(trees).arg(part_d).arg(local_d).arg(&one)
-                        .arg(&mut *z).arg(&rows_i).arg(&jw_i).arg(&q0_i).arg(&n_i)
-                        .launch_unit(rows_of(rows, JW))
+                        .launch_builder(&self.k.join)
+                        .arg(trees).arg(part_d).arg(local_d).arg(&*pooled)
+                        .arg(&self.jw).arg(&join_ln).arg(&join_owed)
+                        .arg(&mut *h).arg(&rows_i).arg(&n_i).arg(&q0_i)
+                        .launch_unit(LaunchConfig {
+                            grid_dim: ((rows as u32).div_ceil(JROWS as u32), 1, 1),
+                            block_dim: (32, (JW / 8) as u32, 1),
+                            shared_mem_bytes: 0,
+                        })
                 }
-                .map_err(err)?;
-                unsafe {
-                    self.stream
-                        .launch_builder(&self.k.join_input)
-                        .arg(&*pooled).arg(&mut *input).arg(&rows_i).arg(&pool_i).arg(&n_i)
-                        .launch_unit(rows_of(rows, POOL))
-                }
-                .map_err(err)?;
-                self.lin(l.join_b, &*input, rows, 1.0, &mut *z)?;
-                // A residual block is a norm and a multiply. The norm reads `z`,
-                // adds what the stream is owed and writes the scratch in one
-                // pass; the multiply accumulates straight back into `z`.
-                for i in 0..JBLOCKS {
-                    self.norm_owed(l.norms[LN_JOIN + i], rows, true, z, t, Some(i * JW))?;
-                    self.lin(l.join_w[i], &*t, rows, 1.0, &mut *z)?;
-                }
-                self.norm_owed(l.norms[LN_JOUT], rows, true, z, t, Some(JBLOCKS * JW))?;
-                // Nothing seeds `h`: the readout adds the board vector as it
-                // reads, so the multiply owns the buffer outright.
-                self.lin(l.join_out, &*t, rows, 0.0, &mut *h)
+                .map_err(err)
             })?;
 
             let bias = self.b.slice(l.value_bias..l.value_bias + 1);
@@ -2488,17 +2481,18 @@ struct Stage {
 /// read, so they are grown rather than cleared.
 #[derive(Default)]
 struct Scratch {
-    /// `[cells]` normalised beliefs, and `[2, rows]` reach mass per player.
-    w: Arr<f32>,
+    /// `[2, rows]` reach mass per player.
     mass: Arr<f32>,
     /// `[2 * rows, POOL]` the pooled belief block.
     pooled: Arr<f32>,
-    /// `[rows, D]` the head, `[rows, JW]` the residual stream, and the two
-    /// buffers the join's input and its per-block scratch need.
+    /// `[rows, D]` the head. The join's residual stream never reaches memory:
+    /// `k_join` holds it in registers from the board seed to this. Also the
+    /// trunk's board vectors and the config encoder's `f`.
     h: Arr<f32>,
+    /// Trunk join-cache / config `f_p`.
     z: Arr<f32>,
+    /// Trunk `board_out` input.
     input: Arr<f32>,
-    t: Arr<f32>,
     /// `[parts * sims]` the leaves an expansion phase sampled.
     leaves: Arr<u32>,
     /// TILE trunk (and the config / prior passes that reuse these).

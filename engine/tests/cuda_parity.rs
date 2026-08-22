@@ -305,6 +305,10 @@ fn the_cfr_loop_agrees_on_a_fixed_tree() {
         "the two backends solved a different number of positions"
     );
     let bad = worst_scaled(&host.cy, &card.cy, "targets");
+    let max_abs = host.cy.iter().zip(&card.cy).map(|(&x, &y)| (x - y).abs()).fold(0.0f32, f32::max);
+    let rms = (host.cy.iter().zip(&card.cy).map(|(&x, &y)| (x - y) * (x - y)).sum::<f32>()
+        / host.cy.len().max(1) as f32)
+        .sqrt();
     let rel = |x: f32, y: f32| (x - y).abs() / (x.abs().max(y.abs()).max(1e-2));
     let off = host.cy.iter().zip(&card.cy).filter(|(&x, &y)| rel(x, y) > 1e-3).count();
     let first = host.cy.iter().zip(&card.cy).position(|(&x, &y)| rel(x, y) > 1e-3);
@@ -318,7 +322,7 @@ fn the_cfr_loop_agrees_on_a_fixed_tree() {
     let pbad = worst(&host.pprob, &card.pprob, "policy");
     eprintln!("  worst policy difference {pbad:e} over {} cells", host.pprob.len());
     eprintln!(
-        "worst {bad:e}; {off} of {} targets differ; first few {:?} vs {:?}",
+        "worst {bad:e}; max abs {max_abs:e} RMS {rms:e}; {off} of {} targets differ; first few {:?} vs {:?}",
         host.cy.len(),
         &host.cy[..8.min(host.cy.len())],
         &card.cy[..8.min(card.cy.len())],
