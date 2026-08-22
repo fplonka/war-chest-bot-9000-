@@ -114,21 +114,6 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
         Ok(self.buf.as_mut().expect("a capacity implies a buffer"))
     }
 
-    /// Staging: grow to `want`. The round's remainder in `round_bytes` is this.
-    pub fn grow(&mut self, stream: &Arc<CudaStream>, want: usize) -> Res<&mut CudaSlice<T>> {
-        if self.cap < want {
-            let add = want.max(1) - self.cap;
-            self.cap = want.max(1);
-            self.buf = Some(unsafe { stream.alloc::<T>(self.cap) }.map_err(err)?);
-            HELD.fetch_add(
-                (add * std::mem::size_of::<T>()) as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
-        self.len = self.len.max(want);
-        Ok(self.buf.as_mut().expect("a capacity implies a buffer"))
-    }
-
     /// Rewind the length. The pages stay; the next solve overwrites them.
     pub fn rewind(&mut self) {
         self.len = 0;
