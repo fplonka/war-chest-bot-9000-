@@ -32,6 +32,7 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
     DriverError, LaunchArgs, LaunchConfig, PushKernelArg,
 };
+use cudarc::driver::sys::CUfunction_attribute_enum;
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 
 use crate::board::{board, N_HEXES, NONE};
@@ -265,31 +266,47 @@ pub struct Device {
     net: Net,
 }
 
-/// The trunk's two square matrices a block, permuted so that one lane's three
-/// channels of a weight row are four floats side by side.
+/// Round to the eleven significand bits a tensor core keeps, nearest-even.
 ///
-/// `k_trunk` reads `m[k * c + lane + 32 * q]` for `q` in nought to two. Stored
-/// as the net stores it that is three loads a row, and the inner product's
-/// twelve multiplies then cost seven loads -- which leaves the kernel issuing
-/// addresses rather than multiplying. Here the row is `TRUNK_LD` wide and a
-/// lane's channels are at `4 * lane + q`: one sixteen-byte load, still five
-/// hundred and twelve contiguous bytes across the warp. The fourth slot is
-/// what makes the address a multiple of sixteen; it is never read.
+/// The trunk multiplies in TF32, whose operands are single-precision numbers
+/// with the low thirteen mantissa bits clear. Rounding the weights here rather
+/// than letting the tensor core drop the bits is what keeps the error
+/// unbiased, and it costs nothing: it happens once, when the weights are
+/// uploaded. The activations are rounded the same way as `k_trunk` stores
+/// them.
+fn tf32(v: f32) -> f32 {
+    let u = v.to_bits();
+    f32::from_bits(u.wrapping_add(0x1000 + ((u >> 13) & 1)) & 0xFFFF_E000)
+}
+
+/// The trunk's two matrices a block, laid out in the order the tensor cores
+/// read them.
+///
+/// `k_trunk` multiplies with `mma.sync.m16n8k8`, which wants an eight by eight
+/// slab of the weight spread over a warp: lane `l` holds `w[k + l % 4][n +
+/// l / 4]` and the value four rows below it. Stored as the net stores it that
+/// is eight thirty-two-byte transactions a fragment. Here the fragment is
+/// written out lane by lane, so it is one eight-byte load a lane and two
+/// hundred and fifty-six contiguous bytes across the warp.
 ///
 /// Returns the buffer and where each matrix starts, mix then out, block by
 /// block.
-fn lanewise(l: &NetLayout, w: &[f32]) -> (Vec<f32>, Vec<usize>) {
+fn fragwise(l: &NetLayout, w: &[f32]) -> (Vec<f32>, Vec<usize>) {
     let mut out = Vec::new();
     let mut at = Vec::new();
     for blk in &l.blocks {
         for s in [blk.mix, blk.out] {
-            assert_eq!(s.o, C, "the trunk's matrices are square in the channels");
+            assert_eq!(s.o, C, "the trunk's matrices are the channel width across");
+            assert_eq!(s.i % 8, 0, "the trunk's matrices are whole fragments deep");
             at.push(out.len());
-            let base = out.len();
-            out.resize(base + s.i * TRUNK_LD, 0.0);
-            for k in 0..s.i {
-                for j in 0..s.o {
-                    out[base + k * TRUNK_LD + 4 * (j % 32) + j / 32] = w[s.w + k * s.o + j];
+            for kt in 0..s.i / 8 {
+                for nt in 0..C / 8 {
+                    for lane in 0..32 {
+                        let (g, t) = (lane / 4, lane % 4);
+                        let at = |k: usize| tf32(w[s.w + (8 * kt + k) * s.o + 8 * nt + g]);
+                        out.push(at(t));
+                        out.push(at(t + 4));
+                    }
                 }
             }
         }
@@ -297,9 +314,16 @@ fn lanewise(l: &NetLayout, w: &[f32]) -> (Vec<f32>, Vec<usize>) {
     (out, at)
 }
 
-/// A lanewise weight row, wide enough that a lane's four floats start on a
-/// sixteen-byte boundary.
-const TRUNK_LD: usize = 128;
+/// The board rounded up to whole sixteen-row `mma` tiles, and the shared row
+/// stride `k_trunk` holds it at. Both are `TRUNK_ROWS` and `TRUNK_LDS` there.
+const TRUNK_ROWS: usize = N_HEXES.next_multiple_of(16);
+const TRUNK_LDS: usize = C + 4;
+const _: () = assert!(C == 96 && TRUNK_ROWS == 48, "k_trunk says so with its own defines");
+
+/// What one block of `k_trunk` asks for: the residual stream, the operand the
+/// tensor cores read with its padding rows, the neighbour projections, and the
+/// pooled row with its bias.
+const TRUNK_SHARED: usize = (2 * N_HEXES + TRUNK_ROWS) * TRUNK_LDS * 4 + 3 * C * 4;
 
 /// The running sums of the join's biases, in the order its norms read them.
 /// See `Card::owed`, which is where they are kept and why.
@@ -1051,7 +1075,7 @@ impl Device {
         for card in &mut self.cards {
             card.stream.context().bind_to_thread().map_err(err)?;
             card.stream.memcpy_htod(&flat.w, &mut card.w).map_err(err)?;
-            let (lw, _) = lanewise(&card.layout, &flat.w);
+            let (lw, _) = fragwise(&card.layout, &flat.w);
             card.stream.memcpy_htod(&lw, &mut card.wt).map_err(err)?;
             card.stream.memcpy_htod(&flat.b, &mut card.b).map_err(err)?;
             card.stream.memcpy_htod(&flat.ln, &mut card.ln).map_err(err)?;
@@ -1172,6 +1196,14 @@ impl Card {
         };
         let module = ctx.load_module(ptx).map_err(err)?;
         let k = Kernels::load(&module)?;
+        // A block of `k_trunk` holds three boards and asks for more than the
+        // forty-eight kilobytes a kernel gets without saying so out loud.
+        k.trunk
+            .set_attribute(
+                CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                TRUNK_SHARED as i32,
+            )
+            .map_err(err)?;
         let blas = CudaBlas::new(stream.clone()).map_err(err)?;
         let flat = net.flat();
         let nb: Vec<i32> = board()
@@ -1181,7 +1213,7 @@ impl Card {
             .map(|&n| if n == NONE { -1 } else { n as i32 })
             .collect();
         let layout = NetLayout::new();
-        let (lanewise, lanes) = lanewise(&layout, &flat.w);
+        let (fragwise, lanes) = fragwise(&layout, &flat.w);
         let mut plan: Vec<i32> = Vec::new();
         for (i, blk) in layout.blocks.iter().enumerate() {
             let (n0, n1) = (layout.norms[ln_block(i, 0)], layout.norms[ln_block(i, 1)]);
@@ -1202,7 +1234,7 @@ impl Card {
             plan: stream.memcpy_stod(&plan).map_err(err)?,
             owed: stream.memcpy_stod(&owed).map_err(err)?,
             w: stream.memcpy_stod(&flat.w).map_err(err)?,
-            wt: stream.memcpy_stod(&lanewise).map_err(err)?,
+            wt: stream.memcpy_stod(&fragwise).map_err(err)?,
             b: stream.memcpy_stod(&flat.b).map_err(err)?,
             ln: stream.memcpy_stod(&flat.ln).map_err(err)?,
             nb: stream.memcpy_stod(&nb).map_err(err)?,
@@ -1513,16 +1545,16 @@ impl Card {
         let width = 2 * C + LOOSE;
         let mut input = self.alloc(rows * width)?;
         let (off, loose_i, blocks_i) = (OFF_LOOSE as i32, LOOSE as i32, BLOCKS as i32);
-        // A warp to a hex, twelve of them: `k_trunk` gives each lane `C / 32`
-        // channels, so a hex's row is exactly one warp wide and its LayerNorm
-        // is a shuffle rather than a barrier.
-        // `TRUNK_SPAN` and `TRUNK_MAXH` in the kernel; both are compile-time
-        // there because a runtime trip count puts the accumulators in local
-        // memory, which cost the kernel a factor of thirty.
-        const SLOTS: u32 = 12;
+        // One warp to each eight-channel output tile of the multiply, twelve
+        // of them; read the other way round that is a warp to a hex and `C /
+        // 32` channels to a lane, so a hex's row is exactly one warp wide and
+        // its LayerNorm is a shuffle rather than a barrier. Every shape the
+        // kernel uses is compile-time there, because a runtime trip count puts
+        // the accumulators in local memory and a matrix multiply whose
+        // accumulator lives in memory runs at a few per cent of the card.
+        const SLOTS: u32 = (C / 8) as u32;
         assert_eq!(C % 32, 0, "k_trunk wants a whole number of warps a row");
-        assert_eq!(N_HEXES.div_ceil(SLOTS as usize), 4, "k_trunk holds four hexes a thread");
-        let shared = (3 * N_HEXES * C + 3 * C) * 4;
+        assert_eq!(TRUNK_ROWS / SLOTS as usize, 4, "k_trunk holds four hexes a thread");
         unsafe {
             self.stream
                 .launch_builder(&self.k.trunk)
@@ -1534,7 +1566,7 @@ impl Card {
                 .launch_unit(LaunchConfig {
                     grid_dim: (rows as u32, 1, 1),
                     block_dim: (32, SLOTS, 1),
-                    shared_mem_bytes: shared as u32,
+                    shared_mem_bytes: TRUNK_SHARED as u32,
                 })
         }
         .map_err(err)?;

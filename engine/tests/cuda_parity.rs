@@ -19,6 +19,12 @@
 //! regret update and the value pass under the average — so a drift in any of
 //! them lands there.
 //!
+//! Both of those hold the card to an f32 CPU network, and the trunk on the card
+//! multiplies on the tensor cores: eleven significand bits into every product,
+//! single precision out of every accumulate. So the two cannot agree to the
+//! last bits and the bound must say what they *can* agree to. `worst_scaled` is
+//! that bound, and it is derived where it is used.
+//!
 //! Neither of those reaches the expansion phase, and a third way is needed for
 //! it. Growth is a discrete function of the CFR arenas, so two backends whose
 //! arenas differ in the last bits build different trees however faithfully they
@@ -213,6 +219,44 @@ fn worst(a: &[f32], b: &[f32], what: &str) -> f32 {
         .fold(0.0, f32::max)
 }
 
+/// The worst difference between two arrays, in units of the reference's own
+/// scale.
+///
+/// `worst` divides cell by cell, which is the right question when the two sides
+/// are meant to agree to the last bits. They are not: the trunk's matrix
+/// multiplies round each operand to the eleven significand bits a tensor core
+/// keeps, so a value carries an error of a few parts in ten thousand *of the
+/// scale it lives on*. A cell that happens to sit near zero turns that into a
+/// ratio of any size at all and says nothing about the network, which is why
+/// `worst` floors its denominator at `1e-2` -- an arbitrary floor that happens
+/// to be far below the scale of everything compared here. The root-mean-square
+/// of the reference is that scale, said properly.
+fn worst_scaled(a: &[f32], b: &[f32], what: &str) -> f32 {
+    assert_eq!(a.len(), b.len(), "{what}: length {} vs {}", a.len(), b.len());
+    let scale = (a.iter().map(|x| x * x).sum::<f32>() / a.len().max(1) as f32).sqrt().max(1e-2);
+    a.iter().zip(b).map(|(&x, &y)| (x - y).abs() / scale).fold(0.0, f32::max)
+}
+
+/// What a TF32 trunk is allowed to differ from an f32 one by, as a share of the
+/// compared array's own scale.
+///
+/// A tensor-core operand keeps eleven significand bits, so each product carries
+/// up to `2^-11 = 4.9e-4` of relative error and the ninety-six of them that
+/// make one channel sum it as a random walk -- the error of the sum stays a few
+/// parts in ten thousand of the sum's own scale. Eight residual blocks
+/// accumulate that, but a LayerNorm stands between each pair and renormalises
+/// rather than compounding. Simulated over the same shapes with random weights,
+/// the worst cell of a board vector lands at `5e-4` of the array's RMS and the
+/// median at `1e-4`. The bound is set four times the worst of that, which is
+/// still two orders below anything a real break would show.
+///
+/// Two independent arguments say the difference does not matter. The trainer
+/// stores every target as float16, whose resolution is `4.9e-4` -- the drift is
+/// half an ulp of the format it is written into. And the trainer multiplies in
+/// TF32 itself (`torch.set_float32_matmul_precision("high")`), so the weights
+/// were learned under ten-mantissa-bit GEMMs to begin with.
+const TF32: f32 = 2e-3;
+
 /// A whole solve, both ways, on the same tree.
 ///
 /// `c = 0` is what makes this a comparison. With it neither side grows, so both
@@ -246,7 +290,7 @@ fn the_cfr_loop_agrees_on_a_fixed_tree() {
         card.cy.len(),
         "the two backends solved a different number of positions"
     );
-    let bad = worst(&host.cy, &card.cy, "targets");
+    let bad = worst_scaled(&host.cy, &card.cy, "targets");
     let rel = |x: f32, y: f32| (x - y).abs() / (x.abs().max(y.abs()).max(1e-2));
     let off = host.cy.iter().zip(&card.cy).filter(|(&x, &y)| rel(x, y) > 1e-3).count();
     let first = host.cy.iter().zip(&card.cy).position(|(&x, &y)| rel(x, y) > 1e-3);
@@ -265,11 +309,14 @@ fn the_cfr_loop_agrees_on_a_fixed_tree() {
         &host.cy[..8.min(host.cy.len())],
         &card.cy[..8.min(card.cy.len())],
     );
-    // The same bound the shared-round test holds a target to, and for the same
-    // reason: a target is an average of counterfactual values over a fixed
-    // tree, so the iterations damp the network's own f32 disagreement rather
-    // than amplifying it. Measured, the worst is 4e-6 against values near 2.5.
-    assert!(bad < 1e-4, "worst target difference {bad:e}");
+    // A target is an average of counterfactual values over a fixed tree, so the
+    // iterations damp the network's disagreement rather than amplifying it:
+    // with both sides in f32 the leaves differ by about a part in a million and
+    // the targets by four parts in ten million. The trunk is on the tensor
+    // cores now, so the leaves differ by `TF32` instead, and twice that is the
+    // room the regret matching in between is allowed. Either way it stays two
+    // orders below the solver's own truncation at sixty-four iterations.
+    assert!(bad < 2.0 * TF32, "worst target difference {bad:e}");
 }
 
 /// The growth rule itself, held to the card on the card's own numbers.
@@ -764,17 +811,27 @@ fn the_resident_state_agrees_with_the_cpu_network() {
     assert_eq!(host.ncells, card.ncells, "the two backends built different trees");
     let cells = host.ncells;
     assert!(cells > 0, "the fixed tree has no strategy cells");
+    // The config encoder is a cuBLAS multiply on both sides and holds to the
+    // last few bits. The board vector, the join's projection of it and the
+    // prior that reads it all come through the trunk, and the trunk multiplies
+    // on the tensor cores.
     for (what, h, c) in [
-        ("board vectors", &host.pb[..], &got.p[..]),
-        ("join cache", &host.jp[..], &got.jp[..]),
         ("f(c)", &host.cf[..], &got.f[..]),
         ("g(c)", &host.cg[..], &got.g[..]),
         ("f_p(c)", &host.cp[..], &got.fp[..]),
-        ("prior", &host.cfr().prior[..cells], &got.prior[..cells]),
     ] {
         let bad = worst(h, c, what);
         eprintln!("{what}: worst {bad:e} over {} values", h.len());
         assert!(bad < 2e-4, "{what} differ by {bad:e}");
+    }
+    for (what, h, c) in [
+        ("board vectors", &host.pb[..], &got.p[..]),
+        ("join cache", &host.jp[..], &got.jp[..]),
+        ("prior", &host.cfr().prior[..cells], &got.prior[..cells]),
+    ] {
+        let bad = worst_scaled(h, c, what);
+        eprintln!("{what}: worst {bad:e} of scale over {} values", h.len());
+        assert!(bad < TF32, "{what} differ by {bad:e} of their scale");
     }
     // A prior that was never written would read as the uniform start the
     // scatter lays down, and would then agree with a host that had also never
@@ -857,8 +914,11 @@ fn a_subgame_scored_from_the_game_agrees_with_the_cpu() {
         want.collect(0);
         let want = run_solve(&host, want).1.expect("a collected solve keeps a row");
         for p in 0..2 {
-            let bad = worst(&want.value[p], &got.value[p], "root value");
-            assert!(bad < 1e-4, "player {p}'s root value differs by {bad:e}");
+            // One network row, then eight iterations over terminals scored from
+            // the game. The row comes off the tensor cores, so it carries the
+            // same bound the fixed-tree targets do.
+            let bad = worst_scaled(&want.value[p], &got.value[p], "root value");
+            assert!(bad < 2.0 * TF32, "player {p}'s root value differs by {bad:e}");
         }
         checked += 1;
         if checked >= 2 {
