@@ -97,6 +97,53 @@ fn solve(
     (root_target(&mut sv), sv.root_policy(), sv.shape().nodes)
 }
 
+/// One budget over the corpus: what its tree cost, how far its target and its
+/// root policy sit from the reference, and how well it solved its own tree.
+struct Row {
+    nodes: f64,
+    ncfg: f64,
+    dv: f64,
+    tv: f64,
+    nash: f64,
+    zs: f64,
+}
+
+/// Run one budget on every root and average the five numbers.
+fn sweep(
+    positions: &[(warchest::state::State, [warchest::pbs::Belief; 2])],
+    nets: &std::sync::Arc<Nets>,
+    refs: &[([f32; 2], Policy)],
+    cfg: Cfg,
+) -> Row {
+    let acc = positions
+        .par_iter()
+        .enumerate()
+        .map(|(i, (st, bel))| {
+            let (r, rp) = &refs[i];
+            let ctx = warchest::pbs::Ctx::new(st);
+            let mut sv = Solver::new(st, ctx, std::sync::Arc::clone(nets), cfg, bel.clone(), Rng::new(0x51D5 ^ i as u64));
+            sv.run_alone();
+            let t = root_target(&mut sv);
+            let p = sv.root_policy();
+            let gap = policy_gap(&p, rp);
+            let c = sv.nash_conv();
+            let sh = sv.shape();
+            [
+                sh.nodes as f64,
+                sh.ncfg as f64,
+                ((t[0] - r[0]).abs() + (t[1] - r[1]).abs()) as f64 / 2.0,
+                gap.unwrap_or(0.0),
+                gap.is_some() as u8 as f64,
+                c.nash as f64,
+                c.zero_sum as f64,
+                1.0,
+            ]
+        })
+        .reduce(|| [0.0f64; 8], |a, b| std::array::from_fn(|k| a[k] + b[k]));
+    let (n, tvk) = (acc[7].max(1.0), acc[4].max(1.0));
+    Row { nodes: acc[0] / n, ncfg: acc[1] / n, dv: acc[2] / n, tv: acc[3] / tvk, nash: acc[5] / n, zs: acc[6] / n }
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let weights = a.get(1).cloned().unwrap_or_else(|| "weights.bin".into());
@@ -173,9 +220,14 @@ fn main() {
     }
 
     // ---- does a cheaper budget move the value target?
+    // Two axes, crossing at the production budget. `c` at fixed `s` buys
+    // regret updates and nothing else -- the tree is the same 512 expansions
+    // whatever `c` is -- so that column is the price of solving one tree less
+    // well. `s` at fixed `c` is the other axis, and there the reference tree
+    // is the smaller one, so read `nash_conv` rather than `|dv|`.
     let budgets: Vec<(u32, f32)> = vec![
-        (512, 8.0), (512, 4.0), (256, 4.0), (256, 2.0), (256, 1.0),
-        (128, 2.0), (128, 1.0), (64, 1.0), (32, 1.0),
+        (512, 2.0), (512, 4.0), (512, 8.0), (512, 16.0), (512, 32.0),
+        (256, 8.0), (1024, 8.0),
     ];
     // The reference: the same tree the production budget builds, solved far
     // past where its own exploitability stops moving. It is not ground truth --
@@ -195,31 +247,23 @@ fn main() {
         .collect();
 
     println!("\nroot value target against a converged SoG(512,2) reference:");
-    println!("{:>12} {:>10} {:>12} {:>12}", "SoG(s,c)", "iters", "|dv| mean", "|v0+v1|");
+    println!(
+        "{:>12} {:>7} {:>8} {:>7} {:>10} {:>10} {:>10} {:>10}",
+        "SoG(s,c)", "iters", "nodes", "ncfg", "|dv| mean", "policy tv", "nash_conv", "|v0+v1|"
+    );
     for &(s, c) in &budgets {
-        let (err, zs, k) = positions
-            .par_iter()
-            .enumerate()
-            .map(|(i, (st, bel))| {
-                let r = refs[i].0;
-                let ctx = warchest::pbs::Ctx::new(st);
-                let mut sv = Solver::new(st, ctx, std::sync::Arc::clone(&nets), cfg_of(s, c), bel.clone(), Rng::new(0x51D5 ^ i as u64));
-                sv.run_alone();
-                let t = root_target(&mut sv);
-                (
-                    ((t[0] - r[0]).abs() + (t[1] - r[1]).abs()) as f64 / 2.0,
-                    (t[0] + t[1]).abs() as f64,
-                    1.0,
-                )
-            })
-            .reduce(|| (0.0f64, 0.0f64, 0.0f64), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
-        let k = k.max(1.0);
+        let cfg = cfg_of(s, c);
+        let r = sweep(&positions, &nets, &refs, cfg);
         println!(
-            "{:>12} {:>10} {:>12.5} {:>12.5}",
+            "{:>12} {:>7} {:>8.0} {:>7.0} {:>10.5} {:>10.5} {:>10.5} {:>10.5}",
             format!("({s},{c})"),
-            cfg_of(s, c).iters(),
-            err / k,
-            zs / k
+            cfg.iters(),
+            r.nodes,
+            r.ncfg,
+            r.dv,
+            r.tv,
+            r.nash,
+            r.zs.abs()
         );
     }
 

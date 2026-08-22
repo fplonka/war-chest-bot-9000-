@@ -115,14 +115,16 @@ fn main() {
     // `s` total expansions and `c` per regret update, the paper's axes.
     // Student of Games trains chess and Go at (400, 1) and poker at (10, 0.01);
     // this engine's default is (512, 8).
+    //
+    // The production budget leads, because every other row is priced against it.
     let budgets: Vec<(u32, f32)> = vec![
         (512, 8.0),
+        (512, 2.0),
         (512, 4.0),
-        (512, 1.0),
-        (256, 2.0),
-        (256, 1.0),
-        (128, 1.0),
-        (64, 1.0),
+        (512, 16.0),
+        (512, 32.0),
+        (256, 8.0),
+        (1024, 8.0),
     ];
 
     println!(
