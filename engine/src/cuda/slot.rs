@@ -47,7 +47,20 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
         );
         Ok(Arr { buf: Some(buf), cap, len: 0 })
     }
+}
 
+impl<T> Drop for Arr<T> {
+    fn drop(&mut self) {
+        if self.buf.is_some() {
+            HELD.fetch_sub(
+                (self.cap * std::mem::size_of::<T>()) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+}
+
+impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> Arr<T> {
     pub fn fit(&mut self, want: usize) -> Res<()> {
         if want > self.cap {
             return Err(format!("solve grew past its slot: {want} > {}", self.cap));
@@ -104,8 +117,13 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
     /// Staging: grow to `want`. The round's remainder in `round_bytes` is this.
     pub fn grow(&mut self, stream: &Arc<CudaStream>, want: usize) -> Res<&mut CudaSlice<T>> {
         if self.cap < want {
+            let add = want.max(1) - self.cap;
             self.cap = want.max(1);
             self.buf = Some(unsafe { stream.alloc::<T>(self.cap) }.map_err(err)?);
+            HELD.fetch_add(
+                (add * std::mem::size_of::<T>()) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         self.len = self.len.max(want);
         Ok(self.buf.as_mut().expect("a capacity implies a buffer"))

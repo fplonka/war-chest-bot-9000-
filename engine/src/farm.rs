@@ -396,6 +396,22 @@ impl Backend {
         }
     }
 
+    pub fn slot_bytes(&self) -> usize {
+        match self {
+            Backend::Reference(_) => 0,
+            #[cfg(feature = "gpu")]
+            Backend::Cuda(d) => d.slot_bytes(),
+        }
+    }
+
+    pub fn slots_per_card(&self) -> usize {
+        match self {
+            Backend::Reference(_) => 0,
+            #[cfg(feature = "gpu")]
+            Backend::Cuda(d) => d.slots_per_card(),
+        }
+    }
+
     /// Whether this backend runs the CFR loop itself rather than answering
     /// network calls alone.
     pub fn keeps_the_solve(&self) -> bool {
@@ -434,11 +450,11 @@ impl Backend {
 
 /// Host-side slots that fit in the memory the process does not already hold.
 ///
-/// A slot is `Budget::host_bytes`. The farm never admits more than this, and
+/// A slot is `Budget::host_slot_bytes`. The farm never admits more than this, and
 /// the card never carves more than this, so host OOM is not a thing that can
 /// happen at admission.
 pub fn host_slots(budget: Budget) -> usize {
-    let slot = budget.host_bytes() as u64;
+    let slot = budget.host_slot_bytes() as u64;
     (host_free() / slot.max(1)) as usize
 }
 
@@ -652,11 +668,18 @@ pub struct Stats {
     /// Solves that hit the budget. A slot is a percentile; this is the rate
     /// that argues with it.
     budget_hits: AtomicU64,
+    slot_bytes: AtomicU64,
+    slots_per_card: AtomicU64,
 }
 
 impl Stats {
-    fn new(slots: usize) -> Stats {
-        Stats { slots: AtomicU64::new(slots as u64), ..Default::default() }
+    fn new(slots: usize, slot_bytes: usize, slots_per_card: usize) -> Stats {
+        Stats {
+            slots: AtomicU64::new(slots as u64),
+            slot_bytes: AtomicU64::new(slot_bytes as u64),
+            slots_per_card: AtomicU64::new(slots_per_card as u64),
+            ..Default::default()
+        }
     }
 
     pub fn slots(&self) -> u64 {
@@ -669,6 +692,14 @@ impl Stats {
 
     pub fn budget_hits(&self) -> u64 {
         self.budget_hits.load(Ordering::Relaxed)
+    }
+
+    pub fn slot_bytes(&self) -> u64 {
+        self.slot_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn slots_per_card(&self) -> u64 {
+        self.slots_per_card.load(Ordering::Relaxed)
     }
 }
 
@@ -684,6 +715,8 @@ impl Farm {
             .map(|c| if cuda { backend.slots(c) } else { workers })
             .collect();
         let n_slots: usize = per_card.iter().sum();
+        let slot_bytes = backend.slot_bytes();
+        let slots_per_card = backend.slots_per_card();
         let work = Arc::new(work);
         let nets = Arc::new(RwLock::new(Arc::new(crate::search::Nets {
             value: backend.net().clone(),
@@ -695,7 +728,7 @@ impl Farm {
         let collected = Arc::new(Mutex::new(Vec::new()));
         let stopping = Arc::new(AtomicBool::new(false));
         let broken = Arc::new(AtomicBool::new(false));
-        let stats = Arc::new(Stats::new(n_slots));
+        let stats = Arc::new(Stats::new(n_slots, slot_bytes, slots_per_card));
         let backend = Arc::new(RwLock::new(backend));
 
         let hands: Vec<JoinHandle<()>> = (0..workers)

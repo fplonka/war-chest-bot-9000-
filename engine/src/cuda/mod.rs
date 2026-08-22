@@ -266,6 +266,7 @@ pub struct Device {
     /// found waiting goes in together.
     cards: Vec<Card>,
     net: Net,
+    slot_bytes: usize,
 }
 
 /// The trunk's two square matrices a block, permuted so that one lane's three
@@ -617,7 +618,8 @@ impl Device {
             .map(|(o, k)| Card::new(o, &net, k > 0))
             .collect::<Res<Vec<_>>>()?;
         let budget = cfg.budget;
-        let slot = budget.device_bytes() as u64;
+        cards[0].stream.context().bind_to_thread().map_err(err)?;
+        let slot = Solve::at_budget(&cards[0].stream, &budget)?.bytes() as u64;
         let mut left = max_slots;
         for o in 0..ordinals.len() {
             let span = &mut cards[o * STREAMS..(o + 1) * STREAMS];
@@ -644,7 +646,7 @@ impl Device {
                 card.carve(m, &cfg)?;
             }
         }
-        Ok(Device { cards, net })
+        Ok(Device { cards, net, slot_bytes: slot as usize })
     }
 
     /// How many cards a round can be spread over.
@@ -660,6 +662,21 @@ impl Device {
     /// Slots across every stream.
     pub fn total_slots(&self) -> usize {
         (0..self.cards.len()).map(|c| self.slots(c)).sum()
+    }
+
+    /// Bytes one solve slot holds, summed from the arrays allocated at the budget.
+    pub fn slot_bytes(&self) -> usize {
+        self.slot_bytes
+    }
+
+    /// Slots one physical card holds, all of its streams together.
+    pub fn slots_per_card(&self) -> usize {
+        let n = self.cards.len() / STREAMS;
+        if n == 0 {
+            0
+        } else {
+            self.total_slots() / n
+        }
     }
 
     /// How many cards the driver can see.
