@@ -425,6 +425,30 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy> Hos
         }
         self.sent.as_ref().expect("just made").record(stream).map_err(err)
     }
+
+    /// Receive `src` into this buffer. The copy is DMA into pinned memory, so
+    /// the driver does not stage it; we wait once, after it is queued.
+    fn recv<Src: DevicePtr<T>>(&mut self, stream: &Arc<CudaStream>, src: &Src) -> Res<Vec<T>> {
+        let n = src.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        if let Some(e) = &self.sent {
+            e.synchronize().map_err(err)?;
+        }
+        if self.buf.as_ref().is_none_or(|b| b.len() < n) {
+            self.buf = Some(unsafe { stream.context().alloc_pinned::<T>(n.max(1)) }.map_err(err)?);
+        }
+        let buf = self.buf.as_mut().expect("just fitted");
+        stream.memcpy_dtoh(src, buf).map_err(err)?;
+        if self.sent.is_none() {
+            self.sent = Some(stream.context().new_event(None).map_err(err)?);
+        }
+        self.sent.as_ref().expect("just made").record(stream).map_err(err)?;
+        self.sent.as_ref().expect("just made").synchronize().map_err(err)?;
+        self.len = n;
+        Ok(self.buf.as_ref().expect("just fitted").as_slice().map_err(err)?[..n].to_vec())
+    }
 }
 
 /// One host buffer and the device buffer it is sent to, kept together and kept
@@ -599,6 +623,9 @@ struct Card {
     host: parking_lot::Mutex<Stage>,
     /// A round's writes, kept between rounds for the same reason.
     pack: parking_lot::Mutex<Pack>,
+    /// Pinned landing pads for the downloads that end a round.
+    down: parking_lot::Mutex<Host<u32>>,
+    down_f: parking_lot::Mutex<Host<f32>>,
     /// The batch index `lay` fills, carved once.
     batch: parking_lot::Mutex<Batch>,
     /// Scratch for one pass, kept between rounds.
@@ -818,18 +845,19 @@ impl Device {
         c.stream.context().bind_to_thread().map_err(err)?;
         let g = c.solves.lock();
         let s = g.get(solve).ok_or_else(|| format!("solve {solve} is not resident"))?;
+        let mut h = c.down_f.lock();
         Ok(Resident {
-            p: s.get_f32(&c.stream, Ent::Board, B_P, 0, s.ent[Ent::Board as usize].len() * D)?,
-            jp: s.get_f32(&c.stream, Ent::Board, B_JP, 0, s.ent[Ent::Board as usize].len() * JW)?,
-            f: s.get_f32(&c.stream, Ent::Config, G_F, 0, s.ent[Ent::Config as usize].len() * D)?,
-            g: s.get_f32(&c.stream, Ent::Config, G_G, 0, s.ent[Ent::Config as usize].len() * POOL)?,
-            fp: s.get_f32(&c.stream, Ent::Config, G_FP, 0, s.ent[Ent::Config as usize].len() * D)?,
-            prior: s.get_f32(&c.stream, Ent::Cell, C_PRIOR, 0, s.ent[Ent::Cell as usize].len())?,
-            cur: s.get_f32(&c.stream, Ent::Cell, C_CUR, 0, s.ncells)?,
-            sum: s.get_f32(&c.stream, Ent::Cell, C_SUM, 0, s.ncells)?,
-            qval: s.get_f32(&c.stream, Ent::Cell, C_QVAL, 0, s.ncells)?,
-            visits: s.get_f32(&c.stream, Ent::Cell, C_VISITS, 0, s.ncells)?,
-            reach: s.get_f32(&c.stream, Ent::Reach, R_REACH, 0, s.nreach)?,
+            p: s.get_f32(&c.stream, Ent::Board, B_P, 0, s.ent[Ent::Board as usize].len() * D, &mut h)?,
+            jp: s.get_f32(&c.stream, Ent::Board, B_JP, 0, s.ent[Ent::Board as usize].len() * JW, &mut h)?,
+            f: s.get_f32(&c.stream, Ent::Config, G_F, 0, s.ent[Ent::Config as usize].len() * D, &mut h)?,
+            g: s.get_f32(&c.stream, Ent::Config, G_G, 0, s.ent[Ent::Config as usize].len() * POOL, &mut h)?,
+            fp: s.get_f32(&c.stream, Ent::Config, G_FP, 0, s.ent[Ent::Config as usize].len() * D, &mut h)?,
+            prior: s.get_f32(&c.stream, Ent::Cell, C_PRIOR, 0, s.ent[Ent::Cell as usize].len(), &mut h)?,
+            cur: s.get_f32(&c.stream, Ent::Cell, C_CUR, 0, s.ncells, &mut h)?,
+            sum: s.get_f32(&c.stream, Ent::Cell, C_SUM, 0, s.ncells, &mut h)?,
+            qval: s.get_f32(&c.stream, Ent::Cell, C_QVAL, 0, s.ncells, &mut h)?,
+            visits: s.get_f32(&c.stream, Ent::Cell, C_VISITS, 0, s.ncells, &mut h)?,
+            reach: s.get_f32(&c.stream, Ent::Reach, R_REACH, 0, s.nreach, &mut h)?,
         })
     }
 }
@@ -926,6 +954,8 @@ impl Card {
             solves: Arc::new(parking_lot::Mutex::new(Vec::new())),
             host: parking_lot::Mutex::new(Stage::default()),
             pack: parking_lot::Mutex::new(Pack::default()),
+            down: parking_lot::Mutex::new(Host::default()),
+            down_f: parking_lot::Mutex::new(Host::default()),
             batch: parking_lot::Mutex::new(Batch::default()),
             scratch: parking_lot::Mutex::new(Scratch::default()),
             layout,
@@ -2074,6 +2104,7 @@ impl Card {
         }
 
         let g = self.solves.lock();
+        let mut h = self.down_f.lock();
         for &i in mine {
             let Call::Read { solve, vals_at, policy_at, reach_at, .. } = &calls[i] else {
                 unreachable!("read shard holds only read calls")
@@ -2081,7 +2112,7 @@ impl Card {
             let s = &g[*solve];
             let mut root = Vec::new();
             for &(at, n) in vals_at {
-                root.extend(s.get_f32(&self.stream, Ent::Reach, R_VALS, at as usize, n as usize)?);
+                root.extend(s.get_f32(&self.stream, Ent::Reach, R_VALS, at as usize, n as usize, &mut h)?);
             }
             let policy = s.get_f32(
                 &self.stream,
@@ -2089,10 +2120,11 @@ impl Card {
                 C_SUM,
                 policy_at.0 as usize,
                 policy_at.1 as usize,
+                &mut h,
             )?;
             let mut beliefs = Vec::new();
             for &(at, n) in reach_at {
-                beliefs.extend(s.get_f32(&self.stream, Ent::Reach, R_REACH, at as usize, n as usize)?);
+                beliefs.extend(s.get_f32(&self.stream, Ent::Reach, R_REACH, at as usize, n as usize, &mut h)?);
             }
             out.push((i, Reply { a: root, b: policy, c: beliefs, ..Default::default() }));
         }
@@ -2379,7 +2411,7 @@ impl Card {
         }
         let mut sc = self.scratch.lock();
         let out = sc.leaves.room(&self.stream, n)?;
-        self.stream.memcpy_dtov(&out.slice(0..n)).map_err(err)
+        self.down.lock().recv(&self.stream, &out.slice(0..n))
     }
 
     /// The reference strategy, once the tree has stopped growing.

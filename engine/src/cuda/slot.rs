@@ -12,7 +12,7 @@ use crate::farm::Dst;
 use crate::net::{D, JW, POOL};
 use crate::search::{Budget, Ent};
 
-use super::{err, Res, HELD};
+use super::{err, Host, Res, HELD};
 
 /// Fields of `struct Tree` in `kernels.cu`, in order. Every one is eight bytes
 /// wide, so the descriptor is positional and needs no packing rules.
@@ -244,7 +244,14 @@ impl Entity {
         stream.memcpy_dtod(&src.slice(from..from + n), &mut fview).map_err(err)
     }
 
-    fn get_f32(&self, stream: &Arc<CudaStream>, field: usize, at: usize, n: usize) -> Res<Vec<f32>> {
+    fn get_f32(
+        &self,
+        stream: &Arc<CudaStream>,
+        field: usize,
+        at: usize,
+        n: usize,
+        host: &mut Host<f32>,
+    ) -> Res<Vec<f32>> {
         if n == 0 {
             return Ok(Vec::new());
         }
@@ -252,7 +259,7 @@ impl Entity {
         let buf = self.buf.as_ref().ok_or("reading an arena that was never written")?;
         let view = buf.slice(off..off + n);
         let fview = unsafe { view.transmute::<f32>(n).expect("u32 and f32 are four bytes") };
-        stream.memcpy_dtov(&fview).map_err(err)
+        host.recv(stream, &fview)
     }
 }
 
@@ -412,8 +419,9 @@ impl Solve {
         field: usize,
         at: usize,
         n: usize,
+        host: &mut Host<f32>,
     ) -> Res<Vec<f32>> {
-        self.ent[e as usize].get_f32(s, field, at, n)
+        self.ent[e as usize].get_f32(s, field, at, n, host)
     }
 
     pub fn describe(&self, s: &Arc<CudaStream>) -> [u64; DESC] {
