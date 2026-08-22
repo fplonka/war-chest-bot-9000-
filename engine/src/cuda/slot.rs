@@ -397,7 +397,7 @@ impl Solve {
 
     pub fn view(&mut self, s: &Arc<CudaStream>, e: Ent, field: usize, at: usize, n: usize, width: usize) -> Res<u64> {
         self.reserve(e, (at + n).div_ceil(width.max(1)))?;
-        Ok(self.ent[e as usize].field(field, s) + (at * 4) as u64)
+        Ok(self.ent[e as usize].field(field, s))
     }
 
     pub fn plan(&mut self, s: &Arc<CudaStream>, d: Dst, at: usize, n: usize) -> Res<u64> {

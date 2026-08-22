@@ -1340,7 +1340,7 @@ impl Card {
             let b = self.slot(&mut g, *solve);
             b.reserve(Ent::Row, row0 + nrows)?;
             let words = pack.words(board_of);
-            let dst = b.ent[Ent::Row as usize].field(Y_BOARD_OF, &self.stream) + (*row0 * 4) as u64;
+            let dst = b.ent[Ent::Row as usize].field(Y_BOARD_OF, &self.stream);
             pack.piece(dst, *row0 as u32, words, nrows as u32);
             // `coff` arrives relative to this call's own `cidx`, so it is
             // shifted onto the resident index before it is stored. Row zero
@@ -1353,7 +1353,7 @@ impl Card {
             let dst = b.view(&self.stream, Ent::Cidx, 0, b.cells, cidx.len(), 1)?;
             pack.piece(dst, b.cells as u32, words, cidx.len() as u32);
             let words = pack.words(&shifted);
-            let dst = b.ent[Ent::Row as usize].field(Y_COFF, &self.stream) + (2 * row0 * 4) as u64;
+            let dst = b.ent[Ent::Row as usize].field(Y_COFF, &self.stream);
             pack.piece(dst, 2 * *row0 as u32, words, shifted.len() as u32);
             b.cells += cidx.len();
             b.rows = row0 + nrows;
