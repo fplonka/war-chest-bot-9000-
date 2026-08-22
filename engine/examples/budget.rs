@@ -1,7 +1,7 @@
 //! What a search budget costs, in the units the cards charge for.
 //!
-//! `SoG(s, c)` is the paper's notation: `s` total expansion simulations at `c`
-//! per regret update, so the solve runs `ceil(s / c)` regret updates.
+//! `SoG(s, c)` is the paper's notation: `s` total expansions at `c` per regret
+//! update, so the solve runs `ceil(s / c)` regret updates.
 //!
 //! The device's kernel table is a handful of terms in a solve's shape:
 //!

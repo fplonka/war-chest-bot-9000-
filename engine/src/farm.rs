@@ -131,10 +131,12 @@ pub enum Call {
         /// them per solve rather than taking one set for the batch.
         step: usize,
         iters: usize,
-        /// Expansion simulations after *each* of those iterations, so the
-        /// call comes back with `iters * expand` sampled leaves. Zero once the
-        /// tree has spent its node budget, and then the round samples nothing
-        /// and the host is only woken to end the solve.
+        /// Distinct leaves to take after *each* of those iterations, so the
+        /// call comes back with `iters * expand` slots. A phase draws
+        /// trajectories until it has that many leaves no phase of this round
+        /// has taken. Zero once the tree has spent its node budget, and then
+        /// the round takes nothing and the host is only woken to end the
+        /// solve.
         expand: usize,
         cfr: Cfr,
         puct: f32,
@@ -284,8 +286,9 @@ pub struct Reply {
     pub a: Vec<f32>,
     pub b: Vec<f32>,
     pub c: Vec<f32>,
-    /// The leaves an expansion phase sampled, or `NO_ROW` where a trajectory
-    /// ran into a terminal or a config with no legal action there.
+    /// The leaves the round's phases took, phase by phase and distinct over
+    /// the whole round. `NO_ROW` pads a phase that gave up short, which is a
+    /// phase that spent its draws on leaves the round already held.
     pub leaves: Vec<u32>,
 }
 

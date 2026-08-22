@@ -26,15 +26,17 @@ class Cfg:
     # imperfect-information games.
     cap: int = 1_000_000
     cfgs_per_row: int = 48
-    # Student of Games' SoG(s, c): `s` expansion simulations in all, `c` of
-    # them after each regret update, so the solve runs ceil(s / c) updates.
+    # Student of Games' SoG(s, c): `s` expansions in all, `c` of them after
+    # each regret update, so the solve runs ceil(s / c) updates. They are
+    # distinct expansions: a phase draws trajectories until it has leaves the
+    # round has not taken, so `s` sets the tree size and `batch` does not.
     s: int = 512
     c: float = 8.0
     # Regret updates one round of a solve carries. The tree is frozen for the
-    # whole round and grows once at its end, from every trajectory the round
-    # sampled, so the per-round cost of re-describing an unchanged tree is paid
-    # once for the whole round instead of once each. (`batch` above is the
-    # optimizer's, which is a different thing entirely.)
+    # whole round and grows once at its end, from every leaf the round took, so
+    # the per-round cost of re-describing an unchanged tree is paid once for the
+    # whole round instead of once each. (`batch` above is the optimizer's, which
+    # is a different thing entirely.)
     round_batch: int = 4
     # Student of Games' q_search and q_recursive: leaves drawn from each solve
     # and queued to be re-solved as roots of their own. This is the only way a

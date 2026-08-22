@@ -2488,23 +2488,28 @@ impl Card {
         .map_err(err)
     }
 
-    /// The expansion phase: `sims` trajectories a solve, and the leaf each one
-    /// reached. The simulations of one phase run in order, because each counts
-    /// the visits it passes and the next is meant to see them -- and so do the
-    /// phases, which is why the round's `iters` phases share one buffer and
-    /// one download.
+    /// The expansion phase: a solve's `sims` distinct leaves, and it draws
+    /// trajectories until it has them. The draws of one phase run in order,
+    /// because each counts the visits it passes and the next is meant to see
+    /// them -- and so do the phases, which is why the round's `iters` phases
+    /// share one buffer and one download.
+    ///
+    /// The kernel is handed the whole buffer rather than this phase's slice of
+    /// it: the leaves the round's earlier phases took are what a leaf is
+    /// checked against, and they are already in it.
     fn expand(&self, trees: &CudaSlice<u64>, parts: u32, sims: usize, puct: f32,
               iter: usize, iters: usize) -> Res<()> {
         let each = parts as usize * sims;
         let mut sc = self.scratch.lock();
         let out = sc.leaves.room(&self.stream, (iters * each).max(1))?;
-        let mut view = out.slice_mut(iter * each..(iter + 1) * each);
         let (parts_i, sims_i) = (parts as i32, sims as i32);
         unsafe {
             self.stream
                 .launch_builder(&self.k.expand)
-                .arg(trees).arg(&mut view).arg(&parts_i).arg(&sims_i).arg(&puct)
+                .arg(trees).arg(out).arg(&parts_i).arg(&sims_i).arg(&puct)
                 .arg(&(iter as i32))
+                .arg(&(each as i32))
+                .arg(&(crate::search::TRIES as i32))
                 .launch_unit(LaunchConfig {
                     grid_dim: (parts.max(1), 1, 1),
                     block_dim: (32, 1, 1),

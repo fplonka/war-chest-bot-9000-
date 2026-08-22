@@ -268,7 +268,7 @@ fn the_cfr_loop_agrees_on_a_fixed_tree() {
 /// What can be compared is the rule. `Device::resident` hands back the arenas
 /// an expansion phase reads, and `Solver::replay_expansion` runs the host's
 /// own `sample_leaf` against them. Given the same numbers and the same stream
-/// the two must agree simulation for simulation -- which is what holds
+/// the two must agree draw for draw -- which is what holds
 /// `k_expand`, `puct_choice`, `pick_live` and `live_cell` to `sample_leaf`,
 /// `Solver::puct_choice`, `pick_live` and `Solver::live_cell`.
 ///
@@ -281,8 +281,10 @@ fn the_cfr_loop_agrees_on_a_fixed_tree() {
 /// the farm batches and a kernel that read a bound from the batch where it
 /// should read it from the solve is right for one member and wrong for the
 /// rest. `c` is what the phase widths come from -- a solve's first phase owes
-/// `floor(c)` trajectories -- so the four ask for 3, 5, 8 and 13 of them and
-/// the launch is a ragged one.
+/// `floor(c)` distinct leaves -- so the four ask for 3, 5, 8 and 13 of them and
+/// the launch is a ragged one. A phase draws until it has what it owes, so what
+/// is compared is the redrawing too: the same leaves in the same order, and the
+/// same visits left behind by the draws that found nothing new.
 #[test]
 fn growth_is_the_same_rule_as_the_reference() {
     if Device::count() == 0 {
@@ -364,7 +366,7 @@ fn growth_is_the_same_rule_as_the_reference() {
         for i in 0..n {
             assert_eq!(
                 sims[i], streams[i].2 as usize,
-                "solve {i}: the first phase owes floor(c) trajectories"
+                "solve {i}: the first phase owes floor(c) leaves"
             );
             let got = d.resident(0, i).expect("the card gave its solve back");
             let theirs = &replies[i].last().expect("the round answered").leaves;
@@ -373,7 +375,8 @@ fn growth_is_the_same_rule_as_the_reference() {
             // the arenas the card holds now are the ones it grew from apart
             // from the visits, which are known.
             let zero = vec![0.0f32; got.visits.len()];
-            let mine = live[i].replay_expansion(
+            let mut taken = Vec::new();
+            live[i].replay_expansion(
                 &Arenas {
                     reach: &got.reach,
                     cur: &got.cur,
@@ -383,10 +386,12 @@ fn growth_is_the_same_rule_as_the_reference() {
                     prior: &got.prior,
                 },
                 sims[i],
+                &mut taken,
             );
-            let mine: Vec<u32> = mine
-                .iter()
-                .map(|l| l.map_or(NO_ROW, |x| x as u32))
+            // A phase hands back as many distinct leaves as it owes, or fewer
+            // when it spent its draws, and pads the rest of the row.
+            let mine: Vec<u32> = (0..sims[i])
+                .map(|k| taken.get(k).map_or(NO_ROW, |&x| x as u32))
                 .collect();
             assert_eq!(
                 &mine, theirs,

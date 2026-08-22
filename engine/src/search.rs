@@ -39,9 +39,32 @@ use crate::units::{ENSIGN, MARSHAL, ROYAL_COIN};
 use crate::timed;
 use std::sync::Arc;
 
+/// Trajectories an expansion phase may draw for each distinct leaf it owes.
+///
+/// The tree is frozen for a whole round, so a phase draws again when it lands
+/// on a leaf the round already took, and this bounds the redrawing. Measured
+/// at `SoG(512, 8)`, a round of one spends 1.4 draws a leaf, a round of four
+/// 1.8 and a round of eight 2.3.
+///
+/// Four, because raising it buys almost nothing. Half the selection rule is
+/// the CFR average, which does not read the visit counts at all, so a large
+/// round keeps drawing the same lines however long it is allowed to. Taking
+/// the bound from four to forty at a round of eight moved 7.6 draws a leaf
+/// where four had cost 2.3, and returned three percent more tree. The
+/// remaining loss is the rule's, not the bound's.
+///
+/// Read by the device backend too: the rule is one rule, and a phase that gave
+/// up at a different point on the two would leave them drawing from different
+/// points of the same stream ever after.
+pub const TRIES: usize = 4;
+
 #[derive(Clone, Copy)]
 pub struct Cfg {
-    /// Expansion simulations the whole solve runs — Student of Games' `s`.
+    /// Expansions the whole solve makes — Student of Games' `s`.
+    ///
+    /// Distinct ones. A phase draws trajectories until it has leaves the round
+    /// has not taken yet, so `s` is a count of nodes the tree gains and not of
+    /// trajectories walked; see `TRIES`.
     ///
     /// One simulation walks to a leaf and expands it, and an expansion adds one
     /// public state together with *every* one of its public children. That is
@@ -57,12 +80,16 @@ pub struct Cfg {
     /// Regret updates one round carries, at least one.
     ///
     /// A round is the unit the host and the backend trade in: the host grows
-    /// the tree, the backend runs the round's updates back to back and samples
-    /// `c` expansion trajectories after each of them, and the host grows again
-    /// from every leaf the round sampled. So the tree lags up to `batch - 1`
-    /// updates behind the trajectories that chose it, and the per-round cost
-    /// of describing a tree that did not change is paid once for `batch`
-    /// updates instead of once each.
+    /// the tree, the backend runs the round's updates back to back and takes
+    /// `c` leaves after each of them, and the host grows again from every leaf
+    /// the round took. So the tree lags up to `batch - 1` updates behind the
+    /// trajectories that chose it, and the per-round cost of describing a tree
+    /// that did not change is paid once for `batch` updates instead of once
+    /// each. What it costs is tree, because the phases of one round draw
+    /// against a strategy that does not move: they take distinct leaves, but a
+    /// large round runs out of lines to sample down and takes fewer than it
+    /// owes. Measured at `SoG(512, 8)`, a round of four builds nine percent
+    /// less tree than a round of one and a round of eight twenty-three.
     pub batch: usize,
     /// The regret-update rule.
     pub cfr: Cfr,
@@ -1428,6 +1455,10 @@ impl Solver {
     /// leaves `id` a leaf that growth will not try again; the solve carries on
     /// with the tree it already had.
     fn expand(&mut self, id: usize) {
+        debug_assert!(
+            self.nodes[id].leaf && self.nodes[id].expandable,
+            "growth turns an expandable leaf into a decision node, and nothing else"
+        );
         let fresh = self.nodes.len();
         self.limit = fresh + EXPANSION_CAP;
         self.grow(id);
@@ -2659,8 +2690,8 @@ impl Solver {
 
     /// Student of Games' GT-CFR, with the CFR loop on this host.
     ///
-    /// `SoG(s, c)`: `s` expansion simulations in total, `c` of them after each
-    /// regret update, so the solve runs `ceil(s / c)` updates. Growing and
+    /// `SoG(s, c)`: `s` expansions in total, `c` of them after each regret
+    /// update, so the solve runs `ceil(s / c)` updates. Growing and
     /// solving interleave rather than staging, which is the point: the strategy
     /// decides where the tree goes, and the tree decides what the strategy is
     /// worth.
@@ -2696,36 +2727,18 @@ impl Solver {
             // added were waiting for. Once a round, which is where the card's
             // policy-head stage sits.
             self.refresh_priors();
-            // Every simulation of a round runs before any of them is grown.
-            // Two of them can then land on the same leaf and the second is
-            // dropped; the visit counts a trajectory leaves behind are what
-            // make that rare.
-            let sampled = self.with_expand_rng(|sv, rng| {
-                let mut sampled = Vec::new();
-                for _ in 0..done {
-                    sv.at += 1;
-                    sv.step();
-                    for _ in 0..want {
-                        // A trajectory that runs into a dead end costs that
-                        // simulation and no more; the phase still owes the
-                        // rest. The card does the same, and a phase that ended
-                        // on the first dead end would leave the two searches
-                        // drawing from different points of the same stream ever
-                        // after.
-                        if let Some(leaf) = sv.sample_leaf(rng) {
-                            sampled.push(leaf);
-                        }
-                    }
-                }
-                sampled
-            });
-            let mut grew = false;
-            for leaf in sampled {
-                // An earlier simulation of this same phase may have taken it.
-                if self.nodes[leaf].leaf && self.nodes[leaf].expandable {
-                    self.expand(leaf);
-                    grew = true;
-                }
+            // Every phase of a round runs before any of its leaves is grown,
+            // so the round's leaves are collected in one place and each phase
+            // draws until it has `want` the round has not taken yet.
+            let mut taken = Vec::new();
+            for _ in 0..done {
+                self.at += 1;
+                self.step();
+                self.expansion_phase(want, &mut taken);
+            }
+            let grew = !taken.is_empty();
+            for leaf in taken {
+                self.expand(leaf);
             }
             if grew {
                 // Growth appended reach rows after `step` propagated the old
@@ -2747,10 +2760,10 @@ impl Solver {
     ///
     /// The round is the one `advance_on_host` runs, iteration for iteration:
     /// `Cfg::batch` regret updates against a frozen tree, each sampling its
-    /// own trajectories, and one growth from all of them. So two trajectories
-    /// of a round can land on the same leaf and the second is dropped. The
-    /// visit counts a trajectory leaves behind — the paper's virtual loss —
-    /// are what makes that rare rather than usual.
+    /// own trajectories, and one growth from all of them. A trajectory that
+    /// lands on a leaf the round already took is drawn again, so what the round
+    /// hands back is distinct leaves and `s` counts nodes the tree gains rather
+    /// than trajectories walked.
     ///
     /// The growth rule itself is the same rule on both, and deliberately so:
     /// the same stream, the same warp-shaped sums, the same per-simulation
@@ -2765,17 +2778,14 @@ impl Solver {
             Phase::Iterating => {
                 self.absorb(replies);
                 let last = replies.last().expect("a round answers every call it was given");
+                // Distinct by construction: a phase draws until it has leaves
+                // no phase of this round has taken. A short row reads as
+                // nothing, which is a phase that spent its draws.
                 for &leaf in &last.leaves.clone() {
                     if leaf == crate::contract::NO_ROW {
                         continue;
                     }
-                    let leaf = leaf as usize;
-                    // An earlier simulation of this same phase may have taken
-                    // it.
-                    if !self.nodes[leaf].leaf || !self.nodes[leaf].expandable {
-                        continue;
-                    }
-                    self.expand(leaf);
+                    self.expand(leaf as usize);
                 }
             }
             Phase::Reading => {
@@ -2795,15 +2805,15 @@ impl Solver {
         }
     }
 
-    /// The next round: iterations it carries, and expansion trajectories each
-    /// of them samples.
+    /// The next round: iterations it carries, and leaves each of their
+    /// expansion phases takes.
     ///
     /// Every iteration that owes the same number of expansions rides in one
     /// round, capped at `batch`. The tree is frozen for the whole round, so
     /// the host has nothing to do between those iterations and should not be
-    /// woken; it grows once at the end, from every trajectory the round
-    /// sampled. The tail a solve runs once its tree can no longer grow is the
-    /// same rule with `want = 0`, not a case of its own.
+    /// woken; it grows once at the end, from every leaf the round took. The
+    /// tail a solve runs once its tree can no longer grow is the same rule
+    /// with `want = 0`, not a case of its own.
     ///
     /// The cap is there because each iteration issues a hundred-odd dependent
     /// launches from the one driver thread, and a round runs as many as its
@@ -3275,6 +3285,38 @@ impl Solver {
         out
     }
 
+    /// One expansion phase: draw trajectories until `want` leaves the round has
+    /// not already taken have been found, and append them to `taken`.
+    ///
+    /// The tree is frozen for a whole round, so a trajectory that ends on a
+    /// leaf an earlier trajectory of the round took would grow nothing and the
+    /// phase draws again. That is what makes `s` a count of *distinct*
+    /// expansions, rather than a count of trajectories that mostly land where
+    /// an earlier one of the same round did.
+    ///
+    /// A draw that runs into a dead end costs that draw and no more. Either
+    /// way the visits the trajectory left along its path stand -- that is
+    /// Student of Games' virtual loss, and it is the thing that sends the next
+    /// draw somewhere else.
+    ///
+    /// `want * TRIES` draws is the bound, and it is why the loop terminates: a
+    /// tree whose every reachable leaf has already been taken would otherwise
+    /// draw for ever. A phase that spends it stops short of `want`.
+    fn expansion_phase(&mut self, want: usize, taken: &mut Vec<usize>) {
+        let (mut got, mut draws) = (0usize, 0usize);
+        self.with_expand_rng(|sv, rng| {
+            while got < want && draws < want * TRIES {
+                draws += 1;
+                if let Some(leaf) = sv.sample_leaf(rng) {
+                    if !taken.contains(&leaf) {
+                        taken.push(leaf);
+                        got += 1;
+                    }
+                }
+            }
+        });
+    }
+
     /// One expansion simulation: sample a world from the root beliefs, walk
     /// down under the current average strategy, and return the leaf it reaches.
     ///
@@ -3345,7 +3387,7 @@ impl Solver {
 
 
     /// Run one expansion phase against arenas some other backend left behind,
-    /// and hand back the leaf each simulation reached.
+    /// appending the leaves it took to `taken`.
     ///
     /// The CFR loop runs on the card in production, so on that path the host's
     /// own copies of these arenas stay at their uniform start. Given numbers
@@ -3356,11 +3398,13 @@ impl Solver {
     ///
     /// `visits` is the one arena the phase writes, so a caller comparing a
     /// phase must hand over the state as it stood before that phase ran.
+    /// `taken` is the round's leaves so far, which is the other state a phase
+    /// reads: the card keeps it in the round's own output buffer.
     ///
     /// Not part of the engine's interface: it gives this solve the arenas in
     /// `a` and advances `seed` by the draws the phase makes.
     #[doc(hidden)]
-    pub fn replay_expansion(&mut self, a: &Arenas, sims: usize) -> Vec<Option<usize>> {
+    pub fn replay_expansion(&mut self, a: &Arenas, want: usize, taken: &mut Vec<usize>) {
         let cells = self.ncells;
         self.cur.copy_from_slice(&a.cur[..cells]);
         // A device solve has no arenas of its own, which is the whole point:
@@ -3380,7 +3424,8 @@ impl Solver {
             reach: a.reach[..self.nreach].to_vec(),
             vals: Vec::new(),
         });
-        self.with_expand_rng(|sv, rng| (0..sims).map(|_| sv.sample_leaf(rng)).collect())
+        self.expansion_phase(want, taken)
+    }
     }
 
     /// The interior search queries this solve produced.

@@ -668,8 +668,8 @@ struct Tree {
     // computed here rather than passed in: one number for the whole batch
     // would be some other solve's weights.
     unsigned long long step;
-    /// Iterations this call asks of this solve, and expansion trajectories
-    /// after them. Both differ across a round once a solve's tree is full.
+    /// Iterations this call asks of this solve, and distinct leaves to take
+    /// after each of them. Both differ across a round once a tree is full.
     unsigned long long todo;
     unsigned long long nexpand;
 };
@@ -1280,27 +1280,29 @@ __global__ void k_prior(const Tree* trees, const unsigned int* part,
     for (unsigned int cell = a + lane; cell < b; cell += 32) t.prior[so + cell] *= scale;
 }
 
+// `out` is the whole round's buffer, `each` the stride between its phases, so
+// the leaves every earlier phase of this round took are here to be read back --
+// which is the state that makes a leaf "already taken". Thread zero is the only
+// one that touches `out`, in this launch and in the ones before it, so there is
+// nothing to synchronise.
 __global__ void k_expand(const Tree* trees, unsigned int* out, int parts,
-                         int sims, float c_puct, int iter) {
+                         int sims, float c_puct, int iter, int each, int tries) {
     int part = blockIdx.x;
     if (part >= parts) return;
     const Tree& t = trees[part];
-    // A round runs as many iterations as its longest member asked for, and a
-    // solve that has had its share must not be given another phase.
-    if ((unsigned long long)iter >= t.todo) {
-        for (int sim = threadIdx.x; sim < sims; sim += 32)
-            out[part * sims + sim] = NO_ROW;
-        return;
-    }
-    // A solve whose tree has spent its budget asks for no trajectories, and a
-    // round holds both kinds. The row is `sims` wide either way so the host can
-    // slice it; what this solve did not sample reads as nothing.
-    for (int sim = (int)t.nexpand + threadIdx.x; sim < sims; sim += 32)
-        out[part * sims + sim] = NO_ROW;
-    if (t.nexpand == 0) return;
+    unsigned int* taken = out + (size_t)iter * each + (size_t)part * sims;
+    // The row is `sims` wide however many leaves this phase takes, so the host
+    // can slice it: a solve that has had its share of the round's iterations, a
+    // solve whose tree has spent its budget and a phase that gave up short all
+    // read as nothing.
+    if (threadIdx.x == 0)
+        for (int sim = 0; sim < sims; ++sim) taken[sim] = NO_ROW;
+    __syncwarp();
+    if ((unsigned long long)iter >= t.todo || t.nexpand == 0) return;
     unsigned long long s = *t.seed;
     unsigned int n0 = t.nc[0], n1 = t.nc[1];
-    for (int sim = 0; sim < (int)t.nexpand; ++sim) {
+    int want = (int)t.nexpand, got = 0;
+    for (int draw = 0; draw < want * tries && got < want; ++draw) {
         int c[2];
         c[0] = pick(t.rootb, (int)n0, &s);
         c[1] = pick(t.rootb + n0, (int)n1, &s);
@@ -1352,7 +1354,20 @@ __global__ void k_expand(const Tree* trees, unsigned int* out, int parts,
             c[me] = (int)t.legal_trans[so + cell];
             node = t.legal_child[so + cell];
         }
-        if (threadIdx.x == 0) out[part * sims + sim] = found;
+        if (found == NO_ROW) continue;
+        // The tree is frozen until the round ends, so a leaf a trajectory of
+        // this round already took would grow nothing twice and the phase draws
+        // again. `NO_ROW` never matches, so a padded slot scans as empty.
+        bool dup = false;
+        if (threadIdx.x == 0) {
+            for (int p = 0; p <= iter && !dup; ++p) {
+                const unsigned int* r = out + (size_t)p * each + (size_t)part * sims;
+                for (int j = 0; j < sims; ++j)
+                    if (r[j] == found) { dup = true; break; }
+            }
+            if (!dup) taken[got] = found;
+        }
+        if (!__shfl_sync(0xffffffff, (int)dup, 0)) ++got;
     }
     if (threadIdx.x == 0) *t.seed = s;
 }
