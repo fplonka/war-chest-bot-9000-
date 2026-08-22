@@ -775,14 +775,14 @@ fn growing_a_coin_play_finishes_its_micro_decisions() {
 fn a_solve_never_grows_past_its_budget() {
     let nets = Arc::new(Nets::default());
     let budget = Budget {
-        nodes: 64,
-        rows: 24,
-        boards: 16,
-        configs: 32,
-        cidx: 256,
-        reach: 512,
-        cells: 128,
-        draws: 256,
+        nodes: 512,
+        rows: 256,
+        boards: 128,
+        configs: 256,
+        cidx: 4_096,
+        reach: 8_192,
+        cells: 2_048,
+        draws: 2_048,
     };
     let cfg = Cfg { s: 4_000, c: 1.0, budget, ..Default::default() };
     let mut checked = 0;

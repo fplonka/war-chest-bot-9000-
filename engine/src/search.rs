@@ -1394,6 +1394,10 @@ pub struct Solver {
     /// Node count at which the expansion in flight gives up. The bound is on
     /// one expansion, not on the tree.
     limit: usize,
+    /// The budget applies. False while `new` grows the root: a root that
+    /// stayed a leaf has no strategy, so that one expansion is `EXPANSION_CAP`
+    /// and nothing else.
+    bounded: bool,
     /// Working memory for the chance transitions, reused across the tree.
     draw_scratch: DrawScratch,
     /// `(config key, legal cell)` scratch for ordering a public child's
@@ -1529,6 +1533,7 @@ impl Solver {
             wbuf: Vec::new(),
             abandon: false,
             limit: usize::MAX,
+            bounded: false,
             draw_scratch: DrawScratch::default(),
             cell_order: Vec::new(),
             contract: Arc::new(crate::contract::Contract::default()),
@@ -1564,7 +1569,11 @@ impl Solver {
             let root = sv.push_node(crate::contract::NO_ROW, root.clone(), cfgs);
             // A root that is a coin play would otherwise stay a leaf with no
             // strategy to read, so the first expansion is unconditional.
+            // The budget does not apply yet: it would rewind this grow and
+            // leave a leaf. `EXPANSION_CAP` still bounds the walk.
+            sv.limit = sv.nodes.len() + EXPANSION_CAP;
             sv.grow(root);
+            sv.limit = usize::MAX;
             sv.seal(root, 1);
             // The first CFR update and every expansion trajectory require
             // reaches for the tree that now exists. The card seeds and sweeps
@@ -1574,6 +1583,7 @@ impl Solver {
                 sv.precompute_reaches();
             }
         }
+        sv.bounded = true;
         sv
     }
 
@@ -1798,7 +1808,7 @@ impl Solver {
 
     /// Whether the expansion in flight has spent its bound.
     fn runaway(&mut self) -> bool {
-        if self.spent() {
+        if self.bounded && self.spent() {
             self.abandon = true;
             self.budget_hit = true;
         } else if self.nodes.len() >= self.limit {
@@ -1821,14 +1831,6 @@ impl Solver {
     /// checked separately because a node's cells are appended after its whole
     /// subtree, with no `grow` between.
     fn spent(&self) -> bool {
-        // Never the first expansion. A solve whose root is still a leaf has no
-        // strategy to average and nothing to hand back, so a budget that
-        // stopped it would not be a smaller solve but a broken one. Every slot
-        // has room for one expansion: `EXPANSION_CAP` is what bounds it, and
-        // the budget is orders above that wherever a run sets it.
-        if self.ncells == 0 {
-            return false;
-        }
         let b = &self.cfg.budget;
         self.nodes.len() >= b.nodes
             || self.leaf_rows.len() >= b.rows
@@ -1910,7 +1912,25 @@ impl Solver {
         self.cmap.retain(|_, &mut i| (i as usize) < m.ncfg);
         self.ncfg = m.ncfg;
         self.grown.retain(|&g| (g as usize) < m.nodes && g != id as u32);
-        self.nodes[id].leaf = true;
+        let n = &mut self.nodes[id];
+        n.leaf = true;
+        n.chance = false;
+        n.draw = DrawMap::default();
+        n.draw_steps = 0;
+        n.acts.clear();
+        n.aslot.clear();
+        n.fdown.clear();
+        n.obs_child.clear();
+        n.obs_start.clear();
+        n.obs_act.clear();
+        n.child.clear();
+        n.legal_off.clear();
+        n.legal_action.clear();
+        n.legal_child.clear();
+        n.legal_trans.clear();
+        n.action_off.clear();
+        n.action_cell.clear();
+        n.cell_row.clear();
     }
 
     /// Give an expanded node its strategy cells, at the end of the arenas.
@@ -2270,7 +2290,7 @@ impl Solver {
         // The one term a `grow` at the head of the recursion cannot bound: a
         // node's cells are appended after its whole subtree has been built, so
         // several nodes' worth can land with no check between them.
-        if self.ncells + self.nodes[id].legal_action.len() > self.cfg.budget.cells {
+        if self.bounded && self.ncells + self.nodes[id].legal_action.len() > self.cfg.budget.cells {
             self.abandon = true;
             self.budget_hit = true;
             self.rewind(id, mark);
