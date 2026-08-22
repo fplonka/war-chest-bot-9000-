@@ -73,7 +73,14 @@ fn main() {
     println!("{} roots", positions.len());
 
     for &s in &sizes {
-        let cfg = Cfg { s, c: 8.0, cfr: Cfr::SOG, ..Default::default() };
+        let cfg = Cfg {
+            s,
+            c: 8.0,
+            cfr: Cfr::SOG,
+            budget: warchest::search::Budget::unbounded(),
+            ..Default::default()
+        };
+        let mut first: Vec<Shape> = Vec::new();
         let mut shapes: Vec<Shape> = Vec::new();
         let mut host: Vec<usize> = Vec::new();
         for (i, (st, belief)) in positions.iter().enumerate() {
@@ -86,11 +93,24 @@ fn main() {
                 belief.clone(),
                 Rng::new(i as u64 * 7 + 1),
             );
+            first.push(sv.shape());
             sv.collect(4);
             sv.run_alone();
             shapes.push(sv.shape());
             host.push(sv.host_bytes());
         }
+        println!(
+            "\n== first expansion ==\n{:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            "", "mean", "p50", "p90", "p99", "max", "max/p99%"
+        );
+        row("nodes", first.iter().map(|x| x.nodes).collect());
+        row("rows", first.iter().map(|x| x.rows).collect());
+        row("boards", first.iter().map(|x| x.boards).collect());
+        row("cells", first.iter().map(|x| x.cells).collect());
+        row("ncfg", first.iter().map(|x| x.ncfg).collect());
+        row("cidx", first.iter().map(|x| x.cidx).collect());
+        row("reach", first.iter().map(|x| x.reach).collect());
+        row("draws", first.iter().map(|x| x.draws).collect());
         println!(
             "\n== s={s} c=8 batch=8 ==\n{:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
             "", "mean", "p50", "p90", "p99", "max", "max/p99%"

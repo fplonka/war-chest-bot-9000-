@@ -104,8 +104,8 @@ impl Budget {
             nodes: k(BUDGET_512.nodes),
             rows: k(BUDGET_512.rows),
             boards: k(BUDGET_512.boards),
-            // Not scaled: interning keys on the node's reserve. A growth test
-            // interned 2096 against a p90 of 1074; the slot is 4096, above that.
+            // Not scaled: interning keys on the node's reserve. A first
+            // expansion interned 2096 against a p90 of 1074; the slot is 4096.
             configs: BUDGET_512.configs,
             cidx: k(BUDGET_512.cidx),
             reach: k(BUDGET_512.reach),
@@ -205,27 +205,24 @@ impl Budget {
     }
 }
 
-/// The shape a solve at `SoG(512, 8)` is allowed: the ninetieth percentile
-/// `examples/shapes` measured over a corpus of real roots.
+/// The shape a solve at `SoG(512, 8)` is allowed.
 ///
-/// A slot is this large, so the percentile is a judgement and `budget_hits` is
-/// what argues with it. The tail is very long -- p99 is thirteen times p50 in
-/// nodes and twenty-one times in cells -- and a slot at p99 is four times one
-/// at p90, to truncate one solve in a hundred instead of one in ten. `reach`
-/// is `nodes * cidx / rows` at the same percentile (one reach entry per
-/// (node, player, config), the same density the belief index has on rows).
-/// `draws` is scaled from the same percentile's nodes against the measured
-/// p99; it is the term `shapes` prints last and the one a run's `budget_hits`
-/// will argue with if this is short.
+/// `nodes` `rows` `boards` are the ninetieth percentile `examples/shapes`
+/// measured over a corpus of real roots. The other terms are a first
+/// expansion: that one is not a budget, because a root that stayed a leaf has
+/// no strategy, so the slot has to hold it. Measured on the training farm at
+/// `s = 512`: a first expansion interned 2096 configs, wrote 199271 cells,
+/// 393223 cidx, 724360 draws. `budget_hits` is then the later expansions that
+/// would have grown past this.
 const BUDGET_512: Budget = Budget {
     nodes: 24_582,
     rows: 14_516,
     boards: 8_518,
     configs: 4_096,
-    cidx: 393_199,
-    reach: 665_872,
+    cidx: 524_288,
+    reach: 1_048_576,
     cells: 262_144,
-    draws: 524_288,
+    draws: 1_048_576,
 };
 
 #[derive(Clone, Copy)]
@@ -1729,6 +1726,11 @@ impl Solver {
         }
         let stop = s.is_terminal() || matches!(s.pending(), Cont::MainPlay);
         let ch = self.push_node(parent as u32, s, cfgs);
+        // `runaway` is the start-of-step check; one row of cidx or one node's
+        // reach can land past the cap between two of those. The caller rewinds.
+        if self.runaway() {
+            return ch;
+        }
         if !stop {
             self.grow(ch);
         }
@@ -2107,6 +2109,12 @@ impl Solver {
             let n = &mut self.nodes[id];
             n.chance = true;
             n.child = vec![ch];
+            if self.bounded && self.ndraws + draw.len() > self.cfg.budget.draws {
+                self.abandon = true;
+                self.budget_hit = true;
+                self.rewind(id, mark);
+                return;
+            }
             self.ndraws += draw.len();
             let n = &mut self.nodes[id];
             n.draw = draw;
