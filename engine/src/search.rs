@@ -220,9 +220,9 @@ const BUDGET_512: Budget = Budget {
     rows: 14_516,
     boards: 8_518,
     configs: 4_096,
-    cidx: 1_048_576,
+    cidx: 2_097_152,
     reach: 2_097_152,
-    cells: 1_048_576,
+    cells: 2_097_152,
     draws: 2_097_152,
 };
 
@@ -1389,9 +1389,8 @@ pub struct Solver {
     /// Node count at which the expansion in flight gives up. The bound is on
     /// one expansion, not on the tree.
     limit: usize,
-    /// The budget applies. False while `new` grows the root: a root that
-    /// stayed a leaf has no strategy, so that one expansion is `EXPANSION_CAP`
-    /// and nothing else.
+    /// The budget applies. A first expansion that would not fit is abandoned
+    /// the same way as any other, and the root stays a leaf.
     bounded: bool,
     /// Working memory for the chance transitions, reused across the tree.
     draw_scratch: DrawScratch,
@@ -1528,7 +1527,7 @@ impl Solver {
             wbuf: Vec::new(),
             abandon: false,
             limit: usize::MAX,
-            bounded: false,
+            bounded: true,
             draw_scratch: DrawScratch::default(),
             cell_order: Vec::new(),
             contract: Arc::new(crate::contract::Contract::default()),
@@ -1546,11 +1545,11 @@ impl Solver {
         sv.jp.clear();
         {
             let _t = timed!(BUILD);
-            // The root is born a leaf like every other node; `solve` grows it.
-            // Its own expansion is unbounded, because a root that stayed a leaf
-            // would leave the solve with no strategy to act on at all. The
-            // bound below is on how much of the *expansion budget* one leaf may
-            // take, and the root spends none of it.
+            // The root is born a leaf like every other node; `expand` grows it.
+            // The budget applies: a first expansion that would not fit the slot
+            // is abandoned, and the root stays a leaf. That is rare at this
+            // budget; a root that stayed a leaf has no strategy, and the farm
+            // still holds a tree that fits.
             sv.nodes.reserve(640);
             sv.cur.reserve(640);
             if let Some(h) = &mut sv.host {
@@ -1562,14 +1561,7 @@ impl Solver {
             // it is drawn here rather than by the round that sends it.
             sv.seed = Rng::new(sv.rng.next_u64()).0;
             let root = sv.push_node(crate::contract::NO_ROW, root.clone(), cfgs);
-            // A root that is a coin play would otherwise stay a leaf with no
-            // strategy to read, so the first expansion is unconditional.
-            // The budget does not apply yet: it would rewind this grow and
-            // leave a leaf. `EXPANSION_CAP` still bounds the walk.
-            sv.limit = sv.nodes.len() + EXPANSION_CAP;
-            sv.grow(root);
-            sv.limit = usize::MAX;
-            sv.seal(root, 1);
+            sv.expand(root);
             // The first CFR update and every expansion trajectory require
             // reaches for the tree that now exists. The card seeds and sweeps
             // its own, from the root beliefs the first tree call carries, so
@@ -1578,7 +1570,6 @@ impl Solver {
                 sv.precompute_reaches();
             }
         }
-        sv.bounded = true;
         sv
     }
 
