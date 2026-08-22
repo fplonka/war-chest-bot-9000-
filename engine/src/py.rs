@@ -735,11 +735,20 @@ impl SolveFarm {
         dict.set_item("round_rows", read(&s.rows))?;
         dict.set_item("round_nanos", read(&s.nanos))?;
         // What the population is, rather than what it is guessed to be: solves
-        // in flight, what the host budget allowed at the last admission, and
+        // in flight, how many the host rule allowed when it was last asked, and
         // the largest a solve has grown to in host bytes.
         dict.set_item("live", s.live())?;
         dict.set_item("live_allowed", s.allowed())?;
         dict.set_item("host_peak", s.host_peak())?;
+        // The two levels admission reads. A run that OOMs shows one of them
+        // climbing to the wall; a run that throttles shows one of them flat
+        // with the population stuck under it.
+        let (rss, avail) = self.farm.host();
+        dict.set_item("host_rss", rss)?;
+        dict.set_item("host_avail", avail)?;
+        let mem = self.farm.memory();
+        dict.set_item("device_held", mem.iter().map(|m| m.0).collect::<Vec<_>>())?;
+        dict.set_item("device_room", mem.iter().map(|m| m.1).collect::<Vec<_>>())?;
         Ok(out)
     }
 }

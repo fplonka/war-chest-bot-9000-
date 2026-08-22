@@ -66,6 +66,14 @@ N_HEXES = warchest.N_HEXES
 # What `SolveFarm.collect` reports about the device rounds, cumulative
 # since the farm started. `rounds` is the denominator of the other three.
 ROUND_KEYS = ("rounds", "round_calls", "round_rows", "round_nanos")
+# What the farm's admission reads and what it decided, as levels rather than
+# counters. `live` is the population, `live_allowed` what the host rule would
+# carry at what a slot costs now, and the four below are the two memories the
+# rule measures. A run that dies of memory shows `host_rss` climbing to the
+# machine or `device_room` falling to nothing; a run that throttles shows
+# `live` stuck well under `live_allowed`.
+FARM_KEYS = ("live", "live_allowed", "host_peak", "host_rss", "host_avail",
+             "device_held", "device_room")
 
 
 def action_feats(pa):
@@ -900,6 +908,7 @@ def main():
                 "buf": len(buf),
                 "buf_s": round(buf.span_seconds(), 1),
                 "solves_per_s": round(raw_sps, 1),
+                **{k: data[k] for k in FARM_KEYS if k in data},
                 "lr": opt.param_groups[0]["lr"],
                 "policy_loss": window["policy_sum"] / max(window["train_steps"], 1),
             }

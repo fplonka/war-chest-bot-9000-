@@ -1,0 +1,29 @@
+[train] runs/admit12 at a9ea2e4 seed=1 {'minutes': 12.0, 'snapshot_every': 300.0, 'ladder_games': 0, 's': 512, 'round_batch': 8, 'note': 'admission soak'}
+[train] admission soak
+[train] CUDA stream priority -1
+[train] search inference on cuda:0,1, training on cuda:1
+[cfg] PUBFEAT=897 CFEAT=15 architecture=gt-cfr s=512 c=8.0 budget=720s snapshot_every=300min device=cuda:1 draft=random replay_ratio=8.0 recent_mix=0.5/0.2 canonical_views=2 cap=1000000 matmul=high
+[t=   0.0s] --- snapshot snap_00.pt (init) ---
+[t=  30.3s] GT-CFR solves=259 rate=8.5/s rows=259 games=0 qrows=86 L=0.00000 L/var=0.00 Lp=0.000 tgt=-0.075/0.017 gen=0.31s train=0.00s gpu=0.00s
+[t=  40.4s] GT-CFR solves=510 rate=12.6/s rows=251 games=0 qrows=85 L=0.00000 L/var=0.00 Lp=0.000 tgt=-0.075/0.018 gen=0.32s train=0.00s gpu=0.00s
+[t=  50.9s] GT-CFR solves=870 rate=17.1/s rows=360 games=0 qrows=125 L=0.00000 L/var=0.00 Lp=0.000 tgt=-0.075/0.017 gen=0.25s train=0.00s gpu=0.00s
+[t=  70.9s] GT-CFR solves=1027 rate=14.5/s rows=157 games=0 qrows=49 L=1.73059 L/var=6246.86 Lp=2.410 tgt=-0.074/0.017 gen=0.29s train=14.43s gpu=0.00s
+[t=  81.3s] GT-CFR solves=2434 rate=29.9/s rows=1407 games=0 qrows=637 L=0.92978 L/var=3113.30 Lp=2.402 tgt=-0.072/0.017 gen=0.14s train=6.83s gpu=0.00s
+Traceback (most recent call last):
+  File "/workspace/warchest-engine/train/train.py", line 979, in <module>
+    main()
+  File "/workspace/warchest-engine/train/train.py", line 956, in main
+    run_search_pipeline()
+  File "/workspace/warchest-engine/train/train.py", line 770, in run_search_pipeline
+    lv, train_stat = train_steps(
+                     ^^^^^^^^^^^^
+  File "/workspace/warchest-engine/train/train.py", line 466, in train_steps
+    value = losses(net, *parts, wp=policy_w, stats=stat)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/warchest-engine/train/train.py", line 378, in losses
+    pl = policy_loss(net, xpub, phi, seg, nseg, policy)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/warchest-engine/train/train.py", line 404, in policy_loss
+    logit = (fp[pcfg] * e[pact]).sum(1)
+             ~~~~~~~~~^~~~~~~~~
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 244.00 MiB. GPU 1 has a total capacity of 23.56 GiB of which 76.12 MiB is free. Including non-PyTorch memory, this process has 23.46 GiB memory in use. Of the allocated memory 3.62 GiB is allocated by PyTorch, and 333.63 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)

@@ -316,22 +316,22 @@ fn owed_by_the_join(l: &NetLayout, b: &[f32]) -> Vec<f32> {
     out
 }
 
-/// Card memory that is never admitted against, per ordinal.
+/// Card memory left free, per ordinal, whatever else happens.
 ///
-/// Two things live in it. A round's own intermediates -- hundreds of megabytes,
-/// four hundred of them for the join head alone at a large round -- which every
-/// stream of an ordinal has its own set of. And the blocks the stream-ordered
-/// allocator keeps back between one solve and the next, which is the larger
-/// half and the reason this cannot be measured instead: a freed arena goes to a
-/// pool rather than to the driver, so `mem_get_info` reports the pool as taken
-/// and the card as full while most of it is available to the next solve.
+/// Two things need it. A round's own intermediates -- hundreds of megabytes,
+/// four hundred of them for the join head alone at a large round, and every
+/// stream of an ordinal has its own set. They are allocated per pass and given
+/// back at the end of it, so a card measured *between* two rounds reads them as
+/// available when the next round needs every byte of them again. And the
+/// trainer, which trains on one of these cards and asks the driver for its own
+/// memory as the batches come: a run that left it seventy-six megabytes died in
+/// the optimiser rather than in the farm.
 ///
-/// What would make it wrong: a round whose intermediates grow -- a wider join
-/// head, a larger `TILE`, more streams an ordinal -- or a pool that fragments
-/// worse than `grow_to`'s size classes allow, so that blocks pile up unusable.
-/// Both show in `leaf_breakdown`'s census: the card's free memory falls while
-/// the solve arenas do not.
+/// It no longer covers the blocks the allocator retains. `Card::room` reads
+/// those from the pool and reports them apart, because only this process can
+/// spend them.
 const ROUND_RESERVE: u64 = 6 << 30;
+
 
 /// Leaf rows a pass works on at once.
 ///
@@ -911,6 +911,8 @@ impl Solve {
 }
 
 struct Card {
+    /// The ordinal's driver handle, for the memory `room` reads.
+    dev: cudarc::driver::sys::CUdevice,
     stream: Arc<CudaStream>,
     blas: CudaBlas,
     k: Kernels,
@@ -951,19 +953,13 @@ struct Card {
     ln: CudaSlice<f32>,
     /// Hex adjacency, `NONE` folded to `-1`.
     nb: CudaSlice<i32>,
-    /// Device bytes this card's solve arenas may hold.
-    ///
-    /// Whatever it had free when the backend came up, less `ROUND_RESERVE`,
-    /// shared out between the streams of its ordinal.
-    ///
-    /// Measured rather than configured. A solve's cost varies twenty-six fold
-    /// with how far into a game its root sits, so no count of threads describes
-    /// what fits, and a run that guesses either wastes the card or fills it.
-    budget: u64,
-    /// The most any one solve on this card has ever held. `room_for` projects
-    /// the population at it, which is what keeps admission from lagging behind
-    /// arenas that are still filling.
-    peak: std::sync::atomic::AtomicU64,
+    /// What this stream's solve arenas hold, and how many slots hold it, as of
+    /// its last round. Read by `room_for`, which cannot take the solve lock:
+    /// the sibling stream that owns it is inside a round.
+    held: std::sync::atomic::AtomicU64,
+    slots: std::sync::atomic::AtomicU64,
+    /// The most this stream's arenas have ever held. See `farm::allows`.
+    hold: std::sync::atomic::AtomicU64,
     /// What the join's residual stream is owed.
     ///
     /// Every block of the join adds its matrix multiply's bias to the same
@@ -1007,24 +1003,50 @@ impl Device {
         self.cards.len()
     }
 
-    /// Whether this card can take another solve beside the `live` it holds.
+    /// Whether this stream's ordinal can take one more solve.
     ///
-    /// Not the level against the ceiling. A solve's arenas fill over its whole
-    /// run, so what a population holds now is what a younger one held, and
-    /// admitting on that overshoots by whatever the solves already in flight
-    /// grow in the meantime. This projects instead: every solve in flight, and
-    /// the one being asked about, at the largest a solve on this card has ever
-    /// reached. Nothing that is already admitted can then surprise it.
+    /// Asked of the ordinal, not the stream: ten streams share one card, and a
+    /// share each was a fixed division of a number that itself was wrong.
     ///
-    /// The peak is nought until the first solve has grown, and the answer is
-    /// yes until it has. What makes that safe is the farm's pacing: it admits
-    /// one solve per solve *finished*, so the second is admitted only once the
-    /// first has run its whole life and the peak is a real one.
-    pub fn room_for(&self, card: usize, live: usize) -> bool {
-        let c = &self.cards[card];
-        let widest = c.solves.lock().iter().map(|s| s.bytes() as u64).max().unwrap_or(0);
-        let peak = widest.max(c.peak.fetch_max(widest, std::sync::atomic::Ordering::Relaxed));
-        (live as u64 + 1) * peak <= c.budget
+    /// `crate::farm::allows` is the rule; this is the card's answer to it. What
+    /// the arenas already hold and the most they ever have, against what the
+    /// card can still hand out, less the reserve a round's intermediates need.
+    ///
+    /// Nothing here is read once at start-up. A budget fixed then cannot see
+    /// the blocks the allocator retains as a run goes on, and a run that filled
+    /// its card had two thirds of it in retained blocks while the budget still
+    /// said there was room.
+    pub fn room_for(&self, card: usize) -> bool {
+        let mine = &self.cards[card / STREAMS * STREAMS..][..STREAMS];
+        let load = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+        let held: u64 = mine.iter().map(|c| load(&c.held)).sum();
+        let hold: u64 = mine.iter().map(|c| load(&c.hold)).sum();
+        let live: u64 = mine.iter().map(|c| load(&c.slots)).sum();
+        // Nothing measured yet: the farm's pacing is the bound until a solve
+        // has run its whole life and said what a slot costs.
+        if hold == 0 {
+            return true;
+        }
+        let Ok((free, slack)) = self.cards[card].room() else {
+            return false;
+        };
+        let cap = held + slack + free.saturating_sub(ROUND_RESERVE);
+        live < crate::farm::allows(cap, hold, live)
+    }
+
+    /// What each ordinal's arenas hold and what its card can still hand out.
+    /// The farm logs both; nothing in a run reads them.
+    pub fn memory(&self) -> Vec<(u64, u64)> {
+        self.cards
+            .chunks(STREAMS)
+            .map(|s| {
+                let held = s
+                    .iter()
+                    .map(|c| c.held.load(std::sync::atomic::Ordering::Relaxed))
+                    .sum();
+                (held, s[0].room().map_or(0, |(free, _)| free))
+            })
+            .collect()
     }
 
     /// How many cards the driver can see.
@@ -1145,6 +1167,10 @@ pub struct Resident {
 impl Card {
     fn new(ordinal: usize, net: &Net, own_stream: bool) -> Res<Card> {
         let ctx = CudaContext::new(ordinal).map_err(|e| format!("device {ordinal}: {e:?}"))?;
+        let mut dev: cudarc::driver::sys::CUdevice = 0;
+        unsafe { cudarc::driver::sys::cuDeviceGet(&mut dev, ordinal as i32) }
+            .result()
+            .map_err(err)?;
         // One stream per context and no sharing between them, so the read/write
         // events cudarc would otherwise create on every allocation buy nothing
         // and cost two event creations per buffer.
@@ -1192,13 +1218,8 @@ impl Card {
         let t = layout.norms[LN_TRUNK];
         plan.extend([t.g as i32, t.b as i32]);
         let owed = owed_by_the_join(&layout, &flat.b);
-        // After the weights are up and before any solve is admitted. The box
-        // is shared, so what another process already holds is simply not free.
-        // Every stream of an ordinal reads the same figure and takes a share of
-        // it, because they are all spending the one card's memory.
-        let free = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
-        let budget = free.saturating_sub(ROUND_RESERVE) / STREAMS as u64;
         Ok(Card {
+            dev,
             plan: stream.memcpy_stod(&plan).map_err(err)?,
             owed: stream.memcpy_stod(&owed).map_err(err)?,
             w: stream.memcpy_stod(&flat.w).map_err(err)?,
@@ -1209,8 +1230,9 @@ impl Card {
             stream,
             blas,
             k,
-            budget,
-            peak: std::sync::atomic::AtomicU64::new(0),
+            held: std::sync::atomic::AtomicU64::new(0),
+            slots: std::sync::atomic::AtomicU64::new(0),
+            hold: std::sync::atomic::AtomicU64::new(0),
             solves: parking_lot::Mutex::new(Vec::new()),
             host: parking_lot::Mutex::new(Stage::default()),
             pack: parking_lot::Mutex::new(Pack::default()),
@@ -1219,8 +1241,49 @@ impl Card {
         })
     }
 
+    /// What this card can still hand out: bytes the driver has never given
+    /// away, then bytes the allocator keeps back.
+    ///
+    /// The two are not interchangeable, and treating them as one number filled
+    /// a card. The second is the blocks of the stream-ordered pool: a freed
+    /// arena goes there rather than to the driver, so `mem_get_info` calls it
+    /// taken while the next solve can have it -- and admission that cannot see
+    /// it stops far short of what the card holds. But only *this* process can
+    /// have it. The trainer trains on one of these cards, and what it asks the
+    /// driver for has to come out of the first number. So the reserve is taken
+    /// from the free memory alone.
+    fn room(&self) -> Res<(u64, u64)> {
+        use cudarc::driver::sys;
+        self.stream.context().bind_to_thread().map_err(err)?;
+        let free = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        unsafe { sys::cuDeviceGetDefaultMemPool(&mut pool, self.dev) }.result().map_err(err)?;
+        let attr = |a| -> Res<u64> {
+            let mut v = 0u64;
+            unsafe { sys::cuMemPoolGetAttribute(pool, a, (&mut v as *mut u64).cast()) }
+                .result()
+                .map_err(err)?;
+            Ok(v)
+        };
+        let kept = attr(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT)?;
+        let used = attr(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)?;
+        Ok((free, kept.saturating_sub(used)))
+    }
+
+    /// What this stream's slots hold, for the next admission to read. Taken
+    /// here because the solve lock is this thread's for the round anyway.
+    fn level(&self) {
+        let g = self.solves.lock();
+        let held: u64 = g.iter().map(|s| s.bytes() as u64).sum();
+        let o = std::sync::atomic::Ordering::Relaxed;
+        self.held.store(held, o);
+        self.hold.fetch_max(held, o);
+        self.slots.store(g.len() as u64, o);
+    }
+
     fn round(&self, calls: &[Call], mine: &[usize]) -> Res<Vec<(usize, Reply)>> {
         self.stream.context().bind_to_thread().map_err(err)?;
+        self.level();
         let pick = |kind: usize| -> Vec<usize> {
             mine.iter()
                 .copied()
