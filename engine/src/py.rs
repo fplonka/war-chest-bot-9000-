@@ -647,7 +647,7 @@ struct SolveFarm {
 #[pymethods]
 impl SolveFarm {
     #[new]
-    #[pyo3(signature = (seed, workers, s=512, c=8.0, batch=4, explore=0.1, random_draft=true, cfr="sog", query_rate=0.9, recursive_rate=0.1, devices=vec![0], roots=None))]
+    #[pyo3(signature = (seed, workers, s=512, c=8.0, batch=8, explore=0.1, random_draft=true, cfr="sog", query_rate=0.9, recursive_rate=0.1, devices=vec![0], roots=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         seed: u64,

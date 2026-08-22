@@ -48,7 +48,7 @@ fn options() -> Result<Options, String> {
         cfr: a.text("cfr", "sog"),
         s: a.num("s", 512)?,
         c: a.num("c", 8.0)?,
-        batch: a.num("batch", 4)?,
+        batch: a.num("batch", 8)?,
         threads: a.num("threads", 0)?,
     })
 }

@@ -108,7 +108,7 @@ impl Default for Cfg {
         Cfg {
             s: 512,
             c: 8.0,
-            batch: 4,
+            batch: 8,
             cfr: Cfr::SOG,
             puct: 1.5,
             prior_temp: 1.0,

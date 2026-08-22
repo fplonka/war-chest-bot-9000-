@@ -37,7 +37,7 @@ class Cfg:
     # the per-round cost of re-describing an unchanged tree is paid once for the
     # whole round instead of once each. (`batch` above is the optimizer's, which
     # is a different thing entirely.)
-    round_batch: int = 4
+    round_batch: int = 8
     # Student of Games' q_search and q_recursive: leaves drawn from each solve
     # and queued to be re-solved as roots of their own. This is the only way a
     # target is ever taken off the line of play.
