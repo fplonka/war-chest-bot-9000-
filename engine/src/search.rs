@@ -2470,10 +2470,10 @@ impl Solver {
                 if !self.reserve(Ent::Cidx, self.leaf_cidx.len() + 1) {
                     break;
                 }
+                // A miss returns 0 and sets `abandon`; the index is still
+                // stored so the row's length matches `nc`. The enclosing
+                // `grow` rewinds.
                 let idx = self.intern_config(c, &res, p);
-                if self.abandon {
-                    break;
-                }
                 self.leaf_cidx.push(idx);
             }
         }
