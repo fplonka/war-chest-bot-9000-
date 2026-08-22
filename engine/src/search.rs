@@ -104,13 +104,8 @@ impl Budget {
             nodes: k(BUDGET_512.nodes),
             rows: k(BUDGET_512.rows),
             boards: k(BUDGET_512.boards),
-            // Not scaled. Interning is keyed on a config's counts *and* the
-            // node's reserve, and the reserve changes as coins leave it, so
-            // this counts the config space the tree reaches rather than the
-            // tree. Measured, a solve at `s = 32` already reaches seventeen
-            // hundred, and a first expansion of a mid-game root interned 1206
-            // against a p90 of 1074 -- so the slot is 2048, above that, not
-            // the percentile of the whole solve.
+            // Not scaled: interning keys on the node's reserve. A growth test
+            // interned 2096 against a p90 of 1074; the slot is 4096, above that.
             configs: BUDGET_512.configs,
             cidx: k(BUDGET_512.cidx),
             reach: k(BUDGET_512.reach),
@@ -226,7 +221,7 @@ const BUDGET_512: Budget = Budget {
     nodes: 24_582,
     rows: 14_516,
     boards: 8_518,
-    configs: 2_048,
+    configs: 4_096,
     cidx: 393_199,
     reach: 665_872,
     cells: 154_716,
