@@ -38,7 +38,7 @@ use crate::board::{board, N_HEXES, NONE};
 use crate::farm::{Call, Dst, Prime, Reply, CARD_ROWS};
 use crate::net::{
     ln_block, Net, NetLayout, NormSpan, Span, AFEAT, AW, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW,
-    LN_ACT, LN_CFG, LN_H, LN_JOIN, LN_JOUT, LN_TRUNK, POOL, TYPE,
+    LN_ACT, LN_CFG, LN_H, LN_JOIN, LN_TRUNK, POOL, TYPE,
 };
 use crate::pbs::{
     CFEAT, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_LOOSE, OFF_PILES, PILE_COUNTS, PUBFEAT,
@@ -108,11 +108,9 @@ const KERNELS: &str = include_str!("kernels.cu");
 /// exist is an error there rather than a wrong answer later.
 struct Kernels {
     gelu: CudaFunction,
-    norm: CudaFunction,
     norm_ip: CudaFunction,
     bias: CudaFunction,
     window: CudaFunction,
-    gather: CudaFunction,
     scatter: CudaFunction,
     seed_reach: CudaFunction,
     avg_block: CudaFunction,
@@ -132,7 +130,7 @@ struct Kernels {
     cfg_slots: CudaFunction,
     sum_slots: CudaFunction,
     bag: CudaFunction,
-    join_input: CudaFunction,
+    join: CudaFunction,
     belief_pool: CudaFunction,
     readout: CudaFunction,
     reach_sweep: CudaFunction,
@@ -147,11 +145,9 @@ impl Kernels {
         };
         Ok(Kernels {
             gelu: get("k_gelu")?,
-            norm: get("k_norm")?,
             norm_ip: get("k_norm_ip")?,
             bias: get("k_bias")?,
             window: get("k_window")?,
-            gather: get("k_gather")?,
             scatter: get("k_scatter")?,
             seed_reach: get("k_seed_reach")?,
             avg_block: get("k_avg_block")?,
@@ -171,7 +167,7 @@ impl Kernels {
             cfg_slots: get("k_cfg_slots")?,
             sum_slots: get("k_sum_slots")?,
             bag: get("k_bag")?,
-            join_input: get("k_join_input")?,
+            join: get("k_join")?,
             belief_pool: get("k_belief_pool")?,
             readout: get("k_readout")?,
             reach_sweep: get("k_reach_sweep")?,
@@ -335,11 +331,24 @@ const ROUND_RESERVE: u64 = 6 << 30;
 
 /// Leaf rows a pass works on at once.
 ///
-/// The intermediates of the leaf pass are 5,640 bytes a row, so sizing them by
-/// the whole round is a gigabyte a lane -- and with several cohorts of solves
-/// in flight, memory is what bounds how many. A tile large enough to fill the
-/// card costs ninety megabytes and a handful of extra launches.
+/// The intermediates of the leaf pass are 2,560 bytes a row -- the pooled
+/// belief block and the head, since the join keeps its residual stream in
+/// registers -- so sizing them by the whole round is half a gigabyte a lane,
+/// and with several cohorts of solves in flight, memory is what bounds how
+/// many. A tile large enough to fill the card costs forty-two megabytes and a
+/// handful of extra launches.
 const TILE: usize = 16384;
+
+/// Join rows one block of `k_join` holds.
+///
+/// The block streams all 394 kB of the join's weights past for whatever rows it
+/// carries, so this is the factor by which the weight traffic falls: at the
+/// production stride, thirty-two rows a block is 404 MB of L2 reads a
+/// round-iteration against the kernel's own arithmetic floor of about 200 GFLOP
+/// -- L2 and the SMs then bind at roughly the same level. Sixteen would double
+/// the reads and bind on L2; sixty-four would need 32 kB of shared memory a
+/// block and cut the blocks resident on an SM in half.
+const JROWS: usize = 32;
 
 /// The capacity an array of `want` elements takes: a power of two.
 ///
@@ -1153,7 +1162,18 @@ impl Card {
         let ptx = compile_ptx_with_opts(
             KERNELS,
             CompileOptions {
-                options: vec![format!("--gpu-architecture=compute_{major}{minor}")],
+                // The join is fused into one kernel that holds a row of the
+                // residual stream in registers, so its shapes have to be
+                // constants there rather than arguments.
+                options: vec![
+                    format!("--gpu-architecture=compute_{major}{minor}"),
+                    format!("-DJ_ROWS={JROWS}"),
+                    format!("-DJ_W={JW}"),
+                    format!("-DJ_IN={JOIN_IN}"),
+                    format!("-DJ_POOL={POOL}"),
+                    format!("-DJ_D={D}"),
+                    format!("-DJ_BLOCKS={JBLOCKS}"),
+                ],
                 // `cuda_fp16.h`, for the half-precision config readout.
                 include_paths: vec![
                     "/usr/local/cuda/include".into(),
@@ -1192,6 +1212,21 @@ impl Card {
         let t = layout.norms[LN_TRUNK];
         plan.extend([t.g as i32, t.b as i32]);
         let owed = owed_by_the_join(&layout, &flat.b);
+        // `k_join` reads the join's weights and norms as one run each, so the
+        // fused kernel takes three slices rather than thirteen. `NetLayout`
+        // lays them down back to back; this is where that is a requirement and
+        // not a coincidence.
+        let mut at = layout.join_b.w + JOIN_IN * JW;
+        for span in layout.join_w {
+            assert_eq!(span.w, at, "the join's weights are not one run");
+            at += JW * JW;
+        }
+        assert_eq!(layout.join_out.w, at, "the join's weights are not one run");
+        for i in 0..=JBLOCKS {
+            let n = layout.norms[LN_JOIN + i];
+            assert_eq!(n.g, layout.norms[LN_JOIN].g + 2 * i * JW, "the join's norms are not one run");
+            assert_eq!(n.b, n.g + JW, "a join norm's shift does not follow its scale");
+        }
         // After the weights are up and before any solve is admitted. The box
         // is shared, so what another process already holds is simply not free.
         // Every stream of an ordinal reads the same figure and takes a share of
@@ -1318,57 +1353,19 @@ impl Card {
         self.bias(s, rows, out)
     }
 
-    /// `Norm::apply` when `act`, `Norm::plain` when not, from `src` into `dst`,
-    /// adding what the residual stream is owed as it reads. `owed` is an index
-    /// into `Card::owed`. The two buffers may be the same, which is what a norm
-    /// in place is.
-    fn norm_owed(
-        &self,
-        s: NormSpan,
-        rows: usize,
-        act: bool,
-        src: &CudaSlice<f32>,
-        dst: &mut CudaSlice<f32>,
-        owed: Option<usize>,
-    ) -> Res<()> {
-        if rows == 0 {
-            return Ok(());
-        }
-        let g = self.ln.slice(s.g..s.g + s.width);
-        let b = self.ln.slice(s.b..s.b + s.width);
-        let add = match owed {
-            Some(at) => self.owed.slice(at..at + s.width),
-            // A launch cannot take a null pointer through the builder, so a
-            // norm with nothing owed reads the first sum and is told to ignore
-            // it by `has`.
-            None => self.owed.slice(0..s.width.min(JW)),
-        };
-        let (rows_i, width, act) = (rows as i32, s.width as i32, act as i32);
-        let has = owed.is_some() as i32;
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.norm)
-                .arg(src).arg(dst).arg(&g).arg(&b).arg(&add).arg(&has)
-                .arg(&rows_i).arg(&width).arg(&act)
-                .launch_unit(warp_rows(rows))
-        }
-        .map_err(err)
-    }
-
-    /// The same, in place.
+    /// `Norm::apply` when `act`, `Norm::plain` when not, in place. The join's
+    /// own four norms are inside `k_join`; this serves everything else.
     fn norm(&self, s: NormSpan, rows: usize, act: bool, x: &mut CudaSlice<f32>) -> Res<()> {
         if rows == 0 {
             return Ok(());
         }
         let g = self.ln.slice(s.g..s.g + s.width);
         let b = self.ln.slice(s.b..s.b + s.width);
-        let add = self.owed.slice(0..s.width.min(JW));
         let (rows_i, width, act) = (rows as i32, s.width as i32, act as i32);
-        let has = 0i32;
         unsafe {
             self.stream
                 .launch_builder(&self.k.norm_ip)
-                .arg(x).arg(&g).arg(&b).arg(&add).arg(&has)
+                .arg(x).arg(&g).arg(&b)
                 .arg(&rows_i).arg(&width).arg(&act)
                 .launch_unit(warp_rows(rows))
         }
@@ -2375,20 +2372,25 @@ impl Card {
         }
 
         // Everything after that is a tile of leaves at a time. The pass's
-        // intermediates are 5,640 bytes a leaf row, so sizing them by the whole
-        // round cost a gigabyte a lane -- and lanes are what solves in flight
-        // are now bounded by.
+        // intermediates are 2,560 bytes a leaf row, so sizing them by the whole
+        // round cost half a gigabyte a lane -- and lanes are what solves in
+        // flight are now bounded by.
         let tile = TILE.min(stride);
         sc.pooled.room(s, 2 * tile * POOL)?;
         sc.h.room(s, 2 * tile * D)?;
-        sc.z.room(s, 2 * tile * JW)?;
-        sc.input.room(s, 2 * tile * JOIN_IN)?;
-        sc.t.room(s, 2 * tile * JW)?;
-        let Scratch { w, mass, pooled, h, z, input, t, .. } = &mut *sc;
+        let Scratch { w, mass, pooled, h, .. } = &mut *sc;
         let (w, mass) = (w.buf.as_mut().unwrap(), mass.buf.as_mut().unwrap());
         let pooled = pooled.buf.as_mut().unwrap();
-        let (h, z) = (h.buf.as_mut().unwrap(), z.buf.as_mut().unwrap());
-        let (input, t) = (input.buf.as_mut().unwrap(), t.buf.as_mut().unwrap());
+        let h = h.buf.as_mut().unwrap();
+
+        // `k_join` walks the join's five matrices, its four norms and the
+        // biases they are owed as three runs rather than as thirteen slices.
+        // `NetLayout` hands them out in exactly that order, which `Card::new`
+        // checks once so this does not have to.
+        let join_w = self.w.slice(l.join_b.w..l.join_out.w + JW * D);
+        let ln = l.norms[LN_JOIN];
+        let join_ln = self.ln.slice(ln.g..ln.g + 2 * (JBLOCKS + 1) * JW);
+        let join_owed = self.owed.slice(0..(JBLOCKS + 1) * JW);
 
         let mut q0 = 0usize;
         while q0 < stride {
@@ -2396,7 +2398,6 @@ impl Card {
             let (q0_i, n_i) = (q0 as i32, n as i32);
             let rows = 2 * n;
             let (rows_i, queries_i) = (rows as i32, rows as i32);
-            let jw_i = JW as i32;
             self.stage(5, || {
                 unsafe {
                     self.stream
@@ -2412,37 +2413,23 @@ impl Card {
                 .map_err(err)
             })?;
 
-            // The join cache, gathered out of the solves straight into the
-            // buffer the residual chain accumulates onto.
+            // The whole join: the board seed gathered out of the solves, the
+            // belief block, five multiplies and four norms, in one launch that
+            // never puts a row of the residual stream in memory.
             self.stage(6, || {
-                let one = 1i32;
                 unsafe {
                     self.stream
-                        .launch_builder(&self.k.gather)
-                        .arg(trees).arg(part_d).arg(local_d).arg(&one)
-                        .arg(&mut *z).arg(&rows_i).arg(&jw_i).arg(&q0_i).arg(&n_i)
-                        .launch_unit(rows_of(rows, JW))
+                        .launch_builder(&self.k.join)
+                        .arg(trees).arg(part_d).arg(local_d).arg(&*pooled)
+                        .arg(&join_w).arg(&join_ln).arg(&join_owed)
+                        .arg(&mut *h).arg(&rows_i).arg(&n_i).arg(&q0_i)
+                        .launch_unit(LaunchConfig {
+                            grid_dim: ((rows as u32).div_ceil(JROWS as u32), 1, 1),
+                            block_dim: (JW as u32, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
                 }
-                .map_err(err)?;
-                unsafe {
-                    self.stream
-                        .launch_builder(&self.k.join_input)
-                        .arg(&*pooled).arg(&mut *input).arg(&rows_i).arg(&pool_i).arg(&n_i)
-                        .launch_unit(rows_of(rows, POOL))
-                }
-                .map_err(err)?;
-                self.lin(l.join_b, &*input, rows, 1.0, &mut *z)?;
-                // A residual block is a norm and a multiply. The norm reads `z`,
-                // adds what the stream is owed and writes the scratch in one
-                // pass; the multiply accumulates straight back into `z`.
-                for i in 0..JBLOCKS {
-                    self.norm_owed(l.norms[LN_JOIN + i], rows, true, z, t, Some(i * JW))?;
-                    self.lin(l.join_w[i], &*t, rows, 1.0, &mut *z)?;
-                }
-                self.norm_owed(l.norms[LN_JOUT], rows, true, z, t, Some(JBLOCKS * JW))?;
-                // Nothing seeds `h`: the readout adds the board vector as it
-                // reads, so the multiply owns the buffer outright.
-                self.lin(l.join_out, &*t, rows, 0.0, &mut *h)
+                .map_err(err)
             })?;
 
             let bias = self.b.slice(l.value_bias..l.value_bias + 1);
@@ -2597,12 +2584,9 @@ struct Scratch {
     mass: Arr<f32>,
     /// `[2 * rows, POOL]` the pooled belief block.
     pooled: Arr<f32>,
-    /// `[rows, D]` the head, `[rows, JW]` the residual stream, and the two
-    /// buffers the join's input and its per-block scratch need.
+    /// `[rows, D]` the head. The join's residual stream never reaches memory:
+    /// `k_join` holds it in registers from the board seed to this.
     h: Arr<f32>,
-    z: Arr<f32>,
-    input: Arr<f32>,
-    t: Arr<f32>,
     /// `[parts * sims]` the leaves an expansion phase sampled.
     leaves: Arr<u32>,
 }

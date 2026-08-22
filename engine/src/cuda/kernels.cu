@@ -1,5 +1,5 @@
-// Elementwise and gather work for the value network. The matrix multiplies are
-// cuBLAS; everything that is not a GEMM is here.
+// Elementwise and gather work for the value network, and the join, which is
+// fused into one kernel of its own. Every other matrix multiply is cuBLAS.
 //
 // Compiled by NVRTC at startup, so the shapes arrive as -D defines and the
 // code below is the same arithmetic as `net.rs`, in the same order.
@@ -35,7 +35,8 @@ __global__ void k_gelu(float* x, int n) {
     if (i < n) x[i] = gelu1(x[i]);
 }
 
-// LayerNorm, `src` to `dst`; the two may be the same buffer.
+// LayerNorm in place, with the GELU folded in when `act` -- `Norm::apply`
+// against `Norm::plain`.
 //
 // One row per **warp**, not per block. The rows here are 96 to 256 wide, so a
 // block-wide reduction spends most of its time in `__syncthreads` for a sum a
@@ -43,33 +44,21 @@ __global__ void k_gelu(float* x, int n) {
 // quarter of its lanes idle throughout. Measured at a third of all device
 // time, it was the largest kernel in the profile.
 //
-// `act` folds in the GELU, which is `Norm::apply`; without it this is
-// `Norm::plain`.
-// `add` is the bias of whichever matrix multiply produced `src`, folded in
-// here rather than paid for with a pass of its own. A residual stream is added
-// to, so the bias a block owes it is never actually stored: `add` carries the
-// running sum of every bias the stream has been owed so far, and the norm is
-// the only thing that reads the stream.
-//
-// Rows are ninety-six to two hundred and fifty-six wide, so one row is one
-// **warp**, not one block: a block-wide reduction spends its time in
-// `__syncthreads` for a sum a warp shuffles in five steps.
-__device__ __forceinline__ void norm_row(const float* src, float* dst,
-                                         const float* gamma, const float* beta,
-                                         const float* add, int has, int rows,
-                                         int width, int act) {
+// The join's four norms are not here: they are fused into `k_join`, which
+// keeps its residual stream in registers and never writes a row out to be
+// normalised.
+__global__ void k_norm_ip(float* x, const float* gamma, const float* beta,
+                          int rows, int width, int act) {
     int r = blockIdx.x * blockDim.y + threadIdx.y;
     if (r >= rows) return;
-    const float* in = src + (size_t)r * width;
-    float* out = dst + (size_t)r * width;
+    float* row = x + (size_t)r * width;
     // At most eight values a lane, so the row is read once and kept.
     float v[8];
     int n = 0;
     float sum = 0.0f;
     for (int j = threadIdx.x; j < width; j += 32) {
-        float x = in[j] + (has ? add[j] : 0.0f);
-        v[n++] = x;
-        sum += x;
+        v[n++] = row[j];
+        sum += row[j];
     }
     for (int s = 16; s > 0; s >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, s);
     float mean = sum / width;
@@ -83,21 +72,8 @@ __device__ __forceinline__ void norm_row(const float* src, float* dst,
     n = 0;
     for (int j = threadIdx.x; j < width; j += 32) {
         float y = (v[n++] - mean) * inv * gamma[j] + beta[j];
-        out[j] = act ? gelu1(y) : y;
+        row[j] = act ? gelu1(y) : y;
     }
-}
-
-__global__ void k_norm(const float* src, float* dst, const float* gamma,
-                       const float* beta, const float* add, int has, int rows,
-                       int width, int act) {
-    norm_row(src, dst, gamma, beta, add, has, rows, width, act);
-}
-
-// The same, in place. A separate entry only because one buffer cannot be
-// handed to a launch as both an argument to read and an argument to write.
-__global__ void k_norm_ip(float* x, const float* gamma, const float* beta,
-                          const float* add, int has, int rows, int width, int act) {
-    norm_row(x, x, gamma, beta, add, has, rows, width, act);
 }
 
 // `out[r, j] += b[j]` -- the per-column bias a GEMM does not carry.
@@ -234,7 +210,7 @@ __global__ void k_stem(float* x, const float* projected, const int* occupant,
 #define TRUNK_MAXH 4
 
 // Mean and inverse standard deviation of one hex's row, held `TRUNK_Q` values
-// to a lane across one warp. Two passes, as `norm_row` does, because the
+// to a lane across one warp. Two passes, as `k_norm_ip` does, because the
 // one-pass form loses the difference between two nearly equal sums.
 __device__ __forceinline__ void row_stats(const float* v, int c, float* mean,
                                           float* inv) {
@@ -512,31 +488,6 @@ __global__ void k_bag(const float* bag, const float* phi,
     g[i] += acc;
 }
 
-
-// `[own pooled | opponent pooled | seat]`, the join's belief-dependent input.
-//
-// The batch is both traversers back to back -- rows `0..stride` ask about
-// player zero and `stride..2*stride` about player one, over the same leaves.
-// The join is the only part of the pass that depends on which seat is asking,
-// so running it once over twice the rows costs the same arithmetic and half
-// the launches.
-__global__ void k_join_input(const float* pooled, float* out, int rows, int pool,
-                             int tile) {
-    int r = blockIdx.x;
-    if (r >= rows) return;
-    int width = 2 * pool + 1;
-    // The tile holds `tile` leaves and both of their seats, seat-major, so a
-    // leaf's two pooled rows are adjacent whichever seat is asking.
-    int p = r / tile, q = r % tile;
-    const float* mine = pooled + ((size_t)2 * q + p) * pool;
-    const float* theirs = pooled + ((size_t)2 * q + 1 - p) * pool;
-    float* dst = out + (size_t)r * width;
-    for (int j = threadIdx.x; j < pool; j += blockDim.x) {
-        dst[j] = mine[j];
-        dst[pool + j] = theirs[j];
-    }
-    if (threadIdx.x == 0) dst[2 * pool] = p == 0 ? -1.0f : 1.0f;
-}
 
 // ------------------------------------------------------ a round of solves
 //
@@ -945,21 +896,6 @@ __global__ void k_beliefs(const Tree* trees, const int* part_of_row,
     if (threadIdx.x == 0) mass[(size_t)p * rows + r] = acc;
 }
 
-// Gather each solve's resident board vectors into the round's layout, so the
-// join is one chain of large GEMMs over every solve in flight.
-__global__ void k_gather(const Tree* trees, const int* part_of_row,
-                         const int* local_row, int which, float* out,
-                         int rows, int width, int q0, int tile) {
-    int row = blockIdx.x;
-    if (row >= rows) return;
-    int r = q0 + row % tile;
-    const Tree& t = trees[part_of_row[r]];
-    const float* src = (which == 0 ? t.p : t.jp)
-                     + (size_t)t.board_of[local_row[r]] * width;
-    float* dst = out + (size_t)row * width;
-    for (int j = threadIdx.x; j < width; j += blockDim.x) dst[j] = src[j];
-}
-
 // The belief block the join reads: `sum_c beta(c) g(c)` over one query's
 // support. `coff` bounds a query's cells in the round's `w`, `cidx` names each
 // cell's row in its own solve's `g`.
@@ -990,6 +926,194 @@ __global__ void k_belief_pool(const Tree* trees, const int* part_of_row,
         float total = 0.0f;
         for (int i = 0; i < ny; ++i) total += part_acc[i * pool + j];
         out[(size_t)mine * pool + j] = total;
+    }
+}
+
+// ------------------------------------------------------------- the join MLP
+//
+// `net::Net::join`, whole, in one launch: the residual seed, `join_b`, three
+// LayerNorm-GELU-multiply residual blocks, the output norm and `join_out`.
+//
+// It used to be eleven launches -- two gathers, five cuBLAS multiplies and four
+// norms -- writing a 128-wide row of the residual stream out to DRAM and
+// reading it back at every step. That is 13,832 bytes of activation a join row
+// against 196,864 FLOP, an arithmetic intensity of 14.2 against the card's
+// balance point of 38, so the chain could not exceed a third of the card's
+// peak however well each launch was tuned. Fused, the only traffic is the seed,
+// the pooled beliefs and the head: 2,048 bytes a row, and the kernel is
+// compute-bound.
+//
+// The weights do not fit in shared memory -- the five matrices are 394 kB -- so
+// rows are blocked instead: one block of `J_W` threads owns `J_ROWS` join rows,
+// holds the residual stream in registers (thread `j` owns column `j` of every
+// row the block has) and streams each weight matrix past from L2, where 394 kB
+// against a 6 MB cache is nothing. Only the normalised activations go through
+// shared memory, because the multiply needs a row's whole width and a thread
+// holds one column of it.
+//
+// Every reduction here is in a fixed order that depends on nothing but the row:
+// the multiplies accumulate over `k` in source order, and the norms sum a warp
+// by shuffle and then the four warp totals by index. So a leaf's values are the
+// same whether its solve rides in a round alone or with thirty others, which is
+// what cuBLAS -- picking a tile shape and a split from `(m, n, k)` -- could not
+// promise.
+
+// The shared row of staged activations. Padded to a multiple of four so a
+// thread can read four of a row's values in one 16-byte shared load.
+#define J_LD (((J_IN) + 3) & ~3)
+#define J_WARPS ((J_W) / 32)
+
+// `z[i] += sum_k act[i][k] * w[k][j]`, for the block's rows at once.
+//
+// `k` outermost, so a weight column entry is read once and used by every row
+// the block holds; that is what makes the weight traffic `J_ROWS` times
+// smaller than the naive order. Unrolled four deep because the four values of
+// one row are contiguous in shared memory.
+__device__ __forceinline__ void join_mul(float (&z)[J_ROWS], const float* act,
+                                         const float* w, int k_in) {
+    int j = threadIdx.x;
+    int k = 0;
+    for (; k + 4 <= k_in; k += 4) {
+        float w0 = w[(size_t)(k + 0) * J_W + j];
+        float w1 = w[(size_t)(k + 1) * J_W + j];
+        float w2 = w[(size_t)(k + 2) * J_W + j];
+        float w3 = w[(size_t)(k + 3) * J_W + j];
+        #pragma unroll
+        for (int i = 0; i < J_ROWS; ++i) {
+            const float* v = act + i * J_LD + k;
+            z[i] = fmaf(v[0], w0, z[i]);
+            z[i] = fmaf(v[1], w1, z[i]);
+            z[i] = fmaf(v[2], w2, z[i]);
+            z[i] = fmaf(v[3], w3, z[i]);
+        }
+    }
+    for (; k < k_in; ++k) {
+        float wk = w[(size_t)k * J_W + j];
+        #pragma unroll
+        for (int i = 0; i < J_ROWS; ++i)
+            z[i] = fmaf(act[i * J_LD + k], wk, z[i]);
+    }
+}
+
+// `Norm::apply` over the block's rows: the residual stream, plus the bias it is
+// owed, normalised into `act`.
+//
+// The stream itself is never written back -- `z` is what the next multiply
+// accumulates onto, and a block's bias is carried by `add` as a running sum
+// rather than stored, exactly as the separate norm kernel carried it.
+//
+// The mean and the inverse deviation are per row and so are the same in every
+// thread; they go through shared memory rather than through `J_ROWS` registers
+// a thread. `mu` and `iv` need `J_ROWS <= J_W` threads to fill them.
+__device__ __forceinline__ void join_norm(float (&z)[J_ROWS], float* act,
+                                          float* red, float* mu, float* iv,
+                                          const float* gamma, const float* beta,
+                                          const float* add) {
+    int j = threadIdx.x, warp = j >> 5, lane = j & 31;
+    float bias = add[j];
+    #pragma unroll
+    for (int i = 0; i < J_ROWS; ++i) {
+        float s = warp_sum(z[i] + bias);
+        if (lane == 0) red[i * J_WARPS + warp] = s;
+    }
+    __syncthreads();
+    if (j < J_ROWS) {
+        float total = 0.0f;
+        for (int k = 0; k < J_WARPS; ++k) total += red[j * J_WARPS + k];
+        mu[j] = total / J_W;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < J_ROWS; ++i) {
+        float d = z[i] + bias - mu[i];
+        float s = warp_sum(d * d);
+        if (lane == 0) red[i * J_WARPS + warp] = s;
+    }
+    __syncthreads();
+    if (j < J_ROWS) {
+        float total = 0.0f;
+        for (int k = 0; k < J_WARPS; ++k) total += red[j * J_WARPS + k];
+        iv[j] = rsqrtf(total / J_W + 1e-5f);
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < J_ROWS; ++i)
+        act[i * J_LD + j] = gelu1((z[i] + bias - mu[i]) * iv[i] * gamma[j] + beta[j]);
+    __syncthreads();
+}
+
+// `wj` is the join's weights from `join_b` through `join_out`, which
+// `NetLayout` lays down back to back; `lnj` is the four norms' scale and shift
+// in the same order, `(gamma, beta)` a norm; `owed` is the running sum of the
+// biases the residual stream is owed, one `J_W` block a norm.
+//
+// `rows` is `2 * tile`: the tile's leaves asking as player zero, then the same
+// leaves asking as player one. `q0` and `tile` place a row in the round.
+// Four blocks an SM is what the shared memory allows, so the register budget
+// is capped there rather than left to ptxas, which would spend it hiding the
+// prologue's gathers and leave one block resident.
+__global__ __launch_bounds__(J_W, 4)
+void k_join(const Tree* trees, const int* part_of_row, const int* local_row,
+            const float* pooled, const float* wj, const float* lnj,
+            const float* owed, float* h, int rows, int tile, int q0) {
+    __shared__ __align__(16) float act[J_ROWS * J_LD];
+    __shared__ float red[J_ROWS * J_WARPS];
+    __shared__ float mu[J_ROWS], iv[J_ROWS];
+
+    int j = threadIdx.x, row0 = blockIdx.x * J_ROWS;
+    float z[J_ROWS];
+
+    // The seed of the residual stream is the solve's own `join_p(board)`, and
+    // the input is `[own pooled | opponent pooled | seat]`. Both used to be
+    // gathers of their own into buffers the size of the tile.
+    #pragma unroll
+    for (int i = 0; i < J_ROWS; ++i) {
+        int row = row0 + i;
+        if (row >= rows) {
+            z[i] = 0.0f;
+            for (int c = j; c < J_IN; c += J_W) act[i * J_LD + c] = 0.0f;
+            continue;
+        }
+        // The tile holds `tile` leaves and both of their seats, seat-major, so
+        // a leaf's two pooled rows are adjacent whichever seat is asking.
+        int p = row >= tile ? 1 : 0, q = row - p * tile, r = q0 + q;
+        const Tree& t = trees[part_of_row[r]];
+        z[i] = t.jp[(size_t)t.board_of[local_row[r]] * J_W + j];
+        const float* mine = pooled + ((size_t)2 * q + p) * J_POOL;
+        const float* theirs = pooled + ((size_t)2 * q + 1 - p) * J_POOL;
+        for (int c = j; c < 2 * J_POOL; c += J_W)
+            act[i * J_LD + c] = c < J_POOL ? mine[c] : theirs[c - J_POOL];
+        if (j == 0) act[i * J_LD + 2 * J_POOL] = p == 0 ? -1.0f : 1.0f;
+    }
+    __syncthreads();
+
+    join_mul(z, act, wj, J_IN);
+    const float* w = wj + (size_t)J_IN * J_W;
+    for (int blk = 0; blk < J_BLOCKS; ++blk) {
+        join_norm(z, act, red, mu, iv, lnj + 2 * blk * J_W, lnj + (2 * blk + 1) * J_W,
+                  owed + blk * J_W);
+        join_mul(z, act, w, J_W);
+        w += (size_t)J_W * J_W;
+    }
+    join_norm(z, act, red, mu, iv, lnj + 2 * J_BLOCKS * J_W,
+              lnj + (2 * J_BLOCKS + 1) * J_W, owed + J_BLOCKS * J_W);
+
+    // `join_out` widens to `J_D`, so a thread owns more than one column of the
+    // head. `z` is dead by now -- the stream ends at the norm above -- so it
+    // carries the accumulator for one column at a time rather than for all of
+    // them at once. `k_readout` adds the head's own bias and its board seed.
+    for (int col = j; col < J_D; col += J_W) {
+        #pragma unroll
+        for (int i = 0; i < J_ROWS; ++i) z[i] = 0.0f;
+        for (int k = 0; k < J_W; ++k) {
+            float wk = w[(size_t)k * J_D + col];
+            #pragma unroll
+            for (int i = 0; i < J_ROWS; ++i)
+                z[i] = fmaf(act[i * J_LD + k], wk, z[i]);
+        }
+        #pragma unroll
+        for (int i = 0; i < J_ROWS; ++i)
+            if (row0 + i < rows) h[(size_t)(row0 + i) * J_D + col] = z[i];
     }
 }
 
