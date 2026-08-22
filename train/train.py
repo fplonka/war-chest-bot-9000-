@@ -677,6 +677,7 @@ def main():
             s=args.s,
             c=args.c,
             batch=args.round_batch,
+            rounds=args.rounds,
             explore=args.explore,
             random_draft=args.random_draft,
             cfr=args.cfr,

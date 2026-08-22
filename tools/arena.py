@@ -81,7 +81,8 @@ class Bot:
         if self.spec.get("weights"):
             argv += ["--weights", str(self.dir / self.spec["weights"])]
         search = self.spec.get("search", {})
-        for key, flag in (("s", "--s"), ("c", "--c"), ("cfr", "--cfr")):
+        for key, flag in (("s", "--s"), ("c", "--c"), ("rounds", "--rounds"),
+                          ("cfr", "--cfr")):
             if key in search:
                 argv += [flag, str(search[key])]
         if threads and "s" in search:
@@ -742,6 +743,7 @@ def pack(run, binary, out_dir, snapshot=None, name=None):
                                 weights_only=False)
         search = {"s": cfg.get("s", 512),
                   "c": cfg.get("c", 8.0),
+                  "rounds": cfg.get("rounds", 0),
                   "cfr": cfg.get("cfr", "sog")}
         bot = name or f"{run.name}.{snap['label']}"
         directory = out_dir / bot

@@ -38,6 +38,9 @@ class Cfg:
     # whole round instead of once each. (`batch` above is the optimizer's, which
     # is a different thing entirely.)
     round_batch: int = 8
+    # Round boundaries tree growth may pass through, 0 being today's limit.
+    # Two converged solves disagree on the root value by 0.077 across it.
+    rounds: int = 0
     # Student of Games' q_search and q_recursive: leaves drawn from each solve
     # and queued to be re-solved as roots of their own. This is the only way a
     # target is ever taken off the line of play.

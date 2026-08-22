@@ -58,6 +58,7 @@ def bench(args, devices, threads):
         s=args.s,
         c=args.c,
         batch=args.batch,
+        rounds=args.rounds,
         cfr=args.cfr,
         recursive_rate=args.recursive_rate,
         devices=devices,
@@ -111,6 +112,8 @@ def main():
                    help="expansions per regret update")
     p.add_argument("--batch", type=int, default=PROD.round_batch,
                    help="regret updates one round of a solve carries")
+    p.add_argument("--rounds", type=int, default=PROD.rounds,
+                   help="round boundaries tree growth may pass through")
     p.add_argument("--cfr", default=PROD.cfr, help="the run's regret rule")
     p.add_argument("--query-rate", type=float, default=PROD.query_rate,
                    help="leaves a self-play solve queues, when making a corpus")

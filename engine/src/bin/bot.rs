@@ -33,13 +33,14 @@ struct Options {
     s: u32,
     c: f32,
     batch: usize,
+    rounds: u8,
     cfr: String,
     threads: usize,
 }
 
 fn options() -> Result<Options, String> {
     let a = Args::parse(&[
-        "name", "weights", "mind", "s", "c", "batch", "cfr", "threads",
+        "name", "weights", "mind", "s", "c", "batch", "rounds", "cfr", "threads",
     ])?;
     Ok(Options {
         name: a.text("name", "bot"),
@@ -49,6 +50,7 @@ fn options() -> Result<Options, String> {
         s: a.num("s", 512)?,
         c: a.num("c", 8.0)?,
         batch: a.num("batch", 8)?,
+        rounds: a.num("rounds", 0)?,
         threads: a.num("threads", 0)?,
     })
 }
@@ -67,7 +69,7 @@ fn brain(o: &Options, cards: Option<Arc<Cards>>) -> Result<Brain, String> {
     Ok(Brain {
         mind,
         nets: Arc::new(nets),
-        cfg: Cfg { s: o.s, c: o.c, batch: o.batch, cfr, ..Default::default() },
+        cfg: Cfg { s: o.s, c: o.c, batch: o.batch, rounds: o.rounds, cfr, ..Default::default() },
         cards,
     })
 }
