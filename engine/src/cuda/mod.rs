@@ -660,14 +660,23 @@ impl Device {
             .collect::<Res<Vec<_>>>()?;
         let budget = cfg.budget;
         cards[0].stream.context().bind_to_thread().map_err(err)?;
-        let slot = Solve::at_budget(&cards[0].stream, &budget)?.bytes() as u64;
+        let slot = {
+            let s = Solve::at_budget(&cards[0].stream, &budget)?;
+            let n = s.bytes() as u64;
+            drop(s);
+            cards[0].stream.synchronize().map_err(err)?;
+            n
+        };
         let mut left = max_slots;
         for (o, card) in cards.iter_mut().enumerate() {
             card.stream.context().bind_to_thread().map_err(err)?;
             let free = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
             let tile = round_bytes(0, &budget, cfg.s) as u64;
             let per = slot + (round_bytes(1, &budget, cfg.s) as u64).saturating_sub(tile);
-            let fit = free.saturating_sub(tile) / per.max(1);
+            // A slot is fifty allocations. Packing the reported free figure to
+            // the last byte OOMs on fragmentation; keep a tenth.
+            let usable = free.saturating_sub(tile);
+            let fit = (usable - usable / 10) / per.max(1);
             let n = (fit as usize).min(left);
             if o == 0 && n == 0 {
                 return Err(format!(
@@ -675,7 +684,9 @@ impl Device {
                 ));
             }
             left = left.saturating_sub(n);
-            card.carve(n, &cfg)?;
+            card.carve(n, &cfg).map_err(|e| {
+                format!("carve card {o} n={n} slot={slot} free={free}: {e}")
+            })?;
             card.stream.synchronize().map_err(err)?;
         }
         Ok(Device { cards, net, slot_bytes: slot as usize })
