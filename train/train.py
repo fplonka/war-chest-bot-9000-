@@ -65,7 +65,12 @@ N_HEXES = warchest.N_HEXES
 
 # What `SolveFarm.collect` reports about the device rounds, cumulative
 # since the farm started. `rounds` is the denominator of the other three.
-ROUND_KEYS = ("rounds", "round_calls", "round_rows", "round_nanos")
+ROUND_KEYS = ("rounds", "round_calls", "round_rows", "round_nanos", "budget_hits")
+
+# Fraction of the training GPU torch may hold. The farm carves whatever is
+# left. Set before the farm starts, and reserved by a live tensor so
+# `mem_get_info` sees it.
+TRAIN_FRAC = 0.25
 
 
 def action_feats(pa):
@@ -589,6 +594,10 @@ def main():
     if args.gen_solves <= 0 or args.gen_workers <= 0:
         raise SystemExit("gen_solves and resolved gen_workers must be positive")
     torch.cuda.set_device(dev)
+    train_idx = int(str(args.device).split(":")[-1])
+    gen_idx = {int(d) for d in args.gen_devices.split(",") if d.strip() != ""}
+    if train_idx in gen_idx:
+        torch.cuda.set_per_process_memory_fraction(TRAIN_FRAC, dev)
     if args.train_stream_priority > 0:
         raise SystemExit("train_stream_priority must be zero or negative")
     if args.train_stream_priority < 0:
@@ -607,9 +616,22 @@ def main():
     next_decay = 0
     value.push()
     buf = Buffer(args.cap, args.cap * args.cfgs_per_row)
+    # Commit the replay pages so the farm carves what is actually left.
+    buf.x.fill(0)
     import gpu_batch
     gpu_batch.warmup(dev)
     batcher = gpu_batch.make_batch
+    _torch_hold = None
+    if train_idx in gen_idx:
+        cap = int(TRAIN_FRAC * torch.cuda.get_device_properties(dev).total_memory)
+        used = torch.cuda.memory_reserved(dev)
+        extra = max(0, cap - used)
+        if extra:
+            _torch_hold = torch.empty(extra // 4, dtype=torch.float32, device=dev)
+        print(f"[train] torch holds {TRAIN_FRAC:.0%} of {dev} "
+              f"({cap / (1 << 20):.0f} MiB, {used / (1 << 20):.0f} in use); "
+              f"the farm carves the rest",
+              flush=True)
     print(f"[train] search inference on cuda:{args.gen_devices}, "
           f"training on {dev}", flush=True)
 
@@ -911,7 +933,13 @@ def main():
                 "solves_per_s": round(raw_sps, 1),
                 "lr": opt.param_groups[0]["lr"],
                 "policy_loss": window["policy_sum"] / max(window["train_steps"], 1),
+                "budget_hits": int(now_at.get("budget_hits", 0)
+                                   - round_at.get("budget_hits", 0)),
+                "slots": int(data.get("slots", 0)),
+                "slots_used": int(data.get("slots_used", 0)),
             }
+            rec["budget_hit_rate"] = round(
+                rec["budget_hits"] / max(rec["solves"], 1), 3)
             log.append(rec)
             write_log(args, log, snaps)
             print(

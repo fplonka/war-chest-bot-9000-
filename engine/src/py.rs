@@ -488,7 +488,7 @@ impl Game {
 
 use crate::net::Net;
 use crate::farm::{Backend, Farm, Work};
-use crate::search::{Cfg, Cfr, Nets};
+use crate::search::{Budget, Cfg, Cfr, Nets};
 use crate::selfplay::{run_games, Agent, Collect, Data, GameCfg};
 use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2};
 use parking_lot::RwLock;
@@ -665,7 +665,7 @@ impl SolveFarm {
         devices: Vec<usize>,
         roots: Option<&str>,
     ) -> PyResult<SolveFarm> {
-        let cfg = Cfg { s, c, batch, rounds, cfr: cfr_of(cfr)?, ..Default::default() };
+        let cfg = Cfg { s, c, batch, rounds, cfr: cfr_of(cfr)?, budget: Budget::for_s(s), ..Default::default() };
         // A corpus makes this a bench rather than a run: the same roots in the
         // same order, so the mix of solve costs in flight does not drift.
         let work = match roots {
@@ -694,7 +694,7 @@ impl SolveFarm {
             }
         };
         let version = NET_VERSION.load(Ordering::Acquire);
-        let backend = backend_for(&devices, (**nets().read()).value.clone())?;
+        let backend = backend_for(&devices, (**nets().read()).value.clone(), cfg)?;
         Ok(SolveFarm {
             farm: Farm::new(seed, workers, work, backend),
             net_version: version,
@@ -738,19 +738,24 @@ impl SolveFarm {
         // What the population is, rather than what it is guessed to be: solves
         // in flight, what the host budget allowed at the last admission, and
         // the largest a solve has grown to in host bytes.
-        dict.set_item("live", s.live())?;
-        dict.set_item("live_allowed", s.allowed())?;
-        dict.set_item("host_peak", s.host_peak())?;
+        dict.set_item("slots", s.slots())?;
+        dict.set_item("slots_used", s.used())?;
+        dict.set_item("budget_hits", s.budget_hits())?;
         Ok(out)
     }
 }
 
 /// The devices. There is no CPU fallback on purpose: a run that cannot reach a
 /// GPU is two orders of magnitude off and should say so rather than crawl.
-fn backend_for(_devices: &[usize], _value: crate::net::Net) -> PyResult<Backend> {
+fn backend_for(
+    _devices: &[usize],
+    _value: crate::net::Net,
+    #[allow(unused)] cfg: Cfg,
+) -> PyResult<Backend> {
     #[cfg(feature = "gpu")]
     {
-        return crate::cuda::Device::new(_devices, _value)
+        let max_slots = crate::farm::host_slots(cfg.budget);
+        return crate::cuda::Device::new(_devices, _value, cfg, max_slots)
             .map(Backend::Cuda)
             .map_err(pyo3::exceptions::PyRuntimeError::new_err);
     }
@@ -775,7 +780,7 @@ fn gen_data(
     p_td1: f32,
     cfr: &str,
 ) -> PyResult<PyObject> {
-    let cfg = Cfg { s, c, cfr: cfr_of(cfr)?, ..Default::default() };
+    let cfg = Cfg { s, c, cfr: cfr_of(cfr)?, budget: Budget::for_s(s), ..Default::default() };
     let agent = Agent::Sog { cfg };
     let gc = GameCfg {
         agents: [agent, agent],
@@ -821,7 +826,7 @@ fn save_roots(
     query_rate: f32,
     recursive_rate: f32,
 ) -> PyResult<usize> {
-    let cfg = Cfg { s, c, ..Default::default() };
+    let cfg = Cfg { s, c, budget: Budget::for_s(s), ..Default::default() };
     let gc = GameCfg {
         agents: [Agent::Sog { cfg }; 2],
         collect: Collect::Sog,
