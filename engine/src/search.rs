@@ -225,7 +225,7 @@ const BUDGET_512: Budget = Budget {
     cidx: 393_199,
     reach: 665_872,
     cells: 262_144,
-    draws: 400_000,
+    draws: 524_288,
 };
 
 #[derive(Clone, Copy)]
