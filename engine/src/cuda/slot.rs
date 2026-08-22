@@ -204,7 +204,10 @@ impl Tree {
             rvd_src: u32(d)?,
             rvd_p: f32(d)?,
             draw_base: u32(n)?,
-            draw_start: u32(n)?,
+            // CSR start indices, one per parent config of a chance node plus a
+            // sentinel. That is `reach`, not `nodes`; sizing it at `n` was a
+            // write past the slot on the first real root.
+            draw_start: u32(r)?,
             draw_to: u32(d)?,
             draw_p: f32(d)?,
             level_start: u32(n)?,

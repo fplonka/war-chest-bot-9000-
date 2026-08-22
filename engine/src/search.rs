@@ -172,8 +172,9 @@ impl Budget {
         // both config counts, parent, roff, voff, soff, util, child_at,
         // child_n, legal_base, rev_base, rvd_base, draw_base, the child slot
         // every node but the root fills, and a level bound each way.
+        // `draw_start` is a config CSR like `legal_off`, so it sits on reach.
         let tree = self.nodes * 19 * u
-            + (self.reach + self.nodes) * 4 * u
+            + (self.reach + self.nodes) * 5 * u
             + self.cells * 6 * u
             + self.draws * 4 * u;
         leaf + cfr + tree + 8
