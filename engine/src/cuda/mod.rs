@@ -333,7 +333,7 @@ fn round_bytes(n_slots: usize, b: &Budget, s: u32) -> usize {
     let f = 4;
     let tile = 2 * TILE * (POOL + D + JW + JOIN_IN + JW) * f;
     let trunk = TILE * (PUBFEAT + D + JW + C * NTYPE) * f;
-    let w = n_slots * b.cells * f;
+    let w = n_slots * b.cidx * f;
     let mass = 2 * n_slots * b.rows * f;
     let leaves = n_slots * s.max(1) as usize * f;
     tile + trunk + w + mass + leaves
@@ -862,7 +862,9 @@ impl Card {
         }
         let mut scratch = Scratch::default();
         let s = &self.stream;
-        scratch.w = Arr::with_cap(s, n * b.cells)?;
+        // `w` is the round's belief weights, one per belief-index entry, so it
+        // is `cidx` a slot, not `cells`.
+        scratch.w = Arr::with_cap(s, n * b.cidx)?;
         scratch.mass = Arr::with_cap(s, 2 * n * b.rows)?;
         scratch.pooled = Arr::with_cap(s, 2 * TILE * POOL)?;
         scratch.h = Arr::with_cap(s, 2 * TILE * D)?;
