@@ -881,3 +881,70 @@ fn a_subgame_scored_from_the_game_agrees_with_the_cpu() {
     }
     panic!("only {checked} such positions were reached in 600 seeds");
 }
+
+/// K iterates in one `Device::run` must match K sequential runs on copies of
+/// the same frozen tree: the leaves, and the resident CFR arenas.
+///
+/// `c = 0` fixes the tree. The copies occupy different slots of one card, so
+/// a bug that reads a bound from the batch where it belongs to the solve
+/// shows up as a slot that moved.
+#[test]
+fn k_iterates_together_match_k_iterates_alone() {
+    if Device::count() == 0 {
+        eprintln!("no cuda device; skipping");
+        return;
+    }
+    const K: usize = 4;
+    let net = random_net(0x9E37);
+    let device = gpu(net.clone());
+    let nets = Arc::new(Nets { value: net.clone(), device: true });
+    let mut setup = Vec::new();
+    let mut iterates = Vec::new();
+    for i in 0..2 * K {
+        let mut data = Data::default();
+        let mut sv = GameStream::new(0x51E5, game_cfg(8, 0.0)).next_solve(&nets, &mut data);
+        sv.pin(i);
+        match sv.advance(&[]) {
+            Step::Calls(cs) => {
+                for c in cs {
+                    if matches!(c, Call::Iterate { .. }) {
+                        iterates.push(c);
+                    } else {
+                        setup.push(c);
+                    }
+                }
+            }
+            Step::Done(_) => panic!("a fresh solve is already done"),
+        }
+    }
+    device.run(&setup, 0).expect("setup");
+    assert_eq!(iterates.len(), 2 * K, "each copy owes one iterate");
+
+    let batched = device.run(&iterates[..K], 0).expect("batched iterate");
+    let mut serial = Vec::new();
+    for c in iterates[K..].iter().cloned() {
+        serial.extend(device.run(std::slice::from_ref(&c), 0).expect("serial iterate"));
+    }
+    assert_eq!(batched.len(), K);
+    assert_eq!(serial.len(), K);
+
+    for i in 0..K {
+        assert_eq!(
+            batched[i].leaves, serial[i].leaves,
+            "slot {i}: batched iterate sampled different leaves"
+        );
+        let a = device.resident(0, i).expect("batched resident");
+        let b = device.resident(0, i + K).expect("serial resident");
+        for (what, x, y) in [
+            ("cur", a.cur.as_slice(), b.cur.as_slice()),
+            ("sum", a.sum.as_slice(), b.sum.as_slice()),
+            ("qval", a.qval.as_slice(), b.qval.as_slice()),
+            ("visits", a.visits.as_slice(), b.visits.as_slice()),
+            ("reach", a.reach.as_slice(), b.reach.as_slice()),
+        ] {
+            let bad = worst(x, y, what);
+            eprintln!("slot {i} {what}: worst {bad:e} over {} values", x.len());
+            assert!(bad < 1e-3, "slot {i} {what} differ by {bad:e}");
+        }
+    }
+}
