@@ -114,7 +114,6 @@ struct Kernels {
     scatter: CudaFunction,
     seed_reach: CudaFunction,
     avg_block: CudaFunction,
-    beliefs: CudaFunction,
     terminals: CudaFunction,
     expand: CudaFunction,
     finish: CudaFunction,
@@ -151,7 +150,6 @@ impl Kernels {
             scatter: get("k_scatter")?,
             seed_reach: get("k_seed_reach")?,
             avg_block: get("k_avg_block")?,
-            beliefs: get("k_beliefs")?,
             terminals: get("k_terminals")?,
             expand: get("k_expand")?,
             finish: get("k_finish")?,
@@ -723,7 +721,6 @@ struct Batch {
     /// with a shorter grid and fewer rows, at no host cost.
     upto: Vec<Prefix>,
     parts: u32,
-    cells: usize,
 }
 
 impl Batch {
@@ -1995,7 +1992,6 @@ impl Card {
             base: Self::alone(s, &mut stage.base, &base)?,
             upto,
             parts: solves.len() as u32,
-            cells: cells as usize,
         })
     }
 
@@ -2327,10 +2323,8 @@ impl Card {
 
     /// The network at every leaf of the round, for both traversers at once.
     ///
-    /// Normalise the beliefs, pool them, run the join, read the values out into
-    /// each solve's own value arena. The beliefs and the pooling do not depend
-    /// on which seat is asking, so they run once; the join and the readout do,
-    /// and run over a batch of twice the rows rather than twice.
+    /// Pool the normalised beliefs, run the join, read the values out into each
+    /// solve's own value arena. Three launches a tile, one stage each.
     #[allow(clippy::too_many_arguments)]
     fn network(&self, b: &Batch, p: &Prefix) -> Res<()> {
         let (trees, part_d, local_d, base_d, coff_d) =
@@ -2347,29 +2341,11 @@ impl Card {
         let (stride_i, pool_i, d_i) = (stride as i32, POOL as i32, D as i32);
         let s = &self.stream;
 
-        // The beliefs are normalised once for the whole round: `w` is indexed
-        // by the round's own cell offsets and `mass` by its rows, so neither
-        // belongs to a tile.
-        sc.w.room(s, b.cells)?;
+        // `mass` is indexed by the round's rows, so it belongs to the round
+        // rather than to a tile; the reach mass of both seats of a leaf is
+        // written by the tile that leaf falls in, and read by the same tile's
+        // readout.
         sc.mass.room(s, 2 * stride)?;
-        {
-            let Scratch { w, mass, .. } = &mut *sc;
-            let (w, mass) = (w.buf.as_mut().unwrap(), mass.buf.as_mut().unwrap());
-            self.stage(5, || {
-                unsafe {
-                    self.stream
-                        .launch_builder(&self.k.beliefs)
-                        .arg(trees).arg(part_d).arg(local_d).arg(coff_d)
-                        .arg(&mut *w).arg(&mut *mass).arg(&stride_i)
-                        .launch_unit(LaunchConfig {
-                            grid_dim: ((stride as u32).div_ceil(8).max(1), 2, 1),
-                            block_dim: (32, 8, 1),
-                            shared_mem_bytes: 0,
-                        })
-                }
-                .map_err(err)
-            })?;
-        }
 
         // Everything after that is a tile of leaves at a time. The pass's
         // intermediates are 2,560 bytes a leaf row, so sizing them by the whole
@@ -2378,8 +2354,8 @@ impl Card {
         let tile = TILE.min(stride);
         sc.pooled.room(s, 2 * tile * POOL)?;
         sc.h.room(s, 2 * tile * D)?;
-        let Scratch { w, mass, pooled, h, .. } = &mut *sc;
-        let (w, mass) = (w.buf.as_mut().unwrap(), mass.buf.as_mut().unwrap());
+        let Scratch { mass, pooled, h, .. } = &mut *sc;
+        let mass = mass.buf.as_mut().unwrap();
         let pooled = pooled.buf.as_mut().unwrap();
         let h = h.buf.as_mut().unwrap();
 
@@ -2402,8 +2378,9 @@ impl Card {
                 unsafe {
                     self.stream
                         .launch_builder(&self.k.belief_pool)
-                        .arg(trees).arg(part_d).arg(base_d).arg(coff_d).arg(&*w)
-                        .arg(&mut *pooled).arg(&(2 * q0_i)).arg(&queries_i).arg(&pool_i)
+                        .arg(trees).arg(part_d).arg(local_d).arg(base_d).arg(coff_d)
+                        .arg(&mut *pooled).arg(&mut *mass)
+                        .arg(&(2 * q0_i)).arg(&queries_i).arg(&stride_i).arg(&pool_i)
                         .launch_unit(LaunchConfig {
                             grid_dim: (rows as u32, 1, 1),
                             block_dim: (POOL as u32, 8, 1),
@@ -2579,8 +2556,7 @@ struct Stage {
 /// read, so they are grown rather than cleared.
 #[derive(Default)]
 struct Scratch {
-    /// `[cells]` normalised beliefs, and `[2, rows]` reach mass per player.
-    w: Arr<f32>,
+    /// `[2, rows]` reach mass per player.
     mass: Arr<f32>,
     /// `[2 * rows, POOL]` the pooled belief block.
     pooled: Arr<f32>,

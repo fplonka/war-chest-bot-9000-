@@ -869,63 +869,68 @@ __global__ void k_avg_block(const Tree* trees, const unsigned int* work, int at,
         t.sum[so + cell] += t.reach[ra + t.cell_row[so + cell]] * t.cur[so + cell];
 }
 
-// Every leaf's normalised belief, and the opponent's reach mass there. One
-// block per (row, player); `w` and `oppmass` are what the network reads.
-__global__ void k_beliefs(const Tree* trees, const int* part_of_row,
-                          const int* local_row, const unsigned int* coff, float* w,
-                          float* mass, int rows) {
-    // A warp to a query, eight warps to a block. One warp per block left an SM
-    // holding sixteen of them and a quarter of its lanes busy, on a kernel that
-    // is nothing but dependent gathers and wants every warp it can get.
-    int r = blockIdx.x * blockDim.y + threadIdx.y;
-    if (r >= rows) return;
-    int part = part_of_row[r];
-    const Tree& t = trees[part];
-    unsigned int node = t.leaf_node[local_row[r]];
-    int p = blockIdx.y;
-    unsigned int n = t.nc[2 * node + p], ra = rbase(t, node, p);
-    unsigned int lo = coff[2 * r + p];
-    // One warp: the support is tens of configs, and the sum has to be seen by
-    // every thread that then divides by it.
-    float acc = 0.0f;
-    for (unsigned int c = threadIdx.x; c < n; c += 32) acc += t.reach[ra + c];
-    for (int s = 16; s > 0; s >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, s);
-    float inv = acc > 0.0f ? 1.0f / acc : 1.0f / (float)max(n, 1u);
-    for (unsigned int c = threadIdx.x; c < n; c += 32)
-        w[lo + c] = acc > 0.0f ? t.reach[ra + c] * inv : inv;
-    if (threadIdx.x == 0) mass[(size_t)p * rows + r] = acc;
-}
-
 // The belief block the join reads: `sum_c beta(c) g(c)` over one query's
-// support. `coff` bounds a query's cells in the round's `w`, `cidx` names each
-// cell's row in its own solve's `g`.
-// The belief-weighted pooling of a query's configs.
+// support, with the belief itself normalised on the way past.
+//
+// One block per query -- a leaf and the seat asking about it -- so the reach
+// sum that normalises the belief and the pooling that consumes it are the same
+// iteration space. They used to be two kernels with a round-wide array of
+// normalised weights between them, which cost two passes over every belief
+// cell in the round and hundreds of megabytes a stream that could not be
+// tiled, because the array was indexed by the round's cell offsets.
+//
+// `coff` bounds a query's cells in the round, `cidx` names each cell's row in
+// its own solve's `g`, and the two orders agree: cell `k` of the query is
+// config `k - lo` of the node, so its reach is a step along the node's own
+// block.
 //
 // `threadIdx.y` splits the support, because that is where the parallelism is:
 // the row is only `pool` wide and the sum runs over a hundred-odd configs, each
 // a dependent gather. One thread per output channel walked the whole support
 // serially and left the block waiting on memory.
 __global__ void k_belief_pool(const Tree* trees, const int* part_of_row,
-                              const int* base_of_part, const unsigned int* coff,
-                              const float* w, float* out, int q0, int queries,
-                              int pool) {
+                              const int* local_row, const int* base_of_part,
+                              const unsigned int* coff, float* out, float* mass,
+                              int q0, int queries, int stride, int pool) {
     extern __shared__ float part_acc[];
+    __shared__ float reach_sum;
     int mine = blockIdx.x;
     if (mine >= queries) return;
-    int q = q0 + mine;
-    int part = part_of_row[q >> 1];
+    int q = q0 + mine, r = q >> 1, p = q & 1;
+    int part = part_of_row[r];
     const Tree& t = trees[part];
+    unsigned int node = t.leaf_node[local_row[r]];
+    unsigned int n = t.nc[2 * node + p], ra = rbase(t, node, p);
     unsigned int base = base_of_part[part], lo = coff[q], hi = coff[q + 1];
     int j = threadIdx.x, y = threadIdx.y, ny = blockDim.y;
+    // The block's first warp sums the query's reach, in the same five shuffles
+    // over the same lane order the separate belief kernel used, so the belief
+    // it hands on is the one that array held. Every thread then divides by it,
+    // which is why the sum goes through shared memory.
+    int tid = j + blockDim.x * y;
+    if (tid < 32) {
+        float sum = 0.0f;
+        for (unsigned int c = tid; c < n; c += 32) sum += t.reach[ra + c];
+        sum = warp_sum(sum);
+        if (tid == 0) {
+            reach_sum = sum;
+            mass[(size_t)p * stride + r] = sum;
+        }
+    }
+    __syncthreads();
+    float total = reach_sum;
+    float inv = total > 0.0f ? 1.0f / total : 1.0f / (float)max(n, 1u);
     float acc = 0.0f;
-    for (unsigned int k = lo + y; k < hi; k += ny)
-        acc += w[k] * t.g[(size_t)t.cidx[k - base] * pool + j];
+    for (unsigned int k = lo + y; k < hi; k += ny) {
+        float beta = total > 0.0f ? t.reach[ra + (k - lo)] * inv : inv;
+        acc += beta * t.g[(size_t)t.cidx[k - base] * pool + j];
+    }
     part_acc[y * pool + j] = acc;
     __syncthreads();
     if (y == 0) {
-        float total = 0.0f;
-        for (int i = 0; i < ny; ++i) total += part_acc[i * pool + j];
-        out[(size_t)mine * pool + j] = total;
+        float pooled = 0.0f;
+        for (int i = 0; i < ny; ++i) pooled += part_acc[i * pool + j];
+        out[(size_t)mine * pool + j] = pooled;
     }
 }
 
