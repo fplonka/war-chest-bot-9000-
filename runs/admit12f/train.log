@@ -1,0 +1,35 @@
+[train] runs/admit12f at e862826 seed=1 {'minutes': 12.0, 'snapshot_every': 300.0, 'ladder_games': 0, 's': 512, 'round_batch': 8, 'note': 'admission soak'}
+[train] admission soak
+[train] CUDA stream priority -1
+[train] search inference on cuda:0,1, training on cuda:1
+[cfg] PUBFEAT=897 CFEAT=15 architecture=gt-cfr s=512 c=8.0 budget=720s snapshot_every=300min device=cuda:1 draft=random replay_ratio=8.0 recent_mix=0.5/0.2 canonical_views=2 cap=1000000 matmul=high
+[t=   0.0s] --- snapshot snap_00.pt (init) ---
+[t=  29.8s] GT-CFR solves=434 rate=14.6/s rows=434 games=0 qrows=202 L=0.00000 L/var=0.00 Lp=0.000 tgt=-0.066/0.017 gen=0.19s train=0.00s gpu=0.00s
+[t=  40.0s] GT-CFR solves=1005 rate=25.1/s rows=571 games=0 qrows=254 L=0.00000 L/var=0.00 Lp=0.000 tgt=-0.063/0.017 gen=0.14s train=0.00s gpu=0.00s
+[t=  54.8s] GT-CFR solves=1030 rate=18.8/s rows=25 games=0 qrows=10 L=1.67354 L/var=5527.13 Lp=2.396 tgt=-0.065/0.017 gen=0.30s train=13.86s gpu=0.00s
+[t=  65.6s] GT-CFR solves=2437 rate=37.2/s rows=1407 games=0 qrows=649 L=0.10638 L/var=362.71 Lp=2.319 tgt=-0.064/0.017 gen=0.11s train=6.86s gpu=0.00s
+[t=  75.9s] GT-CFR solves=3036 rate=40.0/s rows=599 games=0 qrows=263 L=0.04958 L/var=143.66 Lp=2.328 tgt=-0.066/0.019 gen=0.14s train=1.87s gpu=0.00s
+[t=  86.1s] GT-CFR solves=3591 rate=41.7/s rows=555 games=0 qrows=264 L=0.04144 L/var=131.66 Lp=2.344 tgt=-0.064/0.018 gen=0.12s train=3.50s gpu=0.00s
+[t=  96.1s] GT-CFR solves=4231 rate=44.0/s rows=640 games=0 qrows=297 L=0.02928 L/var=95.27 Lp=2.308 tgt=-0.065/0.018 gen=0.12s train=2.88s gpu=0.00s
+[t= 106.2s] GT-CFR solves=4931 rate=46.4/s rows=700 games=0 qrows=330 L=0.03790 L/var=126.90 Lp=2.285 tgt=-0.063/0.017 gen=0.11s train=3.30s gpu=0.00s
+[t= 116.4s] GT-CFR solves=5506 rate=47.3/s rows=575 games=0 qrows=269 L=0.02873 L/var=96.20 Lp=2.281 tgt=-0.063/0.017 gen=0.10s train=3.27s gpu=0.00s
+[t= 127.1s] GT-CFR solves=6126 rate=48.2/s rows=620 games=0 qrows=283 L=0.02827 L/var=93.99 Lp=2.320 tgt=-0.063/0.017 gen=0.16s train=2.09s gpu=0.00s
+[t= 137.1s] GT-CFR solves=6768 rate=49.4/s rows=642 games=0 qrows=298 L=0.02131 L/var=66.61 Lp=2.288 tgt=-0.062/0.018 gen=0.11s train=2.79s gpu=0.00s
+[t= 147.5s] GT-CFR solves=7425 rate=50.4/s rows=657 games=0 qrows=320 L=0.04961 L/var=155.11 Lp=2.262 tgt=-0.062/0.018 gen=0.10s train=3.59s gpu=0.00s
+[t= 157.6s] GT-CFR solves=8195 rate=52.0/s rows=770 games=0 qrows=372 L=0.07025 L/var=245.40 Lp=2.313 tgt=-0.060/0.017 gen=0.08s train=3.18s gpu=0.00s
+[t= 167.6s] GT-CFR solves=8905 rate=53.1/s rows=710 games=0 qrows=349 L=0.18636 L/var=527.47 Lp=2.406 tgt=-0.061/0.019 gen=0.11s train=3.42s gpu=0.00s
+[t= 177.9s] GT-CFR solves=9607 rate=54.0/s rows=702 games=0 qrows=342 L=0.64700 L/var=2046.20 Lp=2.406 tgt=-0.061/0.018 gen=0.10s train=4.10s gpu=0.00s
+[t= 188.1s] GT-CFR solves=10463 rate=55.6/s rows=856 games=0 qrows=434 L=0.29266 L/var=891.99 Lp=2.332 tgt=-0.061/0.018 gen=0.08s train=3.67s gpu=0.00s
+[t= 198.2s] GT-CFR solves=11223 rate=56.6/s rows=760 games=0 qrows=349 L=0.30228 L/var=880.28 Lp=2.288 tgt=-0.063/0.019 gen=0.09s train=2.94s gpu=0.00s
+[t= 208.2s] GT-CFR solves=11981 rate=57.6/s rows=758 games=0 qrows=370 L=0.44768 L/var=1338.50 Lp=2.276 tgt=-0.061/0.018 gen=0.09s train=2.73s gpu=0.00s
+[t= 218.5s] GT-CFR solves=12679 rate=58.0/s rows=698 games=0 qrows=347 L=0.06680 L/var=208.28 Lp=2.268 tgt=-0.062/0.018 gen=0.10s train=2.94s gpu=0.00s
+[t= 228.6s] GT-CFR solves=13359 rate=58.4/s rows=680 games=0 qrows=331 L=0.26721 L/var=844.43 Lp=2.215 tgt=-0.063/0.018 gen=0.10s train=2.36s gpu=0.00s
+[t= 237.9s] --- lr -> 5.00e-04 ---
+[t= 238.9s] GT-CFR solves=14043 rate=58.8/s rows=684 games=0 qrows=335 L=0.30124 L/var=896.22 Lp=2.223 tgt=-0.063/0.018 gen=0.11s train=2.62s gpu=0.00s
+[t= 248.9s] GT-CFR solves=14754 rate=59.3/s rows=711 games=0 qrows=345 L=0.07092 L/var=205.26 Lp=2.275 tgt=-0.062/0.019 gen=0.09s train=2.96s gpu=0.00s
+[t= 259.1s] GT-CFR solves=15456 rate=59.7/s rows=702 games=0 qrows=349 L=0.00687 L/var=21.11 Lp=2.268 tgt=-0.061/0.018 gen=0.10s train=1.86s gpu=0.00s
+[t= 269.2s] GT-CFR solves=16126 rate=59.9/s rows=670 games=0 qrows=330 L=0.00305 L/var=8.39 Lp=2.290 tgt=-0.061/0.019 gen=0.10s train=2.24s gpu=0.00s
+[t= 279.3s] GT-CFR solves=16823 rate=60.2/s rows=697 games=0 qrows=330 L=0.00378 L/var=10.91 Lp=2.268 tgt=-0.061/0.019 gen=0.11s train=2.87s gpu=0.00s
+[t= 289.4s] GT-CFR solves=17537 rate=60.6/s rows=714 games=0 qrows=353 L=0.00262 L/var=7.73 Lp=2.246 tgt=-0.064/0.018 gen=0.10s train=2.44s gpu=0.00s
+[t= 299.6s] GT-CFR solves=18242 rate=60.9/s rows=705 games=0 qrows=349 L=0.01055 L/var=31.64 Lp=2.213 tgt=-0.064/0.018 gen=0.10s train=1.66s gpu=0.00s
+[t= 300.1s] --- target network refresh ---

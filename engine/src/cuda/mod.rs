@@ -332,6 +332,14 @@ fn owed_by_the_join(l: &NetLayout, b: &[f32]) -> Vec<f32> {
 /// spend them.
 const ROUND_RESERVE: u64 = 6 << 30;
 
+/// Bytes of freed memory the stream-ordered pool may keep back, per ordinal.
+///
+/// Large enough that a solve's arenas are regrown from it rather than from the
+/// driver -- eighty gigabytes a minute pass through it -- and small enough that
+/// the card still has free memory when the population is at its line. See where
+/// it is set, in `Card::new`.
+static POOL_KEEP: u64 = 2 << 30;
+
 
 /// Leaf rows a pass works on at once.
 ///
@@ -1058,12 +1066,21 @@ impl Device {
         let Ok((free, slack)) = self.cards[card].room() else {
             return crate::farm::Room { live, allowed: 0, short: true };
         };
-        // A card is short when what it can still hand out is gone, free memory
-        // and retained blocks together. Free memory alone is not the test: a
-        // freed arena goes to the pool rather than to the driver, so a card
-        // that gave a solve up would read exactly as short as before it did,
-        // and the population would shed itself down to nothing.
-        let short = free + slack < ROUND_RESERVE;
+        // A card is short when it is down to half the reserve in memory the
+        // driver can hand to anybody, *and* this farm's own arenas are what is
+        // holding it. The pool's blocks are not counted here, though they are
+        // counted for growth: the question is whether the next allocation of a
+        // size the pool has none of will succeed, and whether the trainer's own
+        // step will, and only free memory answers either. `Card::room` trims
+        // the pool when this is true, which is what makes the answer one that
+        // giving a slot up can change.
+        //
+        // The second half of the test is not a nicety. The trainer trains on
+        // one of these cards and holds several gigabytes of it, and a farm that
+        // shed on free memory alone gave that ordinal up entirely -- down to
+        // three hundred megabytes of arenas -- because no slot it released
+        // brought back memory it was not holding.
+        let short = free < ROUND_RESERVE / 2 && held > ROUND_RESERVE / 2;
         // Nothing measured yet: the farm's pacing is the bound until a solve
         // has run its whole life and said what a slot costs.
         let allowed = if hold == 0 {
@@ -1273,7 +1290,7 @@ impl Card {
         let t = layout.norms[LN_TRUNK];
         plan.extend([t.g as i32, t.b as i32]);
         let owed = owed_by_the_join(&layout, &flat.b);
-        Ok(Card {
+        let card = Card {
             dev,
             plan: stream.memcpy_stod(&plan).map_err(err)?,
             owed: stream.memcpy_stod(&owed).map_err(err)?,
@@ -1293,7 +1310,37 @@ impl Card {
             pack: parking_lot::Mutex::new(Pack::default()),
             scratch: parking_lot::Mutex::new(Scratch::default()),
             layout,
-        })
+        };
+        // How much of the card the allocator may sit on, per ordinal. Every
+        // stream of an ordinal sets the same figure on the same pool.
+        //
+        // Without it the pool takes the whole card. A freed arena goes there
+        // rather than to the driver, and it is handed back only at a
+        // synchronisation and only above this line -- which is nought by
+        // default, and measured, is not what happens: a card ran with two
+        // thirds of itself in retained blocks and six hundred megabytes free,
+        // and the round that then asked for a size the pool had none of died.
+        // Reading the pool is how admission knows those blocks are usable;
+        // capping it is how the card keeps free memory to be short of.
+        unsafe {
+            cudarc::driver::sys::cuMemPoolSetAttribute(
+                card.pool()?,
+                cudarc::driver::sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                (&POOL_KEEP as *const u64 as *mut u64).cast(),
+            )
+        }
+        .result()
+        .map_err(err)?;
+        Ok(card)
+    }
+
+    /// The stream-ordered allocator's pool for this ordinal.
+    fn pool(&self) -> Res<cudarc::driver::sys::CUmemoryPool> {
+        let mut pool = std::ptr::null_mut();
+        unsafe { cudarc::driver::sys::cuDeviceGetDefaultMemPool(&mut pool, self.dev) }
+            .result()
+            .map_err(err)?;
+        Ok(pool)
     }
 
     /// What this card can still hand out: bytes the driver has never given
@@ -1311,8 +1358,7 @@ impl Card {
         use cudarc::driver::sys;
         self.stream.context().bind_to_thread().map_err(err)?;
         let free = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
-        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
-        unsafe { sys::cuDeviceGetDefaultMemPool(&mut pool, self.dev) }.result().map_err(err)?;
+        let pool = self.pool()?;
         let attr = |a| -> Res<u64> {
             let mut v = 0u64;
             unsafe { sys::cuMemPoolGetAttribute(pool, a, (&mut v as *mut u64).cast()) }
@@ -1322,7 +1368,22 @@ impl Card {
         };
         let kept = attr(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT)?;
         let used = attr(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)?;
-        Ok((free, kept.saturating_sub(used)))
+        if free >= ROUND_RESERVE / 2 || kept.saturating_sub(used) <= POOL_KEEP {
+            return Ok((free, kept.saturating_sub(used)));
+        }
+        // Short of free memory with blocks sitting unused: take them back.
+        //
+        // The release threshold set in `Card::new` is meant to do this, and it
+        // does not: the driver honours it at a synchronisation, and a farm of
+        // twenty streams gives it few it can act on -- measured, a card held
+        // eighteen gigabytes it was not using and reported seven hundred
+        // megabytes free. Free memory is then a number the farm cannot move,
+        // and a population that sheds a slot to make room makes none: it goes
+        // to the pool. This is what makes the shed rule true.
+        unsafe { sys::cuMemPoolTrimTo(pool, POOL_KEEP as usize) }.result().map_err(err)?;
+        let free = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
+        Ok((free, attr(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT)?
+            .saturating_sub(used)))
     }
 
     /// What this stream's slots hold, for the next admission to read. Taken
