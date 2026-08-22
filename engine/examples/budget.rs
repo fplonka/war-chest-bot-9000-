@@ -116,25 +116,30 @@ fn main() {
     // Student of Games trains chess and Go at (400, 1) and poker at (10, 0.01);
     // this engine's default is (512, 8).
     //
+    // The third number is `Cfg::rounds`: round boundaries growth may grow
+    // through. Zero is the production limit, and what it saves is exactly what
+    // the last two rows price.
     // The production budget leads, because every other row is priced against it.
-    let budgets: Vec<(u32, f32)> = vec![
-        (512, 8.0),
-        (512, 2.0),
-        (512, 4.0),
-        (512, 16.0),
-        (512, 32.0),
-        (256, 8.0),
-        (1024, 8.0),
+    let budgets: Vec<(u32, f32, u8)> = vec![
+        (512, 8.0, 0),
+        (512, 2.0, 0),
+        (512, 4.0, 0),
+        (512, 16.0, 0),
+        (512, 32.0, 0),
+        (256, 8.0, 0),
+        (1024, 8.0, 0),
+        (512, 8.0, 1),
+        (512, 8.0, 255),
     ];
 
     println!(
         "{:>12} {:>6} {:>6} {:>7} {:>6} {:>6} {:>5} | {:>9} {:>10} {:>10} | {:>7}",
-        "SoG(s,c)", "iters", "nodes", "rows", "ncfg", "dist%", "depth",
+        "SoG(s,c,r)", "iters", "nodes", "rows", "ncfg", "dist%", "depth",
         "joinrows", "readouts", "sweepcell", "f MB"
     );
     let mut base: Option<Cost> = None;
-    for &(s, c) in &budgets {
-        let cfg = Cfg { s, c, cfr: Cfr::SOG, ..Default::default() };
+    for &(s, c, rounds) in &budgets {
+        let cfg = Cfg { s, c, rounds, cfr: Cfr::SOG, ..Default::default() };
         let iters = cfg.iters();
         let t0 = std::time::Instant::now();
         // Per solve, not only the mean: cost varies twenty-six fold with how
@@ -198,7 +203,7 @@ fn main() {
         let fmb = tot.ncfg / n * warchest::net::D as f64 * 2.0 / 1e6;
         let line = format!(
             "{:>12} {:>6} {:>6.0} {:>7.0} {:>6.0} {:>5.0}% {:>5.1} | {:>9.0} {:>10.0} {:>10.0} | {:>7.2}",
-            format!("({s},{c})"),
+            format!("({s},{c},{rounds})"),
             iters,
             tot.nodes / n,
             tot.rows / n,

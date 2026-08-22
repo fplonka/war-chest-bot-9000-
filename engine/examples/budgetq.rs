@@ -267,6 +267,56 @@ fn main() {
         );
     }
 
+    // ---- what the round boundary costs the target.
+    //
+    // Growth stops at the draw that starts the next round, so the value
+    // network carries the whole game from there. That limit cannot be judged
+    // against a reference that shares it: a depth-limited reference is the
+    // same approximation, converged. So the yardstick here is a deep tree --
+    // no limit, twice the expansions, iterated far past its own convergence --
+    // and every row is read against that one.
+    //
+    // It is a yardstick and not a truth. Its own leaves are network values
+    // too, one round further down. What it can say is whether the answer
+    // *moves* when the tree is allowed past the draw, not that the deeper
+    // answer is the better one.
+    //
+    // It is the reference above with the limit taken off and nothing else
+    // changed -- same expansions, same schedule, same iterations -- so the
+    // difference between the two is the limit and not the budget.
+    let deep: Vec<([f32; 2], Policy)> = positions
+        .par_iter()
+        .enumerate()
+        .map(|(i, (st, bel))| {
+            let cfg = Cfg { rounds: u8::MAX, ..cfg_batch(512, 2.0, 1) };
+            let (t, p, _) = solve(st, bel, &nets, cfg, 0x51D5 ^ i as u64, 768);
+            (t, p)
+        })
+        .collect();
+
+    // The two converged answers against each other: CFR error is gone from
+    // both, so what is left is the limit itself.
+    let bias: f64 = refs
+        .iter()
+        .zip(&deep)
+        .map(|((a, _), (b, _))| ((a[0] - b[0]).abs() + (a[1] - b[1]).abs()) as f64 / 2.0)
+        .sum::<f64>()
+        / positions.len().max(1) as f64;
+    println!("\nconverged SoG(512,2) against the deep reference: |dv| {bias:.5}");
+
+    println!("\ndepth at SoG(512,8), against the same reference with no round limit:");
+    println!(
+        "{:>8} {:>8} {:>7} {:>10} {:>10} {:>10} {:>10}",
+        "rounds", "nodes", "ncfg", "|dv| mean", "policy tv", "nash_conv", "|v0+v1|"
+    );
+    for rounds in [0u8, 1, u8::MAX] {
+        let r = sweep(&positions, &nets, &deep, Cfg { rounds, ..cfg_of(512, 8.0) });
+        println!(
+            "{:>8} {:>8.0} {:>7.0} {:>10.5} {:>10.5} {:>10.5} {:>10.5}",
+            rounds, r.nodes, r.ncfg, r.dv, r.tv, r.nash, r.zs.abs()
+        );
+    }
+
     // ---- what a round of several iterations costs.
     //
     // `batch` regret updates ride in one round against a frozen tree, so the

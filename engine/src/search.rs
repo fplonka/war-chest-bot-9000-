@@ -91,6 +91,20 @@ pub struct Cfg {
     /// owes. Measured at `SoG(512, 8)`, a round of four builds nine percent
     /// less tree than a round of one and a round of eight twenty-three.
     pub batch: usize,
+    /// Round boundaries growth may grow *through*.
+    ///
+    /// Zero is DeepStack's street boundary, and what the solver has always
+    /// done: the round-start draw is put into the tree, priced by the value
+    /// network, and nothing under it is ever expanded. Student of Games has no
+    /// such limit, which is `u8::MAX`.
+    ///
+    /// What it saves is tree and not belief. The draw's broadened support is
+    /// already in the tree at zero, sitting there as a priced leaf, so a node
+    /// past the boundary carries no more configs than one before it -- 4.5 a
+    /// row against 4.6 at `SoG(512, 8)`. Taking the limit off costs 1.9x the
+    /// rows and 2.1x the readouts, and leaves a harder game: `nash_conv` at 64
+    /// updates goes 0.031 to 0.057.
+    pub rounds: u8,
     /// The regret-update rule.
     pub cfr: Cfr,
     /// PUCT's exploration constant, weighting the prior against the search's
@@ -109,6 +123,7 @@ impl Default for Cfg {
             s: 512,
             c: 8.0,
             batch: 8,
+            rounds: 0,
             cfr: Cfr::SOG,
             puct: 1.5,
             prior_temp: 1.0,
@@ -1756,10 +1771,11 @@ impl Solver {
                 self.rewind(id, mark);
                 return;
             }
-            if !wp {
-                // The round boundary. Everything this draw put into the tree
-                // lies past it and stays a leaf, priced by the value network.
-                // `TODO.md` records why, and when to reassess it.
+            // The round boundary. Once `Cfg::rounds` of them are behind the
+            // tree, everything a further one puts into it stays a leaf, priced
+            // by the value network. A Warrior Priest draw is mid-round and
+            // bounds nothing. `TODO.md` records why the limit is there.
+            if !wp && cs.round > self.states[0].round + self.cfg.rounds as u16 {
                 for n in &mut self.nodes[mark.nodes..] {
                     n.expandable = false;
                 }
