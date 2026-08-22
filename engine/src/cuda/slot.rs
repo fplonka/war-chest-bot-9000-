@@ -162,8 +162,7 @@ fn dst_slot(d: Dst) -> (Ent, usize, usize) {
     unreachable!("every Dst is a Tree column")
 }
 
-/// One device array of a round's scratch. Slot state is an `Entity`; scratch
-/// is still a typed buffer sized at TILE (or `n_slots` times a budget term).
+/// One device array. Slot state is an `Entity`; a round's scratch is `RoundCap`.
 pub struct Arr<T> {
     pub buf: Option<CudaSlice<T>>,
     pub cap: usize,
