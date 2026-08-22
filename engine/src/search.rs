@@ -105,6 +105,24 @@ pub struct Cfg {
     /// rows and 2.1x the readouts, and leaves a harder game: `nash_conv` at 64
     /// updates goes 0.031 to 0.057.
     pub rounds: u8,
+    /// Iterations between two full leaf queries of the value network.
+    ///
+    /// One is what the solver has always done: every CFR iteration re-runs the
+    /// join and the readout at every leaf row, sixty-four times a leaf. Above
+    /// one, a leaf's per-config values `v(c)` are kept from the last query and
+    /// only re-scaled by the opponent's current reach mass, so beliefs and
+    /// reaches still move every iteration and only the network's opinion of
+    /// them is held. Zero never re-queries: a row is valued when it is created
+    /// and again in the final value pass, which is the target, and nowhere in
+    /// between.
+    ///
+    /// A row growth has just added has nothing to reuse, so it is always
+    /// queried on the first iteration it exists whatever this says. That is
+    /// also why `refresh` aligned with `batch` is the natural setting: the
+    /// round's first iteration has to run the network for the new rows anyway.
+    ///
+    /// Host path only. The card holds no `h` per row between iterations.
+    pub refresh: u32,
     /// The regret-update rule.
     pub cfr: Cfr,
     /// PUCT's exploration constant, weighting the prior against the search's
@@ -124,6 +142,7 @@ impl Default for Cfg {
             c: 8.0,
             batch: 8,
             rounds: 0,
+            refresh: 1,
             cfr: Cfr::SOG,
             puct: 1.5,
             prior_temp: 1.0,
@@ -143,6 +162,15 @@ impl Cfg {
             return self.s as usize;
         }
         (self.s as f32 / self.c).ceil() as usize
+    }
+
+    /// Whether the iteration after `done` of them re-queries the network at
+    /// every leaf.
+    ///
+    /// The first iteration of every `refresh`, so `refresh = batch` puts the
+    /// query at the start of a round and nowhere else in it.
+    fn refresh_due(&self, done: usize) -> bool {
+        self.refresh > 0 && done % self.refresh as usize == 0
     }
 
     /// Expansions the solve owes after its `i`-th regret update, one-based.
@@ -277,6 +305,15 @@ pub struct Trace {
     pub row_iters: u64,
     pub cidx_iters: u64,
     pub cell_iters: u64,
+    /// Rows the join actually ran over, summed across every query the solve
+    /// made — two a regret update, plus the fixed-policy passes. `row_iters`
+    /// is the nominal that assumes every iteration queries every row; under
+    /// `Cfg::refresh` above one it does not, and this is what it cost.
+    pub join_rows: u64,
+    /// Config values the readout actually formed from the network, on the same
+    /// terms. The re-scaling of a cached value is not counted: it is a
+    /// multiply, where this is a dot product of width `D`.
+    pub readout_cfgs: u64,
 }
 
 /// What a solve built, in the units the device charges for. See `Solver::shape`.
@@ -963,6 +1000,11 @@ pub struct HostCfr {
     /// The traverser's counterfactual value per config, flat the same way:
     /// `vals[voff[i] .. voff[i] + max(nc0, nc1)]`.
     pub vals: Vec<f32>,
+    /// The network's value per config, per traverser, before the opponent's
+    /// reach mass scales it — laid out like `vals`, one arena a seat. This is
+    /// the only part of a leaf value that costs a network query, so it is the
+    /// part `Cfg::refresh` keeps between iterations.
+    pub vcache: [Vec<f32>; 2],
 }
 
 pub struct Solver {
@@ -1070,6 +1112,10 @@ pub struct Solver {
     // ~2,000 times a solve and the join ~158,000.
     /// Non-terminal leaves in node order — the rows of the network batch.
     pub leaf_rows: Vec<usize>,
+    /// Per traverser: how many leaf rows `HostCfr::vcache` holds a network
+    /// value for. Rows past it are the ones growth has added since the last
+    /// query, and they are queried whatever `Cfg::refresh` says.
+    cached: [usize; 2],
     /// Diagnostics: the per-iteration work this solve has done so far. Nothing
     /// in a run reads it; the budget study prices a search with it.
     pub trace: Trace,
@@ -1248,6 +1294,7 @@ impl Solver {
             nc: Vec::new(),
             steps: [0, 0],
             leaf_rows: Vec::new(),
+            cached: [0; 2],
             trace: Trace::default(),
             term_leaves: Vec::new(),
             leaf_cidx: Vec::new(),
@@ -1429,6 +1476,8 @@ impl Solver {
         if let Some(h) = &mut self.host {
             h.reach.resize(self.nreach, 0.0);
             h.vals.resize(self.nvals, 0.0);
+            h.vcache[0].resize(self.nvals, 0.0);
+            h.vcache[1].resize(self.nvals, 0.0);
             h.sum_strat.push(Vec::new());
         }
         self.primed.push(false);
@@ -1577,6 +1626,7 @@ impl Solver {
         self.wants_prior.retain(|&i| (i as usize) < m.nodes);
         self.row_of.truncate(m.nodes);
         self.leaf_rows.truncate(m.leaf_rows);
+        self.cached = self.cached.map(|k| k.min(m.leaf_rows));
         // `xpub` is written by index and reused, so only the count and the
         // interning map name boards that no longer exist. A board an abandoned
         // row shared with a surviving one stays, and stays right.
@@ -1591,6 +1641,8 @@ impl Solver {
         if let Some(h) = &mut self.host {
             h.reach.truncate(self.nreach);
             h.vals.truncate(self.nvals);
+            h.vcache[0].truncate(self.nvals);
+            h.vcache[1].truncate(self.nvals);
             h.sum_strat.truncate(m.nodes);
             h.regret.truncate(m.ncells);
             h.prior.truncate(m.ncells);
@@ -2301,7 +2353,10 @@ impl Solver {
     /// linear card-weighted half, which is what makes this pooled vector carry
     /// the belief's exact expected holding of each card rather than an average
     /// of nonlinearities.
-    fn belief_blocks(&mut self) {
+    ///
+    /// Rows below `from` are ones whose join output is being reused, so their
+    /// block is not read and is not written.
+    fn belief_blocks(&mut self, from: usize) {
         let _t = timed!(BELFEAT);
         // Sized where it is written. Growth used to do it, which fitted a
         // megabyte of pooled belief per solve on the device path -- where the
@@ -2318,7 +2373,7 @@ impl Solver {
             &mut self.xb,
         );
         let pool = crate::net::POOL;
-        for (r, &i) in self.leaf_rows.iter().enumerate() {
+        for (r, &i) in self.leaf_rows.iter().enumerate().skip(from) {
             for p in 0..2 {
                 let n = nc[i][p] as usize;
                 let ra = roff[i] as usize + if p == 1 { nc[i][0] as usize } else { 0 };
@@ -2339,32 +2394,55 @@ impl Solver {
         }
     }
 
-    /// Fill `vals` at every leaf with the traverser's counterfactual values.
+    /// Fill `vals` at every leaf with the traverser's counterfactual values,
+    /// querying the network at every row.
     pub fn leaf_values(&mut self, traverser: usize) {
+        self.leaf_values_from(traverser, 0);
+    }
+
+    /// The same, querying the network only from row `from` on and re-scaling
+    /// every earlier row's cached `v(c)` by the opponent's current reach mass.
+    ///
+    /// A leaf's counterfactual value is `v(c)` times that mass. The mass moves
+    /// every iteration and costs a sum over a support; `v(c)` is the network,
+    /// and is the whole of what the join and the readout are for. So the split
+    /// here is exactly the split `Cfg::refresh` trades in.
+    fn leaf_values_from(&mut self, traverser: usize, from: usize) {
         if !self.nets.value.is_empty() {
-            self.belief_blocks();
+            self.belief_blocks(from);
         }
-        self.pbs_head(traverser);
-        self.readout(traverser);
+        self.pbs_head(traverser, from);
+        self.readout_from(traverser, from);
+        self.cached[traverser] = self.leaf_rows.len();
     }
 
     /// The one path CFR pays for on every iteration.
-    fn pbs_head(&mut self, traverser: usize) {
+    ///
+    /// Writes `h` for rows `from ..` at its front, so row `r` of the tree is
+    /// row `r - from` of `h`. The join takes a contiguous batch and this one is
+    /// a suffix of the leaves, because growth only ever appends.
+    fn pbs_head(&mut self, traverser: usize, from: usize) {
         let net = &self.nets.value;
         if net.is_empty() {
             return;
         }
         let _t = timed!(NET);
         let rows = self.leaf_rows.len();
-        crate::prof::work(0, 0, rows, 0);
+        let n = rows - from;
+        if n == 0 {
+            return;
+        }
+        crate::prof::work(0, 0, n, 0);
+        self.trace.join_rows += n as u64;
+        let pool = crate::net::POOL;
         // `xb` is grown by `fit` and never shrinks, so a subgame smaller than
         // an earlier one would otherwise hand the batch a trailing tail.
         self.nets.value.join(
             &self.pb[..self.nboards * crate::net::D],
             &self.jp[..self.nboards * crate::net::JW],
-            &self.board_of[..rows],
-            &self.xb[..2 * rows * crate::net::POOL],
-            rows,
+            &self.board_of[from..rows],
+            &self.xb[2 * from * pool..2 * rows * pool],
+            n,
             traverser,
             &mut self.h,
         );
@@ -2374,15 +2452,18 @@ impl Solver {
     /// value for that exact config times the opponent's unnormalised reach
     /// into the leaf. Runs off the `h` left by the last `pbs_head` query, and
     /// is one dot product per config.
-    pub fn readout(&mut self, p: usize) {
+    ///
+    /// Rows below `from` take their `v(c)` from `vcache` instead of the
+    /// network; every row is scaled by the reach mass it has now.
+    fn readout_from(&mut self, p: usize, from: usize) {
         let _t = timed!(LEAFPOST);
         let empty = self.nets.value.is_empty();
-        let readout_configs = self
-            .leaf_rows
+        let queried: usize = self.leaf_rows[from..]
             .iter()
             .map(|&i| self.nc[i][p] as usize)
             .sum();
-        crate::prof::work(0, 0, 0, readout_configs);
+        crate::prof::work(0, 0, 0, queried);
+        self.trace.readout_cfgs += queried as u64;
         let opp = 1 - p;
         for k in 0..self.term_leaves.len() {
             let i = self.term_leaves[k];
@@ -2402,7 +2483,7 @@ impl Solver {
         }
         let d = crate::net::D;
         let cfr = self.host.as_mut().expect(HOST_PATH);
-        let (reach, vals) = (&cfr.reach, &mut cfr.vals);
+        let (reach, vals, vcache) = (&cfr.reach, &mut cfr.vals, &mut cfr.vcache[p]);
         let (roff, ncs, voff, coff, cidx, cf) = (
             &self.roff,
             &self.nc,
@@ -2412,23 +2493,27 @@ impl Solver {
             &self.cf,
         );
         for (r, &i) in self.leaf_rows.iter().enumerate() {
-            let ra = roff[i] as usize + if opp == 1 { ncs[i][0] as usize } else { 0 };
-            let opp_reach: f32 = reach[ra..ra + ncs[i][opp] as usize].iter().sum();
             let n = ncs[i][p] as usize;
             let vo = voff[i] as usize;
             if empty {
                 vals[vo..vo + n].fill(0.0);
                 continue;
             }
-            let cs = coff[2 * r + p] as usize;
-            self.nets.value.values(
-                &self.h[r * d..(r + 1) * d],
-                cf,
-                &cidx[cs..cs + n],
-                &mut vals[vo..vo + n],
-            );
-            for value in &mut vals[vo..vo + n] {
-                *value *= opp_reach;
+            // `pbs_head` wrote the queried rows at the front of `h`, so the
+            // tree's row `r` is `h`'s row `r - from`.
+            if r >= from {
+                let cs = coff[2 * r + p] as usize;
+                self.nets.value.values(
+                    &self.h[(r - from) * d..(r - from + 1) * d],
+                    cf,
+                    &cidx[cs..cs + n],
+                    &mut vcache[vo..vo + n],
+                );
+            }
+            let ra = roff[i] as usize + if opp == 1 { ncs[i][0] as usize } else { 0 };
+            let opp_reach: f32 = reach[ra..ra + ncs[i][opp] as usize].iter().sum();
+            for (value, &v) in vals[vo..vo + n].iter_mut().zip(&vcache[vo..vo + n]) {
+                *value = v * opp_reach;
             }
         }
     }
@@ -2438,7 +2523,14 @@ impl Solver {
         // every `step` re-establishes it after regret matching, and the
         // fixed-policy passes restore it before returning, so recomputing them
         // here would repeat the previous pass exactly.
-        self.leaf_values(traverser);
+        // `Cfg::refresh` says how often the network runs. Rows growth has added
+        // since the last query have nothing to reuse and are always queried.
+        let from = if self.cfg.refresh_due(self.steps[traverser]) {
+            0
+        } else {
+            self.cached[traverser]
+        };
+        self.leaf_values_from(traverser, from);
         self.backprop(traverser, &[], Back::Regret);
     }
 
@@ -3439,6 +3531,7 @@ impl Solver {
                 .collect(),
             reach: a.reach[..self.nreach].to_vec(),
             vals: Vec::new(),
+            vcache: [Vec::new(), Vec::new()],
         });
         self.expansion_phase(want, taken)
     }
@@ -3675,7 +3768,7 @@ impl Solver {
                         + h.sum_strat.iter().map(|r| r.capacity() * 4).sum::<usize>(),
                 ),
                 ("reach", f(&h.reach)),
-                ("vals", f(&h.vals)),
+                ("vals", f(&h.vals) + f(&h.vcache[0]) + f(&h.vcache[1])),
             ]);
         }
         v.sort_by_key(|&(_, b)| std::cmp::Reverse(b));

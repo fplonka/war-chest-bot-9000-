@@ -22,6 +22,12 @@
 //! solve into nine. The sweep asks what the target pays for that, against the
 //! spread between two seeds at `batch = 1`.
 //!
+//! **How stale may a leaf value be?** The join and the readout are half the
+//! device's arithmetic and they run at every leaf on every iteration, sixty-four
+//! times a leaf. `Cfg::refresh` holds a leaf's `v(c)` between iterations and
+//! re-scales it by the reach mass it has now, so the sweep buys join work with
+//! target error and says what the exchange rate is.
+//!
 //! `cargo run --release --example budgetq -- <weights.bin> [roots] [games]`
 
 use rayon::prelude::*;
@@ -106,6 +112,11 @@ struct Row {
     tv: f64,
     nash: f64,
     zs: f64,
+    /// Join rows and readout configs the solve *ran*, counters rather than a
+    /// nominal. Read after the value pass and before `nash_conv`, so it is the
+    /// cost of a collected solve and not of the measurement around it.
+    join: f64,
+    readouts: f64,
 }
 
 /// Run one budget on every root and average the five numbers.
@@ -124,6 +135,7 @@ fn sweep(
             let mut sv = Solver::new(st, ctx, std::sync::Arc::clone(nets), cfg, bel.clone(), Rng::new(0x51D5 ^ i as u64));
             sv.run_alone();
             let t = root_target(&mut sv);
+            let tr = sv.trace;
             let p = sv.root_policy();
             let gap = policy_gap(&p, rp);
             let c = sv.nash_conv();
@@ -137,11 +149,22 @@ fn sweep(
                 c.nash as f64,
                 c.zero_sum as f64,
                 1.0,
+                tr.join_rows as f64,
+                tr.readout_cfgs as f64,
             ]
         })
-        .reduce(|| [0.0f64; 8], |a, b| std::array::from_fn(|k| a[k] + b[k]));
+        .reduce(|| [0.0f64; 10], |a, b| std::array::from_fn(|k| a[k] + b[k]));
     let (n, tvk) = (acc[7].max(1.0), acc[4].max(1.0));
-    Row { nodes: acc[0] / n, ncfg: acc[1] / n, dv: acc[2] / n, tv: acc[3] / tvk, nash: acc[5] / n, zs: acc[6] / n }
+    Row {
+        nodes: acc[0] / n,
+        ncfg: acc[1] / n,
+        dv: acc[2] / n,
+        tv: acc[3] / tvk,
+        nash: acc[5] / n,
+        zs: acc[6] / n,
+        join: acc[8] / n,
+        readouts: acc[9] / n,
+    }
 }
 
 fn main() {
@@ -349,6 +372,66 @@ fn main() {
             );
         let (k, tvk) = (k.max(1.0), tvk.max(1.0));
         println!("{:>8} {:>10.0} {:>12.5} {:>12.5}", label, nodes / k, err / k, tv / tvk);
+    }
+
+    // ---- how stale may a leaf value be?
+    //
+    // A leaf's counterfactual value is the network's `v(c)` times the
+    // opponent's reach mass. The mass is a sum over a support; `v(c)` is the
+    // join and the readout, which is the whole cost. `Cfg::refresh` keeps
+    // `v(c)` for `refresh` iterations and re-scales it every one of them, so
+    // beliefs and reaches still move and only the network's opinion of them is
+    // held. Zero values a row when it is created and never again before the
+    // final pass, which is always fresh because it is the training target.
+    //
+    // The join column is a counter and not a nominal: a row growth has just
+    // added is queried whatever `refresh` says, so the saving is never the
+    // ratio the knob suggests.
+    let show = |label: &str, r: &Row, base: f64| {
+        println!(
+            "{:>10} {:>8.0} {:>10.5} {:>10.5} {:>10.5} {:>11.0} {:>10.0} {:>7.2}x",
+            label, r.nodes, r.dv, r.tv, r.nash, r.join, r.readouts, r.join / base
+        );
+    };
+    let head = || {
+        println!(
+            "{:>10} {:>8} {:>10} {:>10} {:>10} {:>11} {:>10} {:>8}",
+            "refresh", "nodes", "|dv| mean", "policy tv", "nash_conv", "join rows", "readouts", "join"
+        );
+    };
+    println!("\nleaf refresh at SoG(512,8), against the same reference:");
+    head();
+    let mut base = 0.0;
+    for refresh in [1u32, 2, 4, 8, 16, 0] {
+        let r = sweep(&positions, &nets, &refs, Cfg { refresh, ..cfg_of(512, 8.0) });
+        if refresh == 1 {
+            base = r.join;
+        }
+        show(&refresh.to_string(), &r, base);
+    }
+
+    // The two settings the budget study points at, to see whether the saving
+    // composes with them. `rounds = 1` is read against the deep reference for
+    // the reason section 4 gives; `s = 256` against the same one as above.
+    println!("\nthe same at SoG(512,8) rounds=1, against the deep reference:");
+    head();
+    let mut base = 0.0;
+    for refresh in [1u32, 8] {
+        let r = sweep(&positions, &nets, &deep, Cfg { refresh, rounds: 1, ..cfg_of(512, 8.0) });
+        if refresh == 1 {
+            base = r.join;
+        }
+        show(&refresh.to_string(), &r, base);
+    }
+    println!("\nthe same at SoG(256,8), against the converged reference:");
+    head();
+    let mut base = 0.0;
+    for refresh in [1u32, 8] {
+        let r = sweep(&positions, &nets, &refs, Cfg { refresh, ..cfg_of(256, 8.0) });
+        if refresh == 1 {
+            base = r.join;
+        }
+        show(&refresh.to_string(), &r, base);
     }
 
     // ---- is the policy prior worth what it costs?
