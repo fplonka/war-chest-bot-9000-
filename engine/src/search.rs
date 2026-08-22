@@ -58,28 +58,47 @@ use std::sync::Arc;
 /// points of the same stream ever after.
 pub const TRIES: usize = 4;
 
-/// What one solve may hold, in the terms every arena it owns is linear in.
+/// One of the eight things a solve grows. A slot is eight allocations, one
+/// per entity, each `cap × nfields × 4` bytes. Host and device both ask
+/// `Budget::reserve` before an append.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Ent {
+    Node = 0,
+    Cell = 1,
+    Reach = 2,
+    Draw = 3,
+    Row = 4,
+    Board = 5,
+    Config = 6,
+    Cidx = 7,
+}
+
+impl Ent {
+    pub const ALL: [Ent; 8] = [
+        Ent::Node,
+        Ent::Cell,
+        Ent::Reach,
+        Ent::Draw,
+        Ent::Row,
+        Ent::Board,
+        Ent::Config,
+        Ent::Cidx,
+    ];
+    pub const NAME: [&'static str; 8] = [
+        "node", "cell", "reach", "draw", "row", "board", "config", "cidx",
+    ];
+    pub fn name(self) -> &'static str {
+        Self::NAME[self as usize]
+    }
+}
+
+/// What one solve may hold, in the eight entities it owns.
 ///
-/// A slot's arenas are allocated once at this size and reused by every solve
-/// that ever runs in it, so this is a *bound* and not a forecast. An expansion
-/// that would take the solve past any of these is abandoned exactly as one that
-/// runs away past `EXPANSION_CAP` is: the arenas are rewound, the leaf it
-/// started from is marked unexpandable, and the solve carries on iterating on
-/// the tree it already has. Nothing anywhere else has to ask how large a solve
-/// is, because the answer is this and it is the same for every solve.
-///
-/// Each term is named for the arenas it sizes:
-///
-/// | term | what it sizes |
-/// |---|---|
-/// | `nodes` | the flat tree arrays; a `TNode` and a `State` each on the host |
-/// | `rows` | `board_of`, `leaf_node`, `term`, `coff`, the whole leaf pass |
-/// | `boards` | `p` and `jp` -- the trunk runs once per distinct public state |
-/// | `configs` | `f`, `g`, `fp`, `cphi`: the config encoder's rows |
-/// | `cidx` | the belief index, one entry per (row, player, config) |
-/// | `reach` | `reach`, `vals` and the `nc + 1` offsets beside them |
-/// | `cells` | `cur` `regret` `sum` `qval` `visits` `prior`, and the per-cell tree arrays |
-/// | `draws` | the draw transition, forward and transposed |
+/// A slot is allocated once at this size and reused by every solve that ever
+/// runs in it, so this is a *bound* and not a forecast. An expansion that
+/// would take the solve past any of these is abandoned exactly as one that
+/// runs away past `EXPANSION_CAP` is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budget {
     pub nodes: usize,
@@ -141,6 +160,24 @@ impl Budget {
 }
 
 impl Budget {
+    pub fn cap(&self, e: Ent) -> usize {
+        match e {
+            Ent::Node => self.nodes,
+            Ent::Cell => self.cells,
+            Ent::Reach => self.reach,
+            Ent::Draw => self.draws,
+            Ent::Row => self.rows,
+            Ent::Board => self.boards,
+            Ent::Config => self.configs,
+            Ent::Cidx => self.cidx,
+        }
+    }
+
+    /// The one guard. False when `n` does not fit this entity.
+    pub fn reserve(&self, e: Ent, n: usize) -> bool {
+        n <= self.cap(e)
+    }
+
     /// Host bytes a device-resident solve holds at this budget, from the Vec
     /// capacities it would reserve. The card keeps the CFR arenas.
     pub fn host_slot_bytes(&self) -> usize {
@@ -1770,24 +1807,45 @@ impl Solver {
         self.budget_hit
     }
 
+    /// How many of this entity the solve holds.
+    pub fn used(&self, e: Ent) -> usize {
+        let c = &self.contract;
+        match e {
+            Ent::Node => self.nodes.len().max(c.level_start.len()).max(c.level_node.len()),
+            Ent::Cell => self.ncells,
+            Ent::Reach => self
+                .nreach
+                .max(c.legal_off.len())
+                .max(c.rev_start.len())
+                .max(c.rvd_start.len())
+                .max(c.draw_start.len()),
+            Ent::Draw => self.ndraws.max(c.draw_to.len()).max(c.rvd_src.len()),
+            Ent::Row => self.leaf_rows.len(),
+            Ent::Board => self.nboards,
+            Ent::Config => self.ncfg,
+            Ent::Cidx => self.leaf_cidx.len(),
+        }
+    }
+
+    /// The eight counts, in `Ent::ALL` order.
+    pub fn counts(&self) -> [u32; 8] {
+        Ent::ALL.map(|e| self.used(e) as u32)
+    }
+
+    /// Ensure this entity can hold `n` items. The one host-side guard.
+    fn reserve(&mut self, e: Ent, n: usize) -> bool {
+        if self.bounded && !self.cfg.budget.reserve(e, n) {
+            self.abandon = true;
+            self.budget_hit = true;
+            false
+        } else {
+            true
+        }
+    }
+
     /// Whether the solve has reached its budget in any term.
-    ///
-    /// Asked at the head of every `grow`, which is the same place
-    /// `EXPANSION_CAP` is asked and for the same reason: the recursion is what
-    /// grows the tree, so a check there bounds what one step can add to one
-    /// node's worth, and `rewind` then puts even that back. `alloc_cells` is
-    /// checked separately because a node's cells are appended after its whole
-    /// subtree, with no `grow` between.
     fn spent(&self) -> bool {
-        let b = &self.cfg.budget;
-        self.nodes.len() >= b.nodes
-            || self.leaf_rows.len() >= b.rows
-            || self.nboards >= b.boards
-            || self.ncfg >= b.configs
-            || self.leaf_cidx.len() >= b.cidx
-            || self.nreach >= b.reach
-            || self.ncells >= b.cells
-            || self.ndraws >= b.draws
+        Ent::ALL.iter().any(|&e| !self.cfg.budget.reserve(e, self.used(e) + 1))
     }
 
     /// Where every append-only arena stands.
@@ -2058,9 +2116,7 @@ impl Solver {
             let n = &mut self.nodes[id];
             n.chance = true;
             n.child = vec![ch];
-            if self.bounded && self.ndraws + draw.len() > self.cfg.budget.draws {
-                self.abandon = true;
-                self.budget_hit = true;
+            if !self.reserve(Ent::Draw, self.ndraws + draw.len()) {
                 self.rewind(id, mark);
                 return;
             }
@@ -2244,9 +2300,7 @@ impl Solver {
         // The one term a `grow` at the head of the recursion cannot bound: a
         // node's cells are appended after its whole subtree has been built, so
         // several nodes' worth can land with no check between them.
-        if self.bounded && self.ncells + self.nodes[id].legal_action.len() > self.cfg.budget.cells {
-            self.abandon = true;
-            self.budget_hit = true;
+        if !self.reserve(Ent::Cell, self.ncells + self.nodes[id].legal_action.len()) {
             self.rewind(id, mark);
             return;
         }
@@ -2388,6 +2442,9 @@ impl Solver {
                 return b;
             }
         }
+        if !self.reserve(Ent::Board, self.nboards + 1) {
+            return 0;
+        }
         let b = self.nboards as u32;
         self.bmap.insert(key, b);
         self.nboards += 1;
@@ -2410,7 +2467,13 @@ impl Solver {
             let res = reserve(s, p as u8, &self.ctx);
             self.leaf_coff.push(self.leaf_cidx.len() as u32);
             for c in cfgs[p].iter() {
+                if !self.reserve(Ent::Cidx, self.leaf_cidx.len() + 1) {
+                    break;
+                }
                 let idx = self.intern_config(c, &res, p);
+                if self.abandon {
+                    break;
+                }
                 self.leaf_cidx.push(idx);
             }
         }
@@ -2433,6 +2496,9 @@ impl Solver {
         }
         if let Some(&i) = self.cmap.get(&key) {
             return i;
+        }
+        if !self.reserve(Ent::Config, self.ncfg + 1) {
+            return 0;
         }
         let i = self.ncfg as u32;
         self.ncfg += 1;
@@ -3356,6 +3422,18 @@ impl Solver {
         Arc::make_mut(&mut c).extend(self, &grown, &resealed);
         self.contract = c;
         self.resent = resealed;
+        let reach = self
+            .contract
+            .legal_off
+            .len()
+            .max(self.contract.rev_start.len())
+            .max(self.contract.rvd_start.len())
+            .max(self.contract.draw_start.len());
+        let draws = self.contract.draw_to.len().max(self.contract.rvd_src.len());
+        let nodes = self.contract.level_start.len().max(self.contract.level_node.len());
+        let _ = self.reserve(Ent::Reach, reach);
+        let _ = self.reserve(Ent::Draw, draws);
+        let _ = self.reserve(Ent::Node, nodes);
     }
 
     /// The cell PUCT would take from one config's legal row.

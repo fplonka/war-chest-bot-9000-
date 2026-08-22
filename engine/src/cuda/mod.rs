@@ -42,10 +42,10 @@ use crate::net::{
 use crate::pbs::{
     CFEAT, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_LOOSE, OFF_PILES, PILE_COUNTS, PUBFEAT,
 };
-use crate::search::{Budget, Cfg, Cfr};
+use crate::search::{Budget, Cfg, Cfr, Ent};
 
 mod slot;
-use slot::{Arr, Solve, DESC};
+use slot::{Arr, Solve, DESC, NODE_FIELDS, C_CUR, C_PRIOR, C_QVAL, C_SUM, C_VISITS, R_REACH, R_VALS, B_P, B_JP, G_F, G_G, G_FP, Y_BOARD_OF, Y_COFF};
 
 type Res<T> = Result<T, String>;
 
@@ -340,7 +340,7 @@ fn round_bytes(n_slots: usize, b: &Budget, s: u32) -> usize {
         + TILE * 4
         + TILE * CFEAT * f
         + TILE * 4
-        + n_slots * (b.cells + 8 * b.nodes) * 4
+        + n_slots * (b.cidx + b.cells + NODE_FIELDS * b.nodes) * 4
         + TILE * (4 + 4 + 8 + 4)
         + 4;
     let batch = n_slots * DESC * 8
@@ -673,7 +673,7 @@ impl Device {
             let free = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
             let tile = round_bytes(0, &budget, cfg.s) as u64;
             let per = slot + (round_bytes(1, &budget, cfg.s) as u64).saturating_sub(tile);
-            // A slot is fifty allocations. Packing the reported free figure to
+            // A slot is eight allocations. Packing the reported free figure to
             // the last byte OOMs on fragmentation; keep a tenth.
             let usable = free.saturating_sub(tile);
             let fit = (usable - usable / 10) / per.max(1);
@@ -794,20 +794,18 @@ impl Device {
         c.stream.context().bind_to_thread().map_err(err)?;
         let g = c.solves.lock();
         let s = g.get(solve).ok_or_else(|| format!("solve {solve} is not resident"))?;
-        let all = |a: &Arr<f32>| c.slice(a, 0, a.len);
-        let cells = |a: &Arr<f32>| c.slice(a, 0, s.ncells);
         Ok(Resident {
-            p: all(&s.p)?,
-            jp: all(&s.jp)?,
-            f: all(&s.f)?,
-            g: all(&s.g)?,
-            fp: all(&s.fp)?,
-            prior: all(&s.prior)?,
-            cur: cells(&s.cur)?,
-            sum: cells(&s.sum)?,
-            qval: cells(&s.qval)?,
-            visits: cells(&s.visits)?,
-            reach: c.slice(&s.reach, 0, s.nreach)?,
+            p: s.get_f32(&c.stream, Ent::Board, B_P, 0, s.ent[Ent::Board as usize].len() * D)?,
+            jp: s.get_f32(&c.stream, Ent::Board, B_JP, 0, s.ent[Ent::Board as usize].len() * JW)?,
+            f: s.get_f32(&c.stream, Ent::Config, G_F, 0, s.ent[Ent::Config as usize].len() * D)?,
+            g: s.get_f32(&c.stream, Ent::Config, G_G, 0, s.ent[Ent::Config as usize].len() * POOL)?,
+            fp: s.get_f32(&c.stream, Ent::Config, G_FP, 0, s.ent[Ent::Config as usize].len() * D)?,
+            prior: s.get_f32(&c.stream, Ent::Cell, C_PRIOR, 0, s.ent[Ent::Cell as usize].len())?,
+            cur: s.get_f32(&c.stream, Ent::Cell, C_CUR, 0, s.ncells)?,
+            sum: s.get_f32(&c.stream, Ent::Cell, C_SUM, 0, s.ncells)?,
+            qval: s.get_f32(&c.stream, Ent::Cell, C_QVAL, 0, s.ncells)?,
+            visits: s.get_f32(&c.stream, Ent::Cell, C_VISITS, 0, s.ncells)?,
+            reach: s.get_f32(&c.stream, Ent::Reach, R_REACH, 0, s.nreach)?,
         })
     }
 }
@@ -943,7 +941,7 @@ impl Card {
         stage.phi = Wire::with_cap(s, TILE * CFEAT)?;
         stage.owner = Wire::with_cap(s, TILE)?;
         stage.cfg_cards = Wire::with_cap(s, n * CARD_ROWS * NTYPE * TYPE)?;
-        stage.blob = Wire::with_cap(s, n * (b.cells + 8 * b.nodes))?;
+        stage.blob = Wire::with_cap(s, n * (b.cidx + b.cells + NODE_FIELDS * b.nodes))?;
         stage.at = Wire::with_cap(s, TILE)?;
         stage.src = Wire::with_cap(s, TILE)?;
         stage.dst = Wire::with_cap(s, TILE)?;
@@ -1313,8 +1311,7 @@ impl Card {
             }
             let take = (*nb - skip).min(n - src);
             let b = self.slot(&mut g, *solve);
-            b.p.copy(s, (*boards_at + skip) * D, p, src * D, take * D)?;
-            b.jp.copy(s, (*boards_at + skip) * JW, jp, src * JW, take * JW)?;
+            b.copy_board(s, *boards_at + skip, p, jp, src, take)?;
             src += take;
             skip = 0;
             if src == n {
@@ -1341,8 +1338,9 @@ impl Card {
             };
             let nrows = *nrows;
             let b = self.slot(&mut g, *solve);
+            b.reserve(Ent::Row, row0 + nrows)?;
             let words = pack.words(board_of);
-            let dst = b.board_of.plan(&self.stream, *row0, nrows)?;
+            let dst = b.ent[Ent::Row as usize].field(Y_BOARD_OF, &self.stream) + (*row0 * 4) as u64;
             pack.piece(dst, *row0 as u32, words, nrows as u32);
             // `coff` arrives relative to this call's own `cidx`, so it is
             // shifted onto the resident index before it is stored. Row zero
@@ -1352,10 +1350,10 @@ impl Card {
             let shifted: Vec<u32> = coff.iter().map(|x| x + base).collect();
             b.host_coff.extend(shifted.iter().skip(1));
             let words = pack.words(cidx);
-            let dst = b.cidx.plan(&self.stream, b.cells, cidx.len())?;
+            let dst = b.view(&self.stream, Ent::Cidx, 0, b.cells, cidx.len(), 1)?;
             pack.piece(dst, b.cells as u32, words, cidx.len() as u32);
             let words = pack.words(&shifted);
-            let dst = b.coff.plan(&self.stream, 2 * row0, shifted.len())?;
+            let dst = b.ent[Ent::Row as usize].field(Y_COFF, &self.stream) + (2 * row0 * 4) as u64;
             pack.piece(dst, 2 * *row0 as u32, words, shifted.len() as u32);
             b.cells += cidx.len();
             b.rows = row0 + nrows;
@@ -1503,9 +1501,7 @@ impl Card {
             }
             let take = (kn - skip).min(k - src);
             let b = self.slot(&mut solves, *solve);
-            b.f.copy(s, (*base + skip) * D, f, src * D, take * D)?;
-            b.g.copy(s, (*base + skip) * POOL, g, src * POOL, take * POOL)?;
-            b.fp.copy(s, (*base + skip) * D, fp, src * D, take * D)?;
+            b.copy_cfg(s, *base + skip, f, g, fp, src, take)?;
             src += take;
             skip = 0;
             if src == k {
@@ -1698,12 +1694,7 @@ impl Card {
             // inside them each destination reads.
             let base = pack.words(&writes.blob);
             for r in &writes.runs {
-                let dst = b.plan(s, r.dst, r.at as usize, r.len as usize).map_err(|e| {
-                    format!(
-                        "{:?} at {}+{} ncells={ncells} nreach={nreach}: {e}",
-                        r.dst, r.at, r.len
-                    )
-                })?;
+                let dst = b.plan(s, r.dst, r.at as usize, r.len as usize)?;
                 pack.piece(dst, r.at, base + r.start, r.len);
             }
             b.level_start.clear();
@@ -1714,13 +1705,9 @@ impl Card {
             }
             b.ncells = *ncells;
             b.nreach = *nreach;
-            b.regret.fit(*ncells).map_err(|e| format!("regret ncells={ncells}: {e}"))?;
-            b.sum.fit(*ncells).map_err(|e| format!("sum ncells={ncells}: {e}"))?;
-            b.qval.fit(*ncells).map_err(|e| format!("qval ncells={ncells}: {e}"))?;
-            b.visits.fit(*ncells).map_err(|e| format!("visits ncells={ncells}: {e}"))?;
-            b.reach.fit(*nreach).map_err(|e| format!("reach nreach={nreach}: {e}"))?;
+            b.reserve(Ent::Cell, *ncells)?;
             b.nvals = *nvals;
-            b.vals.fit(2 * *nvals).map_err(|e| format!("vals nvals={nvals}: {e}"))?;
+            b.reserve(Ent::Reach, (*nreach).max(*nvals))?;
         }
         Ok(())
     }
@@ -2067,24 +2054,22 @@ impl Card {
             let s = &g[*solve];
             let mut root = Vec::new();
             for &(at, n) in vals_at {
-                root.extend(self.slice(&s.vals, at as usize, n as usize)?);
+                root.extend(s.get_f32(&self.stream, Ent::Reach, R_VALS, at as usize, n as usize)?);
             }
-            let policy = self.slice(&s.sum, policy_at.0 as usize, policy_at.1 as usize)?;
+            let policy = s.get_f32(
+                &self.stream,
+                Ent::Cell,
+                C_SUM,
+                policy_at.0 as usize,
+                policy_at.1 as usize,
+            )?;
             let mut beliefs = Vec::new();
             for &(at, n) in reach_at {
-                beliefs.extend(self.slice(&s.reach, at as usize, n as usize)?);
+                beliefs.extend(s.get_f32(&self.stream, Ent::Reach, R_REACH, at as usize, n as usize)?);
             }
             out.push((i, Reply { a: root, b: policy, c: beliefs, ..Default::default() }));
         }
         Ok(())
-    }
-
-    fn slice(&self, a: &Arr<f32>, at: usize, n: usize) -> Res<Vec<f32>> {
-        if n == 0 {
-            return Ok(Vec::new());
-        }
-        let buf = a.buf.as_ref().ok_or("reading an arena that was never written")?;
-        self.stream.memcpy_dtov(&buf.slice(at..at + n)).map_err(err)
     }
 
     /// The grid one level of one round takes: a block to each of the level's

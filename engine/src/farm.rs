@@ -670,6 +670,8 @@ pub struct Stats {
     budget_hits: AtomicU64,
     slot_bytes: AtomicU64,
     slots_per_card: AtomicU64,
+    /// Finished-solve entity counts, drained by collect. Eight per solve.
+    shapes: Mutex<Vec<[u32; 8]>>,
 }
 
 impl Stats {
@@ -700,6 +702,10 @@ impl Stats {
 
     pub fn slots_per_card(&self) -> u64 {
         self.slots_per_card.load(Ordering::Relaxed)
+    }
+
+    pub fn take_shapes(&self) -> Vec<[u32; 8]> {
+        std::mem::take(&mut *self.shapes.lock())
     }
 }
 
@@ -885,6 +891,7 @@ fn advance_job(
                 if job.solver.budget_hit() {
                     stats.budget_hits.fetch_add(1, Ordering::Relaxed);
                 }
+                stats.shapes.lock().push(job.solver.counts());
                 job.source.take(&job.solver, solved, &mut job.data);
                 collected.lock().push(std::mem::take(&mut job.data));
                 if stopping.load(Ordering::Relaxed) {

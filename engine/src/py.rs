@@ -488,7 +488,7 @@ impl Game {
 
 use crate::net::Net;
 use crate::farm::{Backend, Farm, Work};
-use crate::search::{Budget, Cfg, Cfr, Nets};
+use crate::search::{Budget, Cfg, Cfr, Ent, Nets};
 use crate::selfplay::{run_games, Agent, Collect, Data, GameCfg};
 use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2};
 use parking_lot::RwLock;
@@ -743,6 +743,7 @@ impl SolveFarm {
         dict.set_item("slots_per_card", s.slots_per_card())?;
         dict.set_item("slot_bytes", s.slot_bytes())?;
         dict.set_item("budget_hits", s.budget_hits())?;
+        dict.set_item("shapes", s.take_shapes())?;
         Ok(out)
     }
 }
@@ -956,6 +957,12 @@ fn solve_census() -> Vec<(String, usize)> {
     }
     #[cfg(not(feature = "gpu"))]
     Vec::new()
+}
+
+#[pyfunction]
+fn budget_for_s(s: u32) -> [usize; 8] {
+    let b = Budget::for_s(s);
+    Ent::ALL.map(|e| b.cap(e))
 }
 
 /// All 37 hexes' axial coords, indexed by hex. The browser UI's board
@@ -1181,5 +1188,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(leaf_breakdown, m)?)?;
         m.add_function(wrap_pyfunction!(stage_names, m)?)?;
         m.add_function(wrap_pyfunction!(solve_census, m)?)?;
+    m.add("ENT_NAMES", Ent::NAME.iter().copied().collect::<Vec<&str>>())?;
+    m.add_function(wrap_pyfunction!(budget_for_s, m)?)?;
     Ok(())
 }
