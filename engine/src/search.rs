@@ -104,9 +104,7 @@ impl Budget {
             nodes: k(BUDGET_512.nodes),
             rows: k(BUDGET_512.rows),
             boards: k(BUDGET_512.boards),
-            // Not scaled: interning keys on the node's reserve. A first
-            // expansion interned 2096 against a p90 of 1074; the slot is 4096.
-            configs: BUDGET_512.configs,
+            configs: k(BUDGET_512.configs),
             cidx: k(BUDGET_512.cidx),
             reach: k(BUDGET_512.reach),
             cells: k(BUDGET_512.cells),
@@ -143,87 +141,46 @@ impl Budget {
 }
 
 impl Budget {
-    /// Device bytes one slot holds, arena by arena.
-    ///
-    /// A slot allocates every one of these once, at this size, and reuses them
-    /// for every solve that ever runs in it. So this is not an estimate of what
-    /// a solve will take: it is what the slot *is*, and `Solve::bytes` on the
-    /// device must equal it exactly -- there is a test that says so.
-    ///
-    /// Written as the arena list rather than a formula because the arena list
-    /// is the thing that can change. Adding a device array without a line here
-    /// should look like the omission it is.
-    pub fn device_bytes(&self) -> usize {
-        use crate::net::{D, JW, POOL};
-        let f = 4;
-        let u = 4;
-        // The leaf pass: board vectors a board, the config encoder's rows a
-        // config, and the index that joins them a row.
-        let leaf = self.boards * (D + JW) * f
-            + self.configs * (2 * D + POOL) * f
-            + self.cidx * u
-            + (2 * self.rows + 1) * u
-            + 2 * self.rows * u
-            + self.configs * D * f;
-        // The CFR arenas: six a cell, and reach and values over the supports.
-        let cfr = 6 * self.cells * f + self.reach * f + 2 * self.reach * f;
-        // The tree, in the four terms the contract's arrays are indexed by.
-        // Per node, all four bytes wide on the card: kind, player, exhausted,
-        // both config counts, parent, roff, voff, soff, util, child_at,
-        // child_n, legal_base, rev_base, rvd_base, draw_base, the child slot
-        // every node but the root fills, and a level bound each way.
-        // `draw_start` is a config CSR like `legal_off`, so it sits on reach.
-        let tree = self.nodes * 19 * u
-            + (self.reach + self.nodes) * 5 * u
-            + self.cells * 6 * u
-            + self.draws * 4 * u;
-        leaf + cfr + tree + 8
-    }
-
-    /// Host bytes one solve holds at this budget, when the card keeps the CFR
-    /// state -- which is every solve the farm runs.
-    ///
-    /// The `Solver`'s own CFR arenas (`regret`, `prior`, `visits`, `qval`,
-    /// `sum`, `reach`, `vals`) are absent then, and they are most of a solve
-    /// on the reference path. What is left is the tree, the states its nodes
-    /// stand on, the description the card reads, and the leaf batch.
-    pub fn host_bytes(&self) -> usize {
-        use crate::net::D;
-        use crate::pbs::PUBFEAT;
-        let f = 4;
-        let u = 4;
-        let node = std::mem::size_of::<TNode>() + std::mem::size_of::<crate::state::State>();
-        // A `TNode` owns per-action and per-cell vectors of its own.
-        let owned = self.cells * 6 * u + self.reach * u;
-        let contract = self.device_bytes() - self.boards * (D + crate::net::JW) * f;
-        let batch = self.cidx * u
-            + 2 * self.rows * u
-            + self.boards * PUBFEAT * f * 2
-            + self.configs * crate::pbs::CFEAT * f
-            + self.rows * u;
-        let readout = self.rows * D * f + self.configs * D * f;
-        self.nodes * node + owned + contract + batch + readout + self.cells * f
+    /// Host bytes a device-resident solve holds at this budget, from the Vec
+    /// capacities it would reserve. The card keeps the CFR arenas.
+    pub fn host_slot_bytes(&self) -> usize {
+        fn cap<T>(n: usize) -> usize {
+            Vec::<T>::with_capacity(n).capacity() * std::mem::size_of::<T>()
+        }
+        cap::<TNode>(self.nodes)
+            + cap::<crate::state::State>(self.nodes)
+            + cap::<u32>(self.nodes) * 8
+            + cap::<u32>(self.cidx)
+            + cap::<u32>(self.rows) * 4
+            + cap::<f32>(self.cells)
+            + cap::<u32>(self.cells) * 6
+            + cap::<u32>(self.reach)
+            + cap::<u32>(self.draws) * 3
+            + cap::<f32>(self.boards * crate::pbs::PUBFEAT) * 2
+            + cap::<f32>(self.configs * crate::pbs::CFEAT)
+            + cap::<f32>(self.rows * crate::net::D)
+            + cap::<f32>(self.configs * crate::net::D)
     }
 }
 
-/// The shape a solve at `SoG(512, 8)` is allowed.
+/// The shape a solve at `SoG(512, 8)` is allowed: the ninetieth percentile
+/// `examples/shapes` measured over finished solves of real roots.
 ///
-/// `nodes` `rows` `boards` are the ninetieth percentile `examples/shapes`
-/// measured over a corpus of real roots. The other terms are a first
-/// expansion: that one is not a budget, because a root that stayed a leaf has
-/// no strategy, so the slot has to hold it. Measured on the training farm at
-/// `s = 512`: a first expansion interned 2096 configs, wrote 540709 cells,
-/// 393223 cidx, 1052788 reach or draws. `budget_hits` is then the later
-/// expansions that would have grown past this.
+/// A slot is this large. Every expansion, including the first, is abandoned
+/// and rewound if it would pass any term. A first expansion that does not fit
+/// leaves the root a leaf: the network's own value, a uniform play. That is
+/// the same truncation as any later expansion; a decision node mid-Footman
+/// cannot be a leaf, so the whole expansion goes back rather than a partial
+/// one staying.
 const BUDGET_512: Budget = Budget {
     nodes: 24_582,
     rows: 14_516,
     boards: 8_518,
-    configs: 4_096,
-    cidx: 2_097_152,
-    reach: 2_097_152,
-    cells: 2_097_152,
-    draws: 2_097_152,
+    configs: 1_074,
+    cidx: 393_199,
+    reach: 665_872,
+    cells: 154_716,
+    draws: 400_000,
 };
 
 #[derive(Clone, Copy)]

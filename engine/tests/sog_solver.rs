@@ -807,15 +807,18 @@ fn a_solve_never_grows_past_its_budget() {
         assert!(got.reach <= budget.reach, "seed {seed}: {} reach", got.reach);
         assert!(got.cells <= budget.cells, "seed {seed}: {} cells", got.cells);
         assert!(got.draws <= budget.draws, "seed {seed}: {} draws", got.draws);
-        // A truncated solve is a smaller solve, not a broken one: it still
-        // has to hand back an average strategy at its root.
-        let root = sv.average_strategy(0, 0);
-        assert!(!root.is_empty(), "seed {seed}: a truncated solve has no average");
-        assert!(
-            root.iter().sum::<f32>() > 0.99 && root.iter().sum::<f32>() < 1.01,
-            "seed {seed}: the root average sums to {}",
-            root.iter().sum::<f32>()
-        );
+        if sv.nodes[0].leaf {
+            // The first expansion did not fit. The root stayed a leaf, which
+            // is the truncation: there is no average to read.
+        } else {
+            let root = sv.average_strategy(0, 0);
+            assert!(!root.is_empty(), "seed {seed}: a truncated solve has no average");
+            assert!(
+                root.iter().sum::<f32>() > 0.99 && root.iter().sum::<f32>() < 1.01,
+                "seed {seed}: the root average sums to {}",
+                root.iter().sum::<f32>()
+            );
+        }
         hits += sv.budget_hit() as usize;
         checked += 1;
         if checked >= 200 {
