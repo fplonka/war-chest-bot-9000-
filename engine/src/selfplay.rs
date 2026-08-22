@@ -29,6 +29,17 @@
 //! `cap_value * delta_markers`, so the first solves against an untrained
 //! network still see a graded outcome -- the win condition, graded -- rather
 //! than a flat zero. `state::cap_marker_value` anneals it away.
+//!
+//! **Grounding: `p_td1`.** A bootstrap target is the network's own answer
+//! propagated one subgame back, so a run whose trees never reach a terminal
+//! trains on nothing but itself. Student of Games' remedy is the TD(1) target:
+//! with probability `p_td1` a self-play row's value is the realised outcome of
+//! the game it came from instead of that solve's counterfactual values. The
+//! outcome is known for the configs the players actually held, so it is written
+//! there and nowhere else; every other config keeps the search value, which is
+//! the best estimate there is for a hand nobody was dealt. A row that is owed
+//! an outcome stays with its game until the game ends, so `p_td1 > 0` is also
+//! what makes a run's rows arrive a game at a time.
 
 use crate::actions::{Action, Play};
 use crate::board::NONE;
@@ -262,6 +273,17 @@ impl Data {
         self.nv += 1;
     }
 
+    /// Move the running counters out, leaving the rows behind. See
+    /// `Game::take_ready`.
+    fn take_counters(&mut self) -> Data {
+        Data {
+            decisions: std::mem::take(&mut self.decisions),
+            configs: std::mem::take(&mut self.configs),
+            plays: std::mem::take(&mut self.plays),
+            ..Default::default()
+        }
+    }
+
     /// The config range of row `r`, player `p`, in the arena.
     #[inline]
     pub fn row_span(&self, r: usize, p: usize) -> std::ops::Range<usize> {
@@ -279,9 +301,10 @@ pub struct GameCfg {
     pub explore: f32,
     /// Randomise the draft instead of using the fixed starter matchup.
     pub random_draft: bool,
-    /// How much of the value target comes from the realised game outcome
-    /// rather than from the CFR bootstrap -- Student of Games' `p_td1`. Zero is
-    /// the pure bootstrap, which is what the paper runs for poker.
+    /// Probability that a self-play row's value target is the realised game
+    /// outcome rather than this solve's CFR bootstrap -- Student of Games'
+    /// `p_td1`, drawn once per row. Zero is the pure bootstrap, which is what
+    /// the paper runs for poker; Go runs 0.2.
     pub p_td1: f32,
     /// Belief states drawn from each self-play search and queued to be solved
     /// as roots of their own — Student of Games' `q_search`. A search only
@@ -309,6 +332,10 @@ pub struct Game {
     /// Belief states this game's searches asked the network about, waiting to
     /// be solved as roots of their own.
     queries: Vec<(State, [Belief; 2])>,
+    /// Per row of `data`, each seat's realised config as an index into that
+    /// seat's belief support. This is the only infostate the game's outcome is
+    /// a target for, so it is what `finish` writes to.
+    truth: [Vec<u32>; 2],
 }
 
 /// A rate like "0.9 queries per search", drawn into a whole number.
@@ -389,6 +416,7 @@ impl Game {
             gc: *gc,
             explorer,
             queries: Vec::new(),
+            truth: Default::default(),
         }
     }
 
@@ -398,22 +426,29 @@ impl Game {
         std::mem::take(&mut self.queries)
     }
 
-    /// This game's rows, which it gives up only once it has ended and final
-    /// ownership targets have been backfilled.
+    /// This game's rows, which it gives up only once it has ended and `finish`
+    /// has written the outcome into the rows that drew it.
     pub fn take_data(&mut self) -> Data {
         assert!(
             self.s.is_terminal(),
             "a game gives up its rows only once it has ended"
         );
+        self.truth = Default::default();
         std::mem::take(&mut self.data)
     }
 
-    /// Yield solved SoG rows without ending the game. Pure bootstrap targets
-    /// are complete when their subgame solve ends; no game outcome backfill is
-    /// pending.
-    pub fn take_rows(&mut self) -> Data {
-        assert_eq!(self.gc.collect, Collect::Sog);
-        assert_eq!(self.gc.p_td1, 0.0);
+    /// Everything whose value target is already final.
+    ///
+    /// A pure bootstrap row is finished the moment its own solve is: the target
+    /// is that solve's own answer, and nothing later changes it. A run with
+    /// `p_td1 > 0` still owes some of its rows the game's outcome, so those wait
+    /// for `finish` and only the counters come out here -- otherwise a run that
+    /// has yet to end a game would report no decisions and no play mix either,
+    /// which is exactly the run whose diagnostics matter most.
+    pub fn take_ready(&mut self) -> Data {
+        if self.gc.p_td1 > 0.0 {
+            return self.data.take_counters();
+        }
         std::mem::take(&mut self.data)
     }
 
@@ -486,21 +521,32 @@ impl Game {
                 &solved.policy,
             );
             self.queries.extend(solved.queries);
+            // The row is stored under the belief that is about to be updated,
+            // so the seats' realised configs are read here and not at `finish`.
+            if self.gc.p_td1 > 0.0 {
+                for p in 0..2 {
+                    self.truth[p].push(self.true_index(p) as u32);
+                }
+            }
         }
         let np = policy::at_node(sv, 0, n);
         self.play(np);
+    }
+
+    /// Where the config a seat is really holding sits in its own belief
+    /// support. Losing the real world would silently corrupt every target taken
+    /// from here on, so this fails loudly instead.
+    fn true_index(&self, p: usize) -> usize {
+        self.bel[p]
+            .index_of(&true_config(&self.s, p as u8, &self.ctx))
+            .expect("belief filter dropped the true config")
     }
 
     /// Sample the acting player's move, update the public belief from what the
     /// opponent observes, and apply it.
     fn play(&mut self, np: policy::NodePolicy) {
         let me = self.s.to_act() as usize;
-        let truth = true_config(&self.s, me as u8, &self.ctx);
-        let true_ci = self.bel[me]
-            .index_of(&truth)
-            // Losing the real world would silently corrupt every target taken
-            // from here on, so fail loudly instead.
-            .expect("belief filter dropped the true config");
+        let true_ci = self.true_index(me);
         let true_row = np.row(true_ci);
         let mut chosen_cell = np.sample(&mut self.rng, true_ci);
         if me as u8 == self.explorer
@@ -527,15 +573,24 @@ impl Game {
         self.s.apply_inplace(np.acts[chosen]);
     }
 
-    /// The game ended: blend the outcome into parked targets and return White's
-    /// result.
+    /// The game ended: write the outcome into the rows that drew a TD(1)
+    /// target, and return White's result.
     pub fn finish(&mut self) -> f32 {
-        let z = self.s.utility(WHITE as usize);
         if self.gc.p_td1 > 0.0 {
-            // Anchor the bootstrap target to the realised outcome, blended in
-            // once per game.
-            let m = self.gc.p_td1.clamp(0.0, 1.0);
-            blend_outcome(&mut self.data, 1.0 - m, m, z);
+            debug_assert_eq!(self.truth[0].len(), self.data.nv, "one truth a row");
+            // `utility` already carries the annealed horizon payoff, so a game
+            // cut at the play cap grounds its rows on the marker lead at
+            // whatever weight the anneal has reached by then.
+            let z = [self.s.utility(0), self.s.utility(1)];
+            for r in 0..self.data.nv {
+                if self.rng.unit_f64() >= self.gc.p_td1 as f64 {
+                    continue;
+                }
+                for p in 0..2 {
+                    let at = self.data.row_span(r, p).start + self.truth[p][r] as usize;
+                    self.data.cy[at] = z[p];
+                }
+            }
         }
         self.data.games += 1;
         if self.s.main_plays >= crate::state::MAX_MAIN_PLAYS {
@@ -545,7 +600,7 @@ impl Game {
             Some(w) => self.data.wins[w as usize] += 1,
             None => self.data.draws += 1,
         }
-        z
+        self.s.utility(WHITE as usize)
     }
 }
 
@@ -645,7 +700,7 @@ impl GameStream {
                 self.game.play_solved(sv, solved);
                 let queued = self.game.take_queries();
                 self.enqueue(queued);
-                out.merge(self.game.take_rows());
+                out.merge(self.game.take_ready());
             }
             Kind::Query => {
                 let more = keep_query(sv, solved, out);
@@ -667,7 +722,7 @@ impl GameStream {
         self.game.finish();
         let queued = self.game.take_queries();
         self.enqueue(queued);
-        out.merge(self.game.take_rows());
+        out.merge(self.game.take_data());
         self.game = Game::new(Rng::new(worker_seed(self.seed, self.game_index)), &self.gc);
         self.game_index += 1;
     }
@@ -694,21 +749,6 @@ pub fn play_game(rng: Rng, nets: &Arc<Nets>, gc: &GameCfg, data: &mut Data) -> f
     data.merge(d);
     z
 }
-/// `y <- keep * y + mix * (+-z)` over every config of every row this game
-/// produced. The sign flips for player 1: `z` is White's outcome and the
-/// targets are per-player utilities of a zero-sum game.
-fn blend_outcome(data: &mut Data, keep: f32, mix: f32, z: f32) {
-    for r in 0..data.nv {
-        for p in 0..2 {
-            let sign = if p == 0 { 1.0 } else { -1.0 };
-            for i in data.row_span(r, p) {
-                data.cy[i] = keep * data.cy[i] + mix * sign * z;
-            }
-        }
-    }
-}
-
-
 pub(crate) fn resolve_chance(s: &mut State, player: u8, rng: &mut Rng) -> Action {
     debug_assert!(matches!(
         s.pending(),
@@ -816,7 +856,7 @@ pub fn run_games(games: usize, seed: u64, nets: &Arc<Nets>, gc: &GameCfg) -> Dat
 }
 
 #[cfg(test)]
-mod policy_target_tests {
+mod target_tests {
     use super::*;
     use crate::search::{Cfg, Solver};
 
@@ -956,5 +996,98 @@ mod policy_target_tests {
             checked += 1;
         }
         assert!(checked > 0, "no solve to check");
+    }
+
+    /// A finished game writes its outcome exactly where the seats were.
+    ///
+    /// `p_td1 = 1` makes every self-play row take the TD(1) target, so this
+    /// pins three things at once. *Placement*: one entry a seat a row, at the
+    /// config that seat was really holding, and every config nobody held keeps
+    /// the search value it had. *Sign*: a row stores a value per player, so
+    /// White's entry and Black's are that player's own utility and must cancel.
+    /// *Reach*: a query row sitting in the same buffer is off the line of play
+    /// and belongs to no game, so nothing may be written to it.
+    #[test]
+    fn a_finished_game_writes_its_outcome_where_the_seats_were() {
+        let nets = Arc::new(Nets { value: random_net(0x7D1), device: false });
+        let cfg = Cfg { s: 4, c: 1.0, ..Default::default() };
+
+        // A query row, in the buffer the game will merge into.
+        let mut out = Data::default();
+        let (s, bel) = positions(0x7D1, 1).pop().expect("a root");
+        let mut qv = Solver::new(
+            &s,
+            Ctx::new(&s),
+            Arc::clone(&nets),
+            cfg,
+            bel.clone(),
+            Rng::new(0x9E4),
+        );
+        qv.collect(0);
+        let solved = qv.run_alone();
+        keep_query(&qv, solved, &mut out);
+        let query_cy = out.cy.clone();
+        assert!(!query_cy.is_empty(), "the query solve stored no values");
+
+        let gc = GameCfg {
+            agents: [Agent::Sog { cfg }; 2],
+            collect: Collect::Sog,
+            explore: 0.0,
+            random_draft: false,
+            p_td1: 1.0,
+            query_rate: 0.0,
+            recursive_rate: 0.0,
+        };
+        let mut g = Game::new(Rng::new(0x51C4), &gc);
+        while let Some(mut sv) = g.next_solve(&nets) {
+            let solved = sv.run_alone();
+            g.play_solved(&sv, solved);
+        }
+        let before = g.data.cy.clone();
+        let truth = g.truth.clone();
+        let z = [g.s.utility(0), g.s.utility(1)];
+        assert_eq!(z[0], -z[1], "the outcome is not zero sum");
+        assert_ne!(z[0], 0.0, "a level game leaves the sign untested; pick a seed");
+        g.finish();
+        let d = g.take_data();
+        assert!(d.nv > 0, "a whole game stored no rows");
+        assert_eq!(d.queries, 0, "a query row reached a game");
+
+        let mut written = 0usize;
+        for r in 0..d.nv {
+            for p in 0..2 {
+                let span = d.row_span(r, p);
+                let at = span.start + truth[p][r] as usize;
+                assert!(at < span.end, "row {r} seat {p}: truth outside the support");
+                for i in span {
+                    if i == at {
+                        assert_eq!(d.cy[i], z[p], "row {r} seat {p}: outcome target");
+                        written += 1;
+                    } else {
+                        assert_eq!(d.cy[i], before[i], "row {r}: a config nobody held moved");
+                    }
+                }
+            }
+        }
+        assert_eq!(written, 2 * d.nv, "one entry a seat a row");
+
+        out.merge(d);
+        assert_eq!(
+            out.cy[..query_cy.len()],
+            query_cy[..],
+            "the game's outcome was written into a query row"
+        );
+
+        // And on the path a run actually drives: while an outcome is owed, the
+        // counters come out every solve and the rows do not.
+        let mut st = GameStream::new(5, GameCfg { p_td1: 0.2, ..gc });
+        let mut live = Data::default();
+        for _ in 0..8 {
+            let mut sv = st.next_solve(&nets, &mut live);
+            let solved = sv.run_alone();
+            st.keep(&sv, solved, &mut live);
+        }
+        assert_eq!(live.nv, 0, "a row left its game before the game ended");
+        assert!(live.decisions > 0, "the counters did not come out");
     }
 }

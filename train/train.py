@@ -681,6 +681,7 @@ def main():
             explore=args.explore,
             random_draft=args.random_draft,
             cfr=args.cfr,
+            p_td1=args.p_td1,
             query_rate=args.query_rate,
             recursive_rate=args.recursive_rate,
             devices=[int(d) for d in args.gen_devices.split(",")])
@@ -740,6 +741,7 @@ def main():
             window["add_s"] += add_s
             for name in (
                     "games", "decisions", "horizon_hits",
+                    "white_wins", "black_wins", "draws",
                     "plays_attack", "plays_pass", "plays_deploy",
                     "plays_bolster", "plays_maneuver", "plays_recruit",
                     "configs", "query_rows"):
@@ -838,6 +840,13 @@ def main():
                 "epoch": epoch,
                 "phase": "sog",
                 "games": int(window["games"]),
+                # Decisive against drawn, per epoch. A finished game is the
+                # earliest evidence that self-play is going anywhere at all, and
+                # a run that only ever draws is failing differently from one
+                # that never finishes a game.
+                "white_wins": int(window["white_wins"]),
+                "black_wins": int(window["black_wins"]),
+                "draws": int(window["draws"]),
                 "decisions": int(window["decisions"]),
                 "rows": int(window["rows"]),
                 "solves": int(window["solves"]),
@@ -908,7 +917,9 @@ def main():
             print(
                 f"[t={rec['t']:6.1f}s] GT-CFR solves={sog_solves} "
                 f"rate={raw_sps:.1f}/s rows={rec['rows']} "
-                f"games={rec['games']} qrows={rec['query_rows']} "
+                f"games={rec['games']} "
+                f"W{rec['white_wins']}/B{rec['black_wins']}/D{rec['draws']} "
+                f"qrows={rec['query_rows']} "
                 f"L={lv:.5f} L/var={lv / max(target_var, 1e-9):.2f} "
                 f"Lp={rec['policy_loss']:.3f} "
                 f"tgt={target_mean:+.3f}/{target_var ** 0.5:.3f} "
@@ -927,7 +938,8 @@ def main():
             f"optimizer_rows={optimizer_rows} "
             f"rate={sog_solves / elapsed:.1f}/s "
             f"horizon={totals['horizon_hits'] / max(totals['games'], 1):.2f} "
-            f"games={totals['games']}",
+            f"games={totals['games']} "
+            f"W{totals['white_wins']}/B{totals['black_wins']}/D{totals['draws']}",
             flush=True)
 
     print(f"[cfg] PUBFEAT={PUBFEAT} CFEAT={CFEAT} architecture=gt-cfr "
@@ -958,7 +970,10 @@ def main():
         tag = pathlib.Path(args.out).name
         bots = sorted(str(p) for p in (ROOT / "bots").glob(f"{tag}.*"))
         # Greedy first, so ratings are quoted against the one reference that
-        # means the same thing from one run to the next.
+        # means the same thing from one run to the next. Without it a ladder
+        # only says which snapshot beats which other snapshot, which every run
+        # can satisfy while learning nothing, so a missing or unrunnable anchor
+        # is a failure rather than something to drop.
         greedy = ROOT / "bots" / "greedy"
         anchor = [str(greedy)] if (greedy / "bot.json").exists() else []
         subprocess.run(arena + ["ladder", *anchor, *bots,
