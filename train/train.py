@@ -624,13 +624,16 @@ def main():
     _torch_hold = None
     if train_idx in gen_idx:
         cap = int(TRAIN_FRAC * torch.cuda.get_device_properties(dev).total_memory)
-        used = torch.cuda.memory_reserved(dev)
-        extra = max(0, cap - used)
+        used = torch.cuda.memory_allocated(dev)
+        # The CUDA context and the caching allocator sit outside
+        # `memory_allocated` but inside the fraction. Leave them, and a
+        # training step, unpinned.
+        extra = max(0, cap - used - (1024 << 20))
         if extra:
             _torch_hold = torch.empty(extra // 4, dtype=torch.float32, device=dev)
         print(f"[train] torch holds {TRAIN_FRAC:.0%} of {dev} "
-              f"({cap / (1 << 20):.0f} MiB, {used / (1 << 20):.0f} in use); "
-              f"the farm carves the rest",
+              f"({cap / (1 << 20):.0f} MiB cap, {used / (1 << 20):.0f} allocated, "
+              f"{extra / (1 << 20):.0f} pinned); the farm carves the rest",
               flush=True)
     print(f"[train] search inference on cuda:{args.gen_devices}, "
           f"training on {dev}", flush=True)
