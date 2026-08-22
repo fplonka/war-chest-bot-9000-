@@ -3658,6 +3658,19 @@ impl Solver {
     /// slice. Leaves the reference reaches in place so a caller can read
     /// beliefs off the tree; it must `restore` when it is done.
     fn value_pass(&mut self) -> [Vec<f32>; 2] {
+        // A root that stayed a leaf has no average strategy. The target is the
+        // network's own answer at this position, which is what the leaf pass
+        // already is.
+        if self.nodes[0].leaf {
+            let mut out = [Vec::new(), Vec::new()];
+            for p in 0..2usize {
+                self.leaf_values(p);
+                let n = self.nc[0][p] as usize;
+                let vo = self.voff[0] as usize;
+                out[p] = self.cfr().vals[vo..vo + n].to_vec();
+            }
+            return out;
+        }
         let reference = self.reference();
         self.propagate(&reference);
         let mut out = [Vec::new(), Vec::new()];
