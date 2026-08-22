@@ -235,7 +235,7 @@ fn the_cfr_loop_agrees_on_a_fixed_tree() {
     let host = generate_one(&net, Backend::Reference(net.clone()), 3, 8, 0.0);
     let card = generate_one(
         &net,
-        Backend::Cuda(Device::new(&[0], net.clone()).expect("device")),
+        Backend::Cuda(Device::new(&[0], net.clone(), Cfg::default(), 8).expect("device")),
         3,
         8,
         0.0,
@@ -309,7 +309,7 @@ fn growth_is_the_same_rule_as_the_reference() {
         return;
     }
     let net = random_net(0x9E37);
-    let device = Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
+    let device = Backend::Cuda(Device::new(&[0], net.clone(), Cfg::default(), 8).expect("device"));
     let Backend::Cuda(d) = &device else { unreachable!("just built") };
     let nets = Arc::new(Nets { value: net.clone(), device: true });
     let streams = [
@@ -452,7 +452,7 @@ fn growth_on_the_device_produces_sane_targets() {
     let net = random_net(0x9E37);
     let card = generate_one(
         &net,
-        Backend::Cuda(Device::new(&[0], net.clone()).expect("device")),
+        Backend::Cuda(Device::new(&[0], net.clone(), Cfg::default(), 8).expect("device")),
         3,
         32,
         4.0,
@@ -494,7 +494,7 @@ fn a_solve_does_not_depend_on_the_round_it_rides_in() {
         (0x77C1, cfg(13, 0.0)),
         (0x2E57, cfg(17, 0.0)),
     ];
-    let device = || Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
+    let device = || Backend::Cuda(Device::new(&[0], net.clone(), Cfg::default(), 8).expect("device"));
     let together = generate(&net, device(), &streams, 3);
     // A shared round must not move a solve at all, so the same run twice is
     // the control: whatever this reports is the floor the comparison sits on.
@@ -610,7 +610,7 @@ fn a_ragged_round_does_not_move_the_small_solve() {
     };
 
     let (alone, tiny) = {
-        let device = Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
+        let device = Backend::Cuda(Device::new(&[0], net.clone(), Cfg::default(), 8).expect("device"));
         let (mut g, mut data, sv) = small();
         let (sv, solved) = run_solve(&device, sv);
         let tiny = sv.nodes.len();
@@ -618,7 +618,7 @@ fn a_ragged_round_does_not_move_the_small_solve() {
         (data, tiny)
     };
 
-    let device = Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
+    let device = Backend::Cuda(Device::new(&[0], net.clone(), Cfg::default(), 8).expect("device"));
     // Two partners, in slots of their own, grown on their own for twelve
     // rounds. A round carries `Cfg::batch` regret updates, so a budget's rounds
     // are `ceil(ceil(s / c) / 4)`: both of these run 128 updates and so 32
@@ -706,7 +706,7 @@ fn a_growing_solve_does_not_depend_on_the_round_it_rides_in() {
         (0x77C1, batched(64, 8.0)),
         (0x2E57, batched(80, 5.0)),
     ];
-    let device = || Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
+    let device = || Backend::Cuda(Device::new(&[0], net.clone(), Cfg::default(), 8).expect("device"));
     let together = generate(&net, device(), &streams, 2);
     for (i, &s) in streams.iter().enumerate() {
         let alone = generate(&net, device(), &[s], 2).pop().expect("one stream");
@@ -754,7 +754,7 @@ fn the_resident_state_agrees_with_the_cpu_network() {
     }
     let net = random_net(0x9E37);
     let host = one_solve(&net, &Backend::Reference(net.clone()), 8, 0.0);
-    let device = Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
+    let device = Backend::Cuda(Device::new(&[0], net.clone(), Cfg::default(), 8).expect("device"));
     let card = one_solve(&net, &device, 8, 0.0);
     let Backend::Cuda(d) = &device else { unreachable!("just built") };
     let got = d.resident(0, 0).expect("the card gave its solve back");
@@ -800,7 +800,7 @@ fn a_subgame_scored_from_the_game_agrees_with_the_cpu() {
     let net = random_net(0x9E37);
     let nets = Arc::new(Nets { value: net.clone(), device: true });
     let host_nets = Arc::new(Nets { value: net.clone(), device: false });
-    let backend = Backend::Cuda(Device::new(&[0], net.clone()).expect("device"));
+    let backend = Backend::Cuda(Device::new(&[0], net.clone(), Cfg::default(), 8).expect("device"));
     let host = Backend::Reference(net.clone());
     let uniform = |s: &State, ctx: &Ctx, p: u8| {
         let truth = true_config(s, p, ctx);
