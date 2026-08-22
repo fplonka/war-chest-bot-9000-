@@ -66,7 +66,6 @@ N_HEXES = warchest.N_HEXES
 # What `SolveFarm.collect` reports about the device rounds, cumulative
 # since the farm started. `rounds` is the denominator of the other three.
 ROUND_KEYS = ("rounds", "round_calls", "round_rows", "round_nanos", "budget_hits")
-ENT_NAMES = ("node", "cell", "reach", "draw", "row", "board", "config", "cidx")
 
 
 def action_feats(pa):
@@ -615,8 +614,10 @@ def main():
     # One training step and one probe at the largest batch the run can make,
     # so the caching allocator holds the peak before the farm carves.
     torch.cuda.reset_peak_memory_stats(dev)
+    names = tuple(warchest.ENT_NAMES)
+    per = warchest.budget_for_s(args.s)[names.index("config")]
     n = max(args.batch, 2048)
-    k = n * warchest.budget_for_s(args.s)[ENT_NAMES.index("config")]
+    k = args.batch * per
     x = torch.zeros(2 * n, PUBFEAT, device=dev)
     phi = torch.zeros(k, CFEAT, device=dev)
     w = torch.ones(k, device=dev)
@@ -630,7 +631,7 @@ def main():
     torch.cuda.synchronize(dev)
     peak = torch.cuda.max_memory_reserved(dev)
     print(f"[train] torch peak {peak / (1 << 20):.0f} MiB reserved on {dev} "
-          f"(batch={n} configs={k}); farm carves mem_get_info free",
+          f"(rows={n} configs={k}); farm carves mem_get_info free",
           flush=True)
     print(f"[train] search inference on cuda:{args.gen_devices}, "
           f"training on {dev}", flush=True)
