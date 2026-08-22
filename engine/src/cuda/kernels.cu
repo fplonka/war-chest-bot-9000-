@@ -956,6 +956,32 @@ __global__ void k_belief_pool(const Tree* trees, const int* part_of_row,
 // shared memory, because the multiply needs a row's whole width and a thread
 // holds one column of it.
 //
+// **The block's footprint is a shared-card decision, not a throughput one.**
+// Ten streams drive one card, and most of what they run -- the reach and
+// backprop sweeps, the terminals -- is a short launch over a small grid that
+// waits on the level before it. Those need somewhere to put a block, and a
+// block needs registers. A first version of this kernel took `J_ROWS = 32` with
+// `__launch_bounds__(J_W, 4)`, which grants ptxas 65,536 / (4 * 128) = 128
+// registers a thread; four resident blocks then hold 4 * 128 * 128 = 65,536
+// registers, which is the *entire* file of an SM. Not one block of any other
+// kernel could be placed beside them -- not for want of block slots, twelve of
+// sixteen being free, but for want of registers -- and a block is not
+// preemptible, so every SM stayed that way for a whole wave: 4 * 32 rows *
+// 769 steps * 128 columns / 128 lanes = 98,000 cycles, some 60 us, and more
+// with the shared loads. The join itself came out 44 % cheaper a solve and the
+// round came out 9 % slower, with reach up 42 %, backprop 56 %, the readout
+// 76 % and the terminals 92 % -- every one of them a kernel this change never
+// touched, and the two that did not move, the belief pool and the expansion,
+// the two whose grids are large enough to saturate on their own.
+//
+// So: fewer, fatter blocks with a tighter register cap. Sixty-four rows a block
+// puts the shared memory at 35,328 B, and three of those do not fit in an SM's
+// 100 kB, so two blocks are resident; `__launch_bounds__(J_W, 5)` caps the
+// register budget at 96 a thread, and 2 * 128 * 96 = 24,576 registers is 37 %
+// of the file. That leaves 40,960 registers and 1,280 thread slots free, which
+// is eight more sweep blocks an SM. The same 128 rows are in flight an SM as
+// before, and the weight traffic halves.
+//
 // Every reduction here is in a fixed order that depends on nothing but the row:
 // the multiplies accumulate over `k` in source order, and the norms sum a warp
 // by shuffle and then the four warp totals by index. So a leaf's values are the
@@ -964,7 +990,8 @@ __global__ void k_belief_pool(const Tree* trees, const int* part_of_row,
 // promise.
 
 // The shared row of staged activations. Padded to a multiple of four so a
-// thread can read four of a row's values in one 16-byte shared load.
+// thread can read four of a row's values in one 16-byte shared load -- and it
+// is this row, `J_ROWS` of it, that sets how many blocks an SM will hold.
 #define J_LD (((J_IN) + 3) & ~3)
 #define J_WARPS ((J_W) / 32)
 
@@ -978,6 +1005,13 @@ __device__ __forceinline__ void join_mul(float (&z)[J_ROWS], const float* act,
                                          const float* w, int k_in) {
     int j = threadIdx.x;
     int k = 0;
+    // Two steps of `k`, not thirty-two. The body is already `J_ROWS` deep, so
+    // unrolling the whole loop would put ten thousand instructions in it and
+    // spend the instruction cache the arithmetic needs; unrolling none of it
+    // would leave the first multiply of each step waiting on its own weight
+    // load. Two puts the next step's four loads in flight under the current
+    // step's work.
+    #pragma unroll 2
     for (; k + 4 <= k_in; k += 4) {
         float w0 = w[(size_t)(k + 0) * J_W + j];
         float w1 = w[(size_t)(k + 1) * J_W + j];
@@ -992,6 +1026,7 @@ __device__ __forceinline__ void join_mul(float (&z)[J_ROWS], const float* act,
             z[i] = fmaf(v[3], w3, z[i]);
         }
     }
+    #pragma unroll 1
     for (; k < k_in; ++k) {
         float wk = w[(size_t)k * J_W + j];
         #pragma unroll
@@ -1054,10 +1089,12 @@ __device__ __forceinline__ void join_norm(float (&z)[J_ROWS], float* act,
 //
 // `rows` is `2 * tile`: the tile's leaves asking as player zero, then the same
 // leaves asking as player one. `q0` and `tile` place a row in the round.
-// Four blocks an SM is what the shared memory allows, so the register budget
-// is capped there rather than left to ptxas, which would spend it hiding the
-// prologue's gathers and leave one block resident.
-__global__ __launch_bounds__(J_W, 4)
+// Two blocks an SM is what the shared memory allows; the bound asks for five so
+// that the register cap it carries -- 65,536 / (5 * 128), rounded down to 96 --
+// is well under what two resident blocks could take. See the note above: the
+// figure that matters here is how much of the SM is left for the other nine
+// streams, not how much of it this kernel can hold.
+__global__ __launch_bounds__(J_W, 5)
 void k_join(const Tree* trees, const int* part_of_row, const int* local_row,
             const float* pooled, const float* wj, const float* lnj,
             const float* owed, float* h, int rows, int tile, int q0) {
@@ -1110,6 +1147,7 @@ void k_join(const Tree* trees, const int* part_of_row, const int* local_row,
     for (int col = j; col < J_D; col += J_W) {
         #pragma unroll
         for (int i = 0; i < J_ROWS; ++i) z[i] = 0.0f;
+        #pragma unroll 2
         for (int k = 0; k < J_W; ++k) {
             float wk = w[(size_t)k * J_D + col];
             #pragma unroll

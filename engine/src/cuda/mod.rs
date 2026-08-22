@@ -339,14 +339,19 @@ const TILE: usize = 16384;
 
 /// Join rows one block of `k_join` holds.
 ///
-/// The block streams all 394 kB of the join's weights past for whatever rows it
-/// carries, so this is the factor by which the weight traffic falls: at the
-/// production stride, thirty-two rows a block is 404 MB of L2 reads a
-/// round-iteration against the kernel's own arithmetic floor of about 200 GFLOP
-/// -- L2 and the SMs then bind at roughly the same level. Sixteen would double
-/// the reads and bind on L2; sixty-four would need 32 kB of shared memory a
-/// block and cut the blocks resident on an SM in half.
-const JROWS: usize = 32;
+/// Two things ride on it, and the second is the larger. It is the factor by
+/// which the weight traffic falls, because a block streams all 394 kB of the
+/// join's weights past for whatever rows it carries: sixty-four rows is about
+/// 76 GB/s of L2 reads a card at the production rate, half what thirty-two was.
+///
+/// And it sets how much of an SM the kernel holds. The block's shared memory is
+/// `JROWS * (JW + 4) * 4` plus a kilobyte of reduction scratch -- 35,328 bytes
+/// here -- so two blocks fit an SM's 100 kB and three do not, and two blocks at
+/// the 96 registers `__launch_bounds__(JW, 5)` allows come to 37 % of the
+/// register file rather than the 100 % that thirty-two rows at four blocks took.
+/// The card is driven ten streams deep and the sweeps that share it need
+/// somewhere to put a block; see the note over `k_join`.
+const JROWS: usize = 64;
 
 /// The capacity an array of `want` elements takes: a power of two.
 ///
