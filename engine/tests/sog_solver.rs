@@ -193,6 +193,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
     let cfg = Cfg {
         s: 200,
         c: 1.0,
+        budget: Budget::unbounded(),
         ..Default::default()
     };
     let mut checked = 0;
@@ -328,7 +329,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
 fn a_solve_stops_expanding_once_the_tree_is_exhausted() {
     let nets = Arc::new(Nets::default());
     // Far more expansions than the whole subgame holds.
-    let cfg = Cfg { s: 4_000, c: 1.0, ..Default::default() };
+    let cfg = Cfg { s: 4_000, c: 1.0, budget: Budget::unbounded(), ..Default::default() };
     let mut checked = 0;
     for seed in 0..3000u64 {
         let Some(s) = micro_position(seed, 60 + (seed as usize % 120), 3) else {
@@ -460,7 +461,7 @@ fn draw_pass_through_consistency() {
             &s,
             ctx,
             Arc::clone(&nets),
-            Cfg { s: 80, c: 1.0, ..Default::default() },
+            Cfg { s: 80, c: 1.0, budget: Budget::unbounded(), ..Default::default() },
             bel.clone(),
             Rng::new(seed),
         );
@@ -606,7 +607,7 @@ fn warrior_priest_draw_walks_through_the_tree() {
         &s,
         ctx,
         Arc::clone(&nets),
-        Cfg { s: 8, c: 1.0, ..Default::default() },
+        Cfg { s: 8, c: 1.0, budget: Budget::unbounded(), ..Default::default() },
         bel.clone(),
         Rng::new(0x5EED),
     );
