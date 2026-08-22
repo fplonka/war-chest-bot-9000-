@@ -13,19 +13,19 @@
 //! the host side. Neither waits for the other, which is what lets one solve's
 //! growth overlap another's device work.
 //!
-//! How many solves are in flight is a question about memory, and it is asked on
-//! both sides: the card's arenas and the host's. Each is a projection of what
-//! the population will hold, not a reading of what it holds.
+//! How many solves are in flight is the number of slots. A slot is allocated
+//! once at the budget; admission is a pop from a free list, and a solve that
+//! would exceed the budget is truncated rather than grown.
 
 use parking_lot::{Condvar, Mutex, RwLock};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::net::Net;
 use crate::pbs::Belief;
-use crate::search::{Cfg, Cfr, Solved, Solver, Step};
+use crate::search::{Budget, Cfg, Cfr, Solved, Solver, Step};
 use crate::selfplay::{Data, GameCfg, GameStream};
 use crate::state::State;
 use rayon::prelude::*;
@@ -387,21 +387,12 @@ impl Backend {
         }
     }
 
-    /// Whether this card has room for another solve in flight.
-    ///
-    /// A solve's cost varies twenty-six fold with how far into a game its root
-    /// sits, so how many fit is a question about bytes and the card is the only
-    /// thing that can answer it. See `Device::room_for`.
-    ///
-    /// The reference backend keeps nothing resident -- a solve it serves lives
-    /// entirely in host memory, where the farm's own budget bounds it -- so
-    /// this is a plain count, and it is the only bound left on a machine whose
-    /// memory cannot be read.
-    pub fn has_room(&self, #[allow(unused)] card: usize, live: usize) -> bool {
+    /// Slots this card holds. Admission pops one; none free means wait.
+    pub fn slots(&self, #[allow(unused)] card: usize) -> usize {
         match self {
-            Backend::Reference(_) => live < REFERENCE_IN_FLIGHT,
+            Backend::Reference(_) => 0,
             #[cfg(feature = "gpu")]
-            Backend::Cuda(d) => d.room_for(card, live),
+            Backend::Cuda(d) => d.slots(card),
         }
     }
 
@@ -441,64 +432,35 @@ impl Backend {
 }
 
 
-/// Solves the CPU reference serves at once. It keeps nothing on a card, so the
-/// host budget is its real bound and this is the backstop for a machine whose
-/// memory cannot be read.
-const REFERENCE_IN_FLIGHT: usize = 64;
-
-/// Host bytes the farm may hold in solves, reserved once before it starts.
+/// Host-side slots that fit in the memory the process does not already hold.
 ///
-/// A solve costs host bytes as well as device bytes, and more of them: the
-/// tree, the states its nodes stand on and the description the card reads are
-/// all here too. A farm that admitted on the card's level alone filled the host
-/// instead, and the run was killed with no message but the exit code.
-///
-/// This used to be a level -- admit while the whole *process* holds less than a
-/// fifth of the machine -- and it was the wrong quantity twice over. It counted
-/// torch, two CUDA contexts and a replay buffer reserved at its cap, none of
-/// which a solve has anything to do with, so the farm was throttled by the
-/// trainer's memory. And a level always lags: a solve's arenas fill over its
-/// whole life, so what the population holds now is what a younger one held.
-/// Measured, that overshot by 4.7x and a bench was killed at 58 GB of 62.
-///
-/// So it is a reservation instead, and admission projects against it the way
-/// the card already does (`Device::room_for`): a share of the machine, less
-/// what the process was already holding before a single solve was admitted, so
-/// everything outside the farm is charged once and never chased again.
-///
-/// The machine's own figures come from `/proc`, and where there is no `/proc`
-/// there is no honest number to give: the farm is then bounded by the card and
-/// by pacing alone, as it was on every non-Linux machine before. The rule that
-/// spends this budget does not depend on where it came from, which is why it is
-/// a number here and not a predicate.
-fn host_budget() -> u64 {
-    /// Share of the machine the farm's solves may hold.
-    ///
-    /// The other half is the trainer, the replay buffer at its cap, the
-    /// allocator's retained pages and whatever else shares the box. Half is
-    /// safe because the population no longer overshoots: what is admitted is
-    /// projected at the largest a solve has ever grown to, so nothing already
-    /// in flight can surprise it.
-    const SHARE: f64 = 0.5;
-    let Some((total, rss)) = machine() else {
-        return u64::MAX;
-    };
-    ((SHARE * total as f64) as u64).saturating_sub(rss)
+/// A slot is `Budget::host_bytes`. The farm never admits more than this, and
+/// the card never carves more than this, so host OOM is not a thing that can
+/// happen at admission.
+pub fn host_slots(budget: Budget) -> usize {
+    let slot = budget.host_bytes() as u64;
+    (host_free() / slot.max(1)) as usize
 }
 
-/// The machine's memory and what this process already holds, in bytes.
-#[cfg(target_os = "linux")]
-fn machine() -> Option<(u64, u64)> {
-    let field = |path: &str, at: usize| -> Option<u64> {
-        std::fs::read_to_string(path).ok()?.split_whitespace().nth(at)?.parse().ok()
-    };
-    // `statm` is in pages and `meminfo`'s first field is `MemTotal:` in kB.
-    Some((field("/proc/meminfo", 1)? * 1024, field("/proc/self/statm", 1)? * 4096))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn machine() -> Option<(u64, u64)> {
-    None
+/// Bytes the farm may still hold in solves.
+fn host_free() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(text) = std::fs::read_to_string("/proc/meminfo") else {
+            return 0;
+        };
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                let kb: u64 = rest.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                return kb * 1024;
+            }
+        }
+        0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        u64::MAX
+    }
 }
 
 /// A queue with parked consumers, closed once when the farm winds down.
@@ -684,76 +646,44 @@ pub struct Stats {
     /// Time inside the backend. Against wall clock this says how much of a
     /// round is the batch and how much is everything around it.
     pub nanos: AtomicU64,
-    /// Per card: solves admitted, how many its share of the host budget allowed
-    /// when the last one was admitted, and the largest a solve on that card has
-    /// grown to in host bytes.
-    ///
-    /// How many solves are in flight used to be folklore -- nothing measured it
-    /// and nothing logged it, so a run that was slow because it was holding
-    /// four solves looked exactly like one holding forty. These three are what
-    /// the population is, and `live <= max(1, allowed)` holds card by card.
-    live: Vec<AtomicU64>,
-    allowed: Vec<AtomicU64>,
-    peak: Vec<AtomicU64>,
+    /// Slots this farm holds, and how many currently have a solve.
+    slots: AtomicU64,
+    used: AtomicU64,
+    /// Solves that hit the budget. A slot is a percentile; this is the rate
+    /// that argues with it.
+    budget_hits: AtomicU64,
 }
 
 impl Stats {
-    fn new(cards: usize) -> Stats {
-        let per = || (0..cards).map(|_| AtomicU64::new(0)).collect();
-        Stats { live: per(), allowed: per(), peak: per(), ..Default::default() }
+    fn new(slots: usize) -> Stats {
+        Stats { slots: AtomicU64::new(slots as u64), ..Default::default() }
     }
 
-    /// One more solve on this card, with the allowance it was admitted under.
-    fn admit(&self, card: usize, allowed: u64) {
-        self.allowed[card].store(allowed, Ordering::Relaxed);
-        self.live[card].fetch_add(1, Ordering::Relaxed);
+    pub fn slots(&self) -> u64 {
+        self.slots.load(Ordering::Relaxed)
     }
 
-    /// A solve on this card finished at `bytes`. Published before the solve is
-    /// counted as done, so the admission that pacing then allows sees it.
-    fn grew(&self, card: usize, bytes: u64) {
-        self.peak[card].fetch_max(bytes, Ordering::Relaxed);
+    pub fn used(&self) -> u64 {
+        self.used.load(Ordering::Relaxed)
     }
 
-    /// Solves in flight, over every card.
-    pub fn live(&self) -> u64 {
-        self.live.iter().map(|a| a.load(Ordering::Relaxed)).sum()
-    }
-
-    /// How many the budget allowed at the last admission, over every card.
-    pub fn allowed(&self) -> u64 {
-        self.allowed.iter().map(|a| a.load(Ordering::Relaxed)).sum()
-    }
-
-    /// The largest a solve has grown to in host bytes, over every card.
-    pub fn host_peak(&self) -> u64 {
-        self.peak.iter().map(|a| a.load(Ordering::Relaxed)).max().unwrap_or(0)
+    pub fn budget_hits(&self) -> u64 {
+        self.budget_hits.load(Ordering::Relaxed)
     }
 }
 
 impl Farm {
-    /// Start `workers` host threads and one driver per card, against whatever
-    /// share of the machine `host_budget` reserved for solves.
-    ///
-    /// How many solves are in flight is not settled here. Each card admits them
-    /// as memory allows, on both sides, which is the only bound that means
-    /// anything: a solve's cost varies twenty-six fold with how far into a game
-    /// its root sits, so no thread count describes what fits.
+    /// Start `workers` host threads and one driver per card, with one job per
+    /// slot. A slot is allocated at the budget; there is nothing to admit
+    /// against after that.
     pub fn new(seed: u64, workers: usize, work: Work, backend: Backend) -> Farm {
-        Farm::bounded(seed, workers, work, backend, host_budget())
-    }
-
-    /// The same farm, against a host budget the caller names. Only the
-    /// admission test wants this: everything else takes the machine's.
-    pub fn bounded(
-        seed: u64,
-        workers: usize,
-        work: Work,
-        backend: Backend,
-        host_budget: u64,
-    ) -> Farm {
         assert!(workers > 0, "a farm needs at least one worker");
         let cards = backend.cards();
+        let cuda = backend.keeps_the_solve();
+        let per_card: Vec<usize> = (0..cards)
+            .map(|c| if cuda { backend.slots(c) } else { workers })
+            .collect();
+        let n_slots: usize = per_card.iter().sum();
         let work = Arc::new(work);
         let nets = Arc::new(RwLock::new(Arc::new(crate::search::Nets {
             value: backend.net().clone(),
@@ -765,25 +695,18 @@ impl Farm {
         let collected = Arc::new(Mutex::new(Vec::new()));
         let stopping = Arc::new(AtomicBool::new(false));
         let broken = Arc::new(AtomicBool::new(false));
-        // Solves each stream has finished, which is what paces its admissions.
-        let done: Vec<Arc<AtomicUsize>> = (0..cards).map(|_| Arc::new(AtomicUsize::new(0))).collect();
-        let stats = Arc::new(Stats::new(cards));
+        let stats = Arc::new(Stats::new(n_slots));
         let backend = Arc::new(RwLock::new(backend));
-        // Split evenly. A card's solves are its own and no card can spend
-        // another's, so one share each is the only division that bounds the
-        // whole process.
-        let share = host_budget / cards as u64;
 
         let hands: Vec<JoinHandle<()>> = (0..workers)
             .map(|t| {
-                let (ready, device, nets, collected, work, stopping, done, stats) = (
+                let (ready, device, nets, collected, work, stopping, stats) = (
                     Arc::clone(&ready),
                     device.clone(),
                     Arc::clone(&nets),
                     Arc::clone(&collected),
                     Arc::clone(&work),
                     Arc::clone(&stopping),
-                    done.clone(),
                     Arc::clone(&stats),
                 );
                 std::thread::Builder::new()
@@ -791,7 +714,7 @@ impl Farm {
                     .spawn(move || {
                         while let Some(job) = ready.pop() {
                             advance_job(
-                                job, &device, &nets, &work, &collected, &stopping, &done, &stats,
+                                job, &device, &nets, &work, &collected, &stopping, &stats,
                             );
                         }
                     })
@@ -801,7 +724,7 @@ impl Farm {
 
         let drivers = (0..cards)
             .map(|c| {
-                let (queue, ready, backend, nets, work, stats, broken, done) = (
+                let (queue, ready, backend, nets, work, stats, broken) = (
                     Arc::clone(&device[c]),
                     Arc::clone(&ready),
                     Arc::clone(&backend),
@@ -809,15 +732,15 @@ impl Farm {
                     Arc::clone(&work),
                     Arc::clone(&stats),
                     Arc::clone(&broken),
-                    Arc::clone(&done[c]),
                 );
+                let n = per_card[c];
                 let seed = seed.wrapping_mul(0x9E37_79B9) ^ c as u64;
                 std::thread::Builder::new()
                     .name(format!("card-{c}"))
                     .spawn(move || {
                         drive_card(
-                            c, cards, seed, share, &queue, &ready, &backend, &nets, &work,
-                            &stats, &broken, &done,
+                            c, cards, n, seed, &queue, &ready, &backend, &nets, &work,
+                            &stats, &broken,
                         )
                     })
                     .expect("spawn driver thread")
@@ -919,7 +842,6 @@ fn advance_job(
     work: &Work,
     collected: &Mutex<Vec<Data>>,
     stopping: &AtomicBool,
-    done: &[Arc<AtomicUsize>],
     stats: &Stats,
 ) {
     let mut replies = std::mem::take(&mut job.replies);
@@ -927,24 +849,15 @@ fn advance_job(
         match job.solver.advance(&replies) {
             Step::Calls(calls) => return device[job.card].push((job, calls)),
             Step::Done(solved) => {
-                // What this solve grew to, before it is counted as finished:
-                // finishing is what pays for the next admission, and that
-                // admission must be projected against a peak that includes
-                // this one. A solve is at its largest here and nowhere else.
-                stats.grew(job.card, job.solver.host_bytes() as u64);
-                // Released, and acquired where the driver reads it, so a
-                // driver that sees this solve counted also sees its size.
-                done[job.card].fetch_add(1, Ordering::Release);
+                if job.solver.budget_hit() {
+                    stats.budget_hits.fetch_add(1, Ordering::Relaxed);
+                }
                 job.source.take(&job.solver, solved, &mut job.data);
-                // Every solve, not every eighth. A job re-reads the network
-                // between two solves anyway, so there is nothing a batch of
-                // them buys -- and holding eight back per job is eight times
-                // the solves in flight before a caller sees its first row.
                 collected.lock().push(std::mem::take(&mut job.data));
                 if stopping.load(Ordering::Relaxed) {
+                    stats.used.fetch_sub(1, Ordering::Relaxed);
                     return;
                 }
-                // A publish lands between two solves rather than inside one.
                 let n = Arc::clone(&*nets.read());
                 job.solver = job.source.next(work, &n, &mut job.data);
                 job.solver.pin(job.slot);
@@ -954,14 +867,13 @@ fn advance_job(
     }
 }
 
-/// One card's rounds, and the solves it admits between them.
+/// One card's rounds, and the solves that occupy its slots.
 #[allow(clippy::too_many_arguments)]
 fn drive_card(
     card: usize,
     cards: usize,
+    n_slots: usize,
     seed: u64,
-    // This card's share of the host budget, in bytes.
-    share: u64,
     queue: &Queue<(Job, Vec<Call>)>,
     ready: &Queue<Job>,
     backend: &RwLock<Backend>,
@@ -969,49 +881,24 @@ fn drive_card(
     work: &Work,
     stats: &Stats,
     broken: &AtomicBool,
-    done: &AtomicUsize,
 ) {
-    let mut live = 0usize;
-    loop {
-        // Solves this stream has room for, admitted between rounds and never
-        // retired. A solve's cost varies twenty-six fold with how far into a
-        // game its root sits, so how many fit is a question about bytes, and it
-        // is asked on both sides: the card's arenas and the host's.
-        //
-        // Both are projections, not levels. A solve's arenas fill over its
-        // whole run, so what a population holds now is what a younger one held,
-        // and admitting on that overshoots by whatever the solves already in
-        // flight grow in the meantime -- measured at 4.7x, and it killed a
-        // bench. So the question asked is what this population *will* hold:
-        // every solve in flight, and the one being asked about, at the largest
-        // a solve on this stream has ever reached.
-        //
-        // The peak is nought until the first solve has finished, and the answer
-        // is yes until it has. What makes that safe is the pacing below: one
-        // admitted per one *finished*, so the second is admitted only once the
-        // first has run its whole life and the peak is a real one.
-        //
-        // Nothing new once the farm is winding down. The solves in flight have
-        // to finish before a worker can leave, and a fresh one would be a whole
-        // solve of that wait for rows nobody will collect.
-        let paid = live <= done.load(Ordering::Acquire);
-        let peak = stats.peak[card].load(Ordering::Relaxed);
-        let allowed = if peak == 0 { u64::MAX } else { share / peak };
-        let room = paid && (live as u64) < allowed && backend.read().has_room(card, live);
-        if !ready.closed() && (live == 0 || room) {
-            stats.admit(card, allowed);
-            let mut source = Source::new(
-                work,
-                seed ^ (live as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-                live * cards + card,
-            );
-            let mut data = Data::default();
-            let n = Arc::clone(&*nets.read());
-            let mut solver = source.next(work, &n, &mut data);
-            solver.pin(live);
-            ready.push(Job { source, solver, card, slot: live, replies: Vec::new(), data });
-            live += 1;
+    for slot in 0..n_slots {
+        if ready.closed() {
+            break;
         }
+        stats.used.fetch_add(1, Ordering::Relaxed);
+        let mut source = Source::new(
+            work,
+            seed ^ (slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            slot * cards + card,
+        );
+        let mut data = Data::default();
+        let n = Arc::clone(&*nets.read());
+        let mut solver = source.next(work, &n, &mut data);
+        solver.pin(slot);
+        ready.push(Job { source, solver, card, slot, replies: Vec::new(), data });
+    }
+    loop {
         let batch = queue.drain();
         if batch.is_empty() {
             return;
@@ -1028,9 +915,6 @@ fn drive_card(
         let answered = backend.read().run(&calls, card);
         let spent = at.elapsed();
         let Some(replies) = answered else {
-            // Not recoverable: the card is out of memory, or gone. Every solve
-            // it holds dies with it, so say so rather than leave the caller
-            // waiting for rows that will never come.
             broken.store(true, Ordering::Relaxed);
             return;
         };
@@ -1062,11 +946,10 @@ fn drive_card(
 /// thread that was ready at the same moment.
 pub struct Cards {
     queues: Vec<Arc<Queue<Ask>>>,
-    /// Seats nobody is sitting in, and how many have ever been handed out. A
-    /// card keeps a solve's arenas while it runs, so two solves must never
-    /// share a slot, and the number in use is therefore the number of threads
-    /// solving at once.
-    seats: Mutex<(Vec<(usize, usize)>, usize)>,
+    /// Seats nobody is sitting in. A card keeps a solve's arenas while it runs,
+    /// so two solves must never share a slot.
+    seats: Mutex<Vec<(usize, usize)>>,
+    free: Condvar,
     drivers: Vec<JoinHandle<()>>,
 }
 
@@ -1086,7 +969,8 @@ pub struct Seat<'a> {
 
 impl Drop for Seat<'_> {
     fn drop(&mut self) {
-        self.cards.seats.lock().0.push((self.card, self.slot));
+        self.cards.seats.lock().push((self.card, self.slot));
+        self.cards.free.notify_one();
     }
 }
 
@@ -1128,18 +1012,24 @@ impl Cards {
                     .expect("spawn driver thread")
             })
             .collect();
-        Cards { queues, seats: Mutex::new((Vec::new(), 0)), drivers }
+        let mut free = Vec::new();
+        for c in 0..n {
+            for s in 0..backend.slots(c) {
+                free.push((c, s));
+            }
+        }
+        Cards { queues, seats: Mutex::new(free), free: Condvar::new(), drivers }
     }
 
     /// Take a card and one of its solve slots for the length of one solve.
     pub fn seat(&self) -> Seat<'_> {
         let mut seats = self.seats.lock();
-        let (card, slot) = seats.0.pop().unwrap_or_else(|| {
-            seats.1 += 1;
-            ((seats.1 - 1) % self.queues.len(), (seats.1 - 1) / self.queues.len())
-        });
-        drop(seats);
-        Seat { cards: self, card, slot }
+        loop {
+            if let Some((card, slot)) = seats.pop() {
+                return Seat { cards: self, card, slot };
+            }
+            self.free.wait(&mut seats);
+        }
     }
 
     /// Run these calls in the next round of `card`, and wait for them.
@@ -1214,22 +1104,9 @@ mod tests {
         assert!(calls > 2.0, "rounds averaged only {calls:.1} calls");
     }
 
-    /// The population a farm holds is the one its host budget allows.
-    ///
-    /// This is the gate nothing used to reach: the old rule was a level on the
-    /// process's own RSS, read from `/proc`, so on any machine without one it
-    /// returned "yes" and no test ever ran it. The rule here is arithmetic on
-    /// two numbers the farm keeps, so it runs everywhere, and the budget is an
-    /// argument so a test can make it small.
-    ///
-    /// Three farms over the same work. With no budget at all a stream holds the
-    /// one solve it must -- a stream that held none could never finish one, and
-    /// nothing would ever pay for the next -- and no more. With room for a few,
-    /// it holds no more than it was told it could. With no bound it holds many
-    /// more than either, which is what says the first two were bounded by the
-    /// budget and not by something else.
+    /// The population a farm holds is its slots, one solve each.
     #[test]
-    fn admission_is_bounded_by_the_host_budget() {
+    fn a_farm_holds_one_solve_per_slot() {
         const WORKERS: usize = 4;
         let cfg = crate::search::Cfg { s: 8, c: 1.0, ..Default::default() };
         let gc = GameCfg {
@@ -1241,25 +1118,11 @@ mod tests {
             query_rate: 0.9,
             recursive_rate: 0.1,
         };
-        let run = |budget: u64| -> (u64, u64, u64) {
-            let backend = Backend::Reference(small_net(0x2E57));
-            let mut farm = Farm::bounded(5, WORKERS, Work::Play(gc), backend, budget);
-            let got = farm.drive(24);
-            assert!(got.soff.len() >= 24, "only {} solves at budget {budget}", got.soff.len());
-            let s = farm.stats();
-            let (live, allowed, peak) = (s.live(), s.allowed(), s.host_peak());
-            eprintln!("budget {budget}: {live} live, {allowed} allowed, peak {peak} B");
-            (live, allowed, peak)
-        };
-
-        let (live, _, peak) = run(0);
-        assert!(peak > 0, "no solve ever reported its host size");
-        assert_eq!(live, 1, "a farm with no host budget held {live} solves");
-
-        let (live, allowed, _) = run(4 * peak);
-        assert!(live <= allowed.max(1), "{live} solves in flight, {allowed} allowed");
-
-        let (big, _, _) = run(u64::MAX);
-        assert!(big > live, "an unbounded farm held {big}, a bounded one {live}");
+        let mut farm = Farm::new(5, WORKERS, Work::Play(gc), Backend::Reference(small_net(0x2E57)));
+        let got = farm.drive(24);
+        assert!(got.soff.len() >= 24, "only {} solves", got.soff.len());
+        let s = farm.stats();
+        assert_eq!(s.slots(), WORKERS as u64, "a reference farm is one slot a worker");
+        assert!(s.used() <= s.slots(), "{} used, {} slots", s.used(), s.slots());
     }
 }
