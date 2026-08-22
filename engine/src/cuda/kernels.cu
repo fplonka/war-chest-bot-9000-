@@ -1130,17 +1130,27 @@ __device__ __forceinline__ double rng_unit(unsigned long long* s) {
     return (double)(rng_next(s) >> 11) * (1.0 / 9007199254740992.0);
 }
 
-// Draw an index from non-negative weights. A row whose weights have all
-// underflowed is drawn uniformly rather than dropped.
-//
-// A warp does this together: the total is a shuffle reduction, and the scan
-// that follows is the same in every lane, so it broadcasts one address at a
-// time rather than gathering. Every lane draws from the same stream and takes
-// the same turn, which is what keeps the walk below coherent.
-__device__ int pick(const float* w, int n, unsigned long long* s) {
+// The weight a row draws against, summed the way a warp of thirty-two does:
+// the lanes stride through the terms and a butterfly folds them. This is
+// `search.rs::warp32_sum`, and it has to be -- f32 addition is not
+// associative, so a total summed straight through would put a draw's cell
+// boundaries a few ulps elsewhere and build a different tree.
+__device__ __forceinline__ float pick_sum(const float* w, int n) {
     float total = 0.0f;
     for (int i = threadIdx.x; i < n; i += 32) total += fmaxf(w[i], 0.0f);
-    total = warp_sum(total);
+    return warp_sum(total);
+}
+
+// Draw an index from non-negative weights whose total is already in hand. A
+// row whose weights have all underflowed is drawn uniformly rather than
+// dropped.
+//
+// A warp does this together: the scan is the same in every lane, so it
+// broadcasts one address at a time rather than gathering. Every lane draws
+// from the same stream and takes the same turn, which is what keeps the walk
+// below coherent. The needle is a double because `search.rs::pick` uses one,
+// and the two must part company at no draw at all.
+__device__ int pick_from(const float* w, int n, float total, unsigned long long* s) {
     if (!(total > 0.0f)) return n > 0 ? (int)(rng_next(s) % (unsigned long long)n) : 0;
     double needle = rng_unit(s) * (double)total;
     for (int i = 0; i < n; ++i) {
@@ -1148,6 +1158,11 @@ __device__ int pick(const float* w, int n, unsigned long long* s) {
         if (needle < 0.0) return i;
     }
     return n - 1;
+}
+
+// The two together, for a row whose total is wanted once.
+__device__ __forceinline__ int pick(const float* w, int n, unsigned long long* s) {
+    return pick_from(w, n, pick_sum(w, n), s);
 }
 
 // Whether the expansion phase may descend through one legal cell: the acting
@@ -1349,11 +1364,14 @@ __global__ void k_expand(const Tree* trees, unsigned int* out, int parts,
     if ((unsigned long long)iter >= t.todo || t.nexpand == 0) return;
     unsigned long long s = *t.seed;
     unsigned int n0 = t.nc[0], n1 = t.nc[1];
+    // The root's belief does not move through a phase, so the weight its two
+    // draws work against is summed once rather than at every draw.
+    float b0 = pick_sum(t.rootb, (int)n0), b1 = pick_sum(t.rootb + n0, (int)n1);
     int want = (int)t.nexpand, got = 0;
     for (int draw = 0; draw < want * tries && got < want; ++draw) {
         int c[2];
-        c[0] = pick(t.rootb, (int)n0, &s);
-        c[1] = pick(t.rootb + n0, (int)n1, &s);
+        c[0] = pick_from(t.rootb, (int)n0, b0, &s);
+        c[1] = pick_from(t.rootb + n0, (int)n1, b1, &s);
         unsigned int node = 0;
         unsigned int found = NO_ROW;
         for (;;) {
@@ -1406,16 +1424,19 @@ __global__ void k_expand(const Tree* trees, unsigned int* out, int parts,
         // The tree is frozen until the round ends, so a leaf a trajectory of
         // this round already took would grow nothing twice and the phase draws
         // again. `NO_ROW` never matches, so a padded slot scans as empty.
+        // The whole warp scans the phases before this one: it is an equality
+        // search, so nothing about it depends on the order the rows are read.
         bool dup = false;
-        if (threadIdx.x == 0) {
-            for (int p = 0; p <= iter && !dup; ++p) {
-                const unsigned int* r = out + (size_t)p * each + (size_t)part * sims;
-                for (int j = 0; j < sims; ++j)
-                    if (r[j] == found) { dup = true; break; }
-            }
-            if (!dup) taken[got] = found;
+        for (int k = threadIdx.x; k < (iter + 1) * sims; k += 32) {
+            const unsigned int* r = out + (size_t)(k / sims) * each + (size_t)part * sims;
+            dup |= r[k % sims] == found;
         }
-        if (!__shfl_sync(0xffffffff, (int)dup, 0)) ++got;
+        if (!__any_sync(0xffffffff, dup)) {
+            if (threadIdx.x == 0) taken[got] = found;
+            // The row just written is one the next draw scans.
+            __syncwarp();
+            ++got;
+        }
     }
     if (threadIdx.x == 0) *t.seed = s;
 }
