@@ -1,0 +1,12 @@
+[train] runs/admit12d at 531b762 seed=1 {'minutes': 12.0, 'snapshot_every': 300.0, 'ladder_games': 0, 's': 512, 'round_batch': 8, 'note': 'admission soak'}
+[train] admission soak
+[train] CUDA stream priority -1
+[train] search inference on cuda:0,1, training on cuda:1
+[cfg] PUBFEAT=897 CFEAT=15 architecture=gt-cfr s=512 c=8.0 budget=720s snapshot_every=300min device=cuda:1 draft=random replay_ratio=8.0 recent_mix=0.5/0.2 canonical_views=2 cap=1000000 matmul=high
+[t=   0.0s] --- snapshot snap_00.pt (init) ---
+[t=  29.9s] GT-CFR solves=426 rate=14.2/s rows=426 games=0 qrows=195 L=0.00000 L/var=0.00 Lp=0.000 tgt=-0.066/0.017 gen=0.19s train=0.00s gpu=0.00s
+[t=  52.0s] GT-CFR solves=1028 rate=19.8/s rows=602 games=0 qrows=273 L=1.64756 L/var=5785.30 Lp=2.382 tgt=-0.063/0.017 gen=0.13s train=12.03s gpu=0.00s
+[t=  62.0s] GT-CFR solves=2226 rate=35.9/s rows=1198 games=0 qrows=555 L=0.11417 L/var=400.98 Lp=2.359 tgt=-0.064/0.017 gen=0.13s train=3.79s gpu=0.00s
+[t=  72.3s] GT-CFR solves=2823 rate=39.1/s rows=597 games=0 qrows=266 L=0.05489 L/var=173.75 Lp=2.346 tgt=-0.065/0.018 gen=0.12s train=2.12s gpu=0.00s
+[t=  82.4s] GT-CFR solves=3428 rate=41.6/s rows=605 games=0 qrows=273 L=0.05985 L/var=191.06 Lp=2.322 tgt=-0.064/0.018 gen=0.12s train=2.09s gpu=0.00s
+[t=  92.5s] GT-CFR solves=4019 rate=43.5/s rows=591 games=0 qrows=271 L=0.06230 L/var=201.28 Lp=2.305 tgt=-0.065/0.018 gen=0.11s train=3.31s gpu=0.00s

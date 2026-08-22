@@ -833,6 +833,39 @@ impl Solve {
         self.census().iter().map(|&(_, b)| b).sum()
     }
 
+    /// Give the board vectors back. Everything the last solve in this slot left
+    /// is another tree's, and the pages are worth more to whichever slot holds
+    /// a large solve now.
+    fn drop_boards(&mut self) {
+        self.cells = 0;
+        self.host_coff.clear();
+        self.host_coff.push(0);
+        for a in [&mut self.p, &mut self.jp, &mut self.f, &mut self.g, &mut self.fp] {
+            a.reset();
+        }
+        self.board_of.reset();
+        self.cidx.reset();
+        self.coff.reset();
+        self.leaf_node.reset();
+        self.term.reset();
+    }
+
+    /// Give the tree and the CFR state back. Regrets, visits and the strategy
+    /// sum accumulate over a solve, so the next solve to take this slot must
+    /// not inherit them; and holding the pages would cost the card the worst
+    /// case in every slot at once.
+    fn drop_tree(&mut self) {
+        for a in self.tree.pools() {
+            a.reset();
+        }
+        self.tree.rvd_p.reset();
+        self.tree.draw_p.reset();
+        for a in [&mut self.reach, &mut self.vals, &mut self.cur, &mut self.regret,
+                  &mut self.sum, &mut self.qval, &mut self.visits, &mut self.prior] {
+            a.reset();
+        }
+    }
+
     /// Where a run of the round's blob lands. The match is the other half of
     /// `farm::Dst`, and the only place the two vocabularies meet.
     fn plan(&mut self, s: &Arc<CudaStream>, d: Dst, at: usize, n: usize) -> Res<u64> {
@@ -1016,22 +1049,44 @@ impl Device {
     /// the blocks the allocator retains as a run goes on, and a run that filled
     /// its card had two thirds of it in retained blocks while the budget still
     /// said there was room.
-    pub fn room_for(&self, card: usize) -> bool {
+    pub fn room_for(&self, card: usize) -> crate::farm::Room {
         let mine = &self.cards[card / STREAMS * STREAMS..][..STREAMS];
         let load = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
         let held: u64 = mine.iter().map(|c| load(&c.held)).sum();
         let hold: u64 = mine.iter().map(|c| load(&c.hold)).sum();
         let live: u64 = mine.iter().map(|c| load(&c.slots)).sum();
+        let Ok((free, slack)) = self.cards[card].room() else {
+            return crate::farm::Room { live, allowed: 0, short: true };
+        };
+        // A card is short when what it can still hand out is gone, free memory
+        // and retained blocks together. Free memory alone is not the test: a
+        // freed arena goes to the pool rather than to the driver, so a card
+        // that gave a solve up would read exactly as short as before it did,
+        // and the population would shed itself down to nothing.
+        let short = free + slack < ROUND_RESERVE;
         // Nothing measured yet: the farm's pacing is the bound until a solve
         // has run its whole life and said what a slot costs.
-        if hold == 0 {
-            return true;
-        }
-        let Ok((free, slack)) = self.cards[card].room() else {
-            return false;
+        let allowed = if hold == 0 {
+            u64::MAX
+        } else {
+            crate::farm::allows(held + slack + free.saturating_sub(ROUND_RESERVE), hold, live)
         };
-        let cap = held + slack + free.saturating_sub(ROUND_RESERVE);
-        live < crate::farm::allows(cap, hold, live)
+        crate::farm::Room { live, allowed, short }
+    }
+
+    /// Give a retired slot's arenas back to the card.
+    ///
+    /// A slot normally hands its pages over when the next solve arrives in it.
+    /// A slot that is not taking another solve would hold the last tree it
+    /// served for the rest of the run, so the farm says so here.
+    pub fn release(&self, card: usize, slot: usize) -> Res<()> {
+        let c = &self.cards[card];
+        c.stream.context().bind_to_thread().map_err(err)?;
+        if let Some(b) = c.solves.lock().get_mut(slot) {
+            b.drop_boards();
+            b.drop_tree();
+        }
+        Ok(())
     }
 
     /// What each ordinal's arenas hold and what its card can still hand out.
@@ -1278,7 +1333,9 @@ impl Card {
         let o = std::sync::atomic::Ordering::Relaxed;
         self.held.store(held, o);
         self.hold.fetch_max(held, o);
-        self.slots.store(g.len() as u64, o);
+        // Occupied, not the length of the table: a retired slot keeps its place
+        // in it for the next admission to take, holding nothing.
+        self.slots.store(g.iter().filter(|s| s.bytes() > 0).count() as u64, o);
     }
 
     fn round(&self, calls: &[Call], mine: &[usize]) -> Res<Vec<(usize, Reply)>> {
@@ -1636,22 +1693,10 @@ impl Card {
             };
             let (n, nrows) = (*n, *nrows);
             let b = self.slot(&mut g, *solve);
+            // A fresh solve in this slot: this comes before the writes below,
+            // not after them.
             if *row0 == 0 {
-                // A fresh solve in this slot. Everything the last one left is
-                // another tree's, and the pages are worth more to whichever
-                // slot is holding a large solve now. This comes before the
-                // writes below, not after them.
-                b.cells = 0;
-                b.host_coff.clear();
-                b.host_coff.push(0);
-                for a in [&mut b.p, &mut b.jp, &mut b.f, &mut b.g, &mut b.fp] {
-                    a.reset();
-                }
-                b.board_of.reset();
-                b.cidx.reset();
-                b.coff.reset();
-                b.leaf_node.reset();
-                b.term.reset();
+                b.drop_boards();
             }
             b.p.copy(&self.stream, boards_at * D, &p, at * D, n * D)?;
             b.jp.copy(&self.stream, boards_at * JW, &jp, at * JW, n * JW)?;
@@ -1910,20 +1955,7 @@ impl Card {
             let b = self.slot(&mut g, *solve);
             let s = &self.stream;
             if *fresh {
-                // Regrets, visits and the strategy sum accumulate over a solve,
-                // so the next solve to take this slot must not inherit them.
-                // The tree's own arrays go back too: the caller rewinds what it
-                // has told the card about, and holding the pages would cost the
-                // card the worst case in every slot at once.
-                for a in b.tree.pools() {
-                    a.reset();
-                }
-                b.tree.rvd_p.reset();
-                b.tree.draw_p.reset();
-                for a in [&mut b.reach, &mut b.vals, &mut b.cur, &mut b.regret,
-                          &mut b.sum, &mut b.qval, &mut b.visits, &mut b.prior] {
-                    a.reset();
-                }
+                b.drop_tree();
             }
             // One copy of the solve's words, then a piece per run saying where
             // inside them each destination reads.

@@ -387,21 +387,38 @@ impl Backend {
         }
     }
 
-    /// Whether this card has room for another solve in flight.
+    /// Solves this card's ordinal holds, and how many it will carry.
     ///
     /// A solve's cost varies twenty-six fold with how far into a game its root
     /// sits, so how many fit is a question about bytes and the card is the only
-    /// thing that can answer it. See `Device::room_for`.
+    /// thing that can answer it. See `Device::allows`.
     ///
     /// The reference backend keeps nothing resident -- a solve it serves lives
-    /// entirely in host memory, where the farm's own budget bounds it -- so
-    /// this is a plain count, and it is the only bound left on a machine whose
+    /// entirely in host memory, where the farm's own rule bounds it -- so this
+    /// is a plain count, and it is the only bound left on a machine whose
     /// memory cannot be read.
-    pub fn has_room(&self, #[allow(unused)] card: usize, live: usize) -> bool {
+    pub fn room(&self, #[allow(unused)] card: usize, live: usize) -> Room {
         match self {
-            Backend::Reference(_) => live < REFERENCE_IN_FLIGHT,
+            Backend::Reference(_) => Room {
+                live: live as u64,
+                allowed: REFERENCE_IN_FLIGHT as u64,
+                short: false,
+            },
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.room_for(card),
+        }
+    }
+
+    /// Give a retired slot's device memory back.
+    pub fn release(&self, #[allow(unused)] card: usize, #[allow(unused)] slot: usize) {
+        match self {
+            Backend::Reference(_) => {}
+            #[cfg(feature = "gpu")]
+            Backend::Cuda(d) => {
+                if let Err(e) = d.release(card, slot) {
+                    eprintln!("cuda: card {card}: releasing slot {slot}: {e}");
+                }
+            }
         }
     }
 
@@ -510,6 +527,26 @@ const GROWTH_DEN: u64 = 2;
 /// everything that is left, and the farm waits rather than fails.
 pub(crate) fn allows(cap: u64, hold: u64, live: u64) -> u64 {
     cap / (hold * GROWTH_NUM / GROWTH_DEN / live.max(1)).max(1)
+}
+
+/// What a memory says about the population it is holding.
+///
+/// The two answers are asked of different quantities, and that is the whole of
+/// the hysteresis. Growth is *projected*: a slot is added only while the
+/// population's own high-water, grown by `GROWTH`, still fits. Shrinking is
+/// *measured*: a slot is given back only once the memory that was reserved has
+/// actually gone. Between the two nothing happens, and no slot is given up and
+/// taken back round after round.
+///
+/// Asking both of the same number is what a first attempt did, and it ran away:
+/// the allowance is proportional to the slots, so shedding one slot lowered the
+/// allowance by exactly as much and the population collapsed to one.
+pub struct Room {
+    /// Slots this memory holds, and how many it will carry.
+    pub live: u64,
+    pub allowed: u64,
+    /// Whether the reserve itself has been eaten into.
+    pub short: bool,
 }
 
 /// The machine's memory and what this process already holds, in bytes:
@@ -751,9 +788,13 @@ impl Stats {
         Stats { live: per(), peak: per(), ..Default::default() }
     }
 
-    /// One more solve on this card.
+    /// One more solve on this card, and one fewer.
     fn admit(&self, card: usize) {
         self.live[card].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn retire(&self, card: usize) {
+        self.live[card].fetch_sub(1, Ordering::Relaxed);
     }
 
     /// A solve on this card finished at `bytes`. Published before the solve is
@@ -767,21 +808,17 @@ impl Stats {
         self.live.iter().map(|a| a.load(Ordering::Relaxed)).sum()
     }
 
-    /// How many slots the host will carry, at what the population costs now.
-    ///
-    /// The population may still grow by `GROWTH`, and one more slot costs what
-    /// a slot costs. What there is to hold it is what the solves already hold
-    /// plus what the machine will still give, less the reserve.
-    fn host_allows(&self, reserve: u64) -> u64 {
+    /// What the machine says about the population the process is holding.
+    fn host_room(&self, reserve: u64) -> Room {
+        let live = self.live();
         let Some((avail, rss)) = machine() else {
-            return u64::MAX;
+            return Room { live, allowed: u64::MAX, short: false };
         };
         let held = rss.saturating_sub(self.base.load(Ordering::Relaxed));
         let hold = held.max(self.hold.fetch_max(held, Ordering::Relaxed));
-        let cap = held + avail.saturating_sub(reserve);
-        let allowed = allows(cap, hold, self.live());
+        let allowed = allows(held + avail.saturating_sub(reserve), hold, live);
         self.allowed.store(allowed, Ordering::Relaxed);
-        allowed
+        Room { live, allowed, short: avail < reserve }
     }
 
     /// The last answer `host_allows` gave, for the log.
@@ -829,8 +866,10 @@ impl Farm {
         let collected = Arc::new(Mutex::new(Vec::new()));
         let stopping = Arc::new(AtomicBool::new(false));
         let broken = Arc::new(AtomicBool::new(false));
-        // Solves each stream has finished, which is what paces its admissions.
+        // Solves each stream has finished, which is what paces its admissions,
+        // and slots it has been told to give up at the next solve boundary.
         let done: Vec<Arc<AtomicUsize>> = (0..cards).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+        let shed: Vec<Arc<AtomicUsize>> = (0..cards).map(|_| Arc::new(AtomicUsize::new(0))).collect();
         let stats = Arc::new(Stats::new(cards));
         // Before a single solve is admitted, so everything outside the farm is
         // charged once and never chased again.
@@ -844,7 +883,7 @@ impl Farm {
 
         let hands: Vec<JoinHandle<()>> = (0..workers)
             .map(|t| {
-                let (ready, device, nets, collected, work, stopping, done, stats) = (
+                let (ready, device, nets, collected, work, stopping, done, shed, stats) = (
                     Arc::clone(&ready),
                     device.clone(),
                     Arc::clone(&nets),
@@ -852,6 +891,7 @@ impl Farm {
                     Arc::clone(&work),
                     Arc::clone(&stopping),
                     done.clone(),
+                    shed.clone(),
                     Arc::clone(&stats),
                 );
                 std::thread::Builder::new()
@@ -859,7 +899,8 @@ impl Farm {
                     .spawn(move || {
                         while let Some(job) = ready.pop() {
                             advance_job(
-                                job, &device, &nets, &work, &collected, &stopping, &done, &stats,
+                                job, &device, &nets, &work, &collected, &stopping, &done, &shed,
+                                &stats,
                             );
                         }
                     })
@@ -869,7 +910,7 @@ impl Farm {
 
         let drivers = (0..cards)
             .map(|c| {
-                let (queue, ready, backend, nets, work, stats, broken, done, retired) = (
+                let (queue, ready, backend, nets, work, stats, broken, done, shed, retired) = (
                     Arc::clone(&device[c]),
                     Arc::clone(&ready),
                     Arc::clone(&backend),
@@ -878,6 +919,7 @@ impl Farm {
                     Arc::clone(&stats),
                     Arc::clone(&broken),
                     Arc::clone(&done[c]),
+                    Arc::clone(&shed[c]),
                     Arc::clone(&retired),
                 );
                 let seed = seed.wrapping_mul(0x9E37_79B9) ^ c as u64;
@@ -886,7 +928,7 @@ impl Farm {
                     .spawn(move || {
                         drive_card(
                             c, cards, seed, reserve, &queue, &ready, &backend, &nets, &work,
-                            &stats, &broken, &done, &retired,
+                            &stats, &broken, &done, &shed, &retired,
                         )
                     })
                     .expect("spawn driver thread")
@@ -1001,6 +1043,7 @@ fn advance_job(
     collected: &Mutex<Vec<Data>>,
     stopping: &AtomicBool,
     done: &[Arc<AtomicUsize>],
+    shed: &[Arc<AtomicUsize>],
     stats: &Stats,
 ) {
     let mut replies = std::mem::take(&mut job.replies);
@@ -1024,6 +1067,17 @@ fn advance_job(
                 collected.lock().push(std::mem::take(&mut job.data));
                 if stopping.load(Ordering::Relaxed) {
                     return;
+                }
+                // Told to give this slot up. The end of a solve is the only
+                // place it can be given: everywhere else the arenas hold a tree
+                // that is still being searched. Handed back through the card's
+                // own queue, with no calls in it, because the driver is what
+                // owns the slot and frees what the last solve left on the card.
+                if shed[job.card]
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .is_ok()
+                {
+                    return device[job.card].push((job, Vec::new()));
                 }
                 // A publish lands between two solves rather than inside one.
                 let n = Arc::clone(&*nets.read());
@@ -1051,14 +1105,23 @@ fn drive_card(
     stats: &Stats,
     broken: &AtomicBool,
     done: &AtomicUsize,
+    shed: &AtomicUsize,
     retired: &AtomicUsize,
 ) {
+    // Slots this stream holds, and the ones it has taken back. A retired slot
+    // keeps its place in the card's solve table and the next admission takes
+    // it, so the table is the size of the population's high-water and not of
+    // every solve the stream ever ran.
     let mut live = 0usize;
+    let mut spare: Vec<usize> = Vec::new();
+    let mut next = 0usize;
+    // Solves this stream had finished when it last took a slot.
+    let mut mark = 0usize;
     loop {
-        // Solves this stream has room for, admitted between rounds and never
-        // retired. A solve's cost varies twenty-six fold with how far into a
-        // game its root sits, so how many fit is a question about bytes, and it
-        // is asked on both sides: the card's arenas and the host's.
+        // Solves this stream has room for, taken between rounds and given back
+        // at a solve boundary. A solve's cost varies twenty-six fold with how
+        // far into a game its root sits, so how many fit is a question about
+        // bytes, and it is asked of both memories: the card's and the host's.
         //
         // Both sides are measured now, and measured again every round. What a
         // start-of-run figure cannot see is what the process and the card
@@ -1072,8 +1135,7 @@ fn drive_card(
         //
         // What a slot costs is unknown until a solve has run its whole life,
         // and the answer is yes until then. What makes that safe is the pacing:
-        // this stream must have finished `PACE` solves for every slot it holds
-        // before it may take one more.
+        // this stream takes at most one more slot per `PACE` solves it finishes.
         //
         // The pacing is a rate limit, and it is what keeps the measurement
         // ahead of the population. A slot admitted now shows in neither memory
@@ -1081,30 +1143,53 @@ fn drive_card(
         // finishes overshoots by about a whole solve's worth of admissions --
         // measured, half again the population, which is the entire margin
         // `GROWTH` was there to hold. At `PACE` the overshoot is an eighth of
-        // it. The ramp stays geometric, so this costs a minute at the start of
-        // a run and nothing at all after.
+        // it. Growth stays geometric, since a larger population finishes more,
+        // so this costs a minute at the start of a run and nothing after.
+        //
+        // A rate, against the finishes since the last admission, and not a
+        // level against the finishes of the whole run: a stream that has run
+        // ten thousand solves would have no rate limit left at all, and a
+        // population that had just given slots up would take them all back in
+        // one round.
         //
         // Nothing new once the farm is winding down. The solves in flight have
         // to finish before a worker can leave, and a fresh one would be a whole
         // solve of that wait for rows nobody will collect.
         const PACE: usize = 8;
-        let paid = live * PACE <= done.load(Ordering::Acquire);
-        let room = paid
-            && stats.live() < stats.host_allows(reserve)
-            && backend.read().has_room(card, live);
+        let host = stats.host_room(reserve);
+        let dev = backend.read().room(card, live);
+        let finished = done.load(Ordering::Acquire);
+        let paid = finished >= mark + PACE;
+        let room = paid && host.live < host.allowed && dev.live < dev.allowed;
         if !ready.closed() && (live == 0 || room) {
+            mark = finished;
+            let slot = spare.pop().unwrap_or_else(|| {
+                next += 1;
+                next - 1
+            });
             stats.admit(card);
             let mut source = Source::new(
                 work,
-                seed ^ (live as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-                live * cards + card,
+                seed ^ (slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                slot * cards + card,
             );
             let mut data = Data::default();
             let n = Arc::clone(&*nets.read());
             let mut solver = source.next(work, &n, &mut data);
-            solver.pin(live);
-            ready.push(Job { source, solver, card, slot: live, replies: Vec::new(), data });
+            solver.pin(slot);
+            ready.push(Job { source, solver, card, slot, replies: Vec::new(), data });
             live += 1;
+        }
+        // The reserve has been eaten into on one side or the other: ask for one
+        // slot back and look again next round.
+        //
+        // This is the half the farm did without, and a run showed why. The
+        // population settles in the first two minutes, on games that are all
+        // openings; the games then get deeper and a solve costs three times
+        // what it did, with no way to admit fewer of them. Both reserves went
+        // to that drift and the rate fell with them.
+        if host.short || dev.short {
+            shed.store(1, Ordering::Relaxed);
         }
         let batch = queue.drain();
         if batch.is_empty() {
@@ -1114,9 +1199,20 @@ fn drive_card(
         let mut spans = Vec::with_capacity(batch.len());
         let mut calls: Vec<Call> = Vec::new();
         for (job, cs) in batch {
+            // A job handed back with no calls is a slot being given up.
+            if cs.is_empty() {
+                backend.read().release(card, job.slot);
+                spare.push(job.slot);
+                stats.retire(card);
+                live -= 1;
+                continue;
+            }
             spans.push(cs.len());
             calls.extend(cs);
             jobs.push(job);
+        }
+        if jobs.is_empty() {
+            continue;
         }
         let at = std::time::Instant::now();
         let answered = backend.read().run(&calls, card);
