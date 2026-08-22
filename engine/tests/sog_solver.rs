@@ -18,12 +18,28 @@ use std::sync::Arc;
 
 use warchest::pbs::*;
 use warchest::rng::Rng;
+use warchest::net::{Net, NetLayout};
 use warchest::search::{node_actions, Cfg, Cfr, Nets, Solver};
 use warchest::selfplay::make_game;
 use warchest::state::{Cont, State, MAX_MAIN_PLAYS, Z_BAG, Z_FACEDOWN, Z_HAND};
 use warchest::units::{
     ARCHER, CAVALRY, CROSSBOWMAN, FOOTMAN, LANCER, PIKEMAN, ROYAL_COIN, SWORDSMAN, WARRIOR_PRIEST,
 };
+
+/// Weights with no meaning, so the leaf pass runs and its bill can be counted.
+fn random_net(seed: u64) -> Net {
+    let mut r = Rng::new(seed);
+    let l = NetLayout::new();
+    let mut draw = |n: usize| -> Vec<f32> {
+        (0..n).map(|_| (r.unit_f64() as f32 - 0.5) * 0.2).collect()
+    };
+    let (w, b) = (draw(l.w_len), draw(l.b_len));
+    let mut ln = vec![0.0; l.ln_len];
+    for n in &l.norms {
+        ln[n.g..n.g + n.width].fill(1.0);
+    }
+    Net::from_flat(&w, &b, &ln).expect("random net")
+}
 
 /// A real position `plies` coin plays from the horizon, reached by random play
 /// so it is a state the engine actually produces.
@@ -761,4 +777,62 @@ fn growing_a_coin_play_finishes_its_micro_decisions() {
         }
     }
     panic!("no compound play found in 400 random games");
+}
+
+/// A round asks the value network about a leaf once, whatever the round holds.
+///
+/// `c = 0` turns growth off, so the tree is the one `Solver::new` built and
+/// every round is `batch` regret updates over the same rows. The join then runs
+/// twice a round -- once per traverser -- plus the two passes the value pass
+/// makes for the training target, and nowhere else. `batch = 1` is the bill the
+/// solver used to pay at every round size.
+#[test]
+fn a_round_values_its_leaves_once() {
+    let nets = Arc::new(Nets { value: random_net(0x5EED), device: false });
+    let mut checked = 0usize;
+    for seed in 0..200u64 {
+        let mut rng = Rng::new(seed);
+        let mut s = make_game(&mut rng, false);
+        for _ in 0..40 + seed % 60 {
+            if s.is_terminal() {
+                break;
+            }
+            let acts = s.legal_actions();
+            s.apply_inplace(acts[rng.below(acts.len())]);
+        }
+        if s.is_terminal() || s.is_chance() || !matches!(s.pending(), Cont::MainPlay) {
+            continue;
+        }
+        let ctx = Ctx::new(&s);
+        let bel = [
+            thinned(uniform_belief(&s, &ctx, 0), 8),
+            thinned(uniform_belief(&s, &ctx, 1), 8),
+        ];
+        for batch in [1usize, 2, 4, 8] {
+            // `s` is the update count when `c` is zero, so this is 24 updates
+            // in rounds of `batch`.
+            let cfg = Cfg { s: 24, c: 0.0, batch, ..Default::default() };
+            let mut sv =
+                Solver::new(&s, ctx, Arc::clone(&nets), cfg, bel.clone(), Rng::new(seed));
+            sv.run_alone();
+            let rows = sv.shape().rows as u64;
+            if rows == 0 {
+                break;
+            }
+            // The training target is never a cached opinion: the final value
+            // pass queries both seats afresh, which is the `+ 2` below.
+            sv.root_values();
+            let rounds = 24u64.div_ceil(batch as u64);
+            assert_eq!(
+                sv.trace.join_rows,
+                rows * (2 * rounds + 2),
+                "seed {seed}, batch {batch}: {rows} rows over {rounds} rounds"
+            );
+            checked += 1;
+        }
+        if checked >= 40 {
+            return;
+        }
+    }
+    panic!("no position produced a leaf batch to count");
 }

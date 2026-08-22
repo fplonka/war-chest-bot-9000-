@@ -633,6 +633,11 @@ struct Tree {
     // The solve's own arenas, laid out exactly as `Solver` lays them out.
     float* reach;
     float* vals;
+    // The network's opinion of a leaf, `v(c)` before the opponent's reach mass
+    // scales it, laid out exactly like `vals`. A round freezes the tree, so
+    // `k_readout` fills this at the head of the round and `k_scale` turns it
+    // into `vals` on every phase of it.
+    float* vcache;
     float* cur;
     float* regret;
     float* sum;
@@ -993,18 +998,18 @@ __global__ void k_belief_pool(const Tree* trees, const int* part_of_row,
     }
 }
 
-// `v(c) = (<f(c), h_row> + bias) * opp_reach[row]`, for every config of the
-// queried player at every leaf of the batch, written straight into that
-// solve's own value arena.
+// `v(c) = <f(c), h_row> + bias`, the network's opinion of every config of the
+// queried player at every leaf of the batch, written straight into that solve's
+// own opinion arena. `k_scale` makes the counterfactual value out of it.
 //
 // One block per row, one config per warp, and the row's head vector staged in
 // shared memory so it is read once for the row rather than once for each of its
 // hundred-odd configs.
 __global__ void k_readout(const Tree* trees, const int* part_of_row,
                           const int* local_row, const unsigned int* coff,
-                          const float* h, const float* cf_bias, const float* mass,
+                          const float* h, const float* cf_bias,
                           const float* add, const float* gamma, const float* beta,
-                          int rows, int stride, int d, int q0, int tile) {
+                          int rows, int d, int q0, int tile) {
     extern __shared__ float hs[];
     __shared__ float red[8];
     int row = blockIdx.x;
@@ -1051,16 +1056,34 @@ __global__ void k_readout(const Tree* trees, const int* part_of_row,
     unsigned int node = t.leaf_node[local_row[r]];
     unsigned int lo = coff[2 * r + traverser], hi = coff[2 * r + traverser + 1];
     unsigned int cs = t.coff[2 * local_row[r] + traverser];
-    float bias = *cf_bias, scale = mass[(size_t)(1 - traverser) * stride + r];
-    float* vals = t.vals + traverser * t.nvals;
+    float bias = *cf_bias;
+    float* vcache = t.vcache + traverser * t.nvals;
     unsigned int vo = t.voff[node];
     for (unsigned int k = lo + threadIdx.y; k < hi; k += blockDim.y) {
         const float* fr = t.f + (size_t)t.cidx[cs + (k - lo)] * d;
         float acc = 0.0f;
         for (int j = threadIdx.x; j < d; j += 32) acc += fr[j] * hs[j];
         for (int s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xffffffff, acc, s);
-        if (threadIdx.x == 0) vals[vo + (k - lo)] = (acc + bias) * scale;
+        if (threadIdx.x == 0) vcache[vo + (k - lo)] = acc + bias;
     }
+}
+
+// The counterfactual value at every leaf: the cached opinion times the
+// opponent's unnormalised reach mass into the leaf, which `k_beliefs` has just
+// summed. One warp per (row, traverser).
+__global__ void k_scale(const Tree* trees, const int* part_of_row,
+                        const int* local_row, const float* mass, int rows) {
+    int r = blockIdx.x * blockDim.y + threadIdx.y;
+    if (r >= rows) return;
+    const Tree& t = trees[part_of_row[r]];
+    unsigned int node = t.leaf_node[local_row[r]];
+    int traverser = blockIdx.y;
+    unsigned int n = t.nc[2 * node + traverser], vo = t.voff[node];
+    float scale = mass[(size_t)(1 - traverser) * rows + r];
+    float* vals = t.vals + traverser * t.nvals;
+    const float* vcache = t.vcache + traverser * t.nvals;
+    for (unsigned int c = threadIdx.x; c < n; c += 32)
+        vals[vo + c] = vcache[vo + c] * scale;
 }
 
 // ------------------------------------------------------------ the expansion

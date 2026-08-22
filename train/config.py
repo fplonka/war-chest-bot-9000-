@@ -35,8 +35,11 @@ class Cfg:
     # Regret updates one round of a solve carries. The tree is frozen for the
     # whole round and grows once at its end, from every leaf the round took, so
     # the per-round cost of re-describing an unchanged tree is paid once for the
-    # whole round instead of once each. (`batch` above is the optimizer's, which
-    # is a different thing entirely.)
+    # whole round instead of once each -- and so is the leaf pass, which asks
+    # the value network about every leaf at the head of the round and re-scales
+    # what it said after. Eight is a sixth of the join work of one, on the same
+    # solve. (`batch` above is the optimizer's, which is a different thing
+    # entirely.)
     round_batch: int = 8
     # Round boundaries tree growth may pass through, 0 being today's limit.
     # Two converged solves disagree on the root value by 0.077 across it.

@@ -17,16 +17,12 @@
 //! one reference solve — the largest tree here, iterated far past convergence —
 //! on the same root under the same weights.
 //!
-//! **What does a bigger round cost?** `Cfg::batch` regret updates ride in one
-//! round against a frozen tree, which is what turns sixty-five host rounds a
-//! solve into nine. The sweep asks what the target pays for that, against the
+//! **What does a bigger round cost, and what does it save?** `Cfg::batch`
+//! regret updates ride in one round against a frozen tree, which is what turns
+//! sixty-five host rounds a solve into nine and asks the value network about a
+//! leaf once where it used to ask `batch` times. The sweep buys tree and join
+//! work with target error and says what the exchange rate is, against the
 //! spread between two seeds at `batch = 1`.
-//!
-//! **How stale may a leaf value be?** The join and the readout are half the
-//! device's arithmetic and they run at every leaf on every iteration, sixty-four
-//! times a leaf. `Cfg::refresh` holds a leaf's `v(c)` between iterations and
-//! re-scales it by the reach mass it has now, so the sweep buys join work with
-//! target error and says what the exchange rate is.
 //!
 //! `cargo run --release --example budgetq -- <weights.bin> [roots] [games]`
 
@@ -125,6 +121,7 @@ fn sweep(
     nets: &std::sync::Arc<Nets>,
     refs: &[([f32; 2], Policy)],
     cfg: Cfg,
+    salt: u64,
 ) -> Row {
     let acc = positions
         .par_iter()
@@ -132,7 +129,7 @@ fn sweep(
         .map(|(i, (st, bel))| {
             let (r, rp) = &refs[i];
             let ctx = warchest::pbs::Ctx::new(st);
-            let mut sv = Solver::new(st, ctx, std::sync::Arc::clone(nets), cfg, bel.clone(), Rng::new(0x51D5 ^ i as u64));
+            let mut sv = Solver::new(st, ctx, std::sync::Arc::clone(nets), cfg, bel.clone(), Rng::new(0x51D5 ^ salt ^ i as u64));
             sv.run_alone();
             let t = root_target(&mut sv);
             let tr = sv.trace;
@@ -276,7 +273,7 @@ fn main() {
     );
     for &(s, c) in &budgets {
         let cfg = cfg_of(s, c);
-        let r = sweep(&positions, &nets, &refs, cfg);
+        let r = sweep(&positions, &nets, &refs, cfg, 0);
         println!(
             "{:>12} {:>7} {:>8.0} {:>7.0} {:>10.5} {:>10.5} {:>10.5} {:>10.5}",
             format!("({s},{c})"),
@@ -333,60 +330,27 @@ fn main() {
         "rounds", "nodes", "ncfg", "|dv| mean", "policy tv", "nash_conv", "|v0+v1|"
     );
     for rounds in [0u8, 1, u8::MAX] {
-        let r = sweep(&positions, &nets, &deep, Cfg { rounds, ..cfg_of(512, 8.0) });
+        let r = sweep(&positions, &nets, &deep, Cfg { rounds, ..cfg_of(512, 8.0) }, 0);
         println!(
             "{:>8} {:>8.0} {:>7.0} {:>10.5} {:>10.5} {:>10.5} {:>10.5}",
             rounds, r.nodes, r.ncfg, r.dv, r.tv, r.nash, r.zs.abs()
         );
     }
 
-    // ---- what a round of several iterations costs.
+    // ---- what a round of several iterations costs, and what it saves.
     //
     // `batch` regret updates ride in one round against a frozen tree, so the
     // trajectories that choose where it grows are up to `batch - 1` updates
     // ahead of it and more of them collide on one leaf. What that buys is one
-    // host round where there were `batch`. `batch = 1` twice on two seeds is
-    // the noise floor the rest of the column is read against.
-    println!("\nround size at SoG(512,8), against the same reference:");
-    println!("{:>8} {:>10} {:>12} {:>12}", "batch", "nodes", "|dv| mean", "policy tv");
-    for (label, b, salt) in [("1", 1, 0u64), ("1'", 1, 0xA5A5), ("2", 2, 0), ("4", 4, 0), ("8", 8, 0), ("16", 16, 0)] {
-        let (err, tv, nodes, tvk, k) = positions
-            .par_iter()
-            .enumerate()
-            .map(|(i, (st, bel))| {
-                let (r, rp) = &refs[i];
-                let cfg = cfg_batch(512, 8.0, b);
-                let (t, p, n) = solve(st, bel, &nets, cfg, 0x51D5 ^ salt ^ i as u64, 0);
-                let gap = policy_gap(&p, rp);
-                (
-                    ((t[0] - r[0]).abs() + (t[1] - r[1]).abs()) as f64 / 2.0,
-                    gap.unwrap_or(0.0),
-                    n as f64,
-                    gap.is_some() as u8 as f64,
-                    1.0,
-                )
-            })
-            .reduce(
-                || (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64),
-                |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3, a.4 + b.4),
-            );
-        let (k, tvk) = (k.max(1.0), tvk.max(1.0));
-        println!("{:>8} {:>10.0} {:>12.5} {:>12.5}", label, nodes / k, err / k, tv / tvk);
-    }
-
-    // ---- how stale may a leaf value be?
+    // host round where there were `batch`, and one leaf query where there were
+    // `batch`: a leaf's `v(c)` is the join and the readout, which is the whole
+    // cost, and the round re-scales it by the reach mass every update instead
+    // of asking again. `batch = 1` twice on two seeds is the noise floor the
+    // rest of the column is read against.
     //
-    // A leaf's counterfactual value is the network's `v(c)` times the
-    // opponent's reach mass. The mass is a sum over a support; `v(c)` is the
-    // join and the readout, which is the whole cost. `Cfg::refresh` keeps
-    // `v(c)` for `refresh` iterations and re-scales it every one of them, so
-    // beliefs and reaches still move and only the network's opinion of them is
-    // held. Zero values a row when it is created and never again before the
-    // final pass, which is always fresh because it is the training target.
-    //
-    // The join column is a counter and not a nominal: a row growth has just
-    // added is queried whatever `refresh` says, so the saving is never the
-    // ratio the knob suggests.
+    // The join column is a counter and not a nominal. The final value pass is
+    // two joins over every row and cannot be skipped, and it is in the bill, so
+    // the saving is never the ratio the round size suggests.
     let show = |label: &str, r: &Row, base: f64| {
         println!(
             "{:>10} {:>8.0} {:>10.5} {:>10.5} {:>10.5} {:>11.0} {:>10.0} {:>7.2}x",
@@ -396,18 +360,20 @@ fn main() {
     let head = || {
         println!(
             "{:>10} {:>8} {:>10} {:>10} {:>10} {:>11} {:>10} {:>8}",
-            "refresh", "nodes", "|dv| mean", "policy tv", "nash_conv", "join rows", "readouts", "join"
+            "batch", "nodes", "|dv| mean", "policy tv", "nash_conv", "join rows", "readouts", "join"
         );
     };
-    println!("\nleaf refresh at SoG(512,8), against the same reference:");
+    println!("\nround size at SoG(512,8), against the same reference:");
     head();
     let mut base = 0.0;
-    for refresh in [1u32, 2, 4, 8, 16, 0] {
-        let r = sweep(&positions, &nets, &refs, Cfg { refresh, ..cfg_of(512, 8.0) });
-        if refresh == 1 {
+    for (label, b, salt) in
+        [("1", 1, 0u64), ("1'", 1, 0xA5A5), ("2", 2, 0), ("4", 4, 0), ("8", 8, 0), ("16", 16, 0)]
+    {
+        let r = sweep(&positions, &nets, &refs, cfg_batch(512, 8.0, b), salt);
+        if label == "1" {
             base = r.join;
         }
-        show(&refresh.to_string(), &r, base);
+        show(label, &r, base);
     }
 
     // The two settings the budget study points at, to see whether the saving
@@ -416,22 +382,22 @@ fn main() {
     println!("\nthe same at SoG(512,8) rounds=1, against the deep reference:");
     head();
     let mut base = 0.0;
-    for refresh in [1u32, 8] {
-        let r = sweep(&positions, &nets, &deep, Cfg { refresh, rounds: 1, ..cfg_of(512, 8.0) });
-        if refresh == 1 {
+    for b in [1usize, 8] {
+        let r = sweep(&positions, &nets, &deep, Cfg { rounds: 1, ..cfg_batch(512, 8.0, b) }, 0);
+        if b == 1 {
             base = r.join;
         }
-        show(&refresh.to_string(), &r, base);
+        show(&b.to_string(), &r, base);
     }
     println!("\nthe same at SoG(256,8), against the converged reference:");
     head();
     let mut base = 0.0;
-    for refresh in [1u32, 8] {
-        let r = sweep(&positions, &nets, &refs, Cfg { refresh, ..cfg_of(256, 8.0) });
-        if refresh == 1 {
+    for b in [1usize, 8] {
+        let r = sweep(&positions, &nets, &refs, cfg_batch(256, 8.0, b), 0);
+        if b == 1 {
             base = r.join;
         }
-        show(&refresh.to_string(), &r, base);
+        show(&b.to_string(), &r, base);
     }
 
     // ---- is the policy prior worth what it costs?

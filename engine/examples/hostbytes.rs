@@ -63,7 +63,8 @@ fn main() {
         // used to fit; the CFR arenas were grown and never read; `avg` was
         // allocated whole to hold the root's row; and the flat description of
         // the tree, which only the device path builds, is added.
-        let cfr_arenas: f64 = ["regret", "prior", "visits", "qval", "sum", "reach", "vals"]
+        let cfr_arenas: f64 =
+            ["regret", "prior", "visits", "qval", "sum", "reach", "vals", "vcache"]
             .iter()
             .map(|k| group(k))
             .sum();

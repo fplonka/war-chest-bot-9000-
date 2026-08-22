@@ -57,9 +57,13 @@ type Res<T> = Result<T, String>;
 /// accumulator, and `leaf_breakdown` scales everything by 1e6 -- which turns
 /// nanoseconds into milliseconds and bytes into megabytes, so both read
 /// correctly.
-pub const STAGES: [&str; 22] = [
+pub const STAGES: [&str; 23] = [
     "marshal", "upload", "launch", "download",
-    "reach", "beliefs", "join", "readout", "terminals", "backprop", "expand",
+    // `beliefs` and `scale` run on every phase of a round; the pooling, the
+    // `join` it feeds and the `readout` run once at its head, because the tree
+    // does not move inside a round. The pooling is charged to `join`, whose
+    // input it is.
+    "reach", "beliefs", "join", "readout", "scale", "terminals", "backprop", "expand",
     "trunk", "configs", "tree",
     "t-marshal", "t-upload", "priors",
     "describe", "scatter",
@@ -135,6 +139,7 @@ struct Kernels {
     join_input: CudaFunction,
     belief_pool: CudaFunction,
     readout: CudaFunction,
+    scale: CudaFunction,
     reach_sweep: CudaFunction,
     backprop_sweep: CudaFunction,
 }
@@ -174,6 +179,7 @@ impl Kernels {
             join_input: get("k_join_input")?,
             belief_pool: get("k_belief_pool")?,
             readout: get("k_readout")?,
+            scale: get("k_scale")?,
             reach_sweep: get("k_reach_sweep")?,
             backprop_sweep: get("k_backprop_sweep")?,
         })
@@ -533,7 +539,7 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
             let old = self.buf.as_ref().expect("a capacity implies a buffer");
             let mut d = fresh.slice_mut(0..self.cap);
             stream.memcpy_dtod(&old.slice(0..self.cap), &mut d).map_err(err)?;
-            LEAF_NS[20].fetch_add(
+            LEAF_NS[21].fetch_add(
                 (self.cap * std::mem::size_of::<T>()) as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
@@ -658,6 +664,12 @@ struct Solve {
     /// The CFR arenas, laid out exactly as `Solver` lays them out.
     reach: Arr<f32>,
     vals: Arr<f32>,
+    /// The network's opinion of a leaf per config per traverser, before the
+    /// opponent's reach mass scales it -- laid out exactly like `vals`. A round
+    /// freezes the tree, so the leaf pass writes this once at the head of the
+    /// round and every phase of the round re-scales it. Twice `nvals`, which is
+    /// a quarter of a megabyte on a production solve.
+    vcache: Arr<f32>,
     cur: Arr<f32>,
     regret: Arr<f32>,
     sum: Arr<f32>,
@@ -792,7 +804,7 @@ impl Pack {
 
 /// Fields of `struct Tree` in `kernels.cu`, in order. Every one is eight bytes
 /// wide, so the descriptor is positional and needs no packing rules.
-const DESC: usize = 58;
+const DESC: usize = 59;
 
 impl Solve {
     /// What this solve holds, array by array.
@@ -806,6 +818,7 @@ impl Solve {
             ("f", self.f.cap * f), ("g", self.g.cap * f), ("fp", self.fp.cap * f),
             ("cidx", self.cidx.cap * u), ("coff", self.coff.cap * u),
             ("reach", self.reach.cap * f), ("vals", self.vals.cap * f),
+            ("vcache", self.vcache.cap * f),
             ("cur", self.cur.cap * f), ("regret", self.regret.cap * f),
             ("sum", self.sum.cap * f), ("qval", self.qval.cap * f),
             ("visits", self.visits.cap * f), ("prior", self.prior.cap * f),
@@ -890,7 +903,8 @@ impl Solve {
             t.rvd_base.ptr(s), t.rvd_start.ptr(s), t.rvd_src.ptr(s), t.rvd_p.ptr(s),
             t.draw_base.ptr(s), t.draw_start.ptr(s), t.draw_to.ptr(s), t.draw_p.ptr(s),
             t.level_start.ptr(s), t.level_node.ptr(s),
-            self.reach.ptr(s), self.vals.ptr(s), self.cur.ptr(s), self.regret.ptr(s),
+            self.reach.ptr(s), self.vals.ptr(s), self.vcache.ptr(s),
+            self.cur.ptr(s), self.regret.ptr(s),
             self.sum.ptr(s), self.qval.ptr(s), self.visits.ptr(s), self.prior.ptr(s),
             // `avg` is `sum` normalised, written once by `k_finish` as a
             // solve's last act and read only by the value pass after it. So it
@@ -1240,15 +1254,15 @@ impl Card {
         // wherever it is planned, travels as one buffer and one kernel.
         let mut pack = self.pack.lock();
         pack.clear();
-        self.wall(11, || self.trunk(calls, &pick(0), &mut pack)).map_err(at("trunk"))?;
-        self.wall(12, || self.configs(calls, &pick(1))).map_err(at("configs"))?;
-        self.wall(17, || self.tree(calls, &pick(2), &mut pack)).map_err(at("tree"))?;
-        self.wall(18, || self.scatter(&mut pack)).map_err(at("scatter"))?;
+        self.wall(12, || self.trunk(calls, &pick(0), &mut pack)).map_err(at("trunk"))?;
+        self.wall(13, || self.configs(calls, &pick(1))).map_err(at("configs"))?;
+        self.wall(18, || self.tree(calls, &pick(2), &mut pack)).map_err(at("tree"))?;
+        self.wall(19, || self.scatter(&mut pack)).map_err(at("scatter"))?;
         drop(pack);
         // After the scatter, which lays the uniform prior down over the cells
         // this growth appended, and before the iteration, whose expansion
         // phase reads what this writes.
-        self.wall(16, || self.priors(calls, &pick(2))).map_err(at("priors"))?;
+        self.wall(17, || self.priors(calls, &pick(2))).map_err(at("priors"))?;
         self.iterate(calls, &pick(3), &mut out).map_err(at("iterate"))?;
         self.read(calls, &pick(4), &mut out).map_err(at("read"))?;
         Ok(out)
@@ -1473,7 +1487,7 @@ impl Card {
         let (rows_i, cells_i) = (rows as i32, cells as i32);
         let (nhex, ntype, chan, nslot) = (N_HEXES as i32, NTYPE as i32, C as i32, NSLOT as i32);
         let l = &self.layout;
-        LEAF_NS[14].fetch_add(mark.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        LEAF_NS[15].fetch_add(mark.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 
         // Tokens: projected pile counts, then the card token and seat on top.
         let mut piles = self.alloc(rows * NTYPE * PILE_COUNTS)?;
@@ -1857,8 +1871,9 @@ impl Card {
                 }
                 b.tree.rvd_p.reset();
                 b.tree.draw_p.reset();
-                for a in [&mut b.reach, &mut b.vals, &mut b.cur, &mut b.regret,
-                          &mut b.sum, &mut b.qval, &mut b.visits, &mut b.prior] {
+                for a in [&mut b.reach, &mut b.vals, &mut b.vcache, &mut b.cur,
+                          &mut b.regret, &mut b.sum, &mut b.qval, &mut b.visits,
+                          &mut b.prior] {
                     a.reset();
                 }
             }
@@ -1884,6 +1899,7 @@ impl Card {
             b.reach.fit(s, *nreach)?;
             b.nvals = *nvals;
             b.vals.fit(s, 2 * *nvals)?;
+            b.vcache.fit(s, 2 * *nvals)?;
         }
         Ok(())
     }
@@ -1895,7 +1911,7 @@ impl Card {
         }
         let moved = pack.moved;
         pack.sum.push(moved);
-        LEAF_NS[19].fetch_add(4 * moved as u64, std::sync::atomic::Ordering::Relaxed);
+        LEAF_NS[20].fetch_add(4 * moved as u64, std::sync::atomic::Ordering::Relaxed);
         let s = &self.stream;
         let mut stage = self.host.lock();
         stage.blob.put(s, pack.blob.len(), copy(&pack.blob))?;
@@ -2009,7 +2025,7 @@ impl Card {
     fn value_pass(&self, b: &Batch) -> Res<()> {
         let all = b.all();
         self.reaches(b, all, 1, false, 0)?;
-        self.network(b, all)?;
+        self.leaf_values(b, all)?;
         self.terminals(&b.trees, all)?;
         self.backprop(b, all, 1, 0, Cfr::LINEAR)
     }
@@ -2120,9 +2136,17 @@ impl Card {
                 .unwrap_or(order.len());
             let p = &b.upto[live];
             let it = iter as i32;
-            self.network(&b, p).map_err(at("net"))?;
-            self.stage(8, || self.terminals(&b.trees, p)).map_err(at("terminals"))?;
-            self.stage(9, || self.backprop(&b, p, 0, it, k)).map_err(at("backprop"))?;
+            // The tree is frozen for the whole round, so the network is asked
+            // about every leaf at the head of it; the other phases re-scale
+            // what it said by the reach mass they have. A terminal leaf is the
+            // game's utility times that same mass, so it is scored every phase.
+            self.beliefs(&b, p).map_err(at("beliefs"))?;
+            if iter == 0 {
+                self.opinions(&b, p).map_err(at("net"))?;
+            }
+            self.scale(&b, p).map_err(at("scale"))?;
+            self.stage(9, || self.terminals(&b.trees, p)).map_err(at("terminals"))?;
+            self.stage(10, || self.backprop(&b, p, 0, it, k)).map_err(at("backprop"))?;
             // The regret update moved both players' strategies, so the reaches
             // the next iteration reads are stale until they are pushed down
             // again -- and the average strategy accumulates against those.
@@ -2131,7 +2155,7 @@ impl Card {
             // belongs inside the loop: a round that runs several iterations
             // samples several times and the host grows all of them at once.
             if sims > 0 {
-                self.stage(10, || {
+                self.stage(11, || {
                     self.expand(&b.trees, b.parts, sims, puct, iter, rounds)
                 })
                 .map_err(at("expand"))?;
@@ -2328,14 +2352,81 @@ impl Card {
         Ok(())
     }
 
-    /// The network at every leaf of the round, for both traversers at once.
+    /// The leaf pass, from the reaches as they now stand.
     ///
-    /// Normalise the beliefs, pool them, run the join, read the values out into
-    /// each solve's own value arena. The beliefs and the pooling do not depend
-    /// on which seat is asking, so they run once; the join and the readout do,
-    /// and run over a batch of twice the rows rather than twice.
-    #[allow(clippy::too_many_arguments)]
-    fn network(&self, b: &Batch, p: &Prefix) -> Res<()> {
+    /// A leaf's counterfactual value is `v(c)` times the opponent's reach mass
+    /// into the leaf. `opinions` is the network and is the whole cost; `scale`
+    /// is a multiply. A round runs all three at its head and the beliefs and
+    /// the scale on every phase after -- see `Cfg::batch`.
+    fn leaf_values(&self, b: &Batch, p: &Prefix) -> Res<()> {
+        self.beliefs(b, p)?;
+        self.opinions(b, p)?;
+        self.scale(b, p)
+    }
+
+    /// Every leaf's normalised belief and the opponent's reach mass there, for
+    /// both players. `w` is indexed by the round's own cell offsets and `mass`
+    /// by its rows, so neither belongs to a tile of the join.
+    fn beliefs(&self, b: &Batch, p: &Prefix) -> Res<()> {
+        let stride = p.rows;
+        if stride == 0 {
+            return Ok(());
+        }
+        let s = &self.stream;
+        let stride_i = stride as i32;
+        let mut sc = self.scratch.lock();
+        sc.w.room(s, b.cells)?;
+        sc.mass.room(s, 2 * stride)?;
+        let Scratch { w, mass, .. } = &mut *sc;
+        let (w, mass) = (w.buf.as_mut().unwrap(), mass.buf.as_mut().unwrap());
+        self.stage(5, || {
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.beliefs)
+                    .arg(&b.trees).arg(&b.part).arg(&b.local).arg(&b.coff)
+                    .arg(&mut *w).arg(&mut *mass).arg(&stride_i)
+                    .launch_unit(LaunchConfig {
+                        grid_dim: ((stride as u32).div_ceil(8).max(1), 2, 1),
+                        block_dim: (32, 8, 1),
+                        shared_mem_bytes: 0,
+                    })
+            }
+            .map_err(err)
+        })
+    }
+
+    /// The counterfactual value at every leaf: the opinion the round's head
+    /// cached, times the mass `beliefs` has just summed.
+    fn scale(&self, b: &Batch, p: &Prefix) -> Res<()> {
+        let stride = p.rows;
+        if stride == 0 {
+            return Ok(());
+        }
+        let stride_i = stride as i32;
+        let sc = self.scratch.lock();
+        let mass = sc.mass.buf.as_ref().ok_or("a leaf scaled before its beliefs")?;
+        self.stage(8, || {
+            unsafe {
+                self.stream
+                    .launch_builder(&self.k.scale)
+                    .arg(&b.trees).arg(&b.part).arg(&b.local).arg(mass).arg(&stride_i)
+                    .launch_unit(LaunchConfig {
+                        grid_dim: ((stride as u32).div_ceil(8).max(1), 2, 1),
+                        block_dim: (32, 8, 1),
+                        shared_mem_bytes: 0,
+                    })
+            }
+            .map_err(err)
+        })
+    }
+
+    /// What the value network says about every leaf of the round, for both
+    /// traversers at once, into each solve's own `vcache`.
+    ///
+    /// Pool the beliefs, run the join, read the values out. The pooling does
+    /// not depend on which seat is asking, so it runs once; the join and the
+    /// readout do, and run over a batch of twice the rows rather than twice.
+    fn opinions(&self, b: &Batch, p: &Prefix) -> Res<()> {
         let (trees, part_d, local_d, base_d, coff_d) =
             (&b.trees, &b.part, &b.local, &b.base, &b.coff);
         // The active solves are a prefix of the batch, so their leaf rows are a
@@ -2347,45 +2438,20 @@ impl Card {
         }
         let mut sc = self.scratch.lock();
         let l = &self.layout;
-        let (stride_i, pool_i, d_i) = (stride as i32, POOL as i32, D as i32);
+        let (pool_i, d_i) = (POOL as i32, D as i32);
         let s = &self.stream;
 
-        // The beliefs are normalised once for the whole round: `w` is indexed
-        // by the round's own cell offsets and `mass` by its rows, so neither
-        // belongs to a tile.
-        sc.w.room(s, b.cells)?;
-        sc.mass.room(s, 2 * stride)?;
-        {
-            let Scratch { w, mass, .. } = &mut *sc;
-            let (w, mass) = (w.buf.as_mut().unwrap(), mass.buf.as_mut().unwrap());
-            self.stage(5, || {
-                unsafe {
-                    self.stream
-                        .launch_builder(&self.k.beliefs)
-                        .arg(trees).arg(part_d).arg(local_d).arg(coff_d)
-                        .arg(&mut *w).arg(&mut *mass).arg(&stride_i)
-                        .launch_unit(LaunchConfig {
-                            grid_dim: ((stride as u32).div_ceil(8).max(1), 2, 1),
-                            block_dim: (32, 8, 1),
-                            shared_mem_bytes: 0,
-                        })
-                }
-                .map_err(err)
-            })?;
-        }
-
-        // Everything after that is a tile of leaves at a time. The pass's
-        // intermediates are 5,640 bytes a leaf row, so sizing them by the whole
-        // round cost a gigabyte a lane -- and lanes are what solves in flight
-        // are now bounded by.
+        // A tile of leaves at a time. The pass's intermediates are 5,640 bytes
+        // a leaf row, so sizing them by the whole round cost a gigabyte a lane
+        // -- and lanes are what solves in flight are now bounded by.
         let tile = TILE.min(stride);
         sc.pooled.room(s, 2 * tile * POOL)?;
         sc.h.room(s, 2 * tile * D)?;
         sc.z.room(s, 2 * tile * JW)?;
         sc.input.room(s, 2 * tile * JOIN_IN)?;
         sc.t.room(s, 2 * tile * JW)?;
-        let Scratch { w, mass, pooled, h, z, input, t, .. } = &mut *sc;
-        let (w, mass) = (w.buf.as_mut().unwrap(), mass.buf.as_mut().unwrap());
+        let Scratch { w, pooled, h, z, input, t, .. } = &mut *sc;
+        let w = w.buf.as_mut().unwrap();
         let pooled = pooled.buf.as_mut().unwrap();
         let (h, z) = (h.buf.as_mut().unwrap(), z.buf.as_mut().unwrap());
         let (input, t) = (input.buf.as_mut().unwrap(), t.buf.as_mut().unwrap());
@@ -2397,7 +2463,7 @@ impl Card {
             let rows = 2 * n;
             let (rows_i, queries_i) = (rows as i32, rows as i32);
             let jw_i = JW as i32;
-            self.stage(5, || {
+            self.stage(6, || {
                 unsafe {
                     self.stream
                         .launch_builder(&self.k.belief_pool)
@@ -2455,8 +2521,8 @@ impl Card {
                     self.stream
                         .launch_builder(&self.k.readout)
                         .arg(trees).arg(part_d).arg(local_d).arg(coff_d)
-                        .arg(&*h).arg(&bias).arg(&*mass).arg(&owed).arg(&g).arg(&hb)
-                        .arg(&rows_i).arg(&stride_i).arg(&d_i).arg(&q0_i).arg(&n_i)
+                        .arg(&*h).arg(&bias).arg(&owed).arg(&g).arg(&hb)
+                        .arg(&rows_i).arg(&d_i).arg(&q0_i).arg(&n_i)
                         .launch_unit(LaunchConfig {
                             grid_dim: (rows as u32, 1, 1),
                             block_dim: (32, 8, 1),

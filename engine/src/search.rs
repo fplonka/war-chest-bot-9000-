@@ -90,6 +90,12 @@ pub struct Cfg {
     /// large round runs out of lines to sample down and takes fewer than it
     /// owes. Measured at `SoG(512, 8)`, a round of four builds nine percent
     /// less tree than a round of one and a round of eight twenty-three.
+    ///
+    /// What it buys is the leaf pass. A round freezes the tree, so the value
+    /// network is asked about every leaf once at the head of the round and the
+    /// round's other updates re-scale what it said -- see `leaf_values`. A
+    /// round of eight is a sixth of the join and readout work of a round of
+    /// one, on the same solve.
     pub batch: usize,
     /// Round boundaries growth may grow *through*.
     ///
@@ -105,24 +111,6 @@ pub struct Cfg {
     /// rows and 2.1x the readouts, and leaves a harder game: `nash_conv` at 64
     /// updates goes 0.031 to 0.057.
     pub rounds: u8,
-    /// Iterations between two full leaf queries of the value network.
-    ///
-    /// One is what the solver has always done: every CFR iteration re-runs the
-    /// join and the readout at every leaf row, sixty-four times a leaf. Above
-    /// one, a leaf's per-config values `v(c)` are kept from the last query and
-    /// only re-scaled by the opponent's current reach mass, so beliefs and
-    /// reaches still move every iteration and only the network's opinion of
-    /// them is held. Zero never re-queries: a row is valued when it is created
-    /// and again in the final value pass, which is the target, and nowhere in
-    /// between.
-    ///
-    /// A row growth has just added has nothing to reuse, so it is always
-    /// queried on the first iteration it exists whatever this says. That is
-    /// also why `refresh` aligned with `batch` is the natural setting: the
-    /// round's first iteration has to run the network for the new rows anyway.
-    ///
-    /// Host path only. The card holds no `h` per row between iterations.
-    pub refresh: u32,
     /// The regret-update rule.
     pub cfr: Cfr,
     /// PUCT's exploration constant, weighting the prior against the search's
@@ -142,7 +130,6 @@ impl Default for Cfg {
             c: 8.0,
             batch: 8,
             rounds: 0,
-            refresh: 1,
             cfr: Cfr::SOG,
             puct: 1.5,
             prior_temp: 1.0,
@@ -162,15 +149,6 @@ impl Cfg {
             return self.s as usize;
         }
         (self.s as f32 / self.c).ceil() as usize
-    }
-
-    /// Whether the iteration after `done` of them re-queries the network at
-    /// every leaf.
-    ///
-    /// The first iteration of every `refresh`, so `refresh = batch` puts the
-    /// query at the start of a round and nowhere else in it.
-    fn refresh_due(&self, done: usize) -> bool {
-        self.refresh > 0 && done % self.refresh as usize == 0
     }
 
     /// Expansions the solve owes after its `i`-th regret update, one-based.
@@ -307,8 +285,8 @@ pub struct Trace {
     pub cell_iters: u64,
     /// Rows the join actually ran over, summed across every query the solve
     /// made — two a regret update, plus the fixed-policy passes. `row_iters`
-    /// is the nominal that assumes every iteration queries every row; under
-    /// `Cfg::refresh` above one it does not, and this is what it cost.
+    /// is the nominal that assumes every iteration queries every row; the
+    /// network runs once a round, and this is what that cost.
     pub join_rows: u64,
     /// Config values the readout actually formed from the network, on the same
     /// terms. The re-scaling of a cached value is not counted: it is a
@@ -1000,10 +978,10 @@ pub struct HostCfr {
     /// The traverser's counterfactual value per config, flat the same way:
     /// `vals[voff[i] .. voff[i] + max(nc0, nc1)]`.
     pub vals: Vec<f32>,
-    /// The network's value per config, per traverser, before the opponent's
-    /// reach mass scales it — laid out like `vals`, one arena a seat. This is
-    /// the only part of a leaf value that costs a network query, so it is the
-    /// part `Cfg::refresh` keeps between iterations.
+    /// The network's opinion of a leaf per config, per traverser, before the
+    /// opponent's reach mass scales it — laid out like `vals`, one arena a
+    /// seat. This is the only part of a leaf value that costs a network query,
+    /// so it is the part a round queries once and re-scales after.
     pub vcache: [Vec<f32>; 2],
 }
 
@@ -1112,10 +1090,6 @@ pub struct Solver {
     // ~2,000 times a solve and the join ~158,000.
     /// Non-terminal leaves in node order — the rows of the network batch.
     pub leaf_rows: Vec<usize>,
-    /// Per traverser: how many leaf rows `HostCfr::vcache` holds a network
-    /// value for. Rows past it are the ones growth has added since the last
-    /// query, and they are queried whatever `Cfg::refresh` says.
-    cached: [usize; 2],
     /// Diagnostics: the per-iteration work this solve has done so far. Nothing
     /// in a run reads it; the budget study prices a search with it.
     pub trace: Trace,
@@ -1294,7 +1268,6 @@ impl Solver {
             nc: Vec::new(),
             steps: [0, 0],
             leaf_rows: Vec::new(),
-            cached: [0; 2],
             trace: Trace::default(),
             term_leaves: Vec::new(),
             leaf_cidx: Vec::new(),
@@ -1626,7 +1599,6 @@ impl Solver {
         self.wants_prior.retain(|&i| (i as usize) < m.nodes);
         self.row_of.truncate(m.nodes);
         self.leaf_rows.truncate(m.leaf_rows);
-        self.cached = self.cached.map(|k| k.min(m.leaf_rows));
         // `xpub` is written by index and reused, so only the count and the
         // interning map name boards that no longer exist. A board an abandoned
         // row shared with a surviving one stays, and stays right.
@@ -2353,10 +2325,7 @@ impl Solver {
     /// linear card-weighted half, which is what makes this pooled vector carry
     /// the belief's exact expected holding of each card rather than an average
     /// of nonlinearities.
-    ///
-    /// Rows below `from` are ones whose join output is being reused, so their
-    /// block is not read and is not written.
-    fn belief_blocks(&mut self, from: usize) {
+    fn belief_blocks(&mut self) {
         let _t = timed!(BELFEAT);
         // Sized where it is written. Growth used to do it, which fitted a
         // megabyte of pooled belief per solve on the device path -- where the
@@ -2373,7 +2342,7 @@ impl Solver {
             &mut self.xb,
         );
         let pool = crate::net::POOL;
-        for (r, &i) in self.leaf_rows.iter().enumerate().skip(from) {
+        for (r, &i) in self.leaf_rows.iter().enumerate() {
             for p in 0..2 {
                 let n = nc[i][p] as usize;
                 let ra = roff[i] as usize + if p == 1 { nc[i][0] as usize } else { 0 };
@@ -2395,40 +2364,44 @@ impl Solver {
     }
 
     /// Fill `vals` at every leaf with the traverser's counterfactual values,
-    /// querying the network at every row.
+    /// from a fresh query of the value network.
+    ///
+    /// A leaf's counterfactual value is two factors multiplied. `v(c)` is what
+    /// the network says the leaf is worth to a traverser holding config `c`,
+    /// and it costs a pooled belief, a join and a dot product against `f(c)` --
+    /// which is the whole of the leaf pass. The other factor is the opponent's
+    /// unnormalised reach mass into the leaf, which is a sum over a support and
+    /// costs nothing. `opinions` forms the first and leaves it in `vcache`;
+    /// `scale` turns it into the value the reaches now imply.
     pub fn leaf_values(&mut self, traverser: usize) {
-        self.leaf_values_from(traverser, 0);
+        self.opinions(traverser);
+        self.scale(traverser);
     }
 
-    /// The same, querying the network only from row `from` on and re-scaling
-    /// every earlier row's cached `v(c)` by the opponent's current reach mass.
+    /// The network's opinion of every leaf, cached per row per config.
     ///
-    /// A leaf's counterfactual value is `v(c)` times that mass. The mass moves
-    /// every iteration and costs a sum over a support; `v(c)` is the network,
-    /// and is the whole of what the join and the readout are for. So the split
-    /// here is exactly the split `Cfg::refresh` trades in.
-    fn leaf_values_from(&mut self, traverser: usize, from: usize) {
-        if !self.nets.value.is_empty() {
-            self.belief_blocks(from);
-        }
-        self.pbs_head(traverser, from);
-        self.readout_from(traverser, from);
-        self.cached[traverser] = self.leaf_rows.len();
-    }
-
-    /// The one path CFR pays for on every iteration.
+    /// A round freezes the tree, so this runs at the head of a round and the
+    /// round's other updates re-scale what it left. The public state at a leaf
+    /// does not move inside a round at all, and the belief moves only by
+    /// however far the iterate travelled in at most `batch` updates, pooled
+    /// over the leaf's support.
     ///
-    /// Writes `h` for rows `from ..` at its front, so row `r` of the tree is
-    /// row `r - from` of `h`. The join takes a contiguous batch and this one is
-    /// a suffix of the leaves, because growth only ever appends.
-    fn pbs_head(&mut self, traverser: usize, from: usize) {
-        let net = &self.nets.value;
-        if net.is_empty() {
+    /// A solve with no value network -- a subgame the game itself scores --
+    /// leaves `vcache` at the zero it was sized to, and `scale` then writes the
+    /// zero those leaves are worth.
+    fn opinions(&mut self, traverser: usize) {
+        if self.nets.value.is_empty() {
             return;
         }
+        self.belief_blocks();
+        self.pbs_head(traverser);
+        self.readout(traverser);
+    }
+
+    /// The join, over every leaf row: the one path a round pays for.
+    fn pbs_head(&mut self, traverser: usize) {
         let _t = timed!(NET);
-        let rows = self.leaf_rows.len();
-        let n = rows - from;
+        let n = self.leaf_rows.len();
         if n == 0 {
             return;
         }
@@ -2440,30 +2413,47 @@ impl Solver {
         self.nets.value.join(
             &self.pb[..self.nboards * crate::net::D],
             &self.jp[..self.nboards * crate::net::JW],
-            &self.board_of[from..rows],
-            &self.xb[2 * from * pool..2 * rows * pool],
+            &self.board_of[..n],
+            &self.xb[..2 * n * pool],
             n,
             traverser,
             &mut self.h,
         );
     }
 
-    /// Per-config leaf values for player `p` — counterfactual: the network's
-    /// value for that exact config times the opponent's unnormalised reach
-    /// into the leaf. Runs off the `h` left by the last `pbs_head` query, and
-    /// is one dot product per config.
-    ///
-    /// Rows below `from` take their `v(c)` from `vcache` instead of the
-    /// network; every row is scaled by the reach mass it has now.
-    fn readout_from(&mut self, p: usize, from: usize) {
+    /// The network's `v(c)` for every config of player `p` at every leaf row,
+    /// into `vcache`. Runs off the `h` the join left, and is one dot product
+    /// per config.
+    fn readout(&mut self, p: usize) {
         let _t = timed!(LEAFPOST);
-        let empty = self.nets.value.is_empty();
-        let queried: usize = self.leaf_rows[from..]
-            .iter()
-            .map(|&i| self.nc[i][p] as usize)
-            .sum();
+        let queried: usize = self.leaf_rows.iter().map(|&i| self.nc[i][p] as usize).sum();
         crate::prof::work(0, 0, 0, queried);
         self.trace.readout_cfgs += queried as u64;
+        let d = crate::net::D;
+        let vcache = &mut self.host.as_mut().expect(HOST_PATH).vcache[p];
+        let (ncs, voff, coff, cidx, cf) =
+            (&self.nc, &self.voff, &self.leaf_coff, &self.leaf_cidx, &self.cf);
+        for (r, &i) in self.leaf_rows.iter().enumerate() {
+            let n = ncs[i][p] as usize;
+            let vo = voff[i] as usize;
+            let cs = coff[2 * r + p] as usize;
+            self.nets.value.values(
+                &self.h[r * d..(r + 1) * d],
+                cf,
+                &cidx[cs..cs + n],
+                &mut vcache[vo..vo + n],
+            );
+        }
+    }
+
+    /// The counterfactual value at every leaf, from the reaches as they now
+    /// stand: the cached opinion times the opponent's unnormalised reach mass.
+    ///
+    /// A terminal leaf's opinion is the game's utility rather than the
+    /// network's, but it is the same multiply, so the terminals are scored
+    /// here too.
+    fn scale(&mut self, p: usize) {
+        let _t = timed!(LEAFPOST);
         let opp = 1 - p;
         for k in 0..self.term_leaves.len() {
             let i = self.term_leaves[k];
@@ -2477,39 +2467,14 @@ impl Solver {
             };
             let n = self.nc[i][p] as usize;
             let vo = self.voff[i] as usize;
-            // A terminal leaf's value is the game's, not the network's, but
-            // it travels the same arithmetic afterwards.
             self.host.as_mut().expect(HOST_PATH).vals[vo..vo + n].fill(u * opp_reach);
         }
-        let d = crate::net::D;
         let cfr = self.host.as_mut().expect(HOST_PATH);
-        let (reach, vals, vcache) = (&cfr.reach, &mut cfr.vals, &mut cfr.vcache[p]);
-        let (roff, ncs, voff, coff, cidx, cf) = (
-            &self.roff,
-            &self.nc,
-            &self.voff,
-            &self.leaf_coff,
-            &self.leaf_cidx,
-            &self.cf,
-        );
-        for (r, &i) in self.leaf_rows.iter().enumerate() {
+        let (reach, vals, vcache) = (&cfr.reach, &mut cfr.vals, &cfr.vcache[p]);
+        let (roff, ncs, voff) = (&self.roff, &self.nc, &self.voff);
+        for &i in &self.leaf_rows {
             let n = ncs[i][p] as usize;
             let vo = voff[i] as usize;
-            if empty {
-                vals[vo..vo + n].fill(0.0);
-                continue;
-            }
-            // `pbs_head` wrote the queried rows at the front of `h`, so the
-            // tree's row `r` is `h`'s row `r - from`.
-            if r >= from {
-                let cs = coff[2 * r + p] as usize;
-                self.nets.value.values(
-                    &self.h[(r - from) * d..(r - from + 1) * d],
-                    cf,
-                    &cidx[cs..cs + n],
-                    &mut vcache[vo..vo + n],
-                );
-            }
             let ra = roff[i] as usize + if opp == 1 { ncs[i][0] as usize } else { 0 };
             let opp_reach: f32 = reach[ra..ra + ncs[i][opp] as usize].iter().sum();
             for (value, &v) in vals[vo..vo + n].iter_mut().zip(&vcache[vo..vo + n]) {
@@ -2518,19 +2483,17 @@ impl Solver {
         }
     }
 
-    fn update_regrets(&mut self, traverser: usize) {
+    /// One regret update. `head` says this is the first update of a round, so
+    /// the network runs; the rest of the round re-scales what it left.
+    fn update_regrets(&mut self, traverser: usize, head: bool) {
         // Reaches are already consistent with `cur`: `new` establishes that,
         // every `step` re-establishes it after regret matching, and the
         // fixed-policy passes restore it before returning, so recomputing them
         // here would repeat the previous pass exactly.
-        // `Cfg::refresh` says how often the network runs. Rows growth has added
-        // since the last query have nothing to reuse and are always queried.
-        let from = if self.cfg.refresh_due(self.steps[traverser]) {
-            0
-        } else {
-            self.cached[traverser]
-        };
-        self.leaf_values_from(traverser, from);
+        if head {
+            self.opinions(traverser);
+        }
+        self.scale(traverser);
         self.backprop(traverser, &[], Back::Regret);
     }
 
@@ -2717,17 +2680,26 @@ impl Solver {
     /// This is twice the work of an alternating half-iteration and twice the
     /// updates, so a solve of `iters` iterations now gives each player `iters`
     /// updates rather than `iters / 2`.
-    pub fn step(&mut self) {
+    ///
+    /// `head` says this is the first update of a round, where the leaves are
+    /// valued. The rest of the round re-scales what that left.
+    fn iterate(&mut self, head: bool) {
         self.trace.iters += 1;
         self.trace.row_iters += self.leaf_rows.len() as u64;
         self.trace.cidx_iters += self.leaf_cidx.len() as u64;
         self.trace.cell_iters += self.ncells as u64;
-        self.update_regrets(0);
-        self.update_regrets(1);
+        self.update_regrets(0, head);
+        self.update_regrets(1, head);
         self.precompute_reaches();
         self.avg_block();
         self.steps[0] += 1;
         self.steps[1] += 1;
+    }
+
+    /// One iteration on its own, with its leaves freshly valued: a round of
+    /// one, which is what `batch = 1` runs.
+    pub fn step(&mut self) {
+        self.iterate(true);
     }
 
     /// Add the fresh reach-weighted iterate to the running strategy sum.
@@ -2839,9 +2811,12 @@ impl Solver {
             // so the round's leaves are collected in one place and each phase
             // draws until it has `want` the round has not taken yet.
             let mut taken = Vec::new();
-            for _ in 0..done {
+            for phase in 0..done {
                 self.at += 1;
-                self.step();
+                // The tree is frozen for the whole round, so the value network
+                // is asked about every leaf at the head of it and the other
+                // phases re-scale that by the reach mass they have.
+                self.iterate(phase == 0);
                 self.expansion_phase(want, &mut taken);
             }
             let grew = !taken.is_empty();
@@ -3768,7 +3743,8 @@ impl Solver {
                         + h.sum_strat.iter().map(|r| r.capacity() * 4).sum::<usize>(),
                 ),
                 ("reach", f(&h.reach)),
-                ("vals", f(&h.vals) + f(&h.vcache[0]) + f(&h.vcache[1])),
+                ("vals", f(&h.vals)),
+                ("vcache", f(&h.vcache[0]) + f(&h.vcache[1])),
             ]);
         }
         v.sort_by_key(|&(_, b)| std::cmp::Reverse(b));
