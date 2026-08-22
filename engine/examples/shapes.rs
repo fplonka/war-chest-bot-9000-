@@ -1,14 +1,52 @@
 //! The distribution of what a solve builds, over a corpus of real roots.
 //!
-//! Admission sizes a slot from this: a slot holds a solve at the budget, so the
-//! budget has to be a percentile of the shape and not a mean. Prints, for each
-//! `s` given, the percentiles of every term a slot's arenas are linear in.
-//!
-//!   cargo run --release --example shapes -- [roots] [s...]
+//!   cargo run --release --example shapes -- [roots] [s... | first]
 use std::sync::Arc;
+use warchest::pbs::{enumerate_configs, reserve, true_config, Belief, Ctx};
 use warchest::rng::Rng;
 use warchest::search::{Cfg, Cfr, Nets, Shape, Solver};
-use warchest::selfplay::{collect_roots, Agent, Collect, GameCfg};
+use warchest::selfplay::make_game;
+use warchest::state::{Cont, State};
+
+fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
+    let truth = true_config(s, p, ctx);
+    let cfg = enumerate_configs(
+        &reserve(s, p, ctx),
+        truth.hand_size(),
+        truth.fd_size(),
+        truth.inflight.is_some(),
+    );
+    let n = cfg.len() as f32;
+    Belief { p: vec![1.0 / n; cfg.len()], cfg }
+}
+
+/// Main-play positions from random legal play of whole games.
+///
+/// `collect_roots` would solve every ply; that is the thing being measured, so
+/// it cannot be how the corpus is gathered. Random play still sits at every
+/// depth, which is what a first expansion's cost varies with.
+fn random_roots(games: usize, seed: u64) -> Vec<(State, [Belief; 2])> {
+    let mut out = Vec::new();
+    for g in 0..games {
+        let mut rng = Rng::new(seed + g as u64);
+        let mut s = make_game(&mut rng, true);
+        let mut ply = 0u32;
+        while !s.is_terminal() && ply < 256 {
+            if matches!(s.pending(), Cont::MainPlay) && !s.is_chance() {
+                let ctx = Ctx::new(&s);
+                let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
+                out.push((s.clone(), bel));
+            }
+            let acts = s.legal_actions();
+            if acts.is_empty() {
+                break;
+            }
+            s.apply_inplace(acts[rng.below(acts.len())]);
+            ply += 1;
+        }
+    }
+    out
+}
 
 fn pct(v: &[usize], q: f64) -> usize {
     if v.is_empty() {
@@ -32,10 +70,124 @@ fn row(name: &str, mut v: Vec<usize>) {
     );
 }
 
+struct Fat {
+    i: usize,
+    shape: Shape,
+    round: u16,
+    main_plays: u16,
+    turns: [u8; 2],
+    pending: String,
+    to_act: u8,
+    hands: [u8; 2],
+    support: [usize; 2],
+    legal: usize,
+    chance: usize,
+    decision: usize,
+    leaves: usize,
+    root_cells: usize,
+    max_node_cells: usize,
+    max_draw: usize,
+    max_draw_row: usize,
+    exhausted: bool,
+    interiors: String,
+}
+
+fn describe(i: usize, st: &warchest::state::State, belief: &[warchest::pbs::Belief; 2], sv: &Solver) -> Fat {
+    let mut chance = 0usize;
+    let mut decision = 0usize;
+    let mut leaves = 0usize;
+    let mut max_node_cells = 0usize;
+    let mut max_draw = 0usize;
+    let mut max_draw_row = 0usize;
+    let mut interiors: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for (ni, n) in sv.nodes.iter().enumerate() {
+        if n.leaf {
+            leaves += 1;
+        } else if n.chance {
+            chance += 1;
+            max_draw = max_draw.max(n.draw.len());
+            for ci in 0..n.draw.rows() {
+                max_draw_row = max_draw_row.max(n.draw.row(ci).0.len());
+            }
+            *interiors.entry(format!("{:?}", sv.states[ni].pending())).or_insert(0) += 1;
+        } else {
+            decision += 1;
+            *interiors.entry(format!("{:?}", sv.states[ni].pending())).or_insert(0) += 1;
+        }
+        max_node_cells = max_node_cells.max(n.legal_action.len());
+    }
+    Fat {
+        i,
+        shape: sv.shape(),
+        round: st.round,
+        main_plays: st.main_plays,
+        turns: st.turns_taken,
+        pending: format!("{:?}", st.pending()),
+        to_act: st.to_act(),
+        hands: [st.hand_size(0), st.hand_size(1)],
+        support: [belief[0].cfg.len(), belief[1].cfg.len()],
+        legal: st.legal_actions().len(),
+        chance,
+        decision,
+        leaves,
+        root_cells: sv.nodes[0].legal_action.len(),
+        max_node_cells,
+        max_draw,
+        max_draw_row,
+        exhausted: sv.nodes[0].exhausted,
+        interiors: interiors
+            .iter()
+            .map(|(k, n)| format!("{k}×{n}"))
+            .collect::<Vec<_>>()
+            .join(","),
+    }
+}
+
+fn print_fat(title: &str, fats: &mut [Fat], key: impl Fn(&Fat) -> usize) {
+    fats.sort_by_key(|f| std::cmp::Reverse(key(f)));
+    println!("\n== {title} ==");
+    for f in fats.iter().take(8) {
+        println!(
+            "root {:>3} cells={:<7} draws={:<7} cidx={:<7} reach={:<7} nodes={:<5} rows={:<5} ncfg={:<5} \
+             round={} plays={} turns={:?} pending={} to_act={} hands={:?} support={:?} legal={} \
+             chance={} decision={} leaves={} root_cells={} max_node_cells={} max_draw={} max_draw_row={} exhausted={} interiors={}",
+            f.i,
+            f.shape.cells,
+            f.shape.draws,
+            f.shape.cidx,
+            f.shape.reach,
+            f.shape.nodes,
+            f.shape.rows,
+            f.shape.ncfg,
+            f.round,
+            f.main_plays,
+            f.turns,
+            f.pending,
+            f.to_act,
+            f.hands,
+            f.support,
+            f.legal,
+            f.chance,
+            f.decision,
+            f.leaves,
+            f.root_cells,
+            f.max_node_cells,
+            f.max_draw,
+            f.max_draw_row,
+            f.exhausted,
+            f.interiors,
+        );
+    }
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let roots: usize = a.get(1).and_then(|x| x.parse().ok()).unwrap_or(64);
-    let sizes: Vec<u32> = if a.len() > 2 {
+    let roots: usize = a.get(1).and_then(|x| x.parse().ok()).unwrap_or(96);
+    let first_only = a.iter().any(|x| x == "first");
+    let sizes: Vec<u32> = if first_only {
+        vec![]
+    } else if a.len() > 2 {
         a[2..].iter().filter_map(|x| x.parse().ok()).collect()
     } else {
         vec![512, 192]
@@ -55,22 +207,80 @@ fn main() {
         warchest::net::Net::from_flat(&w, &b, &ln).expect("net")
     };
     let nets = Arc::new(Nets { value: net, device: false });
-    let small = Cfg { s: 32, c: 4.0, cfr: Cfr::SOG, ..Default::default() };
-    let gc = GameCfg {
-        agents: [Agent::Sog { cfg: small }; 2],
-        collect: Collect::Sog,
-        explore: 0.1,
-        random_draft: true,
-        p_td1: 0.0,
-        query_rate: 0.9,
-        recursive_rate: 0.1,
-    };
-    // A spread of the whole game, not of its openings: a solve's cost varies
-    // twenty-six fold with how far into a game its root sits.
-    let all = collect_roots(64, 99, &nets, &gc, usize::MAX);
+    let all = random_roots(64, 99);
     let step = (all.len() / roots.max(1)).max(1);
     let positions: Vec<_> = all.into_iter().step_by(step).take(roots).collect();
-    println!("{} roots", positions.len());
+    println!("{} roots from {} random games ({} plies kept)", positions.len(), 64, positions.len() * step);
+
+    let cfg = Cfg {
+        s: 1,
+        c: 1.0,
+        cfr: Cfr::SOG,
+        budget: warchest::search::Budget::unbounded(),
+        ..Default::default()
+    };
+    let mut first: Vec<Shape> = Vec::new();
+    let mut fats: Vec<Fat> = Vec::new();
+    let mut pending: Vec<(String, usize)> = Vec::new();
+    for (i, (st, belief)) in positions.iter().enumerate() {
+        let ctx = warchest::pbs::Ctx::new(st);
+        let sv = Solver::new(
+            st,
+            ctx,
+            Arc::clone(&nets),
+            cfg,
+            belief.clone(),
+            Rng::new(i as u64 * 7 + 1),
+        );
+        let f = describe(i, st, belief, &sv);
+        if i % 8 == 0 || f.shape.cells > 200_000 {
+            eprintln!(
+                "root {i} cells={} draws={} nodes={} pending={} support={:?}",
+                f.shape.cells, f.shape.draws, f.shape.nodes, f.pending, f.support
+            );
+        }
+        pending.push((f.pending.clone(), f.shape.cells));
+        first.push(f.shape);
+        fats.push(f);
+    }
+    println!(
+        "\n== first expansion ==\n{:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "", "mean", "p50", "p90", "p99", "max", "max/p99%"
+    );
+    row("nodes", first.iter().map(|x| x.nodes).collect());
+    row("rows", first.iter().map(|x| x.rows).collect());
+    row("boards", first.iter().map(|x| x.boards).collect());
+    row("cells", first.iter().map(|x| x.cells).collect());
+    row("ncfg", first.iter().map(|x| x.ncfg).collect());
+    row("cidx", first.iter().map(|x| x.cidx).collect());
+    row("reach", first.iter().map(|x| x.reach).collect());
+    row("draws", first.iter().map(|x| x.draws).collect());
+    row("acts", first.iter().map(|x| x.acts).collect());
+    row("support", first.iter().map(|x| x.support).collect());
+    row("root_cell", fats.iter().map(|x| x.root_cells).collect());
+    row("max_node", fats.iter().map(|x| x.max_node_cells).collect());
+    row("decision", fats.iter().map(|x| x.decision).collect());
+    row("chance", fats.iter().map(|x| x.chance).collect());
+    row("leaves", fats.iter().map(|x| x.leaves).collect());
+
+    let mut by_pending: std::collections::BTreeMap<String, (usize, usize, usize)> =
+        std::collections::BTreeMap::new();
+    for (p, cells) in &pending {
+        let e = by_pending.entry(p.clone()).or_insert((0, 0, 0));
+        e.0 += 1;
+        e.1 += *cells;
+        e.2 = e.2.max(*cells);
+    }
+    println!("\n== first expansion by pending ==");
+    for (p, (n, sum, max)) in &by_pending {
+        println!(
+            "{p:<40} n={n:<4} mean_cells={:<8.0} max_cells={max}",
+            *sum as f64 / *n as f64
+        );
+    }
+
+    print_fat("fattest first expansions by cells", &mut fats, |f| f.shape.cells);
+    print_fat("fattest first expansions by draws", &mut fats, |f| f.shape.draws);
 
     for &s in &sizes {
         let cfg = Cfg {
@@ -80,7 +290,6 @@ fn main() {
             budget: warchest::search::Budget::unbounded(),
             ..Default::default()
         };
-        let mut first: Vec<Shape> = Vec::new();
         let mut shapes: Vec<Shape> = Vec::new();
         let mut host: Vec<usize> = Vec::new();
         for (i, (st, belief)) in positions.iter().enumerate() {
@@ -93,24 +302,11 @@ fn main() {
                 belief.clone(),
                 Rng::new(i as u64 * 7 + 1),
             );
-            first.push(sv.shape());
             sv.collect(4);
             sv.run_alone();
             shapes.push(sv.shape());
             host.push(sv.host_bytes());
         }
-        println!(
-            "\n== first expansion ==\n{:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
-            "", "mean", "p50", "p90", "p99", "max", "max/p99%"
-        );
-        row("nodes", first.iter().map(|x| x.nodes).collect());
-        row("rows", first.iter().map(|x| x.rows).collect());
-        row("boards", first.iter().map(|x| x.boards).collect());
-        row("cells", first.iter().map(|x| x.cells).collect());
-        row("ncfg", first.iter().map(|x| x.ncfg).collect());
-        row("cidx", first.iter().map(|x| x.cidx).collect());
-        row("reach", first.iter().map(|x| x.reach).collect());
-        row("draws", first.iter().map(|x| x.draws).collect());
         println!(
             "\n== s={s} c=8 batch=8 ==\n{:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
             "", "mean", "p50", "p90", "p99", "max", "max/p99%"
