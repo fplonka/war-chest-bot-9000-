@@ -66,11 +66,7 @@ N_HEXES = warchest.N_HEXES
 # What `SolveFarm.collect` reports about the device rounds, cumulative
 # since the farm started. `rounds` is the denominator of the other three.
 ROUND_KEYS = ("rounds", "round_calls", "round_rows", "round_nanos", "budget_hits")
-
-# Fraction of the training GPU torch may hold. The farm carves whatever is
-# left. Set before the farm starts, and reserved by a live tensor so
-# `mem_get_info` sees it.
-TRAIN_FRAC = 0.25
+ENT_NAMES = ("node", "cell", "reach", "draw", "row", "board", "config", "cidx")
 
 
 def action_feats(pa):
@@ -594,10 +590,6 @@ def main():
     if args.gen_solves <= 0 or args.gen_workers <= 0:
         raise SystemExit("gen_solves and resolved gen_workers must be positive")
     torch.cuda.set_device(dev)
-    train_idx = int(str(args.device).split(":")[-1])
-    gen_idx = {int(d) for d in args.gen_devices.split(",") if d.strip() != ""}
-    if train_idx in gen_idx:
-        torch.cuda.set_per_process_memory_fraction(TRAIN_FRAC, dev)
     if args.train_stream_priority > 0:
         raise SystemExit("train_stream_priority must be zero or negative")
     if args.train_stream_priority < 0:
@@ -616,25 +608,30 @@ def main():
     next_decay = 0
     value.push()
     buf = Buffer(args.cap, args.cap * args.cfgs_per_row)
-    # Commit the replay pages so the farm carves what is actually left.
     buf.x.fill(0)
     import gpu_batch
     gpu_batch.warmup(dev)
     batcher = gpu_batch.make_batch
-    _torch_hold = None
-    if train_idx in gen_idx:
-        cap = int(TRAIN_FRAC * torch.cuda.get_device_properties(dev).total_memory)
-        used = torch.cuda.memory_allocated(dev)
-        # The CUDA context and the caching allocator sit outside
-        # `memory_allocated` but inside the fraction. Leave them, and a
-        # training step, unpinned.
-        extra = max(0, cap - used - (2048 << 20))
-        if extra:
-            _torch_hold = torch.empty(extra // 4, dtype=torch.float32, device=dev)
-        print(f"[train] torch holds {TRAIN_FRAC:.0%} of {dev} "
-              f"({cap / (1 << 20):.0f} MiB cap, {used / (1 << 20):.0f} allocated, "
-              f"{extra / (1 << 20):.0f} pinned); the farm carves the rest",
-              flush=True)
+    # One training step and one probe at the largest batch the run can make,
+    # so the caching allocator holds the peak before the farm carves.
+    torch.cuda.reset_peak_memory_stats(dev)
+    n = max(args.batch, 2048)
+    k = n * warchest.budget_for_s(args.s)[ENT_NAMES.index("config")]
+    x = torch.zeros(2 * n, PUBFEAT, device=dev)
+    phi = torch.zeros(k, CFEAT, device=dev)
+    w = torch.ones(k, device=dev)
+    seg = torch.arange(k, device=dev) % (2 * n)
+    y = torch.zeros(k, device=dev)
+    parts = (x, phi, w, seg, y, 2 * n, None)
+    opt.zero_grad(set_to_none=True)
+    losses(value, *parts, wp=0.0).backward()
+    opt.step()
+    forward_values(value, parts)
+    torch.cuda.synchronize(dev)
+    peak = torch.cuda.max_memory_reserved(dev)
+    print(f"[train] torch peak {peak / (1 << 20):.0f} MiB reserved on {dev} "
+          f"(batch={n} configs={k}); farm carves mem_get_info free",
+          flush=True)
     print(f"[train] search inference on cuda:{args.gen_devices}, "
           f"training on {dev}", flush=True)
 
@@ -716,6 +713,7 @@ def main():
         generated_rows = 0
         window = collections.Counter()
         totals = collections.Counter()
+        window_shapes = []
         # The farm's round counters are cumulative, so an epoch's figures are
         # the difference against the last report and not an average since the
         # farm started.
@@ -764,6 +762,7 @@ def main():
             window["gen_s"] += gen_s
             window["conv_s"] += conv_s
             window["add_s"] += add_s
+            window_shapes.extend(data.get("shapes") or [])
             for name in (
                     "games", "decisions", "horizon_hits",
                     "white_wins", "black_wins", "draws",
@@ -859,7 +858,24 @@ def main():
             rounds = max(now_at["rounds"] - round_at["rounds"], 1)
             per_round = {k: (now_at[k] - round_at[k]) / rounds
                          for k in ROUND_KEYS[1:]}
+            hits = now_at["budget_hits"] - round_at["budget_hits"]
             round_at = now_at
+            names = tuple(warchest.ENT_NAMES)
+            if window_shapes:
+                a = np.asarray(window_shapes, np.uint32)
+                def pct(col, q):
+                    v = np.sort(a[:, col])
+                    return int(v[int(round((len(v) - 1) * q))])
+                shape = {
+                    names[i]: {
+                        "p50": pct(i, 0.50),
+                        "p90": pct(i, 0.90),
+                        "max": int(a[:, i].max()),
+                    }
+                    for i in range(8)
+                }
+            else:
+                shape = {n: {"p50": 0, "p90": 0, "max": 0} for n in names}
             rec = {
                 "t": round(now - t0, 1),
                 "epoch": epoch,
@@ -936,12 +952,12 @@ def main():
                 "solves_per_s": round(raw_sps, 1),
                 "lr": opt.param_groups[0]["lr"],
                 "policy_loss": window["policy_sum"] / max(window["train_steps"], 1),
-                "budget_hits": int(now_at.get("budget_hits", 0)
-                                   - round_at.get("budget_hits", 0)),
+                "budget_hits": int(hits),
                 "slots": int(data.get("slots", 0)),
                 "slots_used": int(data.get("slots_used", 0)),
                 "slots_per_card": int(data.get("slots_per_card", 0)),
                 "slot_bytes": int(data.get("slot_bytes", 0)),
+                "shape": shape,
             }
             rec["budget_hit_rate"] = round(
                 rec["budget_hits"] / max(rec["solves"], 1), 3)
@@ -962,9 +978,11 @@ def main():
                 f"spc={rec['slots_per_card']} "
                 f"slot={rec['slot_bytes'] / (1 << 20):.1f}MiB "
                 f"hits={rec['budget_hits']} "
-                f"hit_rate={rec['budget_hit_rate']}",
+                f"hit_rate={rec['budget_hit_rate']} "
+                f"p90={'/'.join(str(shape[n]['p90']) for n in names)}",
                 flush=True)
             window.clear()
+            window_shapes.clear()
             epoch += 1
         # Dropping the farm stops its threads once they finish the solve they
         # are in, which is also what flushes their last rows.
