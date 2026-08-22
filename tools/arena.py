@@ -63,8 +63,13 @@ class Bot:
         # Both bots answer into one queue, so the referee waits until *either*
         # has something rather than on a particular one.
         self.replies = replies
+        if not (self.dir / "bot.json").exists():
+            raise SystemExit(f"{self.dir} is not a bot: no bot.json in it")
         self.spec = json.loads((self.dir / "bot.json").read_text())
         self.name = self.spec.get("name", self.dir.name)
+        if not os.access(self.dir / "bot", os.X_OK):
+            raise SystemExit(
+                f"{self.name}: {self.dir / 'bot'} is missing or not executable")
         # A bot directory is only self-contained if the binary in it is the
         # one its weights were trained against. Copying a newer build over an
         # archived bot leaves it running weights from one revision on an
@@ -87,9 +92,17 @@ class Bot:
                 argv += [flag, str(search[key])]
         if threads and "s" in search:
             argv += ["--threads", str(threads)]
-        self.proc = subprocess.Popen(
-            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
-            bufsize=1)
+        try:
+            self.proc = subprocess.Popen(
+                argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                bufsize=1)
+        except OSError as why:
+            # The usual cause is a binary built for another platform: the
+            # execute bit says nothing about the machine code behind it.
+            raise SystemExit(
+                f"{self.name}: {self.dir / 'bot'} cannot run on this host "
+                f"({why}). Rebuild it here from sha "
+                f"{self.spec.get('sha', '?')}.") from why
         hello = json.loads(self._line())
         if hello["protocol"] != PROTOCOL:
             raise SystemExit(
@@ -639,9 +652,23 @@ def write_json(path, value):
     os.replace(tmp, path)
 
 
+def hello(paths):
+    """Start each bot, read its greeting and stop it.
+
+    A ladder is worth nothing without its anchor, so whoever is about to run
+    one can check first that the anchor exists, can be executed on this host,
+    and speaks this referee's protocol and rules.
+    """
+    for path in paths:
+        bot = Bot(path, 0, queue.Queue())
+        print(f"{bot.name}: protocol {PROTOCOL}, runs on this host", flush=True)
+        bot.close()
+
+
 def ladder(paths, games, seed, concurrent, out_path):
     if games < 2 or games % 2:
         raise SystemExit("--games must be a positive even number")
+    hello(paths)
     specs = [json.loads((Path(p) / "bot.json").read_text()) for p in paths]
     names = [s.get("name", Path(p).name) for s, p in zip(specs, paths)]
     if len(set(names)) != len(names):
@@ -800,6 +827,9 @@ def main():
     tb.add_argument("--concurrent", type=int, default=32)
     tb.add_argument("--out", default="")
 
+    hi = sub.add_parser("hello", help="check bots can run here and speak this protocol")
+    hi.add_argument("bots", nargs="+")
+
     pk = sub.add_parser("pack", help="archive run snapshots as bots")
     pk.add_argument("run")
     pk.add_argument("--snapshot", default=None,
@@ -813,6 +843,8 @@ def main():
     if args.command == "pack":
         return pack(args.run, Path(args.bin).resolve(), Path(args.out),
                     args.snapshot, args.name)
+    if args.command == "hello":
+        return hello(args.bots)
     if args.command == "generate":
         return generate(args.bots, args.games, args.seed, args.concurrent,
                         args.out, args.depth, args.per_bucket,

@@ -974,9 +974,11 @@ def main():
         # only says which snapshot beats which other snapshot, which every run
         # can satisfy while learning nothing, so a missing or unrunnable anchor
         # is a failure rather than something to drop.
+        # `ladder` greets every bot before it plays any of them, so a greedy
+        # that is absent, unreadable or built for another platform stops the
+        # run here instead of being quietly left out.
         greedy = ROOT / "bots" / "greedy"
-        anchor = [str(greedy)] if (greedy / "bot.json").exists() else []
-        subprocess.run(arena + ["ladder", *anchor, *bots,
+        subprocess.run(arena + ["ladder", str(greedy), *bots,
                                 "--games", str(args.ladder_games),
                                 "--out", f"{args.out}/ladder.json"], check=True)
 

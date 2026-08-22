@@ -94,6 +94,16 @@ The same command rates one architecture against another, because a bot built at
 an old revision keeps playing after the source that produced it has been
 rewritten.
 
+`bots/greedy` is the anchor every run is quoted against, and it is a **binary,
+so each machine needs its own**. The `Greedy` mind was deleted from the engine
+at 260c88b, so it is built from **ed85b88**, the commit before: check that sha
+out into a scratch tree, `cargo build --release --bin bot` with no `gpu`
+feature, and copy the binary over `bots/greedy/bot`, then update the `binary`
+digest in `bots/greedy/bot.json` to match. `python tools/arena.py hello
+bots/greedy` starts it and prints its greeting; the ladder runs the same check
+on every bot before it plays, so an anchor from the wrong platform stops a run
+rather than being silently dropped.
+
 War Chest turns out to be an unusually good fit for this method. A player's
 private state is `(hand, face-down discards, pending forced-play coin)` — the
 bag is derived from a public reserve — and the reachable set has median 22 and
