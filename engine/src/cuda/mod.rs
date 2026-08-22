@@ -352,7 +352,7 @@ fn round_bytes(n_slots: usize, b: &Budget, s: u32) -> usize {
         + TILE * 4
         + TILE * CFEAT * f
         + TILE * 4
-        + n_slots * (b.cells + 8 * b.nodes) * 4
+        + n_slots * (b.cidx + b.cells + 8 * b.nodes) * 4
         + TILE * (4 + 4 + 8 + 4)
         + 4;
     leaf + trunk + w + mass + leaves + bag + stage
@@ -940,7 +940,10 @@ impl Card {
         stage.phi.dev = Arr::with_cap(s, TILE * CFEAT)?;
         stage.owner.dev = Arr::with_cap(s, TILE)?;
         stage.cfg_cards.dev = Arr::with_cap(s, n * CARD_ROWS * NTYPE * TYPE)?;
-        stage.blob.dev = Arr::with_cap(s, n * (b.cells + 8 * b.nodes))?;
+        // Trunk `cidx` and the tree description share this blob. A first
+        // round can send a slot's whole `cidx` plus the tree, so the cap is
+        // both, not the tree alone.
+        stage.blob.dev = Arr::with_cap(s, n * (b.cidx + b.cells + 8 * b.nodes))?;
         stage.at.dev = Arr::with_cap(s, TILE)?;
         stage.src.dev = Arr::with_cap(s, TILE)?;
         stage.dst.dev = Arr::with_cap(s, TILE)?;

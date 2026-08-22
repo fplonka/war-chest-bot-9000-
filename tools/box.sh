@@ -31,7 +31,7 @@ $*"; }
 
 case "${1:-}" in
 sync)
-    rsync -az --delete -e "ssh ${ssh_opts[*]}" \
+    rsync -azc --delete -e "ssh ${ssh_opts[*]}" \
         --exclude runs --exclude bots --exclude arena --exclude suites \
         --exclude target --exclude .venv --exclude papers \
         --exclude __pycache__ --exclude .git --exclude data \

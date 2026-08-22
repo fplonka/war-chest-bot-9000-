@@ -199,7 +199,9 @@ impl Tree {
             cell_row: u32(c)?,
             cell_val: u32(c)?,
             rev_base: u32(n)?,
-            rev_start: u32(c)?,
+            // CSR start indices, one per child-config plus a sentinel. That is
+            // `reach`, not `cells`.
+            rev_start: u32(r)?,
             rev_src: u32(c)?,
             rev_cell: u32(c)?,
             rvd_base: u32(n)?,

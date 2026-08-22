@@ -2388,6 +2388,11 @@ impl Solver {
                 return b;
             }
         }
+        if self.bounded && self.nboards >= self.cfg.budget.boards {
+            self.abandon = true;
+            self.budget_hit = true;
+            return 0;
+        }
         let b = self.nboards as u32;
         self.bmap.insert(key, b);
         self.nboards += 1;
@@ -2410,6 +2415,11 @@ impl Solver {
             let res = reserve(s, p as u8, &self.ctx);
             self.leaf_coff.push(self.leaf_cidx.len() as u32);
             for c in cfgs[p].iter() {
+                if self.bounded && self.leaf_cidx.len() >= self.cfg.budget.cidx {
+                    self.abandon = true;
+                    self.budget_hit = true;
+                    break;
+                }
                 let idx = self.intern_config(c, &res, p);
                 self.leaf_cidx.push(idx);
             }
@@ -2433,6 +2443,14 @@ impl Solver {
         }
         if let Some(&i) = self.cmap.get(&key) {
             return i;
+        }
+        // One leaf intern-loop can add hundreds of configs between two
+        // `runaway` checks. Cap here so the card never sees a table past the
+        // slot; the enclosing `grow` rewinds.
+        if self.ncfg >= self.cfg.budget.configs {
+            self.abandon = true;
+            self.budget_hit = true;
+            return 0;
         }
         let i = self.ncfg as u32;
         self.ncfg += 1;
@@ -2492,6 +2510,18 @@ impl Solver {
     /// order, so the resident state they write is there before the iteration
     /// reads it.
     fn growth_calls(&mut self) -> Vec<Call> {
+        let cap = self.cfg.budget.configs;
+        if self.ncfg > cap {
+            self.budget_hit = true;
+            self.ncfg = cap;
+            self.cplayer.truncate(cap);
+            self.cmap.retain(|_, i| (*i as usize) < cap);
+            for x in &mut self.leaf_cidx {
+                if *x as usize >= cap {
+                    *x = 0;
+                }
+            }
+        }
         let rows = self.leaf_rows.len();
         if rows == self.batch_rows && self.ncfg == self.batch_cfgs {
             return Vec::new();
@@ -2542,7 +2572,7 @@ impl Solver {
             });
             crate::prof::work(fresh_rows, 0, 0, 0);
         }
-        let fresh_cfgs = self.ncfg - self.batch_cfgs;
+        let fresh_cfgs = self.ncfg.saturating_sub(self.batch_cfgs);
         if fresh_cfgs > 0 {
             calls.push(Call::Configs {
                 solve: self.slot,
