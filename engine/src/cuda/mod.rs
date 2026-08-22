@@ -248,21 +248,9 @@ fn warp_rows(rows: usize) -> LaunchConfig {
     }
 }
 
-/// Independent streams a GPU is fed by.
-///
-/// Each is a whole copy of a card's working state -- its own stream, staging,
-/// scratch and solve table -- and the farm drives each with a thread of its
-/// own. One is not enough: a driver spends about three fifths of a round
-/// issuing launches rather than waiting for the card, so a single stream leaves
-/// the GPU idle through most of it. Measured on two 3090s at the production
-/// budget, generation runs at 21 solves/s with one stream a card and 75 to 86
-/// with ten.
-const STREAMS: usize = 10;
-
 pub struct Device {
-    /// One entry per stream, `STREAMS` of them per ordinal. Each is driven by
-    /// one thread, which is what makes a round a batch: everything that thread
-    /// found waiting goes in together.
+    /// One card per ordinal. The farm drives each with a thread of its own,
+    /// and a round is every solve that thread found waiting.
     cards: Vec<Card>,
     net: Net,
     slot_bytes: usize,
@@ -327,9 +315,9 @@ fn owed_by_the_join(l: &NetLayout, b: &[f32]) -> Vec<f32> {
 /// at this size when the card is carved, so a round cannot grow it.
 const TILE: usize = 16384;
 
-/// Bytes one stream allocates at carve besides the slots themselves: the tiled
-/// leaf pass, the tiled trunk/config/prior intermediates, and the scratch that
-/// scales with how many slots the stream holds.
+/// Bytes one card allocates at carve besides the slots themselves: the tiled
+/// leaf pass, the tiled trunk/config/prior intermediates, the scratch that
+/// scales with how many slots the card holds, and the batch index `lay` fills.
 fn round_bytes(n_slots: usize, b: &Budget, s: u32) -> usize {
     let f = 4;
     let leaf = 2 * TILE * (POOL + D + JW + JOIN_IN + JW) * f;
@@ -355,19 +343,14 @@ fn round_bytes(n_slots: usize, b: &Budget, s: u32) -> usize {
         + n_slots * (b.cells + 8 * b.nodes) * 4
         + TILE * (4 + 4 + 8 + 4)
         + 4;
-    leaf + trunk + w + mass + leaves + bag + stage
-}
-
-/// Device bytes `lay` and cuBLAS still take at run time, one stream. Reserved
-/// at carve, not allocated: those paths build a fresh buffer a round.
-fn ephemeral_bytes(n_slots: usize, b: &Budget) -> usize {
-    let u = 4;
-    let one = n_slots * DESC * 8
-        + n_slots * b.nodes * u
-        + n_slots * (2 * b.rows + 1) * u
-        + 2 * n_slots * b.rows * u
-        + n_slots * u;
-    3 * one + (64 << 20)
+    let batch = n_slots * DESC * 8
+        + n_slots * b.nodes * 4
+        + n_slots * (2 * b.rows + 1) * 4
+        + 2 * n_slots * b.rows * 4
+        + n_slots * 4
+        + n_slots * 4
+        + (12 * TILE + n_slots * b.cells) * 4;
+    leaf + trunk + w + mass + leaves + bag + stage + batch
 }
 
 /// Fill a staging buffer with exactly `src`.
@@ -424,14 +407,6 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy> Hos
         Ok(())
     }
 
-    /// The same, into a buffer of its own. `lay` needs this: a round can hold
-    /// three batches at once and they must not share device memory.
-    fn send_new(&mut self, stream: &Arc<CudaStream>) -> Res<CudaSlice<T>> {
-        let mut dst = unsafe { stream.alloc::<T>(self.len.max(1)) }.map_err(err)?;
-        self.send(stream, &mut dst)?;
-        Ok(dst)
-    }
-
     /// Send what was filled into `dst`, without waiting for it.
     fn send(&mut self, stream: &Arc<CudaStream>, dst: &mut CudaSlice<T>) -> Res<()> {
         if self.len == 0 {
@@ -457,6 +432,13 @@ struct Wire<T> {
 }
 
 impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default + Copy> Wire<T> {
+    fn with_cap(stream: &Arc<CudaStream>, cap: usize) -> Res<Wire<T>> {
+        let cap = cap.max(1);
+        let mut host = Host::default();
+        host.fill(stream, cap, |_| 0)?;
+        Ok(Wire { host, dev: Arr::with_cap(stream, cap)? })
+    }
+
     fn put(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -469,6 +451,10 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default +
         let dst = self.dev.buf.as_mut().expect("room");
         self.host.send(stream, dst)
     }
+
+    fn buf(&self) -> &CudaSlice<T> {
+        self.dev.buf.as_ref().expect("carved")
+    }
 }
 
 /// A work item packs the solve above the node's place inside its level. The
@@ -478,17 +464,22 @@ const WORK_BITS: u32 = 20;
 /// A set of solves laid out as one batch, and the device arrays that describe
 /// it. Every stage of an iteration reads these, so laying them out once is what
 /// makes a round of thirty solves one launch a stage rather than thirty.
+///
+/// The device arrays are carved once, at the card's slot count times the
+/// budget. `lay` fills them; it does not allocate.
 struct Batch {
-    trees: CudaSlice<u64>,
+    trees: Wire<u64>,
     /// One work item per (solve, node), bucketed by level: what a level's
     /// launch hands to its blocks. `level_at[l]` is where level `l`'s bucket
     /// starts.
-    work: CudaSlice<u32>,
+    work: Wire<u32>,
     level_at: Vec<u32>,
-    coff: CudaSlice<u32>,
-    part: CudaSlice<i32>,
-    local: CudaSlice<i32>,
-    base: CudaSlice<i32>,
+    coff: Wire<u32>,
+    part: Wire<i32>,
+    local: Wire<i32>,
+    base: Wire<i32>,
+    prime: Wire<u32>,
+    touched: Wire<i32>,
     /// Prefixes of the batch, one per solve count. The solves are laid out
     /// longest-running first, so the ones still owed an iteration are always a
     /// prefix -- and an iteration that fewer solves want is the same launch
@@ -496,6 +487,25 @@ struct Batch {
     upto: Vec<Prefix>,
     parts: u32,
     cells: usize,
+}
+
+impl Default for Batch {
+    fn default() -> Batch {
+        Batch {
+            trees: Wire::default(),
+            work: Wire::default(),
+            level_at: Vec::new(),
+            coff: Wire::default(),
+            part: Wire::default(),
+            local: Wire::default(),
+            base: Wire::default(),
+            prime: Wire::default(),
+            touched: Wire::default(),
+            upto: vec![Prefix::default()],
+            parts: 0,
+            cells: 0,
+        }
+    }
 }
 
 impl Batch {
@@ -584,6 +594,8 @@ struct Card {
     host: parking_lot::Mutex<Stage>,
     /// A round's writes, kept between rounds for the same reason.
     pack: parking_lot::Mutex<Pack>,
+    /// The batch index `lay` fills, carved once.
+    batch: parking_lot::Mutex<Batch>,
     /// Scratch for one pass, kept between rounds.
     ///
     /// A round's intermediates are hundreds of megabytes -- four hundred
@@ -644,23 +656,18 @@ impl Device {
         }
         let mut cards = ordinals
             .iter()
-            .flat_map(|&o| (0..STREAMS).map(move |k| (o, k)))
-            .map(|(o, k)| Card::new(o, &net, k > 0))
+            .map(|&o| Card::new(o, &net))
             .collect::<Res<Vec<_>>>()?;
         let budget = cfg.budget;
         cards[0].stream.context().bind_to_thread().map_err(err)?;
         let slot = Solve::at_budget(&cards[0].stream, &budget)?.bytes() as u64;
         let mut left = max_slots;
-        for o in 0..ordinals.len() {
-            let span = &mut cards[o * STREAMS..(o + 1) * STREAMS];
-            span[0].stream.context().bind_to_thread().map_err(err)?;
+        for (o, card) in cards.iter_mut().enumerate() {
+            card.stream.context().bind_to_thread().map_err(err)?;
             let free = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
             let tile = round_bytes(0, &budget, cfg.s) as u64;
-            let eph0 = ephemeral_bytes(0, &budget) as u64;
-            let per = slot
-                + (round_bytes(1, &budget, cfg.s) as u64).saturating_sub(tile)
-                + (ephemeral_bytes(1, &budget) as u64).saturating_sub(eph0);
-            let fit = free.saturating_sub(STREAMS as u64 * (tile + eph0)) / per.max(1);
+            let per = slot + (round_bytes(1, &budget, cfg.s) as u64).saturating_sub(tile);
+            let fit = free.saturating_sub(tile) / per.max(1);
             let n = (fit as usize).min(left);
             if o == 0 && n == 0 {
                 return Err(format!(
@@ -668,17 +675,8 @@ impl Device {
                 ));
             }
             left = left.saturating_sub(n);
-            let per_stream = n / STREAMS;
-            let extra = n % STREAMS;
-            for (k, card) in span.iter_mut().enumerate() {
-                // Remainder on stream 0, not one extra on each of the first
-                // `extra` streams: a test that pins several solves on card 0
-                // must find them all there, and a small `n` would otherwise
-                // give every stream a single slot.
-                let m = per_stream + if k == 0 { extra } else { 0 };
-                card.carve(m, &cfg)?;
-            }
-            span[0].stream.synchronize().map_err(err)?;
+            card.carve(n, &cfg)?;
+            card.stream.synchronize().map_err(err)?;
         }
         Ok(Device { cards, net, slot_bytes: slot as usize })
     }
@@ -688,12 +686,12 @@ impl Device {
         self.cards.len()
     }
 
-    /// Slots this stream holds. Admission is a pop from a free list of these.
+    /// Slots this card holds. Admission is a pop from a free list of these.
     pub fn slots(&self, card: usize) -> usize {
         self.cards[card].solves.lock().len()
     }
 
-    /// Slots across every stream.
+    /// Slots across every card.
     pub fn total_slots(&self) -> usize {
         (0..self.cards.len()).map(|c| self.slots(c)).sum()
     }
@@ -703,13 +701,12 @@ impl Device {
         self.slot_bytes
     }
 
-    /// Slots one physical card holds, all of its streams together.
+    /// Slots one physical card holds.
     pub fn slots_per_card(&self) -> usize {
-        let n = self.cards.len() / STREAMS;
-        if n == 0 {
+        if self.cards.is_empty() {
             0
         } else {
-            self.total_slots() / n
+            self.total_slots() / self.cards.len()
         }
     }
 
@@ -829,7 +826,7 @@ pub struct Resident {
 }
 
 impl Card {
-    fn new(ordinal: usize, net: &Net, own_stream: bool) -> Res<Card> {
+    fn new(ordinal: usize, net: &Net) -> Res<Card> {
         let ctx = CudaContext::new(ordinal).map_err(|e| format!("device {ordinal}: {e:?}"))?;
         // One stream per context and no sharing between them, so the read/write
         // events cudarc would otherwise create on every allocation buy nothing
@@ -849,13 +846,7 @@ impl Card {
             },
         )
         .map_err(|e| format!("nvrtc: {e:?}"))?;
-        // A stream past the first needs one of its own, or the two drivers
-        // serialise on the card they are meant to be filling in turn.
-        let stream = if own_stream {
-            ctx.new_stream().map_err(err)?
-        } else {
-            ctx.default_stream()
-        };
+        let stream = ctx.default_stream();
         let module = ctx.load_module(ptx).map_err(err)?;
         let k = Kernels::load(&module)?;
         let blas = CudaBlas::new(stream.clone()).map_err(err)?;
@@ -892,12 +883,13 @@ impl Card {
             solves: parking_lot::Mutex::new(Vec::new()),
             host: parking_lot::Mutex::new(Stage::default()),
             pack: parking_lot::Mutex::new(Pack::default()),
+            batch: parking_lot::Mutex::new(Batch::default()),
             scratch: parking_lot::Mutex::new(Scratch::default()),
             layout,
         })
     }
 
-    /// Allocate this stream's slots and the scratch they share, once.
+    /// Allocate this card's slots and the scratch they share, once.
     fn carve(&mut self, n: usize, cfg: &Cfg) -> Res<()> {
         if n == 0 {
             return Ok(());
@@ -934,19 +926,29 @@ impl Card {
         scratch.x = Arr::with_cap(s, TILE * N_HEXES * C)?;
         scratch.bag = Arr::with_cap(s, n * CARD_ROWS * NTYPE * 3 * POOL)?;
         let mut stage = Stage::default();
-        stage.xpub.dev = Arr::with_cap(s, TILE * PUBFEAT)?;
-        stage.cards.dev = Arr::with_cap(s, n * CARD_ROWS * NTYPE * TYPE)?;
-        stage.card_of_row.dev = Arr::with_cap(s, TILE)?;
-        stage.phi.dev = Arr::with_cap(s, TILE * CFEAT)?;
-        stage.owner.dev = Arr::with_cap(s, TILE)?;
-        stage.cfg_cards.dev = Arr::with_cap(s, n * CARD_ROWS * NTYPE * TYPE)?;
-        stage.blob.dev = Arr::with_cap(s, n * (b.cells + 8 * b.nodes))?;
-        stage.at.dev = Arr::with_cap(s, TILE)?;
-        stage.src.dev = Arr::with_cap(s, TILE)?;
-        stage.dst.dev = Arr::with_cap(s, TILE)?;
-        stage.start.dev = Arr::with_cap(s, TILE + 1)?;
+        stage.xpub = Wire::with_cap(s, TILE * PUBFEAT)?;
+        stage.cards = Wire::with_cap(s, n * CARD_ROWS * NTYPE * TYPE)?;
+        stage.card_of_row = Wire::with_cap(s, TILE)?;
+        stage.phi = Wire::with_cap(s, TILE * CFEAT)?;
+        stage.owner = Wire::with_cap(s, TILE)?;
+        stage.cfg_cards = Wire::with_cap(s, n * CARD_ROWS * NTYPE * TYPE)?;
+        stage.blob = Wire::with_cap(s, n * (b.cells + 8 * b.nodes))?;
+        stage.at = Wire::with_cap(s, TILE)?;
+        stage.src = Wire::with_cap(s, TILE)?;
+        stage.dst = Wire::with_cap(s, TILE)?;
+        stage.start = Wire::with_cap(s, TILE + 1)?;
+        let mut batch = Batch::default();
+        batch.trees = Wire::with_cap(s, n * DESC)?;
+        batch.work = Wire::with_cap(s, n * b.nodes)?;
+        batch.coff = Wire::with_cap(s, n * (2 * b.rows + 1))?;
+        batch.part = Wire::with_cap(s, n * b.rows)?;
+        batch.local = Wire::with_cap(s, n * b.rows)?;
+        batch.base = Wire::with_cap(s, n)?;
+        batch.prime = Wire::with_cap(s, 12 * TILE + n * b.cells)?;
+        batch.touched = Wire::with_cap(s, n)?;
         *self.host.lock() = stage;
         *self.scratch.lock() = scratch;
+        *self.batch.lock() = batch;
         *self.solves.lock() = solves;
         Ok(())
     }
@@ -1111,7 +1113,7 @@ impl Card {
     /// The slot the farm pinned this solve to. It was allocated at carve.
     fn slot<'g>(&self, g: &'g mut Vec<Solve>, solve: usize) -> &'g mut Solve {
         let n = g.len();
-        g.get_mut(solve).unwrap_or_else(|| panic!("solve {solve} pinned to a stream that holds {n} slots"))
+        g.get_mut(solve).unwrap_or_else(|| panic!("solve {solve} pinned to a card that holds {n} slots"))
     }
 
     // ----------------------------------------------------------------- trunk
@@ -1556,7 +1558,8 @@ impl Card {
             cells.extend_from_slice(c);
         }
         let m = node.len();
-        let batch = self.lay(&solves)?;
+        self.lay(&solves)?;
+        let mut batch = self.batch.lock();
         let mut i = 0usize;
         while i < m {
             let mut j = i;
@@ -1591,7 +1594,7 @@ impl Card {
                 &cells[cell0..cell1],
             ]
             .concat();
-            self.prior_tile(&batch, &flat, mc, na_c, cell1 - cell0, wide)?;
+            self.prior_tile(&mut batch, &flat, mc, na_c, cell1 - cell0, wide)?;
             i = j;
         }
         Ok(())
@@ -1599,7 +1602,7 @@ impl Card {
 
     fn prior_tile(
         &self,
-        batch: &Batch,
+        batch: &mut Batch,
         flat: &[u32],
         m: usize,
         na: usize,
@@ -1607,10 +1610,8 @@ impl Card {
         widest: u32,
     ) -> Res<()> {
         let s = &self.stream;
-        let dev = {
-            let mut stage = self.host.lock();
-            Self::alone(s, &mut stage.prime, flat)?
-        };
+        batch.prime.put(s, flat.len(), copy(flat))?;
+        let dev = batch.prime.buf();
         let at = |k: usize, n: usize| dev.slice(k..k + n);
         let (part_d, node_d, row_d) = (at(0, m), at(m, m), at(2 * m, m));
         let (act_at_d, cell_at_d, inv_d) = (at(3 * m, m), at(4 * m, m), at(5 * m, m));
@@ -1637,7 +1638,7 @@ impl Card {
         let proj = projected.buf.as_mut().unwrap();
         launch!(self, act_feats, na * AFEAT, &desc_d, &mut *feat, &na_i, &nkinds, &nslot, &nhex, &afeat)?;
         self.run(l.act_in, feat, na, &mut *z)?;
-        launch!(self, act_boards, m * D, &batch.trees, &part_d, &row_d, &mut *hbuf, &m_i, &d_i)?;
+        launch!(self, act_boards, m * D, batch.trees.buf(), &part_d, &row_d, &mut *hbuf, &m_i, &d_i)?;
         self.run(l.act_board, hbuf, m, &mut *proj)?;
         launch!(self, act_add, na * AW, &mut *z, proj, &act_node_d, &na_i, &aw_i)?;
         self.norm(l.norms[LN_ACT], na, true, &mut *z)?;
@@ -1652,7 +1653,7 @@ impl Card {
         unsafe {
             self.stream
                 .launch_builder(&self.k.prior)
-                .arg(&batch.trees).arg(&part_d).arg(&node_d).arg(&row_d)
+                .arg(batch.trees.buf()).arg(&part_d).arg(&node_d).arg(&row_d)
                 .arg(&act_at_d).arg(&cell_at_d).arg(&cells_d).arg(&*hbuf)
                 .arg(&inv_d).arg(&m_i).arg(&d_i)
                 .launch_unit(cfg)
@@ -1748,20 +1749,9 @@ impl Card {
         Ok(())
     }
 
-    /// Stage a small array through its page-locked buffer into a device buffer
-    /// of its own. A round can hold three batches at once, so these cannot
-    /// share one.
-    fn alone<T>(s: &Arc<CudaStream>, h: &mut Host<T>, v: &[T]) -> Res<CudaSlice<T>>
-    where
-        T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy,
-    {
-        h.fill(s, v.len(), copy(v))?;
-        h.send_new(s)
-    }
-
-    /// Lay a set of solves out as one batch.
-    fn lay(&self, solves: &[usize]) -> Res<Batch> {
-        let mut stage = self.host.lock();
+    /// Lay a set of solves out as one batch. Fills the card's arena; does not allocate.
+    fn lay(&self, solves: &[usize]) -> Res<()> {
+        let mut batch = self.batch.lock();
         // These are gathered into ordinary vectors first because the shape of
         // the batch is not known until every solve has been read. They are
         // small -- a descriptor apiece and an entry per leaf row.
@@ -1823,18 +1813,17 @@ impl Card {
         }
         level_at.push(work.len() as u32);
         let s = &self.stream;
-        Ok(Batch {
-            trees: Self::alone(s, &mut stage.desc, &desc)?,
-            work: Self::alone(s, &mut stage.work, &work)?,
-            level_at,
-            coff: Self::alone(s, &mut stage.lcoff, &coff)?,
-            part: Self::alone(s, &mut stage.part_of_row, &part_of_row)?,
-            local: Self::alone(s, &mut stage.local_row, &local_row)?,
-            base: Self::alone(s, &mut stage.base, &base)?,
-            upto,
-            parts: solves.len() as u32,
-            cells: cells as usize,
-        })
+        batch.trees.put(s, desc.len(), copy(&desc))?;
+        batch.work.put(s, work.len(), copy(&work))?;
+        batch.coff.put(s, coff.len(), copy(&coff))?;
+        batch.part.put(s, part_of_row.len(), copy(&part_of_row))?;
+        batch.local.put(s, local_row.len(), copy(&local_row))?;
+        batch.base.put(s, base.len(), copy(&base))?;
+        batch.level_at = level_at;
+        batch.upto = upto;
+        batch.parts = solves.len() as u32;
+        batch.cells = cells as usize;
+        Ok(())
     }
 
     /// A value pass under the reference strategy, for a whole batch: the
@@ -1845,7 +1834,7 @@ impl Card {
         let all = b.all();
         self.reaches(b, all, 1, false, 0)?;
         self.network(b, all)?;
-        self.terminals(&b.trees, all)?;
+        self.terminals(b.trees.buf(), all)?;
         self.backprop(b, all, 1, 0, Cfr::LINEAR)
     }
 
@@ -1933,7 +1922,8 @@ impl Card {
         let solves: Vec<usize> = order.iter().map(|&i| calls[i].solve()).collect();
         let t_marshal = mark.elapsed();
         let mark = std::time::Instant::now();
-        let b = self.lay(&solves).map_err(at("lay"))?;
+        self.lay(&solves).map_err(at("lay"))?;
+        let b = self.batch.lock();
         let t_up = mark.elapsed();
         let mark = std::time::Instant::now();
 
@@ -1956,7 +1946,7 @@ impl Card {
             let p = &b.upto[live];
             let it = iter as i32;
             self.network(&b, p).map_err(at("net"))?;
-            self.stage(8, || self.terminals(&b.trees, p)).map_err(at("terminals"))?;
+            self.stage(8, || self.terminals(b.trees.buf(), p)).map_err(at("terminals"))?;
             self.stage(9, || self.backprop(&b, p, 0, it, k)).map_err(at("backprop"))?;
             // The regret update moved both players' strategies, so the reaches
             // the next iteration reads are stale until they are pushed down
@@ -1967,7 +1957,7 @@ impl Card {
             // samples several times and the host grows all of them at once.
             if sims > 0 {
                 self.stage(10, || {
-                    self.expand(&b.trees, b.parts, sims, puct, iter, rounds)
+                    self.expand(b.trees.buf(), b.parts, sims, puct, iter, rounds)
                 })
                 .map_err(at("expand"))?;
             }
@@ -2032,7 +2022,8 @@ impl Card {
         // most of a CFR iteration, and one solve's leaves are a couple of
         // hundred rows, which no accelerator is interested in.
         let solves: Vec<usize> = mine.iter().map(|&i| calls[i].solve()).collect();
-        let all = self.lay(&solves)?;
+        self.lay(&solves)?;
+        let mut b = self.batch.lock();
         let touched: Vec<i32> = mine
             .iter()
             .map(|&i| match &calls[i] {
@@ -2040,8 +2031,8 @@ impl Card {
                 _ => unreachable!("read shard holds only read calls"),
             })
             .collect();
-        let touched_d = Self::alone(&self.stream, &mut self.host.lock().touched, &touched)?;
-        self.finish(&all, all.all(), &touched_d)?;
+        b.touched.put(&self.stream, touched.len(), copy(&touched))?;
+        self.finish(&b, b.all())?;
 
         // Only a solve that is collected pays for the values. Those are laid
         // out as their own batch so the pass runs over them alone.
@@ -2051,8 +2042,10 @@ impl Card {
                 Call::Read { vals_at, .. } if vals_at[0].1 > 0 || vals_at[1].1 > 0))
             .map(|&i| calls[i].solve())
             .collect();
+        drop(b);
         if !want.is_empty() {
-            self.value_pass(&self.lay(&want)?)?;
+            self.lay(&want)?;
+            self.value_pass(&self.batch.lock())?;
         }
 
         let g = self.solves.lock();
@@ -2102,7 +2095,7 @@ impl Card {
     /// which needs exactly the reaches this pass has just made current.
     fn reaches(&self, b: &Batch, p: &Prefix, avg: i32, also_avg: bool, iter: i32)
         -> Res<()> {
-        let (trees, work) = (&b.trees, &b.work);
+        let (trees, work) = (b.trees.buf(), b.work.buf());
         unsafe {
             self.stream
                 .launch_builder(&self.k.seed_reach)
@@ -2154,7 +2147,7 @@ impl Card {
             unsafe {
                 self.stream
                     .launch_builder(&self.k.backprop_sweep)
-                    .arg(&b.trees).arg(&b.work).arg(&at).arg(&level_i).arg(&avg).arg(&iter)
+                    .arg(b.trees.buf()).arg(b.work.buf()).arg(&at).arg(&level_i).arg(&avg).arg(&iter)
                     .arg(&k.alpha).arg(&k.beta).arg(&k.gamma).arg(&k.predict)
                     .launch_unit(Self::grid(p.items[level], 2))
             }
@@ -2172,7 +2165,7 @@ impl Card {
     #[allow(clippy::too_many_arguments)]
     fn network(&self, b: &Batch, p: &Prefix) -> Res<()> {
         let (trees, part_d, local_d, base_d, coff_d) =
-            (&b.trees, &b.part, &b.local, &b.base, &b.coff);
+            (b.trees.buf(), b.part.buf(), b.local.buf(), b.base.buf(), b.coff.buf());
         // The active solves are a prefix of the batch, so their leaf rows are a
         // prefix of the row arrays and the pass is the same launches over fewer
         // of them.
@@ -2369,7 +2362,8 @@ impl Card {
     /// The reference strategy, once the tree has stopped growing.
     /// `touched` is per solve: which players' running sums have moved, or `-1`
     /// for a solve that is not asking for this at all.
-    fn finish(&self, b: &Batch, p: &Prefix, touched: &CudaSlice<i32>) -> Res<()> {
+    fn finish(&self, b: &Batch, p: &Prefix) -> Res<()> {
+        let touched = b.touched.buf();
         for level in 0..p.items.len() {
             if p.items[level] == 0 {
                 continue;
@@ -2378,7 +2372,7 @@ impl Card {
             unsafe {
                 self.stream
                     .launch_builder(&self.k.finish)
-                    .arg(&b.trees).arg(&b.work).arg(&at).arg(&level_i).arg(touched)
+                    .arg(b.trees.buf()).arg(b.work.buf()).arg(&at).arg(&level_i).arg(touched)
                     .launch_unit(Self::grid(p.items[level], 1))
             }
             .map_err(err)?;
@@ -2408,19 +2402,6 @@ struct Stage {
     at: Wire<u32>,
     src: Wire<u32>,
     start: Wire<u32>,
-    /// The batch descriptors. These take a device buffer of their own per call,
-    /// because a round can hold three batches at once.
-    desc: Host<u64>,
-    work: Host<u32>,
-    lcoff: Host<u32>,
-    part_of_row: Host<i32>,
-    local_row: Host<i32>,
-    base: Host<i32>,
-    touched: Host<i32>,
-    /// Everything `Card::priors` sends: the per-node arrays and then the two
-    /// pools, concatenated. Floats travel as their bits, as everything else a
-    /// round scatters does.
-    prime: Host<u32>,
 }
 
 /// The intermediates of one pass, by role. Each is fully written before it is
