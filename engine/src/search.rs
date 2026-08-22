@@ -200,24 +200,17 @@ impl Budget {
     }
 }
 
-/// The shape a solve at `SoG(512, 8)` is allowed: the ninetieth percentile
-/// `examples/shapes` measured over finished solves of real roots.
-///
-/// A slot is this large. Every expansion, including the first, is abandoned
-/// and rewound if it would pass any term. A first expansion that does not fit
-/// leaves the root a leaf: the network's own value, a uniform play. That is
-/// the same truncation as any later expansion; a decision node mid-Footman
-/// cannot be a leaf, so the whole expansion goes back rather than a partial
-/// one staying.
+/// The shape a solve at `SoG(512, 8)` is allowed: p90 of each entity count
+/// over finished solves in `runs/ent12` (epochs after t=60, max of those p90s).
 const BUDGET_512: Budget = Budget {
-    nodes: 24_582,
-    rows: 14_516,
-    boards: 8_518,
-    configs: 1_074,
-    cidx: 393_199,
-    reach: 665_872,
-    cells: 309_432,
-    draws: 400_000,
+    nodes: 21_908,
+    rows: 13_140,
+    boards: 8_514,
+    configs: 1_070,
+    cidx: 392_832,
+    reach: 597_000,
+    cells: 202_133,
+    draws: 310_826,
 };
 
 #[derive(Clone, Copy)]
