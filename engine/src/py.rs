@@ -740,6 +740,8 @@ impl SolveFarm {
         // the largest a solve has grown to in host bytes.
         dict.set_item("slots", s.slots())?;
         dict.set_item("slots_used", s.used())?;
+        dict.set_item("slots_per_card", s.slots_per_card())?;
+        dict.set_item("slot_bytes", s.slot_bytes())?;
         dict.set_item("budget_hits", s.budget_hits())?;
         Ok(out)
     }

@@ -940,6 +940,8 @@ def main():
                                    - round_at.get("budget_hits", 0)),
                 "slots": int(data.get("slots", 0)),
                 "slots_used": int(data.get("slots_used", 0)),
+                "slots_per_card": int(data.get("slots_per_card", 0)),
+                "slot_bytes": int(data.get("slot_bytes", 0)),
             }
             rec["budget_hit_rate"] = round(
                 rec["budget_hits"] / max(rec["solves"], 1), 3)
@@ -955,7 +957,12 @@ def main():
                 f"Lp={rec['policy_loss']:.3f} "
                 f"tgt={target_mean:+.3f}/{target_var ** 0.5:.3f} "
                 f"gen={gen_s:.2f}s train={train_s:.2f}s "
-                f"gpu={window['gpu_forward_s'] + window['gpu_backward_s']:.2f}s",
+                f"gpu={window['gpu_forward_s'] + window['gpu_backward_s']:.2f}s "
+                f"slots={rec['slots_used']}/{rec['slots']} "
+                f"spc={rec['slots_per_card']} "
+                f"slot={rec['slot_bytes'] / (1 << 20):.1f}MiB "
+                f"hits={rec['budget_hits']} "
+                f"hit_rate={rec['budget_hit_rate']}",
                 flush=True)
             window.clear()
             epoch += 1
