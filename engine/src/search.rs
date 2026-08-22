@@ -212,17 +212,17 @@ impl Budget {
 /// measured over a corpus of real roots. The other terms are a first
 /// expansion: that one is not a budget, because a root that stayed a leaf has
 /// no strategy, so the slot has to hold it. Measured on the training farm at
-/// `s = 512`: a first expansion interned 2096 configs, wrote 262649 cells,
-/// 393223 cidx, 1052788 reach or draws, 724360 draws. `budget_hits` is then
-/// the later expansions that would have grown past this.
+/// `s = 512`: a first expansion interned 2096 configs, wrote 540709 cells,
+/// 393223 cidx, 1052788 reach or draws. `budget_hits` is then the later
+/// expansions that would have grown past this.
 const BUDGET_512: Budget = Budget {
     nodes: 24_582,
     rows: 14_516,
     boards: 8_518,
     configs: 4_096,
-    cidx: 524_288,
+    cidx: 1_048_576,
     reach: 2_097_152,
-    cells: 524_288,
+    cells: 1_048_576,
     draws: 2_097_152,
 };
 
