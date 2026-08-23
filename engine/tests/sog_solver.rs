@@ -835,6 +835,34 @@ fn a_solve_never_grows_past_its_budget() {
     eprintln!("{hits} of {checked} solves reached the budget");
 }
 
+#[test]
+fn a_root_range_is_not_limited_by_the_search_budget() {
+    let nets = Arc::new(Nets::default());
+    for seed in 0..1_000 {
+        let Some(s) = micro_position(seed, 60 + seed as usize % 120, 3) else {
+            continue;
+        };
+        let ctx = Ctx::new(&s);
+        let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
+        if bel.iter().map(Belief::len).sum::<usize>() <= 2 {
+            continue;
+        }
+        let mut budget = Budget::unbounded();
+        budget.configs = 1;
+        let sv = Solver::new(
+            &s,
+            ctx,
+            Arc::clone(&nets),
+            Cfg { budget, ..Default::default() },
+            bel,
+            Rng::new(seed),
+        );
+        assert!(!sv.nodes.is_empty());
+        return;
+    }
+    panic!("no root with a nontrivial range found");
+}
+
 fn roomy_budget() -> Budget {
     Budget {
         nodes: 1_000_000,

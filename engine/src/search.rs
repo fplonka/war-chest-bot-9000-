@@ -123,9 +123,7 @@ impl Budget {
             nodes: k(BUDGET_512.nodes),
             rows: k(BUDGET_512.rows),
             boards: k(BUDGET_512.boards),
-            // A root range is set by the game, not by the search budget. It
-            // must fit before growth can decide to stop.
-            configs: k(BUDGET_512.configs).max(BUDGET_512.configs),
+            configs: k(BUDGET_512.configs),
             cidx: k(BUDGET_512.cidx),
             reach: k(BUDGET_512.reach),
             cells: k(BUDGET_512.cells),
@@ -1449,10 +1447,14 @@ impl Solver {
         root: &State,
         ctx: Ctx,
         nets: Arc<Nets>,
-        cfg: Cfg,
+        mut cfg: Cfg,
         belief: [Belief; 2],
         rng: Rng,
     ) -> Solver {
+        // Search growth may stop at its measured config budget, but the root
+        // is input. Its two supports must fit before growth starts.
+        let root_configs = belief.iter().map(Belief::len).sum();
+        cfg.budget.configs = cfg.budget.configs.max(root_configs);
         let cfgs: [Arc<[Config]>; 2] = [
             belief[0].cfg.as_slice().into(),
             belief[1].cfg.as_slice().into(),
