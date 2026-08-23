@@ -2,6 +2,7 @@
 //!
 //!   cargo run --release --example shapes -- [roots] [s... | first]
 use std::sync::Arc;
+use std::time::Instant;
 use warchest::pbs::{enumerate_configs, reserve, true_config, Belief, Ctx};
 use warchest::rng::Rng;
 use warchest::search::{Cfg, Cfr, Nets, Shape, Solver};
@@ -68,6 +69,41 @@ fn row(name: &str, mut v: Vec<usize>) {
         pct(&v, 1.0),
         pct(&v, 1.0) * 100 / pct(&v, 0.99).max(1),
     );
+}
+
+/// Coin-play depth, round depth (draw_steps on the deepest path), then
+/// chance / walked-through / decision-leaf counts.
+fn mix(sv: &Solver) -> (usize, usize, usize, usize, usize) {
+    let n = sv.nodes.len();
+    let mut chance_n = 0usize;
+    let mut walked_n = 0usize;
+    let mut dleaf_n = 0usize;
+    for i in 0..n {
+        let nd = &sv.nodes[i];
+        let st = &sv.states[i];
+        if nd.chance {
+            chance_n += 1;
+        } else if nd.leaf && st.is_valued() {
+            dleaf_n += 1;
+        } else if !nd.leaf && !st.is_valued() {
+            walked_n += 1;
+        }
+    }
+    fn rec(sv: &Solver, i: usize, coin: usize, round: usize) -> (usize, usize) {
+        let st = &sv.states[i];
+        let nd = &sv.nodes[i];
+        let coin = coin + usize::from(matches!(st.pending(), Cont::MainPlay));
+        let round = round + if nd.chance { (nd.draw_steps as usize).max(1) } else { 0 };
+        let mut best = (coin, round);
+        for &ch in &nd.child {
+            let (c, r) = rec(sv, ch, coin, round);
+            best.0 = best.0.max(c);
+            best.1 = best.1.max(r);
+        }
+        best
+    }
+    let (d_coin, d_round) = if n == 0 { (0, 0) } else { rec(sv, 0, 0, 0) };
+    (d_coin, d_round, chance_n, walked_n, dleaf_n)
 }
 
 struct Fat {
@@ -185,6 +221,7 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     let roots: usize = a.get(1).and_then(|x| x.parse().ok()).unwrap_or(96);
     let first_only = a.iter().any(|x| x == "first");
+    let skip_first = a.iter().any(|x| x == "nofirst");
     let sizes: Vec<u32> = if first_only {
         vec![]
     } else if a.len() > 2 {
@@ -212,6 +249,9 @@ fn main() {
     let positions: Vec<_> = all.into_iter().step_by(step).take(roots).collect();
     println!("{} roots from {} random games ({} plies kept)", positions.len(), 64, positions.len() * step);
 
+    if skip_first {
+        println!("(skipping first-expansion census)");
+    } else {
     let cfg = Cfg {
         s: 1,
         c: 1.0,
@@ -281,6 +321,7 @@ fn main() {
 
     print_fat("fattest first expansions by cells", &mut fats, |f| f.shape.cells);
     print_fat("fattest first expansions by draws", &mut fats, |f| f.shape.draws);
+    }
 
     for &s in &sizes {
         let cfg = Cfg {
@@ -292,8 +333,15 @@ fn main() {
         };
         let mut shapes: Vec<Shape> = Vec::new();
         let mut host: Vec<usize> = Vec::new();
+        let mut coin_d = Vec::new();
+        let mut round_d = Vec::new();
+        let mut chance_p = Vec::new();
+        let mut walked_p = Vec::new();
+        let mut dleaf_p = Vec::new();
+        let mut ms = Vec::new();
         for (i, (st, belief)) in positions.iter().enumerate() {
             let ctx = warchest::pbs::Ctx::new(st);
+            let t0 = Instant::now();
             let mut sv = Solver::new(
                 st,
                 ctx,
@@ -304,8 +352,19 @@ fn main() {
             );
             sv.collect(4);
             sv.run_alone();
+            ms.push(t0.elapsed().as_millis() as usize);
+            let n = sv.nodes.len().max(1);
+            let (dc, dr, ch, wk, dl) = mix(&sv);
+            coin_d.push(dc);
+            round_d.push(dr);
+            chance_p.push(ch * 100 / n);
+            walked_p.push(wk * 100 / n);
+            dleaf_p.push(dl * 100 / n);
             shapes.push(sv.shape());
             host.push(sv.host_bytes());
+            if i % 8 == 0 {
+                eprintln!("s={s} root {i}/{} {}ms nodes={}", positions.len(), ms[i], n);
+            }
         }
         println!(
             "\n== s={s} c=8 batch=8 ==\n{:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
@@ -323,6 +382,12 @@ fn main() {
         row("vals", shapes.iter().map(|x| x.vals).collect());
         row("draws", shapes.iter().map(|x| x.draws).collect());
         row("depth", shapes.iter().map(|x| x.depth).collect());
+        row("coin_d", coin_d);
+        row("round_d", round_d);
+        row("chance%", chance_p);
+        row("walked%", walked_p);
+        row("dleaf%", dleaf_p);
+        row("ms", ms);
         row("host_KB", host.iter().map(|x| x / 1024).collect());
     }
 }
