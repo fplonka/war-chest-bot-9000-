@@ -58,6 +58,161 @@ use std::sync::Arc;
 /// points of the same stream ever after.
 pub const TRIES: usize = 4;
 
+/// One of the eight things a solve grows. A slot is eight allocations, one
+/// per entity, each `cap × nfields × 4` bytes. Host and device both ask
+/// `Budget::reserve` before an append.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Ent {
+    Node = 0,
+    Cell = 1,
+    Reach = 2,
+    Draw = 3,
+    Row = 4,
+    Board = 5,
+    Config = 6,
+    Cidx = 7,
+}
+
+impl Ent {
+    pub const ALL: [Ent; 8] = [
+        Ent::Node,
+        Ent::Cell,
+        Ent::Reach,
+        Ent::Draw,
+        Ent::Row,
+        Ent::Board,
+        Ent::Config,
+        Ent::Cidx,
+    ];
+    pub const NAME: [&'static str; 8] = [
+        "node", "cell", "reach", "draw", "row", "board", "config", "cidx",
+    ];
+    pub fn name(self) -> &'static str {
+        Self::NAME[self as usize]
+    }
+}
+
+/// What one solve may hold, in the eight entities it owns.
+///
+/// A slot is allocated once at this size and reused by every solve that ever
+/// runs in it, so this is a *bound* and not a forecast. An expansion that
+/// would take the solve past any of these is abandoned exactly as one that
+/// runs away past `EXPANSION_CAP` is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    pub nodes: usize,
+    pub rows: usize,
+    pub boards: usize,
+    pub configs: usize,
+    pub cidx: usize,
+    pub reach: usize,
+    pub cells: usize,
+    pub draws: usize,
+}
+
+impl Budget {
+    /// The budget for a solve of `s` expansions.
+    ///
+    /// `s` counts distinct expansions and an expansion adds a bounded piece of
+    /// tree, so every term is linear in it. `BUDGET_512` is measured; this is
+    /// that one proportion, and it is the only arithmetic in the design.
+    pub fn for_s(s: u32) -> Budget {
+        let k = |at512: usize| (at512 * s as usize / 512).max(1);
+        Budget {
+            nodes: k(BUDGET_512.nodes),
+            rows: k(BUDGET_512.rows),
+            boards: k(BUDGET_512.boards),
+            configs: k(BUDGET_512.configs),
+            cidx: k(BUDGET_512.cidx),
+            reach: k(BUDGET_512.reach),
+            cells: k(BUDGET_512.cells),
+            draws: k(BUDGET_512.draws),
+        }
+    }
+}
+
+impl Default for Budget {
+    fn default() -> Budget {
+        Budget::for_s(512)
+    }
+}
+
+impl Budget {
+    /// No budget at all.
+    ///
+    /// `Solver::grow_full` builds a whole subgame for the CPU oracle to compare
+    /// against, and a bound on that is a bound on the reference. Nothing a run
+    /// uses takes this: it is the tests' way of saying they want the whole
+    /// game, and saying it out loud rather than through a second growth path.
+    pub fn unbounded() -> Budget {
+        Budget {
+            nodes: usize::MAX,
+            rows: usize::MAX,
+            boards: usize::MAX,
+            configs: usize::MAX,
+            cidx: usize::MAX,
+            reach: usize::MAX,
+            cells: usize::MAX,
+            draws: usize::MAX,
+        }
+    }
+}
+
+impl Budget {
+    pub fn cap(&self, e: Ent) -> usize {
+        match e {
+            Ent::Node => self.nodes,
+            Ent::Cell => self.cells,
+            Ent::Reach => self.reach,
+            Ent::Draw => self.draws,
+            Ent::Row => self.rows,
+            Ent::Board => self.boards,
+            Ent::Config => self.configs,
+            Ent::Cidx => self.cidx,
+        }
+    }
+
+    /// The one guard. False when `n` does not fit this entity.
+    pub fn reserve(&self, e: Ent, n: usize) -> bool {
+        n <= self.cap(e)
+    }
+
+    /// Host bytes a device-resident solve holds at this budget, from the Vec
+    /// capacities it would reserve. The card keeps the CFR arenas.
+    pub fn host_slot_bytes(&self) -> usize {
+        fn cap<T>(n: usize) -> usize {
+            Vec::<T>::with_capacity(n).capacity() * std::mem::size_of::<T>()
+        }
+        cap::<TNode>(self.nodes)
+            + cap::<crate::state::State>(self.nodes)
+            + cap::<u32>(self.nodes) * 8
+            + cap::<u32>(self.cidx)
+            + cap::<u32>(self.rows) * 4
+            + cap::<f32>(self.cells)
+            + cap::<u32>(self.cells) * 6
+            + cap::<u32>(self.reach)
+            + cap::<u32>(self.draws) * 3
+            + cap::<f32>(self.boards * crate::pbs::PUBFEAT) * 2
+            + cap::<f32>(self.configs * crate::pbs::CFEAT)
+            + cap::<f32>(self.rows * crate::net::D)
+            + cap::<f32>(self.configs * crate::net::D)
+    }
+}
+
+/// The shape a solve at `SoG(512, 8)` is allowed: p90 of each entity count
+/// over finished solves in `runs/unc5` (epochs after t=60, max of those p90s).
+const BUDGET_512: Budget = Budget {
+    nodes: 20_022,
+    rows: 13_116,
+    boards: 9_036,
+    configs: 2_914,
+    cidx: 512_130,
+    reach: 595_774,
+    cells: 201_815,
+    draws: 307_605,
+};
+
 #[derive(Clone, Copy)]
 pub struct Cfg {
     /// Expansions the whole solve makes — Student of Games' `s`.
@@ -133,6 +288,9 @@ pub struct Cfg {
     /// Games notes "can decrease weight of the prior in some games and
     /// encourage more exploration in the search phase".
     pub prior_temp: f32,
+    /// What one solve may hold, and so how large a slot is. Admission is a free
+    /// list because of this and nothing else.
+    pub budget: Budget,
 }
 
 impl Default for Cfg {
@@ -146,6 +304,7 @@ impl Default for Cfg {
             cfr: Cfr::SOG,
             puct: 1.5,
             prior_temp: 1.0,
+            budget: Budget::for_s(512),
         }
     }
 }
@@ -338,6 +497,22 @@ pub struct Shape {
     /// per iteration.
     pub cidx: usize,
     pub depth: usize,
+    /// The widest legal-action row in the tree: actions one config of one
+    /// decision node offers. `cells` is the sum of these over the tree, and
+    /// this is its tail.
+    pub acts: usize,
+    /// The largest config support at any node, over both players. The exact
+    /// maximum the game admits is 4 628 -- reserve (5,5,5,5,1), hand 3,
+    /// face-down 9 -- so this says how far a real tree is from it.
+    pub support: usize,
+    /// Reach entries: one per (node, player, config in support). `reach` is per
+    /// entry, `vals` is the larger of the two supports a node, and the `nc + 1`
+    /// offset arrays beside them are per entry too.
+    pub reach: usize,
+    pub vals: usize,
+    /// Draw-transition entries, forward and transposed: `draw_to`, `draw_p`,
+    /// `rvd_src` and `rvd_p` are per entry.
+    pub draws: usize,
 }
 
 
@@ -598,6 +773,7 @@ struct Mark {
     nodes: usize,
     ncells: usize,
     ncfg: usize,
+    ndraws: usize,
     leaf_rows: usize,
     nboards: usize,
     term_leaves: usize,
@@ -1080,6 +1256,14 @@ pub struct Solver {
     /// path there is no `Vec` to read them off.
     pub nreach: usize,
     pub nvals: usize,
+    /// Draw-transition entries over the whole tree, which the budget bounds and
+    /// the device's `draw_to` / `draw_p` / `rvd_src` / `rvd_p` are sized by.
+    pub ndraws: usize,
+    /// Which entities this solve ran out of, bit `1 << Ent`. The run counts
+    /// them. A budget is a percentile of a measured shape, and the count is
+    /// the only thing that can argue with the percentile chosen: it says how
+    /// often the tail is being truncated, and which term is doing it.
+    budget_hit: u8,
     pub(crate) roff: Vec<u32>,
     pub(crate) voff: Vec<u32>,
     /// `[node]` -> its row in the network batch, or `u32::MAX` for a node that
@@ -1289,6 +1473,8 @@ impl Solver {
             ncells: 0,
             nreach: 0,
             nvals: 0,
+            ndraws: 0,
+            budget_hit: 0,
             roff: Vec::new(),
             voff: Vec::new(),
             nc: Vec::new(),
@@ -1339,11 +1525,11 @@ impl Solver {
         sv.jp.clear();
         {
             let _t = timed!(BUILD);
-            // The root is born a leaf like every other node; `solve` grows it.
-            // Its own expansion is unbounded, because a root that stayed a leaf
-            // would leave the solve with no strategy to act on at all. The
-            // bound below is on how much of the *expansion budget* one leaf may
-            // take, and the root spends none of it.
+            // The root is born a leaf like every other node; `expand` grows it.
+            // The budget applies: a first expansion that would not fit the slot
+            // is abandoned, and the root stays a leaf. That is rare at this
+            // budget; a root that stayed a leaf has no strategy, and the farm
+            // still holds a tree that fits.
             sv.nodes.reserve(640);
             sv.cur.reserve(640);
             if let Some(h) = &mut sv.host {
@@ -1355,10 +1541,7 @@ impl Solver {
             // it is drawn here rather than by the round that sends it.
             sv.seed = Rng::new(sv.rng.next_u64()).0;
             let root = sv.push_node(crate::contract::NO_ROW, root.clone(), cfgs);
-            // A root that is a coin play would otherwise stay a leaf with no
-            // strategy to read, so the first expansion is unconditional.
-            sv.grow(root);
-            sv.seal(root, 1);
+            sv.expand(root);
             // The first CFR update and every expansion trajectory require
             // reaches for the tree that now exists. The card seeds and sweeps
             // its own, from the root beliefs the first tree call carries, so
@@ -1434,6 +1617,12 @@ impl Solver {
     fn push_node(&mut self, parent: u32, s: State, cfgs: [Arc<[Config]>; 2]) -> usize {
         let player = s.to_act();
         let terminal = s.is_terminal();
+        let (c0, c1) = (cfgs[0].len(), cfgs[1].len());
+        if !self.reserve(Ent::Node, self.nodes.len() + 1)
+            || !self.reserve(Ent::Reach, self.nreach + c0 + c1)
+        {
+            return parent as usize;
+        }
         let id = self.nodes.len();
         let _tp = timed!(BPUSH);
         self.nodes.push(TNode {
@@ -1465,7 +1654,6 @@ impl Solver {
         });
         drop(_tp);
         self.parent.push(parent);
-        let (c0, c1) = (cfgs[0].len(), cfgs[1].len());
         self.nc.push([c0 as u32, c1 as u32]);
         // No cells yet: a leaf has no strategy. `grow` appends its region.
         self.soff.push(self.ncells as u32);
@@ -1503,8 +1691,23 @@ impl Solver {
     /// none of those, so they ride free here exactly as they used to ride free
     /// inside a depth unit.
     fn push_child(&mut self, parent: usize, s: State, cfgs: [Arc<[Config]>; 2]) -> usize {
+        // The single funnel every node comes through, and so the only place the
+        // budget can bite exactly. The head of `grow` is not enough: a decision
+        // node pushes its whole fan-out of coin-play children here, and none of
+        // them recurses, so up to forty rows land between two of those checks.
+        //
+        // The parent is handed back rather than a new node. Nothing reads it:
+        // both callers test `abandon` on the next line and rewind.
+        if self.runaway() {
+            return parent;
+        }
         let stop = s.is_terminal() || matches!(s.pending(), Cont::MainPlay);
         let ch = self.push_node(parent as u32, s, cfgs);
+        // `runaway` is the start-of-step check; one row of cidx or one node's
+        // reach can land past the cap between two of those. The caller rewinds.
+        if self.runaway() {
+            return ch;
+        }
         if !stop {
             self.grow(ch);
         }
@@ -1581,10 +1784,52 @@ impl Solver {
 
     /// Whether the expansion in flight has spent its bound.
     fn runaway(&mut self) -> bool {
-        if self.nodes.len() >= self.limit {
+        if self.nodes.len() >= self.limit
+            || Ent::ALL.iter().any(|&e| !self.reserve(e, self.used(e) + 1))
+        {
             self.abandon = true;
         }
         self.abandon
+    }
+
+    /// Whether this solve ever ran out of budget. See `Solver::budget_hit`.
+    pub fn budget_hit(&self) -> bool {
+        self.budget_hit != 0
+    }
+
+    /// Bit `1 << Ent` for each entity this solve ran out of.
+    pub fn hit_mask(&self) -> u8 {
+        self.budget_hit
+    }
+
+    /// How many of this entity the solve holds.
+    pub fn used(&self, e: Ent) -> usize {
+        match e {
+            Ent::Node => self.nodes.len(),
+            Ent::Cell => self.ncells,
+            Ent::Reach => self.nreach,
+            Ent::Draw => self.ndraws,
+            Ent::Row => self.leaf_rows.len(),
+            Ent::Board => self.nboards,
+            Ent::Config => self.ncfg,
+            Ent::Cidx => self.leaf_cidx.len(),
+        }
+    }
+
+    /// The eight counts, in `Ent::ALL` order.
+    pub fn counts(&self) -> [u32; 8] {
+        Ent::ALL.map(|e| self.used(e) as u32)
+    }
+
+    /// Ensure this entity can hold `n` items. The one host-side guard.
+    fn reserve(&mut self, e: Ent, n: usize) -> bool {
+        if !self.cfg.budget.reserve(e, n) {
+            self.abandon = true;
+            self.budget_hit |= 1 << (e as u8);
+            false
+        } else {
+            true
+        }
     }
 
     /// Where every append-only arena stands.
@@ -1593,6 +1838,7 @@ impl Solver {
             nodes: self.nodes.len(),
             ncells: self.ncells,
             ncfg: self.ncfg,
+            ndraws: self.ndraws,
             leaf_rows: self.leaf_rows.len(),
             nboards: self.nboards,
             term_leaves: self.term_leaves.len(),
@@ -1612,8 +1858,10 @@ impl Solver {
     /// enclosing `grow`, so the whole expansion is undone up to the coin play
     /// it started from.
     fn rewind(&mut self, id: usize, m: Mark) {
-        self.nreach = self.roff[m.nodes] as usize;
-        self.nvals = self.voff[m.nodes] as usize;
+        if m.nodes < self.roff.len() {
+            self.nreach = self.roff[m.nodes] as usize;
+            self.nvals = self.voff[m.nodes] as usize;
+        }
         self.nodes.truncate(m.nodes);
         self.states.truncate(m.nodes);
         self.parent.truncate(m.nodes);
@@ -1638,6 +1886,7 @@ impl Solver {
         self.leaf_cidx.truncate(m.leaf_cidx);
         self.cur.truncate(m.ncells);
         self.ncells = m.ncells;
+        self.ndraws = m.ndraws;
         if let Some(h) = &mut self.host {
             h.reach.truncate(self.nreach);
             h.vals.truncate(self.nvals);
@@ -1655,7 +1904,25 @@ impl Solver {
         self.cmap.retain(|_, &mut i| (i as usize) < m.ncfg);
         self.ncfg = m.ncfg;
         self.grown.retain(|&g| (g as usize) < m.nodes && g != id as u32);
-        self.nodes[id].leaf = true;
+        let n = &mut self.nodes[id];
+        n.leaf = true;
+        n.chance = false;
+        n.draw = DrawMap::default();
+        n.draw_steps = 0;
+        n.acts.clear();
+        n.aslot.clear();
+        n.fdown.clear();
+        n.obs_child.clear();
+        n.obs_start.clear();
+        n.obs_act.clear();
+        n.child.clear();
+        n.legal_off.clear();
+        n.legal_action.clear();
+        n.legal_child.clear();
+        n.legal_trans.clear();
+        n.action_off.clear();
+        n.action_cell.clear();
+        n.cell_row.clear();
     }
 
     /// Give an expanded node its strategy cells, at the end of the arenas.
@@ -1835,6 +2102,12 @@ impl Solver {
             let n = &mut self.nodes[id];
             n.chance = true;
             n.child = vec![ch];
+            if !self.reserve(Ent::Draw, self.ndraws + draw.len()) {
+                self.rewind(id, mark);
+                return;
+            }
+            self.ndraws += draw.len();
+            let n = &mut self.nodes[id];
             n.draw = draw;
             n.draw_steps = steps;
             self.grown.push(id as u32);
@@ -2010,6 +2283,13 @@ impl Solver {
         n.action_off = action_off;
         n.action_cell = action_cell;
         n.cell_row = cell_row;
+        // The one term a `grow` at the head of the recursion cannot bound: a
+        // node's cells are appended after its whole subtree has been built, so
+        // several nodes' worth can land with no check between them.
+        if !self.reserve(Ent::Cell, self.ncells + self.nodes[id].legal_action.len()) {
+            self.rewind(id, mark);
+            return;
+        }
         self.alloc_cells(id);
         self.grown.push(id as u32);
     }
@@ -2148,6 +2428,9 @@ impl Solver {
                 return b;
             }
         }
+        if !self.reserve(Ent::Board, self.nboards + 1) {
+            return 0;
+        }
         let b = self.nboards as u32;
         self.bmap.insert(key, b);
         self.nboards += 1;
@@ -2170,6 +2453,12 @@ impl Solver {
             let res = reserve(s, p as u8, &self.ctx);
             self.leaf_coff.push(self.leaf_cidx.len() as u32);
             for c in cfgs[p].iter() {
+                if !self.reserve(Ent::Cidx, self.leaf_cidx.len() + 1) {
+                    break;
+                }
+                // A miss returns 0 and sets `abandon`; the index is still
+                // stored so the row's length matches `nc`. The enclosing
+                // `grow` rewinds.
                 let idx = self.intern_config(c, &res, p);
                 self.leaf_cidx.push(idx);
             }
@@ -2193,6 +2482,9 @@ impl Solver {
         }
         if let Some(&i) = self.cmap.get(&key) {
             return i;
+        }
+        if !self.reserve(Ent::Config, self.ncfg + 1) {
+            return 0;
         }
         let i = self.ncfg as u32;
         self.ncfg += 1;
@@ -2773,7 +3065,7 @@ impl Solver {
     /// trajectories that end on leaves growth may not touch, which is exactly
     /// the failure the deleted node ceiling used to cause.
     fn expansions_at(&self, i: usize) -> usize {
-        if self.nodes[0].exhausted {
+        if self.budget_hit() || self.nodes[0].exhausted {
             0
         } else {
             self.cfg.expansions_at(i)
@@ -2846,6 +3138,9 @@ impl Solver {
             }
             let grew = !taken.is_empty();
             for leaf in taken {
+                if self.budget_hit() {
+                    break;
+                }
                 self.expand(leaf);
             }
             if grew {
@@ -2892,6 +3187,9 @@ impl Solver {
                 for &leaf in &last.leaves.clone() {
                     if leaf == crate::contract::NO_ROW {
                         continue;
+                    }
+                    if self.budget_hit() {
+                        break;
                     }
                     self.expand(leaf as usize);
                 }
@@ -3375,6 +3673,19 @@ impl Solver {
     /// slice. Leaves the reference reaches in place so a caller can read
     /// beliefs off the tree; it must `restore` when it is done.
     fn value_pass(&mut self) -> [Vec<f32>; 2] {
+        // A root that stayed a leaf has no average strategy. The target is the
+        // network's own answer at this position, which is what the leaf pass
+        // already is.
+        if self.nodes[0].leaf {
+            let mut out = [Vec::new(), Vec::new()];
+            for p in 0..2usize {
+                self.leaf_values(p);
+                let n = self.nc[0][p] as usize;
+                let vo = self.voff[0] as usize;
+                out[p] = self.cfr().vals[vo..vo + n].to_vec();
+            }
+            return out;
+        }
         let reference = self.reference();
         self.propagate(&reference);
         let mut out = [Vec::new(), Vec::new()];
@@ -3799,6 +4110,21 @@ impl Solver {
             ncfg: self.ncfg,
             cidx: self.leaf_cidx.len(),
             depth: worst as usize,
+            acts: self
+                .nodes
+                .iter()
+                .flat_map(|n| n.legal_off.windows(2).map(|w| (w[1] - w[0]) as usize))
+                .max()
+                .unwrap_or(0),
+            support: self
+                .nodes
+                .iter()
+                .flat_map(|n| n.cfgs.iter().map(|c| c.len()))
+                .max()
+                .unwrap_or(0),
+            reach: self.nreach,
+            vals: self.nvals,
+            draws: self.nodes.iter().map(|n| n.draw.len()).sum(),
         }
     }
 

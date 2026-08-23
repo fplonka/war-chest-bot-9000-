@@ -529,7 +529,17 @@ impl Game {
                 }
             }
         }
-        let np = policy::at_node(sv, 0, n);
+        let np = if sv.nodes[0].legal_off.is_empty() {
+            // A first expansion that did not fit the slot left the root a leaf.
+            policy::uniform(
+                &self.s,
+                &self.ctx,
+                self.s.to_act(),
+                &self.bel[self.s.to_act() as usize].cfg,
+            )
+        } else {
+            policy::at_node(sv, 0, n)
+        };
         self.play(np);
     }
 
@@ -1038,7 +1048,7 @@ mod target_tests {
             query_rate: 0.0,
             recursive_rate: 0.0,
         };
-        let mut g = Game::new(Rng::new(0x51C4), &gc);
+        let mut g = Game::new(Rng::new(3), &gc);
         while let Some(mut sv) = g.next_solve(&nets) {
             let solved = sv.run_alone();
             g.play_solved(&sv, solved);

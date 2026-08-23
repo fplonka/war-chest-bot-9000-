@@ -322,8 +322,13 @@ impl Contract {
             }
         }
         self.levels_from(sv);
+        // A node created and grown in the same step is in both `grown` and
+        // `first..built`. Transpose it once; a second pass would append another
+        // copy of its reverse edges and the slot is not that large.
         for &g in grown {
-            self.transpose_children(sv, g as usize);
+            if (g as usize) < first {
+                self.transpose_children(sv, g as usize);
+            }
         }
         for i in first..self.built {
             self.transpose_children(sv, i);
