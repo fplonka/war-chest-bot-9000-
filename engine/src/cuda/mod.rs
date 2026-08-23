@@ -853,7 +853,7 @@ impl Device {
             // A first allocation on a cold context can include NVRTC scratch
             // in the free-memory delta, so a slot looks like the whole card
             // and the carve yields one. Warm, then measure a second probe.
-            drop(Solve::at_budget(s0, &budget)?);
+            drop(Solve::at_budget(&s0, &budget)?);
             s0.synchronize().map_err(err)?;
             let free0 = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
             let probe = Solve::at_budget(&s0, &budget)?;
