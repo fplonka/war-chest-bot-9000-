@@ -64,6 +64,9 @@ use crate::units::{write_card_features, CARD_FEATS, N_UNITS};
 pub const NSLOT: usize = 5;
 /// Hand size cap.
 pub const HAND_CAP: usize = 3;
+/// Largest private support one player can have. It is attained at reserve
+/// `(5, 5, 5, 5, 1)`, hand size three and nine face-down coins.
+pub const MAX_CONFIG_SUPPORT: usize = 4_628;
 
 // ------------------------------------------------------------ config features
 
@@ -1518,6 +1521,14 @@ mod enumerate_tests {
     use super::*;
     use crate::state::{Cont, State, BLACK, WHITE, Z_BAG, Z_INFLIGHT};
     use crate::units::{CROSSBOWMAN, PIKEMAN, ROYAL_COIN, SWORDSMAN, WARRIOR_PRIEST};
+
+    #[test]
+    fn config_support_has_a_fixed_maximum() {
+        assert_eq!(
+            enumerate_configs(&[5, 5, 5, 5, 1], 3, 9, false).len(),
+            MAX_CONFIG_SUPPORT
+        );
+    }
 
     #[test]
     fn set_config_accepts_enumerated_inflight_configs() {

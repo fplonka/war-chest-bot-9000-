@@ -1403,6 +1403,18 @@ impl Card {
 
     fn round(&self, calls: &[Call], mine: &[usize]) -> Res<Vec<(usize, Reply)>> {
         self.stream.context().bind_to_thread().map_err(err)?;
+        let mut slots: Vec<usize> = mine.iter().map(|&i| calls[i].solve()).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        {
+            let solves = self.solves.lock();
+            for &slot in &slots {
+                let solve = solves.get(slot).ok_or_else(|| {
+                    format!("round names solve slot {slot}, but only {} were carved", solves.len())
+                })?;
+                self.stream.wait(&solve.ready).map_err(err)?;
+            }
+        }
         let pick = |kind: usize| -> Vec<usize> {
             mine.iter()
                 .copied()
@@ -1433,6 +1445,12 @@ impl Card {
         self.wall(16, || self.priors(calls, &pick(2))).map_err(at("priors"))?;
         self.iterate(calls, &pick(3), &mut out).map_err(at("iterate"))?;
         self.read(calls, &pick(4), &mut out).map_err(at("read"))?;
+        {
+            let solves = self.solves.lock();
+            for &slot in &slots {
+                solves[slot].ready.record(&self.stream).map_err(err)?;
+            }
+        }
         Ok(out)
     }
 

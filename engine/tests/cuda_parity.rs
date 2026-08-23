@@ -271,6 +271,46 @@ fn run_solve(backend: &Backend, mut sv: Solver) -> (Solver, Option<Solved>) {
     }
 }
 
+/// A solve may move between a GPU's two pipeline streams between rounds. The
+/// stream that receives it must wait for the previous stream before it reads
+/// the resident arenas.
+#[test]
+fn a_solve_may_change_pipeline_streams() {
+    if Device::count() == 0 {
+        eprintln!("no cuda device; skipping");
+        return;
+    }
+    let net = random_net(0x9E37);
+    let device = Backend::Cuda(gpu(net.clone()));
+    let nets = Arc::new(Nets { value: net, device: true });
+    let fresh = || {
+        let mut data = Data::default();
+        GameStream::new(0x51E5, game_cfg(32, 0.0)).next_solve(&nets, &mut data)
+    };
+    let want = run_solve(&device, fresh()).1.expect("a finished solve");
+    let mut sv = fresh();
+    sv.pin(0);
+    let mut replies = Vec::new();
+    let mut lane = 0;
+    loop {
+        match sv.advance(&replies) {
+            Step::Calls(calls) => {
+                replies = device.run(&calls, lane).expect("the other pipeline answered");
+                lane ^= 1;
+            }
+            Step::Done(got) => {
+                let got = got.expect("a finished solve");
+                assert_eq!(want.policy.off, got.policy.off);
+                assert_eq!(want.policy.act, got.policy.act);
+                let bad = worst(&want.policy.p, &got.policy.p, "root policy");
+                assert!(bad < 1e-6, "the policy changed across streams by {bad:e}");
+                break;
+            }
+        }
+    }
+    device.run(&[], lane).expect("the context stayed healthy");
+}
+
 /// Largest relative difference, with an absolute floor so values near zero do
 /// not dominate the ratio.
 fn worst(a: &[f32], b: &[f32], what: &str) -> f32 {

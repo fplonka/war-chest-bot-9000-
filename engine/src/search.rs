@@ -122,7 +122,9 @@ impl Budget {
             nodes: k(BUDGET_512.nodes),
             rows: k(BUDGET_512.rows),
             boards: k(BUDGET_512.boards),
-            configs: k(BUDGET_512.configs),
+            // A percentile may bound growth, but it may not reject a root: a
+            // root without every information state has no valid strategy.
+            configs: k(BUDGET_512.configs).max(2 * crate::pbs::MAX_CONFIG_SUPPORT),
             cidx: k(BUDGET_512.cidx),
             reach: k(BUDGET_512.reach),
             cells: k(BUDGET_512.cells),
@@ -1458,8 +1460,20 @@ impl Solver {
         belief: [Belief; 2],
         rng: Rng,
     ) -> Solver {
-        let root_configs = belief.iter().map(Belief::len).sum();
-        cfg.budget.configs = cfg.budget.configs.max(root_configs);
+        let root_configs: usize = belief.iter().map(Belief::len).sum();
+        assert!(
+            root_configs <= 2 * crate::pbs::MAX_CONFIG_SUPPORT,
+            "root has {root_configs} configs, above the game's support bound"
+        );
+        if !nets.device {
+            cfg.budget.configs = cfg.budget.configs.max(root_configs);
+        } else {
+            assert!(
+                root_configs <= cfg.budget.configs,
+                "device slot holds {} configs but this root needs {root_configs}",
+                cfg.budget.configs
+            );
+        }
         let cfgs: [Arc<[Config]>; 2] = [
             belief[0].cfg.as_slice().into(),
             belief[1].cfg.as_slice().into(),

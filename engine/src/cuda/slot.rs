@@ -303,6 +303,10 @@ impl Entity {
 
 /// Everything one solve keeps on its card.
 pub struct Solve {
+    /// Completion of the last round that used this slot. Either pipeline may
+    /// run the next round, so its stream waits on this before touching an
+    /// arena and records it again before returning the round.
+    pub ready: cudarc::driver::CudaEvent,
     pub ent: [Entity; 8],
     pub host_coff: Vec<u32>,
     pub cells: usize,
@@ -320,7 +324,10 @@ pub struct Solve {
 
 impl Solve {
     pub fn at_budget(s: &Arc<CudaStream>, b: &Budget) -> Res<Solve> {
+        let ready = s.context().new_event(None).map_err(err)?;
+        ready.record(s).map_err(err)?;
         Ok(Solve {
+            ready,
             ent: [
                 Entity::with_cap(s, b.cap(Ent::Node), FIELDS[Ent::Node as usize])?,
                 Entity::with_cap(s, b.cap(Ent::Cell), FIELDS[Ent::Cell as usize])?,
