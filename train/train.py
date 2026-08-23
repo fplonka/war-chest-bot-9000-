@@ -72,8 +72,8 @@ def action_feats(pa):
     """The five stored bytes of each action into the head's one-hot input.
 
     The layout is the contract with `Net::action_feats`: kind, the coin slot it
-    spends with the last column meaning none, then the three squares it names
-    with the last column meaning no square.
+    spends as the one-hot column (`NSLOT` meaning none, already so in the row),
+    then the three squares it names with the last column meaning no square.
     """
     feat = np.zeros((len(pa), AFEAT), np.float32)
     if not len(pa):

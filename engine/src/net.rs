@@ -517,6 +517,17 @@ fn physical_rows(xpub: &[f32], rows: usize) -> Vec<f32> {
     out
 }
 
+/// The one-hot column of the coin slot an action spends: `-1`, a micro-decision
+/// that spends nothing, is the column past the last slot. A replay row stores
+/// this column as the action's slot byte, so the trainer reads it as is.
+pub fn slot_column(slot: i8) -> usize {
+    if slot < 0 {
+        NSLOT
+    } else {
+        slot as usize
+    }
+}
+
 impl Net {
     pub fn from_flat(w: &[f32], b: &[f32], ln: &[f32]) -> Result<Self, String> {
         let l = NetLayout::new();
@@ -986,9 +997,7 @@ impl Net {
         debug_assert_eq!(out.len(), AFEAT);
         out.fill(0.0);
         out[kind] = 1.0;
-        // `-1` lands in the slot past the last, which is the "spends nothing"
-        // column rather than a wrap.
-        out[N_KINDS + if slot < 0 { NSLOT } else { slot as usize }] = 1.0;
+        out[N_KINDS + slot_column(slot)] = 1.0;
         let mut at = N_KINDS + NSLOT + 1;
         for h in hexes {
             out[at + if h == NONE { N_HEXES } else { h as usize }] = 1.0;

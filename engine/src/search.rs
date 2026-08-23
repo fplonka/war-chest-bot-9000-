@@ -3988,7 +3988,7 @@ impl Solver {
                     let h = n.acts[a].hexes();
                     [
                         n.acts[a].kind() as u8,
-                        (n.aslot[a] + 1) as u8,
+                        crate::net::slot_column(n.aslot[a]) as u8,
                         h[0],
                         h[1],
                         h[2],
