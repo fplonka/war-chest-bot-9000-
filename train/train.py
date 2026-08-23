@@ -65,7 +65,7 @@ N_HEXES = warchest.N_HEXES
 
 # What `SolveFarm.collect` reports about the device rounds, cumulative
 # since the farm started. `rounds` is the denominator of the other three.
-ROUND_KEYS = ("rounds", "round_calls", "round_rows", "round_nanos")
+ROUND_KEYS = ("rounds", "round_calls", "round_rows", "round_nanos", "budget_hits")
 
 
 def action_feats(pa):
@@ -607,9 +607,33 @@ def main():
     next_decay = 0
     value.push()
     buf = Buffer(args.cap, args.cap * args.cfgs_per_row)
+    buf.x.fill(0)
     import gpu_batch
     gpu_batch.warmup(dev)
     batcher = gpu_batch.make_batch
+    # One training step and one probe at the largest batch the run can make,
+    # so the caching allocator holds the peak before the farm carves.
+    # 2048 is the intern-table floor: a 2048× table does not fit the encoder.
+    torch.cuda.reset_peak_memory_stats(dev)
+    names = tuple(warchest.ENT_NAMES)
+    per = warchest.budget_for_s(args.s)[names.index("config")]
+    n = max(args.batch, 2048)
+    k = args.batch * per
+    x = torch.zeros(2 * n, PUBFEAT, device=dev)
+    phi = torch.zeros(k, CFEAT, device=dev)
+    w = torch.ones(k, device=dev)
+    seg = torch.arange(k, device=dev) % (2 * n)
+    y = torch.zeros(k, device=dev)
+    parts = (x, phi, w, seg, y, 2 * n, None)
+    opt.zero_grad(set_to_none=True)
+    losses(value, *parts, wp=0.0).backward()
+    opt.step()
+    forward_values(value, parts)
+    torch.cuda.synchronize(dev)
+    peak = torch.cuda.max_memory_reserved(dev)
+    print(f"[train] torch peak {peak / (1 << 20):.0f} MiB reserved on {dev} "
+          f"(rows={n} configs={k}); farm carves mem_get_info free",
+          flush=True)
     print(f"[train] search inference on cuda:{args.gen_devices}, "
           f"training on {dev}", flush=True)
 
@@ -691,10 +715,12 @@ def main():
         generated_rows = 0
         window = collections.Counter()
         totals = collections.Counter()
+        window_shapes = []
         # The farm's round counters are cumulative, so an epoch's figures are
         # the difference against the last report and not an average since the
         # farm started.
         round_at = dict.fromkeys(ROUND_KEYS, 0)
+        ent_at = [0] * 8
         next_report = time.time() + 10.0
         next_target = sog_t0 + args.target_every * 60.0
 
@@ -739,6 +765,7 @@ def main():
             window["gen_s"] += gen_s
             window["conv_s"] += conv_s
             window["add_s"] += add_s
+            window_shapes.extend(data.get("shapes") or [])
             for name in (
                     "games", "decisions", "horizon_hits",
                     "white_wins", "black_wins", "draws",
@@ -834,7 +861,27 @@ def main():
             rounds = max(now_at["rounds"] - round_at["rounds"], 1)
             per_round = {k: (now_at[k] - round_at[k]) / rounds
                          for k in ROUND_KEYS[1:]}
+            hits = now_at["budget_hits"] - round_at["budget_hits"]
             round_at = now_at
+            names = tuple(warchest.ENT_NAMES)
+            now_ent = [int(x) for x in (data.get("entity_hits") or [0] * 8)]
+            ent_hits = [now_ent[i] - ent_at[i] for i in range(8)]
+            ent_at = now_ent
+            if window_shapes:
+                a = np.asarray(window_shapes, np.uint32)
+                def pct(col, q):
+                    v = np.sort(a[:, col])
+                    return int(v[int(round((len(v) - 1) * q))])
+                shape = {
+                    names[i]: {
+                        "p50": pct(i, 0.50),
+                        "p90": pct(i, 0.90),
+                        "max": int(a[:, i].max()),
+                    }
+                    for i in range(8)
+                }
+            else:
+                shape = {n: {"p50": 0, "p90": 0, "max": 0} for n in names}
             rec = {
                 "t": round(now - t0, 1),
                 "epoch": epoch,
@@ -911,7 +958,16 @@ def main():
                 "solves_per_s": round(raw_sps, 1),
                 "lr": opt.param_groups[0]["lr"],
                 "policy_loss": window["policy_sum"] / max(window["train_steps"], 1),
+                "budget_hits": int(hits),
+                "entity_hits": {names[i]: ent_hits[i] for i in range(8)},
+                "slots": int(data.get("slots", 0)),
+                "slots_used": int(data.get("slots_used", 0)),
+                "slots_per_card": int(data.get("slots_per_card", 0)),
+                "slot_bytes": int(data.get("slot_bytes", 0)),
+                "shape": shape,
             }
+            rec["budget_hit_rate"] = round(
+                rec["budget_hits"] / max(len(window_shapes), rec["solves"], 1), 3)
             log.append(rec)
             write_log(args, log, snaps)
             print(
@@ -924,9 +980,17 @@ def main():
                 f"Lp={rec['policy_loss']:.3f} "
                 f"tgt={target_mean:+.3f}/{target_var ** 0.5:.3f} "
                 f"gen={gen_s:.2f}s train={train_s:.2f}s "
-                f"gpu={window['gpu_forward_s'] + window['gpu_backward_s']:.2f}s",
+                f"gpu={window['gpu_forward_s'] + window['gpu_backward_s']:.2f}s "
+                f"slots={rec['slots_used']}/{rec['slots']} "
+                f"spc={rec['slots_per_card']} "
+                f"slot={rec['slot_bytes'] / (1 << 20):.1f}MiB "
+                f"hits={rec['budget_hits']} "
+                f"hit_rate={rec['budget_hit_rate']} "
+                f"ehits={'/'.join(str(ent_hits[i]) for i in range(8))} "
+                f"p90={'/'.join(str(shape[n]['p90']) for n in names)}",
                 flush=True)
             window.clear()
+            window_shapes.clear()
             epoch += 1
         # Dropping the farm stops its threads once they finish the solve they
         # are in, which is also what flushes their last rows.
