@@ -21,7 +21,6 @@ one where both bots played in the same run.
 import argparse
 import collections
 import hashlib
-import itertools
 import json
 import math
 import os
@@ -620,19 +619,12 @@ def tablebase(bot_paths, suite_dir, out_path, concurrent=32):
 # ---------------------------------------------------------------- the ladder
 
 def schedule(count):
-    """Every pairing, ordered so that consecutive ones keep a bot on the seat it
-    already holds. Starting a bot costs a weights load and a kernel build, so a
-    ladder that reseats one side at a time pays that far less often."""
-    pairs = list(itertools.combinations(range(count), 2))
-    out, seated = [], (None, None)
-    while pairs:
-        best = max(pairs, key=lambda p: sum(x in seated for x in p))
-        pairs.remove(best)
-        if best[1] == seated[0] or best[0] == seated[1]:
-            best = (best[1], best[0])
-        seated = best
-        out.append(best)
-    return out
+    """Play every snapshot against the anchor first and the final snapshot last.
+
+    Keeping each reference seated for its half avoids another weights load and
+    kernel build. Their own duplicate pairing is played only once."""
+    return ([(0, i) for i in range(1, count)]
+            + [(i, count - 1) for i in range(1, count - 1)])
 
 
 def report(names, paths, specs, records, performance, games, seed, complete,
@@ -894,7 +886,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="command", required=True)
 
-    lad = sub.add_parser("ladder", help="round robin over bot directories")
+    lad = sub.add_parser(
+        "ladder", help="snapshots against the first anchor and last final bot")
     lad.add_argument("bots", nargs="+")
     lad.add_argument("--games", type=int, default=200,
                      help="games per pairing, split evenly between colours")
