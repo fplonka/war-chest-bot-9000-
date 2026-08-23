@@ -31,6 +31,13 @@ CNORM = warchest.CNORM
 ROW_BYTES = warchest.ROW_BYTES
 
 
+def empty_policy():
+    return (np.zeros((0, warchest.ACT_BYTES), np.uint8),
+            np.zeros(0, np.int64), np.zeros(0, np.int64),
+            np.zeros(0, np.int64), np.zeros(0, np.float32),
+            np.zeros(0, np.int64))
+
+
 @torch.no_grad()
 def evaluate(net, parts, rng, dev):
     batch = make_batch(parts, rng, dev)
@@ -75,7 +82,7 @@ def main():
     tiny.clear()
     assert tiny.soff.size == 0
     dump_path = f"{out}/buffer.npz"
-    got, gcc, gcp, gcw, gcy, gseg = buf.ordered()
+    got, gcc, gcp, gcw, gcy, gseg, _ = buf.ordered()
     lo = buf.lo
     gsoff = np.concatenate([[0], buf.soff[(buf.soff > lo) & (buf.soff < buf.rows)] - lo,
                             [len(got)]])
@@ -94,18 +101,19 @@ def main():
 
     print("[4/6] solve-aligned split and batch assembly", flush=True)
     split = dmp.soff[-2]  # the newest solve block is the test set
-    tr = dmp.rows(0, split)
-    te = dmp.rows(split, len(dmp))
+    tr = (*dmp.rows(0, split), empty_policy())
+    te = (*dmp.rows(split, len(dmp)), empty_policy())
     rng = np.random.default_rng(0)
     b = make_batch(tr, rng, dev)
-    xpub, phi, w, seg, y, nseg = b
+    xpub, phi, w, seg, y, nseg, policy = b
     assert xpub.shape == (2 * len(tr[0]), PUBFEAT), xpub.shape
     assert phi.shape[1] == CFEAT
     assert seg.max() == 2 * len(tr[0]) - 1
     assert nseg == 2 * len(tr[0])
+    assert not len(policy[0]) and not len(policy[1])
     assert torch.isfinite(xpub).all() and torch.isfinite(y).all()
     trows, tcc, tcp = tr[0], tr[1], tr[2]
-    mirror.self_check_rows(trows, tcc, tcp, tr[-1])
+    mirror.self_check_rows(trows)
     mirror.self_check(xpub[0::2].numpy())
     print(f"      batch {xpub.shape} phi {phi.shape}", flush=True)
 

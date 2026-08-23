@@ -541,24 +541,10 @@ fn packed_row_expands_to_the_same_features() {
             if s.is_valued() {
                 let mut row = [0u8; ROW_BYTES];
                 pack_row(&s, &ctx, &mut row);
-                let mut hs = [0u8; 2];
-                let mut fd = [0u8; 2];
-                let mut bg = [0u8; 2];
-                for p in 0..2usize {
-                    let res = reserve(&s, p as u8, &ctx);
-                    let truth = true_config(&s, p as u8, &ctx);
-                    hs[p] = truth.hand_size();
-                    fd[p] = truth.fd_size();
-                    let mut bag = 0u8;
-                    for k in 0..NSLOT {
-                        bag += res[k] - truth.hand[k] - truth.fd[k];
-                    }
-                    bg[p] = bag;
-                }
                 let mut direct = vec![0.0f32; PUBFEAT];
                 write_public_features(&s, &ctx, &mut direct);
                 let mut expanded = vec![0.0f32; PUBFEAT];
-                expand_row(&row, &hs, &fd, &bg, &mut expanded);
+                expand_row(&row, &mut expanded);
                 assert_eq!(
                     direct, expanded,
                     "seed {}: packed row and live state encode differently",

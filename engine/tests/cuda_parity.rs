@@ -41,7 +41,10 @@ use warchest::contract::NO_ROW;
 use warchest::cuda::Device;
 use warchest::farm::{Backend, Call, Reply};
 use warchest::net::{Net, NetLayout};
-use warchest::pbs::{enumerate_configs, reserve, true_config, Belief, Ctx};
+use warchest::pbs::{
+    enumerate_configs, expand_row, pack_row, reserve, true_config, Belief, Ctx, PUBFEAT,
+    ROW_BYTES,
+};
 use warchest::rng::Rng;
 use warchest::search::{Arenas, Budget, Cfg, Nets, Solved, Solver, Step};
 use warchest::selfplay::{make_game, Agent, Collect, Data, GameCfg, GameStream};
@@ -112,6 +115,48 @@ fn gpu(net: Net) -> Device {
         4,
     )
     .expect("device")
+}
+
+#[test]
+fn packed_rows_expand_on_the_card() {
+    if Device::count() == 0 {
+        eprintln!("no cuda device; skipping");
+        return;
+    }
+    let mut rng = Rng::new(0xA11C_E55);
+    let mut rows = Vec::with_capacity(4096 * ROW_BYTES);
+    while rows.len() / ROW_BYTES < 4096 {
+        let mut state = make_game(&mut rng, true);
+        let ctx = Ctx::new(&state);
+        for _ in 0..160 {
+            if state.is_terminal() {
+                break;
+            }
+            if state.is_valued() {
+                let mirror = state.mirror();
+                for (s, c) in [(&state, ctx), (&mirror, ctx.mirrored())] {
+                    let at = rows.len();
+                    rows.resize(at + ROW_BYTES, 0);
+                    pack_row(s, &c, &mut rows[at..at + ROW_BYTES]);
+                }
+            }
+            let actions = state.legal_actions();
+            state.apply_inplace(actions[rng.below(actions.len())]);
+        }
+    }
+    rows.truncate(4096 * ROW_BYTES);
+    let mut want = vec![0.0; 4096 * PUBFEAT];
+    for (row, out) in rows.chunks_exact(ROW_BYTES).zip(want.chunks_exact_mut(PUBFEAT)) {
+        expand_row(row, out);
+    }
+    let got = gpu(random_net(13)).expand_rows(&rows).expect("expand rows");
+    for (i, (&a, &b)) in want.iter().zip(&got).enumerate() {
+        if a == 0.0 || a == 1.0 {
+            assert_eq!(a.to_bits(), b.to_bits(), "one-hot feature {i}");
+        } else {
+            assert!((a - b).abs() <= 1e-6, "scalar feature {i}: {a} vs {b}");
+        }
+    }
 }
 
 /// Run one game stream per `(seed, cfg)` against `backend`, every stream's

@@ -264,6 +264,34 @@ def offboard_pile_visibility(net, rng):
     print(f"off-board pile visibility ok: movement {movement:.3e}")
 
 
+def packed_row_cuda_parity():
+    """The Python entry point matches the Rust encoder on real mirrored rows."""
+    if not torch.cuda.is_available():
+        print("packed-row CUDA parity skipped: no CUDA device")
+        return
+    rows = np.frombuffer(bytes(warchest.mirror_row_pairs(128, 19)), np.uint8)
+    rows = rows.reshape(-1, warchest.ROW_BYTES)[:4096].copy()
+    assert len(rows) >= 2048, f"only {len(rows)} real rows"
+    want = np.asarray(warchest.expand_rows(rows.ravel()), np.float32)
+    want = want.reshape(len(rows), warchest.PUBFEAT)
+    device = torch.device("cuda:0")
+    packed = torch.as_tensor(np.ascontiguousarray(rows), device=device)
+    cards = torch.as_tensor(
+        np.asarray(warchest.card_features_table(), np.float32), device=device)
+    locations = torch.as_tensor(
+        np.asarray(warchest.hex_location_flags(), np.uint8), device=device)
+    got = torch.empty_like(torch.as_tensor(want, device=device))
+    stream = torch.cuda.current_stream(device)
+    warchest.expand_rows_cuda(
+        packed.data_ptr(), cards.data_ptr(), locations.data_ptr(), got.data_ptr(),
+        len(rows), stream.cuda_stream, 0)
+    got = got.cpu().numpy()
+    exact = (want == 0.0) | (want == 1.0)
+    assert np.array_equal(got[exact], want[exact]), "one-hot expansion drift"
+    np.testing.assert_allclose(got[~exact], want[~exact], rtol=0, atol=1e-6)
+    print(f"packed-row CUDA parity ok: {len(rows)} real rows, mirrors included")
+
+
 def main():
     rng = np.random.default_rng(11)
     net = random_net(7)
@@ -272,6 +300,7 @@ def main():
     policy_parity(net, rng)
     slot_invariance(net, rng)
     offboard_pile_visibility(net, rng)
+    packed_row_cuda_parity()
 
 
 if __name__ == "__main__":
