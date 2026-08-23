@@ -516,10 +516,6 @@ impl RoundCap {
     }
 }
 
-fn round_bytes(n_slots: usize, b: &Budget, s: u32) -> usize {
-    RoundCap::of(n_slots, b, s).bytes()
-}
-
 /// Fill a staging buffer with exactly `src`.
 fn copy<T: Copy>(src: &[T]) -> impl FnOnce(&mut [T]) -> usize + '_ {
     move |dst: &mut [T]| {
@@ -852,7 +848,7 @@ impl Device {
             let mut pair: Vec<Card> = (0..PIPELINE)
                 .map(|_| Card::on(&gpu, &net))
                 .collect::<Res<_>>()?;
-            let mut s0 = Arc::clone(&pair[0].stream);
+            let s0 = Arc::clone(&pair[0].stream);
             s0.context().bind_to_thread().map_err(err)?;
             let free0 = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
             let probe = Solve::at_budget(&s0, &budget)?;
@@ -865,52 +861,36 @@ impl Device {
                 slot_bytes = slot as usize;
             }
             let free = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
-            let tile = round_bytes(0, &budget, cfg.s) as u64;
-            let extra = (round_bytes(1, &budget, cfg.s) as u64).saturating_sub(tile);
+            let tile = Card::carve_bytes(0, &cfg);
+            let extra = Card::carve_bytes(1, &cfg).saturating_sub(tile);
             let per = slot + PIPELINE as u64 * extra;
             let usable = free.saturating_sub(PIPELINE as u64 * tile);
             // Slot cost is the allocation delta. Carve is many buffers; packing
             // free to the last byte OOMs, so a tenth stays for fragmentation.
             let fit = (usable - usable / 10) / per.max(1);
             let gpus_left = ordinals.len() - g;
-            let mut n = (fit as usize).min(left / gpus_left.max(1));
+            let n = (fit as usize).min(left / gpus_left.max(1));
             if g == 0 && n == 0 {
                 return Err(format!(
                     "a slot of {slot} bytes does not fit in {free} bytes free"
                 ));
             }
-            loop {
-                let attempt = (|| {
-                    let mut solves = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        solves.push(Solve::at_budget(&s0, &budget)?);
-                    }
-                    if let Some(s) = solves.first() {
-                        *CENSUS.lock() = s.census();
-                    }
-                    let solves = Arc::new(parking_lot::Mutex::new(solves));
-                    for (p, card) in pair.iter_mut().enumerate() {
-                        card.solves = Arc::clone(&solves);
-                        card.carve(n, &cfg).map_err(|e| {
-                            format!("carve gpu {g} pipe {p} n={n} slot={slot} free={free}: {e}")
-                        })?;
-                        card.stream.synchronize().map_err(err)?;
-                    }
-                    Ok(())
-                })();
-                match attempt {
-                    Ok(()) => break,
-                    Err(_) if n > 1 => {
-                        n = (n * 9 / 10).min(n - 1).max(1);
-                        pair = (0..PIPELINE)
-                            .map(|_| Card::on(&gpu, &net))
-                            .collect::<Res<_>>()?;
-                        s0 = Arc::clone(&pair[0].stream);
-                        s0.context().bind_to_thread().map_err(err)?;
-                    }
-                    Err(e) => return Err(e),
-                }
+            let mut solves = Vec::with_capacity(n);
+            for _ in 0..n {
+                solves.push(Solve::at_budget(&s0, &budget)?);
             }
+            if let Some(s) = solves.first() {
+                *CENSUS.lock() = s.census();
+            }
+            let solves = Arc::new(parking_lot::Mutex::new(solves));
+            for (p, card) in pair.iter_mut().enumerate() {
+                card.solves = Arc::clone(&solves);
+                card.carve(n, &cfg).map_err(|e| {
+                    format!("carve gpu {g} pipe {p} n={n} slot={slot} free={free}: {e}")
+                })?;
+                card.stream.synchronize().map_err(err)?;
+            }
+            eprintln!("cuda: gpu {g} carved {n} solve slots");
             left = left.saturating_sub(n);
             cards.extend(pair);
         }
@@ -1112,6 +1092,10 @@ impl Gpu {
 }
 
 impl Card {
+    fn carve_bytes(n: usize, cfg: &Cfg) -> u64 {
+        RoundCap::of(n, &cfg.budget, cfg.s).bytes() as u64
+    }
+
     fn on(gpu: &Gpu, net: &Net) -> Res<Card> {
         let stream = gpu.ctx.new_stream().map_err(err)?;
         let blas = CudaBlas::new(stream.clone()).map_err(err)?;
