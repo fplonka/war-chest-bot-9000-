@@ -1086,18 +1086,19 @@ def main():
         # the training budget; on the CPU that was an hour a run, which is far
         # too dear for the thing that says whether the run learned anything.
         arena = [sys.executable, str(ROOT / "tools" / "arena.py")]
-        subprocess.run(arena + ["pack", args.out], check=True)
-        subprocess.run(arena + ["pack-greedy"], check=True)
+        bot_dir = ROOT / "bots"
+        subprocess.run(arena + ["pack", args.out, "--out", str(bot_dir)], check=True)
+        subprocess.run(arena + ["pack-greedy", "--out", str(bot_dir)], check=True)
         tag = pathlib.Path(args.out).name
-        bots = sorted(str(p) for p in (ROOT / "bots").glob(f"{tag}.*"))
-        final = str(ROOT / "bots" / f"{tag}.final")
-        bots.remove(final)
+        bots = [str(bot_dir / f"{tag}.{snap['label']}") for snap in snaps
+                if snap["label"] != "final"]
+        final = str(bot_dir / f"{tag}.final")
         # Greedy first, so ratings are quoted against the one reference that
         # means the same thing from one run to the next. Without it a ladder
         # only says which snapshot beats which other snapshot, which every run
         # can satisfy while learning nothing, so a missing or unrunnable anchor
         # is a failure rather than something to drop.
-        greedy = ROOT / "bots" / "greedy"
+        greedy = bot_dir / "greedy"
         subprocess.run(arena + ["ladder", str(greedy), *bots, final,
                                 "--games", str(args.ladder_games),
                                 "--out", f"{args.out}/ladder.json"], check=True)
