@@ -112,11 +112,10 @@ def expand_batch(rows, hand, fd, bag):
 class Buffer:
     """Fixed-capacity FIFO over rows whose config lists are ragged.
 
-    Two rings advance together: one over rows, one over the config arena the
-    rows point into. A row's configs sit at an *absolute* arena offset, so a row
-    is live exactly while both rings still hold it -- and because both are
-    written in order, the rows the arena has evicted are always the oldest ones,
-    which is a single monotone pointer rather than a validity test per row.
+    One FIFO of rows. Each row occupies a slot in the row ring and a span in
+    the config, action and policy-cell rings. Append retires the oldest rows
+    until the new chunk fits every ring, then writes. No ring is walked on its
+    own: a row is live exactly while `lo` still names it.
 
     Bootstrapped targets are averaged over whatever history the buffer holds, so
     its length is a real algorithmic knob and not just a memory setting -- the
@@ -172,6 +171,21 @@ class Buffer:
     def add(self, x, cc, cw, cy, coff, soff, pol=None):
         n = len(x)
         lens = np.diff(coff).reshape(n, 2)
+        m = len(cw)
+        if pol is None:
+            na = nc = 0
+        else:
+            pa, paoff, pcoff, pci, pact, pprob = pol
+            na, nc = len(pa), len(pci)
+        # Retire the oldest rows until this chunk fits every ring.
+        while self.lo < self.rows:
+            r = self.lo % self.cap
+            if (self.rows - self.lo + n <= self.cap
+                    and self.cfgs - self.cstart[r] + m <= self.ccap
+                    and self.cells - self.pcstart[r] + nc <= self.pcap
+                    and self.acts - self.pastart[r] + na <= self.acap):
+                break
+            self.lo += 1
         cp = np.repeat(np.tile([0, 1], n).astype(np.uint8), lens.ravel())
         starts = self.cfgs + coff[:-1:2]
         base = self.rows
@@ -181,11 +195,9 @@ class Buffer:
             self.x[sl % self.cap] = x[i:j]
             self.cstart[sl % self.cap] = starts[i:j]
             self.clen[sl % self.cap] = lens[i:j]
-        m = len(cw)
         sl = (np.arange(m) + self.cfgs) % self.ccap
         self.cc[sl], self.cp[sl], self.cw[sl], self.cy[sl] = cc, cp, cw, cy
         if pol is not None:
-            pa, paoff, pcoff, pci, pact, pprob = pol
             alen = np.diff(paoff).astype(np.int32)
             clen = np.diff(pcoff).astype(np.int32)
             for i in range(0, n, 4096):
@@ -195,7 +207,6 @@ class Buffer:
                 self.palen[sl] = alen[i:j]
                 self.pcstart[sl] = self.cells + pcoff[i:j]
                 self.pclen[sl] = clen[i:j]
-            na, nc = len(pa), len(pci)
             self.pa[(np.arange(na) + self.acts) % self.acap] = pa
             at = (np.arange(nc) + self.cells) % self.pcap
             self.pci[at], self.pact[at], self.pp[at] = pci, pact, pprob
@@ -206,11 +217,6 @@ class Buffer:
         # Solve offsets in absolute row space (first entry 0, trailing count).
         self.soff = np.concatenate([self.soff, np.asarray(soff, np.int64)[1:] + base])
         self.stamps.append((base, time.time()))
-        # Advance past every row the arena no longer holds in full.
-        floor = self.cfgs - self.ccap
-        self.lo = max(self.lo, self.rows - self.cap)
-        while self.lo < self.rows and self.cstart[self.lo % self.cap] < floor:
-            self.lo += 1
         # Drop offsets whose rows have been evicted. Without this, soff grows
         # for the whole run and the concatenate above copies all of it every
         # chunk — quadratic in the run length.
