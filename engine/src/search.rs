@@ -199,17 +199,18 @@ impl Budget {
     }
 }
 
-/// The shape a solve at `SoG(512, 8)` is allowed: p99 of each entity count
-/// over finished solves in `runs/exp5` (epochs after t=60, max of those p99s).
+/// The shape a solve at `SoG(512, 8)` is allowed: p99 of each entity over
+/// finished solves in a run that trains, after the warm phase. Source:
+/// `runs/prof_exp`, SoG window t ∈ [210, 330] (early SoG; warm is 3 min).
 const BUDGET_512: Budget = Budget {
-    nodes: 32_368,
-    rows: 16_125,
-    boards: 13_874,
-    configs: 9_329,
-    cidx: 2_514_433,
-    reach: 4_919_571,
-    cells: 502_282,
-    draws: 2_476_986,
+    nodes: 16_595,
+    rows: 10_090,
+    boards: 8_219,
+    configs: 921,
+    cidx: 259_756,
+    reach: 346_018,
+    cells: 136_283,
+    draws: 174_834,
 };
 
 #[derive(Clone, Copy)]
