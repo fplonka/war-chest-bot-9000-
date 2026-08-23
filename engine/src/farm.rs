@@ -141,6 +141,14 @@ pub enum Call {
         cfr: Cfr,
         puct: f32,
     },
+    /// Pay expansions that a bounded phase could not find, without running
+    /// another regret update. Growth happens on the host between these calls,
+    /// so each retry samples the larger tree.
+    Expand {
+        solve: usize,
+        expand: usize,
+        puct: f32,
+    },
     /// What the host needs back once the solve is done: the reference
     /// strategy at the nodes it asks about, and their values and beliefs.
     Read {
@@ -296,7 +304,10 @@ impl Call {
             Call::Configs { phi, owner, cards, n, .. } => {
                 net.configs(phi, owner, *n, cards, &mut r.a, &mut r.b, &mut r.c);
             }
-            Call::Tree { .. } | Call::Iterate { .. } | Call::Read { .. } => {
+            Call::Tree { .. }
+            | Call::Iterate { .. }
+            | Call::Expand { .. }
+            | Call::Read { .. } => {
                 unreachable!("the CFR loop needs the resident state")
             }
         }
@@ -311,7 +322,8 @@ impl Call {
             Call::Configs { .. } => 1,
             Call::Tree { .. } => 2,
             Call::Iterate { .. } => 3,
-            Call::Read { .. } => 4,
+            Call::Expand { .. } => 4,
+            Call::Read { .. } => 5,
         }
     }
 
@@ -324,6 +336,7 @@ impl Call {
             | Call::Configs { solve, .. }
             | Call::Tree { solve, .. }
             | Call::Iterate { solve, .. }
+            | Call::Expand { solve, .. }
             | Call::Read { solve, .. } => *solve,
         }
     }
@@ -333,7 +346,10 @@ impl Call {
         match self {
             Call::Trunk { queries, .. } => *queries,
             Call::Configs { n, .. } => *n,
-            Call::Tree { .. } | Call::Iterate { .. } | Call::Read { .. } => 0,
+            Call::Tree { .. }
+            | Call::Iterate { .. }
+            | Call::Expand { .. }
+            | Call::Read { .. } => 0,
         }
     }
 }

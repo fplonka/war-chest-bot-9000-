@@ -46,7 +46,7 @@ use warchest::pbs::{
     ROW_BYTES,
 };
 use warchest::rng::Rng;
-use warchest::search::{Arenas, Budget, Cfg, Nets, Solved, Solver, Step};
+use warchest::search::{Arenas, Budget, Cfg, Nets, Solved, Solver, Step, StopReason};
 use warchest::selfplay::{make_game, Agent, Collect, Data, GameCfg, GameStream};
 use warchest::state::State;
 
@@ -309,6 +309,49 @@ fn a_solve_may_change_pipeline_streams() {
         }
     }
     device.run(&[], lane).expect("the context stayed healthy");
+}
+
+/// A short device phase is expansion debt, not permission to finish. Repeating
+/// one returned leaf models trajectories that all landed on the same frozen
+/// leaf; the next round must expand without another CFR update.
+#[test]
+fn a_short_expansion_phase_is_paid_before_the_next_iterate() {
+    if Device::count() == 0 {
+        eprintln!("no cuda device; skipping");
+        return;
+    }
+    let net = random_net(0x9E37);
+    let device = Backend::Cuda(gpu(net.clone()));
+    let nets = Arc::new(Nets { value: net, device: true });
+    let mut data = Data::default();
+    let mut sv = GameStream::new(0x51E5, game_cfg(32, 8.0)).next_solve(&nets, &mut data);
+    sv.pin(0);
+
+    let Step::Calls(calls) = sv.advance(&[]) else {
+        panic!("a fresh solve asks for a round")
+    };
+    let mut replies = device.run(&calls, 0).expect("the first phase answered");
+    let leaves = &mut replies.last_mut().expect("the iterate replied").leaves;
+    let leaf = leaves
+        .iter()
+        .copied()
+        .find(|&x| x != NO_ROW)
+        .expect("the phase found a leaf");
+    leaves.fill(leaf);
+
+    let Step::Calls(calls) = sv.advance(&replies) else {
+        panic!("the duplicate phase left debt")
+    };
+    assert!(calls.iter().any(|c| matches!(c, Call::Expand { .. })));
+    assert!(!calls.iter().any(|c| matches!(c, Call::Iterate { .. })));
+    let mut replies = device.run(&calls, 1).expect("the debt phase answered");
+    loop {
+        match sv.advance(&replies) {
+            Step::Calls(calls) => replies = device.run(&calls, 0).expect("the solve continued"),
+            Step::Done(_) => break,
+        }
+    }
+    assert_eq!(sv.stop_reason(), StopReason::Complete);
 }
 
 /// Largest relative difference, with an absolute floor so values near zero do
