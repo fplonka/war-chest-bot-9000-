@@ -852,10 +852,10 @@ impl Device {
             let mut pair: Vec<Card> = (0..PIPELINE)
                 .map(|_| Card::on(&gpu, &net))
                 .collect::<Res<_>>()?;
-            let s0 = &pair[0].stream;
+            let s0 = Arc::clone(&pair[0].stream);
             s0.context().bind_to_thread().map_err(err)?;
             let free0 = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
-            let probe = Solve::at_budget(s0, &budget)?;
+            let probe = Solve::at_budget(&s0, &budget)?;
             s0.synchronize().map_err(err)?;
             let measured = free0.saturating_sub(cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64);
             let slot = measured.max(probe.bytes() as u64);
@@ -873,27 +873,37 @@ impl Device {
             // free to the last byte OOMs, so a tenth stays for fragmentation.
             let fit = (usable - usable / 10) / per.max(1);
             let gpus_left = ordinals.len() - g;
-            let n = (fit as usize).min(left / gpus_left.max(1));
+            let mut n = (fit as usize).min(left / gpus_left.max(1));
             if g == 0 && n == 0 {
                 return Err(format!(
                     "a slot of {slot} bytes does not fit in {free} bytes free"
                 ));
             }
+            for (p, card) in pair.iter_mut().enumerate() {
+                card.carve(n, &cfg).map_err(|e| {
+                    format!("carve gpu {g} pipe {p} n={n} slot={slot} free={free}: {e}")
+                })?;
+                card.stream.synchronize().map_err(err)?;
+            }
+            let free_after_round = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
+            n = n.min(((free_after_round - free_after_round / 10) / slot.max(1)) as usize);
+            if n == 0 {
+                return Err(format!(
+                    "a slot of {slot} bytes does not fit after wave buffers leave \
+                     {free_after_round} bytes free"
+                ));
+            }
             left = left.saturating_sub(n);
             let mut solves = Vec::with_capacity(n);
             for _ in 0..n {
-                solves.push(Solve::at_budget(s0, &budget)?);
+                solves.push(Solve::at_budget(&s0, &budget)?);
             }
             if let Some(s) = solves.first() {
                 *CENSUS.lock() = s.census();
             }
             let solves = Arc::new(parking_lot::Mutex::new(solves));
-            for (p, card) in pair.iter_mut().enumerate() {
+            for card in &mut pair {
                 card.solves = Arc::clone(&solves);
-                card.carve(n, &cfg).map_err(|e| {
-                    format!("carve gpu {g} pipe {p} n={n} slot={slot} free={free}: {e}")
-                })?;
-                card.stream.synchronize().map_err(err)?;
             }
             cards.extend(pair);
         }
