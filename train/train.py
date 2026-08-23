@@ -1090,16 +1090,15 @@ def main():
         subprocess.run(arena + ["pack-greedy"], check=True)
         tag = pathlib.Path(args.out).name
         bots = sorted(str(p) for p in (ROOT / "bots").glob(f"{tag}.*"))
+        final = str(ROOT / "bots" / f"{tag}.final")
+        bots.remove(final)
         # Greedy first, so ratings are quoted against the one reference that
         # means the same thing from one run to the next. Without it a ladder
         # only says which snapshot beats which other snapshot, which every run
         # can satisfy while learning nothing, so a missing or unrunnable anchor
         # is a failure rather than something to drop.
-        # `ladder` greets every bot before it plays any of them, so a greedy
-        # that is absent, unreadable or built for another platform stops the
-        # run here instead of being quietly left out.
         greedy = ROOT / "bots" / "greedy"
-        subprocess.run(arena + ["ladder", str(greedy), *bots,
+        subprocess.run(arena + ["ladder", str(greedy), *bots, final,
                                 "--games", str(args.ladder_games),
                                 "--out", f"{args.out}/ladder.json"], check=True)
 
