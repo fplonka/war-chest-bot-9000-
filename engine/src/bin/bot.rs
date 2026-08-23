@@ -36,11 +36,12 @@ struct Options {
     rounds: u8,
     cfr: String,
     threads: usize,
+    temp: f32,
 }
 
 fn options() -> Result<Options, String> {
     let a = Args::parse(&[
-        "name", "weights", "mind", "s", "c", "batch", "rounds", "cfr", "threads",
+        "name", "weights", "mind", "s", "c", "batch", "rounds", "cfr", "threads", "temp",
     ])?;
     Ok(Options {
         name: a.text("name", "bot"),
@@ -52,6 +53,7 @@ fn options() -> Result<Options, String> {
         batch: a.num("batch", 8)?,
         rounds: a.num("rounds", 0)?,
         threads: a.num("threads", 0)?,
+        temp: a.num("temp", 2.0)?,
     })
 }
 
@@ -59,6 +61,7 @@ fn brain(o: &Options, cards: Option<Arc<Cards>>) -> Result<Brain, String> {
     let mind = match o.mind.as_str() {
         "sog" => Mind::Sog,
         "random" => Mind::Random,
+        "greedy" => Mind::Greedy { temp: o.temp },
         other => return Err(format!("unknown mind {}", other)),
     };
     let cfr = Cfr::named(&o.cfr).ok_or_else(|| format!("unknown cfr rule {}", o.cfr))?;

@@ -42,6 +42,8 @@ pub enum Mind {
     Sog,
     /// Uniform over legal actions.
     Random,
+    /// One-ply greedy on the public static evaluation, softmaxed at `temp`.
+    Greedy { temp: f32 },
 }
 
 /// Everything a bot brings to every game it plays: how it thinks and the
@@ -72,6 +74,7 @@ impl Brain {
         let cfgs = &bel[player as usize].cfg;
         match self.mind {
             Mind::Random => return policy::uniform(s, ctx, player, cfgs),
+            Mind::Greedy { temp } => return policy::greedy(s, ctx, player, cfgs, temp),
             Mind::Sog => {}
         }
         let mut sv = Solver::new(

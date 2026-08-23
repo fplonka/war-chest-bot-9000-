@@ -83,6 +83,8 @@ class Bot:
                 f"{self.spec.get('sha', '?')} rather than copying one in.")
         argv = [str(self.dir / "bot"), "--name", self.name,
                 "--mind", self.spec.get("mind", "sog")]
+        if "temp" in self.spec:
+            argv += ["--temp", str(self.spec["temp"])]
         if self.spec.get("weights"):
             argv += ["--weights", str(self.dir / self.spec["weights"])]
         search = self.spec.get("search", {})
@@ -792,6 +794,41 @@ def pack(run, binary, out_dir, snapshot=None, name=None):
     return made
 
 
+def pack_greedy(binary, out_dir):
+    """Archive the one-ply greedy as the ladder's anchor bot.
+
+    Built from the current source, not from a frozen revision: greedy has no
+    weights, so the binary *is* the bot.
+    """
+    import shutil
+
+    binary = Path(binary)
+    if not binary.exists():
+        raise SystemExit(f"{binary} does not exist. Build it:\n"
+                         f"  cd engine && cargo build --release --bin bot")
+    directory = Path(out_dir) / "greedy"
+    directory.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(binary, directory / "bot")
+    os.chmod(directory / "bot", 0o755)
+    sha = ""
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=ROOT, text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    (directory / "bot.json").write_text(json.dumps({
+        "name": "greedy",
+        "sha": sha,
+        "binary": digest(directory / "bot"),
+        "mind": "greedy",
+        "temp": 2.0,
+        "note": "one-ply public static eval",
+    }, indent=1) + "\n")
+    print(f"packed {directory}")
+    return directory
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="command", required=True)
@@ -839,10 +876,17 @@ def main():
                     help="the binary to freeze into the bot")
     pk.add_argument("--out", default="bots")
 
+    pg = sub.add_parser("pack-greedy", help="archive the one-ply greedy as a bot")
+    pg.add_argument("--bin", default=str(ROOT / "engine/target/release/bot"),
+                    help="the binary to freeze into the bot")
+    pg.add_argument("--out", default="bots")
+
     args = ap.parse_args()
     if args.command == "pack":
         return pack(args.run, Path(args.bin).resolve(), Path(args.out),
                     args.snapshot, args.name)
+    if args.command == "pack-greedy":
+        return pack_greedy(Path(args.bin).resolve(), Path(args.out))
     if args.command == "hello":
         return hello(args.bots)
     if args.command == "generate":
