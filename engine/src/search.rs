@@ -779,6 +779,10 @@ struct Mark {
     term_leaves: usize,
     leaf_coff: usize,
     leaf_cidx: usize,
+    nlegal_off: usize,
+    nrev_start: usize,
+    nrvd_start: usize,
+    ndraw_start: usize,
 }
 
 /// What a finished solve gives back.
@@ -1259,6 +1263,12 @@ pub struct Solver {
     /// Draw-transition entries over the whole tree, which the budget bounds and
     /// the device's `draw_to` / `draw_p` / `rvd_src` / `rvd_p` are sized by.
     pub ndraws: usize,
+    /// Concatenated CSR lengths the contract writes into Reach, besides `nreach`
+    /// and `nvals`. Each is one Reach column, so the slot must hold the max.
+    nlegal_off: usize,
+    nrev_start: usize,
+    nrvd_start: usize,
+    ndraw_start: usize,
     /// Which entities this solve ran out of, bit `1 << Ent`. The run counts
     /// them. A budget is a percentile of a measured shape, and the count is
     /// the only thing that can argue with the percentile chosen: it says how
@@ -1474,6 +1484,10 @@ impl Solver {
             nreach: 0,
             nvals: 0,
             ndraws: 0,
+            nlegal_off: 0,
+            nrev_start: 0,
+            nrvd_start: 0,
+            ndraw_start: 0,
             budget_hit: 0,
             roff: Vec::new(),
             voff: Vec::new(),
@@ -1617,9 +1631,32 @@ impl Solver {
     fn push_node(&mut self, parent: u32, s: State, cfgs: [Arc<[Config]>; 2]) -> usize {
         let player = s.to_act();
         let terminal = s.is_terminal();
+        let coin = !terminal && matches!(s.pending(), Cont::MainPlay);
         let (c0, c1) = (cfgs[0].len(), cfgs[1].len());
+        let next_row = if terminal {
+            self.leaf_rows.len().max(self.term_leaves.len() + 1)
+        } else if coin {
+            (self.leaf_rows.len() + 1).max(self.term_leaves.len())
+        } else {
+            self.leaf_rows.len().max(self.term_leaves.len())
+        };
+        // A non-root node is one more child pointer, which is a Cell column.
+        let next_cell = if parent == crate::contract::NO_ROW {
+            self.ncells
+        } else {
+            self.ncells.max(self.nodes.len())
+        };
         if !self.reserve(Ent::Node, self.nodes.len() + 1)
-            || !self.reserve(Ent::Reach, self.nreach + c0 + c1)
+            || !self.reserve(
+                Ent::Reach,
+                (self.nreach + c0 + c1)
+                    .max(self.nvals + c0.max(c1))
+                    .max(self.reach_aux()),
+            )
+            || !self.reserve(Ent::Cell, next_cell)
+            || !self.reserve(Ent::Row, next_row)
+            || (parent == crate::contract::NO_ROW
+                && !self.reserve(Ent::Config, (c0 + c1).div_ceil(2)))
         {
             return parent as usize;
         }
@@ -1671,13 +1708,16 @@ impl Solver {
         self.primed.push(false);
         self.row_of.push(u32::MAX);
         // Only a coin play carries a network row. Everything between two coin
-        // plays is grown through immediately and never stays a leaf.
+        // plays is grown through immediately and never stays a leaf. The Row
+        // slot also holds terminals, so both appends go through the same reserve.
         if terminal {
             self.term_leaves.push(id);
-        } else if matches!(s.pending(), Cont::MainPlay) {
+        } else if coin {
             self.row_of[id] = (self.leaf_coff.len() / 2) as u32;
             self.push_row(id, &s, &cfgs);
-            self.leaf_rows.push(id);
+            if !self.abandon {
+                self.leaf_rows.push(id);
+            }
         }
         self.states.push(s);
         id
@@ -1802,17 +1842,41 @@ impl Solver {
         self.budget_hit
     }
 
-    /// How many of this entity the solve holds.
+    /// How many of this entity the solve holds, as the card would reserve it.
+    ///
+    /// Each entity is one slot, shared by every column of that entity. `used`
+    /// is the max of those columns: a terminal is a Row, a child pointer is a
+    /// Cell, `nvals` and the CSR starts are Reach, and the root belief is a
+    /// Config. The contract handed to the device is this length, by construction.
     pub fn used(&self, e: Ent) -> usize {
         match e {
             Ent::Node => self.nodes.len(),
-            Ent::Cell => self.ncells,
-            Ent::Reach => self.nreach,
+            Ent::Cell => self.ncells.max(self.nodes.len().saturating_sub(1)),
+            Ent::Reach => self.nreach.max(self.nvals).max(self.reach_aux()),
             Ent::Draw => self.ndraws,
-            Ent::Row => self.leaf_rows.len(),
+            Ent::Row => self.leaf_rows.len().max(self.term_leaves.len()),
             Ent::Board => self.nboards,
-            Ent::Config => self.ncfg,
+            Ent::Config => self.ncfg.max(self.rootb_len()),
             Ent::Cidx => self.leaf_cidx.len(),
+        }
+    }
+
+    /// Length of each entity as the card would reserve it from this tree.
+    pub fn entity_lens(&self) -> [usize; 8] {
+        crate::contract::Contract::of(self).entity_lens(self)
+    }
+
+    fn reach_aux(&self) -> usize {
+        self.nlegal_off
+            .max(self.nrev_start)
+            .max(self.nrvd_start)
+            .max(self.ndraw_start)
+    }
+
+    fn rootb_len(&self) -> usize {
+        match self.nc.first() {
+            Some(&[a, b]) => (a as usize + b as usize).div_ceil(2),
+            None => 0,
         }
     }
 
@@ -1844,6 +1908,10 @@ impl Solver {
             term_leaves: self.term_leaves.len(),
             leaf_coff: self.leaf_coff.len(),
             leaf_cidx: self.leaf_cidx.len(),
+            nlegal_off: self.nlegal_off,
+            nrev_start: self.nrev_start,
+            nrvd_start: self.nrvd_start,
+            ndraw_start: self.ndraw_start,
         }
     }
 
@@ -1903,6 +1971,10 @@ impl Solver {
         self.cplayer.truncate(m.ncfg);
         self.cmap.retain(|_, &mut i| (i as usize) < m.ncfg);
         self.ncfg = m.ncfg;
+        self.nlegal_off = m.nlegal_off;
+        self.nrev_start = m.nrev_start;
+        self.nrvd_start = m.nrvd_start;
+        self.ndraw_start = m.ndraw_start;
         self.grown.retain(|&g| (g as usize) < m.nodes && g != id as u32);
         let n = &mut self.nodes[id];
         n.leaf = true;
@@ -2099,14 +2171,28 @@ impl Solver {
                     n.expandable = false;
                 }
             }
+            let extra_draw_start = draw.rows() + 1;
+            let extra_rvd = self.nc[ch][me] as usize + 1;
             let n = &mut self.nodes[id];
             n.chance = true;
             n.child = vec![ch];
-            if !self.reserve(Ent::Draw, self.ndraws + draw.len()) {
+            if !self.reserve(Ent::Draw, self.ndraws + draw.len())
+                || !self.reserve(
+                    Ent::Reach,
+                    self.nreach
+                        .max(self.nvals)
+                        .max(self.nlegal_off)
+                        .max(self.nrev_start)
+                        .max(self.nrvd_start + extra_rvd)
+                        .max(self.ndraw_start + extra_draw_start),
+                )
+            {
                 self.rewind(id, mark);
                 return;
             }
             self.ndraws += draw.len();
+            self.ndraw_start += extra_draw_start;
+            self.nrvd_start += extra_rvd;
             let n = &mut self.nodes[id];
             n.draw = draw;
             n.draw_steps = steps;
@@ -2265,6 +2351,9 @@ impl Solver {
             }
         }
 
+        let extra_legal = legal_off.len();
+        let extra_rev: usize = child.iter().map(|&c| self.nc[c][me] as usize + 1).sum();
+        let extra_cells = legal_action.len();
         let n = &mut self.nodes[id];
         n.acts = acts;
         n.aslot = aslot;
@@ -2285,11 +2374,25 @@ impl Solver {
         n.cell_row = cell_row;
         // The one term a `grow` at the head of the recursion cannot bound: a
         // node's cells are appended after its whole subtree has been built, so
-        // several nodes' worth can land with no check between them.
-        if !self.reserve(Ent::Cell, self.ncells + self.nodes[id].legal_action.len()) {
+        // several nodes' worth can land with no check between them. Child
+        // pointers and the reverse CSR are Cell/Reach columns of the same slot.
+        if !self.reserve(
+            Ent::Cell,
+            (self.ncells + extra_cells).max(self.nodes.len().saturating_sub(1)),
+        ) || !self.reserve(
+            Ent::Reach,
+            self.nreach
+                .max(self.nvals)
+                .max(self.nlegal_off + extra_legal)
+                .max(self.nrev_start + extra_rev)
+                .max(self.nrvd_start)
+                .max(self.ndraw_start),
+        ) {
             self.rewind(id, mark);
             return;
         }
+        self.nlegal_off += extra_legal;
+        self.nrev_start += extra_rev;
         self.alloc_cells(id);
         self.grown.push(id as u32);
     }
@@ -2446,6 +2549,9 @@ impl Solver {
             matches!(s.pending(), Cont::MainPlay),
             "a network row must be a MainPlay state"
         );
+        if !self.reserve(Ent::Row, (self.leaf_rows.len() + 1).max(self.term_leaves.len())) {
+            return;
+        }
         let _t = timed!(PUBFEAT);
         let board = self.encode(s);
         self.board_of.push(board);

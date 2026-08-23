@@ -26,7 +26,7 @@
 //! ship a delta per iteration rather than itself.
 
 use crate::farm::{Dst, Writes};
-use crate::search::{Solver, NO_TRANS};
+use crate::search::{Ent, Solver, NO_TRANS};
 
 /// What a node is, for a device that cannot afford a branch per field.
 pub const KIND_DECISION: u8 = 0;
@@ -284,6 +284,41 @@ impl Contract {
         c.transpose(sv);
         c.built = n;
         c
+    }
+
+    /// Length of each entity as the card would reserve it from this description.
+    pub fn entity_lens(&self, sv: &Solver) -> [usize; 8] {
+        let mut l = [0usize; 8];
+        let mut bump = |e: Ent, n: usize| l[e as usize] = l[e as usize].max(n);
+        bump(Ent::Node, self.kind.len());
+        bump(Ent::Node, self.level_start.len());
+        bump(Ent::Node, self.level_node.len());
+        bump(Ent::Cell, self.child.len());
+        bump(Ent::Cell, self.legal_child.len());
+        bump(Ent::Cell, self.legal_trans.len());
+        bump(Ent::Cell, self.cell_row.len());
+        bump(Ent::Cell, self.cell_val.len());
+        bump(Ent::Cell, self.rev_src.len());
+        bump(Ent::Cell, self.rev_cell.len());
+        bump(Ent::Cell, sv.ncells);
+        bump(Ent::Reach, self.legal_off.len());
+        bump(Ent::Reach, self.rev_start.len());
+        bump(Ent::Reach, self.rvd_start.len());
+        bump(Ent::Reach, self.draw_start.len());
+        bump(Ent::Reach, sv.nreach);
+        bump(Ent::Reach, sv.nvals);
+        bump(Ent::Draw, self.draw_to.len());
+        bump(Ent::Draw, self.rvd_src.len());
+        bump(Ent::Draw, sv.ndraws);
+        bump(Ent::Row, sv.leaf_rows.len());
+        bump(Ent::Row, sv.term_leaves.len());
+        bump(Ent::Board, sv.nboards);
+        bump(Ent::Config, sv.ncfg);
+        if let Some(&[a, b]) = sv.nc.first() {
+            bump(Ent::Config, (a as usize + b as usize).div_ceil(2));
+        }
+        bump(Ent::Cidx, sv.leaf_cidx.len());
+        l
     }
 
     /// Bring a description up to date with a tree that has grown.

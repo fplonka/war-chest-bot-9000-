@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use warchest::pbs::*;
 use warchest::rng::Rng;
-use warchest::search::{node_actions, Budget, Cfg, Cfr, Nets, Solver};
+use warchest::search::{node_actions, Budget, Cfg, Cfr, Ent, Nets, Solver};
 use warchest::selfplay::make_game;
 use warchest::state::{Cont, State, MAX_MAIN_PLAYS, Z_BAG, Z_FACEDOWN, Z_HAND};
 use warchest::units::{
@@ -799,15 +799,16 @@ fn a_solve_never_grows_past_its_budget() {
         ];
         let mut sv = Solver::new(&st, ctx, Arc::clone(&nets), cfg, bel, Rng::new(seed));
         sv.run_alone();
-        let got = sv.shape();
-        assert!(got.nodes <= budget.nodes, "seed {seed}: {} nodes", got.nodes);
-        assert!(got.rows <= budget.rows, "seed {seed}: {} rows", got.rows);
-        assert!(got.boards <= budget.boards, "seed {seed}: {} boards", got.boards);
-        assert!(got.ncfg <= budget.configs, "seed {seed}: {} configs", got.ncfg);
-        assert!(got.cidx <= budget.cidx, "seed {seed}: {} cidx", got.cidx);
-        assert!(got.reach <= budget.reach, "seed {seed}: {} reach", got.reach);
-        assert!(got.cells <= budget.cells, "seed {seed}: {} cells", got.cells);
-        assert!(got.draws <= budget.draws, "seed {seed}: {} draws", got.draws);
+        let lens = sv.entity_lens();
+        for e in Ent::ALL {
+            assert!(
+                lens[e as usize] <= budget.cap(e),
+                "seed {seed}: {} {} > {}",
+                e.name(),
+                lens[e as usize],
+                budget.cap(e)
+            );
+        }
         if sv.nodes[0].leaf {
             // The first expansion did not fit. The root stayed a leaf, which
             // is the truncation: there is no average to read.
@@ -832,4 +833,91 @@ fn a_solve_never_grows_past_its_budget() {
     // and whose assertions above therefore prove nothing.
     assert!(hits > checked / 2, "the budget bit on only {hits} of {checked} solves");
     eprintln!("{hits} of {checked} solves reached the budget");
+}
+
+fn roomy_budget() -> Budget {
+    Budget {
+        nodes: 1_000_000,
+        rows: 1_000_000,
+        boards: 1_000_000,
+        configs: 1_000_000,
+        cidx: 10_000_000,
+        reach: 10_000_000,
+        cells: 10_000_000,
+        draws: 10_000_000,
+    }
+}
+
+fn tight_in(e: Ent) -> Budget {
+    let mut b = roomy_budget();
+    match e {
+        Ent::Node => b.nodes = 512,
+        Ent::Cell => b.cells = 2_048,
+        Ent::Reach => b.reach = 8_192,
+        Ent::Draw => b.draws = 64,
+        Ent::Row => b.rows = 64,
+        Ent::Board => b.boards = 32,
+        Ent::Config => b.configs = 16,
+        Ent::Cidx => b.cidx = 512,
+    }
+    b
+}
+
+/// A budget tight in one entity still yields a tree that fits the slot, and a
+/// normalised root policy. Eight cases, one entity at a time: the other seven
+/// are roomy, so a miss in that entity's append-point reserve is what would
+/// grow the contract past the cap.
+#[test]
+fn a_solve_fits_a_budget_tight_in_one_entity() {
+    let nets = Arc::new(Nets::default());
+    for e in Ent::ALL {
+        let budget = tight_in(e);
+        let cfg = Cfg { s: 512, c: 1.0, budget, ..Default::default() };
+        let mut checked = 0;
+        let mut hits = 0;
+        for seed in 0..8_000u64 {
+            let Some(st) = micro_position(seed, 60 + (seed as usize % 120), 6) else {
+                continue;
+            };
+            let ctx = Ctx::new(&st);
+            let bel = [
+                thinned(uniform_belief(&st, &ctx, 0), CFG_CAP),
+                thinned(uniform_belief(&st, &ctx, 1), CFG_CAP),
+            ];
+            let mut sv = Solver::new(&st, ctx, Arc::clone(&nets), cfg, bel, Rng::new(seed));
+            sv.run_alone();
+            let lens = sv.entity_lens();
+            for x in Ent::ALL {
+                assert!(
+                    lens[x as usize] <= budget.cap(x),
+                    "{} seed {seed}: {} {} > {}",
+                    e.name(),
+                    x.name(),
+                    lens[x as usize],
+                    budget.cap(x)
+                );
+            }
+            if sv.nodes[0].leaf || sv.nodes[0].chance {
+                continue;
+            }
+            let me = sv.nodes[0].player as usize;
+            for c in 0..sv.nodes[0].nc(me) {
+                let row = sv.average_strategy(0, c);
+                let sum: f32 = row.iter().sum();
+                assert!(
+                    !row.is_empty() && sum > 0.99 && sum < 1.01,
+                    "{} seed {seed} config {c}: the root policy sums to {sum}",
+                    e.name()
+                );
+            }
+            hits += sv.budget_hit() as usize;
+            checked += 1;
+            if checked >= 200 {
+                break;
+            }
+        }
+        assert!(checked >= 200, "{}: only {checked} grown roots", e.name());
+        assert!(hits > 0, "{}: the tight budget never bit", e.name());
+        eprintln!("{}: {hits} of {checked} solves reached the budget", e.name());
+    }
 }
