@@ -51,12 +51,33 @@ PROTOCOL = 6
 WIN_MARKERS = 6
 
 
+def cuda_devices():
+    """CUDA ordinals visible to this process."""
+    try:
+        found = subprocess.run(
+            ["nvidia-smi", "-L"], check=True, capture_output=True, text=True)
+    except OSError:
+        return []
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(f"cannot enumerate GPUs: {error.stderr.strip()}") from error
+    count = sum(line.startswith("GPU ") for line in found.stdout.splitlines())
+    return [f"cuda:{i}" for i in range(count)]
+
+
+def split_devices():
+    devices = cuda_devices()
+    if len(devices) % 2:
+        raise SystemExit(f"an arena needs an even GPU count, found {len(devices)}")
+    half = len(devices) // 2
+    return devices[:half], devices[half:]
+
+
 # ------------------------------------------------------------------ bot files
 
 class Bot:
     """One bot process, and the manifest that describes it."""
 
-    def __init__(self, path, seat, replies, threads=0):
+    def __init__(self, path, seat, replies, devices=()):
         self.dir = Path(path)
         self.seat = seat
         self.closing = False
@@ -67,6 +88,13 @@ class Bot:
             raise SystemExit(f"{self.dir} is not a bot: no bot.json in it")
         self.spec = json.loads((self.dir / "bot.json").read_text())
         self.name = self.spec.get("name", self.dir.name)
+        self.searching = self.spec.get("mind", "sog") not in ("greedy", "random")
+        self.lock = threading.Lock()
+        self.outstanding = set()
+        self.busy_since = None
+        self.busy_seconds = 0.0
+        self.solves = 0
+        self.moves = 0
         if not os.access(self.dir / "bot", os.X_OK):
             raise SystemExit(
                 f"{self.name}: {self.dir / 'bot'} is missing or not executable")
@@ -87,13 +115,13 @@ class Bot:
             argv += ["--temp", str(self.spec["temp"])]
         if self.spec.get("weights"):
             argv += ["--weights", str(self.dir / self.spec["weights"])]
+        if devices and self.searching:
+            argv += ["--devices", ",".join(devices)]
         search = self.spec.get("search", {})
         for key, flag in (("s", "--s"), ("c", "--c"), ("rounds", "--rounds"),
                           ("cfr", "--cfr")):
             if key in search:
                 argv += [flag, str(search[key])]
-        if threads and "s" in search:
-            argv += ["--threads", str(threads)]
         try:
             self.proc = subprocess.Popen(
                 argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
@@ -127,20 +155,43 @@ class Bot:
         return line
 
     def _read(self):
-        """Replies arrive as games finish rather than in step with the
-        requests, so they are drained on their own thread. A bot that stops on
-        its own is an error the referee must see; one this process shut down is
-        not."""
+        """Drain replies without blocking the referee."""
         try:
             while True:
-                self.replies.put((self.seat, self._line()))
+                line = self._line()
+                message = json.loads(line)
+                now = time.monotonic()
+                with self.lock:
+                    self.outstanding.difference_update(
+                        d["id"] for d in message.get("done", []))
+                    if not self.outstanding and self.busy_since is not None:
+                        self.busy_seconds += now - self.busy_since
+                        self.busy_since = None
+                self.replies.put((self.seat, line))
         except SystemExit as stop:
             if not self.closing:
                 self.replies.put((self.seat, stop))
 
     def send(self, request):
+        message = json.loads(request)
+        asks = message.get("go", []) + message.get("watch", [])
+        if asks:
+            with self.lock:
+                if not self.outstanding:
+                    self.busy_since = time.monotonic()
+                self.outstanding.update(a["id"] for a in asks)
+                self.moves += len(message.get("go", []))
+                if self.searching:
+                    self.solves += len(asks)
         self.proc.stdin.write(request + "\n")
         self.proc.stdin.flush()
+
+    def snapshot(self):
+        with self.lock:
+            busy = self.busy_seconds
+            if self.busy_since is not None:
+                busy += time.monotonic() - self.busy_since
+            return self.solves, self.moves, busy
 
     def close(self):
         self.closing = True
@@ -207,7 +258,7 @@ def match(bots, pairs, replies, seed, concurrent, report):
                 apply_reply(table, replies.get_nowait())
             except queue.Empty:
                 break
-    return [scores[gid] for gid in sorted(scores)]
+    return [scores[gid] for gid in sorted(scores)], time.time() - started
 
 
 # ------------------------------------------------------------------- ratings
@@ -326,8 +377,8 @@ def generate(paths, games, seed, concurrent, out_dir, depth=8,
     together. Raising it to 400,000 finds 1.5% more positions and takes 2.6
     times as long, so the time is better spent on more games."""
     replies = queue.Queue()
-    threads = max(1, (os.cpu_count() or 2) // len(paths))
-    bots = tuple(Bot(p, i, replies, threads) for i, p in enumerate(paths))
+    devices = split_devices()
+    bots = tuple(Bot(p, i, replies, devices[i]) for i, p in enumerate(paths))
     table = warchest.Table()
     pairs = drafts(seed, (games + 1) // 2)
     todo = deque(range(games))
@@ -461,7 +512,7 @@ def score(bot_path, questions, wire, concurrent):
     name = spec.get("name", Path(bot_path).name)
 
     replies = queue.Queue()
-    bot = Bot(bot_path, 0, replies, os.cpu_count() or 1)
+    bot = Bot(bot_path, 0, replies, cuda_devices())
     table = warchest.Table()
     kept, blundered = [], []
 
@@ -584,7 +635,8 @@ def schedule(count):
     return out
 
 
-def report(names, paths, specs, records, games, seed, complete):
+def report(names, paths, specs, records, performance, games, seed, complete,
+           wall_seconds):
     players = ratings(names, records)
     for player, spec in zip(players, specs):
         if spec.get("minutes") is not None:
@@ -595,16 +647,16 @@ def report(names, paths, specs, records, games, seed, complete):
                   **{k: v for k, v in s.items() if k != "name"}}
                  for n, p, s in zip(names, paths, specs)],
         "games": games, "seed": seed, "anchor": names[0],
+        "wall_seconds": round(wall_seconds, 3),
         "players": players,
-        "pairs": [summarize(names[i], names[j], points)
+        "pairs": [{**summarize(names[i], names[j], points),
+                   **performance[(i, j)]}
                   for (i, j), points in records.items()],
     }
 
 
 def name(bot_dir):
     return Path(bot_dir).name
-
-
 
 
 #: Hardness bands, by the share of legal moves that keep the win. A position
@@ -654,31 +706,20 @@ def write_json(path, value):
     os.replace(tmp, path)
 
 
-def hello(paths):
-    """Start each bot, read its greeting and stop it.
-
-    A ladder is worth nothing without its anchor, so whoever is about to run
-    one can check first that the anchor exists, can be executed on this host,
-    and speaks this referee's protocol and rules.
-    """
-    for path in paths:
-        bot = Bot(path, 0, queue.Queue())
-        print(f"{bot.name}: protocol {PROTOCOL}, runs on this host", flush=True)
-        bot.close()
-
-
 def ladder(paths, games, seed, concurrent, out_path):
     if games < 2 or games % 2:
         raise SystemExit("--games must be a positive even number")
-    hello(paths)
     specs = [json.loads((Path(p) / "bot.json").read_text()) for p in paths]
     names = [s.get("name", Path(p).name) for s, p in zip(specs, paths)]
     if len(set(names)) != len(names):
         raise SystemExit(f"bot names must be distinct: {names}")
 
     records = {}
+    performance = {}
     running = {}
     replies = queue.Queue()
+    devices = split_devices()
+    ladder_started = time.time()
 
     def bot_on(seat, index):
         """Start the requested bot in this seat if it is not already there."""
@@ -686,13 +727,13 @@ def ladder(paths, games, seed, concurrent, out_path):
             return running[seat][1]
         if running.get(seat):
             running[seat][1].close()
-        threads = max(1, (os.cpu_count() or 2) // 2)
-        running[seat] = (index, Bot(paths[index], seat, replies, threads))
+        running[seat] = (index, Bot(paths[index], seat, replies, devices[seat]))
         return running[seat][1]
 
     try:
         for i, j in schedule(len(paths)):
             bots = (bot_on(0, i), bot_on(1, j))
+            before = [bot.snapshot() for bot in bots]
             # Each pairing gets its own drafts and its own draw stream, so two
             # pairings are independent evidence rather than the same games
             # played by different bots.
@@ -704,23 +745,43 @@ def ladder(paths, games, seed, concurrent, out_path):
                           f"{60 * done / max(secs, 1e-9):.0f} games/min",
                           flush=True)
 
-            records[(i, j)] = match(bots, drafts(pairing_seed, games // 2),
-                                    replies, pairing_seed, concurrent, progress)
+            records[(i, j)], wall = match(
+                bots, drafts(pairing_seed, games // 2), replies,
+                pairing_seed, concurrent, progress)
+            perf = []
+            for bot, old in zip(bots, before):
+                solves, moves, busy = (a - b for a, b in zip(bot.snapshot(), old))
+                perf.append({
+                    "name": bot.name,
+                    "solves": solves,
+                    "moves": moves,
+                    "busy_seconds": round(busy, 3),
+                    "solves_per_second": round(solves / max(busy, 1e-9), 3),
+                    "ms_per_move": round(1000 * busy / max(moves, 1), 3),
+                })
+            performance[(i, j)] = {
+                "wall_seconds": round(wall, 3), "performance": perf}
             got = summarize(names[i], names[j], records[(i, j)])
             print(f"{names[i]:>20s} vs {names[j]:<20s} "
                   f"W{got['w']:3d} L{got['l']:3d} D{got['d']:3d}  "
                   f"score {got['score']:.3f}  "
                   f"paired {got['paired_w']}-{got['paired_l']} "
-                  f"p={got['paired_p']:.2g}", flush=True)
+                  f"p={got['paired_p']:.2g}  wall {wall:.1f}s", flush=True)
+            print("  " + "  ".join(
+                f"{p['name']}: {p['solves_per_second']:.1f} solves/s, "
+                f"{p['ms_per_move']:.1f} ms/move" for p in perf), flush=True)
             # Published after every pairing: a ten-pairing ladder takes half an
             # hour, and the dashboard should show it filling in.
             write_json(out_path,
-                       report(names, paths, specs, records, games, seed, False))
+                       report(names, paths, specs, records, performance,
+                              games, seed, False, time.time() - ladder_started))
     finally:
         for _, bot in running.values():
             bot.close()
 
-    result = report(names, paths, specs, records, games, seed, complete=True)
+    wall = time.time() - ladder_started
+    result = report(names, paths, specs, records, performance,
+                    games, seed, complete=True, wall_seconds=wall)
     write_json(out_path, result)
 
     print(f"\n=== Elo ({names[0]} = 0) ===")
@@ -730,7 +791,7 @@ def ladder(paths, games, seed, concurrent, out_path):
         ci = "—" if p["se"] is None else f"{1.96 * p['se']:.0f}"
         print(f"{p['name']:>24s} {elo:>7s} {ci:>6s} "
               f"{p['games']:>6d} {p['score']:>7.3f}")
-    print(f"\nwrote {out_path}")
+    print(f"\nwall {wall:.1f}s; wrote {out_path}")
     return result
 
 
@@ -864,9 +925,6 @@ def main():
     tb.add_argument("--concurrent", type=int, default=32)
     tb.add_argument("--out", default="")
 
-    hi = sub.add_parser("hello", help="check bots can run here and speak this protocol")
-    hi.add_argument("bots", nargs="+")
-
     pk = sub.add_parser("pack", help="archive run snapshots as bots")
     pk.add_argument("run")
     pk.add_argument("--snapshot", default=None,
@@ -887,8 +945,6 @@ def main():
                     args.snapshot, args.name)
     if args.command == "pack-greedy":
         return pack_greedy(Path(args.bin).resolve(), Path(args.out))
-    if args.command == "hello":
-        return hello(args.bots)
     if args.command == "generate":
         return generate(args.bots, args.games, args.seed, args.concurrent,
                         args.out, args.depth, args.per_bucket,
