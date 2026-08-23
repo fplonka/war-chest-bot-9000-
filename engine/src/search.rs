@@ -200,16 +200,16 @@ impl Budget {
 }
 
 /// The shape a solve at `SoG(512, 8)` is allowed: p99 of each entity count
-/// over finished solves.
+/// over finished solves in `runs/exp5` (epochs after t=60, max of those p99s).
 const BUDGET_512: Budget = Budget {
-    nodes: 20_022,
-    rows: 13_116,
-    boards: 9_036,
-    configs: 2_914,
-    cidx: 512_130,
-    reach: 595_774,
-    cells: 201_815,
-    draws: 307_605,
+    nodes: 32_368,
+    rows: 16_125,
+    boards: 13_874,
+    configs: 9_329,
+    cidx: 2_514_433,
+    reach: 4_919_571,
+    cells: 502_282,
+    draws: 2_476_986,
 };
 
 #[derive(Clone, Copy)]
