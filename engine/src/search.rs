@@ -123,7 +123,9 @@ impl Budget {
             nodes: k(BUDGET_512.nodes),
             rows: k(BUDGET_512.rows),
             boards: k(BUDGET_512.boards),
-            configs: k(BUDGET_512.configs),
+            // A root range is set by the game, not by the search budget. It
+            // must fit before growth can decide to stop.
+            configs: k(BUDGET_512.configs).max(BUDGET_512.configs),
             cidx: k(BUDGET_512.cidx),
             reach: k(BUDGET_512.reach),
             cells: k(BUDGET_512.cells),
