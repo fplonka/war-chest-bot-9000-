@@ -146,7 +146,7 @@ pub struct Data {
     /// target probability. Indexed within the row rather than within the acting
     /// support so a batch never has to know which seat acted.
     pub pci: Vec<u16>,
-    pub pcell: Vec<u8>,
+    pub pcell: Vec<u16>,
     pub pprob: Vec<f32>,
     /// Decisions by coarse move class, for the run report's strategy mix.
     pub plays: [usize; 6],

@@ -818,7 +818,7 @@ pub struct Solved {
 pub struct Policy {
     pub acts: Vec<[u8; ACT_BYTES]>,
     pub off: Vec<u32>,
-    pub act: Vec<u8>,
+    pub act: Vec<u16>,
     pub p: Vec<f32>,
 }
 
@@ -4001,7 +4001,7 @@ impl Solver {
         out.off.push(0);
         for c in 0..n.nc(me) {
             for cell in n.legal_row(c) {
-                out.act.push(n.legal_action[cell] as u8);
+                out.act.push(n.legal_action[cell] as u16);
                 out.p.push(self.avg[so + cell]);
             }
             out.off.push(out.act.len() as u32);

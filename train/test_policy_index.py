@@ -30,7 +30,7 @@ def dump(n, ncfg, na, ncells):
     paoff = np.arange(n + 1, dtype=np.int64) * na
     pcoff = np.arange(n + 1, dtype=np.int64) * ncells
     pci = np.tile(np.arange(ncells, dtype=np.int64) % max(ncfg, 1), n).astype(np.uint16)
-    pact = np.tile(np.arange(ncells, dtype=np.int64) % max(na, 1), n).astype(np.uint8)
+    pact = np.tile(np.arange(ncells, dtype=np.int64) % max(na, 1), n).astype(np.uint16)
     pprob = np.full(n * ncells, 1.0 / max(ncells, 1), np.float32)
     return rows, cc, cw, cy, coff, soff, (pa, paoff, pcoff, pci, pact, pprob)
 

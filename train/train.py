@@ -158,7 +158,7 @@ class Buffer:
         self.pcap = cap * 96
         self.pa = np.zeros((self.acap, ACT_BYTES), np.uint8)
         self.pci = np.zeros(self.pcap, np.uint16)
-        self.pact = np.zeros(self.pcap, np.uint8)
+        self.pact = np.zeros(self.pcap, np.uint16)
         self.pp = np.zeros(self.pcap, np.float16)
         self.acts = 0
         self.cells = 0
@@ -752,7 +752,7 @@ def main():
                        np.asarray(data["paoff"], np.int64),
                        np.asarray(data["pcoff"], np.int64),
                        np.asarray(data["pci"], np.uint16),
-                       np.asarray(data["pcell"], np.uint8),
+                       np.asarray(data["pcell"], np.uint16),
                        np.asarray(data["pprob"], np.float16))
                 buf.add(rows, cc, cw.astype(np.float16),
                         cy.astype(np.float16), coff, soff, pol)
