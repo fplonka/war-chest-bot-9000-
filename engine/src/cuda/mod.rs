@@ -891,18 +891,11 @@ impl Device {
             let fixed = round.saturating_sub(variable);
             let usable = free.saturating_sub(fixed);
             let measured_fit = (usable - usable / 10) / per.max(1);
-            let measured_n = n.min(measured_fit as usize);
-            if measured_n < n {
-                n = measured_n;
-                for (p, card) in pair.iter_mut().enumerate() {
-                    *card.host.get_mut() = Stage::default();
-                    *card.scratch.get_mut() = Scratch::default();
-                    *card.batch.get_mut() = Batch::default();
-                    card.carve(n, &cfg).map_err(|e| {
-                        format!("recarve gpu {g} pipe {p} n={n} slot={slot} free={free}: {e}")
-                    })?;
-                    card.stream.synchronize().map_err(err)?;
-                }
+            n = n.min(measured_fit as usize);
+            for card in &mut pair {
+                *card.host.get_mut() = Stage::default();
+                *card.scratch.get_mut() = Scratch::default();
+                *card.batch.get_mut() = Batch::default();
             }
             if n == 0 {
                 return Err(format!(
@@ -918,8 +911,12 @@ impl Device {
                 *CENSUS.lock() = s.census();
             }
             let solves = Arc::new(parking_lot::Mutex::new(solves));
-            for card in &mut pair {
+            for (p, card) in pair.iter_mut().enumerate() {
                 card.solves = Arc::clone(&solves);
+                card.carve(n, &cfg).map_err(|e| {
+                    format!("carve gpu {g} pipe {p} n={n} slot={slot} free={free}: {e}")
+                })?;
+                card.stream.synchronize().map_err(err)?;
             }
             cards.extend(pair);
         }
