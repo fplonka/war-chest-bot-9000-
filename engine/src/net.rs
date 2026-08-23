@@ -26,7 +26,7 @@ use crate::pbs::{
     CFEAT, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_CARDS, OFF_LOOSE, OFF_PILES, PILE_COUNTS,
     PUBFEAT,
 };
-use crate::units::CARD_FEATS;
+use crate::units::{write_card_features, CARD_FEATS};
 use std::cell::RefCell;
 
 /// Coin-type token width.
@@ -657,6 +657,49 @@ impl Net {
         recycle(hidden);
         recycle(arg);
         recycle(th);
+    }
+
+    /// `[rows, NTYPE, TYPE]` printed-card tokens from packed public rows.
+    pub fn cards_from_rows(&self, packed: &[u8], rows: usize, out: &mut Vec<f32>) {
+        use crate::pbs::{ROW_BYTES, ROW_IDS};
+        let mut facts = scratch(rows * NTYPE * CARD_FEATS);
+        for (r, row) in packed.chunks_exact(ROW_BYTES).enumerate() {
+            for t in 0..NTYPE {
+                write_card_features(
+                    row[ROW_IDS + t],
+                    &mut facts[(r * NTYPE + t) * CARD_FEATS..(r * NTYPE + t + 1) * CARD_FEATS],
+                );
+            }
+        }
+        let mut hidden = scratch(0);
+        self.card[0].run(&facts, rows * NTYPE, &mut hidden);
+        let (mut arg, mut th) = (scratch(0), scratch(0));
+        gelu_all(&mut hidden[..rows * NTYPE * TYPE], &mut arg, &mut th);
+        self.card[1].run(&hidden, rows * NTYPE, out);
+        recycle(facts);
+        recycle(hidden);
+        recycle(arg);
+        recycle(th);
+    }
+
+    /// The CPU reference trunk from packed public rows.
+    pub fn board_from_rows(
+        &self,
+        packed: &[u8],
+        cards: &[f32],
+        rows: usize,
+        card_rows: usize,
+        out: &mut Vec<f32>,
+    ) {
+        use crate::pbs::{expand_row, ROW_BYTES};
+        let mut xpub = vec![0.0; rows * PUBFEAT];
+        for (row, dst) in packed
+            .chunks_exact(ROW_BYTES)
+            .zip(xpub.chunks_exact_mut(PUBFEAT))
+        {
+            expand_row(row, dst);
+        }
+        self.board(&xpub, cards, rows, card_rows, out);
     }
 
     /// Card tokens plus this row's pile counts and the owner's seat.

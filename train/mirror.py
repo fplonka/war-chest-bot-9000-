@@ -68,6 +68,9 @@ def mirror_rows(rows):
     # (NSLOT * PILE_COUNTS per player).
     _swap(out, warchest.ROW_IDS, NSLOT)
     _swap(out, warchest.ROW_PILES, NSLOT * PILE_COUNTS)
+    for at in (warchest.ROW_HAND_SIZE, warchest.ROW_FD_SIZE,
+               warchest.ROW_BAG_SIZE):
+        _swap(out, at, 1)
     # Initiative holder and the player to act swap; initiative-moved and the
     # horizon do not.
     out[:, warchest.ROW_INITIATIVE] = _flip_seat(out[:, warchest.ROW_INITIATIVE])
@@ -169,11 +172,8 @@ def self_check(vx, n=512):
     return True
 
 
-def self_check_rows(rows, cc, cp, seg):
-    """The row-level checks: involution, and expansion commuting with the
-    feature mirror. `rows` may be a leading slice of the batch; the config
-    arrays are the full batch's, so sizes are read from the first config of
-    each span as usual."""
+def self_check_rows(rows):
+    """Check involution and expansion commuting with the feature mirror."""
     mr = mirror_rows(rows)
     assert np.array_equal(mirror_rows(mr), rows), "row mirror is not an involution"
     # Unit ids swap players; piles swap players.
@@ -181,14 +181,9 @@ def self_check_rows(rows, cc, cp, seg):
     mids = mr[:, warchest.ROW_IDS:warchest.ROW_IDS + NTYPE]
     assert np.array_equal(ids[:, :NSLOT], mids[:, NSLOT:]), "unit ids did not swap"
     # Expansion commutes: expand(mirror(rows)) == mirror_x(expand(rows)).
-    from train import expand_batch, public_sizes
-    n = len(rows)
-    hand, fd, bag = public_sizes(cc, cp, seg, n)
-    hand_m = hand[:, ::-1].copy()
-    fd_m = fd[:, ::-1].copy()
-    bag_m = bag[:, ::-1].copy()
-    a = expand_batch(mr, hand_m, fd_m, bag_m)
-    b = mirror_x(expand_batch(rows, hand, fd, bag))
+    from train import expand_batch
+    a = expand_batch(mr)
+    b = mirror_x(expand_batch(rows))
     assert np.allclose(a, b, atol=1e-6), "row mirror and feature mirror diverge"
     return True
 

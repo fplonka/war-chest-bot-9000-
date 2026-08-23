@@ -49,18 +49,18 @@ pub enum Call {
     /// Rows and boards are counted apart. The trunk reads the public state and
     /// nothing else, and coin plays commute, so a sixth to a quarter of a
     /// solve's rows repeat a public state an earlier row already carried.
-    /// `xpub` holds the distinct ones and `board_of` says which board each of
+    /// `packed` holds the distinct ones and `board_of` says which board each of
     /// this call's rows reads.
     Trunk {
         solve: usize,
         at: usize,
-        rows: usize,
+        queries: usize,
         /// One entry per row of this call: the board it reads, indexed from
         /// the start of the solve.
         board_of: Vec<u32>,
         boards_at: usize,
         boards: usize,
-        xpub: Vec<f32>,
+        packed: Vec<u8>,
         cards: Vec<f32>,
         /// The belief index of exactly these rows: which config each query's
         /// support names, and where each query's span starts. A leaf's support
@@ -289,10 +289,8 @@ impl Call {
     pub fn run(&self, net: &Net) -> Reply {
         let mut r = Reply::default();
         match self {
-            Call::Trunk { xpub, cards, boards, .. } => {
-                // One row a distinct public state in `xpub`, and one card
-                // table per solve -- `board` reads the physical view of that.
-                net.board(xpub, cards, *boards, CARD_ROWS, &mut r.a);
+            Call::Trunk { packed, cards, boards, .. } => {
+                net.board_from_rows(packed, cards, *boards, CARD_ROWS, &mut r.a);
                 net.join_cache(&r.a, *boards, &mut r.b);
             }
             Call::Configs { phi, owner, cards, n, .. } => {
@@ -333,7 +331,7 @@ impl Call {
     /// Rows this call contributes to its batch, for the round report.
     pub fn rows(&self) -> usize {
         match self {
-            Call::Trunk { rows, .. } => *rows,
+            Call::Trunk { queries, .. } => *queries,
             Call::Configs { n, .. } => *n,
             Call::Tree { .. } | Call::Iterate { .. } | Call::Read { .. } => 0,
         }

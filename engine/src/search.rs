@@ -983,23 +983,21 @@ impl TNode {
 /// The per-solve buffers, pooled *by role*: they differ in size by 5x, so a
 /// single shared pool handed each one somebody else's buffer and made it grow
 /// — and growth is the one thing that zeroes.
-const N_ROLES: usize = 9;
+const N_ROLES: usize = 8;
 const R_PB: usize = 0;
-const R_XPUB: usize = 1;
-const R_XB: usize = 2;
-const R_H: usize = 3;
-const R_CPHI: usize = 4;
-const R_CF: usize = 5;
-const R_CG: usize = 6;
-const R_JP: usize = 7;
-const R_CP: usize = 8;
+const R_XB: usize = 1;
+const R_H: usize = 2;
+const R_CPHI: usize = 3;
+const R_CF: usize = 4;
+const R_CG: usize = 5;
+const R_JP: usize = 6;
+const R_CP: usize = 7;
 
 thread_local! {
     static BUFS: std::cell::RefCell<[Vec<Vec<f32>>; N_ROLES]> = const {
         std::cell::RefCell::new([
             Vec::new(), Vec::new(), Vec::new(), Vec::new(),
             Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(),
         ])
     };
 }
@@ -1074,13 +1072,11 @@ impl std::hash::BuildHasher for KeyHash {
     }
 }
 
-/// One public encoding, hashed. A word at a time, because the row is nine
-/// hundred floats and a byte-at-a-time hash of it would cost more than the
-/// duplicate trunk row it saves.
-fn row_key(row: &[f32]) -> u64 {
+/// One packed public row, hashed.
+fn row_key(row: &[u8]) -> u64 {
     let mut h = 0u64;
     for &x in row {
-        h = (x.to_bits() as u64 ^ h).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h = (x as u64 ^ h).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         h ^= h >> 29;
     }
     h
@@ -1352,13 +1348,12 @@ pub struct Solver {
     /// against the row itself, so a collision costs a duplicate board rather
     /// than a wrong answer.
     bmap: std::collections::HashMap<u64, u32, KeyHash>,
-    /// Distinct public encodings `xpub` holds. Pooled buffers keep their
-    /// length across solves, so this cannot be read off `xpub.len()`.
+    /// Distinct public encodings `packed` holds.
     pub nboards: usize,
-    /// Expanded public encoding, one row a distinct public state.
-    pub(crate) xpub: Vec<f32>,
-    /// The mirrored view of the first leaf, which is all the card table wants.
-    mirror0: Vec<f32>,
+    /// Packed public encoding, one row a distinct public state.
+    pub(crate) packed: Vec<u8>,
+    /// The mirrored packed first leaf, which is all the card table wants.
+    mirror0: Vec<u8>,
     /// `[2 * rows, POOL]` pooled belief embeddings — the one thing the join
     /// reads that moves between CFR iterations.
     pub xb: Vec<f32>,
@@ -1409,7 +1404,6 @@ impl Drop for Solver {
         for (role, v) in [
             (R_PB, &mut self.pb),
             (R_JP, &mut self.jp),
-            (R_XPUB, &mut self.xpub),
             (R_XB, &mut self.xb),
             (R_H, &mut self.h),
             (R_CPHI, &mut self.cphi),
@@ -1502,7 +1496,7 @@ impl Solver {
             cards: Vec::new(),
             pb: take_buf(R_PB),
             jp: take_buf(R_JP),
-            xpub: take_buf(R_XPUB),
+            packed: Vec::new(),
             mirror0: Vec::new(),
             xb: take_buf(R_XB),
             h: take_buf(R_H),
@@ -1892,7 +1886,7 @@ impl Solver {
         self.row_of.truncate(m.nodes);
         self.leaf_rows.truncate(m.leaf_rows);
         self.cached = self.cached.map(|k| k.min(m.leaf_rows));
-        // `xpub` is written by index and reused, so only the count and the
+        // `packed` is written by index and reused, so only the count and the
         // interning map name boards that no longer exist. A board an abandoned
         // row shared with a surviving one stays, and stays right.
         self.board_of.truncate(m.leaf_rows);
@@ -2457,25 +2451,23 @@ impl Solver {
     /// still wants it is the card table, which holds a view a seat and is
     /// built once a solve off the first board; that one mirror is kept here.
     ///
-    /// The encoding is written where the next board would go and kept only if
+    /// The packed row is written where the next board would go and kept only if
     /// no earlier board already holds it. Writing first is what makes the
     /// comparison free: the row has to be built to be hashed either way.
     fn encode(&mut self, s: &State) -> u32 {
-        let at = self.nboards * PUBFEAT;
-        if self.xpub.len() < at + PUBFEAT {
-            // Grow in chunks so the zero-fill happens a handful of times per
-            // solve, and not at all once the pooled buffer is warm.
-            self.xpub.resize(at + 128 * PUBFEAT, 0.0);
+        let at = self.nboards * ROW_BYTES;
+        if self.packed.len() < at + ROW_BYTES {
+            self.packed.resize(at + 128 * ROW_BYTES, 0);
         }
-        write_public_features(s, &self.ctx, &mut self.xpub[at..at + PUBFEAT]);
+        pack_row(s, &self.ctx, &mut self.packed[at..at + ROW_BYTES]);
         if self.nboards == 0 {
-            self.mirror0.resize(PUBFEAT, 0.0);
-            write_public_features(&s.mirror(), &self.ctx.mirrored(), &mut self.mirror0);
+            self.mirror0.resize(ROW_BYTES, 0);
+            pack_row(&s.mirror(), &self.ctx.mirrored(), &mut self.mirror0);
         }
-        let key = row_key(&self.xpub[at..at + PUBFEAT]);
+        let key = row_key(&self.packed[at..at + ROW_BYTES]);
         if let Some(&b) = self.bmap.get(&key) {
-            let old = b as usize * PUBFEAT;
-            if self.xpub[old..old + PUBFEAT] == self.xpub[at..at + PUBFEAT] {
+            let old = b as usize * ROW_BYTES;
+            if self.packed[old..old + ROW_BYTES] == self.packed[at..at + ROW_BYTES] {
                 return b;
             }
         }
@@ -2610,20 +2602,20 @@ impl Solver {
         let fresh_rows = rows - self.batch_rows;
         let fresh_cfgs = self.ncfg - self.batch_cfgs;
         if self.cards.is_empty() && (fresh_rows > 0 || fresh_cfgs > 0) {
-            let both = [&self.xpub[..PUBFEAT], &self.mirror0[..]].concat();
-            self.nets.value.cards(&both, 2, &mut self.cards);
+            let both = [&self.packed[..ROW_BYTES], &self.mirror0[..]].concat();
+            self.nets.value.cards_from_rows(&both, 2, &mut self.cards);
         }
         if fresh_rows > 0 {
             // The cards in play are fixed at the draft, so every row of the
             // subgame carries the same card block and the table is built once,
             // one view per seat. Everything downstream reads it by canonical
             // coin-type index.
-            // Exactly the fresh boards. `xpub` is a grown scratch buffer, so
+            // Exactly the fresh boards. `packed` is a grown scratch buffer, so
             // an open-ended slice would carry whatever the last, larger
             // subgame left behind — invisible to a solve evaluating alone, and
             // wrong the moment the farm concatenates this call with another.
-            let at = self.batch_boards * PUBFEAT;
-            let end = self.nboards * PUBFEAT;
+            let at = self.batch_boards * ROW_BYTES;
+            let end = self.nboards * ROW_BYTES;
             // The belief index of exactly the rows this call makes. A leaf's
             // support is fixed when the leaf is, so it travels with the trunk
             // and never again. `leaf_coff` holds a query's *start* and nothing
@@ -2636,11 +2628,11 @@ impl Solver {
             calls.push(Call::Trunk {
                 solve: self.slot,
                 at: self.batch_rows,
-                rows: fresh_rows,
+                queries: fresh_rows,
                 board_of: self.board_of[self.batch_rows..].to_vec(),
                 boards_at: self.batch_boards,
                 boards: self.nboards - self.batch_boards,
-                xpub: self.xpub[at..end].to_vec(),
+                packed: self.packed[at..end].to_vec(),
                 cards: self.cards.clone(),
                 cidx: self.leaf_cidx[cs..].to_vec(),
                 coff,
@@ -4091,8 +4083,8 @@ impl Solver {
                     + u(&self.leaf_coff)
                     + u(&self.board_of)
                     + f(&self.cphi)
-                    + f(&self.xpub)
-                    + f(&self.mirror0)
+                    + self.packed.capacity()
+                    + self.mirror0.capacity()
                     + f(&self.cards)
                     + self.cplayer.capacity(),
             ),

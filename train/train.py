@@ -90,24 +90,12 @@ def action_feats(pa):
     return feat
 
 
-def public_sizes(cc, cp, seg, n):
-    """Per-row per-player hand/face-down/bag sizes, from the row's config
-    support. `seg` must be non-decreasing with values `2 * row + seat`; all
-    configs in a support share the sizes, so the first config of each span
-    decides."""
-    starts = np.searchsorted(seg, np.arange(2 * n, dtype=np.int64), side="left")
-    cs = cc[starts]
-    return (cs[:, :5].sum(1).astype(np.uint8).reshape(n, 2),
-            cs[:, 5:10].sum(1).astype(np.uint8).reshape(n, 2),
-            cs[:, 10:].sum(1).astype(np.uint8).reshape(n, 2))
-
-
-def expand_batch(rows, hand, fd, bag):
+def expand_batch(rows):
     """Expand packed replay rows into the public encoding, in one batch.
     The expansion itself runs in Rust — one source of truth with the
     solver's leaf encoding."""
     n = len(rows)
-    return np.asarray(warchest.expand_rows(rows.ravel(), hand, fd, bag), np.float32).reshape(n, -1)
+    return np.asarray(warchest.expand_rows(rows.ravel()), np.float32).reshape(n, -1)
 
 
 class Buffer:
@@ -328,17 +316,10 @@ def make_batch(parts, rng, device):
     del rng
     rows, cc, cp, cw, cy, seg, pol = parts
     n = len(rows)
-    hand, fd, bag = public_sizes(cc, cp, seg, n)
     views = np.empty((2 * n, ROW_BYTES), np.uint8)
     views[0::2] = rows
     views[1::2] = mirror.mirror_rows(rows)
-    sizes = []
-    for a in (hand, fd, bag):
-        pair = np.empty((2 * n, 2), np.uint8)
-        pair[0::2] = a
-        pair[1::2] = a[:, ::-1]
-        sizes.append(pair)
-    x = expand_batch(views, *sizes)
+    x = expand_batch(views)
     phi = cc.astype(np.float32) / CNORM
     t = lambda a, d=torch.float32: torch.as_tensor(a, dtype=d, device=device)
     pa, pact, pcrow, pcfg, pprob, parow = pol

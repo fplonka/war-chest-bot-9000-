@@ -490,7 +490,7 @@ use crate::net::Net;
 use crate::farm::{Backend, Farm, Work};
 use crate::search::{Budget, Cfg, Cfr, Ent, Nets};
 use crate::selfplay::{run_games, Agent, Collect, Data, GameCfg};
-use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyReadonlyArray1};
 use parking_lot::RwLock;
 use std::sync::{Arc, LazyLock};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1080,10 +1080,7 @@ fn mirror_row_pairs(games: usize, seed: u64) -> Vec<u8> {
 
 /// Expand packed replay rows into the public encoding, in one batch.
 ///
-/// `rows` is `[n * ROW_BYTES]` u8 (see `pbs::ROW_*`); `hand`/`fd`/`bag` are
-/// the public per-player hand/face-down/bag sizes, `[n, 2]` u8, read off the
-/// row's config support by the caller (every config in a support shares
-/// them) — the only part of the public state the row does not carry itself.
+/// `rows` is `[n * ROW_BYTES]` u8 (see `pbs::ROW_*`).
 /// Returns `[n, PUBFEAT]` f32, the exact layout `write_public_features`
 /// produces for a live state.
 #[pyfunction]
@@ -1092,48 +1089,46 @@ fn rules_table_hash() -> u64 {
 }
 
 #[pyfunction]
-fn expand_rows(
-    rows: PyReadonlyArray1<u8>,
-    hand: PyReadonlyArray2<u8>,
-    fd: PyReadonlyArray2<u8>,
-    bag: PyReadonlyArray2<u8>,
-) -> PyResult<Vec<f32>> {
+fn expand_rows(rows: PyReadonlyArray1<u8>) -> PyResult<Vec<f32>> {
     use crate::pbs::{expand_row, PUBFEAT, ROW_BYTES};
     let rows = rows.as_slice()?;
-    let hand = hand.as_array();
-    let fd = fd.as_array();
-    let bag = bag.as_array();
     let n = rows.len() / ROW_BYTES;
     if rows.len() != n * ROW_BYTES {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "rows is not a multiple of ROW_BYTES",
         ));
     }
-    if hand.shape() != [n, 2] || fd.shape() != [n, 2] || bag.shape() != [n, 2] {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "hand/fd/bag must be [n, 2] u8",
-        ));
-    }
     let mut out = vec![0.0f32; n * PUBFEAT];
     for r in 0..n {
         let row = &rows[r * ROW_BYTES..(r + 1) * ROW_BYTES];
-        let mut hs = [0u8; 2];
-        let mut fds = [0u8; 2];
-        let mut bg = [0u8; 2];
-        for p in 0..2usize {
-            hs[p] = hand[[r, p]];
-            fds[p] = fd[[r, p]];
-            bg[p] = bag[[r, p]];
-        }
-        expand_row(
-            row,
-            &hs,
-            &fds,
-            &bg,
-            &mut out[r * PUBFEAT..(r + 1) * PUBFEAT],
-        );
+        expand_row(row, &mut out[r * PUBFEAT..(r + 1) * PUBFEAT]);
     }
     Ok(out)
+}
+
+/// Expand CUDA-resident packed rows on PyTorch's current stream.
+#[pyfunction]
+fn expand_rows_cuda(
+    rows: u64,
+    cards: u64,
+    locations: u64,
+    out: u64,
+    n: usize,
+    stream: usize,
+    device: i32,
+) -> PyResult<()> {
+    #[cfg(feature = "gpu")]
+    {
+        return crate::cuda::expand_rows_torch(rows, cards, locations, out, n, stream, device)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err);
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = (rows, cards, locations, out, n, stream, device);
+        Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "warchest was built without CUDA",
+        ))
+    }
 }
 
 #[pymodule]
@@ -1176,6 +1171,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("OFF_CARDS", crate::pbs::OFF_CARDS)?;
     m.add("OFF_LOOSE", crate::pbs::OFF_LOOSE)?;
     m.add_function(wrap_pyfunction!(expand_rows, m)?)?;
+    m.add_function(wrap_pyfunction!(expand_rows_cuda, m)?)?;
     m.add("ROW_BYTES", crate::pbs::ROW_BYTES)?;
     m.add("ROW_IDS", crate::pbs::ROW_IDS)?;
     m.add("ROW_HEX_OWNER", crate::pbs::ROW_HEX_OWNER)?;
@@ -1183,6 +1179,9 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ROW_HEX_HEIGHT", crate::pbs::ROW_HEX_HEIGHT)?;
     m.add("ROW_HEX_MARKER", crate::pbs::ROW_HEX_MARKER)?;
     m.add("ROW_PILES", crate::pbs::ROW_PILES)?;
+    m.add("ROW_HAND_SIZE", crate::pbs::ROW_HAND_SIZE)?;
+    m.add("ROW_FD_SIZE", crate::pbs::ROW_FD_SIZE)?;
+    m.add("ROW_BAG_SIZE", crate::pbs::ROW_BAG_SIZE)?;
     m.add("ROW_INITIATIVE", crate::pbs::ROW_INITIATIVE)?;
     m.add("ROW_INIT_MOVED", crate::pbs::ROW_INIT_MOVED)?;
     m.add("ROW_TO_ACT", crate::pbs::ROW_TO_ACT)?;

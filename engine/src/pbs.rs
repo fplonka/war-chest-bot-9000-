@@ -948,12 +948,13 @@ pub const LOOSE: usize = 2 * PLAYER_SCALARS + GLOBAL_SCALARS;
 /// 84  u8   hex_height[37]
 /// 121 u8   hex_marker_owner[37]     NONE sentinel
 /// 158 u8   pile_counts[2][5][4]     reserve, face-up, supply, eliminated
-/// 198 u8   initiative_holder
-/// 199 u8   initiative_moved
-/// 200 u8   player_to_act
-/// 201 u16  main_plays_remaining
-/// 203 u8   stack kind[CONT_CAP]     0xFF = empty slot
-/// 219 u64  stack owed[CONT_CAP]     hex bitmask per level
+/// 198 u8   public_sizes[3][2]       hand, face-down, bag; player-minor
+/// 204 u8   initiative_holder
+/// 205 u8   initiative_moved
+/// 206 u8   player_to_act
+/// 207 u16  main_plays_remaining
+/// 209 u8   stack kind[CONT_CAP]     0xFF = empty slot
+/// 225 u64  stack owed[CONT_CAP]     hex bitmask per level
 /// ```
 
 pub const ROW_IDS: usize = 0;
@@ -962,7 +963,10 @@ pub const ROW_HEX_SLOT: usize = ROW_HEX_OWNER + N_HEXES;
 pub const ROW_HEX_HEIGHT: usize = ROW_HEX_SLOT + N_HEXES;
 pub const ROW_HEX_MARKER: usize = ROW_HEX_HEIGHT + N_HEXES;
 pub const ROW_PILES: usize = ROW_HEX_MARKER + N_HEXES;
-pub const ROW_INITIATIVE: usize = ROW_PILES + 2 * NSLOT * PILE_COUNTS;
+pub const ROW_HAND_SIZE: usize = ROW_PILES + 2 * NSLOT * PILE_COUNTS;
+pub const ROW_FD_SIZE: usize = ROW_HAND_SIZE + 2;
+pub const ROW_BAG_SIZE: usize = ROW_FD_SIZE + 2;
+pub const ROW_INITIATIVE: usize = ROW_BAG_SIZE + 2;
 pub const ROW_INIT_MOVED: usize = ROW_INITIATIVE + 1;
 pub const ROW_TO_ACT: usize = ROW_INIT_MOVED + 1;
 pub const ROW_PLIES: usize = ROW_TO_ACT + 1;
@@ -1257,6 +1261,9 @@ pub fn pack_row(s: &State, ctx: &Ctx, out: &mut [u8]) {
             out[at + 2] = s.zones[p][Z_SUPPLY][u];
             out[at + 3] = s.zones[p][Z_ELIM][u];
         }
+        out[ROW_HAND_SIZE + p] = s.hand_size(p as u8);
+        out[ROW_FD_SIZE + p] = s.zones[p][Z_FACEDOWN].iter().sum();
+        out[ROW_BAG_SIZE + p] = s.bag_size(p as u8);
     }
     out[ROW_INITIATIVE] = s.initiative;
     out[ROW_INIT_MOVED] = s.initiative_moved as u8;
@@ -1273,17 +1280,7 @@ pub fn pack_row(s: &State, ctx: &Ctx, out: &mut [u8]) {
 
 
 /// Expand a stored replay row into the public encoding, in place.
-///
-/// `hand_size`/`fd_size`/`bag_size` are the public per-player counts carried
-/// by the row's config support (every config in a support shares them); they
-/// are the only part of the row that is not stored directly.
-pub fn expand_row(
-    row: &[u8],
-    hand_size: &[u8; 2],
-    fd_size: &[u8; 2],
-    bag_size: &[u8; 2],
-    out: &mut [f32],
-) {
+pub fn expand_row(row: &[u8], out: &mut [f32]) {
     debug_assert_eq!(row.len(), ROW_BYTES);
     let mut hex_owner = [NONE; N_HEXES];
     let mut hex_slot = [NONE; N_HEXES];
@@ -1315,9 +1312,9 @@ pub fn expand_row(
         &row[ROW_PILES..ROW_PILES + 2 * NSLOT * PILE_COUNTS],
         &row[ROW_IDS..ROW_IDS + 2 * NSLOT],
         &markers_hand,
-        hand_size,
-        fd_size,
-        bag_size,
+        row[ROW_HAND_SIZE..ROW_HAND_SIZE + 2].try_into().unwrap(),
+        row[ROW_FD_SIZE..ROW_FD_SIZE + 2].try_into().unwrap(),
+        row[ROW_BAG_SIZE..ROW_BAG_SIZE + 2].try_into().unwrap(),
         initiative,
         row[ROW_INIT_MOVED] != 0,
         row[ROW_TO_ACT],

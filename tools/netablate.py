@@ -25,7 +25,7 @@ import mirror  # noqa: E402
 import value_net  # noqa: E402
 import warchest  # noqa: E402
 from dump import Dump  # noqa: E402
-from train import expand_batch, public_sizes  # noqa: E402
+from train import expand_batch  # noqa: E402
 
 CNORM = warchest.CNORM
 ROW_BYTES = warchest.ROW_BYTES
@@ -72,17 +72,10 @@ def build(dev, blocks, c, jblocks, jw, d, pool, cfgh):
 def batch(dump, lo, hi, dev):
     rows, cc, cp, cw, cy, seg = dump.rows(lo, hi)
     n = len(rows)
-    hand, fd, bag = public_sizes(cc, cp, seg, n)
     views = np.empty((2 * n, ROW_BYTES), np.uint8)
     views[0::2] = rows
     views[1::2] = mirror.mirror_rows(rows)
-    sizes = []
-    for a in (hand, fd, bag):
-        pair = np.empty((2 * n, 2), np.uint8)
-        pair[0::2] = a
-        pair[1::2] = a[:, ::-1]
-        sizes.append(pair)
-    x = expand_batch(views, *sizes)
+    x = expand_batch(views)
     t = lambda a, k=torch.float32: torch.as_tensor(a, dtype=k, device=dev)
     return (t(x), t(cc.astype(np.float32) / CNORM), t(cw),
             t(seg, torch.long), t(cy), 2 * n)

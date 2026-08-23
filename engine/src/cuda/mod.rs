@@ -9,9 +9,9 @@
 //!
 //! Two conventions carry the concatenation into the kernels:
 //!
-//! * a leaf's physical `xpub` row is `2 * r`. The paired canonical queries stay
-//!   adjacent when calls are joined, so the copy `net::board` makes to pick the
-//!   physical rows becomes a stride;
+//! * packed public rows are expanded after upload. A leaf's physical `xpub`
+//!   row is `2 * r`, so paired canonical queries stay adjacent and the copy
+//!   `net::board` makes becomes a stride;
 //! * anything that was constant within a call and varies across a batch — the
 //!   card table a leaf reads, the seat a join asks about — becomes an index
 //!   array.
@@ -41,9 +41,15 @@ use crate::net::{
     LN_ACT, LN_CFG, LN_H, LN_JOIN, LN_TRUNK, POOL, TYPE,
 };
 use crate::pbs::{
-    CFEAT, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_LOOSE, OFF_PILES, PILE_COUNTS, PUBFEAT,
+    CFEAT, HEX_BLOCK, HEX_CH, HEX_FACTS, LOOSE, MAX_COINS, NSLOT, NTYPE, OFF_CARDS, OFF_LOOSE,
+    OFF_PILES, PILE_COUNTS, PLAYER_SCALARS, PUBFEAT, ROW_BAG_SIZE, ROW_BYTES, ROW_FD_SIZE,
+    ROW_HAND_SIZE, ROW_HEX_HEIGHT, ROW_HEX_MARKER, ROW_HEX_OWNER, ROW_HEX_SLOT, ROW_IDS,
+    ROW_INITIATIVE, ROW_INIT_MOVED, ROW_PILES, ROW_PLIES, ROW_STACK_KIND, ROW_STACK_OWED,
+    ROW_TO_ACT,
 };
 use crate::search::{Budget, Cfg, Cfr, Ent};
+use crate::state::{CONT_CAP, MAX_MAIN_PLAYS, PENDING_KINDS};
+use crate::units::{write_card_features, CARD_FEATS, N_UNITS};
 
 mod slot;
 use slot::{Arr, Solve, DESC, FIELDS, C_CUR, C_PRIOR, C_QVAL, C_SUM, C_VISITS, R_REACH, R_VALS, B_P, B_JP, G_F, G_G, G_FP, Y_BOARD_OF, Y_COFF};
@@ -110,6 +116,7 @@ const KERNELS: &str = include_str!("kernels.cu");
 /// Everything in `kernels.cu`, resolved once at startup so a name that does not
 /// exist is an error there rather than a wrong answer later.
 struct Kernels {
+    expand_rows: CudaFunction,
     gelu: CudaFunction,
     norm_ip: CudaFunction,
     bias: CudaFunction,
@@ -146,6 +153,7 @@ impl Kernels {
                 .map_err(|e| format!("kernel {name}: {e:?}"))
         };
         Ok(Kernels {
+            expand_rows: get("k_expand_rows")?,
             gelu: get("k_gelu")?,
             norm_ip: get("k_norm_ip")?,
             bias: get("k_bias")?,
@@ -403,6 +411,7 @@ struct RoundCap {
     occupant: usize,
     x: usize,
     bag: usize,
+    packed: usize,
     xpub: usize,
     cards: usize,
     card_of_row: usize,
@@ -456,6 +465,7 @@ impl RoundCap {
             occupant: TILE * N_HEXES,
             x: TILE * N_HEXES * C,
             bag: n * CARD_ROWS * NTYPE * 3 * POOL,
+            packed: TILE * ROW_BYTES,
             xpub: TILE * PUBFEAT,
             cards,
             card_of_row: TILE,
@@ -512,7 +522,7 @@ impl RoundCap {
             + self.base
             + self.prime
             + self.touched;
-        w4 * 4 + (self.trees + self.dst) * 8
+        w4 * 4 + (self.trees + self.dst) * 8 + self.packed
     }
 }
 
@@ -807,6 +817,8 @@ struct Card {
     ln: CudaSlice<f32>,
     /// Hex adjacency, `NONE` folded to `-1`.
     nb: CudaSlice<i32>,
+    card_facts: CudaSlice<f32>,
+    locations: CudaSlice<u8>,
     /// What the join's residual stream is owed.
     ///
     /// Every block of the join adds its matrix multiply's bias to the same
@@ -952,6 +964,38 @@ impl Device {
         &self.net
     }
 
+    /// Expand packed public rows with the same kernel the trunk uses.
+    pub fn expand_rows(&self, rows: &[u8]) -> Res<Vec<f32>> {
+        if rows.len() % ROW_BYTES != 0 {
+            return Err("packed rows are not a multiple of ROW_BYTES".into());
+        }
+        let n = rows.len() / ROW_BYTES;
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let card = &self.cards[0];
+        card.stream.context().bind_to_thread().map_err(err)?;
+        let packed = card.stream.memcpy_stod(rows).map_err(err)?;
+        let mut out = card.stream.alloc_zeros::<f32>(n * PUBFEAT).map_err(err)?;
+        let n_i = n as i32;
+        unsafe {
+            card.stream
+                .launch_builder(&card.k.expand_rows)
+                .arg(&packed)
+                .arg(&card.card_facts)
+                .arg(&card.locations)
+                .arg(&mut out)
+                .arg(&n_i)
+                .launch_unit(LaunchConfig {
+                    grid_dim: (n as u32, 1, 1),
+                    block_dim: (THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+        }
+        .map_err(err)?;
+        card.stream.memcpy_dtov(&out).map_err(err)
+    }
+
     /// Point the cards at new weights.
     ///
     /// A publish used to build a whole new `Device`: a CUDA context per card
@@ -1066,6 +1110,139 @@ struct Gpu {
     k: Arc<Kernels>,
 }
 
+fn compile_options(major: i32, minor: i32) -> CompileOptions {
+    let define = |name: &str, value: usize| format!("-D{name}={value}");
+    CompileOptions {
+        options: vec![
+            format!("--gpu-architecture=compute_{major}{minor}"),
+            format!("-DJ_ROWS={JROWS}"),
+            format!("-DJ_W={JW}"),
+            format!("-DJ_IN={JOIN_K}"),
+            format!("-DJ_POOL={POOL}"),
+            format!("-DJ_D={D}"),
+            format!("-DJ_BLOCKS={JBLOCKS}"),
+            define("ROW_BYTES", ROW_BYTES),
+            define("PUBFEAT", PUBFEAT),
+            define("N_HEXES", N_HEXES),
+            define("HEX_CH", HEX_CH),
+            define("HEX_FACTS", HEX_FACTS),
+            define("HEX_BLOCK", HEX_BLOCK),
+            define("NTYPE", NTYPE),
+            define("NSLOT", NSLOT),
+            define("PILE_COUNTS", PILE_COUNTS),
+            define("CARD_FEATS", CARD_FEATS),
+            define("OFF_PILES", OFF_PILES),
+            define("OFF_CARDS", OFF_CARDS),
+            define("OFF_LOOSE", OFF_LOOSE),
+            define("PLAYER_SCALARS", PLAYER_SCALARS),
+            define("ROW_IDS", ROW_IDS),
+            define("ROW_HEX_OWNER", ROW_HEX_OWNER),
+            define("ROW_HEX_SLOT", ROW_HEX_SLOT),
+            define("ROW_HEX_HEIGHT", ROW_HEX_HEIGHT),
+            define("ROW_HEX_MARKER", ROW_HEX_MARKER),
+            define("ROW_PILES", ROW_PILES),
+            define("ROW_HAND_SIZE", ROW_HAND_SIZE),
+            define("ROW_FD_SIZE", ROW_FD_SIZE),
+            define("ROW_BAG_SIZE", ROW_BAG_SIZE),
+            define("ROW_INITIATIVE", ROW_INITIATIVE),
+            define("ROW_INIT_MOVED", ROW_INIT_MOVED),
+            define("ROW_TO_ACT", ROW_TO_ACT),
+            define("ROW_PLIES", ROW_PLIES),
+            define("ROW_STACK_KIND", ROW_STACK_KIND),
+            define("ROW_STACK_OWED", ROW_STACK_OWED),
+            define("PENDING_KINDS", PENDING_KINDS),
+            define("CONT_CAP", CONT_CAP),
+            define("MAX_MAIN_PLAYS", MAX_MAIN_PLAYS as usize),
+            format!("-DMAX_COINS={MAX_COINS:.1}f"),
+        ],
+        include_paths: vec![
+            "/usr/local/cuda/include".into(),
+            "/usr/include".into(),
+        ],
+        ..Default::default()
+    }
+}
+
+/// Launch the row expander on memory and a stream owned by PyTorch.
+pub fn expand_rows_torch(
+    rows: u64,
+    cards: u64,
+    locations: u64,
+    out: u64,
+    n: usize,
+    stream: usize,
+    ordinal: i32,
+) -> Res<()> {
+    use cudarc::driver::{result, sys};
+    use std::ffi::{c_void, CString};
+    use std::sync::LazyLock;
+
+    static FUNCTIONS: LazyLock<parking_lot::Mutex<std::collections::HashMap<i32, (usize, usize)>>> =
+        LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    if n == 0 {
+        return Ok(());
+    }
+    if result::ctx::get_current().map_err(err)?.is_none() {
+        return Err("PyTorch has no current CUDA context".into());
+    }
+    let function = {
+        let mut functions = FUNCTIONS.lock();
+        if let Some(&(_, function)) = functions.get(&ordinal) {
+            function as sys::CUfunction
+        } else {
+            let device = result::device::get(ordinal).map_err(err)?;
+            let major = unsafe {
+                result::device::get_attribute(
+                    device,
+                    sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                )
+            }
+            .map_err(err)?;
+            let minor = unsafe {
+                result::device::get_attribute(
+                    device,
+                    sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                )
+            }
+            .map_err(err)?;
+            let ptx = compile_ptx_with_opts(KERNELS, compile_options(major, minor))
+                .map_err(|e| format!("nvrtc: {e:?}"))?;
+            let image = CString::new(ptx.to_src()).expect("PTX contains no nul");
+            let module = unsafe { result::module::load_data(image.as_ptr() as *const c_void) }
+                .map_err(err)?;
+            let function = unsafe {
+                result::module::get_function(
+                    module,
+                    CString::new("k_expand_rows").expect("static name"),
+                )
+            }
+            .map_err(err)?;
+            functions.insert(ordinal, (module as usize, function as usize));
+            function
+        }
+    };
+    let (mut rows, mut cards, mut locations, mut out) = (rows, cards, locations, out);
+    let mut n = n as i32;
+    let mut args = [
+        &mut rows as *mut _ as *mut c_void,
+        &mut cards as *mut _ as *mut c_void,
+        &mut locations as *mut _ as *mut c_void,
+        &mut out as *mut _ as *mut c_void,
+        &mut n as *mut _ as *mut c_void,
+    ];
+    unsafe {
+        result::launch_kernel(
+            function,
+            (n as u32, 1, 1),
+            (THREADS, 1, 1),
+            0,
+            stream as sys::CUstream,
+            &mut args,
+        )
+    }
+    .map_err(err)
+}
+
 impl Gpu {
     fn new(ordinal: usize, _net: &Net) -> Res<Gpu> {
         let ctx = CudaContext::new(ordinal).map_err(|e| format!("device {ordinal}: {e:?}"))?;
@@ -1075,23 +1252,7 @@ impl Gpu {
         let (major, minor) = ctx.compute_capability().map_err(err)?;
         let ptx = compile_ptx_with_opts(
             KERNELS,
-            CompileOptions {
-                options: vec![
-                    format!("--gpu-architecture=compute_{major}{minor}"),
-                    format!("-DJ_ROWS={JROWS}"),
-                    format!("-DJ_W={JW}"),
-                    format!("-DJ_IN={JOIN_K}"),
-                    format!("-DJ_POOL={POOL}"),
-                    format!("-DJ_D={D}"),
-                    format!("-DJ_BLOCKS={JBLOCKS}"),
-                ],
-                // `cuda_fp16.h`, for the half-precision config readout.
-                include_paths: vec![
-                    "/usr/local/cuda/include".into(),
-                    "/usr/include".into(),
-                ],
-                ..Default::default()
-            },
+            compile_options(major, minor),
         )
         .map_err(|e| format!("nvrtc: {e:?}"))?;
         let module = ctx.load_module(ptx).map_err(err)?;
@@ -1123,6 +1284,14 @@ impl Card {
             .flatten()
             .map(|&n| if n == NONE { -1 } else { n as i32 })
             .collect();
+        let mut card_facts = vec![0.0; N_UNITS * CARD_FEATS];
+        for u in 0..N_UNITS {
+            write_card_features(
+                u as u8,
+                &mut card_facts[u * CARD_FEATS..(u + 1) * CARD_FEATS],
+            );
+        }
+        let locations: Vec<u8> = board().is_location.iter().map(|&x| x as u8).collect();
         let layout = NetLayout::new();
         let (fragwise, lanes) = fragwise(&layout, &flat.w);
         let mut plan: Vec<i32> = Vec::new();
@@ -1159,6 +1328,8 @@ impl Card {
             b: stream.memcpy_stod(&flat.b).map_err(err)?,
             ln: stream.memcpy_stod(&flat.ln).map_err(err)?,
             nb: stream.memcpy_stod(&nb).map_err(err)?,
+            card_facts: stream.memcpy_stod(&card_facts).map_err(err)?,
+            locations: stream.memcpy_stod(&locations).map_err(err)?,
             stream,
             blas,
             k: Arc::clone(&gpu.k),
@@ -1200,7 +1371,8 @@ impl Card {
         scratch.x = Arr::with_cap(s, cap.x)?;
         scratch.bag = Arr::with_cap(s, cap.bag)?;
         let mut stage = Stage::default();
-        stage.xpub = Wire::with_cap(s, cap.xpub)?;
+        stage.packed = Wire::with_cap(s, cap.packed)?;
+        stage.xpub = Arr::with_cap(s, cap.xpub)?;
         stage.cards = Wire::with_cap(s, cap.cards)?;
         stage.card_of_row = Wire::with_cap(s, cap.card_of_row)?;
         stage.phi = Wire::with_cap(s, cap.phi)?;
@@ -1358,13 +1530,13 @@ impl Card {
         if mine.is_empty() {
             return Ok(());
         }
-        let each = |i: usize| -> (&[f32], &[f32], usize) {
-            let Call::Trunk { xpub, cards, boards, .. } = &calls[i] else {
+        let each = |i: usize| -> (&[u8], &[f32], usize) {
+            let Call::Trunk { packed, cards, boards, .. } = &calls[i] else {
                 unreachable!("trunk shard holds only trunk calls")
             };
-            assert_eq!(xpub.len(), boards * PUBFEAT, "trunk xpub is not one row a board");
+            assert_eq!(packed.len(), boards * ROW_BYTES, "trunk input is not one packed row a board");
             assert_eq!(cards.len(), CARD_ROWS * NTYPE * TYPE, "trunk card table");
-            (xpub, cards, *boards)
+            (packed, cards, *boards)
         };
         let rows: usize = mine.iter().map(|&i| each(i).2).sum();
         {
@@ -1397,25 +1569,25 @@ impl Card {
             let n = TILE.min(rows - board0);
             {
                 let mut stage = self.host.lock();
-                stage.xpub.put(s, n * PUBFEAT, |dst| {
+                stage.packed.put(s, n * ROW_BYTES, |dst| {
                     let (mut skip, mut wrote) = (board0, 0);
                     for &i in mine {
-                        let (xp, _, boards) = each(i);
+                        let (packed, _, boards) = each(i);
                         if skip >= boards {
                             skip -= boards;
                             continue;
                         }
                         let take = (boards - skip).min(n - wrote);
-                        let a = skip * PUBFEAT;
-                        dst[wrote * PUBFEAT..(wrote + take) * PUBFEAT]
-                            .copy_from_slice(&xp[a..a + take * PUBFEAT]);
+                        let a = skip * ROW_BYTES;
+                        dst[wrote * ROW_BYTES..(wrote + take) * ROW_BYTES]
+                            .copy_from_slice(&packed[a..a + take * ROW_BYTES]);
                         wrote += take;
                         skip = 0;
                         if wrote == n {
                             break;
                         }
                     }
-                    wrote * PUBFEAT
+                    wrote * ROW_BYTES
                 })?;
                 stage.card_of_row.put(s, n, |dst| {
                     let (mut skip, mut wrote, mut card) = (board0, 0, 0i32);
@@ -1437,6 +1609,25 @@ impl Card {
                     }
                     wrote
                 })?;
+                let rows_i = n as i32;
+                let Stage { packed, xpub, .. } = &mut *stage;
+                let packed = packed.dev.buf.as_ref().expect("staged");
+                let xpub = xpub.buf.as_mut().expect("carved");
+                unsafe {
+                    self.stream
+                        .launch_builder(&self.k.expand_rows)
+                        .arg(packed)
+                        .arg(&self.card_facts)
+                        .arg(&self.locations)
+                        .arg(xpub)
+                        .arg(&rows_i)
+                        .launch_unit(LaunchConfig {
+                            grid_dim: (n as u32, 1, 1),
+                            block_dim: (THREADS, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                }
+                .map_err(err)?;
             }
             self.trunk_tile(calls, mine, board0, n)?;
             board0 += n;
@@ -1445,11 +1636,11 @@ impl Card {
         self.keep(calls, mine, pack)
     }
 
-    /// Encode `n` boards already staged at the head of `xpub` / `card_of_row`.
+    /// Encode `n` boards already expanded at the head of `xpub` / `card_of_row`.
     fn trunk_tile(&self, calls: &[Call], mine: &[usize], board0: usize, n: usize) -> Res<()> {
         let s = &self.stream;
         let stage = self.host.lock();
-        let xpub = stage.xpub.dev.buf.as_ref().expect("staged");
+        let xpub = stage.xpub.buf.as_ref().expect("carved");
         let cards = stage.cards.dev.buf.as_ref().expect("staged");
         let card_of_row = stage.card_of_row.dev.buf.as_ref().expect("staged");
         let cells = n * N_HEXES;
@@ -1561,7 +1752,7 @@ impl Card {
         let mut g = self.solves.lock();
         for &i in mine {
             let Call::Trunk {
-                solve, at: row0, rows: nrows, board_of, cidx, coff, ..
+                solve, at: row0, queries: nrows, board_of, cidx, coff, ..
             } = &calls[i] else {
                 unreachable!("trunk shard holds only trunk calls")
             };
@@ -2580,7 +2771,8 @@ impl Card {
 /// longer block; see `Host`.
 #[derive(Default)]
 struct Stage {
-    xpub: Wire<f32>,
+    packed: Wire<u8>,
+    xpub: Arr<f32>,
     cards: Wire<f32>,
     card_of_row: Wire<i32>,
     phi: Wire<f32>,
