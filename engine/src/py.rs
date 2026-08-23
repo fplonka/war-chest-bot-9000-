@@ -1176,8 +1176,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("OFF_LOOSE", crate::pbs::OFF_LOOSE)?;
     m.add_function(wrap_pyfunction!(expand_rows, m)?)?;
     m.add("ROW_BYTES", crate::pbs::ROW_BYTES)?;
-    m.add("ROW_VERSION", crate::pbs::ROW_VERSION)?;
-    m.add("ROW_HASH", crate::pbs::ROW_HASH)?;
     m.add("ROW_IDS", crate::pbs::ROW_IDS)?;
     m.add("ROW_HEX_OWNER", crate::pbs::ROW_HEX_OWNER)?;
     m.add("ROW_HEX_SLOT", crate::pbs::ROW_HEX_SLOT)?;
@@ -1190,7 +1188,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ROW_PLIES", crate::pbs::ROW_PLIES)?;
     m.add("ROW_PENDING", crate::pbs::ROW_PENDING)?;
     m.add("ROW_OWED", crate::pbs::ROW_OWED)?;
-    m.add("ROW_FORMAT_VERSION", crate::pbs::ROW_FORMAT_VERSION)?;
     m.add_function(wrap_pyfunction!(rules_table_hash, m)?)?;
     m.add_function(wrap_pyfunction!(hex_neighbours, m)?)?;
     m.add_function(wrap_pyfunction!(location_hexes, m)?)?;

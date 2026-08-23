@@ -936,33 +936,27 @@ pub const LOOSE: usize = 2 * PLAYER_SCALARS + GLOBAL_SCALARS;
 // learned encoding. The network input is rebuilt from it when a batch is made
 // (`expand_row`). Board
 // coordinates, location hexes and card facts are constants and are not stored
-// per row. Rows carry a format version and a hash of the rules tables so a
-// dump written by a different rules build fails loudly instead of training on
-// silently wrong features.
+// per row. A dump pins the rules tables once in its header.
 
 /// Packed size of one row in bytes. Layout (offsets are `ROW_*`):
 ///
 /// ```text
-/// 0   u32  format_version
-/// 4   u64  rules_table_hash
-/// 12  u8   unit_ids[2 * NSLOT]      player-major, slot order
-/// 22  u8   hex_owner[37]            NONE sentinel
-/// 59  u8   hex_unit_slot[37]        NONE sentinel
-/// 96  u8   hex_height[37]
-/// 133 u8   hex_marker_owner[37]     NONE sentinel
-/// 170 u8   pile_counts[2][5][4]     reserve, face-up, supply, eliminated
-/// 210 u8   initiative_holder
-/// 211 u8   initiative_moved
-/// 212 u8   player_to_act
-/// 213 u16  main_plays_remaining
-/// 215 u8   pending kind (Cont::tag)
-/// 216 u64  owed hexes (HexSet bitmask)
+/// 0   u8   unit_ids[2 * NSLOT]      player-major, slot order
+/// 10  u8   hex_owner[37]            NONE sentinel
+/// 47  u8   hex_unit_slot[37]        NONE sentinel
+/// 84  u8   hex_height[37]
+/// 121 u8   hex_marker_owner[37]     NONE sentinel
+/// 158 u8   pile_counts[2][5][4]     reserve, face-up, supply, eliminated
+/// 198 u8   initiative_holder
+/// 199 u8   initiative_moved
+/// 200 u8   player_to_act
+/// 201 u16  main_plays_remaining
+/// 203 u8   pending kind (Cont::tag)
+/// 204 u64  owed hexes (HexSet bitmask)
 /// ```
 
-pub const ROW_VERSION: usize = 0;
-pub const ROW_HASH: usize = 4;
-pub const ROW_IDS: usize = 12;
-pub const ROW_HEX_OWNER: usize = 22;
+pub const ROW_IDS: usize = 0;
+pub const ROW_HEX_OWNER: usize = ROW_IDS + 2 * NSLOT;
 pub const ROW_HEX_SLOT: usize = ROW_HEX_OWNER + N_HEXES;
 pub const ROW_HEX_HEIGHT: usize = ROW_HEX_SLOT + N_HEXES;
 pub const ROW_HEX_MARKER: usize = ROW_HEX_HEIGHT + N_HEXES;
@@ -974,11 +968,6 @@ pub const ROW_PLIES: usize = ROW_TO_ACT + 1;
 pub const ROW_PENDING: usize = ROW_PLIES + 2;
 pub const ROW_OWED: usize = ROW_PENDING + 1;
 pub const ROW_BYTES: usize = ROW_OWED + 8;
-
-
-/// The current row format version. Bump when the layout or the expanded
-/// feature layout changes; dumps carry it and refuse to load otherwise.
-pub const ROW_FORMAT_VERSION: u32 = 2;
 
 /// Hash of the constants the expansion depends on: the board's location map,
 /// the unit card-fact table and the layout constants. A rules change that
@@ -1230,8 +1219,6 @@ pub fn write_public_features_raw(
 /// Pack one replay row from a live state.
 pub fn pack_row(s: &State, ctx: &Ctx, out: &mut [u8]) {
     debug_assert_eq!(out.len(), ROW_BYTES);
-    out[ROW_VERSION..ROW_VERSION + 4].copy_from_slice(&ROW_FORMAT_VERSION.to_le_bytes());
-    out[ROW_HASH..ROW_HASH + 8].copy_from_slice(&rules_table_hash().to_le_bytes());
     for t in 0..2 * NSLOT {
         out[ROW_IDS + t] = ctx.slots[t / NSLOT][t % NSLOT];
     }

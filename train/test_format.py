@@ -82,13 +82,12 @@ def main():
     np.savez(dump_path, rows=got, cc=gcc, cp=gcp, cw=gcw, cy=gcy, seg=gseg,
              soff=gsoff, pubfeat=np.int32(PUBFEAT), cfeat=np.int32(CFEAT),
              ccounts=np.int32(CCOUNTS), cnorm=np.float32(CNORM),
-             row_bytes=np.int32(ROW_BYTES), version=np.int32(warchest.ROW_FORMAT_VERSION),
+             row_bytes=np.int32(ROW_BYTES),
              rules_hash=np.uint64(warchest.rules_table_hash()))
 
     print("[3/6] loading through Dump and checking the format pins", flush=True)
     dmp = Dump(dump_path)
     dmp.check(PUBFEAT, CCOUNTS)
-    assert dmp.version == warchest.ROW_FORMAT_VERSION
     assert dmp.rules_hash == warchest.rules_table_hash()
     assert len(dmp.soff) >= 2 and dmp.soff[0] == 0 and dmp.soff[-1] == len(dmp)
     print(f"      {len(dmp)} rows, {len(dmp.soff) - 1} solve boundaries", flush=True)

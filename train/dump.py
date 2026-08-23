@@ -23,8 +23,8 @@ A dump holds, oldest row first:
 Rows are stored oldest-first so a split by recency is possible. That is the only
 honest split: rows from one epoch come from the same handful of games and are
 heavily correlated, so a random split leaks its answers into the training set.
-`version` and `rules_hash` pin the row format and the rules tables; a dump from
-a different rules build is refused.
+`rules_hash` pins the rules tables; a dump from a different rules build is
+refused. `ROW_BYTES` / `PUBFEAT` / `CCOUNTS` pin the layout.
 """
 
 import numpy as np
@@ -43,7 +43,6 @@ class Dump:
         self.ccounts = int(d["ccounts"])
         self.cnorm = float(d["cnorm"])
         self.row_bytes = int(d.get("row_bytes", 0))
-        self.version = int(d.get("version", 0))
         self.rules_hash = int(d.get("rules_hash", 0))
         # `seg` is emitted in row order, so a row range is a contiguous config
         # range and slicing is two binary searches rather than a scan.
@@ -68,11 +67,6 @@ class Dump:
         if self.row_bytes != warchest.ROW_BYTES:
             raise SystemExit(
                 f"dump has ROW_BYTES={self.row_bytes}, module has {warchest.ROW_BYTES}"
-            )
-        if self.version != warchest.ROW_FORMAT_VERSION:
-            raise SystemExit(
-                f"dump has format version {self.version}, module has "
-                f"{warchest.ROW_FORMAT_VERSION} -- rebuild or redump"
             )
         if self.rules_hash != warchest.rules_table_hash():
             raise SystemExit(

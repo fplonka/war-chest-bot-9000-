@@ -79,7 +79,6 @@ def main():
              pubfeat=np.int32(PUBFEAT), cfeat=np.int32(CFEAT),
              ccounts=np.int32(CCOUNTS), cnorm=np.float32(CNORM),
              row_bytes=np.int32(ROW_BYTES),
-             version=np.int32(warchest.ROW_FORMAT_VERSION),
              rules_hash=np.uint64(warchest.rules_table_hash()))
     print(f"wrote {args.out}: {len(x)} rows, {len(soff) - 1} solves")
 
