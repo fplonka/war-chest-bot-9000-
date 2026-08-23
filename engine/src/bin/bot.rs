@@ -69,11 +69,19 @@ fn brain(o: &Options) -> Result<Brain, String> {
     };
     let cfr = Cfr::named(&o.cfr).ok_or_else(|| format!("unknown cfr rule {}", o.cfr))?;
     let cfg = Cfg { s: o.s, c: o.c, batch: o.batch, rounds: o.rounds, cfr, budget: Budget::for_s(o.s), ..Default::default() };
-    let cards = devices(o, mind, cfg)?.map(|backend| Arc::new(Cards::new(backend)));
-    let mut nets = Nets { device: cards.is_some(), ..Nets::default() };
-    if matches!(mind, Mind::Sog) && cards.is_none() {
-        nets.value = Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
-    }
+    let backend = devices(o, mind, cfg)?;
+    let mut nets = Nets { device: backend.is_some(), ..Nets::default() };
+    let cards = match backend {
+        Some(backend) => {
+            nets.value = backend.net().clone();
+            Some(Arc::new(Cards::new(backend)))
+        }
+        None if matches!(mind, Mind::Sog) => {
+            nets.value = Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
+            None
+        }
+        None => None,
+    };
     Ok(Brain {
         mind,
         nets: Arc::new(nets),
