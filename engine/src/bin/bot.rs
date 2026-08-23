@@ -74,6 +74,9 @@ fn engine(o: &Options) -> Result<(Brain, Option<Farm>), String> {
         ..Default::default()
     };
     if !matches!(mind, Mind::Sog) {
+        if !o.devices.is_empty() {
+            return Err(format!("{} is CPU-only and cannot use --devices", o.mind));
+        }
         return Ok((Brain { mind, nets: Default::default(), cfg }, None));
     }
     let net = Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
