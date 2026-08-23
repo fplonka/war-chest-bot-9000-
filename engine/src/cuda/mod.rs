@@ -886,11 +886,27 @@ impl Device {
                 card.stream.synchronize().map_err(err)?;
             }
             let free_after_round = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
-            n = n.min(((free_after_round - free_after_round / 10) / slot.max(1)) as usize);
+            let round = free.saturating_sub(free_after_round);
+            let variable = n as u64 * PIPELINE as u64 * extra;
+            let fixed = round.saturating_sub(variable);
+            let usable = free.saturating_sub(fixed);
+            let measured_fit = (usable - usable / 10) / per.max(1);
+            let measured_n = n.min(measured_fit as usize);
+            if measured_n < n {
+                n = measured_n;
+                for (p, card) in pair.iter_mut().enumerate() {
+                    *card.host.get_mut() = Stage::default();
+                    *card.scratch.get_mut() = Scratch::default();
+                    *card.batch.get_mut() = Batch::default();
+                    card.carve(n, &cfg).map_err(|e| {
+                        format!("recarve gpu {g} pipe {p} n={n} slot={slot} free={free}: {e}")
+                    })?;
+                    card.stream.synchronize().map_err(err)?;
+                }
+            }
             if n == 0 {
                 return Err(format!(
-                    "a slot of {slot} bytes does not fit after wave buffers leave \
-                     {free_after_round} bytes free"
+                    "a slot of {slot} bytes does not fit after wave buffers"
                 ));
             }
             left = left.saturating_sub(n);
