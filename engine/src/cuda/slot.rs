@@ -91,7 +91,6 @@ const fn fields() -> [usize; 8] {
 }
 
 pub const FIELDS: [usize; 8] = fields();
-pub const NODE_FIELDS: usize = FIELDS[Ent::Node as usize];
 
 const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {

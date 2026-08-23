@@ -1,5 +1,6 @@
-// Elementwise and gather work for the value network. The matrix multiplies are
-// cuBLAS; everything that is not a GEMM is here.
+// Elementwise and gather work for the value network, and the join, which is
+// fused into one kernel of its own. The trunk and the join multiply on the
+// tensor cores; every other matrix multiply is cuBLAS.
 //
 // Compiled by NVRTC at startup, so the shapes arrive as -D defines and the
 // code below is the same arithmetic as `net.rs`, in the same order.
@@ -35,7 +36,8 @@ __global__ void k_gelu(float* x, int n) {
     if (i < n) x[i] = gelu1(x[i]);
 }
 
-// LayerNorm, `src` to `dst`; the two may be the same buffer.
+// LayerNorm in place, with the GELU folded in when `act` -- `Norm::apply`
+// against `Norm::plain`.
 //
 // One row per **warp**, not per block. The rows here are 96 to 256 wide, so a
 // block-wide reduction spends most of its time in `__syncthreads` for a sum a
@@ -43,33 +45,21 @@ __global__ void k_gelu(float* x, int n) {
 // quarter of its lanes idle throughout. Measured at a third of all device
 // time, it was the largest kernel in the profile.
 //
-// `act` folds in the GELU, which is `Norm::apply`; without it this is
-// `Norm::plain`.
-// `add` is the bias of whichever matrix multiply produced `src`, folded in
-// here rather than paid for with a pass of its own. A residual stream is added
-// to, so the bias a block owes it is never actually stored: `add` carries the
-// running sum of every bias the stream has been owed so far, and the norm is
-// the only thing that reads the stream.
-//
-// Rows are ninety-six to two hundred and fifty-six wide, so one row is one
-// **warp**, not one block: a block-wide reduction spends its time in
-// `__syncthreads` for a sum a warp shuffles in five steps.
-__device__ __forceinline__ void norm_row(const float* src, float* dst,
-                                         const float* gamma, const float* beta,
-                                         const float* add, int has, int rows,
-                                         int width, int act) {
+// The join's four norms are not here: they are fused into `k_join`, which
+// keeps its residual stream in registers and never writes a row out to be
+// normalised.
+__global__ void k_norm_ip(float* x, const float* gamma, const float* beta,
+                          int rows, int width, int act) {
     int r = blockIdx.x * blockDim.y + threadIdx.y;
     if (r >= rows) return;
-    const float* in = src + (size_t)r * width;
-    float* out = dst + (size_t)r * width;
+    float* row = x + (size_t)r * width;
     // At most eight values a lane, so the row is read once and kept.
     float v[8];
     int n = 0;
     float sum = 0.0f;
     for (int j = threadIdx.x; j < width; j += 32) {
-        float x = in[j] + (has ? add[j] : 0.0f);
-        v[n++] = x;
-        sum += x;
+        v[n++] = row[j];
+        sum += row[j];
     }
     for (int s = 16; s > 0; s >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, s);
     float mean = sum / width;
@@ -83,21 +73,8 @@ __device__ __forceinline__ void norm_row(const float* src, float* dst,
     n = 0;
     for (int j = threadIdx.x; j < width; j += 32) {
         float y = (v[n++] - mean) * inv * gamma[j] + beta[j];
-        out[j] = act ? gelu1(y) : y;
+        row[j] = act ? gelu1(y) : y;
     }
-}
-
-__global__ void k_norm(const float* src, float* dst, const float* gamma,
-                       const float* beta, const float* add, int has, int rows,
-                       int width, int act) {
-    norm_row(src, dst, gamma, beta, add, has, rows, width, act);
-}
-
-// The same, in place. A separate entry only because one buffer cannot be
-// handed to a launch as both an argument to read and an argument to write.
-__global__ void k_norm_ip(float* x, const float* gamma, const float* beta,
-                          const float* add, int has, int rows, int width, int act) {
-    norm_row(x, x, gamma, beta, add, has, rows, width, act);
 }
 
 // `out[r, j] += b[j]` -- the per-column bias a GEMM does not carry.
@@ -268,12 +245,12 @@ __device__ __forceinline__ void mma_tile(float (&d)[4], const unsigned (&a)[4],
 /// `lane % 4 + 4`, and the register order is row first: the low bit of the
 /// register index is the row and the next one is the column.
 __device__ __forceinline__ void frag_a(const float* a, int m, int k, int lane,
-                                       unsigned (&f)[4]) {
-    const float* p = a + (size_t)(16 * m + (lane >> 2)) * TRUNK_LDS + k + (lane & 3);
+                                       int lds, unsigned (&f)[4]) {
+    const float* p = a + (size_t)(16 * m + (lane >> 2)) * lds + k + (lane & 3);
     f[0] = __float_as_uint(p[0]);
-    f[1] = __float_as_uint(p[8 * TRUNK_LDS]);
+    f[1] = __float_as_uint(p[8 * lds]);
     f[2] = __float_as_uint(p[4]);
-    f[3] = __float_as_uint(p[8 * TRUNK_LDS + 4]);
+    f[3] = __float_as_uint(p[8 * lds + 4]);
 }
 
 /// The weight's 8x8 fragment at depth `k` for the warp's own output tile. The
@@ -281,8 +258,8 @@ __device__ __forceinline__ void frag_a(const float* a, int m, int k, int lane,
 /// values are one eight-byte load and the warp reads two hundred and fifty-six
 /// contiguous bytes.
 __device__ __forceinline__ void frag_b(const float* w, int k, int slot, int lane,
-                                       unsigned (&f)[2]) {
-    float2 v = *(const float2*)(w + (((size_t)k * TRUNK_SPAN + slot) * 32 + lane) * 2);
+                                       int ntiles, unsigned (&f)[2]) {
+    float2 v = *(const float2*)(w + (((size_t)k * ntiles + slot) * 32 + lane) * 2);
     f[0] = __float_as_uint(v.x);
     f[1] = __float_as_uint(v.y);
 }
@@ -297,7 +274,7 @@ __device__ __forceinline__ int frag_col(int i, int slot, int lane) {
 }
 
 // Mean and inverse standard deviation of one hex's row, held `TRUNK_Q` values
-// to a lane across one warp. Two passes, as `norm_row` does, because the
+// to a lane across one warp. Two passes, as `k_norm_ip` does, because the
 // one-pass form loses the difference between two nearly equal sums.
 __device__ __forceinline__ void row_stats(const float* v, int c, float* mean,
                                           float* inv) {
@@ -409,12 +386,12 @@ void k_trunk(const float* x0, const int* nb, const float* __restrict__ w,
             for (int i = 0; i < 4; ++i) an[m][i] = as[m][i] = 0.0f;
         for (int k = 0; k < TRUNK_KS; ++k) {
             unsigned bs[2], bn[2];
-            frag_b(wt + o[10], k, slot, lane, bs);
-            frag_b(wt + o[10] + (size_t)TRUNK_C * TRUNK_C, k, slot, lane, bn);
+            frag_b(wt + o[10], k, slot, lane, TRUNK_SPAN, bs);
+            frag_b(wt + o[10] + (size_t)TRUNK_C * TRUNK_C, k, slot, lane, TRUNK_SPAN, bn);
 #pragma unroll
             for (int m = 0; m < TRUNK_MT; ++m) {
                 unsigned af[4];
-                frag_a(a, m, 8 * k, lane, af);
+                frag_a(a, m, 8 * k, lane, TRUNK_LDS, af);
                 mma_tile(as[m], af, bs);
                 mma_tile(an[m], af, bn);
             }
@@ -462,11 +439,11 @@ void k_trunk(const float* x0, const int* nb, const float* __restrict__ w,
             for (int i = 0; i < 4; ++i) ao[m][i] = 0.0f;
         for (int k = 0; k < TRUNK_KS; ++k) {
             unsigned bo[2];
-            frag_b(wt + o[11], k, slot, lane, bo);
+            frag_b(wt + o[11], k, slot, lane, TRUNK_SPAN, bo);
 #pragma unroll
             for (int m = 0; m < TRUNK_MT; ++m) {
                 unsigned af[4];
-                frag_a(a, m, 8 * k, lane, af);
+                frag_a(a, m, 8 * k, lane, TRUNK_LDS, af);
                 mma_tile(ao[m], af, bo);
             }
         }
@@ -560,31 +537,6 @@ __global__ void k_bag(const float* bag, const float* phi,
     g[i] += acc;
 }
 
-
-// `[own pooled | opponent pooled | seat]`, the join's belief-dependent input.
-//
-// The batch is both traversers back to back -- rows `0..stride` ask about
-// player zero and `stride..2*stride` about player one, over the same leaves.
-// The join is the only part of the pass that depends on which seat is asking,
-// so running it once over twice the rows costs the same arithmetic and half
-// the launches.
-__global__ void k_join_input(const float* pooled, float* out, int rows, int pool,
-                             int tile) {
-    int r = blockIdx.x;
-    if (r >= rows) return;
-    int width = 2 * pool + 1;
-    // The tile holds `tile` leaves and both of their seats, seat-major, so a
-    // leaf's two pooled rows are adjacent whichever seat is asking.
-    int p = r / tile, q = r % tile;
-    const float* mine = pooled + ((size_t)2 * q + p) * pool;
-    const float* theirs = pooled + ((size_t)2 * q + 1 - p) * pool;
-    float* dst = out + (size_t)r * width;
-    for (int j = threadIdx.x; j < pool; j += blockDim.x) {
-        dst[j] = mine[j];
-        dst[pool + j] = theirs[j];
-    }
-    if (threadIdx.x == 0) dst[2 * pool] = p == 0 ? -1.0f : 1.0f;
-}
 
 // ------------------------------------------------------ a round of solves
 //
@@ -966,78 +918,228 @@ __global__ void k_avg_block(const Tree* trees, const unsigned int* work, int at,
         t.sum[so + cell] += t.reach[ra + t.cell_row[so + cell]] * t.cur[so + cell];
 }
 
-// Every leaf's normalised belief, and the opponent's reach mass there. One
-// block per (row, player); `w` and `oppmass` are what the network reads.
-__global__ void k_beliefs(const Tree* trees, const int* part_of_row,
-                          const int* local_row, const unsigned int* coff, float* w,
-                          float* mass, int rows) {
-    // A warp to a query, eight warps to a block. One warp per block left an SM
-    // holding sixteen of them and a quarter of its lanes busy, on a kernel that
-    // is nothing but dependent gathers and wants every warp it can get.
-    int r = blockIdx.x * blockDim.y + threadIdx.y;
-    if (r >= rows) return;
-    int part = part_of_row[r];
-    const Tree& t = trees[part];
-    unsigned int node = t.leaf_node[local_row[r]];
-    int p = blockIdx.y;
-    unsigned int n = t.nc[2 * node + p], ra = rbase(t, node, p);
-    unsigned int lo = coff[2 * r + p];
-    // One warp: the support is tens of configs, and the sum has to be seen by
-    // every thread that then divides by it.
-    float acc = 0.0f;
-    for (unsigned int c = threadIdx.x; c < n; c += 32) acc += t.reach[ra + c];
-    for (int s = 16; s > 0; s >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, s);
-    float inv = acc > 0.0f ? 1.0f / acc : 1.0f / (float)max(n, 1u);
-    for (unsigned int c = threadIdx.x; c < n; c += 32)
-        w[lo + c] = acc > 0.0f ? t.reach[ra + c] * inv : inv;
-    if (threadIdx.x == 0) mass[(size_t)p * rows + r] = acc;
-}
-
-// Gather each solve's resident board vectors into the round's layout, so the
-// join is one chain of large GEMMs over every solve in flight.
-__global__ void k_gather(const Tree* trees, const int* part_of_row,
-                         const int* local_row, int which, float* out,
-                         int rows, int width, int q0, int tile) {
-    int row = blockIdx.x;
-    if (row >= rows) return;
-    int r = q0 + row % tile;
-    const Tree& t = trees[part_of_row[r]];
-    const float* src = (which == 0 ? t.p : t.jp)
-                     + (size_t)t.board_of[local_row[r]] * width;
-    float* dst = out + (size_t)row * width;
-    for (int j = threadIdx.x; j < width; j += blockDim.x) dst[j] = src[j];
-}
-
-// The belief block the join reads: `sum_c beta(c) g(c)` over one query's
-// support. `coff` bounds a query's cells in the round's `w`, `cidx` names each
-// cell's row in its own solve's `g`.
-// The belief-weighted pooling of a query's configs.
+// The belief-weighted pooling of a query's configs, with the belief itself
+// formed here rather than written to a round-wide array and read back.
+//
+// `coff` bounds a query's cells in the round, `cidx` names each cell's row in
+// its own solve's `g`, and the two orders agree: cell `k` of the query is
+// config `k - lo` of the node, so its reach is a step along the node's own
+// block.
 //
 // `threadIdx.y` splits the support, because that is where the parallelism is:
 // the row is only `pool` wide and the sum runs over a hundred-odd configs, each
 // a dependent gather. One thread per output channel walked the whole support
 // serially and left the block waiting on memory.
 __global__ void k_belief_pool(const Tree* trees, const int* part_of_row,
-                              const int* base_of_part, const unsigned int* coff,
-                              const float* w, float* out, int q0, int queries,
-                              int pool) {
+                              const int* local_row, const int* base_of_part,
+                              const unsigned int* coff, float* out, float* mass,
+                              int q0, int queries, int stride, int pool) {
     extern __shared__ float part_acc[];
+    __shared__ float reach_sum;
     int mine = blockIdx.x;
     if (mine >= queries) return;
-    int q = q0 + mine;
-    int part = part_of_row[q >> 1];
+    int q = q0 + mine, r = q >> 1, p = q & 1;
+    int part = part_of_row[r];
     const Tree& t = trees[part];
+    unsigned int node = t.leaf_node[local_row[r]];
+    unsigned int n = t.nc[2 * node + p], ra = rbase(t, node, p);
     unsigned int base = base_of_part[part], lo = coff[q], hi = coff[q + 1];
     int j = threadIdx.x, y = threadIdx.y, ny = blockDim.y;
+    // The block's first warp sums the query's reach, in the same five shuffles
+    // over the same lane order the separate belief kernel used, so the belief
+    // it hands on is the one that array held. Every thread then divides by it,
+    // which is why the sum goes through shared memory.
+    int tid = j + blockDim.x * y;
+    if (tid < 32) {
+        float sum = 0.0f;
+        for (unsigned int c = tid; c < n; c += 32) sum += t.reach[ra + c];
+        sum = warp_sum(sum);
+        if (tid == 0) {
+            reach_sum = sum;
+            mass[(size_t)p * stride + r] = sum;
+        }
+    }
+    __syncthreads();
+    float total = reach_sum;
+    float inv = total > 0.0f ? 1.0f / total : 1.0f / (float)max(n, 1u);
     float acc = 0.0f;
-    for (unsigned int k = lo + y; k < hi; k += ny)
-        acc += w[k] * t.g[(size_t)t.cidx[k - base] * pool + j];
+    for (unsigned int k = lo + y; k < hi; k += ny) {
+        float beta = total > 0.0f ? t.reach[ra + (k - lo)] * inv : inv;
+        acc += beta * t.g[(size_t)t.cidx[k - base] * pool + j];
+    }
     part_acc[y * pool + j] = acc;
     __syncthreads();
     if (y == 0) {
-        float total = 0.0f;
-        for (int i = 0; i < ny; ++i) total += part_acc[i * pool + j];
-        out[(size_t)mine * pool + j] = total;
+        float pooled = 0.0f;
+        for (int i = 0; i < ny; ++i) pooled += part_acc[i * pool + j];
+        out[(size_t)mine * pool + j] = pooled;
+    }
+}
+
+// ------------------------------------------------------------- the join MLP
+//
+// `net::Net::join`, whole, in one launch: the residual seed, `join_b`, three
+// LayerNorm-GELU-multiply residual blocks, the output norm and `join_out`.
+//
+// A warp is the unit of a multiply, as in `k_trunk`. `mma.sync.m16n8k8` takes
+// a 16x8 slab of the activations and an 8x8 slab of the weight; sixteen warps
+// cover the 128-wide residual, four sixteen-row tiles cover the block's 64
+// rows. `J_IN` is 136: JOIN_IN padded from 129 so the first `k` is whole
+// fragments. Those seven extra columns are zero.
+//
+// The residual stream lives in the accumulators. Only the normalised
+// activations go through shared memory, bank-padded, rounded to tf32 as they
+// are stored. The weights arrive fragwise from the host, rounded once.
+//
+// Two blocks an SM is what the shared memory allows. The bound asks for three
+// so the register cap leaves the file open for the sweep blocks the other
+// card needs.
+#define J_SPAN (J_W / 8)
+#define J_MT (J_ROWS / 16)
+#define J_LDS (J_IN + 4)
+#define J_KS_IN (J_IN / 8)
+#define J_KS (J_W / 8)
+#define J_Q (J_W / 32)
+#define J_OUT_TILES (J_D / 8)
+#define J_PACK_B ((size_t)J_KS_IN * J_SPAN * 64)
+#define J_PACK_W ((size_t)J_KS * J_SPAN * 64)
+
+__device__ __forceinline__ void join_mma(float (&d)[J_MT][4], const float* act,
+                                         const float* w, int ks, int ntiles,
+                                         int nt0) {
+    int lane = threadIdx.x, slot = threadIdx.y;
+    for (int k = 0; k < ks; ++k) {
+        unsigned b[2];
+        frag_b(w, k, nt0 + slot, lane, ntiles, b);
+#pragma unroll
+        for (int m = 0; m < J_MT; ++m) {
+            unsigned a[4];
+            frag_a(act, m, 8 * k, lane, J_LDS, a);
+            mma_tile(d[m], a, b);
+        }
+    }
+}
+
+// `Norm::apply` over the block's rows: the residual stream, plus the bias it is
+// owed, normalised into `act` as the tf32 operand the next multiply reads.
+// The stream itself stays in the accumulators.
+__device__ __forceinline__ void join_norm(float (&z)[J_MT][4], float* act,
+                                          const float* gamma, const float* beta,
+                                          const float* add) {
+    // The multiply that filled `z` is still reading `act` in other warps.
+    __syncthreads();
+    int lane = threadIdx.x, slot = threadIdx.y;
+#pragma unroll
+    for (int m = 0; m < J_MT; ++m)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int r = frag_row(m, i, lane), j = frag_col(i, slot, lane);
+            act[r * J_LDS + j] = z[m][i] + add[j];
+        }
+    __syncthreads();
+#pragma unroll
+    for (int t = 0; t < J_MT; ++t) {
+        int r = slot + t * J_SPAN;
+        float cur[J_Q];
+#pragma unroll
+        for (int q = 0; q < J_Q; ++q) cur[q] = act[r * J_LDS + lane + 32 * q];
+        float s = 0.0f;
+#pragma unroll
+        for (int q = 0; q < J_Q; ++q) s += cur[q];
+        s = warp_sum(s);
+        float mean = s / (float)J_W, var = 0.0f;
+#pragma unroll
+        for (int q = 0; q < J_Q; ++q) {
+            float d = cur[q] - mean;
+            var += d * d;
+        }
+        var = warp_sum(var);
+        float inv = rsqrtf(var / (float)J_W + 1e-5f);
+#pragma unroll
+        for (int q = 0; q < J_Q; ++q) {
+            int j = lane + 32 * q;
+            act[r * J_LDS + j] =
+                tf32(gelu1((cur[q] - mean) * inv * gamma[j] + beta[j]));
+        }
+    }
+    __syncthreads();
+}
+
+__global__ __launch_bounds__(32 * J_SPAN, 3)
+void k_join(const Tree* trees, const int* part_of_row, const int* local_row,
+            const float* pooled, const float* wj, const float* lnj,
+            const float* owed, float* h, int rows, int tile, int q0) {
+    __shared__ __align__(16) float act[J_ROWS * J_LDS];
+
+    int lane = threadIdx.x, slot = threadIdx.y;
+    int tid = lane + 32 * slot, nt = 32 * J_SPAN;
+    int row0 = blockIdx.x * J_ROWS;
+    float z[J_MT][4];
+
+    // jp into shared, then into the accumulators. The same buffer then takes
+    // the belief input, so the seed is read once.
+    for (int e = tid; e < J_ROWS * J_LDS; e += nt) {
+        int i = e / J_LDS, c = e % J_LDS;
+        int row = row0 + i;
+        float v = 0.0f;
+        if (row < rows && c < J_W) {
+            int p = row >= tile ? 1 : 0, q = row - p * tile, rr = q0 + q;
+            const Tree& t = trees[part_of_row[rr]];
+            v = t.jp[(size_t)t.board_of[local_row[rr]] * J_W + c];
+        }
+        act[e] = v;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int m = 0; m < J_MT; ++m)
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            z[m][i] = act[frag_row(m, i, lane) * J_LDS + frag_col(i, slot, lane)];
+    __syncthreads();
+
+    for (int e = tid; e < J_ROWS * J_LDS; e += nt) {
+        int i = e / J_LDS, c = e % J_LDS;
+        int row = row0 + i;
+        float v = 0.0f;
+        if (row < rows && c < 2 * J_POOL + 1) {
+            int p = row >= tile ? 1 : 0, q = row - p * tile;
+            const float* mine = pooled + ((size_t)2 * q + p) * J_POOL;
+            const float* theirs = pooled + ((size_t)2 * q + 1 - p) * J_POOL;
+            if (c < J_POOL) v = mine[c];
+            else if (c < 2 * J_POOL) v = theirs[c - J_POOL];
+            else v = p == 0 ? -1.0f : 1.0f;
+        }
+        act[e] = tf32(v);
+    }
+    __syncthreads();
+
+    join_mma(z, act, wj, J_KS_IN, J_SPAN, 0);
+    const float* w = wj + J_PACK_B;
+    for (int blk = 0; blk < J_BLOCKS; ++blk) {
+        join_norm(z, act, lnj + 2 * blk * J_W, lnj + (2 * blk + 1) * J_W,
+                  owed + blk * J_W);
+        join_mma(z, act, w, J_KS, J_SPAN, 0);
+        w += J_PACK_W;
+    }
+    join_norm(z, act, lnj + 2 * J_BLOCKS * J_W, lnj + (2 * J_BLOCKS + 1) * J_W,
+              owed + J_BLOCKS * J_W);
+
+    // `join_out` is 256 wide, so the sixteen warps cover it in two passes.
+    // The residual stream ended at the norm above, so `z` is the accumulator.
+    for (int pass = 0; pass < J_D / J_W; ++pass) {
+#pragma unroll
+        for (int m = 0; m < J_MT; ++m)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) z[m][i] = 0.0f;
+        join_mma(z, act, w, J_KS, J_OUT_TILES, pass * J_SPAN);
+#pragma unroll
+        for (int m = 0; m < J_MT; ++m)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                int r = frag_row(m, i, lane), j = frag_col(i, slot, lane);
+                int row = row0 + r;
+                if (row < rows) h[(size_t)row * J_D + pass * J_W + j] = z[m][i];
+            }
     }
 }
 
