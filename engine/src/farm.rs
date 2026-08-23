@@ -929,9 +929,11 @@ impl Farm {
         Arc::clone(&*self.nets.read())
     }
 
-    pub fn solve(&self, solves: Vec<(u32, Solver)>) -> Result<Vec<ArenaDone>, String> {
+    pub fn submit(&self, solves: Vec<(u32, Solver)>) -> Result<(), String> {
         let arena = self.arena.as_ref().expect("only an arena farm accepts external solves");
-        let count = solves.len();
+        if self.broken() {
+            return Err("a card could not answer a round".into());
+        }
         arena.pending.lock().extend(solves);
         {
             let mut free = arena.free.lock();
@@ -954,18 +956,18 @@ impl Farm {
         for q in &self.device {
             q.wake();
         }
+        Ok(())
+    }
 
-        let mut done = Vec::with_capacity(count);
-        while done.len() < count {
-            if let Some(solved) = arena.done.try_pop() {
-                done.push(solved);
-            } else if self.broken() {
-                return Err("a card could not answer a round".into());
-            } else {
-                std::thread::sleep(Duration::from_micros(200));
-            }
+    pub fn try_done(&self) -> Result<Option<ArenaDone>, String> {
+        let arena = self.arena.as_ref().expect("only an arena farm accepts external solves");
+        if let Some(done) = arena.done.try_pop() {
+            Ok(Some(done))
+        } else if self.broken() {
+            Err("a card could not answer a round".into())
+        } else {
+            Ok(None)
         }
-        Ok(done)
     }
 }
 
@@ -1246,7 +1248,15 @@ mod tests {
                 (id, stream.next_solve(&nets, &mut data))
             })
             .collect();
-        let mut done = farm.solve(solves).unwrap();
+        farm.submit(solves).unwrap();
+        let mut done = Vec::new();
+        while done.len() < 7 {
+            if let Some(solved) = farm.try_done().unwrap() {
+                done.push(solved);
+            } else {
+                std::thread::yield_now();
+            }
+        }
         done.sort_unstable_by_key(|x| x.id);
         assert_eq!(
             done.iter().map(|x| x.id).collect::<Vec<_>>(),

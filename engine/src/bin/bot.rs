@@ -6,7 +6,8 @@
 //! compare an architecture with the one that replaced it.
 //!
 //! It reads requests from stdin and writes replies in the JSON
-//! `warchest::arena` defines. All searches in one request run as one farm wave.
+//! `warchest::arena` defines. Searches stay resident in one farm and each reply
+//! leaves as soon as its solve finishes.
 //!
 //! ```text
 //! bot --name v5-2h --weights weights.bin --s 512 --c 8 --cfr sog
@@ -14,6 +15,8 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use warchest::arena::{Ask, Done, Hello, Reply, Request, PROTOCOL};
 use warchest::args::Args;
@@ -121,6 +124,119 @@ fn fail(out: &mut impl Write, error: String) -> ! {
     std::process::exit(1);
 }
 
+fn write_reply(out: &mut impl Write, done: Vec<Done>) {
+    if done.is_empty() {
+        return;
+    }
+    let reply = Reply { done, error: None };
+    writeln!(out, "{}", serde_json::to_string(&reply).unwrap()).unwrap();
+    out.flush().unwrap();
+}
+
+fn run_cpu(brain: &Brain, out: &mut impl Write) {
+    let mut table = Table::new();
+    for line in std::io::stdin().lock().lines() {
+        let line = line.unwrap_or_else(|e| fail(out, e.to_string()));
+        let request: Request =
+            serde_json::from_str(&line).unwrap_or_else(|e| fail(out, e.to_string()));
+        for id in &request.drop {
+            table.remove(id);
+        }
+        let asks = request
+            .go
+            .into_iter()
+            .map(|ask| (ask, true))
+            .chain(request.watch.into_iter().map(|ask| (ask, false)));
+        let mut done = Vec::new();
+        for (ask, acting) in asks {
+            let mut game = session(&ask, &mut table, brain)
+                .unwrap_or_else(|e| fail(out, format!("game {}: {e}", ask.id)));
+            let action = if acting {
+                Some(
+                    game.decide(brain)
+                        .unwrap_or_else(|e| fail(out, format!("game {}: {e}", ask.id))),
+                )
+            } else {
+                game.watch(brain);
+                None
+            };
+            done.push(Done { id: ask.id, action });
+            table.insert(ask.id, game);
+        }
+        write_reply(out, done);
+    }
+}
+
+fn request_stream() -> mpsc::Receiver<Result<Request, String>> {
+    let (send, receive) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            let request = line
+                .map_err(|e| e.to_string())
+                .and_then(|line| serde_json::from_str(&line).map_err(|e| e.to_string()));
+            if send.send(request).is_err() {
+                break;
+            }
+        }
+    });
+    receive
+}
+
+fn run_sog(brain: &Brain, farm: &Farm, out: &mut impl Write) {
+    let requests = request_stream();
+    let mut table = Table::new();
+    let mut acting = HashMap::new();
+    let mut input_open = true;
+    while input_open || !acting.is_empty() {
+        let request = if input_open && acting.is_empty() {
+            requests.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        } else if input_open {
+            requests.recv_timeout(Duration::from_micros(200))
+        } else {
+            std::thread::sleep(Duration::from_micros(200));
+            Err(mpsc::RecvTimeoutError::Timeout)
+        };
+        match request {
+            Ok(Err(e)) => fail(out, e),
+            Ok(Ok(request)) => {
+                for id in &request.drop {
+                    table.remove(id);
+                }
+                let asks = request
+                    .go
+                    .into_iter()
+                    .map(|ask| (ask, true))
+                    .chain(request.watch.into_iter().map(|ask| (ask, false)));
+                let mut solves = Vec::new();
+                for (ask, act) in asks {
+                    let mut game = session(&ask, &mut table, brain)
+                        .unwrap_or_else(|e| fail(out, format!("game {}: {e}", ask.id)));
+                    let solver = game
+                        .solver(brain, act)
+                        .unwrap_or_else(|e| fail(out, format!("game {}: {e}", ask.id)));
+                    solves.push((ask.id, solver));
+                    acting.insert(ask.id, act);
+                    table.insert(ask.id, game);
+                }
+                farm.submit(solves).unwrap_or_else(|e| fail(out, e));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => input_open = false,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+
+        let mut done = Vec::new();
+        while let Some(solved) = farm.try_done().unwrap_or_else(|e| fail(out, e)) {
+            let act = acting.remove(&solved.id).expect("a submitted solve is outstanding");
+            let game = table.get_mut(&solved.id).expect("a submitted game is live");
+            let action = game
+                .finish(&solved.solver, act)
+                .unwrap_or_else(|e| fail(out, format!("game {}: {e}", solved.id)));
+            done.push(Done { id: solved.id, action });
+        }
+        write_reply(out, done);
+    }
+}
+
 fn main() {
     let options = options().unwrap_or_else(|e| {
         eprintln!("{}", e);
@@ -145,64 +261,10 @@ fn main() {
         out.flush().unwrap();
     }
 
-    let mut table = Table::new();
-    for line in std::io::stdin().lock().lines() {
-        let line = line.expect("stdin");
-        let request: Request = match serde_json::from_str(&line) {
-            Ok(request) => request,
-            Err(e) => fail(&mut out, e.to_string()),
-        };
-        for id in &request.drop {
-            table.remove(id);
-        }
-        let asks: Vec<(Ask, bool)> = request
-            .go
-            .into_iter()
-            .map(|a| (a, true))
-            .chain(request.watch.into_iter().map(|a| (a, false)))
-            .collect();
-        let mut done = Vec::with_capacity(asks.len());
-        let mut solving = Vec::with_capacity(asks.len());
-        let mut acting = HashMap::with_capacity(asks.len());
-        for (ask, act) in asks {
-            let mut game = session(&ask, &mut table, &brain)
-                .unwrap_or_else(|e| fail(&mut out, format!("game {}: {}", ask.id, e)));
-            if matches!(brain.mind, Mind::Sog) {
-                let solver = game.solver(&brain, act)
-                    .unwrap_or_else(|e| fail(&mut out, format!("game {}: {}", ask.id, e)));
-                solving.push((ask.id, solver));
-                acting.insert(ask.id, act);
-            } else {
-                let action = if act {
-                    Some(game.decide(&brain).unwrap_or_else(|e| {
-                        fail(&mut out, format!("game {}: {}", ask.id, e))
-                    }))
-                } else {
-                    game.watch(&brain);
-                    None
-                };
-                done.push(Done { id: ask.id, action });
-            }
-            table.insert(ask.id, game);
-        }
-        if !solving.is_empty() {
-            let solved = farm
-                .as_ref()
-                .unwrap()
-                .solve(solving)
-                .unwrap_or_else(|e| fail(&mut out, e));
-            for solved in solved {
-                let game = table.get_mut(&solved.id).unwrap();
-                let action = game.finish(&solved.solver, acting[&solved.id])
-                    .unwrap_or_else(|e| fail(&mut out, format!("game {}: {}", solved.id, e)));
-                done.push(Done { id: solved.id, action });
-            }
-        }
-        if !done.is_empty() {
-            let reply = Reply { done, error: None };
-            writeln!(out, "{}", serde_json::to_string(&reply).unwrap()).unwrap();
-            out.flush().unwrap();
-        }
+    if let Some(farm) = &farm {
+        run_sog(&brain, farm, &mut out);
+    } else {
+        run_cpu(&brain, &mut out);
     }
 }
 
