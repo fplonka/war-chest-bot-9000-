@@ -51,16 +51,13 @@ WIN_MARKERS = 6
 
 
 def cuda_devices():
-    """CUDA ordinals visible to this process."""
     try:
-        found = subprocess.run(
-            ["nvidia-smi", "-L"], check=True, capture_output=True, text=True)
+        lines = subprocess.check_output(["nvidia-smi", "-L"], text=True).splitlines()
     except OSError:
         return []
     except subprocess.CalledProcessError as error:
-        raise SystemExit(f"cannot enumerate GPUs: {error.stderr.strip()}") from error
-    count = sum(line.startswith("GPU ") for line in found.stdout.splitlines())
-    return [f"cuda:{i}" for i in range(count)]
+        raise SystemExit("cannot enumerate GPUs") from error
+    return [f"cuda:{i}" for i, line in enumerate(lines) if line.startswith("GPU ")]
 
 
 def split_devices():
@@ -88,10 +85,6 @@ class Bot:
         self.spec = json.loads((self.dir / "bot.json").read_text())
         self.name = self.spec.get("name", self.dir.name)
         self.searching = self.spec.get("mind", "sog") not in ("greedy", "random")
-        self.lock = threading.Lock()
-        self.outstanding = set()
-        self.busy_since = None
-        self.busy_seconds = 0.0
         self.solves = 0
         self.moves = 0
         if not os.access(self.dir / "bot", os.X_OK):
@@ -154,19 +147,10 @@ class Bot:
         return line
 
     def _read(self):
-        """Drain replies without blocking the referee."""
+        """Replies arrive independently, so drain them on their own thread."""
         try:
             while True:
-                line = self._line()
-                message = json.loads(line)
-                now = time.monotonic()
-                with self.lock:
-                    self.outstanding.difference_update(
-                        d["id"] for d in message.get("done", []))
-                    if not self.outstanding and self.busy_since is not None:
-                        self.busy_seconds += now - self.busy_since
-                        self.busy_since = None
-                self.replies.put((self.seat, line))
+                self.replies.put((self.seat, self._line()))
         except SystemExit as stop:
             if not self.closing:
                 self.replies.put((self.seat, stop))
@@ -174,23 +158,14 @@ class Bot:
     def send(self, request):
         message = json.loads(request)
         asks = message.get("go", []) + message.get("watch", [])
-        if asks:
-            with self.lock:
-                if not self.outstanding:
-                    self.busy_since = time.monotonic()
-                self.outstanding.update(a["id"] for a in asks)
-                self.moves += len(message.get("go", []))
-                if self.searching:
-                    self.solves += len(asks)
+        self.moves += len(message.get("go", []))
+        if self.searching:
+            self.solves += len(asks)
         self.proc.stdin.write(request + "\n")
         self.proc.stdin.flush()
 
     def snapshot(self):
-        with self.lock:
-            busy = self.busy_seconds
-            if self.busy_since is not None:
-                busy += time.monotonic() - self.busy_since
-            return self.solves, self.moves, busy
+        return self.solves, self.moves
 
     def close(self):
         self.closing = True
@@ -742,14 +717,13 @@ def ladder(paths, games, seed, concurrent, out_path):
                 pairing_seed, concurrent, progress)
             perf = []
             for bot, old in zip(bots, before):
-                solves, moves, busy = (a - b for a, b in zip(bot.snapshot(), old))
+                solves, moves = (a - b for a, b in zip(bot.snapshot(), old))
                 perf.append({
                     "name": bot.name,
                     "solves": solves,
                     "moves": moves,
-                    "busy_seconds": round(busy, 3),
-                    "solves_per_second": round(solves / max(busy, 1e-9), 3),
-                    "ms_per_move": round(1000 * busy / max(moves, 1), 3),
+                    "solves_per_second": round(solves / max(wall, 1e-9), 3),
+                    "ms_per_move": round(1000 * wall / max(moves, 1), 3),
                 })
             performance[(i, j)] = {
                 "wall_seconds": round(wall, 3), "performance": perf}
