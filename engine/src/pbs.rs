@@ -54,7 +54,9 @@
 
 use crate::actions::Action;
 use crate::board::{board, NONE, N_HEXES};
-use crate::state::{State, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP, Z_HAND, Z_INFLIGHT, Z_SUPPLY};
+use crate::state::{
+    State, PENDING_KINDS, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP, Z_HAND, Z_INFLIGHT, Z_SUPPLY,
+};
 use crate::units::{write_card_features, CARD_FEATS, N_UNITS};
 
 /// Distinct coin types a player can own: 4 drafted units + the Royal Coin.
@@ -120,8 +122,8 @@ pub struct Config {
     pub fd: [u8; NSLOT],
     /// The Warrior Priest's drawn coin, waiting for the forced play that must
     /// spend it (`Z_INFLIGHT` in the world state). Empty at every MainPlay
-    /// boundary. Never a replay or network feature: every training row is a
-    /// MainPlay state.
+    /// boundary. Never a replay or network feature: the forced play is walked
+    /// through, so no training row carries an in-flight coin.
     pub inflight: Option<u8>,
 }
 
@@ -899,16 +901,13 @@ pub const MAX_COINS: f32 = 4.0 * 5.0 + 1.0;
 pub const NTYPE: usize = 2 * NSLOT;
 
 /// Raw per-hex facts: occupant owner (2), stack height, the location marker's
-/// owner (2), is-location.
+/// owner (2), is-location, owed-by-the-pending-tactic.
 ///
 /// Every one is a raw fact about the position. A precomputed
 /// distance-to-nearest-unit map was tried and removed: it is a *derived*
 /// summary of how far each side is from the locations it still needs — so it
-/// imports the handcrafted bot's opinion into the encoding. The pending-
-/// maneuver mask was removed with the MainPlay-only freeze: the network is
-/// queried only between normal turns, so no continuation state ever reaches
-/// it.
-pub const HEX_FACTS: usize = 2 + 1 + 2 + 1;
+/// imports the handcrafted bot's opinion into the encoding.
+pub const HEX_FACTS: usize = 2 + 1 + 2 + 1 + 1;
 /// Per hex: the raw facts, then a one-hot of the occupant's coin type.
 pub const HEX_CH: usize = HEX_FACTS + NTYPE;
 pub const HEX_BLOCK: usize = N_HEXES * HEX_CH;
@@ -920,8 +919,9 @@ pub const PILE_COUNTS: usize = 4;
 /// affects the future (the next round's first player is the initiative
 /// holder, and the horizon is carried by `plies_remaining`).
 pub const PLAYER_SCALARS: usize = 6;
-/// Shared: plies remaining, initiative moved, the player to act.
-pub const GLOBAL_SCALARS: usize = 3;
+/// Shared: plies remaining, initiative moved, the player to act, then a
+/// one-hot of the pending continuation kind.
+pub const GLOBAL_SCALARS: usize = 3 + PENDING_KINDS;
 
 pub const OFF_PILES: usize = HEX_BLOCK;
 /// The rulebook facts of each coin type in play — the card describer's input.
@@ -955,6 +955,8 @@ pub const LOOSE: usize = 2 * PLAYER_SCALARS + GLOBAL_SCALARS;
 /// 211 u8   initiative_moved
 /// 212 u8   player_to_act
 /// 213 u16  main_plays_remaining
+/// 215 u8   pending kind (Cont::tag)
+/// 216 u64  owed hexes (HexSet bitmask)
 /// ```
 
 pub const ROW_VERSION: usize = 0;
@@ -969,12 +971,14 @@ pub const ROW_INITIATIVE: usize = ROW_PILES + 2 * NSLOT * PILE_COUNTS;
 pub const ROW_INIT_MOVED: usize = ROW_INITIATIVE + 1;
 pub const ROW_TO_ACT: usize = ROW_INIT_MOVED + 1;
 pub const ROW_PLIES: usize = ROW_TO_ACT + 1;
-pub const ROW_BYTES: usize = ROW_PLIES + 2;
+pub const ROW_PENDING: usize = ROW_PLIES + 2;
+pub const ROW_OWED: usize = ROW_PENDING + 1;
+pub const ROW_BYTES: usize = ROW_OWED + 8;
 
 
 /// The current row format version. Bump when the layout or the expanded
 /// feature layout changes; dumps carry it and refuse to load otherwise.
-pub const ROW_FORMAT_VERSION: u32 = 1;
+pub const ROW_FORMAT_VERSION: u32 = 2;
 
 /// Hash of the constants the expansion depends on: the board's location map,
 /// the unit card-fact table and the layout constants. A rules change that
@@ -1007,6 +1011,7 @@ pub fn rules_table_hash() -> u64 {
         N_HEXES,
         PILE_COUNTS,
         LOOSE,
+        PENDING_KINDS,
     ] {
         mix(c as u64);
     }
@@ -1113,6 +1118,8 @@ pub fn write_public_features(s: &State, ctx: &Ctx, out: &mut [f32]) {
         s.initiative_moved,
         s.to_act(),
         (crate::state::MAX_MAIN_PLAYS - s.main_plays.min(crate::state::MAX_MAIN_PLAYS)) as u16,
+        s.pending().tag(),
+        s.pending().owed_hexes().0,
         out,
     );
 }
@@ -1136,6 +1143,8 @@ pub fn write_public_features_raw(
     initiative_moved: bool,
     to_act: u8,
     plies_remaining: u16,
+    pending_kind: u8,
+    owed: u64,
     out: &mut [f32],
 ) {
     debug_assert_eq!(out.len(), PUBFEAT);
@@ -1162,6 +1171,9 @@ pub fn write_public_features_raw(
             out[i + 3 + hex_marker[h] as usize] = 1.0;
         }
         out[i + 5] = bd.is_location[h] as u8 as f32;
+        if owed & (1u64 << h) != 0 {
+            out[i + 6] = 1.0;
+        }
         i += HEX_CH;
     }
     debug_assert_eq!(i, OFF_PILES);
@@ -1208,6 +1220,9 @@ pub fn write_public_features_raw(
     out[i] = plies_remaining as f32 / crate::state::MAX_MAIN_PLAYS as f32;
     out[i + 1] = initiative_moved as u8 as f32;
     out[i + 2] = (to_act == 0) as u8 as f32;
+    if (pending_kind as usize) < PENDING_KINDS {
+        out[i + 3 + pending_kind as usize] = 1.0;
+    }
     i += GLOBAL_SCALARS;
     debug_assert_eq!(i, PUBFEAT);
 }
@@ -1246,6 +1261,8 @@ pub fn pack_row(s: &State, ctx: &Ctx, out: &mut [u8]) {
     out[ROW_TO_ACT] = s.to_act();
     let plies = crate::state::MAX_MAIN_PLAYS - s.main_plays.min(crate::state::MAX_MAIN_PLAYS);
     out[ROW_PLIES..ROW_PLIES + 2].copy_from_slice(&plies.to_le_bytes());
+    out[ROW_PENDING] = s.pending().tag();
+    out[ROW_OWED..ROW_OWED + 8].copy_from_slice(&s.pending().owed_hexes().0.to_le_bytes());
 }
 
 
@@ -1298,6 +1315,8 @@ pub fn expand_row(
         row[ROW_INIT_MOVED] != 0,
         row[ROW_TO_ACT],
         u16::from_le_bytes([row[ROW_PLIES], row[ROW_PLIES + 1]]),
+        row[ROW_PENDING],
+        u64::from_le_bytes(row[ROW_OWED..ROW_OWED + 8].try_into().unwrap()),
         out,
     );
 }

@@ -1064,7 +1064,7 @@ fn mirror_row_pairs(games: usize, seed: u64) -> Vec<u8> {
             if acts.is_empty() {
                 break;
             }
-            if matches!(s.pending(), crate::state::Cont::MainPlay) {
+            if !s.is_terminal() && !s.is_chance() {
                 let m = s.mirror();
                 let mctx = Ctx::new(&m);
                 let at = out.len();
@@ -1169,6 +1169,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("PILE_COUNTS", crate::pbs::PILE_COUNTS)?;
     m.add("PLAYER_SCALARS", crate::pbs::PLAYER_SCALARS)?;
     m.add("GLOBAL_SCALARS", crate::pbs::GLOBAL_SCALARS)?;
+    m.add("PENDING_KINDS", crate::state::PENDING_KINDS)?;
     m.add("LOOSE", crate::pbs::LOOSE)?;
     m.add("OFF_PILES", crate::pbs::OFF_PILES)?;
     m.add("OFF_CARDS", crate::pbs::OFF_CARDS)?;
@@ -1187,6 +1188,8 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ROW_INIT_MOVED", crate::pbs::ROW_INIT_MOVED)?;
     m.add("ROW_TO_ACT", crate::pbs::ROW_TO_ACT)?;
     m.add("ROW_PLIES", crate::pbs::ROW_PLIES)?;
+    m.add("ROW_PENDING", crate::pbs::ROW_PENDING)?;
+    m.add("ROW_OWED", crate::pbs::ROW_OWED)?;
     m.add("ROW_FORMAT_VERSION", crate::pbs::ROW_FORMAT_VERSION)?;
     m.add_function(wrap_pyfunction!(rules_table_hash, m)?)?;
     m.add_function(wrap_pyfunction!(hex_neighbours, m)?)?;

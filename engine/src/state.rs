@@ -163,6 +163,97 @@ pub enum Cont {
     _AttackPost { atk_hex: u8 },
 }
 
+/// Discriminants of `Cont`, matching the roots-file tags. The public encoding
+/// one-hots this so a mid-tactic leaf is not the same input as a fresh coin play.
+pub const PENDING_KINDS: usize = 12;
+
+impl Cont {
+    pub fn tag(self) -> u8 {
+        match self {
+            Cont::Draw { .. } => 0,
+            Cont::MainPlay => 1,
+            Cont::RoyalGuardChoice { .. } => 2,
+            Cont::SwordsmanMove { .. } => 3,
+            Cont::BerserkerChain { .. } => 4,
+            Cont::FootmanManeuver { .. } => 5,
+            Cont::CavalryAttack { .. } => 6,
+            Cont::MercenaryManeuver { .. } => 7,
+            Cont::FootmanInstantDeploy { .. } => 8,
+            Cont::WarriorPriestDraw { .. } => 9,
+            Cont::WarriorPriestPlay { .. } => 10,
+            Cont::_AttackPost { .. } => 11,
+        }
+    }
+
+    /// Hexes the in-progress tactic still owes a choice, if any.
+    pub fn owed_hexes(self) -> HexSet {
+        let one = |h: u8| {
+            let mut s = HexSet::default();
+            if (h as usize) < N_HEXES {
+                s.insert(h);
+            }
+            s
+        };
+        match self {
+            Cont::RoyalGuardChoice { rg_hex, .. } => one(rg_hex),
+            Cont::SwordsmanMove { hex }
+            | Cont::BerserkerChain { hex, .. }
+            | Cont::CavalryAttack { hex }
+            | Cont::MercenaryManeuver { hex } => one(hex),
+            Cont::FootmanManeuver { hexes } => hexes,
+            Cont::WarriorPriestDraw { rg_hex, .. } => one(rg_hex),
+            Cont::_AttackPost { atk_hex } => one(atk_hex),
+            _ => HexSet::default(),
+        }
+    }
+
+    fn mirrored(self) -> Cont {
+        let flip = |p: u8| if p == NONE { NONE } else { 1 - p };
+        let hex = |h: u8| {
+            if (h as usize) < N_HEXES {
+                mirror_hex(h as usize) as u8
+            } else {
+                h
+            }
+        };
+        match self {
+            Cont::Draw { player } => Cont::Draw {
+                player: flip(player),
+            },
+            Cont::MainPlay => Cont::MainPlay,
+            Cont::RoyalGuardChoice { defender, rg_hex } => Cont::RoyalGuardChoice {
+                defender: flip(defender),
+                rg_hex: hex(rg_hex),
+            },
+            Cont::SwordsmanMove { hex: h } => Cont::SwordsmanMove { hex: hex(h) },
+            Cont::BerserkerChain { hex: h, v2 } => Cont::BerserkerChain {
+                hex: hex(h),
+                v2,
+            },
+            Cont::FootmanManeuver { hexes } => {
+                let mut out = HexSet::default();
+                for h in hexes.iter() {
+                    out.insert(hex(h));
+                }
+                Cont::FootmanManeuver { hexes: out }
+            }
+            Cont::CavalryAttack { hex: h } => Cont::CavalryAttack { hex: hex(h) },
+            Cont::MercenaryManeuver { hex: h } => Cont::MercenaryManeuver { hex: hex(h) },
+            Cont::FootmanInstantDeploy { coin } => Cont::FootmanInstantDeploy { coin },
+            Cont::WarriorPriestDraw { player, rg_hex } => Cont::WarriorPriestDraw {
+                player: flip(player),
+                rg_hex: hex(rg_hex),
+            },
+            Cont::WarriorPriestPlay { player } => Cont::WarriorPriestPlay {
+                player: flip(player),
+            },
+            Cont::_AttackPost { atk_hex } => Cont::_AttackPost {
+                atk_hex: hex(atk_hex),
+            },
+        }
+    }
+}
+
 /// The LIFO continuation stack, inline.
 ///
 /// A round start queues at most six draws plus the main play, and a coin play's
@@ -226,6 +317,14 @@ impl ContStack {
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &Cont> {
         self.v[..self.n as usize].iter().rev()
+    }
+
+    fn mirrored(self) -> ContStack {
+        let mut o = self;
+        for i in 0..o.n as usize {
+            o.v[i] = o.v[i].mirrored();
+        }
+        o
     }
 }
 
@@ -471,6 +570,17 @@ impl State {
         )
     }
 
+    /// A public decision the value network is defined at.
+    ///
+    /// Chance is walked through (it does not branch the public tree). A forced
+    /// Warrior Priest play is walked through too, so the in-flight coin never
+    /// reaches the net.
+    pub fn is_valued(&self) -> bool {
+        !self.is_terminal()
+            && !self.is_chance()
+            && !matches!(self.pending, Cont::WarriorPriestPlay { .. })
+    }
+
     /// Coins physically in a stack on the board at `hex` (unit's coin count).
     #[inline]
 
@@ -563,17 +673,9 @@ impl State {
     /// is the original's with the players' roles exchanged. It is the ground
     /// truth for the training augmentation, which permutes packed row bytes
     /// instead (`train/mirror.py`).
-    ///
-    /// Only defined at a normal coin play: the continuation stack names players
-    /// and would have to be rewritten, and no training row is taken anywhere
-    /// else.
     pub fn mirror(&self) -> State {
-        assert!(
-            matches!(self.pending, Cont::MainPlay) && self.conts.is_empty(),
-            "the mirror is defined at a normal coin play"
-        );
         let flip = |p: u8| if p == NONE { NONE } else { 1 - p };
-        let mut m = self.clone();
+        let mut m = *self;
         for h in 0..N_HEXES {
             let k = mirror_hex(h);
             m.hex_type[k] = self.hex_type[h];
@@ -588,6 +690,8 @@ impl State {
         m.first_player = flip(self.first_player);
         m.active = flip(self.active);
         m.winner = flip(self.winner);
+        m.pending = self.pending.mirrored();
+        m.conts = self.conts.mirrored();
         m
     }
 }

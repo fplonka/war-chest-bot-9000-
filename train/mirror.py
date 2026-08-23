@@ -72,6 +72,13 @@ def mirror_rows(rows):
     # horizon do not.
     out[:, warchest.ROW_INITIATIVE] = _flip_seat(out[:, warchest.ROW_INITIATIVE])
     out[:, warchest.ROW_TO_ACT] = _flip_seat(out[:, warchest.ROW_TO_ACT])
+    # Pending kind is seat-invariant; owed hexes rotate with the board.
+    raw = rows[:, warchest.ROW_OWED:warchest.ROW_OWED + 8]
+    bits = np.unpackbits(raw, axis=1, bitorder='little')
+    mapped = np.zeros_like(bits)
+    mapped[:, HEXMAP] = bits[:, :N_HEXES]
+    out[:, warchest.ROW_OWED:warchest.ROW_OWED + 8] = np.packbits(
+        mapped, axis=1, bitorder='little')[:, :8]
     return out
 
 
@@ -146,6 +153,8 @@ def self_check(vx, n=512):
     g = warchest.OFF_LOOSE + 2 * warchest.PLAYER_SCALARS
     for off, what in [(0, "plies remaining"), (1, "initiative moved")]:
         assert np.allclose(x[:, g + off], mx[:, g + off]), f"{what} moved under the mirror"
+    for k in range(warchest.PENDING_KINDS):
+        assert np.allclose(x[:, g + 3 + k], mx[:, g + 3 + k]), f"pending kind {k} moved"
 
     # Seat-dependent quantities must swap. Board presence is the clearest:
     # player 0's occupied hexes become player 1's.

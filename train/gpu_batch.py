@@ -33,6 +33,8 @@ def _expand_rows(
         ROW_HEX_MARKER: tl.constexpr, ROW_PILES: tl.constexpr,
         ROW_INITIATIVE: tl.constexpr, ROW_INIT_MOVED: tl.constexpr,
         ROW_TO_ACT: tl.constexpr, ROW_PLIES: tl.constexpr,
+        ROW_PENDING: tl.constexpr, ROW_OWED: tl.constexpr,
+        PENDING_KINDS: tl.constexpr,
         MAX_COINS: tl.constexpr, MAX_PLIES: tl.constexpr,
         BLOCK: tl.constexpr):
     r = tl.program_id(0)
@@ -56,6 +58,11 @@ def _expand_rows(
     value = tl.where(is_hex & (ch == 3) & (marker == 0), 1.0, value)
     value = tl.where(is_hex & (ch == 4) & (marker == 1), 1.0, value)
     value = tl.where(is_hex & (ch == 5), location, value)
+    byte = h // 8
+    bit = h - byte * 8
+    owed_b = tl.load(rows + base + ROW_OWED + byte, mask=is_hex, other=0).to(tl.int32)
+    owed = (owed_b >> bit) & 1
+    value = tl.where(is_hex & (ch == 6) & (owed == 1), 1.0, value)
     one = ch - HEX_FACTS
     expected = owner * NSLOT + slot
     value = tl.where(
@@ -105,15 +112,17 @@ def _expand_rows(
     value = tl.where(is_player, pv, value)
 
     g = j - (OFF_LOOSE + 2 * PLAYER_SCALARS)
-    is_global = (g >= 0) & (g < 3)
+    is_global = (g >= 0) & (g < 3 + PENDING_KINDS)
     pl0 = tl.load(rows + base + ROW_PLIES).to(tl.int32)
     pl1 = tl.load(rows + base + ROW_PLIES + 1).to(tl.int32)
     plies = (pl0 + pl1 * 256).to(tl.float32) / MAX_PLIES
     moved = tl.load(rows + base + ROW_INIT_MOVED).to(tl.float32)
     to_act = tl.load(rows + base + ROW_TO_ACT).to(tl.int32)
+    kind = tl.load(rows + base + ROW_PENDING).to(tl.int32)
     gv = tl.where(g == 0, plies, 0.0)
     gv = tl.where(g == 1, moved, gv)
     gv = tl.where(g == 2, (to_act == 0).to(tl.float32), gv)
+    gv = tl.where((g >= 3) & (g - 3 == kind), 1.0, gv)
     value = tl.where(is_global, gv, value)
     tl.store(out + r * PUBFEAT + j, value, mask=valid)
 
@@ -167,7 +176,9 @@ def make_batch(parts, rng, device):
         ROW_HEX_MARKER=warchest.ROW_HEX_MARKER, ROW_PILES=warchest.ROW_PILES,
         ROW_INITIATIVE=warchest.ROW_INITIATIVE,
         ROW_INIT_MOVED=warchest.ROW_INIT_MOVED, ROW_TO_ACT=warchest.ROW_TO_ACT,
-        ROW_PLIES=warchest.ROW_PLIES, MAX_COINS=21.0,
+        ROW_PLIES=warchest.ROW_PLIES, ROW_PENDING=warchest.ROW_PENDING,
+        ROW_OWED=warchest.ROW_OWED, PENDING_KINDS=warchest.PENDING_KINDS,
+        MAX_COINS=21.0,
         MAX_PLIES=warchest.MAX_MAIN_PLAYS, BLOCK=1024, num_warps=4)
 
     phi = t(cc, torch.float32) / float(warchest.CNORM)

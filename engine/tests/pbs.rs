@@ -160,8 +160,7 @@ fn leak_check(random_draft: bool) -> (usize, usize) {
                     "features changed when only player {}'s hidden config changed",
                     p
                 );
-                // The pending-maneuver mask is channel `6 + NSLOT` of the
-                // hex-major block.
+                // The pending-maneuver mask is hex channel 6.
                 if (0..warchest::board::N_HEXES).any(|h| a[h * HEX_CH + 6] != 0.0) {
                     pending_seen += 1;
                 }
@@ -539,7 +538,7 @@ fn packed_row_expands_to_the_same_features() {
             if s.is_terminal() {
                 break;
             }
-            if matches!(s.pending(), Cont::MainPlay) {
+            if s.is_valued() {
                 let mut row = [0u8; ROW_BYTES];
                 pack_row(&s, &ctx, &mut row);
                 let mut hs = [0u8; 2];
@@ -572,7 +571,7 @@ fn packed_row_expands_to_the_same_features() {
         }
         assert!(
             checked > 20,
-            "seed {} exercised too few MainPlay states",
+            "seed {} exercised too few valued states",
             seed
         );
     }

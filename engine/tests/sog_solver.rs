@@ -563,8 +563,8 @@ fn draw_pass_through_consistency() {
 /// forced-play coin, and the forced play is a config-dependent decision node
 /// whose legal set is exactly the pending coin's plays. Checks the structure
 /// (`belief_after_draw`-consistent support, one public child, per-config
-/// legality), that every non-terminal leaf is a MainPlay state, and that the
-/// solve runs to completion.
+/// legality), that the forced play is walked through, and that the solve runs
+/// to completion.
 #[test]
 fn warrior_priest_draw_walks_through_the_tree() {
     use warchest::state::Z_BAG;
@@ -693,13 +693,15 @@ fn warrior_priest_draw_walks_through_the_tree() {
         }
     }
 
-    // Every non-terminal leaf is a MainPlay state.
+    // Every non-terminal leaf is a valued decision or a chance node the
+    // round boundary froze.
     for i in 0..sv.nodes.len() {
         if sv.nodes[i].leaf && !sv.states[i].is_terminal() {
             assert!(
-                matches!(sv.states[i].pending(), Cont::MainPlay),
-                "non-terminal leaf {} is not a MainPlay state",
-                i
+                sv.states[i].is_valued() || sv.states[i].is_chance(),
+                "non-terminal leaf {} is {:?}",
+                i,
+                sv.states[i].pending()
             );
         }
     }
@@ -713,7 +715,7 @@ fn warrior_priest_draw_walks_through_the_tree() {
 }
 
 #[test]
-fn growing_a_coin_play_finishes_its_micro_decisions() {
+fn expanding_a_coin_play_stops_at_micro_decisions() {
     let nets = Arc::new(Nets::default());
     let mut rng = Rng::new(1234);
     for _ in 0..400 {
@@ -739,22 +741,10 @@ fn growing_a_coin_play_finishes_its_micro_decisions() {
                     Rng::new(rng.next_u64()),
                 );
                 assert!(
-                    sv.nodes
-                        .iter()
-                        .zip(&sv.states)
-                        .skip(1)
-                        .any(|(n, state)| {
-                            !n.leaf && !matches!(state.pending(), Cont::MainPlay)
-                        }),
-                    "the compound play's micro-decision was not grown"
-                );
-                assert!(
-                    sv.nodes.iter().zip(&sv.states).all(|(n, state)| {
-                        !n.leaf
-                            || state.is_terminal()
-                            || matches!(state.pending(), Cont::MainPlay)
+                    sv.nodes.iter().zip(&sv.states).any(|(n, state)| {
+                        n.leaf && state.is_valued() && !matches!(state.pending(), Cont::MainPlay)
                     }),
-                    "a micro-decision remained as a value leaf"
+                    "a micro-decision was grown through instead of left as a value leaf"
                 );
                 return;
             }

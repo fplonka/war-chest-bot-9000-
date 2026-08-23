@@ -902,12 +902,13 @@ def main():
                     names[i]: {
                         "p50": pct(i, 0.50),
                         "p90": pct(i, 0.90),
+                        "p99": pct(i, 0.99),
                         "max": int(a[:, i].max()),
                     }
                     for i in range(8)
                 }
             else:
-                shape = {n: {"p50": 0, "p90": 0, "max": 0} for n in names}
+                shape = {n: {"p50": 0, "p90": 0, "p99": 0, "max": 0} for n in names}
             rec = {
                 "t": round(now - t0, 1),
                 "epoch": epoch,

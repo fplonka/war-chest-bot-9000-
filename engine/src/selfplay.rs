@@ -235,8 +235,8 @@ impl Data {
         policy: &crate::search::Policy,
     ) {
         debug_assert!(
-            matches!(s.pending(), Cont::MainPlay),
-            "every saved value row is a normal coin-play state"
+            s.is_valued(),
+            "every saved value row is a valued decision"
         );
         let base = self.rows.len();
         self.rows.resize(base + ROW_BYTES, 0);
@@ -401,10 +401,10 @@ pub fn keep_query(
     solved.queries
 }
 
-/// Whether a row is collected here. Only coin plays carry one, and only the
-/// SoG collector takes them from a solve.
+/// Whether a row is collected here. Every valued decision carries one, and
+/// only the SoG collector takes them from a solve.
 fn collects_rows(gc: &GameCfg, s: &State) -> bool {
-    gc.collect == Collect::Sog && matches!(s.pending(), Cont::MainPlay)
+    gc.collect == Collect::Sog && s.is_valued()
 }
 
 impl Game {

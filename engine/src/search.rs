@@ -1,11 +1,11 @@
 //! Growing-tree CFR over public belief states, specialised to War Chest.
 //!
 //! The subgame rooted at a PBS is unrolled over **public observations**. A node
-//! is a leaf when it is terminal or when it is a coin play the tree has not
-//! grown through yet. A round-start draw is passed through: its private outcome
-//! does not branch the public tree. The one child is the post-draw state, and the
-//! drawing player's configs are convolved through the draw distribution. Leaf values
-//! come from the value network.
+//! is a leaf when it is terminal or when it is a decision the tree has not
+//! grown through yet. Chance (a round-start draw, a Warrior Priest draw) is
+//! walked through: its private outcome does not branch the public tree. A forced
+//! Warrior Priest play is walked through too, so the in-flight coin never
+//! reaches the net. Leaf values come from the value network.
 //!
 //! Conventions follow the reference implementation (`csrc/liars_dice` of
 //! `facebookresearch/rebel`), with Student of Games' growing tree
@@ -97,8 +97,7 @@ impl Ent {
 ///
 /// A slot is allocated once at this size and reused by every solve that ever
 /// runs in it, so this is a *bound* and not a forecast. An expansion that
-/// would take the solve past any of these is abandoned exactly as one that
-/// runs away past `EXPANSION_CAP` is.
+/// would take the solve past any of these is abandoned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budget {
     pub nodes: usize,
@@ -200,8 +199,8 @@ impl Budget {
     }
 }
 
-/// The shape a solve at `SoG(512, 8)` is allowed: p90 of each entity count
-/// over finished solves in `runs/unc5` (epochs after t=60, max of those p90s).
+/// The shape a solve at `SoG(512, 8)` is allowed: p99 of each entity count
+/// over finished solves.
 const BUDGET_512: Budget = Budget {
     nodes: 20_022,
     rows: 13_116,
@@ -1015,20 +1014,8 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Nodes one expansion may add before it is abandoned.
-///
-/// An expansion adds a coin play and everything beneath it up to the next coin
-/// plays, and that walk recurses through draws, tactics and forced plays. It
-/// usually costs about seventeen nodes, but one that branches through several
-/// tactics at once has been measured building two hundred thousand. Abandoning
-/// that single expansion through `rewind` leaves the rest of the solve intact,
-/// which a ceiling on the whole tree could not do.
-const EXPANSION_CAP: usize = 4096;
-
 /// Nodes a healthy solve of `s` expansions builds, with room to spare: what a
-/// retired node array may hold and still be worth pooling. Larger arrays came
-/// from a pathological tree and holding one per thread costs more memory than
-/// every reallocation it saves.
+/// retired node array may hold and still be worth pooling.
 fn pool_budget(cfg: &Cfg) -> usize {
     32 * cfg.s as usize
 }
@@ -1380,9 +1367,6 @@ pub struct Solver {
     wbuf: Vec<f32>,
     /// The expansion in flight has passed its bound and is unwinding.
     abandon: bool,
-    /// Node count at which the expansion in flight gives up. The bound is on
-    /// one expansion, not on the tree.
-    limit: usize,
     /// Working memory for the chance transitions, reused across the tree.
     draw_scratch: DrawScratch,
     /// `(config key, legal cell)` scratch for ordering a public child's
@@ -1523,7 +1507,6 @@ impl Solver {
             h: take_buf(R_H),
             wbuf: Vec::new(),
             abandon: false,
-            limit: usize::MAX,
             draw_scratch: DrawScratch::default(),
             cell_order: Vec::new(),
             contract: Arc::new(crate::contract::Contract::default()),
@@ -1633,7 +1616,7 @@ impl Solver {
     fn push_node(&mut self, parent: u32, s: State, cfgs: [Arc<[Config]>; 2]) -> usize {
         let player = s.to_act();
         let terminal = s.is_terminal();
-        let coin = !terminal && matches!(s.pending(), Cont::MainPlay);
+        let coin = !terminal && s.is_valued();
         let (c0, c1) = (cfgs[0].len(), cfgs[1].len());
         let next_row = if terminal {
             self.leaf_rows.len().max(self.term_leaves.len() + 1)
@@ -1709,9 +1692,9 @@ impl Solver {
         }
         self.primed.push(false);
         self.row_of.push(u32::MAX);
-        // Only a coin play carries a network row. Everything between two coin
-        // plays is grown through immediately and never stays a leaf. The Row
-        // slot also holds terminals, so both appends go through the same reserve.
+        // A valued decision carries a network row. Chance and the forced
+        // Warrior Priest play do not. The Row slot also holds terminals, so
+        // both appends go through the same reserve.
         if terminal {
             self.term_leaves.push(id);
         } else if coin {
@@ -1727,27 +1710,16 @@ impl Solver {
 
     /// Push a child and, unless it is somewhere the search may stop, grow it.
     ///
-    /// A leaf always stands for a coin play or a terminal, because the value
-    /// network is defined only at a coin play. A round-start draw run, the
-    /// micro-decisions inside a tactic and a Warrior Priest's forced play are
-    /// none of those, so they ride free here exactly as they used to ride free
-    /// inside a depth unit.
+    /// A leaf is a valued decision or a terminal. Chance is walked through: it
+    /// does not branch the public tree. A forced Warrior Priest play is walked
+    /// through too, so the in-flight coin never reaches the net.
     fn push_child(&mut self, parent: usize, s: State, cfgs: [Arc<[Config]>; 2]) -> usize {
-        // The single funnel every node comes through, and so the only place the
-        // budget can bite exactly. The head of `grow` is not enough: a decision
-        // node pushes its whole fan-out of coin-play children here, and none of
-        // them recurses, so up to forty rows land between two of those checks.
-        //
-        // The parent is handed back rather than a new node. Nothing reads it:
-        // both callers test `abandon` on the next line and rewind.
-        if self.runaway() {
+        if self.abandon {
             return parent;
         }
-        let stop = s.is_terminal() || matches!(s.pending(), Cont::MainPlay);
+        let stop = s.is_terminal() || s.is_valued();
         let ch = self.push_node(parent as u32, s, cfgs);
-        // `runaway` is the start-of-step check; one row of cidx or one node's
-        // reach can land past the cap between two of those. The caller rewinds.
-        if self.runaway() {
+        if self.abandon {
             return ch;
         }
         if !stop {
@@ -1756,20 +1728,13 @@ impl Solver {
         ch
     }
 
-    /// One expansion of leaf `id`, abandoned whole if it runs away.
-    ///
-    /// The bound has to bite *inside* the grow-through recursion, because one
-    /// expansion grows through every draw, tactic and forced play beneath the
-    /// coin play it starts from and that walk branches. An abandoned expansion
-    /// leaves `id` a leaf that growth will not try again; the solve carries on
-    /// with the tree it already had.
+    /// One expansion of leaf `id`, abandoned whole if it does not fit the budget.
     fn expand(&mut self, id: usize) {
         debug_assert!(
             self.nodes[id].leaf && self.nodes[id].expandable,
             "growth turns an expandable leaf into a decision node, and nothing else"
         );
         let fresh = self.nodes.len();
-        self.limit = fresh + EXPANSION_CAP;
         self.grow(id);
         if self.abandon {
             self.abandon = false;
@@ -1822,16 +1787,6 @@ impl Solver {
     /// The nodes whose `exhausted` flag has moved since the last call.
     pub(crate) fn take_resealed(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.resealed)
-    }
-
-    /// Whether the expansion in flight has spent its bound.
-    fn runaway(&mut self) -> bool {
-        if self.nodes.len() >= self.limit
-            || Ent::ALL.iter().any(|&e| !self.reserve(e, self.used(e) + 1))
-        {
-            self.abandon = true;
-        }
-        self.abandon
     }
 
     /// Whether this solve ever ran out of budget. See `Solver::budget_hit`.
@@ -1921,12 +1876,8 @@ impl Solver {
     /// again.
     ///
     /// Growth is all-or-nothing so that a tree is a tree at every moment a
-    /// caller can see one: every non-terminal leaf stands for a coin play,
-    /// which is the only place the value network is defined. Stopping halfway
-    /// would leave a leaf in the middle of a tactic, whose value nothing
-    /// defines and which reads as zero. An inner abandon unwinds through every
-    /// enclosing `grow`, so the whole expansion is undone up to the coin play
-    /// it started from.
+    /// caller can see one. An inner abandon unwinds through every enclosing
+    /// `grow`, so the whole expansion is undone.
     fn rewind(&mut self, id: usize, m: Mark) {
         if m.nodes < self.roff.len() {
             self.nreach = self.roff[m.nodes] as usize;
@@ -2072,10 +2023,9 @@ impl Solver {
 
     /// Turn leaf `id` into a decision node, its children pushed as leaves.
     ///
-    /// This is the whole of tree growth. It is the old fixed-depth build with
-    /// the depth counter taken out: one call adds exactly one coin play, and
-    /// the search decides how many calls to make and where, rather than
-    /// spending the same budget evenly over every line.
+    /// This is the whole of tree growth. One call adds this node's public
+    /// children. Chance and a forced Warrior Priest play are grown through;
+    /// every other decision stops as a leaf.
     fn grow(&mut self, id: usize) {
         debug_assert!(self.nodes[id].leaf, "only a leaf can be grown");
         // It is a decision node from here, so it wants a policy prior as soon
@@ -2083,7 +2033,7 @@ impl Solver {
         if self.row_of[id] != u32::MAX {
             self.wants_prior.push(id as u32);
         }
-        if self.runaway() {
+        if self.abandon {
             return;
         }
         let mark = self.mark();
@@ -2545,11 +2495,9 @@ impl Solver {
     /// One row of the network batch: its public encoding, and its configs
     /// interned into the shared table.
     fn push_row(&mut self, _id: usize, s: &State, cfgs: &[Arc<[Config]>; 2]) {
-        // The network is queried only at normal coin-play states: a subgame
-        // finishes every tactic, trigger and forced play before a leaf.
         debug_assert!(
-            matches!(s.pending(), Cont::MainPlay),
-            "a network row must be a MainPlay state"
+            s.is_valued(),
+            "a network row must be a valued decision"
         );
         if !self.reserve(Ent::Row, (self.leaf_rows.len() + 1).max(self.term_leaves.len())) {
             return;
@@ -4015,8 +3963,8 @@ impl Solver {
     ///
     /// Those leaves are where the value function's error enters the solve, so
     /// they are the belief states worth solving in their own right. Every one
-    /// of them is a coin play, which is both what the network is defined on
-    /// and what a training row can carry, so no filtering is needed here.
+    /// of them is a valued decision, which is both what the network is defined
+    /// on and what a training row can carry, so no filtering is needed here.
     fn sample_queries(&self, rng: &mut Rng, want: usize) -> Vec<(State, [Belief; 2])> {
         if self.leaf_rows.is_empty() {
             return Vec::new();
