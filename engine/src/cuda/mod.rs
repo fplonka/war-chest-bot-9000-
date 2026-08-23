@@ -23,7 +23,8 @@
 //! Scratch is allocated at carve from `RoundCap`. A round that needs more rows
 //! tiles. Nothing a round runs is a device allocation.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 
 use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
@@ -855,7 +856,7 @@ impl Device {
         let mut left = max_slots;
         let mut slot_bytes = 0usize;
         for (g, &o) in ordinals.iter().enumerate() {
-            let gpu = Gpu::new(o, &net)?;
+            let gpu = Gpu::get(o)?;
             gpu.ctx.bind_to_thread().map_err(err)?;
             let mut pair: Vec<Card> = (0..PIPELINE)
                 .map(|_| Card::on(&gpu, &net))
@@ -1108,7 +1109,11 @@ pub struct Resident {
 struct Gpu {
     ctx: Arc<CudaContext>,
     k: Arc<Kernels>,
+    torch: Arc<CudaStream>,
 }
+
+static GPUS: LazyLock<parking_lot::Mutex<HashMap<usize, Arc<Gpu>>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 fn compile_options(major: i32, minor: i32) -> CompileOptions {
     let define = |name: &str, value: usize| format!("-D{name}={value}");
@@ -1174,79 +1179,74 @@ pub fn expand_rows_torch(
     ordinal: i32,
 ) -> Res<()> {
     use cudarc::driver::{result, sys};
-    use std::ffi::{c_void, CString};
-    use std::sync::LazyLock;
-
-    static FUNCTIONS: LazyLock<parking_lot::Mutex<std::collections::HashMap<i32, (usize, usize)>>> =
-        LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
     if n == 0 {
         return Ok(());
     }
-    if result::ctx::get_current().map_err(err)?.is_none() {
-        return Err("PyTorch has no current CUDA context".into());
+    let torch_ctx = result::ctx::get_current()
+        .map_err(err)?
+        .ok_or("PyTorch has no current CUDA context")?;
+    let device = result::device::get(ordinal).map_err(err)?;
+    let primary = unsafe { result::primary_ctx::retain(device) }.map_err(err)?;
+    let same_context = primary == torch_ctx;
+    unsafe { result::primary_ctx::release(device) }.map_err(err)?;
+    if !same_context {
+        return Err("PyTorch does not use the device primary CUDA context".into());
     }
-    let function = {
-        let mut functions = FUNCTIONS.lock();
-        if let Some(&(_, function)) = functions.get(&ordinal) {
-            function as sys::CUfunction
-        } else {
-            let device = result::device::get(ordinal).map_err(err)?;
-            let major = unsafe {
-                result::device::get_attribute(
-                    device,
-                    sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-                )
-            }
-            .map_err(err)?;
-            let minor = unsafe {
-                result::device::get_attribute(
-                    device,
-                    sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-                )
-            }
-            .map_err(err)?;
-            let ptx = compile_ptx_with_opts(KERNELS, compile_options(major, minor))
-                .map_err(|e| format!("nvrtc: {e:?}"))?;
-            let image = CString::new(ptx.to_src()).expect("PTX contains no nul");
-            let module = unsafe { result::module::load_data(image.as_ptr() as *const c_void) }
-                .map_err(err)?;
-            let function = unsafe {
-                result::module::get_function(
-                    module,
-                    CString::new("k_expand_rows").expect("static name"),
-                )
-            }
-            .map_err(err)?;
-            functions.insert(ordinal, (module as usize, function as usize));
-            function
-        }
-    };
-    let (mut rows, mut cards, mut locations, mut out) = (rows, cards, locations, out);
-    let mut n = n as i32;
-    let mut args = [
-        &mut rows as *mut _ as *mut c_void,
-        &mut cards as *mut _ as *mut c_void,
-        &mut locations as *mut _ as *mut c_void,
-        &mut out as *mut _ as *mut c_void,
-        &mut n as *mut _ as *mut c_void,
-    ];
+    let gpu = Gpu::get(ordinal as usize)?;
+
+    let before = gpu.ctx.new_event(None).map_err(err)?;
     unsafe {
-        result::launch_kernel(
-            function,
-            (n as u32, 1, 1),
-            (THREADS, 1, 1),
-            0,
-            stream as sys::CUstream,
-            &mut args,
-        )
+        result::event::record(before.cu_event(), stream as sys::CUstream).map_err(err)?;
     }
-    .map_err(err)
+    gpu.torch.wait(&before).map_err(err)?;
+
+    // These are borrowed PyTorch allocations. `leak` below only keeps cudarc
+    // from freeing them; PyTorch retains their ownership.
+    let rows = unsafe { gpu.torch.upgrade_device_ptr::<u8>(rows, n * ROW_BYTES) };
+    let cards = unsafe { gpu.torch.upgrade_device_ptr::<f32>(cards, N_UNITS * CARD_FEATS) };
+    let locations = unsafe { gpu.torch.upgrade_device_ptr::<u8>(locations, N_HEXES) };
+    let mut out = unsafe { gpu.torch.upgrade_device_ptr::<f32>(out, n * PUBFEAT) };
+    let n_i = n as i32;
+    unsafe {
+        gpu.torch
+            .launch_builder(&gpu.k.expand_rows)
+            .arg(&rows)
+            .arg(&cards)
+            .arg(&locations)
+            .arg(&mut out)
+            .arg(&n_i)
+            .launch_unit(LaunchConfig {
+                grid_dim: (n as u32, 1, 1),
+                block_dim: (THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            })
+            .map_err(err)?;
+    }
+    rows.leak();
+    cards.leak();
+    locations.leak();
+    out.leak();
+
+    let after = gpu.torch.record_event(None).map_err(err)?;
+    unsafe {
+        result::stream::wait_event(
+            stream as sys::CUstream,
+            after.cu_event(),
+            sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+        )
+        .map_err(err)
+    }
 }
 
 impl Gpu {
-    fn new(ordinal: usize, _net: &Net) -> Res<Gpu> {
+    fn get(ordinal: usize) -> Res<Arc<Gpu>> {
+        let mut gpus = GPUS.lock();
+        if let Some(gpu) = gpus.get(&ordinal) {
+            gpu.ctx.bind_to_thread().map_err(err)?;
+            return Ok(Arc::clone(gpu));
+        }
         let ctx = CudaContext::new(ordinal).map_err(|e| format!("device {ordinal}: {e:?}"))?;
-        // Two streams on this context, so the read/write events cudarc would
+        // Stream ordering is explicit, so the read/write events cudarc would
         // otherwise create on every allocation buy nothing.
         unsafe { ctx.disable_event_tracking() };
         let (major, minor) = ctx.compute_capability().map_err(err)?;
@@ -1265,7 +1265,10 @@ impl Gpu {
                 TRUNK_SHARED as i32,
             )
             .map_err(err)?;
-        Ok(Gpu { ctx, k: Arc::new(k) })
+        let torch = ctx.new_stream().map_err(err)?;
+        let gpu = Arc::new(Gpu { ctx, k: Arc::new(k), torch });
+        gpus.insert(ordinal, Arc::clone(&gpu));
+        Ok(gpu)
     }
 }
 
