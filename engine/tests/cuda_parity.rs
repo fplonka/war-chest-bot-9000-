@@ -646,8 +646,8 @@ fn shared_round(
 /// reason no leaf either side sampled can be compared across two batch
 /// compositions. Holding the sampling is the replay's job, not this test's.
 ///
-/// The bounds are the neighbouring test's, and hold for its reason: a round of
-/// three and a round of one give the leaf pass different GEMM shapes.
+/// The bound is the neighbouring test's TF32 contract: a round of three and a
+/// round of one give the leaf pass different GEMM shapes.
 #[test]
 fn a_ragged_round_does_not_move_the_small_solve() {
     if Device::count() == 0 {
@@ -723,11 +723,11 @@ fn a_ragged_round_does_not_move_the_small_solve() {
         "the ragged round solved a different number of configs"
     );
     let (t, p) = (
-        worst(&alone.cy, &data.cy, "targets"),
+        worst_scaled(&alone.cy, &data.cy, "targets"),
         worst(&alone.pprob, &data.pprob, "policy"),
     );
     eprintln!("ragged round: targets {t:e}  policy {p:e}");
-    assert!(t < 1e-4, "a ragged round moved the small solve's targets by {t:e}");
+    assert!(t < 2.0 * TF32, "a ragged round moved the small solve's targets by {t:e}");
     assert!(p < 5e-2, "a ragged round moved the small solve's policy by {p:e}");
 }
 

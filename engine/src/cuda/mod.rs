@@ -850,11 +850,17 @@ impl Device {
                 .collect::<Res<_>>()?;
             let s0 = Arc::clone(&pair[0].stream);
             s0.context().bind_to_thread().map_err(err)?;
+            // A first allocation on a cold context can include NVRTC scratch
+            // in the free-memory delta, so a slot looks like the whole card
+            // and the carve yields one. Warm, then measure a second probe.
+            drop(Solve::at_budget(s0, &budget)?);
+            s0.synchronize().map_err(err)?;
             let free0 = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
             let probe = Solve::at_budget(&s0, &budget)?;
             s0.synchronize().map_err(err)?;
             let measured = free0.saturating_sub(cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64);
-            let slot = measured.max(probe.bytes() as u64);
+            let accounted = probe.bytes() as u64;
+            let slot = measured.clamp(accounted, accounted.saturating_mul(2));
             drop(probe);
             s0.synchronize().map_err(err)?;
             if g == 0 {
