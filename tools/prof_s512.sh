@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Real-run nsys window: 90 s warm-up, 120 s trace, train.py --minutes=5 exits itself.
+# Real-run nsys window: 3 min greedy warm, then SoG. Delay 210 s so the 120 s
+# trace sits in SoG; train.py --minutes=8 covers the window and exits itself.
 set -euo pipefail
-cd /workspace/warchest-engine
+cd "$(dirname "$0")/.."
 export PATH=/root/.cargo/bin:/usr/local/cuda/bin:$PATH
 source /venv/main/bin/activate 2>/dev/null || true
 
@@ -13,7 +14,7 @@ fi
 
 OUT=/workspace/logs/prof
 NSYS_OUT=$OUT/train_s512
-RUN=runs/prof_s512
+RUN=runs/prof_exp
 mkdir -p "$OUT"
 rm -rf "$RUN" "$NSYS_OUT".nsys-rep "$NSYS_OUT".sqlite "$NSYS_OUT".qdstrm
 rm -f "$OUT"/summary.txt "$OUT"/gaps.txt "$OUT"/nsys.log "$OUT"/export.log
@@ -22,7 +23,7 @@ if ! command -v py-spy >/dev/null 2>&1; then
     pip install --quiet py-spy || true
 fi
 
-bash tools/host_sample.sh "$OUT" 105 >"$OUT/host_sample.log" 2>&1 &
+bash tools/host_sample.sh "$OUT" 225 >"$OUT/host_sample.log" 2>&1 &
 sample_pid=$!
 
 # --kill none: duration ends the trace; train.py keeps going until --minutes.
@@ -35,15 +36,15 @@ set +e
     --sample=none \
     --cpuctxsw=none \
     --gpu-metrics-devices=none \
-    --delay=90 \
+    --delay=210 \
     --duration=120 \
     --kill=none \
     python train/train.py \
-        out="$RUN" minutes=5 snapshot_every=30 ladder_games=0 \
+        out="$RUN" minutes=8 snapshot_every=30 ladder_games=0 \
         s=512 c=8 round_batch=8 gen_workers=36 gen_solves=8 \
         device=cuda:1 gen_devices=0,1 batch=256 target_every=1 \
         lr_decay_frac= \
-        note="nsys 90s delay + 120s window, s=512" \
+        note="nsys 210s delay + 120s window after 3min warm, s=512" \
     >"$OUT/train.log" 2>&1
 nsys_rc=$?
 set -e

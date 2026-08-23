@@ -638,14 +638,16 @@ def main():
     import gpu_batch
     gpu_batch.warmup(dev)
     batcher = gpu_batch.make_batch
-    # One training step and one probe at the largest batch the run can make,
-    # so the caching allocator holds the peak before the farm carves.
+    # One training step and one probe at a training-sized batch, so the
+    # caching allocator holds that peak before the farm carves. Configs in a
+    # batch are `rows × cfgs_per_row`. The solve slot's config cap is not a
+    # batch width: at s=512 it is thousands, and a dummy that wide does not
+    # fit next to the intern table.
     # 2048 is the intern-table floor: a 2048× table does not fit the encoder.
     torch.cuda.reset_peak_memory_stats(dev)
     names = tuple(warchest.ENT_NAMES)
-    per = warchest.budget_for_s(args.s)[names.index("config")]
     n = max(args.batch, 2048)
-    k = args.batch * per
+    k = n * args.cfgs_per_row
     x = torch.zeros(2 * n, PUBFEAT, device=dev)
     phi = torch.zeros(k, CFEAT, device=dev)
     w = torch.ones(k, device=dev)
