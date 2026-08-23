@@ -1029,8 +1029,8 @@ fn drive_card(
 /// thread that was ready at the same moment.
 pub struct Cards {
     queues: Vec<Arc<Queue<Ask>>>,
-    /// Seats nobody is sitting in. A card keeps a solve's arenas while it runs,
-    /// so two solves must never share a slot.
+    /// Pipeline lanes and solve slots nobody is using. A solve stays on one
+    /// stream because its resident arrays have no cross-stream events.
     seats: Mutex<Vec<(usize, usize)>>,
     free: Condvar,
     drivers: Vec<JoinHandle<()>>,
@@ -1042,17 +1042,17 @@ struct Ask {
     back: std::sync::mpsc::Sender<Vec<Reply>>,
 }
 
-/// A card and one of its solve slots, held for one solve and given back when
+/// A pipeline lane and one of its solve slots, held for one solve and given back when
 /// this is dropped.
 pub struct Seat<'a> {
     cards: &'a Cards,
-    pub card: usize,
+    pub lane: usize,
     pub slot: usize,
 }
 
 impl Drop for Seat<'_> {
     fn drop(&mut self) {
-        self.cards.seats.lock().push((self.card, self.slot));
+        self.cards.seats.lock().push((self.lane, self.slot));
         self.cards.free.notify_one();
     }
 }
@@ -1062,12 +1062,13 @@ impl Cards {
         let n = backend.cards();
         let pipes = backend.pipelines();
         let backend = Arc::new(backend);
-        let queues: Vec<Arc<Queue<Ask>>> = (0..n).map(|_| Arc::new(Queue::default())).collect();
+        let queues: Vec<Arc<Queue<Ask>>> =
+            (0..n * pipes).map(|_| Arc::new(Queue::default())).collect();
         let mut drivers = Vec::with_capacity(n * pipes);
         for g in 0..n {
             for p in 0..pipes {
-                let (queue, backend) = (Arc::clone(&queues[g]), Arc::clone(&backend));
                 let lane = g * pipes + p;
+                let (queue, backend) = (Arc::clone(&queues[lane]), Arc::clone(&backend));
                 drivers.push(
                     std::thread::Builder::new()
                         .name(format!("card-{g}.{p}"))
@@ -1103,7 +1104,7 @@ impl Cards {
         let mut free = Vec::new();
         for g in 0..n {
             for s in 0..backend.slots(g) {
-                free.push((g, s));
+                free.push((g * pipes + s % pipes, s));
             }
         }
         Cards { queues, seats: Mutex::new(free), free: Condvar::new(), drivers }
@@ -1113,18 +1114,18 @@ impl Cards {
     pub fn seat(&self) -> Seat<'_> {
         let mut seats = self.seats.lock();
         loop {
-            if let Some((card, slot)) = seats.pop() {
-                return Seat { cards: self, card, slot };
+            if let Some((lane, slot)) = seats.pop() {
+                return Seat { cards: self, lane, slot };
             }
             self.free.wait(&mut seats);
         }
     }
 
-    /// Run these calls in the next round of `card`, and wait for them.
+    /// Run these calls in the next round of `lane`, and wait for them.
     /// `None` once the card is gone, which is not recoverable.
-    pub fn round(&self, card: usize, calls: Vec<Call>) -> Option<Vec<Reply>> {
+    pub fn round(&self, lane: usize, calls: Vec<Call>) -> Option<Vec<Reply>> {
         let (back, replies) = std::sync::mpsc::channel();
-        self.queues[card].push(Ask { calls, back });
+        self.queues[lane].push(Ask { calls, back });
         replies.recv().ok()
     }
 }
