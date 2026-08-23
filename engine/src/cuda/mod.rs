@@ -852,7 +852,7 @@ impl Device {
             let mut pair: Vec<Card> = (0..PIPELINE)
                 .map(|_| Card::on(&gpu, &net))
                 .collect::<Res<_>>()?;
-            let s0 = Arc::clone(&pair[0].stream);
+            let mut s0 = Arc::clone(&pair[0].stream);
             s0.context().bind_to_thread().map_err(err)?;
             let free0 = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
             let probe = Solve::at_budget(&s0, &budget)?;
@@ -879,45 +879,39 @@ impl Device {
                     "a slot of {slot} bytes does not fit in {free} bytes free"
                 ));
             }
-            for (p, card) in pair.iter_mut().enumerate() {
-                card.carve(n, &cfg).map_err(|e| {
-                    format!("carve gpu {g} pipe {p} n={n} slot={slot} free={free}: {e}")
-                })?;
-                card.stream.synchronize().map_err(err)?;
-            }
-            let free_after_round = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
-            let round = free.saturating_sub(free_after_round);
-            let variable = n as u64 * PIPELINE as u64 * extra;
-            let fixed = round.saturating_sub(variable);
-            let usable = free.saturating_sub(fixed);
-            let measured_fit = (usable - usable / 10) / per.max(1);
-            n = n.min(measured_fit as usize);
-            for card in &mut pair {
-                *card.host.get_mut() = Stage::default();
-                *card.scratch.get_mut() = Scratch::default();
-                *card.batch.get_mut() = Batch::default();
-            }
-            if n == 0 {
-                return Err(format!(
-                    "a slot of {slot} bytes does not fit after wave buffers"
-                ));
+            loop {
+                let attempt = (|| {
+                    let mut solves = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        solves.push(Solve::at_budget(&s0, &budget)?);
+                    }
+                    if let Some(s) = solves.first() {
+                        *CENSUS.lock() = s.census();
+                    }
+                    let solves = Arc::new(parking_lot::Mutex::new(solves));
+                    for (p, card) in pair.iter_mut().enumerate() {
+                        card.solves = Arc::clone(&solves);
+                        card.carve(n, &cfg).map_err(|e| {
+                            format!("carve gpu {g} pipe {p} n={n} slot={slot} free={free}: {e}")
+                        })?;
+                        card.stream.synchronize().map_err(err)?;
+                    }
+                    Ok(())
+                })();
+                match attempt {
+                    Ok(()) => break,
+                    Err(_) if n > 1 => {
+                        n = (n * 9 / 10).min(n - 1).max(1);
+                        pair = (0..PIPELINE)
+                            .map(|_| Card::on(&gpu, &net))
+                            .collect::<Res<_>>()?;
+                        s0 = Arc::clone(&pair[0].stream);
+                        s0.context().bind_to_thread().map_err(err)?;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             left = left.saturating_sub(n);
-            let mut solves = Vec::with_capacity(n);
-            for _ in 0..n {
-                solves.push(Solve::at_budget(&s0, &budget)?);
-            }
-            if let Some(s) = solves.first() {
-                *CENSUS.lock() = s.census();
-            }
-            let solves = Arc::new(parking_lot::Mutex::new(solves));
-            for (p, card) in pair.iter_mut().enumerate() {
-                card.solves = Arc::clone(&solves);
-                card.carve(n, &cfg).map_err(|e| {
-                    format!("carve gpu {g} pipe {p} n={n} slot={slot} free={free}: {e}")
-                })?;
-                card.stream.synchronize().map_err(err)?;
-            }
             cards.extend(pair);
         }
         Ok(Device { cards, n_gpus: ordinals.len(), net, slot_bytes })
