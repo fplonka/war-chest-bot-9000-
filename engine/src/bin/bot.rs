@@ -37,11 +37,13 @@ struct Options {
     cfr: String,
     threads: usize,
     temp: f32,
+    devices: String,
 }
 
 fn options() -> Result<Options, String> {
     let a = Args::parse(&[
         "name", "weights", "mind", "s", "c", "batch", "rounds", "cfr", "threads", "temp",
+        "devices",
     ])?;
     Ok(Options {
         name: a.text("name", "bot"),
@@ -54,10 +56,11 @@ fn options() -> Result<Options, String> {
         rounds: a.num("rounds", 0)?,
         threads: a.num("threads", 0)?,
         temp: a.num("temp", 2.0)?,
+        devices: a.text("devices", ""),
     })
 }
 
-fn brain(o: &Options, cards: Option<Arc<Cards>>) -> Result<Brain, String> {
+fn brain(o: &Options) -> Result<Brain, String> {
     let mind = match o.mind.as_str() {
         "sog" => Mind::Sog,
         "random" => Mind::Random,
@@ -65,14 +68,24 @@ fn brain(o: &Options, cards: Option<Arc<Cards>>) -> Result<Brain, String> {
         other => return Err(format!("unknown mind {}", other)),
     };
     let cfr = Cfr::named(&o.cfr).ok_or_else(|| format!("unknown cfr rule {}", o.cfr))?;
-    let mut nets = Nets { device: cards.is_some(), ..Nets::default() };
-    if matches!(mind, Mind::Sog) {
-        nets.value = Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
-    }
+    let cfg = Cfg { s: o.s, c: o.c, batch: o.batch, rounds: o.rounds, cfr, budget: Budget::for_s(o.s), ..Default::default() };
+    let backend = devices(o, mind, cfg)?;
+    let mut nets = Nets { device: backend.is_some(), ..Nets::default() };
+    let cards = match backend {
+        Some(backend) => {
+            nets.value = backend.net().clone();
+            Some(Arc::new(Cards::new(backend)))
+        }
+        None if matches!(mind, Mind::Sog) => {
+            nets.value = Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
+            None
+        }
+        None => None,
+    };
     Ok(Brain {
         mind,
         nets: Arc::new(nets),
-        cfg: Cfg { s: o.s, c: o.c, batch: o.batch, rounds: o.rounds, cfr, budget: Budget::for_s(o.s), ..Default::default() },
+        cfg,
         cards,
     })
 }
@@ -131,13 +144,8 @@ fn main() {
     // Evaluation scores a game that hit the play horizon as a draw, so the
     // horizon marker is worth nothing to either side.
     warchest::state::set_cap_marker_value(0.0);
-    // The cards, if there are any. A ladder is a few thousand solves at the
-    // same budget a training run uses, so it belongs on the same machinery:
-    // without this a forty-game ladder is an hour of CPU, which is too dear to
-    // be the thing that checks whether a run learned anything.
-    let cards = devices(&options).map(|backend| Arc::new(Cards::new(backend)));
     let brain = Arc::new(
-        brain(&options, cards).unwrap_or_else(|e| {
+        brain(&options).unwrap_or_else(|e| {
             eprintln!("{}", e);
             std::process::exit(2);
         }),
@@ -202,28 +210,28 @@ fn main() {
     }
 }
 
-/// The backend a solve evaluates on: every card the driver can see.
-///
-/// Not a flag. A bot solves at the training budget, so on a machine with cards
-/// it belongs on them, and there is nothing a caller could usefully decide
-/// here. The CPU network answers when there are no cards, which is what makes
-/// a bot runnable on a laptop -- and it is the oracle `cuda_parity` holds the
-/// device to, so it is not going anywhere.
-fn devices(o: &Options) -> Option<Backend> {
-    if !matches!(o.mind.as_str(), "sog") {
-        return None;
+/// Use only the devices assigned by the referee. No assignment means CPU.
+fn devices(o: &Options, mind: Mind, _cfg: Cfg) -> Result<Option<Backend>, String> {
+    if !matches!(mind, Mind::Sog) || o.devices.is_empty() {
+        return Ok(None);
     }
     #[cfg(feature = "gpu")]
     {
-        let n = warchest::cuda::Device::count();
-        if n > 0 {
-            let net = Net::load_bin(&o.weights).ok()?;
-            let cfg = Cfg { s: o.s, c: o.c, budget: Budget::for_s(o.s), ..Default::default() };
-            match warchest::cuda::Device::new(&(0..n).collect::<Vec<_>>(), net, cfg, usize::MAX) {
-                Ok(d) => return Some(Backend::Cuda(d)),
-                Err(e) => eprintln!("no device backend: {e}"),
-            }
-        }
+        let ordinals: Result<Vec<usize>, String> = o
+            .devices
+            .split(',')
+            .map(|name| {
+                name.strip_prefix("cuda:")
+                    .ok_or_else(|| format!("invalid device {name}"))?
+                    .parse()
+                    .map_err(|_| format!("invalid device {name}"))
+            })
+            .collect();
+        let net = Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
+        return warchest::cuda::Device::new(&ordinals?, net, _cfg, usize::MAX)
+            .map(Backend::Cuda)
+            .map(Some);
     }
-    None
+    #[cfg(not(feature = "gpu"))]
+    Err(format!("built without GPU support; cannot open {}", o.devices))
 }

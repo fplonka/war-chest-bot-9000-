@@ -95,7 +95,7 @@ impl Brain {
                 let mut replies = Vec::new();
                 while let Step::Calls(calls) = sv.advance(&replies) {
                     replies = cards
-                        .round(seat.card, calls)
+                        .round(seat.lane, calls)
                         .expect("a card failed while a solve was still running");
                 }
             }
