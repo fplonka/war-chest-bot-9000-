@@ -9,8 +9,8 @@ accurate away from the line of play.
 There is no warm start. A game that reaches the play cap scores
 `cap_value * delta_markers`, the win condition graded rather than an invented
 evaluation, so the first solves against an untrained network still see a graded
-outcome. `anneal_frac` takes `cap_value` to zero, and evaluation always runs on
-the real game.
+outcome. The payoff fades with the fraction of finished games that hit the
+horizon; evaluation always runs on the real game.
 
 Generation runs in Rust across all CPU cores while the previous batch trains
 on the GPU. Python publishes weights between generation batches.
@@ -649,8 +649,8 @@ def main():
     # ReBeL wall time counts every cost, including the trainer's own.
     sog_t0, sog_solves = None, 0
     # The marker-differential payoff at the horizon distorts the game being
-    # solved, so it is annealed away as soon as horizon games become rare, and
-    # evaluation always runs on the real game (value 0).
+    # solved, so it tracks the recent fraction of finished games that hit the
+    # horizon. Evaluation always runs on the real game (value 0).
     cap_v = args.cap_value
     warchest.set_cap_value(cap_v)
     probe = None
@@ -775,6 +775,11 @@ def main():
                 amount = int(data.get(name, 0))
                 totals[name] += amount
                 window[name] += amount
+            # Stay at the full payoff until a game finishes; then scale by the
+            # fraction of this window that still died at the play cap.
+            if window["games"]:
+                cap_v = args.cap_value * (window["horizon_hits"] / window["games"])
+                warchest.set_cap_value(cap_v)
 
             debt = max(0.0, args.replay_ratio * generated_rows - optimizer_rows)
             nsteps = int(debt // args.batch) if len(buf) >= args.batch else 0
@@ -819,9 +824,6 @@ def main():
                 while next_target <= now:
                     next_target += args.target_every * 60.0
             sog_elapsed = max(0.0, now - sog_t0)
-            span = max(args.anneal_frac * total, 1.0)
-            cap_v = args.cap_value * max(0.0, 1.0 - sog_elapsed / span)
-            warchest.set_cap_value(cap_v)
             while next_decay < len(lr_decays) and \
                     sog_elapsed >= lr_decays[next_decay] * total:
                 for pg in opt.param_groups:

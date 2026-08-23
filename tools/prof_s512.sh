@@ -42,7 +42,7 @@ set +e
         out="$RUN" minutes=5 snapshot_every=30 ladder_games=0 \
         s=512 c=8 round_batch=8 gen_workers=36 gen_solves=8 \
         device=cuda:1 gen_devices=0,1 batch=256 target_every=1 \
-        anneal_frac=1.0 lr_decay_frac= \
+        lr_decay_frac= \
         note="nsys 90s delay + 120s window, s=512" \
     >"$OUT/train.log" 2>&1
 nsys_rc=$?
