@@ -345,6 +345,10 @@ impl Solve {
     }
 
     /// Copy used prefixes into `new` and keep it. Returns the old slab.
+    ///
+    /// A column of width `w` is `len × w` consecutive words at that field, the
+    /// same packing scatter and the kernels use. Copying SoA-per-lane of `len`
+    /// would drop the second half of `nc`, `p`, `vals`, and `coff`.
     pub fn relocate(
         &mut self,
         mut new: CudaSlice<u32>,
@@ -354,28 +358,29 @@ impl Solve {
     ) -> Res<CudaSlice<u32>> {
         let old = self.buf.take().ok_or("relocate of an empty solve")?;
         let lens = self.lens();
-        for e in 0..8 {
-            let n = lens[e];
-            if n == 0 {
-                continue;
+        let old_caps = self.caps();
+        s.memset_zeros(&mut new).map_err(err)?;
+        let mut dst_off = [0usize; 8];
+        {
+            let mut o = 0;
+            for e in 0..8 {
+                dst_off[e] = o;
+                o += caps[e].max(1) * FIELDS[e];
             }
-            let src_off = self.ent[e].offset;
-            let dst_off = {
-                let mut o = 0;
-                for i in 0..e {
-                    o += caps[i].max(1) * FIELDS[i];
-                }
-                o
-            };
-            let old_cap = self.ent[e].cap;
-            let new_cap = caps[e].max(1);
-            for k in 0..FIELDS[e] {
-                let a = src_off + k * old_cap;
-                let b = dst_off + k * new_cap;
+        }
+        let mut acc = [0usize; 8];
+        for c in &TABLE {
+            let e = c.ent as usize;
+            let w = c.width;
+            if w > 0 && lens[e] > 0 {
+                let n = lens[e].saturating_mul(w);
+                let a = self.ent[e].offset + acc[e] * old_caps[e];
+                let b = dst_off[e] + acc[e] * caps[e].max(1);
                 let src = old.slice(a..a + n);
                 let mut dst = new.slice_mut(b..b + n);
                 s.memcpy_dtod(&src, &mut dst).map_err(err)?;
             }
+            acc[e] += w;
         }
         self.lay(new, class, caps, lens);
         Ok(old)
@@ -475,10 +480,6 @@ impl Solve {
         v.push(("seed", self.seed.cap * 8));
         v.sort_by_key(|&(_, b)| std::cmp::Reverse(b));
         v
-    }
-
-    pub fn bytes(&self) -> usize {
-        CLASSES.get(self.class).copied().unwrap_or(0) + self.seed.cap * 8
     }
 
     pub fn used_bytes(&self) -> usize {
