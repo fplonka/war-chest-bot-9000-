@@ -510,7 +510,6 @@ impl Game {
 
     /// Act on a finished solve: keep the row it produced, then play its move.
     pub fn play_solved(&mut self, sv: &Solver, solved: Option<Solved>) {
-        let n = self.bel[self.s.to_act() as usize].cfg.len();
         if let Some(solved) = solved {
             self.data.begin_solve();
             self.data.push_value(
@@ -529,18 +528,7 @@ impl Game {
                 }
             }
         }
-        let np = if sv.nodes[0].legal_off.is_empty() {
-            // A first expansion that did not fit the slot left the root a leaf.
-            policy::uniform(
-                &self.s,
-                &self.ctx,
-                self.s.to_act(),
-                &self.bel[self.s.to_act() as usize].cfg,
-            )
-        } else {
-            policy::at_node(sv, 0, n)
-        };
-        self.play(np);
+        self.play(policy::root(sv));
     }
 
     /// Where the config a seat is really holding sits in its own belief

@@ -97,7 +97,7 @@ impl Brain {
                 }
             }
         }
-        policy::at_node(&sv, 0, cfgs.len())
+        policy::root(&sv)
     }
 }
 

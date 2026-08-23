@@ -152,6 +152,20 @@ pub fn cpu_frame(sv: &Solver, node: usize) -> NodePolicy {
     }
 }
 
+/// The acting policy at a finished solve's root.
+///
+/// A first expansion that did not fit the slot left the root a leaf, with an
+/// empty `legal_off`. That root plays uniformly over legal actions.
+pub fn root(sv: &Solver) -> NodePolicy {
+    let n = &sv.nodes[0];
+    let cfgs = n.cfgs[n.player as usize].as_ref();
+    if n.legal_off.is_empty() {
+        uniform(&sv.states[0], &sv.ctx, n.player, cfgs)
+    } else {
+        at_node(sv, 0, cfgs.len())
+    }
+}
+
 /// The CFR average strategy at a node of a finished solve.
 pub fn at_node(sv: &Solver, node: usize, configs: usize) -> NodePolicy {
     let mut np = cpu_frame(sv, node);
@@ -160,4 +174,64 @@ pub fn at_node(sv: &Solver, node: usize, configs: usize) -> NodePolicy {
         np.probs[row].copy_from_slice(sv.average_strategy(node, config));
     }
     np
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pbs::{true_config, Belief, Ctx};
+    use crate::search::{Budget, Cfg, Nets};
+    use crate::selfplay::make_game;
+    use crate::state::Cont;
+    use std::sync::Arc;
+
+    #[test]
+    fn a_leaf_root_plays_uniform() {
+        let mut rng = Rng::new(0x69);
+        let s = loop {
+            let mut s = make_game(&mut rng, true);
+            for _ in 0..16 {
+                if s.is_terminal() {
+                    break;
+                }
+                let a = s.legal_actions();
+                if a.is_empty() {
+                    break;
+                }
+                s.apply_inplace(a[rng.below(a.len())]);
+            }
+            if !s.is_terminal() && !s.is_chance() && matches!(s.pending(), Cont::MainPlay) {
+                break s;
+            }
+        };
+        let ctx = Ctx::new(&s);
+        let bel = [
+            Belief::point(true_config(&s, 0, &ctx)),
+            Belief::point(true_config(&s, 1, &ctx)),
+        ];
+        let sv = Solver::new(
+            &s,
+            ctx,
+            Arc::new(Nets::default()),
+            Cfg {
+                s: 0,
+                budget: Budget {
+                    nodes: 0,
+                    rows: 0,
+                    boards: 0,
+                    configs: 0,
+                    cidx: 0,
+                    reach: 0,
+                    cells: 0,
+                    draws: 0,
+                },
+                ..Default::default()
+            },
+            bel,
+            Rng::new(1),
+        );
+        assert!(sv.nodes[0].legal_off.is_empty());
+        let np = root(&sv);
+        let _ = np.sample(&mut Rng::new(2), 0);
+    }
 }
