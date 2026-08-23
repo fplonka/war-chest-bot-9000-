@@ -5,10 +5,8 @@
 //! the source that produced it has been rewritten — which is the only way to
 //! compare an architecture with the one that replaced it.
 //!
-//! It reads requests from stdin and writes each game back as that game is
-//! ready, in the JSON `warchest::arena` defines. Games are worked on
-//! independently and in parallel. The referee sends work for any game it is
-//! not already waiting on, which keeps the cores busy.
+//! It reads requests from stdin and writes replies in the JSON
+//! `warchest::arena` defines. All searches in one request run as one farm wave.
 //!
 //! ```text
 //! bot --name v5-2h --weights weights.bin --s 512 --c 8 --cfr sog
@@ -16,15 +14,16 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
-use std::sync::{Arc, Mutex};
 
 use warchest::arena::{Ask, Done, Hello, Reply, Request, PROTOCOL};
 use warchest::args::Args;
 use warchest::bot::{Brain, Mind, Session};
-use warchest::farm::{Backend, Cards};
+use warchest::farm::{Backend, Farm};
+#[cfg(feature = "gpu")]
+use warchest::farm::host_slots;
 use warchest::net::Net;
 use warchest::pbs::rules_table_hash;
-use warchest::search::{Budget, Cfg, Cfr, Nets};
+use warchest::search::{Budget, Cfg, Cfr};
 
 struct Options {
     name: String,
@@ -35,13 +34,13 @@ struct Options {
     batch: usize,
     rounds: u8,
     cfr: String,
-    threads: usize,
     temp: f32,
+    devices: String,
 }
 
 fn options() -> Result<Options, String> {
     let a = Args::parse(&[
-        "name", "weights", "mind", "s", "c", "batch", "rounds", "cfr", "threads", "temp",
+        "name", "weights", "mind", "s", "c", "batch", "rounds", "cfr", "temp", "devices",
     ])?;
     Ok(Options {
         name: a.text("name", "bot"),
@@ -52,12 +51,12 @@ fn options() -> Result<Options, String> {
         c: a.num("c", 8.0)?,
         batch: a.num("batch", 8)?,
         rounds: a.num("rounds", 0)?,
-        threads: a.num("threads", 0)?,
         temp: a.num("temp", 2.0)?,
+        devices: a.text("devices", ""),
     })
 }
 
-fn brain(o: &Options, cards: Option<Arc<Cards>>) -> Result<Brain, String> {
+fn engine(o: &Options) -> Result<(Brain, Option<Farm>), String> {
     let mind = match o.mind.as_str() {
         "sog" => Mind::Sog,
         "random" => Mind::Random,
@@ -65,25 +64,31 @@ fn brain(o: &Options, cards: Option<Arc<Cards>>) -> Result<Brain, String> {
         other => return Err(format!("unknown mind {}", other)),
     };
     let cfr = Cfr::named(&o.cfr).ok_or_else(|| format!("unknown cfr rule {}", o.cfr))?;
-    let mut nets = Nets { device: cards.is_some(), ..Nets::default() };
-    if matches!(mind, Mind::Sog) {
-        nets.value = Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
+    let cfg = Cfg {
+        s: o.s,
+        c: o.c,
+        batch: o.batch,
+        rounds: o.rounds,
+        cfr,
+        budget: Budget::for_s(o.s),
+        ..Default::default()
+    };
+    if !matches!(mind, Mind::Sog) {
+        return Ok((Brain { mind, nets: Default::default(), cfg }, None));
     }
-    Ok(Brain {
-        mind,
-        nets: Arc::new(nets),
-        cfg: Cfg { s: o.s, c: o.c, batch: o.batch, rounds: o.rounds, cfr, budget: Budget::for_s(o.s), ..Default::default() },
-        cards,
-    })
+    let net = Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
+    let backend = backend(o, net, cfg)?;
+    let workers = std::thread::available_parallelism().map_or(8, |n| n.get());
+    let farm = Farm::arena(workers, backend);
+    let brain = Brain { mind, nets: farm.value(), cfg };
+    Ok((brain, Some(farm)))
 }
 
-/// Every live game. A game is taken out of the table while it is being worked
-/// on and put back when it is done; the referee never has two asks out for the
-/// same game, so no two tasks ever hold the same session.
-type Table = Arc<Mutex<HashMap<u32, Session>>>;
+/// Every live game. The referee sends at most one ask for each game.
+type Table = HashMap<u32, Session>;
 
-/// Bring one game up to date and, if the ask was a `go`, choose its move.
-fn work(ask: &Ask, table: &Table, brain: &Brain, act: bool) -> Result<Done, String> {
+/// Bring one game up to date for its next solve.
+fn session(ask: &Ask, table: &mut Table, brain: &Brain) -> Result<Session, String> {
     let mut session = match (&ask.start, &ask.at) {
         (Some(start), None) => Session::new(&start.draft, start.seat, start.seed)?,
         (None, Some(at)) => {
@@ -92,32 +97,22 @@ fn work(ask: &Ask, table: &Table, brain: &Brain, act: bool) -> Result<Done, Stri
         }
         (Some(_), Some(_)) => return Err("a game starts one way or the other".into()),
         (None, None) => table
-            .lock()
-            .unwrap()
             .remove(&ask.id)
             .ok_or_else(|| format!("game {} was never started", ask.id))?,
     };
     for obs in &ask.obs {
         session.observe(obs, brain)?;
     }
-    let action = if act {
-        Some(session.decide(brain)?)
-    } else {
-        session.watch(brain);
-        None
-    };
-    table.lock().unwrap().insert(ask.id, session);
-    Ok(Done { id: ask.id, action })
+    Ok(session)
 }
 
 /// A game the bot could not follow ends the run. Half a ladder from a bot that
 /// lost the position is worse than no ladder.
-fn fail(out: &Mutex<impl Write>, error: String) -> ! {
+fn fail(out: &mut impl Write, error: String) -> ! {
     let reply = Reply {
         done: Vec::new(),
         error: Some(error),
     };
-    let mut out = out.lock().unwrap();
     let _ = writeln!(out, "{}", serde_json::to_string(&reply).unwrap());
     let _ = out.flush();
     std::process::exit(1);
@@ -131,99 +126,103 @@ fn main() {
     // Evaluation scores a game that hit the play horizon as a draw, so the
     // horizon marker is worth nothing to either side.
     warchest::state::set_cap_marker_value(0.0);
-    // The cards, if there are any. A ladder is a few thousand solves at the
-    // same budget a training run uses, so it belongs on the same machinery:
-    // without this a forty-game ladder is an hour of CPU, which is too dear to
-    // be the thing that checks whether a run learned anything.
-    let cards = devices(&options).map(|backend| Arc::new(Cards::new(backend)));
-    let brain = Arc::new(
-        brain(&options, cards).unwrap_or_else(|e| {
-            eprintln!("{}", e);
-            std::process::exit(2);
-        }),
-    );
-    let threads = if options.threads == 0 {
-        std::thread::available_parallelism().map_or(8, |n| n.get())
-    } else {
-        options.threads
-    };
-    // A thread's own stack is its continuation: it puts a solve's calls on a
-    // card's queue and waits for the round that carries them, which is shared
-    // with every other thread that was ready at the same moment.
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-        .expect("thread pool");
+    let (brain, farm) = engine(&options).unwrap_or_else(|e| {
+        eprintln!("{}", e);
+        std::process::exit(2);
+    });
 
-    let out = Arc::new(Mutex::new(std::io::stdout()));
+    let mut out = std::io::stdout();
     let hello = Hello {
         name: options.name.clone(),
         protocol: PROTOCOL,
         rules: rules_table_hash(),
     };
     {
-        let mut lock = out.lock().unwrap();
-        writeln!(lock, "{}", serde_json::to_string(&hello).unwrap()).unwrap();
-        lock.flush().unwrap();
+        writeln!(out, "{}", serde_json::to_string(&hello).unwrap()).unwrap();
+        out.flush().unwrap();
     }
 
-    let table: Table = Arc::new(Mutex::new(HashMap::new()));
+    let mut table = Table::new();
     for line in std::io::stdin().lock().lines() {
         let line = line.expect("stdin");
         let request: Request = match serde_json::from_str(&line) {
             Ok(request) => request,
-            Err(e) => fail(&out, e.to_string()),
+            Err(e) => fail(&mut out, e.to_string()),
         };
         for id in &request.drop {
-            table.lock().unwrap().remove(id);
+            table.remove(id);
         }
-        // One task per game rather than per request: a game answered early
-        // gets more work from the referee immediately, keeping the cores busy.
-        for (ask, act) in request
+        let asks: Vec<(Ask, bool)> = request
             .go
             .into_iter()
             .map(|a| (a, true))
             .chain(request.watch.into_iter().map(|a| (a, false)))
-        {
-            let (table, brain, out) = (table.clone(), brain.clone(), out.clone());
-            pool.spawn(move || match work(&ask, &table, &brain, act) {
-                Ok(done) => {
-                    let reply = Reply {
-                        done: vec![done],
-                        error: None,
-                    };
-                    let mut lock = out.lock().unwrap();
-                    let _ = writeln!(lock, "{}", serde_json::to_string(&reply).unwrap());
-                    let _ = lock.flush();
-                }
-                Err(e) => fail(&out, format!("game {}: {}", ask.id, e)),
-            });
+            .collect();
+        let mut done = Vec::with_capacity(asks.len());
+        let mut solving = Vec::with_capacity(asks.len());
+        let mut acting = HashMap::with_capacity(asks.len());
+        for (ask, act) in asks {
+            let mut game = session(&ask, &mut table, &brain)
+                .unwrap_or_else(|e| fail(&mut out, format!("game {}: {}", ask.id, e)));
+            if matches!(brain.mind, Mind::Sog) {
+                let solver = game.solver(&brain, act)
+                    .unwrap_or_else(|e| fail(&mut out, format!("game {}: {}", ask.id, e)));
+                solving.push((ask.id, solver));
+                acting.insert(ask.id, act);
+            } else {
+                let action = if act {
+                    Some(game.decide(&brain).unwrap_or_else(|e| {
+                        fail(&mut out, format!("game {}: {}", ask.id, e))
+                    }))
+                } else {
+                    game.watch(&brain);
+                    None
+                };
+                done.push(Done { id: ask.id, action });
+            }
+            table.insert(ask.id, game);
+        }
+        if !solving.is_empty() {
+            let solved = farm
+                .as_ref()
+                .unwrap()
+                .solve(solving)
+                .unwrap_or_else(|e| fail(&mut out, e));
+            for solved in solved {
+                let game = table.get_mut(&solved.id).unwrap();
+                let action = game.finish(&solved.solver, acting[&solved.id])
+                    .unwrap_or_else(|e| fail(&mut out, format!("game {}: {}", solved.id, e)));
+                done.push(Done { id: solved.id, action });
+            }
+        }
+        if !done.is_empty() {
+            let reply = Reply { done, error: None };
+            writeln!(out, "{}", serde_json::to_string(&reply).unwrap()).unwrap();
+            out.flush().unwrap();
         }
     }
 }
 
-/// The backend a solve evaluates on: every card the driver can see.
-///
-/// Not a flag. A bot solves at the training budget, so on a machine with cards
-/// it belongs on them, and there is nothing a caller could usefully decide
-/// here. The CPU network answers when there are no cards, which is what makes
-/// a bot runnable on a laptop -- and it is the oracle `cuda_parity` holds the
-/// device to, so it is not going anywhere.
-fn devices(o: &Options) -> Option<Backend> {
-    if !matches!(o.mind.as_str(), "sog") {
-        return None;
+/// Use only the devices assigned by the referee. No assignment means CPU.
+fn backend(o: &Options, net: Net, _cfg: Cfg) -> Result<Backend, String> {
+    if o.devices.is_empty() {
+        return Ok(Backend::Reference(net));
     }
     #[cfg(feature = "gpu")]
     {
-        let n = warchest::cuda::Device::count();
-        if n > 0 {
-            let net = Net::load_bin(&o.weights).ok()?;
-            let cfg = Cfg { s: o.s, c: o.c, budget: Budget::for_s(o.s), ..Default::default() };
-            match warchest::cuda::Device::new(&(0..n).collect::<Vec<_>>(), net, cfg, usize::MAX) {
-                Ok(d) => return Some(Backend::Cuda(d)),
-                Err(e) => eprintln!("no device backend: {e}"),
-            }
-        }
+        let devices: Result<Vec<usize>, String> = o
+            .devices
+            .split(',')
+            .map(|name| {
+                name.strip_prefix("cuda:")
+                    .ok_or_else(|| format!("invalid device {name}"))?
+                    .parse()
+                    .map_err(|_| format!("invalid device {name}"))
+            })
+            .collect();
+        return warchest::cuda::Device::new(&devices?, net, _cfg, host_slots(_cfg.budget))
+            .map(Backend::Cuda);
     }
-    None
+    #[cfg(not(feature = "gpu"))]
+    Err(format!("built without GPU support; cannot open {}", o.devices))
 }

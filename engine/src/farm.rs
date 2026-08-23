@@ -18,6 +18,7 @@
 //! would exceed the budget is truncated rather than grown.
 
 use parking_lot::{Condvar, Mutex, RwLock};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -516,28 +517,22 @@ impl<T> Queue<T> {
         }
     }
 
-    /// Everything waiting, which is what a round is. Empty once the queue is
-    /// closed and empty.
-    fn drain(&self) -> Vec<T> {
-        let mut q = self.q.lock();
-        loop {
-            if !q.is_empty() {
-                return q.drain(..).collect();
-            }
-            if self.closed.load(Ordering::Relaxed) {
-                return Vec::new();
-            }
-            self.ready.wait(&mut q);
-        }
+    fn try_pop(&self) -> Option<T> {
+        self.q.lock().pop_front()
+    }
+
+    fn wake(&self) {
+        self.ready.notify_all();
     }
 
     /// Wait until `wave` items are ready, then take that many. Leftover items
     /// wake the other pipe. Empty once the queue is closed and empty.
-    fn drain_wave(&self, wave: usize) -> Vec<T> {
+    fn drain_wave(&self, target: impl Fn() -> usize) -> Vec<T> {
         let mut q = self.q.lock();
         loop {
             let n = q.len();
-            if n >= wave || (self.closed.load(Ordering::Relaxed) && n > 0) {
+            let wave = target();
+            if wave > 0 && (n >= wave || (self.closed.load(Ordering::Relaxed) && n > 0)) {
                 let take = n.min(wave);
                 let out: Vec<T> = q.drain(..take).collect();
                 if !q.is_empty() {
@@ -632,7 +627,6 @@ impl Source {
 
 /// One solve in flight, and everything that outlives it.
 struct Job {
-    source: Source,
     solver: Solver,
     /// The card that holds this solve's arenas, and which of its slots. A GPU
     /// keeps a solve's board vectors between its rounds, so both are fixed for
@@ -641,8 +635,24 @@ struct Job {
     slot: usize,
     /// What the last round gave back, waiting for the host work that reads it.
     replies: Vec<Reply>,
-    /// Rows this job has produced since it last handed any over.
-    data: Data,
+    next: Next,
+}
+
+enum Next {
+    Stream { source: Source, data: Data },
+    Arena { id: u32 },
+}
+
+pub struct ArenaDone {
+    pub id: u32,
+    pub solver: Solver,
+}
+
+struct ArenaState {
+    pending: Mutex<VecDeque<(u32, Solver)>>,
+    free: Mutex<Vec<(usize, usize)>>,
+    done: Queue<ArenaDone>,
+    active: Vec<AtomicU64>,
 }
 
 /// Many solves in flight in one process, and one thing that evaluates for all
@@ -671,12 +681,14 @@ pub struct Farm {
     stopping: Arc<AtomicBool>,
     broken: Arc<AtomicBool>,
     stats: Arc<Stats>,
+    arena: Option<Arc<ArenaState>>,
 }
 
 /// What the rounds carried, for the utilisation report. Calls per round is the
 /// number that matters: it is how many solves shared a forward pass.
 #[derive(Default)]
 pub struct Stats {
+    pub solves: AtomicU64,
     pub rounds: AtomicU64,
     pub rows: AtomicU64,
     pub calls: AtomicU64,
@@ -741,6 +753,14 @@ impl Farm {
     /// slot. A slot is allocated at the budget; there is nothing to admit
     /// against after that.
     pub fn new(seed: u64, workers: usize, work: Work, backend: Backend) -> Farm {
+        Self::build(seed, workers, Some(work), backend)
+    }
+
+    pub fn arena(workers: usize, backend: Backend) -> Farm {
+        Self::build(0, workers, None, backend)
+    }
+
+    fn build(seed: u64, workers: usize, work: Option<Work>, backend: Backend) -> Farm {
         assert!(workers > 0, "a farm needs at least one worker");
         let gpus = backend.cards();
         let pipes = backend.pipelines();
@@ -751,7 +771,7 @@ impl Farm {
         let n_slots: usize = per_gpu.iter().sum();
         let slot_bytes = backend.slot_bytes();
         let slots_per_card = backend.slots_per_card();
-        let work = Arc::new(work);
+        let work = work.map(Arc::new);
         let nets = Arc::new(RwLock::new(Arc::new(crate::search::Nets {
             value: backend.net().clone(),
             device: backend.keeps_the_solve(),
@@ -763,25 +783,44 @@ impl Farm {
         let stopping = Arc::new(AtomicBool::new(false));
         let broken = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(Stats::new(n_slots, slot_bytes, slots_per_card));
+        let arena = work.is_none().then(|| {
+            let free = (0..per_gpu.iter().copied().max().unwrap_or(0))
+                .flat_map(|slot| {
+                    per_gpu
+                        .iter()
+                        .enumerate()
+                        .filter(move |(_, n)| slot < **n)
+                        .map(move |(card, _)| (card, slot))
+                })
+                .collect();
+            Arc::new(ArenaState {
+                pending: Mutex::new(VecDeque::new()),
+                free: Mutex::new(free),
+                done: Queue::default(),
+                active: (0..gpus).map(|_| AtomicU64::new(0)).collect(),
+            })
+        });
         let backend = Arc::new(RwLock::new(backend));
 
         let hands: Vec<JoinHandle<()>> = (0..workers)
             .map(|t| {
-                let (ready, device, nets, collected, work, stopping, stats) = (
+                let (ready, device, nets, collected, work, stopping, stats, arena) = (
                     Arc::clone(&ready),
                     device.clone(),
                     Arc::clone(&nets),
                     Arc::clone(&collected),
-                    Arc::clone(&work),
+                    work.clone(),
                     Arc::clone(&stopping),
                     Arc::clone(&stats),
+                    arena.clone(),
                 );
                 std::thread::Builder::new()
                     .name(format!("host-{t}"))
                     .spawn(move || {
                         while let Some(job) = ready.pop() {
                             advance_job(
-                                job, &device, &nets, &work, &collected, &stopping, &stats,
+                                job, &device, &ready, &nets, work.as_deref(), &collected,
+                                &stopping, &stats, arena.as_deref(),
                             );
                         }
                     })
@@ -792,14 +831,15 @@ impl Farm {
         let mut drivers = Vec::with_capacity(gpus * pipes);
         for g in 0..gpus {
             for p in 0..pipes {
-                let (queue, ready, backend, nets, work, stats, broken) = (
+                let (queue, ready, backend, nets, work, stats, broken, arena) = (
                     Arc::clone(&device[g]),
                     Arc::clone(&ready),
                     Arc::clone(&backend),
                     Arc::clone(&nets),
-                    Arc::clone(&work),
+                    work.clone(),
                     Arc::clone(&stats),
                     Arc::clone(&broken),
+                    arena.clone(),
                 );
                 let n = per_gpu[g];
                 let seed = seed.wrapping_mul(0x9E37_79B9) ^ g as u64 ^ (p as u64) << 32;
@@ -809,8 +849,9 @@ impl Farm {
                         .name(format!("card-{g}.{p}"))
                         .spawn(move || {
                             drive_card(
-                                g, lane, gpus, n, p == 0, n.div_ceil(pipes.max(1)), seed,
-                                &queue, &ready, &backend, &nets, &work, &stats, &broken,
+                                g, p, lane, gpus, pipes, n, p == 0 && work.is_some(), seed,
+                                &queue, &ready, &backend, &nets, work.as_deref(), &stats,
+                                &broken, arena.as_deref(),
                             )
                         })
                         .expect("spawn driver thread"),
@@ -829,6 +870,7 @@ impl Farm {
             stopping,
             broken,
             stats,
+            arena,
         }
     }
 
@@ -879,6 +921,45 @@ impl Farm {
     pub fn value(&self) -> Arc<crate::search::Nets> {
         Arc::clone(&*self.nets.read())
     }
+
+    pub fn solve(&self, solves: Vec<(u32, Solver)>) -> Result<Vec<ArenaDone>, String> {
+        let arena = self.arena.as_ref().expect("only an arena farm accepts external solves");
+        let count = solves.len();
+        arena.pending.lock().extend(solves);
+        {
+            let mut free = arena.free.lock();
+            let mut pending = arena.pending.lock();
+            while !free.is_empty() && !pending.is_empty() {
+                let (card, slot) = free.pop().unwrap();
+                let (id, mut solver) = pending.pop_front().unwrap();
+                solver.pin(slot);
+                arena.active[card].fetch_add(1, Ordering::Relaxed);
+                self.stats.used.fetch_add(1, Ordering::Relaxed);
+                self.ready.push(Job {
+                    solver,
+                    card,
+                    slot,
+                    replies: Vec::new(),
+                    next: Next::Arena { id },
+                });
+            }
+        }
+        for q in &self.device {
+            q.wake();
+        }
+
+        let mut done = Vec::with_capacity(count);
+        while done.len() < count {
+            if let Some(solved) = arena.done.try_pop() {
+                done.push(solved);
+            } else if self.broken() {
+                return Err("a card could not answer a round".into());
+            } else {
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        }
+        Ok(done)
+    }
 }
 
 impl Drop for Farm {
@@ -909,17 +990,20 @@ impl Drop for Farm {
 fn advance_job(
     mut job: Job,
     device: &[Arc<Queue<(Job, Vec<Call>)>>],
+    ready: &Queue<Job>,
     nets: &RwLock<Arc<crate::search::Nets>>,
-    work: &Work,
+    work: Option<&Work>,
     collected: &Mutex<Vec<Data>>,
     stopping: &AtomicBool,
     stats: &Stats,
+    arena: Option<&ArenaState>,
 ) {
     let mut replies = std::mem::take(&mut job.replies);
     loop {
         match job.solver.advance(&replies) {
             Step::Calls(calls) => return device[job.card].push((job, calls)),
             Step::Done(solved) => {
+                stats.solves.fetch_add(1, Ordering::Relaxed);
                 let mask = job.solver.hit_mask();
                 if mask != 0 {
                     stats.budget_hits.fetch_add(1, Ordering::Relaxed);
@@ -930,16 +1014,48 @@ fn advance_job(
                     }
                 }
                 stats.shapes.lock().push(job.solver.counts());
-                job.source.take(&job.solver, solved, &mut job.data);
-                collected.lock().push(std::mem::take(&mut job.data));
-                if stopping.load(Ordering::Relaxed) {
-                    stats.used.fetch_sub(1, Ordering::Relaxed);
-                    return;
+                let Job { solver, card, slot, next, .. } = job;
+                match next {
+                    Next::Stream { mut source, mut data } => {
+                        source.take(&solver, solved, &mut data);
+                        collected.lock().push(std::mem::take(&mut data));
+                        if stopping.load(Ordering::Relaxed) {
+                            stats.used.fetch_sub(1, Ordering::Relaxed);
+                            return;
+                        }
+                        let n = Arc::clone(&*nets.read());
+                        let mut solver = source.next(work.unwrap(), &n, &mut data);
+                        solver.pin(slot);
+                        job = Job {
+                            solver,
+                            card,
+                            slot,
+                            replies: Vec::new(),
+                            next: Next::Stream { source, data },
+                        };
+                        replies = Vec::new();
+                    }
+                    Next::Arena { id } => {
+                        let arena = arena.unwrap();
+                        arena.done.push(ArenaDone { id, solver });
+                        if let Some((id, mut solver)) = arena.pending.lock().pop_front() {
+                            solver.pin(slot);
+                            ready.push(Job {
+                                solver,
+                                card,
+                                slot,
+                                replies: Vec::new(),
+                                next: Next::Arena { id },
+                            });
+                        } else {
+                            arena.free.lock().push((card, slot));
+                            arena.active[card].fetch_sub(1, Ordering::Relaxed);
+                            stats.used.fetch_sub(1, Ordering::Relaxed);
+                            device[card].wake();
+                        }
+                        return;
+                    }
                 }
-                let n = Arc::clone(&*nets.read());
-                job.solver = job.source.next(work, &n, &mut job.data);
-                job.solver.pin(job.slot);
-                replies = Vec::new();
             }
         }
     }
@@ -949,21 +1065,24 @@ fn advance_job(
 #[allow(clippy::too_many_arguments)]
 fn drive_card(
     gpu: usize,
+    pipe: usize,
     lane: usize,
     gpus: usize,
+    pipes: usize,
     n_slots: usize,
     seed_slots: bool,
-    wave: usize,
     seed: u64,
     queue: &Queue<(Job, Vec<Call>)>,
     ready: &Queue<Job>,
     backend: &RwLock<Backend>,
     nets: &RwLock<Arc<crate::search::Nets>>,
-    work: &Work,
+    work: Option<&Work>,
     stats: &Stats,
     broken: &AtomicBool,
+    arena: Option<&ArenaState>,
 ) {
     if seed_slots {
+        let work = work.unwrap();
         for slot in 0..n_slots {
             if ready.closed() {
                 break;
@@ -978,11 +1097,20 @@ fn drive_card(
             let n = Arc::clone(&*nets.read());
             let mut solver = source.next(work, &n, &mut data);
             solver.pin(slot);
-            ready.push(Job { source, solver, card: gpu, slot, replies: Vec::new(), data });
+            ready.push(Job {
+                solver,
+                card: gpu,
+                slot,
+                replies: Vec::new(),
+                next: Next::Stream { source, data },
+            });
         }
     }
     loop {
-        let batch = queue.drain_wave(wave);
+        let batch = queue.drain_wave(|| {
+            let active = arena.map_or(n_slots, |a| a.active[gpu].load(Ordering::Relaxed) as usize);
+            (active + pipes - 1 - pipe) / pipes
+        });
         if batch.is_empty() {
             return;
         }
@@ -1015,131 +1143,6 @@ fn drive_card(
         }
     }
 }
-
-
-// ---------------------------------------------------------- a blocking client
-
-/// One card's rounds, for callers that block on a whole solve.
-///
-/// The farm's solves are state machines because there are far more of them than
-/// there are cores. A bot is the other shape: one game per thread, nothing to
-/// remember between two solves, and a thread that is willing to wait. So the
-/// thread's own stack is its continuation — it puts its calls on a card's queue
-/// and waits for the round that carries them, which is shared with every other
-/// thread that was ready at the same moment.
-pub struct Cards {
-    queues: Vec<Arc<Queue<Ask>>>,
-    /// Seats nobody is sitting in. A card keeps a solve's arenas while it runs,
-    /// so two solves must never share a slot.
-    seats: Mutex<Vec<(usize, usize)>>,
-    free: Condvar,
-    drivers: Vec<JoinHandle<()>>,
-}
-
-/// One thread's calls, and where to send the replies.
-struct Ask {
-    calls: Vec<Call>,
-    back: std::sync::mpsc::Sender<Vec<Reply>>,
-}
-
-/// A card and one of its solve slots, held for one solve and given back when
-/// this is dropped.
-pub struct Seat<'a> {
-    cards: &'a Cards,
-    pub card: usize,
-    pub slot: usize,
-}
-
-impl Drop for Seat<'_> {
-    fn drop(&mut self) {
-        self.cards.seats.lock().push((self.card, self.slot));
-        self.cards.free.notify_one();
-    }
-}
-
-impl Cards {
-    pub fn new(backend: Backend) -> Cards {
-        let n = backend.cards();
-        let pipes = backend.pipelines();
-        let backend = Arc::new(backend);
-        let queues: Vec<Arc<Queue<Ask>>> = (0..n).map(|_| Arc::new(Queue::default())).collect();
-        let mut drivers = Vec::with_capacity(n * pipes);
-        for g in 0..n {
-            for p in 0..pipes {
-                let (queue, backend) = (Arc::clone(&queues[g]), Arc::clone(&backend));
-                let lane = g * pipes + p;
-                drivers.push(
-                    std::thread::Builder::new()
-                        .name(format!("card-{g}.{p}"))
-                        .spawn(move || loop {
-                            let batch = queue.drain();
-                            if batch.is_empty() {
-                                return;
-                            }
-                            let mut backs = Vec::with_capacity(batch.len());
-                            let mut spans = Vec::with_capacity(batch.len());
-                            let mut calls: Vec<Call> = Vec::new();
-                            for ask in batch {
-                                spans.push(ask.calls.len());
-                                calls.extend(ask.calls);
-                                backs.push(ask.back);
-                            }
-                            // A card that cannot answer takes its solves with it.
-                            // Dropping the senders is what tells them.
-                            let Some(replies) = backend.run(&calls, lane) else {
-                                return;
-                            };
-                            let mut rest = replies;
-                            for (back, n) in backs.into_iter().zip(spans) {
-                                let tail = rest.split_off(n);
-                                let _ = back.send(rest);
-                                rest = tail;
-                            }
-                        })
-                        .expect("spawn driver thread"),
-                );
-            }
-        }
-        let mut free = Vec::new();
-        for g in 0..n {
-            for s in 0..backend.slots(g) {
-                free.push((g, s));
-            }
-        }
-        Cards { queues, seats: Mutex::new(free), free: Condvar::new(), drivers }
-    }
-
-    /// Take a card and one of its solve slots for the length of one solve.
-    pub fn seat(&self) -> Seat<'_> {
-        let mut seats = self.seats.lock();
-        loop {
-            if let Some((card, slot)) = seats.pop() {
-                return Seat { cards: self, card, slot };
-            }
-            self.free.wait(&mut seats);
-        }
-    }
-
-    /// Run these calls in the next round of `card`, and wait for them.
-    /// `None` once the card is gone, which is not recoverable.
-    pub fn round(&self, card: usize, calls: Vec<Call>) -> Option<Vec<Reply>> {
-        let (back, replies) = std::sync::mpsc::channel();
-        self.queues[card].push(Ask { calls, back });
-        replies.recv().ok()
-    }
-}
-
-impl Drop for Cards {
-    fn drop(&mut self) {
-        for q in &self.queues {
-            q.close();
-        }
-        for d in self.drivers.drain(..) {
-            let _ = d.join();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1212,5 +1215,37 @@ mod tests {
         let s = farm.stats();
         assert_eq!(s.slots(), WORKERS as u64, "a reference farm is one slot a worker");
         assert!(s.used() <= s.slots(), "{} used, {} slots", s.used(), s.slots());
+    }
+
+    #[test]
+    fn an_arena_wave_reuses_its_slots() {
+        const WORKERS: usize = 4;
+        let cfg = crate::search::Cfg { s: 8, c: 1.0, ..Default::default() };
+        let gc = GameCfg {
+            agents: [Agent::Sog { cfg }; 2],
+            collect: Collect::Sog,
+            explore: 0.1,
+            random_draft: true,
+            p_td1: 0.0,
+            query_rate: 0.0,
+            recursive_rate: 0.0,
+        };
+        let farm = Farm::arena(WORKERS, Backend::Reference(small_net(0xA7E1)));
+        let nets = farm.value();
+        let solves = (0..7)
+            .map(|id| {
+                let mut stream = GameStream::new(id as u64 + 1, gc);
+                let mut data = Data::default();
+                (id, stream.next_solve(&nets, &mut data))
+            })
+            .collect();
+        let mut done = farm.solve(solves).unwrap();
+        done.sort_unstable_by_key(|x| x.id);
+        assert_eq!(
+            done.iter().map(|x| x.id).collect::<Vec<_>>(),
+            (0..7).collect::<Vec<_>>()
+        );
+        assert_eq!(farm.stats().solves.load(Ordering::Relaxed), 7);
+        assert_eq!(farm.stats().used(), 0);
     }
 }

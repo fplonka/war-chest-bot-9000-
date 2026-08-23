@@ -30,8 +30,7 @@ use crate::pbs::{
 };
 use crate::rng::Rng;
 
-use crate::farm::Cards;
-use crate::search::{Cfg, Nets, Solver, Step};
+use crate::search::{Cfg, Nets, Solver};
 use std::sync::Arc;
 use crate::state::{Cont, State};
 
@@ -52,10 +51,6 @@ pub struct Brain {
     pub mind: Mind,
     pub nets: Arc<Nets>,
     pub cfg: Cfg,
-    /// The cards a solve runs on, when there are any. Without them a solve is
-    /// answered by the CPU network where it is raised, which is a hundred
-    /// times slower and is why a ladder used to cost an hour of CPU.
-    pub cards: Option<Arc<Cards>>,
 }
 
 impl Brain {
@@ -77,30 +72,26 @@ impl Brain {
             Mind::Greedy { temp } => return policy::greedy(s, ctx, player, cfgs, temp),
             Mind::Sog => {}
         }
-        let mut sv = Solver::new(
+        let mut sv = self.solver(s, ctx, bel, rng);
+        sv.run_alone();
+        policy::root(&sv)
+    }
+
+    pub fn solver(
+        &self,
+        s: &State,
+        ctx: &Ctx,
+        bel: &[Belief; 2],
+        rng: &mut Rng,
+    ) -> Solver {
+        Solver::new(
             s,
             *ctx,
             Arc::clone(&self.nets),
             self.cfg,
             bel.clone(),
             Rng::new(rng.next_u64()),
-        );
-        match &self.cards {
-            None => {
-                sv.run_alone();
-            }
-            Some(cards) => {
-                let seat = cards.seat();
-                sv.pin(seat.slot);
-                let mut replies = Vec::new();
-                while let Step::Calls(calls) = sv.advance(&replies) {
-                    replies = cards
-                        .round(seat.card, calls)
-                        .expect("a card failed while a solve was still running");
-                }
-            }
-        }
-        policy::root(&sv)
+        )
     }
 }
 
@@ -222,7 +213,10 @@ impl Session {
         }
         let np = match self.modelled.take() {
             Some(np) => np,
-            None => brain.policy(&self.s, &self.ctx, player, &self.bel, &mut self.rng),
+            None if matches!(brain.mind, Mind::Random) => {
+                brain.policy(&self.s, &self.ctx, player, &self.bel, &mut self.rng)
+            }
+            None => return Err("the opponent moved before watch finished".into()),
         };
         let (ci, cell) = np
             .cell_for(key)
@@ -247,11 +241,37 @@ impl Session {
             return Err("the bot was asked to move out of turn".into());
         }
         self.modelled = None;
+        let np = brain.policy(&self.s, &self.ctx, self.seat, &self.bel, &mut self.rng);
+        self.decide_with(np)
+    }
+
+    /// Start the solve requested by `go` or `watch` without blocking on it.
+    pub fn solver(&mut self, brain: &Brain, act: bool) -> Result<Solver, String> {
+        if self.s.is_terminal() || self.s.is_chance() || (self.s.to_act() == self.seat) != act {
+            return Err("the bot was asked to solve out of turn".into());
+        }
+        if act {
+            self.modelled = None;
+        }
+        Ok(brain.solver(&self.s, &self.ctx, &self.bel, &mut self.rng))
+    }
+
+    /// Apply a farm result to this stream.
+    pub fn finish(&mut self, sv: &Solver, act: bool) -> Result<Option<u32>, String> {
+        let np = policy::root(sv);
+        if act {
+            self.decide_with(np).map(Some)
+        } else {
+            self.modelled = Some(np);
+            Ok(None)
+        }
+    }
+
+    fn decide_with(&mut self, np: NodePolicy) -> Result<u32, String> {
         let truth = true_config(&self.s, self.seat, &self.ctx);
         let ci = self.bel[self.seat as usize]
             .index_of(&truth)
             .ok_or("the belief filter dropped this seat's own config")?;
-        let np = brain.policy(&self.s, &self.ctx, self.seat, &self.bel, &mut self.rng);
         if np.row(ci).is_empty() {
             // The node's actions are enumerated over the public reserve and
             // then filtered per hand. A hand with no row cannot move, which
@@ -290,7 +310,6 @@ mod tests {
             mind: Mind::Random,
             nets: Arc::new(Nets::default()),
             cfg: Cfg::default(),
-            cards: None,
         }
     }
 
