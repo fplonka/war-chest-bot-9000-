@@ -789,13 +789,12 @@ fn a_solve_never_grows_past_its_budget() {
         ];
         let mut sv = Solver::new(&st, ctx, Arc::clone(&nets), cfg, bel, Rng::new(seed));
         sv.run_alone();
-        let lens = sv.entity_lens();
         for e in Ent::ALL {
             assert!(
-                lens[e as usize] <= budget.cap(e),
+                sv.used(e) <= budget.cap(e),
                 "seed {seed}: {} {} > {}",
                 e.name(),
-                lens[e as usize],
+                sv.used(e),
                 budget.cap(e)
             );
         }
@@ -876,14 +875,13 @@ fn a_solve_fits_a_budget_tight_in_one_entity() {
             ];
             let mut sv = Solver::new(&st, ctx, Arc::clone(&nets), cfg, bel, Rng::new(seed));
             sv.run_alone();
-            let lens = sv.entity_lens();
             for x in Ent::ALL {
                 assert!(
-                    lens[x as usize] <= budget.cap(x),
+                    sv.used(x) <= budget.cap(x),
                     "{} seed {seed}: {} {} > {}",
                     e.name(),
                     x.name(),
-                    lens[x as usize],
+                    sv.used(x),
                     budget.cap(x)
                 );
             }

@@ -283,42 +283,39 @@ impl Contract {
         c.levels_from(sv);
         c.transpose(sv);
         c.built = n;
+        c.check(sv);
         c
     }
 
-    /// Length of each entity as the card would reserve it from this description.
-    pub fn entity_lens(&self, sv: &Solver) -> [usize; 8] {
-        let mut l = [0usize; 8];
-        let mut bump = |e: Ent, n: usize| l[e as usize] = l[e as usize].max(n);
-        bump(Ent::Node, self.kind.len());
-        bump(Ent::Node, self.level_start.len());
-        bump(Ent::Node, self.level_node.len());
-        bump(Ent::Cell, self.child.len());
-        bump(Ent::Cell, self.legal_child.len());
-        bump(Ent::Cell, self.legal_trans.len());
-        bump(Ent::Cell, self.cell_row.len());
-        bump(Ent::Cell, self.cell_val.len());
-        bump(Ent::Cell, self.rev_src.len());
-        bump(Ent::Cell, self.rev_cell.len());
-        bump(Ent::Cell, sv.ncells);
-        bump(Ent::Reach, self.legal_off.len());
-        bump(Ent::Reach, self.rev_start.len());
-        bump(Ent::Reach, self.rvd_start.len());
-        bump(Ent::Reach, self.draw_start.len());
-        bump(Ent::Reach, sv.nreach);
-        bump(Ent::Reach, sv.nvals);
-        bump(Ent::Draw, self.draw_to.len());
-        bump(Ent::Draw, self.rvd_src.len());
-        bump(Ent::Draw, sv.ndraws);
-        bump(Ent::Row, sv.leaf_rows.len());
-        bump(Ent::Row, sv.term_leaves.len());
-        bump(Ent::Board, sv.nboards);
-        bump(Ent::Config, sv.ncfg);
-        if let Some(&[a, b]) = sv.nc.first() {
-            bump(Ent::Config, (a as usize + b as usize).div_ceil(2));
+    /// Every column of an entity is at most `Solver::used` for that entity.
+    /// `level_start` is a prefix-sum of length `n_levels + 1`, so it is allowed
+    /// one past the node count.
+    fn check(&self, sv: &Solver) {
+        let u = |e: Ent| sv.used(e);
+        debug_assert_eq!(self.kind.len(), u(Ent::Node));
+        debug_assert_eq!(self.level_node.len(), u(Ent::Node));
+        debug_assert!(self.level_start.len() <= u(Ent::Node) + 1);
+        for (n, what) in [
+            (self.child.len(), "child"),
+            (self.legal_child.len(), "legal_child"),
+            (self.legal_trans.len(), "legal_trans"),
+            (self.cell_row.len(), "cell_row"),
+            (self.cell_val.len(), "cell_val"),
+            (self.rev_src.len(), "rev_src"),
+            (self.rev_cell.len(), "rev_cell"),
+        ] {
+            debug_assert!(n <= u(Ent::Cell), "{what} {n} > cell {}", u(Ent::Cell));
         }
-        bump(Ent::Cidx, sv.leaf_cidx.len());
-        l
+        for (n, what) in [
+            (self.legal_off.len(), "legal_off"),
+            (self.rev_start.len(), "rev_start"),
+            (self.rvd_start.len(), "rvd_start"),
+            (self.draw_start.len(), "draw_start"),
+        ] {
+            debug_assert!(n <= u(Ent::Reach), "{what} {n} > reach {}", u(Ent::Reach));
+        }
+        debug_assert!(self.draw_to.len() <= u(Ent::Draw));
+        debug_assert!(self.rvd_src.len() <= u(Ent::Draw));
     }
 
     /// Bring a description up to date with a tree that has grown.
@@ -368,6 +365,7 @@ impl Contract {
         for i in first..self.built {
             self.transpose_children(sv, i);
         }
+        self.check(sv);
     }
 
     /// Rewrite the row of a leaf that has become a decision or chance node.

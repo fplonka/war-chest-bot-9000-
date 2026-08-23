@@ -1804,7 +1804,7 @@ impl Solver {
     /// Each entity is one slot, shared by every column of that entity. `used`
     /// is the max of those columns: a terminal is a Row, a child pointer is a
     /// Cell, `nvals` and the CSR starts are Reach, and the root belief is a
-    /// Config. The contract handed to the device is this length, by construction.
+    /// Config. The contract debug-asserts its columns against this.
     pub fn used(&self, e: Ent) -> usize {
         match e {
             Ent::Node => self.nodes.len(),
@@ -1816,11 +1816,6 @@ impl Solver {
             Ent::Config => self.ncfg.max(self.rootb_len()),
             Ent::Cidx => self.leaf_cidx.len(),
         }
-    }
-
-    /// Length of each entity as the card would reserve it from this tree.
-    pub fn entity_lens(&self) -> [usize; 8] {
-        crate::contract::Contract::of(self).entity_lens(self)
     }
 
     fn reach_aux(&self) -> usize {
