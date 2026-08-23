@@ -1447,10 +1447,12 @@ impl Solver {
         root: &State,
         ctx: Ctx,
         nets: Arc<Nets>,
-        cfg: Cfg,
+        mut cfg: Cfg,
         belief: [Belief; 2],
         rng: Rng,
     ) -> Solver {
+        let root_configs = belief.iter().map(Belief::len).sum();
+        cfg.budget.configs = cfg.budget.configs.max(root_configs);
         let cfgs: [Arc<[Config]>; 2] = [
             belief[0].cfg.as_slice().into(),
             belief[1].cfg.as_slice().into(),
