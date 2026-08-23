@@ -2662,15 +2662,16 @@ impl Solver {
         let _t = timed!(PUBNET);
         let mut calls = Vec::with_capacity(2);
         let fresh_rows = rows - self.batch_rows;
+        let fresh_cfgs = self.ncfg - self.batch_cfgs;
+        if self.cards.is_empty() && (fresh_rows > 0 || fresh_cfgs > 0) {
+            let both = [&self.xpub[..PUBFEAT], &self.mirror0[..]].concat();
+            self.nets.value.cards(&both, 2, &mut self.cards);
+        }
         if fresh_rows > 0 {
             // The cards in play are fixed at the draft, so every row of the
             // subgame carries the same card block and the table is built once,
             // one view per seat. Everything downstream reads it by canonical
             // coin-type index.
-            if self.cards.is_empty() {
-                let both = [&self.xpub[..PUBFEAT], &self.mirror0[..]].concat();
-                self.nets.value.cards(&both, 2, &mut self.cards);
-            }
             // Exactly the fresh boards. `xpub` is a grown scratch buffer, so
             // an open-ended slice would carry whatever the last, larger
             // subgame left behind — invisible to a solve evaluating alone, and
@@ -2700,7 +2701,6 @@ impl Solver {
             });
             crate::prof::work(fresh_rows, 0, 0, 0);
         }
-        let fresh_cfgs = self.ncfg - self.batch_cfgs;
         if fresh_cfgs > 0 {
             calls.push(Call::Configs {
                 solve: self.slot,
