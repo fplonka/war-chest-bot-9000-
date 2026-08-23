@@ -390,7 +390,7 @@ struct RoundCap {
 
 impl RoundCap {
     fn of(n: usize, s: u32) -> RoundCap {
-        let (nodes, cells, _reach, _draws, rows, _boards, configs, cidx) = (
+        let (nodes, cells, _reach, _draws, rows, _boards, _configs, cidx) = (
             PEAK[0], PEAK[1], PEAK[2], PEAK[3], PEAK[4], PEAK[5], PEAK[6], PEAK[7],
         );
         let cards = n * CARD_ROWS * NTYPE * TYPE;
@@ -807,7 +807,7 @@ impl Device {
         }
         let mut cards = Vec::with_capacity(ordinals.len() * PIPELINE);
         let mut left = max_slots;
-        let mut slot_bytes = CLASSES[0];
+        let slot_bytes = CLASSES[0];
         for (g, &o) in ordinals.iter().enumerate() {
             let gpu = Gpu::new(o, &net)?;
             gpu.ctx.bind_to_thread().map_err(err)?;
