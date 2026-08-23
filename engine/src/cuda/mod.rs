@@ -19,9 +19,8 @@
 //! The arithmetic is `net.rs`, in the same order, and `tests/cuda_parity.rs`
 //! holds it to `Backend::Reference` on the same weights.
 //!
-//! Scratch is allocated at carve, at `TILE` for a pass and at `n_slots` times a
-//! budget term for the rest. A round that needs more rows tiles. Nothing a
-//! round runs is a device allocation.
+//! Scratch is allocated at carve from `RoundCap`. A round that needs more rows
+//! tiles. Nothing a round runs is a device allocation.
 
 use std::sync::Arc;
 
@@ -46,7 +45,7 @@ use crate::pbs::{
 use crate::search::{Budget, Cfg, Cfr, Ent};
 
 mod slot;
-use slot::{Arr, Solve, DESC, NODE_FIELDS, C_CUR, C_PRIOR, C_QVAL, C_SUM, C_VISITS, R_REACH, R_VALS, B_P, B_JP, G_F, G_G, G_FP, Y_BOARD_OF, Y_COFF};
+use slot::{Arr, Solve, DESC, FIELDS, C_CUR, C_PRIOR, C_QVAL, C_SUM, C_VISITS, R_REACH, R_VALS, B_P, B_JP, G_F, G_G, G_FP, Y_BOARD_OF, Y_COFF};
 
 type Res<T> = Result<T, String>;
 
@@ -344,42 +343,148 @@ fn owed_by_the_join(l: &NetLayout, b: &[f32]) -> Vec<f32> {
 /// round cannot grow it.
 const TILE: usize = 16384;
 
-/// Bytes one card allocates at carve besides the slots themselves: the tiled
-/// leaf pass, the tiled trunk/config/prior intermediates, the scratch that
-/// scales with how many slots the card holds, and the batch index `lay` fills.
+/// Every device buffer a round holds, from the slot count and the budget.
+///
+/// Carve allocates these. `Device::new` prices a card from the same numbers, so
+/// a larger budget cannot overflow a scratch and cannot OOM a carve that fitted.
+struct RoundCap {
+    w: usize,
+    mass: usize,
+    pooled: usize,
+    h: usize,
+    z: usize,
+    input: usize,
+    t: usize,
+    leaves: usize,
+    piles: usize,
+    tokens: usize,
+    projected: usize,
+    type_pool: usize,
+    loose: usize,
+    glob: usize,
+    facts: usize,
+    occupant: usize,
+    x: usize,
+    bag: usize,
+    xpub: usize,
+    cards: usize,
+    card_of_row: usize,
+    phi: usize,
+    owner: usize,
+    cfg_cards: usize,
+    blob: usize,
+    at: usize,
+    src: usize,
+    dst: usize,
+    start: usize,
+    trees: usize,
+    work: usize,
+    coff: usize,
+    part: usize,
+    local: usize,
+    base: usize,
+    prime: usize,
+    touched: usize,
+}
+
+impl RoundCap {
+    fn of(n: usize, b: &Budget, s: u32) -> RoundCap {
+        let cards = n * CARD_ROWS * NTYPE * TYPE;
+        // Host-packed tree columns (not board `p`/`jp` or config `f`/`g`/`fp`,
+        // which stay on the card), plus the trunk's extra copies of board_of,
+        // cidx and coff on the same scatter.
+        let packed = FIELDS[0] * b.nodes
+            + FIELDS[1] * b.cells
+            + FIELDS[2] * b.reach
+            + FIELDS[3] * b.draws
+            + FIELDS[4] * b.rows
+            + 2 * b.configs
+            + b.cidx;
+        let trunk = b.rows + b.cidx + 2 * b.rows + 1;
+        let blob = n * (packed + trunk);
+        RoundCap {
+            w: n * b.cidx,
+            mass: 2 * n * b.rows,
+            pooled: 2 * TILE * POOL,
+            h: 2 * TILE * D,
+            z: 2 * TILE * JW,
+            input: 2 * TILE * JOIN_IN,
+            t: 2 * TILE * JW,
+            leaves: n * s.max(1) as usize,
+            piles: TILE * NTYPE * PILE_COUNTS,
+            tokens: TILE * NTYPE * TYPE,
+            projected: TILE * NTYPE * C,
+            type_pool: TILE * C,
+            loose: TILE * LOOSE,
+            glob: TILE * C,
+            facts: TILE * N_HEXES * HEX_FACTS,
+            occupant: TILE * N_HEXES,
+            x: TILE * N_HEXES * C,
+            bag: n * CARD_ROWS * NTYPE * 3 * POOL,
+            xpub: TILE * PUBFEAT,
+            cards,
+            card_of_row: TILE,
+            phi: TILE * CFEAT,
+            owner: TILE,
+            cfg_cards: cards,
+            blob,
+            at: TILE,
+            src: TILE,
+            dst: TILE,
+            start: TILE + 1,
+            trees: n * DESC,
+            work: n * b.nodes,
+            coff: n * (2 * b.rows + 1),
+            part: n * b.rows,
+            local: n * b.rows,
+            base: n,
+            prime: 12 * TILE + n * b.cells,
+            touched: n,
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        let w4 = self.w
+            + self.mass
+            + self.pooled
+            + self.h
+            + self.z
+            + self.input
+            + self.t
+            + self.leaves
+            + self.piles
+            + self.tokens
+            + self.projected
+            + self.type_pool
+            + self.loose
+            + self.glob
+            + self.facts
+            + self.occupant
+            + self.x
+            + self.bag
+            + self.xpub
+            + self.cards
+            + self.card_of_row
+            + self.phi
+            + self.owner
+            + self.cfg_cards
+            + self.blob
+            + self.at
+            + self.src
+            + self.start
+            + self.work
+            + self.coff
+            + self.part
+            + self.local
+            + self.base
+            + self.prime
+            + self.touched;
+        w4 * 4 + (self.trees + self.dst) * 8
+    }
+}
+
 fn round_bytes(n_slots: usize, b: &Budget, s: u32) -> usize {
-    let f = 4;
-    let leaf = 2 * TILE * (POOL + D + JW + JOIN_IN + JW) * f;
-    let trunk = (TILE * NTYPE * PILE_COUNTS
-        + TILE * NTYPE * TYPE
-        + TILE * NTYPE * C
-        + TILE * C
-        + TILE * LOOSE
-        + TILE * C
-        + TILE * N_HEXES * HEX_FACTS
-        + TILE * N_HEXES * C)
-        * f
-        + TILE * N_HEXES * 4;
-    let w = n_slots * b.cidx * f;
-    let mass = 2 * n_slots * b.rows * f;
-    let leaves = n_slots * s.max(1) as usize * f;
-    let bag = n_slots * CARD_ROWS * NTYPE * 3 * POOL * f;
-    let stage = TILE * PUBFEAT * f
-        + 2 * n_slots * CARD_ROWS * NTYPE * TYPE * f
-        + TILE * 4
-        + TILE * CFEAT * f
-        + TILE * 4
-        + n_slots * (b.cidx + b.cells + NODE_FIELDS * b.nodes) * 4
-        + TILE * (4 + 4 + 8 + 4)
-        + 4;
-    let batch = n_slots * DESC * 8
-        + n_slots * b.nodes * 4
-        + n_slots * (2 * b.rows + 1) * 4
-        + 2 * n_slots * b.rows * 4
-        + n_slots * 4
-        + n_slots * 4
-        + (12 * TILE + n_slots * b.cells) * 4;
-    leaf + trunk + w + mass + leaves + bag + stage + batch
+    RoundCap::of(n_slots, b, s).bytes()
 }
 
 /// Fill a staging buffer with exactly `src`.
@@ -988,57 +1093,55 @@ impl Card {
         })
     }
 
-    /// Allocate this card's TILE scratch and batch index, once. Slots live on
+    /// Allocate this card's round buffers, once, at `RoundCap`. Slots live on
     /// the GPU's shared pool.
     fn carve(&mut self, n: usize, cfg: &Cfg) -> Res<()> {
         if n == 0 {
             return Ok(());
         }
         self.stream.context().bind_to_thread().map_err(err)?;
-        let b = &cfg.budget;
-        let mut scratch = Scratch::default();
+        let cap = RoundCap::of(n, &cfg.budget, cfg.s);
         let s = &self.stream;
-        // `w` is the round's belief weights, one per belief-index entry, so it
-        // is `cidx` a slot, not `cells`.
-        scratch.w = Arr::with_cap(s, n * b.cidx)?;
-        scratch.mass = Arr::with_cap(s, 2 * n * b.rows)?;
-        scratch.pooled = Arr::with_cap(s, 2 * TILE * POOL)?;
-        scratch.h = Arr::with_cap(s, 2 * TILE * D)?;
-        scratch.z = Arr::with_cap(s, 2 * TILE * JW)?;
-        scratch.input = Arr::with_cap(s, 2 * TILE * JOIN_IN)?;
-        scratch.t = Arr::with_cap(s, 2 * TILE * JW)?;
-        scratch.leaves = Arr::with_cap(s, n * cfg.s.max(1) as usize)?;
-        scratch.piles = Arr::with_cap(s, TILE * NTYPE * PILE_COUNTS)?;
-        scratch.tokens = Arr::with_cap(s, TILE * NTYPE * TYPE)?;
-        scratch.projected = Arr::with_cap(s, TILE * NTYPE * C)?;
-        scratch.type_pool = Arr::with_cap(s, TILE * C)?;
-        scratch.loose = Arr::with_cap(s, TILE * LOOSE)?;
-        scratch.glob = Arr::with_cap(s, TILE * C)?;
-        scratch.facts = Arr::with_cap(s, TILE * N_HEXES * HEX_FACTS)?;
-        scratch.occupant = Arr::with_cap(s, TILE * N_HEXES)?;
-        scratch.x = Arr::with_cap(s, TILE * N_HEXES * C)?;
-        scratch.bag = Arr::with_cap(s, n * CARD_ROWS * NTYPE * 3 * POOL)?;
+        let mut scratch = Scratch::default();
+        scratch.w = Arr::with_cap(s, cap.w)?;
+        scratch.mass = Arr::with_cap(s, cap.mass)?;
+        scratch.pooled = Arr::with_cap(s, cap.pooled)?;
+        scratch.h = Arr::with_cap(s, cap.h)?;
+        scratch.z = Arr::with_cap(s, cap.z)?;
+        scratch.input = Arr::with_cap(s, cap.input)?;
+        scratch.t = Arr::with_cap(s, cap.t)?;
+        scratch.leaves = Arr::with_cap(s, cap.leaves)?;
+        scratch.piles = Arr::with_cap(s, cap.piles)?;
+        scratch.tokens = Arr::with_cap(s, cap.tokens)?;
+        scratch.projected = Arr::with_cap(s, cap.projected)?;
+        scratch.type_pool = Arr::with_cap(s, cap.type_pool)?;
+        scratch.loose = Arr::with_cap(s, cap.loose)?;
+        scratch.glob = Arr::with_cap(s, cap.glob)?;
+        scratch.facts = Arr::with_cap(s, cap.facts)?;
+        scratch.occupant = Arr::with_cap(s, cap.occupant)?;
+        scratch.x = Arr::with_cap(s, cap.x)?;
+        scratch.bag = Arr::with_cap(s, cap.bag)?;
         let mut stage = Stage::default();
-        stage.xpub = Wire::with_cap(s, TILE * PUBFEAT)?;
-        stage.cards = Wire::with_cap(s, n * CARD_ROWS * NTYPE * TYPE)?;
-        stage.card_of_row = Wire::with_cap(s, TILE)?;
-        stage.phi = Wire::with_cap(s, TILE * CFEAT)?;
-        stage.owner = Wire::with_cap(s, TILE)?;
-        stage.cfg_cards = Wire::with_cap(s, n * CARD_ROWS * NTYPE * TYPE)?;
-        stage.blob = Wire::with_cap(s, n * (b.cidx + b.cells + NODE_FIELDS * b.nodes))?;
-        stage.at = Wire::with_cap(s, TILE)?;
-        stage.src = Wire::with_cap(s, TILE)?;
-        stage.dst = Wire::with_cap(s, TILE)?;
-        stage.start = Wire::with_cap(s, TILE + 1)?;
+        stage.xpub = Wire::with_cap(s, cap.xpub)?;
+        stage.cards = Wire::with_cap(s, cap.cards)?;
+        stage.card_of_row = Wire::with_cap(s, cap.card_of_row)?;
+        stage.phi = Wire::with_cap(s, cap.phi)?;
+        stage.owner = Wire::with_cap(s, cap.owner)?;
+        stage.cfg_cards = Wire::with_cap(s, cap.cfg_cards)?;
+        stage.blob = Wire::with_cap(s, cap.blob)?;
+        stage.at = Wire::with_cap(s, cap.at)?;
+        stage.src = Wire::with_cap(s, cap.src)?;
+        stage.dst = Wire::with_cap(s, cap.dst)?;
+        stage.start = Wire::with_cap(s, cap.start)?;
         let mut batch = Batch::default();
-        batch.trees = Wire::with_cap(s, n * DESC)?;
-        batch.work = Wire::with_cap(s, n * b.nodes)?;
-        batch.coff = Wire::with_cap(s, n * (2 * b.rows + 1))?;
-        batch.part = Wire::with_cap(s, n * b.rows)?;
-        batch.local = Wire::with_cap(s, n * b.rows)?;
-        batch.base = Wire::with_cap(s, n)?;
-        batch.prime = Wire::with_cap(s, 12 * TILE + n * b.cells)?;
-        batch.touched = Wire::with_cap(s, n)?;
+        batch.trees = Wire::with_cap(s, cap.trees)?;
+        batch.work = Wire::with_cap(s, cap.work)?;
+        batch.coff = Wire::with_cap(s, cap.coff)?;
+        batch.part = Wire::with_cap(s, cap.part)?;
+        batch.local = Wire::with_cap(s, cap.local)?;
+        batch.base = Wire::with_cap(s, cap.base)?;
+        batch.prime = Wire::with_cap(s, cap.prime)?;
+        batch.touched = Wire::with_cap(s, cap.touched)?;
         *self.host.lock() = stage;
         *self.scratch.lock() = scratch;
         *self.batch.lock() = batch;
