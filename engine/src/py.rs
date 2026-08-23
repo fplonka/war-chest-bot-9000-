@@ -771,7 +771,7 @@ fn backend_for(
 
 /// Run `games` self-play games across all cores and return the training data.
 #[pyfunction]
-#[pyo3(signature = (games, seed, s=512, c=8.0, explore=0.25, random_draft=true, p_td1=0.0, cfr="sog"))]
+#[pyo3(signature = (games, seed, s=512, c=8.0, explore=0.25, random_draft=true, p_td1=0.0, cfr="sog", agent="sog", temp=2.0))]
 #[allow(clippy::too_many_arguments)]
 fn gen_data(
     py: Python<'_>,
@@ -783,12 +783,22 @@ fn gen_data(
     random_draft: bool,
     p_td1: f32,
     cfr: &str,
+    agent: &str,
+    temp: f32,
 ) -> PyResult<PyObject> {
     let cfg = Cfg { s, c, cfr: cfr_of(cfr)?, budget: Budget::for_s(s), ..Default::default() };
-    let agent = Agent::Sog { cfg };
+    let (agent, collect, p_td1) = match agent {
+        "sog" => (Agent::Sog { cfg }, Collect::Sog, p_td1),
+        "greedy" => (Agent::Greedy { temp }, Collect::Static, 0.0),
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown agent {other}"
+            )))
+        }
+    };
     let gc = GameCfg {
         agents: [agent, agent],
-        collect: Collect::Sog,
+        collect,
         explore,
         random_draft,
         p_td1,

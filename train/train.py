@@ -6,10 +6,9 @@ one value per config in each player's belief -- and the leaves it queried
 become roots for solves of their own, which is how the value function becomes
 accurate away from the line of play.
 
-There is no warm start. A game that reaches the play cap scores
+There is a short greedy warm start. A game that reaches the play cap scores
 `cap_value * delta_markers`, the win condition graded rather than an invented
-evaluation, so the first solves against an untrained network still see a graded
-outcome. The payoff fades with the fraction of finished games that hit the
+evaluation. The payoff fades with the fraction of finished games that hit the
 horizon; evaluation always runs on the real game.
 
 Generation runs in Rust across all CPU cores while the previous batch trains
@@ -20,8 +19,10 @@ exact configs in support, their probabilities, and the value the solve gave
 each. The config lists are ragged, so they live in a flat arena and a batch is
 assembled by gathering spans -- see `Buffer`.
 
-The run snapshots every `snapshot_every` minutes. When training ends, the
-snapshots play a ladder and a report is written.
+The run snapshots every `snapshot_every` minutes. Training starts with a
+short greedy warm phase labelled by the public static evaluation, then the
+SoG phase. When training ends, the snapshots play a ladder and a report is
+written.
 
     python train/train.py out=seat
     python train/train.py out=seat note="centre the seat bit at +-0.5"
@@ -482,6 +483,26 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
         stat["gpu_forward_s"] = sum(a.elapsed_time(b) for a, b, _ in event_pairs) / 1000.0
         stat["gpu_backward_s"] = sum(b.elapsed_time(c) for _, b, c in event_pairs) / 1000.0
     return tot / steps, stat
+
+
+def ingest(buf, data):
+    """Append one `gen_data` / farm collect dict onto the replay buffer."""
+    x = np.asarray(data["rows"], np.uint8).reshape(-1, ROW_BYTES)
+    if not len(x):
+        return 0
+    cc = np.asarray(data["cc"], np.uint8).reshape(-1, CCOUNTS)
+    cw = np.asarray(data["cw"], np.float32)
+    cy = np.clip(np.asarray(data["cy"], np.float32), -1.0, 1.0)
+    coff = np.asarray(data["coff"], np.int64)
+    soff = np.asarray(data["soff"], np.int64)
+    pol = (np.asarray(data["pa"], np.uint8).reshape(-1, ACT_BYTES),
+           np.asarray(data["paoff"], np.int64),
+           np.asarray(data["pcoff"], np.int64),
+           np.asarray(data["pci"], np.uint16),
+           np.asarray(data["pcell"], np.uint8),
+           np.asarray(data["pprob"], np.float16))
+    buf.add(x, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff, pol)
+    return len(x)
 
 
 
@@ -1016,7 +1037,7 @@ def main():
 
     print(f"[cfg] PUBFEAT={PUBFEAT} CFEAT={CFEAT} architecture=gt-cfr "
           f"s={args.s} c={args.c} "
-          f"budget={total:.0f}s "
+          f"budget={total:.0f}s warm={args.warm_minutes:g}min "
           f"snapshot_every={args.snapshot_every:g}min device={dev} "
           f"draft={'random' if args.random_draft else 'starter'} "
           f"replay_ratio={args.replay_ratio} "
@@ -1026,6 +1047,54 @@ def main():
 
     snapshot("init", 0.0)
     next_snap = snap_gap
+    warm = args.warm_minutes * 60.0
+    if not 0.0 <= warm <= total:
+        raise SystemExit("warm_minutes must be between zero and the run length")
+    while True:
+        el = time.time() - t0
+        if el >= warm:
+            break
+        tg = time.time()
+        d = warchest.gen_data(
+            args.warm_games, args.seed * 1_000_003 + epoch,
+            explore=args.explore, random_draft=args.random_draft,
+            agent="greedy", temp=args.temp)
+        gen_s = time.time() - tg
+        n = ingest(buf, d)
+        steps = max(1, n // args.batch) if len(buf) >= args.batch else 0
+        tt = time.time()
+        lv, train_stat = (float("nan"), {}) if not steps else train_steps(
+            value, opt, buf, steps, args.batch, rng, dev,
+            recent_mix=args.recent_mix, recent_frac=args.recent_frac,
+            batch_fn=batcher, policy_w=args.policy_w)
+        train_s = time.time() - tt
+        cy = np.clip(np.asarray(d["cy"], np.float32), -1.0, 1.0)
+        rec = {
+            "t": round(time.time() - t0, 1), "epoch": epoch, "phase": "warm",
+            "games": int(d.get("games", 0)), "rows": n,
+            "loss": round(float(lv), 5) if steps else None,
+            "tgt_mean": round(float(cy.mean()) if cy.size else 0.0, 4),
+            "tgt_std": round(float(cy.std()) if cy.size else 0.0, 4),
+            "horizon_frac": round(int(d.get("horizon_hits", 0)) /
+                                  max(int(d.get("games", 0)), 1), 3),
+            "gen_s": round(gen_s, 2), "train_s": round(train_s, 2),
+            "buf": len(buf), "lr": opt.param_groups[0]["lr"],
+        }
+        log.append(rec)
+        write_log(args, log, snaps)
+        print(
+            f"[t={rec['t']:6.1f}s] warm ep{epoch:3d} games={rec['games']:4d} "
+            f"rows={n:6d} L={lv if steps else float('nan'):.5f} "
+            f"tgt={rec['tgt_mean']:+.3f}/{rec['tgt_std']:.3f} "
+            f"gen={gen_s:.1f}s train={train_s:.1f}s",
+            flush=True)
+        now = time.time()
+        if now - t0 >= next_snap:
+            snapshot(f"s{len(snaps)}", now - t0)
+            next_snap = now - t0 + snap_gap
+        epoch += 1
+    value.push()
+
     sog_t0 = time.time()
     sog_solves = 0
     run_search_pipeline()
@@ -1039,6 +1108,7 @@ def main():
         # too dear for the thing that says whether the run learned anything.
         arena = [sys.executable, str(ROOT / "tools" / "arena.py")]
         subprocess.run(arena + ["pack", args.out], check=True)
+        subprocess.run(arena + ["pack-greedy"], check=True)
         tag = pathlib.Path(args.out).name
         bots = sorted(str(p) for p in (ROOT / "bots").glob(f"{tag}.*"))
         # Greedy first, so ratings are quoted against the one reference that

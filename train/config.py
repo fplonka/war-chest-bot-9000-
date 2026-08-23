@@ -9,6 +9,7 @@ from dataclasses import dataclass
 @dataclass
 class Cfg:
     minutes: float = 30.0
+    warm_minutes: float = 3.0
     snapshot_every: float = 15.0
     init_weights: str = ""
 
@@ -65,6 +66,8 @@ class Cfg:
     policy_w: float = 0.05
     # ReBeL's and Student of Games' off-policy exploration rate; both run 0.1.
     explore: float = 0.1
+    temp: float = 2.0
+    warm_games: int = 96
     # The horizon payoff per marker of lead. It is what carries the cold start:
     # a game cut at the play cap scores the win condition graded, which is a
     # real signal where a flat draw is none. Training scales it by the recent
