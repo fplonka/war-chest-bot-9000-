@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use warchest::pbs::*;
 use warchest::rng::Rng;
-use warchest::search::{node_actions, Cfg, Cfr, Nets, Solver};
+use warchest::search::{node_actions, Budget, Cfg, Cfr, Nets, Solver};
 use warchest::selfplay::make_game;
 use warchest::state::{Cont, State, MAX_MAIN_PLAYS, Z_BAG, Z_FACEDOWN, Z_HAND};
 use warchest::units::{
@@ -193,6 +193,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
     let cfg = Cfg {
         s: 200,
         c: 1.0,
+        budget: Budget::unbounded(),
         ..Default::default()
     };
     let mut checked = 0;
@@ -328,7 +329,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
 fn a_solve_stops_expanding_once_the_tree_is_exhausted() {
     let nets = Arc::new(Nets::default());
     // Far more expansions than the whole subgame holds.
-    let cfg = Cfg { s: 4_000, c: 1.0, ..Default::default() };
+    let cfg = Cfg { s: 4_000, c: 1.0, budget: Budget::unbounded(), ..Default::default() };
     let mut checked = 0;
     for seed in 0..3000u64 {
         let Some(s) = micro_position(seed, 60 + (seed as usize % 120), 3) else {
@@ -460,7 +461,7 @@ fn draw_pass_through_consistency() {
             &s,
             ctx,
             Arc::clone(&nets),
-            Cfg { s: 80, c: 1.0, ..Default::default() },
+            Cfg { s: 80, c: 1.0, budget: Budget::unbounded(), ..Default::default() },
             bel.clone(),
             Rng::new(seed),
         );
@@ -606,7 +607,7 @@ fn warrior_priest_draw_walks_through_the_tree() {
         &s,
         ctx,
         Arc::clone(&nets),
-        Cfg { s: 8, c: 1.0, ..Default::default() },
+        Cfg { s: 8, c: 1.0, budget: Budget::unbounded(), ..Default::default() },
         bel.clone(),
         Rng::new(0x5EED),
     );
@@ -761,4 +762,74 @@ fn growing_a_coin_play_finishes_its_micro_decisions() {
         }
     }
     panic!("no compound play found in 400 random games");
+}
+
+/// A solve never grows past its budget, in any term.
+///
+/// This is the property the whole of admission rests on. A slot's arenas are
+/// allocated once at the budget and reused for every solve that runs in it, so
+/// a solve that could exceed the budget in even one term would write past an
+/// arena -- and admission, which is a free list and measures nothing, would
+/// have no way to know. Every term is checked, at a budget far under what these
+/// positions want, so every term's guard is exercised.
+#[test]
+fn a_solve_never_grows_past_its_budget() {
+    let nets = Arc::new(Nets::default());
+    let budget = Budget {
+        nodes: 512,
+        rows: 256,
+        boards: 128,
+        configs: 256,
+        cidx: 4_096,
+        reach: 8_192,
+        cells: 2_048,
+        draws: 2_048,
+    };
+    let cfg = Cfg { s: 4_000, c: 1.0, budget, ..Default::default() };
+    let mut checked = 0;
+    let mut hits = 0;
+    for seed in 0..3000u64 {
+        let Some(st) = micro_position(seed, 60 + (seed as usize % 120), 3) else {
+            continue;
+        };
+        let ctx = Ctx::new(&st);
+        let bel = [
+            thinned(uniform_belief(&st, &ctx, 0), CFG_CAP),
+            thinned(uniform_belief(&st, &ctx, 1), CFG_CAP),
+        ];
+        let mut sv = Solver::new(&st, ctx, Arc::clone(&nets), cfg, bel, Rng::new(seed));
+        sv.run_alone();
+        let got = sv.shape();
+        assert!(got.nodes <= budget.nodes, "seed {seed}: {} nodes", got.nodes);
+        assert!(got.rows <= budget.rows, "seed {seed}: {} rows", got.rows);
+        assert!(got.boards <= budget.boards, "seed {seed}: {} boards", got.boards);
+        assert!(got.ncfg <= budget.configs, "seed {seed}: {} configs", got.ncfg);
+        assert!(got.cidx <= budget.cidx, "seed {seed}: {} cidx", got.cidx);
+        assert!(got.reach <= budget.reach, "seed {seed}: {} reach", got.reach);
+        assert!(got.cells <= budget.cells, "seed {seed}: {} cells", got.cells);
+        assert!(got.draws <= budget.draws, "seed {seed}: {} draws", got.draws);
+        if sv.nodes[0].leaf {
+            // The first expansion did not fit. The root stayed a leaf, which
+            // is the truncation: there is no average to read.
+        } else {
+            let root = sv.average_strategy(0, 0);
+            assert!(!root.is_empty(), "seed {seed}: a truncated solve has no average");
+            assert!(
+                root.iter().sum::<f32>() > 0.99 && root.iter().sum::<f32>() < 1.01,
+                "seed {seed}: the root average sums to {}",
+                root.iter().sum::<f32>()
+            );
+        }
+        hits += sv.budget_hit() as usize;
+        checked += 1;
+        if checked >= 200 {
+            break;
+        }
+    }
+    assert!(checked >= 200, "only {checked} positions exercised");
+    // The budget above is far under what the game wants, so it has to bite.
+    // A run that reports no hits at all is a run whose guards are not reached
+    // and whose assertions above therefore prove nothing.
+    assert!(hits > checked / 2, "the budget bit on only {hits} of {checked} solves");
+    eprintln!("{hits} of {checked} solves reached the budget");
 }
