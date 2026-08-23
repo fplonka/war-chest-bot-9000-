@@ -297,7 +297,9 @@ impl Data {
 pub struct GameCfg {
     pub agents: [Agent; 2],
     pub collect: Collect,
-    /// Probability that the designated explorer plays uniformly this decision.
+    /// Weight of the uniform-over-legal mixed into the designated explorer's
+    /// acting policy. The mixture is public: sampling and the belief update
+    /// both read it.
     pub explore: f32,
     /// Randomise the draft instead of using the fixed starter matchup.
     pub random_draft: bool,
@@ -542,17 +544,17 @@ impl Game {
 
     /// Sample the acting player's move, update the public belief from what the
     /// opponent observes, and apply it.
-    fn play(&mut self, np: policy::NodePolicy) {
+    ///
+    /// If the actor is the explorer, the acting policy is `(1-eps) π + eps`
+    /// uniform over each config's legal set; sampling and the belief update
+    /// both read that mixture.
+    fn play(&mut self, mut np: policy::NodePolicy) {
         let me = self.s.to_act() as usize;
-        let true_ci = self.true_index(me);
-        let true_row = np.row(true_ci);
-        let mut chosen_cell = np.sample(&mut self.rng, true_ci);
-        if me as u8 == self.explorer
-            && self.rng.unit_f64() < self.gc.explore as f64
-            && !true_row.is_empty()
-        {
-            chosen_cell = true_row.start + self.rng.below(true_row.len());
+        if me as u8 == self.explorer {
+            np.mix_uniform(self.gc.explore);
         }
+        let true_ci = self.true_index(me);
+        let chosen_cell = np.sample(&mut self.rng, true_ci);
         let chosen = np.action_at(chosen_cell);
         // Bayes update on the *public observation*: several private actions can
         // produce it, and the belief must sum over all of them.
@@ -1087,5 +1089,62 @@ mod target_tests {
         }
         assert_eq!(live.nv, 0, "a row left its game before the game ended");
         assert!(live.decisions > 0, "the counters did not come out");
+    }
+
+    /// With explore = 1 the explorer's acting policy is uniform over legal, so
+    /// the public belief after a move is the Bayes update under that uniform,
+    /// not under the unmixed search policy.
+    #[test]
+    fn the_explorers_mixture_is_the_policy_the_belief_is_updated_with() {
+        let gc = GameCfg {
+            agents: [Agent::Random; 2],
+            collect: Collect::None,
+            explore: 1.0,
+            random_draft: true,
+            p_td1: 0.0,
+            query_rate: 0.0,
+            recursive_rate: 0.0,
+        };
+        let (s, bel) = positions(0xE1, 8)
+            .into_iter()
+            .find(|(s, bel)| bel[s.to_act() as usize].cfg.len() > 1)
+            .expect("a MainPlay whose actor has more than one config");
+        let me = s.to_act() as usize;
+        let ctx = Ctx::new(&s);
+        let mut g = Game::new(Rng::new(0xE1), &gc);
+        g.s = s;
+        g.ctx = ctx;
+        g.bel = bel;
+        g.explorer = me as u8;
+        g.gc.explore = 1.0;
+
+        let prior = g.bel[me].clone();
+        let uni = policy::uniform(&g.s, &g.ctx, me as u8, &prior.cfg);
+        let mut peaked = policy::NodePolicy::frame(&g.s, &g.ctx, me as u8, &prior.cfg);
+        for ci in 0..prior.cfg.len() {
+            let row = peaked.row(ci);
+            if !row.is_empty() {
+                peaked.probs[row.start] = 1.0;
+            }
+        }
+        let before = g.s;
+        g.play(peaked);
+        let obs = before
+            .legal_actions()
+            .into_iter()
+            .find_map(|a| {
+                let mut t = before;
+                t.apply_inplace(a);
+                (t == g.s).then_some(obs_key(&a))
+            })
+            .expect("the played action");
+        let want = uni.posterior(&prior, obs);
+        assert_eq!(g.bel[me].cfg, want.cfg, "posterior support");
+        for (got, exp) in g.bel[me].p.iter().zip(&want.p) {
+            assert!(
+                (got - exp).abs() < 1e-5,
+                "posterior mass {got} vs uniform-Bayes {exp}"
+            );
+        }
     }
 }

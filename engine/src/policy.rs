@@ -94,6 +94,28 @@ impl NodePolicy {
         row.end - 1
     }
 
+    /// Mix `eps` of the uniform-over-legal into every config's row.
+    ///
+    /// The mixture is the acting policy: public knowledge. Sampling and the
+    /// belief update both read it.
+    pub fn mix_uniform(&mut self, eps: f32) {
+        if eps == 0.0 {
+            return;
+        }
+        let n = self.legal_off.len().saturating_sub(1);
+        for ci in 0..n {
+            let row = self.row(ci);
+            let k = row.len();
+            if k == 0 {
+                continue;
+            }
+            let u = 1.0 / k as f32;
+            let keep = 1.0 - eps;
+            for cell in row {
+                self.probs[cell] = keep * self.probs[cell] + eps * u;
+            }
+        }
+    }
 
     /// The belief over the actor's private config after they were seen to make
     /// the observation `obs`. `prior` must be the belief this node was framed
