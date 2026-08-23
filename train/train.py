@@ -499,7 +499,7 @@ def ingest(buf, data):
            np.asarray(data["paoff"], np.int64),
            np.asarray(data["pcoff"], np.int64),
            np.asarray(data["pci"], np.uint16),
-           np.asarray(data["pcell"], np.uint8),
+           np.asarray(data["pcell"], np.uint16),
            np.asarray(data["pprob"], np.float16))
     buf.add(x, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff, pol)
     return len(x)
@@ -668,6 +668,7 @@ def main():
     if args.snapshot_every <= 0:
         raise SystemExit("snapshot_every must be positive minutes")
     snap_gap = args.snapshot_every * 60.0
+    next_snap = snap_gap
     t0 = time.time()
     epoch, log = 0, []
     # Fresh subgames per second over the whole ReBeL phase: the rate
@@ -714,11 +715,42 @@ def main():
                       "file": os.path.basename(path)})
         print(f"[t={el:6.1f}s] --- snapshot {snaps[-1]['file']} ({label}) ---", flush=True)
 
+    def tick(rec=None, line=None):
+        """Log one epoch if given, then snapshot if due. Both generators use this."""
+        nonlocal epoch, next_snap
+        if rec is not None:
+            rec.setdefault("t", round(time.time() - t0, 1))
+            rec.setdefault("epoch", epoch)
+            rec.setdefault("buf", len(buf))
+            rec.setdefault("lr", opt.param_groups[0]["lr"])
+            log.append(rec)
+            write_log(args, log, snaps)
+            print(line, flush=True)
+        now = time.time()
+        if now - t0 >= next_snap:
+            snapshot(f"s{len(snaps)}", now - t0)
+            next_snap = now - t0 + snap_gap
+        epoch += 1
+
+    def fit(nsteps):
+        """Adam updates on the shared replay. Returns (loss, wall_s, stats)."""
+        if nsteps < 1 or len(buf) < args.batch:
+            return float("nan"), 0.0, {}
+        tt = time.time()
+        lv, st = train_steps(
+            value, opt, buf, nsteps, args.batch, rng, dev,
+            recent_mix=args.recent_mix, recent_frac=args.recent_frac,
+            profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1",
+            batch_fn=batcher, policy_w=args.policy_w)
+        return lv, time.time() - tt, st
+
     def run_search_pipeline():
         """Overlap small GT-CFR batches with each other and with training."""
-        nonlocal probe, cap_v, next_decay, next_snap, epoch, sog_solves
+        nonlocal probe, cap_v, next_decay, sog_solves
 
         deadline = t0 + total
+        if time.time() >= deadline:
+            return
         # One process, one driver a card and a worker per core. A process per
         # core could not batch inference at all: the solves have to share an
         # address space for their leaf rows to end up in one batch.
@@ -759,38 +791,22 @@ def main():
             data = farm.collect(args.gen_solves)
             gen_s = time.time() - gen_t
 
-            tc = time.time()
-            rows = np.asarray(data["rows"], np.uint8).reshape(-1, ROW_BYTES)
-            cc = np.asarray(data["cc"], np.uint8).reshape(-1, CCOUNTS)
-            cw = np.asarray(data["cw"], np.float32)
-            cy = np.clip(np.asarray(data["cy"], np.float32), -1.0, 1.0)
-            coff = np.asarray(data["coff"], np.int64)
-            soff = np.asarray(data["soff"], np.int64)
-            conv_s = time.time() - tc
             ta = time.time()
-            if len(rows):
-                pol = (np.asarray(data["pa"], np.uint8).reshape(-1, ACT_BYTES),
-                       np.asarray(data["paoff"], np.int64),
-                       np.asarray(data["pcoff"], np.int64),
-                       np.asarray(data["pci"], np.uint16),
-                       np.asarray(data["pcell"], np.uint16),
-                       np.asarray(data["pprob"], np.float16))
-                buf.add(rows, cc, cw.astype(np.float16),
-                        cy.astype(np.float16), coff, soff, pol)
+            n = ingest(buf, data)
             add_s = time.time() - ta
+            cy = np.clip(np.asarray(data["cy"], np.float32), -1.0, 1.0)
 
             solves = int(data["solves"])
             sog_solves += solves
-            generated_rows += len(rows)
+            generated_rows += n
             window["results"] += 1
-            window["rows"] += len(rows)
+            window["rows"] += n
             window["solves"] += solves
             window["target_n"] += cy.size
             window["target_sum"] += float(cy.sum(dtype=np.float64))
             window["target_square_sum"] += float(
                 np.square(cy.astype(np.float64)).sum())
             window["gen_s"] += gen_s
-            window["conv_s"] += conv_s
             window["add_s"] += add_s
             window_shapes.extend(data.get("shapes") or [])
             for name in (
@@ -810,23 +826,8 @@ def main():
 
             debt = max(0.0, args.replay_ratio * generated_rows - optimizer_rows)
             nsteps = int(debt // args.batch) if len(buf) >= args.batch else 0
-            train_s = 0.0
-            lv = 0.0
-            train_stat = {
-                name: 0.0 for name in (
-                    "sample_s", "prepare_s", "forward_wall_s",
-                    "backward_wall_s", "gpu_forward_s", "gpu_backward_s",
-                    "batch_configs", "zero_sum_max", "grad_clipped")
-            }
+            lv, train_s, train_stat = fit(nsteps)
             if nsteps:
-                tt = time.time()
-                lv, train_stat = train_steps(
-                    value, opt, buf, nsteps, args.batch, rng, dev,
-                    recent_mix=args.recent_mix,
-                    recent_frac=args.recent_frac,
-                    profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1",
-                    batch_fn=batcher, policy_w=args.policy_w)
-                train_s = time.time() - tt
                 optimizer_steps += nsteps
                 optimizer_rows += nsteps * args.batch
                 window["loss_sum"] += lv * nsteps
@@ -860,12 +861,8 @@ def main():
                     f"{opt.param_groups[0]['lr']:.2e} ---",
                     flush=True)
                 next_decay += 1
-            if now - t0 >= next_snap:
-                snapshot(f"s{len(snaps)}", now - t0)
-                next_snap = now - t0 + snap_gap
-
             if now < next_report:
-                epoch += 1
+                tick()
                 continue
             next_report = now + 10.0
             steps = int(window["train_steps"])
@@ -976,16 +973,13 @@ def main():
                 "probe_std": round(probe_std, 4),
                 "gen_s": round(gen_s, 2),
                 "train_s": round(train_s, 2),
-                "conv_s": round(window["conv_s"], 2),
                 "add_s": round(window["add_s"], 2),
                 "gpu_forward_s": round(window["gpu_forward_s"], 2),
                 "gpu_backward_s": round(window["gpu_backward_s"], 2),
                 "batch_configs": round(
                     window["batch_configs"] / max(steps, 1), 1),
-                "buf": len(buf),
                 "buf_s": round(buf.span_seconds(), 1),
                 "solves_per_s": round(raw_sps, 1),
-                "lr": opt.param_groups[0]["lr"],
                 "policy_loss": window["policy_sum"] / max(window["train_steps"], 1),
                 "budget_hits": int(hits),
                 "entity_hits": {names[i]: ent_hits[i] for i in range(8)},
@@ -997,9 +991,7 @@ def main():
             }
             rec["budget_hit_rate"] = round(
                 rec["budget_hits"] / max(len(window_shapes), rec["solves"], 1), 3)
-            log.append(rec)
-            write_log(args, log, snaps)
-            print(
+            tick(rec,
                 f"[t={rec['t']:6.1f}s] GT-CFR solves={sog_solves} "
                 f"rate={raw_sps:.1f}/s rows={rec['rows']} "
                 f"games={rec['games']} "
@@ -1016,11 +1008,9 @@ def main():
                 f"hits={rec['budget_hits']} "
                 f"hit_rate={rec['budget_hit_rate']} "
                 f"ehits={'/'.join(str(ent_hits[i]) for i in range(8))} "
-                f"p90={'/'.join(str(shape[n]['p90']) for n in names)}",
-                flush=True)
+                f"p90={'/'.join(str(shape[n]['p90']) for n in names)}")
             window.clear()
             window_shapes.clear()
-            epoch += 1
         # Dropping the farm stops its threads once they finish the solve they
         # are in, which is also what flushes their last rows.
         del farm
@@ -1046,7 +1036,6 @@ def main():
           f"matmul={torch.get_float32_matmul_precision()}", flush=True)
 
     snapshot("init", 0.0)
-    next_snap = snap_gap
     warm = args.warm_minutes * 60.0
     if not 0.0 <= warm <= total:
         raise SystemExit("warm_minutes must be between zero and the run length")
@@ -1062,12 +1051,7 @@ def main():
         gen_s = time.time() - tg
         n = ingest(buf, d)
         steps = max(1, n // args.batch) if len(buf) >= args.batch else 0
-        tt = time.time()
-        lv, train_stat = (float("nan"), {}) if not steps else train_steps(
-            value, opt, buf, steps, args.batch, rng, dev,
-            recent_mix=args.recent_mix, recent_frac=args.recent_frac,
-            batch_fn=batcher, policy_w=args.policy_w)
-        train_s = time.time() - tt
+        lv, train_s, _ = fit(steps)
         cy = np.clip(np.asarray(d["cy"], np.float32), -1.0, 1.0)
         rec = {
             "t": round(time.time() - t0, 1), "epoch": epoch, "phase": "warm",
@@ -1078,21 +1062,12 @@ def main():
             "horizon_frac": round(int(d.get("horizon_hits", 0)) /
                                   max(int(d.get("games", 0)), 1), 3),
             "gen_s": round(gen_s, 2), "train_s": round(train_s, 2),
-            "buf": len(buf), "lr": opt.param_groups[0]["lr"],
         }
-        log.append(rec)
-        write_log(args, log, snaps)
-        print(
+        tick(rec,
             f"[t={rec['t']:6.1f}s] warm ep{epoch:3d} games={rec['games']:4d} "
             f"rows={n:6d} L={lv if steps else float('nan'):.5f} "
             f"tgt={rec['tgt_mean']:+.3f}/{rec['tgt_std']:.3f} "
-            f"gen={gen_s:.1f}s train={train_s:.1f}s",
-            flush=True)
-        now = time.time()
-        if now - t0 >= next_snap:
-            snapshot(f"s{len(snaps)}", now - t0)
-            next_snap = now - t0 + snap_gap
-        epoch += 1
+            f"gen={gen_s:.1f}s train={train_s:.1f}s")
     value.push()
 
     sog_t0 = time.time()
