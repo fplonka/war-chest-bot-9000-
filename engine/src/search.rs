@@ -3890,14 +3890,14 @@ impl Solver {
             // ends the trajectory here; that is a property of the sampled
             // world, not of the tree, so it does not seal anything.
             let so = self.soff[node] as usize;
-            let live = |cell: usize| self.live_cell(node, cell);
+            let live = |i: usize| self.live_cell(node, row.start + i);
             let cell = if rng.unit_f64() < 0.5 {
                 self.puct_choice(node, row.clone(), 1 - me)
             } else if self.cfr().sum_strat[node][row.clone()].iter().any(|&x| x > 0.0) {
-                pick_live(&self.cfr().sum_strat[node][row.clone()], |i| live(row.start + i), rng)
+                pick_live(&self.cfr().sum_strat[node][row.clone()], live, rng)
                     .map(|i| row.start + i)
             } else {
-                pick_live(&self.cur[so + row.start..so + row.end], |i| live(row.start + i), rng)
+                pick_live(&self.cur[so + row.start..so + row.end], live, rng)
                     .map(|i| row.start + i)
             };
             let cell = cell?;
