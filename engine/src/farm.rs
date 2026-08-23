@@ -503,6 +503,13 @@ impl<T> Queue<T> {
         self.ready.notify_one();
     }
 
+    /// Both card pipes wait on this queue with different wave sizes. Wake both
+    /// so the pipe whose threshold was reached always sees the new work.
+    fn push_wave(&self, x: T) {
+        self.q.lock().push_back(x);
+        self.ready.notify_all();
+    }
+
     /// The oldest item, or `None` once the queue is closed and empty.
     fn pop(&self) -> Option<T> {
         let mut q = self.q.lock();
@@ -1001,7 +1008,7 @@ fn advance_job(
     let mut replies = std::mem::take(&mut job.replies);
     loop {
         match job.solver.advance(&replies) {
-            Step::Calls(calls) => return device[job.card].push((job, calls)),
+            Step::Calls(calls) => return device[job.card].push_wave((job, calls)),
             Step::Done(solved) => {
                 stats.solves.fetch_add(1, Ordering::Relaxed);
                 let mask = job.solver.hit_mask();
