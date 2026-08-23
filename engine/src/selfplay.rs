@@ -25,10 +25,11 @@
 //! Each search nominates a few of the leaves it asked the network about; each
 //! of those is later solved as a root in its own right and yields its own row.
 //!
-//! There is no warm start. A game that reaches the play cap scores
-//! `cap_value * delta_markers`, so the first solves against an untrained
-//! network still see a graded outcome -- the win condition, graded -- rather
-//! than a flat zero. `state::cap_marker_value` anneals it away.
+//! Training starts with a short greedy warm phase: rows labelled by the
+//! deterministic public evaluation `policy::eval_squashed`, with the greedy
+//! policy as the policy target. No solve runs in a warm game. The SoG phase
+//! that follows is unchanged: a game that reaches the play cap scores
+//! `cap_value * delta_markers`, and `state::cap_marker_value` anneals it away.
 //!
 //! **Grounding: `p_td1`.** A bootstrap target is the network's own answer
 //! propagated one subgame back, so a run whose trees never reach a terminal
@@ -93,6 +94,8 @@ pub fn make_game(rng: &mut Rng, random: bool) -> State {
 pub enum Agent {
     /// Uniform over legal actions: the weakest reference on the Elo ladder.
     Random,
+    /// One-ply greedy on the public static evaluation, softmaxed at `temp`.
+    Greedy { temp: f32 },
     /// Grow and solve a GT-CFR tree, then act on its average strategy.
     Sog { cfg: Cfg },
 }
@@ -102,6 +105,9 @@ pub enum Agent {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Collect {
     None,
+    /// Greedy warm start: the public static evaluation at the current state,
+    /// and the greedy policy, for every config of both seats.
+    Static,
     /// Student of Games: CFR subgame root values.
     Sog,
 }
@@ -485,6 +491,25 @@ impl Game {
                 Agent::Random => {
                     let cfgs = self.bel[player as usize].cfg.clone();
                     let np = policy::uniform(&self.s, &self.ctx, player, &cfgs);
+                    self.play(np);
+                }
+                Agent::Greedy { temp } => {
+                    let cfgs = self.bel[player as usize].cfg.clone();
+                    let np = policy::greedy(&self.s, &self.ctx, player, &cfgs, temp);
+                    if self.gc.collect == Collect::Static
+                        && matches!(self.s.pending(), Cont::MainPlay)
+                    {
+                        let y0 = vec![policy::eval_squashed(&self.s, 0); self.bel[0].cfg.len()];
+                        let y1 = vec![policy::eval_squashed(&self.s, 1); self.bel[1].cfg.len()];
+                        self.data.begin_solve();
+                        self.data.push_value(
+                            &self.s,
+                            &self.ctx,
+                            &self.bel,
+                            [&y0, &y1],
+                            &np.to_replay(),
+                        );
+                    }
                     self.play(np);
                 }
                 Agent::Sog { cfg } => {
@@ -1087,5 +1112,98 @@ mod target_tests {
         }
         assert_eq!(live.nv, 0, "a row left its game before the game ended");
         assert!(live.decisions > 0, "the counters did not come out");
+    }
+
+    fn greedy_cfg(collect: Collect) -> GameCfg {
+        GameCfg {
+            agents: [Agent::Greedy { temp: 2.0 }; 2],
+            collect,
+            explore: 0.1,
+            random_draft: true,
+            p_td1: 0.0,
+            query_rate: 0.0,
+            recursive_rate: 0.0,
+        }
+    }
+
+    /// Fifty greedy games end by six markers, well before the play cap.
+    #[test]
+    fn fifty_greedy_games_end_by_markers() {
+        let nets = Arc::new(Nets {
+            value: random_net(1),
+            device: false,
+        });
+        let gc = greedy_cfg(Collect::None);
+        let mut plays = Vec::new();
+        let mut caps = 0usize;
+        for i in 0..50 {
+            let mut g = Game::new(Rng::new(10_000 + i as u64), &gc);
+            while g.next_solve(&nets).is_some() {
+                panic!("greedy asked for a solve");
+            }
+            assert!(g.s.is_terminal(), "game {i} did not end");
+            plays.push(g.s.main_plays);
+            g.finish();
+            let d = g.take_data();
+            caps += d.cap_hits;
+        }
+        plays.sort_unstable();
+        eprintln!(
+            "greedy play counts: min={} p50={} p90={} max={} mean={:.1} cap_games={caps}",
+            plays[0],
+            plays[24],
+            plays[44],
+            plays[49],
+            plays.iter().map(|&x| x as f32).sum::<f32>() / 50.0
+        );
+        // Greedy-vs-greedy often stalls one marker short of six; those games
+        // still end, at the play cap. The distribution is the result.
+    }
+
+    /// A static row's value is one number per seat: equal across that seat's
+    /// configs, and opposite between seats.
+    #[test]
+    fn a_static_row_is_antisymmetric_and_constant_across_configs() {
+        let nets = Arc::new(Nets {
+            value: random_net(2),
+            device: false,
+        });
+        let gc = greedy_cfg(Collect::Static);
+        let mut data = Data::default();
+        for i in 0..8 {
+            play_game(Rng::new(20_000 + i as u64), &nets, &gc, &mut data);
+        }
+        assert!(data.nv > 0, "no static rows");
+        let mut wide = 0usize;
+        for r in 0..data.nv {
+            let a = data.row_span(r, 0);
+            let b = data.row_span(r, 1);
+            assert!(!a.is_empty() && !b.is_empty());
+            let v0 = data.cy[a.start];
+            let v1 = data.cy[b.start];
+            for i in a.clone() {
+                assert!(
+                    (data.cy[i] - v0).abs() < 1e-6,
+                    "row {r}: white configs disagree"
+                );
+            }
+            for i in b.clone() {
+                assert!(
+                    (data.cy[i] - v1).abs() < 1e-6,
+                    "row {r}: black configs disagree"
+                );
+            }
+            assert!(
+                (v0 + v1).abs() < 1e-5,
+                "row {r}: cy not antisymmetric ({v0} vs {v1})"
+            );
+            if a.len() > 1 || b.len() > 1 {
+                wide += 1;
+            }
+            let pa0 = data.paoff[r] as usize;
+            let pa1 = data.paoff[r + 1] as usize;
+            assert!(pa1 > pa0, "row {r}: no policy actions");
+        }
+        assert!(wide > 0, "every row was a singleton belief; play more games");
     }
 }
