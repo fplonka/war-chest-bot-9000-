@@ -47,8 +47,8 @@ pub const PROTOCOL: u32 = 6;
 pub struct Hello {
     pub name: String,
     pub protocol: u32,
-    /// `pbs::rules_table_hash`. Two builds that disagree here are playing
-    /// different games, and any result between them would be meaningless.
+    /// `pbs::rules_table_hash`. The board and the unit table. Two builds that
+    /// disagree here are playing different games.
     pub rules: u64,
 }
 

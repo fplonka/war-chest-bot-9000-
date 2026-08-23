@@ -970,10 +970,9 @@ pub const ROW_STACK_KIND: usize = ROW_PLIES + 2;
 pub const ROW_STACK_OWED: usize = ROW_STACK_KIND + CONT_CAP;
 pub const ROW_BYTES: usize = ROW_STACK_OWED + CONT_CAP * 8;
 
-/// Hash of the constants the expansion depends on: the board's location map,
-/// the unit card-fact table and the layout constants. A rules change that
-/// moves any feature moves this hash, so a dump from another rules build
-/// fails `Dump.check` instead of silently mis-training.
+/// Hash of the rules a referee needs: the board's location map and the unit
+/// card-fact table. Encoding layout is the bot's own; `Dump.check` pins that
+/// with `ROW_BYTES` / `PUBFEAT` / `CCOUNTS`.
 pub fn rules_table_hash() -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut mix = |x: u64| {
@@ -990,21 +989,6 @@ pub fn rules_table_hash() -> u64 {
         for x in f {
             mix(x.to_bits() as u64);
         }
-    }
-    for c in [
-        PUBFEAT,
-        HEX_FACTS,
-        HEX_CH,
-        CARD_FEATS,
-        NSLOT,
-        NTYPE,
-        N_HEXES,
-        PILE_COUNTS,
-        LOOSE,
-        PENDING_KINDS,
-        CONT_CAP,
-    ] {
-        mix(c as u64);
     }
     h
 }

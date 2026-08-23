@@ -100,13 +100,16 @@ struct Run {
 /// A card carved at a budget that covers every solve these tests grow.
 ///
 /// `Cfg::default` is `SoG(512)`'s p90. Several tests here run `s` two and three
-/// times that, and a slot at 512 is then a write past the arena.
+/// times that, and a slot at 512 is then a write past the arena. Four slots,
+/// not eight: two pipes of round scratch at this budget fill a 24 GB card
+/// before eight slots would fit. Tests that need more concurrent slots use a
+/// 512 budget, where the trees are small.
 fn gpu(net: Net) -> Device {
     Device::new(
         &[0],
         net,
         Cfg { budget: Budget::for_s(2048), ..Default::default() },
-        8,
+        4,
     )
     .expect("device")
 }
@@ -961,7 +964,16 @@ fn k_iterates_together_match_k_iterates_alone() {
     }
     const K: usize = 4;
     let net = random_net(0x9E37);
-    let device = gpu(net.clone());
+    // Eight slots at the 2048 growth budget do not fit two pipes of round
+    // scratch on a 24 GB card. These trees never grow (`c = 0`, `s = 8`), so
+    // the live 512 budget is the one that has room for eight copies.
+    let device = Device::new(
+        &[0],
+        net.clone(),
+        Cfg { budget: Budget::for_s(512), ..Default::default() },
+        8,
+    )
+    .expect("device");
     let nets = Arc::new(Nets { value: net.clone(), device: true });
     let mut setup = Vec::new();
     let mut iterates = Vec::new();

@@ -875,7 +875,18 @@ impl Device {
             // free to the last byte OOMs, so a tenth stays for fragmentation.
             let fit = (usable - usable / 10) / per.max(1);
             let gpus_left = ordinals.len() - g;
-            let n = (fit as usize).min(left / gpus_left.max(1));
+            // `fit` prices a slot as `tile + n * extra`. Carve is
+            // `carve_bytes(n)` per pipe, which matches that only while every
+            // buffer is linear in n. Walk n down until the bytes that will
+            // actually be allocated fit.
+            let mut n = (fit as usize).min(left / gpus_left.max(1));
+            while n > 0 {
+                let need = n as u64 * slot + PIPELINE as u64 * Card::carve_bytes(n, &cfg);
+                if need + need / 10 <= free {
+                    break;
+                }
+                n -= 1;
+            }
             if g == 0 && n == 0 {
                 return Err(format!(
                     "a slot of {slot} bytes does not fit in {free} bytes free"
