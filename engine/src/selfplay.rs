@@ -644,16 +644,23 @@ pub struct GameStream {
     /// own solve and its own training row.
     pending: VecDeque<(State, [Belief; 2])>,
     /// What the solve in flight is for.
-    kind: Kind,
+    kind: SolveKind,
     /// Whether the query solver has the next turn.
     query_turn: bool,
     rng: Rng,
 }
 
 /// What the solve in flight is for: the line of play, or coverage away from it.
-enum Kind {
+#[derive(Clone, Copy)]
+#[repr(u32)]
+pub(crate) enum SolveKind {
     Play,
     Query,
+}
+
+impl SolveKind {
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
+    pub const NAMES: [&'static str; 2] = ["play", "query"];
 }
 
 /// How many queued queries one stream will hold. At the intended rates the
@@ -670,7 +677,7 @@ impl GameStream {
             gc,
             game,
             pending: VecDeque::new(),
-            kind: Kind::Play,
+            kind: SolveKind::Play,
             query_turn: false,
             rng: Rng::new(worker_seed(seed, usize::MAX)),
         }
@@ -687,18 +694,22 @@ impl GameStream {
         if self.query_turn {
             self.query_turn = false;
             if let Some(sv) = self.next_query(nets) {
-                self.kind = Kind::Query;
+                self.kind = SolveKind::Query;
                 return sv;
             }
         }
         self.query_turn = true;
-        self.kind = Kind::Play;
+        self.kind = SolveKind::Play;
         loop {
             if let Some(sv) = self.game.next_solve(nets) {
                 return sv;
             }
             self.end_game(out);
         }
+    }
+
+    pub(crate) fn solve_kind(&self) -> SolveKind {
+        self.kind
     }
 
     /// Run this stream on this host until it has produced `solves` rows.
@@ -721,13 +732,13 @@ impl GameStream {
     /// Take the finished solve back: keep its row, and let the game act on it.
     pub fn keep(&mut self, sv: &Solver, solved: Option<Solved>, out: &mut Data) {
         match self.kind {
-            Kind::Play => {
+            SolveKind::Play => {
                 self.game.play_solved(sv, solved);
                 let queued = self.game.take_queries();
                 self.enqueue(queued);
                 out.merge(self.game.take_ready());
             }
-            Kind::Query => {
+            SolveKind::Query => {
                 let more = keep_query(sv, solved, out);
                 self.enqueue(more);
             }

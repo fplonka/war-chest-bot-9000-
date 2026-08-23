@@ -1205,6 +1205,8 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(stage_names, m)?)?;
         m.add_function(wrap_pyfunction!(solve_census, m)?)?;
     m.add("ENT_NAMES", Ent::NAME.iter().copied().collect::<Vec<&str>>())?;
+    m.add("STOP_NAMES", crate::search::StopReason::NAMES.to_vec())?;
+    m.add("SOLVE_KIND_NAMES", crate::selfplay::SolveKind::NAMES.to_vec())?;
     m.add_function(wrap_pyfunction!(budget_for_s, m)?)?;
     m.add_function(wrap_pyfunction!(host_slot_bytes, m)?)?;
     Ok(())

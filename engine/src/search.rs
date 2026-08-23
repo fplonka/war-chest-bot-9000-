@@ -515,6 +515,31 @@ pub struct Shape {
     pub draws: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum StopReason {
+    Complete,
+    Exhausted,
+    BudgetNode,
+    BudgetCell,
+    BudgetReach,
+    BudgetDraw,
+    BudgetRow,
+    BudgetBoard,
+    BudgetConfig,
+    BudgetCidx,
+    Other,
+}
+
+impl StopReason {
+    pub const NAMES: [&'static str; 11] = [
+        "complete", "exhausted",
+        "budget_node", "budget_cell", "budget_reach", "budget_draw",
+        "budget_row", "budget_board", "budget_config", "budget_cidx",
+        "other",
+    ];
+}
+
 
 /// How well a solve came out, in two numbers that are read together.
 #[derive(Clone, Copy, Debug)]
@@ -1189,6 +1214,9 @@ pub struct Solver {
     collect: Option<usize>,
     /// Iterations run. `advance` picks up from here every time it is called.
     at: usize,
+    /// Successful expansion phases. Unlike nodes, this is exactly Student of
+    /// Games' `s`: one sampled leaf grown, regardless of its branching factor.
+    expansions: u32,
     /// Which round, if any, is in flight.
     phase: Phase,
     /// The leaves the last round was asked for the reach at, in the order the
@@ -1444,6 +1472,7 @@ impl Solver {
             slot: 0,
             collect: None,
             at: 0,
+            expansions: 0,
             phase: Phase::Fresh,
             picks: Vec::new(),
             cfg,
@@ -1735,6 +1764,9 @@ impl Solver {
             self.abandon = false;
             self.nodes[id].expandable = false;
         }
+        if !self.nodes[id].leaf {
+            self.expansions += 1;
+        }
         self.seal(id, fresh);
     }
 
@@ -1827,9 +1859,38 @@ impl Solver {
         }
     }
 
-    /// The eight counts, in `Ent::ALL` order.
-    pub fn counts(&self) -> [u32; 8] {
-        Ent::ALL.map(|e| self.used(e) as u32)
+    pub fn stop_reason(&self) -> StopReason {
+        if self.budget_hit != 0 {
+            debug_assert!(self.budget_hit.is_power_of_two());
+            return match self.budget_hit.trailing_zeros() {
+                0 => StopReason::BudgetNode,
+                1 => StopReason::BudgetCell,
+                2 => StopReason::BudgetReach,
+                3 => StopReason::BudgetDraw,
+                4 => StopReason::BudgetRow,
+                5 => StopReason::BudgetBoard,
+                6 => StopReason::BudgetConfig,
+                7 => StopReason::BudgetCidx,
+                _ => unreachable!(),
+            };
+        }
+        if self.expansions >= self.cfg.s {
+            StopReason::Complete
+        } else if self.nodes[0].exhausted {
+            StopReason::Exhausted
+        } else {
+            StopReason::Other
+        }
+    }
+
+    /// Entity counts followed by why growth stopped.
+    pub fn counts(&self) -> [u32; 9] {
+        let mut out = [0; 9];
+        for (i, e) in Ent::ALL.into_iter().enumerate() {
+            out[i] = self.used(e) as u32;
+        }
+        out[8] = self.stop_reason() as u32;
+        out
     }
 
     /// Ensure this entity can hold `n` items. The one host-side guard.

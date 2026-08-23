@@ -892,6 +892,7 @@ def main():
             now_ent = [int(x) for x in (data.get("entity_hits") or [0] * 8)]
             ent_hits = [now_ent[i] - ent_at[i] for i in range(8)]
             ent_at = now_ent
+            bounds = (1, 4, 16, 64, 256, 1024, 4096, 16384, 65536)
             if window_shapes:
                 a = np.asarray(window_shapes, np.uint32)
                 def pct(col, q):
@@ -906,8 +907,37 @@ def main():
                     }
                     for i in range(8)
                 }
+                node_histogram = {}
+                stop_census = {}
+                for kind_id, kind in enumerate(warchest.SOLVE_KIND_NAMES):
+                    ka = a[a[:, 9] == kind_id]
+                    hist = {}
+                    for lo, hi in zip(bounds[:-1], bounds[1:]):
+                        hist[f"{lo}-{hi - 1}"] = int(
+                            ((ka[:, 0] >= lo) & (ka[:, 0] < hi)).sum())
+                    hist[f"{bounds[-1]}+"] = int((ka[:, 0] >= bounds[-1]).sum())
+                    node_histogram[kind] = hist
+                    stops = {}
+                    for stop_id, stop in enumerate(warchest.STOP_NAMES):
+                        nodes = ka[ka[:, 8] == stop_id, 0]
+                        if nodes.size:
+                            nodes.sort()
+                            stops[stop] = {
+                                "count": int(nodes.size),
+                                "node_p50": int(nodes[int(round(
+                                    (nodes.size - 1) * 0.5))]),
+                            }
+                    stop_census[kind] = stops
             else:
                 shape = {n: {"p50": 0, "p90": 0, "p99": 0, "max": 0} for n in names}
+                empty_hist = {
+                    **{f"{lo}-{hi - 1}": 0
+                       for lo, hi in zip(bounds[:-1], bounds[1:])},
+                    f"{bounds[-1]}+": 0,
+                }
+                node_histogram = {
+                    k: dict(empty_hist) for k in warchest.SOLVE_KIND_NAMES}
+                stop_census = {k: {} for k in warchest.SOLVE_KIND_NAMES}
             rec = {
                 "t": round(now - t0, 1),
                 "epoch": epoch,
@@ -989,6 +1019,8 @@ def main():
                 "slots_per_card": int(data.get("slots_per_card", 0)),
                 "slot_bytes": int(data.get("slot_bytes", 0)),
                 "shape": shape,
+                "node_histogram": node_histogram,
+                "stop_census": stop_census,
             }
             rec["budget_hit_rate"] = round(
                 rec["budget_hits"] / max(len(window_shapes), rec["solves"], 1), 3)

@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use warchest::pbs::*;
 use warchest::rng::Rng;
-use warchest::search::{node_actions, Budget, Cfg, Cfr, Ent, Nets, Solver};
+use warchest::search::{node_actions, Budget, Cfg, Cfr, Ent, Nets, Solver, StopReason};
 use warchest::selfplay::make_game;
 use warchest::state::{Cont, State, MAX_MAIN_PLAYS, Z_BAG, Z_FACEDOWN, Z_HAND};
 use warchest::units::{
@@ -360,6 +360,8 @@ fn a_solve_stops_expanding_once_the_tree_is_exhausted() {
             "seed {seed}: {} of {whole} nodes grown and the root is still open",
             sv.nodes.len()
         );
+        assert_eq!(sv.stop_reason(), StopReason::Exhausted);
+        assert_eq!(sv.trace.iters, cfg.iters() as u64);
         assert_eq!(
             sv.nodes.len(),
             whole,
