@@ -1928,7 +1928,7 @@ impl Card {
             let mut j = i;
             let mut na_c = 0usize;
             let mut wide = 0u32;
-            while j < m && (j - i) < TILE && na_c + nas[j] <= TILE && part[j] == part[i] {
+            while j < m && (j - i) < TILE && na_c + nas[j] <= TILE {
                 na_c += nas[j];
                 wide = wide.max(ncs[j]);
                 j += 1;
