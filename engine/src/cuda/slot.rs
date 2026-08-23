@@ -1,8 +1,9 @@
-//! One solve's eight entities, allocated once at the budget and never grown.
+//! One solve's eight entities, views into one size-class slab.
 //!
-//! A slot is a `Solve`. Each entity is one allocation, `cap × nfields × 4`
-//! bytes; the per-field arrays the kernels read are views at `base + k × cap`.
-//! `reserve` / `plan` / `put` only advance a length.
+//! A `Solve` holds one slab. Each entity is a `(offset, cap)` region; the
+//! per-field arrays the kernels read are views at `base + (offset + k × cap)`.
+//! `reserve` / `plan` / `put` only advance a length. Growth relocates to the
+//! next class that fits.
 
 use std::sync::Arc;
 
@@ -10,7 +11,8 @@ use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 
 use crate::farm::Dst;
 use crate::net::{D, JW, POOL};
-use crate::search::{Budget, Ent};
+use crate::search::Ent;
+use crate::slab::{self, CLASSES, SHAPE};
 
 use super::{err, Host, Res, HELD};
 
@@ -149,9 +151,14 @@ const _: () = {
     assert!(C_CUR == 7 && C_SUM == 9 && C_PRIOR == 12);
     assert!(B_P == 0 && B_JP == D);
     assert!(G_F == 2 && Y_COFF == 1);
+    let mut i = 0;
+    while i < 8 {
+        assert!(FIELDS[i] == slab::FIELDS[i]);
+        i += 1;
+    }
 };
 
-fn dst_slot(d: Dst) -> (Ent, usize, usize) {
+pub(super) fn dst_slot(d: Dst) -> (Ent, usize, usize) {
     let mut acc = [0usize; 8];
     for c in &TABLE {
         if c.dst == Some(d) {
@@ -226,34 +233,17 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
     }
 }
 
-/// One of a solve's eight allocations: `cap × nfields` words.
+/// One of a solve's eight regions: `cap × nfields` words inside the slab.
 pub struct Entity {
-    arr: Arr<u32>,
+    offset: usize,
     cap: usize,
     nfields: usize,
     len: usize,
 }
 
 impl Entity {
-    fn with_cap(stream: &Arc<CudaStream>, cap: usize, nfields: usize) -> Res<Entity> {
-        let cap = cap.max(1);
-        Ok(Entity { arr: Arr::with_cap(stream, cap * nfields)?, cap, nfields, len: 0 })
-    }
-
-    fn rewind(&mut self) {
-        self.len = 0;
-    }
-
-    fn zero(&mut self, stream: &Arc<CudaStream>) -> Res<()> {
-        if let Some(buf) = self.arr.buf.as_mut() {
-            stream.memset_zeros(buf).map_err(err)?;
-        }
-        self.len = 0;
-        Ok(())
-    }
-
-    pub fn field(&self, k: usize, stream: &Arc<CudaStream>) -> u64 {
-        self.arr.ptr(stream) + (k * self.cap * 4) as u64
+    fn field(&self, k: usize, base: u64) -> u64 {
+        base + ((self.offset + k * self.cap) * 4) as u64
     }
 
     fn bytes(&self) -> usize {
@@ -264,46 +254,15 @@ impl Entity {
         self.len
     }
 
-    fn copy_f32(
-        &mut self,
-        stream: &Arc<CudaStream>,
-        field: usize,
-        at: usize,
-        src: &CudaSlice<f32>,
-        from: usize,
-        n: usize,
-    ) -> Res<()> {
-        if n == 0 {
-            return Ok(());
-        }
-        let off = field * self.cap + at;
-        let dst = self.arr.buf.as_mut().expect("a capacity implies a buffer");
-        let mut view = dst.slice_mut(off..off + n);
-        let mut fview = unsafe { view.transmute_mut::<f32>(n).expect("u32 and f32 are four bytes") };
-        stream.memcpy_dtod(&src.slice(from..from + n), &mut fview).map_err(err)
-    }
-
-    fn get_f32(
-        &self,
-        stream: &Arc<CudaStream>,
-        field: usize,
-        at: usize,
-        n: usize,
-        host: &mut Host<f32>,
-    ) -> Res<Vec<f32>> {
-        if n == 0 {
-            return Ok(Vec::new());
-        }
-        let off = field * self.cap + at;
-        let buf = self.arr.buf.as_ref().ok_or("reading an arena that was never written")?;
-        let view = buf.slice(off..off + n);
-        let fview = unsafe { view.transmute::<f32>(n).expect("u32 and f32 are four bytes") };
-        host.recv(stream, &fview)
+    fn rewind(&mut self) {
+        self.len = 0;
     }
 }
 
 /// Everything one solve keeps on its card.
 pub struct Solve {
+    pub class: usize,
+    buf: Option<CudaSlice<u32>>,
     pub ent: [Entity; 8],
     pub host_coff: Vec<u32>,
     pub cells: usize,
@@ -320,18 +279,16 @@ pub struct Solve {
 }
 
 impl Solve {
-    pub fn at_budget(s: &Arc<CudaStream>, b: &Budget) -> Res<Solve> {
+    pub fn empty(s: &Arc<CudaStream>) -> Res<Solve> {
         Ok(Solve {
-            ent: [
-                Entity::with_cap(s, b.cap(Ent::Node), FIELDS[Ent::Node as usize])?,
-                Entity::with_cap(s, b.cap(Ent::Cell), FIELDS[Ent::Cell as usize])?,
-                Entity::with_cap(s, b.cap(Ent::Reach), FIELDS[Ent::Reach as usize])?,
-                Entity::with_cap(s, b.cap(Ent::Draw), FIELDS[Ent::Draw as usize])?,
-                Entity::with_cap(s, b.cap(Ent::Row), FIELDS[Ent::Row as usize])?,
-                Entity::with_cap(s, b.cap(Ent::Board), FIELDS[Ent::Board as usize])?,
-                Entity::with_cap(s, b.cap(Ent::Config), FIELDS[Ent::Config as usize])?,
-                Entity::with_cap(s, b.cap(Ent::Cidx), FIELDS[Ent::Cidx as usize])?,
-            ],
+            class: 0,
+            buf: None,
+            ent: std::array::from_fn(|e| Entity {
+                offset: 0,
+                cap: 1,
+                nfields: FIELDS[e],
+                len: 0,
+            }),
             host_coff: vec![0],
             cells: 0,
             rows: 0,
@@ -347,7 +304,117 @@ impl Solve {
         })
     }
 
-    /// The one device-side guard. False in the error when `n` misses the slot.
+    fn base(&self, s: &Arc<CudaStream>) -> u64 {
+        self.buf.as_ref().map_or(0, |b| b.device_ptr(s).0)
+    }
+
+    pub fn field(&self, e: Ent, k: usize, s: &Arc<CudaStream>) -> u64 {
+        self.ent[e as usize].field(k, self.base(s))
+    }
+
+    pub fn caps(&self) -> [usize; 8] {
+        std::array::from_fn(|e| self.ent[e].cap)
+    }
+
+    pub fn lens(&self) -> [usize; 8] {
+        std::array::from_fn(|e| self.ent[e].len)
+    }
+
+    fn lay(&mut self, buf: CudaSlice<u32>, class: usize, caps: [usize; 8], lens: [usize; 8]) {
+        let mut off = 0;
+        for e in 0..8 {
+            self.ent[e] = Entity {
+                offset: off,
+                cap: caps[e].max(1),
+                nfields: FIELDS[e],
+                len: lens[e],
+            };
+            off += self.ent[e].cap * FIELDS[e];
+        }
+        debug_assert!(off * 4 <= CLASSES[class]);
+        self.class = class;
+        self.buf = Some(buf);
+    }
+
+    pub fn bind(&mut self, buf: CudaSlice<u32>, class: usize) {
+        self.lay(buf, class, slab::caps_for(CLASSES[class], &SHAPE), [0; 8]);
+    }
+
+    pub fn take_buf(&mut self) -> Option<(usize, CudaSlice<u32>)> {
+        self.buf.take().map(|b| (self.class, b))
+    }
+
+    /// Copy used prefixes into `new` and keep it. Returns the old slab.
+    pub fn relocate(
+        &mut self,
+        mut new: CudaSlice<u32>,
+        class: usize,
+        caps: [usize; 8],
+        s: &Arc<CudaStream>,
+    ) -> Res<CudaSlice<u32>> {
+        let old = self.buf.take().ok_or("relocate of an empty solve")?;
+        let lens = self.lens();
+        for e in 0..8 {
+            let n = lens[e];
+            if n == 0 {
+                continue;
+            }
+            let src_off = self.ent[e].offset;
+            let dst_off = {
+                let mut o = 0;
+                for i in 0..e {
+                    o += caps[i].max(1) * FIELDS[i];
+                }
+                o
+            };
+            let old_cap = self.ent[e].cap;
+            let new_cap = caps[e].max(1);
+            for k in 0..FIELDS[e] {
+                let a = src_off + k * old_cap;
+                let b = dst_off + k * new_cap;
+                let src = old.slice(a..a + n);
+                let mut dst = new.slice_mut(b..b + n);
+                s.memcpy_dtod(&src, &mut dst).map_err(err)?;
+            }
+        }
+        self.lay(new, class, caps, lens);
+        Ok(old)
+    }
+
+    /// Fit `lens`. Relocates when a cap is short. `Ok(false)` under pressure.
+    pub fn fit(
+        &mut self,
+        pool: &mut Pool,
+        lens: [usize; 8],
+        s: &Arc<CudaStream>,
+    ) -> Res<bool> {
+        for e in 0..8 {
+            if lens[e] > self.ent[e].cap {
+                let caps = slab::grow_caps(&self.caps(), &lens);
+                let Some(want) = slab::class_of(&caps) else {
+                    pool.stops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(false);
+                };
+                let Some((class, buf)) = pool.take(want, false) else {
+                    pool.stops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(false);
+                };
+                let grown = (0..8).find(|&e| lens[e] > self.ent[e].cap).unwrap_or(0);
+                pool.relocations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                pool.reloc_by[grown].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let old_class = self.class;
+                let old = self.relocate(buf, class, caps, s)?;
+                pool.put(old_class, old);
+                break;
+            }
+        }
+        for e in 0..8 {
+            self.ent[e].len = self.ent[e].len.max(lens[e]);
+        }
+        Ok(true)
+    }
+
+    /// The one device-side guard. False in the error when `n` misses the slab.
     pub fn reserve(&mut self, e: Ent, n: usize) -> Res<()> {
         let a = &mut self.ent[e as usize];
         if n > a.cap {
@@ -379,8 +446,24 @@ impl Solve {
         self.level_start.clear();
         self.ent[Ent::Node as usize].rewind();
         self.ent[Ent::Draw as usize].rewind();
-        self.ent[Ent::Cell as usize].zero(s)?;
-        self.ent[Ent::Reach as usize].zero(s)?;
+        self.zero_ent(Ent::Cell, s)?;
+        self.zero_ent(Ent::Reach, s)?;
+        Ok(())
+    }
+
+    fn zero_ent(&mut self, e: Ent, s: &Arc<CudaStream>) -> Res<()> {
+        let (off, n) = {
+            let a = &self.ent[e as usize];
+            (a.offset, a.cap * a.nfields)
+        };
+        if n == 0 {
+            return Ok(());
+        }
+        if let Some(buf) = self.buf.as_mut() {
+            let mut view = buf.slice_mut(off..off + n);
+            s.memset_zeros(&mut view).map_err(err)?;
+        }
+        self.ent[e as usize].len = 0;
         Ok(())
     }
 
@@ -395,7 +478,32 @@ impl Solve {
     }
 
     pub fn bytes(&self) -> usize {
-        self.census().iter().map(|&(_, b)| b).sum()
+        CLASSES.get(self.class).copied().unwrap_or(0) + self.seed.cap * 8
+    }
+
+    pub fn used_bytes(&self) -> usize {
+        slab::words(&self.lens()) * 4
+    }
+
+    fn copy_f32(
+        &mut self,
+        s: &Arc<CudaStream>,
+        e: Ent,
+        field: usize,
+        at: usize,
+        src: &CudaSlice<f32>,
+        from: usize,
+        n: usize,
+    ) -> Res<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let a = &self.ent[e as usize];
+        let off = a.offset + field * a.cap + at;
+        let dst = self.buf.as_mut().ok_or("copy into an empty solve")?;
+        let mut view = dst.slice_mut(off..off + n);
+        let mut fview = unsafe { view.transmute_mut::<f32>(n).expect("u32 and f32 are four bytes") };
+        s.memcpy_dtod(&src.slice(from..from + n), &mut fview).map_err(err)
     }
 
     pub fn copy_board(
@@ -408,9 +516,8 @@ impl Solve {
         n: usize,
     ) -> Res<()> {
         self.reserve(Ent::Board, at + n)?;
-        let e = &mut self.ent[Ent::Board as usize];
-        e.copy_f32(s, B_P, at * D, p, from * D, n * D)?;
-        e.copy_f32(s, B_JP, at * JW, jp, from * JW, n * JW)
+        self.copy_f32(s, Ent::Board, B_P, at * D, p, from * D, n * D)?;
+        self.copy_f32(s, Ent::Board, B_JP, at * JW, jp, from * JW, n * JW)
     }
 
     pub fn copy_cfg(
@@ -424,15 +531,14 @@ impl Solve {
         n: usize,
     ) -> Res<()> {
         self.reserve(Ent::Config, at + n)?;
-        let e = &mut self.ent[Ent::Config as usize];
-        e.copy_f32(s, G_F, at * D, f, from * D, n * D)?;
-        e.copy_f32(s, G_G, at * POOL, g, from * POOL, n * POOL)?;
-        e.copy_f32(s, G_FP, at * D, fp, from * D, n * D)
+        self.copy_f32(s, Ent::Config, G_F, at * D, f, from * D, n * D)?;
+        self.copy_f32(s, Ent::Config, G_G, at * POOL, g, from * POOL, n * POOL)?;
+        self.copy_f32(s, Ent::Config, G_FP, at * D, fp, from * D, n * D)
     }
 
     pub fn view(&mut self, s: &Arc<CudaStream>, e: Ent, field: usize, at: usize, n: usize, width: usize) -> Res<u64> {
         self.reserve(e, (at + n).div_ceil(width.max(1)))?;
-        Ok(self.ent[e as usize].field(field, s))
+        Ok(self.field(e, field, s))
     }
 
     pub fn plan(&mut self, s: &Arc<CudaStream>, d: Dst, at: usize, n: usize) -> Res<u64> {
@@ -449,19 +555,28 @@ impl Solve {
         n: usize,
         host: &mut Host<f32>,
     ) -> Res<Vec<f32>> {
-        self.ent[e as usize].get_f32(s, field, at, n, host)
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let a = &self.ent[e as usize];
+        let off = a.offset + field * a.cap + at;
+        let buf = self.buf.as_ref().ok_or("reading an arena that was never written")?;
+        let view = buf.slice(off..off + n);
+        let fview = unsafe { view.transmute::<f32>(n).expect("u32 and f32 are four bytes") };
+        host.recv(s, &fview)
     }
 
     pub fn describe(&self, s: &Arc<CudaStream>) -> [u64; DESC] {
         let mut out = [0u64; DESC];
         let mut acc = [0usize; 8];
         let mut i = 0;
+        let base = self.base(s);
         for c in &TABLE {
             let e = c.ent as usize;
             out[i] = if c.width == 0 {
-                self.ent[e].field(C_SUM, s)
+                self.ent[e].field(C_SUM, base)
             } else {
-                self.ent[e].field(acc[e], s)
+                self.ent[e].field(acc[e], base)
             };
             acc[e] += c.width;
             i += 1;
@@ -473,5 +588,63 @@ impl Solve {
         out[i + 4] = self.todo as u64;
         out[i + 5] = self.nexpand as u64;
         out
+    }
+}
+
+/// The card's size-class free lists. Carved once.
+pub struct Pool {
+    pub free: [Vec<CudaSlice<u32>>; 6],
+    pub total: [usize; 6],
+    pub relocations: std::sync::atomic::AtomicU64,
+    pub reloc_by: [std::sync::atomic::AtomicU64; 8],
+    pub stops: std::sync::atomic::AtomicU64,
+    pub finish: parking_lot::Mutex<Vec<u32>>,
+}
+
+impl Pool {
+    pub fn empty() -> Pool {
+        Pool {
+            free: std::array::from_fn(|_| Vec::new()),
+            total: [0; 6],
+            relocations: std::sync::atomic::AtomicU64::new(0),
+            reloc_by: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            stops: std::sync::atomic::AtomicU64::new(0),
+            finish: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn can_admit(&self) -> bool {
+        !self.free[0].is_empty() && !self.free[CLASSES.len() - 1].is_empty()
+    }
+
+    pub fn take(&mut self, want: usize, admit: bool) -> Option<(usize, CudaSlice<u32>)> {
+        if admit {
+            if !self.can_admit() {
+                return None;
+            }
+            return self.free[0].pop().map(|b| (0, b));
+        }
+        for c in want..CLASSES.len() {
+            if let Some(b) = self.free[c].pop() {
+                return Some((c, b));
+            }
+        }
+        None
+    }
+
+    pub fn put(&mut self, class: usize, buf: CudaSlice<u32>) {
+        self.free[class].push(buf);
+    }
+
+    pub fn occupancy(&self) -> [usize; 6] {
+        std::array::from_fn(|c| self.total[c].saturating_sub(self.free[c].len()))
+    }
+
+    pub fn note_finish(&self, bytes: usize) {
+        self.finish.lock().push(bytes as u32);
+    }
+
+    pub fn take_finish(&self) -> Vec<u32> {
+        std::mem::take(&mut *self.finish.lock())
     }
 }

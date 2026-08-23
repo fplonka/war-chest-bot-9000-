@@ -24,7 +24,7 @@ use warchest::bot::{Brain, Mind, Session};
 use warchest::farm::{Backend, Cards};
 use warchest::net::Net;
 use warchest::pbs::rules_table_hash;
-use warchest::search::{Budget, Cfg, Cfr, Nets};
+use warchest::search::{Cfg, Cfr, Nets};
 
 struct Options {
     name: String,
@@ -69,7 +69,7 @@ fn brain(o: &Options, cards: Option<Arc<Cards>>) -> Result<Brain, String> {
     Ok(Brain {
         mind,
         nets: Arc::new(nets),
-        cfg: Cfg { s: o.s, c: o.c, batch: o.batch, rounds: o.rounds, cfr, budget: Budget::for_s(o.s), ..Default::default() },
+        cfg: Cfg { s: o.s, c: o.c, batch: o.batch, rounds: o.rounds, cfr, ..Default::default() },
         cards,
     })
 }
@@ -215,7 +215,7 @@ fn devices(o: &Options) -> Option<Backend> {
         let n = warchest::cuda::Device::count();
         if n > 0 {
             let net = Net::load_bin(&o.weights).ok()?;
-            let cfg = Cfg { s: o.s, c: o.c, budget: Budget::for_s(o.s), ..Default::default() };
+            let cfg = Cfg { s: o.s, c: o.c, ..Default::default() };
             match warchest::cuda::Device::new(&(0..n).collect::<Vec<_>>(), net, cfg, usize::MAX) {
                 Ok(d) => return Some(Backend::Cuda(d)),
                 Err(e) => eprintln!("no device backend: {e}"),

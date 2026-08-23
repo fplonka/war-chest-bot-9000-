@@ -488,7 +488,7 @@ impl Game {
 
 use crate::net::Net;
 use crate::farm::{Backend, Farm, Work};
-use crate::search::{Budget, Cfg, Cfr, Ent, Nets};
+use crate::search::{Cfg, Cfr, Ent, Nets};
 use crate::selfplay::{run_games, Agent, Collect, Data, GameCfg};
 use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2};
 use parking_lot::RwLock;
@@ -665,7 +665,7 @@ impl SolveFarm {
         devices: Vec<usize>,
         roots: Option<&str>,
     ) -> PyResult<SolveFarm> {
-        let cfg = Cfg { s, c, batch, rounds, cfr: cfr_of(cfr)?, budget: Budget::for_s(s), ..Default::default() };
+        let cfg = Cfg { s, c, batch, rounds, cfr: cfr_of(cfr)?, ..Default::default() };
         // A corpus makes this a bench rather than a run: the same roots in the
         // same order, so the mix of solve costs in flight does not drift.
         let work = match roots {
@@ -744,6 +744,12 @@ impl SolveFarm {
         dict.set_item("slot_bytes", s.slot_bytes())?;
         dict.set_item("budget_hits", s.budget_hits())?;
         dict.set_item("entity_hits", s.entity_hits())?;
+        dict.set_item("relocations", self.farm.relocations())?;
+        dict.set_item("reloc_by", self.farm.reloc_by())?;
+        dict.set_item("stops", self.farm.stops())?;
+        dict.set_item("slabs_used", self.farm.occupancy())?;
+        dict.set_item("slabs", self.farm.slab_counts())?;
+        dict.set_item("finish_bytes", self.farm.take_finish())?;
         dict.set_item("shapes", s.take_shapes())?;
         Ok(out)
     }
@@ -758,7 +764,7 @@ fn backend_for(
 ) -> PyResult<Backend> {
     #[cfg(feature = "gpu")]
     {
-        let max_slots = crate::farm::host_slots(cfg.budget);
+        let max_slots = crate::farm::host_slots();
         return crate::cuda::Device::new(_devices, _value, cfg, max_slots)
             .map(Backend::Cuda)
             .map_err(pyo3::exceptions::PyRuntimeError::new_err);
@@ -784,7 +790,7 @@ fn gen_data(
     p_td1: f32,
     cfr: &str,
 ) -> PyResult<PyObject> {
-    let cfg = Cfg { s, c, cfr: cfr_of(cfr)?, budget: Budget::for_s(s), ..Default::default() };
+    let cfg = Cfg { s, c, cfr: cfr_of(cfr)?, ..Default::default() };
     let agent = Agent::Sog { cfg };
     let gc = GameCfg {
         agents: [agent, agent],
@@ -830,7 +836,7 @@ fn save_roots(
     query_rate: f32,
     recursive_rate: f32,
 ) -> PyResult<usize> {
-    let cfg = Cfg { s, c, budget: Budget::for_s(s), ..Default::default() };
+    let cfg = Cfg { s, c, ..Default::default() };
     let gc = GameCfg {
         agents: [Agent::Sog { cfg }; 2],
         collect: Collect::Sog,
@@ -961,14 +967,8 @@ fn solve_census() -> Vec<(String, usize)> {
 }
 
 #[pyfunction]
-fn budget_for_s(s: u32) -> [usize; 8] {
-    let b = Budget::for_s(s);
-    Ent::ALL.map(|e| b.cap(e))
-}
-
-#[pyfunction]
-fn host_slot_bytes(s: u32) -> usize {
-    Budget::for_s(s).host_slot_bytes()
+fn slab_shape() -> [usize; 8] {
+    crate::slab::SHAPE
 }
 
 /// All 37 hexes' axial coords, indexed by hex. The browser UI's board
@@ -1195,7 +1195,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(stage_names, m)?)?;
         m.add_function(wrap_pyfunction!(solve_census, m)?)?;
     m.add("ENT_NAMES", Ent::NAME.iter().copied().collect::<Vec<&str>>())?;
-    m.add_function(wrap_pyfunction!(budget_for_s, m)?)?;
-    m.add_function(wrap_pyfunction!(host_slot_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(slab_shape, m)?)?;
     Ok(())
 }

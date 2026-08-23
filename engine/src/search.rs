@@ -58,9 +58,8 @@ use std::sync::Arc;
 /// points of the same stream ever after.
 pub const TRIES: usize = 4;
 
-/// One of the eight things a solve grows. A slot is eight allocations, one
-/// per entity, each `cap × nfields × 4` bytes. Host and device both ask
-/// `Budget::reserve` before an append.
+/// One of the eight things a solve grows. Host and device both ask
+/// `Solver::reserve` before an append.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Ent {
@@ -92,126 +91,6 @@ impl Ent {
         Self::NAME[self as usize]
     }
 }
-
-/// What one solve may hold, in the eight entities it owns.
-///
-/// A slot is allocated once at this size and reused by every solve that ever
-/// runs in it, so this is a *bound* and not a forecast. An expansion that
-/// would take the solve past any of these is abandoned exactly as one that
-/// runs away past `EXPANSION_CAP` is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Budget {
-    pub nodes: usize,
-    pub rows: usize,
-    pub boards: usize,
-    pub configs: usize,
-    pub cidx: usize,
-    pub reach: usize,
-    pub cells: usize,
-    pub draws: usize,
-}
-
-impl Budget {
-    /// The budget for a solve of `s` expansions.
-    ///
-    /// `s` counts distinct expansions and an expansion adds a bounded piece of
-    /// tree, so every term is linear in it. `BUDGET_512` is measured; this is
-    /// that one proportion, and it is the only arithmetic in the design.
-    pub fn for_s(s: u32) -> Budget {
-        let k = |at512: usize| (at512 * s as usize / 512).max(1);
-        Budget {
-            nodes: k(BUDGET_512.nodes),
-            rows: k(BUDGET_512.rows),
-            boards: k(BUDGET_512.boards),
-            configs: k(BUDGET_512.configs),
-            cidx: k(BUDGET_512.cidx),
-            reach: k(BUDGET_512.reach),
-            cells: k(BUDGET_512.cells),
-            draws: k(BUDGET_512.draws),
-        }
-    }
-}
-
-impl Default for Budget {
-    fn default() -> Budget {
-        Budget::for_s(512)
-    }
-}
-
-impl Budget {
-    /// No budget at all.
-    ///
-    /// `Solver::grow_full` builds a whole subgame for the CPU oracle to compare
-    /// against, and a bound on that is a bound on the reference. Nothing a run
-    /// uses takes this: it is the tests' way of saying they want the whole
-    /// game, and saying it out loud rather than through a second growth path.
-    pub fn unbounded() -> Budget {
-        Budget {
-            nodes: usize::MAX,
-            rows: usize::MAX,
-            boards: usize::MAX,
-            configs: usize::MAX,
-            cidx: usize::MAX,
-            reach: usize::MAX,
-            cells: usize::MAX,
-            draws: usize::MAX,
-        }
-    }
-}
-
-impl Budget {
-    pub fn cap(&self, e: Ent) -> usize {
-        match e {
-            Ent::Node => self.nodes,
-            Ent::Cell => self.cells,
-            Ent::Reach => self.reach,
-            Ent::Draw => self.draws,
-            Ent::Row => self.rows,
-            Ent::Board => self.boards,
-            Ent::Config => self.configs,
-            Ent::Cidx => self.cidx,
-        }
-    }
-
-    /// The one guard. False when `n` does not fit this entity.
-    pub fn reserve(&self, e: Ent, n: usize) -> bool {
-        n <= self.cap(e)
-    }
-
-    /// Host bytes a device-resident solve holds at this budget, from the Vec
-    /// capacities it would reserve. The card keeps the CFR arenas.
-    pub fn host_slot_bytes(&self) -> usize {
-        fn cap<T>(n: usize) -> usize {
-            Vec::<T>::with_capacity(n).capacity() * std::mem::size_of::<T>()
-        }
-        cap::<TNode>(self.nodes)
-            + cap::<crate::state::State>(self.nodes)
-            + cap::<u32>(self.nodes) * 8
-            + cap::<u32>(self.cidx)
-            + cap::<u32>(self.rows) * 4
-            + cap::<f32>(self.cells)
-            + cap::<u32>(self.cells) * 6
-            + cap::<u32>(self.reach)
-            + cap::<u32>(self.draws) * 3
-            + cap::<f32>(self.boards * crate::pbs::PUBFEAT) * 2
-            + cap::<f32>(self.configs * crate::pbs::CFEAT)
-            + cap::<f32>(self.rows * crate::net::D)
-            + cap::<f32>(self.configs * crate::net::D)
-    }
-}
-
-/// The shape a solve at `SoG(512, 8)` is allowed: p90 of each entity count
-/// over finished solves in `runs/unc5` (epochs after t=60, max of those p90s).
-const BUDGET_512: Budget = Budget {
-    nodes: 20_022,
-    rows: 13_116,
-    boards: 9_036,
-    configs: 2_914,
-    cidx: 512_130,
-    reach: 595_774,
-    cells: 201_815,
-    draws: 307_605,
-};
 
 #[derive(Clone, Copy)]
 pub struct Cfg {
@@ -288,9 +167,6 @@ pub struct Cfg {
     /// Games notes "can decrease weight of the prior in some games and
     /// encourage more exploration in the search phase".
     pub prior_temp: f32,
-    /// What one solve may hold, and so how large a slot is. Admission is a free
-    /// list because of this and nothing else.
-    pub budget: Budget,
 }
 
 impl Default for Cfg {
@@ -304,7 +180,6 @@ impl Default for Cfg {
             cfr: Cfr::SOG,
             puct: 1.5,
             prior_temp: 1.0,
-            budget: Budget::for_s(512),
         }
     }
 }
@@ -1256,13 +1131,11 @@ pub struct Solver {
     /// path there is no `Vec` to read them off.
     pub nreach: usize,
     pub nvals: usize,
-    /// Draw-transition entries over the whole tree, which the budget bounds and
-    /// the device's `draw_to` / `draw_p` / `rvd_src` / `rvd_p` are sized by.
+    /// Draw-transition entries over the whole tree, which the largest slab
+    /// bounds and the device's `draw_to` / `draw_p` / `rvd_src` / `rvd_p` are sized by.
     pub ndraws: usize,
     /// Which entities this solve ran out of, bit `1 << Ent`. The run counts
-    /// them. A budget is a percentile of a measured shape, and the count is
-    /// the only thing that can argue with the percentile chosen: it says how
-    /// often the tail is being truncated, and which term is doing it.
+    /// them as stops under memory pressure.
     budget_hit: u8,
     pub(crate) roff: Vec<u32>,
     pub(crate) voff: Vec<u32>,
@@ -1526,10 +1399,8 @@ impl Solver {
         {
             let _t = timed!(BUILD);
             // The root is born a leaf like every other node; `expand` grows it.
-            // The budget applies: a first expansion that would not fit the slot
-            // is abandoned, and the root stays a leaf. That is rare at this
-            // budget; a root that stayed a leaf has no strategy, and the farm
-            // still holds a tree that fits.
+            // A first expansion that would not fit the largest slab is
+            // abandoned, and the root stays a leaf.
             sv.nodes.reserve(640);
             sv.cur.reserve(640);
             if let Some(h) = &mut sv.host {
@@ -1792,7 +1663,7 @@ impl Solver {
         self.abandon
     }
 
-    /// Whether this solve ever ran out of budget. See `Solver::budget_hit`.
+    /// Whether this solve ever ran out of slab. See `Solver::budget_hit`.
     pub fn budget_hit(&self) -> bool {
         self.budget_hit != 0
     }
@@ -1822,14 +1693,21 @@ impl Solver {
     }
 
     /// Ensure this entity can hold `n` items. The one host-side guard.
+    ///
+    /// On the CPU path the Vecs just grow. On the device path a solve stops
+    /// when the grown layout no longer fits the largest class, or when this
+    /// solve's host bytes pass half a gigabyte.
     fn reserve(&mut self, e: Ent, n: usize) -> bool {
-        if !self.cfg.budget.reserve(e, n) {
-            self.abandon = true;
-            self.budget_hit |= 1 << (e as u8);
-            false
-        } else {
-            true
+        if self.nets.device {
+            let mut lens = Ent::ALL.map(|x| self.used(x));
+            lens[e as usize] = n;
+            if !crate::slab::fits(&lens) {
+                self.abandon = true;
+                self.budget_hit |= 1 << (e as u8);
+                return false;
+            }
         }
+        true
     }
 
     /// Where every append-only arena stands.

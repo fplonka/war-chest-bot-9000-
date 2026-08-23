@@ -13,9 +13,9 @@
 //! core, does the host side. Neither waits for the other, which is what lets
 //! one solve's growth overlap another's device work.
 //!
-//! How many solves are in flight is the number of slots. A slot is allocated
-//! once at the budget; admission is a pop from a free list, and a solve that
-//! would exceed the budget is truncated rather than grown.
+//! How many solves are in flight is the number of slabs in use. A new solve
+//! takes the smallest class; growth relocates. A solve stops only when no
+//! slab is big enough.
 
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use crate::net::Net;
 use crate::pbs::Belief;
-use crate::search::{Budget, Cfg, Cfr, Solved, Solver, Step};
+use crate::search::{Cfg, Cfr, Solved, Solver, Step};
 use crate::selfplay::{Data, GameCfg, GameStream};
 use crate::state::State;
 use rayon::prelude::*;
@@ -412,6 +412,69 @@ impl Backend {
         }
     }
 
+    #[cfg(feature = "gpu")]
+    pub fn admit(&self, gpu: usize) -> Option<usize> {
+        match self {
+            Backend::Reference(_) => None,
+            Backend::Cuda(d) => d.admit(gpu),
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn release(&self, gpu: usize, slot: usize) {
+        if let Backend::Cuda(d) = self {
+            d.release(gpu, slot);
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn relocations(&self) -> u64 {
+        match self {
+            Backend::Reference(_) => 0,
+            Backend::Cuda(d) => d.relocations(),
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn reloc_by(&self) -> [u64; 8] {
+        match self {
+            Backend::Reference(_) => [0; 8],
+            Backend::Cuda(d) => d.reloc_by(),
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn stops(&self) -> u64 {
+        match self {
+            Backend::Reference(_) => 0,
+            Backend::Cuda(d) => d.stops(),
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn occupancy(&self, gpu: usize) -> [usize; 6] {
+        match self {
+            Backend::Reference(_) => [0; 6],
+            Backend::Cuda(d) => d.occupancy(gpu),
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn take_finish(&self) -> Vec<u32> {
+        match self {
+            Backend::Reference(_) => Vec::new(),
+            Backend::Cuda(d) => d.take_finish(),
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn slab_counts(&self, gpu: usize) -> [usize; 6] {
+        match self {
+            Backend::Reference(_) => [0; 6],
+            Backend::Cuda(d) => d.counts(gpu),
+        }
+    }
+
     /// Whether this backend runs the CFR loop itself rather than answering
     /// network calls alone.
     pub fn keeps_the_solve(&self) -> bool {
@@ -448,14 +511,12 @@ impl Backend {
 }
 
 
-/// Host-side slots that fit in the memory the process does not already hold.
+/// Host-side live solves that fit in the memory the process does not already hold.
 ///
-/// A slot is `Budget::host_slot_bytes`. The farm never admits more than this, and
-/// the card never carves more than this, so host OOM is not a thing that can
-/// happen at admission.
-pub fn host_slots(budget: Budget) -> usize {
-    let slot = budget.host_slot_bytes() as u64;
-    (host_free() / slot.max(1)) as usize
+/// A live solve is allowed 64 MiB of host heap. The farm never admits more than
+/// this, and the card never carves more than this.
+pub fn host_slots() -> usize {
+    (host_free() / (64u64 << 20).max(1)) as usize
 }
 
 /// Bytes the farm may still hold in solves.
@@ -686,10 +747,9 @@ pub struct Stats {
     /// Slots this farm holds, and how many currently have a solve.
     slots: AtomicU64,
     used: AtomicU64,
-    /// Solves that hit the budget. A slot is a percentile; this is the rate
-    /// that argues with it.
+    /// Solves that stopped under memory pressure.
     budget_hits: AtomicU64,
-    /// Solves that hit each entity's cap, in `Ent::ALL` order.
+    /// Relocations per entity, in `Ent::ALL` order.
     entity_hits: [AtomicU64; 8],
     slot_bytes: AtomicU64,
     slots_per_card: AtomicU64,
@@ -738,8 +798,7 @@ impl Stats {
 
 impl Farm {
     /// Start `workers` host threads and two drivers per GPU, with one job per
-    /// slot. A slot is allocated at the budget; there is nothing to admit
-    /// against after that.
+    /// admitted slab.
     pub fn new(seed: u64, workers: usize, work: Work, backend: Backend) -> Farm {
         assert!(workers > 0, "a farm needs at least one worker");
         let gpus = backend.cards();
@@ -767,7 +826,7 @@ impl Farm {
 
         let hands: Vec<JoinHandle<()>> = (0..workers)
             .map(|t| {
-                let (ready, device, nets, collected, work, stopping, stats) = (
+                let (ready, device, nets, collected, work, stopping, stats, backend) = (
                     Arc::clone(&ready),
                     device.clone(),
                     Arc::clone(&nets),
@@ -775,13 +834,14 @@ impl Farm {
                     Arc::clone(&work),
                     Arc::clone(&stopping),
                     Arc::clone(&stats),
+                    Arc::clone(&backend),
                 );
                 std::thread::Builder::new()
                     .name(format!("host-{t}"))
                     .spawn(move || {
                         while let Some(job) = ready.pop() {
                             advance_job(
-                                job, &device, &nets, &work, &collected, &stopping, &stats,
+                                job, &device, &nets, &work, &collected, &stopping, &stats, &backend,
                             );
                         }
                     })
@@ -875,6 +935,76 @@ impl Farm {
         &self.stats
     }
 
+    pub fn relocations(&self) -> u64 {
+        #[cfg(feature = "gpu")]
+        {
+            return self.backend.read().relocations();
+        }
+        #[cfg(not(feature = "gpu"))]
+        0
+    }
+
+    pub fn reloc_by(&self) -> [u64; 8] {
+        #[cfg(feature = "gpu")]
+        {
+            return self.backend.read().reloc_by();
+        }
+        #[cfg(not(feature = "gpu"))]
+        [0; 8]
+    }
+
+    pub fn stops(&self) -> u64 {
+        #[cfg(feature = "gpu")]
+        {
+            return self.backend.read().stops();
+        }
+        #[cfg(not(feature = "gpu"))]
+        0
+    }
+
+    pub fn occupancy(&self) -> [usize; 6] {
+        #[cfg(feature = "gpu")]
+        {
+            let b = self.backend.read();
+            let mut out = [0; 6];
+            for g in 0..b.cards() {
+                let o = b.occupancy(g);
+                for i in 0..6 {
+                    out[i] += o[i];
+                }
+            }
+            return out;
+        }
+        #[cfg(not(feature = "gpu"))]
+        [0; 6]
+    }
+
+    pub fn slab_counts(&self) -> [usize; 6] {
+        #[cfg(feature = "gpu")]
+        {
+            let b = self.backend.read();
+            let mut out = [0; 6];
+            for g in 0..b.cards() {
+                let o = b.slab_counts(g);
+                for i in 0..6 {
+                    out[i] += o[i];
+                }
+            }
+            return out;
+        }
+        #[cfg(not(feature = "gpu"))]
+        [0; 6]
+    }
+
+    pub fn take_finish(&self) -> Vec<u32> {
+        #[cfg(feature = "gpu")]
+        {
+            return self.backend.read().take_finish();
+        }
+        #[cfg(not(feature = "gpu"))]
+        Vec::new()
+    }
+
     /// The network the farm evaluates with.
     pub fn value(&self) -> Arc<crate::search::Nets> {
         Arc::clone(&*self.nets.read())
@@ -914,6 +1044,7 @@ fn advance_job(
     collected: &Mutex<Vec<Data>>,
     stopping: &AtomicBool,
     stats: &Stats,
+    #[allow(unused)] backend: &RwLock<Backend>,
 ) {
     let mut replies = std::mem::take(&mut job.replies);
     loop {
@@ -934,9 +1065,22 @@ fn advance_job(
                 collected.lock().push(std::mem::take(&mut job.data));
                 if stopping.load(Ordering::Relaxed) {
                     stats.used.fetch_sub(1, Ordering::Relaxed);
+                    #[cfg(feature = "gpu")]
+                    backend.read().release(job.card, job.slot);
                     return;
                 }
                 let n = Arc::clone(&*nets.read());
+                #[cfg(feature = "gpu")]
+                {
+                    if backend.read().keeps_the_solve() {
+                        backend.read().release(job.card, job.slot);
+                        let Some(slot) = backend.read().admit(job.card) else {
+                            stats.used.fetch_sub(1, Ordering::Relaxed);
+                            return;
+                        };
+                        job.slot = slot;
+                    }
+                }
                 job.solver = job.source.next(work, &n, &mut job.data);
                 job.solver.pin(job.slot);
                 replies = Vec::new();
@@ -963,22 +1107,48 @@ fn drive_card(
     stats: &Stats,
     broken: &AtomicBool,
 ) {
+    let cuda = backend.read().keeps_the_solve();
     if seed_slots {
-        for slot in 0..n_slots {
-            if ready.closed() {
-                break;
+        if cuda {
+            #[cfg(feature = "gpu")]
+            {
+                loop {
+                    if ready.closed() {
+                        break;
+                    }
+                    let Some(slot) = backend.read().admit(gpu) else {
+                        break;
+                    };
+                    stats.used.fetch_add(1, Ordering::Relaxed);
+                    let mut source = Source::new(
+                        work,
+                        seed ^ (slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                        slot * gpus + gpu,
+                    );
+                    let mut data = Data::default();
+                    let n = Arc::clone(&*nets.read());
+                    let mut solver = source.next(work, &n, &mut data);
+                    solver.pin(slot);
+                    ready.push(Job { source, solver, card: gpu, slot, replies: Vec::new(), data });
+                }
             }
-            stats.used.fetch_add(1, Ordering::Relaxed);
-            let mut source = Source::new(
-                work,
-                seed ^ (slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-                slot * gpus + gpu,
-            );
-            let mut data = Data::default();
-            let n = Arc::clone(&*nets.read());
-            let mut solver = source.next(work, &n, &mut data);
-            solver.pin(slot);
-            ready.push(Job { source, solver, card: gpu, slot, replies: Vec::new(), data });
+        } else {
+            for slot in 0..n_slots {
+                if ready.closed() {
+                    break;
+                }
+                stats.used.fetch_add(1, Ordering::Relaxed);
+                let mut source = Source::new(
+                    work,
+                    seed ^ (slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                    slot * gpus + gpu,
+                );
+                let mut data = Data::default();
+                let n = Arc::clone(&*nets.read());
+                let mut solver = source.next(work, &n, &mut data);
+                solver.pin(slot);
+                ready.push(Job { source, solver, card: gpu, slot, replies: Vec::new(), data });
+            }
         }
     }
     loop {
@@ -1013,6 +1183,26 @@ fn drive_card(
             rest = tail;
             ready.push(job);
         }
+        #[cfg(feature = "gpu")]
+        if cuda && seed_slots {
+            while let Some(slot) = backend.read().admit(gpu) {
+                if ready.closed() {
+                    backend.read().release(gpu, slot);
+                    break;
+                }
+                stats.used.fetch_add(1, Ordering::Relaxed);
+                let mut source = Source::new(
+                    work,
+                    seed ^ (slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                    slot * gpus + gpu,
+                );
+                let mut data = Data::default();
+                let n = Arc::clone(&*nets.read());
+                let mut solver = source.next(work, &n, &mut data);
+                solver.pin(slot);
+                ready.push(Job { source, solver, card: gpu, slot, replies: Vec::new(), data });
+            }
+        }
     }
 }
 
@@ -1029,9 +1219,11 @@ fn drive_card(
 /// thread that was ready at the same moment.
 pub struct Cards {
     queues: Vec<Arc<Queue<Ask>>>,
-    /// Seats nobody is sitting in. A card keeps a solve's arenas while it runs,
-    /// so two solves must never share a slot.
-    seats: Mutex<Vec<(usize, usize)>>,
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    backend: Arc<Backend>,
+    /// Waiters for a free slab.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    seats: Mutex<()>,
     free: Condvar,
     drivers: Vec<JoinHandle<()>>,
 }
@@ -1052,7 +1244,8 @@ pub struct Seat<'a> {
 
 impl Drop for Seat<'_> {
     fn drop(&mut self) {
-        self.cards.seats.lock().push((self.card, self.slot));
+        #[cfg(feature = "gpu")]
+        self.cards.backend.release(self.card, self.slot);
         self.cards.free.notify_one();
     }
 }
@@ -1084,8 +1277,6 @@ impl Cards {
                                 calls.extend(ask.calls);
                                 backs.push(ask.back);
                             }
-                            // A card that cannot answer takes its solves with it.
-                            // Dropping the senders is what tells them.
                             let Some(replies) = backend.run(&calls, lane) else {
                                 return;
                             };
@@ -1100,24 +1291,30 @@ impl Cards {
                 );
             }
         }
-        let mut free = Vec::new();
-        for g in 0..n {
-            for s in 0..backend.slots(g) {
-                free.push((g, s));
-            }
+        Cards {
+            queues,
+            backend,
+            seats: Mutex::new(()),
+            free: Condvar::new(),
+            drivers,
         }
-        Cards { queues, seats: Mutex::new(free), free: Condvar::new(), drivers }
     }
 
     /// Take a card and one of its solve slots for the length of one solve.
     pub fn seat(&self) -> Seat<'_> {
-        let mut seats = self.seats.lock();
-        loop {
-            if let Some((card, slot)) = seats.pop() {
-                return Seat { cards: self, card, slot };
+        #[cfg(feature = "gpu")]
+        if self.backend.keeps_the_solve() {
+            let mut wait = self.seats.lock();
+            loop {
+                for card in 0..self.backend.cards() {
+                    if let Some(slot) = self.backend.admit(card) {
+                        return Seat { cards: self, card, slot };
+                    }
+                }
+                self.free.wait(&mut wait);
             }
-            self.free.wait(&mut seats);
         }
+        Seat { cards: self, card: 0, slot: 0 }
     }
 
     /// Run these calls in the next round of `card`, and wait for them.

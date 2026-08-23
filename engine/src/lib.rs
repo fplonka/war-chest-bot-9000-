@@ -23,6 +23,7 @@ pub mod rng;
 pub mod roots;
 pub mod rules;
 pub mod search;
+pub mod slab;
 pub mod selfplay;
 pub mod state;
 pub mod units;

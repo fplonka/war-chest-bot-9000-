@@ -42,10 +42,11 @@ use crate::net::{
 use crate::pbs::{
     CFEAT, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_LOOSE, OFF_PILES, PILE_COUNTS, PUBFEAT,
 };
-use crate::search::{Budget, Cfg, Cfr, Ent};
+use crate::search::{Cfg, Cfr, Ent};
+use crate::slab::{CLASSES, PEAK};
 
 mod slot;
-use slot::{Arr, Solve, DESC, FIELDS, C_CUR, C_PRIOR, C_QVAL, C_SUM, C_VISITS, R_REACH, R_VALS, B_P, B_JP, G_F, G_G, G_FP, Y_BOARD_OF, Y_COFF};
+use slot::{Arr, Pool, Solve, DESC, FIELDS, C_CUR, C_PRIOR, C_QVAL, C_SUM, C_VISITS, R_REACH, R_VALS, B_P, B_JP, G_F, G_G, G_FP, Y_BOARD_OF, Y_COFF};
 
 type Res<T> = Result<T, String>;
 
@@ -388,23 +389,20 @@ struct RoundCap {
 }
 
 impl RoundCap {
-    fn of(n: usize, b: &Budget, s: u32) -> RoundCap {
+    fn of(n: usize, s: u32) -> RoundCap {
+        let (nodes, cells, _reach, _draws, rows, _boards, configs, cidx) = (
+            PEAK[0], PEAK[1], PEAK[2], PEAK[3], PEAK[4], PEAK[5], PEAK[6], PEAK[7],
+        );
         let cards = n * CARD_ROWS * NTYPE * TYPE;
         // Host-packed tree columns (not board `p`/`jp` or config `f`/`g`/`fp`,
         // which stay on the card), plus the trunk's extra copies of board_of,
-        // cidx and coff on the same scatter.
-        let packed = FIELDS[0] * b.nodes
-            + FIELDS[1] * b.cells
-            + FIELDS[2] * b.reach
-            + FIELDS[3] * b.draws
-            + FIELDS[4] * b.rows
-            + 2 * b.configs
-            + b.cidx;
-        let trunk = b.rows + b.cidx + 2 * b.rows + 1;
-        let blob = n * (packed + trunk);
+        // cidx and coff on the same scatter. A round sends growth, not the
+        // whole tree; four megabytes a solve is plenty and is what lets the
+        // slab table fill the card.
+        let blob = n * (1 << 20);
         RoundCap {
-            w: n * b.cidx,
-            mass: 2 * n * b.rows,
+            w: n * cidx,
+            mass: 2 * n * rows,
             pooled: 2 * TILE * POOL,
             h: 2 * TILE * D,
             z: 2 * TILE * JW,
@@ -433,12 +431,12 @@ impl RoundCap {
             dst: TILE,
             start: TILE + 1,
             trees: n * DESC,
-            work: n * b.nodes,
-            coff: n * (2 * b.rows + 1),
-            part: n * b.rows,
-            local: n * b.rows,
+            work: n * nodes,
+            coff: n * (2 * rows + 1),
+            part: n * rows,
+            local: n * rows,
             base: n,
-            prime: 12 * TILE + n * b.cells,
+            prime: 12 * TILE + n * cells,
             touched: n,
         }
     }
@@ -483,8 +481,8 @@ impl RoundCap {
     }
 }
 
-fn round_bytes(n_slots: usize, b: &Budget, s: u32) -> usize {
-    RoundCap::of(n_slots, b, s).bytes()
+fn round_bytes(n_slots: usize, s: u32) -> usize {
+    RoundCap::of(n_slots, s).bytes()
 }
 
 /// Fill a staging buffer with exactly `src`.
@@ -742,9 +740,10 @@ struct Card {
     stream: Arc<CudaStream>,
     blas: CudaBlas,
     k: Arc<Kernels>,
-    /// Indexed by solve, which is the slot the farm pinned it to. Shared by
-    /// both cards of a GPU.
+    /// Indexed by solve. Shared by both cards of a GPU.
     solves: Arc<parking_lot::Mutex<Vec<Solve>>>,
+    pool: Arc<parking_lot::Mutex<Pool>>,
+    idle: Arc<parking_lot::Mutex<Vec<usize>>>,
     /// Host staging for a round's batches, kept between rounds for the same
     /// reason the device scratch is: a round concatenates sixteen megabytes of
     /// public encodings, and building that from an empty `Vec` every time is
@@ -795,11 +794,10 @@ struct Card {
 }
 
 impl Device {
-    /// Bring up one card per ordinal, carve each into slots at `cfg.budget`.
+    /// Bring up one card per ordinal. Remaining memory after weights and round
+    /// scratch is carved into size-class slabs.
     ///
-    /// `max_slots` is the host's cap across every ordinal: the farm has already
-    /// asked how many host-side arenas fit, and a card that carved more than
-    /// that would sit empty.
+    /// `max_slots` is the host's cap across every ordinal.
     pub fn new(ordinals: &[usize], net: Net, cfg: Cfg, max_slots: usize) -> Res<Device> {
         if ordinals.is_empty() {
             return Err("no cuda device ordinals given".into());
@@ -807,10 +805,9 @@ impl Device {
         if net.is_empty() {
             return Err("cannot start the device backend without weights".into());
         }
-        let budget = cfg.budget;
         let mut cards = Vec::with_capacity(ordinals.len() * PIPELINE);
         let mut left = max_slots;
-        let mut slot_bytes = 0usize;
+        let mut slot_bytes = CLASSES[0];
         for (g, &o) in ordinals.iter().enumerate() {
             let gpu = Gpu::new(o, &net)?;
             gpu.ctx.bind_to_thread().map_err(err)?;
@@ -819,44 +816,51 @@ impl Device {
                 .collect::<Res<_>>()?;
             let s0 = &pair[0].stream;
             s0.context().bind_to_thread().map_err(err)?;
-            let free0 = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
-            let probe = Solve::at_budget(s0, &budget)?;
-            s0.synchronize().map_err(err)?;
-            let measured = free0.saturating_sub(cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64);
-            let slot = measured.max(probe.bytes() as u64);
-            drop(probe);
-            s0.synchronize().map_err(err)?;
-            if g == 0 {
-                slot_bytes = slot as usize;
-            }
             let free = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
-            let tile = round_bytes(0, &budget, cfg.s) as u64;
-            let extra = (round_bytes(1, &budget, cfg.s) as u64).saturating_sub(tile);
-            let per = slot + PIPELINE as u64 * extra;
+            let tile = round_bytes(0, cfg.s) as u64;
+            let extra = (round_bytes(1, cfg.s) as u64).saturating_sub(tile);
             let usable = free.saturating_sub(PIPELINE as u64 * tile);
-            // Slot cost is the allocation delta. Carve is many buffers; packing
-            // free to the last byte OOMs, so a tenth stays for fragmentation.
-            let fit = (usable - usable / 10) / per.max(1);
+            let usable = usable - usable / 10;
+            let counts = crate::slab::mix(usable, extra, PIPELINE);
+            let n_slabs: usize = counts.iter().sum();
             let gpus_left = ordinals.len() - g;
-            let n = (fit as usize).min(left / gpus_left.max(1));
+            let n = n_slabs.saturating_sub(1).min(left / gpus_left.max(1));
             if g == 0 && n == 0 {
-                return Err(format!(
-                    "a slot of {slot} bytes does not fit in {free} bytes free"
-                ));
+                return Err(format!("a slab table does not fit in {free} bytes free"));
             }
             left = left.saturating_sub(n);
+            let mut pool = Pool::empty();
+            pool.total = counts;
+            for c in 0..CLASSES.len() {
+                for _ in 0..counts[c] {
+                    let words = (CLASSES[c] / 4).max(1);
+                    let mut buf = unsafe { s0.alloc::<u32>(words) }.map_err(err)?;
+                    s0.memset_zeros(&mut buf).map_err(err)?;
+                    HELD.fetch_add((words * 4) as u64, std::sync::atomic::Ordering::Relaxed);
+                    pool.free[c].push(buf);
+                }
+            }
             let mut solves = Vec::with_capacity(n);
             for _ in 0..n {
-                solves.push(Solve::at_budget(s0, &budget)?);
+                solves.push(Solve::empty(s0)?);
             }
-            if let Some(s) = solves.first() {
-                *CENSUS.lock() = s.census();
-            }
+            *CENSUS.lock() = Ent::ALL
+                .iter()
+                .map(|&e| {
+                    let cap = crate::slab::caps_for(CLASSES[0], &crate::slab::SHAPE)[e as usize];
+                    (e.name(), cap * FIELDS[e as usize] * 4)
+                })
+                .collect();
+            let idle: Vec<usize> = (0..n).rev().collect();
             let solves = Arc::new(parking_lot::Mutex::new(solves));
+            let pool = Arc::new(parking_lot::Mutex::new(pool));
+            let idle = Arc::new(parking_lot::Mutex::new(idle));
             for (p, card) in pair.iter_mut().enumerate() {
                 card.solves = Arc::clone(&solves);
+                card.pool = Arc::clone(&pool);
+                card.idle = Arc::clone(&idle);
                 card.carve(n, &cfg).map_err(|e| {
-                    format!("carve gpu {g} pipe {p} n={n} slot={slot} free={free}: {e}")
+                    format!("carve gpu {g} pipe {p} n={n} free={free}: {e}")
                 })?;
                 card.stream.synchronize().map_err(err)?;
             }
@@ -880,7 +884,7 @@ impl Device {
         (0..self.n_gpus).map(|g| self.slots(g)).sum()
     }
 
-    /// Bytes one solve slot holds, summed from the arrays allocated at the budget.
+    /// Bytes of the smallest class, which is what a new solve takes.
     pub fn slot_bytes(&self) -> usize {
         self.slot_bytes
     }
@@ -892,6 +896,112 @@ impl Device {
         } else {
             self.total_slots() / self.n_gpus
         }
+    }
+
+    /// Take a smallest-class slab if the largest class still has a reserve.
+    pub fn admit(&self, gpu: usize) -> Option<usize> {
+        let c = &self.cards[gpu * PIPELINE];
+        let mut pool = c.pool.lock();
+        let mut idle = c.idle.lock();
+        let mut solves = c.solves.lock();
+        let slot = idle.pop()?;
+        let Some((class, buf)) = pool.take(0, true) else {
+            idle.push(slot);
+            return None;
+        };
+        solves[slot].bind(buf, class);
+        Some(slot)
+    }
+
+    /// Bind `n` slots 0..n, for tests that pin by index.
+    pub fn fill(&self, n: usize) {
+        for _ in 0..n {
+            if self.admit(0).is_none() {
+                break;
+            }
+        }
+    }
+
+    /// Give a slot a specific class. Tests that compare a relocating solve
+    /// against one that started in a large slab.
+    pub fn bind_class(&self, gpu: usize, slot: usize, class: usize) -> Res<()> {
+        let c = &self.cards[gpu * PIPELINE];
+        c.stream.context().bind_to_thread().map_err(err)?;
+        let mut pool = c.pool.lock();
+        let mut solves = c.solves.lock();
+        let b = solves.get_mut(slot).ok_or_else(|| format!("solve {slot} is not resident"))?;
+        if let Some((old_c, old)) = b.take_buf() {
+            pool.put(old_c, old);
+        }
+        let (got, buf) = pool.take(class, false).ok_or("no slab of that class")?;
+        b.bind(buf, got);
+        Ok(())
+    }
+
+    pub fn release(&self, gpu: usize, slot: usize) {
+        let c = &self.cards[gpu * PIPELINE];
+        let mut pool = c.pool.lock();
+        let mut idle = c.idle.lock();
+        let mut solves = c.solves.lock();
+        let Some(b) = solves.get_mut(slot) else {
+            return;
+        };
+        pool.note_finish(b.used_bytes());
+        if let Some((class, buf)) = b.take_buf() {
+            pool.put(class, buf);
+        }
+        idle.push(slot);
+    }
+
+    pub fn occupancy(&self, gpu: usize) -> [usize; 6] {
+        self.cards[gpu * PIPELINE].pool.lock().occupancy()
+    }
+
+    pub fn relocations(&self) -> u64 {
+        (0..self.n_gpus)
+            .map(|g| {
+                self.cards[g * PIPELINE]
+                    .pool
+                    .lock()
+                    .relocations
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .sum()
+    }
+
+    pub fn reloc_by(&self) -> [u64; 8] {
+        let mut out = [0u64; 8];
+        for g in 0..self.n_gpus {
+            let p = self.cards[g * PIPELINE].pool.lock();
+            for i in 0..8 {
+                out[i] += p.reloc_by[i].load(std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        out
+    }
+
+    pub fn stops(&self) -> u64 {
+        (0..self.n_gpus)
+            .map(|g| {
+                self.cards[g * PIPELINE]
+                    .pool
+                    .lock()
+                    .stops
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .sum()
+    }
+
+    pub fn take_finish(&self) -> Vec<u32> {
+        let mut v = Vec::new();
+        for g in 0..self.n_gpus {
+            v.extend(self.cards[g * PIPELINE].pool.lock().take_finish());
+        }
+        v
+    }
+
+    pub fn counts(&self, gpu: usize) -> [usize; 6] {
+        self.cards[gpu * PIPELINE].pool.lock().total
     }
 
     /// How many cards the driver can see.
@@ -1083,6 +1193,8 @@ impl Card {
             blas,
             k: Arc::clone(&gpu.k),
             solves: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            pool: Arc::new(parking_lot::Mutex::new(Pool::empty())),
+            idle: Arc::new(parking_lot::Mutex::new(Vec::new())),
             host: parking_lot::Mutex::new(Stage::default()),
             pack: parking_lot::Mutex::new(Pack::default()),
             down: parking_lot::Mutex::new(Host::default()),
@@ -1100,7 +1212,7 @@ impl Card {
             return Ok(());
         }
         self.stream.context().bind_to_thread().map_err(err)?;
-        let cap = RoundCap::of(n, &cfg.budget, cfg.s);
+        let cap = RoundCap::of(n, cfg.s);
         let s = &self.stream;
         let mut scratch = Scratch::default();
         scratch.w = Arr::with_cap(s, cap.w)?;
@@ -1148,6 +1260,60 @@ impl Card {
         Ok(())
     }
 
+    fn bump_lens(lens: &mut [usize; 8], c: &Call, cells: usize) {
+        match c {
+            Call::Trunk { at, rows, boards_at, boards, cidx, .. } => {
+                lens[Ent::Row as usize] = lens[Ent::Row as usize].max(at + rows);
+                lens[Ent::Board as usize] = lens[Ent::Board as usize].max(boards_at + boards);
+                lens[Ent::Cidx as usize] = lens[Ent::Cidx as usize].max(cells + cidx.len());
+            }
+            Call::Configs { at, n, .. } => {
+                lens[Ent::Config as usize] = lens[Ent::Config as usize].max(at + n);
+            }
+            Call::Tree { ncells, nreach, nvals, writes, .. } => {
+                lens[Ent::Cell as usize] = lens[Ent::Cell as usize].max(*ncells);
+                lens[Ent::Reach as usize] = lens[Ent::Reach as usize].max((*nreach).max(*nvals));
+                for r in &writes.runs {
+                    let (e, _, width) = slot::dst_slot(r.dst);
+                    let n = (r.at as usize + r.len as usize).div_ceil(width.max(1));
+                    lens[e as usize] = lens[e as usize].max(n);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn fit_round(&self, calls: &[Call], mine: &[usize]) -> Res<()> {
+        let mut need: Vec<(usize, [usize; 8])> = Vec::new();
+        {
+            let g = self.solves.lock();
+            let mut seen = std::collections::HashSet::new();
+            for &i in mine {
+                let id = calls[i].solve();
+                if !seen.insert(id) {
+                    continue;
+                }
+                let b = g.get(id).ok_or_else(|| format!("solve {id} is not resident"))?;
+                let mut lens = b.lens();
+                for c in calls {
+                    if c.solve() == id {
+                        Self::bump_lens(&mut lens, c, b.cells);
+                    }
+                }
+                need.push((id, lens));
+            }
+        }
+        let mut pool = self.pool.lock();
+        let mut g = self.solves.lock();
+        for (id, lens) in need {
+            let b = g.get_mut(id).expect("resident");
+            if !b.fit(&mut pool, lens, &self.stream)? {
+                return Err(format!("solve {id} has no slab"));
+            }
+        }
+        Ok(())
+    }
+
     fn round(&self, calls: &[Call], mine: &[usize]) -> Res<Vec<(usize, Reply)>> {
         self.stream.context().bind_to_thread().map_err(err)?;
         let pick = |kind: usize| -> Vec<usize> {
@@ -1156,6 +1322,7 @@ impl Card {
                 .filter(|&i| calls[i].kind() == kind)
                 .collect()
         };
+        self.fit_round(calls, mine)?;
         let mut out = Vec::with_capacity(mine.len());
         // Named, because a driver error carries an errno and nothing else, and
         // five stages of a round are five very different suspects.
@@ -1529,7 +1696,7 @@ impl Card {
             let b = self.slot(&mut g, *solve);
             b.reserve(Ent::Row, row0 + nrows)?;
             let words = pack.words(board_of);
-            let dst = b.ent[Ent::Row as usize].field(Y_BOARD_OF, &self.stream);
+            let dst = b.field(Ent::Row, Y_BOARD_OF, &self.stream);
             pack.piece(dst, *row0 as u32, words, nrows as u32);
             // `coff` arrives relative to this call's own `cidx`, so it is
             // shifted onto the resident index before it is stored. Row zero
@@ -1542,7 +1709,7 @@ impl Card {
             let dst = b.view(&self.stream, Ent::Cidx, 0, b.cells, cidx.len(), 1)?;
             pack.piece(dst, b.cells as u32, words, cidx.len() as u32);
             let words = pack.words(&shifted);
-            let dst = b.ent[Ent::Row as usize].field(Y_COFF, &self.stream);
+            let dst = b.field(Ent::Row, Y_COFF, &self.stream);
             pack.piece(dst, 2 * *row0 as u32, words, shifted.len() as u32);
             b.cells += cidx.len();
             b.rows = row0 + nrows;

@@ -216,7 +216,6 @@ fn main() {
         s: 1,
         c: 1.0,
         cfr: Cfr::SOG,
-        budget: warchest::search::Budget::unbounded(),
         ..Default::default()
     };
     let mut first: Vec<Shape> = Vec::new();
@@ -287,7 +286,6 @@ fn main() {
             s,
             c: 8.0,
             cfr: Cfr::SOG,
-            budget: warchest::search::Budget::unbounded(),
             ..Default::default()
         };
         let mut shapes: Vec<Shape> = Vec::new();

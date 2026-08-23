@@ -32,7 +32,7 @@ use warchest::net::Net;
 use warchest::pbs::*;
 use warchest::rng::Rng;
 use warchest::farm::{Call, Reply};
-use warchest::search::{node_actions, Budget, Cfg, Nets, Solver, Step};
+use warchest::search::{node_actions, Cfg, Nets, Solver, Step};
 use warchest::selfplay::{make_game, Agent, Collect, Data, GameCfg, GameStream};
 use warchest::state::{Cont, State, Z_BAG, Z_FACEDOWN, Z_FACEUP};
 use warchest::units::{write_card_features, CARD_FEATS};
@@ -659,7 +659,6 @@ fn a_subgame_of_only_terminal_leaves_solves() {
         let cfg = Cfg {
             s: 8,
             c: 1.0,
-            budget: Budget::unbounded(),
             ..Default::default()
         };
         let mut sv = Solver::new(&s, ctx, Arc::clone(&nets), cfg, bel.clone(), Rng::new(seed));
@@ -807,7 +806,6 @@ fn a_solve_reads_only_the_beliefs() {
     let cfg = Cfg {
         s: 8,
         c: 1.0,
-        budget: Budget::unbounded(),
         ..Default::default()
     };
     let mut checked = 0usize;
@@ -871,7 +869,6 @@ fn the_value_function_separates_configs_sharing_a_hand() {
     let cfg = Cfg {
         s: 8,
         c: 1.0,
-        budget: Budget::unbounded(),
         ..Default::default()
     };
     let (mut positions, mut val_differs, mut strat_differs) = (0usize, 0usize, 0usize);
@@ -932,7 +929,6 @@ fn game_stream_yields_one_complete_solve_at_a_time() {
     let cfg = Cfg {
         s: 8,
         c: 1.0,
-        budget: Budget::unbounded(),
         ..Default::default()
     };
     let gc = GameCfg {
@@ -962,7 +958,7 @@ fn game_stream_yields_one_complete_solve_at_a_time() {
 /// the solve asked, or handing one solve another's reply.
 #[test]
 fn a_batched_solve_matches_one_run_alone_exactly() {
-    let cfg = Cfg { s: 12, c: 1.0, budget: Budget::unbounded(), ..Default::default() };
+        let cfg = Cfg { s: 12, c: 1.0, ..Default::default() };
     let gc = GameCfg {
         agents: [Agent::Sog { cfg }; 2],
         collect: Collect::Sog,
@@ -1066,7 +1062,6 @@ fn a_solve_stores_its_root_and_nothing_else() {
     let cfg = Cfg {
         s: 12,
         c: 1.0,
-        budget: Budget::unbounded(),
         ..Default::default()
     };
     let gc = GameCfg {
@@ -1246,7 +1241,7 @@ fn zero_weight_config_survives_the_walk_update() {
             &s,
             ctx,
             Arc::clone(&nets),
-            Cfg { s: 8, c: 1.0, budget: Budget::unbounded(), ..Default::default() },
+            Cfg { s: 8, c: 1.0, ..Default::default() },
             bel.clone(),
             Rng::new(rng.next_u64()),
         );

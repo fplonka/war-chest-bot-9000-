@@ -43,7 +43,7 @@ use warchest::farm::{Backend, Call, Reply};
 use warchest::net::{Net, NetLayout};
 use warchest::pbs::{enumerate_configs, reserve, true_config, Belief, Ctx};
 use warchest::rng::Rng;
-use warchest::search::{Arenas, Budget, Cfg, Nets, Solved, Solver, Step};
+use warchest::search::{Arenas, Cfg, Nets, Solved, Solver, Step};
 use warchest::selfplay::{make_game, Agent, Collect, Data, GameCfg, GameStream};
 use warchest::state::State;
 
@@ -102,13 +102,15 @@ struct Run {
 /// `Cfg::default` is `SoG(512)`'s p90. Several tests here run `s` two and three
 /// times that, and a slot at 512 is then a write past the arena.
 fn gpu(net: Net) -> Device {
-    Device::new(
+    let d = Device::new(
         &[0],
         net,
-        Cfg { budget: Budget::for_s(2048), ..Default::default() },
+        Cfg::default(),
         8,
     )
-    .expect("device")
+    .expect("device");
+    d.fill(8);
+    d
 }
 
 /// Run one game stream per `(seed, cfg)` against `backend`, every stream's
@@ -1007,5 +1009,52 @@ fn k_iterates_together_match_k_iterates_alone() {
             eprintln!("slot {i} {what}: worst {bad:e} over {} values", x.len());
             assert!(bad < 1e-3, "slot {i} {what} differ by {bad:e}");
         }
+    }
+}
+
+/// A solve that relocates twice equals the same solve run in one large slab.
+#[test]
+fn a_solve_that_relocates_matches_one_in_one_slab() {
+    if Device::count() == 0 {
+        eprintln!("no cuda device; skipping");
+        return;
+    }
+    let net = random_net(0x9E37);
+    let device = gpu(net.clone());
+    device.bind_class(0, 1, 5).expect("large slab");
+    let run = |slot: usize| {
+        let nets = Arc::new(Nets { value: net.clone(), device: true });
+        let mut data = Data::default();
+        let mut sv = GameStream::new(0x51E5, game_cfg(512, 8.0)).next_solve(&nets, &mut data);
+        sv.pin(slot);
+        let mut replies: Vec<Reply> = Vec::new();
+        let mut leaves: Vec<u32> = Vec::new();
+        loop {
+            match sv.advance(&replies) {
+                Step::Calls(calls) => {
+                    replies = device.run(&calls, 0).expect("round");
+                    leaves = replies.iter().flat_map(|r| r.leaves.iter().copied()).collect();
+                }
+                Step::Done(_) => break,
+            }
+        }
+        (device.resident(0, slot).expect("resident"), leaves)
+    };
+    let (a, la) = run(0);
+    let nreloc = device.relocations();
+    eprintln!("relocations {nreloc}");
+    assert!(nreloc >= 2, "the small-class solve relocated {nreloc} times, want two");
+    let (b, lb) = run(1);
+    assert_eq!(la, lb, "leaves");
+    for (what, x, y) in [
+        ("cur", a.cur.as_slice(), b.cur.as_slice()),
+        ("sum", a.sum.as_slice(), b.sum.as_slice()),
+        ("qval", a.qval.as_slice(), b.qval.as_slice()),
+        ("visits", a.visits.as_slice(), b.visits.as_slice()),
+        ("reach", a.reach.as_slice(), b.reach.as_slice()),
+        ("p", a.p.as_slice(), b.p.as_slice()),
+        ("prior", a.prior.as_slice(), b.prior.as_slice()),
+    ] {
+        assert_eq!(x, y, "{what} not bit-exact");
     }
 }

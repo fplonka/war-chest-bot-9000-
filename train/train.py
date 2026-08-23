@@ -616,7 +616,7 @@ def main():
     # 2048 is the intern-table floor: a 2048× table does not fit the encoder.
     torch.cuda.reset_peak_memory_stats(dev)
     names = tuple(warchest.ENT_NAMES)
-    per = warchest.budget_for_s(args.s)[names.index("config")]
+    per = warchest.slab_shape()[names.index("config")]
     n = max(args.batch, 2048)
     k = args.batch * per
     x = torch.zeros(2 * n, PUBFEAT, device=dev)
@@ -716,11 +716,14 @@ def main():
         window = collections.Counter()
         totals = collections.Counter()
         window_shapes = []
+        window_bytes = []
         # The farm's round counters are cumulative, so an epoch's figures are
         # the difference against the last report and not an average since the
         # farm started.
         round_at = dict.fromkeys(ROUND_KEYS, 0)
         ent_at = [0] * 8
+        reloc_at = 0
+        stop_at = 0
         next_report = time.time() + 10.0
         next_target = sog_t0 + args.target_every * 60.0
 
@@ -766,6 +769,7 @@ def main():
             window["conv_s"] += conv_s
             window["add_s"] += add_s
             window_shapes.extend(data.get("shapes") or [])
+            window_bytes.extend(int(x) for x in (data.get("finish_bytes") or []))
             for name in (
                     "games", "decisions", "horizon_hits",
                     "white_wins", "black_wins", "draws",
@@ -867,6 +871,23 @@ def main():
             now_ent = [int(x) for x in (data.get("entity_hits") or [0] * 8)]
             ent_hits = [now_ent[i] - ent_at[i] for i in range(8)]
             ent_at = now_ent
+            now_reloc = int(data.get("relocations", 0))
+            reloc = now_reloc - reloc_at
+            reloc_at = now_reloc
+            now_stop = int(data.get("stops", 0))
+            stops = now_stop - stop_at
+            stop_at = now_stop
+            if window_bytes:
+                vb = np.sort(np.asarray(window_bytes, np.uint64))
+                def bpct(q):
+                    return int(vb[int(round((len(vb) - 1) * q))])
+                bytes_h = {
+                    "p50": bpct(0.50), "p90": bpct(0.90),
+                    "p99": bpct(0.99), "max": int(vb[-1]),
+                    "n": len(vb),
+                }
+            else:
+                bytes_h = {"p50": 0, "p90": 0, "p99": 0, "max": 0, "n": 0}
             if window_shapes:
                 a = np.asarray(window_shapes, np.uint32)
                 def pct(col, q):
@@ -960,6 +981,13 @@ def main():
                 "policy_loss": window["policy_sum"] / max(window["train_steps"], 1),
                 "budget_hits": int(hits),
                 "entity_hits": {names[i]: ent_hits[i] for i in range(8)},
+                "relocations": reloc,
+                "reloc_by": {names[i]: int((data.get("reloc_by") or [0] * 8)[i])
+                             for i in range(8)},
+                "stops": stops,
+                "slabs_used": [int(x) for x in (data.get("slabs_used") or [0] * 6)],
+                "slabs": [int(x) for x in (data.get("slabs") or [0] * 6)],
+                "finish_bytes": bytes_h,
                 "slots": int(data.get("slots", 0)),
                 "slots_used": int(data.get("slots_used", 0)),
                 "slots_per_card": int(data.get("slots_per_card", 0)),
@@ -968,6 +996,8 @@ def main():
             }
             rec["budget_hit_rate"] = round(
                 rec["budget_hits"] / max(len(window_shapes), rec["solves"], 1), 3)
+            rec["stop_rate"] = round(
+                rec["stops"] / max(len(window_shapes), rec["solves"], 1), 3)
             log.append(rec)
             write_log(args, log, snaps)
             print(
@@ -986,11 +1016,15 @@ def main():
                 f"slot={rec['slot_bytes'] / (1 << 20):.1f}MiB "
                 f"hits={rec['budget_hits']} "
                 f"hit_rate={rec['budget_hit_rate']} "
+                f"reloc={rec['relocations']} "
+                f"stop={rec['stops']}/{rec['stop_rate']} "
+                f"slabs={'/'.join(str(x) for x in rec['slabs_used'])} "
                 f"ehits={'/'.join(str(ent_hits[i]) for i in range(8))} "
                 f"p90={'/'.join(str(shape[n]['p90']) for n in names)}",
                 flush=True)
             window.clear()
             window_shapes.clear()
+            window_bytes.clear()
             epoch += 1
         # Dropping the farm stops its threads once they finish the solve they
         # are in, which is also what flushes their last rows.
