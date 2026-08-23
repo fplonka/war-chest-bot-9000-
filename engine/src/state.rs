@@ -665,6 +665,20 @@ impl State {
         &self.pending
     }
 
+    /// The public continuation stack: `pending`, then `conts` from the top
+    /// down. Unused slots are `None`. This is the whole public decision
+    /// context — two states that differ only below the top are not the same.
+    pub fn stack(&self) -> [Option<Cont>; CONT_CAP] {
+        let mut a = [None; CONT_CAP];
+        a[0] = Some(self.pending);
+        for (i, c) in self.conts.iter().enumerate() {
+            if 1 + i < CONT_CAP {
+                a[1 + i] = Some(*c);
+            }
+        }
+        a
+    }
+
     /// The same position rotated 180 degrees with the two seats exchanged.
     ///
     /// The rotation `(x, y) -> (6 - x, 6 - y)` maps white's two starting

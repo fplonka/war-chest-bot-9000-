@@ -1170,6 +1170,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("PLAYER_SCALARS", crate::pbs::PLAYER_SCALARS)?;
     m.add("GLOBAL_SCALARS", crate::pbs::GLOBAL_SCALARS)?;
     m.add("PENDING_KINDS", crate::state::PENDING_KINDS)?;
+    m.add("CONT_CAP", crate::state::CONT_CAP)?;
     m.add("LOOSE", crate::pbs::LOOSE)?;
     m.add("OFF_PILES", crate::pbs::OFF_PILES)?;
     m.add("OFF_CARDS", crate::pbs::OFF_CARDS)?;
@@ -1186,8 +1187,8 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ROW_INIT_MOVED", crate::pbs::ROW_INIT_MOVED)?;
     m.add("ROW_TO_ACT", crate::pbs::ROW_TO_ACT)?;
     m.add("ROW_PLIES", crate::pbs::ROW_PLIES)?;
-    m.add("ROW_PENDING", crate::pbs::ROW_PENDING)?;
-    m.add("ROW_OWED", crate::pbs::ROW_OWED)?;
+    m.add("ROW_STACK_KIND", crate::pbs::ROW_STACK_KIND)?;
+    m.add("ROW_STACK_OWED", crate::pbs::ROW_STACK_OWED)?;
     m.add_function(wrap_pyfunction!(rules_table_hash, m)?)?;
     m.add_function(wrap_pyfunction!(hex_neighbours, m)?)?;
     m.add_function(wrap_pyfunction!(location_hexes, m)?)?;

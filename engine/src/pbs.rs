@@ -55,7 +55,8 @@
 use crate::actions::Action;
 use crate::board::{board, NONE, N_HEXES};
 use crate::state::{
-    State, PENDING_KINDS, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP, Z_HAND, Z_INFLIGHT, Z_SUPPLY,
+    State, CONT_CAP, PENDING_KINDS, Z_BAG, Z_ELIM, Z_FACEDOWN, Z_FACEUP, Z_HAND, Z_INFLIGHT,
+    Z_SUPPLY,
 };
 use crate::units::{write_card_features, CARD_FEATS, N_UNITS};
 
@@ -901,13 +902,13 @@ pub const MAX_COINS: f32 = 4.0 * 5.0 + 1.0;
 pub const NTYPE: usize = 2 * NSLOT;
 
 /// Raw per-hex facts: occupant owner (2), stack height, the location marker's
-/// owner (2), is-location, owed-by-the-pending-tactic.
+/// owner (2), is-location, then one owed-bit per continuation-stack level.
 ///
 /// Every one is a raw fact about the position. A precomputed
 /// distance-to-nearest-unit map was tried and removed: it is a *derived*
 /// summary of how far each side is from the locations it still needs — so it
 /// imports the handcrafted bot's opinion into the encoding.
-pub const HEX_FACTS: usize = 2 + 1 + 2 + 1 + 1;
+pub const HEX_FACTS: usize = 2 + 1 + 2 + 1 + CONT_CAP;
 /// Per hex: the raw facts, then a one-hot of the occupant's coin type.
 pub const HEX_CH: usize = HEX_FACTS + NTYPE;
 pub const HEX_BLOCK: usize = N_HEXES * HEX_CH;
@@ -920,8 +921,8 @@ pub const PILE_COUNTS: usize = 4;
 /// holder, and the horizon is carried by `plies_remaining`).
 pub const PLAYER_SCALARS: usize = 6;
 /// Shared: plies remaining, initiative moved, the player to act, then a
-/// one-hot of the pending continuation kind.
-pub const GLOBAL_SCALARS: usize = 3 + PENDING_KINDS;
+/// kind one-hot for every continuation-stack level.
+pub const GLOBAL_SCALARS: usize = 3 + CONT_CAP * PENDING_KINDS;
 
 pub const OFF_PILES: usize = HEX_BLOCK;
 /// The rulebook facts of each coin type in play — the card describer's input.
@@ -951,8 +952,8 @@ pub const LOOSE: usize = 2 * PLAYER_SCALARS + GLOBAL_SCALARS;
 /// 199 u8   initiative_moved
 /// 200 u8   player_to_act
 /// 201 u16  main_plays_remaining
-/// 203 u8   pending kind (Cont::tag)
-/// 204 u64  owed hexes (HexSet bitmask)
+/// 203 u8   stack kind[CONT_CAP]     0xFF = empty slot
+/// 219 u64  stack owed[CONT_CAP]     hex bitmask per level
 /// ```
 
 pub const ROW_IDS: usize = 0;
@@ -965,9 +966,9 @@ pub const ROW_INITIATIVE: usize = ROW_PILES + 2 * NSLOT * PILE_COUNTS;
 pub const ROW_INIT_MOVED: usize = ROW_INITIATIVE + 1;
 pub const ROW_TO_ACT: usize = ROW_INIT_MOVED + 1;
 pub const ROW_PLIES: usize = ROW_TO_ACT + 1;
-pub const ROW_PENDING: usize = ROW_PLIES + 2;
-pub const ROW_OWED: usize = ROW_PENDING + 1;
-pub const ROW_BYTES: usize = ROW_OWED + 8;
+pub const ROW_STACK_KIND: usize = ROW_PLIES + 2;
+pub const ROW_STACK_OWED: usize = ROW_STACK_KIND + CONT_CAP;
+pub const ROW_BYTES: usize = ROW_STACK_OWED + CONT_CAP * 8;
 
 /// Hash of the constants the expansion depends on: the board's location map,
 /// the unit card-fact table and the layout constants. A rules change that
@@ -1001,6 +1002,7 @@ pub fn rules_table_hash() -> u64 {
         PILE_COUNTS,
         LOOSE,
         PENDING_KINDS,
+        CONT_CAP,
     ] {
         mix(c as u64);
     }
@@ -1039,6 +1041,29 @@ pub fn normalize_weights(w: &[f32], out: &mut [f32]) {
     for (o, x) in out.iter_mut().zip(w.iter()) {
         *o = *x * scale + flat;
     }
+}
+
+fn stack_bits(s: &State) -> ([u8; CONT_CAP], [u64; CONT_CAP]) {
+    let mut kinds = [0xffu8; CONT_CAP];
+    let mut owed = [0u64; CONT_CAP];
+    for (i, c) in s.stack().into_iter().enumerate() {
+        if let Some(c) = c {
+            kinds[i] = c.tag();
+            owed[i] = c.owed_hexes().0;
+        }
+    }
+    (kinds, owed)
+}
+
+fn stack_from_row(row: &[u8]) -> ([u8; CONT_CAP], [u64; CONT_CAP]) {
+    let mut kinds = [0u8; CONT_CAP];
+    let mut owed = [0u64; CONT_CAP];
+    kinds.copy_from_slice(&row[ROW_STACK_KIND..ROW_STACK_KIND + CONT_CAP]);
+    for d in 0..CONT_CAP {
+        let o = ROW_STACK_OWED + d * 8;
+        owed[d] = u64::from_le_bytes(row[o..o + 8].try_into().unwrap());
+    }
+    (kinds, owed)
 }
 
 /// The public encoding. Fixed for a given state, so a solve computes it once
@@ -1092,6 +1117,7 @@ pub fn write_public_features(s: &State, ctx: &Ctx, out: &mut [f32]) {
         fd_size[p] = s.zones[p][Z_FACEDOWN].iter().sum();
         bag_size[p] = s.bag_size(p as u8);
     }
+    let (kinds, owed) = stack_bits(s);
     write_public_features_raw(
         &hex_owner,
         &hex_slot,
@@ -1107,8 +1133,8 @@ pub fn write_public_features(s: &State, ctx: &Ctx, out: &mut [f32]) {
         s.initiative_moved,
         s.to_act(),
         (crate::state::MAX_MAIN_PLAYS - s.main_plays.min(crate::state::MAX_MAIN_PLAYS)) as u16,
-        s.pending().tag(),
-        s.pending().owed_hexes().0,
+        &kinds,
+        &owed,
         out,
     );
 }
@@ -1132,8 +1158,8 @@ pub fn write_public_features_raw(
     initiative_moved: bool,
     to_act: u8,
     plies_remaining: u16,
-    pending_kind: u8,
-    owed: u64,
+    kinds: &[u8; CONT_CAP],
+    owed: &[u64; CONT_CAP],
     out: &mut [f32],
 ) {
     debug_assert_eq!(out.len(), PUBFEAT);
@@ -1160,8 +1186,10 @@ pub fn write_public_features_raw(
             out[i + 3 + hex_marker[h] as usize] = 1.0;
         }
         out[i + 5] = bd.is_location[h] as u8 as f32;
-        if owed & (1u64 << h) != 0 {
-            out[i + 6] = 1.0;
+        for d in 0..CONT_CAP {
+            if owed[d] & (1u64 << h) != 0 {
+                out[i + 6 + d] = 1.0;
+            }
         }
         i += HEX_CH;
     }
@@ -1209,8 +1237,11 @@ pub fn write_public_features_raw(
     out[i] = plies_remaining as f32 / crate::state::MAX_MAIN_PLAYS as f32;
     out[i + 1] = initiative_moved as u8 as f32;
     out[i + 2] = (to_act == 0) as u8 as f32;
-    if (pending_kind as usize) < PENDING_KINDS {
-        out[i + 3 + pending_kind as usize] = 1.0;
+    for d in 0..CONT_CAP {
+        let k = kinds[d];
+        if (k as usize) < PENDING_KINDS {
+            out[i + 3 + d * PENDING_KINDS + k as usize] = 1.0;
+        }
     }
     i += GLOBAL_SCALARS;
     debug_assert_eq!(i, PUBFEAT);
@@ -1248,8 +1279,12 @@ pub fn pack_row(s: &State, ctx: &Ctx, out: &mut [u8]) {
     out[ROW_TO_ACT] = s.to_act();
     let plies = crate::state::MAX_MAIN_PLAYS - s.main_plays.min(crate::state::MAX_MAIN_PLAYS);
     out[ROW_PLIES..ROW_PLIES + 2].copy_from_slice(&plies.to_le_bytes());
-    out[ROW_PENDING] = s.pending().tag();
-    out[ROW_OWED..ROW_OWED + 8].copy_from_slice(&s.pending().owed_hexes().0.to_le_bytes());
+    let (kinds, owed) = stack_bits(s);
+    out[ROW_STACK_KIND..ROW_STACK_KIND + CONT_CAP].copy_from_slice(&kinds);
+    for d in 0..CONT_CAP {
+        let o = ROW_STACK_OWED + d * 8;
+        out[o..o + 8].copy_from_slice(&owed[d].to_le_bytes());
+    }
 }
 
 
@@ -1287,6 +1322,7 @@ pub fn expand_row(
     if initiative > 1 {
         initiative = 0; // defensive; a packed row is engine-written
     }
+    let (kinds, owed) = stack_from_row(row);
     write_public_features_raw(
         &hex_owner,
         &hex_slot,
@@ -1302,8 +1338,8 @@ pub fn expand_row(
         row[ROW_INIT_MOVED] != 0,
         row[ROW_TO_ACT],
         u16::from_le_bytes([row[ROW_PLIES], row[ROW_PLIES + 1]]),
-        row[ROW_PENDING],
-        u64::from_le_bytes(row[ROW_OWED..ROW_OWED + 8].try_into().unwrap()),
+        &kinds,
+        &owed,
         out,
     );
 }
