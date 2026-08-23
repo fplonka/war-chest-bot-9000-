@@ -837,7 +837,9 @@ impl Table {
                 continue;
             };
             let acting = seat == b.s.to_act() as usize;
-            if b.asked[seat] || (!acting && b.watched[seat]) {
+            let other = 1 - seat;
+            let stale_watch = acting && b.asked[other] && !b.watched[other];
+            if b.asked[seat] || stale_watch || (!acting && b.watched[seat]) {
                 continue;
             }
             b.asked[seat] = true;
@@ -888,6 +890,37 @@ impl Table {
             .values()
             .map(|b| usize::from(b.asked[0]) + usize::from(b.asked[1]))
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_actor_waits_for_a_stale_watch() {
+        let draft = Draft {
+            white: vec![17, 12, 4, 9],
+            black: vec![1, 3, 8, 16],
+            first: 0,
+        };
+        let mut table = Table::new();
+        table.start(1, &draft, [0, 1], 7).unwrap();
+        table.settle();
+
+        let bout = table.bouts.get_mut(&1).unwrap();
+        let actor = bout.s.to_act() as usize;
+        let watcher = 1 - actor;
+        bout.asked[watcher] = true;
+        bout.watched[watcher] = false;
+
+        let request = table.request(actor);
+        assert!(request.go.is_empty());
+
+        let bout = table.bouts.get_mut(&1).unwrap();
+        bout.watched[watcher] = true;
+        let request = table.request(actor);
+        assert_eq!(request.go.len(), 1);
     }
 }
 
