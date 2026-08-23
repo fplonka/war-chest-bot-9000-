@@ -188,22 +188,12 @@ mod tests {
     #[test]
     fn a_leaf_root_plays_uniform() {
         let mut rng = Rng::new(0x69);
-        let s = loop {
-            let mut s = make_game(&mut rng, true);
-            for _ in 0..16 {
-                if s.is_terminal() {
-                    break;
-                }
-                let a = s.legal_actions();
-                if a.is_empty() {
-                    break;
-                }
-                s.apply_inplace(a[rng.below(a.len())]);
-            }
-            if !s.is_terminal() && !s.is_chance() && matches!(s.pending(), Cont::MainPlay) {
-                break s;
-            }
-        };
+        let mut s = make_game(&mut rng, true);
+        while !s.is_terminal() && (s.is_chance() || !matches!(s.pending(), Cont::MainPlay)) {
+            let a = s.legal_actions();
+            s.apply_inplace(a[rng.below(a.len())]);
+        }
+        assert!(!s.is_terminal() && matches!(s.pending(), Cont::MainPlay));
         let ctx = Ctx::new(&s);
         let bel = [
             Belief::point(true_config(&s, 0, &ctx)),
@@ -216,14 +206,8 @@ mod tests {
             Cfg {
                 s: 0,
                 budget: Budget {
-                    nodes: 0,
-                    rows: 0,
-                    boards: 0,
-                    configs: 0,
-                    cidx: 0,
-                    reach: 0,
-                    cells: 0,
-                    draws: 0,
+                    nodes: 1,
+                    ..Budget::default()
                 },
                 ..Default::default()
             },
