@@ -263,8 +263,9 @@ class Net(nn.Module):
             *blocks,
             self.board_out,
             self.cfg1, self.cfg_f, self.cfg_g, self.cfg_m,
-            self.cfg_p, self.act_in, self.act_board, self.act_h, self.act_out,
+            self.cfg_p, self.act_in, self.act_board, self.act_out,
             self.join_p, self.join_b, *self.joinw, self.join_out,
+            self.act_h,
         ]
         norms = [n for i in range(BLOCKS) for n in (self.ln1[i], self.ln2[i])]
         norms += [self.ln_trunk, self.ln_cfg, *self.ln_join,

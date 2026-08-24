@@ -328,12 +328,12 @@ impl NetLayout {
         let cfg_p = c.lin(CFGH, D, true);
         let act_in = c.lin(AFEAT, AW, true);
         let act_board = c.lin(D, AW, false);
-        let act_h = c.lin(D, AW, false);
         let act_out = c.lin(AW, D, true);
         let join_p = c.lin(D, JW, false);
         let join_b = c.lin(JOIN_IN, JW, true);
         let join_w = std::array::from_fn(|_| c.lin(JW, JW, true));
         let join_out = c.lin(JW, D, true);
+        let act_h = c.lin(D, AW, false);
         let value_bias = c.b;
         c.b += 1;
         let norms = norm_widths()
