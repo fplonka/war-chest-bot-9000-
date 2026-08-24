@@ -1103,10 +1103,11 @@ def main():
             f"tgt={rec['tgt_mean']:+.3f}/{rec['tgt_std']:.3f} "
             f"gen={gen_s:.1f}s train={train_s:.1f}s")
     value.push()
-    # The warm rows did their job in the weights. Self-play trains on its own
-    # targets only; a replay still holding the static labels would outvote them
-    # for most of the run.
-    buf.clear()
+    # The warm rows stay in the replay and age out through the FIFO: they are
+    # the anchor that holds the value function while self-play rows accumulate.
+    # Clearing them here was tried (9c3e171) and collapsed the run: tgt_std
+    # 0.05 vs 0.66 at five minutes, and the final lost 12-188 to a pre-clear
+    # final (runs/gate30).
 
     sog_t0 = time.time()
     sog_solves = 0
