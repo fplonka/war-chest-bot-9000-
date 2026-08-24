@@ -953,11 +953,6 @@ impl Device {
         }
     }
 
-    /// How many cards the driver can see.
-    pub fn count() -> usize {
-        CudaContext::device_count().unwrap_or(0).max(0) as usize
-    }
-
     pub fn net(&self) -> &Net {
         &self.net
     }

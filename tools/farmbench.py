@@ -47,6 +47,7 @@ def make(args):
         explore=PROD.explore,
         query_rate=args.query_rate,
         recursive_rate=args.recursive_rate,
+        cpu=args.cpu,
     )
     print(f"wrote {n} roots to {args.make}")
 
@@ -99,6 +100,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--roots", help="corpus to solve")
     p.add_argument("--make", help="write a corpus here instead of benching")
+    p.add_argument("--cpu", action="store_true",
+                   help="accept the ~50x slower CPU path used by --make")
     p.add_argument("--games", type=int, default=64, help="games to sample a corpus from")
     p.add_argument("--cap", type=int, default=4096, help="roots to keep")
     p.add_argument("--threads", default="72")

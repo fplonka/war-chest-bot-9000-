@@ -26,8 +26,6 @@ default = []
 python = ["pyo3", "numpy"]
 # Phase timers inside the generation loop; adds ~5% overhead.
 prof = []
-# The CUDA inference backend. Built on the box; everything else builds without
-# it and falls back to the CPU network, which is also the parity reference.
 gpu = ["dep:cudarc"]
 
 [[bin]]
@@ -40,6 +38,7 @@ path = "src/bin/bench.rs"
 [[bin]]
 name = "bot"
 path = "src/bin/bot.rs"
+required-features = ["gpu"]
 
 [profile.release]
 lto = true

@@ -51,13 +51,20 @@ WIN_MARKERS = 6
 
 
 def cuda_devices():
+    if os.environ.get("WARCHEST_CPU") == "1":
+        return []
     try:
         lines = subprocess.check_output(["nvidia-smi", "-L"], text=True).splitlines()
-    except OSError:
-        return []
-    except subprocess.CalledProcessError as error:
-        raise SystemExit("cannot enumerate GPUs") from error
-    return [f"cuda:{i}" for i, line in enumerate(lines) if line.startswith("GPU ")]
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise SystemExit(
+            "GPU inference is required, but nvidia-smi could not enumerate GPUs. "
+            "Set WARCHEST_CPU=1 only to force the ~50x slower CPU path.") from error
+    devices = [f"cuda:{i}" for i, line in enumerate(lines) if line.startswith("GPU ")]
+    if not devices:
+        raise SystemExit(
+            "GPU inference is required, but nvidia-smi found no GPUs. "
+            "Set WARCHEST_CPU=1 only to force the ~50x slower CPU path.")
+    return devices
 
 
 def split_devices():
@@ -73,7 +80,7 @@ def split_devices():
 class Bot:
     """One bot process, and the manifest that describes it."""
 
-    def __init__(self, path, seat, replies, devices=()):
+    def __init__(self, path, seat, replies, devices=None):
         self.dir = Path(path)
         self.seat = seat
         self.closing = False
@@ -85,6 +92,15 @@ class Bot:
         self.spec = json.loads((self.dir / "bot.json").read_text())
         self.name = self.spec.get("name", self.dir.name)
         self.searching = self.spec.get("mind", "sog") not in ("greedy", "random")
+        if self.searching and devices is None:
+            devices = cuda_devices()
+        if self.searching and not devices:
+            if os.environ.get("WARCHEST_CPU") != "1":
+                raise SystemExit(
+                    f"{self.name}: GPU inference requires a device assignment. "
+                    "Set WARCHEST_CPU=1 only to force the ~50x slower CPU path.")
+            print("\n*** WARCHEST_CPU=1: CPU INFERENCE IS ~50x SLOWER. "
+                  "YOU DO NOT WANT THIS. ***\n", file=sys.stderr)
         self.solves = 0
         self.moves = 0
         if not os.access(self.dir / "bot", os.X_OK):
@@ -782,7 +798,7 @@ def pack(run, binary, out_dir, snapshot=None, name=None):
 
     if not Path(binary).exists():
         raise SystemExit(f"{binary} does not exist. Build it:\n"
-                         f"  cd engine && cargo build --release --bin bot")
+                         f"  cd engine && cargo build --release --features gpu --bin bot")
 
     run = Path(run)
     log = json.loads((run / "log.json").read_text())
@@ -832,7 +848,7 @@ def pack_greedy(binary, out_dir):
     binary = Path(binary)
     if not binary.exists():
         raise SystemExit(f"{binary} does not exist. Build it:\n"
-                         f"  cd engine && cargo build --release --bin bot")
+                         f"  cd engine && cargo build --release --features gpu --bin bot")
     directory = Path(out_dir) / "greedy"
     directory.mkdir(parents=True, exist_ok=True)
     shutil.copy2(binary, directory / "bot")

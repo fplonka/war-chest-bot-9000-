@@ -269,8 +269,7 @@ def offboard_pile_visibility(net, rng):
 def packed_row_cuda_parity():
     """The Python entry point matches the Rust encoder on real mirrored rows."""
     if not torch.cuda.is_available():
-        print("packed-row CUDA parity skipped: no CUDA device")
-        return
+        raise RuntimeError("CUDA parity requires a working GPU")
     rows = np.frombuffer(bytes(warchest.mirror_row_pairs(128, 19)), np.uint8)
     rows = rows.reshape(-1, warchest.ROW_BYTES)[:4096].copy()
     assert len(rows) >= 2048, f"only {len(rows)} real rows"

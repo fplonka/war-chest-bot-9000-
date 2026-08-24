@@ -593,6 +593,8 @@ def main():
     dev = torch.device(args.device)
     if dev.type != "cuda":
         raise SystemExit(f"device must be a CUDA device, got {args.device!r}")
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is unavailable; training requires a working GPU")
     if args.replay_ratio <= 0.0:
         raise SystemExit("replay_ratio must be positive")
     if args.target_every <= 0.0:

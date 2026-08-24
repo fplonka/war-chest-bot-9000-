@@ -119,10 +119,6 @@ fn gpu(net: Net) -> Device {
 
 #[test]
 fn packed_rows_expand_on_the_card() {
-    if Device::count() == 0 {
-        eprintln!("no cuda device; skipping");
-        return;
-    }
     let mut rng = Rng::new(0xA11C_E55);
     let mut rows = Vec::with_capacity(4096 * ROW_BYTES);
     while rows.len() / ROW_BYTES < 4096 {
@@ -276,10 +272,6 @@ fn run_solve(backend: &Backend, mut sv: Solver) -> (Solver, Option<Solved>) {
 /// the resident arenas.
 #[test]
 fn a_solve_may_change_pipeline_streams() {
-    if Device::count() == 0 {
-        eprintln!("no cuda device; skipping");
-        return;
-    }
     let net = random_net(0x9E37);
     let device = Backend::Cuda(gpu(net.clone()));
     let nets = Arc::new(Nets { value: net, device: true });
@@ -373,10 +365,6 @@ const TF32: f32 = 2e-3;
 /// the regret update, the average strategy and the value pass under it.
 #[test]
 fn the_cfr_loop_agrees_on_a_fixed_tree() {
-    if Device::count() == 0 {
-        eprintln!("no cuda device; skipping");
-        return;
-    }
     let net = random_net(0x9E37);
     let host = generate_one(&net, Backend::Reference(net.clone()), 3, 8, 0.0);
     let card = generate_one(
@@ -457,10 +445,6 @@ fn the_cfr_loop_agrees_on_a_fixed_tree() {
 /// same visits left behind by the draws that found nothing new.
 #[test]
 fn growth_is_the_same_rule_as_the_reference() {
-    if Device::count() == 0 {
-        eprintln!("no cuda device; skipping");
-        return;
-    }
     let net = random_net(0x9E37);
     let device = Backend::Cuda(gpu(net.clone()));
     let Backend::Cuda(d) = &device else { unreachable!("just built") };
@@ -598,10 +582,6 @@ fn growth_is_the_same_rule_as_the_reference() {
 /// produced as many of them as the reference did positions.
 #[test]
 fn growth_on_the_device_produces_sane_targets() {
-    if Device::count() == 0 {
-        eprintln!("no cuda device; skipping");
-        return;
-    }
     let net = random_net(0x9E37);
     let card = generate_one(
         &net,
@@ -636,10 +616,6 @@ fn growth_on_the_device_produces_sane_targets() {
 /// a function of its seed alone.
 #[test]
 fn a_solve_does_not_depend_on_the_round_it_rides_in() {
-    if Device::count() == 0 {
-        eprintln!("no cuda device; skipping");
-        return;
-    }
     let net = random_net(0x9E37);
     let streams: [(u64, Cfg); 4] = [
         (0x51E5, cfg(8, 0.0)),
@@ -738,10 +714,6 @@ fn shared_round(
 /// round of one give the leaf pass different GEMM shapes.
 #[test]
 fn a_ragged_round_does_not_move_the_small_solve() {
-    if Device::count() == 0 {
-        eprintln!("no cuda device; skipping");
-        return;
-    }
     let net = random_net(0x9E37);
     let nets = Arc::new(Nets { value: net.clone(), device: true });
     // The solve under test: eight iterations over a tree that never grows, so
@@ -839,10 +811,6 @@ fn a_ragged_round_does_not_move_the_small_solve() {
 /// wrong index moves the tree, and a tree is discrete.
 #[test]
 fn a_growing_solve_does_not_depend_on_the_round_it_rides_in() {
-    if Device::count() == 0 {
-        eprintln!("no cuda device; skipping");
-        return;
-    }
     let net = random_net(0x9E37);
     let batched = |s: u32, c: f32| Cfg { batch: 8, ..cfg(s, c) };
     let streams: [(u64, Cfg); 4] = [
@@ -905,10 +873,6 @@ fn a_growing_solve_does_not_depend_on_the_round_it_rides_in() {
 /// cuBLAS picking a different algorithm and none for a real drift.
 #[test]
 fn the_resident_state_agrees_with_the_cpu_network() {
-    if Device::count() == 0 {
-        eprintln!("no cuda device; skipping");
-        return;
-    }
     let net = random_net(0x9E37);
     let host = one_solve(&net, &Backend::Reference(net.clone()), 8, 0.0);
     let device = Backend::Cuda(gpu(net.clone()));
@@ -964,10 +928,6 @@ fn the_resident_state_agrees_with_the_cpu_network() {
 /// touches, because a mid-game subgame has few terminals and they are deep.
 #[test]
 fn a_subgame_scored_from_the_game_agrees_with_the_cpu() {
-    if Device::count() == 0 {
-        eprintln!("no cuda device; skipping");
-        return;
-    }
     let net = random_net(0x9E37);
     let nets = Arc::new(Nets { value: net.clone(), device: true });
     let host_nets = Arc::new(Nets { value: net.clone(), device: false });
@@ -1050,10 +1010,6 @@ fn a_subgame_scored_from_the_game_agrees_with_the_cpu() {
 /// shows up as a slot that moved.
 #[test]
 fn k_iterates_together_match_k_iterates_alone() {
-    if Device::count() == 0 {
-        eprintln!("no cuda device; skipping");
-        return;
-    }
     const K: usize = 4;
     let net = random_net(0x9E37);
     // Eight slots at the 2048 growth budget do not fit two pipes of round

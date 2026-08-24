@@ -14,6 +14,7 @@ handful of games, so a random split leaks its answers into the training set.
 """
 
 import argparse
+import os
 import sys
 import time
 
@@ -101,6 +102,13 @@ def main():
     args = p.parse_args()
 
     dev = torch.device(args.device)
+    if dev.type != "cuda":
+        if os.environ.get("WARCHEST_CPU") != "1":
+            raise SystemExit(
+                "GPU training is required. Set WARCHEST_CPU=1 only to force "
+                "the ~50x slower CPU path.")
+        print("\n*** WARCHEST_CPU=1: CPU TRAINING IS ~50x SLOWER. "
+              "YOU DO NOT WANT THIS. ***\n", file=sys.stderr)
     d = Dump(args.dump)
     d.check(warchest.PUBFEAT, warchest.CCOUNTS)
     # Held out by recency at a solve boundary: the last tenth of the rows.

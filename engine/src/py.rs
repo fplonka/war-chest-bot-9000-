@@ -771,7 +771,7 @@ fn backend_for(
 
 /// Run `games` self-play games across all cores and return the training data.
 #[pyfunction]
-#[pyo3(signature = (games, seed, s=512, c=8.0, explore=0.25, random_draft=true, p_td1=0.0, cfr="sog", agent="sog", temp=2.0))]
+#[pyo3(signature = (games, seed, s=512, c=8.0, explore=0.25, random_draft=true, p_td1=0.0, cfr="sog", agent="sog", temp=2.0, cpu=false))]
 #[allow(clippy::too_many_arguments)]
 fn gen_data(
     py: Python<'_>,
@@ -785,10 +785,17 @@ fn gen_data(
     cfr: &str,
     agent: &str,
     temp: f32,
+    cpu: bool,
 ) -> PyResult<PyObject> {
     let cfg = Cfg { s, c, cfr: cfr_of(cfr)?, budget: Budget::for_s(s), ..Default::default() };
     let (agent, collect, p_td1) = match agent {
-        "sog" => (Agent::Sog { cfg }, Collect::Sog, p_td1),
+        "sog" if cpu => {
+            eprintln!("\n*** cpu=True: CPU SELF-PLAY IS ~50x SLOWER. YOU DO NOT WANT THIS. ***\n");
+            (Agent::Sog { cfg }, Collect::Sog, p_td1)
+        }
+        "sog" => return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "GPU self-play requires SolveFarm; pass cpu=True only for the ~50x slower test path",
+        )),
         "greedy" => (Agent::Greedy { temp }, Collect::Static, 0.0),
         other => {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -825,7 +832,7 @@ fn gen_data(
 /// thirty-two expansion one takes a minute.
 #[pyfunction]
 #[pyo3(signature = (games, seed, path, cap=4096, random_draft=true, s=32, c=4.0,
-                    explore=0.1, query_rate=0.9, recursive_rate=0.1))]
+                    explore=0.1, query_rate=0.9, recursive_rate=0.1, cpu=false))]
 #[allow(clippy::too_many_arguments)]
 fn save_roots(
     py: Python<'_>,
@@ -839,7 +846,14 @@ fn save_roots(
     explore: f32,
     query_rate: f32,
     recursive_rate: f32,
+    cpu: bool,
 ) -> PyResult<usize> {
+    if !cpu {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "save_roots uses CPU search; pass cpu=True to accept the ~50x slower path",
+        ));
+    }
+    eprintln!("\n*** cpu=True: CPU ROOT GENERATION IS ~50x SLOWER. YOU DO NOT WANT THIS. ***\n");
     let cfg = Cfg { s, c, budget: Budget::for_s(s), ..Default::default() };
     let gc = GameCfg {
         agents: [Agent::Sog { cfg }; 2],

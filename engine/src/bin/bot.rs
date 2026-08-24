@@ -210,28 +210,36 @@ fn main() {
     }
 }
 
-/// Use only the devices assigned by the referee. No assignment means CPU.
+/// Use only the devices assigned by the referee. CPU needs a loud opt-in.
 fn devices(o: &Options, mind: Mind, _cfg: Cfg) -> Result<Option<Backend>, String> {
-    if !matches!(mind, Mind::Sog) || o.devices.is_empty() {
+    if !matches!(mind, Mind::Sog) {
         return Ok(None);
     }
-    #[cfg(feature = "gpu")]
-    {
-        let ordinals: Result<Vec<usize>, String> = o
-            .devices
-            .split(',')
-            .map(|name| {
-                name.strip_prefix("cuda:")
-                    .ok_or_else(|| format!("invalid device {name}"))?
-                    .parse()
-                    .map_err(|_| format!("invalid device {name}"))
-            })
-            .collect();
-        let net = Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
-        return warchest::cuda::Device::new(&ordinals?, net, _cfg, usize::MAX)
-            .map(Backend::Cuda)
-            .map(Some);
+    if o.devices.is_empty() {
+        if std::env::var("WARCHEST_CPU").as_deref() != Ok("1") {
+            return Err(
+                "GPU inference is required, but no --devices were assigned. \
+                 Set WARCHEST_CPU=1 only to force the ~50x slower CPU path."
+                    .into(),
+            );
+        }
+        eprintln!(
+            "\n*** WARCHEST_CPU=1: CPU INFERENCE IS ~50x SLOWER. YOU DO NOT WANT THIS. ***\n"
+        );
+        return Ok(None);
     }
-    #[cfg(not(feature = "gpu"))]
-    Err(format!("built without GPU support; cannot open {}", o.devices))
+    let ordinals: Result<Vec<usize>, String> = o
+        .devices
+        .split(',')
+        .map(|name| {
+            name.strip_prefix("cuda:")
+                .ok_or_else(|| format!("invalid device {name}"))?
+                .parse()
+                .map_err(|_| format!("invalid device {name}"))
+        })
+        .collect();
+    let net = Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
+    warchest::cuda::Device::new(&ordinals?, net, _cfg, usize::MAX)
+        .map(Backend::Cuda)
+        .map(Some)
 }
