@@ -168,15 +168,14 @@ def blob_parity(net, rng):
 def policy_parity(net, rng):
     """The policy readout through both implementations of the same weights.
 
-    `logit(c, a) = <cfg_p(c), e(a)>`, so this exercises the third config head
-    and the action encoder — the two layers the value parity above cannot
-    reach, and the two whose place in the weight blob nothing else pins.
+    `logit(c, a) = <cfg_p(c), e(a, h)>`, so this exercises the third config
+    head and every action projection, including a nonzero belief join row.
     """
     sizes = [4, 3, 6, 2]
     queries = len(sizes)
     na = 7
     xpub = public_rows(rng, queries)
-    seg, phi, _weight = belief(rng, sizes)
+    seg, phi, weight = belief(rng, sizes)
     n = len(seg)
 
     # One-hot blocks exactly as `Net::action_feats` writes them: kind, the coin
@@ -197,18 +196,21 @@ def policy_parity(net, rng):
         cards = net.cards(torch.from_numpy(np.ascontiguousarray(xpub)))
         physical = torch.from_numpy(np.ascontiguousarray(xpub))[0::2]
         board = net.board(physical, net.tokens(physical, cards[0::2]))
-        _f, _g, fp = net.configs(torch.from_numpy(np.ascontiguousarray(phi)),
-                                 cards[:, :NSLOT],
-                                 torch.from_numpy(seg.astype(np.int64)))
+        tseg = torch.from_numpy(seg.astype(np.int64))
+        _f, g, fp = net.configs(torch.from_numpy(np.ascontiguousarray(phi)),
+                                cards[:, :NSLOT], tseg)
+        h = net.heads(board, g, torch.from_numpy(weight), tseg, queries)
+        assert float(h.abs().max()) > 1e-2, "policy belief head is zero"
         want = np.zeros(len(cfg), np.float32)
         for k in range(len(cfg)):
-            row = int(seg[cfg[k]]) // 2
+            query = int(seg[cfg[k]])
+            row = query // 2
             e = net.actions(torch.from_numpy(feat[act[k]:act[k] + 1]),
-                            board[row:row + 1])
+                            board[row:row + 1], h[query:query + 1])
             want[k] = float((fp[cfg[k]] * e[0]).sum())
 
     got = np.asarray(warchest.infer_policy(
-        xpub.ravel(), phi.ravel(), seg, feat.ravel(), cfg, act, queries),
+        xpub.ravel(), phi.ravel(), weight, seg, feat.ravel(), cfg, act, queries),
         np.float32)
     assert got.shape == want.shape, f"policy: {got.shape} vs {want.shape}"
     scale = max(1.0, float(np.abs(want).max()))
