@@ -355,7 +355,7 @@ def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0, stats=None):
     if stats is not None:
         stats["value_loss"] = float(loss.detach())
     if policy is not None and wp > 0.0:
-        pl = policy_loss(net, xpub, phi, seg, nseg, policy)
+        pl = policy_loss(net, xpub, phi, w, seg, nseg, policy)
         if pl is not None:
             if stats is not None:
                 stats["policy_loss"] = float(pl)
@@ -363,7 +363,7 @@ def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0, stats=None):
     return loss
 
 
-def policy_loss(net, xpub, phi, seg, nseg, policy):
+def policy_loss(net, xpub, phi, weight, seg, nseg, policy):
     """Cross entropy of the policy head against the search's root average.
 
     The head scores a `(config, action)` cell as `<f_p(c), e(a)>`, so the batch
@@ -376,8 +376,11 @@ def policy_loss(net, xpub, phi, seg, nseg, policy):
     cards = net.cards(xpub)
     physical = xpub[0::2]
     board = net.board(physical, net.tokens(physical, cards[0::2]))
-    _f, _g, fp = net.configs(phi, cards[:, :NSLOT], seg)
-    e = net.actions(feat, board, parow)
+    _f, g, fp = net.configs(phi, cards[:, :NSLOT], seg)
+    h = net.heads(board, g, weight, seg, nseg)
+    action_query = torch.zeros(feat.shape[0], dtype=torch.long, device=feat.device)
+    action_query.scatter_(0, pact, seg[pcfg])
+    e = net.actions(feat, board, h, parow, action_query)
 
     # `pcfg` is already an index into the batch's own config arena, so the cell
     # reads its config vector directly.

@@ -118,6 +118,7 @@ class Net(nn.Module):
         self.cfg_p = nn.Linear(CFGH, D)
         self.act_in = nn.Linear(AFEAT, AW)
         self.act_board = nn.Linear(D, AW, bias=False)
+        self.act_h = nn.Linear(D, AW, bias=False)
         self.ln_act = nn.LayerNorm(AW)
         self.act_out = nn.Linear(AW, D)
 
@@ -199,16 +200,20 @@ class Net(nn.Module):
                 self.cfg_g(u) + (counts.unsqueeze(-1) * bag).sum((1, 2)),
                 self.cfg_p(u))
 
-    def actions(self, feat, boards, board_of=None):
+    def actions(self, feat, boards, heads, board_of=None, head_of=None):
         """``e(a)`` for actions ``feat`` ``[n, AFEAT]``.
 
         ``boards`` is ``[rows, D]`` and ``board_of`` says which row each action
-        is played on, so one batch may span nodes.
+        is played on. ``heads`` is the belief-conditioned join output and
+        ``head_of`` names the query each action belongs to.
         """
         proj = self.act_board(boards)
         if board_of is not None:
             proj = proj[board_of]
-        return self.act_out(gelu(self.ln_act(self.act_in(feat) + proj)))
+        hproj = self.act_h(heads)
+        if head_of is not None:
+            hproj = hproj[head_of]
+        return self.act_out(gelu(self.ln_act(self.act_in(feat) + proj + hproj)))
 
     def join(self, p, pooled, seat):
         """The per-iteration path: beliefs and queried seat modulate the board."""
@@ -216,6 +221,15 @@ class Net(nn.Module):
         for i in range(JBLOCKS):
             z = z + self.joinw[i](gelu(self.ln_join[i](z)))
         return self.ln_h(p + self.join_out(gelu(self.ln_jout(z))))
+
+    def heads(self, p, g, weight, seg, nseg):
+        """Belief-conditioned join rows for all canonical queries."""
+        pooled = p.new_zeros(nseg, POOL)
+        pooled.index_add_(0, seg, g * weight.unsqueeze(1))
+        other = torch.arange(nseg, device=seg.device) ^ 1
+        pair = torch.cat([pooled, pooled[other]], -1)
+        seat = p.new_tensor([-1.0, 1.0]).repeat(p.shape[0]).unsqueeze(1)
+        return self.join(p.repeat_interleave(2, 0), pair, seat)
 
     # --------------------------------------------------------------- forward
 
@@ -230,13 +244,7 @@ class Net(nn.Module):
         p = self.board(physical, self.tokens(physical, cards[0::2]))
 
         f, g, _fp = self.configs(phi, cards[:, :NSLOT], seg)
-        pooled = p.new_zeros(nseg, POOL)
-        pooled.index_add_(0, seg, g * weight.unsqueeze(1))
-
-        other = torch.arange(nseg, device=seg.device) ^ 1
-        pair = torch.cat([pooled, pooled[other]], -1)
-        seat = p.new_tensor([-1.0, 1.0]).repeat(p.shape[0]).unsqueeze(1)
-        h = self.join(p.repeat_interleave(2, 0), pair, seat)
+        h = self.heads(p, g, weight, seg, nseg)
         return (f * h[seg]).sum(1) + self.value_bias
 
     # ------------------------------------------------------------ weight blob
@@ -255,7 +263,7 @@ class Net(nn.Module):
             *blocks,
             self.board_out,
             self.cfg1, self.cfg_f, self.cfg_g, self.cfg_m,
-            self.cfg_p, self.act_in, self.act_board, self.act_out,
+            self.cfg_p, self.act_in, self.act_board, self.act_h, self.act_out,
             self.join_p, self.join_b, *self.joinw, self.join_out,
         ]
         norms = [n for i in range(BLOCKS) for n in (self.ln1[i], self.ln2[i])]

@@ -245,10 +245,11 @@ pub struct NetLayout {
     pub cfg_m: Span,
     /// The policy readout's config vector, beside `cfg_f`'s value one.
     pub cfg_p: Span,
-    /// The action encoder: the action's own description, the board it is
-    /// played on, and the projection out to the readout's width.
+    /// The action encoder: the action's own description, its board and its
+    /// belief-conditioned join row, then the policy readout.
     pub act_in: Span,
     pub act_board: Span,
+    pub act_h: Span,
     pub act_out: Span,
     pub join_p: Span,
     pub join_b: Span,
@@ -327,6 +328,7 @@ impl NetLayout {
         let cfg_p = c.lin(CFGH, D, true);
         let act_in = c.lin(AFEAT, AW, true);
         let act_board = c.lin(D, AW, false);
+        let act_h = c.lin(D, AW, false);
         let act_out = c.lin(AW, D, true);
         let join_p = c.lin(D, JW, false);
         let join_b = c.lin(JOIN_IN, JW, true);
@@ -363,6 +365,7 @@ impl NetLayout {
             cfg_p,
             act_in,
             act_board,
+            act_h,
             act_out,
             join_p,
             join_b,
@@ -488,6 +491,7 @@ pub struct Net {
     cfg_p: Lin,
     act_in: Lin,
     act_board: Lin,
+    act_h: Lin,
     act_out: Lin,
     join_p: Lin,
     join_b: Lin,
@@ -590,6 +594,7 @@ impl Net {
             cfg_p: layer(l.cfg_p),
             act_in: layer(l.act_in),
             act_board: layer(l.act_board),
+            act_h: layer(l.act_h),
             act_out: layer(l.act_out),
             join_p: layer(l.join_p),
             join_b: layer(l.join_b),
@@ -1050,7 +1055,7 @@ impl Net {
     }
 
     /// `e(a)` for every action at one node: what the action is, against the
-    /// board it is played on.
+    /// board and belief state it is played on.
     ///
     /// `feat` is `[n, AFEAT]`, and `board` is that node's own board vector —
     /// the same `D` numbers the value readout dots against, so the action is
@@ -1061,13 +1066,17 @@ impl Net {
         &self,
         feat: &[f32],
         boards: &[f32],
+        heads: &[f32],
         board_of: &[u32],
+        head_of: &[u32],
         n: usize,
         out: &mut Vec<f32>,
     ) {
         debug_assert_eq!(feat.len(), n * AFEAT);
         debug_assert_eq!(board_of.len(), n);
+        debug_assert_eq!(head_of.len(), n);
         let rows = boards.len() / D;
+        let queries = heads.len() / D;
         let mut z = scratch(0);
         self.act_in.run(feat, n, &mut z);
         // Every board once, then each action adds the one it belongs to. A
@@ -1076,9 +1085,15 @@ impl Net {
         // for everything else that was per-call and is now per-row.
         let mut proj = scratch(0);
         self.act_board.run(boards, rows, &mut proj);
+        let mut hproj = scratch(0);
+        self.act_h.run(heads, queries, &mut hproj);
         for r in 0..n {
             let at = board_of[r] as usize * AW;
             for (o, &v) in z[r * AW..(r + 1) * AW].iter_mut().zip(&proj[at..at + AW]) {
+                *o += v;
+            }
+            let at = head_of[r] as usize * AW;
+            for (o, &v) in z[r * AW..(r + 1) * AW].iter_mut().zip(&hproj[at..at + AW]) {
                 *o += v;
             }
         }
@@ -1087,6 +1102,7 @@ impl Net {
         self.act_out.run(&z, n, out);
         recycle(z);
         recycle(proj);
+        recycle(hproj);
         recycle(arg);
         recycle(th);
     }
@@ -1205,6 +1221,7 @@ impl Net {
         &self,
         xpub: &[f32],
         phi: &[f32],
+        weight: &[f32],
         seg: &[u32],
         feat: &[f32],
         cfg: &[u32],
@@ -1212,36 +1229,51 @@ impl Net {
         queries: usize,
     ) -> Vec<f32> {
         let n = seg.len();
-        let na = feat.len() / AFEAT;
         let mut cards = Vec::new();
         self.cards(xpub, queries, &mut cards);
         let rows = queries / 2;
         let phys = physical_rows(xpub, rows);
         let mut p = Vec::new();
         self.board(&phys, &cards, rows, queries, &mut p);
+        let mut jp = Vec::new();
+        self.join_cache(&p, rows, &mut jp);
         let (mut f, mut g, mut fp) = (Vec::new(), Vec::new(), Vec::new());
         self.configs(phi, seg, n, &cards, &mut f, &mut g, &mut fp);
-        // An action belongs to the physical row of its cells' query, and the
-        // paired seat views share that row.
-        let mut e = Vec::new();
-        let mut out = vec![0.0; cfg.len()];
-        for r in 0..rows.max(1) {
-            let mine: Vec<usize> = (0..cfg.len())
-                .filter(|&k| seg[cfg[k] as usize] as usize / 2 == r)
-                .collect();
-            if mine.is_empty() {
-                continue;
-            }
-            let board_of = vec![0u32; na];
-            self.actions(feat, &p[r * D..(r + 1) * D], &board_of, na, &mut e);
-            let (c, a): (Vec<u32>, Vec<u32>) =
-                mine.iter().map(|&k| (cfg[k], act[k])).unzip();
-            let mut got = vec![0.0; mine.len()];
-            self.policy(&fp, &e, &c, &a, &mut got);
-            for (k, v) in mine.into_iter().zip(got) {
-                out[k] = v;
+        let mut pooled = vec![0.0; queries * POOL];
+        for c in 0..n {
+            let q = seg[c] as usize;
+            for j in 0..POOL {
+                pooled[q * POOL + j] += weight[c] * g[c * POOL + j];
             }
         }
+        let board_rows: Vec<u32> = (0..rows as u32).collect();
+        let mut heads = vec![0.0; queries * D];
+        let mut joined = Vec::new();
+        for player in 0..2 {
+            self.join(&p, &jp, &board_rows, &pooled, rows, player, &mut joined);
+            for r in 0..rows {
+                heads[(2 * r + player) * D..(2 * r + player + 1) * D]
+                    .copy_from_slice(&joined[r * D..(r + 1) * D]);
+            }
+        }
+        // Build one action row per cell. This parity path may reuse an action
+        // index across queries, while production action indices belong to one
+        // node and therefore one belief state.
+        let mut cell_feat = vec![0.0; cfg.len() * AFEAT];
+        let mut board_of = Vec::with_capacity(cfg.len());
+        let mut head_of = Vec::with_capacity(cfg.len());
+        for (k, (&c, &a)) in cfg.iter().zip(act).enumerate() {
+            let q = seg[c as usize];
+            cell_feat[k * AFEAT..(k + 1) * AFEAT]
+                .copy_from_slice(&feat[a as usize * AFEAT..(a as usize + 1) * AFEAT]);
+            board_of.push(q / 2);
+            head_of.push(q);
+        }
+        let mut e = Vec::new();
+        self.actions(&cell_feat, &p, &heads, &board_of, &head_of, cfg.len(), &mut e);
+        let cell_act: Vec<u32> = (0..cfg.len() as u32).collect();
+        let mut out = vec![0.0; cfg.len()];
+        self.policy(&fp, &e, cfg, &cell_act, &mut out);
         out
     }
 }

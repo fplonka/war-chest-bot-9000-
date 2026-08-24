@@ -130,7 +130,7 @@ struct Kernels {
     finish: CudaFunction,
     tokens: CudaFunction,
     act_feats: CudaFunction,
-    act_boards: CudaFunction,
+    prior_inputs: CudaFunction,
     act_add: CudaFunction,
     prior: CudaFunction,
     hex_facts: CudaFunction,
@@ -165,7 +165,7 @@ impl Kernels {
             finish: get("k_finish")?,
             tokens: get("k_tokens")?,
             act_feats: get("k_act_feats")?,
-            act_boards: get("k_act_boards")?,
+            prior_inputs: get("k_prior_inputs")?,
             act_add: get("k_act_add")?,
             prior: get("k_prior")?,
             hex_facts: get("k_hex_facts")?,
@@ -2075,19 +2075,59 @@ impl Card {
         sc.tokens.room(na * AW)?;
         sc.h.room((m * D).max(na * D))?;
         sc.projected.room(m * AW)?;
-        let Scratch { x, tokens, h, projected, .. } = &mut *sc;
+        sc.input.room(m * JOIN_IN)?;
+        sc.z.room(m * JW)?;
+        sc.pooled.room((m * JW).max(m * AW))?;
+        let Scratch { x, tokens, h, projected, input, z: join_z, pooled, .. } = &mut *sc;
         let feat = x.buf.as_mut().unwrap();
-        let z = tokens.buf.as_mut().unwrap();
+        let action_z = tokens.buf.as_mut().unwrap();
         let hbuf = h.buf.as_mut().unwrap();
-        let proj = projected.buf.as_mut().unwrap();
+        let board_proj = projected.buf.as_mut().unwrap();
+        let join_in = input.buf.as_mut().unwrap();
+        let join_z = join_z.buf.as_mut().unwrap();
+        let temp = pooled.buf.as_mut().unwrap();
         launch!(self, act_feats, na * AFEAT, &desc_d, &mut *feat, &na_i, &nkinds, &nslot, &nhex, &afeat)?;
-        self.run(l.act_in, feat, na, &mut *z)?;
-        launch!(self, act_boards, m * D, batch.trees.buf(), &part_d, &row_d, &mut *hbuf, &m_i, &d_i)?;
-        self.run(l.act_board, hbuf, m, &mut *proj)?;
-        launch!(self, act_add, na * AW, &mut *z, proj, &act_node_d, &na_i, &aw_i)?;
-        self.norm(l.norms[LN_ACT], na, true, &mut *z)?;
+        self.run(l.act_in, feat, na, &mut *action_z)?;
+        let (pool_i, jw_i) = (POOL as i32, JW as i32);
+        unsafe {
+            self.stream
+                .launch_builder(&self.k.prior_inputs)
+                .arg(batch.trees.buf()).arg(&part_d).arg(&node_d).arg(&row_d)
+                .arg(&mut *join_in).arg(&mut *hbuf).arg(&mut *join_z)
+                .arg(&m_i).arg(&pool_i).arg(&d_i).arg(&jw_i)
+                .launch_unit(LaunchConfig {
+                    grid_dim: (m as u32, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+        }
+        .map_err(err)?;
+        self.run(l.act_board, hbuf, m, &mut *board_proj)?;
+        self.lin(l.join_b, join_in, m, 1.0, join_z)?;
+        self.bias(l.join_b, m, join_z)?;
+        for i in 0..JBLOCKS {
+            let src = join_z.slice(0..m * JW);
+            let mut dst = temp.slice_mut(0..m * JW);
+            self.stream.memcpy_dtod(&src, &mut dst).map_err(err)?;
+            self.norm(l.norms[LN_JOIN + i], m, true, temp)?;
+            self.lin(l.join_w[i], temp, m, 1.0, join_z)?;
+            self.bias(l.join_w[i], m, join_z)?;
+        }
+        {
+            let src = join_z.slice(0..m * JW);
+            let mut dst = temp.slice_mut(0..m * JW);
+            self.stream.memcpy_dtod(&src, &mut dst).map_err(err)?;
+        }
+        self.norm(l.norms[LN_JOUT], m, true, temp)?;
+        self.lin(l.join_out, temp, m, 1.0, hbuf)?;
+        self.bias(l.join_out, m, hbuf)?;
+        self.norm(l.norms[LN_H], m, false, hbuf)?;
+        self.run(l.act_h, hbuf, m, &mut *temp)?;
+        launch!(self, act_add, na * AW, &mut *action_z, board_proj, &act_node_d, &na_i, &aw_i)?;
+        launch!(self, act_add, na * AW, &mut *action_z, temp, &act_node_d, &na_i, &aw_i)?;
+        self.norm(l.norms[LN_ACT], na, true, &mut *action_z)?;
         // `e` reuses `h` after the board rows are done.
-        self.run(l.act_out, z, na, &mut *hbuf)?;
+        self.run(l.act_out, action_z, na, &mut *hbuf)?;
         const WARPS: u32 = 4;
         let cfg = LaunchConfig {
             grid_dim: (widest.div_ceil(WARPS).max(1), m as u32, 1),

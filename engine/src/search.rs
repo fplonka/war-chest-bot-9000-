@@ -2805,6 +2805,33 @@ impl Solver {
         }
     }
 
+    /// The two belief rows at one expanded node, at the instant its prior is
+    /// formed. This is the same normalised reach pooling as `belief_blocks`,
+    /// restricted to the one row the action encoder needs.
+    fn belief_pair(&mut self, node: usize, row: usize, out: &mut [f32]) {
+        let pool = crate::net::POOL;
+        debug_assert_eq!(out.len(), 2 * pool);
+        for p in 0..2 {
+            let n = self.nc[node][p] as usize;
+            let ra = self.roff[node] as usize + if p == 1 { self.nc[node][0] as usize } else { 0 };
+            if self.wbuf.len() < n {
+                self.wbuf.resize(n, 0.0);
+            }
+            normalize_weights(
+                &self.host.as_ref().expect(HOST_PATH).reach[ra..ra + n],
+                &mut self.wbuf[..n],
+            );
+            let cs = self.leaf_coff[2 * row + p] as usize;
+            crate::net::accumulate(
+                &self.cg,
+                &self.leaf_cidx[cs..cs + n],
+                &self.wbuf[..n],
+                pool,
+                &mut out[p * pool..(p + 1) * pool],
+            );
+        }
+    }
+
     /// Fill `vals` at every leaf with the traverser's counterfactual values,
     /// querying the network at every row.
     pub fn leaf_values(&mut self, traverser: usize) {
@@ -3672,14 +3699,30 @@ impl Solver {
         // iteration per thread, more than every other host phase together.
         let d = crate::net::D;
         let mut boards = Vec::with_capacity(want.len() * d);
+        let mut heads = Vec::with_capacity(want.len() * d);
         let mut feat = Vec::new();
         let mut board_of: Vec<u32> = Vec::new();
         let mut base = Vec::with_capacity(want.len());
         for &i in &want {
             base.push(board_of.len() as u32);
-            let at = self.board_of[self.row_of[i] as usize] as usize * d;
+            let row = self.row_of[i] as usize;
+            let board = self.board_of[row] as usize;
+            let at = board * d;
             let mine = (boards.len() / d) as u32;
             boards.extend_from_slice(&self.pb[at..at + d]);
+            let mut pooled = vec![0.0; 2 * crate::net::POOL];
+            self.belief_pair(i, row, &mut pooled);
+            let mut h = Vec::new();
+            self.nets.value.join(
+                &self.pb[at..at + d],
+                &self.jp[board * crate::net::JW..(board + 1) * crate::net::JW],
+                &[0],
+                &pooled,
+                1,
+                self.nodes[i].player as usize,
+                &mut h,
+            );
+            heads.extend_from_slice(&h);
             let n = &self.nodes[i];
             for a in 0..n.na() {
                 let at = feat.len();
@@ -3695,7 +3738,7 @@ impl Solver {
         }
         let na = board_of.len();
         let mut e = Vec::new();
-        self.nets.value.actions(&feat, &boards, &board_of, na, &mut e);
+        self.nets.value.actions(&feat, &boards, &heads, &board_of, &board_of, na, &mut e);
 
         // `logit(c, a) = <f_p(c), e(a)>` over the node's own legal cells, then
         // a softmax across each config's row.

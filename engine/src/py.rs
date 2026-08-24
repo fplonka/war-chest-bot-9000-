@@ -910,6 +910,7 @@ fn infer(
 fn infer_policy(
     xpub: PyReadonlyArray1<f32>,
     phi: PyReadonlyArray1<f32>,
+    weight: PyReadonlyArray1<f32>,
     seg: PyReadonlyArray1<u32>,
     feat: PyReadonlyArray1<f32>,
     cfg: PyReadonlyArray1<u32>,
@@ -921,6 +922,7 @@ fn infer_policy(
     Ok(guard.value.forward_policy(
         xpub.as_slice()?,
         phi.as_slice()?,
+        weight.as_slice()?,
         seg.as_slice()?,
         feat.as_slice()?,
         cfg.as_slice()?,

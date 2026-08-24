@@ -1408,14 +1408,39 @@ __global__ void k_act_feats(const unsigned int* desc, float* feat, int n,
     feat[i] = col == at + (int)desc[5 * (i / afeat) + k] ? 1.0f : 0.0f;
 }
 
-// Every primed node's board vector, gathered out of its own solve's `p`.
-__global__ void k_act_boards(const Tree* trees, const unsigned int* part,
-                             const unsigned int* row, float* boards, int m, int d) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= m * d) return;
-    int k = i / d, j = i % d;
+// The join input and its two cached public rows for every primed node. The
+// belief is the node's normalised reach at the instant its prior is formed.
+__global__ void k_prior_inputs(const Tree* trees, const unsigned int* part,
+                               const unsigned int* node_of,
+                               const unsigned int* row_of, float* input,
+                               float* p_out, float* jp_out, int m, int pool,
+                               int d, int jw) {
+    int k = blockIdx.x, lane = threadIdx.x;
+    if (k >= m) return;
     const Tree& t = trees[part[k]];
-    boards[i] = t.p[(size_t)t.board_of[row[k]] * d + j];
+    unsigned int node = node_of[k], me = t.player[node];
+    for (int role = 0; role < 2; ++role) {
+        unsigned int player = role == 0 ? me : 1 - me;
+        unsigned int n = t.nc[2 * node + player];
+        unsigned int ra = rbase(t, node, player);
+        float total = 0.0f;
+        for (unsigned int c = lane; c < n; c += 32) total += t.reach[ra + c];
+        total = warp_sum(total);
+        float inv = total > 0.0f ? 1.0f / total : 1.0f / (float)max(n, 1u);
+        unsigned int cs = t.coff[2 * row_of[k] + player];
+        for (int j = lane; j < pool; j += 32) {
+            float acc = 0.0f;
+            for (unsigned int c = 0; c < n; ++c) {
+                float belief = total > 0.0f ? t.reach[ra + c] * inv : inv;
+                acc += belief * t.g[(size_t)t.cidx[cs + c] * pool + j];
+            }
+            input[(size_t)k * (2 * pool + 1) + role * pool + j] = acc;
+        }
+    }
+    if (lane == 0) input[(size_t)k * (2 * pool + 1) + 2 * pool] = me == 0 ? -1.0f : 1.0f;
+    unsigned int board = t.board_of[row_of[k]];
+    for (int j = lane; j < d; j += 32) p_out[(size_t)k * d + j] = t.p[(size_t)board * d + j];
+    for (int j = lane; j < jw; j += 32) jp_out[(size_t)k * jw + j] = t.jp[(size_t)board * jw + j];
 }
 
 // The board's projection, added to the action's. A batch spans nodes, so which
