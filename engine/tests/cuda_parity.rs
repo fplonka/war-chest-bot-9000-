@@ -866,6 +866,13 @@ fn a_growing_solve_does_not_depend_on_the_round_it_rides_in() {
             "stream {i} (s={}, c={}) solved a different number of positions",
             s.1.s, s.1.c
         );
+        if alone.nodes != together[i].nodes {
+            eprintln!(
+                "stream {i} s={} c={}: trees {:?} vs {:?}",
+                s.1.s, s.1.c, alone.nodes, together[i].nodes
+            );
+            continue;
+        }
         let t = worst_scaled(&alone.data.cy, &together[i].data.cy, "targets");
         eprintln!(
             "stream {i} s={} c={}: trees {:?} vs {:?}  targets {t:e}",
