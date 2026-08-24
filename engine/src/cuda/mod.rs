@@ -39,7 +39,7 @@ use crate::board::{board, N_HEXES, NONE};
 use crate::farm::{Call, Prime, Reply, CARD_ROWS};
 use crate::net::{
     ln_block, Net, NetLayout, NormSpan, Span, AFEAT, AW, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW,
-    LN_ACT, LN_CFG, LN_H, LN_JOIN, LN_TRUNK, POOL, TYPE,
+    LN_ACT, LN_CFG, LN_H, LN_JOIN, LN_JOUT, LN_TRUNK, POOL, TYPE,
 };
 use crate::pbs::{
     CFEAT, HEX_BLOCK, HEX_CH, HEX_FACTS, LOOSE, MAX_COINS, NSLOT, NTYPE, OFF_CARDS, OFF_LOOSE,
