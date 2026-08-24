@@ -1,0 +1,13 @@
+{
+ "name": "v5-2h-d2t320",
+ "sha": "bd3e685",
+ "mind": "rebel",
+ "weights": "weights.bin",
+ "search": {
+  "depth": 2,
+  "iters": 320,
+  "cfr": "dcfr"
+ },
+ "note": "v5-2h weights, search 2x320",
+ "binary": "f865acd86201"
+}

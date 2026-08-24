@@ -15,8 +15,6 @@ scratch/
 /temp/
 .DS_Store
 
-# Archived bots: a frozen binary, weights and a manifest each.
-bots/
 arena/
 suites/
 .claude/

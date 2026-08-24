@@ -1,0 +1,10 @@
+{
+ "name": "greedy",
+ "mind": "greedy",
+ "search": {
+  "temp": 2.0
+ },
+ "note": "one-ply search on the handcrafted static evaluation; the reference every trained net must beat",
+ "binary": "435c6cafedbd",
+ "sha": "local"
+}

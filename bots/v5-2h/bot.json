@@ -1,0 +1,13 @@
+{
+ "name": "v5-2h",
+ "sha": "bd3e685",
+ "mind": "rebel",
+ "weights": "weights.bin",
+ "search": {
+  "depth": 2,
+  "iters": 64,
+  "cfr": "dcfr"
+ },
+ "note": "v5_d2_125m final, 125 min",
+ "binary": "f865acd86201"
+}
