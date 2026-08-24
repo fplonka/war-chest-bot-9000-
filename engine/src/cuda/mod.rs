@@ -1444,9 +1444,7 @@ impl Card {
         // phase reads what this writes.
         self.wall(16, || self.priors(calls, &pick(2))).map_err(at("priors"))?;
         self.iterate(calls, &pick(3), &mut out).map_err(at("iterate"))?;
-        self.expand_only(calls, &pick(4), &mut out)
-            .map_err(at("expand"))?;
-        self.read(calls, &pick(5), &mut out).map_err(at("read"))?;
+        self.read(calls, &pick(4), &mut out).map_err(at("read"))?;
         {
             let solves = self.solves.lock();
             for &slot in &slots {
@@ -2436,66 +2434,6 @@ impl Card {
                 leaves.extend_from_slice(&host[at..at + want]);
             }
             out.push((i, Reply { leaves, ..Default::default() }));
-        }
-        Ok(())
-    }
-
-    /// Sample leaves owed by an earlier bounded phase, without another CFR
-    /// update. The host grew the leaves that phase did return before issuing
-    /// this call, so the retry sees the larger tree.
-    fn expand_only(
-        &self,
-        calls: &[Call],
-        mine: &[usize],
-        out: &mut Vec<(usize, Reply)>,
-    ) -> Res<()> {
-        if mine.is_empty() {
-            return Ok(());
-        }
-        let mut sims = 0;
-        let mut puct = None;
-        {
-            let mut solves = self.solves.lock();
-            for &i in mine {
-                let Call::Expand { solve, expand, puct: p } = &calls[i] else {
-                    unreachable!("expand shard holds only expand calls")
-                };
-                assert!(
-                    puct.is_none_or(|q| q == *p),
-                    "a round mixes PUCT constants"
-                );
-                puct = Some(*p);
-                let b = self.slot(&mut solves, *solve);
-                b.todo = 1;
-                b.nexpand = *expand;
-                sims = sims.max(*expand);
-            }
-        }
-        let slots = mine.iter().map(|&i| calls[i].solve()).collect::<Vec<_>>();
-        self.lay(&slots)?;
-        let batch = self.batch.lock();
-        self.reaches(&batch, batch.all(), 0, false, 0)?;
-        self.expand(
-            batch.trees.buf(),
-            batch.parts,
-            sims,
-            puct.expect("one call"),
-            0,
-            1,
-        )?;
-        let host = self.sampled(batch.parts as usize * sims)?;
-        for (part, &i) in mine.iter().enumerate() {
-            let Call::Expand { expand, .. } = &calls[i] else {
-                unreachable!()
-            };
-            let at = part * sims;
-            out.push((
-                i,
-                Reply {
-                    leaves: host[at..at + expand].to_vec(),
-                    ..Default::default()
-                },
-            ));
         }
         Ok(())
     }

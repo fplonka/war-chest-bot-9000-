@@ -322,8 +322,9 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
 ///
 /// Growth stops at a terminal and at the round boundary, so a small endgame's
 /// whole frontier goes non-expandable long before a large `s` is spent. Every
-/// `exhausted` ends the solve there; it does not spend the remaining regret
-/// updates on a tree that cannot change.
+/// simulation after that samples a leaf nothing may grow and is thrown away --
+/// which is the failure the deleted node ceiling used to cause, and what
+/// `exhausted` exists to stop.
 #[test]
 fn a_solve_stops_expanding_once_the_tree_is_exhausted() {
     let nets = Arc::new(Nets::default());
@@ -360,7 +361,7 @@ fn a_solve_stops_expanding_once_the_tree_is_exhausted() {
             sv.nodes.len()
         );
         assert_eq!(sv.stop_reason(), StopReason::Exhausted);
-        assert!(sv.trace.iters < cfg.iters() as u64);
+        assert_eq!(sv.trace.iters, cfg.iters() as u64);
         assert_eq!(
             sv.nodes.len(),
             whole,

@@ -343,12 +343,7 @@ impl Cfg {
         if self.c <= 0.0 {
             return 0;
         }
-        // The root is the first expansion. Iterations earn the remaining
-        // `s - 1`, with the same cadence as before and a short final phase.
-        let earned = |k: usize| {
-            let grown = 1usize.saturating_add((k as f32 * self.c).floor() as usize);
-            (self.s as usize).min(grown)
-        };
+        let earned = |k: usize| (self.s as usize).min((k as f32 * self.c).floor() as usize);
         earned(i) - earned(i - 1)
     }
 }
@@ -1140,8 +1135,6 @@ enum Phase {
     /// The round in flight runs iterations, and on the device path an
     /// expansion phase after them.
     Iterating,
-    /// A bounded expansion phase left debt; this round only samples leaves.
-    Expanding,
     /// The round in flight is the last one.
     Reading,
     Done,
@@ -1226,8 +1219,6 @@ pub struct Solver {
     /// Successful expansion phases. Unlike nodes, this is exactly Student of
     /// Games' `s`: one sampled leaf grown, regardless of its branching factor.
     expansions: u32,
-    /// Expansions earned by completed regret updates but not grown yet.
-    debt: u32,
     /// Which round, if any, is in flight.
     phase: Phase,
     /// The leaves the last round was asked for the reach at, in the order the
@@ -1496,7 +1487,6 @@ impl Solver {
             collect: None,
             at: 0,
             expansions: 0,
-            debt: 0,
             phase: Phase::Fresh,
             picks: Vec::new(),
             cfg,
@@ -3201,46 +3191,6 @@ impl Solver {
         }
     }
 
-    fn growth_done(&self) -> bool {
-        self.expansions >= self.cfg.s || self.budget_hit() || self.nodes[0].exhausted
-    }
-
-    /// Grow distinct leaves returned by a phase and retire the debt they pay.
-    fn grow_owed(&mut self, leaves: impl IntoIterator<Item = usize>) -> usize {
-        let mut grew = 0;
-        for leaf in leaves {
-            if self.debt == 0 || self.growth_done() {
-                break;
-            }
-            if self.nodes.get(leaf).is_none_or(|n| !n.leaf || !n.expandable) {
-                continue;
-            }
-            let before = self.expansions;
-            self.expand(leaf);
-            if self.expansions > before {
-                self.debt -= 1;
-                grew += 1;
-            }
-        }
-        grew
-    }
-
-    /// A bounded sampler may miss every live leaf. Make deterministic progress
-    /// rather than ending a solve whose public tree can still grow.
-    fn force_one_owed(&mut self) -> usize {
-        if self.debt == 0 || self.growth_done() {
-            return 0;
-        }
-        let Some(leaf) = self.nodes.iter().position(|n| n.leaf && n.expandable) else {
-            debug_assert!(
-                self.nodes[0].exhausted,
-                "an unsealed root has an expandable leaf"
-            );
-            return 0;
-        };
-        self.grow_owed([leaf])
-    }
-
     /// Consume the replies this solve was waiting for, do the host's share of
     /// the work, and say what it wants next.
     ///
@@ -3282,30 +3232,15 @@ impl Solver {
                 self.phase = Phase::Iterating;
                 return Step::Calls(calls);
             }
-            if self.growth_done() || (self.cfg.c <= 0.0 && self.at == iters) {
+            if self.at == iters {
                 self.finish();
                 self.phase = Phase::Done;
                 return Step::Done(self.collect.map(|q| self.harvest(q)));
             }
-            if self.debt > 0 {
-                self.refresh_priors();
-                let mut taken = Vec::new();
-                self.expansion_phase(self.debt as usize, &mut taken);
-                let mut grew = self.grow_owed(taken);
-                if grew == 0 {
-                    grew = self.force_one_owed();
-                }
-                if grew > 0 {
-                    self.precompute_reaches();
-                }
-                continue;
-            }
-            debug_assert!(self.at < iters, "all iterations must earn s expansions");
             // The same round the device runs, on this core: `done` regret
             // updates against a frozen tree, each sampling `want` trajectories,
             // and one growth at the end from all of them.
             let (done, want) = self.round_shape();
-            self.debt += (done * want) as u32;
             // The expansion phase reads the prior at every node it walks
             // through, and growth has just run the batch that the nodes it
             // added were waiting for. Once a round, which is where the card's
@@ -3320,11 +3255,14 @@ impl Solver {
                 self.step();
                 self.expansion_phase(want, &mut taken);
             }
-            let mut grew = self.grow_owed(taken);
-            if grew == 0 {
-                grew = self.force_one_owed();
+            let grew = !taken.is_empty();
+            for leaf in taken {
+                if self.budget_hit() {
+                    break;
+                }
+                self.expand(leaf);
             }
-            if grew > 0 {
+            if grew {
                 // Growth appended reach rows after `step` propagated the old
                 // tree. The next regret update must see the new leaves.
                 self.precompute_reaches();
@@ -3359,19 +3297,20 @@ impl Solver {
     fn advance_on_device(&mut self, replies: &[Reply]) -> Step {
         match self.phase {
             Phase::Fresh => {}
-            Phase::Iterating | Phase::Expanding => {
+            Phase::Iterating => {
                 self.absorb(replies);
                 let last = replies.last().expect("a round answers every call it was given");
-                let leaves = last
-                    .leaves
-                    .iter()
-                    .copied()
-                    .filter(|&leaf| leaf != crate::contract::NO_ROW)
-                    .map(|leaf| leaf as usize)
-                    .collect::<Vec<_>>();
-                let grew = self.grow_owed(leaves);
-                if grew == 0 {
-                    self.force_one_owed();
+                // Distinct by construction: a phase draws until it has leaves
+                // no phase of this round has taken. A short row reads as
+                // nothing, which is a phase that spent its draws.
+                for &leaf in &last.leaves.clone() {
+                    if leaf == crate::contract::NO_ROW {
+                        continue;
+                    }
+                    if self.budget_hit() {
+                        break;
+                    }
+                    self.expand(leaf as usize);
                 }
             }
             Phase::Reading => {
@@ -3382,17 +3321,12 @@ impl Solver {
             }
             Phase::Done => unreachable!("a finished solve is not advanced again"),
         }
-        if self.growth_done() || (self.cfg.c <= 0.0 && self.at == self.cfg.iters()) {
-            self.phase = Phase::Reading;
-            Step::Calls(self.read_round())
-        } else if self.debt > 0 {
-            self.phase = Phase::Expanding;
-            Step::Calls(self.expand_round())
-        } else if self.at < self.cfg.iters() {
+        if self.at < self.cfg.iters() {
             self.phase = Phase::Iterating;
             Step::Calls(self.iterate_round())
         } else {
-            unreachable!("all iterations must earn s expansions")
+            self.phase = Phase::Reading;
+            Step::Calls(self.read_round())
         }
     }
 
@@ -3423,7 +3357,6 @@ impl Solver {
     /// The next round of iterations, and the expansion phases inside it.
     fn iterate_round(&mut self) -> Vec<Call> {
         let (done, expand) = self.round_shape();
-        self.debt += (done * expand) as u32;
         let mut calls = self.growth_calls();
         // The iteration's decay factors read the step count as it stands, so
         // both calls are built before it advances. The tree call also names the
@@ -3441,18 +3374,6 @@ impl Solver {
         self.steps = [self.steps[0] + done, self.steps[1] + done];
         self.avg_touched = [true; 2];
         self.at += done;
-        calls
-    }
-
-    /// Retry expansion debt against the tree grown from the previous reply.
-    fn expand_round(&mut self) -> Vec<Call> {
-        let mut calls = self.growth_calls();
-        calls.push(self.tree_call());
-        calls.push(Call::Expand {
-            solve: self.slot,
-            expand: self.debt as usize,
-            puct: self.cfg.puct,
-        });
         calls
     }
 
