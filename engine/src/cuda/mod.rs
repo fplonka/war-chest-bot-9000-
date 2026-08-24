@@ -892,7 +892,13 @@ impl Device {
             // `carve_bytes(n)` per pipe, which matches that only while every
             // buffer is linear in n. Walk n down until the bytes that will
             // actually be allocated fit.
-            let mut n = (fit as usize).min(left / gpus_left.max(1));
+            // More residency is not more throughput: a swept 8-minute run per
+            // point (runs/perf1_slots{26b,64,128,max}, 2026-08-24) measured
+            // 190 / 215 / 96 / 62 solves/s at 26 / 64 / 128 / ~176 slots a
+            // card, with the GPU ~94% busy throughout -- past the knee the
+            // rounds grow faster than the card retires them. Carve the knee.
+            const SLOTS_KNEE: usize = 64;
+            let mut n = (fit as usize).min(left / gpus_left.max(1)).min(SLOTS_KNEE);
             while n > 0 {
                 let need = n as u64 * slot + PIPELINE as u64 * Card::carve_bytes(n, &cfg);
                 if need + need / 10 <= free {
