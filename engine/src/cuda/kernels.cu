@@ -109,7 +109,7 @@ __global__ void k_gelu(float* x, int n) {
 // quarter of its lanes idle throughout. Measured at a third of all device
 // time, it was the largest kernel in the profile.
 //
-// The join's four norms are not here: they are fused into `k_join`, which
+// The join's four norms are not here: they are fused into `k_leaf`, which
 // keeps its residual stream in registers and never writes a row out to be
 // normalised.
 __global__ void k_norm_ip(float* x, const float* gamma, const float* beta,
@@ -982,72 +982,14 @@ __global__ void k_avg_block(const Tree* trees, const unsigned int* work, int at,
         t.sum[so + cell] += t.reach[ra + t.cell_row[so + cell]] * t.cur[so + cell];
 }
 
-// The belief-weighted pooling of a query's configs, with the belief itself
-// formed here rather than written to a round-wide array and read back.
+// ------------------------------------------------------------ the leaf network
 //
-// `coff` bounds a query's cells in the round, `cidx` names each cell's row in
-// its own solve's `g`, and the two orders agree: cell `k` of the query is
-// config `k - lo` of the node, so its reach is a step along the node's own
-// block.
-//
-// `threadIdx.y` splits the support, because that is where the parallelism is:
-// the row is only `pool` wide and the sum runs over a hundred-odd configs, each
-// a dependent gather. One thread per output channel walked the whole support
-// serially and left the block waiting on memory.
-__global__ void k_belief_pool(const Tree* trees, const int* part_of_row,
-                              const int* local_row, const int* base_of_part,
-                              const unsigned int* coff, float* out, float* mass,
-                              int q0, int queries, int stride, int pool) {
-    extern __shared__ float part_acc[];
-    __shared__ float reach_sum;
-    int mine = blockIdx.x;
-    if (mine >= queries) return;
-    int q = q0 + mine, r = q >> 1, p = q & 1;
-    int part = part_of_row[r];
-    const Tree& t = trees[part];
-    unsigned int node = t.leaf_node[local_row[r]];
-    unsigned int n = t.nc[2 * node + p], ra = rbase(t, node, p);
-    unsigned int base = base_of_part[part], lo = coff[q], hi = coff[q + 1];
-    int j = threadIdx.x, y = threadIdx.y, ny = blockDim.y;
-    // The block's first warp sums the query's reach, in the same five shuffles
-    // over the same lane order the separate belief kernel used, so the belief
-    // it hands on is the one that array held. Every thread then divides by it,
-    // which is why the sum goes through shared memory.
-    int tid = j + blockDim.x * y;
-    if (tid < 32) {
-        float sum = 0.0f;
-        for (unsigned int c = tid; c < n; c += 32) sum += t.reach[ra + c];
-        sum = warp_sum(sum);
-        if (tid == 0) {
-            reach_sum = sum;
-            mass[(size_t)p * stride + r] = sum;
-        }
-    }
-    __syncthreads();
-    float total = reach_sum;
-    float inv = total > 0.0f ? 1.0f / total : 1.0f / (float)max(n, 1u);
-    float acc = 0.0f;
-    for (unsigned int k = lo + y; k < hi; k += ny) {
-        float beta = total > 0.0f ? t.reach[ra + (k - lo)] * inv : inv;
-        acc += beta * t.g[(size_t)t.cidx[k - base] * pool + j];
-    }
-    part_acc[y * pool + j] = acc;
-    __syncthreads();
-    if (y == 0) {
-        float pooled = 0.0f;
-        for (int i = 0; i < ny; ++i) pooled += part_acc[i * pool + j];
-        out[(size_t)mine * pool + j] = pooled;
-    }
-}
-
-// ------------------------------------------------------------- the join MLP
-//
-// `net::Net::join`, whole, in one launch: the residual seed, `join_b`, three
-// LayerNorm-GELU-multiply residual blocks, the output norm and `join_out`.
+// Belief pooling, `net::Net::join`, the head norm and the config readout in one
+// launch. A block keeps all intermediate rows in registers or shared memory.
 //
 // A warp is the unit of a multiply, as in `k_trunk`. `mma.sync.m16n8k8` takes
 // a 16x8 slab of the activations and an 8x8 slab of the weight; sixteen warps
-// cover the 128-wide residual, four sixteen-row tiles cover the block's 64
+// cover the 128-wide residual, two sixteen-row tiles cover the block's 32
 // rows. `J_IN` is 136: JOIN_IN padded from 129 so the first `k` is whole
 // fragments. Those seven extra columns are zero.
 //
@@ -1055,9 +997,9 @@ __global__ void k_belief_pool(const Tree* trees, const int* part_of_row,
 // activations go through shared memory, bank-padded, rounded to tf32 as they
 // are stored. The weights arrive fragwise from the host, rounded once.
 //
-// Two blocks an SM is what the shared memory allows. The bound asks for three
-// so the register cap leaves the file open for the sweep blocks the other
-// card needs.
+// Rows are interleaved by traverser so both pooled beliefs of a leaf stay in
+// the same block. The shared buffer first holds the join operand and pooled
+// beliefs, then becomes the 256-wide head. The reach masses follow it.
 #define J_SPAN (J_W / 8)
 #define J_MT (J_ROWS / 16)
 #define J_LDS (J_IN + 4)
@@ -1129,16 +1071,49 @@ __device__ __forceinline__ void join_norm(float (&z)[J_MT][4], float* act,
     __syncthreads();
 }
 
-__global__ __launch_bounds__(32 * J_SPAN, 3)
-void k_join(const Tree* trees, const int* part_of_row, const int* local_row,
-            const float* pooled, const float* wj, const float* lnj,
-            const float* owed, float* h, int rows, int tile, int q0) {
-    __shared__ __align__(16) float act[J_ROWS * J_LDS];
+__global__ __launch_bounds__(32 * J_SPAN, 2)
+void k_leaf(const Tree* trees, const int* part_of_row, const int* local_row,
+            const int* base_of_part, const unsigned int* coff,
+            const float* wj, const float* lnj, const float* owed,
+            const float* cf_bias, const float* gamma, const float* beta,
+            int rows, int q0) {
+    __shared__ __align__(16) float shared[J_ROWS * (J_D + 1)];
+    float* act = shared;
+    float* pooled = shared + J_ROWS * J_LDS;
+    float* mass = shared + J_ROWS * J_D;
 
     int lane = threadIdx.x, slot = threadIdx.y;
     int tid = lane + 32 * slot, nt = 32 * J_SPAN;
     int row0 = blockIdx.x * J_ROWS;
     float z[J_MT][4];
+
+    // One warp pools one query at a time. Consecutive rows are the two
+    // traversers of one leaf, so the join reuses both rows in this block.
+    for (int qr = slot; qr < J_ROWS; qr += J_SPAN) {
+        int query = row0 + qr;
+        if (query >= rows) continue;
+        int r = q0 + (query >> 1), p = query & 1;
+        int part = part_of_row[r];
+        const Tree& t = trees[part];
+        unsigned int node = t.leaf_node[local_row[r]];
+        unsigned int n = t.nc[2 * node + p], ra = rbase(t, node, p);
+        unsigned int base = base_of_part[part];
+        unsigned int lo = coff[2 * r + p], hi = coff[2 * r + p + 1];
+        float total = 0.0f;
+        for (unsigned int c = lane; c < n; c += 32) total += t.reach[ra + c];
+        total = warp_sum(total);
+        if (lane == 0) mass[qr] = total;
+        float inv = total > 0.0f ? 1.0f / total : 1.0f / (float)max(n, 1u);
+        for (int j = lane; j < J_POOL; j += 32) {
+            float acc = 0.0f;
+            for (unsigned int k = lo; k < hi; ++k) {
+                float belief = total > 0.0f ? t.reach[ra + k - lo] * inv : inv;
+                acc += belief * t.g[(size_t)t.cidx[k - base] * J_POOL + j];
+            }
+            pooled[(size_t)qr * J_POOL + j] = acc;
+        }
+    }
+    __syncthreads();
 
     // jp into shared, then into the accumulators. The same buffer then takes
     // the belief input, so the seed is read once.
@@ -1147,7 +1122,7 @@ void k_join(const Tree* trees, const int* part_of_row, const int* local_row,
         int row = row0 + i;
         float v = 0.0f;
         if (row < rows && c < J_W) {
-            int p = row >= tile ? 1 : 0, q = row - p * tile, rr = q0 + q;
+            int rr = q0 + (row >> 1);
             const Tree& t = trees[part_of_row[rr]];
             v = t.jp[(size_t)t.board_of[local_row[rr]] * J_W + c];
         }
@@ -1166,9 +1141,9 @@ void k_join(const Tree* trees, const int* part_of_row, const int* local_row,
         int row = row0 + i;
         float v = 0.0f;
         if (row < rows && c < 2 * J_POOL + 1) {
-            int p = row >= tile ? 1 : 0, q = row - p * tile;
-            const float* mine = pooled + ((size_t)2 * q + p) * J_POOL;
-            const float* theirs = pooled + ((size_t)2 * q + 1 - p) * J_POOL;
+            int qr = row - row0, p = row & 1;
+            const float* mine = pooled + (size_t)qr * J_POOL;
+            const float* theirs = pooled + (size_t)(qr ^ 1) * J_POOL;
             if (c < J_POOL) v = mine[c];
             else if (c < 2 * J_POOL) v = theirs[c - J_POOL];
             else v = p == 0 ? -1.0f : 1.0f;
@@ -1188,92 +1163,82 @@ void k_join(const Tree* trees, const int* part_of_row, const int* local_row,
     join_norm(z, act, lnj + 2 * J_BLOCKS * J_W, lnj + (2 * J_BLOCKS + 1) * J_W,
               owed + J_BLOCKS * J_W);
 
-    // `join_out` is 256 wide, so the sixteen warps cover it in two passes.
-    // The residual stream ended at the norm above, so `z` is the accumulator.
+    // Keep the first half of join_out in registers while the second half still
+    // reads `act`. Then the shared join operand can become the whole head.
+    float head0[J_MT][4];
     for (int pass = 0; pass < J_D / J_W; ++pass) {
 #pragma unroll
         for (int m = 0; m < J_MT; ++m)
 #pragma unroll
             for (int i = 0; i < 4; ++i) z[m][i] = 0.0f;
         join_mma(z, act, w, J_KS, J_OUT_TILES, pass * J_SPAN);
+        if (pass == 0) {
 #pragma unroll
-        for (int m = 0; m < J_MT; ++m)
+            for (int m = 0; m < J_MT; ++m)
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                int r = frag_row(m, i, lane), j = frag_col(i, slot, lane);
-                int row = row0 + r;
-                if (row < rows) h[(size_t)row * J_D + pass * J_W + j] = z[m][i];
+                for (int i = 0; i < 4; ++i) head0[m][i] = z[m][i];
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int m = 0; m < J_MT; ++m)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int r = frag_row(m, i, lane), j = frag_col(i, slot, lane);
+            int row = row0 + r;
+            if (row < rows) {
+                int rr = q0 + (row >> 1);
+                const Tree& t = trees[part_of_row[rr]];
+                const float* seed = t.p + (size_t)t.board_of[local_row[rr]] * J_D;
+                shared[(size_t)r * J_D + j] = head0[m][i] + seed[j] + owed[(J_BLOCKS + 1) * J_W + j];
+                shared[(size_t)r * J_D + J_W + j] = z[m][i] + seed[J_W + j]
+                    + owed[(J_BLOCKS + 1) * J_W + J_W + j];
             }
-    }
-}
+        }
+    __syncthreads();
 
-// `v(c) = (<f(c), h_row> + bias) * opp_reach[row]`, for every config of the
-// queried player at every leaf of the batch, written straight into that
-// solve's own value arena.
-//
-// One block per row, one config per warp, and the row's head vector staged in
-// shared memory so it is read once for the row rather than once for each of its
-// hundred-odd configs.
-__global__ void k_readout(const Tree* trees, const int* part_of_row,
-                          const int* local_row, const unsigned int* coff,
-                          const float* h, const float* cf_bias, const float* mass,
-                          const float* add, const float* gamma, const float* beta,
-                          int rows, int stride, int d, int q0, int tile) {
-    extern __shared__ float hs[];
-    __shared__ float red[8];
-    int row = blockIdx.x;
-    if (row >= rows) return;
-    // `row` indexes this tile's join rows; `traverser` and `r` are the round's.
-    int traverser = row / tile, r = q0 + row % tile;
-    int tid = threadIdx.x + 32 * threadIdx.y, nt = 32 * blockDim.y;
-    // The head's own LayerNorm, done here rather than in a pass of its own.
-    // This is the only reader of `h`, and it stages the row in shared memory
-    // anyway, so normalising it costs one reduction instead of a read and a
-    // write of every head vector in the round.
-    // The head's residual seed is this leaf's board vector, added here rather
-    // than copied into `h` by a gather of its own -- `h` is written once by the
-    // join's last multiply and read once, here.
-    const Tree& tr = trees[part_of_row[r]];
-    const float* seed = tr.p + (size_t)tr.board_of[local_row[r]] * d;
-    float sum = 0.0f;
-    for (int j = tid; j < d; j += nt) {
-        float x = h[(size_t)row * d + j] + seed[j] + add[j];
-        hs[j] = x;
-        sum += x;
-    }
-    for (int s = 16; s > 0; s >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, s);
-    if (threadIdx.x == 0) red[threadIdx.y] = sum;
-    __syncthreads();
-    float total = 0.0f;
-    for (int k = 0; k < blockDim.y; ++k) total += red[k];
-    float mean = total / d, var = 0.0f;
-    for (int j = tid; j < d; j += nt) {
-        float dv = hs[j] - mean;
-        var += dv * dv;
-    }
-    for (int s = 16; s > 0; s >>= 1) var += __shfl_xor_sync(0xffffffff, var, s);
-    __syncthreads();
-    if (threadIdx.x == 0) red[threadIdx.y] = var;
-    __syncthreads();
-    total = 0.0f;
-    for (int k = 0; k < blockDim.y; ++k) total += red[k];
-    float inv = rsqrtf(total / d + 1e-5f);
-    __syncthreads();
-    for (int j = tid; j < d; j += nt) hs[j] = (hs[j] - mean) * inv * gamma[j] + beta[j];
-    __syncthreads();
-    const Tree& t = trees[part_of_row[r]];
-    unsigned int node = t.leaf_node[local_row[r]];
-    unsigned int lo = coff[2 * r + traverser], hi = coff[2 * r + traverser + 1];
-    unsigned int cs = t.coff[2 * local_row[r] + traverser];
-    float bias = *cf_bias, scale = mass[(size_t)(1 - traverser) * stride + r];
-    float* vals = t.vals + traverser * t.nvals;
-    unsigned int vo = t.voff[node];
-    for (unsigned int k = lo + threadIdx.y; k < hi; k += blockDim.y) {
-        const float* fr = t.f + (size_t)t.cidx[cs + (k - lo)] * d;
-        float acc = 0.0f;
-        for (int j = threadIdx.x; j < d; j += 32) acc += fr[j] * hs[j];
-        for (int s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xffffffff, acc, s);
-        if (threadIdx.x == 0) vals[vo + (k - lo)] = (acc + bias) * scale;
+    // One warp normalises a head row and then reads out its configs.
+    for (int lr = slot; lr < J_ROWS; lr += J_SPAN) {
+        int row = row0 + lr;
+        if (row >= rows) continue;
+        float h[J_D / 32];
+        float sum = 0.0f;
+#pragma unroll
+        for (int q = 0; q < J_D / 32; ++q) {
+            h[q] = shared[(size_t)lr * J_D + lane + 32 * q];
+            sum += h[q];
+        }
+        sum = warp_sum(sum);
+        float mean = sum / (float)J_D, var = 0.0f;
+#pragma unroll
+        for (int q = 0; q < J_D / 32; ++q) {
+            float d = h[q] - mean;
+            var += d * d;
+        }
+        float inv = rsqrtf(warp_sum(var) / (float)J_D + 1e-5f);
+#pragma unroll
+        for (int q = 0; q < J_D / 32; ++q) {
+            int j = lane + 32 * q;
+            h[q] = (h[q] - mean) * inv * gamma[j] + beta[j];
+        }
+
+        int traverser = row & 1, r = q0 + (row >> 1);
+        const Tree& t = trees[part_of_row[r]];
+        unsigned int node = t.leaf_node[local_row[r]];
+        unsigned int lo = coff[2 * r + traverser], hi = coff[2 * r + traverser + 1];
+        unsigned int cs = t.coff[2 * local_row[r] + traverser];
+        float scale = mass[lr ^ 1], bias = *cf_bias;
+        float* vals = t.vals + traverser * t.nvals;
+        unsigned int vo = t.voff[node];
+        for (unsigned int k = lo; k < hi; ++k) {
+            const float* fr = t.f + (size_t)t.cidx[cs + k - lo] * J_D;
+            float acc = 0.0f;
+#pragma unroll
+            for (int q = 0; q < J_D / 32; ++q) acc += fr[lane + 32 * q] * h[q];
+            for (int s = 16; s > 0; s >>= 1)
+                acc += __shfl_down_sync(0xffffffff, acc, s);
+            if (lane == 0) vals[vo + k - lo] = (acc + bias) * scale;
+        }
     }
 }
 
