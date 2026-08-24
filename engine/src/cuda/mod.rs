@@ -378,6 +378,11 @@ fn owed_by_the_join(l: &NetLayout, b: &[f32]) -> Vec<f32> {
 /// size when the card is carved, so a round cannot grow it.
 const TILE: usize = 16384;
 
+/// Policy joins use one fixed GEMM shape. A different row count can select a
+/// different cuBLAS algorithm, move the last bits of a prior, and make PUCT
+/// grow a different leaf when the same solve shares a round.
+const PRIOR_ROWS: usize = 32;
+
 /// Join rows one block of `k_leaf` holds.
 ///
 /// Shared is the 32 KiB head. Two 512-thread blocks are 66 % occupancy on the
@@ -2009,7 +2014,7 @@ impl Card {
             let mut j = i;
             let mut na_c = 0usize;
             let mut wide = 0u32;
-            while j < m && (j - i) < TILE && na_c + nas[j] <= TILE {
+            while j < m && (j - i) < PRIOR_ROWS && na_c + nas[j] <= TILE {
                 na_c += nas[j];
                 wide = wide.max(ncs[j]);
                 j += 1;
@@ -2073,11 +2078,11 @@ impl Card {
         let mut sc = self.scratch.lock();
         sc.x.room(na * AFEAT)?;
         sc.tokens.room(na * AW)?;
-        sc.h.room((m * D).max(na * D))?;
+        sc.h.room((PRIOR_ROWS * D).max(na * D))?;
         sc.projected.room(m * AW)?;
-        sc.input.room(m * JOIN_IN)?;
-        sc.z.room(m * JW)?;
-        sc.pooled.room((m * JW).max(m * AW))?;
+        sc.input.room(PRIOR_ROWS * JOIN_IN)?;
+        sc.z.room(PRIOR_ROWS * JW)?;
+        sc.pooled.room(PRIOR_ROWS * AW)?;
         let Scratch { x, tokens, h, projected, input, z: join_z, pooled, .. } = &mut *sc;
         let feat = x.buf.as_mut().unwrap();
         let action_z = tokens.buf.as_mut().unwrap();
@@ -2103,26 +2108,26 @@ impl Card {
         }
         .map_err(err)?;
         self.run(l.act_board, hbuf, m, &mut *board_proj)?;
-        self.lin(l.join_b, join_in, m, 1.0, join_z)?;
-        self.bias(l.join_b, m, join_z)?;
+        self.lin(l.join_b, join_in, PRIOR_ROWS, 1.0, join_z)?;
+        self.bias(l.join_b, PRIOR_ROWS, join_z)?;
         for i in 0..JBLOCKS {
-            let src = join_z.slice(0..m * JW);
-            let mut dst = temp.slice_mut(0..m * JW);
+            let src = join_z.slice(0..PRIOR_ROWS * JW);
+            let mut dst = temp.slice_mut(0..PRIOR_ROWS * JW);
             self.stream.memcpy_dtod(&src, &mut dst).map_err(err)?;
-            self.norm(l.norms[LN_JOIN + i], m, true, temp)?;
-            self.lin(l.join_w[i], temp, m, 1.0, join_z)?;
-            self.bias(l.join_w[i], m, join_z)?;
+            self.norm(l.norms[LN_JOIN + i], PRIOR_ROWS, true, temp)?;
+            self.lin(l.join_w[i], temp, PRIOR_ROWS, 1.0, join_z)?;
+            self.bias(l.join_w[i], PRIOR_ROWS, join_z)?;
         }
         {
-            let src = join_z.slice(0..m * JW);
-            let mut dst = temp.slice_mut(0..m * JW);
+            let src = join_z.slice(0..PRIOR_ROWS * JW);
+            let mut dst = temp.slice_mut(0..PRIOR_ROWS * JW);
             self.stream.memcpy_dtod(&src, &mut dst).map_err(err)?;
         }
-        self.norm(l.norms[LN_JOUT], m, true, temp)?;
-        self.lin(l.join_out, temp, m, 1.0, hbuf)?;
-        self.bias(l.join_out, m, hbuf)?;
-        self.norm(l.norms[LN_H], m, false, hbuf)?;
-        self.run(l.act_h, hbuf, m, &mut *temp)?;
+        self.norm(l.norms[LN_JOUT], PRIOR_ROWS, true, temp)?;
+        self.lin(l.join_out, temp, PRIOR_ROWS, 1.0, hbuf)?;
+        self.bias(l.join_out, PRIOR_ROWS, hbuf)?;
+        self.norm(l.norms[LN_H], PRIOR_ROWS, false, hbuf)?;
+        self.run(l.act_h, hbuf, PRIOR_ROWS, &mut *temp)?;
         launch!(self, act_add, na * AW, &mut *action_z, board_proj, &act_node_d, &na_i, &aw_i)?;
         launch!(self, act_add, na * AW, &mut *action_z, temp, &act_node_d, &na_i, &aw_i)?;
         self.norm(l.norms[LN_ACT], na, true, &mut *action_z)?;
