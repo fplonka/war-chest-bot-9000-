@@ -110,6 +110,7 @@ def main():
     assert phi.shape[1] == CFEAT
     assert seg.max() == 2 * len(tr[0]) - 1
     assert nseg == 2 * len(tr[0])
+    assert torch.allclose(torch.bincount(seg, w), torch.ones(nseg), atol=1e-6)
     assert not len(policy[0]) and not len(policy[1])
     assert torch.isfinite(xpub).all() and torch.isfinite(y).all()
     trows, tcc, tcp = tr[0], tr[1], tr[2]

@@ -264,9 +264,11 @@ class Buffer:
                np.repeat(rowbase, clen) + self.pci[ci % self.pcap].astype(np.int64),
                self.pp[ci % self.pcap].astype(np.float32),
                np.repeat(np.arange(len(ids), dtype=np.int64), alen))
-        return (self.x[s], self.cc[at], self.cp[at],
-                self.cw[at].astype(np.float32), self.cy[at].astype(np.float32),
-                seg, pol)
+        cw = self.cw[at].astype(np.float32)
+        mass = np.bincount(seg, weights=cw, minlength=2 * len(ids)).astype(np.float32)
+        cw /= mass[seg]
+        return (self.x[s], self.cc[at], self.cp[at], cw,
+                self.cy[at].astype(np.float32), seg, pol)
 
     def sample(self, batch, rng, recent_mix=0.0, recent_frac=0.2):
         """A batch, part of it drawn from the newest rows only.
