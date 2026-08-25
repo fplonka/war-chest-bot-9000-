@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The GPU box: send the code, run train.py, bring one run back when it finishes.
 #
-#   tools/box.sh go out=seat note="the idea"
-#   tools/box.sh follow run
+#   tools/box.sh go out=seat note="the idea"        train, queued behind other GPU jobs
+#   tools/box.sh start m1 python tools/arena.py ...  any GPU job, same queue
+#   tools/box.sh follow m1
 #   tools/box.sh pull seat
 #   tools/box.sh sync
 #   tools/box.sh build
@@ -82,6 +83,21 @@ follow)
     fi
     echo "JOB_DONE tag=$tag ok"
     ;;
+start)
+    # start <tag> <command...>: the command runs detached on the box, queued
+    # behind every other GPU job by one lock, with its log, pid and exit code
+    # under /workspace/logs/<tag>.*. `follow <tag>` waits on it.
+    tag=${2:?usage: start <tag> <command...>}
+    shift 2
+    cmd=$(printf '%q ' "$@")
+    run_remote "mkdir -p /workspace/logs
+rm -f /workspace/logs/$tag.pid /workspace/logs/$tag.exit
+nohup setsid bash -lc $(printf '%q' "$prelude
+echo \$\$ > /workspace/logs/$tag.pid
+flock /workspace/gpu.lock -c $(printf '%q' "$cmd")
+echo \$? > /workspace/logs/$tag.exit") >/workspace/logs/$tag.log 2>&1 &
+echo started $tag"
+    ;;
 go)
     shift
     out=
@@ -91,15 +107,8 @@ go)
     [ -n "$out" ] || { echo "go needs out=<name>" >&2; exit 1; }
     "$0" sync
     "$0" build
-    cmd=$(printf '%q ' python train/train.py "$@")
-    run_remote "mkdir -p /workspace/logs
-rm -f /workspace/logs/run.pid /workspace/logs/run.exit
-nohup setsid bash -lc $(printf '%q' "$prelude
-echo \$\$ > /workspace/logs/run.pid
-$cmd
-echo \$? > /workspace/logs/run.exit") >/workspace/logs/run.log 2>&1 &
-echo started run"
-    "$0" follow run "$out"
+    "$0" start "$out" python train/train.py "$@"
+    "$0" follow "$out" "$out"
     ;;
 "")  sed -n '2,9p' "$0" ;;
 *)   run_remote "$*" ;;
