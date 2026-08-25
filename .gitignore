@@ -18,3 +18,8 @@ scratch/
 arena/
 suites/
 .claude/
+
+# Local experiment runs: gigabytes of snapshots and logs the dashboard serves
+# from disk. Durable artifacts live in bots/ packs and the run logs already
+# tracked, which stay tracked.
+runs/
