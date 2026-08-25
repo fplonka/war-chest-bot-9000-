@@ -100,7 +100,7 @@ def main():
                 return 0
             except Exception as e:  # taken under us: keep polling
                 print(time.strftime("%H:%M:%S"), f"rent failed: {e}", flush=True)
-        if polls % 300 == 0:
+        if polls % 3600 == 0:
             print(time.strftime("%H:%M:%S"), f"{polls} polls, delay {delay:.1f}s, still watching", flush=True)
 
 
