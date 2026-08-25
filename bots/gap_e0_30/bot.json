@@ -1,0 +1,15 @@
+{
+ "name": "gap_e0_30",
+ "sha": "68a360c+dirty",
+ "binary": "2a73cda4bdd4",
+ "mind": "sog",
+ "weights": "weights.bin",
+ "search": {
+  "s": 512,
+  "c": 8.0,
+  "rounds": 0,
+  "cfr": "sog"
+ },
+ "minutes": 30.1,
+ "note": "gap_e0_30 final, 30 min"
+}
