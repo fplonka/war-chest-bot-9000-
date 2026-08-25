@@ -66,7 +66,8 @@ pull)
     echo "pulled $name"
     ;;
 build)
-    run_remote "$build_script"
+    "$0" start build bash -c "$build_script"
+    "$0" follow build
     ;;
 follow)
     tag=${2:?usage: follow <tag> [run]}
