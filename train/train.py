@@ -911,7 +911,7 @@ def main():
                     "white_wins", "black_wins", "draws",
                     "plays_attack", "plays_pass", "plays_deploy",
                     "plays_bolster", "plays_maneuver", "plays_recruit",
-                    "configs", "query_rows"):
+                    "plays_claim_initiative", "configs", "query_rows"):
                 amount = int(data.get(name, 0))
                 totals[name] += amount
                 window[name] += amount
@@ -1107,7 +1107,7 @@ def main():
                     name: int(window[f"plays_{name}"])
                     for name in (
                         "attack", "pass", "deploy", "bolster",
-                        "maneuver", "recruit")
+                        "maneuver", "recruit", "claim_initiative")
                 },
                 "configs": round(window["configs"] / dec, 1),
                 "cap_value": round(cap_v, 4),

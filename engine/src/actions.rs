@@ -56,8 +56,8 @@ pub const N_KINDS: usize = 39;
 use crate::board::NONE;
 
 /// Coarse move classes for run telemetry. What a policy spends its decisions on
-/// is what shifts between the phases of a game, and four counters make that
-/// visible in the run report without touching the search.
+/// is what shifts between the phases of a game. The run report shows that mix
+/// without touching the search.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Play {
     Attack,
@@ -66,8 +66,8 @@ pub enum Play {
     Bolster,
     /// Moves a unit or takes control of a hex, however the coin paid for it.
     Maneuver,
-    /// A facedown coin spent on the economy rather than the board.
     Recruit,
+    ClaimInitiative,
     Other,
 }
 
@@ -535,7 +535,8 @@ impl Action {
             | Action::MercMove { .. }
             | Action::MercControl { .. }
             | Action::SwordsmanMove { .. } => Play::Maneuver,
-            Action::Recruit { .. } | Action::ClaimInitiative { .. } => Play::Recruit,
+            Action::Recruit { .. } => Play::Recruit,
+            Action::ClaimInitiative { .. } => Play::ClaimInitiative,
             _ => Play::Other,
         }
     }

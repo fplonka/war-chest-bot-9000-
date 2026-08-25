@@ -165,10 +165,12 @@ def panels(eps, elo):
                              [series(title.lower(), col(key), smooth)], zero=True))
 
     if any(e.get("plays") for e in eps):
-        kinds = ("attack", "maneuver", "deploy", "bolster", "recruit", "pass")
-        labels = {"recruit": "recruit / claim initiative"}
+        kinds = ("attack", "maneuver", "deploy", "bolster", "recruit",
+                 "claim_initiative", "pass")
+        kinds = [kind for kind in kinds
+                 if any(kind in (e.get("plays") or {}) for e in eps)]
         out.append(panel("Move mix", "% of decisions", m,
-                         [series(labels.get(kind, kind),
+                         [series(kind.replace("_", " "),
                                  [100 * e.get("plays", {}).get(kind, 0)
                                   / max(e.get("decisions", 1), 1) for e in eps], True)
                           for kind in kinds], zero=True))

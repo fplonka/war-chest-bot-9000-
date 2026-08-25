@@ -596,6 +596,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     out.set_item("plays_bolster", d.plays[3])?;
     out.set_item("plays_maneuver", d.plays[4])?;
     out.set_item("plays_recruit", d.plays[5])?;
+    out.set_item("plays_claim_initiative", d.plays[6])?;
     assert_eq!(
         d.coff.len(),
         if d.nv == 0 { 0 } else { 2 * d.nv + 1 },

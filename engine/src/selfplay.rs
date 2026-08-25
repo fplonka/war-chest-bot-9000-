@@ -155,7 +155,7 @@ pub struct Data {
     pub pcell: Vec<u16>,
     pub pprob: Vec<f32>,
     /// Decisions by coarse move class, for the run report's strategy mix.
-    pub plays: [usize; 6],
+    pub plays: [usize; 7],
 
     /// `[2 * n + 1]` arena offsets.
     pub coff: Vec<u32>,
@@ -591,6 +591,7 @@ impl Game {
             Play::Bolster => Some(3),
             Play::Maneuver => Some(4),
             Play::Recruit => Some(5),
+            Play::ClaimInitiative => Some(6),
             Play::Other => None,
         } {
             self.data.plays[slot] += 1;
