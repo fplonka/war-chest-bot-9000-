@@ -398,6 +398,7 @@ struct RoundCap {
     z: usize,
     input: usize,
     leaves: usize,
+    queries: usize,
     piles: usize,
     tokens: usize,
     projected: usize,
@@ -451,6 +452,9 @@ impl RoundCap {
             z: TILE * D,
             input: TILE * (2 * C + LOOSE),
             leaves: n * s.max(1) as usize,
+            // One full-support query per resident solve. The normal rates keep
+            // at most one row; smaller supports leave room for more.
+            queries: n * b.configs,
             piles: TILE * NTYPE * PILE_COUNTS,
             tokens: TILE * NTYPE * TYPE,
             projected: TILE * NTYPE * C,
@@ -490,6 +494,7 @@ impl RoundCap {
             + self.z
             + self.input
             + self.leaves
+            + self.queries
             + self.piles
             + self.tokens
             + self.projected
@@ -1381,6 +1386,7 @@ impl Card {
         scratch.z = Arr::with_cap(s, cap.z)?;
         scratch.input = Arr::with_cap(s, cap.input)?;
         scratch.leaves = Arr::with_cap(s, cap.leaves)?;
+        scratch.queries = Arr::with_cap(s, cap.queries)?;
         scratch.piles = Arr::with_cap(s, cap.piles)?;
         scratch.tokens = Arr::with_cap(s, cap.tokens)?;
         scratch.projected = Arr::with_cap(s, cap.projected)?;
@@ -2395,10 +2401,13 @@ impl Card {
             (*iters, *puct, *cfr)
         };
         let mut sims = 0usize;
+        let mut query_at = vec![0usize; calls.len()];
+        let mut query_len = vec![0usize; calls.len()];
+        let mut query_total = 0usize;
         {
             let mut g = self.solves.lock();
             for &i in &order {
-                let Call::Iterate { solve, step, iters, expand, cfr, puct: p, .. } = &calls[i]
+                let Call::Iterate { solve, step, iters, expand, query, cfr, puct: p, .. } = &calls[i]
                 else {
                     unreachable!("iterate shard holds only iterate calls")
                 };
@@ -2412,6 +2421,9 @@ impl Card {
                 b.todo = *iters;
                 b.nexpand = *expand;
                 sims = sims.max(*expand);
+                query_at[i] = query_total;
+                query_len[i] = query.iter().map(|q| q.len as usize).sum();
+                query_total += query_len[i];
             }
         }
         let solves: Vec<usize> = order.iter().map(|&i| calls[i].solve()).collect();
@@ -2419,6 +2431,7 @@ impl Card {
         let mark = std::time::Instant::now();
         self.lay(&solves).map_err(at("lay"))?;
         let b = self.batch.lock();
+        self.scratch.lock().queries.room(query_total)?;
         let t_up = mark.elapsed();
         let mark = std::time::Instant::now();
 
@@ -2440,6 +2453,31 @@ impl Card {
                 .unwrap_or(order.len());
             let p = &b.upto[live];
             let it = iter as i32;
+            if query_total > 0 {
+                let solves = self.solves.lock();
+                let mut scratch = self.scratch.lock();
+                let dst = scratch.queries.buf.as_mut().expect("query scratch is carved");
+                for &i in &order[..live] {
+                    let Call::Iterate { solve, query, .. } = &calls[i] else {
+                        unreachable!("iterate shard holds only iterate calls")
+                    };
+                    let mut to = query_at[i];
+                    for q in query {
+                        if q.iter as usize == iter {
+                            solves[*solve].copy_f32_to(
+                                &self.stream,
+                                Ent::Reach,
+                                R_REACH,
+                                q.reach as usize,
+                                dst,
+                                to,
+                                q.len as usize,
+                            )?;
+                        }
+                        to += q.len as usize;
+                    }
+                }
+            }
             self.network(&b, p).map_err(at("net"))?;
             self.stage(6, || self.terminals(b.trees.buf(), p)).map_err(at("terminals"))?;
             self.stage(7, || self.backprop(&b, p, 0, it, k)).map_err(at("backprop"))?;
@@ -2461,6 +2499,13 @@ impl Card {
         let mark = std::time::Instant::now();
         let each = b.parts as usize * sims;
         let host = self.sampled(rounds * each)?;
+        let query_host = if query_total == 0 {
+            Vec::new()
+        } else {
+            let scratch = self.scratch.lock();
+            let src = scratch.queries.buf.as_ref().expect("query scratch is carved");
+            self.down_f.lock().recv(&self.stream, &src.slice(..query_total))?
+        };
         let t_down = mark.elapsed();
         for (slot, n) in [t_marshal, t_up, t_launch, t_down].iter().enumerate() {
             LEAF_NS[slot].fetch_add(n.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -2489,7 +2534,9 @@ impl Card {
                 let at = phase * each + part * sims;
                 leaves.extend_from_slice(&host[at..at + want]);
             }
-            out.push((i, Reply { leaves, ..Default::default() }));
+            let q = query_at[i];
+            let c = query_host[q..q + query_len[i]].to_vec();
+            out.push((i, Reply { c, leaves, ..Default::default() }));
         }
         Ok(())
     }
@@ -2506,9 +2553,8 @@ impl Card {
     ///
     /// The reference strategy, then a value pass under it: the same two sweeps
     /// and the same network, propagating and averaging under `avg` rather than
-    /// under the regret-matching iterate. What crosses is the root's values and
-    /// policy and the beliefs at the leaves the caller asks about — a few
-    /// kilobytes against the tens of megabytes the arenas hold.
+    /// under the regret-matching iterate. Only the root's values and policy
+    /// cross back.
     fn read(&self, calls: &[Call], mine: &[usize], out: &mut Vec<(usize, Reply)>) -> Res<()> {
         if mine.is_empty() {
             return Ok(());
@@ -2546,7 +2592,7 @@ impl Card {
         let g = self.solves.lock();
         let mut h = self.down_f.lock();
         for &i in mine {
-            let Call::Read { solve, vals_at, policy_at, reach_at, .. } = &calls[i] else {
+            let Call::Read { solve, vals_at, policy_at, .. } = &calls[i] else {
                 unreachable!("read shard holds only read calls")
             };
             let s = &g[*solve];
@@ -2562,11 +2608,7 @@ impl Card {
                 policy_at.1 as usize,
                 &mut h,
             )?;
-            let mut beliefs = Vec::new();
-            for &(at, n) in reach_at {
-                beliefs.extend(s.get_f32(&self.stream, Ent::Reach, R_REACH, at as usize, n as usize, &mut h)?);
-            }
-            out.push((i, Reply { a: root, b: policy, c: beliefs, ..Default::default() }));
+            out.push((i, Reply { a: root, b: policy, ..Default::default() }));
         }
         Ok(())
     }
@@ -2827,6 +2869,8 @@ struct Scratch {
     input: Arr<f32>,
     /// `[parts * sims]` the leaves an expansion phase sampled.
     leaves: Arr<u32>,
+    /// Query-time reach snapshots selected by the solve reservoirs.
+    queries: Arr<f32>,
     /// TILE trunk (and the config / prior passes that reuse these).
     piles: Arr<f32>,
     tokens: Arr<f32>,

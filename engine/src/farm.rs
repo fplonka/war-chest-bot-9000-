@@ -138,6 +138,8 @@ pub enum Call {
         /// the round takes nothing and the host is only woken to end the
         /// solve.
         expand: usize,
+        /// Query-time reach snapshots retained by this solve's reservoir.
+        query: Vec<QueryPick>,
         cfr: Cfr,
         puct: f32,
     },
@@ -147,17 +149,23 @@ pub enum Call {
         solve: usize,
         touched: [bool; 2],
         /// Slices of the device arenas the host wants back: the root's value
-        /// row per player, the root's strategy cells, and the reach at each
-        /// leaf the caller sampled. The host knows every offset from its own
-        /// copy of the tree, so nothing here has to be looked up on the card.
+        /// row per player and the root's strategy cells. The host knows every
+        /// offset from its own copy of the tree.
         ///
         /// An empty value row means the caller wants no values, and the value
         /// pass under the reference strategy does not run. Every solve reads
         /// its root policy; only a solve that is collected reads targets.
         vals_at: [(u32, u32); 2],
         policy_at: (u32, u32),
-        reach_at: Vec<(u32, u32)>,
     },
+}
+
+/// One query event whose reach the device snapshots before its network call.
+#[derive(Clone, Copy)]
+pub struct QueryPick {
+    pub iter: u32,
+    pub reach: u32,
+    pub len: u32,
 }
 
 /// One node whose policy prior a round is to fill.
