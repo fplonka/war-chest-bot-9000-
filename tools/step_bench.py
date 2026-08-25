@@ -139,6 +139,13 @@ def main():
     try:
         compiled = torch.compile(fwd_policy, mode="reduce-overhead", dynamic=True)
         stage("forward+policy (torch.compile)", compiled, iters=30)
+
+        def compiled_step():
+            opt.zero_grad(set_to_none=True)
+            compiled().backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0)
+            opt.step()
+        stage("full step (torch.compile)", compiled_step, iters=30)
     except Exception as e:
         print("compile unavailable:", type(e).__name__, str(e)[:120])
     try:
