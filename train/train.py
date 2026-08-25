@@ -510,14 +510,15 @@ def diagnostics(net, buf, probe, batch, rng, device, batch_fn, recent_frac):
 
 def train_steps(net, opt, buf, steps, batch, rng, device,
                 recent_mix=0.0, recent_frac=0.2, profile_cuda=False,
-                batch_fn=make_batch, policy_w=0.0):
-    """Mean loss over `steps` Adam updates -- value, plus the policy head's
-    cross entropy at weight `policy_w`."""
+                batch_fn=make_batch, policy_w=0.0, deadline=None):
+    """Mean loss over up to `steps` Adam updates -- value, plus the policy
+    head's cross entropy at weight `policy_w` -- stopping between updates at
+    `deadline`."""
     policy_metrics = (
         "policy_loss", "policy_target_entropy", "policy_prior_entropy",
         "policy_search_kl")
     stat = {"sample_s": 0.0, "prepare_s": 0.0, "forward_wall_s": 0.0,
-            "backward_wall_s": 0.0, "batch_configs": 0, "steps": steps,
+            "backward_wall_s": 0.0, "batch_configs": 0, "steps": 0,
             "gpu_forward_s": 0.0, "gpu_backward_s": 0.0,
             "zero_sum_max": 0.0, "zero_sum_square_sum": 0.0,
             "zero_sum_n": 0, "grad_clipped": 0,
@@ -534,6 +535,8 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
     event_pairs = []
     stream = torch.cuda.current_stream(device) if profile_cuda and device.type == "cuda" else None
     for _ in range(steps):
+        if deadline is not None and time.time() >= deadline:
+            break
         ts = time.perf_counter()
         ids = buf.sample_ids(batch, rng, recent_mix, recent_frac)
         ring = ids % buf.cap
@@ -584,6 +587,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
         stat["grad_norm_max"] = max(stat["grad_norm_max"], grad_norm)
         stat["grad_clipped"] += int(grad_norm > 5.0)
         opt.step()
+        stat["steps"] += 1
         stat["backward_wall_s"] += time.perf_counter() - ts
         if stream is not None:
             b1.record(stream)
@@ -592,7 +596,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
         torch.cuda.synchronize(device)
         stat["gpu_forward_s"] = sum(a.elapsed_time(b) for a, b, _ in event_pairs) / 1000.0
         stat["gpu_backward_s"] = sum(b.elapsed_time(c) for _, b, c in event_pairs) / 1000.0
-    return tot / steps, stat
+    return tot / stat["steps"] if stat["steps"] else float("nan"), stat
 
 
 def ingest(buf, data, warm=False):
@@ -951,7 +955,7 @@ def main():
             snapshot(f"s{len(snaps)}", now - t0)
             next_snap = now - t0 + snap_gap
 
-    def fit(nsteps):
+    def fit(nsteps, deadline=None):
         """Adam updates on the shared replay. Returns (loss, wall_s, stats)."""
         if nsteps < 1 or len(buf) < args.batch:
             return float("nan"), 0.0, {}
@@ -960,7 +964,7 @@ def main():
             value, opt, buf, nsteps, args.batch, rng, dev,
             recent_mix=args.recent_mix, recent_frac=args.recent_frac,
             profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1",
-            batch_fn=batcher, policy_w=args.policy_w)
+            batch_fn=batcher, policy_w=args.policy_w, deadline=deadline)
         return lv, time.time() - tt, st
 
     def run_search_pipeline():
@@ -1068,12 +1072,13 @@ def main():
             regenerating = len(buf) < grace_rows
             nsteps = (int(debt // args.batch)
                       if len(buf) >= args.batch and not regenerating else 0)
-            lv, train_s, train_stat = fit(nsteps)
-            if nsteps:
-                optimizer_steps += nsteps
-                optimizer_rows += nsteps * args.batch
-                window["loss_sum"] += lv * nsteps
-                window["train_steps"] += nsteps
+            lv, train_s, train_stat = fit(nsteps, deadline)
+            trained = train_stat.get("steps", 0)
+            if trained:
+                optimizer_steps += trained
+                optimizer_rows += trained * args.batch
+                window["loss_sum"] += lv * trained
+                window["train_steps"] += trained
                 window["policy_steps"] += train_stat["policy_steps"]
                 for key in (
                         "policy_loss", "policy_target_entropy", "policy_prior_entropy",
@@ -1100,6 +1105,9 @@ def main():
             window["train_s"] += train_s
 
             now = time.time()
+            if now >= deadline:
+                save_progress()
+                break
             if now >= next_target:
                 # `push` bumps the version the farm watches; its threads
                 # pick the new weights up at their next chunk.
