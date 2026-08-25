@@ -524,6 +524,8 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
             "grad_norm_sum": 0.0, "grad_norm_max": 0.0,
             "policy_steps": 0, "sample_ages": [], "sample_delays": [],
             "sample_warm": 0, "sample_play": 0, "sample_query": 0,
+            "sample_warm_delay_sum": 0.0, "sample_play_delay_sum": 0.0,
+            "sample_query_delay_sum": 0.0,
             "sample_td1_targets": 0, "sample_targets": 0,
             **{f"{key}_sum": 0.0 for key in policy_metrics}}
     if len(buf) < batch:
@@ -536,11 +538,16 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
         ids = buf.sample_ids(batch, rng, recent_mix, recent_frac)
         ring = ids % buf.cap
         stat["sample_ages"].append(time.time() - buf.created_at[ring])
-        stat["sample_delays"].append(buf.written_at[ring] - buf.created_at[ring])
-        source = np.bincount(buf.source[ring], minlength=3)
+        delay = buf.written_at[ring] - buf.created_at[ring]
+        stat["sample_delays"].append(delay)
+        source_id = buf.source[ring]
+        source = np.bincount(source_id, minlength=3)
         stat["sample_warm"] += int(source[0])
         stat["sample_play"] += int(source[1])
         stat["sample_query"] += int(source[2])
+        for source_id_value, name in enumerate(("warm", "play", "query")):
+            stat[f"sample_{name}_delay_sum"] += float(
+                delay[source_id == source_id_value].sum())
         stat["sample_td1_targets"] += 2 * int(buf.td1[ring].sum())
         stat["sample_targets"] += int(buf.clen[ring].sum())
         sampled = buf.gather(ids)
@@ -1080,7 +1087,9 @@ def main():
                 window["grad_norm_max"] = max(
                     window["grad_norm_max"], train_stat["grad_norm_max"])
                 for key in ("sample_warm", "sample_play", "sample_query",
-                            "sample_td1_targets", "sample_targets"):
+                            "sample_warm_delay_sum", "sample_play_delay_sum",
+                            "sample_query_delay_sum", "sample_td1_targets",
+                            "sample_targets"):
                     window[key] += train_stat[key]
                 window_sample_ages.extend(train_stat["sample_ages"])
                 window_sample_delays.extend(train_stat["sample_delays"])
@@ -1329,6 +1338,12 @@ def main():
                 "sample_age_p90": round(float(np.quantile(sample_ages, 0.9)), 1),
                 "sample_delay_mean": round(float(sample_delays.mean()), 1),
                 "sample_delay_p90": round(float(np.quantile(sample_delays, 0.9)), 1),
+                "sample_warm_delay": round(
+                    window["sample_warm_delay_sum"] / max(window["sample_warm"], 1), 1),
+                "sample_play_delay": round(
+                    window["sample_play_delay_sum"] / max(window["sample_play"], 1), 1),
+                "sample_query_delay": round(
+                    window["sample_query_delay_sum"] / max(window["sample_query"], 1), 1),
                 "sample_warm_frac": round(window["sample_warm"] / sample_n, 4),
                 "sample_play_frac": round(window["sample_play"] / sample_n, 4),
                 "sample_query_frac": round(window["sample_query"] / sample_n, 4),

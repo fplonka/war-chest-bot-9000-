@@ -196,8 +196,10 @@ def panels(eps, elo):
                           series("oldest target", col("target_age_max"), True),
                           series("oldest insertion", col("buf_s"), True)], zero=True))
         out.append(panel("Target delivery delay", "seconds", m,
-                         [series("mean", col("sample_delay_mean"), True),
-                          series("p90", col("sample_delay_p90"), True)], zero=True))
+                         [series("p90", col("sample_delay_p90"), True),
+                          series("warm mean", col("sample_warm_delay"), True),
+                          series("main-line mean", col("sample_play_delay"), True),
+                          series("query mean", col("sample_query_delay"), True)], zero=True))
     if has("grad_norm"):
         out.append(panel("Gradient norm before clipping", "L2 norm", m,
                          [series("mean", col("grad_norm"), True),
