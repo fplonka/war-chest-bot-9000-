@@ -30,6 +30,16 @@ mkdir -p $remote && cd $remote"
 run_remote() { ssh "${ssh_opts[@]}" "root@$host" "$prelude
 $*"; }
 
+# No pipe on the build itself: a pipeline exits with `tail`'s status, so a
+# failed build used to look like a success and leave the old module in
+# place — which is how a run started without the `gpu` feature.
+build_script="find engine/src engine/tests engine/examples -type f -exec touch {} +
+cd engine
+maturin develop --release --features python,gpu >/tmp/maturin.log 2>&1 || { tail -40 /tmp/maturin.log; exit 1; }
+tail -2 /tmp/maturin.log
+cargo build --release --features gpu --bin bot >/tmp/bot.log 2>&1 || { tail -40 /tmp/bot.log; exit 1; }
+tail -1 /tmp/bot.log"
+
 case "${1:-}" in
 sync)
     rsync -az --delete -e "ssh ${ssh_opts[*]}" \
@@ -52,15 +62,7 @@ pull)
     echo "pulled $name"
     ;;
 build)
-    # No pipe on the build itself: a pipeline exits with `tail`'s status, so a
-    # failed build used to look like a success and leave the old module in
-    # place — which is how a run started without the `gpu` feature.
-    run_remote "find engine/src engine/tests engine/examples -type f -exec touch {} +
-cd engine
-maturin develop --release --features python,gpu >/tmp/maturin.log 2>&1 || { tail -40 /tmp/maturin.log; exit 1; }
-tail -2 /tmp/maturin.log
-cargo build --release --features gpu --bin bot >/tmp/bot.log 2>&1 || { tail -40 /tmp/bot.log; exit 1; }
-tail -1 /tmp/bot.log"
+    run_remote "$build_script"
     ;;
 follow)
     tag=${2:?usage: follow <tag> [run]}
@@ -85,20 +87,24 @@ follow)
     ;;
 start)
     # start <tag> <command...>: the command runs detached on the box, queued
-    # behind every other GPU job by one lock, with its log, pid and exit code
-    # under /workspace/logs/<tag>.*. `follow <tag>` waits on it.
+    # behind every other GPU job by one lock, with its script, log, pid and
+    # exit code under /workspace/logs/<tag>.*. `follow <tag>` waits on it.
     tag=${2:?usage: start <tag> <command...>}
     shift 2
-    cmd=$(printf '%q ' "$@")
     run_remote "mkdir -p /workspace/logs
 rm -f /workspace/logs/$tag.pid /workspace/logs/$tag.exit
-nohup setsid bash -lc $(printf '%q' "$prelude
-echo \$\$ > /workspace/logs/$tag.pid
-flock /workspace/gpu.lock -c $(printf '%q' "$cmd")
-echo \$? > /workspace/logs/$tag.exit") >/workspace/logs/$tag.log 2>&1 &
+cat > /workspace/logs/$tag.sh <<'EOS'
+$prelude
+$(printf '%q ' "$@")
+EOS
+nohup setsid bash -c 'echo \$\$ > /workspace/logs/$tag.pid
+flock /workspace/gpu.lock bash /workspace/logs/$tag.sh
+echo \$? > /workspace/logs/$tag.exit' >/workspace/logs/$tag.log 2>&1 &
 echo started $tag"
     ;;
 go)
+    # The build runs inside the job, under the lock: a cargo build beside a
+    # measured run would take its cores.
     shift
     out=
     for a in "$@"; do
@@ -106,8 +112,7 @@ go)
     done
     [ -n "$out" ] || { echo "go needs out=<name>" >&2; exit 1; }
     "$0" sync
-    "$0" build
-    "$0" start "$out" python train/train.py "$@"
+    "$0" start "$out" bash -c "($build_script) && exec python train/train.py $(printf '%q ' "$@")"
     "$0" follow "$out" "$out"
     ;;
 "")  sed -n '2,9p' "$0" ;;
