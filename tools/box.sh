@@ -47,6 +47,10 @@ sync)
         --exclude target --exclude .venv --exclude papers \
         --exclude __pycache__ --exclude .git --exclude data \
         "$here/" "root@$host:$remote/"
+    # One runs/ per box: every checkout shares warchest-engine's, so the
+    # results ledger and the dashboard have one place to look.
+    [ "$remote" = /workspace/warchest-engine ] ||
+        run_remote "[ -e runs ] || ln -s /workspace/warchest-engine/runs runs"
     sha=$(git -C "$here" rev-parse --short=7 HEAD)
     git -C "$here" diff-index --quiet HEAD -- . ':!runs' || sha="${sha}+dirty"
     echo "$sha" | ssh "${ssh_opts[@]}" "root@$host" "cat > $remote/.gitsha"
