@@ -225,18 +225,36 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
     }
 }
 
-/// One of a solve's eight allocations: `cap × nfields` words.
+/// One of a solve's eight allocations: `stride × nfields` words.
 pub struct Entity {
     arr: Arr<u32>,
-    cap: usize,
+    /// Words between fields in the allocation.
+    stride: usize,
+    /// Logical entries the solve budget permits.
+    limit: usize,
     nfields: usize,
     len: usize,
 }
 
 impl Entity {
     fn with_cap(stream: &Arc<CudaStream>, cap: usize, nfields: usize) -> Res<Entity> {
-        let cap = cap.max(1);
-        Ok(Entity { arr: Arr::with_cap(stream, cap * nfields)?, cap, nfields, len: 0 })
+        Self::with_stride(stream, cap, cap, nfields)
+    }
+
+    fn with_stride(
+        stream: &Arc<CudaStream>,
+        limit: usize,
+        stride: usize,
+        nfields: usize,
+    ) -> Res<Entity> {
+        let stride = stride.max(1);
+        Ok(Entity {
+            arr: Arr::with_cap(stream, stride * nfields)?,
+            stride,
+            limit,
+            nfields,
+            len: 0,
+        })
     }
 
     fn rewind(&mut self) {
@@ -252,11 +270,11 @@ impl Entity {
     }
 
     pub fn field(&self, k: usize, stream: &Arc<CudaStream>) -> u64 {
-        self.arr.ptr(stream) + (k * self.cap * 4) as u64
+        self.arr.ptr(stream) + (k * self.stride * 4) as u64
     }
 
     fn bytes(&self) -> usize {
-        self.cap * self.nfields * 4
+        self.stride * self.nfields * 4
     }
 
     pub fn len(&self) -> usize {
@@ -275,7 +293,7 @@ impl Entity {
         if n == 0 {
             return Ok(());
         }
-        let off = field * self.cap + at;
+        let off = field * self.stride + at;
         let dst = self.arr.buf.as_mut().expect("a capacity implies a buffer");
         let mut view = dst.slice_mut(off..off + n);
         let mut fview = unsafe { view.transmute_mut::<f32>(n).expect("u32 and f32 are four bytes") };
@@ -293,7 +311,7 @@ impl Entity {
         if n == 0 {
             return Ok(Vec::new());
         }
-        let off = field * self.cap + at;
+        let off = field * self.stride + at;
         let buf = self.arr.buf.as_ref().ok_or("reading an arena that was never written")?;
         let view = buf.slice(off..off + n);
         let fview = unsafe { view.transmute::<f32>(n).expect("u32 and f32 are four bytes") };
@@ -333,7 +351,15 @@ impl Solve {
                 Entity::with_cap(s, b.cap(Ent::Cell), FIELDS[Ent::Cell as usize])?,
                 Entity::with_cap(s, b.cap(Ent::Reach), FIELDS[Ent::Reach as usize])?,
                 Entity::with_cap(s, b.cap(Ent::Draw), FIELDS[Ent::Draw as usize])?,
-                Entity::with_cap(s, b.cap(Ent::Row), FIELDS[Ent::Row as usize])?,
+                // `coff` has a final offset after its two entries per row.
+                // Give that offset its own word instead of letting it land in
+                // the following `leaf_node` field at the row limit.
+                Entity::with_stride(
+                    s,
+                    b.cap(Ent::Row),
+                    b.cap(Ent::Row) + 1,
+                    FIELDS[Ent::Row as usize],
+                )?,
                 Entity::with_cap(s, b.cap(Ent::Board), FIELDS[Ent::Board as usize])?,
                 Entity::with_cap(s, b.cap(Ent::Config), FIELDS[Ent::Config as usize])?,
                 Entity::with_cap(s, b.cap(Ent::Cidx), FIELDS[Ent::Cidx as usize])?,
@@ -356,8 +382,8 @@ impl Solve {
     /// The one device-side guard. False in the error when `n` misses the slot.
     pub fn reserve(&mut self, e: Ent, n: usize) -> Res<()> {
         let a = &mut self.ent[e as usize];
-        if n > a.cap {
-            return Err(format!("{} grew past its slot: {n} > {}", e.name(), a.cap));
+        if n > a.limit {
+            return Err(format!("{} grew past its slot: {n} > {}", e.name(), a.limit));
         }
         a.len = a.len.max(n);
         Ok(())
