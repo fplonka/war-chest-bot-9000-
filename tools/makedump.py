@@ -22,7 +22,7 @@ import numpy as np
 sys.path.insert(0, "train")
 import warchest  # noqa: E402
 from export_weights import load as load_checkpoint  # noqa: E402
-from train import Buffer  # noqa: E402
+from train import Buffer, ingest  # noqa: E402
 from value_net import Net  # noqa: E402
 
 PUBFEAT = warchest.PUBFEAT
@@ -59,13 +59,7 @@ def main():
     start, got = time.time(), 0
     while got < args.solves:
         d = farm.collect(solves=min(4096, args.solves - got))
-        rows = np.asarray(d["rows"], np.uint8).reshape(-1, ROW_BYTES)
-        buf.add(rows,
-                np.asarray(d["cc"], np.uint8).reshape(-1, CCOUNTS),
-                np.asarray(d["cw"], np.float32).astype(np.float16),
-                np.clip(np.asarray(d["cy"], np.float32), -1.0, 1.0).astype(np.float16),
-                np.asarray(d["coff"], np.int64),
-                np.asarray(d["soff"], np.int64))
+        ingest(buf, d)
         got += int(d["solves"])
         print(f"  {got}/{args.solves} solves, {got / (time.time() - start):.1f}/s",
               flush=True)
