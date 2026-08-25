@@ -257,8 +257,8 @@ pub struct Device {
     slot_bytes: usize,
 }
 
-/// Two rounds in flight: while set A grows on the host, set B iterates on the card.
-pub const PIPELINE: usize = 2;
+/// Three rounds in flight keep the card busy while two sets grow on the host.
+pub const PIPELINE: usize = 3;
 
 /// Round to the eleven significand bits a tensor core keeps, matching
 /// `cvt.rna.tf32.f32`: nearest, ties away from zero.
