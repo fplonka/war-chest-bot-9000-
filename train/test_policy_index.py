@@ -35,9 +35,10 @@ def dump(n, ncfg, na, ncells):
     source = np.ones(n, np.uint8)
     truth = np.zeros((n, 2), np.uint32)
     outcome = np.full((n, 2), np.nan, np.float32)
+    created = np.zeros(n, np.float64)
     td1 = np.zeros(n, np.uint8)
     pol = (pa, paoff, pcoff, pci, pact, pprob)
-    return rows, cc, cw, cy, coff, soff, source, truth, outcome, td1, pol
+    return rows, cc, cw, cy, coff, soff, source, truth, outcome, created, td1, pol
 
 
 def check(buf, ids):

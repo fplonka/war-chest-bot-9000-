@@ -150,6 +150,7 @@ class Buffer:
         self.pact = np.zeros(self.pcap, np.uint16)
         self.pp = np.zeros(self.pcap, np.float16)
         self.written_at = np.zeros(cap, np.float64)
+        self.created_at = np.zeros(cap, np.float64)
         self.source = np.zeros(cap, np.uint8)  # 0 warm, 1 play, 2 query
         self.truth = np.zeros((cap, 2), np.uint32)
         self.outcome = np.full((cap, 2), np.nan, np.float32)
@@ -160,8 +161,8 @@ class Buffer:
         self.cfgs = 0   # configs ever written
         self.lo = 0     # oldest row whose configs are still in the arena
 
-    def add(self, x, cc, cw, cy, coff, soff, source, truth, outcome, td1,
-            pol=None):
+    def add(self, x, cc, cw, cy, coff, soff, source, truth, outcome, created,
+            td1, pol=None):
         n = len(x)
         lens = np.diff(coff).reshape(n, 2)
         m = len(cw)
@@ -191,6 +192,7 @@ class Buffer:
             ring = sl % self.cap
             self.clen[ring] = lens[i:j]
             self.written_at[ring] = now
+            self.created_at[ring] = created[i:j]
             self.source[ring] = source[i:j]
             self.truth[ring] = truth[i:j]
             self.outcome[ring] = outcome[i:j]
@@ -325,6 +327,8 @@ class Buffer:
             "replay_query_frac": source[2] / n,
             "replay_td1_row_frac": float(self.td1[ids].sum()) / n,
             "replay_td1_target_frac": 2.0 * self.td1[ids].sum() / max(configs, 1),
+            "target_age_max": (time.time() - self.created_at[ids].min()
+                               if len(ids) else 0.0),
         }
 
     def sample_calibration(self, batch, rng):
@@ -518,7 +522,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
             "zero_sum_max": 0.0, "zero_sum_square_sum": 0.0,
             "zero_sum_n": 0, "grad_clipped": 0,
             "grad_norm_sum": 0.0, "grad_norm_max": 0.0,
-            "policy_steps": 0, "sample_ages": [],
+            "policy_steps": 0, "sample_ages": [], "sample_delays": [],
             "sample_warm": 0, "sample_play": 0, "sample_query": 0,
             "sample_td1_targets": 0, "sample_targets": 0,
             **{f"{key}_sum": 0.0 for key in policy_metrics}}
@@ -531,7 +535,8 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
         ts = time.perf_counter()
         ids = buf.sample_ids(batch, rng, recent_mix, recent_frac)
         ring = ids % buf.cap
-        stat["sample_ages"].append(time.time() - buf.written_at[ring])
+        stat["sample_ages"].append(time.time() - buf.created_at[ring])
+        stat["sample_delays"].append(buf.written_at[ring] - buf.created_at[ring])
         source = np.bincount(buf.source[ring], minlength=3)
         stat["sample_warm"] += int(source[0])
         stat["sample_play"] += int(source[1])
@@ -597,6 +602,7 @@ def ingest(buf, data, warm=False):
     source = np.where(query != 0, 2, 0 if warm else 1).astype(np.uint8)
     truth = np.asarray(data["truth"], np.uint32).reshape(-1, 2)
     outcome = np.asarray(data["outcome"], np.float32).reshape(-1, 2)
+    created = np.asarray(data["created"], np.float64)
     td1 = np.asarray(data["td1"], np.uint8)
     pol = (np.asarray(data["pa"], np.uint8).reshape(-1, ACT_BYTES),
            np.asarray(data["paoff"], np.int64),
@@ -605,7 +611,7 @@ def ingest(buf, data, warm=False):
            np.asarray(data["pcell"], np.uint16),
            np.asarray(data["pprob"], np.float16))
     buf.add(x, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff,
-            source, truth, outcome, td1, pol)
+            source, truth, outcome, created, td1, pol)
     return len(x)
 
 
@@ -985,6 +991,7 @@ def main():
         window_targets = []
         window_target_weights = []
         window_sample_ages = []
+        window_sample_delays = []
         # The farm's round counters are cumulative, so an epoch's figures are
         # the difference against the last report and not an average since the
         # farm started.
@@ -1076,6 +1083,7 @@ def main():
                             "sample_td1_targets", "sample_targets"):
                     window[key] += train_stat[key]
                 window_sample_ages.extend(train_stat["sample_ages"])
+                window_sample_delays.extend(train_stat["sample_delays"])
                 window["zero_sum_max"] = max(
                     window["zero_sum_max"], train_stat["zero_sum_max"])
                 window["zero_sum_square_sum"] += train_stat["zero_sum_square_sum"]
@@ -1137,6 +1145,8 @@ def main():
             target_q = np.quantile(targets, [0.05, 0.5, 0.95])
             sample_ages = (np.concatenate(window_sample_ages)
                            if window_sample_ages else np.zeros(1))
+            sample_delays = (np.concatenate(window_sample_delays)
+                             if window_sample_delays else np.zeros(1))
             replay = buf.replay_stats()
             sample_n = max(window["sample_warm"] + window["sample_play"]
                            + window["sample_query"], 1)
@@ -1317,6 +1327,8 @@ def main():
                 "sample_age_mean": round(float(sample_ages.mean()), 1),
                 "sample_age_p50": round(float(np.quantile(sample_ages, 0.5)), 1),
                 "sample_age_p90": round(float(np.quantile(sample_ages, 0.9)), 1),
+                "sample_delay_mean": round(float(sample_delays.mean()), 1),
+                "sample_delay_p90": round(float(np.quantile(sample_delays, 0.9)), 1),
                 "sample_warm_frac": round(window["sample_warm"] / sample_n, 4),
                 "sample_play_frac": round(window["sample_play"] / sample_n, 4),
                 "sample_query_frac": round(window["sample_query"] / sample_n, 4),
@@ -1362,6 +1374,7 @@ def main():
             window_targets.clear()
             window_target_weights.clear()
             window_sample_ages.clear()
+            window_sample_delays.clear()
         # Dropping the farm stops its threads once they finish the solve they
         # are in, which is also what flushes their last rows.
         del farm

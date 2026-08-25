@@ -78,9 +78,10 @@ def main():
     source = np.where(query != 0, 2, 1).astype(np.uint8)
     truth = np.asarray(d["truth"], np.uint32).reshape(-1, 2)
     outcome = np.asarray(d["outcome"], np.float32).reshape(-1, 2)
+    created = np.asarray(d["created"], np.float64)
     td1 = np.asarray(d["td1"], np.uint8)
     replay = (rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff,
-              soff, source, truth, outcome, td1)
+              soff, source, truth, outcome, created, td1)
     buf.add(*replay)
     tiny = Buffer(max(n * 2, 8), max(n * 2, 8) * 48)
     for _ in range(8):

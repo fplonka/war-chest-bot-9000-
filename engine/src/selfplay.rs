@@ -159,6 +159,9 @@ pub struct Data {
     /// game outcome. Query rows use `u32::MAX` and NaN because no game owns them.
     pub truth: Vec<u32>,
     pub outcome: Vec<f32>,
+    /// Unix time when the solve produced this row. Main-line rows can wait for
+    /// their game's outcome before Python receives them.
+    pub created: Vec<f64>,
     /// One for a query row and one for a main-line row selected for TD(1).
     pub query: Vec<u8>,
     pub td1: Vec<u8>,
@@ -209,6 +212,7 @@ impl Data {
         self.pprob.extend(o.pprob);
         self.truth.extend(o.truth);
         self.outcome.extend(o.outcome);
+        self.created.extend(o.created);
         self.query.extend(o.query);
         self.td1.extend(o.td1);
         self.paoff.extend(o.paoff.iter().skip(tail).map(|x| x + ab));
@@ -290,6 +294,12 @@ impl Data {
         *self.pcoff.last_mut().expect("row offset") = self.pcell.len() as u32;
         self.truth.extend([u32::MAX; 2]);
         self.outcome.extend([f32::NAN; 2]);
+        self.created.push(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is before Unix epoch")
+                .as_secs_f64(),
+        );
         self.query.push(0);
         self.td1.push(0);
         self.nv += 1;

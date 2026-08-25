@@ -189,11 +189,15 @@ def panels(eps, elo):
                           series("TD(1) target cells", col("sample_td1_target_frac"), True)],
                          zero=True))
     if has("sample_age_mean"):
-        out.append(panel("Sampled replay age", "seconds", m,
+        out.append(panel("Target age when sampled", "seconds", m,
                          [series("mean", col("sample_age_mean"), True),
                           series("median", col("sample_age_p50"), True),
                           series("p90", col("sample_age_p90"), True),
-                          series("oldest live", col("buf_s"), True)], zero=True))
+                          series("oldest target", col("target_age_max"), True),
+                          series("oldest insertion", col("buf_s"), True)], zero=True))
+        out.append(panel("Target delivery delay", "seconds", m,
+                         [series("mean", col("sample_delay_mean"), True),
+                          series("p90", col("sample_delay_p90"), True)], zero=True))
     if has("grad_norm"):
         out.append(panel("Gradient norm before clipping", "L2 norm", m,
                          [series("mean", col("grad_norm"), True),
@@ -283,9 +287,11 @@ def health(eps):
                  f"{last.get('replay_warm_frac', 0):.0%} / "
                  f"{last.get('replay_play_frac', 0):.0%} / "
                  f"{last.get('replay_query_frac', 0):.0%}"),
-                ("sample age p90 / oldest",
+                ("target age p90 / oldest",
                  f"{last.get('sample_age_p90', 0) / 60:.1f} / "
-                 f"{last.get('buf_s', 0) / 60:.1f} min"),
+                 f"{last.get('target_age_max', 0) / 60:.1f} min"),
+                ("target delivery delay p90",
+                 f"{last.get('sample_delay_p90', 0) / 60:.1f} min"),
                 ("zero-sum RMS / max",
                  f"{last.get('zero_sum_rms', 0):.2e} / "
                  f"{last.get('zero_sum_max', 0):.2e}")]

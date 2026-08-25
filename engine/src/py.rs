@@ -604,6 +604,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     );
     assert_eq!(d.truth.len(), 2 * d.nv, "truth does not match rows");
     assert_eq!(d.outcome.len(), 2 * d.nv, "outcomes do not match rows");
+    assert_eq!(d.created.len(), d.nv, "creation times do not match rows");
     assert_eq!(d.query.len(), d.nv, "query labels do not match rows");
     assert_eq!(d.td1.len(), d.nv, "TD(1) labels do not match rows");
     // Internal `soff` holds one start per solve; the exposed array appends
@@ -635,6 +636,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     out.set_item("pprob", d.pprob.into_pyarray_bound(py))?;
     out.set_item("truth", d.truth.into_pyarray_bound(py))?;
     out.set_item("outcome", d.outcome.into_pyarray_bound(py))?;
+    out.set_item("created", d.created.into_pyarray_bound(py))?;
     out.set_item("query", d.query.into_pyarray_bound(py))?;
     out.set_item("td1", d.td1.into_pyarray_bound(py))?;
     out.set_item("soff", soff.into_pyarray_bound(py))?;
