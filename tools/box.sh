@@ -78,7 +78,8 @@ follow)
         sleep 0.5
     done
     while run_remote "kill -0 \$(cat /workspace/logs/$tag.pid) 2>/dev/null" >/dev/null 2>&1; do
-        [ -n "${3:-}" ] && "$0" pull "$3" >/dev/null
+        # A queued job has no run directory until it holds the lock.
+        [ -n "${3:-}" ] && { "$0" pull "$3" >/dev/null 2>&1 || true; }
         run_remote "tail -1 /workspace/logs/$tag.log" | tail -1
         sleep "${WARCHEST_BOX_POLL:-60}"
     done
