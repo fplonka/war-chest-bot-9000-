@@ -79,7 +79,8 @@ def main():
     args = ap.parse_args()
     seen, polls, delay = set(), 0, 1.0
     while True:
-        # As fast as the API allows: back off on 429, creep back after success.
+        # The API allows five requests per five seconds ("limit":5.0 in its
+        # 429 body), so one poll a second is the ceiling; back off on a 429.
         time.sleep(delay)
         try:
             found = offers(args.max_dph, args.disk)
@@ -87,7 +88,7 @@ def main():
             delay = min(60.0, delay * 2)
             print(time.strftime("%H:%M:%S"), f"poll failed: {e}; delay {delay:.1f}s", flush=True)
             continue
-        delay = max(0.2, delay * 0.9)
+        delay = max(1.0, delay * 0.9)
         polls += 1
         for o in found:
             if o["id"] not in seen:
