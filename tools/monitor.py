@@ -121,13 +121,10 @@ def panels(eps, elo):
                          [series("ownership", col("aux_acc"), True)], zero=True,
                          hlines=[("chance", 1 / 3)]))
 
-    explained = []
-    for e in eps:
-        std = e.get("tgt_std")
-        explained.append(1 - e["loss"] / std ** 2
-                         if std and "loss" in e else None)
-    out.append(panel("Value variance explained", "1 - loss / target variance", m,
-                     [series("value", explained, True)], hlines=[("zero", 0)]))
+    relative_loss = [e["loss"] / e["tgt_std"] ** 2
+                     if e.get("tgt_std") and "loss" in e else None for e in eps]
+    out.append(panel("Relative value loss", "huber / target variance", m,
+                     [series("value", relative_loss, True)], zero=True))
     out.append(panel("Spread of predictions", "std", m,
                      [series("prediction", col("probe_std"), True),
                       series("target", col("tgt_std"), True)], zero=True))
