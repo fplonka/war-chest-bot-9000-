@@ -300,6 +300,25 @@ impl Entity {
         stream.memcpy_dtod(&src.slice(from..from + n), &mut fview).map_err(err)
     }
 
+    fn copy_f32_to(
+        &self,
+        stream: &Arc<CudaStream>,
+        field: usize,
+        at: usize,
+        dst: &mut CudaSlice<f32>,
+        to: usize,
+        n: usize,
+    ) -> Res<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let off = field * self.stride + at;
+        let buf = self.arr.buf.as_ref().ok_or("copying an arena that was never written")?;
+        let src = buf.slice(off..off + n);
+        let src = unsafe { src.transmute::<f32>(n).expect("u32 and f32 are four bytes") };
+        stream.memcpy_dtod(&src, &mut dst.slice_mut(to..to + n)).map_err(err)
+    }
+
     fn get_f32(
         &self,
         stream: &Arc<CudaStream>,
@@ -470,6 +489,19 @@ impl Solve {
     pub fn plan(&mut self, s: &Arc<CudaStream>, d: Dst, at: usize, n: usize) -> Res<u64> {
         let (e, field, width) = dst_slot(d);
         self.view(s, e, field, at, n, width)
+    }
+
+    pub fn copy_f32_to(
+        &self,
+        s: &Arc<CudaStream>,
+        e: Ent,
+        field: usize,
+        at: usize,
+        dst: &mut CudaSlice<f32>,
+        to: usize,
+        n: usize,
+    ) -> Res<()> {
+        self.ent[e as usize].copy_f32_to(s, field, at, dst, to, n)
     }
 
     pub fn get_f32(
