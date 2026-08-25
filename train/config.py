@@ -14,7 +14,7 @@ class Cfg:
     init_weights: str = ""
     resume: str = ""
 
-    batch: int = 1024
+    batch: int = 256
     lr: float = 1e-3
     lr_decay_frac: str = "0.33,0.67"
     # Gradient updates per generated row — Student of Games' "max grad updates
