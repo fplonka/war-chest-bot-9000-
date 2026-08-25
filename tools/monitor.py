@@ -198,6 +198,10 @@ def panels(eps, elo):
                          hlines=[("clip", 5)]))
         out.append(panel("Weight norm", "L2 norm", m,
                          [series("weights", col("weight_norm"), True)], zero=True))
+    if has("zero_sum_rms"):
+        out.append(panel("Zero-sum residual", "|E[v0] + E[v1]|", m,
+                         [series("RMS", col("zero_sum_rms"), True),
+                          series("batch max", col("zero_sum_max"), True)], zero=True))
 
     for title, ylabel, key, smooth in (
             ("Replay generation throughput", "rows/s", "rows_per_s", False),
@@ -206,7 +210,6 @@ def panels(eps, elo):
             ("Passes per generated row", "optimizer rows / replay row",
              "train_row_ratio", False),
             ("Gradient clipping", "fraction of steps", "grad_clip_frac", True),
-            ("Zero-sum residual", "max |v0 + v1|", "zero_sum_max", True),
             ("Replay age", "seconds retained", "buf_s", False),
             # The horizon cuts a game at 256 coin plays and scores it a draw,
             # and War Chest has no draws. A rising rate means the ladder below
@@ -280,7 +283,9 @@ def health(eps):
                 ("sample age p90 / oldest",
                  f"{last.get('sample_age_p90', 0) / 60:.1f} / "
                  f"{last.get('buf_s', 0) / 60:.1f} min"),
-                ("max |v0+v1|", f"{last.get('zero_sum_max', 0):.2e}")]
+                ("zero-sum RMS / max",
+                 f"{last.get('zero_sum_rms', 0):.2e} / "
+                 f"{last.get('zero_sum_max', 0):.2e}")]
     return out
 
 

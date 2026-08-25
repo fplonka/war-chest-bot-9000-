@@ -383,8 +383,12 @@ def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0, stats=None):
     if stats is not None:
         expected = torch.zeros(nseg, dtype=v.dtype, device=v.device)
         expected.index_add_(0, seg, v.detach() * w)
-        residual = (expected[0::2] + expected[1::2]).abs().max().item()
-        stats["zero_sum_max"] = max(stats["zero_sum_max"], residual)
+        residual = expected[0::2] + expected[1::2]
+        maximum, square_sum = torch.stack([
+            residual.abs().max(), residual.square().sum()]).cpu().tolist()
+        stats["zero_sum_max"] = max(stats["zero_sum_max"], maximum)
+        stats["zero_sum_square_sum"] += square_sum
+        stats["zero_sum_n"] += len(residual)
     per = F.smooth_l1_loss(v, y, reduction="none", beta=0.5)
     total = torch.zeros(nseg, dtype=per.dtype, device=per.device)
     count = torch.zeros(nseg, dtype=per.dtype, device=per.device)
@@ -511,7 +515,8 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
     stat = {"sample_s": 0.0, "prepare_s": 0.0, "forward_wall_s": 0.0,
             "backward_wall_s": 0.0, "batch_configs": 0, "steps": steps,
             "gpu_forward_s": 0.0, "gpu_backward_s": 0.0,
-            "zero_sum_max": 0.0, "grad_clipped": 0,
+            "zero_sum_max": 0.0, "zero_sum_square_sum": 0.0,
+            "zero_sum_n": 0, "grad_clipped": 0,
             "grad_norm_sum": 0.0, "grad_norm_max": 0.0,
             "policy_steps": 0, "sample_ages": [],
             "sample_warm": 0, "sample_play": 0, "sample_query": 0,
@@ -545,10 +550,13 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
             b1 = torch.cuda.Event(enable_timing=True)
             f0.record(stream)
         ts = time.perf_counter()
-        step_stat = {"zero_sum_max": 0.0}
+        step_stat = {"zero_sum_max": 0.0, "zero_sum_square_sum": 0.0,
+                     "zero_sum_n": 0}
         value = losses(net, *parts, wp=policy_w, stats=step_stat)
         tot += step_stat["value_loss"]
         stat["zero_sum_max"] = max(stat["zero_sum_max"], step_stat["zero_sum_max"])
+        stat["zero_sum_square_sum"] += step_stat["zero_sum_square_sum"]
+        stat["zero_sum_n"] += step_stat["zero_sum_n"]
         if "policy_loss" in step_stat:
             stat["policy_steps"] += 1
             for key in policy_metrics:
@@ -1070,6 +1078,8 @@ def main():
                 window_sample_ages.extend(train_stat["sample_ages"])
                 window["zero_sum_max"] = max(
                     window["zero_sum_max"], train_stat["zero_sum_max"])
+                window["zero_sum_square_sum"] += train_stat["zero_sum_square_sum"]
+                window["zero_sum_n"] += train_stat["zero_sum_n"]
             window["train_s"] += train_s
 
             now = time.time()
@@ -1235,6 +1245,8 @@ def main():
                 "loss_old": round(diag["loss_old"], 5),
                 "loss_new": round(diag["loss_new"], 5),
                 "zero_sum_max": round(window["zero_sum_max"], 5),
+                "zero_sum_rms": round((window["zero_sum_square_sum"]
+                                        / max(window["zero_sum_n"], 1)) ** 0.5, 5),
                 "grad_norm": round(window["grad_norm_sum"] / max(steps, 1), 4),
                 "grad_norm_max": round(window["grad_norm_max"], 4),
                 "weight_norm": round(weight_norm, 4),

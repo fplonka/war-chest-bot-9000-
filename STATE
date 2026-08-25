@@ -17,10 +17,22 @@ Instrument the Student-of-Games trainer and dashboard with missing training-dyna
 - Kept game outcomes and true configurations as compact row telemetry; query rows remain explicitly unlabelled.
 - Verified Python syntax, dashboard rendering on the four historical logs, Rust `cargo check --features python`, the box release GPU build, and the host-only replay ring test on the box.
 - A focused CPU solver test on the box was too slow after 10 minutes and was terminated; it compiled successfully but did not complete.
+- Committed instrumentation as `48fb49d`.
+- First `dynamics_default_30` submission was killed by the driver before training because its build overlapped another measured run. Do not touch the box until the driver sends the exact words `box free`.
+
+## Local findings so far
+- The 3-minute warm phase generated 1,277,454 rows in each default-batch run, versus only 359,982 SoG rows in `sweep_control_fixed` and 368,502 in `querybel_30m`.
+- Ring positions imply 235,484 warm rows remained in the control's final 595,466-row replay (39.5% live; about 19.8% of the configured mixed sampler). `sweep2_S6` retained 64.6% warm rows. Do not propose clearing all warm replay without qualification: `arch_j_30` did that and prediction spread collapsed from about 0.41 to 0.15.
+- Fresh-row loss was consistently much larger than old-row loss. In the control's last five minutes: training 0.0293, old 0.0201, fresh 0.0358. This is distribution shift/noisy bootstrap, not the usual stale-row-underfit story.
+- The configured value/policy objective ended near 0.029 + 0.05*1.84 = 0.121 total, so the weighted policy term was about 3.1x the value term by loss magnitude. New gradient telemetry must decide whether it also dominates shared-trunk gradients.
+- The horizon payoff is estimated from only about 10 games per 10-second window: control cap value was zero in 67% of epochs and jumped across 0..0.15 with std 0.040. This makes sparse outcome grounding nonstationary.
+- Search refinement is not the top lever: `sweep2_S6` made 148,713 versus 359,982 rows and scored 0.255 against the control over 200 games. More refined search lost 185 Elo.
+- Zero-sum max residual reached 0.3-0.5, but older projection/penalty experiments lost strength. Added RMS telemetry before ranking this.
+- Existing `batch_configs` was broken and always logged 6; instrumentation now records the actual config count.
 
 ## Next
-1. Commit the instrumentation.
-2. Run `dynamics_default_30` with only `out=` changed, via box `go`.
+1. Continue local code/log analysis and review the instrumentation while the box is unavailable.
+2. After `box free`, re-run `WARCHEST_BOX_DIR=/workspace/warchest-dynamics tools/box.sh go out=dynamics_default_30` with no other overrides.
 3. Pull and analyze its `log.json`, `train.log`, and ladder.
 4. Apply the thermo-nuclear review to the final diff, fix findings, verify, and commit.
 5. Rank likely defects by expected strength gain and write the requested numeric report and experiment proposal.
