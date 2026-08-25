@@ -113,6 +113,7 @@ fn gpu(net: Net) -> Device {
         net,
         Cfg { budget: Budget::for_s(2048), ..Default::default() },
         4,
+        None,
     )
     .expect("device")
 }
@@ -1020,6 +1021,7 @@ fn k_iterates_together_match_k_iterates_alone() {
         net.clone(),
         Cfg { budget: Budget::for_s(512), ..Default::default() },
         8,
+        None,
     )
     .expect("device");
     let nets = Arc::new(Nets { value: net.clone(), device: true });

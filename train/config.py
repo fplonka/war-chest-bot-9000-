@@ -87,6 +87,8 @@ class Cfg:
     # many solves are in flight is not a knob: each card admits them as its own
     # memory allows.
     gen_workers: int = 0
+    # Calibration can force a residency. Zero selects the measured production knee.
+    slots_per_card: int = 0
     train_stream_priority: int = -1
 
     out: str = ""

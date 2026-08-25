@@ -647,7 +647,7 @@ struct SolveFarm {
 #[pymethods]
 impl SolveFarm {
     #[new]
-    #[pyo3(signature = (seed, workers, s=512, c=8.0, batch=8, rounds=0, explore=0.1, random_draft=true, cfr="sog", p_td1=0.2, query_rate=0.9, recursive_rate=0.1, devices=vec![0], roots=None))]
+    #[pyo3(signature = (seed, workers, s=512, c=8.0, batch=8, rounds=0, explore=0.1, random_draft=true, cfr="sog", p_td1=0.2, query_rate=0.9, recursive_rate=0.1, devices=vec![0], roots=None, slots_per_card=0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         seed: u64,
@@ -664,6 +664,7 @@ impl SolveFarm {
         recursive_rate: f32,
         devices: Vec<usize>,
         roots: Option<&str>,
+        slots_per_card: usize,
     ) -> PyResult<SolveFarm> {
         let cfg = Cfg { s, c, batch, rounds, cfr: cfr_of(cfr)?, budget: Budget::for_s(s), ..Default::default() };
         // A corpus makes this a bench rather than a run: the same roots in the
@@ -694,7 +695,12 @@ impl SolveFarm {
             }
         };
         let version = NET_VERSION.load(Ordering::Acquire);
-        let backend = backend_for(&devices, (**nets().read()).value.clone(), cfg)?;
+        let backend = backend_for(
+            &devices,
+            (**nets().read()).value.clone(),
+            cfg,
+            (slots_per_card > 0).then_some(slots_per_card),
+        )?;
         Ok(SolveFarm {
             farm: Farm::new(seed, workers, work, backend),
             net_version: version,
@@ -755,11 +761,13 @@ fn backend_for(
     _devices: &[usize],
     _value: crate::net::Net,
     #[allow(unused)] cfg: Cfg,
+    #[allow(unused)] slots_per_card: Option<usize>,
 ) -> PyResult<Backend> {
     #[cfg(feature = "gpu")]
     {
         let max_slots = crate::farm::host_slots(cfg.budget);
-        return crate::cuda::Device::new(_devices, _value, cfg, max_slots)
+        return crate::cuda::Device::new(
+            _devices, _value, cfg, max_slots, slots_per_card)
             .map(Backend::Cuda)
             .map_err(pyo3::exceptions::PyRuntimeError::new_err);
     }

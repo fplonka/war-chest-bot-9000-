@@ -64,17 +64,21 @@ def bench(args, devices, threads):
         recursive_rate=args.recursive_rate,
         devices=devices,
         roots=args.roots,
+        slots_per_card=args.slots_per_card,
     )
     # Warm: the kernels compile, the pools fill, and every thread reaches its
     # first solve. None of that is what we are measuring.
     warm = farm.collect(solves=4 * threads)
     base = [int(warm[k]) for k in KEYS]
+    base_hits = int(warm["budget_hits"])
 
     start = time.time()
-    mark, solves = start, 0
+    mark, solves, total_solves = start, 0, 0
+    d = warm
     while time.time() - start < args.seconds:
         d = farm.collect(solves=threads)
         solves += int(d["solves"])
+        total_solves += int(d["solves"])
         now = time.time()
         if now - mark < args.window:
             continue
@@ -93,6 +97,11 @@ def bench(args, devices, threads):
             flush=True,
         )
         mark, solves = now, 0
+    elapsed = time.time() - start
+    hits = int(d["budget_hits"]) - base_hits
+    print(f"RESULT slots={d['slots_per_card']} rate={total_solves / elapsed:.2f} "
+          f"solves={total_solves} seconds={elapsed:.2f} "
+          f"budget_stop_share={hits / max(total_solves, 1):.4f}")
     return farm
 
 
@@ -122,14 +131,20 @@ def main():
                    help="leaves a self-play solve queues, when making a corpus")
     p.add_argument("--recursive-rate", type=float, default=PROD.recursive_rate)
     p.add_argument("--weights", help="a checkpoint to solve with, e.g. runs/NAME/snap_02.pt")
+    p.add_argument("--weights-bin", help="an archived bot's weights.bin")
+    p.add_argument("--slots-per-card", type=int, default=0,
+                   help="calibration-only residency override")
     args = p.parse_args()
 
     # The network steers PUCT, so it steers where the tree grows and what a
     # solve costs. A random net is a different workload from a trained one.
-    net = Net()
-    if args.weights:
-        net.load_state_dict(load_checkpoint(args.weights).state_dict())
-    net.push()
+    if args.weights_bin:
+        warchest.set_weights_bin(args.weights_bin)
+    else:
+        net = Net()
+        if args.weights:
+            net.load_state_dict(load_checkpoint(args.weights).state_dict())
+        net.push()
     if args.make:
         return make(args)
     if not args.roots:

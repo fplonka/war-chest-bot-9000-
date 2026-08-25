@@ -239,7 +239,7 @@ fn devices(o: &Options, mind: Mind, _cfg: Cfg) -> Result<Option<Backend>, String
         })
         .collect();
     let net = Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
-    warchest::cuda::Device::new(&ordinals?, net, _cfg, usize::MAX)
+    warchest::cuda::Device::new(&ordinals?, net, _cfg, usize::MAX, None)
         .map(Backend::Cuda)
         .map(Some)
 }

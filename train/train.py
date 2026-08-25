@@ -852,7 +852,8 @@ def main():
             p_td1=args.p_td1,
             query_rate=args.query_rate,
             recursive_rate=args.recursive_rate,
-            devices=[int(d) for d in args.gen_devices.split(",")])
+            devices=[int(d) for d in args.gen_devices.split(",")],
+            slots_per_card=args.slots_per_card)
 
         progress["farm_runs"] += 1
         optimizer_rows = int(progress["optimizer_rows"])

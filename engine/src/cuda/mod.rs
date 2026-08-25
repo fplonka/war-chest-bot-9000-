@@ -835,7 +835,13 @@ impl Device {
     /// `max_slots` is the host's cap across every ordinal: the farm has already
     /// asked how many host-side arenas fit, and a card that carved more than
     /// that would sit empty.
-    pub fn new(ordinals: &[usize], net: Net, cfg: Cfg, max_slots: usize) -> Res<Device> {
+    pub fn new(
+        ordinals: &[usize],
+        net: Net,
+        cfg: Cfg,
+        max_slots: usize,
+        slots_per_card: Option<usize>,
+    ) -> Res<Device> {
         if ordinals.is_empty() {
             return Err("no cuda device ordinals given".into());
         }
@@ -889,7 +895,8 @@ impl Device {
             // card, with the GPU ~94% busy throughout -- past the knee the
             // rounds grow faster than the card retires them. Carve the knee.
             const SLOTS_KNEE: usize = 64;
-            let mut n = (fit as usize).min(left / gpus_left.max(1)).min(SLOTS_KNEE);
+            let slot_cap = slots_per_card.unwrap_or(SLOTS_KNEE);
+            let mut n = (fit as usize).min(left / gpus_left.max(1)).min(slot_cap);
             while n > 0 {
                 let need = n as u64 * slot + PIPELINE as u64 * Card::carve_bytes(n, &cfg);
                 if need + need / 10 <= free {
