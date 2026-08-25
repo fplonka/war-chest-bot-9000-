@@ -94,6 +94,9 @@ def main():
             if o["id"] not in seen:
                 seen.add(o["id"])
                 print(time.strftime("%H:%M:%S"), line(o), flush=True)
+        # The server-side price filter is not trusted: it once returned a
+        # $0.333/h offer under a $0.27 ceiling and we rented it.
+        found = [o for o in found if o["dph_total"] <= args.max_dph]
         if found and args.rent:
             try:
                 print("RENTED", json.dumps(rent(found[0], args.disk)), line(found[0]), flush=True)
