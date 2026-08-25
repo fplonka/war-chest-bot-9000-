@@ -11,10 +11,11 @@ import argparse
 import json
 import sys
 import time
-import urllib.request
+import http.client
 from pathlib import Path
 
-API = "https://console.vast.ai/api/v0"
+API = "/api/v0"
+HOST = "console.vast.ai"
 KEY = Path("~/.config/vastai/vast_api_key").expanduser().read_text().strip()
 IMAGE = "pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel"
 # The floor: two 24 GB cards, a modern many-core CPU, real PCIe bandwidth.
@@ -26,13 +27,28 @@ FLOOR = {"num_gpus": {"eq": 2}, "gpu_ram": {"gte": 24000}, "total_flops": {"gte"
          "rentable": {"eq": True}, "rented": {"eq": False}}
 
 
+conn = None
+
+
 def call(method, path, body):
-    req = urllib.request.Request(f"{API}{path}", method=method,
-                                 data=json.dumps(body).encode(),
-                                 headers={"Authorization": f"Bearer {KEY}",
-                                          "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.load(r)
+    """One kept-alive TLS connection: the handshake, not the server, was most
+    of a poll's latency."""
+    global conn
+    if conn is None:
+        conn = http.client.HTTPSConnection(HOST, timeout=20)
+    try:
+        conn.request(method, f"{API}{path}", body=json.dumps(body),
+                     headers={"Authorization": f"Bearer {KEY}",
+                              "Content-Type": "application/json"})
+        r = conn.getresponse()
+        data = r.read()
+    except (http.client.HTTPException, OSError):
+        conn.close()
+        conn = None
+        raise
+    if r.status != 200:
+        raise RuntimeError(f"HTTP {r.status}: {data[:120].decode(errors='replace')}")
+    return json.loads(data)
 
 
 def offers(max_dph, disk):
@@ -71,7 +87,7 @@ def main():
             delay = min(60.0, delay * 2)
             print(time.strftime("%H:%M:%S"), f"poll failed: {e}; delay {delay:.1f}s", flush=True)
             continue
-        delay = max(0.5, delay * 0.9)
+        delay = max(0.2, delay * 0.9)
         polls += 1
         for o in found:
             if o["id"] not in seen:
