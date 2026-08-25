@@ -893,18 +893,6 @@ def main():
     def snapshot(label, el):
         # "init" and "final" are the two the reader always wants named; the rest
         # are numbered, and the manifest carries the time each was taken at.
-        # Relabelling instead of resaving keeps the ladder from rating the same
-        # weights twice when the clock runs out just after a periodic snapshot.
-        # The window is a quarter of the snapshot cadence: at 10-minute
-        # snapshots a 30-minute run's final lands ~30 s after the last timed
-        # snapshot, and rating both would waste ladder pairings on near-twins.
-        # Never collapse a short run's trained result into `init`: those are
-        # opposite ends of the experiment even when the whole run is shorter
-        # than the ordinary snapshot de-duplication window.
-        if snaps and snaps[-1]["label"] != "init" and \
-                el - snaps[-1]["t"] < snap_gap / 4.0:
-            snaps[-1]["label"] = label
-            return
         path = f"{args.out}/snap_{len(snaps):02d}.pt"
         entry = {"label": label, "t": round(el, 1),
                  "file": os.path.basename(path)}
