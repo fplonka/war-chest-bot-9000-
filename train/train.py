@@ -278,33 +278,41 @@ class Buffer:
         t = lambda a: torch.as_tensor(a, device=dev)
         s_t, lens_t, alen_t, clen_t = t(s), t(lens), t(alen), t(clen)
         row_ids = torch.as_tensor(np.arange(n), device=dev)
+        total, alen_total, clen_total = int(lens.sum()), int(alen.sum()), int(clen.sum())
         # Arena indices of every config of every chosen row, flattened: the
         # within-row offset is `arange(total) - rowstart`, and `rowstart` is
         # known on the host, so the flattened index needs no readback.
+        # `output_size` matters: without it `repeat_interleave` synchronizes
+        # to learn the output length from the device counts.
         rowstart = torch.cumsum(lens_t, 0) - lens_t
-        at = (torch.repeat_interleave(self.cstart[s_t] - rowstart, lens_t)
-              + torch.arange(int(lens.sum()), device=dev)) % self.ccap
-        seg = 2 * torch.repeat_interleave(row_ids, lens_t) + self.cp[at]
+        at = (torch.repeat_interleave(self.cstart[s_t] - rowstart, lens_t,
+                                      output_size=total)
+              + torch.arange(total, device=dev)) % self.ccap
+        seg = 2 * torch.repeat_interleave(row_ids, lens_t, output_size=total) \
+            + self.cp[at]
         # The policy target, remapped onto the batch. A row with no target
         # contributes no cells, which is how a query solve drops out of the
         # policy loss without a mask.
         astart = torch.cumsum(alen_t, 0) - alen_t
         cstart = torch.cumsum(clen_t, 0) - clen_t
-        ai = (torch.repeat_interleave(self.pastart[s_t] - astart, alen_t)
-              + torch.arange(int(alen.sum()), device=dev))
-        ci = (torch.repeat_interleave(self.pcstart[s_t] - cstart, clen_t)
-              + torch.arange(int(clen.sum()), device=dev))
+        ai = (torch.repeat_interleave(self.pastart[s_t] - astart, alen_t,
+                                      output_size=alen_total)
+              + torch.arange(alen_total, device=dev))
+        ci = (torch.repeat_interleave(self.pcstart[s_t] - cstart, clen_t,
+                                      output_size=clen_total)
+              + torch.arange(clen_total, device=dev))
         # An action's index becomes batch-global, and a cell names the query
         # (row, acting config) it belongs to. A cell names its config within
         # its own row; the batch arena puts that row's configs at `rowstart`,
         # so the two add to an arena index.
-        cellrow = torch.repeat_interleave(row_ids, clen_t)
-        pcfg = torch.repeat_interleave(rowstart, clen_t) \
+        cellrow = torch.repeat_interleave(row_ids, clen_t, output_size=clen_total)
+        pcfg = torch.repeat_interleave(rowstart, clen_t, output_size=clen_total) \
             + self.pci[ci % self.pcap]
         pol = (self.pa[ai % self.acap],
-               torch.repeat_interleave(astart, clen_t) + self.pact[ci % self.pcap],
+               torch.repeat_interleave(astart, clen_t, output_size=clen_total)
+               + self.pact[ci % self.pcap],
                cellrow, pcfg, self.pp[ci % self.pcap],
-               torch.repeat_interleave(row_ids, alen_t))
+               torch.repeat_interleave(row_ids, alen_t, output_size=alen_total))
         cw = self.cw[at].to(torch.float32)
         mass = torch.zeros(2 * n, device=dev).index_add_(0, seg, cw)
         return (self.x[s_t], self.cc[at], self.cp[at], cw / mass[seg],
