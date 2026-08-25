@@ -22,7 +22,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PAGE = os.path.join(HERE, "tools", "monitor.html")
+TOOLS = os.path.join(HERE, "tools")
+PAGE = os.path.join(TOOLS, "monitor.html")
+ASSETS = {
+    "/vendor/uPlot.iife.min.js": ("uPlot.iife.min.js", "text/javascript"),
+    "/vendor/uPlot.min.css": ("uPlot.min.css", "text/css"),
+}
 sys.path.insert(0, os.path.join(HERE, "train"))
 import config  # noqa: E402  -- knobs(), so the baseline lives in one place
 
@@ -53,18 +58,22 @@ def read_text(path, limit=64 << 10):
         return ""
 
 
-def series(label, x, y, smooth=False, err=None):
-    fin = lambda v: v if isinstance(v, (int, float)) and math.isfinite(v) else None
-    return {"n": label, "x": x, "y": [fin(v) for v in y], "sm": smooth,
-            "e": [fin(v) for v in err] if err else None}
+def finite(v):
+    return v if isinstance(v, (int, float)) and math.isfinite(v) else None
 
 
-def panel(title, ylabel, ss, zero=False, hlines=(), marks=False):
-    """A panel, or None when nothing in it has data yet -- an early run draws
-    the panels it can fill and none of the others."""
+def series(label, y, smooth=False, err=None):
+    return {"n": label, "y": [finite(v) for v in y], "sm": smooth,
+            "e": [finite(v) for v in err] if err else None}
+
+
+def panel(title, ylabel, x, ss, zero=False, hlines=(), marks=False):
+    """Return None until at least one series has data."""
     ss = [s for s in ss if any(v is not None for v in s["y"])]
-    return ss and {"t": title, "y": ylabel, "s": ss, "zero": zero,
-                   "h": list(hlines), "marks": marks} or None
+    if not ss:
+        return None
+    return {"t": title, "y": ylabel, "x": [finite(v) for v in x], "s": ss,
+            "zero": zero, "h": list(hlines), "marks": marks}
 
 
 def elo_panel(lad, name):
@@ -78,9 +87,9 @@ def elo_panel(lad, name):
                  and p["name"].startswith(name + ".")),
                 key=lambda p: p["minutes"])
     greedy = next((p for p in lad.get("players", []) if p["name"] == "greedy"), None)
-    return panel("Strength vs training time", "elo (95% CI)",
-                 [series("snapshot", [p["minutes"] for p in ps],
-                         [p["elo"] for p in ps],
+    x = [p["minutes"] for p in ps]
+    return panel("Strength vs training time", "elo (95% CI)", x,
+                 [series("snapshot", [p["elo"] for p in ps],
                          err=[CI95 * (p.get("se") or 0) for p in ps])],
                  hlines=[("greedy", greedy["elo"])] if greedy else (), marks=True)
 
@@ -88,50 +97,55 @@ def elo_panel(lad, name):
 def panels(eps, elo):
     """Every panel of the dashboard, from the SoG epochs logged so far."""
     m = [e["t"] / 60.0 for e in eps]
-    col = lambda k: [e.get(k, 0) for e in eps]
+    col = lambda k: [e.get(k) for e in eps]
     has = lambda k: any(k in e for e in eps)
-    per_decision = lambda k: [e.get(k, 0) / max(e.get("decisions", 1), 1) for e in eps]
     out = [elo]
 
     if has("loss_old"):
-        out.append(panel("Value loss by row age", "huber",
-                         [series("old rows", m, col("loss_old"), True),
-                          series("fresh rows", m, col("loss_new"), True)]))
+        out.append(panel("Value loss by row age", "huber", m,
+                         [series("old rows", col("loss_old"), True),
+                          series("fresh rows", col("loss_new"), True)]))
     else:
-        out.append(panel("Value loss", "huber", [series("", m, col("loss"), True)]))
+        out.append(panel("Value loss", "huber", m,
+                         [series("value", col("loss"), True)]))
 
-    # Historical runs may carry the ablated ownership head's metrics. Keep
-    # rendering their recorded data; current runs simply omit these keys.
+    if has("policy_loss"):
+        out.append(panel("Policy loss", "cross-entropy", m,
+                         [series("policy", col("policy_loss"), True)], zero=True))
+
+    # Historical runs may carry the ablated ownership head's metrics.
     if has("aux_loss"):
-        out.append(panel("Auxiliary ownership loss", "cross-entropy",
-                         [series("", m, col("aux_loss"), True)], zero=True))
-        out.append(panel("Auxiliary ownership accuracy", "fraction correct",
-                         [series("", m, col("aux_acc"), True)], zero=True,
+        out.append(panel("Auxiliary ownership loss", "cross-entropy", m,
+                         [series("ownership", col("aux_loss"), True)], zero=True))
+        out.append(panel("Auxiliary ownership accuracy", "fraction correct", m,
+                         [series("ownership", col("aux_acc"), True)], zero=True,
                          hlines=[("chance", 1 / 3)]))
 
-    # Raw loss is not comparable across runs, because the targets it is
-    # measured against change scale as play improves, so a falling loss can be
-    # nothing but a shrinking target. The share of target variance left
-    # unexplained is scale-free, and is what says whether a run actually
-    # fitted.
-    out.append(panel("Unexplained target variance", "loss / target variance",
-                     [series("", m, [e["loss"] / max(e["tgt_std"] ** 2, 1e-9)
-                                     for e in eps], True)], zero=True))
-    out.append(panel("Spread of predictions", "std",
-                     [series("prediction", m, col("probe_std"), True),
-                      series("target", m, col("tgt_std"), True)], zero=True))
+    explained = []
+    for e in eps:
+        std = e.get("tgt_std")
+        explained.append(1 - e["loss"] / std ** 2
+                         if std and "loss" in e else None)
+    out.append(panel("Value variance explained", "1 - loss / target variance", m,
+                     [series("value", explained, True)], hlines=[("zero", 0)]))
+    out.append(panel("Spread of predictions", "std", m,
+                     [series("prediction", col("probe_std"), True),
+                      series("target", col("tgt_std"), True)], zero=True))
 
     # Two throughput lines, and the gap between them is the information.
     # `solves_per_s` is cumulative solves over elapsed -- the run average, not
     # the current rate -- so "now" has to come from consecutive epochs.
-    nx, ny = [], []
+    now = [None]
     for a, b in zip(eps, eps[1:]):
-        if b["t"] - a["t"] > 0.5:
-            nx.append(b["t"] / 60.0)
-            ny.append(b["solves"] / (b["t"] - a["t"]))
-    out.append(panel("Generation throughput", "solves/s",
-                     [series("now", nx, ny, True),
-                      series("run average", m, col("solves_per_s"))], zero=True))
+        dt = b["t"] - a["t"]
+        now.append(b.get("solves") / dt if dt > 0.5 and b.get("solves") is not None
+                   else None)
+    out.append(panel("Generation throughput", "solves/s", m,
+                     [series("now", now, True),
+                      series("run average", col("solves_per_s"))], zero=True))
+    if has("buf"):
+        out.append(panel("Replay buffer fill", "rows", m,
+                         [series("buffer", col("buf"))], zero=True))
 
     for title, ylabel, key, smooth in (
             ("Replay generation throughput", "rows/s", "rows_per_s", False),
@@ -147,17 +161,32 @@ def panels(eps, elo):
             # is measuring a game that is increasingly not the real one.
             ("Games cut at horizon", "fraction", "horizon_frac", True)):
         if has(key):
-            out.append(panel(title, ylabel, [series("", m, col(key), smooth)], zero=True))
+            out.append(panel(title, ylabel, m,
+                             [series(title.lower(), col(key), smooth)], zero=True))
 
-    # One chart makes the policy mix directly comparable; six separate panels
-    # hid the later categories below the fold.
     if any(e.get("plays") for e in eps):
         kinds = ("attack", "maneuver", "deploy", "bolster", "recruit", "pass")
-        out.append(panel("Move mix", "% of decisions",
-                         [series(kind, m, [100 * e.get("plays", {}).get(kind, 0)
-                                          / max(e.get("decisions", 1), 1)
-                                          for e in eps], True)
+        labels = {"recruit": "recruit / claim initiative"}
+        out.append(panel("Move mix", "% of decisions", m,
+                         [series(labels.get(kind, kind),
+                                 [100 * e.get("plays", {}).get(kind, 0)
+                                  / max(e.get("decisions", 1), 1) for e in eps], True)
                           for kind in kinds], zero=True))
+
+    censuses = [e.get("stop_census") or {} for e in eps]
+    reasons = sorted({reason for census in censuses for stops in census.values()
+                      for reason in stops})
+    if reasons:
+        def stop_share(census, reason):
+            groups = [stops for stops in census.values() if isinstance(stops, dict)]
+            total = sum(item.get("count", 0) for stops in groups
+                        for item in stops.values())
+            count = sum(stops.get(reason, {}).get("count", 0) for stops in groups)
+            return 100 * count / total if total else None
+        out.append(panel("Solver stop mix", "% of solves", m,
+                         [series(reason.removeprefix("budget_"),
+                                 [stop_share(c, reason) for c in censuses], True)
+                          for reason in reasons], zero=True))
     return [p for p in out if p]
 
 
@@ -248,7 +277,7 @@ def arena_summary(report):
     """The one line that says what a report found, whichever kind it is."""
     if report["kind"] == "ladder":
         players = report.get("players") or [{"name": "?"}]
-        best = max(players, key=lambda p: p.get("elo") or -1e9)
+        best = max(players, key=lambda p: p["elo"] if p.get("elo") is not None else -1e9)
         return f"{len(players)} bots · {report.get('games')} games · top {best['name']}"
     best = max(report["bots"], key=lambda b: b["rate"])
     return (f"{len(report['bots'])} bots · {report['questions']} proven "
@@ -274,6 +303,14 @@ class Handler(BaseHTTPRequestHandler):
         route = self.path.split("?")[0]
         if route == "/":
             return self.body(read_text(PAGE, 1 << 20).encode(), "text/html")
+        if route in ASSETS:
+            filename, ctype = ASSETS[route]
+            try:
+                with open(os.path.join(TOOLS, "vendor", filename), "rb") as f:
+                    raw = f.read()
+            except OSError:
+                return self.send_error(404)
+            return self.body(raw, ctype)
         if route == "/api/runs":
             return self.body(json.dumps(index(self.server.runs)).encode(),
                              "application/json")

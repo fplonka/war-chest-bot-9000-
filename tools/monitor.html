@@ -1,5 +1,6 @@
 <!doctype html><meta charset=utf-8><title>warchest runs</title>
 <meta name=viewport content="width=device-width,initial-scale=1">
+<link rel=stylesheet href=/vendor/uPlot.min.css>
 <style>
 :root{--bg:#fff;--ink:#111;--mut:#666;--line:#ddd}
 @media (prefers-color-scheme:dark){:root{--bg:#111;--ink:#e8e8e8;--mut:#999;--line:#333}}
@@ -23,9 +24,12 @@ h2{font-size:12px;margin:22px 0 6px;color:var(--mut)}
 .delta{display:flex;flex-wrap:wrap;gap:2px 16px;color:var(--mut);margin-bottom:12px}
 .delta .hit{color:var(--ink);font-weight:700}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:10px 18px}
-.panel canvas{width:100%;height:190px;display:block}
-.ph{font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.ax{color:var(--mut)}
+.panel{min-width:0}
+.uplot{font:10px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.u-title{font-size:11px;text-align:left;font-weight:700}
+.u-legend{font-size:10px;margin:0!important}
+.u-legend th,.u-legend td{padding:0 8px 0 0;border:0}
+.u-select{background:#8883}
 dl{display:flex;flex-wrap:wrap;gap:0 22px;margin:4px 0}
 dt{font-size:11px;color:var(--mut)}
 dd{margin:0 0 4px}
@@ -38,145 +42,126 @@ th:first-child,td:first-child{text-align:left}
 td.rate{text-align:left;width:118px}
 pre{max-height:340px;overflow:auto;margin:4px 0;font:inherit;white-space:pre-wrap}
 #loglink{margin-left:8px;font-size:11px;color:#3d8bfd}
-#tip{position:fixed;display:none;z-index:2;pointer-events:none;white-space:pre;
- padding:5px 7px;background:var(--bg);border:1px solid var(--line);box-shadow:0 2px 8px #0004}
 </style>
 <aside id=list></aside>
 <main>
  <h1><span id=title></span><a id=loglink target=_blank>train.log</a></h1>
  <p class=meta id=meta></p><p class=note id=note></p>
  <div class=delta id=cfg></div>
+ <p class=meta id=charthelp>drag zoom · wheel zoom · middle-drag pan · double-click reset</p>
  <div class=grid id=panels></div>
  <dl id=health></dl>
  <div id=ladders></div>
  <div id=text></div>
 </main>
-<div id=tip></div>
+<script src=/vendor/uPlot.iife.min.js></script>
 <script>
-// Six colour-blind-safe tones: Move mix has six simultaneous series, so the
-// palette must not wrap and make attack indistinguishable from pass.
-const palette = () => matchMedia("(prefers-color-scheme:dark)").matches
-  ? ["#77aadd", "#ee8866", "#44bb99", "#eedd66", "#99ddff", "#cc77aa"]
-  : ["#336699", "#cc3311", "#117755", "#997700", "#2288aa", "#882255"];
-const AXIS = "#8a8a8a";
+const COLORS = ["#4e79a7", "#e15759", "#59a14f", "#f28e2b", "#76b7b2",
+  "#edc949", "#af7aa1", "#ff9da7", "#9c755f", "#bab0ac", "#8cd17d"];
 const $ = id => document.getElementById(id);
 const E = (tag, cls, text) => { const n = document.createElement(tag);
   if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
-let sel = decodeURIComponent(location.hash.slice(1)) || null, shape = "", last = null;
+let sel = decodeURIComponent(location.hash.slice(1)) || null;
+let shape = "", plots = [];
 
 const api = async u => { try { const r = await fetch(u); return r.ok ? r.json() : null; }
                          catch (e) { return null; } };
+const fmt = v => v == null ? "—" : Math.abs(v) >= 1e5 || (v && Math.abs(v) < 1e-3)
+  ? v.toExponential(2) : String(+v.toPrecision(4));
 
-// Per-epoch values are jumpy -- every epoch trains on a fresh sample of a large
-// buffer -- so the trend is the readable part and the scatter is its context.
 function ema(y, span = 12) {
   const a = 2 / (span + 1); let p = null;
   return y.map(v => v == null ? null : (p = p == null ? v : a * v + (1 - a) * p));
 }
 
-const quant = (v, q) => v[Math.min(v.length - 1, Math.max(0, Math.round(q * (v.length - 1))))];
-const fmt = v => Math.abs(v) >= 1e5 || (v && Math.abs(v) < 1e-3)
-  ? v.toExponential(0) : String(+v.toPrecision(3));
-
-function ticks(lo, hi, n) {
-  const raw = (hi - lo) / n, mag = Math.pow(10, Math.floor(Math.log10(raw || 1)));
-  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(m => raw <= m) || 10 * mag, out = [];
-  for (let v = Math.ceil(lo / step) * step; v <= hi + step / 1e3; v += step) out.push(v);
-  return out;
+// This is uPlot's official wheel-zoom and drag-pan plugin pattern. Normal drag
+// selects a zoom range; wheel zooms around the cursor; middle-drag pans.
+function navigation() {
+  return {hooks: {ready: u => {
+    const over = u.over;
+    over.addEventListener("wheel", e => {
+      e.preventDefault();
+      const x = u.posToVal(u.cursor.left, "x"), span = u.scales.x.max - u.scales.x.min;
+      const full = u.data[0], min = full[0], max = full[full.length - 1];
+      const next = Math.min(max - min, e.deltaY < 0 ? span * .75 : span / .75);
+      const pct = (x - u.scales.x.min) / span;
+      let lo = x - pct * next, hi = lo + next;
+      if (lo < min) { lo = min; hi = min + next; }
+      if (hi > max) { hi = max; lo = max - next; }
+      u.setScale("x", {min: lo, max: hi});
+    }, {passive: false});
+    over.addEventListener("mousedown", e => {
+      if (e.button !== 1) return;
+      e.preventDefault();
+      const start = e.clientX, lo0 = u.scales.x.min, hi0 = u.scales.x.max;
+      const units = (hi0 - lo0) / u.bbox.width * devicePixelRatio;
+      const move = ev => {
+        const full = u.data[0], span = hi0 - lo0;
+        let lo = lo0 - units * (ev.clientX - start), hi = lo + span;
+        if (lo < full[0]) { lo = full[0]; hi = lo + span; }
+        if (hi > full[full.length - 1]) { hi = full[full.length - 1]; lo = hi - span; }
+        u.setScale("x", {min: lo, max: hi});
+      };
+      const up = () => { removeEventListener("mousemove", move); removeEventListener("mouseup", up); };
+      addEventListener("mousemove", move); addEventListener("mouseup", up);
+    });
+    over.addEventListener("dblclick", () => u.setData(u.data));
+  }}};
 }
 
-function draw(cv, p, snaps) {
-  const dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
-  cv.width = W * dpr; cv.height = H * dpr;
-  const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, W, H);
-  const L = 46, R = 6, T = 6, B = 16;
-  const ss = p.s.map(s => ({ ...s, v: s.sm ? ema(s.y) : s.y }));
-  const xs = [].concat(...ss.map(s => s.x)); if (!xs.length) return;
-  const x0 = Math.min(...xs), x1 = Math.max(...xs) || 1;
-  const vals = [];
-  ss.forEach(s => s.v.forEach((v, i) => { if (v == null) return; vals.push(v);
-    const e = s.e && s.e[i]; if (e) vals.push(v - e, v + e); }));
-  p.h.forEach(h => vals.push(h[1]));
-  if (!vals.length) return;
-  vals.sort((a, b) => a - b);
-  // One bad epoch -- a warm-up spike, a drain record -- must not set the axis
-  // and flatten everything else, so the limits are percentiles.
-  let lo = p.zero ? Math.min(0, vals[0]) : quant(vals, 0.01), hi = quant(vals, 0.99);
-  const pad = (hi - lo) * 0.12 || Math.abs(hi) * 0.1 || 1;
-  hi += pad; if (!p.zero) lo -= pad;
-  const X = v => L + (v - x0) / ((x1 - x0) || 1) * (W - L - R);
-  const Y = v => T + (1 - (v - lo) / ((hi - lo) || 1)) * (H - T - B);
-  cv._plot = {L, R, W, x0, x1, ss};
-
-  g.font = "10px ui-monospace,Menlo,monospace"; g.strokeStyle = AXIS; g.fillStyle = AXIS;
-  g.lineWidth = 1;
-  for (const t of ticks(lo, hi, 4)) {
-    const y = Math.round(Y(t)) + 0.5;
-    g.strokeStyle = "rgba(138,138,138,0.20)";
-    g.beginPath(); g.moveTo(L, y); g.lineTo(W - R, y); g.stroke();
-    g.fillText(fmt(t), 2, y + 3);
-  }
-  for (const t of ticks(x0, x1, 5)) g.fillText(fmt(t), X(t) - 6, H - 4);
-  // Where the ladder's players were taken from.
-  g.strokeStyle = "rgba(138,138,138,0.35)"; g.setLineDash([2, 3]);
-  for (const t of snaps || []) { if (t < x0 || t > x1) continue;
-    const x = Math.round(X(t)) + 0.5;
-    g.beginPath(); g.moveTo(x, T); g.lineTo(x, H - B); g.stroke(); }
-  g.setLineDash([]);
-
-  const ink = palette();
-  ss.forEach((s, i) => {
-    const col = ink[i % ink.length];
-    const line = (y, w, alpha) => { g.globalAlpha = alpha; g.strokeStyle = col;
-      g.lineWidth = w; g.beginPath(); let on = false;
-      y.forEach((v, k) => { if (v == null) { on = false; return; }
-        on ? g.lineTo(X(s.x[k]), Y(v)) : g.moveTo(X(s.x[k]), Y(v)); on = true; });
-      g.stroke(); g.globalAlpha = 1; };
-    if (s.sm) line(s.y, 1, 0.22);          // raw behind, trend in front
-    line(s.v, 1.6, 1);
-    if (s.e) { g.strokeStyle = col;
-      s.e.forEach((e, k) => { if (!e || s.v[k] == null) return;
-        g.beginPath(); g.moveTo(X(s.x[k]), Y(s.v[k] - e));
-        g.lineTo(X(s.x[k]), Y(s.v[k] + e)); g.stroke(); }); }
-    if (p.marks) { g.fillStyle = col;
-      s.v.forEach((v, k) => { if (v == null) return;
-        g.beginPath(); g.arc(X(s.x[k]), Y(v), 2.5, 0, 7); g.fill(); }); }
-  });
-  g.setLineDash([4, 4]);
-  p.h.forEach((h, i) => { g.strokeStyle = ink[(i + 1) % ink.length];
-    g.beginPath(); g.moveTo(L, Y(h[1])); g.lineTo(W - R, Y(h[1])); g.stroke(); });
-  g.setLineDash([]);
+function overlays(state) {
+  return {hooks: {draw: u => {
+    const {ctx, bbox} = u, dpr = devicePixelRatio || 1;
+    ctx.save(); ctx.beginPath(); ctx.rect(bbox.left, bbox.top, bbox.width, bbox.height); ctx.clip();
+    ctx.lineWidth = dpr; ctx.strokeStyle = "#8886"; ctx.setLineDash([2 * dpr, 3 * dpr]);
+    for (const t of state.snaps) {
+      const x = u.valToPos(t, "x", true);
+      ctx.beginPath(); ctx.moveTo(x, bbox.top); ctx.lineTo(x, bbox.top + bbox.height); ctx.stroke();
+    }
+    ctx.setLineDash([]);
+    state.panel.s.forEach((s, si) => (s.e || []).forEach((err, i) => {
+      const val = s.sm ? ema(s.y)[i] : s.y[i];
+      if (err == null || val == null) return;
+      const x = u.valToPos(state.panel.x[i], "x", true);
+      ctx.strokeStyle = COLORS[si % COLORS.length]; ctx.beginPath();
+      ctx.moveTo(x, u.valToPos(val - err, "y", true));
+      ctx.lineTo(x, u.valToPos(val + err, "y", true)); ctx.stroke();
+    }));
+    ctx.restore();
+  }}};
 }
 
-function hover(e) {
-  const q = e.currentTarget._plot, tip = $("tip");
-  if (!q) { tip.style.display = "none"; return; }
-  const r = e.currentTarget.getBoundingClientRect(), px = e.clientX - r.left;
-  if (px < q.L || px > q.W - q.R) { tip.style.display = "none"; return; }
-  const x = q.x0 + (px - q.L) / (q.W - q.L - q.R) * (q.x1 - q.x0);
-  const rows = ["time " + fmt(x) + " min"];
-  q.ss.forEach(s => {
-    let at = -1, dist = Infinity;
-    s.x.forEach((v, i) => { const d = Math.abs(v - x);
-      if (s.y[i] != null && d < dist) { at = i; dist = d; } });
-    if (at >= 0) rows.push((s.n || "value") + " " + fmt(s.y[at]));
-  });
-  tip.textContent = rows.join("\n"); tip.style.display = "block";
-  tip.style.left = Math.min(innerWidth - tip.offsetWidth - 8, e.clientX + 12) + "px";
-  tip.style.top = Math.min(innerHeight - tip.offsetHeight - 8, e.clientY + 12) + "px";
+function plotData(p) {
+  return [p.x, ...p.s.map(s => s.sm ? ema(s.y) : s.y),
+    ...p.h.map(h => p.x.map(() => h[1]))];
 }
 
-function head(p) {
-  // Series are named in the panel title, so colours never have to be matched
-  // across panels and there is no legend to draw.
-  const h = E("div", "ph"), ink = palette(); h.appendChild(E("b", null, p.t));
-  p.s.forEach((s, i) => { if (!s.n) return;
-    const n = E("span", null, " " + s.n); n.style.color = ink[i % ink.length];
-    h.appendChild(n); });
-  p.h.forEach((x, i) => { const n = E("span", null, " " + x[0]);
-    n.style.color = ink[(i + 1) % ink.length]; h.appendChild(n); });
-  h.appendChild(E("span", "ax", " · " + p.y));
-  return h;
+function makePlot(box, p, snaps) {
+  const dark = matchMedia("(prefers-color-scheme:dark)").matches;
+  const axis = dark ? "#999" : "#666", grid = dark ? "#333" : "#ddd";
+  const state = {panel: p, snaps};
+  const series = [{label: "training time", value: (u, v) => fmt(v) + " min"}];
+  p.s.forEach((s, i) => series.push({label: s.n, stroke: COLORS[i % COLORS.length],
+    width: 1.5, points: {show: p.marks}, spanGaps: false,
+    value: (u, v, si, idx) => fmt(idx == null ? null : state.panel.s[i].y[idx])}));
+  p.h.forEach((h, i) => series.push({label: h[0], stroke: COLORS[(p.s.length + i) % COLORS.length],
+    width: 1, dash: [5, 5], points: {show: false}}));
+  const opts = {title: p.t + " · " + p.y, width: box.clientWidth, height: 230,
+    plugins: [navigation(), overlays(state)], scales: {x: {time: false}, y: {}},
+    cursor: {drag: {x: true, y: false, setScale: true}}, series,
+    axes: [{stroke: axis, grid: {stroke: grid}, values: (u, ticks) => ticks.map(fmt)},
+      {stroke: axis, grid: {stroke: grid}, size: 65,
+       values: (u, ticks) => ticks.map(fmt)}]};
+  if (p.zero) opts.scales.y.range = (u, min, max) => {
+    const lo = Math.min(0, min), hi = Math.max(0, max);
+    return lo === hi ? [0, 1] : [lo, hi];
+  };
+  const u = new uPlot(opts, plotData(p), box);
+  return {u, box, state};
+}
+
+function clearPlots() {
+  plots.forEach(p => p.u.destroy()); plots = [];
 }
 
 function table(head, rows) {
@@ -248,11 +233,12 @@ function bars(box, title, names, rows) {
 }
 
 function renderArena(d) {
-  last = null;
+  clearPlots();
   $("title").textContent = d.name;
   ["note", "cfg", "panels", "health", "text", "ladders"]
     .forEach(id => $(id).textContent = "");
   $("loglink").style.display = "none";
+  $("charthelp").style.display = "none";
   shape = "";
   const box = $("ladders");
   if (d.kind === "ladder") {
@@ -279,8 +265,8 @@ function renderArena(d) {
 }
 
 function render(d) {
-  last = d;
   $("loglink").style.display = "";
+  $("charthelp").style.display = "";
   $("title").textContent = d.name;
   $("meta").textContent = [d.git, d.epochs + " ReBeL epochs"].filter(Boolean).join(" · ");
   $("note").textContent = d.note || "";
@@ -291,16 +277,23 @@ function render(d) {
   d.cfg.forEach(([k, v, changed]) =>
     cfg.appendChild(E("span", changed ? "hit" : null, k + "=" + v)));
 
-  const grid = $("panels"), key = d.panels.map(p => p.t).join("|");
-  if (key !== shape || grid.children.length !== d.panels.length) {
-    grid.textContent = "";
-    d.panels.forEach(p => { const box = E("div", "panel"), cv = E("canvas");
-      cv.onmousemove = hover; cv.onmouseleave = () => $("tip").style.display = "none";
-      box.appendChild(head(p)); box.appendChild(cv); grid.appendChild(box); });
+  const grid = $("panels"), key = d.panels.map(p =>
+    p.t + ":" + p.s.map(s => s.n).join(",") + ":" + p.h.map(h => h[0]).join(",")).join("|");
+  if (key !== shape || plots.length !== d.panels.length) {
+    clearPlots(); grid.textContent = "";
+    const boxes = d.panels.map(() => { const box = E("div", "panel");
+      grid.appendChild(box); return box; });
+    plots = d.panels.map((p, i) => makePlot(boxes[i], p, d.snaps));
     shape = key;
+  } else {
+    d.panels.forEach((p, i) => {
+      const q = plots[i], old = q.u.data[0], scale = q.u.scales.x;
+      const full = Math.abs(scale.min - old[0]) < 1e-9 &&
+        Math.abs(scale.max - old[old.length - 1]) < 1e-9;
+      q.state.panel = p; q.state.snaps = d.snaps;
+      q.u.setData(plotData(p), full);
+    });
   }
-  const cvs = grid.querySelectorAll("canvas");
-  d.panels.forEach((p, i) => draw(cvs[i], p, d.snaps));
 
   const hl = $("health"); hl.textContent = "";
   d.health.forEach(([k, v]) => { hl.appendChild(E("dt", null, k));
@@ -362,7 +355,8 @@ async function poll() {
   }
 }
 
-addEventListener("resize", () => last && render(last));
+addEventListener("resize", () => plots.forEach(p =>
+  p.u.setSize({width: p.box.clientWidth, height: 230})));
 addEventListener("hashchange", () => {   // the hash is the deep link, so honour Back
   sel = decodeURIComponent(location.hash.slice(1)) || sel; shape = ""; poll(); });
 setInterval(poll, 3000);
