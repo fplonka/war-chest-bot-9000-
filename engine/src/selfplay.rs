@@ -154,6 +154,14 @@ pub struct Data {
     pub pci: Vec<u16>,
     pub pcell: Vec<u16>,
     pub pprob: Vec<f32>,
+
+    /// Per row and seat: realised config within that seat's support, and final
+    /// game outcome. Query rows use `u32::MAX` and NaN because no game owns them.
+    pub truth: Vec<u32>,
+    pub outcome: Vec<f32>,
+    /// One for a query row and one for a main-line row selected for TD(1).
+    pub query: Vec<u8>,
+    pub td1: Vec<u8>,
     /// Decisions by coarse move class, for the run report's strategy mix.
     pub plays: [usize; 7],
 
@@ -199,6 +207,10 @@ impl Data {
         self.pci.extend(o.pci);
         self.pcell.extend(o.pcell);
         self.pprob.extend(o.pprob);
+        self.truth.extend(o.truth);
+        self.outcome.extend(o.outcome);
+        self.query.extend(o.query);
+        self.td1.extend(o.td1);
         self.paoff.extend(o.paoff.iter().skip(tail).map(|x| x + ab));
         self.pcoff.extend(o.pcoff.iter().skip(tail).map(|x| x + cb));
         let rb = self.nv as u32;
@@ -276,6 +288,10 @@ impl Data {
             self.coff.push(self.cw.len() as u32);
         }
         *self.pcoff.last_mut().expect("row offset") = self.pcell.len() as u32;
+        self.truth.extend([u32::MAX; 2]);
+        self.outcome.extend([f32::NAN; 2]);
+        self.query.push(0);
+        self.td1.push(0);
         self.nv += 1;
     }
 
@@ -340,10 +356,6 @@ pub struct Game {
     /// Belief states this game's searches asked the network about, waiting to
     /// be solved as roots of their own.
     queries: Vec<(State, [Belief; 2])>,
-    /// Per row of `data`, each seat's realised config as an index into that
-    /// seat's belief support. This is the only infostate the game's outcome is
-    /// a target for, so it is what `finish` writes to.
-    truth: [Vec<u32>; 2],
 }
 
 /// A rate like "0.9 queries per search", drawn into a whole number.
@@ -397,6 +409,7 @@ pub fn keep_query(
         [&solved.value[0], &solved.value[1]],
         &Default::default(),
     );
+    *out.query.last_mut().expect("query row") = 1;
     out.queries += 1;
     solved.queries
 }
@@ -424,7 +437,6 @@ impl Game {
             gc: *gc,
             explorer,
             queries: Vec::new(),
-            truth: Default::default(),
         }
     }
 
@@ -441,7 +453,6 @@ impl Game {
             self.s.is_terminal(),
             "a game gives up its rows only once it has ended"
         );
-        self.truth = Default::default();
         std::mem::take(&mut self.data)
     }
 
@@ -511,6 +522,10 @@ impl Game {
                             [&y0, &y1],
                             &np.to_replay(),
                         );
+                        let row = self.data.nv - 1;
+                        for p in 0..2 {
+                            self.data.truth[2 * row + p] = self.true_index(p) as u32;
+                        }
                     }
                     self.play(np);
                 }
@@ -549,10 +564,9 @@ impl Game {
             self.queries.extend(solved.queries);
             // The row is stored under the belief that is about to be updated,
             // so the seats' realised configs are read here and not at `finish`.
-            if self.gc.p_td1 > 0.0 {
-                for p in 0..2 {
-                    self.truth[p].push(self.true_index(p) as u32);
-                }
+            let row = self.data.nv - 1;
+            for p in 0..2 {
+                self.data.truth[2 * row + p] = self.true_index(p) as u32;
             }
         }
         self.play(policy::root(sv));
@@ -602,20 +616,20 @@ impl Game {
     /// The game ended: write the outcome into the rows that drew a TD(1)
     /// target, and return White's result.
     pub fn finish(&mut self) -> f32 {
-        if self.gc.p_td1 > 0.0 {
-            debug_assert_eq!(self.truth[0].len(), self.data.nv, "one truth a row");
-            // `utility` already carries the annealed horizon payoff, so a game
-            // cut at the play cap grounds its rows on the marker lead at
-            // whatever weight the anneal has reached by then.
-            let z = [self.s.utility(0), self.s.utility(1)];
-            for r in 0..self.data.nv {
-                if self.rng.unit_f64() >= self.gc.p_td1 as f64 {
-                    continue;
-                }
-                for p in 0..2 {
-                    let at = self.data.row_span(r, p).start + self.truth[p][r] as usize;
-                    self.data.cy[at] = z[p];
-                }
+        // `utility` already carries the annealed horizon payoff, so a game
+        // cut at the play cap is calibrated against its marker-lead score.
+        let z = [self.s.utility(0), self.s.utility(1)];
+        for r in 0..self.data.nv {
+            for (p, &outcome) in z.iter().enumerate() {
+                self.data.outcome[2 * r + p] = outcome;
+            }
+            if self.gc.p_td1 <= 0.0 || self.rng.unit_f64() >= self.gc.p_td1 as f64 {
+                continue;
+            }
+            self.data.td1[r] = 1;
+            for p in 0..2 {
+                let at = self.data.row_span(r, p).start + self.data.truth[2 * r + p] as usize;
+                self.data.cy[at] = z[p];
             }
         }
         self.data.games += 1;
@@ -1081,7 +1095,7 @@ mod target_tests {
             g.play_solved(&sv, solved);
         }
         let before = g.data.cy.clone();
-        let truth = g.truth.clone();
+        let truth = g.data.truth.clone();
         let z = [g.s.utility(0), g.s.utility(1)];
         assert_eq!(z[0], -z[1], "the outcome is not zero sum");
         assert_ne!(z[0], 0.0, "a level game leaves the sign untested; pick a seed");
@@ -1094,7 +1108,7 @@ mod target_tests {
         for r in 0..d.nv {
             for p in 0..2 {
                 let span = d.row_span(r, p);
-                let at = span.start + truth[p][r] as usize;
+                let at = span.start + truth[2 * r + p] as usize;
                 assert!(at < span.end, "row {r} seat {p}: truth outside the support");
                 for i in span {
                     if i == at {

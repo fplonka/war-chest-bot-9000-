@@ -1,0 +1,26 @@
+# Dynamics task state
+
+## Objective
+Instrument the Student-of-Games trainer and dashboard with missing training-dynamics metrics, run the exact default config for 30 minutes on the box, analyze code and existing/new logs, rank likely defects by expected strength gain, and report the top single-change experiment with a same-duration control and 200-game match. Commit all code on branch `dynamics`; do not merge.
+
+## Constraints
+- Never run bot, solver, or training binaries locally.
+- Box work only via `WARCHEST_BOX_DIR=/workspace/warchest-dynamics tools/box.sh`.
+- No subagents. Do not ask permission. Final response is the requested report.
+- Apply the thermo-nuclear code-quality standard to the final diff.
+
+## Progress
+- Read AGENTS.md, the task scratchpad, and the full remote review standard.
+- Copied and analyzed `sweep_control_fixed`, `sweep2_S6`, `gap_e0_30`, and `querybel_30m` logs from the main worktree.
+- Added target quantiles and belief-weighted moments; replay source, TD(1), sample-age, and staleness metrics; gradient and weight norms; policy entropy/KL; per-head losses; and direct value-head calibration against eventual outcomes.
+- Added plain dashboard panels and health values for all new metrics.
+- Kept game outcomes and true configurations as compact row telemetry; query rows remain explicitly unlabelled.
+- Verified Python syntax, dashboard rendering on the four historical logs, Rust `cargo check --features python`, the box release GPU build, and the host-only replay ring test on the box.
+- A focused CPU solver test on the box was too slow after 10 minutes and was terminated; it compiled successfully but did not complete.
+
+## Next
+1. Commit the instrumentation.
+2. Run `dynamics_default_30` with only `out=` changed, via box `go`.
+3. Pull and analyze its `log.json`, `train.log`, and ladder.
+4. Apply the thermo-nuclear review to the final diff, fix findings, verify, and commit.
+5. Rank likely defects by expected strength gain and write the requested numeric report and experiment proposal.

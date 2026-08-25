@@ -103,15 +103,25 @@ def panels(eps, elo):
 
     if has("loss_old"):
         out.append(panel("Value loss by row age", "huber", m,
-                         [series("old rows", col("loss_old"), True),
+                         [series("training sample", col("loss"), True),
+                          series("old rows", col("loss_old"), True),
                           series("fresh rows", col("loss_new"), True)]))
     else:
         out.append(panel("Value loss", "huber", m,
                          [series("value", col("loss"), True)]))
 
     if has("policy_loss"):
-        out.append(panel("Policy loss", "cross-entropy", m,
-                         [series("policy", col("policy_loss"), True)], zero=True))
+        out.append(panel("Per-head losses", "loss", m,
+                         [series("value Huber", col("loss"), True),
+                          series("weighted policy CE", col("policy_weighted_loss"), True),
+                          series("total", col("total_loss"), True)], zero=True))
+    if has("policy_target_entropy"):
+        out.append(panel("Policy entropy", "nats / information state", m,
+                         [series("network prior", col("policy_prior_entropy"), True),
+                          series("search target", col("policy_target_entropy"), True)],
+                         zero=True))
+        out.append(panel("Stored search target vs current prior", "KL divergence (nats)", m,
+                         [series("target KL", col("policy_search_kl"), True)], zero=True))
 
     # Historical runs may carry the ablated ownership head's metrics.
     if has("aux_loss"):
@@ -127,7 +137,25 @@ def panels(eps, elo):
                      [series("value", relative_loss, True)], zero=True))
     out.append(panel("Spread of predictions", "std", m,
                      [series("prediction", col("probe_std"), True),
-                      series("target", col("tgt_std"), True)], zero=True))
+                      series("target configs", col("tgt_std"), True),
+                      series("belief-weighted target", col("tgt_belief_std"), True)],
+                     zero=True))
+    if has("tgt_p05"):
+        out.append(panel("Value targets", "target", m,
+                         [series("p05", col("tgt_p05"), True),
+                          series("median", col("tgt_p50"), True),
+                          series("p95", col("tgt_p95"), True),
+                          series("belief mean", col("tgt_belief_mean"), True)],
+                         hlines=[("zero", 0)]))
+    if has("value_outcome_rmse"):
+        out.append(panel("Value head against game outcomes", "error", m,
+                         [series("RMSE", col("value_outcome_rmse"), True),
+                          series("MAE", col("value_outcome_mae"), True)], zero=True))
+        out.append(panel("Value calibration", "statistic", m,
+                         [series("correlation", col("value_outcome_corr"), True),
+                          series("slope", col("value_calibration_slope"), True),
+                          series("bias", col("value_outcome_bias"), True)],
+                         hlines=[("ideal slope", 1), ("zero", 0)]))
 
     # Two throughput lines, and the gap between them is the information.
     # `solves_per_s` is cumulative solves over elapsed -- the run average, not
@@ -143,6 +171,33 @@ def panels(eps, elo):
     if has("buf"):
         out.append(panel("Replay buffer fill", "rows", m,
                          [series("buffer", col("buf"))], zero=True))
+    if has("replay_query_frac"):
+        out.append(panel("Replay composition", "fraction of live rows", m,
+                         [series("warm", col("replay_warm_frac"), True),
+                          series("main line", col("replay_play_frac"), True),
+                          series("query", col("replay_query_frac"), True),
+                          series("TD(1) rows", col("replay_td1_row_frac"), True),
+                          series("TD(1) target cells", col("replay_td1_target_frac"), True)],
+                         zero=True))
+        out.append(panel("Sampled replay composition", "fraction of sampled rows", m,
+                         [series("warm", col("sample_warm_frac"), True),
+                          series("main line", col("sample_play_frac"), True),
+                          series("query", col("sample_query_frac"), True),
+                          series("TD(1) target cells", col("sample_td1_target_frac"), True)],
+                         zero=True))
+    if has("sample_age_mean"):
+        out.append(panel("Sampled replay age", "seconds", m,
+                         [series("mean", col("sample_age_mean"), True),
+                          series("median", col("sample_age_p50"), True),
+                          series("p90", col("sample_age_p90"), True),
+                          series("oldest live", col("buf_s"), True)], zero=True))
+    if has("grad_norm"):
+        out.append(panel("Gradient norm before clipping", "L2 norm", m,
+                         [series("mean", col("grad_norm"), True),
+                          series("max", col("grad_norm_max"), True)], zero=True,
+                         hlines=[("clip", 5)]))
+        out.append(panel("Weight norm", "L2 norm", m,
+                         [series("weights", col("weight_norm"), True)], zero=True))
 
     for title, ylabel, key, smooth in (
             ("Replay generation throughput", "rows/s", "rows_per_s", False),
@@ -211,9 +266,21 @@ def health(eps):
     if "effective_train_ratio" in last:
         out += [("effective train ratio", f"{last['effective_train_ratio']:.3f} /solve"),
                 ("passes per row", f"{last.get('train_row_ratio', 0):.3f}"),
-                ("gradient clipped", f"{last.get('grad_clip_frac', 0):.1%}"),
-                ("max |v0+v1|", f"{last.get('zero_sum_max', 0):.2e}"),
-                ("replay age", f"{last.get('buf_s', 0) / 60:.1f} min")]
+                ("gradient norm / clipped",
+                 f"{last.get('grad_norm', 0):.2f} / {last.get('grad_clip_frac', 0):.1%}"),
+                ("weight norm", f"{last.get('weight_norm', 0):.1f}"),
+                ("value outcome RMSE / corr",
+                 f"{last.get('value_outcome_rmse', 0):.3f} / "
+                 f"{last.get('value_outcome_corr', 0):.3f}"),
+                ("search KL from prior", f"{last.get('policy_search_kl', 0):.3f}"),
+                ("replay warm / play / query",
+                 f"{last.get('replay_warm_frac', 0):.0%} / "
+                 f"{last.get('replay_play_frac', 0):.0%} / "
+                 f"{last.get('replay_query_frac', 0):.0%}"),
+                ("sample age p90 / oldest",
+                 f"{last.get('sample_age_p90', 0) / 60:.1f} / "
+                 f"{last.get('buf_s', 0) / 60:.1f} min"),
+                ("max |v0+v1|", f"{last.get('zero_sum_max', 0):.2e}")]
     return out
 
 

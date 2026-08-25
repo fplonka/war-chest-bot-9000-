@@ -32,7 +32,12 @@ def dump(n, ncfg, na, ncells):
     pci = np.tile(np.arange(ncells, dtype=np.int64) % max(ncfg, 1), n).astype(np.uint16)
     pact = np.tile(np.arange(ncells, dtype=np.int64) % max(na, 1), n).astype(np.uint16)
     pprob = np.full(n * ncells, 1.0 / max(ncells, 1), np.float32)
-    return rows, cc, cw, cy, coff, soff, (pa, paoff, pcoff, pci, pact, pprob)
+    source = np.ones(n, np.uint8)
+    truth = np.zeros((n, 2), np.uint32)
+    outcome = np.full((n, 2), np.nan, np.float32)
+    td1 = np.zeros(n, np.uint8)
+    pol = (pa, paoff, pcoff, pci, pact, pprob)
+    return rows, cc, cw, cy, coff, soff, source, truth, outcome, td1, pol
 
 
 def check(buf, ids):
@@ -48,8 +53,7 @@ def main():
     rng = np.random.default_rng(0)
     n, ncfg, na, ncells = 16000, 40, 12, 24
     buf = Buffer(n * 2, n * ncfg * 2)
-    rows, cc, cw, cy, coff, soff, pol = dump(n, ncfg, na, ncells)
-    buf.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff, pol)
+    buf.add(*dump(n, ncfg, na, ncells))
     check(buf, np.arange(buf.lo, buf.rows))
     print(f"16k burst: {n} live rows, pcfg < {n * ncfg}")
     for _ in range(20):
@@ -60,10 +64,8 @@ def main():
     ring = Buffer(cap, cap * 10_000)
     thin, fat = 50, 30
     ncfg_t, ncfg_f = 6, 400
-    rows, cc, cw, cy, coff, soff, pol = dump(thin, ncfg_t, 4, ncfg_t)
-    ring.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff, pol)
-    rows, cc, cw, cy, coff, soff, pol = dump(fat, ncfg_f, 8, ncfg_f)
-    ring.add(rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff, pol)
+    ring.add(*dump(thin, ncfg_t, 4, ncfg_t))
+    ring.add(*dump(fat, ncfg_f, 8, ncfg_f))
     live = ring.cells - int(ring.pcstart[ring.lo % ring.cap])
     assert live <= ring.pcap, (live, ring.pcap, ring.lo)
     check(ring, np.arange(ring.lo, ring.rows))
