@@ -2,8 +2,7 @@
 """Live view of runs/, read from disk on every request.
 
     python3 tools/monitor.py                    # http://127.0.0.1:8420
-    RSYNC_RSH="ssh -i key -p 40588" python3 tools/monitor.py \
-        --pull root@box:/workspace/warchest-engine/runs/
+    python3 tools/monitor.py --pull
 
 There is no generated page on disk and no regeneration step: a run in progress
 is a log.json with fewer epochs in it than it will have in a minute, and it
@@ -14,6 +13,7 @@ import glob
 import json
 import math
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -373,14 +373,25 @@ def puller(src, dest, every=30):
 
 
 def main():
+    host = os.environ.get("WARCHEST_BOX_HOST", "ssh1.vast.ai")
+    port = os.environ.get("WARCHEST_BOX_PORT", "26778")
+    key = os.path.expanduser(os.environ.get(
+        "WARCHEST_BOX_KEY", "~/.ssh/id_ed25519_warchest_vast"))
+    remote = os.environ.get("WARCHEST_BOX_DIR", "/workspace/warchest-engine")
+    pull_default = f"root@{host}:{remote}/runs/"
+    rsh = shlex.join([
+        "ssh", "-i", key, "-p", port, "-o", "StrictHostKeyChecking=no",
+        "-o", "ServerAliveInterval=30"])
+
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--runs", default=os.path.join(HERE, "runs"))
     ap.add_argument("--arena", default=os.path.join(HERE, "arena"))
     ap.add_argument("--port", type=int, default=8420)
-    ap.add_argument("--pull", metavar="SRC", help="rsync source copied into --runs "
-                    "every 30s; RSYNC_RSH carries the box's ssh options")
+    ap.add_argument("--pull", nargs="?", const=pull_default, metavar="SRC",
+                    help="pull every 30s; omit SRC for the WARCHEST_BOX_* box")
     args = ap.parse_args()
     if args.pull:
+        os.environ.setdefault("RSYNC_RSH", rsh)
         threading.Thread(target=puller, args=(args.pull, args.runs),
                          daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
