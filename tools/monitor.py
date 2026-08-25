@@ -111,9 +111,12 @@ def panels(eps, elo):
                          [series("value", col("loss"), True)]))
 
     if has("policy_loss"):
-        out.append(panel("Per-head losses", "loss", m,
+        out.append(panel("Policy loss", "cross-entropy", m,
+                         [series("policy", col("policy_loss"), True)], zero=True))
+    if has("policy_weighted_loss"):
+        out.append(panel("Per-head objective", "weighted loss", m,
                          [series("value Huber", col("loss"), True),
-                          series("weighted policy CE", col("policy_weighted_loss"), True),
+                          series("policy", col("policy_weighted_loss"), True),
                           series("total", col("total_loss"), True)], zero=True))
     if has("policy_target_entropy"):
         out.append(panel("Policy entropy", "nats / information state", m,
