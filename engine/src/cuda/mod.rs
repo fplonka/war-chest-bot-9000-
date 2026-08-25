@@ -28,7 +28,7 @@ use std::sync::{Arc, LazyLock};
 
 use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
-use cudarc::driver::sys::CUfunction_attribute_enum;
+use cudarc::driver::sys::{CUdevice_attribute_enum, CUfunction_attribute_enum};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
     DriverError, LaunchArgs, LaunchConfig, PushKernelArg,
@@ -347,7 +347,6 @@ fn join_pack(l: &NetLayout, w: &[f32]) -> Vec<f32> {
 /// stride `k_trunk` holds it at. Both are `TRUNK_ROWS` and `TRUNK_LDS` there.
 const TRUNK_ROWS: usize = N_HEXES.next_multiple_of(16);
 const TRUNK_LDS: usize = C + 4;
-const _: () = assert!(C == 96 && TRUNK_ROWS == 48, "k_trunk says so with its own defines");
 
 /// What one block of `k_trunk` asks for: the residual stream, the operand the
 /// tensor cores read with its padding rows, the neighbour projections, and the
@@ -1107,12 +1106,14 @@ struct Gpu {
 static GPUS: LazyLock<parking_lot::Mutex<HashMap<usize, Arc<Gpu>>>> =
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
-fn compile_options(major: i32, minor: i32) -> CompileOptions {
+fn compile_options(major: i32, minor: i32, trunk_blocks: usize) -> CompileOptions {
     let define = |name: &str, value: usize| format!("-D{name}={value}");
     CompileOptions {
         options: vec![
             format!("--gpu-architecture=compute_{major}{minor}"),
             format!("-DJ_ROWS={JROWS}"),
+            format!("-DTRUNK_C={C}"),
+            format!("-DTRUNK_MIN_BLOCKS={trunk_blocks}"),
             format!("-DJ_W={JW}"),
             format!("-DJ_IN={JOIN_K}"),
             format!("-DJ_POOL={POOL}"),
@@ -1241,10 +1242,39 @@ impl Gpu {
         // Stream ordering is explicit, so the read/write events cudarc would
         // otherwise create on every allocation buy nothing.
         unsafe { ctx.disable_event_tracking() };
+        if C % 32 != 0 {
+            return Err(format!("trunk channel width {C} is not a multiple of 32"));
+        }
+        let threads = 4 * C;
+        let max_threads = ctx
+            .attribute(CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)
+            .map_err(err)? as usize;
+        if threads > max_threads {
+            return Err(format!(
+                "trunk channel width {C} needs {threads} threads per block; device {ordinal} allows {max_threads}"
+            ));
+        }
+        if TRUNK_ROWS % (C / 8) != 0 {
+            return Err(format!(
+                "trunk channel width {C} does not divide its {TRUNK_ROWS}-row tensor-core tile"
+            ));
+        }
+        let max_shared = ctx
+            .attribute(CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
+            .map_err(err)? as usize;
+        if TRUNK_SHARED > max_shared {
+            return Err(format!(
+                "trunk channel width {C} needs {TRUNK_SHARED} bytes of shared memory per block; device {ordinal} allows {max_shared}"
+            ));
+        }
+        let sm_shared = ctx
+            .attribute(CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR)
+            .map_err(err)? as usize;
+        let trunk_blocks = (sm_shared / TRUNK_SHARED).max(1);
         let (major, minor) = ctx.compute_capability().map_err(err)?;
         let ptx = compile_ptx_with_opts(
             KERNELS,
-            compile_options(major, minor),
+            compile_options(major, minor, trunk_blocks),
         )
         .map_err(|e| format!("nvrtc: {e:?}"))?;
         let module = ctx.load_module(ptx).map_err(err)?;
@@ -1712,7 +1742,7 @@ impl Card {
         // its LayerNorm is a shuffle rather than a barrier.
         const SLOTS: u32 = (C / 8) as u32;
         assert_eq!(C % 32, 0, "k_trunk wants a whole number of warps a row");
-        assert_eq!(TRUNK_ROWS / SLOTS as usize, 4, "k_trunk holds four hexes a thread");
+        assert_eq!(TRUNK_ROWS % SLOTS as usize, 0, "k_trunk distributes whole hex rows");
         unsafe {
             self.stream
                 .launch_builder(&self.k.trunk)

@@ -263,7 +263,6 @@ __global__ void k_stem(float* x, const float* projected, const int* occupant,
 // The channel width, and the hex count rounded up to whole sixteen-row tiles.
 // The rows the board does not have are held at zero, so they multiply to
 // nothing and cost only their share of the tensor cores.
-#define TRUNK_C 96
 #define TRUNK_ROWS 48
 // Row tiles a warp accumulates, and steps of a ninety-six deep `k` loop.
 #define TRUNK_MT (TRUNK_ROWS / 16)
@@ -355,10 +354,9 @@ __device__ __forceinline__ void row_stats(const float* v, int c, float* mean,
     *inv = rsqrtf(t / c + 1e-5f);
 }
 
-// Two blocks an SM, said out loud. Shared memory allows exactly that, and left
-// to itself the compiler would spend the register budget of one block on
-// nothing the accumulators need.
-__global__ __launch_bounds__(32 * TRUNK_SPAN, 2)
+// Say the occupancy that this width and device can fit. Left to itself the
+// compiler spends a one-block register budget on nothing the accumulators need.
+__global__ __launch_bounds__(32 * TRUNK_SPAN, TRUNK_MIN_BLOCKS)
 void k_trunk(const float* x0, const int* nb, const float* __restrict__ w,
              const float* __restrict__ wt, const float* __restrict__ bias,
              const float* __restrict__ ln,
