@@ -61,14 +61,17 @@ def main():
     ap.add_argument("--rent", action="store_true")
     ap.add_argument("--disk", type=int, default=80)
     args = ap.parse_args()
-    seen, polls = set(), 0
+    seen, polls, delay = set(), 0, 1.0
     while True:
+        # As fast as the API allows: back off on 429, creep back after success.
+        time.sleep(delay)
         try:
             found = offers(args.max_dph, args.disk)
-        except Exception as e:  # a 429 or a blip is not a reason to stop watching
-            print(time.strftime("%H:%M:%S"), f"poll failed: {e}", flush=True)
-            time.sleep(2)
+        except Exception as e:
+            delay = min(60.0, delay * 2)
+            print(time.strftime("%H:%M:%S"), f"poll failed: {e}; delay {delay:.1f}s", flush=True)
             continue
+        delay = max(0.5, delay * 0.9)
         polls += 1
         for o in found:
             if o["id"] not in seen:
@@ -80,8 +83,8 @@ def main():
                 return 0
             except Exception as e:  # taken under us: keep polling
                 print(time.strftime("%H:%M:%S"), f"rent failed: {e}", flush=True)
-        if polls % 600 == 0:
-            print(time.strftime("%H:%M:%S"), f"{polls} polls, still watching", flush=True)
+        if polls % 300 == 0:
+            print(time.strftime("%H:%M:%S"), f"{polls} polls, delay {delay:.1f}s, still watching", flush=True)
 
 
 if __name__ == "__main__":
