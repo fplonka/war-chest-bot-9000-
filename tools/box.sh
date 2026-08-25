@@ -11,8 +11,8 @@
 #   tools/box.sh <command...>
 set -euo pipefail
 
-host=${WARCHEST_BOX_HOST:-ssh3.vast.ai}
-port=${WARCHEST_BOX_PORT:-10570}
+host=${WARCHEST_BOX_HOST:-ssh8.vast.ai}
+port=${WARCHEST_BOX_PORT:-10920}
 key=${WARCHEST_BOX_KEY:-$HOME/.ssh/id_ed25519_warchest_vast}
 remote=${WARCHEST_BOX_DIR:-/workspace/warchest-engine}
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
