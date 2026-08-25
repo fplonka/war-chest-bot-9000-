@@ -30,7 +30,7 @@
 
 use crate::actions::Action;
 use crate::board::{N_HEXES, NONE};
-use crate::farm::{Call, Dst, QueryPick, Reply, Writes};
+use crate::farm::{Call, Dst, Reply, Writes};
 use crate::net::Net;
 use crate::rng::Rng;
 use crate::pbs::*;
@@ -961,17 +961,6 @@ fn pick(w: &[f32], rng: &mut Rng) -> usize {
     w.len() - 1
 }
 
-/// A uniform `k`-subset of `0..n`, in O(k) space and random draws.
-fn sample_indices(rng: &mut Rng, n: usize, k: usize) -> Vec<usize> {
-    debug_assert!(k <= n);
-    let mut out = Vec::with_capacity(k);
-    for j in n - k..n {
-        let pick = rng.below(j + 1);
-        out.push(if out.contains(&pick) { j } else { pick });
-    }
-    out
-}
-
 impl TNode {
     /// Host bytes this node's own lists hold, beside the struct itself.
     ///
@@ -1232,12 +1221,9 @@ pub struct Solver {
     expansions: u32,
     /// Which round, if any, is in flight.
     phase: Phase,
-    /// Uniform reservoir of the value-network queries made during CFR.
-    queries: Vec<(State, [Belief; 2])>,
-    /// Query events considered by the reservoir.
-    query_seen: usize,
-    /// Nodes selected from the current device round, in reply order.
-    query_nodes: Vec<usize>,
+    /// The leaves the last round was asked for the reach at, in the order the
+    /// reply concatenates them.
+    picks: Vec<usize>,
     pub(crate) cfg: Cfg,
     pub nodes: Vec<TNode>,
     /// Node states, parallel to `nodes`. A leaf can only be expanded later if
@@ -1502,9 +1488,7 @@ impl Solver {
             at: 0,
             expansions: 0,
             phase: Phase::Fresh,
-            queries: Vec::new(),
-            query_seen: 0,
-            query_nodes: Vec::new(),
+            picks: Vec::new(),
             cfg,
             nodes: take_nodes(),
             states: Vec::new(),
@@ -1633,9 +1617,9 @@ impl Solver {
         self.slot = slot;
     }
 
-    /// Ask this solve for a training row: the root's values, its policy, and a
-    /// reservoir of `queries` value-network calls as roots for later solves.
-    /// Without it the solve is acted on and thrown away.
+    /// Ask this solve for a training row: the root's values, its policy, and
+    /// `queries` of the leaves it asked the network about, as roots for later
+    /// solves. Without it the solve is acted on and thrown away.
     pub fn collect(&mut self, queries: usize) {
         self.collect = Some(queries);
     }
@@ -1649,76 +1633,6 @@ impl Solver {
         let out = f(self, &mut rng);
         self.rng = rng;
         out
-    }
-
-    /// Update a uniform reservoir with `events` new network queries and return
-    /// the selected event indices. Existing rows stay owned by the reservoir;
-    /// callers append the returned rows with their query-time beliefs.
-    fn plan_query_events(&mut self, events: usize) -> Vec<usize> {
-        let keep = self.collect.unwrap_or(0);
-        if keep == 0 || events == 0 {
-            self.query_seen += events;
-            return Vec::new();
-        }
-        self.with_rng(|sv, rng| {
-            let old_events = sv.query_seen;
-            let total = old_events + events;
-            sv.query_seen = total;
-            if total <= keep {
-                return (0..events).collect();
-            }
-
-            // The number of new rows in a uniform `keep`-subset of the union
-            // is hypergeometric. Draw the categories, then draw each subset.
-            let mut new_left = events;
-            let mut all_left = total;
-            let mut new_count = 0;
-            for _ in 0..keep {
-                if rng.below(all_left) < new_left {
-                    new_count += 1;
-                    new_left -= 1;
-                }
-                all_left -= 1;
-            }
-            let old_count = keep - new_count;
-            let old_idx = sample_indices(rng, sv.queries.len(), old_count);
-            sv.queries = std::mem::take(&mut sv.queries)
-                .into_iter()
-                .enumerate()
-                .filter_map(|(i, row)| old_idx.contains(&i).then_some(row))
-                .collect();
-            sample_indices(rng, events, new_count)
-        })
-    }
-
-    /// Record the host network's query rows before either traverser's update.
-    /// Both traversers query the same two beliefs in a simultaneous iteration.
-    fn record_host_queries(&mut self, from: usize) {
-        if self.nets.value.is_empty() {
-            return;
-        }
-        let selected = self.plan_query_events(self.leaf_rows.len() - from);
-        for e in selected {
-            let node = self.leaf_rows[from + e];
-            self.queries.push((self.states[node].clone(), self.belief_at(node)));
-        }
-    }
-
-    /// Finish the device round's selected queries from the reach snapshots it
-    /// returned. Their nodes were retained when the round was planned.
-    fn absorb_queries(&mut self, reach: &[f32]) {
-        let mut cut = 0;
-        for node in std::mem::take(&mut self.query_nodes) {
-            let beliefs = std::array::from_fn(|p| {
-                let n = self.nc[node][p] as usize;
-                let mut w = vec![0.0; n];
-                normalize_weights(&reach[cut..cut + n], &mut w);
-                cut += n;
-                Belief { cfg: self.nodes[node].cfgs[p].to_vec(), p: w }
-            });
-            self.queries.push((self.states[node].clone(), beliefs));
-        }
-        assert_eq!(cut, reach.len(), "query reach reply has a trailing tail");
     }
 
     /// Run `f` with the expansion's own stream, which is the stream the card
@@ -3246,15 +3160,6 @@ impl Solver {
         self.trace.row_iters += self.leaf_rows.len() as u64;
         self.trace.cidx_iters += self.leaf_cidx.len() as u64;
         self.trace.cell_iters += self.ncells as u64;
-        let query_from = |p| {
-            if self.cfg.refresh_due(self.steps[p]) {
-                0
-            } else {
-                self.cached[p]
-            }
-        };
-        let from = query_from(0).min(query_from(1));
-        self.record_host_queries(from);
         self.update_regrets(0);
         self.update_regrets(1);
         self.precompute_reaches();
@@ -3422,7 +3327,6 @@ impl Solver {
             Phase::Iterating => {
                 self.absorb(replies);
                 let last = replies.last().expect("a round answers every call it was given");
-                self.absorb_queries(&last.c);
                 // Distinct by construction: a phase draws until it has leaves
                 // no phase of this round has taken. A short row reads as
                 // nothing, which is a phase that spent its draws.
@@ -3486,26 +3390,11 @@ impl Solver {
         // nodes whose prior the card is to fill, which it does between the
         // scatter and the iteration that reads it.
         calls.push(self.tree_call());
-        let rows = self.leaf_rows.len();
-        let selected = self.plan_query_events(done * rows);
-        self.query_nodes = selected.iter().map(|&e| self.leaf_rows[e % rows]).collect();
-        let query = selected
-            .into_iter()
-            .map(|e| {
-                let node = self.leaf_rows[e % rows];
-                QueryPick {
-                    iter: (e / rows) as u32,
-                    reach: self.roff[node],
-                    len: self.nc[node][0] + self.nc[node][1],
-                }
-            })
-            .collect();
         calls.push(Call::Iterate {
             solve: self.slot,
             step: self.steps[0],
             iters: done,
             expand,
-            query,
             cfr: self.cfg.cfr,
             puct: self.cfg.puct,
         });
@@ -3519,13 +3408,23 @@ impl Solver {
     /// keeps.
     ///
     /// One round, not two. The read materialises the average, runs the value
-    /// pass under it and slices out the root's policy and values, so a harvest
-    /// is the round that ends the solve rather than one after it. An uncollected
-    /// solve asks for the policy alone, and the value pass, which is most of a CFR
+    /// pass under it and slices out the root's policy, the root's values and
+    /// the reach at the leaves this solve nominates — so a harvest is the round
+    /// that ends the solve rather than one after it. An uncollected solve asks
+    /// for the policy alone, and the value pass, which is most of a CFR
     /// iteration, does not run for it.
     fn read_round(&mut self) -> Vec<Call> {
         let mut calls = self.growth_calls();
         calls.push(self.tree_call());
+        self.picks = match self.collect {
+            None => Vec::new(),
+            Some(q) => self.with_rng(|sv, rng| {
+                (0..q)
+                    .filter(|_| !sv.leaf_rows.is_empty())
+                    .map(|_| sv.leaf_rows[rng.below(sv.leaf_rows.len())])
+                    .collect()
+            }),
+        };
         // The card holds one value arena per traverser, so the second player's
         // root row sits a whole arena past the first's.
         let nvals = self.nvals as u32;
@@ -3536,19 +3435,25 @@ impl Solver {
                 (nvals + self.voff[0], self.nc[0][1]),
             ],
         };
+        let reach_at = self
+            .picks
+            .iter()
+            .map(|&i| (self.roff[i], self.nc[i][0] + self.nc[i][1]))
+            .collect();
         let (at, cells) = self.root_cells();
         calls.push(Call::Read {
             solve: self.slot,
             touched: self.avg_touched,
             vals_at,
             policy_at: (at as u32, cells as u32),
+            reach_at,
         });
         calls
     }
 
-    /// What the last round brought back: the root's reference strategy and,
-    /// for a collected solve, its values. Query beliefs arrived with the CFR
-    /// rounds that made them.
+    /// What the last round brought back: the root's slice of the reference
+    /// strategy, and — for a collected solve — its values and the beliefs at
+    /// the leaves it nominated.
     ///
     /// The arenas stay where they are. Everything else the value pass touches
     /// is tens of megabytes and has no reader here.
@@ -3563,7 +3468,18 @@ impl Solver {
         let n0 = self.nc[0][0] as usize;
         let value = [r.a[..n0].to_vec(), r.a[n0..].to_vec()];
         let policy = self.root_policy();
-        let queries = std::mem::take(&mut self.queries);
+        let mut queries = Vec::with_capacity(self.picks.len());
+        let mut cut = 0;
+        for &i in &self.picks {
+            let beliefs = std::array::from_fn(|p| {
+                let k = self.nc[i][p] as usize;
+                let mut w = vec![0.0; k];
+                normalize_weights(&r.c[cut..cut + k], &mut w);
+                cut += k;
+                Belief { cfg: self.nodes[i].cfgs[p].to_vec(), p: w }
+            });
+            queries.push((self.states[i].clone(), beliefs));
+        }
         Some(Solved { value, queries, policy })
     }
 
@@ -4103,9 +4019,8 @@ impl Solver {
     /// already said; an interior node's value comes from the subtree beneath
     /// it, which is the bootstrap the whole method rests on.
     fn harvest(&mut self, queries: usize) -> Solved {
-        debug_assert_eq!(self.collect, Some(queries));
         let value = self.value_pass();
-        let queries = std::mem::take(&mut self.queries);
+        let queries = self.with_rng(|sv, rng| sv.sample_queries(rng, queries));
         let policy = self.root_policy();
         self.restore();
         Solved { value, queries, policy }
@@ -4148,6 +4063,24 @@ impl Solver {
             out.off.push(out.act.len() as u32);
         }
         out
+    }
+
+    /// Uniform draws from the leaves this solve queried the network at.
+    ///
+    /// Those leaves are where the value function's error enters the solve, so
+    /// they are the belief states worth solving in their own right. Every one
+    /// of them is a valued decision, which is both what the network is defined
+    /// on and what a training row can carry, so no filtering is needed here.
+    fn sample_queries(&self, rng: &mut Rng, want: usize) -> Vec<(State, [Belief; 2])> {
+        if self.leaf_rows.is_empty() {
+            return Vec::new();
+        }
+        (0..want)
+            .map(|_| {
+                let i = self.leaf_rows[rng.below(self.leaf_rows.len())];
+                (self.states[i].clone(), self.belief_at(i))
+            })
+            .collect()
     }
 
     /// Node `i`'s belief for each player, under whichever reaches are
@@ -4258,7 +4191,7 @@ impl Solver {
                     + self.primed.capacity()
                     + z(&self.leaf_rows)
                     + z(&self.term_leaves)
-                    + z(&self.query_nodes),
+                    + z(&self.picks),
             ),
             ("cur", f(&self.cur)),
             ("avg", f(&self.avg)),
