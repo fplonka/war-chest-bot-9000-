@@ -260,10 +260,10 @@ __global__ void k_stem(float* x, const float* projected, const int* occupant,
 //   0 mix.w  1 mix.b  2 pool.w  3 pool.b  4 out.w  5 out.b
 //   6 ln0.g  7 ln0.b  8 ln1.g  9 ln1.b     then trunk.ln.g, trunk.ln.b
 #define TRUNK_OFF 12
-// The channel width, and the hex count rounded up to whole sixteen-row tiles.
-// The rows the board does not have are held at zero, so they multiply to
-// nothing and cost only their share of the tensor cores.
-#define TRUNK_ROWS 48
+// `TRUNK_C` is the channel width and `TRUNK_ROWS` the hex count rounded up to
+// whole sixteen-row tiles, both defines from Rust. The rows the board does not
+// have are held at zero, so they multiply to nothing and cost only their share
+// of the tensor cores.
 // Row tiles a warp accumulates, and steps of a ninety-six deep `k` loop.
 #define TRUNK_MT (TRUNK_ROWS / 16)
 #define TRUNK_KS (TRUNK_C / 8)

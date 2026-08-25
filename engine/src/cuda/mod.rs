@@ -1117,6 +1117,7 @@ fn compile_options(major: i32, minor: i32, trunk_blocks: usize) -> CompileOption
             format!("--gpu-architecture=compute_{major}{minor}"),
             format!("-DJ_ROWS={JROWS}"),
             format!("-DTRUNK_C={C}"),
+            define("TRUNK_ROWS", TRUNK_ROWS),
             format!("-DTRUNK_MIN_BLOCKS={trunk_blocks}"),
             format!("-DJ_W={JW}"),
             format!("-DJ_IN={JOIN_K}"),
