@@ -18,7 +18,7 @@ Instrument the Student-of-Games trainer and dashboard with missing training-dyna
 - Verified Python syntax, dashboard rendering on the four historical logs, Rust `cargo check --features python`, the box release GPU build, and the host-only replay ring test on the box.
 - A focused CPU solver test on the box was too slow after 10 minutes and was terminated; it compiled successfully but did not complete.
 - Committed instrumentation as `48fb49d`.
-- First `dynamics_default_30` submission was killed by the driver before training because its build overlapped another measured run. Do not touch the box until the driver sends the exact words `box free`.
+- First `dynamics_default_30` submission was killed by the driver before training because its build overlapped another measured run. The branch now includes `4d76646`, which puts builds under the GPU lock. Also fixed `follow` locally so a queued job does not fail before its run directory exists. Do not touch the box until the driver sends the exact words `box free`.
 
 ## Local findings so far
 - The 3-minute warm phase generated 1,277,454 rows in each default-batch run, versus only 359,982 SoG rows in `sweep_control_fixed` and 368,502 in `querybel_30m`.
