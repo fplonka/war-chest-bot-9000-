@@ -46,7 +46,7 @@ pull)
     mkdir -p "$here/runs/$name"
     # `*.tmp` is a live run writing log.json atomically; rsync would list it,
     # find it replaced, and exit 24 mid-run.
-    rsync -az -e "ssh ${ssh_opts[*]}" --exclude '*.pt' --exclude '*.tmp' \
+    rsync -az -e "ssh ${ssh_opts[*]}" --exclude '*.tmp' \
         "root@$host:$remote/runs/$name/" "$here/runs/$name/"
     echo "pulled $name"
     ;;

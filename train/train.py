@@ -541,10 +541,23 @@ def write_log(args, epochs, snaps):
     """
     path = f"{args.out}/log.json"
     tmp = path + ".tmp"
+    cfg = dataclasses.asdict(args)
+    cfg["resume"] = ""
     with open(tmp, "w") as f:
-        json.dump({"cfg": dataclasses.asdict(args), "epochs": epochs,
+        json.dump({"cfg": cfg, "epochs": epochs,
                    "snapshots": snaps}, f, indent=1)
     os.replace(tmp, path)
+
+
+def cpu_state(net):
+    return {name: value.detach().cpu().clone()
+            for name, value in net.state_dict().items()}
+
+
+def publish_state(state):
+    net = Net()
+    net.load_state_dict(state)
+    net.push()
 
 
 def main():
@@ -552,17 +565,35 @@ def main():
         description="Train one run, then rate its snapshots against Greedy.")
     ap.add_argument("over", nargs="*", help="knob=value (production defaults)")
     over = config.parse(ap.parse_args().over)
+    resume = over.pop("resume", "")
     name = over.pop("out", None)
-    if not name:
-        raise SystemExit("pass out=<name>")
-    args = dataclasses.replace(config.BASELINE, **over)
-    args.git = config.git_sha()
-    args.out = name if name.startswith("runs/") else f"runs/{name}"
+    checkpoint = None
+    if resume:
+        if over:
+            raise SystemExit("resume accepts no changed training knobs")
+        checkpoint = torch.load(resume, map_location="cpu", weights_only=False)
+        args = config.Cfg(**checkpoint["cfg"])
+        expected = pathlib.Path(args.out)
+        requested = pathlib.Path(name if name and name.startswith("runs/")
+                                 else f"runs/{name}") if name else expected
+        if requested != expected:
+            raise SystemExit(f"resume belongs to {expected}, not {requested}")
+        args.resume = resume
+    else:
+        if not name:
+            raise SystemExit("pass out=<name>")
+        args = dataclasses.replace(config.BASELINE, **over)
+        args.git = config.git_sha()
+        args.out = name if name.startswith("runs/") else f"runs/{name}"
     refuse_if_machine_busy()
-    if os.path.exists(args.out):
-        raise SystemExit(f"{args.out} exists")
-    os.makedirs(args.out)
-    logf = open(f"{args.out}/train.log", "w")
+    if resume:
+        if not os.path.isdir(args.out):
+            raise SystemExit(f"resume output {args.out} does not exist")
+    else:
+        if os.path.exists(args.out):
+            raise SystemExit(f"{args.out} exists")
+        os.makedirs(args.out)
+    logf = open(f"{args.out}/train.log", "a" if resume else "w")
 
     class Tee:
         def write(self, s):
@@ -573,8 +604,11 @@ def main():
             sys.__stdout__.flush()
             logf.flush()
     sys.stdout = sys.stderr = Tee()
-    print(f"[train] {args.out} at {args.git} seed={args.seed} {over or 'baseline'}",
-          flush=True)
+    if resume:
+        print(f"[resume] {resume}", flush=True)
+    else:
+        print(f"[train] {args.out} at {args.git} seed={args.seed} "
+              f"{over or 'baseline'}", flush=True)
     if args.note:
         print(f"[train] {args.note}", flush=True)
     if args.gen_workers == 0:
@@ -617,8 +651,8 @@ def main():
         value.load_state_dict(load_checkpoint(args.init_weights).state_dict())
     opt = torch.optim.Adam(value.parameters(), lr=args.lr)
     lr_decays = sorted(float(x) for x in args.lr_decay_frac.split(",") if x.strip())
-    next_decay = 0
     value.push()
+    target_state = cpu_state(value)
     buf = Buffer(args.cap, args.cap * args.cfgs_per_row)
     buf.x.fill(0)
     import gpu_batch
@@ -645,6 +679,14 @@ def main():
     opt.step()
     forward_values(value, parts)
     torch.cuda.synchronize(dev)
+    if checkpoint:
+        value.load_state_dict(checkpoint["value"])
+        opt.load_state_dict(checkpoint["optimizer"])
+        target_state = checkpoint["target"]
+        publish_state(target_state)
+        rng.bit_generator.state = checkpoint["numpy_rng"]
+        torch.set_rng_state(checkpoint["torch_rng"])
+        torch.cuda.set_rng_state_all(checkpoint["cuda_rng"])
     peak = torch.cuda.max_memory_reserved(dev)
     print(f"[train] torch peak {peak / (1 << 20):.0f} MiB reserved on {dev} "
           f"(rows={n} configs={k}); farm carves mem_get_info free",
@@ -656,18 +698,34 @@ def main():
     if args.snapshot_every <= 0:
         raise SystemExit("snapshot_every must be positive minutes")
     snap_gap = args.snapshot_every * 60.0
-    next_snap = snap_gap
-    t0 = time.time()
-    epoch, log = 0, []
+    elapsed = float(checkpoint["elapsed"]) if checkpoint else 0.0
+    next_snap = float(checkpoint["next_snapshot"]) if checkpoint else snap_gap
+    t0 = time.time() - elapsed
+    epoch = int(checkpoint["epoch"]) if checkpoint else 0
+    log = checkpoint["epochs"] if checkpoint else []
     # Fresh subgames per second over the whole ReBeL phase: the rate
     # docs/GPU_PERF_GOAL.md is about. Generation overlaps training, so
     # per-epoch `gen_s` is not it -- only cumulative solves over cumulative
     # ReBeL wall time counts every cost, including the trainer's own.
-    sog_t0, sog_solves = None, 0
+    progress = checkpoint["progress"] if checkpoint else {
+        "sog_start": None,
+        "sog_solves": 0,
+        "optimizer_rows": 0,
+        "optimizer_steps": 0,
+        "generated_rows": 0,
+        "next_target": None,
+        "next_decay": 0,
+        "farm_runs": 0,
+        "totals": {},
+    }
+    sog_t0 = (t0 + progress["sog_start"]
+              if progress["sog_start"] is not None else None)
+    sog_solves = int(progress["sog_solves"])
+    next_decay = int(progress["next_decay"])
     # The marker-differential payoff at the horizon distorts the game being
     # solved, so it tracks the recent fraction of finished games that hit the
     # horizon. Evaluation always runs on the real game (value 0).
-    cap_v = args.cap_value
+    cap_v = float(checkpoint["cap_value"]) if checkpoint else args.cap_value
     warchest.set_cap_value(cap_v)
     probe = None
 
@@ -678,7 +736,20 @@ def main():
     # between neighbouring snapshots), and answering it from a noisy match is
     # how you ship a checkpoint chosen by a coin flip. The ladder rates all of
     # them at the end, off the clock.
-    snaps = []
+    snaps = checkpoint["snapshots"] if checkpoint else []
+    saved_replay_rows = int(checkpoint["replay_rows"]) if checkpoint else 0
+    grace_rows = (min(saved_replay_rows, 2 * args.batch)
+                  if checkpoint else 0)
+    if checkpoint:
+        gib = args.cap * (ROW_BYTES + 40 + args.cfgs_per_row * 20
+                          + 24 * ACT_BYTES + 96 * 6) / (1 << 30)
+        print(f"[resume] replay is intentionally not persisted: its default-cap "
+              f"snapshot can reach {gib:.2f} GiB "
+              f"({gib * 1440 / args.snapshot_every:.0f} GiB/day at "
+              f"{args.snapshot_every:g}-minute cadence)", flush=True)
+        print(f"[resume] model, optimizer, target network, LR position, RNG, "
+              f"and {elapsed:.1f}s wall budget restored; training waits for "
+              f"{grace_rows} fresh replay rows", flush=True)
 
     def snapshot(label, el):
         # "init" and "final" are the two the reader always wants named; the rest
@@ -696,11 +767,35 @@ def main():
             snaps[-1]["label"] = label
             return
         path = f"{args.out}/snap_{len(snaps):02d}.pt"
-        torch.save({"value": value.state_dict(), "t": round(el, 1),
-                    "label": label, "git": args.git,
-                    "search": {"s": args.s, "c": args.c, "cfr": args.cfr}}, path)
-        snaps.append({"label": label, "t": round(el, 1),
-                      "file": os.path.basename(path)})
+        entry = {"label": label, "t": round(el, 1),
+                 "file": os.path.basename(path)}
+        snaps.append(entry)
+        cfg = dataclasses.asdict(args)
+        cfg["resume"] = ""
+        state = {
+            "value": value.state_dict(),
+            "optimizer": opt.state_dict(),
+            "target": target_state,
+            "numpy_rng": rng.bit_generator.state,
+            "torch_rng": torch.get_rng_state(),
+            "cuda_rng": torch.cuda.get_rng_state_all(),
+            "elapsed": float(el),
+            "next_snapshot": float(el + snap_gap),
+            "epoch": epoch,
+            "epochs": log,
+            "snapshots": snaps,
+            "progress": progress,
+            "cap_value": cap_v,
+            "replay_rows": len(buf),
+            "cfg": cfg,
+            "t": round(el, 1),
+            "label": label,
+            "git": args.git,
+            "search": {"s": args.s, "c": args.c, "cfr": args.cfr},
+        }
+        tmp = path + ".tmp"
+        torch.save(state, tmp)
+        os.replace(tmp, path)
         print(f"[t={el:6.1f}s] --- snapshot {snaps[-1]['file']} ({label}) ---", flush=True)
 
     def tick(rec=None, line=None):
@@ -714,11 +809,11 @@ def main():
             log.append(rec)
             write_log(args, log, snaps)
             print(line, flush=True)
+        epoch += 1
         now = time.time()
         if now - t0 >= next_snap:
             snapshot(f"s{len(snaps)}", now - t0)
             next_snap = now - t0 + snap_gap
-        epoch += 1
 
     def fit(nsteps):
         """Adam updates on the shared replay. Returns (loss, wall_s, stats)."""
@@ -734,7 +829,7 @@ def main():
 
     def run_search_pipeline():
         """Overlap small GT-CFR batches with each other and with training."""
-        nonlocal probe, cap_v, next_decay, sog_solves
+        nonlocal probe, cap_v, next_decay, sog_solves, target_state
 
         deadline = t0 + total
         if time.time() >= deadline:
@@ -743,7 +838,7 @@ def main():
         # core could not batch inference at all: the solves have to share an
         # address space for their leaf rows to end up in one batch.
         farm = warchest.SolveFarm(
-            args.seed,
+            args.seed + 1_000_003 * progress["farm_runs"],
             args.gen_workers,
             s=args.s,
             c=args.c,
@@ -757,11 +852,12 @@ def main():
             recursive_rate=args.recursive_rate,
             devices=[int(d) for d in args.gen_devices.split(",")])
 
-        optimizer_rows = 0
-        optimizer_steps = 0
-        generated_rows = 0
+        progress["farm_runs"] += 1
+        optimizer_rows = int(progress["optimizer_rows"])
+        optimizer_steps = int(progress["optimizer_steps"])
+        generated_rows = int(progress["generated_rows"])
         window = collections.Counter()
-        totals = collections.Counter()
+        totals = collections.Counter(progress["totals"])
         window_shapes = []
         # The farm's round counters are cumulative, so an epoch's figures are
         # the difference against the last report and not an average since the
@@ -770,7 +866,19 @@ def main():
         stage_names = warchest.stage_names()
         ent_at = [0] * 8
         next_report = time.time() + 10.0
-        next_target = sog_t0 + args.target_every * 60.0
+        next_target = t0 + float(progress["next_target"])
+        grace_report = time.time()
+
+        def save_progress():
+            progress.update({
+                "sog_solves": sog_solves,
+                "optimizer_rows": optimizer_rows,
+                "optimizer_steps": optimizer_steps,
+                "generated_rows": generated_rows,
+                "next_target": next_target - t0,
+                "next_decay": next_decay,
+                "totals": dict(totals),
+            })
 
         while True:
             now = time.time()
@@ -814,7 +922,9 @@ def main():
                 warchest.set_cap_value(cap_v)
 
             debt = max(0.0, args.replay_ratio * generated_rows - optimizer_rows)
-            nsteps = int(debt // args.batch) if len(buf) >= args.batch else 0
+            regenerating = len(buf) < grace_rows
+            nsteps = (int(debt // args.batch)
+                      if len(buf) >= args.batch and not regenerating else 0)
             lv, train_s, train_stat = fit(nsteps)
             if nsteps:
                 optimizer_steps += nsteps
@@ -835,6 +945,7 @@ def main():
                 # `push` bumps the version the farm watches; its threads
                 # pick the new weights up at their next chunk.
                 value.push()
+                target_state = cpu_state(value)
                 print(
                     f"[t={now - t0:6.1f}s] --- target network refresh ---",
                     flush=True)
@@ -850,6 +961,15 @@ def main():
                     f"{opt.param_groups[0]['lr']:.2e} ---",
                     flush=True)
                 next_decay += 1
+            save_progress()
+            if regenerating:
+                if now >= grace_report:
+                    print(f"[t={now - t0:6.1f}s] --- resume replay "
+                          f"{len(buf)}/{grace_rows}; training paused ---",
+                          flush=True)
+                    grace_report = now + 10.0
+                tick()
+                continue
             if now < next_report:
                 tick()
                 continue
@@ -1053,6 +1173,7 @@ def main():
         # Dropping the farm stops its threads once they finish the solve they
         # are in, which is also what flushes their last rows.
         del farm
+        save_progress()
 
         elapsed = max(deadline - sog_t0, 1e-9)
         print(
@@ -1074,48 +1195,48 @@ def main():
           f"canonical_views=2 cap={args.cap} "
           f"matmul={torch.get_float32_matmul_precision()}", flush=True)
 
-    snapshot("init", 0.0)
+    if not checkpoint:
+        snapshot("init", 0.0)
     warm = args.warm_minutes * 60.0
     if not 0.0 <= warm <= total:
         raise SystemExit("warm_minutes must be between zero and the run length")
-    while True:
-        el = time.time() - t0
-        if el >= warm:
-            break
-        tg = time.time()
-        d = warchest.gen_data(
-            args.warm_games, args.seed * 1_000_003 + epoch,
-            explore=args.explore, random_draft=args.random_draft,
-            agent="greedy", temp=args.temp)
-        gen_s = time.time() - tg
-        n = ingest(buf, d)
-        steps = max(1, n // args.batch) if len(buf) >= args.batch else 0
-        lv, train_s, _ = fit(steps)
-        cy = np.clip(np.asarray(d["cy"], np.float32), -1.0, 1.0)
-        rec = {
-            "t": round(time.time() - t0, 1), "epoch": epoch, "phase": "warm",
-            "games": int(d.get("games", 0)), "rows": n,
-            "loss": round(float(lv), 5) if steps else None,
-            "tgt_mean": round(float(cy.mean()) if cy.size else 0.0, 4),
-            "tgt_std": round(float(cy.std()) if cy.size else 0.0, 4),
-            "horizon_frac": round(int(d.get("horizon_hits", 0)) /
-                                  max(int(d.get("games", 0)), 1), 3),
-            "gen_s": round(gen_s, 2), "train_s": round(train_s, 2),
-        }
-        tick(rec,
-            f"[t={rec['t']:6.1f}s] warm ep{epoch:3d} games={rec['games']:4d} "
-            f"rows={n:6d} L={lv if steps else float('nan'):.5f} "
-            f"tgt={rec['tgt_mean']:+.3f}/{rec['tgt_std']:.3f} "
-            f"gen={gen_s:.1f}s train={train_s:.1f}s")
-    value.push()
-    # The warm rows stay in the replay and age out through the FIFO: they are
-    # the anchor that holds the value function while self-play rows accumulate.
-    # Clearing them here was tried (9c3e171) and collapsed the run: tgt_std
-    # 0.05 vs 0.66 at five minutes, and the final lost 12-188 to a pre-clear
-    # final (runs/gate30).
-
-    sog_t0 = time.time()
-    sog_solves = 0
+    if sog_t0 is None:
+        while True:
+            el = time.time() - t0
+            if el >= warm:
+                break
+            tg = time.time()
+            d = warchest.gen_data(
+                args.warm_games, args.seed * 1_000_003 + epoch,
+                explore=args.explore, random_draft=args.random_draft,
+                agent="greedy", temp=args.temp)
+            gen_s = time.time() - tg
+            n = ingest(buf, d)
+            steps = max(1, n // args.batch) if len(buf) >= args.batch else 0
+            lv, train_s, _ = fit(steps)
+            cy = np.clip(np.asarray(d["cy"], np.float32), -1.0, 1.0)
+            rec = {
+                "t": round(time.time() - t0, 1), "epoch": epoch, "phase": "warm",
+                "games": int(d.get("games", 0)), "rows": n,
+                "loss": round(float(lv), 5) if steps else None,
+                "tgt_mean": round(float(cy.mean()) if cy.size else 0.0, 4),
+                "tgt_std": round(float(cy.std()) if cy.size else 0.0, 4),
+                "horizon_frac": round(int(d.get("horizon_hits", 0)) /
+                                      max(int(d.get("games", 0)), 1), 3),
+                "gen_s": round(gen_s, 2), "train_s": round(train_s, 2),
+            }
+            tick(rec,
+                f"[t={rec['t']:6.1f}s] warm ep{epoch:3d} games={rec['games']:4d} "
+                f"rows={n:6d} L={lv if steps else float('nan'):.5f} "
+                f"tgt={rec['tgt_mean']:+.3f}/{rec['tgt_std']:.3f} "
+                f"gen={gen_s:.1f}s train={train_s:.1f}s")
+        value.push()
+        target_state = cpu_state(value)
+        sog_t0 = time.time()
+        progress["sog_start"] = sog_t0 - t0
+        progress["next_target"] = (sog_t0 - t0) + args.target_every * 60.0
+    # The warm rows stay in replay and age out through the FIFO. Clearing them
+    # here collapsed an earlier run, so a fresh run carries them into self-play.
     run_search_pipeline()
 
     snapshot("final", time.time() - t0)
