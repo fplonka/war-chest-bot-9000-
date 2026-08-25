@@ -5,13 +5,14 @@
 #   tools/box.sh start m1 python tools/arena.py ...  any GPU job, same queue
 #   tools/box.sh follow m1
 #   tools/box.sh pull seat
+#   tools/box.sh setup                             a fresh vast.ai pytorch image
 #   tools/box.sh sync
 #   tools/box.sh build
 #   tools/box.sh <command...>
 set -euo pipefail
 
-host=${WARCHEST_BOX_HOST:-ssh1.vast.ai}
-port=${WARCHEST_BOX_PORT:-26778}
+host=${WARCHEST_BOX_HOST:-ssh3.vast.ai}
+port=${WARCHEST_BOX_PORT:-10570}
 key=${WARCHEST_BOX_KEY:-$HOME/.ssh/id_ed25519_warchest_vast}
 remote=${WARCHEST_BOX_DIR:-/workspace/warchest-engine}
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -41,6 +42,14 @@ cargo build --release --features gpu --bin bot >/tmp/bot.log 2>&1 || { tail -40 
 tail -1 /tmp/bot.log"
 
 case "${1:-}" in
+setup)
+    # A fresh `pytorch/pytorch:*-devel` image: the allocator, the Rust
+    # toolchain, and the two Python packages the trainer needs beyond torch.
+    run_remote "apt-get update -qq && apt-get install -y -qq libjemalloc2 rsync >/dev/null
+[ -x /root/.cargo/bin/cargo ] || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null
+pip install -q maturin numpy
+cargo --version && nvcc --version | tail -1 && python -c 'import torch; print(torch.__version__, torch.cuda.device_count(), \"gpus\")'"
+    ;;
 sync)
     rsync -az --delete -e "ssh ${ssh_opts[*]}" \
         --exclude runs --exclude bots --exclude arena --exclude suites \
