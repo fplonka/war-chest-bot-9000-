@@ -18,7 +18,7 @@ Instrument the Student-of-Games trainer and dashboard with missing training-dyna
 - Verified Python syntax, dashboard rendering on the four historical logs, Rust `cargo check --features python`, the box release GPU build, and the host-only replay ring test on the box.
 - A focused CPU solver test on the box was too slow after 10 minutes and was terminated; it compiled successfully but did not complete.
 - Instrumentation commits are `48fb49d`, `9326ffd`, `f246a9c`, and `def3379`; dashboard/tool follow-ups are `afc1d03` and `275f17a`.
-- First `dynamics_default_30` submission was killed by the driver before training because its build overlapped another measured run. The branch now includes `4d76646`, which puts builds under the GPU lock. Also fixed `follow` locally so a queued job does not fail before its run directory exists. Do not touch the box until the driver sends the exact words `box free`.
+- `dynamics_default_30` completed from commit `ba9ef5e` with the exact defaults. Its run and 40-game snapshot ladder are in `runs/dynamics_default_30`.
 
 ## Local findings so far
 - The 3-minute warm phase generated 1,277,454 rows in each default-batch run, versus only 359,982 SoG rows in `sweep_control_fixed` and 368,502 in `querybel_30m`.
@@ -29,10 +29,13 @@ Instrument the Student-of-Games trainer and dashboard with missing training-dyna
 - Search refinement is not the top lever: `sweep2_S6` made 148,713 versus 359,982 rows and scored 0.255 against the control over 200 games. More refined search lost 185 Elo.
 - Zero-sum max residual reached 0.3-0.5, but older projection/penalty experiments lost strength. Added RMS telemetry before ranking this.
 - Existing `batch_configs` was broken and always logged 6; instrumentation now records the actual config count.
+- The instrumented run made 360,041 solves at 222.5/s and 359,065 rows. The final live replay was 39.9% warm, 29.6% play, and 30.5% query; the last five minutes sampled 21.1%, 39.5%, and 39.4% respectively.
+- Last-five-minute value loss was 0.02966: old 0.01880 and fresh 0.03540. Outcome RMSE/MAE was 0.7870/0.6535, correlation 0.3585, and calibration slope 0.5732. Only 0.736% of sampled config targets were TD(1) outcomes.
+- Last-five-minute target age was 748.5s mean and 1,482.3s p90. Main-line delivery delay was 69.0s mean and 95.7s p90 overall.
+- Policy CE was 1.8635, target entropy 1.5747, and KL 0.2888. At weight 0.05, the reducible KL term was about 0.0144 versus value loss 0.0297. Gradient norm was 0.252 mean, 0.680 max, with no clipping. Zero-sum residual was 0.0296 RMS and 0.3528 max.
+- The run completed 1,594 games with 12.0% horizon hits. Horizon shaping had annealed to zero throughout the last five minutes. Final beat the 15-minute snapshot 31-9 and Greedy 40-0 in the 40-game ladder.
+- A prior matched 200-game ablation measured `p_td1=0.2` over `0.0` at 111-89, +38.2 Elo. Removing queries lost 34.7 Elo; publishing every 0.2 rather than 1 minute lost 20.8 Elo; stronger search lost 185 Elo.
 
 ## Next
-1. Continue local code/log analysis and review the instrumentation while the box is unavailable.
-2. After `box free`, re-run `WARCHEST_BOX_DIR=/workspace/warchest-dynamics tools/box.sh go out=dynamics_default_30` with no other overrides.
-3. Pull and analyze its `log.json`, `train.log`, and ladder.
-4. Apply the thermo-nuclear review to the final diff, fix findings, verify, and commit.
-5. Rank likely defects by expected strength gain and write the requested numeric report and experiment proposal.
+1. Final report: rank full TD(1) grounding first (+60 Elo expected), one-minute target publication second (+25), bounded warm retention third (+20), and stable horizon shaping fourth (+10).
+2. Proposed gate: exact 30-minute default control versus `p_td1=1.0`, same seed, then 200 paired games; expected candidate score 0.585 (about 117-83, +60 Elo).
