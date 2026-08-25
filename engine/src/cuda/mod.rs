@@ -352,6 +352,10 @@ const TRUNK_LDS: usize = C + 4;
 /// tensor cores read with its padding rows, the neighbour projections, and the
 /// pooled row with its bias.
 const TRUNK_SHARED: usize = (2 * N_HEXES + TRUNK_ROWS) * TRUNK_LDS * 4 + 3 * C * 4;
+const _: () = {
+    assert!(C % 32 == 0, "k_trunk wants a whole number of warps a row");
+    assert!(TRUNK_ROWS % (C / 8) == 0, "k_trunk distributes whole hex rows");
+};
 
 /// The running sums of the join's biases, in the order its norms read them.
 /// See `Card::owed`, which is where they are kept and why.
@@ -1242,9 +1246,6 @@ impl Gpu {
         // Stream ordering is explicit, so the read/write events cudarc would
         // otherwise create on every allocation buy nothing.
         unsafe { ctx.disable_event_tracking() };
-        if C % 32 != 0 {
-            return Err(format!("trunk channel width {C} is not a multiple of 32"));
-        }
         let threads = 4 * C;
         let max_threads = ctx
             .attribute(CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)
@@ -1252,11 +1253,6 @@ impl Gpu {
         if threads > max_threads {
             return Err(format!(
                 "trunk channel width {C} needs {threads} threads per block; device {ordinal} allows {max_threads}"
-            ));
-        }
-        if TRUNK_ROWS % (C / 8) != 0 {
-            return Err(format!(
-                "trunk channel width {C} does not divide its {TRUNK_ROWS}-row tensor-core tile"
             ));
         }
         let max_shared = ctx
@@ -1741,8 +1737,6 @@ impl Card {
         // 32` channels to a lane, so a hex's row is exactly one warp wide and
         // its LayerNorm is a shuffle rather than a barrier.
         const SLOTS: u32 = (C / 8) as u32;
-        assert_eq!(C % 32, 0, "k_trunk wants a whole number of warps a row");
-        assert_eq!(TRUNK_ROWS % SLOTS as usize, 0, "k_trunk distributes whole hex rows");
         unsafe {
             self.stream
                 .launch_builder(&self.k.trunk)
