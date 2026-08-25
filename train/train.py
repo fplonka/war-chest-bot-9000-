@@ -596,6 +596,16 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
         torch.cuda.synchronize(device)
         stat["gpu_forward_s"] = sum(a.elapsed_time(b) for a, b, _ in event_pairs) / 1000.0
         stat["gpu_backward_s"] = sum(b.elapsed_time(c) for _, b, c in event_pairs) / 1000.0
+    if profile_cuda and stat["steps"]:
+        n = stat["steps"]
+        print(f"[profile] steps={n} rows={batch}"
+              f" sample={1e3 * stat['sample_s'] / n:.1f}ms"
+              f" prepare={1e3 * stat['prepare_s'] / n:.1f}ms"
+              f" fwd={1e3 * stat['forward_wall_s'] / n:.1f}ms"
+              f" bwd={1e3 * stat['backward_wall_s'] / n:.1f}ms"
+              f" gpu_fwd={1e3 * stat['gpu_forward_s'] / n:.1f}ms"
+              f" gpu_bwd={1e3 * stat['gpu_backward_s'] / n:.1f}ms",
+              flush=True)
     return tot / stat["steps"] if stat["steps"] else float("nan"), stat
 
 
