@@ -1,7 +1,0 @@
-# Contended trainer profile
-
-We were separating CPU-side batch preparation cost from GPU contention. A 35-second, two-card live stream used 36 builders and 96 actors per builder while a separate process ran the same frozen 1,024-row optimizer steps as the isolated profile on GPU 1. Both processes were restricted to physical cores 0-35. This was a scheduling diagnostic with fixed checkpoint data, not a model-quality experiment.
-
-With self-play active, the mean trainer step rose from 72.32 to 100.94 ms. Replay sampling was 3.09 ms, expansion and host-to-device copies were 79.33 ms, forward was 6.06 ms, and backward, clipping, and Adam were 12.46 ms; p95 total was 127.83 ms. The trainer therefore remains comfortably below the 213 ms per-step budget for 1,200 solves/s when it is limited to one CPU thread. The live stream reached 39,936 solves at the 35.05-second stop, or 1,139.4 solves/s, then counted 43,897 after draining. It had four large-job routes, no exact CPU fallback, no drop, and one true solver node-cap event.
-
-The important result is that sharing GPU 1 with training costs measurable solve throughput even though the optimizer itself is small, while the roughly 250 ms steps in the first live trainer smoke are not reproduced when PyTorch is explicitly limited to one CPU thread. The next real trainer should set that limit before looking for a larger device-replay rewrite, and GPU scheduling still needs enough extra generation margin to clear 1,200 after training.

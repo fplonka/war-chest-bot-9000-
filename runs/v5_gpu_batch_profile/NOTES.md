@@ -1,7 +1,0 @@
-# Device replay-expansion profile
-
-We were replacing the dominant host-side trainer boundary without changing replay contents or sampling. The new path copies packed 223-byte rows and compact configuration counts to GPU 1, then expands the frozen 897-float public encoding and 16-float configuration encoding with Triton. Card facts and board-location flags are exported from the Rust rules engine, so the kernel does not carry an independent rules table.
-
-The correctness gate compared 1,024 real rows and 29,339 configurations from the frozen trainer sample against the existing Rust/numpy path, both without augmentation and with the exact random mirror augmentation. Public features, unit ids, configuration features, weights, segment ids, targets, and auxiliary labels all matched at absolute tolerance 1e-6 (integer tensors exactly). On 20 post-warm-up batches averaging 31,010 configurations, synchronized batch preparation fell from 56.86 ms on the old host-expanded path to 2.28 ms on the compact device-expanded path, a 24.9x speedup; device p95 was 2.37 ms.
-
-At this point the implementation had passed local Rust tests and Python-feature compilation plus the remote CUDA replay parity gate. It had not yet been measured inside live training, where solve kernels share GPU 1; the next run needed to show that the much smaller PCIe payload and expansion kernels still leave enough device scheduling room for 1,200 balanced solves/s.

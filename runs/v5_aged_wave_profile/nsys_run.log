@@ -1,19 +1,0 @@
-v5 GEMM compute=fast-f16
-{"phase": "live", "seconds": 10.095, "solves": 14336, "solves_per_s": 1420.0, "oversize_routes": 0}
-{"phase": "live", "seconds": 20.011, "solves": 34816, "solves_per_s": 1739.8, "oversize_routes": 0}
-{"phase": "live", "seconds": 30.194, "solves": 51200, "solves_per_s": 1695.7, "oversize_routes": 0}
-{"phase": "live", "seconds": 40.022, "solves": 63488, "solves_per_s": 1586.3, "oversize_routes": 2}
-{"phase": "live", "seconds": 50.109, "solves": 77824, "solves_per_s": 1553.1, "oversize_routes": 10}
-{"phase": "live", "seconds": 60.2, "solves": 89088, "solves_per_s": 1479.9, "oversize_routes": 19}
-{"phase": "live", "seconds": 70.176, "solves": 100352, "solves_per_s": 1430.0, "oversize_routes": 30}
-{"phase": "live", "seconds": 80.12, "solves": 109568, "solves_per_s": 1367.5, "oversize_routes": 46}
-{"phase": "live", "seconds": 90.01, "solves": 120832, "solves_per_s": 1342.4, "oversize_routes": 62}
-{"phase": "live", "seconds": 100.152, "solves": 131072, "solves_per_s": 1308.7, "oversize_routes": 81}
-{"phase": "live", "seconds": 110.023, "solves": 141312, "solves_per_s": 1284.4, "oversize_routes": 110}
-{"phase": "live", "seconds": 120.087, "solves": 152576, "solves_per_s": 1270.5, "oversize_routes": 128}
-{"phase": "live", "seconds": 130.111, "solves": 161792, "solves_per_s": 1243.5, "oversize_routes": 148}
-Collecting data...
-Generating '/tmp/nsys-report-2de8.qdstrm'
-[1/1] [0%                          ] aged_nsys.nsys-rep[1/1] [0%                          ] aged_nsys.nsys-rep[1/1] [10%                         ] aged_nsys.nsys-rep[1/1] [==21%                       ] aged_nsys.nsys-rep[1/1] [=============58%            ] aged_nsys.nsys-rep[1/1] [=======================95%  ] aged_nsys.nsys-rep[1/1] [=======================96%  ] aged_nsys.nsys-rep[1/1] [========================97% ] aged_nsys.nsys-rep[1/1] [========================98% ] aged_nsys.nsys-rep[1/1] [========================99% ] aged_nsys.nsys-rep[1/1] [0%                          ] aged_nsys.nsys-rep[1/1] [7%                          ] aged_nsys.nsys-rep[1/1] [9%                          ] aged_nsys.nsys-rep[1/1] [11%                         ] aged_nsys.nsys-rep[1/1] [14%                         ] aged_nsys.nsys-rep[1/1] [=16%                        ] aged_nsys.nsys-rep[1/1] [==18%                       ] aged_nsys.nsys-rep[1/1] [==21%                       ] aged_nsys.nsys-rep[1/1] [===23%                      ] aged_nsys.nsys-rep[1/1] [====25%                     ] aged_nsys.nsys-rep[1/1] [====28%                     ] aged_nsys.nsys-rep[1/1] [=====30%                    ] aged_nsys.nsys-rep[1/1] [=====32%                    ] aged_nsys.nsys-rep[1/1] [======35%                   ] aged_nsys.nsys-rep[1/1] [=======37%                  ] aged_nsys.nsys-rep[1/1] [=======39%                  ] aged_nsys.nsys-rep[1/1] [========42%                 ] aged_nsys.nsys-rep[1/1] [=========44%                ] aged_nsys.nsys-rep[1/1] [=========46%                ] aged_nsys.nsys-rep[1/1] [==========49%               ] aged_nsys.nsys-rep[1/1] [===========51%              ] aged_nsys.nsys-rep[1/1] [===========53%              ] aged_nsys.nsys-rep[1/1] [============56%             ] aged_nsys.nsys-rep[1/1] [=============58%            ] aged_nsys.nsys-rep[1/1] [=============60%            ] aged_nsys.nsys-rep[1/1] [==============63%           ] aged_nsys.nsys-rep[1/1] [===============65%          ] aged_nsys.nsys-rep[1/1] [================68%         ] aged_nsys.nsys-rep[1/1] [================70%         ] aged_nsys.nsys-rep[1/1] [=================72%        ] aged_nsys.nsys-rep[1/1] [==================75%       ] aged_nsys.nsys-rep[1/1] [========================100%] aged_nsys.nsys-rep[1/1] [========================100%] aged_nsys.nsys-rep
-Generated:
-	/workspace/warchest-engine/runs/v5_aged_wave_profile/aged_nsys.nsys-rep

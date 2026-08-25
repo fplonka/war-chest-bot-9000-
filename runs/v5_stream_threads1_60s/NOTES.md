@@ -1,7 +1,0 @@
-# One-thread integrated trainer check
-
-We were testing whether PyTorch CPU oversubscription caused the roughly 250 ms optimizer steps in the first continuous-training smoke. This repeated the same warm-checkpoint, two-card, 36-builder, 96-actor workload after limiting PyTorch to one intra-op and one inter-op thread. Admission used a tighter measured 12-second drain reserve so the short run spent more of its fixed minute doing useful work.
-
-The hypothesis was wrong. Optimizer work still took roughly 220-278 ms per step in the live process, despite the frozen-data profile taking about 101 ms under separate contended generation. The run completed 45,839 solves and 183,296 optimizer rows, leaving only 60 rows of debt. Its fixed-minute headline was 764.0 balanced solves/s, not close to the 1,200 gate. Fifteen large solves used the dedicated path, with zero exact CPU fallbacks and zero drops. Admission stopped at 48.7 seconds, draining and training finished at 59.2 seconds, and there was no deadline overrun.
-
-The short-run checkpoint bug found by the preceding smoke is fixed: this run has a distinct initial `snap_00.pt` and trained final `snap_01.pt`. At this point the continuous pipeline and accounting were reliable, but changing PyTorch's host thread count had not removed the integrated trainer slowdown. The next profile needed to time sampling, row expansion/copy, forward, backward, and publication inside this exact process and measure the live batches' actual configuration width.

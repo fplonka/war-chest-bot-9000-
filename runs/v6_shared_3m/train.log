@@ -1,9 +1,0 @@
-[train] runs/v6_shared_3m at ea3238e+dirty seed=212 {'minutes': 3.0, 'warm_minutes': 0.0, 'init_weights': '/tmp/v6_shared_init.pt', 'snapshot_every': 15.0, 'depth': 2, 'iters': 64, 'cfr': 'dcfr', 'ladder_games': 0, 'gpu_drain_seconds': 5.0, 'seed': 212}
-[cpu] pinned to 36 physical cores
-[train] CUDA stream priority -1
-Traceback (most recent call last):
-  File "/workspace/warchest-engine/train/train.py", line 940, in <module>
-    main()
-  File "/workspace/warchest-engine/train/train.py", line 508, in main
-    warchest.gpu_start(dims, w, b, ln, devices=gpu_devices)
-RuntimeError: GPU lane 0: v5 NVRTC: CompileError { nvrtc: NvrtcError(NVRTC_ERROR_COMPILATION), options: ["--include-path=/usr/local/cuda/include", "--include-path=/usr/local/cuda/targets/x86_64-linux/include/cccl", "--gpu-architecture=compute_86", "--generate-line-info", "--use_fast_math"], log: "default_program(61): error: static assertion failed with \"the join input is the two pooled beliefs\"\n  static_assert(JOIN_IN == 2 * POOL, \"the join input is the two pooled beliefs\");\n  ^\n\n1 error detected in the compilation of \"default_program\".\n" }

@@ -1,6 +1,0 @@
-[gpu] solve services up on [0, 1]
-[cfg] PUBFEAT=897 CFEAT=16 hidden=384 head=384 dg=64 rank=64 depth=2 iters=64 budget=480s warm=0s device=cuda:1 draft=random snapshot_every=60.0min train_gen_ratio=4.0 recent_mix=0.5/0.2 augment=True cap=2000000 matmul=high
-[t=   0.0s] --- snapshot snap_00.pt (init) ---
-[t=   0.0s] --- switching to ReBeL ---
-v5 GEMM compute=fast-f16
-[t=  10.5s] rebel stream solves=12288 raw=1176/s balanced=1176/s debt=0 rows steps=48 over=0 card=0 drop=0 L=0.00104 tgt=+0.019/0.121 cfg/b=49645 prep=2.71s gpu=0.00s conv=0.01s add=0.37s train=9.20s

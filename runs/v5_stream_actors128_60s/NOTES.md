@@ -1,7 +1,0 @@
-# Integrated 128-actor trainer check
-
-We were testing whether the 1,496 solves/s generation-only result at 128 actors per builder supplied enough margin for the balanced trainer. This was a one-minute warm-checkpoint run with the production 4:1 optimizer ratio, fast PyTorch matmuls, both RTX 3090s, 36 builders, and 4,608 live games. Admission reserved ten seconds for drain.
-
-More actors helped but did not clear the gate. The run counted 56,975 solves and trained 227,328 rows, leaving 572 rows of debt. Because drain took longer than the ten-second reserve, it ended 1.19 seconds late; over the actual 61.19-second ReBeL interval it achieved 929.0 balanced solves/s. Five large solves used the dedicated path, with zero exact CPU fallback and zero drop. The comparable 96-actor fixed-minute diagnostic had reached 764 balanced solves/s, so the larger pool was still the correct direction, but generation-only margin did not survive the trainer boundary.
-
-Across the run, 222 optimizer steps consumed about 54 seconds of main-thread wall time, of which replay preparation alone consumed about 36 seconds. Batch width ranged from 35,828 to 92,012 configurations. At this point the production default was 128 actors and fast TF32-backed training GEMMs. The next optimization needed to accelerate or overlap packed-row expansion and tensor preparation; further actor tuning could not recover the missing 271 balanced solves/s by itself.

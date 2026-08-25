@@ -1,7 +1,0 @@
-{
- "final_rebel_vs_init_rebel": 0.7825,
- "init_rebel_vs_greedy": 0.31875,
- "final_rebel_vs_greedy": 0.70875,
- "final_net_vs_init_net": 0.6675,
- "final_net_vs_greedy": 0.65375
-}

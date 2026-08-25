@@ -1,9 +1,0 @@
-v5 GEMM compute=fast-f16
-{"phase": "live", "seconds": 10.058, "solves": 17408, "solves_per_s": 1730.8, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.514}
-{"phase": "live", "seconds": 20.141, "solves": 43008, "solves_per_s": 2135.4, "oversize_routes": 0, "card_exclusive_routes": 0, "wait_frac": 0.515}
-{"phase": "live", "seconds": 30.001, "solves": 51200, "solves_per_s": 1706.6, "oversize_routes": 1, "card_exclusive_routes": 0, "wait_frac": 0.498}
-{"phase": "live", "seconds": 40.087, "solves": 57344, "solves_per_s": 1430.5, "oversize_routes": 3, "card_exclusive_routes": 0, "wait_frac": 0.496}
-{"phase": "live", "seconds": 50.164, "solves": 64512, "solves_per_s": 1286.0, "oversize_routes": 3, "card_exclusive_routes": 0, "wait_frac": 0.5}
-{"phase": "live", "seconds": 60.098, "solves": 71680, "solves_per_s": 1192.7, "oversize_routes": 5, "card_exclusive_routes": 0, "wait_frac": 0.482}
-{"phase": "prestop", "wait_frac": 0.501, "solves": 71680, "games": 0, "decisions": 218452, "oversize_routes": 5, "card_exclusive_routes": 0, "exact_fallbacks": 0, "censored_games": 0, "dropped": 0, "node_caps": 6, "seconds": 60.098072526976466, "solves_per_s": 1192.7}
-{"phase": "drained", "solves": 73197, "games": 1, "decisions": 228225, "oversize_routes": 6, "card_exclusive_routes": 0, "exact_fallbacks": 0, "censored_games": 4608, "dropped": 0, "node_caps": 53, "seconds": 104.455, "solves_per_s": 700.8}

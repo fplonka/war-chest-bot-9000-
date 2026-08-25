@@ -1,3 +1,0 @@
-[ladder] 14 players, 91 pairings, 100 paired games each (depth=2 iters=64)
-        t64_h384_dg64_s11.init vs t64_h384_dg64_s11.s1         W   3 L  96 D   1  score 0.035
-        t64_h384_dg64_s11.init vs t64_h384_dg64_s11.s2         W   1 L  97 D   2  score 0.020
