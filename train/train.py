@@ -75,16 +75,18 @@ def action_feats(pa):
     The layout is the contract with `Net::action_feats`: kind, the coin slot it
     spends as the one-hot column (`NSLOT` meaning none, already so in the row),
     then the three squares it names with the last column meaning no square.
+    Built where `pa` already lives, so a batch never hands the policy a
+    host-sized one-hot.
     """
-    feat = np.zeros((len(pa), AFEAT), np.float32)
+    feat = torch.zeros((len(pa), AFEAT), dtype=torch.float32, device=pa.device)
     if not len(pa):
         return feat
-    idx = np.arange(len(pa))
-    feat[idx, pa[:, 0]] = 1.0
-    feat[idx, N_KINDS + pa[:, 1]] = 1.0
+    idx = torch.arange(len(pa), device=pa.device)
+    feat[idx, pa[:, 0].long()] = 1.0
+    feat[idx, N_KINDS + pa[:, 1].long()] = 1.0
     at = N_KINDS + NSLOT + 1
     for k in range(3):
-        h = np.where(pa[:, 2 + k] == 255, N_HEXES, pa[:, 2 + k].astype(np.int64))
+        h = torch.where(pa[:, 2 + k] == 255, N_HEXES, pa[:, 2 + k].long())
         feat[idx, at + h] = 1.0
         at += N_HEXES + 1
     return feat
@@ -124,31 +126,41 @@ class Buffer:
 
     Solve offsets are kept in row space (`soff`), so a dump can be split at
     solve boundaries for honest offline comparisons.
+
+    The data rings live on the device and `gather` assembles a batch there,
+    so an optimizer step never copies through the host. The per-row config
+    counts stay on the host -- `gather` needs the flattened arena offsets as
+    host integers, and the step's sampling telemetry reads the host metadata
+    rings -- and only their sampled slices cross to the device.
     """
 
-    def __init__(self, cap, ccap):
+    def __init__(self, cap, ccap, device):
         self.cap, self.ccap = cap, ccap
-        self.x = np.zeros((cap, ROW_BYTES), np.uint8)
+        self.device = device
+        self.x = torch.zeros((cap, ROW_BYTES), dtype=torch.uint8, device=device)
         self.soff = np.zeros(0, np.int64)
-        self.cstart = np.zeros(cap, np.int64)   # absolute arena offset
+        self.cstart = torch.zeros(cap, dtype=torch.int64, device=device)  # abs arena offset
         self.clen = np.zeros((cap, 2), np.int32)
-        self.cc = np.zeros((ccap, CCOUNTS), np.uint8)
-        self.cp = np.zeros(ccap, np.uint8)
-        self.cw = np.zeros(ccap, np.float16)
-        self.cy = np.zeros(ccap, np.float16)
+        self.cc = torch.zeros((ccap, CCOUNTS), dtype=torch.uint8, device=device)
+        self.cp = torch.zeros(ccap, dtype=torch.uint8, device=device)
+        self.cw = torch.zeros(ccap, dtype=torch.float16, device=device)
+        self.cy = torch.zeros(ccap, dtype=torch.float16, device=device)
         # The policy target, per row: the root's actions, and the legal cells
         # with their probability. Only main-line rows carry one, so both arenas
         # are sized off the row cap rather than the config cap.
-        self.pastart = np.zeros(cap, np.int64)
+        self.pastart = torch.zeros(cap, dtype=torch.int64, device=device)
         self.palen = np.zeros(cap, np.int32)
-        self.pcstart = np.zeros(cap, np.int64)
+        self.pcstart = torch.zeros(cap, dtype=torch.int64, device=device)
         self.pclen = np.zeros(cap, np.int32)
         self.acap = cap * 24
         self.pcap = cap * 96
-        self.pa = np.zeros((self.acap, ACT_BYTES), np.uint8)
-        self.pci = np.zeros(self.pcap, np.uint16)
-        self.pact = np.zeros(self.pcap, np.uint16)
-        self.pp = np.zeros(self.pcap, np.float16)
+        self.pa = torch.zeros((self.acap, ACT_BYTES), dtype=torch.uint8, device=device)
+        # Cell indices are within-row, but a row can hold thousands of configs,
+        # so int32 rather than the uint16 numpy used -- torch has no indexed
+        # write for uint16.
+        self.pci = torch.zeros(self.pcap, dtype=torch.int32, device=device)
+        self.pact = torch.zeros(self.pcap, dtype=torch.int32, device=device)
+        self.pp = torch.zeros(self.pcap, dtype=torch.float16, device=device)
         self.written_at = np.zeros(cap, np.float64)
         self.created_at = np.zeros(cap, np.float64)
         self.source = np.zeros(cap, np.uint8)  # 0 warm, 1 play, 2 query
@@ -164,6 +176,8 @@ class Buffer:
     def add(self, x, cc, cw, cy, coff, soff, source, truth, outcome, created,
             td1, pol=None):
         n = len(x)
+        if not x.flags.writeable:
+            x = x.copy()  # engine rows arrive as read-only bytes
         lens = np.diff(coff).reshape(n, 2)
         m = len(cw)
         if pol is None:
@@ -175,9 +189,9 @@ class Buffer:
         while self.lo < self.rows:
             r = self.lo % self.cap
             if (self.rows - self.lo + n <= self.cap
-                    and self.cfgs - self.cstart[r] + m <= self.ccap
-                    and self.cells - self.pcstart[r] + nc <= self.pcap
-                    and self.acts - self.pastart[r] + na <= self.acap):
+                    and self.cfgs - int(self.cstart[r]) + m <= self.ccap
+                    and self.cells - int(self.pcstart[r]) + nc <= self.pcap
+                    and self.acts - int(self.pastart[r]) + na <= self.acap):
                 break
             self.lo += 1
         cp = np.repeat(np.tile([0, 1], n).astype(np.uint8), lens.ravel())
@@ -187,9 +201,9 @@ class Buffer:
         for i in range(0, n, 4096):
             j = min(i + 4096, n)
             sl = np.arange(i, j) + base
-            self.x[sl % self.cap] = x[i:j]
-            self.cstart[sl % self.cap] = starts[i:j]
             ring = sl % self.cap
+            self.x[ring] = torch.as_tensor(x[i:j], device=self.device)
+            self.cstart[ring] = torch.as_tensor(starts[i:j], device=self.device)
             self.clen[ring] = lens[i:j]
             self.written_at[ring] = now
             self.created_at[ring] = created[i:j]
@@ -198,20 +212,31 @@ class Buffer:
             self.outcome[ring] = outcome[i:j]
             self.td1[ring] = td1[i:j]
         sl = (np.arange(m) + self.cfgs) % self.ccap
-        self.cc[sl], self.cp[sl], self.cw[sl], self.cy[sl] = cc, cp, cw, cy
+        self.cc[sl] = torch.as_tensor(cc, device=self.device)
+        self.cp[sl] = torch.as_tensor(cp, device=self.device)
+        self.cw[sl] = torch.as_tensor(cw, dtype=torch.float16, device=self.device)
+        self.cy[sl] = torch.as_tensor(cy, dtype=torch.float16, device=self.device)
         if pol is not None:
             alen = np.diff(paoff).astype(np.int32)
             clen = np.diff(pcoff).astype(np.int32)
             for i in range(0, n, 4096):
                 j = min(i + 4096, n)
                 sl = (np.arange(i, j) + base) % self.cap
-                self.pastart[sl] = self.acts + paoff[i:j]
+                self.pastart[sl] = torch.as_tensor(self.acts + paoff[i:j],
+                                                   device=self.device)
                 self.palen[sl] = alen[i:j]
-                self.pcstart[sl] = self.cells + pcoff[i:j]
+                self.pcstart[sl] = torch.as_tensor(self.cells + pcoff[i:j],
+                                                   device=self.device)
                 self.pclen[sl] = clen[i:j]
-            self.pa[(np.arange(na) + self.acts) % self.acap] = pa
+            self.pa[(np.arange(na) + self.acts) % self.acap] = torch.as_tensor(
+                pa, device=self.device)
             at = (np.arange(nc) + self.cells) % self.pcap
-            self.pci[at], self.pact[at], self.pp[at] = pci, pact, pprob
+            self.pci[at] = torch.as_tensor(pci, dtype=torch.int32,
+                                           device=self.device)
+            self.pact[at] = torch.as_tensor(pact, dtype=torch.int32,
+                                            device=self.device)
+            self.pp[at] = torch.as_tensor(pprob, dtype=torch.float16,
+                                          device=self.device)
             self.acts += na
             self.cells += nc
         self.rows += n
@@ -238,47 +263,52 @@ class Buffer:
         return self.rows - self.lo
 
     def gather(self, ids):
-        """Assemble a batch from absolute row ids.
+        """Assemble a batch from absolute row ids, on the device.
 
-        Returns `(rows, cc, cp, cw, cy, seg)`.
+        Returns `(rows, cc, cp, cw, cy, seg, pol)`. The config counts stay on
+        the host so the flattened arena offsets are host integers -- nothing
+        here reads a device value back, so a step never synchronizes.
         """
         s = ids % self.cap
         lens = self.clen[s].sum(1).astype(np.int64)
-        total = int(lens.sum())
-        # Arena indices of every config of every chosen row, flattened.
-        base = np.repeat(self.cstart[s], lens)
-        within = np.arange(total, dtype=np.int64) - np.repeat(
-            np.concatenate([[0], np.cumsum(lens)[:-1]]), lens)
-        at = (base + within) % self.ccap
-        seg = 2 * np.repeat(np.arange(len(ids), dtype=np.int64), lens) + self.cp[at]
+        alen = self.palen[s].astype(np.int64)
+        clen = self.pclen[s].astype(np.int64)
+        n = len(ids)
+        dev = self.device
+        t = lambda a: torch.as_tensor(a, device=dev)
+        s_t, lens_t, alen_t, clen_t = t(s), t(lens), t(alen), t(clen)
+        row_ids = torch.as_tensor(np.arange(n), device=dev)
+        # Arena indices of every config of every chosen row, flattened: the
+        # within-row offset is `arange(total) - rowstart`, and `rowstart` is
+        # known on the host, so the flattened index needs no readback.
+        rowstart = torch.cumsum(lens_t, 0) - lens_t
+        at = (torch.repeat_interleave(self.cstart[s_t] - rowstart, lens_t)
+              + torch.arange(int(lens.sum()), device=dev)) % self.ccap
+        seg = 2 * torch.repeat_interleave(row_ids, lens_t) + self.cp[at]
         # The policy target, remapped onto the batch. A row with no target
         # contributes no cells, which is how a query solve drops out of the
         # policy loss without a mask.
-        alen, clen = self.palen[s].astype(np.int64), self.pclen[s].astype(np.int64)
-        ai = (np.repeat(self.pastart[s], alen)
-              + (np.arange(int(alen.sum()), dtype=np.int64)
-                 - np.repeat(np.concatenate([[0], np.cumsum(alen)[:-1]]), alen)))
-        ci = (np.repeat(self.pcstart[s], clen)
-              + (np.arange(int(clen.sum()), dtype=np.int64)
-                 - np.repeat(np.concatenate([[0], np.cumsum(clen)[:-1]]), clen)))
+        astart = torch.cumsum(alen_t, 0) - alen_t
+        cstart = torch.cumsum(clen_t, 0) - clen_t
+        ai = (torch.repeat_interleave(self.pastart[s_t] - astart, alen_t)
+              + torch.arange(int(alen.sum()), device=dev))
+        ci = (torch.repeat_interleave(self.pcstart[s_t] - cstart, clen_t)
+              + torch.arange(int(clen.sum()), device=dev))
         # An action's index becomes batch-global, and a cell names the query
-        # (row, acting config) it belongs to.
-        abase = np.concatenate([[0], np.cumsum(alen)[:-1]])
-        cellrow = np.repeat(np.arange(len(ids), dtype=np.int64), clen)
-        # A cell names its config within its own row; the batch arena puts that
-        # row's configs at `rowbase`, so the two add to an arena index.
-        rowbase = np.concatenate([[0], np.cumsum(lens)[:-1]])
-        pcfg = np.repeat(rowbase, clen) + self.pci[ci % self.pcap].astype(np.int64)
-        pp = self.pp[ci % self.pcap].astype(np.float32)
+        # (row, acting config) it belongs to. A cell names its config within
+        # its own row; the batch arena puts that row's configs at `rowstart`,
+        # so the two add to an arena index.
+        cellrow = torch.repeat_interleave(row_ids, clen_t)
+        pcfg = torch.repeat_interleave(rowstart, clen_t) \
+            + self.pci[ci % self.pcap]
         pol = (self.pa[ai % self.acap],
-               np.repeat(abase, clen) + self.pact[ci % self.pcap],
-               cellrow, pcfg, pp,
-               np.repeat(np.arange(len(ids), dtype=np.int64), alen))
-        cw = self.cw[at].astype(np.float32)
-        mass = np.bincount(seg, weights=cw, minlength=2 * len(ids)).astype(np.float32)
-        cw /= mass[seg]
-        return (self.x[s], self.cc[at], self.cp[at], cw,
-                self.cy[at].astype(np.float32), seg, pol)
+               torch.repeat_interleave(astart, clen_t) + self.pact[ci % self.pcap],
+               cellrow, pcfg, self.pp[ci % self.pcap],
+               torch.repeat_interleave(row_ids, alen_t))
+        cw = self.cw[at].to(torch.float32)
+        mass = torch.zeros(2 * n, device=dev).index_add_(0, seg, cw)
+        return (self.x[s_t], self.cc[at], self.cp[at], cw / mass[seg],
+                self.cy[at], seg, pol)
 
     def sample_ids(self, batch, rng, recent_mix=0.0, recent_frac=0.2):
         """Row ids, with part drawn from the newest rows only.
@@ -358,7 +388,11 @@ class Buffer:
 
 
 def make_batch(parts, rng, device):
-    """Numpy replay batch -> the two canonical player queries per row."""
+    """Numpy replay batch -> the two canonical player queries per row.
+
+    The host-side oracle for `gpu_batch.make_batch`: same shapes, same values,
+    expanded with the engine's CPU encoder instead of the CUDA kernel.
+    """
     del rng
     rows, cc, cp, cw, cy, seg, pol = parts
     n = len(rows)
@@ -369,8 +403,9 @@ def make_batch(parts, rng, device):
     phi = cc.astype(np.float32) / CNORM
     t = lambda a, d=torch.float32: torch.as_tensor(a, dtype=d, device=device)
     pa, pact, pcrow, pcfg, pprob, parow = pol
-    policy = (t(action_feats(pa)), t(parow, torch.long), t(pact, torch.long),
-              t(pcrow, torch.long), t(pcfg, torch.long), t(pprob))
+    policy = (action_feats(t(pa, torch.uint8)), t(parow, torch.long),
+              t(pact, torch.long), t(pcrow, torch.long), t(pcfg, torch.long),
+              t(pprob))
     return (t(x), t(phi), t(cw), t(seg, torch.long), t(cy), 2 * n, policy)
 
 
@@ -388,11 +423,13 @@ def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0, stats=None):
         expected = torch.zeros(nseg, dtype=v.dtype, device=v.device)
         expected.index_add_(0, seg, v.detach() * w)
         residual = expected[0::2] + expected[1::2]
-        maximum, square_sum = torch.stack([
-            residual.abs().max(), residual.square().sum()]).cpu().tolist()
-        stats["zero_sum_max"] = max(stats["zero_sum_max"], maximum)
-        stats["zero_sum_square_sum"] += square_sum
-        stats["zero_sum_n"] += len(residual)
+        # Device scalars: `train_steps` reads them back once a call, so the
+        # step loop itself never synchronizes.
+        stats["zero_sum_max"] = torch.maximum(
+            stats["zero_sum_max"], residual.abs().max())
+        stats["zero_sum_square_sum"] = stats["zero_sum_square_sum"] \
+            + residual.square().sum()
+        stats["zero_sum_n"] = stats["zero_sum_n"] + len(residual)
     per = F.smooth_l1_loss(v, y, reduction="none", beta=0.5)
     total = torch.zeros(nseg, dtype=per.dtype, device=per.device)
     count = torch.zeros(nseg, dtype=per.dtype, device=per.device)
@@ -403,7 +440,7 @@ def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0, stats=None):
     # existed, so the run report still compares with every run before it. The
     # policy term is reported beside them, never folded into them.
     if stats is not None:
-        stats["value_loss"] = float(loss.detach())
+        stats["value_loss"] = loss.detach()
     if policy is not None and wp > 0.0:
         pl = policy_loss(net, xpub, phi, w, seg, nseg, policy, stats)
         if pl is not None:
@@ -457,12 +494,12 @@ def policy_loss(net, xpub, phi, weight, seg, nseg, policy, stats=None):
             0, inv, -(prior * logp))
         search_ce = torch.zeros(len(uniq), device=target.device).index_add_(
             0, inv, -(q * logp))
-        values = torch.stack([
-            loss, target_entropy.mean(), prior_entropy.mean(),
-            (search_ce - target_entropy).mean()]).detach().cpu().tolist()
-        stats.update(dict(zip((
-            "policy_loss", "policy_target_entropy", "policy_prior_entropy",
-            "policy_search_kl"), values)))
+        for key, value in zip((
+                "policy_loss", "policy_target_entropy", "policy_prior_entropy",
+                "policy_search_kl"), (
+                loss, target_entropy.mean(), prior_entropy.mean(),
+                (search_ce - target_entropy).mean())):
+            stats[key] = value.detach()
         stats["policy_groups"] = len(uniq)
     return loss
 
@@ -517,18 +554,19 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
     policy_metrics = (
         "policy_loss", "policy_target_entropy", "policy_prior_entropy",
         "policy_search_kl")
+    z = lambda: torch.zeros((), device=device)
     stat = {"sample_s": 0.0, "prepare_s": 0.0, "forward_wall_s": 0.0,
             "backward_wall_s": 0.0, "batch_configs": 0, "steps": 0,
             "gpu_forward_s": 0.0, "gpu_backward_s": 0.0,
-            "zero_sum_max": 0.0, "zero_sum_square_sum": 0.0,
+            "zero_sum_max": z(), "zero_sum_square_sum": z(),
             "zero_sum_n": 0, "grad_clipped": 0,
-            "grad_norm_sum": 0.0, "grad_norm_max": 0.0,
+            "grad_norm_sum": z(), "grad_norm_max": z(),
             "policy_steps": 0, "sample_ages": [], "sample_delays": [],
             "sample_warm": 0, "sample_play": 0, "sample_query": 0,
             "sample_warm_delay_sum": 0.0, "sample_play_delay_sum": 0.0,
             "sample_query_delay_sum": 0.0,
             "sample_td1_targets": 0, "sample_targets": 0,
-            **{f"{key}_sum": 0.0 for key in policy_metrics}}
+            **{f"{key}_sum": z() for key in policy_metrics}}
     if len(buf) < batch:
         return float("nan"), stat
     tot = 0.0
@@ -565,33 +603,44 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
             b1 = torch.cuda.Event(enable_timing=True)
             f0.record(stream)
         ts = time.perf_counter()
-        step_stat = {"zero_sum_max": 0.0, "zero_sum_square_sum": 0.0,
+        step_stat = {"zero_sum_max": z(), "zero_sum_square_sum": z(),
                      "zero_sum_n": 0}
         value = losses(net, *parts, wp=policy_w, stats=step_stat)
         tot += step_stat["value_loss"]
-        stat["zero_sum_max"] = max(stat["zero_sum_max"], step_stat["zero_sum_max"])
-        stat["zero_sum_square_sum"] += step_stat["zero_sum_square_sum"]
+        stat["zero_sum_max"] = torch.maximum(
+            stat["zero_sum_max"], step_stat["zero_sum_max"])
+        stat["zero_sum_square_sum"] = stat["zero_sum_square_sum"] \
+            + step_stat["zero_sum_square_sum"]
         stat["zero_sum_n"] += step_stat["zero_sum_n"]
         if "policy_loss" in step_stat:
             stat["policy_steps"] += 1
             for key in policy_metrics:
-                stat[f"{key}_sum"] += step_stat[key]
+                stat[f"{key}_sum"] = stat[f"{key}_sum"] + step_stat[key]
         stat["forward_wall_s"] += time.perf_counter() - ts
         if stream is not None:
             f1.record(stream)
         ts = time.perf_counter()
         opt.zero_grad(set_to_none=True)
         value.backward()
-        grad_norm = float(nn.utils.clip_grad_norm_(net.parameters(), 5.0))
-        stat["grad_norm_sum"] += grad_norm
-        stat["grad_norm_max"] = max(stat["grad_norm_max"], grad_norm)
-        stat["grad_clipped"] += int(grad_norm > 5.0)
+        grad_norm = nn.utils.clip_grad_norm_(net.parameters(), 5.0)
+        stat["grad_norm_sum"] = stat["grad_norm_sum"] + grad_norm
+        stat["grad_norm_max"] = torch.maximum(stat["grad_norm_max"], grad_norm)
+        stat["grad_clipped"] = stat["grad_clipped"] + (grad_norm > 5.0).long()
         opt.step()
         stat["steps"] += 1
         stat["backward_wall_s"] += time.perf_counter() - ts
         if stream is not None:
             b1.record(stream)
             event_pairs.append((f0, f1, b1))
+    if stat["steps"]:
+        # The loop above never synchronizes, so the device and the host stay
+        # overlapped; one readback a call drains it.
+        cpu = lambda t: float(t.detach().cpu()) if torch.is_tensor(t) else float(t)
+        for key in ("zero_sum_max", "zero_sum_square_sum", "zero_sum_n",
+                    "grad_clipped", "grad_norm_sum", "grad_norm_max",
+                    *(f"{k}_sum" for k in policy_metrics)):
+            stat[key] = cpu(stat[key])
+        tot = cpu(tot)
     if event_pairs:
         torch.cuda.synchronize(device)
         stat["gpu_forward_s"] = sum(a.elapsed_time(b) for a, b, _ in event_pairs) / 1000.0
@@ -801,7 +850,7 @@ def main():
     lr_decays = sorted(float(x) for x in args.lr_decay_frac.split(",") if x.strip())
     value.push()
     target_state = cpu_state(value)
-    buf = Buffer(args.cap, args.cap * args.cfgs_per_row)
+    buf = Buffer(args.cap, args.cap * args.cfgs_per_row, dev)
     buf.x.fill(0)
     import gpu_batch
     gpu_batch.warmup(dev)

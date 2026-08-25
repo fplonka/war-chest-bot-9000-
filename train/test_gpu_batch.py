@@ -20,10 +20,13 @@ from gpu_batch import make_batch as make_gpu_batch, warmup
 from train import make_batch as make_cpu_batch
 
 
-def clone(parts):
-    return tuple(tuple(np.array(y, copy=True) for y in x)
-                 if isinstance(x, tuple) else np.array(x, copy=True)
-                 for x in parts)
+def to_device(parts, dev):
+    """Numpy batch -> device tensors, the shape `Buffer.gather` produces."""
+    rows, cc, cp, cw, cy, seg, pol = parts
+    t = lambda a, d=None: torch.as_tensor(a, dtype=d, device=dev)
+    return (t(rows, torch.uint8), t(cc, torch.uint8), t(cp, torch.uint8),
+            t(cw, torch.float32), t(cy, torch.float32), t(seg, torch.int64),
+            tuple(t(a) for a in pol))
 
 
 def empty_policy():
@@ -44,8 +47,8 @@ def main():
     d = Dump(args.dump)
     parts = (*d.rows(0, min(args.rows, len(d))), empty_policy())
     warmup(dev)
-    a = make_cpu_batch(clone(parts), np.random.default_rng(17), dev)
-    b = make_gpu_batch(clone(parts), np.random.default_rng(17), dev)
+    a = make_cpu_batch(parts, np.random.default_rng(17), dev)
+    b = make_gpu_batch(to_device(parts, dev), np.random.default_rng(17), dev)
     torch.cuda.synchronize(dev)
     for x, y in zip(a[:5], b[:5]):
         if x.dtype.is_floating_point:

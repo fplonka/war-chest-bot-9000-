@@ -7,6 +7,7 @@ import torch
 
 import mirror
 import warchest
+from train import action_feats
 
 
 @lru_cache(maxsize=None)
@@ -20,49 +21,49 @@ def _tables(device_text):
 
 
 def make_batch(parts, rng, device):
-    """Compact replay batch -> two canonical query rows on ``device``."""
+    """Device replay batch -> two canonical query rows on ``device``.
+
+    ``parts`` comes from ``Buffer.gather`` and is already on the device; this
+    mirrors the rows, runs the engine's expander, and assembles the network
+    input. Nothing crosses the host.
+    """
     del rng
     rows, cc, cp, cw, cy, seg, pol = parts
     n = len(rows)
-    views = np.empty((2 * n, warchest.ROW_BYTES), np.uint8)
-    views[0::2] = rows
-    views[1::2] = mirror.mirror_rows(rows)
-    rows = np.ascontiguousarray(views)
-    cc = np.ascontiguousarray(cc)
-    t = lambda a, dtype=None: torch.as_tensor(a, dtype=dtype, device=device)
-    rows_t = t(rows, torch.uint8)
+    views = torch.stack([rows, mirror.mirror_torch(rows)], 1).reshape(2 * n, -1)
     cards, locations = _tables(str(device))
     x = torch.empty((2 * n, warchest.PUBFEAT), dtype=torch.float32, device=device)
     stream = torch.cuda.current_stream(device)
     ordinal = device.index if device.index is not None else torch.cuda.current_device()
     warchest.expand_rows_cuda(
-        rows_t.data_ptr(), cards.data_ptr(), locations.data_ptr(), x.data_ptr(),
+        views.data_ptr(), cards.data_ptr(), locations.data_ptr(), x.data_ptr(),
         2 * n, stream.cuda_stream, ordinal)
-
-    phi = t(cc, torch.float32) / float(warchest.CNORM)
-    from train import action_feats
+    phi = cc.to(torch.float32) / float(warchest.CNORM)
     pa, pact, pcrow, pcfg, pprob, parow = pol
-    policy = (t(action_feats(pa), torch.float32), t(parow, torch.long),
-              t(pact, torch.long), t(pcrow, torch.long), t(pcfg, torch.long),
-              t(pprob, torch.float32))
-    return (x, phi, t(cw, torch.float32), t(seg, torch.long),
-            t(cy, torch.float32), 2 * n, policy)
+    policy = (action_feats(pa), parow.long(), pact.long(), pcrow.long(),
+              pcfg.long(), pprob.to(torch.float32))
+    return (x, phi, cw.to(torch.float32), seg, cy.to(torch.float32), 2 * n,
+            policy)
 
 
 def warmup(device):
     """Compile the expansion kernel before the run's wall-clock starts."""
-    rows = np.zeros((1, warchest.ROW_BYTES), np.uint8)
+    rows = torch.zeros((1, warchest.ROW_BYTES), torch.uint8, device=device)
     rows[:, warchest.ROW_HEX_OWNER:warchest.ROW_HEX_OWNER + warchest.N_HEXES] = 255
     rows[:, warchest.ROW_HEX_SLOT:warchest.ROW_HEX_SLOT + warchest.N_HEXES] = 255
     rows[:, warchest.ROW_HEX_MARKER:warchest.ROW_HEX_MARKER + warchest.N_HEXES] = 255
-    cc = np.zeros((2, warchest.CCOUNTS), np.uint8)
+    cc = torch.zeros((2, warchest.CCOUNTS), torch.uint8, device=device)
     # An empty policy: a row without a target is exactly what the warm start
     # and every query solve look like, so this is the shape, not a special case.
-    empty = (np.zeros((0, warchest.ACT_BYTES), np.uint8),
-             np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0, np.int64),
-             np.zeros(0, np.float32), np.zeros(0, np.int64))
-    parts = (rows, cc, np.asarray([0, 1], np.uint8),
-             np.asarray([1.0, 1.0], np.float32), np.zeros(2, np.float32),
-             np.asarray([0, 1], np.int64), empty)
+    empty = (torch.zeros((0, warchest.ACT_BYTES), torch.uint8, device=device),
+             torch.zeros(0, torch.int64, device=device),
+             torch.zeros(0, torch.int64, device=device),
+             torch.zeros(0, torch.int64, device=device),
+             torch.zeros(0, torch.float32, device=device),
+             torch.zeros(0, torch.int64, device=device))
+    parts = (rows, cc, torch.as_tensor([0, 1], torch.uint8, device=device),
+             torch.as_tensor([1.0, 1.0], device=device),
+             torch.zeros(2, device=device),
+             torch.as_tensor([0, 1], torch.int64, device=device), empty)
     make_batch(parts, np.random.default_rng(0), device)
     torch.cuda.synchronize(device)

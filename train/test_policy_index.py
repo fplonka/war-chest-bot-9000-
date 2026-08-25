@@ -11,6 +11,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
+import torch
 from train import ACT_BYTES, CCOUNTS, ROW_BYTES, Buffer
 
 
@@ -53,7 +54,7 @@ def check(buf, ids):
 def main():
     rng = np.random.default_rng(0)
     n, ncfg, na, ncells = 16000, 40, 12, 24
-    buf = Buffer(n * 2, n * ncfg * 2)
+    buf = Buffer(n * 2, n * ncfg * 2, torch.device("cpu"))
     buf.add(*dump(n, ncfg, na, ncells))
     check(buf, np.arange(buf.lo, buf.rows))
     print(f"16k burst: {n} live rows, pcfg < {n * ncfg}")
@@ -62,7 +63,7 @@ def main():
         check(buf, ids)
 
     cap = 128
-    ring = Buffer(cap, cap * 10_000)
+    ring = Buffer(cap, cap * 10_000, torch.device("cpu"))
     thin, fat = 50, 30
     ncfg_t, ncfg_f = 6, 400
     ring.add(*dump(thin, ncfg_t, 4, ncfg_t))

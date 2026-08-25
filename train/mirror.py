@@ -26,7 +26,10 @@ The strongest check: expansion and mirror commute — `expand(mirror(row))`
 must equal the feature-level mirror of `expand(row)`.
 """
 
+from functools import lru_cache
+
 import numpy as np
+import torch
 
 import warchest
 
@@ -49,6 +52,66 @@ def _swap(a, lo, width):
     tmp = a[:, lo:lo + width].copy()
     a[:, lo:lo + width] = a[:, lo + width:lo + 2 * width]
     a[:, lo + width:lo + 2 * width] = tmp
+
+
+@lru_cache(maxsize=None)
+def _mirror_tables(device):
+    """The device tables `mirror_torch` runs on.
+
+    The whole transform is a column permutation plus a per-element seat flip,
+    except the stack-owed bit sets: those are a permutation of the first 37
+    bits of each 8-byte level, which no column permutation can express, so it
+    is a GF(2) matrix over the level's 64 bits instead.
+    """
+    dev = torch.device(device)
+    o = warchest.ROW_HEX_OWNER
+    mx = warchest.ROW_HEX_MARKER
+    hexmap = np.asarray(warchest.hex_mirror(), dtype=np.int64)
+    perm = np.arange(ROW_BYTES)
+    for (lo, w) in [(o, N_HEXES), (warchest.ROW_HEX_SLOT, N_HEXES),
+                    (warchest.ROW_HEX_HEIGHT, N_HEXES), (mx, N_HEXES)]:
+        perm[lo:lo + w] = lo + hexmap
+
+    def swap(lo, w):
+        perm[lo:lo + w] = lo + w + np.arange(w)
+        perm[lo + w:lo + 2 * w] = lo + np.arange(w)
+
+    swap(warchest.ROW_IDS, NSLOT)
+    swap(warchest.ROW_PILES, NSLOT * PILE_COUNTS)
+    for at in (warchest.ROW_HAND_SIZE, warchest.ROW_FD_SIZE,
+               warchest.ROW_BAG_SIZE):
+        swap(at, 1)
+    # Owner, marker, initiative and to-act bytes swap seats (0 <-> 1, else
+    # unchanged), which is a lookup on the value, not a column move.
+    flip = np.concatenate([np.arange(o, o + N_HEXES),
+                           np.arange(mx, mx + N_HEXES),
+                           [warchest.ROW_INITIATIVE, warchest.ROW_TO_ACT]])
+    lut = np.arange(256, dtype=np.uint8)
+    lut[0], lut[1] = 1, 0
+    stack = np.arange(warchest.ROW_STACK_OWED,
+                      warchest.ROW_STACK_OWED + warchest.CONT_CAP * 8)
+    # Output bit j (< N_HEXES) copies input bit hexmap[j]; the rest stay 0.
+    matrix = np.zeros((64, 64), np.uint8)
+    for j in range(N_HEXES):
+        matrix[hexmap[j], j] = 1
+    t = lambda a: torch.as_tensor(a, device=dev)
+    return (t(perm), t(flip), t(lut), t(stack), t(matrix), warchest.CONT_CAP)
+
+
+def mirror_torch(x):
+    """Mirror a device batch of packed rows; `mirror_rows` on the device."""
+    perm, flip, lut, stack, matrix, cont = _mirror_tables(x.device)
+    out = x[:, perm]
+    out[:, flip] = lut[out[:, flip].to(torch.int64)]
+    bits = (x[:, stack].reshape(-1, 8).unsqueeze(-1)
+            >> torch.arange(8, dtype=torch.uint8, device=x.device)) & 1
+    bits = bits.reshape(-1, 64)
+    mapped = (bits.to(torch.int32) @ matrix.to(torch.int32)) % 2
+    mapped = mapped.reshape(-1, 8, 8)
+    shifts = torch.ones(8, dtype=torch.int32, device=x.device) \
+        << torch.arange(8, dtype=torch.int32, device=x.device)
+    out[:, stack] = (mapped * shifts).sum(2).reshape(-1, cont * 8).to(torch.uint8)
+    return out
 
 
 def mirror_rows(rows):
