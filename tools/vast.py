@@ -1,30 +1,50 @@
 #!/usr/bin/env python3
 """Watch vast.ai for a box at least as good as ours and rent the first one.
 
-    tools/vast.py                 # print matching offers, cheapest first, every 20 s
+    tools/vast.py                 # print each new matching offer, cheapest first
     tools/vast.py --rent          # rent the first match, then stop
 
-The `vastai` CLI (pip install vastai; vastai set api-key ...) does the HTTP.
-Good offers go within minutes, so this polls; the CLI's half-second start-up
-is nothing against the 20 s cadence.
+Good offers are gone within seconds, so this talks to the API directly and
+polls as fast as it answers. The key is the one `vastai set api-key` saved.
 """
 import argparse
 import json
-import subprocess
 import sys
 import time
+import urllib.request
+from pathlib import Path
 
-# The floor: two 24 GB cards, a modern many-core CPU, real PCIe bandwidth.
-QUERY = ("num_gpus=2 gpu_ram>=24 total_flops>=68 cpu_cores_effective>=48 cpu_ram>=64 "
-         "disk_space>=90 pcie_bw>=9 inet_down>=200 reliability>=0.98 cuda_max_good>=12.8 "
-         "rentable=true verified=true")
+API = "https://console.vast.ai/api/v0"
+KEY = Path("~/.config/vastai/vast_api_key").expanduser().read_text().strip()
 IMAGE = "pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel"
+# The floor: two 24 GB cards, a modern many-core CPU, real PCIe bandwidth.
+FLOOR = {"num_gpus": {"eq": 2}, "gpu_ram": {"gte": 24000}, "total_flops": {"gte": 68},
+         "cpu_cores_effective": {"gte": 48}, "cpu_ram": {"gte": 64000},
+         "disk_space": {"gte": 90}, "pcie_bw": {"gte": 9}, "inet_down": {"gte": 200},
+         "reliability2": {"gte": 0.98}, "cuda_max_good": {"gte": 12.8},
+         "verified": {"eq": True}, "external": {"eq": False},
+         "rentable": {"eq": True}, "rented": {"eq": False}}
 
 
-def offers(max_dph):
-    out = subprocess.run(["vastai", "search", "offers", f"{QUERY} dph<={max_dph}",
-                          "-o", "dph", "--raw"], capture_output=True, text=True)
-    return json.loads(out.stdout) if out.returncode == 0 else []
+def call(method, path, body):
+    req = urllib.request.Request(f"{API}{path}", method=method,
+                                 data=json.dumps(body).encode(),
+                                 headers={"Authorization": f"Bearer {KEY}",
+                                          "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.load(r)
+
+
+def offers(max_dph, disk):
+    q = dict(FLOOR, dph_total={"lte": max_dph}, order=[["dph_total", "asc"]],
+             type="on-demand", allocated_storage=disk)
+    return call("POST", "/bundles/", q)["offers"]
+
+
+def rent(offer, disk):
+    return call("PUT", f"/asks/{offer['id']}/", {
+        "client_id": "me", "image": IMAGE, "disk": disk, "label": "warchest",
+        "runtype": "ssh_direc ssh_proxy", "env": {}})
 
 
 def line(o):
@@ -37,26 +57,31 @@ def line(o):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--max-dph", type=float, default=0.30, help="price ceiling, $/h")
+    ap.add_argument("--max-dph", type=float, default=0.27, help="price ceiling, $/h with disk")
     ap.add_argument("--rent", action="store_true")
-    ap.add_argument("--disk", type=int, default=100)
+    ap.add_argument("--disk", type=int, default=80)
     args = ap.parse_args()
-    seen = set()
+    seen, polls = set(), 0
     while True:
-        found = offers(args.max_dph)
+        try:
+            found = offers(args.max_dph, args.disk)
+        except Exception as e:  # a 429 or a blip is not a reason to stop watching
+            print(time.strftime("%H:%M:%S"), f"poll failed: {e}", flush=True)
+            time.sleep(2)
+            continue
+        polls += 1
         for o in found:
             if o["id"] not in seen:
                 seen.add(o["id"])
                 print(time.strftime("%H:%M:%S"), line(o), flush=True)
         if found and args.rent:
-            best = found[0]
-            r = subprocess.run(["vastai", "create", "instance", str(best["id"]),
-                                "--image", IMAGE, "--disk", str(args.disk),
-                                "--ssh", "--direct", "--label", "warchest", "--raw"],
-                               capture_output=True, text=True)
-            print(r.stdout.strip() or r.stderr.strip())
-            return 0 if r.returncode == 0 else 1
-        time.sleep(20)
+            try:
+                print("RENTED", json.dumps(rent(found[0], args.disk)), line(found[0]), flush=True)
+                return 0
+            except Exception as e:  # taken under us: keep polling
+                print(time.strftime("%H:%M:%S"), f"rent failed: {e}", flush=True)
+        if polls % 600 == 0:
+            print(time.strftime("%H:%M:%S"), f"{polls} polls, still watching", flush=True)
 
 
 if __name__ == "__main__":
