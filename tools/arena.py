@@ -816,7 +816,7 @@ def pack(run, binary, out_dir, snapshot=None, name=None):
         search = {"s": cfg.get("s", 512),
                   "c": cfg.get("c", 8.0),
                   "rounds": cfg.get("rounds", 0),
-                  "cfr": cfg.get("cfr", "sog")}
+                  "cfr": "dcfr"}
         bot = name or f"{run.name}.{snap['label']}"
         directory = out_dir / bot
         directory.mkdir(parents=True, exist_ok=True)
