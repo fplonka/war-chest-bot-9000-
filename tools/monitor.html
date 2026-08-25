@@ -29,6 +29,7 @@ h2{font-size:12px;margin:22px 0 6px;color:var(--mut)}
 .uplot{font:10px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .u-title{font-size:11px;text-align:left;font-weight:700}
 .panel .u-legend{font-size:10px;margin:0}
+.u-legend .raw{display:none}
 .u-legend th,.u-legend td{padding:0 8px 0 0;border:0}
 .u-select{background:#8883}
 dl{display:flex;flex-wrap:wrap;gap:0 22px;margin:4px 0}
@@ -59,6 +60,9 @@ pre{max-height:340px;overflow:auto;margin:4px 0;font:inherit;white-space:pre-wra
 <script>
 const COLORS = ["#4e79a7", "#e15759", "#59a14f", "#f28e2b", "#76b7b2",
   "#edc949", "#af7aa1", "#ff9da7", "#9c755f", "#bab0ac", "#8cd17d"];
+const MOVE_COLORS = matchMedia("(prefers-color-scheme:dark)").matches
+  ? ["#77aadd", "#ee8866", "#44bb99", "#eedd66", "#99ddff", "#cc77aa", "#aaa"]
+  : ["#336699", "#cc3311", "#117755", "#997700", "#2288aa", "#882255", "#777"];
 const $ = id => document.getElementById(id);
 const E = (tag, cls, text) => { const n = document.createElement(tag);
   if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
@@ -133,7 +137,7 @@ function overlays(state) {
 }
 
 function plotData(p) {
-  return [p.x, ...p.s.map(s => s.sm ? ema(s.y) : s.y),
+  return [p.x, ...p.s.flatMap(s => s.sm ? [s.y, ema(s.y)] : [s.y]),
     ...p.h.map(h => p.x.map(() => h[1]))];
 }
 
@@ -142,9 +146,15 @@ function makePlot(box, p, snaps) {
   const axis = dark ? "#999" : "#666", grid = dark ? "#333" : "#ddd";
   const state = {panel: p, snaps};
   const series = [{label: "training time", value: (u, v) => fmt(v) + " min"}];
-  p.s.forEach((s, i) => series.push({label: s.n, stroke: COLORS[i % COLORS.length],
-    width: 1.5, points: {show: p.marks}, spanGaps: false,
-    value: (u, v, si, idx) => fmt(idx == null ? null : state.panel.s[i].y[idx])}));
+  p.s.forEach((s, i) => {
+    const colors = p.t === "Move mix" ? MOVE_COLORS : COLORS;
+    const stroke = colors[i % colors.length];
+    if (s.sm) series.push({label: s.n, class: "raw", stroke, width: 1,
+      alpha: .22, auto: false, points: {show: false}, spanGaps: false});
+    series.push({label: s.n, stroke, width: 1.5, points: {show: p.marks},
+      spanGaps: false,
+      value: (u, v, si, idx) => fmt(idx == null ? null : state.panel.s[i].y[idx])});
+  });
   p.h.forEach((h, i) => series.push({label: h[0], stroke: COLORS[(p.s.length + i) % COLORS.length],
     width: 1, dash: [5, 5], points: {show: false}}));
   const opts = {title: p.t + " · " + p.y, width: box.clientWidth, height: 230,

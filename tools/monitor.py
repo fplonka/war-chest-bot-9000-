@@ -163,7 +163,7 @@ def panels(eps, elo):
 
     if any(e.get("plays") for e in eps):
         kinds = ("attack", "maneuver", "deploy", "bolster", "recruit",
-                 "claim_initiative", "pass")
+                 "pass", "claim_initiative")
         kinds = [kind for kind in kinds
                  if any(kind in (e.get("plays") or {}) for e in eps)]
         out.append(panel("Move mix", "% of decisions", m,
