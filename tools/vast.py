@@ -41,11 +41,13 @@ def main():
     ap.add_argument("--rent", action="store_true")
     ap.add_argument("--disk", type=int, default=100)
     args = ap.parse_args()
+    seen = set()
     while True:
         found = offers(args.max_dph)
-        print(time.strftime("%H:%M:%S"), f"{len(found)} offers", flush=True)
         for o in found:
-            print(line(o), flush=True)
+            if o["id"] not in seen:
+                seen.add(o["id"])
+                print(time.strftime("%H:%M:%S"), line(o), flush=True)
         if found and args.rent:
             best = found[0]
             r = subprocess.run(["vastai", "create", "instance", str(best["id"]),
