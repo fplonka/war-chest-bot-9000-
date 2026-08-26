@@ -294,8 +294,10 @@ impl Data {
         // no policy at all.
         let actor = s.to_act() as usize;
         let usable = !policy.acts.is_empty() && policy.off.len() == bel[actor].len() + 1;
-        for a in policy.acts.iter().take(if usable { usize::MAX } else { 0 }) {
-            self.pa.extend_from_slice(a);
+        if usable {
+            for a in &policy.acts {
+                self.pa.extend_from_slice(a);
+            }
         }
         self.paoff.push((self.pa.len() / crate::search::ACT_BYTES) as u32);
         self.pcoff.push(0); // rewritten below, once the cells are known
