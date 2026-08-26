@@ -118,6 +118,7 @@ start)
     shift 2
     run_remote "mkdir -p /workspace/logs /workspace/queue
 rm -f /workspace/logs/$tag.pid /workspace/logs/$tag.exit
+echo $remote > /workspace/logs/$tag.owner
 cat > /workspace/logs/$tag.sh <<'EOS'
 echo \$\$ > /workspace/logs/$tag.pid
 ticket=/workspace/queue/\$(date +%s%N)-$tag
@@ -136,8 +137,11 @@ echo started $tag"
 kill)
     # The job's pid is its process-group leader (setsid), so this takes the
     # whole tree: an orphaned test binary once held the queue for an hour.
+    # Only the checkout that started a job may kill it: workers killed each
+    # other's queued runs and a driver match by "tidying" the queue.
     tag=${2:?usage: kill <tag>}
-    run_remote "kill -- -\$(cat /workspace/logs/$tag.pid) && echo killed $tag"
+    run_remote "[ \"\$(cat /workspace/logs/$tag.owner 2>/dev/null)\" = $remote ] || { echo \"$tag was not started from $remote; not killed\"; exit 1; }
+kill -- -\$(cat /workspace/logs/$tag.pid) && echo killed $tag"
     ;;
 go)
     # The build runs inside the queued job, so a cargo build beside a measured
