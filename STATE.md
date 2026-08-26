@@ -25,12 +25,12 @@ Remove the runtime host solver. Keep CUDA as the only runtime solver and keep ex
 - Removed the `Nets` wrapper; solvers now receive `Arc<Net>` directly.
 - Removed CPU arena opt-ins. Static generation remains for greedy replay-format tests; SoG generation uses `SolveFarm`.
 - Applied the thermo-nuclear review: `advance` is now the direct CUDA state machine and the CPU call evaluator is test-only.
-- Rebased onto the FIFO `box.sh` redesign.
+- Rebased onto the current FIFO `box.sh` redesign (`4ac184a`).
 - Preserved query-time reservoir sampling from the new base in the single runtime path and its test oracle.
 - The old `onepath-tests`, `onepath-after`, and `onepath30` jobs were killed because the broad test job ran CPU tests while holding the GPU lock.
 - Read the surviving queued jobs before restarting work. They wait behind `b256_125`.
 - The inherited `onepath-*` queued jobs were terminated externally without exit files. Do not alter their files or tickets.
-- This session queued its own gates as `onepath-pi-gpu`, `onepath-pi-after`, `onepath-pi-cuda30`, and `onepath-pi-arena200`.
+- This session queued its own gates as `onepath-pi-gpu`, `onepath-pi-after`, `onepath-pi-cuda30`, and `onepath-pi-arena200`. After the queue harness changed, it killed only these four owned tags and restarted them through the current FIFO harness.
 - `onepath-pi-gpu` runs the required full `cargo test --features gpu`; `onepath-pi-after` uses the baseline farmbench settings.
 - `onepath-pi-cuda30` is the default 30-minute run. `onepath-pi-arena200` copies its packed bot, sets that copy to DCFR, asserts `sweep3_b256` is DCFR, and swaps seats over 200 games.
 - Re-ran the thermo-nuclear review. The runtime has one direct CUDA state machine; the host evaluator, arenas, solver, replay helpers, and backend adapter compile only under `cfg(test)`.
