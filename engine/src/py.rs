@@ -489,7 +489,7 @@ impl Game {
 use crate::net::Net;
 use crate::farm::{Backend, Farm, Work};
 use crate::search::{Budget, Cfg, Cfr, Ent};
-use crate::selfplay::{run_games, Agent, Collect, Data, GameCfg};
+use crate::selfplay::{run_static_games, Agent, Collect, Data, GameCfg};
 use numpy::{IntoPyArray, PyReadonlyArray1};
 use parking_lot::RwLock;
 use std::sync::{Arc, LazyLock};
@@ -814,7 +814,7 @@ fn gen_data(
         recursive_rate: 0.0,
     };
     let n = Arc::clone(&nets().read());
-    let d = py.allow_threads(|| run_games(games, seed, &n, &gc));
+    let d = py.allow_threads(|| run_static_games(games, seed, &n, &gc));
     data_to_dict(py, d)
 }
 

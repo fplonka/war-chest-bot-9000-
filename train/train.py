@@ -1412,7 +1412,7 @@ def main():
             d = warchest.gen_data(
                 args.warm_games, args.seed * 1_000_003 + epoch,
                 explore=args.explore, random_draft=args.random_draft,
-                agent="greedy", temp=args.temp)
+                temp=args.temp)
             gen_s = time.time() - tg
             n = ingest(buf, d, warm=True)
             steps = max(1, n // args.batch) if len(buf) >= args.batch else 0

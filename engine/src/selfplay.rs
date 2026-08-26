@@ -908,7 +908,7 @@ pub fn collect_roots(
 }
 
 /// Play `games` games in parallel, returning merged data and statistics.
-pub fn run_games(games: usize, seed: u64, nets: &Arc<Net>, gc: &GameCfg) -> Data {
+pub(crate) fn run_static_games(games: usize, seed: u64, nets: &Arc<Net>, gc: &GameCfg) -> Data {
     (0..games)
         .into_par_iter()
         .fold(Data::default, |mut acc, i| {
