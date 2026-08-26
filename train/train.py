@@ -1458,8 +1458,8 @@ def main():
     run_search_pipeline()
 
     snapshot("final", time.time() - t0)
-    arena = [sys.executable, str(ROOT / "tools" / "arena.py")]
-    subprocess.run(arena + ["pack", args.out, "--out", str(ROOT / "bots")], check=True)
+    subprocess.run([sys.executable, str(ROOT / "tools" / "arena.py"),
+                    "pack", args.out, "--out", str(ROOT / "bots")], check=True)
 
 
 if __name__ == "__main__":

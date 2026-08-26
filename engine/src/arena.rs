@@ -610,9 +610,6 @@ impl Table {
         Table::default()
     }
 
-    /// Let `bot` see the strategy its opponents play, which makes every result
-    /// it produces a measurement rather than a game.
-
     /// Games still being played. A decided game waiting for its last ack does
     /// not count.
     pub fn live(&self) -> usize {
