@@ -2365,12 +2365,30 @@ impl Card {
         self.backprop(b, all, 1, 0, Cfr::LINEAR)
     }
 
+    /// Measure work on a stream with CUDA events when profiling is enabled.
+    /// Production runs stay asynchronous.
+    fn timed<T>(stream: &CudaStream, slot: usize, f: impl FnOnce() -> Res<T>) -> Res<T> {
+        if !timing() {
+            return f();
+        }
+        let start = stream
+            .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+            .map_err(err)?;
+        let got = f()?;
+        let end = stream
+            .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+            .map_err(err)?;
+        let nanos = (start.elapsed_ms(&end).map_err(err)? * 1e6) as u64;
+        LEAF_NS[slot].fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+        Ok(got)
+    }
+
     /// Time host work unless stage profiling is enabled. In profiling mode
     /// these round stages use the same CUDA-event measurement as iteration
     /// stages, so queued device work is charged to the stage that issued it.
     fn wall<T>(&self, slot: usize, f: impl FnOnce() -> Res<T>) -> Res<T> {
         if timing() {
-            return self.stage(slot, f);
+            return Self::timed(&self.stream, slot, f);
         }
         let mark = std::time::Instant::now();
         let got = f()?;
@@ -2381,28 +2399,13 @@ impl Card {
         Ok(got)
     }
 
-    /// Time one device stage with CUDA events. The synchronise only completes
-    /// the requested profile; production runs stay asynchronous.
+    /// Time one device stage with CUDA events.
     fn stage<T>(&self, slot: usize, f: impl FnOnce() -> Res<T>) -> Res<T> {
-        if !timing() {
-            return f();
-        }
-        let start = self
-            .stream
-            .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
-            .map_err(err)?;
-        let got = f()?;
-        let end = self
-            .stream
-            .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
-            .map_err(err)?;
-        let nanos = (start.elapsed_ms(&end).map_err(err)? * 1e6) as u64;
-        LEAF_NS[slot].fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
-        Ok(got)
+        Self::timed(&self.stream, slot, f)
     }
 
-    /// The expansion stream has its own event clock because it overlaps the
-    /// main stream's next network pass.
+    /// The expansion stream has its own clock because it overlaps the main
+    /// stream's next network pass.
     fn expand_stage(
         &self,
         b: &Batch,
@@ -2411,21 +2414,9 @@ impl Card {
         iter: usize,
         rounds: usize,
     ) -> Res<()> {
-        if !timing() {
-            return self.expand(b.trees.buf(), b.parts, sims, puct, iter, rounds);
-        }
-        let start = self
-            .expand_stream
-            .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
-            .map_err(err)?;
-        self.expand(b.trees.buf(), b.parts, sims, puct, iter, rounds)?;
-        let end = self
-            .expand_stream
-            .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
-            .map_err(err)?;
-        let nanos = (start.elapsed_ms(&end).map_err(err)? * 1e6) as u64;
-        LEAF_NS[8].fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+        Self::timed(&self.expand_stream, 8, || {
+            self.expand(b.trees.buf(), b.parts, sims, puct, iter, rounds)
+        })
     }
 
     /// One CFR iteration and one expansion phase, for every solve in the round.
