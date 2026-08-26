@@ -98,12 +98,9 @@ def main():
     def fwd():
         return net(xpub, phi, w, seg, nseg)
 
-    def new_stats():
-        return {}
-
     def fwd_policy():
         return losses(net, xpub, phi, w, seg, y, nseg, policy=policy,
-                      wp=0.05, stats=new_stats())[0]
+                      wp=0.05)[0]
 
     def step():
         opt.zero_grad(set_to_none=True)
@@ -137,10 +134,10 @@ def main():
         warm_batch = (*batch[:6], empty_policy)
 
         def compiled_warm():
-            return compiled(net, *warm_batch, wp=0.05, stats=new_stats())
+            return compiled(net, *warm_batch, wp=0.05)
 
         def compiled_sog():
-            return compiled(net, *batch, wp=0.05, stats=new_stats())
+            return compiled(net, *batch, wp=0.05)
 
         t0 = time.perf_counter()
         compiled_warm()

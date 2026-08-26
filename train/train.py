@@ -74,8 +74,9 @@ def forward_values(net, parts):
     return net(*parts[:4], parts[5])
 
 
-def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0, *, stats):
+def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0):
     """Return the value-and-policy loss and its device-side measurements."""
+    stats = {}
     v = net(xpub, phi, w, seg, nseg)
     expected = torch.zeros(nseg, dtype=v.dtype, device=v.device)
     expected.index_add_(0, seg, v.detach() * w)
@@ -96,20 +97,22 @@ def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0, *, stats):
     # policy term is reported beside them, never folded into them.
     stats["value_loss"] = loss.detach()
     if policy is not None and wp > 0.0:
-        policy_value, stats = policy_loss(
-            net, xpub, phi, w, seg, nseg, policy, stats)
+        policy_value, policy_stats = policy_loss(
+            net, xpub, phi, w, seg, nseg, policy)
+        stats.update(policy_stats)
         if policy_value is not None:
             loss = loss + wp * policy_value
     return loss, stats
 
 
-def policy_loss(net, xpub, phi, weight, seg, nseg, policy, stats):
+def policy_loss(net, xpub, phi, weight, seg, nseg, policy):
     """Cross entropy of the policy head against the search's root average.
 
     The head scores a `(config, action)` cell as `<f_p(c), e(a)>`, so the batch
     is exactly the cells the solves stored. Each cell's softmax runs over its
     own `(row, config)` group, which is one information state.
     """
+    stats = {}
     feat, parow, pact, pcfg, group, target, group_count = policy
     if feat.shape[0] == 0 or pact.shape[0] == 0:
         return None, stats
@@ -175,8 +178,8 @@ def diagnostics(net, buf, probe, batch, rng, device, recent_frac):
     old = make_batch(buf.sample_old(batch, rng, recent_frac), device)
     new = make_batch(buf.sample(batch, rng, recent_mix=1.0, recent_frac=recent_frac),
                      device)
-    out["loss_old"] = float(losses(net, *old, wp=0.0, stats={})[0])
-    out["loss_new"] = float(losses(net, *new, wp=0.0, stats={})[0])
+    out["loss_old"] = float(losses(net, *old, wp=0.0)[0])
+    out["loss_new"] = float(losses(net, *new, wp=0.0)[0])
     calibration = buf.sample_calibration(batch, rng)
     if calibration is None:
         return out
@@ -256,18 +259,17 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
             b1 = torch.cuda.Event(enable_timing=True)
             f0.record(stream)
         ts = time.perf_counter()
-        step_stat = {}
-        value, step_stat = loss_fn(net, *parts, wp=policy_w, stats=step_stat)
-        tot += step_stat["value_loss"]
+        value, loss_stats = loss_fn(net, *parts, wp=policy_w)
+        tot += loss_stats["value_loss"]
         stat["zero_sum_max"] = torch.maximum(
-            stat["zero_sum_max"], step_stat["zero_sum_max"])
+            stat["zero_sum_max"], loss_stats["zero_sum_max"])
         stat["zero_sum_square_sum"] = stat["zero_sum_square_sum"] \
-            + step_stat["zero_sum_square_sum"]
-        stat["zero_sum_n"] += step_stat["zero_sum_n"]
-        if "policy_loss" in step_stat:
+            + loss_stats["zero_sum_square_sum"]
+        stat["zero_sum_n"] += loss_stats["zero_sum_n"]
+        if "policy_loss" in loss_stats:
             stat["policy_steps"] += 1
             for key in policy_metrics:
-                stat[f"{key}_sum"] = stat[f"{key}_sum"] + step_stat[key]
+                stat[f"{key}_sum"] = stat[f"{key}_sum"] + loss_stats[key]
         stat["forward_wall_s"] += time.perf_counter() - ts
         if stream is not None:
             f1.record(stream)
@@ -545,7 +547,7 @@ def main():
     y = torch.zeros(k, device=dev)
     parts = (x, phi, w, seg, y, 2 * n, None)
     opt.zero_grad(set_to_none=True)
-    losses(value, *parts, wp=0.0, stats={})[0].backward()
+    losses(value, *parts, wp=0.0)[0].backward()
     opt.step()
     forward_values(value, parts)
     torch.cuda.synchronize(dev)

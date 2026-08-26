@@ -43,7 +43,7 @@ def empty_policy():
 @torch.no_grad()
 def evaluate(net, parts, dev):
     batch = make_batch(parts, dev)
-    value = losses(net, *batch, stats={})[0]
+    value = losses(net, *batch)[0]
     rms = torch.sqrt(torch.mean((forward_values(net, batch) - batch[4]) ** 2))
     return float(value), float(rms)
 
@@ -132,7 +132,7 @@ def main():
     seen = []
     for _ in range(10):
         parts = make_batch(tr, dev)
-        value = losses(net, *parts, stats={})[0]
+        value = losses(net, *parts)[0]
         opt.zero_grad(set_to_none=True)
         value.backward()
         opt.step()
