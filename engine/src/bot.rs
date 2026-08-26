@@ -53,9 +53,7 @@ pub struct Brain {
     pub mind: Mind,
     pub net: Arc<Net>,
     pub cfg: Cfg,
-    /// The cards a solve runs on, when there are any. Without them a solve is
-    /// answered by the CPU network where it is raised, which is a hundred
-    /// times slower and is why a ladder used to cost an hour of CPU.
+    /// The cards used by SoG. Static agents do not need one.
     pub cards: Option<Arc<Cards>>,
 }
 

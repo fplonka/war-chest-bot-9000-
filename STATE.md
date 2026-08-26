@@ -20,7 +20,7 @@ Remove the runtime host solver. Keep CUDA as the only runtime solver and keep ex
 - Removed `Nets.device`, runtime backend dispatch, `Backend::Reference` outside tests, and the bot CPU opt-in.
 - Removed host-only examples, the CPU throughput probe, and CPU root generation.
 - Converted the host-dependent integration suites to unit suites so the oracle can be compiled only under `cfg(test)`.
-- Moved 1,266 lines of host arithmetic from `search.rs` to `search/reference.rs`, compiled only for tests.
+- Moved host arithmetic from `search.rs` to test-only `search/reference.rs` and `search/reference/growth.rs`; both files stay below 1,000 lines.
 - Removed the `Nets` wrapper; solvers now receive `Arc<Net>` directly.
 - Removed CPU arena opt-ins. Static generation remains for greedy replay-format tests; SoG generation uses `SolveFarm`.
 

@@ -32,7 +32,6 @@ use warchest::net::Net;
 use warchest::pbs::*;
 use warchest::rng::Rng;
 use warchest::farm::{Call, Reply};
-use warchest::net::Net;
 use warchest::search::{node_actions, Budget, Cfg, Solver, Step};
 use warchest::selfplay::{make_game, Agent, Collect, Data, GameCfg, GameStream};
 use warchest::state::{Cont, State, Z_BAG, Z_FACEDOWN, Z_FACEUP};
