@@ -92,7 +92,7 @@ def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0):
     count = torch.zeros(nseg, dtype=per.dtype, device=per.device)
     total.index_add_(0, seg, per)
     count.index_add_(0, seg, torch.ones_like(per))
-    loss = (total / count.clamp(min=1)).mean()
+    loss = (total / count).mean()
     # `L` and `L/var` are the *value* loss, as they were before the policy head
     # existed, so the run report still compares with every run before it. The
     # policy term is reported beside them, never folded into them.

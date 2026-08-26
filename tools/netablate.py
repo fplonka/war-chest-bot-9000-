@@ -86,7 +86,7 @@ def value_loss(net, b):
     count = torch.zeros(b[5], dtype=per.dtype, device=per.device)
     total.index_add_(0, b[3], per)
     count.index_add_(0, b[3], torch.ones_like(per))
-    return (total / count.clamp(min=1)).mean()
+    return (total / count).mean()
 
 
 def main():
