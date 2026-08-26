@@ -33,8 +33,8 @@ class Buffer:
 
     Payload rings live on the training device: packed rows, config counts,
     player labels, weights, targets, actions, policy cells, and probabilities.
-    Index and metadata rings stay on the host: arena starts and lengths,
-    timestamps, source labels, truth, outcomes, and TD(1) labels.
+    Index and metadata rings stay on the host: arena starts and lengths, policy
+    group counts, timestamps, source labels, truth, outcomes, and TD(1) labels.
 
     Append retires the oldest rows until the new chunk fits every ring. Absolute
     arena offsets make each live row's spans unambiguous even after wraparound.
