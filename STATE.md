@@ -1,8 +1,13 @@
 # fastfit — optimizer step cost tracks its arithmetic
 
-Goal: an optimizer step whose cost tracks its arithmetic, not fixed overhead.
-Measured baseline (task facts): 172 ms/step at 1024 rows, 111 ms/step at 256
-rows; at batch 256 the optimizer takes 8.4 s of every 10 s epoch.
+Goal: make an optimizer step cost track its arithmetic, not fixed Python,
+transfer, or synchronization overhead.
+
+## Baseline
+
+The task baseline is 172 ms/step at 1024 rows and 111 ms/step at batch 256.
+The batch-256 optimizer used 8.4 s of every 10 s epoch. The earlier 4-minute
+profile measured about 78 ms/step in warm bursts and 145 ms/step during SoG.
 
 ## Baseline profile (fastfit_prof, 4-min run, WARCHEST_TRAIN_PROFILE=1)
 
@@ -19,19 +24,32 @@ backward are ~67 ms of device time (launch/latency bound, not arithmetic:
 the net is a few GFLOP). Gate 1 (3x) needs the step at ~37 ms, which means
 cutting the device time as well as the host overhead.
 
-## Plan
+## Work completed
 
-1. Done: device-backed replay buffer; gather, mirror and one-hot actions on
-   the device; per-step telemetry as device scalars read back once a call
-   (no per-step syncs); host stays ~1 ms of enqueue per step.
-2. In flight: tools/step_bench.py measures each net stage (expander, trunk,
-   configs, join, policy, backward, Adam) and what torch.compile / CUDA
-   graphs do to the forward. Decide there whether the device time needs a
-   fusion pass.
-3. Gate 1: steps/s at batch 256 >= 3x baseline in a short run.
-4. Gate 2: 30-min default run, 200 games vs bots/sweep3_b256 (packed from
-   the existing runs/sweep3_b256 at git 9c22119; arch unchanged since),
-   cfr=dcfr both seats, expected ~0.50+, solves/s vs the 200.5/s reference.
+The replay payload rings, CUDA mirror, one-hot action encoding, and row
+expansion now stay on the training device. Replay indexes and metadata stay on
+the host. Policy groups are counted at ingest, so policy loss uses compact
+group IDs and `index_add_` without `torch.unique`. The trainer has one batch
+producer, and the dump and parity tools use it directly.
 
-Box: 2x RTX 3090 24GB; WARCHEST_BOX_DIR=/workspace/warchest-fastfit.
-Reference: runs/sweep3_b256 (batch 256, 200.5 solves/s, W675/B686/D135).
+Per-step training no longer reads device scalars or synchronizes. Profile
+labels distinguish host enqueue time from CUDA event time. The peak allocator
+measurement includes Net, Adam, replay, warmup, and a training-sized dummy.
+
+## Measurements and gates
+
+`tools/step_bench.py` is synced to the box and queued. It measures every batch
+and optimizer stage, then measures default-mode `torch.compile`, its warm and
+second SoG graphs, and the eager fallback path. The startup smoke is also
+queued. Both wait behind the unrelated 125-minute `b256_125` run.
+
+Gate 1 is a short batch-256 result at least 3x the 111 ms baseline. Gate 2 is a
+30-minute default run, then 200 color-swapped games against
+`/workspace/warchest-engine/bots/base_b256`; both seats use `cfr=dcfr`. The
+reference is `runs/base_b256`, 319652 solves at 197.8 solves/s.
+
+## Validation status (2026-08-26)
+
+Local syntax, compile, and diff checks pass. The remote host test for policy
+arena indexing passes, including 16k-row and fat-wrap cases. No local bot,
+solver, or training binary has been run.
