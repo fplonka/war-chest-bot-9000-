@@ -946,9 +946,9 @@ pub enum Step {
 #[cfg(test)]
 mod reference;
 #[cfg(test)]
-pub use reference::{Arenas, Back, Conv, HostCfr};
+pub use reference::{Arenas, Back, Conv, HostCfr, Trace};
 #[cfg(test)]
-use reference::ReferenceState;
+pub(crate) use reference::ReferenceState;
 
 pub struct Solver {
     /// Owned because a solver retains its context for its full solve.

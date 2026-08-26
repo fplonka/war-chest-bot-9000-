@@ -71,7 +71,7 @@ pub struct HostCfr {
 #[derive(Default)]
 pub(crate) struct ReferenceState {
     pub cfr: HostCfr,
-    cached: [usize; 2],
+    pub(super) cached: [usize; 2],
     pub trace: Trace,
     pub cf: Vec<f32>,
     pub cg: Vec<f32>,
@@ -80,7 +80,7 @@ pub(crate) struct ReferenceState {
     pub jp: Vec<f32>,
     pub xb: Vec<f32>,
     pub h: Vec<f32>,
-    wbuf: Vec<f32>,
+    pub(super) wbuf: Vec<f32>,
 }
 
 impl Solver {
