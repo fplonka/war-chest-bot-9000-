@@ -30,11 +30,7 @@ struct Options {
     name: String,
     weights: String,
     mind: String,
-    s: u32,
-    c: f32,
-    batch: usize,
-    rounds: u8,
-    cfr: String,
+    cfg: Cfg,
     threads: usize,
     temp: f32,
     devices: String,
@@ -42,18 +38,20 @@ struct Options {
 
 fn options() -> Result<Options, String> {
     let a = Args::parse(&[
-        "name", "weights", "mind", "s", "c", "batch", "rounds", "cfr", "threads", "temp",
-        "devices",
+        "name", "weights", "mind", "s", "c", "batch", "rounds", "refresh", "puct",
+        "prior_temp", "cfr", "threads", "temp", "devices",
     ])?;
+    let s = a.num("s", 512)?;
+    let cfr = a.text("cfr", "sog");
+    let cfr = Cfr::named(&cfr).ok_or_else(|| format!("unknown cfr rule {}", cfr))?;
     Ok(Options {
         name: a.text("name", "bot"),
         weights: a.text("weights", ""),
         mind: a.text("mind", "sog"),
-        cfr: a.text("cfr", "sog"),
-        s: a.num("s", 512)?,
-        c: a.num("c", 8.0)?,
-        batch: a.num("batch", 8)?,
-        rounds: a.num("rounds", 0)?,
+        cfg: Cfg { s, c: a.num("c", 8.0)?, batch: a.num("batch", 8)?,
+            rounds: a.num("rounds", 0)?, refresh: a.num("refresh", 1)?,
+            puct: a.num("puct", 1.5)?, prior_temp: a.num("prior_temp", 1.0)?, cfr,
+            budget: Budget::for_s(s), ..Default::default() },
         threads: a.num("threads", 0)?,
         temp: a.num("temp", 2.0)?,
         devices: a.text("devices", ""),
@@ -67,8 +65,7 @@ fn brain(o: &Options) -> Result<Brain, String> {
         "greedy" => Mind::Greedy { temp: o.temp },
         other => return Err(format!("unknown mind {}", other)),
     };
-    let cfr = Cfr::named(&o.cfr).ok_or_else(|| format!("unknown cfr rule {}", o.cfr))?;
-    let cfg = Cfg { s: o.s, c: o.c, batch: o.batch, rounds: o.rounds, cfr, budget: Budget::for_s(o.s), ..Default::default() };
+    let cfg = o.cfg;
     let backend = devices(o, mind, cfg)?;
     let mut nets = Nets { device: backend.is_some(), ..Nets::default() };
     let cards = match backend {

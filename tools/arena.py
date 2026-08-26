@@ -822,8 +822,12 @@ def pack(run, binary, out_dir, snapshot=None, name=None):
         net.load_state_dict(checkpoint["value"])
         search = {"s": cfg.get("s", 512),
                   "c": cfg.get("c", 8.0),
+                  "batch": cfg.get("round_batch", 8),
                   "rounds": cfg.get("rounds", 0),
-                  "cfr": "dcfr"}
+                  "refresh": 1,
+                  "puct": 1.5,
+                  "prior_temp": 1.0,
+                  "cfr": cfg.get("cfr", "sog")}
         bot = name or f"{run.name}.{snap['label']}"
         directory = out_dir / bot
         directory.mkdir(parents=True, exist_ok=True)

@@ -1,13 +1,17 @@
 {
  "name": "querybel_b256",
  "sha": "4226353",
- "binary": "561ea16fbba7",
+ "binary": "38956d2df6e4",
  "mind": "sog",
  "weights": "weights.bin",
  "search": {
   "s": 512,
   "c": 8.0,
+  "batch": 8,
   "rounds": 0,
+  "refresh": 1,
+  "puct": 1.5,
+  "prior_temp": 1.0,
   "cfr": "dcfr"
  },
  "minutes": 30.0,
