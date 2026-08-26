@@ -22,6 +22,10 @@ for the configured rates, and restore the contract test invariant.
   owner-checked queue tool.
 - The queue is behind other workers' `probe_rr16` and `onepath-*` jobs, which
   remain untouched. The session's v3 gates are still queued.
+- Driver correction: `b256_125_vs_v5` and `b256_125_vs_v5b` were foreign
+  milestone jobs. They were mistakenly killed and their tickets removed.
+  Never touch foreign jobs again. Box work is paused for 30 minutes; resume
+  only tags beginning with `querytidy`.
 
 ## Validation
 
