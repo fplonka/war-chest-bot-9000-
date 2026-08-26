@@ -1561,13 +1561,13 @@ impl Card {
     /// Pack the trunk weights once on the card. The network publishes new
     /// values between rounds, so the half buffer follows the canonical f32
     /// weights without a host conversion.
-    fn refresh_trunk(&self) -> Res<()> {
+    fn refresh_trunk(&mut self) -> Res<()> {
         let n = self.wh.len();
         let n_i = n as i32;
         unsafe {
             self.stream
                 .launch_builder(&self.k.trunk_half)
-                .arg(&self.w).arg(&self.plan).arg(&self.wh).arg(&n_i)
+                .arg(&self.w).arg(&self.plan).arg(&mut self.wh).arg(&n_i)
                 .launch_unit(spread(n))
         }
         .map_err(err)
