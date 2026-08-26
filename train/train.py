@@ -304,6 +304,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
     if profile_cuda and stat["steps"]:
         n = stat["steps"]
         print(f"[profile] steps={n} rows={batch}"
+              f" step_enqueue={1e3 * stat['enqueue_s'] / n:.1f}ms"
               f" sample_enqueue={1e3 * stat['sample_s'] / n:.1f}ms"
               f" prepare_enqueue={1e3 * stat['prepare_s'] / n:.1f}ms"
               f" fwd_enqueue={1e3 * stat['forward_wall_s'] / n:.1f}ms"
@@ -412,6 +413,8 @@ def publish_state(state):
 def compiled_loss():
     """Compile the measured loss path, with eager as the safe fallback."""
     try:
+        torch._dynamo.reset()
+        torch._dynamo.utils.counters.clear()
         compiled = torch.compile(losses, mode="default", dynamic=True)
     except Exception as error:
         print(f"[train] torch.compile unavailable; using eager: "
@@ -419,13 +422,22 @@ def compiled_loss():
         return losses
 
     failed = False
+    last_counts = None
 
     def run(*args, **kwargs):
-        nonlocal failed
+        nonlocal failed, last_counts
         if failed:
             return losses(*args, **kwargs)
         try:
-            return compiled(*args, **kwargs)
+            result = compiled(*args, **kwargs)
+            counters = torch._dynamo.utils.counters
+            counts = (counters["stats"].get("unique_graphs", 0),
+                      counters["frames"].get("total", 0))
+            if counts != last_counts:
+                print(f"[train] torch.compile unique_graphs={counts[0]} "
+                      f"frames={counts[1]}", flush=True)
+                last_counts = counts
+            return result
         except Exception as error:
             failed = True
             print(f"[train] torch.compile failed; using eager: "
