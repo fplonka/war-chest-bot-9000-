@@ -13,8 +13,7 @@ engine/          Rust crate, lib name `warchest`
   src/           farm, contract, cuda  (many solves, one forward pass)
   src/           arena, bot, policy  (the referee, a bot, and a node's policy)
   tests/         36 scenario tests, playout invariants, PBS correctness tests
-  examples/      coords.rs (hex dump), budget.rs (what a search budget costs),
-                 budgetq.rs (whether a cheaper budget searches as well)
+  examples/      coords.rs (hex dump)
   src/bin/       bench.rs (applies/sec, playouts/sec), bot.rs (an arena bot)
 webui/           play.py + index.html: browser UI for playing a trained agent
 play.sh          one-liner: build the extension, serve the UI, open the browser
