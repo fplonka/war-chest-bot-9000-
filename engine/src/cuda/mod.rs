@@ -263,8 +263,7 @@ pub struct Device {
 /// Three rounds in flight keep the card busy while two sets grow on the host.
 pub const PIPELINE: usize = 3;
 
-/// Round to the eleven significand bits a tensor core keeps, matching
-/// JOIN_IN padded to a whole `mma.m16n8k16` k-tile. Fifteen zero columns.
+/// Pad `JOIN_IN` to a whole `mma.m16n8k16` k-tile. Fifteen zero columns.
 const JOIN_K: usize = JOIN_IN.next_multiple_of(16);
 const _: () = assert!(JOIN_K == 144 && JOIN_IN == 129);
 

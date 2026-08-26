@@ -267,52 +267,6 @@ __global__ void k_stem(float* x, const float* projected, const int* occupant,
 #define TRUNK_LDS (TRUNK_C + 4)
 #define TRUNK_HALF_LDS (TRUNK_C + 8)
 
-// A `.tf32` operand is an f32 register whose low thirteen mantissa bits are
-// zero. Rounding here, rather than letting the tensor core truncate, is what
-// makes the error unbiased: eleven significand bits into every product, single
-// precision out of every accumulate. The weights are rounded once on the host,
-// so this is only ever applied to an activation as it is stored.
-__device__ __forceinline__ float tf32(float v) {
-    unsigned r;
-    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(v));
-    return __uint_as_float(r);
-}
-
-/// `d += a * b` over one 16x8x8 tile: `a` row-major, `b` column-major, `d` an
-/// f32 accumulator. The register-to-element map is the one the PTX manual
-/// gives for `mma.m16n8k8` with `.f32` operands; `frag_a`, `frag_b`,
-/// `frag_row` and `frag_col` are the four corners of it.
-__device__ __forceinline__ void mma_tile(float (&d)[4], const unsigned (&a)[4],
-                                         const unsigned (&b)[2]) {
-    asm("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-}
-
-/// The board's 16x8 fragment at row tile `m` and depth `k`. A lane holds the
-/// rows `lane / 4` and `lane / 4 + 8` at the columns `lane % 4` and
-/// `lane % 4 + 4`, and the register order is row first: the low bit of the
-/// register index is the row and the next one is the column.
-__device__ __forceinline__ void frag_a(const float* a, int m, int k, int lane,
-                                       int lds, unsigned (&f)[4]) {
-    const float* p = a + (size_t)(16 * m + (lane >> 2)) * lds + k + (lane & 3);
-    f[0] = __float_as_uint(p[0]);
-    f[1] = __float_as_uint(p[8 * lds]);
-    f[2] = __float_as_uint(p[4]);
-    f[3] = __float_as_uint(p[8 * lds + 4]);
-}
-
-/// The weight's 8x8 fragment at depth `k` for the warp's own output tile. The
-/// matrix arrives in fragment order, so a lane's two values are one eight-byte
-/// load and the warp reads two hundred and fifty-six contiguous bytes.
-__device__ __forceinline__ void frag_b(const float* w, int k, int slot, int lane,
-                                       int ntiles, unsigned (&f)[2]) {
-    float2 v = *(const float2*)(w + (((size_t)k * ntiles + slot) * 32 + lane) * 2);
-    f[0] = __float_as_uint(v.x);
-    f[1] = __float_as_uint(v.y);
-}
-
 /// `d += a * b` over one 16x8x16 half tile. The operands are four and two
 /// packed half2 registers; accumulation stays in f32.
 __device__ __forceinline__ void mma_half_tile(float (&d)[4], const unsigned (&a)[4],
@@ -349,6 +303,7 @@ __device__ __forceinline__ void frag_b_half(const __half* w, int k, int slot, in
 __global__ void k_trunk_half(const float* w, const int* off, unsigned short* out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    // Each block stores mix-self, mix-neighbour and out as three matrices.
     const int matrix_size = TRUNK_C * TRUNK_C;
     const int block = i / (3 * matrix_size);
     const int matrix = (i % (3 * matrix_size)) / matrix_size;
