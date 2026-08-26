@@ -1,6 +1,7 @@
 """The device-backed replay ring used by the trainer."""
 
 import time
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -11,6 +12,28 @@ import warchest
 CCOUNTS = warchest.CCOUNTS
 ROW_BYTES = warchest.ROW_BYTES
 ACT_BYTES = warchest.ACT_BYTES
+SOURCE_QUERY = 2
+
+
+class Columns(NamedTuple):
+    """The raw value columns shared by replay, dumps, and batch assembly."""
+
+    rows: object
+    cc: object
+    cp: object
+    cw: object
+    cy: object
+    seg: object
+
+
+# Per-row columns received from the generator and retained by Buffer.
+ROW_COLUMNS = (
+    ("source", "source", np.uint8, ()),
+    ("truth", "truth", np.uint32, (2,)),
+    ("outcome", "outcome", np.float32, ()),
+    ("created_at", "created", np.float64, ()),
+    ("td1", "td1", np.uint8, ()),
+)
 
 
 def _to_numpy(value):
@@ -38,6 +61,7 @@ class Buffer:
     player labels, weights, targets, actions, policy cells, and probabilities.
     Index and metadata rings stay on the host: arena starts and lengths, policy
     group counts, timestamps, source labels, truth, outcomes, and TD(1) labels.
+    The shared generator columns are listed once in ROW_COLUMNS.
 
     Append retires the oldest rows until the new chunk fits every ring. Absolute
     arena offsets make each live row's spans unambiguous even after wraparound.
@@ -65,7 +89,6 @@ class Buffer:
         self.palen = np.zeros(cap, np.int32)
         self.pcstart = np.zeros(cap, np.int64)
         self.pclen = np.zeros(cap, np.int32)
-        self.pgroup_count = np.zeros(cap, np.int32)
         self.acap = cap * 24
         self.pcap = cap * 96
         self.pa = torch.zeros((self.acap, ACT_BYTES), dtype=torch.uint8,
@@ -77,12 +100,10 @@ class Buffer:
         self.pp = torch.zeros(self.pcap, dtype=torch.float16,
                               device=self.device)
 
-        self.written_at = np.zeros(cap, np.float64)
-        self.created_at = np.zeros(cap, np.float64)
-        self.source = np.zeros(cap, np.uint8)  # 0 warm, 1 play, 2 query
-        self.truth = np.zeros((cap, 2), np.uint32)
-        self.outcome = np.full((cap, 2), np.nan, np.float32)
-        self.td1 = np.zeros(cap, np.uint8)
+        for name, _, dtype, shape in ROW_COLUMNS:
+            setattr(self, name, np.empty((cap, *shape), dtype=dtype))
+        self.written_at = np.empty(cap, np.float64)
+        self.pgroup_count = np.empty(cap, np.int32)
 
         self.acts = 0
         self.cells = 0
@@ -90,13 +111,15 @@ class Buffer:
         self.cfgs = 0
         self.lo = 0
 
-    def add(self, x, cc, cw, cy, coff, soff, source, truth, outcome, created,
-            td1, pol=None):
+    def add(self, x, cols, cc, cw, cy, coff, soff, pol=None):
         n = len(x)
         if not x.flags.writeable:
             x = x.copy()
         lens = np.diff(coff).reshape(n, 2)
         m = len(cw)
+        for name, _, _, _ in ROW_COLUMNS:
+            if name not in cols:
+                raise ValueError(f"missing replay row column {name!r}")
         if pol is None:
             na = nc = 0
             group_counts = np.zeros(n, np.int32)
@@ -125,6 +148,8 @@ class Buffer:
             self.x[ring] = torch.as_tensor(x[i:j], device=self.device)
             self.cstart[ring] = starts[i:j]
             self.clen[ring] = lens[i:j]
+            for name, _, _, _ in ROW_COLUMNS:
+                getattr(self, name)[ring] = cols[name][i:j]
             self.pgroup_count[ring] = group_counts[i:j]
             if pol is None:
                 self.pastart[ring] = self.acts
@@ -132,11 +157,6 @@ class Buffer:
                 self.pcstart[ring] = self.cells
                 self.pclen[ring] = 0
             self.written_at[ring] = now
-            self.created_at[ring] = created[i:j]
-            self.source[ring] = source[i:j]
-            self.truth[ring] = truth[i:j]
-            self.outcome[ring] = outcome[i:j]
-            self.td1[ring] = td1[i:j]
 
         sl = (np.arange(m) + self.cfgs) % self.ccap
         self.cc[sl] = torch.as_tensor(cc, device=self.device)
@@ -269,26 +289,11 @@ class Buffer:
         hi = max(self.lo + 1, self.rows - span)
         return self.gather(rng.integers(self.lo, hi, size=batch))
 
-    def replay_stats(self):
-        ids = np.arange(self.lo, self.rows, dtype=np.int64) % self.cap
-        n = max(len(ids), 1)
-        source = np.bincount(self.source[ids], minlength=3)
-        configs = self.clen[ids].sum(dtype=np.int64)
-        return {
-            "replay_warm_frac": source[0] / n,
-            "replay_play_frac": source[1] / n,
-            "replay_query_frac": source[2] / n,
-            "replay_td1_row_frac": float(self.td1[ids].sum()) / n,
-            "replay_td1_target_frac": 2.0 * self.td1[ids].sum()
-            / max(configs, 1),
-            "target_age_max": (time.time() - self.created_at[ids].min()
-                               if len(ids) else 0.0),
-        }
-
     def sample_calibration(self, batch, rng):
-        """Rows with game outcomes and their true-config indices."""
+        """Rows owned by a game, with their true-config indices."""
         ids = np.arange(self.lo, self.rows, dtype=np.int64)
-        ids = ids[np.isfinite(self.outcome[ids % self.cap, 0])]
+        ring = ids % self.cap
+        ids = ids[self.source[ring] != SOURCE_QUERY]
         if not len(ids):
             return None
         ids = rng.choice(ids, size=min(batch, len(ids)), replace=False)
@@ -299,8 +304,10 @@ class Buffer:
         at = np.empty(2 * len(ids), np.int64)
         at[0::2] = start + self.truth[ring, 0]
         at[1::2] = start + lens[:, 0] + self.truth[ring, 1]
-        return parts, at, self.outcome[ring].ravel()
+        outcome = self.outcome[ring]
+        return parts, at, np.stack((outcome, -outcome), axis=1).ravel()
 
     def ordered(self):
-        """Return live raw payload oldest-first, as host arrays."""
-        return _to_numpy(self._gather(np.arange(self.lo, self.rows)))
+        """Return dump columns oldest-first, as host arrays."""
+        raw = _to_numpy(self._gather(np.arange(self.lo, self.rows)))
+        return Columns(*raw[:6])

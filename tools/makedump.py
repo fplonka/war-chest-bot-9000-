@@ -65,17 +65,18 @@ def main():
         print(f"  {got}/{args.solves} solves, {got / (time.time() - start):.1f}/s",
               flush=True)
 
-    x, cc, cp, cw, cy, seg, _ = buf.ordered()
+    columns = buf.ordered()
     lo = buf.lo
     soff = np.concatenate([[0],
                            buf.soff[(buf.soff > lo) & (buf.soff < buf.rows)] - lo,
-                           [len(x)]])
-    np.savez(args.out, rows=x, cc=cc, cp=cp, cw=cw, cy=cy, seg=seg, soff=soff,
+                           [len(columns.rows)]])
+    np.savez(args.out, rows=columns.rows, cc=columns.cc, cp=columns.cp,
+             cw=columns.cw, cy=columns.cy, seg=columns.seg, soff=soff,
              pubfeat=np.int32(PUBFEAT), cfeat=np.int32(CFEAT),
              ccounts=np.int32(CCOUNTS), cnorm=np.float32(CNORM),
              row_bytes=np.int32(ROW_BYTES),
              rules_hash=np.uint64(warchest.rules_table_hash()))
-    print(f"wrote {args.out}: {len(x)} rows, {len(soff) - 1} solves")
+    print(f"wrote {args.out}: {len(columns.rows)} rows, {len(soff) - 1} solves")
 
 
 if __name__ == "__main__":

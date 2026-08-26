@@ -43,7 +43,7 @@ def empty_policy():
 @torch.no_grad()
 def evaluate(net, parts, dev):
     batch = make_batch(parts, dev)
-    value = losses(net, *batch)
+    value = losses(net, *batch, stats={})[0]
     rms = torch.sqrt(torch.mean((forward_values(net, batch) - batch[4]) ** 2))
     return float(value), float(rms)
 
@@ -76,15 +76,15 @@ def main():
     cy = np.clip(np.asarray(d["cy"], np.float32), -1.0, 1.0)
     coff = np.asarray(d["coff"], np.int64)
     soff = np.asarray(d["soff"], np.int64)
-    query = np.asarray(d["query"], np.uint8)
-    source = np.where(query != 0, 2, 1).astype(np.uint8)
-    truth = np.asarray(d["truth"], np.uint32).reshape(-1, 2)
-    outcome = np.asarray(d["outcome"], np.float32).reshape(-1, 2)
-    created = np.asarray(d["created"], np.float64)
-    td1 = np.asarray(d["td1"], np.uint8)
-    replay = (rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff,
-              soff, source, truth, outcome, created, td1)
-    buf.add(*replay)
+    cols = {
+        "source": np.asarray(d["source"], np.uint8),
+        "truth": np.asarray(d["truth"], np.uint32).reshape(-1, 2),
+        "outcome": np.asarray(d["outcome"], np.float32),
+        "created_at": np.asarray(d["created"], np.float64),
+        "td1": np.asarray(d["td1"], np.uint8),
+    }
+    buf.add(rows, cols, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
+    replay = (rows, cols, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff)
     tiny = Buffer(max(n * 2, 8), max(n * 2, 8) * 48, dev)
     for _ in range(8):
         tiny.add(*replay)
@@ -92,11 +92,12 @@ def main():
     tiny.clear()
     assert tiny.soff.size == 0
     dump_path = f"{out}/buffer.npz"
-    got, gcc, gcp, gcw, gcy, gseg, _ = buf.ordered()
+    ordered = buf.ordered()
     lo = buf.lo
     gsoff = np.concatenate([[0], buf.soff[(buf.soff > lo) & (buf.soff < buf.rows)] - lo,
-                            [len(got)]])
-    np.savez(dump_path, rows=got, cc=gcc, cp=gcp, cw=gcw, cy=gcy, seg=gseg,
+                            [len(ordered.rows)]])
+    np.savez(dump_path, rows=ordered.rows, cc=ordered.cc, cp=ordered.cp,
+             cw=ordered.cw, cy=ordered.cy, seg=ordered.seg,
              soff=gsoff, pubfeat=np.int32(PUBFEAT), cfeat=np.int32(CFEAT),
              ccounts=np.int32(CCOUNTS), cnorm=np.float32(CNORM),
              row_bytes=np.int32(ROW_BYTES),
@@ -131,7 +132,7 @@ def main():
     seen = []
     for _ in range(10):
         parts = make_batch(tr, dev)
-        value = losses(net, *parts)
+        value = losses(net, *parts, stats={})[0]
         opt.zero_grad(set_to_none=True)
         value.backward()
         opt.step()

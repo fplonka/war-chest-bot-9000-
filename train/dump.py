@@ -30,6 +30,7 @@ refused. `ROW_BYTES` / `PUBFEAT` / `CCOUNTS` pin the layout.
 import numpy as np
 
 import warchest
+from replay import Columns
 
 
 class Dump:
@@ -54,9 +55,10 @@ class Dump:
     def rows(self, lo, hi):
         """Rows `[lo, hi)` as a self-contained batch, `seg` renumbered from 0."""
         a, b = int(self.row_start[lo]), int(self.row_start[hi])
-        return (self.x[lo:hi], self.cc[a:b], self.cp[a:b],
-                self.cw[a:b].astype(np.float32), self.cy[a:b].astype(np.float32),
-                self.seg[a:b] - 2 * lo)
+        return Columns(
+            self.x[lo:hi], self.cc[a:b], self.cp[a:b],
+            self.cw[a:b].astype(np.float32), self.cy[a:b].astype(np.float32),
+            self.seg[a:b] - 2 * lo)
 
     def check(self, pubfeat, ccounts):
         if self.pubfeat != pubfeat or self.ccounts != ccounts:
@@ -88,5 +90,6 @@ def subset(parts, ids):
     # `ids` must be sorted for the renumbering below to stay in row order.
     newid = np.full(len(rows), -1, np.int64)
     newid[ids] = np.arange(len(ids))
-    return (rows[ids], cc[keep], cp[keep], cw[keep], cy[keep],
-            2 * newid[row[keep]] + (seg[keep] & 1))
+    return Columns(
+        rows[ids], cc[keep], cp[keep], cw[keep], cy[keep],
+        2 * newid[row[keep]] + (seg[keep] & 1))

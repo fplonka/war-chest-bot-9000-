@@ -51,13 +51,15 @@ def synth_parts(n, ncfg, na, ncells, seed=0):
     pci = np.tile(np.arange(ncells) % ncfg, n).astype(np.uint16)
     pact = np.tile(np.arange(ncells) % na, n).astype(np.uint16)
     pprob = np.full(n * ncells, 1.0 / ncells, np.float32)
-    source = np.ones(n, np.uint8)
-    truth = np.zeros((n, 2), np.uint32)
-    outcome = np.full((n, 2), np.nan, np.float32)
-    created = np.zeros(n, np.float64)
-    td1 = np.zeros(n, np.uint8)
+    cols = {
+        "source": np.ones(n, np.uint8),
+        "truth": np.zeros((n, 2), np.uint32),
+        "outcome": np.zeros(n, np.float32),
+        "created_at": np.zeros(n, np.float64),
+        "td1": np.zeros(n, np.uint8),
+    }
     pol = (pa, paoff, pcoff, pci, pact, pprob)
-    return rows, cc, cw, cy, coff, soff, source, truth, outcome, created, td1, pol
+    return rows, cols, cc, cw, cy, coff, soff, pol
 
 
 def main():
@@ -97,15 +99,11 @@ def main():
         return net(xpub, phi, w, seg, nseg)
 
     def new_stats():
-        return {
-            "zero_sum_max": torch.zeros((), device=dev),
-            "zero_sum_square_sum": torch.zeros((), device=dev),
-            "zero_sum_n": 0,
-        }
+        return {}
 
     def fwd_policy():
         return losses(net, xpub, phi, w, seg, y, nseg, policy=policy,
-                      wp=0.05, stats=new_stats())
+                      wp=0.05, stats=new_stats())[0]
 
     def step():
         opt.zero_grad(set_to_none=True)
@@ -158,7 +156,7 @@ def main():
 
         def compiled_step():
             opt.zero_grad(set_to_none=True)
-            compiled_sog().backward()
+            compiled_sog()[0].backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0)
             opt.step()
         stage("full step (torch.compile)", compiled_step, iters=30)

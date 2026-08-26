@@ -112,6 +112,42 @@ pub enum Collect {
     Sog,
 }
 
+pub const SOURCE_WARM: u8 = 0;
+pub const SOURCE_PLAY: u8 = 1;
+pub const SOURCE_QUERY: u8 = 2;
+
+macro_rules! row_columns {
+    ($($name:ident: $ty:ty),+ $(,)?) => {
+        #[derive(Clone, Copy)]
+        struct Row {
+            $( $name: $ty, )+
+        }
+
+        #[derive(Default)]
+        pub struct RowColumns {
+            $( pub $name: Vec<$ty>, )+
+        }
+
+        impl RowColumns {
+            fn push(&mut self, row: Row) {
+                $( self.$name.push(row.$name); )+
+            }
+
+            fn merge(&mut self, other: Self) {
+                $( self.$name.extend(other.$name); )+
+            }
+        }
+    };
+}
+
+row_columns! {
+    source: u8,
+    truth: [u32; 2],
+    outcome: f32,
+    created: f64,
+    td1: u8,
+}
+
 /// One training row is a public state plus, for each player, that player's
 /// whole belief: the exact configs in support, their probabilities, and the
 /// value the solve gave each one. Nothing is projected onto a fixed-width
@@ -126,6 +162,8 @@ pub struct Data {
     /// row is expanded when a batch is made, so the stored bytes never go
     /// stale as the network changes.
     pub rows: Vec<u8>,
+    /// Per-row metadata shared with the Python replay buffer.
+    pub columns: RowColumns,
     /// `[total_configs, CCOUNTS]` raw counts per config, in the arena order.
     /// Raw rather than normalised: they are `u8`-valued, and storing them that
     /// way is what keeps a replay row small enough to hold millions of them.
@@ -155,16 +193,9 @@ pub struct Data {
     pub pcell: Vec<u16>,
     pub pprob: Vec<f32>,
 
-    /// Per row and seat: realised config within that seat's support, and final
-    /// game outcome. Query rows use `u32::MAX` and NaN because no game owns them.
-    pub truth: Vec<u32>,
-    pub outcome: Vec<f32>,
-    /// Unix time when the solve produced this row. Main-line rows can wait for
-    /// their game's outcome before Python receives them.
-    pub created: Vec<f64>,
-    /// One for a query row and one for a main-line row selected for TD(1).
-    pub query: Vec<u8>,
-    pub td1: Vec<u8>,
+    /// Per-row columns use `SOURCE_QUERY` for coverage rows. Other rows belong
+    /// to a game and carry its source, true configs, and White's outcome;
+    /// Black's outcome is its negation.
     /// Decisions by coarse move class, for the run report's strategy mix.
     pub plays: [usize; 7],
 
@@ -192,6 +223,7 @@ impl Data {
     pub fn merge(&mut self, o: Data) {
         let base = self.cw.len() as u32;
         self.rows.extend(o.rows);
+        self.columns.merge(o.columns);
         self.cc.extend(o.cc);
         self.cw.extend(o.cw);
         self.cy.extend(o.cy);
@@ -210,11 +242,6 @@ impl Data {
         self.pci.extend(o.pci);
         self.pcell.extend(o.pcell);
         self.pprob.extend(o.pprob);
-        self.truth.extend(o.truth);
-        self.outcome.extend(o.outcome);
-        self.created.extend(o.created);
-        self.query.extend(o.query);
-        self.td1.extend(o.td1);
         self.paoff.extend(o.paoff.iter().skip(tail).map(|x| x + ab));
         self.pcoff.extend(o.pcoff.iter().skip(tail).map(|x| x + cb));
         let rb = self.nv as u32;
@@ -249,6 +276,7 @@ impl Data {
         bel: &[Belief; 2],
         y: [&[f32]; 2],
         policy: &crate::search::Policy,
+        source: u8,
     ) {
         debug_assert!(
             s.is_valued(),
@@ -292,16 +320,18 @@ impl Data {
             self.coff.push(self.cw.len() as u32);
         }
         *self.pcoff.last_mut().expect("row offset") = self.pcell.len() as u32;
-        self.truth.extend([u32::MAX; 2]);
-        self.outcome.extend([f32::NAN; 2]);
-        self.created.push(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock is before Unix epoch")
-                .as_secs_f64(),
-        );
-        self.query.push(0);
-        self.td1.push(0);
+        debug_assert!(source <= SOURCE_QUERY, "unknown replay row source {source}");
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is before Unix epoch")
+            .as_secs_f64();
+        self.columns.push(Row {
+            source,
+            truth: [0; 2],
+            outcome: 0.0,
+            created,
+            td1: 0,
+        });
         self.nv += 1;
     }
 
@@ -418,8 +448,8 @@ pub fn keep_query(
         &sv.root_belief,
         [&solved.value[0], &solved.value[1]],
         &Default::default(),
+        SOURCE_QUERY,
     );
-    *out.query.last_mut().expect("query row") = 1;
     out.queries += 1;
     solved.queries
 }
@@ -531,10 +561,11 @@ impl Game {
                             &self.bel,
                             [&y0, &y1],
                             &np.to_replay(),
+                            SOURCE_WARM,
                         );
                         let row = self.data.nv - 1;
                         for p in 0..2 {
-                            self.data.truth[2 * row + p] = self.true_index(p) as u32;
+                            self.data.columns.truth[row][p] = self.true_index(p) as u32;
                         }
                     }
                     self.play(np);
@@ -570,13 +601,14 @@ impl Game {
                 &self.bel,
                 [&solved.value[0], &solved.value[1]],
                 &solved.policy,
+                SOURCE_PLAY,
             );
             self.queries.extend(solved.queries);
             // The row is stored under the belief that is about to be updated,
             // so the seats' realised configs are read here and not at `finish`.
             let row = self.data.nv - 1;
             for p in 0..2 {
-                self.data.truth[2 * row + p] = self.true_index(p) as u32;
+                self.data.columns.truth[row][p] = self.true_index(p) as u32;
             }
         }
         self.play(policy::root(sv));
@@ -630,15 +662,14 @@ impl Game {
         // cut at the play cap is calibrated against its marker-lead score.
         let z = [self.s.utility(0), self.s.utility(1)];
         for r in 0..self.data.nv {
-            for (p, &outcome) in z.iter().enumerate() {
-                self.data.outcome[2 * r + p] = outcome;
-            }
+            self.data.columns.outcome[r] = z[0];
             if self.gc.p_td1 <= 0.0 || self.rng.unit_f64() >= self.gc.p_td1 as f64 {
                 continue;
             }
-            self.data.td1[r] = 1;
+            self.data.columns.td1[r] = 1;
             for p in 0..2 {
-                let at = self.data.row_span(r, p).start + self.data.truth[2 * r + p] as usize;
+                let at = self.data.row_span(r, p).start
+                    + self.data.columns.truth[r][p] as usize;
                 self.data.cy[at] = z[p];
             }
         }
@@ -1017,6 +1048,7 @@ mod target_tests {
                 bel,
                 [&solved.value[0], &solved.value[1]],
                 &solved.policy,
+                SOURCE_PLAY,
             );
 
             let actor = s.to_act() as usize;
@@ -1105,7 +1137,7 @@ mod target_tests {
             g.play_solved(&sv, solved);
         }
         let before = g.data.cy.clone();
-        let truth = g.data.truth.clone();
+        let truth = g.data.columns.truth.clone();
         let z = [g.s.utility(0), g.s.utility(1)];
         assert_eq!(z[0], -z[1], "the outcome is not zero sum");
         assert_ne!(z[0], 0.0, "a level game leaves the sign untested; pick a seed");
@@ -1118,7 +1150,7 @@ mod target_tests {
         for r in 0..d.nv {
             for p in 0..2 {
                 let span = d.row_span(r, p);
-                let at = span.start + truth[2 * r + p] as usize;
+                let at = span.start + truth[r][p] as usize;
                 assert!(at < span.end, "row {r} seat {p}: truth outside the support");
                 for i in span {
                     if i == at {
@@ -1138,6 +1170,8 @@ mod target_tests {
             query_cy[..],
             "the game's outcome was written into a query row"
         );
+        assert_eq!(out.columns.source[0], SOURCE_QUERY);
+        assert_eq!(out.columns.outcome[0], 0.0);
 
         // And on the path a run actually drives: while an outcome is owed, the
         // counters come out every solve and the rows do not.

@@ -240,10 +240,6 @@ def health(eps):
                  f"{last.get('value_outcome_rmse', 0):.3f} / "
                  f"{last.get('value_outcome_corr', 0):.3f}"),
                 ("search KL from prior", f"{last.get('policy_search_kl', 0):.3f}"),
-                ("replay warm / play / query",
-                 f"{last.get('replay_warm_frac', 0):.0%} / "
-                 f"{last.get('replay_play_frac', 0):.0%} / "
-                 f"{last.get('replay_query_frac', 0):.0%}"),
                 ("target age p90 / oldest",
                  f"{last.get('sample_age_p90', 0) / 60:.1f} / "
                  f"{last.get('target_age_max', 0) / 60:.1f} min"),

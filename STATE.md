@@ -53,3 +53,13 @@ reference is `runs/base_b256`, 319652 solves at 197.8 solves/s.
 Local syntax, compile, and diff checks pass. The remote host test for policy
 arena indexing passes, including 16k-row and fat-wrap cases. No local bot,
 solver, or training binary has been run.
+
+## Driver additions in progress
+
+Refactor the replay row schema and Rust data export first: named dump columns,
+source-owned rows, one stored outcome, and one schema-driven Buffer write.
+Then remove per-source delay accumulators, make losses return `(loss, stats)`,
+remove full-buffer replay scans, and simplify deadline and batch APIs. Re-measure
+on the box after each change group. Only then enable guarded default-mode
+`torch.compile` if the actual step benchmark wins, and run the short and gate
+runs. Never touch jobs started by another session.
