@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 use warchest::pbs::*;
 use warchest::rng::Rng;
-use warchest::search::{node_actions, Budget, Cfg, Cfr, Ent, Nets, Solver, StopReason};
+use warchest::net::Net;
+use warchest::search::{node_actions, Budget, Cfg, Cfr, Ent, Solver, StopReason};
 use warchest::selfplay::make_game;
 use warchest::state::{Cont, State, MAX_MAIN_PLAYS, Z_BAG, Z_FACEDOWN, Z_HAND};
 use warchest::units::{
@@ -189,7 +190,7 @@ const CFG_CAP: usize = 3;
 
 #[test]
 fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
-    let nets = Arc::new(Nets::default());
+    let nets = Arc::new(Net::default());
     let cfg = Cfg {
         s: 200,
         c: 1.0,
@@ -327,7 +328,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
 /// `exhausted` exists to stop.
 #[test]
 fn a_solve_stops_expanding_once_the_tree_is_exhausted() {
-    let nets = Arc::new(Nets::default());
+    let nets = Arc::new(Net::default());
     // Far more expansions than the whole subgame holds.
     let cfg = Cfg { s: 4_000, c: 1.0, budget: Budget::unbounded(), ..Default::default() };
     let mut checked = 0;
@@ -438,7 +439,7 @@ fn draw_position(seed: u64, warmup: usize, plies: u16) -> Option<State> {
 /// brute-force enumeration in `pbs.rs`.
 #[test]
 fn draw_pass_through_consistency() {
-    let nets = Arc::new(Nets::default());
+    let nets = Arc::new(Net::default());
     let mut checked = 0;
     let mut cnt = [0usize; 5]; // 0 rejected, 1 built, 2 toolarge, 3 nochance, 4 solved
     for seed in 0..4000u64 {
@@ -570,7 +571,7 @@ fn draw_pass_through_consistency() {
 #[test]
 fn warrior_priest_draw_walks_through_the_tree() {
     use warchest::state::Z_BAG;
-    let nets = Arc::new(Nets::default());
+    let nets = Arc::new(Net::default());
     // White: WP at W1, enemy at E1. Hand holds one WP coin (the trigger);
     // the bag holds a WP coin and a Swordsman coin, so a draw can leave
     // either of two pendings. The root belief carries two configs so the
@@ -718,7 +719,7 @@ fn warrior_priest_draw_walks_through_the_tree() {
 
 #[test]
 fn expanding_a_coin_play_stops_at_micro_decisions() {
-    let nets = Arc::new(Nets::default());
+    let nets = Arc::new(Net::default());
     let mut rng = Rng::new(1234);
     for _ in 0..400 {
         let mut s = make_game(&mut rng, false);
@@ -766,7 +767,7 @@ fn expanding_a_coin_play_stops_at_micro_decisions() {
 /// positions want, so every term's guard is exercised.
 #[test]
 fn a_solve_never_grows_past_its_budget() {
-    let nets = Arc::new(Nets::default());
+    let nets = Arc::new(Net::default());
     let budget = Budget {
         nodes: 512,
         rows: 256,
@@ -860,7 +861,7 @@ fn tight_in(e: Ent) -> Budget {
 /// grow the contract past the cap.
 #[test]
 fn a_solve_fits_a_budget_tight_in_one_entity() {
-    let nets = Arc::new(Nets::default());
+    let nets = Arc::new(Net::default());
     for e in Ent::ALL {
         let budget = tight_in(e);
         let cfg = Cfg { s: 512, c: 1.0, budget, ..Default::default() };

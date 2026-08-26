@@ -353,78 +353,81 @@ pub const CARD_ROWS: usize = 2;
 
 /// What actually runs a round's batch.
 ///
-/// A run always uses the device. `Reference` is the CPU network answering each
-/// call on its own — the oracle the device is held to in the parity test, and
-/// what the farm's own tests drive. It is deliberately not a fallback: a run
-/// that cannot reach a GPU should fail, not quietly become a hundred times
-/// slower.
+/// A run always uses CUDA. The reference variant exists only in unit tests.
 pub enum Backend {
     #[cfg(feature = "gpu")]
     Cuda(crate::cuda::Device),
+    #[cfg(test)]
     Reference(Net),
 }
 
 impl Backend {
     pub fn run(&self, calls: &[Call], #[allow(unused)] card: usize) -> Option<Vec<Reply>> {
         match self {
-            // Every call in a round is independent, and this is the only
-            // thread the reference backend has anything for.
+            #[cfg(test)]
             Backend::Reference(net) => Some(calls.par_iter().map(|c| c.run(net)).collect()),
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.run(calls, card),
+            #[cfg(not(feature = "gpu"))]
+            _ => unreachable!(),
         }
     }
 
     /// How many GPUs this backend has, and so how many queues the farm runs.
     pub fn cards(&self) -> usize {
         match self {
+            #[cfg(test)]
             Backend::Reference(_) => 1,
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.cards(),
+            #[cfg(not(feature = "gpu"))]
+            _ => unreachable!(),
         }
     }
 
     /// Cards per GPU. Two, so one set can grow while the other iterates.
     pub fn pipelines(&self) -> usize {
         match self {
+            #[cfg(test)]
             Backend::Reference(_) => 1,
             #[cfg(feature = "gpu")]
             Backend::Cuda(_) => crate::cuda::PIPELINE,
+            #[cfg(not(feature = "gpu"))]
+            _ => unreachable!(),
         }
     }
 
     /// Slots this card holds. Admission pops one; none free means wait.
     pub fn slots(&self, #[allow(unused)] card: usize) -> usize {
         match self {
+            #[cfg(test)]
             Backend::Reference(_) => 0,
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.slots(card),
+            #[cfg(not(feature = "gpu"))]
+            _ => unreachable!(),
         }
     }
 
     pub fn slot_bytes(&self) -> usize {
         match self {
+            #[cfg(test)]
             Backend::Reference(_) => 0,
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.slot_bytes(),
+            #[cfg(not(feature = "gpu"))]
+            _ => unreachable!(),
         }
     }
 
     pub fn slots_per_card(&self) -> usize {
         match self {
+            #[cfg(test)]
             Backend::Reference(_) => 0,
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.slots_per_card(),
-        }
-    }
-
-    /// Whether this backend runs the CFR loop itself rather than answering
-    /// network calls alone.
-    pub fn keeps_the_solve(&self) -> bool {
-        match self {
-            Backend::Reference(_) => false,
-            #[cfg(feature = "gpu")]
-            Backend::Cuda(_) => true,
+            #[cfg(not(feature = "gpu"))]
+            _ => unreachable!(),
         }
     }
 
@@ -432,9 +435,12 @@ impl Backend {
     /// still does itself.
     pub fn net(&self) -> &Net {
         match self {
+            #[cfg(test)]
             Backend::Reference(net) => net,
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.net(),
+            #[cfg(not(feature = "gpu"))]
+            _ => unreachable!(),
         }
     }
 
@@ -443,12 +449,15 @@ impl Backend {
     /// for a change that touches three arrays.
     pub fn set_net(&mut self, net: Net) -> Result<(), String> {
         match self {
+            #[cfg(test)]
             Backend::Reference(old) => {
                 *old = net;
                 Ok(())
             }
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.set_weights(net),
+            #[cfg(not(feature = "gpu"))]
+            _ => unreachable!(),
         }
     }
 }
@@ -612,7 +621,7 @@ impl Source {
     }
 
     /// The next solve this source wants run.
-    fn next(&mut self, work: &Work, nets: &Arc<crate::search::Nets>, out: &mut Data) -> Solver {
+    fn next(&mut self, work: &Work, nets: &Arc<crate::net::Net>, out: &mut Data) -> Solver {
         match (self, work) {
             (Source::Play(stream), _) => stream.next_solve(nets, out),
             (Source::Roots { at, rng }, Work::Roots { roots, cfg, recursive_rate }) => {
@@ -677,7 +686,7 @@ pub struct Farm {
     backend: Arc<RwLock<Backend>>,
     /// The copy a solve reads for the work it still does itself. Replaced
     /// whole, so a solve that has started keeps the weights it started with.
-    nets: Arc<RwLock<Arc<crate::search::Nets>>>,
+    nets: Arc<RwLock<Arc<crate::net::Net>>>,
     collected: Arc<Mutex<Vec<Data>>>,
     workers: Vec<JoinHandle<()>>,
     drivers: Vec<JoinHandle<()>>,
@@ -757,18 +766,14 @@ impl Farm {
         assert!(workers > 0, "a farm needs at least one worker");
         let gpus = backend.cards();
         let pipes = backend.pipelines();
-        let cuda = backend.keeps_the_solve();
         let per_gpu: Vec<usize> = (0..gpus)
-            .map(|g| if cuda { backend.slots(g) } else { workers })
+            .map(|g| backend.slots(g))
             .collect();
         let n_slots: usize = per_gpu.iter().sum();
         let slot_bytes = backend.slot_bytes();
         let slots_per_card = backend.slots_per_card();
         let work = Arc::new(work);
-        let nets = Arc::new(RwLock::new(Arc::new(crate::search::Nets {
-            value: backend.net().clone(),
-            device: backend.keeps_the_solve(),
-        })));
+        let nets = Arc::new(RwLock::new(Arc::new(backend.net().clone())));
         let ready = Arc::new(Queue::default());
         let device: Vec<Arc<Queue<(Job, Vec<Call>)>>> =
             (0..gpus).map(|_| Arc::new(Queue::default())).collect();
@@ -850,8 +855,7 @@ impl Farm {
     /// so no round is ever evaluated against two different networks.
     pub fn publish(&mut self, net: Net) -> Result<(), String> {
         self.backend.write().set_net(net.clone())?;
-        let device = self.backend.read().keeps_the_solve();
-        *self.nets.write() = Arc::new(crate::search::Nets { value: net, device });
+        *self.nets.write() = Arc::new(net);
         Ok(())
     }
 
@@ -889,7 +893,7 @@ impl Farm {
     }
 
     /// The network the farm evaluates with.
-    pub fn value(&self) -> Arc<crate::search::Nets> {
+    pub fn value(&self) -> Arc<crate::net::Net> {
         Arc::clone(&*self.nets.read())
     }
 }
@@ -922,7 +926,7 @@ impl Drop for Farm {
 fn advance_job(
     mut job: Job,
     device: &[Arc<Queue<(Job, Vec<Call>)>>],
-    nets: &RwLock<Arc<crate::search::Nets>>,
+    nets: &RwLock<Arc<crate::net::Net>>,
     work: &Work,
     collected: &Mutex<Vec<Data>>,
     stopping: &AtomicBool,
@@ -975,7 +979,7 @@ fn drive_card(
     queue: &Queue<(Job, Vec<Call>)>,
     ready: &Queue<Job>,
     backend: &RwLock<Backend>,
-    nets: &RwLock<Arc<crate::search::Nets>>,
+    nets: &RwLock<Arc<crate::net::Net>>,
     work: &Work,
     stats: &Stats,
     broken: &AtomicBool,
@@ -1155,80 +1159,5 @@ impl Drop for Cards {
         for d in self.drivers.drain(..) {
             let _ = d.join();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::selfplay::{Agent, Collect};
-
-    /// Small random weights, so the network actually makes calls rather than
-    /// being skipped as absent.
-    fn small_net(seed: u64) -> Net {
-        let mut r = crate::rng::Rng::new(seed);
-        let l = crate::net::NetLayout::new();
-        let mut draw = |n: usize| -> Vec<f32> {
-            (0..n).map(|_| (r.unit_f64() as f32 - 0.5) * 0.2).collect()
-        };
-        let (w, b) = (draw(l.w_len), draw(l.b_len));
-        let mut ln = vec![0.0; l.ln_len];
-        for n in &l.norms {
-            ln[n.g..n.g + n.width].fill(1.0);
-        }
-        Net::from_flat(&w, &b, &ln).expect("small net")
-    }
-
-    /// Many solves in flight, one thing that evaluates for all of them: the
-    /// farm must produce well-formed rows, share a round between solves, and
-    /// shut down without stranding anyone.
-    #[test]
-    fn a_farm_batches_many_solves_into_one_round() {
-        const WORKERS: usize = 4;
-        let cfg = crate::search::Cfg { s: 8, c: 1.0, ..Default::default() };
-        let gc = GameCfg {
-            agents: [Agent::Sog { cfg }; 2],
-            collect: Collect::Sog,
-            explore: 0.1,
-            random_draft: true,
-            p_td1: 0.0,
-            query_rate: 0.9,
-            recursive_rate: 0.1,
-        };
-        let mut farm = Farm::new(5, WORKERS, Work::Play(gc), Backend::Reference(small_net(0x2E57)));
-        let data = farm.drive(48);
-        assert!(data.soff.len() >= 48, "only {} solves", data.soff.len());
-        assert_eq!(data.nv, data.soff.len(), "a solve must store one row");
-        assert_eq!(data.coff.len(), 2 * data.nv + 1, "ragged arena is malformed");
-        let read = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64;
-        let s = farm.stats();
-        assert!(read(&s.rounds) > 0.0, "no round ever ran");
-        assert!(read(&s.rows) > 0.0, "rounds carried no rows");
-        // The whole point: a round is one forward pass shared by every solve
-        // that was ready, not one pass per solve.
-        let calls = read(&s.calls) / read(&s.rounds);
-        assert!(calls > 2.0, "rounds averaged only {calls:.1} calls");
-    }
-
-    /// The population a farm holds is its slots, one solve each.
-    #[test]
-    fn a_farm_holds_one_solve_per_slot() {
-        const WORKERS: usize = 4;
-        let cfg = crate::search::Cfg { s: 8, c: 1.0, ..Default::default() };
-        let gc = GameCfg {
-            agents: [Agent::Sog { cfg }; 2],
-            collect: Collect::Sog,
-            explore: 0.1,
-            random_draft: true,
-            p_td1: 0.0,
-            query_rate: 0.9,
-            recursive_rate: 0.1,
-        };
-        let mut farm = Farm::new(5, WORKERS, Work::Play(gc), Backend::Reference(small_net(0x2E57)));
-        let got = farm.drive(24);
-        assert!(got.soff.len() >= 24, "only {} solves", got.soff.len());
-        let s = farm.stats();
-        assert_eq!(s.slots(), WORKERS as u64, "a reference farm is one slot a worker");
-        assert!(s.used() <= s.slots(), "{} used, {} slots", s.used(), s.slots());
     }
 }

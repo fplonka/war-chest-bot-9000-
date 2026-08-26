@@ -16,7 +16,6 @@ consecutive probes of one build. Here the threads walk one shuffled corpus on
 interleaved strides and cycle it, so the mix of costs in flight is the same at
 every moment and the same between two builds.
 
-    python tools/farmbench.py --make roots.bin --games 64
     python tools/farmbench.py --roots roots.bin --threads 72 --devices 0,1
 
 What it cannot do is claim a rate for a training run: the trainer holds a card,
@@ -35,21 +34,6 @@ from export_weights import load as load_checkpoint  # noqa: E402
 from value_net import Net  # noqa: E402
 
 KEYS = ("rounds", "round_calls", "round_rows", "round_nanos")
-
-
-def make(args):
-    n = warchest.save_roots(
-        args.games,
-        args.seed,
-        args.make,
-        cap=args.cap,
-        random_draft=PROD.random_draft,
-        explore=PROD.explore,
-        query_rate=args.query_rate,
-        recursive_rate=args.recursive_rate,
-        cpu=args.cpu,
-    )
-    print(f"wrote {n} roots to {args.make}")
 
 
 def bench(args, devices, threads):
@@ -99,11 +83,6 @@ def bench(args, devices, threads):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--roots", help="corpus to solve")
-    p.add_argument("--make", help="write a corpus here instead of benching")
-    p.add_argument("--cpu", action="store_true",
-                   help="accept the ~50x slower CPU path used by --make")
-    p.add_argument("--games", type=int, default=64, help="games to sample a corpus from")
-    p.add_argument("--cap", type=int, default=4096, help="roots to keep")
     p.add_argument("--threads", default="72")
     p.add_argument("--devices", default="0,1")
     p.add_argument("--seconds", type=float, default=60)
@@ -130,10 +109,8 @@ def main():
     if args.weights:
         net.load_state_dict(load_checkpoint(args.weights).state_dict())
     net.push()
-    if args.make:
-        return make(args)
     if not args.roots:
-        p.error("one of --roots or --make")
+        p.error("--roots is required")
     devices = [int(d) for d in args.devices.split(",")]
     for threads in (int(t) for t in args.threads.split(",")):
         bench(args, devices, threads)

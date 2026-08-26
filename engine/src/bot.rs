@@ -31,7 +31,8 @@ use crate::pbs::{
 use crate::rng::Rng;
 
 use crate::farm::Cards;
-use crate::search::{Cfg, Nets, Solver, Step};
+use crate::net::Net;
+use crate::search::{Cfg, Solver, Step};
 use std::sync::Arc;
 use crate::state::{Cont, State};
 
@@ -50,7 +51,7 @@ pub enum Mind {
 /// network it thinks with. Shared across all live games and read-only.
 pub struct Brain {
     pub mind: Mind,
-    pub nets: Arc<Nets>,
+    pub net: Arc<Net>,
     pub cfg: Cfg,
     /// The cards a solve runs on, when there are any. Without them a solve is
     /// answered by the CPU network where it is raised, which is a hundred
@@ -80,15 +81,12 @@ impl Brain {
         let mut sv = Solver::new(
             s,
             *ctx,
-            Arc::clone(&self.nets),
+            Arc::clone(&self.net),
             self.cfg,
             bel.clone(),
             Rng::new(rng.next_u64()),
         );
         match &self.cards {
-            None => {
-                sv.run_alone();
-            }
             Some(cards) => {
                 let seat = cards.seat();
                 sv.pin(seat.slot);
@@ -99,6 +97,7 @@ impl Brain {
                         .expect("a card failed while a solve was still running");
                 }
             }
+            None => unreachable!("SoG always has a device"),
         }
         policy::root(&sv)
     }
@@ -288,7 +287,7 @@ mod tests {
     fn brain() -> Brain {
         Brain {
             mind: Mind::Random,
-            nets: Arc::new(Nets::default()),
+            net: Arc::new(Net::default()),
             cfg: Cfg::default(),
             cards: None,
         }

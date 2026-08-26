@@ -3,6 +3,7 @@ name = "warchest-engine"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.78"
+autotests = false
 
 [lib]
 name = "warchest"
@@ -39,6 +40,14 @@ path = "src/bin/bench.rs"
 name = "bot"
 path = "src/bin/bot.rs"
 required-features = ["gpu"]
+
+[[test]]
+name = "invariants"
+path = "tests/invariants.rs"
+
+[[test]]
+name = "scenarios"
+path = "tests/scenarios.rs"
 
 [profile.release]
 lto = true

@@ -43,10 +43,11 @@
 
 use crate::actions::{Action, Play};
 use crate::board::NONE;
+use crate::net::Net;
 use crate::policy;
 use crate::pbs::*;
 use crate::rng::Rng;
-use crate::search::{Cfg, Nets, Solved, Solver};
+use crate::search::{Cfg, Solved, Solver};
 use crate::state::{Cont, State, BLACK, WHITE, Z_BAG, Z_FACEDOWN, Z_FACEUP};
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -379,7 +380,7 @@ fn draw_count(rng: &mut Rng, rate: f32) -> usize {
 
 /// A solve of one queued belief state, as a root in its own right.
 pub fn query_solver(
-    nets: &Arc<Nets>,
+    nets: &Arc<Net>,
     cfg: Cfg,
     recursive_rate: f32,
     s: &State,
@@ -495,7 +496,7 @@ impl Game {
     /// resolved here. Everything else about a decision waits for the solve,
     /// which is why the game is a state machine: the solve belongs to the farm
     /// and may be run on any core, or on a card, long after this returns.
-    pub fn next_solve(&mut self, nets: &Arc<Nets>) -> Option<Solver> {
+    pub fn next_solve(&mut self, nets: &Arc<Net>) -> Option<Solver> {
         loop {
             if self.s.is_terminal() {
                 return None;
@@ -708,7 +709,7 @@ impl GameStream {
     /// `recursive_rate`, so at the reference rates a turn each leaves the queue
     /// exactly where it started. An empty queue simply gives its turn back to
     /// self-play.
-    pub fn next_solve(&mut self, nets: &Arc<Nets>, out: &mut Data) -> Solver {
+    pub fn next_solve(&mut self, nets: &Arc<Net>, out: &mut Data) -> Solver {
         if self.query_turn {
             self.query_turn = false;
             if let Some(sv) = self.next_query(nets) {
@@ -736,7 +737,8 @@ impl GameStream {
     /// round shared with every other solve in flight. This is the same stream
     /// driven alone, which is what the single-process tools and the tests
     /// want.
-    pub fn generate(&mut self, nets: &Arc<Nets>, solves: usize) -> Data {
+    #[cfg(test)]
+    pub fn generate(&mut self, nets: &Arc<Net>, solves: usize) -> Data {
         assert!(solves > 0);
         let mut out = Data::default();
         while out.soff.len() < solves {
@@ -763,7 +765,7 @@ impl GameStream {
         }
     }
 
-    fn next_query(&mut self, nets: &Arc<Nets>) -> Option<Solver> {
+    fn next_query(&mut self, nets: &Arc<Net>) -> Option<Solver> {
         let (s, bel) = self.pending.pop_front()?;
         let Agent::Sog { cfg } = self.gc.agents[s.to_act() as usize] else {
             return None;
@@ -790,7 +792,8 @@ impl GameStream {
 }
 
 /// Play one game to the end. Returns the result from White's point of view.
-pub fn play_game(rng: Rng, nets: &Arc<Nets>, gc: &GameCfg, data: &mut Data) -> f32 {
+#[cfg(test)]
+pub fn play_game(rng: Rng, nets: &Arc<Net>, gc: &GameCfg, data: &mut Data) -> f32 {
     let mut g = Game::new(rng, gc);
     while let Some(mut sv) = g.next_solve(nets) {
         let solved = sv.run_alone();
@@ -800,6 +803,17 @@ pub fn play_game(rng: Rng, nets: &Arc<Nets>, gc: &GameCfg, data: &mut Data) -> f
     let d = g.take_data();
     data.merge(d);
     z
+}
+
+fn play_static_game(rng: Rng, net: &Arc<Net>, gc: &GameCfg, data: &mut Data) -> f32 {
+    let mut game = Game::new(rng, gc);
+    assert!(
+        game.next_solve(net).is_none(),
+        "SoG self-play runs through SolveFarm"
+    );
+    let value = game.finish();
+    data.merge(game.take_data());
+    value
 }
 pub(crate) fn resolve_chance(s: &mut State, player: u8, rng: &mut Rng) -> Action {
     debug_assert!(matches!(
@@ -854,10 +868,11 @@ fn worker_seed(seed: u64, i: usize) -> u64 {
 /// arise in ply order, and a tool that walks the file forward would otherwise
 /// have all its jobs march up that ordering together and see the workload
 /// deepen as it ran.
+#[cfg(test)]
 pub fn collect_roots(
     games: usize,
     seed: u64,
-    nets: &Arc<Nets>,
+    nets: &Arc<Net>,
     gc: &GameCfg,
     cap: usize,
 ) -> Vec<(State, [Belief; 2])> {
@@ -893,12 +908,12 @@ pub fn collect_roots(
 }
 
 /// Play `games` games in parallel, returning merged data and statistics.
-pub fn run_games(games: usize, seed: u64, nets: &Arc<Nets>, gc: &GameCfg) -> Data {
+pub fn run_games(games: usize, seed: u64, nets: &Arc<Net>, gc: &GameCfg) -> Data {
     (0..games)
         .into_par_iter()
         .fold(Data::default, |mut acc, i| {
             let rng = Rng::new(worker_seed(seed, i));
-            play_game(rng, nets, gc, &mut acc);
+            play_static_game(rng, nets, gc, &mut acc);
             acc
         })
         .reduce(Data::default, |mut a, b| {
@@ -1005,7 +1020,7 @@ mod target_tests {
     /// except as a loss that will not fall, which is why it is pinned here.
     #[test]
     fn a_stored_row_carries_the_root_average_policy() {
-        let nets = Arc::new(Nets { value: random_net(0x5EED), device: false });
+        let nets = Arc::new(random_net(0x5EED));
         let cfg = Cfg { s: 32, c: 4.0, ..Default::default() };
         let roots = positions(0x5EED, 3);
         assert!(!roots.is_empty(), "no roots to test against");
@@ -1086,7 +1101,7 @@ mod target_tests {
     /// and belongs to no game, so nothing may be written to it.
     #[test]
     fn a_finished_game_writes_its_outcome_where_the_seats_were() {
-        let nets = Arc::new(Nets { value: random_net(0x7D1), device: false });
+        let nets = Arc::new(random_net(0x7D1));
         let cfg = Cfg { s: 4, c: 1.0, ..Default::default() };
 
         // A query row, in the buffer the game will merge into.
@@ -1183,10 +1198,7 @@ mod target_tests {
     /// Fifty greedy games end by six markers, well before the play cap.
     #[test]
     fn fifty_greedy_games_end_by_markers() {
-        let nets = Arc::new(Nets {
-            value: random_net(1),
-            device: false,
-        });
+        let nets = Arc::new(random_net(1));
         let gc = greedy_cfg(Collect::None);
         let mut plays = Vec::new();
         let mut caps = 0usize;
@@ -1218,10 +1230,7 @@ mod target_tests {
     /// configs, and opposite between seats.
     #[test]
     fn a_static_row_is_antisymmetric_and_constant_across_configs() {
-        let nets = Arc::new(Nets {
-            value: random_net(2),
-            device: false,
-        });
+        let nets = Arc::new(random_net(2));
         let gc = greedy_cfg(Collect::Static);
         let mut data = Data::default();
         for i in 0..8 {

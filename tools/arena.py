@@ -51,19 +51,13 @@ WIN_MARKERS = 6
 
 
 def cuda_devices():
-    if os.environ.get("WARCHEST_CPU") == "1":
-        return []
     try:
         lines = subprocess.check_output(["nvidia-smi", "-L"], text=True).splitlines()
     except (OSError, subprocess.CalledProcessError) as error:
-        raise SystemExit(
-            "GPU inference is required, but nvidia-smi could not enumerate GPUs. "
-            "Set WARCHEST_CPU=1 only to force the ~50x slower CPU path.") from error
+        raise SystemExit("GPU inference is required, but nvidia-smi failed") from error
     devices = [f"cuda:{i}" for i, line in enumerate(lines) if line.startswith("GPU ")]
     if not devices:
-        raise SystemExit(
-            "GPU inference is required, but nvidia-smi found no GPUs. "
-            "Set WARCHEST_CPU=1 only to force the ~50x slower CPU path.")
+        raise SystemExit("GPU inference is required, but nvidia-smi found no GPUs")
     return devices
 
 
@@ -95,12 +89,7 @@ class Bot:
         if self.searching and devices is None:
             devices = cuda_devices()
         if self.searching and not devices:
-            if os.environ.get("WARCHEST_CPU") != "1":
-                raise SystemExit(
-                    f"{self.name}: GPU inference requires a device assignment. "
-                    "Set WARCHEST_CPU=1 only to force the ~50x slower CPU path.")
-            print("\n*** WARCHEST_CPU=1: CPU INFERENCE IS ~50x SLOWER. "
-                  "YOU DO NOT WANT THIS. ***\n", file=sys.stderr)
+            raise SystemExit(f"{self.name}: GPU inference requires a device assignment")
         self.solves = 0
         self.moves = 0
         if not os.access(self.dir / "bot", os.X_OK):

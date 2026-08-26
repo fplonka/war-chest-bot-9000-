@@ -46,7 +46,7 @@ use warchest::pbs::{
     ROW_BYTES,
 };
 use warchest::rng::Rng;
-use warchest::search::{Arenas, Budget, Cfg, Nets, Solved, Solver, Step};
+use warchest::search::{Arenas, Budget, Cfg, Solved, Solver, Step};
 use warchest::selfplay::{make_game, Agent, Collect, Data, GameCfg, GameStream};
 use warchest::state::State;
 
@@ -167,7 +167,8 @@ fn generate(
     streams: &[(u64, Cfg)],
     games: usize,
 ) -> Vec<Run> {
-    let nets = Arc::new(Nets { value: net.clone(), device: backend.keeps_the_solve() });
+    let nets = Arc::new(net.clone());
+    let reference = matches!(backend, Backend::Reference(_));
     let n = streams.len();
     let mut nodes: Vec<Vec<usize>> = (0..n).map(|_| Vec::new()).collect();
     let mut streams: Vec<GameStream> = streams
@@ -188,7 +189,12 @@ fn generate(
         let mut spans = vec![0usize; n];
         for i in 0..n {
             let Some(sv) = live[i].as_mut() else { continue };
-            match sv.advance(&replies[i]) {
+            let step = if reference {
+                sv.advance_on_host(&replies[i])
+            } else {
+                sv.advance(&replies[i])
+            };
+            match step {
                 Step::Calls(cs) => {
                     spans[i] = cs.len();
                     calls.extend(cs);
@@ -249,7 +255,7 @@ fn generate_one(net: &Net, backend: Backend, games: usize, s: u32, c: f32) -> Da
 /// Pinned to slot zero of card zero, which is where `Device::resident` then
 /// looks for it.
 fn one_solve(net: &Net, backend: &Backend, s: u32, c: f32) -> Solver {
-    let nets = Arc::new(Nets { value: net.clone(), device: backend.keeps_the_solve() });
+    let nets = Arc::new(net.clone());
     let mut data = Data::default();
     let sv = GameStream::new(0x51E5, game_cfg(s, c)).next_solve(&nets, &mut data);
     run_solve(backend, sv).0
@@ -260,7 +266,11 @@ fn run_solve(backend: &Backend, mut sv: Solver) -> (Solver, Option<Solved>) {
     sv.pin(0);
     let mut replies: Vec<Reply> = Vec::new();
     loop {
-        match sv.advance(&replies) {
+        let step = match backend {
+            Backend::Reference(_) => sv.advance_on_host(&replies),
+            Backend::Cuda(_) => sv.advance(&replies),
+        };
+        match step {
             Step::Calls(calls) => replies = backend.run(&calls, 0).expect("the backend answered"),
             Step::Done(solved) => return (sv, solved),
         }
@@ -274,7 +284,7 @@ fn run_solve(backend: &Backend, mut sv: Solver) -> (Solver, Option<Solved>) {
 fn a_solve_may_change_pipeline_streams() {
     let net = random_net(0x9E37);
     let device = Backend::Cuda(gpu(net.clone()));
-    let nets = Arc::new(Nets { value: net, device: true });
+    let nets = Arc::new(net);
     let fresh = || {
         let mut data = Data::default();
         GameStream::new(0x51E5, game_cfg(32, 0.0)).next_solve(&nets, &mut data)
@@ -448,7 +458,7 @@ fn growth_is_the_same_rule_as_the_reference() {
     let net = random_net(0x9E37);
     let device = Backend::Cuda(gpu(net.clone()));
     let Backend::Cuda(d) = &device else { unreachable!("just built") };
-    let nets = Arc::new(Nets { value: net.clone(), device: true });
+    let nets = Arc::new(net.clone());
     let streams = [
         (0x51E5u64, 128u32, 3.0f32),
         (0x0A13, 192, 5.0),
@@ -715,7 +725,7 @@ fn shared_round(
 #[test]
 fn a_ragged_round_does_not_move_the_small_solve() {
     let net = random_net(0x9E37);
-    let nets = Arc::new(Nets { value: net.clone(), device: true });
+    let nets = Arc::new(net.clone());
     // The solve under test: eight iterations over a tree that never grows, so
     // it is one round from beginning to end and the same one every time.
     let small = || {
@@ -929,8 +939,8 @@ fn the_resident_state_agrees_with_the_cpu_network() {
 #[test]
 fn a_subgame_scored_from_the_game_agrees_with_the_cpu() {
     let net = random_net(0x9E37);
-    let nets = Arc::new(Nets { value: net.clone(), device: true });
-    let host_nets = Arc::new(Nets { value: net.clone(), device: false });
+    let nets = Arc::new(net.clone());
+    let host_nets = Arc::new(net.clone());
     let backend = Backend::Cuda(gpu(net.clone()));
     let host = Backend::Reference(net.clone());
     let uniform = |s: &State, ctx: &Ctx, p: u8| {
@@ -1022,7 +1032,7 @@ fn k_iterates_together_match_k_iterates_alone() {
         8,
     )
     .expect("device");
-    let nets = Arc::new(Nets { value: net.clone(), device: true });
+    let nets = Arc::new(net.clone());
     let mut setup = Vec::new();
     let mut iterates = Vec::new();
     for i in 0..2 * K {

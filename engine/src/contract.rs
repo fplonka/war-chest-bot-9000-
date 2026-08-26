@@ -789,7 +789,8 @@ impl Contract {
 mod tests {
     use super::*;
     use crate::rng::Rng;
-    use crate::search::{Cfg, Nets};
+    use crate::net::Net;
+    use crate::search::Cfg;
     use std::sync::Arc;
     use crate::selfplay::{collect_roots, Agent, Collect, GameCfg};
     use crate::board::N_HEXES;
@@ -818,7 +819,7 @@ mod tests {
     /// tree `Solver::new` builds would pass a static test and fail in a solve.
     #[test]
     fn the_transposed_reach_reproduces_the_scatter_exactly() {
-        let nets = Arc::new(Nets { value: random_net(0x5EED), device: false });
+        let nets = Arc::new(random_net(0x5EED));
         let cfg = Cfg { s: 32, c: 4.0, ..Default::default() };
         let gc = GameCfg {
             agents: [Agent::Sog {
@@ -884,7 +885,7 @@ mod tests {
     /// the failure a device would actually have.
     #[test]
     fn a_solve_driven_from_the_description_reaches_the_same_strategy() {
-        let nets = Arc::new(Nets { value: random_net(0x5EED), device: false });
+        let nets = Arc::new(random_net(0x5EED));
         let cfg = Cfg {
             s: 48,
             c: 4.0,
@@ -997,7 +998,7 @@ mod tests {
     #[test]
     fn the_action_words_a_solve_sends_rebuild_its_one_hot() {
         use crate::net::{Net, AFEAT};
-        let nets = Arc::new(Nets { value: random_net(0x5EED), device: false });
+        let nets = Arc::new(random_net(0x5EED));
         let cfg = Cfg { s: 24, c: 2.0, ..Default::default() };
         let gc = GameCfg {
             agents: [Agent::Sog { cfg }; 2],
@@ -1066,7 +1067,7 @@ mod tests {
     /// way no downstream assertion notices.
     #[test]
     fn a_level_never_depends_on_itself() {
-        let nets = Arc::new(Nets { value: random_net(0x5EED), device: false });
+        let nets = Arc::new(random_net(0x5EED));
         let cfg = Cfg {
             s: 32,
             c: 4.0,
@@ -1145,7 +1146,7 @@ mod tests {
     /// equal the contract at every step.
     #[test]
     fn the_runs_a_solve_sends_rebuild_its_contract() {
-        let nets = Arc::new(Nets { value: random_net(0x5EED), device: false });
+        let nets = Arc::new(random_net(0x5EED));
         let cfg = Cfg { s: 40, c: 4.0, ..Default::default() };
         let gc = GameCfg {
             agents: [Agent::Sog { cfg: Cfg { s: 4, c: 1.0, ..cfg } }; 2],
@@ -1240,7 +1241,7 @@ mod tests {
     #[test]
 
     fn extending_a_contract_equals_rebuilding_it() {
-        let nets = Arc::new(Nets { value: random_net(0x5EED), device: false });
+        let nets = Arc::new(random_net(0x5EED));
         let cfg = Cfg {
             s: 40,
             c: 4.0,
@@ -1364,7 +1365,7 @@ mod tests {
     #[test]
     fn the_gathered_backprop_reproduces_the_scatter_exactly() {
         use crate::search::Back;
-        let nets = Arc::new(Nets { value: random_net(0x5EED), device: false });
+        let nets = Arc::new(random_net(0x5EED));
         let cfg = Cfg {
             s: 32,
             c: 4.0,

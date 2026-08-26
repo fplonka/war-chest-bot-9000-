@@ -53,14 +53,12 @@ def main():
     out = "/tmp/format_test"
     os.makedirs(out, exist_ok=True)
 
-    # A small random net so generation produces real (noisy) targets; the
-    # point is the plumbing, not the strength.
+    # The point is the replay plumbing, not search strength.
     net = Net()
     net.push()
 
     print("[1/6] generating rows (random drafts, WP included)", flush=True)
-    d = warchest.gen_data(1, 7, s=64, c=1.0,
-                          explore=0.25, random_draft=True, cpu=True)
+    d = warchest.gen_data(1, 7, explore=0.25, random_draft=True)
     n = len(d["rows"]) // ROW_BYTES
     assert n > 200, f"expected a few hundred rows, got {n}"
     print(f"      {n} rows, {len(d['cc']) // CCOUNTS} configs, "

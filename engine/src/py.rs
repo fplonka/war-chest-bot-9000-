@@ -488,7 +488,7 @@ impl Game {
 
 use crate::net::Net;
 use crate::farm::{Backend, Farm, Work};
-use crate::search::{Budget, Cfg, Cfr, Ent, Nets};
+use crate::search::{Budget, Cfg, Cfr, Ent};
 use crate::selfplay::{run_games, Agent, Collect, Data, GameCfg};
 use numpy::{IntoPyArray, PyReadonlyArray1};
 use parking_lot::RwLock;
@@ -498,16 +498,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// The live network. Empty until the trainer pushes weights: the
 /// phase plays with no network at all. One process holds one network — two
 /// checkpoints meet each other as two arena bots, not as two slots here.
-static NETS: LazyLock<RwLock<Arc<Nets>>> =
-    LazyLock::new(|| RwLock::new(Arc::new(Nets::default())));
+static NETS: LazyLock<RwLock<Arc<Net>>> =
+    LazyLock::new(|| RwLock::new(Arc::new(Net::default())));
 static NET_VERSION: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn nets() -> &'static RwLock<Arc<Nets>> {
+pub(crate) fn nets() -> &'static RwLock<Arc<Net>> {
     &NETS
 }
 
 fn check_nets() -> PyResult<()> {
-    if nets().read().value.is_empty() {
+    if nets().read().is_empty() {
         return Err(pyo3::exceptions::PyValueError::new_err("no weights pushed"));
     }
     Ok(())
@@ -522,7 +522,7 @@ fn set_weights(
 ) -> PyResult<()> {
     let value = Net::from_flat(w.as_slice()?, b.as_slice()?, ln.as_slice()?)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    *nets().write() = Arc::new(Nets { value, device: false });
+    *nets().write() = Arc::new(value);
     NET_VERSION.fetch_add(1, Ordering::Release);
     Ok(())
 }
@@ -534,7 +534,7 @@ fn set_weights(
 fn set_weights_bin(path: &str) -> PyResult<()> {
     let value = Net::load_bin(path)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}: {}", path, e)))?;
-    *nets().write() = Arc::new(Nets { value, device: false });
+    *nets().write() = Arc::new(value);
     NET_VERSION.fetch_add(1, Ordering::Release);
     Ok(())
 }
@@ -718,7 +718,7 @@ impl SolveFarm {
             }
         };
         let version = NET_VERSION.load(Ordering::Acquire);
-        let backend = backend_for(&devices, (**nets().read()).value.clone(), cfg)?;
+        let backend = backend_for(&devices, (**nets().read()).clone(), cfg)?;
         Ok(SolveFarm {
             farm: Farm::new(seed, workers, work, backend),
             net_version: version,
@@ -737,7 +737,7 @@ impl SolveFarm {
         let version = NET_VERSION.load(Ordering::Acquire);
         if self.net_version != version {
             self.farm
-                .publish((**nets().read()).value.clone())
+                .publish((**nets().read()).clone())
                 .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
             self.net_version = version;
         }
@@ -795,110 +795,28 @@ fn backend_for(
 
 /// Run `games` self-play games across all cores and return the training data.
 #[pyfunction]
-#[pyo3(signature = (games, seed, s=512, c=8.0, explore=0.25, random_draft=true, p_td1=0.0, cfr="sog", agent="sog", temp=2.0, cpu=false))]
+#[pyo3(signature = (games, seed, explore=0.25, random_draft=true, temp=2.0))]
 #[allow(clippy::too_many_arguments)]
 fn gen_data(
     py: Python<'_>,
     games: usize,
     seed: u64,
-    s: u32,
-    c: f32,
     explore: f32,
     random_draft: bool,
-    p_td1: f32,
-    cfr: &str,
-    agent: &str,
     temp: f32,
-    cpu: bool,
 ) -> PyResult<PyObject> {
-    let cfg = Cfg { s, c, cfr: cfr_of(cfr)?, budget: Budget::for_s(s), ..Default::default() };
-    let (agent, collect, p_td1) = match agent {
-        "sog" if cpu => {
-            eprintln!("\n*** cpu=True: CPU SELF-PLAY IS ~50x SLOWER. YOU DO NOT WANT THIS. ***\n");
-            (Agent::Sog { cfg }, Collect::Sog, p_td1)
-        }
-        "sog" => return Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "GPU self-play requires SolveFarm; pass cpu=True only for the ~50x slower test path",
-        )),
-        "greedy" => (Agent::Greedy { temp }, Collect::Static, 0.0),
-        other => {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown agent {other}"
-            )))
-        }
-    };
     let gc = GameCfg {
-        agents: [agent, agent],
-        collect,
+        agents: [Agent::Greedy { temp }; 2],
+        collect: Collect::Static,
         explore,
         random_draft,
-        p_td1,
-        // The batch generator takes a row at every decision already; the query
-        // solver belongs to the streaming generator.
+        p_td1: 0.0,
         query_rate: 0.0,
         recursive_rate: 0.0,
     };
     let n = Arc::clone(&nets().read());
     let d = py.allow_threads(|| run_games(games, seed, &n, &gc));
     data_to_dict(py, d)
-}
-
-/// Write a corpus of solve roots for the tools that need a fixed workload.
-///
-/// The rates belong to the caller because the corpus is only worth anything if
-/// it is the mix a real run solves: pass the run's own `query_rate` and
-/// `recursive_rate`, not a convenient number.
-///
-/// The search here decides which positions arise, not what a root *is*: a
-/// belief support comes from the draw history. So this runs a cheap search by
-/// default -- the corpus is generated on the cores, and a full-budget solve at
-/// every decision of every game takes the better part of an hour where a
-/// thirty-two expansion one takes a minute.
-#[pyfunction]
-#[pyo3(signature = (games, seed, path, cap=4096, random_draft=true, s=32, c=4.0,
-                    explore=0.1, query_rate=0.9, recursive_rate=0.1, cpu=false))]
-#[allow(clippy::too_many_arguments)]
-fn save_roots(
-    py: Python<'_>,
-    games: usize,
-    seed: u64,
-    path: &str,
-    cap: usize,
-    random_draft: bool,
-    s: u32,
-    c: f32,
-    explore: f32,
-    query_rate: f32,
-    recursive_rate: f32,
-    cpu: bool,
-) -> PyResult<usize> {
-    let query_rate = rate("query_rate", query_rate)?;
-    let recursive_rate = rate("recursive_rate", recursive_rate)?;
-    if !cpu {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "save_roots uses CPU search; pass cpu=True to accept the ~50x slower path",
-        ));
-    }
-    eprintln!("\n*** cpu=True: CPU ROOT GENERATION IS ~50x SLOWER. YOU DO NOT WANT THIS. ***\n");
-    let cfg = Cfg { s, c, budget: Budget::for_s(s), ..Default::default() };
-    let gc = GameCfg {
-        agents: [Agent::Sog { cfg }; 2],
-        collect: Collect::Sog,
-        explore,
-        random_draft,
-        p_td1: 0.0,
-        query_rate,
-        recursive_rate,
-    };
-    let n = Arc::clone(&nets().read());
-    let roots =
-        py.allow_threads(|| crate::selfplay::collect_roots(games, seed, &n, &gc, cap));
-    let f = std::fs::File::create(path)
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-    let mut w = std::io::BufWriter::new(f);
-    crate::roots::write_roots(&mut w, &roots)
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-    Ok(roots.len())
 }
 
 /// Print generation phase timers. Empty unless the extension was built with
@@ -926,7 +844,7 @@ fn infer(
 ) -> PyResult<Vec<f32>> {
     check_nets()?;
     let guard = nets().read();
-    Ok(guard.value.forward(
+    Ok(guard.forward(
         xpub.as_slice()?,
         phi.as_slice()?,
         weight.as_slice()?,
@@ -953,7 +871,7 @@ fn infer_policy(
 ) -> PyResult<Vec<f32>> {
     check_nets()?;
     let guard = nets().read();
-    Ok(guard.value.forward_policy(
+    Ok(guard.forward_policy(
         xpub.as_slice()?,
         phi.as_slice()?,
         weight.as_slice()?,
@@ -1232,7 +1150,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(action_label, m)?)?;
     m.add_function(wrap_pyfunction!(obs_label, m)?)?;
     m.add_function(wrap_pyfunction!(prof_dump, m)?)?;
-    m.add_function(wrap_pyfunction!(save_roots, m)?)?;
     m.add_function(wrap_pyfunction!(gen_data, m)?)?;
         m.add_function(wrap_pyfunction!(infer, m)?)?;
         m.add_function(wrap_pyfunction!(infer_policy, m)?)?;

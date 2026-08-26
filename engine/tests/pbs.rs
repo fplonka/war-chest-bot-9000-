@@ -32,7 +32,8 @@ use warchest::net::Net;
 use warchest::pbs::*;
 use warchest::rng::Rng;
 use warchest::farm::{Call, Reply};
-use warchest::search::{node_actions, Budget, Cfg, Nets, Solver, Step};
+use warchest::net::Net;
+use warchest::search::{node_actions, Budget, Cfg, Solver, Step};
 use warchest::selfplay::{make_game, Agent, Collect, Data, GameCfg, GameStream};
 use warchest::state::{Cont, State, Z_BAG, Z_FACEDOWN, Z_FACEUP};
 use warchest::units::{write_card_features, CARD_FEATS};
@@ -622,7 +623,7 @@ fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
 /// combination a benchmark hit and the suite did not.
 #[test]
 fn a_subgame_of_only_terminal_leaves_solves() {
-    let nets = Arc::new(Nets { device: false, value: random_net(5) });
+    let nets = Arc::new(random_net(5));
     let mut checked = 0usize;
     for seed in 0..600u64 {
         let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
@@ -788,7 +789,7 @@ fn position_with_ambiguous_facedown(seed: u64) -> Option<(State, Ctx, [Belief; 2
 /// different worlds and require the results to agree bit for bit.
 #[test]
 fn a_solve_reads_only_the_beliefs() {
-    let nets = Arc::new(Nets { device: false, value: random_net(0xA11CE) });
+    let nets = Arc::new(random_net(0xA11CE));
     let cfg = Cfg {
         s: 8,
         c: 1.0,
@@ -852,7 +853,7 @@ fn a_solve_reads_only_the_beliefs() {
 /// could not act on it.
 #[test]
 fn the_value_function_separates_configs_sharing_a_hand() {
-    let nets = Arc::new(Nets { device: false, value: random_net(0xBEEF) });
+    let nets = Arc::new(random_net(0xBEEF));
     let cfg = Cfg {
         s: 8,
         c: 1.0,
@@ -913,7 +914,7 @@ fn the_value_function_separates_configs_sharing_a_hand() {
 
 #[test]
 fn game_stream_yields_one_complete_solve_at_a_time() {
-    let nets = Arc::new(Nets { device: false, value: random_net(0x57EA) });
+    let nets = Arc::new(random_net(0x57EA));
     let cfg = Cfg {
         s: 8,
         c: 1.0,
@@ -964,7 +965,7 @@ fn a_batched_solve_matches_one_run_alone_exactly() {
     let alone: Vec<_> = SEEDS
         .iter()
         .map(|&seed| {
-            let nets = Arc::new(Nets { device: false, value: net() });
+            let nets = Arc::new(net());
             GameStream::new(seed, gc).generate(&nets, SOLVES)
         })
         .collect();
@@ -974,7 +975,7 @@ fn a_batched_solve_matches_one_run_alone_exactly() {
     // maps `Call::run` over the calls has nowhere to put them and is not the
     // thing production runs.
     let backend = warchest::farm::Backend::Reference(net());
-    let nets = Arc::new(Nets { device: false, value: net() });
+    let nets = Arc::new(net());
     let mut streams: Vec<_> = SEEDS.iter().map(|&s| GameStream::new(s, gc)).collect();
     let mut out: Vec<Data> = (0..SEEDS.len()).map(|_| Data::default()).collect();
     let mut live: Vec<Option<Solver>> = streams
@@ -995,7 +996,7 @@ fn a_batched_solve_matches_one_run_alone_exactly() {
         let mut spans = vec![0usize; SEEDS.len()];
         for i in 0..SEEDS.len() {
             let Some(sv) = live[i].as_mut() else { continue };
-            match sv.advance(&replies[i]) {
+            match sv.advance_on_host(&replies[i]) {
                 Step::Calls(cs) => {
                     spans[i] = cs.len();
                     calls.extend(cs);
@@ -1047,7 +1048,7 @@ fn a_batched_solve_matches_one_run_alone_exactly() {
 /// belongs in the run report as a diagnostic, not in this test.
 #[test]
 fn a_solve_stores_its_root_and_nothing_else() {
-    let nets = Arc::new(Nets { device: false, value: random_net(0x51DE) });
+    let nets = Arc::new(random_net(0x51DE));
     let cfg = Cfg {
         s: 12,
         c: 1.0,
@@ -1171,7 +1172,7 @@ fn zero_weight_config_survives_the_walk_update() {
     // support to equal the tree child's config list element for element — the
     // invariant the desync assert protects: support is reachability, never
     // weight.
-    let nets = Arc::new(Nets::default());
+    let nets = Arc::new(Net::default());
     let mut rng = Rng::new(777);
     for _ in 0..200 {
         let mut s = make_game(&mut rng, false);

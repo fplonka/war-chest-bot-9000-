@@ -20,7 +20,7 @@ use warchest::bot::{Brain, Mind, Session};
 use warchest::farm::{Backend, Cards};
 use warchest::net::Net;
 use warchest::pbs::rules_table_hash;
-use warchest::search::{Budget, Cfg, Cfr, Nets};
+use warchest::search::{Budget, Cfg, Cfr};
 
 struct Options {
     name: String,
@@ -60,21 +60,18 @@ fn options() -> Result<Options, String> {
 
 fn brain(o: &Options) -> Result<Brain, String> {
     let backend = devices(o, o.mind, o.cfg)?;
-    let mut nets = Nets { device: backend.is_some(), ..Nets::default() };
+    let mut net = Net::default();
     let cards = match backend {
         Some(backend) => {
-            nets.value = backend.net().clone();
+            net = backend.net().clone();
             Some(Arc::new(Cards::new(backend)))
         }
-        None if matches!(o.mind, Mind::Sog) => {
-            nets.value = Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
-            None
-        }
+        None if matches!(o.mind, Mind::Sog) => unreachable!("SoG always has a device"),
         None => None,
     };
     Ok(Brain {
         mind: o.mind,
-        nets: Arc::new(nets),
+        net: Arc::new(net),
         cfg: o.cfg,
         cards,
     })
@@ -197,23 +194,13 @@ fn main() {
     }
 }
 
-/// Use only the devices assigned by the referee. CPU needs a loud opt-in.
+/// Use only the devices assigned by the referee.
 fn devices(o: &Options, mind: Mind, cfg: Cfg) -> Result<Option<Backend>, String> {
     if !matches!(mind, Mind::Sog) {
         return Ok(None);
     }
     if o.devices.is_empty() {
-        if std::env::var("WARCHEST_CPU").as_deref() != Ok("1") {
-            return Err(
-                "GPU inference is required, but no --devices were assigned. \
-                 Set WARCHEST_CPU=1 only to force the ~50x slower CPU path."
-                    .into(),
-            );
-        }
-        eprintln!(
-            "\n*** WARCHEST_CPU=1: CPU INFERENCE IS ~50x SLOWER. YOU DO NOT WANT THIS. ***\n"
-        );
-        return Ok(None);
+        return Err("GPU inference is required, but no --devices were assigned".into());
     }
     let ordinals: Result<Vec<usize>, String> = o
         .devices

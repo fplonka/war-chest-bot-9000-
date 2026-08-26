@@ -6,6 +6,9 @@
 //! chance-node `DrawCoin` actions; the core is RNG-free and deterministic, so a
 //! replay can force observed draws.
 
+#[cfg(test)]
+extern crate self as warchest;
+
 pub mod actions;
 pub mod arena;
 pub mod args;
@@ -32,3 +35,15 @@ pub use state::{State, BLACK, WHITE};
 
 #[cfg(feature = "python")]
 mod py;
+
+#[cfg(test)]
+#[path = "../tests/pbs.rs"]
+mod pbs_integration;
+
+#[cfg(test)]
+#[path = "../tests/sog_solver.rs"]
+mod sog_solver;
+
+#[cfg(all(test, feature = "gpu"))]
+#[path = "../tests/cuda_parity.rs"]
+mod cuda_parity;

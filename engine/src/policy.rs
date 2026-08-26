@@ -332,7 +332,8 @@ pub fn greedy(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config], temp: f32) -> N
 mod tests {
     use super::*;
     use crate::pbs::{true_config, Belief, Ctx};
-    use crate::search::{Budget, Cfg, Nets};
+    use crate::net::Net;
+    use crate::search::{Budget, Cfg};
     use crate::selfplay::make_game;
     use crate::state::Cont;
     use std::sync::Arc;
@@ -354,7 +355,7 @@ mod tests {
         let sv = Solver::new(
             &s,
             ctx,
-            Arc::new(Nets::default()),
+            Arc::new(Net::default()),
             Cfg {
                 s: 0,
                 budget: Budget {
