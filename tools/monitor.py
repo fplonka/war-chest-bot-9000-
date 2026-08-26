@@ -13,7 +13,6 @@ import glob
 import json
 import math
 import os
-import shlex
 import subprocess
 import sys
 import threading
@@ -398,40 +397,28 @@ class Handler(BaseHTTPRequestHandler):
         pass          # a poll every three seconds is not news
 
 
-def puller(src, dest, every=30):
-    """Keep the laptop current while serving it. rsync failures are ordinary
-    here -- the box reboots, a run replaces log.json mid-transfer (exit 24) --
-    and none of them is a reason to stop serving what is already on disk."""
+def puller(dest, every=30):
+    """Keep the laptop current while serving it through box.sh."""
+    env = os.environ.copy()
+    env["WARCHEST_BOX_LOCAL_DIR"] = os.path.abspath(dest)
+    command = [os.path.join(TOOLS, "box.sh"), "pull"]
     while True:
-        r = subprocess.run(["rsync", "-az", "--exclude", "*.pt", "--exclude", "*.tmp",
-                            src, dest + os.sep], capture_output=True, text=True)
+        r = subprocess.run(command, env=env, capture_output=True, text=True)
         if r.returncode:
             print(f"[monitor] pull {r.returncode}: {r.stderr.strip()[:200]}", flush=True)
         time.sleep(every)
 
 
 def main():
-    host = os.environ.get("WARCHEST_BOX_HOST", "ssh1.vast.ai")
-    port = os.environ.get("WARCHEST_BOX_PORT", "26778")
-    key = os.path.expanduser(os.environ.get(
-        "WARCHEST_BOX_KEY", "~/.ssh/id_ed25519_warchest_vast"))
-    remote = os.environ.get("WARCHEST_BOX_DIR", "/workspace/warchest-engine")
-    pull_default = f"root@{host}:{remote}/runs/"
-    rsh = shlex.join([
-        "ssh", "-i", key, "-p", port, "-o", "StrictHostKeyChecking=no",
-        "-o", "ServerAliveInterval=30"])
-
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--runs", default=os.path.join(HERE, "runs"))
     ap.add_argument("--arena", default=os.path.join(HERE, "arena"))
     ap.add_argument("--port", type=int, default=8420)
-    ap.add_argument("--pull", nargs="?", const=pull_default, metavar="SRC",
-                    help="pull every 30s; omit SRC for the WARCHEST_BOX_* box")
+    ap.add_argument("--pull", action="store_true",
+                    help="pull runs from the box every 30s")
     args = ap.parse_args()
     if args.pull:
-        os.environ.setdefault("RSYNC_RSH", rsh)
-        threading.Thread(target=puller, args=(args.pull, args.runs),
-                         daemon=True).start()
+        threading.Thread(target=puller, args=(args.runs,), daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     srv.runs = os.path.abspath(args.runs)
     srv.arena = os.path.abspath(args.arena)

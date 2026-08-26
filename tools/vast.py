@@ -16,7 +16,6 @@ from pathlib import Path
 
 API = "/api/v0"
 HOST = "console.vast.ai"
-KEY = Path("~/.config/vastai/vast_api_key").expanduser().read_text().strip()
 IMAGE = "pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel"
 # The floor: two 24 GB cards, a modern many-core CPU, real PCIe bandwidth.
 FLOOR = {"num_gpus": {"eq": 2}, "gpu_ram": {"gte": 24000}, "total_flops": {"gte": 68},
@@ -30,7 +29,7 @@ FLOOR = {"num_gpus": {"eq": 2}, "gpu_ram": {"gte": 24000}, "total_flops": {"gte"
 conn = None
 
 
-def call(method, path, body):
+def call(method, path, body, key):
     """One kept-alive TLS connection: the handshake, not the server, was most
     of a poll's latency."""
     global conn
@@ -38,7 +37,7 @@ def call(method, path, body):
         conn = http.client.HTTPSConnection(HOST, timeout=20)
     try:
         conn.request(method, f"{API}{path}", body=json.dumps(body),
-                     headers={"Authorization": f"Bearer {KEY}",
+                     headers={"Authorization": f"Bearer {key}",
                               "Content-Type": "application/json"})
         r = conn.getresponse()
         data = r.read()
@@ -51,16 +50,16 @@ def call(method, path, body):
     return json.loads(data)
 
 
-def offers(max_dph, disk):
+def offers(max_dph, disk, key):
     q = dict(FLOOR, dph_total={"lte": max_dph}, order=[["dph_total", "asc"]],
              type="on-demand", allocated_storage=disk)
-    return call("POST", "/bundles/", q)["offers"]
+    return call("POST", "/bundles/", q, key)["offers"]
 
 
-def rent(offer, disk):
+def rent(offer, disk, key):
     return call("PUT", f"/asks/{offer['id']}/", {
         "client_id": "me", "image": IMAGE, "disk": disk, "label": "warchest",
-        "runtype": "ssh_direc ssh_proxy", "env": {}})
+        "runtype": "ssh_direc ssh_proxy", "env": {}}, key)
 
 
 def line(o):
@@ -77,13 +76,14 @@ def main():
     ap.add_argument("--rent", action="store_true")
     ap.add_argument("--disk", type=int, default=80)
     args = ap.parse_args()
+    key = Path("~/.config/vastai/vast_api_key").expanduser().read_text().strip()
     seen, polls, delay = set(), 0, 1.0
     while True:
         # The API allows five requests per five seconds ("limit":5.0 in its
         # 429 body), so one poll a second is the ceiling; back off on a 429.
         time.sleep(delay)
         try:
-            found = offers(args.max_dph, args.disk)
+            found = offers(args.max_dph, args.disk, key)
         except Exception as e:
             delay = min(60.0, delay * 2)
             print(time.strftime("%H:%M:%S"), f"poll failed: {e}; delay {delay:.1f}s", flush=True)
@@ -99,7 +99,7 @@ def main():
         found = [o for o in found if o["dph_total"] <= args.max_dph]
         if found and args.rent:
             try:
-                print("RENTED", json.dumps(rent(found[0], args.disk)), line(found[0]), flush=True)
+                print("RENTED", json.dumps(rent(found[0], args.disk, key)), line(found[0]), flush=True)
                 return 0
             except Exception as e:  # taken under us: keep polling
                 print(time.strftime("%H:%M:%S"), f"rent failed: {e}", flush=True)

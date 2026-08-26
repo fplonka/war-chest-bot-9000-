@@ -5,7 +5,7 @@
 #   tools/box.sh start m1 python tools/arena.py ...  any GPU job, same queue
 #   tools/box.sh follow m1
 #   tools/box.sh kill m1                            the job and everything it spawned
-#   tools/box.sh pull seat
+#   tools/box.sh pull [run]
 #   tools/box.sh setup                             a fresh vast.ai pytorch image
 #   tools/box.sh sync
 #   tools/box.sh build
@@ -17,6 +17,7 @@ port=${WARCHEST_BOX_PORT:-26778}
 key=${WARCHEST_BOX_KEY:-$HOME/.ssh/id_ed25519_warchest_vast}
 remote=${WARCHEST_BOX_DIR:-/workspace/warchest-engine}
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+local_dir=${WARCHEST_BOX_LOCAL_DIR:-$here}
 
 ssh_opts=(-i "$key" -p "$port" -o StrictHostKeyChecking=no -o ServerAliveInterval=30)
 # jemalloc and the image's virtualenv are both nice to have and neither is
@@ -67,13 +68,23 @@ sync)
     echo "synced -> $host:$remote"
     ;;
 pull)
-    name=${2:?usage: pull <run>}
-    mkdir -p "$here/runs/$name"
-    # `*.tmp` is a live run writing log.json atomically; rsync would list it,
-    # find it replaced, and exit 24 mid-run.
-    rsync -az -e "ssh ${ssh_opts[*]}" --exclude '*.tmp' \
-        "root@$host:$remote/runs/$name/" "$here/runs/$name/"
-    echo "pulled $name"
+    if [ -n "${2:-}" ]; then
+        name=$2
+        mkdir -p "$local_dir/runs/$name"
+        # `*.tmp` is a live run writing log.json atomically; rsync would list it,
+        # find it replaced, and exit 24 mid-run.
+        rsync -az -e "ssh ${ssh_opts[*]}" --exclude '*.tmp' \
+            "root@$host:$remote/runs/$name/" "$local_dir/runs/$name/"
+        echo "pulled $name"
+    else
+        mkdir -p "$local_dir/runs"
+        rsync -az -e "ssh ${ssh_opts[*]}" --exclude '*.tmp' \
+            --include '*/' --include '*.html' --include 'plotly.min.js' \
+            --include 'log.json' --include 'ladder*.json' --include 'config.json' \
+            --include 'NOTES.md' --include 'train.log' --exclude '*' \
+            "root@$host:$remote/runs/" "$local_dir/runs/"
+        echo "pulled runs"
+    fi
     ;;
 build)
     "$0" start build bash -c "$build_script"
