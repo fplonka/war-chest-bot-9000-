@@ -103,19 +103,28 @@ follow)
     ;;
 start)
     # start <tag> <command...>: the command runs detached on the box, queued
-    # behind every other GPU job by one lock, with its script, log, pid and
-    # exit code under /workspace/logs/<tag>.*. `follow <tag>` waits on it.
+    # behind every other GPU job in order of arrival (a ticket in
+    # /workspace/queue; flock alone is not first-come-first-served and let
+    # 30-minute runs starve 3-minute matches for hours), with its script, log,
+    # pid and exit code under /workspace/logs/<tag>.*. `follow <tag>` waits.
     tag=${2:?usage: start <tag> <command...>}
     shift 2
-    run_remote "mkdir -p /workspace/logs
+    run_remote "mkdir -p /workspace/logs /workspace/queue
 rm -f /workspace/logs/$tag.pid /workspace/logs/$tag.exit
 cat > /workspace/logs/$tag.sh <<'EOS'
 $prelude
 $(printf '%q ' "$@")
 EOS
-nohup setsid bash -c 'echo \$\$ > /workspace/logs/$tag.pid
+cat > /workspace/logs/$tag.run <<'EOS'
+echo \$\$ > /workspace/logs/$tag.pid
+ticket=/workspace/queue/\$(date +%s%N)-$tag
+touch \$ticket
+trap 'rm -f \$ticket' EXIT
+while [ \"\$(ls /workspace/queue | head -1)\" != \"\$(basename \$ticket)\" ]; do sleep 2; done
 flock /workspace/gpu.lock bash /workspace/logs/$tag.sh
-echo \$? > /workspace/logs/$tag.exit' >/workspace/logs/$tag.log 2>&1 &
+echo \$? > /workspace/logs/$tag.exit
+EOS
+nohup setsid bash /workspace/logs/$tag.run >/workspace/logs/$tag.log 2>&1 &
 echo started $tag"
     ;;
 kill)
