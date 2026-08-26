@@ -827,7 +827,7 @@ def pack(run, binary, out_dir, snapshot=None, name=None):
                   "refresh": 1,
                   "puct": 1.5,
                   "prior_temp": 1.0,
-                  "cfr": cfg.get("cfr", "sog")}
+                  "cfr": "dcfr"}
         bot = name or f"{run.name}.{snap['label']}"
         directory = out_dir / bot
         directory.mkdir(parents=True, exist_ok=True)

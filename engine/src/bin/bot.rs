@@ -10,10 +10,6 @@
 //! independently and in parallel. The referee sends work for any game it is
 //! not already waiting on, which keeps the cores busy.
 //!
-//! ```text
-//! bot --name v5-2h --weights weights.bin --s 512 --c 8 --cfr sog
-//! ```
-
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
@@ -29,10 +25,9 @@ use warchest::search::{Budget, Cfg, Cfr, Nets};
 struct Options {
     name: String,
     weights: String,
-    mind: String,
+    mind: Mind,
     cfg: Cfg,
     threads: usize,
-    temp: f32,
     devices: String,
 }
 
@@ -41,48 +36,46 @@ fn options() -> Result<Options, String> {
         "name", "weights", "mind", "s", "c", "batch", "rounds", "refresh", "puct",
         "prior_temp", "cfr", "threads", "temp", "devices",
     ])?;
+    let mind = match a.text("mind", "sog").as_str() {
+        "sog" => Mind::Sog,
+        "random" => Mind::Random,
+        "greedy" => Mind::Greedy { temp: a.num("temp", 2.0)? },
+        other => return Err(format!("unknown mind {}", other)),
+    };
     let s = a.num("s", 512)?;
-    let cfr = a.text("cfr", "sog");
+    let cfr = a.text("cfr", "dcfr");
     let cfr = Cfr::named(&cfr).ok_or_else(|| format!("unknown cfr rule {}", cfr))?;
     Ok(Options {
         name: a.text("name", "bot"),
         weights: a.text("weights", ""),
-        mind: a.text("mind", "sog"),
+        mind,
         cfg: Cfg { s, c: a.num("c", 8.0)?, batch: a.num("batch", 8)?,
             rounds: a.num("rounds", 0)?, refresh: a.num("refresh", 1)?,
             puct: a.num("puct", 1.5)?, prior_temp: a.num("prior_temp", 1.0)?, cfr,
             budget: Budget::for_s(s), ..Default::default() },
         threads: a.num("threads", 0)?,
-        temp: a.num("temp", 2.0)?,
         devices: a.text("devices", ""),
     })
 }
 
 fn brain(o: &Options) -> Result<Brain, String> {
-    let mind = match o.mind.as_str() {
-        "sog" => Mind::Sog,
-        "random" => Mind::Random,
-        "greedy" => Mind::Greedy { temp: o.temp },
-        other => return Err(format!("unknown mind {}", other)),
-    };
-    let cfg = o.cfg;
-    let backend = devices(o, mind, cfg)?;
+    let backend = devices(o, o.mind, o.cfg)?;
     let mut nets = Nets { device: backend.is_some(), ..Nets::default() };
     let cards = match backend {
         Some(backend) => {
             nets.value = backend.net().clone();
             Some(Arc::new(Cards::new(backend)))
         }
-        None if matches!(mind, Mind::Sog) => {
+        None if matches!(o.mind, Mind::Sog) => {
             nets.value = Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
             None
         }
         None => None,
     };
     Ok(Brain {
-        mind,
+        mind: o.mind,
         nets: Arc::new(nets),
-        cfg,
+        cfg: o.cfg,
         cards,
     })
 }
@@ -205,7 +198,7 @@ fn main() {
 }
 
 /// Use only the devices assigned by the referee. CPU needs a loud opt-in.
-fn devices(o: &Options, mind: Mind, _cfg: Cfg) -> Result<Option<Backend>, String> {
+fn devices(o: &Options, mind: Mind, cfg: Cfg) -> Result<Option<Backend>, String> {
     if !matches!(mind, Mind::Sog) {
         return Ok(None);
     }
@@ -233,7 +226,7 @@ fn devices(o: &Options, mind: Mind, _cfg: Cfg) -> Result<Option<Backend>, String
         })
         .collect();
     let net = Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
-    warchest::cuda::Device::new(&ordinals?, net, _cfg, usize::MAX)
+    warchest::cuda::Device::new(&ordinals?, net, cfg, usize::MAX)
         .map(Backend::Cuda)
         .map(Some)
 }
