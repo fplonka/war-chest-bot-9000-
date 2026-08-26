@@ -555,10 +555,13 @@ def diagnostics(net, buf, probe, batch, rng, device, batch_fn, recent_frac):
 
 def train_steps(net, opt, buf, steps, batch, rng, device,
                 recent_mix=0.0, recent_frac=0.2, profile_cuda=False,
-                batch_fn=make_batch, policy_w=0.0, deadline=None):
+                batch_fn=make_batch, policy_w=0.0, deadline=None,
+                loss_fn=losses):
     """Mean loss over up to `steps` Adam updates -- value, plus the policy
     head's cross entropy at weight `policy_w` -- stopping between updates at
-    `deadline`."""
+    `deadline`. `loss_fn` is `losses`, or its torch.compile form on the box:
+    the forward and its backward become one fused graph, which is where most
+    of a step's device time went."""
     policy_metrics = (
         "policy_loss", "policy_target_entropy", "policy_prior_entropy",
         "policy_search_kl")
@@ -613,7 +616,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
         ts = time.perf_counter()
         step_stat = {"zero_sum_max": z(), "zero_sum_square_sum": z(),
                      "zero_sum_n": 0}
-        value = losses(net, *parts, wp=policy_w, stats=step_stat)
+        value = loss_fn(net, *parts, wp=policy_w, stats=step_stat)
         tot += step_stat["value_loss"]
         stat["zero_sum_max"] = torch.maximum(
             stat["zero_sum_max"], step_stat["zero_sum_max"])
@@ -884,6 +887,13 @@ def main():
     opt.step()
     forward_values(value, parts)
     torch.cuda.synchronize(dev)
+    # The training loss as one fused graph: the net is a few GFLOP spread
+    # over hundreds of small kernels, so the eager step is launch-bound.
+    # torch.compile buckets the variable batch shapes and fuses the value
+    # and policy paths into one forward and one backward. The first call
+    # (the warm phase's first fit) pays the compilation; the box's copy of
+    # the engine never recompiles.
+    step_loss = torch.compile(losses, dynamic=True)
     if checkpoint:
         value.load_state_dict(checkpoint["value"])
         opt.load_state_dict(checkpoint["optimizer"])
@@ -1019,7 +1029,8 @@ def main():
             value, opt, buf, nsteps, args.batch, rng, dev,
             recent_mix=args.recent_mix, recent_frac=args.recent_frac,
             profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1",
-            batch_fn=batcher, policy_w=args.policy_w, deadline=deadline)
+            batch_fn=batcher, policy_w=args.policy_w, deadline=deadline,
+            loss_fn=step_loss)
         return lv, time.time() - tt, st
 
     def run_search_pipeline():
