@@ -40,10 +40,6 @@ sys.path.insert(0, str(ROOT / "train"))
 
 import warchest  # noqa: E402
 
-# A game that hits the play horizon is a draw, as the bots themselves score
-# it (bin/bot.rs); without this the referee would award the marker lead.
-warchest.set_cap_value(0.0)
-
 # Every unit in scope for the ranked two-player game. A ladder drafts from all
 # of it, so a rating is strength across the pool rather than on one army.
 DRAFT_POOL = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 17, 18, 19, 52, 53, 54]

@@ -66,9 +66,6 @@ class Session:
         # protocol. Nothing here knows how it thinks.
         self.agent = Bot(bot, self.AGENT, -1, self.replies)
         self.log = []
-        # The referee scores a game that hit the play horizon as a draw, so the
-        # horizon marker is worth nothing to either side.
-        warchest.set_cap_value(0.0)
         self.new_game()
 
     def _geometry(self):

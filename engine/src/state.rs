@@ -12,19 +12,9 @@ pub const WIN_MARKERS: u8 = 6;
 /// adjudicated before another top-level coin play begins.
 pub const MAX_MAIN_PLAYS: u16 = 256;
 /// Default value of one control marker of lead when the horizon is reached.
-///
-/// A flat zero at the horizon is a trap: under early, near-random play almost
-/// no game ends by placing all six markers, so every target is zero and `V = 0`
-/// becomes a self-consistent fixed point with no gradient toward winning.
-/// Scoring the marker differential instead keeps the payoff zero-sum and
-/// strictly inside +/-1, and induces a curriculum (take locations -> deny
-/// locations -> race to six).
-///
-/// It is a change to the terminal payoff of the game being solved, so it is
-/// annealed to zero as soon as horizon games become rare — see
-/// `set_cap_marker_value`. At zero the payoff is the real game's: a timeout is
-/// a draw. Evaluation always runs at zero.
-pub const CAP_MARKER_VALUE_DEFAULT: f32 = 0.15;
+/// A zero value is the real game's payoff: a horizon is a draw. Training
+/// deliberately overrides it and anneals that temporary curriculum to zero.
+pub const CAP_MARKER_VALUE_DEFAULT: f32 = 0.0;
 
 /// The value in flight, as bits: an `AtomicF32` is not a thing.
 static CAP_MARKER_VALUE: std::sync::atomic::AtomicU32 =

@@ -141,9 +141,6 @@ fn main() {
         eprintln!("{}", e);
         std::process::exit(2);
     });
-    // Evaluation scores a game that hit the play horizon as a draw, so the
-    // horizon marker is worth nothing to either side.
-    warchest::state::set_cap_marker_value(0.0);
     let brain = Arc::new(
         brain(&options).unwrap_or_else(|e| {
             eprintln!("{}", e);
