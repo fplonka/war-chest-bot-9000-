@@ -42,7 +42,7 @@ Remove the runtime host solver. Keep CUDA as the only runtime solver and keep ex
 - CUDA parity tests now hold one test-only card lock. A fresh full run passed every parity test it reached, including exact host/device CFR and growth checks.
 - The full run exposed two unrelated baseline failures caused by the zero-value horizon: the random micro-endgames all had only draw outcomes, and the TD(1) placement test solved a weak full game to a draw. The merge-base micro-endgame test fails identically.
 - The micro-endgame test now selects near-win positions, and the TD(1) test forces a winner after eight solved rows. `onepath-pi4-sog-nearwin` passed with three contested games and exact agreement for every regret rule; `onepath-pi4-outcome` passed.
-- The fresh full test is queued as `onepath-pi5-gpu`; the default 4-minute training gate is queued after it as `onepath-pi6-go`.
+- The fresh full test is queued as `onepath-pi5-gpu`; the default 4-minute training gate is queued after it as `onepath-pi6-go4` with only the ladder disabled, per the gate.
 
 ## Next
 
