@@ -92,7 +92,9 @@ class Buffer:
         self.pcap = cap * 96
         self.pa = torch.zeros((self.acap, ACT_BYTES), dtype=torch.uint8,
                               device=self.device)
-        self.pci = torch.zeros(self.pcap, dtype=torch.int32,
+        # `pci` is a row-local config index, so signed int16 is wide enough
+        # and avoids widening Rust's u16 arena on the device.
+        self.pci = torch.zeros(self.pcap, dtype=torch.int16,
                                device=self.device)
         self.pact = torch.zeros(self.pcap, dtype=torch.int16,
                                 device=self.device)
@@ -103,6 +105,11 @@ class Buffer:
             setattr(self, name, np.empty((cap, *shape), dtype=dtype))
         self.written_at = np.empty(cap, np.float64)
         self.pgroup_count = np.empty(cap, np.int32)
+
+        self.payload_bytes = sum(
+            t.numel() * t.element_size()
+            for t in (self.x, self.cc, self.cp, self.cw, self.cy,
+                      self.pa, self.pci, self.pact, self.pp))
 
         self.acts = 0
         self.cells = 0
@@ -176,7 +183,7 @@ class Buffer:
             self.pa[(np.arange(na) + self.acts) % self.acap] = \
                 torch.as_tensor(pa, device=self.device)
             at = (np.arange(nc) + self.cells) % self.pcap
-            self.pci[at] = torch.as_tensor(pci, dtype=torch.int32,
+            self.pci[at] = torch.as_tensor(pci, dtype=torch.int16,
                                            device=self.device)
             self.pact[at] = torch.as_tensor(pact, dtype=torch.int16,
                                             device=self.device)

@@ -546,6 +546,8 @@ def main():
     value.push()
     target_state = cpu_state(value)
     buf = Buffer(args.cap, args.cap * args.cfgs_per_row, dev)
+    print(f"[train] device replay payload {buf.payload_bytes / (1 << 30):.2f} GiB "
+          f"({buf.payload_bytes:,} bytes; cap={args.cap})", flush=True)
     warmup(dev)
     # One training step and one probe at a training-sized batch, so the
     # caching allocator holds that peak before the farm carves. Configs in a
@@ -632,8 +634,7 @@ def main():
     grace_rows = (min(saved_replay_rows, 2 * args.batch)
                   if checkpoint else 0)
     if checkpoint:
-        gib = args.cap * (ROW_BYTES + 40 + args.cfgs_per_row * 20
-                          + 24 * ACT_BYTES + 96 * 6 + 34) / (1 << 30)
+        gib = buf.payload_bytes / (1 << 30)
         print(f"[resume] replay is intentionally not persisted: its default-cap "
               f"snapshot can reach {gib:.2f} GiB "
               f"({gib * 1440 / args.snapshot_every:.0f} GiB/day at "
