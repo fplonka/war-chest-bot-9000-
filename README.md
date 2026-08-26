@@ -44,7 +44,7 @@ not redistributed here.
 
 ```bash
 uv venv --python 3.12 .venv && VIRTUAL_ENV=.venv uv pip install torch numpy maturin
-cd engine && maturin develop --release && cd ..
+cd engine && maturin develop --release --features python,gpu && cd ..
 .venv/bin/python train/train.py out=mine minutes=30
 python3 tools/monitor.py       # watch it live at http://127.0.0.1:8420
 ```
