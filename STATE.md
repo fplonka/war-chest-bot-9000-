@@ -56,8 +56,17 @@ A 4-minute schema and mirror smoke passed at 242.4 s with 3,140 solves and
 warm graph consumed 153.3 s, then query-only training ran normally. The first
 profile job used the old, non-queue-aware box script and overlapped an unrelated
 queued match; its result is not a gate. After rebasing onto `redesign`,
-`tools/box.sh` is queue-aware and the post-rebase smoke plus post-refactor step
-benchmark are queued behind other workers without touching them.
+`tools/box.sh` is queue-aware. The post-rebase smoke and post-refactor step
+benchmark ran behind the queue without touching other workers.
+
+The queue-aware post-rebase smoke passed at 242.6 s with 3,184 solves, 25,344
+optimizer rows, and 53.5 solves/s. The batch-256 step benchmark passed its
+production-path checks: gather 1.73 ms enqueue, batch preparation 1.66 ms,
+eager sync-free full step 70.07 ms, and default-mode compiled full step 40.16
+ms. The warm and SoG compile walls were 50.15 s and 90.02 s. The compiled
+step is 111 / 40.16 = 2.76x the 111 ms baseline, so Gate 1's 3x requirement
+is not met. Gate 2 was not run because the task requires accepting Gate 1
+before the 30-minute run and match.
 
 Gate 1 is a short batch-256 result at least 3x the 111 ms baseline. Gate 2 is a
 30-minute default run, then 200 color-swapped games against
@@ -67,16 +76,16 @@ reference is `runs/base_b256`, 319652 solves at 197.8 solves/s.
 ## Validation status (2026-08-26)
 
 Local Python syntax, Rust non-GPU compile, and diff checks pass. Local CUDA
-compile is unavailable because `nvcc` is not installed. The remote policy arena
-indexing test passes, including 16k-row and fat-wrap cases. The pre-rebase
-schema, compile, and fused-profile jobs passed; the queue-aware post-rebase
-validation remains pending. No local bot, solver, or training binary has been
-run.
+compile is unavailable because `nvcc` is not installed. The local replay test
+could not run because NumPy is not installed. The remote policy arena indexing
+test passes, including 16k-row and fat-wrap cases. The pre-rebase schema,
+compile, and fused-profile jobs passed; the queue-aware post-rebase smoke and
+step benchmark also passed their runtime checks. No local bot, solver, or
+training binary has been run.
 
 ## Remaining validation
 
-Wait for the queue-aware post-rebase smoke and step benchmark. If the compiled
-step remains above 37 ms, Gate 1 is not met; do not hide that result with another
-mode or compatibility path. Run Gate 2 only if the measured path is accepted.
-Never touch jobs, tickets, pid files, or run directories started by another
-session.
+Gate 1 remains open: the accepted-path compiled step must reach 37 ms or less
+for the 3x threshold. Do not hide the miss with another mode or compatibility
+path. Run Gate 2 only if the measured path is accepted. Never touch jobs,
+tickets, pid files, or run directories started by another session.
