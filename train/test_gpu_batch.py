@@ -16,24 +16,15 @@ import torch
 import warchest
 
 from dump import Dump
-from gpu_batch import make_batch as make_gpu_batch, warmup
-from train import make_batch as make_cpu_batch
-
-
-def to_device(parts, dev):
-    """Numpy batch -> device tensors, the shape `Buffer.gather` produces."""
-    rows, cc, cp, cw, cy, seg, pol = parts
-    t = lambda a, d=None: torch.as_tensor(a, dtype=d, device=dev)
-    return (t(rows, torch.uint8), t(cc, torch.uint8), t(cp, torch.uint8),
-            t(cw, torch.float32), t(cy, torch.float32), t(seg, torch.int64),
-            tuple(t(a) for a in pol))
+from gpu_batch import expand_rows, warmup
+import mirror
 
 
 def empty_policy():
     return (np.zeros((0, warchest.ACT_BYTES), np.uint8),
+            np.zeros(0, np.int16), np.zeros(0, np.int64),
             np.zeros(0, np.int64), np.zeros(0, np.int64),
-            np.zeros(0, np.int64), np.zeros(0, np.float32),
-            np.zeros(0, np.int64))
+            np.zeros(0, np.float32), 0)
 
 
 def main():
@@ -46,18 +37,17 @@ def main():
     dev = torch.device(args.device)
     d = Dump(args.dump)
     parts = (*d.rows(0, min(args.rows, len(d))), empty_policy())
+    rows = parts[0]
+    views = np.empty((2 * len(rows), warchest.ROW_BYTES), np.uint8)
+    views[0::2] = rows
+    views[1::2] = mirror.mirror_rows(rows)
+    cpu = np.asarray(warchest.expand_rows(views.ravel()), np.float32)
+    cpu = cpu.reshape(2 * len(rows), -1)
     warmup(dev)
-    a = make_cpu_batch(parts, np.random.default_rng(17), dev)
-    b = make_gpu_batch(to_device(parts, dev), np.random.default_rng(17), dev)
+    gpu = expand_rows(torch.as_tensor(rows, dtype=torch.uint8, device=dev))
     torch.cuda.synchronize(dev)
-    for x, y in zip(a[:5], b[:5]):
-        if x.dtype.is_floating_point:
-            torch.testing.assert_close(x, y, rtol=0, atol=1e-6)
-        else:
-            torch.testing.assert_close(x, y, rtol=0, atol=0)
-    assert a[5] == b[5]
-    for x, y in zip(a[6], b[6]):
-        torch.testing.assert_close(x, y, rtol=0, atol=0)
+    torch.testing.assert_close(
+        torch.as_tensor(cpu, device=dev), gpu, rtol=0, atol=1e-6)
     print(f"{len(parts[0])} rows, {len(parts[1])} configs OK")
 
 

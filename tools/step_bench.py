@@ -7,9 +7,8 @@ the physical trunk, the config encoder, the join, the policy head, the
 backward pass, and Adam. A hundred back-to-back iterations, one sync at the
 end, like a training burst with the synchronizations removed.
 
-Also checks that the device batcher and the host oracle agree on the same
-numpy parts (the gpu_batch parity gate), and what torch.compile does to the
-forward.
+The CUDA expander has its own parity test; this benchmark measures the
+production batch and optimizer path, including what torch.compile does to it.
 
     python tools/step_bench.py
 """
@@ -24,8 +23,9 @@ import numpy as np
 import torch
 
 import warchest
-from train import ACT_BYTES, CCOUNTS, ROW_BYTES, Buffer, losses, make_batch as make_cpu_batch
-from gpu_batch import make_batch as make_gpu_batch, warmup
+from replay import ACT_BYTES, CCOUNTS, ROW_BYTES, Buffer
+from train import losses
+from gpu_batch import make_batch, warmup
 from value_net import Net
 
 
@@ -73,28 +73,10 @@ def main():
     opt = torch.optim.Adam(net.parameters(), lr=1e-3)
     warmup(dev)
 
-    batch = make_gpu_batch(device_parts, np.random.default_rng(0), dev)
+    batch = make_batch(device_parts, dev)
     xpub, phi, w, seg, y, nseg, policy = batch
     print(f"batch: xpub={tuple(xpub.shape)} phi={tuple(phi.shape)} "
           f"cells={tuple(policy[0].shape)} nseg={nseg}")
-
-    # host oracle parity on the same data
-    def to_numpy(value):
-        if isinstance(value, tuple):
-            return tuple(to_numpy(item) for item in value)
-        return value.cpu().numpy() if torch.is_tensor(value) else value
-
-    np_parts = to_numpy(device_parts)
-    a = make_cpu_batch(np_parts, np.random.default_rng(0), dev)
-    for i, (u, v) in enumerate(zip(a, batch)):
-        if i == 5:
-            assert u == v
-        elif i == 6:
-            for left, right in zip(u, v):
-                torch.testing.assert_close(left, right, rtol=0, atol=1e-6)
-        else:
-            torch.testing.assert_close(u, v, rtol=0, atol=1e-6)
-    print("gpu batcher == host oracle on the same parts: OK")
 
     def stage(name, fn, iters=100):
         for _ in range(3):
@@ -129,7 +111,7 @@ def main():
     for _ in range(100):
         buf.gather(ids)
     print(f"{'gather (256 rows, wall)':36s} {1e3 * (time.perf_counter() - t0) / 100:8.2f} ms")
-    stage("make_batch (mirror+expand)", lambda: make_gpu_batch(device_parts, np.random.default_rng(0), dev))
+    stage("make_batch (mirror+expand)", lambda: make_batch(device_parts, dev))
     cards = net.cards(xpub)
     physical = xpub[0::2]
     toks = net.tokens(physical, cards[0::2])

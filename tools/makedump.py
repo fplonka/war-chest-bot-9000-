@@ -23,7 +23,8 @@ import torch
 sys.path.insert(0, "train")
 import warchest  # noqa: E402
 from export_weights import load as load_checkpoint  # noqa: E402
-from train import Buffer, ingest  # noqa: E402
+from replay import Buffer  # noqa: E402
+from train import ingest  # noqa: E402
 from value_net import Net  # noqa: E402
 
 PUBFEAT = warchest.PUBFEAT

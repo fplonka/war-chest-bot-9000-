@@ -21,7 +21,9 @@ import torch
 import warchest
 import mirror
 from value_net import Net
-from train import Buffer, forward_values, losses, make_batch
+from gpu_batch import make_batch
+from replay import Buffer
+from train import forward_values, losses
 from dump import Dump
 
 PUBFEAT = warchest.PUBFEAT
@@ -33,14 +35,14 @@ ROW_BYTES = warchest.ROW_BYTES
 
 def empty_policy():
     return (np.zeros((0, warchest.ACT_BYTES), np.uint8),
+            np.zeros(0, np.int16), np.zeros(0, np.int64),
             np.zeros(0, np.int64), np.zeros(0, np.int64),
-            np.zeros(0, np.int64), np.zeros(0, np.float32),
-            np.zeros(0, np.int64))
+            np.zeros(0, np.float32), 0)
 
 
 @torch.no_grad()
 def evaluate(net, parts, rng, dev):
-    batch = make_batch(parts, rng, dev)
+    batch = make_batch(parts, dev)
     value = losses(net, *batch)
     rms = torch.sqrt(torch.mean((forward_values(net, batch) - batch[4]) ** 2))
     return float(value), float(rms)
@@ -91,9 +93,6 @@ def main():
     assert tiny.soff.size == 0
     dump_path = f"{out}/buffer.npz"
     got, gcc, gcp, gcw, gcy, gseg, _ = buf.ordered()
-    to_numpy = lambda value: value.cpu().numpy() if torch.is_tensor(value) else value
-    got, gcc, gcp, gcw, gcy, gseg = map(to_numpy,
-                                        (got, gcc, gcp, gcw, gcy, gseg))
     lo = buf.lo
     gsoff = np.concatenate([[0], buf.soff[(buf.soff > lo) & (buf.soff < buf.rows)] - lo,
                             [len(got)]])
@@ -115,7 +114,7 @@ def main():
     tr = (*dmp.rows(0, split), empty_policy())
     te = (*dmp.rows(split, len(dmp)), empty_policy())
     rng = np.random.default_rng(0)
-    b = make_batch(tr, rng, dev)
+    b = make_batch(tr, dev)
     xpub, phi, w, seg, y, nseg, policy = b
     assert xpub.shape == (2 * len(tr[0]), PUBFEAT), xpub.shape
     assert phi.shape[1] == CFEAT
@@ -133,7 +132,7 @@ def main():
     opt = torch.optim.Adam(net.parameters(), lr=1e-3)
     seen = []
     for _ in range(10):
-        parts = make_batch(tr, rng, dev)
+        parts = make_batch(tr, dev)
         value = losses(net, *parts)
         opt.zero_grad(set_to_none=True)
         value.backward()

@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
 import torch
-from train import ACT_BYTES, CCOUNTS, ROW_BYTES, Buffer
+from replay import ACT_BYTES, CCOUNTS, ROW_BYTES, Buffer
 
 
 def dump(n, ncfg, na, ncells):
@@ -44,7 +44,7 @@ def dump(n, ncfg, na, ncells):
 
 def check(buf, ids):
     _x, cc, _cp, _cw, _cy, _seg, pol = buf.gather(ids)
-    pa, pact, _pcrow, pcfg, _pp, _parow = pol
+    pa, pact, _parow, pcfg, _group, _pp, _group_count = pol
     n_cfg, n_act = len(cc), len(pa)
     assert pcfg.size == 0 or int(pcfg.max()) < n_cfg, (int(pcfg.max()), n_cfg)
     assert pact.size == 0 or int(pact.max()) < n_act, (int(pact.max()), n_act)
