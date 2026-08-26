@@ -349,11 +349,12 @@ __device__ __forceinline__ void frag_b_half(const __half* w, int k, int slot, in
 __global__ void k_trunk_half(const float* w, const int* off, unsigned short* out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const int mix = 2 * TRUNK_C * TRUNK_C;
-    const int matrix = i % (3 * TRUNK_C * TRUNK_C) < mix ? 0 : 1;
-    const int block = i / (3 * TRUNK_C * TRUNK_C);
-    const int local = i % (3 * TRUNK_C * TRUNK_C) - matrix * mix;
-    const int base = off[block * TRUNK_OFF + (matrix == 0 ? 10 : 11)];
+    const int matrix_size = TRUNK_C * TRUNK_C;
+    const int block = i / (3 * matrix_size);
+    const int matrix = (i % (3 * matrix_size)) / matrix_size;
+    const int local = i % matrix_size;
+    const int base = off[block * TRUNK_OFF + (matrix == 2 ? 11 : 10)]
+        + (matrix == 1 ? matrix_size : 0);
     const int tiles = TRUNK_C / 8;
     const int tile = local / (tiles * 128);
     const int in_tile = local % (tiles * 128);
