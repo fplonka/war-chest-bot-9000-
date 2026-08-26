@@ -47,6 +47,7 @@ import torch.nn.functional as F
 
 import warchest
 import config
+import mirror
 from export_weights import load as load_checkpoint
 from value_net import AFEAT, Net
 
@@ -369,8 +370,7 @@ class Buffer:
 
 def make_batch(parts, rng, device):
     """Numpy replay batch -> one physical row and two player queries per row."""
-    del rng
-    rows, cc, cp, cw, cy, seg, pol = parts
+    rows, cc, cp, cw, cy, seg, pol = mirror.augment(parts, rng)
     n = len(rows)
     x = expand_batch(rows)
     phi = cc.astype(np.float32) / CNORM

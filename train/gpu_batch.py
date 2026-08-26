@@ -5,6 +5,7 @@ from functools import lru_cache
 import numpy as np
 import torch
 
+import mirror
 import warchest
 
 
@@ -20,8 +21,7 @@ def _tables(device_text):
 
 def make_batch(parts, rng, device):
     """Compact replay batch -> one physical row and two player queries."""
-    del rng
-    rows, cc, cp, cw, cy, seg, pol = parts
+    rows, cc, cp, cw, cy, seg, pol = mirror.augment(parts, rng)
     n = len(rows)
     cc = np.ascontiguousarray(cc)
     t = lambda a, dtype=None: torch.as_tensor(a, dtype=dtype, device=device)

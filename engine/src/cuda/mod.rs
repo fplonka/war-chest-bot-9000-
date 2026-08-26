@@ -1837,6 +1837,7 @@ impl Card {
             };
             assert_eq!(phi.len(), n * CFEAT, "config phi is not one row a config");
             assert_eq!(owner.len(), *n, "config owner is not one entry a config");
+            assert_eq!(cards.len(), NTYPE * TYPE, "config card table");
             (phi, owner, cards, *n)
         };
         let n: usize = mine.iter().map(|&i| each(i).3).sum();
