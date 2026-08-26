@@ -149,7 +149,7 @@ echo started $tag"
     ;;
 kill)
     # The job's pid is its process-group leader (setsid), so this takes the
-    # whole tree: an orphaned test binary once kept the lock for an hour.
+    # whole tree: an orphaned test binary once held the queue for an hour.
     tag=${2:?usage: kill <tag>}
     run_remote "kill -- -\$(cat /workspace/logs/$tag.pid) && echo killed $tag"
     ;;
