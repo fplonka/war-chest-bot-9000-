@@ -3070,10 +3070,8 @@ impl Solver {
     /// and update regret matching, or take the max. Regret mode uses
     /// `self.cur`; fixed-policy modes read `strat`.
     pub fn backprop(&mut self, traverser: usize, strat: &[f32], mode: Back) {
-        // Regret matching floors at EPS rather than at zero, so every legal
-        // action keeps positive probability and carried beliefs keep their
-        // full support. The factors are constant for this whole traversal.
-        const EPS: f32 = 1e-6;
+        // Regret matching uses positive cumulative regret. A row with no
+        // positive regret falls back to uniform.
         let rm = if mode == Back::Regret {
             let k = self.cfg.cfr;
             let m = self.steps[traverser] as f32 + 1.0;
@@ -3197,7 +3195,7 @@ impl Solver {
                                 let old = cfr.regret[at];
                                 let r = old * if old > 0.0 { da } else { db } + delta;
                                 cfr.regret[at] = r;
-                                let v = (r + k.predict * delta).max(EPS);
+                                let v = (r + k.predict * delta).max(0.0);
                                 self.cur[at] = v;
                                 sum += v;
                             }
@@ -3205,6 +3203,11 @@ impl Solver {
                                 let inv = 1.0 / sum;
                                 for cell in row {
                                     self.cur[so + cell] *= inv;
+                                }
+                            } else {
+                                let v = 1.0 / row.len().max(1) as f32;
+                                for cell in row {
+                                    self.cur[so + cell] = v;
                                 }
                             }
                         }

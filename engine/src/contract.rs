@@ -685,7 +685,6 @@ impl Contract {
         sum: &mut [f32],
         qval: &mut [f32],
     ) {
-        const EPS: f32 = 1e-6;
         let (da, db, dg) = factors;
         for level in (0..self.levels()).rev() {
             let lo = self.level_start[level] as usize;
@@ -765,7 +764,7 @@ impl Contract {
                         let old = regret[so + cell];
                         let r = old * if old > 0.0 { da } else { db } + delta;
                         regret[so + cell] = r;
-                        let v = (r + cfr.predict * delta).max(EPS);
+                        let v = (r + cfr.predict * delta).max(0.0);
                         cur[so + cell] = v;
                         total += v;
                     }
@@ -773,6 +772,11 @@ impl Contract {
                         let inv = 1.0 / total;
                         for cell in a..b {
                             cur[so + cell] *= inv;
+                        }
+                    } else {
+                        let v = 1.0 / (b - a).max(1) as f32;
+                        for cell in a..b {
+                            cur[so + cell] = v;
                         }
                     }
                 }

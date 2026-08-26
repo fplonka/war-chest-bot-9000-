@@ -851,7 +851,6 @@ __global__ void k_reach_sweep(const Tree* trees, const unsigned int* work, int a
 __global__ void k_backprop_sweep(const Tree* trees, const unsigned int* work, int at,
                                  int level, int avg, int iter,
                                  float alpha, float beta, float gamma, float predict) {
-    const float EPS = 1e-6f;
     unsigned int item = work[at + blockIdx.x];
     const Tree& t = trees[item >> WORK_BITS];
     if ((unsigned long long)iter >= t.todo) return;
@@ -943,7 +942,7 @@ __global__ void k_backprop_sweep(const Tree* trees, const unsigned int* work, in
             float old = t.regret[so + cell];
             float r = old * (old > 0.0f ? da : db) + delta;
             t.regret[so + cell] = r;
-            float v = fmaxf(r + predict * delta, EPS);
+            float v = fmaxf(r + predict * delta, 0.0f);
             t.cur[so + cell] = v;
             total += v;
         }
@@ -951,6 +950,9 @@ __global__ void k_backprop_sweep(const Tree* trees, const unsigned int* work, in
         if (total > 0.0f) {
             float inv = 1.0f / total;
             for (unsigned int cell = a + lane; cell < b; cell += 32) t.cur[so + cell] *= inv;
+        } else {
+            float v = 1.0f / fmaxf((float)(b - a), 1.0f);
+            for (unsigned int cell = a + lane; cell < b; cell += 32) t.cur[so + cell] = v;
         }
     }
     __syncthreads();
