@@ -16,7 +16,7 @@ Remove the runtime host solver. Keep CUDA as the only runtime solver and keep ex
 - Read `AGENTS.md`, the task, and the thermo-nuclear review standard.
 - Located runtime host-path entry points in `search.rs`, `farm.rs`, `bot.rs`, `selfplay.rs`, and `py.rs`.
 - Baseline corpus is `/workspace/onepath-roots.bin`, outside synced trees.
-- Baseline farmbench: 72 workers, GPUs 0,1, 60 seconds; measured window 143.5 solves/s, 25.0 calls/solve, 17.0 ms/round, 61.0 calls/round, 9,837 rows/round.
+- Matched farmbench: 72 workers, GPUs 0,1, `/workspace/onepath-roots.bin`, 60 seconds, 20-second windows. Merge-base: 252.5 solves/s, 27.1 calls/solve, 9.7 ms/round; branch: 254.7 solves/s, 27.2 calls/solve, 9.6 ms/round (+0.9%), within noise.
 - Removed `Nets.device`, runtime backend dispatch, `Backend::Reference` outside tests, and the bot CPU opt-in.
 - Removed host-only examples, the CPU throughput probe, and CPU root generation.
 - Converted the host-dependent integration suites to unit suites so the oracle can be compiled only under `cfg(test)`.
@@ -30,14 +30,12 @@ Remove the runtime host solver. Keep CUDA as the only runtime solver and keep ex
 - The old `onepath-tests`, `onepath-after`, and `onepath30` jobs were killed because the broad test job ran CPU tests while holding the GPU lock.
 - Read the surviving queued jobs before restarting work. They wait behind `b256_125`.
 - The inherited `onepath-*` queued jobs were terminated externally without exit files. Do not alter their files or tickets.
-- This session queued its own gates as `onepath-pi-gpu`, `onepath-pi-after`, `onepath-pi-cuda30`, and `onepath-pi-arena200`. After the queue harness changed, it killed only these four owned tags and restarted them through the current FIFO harness.
+- The earlier owned GPU, benchmark, 30-minute, and arena jobs were stopped before the gate changed. The current full-test job is `onepath-pi5-gpu`; the current four-minute training job is `onepath-pi6-go4`.
 - The first `onepath-pi-gpu` compile found two over-gated helpers: runtime `worker_seed` was absent, and test-only `ncells` was declared in production. Both are fixed; queue a fresh full test before the remaining gates.
 - Committed those fixes as `36dcb9e` and queued the replacement full test as `onepath-pi2-gpu`.
 - The recorded baseline predates the merge-base at `4ac184a`, and the terminated after-run's first sample was not comparable. Queued a clean merge-base benchmark as `onepath-pi2-base`, followed by the current branch as `onepath-pi2-after`, with the same corpus and settings.
-- `onepath-pi-gpu` runs the required full `cargo test --features gpu`; `onepath-pi-after` uses the baseline farmbench settings.
-- `onepath-pi-cuda30` is the default 30-minute run. `onepath-pi-arena200` copies its packed bot, sets that copy to DCFR, asserts `sweep3_b256` is DCFR, and swaps seats over 200 games.
 - Re-ran the thermo-nuclear review. The runtime has one direct CUDA state machine; the host evaluator, arenas, solver, replay helpers, and backend adapter compile only under `cfg(test)`.
-- `onepath-pi2-base` and `onepath-pi2-after` passed. Their 40-second matched samples were 252.5 and 254.7 solves/s, respectively (+0.9%); calls/solve and round time also matched within noise.
+- `onepath-pi2-base` and `onepath-pi2-after` passed the matched farmbench. Their 40-second samples were 252.5 and 254.7 solves/s, respectively (+0.9%); calls/solve and round time also matched within noise.
 - `onepath-pi2-gpu` was terminated without an exit file after concurrent CUDA tests failed and long host-oracle tests continued. Its captured output has no panic bodies.
 - CUDA parity tests now hold one test-only card lock. A fresh full run passed every parity test it reached, including exact host/device CFR and growth checks.
 - The full run exposed two unrelated baseline failures caused by the zero-value horizon: the random micro-endgames all had only draw outcomes, and the TD(1) placement test solved a weak full game to a draw. The merge-base micro-endgame test fails identically.
