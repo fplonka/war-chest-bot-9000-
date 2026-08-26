@@ -81,50 +81,59 @@ build)
     ;;
 follow)
     tag=${2:?usage: follow <tag> [run]}
-    for _ in $(seq 1 40); do
-        if run_remote "test -s /workspace/logs/$tag.pid"; then
-            break
-        fi
-        sleep 0.5
-    done
-    while run_remote "kill -0 \$(cat /workspace/logs/$tag.pid) 2>/dev/null" >/dev/null 2>&1; do
-        # A queued job has no run directory until it holds the lock.
-        [ -n "${3:-}" ] && { "$0" pull "$3" >/dev/null 2>&1 || true; }
-        run_remote "tail -1 /workspace/logs/$tag.log" | tail -1
-        sleep "${WARCHEST_BOX_POLL:-60}"
-    done
+    if [ -n "${3:-}" ]; then
+        (
+            while :; do
+                "$0" pull "$3" >/dev/null 2>&1 || true
+                sleep "${WARCHEST_BOX_POLL:-60}"
+            done
+        ) &
+        pull_pid=$!
+    fi
+    if run_remote "while [ ! -s /workspace/logs/$tag.pid ]; do sleep 0.5; done
+while kill -0 \$(cat /workspace/logs/$tag.pid) 2>/dev/null; do
+    tail -1 /workspace/logs/$tag.log
+    sleep \${WARCHEST_BOX_POLL:-60}
+done
+cat /workspace/logs/$tag.exit
+grep -qx 0 /workspace/logs/$tag.exit || { tail -20 /workspace/logs/$tag.log; exit 1; }"; then
+        status=0
+    else
+        status=$?
+    fi
+    [ -z "${pull_pid:-}" ] || {
+        kill "$pull_pid" 2>/dev/null || true
+        wait "$pull_pid" 2>/dev/null || true
+    }
     [ -n "${3:-}" ] && "$0" pull "$3"
-    if ! run_remote "grep -qx 0 /workspace/logs/$tag.exit"; then
+    if [ "$status" -ne 0 ]; then
         echo "JOB_DONE tag=$tag failed"
-        run_remote "tail -20 /workspace/logs/$tag.log" | tail -20
         exit 1
     fi
     echo "JOB_DONE tag=$tag ok"
     ;;
 start)
     # start <tag> <command...>: the command runs detached on the box, queued
-    # behind every other GPU job in order of arrival (a ticket in
-    # /workspace/queue; flock alone is not first-come-first-served and let
-    # 30-minute runs starve 3-minute matches for hours), with its script, log,
-    # pid and exit code under /workspace/logs/<tag>.*. `follow <tag>` waits.
+    # behind every other GPU job in order of arrival by a ticket in
+    # /workspace/queue. Its script, log, pid and exit code live under
+    # /workspace/logs/<tag>.*. `follow <tag>` waits.
     tag=${2:?usage: start <tag> <command...>}
     shift 2
     run_remote "mkdir -p /workspace/logs /workspace/queue
 rm -f /workspace/logs/$tag.pid /workspace/logs/$tag.exit
 cat > /workspace/logs/$tag.sh <<'EOS'
-$prelude
-$(printf '%q ' "$@")
-EOS
-cat > /workspace/logs/$tag.run <<'EOS'
 echo \$\$ > /workspace/logs/$tag.pid
 ticket=/workspace/queue/\$(date +%s%N)-$tag
 touch \$ticket
 trap 'rm -f \$ticket' EXIT
 while [ \"\$(ls /workspace/queue | head -1)\" != \"\$(basename \$ticket)\" ]; do sleep 2; done
-flock /workspace/gpu.lock bash /workspace/logs/$tag.sh
-echo \$? > /workspace/logs/$tag.exit
+$prelude
+$(printf '%q ' "$@")
+status=\$?
+echo \$status > /workspace/logs/$tag.exit
+exit \$status
 EOS
-nohup setsid bash /workspace/logs/$tag.run >/workspace/logs/$tag.log 2>&1 &
+nohup setsid bash /workspace/logs/$tag.sh >/workspace/logs/$tag.log 2>&1 &
 echo started $tag"
     ;;
 kill)
@@ -134,8 +143,8 @@ kill)
     run_remote "kill -- -\$(cat /workspace/logs/$tag.pid) && echo killed $tag"
     ;;
 go)
-    # The build runs inside the job, under the lock: a cargo build beside a
-    # measured run would take its cores.
+    # The build runs inside the queued job, so a cargo build beside a measured
+    # run cannot take its cores.
     shift
     out=
     for a in "$@"; do
