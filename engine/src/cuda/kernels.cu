@@ -365,6 +365,25 @@ __global__ void k_trunk_half(const float* w, const int* off, unsigned short* out
     out[i] = __half_as_ushort(__float2half_rn(w[base + row * TRUNK_C + col]));
 }
 
+/// Pack one join matrix into the same half fragment order. The first matrix
+/// has a padded tail; the other matrices pass their full depth.
+__global__ void k_join_half(const float* w, int base, int k_real, int k_pad, int n,
+                            unsigned short* out) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= k_pad * n) return;
+    const int tiles = n / 8;
+    const int tile = i / (tiles * 128);
+    const int in_tile = i % (tiles * 128);
+    const int nt = in_tile / 128;
+    const int lane = (in_tile % 128) / 4;
+    const int element = in_tile % 4;
+    const int row = 16 * tile + 2 * (lane & 3) + (element >= 2 ? 8 : 0) + (element & 1);
+    const int col = 8 * nt + (lane >> 2);
+    out[i] = row < k_real
+        ? __half_as_ushort(__float2half_rn(w[base + row * n + col]))
+        : __half_as_ushort(__float2half(0.0f));
+}
+
 /// Which element of the board an accumulator register holds: register `i` of
 /// row tile `m` is the row below, and the channel beside it.
 __device__ __forceinline__ int frag_row(int m, int i, int lane) {
@@ -1042,52 +1061,46 @@ __global__ void k_avg_block(const Tree* trees, const unsigned int* work, int at,
 // Belief pooling, `net::Net::join`, the head norm and the config readout in one
 // launch. A block keeps all intermediate rows in registers or shared memory.
 //
-// A warp is the unit of a multiply, as in `k_trunk`. `mma.sync.m16n8k8` takes
-// a 16x8 slab of the activations and an 8x8 slab of the weight; sixteen warps
-// cover the 128-wide residual, two sixteen-row tiles cover the block's 32
-// rows. `J_IN` is 136: JOIN_IN padded from 129 so the first `k` is whole
-// fragments. Those seven extra columns are zero.
+// A warp is the unit of a multiply, as in `k_trunk`. `mma.sync.m16n8k16`
+// takes a 16x8 slab of the activations and a 16x8 slab of the weight; sixteen
+// warps cover the 128-wide residual, two sixteen-row tiles cover the block's
+// 32 rows. `J_IN` is 144: JOIN_IN padded from 129 so the first `k` is whole
+// half fragments. The extra columns are zero.
 //
-// The residual stream lives in the accumulators. Only the normalised
-// activations go through shared memory, bank-padded, rounded to tf32 as they
-// are stored. The weights arrive fragwise from the host, rounded once.
-//
-// Rows are interleaved by traverser so both pooled beliefs of a leaf stay in
-// the same block. The shared buffer first holds the join operand and pooled
-// beliefs, then becomes the 256-wide head. The reach masses follow it.
+// The residual stream lives in the accumulators. Only the normalized half
+// activations go through shared memory. Rows are interleaved by traverser so
+// both pooled beliefs of a leaf stay in the same block.
 #define J_SPAN (J_W / 8)
 #define J_MT (J_ROWS / 16)
 #define J_LDS (J_IN + 4)
-#define J_KS_IN (J_IN / 8)
-#define J_KS (J_W / 8)
+#define J_KS_IN (J_IN / 16)
+#define J_KS (J_W / 16)
 #define J_Q (J_W / 32)
 #define J_OUT_TILES (J_D / 8)
-#define J_PACK_B ((size_t)J_KS_IN * J_SPAN * 64)
-#define J_PACK_W ((size_t)J_KS * J_SPAN * 64)
+#define J_PACK_B ((size_t)J_KS_IN * J_SPAN * 128)
+#define J_PACK_W ((size_t)J_KS * J_SPAN * 128)
 
-__device__ __forceinline__ void join_mma(float (&d)[J_MT][4], const float* act,
-                                         const float* w, int ks, int ntiles,
+__device__ __forceinline__ void join_mma(float (&d)[J_MT][4], const __half* act,
+                                         const __half* w, int ks, int ntiles,
                                          int nt0) {
     int lane = threadIdx.x, slot = threadIdx.y;
     for (int k = 0; k < ks; ++k) {
         unsigned b[2];
-        frag_b(w, k, nt0 + slot, lane, ntiles, b);
+        frag_b_half(w, k, nt0 + slot, lane, ntiles, b);
 #pragma unroll
         for (int m = 0; m < J_MT; ++m) {
             unsigned a[4];
-            frag_a(act, m, 8 * k, lane, J_LDS, a);
-            mma_tile(d[m], a, b);
+            frag_a_half(act, m, 16 * k, lane, J_LDS, a);
+            mma_half_tile(d[m], a, b);
         }
     }
 }
 
-// `Norm::apply` over the block's rows: the residual stream, plus the bias it is
-// owed, normalised into `act` as the tf32 operand the next multiply reads.
-// The stream itself stays in the accumulators.
-__device__ __forceinline__ void join_norm(float (&z)[J_MT][4], float* act,
+// `Norm::apply` over the block's rows. The residual stream stays in f32, while
+// the normalized operand is rounded to half for the next multiply.
+__device__ __forceinline__ void join_norm(float (&z)[J_MT][4], __half* act,
                                           const float* gamma, const float* beta,
                                           const float* add) {
-    // The multiply that filled `z` is still reading `act` in other warps.
     __syncthreads();
     int lane = threadIdx.x, slot = threadIdx.y;
 #pragma unroll
@@ -1095,7 +1108,7 @@ __device__ __forceinline__ void join_norm(float (&z)[J_MT][4], float* act,
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             int r = frag_row(m, i, lane), j = frag_col(i, slot, lane);
-            act[r * J_LDS + j] = z[m][i] + add[j];
+            act[r * J_LDS + j] = __float2half_rn(z[m][i] + add[j]);
         }
     __syncthreads();
 #pragma unroll
@@ -1103,7 +1116,8 @@ __device__ __forceinline__ void join_norm(float (&z)[J_MT][4], float* act,
         int r = slot + t * J_SPAN;
         float cur[J_Q];
 #pragma unroll
-        for (int q = 0; q < J_Q; ++q) cur[q] = act[r * J_LDS + lane + 32 * q];
+        for (int q = 0; q < J_Q; ++q)
+            cur[q] = __half2float(act[r * J_LDS + lane + 32 * q]);
         float s = 0.0f;
 #pragma unroll
         for (int q = 0; q < J_Q; ++q) s += cur[q];
@@ -1119,8 +1133,8 @@ __device__ __forceinline__ void join_norm(float (&z)[J_MT][4], float* act,
 #pragma unroll
         for (int q = 0; q < J_Q; ++q) {
             int j = lane + 32 * q;
-            act[r * J_LDS + j] =
-                tf32(gelu1((cur[q] - mean) * inv * gamma[j] + beta[j]));
+            act[r * J_LDS + j] = __float2half_rn(
+                gelu1((cur[q] - mean) * inv * gamma[j] + beta[j]));
         }
     }
     __syncthreads();
@@ -1129,13 +1143,14 @@ __device__ __forceinline__ void join_norm(float (&z)[J_MT][4], float* act,
 __global__ __launch_bounds__(32 * J_SPAN, 2)
 void k_leaf(const Tree* trees, const int* part_of_row, const int* local_row,
             const int* base_of_part, const unsigned int* coff,
-            const float* wj, const float* lnj, const float* owed,
+            const __half* wj, const float* lnj, const float* owed,
             const float* cf_bias, const float* gamma, const float* beta,
             int rows, int q0) {
-    __shared__ __align__(16) float shared[J_ROWS * (J_D + 1)];
-    float* act = shared;
-    float* pooled = shared + J_ROWS * J_LDS;
-    float* mass = shared + J_ROWS * J_D;
+    extern __shared__ __align__(16) unsigned char raw[];
+    __half* act = reinterpret_cast<__half*>(raw);
+    float* pooled = reinterpret_cast<float*>(act + J_ROWS * J_LDS);
+    float* head = pooled + J_ROWS * J_POOL;
+    float* mass = head + J_ROWS * J_D;
 
     int lane = threadIdx.x, slot = threadIdx.y;
     int tid = lane + 32 * slot, nt = 32 * J_SPAN;
@@ -1181,14 +1196,15 @@ void k_leaf(const Tree* trees, const int* part_of_row, const int* local_row,
             const Tree& t = trees[part_of_row[rr]];
             v = t.jp[(size_t)t.board_of[local_row[rr]] * J_W + c];
         }
-        act[e] = v;
+        act[e] = __float2half_rn(v);
     }
     __syncthreads();
 #pragma unroll
     for (int m = 0; m < J_MT; ++m)
 #pragma unroll
         for (int i = 0; i < 4; ++i)
-            z[m][i] = act[frag_row(m, i, lane) * J_LDS + frag_col(i, slot, lane)];
+            z[m][i] = __half2float(
+                act[frag_row(m, i, lane) * J_LDS + frag_col(i, slot, lane)]);
     __syncthreads();
 
     for (int e = tid; e < J_ROWS * J_LDS; e += nt) {
@@ -1203,12 +1219,12 @@ void k_leaf(const Tree* trees, const int* part_of_row, const int* local_row,
             else if (c < 2 * J_POOL) v = theirs[c - J_POOL];
             else v = p == 0 ? -1.0f : 1.0f;
         }
-        act[e] = tf32(v);
+        act[e] = __float2half_rn(v);
     }
     __syncthreads();
 
     join_mma(z, act, wj, J_KS_IN, J_SPAN, 0);
-    const float* w = wj + J_PACK_B;
+    const __half* w = wj + J_PACK_B;
     for (int blk = 0; blk < J_BLOCKS; ++blk) {
         join_norm(z, act, lnj + 2 * blk * J_W, lnj + (2 * blk + 1) * J_W,
                   owed + blk * J_W);
@@ -1245,8 +1261,8 @@ void k_leaf(const Tree* trees, const int* part_of_row, const int* local_row,
                 int rr = q0 + (row >> 1);
                 const Tree& t = trees[part_of_row[rr]];
                 const float* seed = t.p + (size_t)t.board_of[local_row[rr]] * J_D;
-                shared[(size_t)r * J_D + j] = head0[m][i] + seed[j] + owed[(J_BLOCKS + 1) * J_W + j];
-                shared[(size_t)r * J_D + J_W + j] = z[m][i] + seed[J_W + j]
+                head[(size_t)r * J_D + j] = head0[m][i] + seed[j] + owed[(J_BLOCKS + 1) * J_W + j];
+                head[(size_t)r * J_D + J_W + j] = z[m][i] + seed[J_W + j]
                     + owed[(J_BLOCKS + 1) * J_W + J_W + j];
             }
         }
@@ -1260,7 +1276,7 @@ void k_leaf(const Tree* trees, const int* part_of_row, const int* local_row,
         float sum = 0.0f;
 #pragma unroll
         for (int q = 0; q < J_D / 32; ++q) {
-            h[q] = shared[(size_t)lr * J_D + lane + 32 * q];
+            h[q] = head[(size_t)lr * J_D + lane + 32 * q];
             sum += h[q];
         }
         sum = warp_sum(sum);

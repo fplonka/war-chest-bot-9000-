@@ -137,6 +137,7 @@ struct Kernels {
     stem: CudaFunction,
     trunk: CudaFunction,
     trunk_half: CudaFunction,
+    join_half: CudaFunction,
     cfg_slots: CudaFunction,
     sum_slots: CudaFunction,
     bag: CudaFunction,
@@ -173,6 +174,7 @@ impl Kernels {
             stem: get("k_stem")?,
             trunk: get("k_trunk")?,
             trunk_half: get("k_trunk_half")?,
+            join_half: get("k_join_half")?,
             cfg_slots: get("k_cfg_slots")?,
             sum_slots: get("k_sum_slots")?,
             bag: get("k_bag")?,
@@ -262,45 +264,31 @@ pub struct Device {
 pub const PIPELINE: usize = 3;
 
 /// Round to the eleven significand bits a tensor core keeps, matching
-/// `cvt.rna.tf32.f32`: nearest, ties away from zero. The packed join weights
-/// use this explicit rounding so their tensor-core operands do not depend on
-/// the device's implicit conversion.
-fn tf32(v: f32) -> f32 {
-    let u = v.to_bits();
-    f32::from_bits(u.wrapping_add(0x1000) & 0xFFFF_E000)
-}
+/// JOIN_IN padded to a whole `mma.m16n8k16` k-tile. Fifteen zero columns.
+const JOIN_K: usize = JOIN_IN.next_multiple_of(16);
+const _: () = assert!(JOIN_K == 144 && JOIN_IN == 129);
 
-/// JOIN_IN padded to a whole `mma.m16n8k8` k-tile. Seven zero columns, 5 %.
-const JOIN_K: usize = JOIN_IN.next_multiple_of(8);
-const _: () = assert!(JOIN_K == 136 && JOIN_IN == 129);
-
-/// One matrix in the order a warp of `mma.sync.m16n8k8` reads it.
-///
-/// Lane `l` holds `w[k + l % 4][n + l / 4]` and the value four rows below it.
-/// Stored as the net stores it that is eight thirty-two-byte transactions a
-/// fragment; here the fragment is written out lane by lane, so it is one
-/// eight-byte load a lane. `k_pad` may exceed `k_real`: the extra rows are
-/// zero, which is how JOIN_IN = 129 becomes a 136-deep tile.
-fn pack_mma(w: &[f32], base: usize, k_real: usize, k_pad: usize, n: usize, out: &mut Vec<f32>) {
-    assert_eq!(k_pad % 8, 0, "a packed matrix is whole fragments deep");
-    assert_eq!(n % 8, 0, "a packed matrix is whole fragments across");
-    for kt in 0..k_pad / 8 {
-        for nt in 0..n / 8 {
-            for lane in 0..32 {
-                let (g, t) = (lane / 4, lane % 4);
-                let at = |k: usize| {
-                    let row = 8 * kt + k;
-                    if row >= k_real {
-                        0.0
-                    } else {
-                        tf32(w[base + row * n + 8 * nt + g])
-                    }
-                };
-                out.push(at(t));
-                out.push(at(t + 4));
-            }
-        }
+/// The join matrices and their offsets in the half-weight buffer. The first
+/// matrix has real depth 129 and the rest are already whole half tiles.
+fn join_layout(l: &NetLayout) -> (Vec<(Span, usize, usize)>, usize) {
+    let mut matrices = Vec::with_capacity(JBLOCKS + 2);
+    let mut at = 0;
+    let mut add = |s: Span, k_pad: usize| {
+        assert_eq!(k_pad % 16, 0, "a join matrix is whole half fragments deep");
+        assert_eq!(s.o % 8, 0, "a join matrix is whole fragments across");
+        matrices.push((s, k_pad, at));
+        at += k_pad * s.o;
+    };
+    add(l.join_b, JOIN_K);
+    for s in l.join_w {
+        assert_eq!(s.i, JW, "a join residual is JW deep");
+        assert_eq!(s.o, JW, "a join residual is JW across");
+        add(s, s.i);
     }
+    assert_eq!(l.join_out.i, JW, "join_out is JW deep");
+    assert_eq!(l.join_out.o, D, "join_out is D across");
+    add(l.join_out, l.join_out.i);
+    (matrices, at)
 }
 
 /// The trunk's matrix offsets in the half-weight buffer. The conversion
@@ -317,25 +305,6 @@ fn trunk_layout(l: &NetLayout) -> (Vec<usize>, usize) {
         }
     }
     (offsets, at)
-}
-
-/// `join_b`, the three `join_w`, then `join_out`, each packed the way `k_leaf`
-/// indexes them. `join_b` is padded to `JOIN_K`.
-fn join_pack(l: &NetLayout, w: &[f32]) -> Vec<f32> {
-    let mut out = Vec::new();
-    assert_eq!(l.join_b.i, JOIN_IN, "join_b is JOIN_IN deep");
-    assert_eq!(l.join_b.o, JW, "join_b is JW across");
-    pack_mma(w, l.join_b.w, l.join_b.i, JOIN_K, l.join_b.o, &mut out);
-    for s in l.join_w {
-        assert_eq!(s.i, JW, "a join residual is JW deep");
-        assert_eq!(s.o, JW, "a join residual is JW across");
-        pack_mma(w, s.w, s.i, s.i, s.o, &mut out);
-    }
-    let o = l.join_out;
-    assert_eq!(o.i, JW, "join_out is JW deep");
-    assert_eq!(o.o, D, "join_out is D across");
-    pack_mma(w, o.w, o.i, o.i, o.o, &mut out);
-    out
 }
 
 /// Three boards share one tensor-core row dimension. Only the final row of
@@ -381,10 +350,12 @@ fn owed_by_the_join(l: &NetLayout, b: &[f32]) -> Vec<f32> {
 const TILE: usize = 16384;
 
 /// Join rows one block of `k_leaf` holds.
-///
-/// Shared is the 32 KiB head. Two 512-thread blocks are 66 % occupancy on the
-/// RTX 3090 and leave the other card room to run its sweeps.
 const JROWS: usize = 32;
+const J_LDS: usize = JOIN_K + 4;
+const J_SHARED: usize = JROWS * J_LDS * 2
+    + JROWS * POOL * 4
+    + JROWS * D * 4
+    + JROWS * 4;
 const _: () = assert!(JROWS <= JW && JROWS % 16 == 0);
 
 /// Every device buffer a round holds, from the slot count and the budget.
@@ -810,8 +781,8 @@ struct Card {
     w: CudaSlice<f32>,
     /// The trunk matrices, packed as half fragments for `mma.m16n8k16`.
     wh: CudaSlice<u16>,
-    /// The join's five matrices, packed the same way. See `join_pack`.
-    jw: CudaSlice<f32>,
+    /// The join's five matrices, packed as half fragments for the leaf kernel.
+    jwh: CudaSlice<u16>,
     b: CudaSlice<f32>,
     ln: CudaSlice<f32>,
     /// Hex adjacency, `NONE` folded to `-1`.
@@ -1012,9 +983,7 @@ impl Device {
             card.stream.context().bind_to_thread().map_err(err)?;
             card.stream.memcpy_htod(&flat.w, &mut card.w).map_err(err)?;
             card.refresh_trunk()?;
-            card.stream
-                .memcpy_htod(&join_pack(&card.layout, &flat.w), &mut card.jw)
-                .map_err(err)?;
+            card.refresh_join()?;
             card.stream.memcpy_htod(&flat.b, &mut card.b).map_err(err)?;
             card.stream.memcpy_htod(&flat.ln, &mut card.ln).map_err(err)?;
             let owed = owed_by_the_join(&card.layout, &flat.b);
@@ -1269,6 +1238,11 @@ impl Gpu {
                 "trunk channel width {C} needs {TRUNK_SHARED} bytes of shared memory per block; device {ordinal} allows {max_shared}"
             ));
         }
+        if J_SHARED > max_shared {
+            return Err(format!(
+                "leaf needs {J_SHARED} bytes of shared memory per block; device {ordinal} allows {max_shared}"
+            ));
+        }
         let sm_shared = ctx
             .attribute(CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR)
             .map_err(err)? as usize;
@@ -1287,6 +1261,12 @@ impl Gpu {
             .set_attribute(
                 CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                 TRUNK_SHARED as i32,
+            )
+            .map_err(err)?;
+        k.leaf
+            .set_attribute(
+                CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                J_SHARED as i32,
             )
             .map_err(err)?;
         let torch = ctx.new_stream().map_err(err)?;
@@ -1322,6 +1302,7 @@ impl Card {
         let locations: Vec<u8> = board().is_location.iter().map(|&x| x as u8).collect();
         let layout = NetLayout::new();
         let (lanes, trunk_weights) = trunk_layout(&layout);
+        let (_, join_weights) = join_layout(&layout);
         let mut plan: Vec<i32> = Vec::new();
         for (i, blk) in layout.blocks.iter().enumerate() {
             let (n0, n1) = (layout.norms[ln_block(i, 0)], layout.norms[ln_block(i, 1)]);
@@ -1352,7 +1333,7 @@ impl Card {
             owed: stream.memcpy_stod(&owed).map_err(err)?,
             w: stream.memcpy_stod(&flat.w).map_err(err)?,
             wh: stream.alloc_zeros(trunk_weights).map_err(err)?,
-            jw: stream.memcpy_stod(&join_pack(&layout, &flat.w)).map_err(err)?,
+            jwh: stream.alloc_zeros(join_weights).map_err(err)?,
             b: stream.memcpy_stod(&flat.b).map_err(err)?,
             ln: stream.memcpy_stod(&flat.ln).map_err(err)?,
             nb: stream.memcpy_stod(&nb).map_err(err)?,
@@ -1372,6 +1353,7 @@ impl Card {
             layout,
         };
         card.refresh_trunk()?;
+        card.refresh_join()?;
         Ok(card)
     }
 
@@ -1587,6 +1569,29 @@ impl Card {
                 .launch_unit(spread(n))
         }
         .map_err(err)
+    }
+
+    /// Pack the join weights once on the card. Each matrix has a separate
+    /// launch because its real depth and output width are part of its layout.
+    fn refresh_join(&mut self) -> Res<()> {
+        let (matrices, total) = join_layout(&self.layout);
+        assert_eq!(total, self.jwh.len(), "join weight layout changed");
+        let stream = &self.stream;
+        let k = &self.k;
+        let w = &self.w;
+        for (s, k_pad, at) in matrices {
+            let mut out = self.jwh.slice_mut(at..at + k_pad * s.o);
+            let (base, k_real, k_pad, n) =
+                (s.w as i32, s.i as i32, k_pad as i32, s.o as i32);
+            unsafe {
+                stream
+                    .launch_builder(&k.join_half)
+                    .arg(w).arg(&base).arg(&k_real).arg(&k_pad).arg(&n).arg(&mut out)
+                    .launch_unit(spread((k_pad as usize) * s.o))
+            }
+            .map_err(err)?;
+        }
+        Ok(())
     }
 
     /// Every new leaf in the round: the board vector and the join cache.
@@ -2791,13 +2796,13 @@ impl Card {
                     self.stream
                         .launch_builder(&self.k.leaf)
                         .arg(trees).arg(part_d).arg(local_d).arg(base_d).arg(coff_d)
-                        .arg(&self.jw).arg(&join_ln).arg(&self.owed)
+                        .arg(&self.jwh).arg(&join_ln).arg(&self.owed)
                         .arg(&bias).arg(&g).arg(&hb)
                         .arg(&rows_i).arg(&q0_i)
                         .launch_unit(LaunchConfig {
                             grid_dim: ((rows as u32).div_ceil(JROWS as u32), 1, 1),
                             block_dim: (32, (JW / 8) as u32, 1),
-                            shared_mem_bytes: 0,
+                            shared_mem_bytes: J_SHARED as u32,
                         })
                 }
                 .map_err(err)
