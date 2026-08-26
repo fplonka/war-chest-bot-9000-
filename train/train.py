@@ -35,7 +35,6 @@ import dataclasses
 import json
 import os
 import pathlib
-import subprocess
 import sys
 import time
 
@@ -627,8 +626,6 @@ def ingest(buf, data, warm=False):
     return len(x)
 
 
-
-
 def physical_cpus():
     """Return one Linux hardware thread from each physical core."""
     cpus = set()
@@ -645,29 +642,6 @@ def physical_cpus():
         except (OSError, ValueError):
             pass
     return sorted(cpus)
-
-def refuse_if_machine_busy():
-    """Catch a second run started by accident."""
-    try:
-        raw = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used",
-             "--format=csv,noheader,nounits"], text=True, timeout=5)
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        raw = ""
-    for line in raw.strip().splitlines():
-        bits = [b.strip() for b in line.split(",")]
-        if len(bits) != 3:
-            continue
-        idx, util, mem = bits[0], float(bits[1]), float(bits[2])
-        if util >= 25 or mem >= 2048:
-            raise SystemExit(
-                f"GPU {idx} is busy ({util:.0f}% util, {mem:.0f} MiB). "
-                "Another run already going?")
-    n = os.cpu_count() or 1
-    load = os.getloadavg()[0]
-    if load >= 0.5 * n:
-        raise SystemExit(
-            f"CPU load {load:.1f} on {n} CPUs. Another run already going?")
 
 
 def append_epoch(args, rec):
@@ -744,7 +718,6 @@ def main():
         args = dataclasses.replace(config.BASELINE, **over)
         args.git = config.git_sha()
         args.out = name if name.startswith("runs/") else f"runs/{name}"
-    refuse_if_machine_busy()
     if resume:
         if not os.path.isdir(args.out):
             raise SystemExit(f"resume output {args.out} does not exist")

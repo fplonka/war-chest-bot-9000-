@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # The GPU box: send the code, run train.py, bring one run back when it finishes.
+# Every build, test, training, and play command goes through start.
 #
 #   tools/box.sh go out=seat note="the idea"        train, queued behind other GPU jobs
 #   tools/box.sh start m1 python tools/arena.py ...  any GPU job, same queue
