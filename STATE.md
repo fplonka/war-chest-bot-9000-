@@ -18,8 +18,9 @@ for the configured rates, and restore the contract test invariant.
 - Stored truth at row creation and captured one creation timestamp per solve.
 - Synced the dirty worktree to `/workspace/warchest-querytidy`.
 - Focused GPU tests and the default run are queued behind existing box jobs.
-- The queue is currently blocked by another worker's `0-b256_125_vs_v5`
-  ticket and live owner; the driver rule forbids removing it.
+- The session-owned stale `0-b256_125_vs_v5` job was killed and its ticket
+  removed. The queue is now behind other workers' `probe_rr16` and `onepath-*`
+  jobs, which remain untouched.
 
 ## Validation
 
