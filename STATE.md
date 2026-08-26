@@ -31,6 +31,7 @@ Remove the runtime host solver. Keep CUDA as the only runtime solver and keep ex
 - Read the surviving queued jobs before restarting work. They wait behind `b256_125`.
 - The inherited `onepath-*` queued jobs were terminated externally without exit files. Do not alter their files or tickets.
 - This session queued its own gates as `onepath-pi-gpu`, `onepath-pi-after`, `onepath-pi-cuda30`, and `onepath-pi-arena200`. After the queue harness changed, it killed only these four owned tags and restarted them through the current FIFO harness.
+- The first `onepath-pi-gpu` compile found two over-gated helpers: runtime `worker_seed` was absent, and test-only `ncells` was declared in production. Both are fixed; queue a fresh full test before the remaining gates.
 - `onepath-pi-gpu` runs the required full `cargo test --features gpu`; `onepath-pi-after` uses the baseline farmbench settings.
 - `onepath-pi-cuda30` is the default 30-minute run. `onepath-pi-arena200` copies its packed bot, sets that copy to DCFR, asserts `sweep3_b256` is DCFR, and swaps seats over 200 games.
 - Re-ran the thermo-nuclear review. The runtime has one direct CUDA state machine; the host evaluator, arenas, solver, replay helpers, and backend adapter compile only under `cfg(test)`.

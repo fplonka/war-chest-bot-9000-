@@ -1780,9 +1780,9 @@ impl Solver {
             }
         }
         self.cur.extend_from_slice(&u);
-        let ncells = self.ncells;
         #[cfg(test)]
         {
+            let ncells = self.ncells;
             let h = &mut self.oracle.cfr;
             h.regret.resize(ncells, 0.0);
             h.visits.resize(ncells, 0.0);
