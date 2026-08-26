@@ -3205,10 +3205,7 @@ impl Solver {
                                     self.cur[so + cell] *= inv;
                                 }
                             } else {
-                                let v = 1.0 / row.len().max(1) as f32;
-                                for cell in row {
-                                    self.cur[so + cell] = v;
-                                }
+                                self.cur[so + row.start..so + row.end].fill(1.0 / row.len() as f32);
                             }
                         }
                         for x in cfr.sum_strat[i].iter_mut() {

@@ -1134,11 +1134,6 @@ fn normalized_weights_match_belief_normalize() {
 
 #[test]
 fn from_pairs_keeps_zero_weight_configs() {
-    // Support is reachability, never weight. A belief weight is a product of
-    // one strategy probability per decision; regret matching floors those at
-    // 1e-6, so after enough of them a reachable config's weight reaches
-    // exactly 0.0 in f32. Dropping it would shift every later strategy row
-    // index by one.
     let a = Config::default();
     let b = Config {
         hand: [1, 0, 0, 0, 0],

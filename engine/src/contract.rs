@@ -774,10 +774,7 @@ impl Contract {
                             cur[so + cell] *= inv;
                         }
                     } else {
-                        let v = 1.0 / (b - a).max(1) as f32;
-                        for cell in a..b {
-                            cur[so + cell] = v;
-                        }
+                        cur[so + a..so + b].fill(1.0 / (b - a) as f32);
                     }
                 }
                 for x in sum[so..so + cells].iter_mut() {

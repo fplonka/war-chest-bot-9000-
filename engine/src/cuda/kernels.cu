@@ -951,7 +951,7 @@ __global__ void k_backprop_sweep(const Tree* trees, const unsigned int* work, in
             float inv = 1.0f / total;
             for (unsigned int cell = a + lane; cell < b; cell += 32) t.cur[so + cell] *= inv;
         } else {
-            float v = 1.0f / fmaxf((float)(b - a), 1.0f);
+            float v = 1.0f / (float)(b - a);
             for (unsigned int cell = a + lane; cell < b; cell += 32) t.cur[so + cell] = v;
         }
     }
