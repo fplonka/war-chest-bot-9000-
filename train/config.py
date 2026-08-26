@@ -16,7 +16,9 @@ class Cfg:
 
     batch: int = 256
     lr: float = 1e-3
-    lr_decay_frac: str = "0.33,0.67"
+    # Flat through this fraction of self-play, then cosine to lr_final.
+    lr_final: float = 1e-4
+    lr_stable_frac: float = 0.75
     # Gradient updates per generated row — Student of Games' "max grad updates
     # per example", which it runs at 10 for poker and 5 for Scotland Yard. A
     # solve yields one row now, so this is also updates per solve.

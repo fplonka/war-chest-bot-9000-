@@ -33,6 +33,7 @@ import argparse
 import collections
 import dataclasses
 import json
+import math
 import os
 import pathlib
 import sys
@@ -67,6 +68,19 @@ N_HEXES = warchest.N_HEXES
 # since the farm started. `rounds` is the denominator of the other three.
 ROUND_KEYS = ("rounds", "round_calls", "round_rows", "round_nanos", "budget_hits")
 RESUME_GRACE_ROWS = 100_000
+
+
+def scheduled_lr(initial, final, elapsed, duration, stable_frac):
+    """Flat warm self-play rate followed by a cosine decay to ``final``."""
+    if stable_frac >= 1.0 or initial == final:
+        return initial
+    stable = stable_frac * duration
+    if elapsed <= stable:
+        return initial
+    if elapsed >= duration:
+        return final
+    progress = (elapsed - stable) / (duration - stable)
+    return final + (initial - final) * (1.0 + math.cos(math.pi * progress)) / 2.0
 
 
 def action_feats(pa):
@@ -783,7 +797,6 @@ def main():
     if args.init_weights:
         value.load_state_dict(load_checkpoint(args.init_weights).state_dict())
     opt = torch.optim.Adam(value.parameters(), lr=args.lr)
-    lr_decays = sorted(float(x) for x in args.lr_decay_frac.split(",") if x.strip())
     value.push()
     target_state = cpu_state(value)
     buf = Buffer(args.cap, args.cap * args.cfgs_per_row)
@@ -849,14 +862,12 @@ def main():
         "optimizer_steps": 0,
         "generated_rows": 0,
         "next_target": None,
-        "next_decay": 0,
         "farm_runs": 0,
         "totals": {},
     }
     sog_t0 = (t0 + progress["sog_start"]
               if progress["sog_start"] is not None else None)
     sog_solves = int(progress["sog_solves"])
-    next_decay = int(progress["next_decay"])
     # The marker-differential payoff at the horizon distorts the game being
     # solved, so it tracks the recent fraction of finished games that hit the
     # horizon. Evaluation always runs on the real game (value 0).
@@ -937,6 +948,13 @@ def main():
 
     def fit(nsteps, deadline=None):
         """Adam updates on the shared replay. Returns (loss, wall_s, stats)."""
+        if sog_t0 is not None:
+            target_lr = scheduled_lr(
+                args.lr, args.lr_final, time.time() - sog_t0,
+                total - warm, args.lr_stable_frac)
+            lr = min(opt.param_groups[0]["lr"], target_lr)
+            for pg in opt.param_groups:
+                pg["lr"] = lr
         if nsteps < 1 or len(buf) < args.batch:
             return float("nan"), 0.0, {}
         tt = time.time()
@@ -949,7 +967,7 @@ def main():
 
     def run_search_pipeline():
         """Overlap small GT-CFR batches with each other and with training."""
-        nonlocal probe, cap_v, next_decay, sog_solves, target_state
+        nonlocal probe, cap_v, sog_solves, target_state
 
         deadline = t0 + total
         if time.time() >= deadline:
@@ -1003,7 +1021,6 @@ def main():
                 "optimizer_steps": optimizer_steps,
                 "generated_rows": generated_rows,
                 "next_target": next_target - t0,
-                "next_decay": next_decay,
                 "totals": dict(totals),
             })
 
@@ -1112,15 +1129,6 @@ def main():
                 while next_target <= now:
                     next_target += args.target_every * 60.0
             sog_elapsed = max(0.0, now - sog_t0)
-            while next_decay < len(lr_decays) and \
-                    sog_elapsed >= lr_decays[next_decay] * total:
-                for pg in opt.param_groups:
-                    pg["lr"] /= 2
-                print(
-                    f"[t={now - t0:6.1f}s] --- lr -> "
-                    f"{opt.param_groups[0]['lr']:.2e} ---",
-                    flush=True)
-                next_decay += 1
             save_progress()
             if regenerating:
                 if now >= grace_report:
@@ -1411,6 +1419,7 @@ def main():
     print(f"[cfg] PUBFEAT={PUBFEAT} CFEAT={CFEAT} architecture=gt-cfr "
           f"s={args.s} c={args.c} "
           f"budget={total:.0f}s warm={args.warm_minutes:g}min "
+          f"lr={args.lr:g}->{args.lr_final:g} stable={args.lr_stable_frac:g} "
           f"snapshot_every={args.snapshot_every:g}min device={dev} "
           f"draft={'random' if args.random_draft else 'starter'} "
           f"replay_ratio={args.replay_ratio} "
@@ -1423,6 +1432,10 @@ def main():
     warm = args.warm_minutes * 60.0
     if not 0.0 <= warm <= total:
         raise SystemExit("warm_minutes must be between zero and the run length")
+    if args.lr <= 0.0 or args.lr_final <= 0.0 or args.lr_final > args.lr:
+        raise SystemExit("lr_final must be positive and no greater than lr")
+    if not 0.0 <= args.lr_stable_frac <= 1.0:
+        raise SystemExit("lr_stable_frac must be between zero and one")
     if sog_t0 is None:
         while True:
             el = time.time() - t0
