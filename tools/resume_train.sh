@@ -16,8 +16,7 @@ run=${out#runs/}
 dir="runs/$run"
 
 newest_snapshot() {
-    find "$dir" -maxdepth 1 -type f -name 'snap_*.pt' -printf '%T@ %p\n' 2>/dev/null \
-        | sort -nr | sed -n '1s/^[^ ]* //p'
+    ls -1t "$dir"/snap_*.pt 2>/dev/null | head -1
 }
 
 resume=$(newest_snapshot || true)
