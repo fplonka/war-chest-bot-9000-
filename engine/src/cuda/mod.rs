@@ -748,7 +748,9 @@ impl Pack {
 }
 
 struct Card {
+    /// Main network and tree stream.
     stream: Arc<CudaStream>,
+    /// Expansion walks overlap the next network and terminal pass.
     expand_stream: Arc<CudaStream>,
     blas: CudaBlas,
     k: Arc<Kernels>,
