@@ -32,12 +32,15 @@ Remove the runtime host solver. Keep CUDA as the only runtime solver and keep ex
 - The inherited `onepath-*` queued jobs were terminated externally without exit files. Do not alter their files or tickets.
 - This session queued its own gates as `onepath-pi-gpu`, `onepath-pi-after`, `onepath-pi-cuda30`, and `onepath-pi-arena200`. After the queue harness changed, it killed only these four owned tags and restarted them through the current FIFO harness.
 - The first `onepath-pi-gpu` compile found two over-gated helpers: runtime `worker_seed` was absent, and test-only `ncells` was declared in production. Both are fixed; queue a fresh full test before the remaining gates.
+- Committed those fixes as `36dcb9e` and queued the replacement full test as `onepath-pi2-gpu`.
+- The recorded baseline predates the merge-base at `4ac184a`, and the terminated after-run's first sample was not comparable. Queued a clean merge-base benchmark as `onepath-pi2-base`, followed by the current branch as `onepath-pi2-after`, with the same corpus and settings.
 - `onepath-pi-gpu` runs the required full `cargo test --features gpu`; `onepath-pi-after` uses the baseline farmbench settings.
 - `onepath-pi-cuda30` is the default 30-minute run. `onepath-pi-arena200` copies its packed bot, sets that copy to DCFR, asserts `sweep3_b256` is DCFR, and swaps seats over 200 games.
 - Re-ran the thermo-nuclear review. The runtime has one direct CUDA state machine; the host evaluator, arenas, solver, replay helpers, and backend adapter compile only under `cfg(test)`.
 
 ## Next
 
-1. Follow `onepath-pi-gpu`, `onepath-pi-after`, `onepath-pi-cuda30`, and `onepath-pi-arena200` in order; fix any failed gate without weakening parity.
-2. Compare farmbench with the recorded baseline, inspect the default run, and report the arena score and p-value.
-3. Complete the final diff review and report.
+1. Follow `onepath-pi2-gpu`, `onepath-pi2-base`, and `onepath-pi2-after`; fix any failed gate without weakening parity.
+2. Run the default 30-minute `go`, then the 200-game two-seat DCFR arena.
+3. Compare farmbench, inspect the default run, and report the arena score and p-value.
+4. Complete the final diff review and report.
