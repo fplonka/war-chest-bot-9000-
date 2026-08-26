@@ -860,7 +860,6 @@ def main():
     sog_t0 = (t0 + progress["sog_start"]
               if progress["sog_start"] is not None else None)
     sog_solves = int(progress["sog_solves"])
-    next_decay = int(progress["next_decay"])
     probe = None
 
     # Snapshots are archival only. Evaluate the packed bots separately after
@@ -946,7 +945,7 @@ def main():
 
     def run_search_pipeline():
         """Overlap small GT-CFR batches with each other and with training."""
-        nonlocal probe, next_decay, sog_solves, target_state
+        nonlocal probe, sog_solves, target_state
 
         deadline = t0 + total
         if time.time() >= deadline:
