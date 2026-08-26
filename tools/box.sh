@@ -68,23 +68,19 @@ sync)
     echo "synced -> $host:$remote"
     ;;
 pull)
-    if [ -n "${2:-}" ]; then
-        name=$2
-        mkdir -p "$local_dir/runs/$name"
-        # `*.tmp` is a live run writing log.json atomically; rsync would list it,
-        # find it replaced, and exit 24 mid-run.
-        rsync -az -e "ssh ${ssh_opts[*]}" --exclude '*.tmp' \
-            "root@$host:$remote/runs/$name/" "$local_dir/runs/$name/"
-        echo "pulled $name"
-    else
-        mkdir -p "$local_dir/runs"
-        rsync -az -e "ssh ${ssh_opts[*]}" --exclude '*.tmp' \
-            --include '*/' --include '*.html' --include 'plotly.min.js' \
-            --include 'log.json' --include 'ladder*.json' --include 'config.json' \
-            --include 'NOTES.md' --include 'train.log' --exclude '*' \
-            "root@$host:$remote/runs/" "$local_dir/runs/"
-        echo "pulled runs"
+    name=${2:-}
+    filters=(--exclude '*.tmp')
+    if [ -z "$name" ]; then
+        filters+=(--include '*/' --include '*.html' --include 'plotly.min.js'
+                  --include 'log.json' --include 'ladder*.json' --include 'config.json'
+                  --include 'NOTES.md' --include 'train.log' --exclude '*')
     fi
+    # `*.tmp` is a live run writing log.json atomically; rsync would list it,
+    # find it replaced, and exit 24 mid-run.
+    mkdir -p "$local_dir/runs${name:+/$name}"
+    rsync -az -e "ssh ${ssh_opts[*]}" "${filters[@]}" \
+        "root@$host:$remote/runs/$name/" "$local_dir/runs${name:+/$name}/"
+    echo "pulled ${name:-runs}"
     ;;
 build)
     "$0" start build bash -c "$build_script"
