@@ -530,10 +530,7 @@ impl Game {
                     {
                         let y0 = vec![policy::eval_squashed(&self.s, 0); self.bel[0].cfg.len()];
                         let y1 = vec![policy::eval_squashed(&self.s, 1); self.bel[1].cfg.len()];
-                        let truth = [
-                            self.true_index(0) as u32,
-                            self.true_index(1) as u32,
-                        ];
+                        let truth = [self.true_index(0) as u32, self.true_index(1) as u32];
                         self.data.begin_solve();
                         self.data.push_value(
                             &self.s,
@@ -572,10 +569,7 @@ impl Game {
         if let Some(solved) = solved {
             // The row is stored under the belief that is about to be updated,
             // so the seats' realised configs are read here and not at `finish`.
-            let truth = [
-                self.true_index(0) as u32,
-                self.true_index(1) as u32,
-            ];
+            let truth = [self.true_index(0) as u32, self.true_index(1) as u32];
             self.data.begin_solve();
             self.data.push_value(
                 &self.s,

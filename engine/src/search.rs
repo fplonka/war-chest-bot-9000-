@@ -1712,7 +1712,10 @@ impl Solver {
             .iter()
             .filter(|&&(node, _)| !self.nodes[node].leaf)
             .count();
-        debug_assert_eq!(non_leaf, 0, "query sampler selected {non_leaf} non-leaf nodes");
+        debug_assert_eq!(
+            non_leaf, 0,
+            "query sampler selected {non_leaf} non-leaf nodes"
+        );
         let mut cut = 0;
         for (node, slot) in query_nodes {
             let beliefs = std::array::from_fn(|p| {
@@ -1720,7 +1723,10 @@ impl Solver {
                 let mut w = vec![0.0; n];
                 normalize_weights(&reach[cut..cut + n], &mut w);
                 cut += n;
-                Belief { cfg: self.nodes[node].cfgs[p].to_vec(), p: w }
+                Belief {
+                    cfg: self.nodes[node].cfgs[p].to_vec(),
+                    p: w,
+                }
             });
             self.store_query(slot, (self.states[node].clone(), beliefs));
         }
@@ -4262,8 +4268,7 @@ impl Solver {
                     + self.primed.capacity()
                     + z(&self.leaf_rows)
                     + z(&self.term_leaves)
-                    + self.query_nodes.capacity()
-                        * std::mem::size_of::<(usize, Option<usize>)>(),
+                    + self.query_nodes.capacity() * std::mem::size_of::<(usize, Option<usize>)>(),
             ),
             ("cur", f(&self.cur)),
             ("avg", f(&self.avg)),
