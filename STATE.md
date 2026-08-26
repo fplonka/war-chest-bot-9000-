@@ -12,4 +12,4 @@
 - Resume gate first phase: `go minutes=20 snapshot_every=5` ran to about 12.5 minutes, was killed with `box.sh kill`, and left `snap_0002.pt`; remote sizes were log 1,017 B, epochs 107,883 B, and snapshots 12,788,036 / 14,015,582 / 14,015,646 B.
 - Resume gate passed: the wrapper resumed `snap_0002.pt` with `minutes=25`, waited for 100,000 fresh rows, then trained; first post-grace record had `steps=0`, `optimizer_debt=0.0`, and the next had 44 steps. Exit was 0. Final remote sizes: log 1,226 B, epochs 214,482 B, snapshots 12,788,036 / 14,015,582 / 14,015,646 / 14,015,710 / 14,015,774 / 14,015,838 B.
 - Dashboard verification: pulled JSONL rendered 28 panels in 4 ms; log keys are only `cfg` and `snapshots`, and checkpoints contain neither `epochs` nor `replay_rows`.
-- Next: commit this state and report the artifacts, verification, protected delegated regions, and 24-hour command.
+- Final: commit `1bb38a9` contains the state and logged-epoch cleanup; report the artifacts, verification, protected delegated regions, and 24-hour command.
