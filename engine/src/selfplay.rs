@@ -162,7 +162,8 @@ pub struct Data {
     /// row is expanded when a batch is made, so the stored bytes never go
     /// stale as the network changes.
     pub rows: Vec<u8>,
-    /// Per-row metadata shared with the Python replay buffer.
+    /// Per-row metadata shared with the Python replay buffer. Query rows use
+    /// `SOURCE_QUERY`; game rows also carry true configs and White's outcome.
     pub columns: RowColumns,
     /// `[total_configs, CCOUNTS]` raw counts per config, in the arena order.
     /// Raw rather than normalised: they are `u8`-valued, and storing them that
@@ -193,9 +194,6 @@ pub struct Data {
     pub pcell: Vec<u16>,
     pub pprob: Vec<f32>,
 
-    /// Per-row columns use `SOURCE_QUERY` for coverage rows. Other rows belong
-    /// to a game and carry its source, true configs, and White's outcome;
-    /// Black's outcome is its negation.
     /// Decisions by coarse move class, for the run report's strategy mix.
     pub plays: [usize; 7],
 
