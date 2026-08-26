@@ -1367,6 +1367,16 @@ impl Solver {
         })
     }
 
+    /// The network batch keeps rows after growth for policy work, but only
+    /// live leaves are query roots.
+    fn leaf_query_rows(&self, from: usize) -> Vec<usize> {
+        self.leaf_rows[from..]
+            .iter()
+            .copied()
+            .filter(|&node| self.nodes[node].leaf)
+            .collect()
+    }
+
     /// Attach query-time beliefs to the device round's selected nodes.
     fn absorb_queries(&mut self, reach: &[f32]) {
         let mut cut = 0;
@@ -2440,13 +2450,14 @@ impl Solver {
         // nodes whose prior the card is to fill, which it does between the
         // scatter and the iteration that reads it.
         calls.push(self.tree_call());
-        let rows = self.leaf_rows.len();
+        let query_rows = self.leaf_query_rows(0);
+        let rows = query_rows.len();
         let selected = self.plan_query_events(done * rows);
-        self.query_nodes = selected.iter().map(|&e| self.leaf_rows[e % rows]).collect();
+        self.query_nodes = selected.iter().map(|&e| query_rows[e % rows]).collect();
         let query = selected
             .into_iter()
             .map(|e| {
-                let node = self.leaf_rows[e % rows];
+                let node = query_rows[e % rows];
                 QueryPick {
                     iter: (e / rows) as u32,
                     reach: self.roff[node],

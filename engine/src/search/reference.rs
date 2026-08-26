@@ -884,9 +884,10 @@ impl Solver {
         if self.net.is_empty() {
             return;
         }
-        let selected = self.plan_query_events(self.leaf_rows.len() - from);
+        let rows = self.leaf_query_rows(from);
+        let selected = self.plan_query_events(rows.len());
         for event in selected {
-            let node = self.leaf_rows[from + event];
+            let node = rows[event];
             self.queries
                 .push((self.states[node].clone(), self.belief_at(node)));
         }

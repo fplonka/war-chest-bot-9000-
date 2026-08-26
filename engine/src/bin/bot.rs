@@ -33,7 +33,7 @@ struct Options {
 
 fn options() -> Result<Options, String> {
     let a = Args::parse(&[
-        "name", "weights", "mind", "s", "c", "batch", "rounds", "refresh", "puct",
+        "name", "weights", "mind", "s", "c", "batch", "rounds", "puct",
         "prior_temp", "cfr", "threads", "temp", "devices",
     ])?;
     let mind = match a.text("mind", "sog").as_str() {
@@ -50,7 +50,7 @@ fn options() -> Result<Options, String> {
         weights: a.text("weights", ""),
         mind,
         cfg: Cfg { s, c: a.num("c", 8.0)?, batch: a.num("batch", 8)?,
-            rounds: a.num("rounds", 0)?, refresh: a.num("refresh", 1)?,
+            rounds: a.num("rounds", 0)?,
             puct: a.num("puct", 1.5)?, prior_temp: a.num("prior_temp", 1.0)?, cfr,
             budget: Budget::for_s(s), ..Default::default() },
         threads: a.num("threads", 0)?,
