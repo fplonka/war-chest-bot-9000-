@@ -89,8 +89,11 @@ def main():
     for i, (u, v) in enumerate(zip(a, batch)):
         if i == 5:
             assert u == v
-            continue
-        torch.testing.assert_close(u, v, rtol=0, atol=1e-6)
+        elif i == 6:
+            for left, right in zip(u, v):
+                torch.testing.assert_close(left, right, rtol=0, atol=1e-6)
+        else:
+            torch.testing.assert_close(u, v, rtol=0, atol=1e-6)
     print("gpu batcher == host oracle on the same parts: OK")
 
     def stage(name, fn, iters=100):
