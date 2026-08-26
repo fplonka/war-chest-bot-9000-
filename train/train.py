@@ -407,6 +407,32 @@ def publish_state(state):
     net.push()
 
 
+def compiled_loss():
+    """Compile the measured loss path, with eager as the safe fallback."""
+    try:
+        compiled = torch.compile(losses, mode="default", dynamic=True)
+    except Exception as error:
+        print(f"[train] torch.compile unavailable; using eager: "
+              f"{type(error).__name__}: {error}", flush=True)
+        return losses
+
+    failed = False
+
+    def run(*args, **kwargs):
+        nonlocal failed
+        if failed:
+            return losses(*args, **kwargs)
+        try:
+            return compiled(*args, **kwargs)
+        except Exception as error:
+            failed = True
+            print(f"[train] torch.compile failed; using eager: "
+                  f"{type(error).__name__}: {error}", flush=True)
+            return losses(*args, **kwargs)
+
+    return run
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Train one run, then rate its snapshots against Greedy.")
@@ -523,9 +549,9 @@ def main():
     opt.step()
     forward_values(value, parts)
     torch.cuda.synchronize(dev)
-    # The benchmark chooses the loss implementation after the replay and
-    # batch path have been measured. Eager is the safe path until then.
-    step_loss = losses
+    # The replay and batch paths are measured. Default-mode compile is now the
+    # measured loss path; a graph failure falls back to eager in compiled_loss.
+    step_loss = compiled_loss()
     if checkpoint:
         value.load_state_dict(checkpoint["value"])
         opt.load_state_dict(checkpoint["optimizer"])
