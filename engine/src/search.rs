@@ -1018,12 +1018,10 @@ pub struct Solver {
     /// a multiply-then-divide reconstruction of it.
     pub(crate) avg_touched: [bool; 2],
     /// Total legal strategy cells across decision nodes: the length of `cur`,
-    /// `regret` and `avg`, and where the next expanded node's region starts.
+    /// `avg`, and the card's strategy arenas.
     pub ncells: usize,
-    /// Reach and value cells the tree has: the lengths `HostCfr::reach` and
-    /// `HostCfr::vals` are held at, and the sizes the card fits its own two
-    /// arenas to. Counted rather than read off a `Vec`, because on the device
-    /// path there is no `Vec` to read them off.
+    /// Reach and value cells the tree has. The card fits its arenas to these
+    /// counts; no host vector exists in production.
     pub nreach: usize,
     pub nvals: usize,
     /// Draw-transition entries over the whole tree, which the budget bounds and
@@ -1067,15 +1065,11 @@ pub struct Solver {
     // ---------------------------------------------------------- leaf batch
     // Built once per solve. Everything here is a property of the leaf's public
     // state or its config support, so it survives every CFR iteration; only
-    // the belief block `xb` and the join output `h` are rewritten
-    // per iteration. That split is the whole architecture: the trunk runs
-    // ~2,000 times a solve and the join ~158,000.
-    /// Non-terminal network rows in node order. Grown rows stay in this batch
-    /// for policy work; `leaf_query_rows` selects the live leaves.
+    // the device's belief block and join output are rewritten per iteration.
+    // That split is the whole architecture: the trunk runs ~2,000 times a
+    // solve and the join ~158,000.
+    /// Non-terminal leaves in node order — the rows of the network batch.
     pub leaf_rows: Vec<usize>,
-    /// Per traverser: how many leaf rows `HostCfr::vcache` holds a network
-    /// value for. Rows past it are the ones growth has added since the last
-    /// query, and they are queried whatever `Cfg::refresh` says.
     /// Terminal leaves, scored from the game instead of the network.
     pub(crate) term_leaves: Vec<usize>,
     /// Per row, per player: an index into `cphi` for every config in support,
@@ -1096,14 +1090,9 @@ pub struct Solver {
     batch_rows: usize,
     batch_boards: usize,
     batch_cfgs: usize,
-    /// `[ncfg, D]` readout rows `f(c)` and `[ncfg, POOL]` pooling vectors
-    /// `g(c)`. Both survive every CFR iteration.
-    /// `[ncfg, D]` policy readout rows `f_p(c)`, beside the value's `f(c)`.
     /// `[2, NTYPE, TYPE]`: the printed-card tokens, one table per player view.
     /// The draft is fixed for the solve, so this is built once.
     pub cards: Vec<f32>,
-    /// `[boards, D]` board vectors, and their `[boards, JW]` projection into
-    /// the join's first layer. Neither moves between CFR iterations.
     /// `[row]` -> the board vector the row reads.
     ///
     /// The trunk reads the public state and nothing else, and a tree that
@@ -1128,9 +1117,6 @@ pub struct Solver {
     pub(crate) packed: Vec<u8>,
     /// The mirrored packed first leaf, which is all the card table wants.
     mirror0: Vec<u8>,
-    /// `[2 * rows, POOL]` pooled belief embeddings — the one thing the join
-    /// reads that moves between CFR iterations.
-    /// `[rows, D]`: the join output for the last traverser queried.
     /// The expansion in flight has passed its bound and is unwinding.
     abandon: bool,
     /// Working memory for the chance transitions, reused across the tree.

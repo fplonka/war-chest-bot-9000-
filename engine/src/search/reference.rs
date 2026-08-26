@@ -71,13 +71,17 @@ pub struct HostCfr {
 #[derive(Default)]
 pub(crate) struct ReferenceState {
     pub cfr: HostCfr,
+    /// Per traverser, leaf rows already held in `cfr.vcache`.
     pub(super) cached: [usize; 2],
     pub trace: Trace,
+    /// Cached config readouts and pooling vectors.
     pub cf: Vec<f32>,
     pub cg: Vec<f32>,
     pub cp: Vec<f32>,
+    /// Cached board vectors and their join projection.
     pub pb: Vec<f32>,
     pub jp: Vec<f32>,
+    /// Belief pooling and join scratch.
     pub xb: Vec<f32>,
     pub h: Vec<f32>,
     pub(super) wbuf: Vec<f32>,
