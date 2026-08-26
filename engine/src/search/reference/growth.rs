@@ -322,6 +322,7 @@ impl Solver {
     /// `a` and advances `seed` by the draws the phase makes.
     #[doc(hidden)]
     pub fn replay_expansion(&mut self, a: &Arenas, want: usize, taken: &mut Vec<usize>) {
+        self.init_reference();
         let cells = self.ncells;
         self.cur.copy_from_slice(&a.cur[..cells]);
         // A device solve has no arenas of its own, which is the whole point:

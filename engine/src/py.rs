@@ -487,7 +487,9 @@ impl Game {
 // and pulls tensors back once per epoch.
 
 use crate::net::Net;
-use crate::farm::{Backend, Farm, Work};
+use crate::farm::Work;
+#[cfg(feature = "gpu")]
+use crate::farm::Farm;
 use crate::search::{Budget, Cfg, Cfr, Ent};
 use crate::selfplay::{run_static_games, Agent, Collect, Data, GameCfg};
 use numpy::{IntoPyArray, PyReadonlyArray1};
@@ -662,7 +664,9 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
 /// the same address space.
 #[pyclass]
 struct SolveFarm {
+    #[cfg(feature = "gpu")]
     farm: Farm,
+    #[cfg(feature = "gpu")]
     net_version: u64,
 }
 
@@ -717,80 +721,93 @@ impl SolveFarm {
                 }
             }
         };
-        let version = NET_VERSION.load(Ordering::Acquire);
-        let backend = backend_for(&devices, (**nets().read()).clone(), cfg)?;
-        Ok(SolveFarm {
-            farm: Farm::new(seed, workers, work, backend),
-            net_version: version,
-        })
+        #[cfg(feature = "gpu")]
+        {
+            let version = NET_VERSION.load(Ordering::Acquire);
+            let device = device_for(&devices, (**nets().read()).clone(), cfg)?;
+            Ok(SolveFarm {
+                farm: Farm::new(seed, workers, work, device),
+                net_version: version,
+            })
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = (seed, workers, work, devices, cfg);
+            Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "built without the `gpu` feature: there is no CUDA solve farm",
+            ))
+        }
     }
 
     /// Run rounds until at least `solves` rows are ready, then hand them over.
     #[pyo3(signature = (solves=1))]
     fn collect(&mut self, py: Python<'_>, solves: usize) -> PyResult<PyObject> {
-        if solves == 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "solves must be positive",
-            ));
+        #[cfg(feature = "gpu")]
+        {
+            if solves == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "solves must be positive",
+                ));
+            }
+            check_nets()?;
+            let version = NET_VERSION.load(Ordering::Acquire);
+            if self.net_version != version {
+                self.farm
+                    .publish((**nets().read()).clone())
+                    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+                self.net_version = version;
+            }
+            let d = py.allow_threads(|| self.farm.drive(solves));
+            if self.farm.broken() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "a card could not answer a round; the solves it held are gone. \
+                     The driver prints the reason, and out of memory is the usual \
+                     one.",
+                ));
+            }
+            let out = data_to_dict(py, d)?;
+            let dict = out.bind(py).downcast::<PyDict>()?.clone();
+            // How well the batching is working: calls per round is how many solves
+            // shared a forward pass.
+            let s = self.farm.stats();
+            let read = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+            dict.set_item("rounds", read(&s.rounds))?;
+            dict.set_item("round_calls", read(&s.calls))?;
+            dict.set_item("round_rows", read(&s.rows))?;
+            dict.set_item("round_nanos", read(&s.nanos))?;
+            // What the population is, rather than what it is guessed to be: solves
+            // in flight, what the host budget allowed at the last admission, and
+            // the largest a solve has grown to in host bytes.
+            dict.set_item("slots", s.slots())?;
+            dict.set_item("slots_used", s.used())?;
+            dict.set_item("slots_per_card", s.slots_per_card())?;
+            dict.set_item("slot_bytes", s.slot_bytes())?;
+            dict.set_item("budget_hits", s.budget_hits())?;
+            dict.set_item("entity_hits", s.entity_hits())?;
+            dict.set_item("shapes", s.take_shapes())?;
+            Ok(out)
         }
-        check_nets()?;
-        let version = NET_VERSION.load(Ordering::Acquire);
-        if self.net_version != version {
-            self.farm
-                .publish((**nets().read()).clone())
-                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
-            self.net_version = version;
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = (py, solves);
+            Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "built without the `gpu` feature: there is no CUDA solve farm",
+            ))
         }
-        let d = py.allow_threads(|| self.farm.drive(solves));
-        if self.farm.broken() {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "a card could not answer a round; the solves it held are gone. \
-                 The driver prints the reason, and out of memory is the usual \
-                 one.",
-            ));
-        }
-        let out = data_to_dict(py, d)?;
-        let dict = out.bind(py).downcast::<PyDict>()?.clone();
-        // How well the batching is working: calls per round is how many solves
-        // shared a forward pass.
-        let s = self.farm.stats();
-        let read = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
-        dict.set_item("rounds", read(&s.rounds))?;
-        dict.set_item("round_calls", read(&s.calls))?;
-        dict.set_item("round_rows", read(&s.rows))?;
-        dict.set_item("round_nanos", read(&s.nanos))?;
-        // What the population is, rather than what it is guessed to be: solves
-        // in flight, what the host budget allowed at the last admission, and
-        // the largest a solve has grown to in host bytes.
-        dict.set_item("slots", s.slots())?;
-        dict.set_item("slots_used", s.used())?;
-        dict.set_item("slots_per_card", s.slots_per_card())?;
-        dict.set_item("slot_bytes", s.slot_bytes())?;
-        dict.set_item("budget_hits", s.budget_hits())?;
-        dict.set_item("entity_hits", s.entity_hits())?;
-        dict.set_item("shapes", s.take_shapes())?;
-        Ok(out)
     }
 }
 
-/// The devices. There is no CPU fallback on purpose: a run that cannot reach a
-/// GPU is two orders of magnitude off and should say so rather than crawl.
-fn backend_for(
-    _devices: &[usize],
-    _value: crate::net::Net,
-    #[allow(unused)] cfg: Cfg,
-) -> PyResult<Backend> {
-    #[cfg(feature = "gpu")]
-    {
-        let max_slots = crate::farm::host_slots(cfg.budget);
-        return crate::cuda::Device::new(_devices, _value, cfg, max_slots)
-            .map(Backend::Cuda)
-            .map_err(pyo3::exceptions::PyRuntimeError::new_err);
-    }
-    #[cfg(not(feature = "gpu"))]
-    Err(pyo3::exceptions::PyRuntimeError::new_err(
-        "built without the `gpu` feature: there is no CPU inference path",
-    ))
+/// The device farm. There is no CPU fallback: a run that cannot reach a GPU
+/// must fail rather than crawl.
+#[cfg(feature = "gpu")]
+fn device_for(
+    devices: &[usize],
+    value: crate::net::Net,
+    cfg: Cfg,
+) -> PyResult<crate::cuda::Device> {
+    let max_slots = crate::farm::host_slots(cfg.budget);
+    crate::cuda::Device::new(devices, value, cfg, max_slots)
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
 }
 
 /// Run `games` self-play games across all cores and return the training data.

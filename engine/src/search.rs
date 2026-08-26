@@ -140,12 +140,8 @@ impl Default for Budget {
 }
 
 impl Budget {
-    /// No budget at all.
-    ///
-    /// `Solver::grow_full` builds a whole subgame for the CPU oracle to compare
-    /// against, and a bound on that is a bound on the reference. Nothing a run
-    /// uses takes this: it is the tests' way of saying they want the whole
-    /// game, and saying it out loud rather than through a second growth path.
+    /// No budget at all for a complete test-oracle subgame.
+    #[cfg(test)]
     pub fn unbounded() -> Budget {
         Budget {
             nodes: usize::MAX,
@@ -278,7 +274,7 @@ pub struct Cfg {
     /// also why `refresh` aligned with `batch` is the natural setting: the
     /// round's first iteration has to run the network for the new rows anyway.
     ///
-    /// Host path only. The card holds no `h` per row between iterations.
+    /// The test oracle's interval between full value-network queries.
     #[cfg(test)]
     pub refresh: u32,
     /// The regret-update rule.
@@ -332,9 +328,13 @@ impl Cfg {
     ///
     /// The first iteration of every `refresh`, so `refresh = batch` puts the
     /// query at the start of a round and nowhere else in it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "gpu"))]
     fn refresh_due(&self, done: usize) -> bool {
-        self.refresh > 0 && done % self.refresh as usize == 0
+        #[cfg(test)]
+        let refresh = self.refresh;
+        #[cfg(not(test))]
+        let refresh = 1;
+        refresh > 0 && done % refresh as usize == 0
     }
 
     /// Expansions the solve owes after its `i`-th regret update, one-based.
@@ -449,7 +449,7 @@ impl Cfr {
 
     /// `t^p / (t^p + 1)`, with the infinities that name "do not discount" and
     /// "discard entirely" evaluated rather than computed.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "gpu"))]
     fn factor(t: f32, p: f32) -> f32 {
         if p.is_infinite() {
             return if p > 0.0 { 1.0 } else { 0.0 };
@@ -457,46 +457,6 @@ impl Cfr {
         let x = t.powf(p);
         x / (x + 1.0)
     }
-}
-
-/// What a solve built, in the units the device charges for. See `Solver::shape`.
-#[derive(Default, Clone, Copy, Debug)]
-pub struct Shape {
-    pub nodes: usize,
-    /// Network rows: one per decision node at a coin play, ever created. The
-    /// join runs over all of them every iteration, including the rows of nodes
-    /// that growth has since made interior.
-    pub rows: usize,
-    /// Distinct public states among those rows. The trunk runs once per board,
-    /// not once per row: coin plays commute, so a tree spanning one round
-    /// reaches the same public state several ways.
-    pub boards: usize,
-    pub cells: usize,
-    /// Distinct configs the solve interned. `f` is `[ncfg, D]` and the readout
-    /// gathers rows of it, so this is the working set that decides whether the
-    /// gather hits L2 or memory.
-    pub ncfg: usize,
-    /// Belief-index entries over the rows: one per (row, player, config in
-    /// support). The readout and the belief pooling each run once per entry
-    /// per iteration.
-    pub cidx: usize,
-    pub depth: usize,
-    /// The widest legal-action row in the tree: actions one config of one
-    /// decision node offers. `cells` is the sum of these over the tree, and
-    /// this is its tail.
-    pub acts: usize,
-    /// The largest config support at any node, over both players. The exact
-    /// maximum the game admits is 4 628 -- reserve (5,5,5,5,1), hand 3,
-    /// face-down 9 -- so this says how far a real tree is from it.
-    pub support: usize,
-    /// Reach entries: one per (node, player, config in support). `reach` is per
-    /// entry, `vals` is the larger of the two supports a node, and the `nc + 1`
-    /// offset arrays beside them are per entry too.
-    pub reach: usize,
-    pub vals: usize,
-    /// Draw-transition entries, forward and transposed: `draw_to`, `draw_p`,
-    /// `rvd_src` and `rvd_p` are per entry.
-    pub draws: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -780,30 +740,6 @@ pub struct Policy {
 pub const ACT_BYTES: usize = 5;
 
 impl TNode {
-    /// Host bytes this node's own lists hold, beside the struct itself.
-    ///
-    /// The config supports are shared between a node and its children, so they
-    /// are not counted here: charging every node for an `Arc` most of its
-    /// siblings hold too would make a tree look several times its size.
-    fn bytes(&self) -> usize {
-        let u = |v: &Vec<u32>| v.capacity() * 4;
-        self.draw.bytes()
-            + self.acts.capacity() * std::mem::size_of::<Action>()
-            + self.aslot.capacity()
-            + self.fdown.capacity()
-            + self.obs_child.capacity() * 8
-            + u(&self.obs_start)
-            + u(&self.obs_act)
-            + self.child.capacity() * 8
-            + u(&self.legal_off)
-            + u(&self.legal_action)
-            + u(&self.legal_child)
-            + u(&self.legal_trans)
-            + u(&self.action_off)
-            + u(&self.action_cell)
-            + u(&self.cell_row)
-    }
-
     #[inline]
     pub fn na(&self) -> usize {
         self.acts.len()
@@ -955,12 +891,10 @@ pub enum Step {
 }
 
 /// Exact host arithmetic used only by the CUDA parity oracle.
-#[cfg(test)]
+#[cfg(any(test, feature = "gpu"))]
 mod reference;
-#[cfg(test)]
-pub use reference::{Arenas, Back, Conv, HostCfr, Trace};
-#[cfg(test)]
-pub(crate) use reference::ReferenceState;
+#[cfg(any(test, feature = "gpu"))]
+pub use reference::{Arenas, Back, Conv, HostCfr, ReferenceState, Trace};
 
 pub struct Solver {
     /// Owned because a solver retains its context for its full solve.
@@ -1020,9 +954,13 @@ pub struct Solver {
     /// whole of it in `finish`; the device path reads the root's row and
     /// nothing else, so `read_back` sizes it to that row alone.
     pub avg: Vec<f32>,
-    /// Exact oracle state. Production builds omit this field; the card owns
-    /// the corresponding arenas and never copies them back.
-    #[cfg(test)]
+    /// Whether the host reference is active. Device solves leave it off, so
+    /// they keep no host copies of the card's arenas.
+    #[cfg(any(test, feature = "gpu"))]
+    reference: bool,
+    /// Exact host-reference state for tests and the parity target. The runtime
+    /// CUDA path never reads it; the card owns the corresponding arenas.
+    #[cfg(any(test, feature = "gpu"))]
     oracle: ReferenceState,
     /// Leaves that have become decision or chance nodes since a reader last
     /// looked. A flat description of the tree is append-only apart from these,
@@ -1228,7 +1166,9 @@ impl Solver {
             wants_prior: Vec::new(),
             soff: Vec::new(),
             avg: Vec::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "gpu"))]
+            reference: cfg!(test),
+            #[cfg(any(test, feature = "gpu"))]
             oracle: ReferenceState::default(),
             grown: Vec::new(),
             avg_touched: [false; 2],
@@ -1282,8 +1222,8 @@ impl Solver {
             // still holds a tree that fits.
             sv.nodes.reserve(640);
             sv.cur.reserve(640);
-            #[cfg(test)]
-            {
+            #[cfg(any(test, feature = "gpu"))]
+            if sv.reference {
                 let h = &mut sv.oracle.cfr;
                 h.reach.reserve(640);
                 h.vals.reserve(640);
@@ -1298,8 +1238,10 @@ impl Solver {
             // reaches for the tree that now exists. The card seeds and sweeps
             // its own, from the root beliefs the first tree call carries, so
             // on that path this pass would be redone before it was ever read.
-            #[cfg(test)]
-            sv.precompute_reaches();
+            #[cfg(any(test, feature = "gpu"))]
+            if sv.reference {
+                sv.precompute_reaches();
+            }
         }
         sv
     }
@@ -1469,8 +1411,8 @@ impl Solver {
         self.voff.push(self.nvals as u32);
         self.nreach += c0 + c1;
         self.nvals += c0.max(c1);
-        #[cfg(test)]
-        {
+        #[cfg(any(test, feature = "gpu"))]
+        if self.reference {
             let h = &mut self.oracle.cfr;
             h.reach.resize(self.nreach, 0.0);
             h.vals.resize(self.nvals, 0.0);
@@ -1710,8 +1652,8 @@ impl Solver {
         self.wants_prior.retain(|&i| (i as usize) < m.nodes);
         self.row_of.truncate(m.nodes);
         self.leaf_rows.truncate(m.leaf_rows);
-        #[cfg(test)]
-        {
+        #[cfg(any(test, feature = "gpu"))]
+        if self.reference {
             self.oracle.cached = self.oracle.cached.map(|k| k.min(m.leaf_rows));
         }
         // `packed` is written by index and reused, so only the count and the
@@ -1726,8 +1668,8 @@ impl Solver {
         self.cur.truncate(m.ncells);
         self.ncells = m.ncells;
         self.ndraws = m.ndraws;
-        #[cfg(test)]
-        {
+        #[cfg(any(test, feature = "gpu"))]
+        if self.reference {
             let h = &mut self.oracle.cfr;
             h.reach.truncate(self.nreach);
             h.vals.truncate(self.nvals);
@@ -1790,8 +1732,8 @@ impl Solver {
             }
         }
         self.cur.extend_from_slice(&u);
-        #[cfg(test)]
-        {
+        #[cfg(any(test, feature = "gpu"))]
+        if self.reference {
             let ncells = self.ncells;
             let h = &mut self.oracle.cfr;
             h.regret.resize(ncells, 0.0);
@@ -2314,13 +2256,13 @@ impl Solver {
     /// Record what `growth_calls` made resident. The test oracle also retains
     /// the returned vectors for its host network.
     fn absorb(&mut self, replies: &[Reply]) {
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "gpu")))]
         let _ = replies;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "gpu"))]
         let mut at = 0;
         if self.leaf_rows.len() > self.batch_rows {
-            #[cfg(test)]
-            {
+            #[cfg(any(test, feature = "gpu"))]
+            if self.reference {
                 let r = &replies[at];
                 self.oracle.pb.extend_from_slice(&r.a);
                 self.oracle.jp.extend_from_slice(&r.b);
@@ -2330,8 +2272,8 @@ impl Solver {
             self.batch_boards = self.nboards;
         }
         if self.ncfg > self.batch_cfgs {
-            #[cfg(test)]
-            {
+            #[cfg(any(test, feature = "gpu"))]
+            if self.reference {
                 let r = &replies[at];
                 self.oracle.cf.extend_from_slice(&r.a);
                 self.oracle.cg.extend_from_slice(&r.b);
@@ -2715,147 +2657,6 @@ impl Solver {
             out.off.push(out.act.len() as u32);
         }
         out
-    }
-
-    /// What this solve holds in host memory, group by group.
-    ///
-    /// The mirror of `cuda::Solve::census`, and it exists for the same reason:
-    /// the farm admits the next solve against what the population *will* hold,
-    /// so it needs a figure for one solve that is a projection and not a level.
-    /// Every term is a capacity already recorded, so the walk is over nodes and
-    /// nothing deeper.
-    pub fn host_census(&self) -> Vec<(&'static str, usize)> {
-        let f = |v: &Vec<f32>| v.capacity() * 4;
-        let u = |v: &Vec<u32>| v.capacity() * 4;
-        let z = |v: &Vec<usize>| v.capacity() * 8;
-        let cfg_bytes = std::mem::size_of::<Config>();
-        let mut v = vec![
-            (
-                "nodes",
-                self.nodes.capacity() * std::mem::size_of::<TNode>()
-                    + self.nodes.iter().map(TNode::bytes).sum::<usize>(),
-            ),
-            ("states", self.states.capacity() * std::mem::size_of::<State>()),
-            ("contract", self.contract.bytes()),
-            (
-                "tree",
-                u(&self.parent)
-                    + u(&self.soff)
-                    + u(&self.roff)
-                    + u(&self.voff)
-                    + u(&self.row_of)
-                    + u(&self.grown)
-                    + u(&self.resealed)
-                    + u(&self.wants_prior)
-                    + u(&self.rewrite)
-                    + u(&self.resent)
-                    + self.nc.capacity() * 8
-                    + self.primed.capacity()
-                    + z(&self.leaf_rows)
-                    + z(&self.term_leaves)
-                    + z(&self.query_nodes),
-            ),
-            ("cur", f(&self.cur)),
-            ("avg", f(&self.avg)),
-            (
-                "batch",
-                u(&self.leaf_cidx)
-                    + u(&self.leaf_coff)
-                    + u(&self.board_of)
-                    + f(&self.cphi)
-                    + self.packed.capacity()
-                    + self.mirror0.capacity()
-                    + f(&self.cards)
-                    + self.cplayer.capacity(),
-            ),
-            (
-                "interning",
-                (self.cmap.capacity() + self.bmap.capacity()) * 16,
-            ),
-            (
-                "scratch",
-                self.draw_scratch.bytes() + self.cell_order.capacity() * 16,
-            ),
-            (
-                "beliefs",
-                self.root_belief
-                    .iter()
-                    .map(|b| b.cfg.capacity() * cfg_bytes + b.p.capacity() * 4)
-                    .sum(),
-            ),
-        ];
-        #[cfg(test)]
-        {
-            v.push((
-                "reference network",
-                f(&self.oracle.pb)
-                    + f(&self.oracle.jp)
-                    + f(&self.oracle.cf)
-                    + f(&self.oracle.cg)
-                    + f(&self.oracle.cp)
-                    + f(&self.oracle.xb)
-                    + f(&self.oracle.h)
-                    + f(&self.oracle.wbuf),
-            ));
-            let h = &self.oracle.cfr;
-            v.extend([
-                ("regret", f(&h.regret)),
-                ("prior", f(&h.prior)),
-                ("visits", f(&h.visits)),
-                ("qval", f(&h.qval)),
-                (
-                    "sum",
-                    h.sum_strat.capacity() * 24
-                        + h.sum_strat.iter().map(|r| r.capacity() * 4).sum::<usize>(),
-                ),
-                ("reach", f(&h.reach)),
-                ("vals", f(&h.vals) + f(&h.vcache[0]) + f(&h.vcache[1])),
-            ]);
-        }
-        v.sort_by_key(|&(_, b)| std::cmp::Reverse(b));
-        v
-    }
-
-    /// Host bytes this solve holds, all of them together.
-    pub fn host_bytes(&self) -> usize {
-        self.host_census().iter().map(|&(_, b)| b).sum()
-    }
-
-    pub fn shape(&self) -> Shape {
-        let mut depth = vec![0u32; self.nodes.len()];
-        let mut worst = 0;
-        for i in 0..self.nodes.len() {
-            for &ch in &self.nodes[i].child {
-                if ch > i {
-                    depth[ch] = depth[i] + 1;
-                    worst = worst.max(depth[ch]);
-                }
-            }
-        }
-        Shape {
-            nodes: self.nodes.len(),
-            rows: self.leaf_rows.len(),
-            boards: self.nboards,
-            cells: self.ncells,
-            ncfg: self.ncfg,
-            cidx: self.leaf_cidx.len(),
-            depth: worst as usize,
-            acts: self
-                .nodes
-                .iter()
-                .flat_map(|n| n.legal_off.windows(2).map(|w| (w[1] - w[0]) as usize))
-                .max()
-                .unwrap_or(0),
-            support: self
-                .nodes
-                .iter()
-                .flat_map(|n| n.cfgs.iter().map(|c| c.len()))
-                .max()
-                .unwrap_or(0),
-            reach: self.nreach,
-            vals: self.nvals,
-            draws: self.nodes.iter().map(|n| n.draw.len()).sum(),
-        }
     }
 
     /// The CFR average strategy at the root: the policy used to act.

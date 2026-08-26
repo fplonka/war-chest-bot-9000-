@@ -34,7 +34,7 @@ Remove the runtime host solver. Keep CUDA as the only runtime solver and keep ex
 - The first `onepath-pi-gpu` compile found two over-gated helpers: runtime `worker_seed` was absent, and test-only `ncells` was declared in production. Both are fixed; queue a fresh full test before the remaining gates.
 - Committed those fixes as `36dcb9e` and queued the replacement full test as `onepath-pi2-gpu`.
 - The recorded baseline predates the merge-base at `4ac184a`, and the terminated after-run's first sample was not comparable. Queued a clean merge-base benchmark as `onepath-pi2-base`, followed by the current branch as `onepath-pi2-after`, with the same corpus and settings.
-- Re-ran the thermo-nuclear review. The runtime has one direct CUDA state machine; the host evaluator, arenas, solver, replay helpers, and backend adapter compile only under `cfg(test)`.
+- Re-ran the thermo-nuclear review. The runtime has one direct CUDA state machine; the host evaluator and replay helpers are available only to tests and the CUDA parity target.
 - `onepath-pi2-base` and `onepath-pi2-after` passed the matched farmbench. Their 40-second samples were 252.5 and 254.7 solves/s, respectively (+0.9%); calls/solve and round time also matched within noise.
 - `onepath-pi2-gpu` was terminated without an exit file after concurrent CUDA tests failed and long host-oracle tests continued. Its captured output has no panic bodies.
 - CUDA parity tests now hold one test-only card lock. A fresh full run passed every parity test it reached, including exact host/device CFR and growth checks.

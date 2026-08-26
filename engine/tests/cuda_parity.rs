@@ -9,7 +9,7 @@
 //! One is to ask a solve for the state it *keeps*. `Device::resident` copies a
 //! solve's board vectors, its three config rows and its policy prior back off
 //! the card, and every one of them has a CPU counterpart the same solver
-//! computed on the host path. That is the call-by-call comparison, and it is
+//! computed by the reference oracle. That is the call-by-call comparison, and it is
 //! the only check the policy prior has: the prior steers expansion alone, so a
 //! wrong one degrades the search silently and moves no target at all.
 //!
@@ -238,7 +238,7 @@ fn generate(
                 }
                 Step::Done(solved) => {
                     let sv = live[i].take().expect("a live solve");
-                    nodes[i].push(sv.shape().nodes);
+                    nodes[i].push(sv.nodes.len());
                     streams[i].keep(&sv, solved, &mut out[i]);
                     if out[i].soff.len() < games {
                         let mut next = streams[i].next_solve(&nets, &mut out[i]);
@@ -898,7 +898,7 @@ fn a_growing_solve_does_not_depend_on_the_round_it_rides_in() {
 
 
 /// Every array a solve keeps on the card, against the CPU network that makes
-/// the same ones on the host path.
+/// the same ones in the reference oracle.
 ///
 /// `c = 0` fixes the tree, so both solvers build the same nodes in the same
 /// order and hold their arrays in the same layout. The two are then the same

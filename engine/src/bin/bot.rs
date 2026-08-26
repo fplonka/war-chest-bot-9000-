@@ -17,7 +17,8 @@ use std::sync::{Arc, Mutex};
 use warchest::arena::{Ask, Done, Hello, Reply, Request, PROTOCOL};
 use warchest::args::Args;
 use warchest::bot::{Brain, Mind, Session};
-use warchest::farm::{Backend, Cards};
+use warchest::cuda::Device;
+use warchest::farm::Cards;
 use warchest::net::Net;
 use warchest::pbs::rules_table_hash;
 use warchest::search::{Budget, Cfg, Cfr};
@@ -59,12 +60,12 @@ fn options() -> Result<Options, String> {
 }
 
 fn brain(o: &Options) -> Result<Brain, String> {
-    let backend = devices(o, o.mind, o.cfg)?;
+    let device = devices(o, o.mind, o.cfg)?;
     let mut net = Net::default();
-    let cards = match backend {
-        Some(backend) => {
-            net = backend.net().clone();
-            Some(Arc::new(Cards::new(backend)))
+    let cards = match device {
+        Some(device) => {
+            net = device.net().clone();
+            Some(Arc::new(Cards::new(device)))
         }
         None if matches!(o.mind, Mind::Sog) => unreachable!("SoG always has a device"),
         None => None,
@@ -195,7 +196,7 @@ fn main() {
 }
 
 /// Use only the devices assigned by the referee.
-fn devices(o: &Options, mind: Mind, cfg: Cfg) -> Result<Option<Backend>, String> {
+fn devices(o: &Options, mind: Mind, cfg: Cfg) -> Result<Option<Device>, String> {
     if !matches!(mind, Mind::Sog) {
         return Ok(None);
     }
@@ -213,7 +214,5 @@ fn devices(o: &Options, mind: Mind, cfg: Cfg) -> Result<Option<Backend>, String>
         })
         .collect();
     let net = Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
-    warchest::cuda::Device::new(&ordinals?, net, cfg, usize::MAX)
-        .map(Backend::Cuda)
-        .map(Some)
+    Device::new(&ordinals?, net, cfg, usize::MAX).map(Some)
 }

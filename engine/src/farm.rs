@@ -23,6 +23,9 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+#[cfg(feature = "gpu")]
+use crate::cuda::Device;
+#[cfg(any(test, feature = "gpu"))]
 use crate::net::Net;
 use crate::pbs::Belief;
 use crate::search::{Budget, Cfg, Cfr, Solved, Solver, Step};
@@ -293,7 +296,7 @@ pub struct Reply {
 impl Call {
     /// Run this call on the CPU network. The batched driver runs the same
     /// arithmetic on the device; this is the reference both are held to.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "gpu"))]
     pub fn run(&self, net: &Net) -> Reply {
         let mut r = Reply::default();
         match self {
@@ -350,95 +353,6 @@ impl Call {
 /// A solve's card table: one row per seat view. Fixed at the draft, so it is
 /// built once per solve and every leaf of that solve reads it.
 pub const CARD_ROWS: usize = 2;
-
-/// The CUDA devices that run a round's batch.
-pub enum Backend {
-    #[cfg(feature = "gpu")]
-    Cuda(crate::cuda::Device),
-}
-
-impl Backend {
-    pub fn run(&self, _calls: &[Call], #[allow(unused)] card: usize) -> Option<Vec<Reply>> {
-        match self {
-            #[cfg(feature = "gpu")]
-            Backend::Cuda(d) => d.run(_calls, card),
-            #[cfg(not(feature = "gpu"))]
-            _ => unreachable!(),
-        }
-    }
-
-    /// How many GPUs this backend has, and so how many queues the farm runs.
-    pub fn cards(&self) -> usize {
-        match self {
-            #[cfg(feature = "gpu")]
-            Backend::Cuda(d) => d.cards(),
-            #[cfg(not(feature = "gpu"))]
-            _ => unreachable!(),
-        }
-    }
-
-    /// Cards per GPU. Two, so one set can grow while the other iterates.
-    pub fn pipelines(&self) -> usize {
-        match self {
-            #[cfg(feature = "gpu")]
-            Backend::Cuda(_) => crate::cuda::PIPELINE,
-            #[cfg(not(feature = "gpu"))]
-            _ => unreachable!(),
-        }
-    }
-
-    /// Slots this card holds. Admission pops one; none free means wait.
-    pub fn slots(&self, #[allow(unused)] card: usize) -> usize {
-        match self {
-            #[cfg(feature = "gpu")]
-            Backend::Cuda(d) => d.slots(card),
-            #[cfg(not(feature = "gpu"))]
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn slot_bytes(&self) -> usize {
-        match self {
-            #[cfg(feature = "gpu")]
-            Backend::Cuda(d) => d.slot_bytes(),
-            #[cfg(not(feature = "gpu"))]
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn slots_per_card(&self) -> usize {
-        match self {
-            #[cfg(feature = "gpu")]
-            Backend::Cuda(d) => d.slots_per_card(),
-            #[cfg(not(feature = "gpu"))]
-            _ => unreachable!(),
-        }
-    }
-
-    /// The weights this backend evaluates with, for the readout the solver
-    /// still does itself.
-    pub fn net(&self) -> &Net {
-        match self {
-            #[cfg(feature = "gpu")]
-            Backend::Cuda(d) => d.net(),
-            #[cfg(not(feature = "gpu"))]
-            _ => unreachable!(),
-        }
-    }
-
-    /// Evaluate with new weights from here on. The backend itself survives:
-    /// rebuilding it would tear down a CUDA context and recompile every kernel
-    /// for a change that touches three arrays.
-    pub fn set_net(&mut self, _net: Net) -> Result<(), String> {
-        match self {
-            #[cfg(feature = "gpu")]
-            Backend::Cuda(d) => d.set_weights(_net),
-            #[cfg(not(feature = "gpu"))]
-            _ => unreachable!(),
-        }
-    }
-}
-
 
 /// Host-side slots that fit in the memory the process does not already hold.
 ///
@@ -660,7 +574,8 @@ pub struct Farm {
     ready: Arc<Queue<Job>>,
     /// Shared because every card evaluates against it, and locked because a
     /// publish rewrites the weights under them.
-    backend: Arc<RwLock<Backend>>,
+    #[cfg(feature = "gpu")]
+    cuda: Arc<RwLock<Device>>,
     /// The copy a solve reads for the work it still does itself. Replaced
     /// whole, so a solve that has started keeps the weights it started with.
     nets: Arc<RwLock<Arc<crate::net::Net>>>,
@@ -739,18 +654,17 @@ impl Farm {
     /// Start `workers` host threads and two drivers per GPU, with one job per
     /// slot. A slot is allocated at the budget; there is nothing to admit
     /// against after that.
-    pub fn new(seed: u64, workers: usize, work: Work, backend: Backend) -> Farm {
+    #[cfg(feature = "gpu")]
+    pub fn new(seed: u64, workers: usize, work: Work, cuda: Device) -> Farm {
         assert!(workers > 0, "a farm needs at least one worker");
-        let gpus = backend.cards();
-        let pipes = backend.pipelines();
-        let per_gpu: Vec<usize> = (0..gpus)
-            .map(|g| backend.slots(g))
-            .collect();
+        let gpus = cuda.cards();
+        let pipes = crate::cuda::PIPELINE;
+        let per_gpu: Vec<usize> = (0..gpus).map(|g| cuda.slots(g)).collect();
         let n_slots: usize = per_gpu.iter().sum();
-        let slot_bytes = backend.slot_bytes();
-        let slots_per_card = backend.slots_per_card();
+        let slot_bytes = cuda.slot_bytes();
+        let slots_per_card = cuda.slots_per_card();
         let work = Arc::new(work);
-        let nets = Arc::new(RwLock::new(Arc::new(backend.net().clone())));
+        let nets = Arc::new(RwLock::new(Arc::new(cuda.net().clone())));
         let ready = Arc::new(Queue::default());
         let device: Vec<Arc<Queue<(Job, Vec<Call>)>>> =
             (0..gpus).map(|_| Arc::new(Queue::default())).collect();
@@ -758,7 +672,7 @@ impl Farm {
         let stopping = Arc::new(AtomicBool::new(false));
         let broken = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(Stats::new(n_slots, slot_bytes, slots_per_card));
-        let backend = Arc::new(RwLock::new(backend));
+        let cuda = Arc::new(RwLock::new(cuda));
 
         let hands: Vec<JoinHandle<()>> = (0..workers)
             .map(|t| {
@@ -787,10 +701,10 @@ impl Farm {
         let mut drivers = Vec::with_capacity(gpus * pipes);
         for g in 0..gpus {
             for p in 0..pipes {
-                let (queue, ready, backend, nets, work, stats, broken) = (
+                let (queue, ready, cuda, nets, work, stats, broken) = (
                     Arc::clone(&device[g]),
                     Arc::clone(&ready),
-                    Arc::clone(&backend),
+                    Arc::clone(&cuda),
                     Arc::clone(&nets),
                     Arc::clone(&work),
                     Arc::clone(&stats),
@@ -805,7 +719,7 @@ impl Farm {
                         .spawn(move || {
                             drive_card(
                                 g, lane, gpus, n, p == 0, n.div_ceil(pipes.max(1)), seed,
-                                &queue, &ready, &backend, &nets, &work, &stats, &broken,
+                                &queue, &ready, &cuda, &nets, &work, &stats, &broken,
                             )
                         })
                         .expect("spawn driver thread"),
@@ -816,7 +730,7 @@ impl Farm {
         Farm {
             device,
             ready,
-            backend,
+            cuda,
             nets,
             collected,
             workers: hands,
@@ -827,11 +741,12 @@ impl Farm {
         }
     }
 
-    /// Install new weights, in the backend and in the copy a solve keeps for
-    /// the work it does itself. The write lock waits for every round in flight,
-    /// so no round is ever evaluated against two different networks.
+    /// Install new weights in the device and in the copy a solve keeps for its
+    /// host-side work. The write lock waits for every round in flight, so no
+    /// round is evaluated against two different networks.
+    #[cfg(feature = "gpu")]
     pub fn publish(&mut self, net: Net) -> Result<(), String> {
-        self.backend.write().set_net(net.clone())?;
+        self.cuda.write().set_weights(net.clone())?;
         *self.nets.write() = Arc::new(net);
         Ok(())
     }
@@ -869,10 +784,6 @@ impl Farm {
         &self.stats
     }
 
-    /// The network the farm evaluates with.
-    pub fn value(&self) -> Arc<crate::net::Net> {
-        Arc::clone(&*self.nets.read())
-    }
 }
 
 impl Drop for Farm {
@@ -944,6 +855,7 @@ fn advance_job(
 }
 
 /// One card's rounds, and the solves that occupy its GPU's slots.
+#[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn drive_card(
     gpu: usize,
@@ -955,7 +867,7 @@ fn drive_card(
     seed: u64,
     queue: &Queue<(Job, Vec<Call>)>,
     ready: &Queue<Job>,
-    backend: &RwLock<Backend>,
+    cuda: &RwLock<Device>,
     nets: &RwLock<Arc<crate::net::Net>>,
     work: &Work,
     stats: &Stats,
@@ -993,7 +905,7 @@ fn drive_card(
             jobs.push(job);
         }
         let at = std::time::Instant::now();
-        let answered = backend.read().run(&calls, lane);
+        let answered = cuda.read().run(&calls, lane);
         let spent = at.elapsed();
         let Some(replies) = answered else {
             broken.store(true, Ordering::Relaxed);
@@ -1013,7 +925,6 @@ fn drive_card(
         }
     }
 }
-
 
 // ---------------------------------------------------------- a blocking client
 
@@ -1056,17 +967,18 @@ impl Drop for Seat<'_> {
 }
 
 impl Cards {
-    pub fn new(backend: Backend) -> Cards {
-        let n = backend.cards();
-        let pipes = backend.pipelines();
-        let backend = Arc::new(backend);
+    #[cfg(feature = "gpu")]
+    pub fn new(device: Device) -> Cards {
+        let n = device.cards();
+        let pipes = crate::cuda::PIPELINE;
+        let device = Arc::new(device);
         let queues: Vec<Arc<Queue<Ask>>> =
             (0..n * pipes).map(|_| Arc::new(Queue::default())).collect();
         let mut drivers = Vec::with_capacity(n * pipes);
         for g in 0..n {
             for p in 0..pipes {
                 let lane = g * pipes + p;
-                let (queue, backend) = (Arc::clone(&queues[lane]), Arc::clone(&backend));
+                let (queue, device) = (Arc::clone(&queues[lane]), Arc::clone(&device));
                 drivers.push(
                     std::thread::Builder::new()
                         .name(format!("card-{g}.{p}"))
@@ -1085,7 +997,7 @@ impl Cards {
                             }
                             // A card that cannot answer takes its solves with it.
                             // Dropping the senders is what tells them.
-                            let Some(replies) = backend.run(&calls, lane) else {
+                            let Some(replies) = device.run(&calls, lane) else {
                                 return;
                             };
                             let mut rest = replies;
@@ -1101,7 +1013,7 @@ impl Cards {
         }
         let mut free = Vec::new();
         for g in 0..n {
-            for s in 0..backend.slots(g) {
+            for s in 0..device.slots(g) {
                 free.push((g * pipes + s % pipes, s));
             }
         }

@@ -3,8 +3,8 @@ name = "warchest-engine"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.78"
-# Solver suites are unit modules so their reference oracle exists only under
-# `cfg(test)`. The two ordinary integration suites are listed below.
+# CPU solver suites are unit modules so their reference oracle is available
+# under `cfg(test)`. The rules and CUDA parity suites are explicit targets below.
 autotests = false
 
 [lib]
@@ -50,6 +50,11 @@ path = "tests/invariants.rs"
 [[test]]
 name = "scenarios"
 path = "tests/scenarios.rs"
+
+[[test]]
+name = "cuda_parity"
+path = "tests/cuda_parity.rs"
+required-features = ["gpu"]
 
 [profile.release]
 lto = true

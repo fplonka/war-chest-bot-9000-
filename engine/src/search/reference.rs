@@ -69,7 +69,7 @@ pub struct HostCfr {
 }
 
 #[derive(Default)]
-pub(crate) struct ReferenceState {
+pub struct ReferenceState {
     pub cfr: HostCfr,
     /// Per traverser, leaf rows already held in `cfr.vcache`.
     pub(super) cached: [usize; 2],
@@ -88,16 +88,39 @@ pub(crate) struct ReferenceState {
 }
 
 impl Solver {
-    pub(crate) fn oracle(&self) -> &ReferenceState {
+    pub fn oracle(&self) -> &ReferenceState {
         &self.oracle
     }
 
-    /// The CFR arenas this solve works in.
+    /// Activate the reference lazily for an integration test. Device solves
+    /// keep this state empty, so the runtime path does not mirror its arenas.
+    fn init_reference(&mut self) {
+        if self.reference {
+            return;
+        }
+        self.reference = true;
+        let cfr = &mut self.oracle.cfr;
+        cfr.reach.resize(self.nreach, 0.0);
+        cfr.vals.resize(self.nvals, 0.0);
+        cfr.vcache[0].resize(self.nvals, 0.0);
+        cfr.vcache[1].resize(self.nvals, 0.0);
+        cfr.regret.resize(self.ncells, 0.0);
+        cfr.prior.resize(self.ncells, 0.0);
+        cfr.prior.copy_from_slice(&self.cur);
+        cfr.visits.resize(self.ncells, 0.0);
+        cfr.qval.resize(self.ncells, 0.0);
+        cfr.sum_strat = self
+            .nodes
+            .iter()
+            .map(|n| vec![0.0; n.legal_action.len()])
+            .collect();
+        self.precompute_reaches();
+    }
+
+    /// The exact host arenas used by the parity reference.
     ///
-    /// A solve on the device path has none. Nothing there reads one — the card
-    /// runs the loop — so reaching for them is a mistake about which backend is
-    /// driving, and it says so here rather than returning the zeroes an
-    /// unallocated arena would.
+    /// The production device path never reads them; this accessor exists for
+    /// the oracle and its tests.
     pub fn cfr(&self) -> &HostCfr {
         &self.oracle.cfr
     }
@@ -258,12 +281,10 @@ impl Solver {
         &self.cfr().reach[at..at + self.nc[i][p] as usize]
     }
 
-    /// Drive this solve to its end on this host, answering its own calls.
+    /// Drive this solve to its end with the reference evaluator.
     ///
-    /// The farm gathers those calls across every solve in flight and answers
-    /// them as one batch; a single game, a tool or a test wants exactly one
-    /// solve, so it answers them where they are raised. Only the host path can
-    /// do this: a device keeps the solve, and there is no device here.
+    /// The farm gathers calls across solves and answers them as one batch. A
+    /// single test or tool answers them here instead.
     pub fn run_alone(&mut self) -> Option<Solved> {
         let mut replies: Vec<Reply> = Vec::new();
         loop {
@@ -764,7 +785,8 @@ impl Solver {
     /// than of an iteration, so they are asked for once per growth. The join
     /// that every iteration pays for, and the policy head the expansion phase
     /// reads, run inline on the core the solve is already on.
-    pub(crate) fn advance_on_host(&mut self, replies: &[Reply]) -> Step {
+    pub fn advance_on_host(&mut self, replies: &[Reply]) -> Step {
+        self.init_reference();
         if self.phase == Phase::Iterating {
             self.absorb(replies);
         }

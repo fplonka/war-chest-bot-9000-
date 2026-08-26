@@ -36,6 +36,7 @@ pub use state::{State, BLACK, WHITE};
 #[cfg(feature = "python")]
 mod py;
 
+// These solver suites stay in the library so their test-only oracle is present.
 #[cfg(test)]
 #[path = "../tests/pbs.rs"]
 mod pbs_integration;
@@ -43,7 +44,3 @@ mod pbs_integration;
 #[cfg(test)]
 #[path = "../tests/sog_solver.rs"]
 mod sog_solver;
-
-#[cfg(all(test, feature = "gpu"))]
-#[path = "../tests/cuda_parity.rs"]
-mod cuda_parity;
