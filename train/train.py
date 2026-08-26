@@ -78,7 +78,7 @@ def forward_values(net, parts):
 def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0):
     """Return the value-and-policy loss and its device-side measurements."""
     stats = {}
-    v = net(xpub, phi, w, seg, nseg)
+    v, board, heads, policy_config = net.forward_parts(xpub, phi, w, seg, nseg)
     expected = torch.zeros(nseg, dtype=v.dtype, device=v.device)
     expected.index_add_(0, seg, v.detach() * w)
     residual = expected[0::2] + expected[1::2]
@@ -99,29 +99,29 @@ def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0):
     stats["value_loss"] = loss.detach()
     if policy is not None and wp > 0.0:
         policy_value, policy_stats = policy_loss(
-            net, xpub, phi, w, seg, nseg, policy)
+            net, xpub, w, seg, nseg, policy, board, heads, policy_config)
         stats.update(policy_stats)
         if policy_value is not None:
             loss = loss + wp * policy_value
     return loss, stats
 
 
-def policy_loss(net, xpub, phi, weight, seg, nseg, policy):
+def policy_loss(net, xpub, weight, seg, nseg, policy, board, heads,
+                policy_config):
     """Cross entropy of the policy head against the search's root average.
 
     The head scores a `(config, action)` cell as `<f_p(c), e(a)>`, so the batch
     is exactly the cells the solves stored. Each cell's softmax runs over its
-    own `(row, config)` group, which is one information state.
+    own `(row, config)` group, which is one information state. ``board``,
+    ``heads``, and ``policy_config`` come from the value path, so shared network
+    work runs once per step.
     """
     stats = {}
     feat, parow, pact, pcfg, group, target, group_count = policy
     if feat.shape[0] == 0 or pact.shape[0] == 0:
         return None, stats
-    cards = net.cards(xpub)
-    physical = xpub[0::2]
-    board = net.board(physical, net.tokens(physical, cards[0::2]))
-    _f, g, fp = net.configs(phi, cards[:, :NSLOT], seg)
-    h = net.heads(board, g, weight, seg, nseg)
+    h = heads
+    fp = policy_config
     action_query = torch.zeros(feat.shape[0], dtype=torch.long, device=feat.device)
     action_query.scatter_(0, pact, seg[pcfg])
     e = net.actions(feat, board, h, parow, action_query)

@@ -233,19 +233,23 @@ class Net(nn.Module):
 
     # --------------------------------------------------------------- forward
 
+    def forward_parts(self, xpub, phi, weight, seg, nseg):
+        """Return values and the features shared by the policy head."""
+        cards = self.cards(xpub)
+        physical = xpub[0::2]
+        board = self.board(physical, self.tokens(physical, cards[0::2]))
+        f, g, fp = self.configs(phi, cards[:, :NSLOT], seg)
+        heads = self.heads(board, g, weight, seg, nseg)
+        value = (f * heads[seg]).sum(1) + self.value_bias
+        return value, board, heads, fp
+
     def forward(self, xpub, phi, weight, seg, nseg):
         """Values for paired physical-state queries.
 
         Query ``q`` owns configs with ``seg == q``. Queries ``q`` and ``q ^ 1``
         share one physical board trunk and differ by belief order and seat.
         """
-        cards = self.cards(xpub)
-        physical = xpub[0::2]
-        p = self.board(physical, self.tokens(physical, cards[0::2]))
-
-        f, g, _fp = self.configs(phi, cards[:, :NSLOT], seg)
-        h = self.heads(p, g, weight, seg, nseg)
-        return (f * h[seg]).sum(1) + self.value_bias
+        return self.forward_parts(xpub, phi, weight, seg, nseg)[0]
 
     # ------------------------------------------------------------ weight blob
 
