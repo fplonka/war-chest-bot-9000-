@@ -16,7 +16,6 @@ class Cfg:
 
     batch: int = 256
     lr: float = 1e-3
-    # Flat through this fraction of self-play, then cosine to lr_final.
     lr_final: float = 1e-4
     lr_stable_frac: float = 0.75
     # Gradient updates per generated row — Student of Games' "max grad updates

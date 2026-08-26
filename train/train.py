@@ -72,15 +72,13 @@ RESUME_GRACE_ROWS = 100_000
 
 def scheduled_lr(initial, final, elapsed, duration, stable_frac):
     """Flat warm self-play rate followed by a cosine decay to ``final``."""
-    if stable_frac >= 1.0 or initial == final:
-        return initial
     stable = stable_frac * duration
-    if elapsed <= stable:
+    if stable_frac >= 1.0 or elapsed <= stable:
         return initial
     if elapsed >= duration:
         return final
-    progress = (elapsed - stable) / (duration - stable)
-    return final + (initial - final) * (1.0 + math.cos(math.pi * progress)) / 2.0
+    return final + (initial - final) * (1.0 + math.cos(
+        math.pi * ((elapsed - stable) / (duration - stable)))) / 2.0
 
 
 def action_feats(pa):
@@ -851,15 +849,10 @@ def main():
     epoch = int(checkpoint["epoch"]) if checkpoint else 0
     if checkpoint:
         epoch = max(epoch, last_epoch(args))
-    # Fresh subgames per second over the whole ReBeL phase: the rate
-    # docs/GPU_PERF_GOAL.md is about. Generation overlaps training, so
-    # per-epoch `gen_s` is not it -- only cumulative solves over cumulative
-    # ReBeL wall time counts every cost, including the trainer's own.
     progress = checkpoint["progress"] if checkpoint else {
         "sog_start": None,
         "sog_solves": 0,
         "optimizer_rows": 0,
-        "optimizer_steps": 0,
         "generated_rows": 0,
         "next_target": None,
         "farm_runs": 0,
@@ -949,12 +942,9 @@ def main():
     def fit(nsteps, deadline=None):
         """Adam updates on the shared replay. Returns (loss, wall_s, stats)."""
         if sog_t0 is not None:
-            target_lr = scheduled_lr(
+            opt.param_groups[0]["lr"] = scheduled_lr(
                 args.lr, args.lr_final, time.time() - sog_t0,
                 total - warm, args.lr_stable_frac)
-            lr = min(opt.param_groups[0]["lr"], target_lr)
-            for pg in opt.param_groups:
-                pg["lr"] = lr
         if nsteps < 1 or len(buf) < args.batch:
             return float("nan"), 0.0, {}
         tt = time.time()
@@ -992,7 +982,6 @@ def main():
 
         progress["farm_runs"] += 1
         optimizer_rows = int(progress["optimizer_rows"])
-        optimizer_steps = int(progress["optimizer_steps"])
         generated_rows = int(progress["generated_rows"])
         debt_generated_rows = generated_rows
         debt_optimizer_rows = optimizer_rows
@@ -1018,7 +1007,6 @@ def main():
             progress.update({
                 "sog_solves": sog_solves,
                 "optimizer_rows": optimizer_rows,
-                "optimizer_steps": optimizer_steps,
                 "generated_rows": generated_rows,
                 "next_target": next_target - t0,
                 "totals": dict(totals),
@@ -1083,7 +1071,6 @@ def main():
             lv, train_s, train_stat = fit(nsteps, deadline)
             trained = train_stat.get("steps", 0)
             if trained:
-                optimizer_steps += trained
                 optimizer_rows += trained * args.batch
                 window["loss_sum"] += lv * trained
                 window["train_steps"] += trained
@@ -1309,7 +1296,7 @@ def main():
                 "configs": round(window["configs"] / dec, 1),
                 "cap_value": round(cap_v, 4),
                 "steps": steps,
-                "optimizer_steps": optimizer_steps,
+                "optimizer_steps": optimizer_rows // args.batch,
                 "optimizer_rows": optimizer_rows,
                 "optimizer_debt": round(
                     max(0.0,
@@ -1471,8 +1458,7 @@ def main():
         sog_t0 = time.time()
         progress["sog_start"] = sog_t0 - t0
         progress["next_target"] = (sog_t0 - t0) + args.target_every * 60.0
-    # The warm rows stay in replay and age out through the FIFO. Clearing them
-    # here collapsed an earlier run, so a fresh run carries them into self-play.
+    # Keep warm rows in replay; the FIFO ages them out.
     run_search_pipeline()
 
     snapshot("final", time.time() - t0)
