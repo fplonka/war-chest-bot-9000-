@@ -912,6 +912,11 @@ def main():
                 if np.any(sample_sources == source) else 0.0
             target_age_max = (time.time() - buf.created_at[buf.lo % buf.cap]
                               if len(buf) else 0.0)
+            live = np.arange(buf.lo, buf.rows, dtype=np.int64) % buf.cap
+            live_source = buf.source[live]
+            live_n = max(len(live), 1)
+            live_td1 = int(buf.td1[live].sum())
+            live_targets = max(int(buf.clen[live].sum()), 1)
             now_at = {k: int(data[k]) for k in ROUND_KEYS}
             rounds = max(now_at["rounds"] - round_at["rounds"], 1)
             per_round = {k: (now_at[k] - round_at[k]) / rounds
@@ -1044,6 +1049,15 @@ def main():
                     max(0.0, args.replay_ratio * generated_rows
                         - optimizer_rows), 1),
                 "replay_rows": generated_rows,
+                "replay_warm_frac": round(
+                    float(np.count_nonzero(live_source == SOURCE_WARM) / live_n), 4),
+                "replay_play_frac": round(
+                    float(np.count_nonzero(live_source == SOURCE_PLAY) / live_n), 4),
+                "replay_query_frac": round(
+                    float(np.count_nonzero(live_source == SOURCE_QUERY) / live_n), 4),
+                "replay_td1_row_frac": round(live_td1 / live_n, 5),
+                "replay_td1_target_frac": round(
+                    2 * live_td1 / live_targets, 5),
                 "rows_per_s": round(
                     generated_rows / max(sog_elapsed, 1e-9), 1),
                 "effective_train_ratio": round(
