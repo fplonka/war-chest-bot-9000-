@@ -32,16 +32,32 @@ the host. Policy groups are counted at ingest, so policy loss uses compact
 group IDs and `index_add_` without `torch.unique`. The trainer has one batch
 producer, and the dump and parity tools use it directly.
 
-Per-step training no longer reads device scalars or synchronizes. Profile
-labels distinguish host enqueue time from CUDA event time. The peak allocator
-measurement includes Net, Adam, replay, warmup, and a training-sized dummy.
+Rust and Python share one named row schema. Rows carry `source`, true-config
+indices, one White-perspective outcome, creation time, and a TD(1) flag. The
+buffer writes those columns in one loop; dumps expose named host columns. Query
+rows are filtered by source, and calibration derives the Black outcome instead
+of storing a second encoding.
+
+Per-step training no longer reads device scalars or synchronizes. Losses return
+`(loss, stats)` without an out-parameter or caller-side stats allocation. Source
+IDs and delays are retained until report time. Optimizer deadlines are required,
+and CUDA training uses fused Adam plus guarded default-mode `torch.compile`.
 
 ## Measurements and gates
 
-`tools/step_bench.py` is synced to the box and queued. It measures every batch
-and optimizer stage, then measures default-mode `torch.compile`, its warm and
-second SoG graphs, and the eager fallback path. The startup smoke is also
-queued. Both wait behind the unrelated 125-minute `b256_125` run.
+The fused `tools/step_bench.py` run passed on the box. At batch 256 it measured
+eager full step 70.66 ms and default-mode compiled full step 42.15 ms; warm and
+SoG graph compile walls were 16.39 s and 26.95 s. Fused Adam did not materially
+change the eager 69.39 ms backward/clip/Adam stage. The compiled result is about
+2.64x against the 111 ms baseline, below the 3x / 37 ms Gate 1 target.
+
+A 4-minute schema and mirror smoke passed at 242.4 s with 3,140 solves and
+25,088 optimizer rows. A default-compile smoke passed at 241.8 s; its first
+warm graph consumed 153.3 s, then query-only training ran normally. The first
+profile job used the old, non-queue-aware box script and overlapped an unrelated
+queued match; its result is not a gate. After rebasing onto `redesign`,
+`tools/box.sh` is queue-aware and the post-rebase smoke plus post-refactor step
+benchmark are queued behind other workers without touching them.
 
 Gate 1 is a short batch-256 result at least 3x the 111 ms baseline. Gate 2 is a
 30-minute default run, then 200 color-swapped games against
@@ -50,16 +66,17 @@ reference is `runs/base_b256`, 319652 solves at 197.8 solves/s.
 
 ## Validation status (2026-08-26)
 
-Local syntax, compile, and diff checks pass. The remote host test for policy
-arena indexing passes, including 16k-row and fat-wrap cases. No local bot,
-solver, or training binary has been run.
+Local Python syntax, Rust non-GPU compile, and diff checks pass. Local CUDA
+compile is unavailable because `nvcc` is not installed. The remote policy arena
+indexing test passes, including 16k-row and fat-wrap cases. The pre-rebase
+schema, compile, and fused-profile jobs passed; the queue-aware post-rebase
+validation remains pending. No local bot, solver, or training binary has been
+run.
 
-## Driver additions in progress
+## Remaining validation
 
-Refactor the replay row schema and Rust data export first: named dump columns,
-source-owned rows, one stored outcome, and one schema-driven Buffer write.
-Then remove per-source delay accumulators, make losses return `(loss, stats)`,
-remove full-buffer replay scans, and simplify deadline and batch APIs. Re-measure
-on the box after each change group. Only then enable guarded default-mode
-`torch.compile` if the actual step benchmark wins, and run the short and gate
-runs. Never touch jobs started by another session.
+Wait for the queue-aware post-rebase smoke and step benchmark. If the compiled
+step remains above 37 ms, Gate 1 is not met; do not hide that result with another
+mode or compatibility path. Run Gate 2 only if the measured path is accepted.
+Never touch jobs, tickets, pid files, or run directories started by another
+session.
