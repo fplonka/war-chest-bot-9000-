@@ -97,8 +97,6 @@ def main():
     p.add_argument("--rounds", type=int, default=PROD.rounds,
                    help="round boundaries tree growth may pass through")
     p.add_argument("--cfr", default=PROD.cfr, help="the run's regret rule")
-    p.add_argument("--query-rate", type=float, default=PROD.query_rate,
-                   help="leaves a self-play solve queues, when making a corpus")
     p.add_argument("--recursive-rate", type=float, default=PROD.recursive_rate)
     p.add_argument("--weights", help="a checkpoint to solve with, e.g. runs/NAME/snap_02.pt")
     args = p.parse_args()
