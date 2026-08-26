@@ -287,7 +287,7 @@ def offboard_pile_visibility(net, rng):
     """Every type's public piles reach the trunk, occupied or not."""
     sizes = [1, 1]
     xpub = public_rows(rng, len(sizes) // 2)
-    hexes = xpub[:, :N_HEXES * HEX_CH].reshape(len(sizes), N_HEXES, HEX_CH)
+    hexes = xpub[:, :N_HEXES * HEX_CH].reshape(len(xpub), N_HEXES, HEX_CH)
     hexes[:, :, HEX_FACTS] = 0.0
     seg, phi, weight = belief(rng, sizes)
     base = run(net, xpub, phi, weight, seg, len(sizes))
