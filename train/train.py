@@ -50,7 +50,8 @@ import warchest
 import config
 from export_weights import load as load_checkpoint
 from gpu_batch import make_batch, warmup
-from replay import Buffer, ROW_COLUMNS
+from replay import (Buffer, ROW_COLUMNS, SOURCE_COUNT, SOURCE_PLAY,
+                    SOURCE_QUERY, SOURCE_WARM)
 from value_net import Net
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -240,11 +241,11 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
         delay = buf.written_at[ring] - buf.created_at[ring]
         stat["sample_delays"].append(delay)
         source_id = buf.source[ring]
-        source = np.bincount(source_id, minlength=3)
+        source = np.bincount(source_id, minlength=SOURCE_COUNT)
         stat["sample_sources"].append(source_id.copy())
-        stat["sample_warm"] += int(source[0])
-        stat["sample_play"] += int(source[1])
-        stat["sample_query"] += int(source[2])
+        stat["sample_warm"] += int(source[SOURCE_WARM])
+        stat["sample_play"] += int(source[SOURCE_PLAY])
+        stat["sample_query"] += int(source[SOURCE_QUERY])
         stat["sample_td1_targets"] += 2 * int(buf.td1[ring].sum())
         stat["sample_targets"] += int(buf.clen[ring].sum())
         sampled = buf.gather(ids)
@@ -1079,9 +1080,9 @@ def main():
                 "sample_age_p90": round(float(np.quantile(sample_ages, 0.9)), 1),
                 "sample_delay_mean": round(float(sample_delays.mean()), 1),
                 "sample_delay_p90": round(float(np.quantile(sample_delays, 0.9)), 1),
-                "sample_warm_delay": round(delay_mean(0), 1),
-                "sample_play_delay": round(delay_mean(1), 1),
-                "sample_query_delay": round(delay_mean(2), 1),
+                "sample_warm_delay": round(delay_mean(SOURCE_WARM), 1),
+                "sample_play_delay": round(delay_mean(SOURCE_PLAY), 1),
+                "sample_query_delay": round(delay_mean(SOURCE_QUERY), 1),
                 "sample_warm_frac": round(window["sample_warm"] / sample_n, 4),
                 "sample_play_frac": round(window["sample_play"] / sample_n, 4),
                 "sample_query_frac": round(window["sample_query"] / sample_n, 4),
