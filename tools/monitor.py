@@ -94,71 +94,84 @@ def elo_panel(lad, name):
                  hlines=[("greedy", greedy["elo"])] if greedy else (), marks=True)
 
 
+PANELS = (
+    ("Value loss by row age", "huber",
+     (("training sample", "loss"), ("old rows", "loss_old"),
+      ("fresh rows", "loss_new")), False, ()),
+    ("Policy loss", "cross-entropy", (("policy", "policy_loss"),), True, ()),
+    ("Per-head objective", "weighted loss",
+     (("value Huber", "loss"), ("policy", "policy_weighted_loss"),
+      ("total", "total_loss")), True, ()),
+    ("Policy entropy", "nats / information state",
+     (("network prior", "policy_prior_entropy"),
+      ("search target", "policy_target_entropy")), True, ()),
+    ("Stored search target vs current prior", "KL divergence (nats)",
+     (("target KL", "policy_search_kl"),), True, ()),
+    ("Auxiliary ownership loss", "cross-entropy", (("ownership", "aux_loss"),), True, ()),
+    ("Auxiliary ownership accuracy", "fraction correct", (("ownership", "aux_acc"),),
+     True, (("chance", 1 / 3),)),
+    ("Spread of predictions", "std",
+     (("prediction", "probe_std"), ("target configs", "tgt_std"),
+      ("belief-weighted target", "tgt_belief_std")), True, ()),
+    ("Value targets", "target",
+     (("p05", "tgt_p05"), ("median", "tgt_p50"), ("p95", "tgt_p95"),
+      ("belief mean", "tgt_belief_mean")), False, (("zero", 0),)),
+    ("Value head against game outcomes", "error",
+     (("RMSE", "value_outcome_rmse"), ("MAE", "value_outcome_mae")), True, ()),
+    ("Value calibration", "statistic",
+     (("correlation", "value_outcome_corr"), ("slope", "value_calibration_slope"),
+      ("bias", "value_outcome_bias")), False, (("ideal slope", 1), ("zero", 0))),
+    ("Replay buffer fill", "rows", (("buffer", "buf"),), True, ()),
+    ("Replay composition", "fraction of live rows",
+     (("warm", "replay_warm_frac"), ("main line", "replay_play_frac"),
+      ("query", "replay_query_frac"), ("TD(1) rows", "replay_td1_row_frac"),
+      ("TD(1) target cells", "replay_td1_target_frac")), True, ()),
+    ("Sampled replay composition", "fraction of sampled rows",
+     (("warm", "sample_warm_frac"), ("main line", "sample_play_frac"),
+      ("query", "sample_query_frac"), ("TD(1) target cells", "sample_td1_target_frac")),
+     True, ()),
+    ("Target age when sampled", "seconds",
+     (("mean", "sample_age_mean"), ("median", "sample_age_p50"),
+      ("p90", "sample_age_p90"), ("oldest target", "target_age_max"),
+      ("oldest insertion", "buf_s")), True, ()),
+    ("Target delivery delay", "seconds",
+     (("p90", "sample_delay_p90"), ("warm mean", "sample_warm_delay"),
+      ("main-line mean", "sample_play_delay"), ("query mean", "sample_query_delay")),
+     True, ()),
+    ("Gradient norm before clipping", "L2 norm",
+     (("mean", "grad_norm"), ("max", "grad_norm_max")), True, (("clip", 5),)),
+    ("Weight norm", "L2 norm", (("weights", "weight_norm"),), True, ()),
+    ("Zero-sum residual", "|E[v0] + E[v1]|",
+     (("RMS", "zero_sum_rms"), ("batch max", "zero_sum_max")), True, ()),
+    ("Replay generation throughput", "rows/s", (("replay generation throughput", "rows_per_s"),),
+     True, ()),
+    ("Effective training ratio", "optimizer rows / solve",
+     (("effective training ratio", "effective_train_ratio"),), True, ()),
+    ("Passes per generated row", "optimizer rows / replay row",
+     (("passes per generated row", "train_row_ratio"),), True, ()),
+    ("Gradient clipping", "fraction of steps", (("gradient clipping", "grad_clip_frac"),),
+     True, ()),
+    ("Replay age", "seconds retained", (("replay age", "buf_s"),), True, ()),
+    # The horizon cuts a game at 256 coin plays and scores it a draw. A rising
+    # rate means the ladder is measuring a game that is increasingly not real.
+    ("Games cut at horizon", "fraction", (("games cut at horizon", "horizon_frac"),),
+     True, ()),
+)
+
+
 def panels(eps, elo):
     """Every panel of the dashboard, from the SoG epochs logged so far."""
     m = [e["t"] / 60.0 for e in eps]
-    col = lambda k: [e.get(k) for e in eps]
-    has = lambda k: any(k in e for e in eps)
-    out = [elo]
-
-    if has("loss_old"):
-        out.append(panel("Value loss by row age", "huber", m,
-                         [series("training sample", col("loss"), True),
-                          series("old rows", col("loss_old"), True),
-                          series("fresh rows", col("loss_new"), True)]))
-    else:
-        out.append(panel("Value loss", "huber", m,
-                         [series("value", col("loss"), True)]))
-
-    if has("policy_loss"):
-        out.append(panel("Policy loss", "cross-entropy", m,
-                         [series("policy", col("policy_loss"), True)], zero=True))
-    if has("policy_weighted_loss"):
-        out.append(panel("Per-head objective", "weighted loss", m,
-                         [series("value Huber", col("loss"), True),
-                          series("policy", col("policy_weighted_loss"), True),
-                          series("total", col("total_loss"), True)], zero=True))
-    if has("policy_target_entropy"):
-        out.append(panel("Policy entropy", "nats / information state", m,
-                         [series("network prior", col("policy_prior_entropy"), True),
-                          series("search target", col("policy_target_entropy"), True)],
-                         zero=True))
-        out.append(panel("Stored search target vs current prior", "KL divergence (nats)", m,
-                         [series("target KL", col("policy_search_kl"), True)], zero=True))
-
-    # Historical runs may carry the ablated ownership head's metrics.
-    if has("aux_loss"):
-        out.append(panel("Auxiliary ownership loss", "cross-entropy", m,
-                         [series("ownership", col("aux_loss"), True)], zero=True))
-        out.append(panel("Auxiliary ownership accuracy", "fraction correct", m,
-                         [series("ownership", col("aux_acc"), True)], zero=True,
-                         hlines=[("chance", 1 / 3)]))
+    out = [elo] + [
+        panel(title, ylabel, m,
+              [series(label, [e.get(key) for e in eps], True)
+               for label, key in specs], zero=zero, hlines=hlines)
+        for title, ylabel, specs, zero, hlines in PANELS]
 
     relative_loss = [e["loss"] / e["tgt_std"] ** 2
                      if e.get("tgt_std") and "loss" in e else None for e in eps]
     out.append(panel("Relative value loss", "huber / target variance", m,
                      [series("value", relative_loss, True)], zero=True))
-    out.append(panel("Spread of predictions", "std", m,
-                     [series("prediction", col("probe_std"), True),
-                      series("target configs", col("tgt_std"), True),
-                      series("belief-weighted target", col("tgt_belief_std"), True)],
-                     zero=True))
-    if has("tgt_p05"):
-        out.append(panel("Value targets", "target", m,
-                         [series("p05", col("tgt_p05"), True),
-                          series("median", col("tgt_p50"), True),
-                          series("p95", col("tgt_p95"), True),
-                          series("belief mean", col("tgt_belief_mean"), True)],
-                         hlines=[("zero", 0)]))
-    if has("value_outcome_rmse"):
-        out.append(panel("Value head against game outcomes", "error", m,
-                         [series("RMSE", col("value_outcome_rmse"), True),
-                          series("MAE", col("value_outcome_mae"), True)], zero=True))
-        out.append(panel("Value calibration", "statistic", m,
-                         [series("correlation", col("value_outcome_corr"), True),
-                          series("slope", col("value_calibration_slope"), True),
-                          series("bias", col("value_outcome_bias"), True)],
-                         hlines=[("ideal slope", 1), ("zero", 0)]))
 
     # Two throughput lines, and the gap between them is the information.
     # `solves_per_s` is cumulative solves over elapsed -- the run average, not
@@ -170,89 +183,34 @@ def panels(eps, elo):
                    else None)
     out.append(panel("Generation throughput", "solves/s", m,
                      [series("now", now, True),
-                      series("run average", col("solves_per_s"))], zero=True))
-    if has("buf"):
-        out.append(panel("Replay buffer fill", "rows", m,
-                         [series("buffer", col("buf"))], zero=True))
-    if has("replay_query_frac"):
-        out.append(panel("Replay composition", "fraction of live rows", m,
-                         [series("warm", col("replay_warm_frac"), True),
-                          series("main line", col("replay_play_frac"), True),
-                          series("query", col("replay_query_frac"), True),
-                          series("TD(1) rows", col("replay_td1_row_frac"), True),
-                          series("TD(1) target cells", col("replay_td1_target_frac"), True)],
-                         zero=True))
-        out.append(panel("Sampled replay composition", "fraction of sampled rows", m,
-                         [series("warm", col("sample_warm_frac"), True),
-                          series("main line", col("sample_play_frac"), True),
-                          series("query", col("sample_query_frac"), True),
-                          series("TD(1) target cells", col("sample_td1_target_frac"), True)],
-                         zero=True))
-    if has("sample_age_mean"):
-        out.append(panel("Target age when sampled", "seconds", m,
-                         [series("mean", col("sample_age_mean"), True),
-                          series("median", col("sample_age_p50"), True),
-                          series("p90", col("sample_age_p90"), True),
-                          series("oldest target", col("target_age_max"), True),
-                          series("oldest insertion", col("buf_s"), True)], zero=True))
-        out.append(panel("Target delivery delay", "seconds", m,
-                         [series("p90", col("sample_delay_p90"), True),
-                          series("warm mean", col("sample_warm_delay"), True),
-                          series("main-line mean", col("sample_play_delay"), True),
-                          series("query mean", col("sample_query_delay"), True)], zero=True))
-    if has("grad_norm"):
-        out.append(panel("Gradient norm before clipping", "L2 norm", m,
-                         [series("mean", col("grad_norm"), True),
-                          series("max", col("grad_norm_max"), True)], zero=True,
-                         hlines=[("clip", 5)]))
-        out.append(panel("Weight norm", "L2 norm", m,
-                         [series("weights", col("weight_norm"), True)], zero=True))
-    if has("zero_sum_rms"):
-        out.append(panel("Zero-sum residual", "|E[v0] + E[v1]|", m,
-                         [series("RMS", col("zero_sum_rms"), True),
-                          series("batch max", col("zero_sum_max"), True)], zero=True))
+                      series("run average", [e.get("solves_per_s") for e in eps])],
+                     zero=True))
 
-    for title, ylabel, key, smooth in (
-            ("Replay generation throughput", "rows/s", "rows_per_s", False),
-            ("Effective training ratio", "optimizer rows / solve",
-             "effective_train_ratio", False),
-            ("Passes per generated row", "optimizer rows / replay row",
-             "train_row_ratio", False),
-            ("Gradient clipping", "fraction of steps", "grad_clip_frac", True),
-            ("Replay age", "seconds retained", "buf_s", False),
-            # The horizon cuts a game at 256 coin plays and scores it a draw,
-            # and War Chest has no draws. A rising rate means the ladder below
-            # is measuring a game that is increasingly not the real one.
-            ("Games cut at horizon", "fraction", "horizon_frac", True)):
-        if has(key):
-            out.append(panel(title, ylabel, m,
-                             [series(title.lower(), col(key), smooth)], zero=True))
-
-    if any(e.get("plays") for e in eps):
-        kinds = ("attack", "maneuver", "deploy", "bolster", "recruit",
-                 "pass", "claim_initiative")
-        kinds = [kind for kind in kinds
-                 if any(kind in (e.get("plays") or {}) for e in eps)]
-        out.append(panel("Move mix", "% of decisions", m,
-                         [series(kind.replace("_", " "),
-                                 [100 * e.get("plays", {}).get(kind, 0)
-                                  / max(e.get("decisions", 1), 1) for e in eps], True)
-                          for kind in kinds], zero=True))
+    kinds = ("attack", "maneuver", "deploy", "bolster", "recruit", "pass",
+             "claim_initiative")
+    kinds = [kind for kind in kinds
+             if any(kind in (e.get("plays") or {}) for e in eps)]
+    out.append(panel("Move mix", "% of decisions", m,
+                     [series(kind.replace("_", " "),
+                             [100 * e.get("plays", {}).get(kind, 0)
+                              / max(e.get("decisions", 1), 1) for e in eps], True)
+                      for kind in kinds], zero=True))
 
     censuses = [e.get("stop_census") or {} for e in eps]
     reasons = sorted({reason for census in censuses for stops in census.values()
                       for reason in stops})
-    if reasons:
-        def stop_share(census, reason):
-            groups = [stops for stops in census.values() if isinstance(stops, dict)]
-            total = sum(item.get("count", 0) for stops in groups
-                        for item in stops.values())
-            count = sum(stops.get(reason, {}).get("count", 0) for stops in groups)
-            return 100 * count / total if total else None
-        out.append(panel("Solver stop mix", "% of solves", m,
-                         [series(reason.removeprefix("budget_"),
-                                 [stop_share(c, reason) for c in censuses], True)
-                          for reason in reasons], zero=True))
+
+    def stop_share(census, reason):
+        groups = [stops for stops in census.values() if isinstance(stops, dict)]
+        total = sum(item.get("count", 0) for stops in groups
+                    for item in stops.values())
+        count = sum(stops.get(reason, {}).get("count", 0) for stops in groups)
+        return 100 * count / total if total else None
+
+    out.append(panel("Solver stop mix", "% of solves", m,
+                     [series(reason.removeprefix("budget_"),
+                             [stop_share(c, reason) for c in censuses], True)
+                      for reason in reasons], zero=True))
     return [p for p in out if p]
 
 
