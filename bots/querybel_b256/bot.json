@@ -1,0 +1,15 @@
+{
+ "name": "querybel_b256",
+ "sha": "4226353",
+ "binary": "561ea16fbba7",
+ "mind": "sog",
+ "weights": "weights.bin",
+ "search": {
+  "s": 512,
+  "c": 8.0,
+  "rounds": 0,
+  "cfr": "dcfr"
+ },
+ "minutes": 30.0,
+ "note": "querybel_b256 final, 30 min"
+}

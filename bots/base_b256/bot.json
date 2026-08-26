@@ -1,0 +1,15 @@
+{
+ "name": "base_b256",
+ "sha": "5529467",
+ "binary": "ceac5145ad75",
+ "mind": "sog",
+ "weights": "weights.bin",
+ "search": {
+  "s": 512,
+  "c": 8.0,
+  "rounds": 0,
+  "cfr": "dcfr"
+ },
+ "minutes": 30.0,
+ "note": "base_b256 final, 30 min"
+}
