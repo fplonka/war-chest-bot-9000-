@@ -16,8 +16,8 @@
 //!   card table a leaf reads, the seat a join asks about — becomes an index
 //!   array.
 //!
-//! The arithmetic is `net.rs`, in the same order, and `tests/cuda_parity.rs`
-//! holds it to `Backend::Reference` on the same weights. The join is one kernel;
+//! The arithmetic is `net.rs`, in the same order, and the test-only oracle in
+//! `tests/cuda_parity.rs` holds it to exact host arithmetic. The join is one kernel;
 //! the trunk and the join multiply on the tensor cores.
 //!
 //! Scratch is allocated at carve from `RoundCap`. A round that needs more rows

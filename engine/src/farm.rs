@@ -28,8 +28,6 @@ use crate::pbs::Belief;
 use crate::search::{Budget, Cfg, Cfr, Solved, Solver, Step};
 use crate::selfplay::{Data, GameCfg, GameStream};
 use crate::state::State;
-#[cfg(test)]
-use rayon::prelude::*;
 
 /// One solve's network work for this round.
 ///
@@ -353,21 +351,15 @@ impl Call {
 /// built once per solve and every leaf of that solve reads it.
 pub const CARD_ROWS: usize = 2;
 
-/// What actually runs a round's batch.
-///
-/// A run always uses CUDA. The reference variant exists only in unit tests.
+/// The CUDA devices that run a round's batch.
 pub enum Backend {
     #[cfg(feature = "gpu")]
     Cuda(crate::cuda::Device),
-    #[cfg(test)]
-    Reference(Net),
 }
 
 impl Backend {
     pub fn run(&self, calls: &[Call], #[allow(unused)] card: usize) -> Option<Vec<Reply>> {
         match self {
-            #[cfg(test)]
-            Backend::Reference(net) => Some(calls.par_iter().map(|c| c.run(net)).collect()),
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.run(calls, card),
             #[cfg(not(feature = "gpu"))]
@@ -378,8 +370,6 @@ impl Backend {
     /// How many GPUs this backend has, and so how many queues the farm runs.
     pub fn cards(&self) -> usize {
         match self {
-            #[cfg(test)]
-            Backend::Reference(_) => 1,
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.cards(),
             #[cfg(not(feature = "gpu"))]
@@ -390,8 +380,6 @@ impl Backend {
     /// Cards per GPU. Two, so one set can grow while the other iterates.
     pub fn pipelines(&self) -> usize {
         match self {
-            #[cfg(test)]
-            Backend::Reference(_) => 1,
             #[cfg(feature = "gpu")]
             Backend::Cuda(_) => crate::cuda::PIPELINE,
             #[cfg(not(feature = "gpu"))]
@@ -402,8 +390,6 @@ impl Backend {
     /// Slots this card holds. Admission pops one; none free means wait.
     pub fn slots(&self, #[allow(unused)] card: usize) -> usize {
         match self {
-            #[cfg(test)]
-            Backend::Reference(_) => 0,
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.slots(card),
             #[cfg(not(feature = "gpu"))]
@@ -413,8 +399,6 @@ impl Backend {
 
     pub fn slot_bytes(&self) -> usize {
         match self {
-            #[cfg(test)]
-            Backend::Reference(_) => 0,
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.slot_bytes(),
             #[cfg(not(feature = "gpu"))]
@@ -424,8 +408,6 @@ impl Backend {
 
     pub fn slots_per_card(&self) -> usize {
         match self {
-            #[cfg(test)]
-            Backend::Reference(_) => 0,
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.slots_per_card(),
             #[cfg(not(feature = "gpu"))]
@@ -437,8 +419,6 @@ impl Backend {
     /// still does itself.
     pub fn net(&self) -> &Net {
         match self {
-            #[cfg(test)]
-            Backend::Reference(net) => net,
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.net(),
             #[cfg(not(feature = "gpu"))]
@@ -451,11 +431,6 @@ impl Backend {
     /// for a change that touches three arrays.
     pub fn set_net(&mut self, net: Net) -> Result<(), String> {
         match self {
-            #[cfg(test)]
-            Backend::Reference(old) => {
-                *old = net;
-                Ok(())
-            }
             #[cfg(feature = "gpu")]
             Backend::Cuda(d) => d.set_weights(net),
             #[cfg(not(feature = "gpu"))]

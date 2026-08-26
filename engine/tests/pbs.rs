@@ -969,11 +969,7 @@ fn a_batched_solve_matches_one_run_alone_exactly() {
         })
         .collect();
 
-    // The real evaluator, not a hand-rolled one: a batched backend keeps a
-    // solve's board and config vectors between iterations, so a driver that
-    // maps `Call::run` over the calls has nowhere to put them and is not the
-    // thing production runs.
-    let backend = warchest::farm::Backend::Reference(net());
+    let evaluator = net();
     let nets = Arc::new(net());
     let mut streams: Vec<_> = SEEDS.iter().map(|&s| GameStream::new(s, gc)).collect();
     let mut out: Vec<Data> = (0..SEEDS.len()).map(|_| Data::default()).collect();
@@ -1014,7 +1010,7 @@ fn a_batched_solve_matches_one_run_alone_exactly() {
         if calls.is_empty() {
             continue;
         }
-        let mut rest = backend.run(&calls, 0).expect("the reference answers");
+        let mut rest: Vec<_> = calls.iter().map(|call| call.run(&evaluator)).collect();
         for (i, n) in spans.into_iter().enumerate() {
             let tail = rest.split_off(n);
             replies[i] = rest;

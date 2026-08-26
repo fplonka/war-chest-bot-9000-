@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use warchest::contract::NO_ROW;
 use warchest::cuda::Device;
-use warchest::farm::{Backend, Call, Reply};
+use warchest::farm::{Call, Reply};
 use warchest::net::{Net, NetLayout};
 use warchest::pbs::{
     enumerate_configs, expand_row, pack_row, reserve, true_config, Belief, Ctx, PUBFEAT,
@@ -49,6 +49,21 @@ use warchest::rng::Rng;
 use warchest::search::{Arenas, Budget, Cfg, Solved, Solver, Step};
 use warchest::selfplay::{make_game, Agent, Collect, Data, GameCfg, GameStream};
 use warchest::state::State;
+
+/// The two evaluators compared by this test-only oracle.
+enum Backend {
+    Cuda(Device),
+    Reference(Net),
+}
+
+impl Backend {
+    fn run(&self, calls: &[Call], card: usize) -> Option<Vec<Reply>> {
+        match self {
+            Backend::Cuda(device) => device.run(calls, card),
+            Backend::Reference(net) => Some(calls.iter().map(|call| call.run(net)).collect()),
+        }
+    }
+}
 
 fn random_net(seed: u64) -> Net {
     let mut r = warchest::rng::Rng::new(seed);

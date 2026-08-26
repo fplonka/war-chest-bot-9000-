@@ -31,7 +31,7 @@ Remove the runtime host solver. Keep CUDA as the only runtime solver and keep ex
 - Read the surviving queued jobs before restarting work. They wait behind `b256_125`.
 - Restored the required full `cargo test --features gpu` command in `onepath-gpu`; `onepath-after2` uses the baseline settings.
 - `onepath_cuda30` is the default 30-minute run. `onepath-arena200` copies its packed bot, sets that copy and `sweep3_b256` to their recorded DCFR search, and swaps seats over 200 games.
-- Re-ran the thermo-nuclear review. The runtime has one direct CUDA state machine; the host evaluator, arenas, solver, and replay helpers compile only under `cfg(test)`.
+- Re-ran the thermo-nuclear review. The runtime has one direct CUDA state machine; the host evaluator, arenas, solver, replay helpers, and backend adapter compile only under `cfg(test)`.
 
 ## Next
 
