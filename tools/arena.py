@@ -813,7 +813,6 @@ def pack(run, binary, out_dir, snapshot=None, name=None):
                   "c": cfg.get("c", 8.0),
                   "batch": cfg.get("round_batch", 8),
                   "rounds": cfg.get("rounds", 0),
-                  "refresh": 1,
                   "puct": 1.5,
                   "prior_temp": 1.0,
                   "cfr": "dcfr"}
