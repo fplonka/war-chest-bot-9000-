@@ -1287,7 +1287,6 @@ mod target_tests {
         g.s = s;
         g.ctx = ctx;
         g.bel = bel;
-        g.gc.explore = 1.0;
 
         let prior = g.bel[me].clone();
         let uni = policy::uniform(&g.s, &g.ctx, me as u8, &prior.cfg);
