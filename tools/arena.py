@@ -123,13 +123,17 @@ class Bot:
             argv += ["--temp", str(self.spec["temp"])]
         if self.spec.get("weights"):
             argv += ["--weights", str(self.dir / self.spec["weights"])]
+        # The manifest's search keys are the bot's own flags. An archived
+        # bot that names a single `device` takes the seat's first card by
+        # index; current bots take the seat's cards as `--devices`.
+        search = dict(self.spec.get("search", {}))
         if devices and self.searching:
-            argv += ["--devices", ",".join(devices)]
-        search = self.spec.get("search", {})
-        for key, flag in (("s", "--s"), ("c", "--c"), ("rounds", "--rounds"),
-                          ("cfr", "--cfr")):
-            if key in search:
-                argv += [flag, str(search[key])]
+            if "device" in search:
+                search["device"] = devices[0].removeprefix("cuda:")
+            else:
+                argv += ["--devices", ",".join(devices)]
+        for key, value in search.items():
+            argv += [f"--{key}", str(value)]
         try:
             self.proc = subprocess.Popen(
                 argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
