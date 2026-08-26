@@ -244,9 +244,9 @@ def self_check_rows(rows):
     mids = mr[:, warchest.ROW_IDS:warchest.ROW_IDS + NTYPE]
     assert np.array_equal(ids[:, :NSLOT], mids[:, NSLOT:]), "unit ids did not swap"
     # Expansion commutes: expand(mirror(rows)) == mirror_x(expand(rows)).
-    from train import expand_batch
-    a = expand_batch(mr)
-    b = mirror_x(expand_batch(rows))
+    a = np.asarray(warchest.expand_rows(mr.ravel()), np.float32).reshape(len(mr), -1)
+    b = mirror_x(np.asarray(
+        warchest.expand_rows(rows.ravel()), np.float32).reshape(len(rows), -1))
     assert np.allclose(a, b, atol=1e-6), "row mirror and feature mirror diverge"
     return True
 
