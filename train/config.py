@@ -26,7 +26,7 @@ class Cfg:
     recent_frac: float = 0.2
     # Rows, and one row per solve. Student of Games holds 1M for both of its
     # imperfect-information games.
-    cap: int = 1_000_000
+    cap: int = 150_000
     cfgs_per_row: int = 48
     # Student of Games' SoG(s, c): `s` expansions in all, `c` of them after
     # each regret update, so the solve runs ceil(s / c) updates. They are
