@@ -79,13 +79,13 @@ impl Solver {
             let board = self.board_of[row] as usize;
             let at = board * d;
             let mine = (boards.len() / d) as u32;
-            boards.extend_from_slice(&self.pb[at..at + d]);
+            boards.extend_from_slice(&self.oracle.pb[at..at + d]);
             let mut pooled = vec![0.0; 2 * crate::net::POOL];
             self.belief_pair(i, row, &mut pooled);
             let mut h = Vec::new();
             self.net.join(
-                &self.pb[at..at + d],
-                &self.jp[board * crate::net::JW..(board + 1) * crate::net::JW],
+                &self.oracle.pb[at..at + d],
+                &self.oracle.jp[board * crate::net::JW..(board + 1) * crate::net::JW],
                 &[0],
                 &pooled,
                 1,
@@ -114,7 +114,7 @@ impl Solver {
         // `logit(c, a) = <f_p(c), e(a)>` over the node's own legal cells, then
         // a softmax across each config's row.
         let mut logit = Vec::new();
-        let prior = &mut self.host.as_mut().expect(HOST_PATH).prior;
+        let prior = &mut self.oracle.cfr.prior;
         for (k, &i) in want.iter().enumerate() {
             let me = self.nodes[i].player as usize;
             let q = 2 * self.row_of[i] as usize + me;
@@ -129,7 +129,7 @@ impl Solver {
             let act: Vec<u32> = (0..cells)
                 .map(|cell| base[k] + n.legal_action[cell])
                 .collect();
-            self.net.policy(&self.cp, &e, &cfg, &act, &mut logit);
+            self.net.policy(&self.oracle.cp, &e, &cfg, &act, &mut logit);
             let so = self.soff[i] as usize;
             let inv_t = 1.0 / self.cfg.prior_temp.max(1e-6);
             for c in 0..n.nc(me) {
@@ -303,7 +303,7 @@ impl Solver {
             // Counted as the trajectory passes, which is also the virtual loss
             // Student of Games adds across the simulations of one iteration:
             // a later simulation of the same phase sees this one's visit.
-            self.host.as_mut().expect(HOST_PATH).visits[so + cell] += 1.0;
+            self.oracle.cfr.visits[so + cell] += 1.0;
             c[me] = self.nodes[node].legal_trans[cell] as usize;
             node = self.nodes[node].legal_child[cell] as usize;
         }
@@ -334,7 +334,7 @@ impl Solver {
         // A device solve has no arenas of its own, which is the whole point:
         // the rule is being run on the card's numbers, not on numbers the host
         // made. So the arenas it reads are built here, out of `a`.
-        self.host = Some(HostCfr {
+        self.oracle.cfr = HostCfr {
             regret: Vec::new(),
             prior: a.prior[..cells].to_vec(),
             visits: a.visits[..cells].to_vec(),
@@ -348,7 +348,7 @@ impl Solver {
             reach: a.reach[..self.nreach].to_vec(),
             vals: Vec::new(),
             vcache: [Vec::new(), Vec::new()],
-        });
+        };
         self.expansion_phase(want, taken)
     }
 }

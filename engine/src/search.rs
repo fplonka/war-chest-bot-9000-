@@ -463,6 +463,7 @@ impl Cfr {
 /// The device charges per iteration for the join, the readout, the pooling and
 /// the two sweeps, and a growing tree is a different size at every one, so a
 /// final `Shape` prices none of them. `Solver::step` adds a term.
+#[cfg(test)]
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Trace {
     pub iters: u64,
@@ -992,31 +993,9 @@ impl TNode {
     }
 }
 
-// A subgame's leaf batch runs to a couple of megabytes — the public encodings,
-// the cached first layer, the belief blocks, the network scratch — and a game
-// builds a fresh solver every couple of decisions. Allocating those buffers per
-// solve meant faulting in megabytes of fresh zero pages thousands of times a
-// second; the arithmetic that followed was the cheap part. They are handed back
-// on drop and reused, capacity and all.
-/// The per-solve buffers, pooled *by role*: they differ in size by 5x, so a
-/// single shared pool handed each one somebody else's buffer and made it grow
-/// — and growth is the one thing that zeroes.
-const N_ROLES: usize = 8;
-const R_PB: usize = 0;
-const R_XB: usize = 1;
-const R_H: usize = 2;
-const R_CPHI: usize = 3;
-const R_CF: usize = 4;
-const R_CG: usize = 5;
-const R_JP: usize = 6;
-const R_CP: usize = 7;
-
 thread_local! {
-    static BUFS: std::cell::RefCell<[Vec<Vec<f32>>; N_ROLES]> = const {
-        std::cell::RefCell::new([
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-        ])
+    static CONFIG_POOL: std::cell::RefCell<Vec<Vec<f32>>> = const {
+        std::cell::RefCell::new(Vec::new())
     };
 }
 
@@ -1100,20 +1079,18 @@ fn row_key(row: &[u8]) -> u64 {
     h
 }
 
-fn take_buf(role: usize) -> Vec<f32> {
-    BUFS.with(|b| b.borrow_mut()[role].pop().unwrap_or_default())
+fn take_config_buf() -> Vec<f32> {
+    CONFIG_POOL.with(|pool| pool.borrow_mut().pop().unwrap_or_default())
 }
 
-fn give_buf(role: usize, v: Vec<f32>) {
+fn give_config_buf(v: Vec<f32>) {
     if v.capacity() == 0 {
         return;
     }
-    // Point-written workspaces retain their length. Append-only cache arenas
-    // are cleared by `Solver::new` before their first extension.
-    BUFS.with(|b| {
-        let mut b = b.borrow_mut();
-        if b[role].len() < 2 {
-            b[role].push(v);
+    CONFIG_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < 2 {
+            pool.push(v);
         }
     });
 }
@@ -1145,6 +1122,8 @@ pub enum Step {
 mod reference;
 #[cfg(test)]
 pub use reference::HostCfr;
+#[cfg(test)]
+use reference::ReferenceState;
 
 pub struct Solver {
     /// Owned because a solver retains its context for its full solve.
@@ -1205,7 +1184,7 @@ pub struct Solver {
     /// device path: the card owns equivalents of every one of them and
     /// advances them itself, and not one ever crosses back.
     #[cfg(test)]
-    host: Option<HostCfr>,
+    oracle: ReferenceState,
     /// Leaves that have become decision or chance nodes since a reader last
     /// looked. A flat description of the tree is append-only apart from these,
     /// so they are what an incremental update needs to be told.
@@ -1273,12 +1252,6 @@ pub struct Solver {
     /// Per traverser: how many leaf rows `HostCfr::vcache` holds a network
     /// value for. Rows past it are the ones growth has added since the last
     /// query, and they are queried whatever `Cfg::refresh` says.
-    #[cfg(test)]
-    cached: [usize; 2],
-    /// Diagnostics: the per-iteration work this solve has done so far. Nothing
-    /// in a run reads it; the budget study prices a search with it.
-    #[cfg(test)]
-    pub trace: Trace,
     /// Terminal leaves, scored from the game instead of the network.
     pub(crate) term_leaves: Vec<usize>,
     /// Per row, per player: an index into `cphi` for every config in support,
@@ -1301,22 +1274,12 @@ pub struct Solver {
     batch_cfgs: usize,
     /// `[ncfg, D]` readout rows `f(c)` and `[ncfg, POOL]` pooling vectors
     /// `g(c)`. Both survive every CFR iteration.
-    #[cfg(test)]
-    pub cf: Vec<f32>,
-    #[cfg(test)]
-    pub cg: Vec<f32>,
     /// `[ncfg, D]` policy readout rows `f_p(c)`, beside the value's `f(c)`.
-    #[cfg(test)]
-    pub cp: Vec<f32>,
     /// `[2, NTYPE, TYPE]`: the printed-card tokens, one table per player view.
     /// The draft is fixed for the solve, so this is built once.
     pub cards: Vec<f32>,
     /// `[boards, D]` board vectors, and their `[boards, JW]` projection into
     /// the join's first layer. Neither moves between CFR iterations.
-    #[cfg(test)]
-    pub pb: Vec<f32>,
-    #[cfg(test)]
-    pub jp: Vec<f32>,
     /// `[row]` -> the board vector the row reads.
     ///
     /// The trunk reads the public state and nothing else, and a tree that
@@ -1343,14 +1306,7 @@ pub struct Solver {
     mirror0: Vec<u8>,
     /// `[2 * rows, POOL]` pooled belief embeddings — the one thing the join
     /// reads that moves between CFR iterations.
-    #[cfg(test)]
-    pub xb: Vec<f32>,
     /// `[rows, D]`: the join output for the last traverser queried.
-    #[cfg(test)]
-    pub h: Vec<f32>,
-    /// Normalised belief weights for one leaf's support.
-    #[cfg(test)]
-    wbuf: Vec<f32>,
     /// The expansion in flight has passed its bound and is unwinding.
     abandon: bool,
     /// Working memory for the chance transitions, reused across the tree.
@@ -1391,19 +1347,7 @@ const _: () = {
 
 impl Drop for Solver {
     fn drop(&mut self) {
-        #[cfg(test)]
-        for (role, v) in [
-            (R_PB, &mut self.pb),
-            (R_JP, &mut self.jp),
-            (R_XB, &mut self.xb),
-            (R_H, &mut self.h),
-            (R_CF, &mut self.cf),
-            (R_CG, &mut self.cg),
-            (R_CP, &mut self.cp),
-        ] {
-            give_buf(role, std::mem::take(v));
-        }
-        give_buf(R_CPHI, std::mem::take(&mut self.cphi));
+        give_config_buf(std::mem::take(&mut self.cphi));
         give_nodes(std::mem::take(&mut self.nodes), pool_budget(&self.cfg));
     }
 }
@@ -1458,7 +1402,7 @@ impl Solver {
             soff: Vec::new(),
             avg: Vec::new(),
             #[cfg(test)]
-            host: Some(HostCfr::default()),
+            oracle: ReferenceState::default(),
             grown: Vec::new(),
             avg_touched: [false; 2],
             ncells: 0,
@@ -1475,14 +1419,10 @@ impl Solver {
             nc: Vec::new(),
             steps: [0, 0],
             leaf_rows: Vec::new(),
-            #[cfg(test)]
-            cached: [0; 2],
-            #[cfg(test)]
-            trace: Trace::default(),
             term_leaves: Vec::new(),
             leaf_cidx: Vec::new(),
             leaf_coff: Vec::new(),
-            cphi: take_buf(R_CPHI),
+            cphi: take_config_buf(),
             cplayer: Vec::new(),
             cmap: std::collections::HashMap::with_capacity_and_hasher(1024, KeyHash),
             board_of: Vec::new(),
@@ -1492,25 +1432,9 @@ impl Solver {
             batch_rows: 0,
             batch_boards: 0,
             batch_cfgs: 0,
-            #[cfg(test)]
-            cf: take_buf(R_CF),
-            #[cfg(test)]
-            cg: take_buf(R_CG),
-            #[cfg(test)]
-            cp: take_buf(R_CP),
             cards: Vec::new(),
-            #[cfg(test)]
-            pb: take_buf(R_PB),
-            #[cfg(test)]
-            jp: take_buf(R_JP),
             packed: Vec::new(),
             mirror0: Vec::new(),
-            #[cfg(test)]
-            xb: take_buf(R_XB),
-            #[cfg(test)]
-            h: take_buf(R_H),
-            #[cfg(test)]
-            wbuf: Vec::new(),
             abandon: false,
             draw_scratch: DrawScratch::default(),
             cell_order: Vec::new(),
@@ -1522,14 +1446,6 @@ impl Solver {
             seed: 0,
             sent: Default::default(),
         };
-        #[cfg(test)]
-        {
-            sv.cf.clear();
-            sv.cg.clear();
-            sv.cp.clear();
-            sv.pb.clear();
-            sv.jp.clear();
-        }
         {
             let _t = timed!(BUILD);
             // The root is born a leaf like every other node; `expand` grows it.
@@ -1540,7 +1456,8 @@ impl Solver {
             sv.nodes.reserve(640);
             sv.cur.reserve(640);
             #[cfg(test)]
-            if let Some(h) = &mut sv.host {
+            {
+                let h = &mut sv.oracle.cfr;
                 h.reach.reserve(640);
                 h.vals.reserve(640);
                 h.regret.reserve(640);
@@ -1667,7 +1584,8 @@ impl Solver {
         self.nreach += c0 + c1;
         self.nvals += c0.max(c1);
         #[cfg(test)]
-        if let Some(h) = &mut self.host {
+        {
+            let h = &mut self.oracle.cfr;
             h.reach.resize(self.nreach, 0.0);
             h.vals.resize(self.nvals, 0.0);
             h.vcache[0].resize(self.nvals, 0.0);
@@ -1908,7 +1826,7 @@ impl Solver {
         self.leaf_rows.truncate(m.leaf_rows);
         #[cfg(test)]
         {
-            self.cached = self.cached.map(|k| k.min(m.leaf_rows));
+            self.oracle.cached = self.oracle.cached.map(|k| k.min(m.leaf_rows));
         }
         // `packed` is written by index and reused, so only the count and the
         // interning map name boards that no longer exist. A board an abandoned
@@ -1923,7 +1841,8 @@ impl Solver {
         self.ncells = m.ncells;
         self.ndraws = m.ndraws;
         #[cfg(test)]
-        if let Some(h) = &mut self.host {
+        {
+            let h = &mut self.oracle.cfr;
             h.reach.truncate(self.nreach);
             h.vals.truncate(self.nvals);
             h.vcache[0].truncate(self.nvals);
@@ -1987,7 +1906,8 @@ impl Solver {
         self.cur.extend_from_slice(&u);
         let ncells = self.ncells;
         #[cfg(test)]
-        if let Some(h) = &mut self.host {
+        {
+            let h = &mut self.oracle.cfr;
             h.regret.resize(ncells, 0.0);
             h.visits.resize(ncells, 0.0);
             h.qval.resize(ncells, 0.0);
@@ -2511,29 +2431,31 @@ impl Solver {
         calls
     }
 
-    /// Take in what `growth_calls` asked for. The host keeps the board vectors
-    /// because the policy head builds its action embeddings against them, and
-    /// `f_p` for the same reason.
+    /// Record what `growth_calls` made resident. The test oracle also retains
+    /// the returned vectors for its host network.
     fn absorb(&mut self, replies: &[Reply]) {
+        #[cfg(not(test))]
+        let _ = replies;
+        #[cfg(test)]
         let mut at = 0;
         if self.leaf_rows.len() > self.batch_rows {
             #[cfg(test)]
             {
                 let r = &replies[at];
-                self.pb.extend_from_slice(&r.a);
-                self.jp.extend_from_slice(&r.b);
+                self.oracle.pb.extend_from_slice(&r.a);
+                self.oracle.jp.extend_from_slice(&r.b);
+                at += 1;
             }
             self.batch_rows = self.leaf_rows.len();
             self.batch_boards = self.nboards;
-            at += 1;
         }
         if self.ncfg > self.batch_cfgs {
             #[cfg(test)]
             {
                 let r = &replies[at];
-                self.cf.extend_from_slice(&r.a);
-                self.cg.extend_from_slice(&r.b);
-                self.cp.extend_from_slice(&r.c);
+                self.oracle.cf.extend_from_slice(&r.a);
+                self.oracle.cg.extend_from_slice(&r.b);
+                self.oracle.cp.extend_from_slice(&r.c);
             }
             self.batch_cfgs = self.ncfg;
         }
@@ -3031,16 +2953,16 @@ impl Solver {
         {
             v.push((
                 "reference network",
-                f(&self.pb)
-                    + f(&self.jp)
-                    + f(&self.cf)
-                    + f(&self.cg)
-                    + f(&self.cp)
-                    + f(&self.xb)
-                    + f(&self.h)
-                    + f(&self.wbuf),
+                f(&self.oracle.pb)
+                    + f(&self.oracle.jp)
+                    + f(&self.oracle.cf)
+                    + f(&self.oracle.cg)
+                    + f(&self.oracle.cp)
+                    + f(&self.oracle.xb)
+                    + f(&self.oracle.h)
+                    + f(&self.oracle.wbuf),
             ));
-            let h = self.host.as_ref().expect("reference arenas");
+            let h = &self.oracle.cfr;
             v.extend([
                 ("regret", f(&h.regret)),
                 ("prior", f(&h.prior)),

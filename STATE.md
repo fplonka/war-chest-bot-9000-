@@ -15,19 +15,18 @@ Remove the runtime host solver. Keep CUDA as the only runtime solver and keep ex
 
 - Read `AGENTS.md`, the task, and the thermo-nuclear review standard.
 - Located runtime host-path entry points in `search.rs`, `farm.rs`, `bot.rs`, `selfplay.rs`, and `py.rs`.
-- Baseline corpus: `/workspace/warchest-onepath/onepath-roots.bin`, 64 games, retained on box.
+- Baseline corpus regeneration is queued from commit `5529467`; output is `/workspace/onepath-roots.bin`, outside synced trees.
 - Baseline farmbench: 72 workers, GPUs 0,1, 60 seconds; measured window 143.5 solves/s, 25.0 calls/solve, 17.0 ms/round, 61.0 calls/round, 9,837 rows/round.
 - Removed `Nets.device`, runtime backend dispatch, `Backend::Reference` outside tests, and the bot CPU opt-in.
 - Removed host-only examples, the CPU throughput probe, and CPU root generation.
 - Converted the host-dependent integration suites to unit suites so the oracle can be compiled only under `cfg(test)`.
 - Moved host arithmetic from `search.rs` to test-only `search/reference.rs` and `search/reference/growth.rs`; both files stay below 1,000 lines.
+- Consolidated every test-oracle arena and scratch buffer under one `cfg(test)` state.
 - Removed the `Nets` wrapper; solvers now receive `Arc<Net>` directly.
 - Removed CPU arena opt-ins. Static generation remains for greedy replay-format tests; SoG generation uses `SolveFarm`.
 
 ## Next
 
-1. Make the test-only reference path compile after removing runtime dispatch.
-2. Move the exact oracle out of `search.rs` and delete host-only runtime state.
-3. Run the box tests and matched after benchmark.
-4. Run the 30-minute training and 200-game arena gate.
-5. Apply the thermo-nuclear self-review and report.
+1. Run the box tests and matched after benchmark.
+2. Run the 30-minute training and 200-game arena gate.
+3. Apply the thermo-nuclear self-review and report.

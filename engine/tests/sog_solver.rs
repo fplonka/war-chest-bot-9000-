@@ -362,7 +362,7 @@ fn a_solve_stops_expanding_once_the_tree_is_exhausted() {
             sv.nodes.len()
         );
         assert_eq!(sv.stop_reason(), StopReason::Exhausted);
-        assert_eq!(sv.trace.iters, cfg.iters() as u64);
+        assert_eq!(sv.oracle().trace.iters, cfg.iters() as u64);
         assert_eq!(
             sv.nodes.len(),
             whole,

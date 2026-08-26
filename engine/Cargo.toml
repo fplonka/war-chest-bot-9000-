@@ -3,6 +3,8 @@ name = "warchest-engine"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.78"
+# Solver suites are unit modules so their reference oracle exists only under
+# `cfg(test)`. The two ordinary integration suites are listed below.
 autotests = false
 
 [lib]

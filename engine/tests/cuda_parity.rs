@@ -890,7 +890,7 @@ fn the_resident_state_agrees_with_the_cpu_network() {
     let Backend::Cuda(d) = &device else { unreachable!("just built") };
     let got = d.resident(0, 0).expect("the card gave its solve back");
 
-    assert!(!host.pb.is_empty(), "the reference solve made no board vectors");
+    assert!(!host.oracle().pb.is_empty(), "the reference solve made no board vectors");
     assert!(host.ncfg > 0, "the reference solve made no config rows");
     assert_eq!(host.ncells, card.ncells, "the two backends built different trees");
     let cells = host.ncells;
@@ -900,17 +900,17 @@ fn the_resident_state_agrees_with_the_cpu_network() {
     // prior that reads it all come through the trunk, and the trunk multiplies
     // on the tensor cores.
     for (what, h, c) in [
-        ("f(c)", &host.cf[..], &got.f[..]),
-        ("g(c)", &host.cg[..], &got.g[..]),
-        ("f_p(c)", &host.cp[..], &got.fp[..]),
+        ("f(c)", &host.oracle().cf[..], &got.f[..]),
+        ("g(c)", &host.oracle().cg[..], &got.g[..]),
+        ("f_p(c)", &host.oracle().cp[..], &got.fp[..]),
     ] {
         let bad = worst(h, c, what);
         eprintln!("{what}: worst {bad:e} over {} values", h.len());
         assert!(bad < 2e-4, "{what} differ by {bad:e}");
     }
     for (what, h, c) in [
-        ("board vectors", &host.pb[..], &got.p[..]),
-        ("join cache", &host.jp[..], &got.jp[..]),
+        ("board vectors", &host.oracle().pb[..], &got.p[..]),
+        ("join cache", &host.oracle().jp[..], &got.jp[..]),
         ("prior", &host.cfr().prior[..cells], &got.prior[..cells]),
     ] {
         let bad = worst_scaled(h, c, what);

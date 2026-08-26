@@ -796,7 +796,6 @@ fn backend_for(
 /// Run `games` self-play games across all cores and return the training data.
 #[pyfunction]
 #[pyo3(signature = (games, seed, explore=0.25, random_draft=true, temp=2.0))]
-#[allow(clippy::too_many_arguments)]
 fn gen_data(
     py: Python<'_>,
     games: usize,

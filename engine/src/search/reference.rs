@@ -2,9 +2,6 @@ use super::*;
 mod growth;
 
 #[cfg(test)]
-const HOST_PATH: &str = "the CFR arenas belong to the reference solver";
-
-#[cfg(test)]
 #[derive(Default)]
 pub struct HostCfr {
     /// Accumulated regret, laid out exactly like `Solver::cur`.
@@ -43,7 +40,26 @@ pub struct HostCfr {
     pub vcache: [Vec<f32>; 2],
 }
 
+#[derive(Default)]
+pub(crate) struct ReferenceState {
+    pub cfr: HostCfr,
+    cached: [usize; 2],
+    pub trace: Trace,
+    pub cf: Vec<f32>,
+    pub cg: Vec<f32>,
+    pub cp: Vec<f32>,
+    pub pb: Vec<f32>,
+    pub jp: Vec<f32>,
+    pub xb: Vec<f32>,
+    pub h: Vec<f32>,
+    wbuf: Vec<f32>,
+}
+
 impl Solver {
+    pub(crate) fn oracle(&self) -> &ReferenceState {
+        &self.oracle
+    }
+
     /// The CFR arenas this solve works in.
     ///
     /// A solve on the device path has none. Nothing there reads one — the card
@@ -52,7 +68,7 @@ impl Solver {
     /// unallocated arena would.
     #[cfg(test)]
     pub fn cfr(&self) -> &HostCfr {
-        self.host.as_ref().expect(HOST_PATH)
+        &self.oracle.cfr
     }
 
     /// The same arenas, to write. Only the oracles want this: they run a
@@ -60,7 +76,7 @@ impl Solver {
     #[doc(hidden)]
     #[cfg(test)]
     pub fn cfr_mut(&mut self) -> &mut HostCfr {
-        self.host.as_mut().expect(HOST_PATH)
+        &mut self.oracle.cfr
     }
 
     /// Run `f` with the expansion's own stream, which is the stream the card
@@ -88,7 +104,7 @@ impl Solver {
         // rather than a multiply and divide that need not round back.
         self.avg.clear();
         self.avg.extend_from_slice(&self.cur);
-        let sum_strat = &self.host.as_ref().expect(HOST_PATH).sum_strat;
+        let sum_strat = &self.oracle.cfr.sum_strat;
         for i in 0..self.nodes.len() {
             let n = &self.nodes[i];
             if n.leaf || n.chance || !self.avg_touched[n.player as usize] {
@@ -129,7 +145,7 @@ impl Solver {
     #[cfg(test)]
     fn propagate(&mut self, strat: &[f32]) {
         let _t = timed!(REACH);
-        let reach = &mut self.host.as_mut().expect(HOST_PATH).reach;
+        let reach = &mut self.oracle.cfr.reach;
         reach.fill(0.0);
         for p in 0..2 {
             let at = self.roff[0] as usize + if p == 1 { self.nc[0][0] as usize } else { 0 };
@@ -270,16 +286,19 @@ impl Solver {
         // Sized where it is written. Growth used to do it, which fitted a
         // megabyte of pooled belief per solve on the device path -- where the
         // card pools its own and nothing here ever reads a row of it.
-        crate::net::fit(&mut self.xb, 2 * self.leaf_rows.len() * crate::net::POOL);
+        crate::net::fit(
+            &mut self.oracle.xb,
+            2 * self.leaf_rows.len() * crate::net::POOL,
+        );
         let (reach, roff, nc, coff, cidx, cg, wbuf, xb) = (
-            &self.host.as_ref().expect(HOST_PATH).reach,
+            &self.oracle.cfr.reach,
             &self.roff,
             &self.nc,
             &self.leaf_coff,
             &self.leaf_cidx,
-            &self.cg,
-            &mut self.wbuf,
-            &mut self.xb,
+            &self.oracle.cg,
+            &mut self.oracle.wbuf,
+            &mut self.oracle.xb,
         );
         let pool = crate::net::POOL;
         for (r, &i) in self.leaf_rows.iter().enumerate().skip(from) {
@@ -313,18 +332,18 @@ impl Solver {
         for p in 0..2 {
             let n = self.nc[node][p] as usize;
             let ra = self.roff[node] as usize + if p == 1 { self.nc[node][0] as usize } else { 0 };
-            if self.wbuf.len() < n {
-                self.wbuf.resize(n, 0.0);
+            if self.oracle.wbuf.len() < n {
+                self.oracle.wbuf.resize(n, 0.0);
             }
             normalize_weights(
-                &self.host.as_ref().expect(HOST_PATH).reach[ra..ra + n],
-                &mut self.wbuf[..n],
+                &self.oracle.cfr.reach[ra..ra + n],
+                &mut self.oracle.wbuf[..n],
             );
             let cs = self.leaf_coff[2 * row + p] as usize;
             crate::net::accumulate(
-                &self.cg,
+                &self.oracle.cg,
                 &self.leaf_cidx[cs..cs + n],
-                &self.wbuf[..n],
+                &self.oracle.wbuf[..n],
                 pool,
                 &mut out[p * pool..(p + 1) * pool],
             );
@@ -352,7 +371,7 @@ impl Solver {
         }
         self.pbs_head(traverser, from);
         self.readout_from(traverser, from);
-        self.cached[traverser] = self.leaf_rows.len();
+        self.oracle.cached[traverser] = self.leaf_rows.len();
     }
 
     /// The one path CFR pays for on every iteration.
@@ -373,18 +392,18 @@ impl Solver {
             return;
         }
         crate::prof::work(0, 0, n, 0);
-        self.trace.join_rows += n as u64;
+        self.oracle.trace.join_rows += n as u64;
         let pool = crate::net::POOL;
         // `xb` is grown by `fit` and never shrinks, so a subgame smaller than
         // an earlier one would otherwise hand the batch a trailing tail.
         self.net.join(
-            &self.pb[..self.nboards * crate::net::D],
-            &self.jp[..self.nboards * crate::net::JW],
+            &self.oracle.pb[..self.nboards * crate::net::D],
+            &self.oracle.jp[..self.nboards * crate::net::JW],
             &self.board_of[from..rows],
-            &self.xb[2 * from * pool..2 * rows * pool],
+            &self.oracle.xb[2 * from * pool..2 * rows * pool],
             n,
             traverser,
-            &mut self.h,
+            &mut self.oracle.h,
         );
     }
 
@@ -404,7 +423,7 @@ impl Solver {
             .map(|&i| self.nc[i][p] as usize)
             .sum();
         crate::prof::work(0, 0, 0, queried);
-        self.trace.readout_cfgs += queried as u64;
+        self.oracle.trace.readout_cfgs += queried as u64;
         let opp = 1 - p;
         for k in 0..self.term_leaves.len() {
             let i = self.term_leaves[k];
@@ -420,10 +439,10 @@ impl Solver {
             let vo = self.voff[i] as usize;
             // A terminal leaf's value is the game's, not the network's, but
             // it travels the same arithmetic afterwards.
-            self.host.as_mut().expect(HOST_PATH).vals[vo..vo + n].fill(u * opp_reach);
+            self.oracle.cfr.vals[vo..vo + n].fill(u * opp_reach);
         }
         let d = crate::net::D;
-        let cfr = self.host.as_mut().expect(HOST_PATH);
+        let cfr = &mut self.oracle.cfr;
         let (reach, vals, vcache) = (&cfr.reach, &mut cfr.vals, &mut cfr.vcache[p]);
         let (roff, ncs, voff, coff, cidx, cf) = (
             &self.roff,
@@ -431,7 +450,7 @@ impl Solver {
             &self.voff,
             &self.leaf_coff,
             &self.leaf_cidx,
-            &self.cf,
+            &self.oracle.cf,
         );
         for (r, &i) in self.leaf_rows.iter().enumerate() {
             let n = ncs[i][p] as usize;
@@ -445,7 +464,7 @@ impl Solver {
             if r >= from {
                 let cs = coff[2 * r + p] as usize;
                 self.net.values(
-                    &self.h[(r - from) * d..(r - from + 1) * d],
+                    &self.oracle.h[(r - from) * d..(r - from + 1) * d],
                     cf,
                     &cidx[cs..cs + n],
                     &mut vcache[vo..vo + n],
@@ -470,7 +489,7 @@ impl Solver {
         let from = if self.cfg.refresh_due(self.steps[traverser]) {
             0
         } else {
-            self.cached[traverser]
+            self.oracle.cached[traverser]
         };
         self.leaf_values_from(traverser, from);
         self.backprop(traverser, &[], Back::Regret);
@@ -499,7 +518,7 @@ impl Solver {
             None
         };
         let _t = timed!(BACK);
-        let cfr = self.host.as_mut().expect(HOST_PATH);
+        let cfr = &mut self.oracle.cfr;
         for i in (0..self.nodes.len()).rev() {
             if self.nodes[i].leaf {
                 continue;
@@ -662,10 +681,10 @@ impl Solver {
     /// updates rather than `iters / 2`.
     #[cfg(test)]
     pub fn step(&mut self) {
-        self.trace.iters += 1;
-        self.trace.row_iters += self.leaf_rows.len() as u64;
-        self.trace.cidx_iters += self.leaf_cidx.len() as u64;
-        self.trace.cell_iters += self.ncells as u64;
+        self.oracle.trace.iters += 1;
+        self.oracle.trace.row_iters += self.leaf_rows.len() as u64;
+        self.oracle.trace.cidx_iters += self.leaf_cidx.len() as u64;
+        self.oracle.trace.cell_iters += self.ncells as u64;
         self.update_regrets(0);
         self.update_regrets(1);
         self.precompute_reaches();
@@ -686,7 +705,7 @@ impl Solver {
     pub fn avg_block(&mut self) {
         let _t = timed!(AVG);
         self.avg_touched = [true; 2];
-        let cfr = self.host.as_mut().expect(HOST_PATH);
+        let cfr = &mut self.oracle.cfr;
         for i in 0..self.nodes.len() {
             let n = &self.nodes[i];
             if n.leaf || n.chance {
