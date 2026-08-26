@@ -65,8 +65,7 @@ def main():
     torch.manual_seed(0)
     torch.set_float32_matmul_precision("high")
     n, ncfg, na, ncells = 256, 48, 24, 24
-    host = torch.device("cpu")
-    buf = Buffer(n * 4, n * 4 * ncfg, host)
+    buf = Buffer(n * 4, n * 4 * ncfg, dev)
     buf.add(*synth_parts(n, ncfg, na, ncells))
     ids = np.arange(buf.lo, buf.rows)
     device_parts = buf.gather(ids)
@@ -80,7 +79,12 @@ def main():
           f"cells={tuple(policy[0].shape)} nseg={nseg}")
 
     # host oracle parity on the same data
-    np_parts = tuple(p.numpy() for p in device_parts)
+    def to_numpy(value):
+        if isinstance(value, tuple):
+            return tuple(to_numpy(item) for item in value)
+        return value.cpu().numpy() if torch.is_tensor(value) else value
+
+    np_parts = to_numpy(device_parts)
     a = make_cpu_batch(np_parts, np.random.default_rng(0), dev)
     for i, (u, v) in enumerate(zip(a, batch)):
         if i == 5:
