@@ -47,7 +47,6 @@ import torch.nn.functional as F
 
 import warchest
 import config
-import mirror
 from export_weights import load as load_checkpoint
 from value_net import AFEAT, Net
 
@@ -369,14 +368,11 @@ class Buffer:
 
 
 def make_batch(parts, rng, device):
-    """Numpy replay batch -> the two canonical player queries per row."""
+    """Numpy replay batch -> one physical row and two player queries per row."""
     del rng
     rows, cc, cp, cw, cy, seg, pol = parts
     n = len(rows)
-    views = np.empty((2 * n, ROW_BYTES), np.uint8)
-    views[0::2] = rows
-    views[1::2] = mirror.mirror_rows(rows)
-    x = expand_batch(views)
+    x = expand_batch(rows)
     phi = cc.astype(np.float32) / CNORM
     t = lambda a, d=torch.float32: torch.as_tensor(a, dtype=d, device=device)
     pa, pact, pcrow, pcfg, pprob, parow = pol
@@ -433,9 +429,8 @@ def policy_loss(net, xpub, phi, weight, seg, nseg, policy, stats=None):
     if feat.shape[0] == 0 or pact.shape[0] == 0:
         return None
     cards = net.cards(xpub)
-    physical = xpub[0::2]
-    board = net.board(physical, net.tokens(physical, cards[0::2]))
-    _f, g, fp = net.configs(phi, cards[:, :NSLOT], seg)
+    board = net.board(xpub, net.tokens(xpub, cards))
+    _f, g, fp = net.configs(phi, net.query_cards(cards, nseg), seg)
     h = net.heads(board, g, weight, seg, nseg)
     action_query = torch.zeros(feat.shape[0], dtype=torch.long, device=feat.device)
     action_query.scatter_(0, pact, seg[pcfg])
@@ -811,7 +806,7 @@ def main():
     names = tuple(warchest.ENT_NAMES)
     n = max(args.batch, 2048)
     k = n * args.cfgs_per_row
-    x = torch.zeros(2 * n, PUBFEAT, device=dev)
+    x = torch.zeros(n, PUBFEAT, device=dev)
     phi = torch.zeros(k, CFEAT, device=dev)
     w = torch.ones(k, device=dev)
     seg = torch.arange(k, device=dev) % (2 * n)
@@ -1391,7 +1386,7 @@ def main():
           f"draft={'random' if args.random_draft else 'starter'} "
           f"replay_ratio={args.replay_ratio} "
           f"recent_mix={args.recent_mix}/{args.recent_frac} "
-          f"canonical_views=2 cap={args.cap} "
+          f"cap={args.cap} "
           f"matmul={torch.get_float32_matmul_precision()}", flush=True)
 
     if not checkpoint:

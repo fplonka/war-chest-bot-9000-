@@ -126,6 +126,40 @@ def run(net, xpub, phi, weight, seg, queries):
     return v.numpy()
 
 
+def legacy_two_view_values(net, xpub, phi, weight, seg, queries):
+    """The removed two-view path, retained as a value-regression oracle."""
+    txpub = torch.from_numpy(np.ascontiguousarray(xpub))
+    old = torch.empty((2 * len(xpub), PUBFEAT), dtype=txpub.dtype)
+    old[0::2] = txpub
+    old[1::2] = txpub
+    card_facts = old[:, OFF_CARDS:OFF_LOOSE].reshape(-1, NTYPE, CARD_FEATS)
+    first = card_facts[0::2].clone()
+    card_facts[1::2, :NSLOT] = first[:, NSLOT:]
+    card_facts[1::2, NSLOT:] = first[:, :NSLOT]
+    cards = net.cards(old)
+    physical = old[0::2]
+    board = net.board(physical, net.tokens(physical, cards[0::2]))
+    tseg = torch.from_numpy(seg.astype(np.int64))
+    f, g, _ = net.configs(torch.from_numpy(np.ascontiguousarray(phi)),
+                           cards[:, :NSLOT], tseg)
+    h = net.heads(board, g, torch.from_numpy(weight), tseg, queries)
+    return ((f * h[seg]).sum(1) + net.value_bias).detach().numpy()
+
+
+def legacy_two_view_equivalence(net, rng):
+    """Physical expansion preserves values from the old paired-view batch."""
+    sizes = [3, 5, 1, 4, 2, 6]
+    queries = len(sizes)
+    xpub = public_rows(rng, queries // 2)
+    seg, phi, weight = belief(rng, sizes)
+    old = legacy_two_view_values(net, xpub, phi, weight, seg, queries)
+    new = run(net, xpub, phi, weight, seg, queries)
+    err = float(np.max(np.abs(old - new)))
+    scale = max(1.0, float(np.abs(old).max()))
+    assert err < 1e-6 * scale, f"two-view regression: {err:.3e}"
+    print(f"two-view value regression ok: max err {err:.3e}")
+
+
 def slot_permutation(perm):
     """The `PUBFEAT` permutation a relabelling of the draft slots induces.
 
@@ -149,7 +183,7 @@ def blob_parity(net, rng):
     worst = 0.0
     for name, sizes, zero in CASES:
         queries = len(sizes)
-        xpub = public_rows(rng, queries)
+        xpub = public_rows(rng, queries // 2)
         seg, phi, weight = belief(rng, sizes, zero)
         want = run(net, xpub, phi, weight, seg, queries)
         got = np.asarray(warchest.infer(
@@ -174,7 +208,7 @@ def policy_parity(net, rng):
     sizes = [4, 3, 6, 2]
     queries = len(sizes)
     na = 7
-    xpub = public_rows(rng, queries)
+    xpub = public_rows(rng, queries // 2)
     seg, phi, weight = belief(rng, sizes)
     n = len(seg)
 
@@ -193,12 +227,12 @@ def policy_parity(net, rng):
     act = rng.integers(0, na, size=24).astype(np.uint32)
 
     with torch.no_grad():
-        cards = net.cards(torch.from_numpy(np.ascontiguousarray(xpub)))
-        physical = torch.from_numpy(np.ascontiguousarray(xpub))[0::2]
-        board = net.board(physical, net.tokens(physical, cards[0::2]))
+        txpub = torch.from_numpy(np.ascontiguousarray(xpub))
+        cards = net.cards(txpub)
+        board = net.board(txpub, net.tokens(txpub, cards))
         tseg = torch.from_numpy(seg.astype(np.int64))
         _f, g, fp = net.configs(torch.from_numpy(np.ascontiguousarray(phi)),
-                                cards[:, :NSLOT], tseg)
+                                net.query_cards(cards, queries), tseg)
         h = net.heads(board, g, torch.from_numpy(weight), tseg, queries)
         assert float(h.abs().max()) > 1e-2, "policy belief head is zero"
         want = np.zeros(len(cfg), np.float32)
@@ -225,7 +259,7 @@ def slot_invariance(net, rng, perms=6):
     """Relabel the draft six ways; nothing the network says may move."""
     sizes = [4, 3, 6, 2, 5, 5]
     queries = len(sizes)
-    xpub = public_rows(rng, queries)
+    xpub = public_rows(rng, queries // 2)
     seg, phi, weight = belief(rng, sizes)
     base = run(net, xpub, phi, weight, seg, queries)
     spread = float(base.std())
@@ -252,7 +286,7 @@ def slot_invariance(net, rng, perms=6):
 def offboard_pile_visibility(net, rng):
     """Every type's public piles reach the trunk, occupied or not."""
     sizes = [1, 1]
-    xpub = public_rows(rng, len(sizes))
+    xpub = public_rows(rng, len(sizes) // 2)
     hexes = xpub[:, :N_HEXES * HEX_CH].reshape(len(sizes), N_HEXES, HEX_CH)
     hexes[:, :, HEX_FACTS] = 0.0
     seg, phi, weight = belief(rng, sizes)
@@ -267,12 +301,23 @@ def offboard_pile_visibility(net, rng):
 
 
 def packed_row_cuda_parity():
-    """The Python entry point matches the Rust encoder on real mirrored rows."""
+    """The Python entry point matches the Rust encoder on packed rows."""
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA parity requires a working GPU")
-    rows = np.frombuffer(bytes(warchest.mirror_row_pairs(128, 19)), np.uint8)
-    rows = rows.reshape(-1, warchest.ROW_BYTES)[:4096].copy()
-    assert len(rows) >= 2048, f"only {len(rows)} real rows"
+    rng = np.random.default_rng(19)
+    rows = np.zeros((4096, warchest.ROW_BYTES), np.uint8)
+    rows[:, warchest.ROW_HEX_OWNER:warchest.ROW_HEX_OWNER + warchest.N_HEXES] = rng.choice(
+        [0, 1, 255], (len(rows), warchest.N_HEXES))
+    rows[:, warchest.ROW_HEX_SLOT:warchest.ROW_HEX_SLOT + warchest.N_HEXES] = rng.integers(
+        0, warchest.NSLOT, (len(rows), warchest.N_HEXES), dtype=np.uint8)
+    rows[:, warchest.ROW_HEX_MARKER:warchest.ROW_HEX_MARKER + warchest.N_HEXES] = rng.choice(
+        [0, 1, 255], (len(rows), warchest.N_HEXES))
+    rows[:, warchest.ROW_HEX_HEIGHT:warchest.ROW_HEX_HEIGHT + warchest.N_HEXES] = rng.integers(
+        0, 6, (len(rows), warchest.N_HEXES), dtype=np.uint8)
+    rows[:, warchest.ROW_IDS:warchest.ROW_IDS + warchest.NTYPE] = rng.integers(
+        0, warchest.N_UNITS, (len(rows), warchest.NTYPE), dtype=np.uint8)
+    rows[:, warchest.ROW_PILES:warchest.ROW_PILES + 4 * warchest.NTYPE] = rng.integers(
+        0, 6, (len(rows), 4 * warchest.NTYPE), dtype=np.uint8)
     want = np.asarray(warchest.expand_rows(rows.ravel()), np.float32)
     want = want.reshape(len(rows), warchest.PUBFEAT)
     device = torch.device("cuda:0")
@@ -290,13 +335,14 @@ def packed_row_cuda_parity():
     exact = (want == 0.0) | (want == 1.0)
     assert np.array_equal(got[exact], want[exact]), "one-hot expansion drift"
     np.testing.assert_allclose(got[~exact], want[~exact], rtol=0, atol=1e-6)
-    print(f"packed-row CUDA parity ok: {len(rows)} real rows, mirrors included")
+    print(f"packed-row CUDA parity ok: {len(rows)} packed rows")
 
 
 def main():
     rng = np.random.default_rng(11)
     net = random_net(7)
     net.push()
+    legacy_two_view_equivalence(net, rng)
     blob_parity(net, rng)
     policy_parity(net, rng)
     slot_invariance(net, rng)

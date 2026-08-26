@@ -9,9 +9,8 @@
 //!
 //! Two conventions carry the concatenation into the kernels:
 //!
-//! * packed public rows are expanded after upload. A leaf's physical `xpub`
-//!   row is `2 * r`, so paired canonical queries stay adjacent and the copy
-//!   `net::board` makes becomes a stride;
+//! * packed public rows are expanded after upload. The trunk receives one
+//!   physical row per leaf;
 //! * anything that was constant within a call and varies across a batch — the
 //!   card table a leaf reads, the seat a join asks about — becomes an index
 //!   array.
@@ -36,7 +35,7 @@ use cudarc::driver::{
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 
 use crate::board::{board, N_HEXES, NONE};
-use crate::farm::{Call, Prime, Reply, CARD_ROWS};
+use crate::farm::{Call, Prime, Reply};
 use crate::net::{
     ln_block, Net, NetLayout, NormSpan, Span, AFEAT, AW, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW,
     LN_ACT, LN_CFG, LN_H, LN_JOIN, LN_JOUT, LN_TRUNK, POOL, TYPE,
@@ -433,7 +432,7 @@ struct RoundCap {
 
 impl RoundCap {
     fn of(n: usize, b: &Budget, s: u32) -> RoundCap {
-        let cards = n * CARD_ROWS * NTYPE * TYPE;
+        let cards = n * NTYPE * TYPE;
         // Host-packed tree columns (not board `p`/`jp` or config `f`/`g`/`fp`,
         // which stay on the card), plus the trunk's extra copies of board_of,
         // cidx and coff on the same scatter.
@@ -464,7 +463,7 @@ impl RoundCap {
             facts: TILE * N_HEXES * HEX_FACTS,
             occupant: TILE * N_HEXES,
             x: TILE * N_HEXES * C,
-            bag: n * CARD_ROWS * NTYPE * 3 * POOL,
+            bag: n * NTYPE * 3 * POOL,
             packed: TILE * ROW_BYTES,
             xpub: TILE * PUBFEAT,
             cards,
@@ -1580,7 +1579,7 @@ impl Card {
                 unreachable!("trunk shard holds only trunk calls")
             };
             assert_eq!(packed.len(), boards * ROW_BYTES, "trunk input is not one packed row a board");
-            assert_eq!(cards.len(), CARD_ROWS * NTYPE * TYPE, "trunk card table");
+            assert_eq!(cards.len(), NTYPE * TYPE, "trunk card table");
             (packed, cards, *boards)
         };
         let rows: usize = mine.iter().map(|&i| each(i).2).sum();
@@ -1599,7 +1598,7 @@ impl Card {
         let s = &self.stream;
         {
             let mut stage = self.host.lock();
-            stage.cards.put(s, mine.len() * CARD_ROWS * NTYPE * TYPE, |dst| {
+            stage.cards.put(s, mine.len() * NTYPE * TYPE, |dst| {
                 let mut at = 0;
                 for &i in mine {
                     let (_, cd, _) = each(i);
@@ -1640,14 +1639,14 @@ impl Card {
                         let boards = each(i).2;
                         if skip >= boards {
                             skip -= boards;
-                            card += CARD_ROWS as i32;
+                            card += 1;
                             continue;
                         }
                         let take = (boards - skip).min(n - wrote);
                         dst[wrote..wrote + take].fill(card);
                         wrote += take;
                         skip = 0;
-                        card += CARD_ROWS as i32;
+                        card += 1;
                         if wrote == n {
                             break;
                         }
@@ -1681,7 +1680,7 @@ impl Card {
         self.keep(calls, mine, pack)
     }
 
-    /// Encode `n` boards already expanded at the head of `xpub` / `card_of_row`.
+    /// Encode `n` physical boards already expanded at the head of `xpub`.
     fn trunk_tile(&self, calls: &[Call], mine: &[usize], board0: usize, n: usize) -> Res<()> {
         let s = &self.stream;
         let stage = self.host.lock();
@@ -1827,7 +1826,7 @@ impl Card {
     // --------------------------------------------------------------- configs
 
     /// `f(c)` for the readout and `g(c)` for the pooling, for every config the
-    /// round asked about.
+    /// round asked about. Each card table contains both seats' tokens.
     fn configs(&self, calls: &[Call], mine: &[usize]) -> Res<()> {
         if mine.is_empty() {
             return Ok(());
@@ -1845,7 +1844,7 @@ impl Card {
         let l = &self.layout;
         {
             let mut stage = self.host.lock();
-            stage.cfg_cards.put(s, mine.len() * CARD_ROWS * NTYPE * TYPE, |dst| {
+            stage.cfg_cards.put(s, mine.len() * NTYPE * TYPE, |dst| {
                 let mut at = 0;
                 for &i in mine {
                     let (_, _, cd, _) = each(i);
@@ -1854,11 +1853,11 @@ impl Card {
                 }
                 at
             })?;
-            let views = stage.cfg_cards.host.len / (NTYPE * TYPE);
+            let tables = stage.cfg_cards.host.len / (NTYPE * TYPE);
             let cards = stage.cfg_cards.dev.buf.as_ref().expect("staged");
             let mut sc = self.scratch.lock();
-            sc.bag.room(views * NTYPE * 3 * POOL)?;
-            self.run(l.cfg_m, cards, views * NTYPE, sc.bag.buf.as_mut().unwrap())?;
+            sc.bag.room(tables * NTYPE * 3 * POOL)?;
+            self.run(l.cfg_m, cards, tables * NTYPE, sc.bag.buf.as_mut().unwrap())?;
         }
         let mut cfg0 = 0usize;
         while cfg0 < n {
@@ -1886,21 +1885,21 @@ impl Card {
                     wrote * CFEAT
                 })?;
                 stage.owner.put(s, k, |dst| {
-                    let (mut skip, mut wrote, mut base) = (cfg0, 0, 0u32);
+                    let (mut skip, mut wrote, mut query_base) = (cfg0, 0, 0u32);
                     for &i in mine {
                         let (_, ow, cd, kn) = each(i);
                         if skip >= kn {
                             skip -= kn;
-                            base += (cd.len() / (NTYPE * TYPE)) as u32;
+                            query_base += 2 * (cd.len() / (NTYPE * TYPE)) as u32;
                             continue;
                         }
                         let take = (kn - skip).min(k - wrote);
                         for (d, &q) in dst[wrote..wrote + take].iter_mut().zip(&ow[skip..skip + take]) {
-                            *d = q + base;
+                            *d = q + query_base;
                         }
                         wrote += take;
                         skip = 0;
-                        base += (cd.len() / (NTYPE * TYPE)) as u32;
+                        query_base += 2 * (cd.len() / (NTYPE * TYPE)) as u32;
                         if wrote == k {
                             break;
                         }

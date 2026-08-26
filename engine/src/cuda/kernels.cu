@@ -7,13 +7,9 @@
 //
 // Every kernel takes a whole round's batch. Calls of one kind are concatenated
 // before they get here, so where the CPU network walks one solve's rows these
-// walk every solve's rows at once. Two conventions carry the concatenation:
-//
-//  * a leaf's physical `xpub` row is `2 * r`, because the paired canonical
-//    queries stay adjacent when the calls are joined, so a strided read
-//    replaces the copy `net::board` makes;
-//  * anything that was per-call and is now per-row — the card table a row
-//    reads, the seat a join queries — arrives as an index array.
+// walk every solve's rows at once. Anything that was per-call and is now
+// per-row — the card table a row reads, the seat a join queries — arrives as an
+// index array.
 
 extern "C" {
 
@@ -156,8 +152,7 @@ __global__ void k_bias(float* out, const float* b, int rows, int width) {
 
 
 // A contiguous window out of each source row, into a packed matrix. Pile counts
-// and the loose scalars both reach their GEMM this way; `stride` is `2 *
-// PUBFEAT`, which picks the physical row of each leaf.
+// and the loose scalars both reach their GEMM this way.
 __global__ void k_window(const float* src, float* out, int rows, int stride,
                          int off, int width) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -555,6 +550,8 @@ void k_trunk(const float* x0, const int* nb, const float* __restrict__ w,
 }
 
 // One slot row per (config, slot): three counts then that slot's card token.
+// `owner` is a paired query index: its high bits select the physical card
+// table and its low bit selects the queried seat.
 __global__ void k_cfg_slots(const float* phi, const unsigned int* owner,
                             const float* cards, float* slots, int n, int nslot,
                             int cfeat, int ntype, int type) {
@@ -566,7 +563,11 @@ __global__ void k_cfg_slots(const float* phi, const unsigned int* owner,
     if (j == 0) slots[i] = phi[(size_t)cfg * cfeat + k];
     else if (j == 1) slots[i] = phi[(size_t)cfg * cfeat + nslot + k];
     else if (j == 2) slots[i] = phi[(size_t)cfg * cfeat + 2 * nslot + k];
-    else slots[i] = cards[((size_t)owner[cfg] * ntype + k) * type + j - 3];
+    else {
+        int query = owner[cfg];
+        int table = query >> 1, seat = query & 1;
+        slots[i] = cards[((size_t)table * ntype + seat * nslot + k) * type + j - 3];
+    }
 }
 
 // Sum a config's slot rows back into one vector.
@@ -589,7 +590,10 @@ __global__ void k_bag(const float* bag, const float* phi,
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n * pool) return;
     int cfg = i / pool, j = i % pool;
-    const float* v = bag + (size_t)owner[cfg] * ntype * 3 * pool;
+    int query = owner[cfg];
+    int table = query >> 1, seat = query & 1;
+    const float* v = bag + (size_t)table * ntype * 3 * pool
+                   + (size_t)seat * nslot * 3 * pool;
     float acc = 0.0f;
     for (int k = 0; k < nslot; ++k)
         for (int zone = 0; zone < 3; ++zone) {

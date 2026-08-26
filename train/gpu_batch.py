@@ -5,7 +5,6 @@ from functools import lru_cache
 import numpy as np
 import torch
 
-import mirror
 import warchest
 
 
@@ -20,24 +19,20 @@ def _tables(device_text):
 
 
 def make_batch(parts, rng, device):
-    """Compact replay batch -> two canonical query rows on ``device``."""
+    """Compact replay batch -> one physical row and two player queries."""
     del rng
     rows, cc, cp, cw, cy, seg, pol = parts
     n = len(rows)
-    views = np.empty((2 * n, warchest.ROW_BYTES), np.uint8)
-    views[0::2] = rows
-    views[1::2] = mirror.mirror_rows(rows)
-    rows = np.ascontiguousarray(views)
     cc = np.ascontiguousarray(cc)
     t = lambda a, dtype=None: torch.as_tensor(a, dtype=dtype, device=device)
-    rows_t = t(rows, torch.uint8)
+    rows_t = t(np.ascontiguousarray(rows), torch.uint8)
     cards, locations = _tables(str(device))
-    x = torch.empty((2 * n, warchest.PUBFEAT), dtype=torch.float32, device=device)
+    x = torch.empty((n, warchest.PUBFEAT), dtype=torch.float32, device=device)
     stream = torch.cuda.current_stream(device)
     ordinal = device.index if device.index is not None else torch.cuda.current_device()
     warchest.expand_rows_cuda(
         rows_t.data_ptr(), cards.data_ptr(), locations.data_ptr(), x.data_ptr(),
-        2 * n, stream.cuda_stream, ordinal)
+        n, stream.cuda_stream, ordinal)
 
     phi = t(cc, torch.float32) / float(warchest.CNORM)
     from train import action_feats

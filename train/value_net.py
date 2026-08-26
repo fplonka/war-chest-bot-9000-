@@ -182,6 +182,12 @@ class Net(nn.Module):
         loose = xpub[:, OFF_LOOSE:OFF_LOOSE + LOOSE]
         return self.board_out(torch.cat([x.mean(1), x.amax(1), loose], -1))
 
+    def query_cards(self, cards, nseg):
+        """The queried player's card tokens, in even/odd query order."""
+        assert nseg == 2 * cards.shape[0]
+        return torch.stack((cards[:, :NSLOT], cards[:, NSLOT:]), 1).reshape(
+            nseg, NSLOT, TYPE)
+
     def configs(self, phi, own, seg):
         """Readout vector `f(c)` and pooling vector `g(c)` for each config.
 
@@ -240,10 +246,9 @@ class Net(nn.Module):
         share one physical board trunk and differ by belief order and seat.
         """
         cards = self.cards(xpub)
-        physical = xpub[0::2]
-        p = self.board(physical, self.tokens(physical, cards[0::2]))
+        p = self.board(xpub, self.tokens(xpub, cards))
 
-        f, g, _fp = self.configs(phi, cards[:, :NSLOT], seg)
+        f, g, _fp = self.configs(phi, self.query_cards(cards, nseg), seg)
         h = self.heads(p, g, weight, seg, nseg)
         return (f * h[seg]).sum(1) + self.value_bias
 

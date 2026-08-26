@@ -22,14 +22,12 @@ import numpy as np
 import torch
 
 sys.path.insert(0, "train")
-import mirror  # noqa: E402
 import value_net  # noqa: E402
 import warchest  # noqa: E402
 from dump import Dump  # noqa: E402
 from train import expand_batch  # noqa: E402
 
 CNORM = warchest.CNORM
-ROW_BYTES = warchest.ROW_BYTES
 
 # `(name, BLOCKS, C, JBLOCKS, JW, D, POOL, CFGH)`. The first is production.
 VARIANTS = [
@@ -73,10 +71,7 @@ def build(dev, blocks, c, jblocks, jw, d, pool, cfgh):
 def batch(dump, lo, hi, dev):
     rows, cc, cp, cw, cy, seg = dump.rows(lo, hi)
     n = len(rows)
-    views = np.empty((2 * n, ROW_BYTES), np.uint8)
-    views[0::2] = rows
-    views[1::2] = mirror.mirror_rows(rows)
-    x = expand_batch(views)
+    x = expand_batch(rows)
     t = lambda a, k=torch.float32: torch.as_tensor(a, dtype=k, device=dev)
     return (t(x), t(cc.astype(np.float32) / CNORM), t(cw),
             t(seg, torch.long), t(cy), 2 * n)

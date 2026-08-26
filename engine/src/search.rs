@@ -1358,7 +1358,7 @@ pub struct Solver {
     pub cg: Vec<f32>,
     /// `[ncfg, D]` policy readout rows `f_p(c)`, beside the value's `f(c)`.
     pub cp: Vec<f32>,
-    /// `[2, NTYPE, TYPE]`: the printed-card tokens, one table per player view.
+    /// `[NTYPE, TYPE]`: the printed-card tokens for the physical draft.
     /// The draft is fixed for the solve, so this is built once.
     pub cards: Vec<f32>,
     /// `[boards, D]` board vectors, and their `[boards, JW]` projection into
@@ -1387,8 +1387,6 @@ pub struct Solver {
     pub nboards: usize,
     /// Packed public encoding, one row a distinct public state.
     pub(crate) packed: Vec<u8>,
-    /// The mirrored packed first leaf, which is all the card table wants.
-    mirror0: Vec<u8>,
     /// `[2 * rows, POOL]` pooled belief embeddings — the one thing the join
     /// reads that moves between CFR iterations.
     pub xb: Vec<f32>,
@@ -1547,7 +1545,6 @@ impl Solver {
             pb: take_buf(R_PB),
             jp: take_buf(R_JP),
             packed: Vec::new(),
-            mirror0: Vec::new(),
             xb: take_buf(R_XB),
             h: take_buf(R_H),
             wbuf: Vec::new(),
@@ -2614,10 +2611,7 @@ impl Solver {
     /// One leaf's public encoding, interned: the board it reads.
     ///
     /// A row, not two. The board is public and the trunk reads the physical
-    /// view only -- the mirrored one was written for every leaf, carried
-    /// through the call, and gathered past by everything that read it. What
-    /// still wants it is the card table, which holds a view a seat and is
-    /// built once a solve off the first board; that one mirror is kept here.
+    /// view; the card table contains both players' unit types in that row.
     ///
     /// The packed row is written where the next board would go and kept only if
     /// no earlier board already holds it. Writing first is what makes the
@@ -2628,10 +2622,6 @@ impl Solver {
             self.packed.resize(at + 128 * ROW_BYTES, 0);
         }
         pack_row(s, &self.ctx, &mut self.packed[at..at + ROW_BYTES]);
-        if self.nboards == 0 {
-            self.mirror0.resize(ROW_BYTES, 0);
-            pack_row(&s.mirror(), &self.ctx.mirrored(), &mut self.mirror0);
-        }
         let key = row_key(&self.packed[at..at + ROW_BYTES]);
         if let Some(&b) = self.bmap.get(&key) {
             let old = b as usize * ROW_BYTES;
@@ -2770,14 +2760,12 @@ impl Solver {
         let fresh_rows = rows - self.batch_rows;
         let fresh_cfgs = self.ncfg - self.batch_cfgs;
         if self.cards.is_empty() && (fresh_rows > 0 || fresh_cfgs > 0) {
-            let both = [&self.packed[..ROW_BYTES], &self.mirror0[..]].concat();
-            self.nets.value.cards_from_rows(&both, 2, &mut self.cards);
+            self.nets.value.cards_from_rows(&self.packed[..ROW_BYTES], 1, &mut self.cards);
         }
         if fresh_rows > 0 {
             // The cards in play are fixed at the draft, so every row of the
-            // subgame carries the same card block and the table is built once,
-            // one view per seat. Everything downstream reads it by canonical
-            // coin-type index.
+            // subgame carries the same physical card block and the table is
+            // built once. Config queries select one player's five tokens.
             // Exactly the fresh boards. `packed` is a grown scratch buffer, so
             // an open-ended slice would carry whatever the last, larger
             // subgame left behind — invisible to a solve evaluating alone, and
@@ -4279,7 +4267,6 @@ impl Solver {
                     + u(&self.board_of)
                     + f(&self.cphi)
                     + self.packed.capacity()
-                    + self.mirror0.capacity()
                     + f(&self.cards)
                     + self.cplayer.capacity(),
             ),

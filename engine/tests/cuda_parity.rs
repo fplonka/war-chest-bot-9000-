@@ -129,12 +129,9 @@ fn packed_rows_expand_on_the_card() {
                 break;
             }
             if state.is_valued() {
-                let mirror = state.mirror();
-                for (s, c) in [(&state, ctx), (&mirror, ctx.mirrored())] {
-                    let at = rows.len();
-                    rows.resize(at + ROW_BYTES, 0);
-                    pack_row(s, &c, &mut rows[at..at + ROW_BYTES]);
-                }
+                let at = rows.len();
+                rows.resize(at + ROW_BYTES, 0);
+                pack_row(&state, &ctx, &mut rows[at..at + ROW_BYTES]);
             }
             let actions = state.legal_actions();
             state.apply_inplace(actions[rng.below(actions.len())]);

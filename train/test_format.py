@@ -3,8 +3,8 @@
 Generate a few hundred rows through the real generation path, write a dump,
 load it back through `Dump`, take a solve-aligned subset, make a batch, run a
 few offline training steps, and evaluate a validation loss. Anything that
-changes a shape -- the row layout, the expansion, the dedup key, the mirror,
-the batch assembly -- breaks this test loudly instead of silently mis-training
+changes a shape -- the row layout, the expansion, the dedup key, or the
+batch assembly -- breaks this test loudly instead of silently mis-training
 later.
 
     python train/test_format.py
@@ -19,7 +19,6 @@ import numpy as np
 import torch
 
 import warchest
-import mirror
 from value_net import Net
 from train import Buffer, forward_values, losses, make_batch
 from dump import Dump
@@ -114,16 +113,13 @@ def main():
     rng = np.random.default_rng(0)
     b = make_batch(tr, rng, dev)
     xpub, phi, w, seg, y, nseg, policy = b
-    assert xpub.shape == (2 * len(tr[0]), PUBFEAT), xpub.shape
+    assert xpub.shape == (len(tr[0]), PUBFEAT), xpub.shape
     assert phi.shape[1] == CFEAT
     assert seg.max() == 2 * len(tr[0]) - 1
     assert nseg == 2 * len(tr[0])
     assert torch.allclose(torch.bincount(seg, w), torch.ones(nseg), atol=1e-6)
     assert not len(policy[0]) and not len(policy[1])
     assert torch.isfinite(xpub).all() and torch.isfinite(y).all()
-    trows, tcc, tcp = tr[0], tr[1], tr[2]
-    mirror.self_check_rows(trows)
-    mirror.self_check(xpub[0::2].numpy())
     print(f"      batch {xpub.shape} phi {phi.shape}", flush=True)
 
     print("[5/6] ten offline training steps", flush=True)
@@ -143,8 +139,6 @@ def main():
     hl, hrms = evaluate(net, te, rng, dev)
     print(f"      test huber {hl:.6f} rms {hrms:.5f}", flush=True)
     assert np.isfinite(hl)
-    print(f"row mirror matches State::mirror on {mirror.check_against_engine()} states",
-          flush=True)
     print("format test OK", flush=True)
 
 

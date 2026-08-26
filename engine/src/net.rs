@@ -511,16 +511,6 @@ pub const LN_JOUT: usize = LN_JOIN + JBLOCKS;
 pub const LN_H: usize = LN_JOUT + 1;
 pub const LN_ACT: usize = LN_H + 1;
 
-/// The physical row of each leaf, out of a buffer that holds both seat views.
-/// Only the reference path keeps both: it builds a card table per seat view.
-fn physical_rows(xpub: &[f32], rows: usize) -> Vec<f32> {
-    let mut out = Vec::with_capacity(rows * PUBFEAT);
-    for r in 0..rows {
-        out.extend_from_slice(&xpub[2 * r * PUBFEAT..(2 * r + 1) * PUBFEAT]);
-    }
-    out
-}
-
 /// The one-hot column of the coin slot an action spends: `-1`, a micro-decision
 /// that spends nothing, is the column past the last slot. A replay row stores
 /// this column as the action's slot byte, so the trainer reads it as is.
@@ -645,8 +635,7 @@ impl Net {
 
     // ---------------------------------------------------------------- pieces
 
-    /// `[rows, NTYPE, TYPE]` printed-card tokens. Fixed for a whole solve, so
-    /// the solver runs this on the two canonical views only.
+    /// `[rows, NTYPE, TYPE]` printed-card tokens for the physical rows.
     pub fn cards(&self, xpub: &[f32], rows: usize, out: &mut Vec<f32>) {
         let mut facts = scratch(rows * NTYPE * CARD_FEATS);
         for r in 0..rows {
@@ -693,7 +682,6 @@ impl Net {
         packed: &[u8],
         cards: &[f32],
         rows: usize,
-        card_rows: usize,
         out: &mut Vec<f32>,
     ) {
         use crate::pbs::{expand_row, ROW_BYTES};
@@ -704,11 +692,11 @@ impl Net {
         {
             expand_row(row, dst);
         }
-        self.board(&xpub, cards, rows, card_rows, out);
+        self.board(&xpub, cards, rows, out);
     }
 
     /// Card tokens plus this row's pile counts and the owner's seat.
-    fn tokens(&self, xpub: &[f32], cards: &[f32], rows: usize, card_rows: usize) -> Vec<f32> {
+    fn tokens(&self, xpub: &[f32], cards: &[f32], rows: usize) -> Vec<f32> {
         let mut piles = scratch(rows * NTYPE * PILE_COUNTS);
         let n = NTYPE * PILE_COUNTS;
         for r in 0..rows {
@@ -717,6 +705,8 @@ impl Net {
         }
         let mut out = scratch(rows * NTYPE * TYPE);
         self.pile.add(&piles, rows * NTYPE, &mut out);
+        let card_rows = cards.len() / (NTYPE * TYPE);
+        debug_assert!(card_rows > 0 || rows == 0);
         for r in 0..rows {
             let card = &cards[(r % card_rows) * NTYPE * TYPE..(r % card_rows + 1) * NTYPE * TYPE];
             for t in 0..NTYPE {
@@ -850,27 +840,15 @@ impl Net {
         x
     }
 
-    /// One board vector per physical row. `xpub` contains paired canonical
-    /// queries; the trunk reads the even, physical-seat-zero rows.
+    /// One board vector per physical row.
     pub fn board(
         &self,
         xpub: &[f32],
         cards: &[f32],
         rows: usize,
-        card_rows: usize,
         out: &mut Vec<f32>,
     ) {
-        // `xpub` is one row a leaf: the board is a public thing and the trunk
-        // never looked at the mirrored seat view, which this used to gather
-        // past. The card table still holds both views, and a leaf takes the
-        // physical one.
-        let mut physical_cards = scratch(rows * NTYPE * TYPE);
-        for r in 0..rows {
-            let cr = (2 * r) % card_rows;
-            physical_cards[r * NTYPE * TYPE..(r + 1) * NTYPE * TYPE]
-                .copy_from_slice(&cards[cr * NTYPE * TYPE..(cr + 1) * NTYPE * TYPE]);
-        }
-        let tokens = self.tokens(xpub, &physical_cards, rows, rows);
+        let tokens = self.tokens(xpub, cards, rows);
         let x = self.trunk(xpub, &tokens, rows);
         let width = 2 * C + LOOSE;
         let mut input = scratch(rows * width);
@@ -890,7 +868,6 @@ impl Net {
             );
         }
         self.board_out.run(&input, rows, out);
-        recycle(physical_cards);
         recycle(tokens);
         recycle(x);
         recycle(input);
@@ -904,11 +881,12 @@ impl Net {
     }
 
     /// `f(c)` (the readout row) and `g(c)` (the pooling vector) per config.
-    /// `owner` is the canonical query whose five card tokens the config reads.
+    /// `query` names the physical card table and seat as `2 * row + seat`.
+    /// A single-solve config call uses query values zero and one.
     pub fn configs(
         &self,
         phi: &[f32],
-        owner: &[u32],
+        query: &[u32],
         n: usize,
         cards: &[f32],
         f_out: &mut Vec<f32>,
@@ -918,14 +896,18 @@ impl Net {
         let width = 3 + TYPE;
         let mut slots = scratch(n * NSLOT * width);
         for c in 0..n {
-            let q = owner[c] as usize;
+            let q = query[c] as usize;
+            let table = q / 2;
+            let seat = q % 2;
             for k in 0..NSLOT {
                 let row = &mut slots[(c * NSLOT + k) * width..(c * NSLOT + k + 1) * width];
                 row[0] = phi[c * CFEAT + k];
                 row[1] = phi[c * CFEAT + NSLOT + k];
                 row[2] = phi[c * CFEAT + 2 * NSLOT + k];
-                row[3..]
-                    .copy_from_slice(&cards[(q * NTYPE + k) * TYPE..(q * NTYPE + k + 1) * TYPE]);
+                row[3..].copy_from_slice(
+                    &cards[(table * NTYPE + seat * NSLOT + k) * TYPE
+                        ..(table * NTYPE + seat * NSLOT + k + 1) * TYPE],
+                );
             }
         }
         let mut hidden = scratch(0);
@@ -949,17 +931,17 @@ impl Net {
         // The linear half of `g`: a count-weighted sum of per-zone card
         // embeddings. Pooling is linear over it, so `sum_c beta(c) g(c)`
         // carries the belief's exact expected holding of every card, bound to
-        // that card. `bag` depends only on the card table, so it costs two
-        // rows per solve and fifteen accumulations per config.
+        // that card.
         let mut bag = scratch(0);
-        let views = cards.len() / (NTYPE * TYPE);
-        self.cfg_m.run(cards, views * NTYPE, &mut bag);
+        let tables = cards.len() / (NTYPE * TYPE);
+        self.cfg_m.run(cards, tables * NTYPE, &mut bag);
         let stride = 3 * POOL;
         for c in 0..n {
-            let q = owner[c] as usize;
+            let q = query[c] as usize;
+            let base = (q / 2) * NTYPE + (q % 2) * NSLOT;
             let dst = &mut g_out[c * POOL..(c + 1) * POOL];
             for k in 0..NSLOT {
-                let v = &bag[(q * NTYPE + k) * stride..(q * NTYPE + k + 1) * stride];
+                let v = &bag[(base + k) * stride..(base + k + 1) * stride];
                 for zone in 0..3 {
                     let count = phi[c * CFEAT + zone * NSLOT + k];
                     if count == 0.0 {
@@ -1172,12 +1154,11 @@ impl Net {
         queries: usize,
     ) -> Vec<f32> {
         let n = weight.len();
-        let mut cards = Vec::new();
-        self.cards(xpub, queries, &mut cards);
         let rows = queries / 2;
-        let phys = physical_rows(xpub, rows);
+        let mut cards = Vec::new();
+        self.cards(xpub, rows, &mut cards);
         let (mut p, mut jp) = (Vec::new(), Vec::new());
-        self.board(&phys, &cards, rows, queries, &mut p);
+        self.board(xpub, &cards, rows, &mut p);
         self.join_cache(&p, rows, &mut jp);
         let (mut f, mut g, mut fp) = (Vec::new(), Vec::new(), Vec::new());
         self.configs(phi, seg, n, &cards, &mut f, &mut g, &mut fp);
@@ -1229,12 +1210,11 @@ impl Net {
         queries: usize,
     ) -> Vec<f32> {
         let n = seg.len();
-        let mut cards = Vec::new();
-        self.cards(xpub, queries, &mut cards);
         let rows = queries / 2;
-        let phys = physical_rows(xpub, rows);
+        let mut cards = Vec::new();
+        self.cards(xpub, rows, &mut cards);
         let mut p = Vec::new();
-        self.board(&phys, &cards, rows, queries, &mut p);
+        self.board(xpub, &cards, rows, &mut p);
         let mut jp = Vec::new();
         self.join_cache(&p, rows, &mut jp);
         let (mut f, mut g, mut fp) = (Vec::new(), Vec::new(), Vec::new());

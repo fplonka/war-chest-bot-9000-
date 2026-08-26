@@ -108,12 +108,6 @@ impl Ctx {
         Ctx { slots, slot_of }
     }
 
-    pub fn mirrored(self) -> Ctx {
-        Ctx {
-            slots: [self.slots[1], self.slots[0]],
-            slot_of: [self.slot_of[1], self.slot_of[0]],
-        }
-    }
 }
 
 // ------------------------------------------------------------------- configs

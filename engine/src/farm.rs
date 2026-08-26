@@ -298,7 +298,7 @@ impl Call {
         let mut r = Reply::default();
         match self {
             Call::Trunk { packed, cards, boards, .. } => {
-                net.board_from_rows(packed, cards, *boards, CARD_ROWS, &mut r.a);
+                net.board_from_rows(packed, cards, *boards, &mut r.a);
                 net.join_cache(&r.a, *boards, &mut r.b);
             }
             Call::Configs { phi, owner, cards, n, .. } => {
@@ -346,10 +346,6 @@ impl Call {
     }
 }
 
-
-/// A solve's card table: one row per seat view. Fixed at the draft, so it is
-/// built once per solve and every leaf of that solve reads it.
-pub const CARD_ROWS: usize = 2;
 
 /// What actually runs a round's batch.
 ///

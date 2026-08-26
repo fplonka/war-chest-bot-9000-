@@ -1069,50 +1069,6 @@ fn location_hexes() -> Vec<u8> {
     board().location_hexes.to_vec()
 }
 
-/// `N_HEXES` indices: where each hex lands under a 180-degree rotation of the
-/// board, `(x, y) -> (6 - x, 6 - y)` in axial coordinates.
-///
-/// That rotation maps white's two starting locations exactly onto black's and
-/// permutes the six neutral ones, so rotating the board and swapping the two
-/// players is an exact symmetry of the game. It is the basis of the training
-/// augmentation: every position can be presented a second way, for free.
-#[pyfunction]
-fn hex_mirror() -> Vec<u32> {
-    (0..crate::board::N_HEXES)
-        .map(|h| crate::state::mirror_hex(h) as u32)
-        .collect()
-}
-
-/// Packed rows for coin-play states off random playouts, each followed by the
-/// packed row of the same position rotated 180 degrees with the seats swapped.
-/// `State::mirror` is the engine's own answer; `train/mirror.py` permutes row
-/// bytes to get there and is checked against this.
-#[pyfunction]
-fn mirror_row_pairs(games: usize, seed: u64) -> Vec<u8> {
-    use crate::pbs::{pack_row, Ctx, ROW_BYTES};
-    let mut rng = crate::rng::Rng::new(seed);
-    let mut out = Vec::new();
-    for _ in 0..games {
-        let mut s = crate::selfplay::make_game(&mut rng, true);
-        let ctx = Ctx::new(&s);
-        while !s.is_terminal() {
-            let acts = s.legal_actions();
-            if acts.is_empty() {
-                break;
-            }
-            if !s.is_terminal() && !s.is_chance() {
-                let m = s.mirror();
-                let mctx = Ctx::new(&m);
-                let at = out.len();
-                out.resize(at + 2 * ROW_BYTES, 0);
-                pack_row(&s, &ctx, &mut out[at..at + ROW_BYTES]);
-                pack_row(&m, &mctx, &mut out[at + ROW_BYTES..at + 2 * ROW_BYTES]);
-            }
-            s.apply_inplace(acts[rng.below(acts.len())]);
-        }
-    }
-    out
-}
 
 /// Expand packed replay rows into the public encoding, in one batch.
 ///
@@ -1169,8 +1125,6 @@ fn expand_rows_cuda(
 
 #[pymodule]
 fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(hex_mirror, m)?)?;
-    m.add_function(wrap_pyfunction!(mirror_row_pairs, m)?)?;
     m.add_function(wrap_pyfunction!(hex_coords, m)?)?;
     m.add_function(wrap_pyfunction!(units_info, m)?)?;
     m.add_function(wrap_pyfunction!(card_features_table, m)?)?;
@@ -1190,9 +1144,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("N_KINDS", crate::actions::N_KINDS)?;
     m.add("ACT_BYTES", crate::search::ACT_BYTES)?;
     m.add("CARD_FEATS", crate::units::CARD_FEATS)?;
-    // Block offsets in the public half of the encoding. Exported so the
-    // training side can build the mirror permutation from one source of truth
-    // rather than restating the layout.
+    // Block offsets in the public half of the encoding.
     m.add("NTYPE", crate::pbs::NTYPE)?;
     m.add("HEX_CH", crate::pbs::HEX_CH)?;
     m.add("HEX_FACTS", crate::pbs::HEX_FACTS)?;

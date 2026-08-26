@@ -175,52 +175,6 @@ impl Cont {
             _ => HexSet::default(),
         }
     }
-
-    fn mirrored(self) -> Cont {
-        let flip = |p: u8| if p == NONE { NONE } else { 1 - p };
-        let hex = |h: u8| {
-            if (h as usize) < N_HEXES {
-                mirror_hex(h as usize) as u8
-            } else {
-                h
-            }
-        };
-        match self {
-            Cont::Draw { player } => Cont::Draw {
-                player: flip(player),
-            },
-            Cont::MainPlay => Cont::MainPlay,
-            Cont::RoyalGuardChoice { defender, rg_hex } => Cont::RoyalGuardChoice {
-                defender: flip(defender),
-                rg_hex: hex(rg_hex),
-            },
-            Cont::SwordsmanMove { hex: h } => Cont::SwordsmanMove { hex: hex(h) },
-            Cont::BerserkerChain { hex: h, v2 } => Cont::BerserkerChain {
-                hex: hex(h),
-                v2,
-            },
-            Cont::FootmanManeuver { hexes } => {
-                let mut out = HexSet::default();
-                for h in hexes.iter() {
-                    out.insert(hex(h));
-                }
-                Cont::FootmanManeuver { hexes: out }
-            }
-            Cont::CavalryAttack { hex: h } => Cont::CavalryAttack { hex: hex(h) },
-            Cont::MercenaryManeuver { hex: h } => Cont::MercenaryManeuver { hex: hex(h) },
-            Cont::FootmanInstantDeploy { coin } => Cont::FootmanInstantDeploy { coin },
-            Cont::WarriorPriestDraw { player, rg_hex } => Cont::WarriorPriestDraw {
-                player: flip(player),
-                rg_hex: hex(rg_hex),
-            },
-            Cont::WarriorPriestPlay { player } => Cont::WarriorPriestPlay {
-                player: flip(player),
-            },
-            Cont::_AttackPost { atk_hex } => Cont::_AttackPost {
-                atk_hex: hex(atk_hex),
-            },
-        }
-    }
 }
 
 /// The LIFO continuation stack, inline.
@@ -286,14 +240,6 @@ impl ContStack {
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &Cont> {
         self.v[..self.n as usize].iter().rev()
-    }
-
-    fn mirrored(self) -> ContStack {
-        let mut o = self;
-        for i in 0..o.n as usize {
-            o.v[i] = o.v[i].mirrored();
-        }
-        o
     }
 }
 
@@ -643,45 +589,6 @@ impl State {
         a
     }
 
-    /// The same position rotated 180 degrees with the two seats exchanged.
-    ///
-    /// The rotation `(x, y) -> (6 - x, 6 - y)` maps white's two starting
-    /// locations onto black's and permutes the six neutral ones, so this is an
-    /// exact symmetry of War Chest: the result is a legal position whose value
-    /// is the original's with the players' roles exchanged. It is the ground
-    /// truth for the training augmentation, which permutes packed row bytes
-    /// instead (`train/mirror.py`).
-    pub fn mirror(&self) -> State {
-        let flip = |p: u8| if p == NONE { NONE } else { 1 - p };
-        let mut m = *self;
-        for h in 0..N_HEXES {
-            let k = mirror_hex(h);
-            m.hex_type[k] = self.hex_type[h];
-            m.hex_height[k] = self.hex_height[h];
-            m.hex_owner[k] = flip(self.hex_owner[h]);
-            m.loc_marker[k] = flip(self.loc_marker[h]);
-        }
-        m.zones.swap(0, 1);
-        m.markers_hand.swap(0, 1);
-        m.turns_taken.swap(0, 1);
-        m.initiative = flip(self.initiative);
-        m.first_player = flip(self.first_player);
-        m.active = flip(self.active);
-        m.winner = flip(self.winner);
-        m.pending = self.pending.mirrored();
-        m.conts = self.conts.mirrored();
-        m
-    }
-}
-
-/// The hex the 180-degree rotation sends `h` to. `py::hex_mirror` hands the
-/// same permutation to the training augmentation.
-pub fn mirror_hex(h: usize) -> usize {
-    let bd = board();
-    let (x, y) = bd.coord[h];
-    (0..N_HEXES)
-        .find(|&k| bd.coord[k] == (6 - x, 6 - y))
-        .expect("the rotation stays on the board")
 }
 
 #[cfg(test)]

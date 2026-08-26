@@ -20,8 +20,6 @@ webui/           play.py + index.html: browser UI for playing a trained agent
 play.sh          one-liner: build the extension, serve the UI, open the browser
 train/           train.py    PyTorch training loop, snapshots on a timer
   value_net.py   the value network itself, shared by every tool that loads one
-  mirror.py      the board's 180-degree rotation, which is how the second
-                 canonical seat view of a row is produced
   diagnose.py    model-free check on how learnable a dump's targets are
   dump.py        reading a dumped replay buffer
   gpu_batch.py   replay rows -> canonical query batch, expanded on the device
