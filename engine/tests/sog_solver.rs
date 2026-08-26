@@ -805,7 +805,7 @@ fn a_solve_never_grows_past_its_budget() {
             // The first expansion did not fit. The root stayed a leaf, which
             // is the truncation: there is no average to read.
         } else {
-            let root = sv.average_strategy(0, 0);
+            let root = sv.root_strategy(0);
             assert!(!root.is_empty(), "seed {seed}: a truncated solve has no average");
             assert!(
                 root.iter().sum::<f32>() > 0.99 && root.iter().sum::<f32>() < 1.01,
@@ -893,7 +893,7 @@ fn a_solve_fits_a_budget_tight_in_one_entity() {
             }
             let me = sv.nodes[0].player as usize;
             for c in 0..sv.nodes[0].nc(me) {
-                let row = sv.average_strategy(0, c);
+                let row = sv.root_strategy(c);
                 let sum: f32 = row.iter().sum();
                 assert!(
                     !row.is_empty() && sum > 0.99 && sum < 1.01,

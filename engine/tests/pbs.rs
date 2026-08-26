@@ -821,7 +821,7 @@ fn a_solve_reads_only_the_beliefs() {
             sv.run_alone();
             let vals = vec![sv.root_values()];
             let strat: Vec<f32> = (0..bel[w.to_act() as usize].cfg.len())
-                .flat_map(|c| sv.average_strategy(0, c).to_vec())
+                .flat_map(|c| sv.root_strategy(c).to_vec())
                 .collect();
             runs.push((vals[0][0].clone(), vals[0][1].clone(), strat));
         }
@@ -885,7 +885,7 @@ fn the_value_function_separates_configs_sharing_a_hand() {
                 if (v[i] - v[j]).abs() > 1e-9 {
                     val_differs += 1;
                 }
-                let (a, b) = (sv.average_strategy(0, i), sv.average_strategy(0, j));
+                let (a, b) = (sv.root_strategy(i), sv.root_strategy(j));
                 if a.iter().zip(b.iter()).any(|(x, y)| (x - y).abs() > 1e-9) {
                     strat_differs += 1;
                 }
@@ -1247,7 +1247,7 @@ fn zero_weight_config_survives_the_walk_update() {
         let obs = obs_key(&n0.acts[chosen]);
         let mut pairs = Vec::new();
         for (ci, c) in bel[me].cfg.iter().enumerate() {
-            let row = sv.average_strategy(0, ci);
+            let row = sv.root_strategy(ci);
             for (cell, &p) in n0.legal_row(ci).zip(row) {
                 let a = n0.legal_action[cell] as usize;
                 if obs_key(&n0.acts[a]) != obs {
