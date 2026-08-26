@@ -2847,15 +2847,13 @@ impl Solver {
         }
     }
 
-    /// The CFR average strategy: the approximate equilibrium of the subgame.
-    /// Acting and belief propagation use it.
-    pub fn average_strategy(&self, node: usize, c: usize) -> &[f32] {
-        let so = self.soff[node] as usize;
-        let row = self.nodes[node].legal_row(c);
+    /// The CFR average strategy at the root: the policy used to act.
+    pub(crate) fn root_strategy(&self, config: usize) -> &[f32] {
+        let row = self.nodes[0].legal_row(config);
         assert!(
             !self.avg.is_empty(),
-            "the solve must `finish` before its average is read"
+            "the solve must finish before its average is read"
         );
-        &self.avg[so + row.start..so + row.end]
+        &self.avg[row]
     }
 }

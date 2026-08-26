@@ -1067,7 +1067,7 @@ mod target_tests {
                     .clone()
                     .filter(|&cell| d.pci[cell] as usize == k + shift)
                     .collect();
-                let want = sv.average_strategy(0, k);
+                let want = sv.root_strategy(k);
                 assert_eq!(mine.len(), want.len(), "config {k}: cell count");
                 let total: f32 = mine.iter().map(|&cell| d.pprob[cell]).sum();
                 assert!(

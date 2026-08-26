@@ -197,19 +197,6 @@ pub fn uniform(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config]) -> NodePolicy 
     np
 }
 
-/// A node's shape, read off a solved tree.
-fn frame(sv: &Solver, node: usize) -> NodePolicy {
-    let n = &sv.nodes[node];
-    NodePolicy {
-        acts: n.acts.clone(),
-        aslot: n.aslot.clone(),
-        fdown: n.fdown.clone(),
-        legal_off: n.legal_off.clone(),
-        legal_action: n.legal_action.clone(),
-        probs: vec![0.0; n.legal_action.len()],
-    }
-}
-
 /// The acting policy at a finished solve's root.
 ///
 /// A first expansion that did not fit the slot left the root a leaf, with an
@@ -218,20 +205,21 @@ pub fn root(sv: &Solver) -> NodePolicy {
     let n = &sv.nodes[0];
     let cfgs = n.cfgs[n.player as usize].as_ref();
     if n.legal_off.is_empty() {
-        uniform(&sv.states[0], &sv.ctx, n.player, cfgs)
-    } else {
-        at_node(sv, 0, cfgs.len())
+        return uniform(&sv.states[0], &sv.ctx, n.player, cfgs);
     }
-}
-
-/// The CFR average strategy at a node of a finished solve.
-pub fn at_node(sv: &Solver, node: usize, configs: usize) -> NodePolicy {
-    let mut np = frame(sv, node);
-    for config in 0..configs {
-        let row = np.row(config);
-        np.probs[row].copy_from_slice(sv.average_strategy(node, config));
+    let mut policy = NodePolicy {
+        acts: n.acts.clone(),
+        aslot: n.aslot.clone(),
+        fdown: n.fdown.clone(),
+        legal_off: n.legal_off.clone(),
+        legal_action: n.legal_action.clone(),
+        probs: vec![0.0; n.legal_action.len()],
+    };
+    for config in 0..cfgs.len() {
+        let row = policy.row(config);
+        policy.probs[row].copy_from_slice(sv.root_strategy(config));
     }
-    np
+    policy
 }
 
 /// A handwritten positional score from `p`'s seat, over public facts only:
