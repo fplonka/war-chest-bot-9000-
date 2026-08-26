@@ -40,11 +40,7 @@ ROW_COLUMNS = (
 
 
 def _to_numpy(value):
-    if isinstance(value, tuple):
-        return tuple(_to_numpy(item) for item in value)
-    if torch.is_tensor(value):
-        return value.detach().cpu().numpy()
-    return value
+    return value.detach().cpu().numpy() if torch.is_tensor(value) else value
 
 
 def _policy_group_counts(pcoff, pci, rows):
@@ -312,5 +308,5 @@ class Buffer:
 
     def ordered(self):
         """Return dump columns oldest-first, as host arrays."""
-        raw = _to_numpy(self._gather(np.arange(self.lo, self.rows)))
-        return Columns(*raw[:6])
+        raw = self._gather(np.arange(self.lo, self.rows))
+        return Columns(*(_to_numpy(item) for item in raw[:6]))
