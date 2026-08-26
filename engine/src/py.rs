@@ -916,12 +916,6 @@ fn prof_dump() {
     crate::prof::dump_work();
 }
 
-/// Set the fixed training payoff per marker of lead.
-#[pyfunction]
-fn set_cap_value(v: f32) {
-    crate::state::set_cap_marker_value(v);
-}
-
 #[pyfunction]
 fn infer(
     xpub: PyReadonlyArray1<f32>,
@@ -1237,7 +1231,6 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(set_weights_bin, m)?)?;
     m.add_function(wrap_pyfunction!(action_label, m)?)?;
     m.add_function(wrap_pyfunction!(obs_label, m)?)?;
-    m.add_function(wrap_pyfunction!(set_cap_value, m)?)?;
     m.add_function(wrap_pyfunction!(prof_dump, m)?)?;
     m.add_function(wrap_pyfunction!(save_roots, m)?)?;
     m.add_function(wrap_pyfunction!(gen_data, m)?)?;

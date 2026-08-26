@@ -70,11 +70,6 @@ class Cfg:
     explore: float = 0.1
     temp: float = 2.0
     warm_games: int = 96
-    # The horizon payoff per marker of lead. It is what carries the cold start:
-    # a game cut at the play cap scores the win condition graded, which is a
-    # real signal where a flat draw is none. It stays fixed during training;
-    # evaluation always runs the real game.
-    cap_value: float = 0.15
     random_draft: bool = True
 
     device: str = "cuda:1"

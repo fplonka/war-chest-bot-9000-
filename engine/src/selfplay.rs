@@ -28,8 +28,7 @@
 //! Training starts with a short greedy warm phase: rows labelled by the
 //! deterministic public evaluation `policy::eval_squashed`, with the greedy
 //! policy as the policy target. No solve runs in a warm game. The SoG phase
-//! that follows: a game that reaches the play cap scores
-//! `cap_value * delta_markers` with the fixed training payoff.
+//! that follows: a game that reaches the play cap is a draw with zero utility.
 //!
 //! **Grounding: `p_td1`.** A bootstrap target is the network's own answer
 //! propagated one subgame back, so a run whose trees never reach a terminal
@@ -622,8 +621,7 @@ impl Game {
     /// The game ended: write the outcome into the rows that drew a TD(1)
     /// target, and return White's result.
     pub fn finish(&mut self) -> f32 {
-        // `utility` carries the fixed horizon payoff, so a game cut at the
-        // play cap is calibrated against its marker-lead score.
+        // A game cut at the play cap is a draw, so its utility is zero.
         let z = [self.s.utility(0), self.s.utility(1)];
         for r in 0..self.data.nv {
             for (p, &outcome) in z.iter().enumerate() {

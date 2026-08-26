@@ -11,26 +11,6 @@ pub const WIN_MARKERS: u8 = 6;
 /// play that reaches this count resolves completely, then the game is
 /// adjudicated before another top-level coin play begins.
 pub const MAX_MAIN_PLAYS: u16 = 256;
-/// Default value of one control marker of lead when the horizon is reached.
-/// A zero value is the real game's payoff: a horizon is a draw. Training
-/// overrides it with its fixed configured payoff.
-pub const CAP_MARKER_VALUE_DEFAULT: f32 = 0.0;
-
-/// The value in flight, as bits: an `AtomicF32` is not a thing.
-static CAP_MARKER_VALUE: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(CAP_MARKER_VALUE_DEFAULT.to_bits());
-
-/// The current horizon payoff per marker of lead.
-#[inline]
-pub fn cap_marker_value() -> f32 {
-    f32::from_bits(CAP_MARKER_VALUE.load(std::sync::atomic::Ordering::Relaxed))
-}
-
-/// Set the horizon payoff. Training sets this once for the run.
-pub fn set_cap_marker_value(v: f32) {
-    CAP_MARKER_VALUE.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
-}
-
 // Zones (indices into State::zones[player][zone][unit]).
 pub const Z_BAG: usize = 0;
 pub const Z_HAND: usize = 1;
@@ -530,12 +510,7 @@ impl State {
         match self.winner() {
             Some(winner) if winner as usize == player => 1.0,
             Some(_) => -1.0,
-            // Horizon: score the marker differential (see cap_marker_value).
-            None => {
-                let me = self.markers_on_board(player as u8) as f32;
-                let them = self.markers_on_board(1 - player as u8) as f32;
-                cap_marker_value() * (me - them)
-            }
+            None => 0.0,
         }
     }
 

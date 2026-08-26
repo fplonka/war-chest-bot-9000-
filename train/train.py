@@ -6,9 +6,8 @@ one value per config in each player's belief -- and the leaves it queried
 become roots for solves of their own, which is how the value function becomes
 accurate away from the line of play.
 
-There is a short greedy warm start. A game that reaches the play cap scores
-`cap_value * delta_markers`, the fixed win condition graded rather than an
-invented evaluation. Evaluation always runs on the real game.
+There is a short greedy warm start. A game that reaches the play cap is a draw
+with zero utility.
 
 Generation runs in Rust across all CPU cores while the previous batch trains
 on the GPU. Python publishes weights between generation batches.
@@ -862,9 +861,6 @@ def main():
               if progress["sog_start"] is not None else None)
     sog_solves = int(progress["sog_solves"])
     next_decay = int(progress["next_decay"])
-    # The marker-differential payoff is fixed during training. Evaluation runs
-    # on the real game (value 0).
-    warchest.set_cap_value(args.cap_value)
     probe = None
 
     # Snapshots are archival only. Evaluate the packed bots separately after
@@ -904,7 +900,6 @@ def main():
             "epoch": epoch,
             "snapshots": snaps,
             "progress": progress,
-            "cap_value": args.cap_value,
             "cfg": cfg,
             "t": round(el, 1),
             "label": label,
@@ -1281,7 +1276,6 @@ def main():
                         "maneuver", "recruit", "claim_initiative")
                 },
                 "configs": round(window["configs"] / dec, 1),
-                "cap_value": round(args.cap_value, 4),
                 "steps": steps,
                 "optimizer_steps": optimizer_rows // args.batch,
                 "optimizer_rows": optimizer_rows,
