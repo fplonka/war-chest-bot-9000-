@@ -197,8 +197,8 @@ pub fn uniform(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config]) -> NodePolicy 
     np
 }
 
-/// A node's shape, read off a solved CPU tree.
-pub fn cpu_frame(sv: &Solver, node: usize) -> NodePolicy {
+/// A node's shape, read off a solved tree.
+fn frame(sv: &Solver, node: usize) -> NodePolicy {
     let n = &sv.nodes[node];
     NodePolicy {
         acts: n.acts.clone(),
@@ -226,7 +226,7 @@ pub fn root(sv: &Solver) -> NodePolicy {
 
 /// The CFR average strategy at a node of a finished solve.
 pub fn at_node(sv: &Solver, node: usize, configs: usize) -> NodePolicy {
-    let mut np = cpu_frame(sv, node);
+    let mut np = frame(sv, node);
     for config in 0..configs {
         let row = np.row(config);
         np.probs[row].copy_from_slice(sv.average_strategy(node, config));
