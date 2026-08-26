@@ -117,7 +117,7 @@ def policy_loss(net, xpub, weight, seg, nseg, policy, board, heads,
     work runs once per step.
     """
     stats = {}
-    feat, parow, pact, pcfg, group, target, group_count = policy
+    feat, parow, pact, pcfg, group, target, _group_count = policy
     if feat.shape[0] == 0 or pact.shape[0] == 0:
         return None, stats
     h = heads
@@ -130,33 +130,36 @@ def policy_loss(net, xpub, weight, seg, nseg, policy, board, heads,
     # its config vector directly.
     logit = (fp[pcfg] * e[pact]).sum(1)
 
-    # The gatherer emits sorted, compact group ids. Their count came from the
-    # host metadata ring, so no device value is read to size these reductions.
-    top = torch.full((group_count,), -1e30, device=logit.device)
+    # The group ids are compact and sorted, but their count changes with every
+    # sampled batch. Reduce into the cell-sized arena and mask its unused tail;
+    # no Python integer controls a compiled tensor shape.
+    slots = torch.arange(logit.shape[0], device=logit.device)
+    used = slots <= group[-1]
+    groups = used.sum()
+    top = torch.full_like(logit, -1e30)
     top.scatter_reduce_(0, group, logit, reduce="amax")
     ex = (logit - top[group]).exp()
-    tot = torch.zeros(group_count, device=ex.device).index_add_(0, group, ex)
+    tot = torch.zeros_like(logit).index_add_(0, group, ex)
     logp = (logit - top[group]) - tot[group].clamp(min=1e-30).log()
     per = -(target * logp)
-    out = torch.zeros(group_count, device=per.device).index_add_(0, group, per)
-    loss = out.mean()
-    target_mass = torch.zeros(group_count, device=target.device).index_add_(
-        0, group, target)
+    out = torch.zeros_like(logit).index_add_(0, group, per)
+    loss = (out * used).sum() / groups
+    target_mass = torch.zeros_like(target).index_add_(0, group, target)
     q = target / target_mass[group].clamp(min=1e-30)
-    target_entropy = torch.zeros(group_count, device=target.device).index_add_(
+    target_entropy = torch.zeros_like(target).index_add_(
         0, group, -(q * q.clamp(min=1e-30).log()))
     prior = logp.exp()
-    prior_entropy = torch.zeros(group_count, device=target.device).index_add_(
+    prior_entropy = torch.zeros_like(target).index_add_(
         0, group, -(prior * logp))
-    search_ce = torch.zeros(group_count, device=target.device).index_add_(
+    search_ce = torch.zeros_like(target).index_add_(
         0, group, -(q * logp))
     for key, value in zip((
             "policy_loss", "policy_target_entropy", "policy_prior_entropy",
             "policy_search_kl"), (
-            loss, target_entropy.mean(), prior_entropy.mean(),
-            (search_ce - target_entropy).mean())):
+            loss, (target_entropy * used).sum() / groups,
+            (prior_entropy * used).sum() / groups,
+            ((search_ce - target_entropy) * used).sum() / groups)):
         stats[key] = value.detach()
-    stats["policy_groups"] = group_count
     return loss, stats
 
 
