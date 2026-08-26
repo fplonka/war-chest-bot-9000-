@@ -44,10 +44,11 @@ def dump(n, ncfg, na, ncells):
 
 def check(buf, ids):
     _x, cc, _cp, _cw, _cy, _seg, pol = buf.gather(ids)
-    pa, pact, _parow, pcfg, _group, _pp, _group_count = pol
+    pa, pact, _parow, pcfg, group, _pp, group_count = pol
     n_cfg, n_act = len(cc), len(pa)
     assert pcfg.size == 0 or int(pcfg.max()) < n_cfg, (int(pcfg.max()), n_cfg)
     assert pact.size == 0 or int(pact.max()) < n_act, (int(pact.max()), n_act)
+    assert group_count == (int(group[-1]) + 1 if len(group) else 0)
     return n_cfg, n_act
 
 
