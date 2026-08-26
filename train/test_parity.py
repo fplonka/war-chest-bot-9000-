@@ -310,8 +310,14 @@ def packed_row_cuda_parity():
         [0, 1, 255], (len(rows), warchest.N_HEXES))
     rows[:, warchest.ROW_HEX_SLOT:warchest.ROW_HEX_SLOT + warchest.N_HEXES] = rng.integers(
         0, warchest.NSLOT, (len(rows), warchest.N_HEXES), dtype=np.uint8)
-    rows[:, warchest.ROW_HEX_MARKER:warchest.ROW_HEX_MARKER + warchest.N_HEXES] = rng.choice(
-        [0, 1, 255], (len(rows), warchest.N_HEXES))
+    marker_counts = rng.integers(0, 7, (len(rows), 2))
+    marker_order = rng.random((len(rows), warchest.N_HEXES)).argsort(axis=1)
+    markers = np.full((len(rows), warchest.N_HEXES), 255, np.uint8)
+    for player, start in ((0, 0), (1, 6)):
+        for k in range(6):
+            active = marker_counts[:, player] > k
+            markers[active, marker_order[active, start + k]] = player
+    rows[:, warchest.ROW_HEX_MARKER:warchest.ROW_HEX_MARKER + warchest.N_HEXES] = markers
     rows[:, warchest.ROW_HEX_HEIGHT:warchest.ROW_HEX_HEIGHT + warchest.N_HEXES] = rng.integers(
         0, 6, (len(rows), warchest.N_HEXES), dtype=np.uint8)
     rows[:, warchest.ROW_IDS:warchest.ROW_IDS + warchest.NTYPE] = rng.integers(
