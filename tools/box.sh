@@ -4,6 +4,7 @@
 #   tools/box.sh go out=seat note="the idea"        train, queued behind other GPU jobs
 #   tools/box.sh start m1 python tools/arena.py ...  any GPU job, same queue
 #   tools/box.sh follow m1
+#   tools/box.sh kill m1                            the job and everything it spawned
 #   tools/box.sh pull seat
 #   tools/box.sh setup                             a fresh vast.ai pytorch image
 #   tools/box.sh sync
@@ -116,6 +117,12 @@ nohup setsid bash -c 'echo \$\$ > /workspace/logs/$tag.pid
 flock /workspace/gpu.lock bash /workspace/logs/$tag.sh
 echo \$? > /workspace/logs/$tag.exit' >/workspace/logs/$tag.log 2>&1 &
 echo started $tag"
+    ;;
+kill)
+    # The job's pid is its process-group leader (setsid), so this takes the
+    # whole tree: an orphaned test binary once kept the lock for an hour.
+    tag=${2:?usage: kill <tag>}
+    run_remote "kill -- -\$(cat /workspace/logs/$tag.pid) && echo killed $tag"
     ;;
 go)
     # The build runs inside the job, under the lock: a cargo build beside a
