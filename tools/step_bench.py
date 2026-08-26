@@ -118,7 +118,7 @@ def main():
     t0 = time.perf_counter()
     for _ in range(100):
         buf.gather(ids)
-    print(f"{'gather (256 rows, wall)':36s} {1e3 * (time.perf_counter() - t0) / 100:8.2f} ms")
+    print(f"{'gather (256 rows, enqueue)':36s} {1e3 * (time.perf_counter() - t0) / 100:8.2f} ms")
     stage("make_batch (mirror+expand)", lambda: make_batch(device_parts, dev))
     cards = net.cards(xpub)
     physical = xpub[0::2]
