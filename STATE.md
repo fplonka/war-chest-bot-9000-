@@ -15,7 +15,7 @@ Remove the runtime host solver. Keep CUDA as the only runtime solver and keep ex
 
 - Read `AGENTS.md`, the task, and the thermo-nuclear review standard.
 - Located runtime host-path entry points in `search.rs`, `farm.rs`, `bot.rs`, `selfplay.rs`, and `py.rs`.
-- Baseline corpus regeneration is queued from commit `5529467`; output is `/workspace/onepath-roots.bin`, outside synced trees.
+- Baseline corpus is `/workspace/onepath-roots.bin`, outside synced trees.
 - Baseline farmbench: 72 workers, GPUs 0,1, 60 seconds; measured window 143.5 solves/s, 25.0 calls/solve, 17.0 ms/round, 61.0 calls/round, 9,837 rows/round.
 - Removed `Nets.device`, runtime backend dispatch, `Backend::Reference` outside tests, and the bot CPU opt-in.
 - Removed host-only examples, the CPU throughput probe, and CPU root generation.
@@ -25,10 +25,12 @@ Remove the runtime host solver. Keep CUDA as the only runtime solver and keep ex
 - Removed the `Nets` wrapper; solvers now receive `Arc<Net>` directly.
 - Removed CPU arena opt-ins. Static generation remains for greedy replay-format tests; SoG generation uses `SolveFarm`.
 - Applied the thermo-nuclear review: `advance` is now the direct CUDA state machine and the CPU call evaluator is test-only.
-- Box jobs are queued in order for corpus regeneration, GPU tests, the matched after benchmark, and the default 30-minute `onepath30` run.
+- Rebased onto the FIFO `box.sh` redesign.
+- Preserved query-time reservoir sampling from the new base in the single runtime path and its test oracle.
+- The old `onepath-tests`, `onepath-after`, and `onepath30` jobs were killed because the broad test job ran CPU tests while holding the GPU lock.
 
 ## Next
 
-1. Follow the queued tests, after benchmark, and training run.
-2. Pack `onepath30` and run the 200-game arena gate.
+1. Queue and follow only CUDA-filtered tests, the matched after benchmark, and a fresh default 30-minute run.
+2. Run the 200-game arena gate against `bots/sweep3_b256`.
 3. Finish the review and report.

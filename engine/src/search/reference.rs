@@ -699,6 +699,15 @@ impl Solver {
         self.oracle.trace.row_iters += self.leaf_rows.len() as u64;
         self.oracle.trace.cidx_iters += self.leaf_cidx.len() as u64;
         self.oracle.trace.cell_iters += self.ncells as u64;
+        let query_from = |p| {
+            if self.cfg.refresh_due(self.steps[p]) {
+                0
+            } else {
+                self.oracle.cached[p]
+            }
+        };
+        let from = query_from(0).min(query_from(1));
+        self.record_host_queries(from);
         self.update_regrets(0);
         self.update_regrets(1);
         self.precompute_reaches();
@@ -858,8 +867,9 @@ impl Solver {
     /// already said; an interior node's value comes from the subtree beneath
     /// it, which is the bootstrap the whole method rests on.
     fn harvest(&mut self, queries: usize) -> Solved {
+        debug_assert_eq!(self.collect, Some(queries));
         let value = self.value_pass();
-        let queries = self.with_rng(|sv, rng| sv.sample_queries(rng, queries));
+        let queries = std::mem::take(&mut self.queries);
         let policy = self.root_policy();
         self.restore();
         Solved {
@@ -869,22 +879,17 @@ impl Solver {
         }
     }
 
-    /// Uniform draws from the leaves this solve queried the network at.
-    ///
-    /// Those leaves are where the value function's error enters the solve, so
-    /// they are the belief states worth solving in their own right. Every one
-    /// of them is a valued decision, which is both what the network is defined
-    /// on and what a training row can carry, so no filtering is needed here.
-    fn sample_queries(&self, rng: &mut Rng, want: usize) -> Vec<(State, [Belief; 2])> {
-        if self.leaf_rows.is_empty() {
-            return Vec::new();
+    /// Record selected host-network calls with the beliefs used by that call.
+    fn record_host_queries(&mut self, from: usize) {
+        if self.net.is_empty() {
+            return;
         }
-        (0..want)
-            .map(|_| {
-                let i = self.leaf_rows[rng.below(self.leaf_rows.len())];
-                (self.states[i].clone(), self.belief_at(i))
-            })
-            .collect()
+        let selected = self.plan_query_events(self.leaf_rows.len() - from);
+        for event in selected {
+            let node = self.leaf_rows[from + event];
+            self.queries
+                .push((self.states[node].clone(), self.belief_at(node)));
+        }
     }
 
     /// Node `i`'s belief for each player, under whichever reaches are
