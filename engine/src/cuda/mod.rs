@@ -28,7 +28,7 @@ use std::sync::{Arc, LazyLock};
 
 use cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
-use cudarc::driver::sys::{CUdevice_attribute_enum, CUfunction_attribute_enum};
+use cudarc::driver::sys::{CUdevice_attribute_enum, CUevent_flags, CUfunction_attribute_enum};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
     DriverError, LaunchArgs, LaunchConfig, PushKernelArg,
@@ -57,11 +57,10 @@ use slot::{Arr, Solve, DESC, FIELDS, C_CUR, C_PRIOR, C_QVAL, C_SUM, C_VISITS, R_
 
 type Res<T> = Result<T, String>;
 
-/// Where an iteration spends its wall clock, by stage. The first four are the
-/// host's own: marshalling, the uploads, issuing the launches, the download
-/// that ends the round. The rest are device stages, and are only filled when
-/// `WARCHEST_STAGES` is set -- separating them means synchronising after each,
-/// which changes the thing being measured, so it is off by default.
+/// Where an iteration spends its time, by stage. The first four are host
+/// stages: marshalling, upload, launch issue and the final download. The
+/// remaining stages use CUDA events when `WARCHEST_STAGES` is set; otherwise
+/// they remain asynchronous and are not charged to a misleading host timer.
 ///
 /// The last two are byte counts rather than nanoseconds. They ride the same
 /// accumulator, and `leaf_breakdown` scales everything by 1e6 -- which turns
@@ -137,6 +136,7 @@ struct Kernels {
     type_pool: CudaFunction,
     stem: CudaFunction,
     trunk: CudaFunction,
+    trunk_half: CudaFunction,
     cfg_slots: CudaFunction,
     sum_slots: CudaFunction,
     bag: CudaFunction,
@@ -172,6 +172,7 @@ impl Kernels {
             type_pool: get("k_type_pool")?,
             stem: get("k_stem")?,
             trunk: get("k_trunk")?,
+            trunk_half: get("k_trunk_half")?,
             cfg_slots: get("k_cfg_slots")?,
             sum_slots: get("k_sum_slots")?,
             bag: get("k_bag")?,
@@ -261,14 +262,9 @@ pub struct Device {
 pub const PIPELINE: usize = 3;
 
 /// Round to the eleven significand bits a tensor core keeps, matching
-/// `cvt.rna.tf32.f32`: nearest, ties away from zero.
-///
-/// The trunk multiplies in TF32, whose operands are single-precision numbers
-/// with the low thirteen mantissa bits clear. Rounding the weights here rather
-/// than letting the tensor core drop the bits is what keeps the error
-/// unbiased, and it costs nothing: it happens once, when the weights are
-/// uploaded. The activations are rounded the same way as `k_trunk` stores
-/// them.
+/// `cvt.rna.tf32.f32`: nearest, ties away from zero. The packed join weights
+/// use this explicit rounding so their tensor-core operands do not depend on
+/// the device's implicit conversion.
 fn tf32(v: f32) -> f32 {
     let u = v.to_bits();
     f32::from_bits(u.wrapping_add(0x1000) & 0xFFFF_E000)
@@ -307,21 +303,20 @@ fn pack_mma(w: &[f32], base: usize, k_real: usize, k_pad: usize, n: usize, out: 
     }
 }
 
-/// The trunk's two matrices a block, laid out in the order the tensor cores
-/// read them. Returns the buffer and where each matrix starts, mix then out,
-/// block by block.
-fn fragwise(l: &NetLayout, w: &[f32]) -> (Vec<f32>, Vec<usize>) {
-    let mut out = Vec::new();
-    let mut at = Vec::new();
+/// The trunk's matrix offsets in the half-weight buffer. The conversion
+/// kernel uses the same offsets as the plan passed to `k_trunk`.
+fn trunk_layout(l: &NetLayout) -> (Vec<usize>, usize) {
+    let mut at = 0;
+    let mut offsets = Vec::with_capacity(2 * BLOCKS);
     for blk in &l.blocks {
         for s in [blk.mix, blk.out] {
             assert_eq!(s.o, C, "the trunk's matrices are the channel width across");
-            assert_eq!(s.i % 8, 0, "the trunk's matrices are whole fragments deep");
-            at.push(out.len());
-            pack_mma(w, s.w, s.i, s.i, s.o, &mut out);
+            assert_eq!(s.i % 16, 0, "the trunk's matrices are whole half fragments");
+            offsets.push(at);
+            at += s.i * s.o;
         }
     }
-    (out, at)
+    (offsets, at)
 }
 
 /// `join_b`, the three `join_w`, then `join_out`, each packed the way `k_leaf`
@@ -343,18 +338,22 @@ fn join_pack(l: &NetLayout, w: &[f32]) -> Vec<f32> {
     out
 }
 
-/// The board rounded up to whole sixteen-row `mma` tiles, and the shared row
-/// stride `k_trunk` holds it at. Both are `TRUNK_ROWS` and `TRUNK_LDS` there.
-const TRUNK_ROWS: usize = N_HEXES.next_multiple_of(16);
+/// Three boards share one tensor-core row dimension. Only the final row of
+/// the combined 111-row matrix is padding.
+const TRUNK_BOARDS: usize = 3;
+const TRUNK_BOARD_ROWS: usize = TRUNK_BOARDS * N_HEXES;
+const TRUNK_ROWS: usize = TRUNK_BOARD_ROWS.next_multiple_of(16);
 const TRUNK_LDS: usize = C + 4;
+const TRUNK_HALF_LDS: usize = C + 8;
 
-/// What one block of `k_trunk` asks for: the residual stream, the operand the
-/// tensor cores read with its padding rows, the neighbour projections, and the
-/// pooled row with its bias.
-const TRUNK_SHARED: usize = (2 * N_HEXES + TRUNK_ROWS) * TRUNK_LDS * 4 + 3 * C * 4;
+/// What one block of `k_trunk` asks for: a float residual stream, half operands
+/// and neighbour projections, and pooled rows with their biases.
+const TRUNK_SHARED: usize = TRUNK_BOARD_ROWS * TRUNK_LDS * 4
+    + (TRUNK_ROWS + TRUNK_BOARD_ROWS) * TRUNK_HALF_LDS * 2
+    + TRUNK_BOARDS * 3 * C * 4;
 const _: () = {
     assert!(C % 32 == 0, "k_trunk wants a whole number of warps a row");
-    assert!(TRUNK_ROWS % (C / 8) == 0, "k_trunk distributes whole hex rows");
+    assert!(TRUNK_ROWS % 16 == 0, "k_trunk wants whole tensor-core rows");
 };
 
 /// The running sums of the join's biases, in the order its norms read them.
@@ -779,6 +778,7 @@ impl Pack {
 
 struct Card {
     stream: Arc<CudaStream>,
+    expand_stream: Arc<CudaStream>,
     blas: CudaBlas,
     k: Arc<Kernels>,
     /// Indexed by solve, which is the slot the farm pinned it to. Shared by
@@ -808,9 +808,8 @@ struct Card {
     scratch: parking_lot::Mutex<Scratch>,
     /// The weights exactly as `NetLayout` describes them.
     w: CudaSlice<f32>,
-    /// The two square matrices of every trunk block, laid out the way a warp
-    /// of `mma.sync.m16n8k8` reads them. See `fragwise`.
-    wt: CudaSlice<f32>,
+    /// The trunk matrices, packed as half fragments for `mma.m16n8k16`.
+    wh: CudaSlice<u16>,
     /// The join's five matrices, packed the same way. See `join_pack`.
     jw: CudaSlice<f32>,
     b: CudaSlice<f32>,
@@ -1012,8 +1011,7 @@ impl Device {
         for card in &mut self.cards {
             card.stream.context().bind_to_thread().map_err(err)?;
             card.stream.memcpy_htod(&flat.w, &mut card.w).map_err(err)?;
-            let (lw, _) = fragwise(&card.layout, &flat.w);
-            card.stream.memcpy_htod(&lw, &mut card.wt).map_err(err)?;
+            card.refresh_trunk()?;
             card.stream
                 .memcpy_htod(&join_pack(&card.layout, &flat.w), &mut card.jw)
                 .map_err(err)?;
@@ -1123,6 +1121,8 @@ fn compile_options(major: i32, minor: i32, trunk_blocks: usize) -> CompileOption
             format!("-DJ_ROWS={JROWS}"),
             format!("-DTRUNK_C={C}"),
             define("TRUNK_ROWS", TRUNK_ROWS),
+            define("TRUNK_BOARDS", TRUNK_BOARDS),
+            define("TRUNK_HALF_LDS", TRUNK_HALF_LDS),
             format!("-DTRUNK_MIN_BLOCKS={trunk_blocks}"),
             format!("-DJ_W={JW}"),
             format!("-DJ_IN={JOIN_K}"),
@@ -1303,6 +1303,7 @@ impl Card {
 
     fn on(gpu: &Gpu, net: &Net) -> Res<Card> {
         let stream = gpu.ctx.new_stream().map_err(err)?;
+        let expand_stream = gpu.ctx.new_stream().map_err(err)?;
         let blas = CudaBlas::new(stream.clone()).map_err(err)?;
         let flat = net.flat();
         let nb: Vec<i32> = board()
@@ -1320,7 +1321,7 @@ impl Card {
         }
         let locations: Vec<u8> = board().is_location.iter().map(|&x| x as u8).collect();
         let layout = NetLayout::new();
-        let (fragwise, lanes) = fragwise(&layout, &flat.w);
+        let (lanes, trunk_weights) = trunk_layout(&layout);
         let mut plan: Vec<i32> = Vec::new();
         for (i, blk) in layout.blocks.iter().enumerate() {
             let (n0, n1) = (layout.norms[ln_block(i, 0)], layout.norms[ln_block(i, 1)]);
@@ -1346,11 +1347,11 @@ impl Card {
             assert_eq!(n.g, layout.norms[LN_JOIN].g + 2 * i * JW, "the join's norms are not one run");
             assert_eq!(n.b, n.g + JW, "a join norm's shift does not follow its scale");
         }
-        Ok(Card {
+        let mut card = Card {
             plan: stream.memcpy_stod(&plan).map_err(err)?,
             owed: stream.memcpy_stod(&owed).map_err(err)?,
             w: stream.memcpy_stod(&flat.w).map_err(err)?,
-            wt: stream.memcpy_stod(&fragwise).map_err(err)?,
+            wh: stream.alloc_zeros(trunk_weights).map_err(err)?,
             jw: stream.memcpy_stod(&join_pack(&layout, &flat.w)).map_err(err)?,
             b: stream.memcpy_stod(&flat.b).map_err(err)?,
             ln: stream.memcpy_stod(&flat.ln).map_err(err)?,
@@ -1358,6 +1359,7 @@ impl Card {
             card_facts: stream.memcpy_stod(&card_facts).map_err(err)?,
             locations: stream.memcpy_stod(&locations).map_err(err)?,
             stream,
+            expand_stream,
             blas,
             k: Arc::clone(&gpu.k),
             solves: Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -1368,7 +1370,9 @@ impl Card {
             batch: parking_lot::Mutex::new(Batch::default()),
             scratch: parking_lot::Mutex::new(Scratch::default()),
             layout,
-        })
+        };
+        card.refresh_trunk()?;
+        Ok(card)
     }
 
     /// Allocate this card's round buffers, once, at `RoundCap`. Slots live on
@@ -1570,6 +1574,21 @@ impl Card {
 
     // ----------------------------------------------------------------- trunk
 
+    /// Pack the trunk weights once on the card. The network publishes new
+    /// values between rounds, so the half buffer follows the canonical f32
+    /// weights without a host conversion.
+    fn refresh_trunk(&self) -> Res<()> {
+        let n = self.wh.len();
+        let n_i = n as i32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.k.trunk_half)
+                .arg(&self.w).arg(&self.plan).arg(&self.wh).arg(&n_i)
+                .launch_unit(spread(n))
+        }
+        .map_err(err)
+    }
+
     /// Every new leaf in the round: the board vector and the join cache.
     fn trunk(&self, calls: &[Call], mine: &[usize], pack: &mut Pack) -> Res<()> {
         if mine.is_empty() {
@@ -1747,13 +1766,13 @@ impl Card {
         unsafe {
             self.stream
                 .launch_builder(&self.k.trunk)
-                .arg(&*x).arg(&self.nb).arg(&self.w).arg(&self.wt)
+                .arg(&*x).arg(&self.nb).arg(&self.w).arg(&self.wh)
                 .arg(&self.b).arg(&self.ln)
                 .arg(&self.plan).arg(xpub).arg(&mut *input)
                 .arg(&rows_i).arg(&nhex).arg(&chan).arg(&blocks_i)
                 .arg(&stride).arg(&off).arg(&loose_i)
                 .launch_unit(LaunchConfig {
-                    grid_dim: (n as u32, 1, 1),
+                    grid_dim: (n.div_ceil(TRUNK_BOARDS) as u32, 1, 1),
                     block_dim: (32, SLOTS, 1),
                     shared_mem_bytes: TRUNK_SHARED as u32,
                 })
@@ -2339,10 +2358,13 @@ impl Card {
         self.backprop(b, all, 1, 0, Cfr::LINEAR)
     }
 
-    /// Time a stage's wall clock, always. No synchronise: what these cost is
-    /// the host work in them, and the launches they queue are paid for by
-    /// whichever stage synchronises next.
+    /// Time host work unless stage profiling is enabled. In profiling mode
+    /// these round stages use the same CUDA-event measurement as iteration
+    /// stages, so queued device work is charged to the stage that issued it.
     fn wall<T>(&self, slot: usize, f: impl FnOnce() -> Res<T>) -> Res<T> {
+        if timing() {
+            return self.stage(slot, f);
+        }
         let mark = std::time::Instant::now();
         let got = f()?;
         LEAF_NS[slot].fetch_add(
@@ -2352,21 +2374,51 @@ impl Card {
         Ok(got)
     }
 
-    /// Time one device stage, when `WARCHEST_STAGES` asks for it. The
-    /// synchronise is the measurement: without it a launch returns before the
-    /// kernel has run and every stage but the last reads as free.
+    /// Time one device stage with CUDA events. The synchronise only completes
+    /// the requested profile; production runs stay asynchronous.
     fn stage<T>(&self, slot: usize, f: impl FnOnce() -> Res<T>) -> Res<T> {
         if !timing() {
             return f();
         }
-        let mark = std::time::Instant::now();
+        let start = self
+            .stream
+            .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+            .map_err(err)?;
         let got = f()?;
-        self.stream.synchronize().map_err(err)?;
-        LEAF_NS[slot].fetch_add(
-            mark.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let end = self
+            .stream
+            .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+            .map_err(err)?;
+        let nanos = (start.elapsed_ms(&end).map_err(err)? * 1e6) as u64;
+        LEAF_NS[slot].fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
         Ok(got)
+    }
+
+    /// The expansion stream has its own event clock because it overlaps the
+    /// main stream's next network pass.
+    fn expand_stage(
+        &self,
+        b: &Batch,
+        sims: usize,
+        puct: f32,
+        iter: usize,
+        rounds: usize,
+    ) -> Res<()> {
+        if !timing() {
+            return self.expand(b.trees.buf(), b.parts, sims, puct, iter, rounds);
+        }
+        let start = self
+            .expand_stream
+            .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+            .map_err(err)?;
+        self.expand(b.trees.buf(), b.parts, sims, puct, iter, rounds)?;
+        let end = self
+            .expand_stream
+            .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+            .map_err(err)?;
+        let nanos = (start.elapsed_ms(&end).map_err(err)? * 1e6) as u64;
+        LEAF_NS[8].fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     /// One CFR iteration and one expansion phase, for every solve in the round.
@@ -2489,15 +2541,18 @@ impl Card {
             // the next iteration reads are stale until they are pushed down
             // again -- and the average strategy accumulates against those.
             self.stage(4, || self.reaches(&b, p, 0, true, it)).map_err(at("avg"))?;
-            // The phase reads the Q this iteration has just formed, so it
-            // belongs inside the loop: a round that runs several iterations
-            // samples several times and the host grows all of them at once.
+            // Expansion only needs the reaches just made. Keep it on its own
+            // stream while the main stream starts the next network pass.
             if sims > 0 {
-                self.stage(8, || {
-                    self.expand(b.trees.buf(), b.parts, sims, puct, iter, rounds)
-                })
-                .map_err(at("expand"))?;
+                let ready = self.stream.record_event(None).map_err(err)?;
+                self.expand_stream.wait(&ready).map_err(err)?;
+                self.expand_stage(&b, sims, puct, iter, rounds)
+                    .map_err(at("expand"))?;
             }
+        }
+        if sims > 0 {
+            let done = self.expand_stream.record_event(None).map_err(err)?;
+            self.stream.wait(&done).map_err(err)?;
         }
         let t_launch = mark.elapsed();
         let mark = std::time::Instant::now();
@@ -2782,11 +2837,12 @@ impl Card {
     fn expand(&self, trees: &CudaSlice<u64>, parts: u32, sims: usize, puct: f32,
               iter: usize, iters: usize) -> Res<()> {
         let each = parts as usize * sims;
+        let stream = &self.expand_stream;
         let mut sc = self.scratch.lock();
         let out = sc.leaves.room((iters * each).max(1))?;
         let (parts_i, sims_i) = (parts as i32, sims as i32);
         unsafe {
-            self.stream
+            stream
                 .launch_builder(&self.k.expand)
                 .arg(trees).arg(out).arg(&parts_i).arg(&sims_i).arg(&puct)
                 .arg(&(iter as i32))

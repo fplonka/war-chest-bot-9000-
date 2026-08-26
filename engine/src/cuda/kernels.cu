@@ -1,3 +1,5 @@
+#include <cuda_fp16.h>
+
 // Elementwise and gather work for the value network, and the join, which is
 // fused into one kernel of its own. The trunk and the join multiply on the
 // tensor cores; every other matrix multiply is cuBLAS.
@@ -228,57 +230,42 @@ __global__ void k_stem(float* x, const float* projected, const int* occupant,
 // and the three matrix multiplies on the tensor cores.
 //
 // This is the kernel that decides whether the throughput target is reachable.
-// Written as separate launches a block is eighteen passes over `[37 hexes, 96
-// channels]` of global memory -- two norms, a neighbour mix, two matrix
-// multiplies, a pool, a group bias and an accumulate, each reading and writing
-// the whole board. A whole board is 37 x 96 x 4 = 14.2 KB, so three of them fit
-// in shared memory: the board is read once, worked on eight times where it
-// sits, and handed back as the pooled row the head wants -- about eight hundred
-// bytes. The weights are the same for every leaf and L2 holds them.
+// Three boards share one 112-row matrix, so the tensor cores pay for one
+// padding row instead of eleven per board. The float residual stream stays in
+// shared memory; normalized rows and neighbour projections stay half-sized.
+// The eight residual blocks run in one fixed order, and a board's answer is
+// independent of which other boards share its block.
 //
-// **One CUDA block is one board**, and the `k` loop of every multiply has a
-// compile-time trip count in a fixed order. Nothing crosses a block, so the
-// number of boards in a round changes the grid and not a single rounding: the
-// kernel is batch-invariant by construction, and a board's answer is the same
-// bits whichever solves ride the round with it.
-//
-// A warp is the unit of a multiply. `mma.sync.m16n8k8` takes a 16x8 slab of
-// the board and an 8x8 slab of the weight and adds their product to a 16x8
-// f32 accumulator, so one warp owns eight output channels and all the rows,
-// three sixteen-row tiles of them. Twelve warps cover the ninety-six channels.
-// Between the multiplies the same twelve warps read the board the other way
-// round -- a warp to a hex row, a lane to three of its channels -- because a
-// LayerNorm is a reduction along a row and that shape makes it a shuffle.
+// A warp is the unit of a multiply. `mma.sync.m16n8k16` takes a 16x8 slab of
+// the combined board and a 16x8 slab of the weight, accumulating in f32. Twelve
+// warps cover the ninety-six output channels. The same warps then read rows in
+// the LayerNorm shape, so reductions remain warp shuffles.
 //
 // The neighbour half of the mix is folded rather than gathered: the mix is
-// linear, so summing the neighbours' *projections* is the same as projecting
-// their sum, and the projection is a row every hex needs for itself anyway.
-// That is what keeps this to three boards instead of four. Both halves come
-// out of one pass over the board, sharing the fragment loads.
+// linear, so summing the neighbours' projections is the same as projecting
+// their sum. Both halves share each input fragment.
 //
 // `off` is the weight plan, `TRUNK_OFF` entries a block and two after them:
 //   0 mix.w  1 mix.b  2 pool.w  3 pool.b  4 out.w  5 out.b
 //   6 ln0.g  7 ln0.b  8 ln1.g  9 ln1.b     then trunk.ln.g, trunk.ln.b
 #define TRUNK_OFF 12
-// `TRUNK_C` is the channel width and `TRUNK_ROWS` the hex count rounded up to
-// whole sixteen-row tiles, both defines from Rust. The rows the board does not
-// have are held at zero, so they multiply to nothing and cost only their share
-// of the tensor cores.
-// Row tiles a warp accumulates, and steps of a ninety-six deep `k` loop.
+// `TRUNK_C`, `TRUNK_BOARDS` and `TRUNK_ROWS` arrive from Rust. Three boards
+// share one M dimension, and the rows beyond the real batch are zero, so only
+// one of the 112 tensor-core rows is padding.
+// Row tiles a warp accumulates, and steps of a sixteen-wide `k` tile.
 #define TRUNK_MT (TRUNK_ROWS / 16)
-#define TRUNK_KS (TRUNK_C / 8)
+#define TRUNK_KS (TRUNK_C / 16)
 // Warps in a block: one eight-channel output tile each. Row-wise that is four
 // hexes a warp and three channels a lane, and a hex row is exactly one warp
 // wide, so a LayerNorm is a shuffle with no barrier in it.
 #define TRUNK_SPAN (TRUNK_C / 8)
-#define TRUNK_MAXH (TRUNK_ROWS / TRUNK_SPAN)
+#define TRUNK_MAXH ((N_HEXES + TRUNK_SPAN - 1) / TRUNK_SPAN)
 #define TRUNK_Q (TRUNK_C / 32)
-// The shared row stride. The four floats of padding are what make the fragment
-// loads conflict-free: a lane reads `a[16m + lane/4][k + lane%4]`, and at a
-// stride of ninety-six the eight rows of a fragment land in four banks and
-// every load is an eightfold conflict. A hundred spreads them over all
-// thirty-two.
+// The float residual stride and the half operand stride. Both are padded so a
+// fragment starts on a four-byte boundary and neighboring rows do not alias
+// the same shared-memory banks.
 #define TRUNK_LDS (TRUNK_C + 4)
+#define TRUNK_HALF_LDS (TRUNK_C + 8)
 
 // A `.tf32` operand is an f32 register whose low thirteen mantissa bits are
 // zero. Rounding here, rather than letting the tensor core truncate, is what
@@ -317,14 +304,65 @@ __device__ __forceinline__ void frag_a(const float* a, int m, int k, int lane,
 }
 
 /// The weight's 8x8 fragment at depth `k` for the warp's own output tile. The
-/// matrix arrives in fragment order -- see `fragwise` -- so a lane's two
-/// values are one eight-byte load and the warp reads two hundred and fifty-six
-/// contiguous bytes.
+/// matrix arrives in fragment order, so a lane's two values are one eight-byte
+/// load and the warp reads two hundred and fifty-six contiguous bytes.
 __device__ __forceinline__ void frag_b(const float* w, int k, int slot, int lane,
                                        int ntiles, unsigned (&f)[2]) {
     float2 v = *(const float2*)(w + (((size_t)k * ntiles + slot) * 32 + lane) * 2);
     f[0] = __float_as_uint(v.x);
     f[1] = __float_as_uint(v.y);
+}
+
+/// `d += a * b` over one 16x8x16 half tile. The operands are four and two
+/// packed half2 registers; accumulation stays in f32.
+__device__ __forceinline__ void mma_half_tile(float (&d)[4], const unsigned (&a)[4],
+                                              const unsigned (&b)[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+/// The `m16n8k16` A fragment: two rows eight apart, and two pairs of columns
+/// eight apart. The four registers contain the eight half values in PTX order.
+__device__ __forceinline__ void frag_a_half(const __half* a, int m, int k, int lane,
+                                            int lds, unsigned (&f)[4]) {
+    const __half* p = a + (size_t)(16 * m + (lane >> 2)) * lds + k + 2 * (lane & 3);
+    f[0] = *(const unsigned*)p;
+    f[1] = *(const unsigned*)(p + 8 * lds);
+    f[2] = *(const unsigned*)(p + 8);
+    f[3] = *(const unsigned*)(p + 8 * lds + 8);
+}
+
+/// The `m16n8k16` B fragment is packed by k tile, output tile and lane. A
+/// lane's four values are two consecutive rows, then the pair eight rows on.
+__device__ __forceinline__ void frag_b_half(const __half* w, int k, int slot, int lane,
+                                            int ntiles, unsigned (&f)[2]) {
+    const unsigned* p = (const unsigned*)w
+        + (((size_t)k * ntiles + slot) * 32 + lane) * 2;
+    f[0] = p[0];
+    f[1] = p[1];
+}
+
+/// Pack the trunk's f32 matrices into the half fragments its tensor cores read.
+__global__ void k_trunk_half(const float* w, const int* off, unsigned short* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int mix = 2 * TRUNK_C * TRUNK_C;
+    const int matrix = i % (3 * TRUNK_C * TRUNK_C) < mix ? 0 : 1;
+    const int block = i / (3 * TRUNK_C * TRUNK_C);
+    const int local = i % (3 * TRUNK_C * TRUNK_C) - matrix * mix;
+    const int base = off[block * TRUNK_OFF + (matrix == 0 ? 10 : 11)];
+    const int tiles = TRUNK_C / 8;
+    const int tile = local / (tiles * 128);
+    const int in_tile = local % (tiles * 128);
+    const int nt = in_tile / 128;
+    const int lane = (in_tile % 128) / 4;
+    const int element = in_tile % 4;
+    const int row = 16 * tile + 2 * (lane & 3) + (element >= 2 ? 8 : 0) + (element & 1);
+    const int col = 8 * nt + (lane >> 2);
+    out[i] = __half_as_ushort(__float2half_rn(w[base + row * TRUNK_C + col]));
 }
 
 /// Which element of the board an accumulator register holds: register `i` of
@@ -358,89 +396,93 @@ __device__ __forceinline__ void row_stats(const float* v, int c, float* mean,
 // compiler spends a one-block register budget on nothing the accumulators need.
 __global__ __launch_bounds__(32 * TRUNK_SPAN, TRUNK_MIN_BLOCKS)
 void k_trunk(const float* x0, const int* nb, const float* __restrict__ w,
-             const float* __restrict__ wt, const float* __restrict__ bias,
+             const __half* __restrict__ wh, const float* __restrict__ bias,
              const float* __restrict__ ln,
              const int* __restrict__ off, const float* xpub, float* out,
              int rows, int nhex, int c, int blocks, int stride, int off_loose,
              int loose) {
-    int row = blockIdx.x;
-    if (row >= rows) return;
-    extern __shared__ float sm[];
-    float* x = sm;                                 // [nhex, TRUNK_LDS] the stream
-    float* a = x + nhex * TRUNK_LDS;               // [TRUNK_ROWS, TRUNK_LDS] the operand
-    float* u = a + TRUNK_ROWS * TRUNK_LDS;         // [nhex, TRUNK_LDS] neighbour rows
-    float* pooled = u + nhex * TRUNK_LDS;          // [2c]
-    float* gb = pooled + 2 * c;                    // [c]
+    int first = blockIdx.x * TRUNK_BOARDS;
+    if (first >= rows) return;
+    int count = min(TRUNK_BOARDS, rows - first);
+    int valid_rows = count * nhex;
+    extern __shared__ __align__(16) unsigned char raw[];
+    float* x = reinterpret_cast<float*>(raw);
+    __half* a = reinterpret_cast<__half*>(x + TRUNK_BOARDS * N_HEXES * TRUNK_LDS);
+    __half* u = a + TRUNK_ROWS * TRUNK_HALF_LDS;
+    float* pooled = reinterpret_cast<float*>(u + TRUNK_BOARDS * N_HEXES * TRUNK_HALF_LDS);
+    float* gb = pooled + TRUNK_BOARDS * 2 * c;
 
     const int lane = threadIdx.x, slot = threadIdx.y;
-    // Row-wise, a warp owns the hexes `slot, slot + 12, slot + 24, slot + 36`.
-    // The last of those is past the board for all but one warp, and those rows
-    // are the padding the tensor-core tiling wants: zero, and never stored to.
-    int hex[TRUNK_MAXH];
-    bool live[TRUNK_MAXH];
-#pragma unroll
-    for (int t = 0; t < TRUNK_MAXH; ++t) {
-        hex[t] = slot + t * TRUNK_SPAN;
-        live[t] = hex[t] < nhex;
-    }
     float cur[TRUNK_Q];
 
 #pragma unroll
-    for (int t = 0; t < TRUNK_MAXH; ++t)
-        if (live[t])
-            for (int q = 0; q < TRUNK_Q; ++q)
-                x[hex[t] * TRUNK_LDS + lane + 32 * q] =
-                    x0[((size_t)row * nhex + hex[t]) * TRUNK_C + lane + 32 * q];
+    for (int board = 0; board < TRUNK_BOARDS; ++board)
+#pragma unroll
+        for (int t = 0; t < TRUNK_MAXH; ++t) {
+            int hex = slot + t * TRUNK_SPAN;
+            if (board < count && hex < nhex)
+                for (int q = 0; q < TRUNK_Q; ++q)
+                    x[(board * nhex + hex) * TRUNK_LDS + lane + 32 * q] =
+                        x0[((size_t)(first + board) * nhex + hex) * TRUNK_C + lane + 32 * q];
+        }
     __syncthreads();
 
     for (int blk = 0; blk < blocks; ++blk) {
         const int* o = off + blk * TRUNK_OFF;
-        // a = gelu(norm(x)), rounded to the operand the tensor cores read.
+        // Normalize every real board row into the half operand. The combined
+        // matrix has one final zero row, which removes the per-board padding.
 #pragma unroll
-        for (int t = 0; t < TRUNK_MAXH; ++t) {
-            // Only the board's own rows are in `x`; the padding reads as zero
-            // and is stored as zero, which is what makes it multiply to
-            // nothing.
-            for (int q = 0; q < TRUNK_Q; ++q)
-                cur[q] = live[t] ? x[hex[t] * TRUNK_LDS + lane + 32 * q] : 0.0f;
-            float mean, inv;
-            row_stats(cur, c, &mean, &inv);
-            for (int q = 0; q < TRUNK_Q; ++q) {
-                int j = lane + 32 * q;
-                a[hex[t] * TRUNK_LDS + j] =
-                    live[t] ? tf32(gelu1((cur[q] - mean) * inv * ln[o[6] + j] + ln[o[7] + j]))
-                            : 0.0f;
+        for (int board = 0; board < TRUNK_BOARDS; ++board)
+#pragma unroll
+            for (int t = 0; t < TRUNK_MAXH; ++t) {
+                int hex = slot + t * TRUNK_SPAN;
+                bool live = board < count && hex < nhex;
+                int r = board * nhex + hex;
+                for (int q = 0; q < TRUNK_Q; ++q)
+                    cur[q] = live ? x[r * TRUNK_LDS + lane + 32 * q] : 0.0f;
+                float mean, inv;
+                row_stats(cur, c, &mean, &inv);
+                if (live)
+                    for (int q = 0; q < TRUNK_Q; ++q) {
+                        int j = lane + 32 * q;
+                        a[(size_t)r * TRUNK_HALF_LDS + j] = __float2half_rn(
+                            gelu1((cur[q] - mean) * inv * ln[o[6] + j] + ln[o[7] + j]));
+                    }
             }
+        if (slot == 0)
+            for (int r = valid_rows; r < TRUNK_ROWS; ++r)
+                for (int j = lane; j < c; j += 32)
+                    a[(size_t)r * TRUNK_HALF_LDS + j] = __float2half(0.0f);
+        __syncthreads();
+
+        // Pool each board's normalized rows and form its global bias.
+        if (slot == 0) {
+            for (int board = 0; board < count; ++board)
+                for (int q = 0; q < TRUNK_Q; ++q) {
+                    int j = lane + 32 * q;
+                    float sum = 0.0f, mx = neg_inf();
+                    for (int hex = 0; hex < nhex; ++hex) {
+                        float v = __half2float(a[(size_t)(board * nhex + hex) * TRUNK_HALF_LDS + j]);
+                        sum += v;
+                        mx = fmaxf(mx, v);
+                    }
+                    pooled[(size_t)board * 2 * c + j] = sum / nhex;
+                    pooled[(size_t)board * 2 * c + c + j] = mx;
+                }
+            for (int board = 0; board < count; ++board)
+                for (int q = 0; q < TRUNK_Q; ++q) {
+                    int j = lane + 32 * q;
+                    float sv = bias[o[3] + j];
+                    for (int k = 0; k < 2 * c; ++k)
+                        sv += pooled[(size_t)board * 2 * c + k] * w[o[2] + (size_t)k * c + j];
+                    gb[(size_t)board * c + j] = sv;
+                }
         }
         __syncthreads();
-        // The pooled global bias: mean and max over the hexes, projected once
-        // for the whole board. It is one warp's work either way, so warp zero
-        // does it before its share of the mix and the other eleven multiply
-        // through it rather than waiting at a barrier.
-        if (slot == 0) {
-            for (int q = 0; q < TRUNK_Q; ++q) {
-                int j = lane + 32 * q;
-                float sum = 0.0f, mx = neg_inf();
-                for (int h = 0; h < nhex; ++h) {
-                    float v = a[h * TRUNK_LDS + j];
-                    sum += v;
-                    mx = fmaxf(mx, v);
-                }
-                pooled[j] = sum / nhex;
-                pooled[c + j] = mx;
-            }
-            __syncwarp();
-            for (int q = 0; q < TRUNK_Q; ++q) {
-                int j = lane + 32 * q;
-                float sv = bias[o[3] + j];
-                for (int k = 0; k < 2 * c; ++k) sv += pooled[k] * w[o[2] + (size_t)k * c + j];
-                gb[j] = sv;
-            }
-        }
-        // Both halves of the mix, from one pass over the board: the self half
-        // into `as`, the neighbour half into `an`. The fragment of `a` is
-        // loaded once and multiplied twice, which is half the shared traffic
-        // two passes would cost.
+
+        // The three boards are one M dimension. Both halves of the mix share
+        // each A fragment, and their f32 accumulators are written back as
+        // half rows for the neighbour gather and the next norm.
         float an[TRUNK_MT][4], as[TRUNK_MT][4];
 #pragma unroll
         for (int m = 0; m < TRUNK_MT; ++m)
@@ -448,52 +490,62 @@ void k_trunk(const float* x0, const int* nb, const float* __restrict__ w,
             for (int i = 0; i < 4; ++i) an[m][i] = as[m][i] = 0.0f;
         for (int k = 0; k < TRUNK_KS; ++k) {
             unsigned bs[2], bn[2];
-            frag_b(wt + o[10], k, slot, lane, TRUNK_SPAN, bs);
-            frag_b(wt + o[10] + (size_t)TRUNK_C * TRUNK_C, k, slot, lane, TRUNK_SPAN, bn);
+            frag_b_half(wh + o[10], k, slot, lane, TRUNK_SPAN, bs);
+            frag_b_half(wh + o[10] + (size_t)TRUNK_C * TRUNK_C, k, slot, lane, TRUNK_SPAN, bn);
 #pragma unroll
             for (int m = 0; m < TRUNK_MT; ++m) {
                 unsigned af[4];
-                frag_a(a, m, 8 * k, lane, TRUNK_LDS, af);
-                mma_tile(as[m], af, bs);
-                mma_tile(an[m], af, bn);
+                frag_a_half(a, m, 16 * k, lane, TRUNK_HALF_LDS, af);
+                mma_half_tile(as[m], af, bs);
+                mma_half_tile(an[m], af, bn);
             }
         }
-        // `gb` is written and every warp is done reading `a`, so the mix may
-        // go back where the normalised board was.
-        __syncthreads();
 #pragma unroll
         for (int m = 0; m < TRUNK_MT; ++m)
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 int r = frag_row(m, i, lane), j = frag_col(i, slot, lane);
-                if (r < nhex) u[r * TRUNK_LDS + j] = an[m][i];
-                a[r * TRUNK_LDS + j] = as[m][i] + bias[o[1] + j] + gb[j];
+                if (r < valid_rows) {
+                    int board = r / nhex;
+                    a[(size_t)r * TRUNK_HALF_LDS + j] =
+                        __float2half_rn(as[m][i] + bias[o[1] + j] + gb[(size_t)board * c + j]);
+                    u[(size_t)r * TRUNK_HALF_LDS + j] = __float2half_rn(an[m][i]);
+                }
             }
         __syncthreads();
-        // The six-neighbour gather, then gelu(norm(.)) back into the operand.
+
+        // Gather the six neighbours from the half projection, then normalize
+        // the mixed row for the next half-precision matrix multiply.
 #pragma unroll
-        for (int t = 0; t < TRUNK_MAXH; ++t) {
-            for (int q = 0; q < TRUNK_Q; ++q) {
-                int j = lane + 32 * q;
-                float v = a[hex[t] * TRUNK_LDS + j];
-                if (live[t])
-                    for (int k = 0; k < 6; ++k) {
-                        int n = nb[hex[t] * 6 + k];
-                        if (n >= 0) v += u[n * TRUNK_LDS + j];
+        for (int board = 0; board < TRUNK_BOARDS; ++board)
+#pragma unroll
+            for (int t = 0; t < TRUNK_MAXH; ++t) {
+                int hex = slot + t * TRUNK_SPAN;
+                bool live = board < count && hex < nhex;
+                int r = board * nhex + hex;
+                for (int q = 0; q < TRUNK_Q; ++q) {
+                    int j = lane + 32 * q;
+                    float v = live ? __half2float(a[(size_t)r * TRUNK_HALF_LDS + j]) : 0.0f;
+                    if (live)
+                        for (int k = 0; k < 6; ++k) {
+                            int n = nb[hex * 6 + k];
+                            if (n >= 0)
+                                v += __half2float(u[(size_t)(board * nhex + n) * TRUNK_HALF_LDS + j]);
+                        }
+                    cur[q] = v;
+                }
+                float mean, inv;
+                row_stats(cur, c, &mean, &inv);
+                if (live)
+                    for (int q = 0; q < TRUNK_Q; ++q) {
+                        int j = lane + 32 * q;
+                        a[(size_t)r * TRUNK_HALF_LDS + j] = __float2half_rn(
+                            gelu1((cur[q] - mean) * inv * ln[o[8] + j] + ln[o[9] + j]));
                     }
-                cur[q] = v;
             }
-            float mean, inv;
-            row_stats(cur, c, &mean, &inv);
-            for (int q = 0; q < TRUNK_Q; ++q) {
-                int j = lane + 32 * q;
-                a[hex[t] * TRUNK_LDS + j] =
-                    live[t] ? tf32(gelu1((cur[q] - mean) * inv * ln[o[8] + j] + ln[o[9] + j]))
-                            : 0.0f;
-            }
-        }
         __syncthreads();
-        // The output projection, accumulated onto the residual stream.
+
+        // The output projection stays in f32 until it is added to the residual.
         float ao[TRUNK_MT][4];
 #pragma unroll
         for (int m = 0; m < TRUNK_MT; ++m)
@@ -501,12 +553,12 @@ void k_trunk(const float* x0, const int* nb, const float* __restrict__ w,
             for (int i = 0; i < 4; ++i) ao[m][i] = 0.0f;
         for (int k = 0; k < TRUNK_KS; ++k) {
             unsigned bo[2];
-            frag_b(wt + o[11], k, slot, lane, TRUNK_SPAN, bo);
+            frag_b_half(wh + o[11], k, slot, lane, TRUNK_SPAN, bo);
 #pragma unroll
             for (int m = 0; m < TRUNK_MT; ++m) {
                 unsigned af[4];
-                frag_a(a, m, 8 * k, lane, TRUNK_LDS, af);
-                mma_tile(ao[m], af, bo);
+                frag_a_half(a, m, 16 * k, lane, TRUNK_HALF_LDS, af);
+                mma_half_tile(ao[m], af, bo);
             }
         }
 #pragma unroll
@@ -514,44 +566,49 @@ void k_trunk(const float* x0, const int* nb, const float* __restrict__ w,
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 int r = frag_row(m, i, lane), j = frag_col(i, slot, lane);
-                if (r < nhex) x[r * TRUNK_LDS + j] += ao[m][i] + bias[o[5] + j];
+                if (r < valid_rows) x[r * TRUNK_LDS + j] += ao[m][i] + bias[o[5] + j];
             }
         __syncthreads();
     }
 
-    // The trunk norm, and the head's input: pooled mean and max, then the
-    // loose scalars straight off the public encoding.
     const int* tn = off + blocks * TRUNK_OFF;
 #pragma unroll
-    for (int t = 0; t < TRUNK_MAXH; ++t) {
-        for (int q = 0; q < TRUNK_Q; ++q)
-            cur[q] = live[t] ? x[hex[t] * TRUNK_LDS + lane + 32 * q] : 0.0f;
-        float mean, inv;
-        row_stats(cur, c, &mean, &inv);
-        if (live[t])
-            for (int q = 0; q < TRUNK_Q; ++q) {
-                int j = lane + 32 * q;
-                x[hex[t] * TRUNK_LDS + j] =
-                    gelu1((cur[q] - mean) * inv * ln[tn[0] + j] + ln[tn[1] + j]);
-            }
-    }
+    for (int board = 0; board < TRUNK_BOARDS; ++board)
+#pragma unroll
+        for (int t = 0; t < TRUNK_MAXH; ++t) {
+            int hex = slot + t * TRUNK_SPAN;
+            bool live = board < count && hex < nhex;
+            int r = board * nhex + hex;
+            for (int q = 0; q < TRUNK_Q; ++q)
+                cur[q] = live ? x[r * TRUNK_LDS + lane + 32 * q] : 0.0f;
+            float mean, inv;
+            row_stats(cur, c, &mean, &inv);
+            if (live)
+                for (int q = 0; q < TRUNK_Q; ++q) {
+                    int j = lane + 32 * q;
+                    x[r * TRUNK_LDS + j] =
+                        gelu1((cur[q] - mean) * inv * ln[tn[0] + j] + ln[tn[1] + j]);
+                }
+        }
     __syncthreads();
     int width = 2 * c + loose;
-    if (slot == 0) {
-        for (int q = 0; q < TRUNK_Q; ++q) {
-            int j = lane + 32 * q;
-            float sum = 0.0f, mx = neg_inf();
-            for (int h = 0; h < nhex; ++h) {
-                float v = x[h * TRUNK_LDS + j];
-                sum += v;
-                mx = fmaxf(mx, v);
+    if (slot == 0)
+        for (int board = 0; board < count; ++board)
+            for (int q = 0; q < TRUNK_Q; ++q) {
+                int j = lane + 32 * q;
+                float sum = 0.0f, mx = neg_inf();
+                for (int hex = 0; hex < nhex; ++hex) {
+                    float v = x[(board * nhex + hex) * TRUNK_LDS + j];
+                    sum += v;
+                    mx = fmaxf(mx, v);
+                }
+                out[(size_t)(first + board) * width + j] = sum / nhex;
+                out[(size_t)(first + board) * width + c + j] = mx;
             }
-            out[(size_t)row * width + j] = sum / nhex;
-            out[(size_t)row * width + c + j] = mx;
-        }
-    }
-    for (int k = lane + 32 * slot; k < loose; k += 32 * TRUNK_SPAN)
-        out[(size_t)row * width + 2 * c + k] = xpub[(size_t)row * stride + off_loose + k];
+    for (int board = 0; board < count; ++board)
+        for (int k = lane + 32 * slot; k < loose; k += 32 * TRUNK_SPAN)
+            out[(size_t)(first + board) * width + 2 * c + k] =
+                xpub[(size_t)(first + board) * stride + off_loose + k];
 }
 
 // One slot row per (config, slot): three counts then that slot's card token.
