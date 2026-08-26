@@ -159,9 +159,10 @@ pub struct Data {
     /// game outcome. Query rows use `u32::MAX` and NaN because no game owns them.
     pub truth: Vec<u32>,
     pub outcome: Vec<f32>,
-    /// Unix time when the solve produced this row. Main-line rows can wait for
+    /// Unix time when the solve produced its rows. Main-line rows can wait for
     /// their game's outcome before Python receives them.
     pub created: Vec<f64>,
+    solve_created: f64,
     /// One for a query row and one for a main-line row selected for TD(1).
     pub query: Vec<u8>,
     pub td1: Vec<u8>,
@@ -237,6 +238,10 @@ impl Data {
     /// are pushed; `soff[k]` is the row index where solve k starts.
     pub fn begin_solve(&mut self) {
         self.soff.push(self.nv as u32);
+        self.solve_created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is before Unix epoch")
+            .as_secs_f64();
     }
 
     /// `y[p]` holds one value per *config* in `bel[p]`. Every one of them is
@@ -248,6 +253,7 @@ impl Data {
         ctx: &Ctx,
         bel: &[Belief; 2],
         y: [&[f32]; 2],
+        truth: [u32; 2],
         policy: &crate::search::Policy,
     ) {
         debug_assert!(
@@ -292,14 +298,9 @@ impl Data {
             self.coff.push(self.cw.len() as u32);
         }
         *self.pcoff.last_mut().expect("row offset") = self.pcell.len() as u32;
-        self.truth.extend([u32::MAX; 2]);
+        self.truth.extend(truth);
         self.outcome.extend([f32::NAN; 2]);
-        self.created.push(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock is before Unix epoch")
-                .as_secs_f64(),
-        );
+        self.created.push(self.solve_created);
         self.query.push(0);
         self.td1.push(0);
         self.nv += 1;
@@ -421,6 +422,7 @@ pub fn keep_query(
         &sv.ctx,
         &sv.root_belief,
         [&solved.value[0], &solved.value[1]],
+        [u32::MAX; 2],
         &Default::default(),
     );
     *out.query.last_mut().expect("query row") = 1;
@@ -528,18 +530,19 @@ impl Game {
                     {
                         let y0 = vec![policy::eval_squashed(&self.s, 0); self.bel[0].cfg.len()];
                         let y1 = vec![policy::eval_squashed(&self.s, 1); self.bel[1].cfg.len()];
+                        let truth = [
+                            self.true_index(0) as u32,
+                            self.true_index(1) as u32,
+                        ];
                         self.data.begin_solve();
                         self.data.push_value(
                             &self.s,
                             &self.ctx,
                             &self.bel,
                             [&y0, &y1],
+                            truth,
                             &np.to_replay(),
                         );
-                        let row = self.data.nv - 1;
-                        for p in 0..2 {
-                            self.data.truth[2 * row + p] = self.true_index(p) as u32;
-                        }
                     }
                     self.play(np);
                 }
@@ -567,21 +570,22 @@ impl Game {
     /// Act on a finished solve: keep the row it produced, then play its move.
     pub fn play_solved(&mut self, sv: &Solver, solved: Option<Solved>) {
         if let Some(solved) = solved {
+            // The row is stored under the belief that is about to be updated,
+            // so the seats' realised configs are read here and not at `finish`.
+            let truth = [
+                self.true_index(0) as u32,
+                self.true_index(1) as u32,
+            ];
             self.data.begin_solve();
             self.data.push_value(
                 &self.s,
                 &self.ctx,
                 &self.bel,
                 [&solved.value[0], &solved.value[1]],
+                truth,
                 &solved.policy,
             );
             self.queries.extend(solved.queries);
-            // The row is stored under the belief that is about to be updated,
-            // so the seats' realised configs are read here and not at `finish`.
-            let row = self.data.nv - 1;
-            for p in 0..2 {
-                self.data.truth[2 * row + p] = self.true_index(p) as u32;
-            }
         }
         self.play(policy::root(sv));
     }
@@ -1019,6 +1023,7 @@ mod target_tests {
                 &ctx,
                 bel,
                 [&solved.value[0], &solved.value[1]],
+                [u32::MAX; 2],
                 &solved.policy,
             );
 

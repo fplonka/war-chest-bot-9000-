@@ -961,17 +961,6 @@ fn pick(w: &[f32], rng: &mut Rng) -> usize {
     w.len() - 1
 }
 
-/// A uniform `k`-subset of `0..n`, in O(k) space and random draws.
-fn sample_indices(rng: &mut Rng, n: usize, k: usize) -> Vec<usize> {
-    debug_assert!(k <= n);
-    let mut out = Vec::with_capacity(k);
-    for j in n - k..n {
-        let pick = rng.below(j + 1);
-        out.push(if out.contains(&pick) { j } else { pick });
-    }
-    out
-}
-
 impl TNode {
     /// Host bytes this node's own lists hold, beside the struct itself.
     ///
@@ -1236,8 +1225,9 @@ pub struct Solver {
     queries: Vec<(State, [Belief; 2])>,
     /// Query events considered by the reservoir.
     query_seen: usize,
-    /// Nodes selected from the current device round, in reply order.
-    query_nodes: Vec<usize>,
+    /// Nodes selected from the current device round, with their reservoir slots,
+    /// in reply order.
+    query_nodes: Vec<(usize, Option<usize>)>,
     pub(crate) cfg: Cfg,
     pub nodes: Vec<TNode>,
     /// Node states, parallel to `nodes`. A leaf can only be expanded later if
@@ -1652,43 +1642,25 @@ impl Solver {
         out
     }
 
-    /// Update a uniform reservoir with `events` new network queries and return
-    /// the selected event indices. Existing rows stay owned by the reservoir;
-    /// callers append the returned rows with their query-time beliefs.
-    fn plan_query_events(&mut self, events: usize) -> Vec<usize> {
-        let keep = self.collect.unwrap_or(0);
-        if keep == 0 || events == 0 {
-            self.query_seen += events;
-            return Vec::new();
-        }
+    /// Run Algorithm R over the new query events. Each selected event carries
+    /// the reservoir slot it replaces, or `None` while the reservoir fills.
+    fn plan_query_events(&mut self, events: usize) -> Vec<(usize, Option<usize>)> {
+        let start = self.query_seen;
+        self.query_seen += events;
         self.with_rng(|sv, rng| {
-            let old_events = sv.query_seen;
-            let total = old_events + events;
-            sv.query_seen = total;
-            if total <= keep {
-                return (0..events).collect();
-            }
-
-            // The number of new rows in a uniform `keep`-subset of the union
-            // is hypergeometric. Draw the categories, then draw each subset.
-            let mut new_left = events;
-            let mut all_left = total;
-            let mut new_count = 0;
-            for _ in 0..keep {
-                if rng.below(all_left) < new_left {
-                    new_count += 1;
-                    new_left -= 1;
-                }
-                all_left -= 1;
-            }
-            let old_count = keep - new_count;
-            let old_idx = sample_indices(rng, sv.queries.len(), old_count);
-            sv.queries = std::mem::take(&mut sv.queries)
-                .into_iter()
-                .enumerate()
-                .filter_map(|(i, row)| old_idx.contains(&i).then_some(row))
-                .collect();
-            sample_indices(rng, events, new_count)
+            let keep = sv.collect.unwrap_or(0);
+            debug_assert_eq!(sv.queries.len(), start.min(keep));
+            (0..events)
+                .filter_map(|event| {
+                    let seen = start + event;
+                    if seen < keep {
+                        Some((event, None))
+                    } else {
+                        let slot = rng.below(seen + 1);
+                        (slot < keep).then_some((event, Some(slot)))
+                    }
+                })
+                .collect()
         })
     }
 
@@ -1710,21 +1682,30 @@ impl Solver {
             return;
         }
         let rows = self.leaf_query_rows(from);
-        let selected = self.plan_query_events(rows.len());
-        for e in selected {
+        for (e, slot) in self.plan_query_events(rows.len()) {
             let node = rows[e];
-            self.queries.push((self.states[node].clone(), self.belief_at(node)));
+            self.store_query(slot, (self.states[node].clone(), self.belief_at(node)));
         }
     }
 
     /// Finish the device round's selected queries from the reach snapshots it
     /// returned. Their nodes were retained when the round was planned.
+    fn store_query(&mut self, slot: Option<usize>, query: (State, [Belief; 2])) {
+        match slot {
+            Some(slot) => self.queries[slot] = query,
+            None => self.queries.push(query),
+        }
+    }
+
     fn absorb_queries(&mut self, reach: &[f32]) {
         let query_nodes = std::mem::take(&mut self.query_nodes);
-        let non_leaf = query_nodes.iter().filter(|&&node| !self.nodes[node].leaf).count();
+        let non_leaf = query_nodes
+            .iter()
+            .filter(|&&(node, _)| !self.nodes[node].leaf)
+            .count();
         debug_assert_eq!(non_leaf, 0, "query sampler selected {non_leaf} non-leaf nodes");
         let mut cut = 0;
-        for node in query_nodes {
+        for (node, slot) in query_nodes {
             let beliefs = std::array::from_fn(|p| {
                 let n = self.nc[node][p] as usize;
                 let mut w = vec![0.0; n];
@@ -1732,7 +1713,7 @@ impl Solver {
                 cut += n;
                 Belief { cfg: self.nodes[node].cfgs[p].to_vec(), p: w }
             });
-            self.queries.push((self.states[node].clone(), beliefs));
+            self.store_query(slot, (self.states[node].clone(), beliefs));
         }
         assert_eq!(cut, reach.len(), "query reach reply has a trailing tail");
     }
@@ -3368,7 +3349,7 @@ impl Solver {
             if self.at == iters {
                 self.finish();
                 self.phase = Phase::Done;
-                return Step::Done(self.collect.map(|q| self.harvest(q)));
+                return Step::Done(self.collect.is_some().then(|| self.harvest()));
             }
             // The same round the device runs, on this core: `done` regret
             // updates against a frozen tree, each sampling `want` trajectories,
@@ -3500,10 +3481,13 @@ impl Solver {
         let query_rows = self.leaf_query_rows(0);
         let rows = query_rows.len();
         let selected = self.plan_query_events(done * rows);
-        self.query_nodes = selected.iter().map(|&e| query_rows[e % rows]).collect();
+        self.query_nodes = selected
+            .iter()
+            .map(|&(e, slot)| (query_rows[e % rows], slot))
+            .collect();
         let query = selected
             .into_iter()
-            .map(|e| {
+            .map(|(e, _)| {
                 let node = query_rows[e % rows];
                 QueryPick {
                     iter: (e / rows) as u32,
@@ -4114,8 +4098,7 @@ impl Solver {
     /// network's own answer, so training on it would teach the network what it
     /// already said; an interior node's value comes from the subtree beneath
     /// it, which is the bootstrap the whole method rests on.
-    fn harvest(&mut self, queries: usize) -> Solved {
-        debug_assert_eq!(self.collect, Some(queries));
+    fn harvest(&mut self) -> Solved {
         let value = self.value_pass();
         let queries = std::mem::take(&mut self.queries);
         let policy = self.root_policy();
@@ -4270,7 +4253,8 @@ impl Solver {
                     + self.primed.capacity()
                     + z(&self.leaf_rows)
                     + z(&self.term_leaves)
-                    + z(&self.query_nodes),
+                    + self.query_nodes.capacity()
+                        * std::mem::size_of::<(usize, Option<usize>)>(),
             ),
             ("cur", f(&self.cur)),
             ("avg", f(&self.avg)),

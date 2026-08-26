@@ -11,11 +11,17 @@ for the configured rates, and restore the contract test invariant.
 - Worktree was clean at start.
 - Implemented the leaf-only query event view, rate validation, assertion, and
   contract-test threshold.
+- Replaced the query reservoir's hypergeometric rebuild with Algorithm R.
+- Made query slots explicit, removed the harvest argument, and asserted CUDA
+  query picks stay inside their live iterations.
+- Stored truth at row creation and captured one creation timestamp per solve.
 - Synced the dirty worktree to `/workspace/warchest-querytidy`.
-- Focused box tests are queued behind existing box jobs.
+- Focused GPU tests are queued behind existing box jobs.
 
 ## Validation
 
-- No local bot, solver, or training binary will be run.
-- Required work will use `WARCHEST_BOX_DIR=/workspace/warchest-querytidy` and
+- `cargo check` and `cargo check --features python` pass locally.
+- The GPU check failed locally because `nvcc` is not installed; no local bot,
+  solver, or training binary was run.
+- Required work uses `WARCHEST_BOX_DIR=/workspace/warchest-querytidy` and
   `tools/box.sh`.

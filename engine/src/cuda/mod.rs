@@ -2422,6 +2422,10 @@ impl Card {
                 b.nexpand = *expand;
                 sims = sims.max(*expand);
                 query_at[i] = query_total;
+                debug_assert!(
+                    query.iter().all(|q| (q.iter as usize) < *iters),
+                    "query pick is outside its solve's live iterations"
+                );
                 query_len[i] = query.iter().map(|q| q.len as usize).sum();
                 query_total += query_len[i];
             }
