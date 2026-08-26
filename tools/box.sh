@@ -93,35 +93,25 @@ build)
 follow)
     tag=${2:?usage: follow <tag> [run]}
     if [ -n "${3:-}" ]; then
-        (
-            while :; do
-                "$0" pull "$3" >/dev/null 2>&1 || true
-                sleep "${WARCHEST_BOX_POLL:-60}"
-            done
-        ) &
+        (while :; do
+            "$0" pull "$3" >/dev/null 2>&1 || true
+            sleep "${WARCHEST_BOX_POLL:-60}"
+        done) &
         pull_pid=$!
+        trap 'kill "$pull_pid" 2>/dev/null || true; wait "$pull_pid" 2>/dev/null || true' EXIT
     fi
-    if run_remote "while [ ! -s /workspace/logs/$tag.pid ]; do sleep 0.5; done
-while kill -0 \$(cat /workspace/logs/$tag.pid) 2>/dev/null; do
-    tail -1 /workspace/logs/$tag.log
+    status=0
+    run_remote "while [ ! -s /workspace/logs/$tag.pid ] || kill -0 \$(cat /workspace/logs/$tag.pid) 2>/dev/null; do
+    tail -1 /workspace/logs/$tag.log 2>/dev/null || true
     sleep \${WARCHEST_BOX_POLL:-60}
 done
 cat /workspace/logs/$tag.exit
-grep -qx 0 /workspace/logs/$tag.exit || { tail -20 /workspace/logs/$tag.log; exit 1; }"; then
-        status=0
-    else
-        status=$?
-    fi
-    [ -z "${pull_pid:-}" ] || {
-        kill "$pull_pid" 2>/dev/null || true
-        wait "$pull_pid" 2>/dev/null || true
-    }
+grep -qx 0 /workspace/logs/$tag.exit || { tail -20 /workspace/logs/$tag.log; exit 1; }" || status=$?
     [ -n "${3:-}" ] && "$0" pull "$3"
-    if [ "$status" -ne 0 ]; then
+    [ "$status" -eq 0 ] && echo "JOB_DONE tag=$tag ok" || {
         echo "JOB_DONE tag=$tag failed"
         exit 1
-    fi
-    echo "JOB_DONE tag=$tag ok"
+    }
     ;;
 start)
     # start <tag> <command...>: the command runs detached on the box, queued
