@@ -5,7 +5,8 @@
     python3 tools/monitor.py --pull
 
 There is no generated page on disk and no regeneration step: a run in progress
-appends epochs.jsonl and renders exactly like a finished one.
+appends epochs.jsonl and renders exactly like a finished one. Older runs keep
+their epochs in log.json and use the same dashboard path.
 """
 import argparse
 import glob
@@ -30,7 +31,7 @@ sys.path.insert(0, os.path.join(HERE, "train"))
 import config  # noqa: E402  -- knobs(), so the baseline lives in one place
 
 CI95 = 1.96   # ladder.json stores the 1-sigma Bradley-Terry SE
-LIVE = 120    # an epoch log untouched for this long is not a live run
+LIVE = 120    # a run log untouched for this long is not a live run
 EPOCH_LIMIT = 2048
 
 
@@ -114,6 +115,24 @@ def read_epochs(path, limit=EPOCH_LIMIT):
             return out
     except OSError:
         return []
+
+
+def run_epochs(run_path, log):
+    """Read the run's epoch records, regardless of its log format."""
+    path = os.path.join(run_path, "epochs.jsonl")
+    return read_epochs(path) if os.path.exists(path) else log.get("epochs") or []
+
+
+def run_epoch_summary(run_path, log):
+    """Return sidebar metadata without loading a large JSONL log."""
+    path = os.path.join(run_path, "epochs.jsonl")
+    if os.path.exists(path):
+        last = last_jsonl(path)
+        epoch = last.get("epoch", -1)
+        count = int(epoch) + 1 if isinstance(epoch, (int, float)) else 0
+        return count, last
+    eps = log.get("epochs") or []
+    return len(eps), eps[-1] if eps else {}
 
 
 def finite(v):
@@ -321,8 +340,9 @@ def index(runs_dir):
     """One line per run. The epoch log mtime is the live-run signal."""
     out = []
     for path in glob.glob(os.path.join(runs_dir, "*", "log.json")):
-        name = os.path.basename(os.path.dirname(path))
-        epoch_path = os.path.join(os.path.dirname(path), "epochs.jsonl")
+        run_path = os.path.dirname(path)
+        name = os.path.basename(run_path)
+        epoch_path = os.path.join(run_path, "epochs.jsonl")
         try:
             epoch_mt = os.path.getmtime(epoch_path)
         except OSError:
@@ -331,10 +351,9 @@ def index(runs_dir):
         hit = SUMMARY.get(name)
         if not hit or hit[0] != mt:
             log = read_json(path) or {}
-            last = last_jsonl(epoch_path)
-            epoch = last.get("epoch", -1)
+            count, last = run_epoch_summary(run_path, log)
             hit = (mt, {"name": name, "mtime": mt,
-                        "epochs": int(epoch) + 1 if isinstance(epoch, (int, float)) else 0,
+                        "epochs": count,
                         "phase": last.get("phase", ""),
                         "minutes": round(last.get("t", 0) / 60.0),
                         "note": (log.get("cfg") or {}).get("note", "")})
@@ -352,7 +371,7 @@ def detail(runs_dir, name):
     # report loss 0 and a handful of solves, and plotting them drags every
     # curve to the floor in its final pixel. Large logs are sampled before
     # parsing, so a dashboard request never loads the whole run.
-    eps = [e for e in read_epochs(os.path.join(path, "epochs.jsonl"))
+    eps = [e for e in run_epochs(path, log)
            if e.get("phase") == "sog" and e.get("solves", 0) > 0
            and e.get("steps", 1) > 0]
     cfg = log.get("cfg") or {}
