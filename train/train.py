@@ -956,7 +956,7 @@ def main():
             rec.setdefault("lr", opt.param_groups[0]["lr"])
             append_epoch(args, rec)
             print(line, flush=True)
-        epoch += 1
+            epoch += 1
         now = time.time()
         if now - t0 >= next_snap:
             snapshot(f"s{len(snaps)}", now - t0)
