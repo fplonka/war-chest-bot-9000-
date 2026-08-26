@@ -94,9 +94,9 @@ def elo_panel(lad, name):
 
 
 PANELS = (
+    ("Value loss", "huber", (("value", "loss"),), False, ()),
     ("Value loss by row age", "huber",
-     (("training sample", "loss"), ("old rows", "loss_old"),
-      ("fresh rows", "loss_new")), False, ()),
+     (("old rows", "loss_old"), ("fresh rows", "loss_new")), False, ()),
     ("Policy loss", "cross-entropy", (("policy", "policy_loss"),), True, ()),
     ("Per-head objective", "weighted loss",
      (("policy", "policy_weighted_loss"), ("total", "total_loss")), True, ()),
