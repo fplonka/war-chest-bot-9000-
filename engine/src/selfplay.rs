@@ -49,6 +49,7 @@ use crate::pbs::*;
 use crate::rng::Rng;
 use crate::search::{Cfg, Solved, Solver};
 use crate::state::{Cont, State, BLACK, WHITE, Z_BAG, Z_FACEDOWN, Z_FACEUP};
+#[cfg(any(test, feature = "python"))]
 use rayon::prelude::*;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -805,6 +806,7 @@ pub fn play_game(rng: Rng, nets: &Arc<Net>, gc: &GameCfg, data: &mut Data) -> f3
     z
 }
 
+#[cfg(any(test, feature = "python"))]
 fn play_static_game(rng: Rng, net: &Arc<Net>, gc: &GameCfg, data: &mut Data) -> f32 {
     let mut game = Game::new(rng, gc);
     assert!(
@@ -851,6 +853,7 @@ pub(crate) fn effective_bag_count(s: &State, p: u8, unit: u8) -> u8 {
 
 // ------------------------------------------------------------- batch drivers
 
+#[cfg(any(test, feature = "python"))]
 fn worker_seed(seed: u64, i: usize) -> u64 {
     seed.wrapping_mul(0x9E3779B97F4A7C15) ^ (i as u64).wrapping_mul(0xD1B54A32D192ED03)
 }
@@ -907,7 +910,8 @@ pub fn collect_roots(
     out
 }
 
-/// Play `games` games in parallel, returning merged data and statistics.
+/// Play `games` static-agent games in parallel, returning merged data and statistics.
+#[cfg(any(test, feature = "python"))]
 pub(crate) fn run_static_games(games: usize, seed: u64, nets: &Arc<Net>, gc: &GameCfg) -> Data {
     (0..games)
         .into_par_iter()

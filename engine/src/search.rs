@@ -449,6 +449,7 @@ impl Cfr {
 
     /// `t^p / (t^p + 1)`, with the infinities that name "do not discount" and
     /// "discard entirely" evaluated rather than computed.
+    #[cfg(test)]
     fn factor(t: f32, p: f32) -> f32 {
         if p.is_infinite() {
             return if p > 0.0 { 1.0 } else { 0.0 };

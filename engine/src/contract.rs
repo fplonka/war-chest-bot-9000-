@@ -789,7 +789,6 @@ impl Contract {
 mod tests {
     use super::*;
     use crate::rng::Rng;
-    use crate::net::Net;
     use crate::search::Cfg;
     use std::sync::Arc;
     use crate::selfplay::{collect_roots, Agent, Collect, GameCfg};
