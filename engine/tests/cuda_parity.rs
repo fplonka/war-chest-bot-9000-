@@ -35,7 +35,8 @@
 //! Needs a GPU, so it only builds under `--features gpu`.
 #![cfg(feature = "gpu")]
 
-use std::sync::Arc;
+use std::ops::Deref;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use warchest::contract::NO_ROW;
 use warchest::cuda::Device;
@@ -52,7 +53,7 @@ use warchest::state::State;
 
 /// The two evaluators compared by this test-only oracle.
 enum Backend {
-    Cuda(Device),
+    Cuda(TestDevice),
     Reference(Net),
 }
 
@@ -122,14 +123,35 @@ struct Run {
 /// not eight: two pipes of round scratch at this budget fill a 24 GB card
 /// before eight slots would fit. Tests that need more concurrent slots use a
 /// 512 budget, where the trees are small.
-fn gpu(net: Net) -> Device {
-    Device::new(
-        &[0],
+static GPU: Mutex<()> = Mutex::new(());
+
+/// One parity test owns the card at a time. Each test carves most of GPU 0,
+/// so parallel test threads would test allocation failure instead of parity.
+struct TestDevice {
+    device: Device,
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl Deref for TestDevice {
+    type Target = Device;
+
+    fn deref(&self) -> &Device {
+        &self.device
+    }
+}
+
+fn test_device(net: Net, cfg: Cfg, slots: usize) -> TestDevice {
+    let guard = GPU.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let device = Device::new(&[0], net, cfg, slots).expect("device");
+    TestDevice { device, _guard: guard }
+}
+
+fn gpu(net: Net) -> TestDevice {
+    test_device(
         net,
         Cfg { budget: Budget::for_s(2048), ..Default::default() },
         4,
     )
-    .expect("device")
 }
 
 #[test]
@@ -1040,13 +1062,11 @@ fn k_iterates_together_match_k_iterates_alone() {
     // Eight slots at the 2048 growth budget do not fit two pipes of round
     // scratch on a 24 GB card. These trees never grow (`c = 0`, `s = 8`), so
     // the live 512 budget is the one that has room for eight copies.
-    let device = Device::new(
-        &[0],
+    let device = test_device(
         net.clone(),
         Cfg { budget: Budget::for_s(512), ..Default::default() },
         8,
-    )
-    .expect("device");
+    );
     let nets = Arc::new(net.clone());
     let mut setup = Vec::new();
     let mut iterates = Vec::new();
