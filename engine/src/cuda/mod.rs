@@ -2507,6 +2507,7 @@ impl Card {
         // the loop, which is not redundant: the tree grew since the last round
         // and the new subtrees have no reaches yet.
         self.stage(4, || self.reaches(&b, b.all(), 0, false, 0)).map_err(at("reach"))?;
+        let mut expand_done = None;
         for iter in 0..rounds {
             let live = order
                 .iter()
@@ -2541,6 +2542,11 @@ impl Card {
             }
             self.network(&b, p).map_err(at("net"))?;
             self.stage(6, || self.terminals(b.trees.buf(), p)).map_err(at("terminals"))?;
+            // The next backpropagation updates the arenas expansion reads.
+            // Let its dependent walk overlap only the network and terminals.
+            if let Some(done) = expand_done.take() {
+                self.stream.wait(&done).map_err(err)?;
+            }
             self.stage(7, || self.backprop(&b, p, 0, it, k)).map_err(at("backprop"))?;
             // The regret update moved both players' strategies, so the reaches
             // the next iteration reads are stale until they are pushed down
@@ -2553,10 +2559,10 @@ impl Card {
                 self.expand_stream.wait(&ready).map_err(err)?;
                 self.expand_stage(&b, sims, puct, iter, rounds)
                     .map_err(at("expand"))?;
+                expand_done = Some(self.expand_stream.record_event(None).map_err(err)?);
             }
         }
-        if sims > 0 {
-            let done = self.expand_stream.record_event(None).map_err(err)?;
+        if let Some(done) = expand_done {
             self.stream.wait(&done).map_err(err)?;
         }
         let t_launch = mark.elapsed();
