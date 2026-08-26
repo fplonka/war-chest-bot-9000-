@@ -112,8 +112,6 @@ class Buffer:
 
     def add(self, x, cols, cc, cw, cy, coff, soff, pol=None):
         n = len(x)
-        if not x.flags.writeable:
-            x = x.copy()
         lens = np.diff(coff).reshape(n, 2)
         m = len(cw)
         for name, _, _, _ in ROW_COLUMNS:
