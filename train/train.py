@@ -339,8 +339,6 @@ def ingest(buf, data):
     return len(x)
 
 
-
-
 def physical_cpus():
     """Return one Linux hardware thread from each physical core."""
     cpus = set()
@@ -357,6 +355,7 @@ def physical_cpus():
         except (OSError, ValueError):
             pass
     return sorted(cpus)
+
 
 def refuse_if_machine_busy():
     """Catch a second run started by accident."""
