@@ -1117,7 +1117,7 @@ mod target_tests {
             query_rate: 0.0,
             recursive_rate: 0.0,
         };
-        let mut g = Game::new(Rng::new(6), &gc);
+        let mut g = Game::new(Rng::new(49), &gc);
         while let Some(mut sv) = g.next_solve(&nets) {
             let solved = sv.run_alone();
             g.play_solved(&sv, solved);
