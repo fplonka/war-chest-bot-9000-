@@ -1,7 +1,5 @@
 use super::*;
 mod growth;
-
-#[cfg(test)]
 #[derive(Default)]
 pub struct HostCfr {
     /// Accumulated regret, laid out exactly like `Solver::cur`.
@@ -66,7 +64,6 @@ impl Solver {
     /// runs the loop — so reaching for them is a mistake about which backend is
     /// driving, and it says so here rather than returning the zeroes an
     /// unallocated arena would.
-    #[cfg(test)]
     pub fn cfr(&self) -> &HostCfr {
         &self.oracle.cfr
     }
@@ -74,7 +71,6 @@ impl Solver {
     /// The same arenas, to write. Only the oracles want this: they run a
     /// contract's arithmetic beside the solver's and put the result back.
     #[doc(hidden)]
-    #[cfg(test)]
     pub fn cfr_mut(&mut self) -> &mut HostCfr {
         &mut self.oracle.cfr
     }
@@ -96,7 +92,6 @@ impl Solver {
     /// are done, because that is the only moment at which one flat array can
     /// describe the whole tree. Everything that acts, filters a belief or
     /// values a node reads it afterwards.
-    #[cfg(test)]
     pub fn finish(&mut self) {
         // `cur` still holds the literal initial policy for a player that has
         // not traversed yet, so start there and overwrite every player whose
@@ -133,7 +128,6 @@ impl Solver {
     /// the parent's row can be borrowed alongside the child's through one
     /// `split_at_mut` — no copy of the parent's reach, which used to be two
     /// heap allocations per node per pass.
-    #[cfg(test)]
     pub fn precompute_reaches(&mut self) {
         let cur = std::mem::take(&mut self.cur);
         self.propagate(&cur);
@@ -142,7 +136,6 @@ impl Solver {
 
     /// Push reach probabilities down the tree under `strat`, from the root
     /// beliefs.
-    #[cfg(test)]
     fn propagate(&mut self, strat: &[f32]) {
         let _t = timed!(REACH);
         let reach = &mut self.oracle.cfr.reach;
@@ -226,7 +219,6 @@ impl Solver {
 
     /// Node `i`'s reach vector for player `p`.
     #[inline]
-    #[cfg(test)]
     fn reach_of(&self, i: usize, p: usize) -> &[f32] {
         let at = self.roff[i] as usize + if p == 1 { self.nc[i][0] as usize } else { 0 };
         &self.cfr().reach[at..at + self.nc[i][p] as usize]
@@ -238,7 +230,6 @@ impl Solver {
     /// them as one batch; a single game, a tool or a test wants exactly one
     /// solve, so it answers them where they are raised. Only the host path can
     /// do this: a device keeps the solve, and there is no device here.
-    #[cfg(test)]
     pub fn run_alone(&mut self) -> Option<Solved> {
         let mut replies: Vec<Reply> = Vec::new();
         loop {
@@ -256,7 +247,6 @@ impl Solver {
     /// The farm gathers these across every solve in flight and answers them in
     /// one batch. This is the same work for a solve driven on its own, which
     /// is what the single-position tools and the tests want.
-    #[cfg(test)]
     pub fn catch_up(&mut self) {
         let calls = self.growth_calls();
         let replies: Vec<Reply> = calls.iter().map(|c| c.run(&self.net)).collect();
@@ -280,7 +270,6 @@ impl Solver {
     ///
     /// Rows below `from` are ones whose join output is being reused, so their
     /// block is not read and is not written.
-    #[cfg(test)]
     fn belief_blocks(&mut self, from: usize) {
         let _t = timed!(BELFEAT);
         // Sized where it is written. Growth used to do it, which fitted a
@@ -325,7 +314,6 @@ impl Solver {
     /// The two belief rows at one expanded node, at the instant its prior is
     /// formed. This is the same normalised reach pooling as `belief_blocks`,
     /// restricted to the one row the action encoder needs.
-    #[cfg(test)]
     fn belief_pair(&mut self, node: usize, row: usize, out: &mut [f32]) {
         let pool = crate::net::POOL;
         debug_assert_eq!(out.len(), 2 * pool);
@@ -352,7 +340,6 @@ impl Solver {
 
     /// Fill `vals` at every leaf with the traverser's counterfactual values,
     /// querying the network at every row.
-    #[cfg(test)]
     pub fn leaf_values(&mut self, traverser: usize) {
         self.leaf_values_from(traverser, 0);
     }
@@ -364,7 +351,6 @@ impl Solver {
     /// every iteration and costs a sum over a support; `v(c)` is the network,
     /// and is the whole of what the join and the readout are for. So the split
     /// here is exactly the split `Cfg::refresh` trades in.
-    #[cfg(test)]
     fn leaf_values_from(&mut self, traverser: usize, from: usize) {
         if !self.net.is_empty() {
             self.belief_blocks(from);
@@ -379,7 +365,6 @@ impl Solver {
     /// Writes `h` for rows `from ..` at its front, so row `r` of the tree is
     /// row `r - from` of `h`. The join takes a contiguous batch and this one is
     /// a suffix of the leaves, because growth only ever appends.
-    #[cfg(test)]
     fn pbs_head(&mut self, traverser: usize, from: usize) {
         let net = &self.net;
         if net.is_empty() {
@@ -414,7 +399,6 @@ impl Solver {
     ///
     /// Rows below `from` take their `v(c)` from `vcache` instead of the
     /// network; every row is scaled by the reach mass it has now.
-    #[cfg(test)]
     fn readout_from(&mut self, p: usize, from: usize) {
         let _t = timed!(LEAFPOST);
         let empty = self.net.is_empty();
@@ -477,8 +461,6 @@ impl Solver {
             }
         }
     }
-
-    #[cfg(test)]
     fn update_regrets(&mut self, traverser: usize) {
         // Reaches are already consistent with `cur`: `new` establishes that,
         // every `step` re-establishes it after regret matching, and the
@@ -499,7 +481,6 @@ impl Solver {
     /// whether the traverser's decision nodes average under `strat`, average
     /// and update regret matching, or take the max. Regret mode uses
     /// `self.cur`; fixed-policy modes read `strat`.
-    #[cfg(test)]
     pub fn backprop(&mut self, traverser: usize, strat: &[f32], mode: Back) {
         // Regret matching floors at EPS rather than at zero, so every legal
         // action keeps positive probability and carried beliefs keep their
@@ -679,7 +660,6 @@ impl Solver {
     /// This is twice the work of an alternating half-iteration and twice the
     /// updates, so a solve of `iters` iterations now gives each player `iters`
     /// updates rather than `iters / 2`.
-    #[cfg(test)]
     pub fn step(&mut self) {
         self.oracle.trace.iters += 1;
         self.oracle.trace.row_iters += self.leaf_rows.len() as u64;
@@ -701,7 +681,6 @@ impl Solver {
     /// traversal twice -- which was right while CFR alternated traversers and
     /// only one player's sum moved per iteration, and is not now that `step`
     /// updates both.
-    #[cfg(test)]
     pub fn avg_block(&mut self) {
         let _t = timed!(AVG);
         self.avg_touched = [true; 2];
@@ -723,8 +702,6 @@ impl Solver {
             }
         }
     }
-
-    #[cfg(test)]
     pub fn multistep(&mut self, iters: usize) {
         for _ in 0..iters {
             self.step();
@@ -744,7 +721,6 @@ impl Solver {
     /// than of an iteration, so they are asked for once per growth. The join
     /// that every iteration pays for, and the policy head the expansion phase
     /// reads, run inline on the core the solve is already on.
-    #[cfg(test)]
     pub(crate) fn advance_on_host(&mut self, replies: &[Reply]) -> Step {
         if self.phase == Phase::Iterating {
             self.absorb(replies);
@@ -797,7 +773,6 @@ impl Solver {
 
     /// The root's per-config values under the reference strategy — the target
     /// a solve at this position produces for itself.
-    #[cfg(test)]
     pub fn root_values(&mut self) -> [Vec<f32>; 2] {
         let out = self.value_pass();
         self.restore();
@@ -807,7 +782,6 @@ impl Solver {
     /// Value every node under the reference strategy and return the root's
     /// slice. Leaves the reference reaches in place so a caller can read
     /// beliefs off the tree; it must `restore` when it is done.
-    #[cfg(test)]
     fn value_pass(&mut self) -> [Vec<f32>; 2] {
         // A root that stayed a leaf has no average strategy. The target is the
         // network's own answer at this position, which is what the leaf pass
@@ -849,7 +823,6 @@ impl Solver {
     /// network's own answer, so training on it would teach the network what it
     /// already said; an interior node's value comes from the subtree beneath
     /// it, which is the bootstrap the whole method rests on.
-    #[cfg(test)]
     fn harvest(&mut self, queries: usize) -> Solved {
         let value = self.value_pass();
         let queries = self.with_rng(|sv, rng| sv.sample_queries(rng, queries));
@@ -868,7 +841,6 @@ impl Solver {
     /// they are the belief states worth solving in their own right. Every one
     /// of them is a valued decision, which is both what the network is defined
     /// on and what a training row can carry, so no filtering is needed here.
-    #[cfg(test)]
     fn sample_queries(&self, rng: &mut Rng, want: usize) -> Vec<(State, [Belief; 2])> {
         if self.leaf_rows.is_empty() {
             return Vec::new();
@@ -883,7 +855,6 @@ impl Solver {
 
     /// Node `i`'s belief for each player, under whichever reaches are
     /// currently propagated.
-    #[cfg(test)]
     fn belief_at(&self, i: usize) -> [Belief; 2] {
         std::array::from_fn(|p| {
             let mut w = vec![0.0; self.nc[i][p] as usize];
@@ -903,7 +874,6 @@ impl Solver {
     /// induces. They are a function of the beliefs at the leaf, so a real
     /// deviation would move them, so this measures exploitability of the
     /// finite search game, not of the true War Chest continuation.
-    #[cfg(test)]
     pub fn nash_conv(&mut self) -> Conv {
         let reference = self.reference();
         let root = [self.root_belief[0].p.clone(), self.root_belief[1].p.clone()];
@@ -927,7 +897,6 @@ impl Solver {
     }
 
     /// The strategy the fixed-policy passes run under.
-    #[cfg(test)]
     fn reference(&self) -> Vec<f32> {
         assert!(
             !self.avg.is_empty(),
@@ -941,7 +910,6 @@ impl Solver {
     /// are consistent with `cur` and does not recompute them, so without this a
     /// solve that is read mid-flight — which is exactly what the solver-error
     /// harness does — would resume from another strategy's reaches.
-    #[cfg(test)]
     fn restore(&mut self) {
         self.precompute_reaches();
     }

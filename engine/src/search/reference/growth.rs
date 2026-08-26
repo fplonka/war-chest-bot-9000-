@@ -11,7 +11,6 @@ impl Solver {
     /// so without it a node deep behind an unlikely opponent line would look
     /// worthless next to its own siblings rather than being compared with
     /// them.
-    #[cfg(test)]
     fn puct_choice(&self, node: usize, row: std::ops::Range<usize>, opp: usize) -> Option<usize> {
         let so = self.soff[node] as usize;
         let reach = self.reach_of(node, opp);
@@ -42,7 +41,6 @@ impl Solver {
     /// only end on a leaf growth may not touch, and the simulation is then
     /// spent for nothing -- which is what a mature tree does to the whole of
     /// its remaining budget once its frontier stops being expandable.
-    #[cfg(test)]
     fn live_cell(&self, node: usize, cell: usize) -> bool {
         let n = &self.nodes[node];
         n.legal_trans[cell] != NO_TRANS && !self.nodes[n.legal_child[cell] as usize].exhausted
@@ -50,7 +48,6 @@ impl Solver {
 
     /// Fill the policy prior of every decision node that is ready for one, on
     /// this host. The device path sends `prime` instead.
-    #[cfg(test)]
     pub(super) fn refresh_priors(&mut self) {
         if self.net.is_empty() {
             return;
@@ -164,7 +161,6 @@ impl Solver {
     ///
     /// False when nothing grew, which is a spent budget, a trajectory that ran
     /// into a terminal, or a config with no legal action there.
-    #[cfg(test)]
     pub fn expand_once(&mut self) -> bool {
         let Some(leaf) = self.with_expand_rng(|sv, rng| sv.sample_leaf(rng)) else {
             return false;
@@ -181,7 +177,6 @@ impl Solver {
     /// one of those and its subgame runs to millions of nodes, so the bound is
     /// the caller's way of asking for the subgame only if it is small: a
     /// `false` means the tree it now holds is a partial one.
-    #[cfg(test)]
     pub fn grow_full(&mut self, cap: usize) -> bool {
         let mut at = 0usize;
         while at < self.nodes.len() {
@@ -213,7 +208,6 @@ impl Solver {
     /// `want * TRIES` draws is the bound, and it is why the loop terminates: a
     /// tree whose every reachable leaf has already been taken would otherwise
     /// draw for ever. A phase that spends it stops short of `want`.
-    #[cfg(test)]
     pub(super) fn expansion_phase(&mut self, want: usize, taken: &mut Vec<usize>) {
         let (mut got, mut draws) = (0usize, 0usize);
         self.with_expand_rng(|sv, rng| {
@@ -238,7 +232,6 @@ impl Solver {
     /// gives weight to. Their selection rule is half PUCT and half the CFR
     /// average; with no prior to compute PUCT from, this is the half that
     /// exists.
-    #[cfg(test)]
     fn sample_leaf(&mut self, rng: &mut Rng) -> Option<usize> {
         // A tree with nothing left to grow gets no trajectory at all, not even
         // the draws one would spend.
@@ -327,7 +320,6 @@ impl Solver {
     /// Not part of the engine's interface: it gives this solve the arenas in
     /// `a` and advances `seed` by the draws the phase makes.
     #[doc(hidden)]
-    #[cfg(test)]
     pub fn replay_expansion(&mut self, a: &Arenas, want: usize, taken: &mut Vec<usize>) {
         let cells = self.ncells;
         self.cur.copy_from_slice(&a.cur[..cells]);
