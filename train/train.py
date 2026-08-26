@@ -67,6 +67,7 @@ N_HEXES = warchest.N_HEXES
 # What `SolveFarm.collect` reports about the device rounds, cumulative
 # since the farm started. `rounds` is the denominator of the other three.
 ROUND_KEYS = ("rounds", "round_calls", "round_rows", "round_nanos", "budget_hits")
+RESUME_GRACE_ROWS = 100_000
 
 
 def action_feats(pa):
@@ -669,20 +670,36 @@ def refuse_if_machine_busy():
             f"CPU load {load:.1f} on {n} CPUs. Another run already going?")
 
 
-def write_log(args, epochs, snaps):
-    """The run's whole record: settings, per-epoch stats, snapshot manifest.
+def append_epoch(args, rec):
+    with open(f"{args.out}/epochs.jsonl", "a") as f:
+        f.write(json.dumps(rec, separators=(",", ":")) + "\n")
 
-    One file, rewritten in place, so `tools/arena.py` and `tools/monitor.py` have a
-    single thing to read and a run that is still going is readable at any
-    moment.
-    """
+
+def last_epoch(args):
+    try:
+        with open(f"{args.out}/epochs.jsonl", "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - (64 << 10)))
+            lines = f.read().splitlines()
+    except OSError:
+        return 0
+    for line in reversed(lines):
+        try:
+            return int(json.loads(line)["epoch"]) + 1
+        except (KeyError, TypeError, ValueError):
+            pass
+    return 0
+
+
+def write_log(args, snaps):
+    """Write settings and the snapshot manifest atomically."""
     path = f"{args.out}/log.json"
     tmp = path + ".tmp"
     cfg = dataclasses.asdict(args)
     cfg["resume"] = ""
     with open(tmp, "w") as f:
-        json.dump({"cfg": cfg, "epochs": epochs,
-                   "snapshots": snaps}, f, indent=1)
+        json.dump({"cfg": cfg, "snapshots": snaps}, f, indent=1)
+        f.write("\n")
     os.replace(tmp, path)
 
 
@@ -706,10 +723,15 @@ def main():
     name = over.pop("out", None)
     checkpoint = None
     if resume:
+        minutes = over.pop("minutes", None)
         if over:
-            raise SystemExit("resume accepts no changed training knobs")
+            raise SystemExit("resume only accepts a minutes extension")
         checkpoint = torch.load(resume, map_location="cpu", weights_only=False)
         args = config.Cfg(**checkpoint["cfg"])
+        if minutes is not None:
+            if minutes < args.minutes:
+                raise SystemExit("resume minutes cannot be reduced")
+            args = dataclasses.replace(args, minutes=minutes)
         expected = pathlib.Path(args.out)
         requested = pathlib.Path(name if name and name.startswith("runs/")
                                  else f"runs/{name}") if name else expected
@@ -841,7 +863,8 @@ def main():
     next_snap = float(checkpoint["next_snapshot"]) if checkpoint else snap_gap
     t0 = time.time() - elapsed
     epoch = int(checkpoint["epoch"]) if checkpoint else 0
-    log = checkpoint["epochs"] if checkpoint else []
+    if checkpoint:
+        epoch = max(epoch, last_epoch(args))
     # Fresh subgames per second over the whole ReBeL phase: the rate
     # docs/GPU_PERF_GOAL.md is about. Generation overlaps training, so
     # per-epoch `gen_s` is not it -- only cumulative solves over cumulative
@@ -876,9 +899,7 @@ def main():
     # how you ship a checkpoint chosen by a coin flip. The ladder rates all of
     # them at the end, off the clock.
     snaps = checkpoint["snapshots"] if checkpoint else []
-    saved_replay_rows = int(checkpoint["replay_rows"]) if checkpoint else 0
-    grace_rows = (min(saved_replay_rows, 2 * args.batch)
-                  if checkpoint else 0)
+    grace_rows = RESUME_GRACE_ROWS if checkpoint else 0
     if checkpoint:
         gib = args.cap * (ROW_BYTES + 40 + args.cfgs_per_row * 20
                           + 24 * ACT_BYTES + 96 * 6) / (1 << 30)
@@ -893,7 +914,7 @@ def main():
     def snapshot(label, el):
         # "init" and "final" are the two the reader always wants named; the rest
         # are numbered, and the manifest carries the time each was taken at.
-        path = f"{args.out}/snap_{len(snaps):02d}.pt"
+        path = f"{args.out}/snap_{len(snaps):04d}.pt"
         entry = {"label": label, "t": round(el, 1),
                  "file": os.path.basename(path)}
         snaps.append(entry)
@@ -910,11 +931,9 @@ def main():
             "elapsed": float(el),
             "next_snapshot": float(el + snap_gap),
             "epoch": epoch,
-            "epochs": log,
             "snapshots": snaps,
             "progress": progress,
             "cap_value": cap_v,
-            "replay_rows": len(buf),
             "cfg": cfg,
             "t": round(el, 1),
             "label": label,
@@ -924,6 +943,7 @@ def main():
         tmp = path + ".tmp"
         torch.save(state, tmp)
         os.replace(tmp, path)
+        write_log(args, snaps)
         print(f"[t={el:6.1f}s] --- snapshot {snaps[-1]['file']} ({label}) ---", flush=True)
 
     def tick(rec=None, line=None):
@@ -934,8 +954,7 @@ def main():
             rec.setdefault("epoch", epoch)
             rec.setdefault("buf", len(buf))
             rec.setdefault("lr", opt.param_groups[0]["lr"])
-            log.append(rec)
-            write_log(args, log, snaps)
+            append_epoch(args, rec)
             print(line, flush=True)
         epoch += 1
         now = time.time()
@@ -984,6 +1003,9 @@ def main():
         optimizer_rows = int(progress["optimizer_rows"])
         optimizer_steps = int(progress["optimizer_steps"])
         generated_rows = int(progress["generated_rows"])
+        debt_generated_rows = generated_rows
+        debt_optimizer_rows = optimizer_rows
+        grace_active = bool(grace_rows)
         window = collections.Counter()
         totals = collections.Counter(progress["totals"])
         window_shapes = []
@@ -1046,18 +1068,26 @@ def main():
                     "white_wins", "black_wins", "draws",
                     "plays_attack", "plays_pass", "plays_deploy",
                     "plays_bolster", "plays_maneuver", "plays_recruit",
-                    "plays_claim_initiative", "configs", "query_rows"):
+                    "plays_claim_initiative", "configs", "query_rows", "dropped"):
                 amount = int(data.get(name, 0))
                 totals[name] += amount
                 window[name] += amount
-            # Stay at the full payoff until a game finishes; then scale by the
-            # fraction of this window that still died at the play cap.
+            # The horizon payoff only ratchets down. A clean window cannot
+            # restore confidence lost to an earlier horizon wave.
             if window["games"]:
-                cap_v = args.cap_value * (window["horizon_hits"] / window["games"])
+                candidate = args.cap_value * (window["horizon_hits"] / window["games"])
+                cap_v = min(cap_v, candidate)
                 warchest.set_cap_value(cap_v)
 
-            debt = max(0.0, args.replay_ratio * generated_rows - optimizer_rows)
             regenerating = len(buf) < grace_rows
+            if not regenerating and grace_active:
+                debt_generated_rows = generated_rows
+                debt_optimizer_rows = optimizer_rows
+                grace_active = False
+            debt = max(
+                0.0,
+                args.replay_ratio * (generated_rows - debt_generated_rows)
+                - (optimizer_rows - debt_optimizer_rows))
             nsteps = (int(debt // args.batch)
                       if len(buf) >= args.batch and not regenerating else 0)
             lv, train_s, train_stat = fit(nsteps, deadline)
@@ -1101,6 +1131,8 @@ def main():
                 # pick the new weights up at their next chunk.
                 value.push()
                 target_state = cpu_state(value)
+                if len(buf) >= 2048:
+                    probe = batcher(buf.sample(2048, diag_rng), diag_rng, dev)
                 print(
                     f"[t={now - t0:6.1f}s] --- target network refresh ---",
                     flush=True)
@@ -1286,6 +1318,7 @@ def main():
                 # Rows the query solver produced, i.e. targets taken off
                 # the line of play. Zero means the coverage path is dead.
                 "query_rows": int(window["query_rows"]),
+                "dropped": int(window["dropped"]),
                 "plays": {
                     name: int(window[f"plays_{name}"])
                     for name in (
@@ -1298,8 +1331,9 @@ def main():
                 "optimizer_steps": optimizer_steps,
                 "optimizer_rows": optimizer_rows,
                 "optimizer_debt": round(
-                    max(0.0, args.replay_ratio * generated_rows
-                        - optimizer_rows), 1),
+                    max(0.0,
+                        args.replay_ratio * (generated_rows - debt_generated_rows)
+                        - (optimizer_rows - debt_optimizer_rows)), 1),
                 "replay_rows": generated_rows,
                 "rows_per_s": round(
                     generated_rows / max(sog_elapsed, 1e-9), 1),
@@ -1456,7 +1490,6 @@ def main():
     run_search_pipeline()
 
     snapshot("final", time.time() - t0)
-    write_log(args, log, snaps)
     if args.ladder_games:
         # Every snapshot becomes an immutable bot for the ladder, and a bot
         # solves on whatever cards it finds. A ladder is thousands of solves at

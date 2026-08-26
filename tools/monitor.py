@@ -5,8 +5,7 @@
     python3 tools/monitor.py --pull
 
 There is no generated page on disk and no regeneration step: a run in progress
-is a log.json with fewer epochs in it than it will have in a minute, and it
-renders exactly like a finished one.
+appends epochs.jsonl and renders exactly like a finished one.
 """
 import argparse
 import glob
@@ -31,13 +30,12 @@ sys.path.insert(0, os.path.join(HERE, "train"))
 import config  # noqa: E402  -- knobs(), so the baseline lives in one place
 
 CI95 = 1.96   # ladder.json stores the 1-sigma Bradley-Terry SE
-LIVE = 120    # a log.json untouched for this long is not a live run
+LIVE = 120    # an epoch log untouched for this long is not a live run
+EPOCH_LIMIT = 2048
 
 
 def read_json(path):
-    """A JSON object, or None. An rsync caught mid-transfer hands us half a
-    file, and the oldest runs wrote log.json as a bare list of epochs; neither
-    is worth a 500, and neither has anything to draw."""
+    """A complete JSON object, or None if a pull caught it mid-write."""
     try:
         with open(path) as f:
             got = json.load(f)
@@ -55,6 +53,67 @@ def read_text(path, limit=64 << 10):
             return f.read().decode("utf-8", "replace")
     except OSError:
         return ""
+
+
+def jsonl_record(raw):
+    try:
+        got = json.loads(raw)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return got if isinstance(got, dict) else None
+
+
+def last_jsonl(path):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - (64 << 10)))
+            lines = f.read().splitlines()
+    except OSError:
+        return {}
+    for raw in reversed(lines):
+        got = jsonl_record(raw)
+        if got is not None:
+            return got
+    return {}
+
+
+def read_epochs(path, limit=EPOCH_LIMIT):
+    """Read all small logs, or evenly sample a large JSONL log by byte offset."""
+    if limit <= 0:
+        return []
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            if not size:
+                return []
+            if size <= (8 << 20):
+                f.seek(0)
+                return [got for raw in f
+                        if (got := jsonl_record(raw)) is not None]
+            out, starts = [], set()
+            for i in range(limit):
+                offset = size * i // limit
+                f.seek(offset)
+                if offset:
+                    f.readline()
+                start = f.tell()
+                got = jsonl_record(f.readline())
+                if got is not None and start not in starts:
+                    starts.add(start)
+                    out.append(got)
+            f.seek(max(0, size - (64 << 10)))
+            last = next((got for raw in reversed(f.read().splitlines())
+                         if (got := jsonl_record(raw)) is not None), None)
+            if last is not None:
+                if len(out) == limit:
+                    out[-1] = last
+                elif not out or out[-1] != last:
+                    out.append(last)
+            return out
+    except OSError:
+        return []
 
 
 def finite(v):
@@ -225,7 +284,7 @@ def health(eps):
            ("solves", f"{tot('solves'):,}"),
            ("solves/s", f"{last.get('solves_per_s', 0):.0f}"),
            ("buffer", f"{last.get('buf', 0):,}"),
-           ("dropped solves", f"{tot('dropped'):,}"),
+           ("dropped queries", f"{tot('dropped'):,}"),
            ("games cut at horizon", f"{horizon:.1f}%")]
     if "aux_loss" in last:
         out.append(("aux ownership ce / accuracy",
@@ -259,17 +318,20 @@ SUMMARY = {}   # name -> (mtime, entry): the mtime check is the whole cache
 
 
 def index(runs_dir):
-    """One line per run. Re-reading 150 log.json files every three seconds is
-    the only thing here worth avoiding, and an mtime settles it."""
+    """One line per run. The epoch log mtime is the live-run signal."""
     out = []
     for path in glob.glob(os.path.join(runs_dir, "*", "log.json")):
-        name, mt = os.path.basename(os.path.dirname(path)), os.path.getmtime(path)
+        name = os.path.basename(os.path.dirname(path))
+        epoch_path = os.path.join(os.path.dirname(path), "epochs.jsonl")
+        mt = max(os.path.getmtime(path),
+                 os.path.getmtime(epoch_path) if os.path.exists(epoch_path) else 0)
         hit = SUMMARY.get(name)
         if not hit or hit[0] != mt:
             log = read_json(path) or {}
-            eps = log.get("epochs") or []
-            last = eps[-1] if eps else {}
-            hit = (mt, {"name": name, "mtime": mt, "epochs": len(eps),
+            last = last_jsonl(epoch_path)
+            epoch = last.get("epoch", -1)
+            hit = (mt, {"name": name, "mtime": mt,
+                        "epochs": int(epoch) + 1 if isinstance(epoch, (int, float)) else 0,
                         "phase": last.get("phase", ""),
                         "minutes": round(last.get("t", 0) / 60.0),
                         "note": (log.get("cfg") or {}).get("note", "")})
@@ -285,8 +347,9 @@ def detail(runs_dir, name):
     log = read_json(os.path.join(path, "log.json")) or {}
     # Epochs that generated nothing are the drain at the end of a run: they
     # report loss 0 and a handful of solves, and plotting them drags every
-    # curve to the floor in its final pixel.
-    eps = [e for e in log.get("epochs") or []
+    # curve to the floor in its final pixel. Large logs are sampled before
+    # parsing, so a dashboard request never loads the whole run.
+    eps = [e for e in read_epochs(os.path.join(path, "epochs.jsonl"))
            if e.get("phase") == "sog" and e.get("solves", 0) > 0
            and e.get("steps", 1) > 0]
     cfg = log.get("cfg") or {}

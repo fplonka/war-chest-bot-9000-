@@ -798,7 +798,8 @@ def pack(run, binary, out_dir, snapshot=None, name=None):
     import shutil
 
     import torch
-    from export_weights import write_bin, load
+    from export_weights import write_bin
+    from value_net import Net
 
     if not Path(binary).exists():
         raise SystemExit(f"{binary} does not exist. Build it:\n"
@@ -817,6 +818,8 @@ def pack(run, binary, out_dir, snapshot=None, name=None):
     for snap in snaps:
         checkpoint = torch.load(run / snap["file"], map_location="cpu",
                                 weights_only=False)
+        net = Net()
+        net.load_state_dict(checkpoint["value"])
         search = {"s": cfg.get("s", 512),
                   "c": cfg.get("c", 8.0),
                   "rounds": cfg.get("rounds", 0),
@@ -824,7 +827,7 @@ def pack(run, binary, out_dir, snapshot=None, name=None):
         bot = name or f"{run.name}.{snap['label']}"
         directory = out_dir / bot
         directory.mkdir(parents=True, exist_ok=True)
-        write_bin(load(run / snap["file"]), directory / "weights.bin")
+        write_bin(net, directory / "weights.bin")
         shutil.copy2(binary, directory / "bot")
         (directory / "bot.json").write_text(json.dumps({
             "name": bot,

@@ -72,10 +72,11 @@ pull)
     filters=(--exclude '*.tmp')
     if [ -z "$name" ]; then
         filters+=(--include '*/' --include '*.html' --include 'plotly.min.js'
-                  --include 'log.json' --include 'ladder*.json' --include 'config.json'
+                  --include 'log.json' --include 'epochs.jsonl'
+                  --include 'ladder*.json' --include 'config.json'
                   --include 'NOTES.md' --include 'train.log' --exclude '*')
     fi
-    # `*.tmp` is a live run writing log.json atomically; rsync would list it,
+    # `*.tmp` is a live run writing a snapshot or log.json atomically; rsync would list it,
     # find it replaced, and exit 24 mid-run.
     mkdir -p "$local_dir/runs${name:+/$name}"
     rsync -az -e "ssh ${ssh_opts[*]}" "${filters[@]}" \
@@ -155,7 +156,7 @@ go)
     done
     [ -n "$out" ] || { echo "go needs out=<name>" >&2; exit 1; }
     "$0" sync
-    "$0" start "$out" bash -c "($build_script) && exec python train/train.py $(printf '%q ' "$@")"
+    "$0" start "$out" bash -c "($build_script) && exec bash tools/resume_train.sh $(printf '%q ' "$@")"
     "$0" follow "$out" "$out"
     ;;
 "")  sed -n '2,9p' "$0" ;;

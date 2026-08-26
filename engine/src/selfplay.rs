@@ -187,6 +187,8 @@ pub struct Data {
     /// Rows that came from the query solver rather than from a self-play
     /// decision. Off the line of play, so this is the coverage term.
     pub queries: usize,
+    /// Query nominations discarded because the stream queue was full.
+    pub dropped: usize,
 }
 
 impl Data {
@@ -232,6 +234,7 @@ impl Data {
         self.cap_hits += o.cap_hits;
         self.configs += o.configs;
         self.queries += o.queries;
+        self.dropped += o.dropped;
     }
 
     /// Mark the start of a solve's rows. One call per solve, before its rows
@@ -690,9 +693,9 @@ impl SolveKind {
     pub const NAMES: [&'static str; 2] = ["play", "query"];
 }
 
-/// How many queued queries one stream will hold. At the intended rates the
-/// queue is stationary; the cap also prevents an accidental queue runaway.
-const QUEUE_CAP: usize = 4096;
+/// How many queued queries one stream will hold. A bounded queue keeps a
+/// random-walk backlog from becoming an unbounded host allocation.
+const QUEUE_CAP: usize = 64;
 
 impl GameStream {
     pub fn new(seed: u64, gc: GameCfg) -> GameStream {
@@ -761,12 +764,12 @@ impl GameStream {
             SolveKind::Play => {
                 self.game.play_solved(sv, solved);
                 let queued = self.game.take_queries();
-                self.enqueue(queued);
+                out.dropped += self.enqueue(queued);
                 out.merge(self.game.take_ready());
             }
             SolveKind::Query => {
                 let more = keep_query(sv, solved, out);
-                self.enqueue(more);
+                out.dropped += self.enqueue(more);
             }
         }
     }
@@ -783,19 +786,17 @@ impl GameStream {
     fn end_game(&mut self, out: &mut Data) {
         self.game.finish();
         let queued = self.game.take_queries();
-        self.enqueue(queued);
+        out.dropped += self.enqueue(queued);
         out.merge(self.game.take_data());
         self.game = Game::new(Rng::new(worker_seed(self.seed, self.game_index)), &self.gc);
         self.game_index += 1;
     }
 
-    fn enqueue(&mut self, qs: Vec<(State, [Belief; 2])>) {
-        for q in qs {
-            if self.pending.len() >= QUEUE_CAP {
-                break;
-            }
-            self.pending.push_back(q);
-        }
+    fn enqueue(&mut self, qs: Vec<(State, [Belief; 2])>) -> usize {
+        let n = qs.len();
+        let room = QUEUE_CAP.saturating_sub(self.pending.len());
+        self.pending.extend(qs.into_iter().take(room));
+        n.saturating_sub(room)
     }
 }
 

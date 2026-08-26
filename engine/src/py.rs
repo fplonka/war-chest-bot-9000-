@@ -600,6 +600,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     out.set_item("horizon_hits", d.cap_hits)?;
     out.set_item("configs", d.configs)?;
     out.set_item("query_rows", d.queries)?;
+    out.set_item("dropped", d.dropped)?;
     out.set_item("plays_attack", d.plays[0])?;
     out.set_item("plays_pass", d.plays[1])?;
     out.set_item("plays_deploy", d.plays[2])?;
