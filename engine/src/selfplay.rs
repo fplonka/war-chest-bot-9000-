@@ -1096,8 +1096,8 @@ mod target_tests {
     /// `p_td1 = 1` makes every self-play row take the TD(1) target, so this
     /// pins three things at once. *Placement*: one entry a seat a row, at the
     /// config that seat was really holding, and every config nobody held keeps
-    /// the search value it had. *Sign*: a row stores a value per player, so
-    /// White's entry and Black's are that player's own utility and must cancel.
+    /// the search value it had. *Sign*: a row stores White's outcome once;
+    /// Black's outcome is its negation, and the two target entries cancel.
     /// *Reach*: a query row sitting in the same buffer is off the line of play
     /// and belongs to no game, so nothing may be written to it.
     #[test]
@@ -1145,6 +1145,8 @@ mod target_tests {
         let d = g.take_data();
         assert!(d.nv > 0, "a whole game stored no rows");
         assert_eq!(d.queries, 0, "a query row reached a game");
+        assert!(d.columns.source.iter().all(|&source| source == SOURCE_PLAY));
+        assert!(d.columns.outcome.iter().all(|&outcome| outcome == z[0]));
 
         let mut written = 0usize;
         for r in 0..d.nv {
@@ -1171,6 +1173,7 @@ mod target_tests {
             "the game's outcome was written into a query row"
         );
         assert_eq!(out.columns.source[0], SOURCE_QUERY);
+        assert_eq!(out.columns.truth[0], [0; 2]);
         assert_eq!(out.columns.outcome[0], 0.0);
 
         // And on the path a run actually drives: while an outcome is owed, the
