@@ -323,8 +323,11 @@ def index(runs_dir):
     for path in glob.glob(os.path.join(runs_dir, "*", "log.json")):
         name = os.path.basename(os.path.dirname(path))
         epoch_path = os.path.join(os.path.dirname(path), "epochs.jsonl")
-        mt = max(os.path.getmtime(path),
-                 os.path.getmtime(epoch_path) if os.path.exists(epoch_path) else 0)
+        try:
+            epoch_mt = os.path.getmtime(epoch_path)
+        except OSError:
+            epoch_mt = 0
+        mt = max(os.path.getmtime(path), epoch_mt)
         hit = SUMMARY.get(name)
         if not hit or hit[0] != mt:
             log = read_json(path) or {}

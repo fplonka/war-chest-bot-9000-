@@ -686,7 +686,7 @@ def last_epoch(args):
     for line in reversed(lines):
         try:
             return int(json.loads(line)["epoch"]) + 1
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, UnicodeDecodeError, ValueError):
             pass
     return 0
 
