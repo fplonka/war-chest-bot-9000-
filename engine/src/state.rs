@@ -13,7 +13,7 @@ pub const WIN_MARKERS: u8 = 6;
 pub const MAX_MAIN_PLAYS: u16 = 256;
 /// Default value of one control marker of lead when the horizon is reached.
 /// A zero value is the real game's payoff: a horizon is a draw. Training
-/// deliberately overrides it and anneals that temporary curriculum to zero.
+/// overrides it with its fixed configured payoff.
 pub const CAP_MARKER_VALUE_DEFAULT: f32 = 0.0;
 
 /// The value in flight, as bits: an `AtomicF32` is not a thing.
@@ -26,8 +26,7 @@ pub fn cap_marker_value() -> f32 {
     f32::from_bits(CAP_MARKER_VALUE.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Set the horizon payoff. The trainer anneals this toward 0 once the fraction
-/// of games reaching the horizon falls, so the distortion is temporary.
+/// Set the horizon payoff. Training sets this once for the run.
 pub fn set_cap_marker_value(v: f32) {
     CAP_MARKER_VALUE.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }

@@ -7,9 +7,8 @@ become roots for solves of their own, which is how the value function becomes
 accurate away from the line of play.
 
 There is a short greedy warm start. A game that reaches the play cap scores
-`cap_value * delta_markers`, the win condition graded rather than an invented
-evaluation. The payoff fades with the fraction of finished games that hit the
-horizon; evaluation always runs on the real game.
+`cap_value * delta_markers`, the fixed win condition graded rather than an
+invented evaluation. Evaluation always runs on the real game.
 
 Generation runs in Rust across all CPU cores while the previous batch trains
 on the GPU. Python publishes weights between generation batches.
@@ -862,11 +861,10 @@ def main():
     sog_t0 = (t0 + progress["sog_start"]
               if progress["sog_start"] is not None else None)
     sog_solves = int(progress["sog_solves"])
-    # The marker-differential payoff at the horizon distorts the game being
-    # solved, so it tracks the recent fraction of finished games that hit the
-    # horizon. Evaluation always runs on the real game (value 0).
-    cap_v = float(checkpoint["cap_value"]) if checkpoint else args.cap_value
-    warchest.set_cap_value(cap_v)
+    next_decay = int(progress["next_decay"])
+    # The marker-differential payoff is fixed during training. Evaluation runs
+    # on the real game (value 0).
+    warchest.set_cap_value(args.cap_value)
     probe = None
 
     # Snapshots are archival only. Evaluate the packed bots separately after
@@ -906,7 +904,7 @@ def main():
             "epoch": epoch,
             "snapshots": snaps,
             "progress": progress,
-            "cap_value": cap_v,
+            "cap_value": args.cap_value,
             "cfg": cfg,
             "t": round(el, 1),
             "label": label,
@@ -953,7 +951,7 @@ def main():
 
     def run_search_pipeline():
         """Overlap small GT-CFR batches with each other and with training."""
-        nonlocal probe, cap_v, sog_solves, target_state
+        nonlocal probe, next_decay, sog_solves, target_state
 
         deadline = t0 + total
         if time.time() >= deadline:
@@ -1046,13 +1044,6 @@ def main():
                 amount = int(data.get(name, 0))
                 totals[name] += amount
                 window[name] += amount
-            # The horizon payoff only ratchets down. A clean window cannot
-            # restore confidence lost to an earlier horizon wave.
-            if window["games"]:
-                candidate = args.cap_value * (window["horizon_hits"] / window["games"])
-                cap_v = min(cap_v, candidate)
-                warchest.set_cap_value(cap_v)
-
             regenerating = len(buf) < grace_rows
             if not regenerating and grace_active:
                 debt_generated_rows = generated_rows
@@ -1290,7 +1281,7 @@ def main():
                         "maneuver", "recruit", "claim_initiative")
                 },
                 "configs": round(window["configs"] / dec, 1),
-                "cap_value": round(cap_v, 4),
+                "cap_value": round(args.cap_value, 4),
                 "steps": steps,
                 "optimizer_steps": optimizer_rows // args.batch,
                 "optimizer_rows": optimizer_rows,

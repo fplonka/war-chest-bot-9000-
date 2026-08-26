@@ -916,7 +916,7 @@ fn prof_dump() {
     crate::prof::dump_work();
 }
 
-/// Set the horizon payoff per marker of lead. The trainer anneals it to 0.
+/// Set the fixed training payoff per marker of lead.
 #[pyfunction]
 fn set_cap_value(v: f32) {
     crate::state::set_cap_marker_value(v);
