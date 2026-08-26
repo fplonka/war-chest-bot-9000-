@@ -18,8 +18,8 @@ for the configured rates, and restore the contract test invariant.
 - Stored truth at row creation and captured one creation timestamp per solve.
 - Synced the dirty worktree to `/workspace/warchest-querytidy`.
 - Focused GPU tests and the default run are queued behind existing box jobs.
-- Rebased onto the latest `redesign`; `tools/box.sh sync` now installs the
-  owner-checked queue tool.
+- Rebased onto the latest `redesign`; local `tools/box.sh` now matches its
+  owner-checked queue tool. Re-sync is pending until the driver pause ends.
 - The queue is behind other workers' `probe_rr16` and `onepath-*` jobs, which
   remain untouched. The session's v3 gates are still queued.
 - Driver correction: `b256_125_vs_v5` and `b256_125_vs_v5b` were foreign
