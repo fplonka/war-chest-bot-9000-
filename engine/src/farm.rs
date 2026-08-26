@@ -358,10 +358,10 @@ pub enum Backend {
 }
 
 impl Backend {
-    pub fn run(&self, calls: &[Call], #[allow(unused)] card: usize) -> Option<Vec<Reply>> {
+    pub fn run(&self, _calls: &[Call], #[allow(unused)] card: usize) -> Option<Vec<Reply>> {
         match self {
             #[cfg(feature = "gpu")]
-            Backend::Cuda(d) => d.run(calls, card),
+            Backend::Cuda(d) => d.run(_calls, card),
             #[cfg(not(feature = "gpu"))]
             _ => unreachable!(),
         }
@@ -429,10 +429,10 @@ impl Backend {
     /// Evaluate with new weights from here on. The backend itself survives:
     /// rebuilding it would tear down a CUDA context and recompile every kernel
     /// for a change that touches three arrays.
-    pub fn set_net(&mut self, net: Net) -> Result<(), String> {
+    pub fn set_net(&mut self, _net: Net) -> Result<(), String> {
         match self {
             #[cfg(feature = "gpu")]
-            Backend::Cuda(d) => d.set_weights(net),
+            Backend::Cuda(d) => d.set_weights(_net),
             #[cfg(not(feature = "gpu"))]
             _ => unreachable!(),
         }
