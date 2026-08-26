@@ -1332,7 +1332,8 @@ pub struct Solver {
     // the belief block `xb` and the join output `h` are rewritten
     // per iteration. That split is the whole architecture: the trunk runs
     // ~2,000 times a solve and the join ~158,000.
-    /// Non-terminal leaves in node order — the rows of the network batch.
+    /// Non-terminal network rows in node order. Grown rows stay in this batch
+    /// for policy work; `leaf_query_rows` selects the live leaves.
     pub leaf_rows: Vec<usize>,
     /// Per traverser: how many leaf rows `HostCfr::vcache` holds a network
     /// value for. Rows past it are the ones growth has added since the last
@@ -1691,15 +1692,27 @@ impl Solver {
         })
     }
 
+    /// The network batch keeps rows after growth so its policy head can use
+    /// them, but only live leaves are query roots. This view is the event
+    /// universe sampled by both backends.
+    fn leaf_query_rows(&self, from: usize) -> Vec<usize> {
+        self.leaf_rows[from..]
+            .iter()
+            .copied()
+            .filter(|&node| self.nodes[node].leaf)
+            .collect()
+    }
+
     /// Record the host network's query rows before either traverser's update.
     /// Both traversers query the same two beliefs in a simultaneous iteration.
     fn record_host_queries(&mut self, from: usize) {
         if self.nets.value.is_empty() {
             return;
         }
-        let selected = self.plan_query_events(self.leaf_rows.len() - from);
+        let rows = self.leaf_query_rows(from);
+        let selected = self.plan_query_events(rows.len());
         for e in selected {
-            let node = self.leaf_rows[from + e];
+            let node = rows[e];
             self.queries.push((self.states[node].clone(), self.belief_at(node)));
         }
     }
@@ -1707,8 +1720,11 @@ impl Solver {
     /// Finish the device round's selected queries from the reach snapshots it
     /// returned. Their nodes were retained when the round was planned.
     fn absorb_queries(&mut self, reach: &[f32]) {
+        let query_nodes = std::mem::take(&mut self.query_nodes);
+        let non_leaf = query_nodes.iter().filter(|&&node| !self.nodes[node].leaf).count();
+        debug_assert_eq!(non_leaf, 0, "query sampler selected {non_leaf} non-leaf nodes");
         let mut cut = 0;
-        for node in std::mem::take(&mut self.query_nodes) {
+        for node in query_nodes {
             let beliefs = std::array::from_fn(|p| {
                 let n = self.nc[node][p] as usize;
                 let mut w = vec![0.0; n];
@@ -2192,13 +2208,8 @@ impl Solver {
         debug_assert!(!s.is_terminal(), "a terminal has nothing to grow");
         let cfgs = self.nodes[id].cfgs.clone();
         self.nodes[id].leaf = false;
-        // The node keeps its row in the network batch, which is now spent on a
-        // value nobody reads: `backprop` decides leafhood from the node and
-        // recomputes an interior node from its children, so the stale readout
-        // is overwritten. Retiring the row would mean compacting the batch or
-        // carrying a liveness mask through every per-iteration loop, to save
-        // the interior-node share of the rows -- about one in twenty at this
-        // branching factor. Not worth either.
+        // The network batch is append-only because its policy head still needs
+        // this row. Query sampling filters it out now that it is interior.
         let player = s.to_act();
         // A draw is walked through: the outcome is private, so the public tree
         // does not branch. Round-start draws collapse over a whole run; a
@@ -3486,13 +3497,14 @@ impl Solver {
         // nodes whose prior the card is to fill, which it does between the
         // scatter and the iteration that reads it.
         calls.push(self.tree_call());
-        let rows = self.leaf_rows.len();
+        let query_rows = self.leaf_query_rows(0);
+        let rows = query_rows.len();
         let selected = self.plan_query_events(done * rows);
-        self.query_nodes = selected.iter().map(|&e| self.leaf_rows[e % rows]).collect();
+        self.query_nodes = selected.iter().map(|&e| query_rows[e % rows]).collect();
         let query = selected
             .into_iter()
             .map(|e| {
-                let node = self.leaf_rows[e % rows];
+                let node = query_rows[e % rows];
                 QueryPick {
                     iter: (e / rows) as u32,
                     reach: self.roff[node],

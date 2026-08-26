@@ -452,8 +452,8 @@ impl RoundCap {
             z: TILE * D,
             input: TILE * (2 * C + LOOSE),
             leaves: n * s.max(1) as usize,
-            // One full-support query per resident solve. The normal rates keep
-            // at most one row; smaller supports leave room for more.
+            // The rate contract keeps at most one full-support query per
+            // resident solve.
             queries: n * b.configs,
             piles: TILE * NTYPE * PILE_COUNTS,
             tokens: TILE * NTYPE * TYPE,

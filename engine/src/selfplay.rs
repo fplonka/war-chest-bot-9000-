@@ -344,10 +344,11 @@ pub struct GameCfg {
     /// as roots of their own — Student of Games' `q_search`. A search only
     /// tells us the value at the state it was rooted at, so this is what makes
     /// the network accurate at the leaves it is actually asked about, rather
-    /// than only along the line of play.
+    /// than only along the line of play. It must be in `[0, 1]`.
     pub query_rate: f32,
     /// The same, drawn from a query's own solve — `q_recursive`. Kept well
-    /// below `query_rate` so the queue cannot run away from self-play.
+    /// below `query_rate` so the queue cannot run away from self-play. It must
+    /// be in `[0, 1]`.
     pub recursive_rate: f32,
 }
 
@@ -370,8 +371,11 @@ pub struct Game {
 
 /// A rate like "0.9 queries per search", drawn into a whole number.
 fn draw_count(rng: &mut Rng, rate: f32) -> usize {
-    let whole = rate.max(0.0).floor();
-    whole as usize + (rng.unit_f64() < (rate - whole) as f64) as usize
+    assert!(
+        rate.is_finite() && (0.0..=1.0).contains(&rate),
+        "query rate must be finite and in [0, 1], got {rate}"
+    );
+    (rng.unit_f64() < rate as f64) as usize
 }
 
 /// A solve of one queued belief state, as a root in its own right.
@@ -689,8 +693,7 @@ impl SolveKind {
 }
 
 /// How many queued queries one stream will hold. At the intended rates the
-/// queue is stationary, so this only bounds the damage if a run is configured
-/// with `query_rate` above one.
+/// queue is stationary; the cap also prevents an accidental queue runaway.
 const QUEUE_CAP: usize = 4096;
 
 impl GameStream {

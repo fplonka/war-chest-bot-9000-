@@ -578,6 +578,16 @@ fn cfr_of(name: &str) -> PyResult<Cfr> {
     })
 }
 
+fn rate(name: &str, value: f32) -> PyResult<f32> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{name} must be finite and in [0, 1], got {value}"
+        )))
+    }
+}
+
 fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
     let out = PyDict::new_bound(py);
     out.set_item("nv", d.nv)?;
@@ -676,6 +686,8 @@ impl SolveFarm {
         devices: Vec<usize>,
         roots: Option<&str>,
     ) -> PyResult<SolveFarm> {
+        let query_rate = rate("query_rate", query_rate)?;
+        let recursive_rate = rate("recursive_rate", recursive_rate)?;
         let cfg = Cfg { s, c, batch, rounds, cfr: cfr_of(cfr)?, budget: Budget::for_s(s), ..Default::default() };
         // A corpus makes this a bench rather than a run: the same roots in the
         // same order, so the mix of solve costs in flight does not drift.
@@ -859,6 +871,8 @@ fn save_roots(
     recursive_rate: f32,
     cpu: bool,
 ) -> PyResult<usize> {
+    let query_rate = rate("query_rate", query_rate)?;
+    let recursive_rate = rate("recursive_rate", recursive_rate)?;
     if !cpu {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "save_roots uses CPU search; pass cpu=True to accept the ~50x slower path",

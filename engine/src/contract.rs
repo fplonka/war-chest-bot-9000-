@@ -1053,7 +1053,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert!(checked > 0, "no nodes described");
+        assert!(checked > 4, "only {checked} nodes described");
     }
 
     /// Every node of a level must have its parent in an earlier one.
