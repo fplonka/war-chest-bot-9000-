@@ -135,7 +135,7 @@ def main():
 
     try:
         compiled = torch.compile(losses, mode="default", dynamic=True)
-        empty_policy = tuple(value[:0] for value in policy[:6]) + (0,)
+        empty_policy = tuple(item[:0] for item in policy[:6]) + (0,)
         warm_batch = (*batch[:6], empty_policy)
 
         def compiled_warm():
