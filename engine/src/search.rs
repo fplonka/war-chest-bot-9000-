@@ -546,7 +546,6 @@ impl StopReason {
     ];
 }
 
-
 /// How well a solve came out, in two numbers that are read together.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
@@ -1477,8 +1476,6 @@ impl Solver {
         sv
     }
 
-
-
     /// Pin this solve to one of a card's solve slots.
     ///
     /// The card keeps a solve's board vectors, config rows and CFR arenas
@@ -1918,7 +1915,6 @@ impl Solver {
         }
     }
 
-
     // ------------------------------------------------------------ tree build
 
     /// Turn leaf `id` into a decision node, its children pushed as leaves.
@@ -2246,9 +2242,6 @@ impl Solver {
 
     // -------------------------------------------------------------- CFR core
 
-
-
-
     /// One leaf's public encoding, interned: the board it reads.
     ///
     /// A row, not two. The board is public and the trunk reads the physical
@@ -2349,8 +2342,6 @@ impl Solver {
         self.cmap.insert(key, i);
         i
     }
-
-
 
     /// The network calls the last growth made necessary: the trunk over fresh
     /// leaves, the encoder over fresh configs. Empty when nothing grew.
@@ -2475,19 +2466,8 @@ impl Solver {
         }
     }
 
-    /// Consume the replies this solve was waiting for, do the host's share of
-    /// the work, and say what it wants next.
-    ///
-    /// The host's share is growth, which is the game's rules: it turns the
-    /// leaves an expansion sampled into decision nodes. Everything else is a
-    /// call. The solve owns its whole state, so nothing about it blocks a
-    /// thread -- it can sit in a queue between two rounds and be picked up on
-    /// whichever core comes free.
-    pub fn advance(&mut self, replies: &[Reply]) -> Step {
-        self.advance_on_device(replies)
-    }
-
-    /// The same search, with the CFR loop on the backend.
+    /// Consume the replies this solve was waiting for and request its next
+    /// CUDA round.
     ///
     /// The host keeps growth and nothing else: growth is the game rules, so it
     /// turns the leaves an expansion sampled into decision nodes and describes
@@ -2511,7 +2491,7 @@ impl Solver {
     /// in the last bits — so two whole solves still build different trees.
     /// `cuda_parity` holds the rule to the card by giving the host the card's
     /// own arenas.
-    fn advance_on_device(&mut self, replies: &[Reply]) -> Step {
+    pub fn advance(&mut self, replies: &[Reply]) -> Step {
         match self.phase {
             Phase::Fresh => {}
             Phase::Iterating => {
@@ -2752,8 +2732,6 @@ impl Solver {
         self.resent = resealed;
     }
 
-
-
     /// The decision nodes that are ready for a policy prior: the batch has
     /// reached their board vector and nothing has given them one yet.
     ///
@@ -2824,9 +2802,6 @@ impl Solver {
         (prime, acts, cells)
     }
 
-
-
-
     /// The root's action list and its average policy, per acting config.
     ///
     /// Read off `avg`, which `finish` materialised — so this is the reference
@@ -2866,22 +2841,6 @@ impl Solver {
         out
     }
 
-
-
-
-
-
-    /// How concentrated the expansion phase's visits are, as the share of them
-    /// that went to each config's most-visited action, averaged over the
-    /// decision nodes that were visited at all.
-    ///
-    /// The counters a solve's device cost is proportional to.
-    ///
-    /// Diagnostics: nothing in a run reads this. The kernel table is a handful
-    /// of terms in these -- the trunk runs once per row, the join twice per
-    /// row per iteration, the readout and the pooling once per belief-index
-    /// entry per iteration, and the two sweeps once per cell per iteration --
-    /// so a search budget can be priced without running the farm.
     /// What this solve holds in host memory, group by group.
     ///
     /// The mirror of `cuda::Solve::census`, and it exists for the same reason:

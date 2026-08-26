@@ -28,6 +28,7 @@ use crate::pbs::Belief;
 use crate::search::{Budget, Cfg, Cfr, Solved, Solver, Step};
 use crate::selfplay::{Data, GameCfg, GameStream};
 use crate::state::State;
+#[cfg(test)]
 use rayon::prelude::*;
 
 /// One solve's network work for this round.
@@ -294,6 +295,7 @@ pub struct Reply {
 impl Call {
     /// Run this call on the CPU network. The batched driver runs the same
     /// arithmetic on the device; this is the reference both are held to.
+    #[cfg(test)]
     pub fn run(&self, net: &Net) -> Reply {
         let mut r = Reply::default();
         match self {
