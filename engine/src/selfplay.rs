@@ -333,9 +333,8 @@ impl Data {
 pub struct GameCfg {
     pub agents: [Agent; 2],
     pub collect: Collect,
-    /// Weight of the uniform-over-legal mixed into the designated explorer's
-    /// acting policy. The mixture is public: sampling and the belief update
-    /// both read it.
+    /// Weight of the uniform-over-legal mixed into each seat's acting policy.
+    /// The mixture is public: sampling and the belief update both read it.
     pub explore: f32,
     /// Randomise the draft instead of using the fixed starter matchup.
     pub random_draft: bool,
@@ -365,9 +364,6 @@ pub struct Game {
     bel: [Belief; 2],
     data: Data,
     gc: GameCfg,
-    /// The one seat that explores in this game. Drawn once, so the other
-    /// seat's whole episode stays on policy.
-    explorer: u8,
     /// Belief states this game's searches asked the network about, waiting to
     /// be solved as roots of their own.
     queries: Vec<(State, [Belief; 2])>,
@@ -443,7 +439,6 @@ impl Game {
     pub fn new(mut rng: Rng, gc: &GameCfg) -> Game {
         let s = make_game(&mut rng, gc.random_draft);
         let ctx = Ctx::new(&s);
-        let explorer = (rng.next_u64() & 1) as u8;
         Game {
             rng,
             s,
@@ -454,7 +449,6 @@ impl Game {
             ],
             data: Data::default(),
             gc: *gc,
-            explorer,
             queries: Vec::new(),
         }
     }
@@ -599,14 +593,11 @@ impl Game {
     /// Sample the acting player's move, update the public belief from what the
     /// opponent observes, and apply it.
     ///
-    /// If the actor is the explorer, the acting policy is `(1-eps) π + eps`
-    /// uniform over each config's legal set; sampling and the belief update
-    /// both read that mixture.
+    /// The acting policy is `(1-eps) π + eps` uniform over each config's
+    /// legal set; sampling and the belief update both read that mixture.
     fn play(&mut self, mut np: policy::NodePolicy) {
         let me = self.s.to_act() as usize;
-        if me as u8 == self.explorer {
-            np.mix_uniform(self.gc.explore);
-        }
+        np.mix_uniform(self.gc.explore);
         let true_ci = self.true_index(me);
         let chosen_cell = np.sample(&mut self.rng, true_ci);
         let chosen = np.action_at(chosen_cell);
@@ -1272,11 +1263,11 @@ mod target_tests {
         assert!(wide > 0, "every row was a singleton belief; play more games");
     }
 
-    /// With explore = 1 the explorer's acting policy is uniform over legal, so
-    /// the public belief after a move is the Bayes update under that uniform,
-    /// not under the unmixed search policy.
+    /// With explore = 1 the acting policy is uniform over legal, so the public
+    /// belief after a move is the Bayes update under that uniform, not under
+    /// the unmixed search policy.
     #[test]
-    fn the_explorers_mixture_is_the_policy_the_belief_is_updated_with() {
+    fn exploration_is_the_policy_the_belief_is_updated_with() {
         let gc = GameCfg {
             agents: [Agent::Random; 2],
             collect: Collect::None,
@@ -1296,7 +1287,6 @@ mod target_tests {
         g.s = s;
         g.ctx = ctx;
         g.bel = bel;
-        g.explorer = me as u8;
         g.gc.explore = 1.0;
 
         let prior = g.bel[me].clone();
