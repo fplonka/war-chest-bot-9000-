@@ -229,7 +229,9 @@ class Buffer:
             group = torch.empty(0, dtype=torch.long, device=dev)
         policy = (
             self.pa[ai % self.acap],
-            self.pact[ci % self.pcap],
+            torch.repeat_interleave(astart, clen_t,
+                                    output_size=clen_total)
+            + self.pact[ci % self.pcap],
             torch.repeat_interleave(row_ids, alen_t,
                                     output_size=alen_total),
             pcfg,

@@ -57,6 +57,8 @@ def main():
     buf = Buffer(n * 2, n * ncfg * 2, torch.device("cpu"))
     buf.add(*dump(n, ncfg, na, ncells))
     check(buf, np.arange(buf.lo, buf.rows))
+    two = buf.gather(np.array([buf.lo, buf.lo + 1]))[-1]
+    assert int(two[1].max()) >= na
     print(f"16k burst: {n} live rows, pcfg < {n * ncfg}")
     for _ in range(20):
         ids = rng.integers(buf.lo, buf.rows, size=256)
