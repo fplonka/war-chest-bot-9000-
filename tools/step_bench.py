@@ -72,7 +72,7 @@ def main():
     ids = np.arange(buf.lo, buf.rows)
     device_parts = buf.gather(ids)
     net = Net().to(dev)
-    opt = torch.optim.Adam(net.parameters(), lr=1e-3)
+    opt = torch.optim.Adam(net.parameters(), lr=1e-3, fused=True)
     warmup(dev)
 
     batch = make_batch(device_parts, dev)

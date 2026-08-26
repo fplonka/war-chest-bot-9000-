@@ -524,7 +524,7 @@ def main():
     value = Net().to(dev)
     if args.init_weights:
         value.load_state_dict(load_checkpoint(args.init_weights).state_dict())
-    opt = torch.optim.Adam(value.parameters(), lr=args.lr)
+    opt = torch.optim.Adam(value.parameters(), lr=args.lr, fused=True)
     lr_decays = sorted(float(x) for x in args.lr_decay_frac.split(",") if x.strip())
     value.push()
     target_state = cpu_state(value)
