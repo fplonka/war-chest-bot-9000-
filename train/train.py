@@ -862,7 +862,6 @@ def main():
     value.push()
     target_state = cpu_state(value)
     buf = Buffer(args.cap, args.cap * args.cfgs_per_row, dev)
-    buf.x.fill(0)
     import gpu_batch
     gpu_batch.warmup(dev)
     batcher = gpu_batch.make_batch

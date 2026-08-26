@@ -56,11 +56,11 @@ def warmup(device):
     # An empty policy: a row without a target is exactly what the warm start
     # and every query solve look like, so this is the shape, not a special case.
     empty = (torch.zeros((0, warchest.ACT_BYTES), dtype=torch.uint8, device=device),
-             torch.zeros(0, torch.int64, device=device),
-             torch.zeros(0, torch.int64, device=device),
-             torch.zeros(0, torch.int64, device=device),
-             torch.zeros(0, torch.float32, device=device),
-             torch.zeros(0, torch.int64, device=device))
+             torch.zeros(0, dtype=torch.int64, device=device),
+             torch.zeros(0, dtype=torch.int64, device=device),
+             torch.zeros(0, dtype=torch.int64, device=device),
+             torch.zeros(0, dtype=torch.float32, device=device),
+             torch.zeros(0, dtype=torch.int64, device=device))
     parts = (rows, cc, torch.as_tensor([0, 1], torch.uint8, device=device),
              torch.as_tensor([1.0, 1.0], device=device),
              torch.zeros(2, device=device),

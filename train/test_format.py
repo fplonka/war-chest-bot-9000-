@@ -67,7 +67,7 @@ def main():
           f"{int(d['solves'])} solves, row_bytes={ROW_BYTES}", flush=True)
 
     print("[2/6] dumping through the real Buffer path", flush=True)
-    buf = Buffer(200_000, 200_000 * 48)
+    buf = Buffer(200_000, 200_000 * 48, dev)
     rows = np.asarray(d["rows"], np.uint8).reshape(-1, ROW_BYTES)
     cc = np.asarray(d["cc"], np.uint8).reshape(-1, CCOUNTS)
     cw = np.asarray(d["cw"], np.float32)
@@ -83,7 +83,7 @@ def main():
     replay = (rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff,
               soff, source, truth, outcome, created, td1)
     buf.add(*replay)
-    tiny = Buffer(max(n * 2, 8), max(n * 2, 8) * 48)
+    tiny = Buffer(max(n * 2, 8), max(n * 2, 8) * 48, dev)
     for _ in range(8):
         tiny.add(*replay)
     assert tiny.soff.size < tiny.rows, (tiny.soff.size, tiny.rows)
@@ -91,6 +91,9 @@ def main():
     assert tiny.soff.size == 0
     dump_path = f"{out}/buffer.npz"
     got, gcc, gcp, gcw, gcy, gseg, _ = buf.ordered()
+    to_numpy = lambda value: value.cpu().numpy() if torch.is_tensor(value) else value
+    got, gcc, gcp, gcw, gcy, gseg = map(to_numpy,
+                                        (got, gcc, gcp, gcw, gcy, gseg))
     lo = buf.lo
     gsoff = np.concatenate([[0], buf.soff[(buf.soff > lo) & (buf.soff < buf.rows)] - lo,
                             [len(got)]])

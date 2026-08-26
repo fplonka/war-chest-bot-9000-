@@ -65,7 +65,9 @@ def main():
         print(f"  {got}/{args.solves} solves, {got / (time.time() - start):.1f}/s",
               flush=True)
 
-    x, cc, cp, cw, cy, seg = buf.ordered()
+    x, cc, cp, cw, cy, seg, _ = buf.ordered()
+    to_numpy = lambda value: value.cpu().numpy() if torch.is_tensor(value) else value
+    x, cc, cp, cw, cy, seg = map(to_numpy, (x, cc, cp, cw, cy, seg))
     lo = buf.lo
     soff = np.concatenate([[0],
                            buf.soff[(buf.soff > lo) & (buf.soff < buf.rows)] - lo,
