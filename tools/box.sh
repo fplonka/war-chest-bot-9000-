@@ -112,8 +112,10 @@ grep -qx 0 /workspace/logs/$tag.exit || { tail -20 /workspace/logs/$tag.log; exi
 start)
     # start <tag> <command...>: the command runs detached on the box, queued
     # behind every other GPU job in order of arrival by a ticket in
-    # /workspace/queue. Its script, log, pid and exit code live under
-    # /workspace/logs/<tag>.*. `follow <tag>` waits.
+    # /workspace/queue (WARCHEST_BOX_PRIORITY=1 puts it ahead of the queue;
+    # the flock keeps it exclusive against jobs queued by older checkouts).
+    # Its script, log, pid and exit code live under /workspace/logs/<tag>.*.
+    # `follow <tag>` waits.
     tag=${2:?usage: start <tag> <command...>}
     shift 2
     run_remote "mkdir -p /workspace/logs /workspace/queue
@@ -121,12 +123,12 @@ rm -f /workspace/logs/$tag.pid /workspace/logs/$tag.exit
 echo $remote > /workspace/logs/$tag.owner
 cat > /workspace/logs/$tag.sh <<'EOS'
 echo \$\$ > /workspace/logs/$tag.pid
-ticket=/workspace/queue/\$(date +%s%N)-$tag
+ticket=/workspace/queue/${WARCHEST_BOX_PRIORITY:+0-}\$(date +%s%N)-$tag
 touch \$ticket
 trap 'rm -f \$ticket' EXIT
 while [ \"\$(ls /workspace/queue | head -1)\" != \"\$(basename \$ticket)\" ]; do sleep 2; done
 $prelude
-$(printf '%q ' "$@")
+flock /workspace/gpu.lock $(printf '%q ' "$@")
 status=\$?
 echo \$status > /workspace/logs/$tag.exit
 exit \$status
