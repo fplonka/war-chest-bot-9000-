@@ -1133,11 +1133,16 @@ mod target_tests {
             query_rate: 0.0,
             recursive_rate: 0.0,
         };
-        let mut g = Game::new(Rng::new(49), &gc);
-        while let Some(mut sv) = g.next_solve(&nets) {
+        let mut g = Game::new(Rng::new(6), &gc);
+        for _ in 0..8 {
+            let mut sv = g.next_solve(&nets).expect("the test game is still live");
             let solved = sv.run_alone();
             g.play_solved(&sv, solved);
         }
+        // This test owns the outcome. Natural termination is covered by the
+        // greedy-game test; forcing it here avoids solving an entire weak game
+        // only to choose which nonzero value is written.
+        g.s.winner = WHITE;
         let before = g.data.cy.clone();
         let truth = g.data.truth.clone();
         let z = [g.s.utility(0), g.s.utility(1)];

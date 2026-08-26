@@ -50,6 +50,24 @@ fn micro_position(seed: u64, warmup: usize, plies: u16) -> Option<State> {
     Some(s)
 }
 
+/// A real decision where the actor can win before the short test horizon.
+fn near_win_position(seed: u64, plies: u16) -> Option<State> {
+    let mut rng = Rng::new(seed);
+    let mut s = make_game(&mut rng, false);
+    while !s.is_terminal() {
+        let plain = !s.is_chance() && matches!(s.pending(), Cont::MainPlay);
+        if plain && s.hand_size(0) >= 2 && s.hand_size(1) >= 2
+            && s.markers_hand[s.to_act() as usize] == 1
+        {
+            s.main_plays = MAX_MAIN_PLAYS - plies;
+            return Some(s);
+        }
+        let acts = s.legal_actions();
+        s.apply_inplace(acts[rng.below(acts.len())]);
+    }
+    None
+}
+
 fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
     let res = reserve(s, p, ctx);
     let truth = true_config(s, p, ctx);
@@ -200,7 +218,7 @@ fn subgame_solver_matches_tabular_cfr_on_micro_endgames() {
     let mut checked = 0;
     let mut skipped = [0usize; 3]; // too large, one-sided, no position
     for seed in 0..3000u64 {
-        let Some(s) = micro_position(seed, 60 + (seed as usize % 120), 3) else {
+        let Some(s) = near_win_position(seed, 3) else {
             skipped[2] += 1;
             continue;
         };
