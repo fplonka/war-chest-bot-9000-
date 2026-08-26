@@ -22,9 +22,12 @@ def _to_numpy(value):
 
 
 def _policy_group_counts(pcoff, pci, rows):
+    """Count contiguous config groups in the policy-cell arena."""
     counts = np.zeros(rows, np.int32)
     for row, (lo, hi) in enumerate(zip(pcoff[:-1], pcoff[1:])):
-        counts[row] = np.unique(pci[lo:hi]).size
+        if hi > lo:
+            cells = pci[lo:hi]
+            counts[row] = 1 + np.count_nonzero(cells[1:] != cells[:-1])
     return counts
 
 
