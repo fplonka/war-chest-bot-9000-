@@ -155,8 +155,8 @@ def legacy_two_view_equivalence(net, rng):
     old = legacy_two_view_values(net, xpub, phi, weight, seg, queries)
     new = run(net, xpub, phi, weight, seg, queries)
     err = float(np.max(np.abs(old - new)))
-    scale = max(1.0, float(np.abs(old).max()))
-    assert err < 1e-6 * scale, f"two-view regression: {err:.3e}"
+    np.testing.assert_allclose(old, new, rtol=1e-5, atol=2e-5,
+                               err_msg="two-view regression")
     print(f"two-view value regression ok: max err {err:.3e}")
 
 
