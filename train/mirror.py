@@ -60,8 +60,7 @@ def _mirror_tables(device):
 
     The whole transform is a column permutation plus a per-element seat flip,
     except the stack-owed bit sets: those are a permutation of the first 37
-    bits of each 8-byte level, which no column permutation can express, so it
-    is a GF(2) matrix over the level's 64 bits instead.
+    bits of each 8-byte level, which no column permutation can express.
     """
     dev = torch.device(device)
     o = warchest.ROW_HEX_OWNER
@@ -91,22 +90,21 @@ def _mirror_tables(device):
     stack = np.arange(warchest.ROW_STACK_OWED,
                       warchest.ROW_STACK_OWED + warchest.CONT_CAP * 8)
     # Output bit j (< N_HEXES) copies input bit hexmap[j]; the rest stay 0.
-    matrix = np.zeros((64, 64), np.uint8)
-    for j in range(N_HEXES):
-        matrix[hexmap[j], j] = 1
     t = lambda a: torch.as_tensor(a, device=dev)
-    return (t(perm), t(flip), t(lut), t(stack), t(matrix), warchest.CONT_CAP)
+    return (t(perm), t(flip), t(lut), t(stack), t(hexmap), warchest.CONT_CAP)
 
 
 def mirror_torch(x):
     """Mirror a device batch of packed rows; `mirror_rows` on the device."""
-    perm, flip, lut, stack, matrix, cont = _mirror_tables(x.device)
+    perm, flip, lut, stack, hexmap, cont = _mirror_tables(x.device)
     out = x[:, perm]
     out[:, flip] = lut[out[:, flip].to(torch.int64)]
     bits = (x[:, stack].reshape(-1, 8).unsqueeze(-1)
             >> torch.arange(8, dtype=torch.uint8, device=x.device)) & 1
     bits = bits.reshape(-1, 64)
-    mapped = (bits.to(torch.int32) @ matrix.to(torch.int32)) % 2
+    mapped = torch.zeros_like(bits)
+    mapped.scatter_(1, hexmap.unsqueeze(0).expand(bits.shape[0], -1),
+                    bits[:, :N_HEXES])
     mapped = mapped.reshape(-1, 8, 8)
     shifts = torch.ones(8, dtype=torch.int32, device=x.device) \
         << torch.arange(8, dtype=torch.int32, device=x.device)
