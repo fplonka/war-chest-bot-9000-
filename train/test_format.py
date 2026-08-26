@@ -41,7 +41,7 @@ def empty_policy():
 
 
 @torch.no_grad()
-def evaluate(net, parts, rng, dev):
+def evaluate(net, parts, dev):
     batch = make_batch(parts, dev)
     value = losses(net, *batch)
     rms = torch.sqrt(torch.mean((forward_values(net, batch) - batch[4]) ** 2))
@@ -113,7 +113,6 @@ def main():
     split = dmp.soff[-2]  # the newest solve block is the test set
     tr = (*dmp.rows(0, split), empty_policy())
     te = (*dmp.rows(split, len(dmp)), empty_policy())
-    rng = np.random.default_rng(0)
     b = make_batch(tr, dev)
     xpub, phi, w, seg, y, nseg, policy = b
     assert xpub.shape == (2 * len(tr[0]), PUBFEAT), xpub.shape
@@ -123,8 +122,7 @@ def main():
     assert torch.allclose(torch.bincount(seg, w), torch.ones(nseg), atol=1e-6)
     assert not len(policy[0]) and not len(policy[1])
     assert torch.isfinite(xpub).all() and torch.isfinite(y).all()
-    trows, tcc, tcp = tr[0], tr[1], tr[2]
-    mirror.self_check_rows(trows)
+    mirror.self_check_rows(tr[0])
     mirror.self_check(xpub[0::2].numpy())
     print(f"      batch {xpub.shape} phi {phi.shape}", flush=True)
 
@@ -142,7 +140,7 @@ def main():
     print("      value: " + " ".join(f"{v:.3f}" for v in seen), flush=True)
 
     print("[6/6] validation loss on the held-out solve block", flush=True)
-    hl, hrms = evaluate(net, te, rng, dev)
+    hl, hrms = evaluate(net, te, dev)
     print(f"      test huber {hl:.6f} rms {hrms:.5f}", flush=True)
     assert np.isfinite(hl)
     print(f"row mirror matches State::mirror on {mirror.check_against_engine()} states",

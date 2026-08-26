@@ -96,8 +96,16 @@ def main():
     def fwd():
         return net(xpub, phi, w, seg, nseg)
 
+    def new_stats():
+        return {
+            "zero_sum_max": torch.zeros((), device=dev),
+            "zero_sum_square_sum": torch.zeros((), device=dev),
+            "zero_sum_n": 0,
+        }
+
     def fwd_policy():
-        return losses(net, xpub, phi, w, seg, y, nseg, policy=policy, wp=0.05)
+        return losses(net, xpub, phi, w, seg, y, nseg, policy=policy,
+                      wp=0.05, stats=new_stats())
 
     def step():
         opt.zero_grad(set_to_none=True)
@@ -126,12 +134,31 @@ def main():
     stage("full step (sync-free)", step)
 
     try:
-        compiled = torch.compile(fwd_policy, mode="reduce-overhead", dynamic=True)
-        stage("forward+policy (torch.compile)", compiled, iters=30)
+        compiled = torch.compile(losses, mode="default", dynamic=True)
+        empty_policy = tuple(value[:0] for value in policy[:6]) + (0,)
+        warm_batch = (*batch[:6], empty_policy)
+
+        def compiled_warm():
+            return compiled(net, *warm_batch, wp=0.05, stats=new_stats())
+
+        def compiled_sog():
+            return compiled(net, *batch, wp=0.05, stats=new_stats())
+
+        t0 = time.perf_counter()
+        compiled_warm()
+        torch.cuda.synchronize(dev)
+        print(f"torch.compile warm graph wall {time.perf_counter() - t0:.2f}s")
+        stage("forward (torch.compile, warm)", compiled_warm, iters=30)
+
+        t0 = time.perf_counter()
+        compiled_sog()
+        torch.cuda.synchronize(dev)
+        print(f"torch.compile SoG graph wall {time.perf_counter() - t0:.2f}s")
+        stage("forward+policy (torch.compile, SoG)", compiled_sog, iters=30)
 
         def compiled_step():
             opt.zero_grad(set_to_none=True)
-            compiled().backward()
+            compiled_sog().backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0)
             opt.step()
         stage("full step (torch.compile)", compiled_step, iters=30)

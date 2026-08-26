@@ -48,7 +48,6 @@ import torch.nn.functional as F
 
 import warchest
 import config
-import mirror
 from export_weights import load as load_checkpoint
 from gpu_batch import make_batch, warmup
 from replay import Buffer
@@ -62,24 +61,11 @@ CCOUNTS = warchest.CCOUNTS
 CNORM = warchest.CNORM
 ROW_BYTES = warchest.ROW_BYTES
 ACT_BYTES = warchest.ACT_BYTES
-N_KINDS = warchest.N_KINDS
 NSLOT = warchest.NSLOT
-N_HEXES = warchest.N_HEXES
 
 # What `SolveFarm.collect` reports about the device rounds, cumulative
 # since the farm started. `rounds` is the denominator of the other three.
 ROUND_KEYS = ("rounds", "round_calls", "round_rows", "round_nanos", "budget_hits")
-
-
-
-
-def expand_batch(rows):
-    """Expand packed replay rows into the public encoding, in one batch.
-    The expansion itself runs in Rust — one source of truth with the
-    solver's leaf encoding."""
-    n = len(rows)
-    return np.asarray(warchest.expand_rows(rows.ravel()), np.float32).reshape(n, -1)
-
 
 
 def forward_values(net, parts):
@@ -231,6 +217,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
     z = lambda: torch.zeros((), device=device)
     stat = {"sample_s": 0.0, "prepare_s": 0.0, "forward_wall_s": 0.0,
             "backward_wall_s": 0.0, "batch_configs": 0, "steps": 0,
+            "enqueue_s": 0.0,
             "gpu_forward_s": 0.0, "gpu_backward_s": 0.0,
             "zero_sum_max": z(), "zero_sum_square_sum": z(),
             "zero_sum_n": 0, "grad_clipped": 0,
@@ -243,6 +230,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
             **{f"{key}_sum": z() for key in policy_metrics}}
     if len(buf) < batch:
         return float("nan"), stat
+    enqueue_t = time.perf_counter()
     tot = 0.0
     event_pairs = []
     stream = torch.cuda.current_stream(device) if profile_cuda and device.type == "cuda" else None
@@ -307,6 +295,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
             b1.record(stream)
             event_pairs.append((f0, f1, b1))
     if stat["steps"]:
+        stat["enqueue_s"] = time.perf_counter() - enqueue_t
         # The loop above never synchronizes, so the device and the host stay
         # overlapped; one readback a call drains it.
         cpu = lambda t: float(t.detach().cpu()) if torch.is_tensor(t) else float(t)
@@ -322,12 +311,12 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
     if profile_cuda and stat["steps"]:
         n = stat["steps"]
         print(f"[profile] steps={n} rows={batch}"
-              f" sample={1e3 * stat['sample_s'] / n:.1f}ms"
-              f" prepare={1e3 * stat['prepare_s'] / n:.1f}ms"
-              f" fwd={1e3 * stat['forward_wall_s'] / n:.1f}ms"
-              f" bwd={1e3 * stat['backward_wall_s'] / n:.1f}ms"
-              f" gpu_fwd={1e3 * stat['gpu_forward_s'] / n:.1f}ms"
-              f" gpu_bwd={1e3 * stat['gpu_backward_s'] / n:.1f}ms",
+              f" sample_enqueue={1e3 * stat['sample_s'] / n:.1f}ms"
+              f" prepare_enqueue={1e3 * stat['prepare_s'] / n:.1f}ms"
+              f" fwd_enqueue={1e3 * stat['forward_wall_s'] / n:.1f}ms"
+              f" bwd_enqueue={1e3 * stat['backward_wall_s'] / n:.1f}ms"
+              f" fwd_event={1e3 * stat['gpu_forward_s'] / n:.1f}ms"
+              f" bwd_event={1e3 * stat['gpu_backward_s'] / n:.1f}ms",
               flush=True)
     return tot / stat["steps"] if stat["steps"] else float("nan"), stat
 
@@ -517,6 +506,7 @@ def main():
         torch.cuda.set_stream(train_stream)
         print(f"[train] CUDA stream priority {args.train_stream_priority}", flush=True)
 
+    torch.cuda.reset_peak_memory_stats(dev)
     value = Net().to(dev)
     if args.init_weights:
         value.load_state_dict(load_checkpoint(args.init_weights).state_dict())
@@ -532,7 +522,6 @@ def main():
     # batch width: at s=512 it is thousands, and a dummy that wide does not
     # fit next to the intern table.
     # 2048 is the intern-table floor: a 2048× table does not fit the encoder.
-    torch.cuda.reset_peak_memory_stats(dev)
     names = tuple(warchest.ENT_NAMES)
     n = max(args.batch, 2048)
     k = n * args.cfgs_per_row
@@ -547,13 +536,9 @@ def main():
     opt.step()
     forward_values(value, parts)
     torch.cuda.synchronize(dev)
-    # The training loss as one fused graph: the net is a few GFLOP spread
-    # over hundreds of small kernels, so the eager step is launch-bound.
-    # torch.compile buckets the variable batch shapes and fuses the value
-    # and policy paths into one forward and one backward. The first call
-    # (the warm phase's first fit) pays the compilation; the box's copy of
-    # the engine never recompiles.
-    step_loss = torch.compile(losses, dynamic=True)
+    # The benchmark chooses the loss implementation after the replay and
+    # batch path have been measured. Eager is the safe path until then.
+    step_loss = losses
     if checkpoint:
         value.load_state_dict(checkpoint["value"])
         opt.load_state_dict(checkpoint["optimizer"])
@@ -564,7 +549,7 @@ def main():
         torch.set_rng_state(checkpoint["torch_rng"])
         torch.cuda.set_rng_state_all(checkpoint["cuda_rng"])
     peak = torch.cuda.max_memory_reserved(dev)
-    print(f"[train] torch peak {peak / (1 << 20):.0f} MiB reserved on {dev} "
+    print(f"[train] torch+replay peak {peak / (1 << 20):.0f} MiB reserved on {dev} "
           f"(rows={n} configs={k}); farm carves mem_get_info free",
           flush=True)
     print(f"[train] search inference on cuda:{args.gen_devices}, "
@@ -681,17 +666,16 @@ def main():
             next_snap = now - t0 + snap_gap
 
     def fit(nsteps, deadline=None):
-        """Adam updates on the shared replay. Returns (loss, wall_s, stats)."""
+        """Adam updates on the shared replay. Returns (loss, enqueue_s, stats)."""
         if nsteps < 1 or len(buf) < args.batch:
             return float("nan"), 0.0, {}
-        tt = time.time()
         lv, st = train_steps(
             value, opt, buf, nsteps, args.batch, rng, dev,
             recent_mix=args.recent_mix, recent_frac=args.recent_frac,
             profile_cuda=os.environ.get("WARCHEST_TRAIN_PROFILE") == "1",
             policy_w=args.policy_w, deadline=deadline,
             loss_fn=step_loss)
-        return lv, time.time() - tt, st
+        return lv, st["enqueue_s"], st
 
     def run_search_pipeline():
         """Overlap small GT-CFR batches with each other and with training."""
@@ -1061,6 +1045,7 @@ def main():
                 "value_calibration_slope": round(diag["value_calibration_slope"], 4),
                 "gen_s": round(gen_s, 2),
                 "train_s": round(train_s, 2),
+                "train_enqueue_s": round(train_s, 2),
                 "add_s": round(window["add_s"], 2),
                 "gpu_forward_s": round(window["gpu_forward_s"], 2),
                 "gpu_backward_s": round(window["gpu_backward_s"], 2),
@@ -1108,8 +1093,9 @@ def main():
                 f"L={lv:.5f} L/var={lv / max(target_var, 1e-9):.2f} "
                 f"Lp={rec['policy_loss']:.3f} "
                 f"tgt={target_mean:+.3f}/{target_var ** 0.5:.3f} "
-                f"gen={gen_s:.2f}s train={train_s:.2f}s "
-                f"gpu={window['gpu_forward_s'] + window['gpu_backward_s']:.2f}s "
+                f"gen={gen_s:.2f}s train_enqueue={train_s:.2f}s "
+                f"add={window['add_s']:.2f}s "
+                f"gpu_events={window['gpu_forward_s'] + window['gpu_backward_s']:.2f}s "
                 f"slots={rec['slots_used']}/{rec['slots']} "
                 f"spc={rec['slots_per_card']} "
                 f"slot={rec['slot_bytes'] / (1 << 20):.1f}MiB "
@@ -1178,12 +1164,13 @@ def main():
                 "horizon_frac": round(int(d.get("horizon_hits", 0)) /
                                       max(int(d.get("games", 0)), 1), 3),
                 "gen_s": round(gen_s, 2), "train_s": round(train_s, 2),
+                "train_enqueue_s": round(train_s, 2),
             }
             tick(rec,
                 f"[t={rec['t']:6.1f}s] warm ep{epoch:3d} games={rec['games']:4d} "
                 f"rows={n:6d} L={lv if steps else float('nan'):.5f} "
                 f"tgt={rec['tgt_mean']:+.3f}/{rec['tgt_std']:.3f} "
-                f"gen={gen_s:.1f}s train={train_s:.1f}s")
+                f"gen={gen_s:.1f}s train_enqueue={train_s:.1f}s")
         value.push()
         target_state = cpu_state(value)
         sog_t0 = time.time()

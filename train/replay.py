@@ -123,6 +123,11 @@ class Buffer:
             self.cstart[ring] = starts[i:j]
             self.clen[ring] = lens[i:j]
             self.pgroup_count[ring] = group_counts[i:j]
+            if pol is None:
+                self.pastart[ring] = self.acts
+                self.palen[ring] = 0
+                self.pcstart[ring] = self.cells
+                self.pclen[ring] = 0
             self.written_at[ring] = now
             self.created_at[ring] = created[i:j]
             self.source[ring] = source[i:j]
@@ -206,12 +211,12 @@ class Buffer:
         astart = torch.cumsum(alen_t, 0) - alen_t
         pstart = t(self.pastart[s])
         ccell_start = t(self.pcstart[s])
+        cstart = torch.cumsum(clen_t, 0) - clen_t
         ai = (torch.repeat_interleave(pstart - astart, alen_t,
                                       output_size=alen_total)
               + torch.arange(alen_total, device=dev))
-        ci = (torch.repeat_interleave(ccell_start
-                                      - torch.cumsum(clen_t, 0) + clen_t,
-                                      clen_t, output_size=clen_total)
+        ci = (torch.repeat_interleave(ccell_start - cstart, clen_t,
+                                      output_size=clen_total)
               + torch.arange(clen_total, device=dev))
         pcfg = (torch.repeat_interleave(rowstart, clen_t,
                                         output_size=clen_total)

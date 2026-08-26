@@ -73,6 +73,10 @@ def main():
     check(ring, np.arange(ring.lo, ring.rows))
     print(f"fat wrap: lo={ring.lo} live_cells={live} pcap={ring.pcap}")
 
+    ring.add(*dump(1, ncfg_t, 0, 0)[:-1])
+    policy = ring.gather(np.array([ring.rows - 1]))[-1]
+    assert all(not len(value) for value in policy[:6]) and policy[-1] == 0
+
 
 if __name__ == "__main__":
     main()
