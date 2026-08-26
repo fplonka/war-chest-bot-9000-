@@ -17,7 +17,9 @@ for the configured rates, and restore the contract test invariant.
   query picks stay inside their live iterations.
 - Stored truth at row creation and captured one creation timestamp per solve.
 - Synced the dirty worktree to `/workspace/warchest-querytidy`.
-- Focused GPU tests are queued behind existing box jobs.
+- Focused GPU tests and the default run are queued behind existing box jobs.
+- The queue is currently blocked by another worker's `0-b256_125_vs_v5`
+  ticket and live owner; the driver rule forbids removing it.
 
 ## Validation
 
