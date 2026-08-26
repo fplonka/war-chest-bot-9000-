@@ -24,9 +24,11 @@ Remove the runtime host solver. Keep CUDA as the only runtime solver and keep ex
 - Consolidated every test-oracle arena and scratch buffer under one `cfg(test)` state.
 - Removed the `Nets` wrapper; solvers now receive `Arc<Net>` directly.
 - Removed CPU arena opt-ins. Static generation remains for greedy replay-format tests; SoG generation uses `SolveFarm`.
+- Applied the thermo-nuclear review: `advance` is now the direct CUDA state machine and the CPU call evaluator is test-only.
+- Box jobs are queued in order for corpus regeneration, GPU tests, the matched after benchmark, and the default 30-minute `onepath30` run.
 
 ## Next
 
-1. Run the box tests and matched after benchmark.
-2. Run the 30-minute training and 200-game arena gate.
-3. Apply the thermo-nuclear self-review and report.
+1. Follow the queued tests, after benchmark, and training run.
+2. Pack `onepath30` and run the 200-game arena gate.
+3. Finish the review and report.
