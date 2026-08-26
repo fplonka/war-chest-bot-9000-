@@ -1649,16 +1649,25 @@ impl Solver {
         self.query_seen += events;
         self.with_rng(|sv, rng| {
             let keep = sv.collect.unwrap_or(0);
-            debug_assert_eq!(sv.queries.len(), start.min(keep));
-            (0..events)
-                .filter_map(|event| {
-                    let seen = start + event;
-                    if seen < keep {
-                        Some((event, None))
-                    } else {
-                        let slot = rng.below(seen + 1);
-                        (slot < keep).then_some((event, Some(slot)))
-                    }
+            let old = start.min(keep);
+            debug_assert_eq!(sv.queries.len(), old);
+            let mut selected = vec![None; keep];
+            for event in 0..events {
+                let seen = start + event;
+                let slot = if seen < keep {
+                    seen
+                } else {
+                    rng.below(seen + 1)
+                };
+                if slot < keep {
+                    selected[slot] = Some(event);
+                }
+            }
+            selected
+                .into_iter()
+                .enumerate()
+                .filter_map(|(slot, event)| {
+                    event.map(|event| (event, (slot < old).then_some(slot)))
                 })
                 .collect()
         })

@@ -11,7 +11,8 @@ for the configured rates, and restore the contract test invariant.
 - Worktree was clean at start.
 - Implemented the leaf-only query event view, rate validation, assertion, and
   contract-test threshold.
-- Replaced the query reservoir's hypergeometric rebuild with Algorithm R.
+- Replaced the query reservoir's hypergeometric rebuild with Algorithm R;
+  coalescing replacements keeps one final event per reservoir slot.
 - Made query slots explicit, removed the harvest argument, and asserted CUDA
   query picks stay inside their live iterations.
 - Stored truth at row creation and captured one creation timestamp per solve.
