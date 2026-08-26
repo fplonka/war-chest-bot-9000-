@@ -30,3 +30,4 @@ sweep settle a baseline: 30-min run trained AND played with dcfr vs the
 train-sog/play-dcfr combo, 200 games. If within noise, unify on dcfr and
 delete the second rule; if the split genuinely wins, document why it is
 principled (paper-faithful targets, discounted play) rather than accidental.
+- Re-evaluate search past the round boundary (`rounds=0` today). War Chest is more chess than poker with a small hidden state, so deeper GT-CFR trees are likely worth their cost; measure at equal compute before changing the default.

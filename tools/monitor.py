@@ -463,8 +463,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def puller(dest, every=30):
     """Keep the laptop current while serving it through box.sh."""
+    # box.sh pulls into <local dir>/runs, so hand it the parent of `dest`.
     env = os.environ.copy()
-    env["WARCHEST_BOX_LOCAL_DIR"] = os.path.abspath(dest)
+    env["WARCHEST_BOX_LOCAL_DIR"] = os.path.dirname(os.path.abspath(dest))
     command = [os.path.join(TOOLS, "box.sh"), "pull"]
     while True:
         r = subprocess.run(command, env=env, capture_output=True, text=True)
