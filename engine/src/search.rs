@@ -1005,9 +1005,8 @@ pub struct Solver {
     /// whole of it in `finish`; the device path reads the root's row and
     /// nothing else, so `read_back` sizes it to that row alone.
     pub avg: Vec<f32>,
-    /// The CFR arenas, when this solve runs its own CFR loop. `None` on the
-    /// device path: the card owns equivalents of every one of them and
-    /// advances them itself, and not one ever crosses back.
+    /// Exact oracle state. Production builds omit this field; the card owns
+    /// the corresponding arenas and never copies them back.
     #[cfg(test)]
     oracle: ReferenceState,
     /// Leaves that have become decision or chance nodes since a reader last
