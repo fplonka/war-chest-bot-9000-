@@ -982,6 +982,30 @@ mod target_tests {
         out
     }
 
+    #[test]
+    fn a_full_query_queue_reports_every_dropped_nomination() {
+        let gc = GameCfg {
+            agents: [Agent::Sog { cfg: Cfg::default() }; 2],
+            collect: Collect::Sog,
+            explore: 0.0,
+            random_draft: true,
+            p_td1: 0.0,
+            query_rate: 0.0,
+            recursive_rate: 0.0,
+        };
+        let mut stream = GameStream::new(1, gc);
+        let q = (stream.game.s, stream.game.bel.clone());
+        let total = QUEUE_CAP + 3;
+        let mut nominations = Vec::with_capacity(total);
+        for _ in 0..total {
+            nominations.push((q.0, q.1.clone()));
+        }
+        let mut out = Data::default();
+        out.dropped += stream.enqueue(nominations);
+        assert_eq!(stream.pending.len(), QUEUE_CAP);
+        assert_eq!(out.dropped, 3);
+    }
+
     /// A stored row's policy target must be the solve's own root average: one
     /// row per acting config, summing to one, over the actions that config can
     /// actually play.
