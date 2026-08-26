@@ -1201,6 +1201,10 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("GLOBAL_SCALARS", crate::pbs::GLOBAL_SCALARS)?;
     m.add("PENDING_KINDS", crate::state::PENDING_KINDS)?;
     m.add("CONT_CAP", crate::state::CONT_CAP)?;
+    m.add("SOURCE_WARM", crate::selfplay::SOURCE_WARM)?;
+    m.add("SOURCE_PLAY", crate::selfplay::SOURCE_PLAY)?;
+    m.add("SOURCE_QUERY", crate::selfplay::SOURCE_QUERY)?;
+    m.add("SOURCE_COUNT", crate::selfplay::SOURCE_COUNT)?;
     m.add("LOOSE", crate::pbs::LOOSE)?;
     m.add("OFF_PILES", crate::pbs::OFF_PILES)?;
     m.add("OFF_CARDS", crate::pbs::OFF_CARDS)?;

@@ -115,6 +115,7 @@ pub enum Collect {
 pub const SOURCE_WARM: u8 = 0;
 pub const SOURCE_PLAY: u8 = 1;
 pub const SOURCE_QUERY: u8 = 2;
+pub const SOURCE_COUNT: usize = 3;
 
 macro_rules! row_columns {
     ($($name:ident: $ty:ty),+ $(,)?) => {
@@ -318,7 +319,10 @@ impl Data {
             self.coff.push(self.cw.len() as u32);
         }
         *self.pcoff.last_mut().expect("row offset") = self.pcell.len() as u32;
-        debug_assert!(source <= SOURCE_QUERY, "unknown replay row source {source}");
+        debug_assert!(
+            (source as usize) < SOURCE_COUNT,
+            "unknown replay row source {source}"
+        );
         let created = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock is before Unix epoch")

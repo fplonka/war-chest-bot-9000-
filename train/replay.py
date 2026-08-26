@@ -12,10 +12,10 @@ import warchest
 CCOUNTS = warchest.CCOUNTS
 ROW_BYTES = warchest.ROW_BYTES
 ACT_BYTES = warchest.ACT_BYTES
-SOURCE_WARM = 0
-SOURCE_PLAY = 1
-SOURCE_QUERY = 2
-SOURCE_COUNT = 3
+SOURCE_WARM = warchest.SOURCE_WARM
+SOURCE_PLAY = warchest.SOURCE_PLAY
+SOURCE_QUERY = warchest.SOURCE_QUERY
+SOURCE_COUNT = warchest.SOURCE_COUNT
 
 
 class Columns(NamedTuple):
