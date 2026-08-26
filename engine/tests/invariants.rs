@@ -108,7 +108,7 @@ fn check_invariants(s: &State, init: &[[u16; N_UNITS]; 2]) {
     if let Some(w) = s.winner() {
         assert_eq!(s.markers_on_board(w), 6, "winner must have 6 markers");
     }
-    // 5. a game that reaches the horizon is a draw.
+    // 5. terminal games without a winner have zero utility.
     if s.is_terminal() && s.winner().is_none() {
         assert_eq!(s.utility(0), 0.0);
         assert_eq!(s.utility(1), 0.0);

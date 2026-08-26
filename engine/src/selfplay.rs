@@ -27,8 +27,8 @@
 //!
 //! Training starts with a short greedy warm phase: rows labelled by the
 //! deterministic public evaluation `policy::eval_squashed`, with the greedy
-//! policy as the policy target. No solve runs in a warm game. The SoG phase
-//! that follows: a game that reaches the play cap is a draw with zero utility.
+//! policy as the policy target. No solve runs in a warm game. The following SoG
+//! phase treats a game that reaches the play cap as a draw with zero utility.
 //!
 //! **Grounding: `p_td1`.** A bootstrap target is the network's own answer
 //! propagated one subgame back, so a run whose trees never reach a terminal
