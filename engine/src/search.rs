@@ -458,29 +458,6 @@ impl Cfr {
     }
 }
 
-/// The same units, summed over the iterations that ran on them.
-///
-/// The device charges per iteration for the join, the readout, the pooling and
-/// the two sweeps, and a growing tree is a different size at every one, so a
-/// final `Shape` prices none of them. `Solver::step` adds a term.
-#[cfg(test)]
-#[derive(Default, Clone, Copy, Debug)]
-pub struct Trace {
-    pub iters: u64,
-    pub row_iters: u64,
-    pub cidx_iters: u64,
-    pub cell_iters: u64,
-    /// Rows the join actually ran over, summed across every query the solve
-    /// made — two a regret update, plus the fixed-policy passes. `row_iters`
-    /// is the nominal that assumes every iteration queries every row; under
-    /// `Cfg::refresh` above one it does not, and this is what it cost.
-    pub join_rows: u64,
-    /// Config values the readout actually formed from the network, on the same
-    /// terms. The re-scaling of a cached value is not counted: it is a
-    /// multiply, where this is a dot product of width `D`.
-    pub readout_cfgs: u64,
-}
-
 /// What a solve built, in the units the device charges for. See `Solver::shape`.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Shape {
@@ -544,45 +521,6 @@ impl StopReason {
         "budget_row", "budget_board", "budget_config", "budget_cidx",
         "other",
     ];
-}
-
-/// How well a solve came out, in two numbers that are read together.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug)]
-pub struct Conv {
-    /// `sum_p (BR_p - v_p)`: what a best response to the solve's own average
-    /// strategy would gain, summed over the players. Zero means the strategy is
-    /// an equilibrium of the subgame it induces — the fixed point ReBeL
-    /// iterates towards — and it is what tells two regret rules apart at a
-    /// given iteration count, because unlike a distance to some other solve it
-    /// is absolute.
-    pub nash: f32,
-    /// `v_0 + v_1` at the root. **This is not zero**, and that is not a bug in
-    /// the solver. The subgame's leaves are network values, and nothing makes
-    /// the network's value for player 0 at a leaf the negative of its value for
-    /// player 1 there. So the finite search game is only *approximately*
-    /// zero-sum, by however far the value network is from
-    /// antisymmetric — which is what this measures, and it is a property of the
-    /// network rather than of the solve. It vanishes when every leaf is
-    /// terminal, which is the case `tests/sog_solver.rs` pins against an
-    /// independent solver.
-    pub zero_sum: f32,
-}
-
-/// What a backward pass over the tree does with the values it computes.
-#[cfg(test)]
-#[derive(Clone, Copy, PartialEq)]
-pub enum Back {
-    /// CFR: average under the old current strategy, then immediately fold each
-    /// action value less the node value into regret matching. The delta is
-    /// consumed in the row where it is formed; there is no instantaneous-
-    /// regret arena.
-    Regret,
-    /// Pure value propagation under a fixed strategy.
-    Value,
-    /// The traverser maxes instead of averaging, which makes the root values a
-    /// best response to whatever the opponent's reaches were built under.
-    BestResponse,
 }
 
 /// Which coin leaves the acting player's hand when `a` is played. Derived from
@@ -840,118 +778,6 @@ pub struct Policy {
 /// (offset by one so `-1` is zero), and the three squares it names.
 pub const ACT_BYTES: usize = 5;
 
-/// The arenas one expansion phase reads, as whichever backend ran the CFR
-/// loop left them. `Solver::replay_expansion` is the only consumer.
-#[cfg(test)]
-pub struct Arenas<'a> {
-    pub reach: &'a [f32],
-    pub cur: &'a [f32],
-    pub sum: &'a [f32],
-    pub qval: &'a [f32],
-    pub visits: &'a [f32],
-    pub prior: &'a [f32],
-}
-
-/// Sum `K` running totals over `n` terms the way a warp of thirty-two does:
-/// the lanes stride through the terms, then a butterfly folds the lanes.
-///
-/// The expansion phase runs on the card in production, and every total it
-/// forms is this shape. f32 addition is not associative, so a host that summed
-/// a row straight through would put the cell boundaries of a sampled draw a
-/// few ulps elsewhere and take a different turn often enough to build a
-/// different tree. It sums the same way instead. Growth is the one place this
-/// matters: everywhere else a few ulps stay a few ulps, and here they decide
-/// which node exists.
-///
-/// Only the lower half is folded at each step, and that is exact rather than a
-/// shortcut: IEEE addition is commutative, so `a[k] + a[k^s]` and
-/// `a[k^s] + a[k]` are the same bits and lanes `k` and `k^s` stay equal all the
-/// way down. The card's butterfly leaves every lane holding this value.
-#[cfg(test)]
-fn warp32_sum<const K: usize>(n: usize, f: impl Fn(usize) -> [f32; K]) -> [f32; K] {
-    let mut lane = [[0.0f32; K]; 32];
-    for (t, acc) in lane.iter_mut().enumerate() {
-        let mut i = t;
-        while i < n {
-            let v = f(i);
-            for k in 0..K {
-                acc[k] += v[k];
-            }
-            i += 32;
-        }
-    }
-    let mut s = 16;
-    while s > 0 {
-        for j in 0..s {
-            for k in 0..K {
-                let other = lane[j + s][k];
-                lane[j][k] += other;
-            }
-        }
-        s >>= 1;
-    }
-    lane[0]
-}
-
-/// Draw an index from non-negative weights, over the entries `live` accepts
-/// and no others. A row whose live weights have all underflowed is drawn
-/// uniformly over them rather than dropped; a row with no live entry at all
-/// gives nothing back.
-#[cfg(test)]
-fn pick_live(w: &[f32], live: impl Fn(usize) -> bool, rng: &mut Rng) -> Option<usize> {
-    // Weight and count in one walk, which is also how the card takes them.
-    let [total, count] =
-        warp32_sum(w.len(), |i| if live(i) { [w[i].max(0.0), 1.0] } else { [0.0, 0.0] });
-    let n = count as usize;
-    if n == 0 {
-        return None;
-    }
-    let mut last = None;
-    if !(total > 0.0) {
-        let mut k = rng.below(n);
-        for i in 0..w.len() {
-            if live(i) {
-                if k == 0 {
-                    return Some(i);
-                }
-                k -= 1;
-            }
-        }
-        unreachable!("a live entry was counted");
-    }
-    let mut needle = rng.unit_f64() * total as f64;
-    for (i, &weight) in w.iter().enumerate() {
-        if !live(i) {
-            continue;
-        }
-        last = Some(i);
-        needle -= weight.max(0.0) as f64;
-        if needle < 0.0 {
-            return Some(i);
-        }
-    }
-    last
-}
-
-/// Draw an index from non-negative weights without allocating. A row whose
-/// weights have all underflowed is drawn uniformly rather than dropped, and an
-/// empty row costs no draw at all.
-#[cfg(test)]
-fn pick(w: &[f32], rng: &mut Rng) -> usize {
-    let [total] = warp32_sum(w.len(), |i| [w[i].max(0.0)]);
-    if !(total > 0.0) {
-        return if w.is_empty() { 0 } else { rng.below(w.len()) };
-    }
-    let mut needle = rng.unit_f64() * total as f64;
-    for (i, &weight) in w.iter().enumerate() {
-        needle -= weight.max(0.0) as f64;
-        if needle < 0.0 {
-            return i;
-        }
-    }
-    w.len() - 1
-}
-
 impl TNode {
     /// Host bytes this node's own lists hold, beside the struct itself.
     ///
@@ -1120,7 +946,7 @@ pub enum Step {
 #[cfg(test)]
 mod reference;
 #[cfg(test)]
-pub use reference::HostCfr;
+pub use reference::{Arenas, Back, Conv, HostCfr};
 #[cfg(test)]
 use reference::ReferenceState;
 

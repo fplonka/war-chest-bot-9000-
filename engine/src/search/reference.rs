@@ -1,5 +1,35 @@
 use super::*;
 mod growth;
+mod sampling;
+pub use sampling::Arenas;
+
+/// Host-oracle work summed over the iterations that ran on it.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct Trace {
+    pub iters: u64,
+    pub row_iters: u64,
+    pub cidx_iters: u64,
+    pub cell_iters: u64,
+    pub join_rows: u64,
+    pub readout_cfgs: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Conv {
+    /// Exploitability of the reference average strategy.
+    pub nash: f32,
+    /// Sum of both root values; nonzero network leaves need not be antisymmetric.
+    pub zero_sum: f32,
+}
+
+/// The operation performed by an exact host backward pass.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Back {
+    Regret,
+    Value,
+    BestResponse,
+}
+
 #[derive(Default)]
 pub struct HostCfr {
     /// Accumulated regret, laid out exactly like `Solver::cur`.

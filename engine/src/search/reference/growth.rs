@@ -1,3 +1,4 @@
+use super::sampling::{pick, pick_live, warp32_sum};
 use super::*;
 
 impl Solver {
