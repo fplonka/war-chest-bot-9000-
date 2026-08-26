@@ -228,7 +228,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
     event_pairs = []
     stream = torch.cuda.current_stream(device) if profile_cuda and device.type == "cuda" else None
     for _ in range(steps):
-        if deadline is not None and time.time() >= deadline:
+        if time.time() >= deadline:
             break
         ts = time.perf_counter()
         ids = buf.sample_ids(batch, rng, recent_mix, recent_frac)
