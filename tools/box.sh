@@ -74,7 +74,7 @@ pull)
     if [ -z "$name" ]; then
         filters+=(--include '*/' --include '*.html' --include 'plotly.min.js'
                   --include 'log.json' --include 'epochs.jsonl'
-                  --include 'ladder*.json' --include 'config.json'
+                  --include 'config.json'
                   --include 'NOTES.md' --include 'train.log' --exclude '*')
     fi
     # `*.tmp` is a live run writing a snapshot or log.json atomically; rsync would list it,

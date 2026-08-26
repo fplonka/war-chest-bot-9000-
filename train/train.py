@@ -21,8 +21,8 @@ assembled by gathering spans -- see `Buffer`.
 
 The run snapshots every `snapshot_every` minutes. Training starts with a
 short greedy warm phase labelled by the public static evaluation, then the
-SoG phase. When training ends, the snapshots play a ladder and a report is
-written.
+SoG phase. When training ends, the snapshots are packed as bots for evaluation
+by `tools/arena.py`.
 
     python train/train.py out=seat
     python train/train.py out=seat note="centre the seat bit at +-0.5"
@@ -36,6 +36,7 @@ import json
 import math
 import os
 import pathlib
+import subprocess
 import sys
 import time
 
@@ -702,7 +703,7 @@ def publish_state(state):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Train one run, then rate its snapshots against Greedy.")
+        description="Train one run and pack its snapshots as bots.")
     ap.add_argument("over", nargs="*", help="knob=value (production defaults)")
     over = config.parse(ap.parse_args().over)
     resume = over.pop("resume", "")
@@ -868,13 +869,8 @@ def main():
     warchest.set_cap_value(cap_v)
     probe = None
 
-    # Snapshots. Nothing selects between them during the run. Bootstrapped value
-    # learning is not monotone, so there is a real question about which weights
-    # are best -- but a match large enough to answer it costs minutes of the
-    # budget (300 paired games: standard error 0.029, about the size of the gap
-    # between neighbouring snapshots), and answering it from a noisy match is
-    # how you ship a checkpoint chosen by a coin flip. The ladder rates all of
-    # them at the end, off the clock.
+    # Snapshots are archival only. Evaluate the packed bots separately after
+    # the run, outside the training clock.
     snaps = checkpoint["snapshots"] if checkpoint else []
     grace_rows = RESUME_GRACE_ROWS if checkpoint else 0
     if checkpoint:
@@ -1462,28 +1458,8 @@ def main():
     run_search_pipeline()
 
     snapshot("final", time.time() - t0)
-    if args.ladder_games:
-        # Every snapshot becomes an immutable bot for the ladder, and a bot
-        # solves on whatever cards it finds. A ladder is thousands of solves at
-        # the training budget; on the CPU that was an hour a run, which is far
-        # too dear for the thing that says whether the run learned anything.
-        arena = [sys.executable, str(ROOT / "tools" / "arena.py")]
-        bot_dir = ROOT / "bots"
-        subprocess.run(arena + ["pack", args.out, "--out", str(bot_dir)], check=True)
-        subprocess.run(arena + ["pack-greedy", "--out", str(bot_dir)], check=True)
-        tag = pathlib.Path(args.out).name
-        bots = [str(bot_dir / f"{tag}.{snap['label']}") for snap in snaps
-                if snap["label"] != "final"]
-        final = str(bot_dir / f"{tag}.final")
-        # Greedy first, so ratings are quoted against the one reference that
-        # means the same thing from one run to the next. Without it a ladder
-        # only says which snapshot beats which other snapshot, which every run
-        # can satisfy while learning nothing, so a missing or unrunnable anchor
-        # is a failure rather than something to drop.
-        greedy = bot_dir / "greedy"
-        subprocess.run(arena + ["ladder", str(greedy), *bots, final,
-                                "--games", str(args.ladder_games),
-                                "--out", f"{args.out}/ladder.json"], check=True)
+    arena = [sys.executable, str(ROOT / "tools" / "arena.py")]
+    subprocess.run(arena + ["pack", args.out, "--out", str(ROOT / "bots")], check=True)
 
 
 if __name__ == "__main__":

@@ -81,9 +81,8 @@ the agent you play is the agent the ladder rated, down to the binary.
 
 A run saves the network every few minutes and judges nothing while it trains.
 When it ends, every snapshot is archived as a **bot** — a directory holding a
-frozen binary, its weights and a manifest — and the arena plays them against
-each other and against the archived reference bots. What a run reports is
-strength against minutes trained. `train.py` does this automatically:
+frozen binary, its weights and a manifest. Run the arena explicitly after the
+run to measure the bots:
 
 ```bash
 python tools/arena.py pack runs/mine            # bots/mine.init, bots/mine.s1, ...
@@ -94,12 +93,12 @@ The same command rates one architecture against another, because a bot built at
 an old revision keeps playing after the source that produced it has been
 rewritten.
 
-`bots/greedy` is the anchor every run is quoted against, and it is a **binary,
-so each machine needs its own**. The `Greedy` mind was deleted from the engine
-at 260c88b, so it is built from **ed85b88**, the commit before: check that sha
-out into a scratch tree, `cargo build --release --bin bot` with no `gpu`
-feature, and copy the binary over `bots/greedy/bot`, then update the `binary`
-digest in `bots/greedy/bot.json` to match. `python tools/arena.py hello
+`bots/greedy` is an optional anchor for an explicit arena match, and it is a
+**binary, so each machine needs its own**. The `Greedy` mind was deleted from
+the engine at 260c88b, so it is built from **ed85b88**, the commit before:
+check that sha out into a scratch tree, `cargo build --release --bin bot` with
+no `gpu` feature, and copy the binary over `bots/greedy/bot`, then update the
+`binary` digest in `bots/greedy/bot.json` to match. `python tools/arena.py hello
 bots/greedy` starts it and prints its greeting; the ladder runs the same check
 on every bot before it plays, so an anchor from the wrong platform stops a run
 rather than being silently dropped.

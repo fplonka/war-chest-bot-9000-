@@ -310,8 +310,7 @@ function render(d) {
   d.health.forEach(([k, v]) => { hl.appendChild(E("dt", null, k));
     hl.appendChild(E("dd", null, v)); });
 
-  const box = $("ladders"); box.textContent = "";
-  Object.entries(d.ladders || {}).forEach(([name, l]) => ladder(box, name, l));
+  $("ladders").textContent = "";
 
   const text = $("text");
   if (!text.firstChild) ["notes", "train.log"].forEach(h => {

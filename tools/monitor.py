@@ -29,7 +29,6 @@ ASSETS = {
 sys.path.insert(0, os.path.join(HERE, "train"))
 import config  # noqa: E402  -- knobs(), so the baseline lives in one place
 
-CI95 = 1.96   # ladder.json stores the 1-sigma Bradley-Terry SE
 LIVE = 120    # an epoch log untouched for this long is not a live run
 EPOCH_LIMIT = 2048
 
@@ -134,24 +133,6 @@ def panel(title, ylabel, x, ss, zero=False, hlines=(), marks=False):
             "zero": zero, "h": list(hlines), "marks": marks}
 
 
-def elo_panel(lad, name):
-    """This run's snapshots on a ladder that may also hold other bots. A
-    snapshot bot is named `<run>.<label>` and carries the minutes it trained
-    for; anything else on the ladder is a reference, not a point on the curve."""
-    if not lad:
-        return None
-    ps = sorted((p for p in lad.get("players", [])
-                 if p.get("minutes") is not None
-                 and p["name"].startswith(name + ".")),
-                key=lambda p: p["minutes"])
-    greedy = next((p for p in lad.get("players", []) if p["name"] == "greedy"), None)
-    x = [p["minutes"] for p in ps]
-    return panel("Strength vs training time", "elo (95% CI)", x,
-                 [series("snapshot", [p["elo"] for p in ps],
-                         err=[CI95 * (p.get("se") or 0) for p in ps])],
-                 hlines=[("greedy", greedy["elo"])] if greedy else (), marks=True)
-
-
 PANELS = (
     ("Value loss", "huber", (("value", "loss"),), False, ()),
     ("Value loss by row age", "huber",
@@ -209,16 +190,16 @@ PANELS = (
      True, ()),
     ("Replay age", "seconds retained", (("replay age", "buf_s"),), True, ()),
     # The horizon cuts a game at 256 coin plays and scores it a draw. A rising
-    # rate means the ladder is measuring a game that is increasingly not real.
+    # rate means evaluation sees a game that is increasingly not real.
     ("Games cut at horizon", "fraction", (("games cut at horizon", "horizon_frac"),),
      True, ()),
 )
 
 
-def panels(eps, elo):
+def panels(eps):
     """Every panel of the dashboard, from the SoG epochs logged so far."""
     m = [e["t"] / 60.0 for e in eps]
-    out = [elo] + [
+    out = [
         panel(title, ylabel, m,
               [series(label, [e.get(key) for e in eps], True)
                for label, key in specs], zero=zero, hlines=hlines)
@@ -356,20 +337,13 @@ def detail(runs_dir, name):
            if e.get("phase") == "sog" and e.get("solves", 0) > 0
            and e.get("steps", 1) > 0]
     cfg = log.get("cfg") or {}
-    # Only ladders in the current format. Older runs kept a `ladder.json`
-    # written by code that no longer exists; the file is history, not something
-    # to render.
-    lads = {os.path.basename(p)[:-5]: read_json(p)
-            for p in sorted(glob.glob(os.path.join(path, "ladder*.json")))}
-    lads = {k: v for k, v in lads.items() if v and v.get("kind") == "ladder"}
     out = {"name": name, "epochs": len(eps),
            "cfg": [[k, str(v), ch] for k, v, ch in config.knobs(cfg)],
-           "panels": panels(eps, elo_panel(lads.get("ladder")
-                                           or next(iter(lads.values()), None), name)),
+           "panels": panels(eps),
            "health": health(eps),
            "snaps": [s.get("t", 0) / 60.0 for s in log.get("snapshots") or []]}
     for key, val in (("note", cfg.get("note")), ("git", cfg.get("git")),
-                     ("ladders", lads), ("log", read_text(f"{path}/train.log")),
+                     ("log", read_text(f"{path}/train.log")),
                      ("notes", read_text(f"{path}/NOTES.md"))):
         if val:
             out[key] = val

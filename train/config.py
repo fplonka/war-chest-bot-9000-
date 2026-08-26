@@ -77,7 +77,6 @@ class Cfg:
     # the real game.
     cap_value: float = 0.15
     random_draft: bool = True
-    ladder_games: int = 40
 
     device: str = "cuda:1"
     # Cards the solve farm evaluates on. A round is split across them by call,

@@ -21,7 +21,7 @@ LOGS=/workspace/logs
 mkdir -p "$LOGS"
 rm -rf "runs/$OUT"
 
-python train/train.py "out=$OUT" minutes=6 snapshot_every=30 ladder_games=0 \
+python train/train.py "out=$OUT" minutes=6 snapshot_every=30 \
     "note=generation rate only" > "$LOGS/genrate.log" 2>&1 &
 pid=$!
 
