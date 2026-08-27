@@ -855,7 +855,6 @@ def main():
     value = Net().to(dev)
     if args.init_weights:
         value.load_state_dict(load_checkpoint(args.init_weights).state_dict())
-    opt = torch.optim.Adam(value.parameters(), lr=args.lr)
     value.push()
     target_state = cpu_state(value)
     buf = Buffer(args.cap, args.cap * args.cfgs_per_row)
@@ -879,9 +878,15 @@ def main():
     seg = torch.arange(k, device=dev) % (2 * n)
     y = torch.zeros(k, device=dev)
     parts = (x, phi, w, seg, y, 2 * n, None)
-    opt.zero_grad(set_to_none=True)
+    # This step only reserves the optimizer-state and activation memory. Keep
+    # its Adam state out of the optimizer used by training.
+    prealloc_opt = torch.optim.Adam(value.parameters(), lr=args.lr)
+    prealloc_opt.zero_grad(set_to_none=True)
     losses(value, *parts, wp=0.0).backward()
-    opt.step()
+    prealloc_opt.step()
+    prealloc_opt.zero_grad(set_to_none=True)
+    del prealloc_opt
+    opt = torch.optim.Adam(value.parameters(), lr=args.lr)
     forward_values(value, parts)
     torch.cuda.synchronize(dev)
     if checkpoint:
@@ -1463,6 +1468,9 @@ def main():
                 f"rows={n:6d} L={lv if steps else float('nan'):.5f} "
                 f"tgt={rec['tgt_mean']:+.3f}/{rec['tgt_std']:.3f} "
                 f"gen={gen_s:.1f}s train={train_s:.1f}s")
+        # Greedy labels and SoG targets are different distributions. Start
+        # Adam again so warm-phase momentum and variance do not carry over.
+        opt = torch.optim.Adam(value.parameters(), lr=args.lr)
         value.push()
         target_state = cpu_state(value)
         sog_t0 = time.time()
