@@ -26,6 +26,7 @@
 //! ship a delta per iteration rather than itself.
 
 use crate::farm::{Dst, Writes};
+use crate::pbs::normalize_strategy;
 use crate::search::{Ent, Solver, NO_TRANS};
 
 /// What a node is, for a device that cannot afford a branch per field.
@@ -768,14 +769,8 @@ impl Contract {
                         cur[so + cell] = v;
                         total += v;
                     }
-                    if total > 0.0 {
-                        let inv = 1.0 / total;
-                        for cell in a..b {
-                            cur[so + cell] *= inv;
-                        }
-                    } else {
-                        cur[so + a..so + b].fill(1.0 / (b - a) as f32);
-                    }
+                    // A tiny positive mass cannot be inverted without making zero cells NaN.
+                    normalize_strategy(&mut cur[so + a..so + b], total);
                 }
                 for x in sum[so..so + cells].iter_mut() {
                     *x *= dg;
@@ -790,7 +785,7 @@ mod tests {
     use super::*;
     use crate::rng::Rng;
 
-    use crate::search::Cfg;
+    use crate::search::{Cfg, Cfr};
     use std::sync::Arc;
     use crate::selfplay::collect_roots;
     use crate::board::N_HEXES;
@@ -808,6 +803,48 @@ mod tests {
             ln[n.g..n.g + n.width].fill(1.0);
         }
         crate::net::Net::from_flat(&w, &b, &ln).expect("random net")
+    }
+
+    /// Standard regret matching must use a uniform row when positive mass is
+    /// zero or too small to invert without turning zero cells into NaN.
+    #[test]
+    fn regret_matching_falls_back_for_zero_and_underflowed_mass() {
+        let contract = Contract {
+            kind: vec![KIND_DECISION],
+            player: vec![0],
+            nc: vec![[1, 0]],
+            voff: vec![0],
+            soff: vec![0],
+            legal_base: vec![0],
+            legal_off: vec![0, 2],
+            legal_trans: vec![NO_TRANS; 2],
+            level_start: vec![0, 1],
+            level_node: vec![0],
+            ..Default::default()
+        };
+        let run = |regret: [f32; 2]| {
+            let (mut vals, mut cur, mut regret, mut sum, mut qval) =
+                (vec![0.0; 2], vec![0.0; 2], regret.to_vec(), vec![0.0; 2], vec![0.0; 2]);
+            contract.backprop(
+                0,
+                Cfr::LINEAR,
+                (1.0, 1.0, 1.0),
+                &mut vals,
+                &mut cur,
+                &mut regret,
+                &mut sum,
+                &mut qval,
+            );
+            cur
+        };
+
+        assert_eq!(run([-1.0, -1.0]), [0.5, 0.5]);
+        let underflowed = run([f32::from_bits(1), -1.0]);
+        assert!(
+            underflowed.iter().all(|value| value.is_finite()),
+            "underflowed strategy row: {underflowed:?}"
+        );
+        assert_eq!(underflowed, [0.5, 0.5]);
     }
 
     /// The transposed reach must reproduce `Solver::propagate` exactly, not

@@ -168,8 +168,9 @@ impl Solver {
                 let row = n.legal_row(c);
                 let sum: f32 = sum_strat[i][row.clone()].iter().sum();
                 let k = row.len().max(1) as f32;
+                // A tiny positive mass cannot be inverted without making zero cells NaN.
                 for cell in row {
-                    self.avg[so + cell] = if sum > 0.0 {
+                    self.avg[so + cell] = if sum > SMOOTH {
                         sum_strat[i][cell] / sum
                     } else {
                         1.0 / k
@@ -537,10 +538,8 @@ impl Solver {
     /// and update regret matching, or take the max. Regret mode uses
     /// `self.cur`; fixed-policy modes read `strat`.
     pub fn backprop(&mut self, traverser: usize, strat: &[f32], mode: Back) {
-        // Regret matching floors at EPS rather than at zero, so every legal
-        // action keeps positive probability and carried beliefs keep their
-        // full support. The factors are constant for this whole traversal.
-        const EPS: f32 = 1e-6;
+        // Standard positive-part regret matching keeps zero-total rows uniform.
+        // The factors are constant for this whole traversal.
         let rm = if mode == Back::Regret {
             let k = self.cfg.cfr;
             let m = self.steps[traverser] as f32 + 1.0;
@@ -647,6 +646,7 @@ impl Solver {
                         for c in 0..nc {
                             let base = vi[c];
                             let row = n.legal_row(c);
+                            let (row_start, row_end) = (row.start, row.end);
                             let mut sum = 0.0;
                             for cell in row.clone() {
                                 // Re-form this row-local action value rather
@@ -664,16 +664,12 @@ impl Solver {
                                 let old = cfr.regret[at];
                                 let r = old * if old > 0.0 { da } else { db } + delta;
                                 cfr.regret[at] = r;
-                                let v = (r + k.predict * delta).max(EPS);
+                                let v = (r + k.predict * delta).max(0.0);
                                 self.cur[at] = v;
                                 sum += v;
                             }
-                            if sum > 0.0 {
-                                let inv = 1.0 / sum;
-                                for cell in row {
-                                    self.cur[so + cell] *= inv;
-                                }
-                            }
+                            // A tiny positive mass cannot be inverted without making zero cells NaN.
+                            normalize_strategy(&mut self.cur[so + row_start..so + row_end], sum);
                         }
                         for x in cfr.sum_strat[i].iter_mut() {
                             *x *= dg;

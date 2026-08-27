@@ -744,6 +744,8 @@ __device__ __forceinline__ float cfr_factor(float t, float p) {
     return x / (x + 1.0f);
 }
 
+// A positive mass below this threshold can invert to infinity in f32.
+#define SMOOTH 1e-30f
 #define NO_ROW 0xffffffffu
 #define NO_TRANS 0xffffffffu
 #define KIND_LEAF 2u
@@ -947,7 +949,8 @@ __global__ void k_backprop_sweep(const Tree* trees, const unsigned int* work, in
             total += v;
         }
         total = warp_sum(total);
-        if (total > 0.0f) {
+        // A tiny positive mass cannot be inverted without making zero cells NaN.
+        if (total > SMOOTH) {
             float inv = 1.0f / total;
             for (unsigned int cell = a + lane; cell < b; cell += 32) t.cur[so + cell] *= inv;
         } else {
@@ -1103,11 +1106,12 @@ void k_leaf(const Tree* trees, const int* part_of_row, const int* local_row,
         for (unsigned int c = lane; c < n; c += 32) total += t.reach[ra + c];
         total = warp_sum(total);
         if (lane == 0) mass[qr] = total;
-        float inv = total > 0.0f ? 1.0f / total : 1.0f / (float)max(n, 1u);
+        // A tiny positive mass cannot be inverted without making zero cells NaN.
+        float inv = total > SMOOTH ? 1.0f / total : 1.0f / (float)max(n, 1u);
         for (int j = lane; j < J_POOL; j += 32) {
             float acc = 0.0f;
             for (unsigned int k = lo; k < hi; ++k) {
-                float belief = total > 0.0f ? t.reach[ra + k - lo] * inv : inv;
+                float belief = total > SMOOTH ? t.reach[ra + k - lo] * inv : inv;
                 acc += belief * t.g[(size_t)t.cidx[k - base] * J_POOL + j];
             }
             pooled[(size_t)qr * J_POOL + j] = acc;
@@ -1358,7 +1362,7 @@ __device__ unsigned int puct_choice(const Tree& t, unsigned int node, unsigned i
     float mass = 0.0f;
     for (unsigned int i = threadIdx.x; i < nc; i += 32) mass += t.reach[ra + i];
     mass = warp_sum(mass);
-    float scale = mass > 1e-30f ? __fdiv_rn(1.0f, mass) : 0.0f;
+    float scale = mass > SMOOTH ? __fdiv_rn(1.0f, mass) : 0.0f;
     float total = 0.0f;
     for (unsigned int cell = a + threadIdx.x; cell < b; cell += 32)
         total += t.visits[so + cell];
@@ -1426,12 +1430,13 @@ __global__ void k_prior_inputs(const Tree* trees, const unsigned int* part,
         float total = 0.0f;
         for (unsigned int c = lane; c < n; c += 32) total += t.reach[ra + c];
         total = warp_sum(total);
-        float inv = total > 0.0f ? 1.0f / total : 1.0f / (float)max(n, 1u);
+        // A tiny positive mass cannot be inverted without making zero cells NaN.
+        float inv = total > SMOOTH ? 1.0f / total : 1.0f / (float)max(n, 1u);
         unsigned int cs = t.coff[2 * row_of[k] + player];
         for (int j = lane; j < pool; j += 32) {
             float acc = 0.0f;
             for (unsigned int c = 0; c < n; ++c) {
-                float belief = total > 0.0f ? t.reach[ra + c] * inv : inv;
+                float belief = total > SMOOTH ? t.reach[ra + c] * inv : inv;
                 acc += belief * t.g[(size_t)t.cidx[cs + c] * pool + j];
             }
             input[(size_t)k * (2 * pool + 1) + role * pool + j] = acc;
@@ -1495,7 +1500,7 @@ __global__ void k_prior(const Tree* trees, const unsigned int* part,
         mine += v;
     }
     float total = warp_sum(mine);
-    float scale = total > 0.0f ? 1.0f / total : 1.0f / (float)(b - a);
+    float scale = total > SMOOTH ? 1.0f / total : 1.0f / (float)(b - a);
     for (unsigned int cell = a + lane; cell < b; cell += 32) t.prior[so + cell] *= scale;
 }
 
@@ -1643,8 +1648,9 @@ __global__ void k_finish(const Tree* trees, const unsigned int* work, int at,
         float sum = 0.0f;
         for (unsigned int cell = a; cell < b; ++cell) sum += t.sum[so + cell];
         float k = (float)max(b - a, 1u);
+        // A tiny positive mass cannot be inverted without making zero cells NaN.
         for (unsigned int cell = a; cell < b; ++cell)
-            t.avg[so + cell] = sum > 0.0f ? t.sum[so + cell] / sum : 1.0f / k;
+            t.avg[so + cell] = sum > SMOOTH ? t.sum[so + cell] / sum : 1.0f / k;
     }
 }
 
