@@ -35,8 +35,7 @@
 //! Needs a GPU, so it only builds under `--features gpu`.
 #![cfg(feature = "gpu")]
 
-use std::ops::Deref;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, OnceLock};
 
 use warchest::contract::NO_ROW;
 use warchest::cuda::Device;
@@ -116,42 +115,59 @@ struct Run {
     nodes: Vec<usize>,
 }
 
-/// A card carved at a budget that covers every solve these tests grow.
-///
-/// `Cfg::default` is `SoG(512)`'s p90. Several tests here run `s` two and three
-/// times that, and a slot at 512 is then a write past the arena. Four slots,
-/// not eight: two pipes of round scratch at this budget fill a 24 GB card
-/// before eight slots would fit. Tests that need more concurrent slots use a
-/// 512 budget, where the trees are small.
-static GPU: Mutex<()> = Mutex::new(());
+/// All parity tests share one card and carve its slots once. Each test uses a
+/// private slot range, so the test runner can keep its threads parallel.
+const GPU_SLOTS: usize = 32;
+static DEVICE: OnceLock<Device> = OnceLock::new();
 
-/// One parity test owns the card at a time. Each test carves most of GPU 0,
-/// so parallel test threads would test allocation failure instead of parity.
-struct TestDevice {
-    device: Device,
-    _guard: MutexGuard<'static, ()>,
+fn shared_device() -> &'static Device {
+    DEVICE.get_or_init(|| {
+        Device::new(
+            &[0],
+            random_net(0x9E37),
+            Cfg { budget: Budget::for_s(512), ..Default::default() },
+            GPU_SLOTS,
+        )
+        .expect("device")
+    })
 }
 
-impl Deref for TestDevice {
-    type Target = Device;
+#[derive(Clone, Copy)]
+struct TestDevice {
+    device: &'static Device,
+    slot_base: usize,
+}
 
-    fn deref(&self) -> &Device {
-        &self.device
+impl TestDevice {
+    fn run(&self, calls: &[Call], lane: usize) -> Option<Vec<Reply>> {
+        let calls: Vec<Call> = calls.iter().map(|call| shift_call(call, self.slot_base)).collect();
+        self.device.run(&calls, lane)
+    }
+
+    fn resident(&self, card: usize, solve: usize) -> Result<warchest::cuda::Resident, String> {
+        self.device.resident(card, self.slot_base + solve)
+    }
+
+    fn expand_rows(&self, rows: &[u8]) -> Result<Vec<f32>, String> {
+        self.device.expand_rows(rows)
     }
 }
 
-fn test_device(net: Net, cfg: Cfg, slots: usize) -> TestDevice {
-    let guard = GPU.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let device = Device::new(&[0], net, cfg, slots).expect("device");
-    TestDevice { device, _guard: guard }
+fn shift_call(call: &Call, base: usize) -> Call {
+    let mut shifted = call.clone();
+    match &mut shifted {
+        Call::Trunk { solve, .. }
+        | Call::Configs { solve, .. }
+        | Call::Tree { solve, .. }
+        | Call::Iterate { solve, .. }
+        | Call::Read { solve, .. } => *solve += base,
+    }
+    shifted
 }
 
-fn gpu(net: Net) -> TestDevice {
-    test_device(
-        net,
-        Cfg { budget: Budget::for_s(2048), ..Default::default() },
-        4,
-    )
+fn gpu(slot_base: usize) -> TestDevice {
+    assert!(slot_base < GPU_SLOTS, "test slot range starts outside the device");
+    TestDevice { device: shared_device(), slot_base }
 }
 
 #[test]
@@ -182,7 +198,7 @@ fn packed_rows_expand_on_the_card() {
     for (row, out) in rows.chunks_exact(ROW_BYTES).zip(want.chunks_exact_mut(PUBFEAT)) {
         expand_row(row, out);
     }
-    let got = gpu(random_net(13)).expand_rows(&rows).expect("expand rows");
+    let got = gpu(0).expand_rows(&rows).expect("expand rows");
     for (i, (&a, &b)) in want.iter().zip(&got).enumerate() {
         if a == 0.0 || a == 1.0 {
             assert_eq!(a.to_bits(), b.to_bits(), "one-hot feature {i}");
@@ -320,7 +336,7 @@ fn run_solve(backend: &Backend, mut sv: Solver) -> (Solver, Option<Solved>) {
 #[test]
 fn a_solve_may_change_pipeline_streams() {
     let net = random_net(0x9E37);
-    let device = Backend::Cuda(gpu(net.clone()));
+    let device = Backend::Cuda(gpu(0));
     let nets = Arc::new(net);
     let fresh = || {
         let mut data = Data::default();
@@ -416,7 +432,7 @@ fn the_cfr_loop_agrees_on_a_fixed_tree() {
     let host = generate_one(&net, Backend::Reference(net.clone()), 3, 8, 0.0);
     let card = generate_one(
         &net,
-        Backend::Cuda(gpu(net.clone())),
+        Backend::Cuda(gpu(1)),
         3,
         8,
         0.0,
@@ -493,7 +509,7 @@ fn the_cfr_loop_agrees_on_a_fixed_tree() {
 #[test]
 fn growth_is_the_same_rule_as_the_reference() {
     let net = random_net(0x9E37);
-    let device = Backend::Cuda(gpu(net.clone()));
+    let device = Backend::Cuda(gpu(2));
     let Backend::Cuda(d) = &device else { unreachable!("just built") };
     let nets = Arc::new(net.clone());
     let streams = [
@@ -632,7 +648,7 @@ fn growth_on_the_device_produces_sane_targets() {
     let net = random_net(0x9E37);
     let card = generate_one(
         &net,
-        Backend::Cuda(gpu(net.clone())),
+        Backend::Cuda(gpu(6)),
         3,
         32,
         4.0,
@@ -670,7 +686,7 @@ fn a_solve_does_not_depend_on_the_round_it_rides_in() {
         (0x77C1, cfg(13, 0.0)),
         (0x2E57, cfg(17, 0.0)),
     ];
-    let device = || Backend::Cuda(gpu(net.clone()));
+    let device = || Backend::Cuda(gpu(7));
     let together = generate(&net, device(), &streams, 3);
     // A shared round must not move a solve at all, so the same run twice is
     // the control: whatever this reports is the floor the comparison sits on.
@@ -774,7 +790,7 @@ fn a_ragged_round_does_not_move_the_small_solve() {
     };
 
     let (alone, tiny) = {
-        let device = Backend::Cuda(gpu(net.clone()));
+        let device = Backend::Cuda(gpu(11));
         let (mut g, mut data, sv) = small();
         let (sv, solved) = run_solve(&device, sv);
         let tiny = sv.nodes.len();
@@ -782,7 +798,7 @@ fn a_ragged_round_does_not_move_the_small_solve() {
         (data, tiny)
     };
 
-    let device = Backend::Cuda(gpu(net.clone()));
+    let device = Backend::Cuda(gpu(11));
     // Two partners, in slots of their own, grown on their own for twelve
     // rounds. A round carries `Cfg::batch` regret updates, so a budget's rounds
     // are `ceil(ceil(s / c) / 4)`: both of these run 128 updates and so 32
@@ -866,7 +882,7 @@ fn a_growing_solve_does_not_depend_on_the_round_it_rides_in() {
         (0x77C1, batched(64, 8.0)),
         (0x2E57, batched(80, 5.0)),
     ];
-    let device = || Backend::Cuda(gpu(net.clone()));
+    let device = || Backend::Cuda(gpu(14));
     let together = generate(&net, device(), &streams, 2);
     for (i, &s) in streams.iter().enumerate() {
         let alone = generate(&net, device(), &[s], 2).pop().expect("one stream");
@@ -922,7 +938,7 @@ fn a_growing_solve_does_not_depend_on_the_round_it_rides_in() {
 fn the_resident_state_agrees_with_the_cpu_network() {
     let net = random_net(0x9E37);
     let host = one_solve(&net, &Backend::Reference(net.clone()), 8, 0.0);
-    let device = Backend::Cuda(gpu(net.clone()));
+    let device = Backend::Cuda(gpu(18));
     let card = one_solve(&net, &device, 8, 0.0);
     let Backend::Cuda(d) = &device else { unreachable!("just built") };
     let got = d.resident(0, 0).expect("the card gave its solve back");
@@ -978,7 +994,7 @@ fn a_subgame_scored_from_the_game_agrees_with_the_cpu() {
     let net = random_net(0x9E37);
     let nets = Arc::new(net.clone());
     let host_nets = Arc::new(net.clone());
-    let backend = Backend::Cuda(gpu(net.clone()));
+    let backend = Backend::Cuda(gpu(19));
     let host = Backend::Reference(net.clone());
     let uniform = |s: &State, ctx: &Ctx, p: u8| {
         let truth = true_config(s, p, ctx);
@@ -1059,14 +1075,9 @@ fn a_subgame_scored_from_the_game_agrees_with_the_cpu() {
 fn k_iterates_together_match_k_iterates_alone() {
     const K: usize = 4;
     let net = random_net(0x9E37);
-    // Eight slots at the 2048 growth budget do not fit two pipes of round
-    // scratch on a 24 GB card. These trees never grow (`c = 0`, `s = 8`), so
-    // the live 512 budget is the one that has room for eight copies.
-    let device = test_device(
-        net.clone(),
-        Cfg { budget: Budget::for_s(512), ..Default::default() },
-        8,
-    );
+    // These trees never grow (`c = 0`, `s = 8`), so the shared 512 budget
+    // leaves room for all eight copies.
+    let device = gpu(20);
     let nets = Arc::new(net.clone());
     let mut setup = Vec::new();
     let mut iterates = Vec::new();

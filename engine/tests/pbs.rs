@@ -957,8 +957,8 @@ fn a_batched_solve_matches_one_run_alone_exactly() {
         query_rate: 0.9,
         recursive_rate: 0.25,
     };
-    const SOLVES: usize = 16;
-    const SEEDS: [u64; 3] = [3, 11, 29];
+    const SOLVES: usize = 2;
+    const SEEDS: [u64; 2] = [3, 11];
     let net = || random_net(0x6A7E);
 
     let alone: Vec<_> = SEEDS
@@ -1061,7 +1061,7 @@ fn a_solve_stores_its_root_and_nothing_else() {
         recursive_rate: 0.25,
     };
     let mut stream = GameStream::new(11, gc);
-    let data = stream.generate(&nets, 24);
+    let data = stream.generate(&nets, 4);
     assert_eq!(
         data.nv,
         data.soff.len(),

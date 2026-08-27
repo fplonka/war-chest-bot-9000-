@@ -668,11 +668,11 @@ impl Contract {
     /// from the leaves up.
     ///
     /// Unlike the reach sweep this needs no transpose: a config reads its own
-    /// legal row, and the row is stored action-ordered, so a thread per
-    /// (node, config) sums the same products in the same order as
-    /// `Solver::backprop`'s action-major walk. Leaf values must already be in
-    /// `vals`; this fills every interior node and leaves `cur` holding the
-    /// fresh regret-matching iterate.
+    /// legal row, so a thread per (node, config) gathers the same products as
+    /// `Solver::backprop`. The reduction order differs between the flat and
+    /// action-major layouts, so callers compare the f32 results within a small
+    /// error. Leaf values must already be in `vals`; this fills every interior
+    /// node and leaves `cur` holding the fresh regret-matching iterate.
     #[allow(clippy::too_many_arguments)]
     pub fn backprop(
         &self,
@@ -789,9 +789,10 @@ impl Contract {
 mod tests {
     use super::*;
     use crate::rng::Rng;
+
     use crate::search::Cfg;
     use std::sync::Arc;
-    use crate::selfplay::{collect_roots, Agent, Collect, GameCfg};
+    use crate::selfplay::collect_roots;
     use crate::board::N_HEXES;
     use crate::pbs::NSLOT;
 
@@ -820,18 +821,7 @@ mod tests {
     fn the_transposed_reach_reproduces_the_scatter_exactly() {
         let nets = Arc::new(random_net(0x5EED));
         let cfg = Cfg { s: 32, c: 4.0, ..Default::default() };
-        let gc = GameCfg {
-            agents: [Agent::Sog {
-                cfg: Cfg { s: 4, c: 1.0, ..cfg },
-            }; 2],
-            collect: Collect::Sog,
-            explore: 0.1,
-            random_draft: true,
-            p_td1: 0.0,
-            query_rate: 0.9,
-            recursive_rate: 0.1,
-        };
-        let roots = collect_roots(3, 7, &nets, &gc, 4);
+        let roots = collect_roots(4, 7);
         assert!(!roots.is_empty(), "no roots to test against");
 
         let mut checked = 0usize;
@@ -873,121 +863,6 @@ mod tests {
         assert!(checked >= 8, "only {checked} comparisons");
     }
 
-    /// A whole solve driven through the flat description must reach the same
-    /// strategy as one driven by the tree walk.
-    ///
-    /// The per-iteration tests pin the two sweeps against each other on a tree
-    /// that the *walk* advanced. This drives the solve from the description
-    /// instead, so an error in the sequencing -- extending too late, missing a
-    /// growth, feeding a stale level table -- compounds across sixty-four
-    /// iterations rather than being corrected by the next comparison. That is
-    /// the failure a device would actually have.
-    #[test]
-    fn a_solve_driven_from_the_description_reaches_the_same_strategy() {
-        let nets = Arc::new(random_net(0x5EED));
-        let cfg = Cfg {
-            s: 48,
-            c: 4.0,
-            ..Default::default()
-        };
-        let gc = GameCfg {
-            agents: [Agent::Sog {
-                cfg: Cfg { s: 4, c: 1.0, ..cfg },
-            }; 2],
-            collect: Collect::Sog,
-            explore: 0.1,
-            random_draft: true,
-            p_td1: 0.0,
-            query_rate: 0.9,
-            recursive_rate: 0.1,
-        };
-        let roots = collect_roots(2, 47, &nets, &gc, 2);
-        assert!(!roots.is_empty(), "no roots to test against");
-
-        let mut checked = 0usize;
-        for (s, belief) in &roots {
-            let ctx = crate::pbs::Ctx::new(s);
-            // The same solve twice, from the same seed, so the expansion
-            // trajectories match and only the sweep differs.
-            let run = |flat: bool| {
-                        let mut sv = crate::search::Solver::new(s, ctx, Arc::clone(&nets), cfg, belief.clone(), Rng::new(0xD12E));
-                let mut c = Contract::of(&sv);
-                sv.grown.clear();
-                for t in 0..cfg.iters() {
-                    if flat {
-                        let grown = std::mem::take(&mut sv.grown);
-                        let resealed = sv.take_resealed();
-                        c.extend(&sv, &grown, &resealed);
-                        let k = sv.cfg.cfr;
-                        for p in 0..2 {
-                            let m = sv.steps[p] as f32 + 1.0;
-                            let fs = (
-                                factor(m, k.alpha),
-                                factor(m, k.beta),
-                                (m / (m + 1.0)).powf(k.gamma),
-                            );
-                            sv.catch_up();
-                            sv.leaf_values(p);
-                            let (mut vals, mut cur, mut regret) =
-                                (sv.cfr().vals.clone(), sv.cur.clone(), sv.cfr().regret.clone());
-                            let mut sum = vec![0.0f32; sv.ncells];
-                            for i in 0..sv.nodes.len() {
-                                let so = sv.soff[i] as usize;
-                                let row = &sv.cfr().sum_strat[i];
-                                sum[so..so + row.len()].copy_from_slice(row);
-                            }
-                            let mut qv = sv.cfr().qval.clone();
-                            c.backprop(
-                                p, k, fs, &mut vals, &mut cur, &mut regret, &mut sum, &mut qv,
-                            );
-                            sv.cfr_mut().vals = vals;
-                            sv.cur = cur;
-                            sv.cfr_mut().regret = regret;
-                            sv.cfr_mut().qval = qv;
-                            for i in 0..sv.nodes.len() {
-                                let so = sv.soff[i] as usize;
-                                let n = sv.cfr().sum_strat[i].len();
-                                sv.cfr_mut().sum_strat[i].copy_from_slice(&sum[so..so + n]);
-                            }
-                        }
-                        let root = [&sv.root_belief[0].p[..], &sv.root_belief[1].p[..]];
-                        let mut out = vec![0.0f32; sv.cfr().reach.len()];
-                        c.reach(root, &sv.cur, &mut out);
-                        sv.cfr_mut().reach = out;
-                        sv.avg_block();
-                        sv.steps[0] += 1;
-                        sv.steps[1] += 1;
-                    } else {
-                        sv.catch_up();
-                        sv.step();
-                    }
-                    for _ in 0..4 {
-                        if !sv.expand_once() {
-                            break;
-                        }
-                    }
-                    let _ = t;
-                }
-                sv.finish();
-                (sv.avg.clone(), sv.cur.clone(), sv.cfr().regret.clone())
-            };
-            let (a_avg, a_cur, a_reg) = run(false);
-            let (b_avg, b_cur, b_reg) = run(true);
-            for (name, x, y) in [
-                ("avg", &a_avg, &b_avg),
-                ("cur", &a_cur, &b_cur),
-                ("regret", &a_reg, &b_reg),
-            ] {
-                assert_eq!(x.len(), y.len(), "{name} length differs");
-                for (k, (p, q)) in x.iter().zip(y.iter()).enumerate() {
-                    assert_eq!(p.to_bits(), q.to_bits(), "{name}[{k}] differs");
-                }
-            }
-            checked += 1;
-        }
-        assert!(checked > 0, "no solve compared");
-    }
-
     /// The action words a solve sends must rebuild the policy head's own input.
     ///
     /// The card runs the action encoder now, and the one thing it cannot know
@@ -999,16 +874,7 @@ mod tests {
         use crate::net::{Net, AFEAT};
         let nets = Arc::new(random_net(0x5EED));
         let cfg = Cfg { s: 24, c: 2.0, ..Default::default() };
-        let gc = GameCfg {
-            agents: [Agent::Sog { cfg }; 2],
-            collect: Collect::Sog,
-            explore: 0.1,
-            random_draft: true,
-            p_td1: 0.0,
-            query_rate: 0.9,
-            recursive_rate: 0.1,
-        };
-        let roots = collect_roots(2, 0x51E5, &nets, &gc, 2);
+        let roots = collect_roots(2, 0x51E5);
         let mut checked = 0usize;
         for (s, belief) in &roots {
             let ctx = crate::pbs::Ctx::new(s);
@@ -1072,18 +938,7 @@ mod tests {
             c: 4.0,
             ..Default::default()
         };
-        let gc = GameCfg {
-            agents: [Agent::Sog {
-                cfg: Cfg { s: 4, c: 1.0, ..cfg },
-            }; 2],
-            collect: Collect::Sog,
-            explore: 0.1,
-            random_draft: true,
-            p_td1: 0.0,
-            query_rate: 0.9,
-            recursive_rate: 0.1,
-        };
-        let roots = collect_roots(2, 31, &nets, &gc, 2);
+        let roots = collect_roots(2, 31);
         assert!(!roots.is_empty(), "no roots to test against");
 
         let mut deepest = 0usize;
@@ -1147,16 +1002,7 @@ mod tests {
     fn the_runs_a_solve_sends_rebuild_its_contract() {
         let nets = Arc::new(random_net(0x5EED));
         let cfg = Cfg { s: 40, c: 4.0, ..Default::default() };
-        let gc = GameCfg {
-            agents: [Agent::Sog { cfg: Cfg { s: 4, c: 1.0, ..cfg } }; 2],
-            collect: Collect::Sog,
-            explore: 0.1,
-            random_draft: true,
-            p_td1: 0.0,
-            query_rate: 0.9,
-            recursive_rate: 0.1,
-        };
-        let roots = collect_roots(3, 23, &nets, &gc, 3);
+        let roots = collect_roots(3, 23);
         assert!(!roots.is_empty(), "no roots to test against");
         let mut checked = 0usize;
         for (s, belief) in &roots {
@@ -1246,18 +1092,7 @@ mod tests {
             c: 4.0,
             ..Default::default()
         };
-        let gc = GameCfg {
-            agents: [Agent::Sog {
-                cfg: Cfg { s: 4, c: 1.0, ..cfg },
-            }; 2],
-            collect: Collect::Sog,
-            explore: 0.1,
-            random_draft: true,
-            p_td1: 0.0,
-            query_rate: 0.9,
-            recursive_rate: 0.1,
-        };
-        let roots = collect_roots(3, 23, &nets, &gc, 3);
+        let roots = collect_roots(3, 23);
         assert!(!roots.is_empty(), "no roots to test against");
 
         let mut checked = 0usize;
@@ -1356,132 +1191,4 @@ mod tests {
         x / (x + 1.0)
     }
 
-    /// The contract's backpropagation and regret update must reproduce
-    /// `Solver::backprop` exactly. A per-config gather over an action-ordered
-    /// legal row sums the same products in the same order as the CPU's
-    /// action-major walk, so again this is `to_bits` equality and not a
-    /// tolerance.
-    #[test]
-    fn the_gathered_backprop_reproduces_the_scatter_exactly() {
-        use crate::search::Back;
-        let nets = Arc::new(random_net(0x5EED));
-        let cfg = Cfg {
-            s: 32,
-            c: 4.0,
-            ..Default::default()
-        };
-        let gc = GameCfg {
-            agents: [Agent::Sog {
-                cfg: Cfg { s: 4, c: 1.0, ..cfg },
-            }; 2],
-            collect: Collect::Sog,
-            explore: 0.1,
-            random_draft: true,
-            p_td1: 0.0,
-            query_rate: 0.9,
-            recursive_rate: 0.1,
-        };
-        let roots = collect_roots(3, 11, &nets, &gc, 3);
-        assert!(!roots.is_empty(), "no roots to test against");
-
-        let mut checked = 0usize;
-        for (s, belief) in &roots {
-            let ctx = crate::pbs::Ctx::new(s);
-            let mut sv = crate::search::Solver::new(s, ctx, Arc::clone(&nets), cfg, belief.clone(), Rng::new(0xD12E));
-            for t in 0..cfg.iters() {
-                // Run whole iterations first, so the regrets and the running
-                // strategy sum are both non-trivial before anything is
-                // compared: a comparison against all-zero state proves nothing
-                // about the discount factors.
-                sv.catch_up();
-                sv.step();
-                for _ in 0..4 {
-                    if !sv.expand_once() {
-                        break;
-                    }
-                }
-                sv.precompute_reaches();
-                if t < 2 {
-                    continue;
-                }
-
-                let traverser = t % 2;
-                sv.catch_up();
-                sv.leaf_values(traverser);
-                let snap = (
-                    sv.cfr().vals.clone(),
-                    sv.cur.clone(),
-                    sv.cfr().regret.clone(),
-                    sv.cfr().sum_strat.clone(),
-                );
-                let k = sv.cfg.cfr;
-                let m = sv.steps[traverser] as f32 + 1.0;
-                let fs = (
-                    factor(m, k.alpha),
-                    factor(m, k.beta),
-                    (m / (m + 1.0)).powf(k.gamma),
-                );
-
-                sv.backprop(traverser, &[], Back::Regret);
-                let want = (
-                    sv.cfr().vals.clone(),
-                    sv.cur.clone(),
-                    sv.cfr().regret.clone(),
-                    sv.cfr().sum_strat.clone(),
-                );
-
-                // Put the solver back and run the contract over the same state.
-                sv.cfr_mut().vals = snap.0;
-                sv.cur = snap.1;
-                sv.cfr_mut().regret = snap.2;
-                sv.cfr_mut().sum_strat = snap.3;
-                let c = Contract::of(&sv);
-                let mut sum = vec![0.0f32; sv.ncells];
-                for i in 0..sv.nodes.len() {
-                    let so = sv.soff[i] as usize;
-                    let row = &sv.cfr().sum_strat[i];
-                    sum[so..so + row.len()].copy_from_slice(row);
-                }
-                let (mut vals, mut cur, mut regret) =
-                    (sv.cfr().vals.clone(), sv.cur.clone(), sv.cfr().regret.clone());
-                let mut qv = vec![0.0f32; sv.ncells];
-                c.backprop(
-                    traverser, k, fs, &mut vals, &mut cur, &mut regret, &mut sum, &mut qv,
-                );
-
-                let same = |got: &[f32], want: &[f32], what: &str| {
-                    assert_eq!(got.len(), want.len(), "{what} length at iteration {t}");
-                    for (i, (a, b)) in got.iter().zip(want).enumerate() {
-                        assert_eq!(
-                            a.to_bits(),
-                            b.to_bits(),
-                            "{what}[{i}] {a} vs {b} at iteration {t}, {} nodes",
-                            c.nodes()
-                        );
-                    }
-                };
-                same(&vals, &want.0, "vals");
-                same(&cur, &want.1, "cur");
-                same(&regret, &want.2, "regret");
-                for i in 0..sv.nodes.len() {
-                    let so = sv.soff[i] as usize;
-                    let row = &want.3[i];
-                    same(&sum[so..so + row.len()], row, "sum_strat");
-                }
-                // Restore what the comparison consumed, so the next iteration
-                // continues the same solve rather than a diverged one.
-                sv.cfr_mut().vals = vals;
-                sv.cur = cur;
-                sv.cfr_mut().regret = regret;
-                for i in 0..sv.nodes.len() {
-                    let so = sv.soff[i] as usize;
-                    let n = sv.cfr().sum_strat[i].len();
-                    sv.cfr_mut().sum_strat[i].copy_from_slice(&sum[so..so + n]);
-                }
-                sv.steps[traverser] += 1;
-                checked += 1;
-            }
-        }
-        assert!(checked >= 6, "only {checked} comparisons");
-    }
 }

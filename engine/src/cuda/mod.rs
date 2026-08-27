@@ -779,6 +779,9 @@ impl Pack {
 
 struct Card {
     stream: Arc<CudaStream>,
+    /// The buffers and stream below belong to this card, so one round must own
+    /// them as a unit when callers share a device.
+    busy: parking_lot::Mutex<()>,
     blas: CudaBlas,
     k: Arc<Kernels>,
     /// Indexed by solve, which is the slot the farm pinned it to. Shared by
@@ -975,6 +978,7 @@ impl Device {
             return Ok(Vec::new());
         }
         let card = &self.cards[0];
+        let _busy = card.busy.lock();
         card.stream.context().bind_to_thread().map_err(err)?;
         let packed = card.stream.memcpy_stod(rows).map_err(err)?;
         let mut out = card.stream.alloc_zeros::<f32>(n * PUBFEAT).map_err(err)?;
@@ -1010,6 +1014,7 @@ impl Device {
         }
         let flat = net.flat();
         for card in &mut self.cards {
+            let _busy = card.busy.lock();
             card.stream.context().bind_to_thread().map_err(err)?;
             card.stream.memcpy_htod(&flat.w, &mut card.w).map_err(err)?;
             let (lw, _) = fragwise(&card.layout, &flat.w);
@@ -1061,6 +1066,7 @@ impl Device {
     /// the only caller.
     pub fn resident(&self, card: usize, solve: usize) -> Res<Resident> {
         let c = &self.cards[card];
+        let _busy = c.busy.lock();
         c.stream.context().bind_to_thread().map_err(err)?;
         let g = c.solves.lock();
         let s = g.get(solve).ok_or_else(|| format!("solve {solve} is not resident"))?;
@@ -1358,6 +1364,7 @@ impl Card {
             card_facts: stream.memcpy_stod(&card_facts).map_err(err)?,
             locations: stream.memcpy_stod(&locations).map_err(err)?,
             stream,
+            busy: parking_lot::Mutex::new(()),
             blas,
             k: Arc::clone(&gpu.k),
             solves: Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -1426,6 +1433,7 @@ impl Card {
     }
 
     fn round(&self, calls: &[Call], mine: &[usize]) -> Res<Vec<(usize, Reply)>> {
+        let _busy = self.busy.lock();
         self.stream.context().bind_to_thread().map_err(err)?;
         let mut slots: Vec<usize> = mine.iter().map(|&i| calls[i].solve()).collect();
         slots.sort_unstable();

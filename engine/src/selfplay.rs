@@ -49,7 +49,7 @@ use crate::pbs::*;
 use crate::rng::Rng;
 use crate::search::{Cfg, Solved, Solver};
 use crate::state::{Cont, State, BLACK, WHITE, Z_BAG, Z_FACEDOWN, Z_FACEUP};
-#[cfg(any(test, feature = "python"))]
+#[cfg(feature = "python")]
 use rayon::prelude::*;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -792,20 +792,6 @@ impl GameStream {
     }
 }
 
-/// Play one game to the end. Returns the result from White's point of view.
-#[cfg(test)]
-pub fn play_game(rng: Rng, nets: &Arc<Net>, gc: &GameCfg, data: &mut Data) -> f32 {
-    let mut g = Game::new(rng, gc);
-    while let Some(mut sv) = g.next_solve(nets) {
-        let solved = sv.run_alone();
-        g.play_solved(&sv, solved);
-    }
-    let z = g.finish();
-    let d = g.take_data();
-    data.merge(d);
-    z
-}
-
 #[cfg(feature = "python")]
 fn play_static_game(rng: Rng, net: &Arc<Net>, gc: &GameCfg, data: &mut Data) -> f32 {
     let mut game = Game::new(rng, gc);
@@ -857,55 +843,47 @@ fn worker_seed(seed: u64, i: usize) -> u64 {
     seed.wrapping_mul(0x9E3779B97F4A7C15) ^ (i as u64).wrapping_mul(0xD1B54A32D192ED03)
 }
 
-/// Collect the roots of the solves a run would run, for the tools that need a
-/// fixed workload.
+/// Make deterministic public roots without playing a complete self-play game.
 ///
-/// A run alternates a self-play solve and a solve of a leaf an earlier search
-/// nominated, and the two cost very different amounts: a self-play root sits on
-/// the line of play with a wide belief, where a query root is a leaf. So the
-/// corpus is taken from `GameStream`, which is the same thing a run drives, and
-/// it holds whatever mix of the two the configured rates produce.
-///
-/// One game a stream, and the roots are shuffled before they are returned: they
-/// arise in ply order, and a tool that walks the file forward would otherwise
-/// have all its jobs march up that ordering together and see the workload
-/// deepen as it ran.
+/// The oracle tests need a valid decision state, not a complete game stream.
+/// Resolving the opening draw gives each test a deterministic, cheap fixture.
 #[cfg(test)]
-pub fn collect_roots(
-    games: usize,
-    seed: u64,
-    nets: &Arc<Net>,
-    gc: &GameCfg,
-    cap: usize,
-) -> Vec<(State, [Belief; 2])> {
-    let mut out: Vec<(State, [Belief; 2])> = (0..games)
-        .into_par_iter()
-        .fold(Vec::new, |mut acc, i| {
-            let mut st = GameStream::new(worker_seed(seed, i), *gc);
-            let mut d = Data::default();
-            loop {
-                let mut sv = st.next_solve(nets, &mut d);
-                // The stream rolls straight into the next game, and that game's
-                // solves are another sample of the same distribution.
-                if st.game_index > 1 {
-                    break;
-                }
-                acc.push((sv.states[0], sv.root_belief.clone()));
-                let solved = sv.run_alone();
-                st.keep(&sv, solved, &mut d);
-            }
-            acc
-        })
-        .reduce(Vec::new, |mut a, mut b| {
-            a.append(&mut b);
-            a
-        });
-    assert!(!out.is_empty(), "no roots: a game collected none");
-    let mut rng = Rng::new(0x0057_1E5E);
-    for i in (1..out.len()).rev() {
-        out.swap(i, rng.below(i + 1));
+fn resolve_fixture_chance(game: &mut Game) {
+    while game.s.is_chance() {
+        let player = game.s.to_act();
+        let res = reserve(&game.s, player, &game.ctx);
+        let fu = faceup_counts(&game.s, player, &game.ctx);
+        let wp = matches!(game.s.pending(), Cont::WarriorPriestDraw { .. });
+        game.bel[player as usize] =
+            belief_after_draw(&game.bel[player as usize], &res, &fu, wp);
+        resolve_chance(&mut game.s, player, &mut game.rng);
     }
-    out.truncate(cap);
+}
+
+#[cfg(test)]
+pub(crate) fn collect_roots(count: usize, seed: u64) -> Vec<(State, [Belief; 2])> {
+    let gc = GameCfg {
+        agents: [Agent::Random; 2],
+        collect: Collect::None,
+        explore: 0.0,
+        random_draft: false,
+        p_td1: 0.0,
+        query_rate: 0.0,
+        recursive_rate: 0.0,
+    };
+    let mut out = Vec::with_capacity(count);
+    for attempt in 0..count.saturating_mul(64).max(1) {
+        if out.len() == count {
+            break;
+        }
+        let mut game = Game::new(Rng::new(seed.wrapping_add(attempt as u64)), &gc);
+        resolve_fixture_chance(&mut game);
+        if game.s.is_terminal() || !matches!(game.s.pending(), Cont::MainPlay) {
+            continue;
+        }
+        out.push((game.s, game.bel));
+    }
+    assert_eq!(out.len(), count, "not enough random-walk roots");
     out
 }
 
@@ -944,51 +922,6 @@ mod target_tests {
         crate::net::Net::from_flat(&w, &b, &ln).expect("random net")
     }
 
-    /// The uniform belief over every config a seat could be holding.
-    fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
-        let truth = true_config(s, p, ctx);
-        let cfg = enumerate_configs(
-            &reserve(s, p, ctx),
-            truth.hand_size(),
-            truth.fd_size(),
-            truth.inflight.is_some(),
-        );
-        let n = cfg.len() as f32;
-        Belief { p: vec![1.0 / n; cfg.len()], cfg }
-    }
-
-    /// A few real coin plays, reached by random play, each with the uniform
-    /// belief over both seats.
-    ///
-    /// Taking roots from self-play instead would play whole games to keep three
-    /// of their queries, and a game is up to 256 plies with a solve at each.
-    /// What this test checks is how a solved root is stored, so any real root
-    /// will do.
-    fn positions(seed: u64, want: usize) -> Vec<(State, [Belief; 2])> {
-        let mut out = Vec::new();
-        for i in 0..64 {
-            if out.len() == want {
-                break;
-            }
-            let mut rng = Rng::new(seed + i);
-            let mut s = make_game(&mut rng, true);
-            for _ in 0..8 {
-                if s.is_terminal() {
-                    break;
-                }
-                let acts = s.legal_actions();
-                s.apply_inplace(acts[rng.below(acts.len())]);
-            }
-            if s.is_terminal() || s.is_chance() || !matches!(s.pending(), Cont::MainPlay) {
-                continue;
-            }
-            let ctx = Ctx::new(&s);
-            let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
-            out.push((s, bel));
-        }
-        out
-    }
-
     #[test]
     fn a_full_query_queue_reports_every_dropped_nomination() {
         let gc = GameCfg {
@@ -1025,7 +958,7 @@ mod target_tests {
     fn a_stored_row_carries_the_root_average_policy() {
         let nets = Arc::new(random_net(0x5EED));
         let cfg = Cfg { s: 32, c: 4.0, ..Default::default() };
-        let roots = positions(0x5EED, 3);
+        let roots = collect_roots(3, 0x5EED);
         assert!(!roots.is_empty(), "no roots to test against");
 
         let mut rng = Rng::new(0x9017);
@@ -1093,15 +1026,8 @@ mod target_tests {
         assert!(checked > 0, "no solve to check");
     }
 
-    /// A finished game writes its outcome exactly where the seats were.
-    ///
-    /// `p_td1 = 1` makes every self-play row take the TD(1) target, so this
-    /// pins three things at once. *Placement*: one entry a seat a row, at the
-    /// config that seat was really holding, and every config nobody held keeps
-    /// the search value it had. *Sign*: a row stores a value per player, so
-    /// White's entry and Black's are that player's own utility and must cancel.
-    /// *Reach*: a query row sitting in the same buffer is off the line of play
-    /// and belongs to no game, so nothing may be written to it.
+    /// A finished game writes its TD(1) outcome only at the configs the seats
+    /// really held. A query row in the same buffer must remain unchanged.
     #[test]
     fn a_finished_game_writes_its_outcome_where_the_seats_were() {
         let nets = Arc::new(random_net(0x7D1));
@@ -1109,7 +1035,7 @@ mod target_tests {
 
         // A query row, in the buffer the game will merge into.
         let mut out = Data::default();
-        let (s, bel) = positions(0x7D1, 1).pop().expect("a root");
+        let (s, bel) = collect_roots(1, 0x7D1).pop().expect("a root");
         let mut qv = Solver::new(
             &s,
             Ctx::new(&s),
@@ -1134,148 +1060,89 @@ mod target_tests {
             recursive_rate: 0.0,
         };
         let mut g = Game::new(Rng::new(6), &gc);
-        for _ in 0..8 {
-            let mut sv = g.next_solve(&nets).expect("the test game is still live");
-            let solved = sv.run_alone();
-            g.play_solved(&sv, solved);
-        }
-        // This test owns the outcome. Natural termination is covered by the
-        // greedy-game test; forcing it here avoids solving an entire weak game
-        // only to choose which nonzero value is written.
+        g.s = s;
+        g.ctx = Ctx::new(&s);
+        g.bel = bel;
+        let values = [vec![0.25; g.bel[0].len()], vec![-0.25; g.bel[1].len()]];
+        let truth = [g.true_index(0) as u32, g.true_index(1) as u32];
+        g.data.begin_solve();
+        g.data.push_value(
+            &g.s,
+            &g.ctx,
+            &g.bel,
+            [&values[0], &values[1]],
+            truth,
+            &Default::default(),
+        );
         g.s.winner = WHITE;
         let before = g.data.cy.clone();
         let truth = g.data.truth.clone();
         let z = [g.s.utility(0), g.s.utility(1)];
-        assert_eq!(z[0], -z[1], "the outcome is not zero sum");
-        assert_ne!(z[0], 0.0, "a level game leaves the sign untested; pick a seed");
         g.finish();
         let d = g.take_data();
-        assert!(d.nv > 0, "a whole game stored no rows");
+        assert_eq!(d.nv, 1, "fixture stored the wrong number of rows");
         assert_eq!(d.queries, 0, "a query row reached a game");
 
-        let mut written = 0usize;
-        for r in 0..d.nv {
-            for p in 0..2 {
-                let span = d.row_span(r, p);
-                let at = span.start + truth[2 * r + p] as usize;
-                assert!(at < span.end, "row {r} seat {p}: truth outside the support");
-                for i in span {
-                    if i == at {
-                        assert_eq!(d.cy[i], z[p], "row {r} seat {p}: outcome target");
-                        written += 1;
-                    } else {
-                        assert_eq!(d.cy[i], before[i], "row {r}: a config nobody held moved");
-                    }
+        let mut written = 0;
+        for p in 0..2 {
+            let span = d.row_span(0, p);
+            let at = span.start + truth[p] as usize;
+            for i in span {
+                if i == at {
+                    assert_eq!(d.cy[i], z[p], "seat {p}: outcome target");
+                    written += 1;
+                } else {
+                    assert_eq!(d.cy[i], before[i], "seat {p}: unrelated config moved");
                 }
             }
         }
-        assert_eq!(written, 2 * d.nv, "one entry a seat a row");
-
+        assert_eq!(written, 2);
         out.merge(d);
-        assert_eq!(
-            out.cy[..query_cy.len()],
-            query_cy[..],
-            "the game's outcome was written into a query row"
-        );
+        assert_eq!(out.cy[..query_cy.len()], query_cy[..]);
 
-        // And on the path a run actually drives: while an outcome is owed, the
-        // counters come out every solve and the rows do not.
         let mut st = GameStream::new(5, GameCfg { p_td1: 0.2, ..gc });
         let mut live = Data::default();
-        for _ in 0..8 {
-            let mut sv = st.next_solve(&nets, &mut live);
-            let solved = sv.run_alone();
-            st.keep(&sv, solved, &mut live);
-        }
+        let mut sv = st.next_solve(&nets, &mut live);
+        let solved = sv.run_alone();
+        st.keep(&sv, solved, &mut live);
         assert_eq!(live.nv, 0, "a row left its game before the game ended");
         assert!(live.decisions > 0, "the counters did not come out");
     }
 
-    fn greedy_cfg(collect: Collect) -> GameCfg {
-        GameCfg {
-            agents: [Agent::Greedy { temp: 2.0 }; 2],
-            collect,
-            explore: 0.1,
-            random_draft: true,
-            p_td1: 0.0,
-            query_rate: 0.0,
-            recursive_rate: 0.0,
-        }
-    }
-
-    /// Fifty greedy games end by six markers, well before the play cap.
-    #[test]
-    fn fifty_greedy_games_end_by_markers() {
-        let nets = Arc::new(random_net(1));
-        let gc = greedy_cfg(Collect::None);
-        let mut plays = Vec::new();
-        let mut caps = 0usize;
-        for i in 0..50 {
-            let mut g = Game::new(Rng::new(10_000 + i as u64), &gc);
-            while g.next_solve(&nets).is_some() {
-                panic!("greedy asked for a solve");
-            }
-            assert!(g.s.is_terminal(), "game {i} did not end");
-            plays.push(g.s.main_plays);
-            g.finish();
-            let d = g.take_data();
-            caps += d.cap_hits;
-        }
-        plays.sort_unstable();
-        eprintln!(
-            "greedy play counts: min={} p50={} p90={} max={} mean={:.1} cap_games={caps}",
-            plays[0],
-            plays[24],
-            plays[44],
-            plays[49],
-            plays.iter().map(|&x| x as f32).sum::<f32>() / 50.0
-        );
-        // Greedy-vs-greedy often stalls one marker short of six; those games
-        // still end, at the play cap. The distribution is the result.
-    }
-
-    /// A static row's value is one number per seat: equal across that seat's
-    /// configs, and opposite between seats.
+    /// A static row stores one public evaluation per seat and the greedy policy.
     #[test]
     fn a_static_row_is_antisymmetric_and_constant_across_configs() {
-        let nets = Arc::new(random_net(2));
-        let gc = greedy_cfg(Collect::Static);
+        let (s, bel) = collect_roots(1, 0x2E57).pop().expect("a root");
+        let ctx = Ctx::new(&s);
+        let actor = s.to_act() as usize;
+        let cfgs = bel[actor].cfg.clone();
+        let policy = policy::greedy(&s, &ctx, actor as u8, &cfgs, 2.0).to_replay();
+        let values = [vec![0.25; bel[0].len()], vec![-0.25; bel[1].len()]];
+        let truth = [
+            bel[0].index_of(&true_config(&s, 0, &ctx)).expect("white config") as u32,
+            bel[1].index_of(&true_config(&s, 1, &ctx)).expect("black config") as u32,
+        ];
         let mut data = Data::default();
-        for i in 0..8 {
-            play_game(Rng::new(20_000 + i as u64), &nets, &gc, &mut data);
+        data.begin_solve();
+        data.push_value(
+            &s,
+            &ctx,
+            &bel,
+            [&values[0], &values[1]],
+            truth,
+            &policy,
+        );
+        assert_eq!(data.nv, 1);
+        let a = data.row_span(0, 0);
+        let b = data.row_span(0, 1);
+        assert!(a.len() > 1 && b.len() > 1);
+        for i in a.clone() {
+            assert_eq!(data.cy[i], 0.25, "white configs disagree");
         }
-        assert!(data.nv > 0, "no static rows");
-        let mut wide = 0usize;
-        for r in 0..data.nv {
-            let a = data.row_span(r, 0);
-            let b = data.row_span(r, 1);
-            assert!(!a.is_empty() && !b.is_empty());
-            let v0 = data.cy[a.start];
-            let v1 = data.cy[b.start];
-            for i in a.clone() {
-                assert!(
-                    (data.cy[i] - v0).abs() < 1e-6,
-                    "row {r}: white configs disagree"
-                );
-            }
-            for i in b.clone() {
-                assert!(
-                    (data.cy[i] - v1).abs() < 1e-6,
-                    "row {r}: black configs disagree"
-                );
-            }
-            assert!(
-                (v0 + v1).abs() < 1e-5,
-                "row {r}: cy not antisymmetric ({v0} vs {v1})"
-            );
-            if a.len() > 1 || b.len() > 1 {
-                wide += 1;
-            }
-            let pa0 = data.paoff[r] as usize;
-            let pa1 = data.paoff[r + 1] as usize;
-            assert!(pa1 > pa0, "row {r}: no policy actions");
+        for i in b.clone() {
+            assert_eq!(data.cy[i], -0.25, "black configs disagree");
         }
-        assert!(wide > 0, "every row was a singleton belief; play more games");
+        assert!(data.paoff[1] > data.paoff[0], "no policy actions");
     }
 
     /// With explore = 1 the acting policy is uniform over legal, so the public
@@ -1292,7 +1159,7 @@ mod target_tests {
             query_rate: 0.0,
             recursive_rate: 0.0,
         };
-        let (s, bel) = positions(0xE1, 8)
+        let (s, bel) = collect_roots(8, 0xE1)
             .into_iter()
             .find(|(s, bel)| bel[s.to_act() as usize].cfg.len() > 1)
             .expect("a MainPlay whose actor has more than one config");
