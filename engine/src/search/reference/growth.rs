@@ -16,7 +16,7 @@ impl Solver {
         let so = self.soff[node] as usize;
         let reach = self.reach_of(node, opp);
         let [mass] = warp32_sum(reach.len(), |i| [reach[i]]);
-        let scale = if mass > 1e-30 { 1.0 / mass } else { 0.0 };
+        let scale = if mass > SMOOTH { 1.0 / mass } else { 0.0 };
         let cfr = self.cfr();
         let [total] = warp32_sum(row.len(), |i| [cfr.visits[so + row.start + i]]);
         let explore = self.cfg.puct * total.max(0.0).sqrt();
@@ -142,7 +142,7 @@ impl Solver {
                     prior[so + cell] = v;
                     total += v;
                 }
-                let scale = if total > 0.0 {
+                let scale = if total > SMOOTH {
                     1.0 / total
                 } else {
                     1.0 / row.len().max(1) as f32

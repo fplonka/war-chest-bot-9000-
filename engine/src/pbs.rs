@@ -360,9 +360,21 @@ pub struct Belief {
     pub p: Vec<f32>,
 }
 
-/// Mirrors `kReachSmoothingEps` in the reference: stops an underflowed belief
-/// from turning into NaN downstream.
-const SMOOTH: f32 = 1e-30;
+/// The smallest mass for which a reciprocal is safe to use in f32.
+pub(crate) const SMOOTH: f32 = 1e-30;
+
+/// Normalize a non-negative strategy row with its total mass, using the same underflow fallback as beliefs.
+#[inline]
+pub(crate) fn normalize_strategy(row: &mut [f32], total: f32) {
+    if total > SMOOTH {
+        let inv = 1.0 / total;
+        for value in row {
+            *value *= inv;
+        }
+    } else {
+        row.fill(1.0 / row.len().max(1) as f32);
+    }
+}
 
 impl Belief {
     pub fn point(c: Config) -> Belief {
