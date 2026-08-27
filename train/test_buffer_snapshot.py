@@ -24,8 +24,6 @@ def load_buffer_module():
     }.items():
         setattr(warchest, name, value)
     torch = types.ModuleType("torch")
-    torch.float32 = object()
-    torch.long = object()
     torch.no_grad = lambda: (lambda fn: fn)
     torch.nn = types.ModuleType("torch.nn")
     torch.nn.functional = types.ModuleType("torch.nn.functional")
@@ -88,7 +86,7 @@ def chunk(train, start, n):
     pa = np.arange(int(paoff[-1]) * train.ACT_BYTES, dtype=np.uint32).astype(
         np.uint8).reshape(-1, train.ACT_BYTES)
     pci = np.concatenate([
-        (np.arange(nc) % max(int(p0[i] + p1[i]), 1))
+        (np.arange(nc) % int(p0[i] + p1[i]))
         for i, nc in enumerate(nc_row) if nc
     ]).astype(np.uint16)
     pact = np.concatenate([
@@ -126,6 +124,7 @@ def main():
     assert len(state["pci"]) < buf.pcap
 
     restored = train.Buffer(buf.cap, buf.ccap)
+    restored.add(*chunk(train, 7000, 1000))
     restored.load_state_dict(state)
     assert len(restored) == len(buf)
     ids = np.arange(buf.lo, buf.rows)

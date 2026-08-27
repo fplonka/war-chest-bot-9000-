@@ -175,16 +175,11 @@ class Buffer:
     _ROW_FIELDS = (
         "x", "cstart", "clen", "pastart", "palen", "pcstart", "pclen",
         "written_at", "created_at", "source", "truth", "outcome", "td1")
-    _CONFIG_FIELDS = ("cc", "cp", "cw", "cy")
-    _ACTION_FIELDS = ("pa",)
-    _CELL_FIELDS = ("pci", "pact", "pp")
-
-    @staticmethod
-    def _compact_arena(starts, lens, total, size):
-        used = lens > 0
-        base = int(starts[used].min()) if np.any(used) else total
-        return base, starts - base, (
-            np.arange(base, total, dtype=np.int64) % size)
+    # start, per-row lengths, arena fields, running count, capacity.
+    _ARENAS = (
+        ("cstart", "clen", ("cc", "cp", "cw", "cy"), "cfgs", "ccap"),
+        ("pastart", "palen", ("pa",), "acts", "acap"),
+        ("pcstart", "pclen", ("pci", "pact", "pp"), "cells", "pcap"))
 
     def state_dict(self):
         """Return the live replay state in compact row and arena order."""
@@ -192,25 +187,21 @@ class Buffer:
         ring = ids % self.cap
         state = {name: getattr(self, name)[ring].copy()
                  for name in self._ROW_FIELDS}
-        for start, starts, lens, total, size, fields in (
-                ("cstart", self.cstart[ring], self.clen[ring].sum(1),
-                 self.cfgs, self.ccap, self._CONFIG_FIELDS),
-                ("pastart", self.pastart[ring], self.palen[ring],
-                 self.acts, self.acap, self._ACTION_FIELDS),
-                ("pcstart", self.pcstart[ring], self.pclen[ring],
-                 self.cells, self.pcap, self._CELL_FIELDS)):
-            base, offsets, at = self._compact_arena(starts, lens, total, size)
-            state[start] = offsets.copy()
+        for start, lens_name, fields, total_name, size_name in self._ARENAS:
+            starts = state[start]
+            lens = getattr(self, lens_name)[ring]
+            if lens.ndim == 2:
+                lens = lens.sum(1)
+            total, size = getattr(self, total_name), getattr(self, size_name)
+            used = lens > 0
+            base = int(starts[used].min()) if np.any(used) else total
+            state[start] = starts - base
+            at = np.arange(base, total, dtype=np.int64) % size
             state.update({name: getattr(self, name)[at].copy()
                           for name in fields})
-        state.update({
-            "soff": self.soff.copy(),
-            "acts": int(self.acts),
-            "cells": int(self.cells),
-            "rows": int(self.rows),
-            "cfgs": int(self.cfgs),
-            "lo": int(self.lo),
-        })
+        state["soff"] = self.soff.copy()
+        state.update({name: int(getattr(self, name))
+                      for name in ("acts", "cells", "rows", "cfgs", "lo")})
         return state
 
     def load_state_dict(self, state):
@@ -218,18 +209,18 @@ class Buffer:
         lo, rows = int(state["lo"]), int(state["rows"])
         if lo < 0 or rows < lo or rows - lo > self.cap:
             raise ValueError(f"invalid replay row range {lo}:{rows}")
-        self.__init__(self.cap, self.ccap)
         ids = np.arange(lo, rows, dtype=np.int64)
         ring = ids % self.cap
         self.lo, self.rows = lo, rows
         self.cfgs, self.acts, self.cells = (
             int(state["cfgs"]), int(state["acts"]), int(state["cells"]))
+        # Keep policy-less appends from seeing stale capacity rows.
+        self.palen.fill(0)
+        self.pclen.fill(0)
         for name in self._ROW_FIELDS:
             getattr(self, name)[ring] = state[name]
-        for start, fields, total, size in (
-                ("cstart", self._CONFIG_FIELDS, self.cfgs, self.ccap),
-                ("pastart", self._ACTION_FIELDS, self.acts, self.acap),
-                ("pcstart", self._CELL_FIELDS, self.cells, self.pcap)):
+        for start, _, fields, total_name, size_name in self._ARENAS:
+            total, size = getattr(self, total_name), getattr(self, size_name)
             base = total - len(state[fields[0]])
             at = (np.arange(len(state[fields[0]]), dtype=np.int64) + base) % size
             for name in fields:
