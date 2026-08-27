@@ -17,10 +17,11 @@ exact configs in support, their probabilities, and the value the solve gave
 each. The config lists are ragged, so they live in a flat arena and a batch is
 assembled by gathering spans -- see `Buffer`.
 
-The run snapshots every `snapshot_every` minutes. Training starts with a
-short greedy warm phase labelled by the public static evaluation, then the
-SoG phase. When training ends, the snapshots are packed as bots for evaluation
-by `tools/arena.py`.
+The run snapshots every `snapshot_every` minutes, including the live replay
+buffer so a resumed run continues training immediately. Training starts with a
+short greedy warm phase labelled by the public static evaluation, then the SoG
+phase. When training ends, the snapshots are packed as bots for evaluation by
+`tools/arena.py`.
 
     python train/train.py out=seat
     python train/train.py out=seat note="centre the seat bit at +-0.5"
@@ -66,7 +67,6 @@ N_HEXES = warchest.N_HEXES
 # What `SolveFarm.collect` reports about the device rounds, cumulative
 # since the farm started. `rounds` is the denominator of the other three.
 ROUND_KEYS = ("rounds", "round_calls", "round_rows", "round_nanos", "budget_hits")
-RESUME_GRACE_ROWS = 100_000
 
 
 def scheduled_lr(initial, final, elapsed, duration, stable_frac):
@@ -171,6 +171,71 @@ class Buffer:
         self.rows = 0   # rows ever written
         self.cfgs = 0   # configs ever written
         self.lo = 0     # oldest row whose configs are still in the arena
+
+    _ROW_FIELDS = (
+        "x", "cstart", "clen", "pastart", "palen", "pcstart", "pclen",
+        "written_at", "created_at", "source", "truth", "outcome", "td1")
+    _CONFIG_FIELDS = ("cc", "cp", "cw", "cy")
+    _ACTION_FIELDS = ("pa",)
+    _CELL_FIELDS = ("pci", "pact", "pp")
+
+    @staticmethod
+    def _compact_arena(starts, lens, total, size):
+        used = lens > 0
+        base = int(starts[used].min()) if np.any(used) else total
+        return base, starts - base, (
+            np.arange(base, total, dtype=np.int64) % size)
+
+    def state_dict(self):
+        """Return the live replay state in compact row and arena order."""
+        ids = np.arange(self.lo, self.rows, dtype=np.int64)
+        ring = ids % self.cap
+        state = {name: getattr(self, name)[ring].copy()
+                 for name in self._ROW_FIELDS}
+        for start, starts, lens, total, size, fields in (
+                ("cstart", self.cstart[ring], self.clen[ring].sum(1),
+                 self.cfgs, self.ccap, self._CONFIG_FIELDS),
+                ("pastart", self.pastart[ring], self.palen[ring],
+                 self.acts, self.acap, self._ACTION_FIELDS),
+                ("pcstart", self.pcstart[ring], self.pclen[ring],
+                 self.cells, self.pcap, self._CELL_FIELDS)):
+            base, offsets, at = self._compact_arena(starts, lens, total, size)
+            state[start] = offsets.copy()
+            state.update({name: getattr(self, name)[at].copy()
+                          for name in fields})
+        state.update({
+            "soff": self.soff.copy(),
+            "acts": int(self.acts),
+            "cells": int(self.cells),
+            "rows": int(self.rows),
+            "cfgs": int(self.cfgs),
+            "lo": int(self.lo),
+        })
+        return state
+
+    def load_state_dict(self, state):
+        """Restore a state_dict into this buffer."""
+        lo, rows = int(state["lo"]), int(state["rows"])
+        if lo < 0 or rows < lo or rows - lo > self.cap:
+            raise ValueError(f"invalid replay row range {lo}:{rows}")
+        self.__init__(self.cap, self.ccap)
+        ids = np.arange(lo, rows, dtype=np.int64)
+        ring = ids % self.cap
+        self.lo, self.rows = lo, rows
+        self.cfgs, self.acts, self.cells = (
+            int(state["cfgs"]), int(state["acts"]), int(state["cells"]))
+        for name in self._ROW_FIELDS:
+            getattr(self, name)[ring] = state[name]
+        for start, fields, total, size in (
+                ("cstart", self._CONFIG_FIELDS, self.cfgs, self.ccap),
+                ("pastart", self._ACTION_FIELDS, self.acts, self.acap),
+                ("pcstart", self._CELL_FIELDS, self.cells, self.pcap)):
+            base = total - len(state[fields[0]])
+            at = (np.arange(len(state[fields[0]]), dtype=np.int64) + base) % size
+            for name in fields:
+                getattr(self, name)[at] = state[name]
+            getattr(self, start)[ring] += base
+        self.soff = np.asarray(state["soff"], np.int64).copy()
 
     def add(self, x, cc, cw, cy, coff, soff, source, truth, outcome, created,
             td1, pol=None):
@@ -613,11 +678,17 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
 def ingest(buf, data, warm=False):
     """Append one `gen_data` / farm collect dict onto the replay buffer."""
     x = np.asarray(data["rows"], np.uint8).reshape(-1, ROW_BYTES)
-    if not len(x):
-        return 0
     cc = np.asarray(data["cc"], np.uint8).reshape(-1, CCOUNTS)
     cw = np.asarray(data["cw"], np.float32)
-    cy = np.clip(np.asarray(data["cy"], np.float32), -1.0, 1.0)
+    cy = np.asarray(data["cy"], np.float32)
+    bad_cw = int((~np.isfinite(cw)).sum())
+    bad_cy = int((~np.isfinite(cy)).sum())
+    if bad_cw or bad_cy:
+        raise SystemExit(
+            f"non-finite collect values: data['cw']={bad_cw}, data['cy']={bad_cy}")
+    if not len(x):
+        return 0
+    cy = np.clip(cy, -1.0, 1.0)
     coff = np.asarray(data["coff"], np.int64)
     soff = np.asarray(data["soff"], np.int64)
     query = np.asarray(data["query"], np.uint8)
@@ -831,6 +902,7 @@ def main():
         diag_rng.bit_generator.state = checkpoint["diag_numpy_rng"]
         torch.set_rng_state(checkpoint["torch_rng"])
         torch.cuda.set_rng_state_all(checkpoint["cuda_rng"])
+        buf.load_state_dict(checkpoint["buffer"])
     peak = torch.cuda.max_memory_reserved(dev)
     print(f"[train] torch peak {peak / (1 << 20):.0f} MiB reserved on {dev} "
           f"(rows={n} configs={k}); farm carves mem_get_info free",
@@ -862,20 +934,9 @@ def main():
     sog_solves = int(progress["sog_solves"])
     probe = None
 
-    # Snapshots are archival only. Evaluate the packed bots separately after
-    # the run, outside the training clock.
+    # Snapshots are also checkpoints. Evaluate packed bots separately after the
+    # run, outside the training clock.
     snaps = checkpoint["snapshots"] if checkpoint else []
-    grace_rows = RESUME_GRACE_ROWS if checkpoint else 0
-    if checkpoint:
-        gib = args.cap * (ROW_BYTES + 40 + args.cfgs_per_row * 20
-                          + 24 * ACT_BYTES + 96 * 6) / (1 << 30)
-        print(f"[resume] replay is intentionally not persisted: its default-cap "
-              f"snapshot can reach {gib:.2f} GiB "
-              f"({gib * 1440 / args.snapshot_every:.0f} GiB/day at "
-              f"{args.snapshot_every:g}-minute cadence)", flush=True)
-        print(f"[resume] model, optimizer, target network, LR position, RNG, "
-              f"and {elapsed:.1f}s wall budget restored; training waits for "
-              f"{grace_rows} fresh replay rows", flush=True)
 
     def snapshot(label, el):
         # "init" and "final" are the two the reader always wants named; the rest
@@ -894,6 +955,7 @@ def main():
             "diag_numpy_rng": diag_rng.bit_generator.state,
             "torch_rng": torch.get_rng_state(),
             "cuda_rng": torch.cuda.get_rng_state_all(),
+            "buffer": buf.state_dict(),
             "elapsed": float(el),
             "next_snapshot": float(el + snap_gap),
             "epoch": epoch,
@@ -971,9 +1033,6 @@ def main():
         progress["farm_runs"] += 1
         optimizer_rows = int(progress["optimizer_rows"])
         generated_rows = int(progress["generated_rows"])
-        debt_generated_rows = generated_rows
-        debt_optimizer_rows = optimizer_rows
-        grace_active = bool(grace_rows)
         window = collections.Counter()
         totals = collections.Counter(progress["totals"])
         window_shapes = []
@@ -989,7 +1048,6 @@ def main():
         ent_at = [0] * 8
         next_report = time.time() + 10.0
         next_target = t0 + float(progress["next_target"])
-        grace_report = time.time()
 
         def save_progress():
             progress.update({
@@ -1038,17 +1096,8 @@ def main():
                 amount = int(data.get(name, 0))
                 totals[name] += amount
                 window[name] += amount
-            regenerating = len(buf) < grace_rows
-            if not regenerating and grace_active:
-                debt_generated_rows = generated_rows
-                debt_optimizer_rows = optimizer_rows
-                grace_active = False
-            debt = max(
-                0.0,
-                args.replay_ratio * (generated_rows - debt_generated_rows)
-                - (optimizer_rows - debt_optimizer_rows))
-            nsteps = (int(debt // args.batch)
-                      if len(buf) >= args.batch and not regenerating else 0)
+            debt = max(0.0, args.replay_ratio * generated_rows - optimizer_rows)
+            nsteps = int(debt // args.batch) if len(buf) >= args.batch else 0
             lv, train_s, train_stat = fit(nsteps, deadline)
             trained = train_stat.get("steps", 0)
             if trained:
@@ -1098,14 +1147,6 @@ def main():
                     next_target += args.target_every * 60.0
             sog_elapsed = max(0.0, now - sog_t0)
             save_progress()
-            if regenerating:
-                if now >= grace_report:
-                    print(f"[t={now - t0:6.1f}s] --- resume replay "
-                          f"{len(buf)}/{grace_rows}; training paused ---",
-                          flush=True)
-                    grace_report = now + 10.0
-                tick()
-                continue
             if now < next_report:
                 tick()
                 continue
@@ -1279,9 +1320,7 @@ def main():
                 "optimizer_steps": optimizer_rows // args.batch,
                 "optimizer_rows": optimizer_rows,
                 "optimizer_debt": round(
-                    max(0.0,
-                        args.replay_ratio * (generated_rows - debt_generated_rows)
-                        - (optimizer_rows - debt_optimizer_rows)), 1),
+                    max(0.0, args.replay_ratio * generated_rows - optimizer_rows), 1),
                 "replay_rows": generated_rows,
                 "rows_per_s": round(
                     generated_rows / max(sog_elapsed, 1e-9), 1),
