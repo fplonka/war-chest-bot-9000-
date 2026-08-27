@@ -51,7 +51,7 @@ def main():
 
     farm = warchest.SolveFarm(
         args.seed, args.threads,
-        s=args.s, c=args.c, cfr="sog",
+        s=args.s, c=args.c,
         recursive_rate=0.1, devices=[int(d) for d in args.devices.split(",")],
         roots=args.roots or None,
     )

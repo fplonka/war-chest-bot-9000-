@@ -903,7 +903,7 @@ def main():
             "t": round(el, 1),
             "label": label,
             "git": args.git,
-            "search": {"s": args.s, "c": args.c, "cfr": args.cfr},
+            "search": {"s": args.s, "c": args.c},
         }
         tmp = path + ".tmp"
         torch.save(state, tmp)
@@ -962,7 +962,6 @@ def main():
             rounds=args.rounds,
             explore=args.explore,
             random_draft=args.random_draft,
-            cfr=args.cfr,
             p_td1=args.p_td1,
             query_rate=args.query_rate,
             recursive_rate=args.recursive_rate,

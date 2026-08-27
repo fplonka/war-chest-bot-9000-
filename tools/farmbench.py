@@ -44,7 +44,6 @@ def bench(args, devices, threads):
         c=args.c,
         batch=args.batch,
         rounds=args.rounds,
-        cfr=args.cfr,
         recursive_rate=args.recursive_rate,
         devices=devices,
         roots=args.roots,
@@ -96,7 +95,6 @@ def main():
                    help="regret updates one round of a solve carries")
     p.add_argument("--rounds", type=int, default=PROD.rounds,
                    help="round boundaries tree growth may pass through")
-    p.add_argument("--cfr", default=PROD.cfr, help="the run's regret rule")
     p.add_argument("--recursive-rate", type=float, default=PROD.recursive_rate)
     p.add_argument("--weights", help="a checkpoint to solve with, e.g. runs/NAME/snap_02.pt")
     args = p.parse_args()

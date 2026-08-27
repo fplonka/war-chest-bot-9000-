@@ -55,10 +55,6 @@ class Cfg:
     # target is ever taken off the line of play.
     query_rate: float = 0.9
     recursive_rate: float = 0.1
-    # What Student of Games runs: regret-matching+ with linearly-weighted
-    # policy averaging, against simultaneous updates. `Solver::step` supplies
-    # the simultaneous half.
-    cfr: str = "sog"
     # Student of Games weights the two heads, `wv * huber + wp * cross_entropy`.
     # The value head is what CFR consumes, so it keeps weight one and the
     # policy -- which only steers the expansion phase -- comes in under it.

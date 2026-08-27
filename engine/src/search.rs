@@ -301,7 +301,7 @@ impl Default for Cfg {
             rounds: 0,
             #[cfg(test)]
             refresh: 1,
-            cfr: Cfr::SOG,
+            cfr: Cfr::DISCOUNTED,
             puct: 1.5,
             prior_temp: 1.0,
             budget: Budget::for_s(512),
@@ -365,7 +365,7 @@ impl Cfg {
 /// |---|---|---|---|---|
 /// | linear CFR (the reference implementation's) | 1 | 1 | 1 | 0 |
 /// | CFR+ (Tammelin 2014) | inf | -inf | 2 | 0 |
-/// | DCFR (what TurboReBeL itself runs) | 1.5 | 0 | 2 | 0 |
+/// | DCFR (the engine's default) | 1.5 | 0 | 2 | 0 |
 /// | PCFR+ (Farina et al. 2021) | inf | -inf | 2 | 1 |
 /// | SAPCFR+ (Meng et al. 2026) | inf | -inf | 2 | 1/3 |
 ///
@@ -411,36 +411,13 @@ impl Cfr {
         predict: 1.0 / 3.0,
     };
 
-    /// What Student of Games runs in its regret update phase, verbatim:
-    /// "simultaneous updates, regret-matching+, and linearly-weighted policy
-    /// averaging".
-    ///
-    /// Regret matching+ is `alpha = inf, beta = -inf` — accumulated positive
-    /// regret is undiscounted and negative accumulated regret is floored at
-    /// zero, which is `Q_t(s,a) = (Q_{t-1}(s,a) + r_t(s,a))^+`.
-    ///
-    /// The averaging weight needs care. A running sum multiplied by
-    /// `(t / (t + 1))^gamma` before each iterate is added gives iterate `j` a
-    /// weight proportional to `(j + 1)^gamma` at the end, so *linear*
-    /// weighting is `gamma = 1` and not the 2 that `PLUS` carries.
-    ///
-    /// Simultaneous updates are not in this constant — they are `Solver::step`
-    /// traversing both players against one reach profile.
-    pub const SOG: Cfr = Cfr {
-        alpha: f32::INFINITY,
-        beta: f32::NEG_INFINITY,
-        gamma: 1.0,
-        predict: 0.0,
-    };
-
     /// The named variants, for the tools that sweep them.
-    pub const NAMED: [(&'static str, Cfr); 6] = [
+    pub const NAMED: [(&'static str, Cfr); 5] = [
         ("linear", Cfr::LINEAR),
         ("plus", Cfr::PLUS),
         ("dcfr", Cfr::DISCOUNTED),
         ("pcfr", Cfr::PREDICTIVE),
         ("sapcfr", Cfr::SIMPLE_ASYM),
-        ("sog", Cfr::SOG),
     ];
 
     pub fn named(name: &str) -> Option<Cfr> {
