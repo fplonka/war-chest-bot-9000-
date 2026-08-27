@@ -2666,6 +2666,7 @@ impl Solver {
             !self.avg.is_empty(),
             "the solve must finish before its average is read"
         );
-        &self.avg[row]
+        let so = self.soff[0] as usize;
+        &self.avg[so + row.start..so + row.end]
     }
 }

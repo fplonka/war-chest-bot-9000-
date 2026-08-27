@@ -359,4 +359,38 @@ mod tests {
         let np = root(&sv);
         let _ = np.sample(&mut Rng::new(2), 0);
     }
+
+    #[test]
+    fn root_policy_uses_nonzero_strategy_offset() {
+        const MAX_PLIES: usize = 200;
+        let mut rng = Rng::new(0);
+        let mut state = make_game(&mut rng, true);
+        for _ in 0..(MAX_PLIES - 1) {
+            let acts = state.legal_actions();
+            state.apply_inplace(acts[rng.below(acts.len())]);
+        }
+
+        let ctx = Ctx::new(&state);
+        let bel = [
+            Belief::point(true_config(&state, 0, &ctx)),
+            Belief::point(true_config(&state, 1, &ctx)),
+        ];
+        let mut sv = Solver::new(
+            &state,
+            ctx,
+            Arc::new(Net::default()),
+            Cfg {
+                s: 3,
+                c: 0.0,
+                ..Default::default()
+            },
+            bel,
+            Rng::new(1),
+        );
+        assert!(sv.soff[0] > 0);
+        sv.run_alone();
+        let want = sv.root_policy();
+        assert!(!want.p.is_empty());
+        assert_eq!(root(&sv).probs, want.p);
+    }
 }
