@@ -36,7 +36,7 @@ use cudarc::driver::{
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 
 use crate::board::{board, N_HEXES, NONE};
-use crate::farm::{Call, Prime, Reply, CARD_ROWS};
+use crate::farm::{Call, Prime, Reply};
 use crate::net::{
     ln_block, Net, NetLayout, NormSpan, Span, AW, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW,
     LN_ACT, LN_CFG, LN_H, LN_JOIN, LN_JOUT, LN_TRUNK, POOL, TYPE,
@@ -434,7 +434,7 @@ struct RoundCap {
 
 impl RoundCap {
     fn of(n: usize, b: &Budget, s: u32) -> RoundCap {
-        let cards = n * CARD_ROWS * NTYPE * TYPE;
+        let cards = n * NTYPE * TYPE;
         // Host-packed tree columns (not board `p`/`jp` or config `f`/`g`/`fp`,
         // which stay on the card), plus the trunk's extra copies of board_of,
         // cidx and coff on the same scatter.
@@ -466,7 +466,7 @@ impl RoundCap {
             occupant: TILE * N_HEXES,
             x: TILE * N_HEXES * C,
             action: TILE * AW,
-            bag: n * CARD_ROWS * NTYPE * 3 * POOL,
+            bag: n * NTYPE * 3 * POOL,
             packed: TILE * ROW_BYTES,
             xpub: TILE * PUBFEAT,
             cards,
@@ -1592,7 +1592,7 @@ impl Card {
                 unreachable!("trunk shard holds only trunk calls")
             };
             assert_eq!(packed.len(), boards * ROW_BYTES, "trunk input is not one packed row a board");
-            assert_eq!(cards.len(), CARD_ROWS * NTYPE * TYPE, "trunk card table");
+            assert_eq!(cards.len(), NTYPE * TYPE, "trunk card table");
             (packed, cards, *boards)
         };
         let rows: usize = mine.iter().map(|&i| each(i).2).sum();
@@ -1611,7 +1611,7 @@ impl Card {
         let s = &self.stream;
         {
             let mut stage = self.host.lock();
-            stage.cards.put(s, mine.len() * CARD_ROWS * NTYPE * TYPE, |dst| {
+            stage.cards.put(s, mine.len() * NTYPE * TYPE, |dst| {
                 let mut at = 0;
                 for &i in mine {
                     let (_, cd, _) = each(i);
@@ -1652,14 +1652,14 @@ impl Card {
                         let boards = each(i).2;
                         if skip >= boards {
                             skip -= boards;
-                            card += CARD_ROWS as i32;
+                            card += 1;
                             continue;
                         }
                         let take = (boards - skip).min(n - wrote);
                         dst[wrote..wrote + take].fill(card);
                         wrote += take;
                         skip = 0;
-                        card += CARD_ROWS as i32;
+                        card += 1;
                         if wrote == n {
                             break;
                         }
@@ -1863,6 +1863,7 @@ impl Card {
             };
             assert_eq!(phi.len(), n * CFEAT, "config phi is not one row a config");
             assert_eq!(owner.len(), *n, "config owner is not one entry a config");
+            assert_eq!(cards.len(), NTYPE * TYPE, "config card table");
             (phi, owner, cards, *n)
         };
         let n: usize = mine.iter().map(|&i| each(i).3).sum();
@@ -1870,7 +1871,7 @@ impl Card {
         let l = &self.layout;
         {
             let mut stage = self.host.lock();
-            stage.cfg_cards.put(s, mine.len() * CARD_ROWS * NTYPE * TYPE, |dst| {
+            stage.cfg_cards.put(s, mine.len() * NTYPE * TYPE, |dst| {
                 let mut at = 0;
                 for &i in mine {
                     let (_, _, cd, _) = each(i);
@@ -1913,10 +1914,10 @@ impl Card {
                 stage.owner.put(s, k, |dst| {
                     let (mut skip, mut wrote, mut base) = (cfg0, 0, 0u32);
                     for &i in mine {
-                        let (_, ow, cd, kn) = each(i);
+                        let (_, ow, _, kn) = each(i);
                         if skip >= kn {
                             skip -= kn;
-                            base += (2 * cd.len() / (NTYPE * TYPE)) as u32;
+                            base += 2;
                             continue;
                         }
                         let take = (kn - skip).min(k - wrote);
@@ -1925,7 +1926,7 @@ impl Card {
                         }
                         wrote += take;
                         skip = 0;
-                        base += (2 * cd.len() / (NTYPE * TYPE)) as u32;
+                        base += 2;
                         if wrote == k {
                             break;
                         }
@@ -1947,7 +1948,7 @@ impl Card {
         let cards = stage.cfg_cards.dev.buf.as_ref().expect("staged");
         let l = &self.layout;
         let (n_i, nslot, cfeat) = (k as i32, NSLOT as i32, CFEAT as i32);
-        let (ntype, type_i, pool_i) = (NTYPE as i32, TYPE as i32, POOL as i32);
+        let (type_i, pool_i) = (TYPE as i32, POOL as i32);
         let width = 3 + TYPE;
         let mut sc = self.scratch.lock();
         sc.tokens.room(k * NSLOT * width)?;
@@ -1964,7 +1965,7 @@ impl Card {
         let g = pooled.buf.as_mut().unwrap();
         let fp = z.buf.as_mut().unwrap();
         let bag = bag.buf.as_mut().unwrap();
-        launch!(self, cfg_slots, k * NSLOT * width, phi, owner, cards, &mut *slots, &n_i, &nslot, &cfeat, &ntype, &type_i)?;
+        launch!(self, cfg_slots, k * NSLOT * width, phi, owner, cards, &mut *slots, &n_i, &nslot, &cfeat, &type_i)?;
         self.run(l.cfg1, slots, k * NSLOT, &mut *hidden)?;
         let hid = (k * NSLOT * CFGH) as i32;
         launch!(self, gelu, k * NSLOT * CFGH, &mut *hidden, &hid)?;
@@ -1974,7 +1975,7 @@ impl Card {
         self.run(l.cfg_f, u, k, &mut *f)?;
         self.run(l.cfg_g, u, k, &mut *g)?;
         self.run(l.cfg_p, u, k, &mut *fp)?;
-        launch!(self, bag, k * POOL, bag, phi, owner, &mut *g, &n_i, &nslot, &ntype, &cfeat, &pool_i)?;
+        launch!(self, bag, k * POOL, bag, phi, owner, &mut *g, &n_i, &nslot, &cfeat, &pool_i)?;
         let mut skip = cfg0;
         let mut src = 0;
         let mut solves = self.solves.lock();

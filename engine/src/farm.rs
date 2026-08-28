@@ -300,7 +300,7 @@ impl Call {
         let mut r = Reply::default();
         match self {
             Call::Trunk { packed, cards, boards, .. } => {
-                net.board_from_rows(packed, cards, *boards, CARD_ROWS, &mut r.a);
+                net.board_from_rows(packed, cards, *boards, &mut r.a);
                 net.join_cache(&r.a, *boards, &mut r.b);
             }
             Call::Configs { phi, owner, cards, n, .. } => {
@@ -347,10 +347,6 @@ impl Call {
         }
     }
 }
-
-
-/// One physical card table per solve, fixed at the draft.
-pub const CARD_ROWS: usize = 1;
 
 /// Host-side slots that fit in the memory the process does not already hold.
 ///

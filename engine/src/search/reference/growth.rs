@@ -104,7 +104,7 @@ impl Solver {
                 board_of.push(mine);
             }
         }
-        let (projected, spatial) = self.net.position_parts(&xpub, &self.cards, want.len(), 1);
+        let (projected, spatial) = self.net.position_parts(&xpub, &self.cards, want.len());
         let na = board_of.len();
         let mut e = Vec::new();
         self.net.actions(

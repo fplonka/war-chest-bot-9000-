@@ -1,29 +1,8 @@
-"""The board's 180-degree symmetry, as a transform on packed replay rows.
+"""The exact 180-degree board rotation and player swap.
 
-Rotating the board by 180 degrees maps white's two starting locations exactly
-onto black's and permutes the six neutral ones, so *rotate the board and swap
-the two players* is an exact symmetry of War Chest: the rotated position is a
-legal position with the seats exchanged, and its value is the original value
-with the two players' roles exchanged.
-
-That makes every training row usable twice, for free and with no cost at
-generation time.
-
-Applied to the second canonical view of every row rather than stored, so the
-replay buffer does not double. The transform permutes the frozen row fields
-(`warchest.ROW_*` byte slices) directly; the network input is expanded from
-the mirrored row afterwards, so the encoder itself never has to know about the
-mirror. The board trunk runs in physical seat-0 space, so only the config side
-of a query needs the mirrored row.
-
-Correctness
------------
-`self_check` asserts the properties that any indexing mistake would break:
-the transform is an involution, quantities that must be invariant under a
-rotation (whether a hex is a location, the round number) do not move, and
-quantities that must swap (each player's board presence, the unit ids) do.
-The strongest check: expansion and mirror commute — `expand(mirror(row))`
-must equal the feature-level mirror of `expand(row)`.
+Training randomly applies it to a replay row and all attached player and policy
+indices. The physical row contains both players' cards, so inference needs no
+mirrored copy.
 """
 
 import numpy as np

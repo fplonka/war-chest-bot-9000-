@@ -558,7 +558,7 @@ void k_trunk(float* x0, const int* nb, const float* __restrict__ w,
 // One slot row per (config, slot): three counts then that slot's card token.
 __global__ void k_cfg_slots(const float* phi, const unsigned int* owner,
                             const float* cards, float* slots, int n, int nslot,
-                            int cfeat, int ntype, int type) {
+                            int cfeat, int type) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int width = 3 + type;
     if (i >= n * nslot * width) return;
@@ -586,7 +586,7 @@ __global__ void k_sum_slots(const float* hidden, float* out, int n, int nslot,
 // that pooling a belief carries its exact expected holding of every card.
 __global__ void k_bag(const float* bag, const float* phi,
                       const unsigned int* owner, float* g, int n, int nslot,
-                      int ntype, int cfeat, int pool) {
+                      int cfeat, int pool) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n * pool) return;
     int cfg = i / pool, j = i % pool;
