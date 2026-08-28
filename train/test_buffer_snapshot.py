@@ -113,6 +113,14 @@ def assert_same(left, right):
 def main():
     train = load_buffer_module()
     train.time.time = lambda: 1_000_000.0
+    probe = train.Buffer(4, 16)
+    tiny = np.float32(1e-10)
+    one = list(chunk(train, 1, 1))
+    one[2][0] = tiny
+    probe.add(*one)
+    assert probe.cw.dtype == np.float32
+    assert probe.cw[0] == tiny
+
     buf = train.Buffer(4096, 12_000)
     for start in range(0, 6000, 1000):
         buf.add(*chunk(train, start, 1000))

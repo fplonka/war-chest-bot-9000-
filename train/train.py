@@ -100,8 +100,9 @@ class Buffer:
     format (`ROW_BYTES` raw bytes: hex facts, piles, unit ids, and scalars) --
     ~223 bytes instead of the ~1.9 KB the old float encoding cost -- and the
     network input is expanded from it when a batch is made. Counts are stored
-    as the `uint8` they are and everything else as float16, which is what makes
-    the cap affordable: a row costs `ROW_BYTES` bytes plus 20 per config.
+    as the `uint8` they are. Targets and policy probabilities use float16;
+    belief weights stay float32 so replay does not change the range that made
+    the targets. A row costs `ROW_BYTES` bytes plus 22 per config.
 
     Preallocated and written with wraparound rather than grown by
     concatenation. The concatenate form rebuilt the whole buffer every epoch:
@@ -122,7 +123,7 @@ class Buffer:
         self.clen = np.zeros((cap, 2), np.int32)
         self.cc = np.zeros((ccap, CCOUNTS), np.uint8)
         self.cp = np.zeros(ccap, np.uint8)
-        self.cw = np.zeros(ccap, np.float16)
+        self.cw = np.zeros(ccap, np.float32)
         self.cy = np.zeros(ccap, np.float16)
         # The policy target, per row: the root's actions, and the legal cells
         # with their probability. Only main-line rows carry one, so both arenas
@@ -672,7 +673,7 @@ def ingest(buf, data, warm=False):
            np.asarray(data["pci"], np.uint16),
            np.asarray(data["pcell"], np.uint16),
            np.asarray(data["pprob"], np.float16))
-    buf.add(x, cc, cw.astype(np.float16), cy.astype(np.float16), coff, soff,
+    buf.add(x, cc, cw, cy.astype(np.float16), coff, soff,
             source, truth, outcome, created, td1, pol)
     return len(x)
 
