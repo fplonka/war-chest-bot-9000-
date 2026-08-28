@@ -1770,8 +1770,7 @@ impl Solver {
     /// every other decision stops as a leaf.
     fn grow(&mut self, id: usize) {
         debug_assert!(self.nodes[id].leaf, "only a leaf can be grown");
-        // It is a decision node from here, so it wants a policy prior as soon
-        // as the batch reaches its row.
+        // It is a decision node from here, so the next round gives it a policy prior.
         if self.row_of[id] != u32::MAX {
             self.wants_prior.push(id as u32);
         }
@@ -2579,24 +2578,16 @@ impl Solver {
     /// Games' "the prior policy `p` obtained from the queries", asked for at
     /// the moment it first has a use.
     fn ready_for_prior(&mut self) -> Vec<usize> {
-        let mut want: Vec<usize> = Vec::new();
-        let mut queue = std::mem::take(&mut self.wants_prior);
-        queue.retain(|&i| {
+        let mut ready = Vec::new();
+        for i in std::mem::take(&mut self.wants_prior) {
             let i = i as usize;
             if self.primed[i] || self.nodes[i].leaf || self.nodes[i].chance {
-                return false;
+                continue;
             }
-            if self.row_of[i] == u32::MAX {
-                return false;
-            }
-            if (self.row_of[i] as usize) < self.leaf_rows.len() {
-                want.push(i);
-                return false;
-            }
-            true
-        });
-        self.wants_prior = queue;
-        want
+            debug_assert_ne!(self.row_of[i], u32::MAX, "a decision node has no network row");
+            ready.push(i);
+        }
+        ready
     }
 
     /// The same nodes, described for the card, which runs the policy head
