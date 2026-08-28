@@ -98,11 +98,11 @@ class Buffer:
     its length is a real algorithmic knob and not just a memory setting -- the
     reference implementation runs a 2M buffer. A row is the frozen compact
     format (`ROW_BYTES` raw bytes: hex facts, piles, unit ids, and scalars) --
-    ~223 bytes instead of the ~1.9 KB the old float encoding cost -- and the
+    353 bytes instead of the ~1.9 KB the old float encoding cost -- and the
     network input is expanded from it when a batch is made. Counts are stored
     as the `uint8` they are. Targets and policy probabilities use float16;
     belief weights stay float32 so replay does not change the range that made
-    the targets. A row costs `ROW_BYTES` bytes plus 22 per config.
+    the targets. A row costs `ROW_BYTES` bytes plus 21 per config.
 
     Preallocated and written with wraparound rather than grown by
     concatenation. The concatenate form rebuilt the whole buffer every epoch:
@@ -122,7 +122,6 @@ class Buffer:
         self.cstart = np.zeros(cap, np.int64)   # absolute arena offset
         self.clen = np.zeros((cap, 2), np.int32)
         self.cc = np.zeros((ccap, CCOUNTS), np.uint8)
-        self.cp = np.zeros(ccap, np.uint8)
         self.cw = np.zeros(ccap, np.float32)
         self.cy = np.zeros(ccap, np.float16)
         # The policy target, per row: the root's actions, and the legal cells
@@ -155,7 +154,7 @@ class Buffer:
         "written_at", "created_at", "source", "truth", "outcome", "td1")
     # start, per-row lengths, arena fields, running count, capacity.
     _ARENAS = (
-        ("cstart", "clen", ("cc", "cp", "cw", "cy"), "cfgs", "ccap"),
+        ("cstart", "clen", ("cc", "cw", "cy"), "cfgs", "ccap"),
         ("pastart", "palen", ("pa",), "acts", "acap"),
         ("pcstart", "pclen", ("pci", "pact", "pp"), "cells", "pcap"))
 
@@ -225,7 +224,6 @@ class Buffer:
                     and self.acts - self.pastart[r] + na <= self.acap):
                 break
             self.lo += 1
-        cp = np.repeat(np.tile([0, 1], n).astype(np.uint8), lens.ravel())
         starts = self.cfgs + coff[:-1:2]
         base = self.rows
         now = time.time()
@@ -243,7 +241,7 @@ class Buffer:
             self.outcome[ring] = outcome[i:j]
             self.td1[ring] = td1[i:j]
         sl = (np.arange(m) + self.cfgs) % self.ccap
-        self.cc[sl], self.cp[sl], self.cw[sl], self.cy[sl] = cc, cp, cw, cy
+        self.cc[sl], self.cw[sl], self.cy[sl] = cc, cw, cy
         if pol is not None:
             alen = np.diff(paoff).astype(np.int32)
             clen = np.diff(pcoff).astype(np.int32)
@@ -295,7 +293,9 @@ class Buffer:
         within = np.arange(total, dtype=np.int64) - np.repeat(
             np.concatenate([[0], np.cumsum(lens)[:-1]]), lens)
         at = (base + within) % self.ccap
-        seg = 2 * np.repeat(np.arange(len(ids), dtype=np.int64), lens) + self.cp[at]
+        row = np.repeat(np.arange(len(ids), dtype=np.int64), lens)
+        player = (within >= np.repeat(self.clen[s, 0], lens)).astype(np.uint8)
+        seg = 2 * row + player
         # The policy target, remapped onto the batch. A row with no target
         # contributes no cells, which is how a query solve drops out of the
         # policy loss without a mask.
@@ -319,10 +319,10 @@ class Buffer:
                np.repeat(abase, clen) + self.pact[ci % self.pcap],
                cellrow, pcfg, pp,
                np.repeat(np.arange(len(ids), dtype=np.int64), alen))
-        cw = self.cw[at].astype(np.float32)
+        cw = self.cw[at].copy()
         mass = np.bincount(seg, weights=cw, minlength=2 * len(ids)).astype(np.float32)
         cw /= mass[seg]
-        return (self.x[s], self.cc[at], self.cp[at], cw,
+        return (self.x[s], self.cc[at], player, cw,
                 self.cy[at].astype(np.float32), seg, pol)
 
     def sample_ids(self, batch, rng, recent_mix=0.0, recent_frac=0.2):
