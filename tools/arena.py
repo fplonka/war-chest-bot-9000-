@@ -262,18 +262,34 @@ def fit_elo(n, w):
 
 
 def elo_stderr(n, elo):
-    """The standard error of each rating, from the Fisher information of the
-    games actually played. A pair that went 20-0 carries almost none."""
+    """Bradley-Terry covariance with player zero fixed as the rating anchor."""
+    k = len(n)
     c = 400.0 / math.log(10.0)
-    out = []
-    for i in range(len(n)):
-        info = 0.0
-        for j in range(len(n)):
-            if i == j or n[i][j] == 0:
+    info = np.zeros((k, k))
+    for i in range(k):
+        for j in range(i):
+            if n[i][j] == 0:
                 continue
             q = 1.0 / (1.0 + 10.0 ** ((elo[j] - elo[i]) / 400.0))
-            info += n[i][j] * q * (1 - q) / (c * c)
-        out.append(float("inf") if info == 0 else 1.0 / math.sqrt(info))
+            weight = n[i][j] * q * (1 - q) / (c * c)
+            info[i][i] += weight
+            info[j][j] += weight
+            info[i][j] -= weight
+            info[j][i] -= weight
+    reached = {0}
+    pending = [0]
+    while pending:
+        i = pending.pop()
+        for j in np.flatnonzero(n[i]):
+            if j not in reached:
+                reached.add(j)
+                pending.append(j)
+    ids = sorted(reached - {0})
+    out = [0.0] + [float("inf")] * (k - 1)
+    if ids:
+        covariance = np.linalg.inv(info[np.ix_(ids, ids)])
+        for i, variance in zip(ids, np.diag(covariance)):
+            out[i] = math.sqrt(max(0.0, variance))
     return out
 
 
