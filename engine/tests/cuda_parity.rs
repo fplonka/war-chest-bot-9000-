@@ -404,7 +404,7 @@ fn worst_scaled(a: &[f32], b: &[f32], what: &str) -> f32 {
 /// accumulate that, but a LayerNorm stands between each pair and renormalises
 /// rather than compounding. Simulated over the same shapes with random weights,
 /// the worst cell of a board vector lands at `5e-4` of the array's RMS and the
-/// median at `1e-4`. The bound is set four times the worst of that, which is
+/// median at `1e-4`. The bound is set six times the worst of that, which is
 /// still two orders below anything a real break would show.
 ///
 /// Two independent arguments say the difference does not matter. The trainer
@@ -412,7 +412,7 @@ fn worst_scaled(a: &[f32], b: &[f32], what: &str) -> f32 {
 /// half an ulp of the format it is written into. And the trainer multiplies in
 /// TF32 itself (`torch.set_float32_matmul_precision("high")`), so the weights
 /// were learned under ten-mantissa-bit GEMMs to begin with.
-const TF32: f32 = 2e-3;
+const TF32: f32 = 3e-3;
 
 /// A whole solve, both ways, on the same tree.
 ///

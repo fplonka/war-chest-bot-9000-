@@ -78,23 +78,14 @@ impl NodePolicy {
 
     /// This node's policy in the replay-row layout a SoG root stores, so a
     /// warm row is an ordinary row.
-    pub fn to_replay(&self) -> Policy {
+    pub fn to_replay(&self, player: u8, ctx: &Ctx) -> Policy {
         let ncfg = self.legal_off.len().saturating_sub(1);
         let mut out = Policy {
             acts: self
                 .acts
                 .iter()
                 .enumerate()
-                .map(|(a, act)| {
-                    let h = act.hexes();
-                    [
-                        act.kind() as u8,
-                        crate::net::slot_column(self.aslot[a]) as u8,
-                        h[0],
-                        h[1],
-                        h[2],
-                    ]
-                })
+                .map(|(a, act)| crate::search::action_desc(act, player, ctx, self.aslot[a]))
                 .collect(),
             off: Vec::with_capacity(ncfg + 1),
             act: Vec::new(),

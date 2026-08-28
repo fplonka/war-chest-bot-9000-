@@ -8,8 +8,10 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 
+use crate::board::N_HEXES;
 use crate::farm::Dst;
-use crate::net::{D, JW, POOL};
+use crate::net::{C, D, JW, POOL};
+use crate::pbs::NTYPE;
 use crate::search::{Budget, Ent};
 
 use super::{err, Host, Res, HELD};
@@ -23,7 +25,7 @@ struct Col {
     name: &'static str,
 }
 
-const TABLE: [Col; 52] = [
+const TABLE: [Col; 54] = [
     Col { ent: Ent::Node, width: 1, dst: Some(Dst::Kind), name: "kind" },
     Col { ent: Ent::Node, width: 1, dst: Some(Dst::Player), name: "player" },
     Col { ent: Ent::Node, width: 1, dst: Some(Dst::Exhausted), name: "exhausted" },
@@ -68,6 +70,8 @@ const TABLE: [Col; 52] = [
     Col { ent: Ent::Config, width: 2, dst: Some(Dst::Rootb), name: "rootb" },
     Col { ent: Ent::Board, width: D, dst: None, name: "p" },
     Col { ent: Ent::Board, width: JW, dst: None, name: "jp" },
+    Col { ent: Ent::Board, width: NTYPE * C, dst: None, name: "tokens" },
+    Col { ent: Ent::Board, width: N_HEXES * C, dst: None, name: "spatial" },
     Col { ent: Ent::Row, width: 1, dst: None, name: "board_of" },
     Col { ent: Ent::Config, width: D, dst: None, name: "f" },
     Col { ent: Ent::Config, width: POOL, dst: None, name: "g" },
@@ -130,6 +134,8 @@ pub const R_REACH: usize = lane(Ent::Reach, "reach");
 pub const R_VALS: usize = lane(Ent::Reach, "vals");
 pub const B_P: usize = lane(Ent::Board, "p");
 pub const B_JP: usize = lane(Ent::Board, "jp");
+pub const B_TOKENS: usize = lane(Ent::Board, "tokens");
+pub const B_SPATIAL: usize = lane(Ent::Board, "spatial");
 pub const G_F: usize = lane(Ent::Config, "f");
 pub const G_G: usize = lane(Ent::Config, "g");
 pub const G_FP: usize = lane(Ent::Config, "fp");
@@ -142,11 +148,12 @@ const _: () = {
     assert!(FIELDS[2] == 7);
     assert!(FIELDS[3] == 4);
     assert!(FIELDS[4] == 5);
-    assert!(FIELDS[5] == D + JW);
+    assert!(FIELDS[5] == D + JW + NTYPE * C + N_HEXES * C);
     assert!(FIELDS[6] == 2 * D + POOL + 2);
     assert!(FIELDS[7] == 1);
     assert!(C_CUR == 7 && C_SUM == 9 && C_PRIOR == 12);
     assert!(B_P == 0 && B_JP == D);
+    assert!(B_TOKENS == D + JW && B_SPATIAL == D + JW + NTYPE * C);
     assert!(G_F == 2 && Y_COFF == 1);
 };
 
@@ -455,13 +462,17 @@ impl Solve {
         at: usize,
         p: &CudaSlice<f32>,
         jp: &CudaSlice<f32>,
+        tokens: &CudaSlice<f32>,
+        spatial: &CudaSlice<f32>,
         from: usize,
         n: usize,
     ) -> Res<()> {
         self.reserve(Ent::Board, at + n)?;
         let e = &mut self.ent[Ent::Board as usize];
         e.copy_f32(s, B_P, at * D, p, from * D, n * D)?;
-        e.copy_f32(s, B_JP, at * JW, jp, from * JW, n * JW)
+        e.copy_f32(s, B_JP, at * JW, jp, from * JW, n * JW)?;
+        e.copy_f32(s, B_TOKENS, at * NTYPE * C, tokens, from * NTYPE * C, n * NTYPE * C)?;
+        e.copy_f32(s, B_SPATIAL, at * N_HEXES * C, spatial, from * N_HEXES * C, n * N_HEXES * C)
     }
 
     pub fn copy_cfg(

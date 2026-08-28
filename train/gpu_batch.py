@@ -40,9 +40,8 @@ def make_batch(parts, rng, device):
         2 * n, stream.cuda_stream, ordinal)
 
     phi = t(cc, torch.float32) / float(warchest.CNORM)
-    from train import action_feats
     pa, pact, pcrow, pcfg, pprob, parow = pol
-    policy = (t(action_feats(pa), torch.float32), t(parow, torch.long),
+    policy = (t(pa, torch.uint8), t(parow, torch.long),
               t(pact, torch.long), t(pcrow, torch.long), t(pcfg, torch.long),
               t(pprob, torch.float32))
     return (x, phi, t(cw, torch.float32), t(seg, torch.long),

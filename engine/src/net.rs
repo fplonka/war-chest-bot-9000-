@@ -47,16 +47,8 @@ pub const JW: usize = 128;
 pub const JBLOCKS: usize = 3;
 /// Both pooled beliefs and the queried physical seat.
 pub const JOIN_IN: usize = 2 * POOL + 1;
-/// Action encoder hidden width.
-pub const AW: usize = 128;
-/// How an action is described to the policy head: what kind it is, which coin
-/// slot it spends (or none), and the three squares it can name — where the
-/// acting piece stands, where it ends up, and what it strikes.
-///
-/// Every one of these is public, which is what lets one description serve every
-/// config at a node: an action's private content is *whether it is legal*, and
-/// the tree already carries that as the legal cells.
-pub const AFEAT: usize = N_KINDS + (NSLOT + 1) + 3 * (N_HEXES + 1);
+/// Action encoder width, shared with entity tokens.
+pub const AW: usize = C;
 
 #[cfg(target_vendor = "apple")]
 #[link(name = "Accelerate", kind = "framework")]
@@ -245,9 +237,9 @@ pub struct NetLayout {
     pub cfg_m: Span,
     /// The policy readout's config vector, beside `cfg_f`'s value one.
     pub cfg_p: Span,
-    /// The action encoder: the action's own description, its board and its
-    /// belief-conditioned join row, then the policy readout.
-    pub act_in: Span,
+    /// The action encoder: action kind, role gates, board and belief row.
+    pub act_kind: usize,
+    pub act_role: usize,
     pub act_board: Span,
     pub act_h: Span,
     pub act_out: Span,
@@ -326,7 +318,8 @@ impl NetLayout {
         let cfg_g = c.lin(CFGH, POOL, true);
         let cfg_m = c.lin(TYPE, 3 * POOL, false);
         let cfg_p = c.lin(CFGH, D, true);
-        let act_in = c.lin(AFEAT, AW, true);
+        let act_kind = c.embed(N_KINDS * AW);
+        let act_role = c.embed(5 * AW);
         let act_board = c.lin(D, AW, false);
         let act_out = c.lin(AW, D, true);
         let join_p = c.lin(D, JW, false);
@@ -363,7 +356,8 @@ impl NetLayout {
             cfg_g,
             cfg_m,
             cfg_p,
-            act_in,
+            act_kind,
+            act_role,
             act_board,
             act_h,
             act_out,
@@ -489,7 +483,8 @@ pub struct Net {
     cfg_g: Lin,
     cfg_m: Lin,
     cfg_p: Lin,
-    act_in: Lin,
+    act_kind: Vec<f32>,
+    act_role: Vec<f32>,
     act_board: Lin,
     act_h: Lin,
     act_out: Lin,
@@ -519,17 +514,6 @@ fn physical_rows(xpub: &[f32], rows: usize) -> Vec<f32> {
         out.extend_from_slice(&xpub[2 * r * PUBFEAT..(2 * r + 1) * PUBFEAT]);
     }
     out
-}
-
-/// The one-hot column of the coin slot an action spends: `-1`, a micro-decision
-/// that spends nothing, is the column past the last slot. A replay row stores
-/// this column as the action's slot byte, so the trainer reads it as is.
-pub fn slot_column(slot: i8) -> usize {
-    if slot < 0 {
-        NSLOT
-    } else {
-        slot as usize
-    }
 }
 
 impl Net {
@@ -592,7 +576,8 @@ impl Net {
             cfg_g: layer(l.cfg_g),
             cfg_m: layer(l.cfg_m),
             cfg_p: layer(l.cfg_p),
-            act_in: layer(l.act_in),
+            act_kind: w[l.act_kind..l.act_kind + N_KINDS * AW].to_vec(),
+            act_role: w[l.act_role..l.act_role + 5 * AW].to_vec(),
             act_board: layer(l.act_board),
             act_h: layer(l.act_h),
             act_out: layer(l.act_out),
@@ -733,7 +718,7 @@ impl Net {
 
     /// The trunk stem: hex facts, the occupant's projected token, position,
     /// globals, and a nonlinear pool over every drafted coin type.
-    fn stem(&self, xpub: &[f32], tokens: &[f32], rows: usize) -> Vec<f32> {
+    fn stem(&self, xpub: &[f32], tokens: &[f32], rows: usize) -> (Vec<f32>, Vec<f32>) {
         let mut facts = scratch(rows * N_HEXES * HEX_FACTS);
         let mut occ = scratch(rows * N_HEXES * C);
         let mut loose = scratch(rows * LOOSE);
@@ -778,17 +763,16 @@ impl Net {
         recycle(facts);
         recycle(occ);
         recycle(loose);
-        recycle(projected);
         recycle(type_pool);
         recycle(glob);
-        x
+        (projected, x)
     }
 
-    /// `[rows, N_HEXES, C]` trunk output, already normalised and activated.
-    fn trunk(&self, xpub: &[f32], tokens: &[f32], rows: usize) -> Vec<f32> {
+    /// Projected card tokens and the normalised, activated hex tokens.
+    fn trunk(&self, xpub: &[f32], tokens: &[f32], rows: usize) -> (Vec<f32>, Vec<f32>) {
         let bd = board();
         let cells = rows * N_HEXES;
-        let mut x = self.stem(xpub, tokens, rows);
+        let (projected, mut x) = self.stem(xpub, tokens, rows);
         let mut a = scratch(cells * C);
         let mut mixed = scratch(cells * 2 * C);
         let mut pooled = scratch(rows * 2 * C);
@@ -847,23 +831,16 @@ impl Net {
         recycle(z);
         recycle(arg);
         recycle(th);
-        x
+        (projected, x)
     }
 
-    /// One board vector per physical row. `xpub` contains paired canonical
-    /// queries; the trunk reads the even, physical-seat-zero rows.
-    pub fn board(
+    pub(crate) fn position_parts(
         &self,
         xpub: &[f32],
         cards: &[f32],
         rows: usize,
         card_rows: usize,
-        out: &mut Vec<f32>,
-    ) {
-        // `xpub` is one row a leaf: the board is a public thing and the trunk
-        // never looked at the mirrored seat view, which this used to gather
-        // past. The card table still holds both views, and a leaf takes the
-        // physical one.
+    ) -> (Vec<f32>, Vec<f32>) {
         let mut physical_cards = scratch(rows * NTYPE * TYPE);
         for r in 0..rows {
             let cr = (2 * r) % card_rows;
@@ -871,7 +848,13 @@ impl Net {
                 .copy_from_slice(&cards[cr * NTYPE * TYPE..(cr + 1) * NTYPE * TYPE]);
         }
         let tokens = self.tokens(xpub, &physical_cards, rows, rows);
-        let x = self.trunk(xpub, &tokens, rows);
+        let (projected, spatial) = self.trunk(xpub, &tokens, rows);
+        recycle(tokens);
+        recycle(physical_cards);
+        (projected, spatial)
+    }
+
+    fn pool_board(&self, xpub: &[f32], spatial: &[f32], rows: usize, out: &mut Vec<f32>) {
         let width = 2 * C + LOOSE;
         let mut input = scratch(rows * width);
         for r in 0..rows {
@@ -879,7 +862,7 @@ impl Net {
             dst[..C].fill(0.0);
             dst[C..2 * C].fill(f32::NEG_INFINITY);
             for h in 0..N_HEXES {
-                let src = &x[(r * N_HEXES + h) * C..(r * N_HEXES + h + 1) * C];
+                let src = &spatial[(r * N_HEXES + h) * C..(r * N_HEXES + h + 1) * C];
                 for j in 0..C {
                     dst[j] += src[j] / N_HEXES as f32;
                     dst[C + j] = dst[C + j].max(src[j]);
@@ -890,10 +873,22 @@ impl Net {
             );
         }
         self.board_out.run(&input, rows, out);
-        recycle(physical_cards);
-        recycle(tokens);
-        recycle(x);
         recycle(input);
+    }
+
+    /// One global board vector per physical row.
+    pub fn board(
+        &self,
+        xpub: &[f32],
+        cards: &[f32],
+        rows: usize,
+        card_rows: usize,
+        out: &mut Vec<f32>,
+    ) {
+        let (projected, spatial) = self.position_parts(xpub, cards, rows, card_rows);
+        self.pool_board(xpub, &spatial, rows, out);
+        recycle(projected);
+        recycle(spatial);
     }
 
     /// The half of the join's first layer that does not move between CFR
@@ -1035,54 +1030,47 @@ impl Net {
         recycle(th);
     }
 
-    /// One action's description, as the policy head reads it.
-    ///
-    /// `slot` is the coin slot the action spends, or `-1` for the
-    /// micro-decisions that spend nothing; it comes from the node's own
-    /// `aslot`, so nothing here has to re-derive it. `hexes` is
-    /// `Action::hexes`. The layout is the contract with `value_net.py`.
-    pub fn action_feats(kind: usize, slot: i8, hexes: [u8; 3], out: &mut [f32]) {
-        debug_assert_eq!(out.len(), AFEAT);
-        out.fill(0.0);
-        out[kind] = 1.0;
-        out[N_KINDS + slot_column(slot)] = 1.0;
-        let mut at = N_KINDS + NSLOT + 1;
-        for h in hexes {
-            out[at + if h == NONE { N_HEXES } else { h as usize }] = 1.0;
-            at += N_HEXES + 1;
-        }
-        debug_assert_eq!(at, AFEAT);
-    }
-
-    /// `e(a)` for every action at one node: what the action is, against the
-    /// board and belief state it is played on.
-    ///
-    /// `feat` is `[n, AFEAT]`, and `board` is that node's own board vector —
-    /// the same `D` numbers the value readout dots against, so the action is
-    /// described in the position rather than in the abstract. A node's actions
-    /// are public, so this runs once per node and every config at it reads the
-    /// result.
+    /// `e(a)` for every action, built from the entities its descriptor names.
+    #[allow(clippy::too_many_arguments)]
     pub fn actions(
         &self,
-        feat: &[f32],
+        desc: &[u8],
         boards: &[f32],
         heads: &[f32],
+        cards: &[f32],
+        spatial: &[f32],
         board_of: &[u32],
         head_of: &[u32],
         n: usize,
         out: &mut Vec<f32>,
     ) {
-        debug_assert_eq!(feat.len(), n * AFEAT);
+        use crate::search::ACT_BYTES;
+        debug_assert_eq!(desc.len(), n * ACT_BYTES);
         debug_assert_eq!(board_of.len(), n);
         debug_assert_eq!(head_of.len(), n);
         let rows = boards.len() / D;
         let queries = heads.len() / D;
-        let mut z = scratch(0);
-        self.act_in.run(feat, n, &mut z);
-        // Every board once, then each action adds the one it belongs to. A
-        // batch spans nodes, so which board an action reads is an index rather
-        // than a property of the call — the same convention the device uses
-        // for everything else that was per-call and is now per-row.
+        let mut z = scratch(n * AW);
+        for r in 0..n {
+            let d = &desc[r * ACT_BYTES..(r + 1) * ACT_BYTES];
+            let row = board_of[r] as usize;
+            let dst = &mut z[r * AW..(r + 1) * AW];
+            dst.copy_from_slice(&self.act_kind[d[0] as usize * AW..(d[0] as usize + 1) * AW]);
+            for role in 0..5 {
+                let entity = d[role + 1] as usize;
+                let src = if role < 2 && entity < NTYPE {
+                    &cards[(row * NTYPE + entity) * C..(row * NTYPE + entity + 1) * C]
+                } else if role >= 2 && entity < N_HEXES {
+                    &spatial[(row * N_HEXES + entity) * C..(row * N_HEXES + entity + 1) * C]
+                } else {
+                    continue;
+                };
+                let gate = &self.act_role[role * AW..(role + 1) * AW];
+                for j in 0..AW {
+                    dst[j] += gate[j] * src[j];
+                }
+            }
+        }
         let mut proj = scratch(0);
         self.act_board.run(boards, rows, &mut proj);
         let mut hproj = scratch(0);
@@ -1223,7 +1211,7 @@ impl Net {
         phi: &[f32],
         weight: &[f32],
         seg: &[u32],
-        feat: &[f32],
+        desc: &[u8],
         cfg: &[u32],
         act: &[u32],
         queries: usize,
@@ -1233,8 +1221,9 @@ impl Net {
         self.cards(xpub, queries, &mut cards);
         let rows = queries / 2;
         let phys = physical_rows(xpub, rows);
+        let (projected, spatial) = self.position_parts(&phys, &cards, rows, queries);
         let mut p = Vec::new();
-        self.board(&phys, &cards, rows, queries, &mut p);
+        self.pool_board(&phys, &spatial, rows, &mut p);
         let mut jp = Vec::new();
         self.join_cache(&p, rows, &mut jp);
         let (mut f, mut g, mut fp) = (Vec::new(), Vec::new(), Vec::new());
@@ -1259,18 +1248,29 @@ impl Net {
         // Build one action row per cell. This parity path may reuse an action
         // index across queries, while production action indices belong to one
         // node and therefore one belief state.
-        let mut cell_feat = vec![0.0; cfg.len() * AFEAT];
+        let mut cell_desc = vec![0u8; cfg.len() * crate::search::ACT_BYTES];
         let mut board_of = Vec::with_capacity(cfg.len());
         let mut head_of = Vec::with_capacity(cfg.len());
         for (k, (&c, &a)) in cfg.iter().zip(act).enumerate() {
             let q = seg[c as usize];
-            cell_feat[k * AFEAT..(k + 1) * AFEAT]
-                .copy_from_slice(&feat[a as usize * AFEAT..(a as usize + 1) * AFEAT]);
+            let width = crate::search::ACT_BYTES;
+            cell_desc[k * width..(k + 1) * width]
+                .copy_from_slice(&desc[a as usize * width..(a as usize + 1) * width]);
             board_of.push(q / 2);
             head_of.push(q);
         }
         let mut e = Vec::new();
-        self.actions(&cell_feat, &p, &heads, &board_of, &head_of, cfg.len(), &mut e);
+        self.actions(
+            &cell_desc,
+            &p,
+            &heads,
+            &projected,
+            &spatial,
+            &board_of,
+            &head_of,
+            cfg.len(),
+            &mut e,
+        );
         let cell_act: Vec<u32> = (0..cfg.len() as u32).collect();
         let mut out = vec![0.0; cfg.len()];
         self.policy(&fp, &e, cfg, &cell_act, &mut out);

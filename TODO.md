@@ -19,6 +19,15 @@ sweep (`ml_refresh.md` method) with a late snapshot from a real run; if the
 opinion has become belief-sensitive, shrink the round rather than add a
 mechanism.
 
+**Reassess value pooling.** The trunk first contextualizes every hex, then
+reduces the 37 tokens with mean and max before producing the scalar value.
+This is a sound global-value design, not the policy head's action-local
+information loss, but learned attention or set pooling may preserve useful
+spatial interactions better. Compare pooling methods at matched compute on
+fixed current-network targets and playing strength. Do not combine this with
+the policy action-encoder redesign, and keep mean/max unless the replacement
+wins both tests.
+
 ## One regret rule, not two (smell)
 
 Packed bots play with `cfr=dcfr` (+0.09 equal-weights, measured) while

@@ -50,7 +50,7 @@ import warchest
 import config
 import mirror
 from export_weights import load as load_checkpoint
-from value_net import AFEAT, Net
+from value_net import Net
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -60,9 +60,7 @@ CCOUNTS = warchest.CCOUNTS
 CNORM = warchest.CNORM
 ROW_BYTES = warchest.ROW_BYTES
 ACT_BYTES = warchest.ACT_BYTES
-N_KINDS = warchest.N_KINDS
 NSLOT = warchest.NSLOT
-N_HEXES = warchest.N_HEXES
 
 # What `SolveFarm.collect` reports about the device rounds, cumulative
 # since the farm started. `rounds` is the denominator of the other three.
@@ -78,27 +76,6 @@ def scheduled_lr(initial, final, elapsed, duration, stable_frac):
         return final
     return final + (initial - final) * (1.0 + math.cos(
         math.pi * ((elapsed - stable) / (duration - stable)))) / 2.0
-
-
-def action_feats(pa):
-    """The five stored bytes of each action into the head's one-hot input.
-
-    The layout is the contract with `Net::action_feats`: kind, the coin slot it
-    spends as the one-hot column (`NSLOT` meaning none, already so in the row),
-    then the three squares it names with the last column meaning no square.
-    """
-    feat = np.zeros((len(pa), AFEAT), np.float32)
-    if not len(pa):
-        return feat
-    idx = np.arange(len(pa))
-    feat[idx, pa[:, 0]] = 1.0
-    feat[idx, N_KINDS + pa[:, 1]] = 1.0
-    at = N_KINDS + NSLOT + 1
-    for k in range(3):
-        h = np.where(pa[:, 2 + k] == 255, N_HEXES, pa[:, 2 + k].astype(np.int64))
-        feat[idx, at + h] = 1.0
-        at += N_HEXES + 1
-    return feat
 
 
 def expand_batch(rows):
@@ -436,7 +413,7 @@ def make_batch(parts, rng, device):
     phi = cc.astype(np.float32) / CNORM
     t = lambda a, d=torch.float32: torch.as_tensor(a, dtype=d, device=device)
     pa, pact, pcrow, pcfg, pprob, parow = pol
-    policy = (t(action_feats(pa)), t(parow, torch.long), t(pact, torch.long),
+    policy = (t(pa, torch.uint8), t(parow, torch.long), t(pact, torch.long),
               t(pcrow, torch.long), t(pcfg, torch.long), t(pprob))
     return (t(x), t(phi), t(cw), t(seg, torch.long), t(cy), 2 * n, policy)
 
@@ -485,17 +462,18 @@ def policy_loss(net, xpub, phi, weight, seg, nseg, policy, stats=None):
     is exactly the cells the solves stored. Each cell's softmax runs over its
     own `(row, config)` group, which is one information state.
     """
-    feat, parow, pact, _pcrow, pcfg, target = policy
-    if feat.shape[0] == 0 or pact.shape[0] == 0:
+    desc, parow, pact, _pcrow, pcfg, target = policy
+    if desc.shape[0] == 0 or pact.shape[0] == 0:
         return None
     cards = net.cards(xpub)
     physical = xpub[0::2]
-    board = net.board(physical, net.tokens(physical, cards[0::2]))
+    tokens = net.tokens(physical, cards[0::2])
+    board, projected, spatial = net.position(physical, tokens)
     _f, g, fp = net.configs(phi, cards[:, :NSLOT], seg)
     h = net.heads(board, g, weight, seg, nseg)
-    action_query = torch.zeros(feat.shape[0], dtype=torch.long, device=feat.device)
+    action_query = torch.zeros(desc.shape[0], dtype=torch.long, device=desc.device)
     action_query.scatter_(0, pact, seg[pcfg])
-    e = net.actions(feat, board, h, parow, action_query)
+    e = net.actions(desc, board, h, projected, spatial, parow, action_query)
 
     # `pcfg` is already an index into the batch's own config arena, so the cell
     # reads its config vector directly.

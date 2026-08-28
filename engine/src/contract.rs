@@ -788,8 +788,6 @@ mod tests {
     use crate::search::{Cfg, Cfr};
     use std::sync::Arc;
     use crate::selfplay::collect_roots;
-    use crate::board::N_HEXES;
-    use crate::pbs::NSLOT;
 
     fn random_net(seed: u64) -> crate::net::Net {
         let mut r = Rng::new(seed);
@@ -900,15 +898,11 @@ mod tests {
         assert!(checked >= 8, "only {checked} comparisons");
     }
 
-    /// The action words a solve sends must rebuild the policy head's own input.
-    ///
-    /// The card runs the action encoder now, and the one thing it cannot know
-    /// is what an action *is*. The five words a node sends are a
-    /// `Net::action_feats` one-hot in the making, and a column out of place is
-    /// a policy prior that is wrong everywhere and finite everywhere.
+    /// Every action must point at the exact entities it names. Distinct legal
+    /// actions must have distinct descriptors or the policy can never assign
+    /// them different probabilities.
     #[test]
-    fn the_action_words_a_solve_sends_rebuild_its_one_hot() {
-        use crate::net::{Net, AFEAT};
+    fn policy_action_descriptors_are_complete() {
         let nets = Arc::new(random_net(0x5EED));
         let cfg = Cfg { s: 24, c: 2.0, ..Default::default() };
         let roots = collect_roots(2, 0x51E5);
@@ -927,25 +921,24 @@ mod tests {
             sv.catch_up();
             let (prime, acts, cells) = sv.prime();
             assert!(!prime.is_empty(), "no node was ready for a prior");
-            // The blocks `Net::action_feats` writes, in order: the kind, the
-            // coin slot with a column for "spends nothing", and three hexes
-            // each with a column for "names none".
-            let widths = [crate::actions::N_KINDS, NSLOT + 1, N_HEXES + 1, N_HEXES + 1, N_HEXES + 1];
             for q in &prime {
                 let n = &sv.nodes[q.node as usize];
                 assert_eq!(q.na as usize, n.na(), "action count");
                 assert_eq!(q.nc as usize, n.nc(n.player as usize), "config count");
+                let mut seen = std::collections::HashSet::new();
                 for a in 0..n.na() {
-                    let d = &acts[5 * (q.at as usize + a)..][..5];
-                    let mut got = vec![0.0f32; AFEAT];
-                    let mut at = 0;
-                    for (k, w) in widths.iter().enumerate() {
-                        got[at + d[k] as usize] = 1.0;
-                        at += w;
-                    }
-                    let mut want = vec![0.0f32; AFEAT];
-                    Net::action_feats(n.acts[a].kind(), n.aslot[a], n.acts[a].hexes(), &mut want);
+                    let at = crate::search::ACT_BYTES * (q.at as usize + a);
+                    let got: [u8; crate::search::ACT_BYTES] = acts[at..at + crate::search::ACT_BYTES]
+                        .iter()
+                        .map(|&x| x as u8)
+                        .collect::<Vec<_>>()
+                        .try_into()
+                        .unwrap();
+                    let want = crate::search::action_desc(
+                        &n.acts[a], n.player, &sv.ctx, n.aslot[a],
+                    );
                     assert_eq!(got, want, "action {a} of node {}", q.node);
+                    assert!(seen.insert(got), "two actions of node {} share a descriptor", q.node);
                 }
                 let at = q.cell_at as usize;
                 assert_eq!(

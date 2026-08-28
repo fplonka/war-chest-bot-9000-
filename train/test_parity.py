@@ -36,7 +36,7 @@ import torch.nn as nn
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import warchest  # noqa: E402
-from value_net import AFEAT, Net  # noqa: E402
+from value_net import Net  # noqa: E402
 
 PUBFEAT = warchest.PUBFEAT
 N_HEXES = warchest.N_HEXES
@@ -178,16 +178,15 @@ def policy_parity(net, rng):
     seg, phi, weight = belief(rng, sizes)
     n = len(seg)
 
-    # One-hot blocks exactly as `Net::action_feats` writes them: kind, the coin
-    # slot spent (the last column meaning none), then the three squares.
-    feat = np.zeros((na, AFEAT), np.float32)
+    desc = np.full((na, warchest.ACT_BYTES), 255, np.uint8)
+    desc[:, 0] = rng.integers(N_KINDS, size=na)
     for a in range(na):
-        feat[a, rng.integers(N_KINDS)] = 1.0
-        feat[a, N_KINDS + rng.integers(NSLOT + 1)] = 1.0
-        at = N_KINDS + NSLOT + 1
-        for _ in range(3):
-            feat[a, at + rng.integers(N_HEXES + 1)] = 1.0
-            at += N_HEXES + 1
+        for k in range(1, 3):
+            if rng.random() < 0.8:
+                desc[a, k] = rng.integers(NTYPE)
+        for k in range(3, 6):
+            if rng.random() < 0.8:
+                desc[a, k] = rng.integers(N_HEXES)
 
     cfg = rng.integers(0, n, size=24).astype(np.uint32)
     act = rng.integers(0, na, size=24).astype(np.uint32)
@@ -195,7 +194,8 @@ def policy_parity(net, rng):
     with torch.no_grad():
         cards = net.cards(torch.from_numpy(np.ascontiguousarray(xpub)))
         physical = torch.from_numpy(np.ascontiguousarray(xpub))[0::2]
-        board = net.board(physical, net.tokens(physical, cards[0::2]))
+        tokens = net.tokens(physical, cards[0::2])
+        board, projected, spatial = net.position(physical, tokens)
         tseg = torch.from_numpy(seg.astype(np.int64))
         _f, g, fp = net.configs(torch.from_numpy(np.ascontiguousarray(phi)),
                                 cards[:, :NSLOT], tseg)
@@ -205,12 +205,16 @@ def policy_parity(net, rng):
         for k in range(len(cfg)):
             query = int(seg[cfg[k]])
             row = query // 2
-            e = net.actions(torch.from_numpy(feat[act[k]:act[k] + 1]),
-                            board[row:row + 1], h[query:query + 1])
+            e = net.actions(
+                torch.from_numpy(desc[act[k]:act[k] + 1]),
+                board[row:row + 1], h[query:query + 1],
+                projected[row:row + 1], spatial[row:row + 1],
+                torch.zeros(1, dtype=torch.long), torch.zeros(1, dtype=torch.long),
+            )
             want[k] = float((fp[cfg[k]] * e[0]).sum())
 
     got = np.asarray(warchest.infer_policy(
-        xpub.ravel(), phi.ravel(), weight, seg, feat.ravel(), cfg, act, queries),
+        xpub.ravel(), phi.ravel(), weight, seg, desc.ravel(), cfg, act, queries),
         np.float32)
     assert got.shape == want.shape, f"policy: {got.shape} vs {want.shape}"
     scale = max(1.0, float(np.abs(want).max()))

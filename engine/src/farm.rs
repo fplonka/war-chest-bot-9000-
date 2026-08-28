@@ -107,11 +107,10 @@ pub enum Call {
         nterm: usize,
         /// The seed of the expansion's own random stream, sent once.
         seed: Option<u64>,
-        /// Nodes whose policy prior the card is to fill this round, and the two
-        /// things it needs that it does not already hold.
+        /// Nodes whose policy prior the card is to fill this round.
         prime: Vec<Prime>,
-        /// Five words an action -- kind, coin slot, three hexes -- which the
-        /// card expands into the encoder's one-hot input.
+        /// Six words an action: kind, paying and recruited coin types, then
+        /// source, destination and target hexes.
         acts: Vec<u32>,
         /// Which action each of a primed node's strategy cells stands for.
         cells: Vec<u32>,
@@ -172,8 +171,8 @@ pub struct QueryPick {
 
 /// One node whose policy prior a round is to fill.
 ///
-/// The card holds everything this reads but two facts: what an action *is*, and
-/// which action each strategy cell stands for. Both are a few kilobytes a node.
+/// The card holds the node's board and config representations. The call names
+/// what each action is and which action each strategy cell stands for.
 #[derive(Clone, Copy)]
 pub struct Prime {
     pub node: u32,

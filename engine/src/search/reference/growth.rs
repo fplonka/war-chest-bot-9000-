@@ -68,21 +68,26 @@ impl Solver {
         let d = crate::net::D;
         let mut boards = Vec::with_capacity(want.len() * d);
         let mut heads = Vec::with_capacity(want.len() * d);
-        let mut feat = Vec::new();
+        let mut desc = Vec::new();
+        let mut xpub = Vec::with_capacity(want.len() * crate::pbs::PUBFEAT);
         let mut board_of: Vec<u32> = Vec::new();
         let mut base = Vec::with_capacity(want.len());
         for &i in &want {
             base.push(board_of.len() as u32);
             let row = self.row_of[i] as usize;
             let board = self.board_of[row] as usize;
-            let at = board * d;
+            let board_at = board * d;
             let mine = (boards.len() / d) as u32;
-            boards.extend_from_slice(&self.oracle.pb[at..at + d]);
+            boards.extend_from_slice(&self.oracle.pb[board_at..board_at + d]);
+            let packed = &self.packed[board * crate::pbs::ROW_BYTES..(board + 1) * crate::pbs::ROW_BYTES];
+            let public_at = xpub.len();
+            xpub.resize(public_at + crate::pbs::PUBFEAT, 0.0);
+            crate::pbs::expand_row(packed, &mut xpub[public_at..]);
             let mut pooled = vec![0.0; 2 * crate::net::POOL];
             self.belief_pair(i, row, &mut pooled);
             let mut h = Vec::new();
             self.net.join(
-                &self.oracle.pb[at..at + d],
+                &self.oracle.pb[board_at..board_at + d],
                 &self.oracle.jp[board * crate::net::JW..(board + 1) * crate::net::JW],
                 &[0],
                 &pooled,
@@ -93,21 +98,19 @@ impl Solver {
             heads.extend_from_slice(&h);
             let n = &self.nodes[i];
             for a in 0..n.na() {
-                let at = feat.len();
-                feat.resize(at + crate::net::AFEAT, 0.0);
-                Net::action_feats(
-                    n.acts[a].kind(),
-                    n.aslot[a],
-                    n.acts[a].hexes(),
-                    &mut feat[at..],
-                );
+                desc.extend_from_slice(&crate::search::action_desc(
+                    &n.acts[a], n.player, &self.ctx, n.aslot[a],
+                ));
                 board_of.push(mine);
             }
         }
+        let (projected, spatial) = self.net.position_parts(&xpub, &self.cards, want.len(), 2);
         let na = board_of.len();
         let mut e = Vec::new();
-        self.net
-            .actions(&feat, &boards, &heads, &board_of, &board_of, na, &mut e);
+        self.net.actions(
+            &desc, &boards, &heads, &projected, &spatial,
+            &board_of, &board_of, na, &mut e,
+        );
 
         // `logit(c, a) = <f_p(c), e(a)>` over the node's own legal cells, then
         // a softmax across each config's row.

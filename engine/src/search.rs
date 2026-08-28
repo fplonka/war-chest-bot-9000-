@@ -29,7 +29,7 @@
 //!    belief update sums over the private actions consistent with what was seen.
 
 use crate::actions::Action;
-use crate::board::{N_HEXES, NONE};
+use crate::board::NONE;
 use crate::farm::{Call, Dst, QueryPick, Reply, Writes};
 use crate::net::Net;
 use crate::rng::Rng;
@@ -735,9 +735,24 @@ pub struct Policy {
     pub p: Vec<f32>,
 }
 
-/// How an action is stored in a replay row: kind, the coin slot it spends
-/// (offset by one so `-1` is zero), and the three squares it names.
-pub const ACT_BYTES: usize = 5;
+/// How an action points into a position: kind, paying and recruited physical
+/// coin types, then source, destination and target hexes. Optional entities use
+/// `NONE`. The policy gathers their learned tokens directly.
+pub const ACT_BYTES: usize = 6;
+
+pub(crate) fn action_desc(a: &Action, player: u8, ctx: &Ctx, slot: i8) -> [u8; ACT_BYTES] {
+    let coin = |k: i8| {
+        if k < 0 { NONE } else { player * NSLOT as u8 + k as u8 }
+    };
+    let recruited = a.recruited();
+    let rslot = if recruited == NONE {
+        -1
+    } else {
+        ctx.slot_of[player as usize][recruited as usize]
+    };
+    let h = a.hexes();
+    [a.kind() as u8, coin(slot), coin(rslot), h[0], h[1], h[2]]
+}
 
 impl TNode {
     #[inline]
@@ -2594,25 +2609,13 @@ impl Solver {
             prime.push(crate::farm::Prime {
                 node: i as u32,
                 row: self.row_of[i],
-                at: (acts.len() / 5) as u32,
+                at: (acts.len() / ACT_BYTES) as u32,
                 na: n.na() as u32,
                 cell_at: cells.len() as u32,
                 nc: n.nc(n.player as usize) as u32,
             });
-            // Already the column each block of `Net::action_feats` sets, so
-            // "spends nothing" and "names no hex" cross as the column past the
-            // last rather than as a sentinel the card would have to fold.
             for a in 0..n.na() {
-                let slot = n.aslot[a];
-                let hex = |h: u8| if h == NONE { N_HEXES as u32 } else { h as u32 };
-                let h = n.acts[a].hexes();
-                acts.extend([
-                    n.acts[a].kind() as u32,
-                    if slot < 0 { NSLOT as u32 } else { slot as u32 },
-                    hex(h[0]),
-                    hex(h[1]),
-                    hex(h[2]),
-                ]);
+                acts.extend(action_desc(&n.acts[a], n.player, &self.ctx, n.aslot[a]).map(u32::from));
             }
             cells.extend_from_slice(&n.legal_action);
             self.primed[i] = true;
@@ -2634,16 +2637,7 @@ impl Solver {
         let me = n.player as usize;
         let mut out = Policy {
             acts: (0..n.na())
-                .map(|a| {
-                    let h = n.acts[a].hexes();
-                    [
-                        n.acts[a].kind() as u8,
-                        crate::net::slot_column(n.aslot[a]) as u8,
-                        h[0],
-                        h[1],
-                        h[2],
-                    ]
-                })
+                .map(|a| action_desc(&n.acts[a], n.player, &self.ctx, n.aslot[a]))
                 .collect(),
             ..Default::default()
         };

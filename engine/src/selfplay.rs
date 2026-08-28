@@ -536,7 +536,7 @@ impl Game {
                             &self.bel,
                             [&y0, &y1],
                             truth,
-                            &np.to_replay(),
+                            &np.to_replay(player, &self.ctx),
                         );
                     }
                     self.play(np);
@@ -1116,7 +1116,8 @@ mod target_tests {
         let ctx = Ctx::new(&s);
         let actor = s.to_act() as usize;
         let cfgs = bel[actor].cfg.clone();
-        let policy = policy::greedy(&s, &ctx, actor as u8, &cfgs, 2.0).to_replay();
+        let policy = policy::greedy(&s, &ctx, actor as u8, &cfgs, 2.0)
+            .to_replay(actor as u8, &ctx);
         let values = [vec![0.25; bel[0].len()], vec![-0.25; bel[1].len()]];
         let truth = [
             bel[0].index_of(&true_config(&s, 0, &ctx)).expect("white config") as u32,

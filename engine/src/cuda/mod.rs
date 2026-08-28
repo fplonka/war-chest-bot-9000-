@@ -38,7 +38,7 @@ use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use crate::board::{board, N_HEXES, NONE};
 use crate::farm::{Call, Prime, Reply, CARD_ROWS};
 use crate::net::{
-    ln_block, Net, NetLayout, NormSpan, Span, AFEAT, AW, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW,
+    ln_block, Net, NetLayout, NormSpan, Span, AW, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW,
     LN_ACT, LN_CFG, LN_H, LN_JOIN, LN_JOUT, LN_TRUNK, POOL, TYPE,
 };
 use crate::pbs::{
@@ -408,6 +408,7 @@ struct RoundCap {
     facts: usize,
     occupant: usize,
     x: usize,
+    action: usize,
     bag: usize,
     packed: usize,
     xpub: usize,
@@ -464,6 +465,7 @@ impl RoundCap {
             facts: TILE * N_HEXES * HEX_FACTS,
             occupant: TILE * N_HEXES,
             x: TILE * N_HEXES * C,
+            action: TILE * AW,
             bag: n * CARD_ROWS * NTYPE * 3 * POOL,
             packed: TILE * ROW_BYTES,
             xpub: TILE * PUBFEAT,
@@ -504,6 +506,7 @@ impl RoundCap {
             + self.facts
             + self.occupant
             + self.x
+            + self.action
             + self.bag
             + self.xpub
             + self.cards
@@ -1403,6 +1406,7 @@ impl Card {
         scratch.facts = Arr::with_cap(s, cap.facts)?;
         scratch.occupant = Arr::with_cap(s, cap.occupant)?;
         scratch.x = Arr::with_cap(s, cap.x)?;
+        scratch.action = Arr::with_cap(s, cap.action)?;
         scratch.bag = Arr::with_cap(s, cap.bag)?;
         let mut stage = Stage::default();
         stage.packed = Wire::with_cap(s, cap.packed)?;
@@ -1689,9 +1693,9 @@ impl Card {
         self.keep(calls, mine, pack)
     }
 
-    /// Encode `n` boards already expanded at the head of `xpub` / `card_of_row`.
-    fn trunk_tile(&self, calls: &[Call], mine: &[usize], board0: usize, n: usize) -> Res<()> {
-        let s = &self.stream;
+    /// Run the shared board encoder on rows already staged in `xpub`.
+    /// The global head reads `input`; the policy reads `tokens` and `x`.
+    fn encode_boards(&self, n: usize) -> Res<()> {
         let stage = self.host.lock();
         let xpub = stage.xpub.buf.as_ref().expect("carved");
         let cards = stage.cards.dev.buf.as_ref().expect("staged");
@@ -1712,10 +1716,8 @@ impl Card {
         sc.occupant.room(cells)?;
         sc.x.room(cells * C)?;
         sc.input.room(n * (2 * C + LOOSE))?;
-        sc.h.room(n * D)?;
-        sc.z.room(n * JW)?;
         let Scratch {
-            piles, tokens, projected, type_pool, loose, glob, facts, occupant, x, input, h, z, ..
+            piles, tokens, projected, type_pool, loose, glob, facts, occupant, x, input, ..
         } = &mut *sc;
         let piles = piles.buf.as_mut().unwrap();
         let tokens = tokens.buf.as_mut().unwrap();
@@ -1727,8 +1729,6 @@ impl Card {
         let occupant = occupant.buf.as_mut().unwrap();
         let x = x.buf.as_mut().unwrap();
         let input = input.buf.as_mut().unwrap();
-        let p = h.buf.as_mut().unwrap();
-        let jp = z.buf.as_mut().unwrap();
 
         let (off, width) = (OFF_PILES as i32, (NTYPE * PILE_COUNTS) as i32);
         launch!(self, window, n * NTYPE * PILE_COUNTS, xpub, &mut *piles, &rows_i, &stride, &off, &width)?;
@@ -1747,10 +1747,6 @@ impl Card {
         let pos = self.w.slice(l.pos..l.pos + N_HEXES * C);
         launch!(self, stem, cells * C, &mut *x, &*projected, &*occupant, &pos, &*glob, &*type_pool, &cells_i, &nhex, &ntype, &chan)?;
         let (off, loose_i, blocks_i) = (OFF_LOOSE as i32, LOOSE as i32, BLOCKS as i32);
-        // One warp to each eight-channel output tile of the multiply, twelve
-        // of them; read the other way round that is a warp to a hex and `C /
-        // 32` channels to a lane, so a hex's row is exactly one warp wide and
-        // its LayerNorm is a shuffle rather than a barrier.
         const SLOTS: u32 = (C / 8) as u32;
         unsafe {
             self.stream
@@ -1766,9 +1762,21 @@ impl Card {
                     shared_mem_bytes: TRUNK_SHARED as u32,
                 })
         }
-        .map_err(err)?;
-        self.run(l.board_out, input, n, &mut *p)?;
-        self.run(l.join_p, p, n, &mut *jp)?;
+        .map_err(err)
+    }
+
+    /// Encode `n` new leaf boards and keep their global value representation.
+    fn trunk_tile(&self, calls: &[Call], mine: &[usize], board0: usize, n: usize) -> Res<()> {
+        self.encode_boards(n)?;
+        let s = &self.stream;
+        let mut sc = self.scratch.lock();
+        sc.h.room(n * D)?;
+        sc.z.room(n * JW)?;
+        let Scratch { input, projected, x, h, z, .. } = &mut *sc;
+        let p = h.buf.as_mut().unwrap();
+        let jp = z.buf.as_mut().unwrap();
+        self.run(self.layout.board_out, input.buf.as_ref().unwrap(), n, &mut *p)?;
+        self.run(self.layout.join_p, p, n, &mut *jp)?;
         let mut skip = board0;
         let mut src = 0;
         let mut g = self.solves.lock();
@@ -1782,7 +1790,16 @@ impl Card {
             }
             let take = (*nb - skip).min(n - src);
             let b = self.slot(&mut g, *solve);
-            b.copy_board(s, *boards_at + skip, p, jp, src, take)?;
+            b.copy_board(
+                s,
+                *boards_at + skip,
+                p,
+                jp,
+                projected.buf.as_ref().unwrap(),
+                x.buf.as_ref().unwrap(),
+                src,
+                take,
+            )?;
             src += take;
             skip = 0;
             if src == n {
@@ -1994,8 +2011,7 @@ impl Card {
     /// round, for a handful of nodes.
     ///
     /// What the card does not hold is what an action *is* and which action each
-    /// strategy cell stands for. Both ride in the tree call, and both are a few
-    /// kilobytes a node.
+    /// strategy cell stands for. Both ride in the tree call.
     fn priors(&self, calls: &[Call], mine: &[usize]) -> Res<()> {
         let each = |i: usize| -> (&[Prime], &[u32], &[u32], f32) {
             let Call::Tree { prime, acts, cells, prior_temp, .. } = &calls[i] else {
@@ -2012,9 +2028,7 @@ impl Card {
         if solves.is_empty() {
             return Ok(());
         }
-        // One upload: the six per-node arrays, then the action's own node, then
-        // the two pools. Floats travel as their bits, as everything else a
-        // round scatters does.
+        // One upload per tile: node metadata, action descriptors and cells.
         let (mut part, mut node, mut row) = (Vec::new(), Vec::new(), Vec::new());
         let (mut act_at, mut cell_at, mut inv_t) = (Vec::new(), Vec::new(), Vec::new());
         let (mut act_node, mut desc, mut cells) = (Vec::new(), Vec::new(), Vec::new());
@@ -2026,7 +2040,7 @@ impl Card {
                 part.push(p as u32);
                 node.push(q.node);
                 row.push(q.row);
-                act_at.push(desc.len() as u32 / 5 + q.at);
+                act_at.push(desc.len() as u32 / crate::search::ACT_BYTES as u32 + q.at);
                 cell_at.push(cells.len() as u32 + q.cell_at);
                 inv_t.push((1.0f32 / temp.max(1e-6)).to_bits());
                 nas.push(q.na as usize);
@@ -2068,7 +2082,7 @@ impl Card {
                 &cell_at_r,
                 &inv_t[i..j],
                 &act_node_r,
-                &desc[act0 * 5..(act0 + na_c) * 5],
+                &desc[act0 * crate::search::ACT_BYTES..(act0 + na_c) * crate::search::ACT_BYTES],
                 &cells[cell0..cell1],
             ]
             .concat();
@@ -2094,34 +2108,30 @@ impl Card {
         let (part_d, node_d, row_d) = (at(0, m), at(m, m), at(2 * m, m));
         let (act_at_d, cell_at_d, inv_d) = (at(3 * m, m), at(4 * m, m), at(5 * m, m));
         let act_node_d = at(6 * m, na);
-        let desc_d = at(6 * m + na, 5 * na);
-        let cells_d = at(6 * m + 6 * na, ncells);
+        let desc_d = at(6 * m + na, crate::search::ACT_BYTES * na);
+        let cells_d = at(6 * m + (1 + crate::search::ACT_BYTES) * na, ncells);
         let l = &self.layout;
         let (na_i, m_i, d_i, aw_i) = (na as i32, m as i32, D as i32, AW as i32);
-        let (nkinds, nslot, nhex, afeat) = (
-            crate::actions::N_KINDS as i32,
-            NSLOT as i32,
-            N_HEXES as i32,
-            AFEAT as i32,
-        );
+        let (ntype, nhex, chan) = (NTYPE as i32, N_HEXES as i32, C as i32);
         let mut sc = self.scratch.lock();
-        sc.x.room(na * AFEAT)?;
-        sc.tokens.room(na * AW)?;
+        sc.action.room(na * AW)?;
         sc.h.room((m * D).max(na * D))?;
-        sc.projected.room(m * AW)?;
+        sc.facts.room(m * AW)?;
         sc.input.room(m * JOIN_IN)?;
         sc.z.room(m * JW)?;
         sc.pooled.room((m * JW).max(m * AW))?;
-        let Scratch { x, tokens, h, projected, input, z: join_z, pooled, .. } = &mut *sc;
-        let feat = x.buf.as_mut().unwrap();
-        let action_z = tokens.buf.as_mut().unwrap();
+        let Scratch { action, h, input, z: join_z, pooled, facts, .. } = &mut *sc;
+        let action_z = action.buf.as_mut().unwrap();
         let hbuf = h.buf.as_mut().unwrap();
-        let board_proj = projected.buf.as_mut().unwrap();
+        let board_proj = facts.buf.as_mut().unwrap();
         let join_in = input.buf.as_mut().unwrap();
         let join_z = join_z.buf.as_mut().unwrap();
         let temp = pooled.buf.as_mut().unwrap();
-        launch!(self, act_feats, na * AFEAT, &desc_d, &mut *feat, &na_i, &nkinds, &nslot, &nhex, &afeat)?;
-        self.run(l.act_in, feat, na, &mut *action_z)?;
+        let kind = self.w.slice(l.act_kind..l.act_kind + crate::actions::N_KINDS * AW);
+        let role = self.w.slice(l.act_role..l.act_role + 5 * AW);
+        launch!(self, act_feats, na * AW, batch.trees.buf(), &part_d, &row_d,
+                &desc_d, &act_node_d, &kind, &role, &mut *action_z,
+                &na_i, &ntype, &nhex, &chan)?;
         let (pool_i, jw_i) = (POOL as i32, JW as i32);
         unsafe {
             self.stream
@@ -2893,6 +2903,7 @@ struct Scratch {
     facts: Arr<f32>,
     occupant: Arr<i32>,
     x: Arr<f32>,
+    action: Arr<f32>,
     bag: Arr<f32>,
 }
 

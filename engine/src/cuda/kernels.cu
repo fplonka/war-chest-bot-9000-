@@ -357,7 +357,7 @@ __device__ __forceinline__ void row_stats(const float* v, int c, float* mean,
 // Say the occupancy that this width and device can fit. Left to itself the
 // compiler spends a one-block register budget on nothing the accumulators need.
 __global__ __launch_bounds__(32 * TRUNK_SPAN, TRUNK_MIN_BLOCKS)
-void k_trunk(const float* x0, const int* nb, const float* __restrict__ w,
+void k_trunk(float* x0, const int* nb, const float* __restrict__ w,
              const float* __restrict__ wt, const float* __restrict__ bias,
              const float* __restrict__ ln,
              const int* __restrict__ off, const float* xpub, float* out,
@@ -531,8 +531,9 @@ void k_trunk(const float* x0, const int* nb, const float* __restrict__ w,
         if (live[t])
             for (int q = 0; q < TRUNK_Q; ++q) {
                 int j = lane + 32 * q;
-                x[hex[t] * TRUNK_LDS + j] =
-                    gelu1((cur[q] - mean) * inv * ln[tn[0] + j] + ln[tn[1] + j]);
+                float v = gelu1((cur[q] - mean) * inv * ln[tn[0] + j] + ln[tn[1] + j]);
+                x[hex[t] * TRUNK_LDS + j] = v;
+                x0[((size_t)row * nhex + hex[t]) * c + j] = v;
             }
     }
     __syncthreads();
@@ -707,6 +708,8 @@ struct Tree {
     // cache, the config readout and pooling rows, and the belief index.
     const float* p;
     const float* jp;
+    const float* tokens;
+    const float* spatial;
     // Row -> the board it reads. Coin plays commute, so a tree spanning one
     // round holds the same public state at several places and the trunk runs
     // once for all of them.
@@ -1390,26 +1393,34 @@ __device__ unsigned int puct_choice(const Tree& t, unsigned int node, unsigned i
 // `Solver::refresh_priors` used to run on the host, and the round downloaded a
 // board vector per fresh leaf and an `f_p` row per fresh config so that it
 // could. Everything it reads is here; what it needs and the card does not hold
-// is what an action *is*, which is five words an action in `desc`.
+// is what an action *is*, which is six words an action in `desc`.
 
-// The action encoder's one-hot input, expanded from `Net::action_feats`.
-//
-// `desc` is five words an action -- kind, coin slot, three hexes -- each
-// already the column its block sets, so "spends nothing" and "names no hex"
-// arrive as the column past the last rather than as a sentinel to fold here.
-// The five blocks are `nkinds`, `nslot + 1` and three of `nhex + 1`.
-__global__ void k_act_feats(const unsigned int* desc, float* feat, int n,
-                            int nkinds, int nslot, int nhex, int afeat) {
+// Gather the card and contextualized hex tokens named by each action.
+// `desc` is kind, paying type, recruited type, source, destination, target;
+// 255 means the action names no entity in that role and contributes zeros.
+__global__ void k_act_feats(const Tree* trees, const unsigned int* part,
+                            const unsigned int* row_of, const unsigned int* desc,
+                            const unsigned int* node_of, const float* kind,
+                            const float* role, float* out, int n, int ntype,
+                            int nhex, int chan) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n * afeat) return;
-    int col = i % afeat;
-    int at = 0, k = 0, width = nkinds;
-    while (col >= at + width) {
-        at += width;
-        ++k;
-        width = k == 1 ? nslot + 1 : nhex + 1;
+    if (i >= n * chan) return;
+    int action = i / chan, j = i % chan;
+    const unsigned int* d = desc + 6 * action;
+    int node = node_of[action];
+    const Tree& t = trees[part[node]];
+    unsigned int board = t.board_of[row_of[node]];
+    float v = kind[(size_t)d[0] * chan + j];
+    for (int r = 0; r < 5; ++r) {
+        unsigned int entity = d[r + 1];
+        const float* src = nullptr;
+        if (r < 2 && entity < (unsigned int)ntype)
+            src = t.tokens + ((size_t)board * ntype + entity) * chan;
+        if (r >= 2 && entity < (unsigned int)nhex)
+            src = t.spatial + ((size_t)board * nhex + entity) * chan;
+        if (src) v += role[r * chan + j] * src[j];
     }
-    feat[i] = col == at + (int)desc[5 * (i / afeat) + k] ? 1.0f : 0.0f;
+    out[i] = v;
 }
 
 // The join input and its two cached public rows for every primed node. The

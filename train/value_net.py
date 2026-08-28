@@ -58,11 +58,8 @@ POOL = 64      # pooled config embedding width
 CFGH = 128     # config encoder hidden width
 JW = 128       # join width
 JBLOCKS = 3    # join residual blocks
-AW = 128       # action encoder hidden width
 N_KINDS = warchest.N_KINDS
-# What the policy head reads off an action: its kind, the coin slot it spends
-# (or none), and the three squares it can name.
-AFEAT = N_KINDS + (NSLOT + 1) + 3 * (N_HEXES + 1)
+ACT_BYTES = warchest.ACT_BYTES
 
 JOIN_IN = 2 * POOL + 1  # both beliefs and the queried physical seat
 
@@ -116,11 +113,16 @@ class Net(nn.Module):
         # situation vector, `logit(c, a) = <cfg_p(c), e(a)>`, where `e(a)`
         # describes one action against the board it is played on.
         self.cfg_p = nn.Linear(CFGH, D)
-        self.act_in = nn.Linear(AFEAT, AW)
-        self.act_board = nn.Linear(D, AW, bias=False)
-        self.act_h = nn.Linear(D, AW, bias=False)
-        self.ln_act = nn.LayerNorm(AW)
-        self.act_out = nn.Linear(AW, D)
+        # Role-wise gates bind shared entity channels to pay/recruit/source/
+        # destination/target without rebuilding a wide one-hot action vector.
+        self.act_kind = nn.Embedding(N_KINDS, C)
+        self.act_role = nn.Embedding(5, C)
+        nn.init.normal_(self.act_kind.weight, std=C ** -0.5)
+        nn.init.ones_(self.act_role.weight)
+        self.act_board = nn.Linear(D, C, bias=False)
+        self.act_h = nn.Linear(D, C, bias=False)
+        self.ln_act = nn.LayerNorm(C)
+        self.act_out = nn.Linear(C, D)
 
         # -- join (the only per-iteration path) --
         self.join_p = nn.Linear(D, JW, bias=False)
@@ -155,11 +157,10 @@ class Net(nn.Module):
         piles = xpub[:, OFF_PILES:OFF_CARDS].reshape(-1, NTYPE, PILE_COUNTS)
         return cards + self.pile(piles) + self.seat(self.seat_of)
 
-    def trunk(self, xpub, tokens):
+    def trunk(self, xpub, projected):
         """37 physical hex tokens through BLOCKS residual blocks."""
         batch = xpub.shape[0]
         hexes = xpub[:, :N_HEXES * HEX_CH].reshape(batch, N_HEXES, HEX_CH)
-        projected = self.tok_stem(tokens)
         occupant = hexes[:, :, HEX_FACTS:] @ projected
         type_pool = gelu(projected).mean(1)
         loose = xpub[:, OFF_LOOSE:OFF_LOOSE + LOOSE]
@@ -176,11 +177,16 @@ class Net(nn.Module):
             x = x + self.blk2[i](gelu(self.ln2[i](y)))
         return gelu(self.ln_trunk(x))
 
-    def board(self, xpub, tokens):
-        """One physical board vector."""
-        x = self.trunk(xpub, tokens)
+    def position(self, xpub, tokens):
+        """Global board, projected card and contextualized hex tokens."""
+        projected = self.tok_stem(tokens)
+        x = self.trunk(xpub, projected)
         loose = xpub[:, OFF_LOOSE:OFF_LOOSE + LOOSE]
-        return self.board_out(torch.cat([x.mean(1), x.amax(1), loose], -1))
+        board = self.board_out(torch.cat([x.mean(1), x.amax(1), loose], -1))
+        return board, projected, x
+
+    def board(self, xpub, tokens):
+        return self.position(xpub, tokens)[0]
 
     def configs(self, phi, own, seg):
         """Readout vector `f(c)` and pooling vector `g(c)` for each config.
@@ -200,20 +206,25 @@ class Net(nn.Module):
                 self.cfg_g(u) + (counts.unsqueeze(-1) * bag).sum((1, 2)),
                 self.cfg_p(u))
 
-    def actions(self, feat, boards, heads, board_of=None, head_of=None):
-        """``e(a)`` for actions ``feat`` ``[n, AFEAT]``.
-
-        ``boards`` is ``[rows, D]`` and ``board_of`` says which row each action
-        is played on. ``heads`` is the belief-conditioned join output and
-        ``head_of`` names the query each action belongs to.
-        """
-        proj = self.act_board(boards)
-        if board_of is not None:
-            proj = proj[board_of]
-        hproj = self.act_h(heads)
-        if head_of is not None:
-            hproj = hproj[head_of]
-        return self.act_out(gelu(self.ln_act(self.act_in(feat) + proj + hproj)))
+    def actions(self, desc, boards, heads, cards, spatial, board_of, head_of):
+        """``e(a)`` from the card and hex tokens named by each action."""
+        row = board_of
+        zero_card = cards.new_zeros(cards.shape[0], 1, C)
+        card = torch.cat([cards, zero_card], 1)
+        coin = desc[:, 1:3].long().clamp_max(NTYPE)
+        zero_hex = spatial.new_zeros(spatial.shape[0], 1, C)
+        hexes = torch.cat([spatial, zero_hex], 1)
+        where = desc[:, 3:6].long().clamp_max(N_HEXES)
+        entity = torch.stack([
+            card[row, coin[:, 0]], card[row, coin[:, 1]],
+            hexes[row, where[:, 0]], hexes[row, where[:, 1]],
+            hexes[row, where[:, 2]],
+        ], 1)
+        present = desc[:, 1:6].lt(255).unsqueeze(-1)
+        local = (entity * self.act_role.weight * present).sum(1)
+        z = (self.act_kind(desc[:, 0].long()) + local
+             + self.act_board(boards)[row] + self.act_h(heads)[head_of])
+        return self.act_out(gelu(self.ln_act(z)))
 
     def join(self, p, pooled, seat):
         """The per-iteration path: beliefs and queried seat modulate the board."""
@@ -250,7 +261,7 @@ class Net(nn.Module):
     # ------------------------------------------------------------ weight blob
 
     def flat(self):
-        """The fixed v11 blob read by Rust.
+        """The fixed v12 blob read by Rust.
 
         Order is the contract. Linear matrices are stored ``[in, out]``
         row-major, embeddings ``[n, width]``.
@@ -263,7 +274,7 @@ class Net(nn.Module):
             *blocks,
             self.board_out,
             self.cfg1, self.cfg_f, self.cfg_g, self.cfg_m,
-            self.cfg_p, self.act_in, self.act_board, self.act_out,
+            self.cfg_p, self.act_kind, self.act_role, self.act_board, self.act_out,
             self.join_p, self.join_b, *self.joinw, self.join_out,
             self.act_h,
         ]
