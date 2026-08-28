@@ -65,24 +65,18 @@ def mirror_rows(rows):
     return out
 
 
-def mirror_batch(parts, flipped):
-    """Rotate selected replay rows and swap every attached player reference."""
-    rows, cc, player, weight, target, seg, policy = parts
+def mirror_batch(rows, seg, policy, flipped):
+    """Rotate selected rows and their attached player references."""
     flipped = np.asarray(flipped, dtype=bool)
     if flipped.shape != (len(rows),):
         raise ValueError("one symmetry choice is required per replay row")
-    if not flipped.any():
-        return parts
 
     rows = rows.copy()
     rows[flipped] = mirror_rows(rows[flipped])
-    config_flipped = flipped[seg // 2]
-    player = player.copy()
-    player[config_flipped] ^= 1
     seg = seg.copy()
-    seg[config_flipped] ^= 1
+    seg[flipped[seg // 2]] ^= 1
 
-    desc, pact, pcrow, pcfg, probability, parow = policy
+    desc, parow, pact, pcfg, probability = policy
     desc = desc.copy()
     action_flipped = flipped[parow]
     actions = desc[action_flipped]
@@ -93,8 +87,7 @@ def mirror_batch(parts, flipped):
         present = actions[:, field] < N_HEXES
         actions[present, field] = HEXMAP[actions[present, field]]
     desc[action_flipped] = actions
-    policy = (desc, pact, pcrow, pcfg, probability, parow)
-    return rows, cc, player, weight, target, seg, policy
+    return rows, seg, (desc, parow, pact, pcfg, probability)
 
 
 # The feature-level mirror of the *expanded* encoding, kept only as the

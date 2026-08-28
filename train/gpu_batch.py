@@ -21,8 +21,8 @@ def _tables(device_text):
 
 def make_batch(parts, rng, device):
     """Compact replay batch -> two player queries on ``device``."""
-    parts = mirror.mirror_batch(parts, rng.random(len(parts[0])) < 0.5)
-    rows, cc, _cp, cw, cy, seg, pol = parts
+    rows, cc, cw, cy, seg, pol = parts
+    rows, seg, pol = mirror.mirror_batch(rows, seg, pol, rng.random(len(rows)) < 0.5)
     n = len(rows)
     rows = np.ascontiguousarray(rows)
     cc = np.ascontiguousarray(cc)
@@ -37,10 +37,9 @@ def make_batch(parts, rng, device):
         n, stream.cuda_stream, ordinal)
 
     phi = t(cc, torch.float32) / float(warchest.CNORM)
-    pa, pact, pcrow, pcfg, pprob, parow = pol
+    pa, parow, pact, pcfg, pprob = pol
     policy = (t(pa, torch.uint8), t(parow, torch.long),
-              t(pact, torch.long), t(pcrow, torch.long), t(pcfg, torch.long),
-              t(pprob, torch.float32))
+              t(pact, torch.long), t(pcfg, torch.long), t(pprob, torch.float32))
     return (x, phi, t(cw, torch.float32), t(seg, torch.long),
             t(cy, torch.float32), 2 * n, policy)
 
@@ -55,10 +54,9 @@ def warmup(device):
     # An empty policy: a row without a target is exactly what the warm start
     # and every query solve look like, so this is the shape, not a special case.
     empty = (np.zeros((0, warchest.ACT_BYTES), np.uint8),
-             np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0, np.int64),
-             np.zeros(0, np.float32), np.zeros(0, np.int64))
-    parts = (rows, cc, np.asarray([0, 1], np.uint8),
-             np.asarray([1.0, 1.0], np.float32), np.zeros(2, np.float32),
-             np.asarray([0, 1], np.int64), empty)
+             np.zeros(0, np.int64), np.zeros(0, np.int64),
+             np.zeros(0, np.int64), np.zeros(0, np.float32))
+    parts = (rows, cc, np.asarray([1.0, 1.0], np.float32),
+             np.zeros(2, np.float32), np.asarray([0, 1], np.int64), empty)
     make_batch(parts, np.random.default_rng(0), device)
     torch.cuda.synchronize(device)

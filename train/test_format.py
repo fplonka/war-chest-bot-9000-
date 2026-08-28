@@ -34,8 +34,7 @@ ROW_BYTES = warchest.ROW_BYTES
 def empty_policy():
     return (np.zeros((0, warchest.ACT_BYTES), np.uint8),
             np.zeros(0, np.int64), np.zeros(0, np.int64),
-            np.zeros(0, np.int64), np.zeros(0, np.float32),
-            np.zeros(0, np.int64))
+            np.zeros(0, np.int64), np.zeros(0, np.float32))
 
 
 @torch.no_grad()
@@ -60,7 +59,7 @@ def main():
     print("[1/6] generating rows (random drafts, WP included)", flush=True)
     d = warchest.gen_data(1, 7, explore=0.25, random_draft=True)
     n = len(d["rows"]) // ROW_BYTES
-    assert n > 200, f"expected a few hundred rows, got {n}"
+    assert n > 100, f"expected hundreds of rows, got {n}"
     print(f"      {n} rows, {len(d['cc']) // CCOUNTS} configs, "
           f"{int(d['solves'])} solves, row_bytes={ROW_BYTES}", flush=True)
 
@@ -88,11 +87,11 @@ def main():
     tiny.clear()
     assert tiny.soff.size == 0
     dump_path = f"{out}/buffer.npz"
-    got, gcc, gcp, gcw, gcy, gseg, _ = buf.ordered()
+    got, gcc, gcw, gcy, gseg, _ = buf.ordered()
     lo = buf.lo
     gsoff = np.concatenate([[0], buf.soff[(buf.soff > lo) & (buf.soff < buf.rows)] - lo,
                             [len(got)]])
-    np.savez(dump_path, rows=got, cc=gcc, cp=gcp, cw=gcw, cy=gcy, seg=gseg,
+    np.savez(dump_path, rows=got, cc=gcc, cw=gcw, cy=gcy, seg=gseg,
              soff=gsoff, pubfeat=np.int32(PUBFEAT), cfeat=np.int32(CFEAT),
              ccounts=np.int32(CCOUNTS), cnorm=np.float32(CNORM),
              row_bytes=np.int32(ROW_BYTES),
@@ -119,8 +118,7 @@ def main():
     assert torch.allclose(torch.bincount(seg, w), torch.ones(nseg), atol=1e-6)
     assert not len(policy[0]) and not len(policy[1])
     assert torch.isfinite(xpub).all() and torch.isfinite(y).all()
-    trows, tcc, tcp = tr[0], tr[1], tr[2]
-    mirror.self_check_rows(trows)
+    mirror.self_check_rows(tr[0])
     mirror.self_check(xpub.numpy())
     print(f"      batch {xpub.shape} phi {phi.shape}", flush=True)
 

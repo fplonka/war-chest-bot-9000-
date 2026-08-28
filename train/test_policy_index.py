@@ -42,8 +42,8 @@ def dump(n, ncfg, na, ncells):
 
 
 def check(buf, ids):
-    _x, cc, _cp, _cw, _cy, _seg, pol = buf.gather(ids)
-    pa, pact, _pcrow, pcfg, _pp, _parow = pol
+    _x, cc, _cw, _cy, _seg, pol = buf.gather(ids)
+    pa, _parow, pact, pcfg, _pp = pol
     n_cfg, n_act = len(cc), len(pa)
     assert pcfg.size == 0 or int(pcfg.max()) < n_cfg, (int(pcfg.max()), n_cfg)
     assert pact.size == 0 or int(pact.max()) < n_act, (int(pact.max()), n_act)

@@ -96,6 +96,8 @@ def public_rows(rng, rows):
     occupant = rng.integers(0, NTYPE + 1, (rows, N_HEXES))
     r, h = np.nonzero(occupant < NTYPE)
     hexes[r, h, HEX_FACTS + occupant[r, h]] = 1
+    # A flat batch models one solve: boards differ, its draft does not.
+    x[:, OFF_CARDS:OFF_LOOSE] = x[0, OFF_CARDS:OFF_LOOSE]
     return x
 
 
@@ -271,7 +273,7 @@ def offboard_pile_visibility(net, rng):
     print(f"off-board pile visibility ok: movement {movement:.3e}")
 
 
-def packed_row_cuda_parity():
+def packed_row_cuda_parity(net):
     """The Python entry point matches the Rust encoder on real mirrored rows."""
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA parity requires a working GPU")
@@ -280,6 +282,12 @@ def packed_row_cuda_parity():
     assert len(rows) >= 2048, f"only {len(rows)} real rows"
     want = np.asarray(warchest.expand_rows(rows.ravel()), np.float32)
     want = want.reshape(len(rows), warchest.PUBFEAT)
+    paired = torch.from_numpy(want)
+    with torch.no_grad():
+        old = net.cards(paired)[:, :NSLOT]
+        cards = net.cards(paired[0::2])
+        direct = cards.reshape(-1, 2, NSLOT, cards.shape[-1]).flatten(0, 1)
+    torch.testing.assert_close(direct, old, rtol=0, atol=2e-7)
     device = torch.device("cuda:0")
     packed = torch.as_tensor(np.ascontiguousarray(rows), device=device)
     cards = torch.as_tensor(
@@ -306,7 +314,7 @@ def main():
     policy_parity(net, rng)
     slot_invariance(net, rng)
     offboard_pile_visibility(net, rng)
-    packed_row_cuda_parity()
+    packed_row_cuda_parity(net)
 
 
 if __name__ == "__main__":

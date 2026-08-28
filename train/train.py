@@ -283,7 +283,7 @@ class Buffer:
     def gather(self, ids):
         """Assemble a batch from absolute row ids.
 
-        Returns `(rows, cc, cp, cw, cy, seg)`.
+        Returns `(rows, cc, cw, cy, seg)`.
         """
         s = ids % self.cap
         lens = self.clen[s].sum(1).astype(np.int64)
@@ -294,8 +294,7 @@ class Buffer:
             np.concatenate([[0], np.cumsum(lens)[:-1]]), lens)
         at = (base + within) % self.ccap
         row = np.repeat(np.arange(len(ids), dtype=np.int64), lens)
-        player = (within >= np.repeat(self.clen[s, 0], lens)).astype(np.uint8)
-        seg = 2 * row + player
+        seg = 2 * row + (within >= np.repeat(self.clen[s, 0], lens))
         # The policy target, remapped onto the batch. A row with no target
         # contributes no cells, which is how a query solve drops out of the
         # policy loss without a mask.
@@ -309,20 +308,18 @@ class Buffer:
         # An action's index becomes batch-global, and a cell names the query
         # (row, acting config) it belongs to.
         abase = np.concatenate([[0], np.cumsum(alen)[:-1]])
-        cellrow = np.repeat(np.arange(len(ids), dtype=np.int64), clen)
         # A cell names its config within its own row; the batch arena puts that
         # row's configs at `rowbase`, so the two add to an arena index.
         rowbase = np.concatenate([[0], np.cumsum(lens)[:-1]])
         pcfg = np.repeat(rowbase, clen) + self.pci[ci % self.pcap].astype(np.int64)
         pp = self.pp[ci % self.pcap].astype(np.float32)
         pol = (self.pa[ai % self.acap],
-               np.repeat(abase, clen) + self.pact[ci % self.pcap],
-               cellrow, pcfg, pp,
-               np.repeat(np.arange(len(ids), dtype=np.int64), alen))
+               np.repeat(np.arange(len(ids), dtype=np.int64), alen),
+               np.repeat(abase, clen) + self.pact[ci % self.pcap], pcfg, pp)
         cw = self.cw[at].copy()
         mass = np.bincount(seg, weights=cw, minlength=2 * len(ids)).astype(np.float32)
         cw /= mass[seg]
-        return (self.x[s], self.cc[at], player, cw,
+        return (self.x[s], self.cc[at], cw,
                 self.cy[at].astype(np.float32), seg, pol)
 
     def sample_ids(self, batch, rng, recent_mix=0.0, recent_frac=0.2):
@@ -404,15 +401,15 @@ class Buffer:
 
 def make_batch(parts, rng, device):
     """Numpy replay batch -> two player queries over each physical row."""
-    parts = mirror.mirror_batch(parts, rng.random(len(parts[0])) < 0.5)
-    rows, cc, _cp, cw, cy, seg, pol = parts
+    rows, cc, cw, cy, seg, pol = parts
+    rows, seg, pol = mirror.mirror_batch(rows, seg, pol, rng.random(len(rows)) < 0.5)
     n = len(rows)
     x = expand_batch(rows)
     phi = cc.astype(np.float32) / CNORM
     t = lambda a, d=torch.float32: torch.as_tensor(a, dtype=d, device=device)
-    pa, pact, pcrow, pcfg, pprob, parow = pol
+    pa, parow, pact, pcfg, pprob = pol
     policy = (t(pa, torch.uint8), t(parow, torch.long), t(pact, torch.long),
-              t(pcrow, torch.long), t(pcfg, torch.long), t(pprob))
+              t(pcfg, torch.long), t(pprob))
     return (t(x), t(phi), t(cw), t(seg, torch.long), t(cy), 2 * n, policy)
 
 
@@ -460,7 +457,7 @@ def policy_loss(net, xpub, phi, weight, seg, nseg, policy, stats=None):
     is exactly the cells the solves stored. Each cell's softmax runs over its
     own `(row, config)` group, which is one information state.
     """
-    desc, parow, pact, _pcrow, pcfg, target = policy
+    desc, parow, pact, pcfg, target = policy
     if desc.shape[0] == 0 or pact.shape[0] == 0:
         return None
     cards = net.cards(xpub)

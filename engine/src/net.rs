@@ -690,9 +690,9 @@ impl Net {
         }
         let mut out = scratch(rows * NTYPE * TYPE);
         self.pile.add(&piles, rows * NTYPE, &mut out);
-        let card_rows = cards.len() / (NTYPE * TYPE);
+        assert_eq!(cards.len(), NTYPE * TYPE, "one physical card table");
         for r in 0..rows {
-            let card = &cards[(r % card_rows) * NTYPE * TYPE..(r % card_rows + 1) * NTYPE * TYPE];
+            let card = cards;
             for t in 0..NTYPE {
                 let seat = &self.seat[(t / NSLOT) * TYPE..(t / NSLOT + 1) * TYPE];
                 let dst = &mut out[(r * NTYPE + t) * TYPE..(r * NTYPE + t + 1) * TYPE];
@@ -1145,7 +1145,7 @@ impl Net {
         let rows = queries / 2;
         self.cards(xpub, rows, &mut cards);
         let (mut p, mut jp) = (Vec::new(), Vec::new());
-        self.board(xpub, &cards, rows, &mut p);
+        self.board(xpub, &cards[..NTYPE * TYPE], rows, &mut p);
         self.join_cache(&p, rows, &mut jp);
         let (mut f, mut g, mut fp) = (Vec::new(), Vec::new(), Vec::new());
         self.configs(phi, seg, n, &cards, &mut f, &mut g, &mut fp);
@@ -1200,7 +1200,8 @@ impl Net {
         let mut cards = Vec::new();
         let rows = queries / 2;
         self.cards(xpub, rows, &mut cards);
-        let (projected, spatial) = self.position_parts(xpub, &cards, rows);
+        let (projected, spatial) =
+            self.position_parts(xpub, &cards[..NTYPE * TYPE], rows);
         let mut p = Vec::new();
         self.pool_board(xpub, &spatial, rows, &mut p);
         let mut jp = Vec::new();

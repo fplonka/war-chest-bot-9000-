@@ -43,7 +43,6 @@ def row_keys(d, n):
         keys.append(
             d.x[r].tobytes()
             + d.cc[a:b].tobytes()
-            + d.cp[a:b].tobytes()
             + d.cw[a:b].tobytes()
         )
     return keys

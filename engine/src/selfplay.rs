@@ -157,7 +157,7 @@ pub struct Data {
     pub pprob: Vec<f32>,
 
     /// Per row and seat: realised config within that seat's support, and final
-    /// game outcome. Query rows use `u32::MAX` and NaN because no game owns them.
+    /// game outcome. Rows without a TD(1) target use `u32::MAX` and NaN.
     pub truth: Vec<u32>,
     pub outcome: Vec<f32>,
     /// Unix time when the solve produced its rows. Main-line rows can wait for
@@ -431,7 +431,7 @@ fn collects_rows(gc: &GameCfg, s: &State) -> bool {
 
 impl Game {
     pub fn new(mut rng: Rng, gc: &GameCfg) -> Game {
-        let target_rng = Rng::new(rng.0 ^ 0x5444_312D_7461_7267);
+        let target_rng = rng.fork(0x5444_312D_7461_7267);
         let s = make_game(&mut rng, gc.random_draft);
         let ctx = Ctx::new(&s);
         Game {

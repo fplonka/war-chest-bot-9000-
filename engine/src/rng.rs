@@ -10,6 +10,10 @@ impl Rng {
         let s = seed ^ 0x9E3779B97F4A7C15;
         Rng(if s == 0 { 0xDEADBEEFCAFEF00D } else { s })
     }
+    pub fn fork(&self, domain: u64) -> Rng {
+        Rng::new(self.0 ^ domain)
+    }
+
     #[inline]
     pub fn next_u64(&mut self) -> u64 {
         let mut x = self.0;

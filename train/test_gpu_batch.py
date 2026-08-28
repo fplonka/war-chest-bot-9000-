@@ -29,8 +29,7 @@ def clone(parts):
 def empty_policy():
     return (np.zeros((0, warchest.ACT_BYTES), np.uint8),
             np.zeros(0, np.int64), np.zeros(0, np.int64),
-            np.zeros(0, np.int64), np.zeros(0, np.float32),
-            np.zeros(0, np.int64))
+            np.zeros(0, np.int64), np.zeros(0, np.float32))
 
 
 def main():
