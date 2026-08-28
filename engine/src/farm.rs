@@ -349,9 +349,8 @@ impl Call {
 }
 
 
-/// A solve's card table: one row per seat view. Fixed at the draft, so it is
-/// built once per solve and every leaf of that solve reads it.
-pub const CARD_ROWS: usize = 2;
+/// One physical card table per solve, fixed at the draft.
+pub const CARD_ROWS: usize = 1;
 
 /// Host-side slots that fit in the memory the process does not already hold.
 ///

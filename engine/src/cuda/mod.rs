@@ -1916,7 +1916,7 @@ impl Card {
                         let (_, ow, cd, kn) = each(i);
                         if skip >= kn {
                             skip -= kn;
-                            base += (cd.len() / (NTYPE * TYPE)) as u32;
+                            base += (2 * cd.len() / (NTYPE * TYPE)) as u32;
                             continue;
                         }
                         let take = (kn - skip).min(k - wrote);
@@ -1925,7 +1925,7 @@ impl Card {
                         }
                         wrote += take;
                         skip = 0;
-                        base += (cd.len() / (NTYPE * TYPE)) as u32;
+                        base += (2 * cd.len() / (NTYPE * TYPE)) as u32;
                         if wrote == k {
                             break;
                         }

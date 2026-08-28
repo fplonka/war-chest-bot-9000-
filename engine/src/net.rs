@@ -506,16 +506,6 @@ pub const LN_JOUT: usize = LN_JOIN + JBLOCKS;
 pub const LN_H: usize = LN_JOUT + 1;
 pub const LN_ACT: usize = LN_H + 1;
 
-/// The physical row of each leaf, out of a buffer that holds both seat views.
-/// Only the reference path keeps both: it builds a card table per seat view.
-fn physical_rows(xpub: &[f32], rows: usize) -> Vec<f32> {
-    let mut out = Vec::with_capacity(rows * PUBFEAT);
-    for r in 0..rows {
-        out.extend_from_slice(&xpub[2 * r * PUBFEAT..(2 * r + 1) * PUBFEAT]);
-    }
-    out
-}
-
 impl Net {
     pub fn from_flat(w: &[f32], b: &[f32], ln: &[f32]) -> Result<Self, String> {
         let l = NetLayout::new();
@@ -630,8 +620,7 @@ impl Net {
 
     // ---------------------------------------------------------------- pieces
 
-    /// `[rows, NTYPE, TYPE]` printed-card tokens. Fixed for a whole solve, so
-    /// the solver runs this on the two canonical views only.
+    /// `[rows, NTYPE, TYPE]` printed-card tokens.
     pub fn cards(&self, xpub: &[f32], rows: usize, out: &mut Vec<f32>) {
         let mut facts = scratch(rows * NTYPE * CARD_FEATS);
         for r in 0..rows {
@@ -843,7 +832,7 @@ impl Net {
     ) -> (Vec<f32>, Vec<f32>) {
         let mut physical_cards = scratch(rows * NTYPE * TYPE);
         for r in 0..rows {
-            let cr = (2 * r) % card_rows;
+            let cr = r % card_rows;
             physical_cards[r * NTYPE * TYPE..(r + 1) * NTYPE * TYPE]
                 .copy_from_slice(&cards[cr * NTYPE * TYPE..(cr + 1) * NTYPE * TYPE]);
         }
@@ -899,7 +888,7 @@ impl Net {
     }
 
     /// `f(c)` (the readout row) and `g(c)` (the pooling vector) per config.
-    /// `owner` is the canonical query whose five card tokens the config reads.
+    /// `owner` is the query whose player's five card tokens the config reads.
     pub fn configs(
         &self,
         phi: &[f32],
@@ -919,8 +908,8 @@ impl Net {
                 row[0] = phi[c * CFEAT + k];
                 row[1] = phi[c * CFEAT + NSLOT + k];
                 row[2] = phi[c * CFEAT + 2 * NSLOT + k];
-                row[3..]
-                    .copy_from_slice(&cards[(q * NTYPE + k) * TYPE..(q * NTYPE + k + 1) * TYPE]);
+                let t = q * NSLOT + k;
+                row[3..].copy_from_slice(&cards[t * TYPE..(t + 1) * TYPE]);
             }
         }
         let mut hidden = scratch(0);
@@ -954,7 +943,8 @@ impl Net {
             let q = owner[c] as usize;
             let dst = &mut g_out[c * POOL..(c + 1) * POOL];
             for k in 0..NSLOT {
-                let v = &bag[(q * NTYPE + k) * stride..(q * NTYPE + k + 1) * stride];
+                let t = q * NSLOT + k;
+                let v = &bag[t * stride..(t + 1) * stride];
                 for zone in 0..3 {
                     let count = phi[c * CFEAT + zone * NSLOT + k];
                     if count == 0.0 {
@@ -1148,7 +1138,7 @@ impl Net {
         }
     }
 
-    /// The whole network on one ragged canonical-query batch. Parity tests and
+    /// The whole network on one ragged query batch. Parity tests and
     /// the offline tools use this; the solver drives the pieces directly so it
     /// can cache everything that does not move between CFR iterations.
     pub fn forward(
@@ -1161,11 +1151,10 @@ impl Net {
     ) -> Vec<f32> {
         let n = weight.len();
         let mut cards = Vec::new();
-        self.cards(xpub, queries, &mut cards);
         let rows = queries / 2;
-        let phys = physical_rows(xpub, rows);
+        self.cards(xpub, rows, &mut cards);
         let (mut p, mut jp) = (Vec::new(), Vec::new());
-        self.board(&phys, &cards, rows, queries, &mut p);
+        self.board(xpub, &cards, rows, rows, &mut p);
         self.join_cache(&p, rows, &mut jp);
         let (mut f, mut g, mut fp) = (Vec::new(), Vec::new(), Vec::new());
         self.configs(phi, seg, n, &cards, &mut f, &mut g, &mut fp);
@@ -1218,12 +1207,11 @@ impl Net {
     ) -> Vec<f32> {
         let n = seg.len();
         let mut cards = Vec::new();
-        self.cards(xpub, queries, &mut cards);
         let rows = queries / 2;
-        let phys = physical_rows(xpub, rows);
-        let (projected, spatial) = self.position_parts(&phys, &cards, rows, queries);
+        self.cards(xpub, rows, &mut cards);
+        let (projected, spatial) = self.position_parts(xpub, &cards, rows, rows);
         let mut p = Vec::new();
-        self.pool_board(&phys, &spatial, rows, &mut p);
+        self.pool_board(xpub, &spatial, rows, &mut p);
         let mut jp = Vec::new();
         self.join_cache(&p, rows, &mut jp);
         let (mut f, mut g, mut fp) = (Vec::new(), Vec::new(), Vec::new());

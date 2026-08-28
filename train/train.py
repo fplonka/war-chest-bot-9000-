@@ -403,14 +403,11 @@ class Buffer:
 
 
 def make_batch(parts, rng, device):
-    """Numpy replay batch -> the two canonical player queries per row."""
-    del rng
-    rows, cc, cp, cw, cy, seg, pol = parts
+    """Numpy replay batch -> two player queries over each physical row."""
+    parts = mirror.mirror_batch(parts, rng.random(len(parts[0])) < 0.5)
+    rows, cc, _cp, cw, cy, seg, pol = parts
     n = len(rows)
-    views = np.empty((2 * n, ROW_BYTES), np.uint8)
-    views[0::2] = rows
-    views[1::2] = mirror.mirror_rows(rows)
-    x = expand_batch(views)
+    x = expand_batch(rows)
     phi = cc.astype(np.float32) / CNORM
     t = lambda a, d=torch.float32: torch.as_tensor(a, dtype=d, device=device)
     pa, pact, pcrow, pcfg, pprob, parow = pol
@@ -467,10 +464,10 @@ def policy_loss(net, xpub, phi, weight, seg, nseg, policy, stats=None):
     if desc.shape[0] == 0 or pact.shape[0] == 0:
         return None
     cards = net.cards(xpub)
-    physical = xpub[0::2]
-    tokens = net.tokens(physical, cards[0::2])
-    board, projected, spatial = net.position(physical, tokens)
-    _f, g, fp = net.configs(phi, cards[:, :NSLOT], seg)
+    tokens = net.tokens(xpub, cards)
+    board, projected, spatial = net.position(xpub, tokens)
+    own = cards.reshape(-1, 2, NSLOT, cards.shape[-1]).flatten(0, 1)
+    _f, g, fp = net.configs(phi, own, seg)
     h = net.heads(board, g, weight, seg, nseg)
     action_query = torch.zeros(desc.shape[0], dtype=torch.long, device=desc.device)
     action_query.scatter_(0, pact, seg[pcfg])

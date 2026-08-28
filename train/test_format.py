@@ -112,7 +112,7 @@ def main():
     rng = np.random.default_rng(0)
     b = make_batch(tr, rng, dev)
     xpub, phi, w, seg, y, nseg, policy = b
-    assert xpub.shape == (2 * len(tr[0]), PUBFEAT), xpub.shape
+    assert xpub.shape == (len(tr[0]), PUBFEAT), xpub.shape
     assert phi.shape[1] == CFEAT
     assert seg.max() == 2 * len(tr[0]) - 1
     assert nseg == 2 * len(tr[0])
@@ -121,7 +121,7 @@ def main():
     assert torch.isfinite(xpub).all() and torch.isfinite(y).all()
     trows, tcc, tcp = tr[0], tr[1], tr[2]
     mirror.self_check_rows(trows)
-    mirror.self_check(xpub[0::2].numpy())
+    mirror.self_check(xpub.numpy())
     print(f"      batch {xpub.shape} phi {phi.shape}", flush=True)
 
     print("[5/6] ten offline training steps", flush=True)

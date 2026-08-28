@@ -149,7 +149,7 @@ def blob_parity(net, rng):
     worst = 0.0
     for name, sizes, zero in CASES:
         queries = len(sizes)
-        xpub = public_rows(rng, queries)
+        xpub = public_rows(rng, queries // 2)
         seg, phi, weight = belief(rng, sizes, zero)
         want = run(net, xpub, phi, weight, seg, queries)
         got = np.asarray(warchest.infer(
@@ -174,7 +174,7 @@ def policy_parity(net, rng):
     sizes = [4, 3, 6, 2]
     queries = len(sizes)
     na = 7
-    xpub = public_rows(rng, queries)
+    xpub = public_rows(rng, queries // 2)
     seg, phi, weight = belief(rng, sizes)
     n = len(seg)
 
@@ -192,13 +192,14 @@ def policy_parity(net, rng):
     act = rng.integers(0, na, size=24).astype(np.uint32)
 
     with torch.no_grad():
-        cards = net.cards(torch.from_numpy(np.ascontiguousarray(xpub)))
-        physical = torch.from_numpy(np.ascontiguousarray(xpub))[0::2]
-        tokens = net.tokens(physical, cards[0::2])
-        board, projected, spatial = net.position(physical, tokens)
+        public = torch.from_numpy(np.ascontiguousarray(xpub))
+        cards = net.cards(public)
+        tokens = net.tokens(public, cards)
+        board, projected, spatial = net.position(public, tokens)
         tseg = torch.from_numpy(seg.astype(np.int64))
+        own = cards.reshape(-1, 2, NSLOT, cards.shape[-1]).flatten(0, 1)
         _f, g, fp = net.configs(torch.from_numpy(np.ascontiguousarray(phi)),
-                                cards[:, :NSLOT], tseg)
+                                own, tseg)
         h = net.heads(board, g, torch.from_numpy(weight), tseg, queries)
         assert float(h.abs().max()) > 1e-2, "policy belief head is zero"
         want = np.zeros(len(cfg), np.float32)
@@ -229,7 +230,7 @@ def slot_invariance(net, rng, perms=6):
     """Relabel the draft six ways; nothing the network says may move."""
     sizes = [4, 3, 6, 2, 5, 5]
     queries = len(sizes)
-    xpub = public_rows(rng, queries)
+    xpub = public_rows(rng, queries // 2)
     seg, phi, weight = belief(rng, sizes)
     base = run(net, xpub, phi, weight, seg, queries)
     spread = float(base.std())
@@ -256,8 +257,8 @@ def slot_invariance(net, rng, perms=6):
 def offboard_pile_visibility(net, rng):
     """Every type's public piles reach the trunk, occupied or not."""
     sizes = [1, 1]
-    xpub = public_rows(rng, len(sizes))
-    hexes = xpub[:, :N_HEXES * HEX_CH].reshape(len(sizes), N_HEXES, HEX_CH)
+    xpub = public_rows(rng, len(sizes) // 2)
+    hexes = xpub[:, :N_HEXES * HEX_CH].reshape(len(sizes) // 2, N_HEXES, HEX_CH)
     hexes[:, :, HEX_FACTS] = 0.0
     seg, phi, weight = belief(rng, sizes)
     base = run(net, xpub, phi, weight, seg, len(sizes))
