@@ -824,7 +824,6 @@ def main():
             else (os.cpu_count() or 1)
         )
 
-    torch.manual_seed(args.seed)
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
     torch.set_float32_matmul_precision("high")
@@ -852,38 +851,30 @@ def main():
         torch.cuda.set_stream(train_stream)
         print(f"[train] CUDA stream priority {args.train_stream_priority}", flush=True)
 
-    value = Net().to(dev)
-    if args.init_weights:
-        value.load_state_dict(load_checkpoint(args.init_weights).state_dict())
-    opt = torch.optim.Adam(value.parameters(), lr=args.lr)
-    value.push()
-    target_state = cpu_state(value)
-    buf = Buffer(args.cap, args.cap * args.cfgs_per_row)
-    buf.x.fill(0)
     import gpu_batch
     gpu_batch.warmup(dev)
     batcher = gpu_batch.make_batch
-    # One training step and one probe at a training-sized batch, so the
-    # caching allocator holds that peak before the farm carves. Configs in a
-    # batch are `rows × cfgs_per_row`. The solve slot's config cap is not a
-    # batch width: at s=512 it is thousands, and a dummy that wide does not
-    # fit next to the intern table.
-    # 2048 is the intern-table floor: a 2048× table does not fit the encoder.
     torch.cuda.reset_peak_memory_stats(dev)
-    names = tuple(warchest.ENT_NAMES)
     n = max(args.batch, 2048)
     k = n * args.cfgs_per_row
     x = torch.zeros(2 * n, PUBFEAT, device=dev)
     phi = torch.zeros(k, CFEAT, device=dev)
-    w = torch.ones(k, device=dev)
     seg = torch.arange(k, device=dev) % (2 * n)
+    w = torch.bincount(seg, minlength=2 * n).float().reciprocal()[seg]
     y = torch.zeros(k, device=dev)
     parts = (x, phi, w, seg, y, 2 * n, None)
-    opt.zero_grad(set_to_none=True)
-    losses(value, *parts, wp=0.0).backward()
-    opt.step()
-    forward_values(value, parts)
+    scratch = Net().to(dev)
+    scratch_opt = torch.optim.Adam(scratch.parameters(), lr=args.lr)
+    losses(scratch, *parts, wp=0.0).backward()
+    scratch_opt.step()
+    forward_values(scratch, parts)
     torch.cuda.synchronize(dev)
+    del scratch_opt, scratch, parts, x, phi, w, seg, y
+
+    torch.manual_seed(args.seed)
+    value = Net().to(dev)
+    opt = torch.optim.Adam(value.parameters(), lr=args.lr)
+    buf = Buffer(args.cap, args.cap * args.cfgs_per_row)
     if checkpoint:
         value.load_state_dict(checkpoint["value"])
         opt.load_state_dict(checkpoint["optimizer"])
@@ -894,6 +885,11 @@ def main():
         torch.set_rng_state(checkpoint["torch_rng"])
         torch.cuda.set_rng_state_all(checkpoint["cuda_rng"])
         buf.load_state_dict(checkpoint["buffer"])
+    else:
+        if args.init_weights:
+            value.load_state_dict(load_checkpoint(args.init_weights).state_dict())
+        value.push()
+        target_state = cpu_state(value)
     peak = torch.cuda.max_memory_reserved(dev)
     print(f"[train] torch peak {peak / (1 << 20):.0f} MiB reserved on {dev} "
           f"(rows={n} configs={k}); farm carves mem_get_info free",
@@ -917,6 +913,7 @@ def main():
         "optimizer_rows": 0,
         "generated_rows": 0,
         "next_target": None,
+        "lr_duration": None,
         "farm_runs": 0,
         "totals": {},
     }
@@ -985,7 +982,7 @@ def main():
         if sog_t0 is not None:
             opt.param_groups[0]["lr"] = scheduled_lr(
                 args.lr, args.lr_final, time.time() - sog_t0,
-                total - warm, args.lr_stable_frac)
+                progress["lr_duration"], args.lr_stable_frac)
         if nsteps < 1 or len(buf) < args.batch:
             return float("nan"), 0.0, {}
         tt = time.time()
@@ -1468,6 +1465,7 @@ def main():
         sog_t0 = time.time()
         progress["sog_start"] = sog_t0 - t0
         progress["next_target"] = (sog_t0 - t0) + args.target_every * 60.0
+        progress["lr_duration"] = total - warm
     # Keep warm rows in replay; the FIFO ages them out.
     run_search_pipeline()
 
