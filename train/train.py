@@ -833,7 +833,7 @@ def main():
     torch.cuda.reset_peak_memory_stats(dev)
     n = max(args.batch, 2048)
     k = n * args.cfgs_per_row
-    x = torch.zeros(2 * n, PUBFEAT, device=dev)
+    x = torch.zeros(n, PUBFEAT, device=dev)
     phi = torch.zeros(k, CFEAT, device=dev)
     seg = torch.arange(k, device=dev) % (2 * n)
     w = torch.bincount(seg, minlength=2 * n).float().reciprocal()[seg]
@@ -1394,7 +1394,7 @@ def main():
           f"draft={'random' if args.random_draft else 'starter'} "
           f"replay_ratio={args.replay_ratio} "
           f"recent_mix={args.recent_mix}/{args.recent_frac} "
-          f"canonical_views=2 cap={args.cap} "
+          f"symmetry_augmentation=0.5 cap={args.cap} "
           f"matmul={torch.get_float32_matmul_precision()}", flush=True)
 
     if not checkpoint:
