@@ -16,10 +16,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use warchest::farm::Call;
+use warchest::net::{Net, NetLayout};
 use warchest::pbs::*;
 use warchest::rng::Rng;
-use warchest::net::Net;
-use warchest::search::{node_actions, Budget, Cfg, Cfr, Ent, Solver, StopReason};
+use warchest::search::{node_actions, Budget, Cfg, Cfr, Ent, Solver, Step, StopReason};
 use warchest::selfplay::make_game;
 use warchest::state::{Cont, State, MAX_MAIN_PLAYS, Z_BAG, Z_FACEDOWN, Z_HAND};
 use warchest::units::{
@@ -66,6 +67,35 @@ fn near_win_position(seed: u64, plies: u16) -> Option<State> {
         s.apply_inplace(acts[rng.below(acts.len())]);
     }
     None
+}
+
+#[test]
+fn fresh_root_has_its_policy_prior_in_the_first_round() {
+    let mut rng = Rng::new(91);
+    let mut s = make_game(&mut rng, false);
+    while s.is_chance() {
+        s.apply_inplace(s.legal_actions()[0]);
+    }
+    let ctx = Ctx::new(&s);
+    let belief = [
+        Belief::point(true_config(&s, 0, &ctx)),
+        Belief::point(true_config(&s, 1, &ctx)),
+    ];
+    let layout = NetLayout::new();
+    let net = Net::from_flat(
+        &vec![0.0; layout.w_len],
+        &vec![0.0; layout.b_len],
+        &vec![0.0; layout.ln_len],
+    )
+    .unwrap();
+    let mut solver = Solver::new(&s, ctx, Arc::new(net), Cfg::default(), belief, Rng::new(92));
+    let Step::Calls(calls) = solver.advance(&[]) else {
+        panic!("a fresh solve must request its first round");
+    };
+    let root_is_primed = calls.iter().any(|call| {
+        matches!(call, Call::Tree { prime, .. } if prime.iter().any(|p| p.node == 0))
+    });
+    assert!(root_is_primed, "the first expansion round used a uniform root prior");
 }
 
 fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {

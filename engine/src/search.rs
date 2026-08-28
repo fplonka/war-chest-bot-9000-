@@ -2565,14 +2565,14 @@ impl Solver {
         self.resent = resealed;
     }
 
-    /// The decision nodes that are ready for a policy prior: the batch has
-    /// reached their board vector and nothing has given them one yet.
+    /// Decision nodes whose representations this round submits before its
+    /// policy stage, and which have not received a prior yet.
     ///
     /// Deferred rather than done inside `grow` because a node is expanded
-    /// before the batch carrying its board vector has necessarily run — the
-    /// root most of all, which `Solver::new` expands before any network call.
-    /// Deferring also makes this one batched pass per expansion phase instead
-    /// of one small call per node.
+    /// before its representation is submitted — the root most of all, which
+    /// `Solver::new` expands before any network call. `growth_calls` always
+    /// precedes `tree_call`, and the backend runs trunk and config stages before
+    /// policy, so rows in the current growth are ready in this same round.
     ///
     /// Only nodes that get expanded need a prior. A leaf has no action list and
     /// an expansion trajectory stops there, so this is exactly Student of
@@ -2589,7 +2589,7 @@ impl Solver {
             if self.row_of[i] == u32::MAX {
                 return false;
             }
-            if (self.row_of[i] as usize) < self.batch_rows {
+            if (self.row_of[i] as usize) < self.leaf_rows.len() {
                 want.push(i);
                 return false;
             }
