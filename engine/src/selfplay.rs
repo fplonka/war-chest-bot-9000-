@@ -37,9 +37,9 @@
 //! the game it came from instead of that solve's counterfactual values. The
 //! outcome is known for the configs the players actually held, so it is written
 //! there and nowhere else; every other config keeps the search value, which is
-//! the best estimate there is for a hand nobody was dealt. A row that is owed
-//! an outcome stays with its game until the game ends, so `p_td1 > 0` is also
-//! what makes a run's rows arrive a game at a time.
+//! the best estimate there is for a hand nobody was dealt. The TD(1) choice is
+//! made when the row is created. Bootstrap rows enter replay immediately;
+//! selected rows stay with their game until its outcome is known.
 
 use crate::actions::{Action, Play};
 use crate::board::NONE;
@@ -360,10 +360,14 @@ pub struct GameCfg {
 
 pub struct Game {
     rng: Rng,
+    target_rng: Rng,
     s: State,
     ctx: Ctx,
     bel: [Belief; 2],
+    /// Rows selected for TD(1), held until the terminal outcome exists.
     data: Data,
+    /// Final bootstrap rows and counters, released after each solve.
+    ready: Data,
     gc: GameCfg,
     /// Belief states this game's searches asked the network about, waiting to
     /// be solved as roots of their own.
@@ -438,10 +442,12 @@ fn collects_rows(gc: &GameCfg, s: &State) -> bool {
 
 impl Game {
     pub fn new(mut rng: Rng, gc: &GameCfg) -> Game {
+        let target_rng = Rng::new(rng.0 ^ 0x5444_312D_7461_7267);
         let s = make_game(&mut rng, gc.random_draft);
         let ctx = Ctx::new(&s);
         Game {
             rng,
+            target_rng,
             s,
             ctx,
             bel: [
@@ -449,6 +455,7 @@ impl Game {
                 Belief::point(Config::default()),
             ],
             data: Data::default(),
+            ready: Data::default(),
             gc: *gc,
             queries: Vec::new(),
         }
@@ -460,34 +467,42 @@ impl Game {
         std::mem::take(&mut self.queries)
     }
 
-    /// This game's rows, which it gives up only once it has ended and `finish`
-    /// has written the outcome into the rows that drew it.
+    /// Finish releasing this game's data after terminal outcomes are written.
     pub fn take_data(&mut self) -> Data {
         assert!(
             self.s.is_terminal(),
-            "a game gives up its rows only once it has ended"
+            "a game gives up its TD(1) rows only once it has ended"
         );
-        std::mem::take(&mut self.data)
+        let mut out = std::mem::take(&mut self.ready);
+        out.merge(std::mem::take(&mut self.data));
+        out
     }
 
-    /// Everything whose value target is already final.
-    ///
-    /// A pure bootstrap row is finished the moment its own solve is: the target
-    /// is that solve's own answer, and nothing later changes it. A run with
-    /// `p_td1 > 0` still owes some of its rows the game's outcome, so those wait
-    /// for `finish` and only the counters come out here -- otherwise a run that
-    /// has yet to end a game would report no decisions and no play mix either,
-    /// which is exactly the run whose diagnostics matter most.
+    /// Bootstrap rows and counters that cannot change later.
     pub fn take_ready(&mut self) -> Data {
-        if self.gc.p_td1 > 0.0 {
-            return self.data.take_counters();
-        }
-        std::mem::take(&mut self.data)
+        std::mem::take(&mut self.ready)
     }
 
     /// True when the game has ended (used by the worker's idle check).
     pub fn is_terminal(&self) -> bool {
         self.s.is_terminal()
+    }
+
+    fn record_value(
+        &mut self,
+        y: [&[f32]; 2],
+        truth: [u32; 2],
+        policy: &crate::search::Policy,
+    ) {
+        let td1 = self.target_rng.unit_f64() < self.gc.p_td1 as f64;
+        let (data, truth) = if td1 {
+            (&mut self.data, truth)
+        } else {
+            (&mut self.ready, [u32::MAX; 2])
+        };
+        data.begin_solve();
+        data.push_value(&self.s, &self.ctx, &self.bel, y, truth, policy);
+        *data.td1.last_mut().expect("stored row") = td1 as u8;
     }
 
     /// Play forward until a solve is wanted, and hand it over. `None` once the
@@ -512,8 +527,8 @@ impl Game {
                 resolve_chance(&mut self.s, player, &mut self.rng);
                 continue;
             }
-            self.data.decisions += 1;
-            self.data.configs += self.bel[player as usize].cfg.len();
+            self.ready.decisions += 1;
+            self.ready.configs += self.bel[player as usize].cfg.len();
             match self.gc.agents[player as usize] {
                 Agent::Random => {
                     let cfgs = self.bel[player as usize].cfg.clone();
@@ -529,11 +544,7 @@ impl Game {
                         let y0 = vec![policy::eval_squashed(&self.s, 0); self.bel[0].cfg.len()];
                         let y1 = vec![policy::eval_squashed(&self.s, 1); self.bel[1].cfg.len()];
                         let truth = [self.true_index(0) as u32, self.true_index(1) as u32];
-                        self.data.begin_solve();
-                        self.data.push_value(
-                            &self.s,
-                            &self.ctx,
-                            &self.bel,
+                        self.record_value(
                             [&y0, &y1],
                             truth,
                             &np.to_replay(player, &self.ctx),
@@ -568,11 +579,7 @@ impl Game {
             // The row is stored under the belief that is about to be updated,
             // so the seats' realised configs are read here and not at `finish`.
             let truth = [self.true_index(0) as u32, self.true_index(1) as u32];
-            self.data.begin_solve();
-            self.data.push_value(
-                &self.s,
-                &self.ctx,
-                &self.bel,
+            self.record_value(
                 [&solved.value[0], &solved.value[1]],
                 truth,
                 &solved.policy,
@@ -615,7 +622,7 @@ impl Game {
             Play::ClaimInitiative => Some(6),
             Play::Other => None,
         } {
-            self.data.plays[slot] += 1;
+            self.ready.plays[slot] += 1;
         }
         self.s.apply_inplace(np.acts[chosen]);
     }
@@ -628,23 +635,18 @@ impl Game {
         for r in 0..self.data.nv {
             for (p, &outcome) in z.iter().enumerate() {
                 self.data.outcome[2 * r + p] = outcome;
-            }
-            if self.gc.p_td1 <= 0.0 || self.rng.unit_f64() >= self.gc.p_td1 as f64 {
-                continue;
-            }
-            self.data.td1[r] = 1;
-            for p in 0..2 {
-                let at = self.data.row_span(r, p).start + self.data.truth[2 * r + p] as usize;
-                self.data.cy[at] = z[p];
+                let at = self.data.row_span(r, p).start
+                    + self.data.truth[2 * r + p] as usize;
+                self.data.cy[at] = outcome;
             }
         }
-        self.data.games += 1;
+        self.ready.games += 1;
         if self.s.main_plays >= crate::state::MAX_MAIN_PLAYS {
-            self.data.cap_hits += 1;
+            self.ready.cap_hits += 1;
         }
         match self.s.winner() {
-            Some(w) => self.data.wins[w as usize] += 1,
-            None => self.data.draws += 1,
+            Some(w) => self.ready.wins[w as usize] += 1,
+            None => self.ready.draws += 1,
         }
         self.s.utility(WHITE as usize)
     }
@@ -1065,11 +1067,7 @@ mod target_tests {
         g.bel = bel;
         let values = [vec![0.25; g.bel[0].len()], vec![-0.25; g.bel[1].len()]];
         let truth = [g.true_index(0) as u32, g.true_index(1) as u32];
-        g.data.begin_solve();
-        g.data.push_value(
-            &g.s,
-            &g.ctx,
-            &g.bel,
+        g.record_value(
             [&values[0], &values[1]],
             truth,
             &Default::default(),
@@ -1100,13 +1098,67 @@ mod target_tests {
         out.merge(d);
         assert_eq!(out.cy[..query_cy.len()], query_cy[..]);
 
-        let mut st = GameStream::new(5, GameCfg { p_td1: 0.2, ..gc });
+        let mut st = GameStream::new(5, GameCfg { p_td1: 0.0, ..gc });
         let mut live = Data::default();
         let mut sv = st.next_solve(&nets, &mut live);
         let solved = sv.run_alone();
         st.keep(&sv, solved, &mut live);
-        assert_eq!(live.nv, 0, "a row left its game before the game ended");
+        assert_eq!(live.nv, 1, "a bootstrap row waited for the game outcome");
         assert!(live.decisions > 0, "the counters did not come out");
+    }
+
+    #[test]
+    fn td1_selection_has_the_requested_rate_and_keeps_only_needed_truth() {
+        let (s, bel) = collect_roots(1, 0x7D15).pop().expect("a root");
+        let gc = GameCfg {
+            agents: [Agent::Random; 2],
+            collect: Collect::Sog,
+            explore: 0.0,
+            random_draft: false,
+            p_td1: 0.2,
+            query_rate: 0.0,
+            recursive_rate: 0.0,
+        };
+        let mut game = Game::new(Rng::new(91), &gc);
+        game.s = s;
+        game.ctx = Ctx::new(&s);
+        game.bel = bel;
+        let y = [vec![0.25; game.bel[0].len()], vec![-0.25; game.bel[1].len()]];
+        let truth = [game.true_index(0) as u32, game.true_index(1) as u32];
+        for _ in 0..1000 {
+            game.record_value([&y[0], &y[1]], truth, &Default::default());
+        }
+        assert!((150..=250).contains(&game.data.nv), "selected {} of 1000", game.data.nv);
+        assert_eq!(game.data.nv + game.ready.nv, 1000);
+        assert!(game.data.td1.iter().all(|&x| x == 1));
+        assert!(game.ready.td1.iter().all(|&x| x == 0));
+        assert!(game.data.truth.iter().all(|&x| x != u32::MAX));
+        assert!(game.ready.truth.iter().all(|&x| x == u32::MAX));
+    }
+
+    #[test]
+    fn target_selection_does_not_change_gameplay() {
+        let gc = GameCfg {
+            agents: [Agent::Greedy { temp: 2.0 }; 2],
+            collect: Collect::Static,
+            explore: 0.1,
+            random_draft: true,
+            p_td1: 0.0,
+            query_rate: 0.0,
+            recursive_rate: 0.0,
+        };
+        let net = Arc::new(Net::default());
+        let mut bootstrap = Game::new(Rng::new(8128), &gc);
+        let mut terminal = Game::new(Rng::new(8128), &GameCfg { p_td1: 1.0, ..gc });
+        assert!(bootstrap.next_solve(&net).is_none());
+        assert!(terminal.next_solve(&net).is_none());
+        let mut a = vec![0; ROW_BYTES];
+        let mut b = vec![0; ROW_BYTES];
+        pack_row(&bootstrap.s, &bootstrap.ctx, &mut a);
+        pack_row(&terminal.s, &terminal.ctx, &mut b);
+        assert_eq!(a, b);
+        assert_eq!(bootstrap.s.winner(), terminal.s.winner());
+        assert_eq!(bootstrap.s.main_plays, terminal.s.main_plays);
     }
 
     /// A static row stores one public evaluation per seat and the greedy policy.
