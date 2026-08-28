@@ -310,17 +310,6 @@ impl Data {
         self.nv += 1;
     }
 
-    /// Move the running counters out, leaving the rows behind. See
-    /// `Game::take_ready`.
-    fn take_counters(&mut self) -> Data {
-        Data {
-            decisions: std::mem::take(&mut self.decisions),
-            configs: std::mem::take(&mut self.configs),
-            plays: std::mem::take(&mut self.plays),
-            ..Default::default()
-        }
-    }
-
     /// The config range of row `r`, player `p`, in the arena.
     #[inline]
     pub fn row_span(&self, r: usize, p: usize) -> std::ops::Range<usize> {
@@ -365,7 +354,7 @@ pub struct Game {
     ctx: Ctx,
     bel: [Belief; 2],
     /// Rows selected for TD(1), held until the terminal outcome exists.
-    data: Data,
+    pending: Data,
     /// Final bootstrap rows and counters, released after each solve.
     ready: Data,
     gc: GameCfg,
@@ -454,7 +443,7 @@ impl Game {
                 Belief::point(Config::default()),
                 Belief::point(Config::default()),
             ],
-            data: Data::default(),
+            pending: Data::default(),
             ready: Data::default(),
             gc: *gc,
             queries: Vec::new(),
@@ -474,7 +463,7 @@ impl Game {
             "a game gives up its TD(1) rows only once it has ended"
         );
         let mut out = std::mem::take(&mut self.ready);
-        out.merge(std::mem::take(&mut self.data));
+        out.merge(std::mem::take(&mut self.pending));
         out
     }
 
@@ -496,7 +485,7 @@ impl Game {
     ) {
         let td1 = self.target_rng.unit_f64() < self.gc.p_td1 as f64;
         let (data, truth) = if td1 {
-            (&mut self.data, truth)
+            (&mut self.pending, truth)
         } else {
             (&mut self.ready, [u32::MAX; 2])
         };
@@ -632,12 +621,12 @@ impl Game {
     pub fn finish(&mut self) -> f32 {
         // A game cut at the play cap is a draw, so its utility is zero.
         let z = [self.s.utility(0), self.s.utility(1)];
-        for r in 0..self.data.nv {
+        for r in 0..self.pending.nv {
             for (p, &outcome) in z.iter().enumerate() {
-                self.data.outcome[2 * r + p] = outcome;
-                let at = self.data.row_span(r, p).start
-                    + self.data.truth[2 * r + p] as usize;
-                self.data.cy[at] = outcome;
+                self.pending.outcome[2 * r + p] = outcome;
+                let at = self.pending.row_span(r, p).start
+                    + self.pending.truth[2 * r + p] as usize;
+                self.pending.cy[at] = outcome;
             }
         }
         self.ready.games += 1;
@@ -1073,8 +1062,8 @@ mod target_tests {
             &Default::default(),
         );
         g.s.winner = WHITE;
-        let before = g.data.cy.clone();
-        let truth = g.data.truth.clone();
+        let before = g.pending.cy.clone();
+        let truth = g.pending.truth.clone();
         let z = [g.s.utility(0), g.s.utility(1)];
         g.finish();
         let d = g.take_data();
@@ -1128,11 +1117,12 @@ mod target_tests {
         for _ in 0..1000 {
             game.record_value([&y[0], &y[1]], truth, &Default::default());
         }
-        assert!((150..=250).contains(&game.data.nv), "selected {} of 1000", game.data.nv);
-        assert_eq!(game.data.nv + game.ready.nv, 1000);
-        assert!(game.data.td1.iter().all(|&x| x == 1));
+        assert!((150..=250).contains(&game.pending.nv),
+                "selected {} of 1000", game.pending.nv);
+        assert_eq!(game.pending.nv + game.ready.nv, 1000);
+        assert!(game.pending.td1.iter().all(|&x| x == 1));
         assert!(game.ready.td1.iter().all(|&x| x == 0));
-        assert!(game.data.truth.iter().all(|&x| x != u32::MAX));
+        assert!(game.pending.truth.iter().all(|&x| x != u32::MAX));
         assert!(game.ready.truth.iter().all(|&x| x == u32::MAX));
     }
 

@@ -691,6 +691,7 @@ impl SolveFarm {
         devices: Vec<usize>,
         roots: Option<&str>,
     ) -> PyResult<SolveFarm> {
+        let p_td1 = rate("p_td1", p_td1)?;
         let query_rate = rate("query_rate", query_rate)?;
         let recursive_rate = rate("recursive_rate", recursive_rate)?;
         let cfg = Cfg { s, c, batch, rounds, cfr: cfr_of(cfr)?, budget: Budget::for_s(s), ..Default::default() };
