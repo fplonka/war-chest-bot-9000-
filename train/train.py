@@ -426,7 +426,6 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
     for _ in range(steps):
         if deadline is not None and time.time() >= deadline:
             break
-        ts = time.perf_counter()
         ids = buf.sample_ids(batch, rng, recent_mix, recent_frac)
         ring = ids % buf.cap
         stat["sample_ages"].append(time.time() - buf.created_at[ring])
@@ -443,17 +442,13 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
         stat["sample_td1_targets"] += 2 * int(buf.td1[ring].sum())
         stat["sample_targets"] += int(buf.clen[ring].sum())
         sampled = buf.gather(ids)
-        stat["sample_s"] += time.perf_counter() - ts
         stat["batch_configs"] += len(sampled[1])
-        ts = time.perf_counter()
         parts = batch_fn(sampled, rng, device)
-        stat["prepare_s"] += time.perf_counter() - ts
         if stream is not None:
             f0 = torch.cuda.Event(enable_timing=True)
             f1 = torch.cuda.Event(enable_timing=True)
             b1 = torch.cuda.Event(enable_timing=True)
             f0.record(stream)
-        ts = time.perf_counter()
         step_stat = {"zero_sum_max": 0.0, "zero_sum_square_sum": 0.0,
                      "zero_sum_n": 0}
         value = losses(net, *parts, wp=policy_w, stats=step_stat)
@@ -465,10 +460,8 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
             stat["policy_steps"] += 1
             for key in POLICY_METRICS:
                 stat[f"{key}_sum"] += step_stat[key]
-        stat["forward_wall_s"] += time.perf_counter() - ts
         if stream is not None:
             f1.record(stream)
-        ts = time.perf_counter()
         opt.zero_grad(set_to_none=True)
         value.backward()
         grad_norm = float(nn.utils.clip_grad_norm_(net.parameters(), 5.0))
@@ -477,7 +470,6 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
         stat["grad_clipped"] += int(grad_norm > 5.0)
         opt.step()
         stat["steps"] += 1
-        stat["backward_wall_s"] += time.perf_counter() - ts
         if stream is not None:
             b1.record(stream)
             event_pairs.append((f0, f1, b1))

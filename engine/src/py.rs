@@ -92,23 +92,17 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
         soff.windows(2).all(|w| w[0] < w[1]),
         "solve offsets must be strictly increasing"
     );
-    out.set_item("rows", d.rows.into_pyarray_bound(py))?;
-    out.set_item("cc", d.cc.into_pyarray_bound(py))?;
-    out.set_item("cw", d.cw.into_pyarray_bound(py))?;
-    out.set_item("cy", d.cy.into_pyarray_bound(py))?;
-    out.set_item("coff", d.coff.into_pyarray_bound(py))?;
-    out.set_item("pa", d.pa.into_pyarray_bound(py))?;
-    out.set_item("paoff", d.paoff.into_pyarray_bound(py))?;
-    out.set_item("pcoff", d.pcoff.into_pyarray_bound(py))?;
-    out.set_item("pci", d.pci.into_pyarray_bound(py))?;
-    out.set_item("pcell", d.pcell.into_pyarray_bound(py))?;
-    out.set_item("pprob", d.pprob.into_pyarray_bound(py))?;
-    out.set_item("truth", d.truth.into_pyarray_bound(py))?;
-    out.set_item("outcome", d.outcome.into_pyarray_bound(py))?;
-    out.set_item("created", d.created.into_pyarray_bound(py))?;
-    out.set_item("query", d.query.into_pyarray_bound(py))?;
-    out.set_item("td1", d.td1.into_pyarray_bound(py))?;
-    out.set_item("soff", soff.into_pyarray_bound(py))?;
+    macro_rules! arrays {
+        ($($name:ident = $value:expr),* $(,)?) => {
+            $( out.set_item(stringify!($name), $value.into_pyarray_bound(py))?; )*
+        };
+    }
+    arrays! {
+        rows = d.rows, cc = d.cc, cw = d.cw, cy = d.cy, coff = d.coff,
+        pa = d.pa, paoff = d.paoff, pcoff = d.pcoff, pci = d.pci,
+        pcell = d.pcell, pprob = d.pprob, truth = d.truth, outcome = d.outcome,
+        created = d.created, query = d.query, td1 = d.td1, soff = soff,
+    }
     out.set_item("row_bytes", crate::pbs::ROW_BYTES)?;
     out.set_item("solves", n_solves)?;
     Ok(out.into())

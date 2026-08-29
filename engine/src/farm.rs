@@ -191,6 +191,28 @@ impl Call {
 
 pub const CARD_ROWS: usize = 2;
 
+fn batched<T>(items: Vec<(T, Vec<Call>)>) -> (Vec<T>, Vec<usize>, Vec<Call>) {
+    let mut heads = Vec::with_capacity(items.len());
+    let mut spans = Vec::with_capacity(items.len());
+    let mut calls = Vec::new();
+    for (head, cs) in items {
+        spans.push(cs.len());
+        calls.extend(cs);
+        heads.push(head);
+    }
+    (heads, spans, calls)
+}
+
+fn deal(mut replies: Vec<Reply>, spans: &[usize]) -> Vec<Vec<Reply>> {
+    spans
+        .iter()
+        .map(|&n| {
+            let tail = replies.split_off(n);
+            std::mem::replace(&mut replies, tail)
+        })
+        .collect()
+}
+
 pub fn host_slots(budget: Budget) -> usize {
     let slot = budget.host_slot_bytes() as u64;
     (host_free() / slot.max(1)) as usize
@@ -251,26 +273,12 @@ impl<T> Queue<T> {
         }
     }
 
-    fn drain(&self) -> Vec<T> {
-        let mut q = self.q.lock();
-        loop {
-            if !q.is_empty() {
-                return q.drain(..).collect();
-            }
-            if self.closed.load(Ordering::Relaxed) {
-                return Vec::new();
-            }
-            self.ready.wait(&mut q);
-        }
-    }
-
-    fn drain_wave(&self, wave: usize) -> Vec<T> {
+    fn take(&self, least: usize, most: usize) -> Vec<T> {
         let mut q = self.q.lock();
         loop {
             let n = q.len();
-            if n >= wave || (self.closed.load(Ordering::Relaxed) && n > 0) {
-                let take = n.min(wave);
-                let out: Vec<T> = q.drain(..take).collect();
+            if n >= least || (self.closed.load(Ordering::Relaxed) && n > 0) {
+                let out: Vec<T> = q.drain(..n.min(most)).collect();
                 if !q.is_empty() {
                     self.ready.notify_one();
                 }
@@ -564,17 +572,9 @@ fn drive_card(
         }
     }
     loop {
-        let batch = queue.drain_wave(wave);
-        if batch.is_empty() {
+        let (jobs, spans, calls) = batched(queue.take(wave, wave));
+        if jobs.is_empty() {
             return;
-        }
-        let mut jobs = Vec::with_capacity(batch.len());
-        let mut spans = Vec::with_capacity(batch.len());
-        let mut calls: Vec<Call> = Vec::new();
-        for (job, cs) in batch {
-            spans.push(cs.len());
-            calls.extend(cs);
-            jobs.push(job);
         }
         let at = std::time::Instant::now();
         let answered = cuda.read().run(&calls, lane);
@@ -588,27 +588,21 @@ fn drive_card(
         stats.rows.fetch_add(calls.iter().map(Call::rows).sum::<usize>() as u64, Ordering::Relaxed);
         stats.calls.fetch_add(calls.len() as u64, Ordering::Relaxed);
         stats.nanos.fetch_add(spent.as_nanos() as u64, Ordering::Relaxed);
-        let mut rest = replies;
-        for (mut job, n) in jobs.into_iter().zip(spans) {
-            let tail = rest.split_off(n);
-            job.replies = rest;
-            rest = tail;
+        for (mut job, replies) in jobs.into_iter().zip(deal(replies, &spans)) {
+            job.replies = replies;
             ready.push(job);
         }
     }
 }
 
 
+type Back = std::sync::mpsc::Sender<Vec<Reply>>;
+
 pub struct Cards {
-    queues: Vec<Arc<Queue<Ask>>>,
+    queues: Vec<Arc<Queue<(Back, Vec<Call>)>>>,
     seats: Mutex<Vec<(usize, usize)>>,
     free: Condvar,
     drivers: Vec<JoinHandle<()>>,
-}
-
-struct Ask {
-    calls: Vec<Call>,
-    back: std::sync::mpsc::Sender<Vec<Reply>>,
 }
 
 pub struct Seat<'a> {
@@ -630,7 +624,7 @@ impl Cards {
         let n = device.cards();
         let pipes = crate::cuda::PIPELINE;
         let device = Arc::new(device);
-        let queues: Vec<Arc<Queue<Ask>>> =
+        let queues: Vec<Arc<Queue<(Back, Vec<Call>)>>> =
             (0..n * pipes).map(|_| Arc::new(Queue::default())).collect();
         let mut drivers = Vec::with_capacity(n * pipes);
         for g in 0..n {
@@ -641,26 +635,15 @@ impl Cards {
                     std::thread::Builder::new()
                         .name(format!("card-{g}.{p}"))
                         .spawn(move || loop {
-                            let batch = queue.drain();
-                            if batch.is_empty() {
+                            let (backs, spans, calls) = batched(queue.take(1, usize::MAX));
+                            if backs.is_empty() {
                                 return;
-                            }
-                            let mut backs = Vec::with_capacity(batch.len());
-                            let mut spans = Vec::with_capacity(batch.len());
-                            let mut calls: Vec<Call> = Vec::new();
-                            for ask in batch {
-                                spans.push(ask.calls.len());
-                                calls.extend(ask.calls);
-                                backs.push(ask.back);
                             }
                             let Some(replies) = device.run(&calls, lane) else {
                                 return;
                             };
-                            let mut rest = replies;
-                            for (back, n) in backs.into_iter().zip(spans) {
-                                let tail = rest.split_off(n);
-                                let _ = back.send(rest);
-                                rest = tail;
+                            for (back, replies) in backs.into_iter().zip(deal(replies, &spans)) {
+                                let _ = back.send(replies);
                             }
                         })
                         .expect("spawn driver thread"),
@@ -688,7 +671,7 @@ impl Cards {
 
     pub fn round(&self, lane: usize, calls: Vec<Call>) -> Option<Vec<Reply>> {
         let (back, replies) = std::sync::mpsc::channel();
-        self.queues[lane].push(Ask { calls, back });
+        self.queues[lane].push((back, calls));
         replies.recv().ok()
     }
 }

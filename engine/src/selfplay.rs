@@ -80,25 +80,16 @@ pub struct Data {
 impl Data {
     pub fn merge(&mut self, o: Data) {
         let base = self.cw.len() as u32;
-        self.rows.extend(o.rows);
-        self.cc.extend(o.cc);
-        self.cw.extend(o.cw);
-        self.cy.extend(o.cy);
         let tail = if self.coff.is_empty() { 0 } else { 1 };
         self.coff.extend(o.coff.iter().skip(tail).map(|x| x + base));
         let (ab, cb) = (
             (self.pa.len() / crate::search::ACT_BYTES) as u32,
             self.pcell.len() as u32,
         );
-        self.pa.extend(o.pa);
-        self.pci.extend(o.pci);
-        self.pcell.extend(o.pcell);
-        self.pprob.extend(o.pprob);
-        self.truth.extend(o.truth);
-        self.outcome.extend(o.outcome);
-        self.created.extend(o.created);
-        self.query.extend(o.query);
-        self.td1.extend(o.td1);
+        macro_rules! append {
+            ($($name:ident),* $(,)?) => { $( self.$name.extend(o.$name); )* };
+        }
+        append!(rows, cc, cw, cy, pa, pci, pcell, pprob, truth, outcome, created, query, td1);
         self.paoff.extend(o.paoff.iter().skip(tail).map(|x| x + ab));
         self.pcoff.extend(o.pcoff.iter().skip(tail).map(|x| x + cb));
         let rb = self.nv as u32;

@@ -132,9 +132,6 @@ PANELS = (
       ("search target", "policy_target_entropy")), True, ()),
     ("Stored search target vs current prior", "KL divergence (nats)",
      (("target KL", "policy_search_kl"),), True, ()),
-    ("Auxiliary ownership loss", "cross-entropy", (("ownership", "aux_loss"),), True, ()),
-    ("Auxiliary ownership accuracy", "fraction correct", (("ownership", "aux_acc"),),
-     True, (("chance", 1 / 3),)),
     ("Spread of predictions", "std",
      (("prediction", "probe_std"), ("target configs", "tgt_std"),
       ("belief-weighted target", "tgt_belief_std")), True, ()),
@@ -245,9 +242,6 @@ def health(eps):
            ("buffer", f"{last.get('buf', 0):,}"),
            ("dropped queries", f"{tot('dropped'):,}"),
            ("games cut at horizon", f"{horizon:.1f}%")]
-    if "aux_loss" in last:
-        out.append(("aux ownership ce / accuracy",
-                    f"{last['aux_loss']:.3f} / {last['aux_acc']:.1%}"))
     if "effective_train_ratio" in last:
         out += [("effective train ratio", f"{last['effective_train_ratio']:.3f} /solve"),
                 ("passes per row", f"{last.get('train_row_ratio', 0):.3f}"),
