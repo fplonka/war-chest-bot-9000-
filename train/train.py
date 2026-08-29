@@ -669,7 +669,7 @@ def main():
     torch.cuda.reset_peak_memory_stats(dev)
     n = max(args.batch, 2048)
     k = n * args.cfgs_per_row
-    x = torch.zeros(2 * n, PUBFEAT, device=dev)
+    x = torch.zeros(n, PUBFEAT, device=dev)
     phi = torch.zeros(k, CFEAT, device=dev)
     seg = torch.arange(k, device=dev) % (2 * n)
     w = torch.bincount(seg, minlength=2 * n).float().reciprocal()[seg]
