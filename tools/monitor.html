@@ -45,6 +45,7 @@ pre{max-height:340px;overflow:auto;margin:4px 0;font:inherit;white-space:pre-wra
  <p class=meta id=charthelp>drag zoom · wheel zoom · middle-drag pan · double-click reset</p>
  <div class=grid id=panels></div>
  <dl id=health></dl>
+ <h2 id=laddertitle>checkpoint ladder</h2><pre id=ladder></pre>
  <div id=text></div>
 </main>
 <script src=/vendor/uPlot.iife.min.js></script>
@@ -200,6 +201,13 @@ function render(d) {
   const hl = $("health"); hl.textContent = "";
   d.health.forEach(([k, v]) => { hl.appendChild(E("dt", null, k));
     hl.appendChild(E("dd", null, v)); });
+
+  const ladder = d.ladder;
+  const ladderText = ladder ? ladder.pairs.map(p =>
+    `${p.a} (${p.a_minutes}m) vs ${p.b} (${p.b_minutes}m)  ` +
+    `W${p.wins} L${p.losses} D${p.draws}  score ${fmt(p.score)}`).join("\n") : "";
+  $("laddertitle").style.display = $("ladder").style.display = ladderText ? "" : "none";
+  setText($("ladder"), ladderText);
 
   const text = $("text");
   if (!text.firstChild) ["notes", "train.log"].forEach(h => {
