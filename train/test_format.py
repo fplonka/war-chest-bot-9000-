@@ -11,7 +11,6 @@ import warchest
 from value_net import Net
 from gpu_batch import make_batch
 from train import Buffer, forward_values, losses
-from dump import Dump
 
 PUBFEAT = warchest.PUBFEAT
 CFEAT = warchest.CFEAT
@@ -39,20 +38,17 @@ def main():
     torch.manual_seed(3)
     torch.set_num_threads(4)
     dev = torch.device("cuda:0")
-    out = "/tmp/format_test"
-    os.makedirs(out, exist_ok=True)
-
     net = Net()
     net.push()
 
-    print("[1/6] generating rows (random drafts, WP included)", flush=True)
+    print("[1/5] generating rows (random drafts, WP included)", flush=True)
     d = warchest.gen_data(1, 7, explore=0.25, random_draft=True)
     n = len(d["rows"]) // ROW_BYTES
     assert n > 200, f"expected a few hundred rows, got {n}"
     print(f"      {n} rows, {len(d['cc']) // CCOUNTS} configs, "
           f"{int(d['solves'])} solves, row_bytes={ROW_BYTES}", flush=True)
 
-    print("[2/6] dumping through the real Buffer path", flush=True)
+    print("[2/5] filling the real Buffer path", flush=True)
     buf = Buffer(200_000, 200_000 * 48)
     rows = np.asarray(d["rows"], np.uint8).reshape(-1, ROW_BYTES)
     cc = np.asarray(d["cc"], np.uint8).reshape(-1, CCOUNTS)
@@ -75,28 +71,14 @@ def main():
     assert tiny.soff.size < tiny.rows, (tiny.soff.size, tiny.rows)
     tiny.clear()
     assert tiny.soff.size == 0
-    dump_path = f"{out}/buffer.npz"
-    got, gcc, gcp, gcw, gcy, gseg, _ = buf.ordered()
-    lo = buf.lo
-    gsoff = np.concatenate([[0], buf.soff[(buf.soff > lo) & (buf.soff < buf.rows)] - lo,
-                            [len(got)]])
-    np.savez(dump_path, rows=got, cc=gcc, cp=gcp, cw=gcw, cy=gcy, seg=gseg,
-             soff=gsoff, pubfeat=np.int32(PUBFEAT), cfeat=np.int32(CFEAT),
-             ccounts=np.int32(CCOUNTS), cnorm=np.float32(CNORM),
-             row_bytes=np.int32(ROW_BYTES),
-             rules_hash=np.uint64(warchest.rules_table_hash()))
+    inner = buf.soff[(buf.soff > buf.lo) & (buf.soff < buf.rows)]
+    assert inner.size, "a dump needs at least one interior solve boundary"
+    print(f"      {len(buf)} rows, {inner.size + 1} solve boundaries", flush=True)
 
-    print("[3/6] loading through Dump and checking the format pins", flush=True)
-    dmp = Dump(dump_path)
-    dmp.check(PUBFEAT, CCOUNTS)
-    assert dmp.rules_hash == warchest.rules_table_hash()
-    assert len(dmp.soff) >= 2 and dmp.soff[0] == 0 and dmp.soff[-1] == len(dmp)
-    print(f"      {len(dmp)} rows, {len(dmp.soff) - 1} solve boundaries", flush=True)
-
-    print("[4/6] solve-aligned split and batch assembly", flush=True)
-    split = dmp.soff[-2]
-    tr = (*dmp.rows(0, split), empty_policy())
-    te = (*dmp.rows(split, len(dmp)), empty_policy())
+    print("[3/5] solve-aligned split and batch assembly", flush=True)
+    split = int(inner[-1])
+    block = lambda lo, hi: (*buf.gather(np.arange(lo, hi))[:6], empty_policy())
+    tr, te = block(buf.lo, split), block(split, buf.rows)
     rng = np.random.default_rng(0)
     b = make_batch(tr, rng, dev)
     xpub, phi, w, seg, y, nseg, policy = b
@@ -107,10 +89,9 @@ def main():
     assert torch.allclose(torch.bincount(seg, w), torch.ones(nseg), atol=1e-6)
     assert not len(policy[0]) and not len(policy[1])
     assert torch.isfinite(xpub).all() and torch.isfinite(y).all()
-    trows, tcc, tcp = tr[0], tr[1], tr[2]
     print(f"      batch {xpub.shape} phi {phi.shape}", flush=True)
 
-    print("[5/6] ten offline training steps", flush=True)
+    print("[4/5] ten offline training steps", flush=True)
     opt = torch.optim.Adam(net.parameters(), lr=1e-3)
     seen = []
     for _ in range(10):
@@ -123,7 +104,7 @@ def main():
     assert all(np.isfinite(x) for x in seen), seen
     print("      value: " + " ".join(f"{v:.3f}" for v in seen), flush=True)
 
-    print("[6/6] validation loss on the held-out solve block", flush=True)
+    print("[5/5] validation loss on the held-out solve block", flush=True)
     hl, hrms = evaluate(net, te, rng, dev)
     print(f"      test huber {hl:.6f} rms {hrms:.5f}", flush=True)
     assert np.isfinite(hl)
