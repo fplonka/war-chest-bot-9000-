@@ -284,7 +284,7 @@ fn marshal_grants_normal_attack_not_archer() {
     s2.set_unit(W1, WHITE, SWORDSMAN, 1);
     s2.set_unit(NB, BLACK, FOOTMAN, 1);
     let acts2 = s2.legal_actions();
-    assert!(has(&acts2, Action::TacMarshal { from: W1, target: NB as u8 }));
+    assert!(has(&acts2, Action::TacMarshal { from: W1, target: NB }));
 }
 
 #[test]

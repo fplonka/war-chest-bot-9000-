@@ -11,7 +11,7 @@ use warchest::units::{write_card_features, CARD_FEATS};
 use warchest::Action;
 
 fn world(pubs: &State, ctx: &Ctx, c: &(Config, Config)) -> State {
-    let mut w = pubs.clone();
+    let mut w = *pubs;
     set_config(&mut w, 0, ctx, &c.0);
     set_config(&mut w, 1, ctx, &c.1);
     w
@@ -82,11 +82,11 @@ fn leak_check(random_draft: bool) -> (usize, usize) {
                 let mut a = vec![0.0f32; PUBFEAT];
                 let mut b = vec![0.0f32; PUBFEAT];
                 let mut row = [0u8; ROW_BYTES];
-                let mut sa = s.clone();
+                let mut sa = s;
                 set_config(&mut sa, p, &ctx, &all[0]);
                 pack_row(&sa, &ctx, &mut row);
                 expand_row(&row, &mut a);
-                let mut sb = s.clone();
+                let mut sb = s;
                 set_config(&mut sb, p, &ctx, &all[all.len() - 1]);
                 pack_row(&sb, &ctx, &mut row);
                 expand_row(&row, &mut b);
@@ -152,7 +152,7 @@ fn run_one_draft(seed: u64, white: &[u16], black: &[u16]) {
                     if wts[i] <= 0.0 {
                         continue;
                     }
-                    let mut nx = ws.clone();
+                    let mut nx = ws;
                     nx.apply_inplace(*a);
                     let nc = with(c, p, true_config(&nx, p, &ctx));
                     *next.entry(nc).or_insert(0.0) += w * wts[i] / tot;
@@ -187,7 +187,7 @@ fn run_one_draft(seed: u64, white: &[u16], black: &[u16]) {
                 if wprobs[i] <= 0.0 || obs_key(a) != obs {
                     continue;
                 }
-                let mut nx = ws.clone();
+                let mut nx = ws;
                 nx.apply_inplace(*a);
                 let nc = with(c, p, true_config(&nx, p, &ctx));
                 *next.entry(nc).or_insert(0.0) += w * wprobs[i];

@@ -565,7 +565,7 @@ impl Solver {
         sv.nodes.reserve(640);
         sv.cur.reserve(640);
         sv.seed = Rng::new(sv.rng.next_u64()).0;
-        let root = sv.push_node(crate::contract::NO_ROW, root.clone(), cfgs);
+        let root = sv.push_node(crate::contract::NO_ROW, *root, cfgs);
         sv.expand(root);
         sv
     }
@@ -1072,7 +1072,7 @@ impl Solver {
                 .iter()
                 .find(|c| action_legal(c, aslot[a]))
                 .expect("a kept action is playable by some config in the support");
-            let mut cs = s.clone();
+            let mut cs = s;
             set_config(&mut cs, player, &self.ctx, &rep);
             cs.apply_inplace(acts[a]);
             let mut cc = cfgs.clone();

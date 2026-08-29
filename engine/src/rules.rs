@@ -99,14 +99,13 @@ impl State {
         } else {
             false
         };
-        if bers {
-            if self.hex_height[hex] >= 2 {
+        if bers
+            && self.hex_height[hex] >= 2 {
                 self.push_cont(Cont::BerserkerChain {
                     hex: hex as u8,
                     v2: d.berserker_v2,
                 });
             }
-        }
         if d.swordsman && was_attack {
             self.push_cont(Cont::SwordsmanMove { hex: hex as u8 });
         }
@@ -161,11 +160,13 @@ impl State {
                     self.queue_maneuver_post(atk_hex as usize, true, false);
                     continue;
                 }
+                Some(Cont::MainPlay) => {
+                    self.begin_main_turn();
+                    return;
+                }
                 Some(c) => {
                     self.pending = c;
-                    if matches!(c, Cont::MainPlay) {
-                        self.begin_main_turn();
-                    } else if matches!(c, Cont::FootmanManeuver { .. } | Cont::CavalryAttack { .. })
+                    if matches!(c, Cont::FootmanManeuver { .. } | Cont::CavalryAttack { .. })
                         && self.legal_actions().is_empty()
                     {
                         continue;
@@ -687,7 +688,7 @@ impl State {
     }
 
     pub fn apply(&self, action: Action) -> State {
-        let mut s = self.clone();
+        let mut s = *self;
         s.apply_inplace(action);
         s
     }
@@ -742,7 +743,6 @@ impl State {
             }
             Cont::WarriorPriestPlay { player } => {
                 self.apply_main(player, action);
-                return;
             }
             Cont::RoyalGuardChoice { defender, rg_hex } => {
                 match action {
@@ -756,7 +756,6 @@ impl State {
                     _ => {}
                 }
                 self.finish();
-                return;
             }
             Cont::SwordsmanMove { hex } => {
                 match action {
@@ -768,11 +767,9 @@ impl State {
                     _ => {}
                 }
                 self.finish();
-                return;
             }
             Cont::BerserkerChain { hex, .. } => {
                 self.apply_berserker(hex, action);
-                return;
             }
             Cont::MercenaryManeuver { .. } => {
                 match action {
@@ -783,11 +780,9 @@ impl State {
                     _ => {}
                 }
                 self.finish();
-                return;
             }
             Cont::FootmanManeuver { hexes } => {
                 self.apply_footman(hexes, action);
-                return;
             }
             Cont::CavalryAttack { hex } => {
                 if let TacCavalryAttack { from, target } = action {
@@ -795,7 +790,6 @@ impl State {
                     self.do_attack(from as usize, target as usize);
                 }
                 self.finish();
-                return;
             }
             Cont::FootmanInstantDeploy { coin } => {
                 match action {
@@ -807,7 +801,6 @@ impl State {
                     _ => {}
                 }
                 self.finish();
-                return;
             }
             _ => {}
         }

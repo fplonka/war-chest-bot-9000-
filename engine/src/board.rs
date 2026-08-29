@@ -36,6 +36,12 @@ fn axial_dist(a: (i8, i8), b: (i8, i8)) -> u8 {
     ((dx.abs() + dy.abs() + (dx + dy).abs()) / 2) as u8
 }
 
+impl Default for Board {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Board {
     pub fn new() -> Board {
         let mut coords: Vec<(i8, i8)> = Vec::with_capacity(N_HEXES);
