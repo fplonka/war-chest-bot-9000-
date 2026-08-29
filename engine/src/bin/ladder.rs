@@ -12,7 +12,8 @@ use warchest::selfplay::DRAFT_POOL;
 
 struct Spec {
     name: String,
-    mind: Mind,
+    mind: String,
+    temp: f32,
     cfg: Cfg,
     weights: String,
 }
@@ -26,14 +27,8 @@ fn spec_of(dir: &str) -> Result<Spec, String> {
     let cfr = j["search"]["cfr"].as_str().unwrap_or("dcfr");
     Ok(Spec {
         name: text("name", dir),
-        mind: match text("mind", "sog").as_str() {
-            "random" => Mind::Random,
-            "greedy" => Mind::Greedy {
-                temp: j["temp"].as_f64().unwrap_or(2.0) as f32,
-            },
-            "sog" => Mind::Sog,
-            other => return Err(format!("unknown mind {other}")),
-        },
+        mind: text("mind", "sog"),
+        temp: j["temp"].as_f64().unwrap_or(2.0) as f32,
         cfg: Cfg {
             s,
             c: num("c", 8.0) as f32,
@@ -57,15 +52,21 @@ fn brain_of(spec: &Spec, device: usize) -> Result<Brain, String> {
     } else {
         Net::load_bin(&spec.weights).map_err(|e| format!("{}: {e}", spec.weights))?
     };
-    let cards = match spec.mind {
-        Mind::Sog => Some(Arc::new(Cards::new(Device::new(&[device], net.clone(), spec.cfg, 0)?))),
-        _ => None,
+    let mind = match spec.mind.as_str() {
+        "random" => Mind::Random,
+        "greedy" => Mind::Greedy { temp: spec.temp },
+        "sog" => Mind::Sog(Arc::new(Cards::new(Device::new(
+            &[device],
+            net.clone(),
+            spec.cfg,
+            0,
+        )?))),
+        other => return Err(format!("unknown mind {other}")),
     };
     Ok(Brain {
-        mind: spec.mind,
+        mind,
         net: Arc::new(net),
         cfg: spec.cfg,
-        cards,
     })
 }
 

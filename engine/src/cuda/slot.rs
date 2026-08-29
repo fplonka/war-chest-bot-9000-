@@ -4,7 +4,7 @@ use std::sync::Arc;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 
 use crate::board::N_HEXES;
-use crate::farm::Dst;
+use crate::contract::Dst;
 use crate::net::{C, D, JW, POOL};
 use crate::pbs::NTYPE;
 use crate::search::{Budget, Ent};

@@ -4,15 +4,19 @@ use crate::pbs::{belief_after_draw, faceup_counts, obs_key, reserve, set_config,
 use crate::policy::{self, NodePolicy};
 use crate::rng::Rng;
 
+#[cfg(feature = "gpu")]
 use crate::farm::Cards;
 use crate::net::Net;
-use crate::search::{Cfg, Solver, Step};
+#[cfg(feature = "gpu")]
+use crate::search::{Solver, Step};
+use crate::search::Cfg;
 use crate::state::{Cont, State};
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub enum Mind {
-    Sog,
+    #[cfg(feature = "gpu")]
+    Sog(Arc<Cards>),
     Random,
     Greedy { temp: f32 },
 }
@@ -21,17 +25,22 @@ pub struct Brain {
     pub mind: Mind,
     pub net: Arc<Net>,
     pub cfg: Cfg,
-    pub cards: Option<Arc<Cards>>,
 }
 
 impl Brain {
+    #[cfg_attr(not(feature = "gpu"), allow(unused_variables))]
     pub fn policy(&self, s: &State, ctx: &Ctx, player: u8, bel: &[Belief; 2], rng: &mut Rng) -> NodePolicy {
         let cfgs = &bel[player as usize].cfg;
-        match self.mind {
-            Mind::Random => return policy::uniform(s, ctx, player, cfgs),
-            Mind::Greedy { temp } => return policy::greedy(s, ctx, player, cfgs, temp),
-            Mind::Sog => {}
+        match &self.mind {
+            Mind::Random => policy::uniform(s, ctx, player, cfgs),
+            Mind::Greedy { temp } => policy::greedy(s, ctx, player, cfgs, *temp),
+            #[cfg(feature = "gpu")]
+            Mind::Sog(cards) => self.solve(s, ctx, bel, rng, cards),
         }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn solve(&self, s: &State, ctx: &Ctx, bel: &[Belief; 2], rng: &mut Rng, cards: &Cards) -> NodePolicy {
         let mut sv = Solver::new(
             s,
             *ctx,
@@ -40,18 +49,13 @@ impl Brain {
             bel.clone(),
             Rng::new(rng.next_u64()),
         );
-        match &self.cards {
-            Some(cards) => {
-                let seat = cards.seat();
-                sv.pin(seat.slot);
-                let mut replies = Vec::new();
-                while let Step::Calls(calls) = sv.advance(&replies) {
-                    replies = cards
-                        .round(seat.lane, calls)
-                        .expect("a card failed while a solve was still running");
-                }
-            }
-            None => unreachable!("SoG always has a device"),
+        let seat = cards.seat();
+        sv.pin(seat.slot);
+        let mut replies = Vec::new();
+        while let Step::Calls(calls) = sv.advance(&replies) {
+            replies = cards
+                .round(seat.lane, calls)
+                .expect("a card failed while a solve was still running");
         }
         policy::root(&sv)
     }
@@ -185,7 +189,6 @@ mod tests {
             mind: Mind::Random,
             net: Arc::new(Net::default()),
             cfg: Cfg::default(),
-            cards: None,
         }
     }
 

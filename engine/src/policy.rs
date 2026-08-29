@@ -78,19 +78,11 @@ impl NodePolicy {
 
     pub fn sample(&self, rng: &mut Rng, c: usize) -> usize {
         let row = self.row(c);
-        let weights = &self.probs[row.clone()];
-        let total: f64 = weights.iter().map(|&x| x.max(0.0) as f64).sum();
-        if total == 0.0 {
+        let weights: Vec<f64> = self.probs[row.clone()].iter().map(|&x| x.max(0.0) as f64).collect();
+        if weights.iter().all(|&w| w == 0.0) {
             return row.start + rng.below(row.len().max(1));
         }
-        let mut needle = rng.unit_f64() * total;
-        for (i, &weight) in weights.iter().enumerate() {
-            needle -= weight.max(0.0) as f64;
-            if needle < 0.0 {
-                return row.start + i;
-            }
-        }
-        row.end - 1
+        row.start + rng.weighted_index(&weights)
     }
 
     pub fn mix_uniform(&mut self, eps: f32) {

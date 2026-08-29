@@ -12,7 +12,7 @@ use cudarc::driver::{
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 
 use crate::board::{board, N_HEXES, NONE};
-use crate::farm::{Call, Prime, Reply, CARD_ROWS};
+use crate::contract::{Call, Prime, Reply, CARD_ROWS};
 use crate::net::{
     ln_block, Net, NetLayout, NormSpan, Span, AW, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW,
     LN_ACT, LN_CFG, LN_H, LN_JOIN, LN_JOUT, LN_TRUNK, POOL, TYPE,

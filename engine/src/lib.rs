@@ -8,6 +8,7 @@ pub mod bot;
 pub mod contract;
 #[cfg(feature = "gpu")]
 pub mod cuda;
+#[cfg(feature = "gpu")]
 pub mod farm;
 pub mod net;
 pub mod pbs;

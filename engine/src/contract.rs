@@ -1,5 +1,184 @@
-use crate::farm::{Dst, Writes};
-use crate::search::{Solver, NO_TRANS};
+use crate::search::{Cfr, Solver, NO_TRANS};
+
+#[derive(Clone)]
+pub enum Call {
+    Trunk {
+        solve: usize,
+        at: usize,
+        queries: usize,
+        board_of: Vec<u32>,
+        boards_at: usize,
+        boards: usize,
+        packed: Vec<u8>,
+        cards: Vec<f32>,
+        cidx: Vec<u32>,
+        coff: Vec<u32>,
+    },
+    Configs {
+        solve: usize,
+        at: usize,
+        phi: Vec<f32>,
+        owner: Vec<u32>,
+        cards: Vec<f32>,
+        n: usize,
+    },
+    Tree {
+        solve: usize,
+        writes: Writes,
+        fresh: bool,
+        ncells: usize,
+        nreach: usize,
+        nvals: usize,
+        levels: Vec<u32>,
+        nterm: usize,
+        seed: Option<u64>,
+        prime: Vec<Prime>,
+        acts: Vec<u32>,
+        cells: Vec<u32>,
+        prior_temp: f32,
+    },
+    Iterate {
+        solve: usize,
+        step: usize,
+        iters: usize,
+        expand: usize,
+        query: Vec<QueryPick>,
+        cfr: Cfr,
+        puct: f32,
+    },
+    Read {
+        solve: usize,
+        touched: [bool; 2],
+        vals_at: [(u32, u32); 2],
+        policy_at: (u32, u32),
+    },
+}
+
+#[derive(Clone, Copy)]
+pub struct QueryPick {
+    pub iter: u32,
+    pub reach: u32,
+    pub len: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct Prime {
+    pub node: u32,
+    pub row: u32,
+    pub at: u32,
+    pub na: u32,
+    pub cell_at: u32,
+    pub nc: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dst {
+    Kind, Player, Exhausted, Nc, Parent, Roff, Voff, Soff, Util,
+    ChildAt, ChildN, Child,
+    LegalBase, LegalOff, LegalChild, LegalTrans, CellRow, CellVal,
+    RevBase, RevStart, RevSrc, RevCell,
+    RvdBase, RvdStart, RvdSrc, RvdP,
+    DrawBase, DrawStart, DrawTo, DrawP,
+    LevelStart, LevelNode,
+    Cur, Prior, LeafNode, Term, Rootb,
+}
+
+#[derive(Clone, Default)]
+pub struct Writes {
+    pub blob: Vec<u32>,
+    pub runs: Vec<Run>,
+}
+
+#[derive(Clone, Copy)]
+pub struct Run {
+    pub dst: Dst,
+    pub at: u32,
+    pub len: u32,
+    pub start: u32,
+}
+
+impl Writes {
+    pub fn u32s(&mut self, d: Dst, at: usize, src: &[u32]) {
+        self.run(d, at, src.iter().copied(), src.len());
+    }
+
+    pub fn f32s(&mut self, d: Dst, at: usize, src: &[f32]) {
+        self.run(d, at, src.iter().map(|x| x.to_bits()), src.len());
+    }
+
+    pub fn u8s(&mut self, d: Dst, at: usize, src: &[u8]) {
+        self.run(d, at, src.iter().map(|&x| x as u32), src.len());
+    }
+
+    pub fn f32s_both(&mut self, a: Dst, b: Dst, at: usize, src: &[f32]) {
+        self.f32s(a, at, src);
+        if !src.is_empty() {
+            let last = *self.runs.last().expect("a non-empty run was just pushed");
+            self.runs.push(Run { dst: b, ..last });
+        }
+    }
+
+    fn run(&mut self, d: Dst, at: usize, src: impl Iterator<Item = u32>, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let start = self.blob.len() as u32;
+        self.blob.extend(src);
+        debug_assert!(
+            !self.runs.iter().any(|r| {
+                r.dst == d && (at as u32) < r.at + r.len && r.at < (at + n) as u32
+            }),
+            "two runs of one round overlap in the same array"
+        );
+        self.runs.push(Run { dst: d, at: at as u32, len: n as u32, start });
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+}
+
+#[derive(Default)]
+pub struct Reply {
+    pub a: Vec<f32>,
+    pub b: Vec<f32>,
+    pub c: Vec<f32>,
+    pub leaves: Vec<u32>,
+}
+
+impl Call {
+    #[cfg(any(test, feature = "gpu"))]
+    pub fn kind(&self) -> usize {
+        match self {
+            Call::Trunk { .. } => 0,
+            Call::Configs { .. } => 1,
+            Call::Tree { .. } => 2,
+            Call::Iterate { .. } => 3,
+            Call::Read { .. } => 4,
+        }
+    }
+
+    pub fn solve(&self) -> usize {
+        match self {
+            Call::Trunk { solve, .. }
+            | Call::Configs { solve, .. }
+            | Call::Tree { solve, .. }
+            | Call::Iterate { solve, .. }
+            | Call::Read { solve, .. } => *solve,
+        }
+    }
+
+    pub fn rows(&self) -> usize {
+        match self {
+            Call::Trunk { queries, .. } => *queries,
+            Call::Configs { n, .. } => *n,
+            Call::Tree { .. } | Call::Iterate { .. } | Call::Read { .. } => 0,
+        }
+    }
+}
+
+
+pub const CARD_ROWS: usize = 2;
 
 pub const KIND_DECISION: u8 = 0;
 pub const KIND_CHANCE: u8 = 1;

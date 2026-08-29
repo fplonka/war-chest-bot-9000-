@@ -399,7 +399,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(set_weights, m)?)?;
     m.add_function(wrap_pyfunction!(gen_data, m)?)?;
     m.add("ENT_NAMES", Ent::NAME.to_vec())?;
-    m.add("STOP_NAMES", crate::search::StopReason::NAMES.to_vec())?;
+    m.add("STOP_NAMES", crate::search::STOP_NAMES.to_vec())?;
     m.add("SOLVE_KIND_NAMES", crate::selfplay::SolveKind::NAMES.to_vec())?;
     Ok(())
 }

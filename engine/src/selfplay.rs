@@ -471,6 +471,7 @@ impl GameStream {
         }
     }
 
+    #[cfg(feature = "gpu")]
     pub(crate) fn solve_kind(&self) -> SolveKind {
         self.kind
     }

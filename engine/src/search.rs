@@ -1,6 +1,6 @@
 use crate::actions::Action;
 use crate::board::NONE;
-use crate::farm::{Call, Dst, QueryPick, Reply, Writes};
+use crate::contract::{Call, Dst, Prime, QueryPick, Reply, Writes};
 use crate::net::Net;
 use crate::pbs::*;
 use crate::rng::Rng;
@@ -53,10 +53,6 @@ impl Budget {
 
     pub fn cap(&self, e: Ent) -> usize {
         self.0[e as usize]
-    }
-
-    pub fn reserve(&self, e: Ent, n: usize) -> bool {
-        n <= self.cap(e)
     }
 
     pub fn host_slot_bytes(&self) -> usize {
@@ -166,37 +162,19 @@ impl Cfr {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
-pub enum StopReason {
-    Complete,
-    Exhausted,
-    BudgetNode,
-    BudgetCell,
-    BudgetReach,
-    BudgetDraw,
-    BudgetRow,
-    BudgetBoard,
-    BudgetConfig,
-    BudgetCidx,
-    Other,
-}
-
-impl StopReason {
-    pub const NAMES: [&'static str; 11] = [
-        "complete",
-        "exhausted",
-        "budget_node",
-        "budget_cell",
-        "budget_reach",
-        "budget_draw",
-        "budget_row",
-        "budget_board",
-        "budget_config",
-        "budget_cidx",
-        "other",
-    ];
-}
+pub const STOP_NAMES: [&str; 11] = [
+    "complete",
+    "exhausted",
+    "budget_node",
+    "budget_cell",
+    "budget_reach",
+    "budget_draw",
+    "budget_row",
+    "budget_board",
+    "budget_config",
+    "budget_cidx",
+    "other",
+];
 
 pub fn action_coin(a: &Action, s: &State) -> u8 {
     use Action::*;
@@ -227,19 +205,18 @@ pub fn node_actions(s: &State, player: u8, ctx: &Ctx, cfgs: &[Config]) -> (Vec<A
     let forced = matches!(s.pending(), Cont::WarriorPriestPlay { .. });
     if matches!(s.pending(), Cont::MainPlay) || forced {
         let res = reserve(s, player, ctx);
-        for k in 0..NSLOT {
-            if res[k] == 0 {
-                continue;
-            }
-            if !cfgs.is_empty()
-                && !cfgs.iter().any(|c| {
+        let playable: [bool; NSLOT] = std::array::from_fn(|k| {
+            cfgs.is_empty()
+                || cfgs.iter().any(|c| {
                     if forced {
                         c.inflight == Some(k as u8)
                     } else {
                         c.hand[k] > 0
                     }
                 })
-            {
+        });
+        for k in 0..NSLOT {
+            if res[k] == 0 || !playable[k] {
                 continue;
             }
             let mut one = Config::default();
@@ -261,16 +238,7 @@ pub fn node_actions(s: &State, player: u8, ctx: &Ctx, cfgs: &[Config]) -> (Vec<A
                 } else {
                     ctx.slot_of[player as usize][coin as usize]
                 };
-                if slot >= 0
-                    && !cfgs.is_empty()
-                    && !cfgs.iter().any(|c| {
-                        if forced {
-                            c.inflight == Some(slot as u8)
-                        } else {
-                            c.hand[slot as usize] > 0
-                        }
-                    })
-                {
+                if slot >= 0 && !playable[slot as usize] {
                     continue;
                 }
                 aslot.push(slot);
@@ -874,22 +842,17 @@ impl Solver {
         }
     }
 
-    pub fn stop_reason(&self) -> StopReason {
+    pub fn stop_reason(&self) -> u32 {
         if self.budget_hit != 0 {
             debug_assert!(self.budget_hit.is_power_of_two());
-            const BY_ENT: [StopReason; 8] = [
-                StopReason::BudgetNode, StopReason::BudgetCell, StopReason::BudgetReach,
-                StopReason::BudgetDraw, StopReason::BudgetRow, StopReason::BudgetBoard,
-                StopReason::BudgetConfig, StopReason::BudgetCidx,
-            ];
-            return BY_ENT[self.budget_hit.trailing_zeros() as usize];
+            return 2 + self.budget_hit.trailing_zeros();
         }
         if self.expansions >= self.cfg.s {
-            StopReason::Complete
+            0
         } else if self.nodes[0].exhausted {
-            StopReason::Exhausted
+            1
         } else {
-            StopReason::Other
+            (STOP_NAMES.len() - 1) as u32
         }
     }
 
@@ -898,12 +861,12 @@ impl Solver {
         for (i, e) in Ent::ALL.into_iter().enumerate() {
             out[i] = self.used(e) as u32;
         }
-        out[8] = self.stop_reason() as u32;
+        out[8] = self.stop_reason();
         out
     }
 
     fn reserve(&mut self, e: Ent, n: usize) -> bool {
-        if !self.cfg.budget.reserve(e, n) {
+        if n > self.cfg.budget.cap(e) {
             self.abandon = true;
             self.budget_hit |= 1 << (e as u8);
             false
@@ -1318,14 +1281,12 @@ impl Solver {
         calls
     }
 
-    fn absorb(&mut self, _replies: &[Reply]) {
+    fn absorb(&mut self) {
         if self.leaf_rows.len() > self.batch_rows {
             self.batch_rows = self.leaf_rows.len();
             self.batch_boards = self.nboards;
         }
-        if self.ncfg > self.batch_cfgs {
-            self.batch_cfgs = self.ncfg;
-        }
+        self.batch_cfgs = self.batch_cfgs.max(self.ncfg);
     }
 
     fn expansions_at(&self, i: usize) -> usize {
@@ -1340,7 +1301,7 @@ impl Solver {
         match self.phase {
             Phase::Fresh => {}
             Phase::Iterating => {
-                self.absorb(replies);
+                self.absorb();
                 let last = replies.last().expect("a round answers every call it was given");
                 self.absorb_queries(&last.c);
                 for &leaf in &last.leaves.clone() {
@@ -1354,7 +1315,7 @@ impl Solver {
                 }
             }
             Phase::Reading => {
-                self.absorb(replies);
+                self.absorb();
                 self.phase = Phase::Done;
                 let last = replies.last().expect("a round answers every call it was given");
                 return Step::Done(self.read_back(last));
@@ -1382,8 +1343,7 @@ impl Solver {
 
     fn iterate_round(&mut self) -> Vec<Call> {
         let (done, expand) = self.round_shape();
-        let mut calls = self.growth_calls();
-        calls.push(self.tree_call());
+        let mut calls = self.opening_calls();
         let query_rows = self.leaf_query_rows(0);
         let rows = query_rows.len();
         let selected = self.plan_query_events(done * rows);
@@ -1414,9 +1374,14 @@ impl Solver {
         calls
     }
 
-    fn read_round(&mut self) -> Vec<Call> {
+    fn opening_calls(&mut self) -> Vec<Call> {
         let mut calls = self.growth_calls();
         calls.push(self.tree_call());
+        calls
+    }
+
+    fn read_round(&mut self) -> Vec<Call> {
+        let mut calls = self.opening_calls();
         let nvals = self.nvals as u32;
         let vals_at = match self.collect {
             None => [(0, 0); 2],
@@ -1534,12 +1499,12 @@ impl Solver {
         want
     }
 
-    pub(crate) fn prime(&mut self) -> (Vec<crate::farm::Prime>, Vec<u32>, Vec<u32>) {
+    pub(crate) fn prime(&mut self) -> (Vec<Prime>, Vec<u32>, Vec<u32>) {
         let want = self.ready_for_prior();
         let (mut prime, mut acts, mut cells) = (Vec::new(), Vec::new(), Vec::new());
         for i in want {
             let n = &self.nodes[i];
-            prime.push(crate::farm::Prime {
+            prime.push(Prime {
                 node: i as u32,
                 row: n.row_of,
                 at: (acts.len() / ACT_BYTES) as u32,

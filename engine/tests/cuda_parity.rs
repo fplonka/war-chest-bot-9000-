@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 
 use warchest::contract::NO_ROW;
 use warchest::cuda::Device;
-use warchest::farm::{Call, Reply};
+use warchest::contract::{Call, Reply};
 use warchest::net::Net;
 use warchest::pbs::{expand_row, pack_row, uniform_belief, Ctx, PUBFEAT, ROW_BYTES};
 use warchest::rng::Rng;
