@@ -645,12 +645,13 @@ def main():
         raise SystemExit(f"device must be a CUDA device, got {args.device!r}")
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is unavailable; training requires a working GPU")
-    if args.replay_ratio <= 0.0:
-        raise SystemExit("replay_ratio must be positive")
-    if args.target_every <= 0.0:
-        raise SystemExit("target_every must be positive minutes")
-    if args.gen_solves <= 0 or args.gen_workers <= 0:
-        raise SystemExit("gen_solves and resolved gen_workers must be positive")
+    for bad, why in (
+            (args.replay_ratio <= 0.0, "replay_ratio must be positive"),
+            (args.target_every <= 0.0, "target_every must be positive minutes"),
+            (args.gen_solves <= 0 or args.gen_workers <= 0,
+             "gen_solves and resolved gen_workers must be positive")):
+        if bad:
+            raise SystemExit(why)
     torch.cuda.set_device(dev)
     if args.train_stream_priority > 0:
         raise SystemExit("train_stream_priority must be zero or negative")
@@ -956,62 +957,36 @@ def main():
             ent_hits = [now_ent[i] - ent_at[i] for i in range(8)]
             ent_at = now_ent
             bounds = (1, 4, 16, 64, 256, 1024, 4096, 16384, 65536)
-            if window_shapes:
-                a = np.asarray(window_shapes, np.uint32)
-                def pct(col, q):
-                    v = np.sort(a[:, col])
-                    return int(v[int(round((len(v) - 1) * q))])
-                shape = {
-                    names[i]: {
-                        "p50": pct(i, 0.50),
-                        "p90": pct(i, 0.90),
-                        "p99": pct(i, 0.99),
-                        "max": int(a[:, i].max()),
-                    }
-                    for i in range(8)
-                }
-                node_histogram = {}
-                stop_census = {}
-                for kind_id, kind in enumerate(warchest.SOLVE_KIND_NAMES):
-                    ka = a[a[:, 9] == kind_id]
-                    hist = {}
-                    for lo, hi in zip(bounds[:-1], bounds[1:]):
-                        hist[f"{lo}-{hi - 1}"] = int(
-                            ((ka[:, 0] >= lo) & (ka[:, 0] < hi)).sum())
-                    hist[f"{bounds[-1]}+"] = int((ka[:, 0] >= bounds[-1]).sum())
-                    node_histogram[kind] = hist
-                    stops = {}
-                    for stop_id, stop in enumerate(warchest.STOP_NAMES):
-                        nodes = ka[ka[:, 8] == stop_id, 0]
-                        if nodes.size:
-                            nodes.sort()
-                            stops[stop] = {
-                                "count": int(nodes.size),
-                                "node_p50": int(nodes[int(round(
-                                    (nodes.size - 1) * 0.5))]),
-                            }
-                    stop_census[kind] = stops
-            else:
-                shape = {n: {"p50": 0, "p90": 0, "p99": 0, "max": 0} for n in names}
-                empty_hist = {
-                    **{f"{lo}-{hi - 1}": 0
+            a = np.asarray(window_shapes or [[0] * 10], np.uint32)
+
+            def pct(column, q):
+                v = np.sort(column)
+                return int(v[int(round((len(v) - 1) * q))]) if v.size else 0
+
+            shape = {names[i]: {"p50": pct(a[:, i], 0.50), "p90": pct(a[:, i], 0.90),
+                                "p99": pct(a[:, i], 0.99), "max": int(a[:, i].max())}
+                     for i in range(8)}
+            node_histogram = {}
+            stop_census = {}
+            for kind_id, kind in enumerate(warchest.SOLVE_KIND_NAMES):
+                ka = a[a[:, 9] == kind_id] if window_shapes else a[:0]
+                node_histogram[kind] = {
+                    **{f"{lo}-{hi - 1}": int(((ka[:, 0] >= lo) & (ka[:, 0] < hi)).sum())
                        for lo, hi in zip(bounds[:-1], bounds[1:])},
-                    f"{bounds[-1]}+": 0,
+                    f"{bounds[-1]}+": int((ka[:, 0] >= bounds[-1]).sum()),
                 }
-                node_histogram = {
-                    k: dict(empty_hist) for k in warchest.SOLVE_KIND_NAMES}
-                stop_census = {k: {} for k in warchest.SOLVE_KIND_NAMES}
+                stop_census[kind] = {
+                    stop: {"count": int((ka[:, 8] == stop_id).sum()),
+                           "node_p50": pct(ka[ka[:, 8] == stop_id, 0], 0.5)}
+                    for stop_id, stop in enumerate(warchest.STOP_NAMES)
+                    if (ka[:, 8] == stop_id).any()}
             rec = {
                 "t": round(now - t0, 1),
                 "epoch": epoch,
                 "phase": "sog",
-                "games": int(window["games"]),
-                "white_wins": int(window["white_wins"]),
-                "black_wins": int(window["black_wins"]),
-                "draws": int(window["draws"]),
-                "decisions": int(window["decisions"]),
-                "rows": int(window["rows"]),
-                "solves": int(window["solves"]),
+                **{key: int(window[key]) for key in (
+                    "games", "white_wins", "black_wins", "draws", "decisions",
+                    "rows", "solves", "query_rows", "dropped")},
                 "loss": round(lv, 5),
                 "total_loss": round(lv + args.policy_w * policy["policy_loss"], 5),
                 "loss_old": round(diag["loss_old"], 5),
@@ -1029,8 +1004,6 @@ def main():
                 "rows_per_round": round(per_round["round_rows"], 1),
                 "device_ms_per_round": round(
                     1e-6 * per_round["round_nanos"], 2),
-                "query_rows": int(window["query_rows"]),
-                "dropped": int(window["dropped"]),
                 "plays": {
                     name: int(window[f"plays_{name}"])
                     for name in (

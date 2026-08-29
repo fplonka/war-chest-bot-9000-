@@ -103,6 +103,10 @@ macro_rules! launch {
     }};
 }
 
+macro_rules! carved {
+    ($($name:ident),* $(,)?) => { $( let $name = $name.buf.as_mut().expect("carved"); )* };
+}
+
 const THREADS: u32 = 256;
 
 fn spread(n: usize) -> LaunchConfig {
@@ -629,20 +633,14 @@ impl Device {
     }
 
     pub fn run(&self, calls: &[Call], lane: usize) -> Option<Vec<Reply>> {
-        let all: Vec<usize> = (0..calls.len()).collect();
-        match self.cards[lane].round(calls, &all) {
-            Ok(part) => {
-                let mut out: Vec<Reply> = (0..calls.len()).map(|_| Reply::default()).collect();
-                for (i, reply) in part {
-                    out[i] = reply;
-                }
-                Some(out)
-            }
-            Err(e) => {
-                eprintln!("cuda: lane {lane}: {e}");
-                None
-            }
+        let answered = self.cards[lane].round(calls).inspect_err(|e| {
+            eprintln!("cuda: lane {lane}: {e}");
+        });
+        let mut out: Vec<Reply> = (0..calls.len()).map(|_| Reply::default()).collect();
+        for (i, reply) in answered.ok()? {
+            out[i] = reply;
         }
+        Some(out)
     }
 
     pub fn resident(&self, card: usize, solve: usize) -> Res<Resident> {
@@ -653,17 +651,17 @@ impl Device {
         let s = g.get(solve).ok_or_else(|| format!("solve {solve} is not resident"))?;
         let mut h = c.down_f.lock();
         Ok(Resident {
-            p: s.get_f32(&c.stream, Ent::Board, B_P, 0, s.ent[Ent::Board as usize].len() * D, &mut h)?,
-            jp: s.get_f32(&c.stream, Ent::Board, B_JP, 0, s.ent[Ent::Board as usize].len() * JW, &mut h)?,
-            f: s.get_f32(&c.stream, Ent::Config, G_F, 0, s.ent[Ent::Config as usize].len() * D, &mut h)?,
-            g: s.get_f32(&c.stream, Ent::Config, G_G, 0, s.ent[Ent::Config as usize].len() * POOL, &mut h)?,
-            fp: s.get_f32(&c.stream, Ent::Config, G_FP, 0, s.ent[Ent::Config as usize].len() * D, &mut h)?,
-            prior: s.get_f32(&c.stream, Ent::Cell, C_PRIOR, 0, s.ent[Ent::Cell as usize].len(), &mut h)?,
-            cur: s.get_f32(&c.stream, Ent::Cell, C_CUR, 0, s.ncells, &mut h)?,
-            sum: s.get_f32(&c.stream, Ent::Cell, C_SUM, 0, s.ncells, &mut h)?,
-            qval: s.get_f32(&c.stream, Ent::Cell, C_QVAL, 0, s.ncells, &mut h)?,
-            visits: s.get_f32(&c.stream, Ent::Cell, C_VISITS, 0, s.ncells, &mut h)?,
-            reach: s.get_f32(&c.stream, Ent::Reach, R_REACH, 0, s.nreach, &mut h)?,
+            p: s.ent[Ent::Board as usize].get_f32(&c.stream, B_P, 0, s.ent[Ent::Board as usize].len() * D, &mut h)?,
+            jp: s.ent[Ent::Board as usize].get_f32(&c.stream, B_JP, 0, s.ent[Ent::Board as usize].len() * JW, &mut h)?,
+            f: s.ent[Ent::Config as usize].get_f32(&c.stream, G_F, 0, s.ent[Ent::Config as usize].len() * D, &mut h)?,
+            g: s.ent[Ent::Config as usize].get_f32(&c.stream, G_G, 0, s.ent[Ent::Config as usize].len() * POOL, &mut h)?,
+            fp: s.ent[Ent::Config as usize].get_f32(&c.stream, G_FP, 0, s.ent[Ent::Config as usize].len() * D, &mut h)?,
+            prior: s.ent[Ent::Cell as usize].get_f32(&c.stream, C_PRIOR, 0, s.ent[Ent::Cell as usize].len(), &mut h)?,
+            cur: s.ent[Ent::Cell as usize].get_f32(&c.stream, C_CUR, 0, s.ncells, &mut h)?,
+            sum: s.ent[Ent::Cell as usize].get_f32(&c.stream, C_SUM, 0, s.ncells, &mut h)?,
+            qval: s.ent[Ent::Cell as usize].get_f32(&c.stream, C_QVAL, 0, s.ncells, &mut h)?,
+            visits: s.ent[Ent::Cell as usize].get_f32(&c.stream, C_VISITS, 0, s.ncells, &mut h)?,
+            reach: s.ent[Ent::Reach as usize].get_f32(&c.stream, R_REACH, 0, s.nreach, &mut h)?,
         })
     }
 }
@@ -926,7 +924,9 @@ impl Card {
         Ok(())
     }
 
-    fn round(&self, calls: &[Call], mine: &[usize]) -> Res<Vec<(usize, Reply)>> {
+    fn round(&self, calls: &[Call]) -> Res<Vec<(usize, Reply)>> {
+        let mine: Vec<usize> = (0..calls.len()).collect();
+        let mine = &mine[..];
         let _busy = self.busy.lock();
         self.stream.context().bind_to_thread().map_err(err)?;
         let mut slots: Vec<usize> = mine.iter().map(|&i| calls[i].solve()).collect();
@@ -1158,16 +1158,7 @@ impl Card {
         let Scratch {
             piles, tokens, projected, type_pool, loose, glob, facts, occupant, x, input, ..
         } = &mut *sc;
-        let piles = piles.buf.as_mut().unwrap();
-        let tokens = tokens.buf.as_mut().unwrap();
-        let projected = projected.buf.as_mut().unwrap();
-        let type_pool = type_pool.buf.as_mut().unwrap();
-        let loose = loose.buf.as_mut().unwrap();
-        let glob = glob.buf.as_mut().unwrap();
-        let facts = facts.buf.as_mut().unwrap();
-        let occupant = occupant.buf.as_mut().unwrap();
-        let x = x.buf.as_mut().unwrap();
-        let input = input.buf.as_mut().unwrap();
+        carved!(piles, tokens, projected, type_pool, loose, glob, facts, occupant, x, input);
 
         let (off, width) = (OFF_PILES as i32, (NTYPE * PILE_COUNTS) as i32);
         launch!(self, window, n * NTYPE * PILE_COUNTS, xpub, &mut *piles, &rows_i, &stride, &off, &width)?;
@@ -1357,13 +1348,9 @@ impl Card {
         sc.pooled.room(k * POOL)?;
         sc.z.room(k * D)?;
         let Scratch { tokens, projected, facts, h, pooled, z, bag, .. } = &mut *sc;
-        let slots = tokens.buf.as_mut().unwrap();
-        let hidden = projected.buf.as_mut().unwrap();
-        let u = facts.buf.as_mut().unwrap();
-        let f = h.buf.as_mut().unwrap();
-        let g = pooled.buf.as_mut().unwrap();
-        let fp = z.buf.as_mut().unwrap();
-        let bag = bag.buf.as_mut().unwrap();
+        carved!(tokens, projected, facts, h, pooled, z, bag);
+        let (slots, hidden, u) = (tokens, projected, facts);
+        let (f, g, fp) = (h, pooled, z);
         launch!(self, cfg_slots, k * NSLOT * width, phi, owner, cards, &mut *slots, &n_i, &nslot, &cfeat, &ntype, &type_i)?;
         self.run(l.cfg1, slots, k * NSLOT, &mut *hidden)?;
         let hid = (k * NSLOT * CFGH) as i32;
@@ -1403,27 +1390,21 @@ impl Card {
         if solves.is_empty() {
             return Ok(());
         }
-        let (mut part, mut node, mut row) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut act_at, mut cell_at, mut inv_t) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut act_node, mut desc, mut cells) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut nas, mut ncs) = (Vec::new(), Vec::new());
+        let (mut want, mut desc, mut cells): (Vec<(u32, u32, Prime)>, Vec<u32>, Vec<u32>) =
+            (Vec::new(), Vec::new(), Vec::new());
         for (p, &i) in mine.iter().filter(|&&i| !each(i).0.is_empty()).enumerate() {
             let (prime, a, c, temp) = each(i);
-            for q in prime {
-                act_node.extend(std::iter::repeat(node.len() as u32).take(q.na as usize));
-                part.push(p as u32);
-                node.push(q.node);
-                row.push(q.row);
-                act_at.push(desc.len() as u32 / crate::search::ACT_BYTES as u32 + q.at);
-                cell_at.push(cells.len() as u32 + q.cell_at);
-                inv_t.push((1.0f32 / temp.max(1e-6)).to_bits());
-                nas.push(q.na as usize);
-                ncs.push(q.nc);
-            }
+            let inv = (1.0f32 / temp.max(1e-6)).to_bits();
+            let at = (desc.len() / crate::search::ACT_BYTES) as u32;
+            let cell_at = cells.len() as u32;
+            want.extend(prime.iter().map(|q| {
+                let q = Prime { at: at + q.at, cell_at: cell_at + q.cell_at, ..*q };
+                (p as u32, inv, q)
+            }));
             desc.extend_from_slice(a);
             cells.extend_from_slice(c);
         }
-        let m = node.len();
+        let m = want.len();
         self.lay(&solves)?;
         let mut batch = self.batch.lock();
         let mut i = 0usize;
@@ -1431,36 +1412,37 @@ impl Card {
             let mut j = i;
             let mut na_c = 0usize;
             let mut wide = 0u32;
-            while j < m && (j - i) < TILE && na_c + nas[j] <= TILE {
-                na_c += nas[j];
-                wide = wide.max(ncs[j]);
+            while j < m && (j - i) < TILE && na_c + want[j].2.na as usize <= TILE {
+                na_c += want[j].2.na as usize;
+                wide = wide.max(want[j].2.nc);
                 j += 1;
             }
             if j == i {
-                na_c = nas[j];
-                wide = ncs[j];
+                na_c = want[j].2.na as usize;
+                wide = want[j].2.nc;
                 j = i + 1;
             }
-            let act0 = act_at[i] as usize;
-            let cell0 = cell_at[i] as usize;
-            let cell1 = if j < m { cell_at[j] as usize } else { cells.len() };
-            let act_at_r: Vec<u32> = act_at[i..j].iter().map(|x| x - act_at[i]).collect();
-            let cell_at_r: Vec<u32> = cell_at[i..j].iter().map(|x| x - cell_at[i]).collect();
-            let act_node_r: Vec<u32> = act_node[act0..act0 + na_c].iter().map(|x| x - i as u32).collect();
-            let mc = j - i;
+            let (act0, cell0) = (want[i].2.at as usize, want[i].2.cell_at as usize);
+            let cell1 = if j < m { want[j].2.cell_at as usize } else { cells.len() };
+            let col = |f: &dyn Fn(&(u32, u32, Prime)) -> u32| -> Vec<u32> {
+                want[i..j].iter().map(f).collect()
+            };
+            let act_node: Vec<u32> = (0..j - i)
+                .flat_map(|k| std::iter::repeat(k as u32).take(want[i + k].2.na as usize))
+                .collect();
             let flat: Vec<u32> = [
-                &part[i..j],
-                &node[i..j],
-                &row[i..j],
-                &act_at_r,
-                &cell_at_r,
-                &inv_t[i..j],
-                &act_node_r,
-                &desc[act0 * crate::search::ACT_BYTES..(act0 + na_c) * crate::search::ACT_BYTES],
-                &cells[cell0..cell1],
+                col(&|r| r.0),
+                col(&|r| r.2.node),
+                col(&|r| r.2.row),
+                col(&|r| r.2.at - want[i].2.at),
+                col(&|r| r.2.cell_at - want[i].2.cell_at),
+                col(&|r| r.1),
+                act_node,
+                desc[act0 * crate::search::ACT_BYTES..(act0 + na_c) * crate::search::ACT_BYTES].to_vec(),
+                cells[cell0..cell1].to_vec(),
             ]
             .concat();
-            self.prior_tile(&mut batch, &flat, mc, na_c, cell1 - cell0, wide)?;
+            self.prior_tile(&mut batch, &flat, j - i, na_c, cell1 - cell0, wide)?;
             i = j;
         }
         Ok(())
@@ -1495,12 +1477,9 @@ impl Card {
         sc.z.room(m * JW)?;
         sc.pooled.room((m * JW).max(m * AW))?;
         let Scratch { action, h, input, z: join_z, pooled, facts, .. } = &mut *sc;
-        let action_z = action.buf.as_mut().unwrap();
-        let hbuf = h.buf.as_mut().unwrap();
-        let board_proj = facts.buf.as_mut().unwrap();
-        let join_in = input.buf.as_mut().unwrap();
-        let join_z = join_z.buf.as_mut().unwrap();
-        let temp = pooled.buf.as_mut().unwrap();
+        carved!(action, h, facts, input, join_z, pooled);
+        let (action_z, hbuf, board_proj) = (action, h, facts);
+        let (join_in, temp) = (input, pooled);
         let kind = self.w.slice(l.act_kind..l.act_kind + crate::actions::N_KINDS * AW);
         let role = self.w.slice(l.act_role..l.act_role + 5 * AW);
         launch!(self, act_feats, na * AW, batch.trees.buf(), &part_d, &row_d,
@@ -1771,9 +1750,8 @@ impl Card {
                     let mut to = query_at[i];
                     for q in query {
                         if q.iter as usize == iter {
-                            solves[*solve].copy_f32_to(
+                            solves[*solve].ent[Ent::Reach as usize].copy_f32_to(
                                 &self.stream,
-                                Ent::Reach,
                                 R_REACH,
                                 q.reach as usize,
                                 dst,
@@ -1864,11 +1842,10 @@ impl Card {
             let s = &g[*solve];
             let mut root = Vec::new();
             for &(at, n) in vals_at {
-                root.extend(s.get_f32(&self.stream, Ent::Reach, R_VALS, at as usize, n as usize, &mut h)?);
+                root.extend(s.ent[Ent::Reach as usize].get_f32(&self.stream, R_VALS, at as usize, n as usize, &mut h)?);
             }
-            let policy = s.get_f32(
+            let policy = s.ent[Ent::Cell as usize].get_f32(
                 &self.stream,
-                Ent::Cell,
                 C_SUM,
                 policy_at.0 as usize,
                 policy_at.1 as usize,

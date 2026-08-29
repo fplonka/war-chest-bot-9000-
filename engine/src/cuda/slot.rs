@@ -299,7 +299,7 @@ impl Entity {
         stream.memcpy_dtod(&src.slice(from..from + n), &mut fview).map_err(err)
     }
 
-    fn copy_f32_to(
+    pub fn copy_f32_to(
         &self,
         stream: &Arc<CudaStream>,
         field: usize,
@@ -318,7 +318,7 @@ impl Entity {
         stream.memcpy_dtod(&src, &mut dst.slice_mut(to..to + n)).map_err(err)
     }
 
-    fn get_f32(
+    pub fn get_f32(
         &self,
         stream: &Arc<CudaStream>,
         field: usize,
@@ -474,31 +474,6 @@ impl Solve {
     pub fn plan(&mut self, s: &Arc<CudaStream>, d: Dst, at: usize, n: usize) -> Res<u64> {
         let (e, field, width) = dst_slot(d);
         self.view(s, e, field, at, n, width)
-    }
-
-    pub fn copy_f32_to(
-        &self,
-        s: &Arc<CudaStream>,
-        e: Ent,
-        field: usize,
-        at: usize,
-        dst: &mut CudaSlice<f32>,
-        to: usize,
-        n: usize,
-    ) -> Res<()> {
-        self.ent[e as usize].copy_f32_to(s, field, at, dst, to, n)
-    }
-
-    pub fn get_f32(
-        &self,
-        s: &Arc<CudaStream>,
-        e: Ent,
-        field: usize,
-        at: usize,
-        n: usize,
-        host: &mut Host<f32>,
-    ) -> Res<Vec<f32>> {
-        self.ent[e as usize].get_f32(s, field, at, n, host)
     }
 
     pub fn describe(&self, s: &Arc<CudaStream>) -> [u64; DESC] {

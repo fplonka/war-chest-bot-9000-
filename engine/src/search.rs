@@ -296,21 +296,26 @@ pub struct TNode {
 
 pub const NO_TRANS: u32 = u32::MAX;
 
+#[derive(Clone, Copy, Default)]
+pub struct Counts {
+    pub cells: usize,
+    pub cfgs: usize,
+    pub draws: usize,
+    pub boards: usize,
+    legal_off: usize,
+    rev_start: usize,
+    rvd_start: usize,
+    draw_start: usize,
+}
+
 #[derive(Clone, Copy)]
 struct Mark {
     nodes: usize,
-    ncells: usize,
-    ncfg: usize,
-    ndraws: usize,
     leaf_rows: usize,
-    nboards: usize,
     term_leaves: usize,
     leaf_coff: usize,
     leaf_cidx: usize,
-    nlegal_off: usize,
-    nrev_start: usize,
-    nrvd_start: usize,
-    ndraw_start: usize,
+    counts: Counts,
 }
 
 pub struct Solved {
@@ -358,36 +363,32 @@ impl TNode {
     }
 }
 
-thread_local! {
-    static CONFIG_POOL: std::cell::RefCell<Vec<Vec<f32>>> = const {
-        std::cell::RefCell::new(Vec::new())
-    };
-}
+struct Pool<T>(std::cell::RefCell<Vec<Vec<T>>>);
 
-thread_local! {
-    static NODE_POOL: std::cell::RefCell<Vec<Vec<TNode>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-fn pool_budget(cfg: &Cfg) -> usize {
-    32 * cfg.s as usize
-}
-
-fn take_nodes() -> Vec<TNode> {
-    NODE_POOL.with(|b| b.borrow_mut().pop().unwrap_or_default())
-}
-
-fn give_nodes(mut v: Vec<TNode>, budget: usize) {
-    if v.capacity() == 0 || v.capacity() > budget {
-        return;
+impl<T> Pool<T> {
+    const fn new() -> Pool<T> {
+        Pool(std::cell::RefCell::new(Vec::new()))
     }
-    v.clear();
-    NODE_POOL.with(|b| {
-        let mut b = b.borrow_mut();
-        if b.len() < 2 {
-            b.push(v);
+
+    fn take(&self) -> Vec<T> {
+        self.0.borrow_mut().pop().unwrap_or_default()
+    }
+
+    fn give(&self, mut v: Vec<T>, budget: usize) {
+        if v.capacity() == 0 || v.capacity() > budget {
+            return;
         }
-    });
+        v.clear();
+        let mut held = self.0.borrow_mut();
+        if held.len() < 2 {
+            held.push(v);
+        }
+    }
+}
+
+thread_local! {
+    static NODES: Pool<TNode> = const { Pool::new() };
+    static CONFIGS: Pool<f32> = const { Pool::new() };
 }
 
 #[derive(Default, Clone, Copy)]
@@ -457,22 +458,6 @@ fn sample_indices(rng: &mut Rng, n: usize, k: usize) -> Vec<usize> {
     out
 }
 
-fn take_config_buf() -> Vec<f32> {
-    CONFIG_POOL.with(|pool| pool.borrow_mut().pop().unwrap_or_default())
-}
-
-fn give_config_buf(v: Vec<f32>) {
-    if v.capacity() == 0 {
-        return;
-    }
-    CONFIG_POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
-        if pool.len() < 2 {
-            pool.push(v);
-        }
-    });
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum Phase {
     #[default]
@@ -508,14 +493,9 @@ pub struct Solver {
     pub avg: Vec<f32>,
     pub grown: Vec<u32>,
     pub(crate) avg_touched: [bool; 2],
-    pub ncells: usize,
+    pub counts: Counts,
     pub nreach: usize,
     pub nvals: usize,
-    pub ndraws: usize,
-    nlegal_off: usize,
-    nrev_start: usize,
-    nrvd_start: usize,
-    ndraw_start: usize,
     budget_hit: u8,
     wants_prior: Vec<u32>,
     pub(crate) steps: [usize; 2],
@@ -527,14 +507,12 @@ pub struct Solver {
     pub(crate) cphi: Vec<f32>,
     pub(crate) cplayer: Vec<u8>,
     pub(crate) cmap: std::collections::HashMap<u64, u32, KeyHash>,
-    pub ncfg: usize,
     batch_rows: usize,
     batch_boards: usize,
     batch_cfgs: usize,
     pub cards: Vec<f32>,
     pub(crate) board_of: Vec<u32>,
     bmap: std::collections::HashMap<u64, u32, KeyHash>,
-    pub nboards: usize,
     pub(crate) packed: Vec<u8>,
     abandon: bool,
     draw_scratch: DrawScratch,
@@ -556,8 +534,8 @@ const _: () = {
 
 impl Drop for Solver {
     fn drop(&mut self) {
-        give_config_buf(std::mem::take(&mut self.cphi));
-        give_nodes(std::mem::take(&mut self.nodes), pool_budget(&self.cfg));
+        CONFIGS.with(|p| p.give(std::mem::take(&mut self.cphi), usize::MAX));
+        NODES.with(|p| p.give(std::mem::take(&mut self.nodes), 32 * self.cfg.s as usize));
     }
 }
 
@@ -580,8 +558,8 @@ impl Solver {
         sv.rng = rng;
         sv.cfg = cfg;
         sv.root_belief = belief;
-        sv.nodes = take_nodes();
-        sv.cphi = take_config_buf();
+        sv.nodes = NODES.with(Pool::take);
+        sv.cphi = CONFIGS.with(Pool::take);
         sv.cmap = std::collections::HashMap::with_capacity_and_hasher(1024, KeyHash);
         sv.bmap = std::collections::HashMap::with_capacity_and_hasher(1024, KeyHash);
         sv.nodes.reserve(640);
@@ -680,9 +658,9 @@ impl Solver {
             self.leaf_rows.len().max(self.term_leaves.len())
         };
         let next_cell = if parent == crate::contract::NO_ROW {
-            self.ncells
+            self.counts.cells
         } else {
-            self.ncells.max(self.nodes.len())
+            self.counts.cells.max(self.nodes.len())
         };
         if !self.reserve(Ent::Node, self.nodes.len() + 1)
             || !self.reserve(Ent::Reach, self.nreach + c0 + c1)
@@ -700,7 +678,7 @@ impl Solver {
             nc: [c0 as u32, c1 as u32],
             roff: self.nreach as u32,
             voff: self.nvals as u32,
-            soff: self.ncells as u32,
+            soff: self.counts.cells as u32,
             row_of: u32::MAX,
             primed: false,
             util: if terminal { s.utility(player as usize) } else { 0.0 },
@@ -818,28 +796,23 @@ impl Solver {
     pub fn used(&self, e: Ent) -> usize {
         match e {
             Ent::Node => self.nodes.len(),
-            Ent::Cell => self.ncells.max(self.nodes.len().saturating_sub(1)),
+            Ent::Cell => self.counts.cells.max(self.nodes.len().saturating_sub(1)),
             Ent::Reach => self.nreach.max(self.nvals).max(self.reach_aux()),
-            Ent::Draw => self.ndraws,
+            Ent::Draw => self.counts.draws,
             Ent::Row => self.leaf_rows.len().max(self.term_leaves.len()),
-            Ent::Board => self.nboards,
-            Ent::Config => self.ncfg.max(self.rootb_len()),
+            Ent::Board => self.counts.boards,
+            Ent::Config => self.counts.cfgs.max(self.nodes.first().map_or(0, |n| {
+                (n.nc[0] as usize + n.nc[1] as usize).div_ceil(2)
+            })),
             Ent::Cidx => self.leaf_cidx.len(),
         }
     }
 
     fn reach_aux(&self) -> usize {
-        self.nlegal_off
-            .max(self.nrev_start)
-            .max(self.nrvd_start)
-            .max(self.ndraw_start)
-    }
-
-    fn rootb_len(&self) -> usize {
-        match self.nodes.first() {
-            Some(n) => (n.nc[0] as usize + n.nc[1] as usize).div_ceil(2),
-            None => 0,
-        }
+        self.counts.legal_off
+            .max(self.counts.rev_start)
+            .max(self.counts.rvd_start)
+            .max(self.counts.draw_start)
     }
 
     pub fn stop_reason(&self) -> u32 {
@@ -878,18 +851,11 @@ impl Solver {
     fn mark(&self) -> Mark {
         Mark {
             nodes: self.nodes.len(),
-            ncells: self.ncells,
-            ncfg: self.ncfg,
-            ndraws: self.ndraws,
             leaf_rows: self.leaf_rows.len(),
-            nboards: self.nboards,
             term_leaves: self.term_leaves.len(),
             leaf_coff: self.leaf_coff.len(),
             leaf_cidx: self.leaf_cidx.len(),
-            nlegal_off: self.nlegal_off,
-            nrev_start: self.nrev_start,
-            nrvd_start: self.nrvd_start,
-            ndraw_start: self.ndraw_start,
+            counts: self.counts,
         }
     }
 
@@ -903,21 +869,14 @@ impl Solver {
         self.wants_prior.retain(|&i| (i as usize) < m.nodes);
         self.leaf_rows.truncate(m.leaf_rows);
         self.board_of.truncate(m.leaf_rows);
-        self.nboards = m.nboards;
-        self.bmap.retain(|_, &mut b| (b as usize) < m.nboards);
+        self.bmap.retain(|_, &mut b| (b as usize) < m.counts.boards);
         self.term_leaves.truncate(m.term_leaves);
         self.leaf_coff.truncate(m.leaf_coff);
         self.leaf_cidx.truncate(m.leaf_cidx);
-        self.cur.truncate(m.ncells);
-        self.ncells = m.ncells;
-        self.ndraws = m.ndraws;
-        self.cplayer.truncate(m.ncfg);
-        self.cmap.retain(|_, &mut i| (i as usize) < m.ncfg);
-        self.ncfg = m.ncfg;
-        self.nlegal_off = m.nlegal_off;
-        self.nrev_start = m.nrev_start;
-        self.nrvd_start = m.nrvd_start;
-        self.ndraw_start = m.ndraw_start;
+        self.cur.truncate(m.counts.cells);
+        self.cplayer.truncate(m.counts.cfgs);
+        self.cmap.retain(|_, &mut i| (i as usize) < m.counts.cfgs);
+        self.counts = m.counts;
         self.grown.retain(|&g| (g as usize) < m.nodes && g != id as u32);
         let n = &mut self.nodes[id];
         n.leaf = true;
@@ -942,8 +901,8 @@ impl Solver {
 
     fn alloc_cells(&mut self, id: usize) {
         let cells = self.nodes[id].legal_action.len();
-        self.nodes[id].soff = self.ncells as u32;
-        self.ncells += cells;
+        self.nodes[id].soff = self.counts.cells as u32;
+        self.counts.cells += cells;
         let n = &self.nodes[id];
         let nc = n.nc[n.player as usize] as usize;
         let mut u = vec![0.0f32; cells];
@@ -1015,16 +974,16 @@ impl Solver {
             let n = &mut self.nodes[id];
             n.chance = true;
             n.child = vec![ch];
-            if !self.reserve(Ent::Draw, self.ndraws + draw.len())
-                || !self.reserve(Ent::Reach, self.nrvd_start + extra_rvd)
-                || !self.reserve(Ent::Reach, self.ndraw_start + extra_draw_start)
+            if !self.reserve(Ent::Draw, self.counts.draws + draw.len())
+                || !self.reserve(Ent::Reach, self.counts.rvd_start + extra_rvd)
+                || !self.reserve(Ent::Reach, self.counts.draw_start + extra_draw_start)
             {
                 self.rewind(id, mark);
                 return;
             }
-            self.ndraws += draw.len();
-            self.ndraw_start += extra_draw_start;
-            self.nrvd_start += extra_rvd;
+            self.counts.draws += draw.len();
+            self.counts.draw_start += extra_draw_start;
+            self.counts.rvd_start += extra_rvd;
             let n = &mut self.nodes[id];
             n.draw = draw;
             n.draw_steps = steps;
@@ -1148,21 +1107,21 @@ impl Solver {
         n.cell_row = cell_row;
         if !self.reserve(
             Ent::Cell,
-            (self.ncells + extra_cells).max(self.nodes.len().saturating_sub(1)),
-        ) || !self.reserve(Ent::Reach, self.nlegal_off + extra_legal)
-            || !self.reserve(Ent::Reach, self.nrev_start + extra_rev)
+            (self.counts.cells + extra_cells).max(self.nodes.len().saturating_sub(1)),
+        ) || !self.reserve(Ent::Reach, self.counts.legal_off + extra_legal)
+            || !self.reserve(Ent::Reach, self.counts.rev_start + extra_rev)
         {
             self.rewind(id, mark);
             return;
         }
-        self.nlegal_off += extra_legal;
-        self.nrev_start += extra_rev;
+        self.counts.legal_off += extra_legal;
+        self.counts.rev_start += extra_rev;
         self.alloc_cells(id);
         self.grown.push(id as u32);
     }
 
     fn encode(&mut self, s: &State) -> u32 {
-        let at = self.nboards * ROW_BYTES;
+        let at = self.counts.boards * ROW_BYTES;
         if self.packed.len() < at + ROW_BYTES {
             self.packed.resize(at + 128 * ROW_BYTES, 0);
         }
@@ -1174,12 +1133,12 @@ impl Solver {
                 return b;
             }
         }
-        if !self.reserve(Ent::Board, self.nboards + 1) {
+        if !self.reserve(Ent::Board, self.counts.boards + 1) {
             return 0;
         }
-        let b = self.nboards as u32;
+        let b = self.counts.boards as u32;
         self.bmap.insert(key, b);
-        self.nboards += 1;
+        self.counts.boards += 1;
         b
     }
 
@@ -1214,11 +1173,11 @@ impl Solver {
         if let Some(&i) = self.cmap.get(&key) {
             return i;
         }
-        if !self.reserve(Ent::Config, self.ncfg + 1) {
+        if !self.reserve(Ent::Config, self.counts.cfgs + 1) {
             return 0;
         }
-        let i = self.ncfg as u32;
-        self.ncfg += 1;
+        let i = self.counts.cfgs as u32;
+        self.counts.cfgs += 1;
         let at = i as usize * CFEAT;
         if self.cphi.len() < at + CFEAT {
             self.cphi.resize(at + 64 * CFEAT, 0.0);
@@ -1233,24 +1192,24 @@ impl Solver {
 
     fn growth_calls(&mut self) -> Vec<Call> {
         let rows = self.leaf_rows.len();
-        if rows == self.batch_rows && self.ncfg == self.batch_cfgs {
+        if rows == self.batch_rows && self.counts.cfgs == self.batch_cfgs {
             return Vec::new();
         }
         if self.net.is_empty() {
             self.batch_rows = rows;
-            self.batch_cfgs = self.ncfg;
+            self.batch_cfgs = self.counts.cfgs;
             return Vec::new();
         }
         let mut calls = Vec::with_capacity(2);
         let fresh_rows = rows - self.batch_rows;
-        let fresh_cfgs = self.ncfg - self.batch_cfgs;
+        let fresh_cfgs = self.counts.cfgs - self.batch_cfgs;
         if self.cards.is_empty() && (fresh_rows > 0 || fresh_cfgs > 0) {
             let (me, other) = (self.ctx.slots[0], self.ctx.slots[1]);
             self.net.cards(&[me, other, other, me].concat(), &mut self.cards);
         }
         if fresh_rows > 0 {
             let at = self.batch_boards * ROW_BYTES;
-            let end = self.nboards * ROW_BYTES;
+            let end = self.counts.boards * ROW_BYTES;
             let q0 = 2 * self.batch_rows;
             let cs = self.leaf_coff[q0] as usize;
             let mut coff: Vec<u32> = self.leaf_coff[q0..].iter().map(|x| x - cs as u32).collect();
@@ -1261,7 +1220,7 @@ impl Solver {
                 queries: fresh_rows,
                 board_of: self.board_of[self.batch_rows..].to_vec(),
                 boards_at: self.batch_boards,
-                boards: self.nboards - self.batch_boards,
+                boards: self.counts.boards - self.batch_boards,
                 packed: self.packed[at..end].to_vec(),
                 cards: self.cards.clone(),
                 cidx: self.leaf_cidx[cs..].to_vec(),
@@ -1272,7 +1231,7 @@ impl Solver {
             calls.push(Call::Configs {
                 solve: self.slot,
                 at: self.batch_cfgs,
-                phi: self.cphi[self.batch_cfgs * CFEAT..self.ncfg * CFEAT].to_vec(),
+                phi: self.cphi[self.batch_cfgs * CFEAT..self.counts.cfgs * CFEAT].to_vec(),
                 owner: self.cplayer[self.batch_cfgs..].iter().map(|&p| p as u32).collect(),
                 cards: self.cards.clone(),
                 n: fresh_cfgs,
@@ -1284,9 +1243,9 @@ impl Solver {
     fn absorb(&mut self) {
         if self.leaf_rows.len() > self.batch_rows {
             self.batch_rows = self.leaf_rows.len();
-            self.batch_boards = self.nboards;
+            self.batch_boards = self.counts.boards;
         }
-        self.batch_cfgs = self.batch_cfgs.max(self.ncfg);
+        self.batch_cfgs = self.batch_cfgs.max(self.counts.cfgs);
     }
 
     fn expansions_at(&self, i: usize) -> usize {
@@ -1421,7 +1380,7 @@ impl Solver {
     fn tree_call(&mut self) -> Call {
         self.contract_extend();
         let sent = self.sent_cells;
-        self.sent_cells = self.ncells;
+        self.sent_cells = self.counts.cells;
         let first = self.steps[0] == 0 && self.sent_from == 0;
         if first {
             self.sent = Default::default();
@@ -1450,7 +1409,7 @@ impl Solver {
             solve: self.slot,
             writes: w,
             fresh: first,
-            ncells: self.ncells,
+            ncells: self.counts.cells,
             nreach: self.nreach,
             nvals: self.nvals,
             levels: self.contract.level_start.clone(),

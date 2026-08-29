@@ -426,29 +426,21 @@ impl DrawScratch {
                 self.deal(&bag, k, *c);
             } else {
                 let mut base = *c;
+                base.fd = [0; NSLOT];
                 for s in 0..NSLOT {
                     base.hand[s] += bag[s];
                 }
-                let mut r = [0u8; NSLOT];
-                for s in 0..NSLOT {
-                    r[s] = faceup[s] + c.fd[s];
-                }
-                let rt: u32 = r.iter().map(|&x| x as u32).sum();
+                let refill: [u8; NSLOT] = std::array::from_fn(|s| faceup[s] + c.fd[s]);
+                let total: u32 = refill.iter().map(|&x| x as u32).sum();
                 let left = k - b;
-                if rt == 0 {
+                if total > left {
+                    self.deal(&refill, left, base);
+                } else {
+                    for s in 0..NSLOT {
+                        base.hand[s] += refill[s];
+                    }
                     self.kid.push(base);
                     self.prob.push(1.0);
-                } else {
-                    base.fd = [0; NSLOT];
-                    if rt <= left {
-                        for s in 0..NSLOT {
-                            base.hand[s] += r[s];
-                        }
-                        self.kid.push(base);
-                        self.prob.push(1.0);
-                    } else {
-                        self.deal(&r, left, base);
-                    }
                 }
             }
             map.start.push(self.kid.len() as u32);

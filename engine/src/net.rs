@@ -139,73 +139,47 @@ impl Default for NetLayout {
 impl NetLayout {
     pub fn new() -> Self {
         let mut c = Cursor::default();
-        let card = [c.lin(CARD_FEATS, TYPE, true), c.lin(TYPE, TYPE, true)];
-        let pile = c.lin(PILE_COUNTS, TYPE, false);
-        let seat = c.embed(2 * TYPE);
-        let hex_stem = c.lin(HEX_FACTS, C, true);
-        let tok_stem = c.lin(TYPE, C, false);
-        let pos = c.embed(N_HEXES * C);
-        let glob_stem = c.lin(LOOSE, C, false);
-        let blocks = std::array::from_fn(|_| BlockSpan {
-            mix: c.lin(2 * C, C, true),
-            pool: c.lin(2 * C, C, true),
-            out: c.lin(C, C, true),
-        });
-        let board_out = c.lin(2 * C + LOOSE, D, true);
-        let cfg1 = c.lin(3 + TYPE, CFGH, true);
-        let cfg_f = c.lin(CFGH, D, true);
-        let cfg_g = c.lin(CFGH, POOL, true);
-        let cfg_m = c.lin(TYPE, 3 * POOL, false);
-        let cfg_p = c.lin(CFGH, D, true);
-        let act_kind = c.embed(N_KINDS * AW);
-        let act_role = c.embed(5 * AW);
-        let act_board = c.lin(D, AW, false);
-        let act_out = c.lin(AW, D, true);
-        let join_p = c.lin(D, JW, false);
-        let join_b = c.lin(JOIN_IN, JW, true);
-        let join_w = std::array::from_fn(|_| c.lin(JW, JW, true));
-        let join_out = c.lin(JW, D, true);
-        let act_h = c.lin(D, AW, false);
-        let value_bias = c.b;
-        c.b += 1;
-        let norms = norm_widths()
-            .into_iter()
-            .map(|width| {
-                let s = NormSpan {
-                    g: c.ln,
-                    b: c.ln + width,
-                    width,
-                };
-                c.ln += 2 * width;
-                s
-            })
-            .collect();
         Self {
-            card,
-            pile,
-            seat,
-            hex_stem,
-            tok_stem,
-            pos,
-            glob_stem,
-            blocks,
-            board_out,
-            cfg1,
-            cfg_f,
-            cfg_g,
-            cfg_m,
-            cfg_p,
-            act_kind,
-            act_role,
-            act_board,
-            act_h,
-            act_out,
-            join_p,
-            join_b,
-            join_w,
-            join_out,
-            value_bias,
-            norms,
+            card: [c.lin(CARD_FEATS, TYPE, true), c.lin(TYPE, TYPE, true)],
+            pile: c.lin(PILE_COUNTS, TYPE, false),
+            seat: c.embed(2 * TYPE),
+            hex_stem: c.lin(HEX_FACTS, C, true),
+            tok_stem: c.lin(TYPE, C, false),
+            pos: c.embed(N_HEXES * C),
+            glob_stem: c.lin(LOOSE, C, false),
+            blocks: std::array::from_fn(|_| BlockSpan {
+                mix: c.lin(2 * C, C, true),
+                pool: c.lin(2 * C, C, true),
+                out: c.lin(C, C, true),
+            }),
+            board_out: c.lin(2 * C + LOOSE, D, true),
+            cfg1: c.lin(3 + TYPE, CFGH, true),
+            cfg_f: c.lin(CFGH, D, true),
+            cfg_g: c.lin(CFGH, POOL, true),
+            cfg_m: c.lin(TYPE, 3 * POOL, false),
+            cfg_p: c.lin(CFGH, D, true),
+            act_kind: c.embed(N_KINDS * AW),
+            act_role: c.embed(5 * AW),
+            act_board: c.lin(D, AW, false),
+            act_out: c.lin(AW, D, true),
+            join_p: c.lin(D, JW, false),
+            join_b: c.lin(JOIN_IN, JW, true),
+            join_w: std::array::from_fn(|_| c.lin(JW, JW, true)),
+            join_out: c.lin(JW, D, true),
+            act_h: c.lin(D, AW, false),
+            value_bias: {
+                let at = c.b;
+                c.b += 1;
+                at
+            },
+            norms: norm_widths()
+                .into_iter()
+                .map(|width| {
+                    let s = NormSpan { g: c.ln, b: c.ln + width, width };
+                    c.ln += 2 * width;
+                    s
+                })
+                .collect(),
             w_len: c.w,
             b_len: c.b,
             ln_len: c.ln,
