@@ -1095,8 +1095,8 @@ def main():
                 save_progress()
                 break
             if now >= next_target:
-                # `push` bumps the version the farm watches; its threads
-                # pick the new weights up at their next chunk.
+                # The next collect finishes every old-target solve before it
+                # resumes the same game streams on these weights.
                 value.push()
                 target_state = cpu_state(value)
                 if len(buf) >= 2048:

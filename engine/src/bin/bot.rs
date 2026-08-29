@@ -60,22 +60,12 @@ fn options() -> Result<Options, String> {
 }
 
 fn brain(o: &Options) -> Result<Brain, String> {
-    let device = devices(o, o.mind, o.cfg)?;
-    let mut net = Net::default();
-    let cards = match device {
-        Some(device) => {
-            net = device.net().clone();
-            Some(Arc::new(Cards::new(device)))
-        }
-        None if matches!(o.mind, Mind::Sog) => unreachable!("SoG always has a device"),
-        None => None,
+    let net = match o.mind {
+        Mind::Sog => Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?,
+        _ => Net::default(),
     };
-    Ok(Brain {
-        mind: o.mind,
-        net: Arc::new(net),
-        cfg: o.cfg,
-        cards,
-    })
+    let cards = devices(o, o.mind, o.cfg, &net)?.map(|d| Arc::new(Cards::new(d)));
+    Ok(Brain { mind: o.mind, net: Arc::new(net), cfg: o.cfg, cards })
 }
 
 /// Every live game. A game is taken out of the table while it is being worked
@@ -196,7 +186,7 @@ fn main() {
 }
 
 /// Use only the devices assigned by the referee.
-fn devices(o: &Options, mind: Mind, cfg: Cfg) -> Result<Option<Device>, String> {
+fn devices(o: &Options, mind: Mind, cfg: Cfg, net: &Net) -> Result<Option<Device>, String> {
     if !matches!(mind, Mind::Sog) {
         return Ok(None);
     }
@@ -213,6 +203,5 @@ fn devices(o: &Options, mind: Mind, cfg: Cfg) -> Result<Option<Device>, String> 
                 .map_err(|_| format!("invalid device {name}"))
         })
         .collect();
-    let net = Net::load_bin(&o.weights).map_err(|e| format!("{}: {}", o.weights, e))?;
     Device::new(&ordinals?, net, cfg, usize::MAX).map(Some)
 }

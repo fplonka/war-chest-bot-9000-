@@ -124,7 +124,7 @@ fn shared_device() -> &'static Device {
     DEVICE.get_or_init(|| {
         Device::new(
             &[0],
-            random_net(0x9E37),
+            &random_net(0x9E37),
             Cfg { budget: Budget::for_s(512), ..Default::default() },
             GPU_SLOTS,
         )

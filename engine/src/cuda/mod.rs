@@ -253,7 +253,6 @@ pub struct Device {
     /// both cards of a GPU share one slot pool and pull from that queue.
     cards: Vec<Card>,
     n_gpus: usize,
-    net: Net,
     slot_bytes: usize,
 }
 
@@ -849,7 +848,7 @@ impl Device {
     /// `max_slots` is the host's cap across every ordinal: the farm has already
     /// asked how many host-side arenas fit, and a card that carved more than
     /// that would sit empty.
-    pub fn new(ordinals: &[usize], net: Net, cfg: Cfg, max_slots: usize) -> Res<Device> {
+    pub fn new(ordinals: &[usize], net: &Net, cfg: Cfg, max_slots: usize) -> Res<Device> {
         if ordinals.is_empty() {
             return Err("no cuda device ordinals given".into());
         }
@@ -864,7 +863,7 @@ impl Device {
             let gpu = Gpu::get(o)?;
             gpu.ctx.bind_to_thread().map_err(err)?;
             let mut pair: Vec<Card> = (0..PIPELINE)
-                .map(|_| Card::on(&gpu, &net))
+                .map(|_| Card::on(&gpu, net))
                 .collect::<Res<_>>()?;
             let s0 = Arc::clone(&pair[0].stream);
             s0.context().bind_to_thread().map_err(err)?;
@@ -935,7 +934,7 @@ impl Device {
             left = left.saturating_sub(n);
             cards.extend(pair);
         }
-        Ok(Device { cards, n_gpus: ordinals.len(), net, slot_bytes })
+        Ok(Device { cards, n_gpus: ordinals.len(), slot_bytes })
     }
 
     /// How many GPUs a round can be spread over. Each has `PIPELINE` cards.
@@ -965,10 +964,6 @@ impl Device {
         } else {
             self.total_slots() / self.n_gpus
         }
-    }
-
-    pub fn net(&self) -> &Net {
-        &self.net
     }
 
     /// Expand packed public rows with the same kernel the trunk uses.
@@ -1011,7 +1006,7 @@ impl Device {
     /// touches three arrays. Nothing else about a card depends on the weights,
     /// and once a solve keeps state on the device the context cannot be torn
     /// down under it anyway.
-    pub fn set_weights(&mut self, net: Net) -> Res<()> {
+    pub(crate) fn set_weights(&mut self, net: &Net) -> Res<()> {
         if net.is_empty() {
             return Err("cannot publish empty weights to the device".into());
         }
@@ -1030,7 +1025,6 @@ impl Device {
             let owed = owed_by_the_join(&card.layout, &flat.b);
             card.stream.memcpy_htod(&owed, &mut card.owed).map_err(err)?;
         }
-        self.net = net;
         Ok(())
     }
 

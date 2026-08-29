@@ -18,7 +18,7 @@
 //! would exceed the budget is truncated rather than grown.
 
 use parking_lot::{Condvar, Mutex, RwLock};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -379,11 +379,16 @@ fn host_free() -> u64 {
     }
 }
 
+const OPEN: u8 = 0;
+const DRAINING: u8 = 1;
+const CLOSED: u8 = 2;
+
 /// A queue with parked consumers, closed once when the farm winds down.
 struct Queue<T> {
     q: Mutex<std::collections::VecDeque<T>>,
     ready: Condvar,
-    closed: AtomicBool,
+    /// Open, draining, or closed.
+    state: AtomicU8,
 }
 
 impl<T> Default for Queue<T> {
@@ -391,7 +396,7 @@ impl<T> Default for Queue<T> {
         Queue {
             q: Mutex::new(std::collections::VecDeque::new()),
             ready: Condvar::new(),
-            closed: AtomicBool::new(false),
+            state: AtomicU8::new(OPEN),
         }
     }
 }
@@ -409,7 +414,7 @@ impl<T> Queue<T> {
             if let Some(x) = q.pop_front() {
                 return Some(x);
             }
-            if self.closed.load(Ordering::Relaxed) {
+            if self.state.load(Ordering::Relaxed) == CLOSED {
                 return None;
             }
             self.ready.wait(&mut q);
@@ -424,20 +429,19 @@ impl<T> Queue<T> {
             if !q.is_empty() {
                 return q.drain(..).collect();
             }
-            if self.closed.load(Ordering::Relaxed) {
+            if self.state.load(Ordering::Relaxed) == CLOSED {
                 return Vec::new();
             }
             self.ready.wait(&mut q);
         }
     }
 
-    /// Wait until `wave` items are ready, then take that many. Leftover items
-    /// wake the other pipe. Empty once the queue is closed and empty.
+    /// Take a full wave, or the tail while the queue drains.
     fn drain_wave(&self, wave: usize) -> Vec<T> {
         let mut q = self.q.lock();
         loop {
             let n = q.len();
-            if n >= wave || (self.closed.load(Ordering::Relaxed) && n > 0) {
+            if n >= wave || self.state.load(Ordering::Relaxed) != OPEN && n > 0 {
                 let take = n.min(wave);
                 let out: Vec<T> = q.drain(..take).collect();
                 if !q.is_empty() {
@@ -445,21 +449,21 @@ impl<T> Queue<T> {
                 }
                 return out;
             }
-            if self.closed.load(Ordering::Relaxed) {
+            if self.state.load(Ordering::Relaxed) == CLOSED {
                 return Vec::new();
             }
             self.ready.wait(&mut q);
         }
     }
 
-    fn close(&self) {
+    fn state(&self, state: u8) {
         let _held = self.q.lock();
-        self.closed.store(true, Ordering::Relaxed);
+        self.state.store(state, Ordering::Relaxed);
         self.ready.notify_all();
     }
 
-    fn closed(&self) -> bool {
-        self.closed.load(Ordering::Relaxed)
+    fn close(&self) {
+        self.state(CLOSED);
     }
 }
 
@@ -490,31 +494,39 @@ pub enum Work {
 /// a loop — the solve it is waiting on belongs to the farm, not to a thread.
 enum Source {
     Play(GameStream),
-    /// Where in the corpus this job is, and its own random stream. Each job
-    /// starts at its own place and cycles from there, so the roots in flight
-    /// are a spread of the corpus at every moment of a bench and the same
-    /// spread between two builds.
-    Roots { at: usize, rng: crate::rng::Rng },
+    /// A fixed-root corpus cursor and its random stream.
+    Roots {
+        roots: Arc<Vec<(State, [Belief; 2])>>,
+        cfg: Cfg,
+        recursive_rate: f32,
+        at: usize,
+        rng: crate::rng::Rng,
+    },
 }
 
 impl Source {
     fn new(work: &Work, seed: u64, i: usize) -> Source {
         match work {
             Work::Play(gc) => Source::Play(GameStream::new(seed, *gc)),
-            Work::Roots { .. } => Source::Roots { at: i, rng: crate::rng::Rng::new(seed) },
+            Work::Roots { roots, cfg, recursive_rate } => Source::Roots {
+                roots: Arc::clone(roots),
+                cfg: *cfg,
+                recursive_rate: *recursive_rate,
+                at: i,
+                rng: crate::rng::Rng::new(seed),
+            },
         }
     }
 
     /// The next solve this source wants run.
-    fn next(&mut self, work: &Work, nets: &Arc<crate::net::Net>, out: &mut Data) -> Solver {
-        match (self, work) {
-            (Source::Play(stream), _) => stream.next_solve(nets, out),
-            (Source::Roots { at, rng }, Work::Roots { roots, cfg, recursive_rate }) => {
+    fn next(&mut self, nets: &Arc<crate::net::Net>, out: &mut Data) -> Solver {
+        match self {
+            Source::Play(stream) => stream.next_solve(nets, out),
+            Source::Roots { roots, cfg, recursive_rate, at, rng } => {
                 let (s, bel) = &roots[*at % roots.len()];
                 *at += 1;
                 crate::selfplay::query_solver(nets, *cfg, *recursive_rate, s, bel, rng)
             }
-            (Source::Roots { .. }, Work::Play(_)) => unreachable!("a source matches its work"),
         }
     }
 
@@ -566,14 +578,11 @@ pub struct Farm {
     device: Vec<Arc<Queue<(Job, Vec<Call>)>>>,
     /// Solves whose replies are in and whose host work wants a core.
     ready: Arc<Queue<Job>>,
-    /// Shared because every card evaluates against it, and locked because a
-    /// publish rewrites the weights under them.
     #[cfg(feature = "gpu")]
     cuda: Arc<RwLock<Device>>,
-    /// The copy a solve reads for the work it still does itself. Replaced
-    /// whole, so a solve that has started keeps the weights it started with.
     nets: Arc<RwLock<Arc<crate::net::Net>>>,
     collected: Arc<Mutex<Vec<Data>>>,
+    retired: Arc<Mutex<Vec<Job>>>,
     workers: Vec<JoinHandle<()>>,
     drivers: Vec<JoinHandle<()>>,
     stopping: Arc<AtomicBool>,
@@ -591,16 +600,15 @@ pub struct Stats {
     /// Time inside the backend. Against wall clock this says how much of a
     /// round is the batch and how much is everything around it.
     pub nanos: AtomicU64,
-    /// Slots this farm holds, and how many currently have a solve.
-    slots: AtomicU64,
-    used: AtomicU64,
+    /// Slots this farm holds. Steady-state farms fill all of them.
+    pub slots: u64,
     /// Solves that hit the budget. A slot is a percentile; this is the rate
     /// that argues with it.
     budget_hits: AtomicU64,
     /// Solves that hit each entity's cap, in `Ent::ALL` order.
     entity_hits: [AtomicU64; 8],
-    slot_bytes: AtomicU64,
-    slots_per_card: AtomicU64,
+    pub slot_bytes: u64,
+    pub slots_per_card: u64,
     /// Entity counts, stop reason, and solve kind for each finished solve.
     shapes: Mutex<Vec<[u32; 10]>>,
 }
@@ -608,19 +616,11 @@ pub struct Stats {
 impl Stats {
     fn new(slots: usize, slot_bytes: usize, slots_per_card: usize) -> Stats {
         Stats {
-            slots: AtomicU64::new(slots as u64),
-            slot_bytes: AtomicU64::new(slot_bytes as u64),
-            slots_per_card: AtomicU64::new(slots_per_card as u64),
+            slots: slots as u64,
+            slot_bytes: slot_bytes as u64,
+            slots_per_card: slots_per_card as u64,
             ..Default::default()
         }
-    }
-
-    pub fn slots(&self) -> u64 {
-        self.slots.load(Ordering::Relaxed)
-    }
-
-    pub fn used(&self) -> u64 {
-        self.used.load(Ordering::Relaxed)
     }
 
     pub fn budget_hits(&self) -> u64 {
@@ -629,14 +629,6 @@ impl Stats {
 
     pub fn entity_hits(&self) -> [u64; 8] {
         std::array::from_fn(|i| self.entity_hits[i].load(Ordering::Relaxed))
-    }
-
-    pub fn slot_bytes(&self) -> u64 {
-        self.slot_bytes.load(Ordering::Relaxed)
-    }
-
-    pub fn slots_per_card(&self) -> u64 {
-        self.slots_per_card.load(Ordering::Relaxed)
     }
 
     pub fn take_shapes(&self) -> Vec<[u32; 10]> {
@@ -649,7 +641,7 @@ impl Farm {
     /// slot. A slot is allocated at the budget; there is nothing to admit
     /// against after that.
     #[cfg(feature = "gpu")]
-    pub fn new(seed: u64, workers: usize, work: Work, cuda: Device) -> Farm {
+    pub fn new(seed: u64, workers: usize, work: Work, net: Arc<Net>, cuda: Device) -> Farm {
         assert!(workers > 0, "a farm needs at least one worker");
         let gpus = cuda.cards();
         let pipes = crate::cuda::PIPELINE;
@@ -657,25 +649,40 @@ impl Farm {
         let n_slots: usize = per_gpu.iter().sum();
         let slot_bytes = cuda.slot_bytes();
         let slots_per_card = cuda.slots_per_card();
-        let work = Arc::new(work);
-        let nets = Arc::new(RwLock::new(Arc::new(cuda.net().clone())));
+        let nets = Arc::new(RwLock::new(Arc::clone(&net)));
         let ready = Arc::new(Queue::default());
         let device: Vec<Arc<Queue<(Job, Vec<Call>)>>> =
             (0..gpus).map(|_| Arc::new(Queue::default())).collect();
         let collected = Arc::new(Mutex::new(Vec::new()));
+        let retired = Arc::new(Mutex::new(Vec::new()));
         let stopping = Arc::new(AtomicBool::new(false));
         let broken = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(Stats::new(n_slots, slot_bytes, slots_per_card));
         let cuda = Arc::new(RwLock::new(cuda));
 
+        for g in 0..gpus {
+            let card_seed = seed.wrapping_mul(0x9E37_79B9) ^ g as u64;
+            for slot in 0..per_gpu[g] {
+                let mut source = Source::new(
+                    &work,
+                    card_seed ^ (slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                    slot * gpus + g,
+                );
+                let mut data = Data::default();
+                let mut solver = source.next(&net, &mut data);
+                solver.pin(slot);
+                ready.push(Job { source, solver, card: g, slot, replies: Vec::new(), data });
+            }
+        }
+
         let hands: Vec<JoinHandle<()>> = (0..workers)
             .map(|t| {
-                let (ready, device, nets, collected, work, stopping, stats) = (
+                let (ready, device, nets, collected, retired, stopping, stats) = (
                     Arc::clone(&ready),
                     device.clone(),
                     Arc::clone(&nets),
                     Arc::clone(&collected),
-                    Arc::clone(&work),
+                    Arc::clone(&retired),
                     Arc::clone(&stopping),
                     Arc::clone(&stats),
                 );
@@ -684,7 +691,7 @@ impl Farm {
                     .spawn(move || {
                         while let Some(job) = ready.pop() {
                             advance_job(
-                                job, &device, &nets, &work, &collected, &stopping, &stats,
+                                job, &device, &nets, &collected, &retired, &stopping, &stats,
                             );
                         }
                     })
@@ -695,27 +702,19 @@ impl Farm {
         let mut drivers = Vec::with_capacity(gpus * pipes);
         for g in 0..gpus {
             for p in 0..pipes {
-                let (queue, ready, cuda, nets, work, stats, broken) = (
+                let (queue, ready, cuda, stats, broken) = (
                     Arc::clone(&device[g]),
                     Arc::clone(&ready),
                     Arc::clone(&cuda),
-                    Arc::clone(&nets),
-                    Arc::clone(&work),
                     Arc::clone(&stats),
                     Arc::clone(&broken),
                 );
-                let n = per_gpu[g];
-                let seed = seed.wrapping_mul(0x9E37_79B9) ^ g as u64 ^ (p as u64) << 32;
                 let lane = g * pipes + p;
+                let wave = per_gpu[g].div_ceil(pipes.max(1));
                 drivers.push(
                     std::thread::Builder::new()
                         .name(format!("card-{g}.{p}"))
-                        .spawn(move || {
-                            drive_card(
-                                g, lane, gpus, n, p == 0, n.div_ceil(pipes.max(1)), seed,
-                                &queue, &ready, &cuda, &nets, &work, &stats, &broken,
-                            )
-                        })
+                        .spawn(move || drive_card(lane, wave, &queue, &ready, &cuda, &stats, &broken))
                         .expect("spawn driver thread"),
                 );
             }
@@ -727,6 +726,7 @@ impl Farm {
             cuda,
             nets,
             collected,
+            retired,
             workers: hands,
             drivers,
             stopping,
@@ -735,13 +735,44 @@ impl Farm {
         }
     }
 
-    /// Install new weights in the device and in the copy a solve keeps for its
-    /// host-side work. The write lock waits for every round in flight, so no
-    /// round is evaluated against two different networks.
+    /// Finish the old-network solves, then resume their streams on `next`.
     #[cfg(feature = "gpu")]
-    pub fn publish(&mut self, net: Net) -> Result<(), String> {
-        self.cuda.write().set_weights(net.clone())?;
-        *self.nets.write() = Arc::new(net);
+    pub fn publish(&mut self, next: Arc<Net>) -> Result<(), String> {
+        if Arc::ptr_eq(&self.nets.read(), &next) {
+            return Ok(());
+        }
+        self.drain()?;
+        self.cuda.write().set_weights(&next)?;
+        *self.nets.write() = Arc::clone(&next);
+        let mut jobs = std::mem::take(&mut *self.retired.lock());
+        assert_eq!(jobs.len(), self.stats.slots as usize, "drain lost a game stream");
+        for job in &mut jobs {
+            job.solver = job.source.next(&next, &mut job.data);
+            job.solver.pin(job.slot);
+        }
+        for q in &self.device {
+            q.state(OPEN);
+        }
+        self.stopping.store(false, Ordering::Release);
+        for job in jobs {
+            self.ready.push(job);
+        }
+        Ok(())
+    }
+
+    fn drain(&self) -> Result<(), String> {
+        let gate = self.nets.write();
+        self.stopping.store(true, Ordering::Release);
+        drop(gate);
+        for q in &self.device {
+            q.state(DRAINING);
+        }
+        while self.retired.lock().len() != self.stats.slots as usize {
+            if self.broken() {
+                return Err("a card could not finish its solves".into());
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        }
         Ok(())
     }
 
@@ -782,16 +813,13 @@ impl Farm {
 
 impl Drop for Farm {
     fn drop(&mut self) {
-        // Close the host side first and let the cards answer whatever is still
-        // in their queues, so no worker is left parked on a round that will
-        // never come back.
-        self.stopping.store(true, Ordering::Relaxed);
+        let _ = self.drain();
         self.ready.close();
-        for w in self.workers.drain(..) {
-            let _ = w.join();
-        }
         for q in &self.device {
             q.close();
+        }
+        for w in self.workers.drain(..) {
+            let _ = w.join();
         }
         for d in self.drivers.drain(..) {
             let _ = d.join();
@@ -809,12 +837,12 @@ fn advance_job(
     mut job: Job,
     device: &[Arc<Queue<(Job, Vec<Call>)>>],
     nets: &RwLock<Arc<crate::net::Net>>,
-    work: &Work,
     collected: &Mutex<Vec<Data>>,
+    retired: &Mutex<Vec<Job>>,
     stopping: &AtomicBool,
     stats: &Stats,
 ) {
-    let mut replies = std::mem::take(&mut job.replies);
+    let replies = std::mem::take(&mut job.replies);
     loop {
         match job.solver.advance(&replies) {
             Step::Calls(calls) => return device[job.card].push((job, calls)),
@@ -835,14 +863,22 @@ fn advance_job(
                 stats.shapes.lock().push(census);
                 job.source.take(&job.solver, solved, &mut job.data);
                 collected.lock().push(std::mem::take(&mut job.data));
-                if stopping.load(Ordering::Relaxed) {
-                    stats.used.fetch_sub(1, Ordering::Relaxed);
+                let n = nets.read();
+                if stopping.load(Ordering::Acquire) {
+                    drop(n);
+                    retired.lock().push(job);
                     return;
                 }
-                let n = Arc::clone(&*nets.read());
-                job.solver = job.source.next(work, &n, &mut job.data);
+                job.solver = job.source.next(&n, &mut job.data);
                 job.solver.pin(job.slot);
-                replies = Vec::new();
+                let calls = match job.solver.advance(&[]) {
+                    Step::Calls(calls) => calls,
+                    Step::Done(_) => unreachable!("a fresh solve finishes without a round"),
+                };
+                let card = job.card;
+                device[card].push((job, calls));
+                drop(n);
+                return;
             }
         }
     }
@@ -850,41 +886,15 @@ fn advance_job(
 
 /// One card's rounds, and the solves that occupy its GPU's slots.
 #[cfg(feature = "gpu")]
-#[allow(clippy::too_many_arguments)]
 fn drive_card(
-    gpu: usize,
     lane: usize,
-    gpus: usize,
-    n_slots: usize,
-    seed_slots: bool,
     wave: usize,
-    seed: u64,
     queue: &Queue<(Job, Vec<Call>)>,
     ready: &Queue<Job>,
     cuda: &RwLock<Device>,
-    nets: &RwLock<Arc<crate::net::Net>>,
-    work: &Work,
     stats: &Stats,
     broken: &AtomicBool,
 ) {
-    if seed_slots {
-        for slot in 0..n_slots {
-            if ready.closed() {
-                break;
-            }
-            stats.used.fetch_add(1, Ordering::Relaxed);
-            let mut source = Source::new(
-                work,
-                seed ^ (slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-                slot * gpus + gpu,
-            );
-            let mut data = Data::default();
-            let n = Arc::clone(&*nets.read());
-            let mut solver = source.next(work, &n, &mut data);
-            solver.pin(slot);
-            ready.push(Job { source, solver, card: gpu, slot, replies: Vec::new(), data });
-        }
-    }
     loop {
         let batch = queue.drain_wave(wave);
         if batch.is_empty() {
@@ -1043,4 +1053,18 @@ impl Drop for Cards {
             let _ = d.join();
         }
     }
+}
+
+#[test]
+fn draining_releases_and_reopens_an_underfilled_wave() {
+    let q = Arc::new(Queue::default());
+    q.push(1);
+    let other = Arc::clone(&q);
+    let waiting = std::thread::spawn(move || other.drain_wave(2));
+    q.state(DRAINING);
+    assert_eq!(waiting.join().unwrap(), [1]);
+    q.state(OPEN);
+    q.push(2);
+    q.push(3);
+    assert_eq!(q.drain_wave(2), [2, 3]);
 }

@@ -495,14 +495,11 @@ use crate::selfplay::{run_static_games, Agent, Collect, Data, GameCfg};
 use numpy::{IntoPyArray, PyReadonlyArray1};
 use parking_lot::RwLock;
 use std::sync::{Arc, LazyLock};
-use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The live network. Empty until the trainer pushes weights: the
-/// phase plays with no network at all. One process holds one network — two
-/// checkpoints meet each other as two arena bots, not as two slots here.
+/// The next farm epoch's network. A live farm adopts it only after its old
+/// solves finish. Two checkpoints meet as two arena bots, not as two slots.
 static NETS: LazyLock<RwLock<Arc<Net>>> =
     LazyLock::new(|| RwLock::new(Arc::new(Net::default())));
-static NET_VERSION: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn nets() -> &'static RwLock<Arc<Net>> {
     &NETS
@@ -525,7 +522,6 @@ fn set_weights(
     let value = Net::from_flat(w.as_slice()?, b.as_slice()?, ln.as_slice()?)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
     *nets().write() = Arc::new(value);
-    NET_VERSION.fetch_add(1, Ordering::Release);
     Ok(())
 }
 
@@ -537,7 +533,6 @@ fn set_weights_bin(path: &str) -> PyResult<()> {
     let value = Net::load_bin(path)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}: {}", path, e)))?;
     *nets().write() = Arc::new(value);
-    NET_VERSION.fetch_add(1, Ordering::Release);
     Ok(())
 }
 
@@ -666,8 +661,6 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
 struct SolveFarm {
     #[cfg(feature = "gpu")]
     farm: Farm,
-    #[cfg(feature = "gpu")]
-    net_version: u64,
 }
 
 #[pymethods]
@@ -724,11 +717,10 @@ impl SolveFarm {
         };
         #[cfg(feature = "gpu")]
         {
-            let version = NET_VERSION.load(Ordering::Acquire);
-            let device = device_for(&devices, (**nets().read()).clone(), cfg)?;
+            let net = Arc::clone(&nets().read());
+            let device = device_for(&devices, &net, cfg)?;
             Ok(SolveFarm {
-                farm: Farm::new(seed, workers, work, device),
-                net_version: version,
+                farm: Farm::new(seed, workers, work, net, device),
             })
         }
         #[cfg(not(feature = "gpu"))]
@@ -751,13 +743,9 @@ impl SolveFarm {
                 ));
             }
             check_nets()?;
-            let version = NET_VERSION.load(Ordering::Acquire);
-            if self.net_version != version {
-                self.farm
-                    .publish((**nets().read()).clone())
-                    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
-                self.net_version = version;
-            }
+            self.farm
+                .publish(Arc::clone(&nets().read()))
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
             let d = py.allow_threads(|| self.farm.drive(solves));
             if self.farm.broken() {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -771,7 +759,7 @@ impl SolveFarm {
             // How well the batching is working: calls per round is how many solves
             // shared a forward pass.
             let s = self.farm.stats();
-            let read = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+            let read = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
             dict.set_item("rounds", read(&s.rounds))?;
             dict.set_item("round_calls", read(&s.calls))?;
             dict.set_item("round_rows", read(&s.rows))?;
@@ -779,10 +767,10 @@ impl SolveFarm {
             // What the population is, rather than what it is guessed to be: solves
             // in flight, what the host budget allowed at the last admission, and
             // the largest a solve has grown to in host bytes.
-            dict.set_item("slots", s.slots())?;
-            dict.set_item("slots_used", s.used())?;
-            dict.set_item("slots_per_card", s.slots_per_card())?;
-            dict.set_item("slot_bytes", s.slot_bytes())?;
+            dict.set_item("slots", s.slots)?;
+            dict.set_item("slots_used", s.slots)?;
+            dict.set_item("slots_per_card", s.slots_per_card)?;
+            dict.set_item("slot_bytes", s.slot_bytes)?;
             dict.set_item("budget_hits", s.budget_hits())?;
             dict.set_item("entity_hits", s.entity_hits())?;
             dict.set_item("shapes", s.take_shapes())?;
@@ -803,7 +791,7 @@ impl SolveFarm {
 #[cfg(feature = "gpu")]
 fn device_for(
     devices: &[usize],
-    value: crate::net::Net,
+    value: &crate::net::Net,
     cfg: Cfg,
 ) -> PyResult<crate::cuda::Device> {
     let max_slots = crate::farm::host_slots(cfg.budget);

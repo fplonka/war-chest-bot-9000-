@@ -456,9 +456,8 @@ impl Norm {
     }
 }
 
-/// The weights exactly as they arrived, for a backend that indexes them with
-/// `NetLayout` instead of unpacking them into layers. Shared, so cloning a
-/// `Net` — which happens on every publish — does not copy them.
+/// The weights exactly as they arrived, shared for backends that index them
+/// with `NetLayout` instead of unpacking them into layers.
 #[derive(Default)]
 pub struct Flat {
     pub w: Vec<f32>,
