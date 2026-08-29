@@ -11,12 +11,9 @@ use crate::search::{Budget, Cfg, Cfr, Ent};
 use crate::selfplay::{run_static_games, Agent, Collect, Data, GameCfg};
 use numpy::{IntoPyArray, PyReadonlyArray1};
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 static NETS: LazyLock<RwLock<Arc<Net>>> = LazyLock::new(|| RwLock::new(Arc::new(Net::default())));
-
-static NET_VERSION: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn nets() -> &'static RwLock<Arc<Net>> {
     &NETS
@@ -27,7 +24,6 @@ fn set_weights(w: PyReadonlyArray1<f32>, b: PyReadonlyArray1<f32>, ln: PyReadonl
     let value = Net::from_flat(w.as_slice()?, b.as_slice()?, ln.as_slice()?)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
     *nets().write() = Arc::new(value);
-    NET_VERSION.fetch_add(1, Ordering::Release);
     Ok(())
 }
 
@@ -112,8 +108,6 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
 struct SolveFarm {
     #[cfg(feature = "gpu")]
     farm: Farm,
-    #[cfg(feature = "gpu")]
-    net_version: u64,
 }
 
 #[pymethods]
@@ -158,11 +152,10 @@ impl SolveFarm {
         };
         #[cfg(feature = "gpu")]
         {
-            let version = NET_VERSION.load(Ordering::Acquire);
-            let device = device_for(&devices, (**nets().read()).clone(), cfg)?;
+            let net = Arc::clone(&nets().read());
+            let device = device_for(&devices, &net, cfg)?;
             Ok(SolveFarm {
-                farm: Farm::new(seed, workers, gc, device),
-                net_version: version,
+                farm: Farm::new(seed, workers, gc, net, device),
             })
         }
         #[cfg(not(feature = "gpu"))]
@@ -182,13 +175,9 @@ impl SolveFarm {
                 return Err(pyo3::exceptions::PyValueError::new_err("solves must be positive"));
             }
             check_nets()?;
-            let version = NET_VERSION.load(Ordering::Acquire);
-            if self.net_version != version {
-                self.farm
-                    .publish((**nets().read()).clone())
-                    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
-                self.net_version = version;
-            }
+            self.farm
+                .publish(Arc::clone(&nets().read()))
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
             let d = py.allow_threads(|| self.farm.drive(solves));
             if self.farm.broken() {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -200,13 +189,15 @@ impl SolveFarm {
             let out = data_to_dict(py, d)?;
             let dict = out.bind(py).downcast::<PyDict>()?.clone();
             let s = self.farm.stats();
-            let read = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+            let read = |a: &std::sync::atomic::AtomicU64| {
+                a.load(std::sync::atomic::Ordering::Relaxed)
+            };
             dict.set_item("rounds", read(&s.rounds))?;
             dict.set_item("round_calls", read(&s.calls))?;
             dict.set_item("round_rows", read(&s.rows))?;
             dict.set_item("round_nanos", read(&s.nanos))?;
             dict.set_item("slots", read(&s.slots))?;
-            dict.set_item("slots_used", read(&s.used))?;
+            dict.set_item("slots_used", read(&s.slots))?;
             dict.set_item("slots_per_card", read(&s.slots_per_card))?;
             dict.set_item("slot_bytes", read(&s.slot_bytes))?;
             dict.set_item("budget_hits", read(&s.budget_hits))?;
@@ -225,7 +216,7 @@ impl SolveFarm {
 }
 
 #[cfg(feature = "gpu")]
-fn device_for(devices: &[usize], value: crate::net::Net, cfg: Cfg) -> PyResult<crate::cuda::Device> {
+fn device_for(devices: &[usize], value: &crate::net::Net, cfg: Cfg) -> PyResult<crate::cuda::Device> {
     let max_slots = crate::farm::host_slots(cfg.budget);
     crate::cuda::Device::new(devices, value, cfg, max_slots).map_err(pyo3::exceptions::PyRuntimeError::new_err)
 }

@@ -137,7 +137,6 @@ fn warp_rows(rows: usize) -> LaunchConfig {
 pub struct Device {
     cards: Vec<Card>,
     n_gpus: usize,
-    net: Net,
     slot_bytes: usize,
 }
 
@@ -477,7 +476,7 @@ struct Card {
 }
 
 impl Device {
-    pub fn new(ordinals: &[usize], net: Net, cfg: Cfg, max_slots: usize) -> Res<Device> {
+    pub fn new(ordinals: &[usize], net: &Net, cfg: Cfg, max_slots: usize) -> Res<Device> {
         if ordinals.is_empty() {
             return Err("no cuda device ordinals given".into());
         }
@@ -492,7 +491,7 @@ impl Device {
             let gpu = Gpu::get(o)?;
             gpu.ctx.bind_to_thread().map_err(err)?;
             let mut pair: Vec<Card> = (0..PIPELINE)
-                .map(|_| Card::on(&gpu, &net))
+                .map(|_| Card::on(&gpu, net))
                 .collect::<Res<_>>()?;
             let s0 = Arc::clone(&pair[0].stream);
             s0.context().bind_to_thread().map_err(err)?;
@@ -546,7 +545,7 @@ impl Device {
             left = left.saturating_sub(n);
             cards.extend(pair);
         }
-        Ok(Device { cards, n_gpus: ordinals.len(), net, slot_bytes })
+        Ok(Device { cards, n_gpus: ordinals.len(), slot_bytes })
     }
 
     pub fn cards(&self) -> usize {
@@ -571,10 +570,6 @@ impl Device {
         } else {
             self.total_slots() / self.n_gpus
         }
-    }
-
-    pub fn net(&self) -> &Net {
-        &self.net
     }
 
     pub fn expand_rows(&self, rows: &[u8]) -> Res<Vec<f32>> {
@@ -609,7 +604,7 @@ impl Device {
         card.stream.memcpy_dtov(&out).map_err(err)
     }
 
-    pub fn set_weights(&mut self, net: Net) -> Res<()> {
+    pub(crate) fn set_weights(&mut self, net: &Net) -> Res<()> {
         if net.is_empty() {
             return Err("cannot publish empty weights to the device".into());
         }
@@ -628,7 +623,6 @@ impl Device {
             let owed = owed_by_the_join(&card.layout, &flat.b);
             card.stream.memcpy_htod(&owed, &mut card.owed).map_err(err)?;
         }
-        self.net = net;
         Ok(())
     }
 

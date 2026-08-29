@@ -55,12 +55,7 @@ fn brain_of(spec: &Spec, device: usize) -> Result<Brain, String> {
     let mind = match spec.mind.as_str() {
         "random" => Mind::Random,
         "greedy" => Mind::Greedy { temp: spec.temp },
-        "sog" => Mind::Sog(Arc::new(Cards::new(Device::new(
-            &[device],
-            net.clone(),
-            spec.cfg,
-            0,
-        )?))),
+        "sog" => Mind::Sog(Arc::new(Cards::new(Device::new(&[device], &net, spec.cfg, 0)?))),
         other => return Err(format!("unknown mind {other}")),
     };
     Ok(Brain {

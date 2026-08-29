@@ -22,8 +22,8 @@ build_script="find engine/src engine/tests engine/examples -type f -exec touch {
 cd engine
 maturin develop --release --features python,gpu >/tmp/maturin.log 2>&1 || { tail -40 /tmp/maturin.log; exit 1; }
 tail -2 /tmp/maturin.log
-cargo build --release --features gpu --bin bot >/tmp/bot.log 2>&1 || { tail -40 /tmp/bot.log; exit 1; }
-tail -1 /tmp/bot.log"
+cargo build --release --features gpu --bin ladder >/tmp/ladder.log 2>&1 || { tail -40 /tmp/ladder.log; exit 1; }
+tail -1 /tmp/ladder.log"
 
 case "${1:-}" in
 setup)
