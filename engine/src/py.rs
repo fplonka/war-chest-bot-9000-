@@ -27,6 +27,14 @@ fn set_weights(w: PyReadonlyArray1<f32>, b: PyReadonlyArray1<f32>, ln: PyReadonl
     Ok(())
 }
 
+#[cfg(feature = "gpu")]
+fn check_nets() -> PyResult<()> {
+    if nets().read().is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err("no weights pushed"));
+    }
+    Ok(())
+}
+
 fn cfr_of(name: &str) -> PyResult<Cfr> {
     Cfr::named(name).ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err(format!(
