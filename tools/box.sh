@@ -18,7 +18,7 @@ mkdir -p $remote && cd $remote"
 run_remote() { ssh "${ssh_opts[@]}" "root@$host" "$prelude
 $*"; }
 
-build_script="find engine/src engine/tests engine/examples -type f -exec touch {} +
+build_script="find engine/src engine/tests -type f -exec touch {} +
 cd engine
 maturin develop --release --features python,gpu >/tmp/maturin.log 2>&1 || { tail -40 /tmp/maturin.log; exit 1; }
 tail -2 /tmp/maturin.log
