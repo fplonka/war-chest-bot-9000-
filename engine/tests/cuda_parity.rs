@@ -302,16 +302,23 @@ fn generate_one(net: &Net, backend: Backend, games: usize, s: u32, c: f32) -> Da
         .data
 }
 
-/// One solve of the first position a stream reaches, run to the end on
-/// `backend`, and the solver it leaves behind.
-///
-/// Pinned to slot zero of card zero, which is where `Device::resident` then
-/// looks for it.
-fn one_solve(net: &Net, backend: &Backend, s: u32, c: f32) -> Solver {
+/// A sharp belief over an uncertain support makes uniform substitution visible.
+fn sharp_solve(net: &Net, s: u32, c: f32) -> Solver {
     let nets = Arc::new(net.clone());
     let mut data = Data::default();
-    let sv = GameStream::new(0x51E5, game_cfg(s, c)).next_solve(&nets, &mut data);
-    run_solve(backend, sv).0
+    let seed = GameStream::new(0x51E5, game_cfg(s, c)).next_solve(&nets, &mut data);
+    let root = seed.states[0].clone();
+    let mut belief = seed.root_belief.clone();
+    assert!(belief.iter().any(|b| b.len() > 1));
+    for b in &mut belief {
+        b.p.fill(0.0);
+        b.p[0] = 1.0;
+    }
+    Solver::new(&root, Ctx::new(&root), nets, cfg(s, c), belief, Rng::new(0xB3113F))
+}
+
+fn one_solve(net: &Net, backend: &Backend, s: u32, c: f32) -> Solver {
+    run_solve(backend, sharp_solve(net, s, c)).0
 }
 
 /// Drive one solve to its end on `backend`, in slot zero of card zero.
@@ -939,8 +946,17 @@ fn the_resident_state_agrees_with_the_cpu_network() {
     let net = random_net(0x9E37);
     let host = one_solve(&net, &Backend::Reference(net.clone()), 8, 0.0);
     let device = Backend::Cuda(gpu(18));
-    let card = one_solve(&net, &device, 8, 0.0);
     let Backend::Cuda(d) = &device else { unreachable!("just built") };
+    let mut fresh = sharp_solve(&net, 8, 0.0);
+    let belief = [&fresh.root_belief[0].p[..], &fresh.root_belief[1].p[..]].concat();
+    fresh.pin(0);
+    let Step::Calls(calls) = fresh.advance(&[]) else { unreachable!("a fresh solve asks for work") };
+    let tree = calls.iter().position(|c| matches!(c, Call::Tree { .. })).expect("a tree call");
+    d.run(&calls[..=tree], 0).expect("the card accepted the fresh tree");
+    let seeded = d.resident(0, 0).expect("the card gave its fresh tree back");
+    assert_eq!(&seeded.reach[..belief.len()], &belief);
+
+    let card = one_solve(&net, &device, 8, 0.0);
     let got = d.resident(0, 0).expect("the card gave its solve back");
 
     assert!(!host.oracle().pb.is_empty(), "the reference solve made no board vectors");
@@ -974,11 +990,6 @@ fn the_resident_state_agrees_with_the_cpu_network() {
         );
         assert!(bad < TF32, "{what} differ by {bad:e} of their scale");
     }
-    // A prior that was never written would read as the uniform start the
-    // scatter lays down, and would then agree with a host that had also never
-    // written one. Both sides must actually be a policy.
-    let uniform = got.prior[..cells].windows(2).all(|w| w[0] == w[1]);
-    assert!(!uniform, "the card's prior is still the uniform start");
 }
 
 

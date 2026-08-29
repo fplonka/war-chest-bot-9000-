@@ -1041,7 +1041,7 @@ mod tests {
             let mut inc = Contract::of(&sv);
             sv.grown.clear();
             // What the card holds, one vector an array.
-            let mut card: Vec<Vec<u32>> = vec![Vec::new(); Dst::Rootb as usize + 1];
+            let mut card: Vec<Vec<u32>> = vec![Vec::new(); Dst::Reach as usize + 1];
             let mut sent = Sent::default();
             let mut from = 0usize;
             let mut rewrite: Vec<u32> = Vec::new();

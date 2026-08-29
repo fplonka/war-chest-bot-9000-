@@ -1245,10 +1245,8 @@ impl Solver {
             sv.seed = Rng::new(sv.rng.next_u64()).0;
             let root = sv.push_node(crate::contract::NO_ROW, root.clone(), cfgs);
             sv.expand(root);
-            // The first CFR update and every expansion trajectory require
-            // reaches for the tree that now exists. The card seeds and sweeps
-            // its own, from the root beliefs the first tree call carries, so
-            // on that path this pass would be redone before it was ever read.
+            // The first tree call writes the root reaches and sweeps the rest,
+            // so a host pass here would be redone before it was ever read.
             #[cfg(any(test, feature = "gpu"))]
             if sv.reference {
                 sv.precompute_reaches();
@@ -1379,8 +1377,6 @@ impl Solver {
             )
             || !self.reserve(Ent::Cell, next_cell)
             || !self.reserve(Ent::Row, next_row)
-            || (parent == crate::contract::NO_ROW
-                && !self.reserve(Ent::Config, (c0 + c1).div_ceil(2)))
         {
             return parent as usize;
         }
@@ -1547,8 +1543,8 @@ impl Solver {
     ///
     /// Each entity is one slot, shared by every column of that entity. `used`
     /// is the max of those columns: a terminal is a Row, a child pointer is a
-    /// Cell, `nvals` and the CSR starts are Reach, and the root belief is a
-    /// Config. The contract debug-asserts its columns against this.
+    /// Cell, and `nvals` and the CSR starts are Reach. The contract
+    /// debug-asserts its columns against this.
     pub fn used(&self, e: Ent) -> usize {
         match e {
             Ent::Node => self.nodes.len(),
@@ -1557,7 +1553,7 @@ impl Solver {
             Ent::Draw => self.ndraws,
             Ent::Row => self.leaf_rows.len().max(self.term_leaves.len()),
             Ent::Board => self.nboards,
-            Ent::Config => self.ncfg.max(self.rootb_len()),
+            Ent::Config => self.ncfg,
             Ent::Cidx => self.leaf_cidx.len(),
         }
     }
@@ -1567,13 +1563,6 @@ impl Solver {
             .max(self.nrev_start)
             .max(self.nrvd_start)
             .max(self.ndraw_start)
-    }
-
-    fn rootb_len(&self) -> usize {
-        match self.nc.first() {
-            Some(&[a, b]) => (a as usize + b as usize).div_ceil(2),
-            None => 0,
-        }
     }
 
     pub fn stop_reason(&self) -> StopReason {
@@ -2502,7 +2491,7 @@ impl Solver {
         w.u32s(Dst::Term, 0, &self.term_leaves.iter().map(|&i| i as u32).collect::<Vec<_>>());
         if first {
             let b = [&self.root_belief[0].p[..], &self.root_belief[1].p[..]].concat();
-            w.f32s(Dst::Rootb, 0, &b);
+            w.f32s(Dst::Reach, self.roff[0] as usize, &b);
         }
         // The tail this growth appended, which `cur` and `prior` both start at.
         // The prior of a node the card primes is written there, by the policy

@@ -123,7 +123,6 @@ struct Kernels {
     bias: CudaFunction,
     window: CudaFunction,
     scatter: CudaFunction,
-    seed_reach: CudaFunction,
     avg_block: CudaFunction,
     terminals: CudaFunction,
     expand: CudaFunction,
@@ -158,7 +157,6 @@ impl Kernels {
             bias: get("k_bias")?,
             window: get("k_window")?,
             scatter: get("k_scatter")?,
-            seed_reach: get("k_seed_reach")?,
             avg_block: get("k_avg_block")?,
             terminals: get("k_terminals")?,
             expand: get("k_expand")?,
@@ -2650,23 +2648,12 @@ impl Card {
         }
     }
 
-    /// Push the reach probabilities down from the root beliefs, level by level.
+    /// Push the reach probabilities below the root, level by level.
     /// `also_avg` adds the reach-weighted iterate to the running strategy sum,
     /// which needs exactly the reaches this pass has just made current.
     fn reaches(&self, b: &Batch, p: &Prefix, avg: i32, also_avg: bool, iter: i32)
         -> Res<()> {
         let (trees, work) = (b.trees.buf(), b.work.buf());
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.seed_reach)
-                .arg(trees).arg(&iter)
-                .launch_unit(LaunchConfig {
-                    grid_dim: (64, p.parts, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-        }
-        .map_err(err)?;
         let sum = also_avg as i32;
         for level in 1..p.items.len() {
             if p.items[level] == 0 {

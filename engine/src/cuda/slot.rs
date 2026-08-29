@@ -25,7 +25,7 @@ struct Col {
     name: &'static str,
 }
 
-const TABLE: [Col; 54] = [
+const TABLE: [Col; 53] = [
     Col { ent: Ent::Node, width: 1, dst: Some(Dst::Kind), name: "kind" },
     Col { ent: Ent::Node, width: 1, dst: Some(Dst::Player), name: "player" },
     Col { ent: Ent::Node, width: 1, dst: Some(Dst::Exhausted), name: "exhausted" },
@@ -58,7 +58,7 @@ const TABLE: [Col; 54] = [
     Col { ent: Ent::Draw, width: 1, dst: Some(Dst::DrawP), name: "draw_p" },
     Col { ent: Ent::Node, width: 1, dst: Some(Dst::LevelStart), name: "level_start" },
     Col { ent: Ent::Node, width: 1, dst: Some(Dst::LevelNode), name: "level_node" },
-    Col { ent: Ent::Reach, width: 1, dst: None, name: "reach" },
+    Col { ent: Ent::Reach, width: 1, dst: Some(Dst::Reach), name: "reach" },
     Col { ent: Ent::Reach, width: 2, dst: None, name: "vals" },
     Col { ent: Ent::Cell, width: 1, dst: Some(Dst::Cur), name: "cur" },
     Col { ent: Ent::Cell, width: 1, dst: None, name: "regret" },
@@ -67,7 +67,6 @@ const TABLE: [Col; 54] = [
     Col { ent: Ent::Cell, width: 1, dst: None, name: "visits" },
     Col { ent: Ent::Cell, width: 1, dst: Some(Dst::Prior), name: "prior" },
     Col { ent: Ent::Cell, width: 0, dst: None, name: "avg" },
-    Col { ent: Ent::Config, width: 2, dst: Some(Dst::Rootb), name: "rootb" },
     Col { ent: Ent::Board, width: D, dst: None, name: "p" },
     Col { ent: Ent::Board, width: JW, dst: None, name: "jp" },
     Col { ent: Ent::Board, width: NTYPE * C, dst: None, name: "tokens" },
@@ -149,12 +148,12 @@ const _: () = {
     assert!(FIELDS[3] == 4);
     assert!(FIELDS[4] == 5);
     assert!(FIELDS[5] == D + JW + NTYPE * C + N_HEXES * C);
-    assert!(FIELDS[6] == 2 * D + POOL + 2);
+    assert!(FIELDS[6] == 2 * D + POOL);
     assert!(FIELDS[7] == 1);
     assert!(C_CUR == 7 && C_SUM == 9 && C_PRIOR == 12);
     assert!(B_P == 0 && B_JP == D);
     assert!(B_TOKENS == D + JW && B_SPATIAL == D + JW + NTYPE * C);
-    assert!(G_F == 2 && Y_COFF == 1);
+    assert!(G_F == 0 && Y_COFF == 1);
 };
 
 fn dst_slot(d: Dst) -> (Ent, usize, usize) {
