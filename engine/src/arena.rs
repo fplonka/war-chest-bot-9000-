@@ -8,6 +8,15 @@ use crate::selfplay::resolve_chance;
 use crate::state::{State, BLACK, WHITE};
 use crate::units::index_of_id;
 
+pub const PROTOCOL: u32 = 6;
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Hello {
+    pub name: String,
+    pub protocol: u32,
+    pub rules: u64,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Draft {
     pub white: Vec<u16>,
@@ -118,7 +127,13 @@ impl Table {
         self.bouts.values().filter(|b| !b.over).count()
     }
 
-    pub fn start(&mut self, id: u32, draft: &Draft, bots: [usize; 2], seed: u64) -> Result<(), String> {
+    pub fn start(
+        &mut self,
+        id: u32,
+        draft: &Draft,
+        bots: [usize; 2],
+        seed: u64,
+    ) -> Result<(), String> {
         let s = draft.state()?;
         let start = |seat: u8| {
             Some(Start {
@@ -195,14 +210,16 @@ impl Table {
             .bouts
             .get_mut(&id)
             .ok_or_else(|| format!("game {} is not live", id))?;
-        let action = Action::decode(code).ok_or_else(|| format!("action {} does not decode", code))?;
+        let action =
+            Action::decode(code).ok_or_else(|| format!("action {} does not decode", code))?;
         if !b.s.legal_actions().iter().any(|x| x.encode() == code) {
             return Err(format!("game {id}: illegal action {action:?}"));
         }
         let player = b.s.to_act();
         b.s.apply_inplace(action);
         b.watched = [false, false];
-        let reached = (!b.s.is_terminal() && !b.s.is_chance()).then_some((id, b.s, b.draft.clone()));
+        let reached =
+            (!b.s.is_terminal() && !b.s.is_chance()).then_some((id, b.s, b.draft.clone()));
         b.pending[1 - player as usize].push(Obs::Act {
             player,
             key: crate::pbs::obs_key(&action),

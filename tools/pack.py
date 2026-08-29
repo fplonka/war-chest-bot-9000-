@@ -11,7 +11,19 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
 
 
-def pack(run, binary, out_dir, snapshot=None, name=None):
+def selected(snapshots):
+    if not snapshots:
+        return []
+    end = snapshots[-1]["t"]
+    targets = [0.0, end / 8, end / 4, end / 2, end]
+    indices = {min(range(len(snapshots)),
+                   key=lambda i: abs(snapshots[i]["t"] - target))
+               for target in targets}
+    indices.add(len(snapshots) - 1)
+    return [snapshots[i] for i in sorted(indices)]
+
+
+def pack(run, binary, out_dir=None, snapshot=None, name=None):
     import sys
 
     sys.path.insert(0, str(ROOT / "train"))
@@ -19,19 +31,26 @@ def pack(run, binary, out_dir, snapshot=None, name=None):
     from export_weights import write_bin
     from value_net import Net
 
-    if not Path(binary).exists():
-        raise SystemExit(f"{binary} does not exist. Build it:\n"
-                         f"  cd engine && cargo build --release --features gpu --bin ladder")
-
+    binary = Path(binary)
+    if not binary.exists():
+        raise SystemExit(f"{binary} does not exist. Build it with "
+                         "cargo build --release --features gpu --bin bot")
     run = Path(run)
+    out_dir = Path(out_dir) if out_dir else run / "bots"
     log = json.loads((run / "log.json").read_text())
     cfg = log.get("cfg", {})
-    snaps = [s for s in log.get("snapshots", [])
-             if snapshot is None or s["label"] == snapshot]
+    snapshots = log.get("snapshots", [])
+    if snapshot is None:
+        snaps = selected(snapshots)
+    else:
+        snaps = [snap for snap in snapshots if snap["label"] == snapshot]
     if not snaps:
         raise SystemExit(f"{run} has no snapshot {snapshot!r}")
     if name and len(snaps) > 1:
         raise SystemExit("--name needs a single --snapshot")
+    if out_dir == run / "bots" and out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     made = []
     for snap in snaps:
         checkpoint = torch.load(run / snap["file"], map_location="cpu",
@@ -45,19 +64,22 @@ def pack(run, binary, out_dir, snapshot=None, name=None):
                   "puct": 1.5,
                   "prior_temp": 1.0,
                   "cfr": "dcfr"}
-        bot = name or f"{run.name}.{snap['label']}"
+        final = snap is snapshots[-1]
+        stem = Path(snap["file"]).stem.removeprefix("snap_")
+        bot = name or ("final" if final else f"{stem}-{snap['label']}")
         directory = out_dir / bot
-        directory.mkdir(parents=True, exist_ok=True)
+        directory.mkdir(parents=True, exist_ok=False)
         write_bin(net, directory / "weights.bin")
         shutil.copy2(binary, directory / "bot")
         (directory / "bot.json").write_text(json.dumps({
-            "name": bot,
-            "sha": checkpoint.get("git", ""),
+            "format": 1,
+            "name": f"{run.name}.{bot}",
+            "sha": checkpoint.get("git", cfg.get("git", "")),
             "binary": digest(directory / "bot"),
             "mind": "sog",
             "weights": "weights.bin",
             "search": search,
-            "minutes": round(snap["t"] / 60.0, 1),
+            "minutes": round(snap["t"] / 60.0, 3),
             "note": f"{run.name} {snap['label']}, {snap['t'] / 60:.0f} min",
         }, indent=1) + "\n")
         made.append(directory)
@@ -66,16 +88,14 @@ def pack(run, binary, out_dir, snapshot=None, name=None):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Archive run snapshots as bots.")
+    ap = argparse.ArgumentParser(description="Pack selected run checkpoints as bots.")
     ap.add_argument("run")
-    ap.add_argument("--snapshot", default=None,
-                    help="one snapshot label instead of all of them")
-    ap.add_argument("--name", default=None, help="bot name (default run.label)")
-    ap.add_argument("--bin", default=str(ROOT / "engine/target/release/ladder"),
-                    help="the binary to record alongside the weights")
-    ap.add_argument("--out", default="bots")
+    ap.add_argument("--snapshot", default=None)
+    ap.add_argument("--name", default=None)
+    ap.add_argument("--bin", default=str(ROOT / "engine/target/release/bot"))
+    ap.add_argument("--out", default=None)
     args = ap.parse_args()
-    pack(args.run, Path(args.bin).resolve(), Path(args.out), args.snapshot, args.name)
+    pack(args.run, Path(args.bin).resolve(), args.out, args.snapshot, args.name)
 
 
 if __name__ == "__main__":

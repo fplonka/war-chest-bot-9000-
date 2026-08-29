@@ -1167,8 +1167,13 @@ def main():
     run_search_pipeline()
 
     snapshot("final", time.time() - t0)
+    subprocess.run(["cargo", "build", "--release", "--features", "gpu",
+                    "--bin", "bot", "--bin", "ladder"],
+                   cwd=ROOT / "engine", check=True)
     subprocess.run([sys.executable, str(ROOT / "tools" / "pack.py"),
-                    args.out, "--out", str(ROOT / "bots")], check=True)
+                    args.out], check=True)
+    subprocess.run([str(ROOT / "engine" / "target" / "release" / "ladder"),
+                    args.out, "--games", "16"], check=True)
 
 
 if __name__ == "__main__":

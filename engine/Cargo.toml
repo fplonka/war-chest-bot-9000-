@@ -29,6 +29,7 @@ parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 cudarc = { version = "0.17", optional = true, default-features = false, features = ["cuda-version-from-build-system", "dynamic-loading", "driver", "nvrtc", "cublas"] }
 serde_json = "1"
+sha2 = "0.10"
 
 [features]
 default = []
@@ -37,9 +38,12 @@ python = ["pyo3", "numpy"]
 gpu = ["dep:cudarc"]
 
 [[bin]]
+name = "bot"
+path = "src/bin/bot.rs"
+
+[[bin]]
 name = "ladder"
 path = "src/bin/ladder.rs"
-required-features = ["gpu"]
 
 [[test]]
 name = "invariants"
