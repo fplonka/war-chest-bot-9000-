@@ -1,27 +1,3 @@
-//! The device backend: one round of the farm, on the GPU.
-//!
-//! The farm hands this a whole round — every solve in flight, one call each.
-//! Those calls are not run one at a time. Calls of a kind are concatenated into
-//! a single batch and the network runs **once per kind per round**, so a round
-//! costs three chains of large GEMMs instead of a hundred small ones. That is
-//! the entire reason the farm exists; a solve on its own is a couple of hundred
-//! rows, which no accelerator is interested in.
-//!
-//! Two conventions carry the concatenation into the kernels:
-//!
-//! * packed public rows are expanded after upload. A leaf's physical `xpub`
-//!   row is `2 * r`, so paired canonical queries stay adjacent and the copy
-//!   `net::board` makes becomes a stride;
-//! * anything that was constant within a call and varies across a batch — the
-//!   card table a leaf reads, the seat a join asks about — becomes an index
-//!   array.
-//!
-//! The arithmetic is `net.rs`, in the same order, and the test-only oracle in
-//! `tests/cuda_parity.rs` holds it to exact host arithmetic. The join is one kernel;
-//! the trunk and the join multiply on the tensor cores.
-//!
-//! Scratch is allocated at carve from `RoundCap`. A round that needs more rows
-//! tiles. Nothing a round runs is a device allocation.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -36,7 +12,7 @@ use cudarc::driver::{
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 
 use crate::board::{board, N_HEXES, NONE};
-use crate::farm::{Call, Prime, Reply};
+use crate::contract::{Call, Prime, Reply};
 use crate::net::{
     ln_block, Net, NetLayout, NormSpan, Span, AW, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW,
     LN_ACT, LN_CFG, LN_H, LN_JOIN, LN_JOUT, LN_TRUNK, POOL, TYPE,
@@ -48,7 +24,7 @@ use crate::pbs::{
     ROW_INITIATIVE, ROW_INIT_MOVED, ROW_PILES, ROW_PLIES, ROW_STACK_KIND, ROW_STACK_OWED,
     ROW_TO_ACT,
 };
-use crate::search::{Budget, Cfg, Cfr, Ent};
+use crate::search::{Cfg, Cfr, Ent};
 use crate::state::{CONT_CAP, MAX_MAIN_PLAYS, PENDING_KINDS};
 use crate::units::{write_card_features, CARD_FEATS, N_UNITS};
 
@@ -57,137 +33,54 @@ use slot::{Arr, Solve, DESC, FIELDS, C_CUR, C_PRIOR, C_QVAL, C_SUM, C_VISITS, R_
 
 type Res<T> = Result<T, String>;
 
-/// Where an iteration spends its wall clock, by stage. The first four are the
-/// host's own: marshalling, the uploads, issuing the launches, the download
-/// that ends the round. The rest are device stages, and are only filled when
-/// `WARCHEST_STAGES` is set -- separating them means synchronising after each,
-/// which changes the thing being measured, so it is off by default.
-///
-/// The last two are byte counts rather than nanoseconds. They ride the same
-/// accumulator, and `leaf_breakdown` scales everything by 1e6 -- which turns
-/// nanoseconds into milliseconds and bytes into megabytes, so both read
-/// correctly.
-pub const STAGES: [&str; 20] = [
-    "marshal", "upload", "launch", "download",
-    "reach", "leaf", "terminals", "backprop", "expand",
-    "trunk", "configs", "tree",
-    "t-marshal", "t-upload", "priors",
-    "describe", "scatter",
-    "sent", "regrown",
-    // Not a rate but a level: how much device memory every solve arena on this
-    // process holds. Solves in flight is what the rate is linear in, and this
-    // is the ceiling on it.
-    "held",
-];
-
-/// The bytes each of a solve's arrays holds, largest first.
-///
-/// `held` says solves in flight is memory-bound; this says which array to
-/// argue with. Reported for the largest solve a card holds, because the mean
-/// is not what fills the pool.
-pub static CENSUS: parking_lot::Mutex<Vec<(&'static str, usize)>> =
-    parking_lot::Mutex::new(Vec::new());
-
-/// Device bytes every card's solve arenas hold. Fixed at carve: a slot is
-/// allocated once at the budget and never grows, so this is a level, not a
-/// rate, and `leaf_breakdown` reports it without resetting.
-pub static HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-pub static LEAF_NS: [std::sync::atomic::AtomicU64; STAGES.len()] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; STAGES.len()];
-
-/// Report and reset.
-pub fn leaf_breakdown() -> [f64; STAGES.len()] {
-    std::array::from_fn(|i| {
-        if i == STAGES.len() - 1 {
-            return HELD.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
-        }
-        LEAF_NS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
-    })
-}
-
-/// Whether to time the device stages, which costs a stream synchronise apiece.
-fn timing() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("WARCHEST_STAGES").is_some())
-}
-
 const KERNELS: &str = include_str!("kernels.cu");
 
-/// Everything in `kernels.cu`, resolved once at startup so a name that does not
-/// exist is an error there rather than a wrong answer later.
-struct Kernels {
-    expand_rows: CudaFunction,
-    gelu: CudaFunction,
-    norm_ip: CudaFunction,
-    bias: CudaFunction,
-    window: CudaFunction,
-    scatter: CudaFunction,
-    seed_reach: CudaFunction,
-    avg_block: CudaFunction,
-    terminals: CudaFunction,
-    expand: CudaFunction,
-    finish: CudaFunction,
-    tokens: CudaFunction,
-    act_feats: CudaFunction,
-    prior_inputs: CudaFunction,
-    act_add: CudaFunction,
-    prior: CudaFunction,
-    hex_facts: CudaFunction,
-    type_pool: CudaFunction,
-    stem: CudaFunction,
-    trunk: CudaFunction,
-    cfg_slots: CudaFunction,
-    sum_slots: CudaFunction,
-    bag: CudaFunction,
-    leaf: CudaFunction,
-    reach_sweep: CudaFunction,
-    backprop_sweep: CudaFunction,
+macro_rules! kernels {
+    ($($name:ident,)*) => {
+        struct Kernels { $($name: CudaFunction,)* }
+
+        impl Kernels {
+            fn load(m: &Arc<CudaModule>) -> Res<Kernels> {
+                $(let $name = {
+                    let at = concat!("k_", stringify!($name));
+                    m.load_function(at).map_err(|e| format!("kernel {at}: {e:?}"))?
+                };)*
+                Ok(Kernels { $($name,)* })
+            }
+        }
+    };
 }
 
-impl Kernels {
-    fn load(m: &Arc<CudaModule>) -> Res<Kernels> {
-        let get = |name: &str| {
-            m.load_function(name)
-                .map_err(|e| format!("kernel {name}: {e:?}"))
-        };
-        Ok(Kernels {
-            expand_rows: get("k_expand_rows")?,
-            gelu: get("k_gelu")?,
-            norm_ip: get("k_norm_ip")?,
-            bias: get("k_bias")?,
-            window: get("k_window")?,
-            scatter: get("k_scatter")?,
-            seed_reach: get("k_seed_reach")?,
-            avg_block: get("k_avg_block")?,
-            terminals: get("k_terminals")?,
-            expand: get("k_expand")?,
-            finish: get("k_finish")?,
-            tokens: get("k_tokens")?,
-            act_feats: get("k_act_feats")?,
-            prior_inputs: get("k_prior_inputs")?,
-            act_add: get("k_act_add")?,
-            prior: get("k_prior")?,
-            hex_facts: get("k_hex_facts")?,
-            type_pool: get("k_type_pool")?,
-            stem: get("k_stem")?,
-            trunk: get("k_trunk")?,
-            cfg_slots: get("k_cfg_slots")?,
-            sum_slots: get("k_sum_slots")?,
-            bag: get("k_bag")?,
-            leaf: get("k_leaf")?,
-            reach_sweep: get("k_reach_sweep")?,
-            backprop_sweep: get("k_backprop_sweep")?,
-        })
-    }
+kernels! {
+    expand_rows,
+    gelu,
+    norm_ip,
+    bias,
+    window,
+    scatter,
+    seed_reach,
+    avg_block,
+    terminals,
+    expand,
+    finish,
+    tokens,
+    act_feats,
+    prior_inputs,
+    act_add,
+    prior,
+    hex_facts,
+    type_pool,
+    stem,
+    trunk,
+    cfg_slots,
+    sum_slots,
+    bag,
+    leaf,
+    reach_sweep,
+    backprop_sweep,
 }
 
-/// `LaunchArgs::launch` hands back the events it may have recorded. Event
-/// tracking is off here, so it never records any and no call site wants them.
 trait LaunchUnit {
-    /// # Safety
-    /// The same contract as `LaunchArgs::launch`: the arguments must match the
-    /// kernel's signature and stay in bounds.
     unsafe fn launch_unit(&mut self, cfg: LaunchConfig) -> Result<(), DriverError>;
 }
 
@@ -197,9 +90,6 @@ impl LaunchUnit for LaunchArgs<'_> {
     }
 }
 
-/// `launch!(self, kernel, elements, args...)` — one kernel over `elements`
-/// work items. The builder is the same nine lines every time, and spelling it
-/// out buries the arithmetic it is there to express.
 macro_rules! launch {
     ($card:expr, $kernel:ident, $n:expr, $($arg:expr),+ $(,)?) => {{
         let n = $n;
@@ -213,7 +103,10 @@ macro_rules! launch {
     }};
 }
 
-/// Threads per block for the elementwise kernels.
+macro_rules! carved {
+    ($($name:ident),* $(,)?) => { $( let $name = $name.buf.as_mut().expect("carved"); )* };
+}
+
 const THREADS: u32 = 256;
 
 fn spread(n: usize) -> LaunchConfig {
@@ -224,10 +117,6 @@ fn spread(n: usize) -> LaunchConfig {
     }
 }
 
-/// One block per row, threads across the row. What every kernel that walks a
-/// `[rows, width]` matrix wants: a flat index would need a division and a
-/// modulo per element, which is twenty-odd cycles against the one operation
-/// the kernel is there to do.
 fn rows_of(rows: usize, width: usize) -> LaunchConfig {
     LaunchConfig {
         grid_dim: (rows.max(1) as u32, 1, 1),
@@ -236,9 +125,6 @@ fn rows_of(rows: usize, width: usize) -> LaunchConfig {
     }
 }
 
-/// One row per warp, eight warps to a block. What `k_norm_ip` wants: its rows
-/// are a hundred-odd wide, which one warp reduces in five shuffles where a
-/// block spends the same time in barriers.
 fn warp_rows(rows: usize) -> LaunchConfig {
     const WARPS: u32 = 8;
     LaunchConfig {
@@ -249,41 +135,21 @@ fn warp_rows(rows: usize) -> LaunchConfig {
 }
 
 pub struct Device {
-    /// `PIPELINE` cards per GPU, flattened. The farm's queues are one per GPU;
-    /// both cards of a GPU share one slot pool and pull from that queue.
     cards: Vec<Card>,
     n_gpus: usize,
     slot_bytes: usize,
 }
 
-/// Three rounds in flight keep the card busy while two sets grow on the host.
 pub const PIPELINE: usize = 3;
 
-/// Round to the eleven significand bits a tensor core keeps, matching
-/// `cvt.rna.tf32.f32`: nearest, ties away from zero.
-///
-/// The trunk multiplies in TF32, whose operands are single-precision numbers
-/// with the low thirteen mantissa bits clear. Rounding the weights here rather
-/// than letting the tensor core drop the bits is what keeps the error
-/// unbiased, and it costs nothing: it happens once, when the weights are
-/// uploaded. The activations are rounded the same way as `k_trunk` stores
-/// them.
 fn tf32(v: f32) -> f32 {
     let u = v.to_bits();
     f32::from_bits(u.wrapping_add(0x1000) & 0xFFFF_E000)
 }
 
-/// JOIN_IN padded to a whole `mma.m16n8k8` k-tile. Seven zero columns, 5 %.
 const JOIN_K: usize = JOIN_IN.next_multiple_of(8);
 const _: () = assert!(JOIN_K == 136 && JOIN_IN == 129);
 
-/// One matrix in the order a warp of `mma.sync.m16n8k8` reads it.
-///
-/// Lane `l` holds `w[k + l % 4][n + l / 4]` and the value four rows below it.
-/// Stored as the net stores it that is eight thirty-two-byte transactions a
-/// fragment; here the fragment is written out lane by lane, so it is one
-/// eight-byte load a lane. `k_pad` may exceed `k_real`: the extra rows are
-/// zero, which is how JOIN_IN = 129 becomes a 136-deep tile.
 fn pack_mma(w: &[f32], base: usize, k_real: usize, k_pad: usize, n: usize, out: &mut Vec<f32>) {
     assert_eq!(k_pad % 8, 0, "a packed matrix is whole fragments deep");
     assert_eq!(n % 8, 0, "a packed matrix is whole fragments across");
@@ -306,9 +172,6 @@ fn pack_mma(w: &[f32], base: usize, k_real: usize, k_pad: usize, n: usize, out: 
     }
 }
 
-/// The trunk's two matrices a block, laid out in the order the tensor cores
-/// read them. Returns the buffer and where each matrix starts, mix then out,
-/// block by block.
 fn fragwise(l: &NetLayout, w: &[f32]) -> (Vec<f32>, Vec<usize>) {
     let mut out = Vec::new();
     let mut at = Vec::new();
@@ -323,8 +186,6 @@ fn fragwise(l: &NetLayout, w: &[f32]) -> (Vec<f32>, Vec<usize>) {
     (out, at)
 }
 
-/// `join_b`, the three `join_w`, then `join_out`, each packed the way `k_leaf`
-/// indexes them. `join_b` is padded to `JOIN_K`.
 fn join_pack(l: &NetLayout, w: &[f32]) -> Vec<f32> {
     let mut out = Vec::new();
     assert_eq!(l.join_b.i, JOIN_IN, "join_b is JOIN_IN deep");
@@ -342,22 +203,15 @@ fn join_pack(l: &NetLayout, w: &[f32]) -> Vec<f32> {
     out
 }
 
-/// The board rounded up to whole sixteen-row `mma` tiles, and the shared row
-/// stride `k_trunk` holds it at. Both are `TRUNK_ROWS` and `TRUNK_LDS` there.
 const TRUNK_ROWS: usize = N_HEXES.next_multiple_of(16);
 const TRUNK_LDS: usize = C + 4;
 
-/// What one block of `k_trunk` asks for: the residual stream, the operand the
-/// tensor cores read with its padding rows, the neighbour projections, and the
-/// pooled row with its bias.
 const TRUNK_SHARED: usize = (2 * N_HEXES + TRUNK_ROWS) * TRUNK_LDS * 4 + 3 * C * 4;
 const _: () = {
     assert!(C % 32 == 0, "k_trunk wants a whole number of warps a row");
     assert!(TRUNK_ROWS % (C / 8) == 0, "k_trunk distributes whole hex rows");
 };
 
-/// The running sums of the join's biases, in the order its norms read them.
-/// See `Card::owed`, which is where they are kept and why.
 fn owed_by_the_join(l: &NetLayout, b: &[f32]) -> Vec<f32> {
     let mut out = Vec::with_capacity((JBLOCKS + 1) * JW + D);
     let mut run = vec![0.0f32; JW];
@@ -371,164 +225,36 @@ fn owed_by_the_join(l: &NetLayout, b: &[f32]) -> Vec<f32> {
     out
 }
 
-/// Leaf rows a pass works on at once.
-///
-/// The intermediates of the leaf pass are 2,560 bytes a row -- the pooled
-/// belief block and the head, since the join keeps its residual stream in
-/// registers -- so a tile large enough to fill the card costs forty-two
-/// megabytes and a handful of extra launches. Scratch is allocated at this
-/// size when the card is carved, so a round cannot grow it.
 const TILE: usize = 16384;
 
-/// Join rows one block of `k_leaf` holds.
-///
-/// Shared is the 32 KiB head. Two 512-thread blocks are 66 % occupancy on the
-/// RTX 3090 and leave the other card room to run its sweeps.
 const JROWS: usize = 32;
 const _: () = assert!(JROWS <= JW && JROWS % 16 == 0);
 
-/// Every device buffer a round holds, from the slot count and the budget.
-///
-/// Carve allocates these. `Device::new` prices a card from the same numbers, so
-/// a larger budget cannot overflow a scratch and cannot OOM a carve that fitted.
-struct RoundCap {
-    pooled: usize,
-    h: usize,
-    z: usize,
-    input: usize,
-    leaves: usize,
-    queries: usize,
-    piles: usize,
-    tokens: usize,
-    projected: usize,
-    type_pool: usize,
-    loose: usize,
-    glob: usize,
-    facts: usize,
-    occupant: usize,
-    x: usize,
-    action: usize,
-    bag: usize,
-    packed: usize,
-    xpub: usize,
-    cards: usize,
-    card_of_row: usize,
-    phi: usize,
-    owner: usize,
-    cfg_cards: usize,
-    blob: usize,
+struct Shard {
+    call: usize,
     at: usize,
-    src: usize,
-    dst: usize,
-    start: usize,
-    trees: usize,
-    work: usize,
-    coff: usize,
-    part: usize,
-    local: usize,
-    base: usize,
-    prime: usize,
-    touched: usize,
+    len: usize,
 }
 
-impl RoundCap {
-    fn of(n: usize, b: &Budget, s: u32) -> RoundCap {
-        let cards = n * NTYPE * TYPE;
-        // Host-packed tree columns (not board `p`/`jp` or config `f`/`g`/`fp`,
-        // which stay on the card), plus the trunk's extra copies of board_of,
-        // cidx and coff on the same scatter.
-        let packed = FIELDS[0] * b.nodes
-            + FIELDS[1] * b.cells
-            + FIELDS[2] * b.reach
-            + FIELDS[3] * b.draws
-            + FIELDS[4] * b.rows
-            + 2 * b.configs
-            + b.cidx;
-        let trunk = b.rows + b.cidx + 2 * b.rows + 1;
-        let blob = n * (packed + trunk);
-        RoundCap {
-            pooled: 2 * TILE * POOL,
-            h: 2 * TILE * D,
-            z: TILE * D,
-            input: TILE * (2 * C + LOOSE),
-            leaves: n * s.max(1) as usize,
-            // The rate contract keeps at most one full-support query per
-            // resident solve.
-            queries: n * b.configs,
-            piles: TILE * NTYPE * PILE_COUNTS,
-            tokens: TILE * NTYPE * TYPE,
-            projected: TILE * NTYPE * C,
-            type_pool: TILE * C,
-            loose: TILE * LOOSE,
-            glob: TILE * C,
-            facts: TILE * N_HEXES * HEX_FACTS,
-            occupant: TILE * N_HEXES,
-            x: TILE * N_HEXES * C,
-            action: TILE * AW,
-            bag: n * NTYPE * 3 * POOL,
-            packed: TILE * ROW_BYTES,
-            xpub: TILE * PUBFEAT,
-            cards,
-            card_of_row: TILE,
-            phi: TILE * CFEAT,
-            owner: TILE,
-            cfg_cards: cards,
-            blob,
-            at: TILE,
-            src: TILE,
-            dst: TILE,
-            start: TILE + 1,
-            trees: n * DESC,
-            work: n * b.nodes,
-            coff: n * (2 * b.rows + 1),
-            part: n * b.rows,
-            local: n * b.rows,
-            base: n,
-            prime: 12 * TILE + n * b.cells,
-            touched: n,
+fn shards(sizes: &[usize], from: usize, want: usize) -> Vec<Shard> {
+    let mut out = Vec::new();
+    let (mut skip, mut taken) = (from, 0);
+    for (call, &size) in sizes.iter().enumerate() {
+        if taken == want {
+            break;
         }
+        if skip >= size {
+            skip -= size;
+            continue;
+        }
+        let len = (size - skip).min(want - taken);
+        out.push(Shard { call, at: skip, len });
+        taken += len;
+        skip = 0;
     }
-
-    fn bytes(&self) -> usize {
-        let w4 = self.pooled
-            + self.h
-            + self.z
-            + self.input
-            + self.leaves
-            + self.queries
-            + self.piles
-            + self.tokens
-            + self.projected
-            + self.type_pool
-            + self.loose
-            + self.glob
-            + self.facts
-            + self.occupant
-            + self.x
-            + self.action
-            + self.bag
-            + self.xpub
-            + self.cards
-            + self.card_of_row
-            + self.phi
-            + self.owner
-            + self.cfg_cards
-            + self.blob
-            + self.at
-            + self.src
-            + self.start
-            + self.work
-            + self.coff
-            + self.part
-            + self.local
-            + self.base
-            + self.prime
-            + self.touched;
-        w4 * 4 + (self.trees + self.dst) * 8 + self.packed
-    }
+    out
 }
 
-/// Fill a staging buffer with exactly `src`.
 fn copy<T: Copy>(src: &[T]) -> impl FnOnce(&mut [T]) -> usize + '_ {
     move |dst: &mut [T]| {
         dst[..src.len()].copy_from_slice(src);
@@ -536,19 +262,6 @@ fn copy<T: Copy>(src: &[T]) -> impl FnOnce(&mut [T]) -> usize + '_ {
     }
 }
 
-/// A page-locked host buffer that grows like a `Vec`.
-///
-/// Every byte a round sends goes through one of these, because a copy from
-/// ordinary pageable memory is not asynchronous. The driver has to stage such a
-/// copy through a pinned buffer of its own, and it blocks the calling thread
-/// and drains the stream while it does -- so a round with one explicit
-/// synchronise had ninety implicit ones, and the cards stood idle through all
-/// of them. Page-locked memory is copied by the DMA engine directly, with the
-/// host free to carry on.
-///
-/// The event is what makes reuse safe: a buffer must not be overwritten while
-/// the copy that reads it is still in flight, and `fill` waits on the copy the
-/// last round issued.
 struct Host<T> {
     buf: Option<cudarc::driver::PinnedHostSlice<T>>,
     len: usize,
@@ -562,8 +275,6 @@ impl<T> Default for Host<T> {
 }
 
 impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy> Host<T> {
-    /// Make room for `want`, hand the buffer over, and keep what was written.
-    /// `f` returns how many elements it filled.
     fn fill(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -582,7 +293,6 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy> Hos
         Ok(())
     }
 
-    /// Send what was filled into `dst`, without waiting for it.
     fn send(&mut self, stream: &Arc<CudaStream>, dst: &mut CudaSlice<T>) -> Res<()> {
         if self.len == 0 {
             return Ok(());
@@ -597,8 +307,6 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy> Hos
         self.sent.as_ref().expect("just made").record(stream).map_err(err)
     }
 
-    /// Receive `src` into this buffer. The copy is DMA into pinned memory, so
-    /// the driver does not stage it; we wait once, after it is queued.
     fn recv<Src: DevicePtr<T>>(&mut self, stream: &Arc<CudaStream>, src: &Src) -> Res<Vec<T>> {
         let n = src.len();
         if n == 0 {
@@ -622,8 +330,6 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy> Hos
     }
 }
 
-/// One host buffer and the device buffer it is sent to, kept together and kept
-/// between rounds. A round's staging is a fixed set of these, by role.
 #[derive(Default)]
 struct Wire<T> {
     host: Host<T>,
@@ -656,21 +362,10 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default +
     }
 }
 
-/// A work item packs the solve above the node's place inside its level. The
-/// kernels' `WORK_BITS` is the same split.
 const WORK_BITS: u32 = 20;
 
-/// A set of solves laid out as one batch, and the device arrays that describe
-/// it. Every stage of an iteration reads these, so laying them out once is what
-/// makes a round of thirty solves one launch a stage rather than thirty.
-///
-/// The device arrays are carved once, at the card's slot count times the
-/// budget. `lay` fills them; it does not allocate.
 struct Batch {
     trees: Wire<u64>,
-    /// One work item per (solve, node), bucketed by level: what a level's
-    /// launch hands to its blocks. `level_at[l]` is where level `l`'s bucket
-    /// starts.
     work: Wire<u32>,
     level_at: Vec<u32>,
     coff: Wire<u32>,
@@ -679,10 +374,6 @@ struct Batch {
     base: Wire<i32>,
     prime: Wire<u32>,
     touched: Wire<i32>,
-    /// Prefixes of the batch, one per solve count. The solves are laid out
-    /// longest-running first, so the ones still owed an iteration are always a
-    /// prefix -- and an iteration that fewer solves want is the same launch
-    /// with a shorter grid and fewer rows, at no host cost.
     upto: Vec<Prefix>,
     parts: u32,
     cells: usize,
@@ -708,56 +399,36 @@ impl Default for Batch {
 }
 
 impl Batch {
-    /// The whole batch, for the passes every member takes part in.
     fn all(&self) -> &Prefix {
         self.upto.last().expect("a batch has at least the empty prefix")
     }
 }
 
-/// What the first `parts` solves of a batch come to.
 #[derive(Default, Clone)]
 struct Prefix {
     parts: u32,
     rows: usize,
-    /// Work items these solves own, level by level. They are the first of each
-    /// bucket, so a launch covering a level is that many blocks from
-    /// `level_at[l]`.
     items: Vec<u32>,
-    /// The most terminals any one of them holds.
     nterm: usize,
 }
 
-/// Every write a round makes to its solves' arrays, gathered to be sent as one.
-///
-/// The pieces are small and there are thousands of them; concatenated they are
-/// one upload and one kernel. A solve hands over its words already
-/// concatenated, so the driver copies each solve's blob once and records where
-/// each run inside it lands.
 #[derive(Default)]
 struct Pack {
     blob: Vec<u32>,
     dst: Vec<u64>,
     at: Vec<u32>,
     src: Vec<u32>,
-    /// Prefix sum of the piece lengths, so the kernel can find its piece.
     sum: Vec<u32>,
-    /// Words the pieces move, which is more than the blob holds once a run has
-    /// two destinations.
     moved: u32,
 }
 
 impl Pack {
-    /// Add words to the blob and say where they landed.
     fn words(&mut self, w: &[u32]) -> u32 {
         let base = self.blob.len() as u32;
         self.blob.extend_from_slice(w);
         base
     }
 
-    /// Keep the buffers, drop the contents. A round concatenates tens of
-    /// megabytes, and building that from an empty `Vec` every time is a dozen
-    /// reallocations and thousands of first-touch page faults -- the same cost
-    /// `Stage` and `Scratch` are kept to avoid.
     fn clear(&mut self) {
         self.blob.clear();
         self.dst.clear();
@@ -781,73 +452,30 @@ impl Pack {
 
 struct Card {
     stream: Arc<CudaStream>,
-    /// The buffers and stream below belong to this card, so one round must own
-    /// them as a unit when callers share a device.
     busy: parking_lot::Mutex<()>,
     blas: CudaBlas,
     k: Arc<Kernels>,
-    /// Indexed by solve, which is the slot the farm pinned it to. Shared by
-    /// both cards of a GPU.
     solves: Arc<parking_lot::Mutex<Vec<Solve>>>,
-    /// Host staging for a round's batches, kept between rounds for the same
-    /// reason the device scratch is: a round concatenates sixteen megabytes of
-    /// public encodings, and building that from an empty `Vec` every time is
-    /// twenty-odd reallocations and four thousand first-touch page faults --
-    /// which measured at a quarter of the whole round.
     host: parking_lot::Mutex<Stage>,
-    /// A round's writes, kept between rounds for the same reason.
     pack: parking_lot::Mutex<Pack>,
-    /// Pinned landing pads for the downloads that end a round.
     down: parking_lot::Mutex<Host<u32>>,
     down_f: parking_lot::Mutex<Host<f32>>,
-    /// The batch index `lay` fills, carved once.
     batch: parking_lot::Mutex<Batch>,
-    /// Scratch for one pass, kept between rounds.
-    ///
-    /// A round's intermediates are hundreds of megabytes -- four hundred
-    /// thousand join rows at `D` wide is four hundred of them for the head
-    /// alone -- and allocating and freeing that every round is work the driver
-    /// does instead of the arithmetic. They are grown by role and reused, for
-    /// the same reason `docs/PERF.md` pools the host's five big buffers by
-    /// role rather than from one shared pool.
     scratch: parking_lot::Mutex<Scratch>,
-    /// The weights exactly as `NetLayout` describes them.
     w: CudaSlice<f32>,
-    /// The two square matrices of every trunk block, laid out the way a warp
-    /// of `mma.sync.m16n8k8` reads them. See `fragwise`.
     wt: CudaSlice<f32>,
-    /// The join's five matrices, packed the same way. See `join_pack`.
     jw: CudaSlice<f32>,
     b: CudaSlice<f32>,
     ln: CudaSlice<f32>,
-    /// Hex adjacency, `NONE` folded to `-1`.
     nb: CudaSlice<i32>,
     card_facts: CudaSlice<f32>,
     locations: CudaSlice<u8>,
-    /// What the join's residual stream is owed.
-    ///
-    /// Every block of the join adds its matrix multiply's bias to the same
-    /// stream, and the only thing that reads the stream is the norm at the top
-    /// of the next block. So the biases are never stored: this holds their
-    /// running sums, one per norm, and the norm adds the one it needs as it
-    /// reads. Five passes over `[rows, JW]` a call become none.
-    ///
-    /// Layout: `JBLOCKS + 1` sums of width `JW`, then the head's own bias of
-    /// width `D`.
     owed: CudaSlice<f32>,
-    /// Where every weight the fused trunk reads lives, in the order
-    /// `k_trunk` expects. Built once: the layout never moves, and a publish
-    /// replaces the numbers rather than their offsets.
     plan: CudaSlice<i32>,
     layout: NetLayout,
 }
 
 impl Device {
-    /// Bring up one card per ordinal, carve each into slots at `cfg.budget`.
-    ///
-    /// `max_slots` is the host's cap across every ordinal: the farm has already
-    /// asked how many host-side arenas fit, and a card that carved more than
-    /// that would sit empty.
     pub fn new(ordinals: &[usize], net: &Net, cfg: Cfg, max_slots: usize) -> Res<Device> {
         if ordinals.is_empty() {
             return Err("no cuda device ordinals given".into());
@@ -867,9 +495,6 @@ impl Device {
                 .collect::<Res<_>>()?;
             let s0 = Arc::clone(&pair[0].stream);
             s0.context().bind_to_thread().map_err(err)?;
-            // A first allocation on a cold context can include NVRTC scratch
-            // in the free-memory delta, so a slot looks like the whole card
-            // and the carve yields one. Warm, then measure a second probe.
             drop(Solve::at_budget(&s0, &budget)?);
             s0.synchronize().map_err(err)?;
             let free0 = cudarc::driver::result::mem_get_info().map_err(err)?.0 as u64;
@@ -888,19 +513,8 @@ impl Device {
             let extra = Card::carve_bytes(1, &cfg).saturating_sub(tile);
             let per = slot + PIPELINE as u64 * extra;
             let usable = free.saturating_sub(PIPELINE as u64 * tile);
-            // Slot cost is the allocation delta. Carve is many buffers; packing
-            // free to the last byte OOMs, so a tenth stays for fragmentation.
             let fit = (usable - usable / 10) / per.max(1);
             let gpus_left = ordinals.len() - g;
-            // `fit` prices a slot as `tile + n * extra`. Carve is
-            // `carve_bytes(n)` per pipe, which matches that only while every
-            // buffer is linear in n. Walk n down until the bytes that will
-            // actually be allocated fit.
-            // More residency is not more throughput: a swept 8-minute run per
-            // point (runs/perf1_slots{26b,64,128,max}, 2026-08-24) measured
-            // 190 / 215 / 96 / 62 solves/s at 26 / 64 / 128 / ~176 slots a
-            // card, with the GPU ~94% busy throughout -- past the knee the
-            // rounds grow faster than the card retires them. Carve the knee.
             const SLOTS_KNEE: usize = 64;
             let mut n = (fit as usize).min(left / gpus_left.max(1)).min(SLOTS_KNEE);
             while n > 0 {
@@ -919,9 +533,6 @@ impl Device {
             for _ in 0..n {
                 solves.push(Solve::at_budget(&s0, &budget)?);
             }
-            if let Some(s) = solves.first() {
-                *CENSUS.lock() = s.census();
-            }
             let solves = Arc::new(parking_lot::Mutex::new(solves));
             for (p, card) in pair.iter_mut().enumerate() {
                 card.solves = Arc::clone(&solves);
@@ -937,27 +548,22 @@ impl Device {
         Ok(Device { cards, n_gpus: ordinals.len(), slot_bytes })
     }
 
-    /// How many GPUs a round can be spread over. Each has `PIPELINE` cards.
     pub fn cards(&self) -> usize {
         self.n_gpus
     }
 
-    /// Slots this GPU holds. Admission is a pop from a free list of these.
     pub fn slots(&self, gpu: usize) -> usize {
         self.cards[gpu * PIPELINE].solves.lock().len()
     }
 
-    /// Slots across every GPU.
     pub fn total_slots(&self) -> usize {
         (0..self.n_gpus).map(|g| self.slots(g)).sum()
     }
 
-    /// Bytes one solve slot holds, summed from the arrays allocated at the budget.
     pub fn slot_bytes(&self) -> usize {
         self.slot_bytes
     }
 
-    /// Slots one physical GPU holds.
     pub fn slots_per_card(&self) -> usize {
         if self.n_gpus == 0 {
             0
@@ -966,7 +572,6 @@ impl Device {
         }
     }
 
-    /// Expand packed public rows with the same kernel the trunk uses.
     pub fn expand_rows(&self, rows: &[u8]) -> Res<Vec<f32>> {
         if rows.len() % ROW_BYTES != 0 {
             return Err("packed rows are not a multiple of ROW_BYTES".into());
@@ -999,13 +604,6 @@ impl Device {
         card.stream.memcpy_dtov(&out).map_err(err)
     }
 
-    /// Point the cards at new weights.
-    ///
-    /// A publish used to build a whole new `Device`: a CUDA context per card
-    /// and an NVRTC compile of every kernel, for a change that only ever
-    /// touches three arrays. Nothing else about a card depends on the weights,
-    /// and once a solve keeps state on the device the context cannot be torn
-    /// down under it anyway.
     pub(crate) fn set_weights(&mut self, net: &Net) -> Res<()> {
         if net.is_empty() {
             return Err("cannot publish empty weights to the device".into());
@@ -1028,39 +626,17 @@ impl Device {
         Ok(())
     }
 
-    /// Evaluate a round. A device error is not recoverable and not worth
-    /// limping past, so it stops the run.
-    /// `None` when the round could not be answered. The caller closes its
-    /// gate on that, so the cohort unwinds instead of parking on a card that
-    /// is never going to reply.
     pub fn run(&self, calls: &[Call], lane: usize) -> Option<Vec<Reply>> {
-        // `lane` is `gpu * PIPELINE + pipe`. Slots are shared per GPU; the
-        // farm pins a solve to a GPU for its whole life, and either pipe of
-        // that GPU may run the round.
-        let all: Vec<usize> = (0..calls.len()).collect();
-        match self.cards[lane].round(calls, &all) {
-            Ok(part) => {
-                let mut out: Vec<Reply> = (0..calls.len()).map(|_| Reply::default()).collect();
-                for (i, reply) in part {
-                    out[i] = reply;
-                }
-                Some(out)
-            }
-            Err(e) => {
-                eprintln!("cuda: lane {lane}: {e}");
-                None
-            }
+        let answered = self.cards[lane].round(calls).inspect_err(|e| {
+            eprintln!("cuda: lane {lane}: {e}");
+        });
+        let mut out: Vec<Reply> = (0..calls.len()).map(|_| Reply::default()).collect();
+        for (i, reply) in answered.ok()? {
+            out[i] = reply;
         }
+        Some(out)
     }
 
-    /// Everything one solve keeps on the card that the CPU network can also
-    /// produce, copied back.
-    ///
-    /// Nothing in a run reads any of it. The trunk's board vectors, the config
-    /// encoder's three rows and the policy prior are made here and consumed
-    /// here, so a round carries none of them home -- which is exactly why the
-    /// arithmetic that makes them needs a way to be asked. The parity test is
-    /// the only caller.
     pub fn resident(&self, card: usize, solve: usize) -> Res<Resident> {
         let c = &self.cards[card];
         let _busy = c.busy.lock();
@@ -1069,38 +645,28 @@ impl Device {
         let s = g.get(solve).ok_or_else(|| format!("solve {solve} is not resident"))?;
         let mut h = c.down_f.lock();
         Ok(Resident {
-            p: s.get_f32(&c.stream, Ent::Board, B_P, 0, s.ent[Ent::Board as usize].len() * D, &mut h)?,
-            jp: s.get_f32(&c.stream, Ent::Board, B_JP, 0, s.ent[Ent::Board as usize].len() * JW, &mut h)?,
-            f: s.get_f32(&c.stream, Ent::Config, G_F, 0, s.ent[Ent::Config as usize].len() * D, &mut h)?,
-            g: s.get_f32(&c.stream, Ent::Config, G_G, 0, s.ent[Ent::Config as usize].len() * POOL, &mut h)?,
-            fp: s.get_f32(&c.stream, Ent::Config, G_FP, 0, s.ent[Ent::Config as usize].len() * D, &mut h)?,
-            prior: s.get_f32(&c.stream, Ent::Cell, C_PRIOR, 0, s.ent[Ent::Cell as usize].len(), &mut h)?,
-            cur: s.get_f32(&c.stream, Ent::Cell, C_CUR, 0, s.ncells, &mut h)?,
-            sum: s.get_f32(&c.stream, Ent::Cell, C_SUM, 0, s.ncells, &mut h)?,
-            qval: s.get_f32(&c.stream, Ent::Cell, C_QVAL, 0, s.ncells, &mut h)?,
-            visits: s.get_f32(&c.stream, Ent::Cell, C_VISITS, 0, s.ncells, &mut h)?,
-            reach: s.get_f32(&c.stream, Ent::Reach, R_REACH, 0, s.nreach, &mut h)?,
+            p: s.ent[Ent::Board as usize].get_f32(&c.stream, B_P, 0, s.ent[Ent::Board as usize].len() * D, &mut h)?,
+            jp: s.ent[Ent::Board as usize].get_f32(&c.stream, B_JP, 0, s.ent[Ent::Board as usize].len() * JW, &mut h)?,
+            f: s.ent[Ent::Config as usize].get_f32(&c.stream, G_F, 0, s.ent[Ent::Config as usize].len() * D, &mut h)?,
+            g: s.ent[Ent::Config as usize].get_f32(&c.stream, G_G, 0, s.ent[Ent::Config as usize].len() * POOL, &mut h)?,
+            fp: s.ent[Ent::Config as usize].get_f32(&c.stream, G_FP, 0, s.ent[Ent::Config as usize].len() * D, &mut h)?,
+            prior: s.ent[Ent::Cell as usize].get_f32(&c.stream, C_PRIOR, 0, s.ent[Ent::Cell as usize].len(), &mut h)?,
+            cur: s.ent[Ent::Cell as usize].get_f32(&c.stream, C_CUR, 0, s.ncells, &mut h)?,
+            sum: s.ent[Ent::Cell as usize].get_f32(&c.stream, C_SUM, 0, s.ncells, &mut h)?,
+            qval: s.ent[Ent::Cell as usize].get_f32(&c.stream, C_QVAL, 0, s.ncells, &mut h)?,
+            visits: s.ent[Ent::Cell as usize].get_f32(&c.stream, C_VISITS, 0, s.ncells, &mut h)?,
+            reach: s.ent[Ent::Reach as usize].get_f32(&c.stream, R_REACH, 0, s.nreach, &mut h)?,
         })
     }
 }
 
-/// What `Device::resident` hands back: one solve's network state, in the same
-/// layout `Solver` keeps it in on the host.
 pub struct Resident {
-    /// A board vector a leaf row, and the join's projection of it.
     pub p: Vec<f32>,
     pub jp: Vec<f32>,
-    /// The readout's `f(c)`, the pooling's `g(c)` and the policy's `f_p(c)`.
     pub f: Vec<f32>,
     pub g: Vec<f32>,
     pub fp: Vec<f32>,
-    /// The PUCT prior, over every strategy cell of the tree.
     pub prior: Vec<f32>,
-    /// The CFR arenas the expansion phase reads, in `Solver`'s own layout.
-    /// Nothing in a run reads these either: the loop that makes them is here
-    /// and so is the growth that consumes them, so a round carries none of
-    /// them home. `Solver::replay_expansion` takes them to hold the host's
-    /// growth rule to the card's on the card's own numbers.
     pub cur: Vec<f32>,
     pub sum: Vec<f32>,
     pub qval: Vec<f32>,
@@ -1108,7 +674,6 @@ pub struct Resident {
     pub reach: Vec<f32>,
 }
 
-/// One GPU's context and kernels, shared by its two cards.
 struct Gpu {
     ctx: Arc<CudaContext>,
     k: Arc<Kernels>,
@@ -1118,63 +683,40 @@ struct Gpu {
 static GPUS: LazyLock<parking_lot::Mutex<HashMap<usize, Arc<Gpu>>>> =
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
+macro_rules! defines {
+    ($($name:ident),* $(,)?) => {
+        vec![$(format!("-D{}={}", stringify!($name), $name)),*]
+    };
+}
+
 fn compile_options(major: i32, minor: i32, trunk_blocks: usize) -> CompileOptions {
-    let define = |name: &str, value: usize| format!("-D{name}={value}");
+    let mut options = defines![
+        ROW_BYTES, PUBFEAT, N_HEXES, HEX_CH, HEX_FACTS, HEX_BLOCK, NTYPE, NSLOT, PILE_COUNTS,
+        CARD_FEATS, OFF_PILES, OFF_CARDS, OFF_LOOSE, PLAYER_SCALARS, ROW_IDS, ROW_HEX_OWNER,
+        ROW_HEX_SLOT, ROW_HEX_HEIGHT, ROW_HEX_MARKER, ROW_PILES, ROW_HAND_SIZE, ROW_FD_SIZE,
+        ROW_BAG_SIZE, ROW_INITIATIVE, ROW_INIT_MOVED, ROW_TO_ACT, ROW_PLIES, ROW_STACK_KIND,
+        ROW_STACK_OWED, PENDING_KINDS, CONT_CAP, TRUNK_ROWS,
+    ];
+    options.extend([
+        format!("--gpu-architecture=compute_{major}{minor}"),
+        format!("-DTRUNK_MIN_BLOCKS={trunk_blocks}"),
+        format!("-DTRUNK_C={C}"),
+        format!("-DJ_ROWS={JROWS}"),
+        format!("-DJ_W={JW}"),
+        format!("-DJ_IN={JOIN_K}"),
+        format!("-DJ_POOL={POOL}"),
+        format!("-DJ_D={D}"),
+        format!("-DJ_BLOCKS={JBLOCKS}"),
+        format!("-DMAX_MAIN_PLAYS={}", MAX_MAIN_PLAYS as usize),
+        format!("-DMAX_COINS={MAX_COINS:.1}f"),
+    ]);
     CompileOptions {
-        options: vec![
-            format!("--gpu-architecture=compute_{major}{minor}"),
-            format!("-DJ_ROWS={JROWS}"),
-            format!("-DTRUNK_C={C}"),
-            define("TRUNK_ROWS", TRUNK_ROWS),
-            format!("-DTRUNK_MIN_BLOCKS={trunk_blocks}"),
-            format!("-DJ_W={JW}"),
-            format!("-DJ_IN={JOIN_K}"),
-            format!("-DJ_POOL={POOL}"),
-            format!("-DJ_D={D}"),
-            format!("-DJ_BLOCKS={JBLOCKS}"),
-            define("ROW_BYTES", ROW_BYTES),
-            define("PUBFEAT", PUBFEAT),
-            define("N_HEXES", N_HEXES),
-            define("HEX_CH", HEX_CH),
-            define("HEX_FACTS", HEX_FACTS),
-            define("HEX_BLOCK", HEX_BLOCK),
-            define("NTYPE", NTYPE),
-            define("NSLOT", NSLOT),
-            define("PILE_COUNTS", PILE_COUNTS),
-            define("CARD_FEATS", CARD_FEATS),
-            define("OFF_PILES", OFF_PILES),
-            define("OFF_CARDS", OFF_CARDS),
-            define("OFF_LOOSE", OFF_LOOSE),
-            define("PLAYER_SCALARS", PLAYER_SCALARS),
-            define("ROW_IDS", ROW_IDS),
-            define("ROW_HEX_OWNER", ROW_HEX_OWNER),
-            define("ROW_HEX_SLOT", ROW_HEX_SLOT),
-            define("ROW_HEX_HEIGHT", ROW_HEX_HEIGHT),
-            define("ROW_HEX_MARKER", ROW_HEX_MARKER),
-            define("ROW_PILES", ROW_PILES),
-            define("ROW_HAND_SIZE", ROW_HAND_SIZE),
-            define("ROW_FD_SIZE", ROW_FD_SIZE),
-            define("ROW_BAG_SIZE", ROW_BAG_SIZE),
-            define("ROW_INITIATIVE", ROW_INITIATIVE),
-            define("ROW_INIT_MOVED", ROW_INIT_MOVED),
-            define("ROW_TO_ACT", ROW_TO_ACT),
-            define("ROW_PLIES", ROW_PLIES),
-            define("ROW_STACK_KIND", ROW_STACK_KIND),
-            define("ROW_STACK_OWED", ROW_STACK_OWED),
-            define("PENDING_KINDS", PENDING_KINDS),
-            define("CONT_CAP", CONT_CAP),
-            define("MAX_MAIN_PLAYS", MAX_MAIN_PLAYS as usize),
-            format!("-DMAX_COINS={MAX_COINS:.1}f"),
-        ],
-        include_paths: vec![
-            "/usr/local/cuda/include".into(),
-            "/usr/include".into(),
-        ],
+        options,
+        include_paths: vec!["/usr/local/cuda/include".into(), "/usr/include".into()],
         ..Default::default()
     }
 }
 
-/// Launch the row expander on memory and a stream owned by PyTorch.
 pub fn expand_rows_torch(
     rows: u64,
     cards: u64,
@@ -1206,8 +748,6 @@ pub fn expand_rows_torch(
     }
     gpu.torch.wait(&before).map_err(err)?;
 
-    // These are borrowed PyTorch allocations. `leak` below only keeps cudarc
-    // from freeing them; PyTorch retains their ownership.
     let rows = unsafe { gpu.torch.upgrade_device_ptr::<u8>(rows, n * ROW_BYTES) };
     let cards = unsafe { gpu.torch.upgrade_device_ptr::<f32>(cards, N_UNITS * CARD_FEATS) };
     let locations = unsafe { gpu.torch.upgrade_device_ptr::<u8>(locations, N_HEXES) };
@@ -1252,8 +792,6 @@ impl Gpu {
             return Ok(Arc::clone(gpu));
         }
         let ctx = CudaContext::new(ordinal).map_err(|e| format!("device {ordinal}: {e:?}"))?;
-        // Stream ordering is explicit, so the read/write events cudarc would
-        // otherwise create on every allocation buy nothing.
         unsafe { ctx.disable_event_tracking() };
         let threads = 4 * C;
         let max_threads = ctx
@@ -1277,15 +815,11 @@ impl Gpu {
             .map_err(err)? as usize;
         let trunk_blocks = (sm_shared / TRUNK_SHARED).max(1);
         let (major, minor) = ctx.compute_capability().map_err(err)?;
-        let ptx = compile_ptx_with_opts(
-            KERNELS,
-            compile_options(major, minor, trunk_blocks),
-        )
-        .map_err(|e| format!("nvrtc: {e:?}"))?;
+        let source = slot::tree_source() + KERNELS;
+        let ptx = compile_ptx_with_opts(&source, compile_options(major, minor, trunk_blocks))
+            .map_err(|e| format!("nvrtc: {e:?}"))?;
         let module = ctx.load_module(ptx).map_err(err)?;
         let k = Kernels::load(&module)?;
-        // A block of `k_trunk` holds three boards and asks for more than the
-        // forty-eight kilobytes a kernel gets without saying so out loud.
         k.trunk
             .set_attribute(
                 CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -1301,7 +835,7 @@ impl Gpu {
 
 impl Card {
     fn carve_bytes(n: usize, cfg: &Cfg) -> u64 {
-        RoundCap::of(n, &cfg.budget, cfg.s).bytes() as u64
+        Plan { stream: None, bytes: 0 }.build(n, cfg).map_or(0, |(_, _, _, b)| b as u64)
     }
 
     fn on(gpu: &Gpu, net: &Net) -> Res<Card> {
@@ -1334,10 +868,6 @@ impl Card {
         let t = layout.norms[LN_TRUNK];
         plan.extend([t.g as i32, t.b as i32]);
         let owed = owed_by_the_join(&layout, &flat.b);
-        // `k_leaf` reads the join's weights and norms as one run each, so the
-        // fused kernel takes three slices rather than thirteen. `NetLayout`
-        // lays them down back to back; this is where that is a requirement and
-        // not a coincidence.
         let mut at = layout.join_b.w + JOIN_IN * JW;
         for span in layout.join_w {
             assert_eq!(span.w, at, "the join's weights are not one run");
@@ -1375,62 +905,22 @@ impl Card {
         })
     }
 
-    /// Allocate this card's round buffers, once, at `RoundCap`. Slots live on
-    /// the GPU's shared pool.
     fn carve(&mut self, n: usize, cfg: &Cfg) -> Res<()> {
         if n == 0 {
             return Ok(());
         }
         self.stream.context().bind_to_thread().map_err(err)?;
-        let cap = RoundCap::of(n, &cfg.budget, cfg.s);
-        let s = &self.stream;
-        let mut scratch = Scratch::default();
-        scratch.pooled = Arr::with_cap(s, cap.pooled)?;
-        scratch.h = Arr::with_cap(s, cap.h)?;
-        scratch.z = Arr::with_cap(s, cap.z)?;
-        scratch.input = Arr::with_cap(s, cap.input)?;
-        scratch.leaves = Arr::with_cap(s, cap.leaves)?;
-        scratch.queries = Arr::with_cap(s, cap.queries)?;
-        scratch.piles = Arr::with_cap(s, cap.piles)?;
-        scratch.tokens = Arr::with_cap(s, cap.tokens)?;
-        scratch.projected = Arr::with_cap(s, cap.projected)?;
-        scratch.type_pool = Arr::with_cap(s, cap.type_pool)?;
-        scratch.loose = Arr::with_cap(s, cap.loose)?;
-        scratch.glob = Arr::with_cap(s, cap.glob)?;
-        scratch.facts = Arr::with_cap(s, cap.facts)?;
-        scratch.occupant = Arr::with_cap(s, cap.occupant)?;
-        scratch.x = Arr::with_cap(s, cap.x)?;
-        scratch.action = Arr::with_cap(s, cap.action)?;
-        scratch.bag = Arr::with_cap(s, cap.bag)?;
-        let mut stage = Stage::default();
-        stage.packed = Wire::with_cap(s, cap.packed)?;
-        stage.xpub = Arr::with_cap(s, cap.xpub)?;
-        stage.cards = Wire::with_cap(s, cap.cards)?;
-        stage.card_of_row = Wire::with_cap(s, cap.card_of_row)?;
-        stage.phi = Wire::with_cap(s, cap.phi)?;
-        stage.owner = Wire::with_cap(s, cap.owner)?;
-        stage.cfg_cards = Wire::with_cap(s, cap.cfg_cards)?;
-        stage.blob = Wire::with_cap(s, cap.blob)?;
-        stage.at = Wire::with_cap(s, cap.at)?;
-        stage.src = Wire::with_cap(s, cap.src)?;
-        stage.dst = Wire::with_cap(s, cap.dst)?;
-        stage.start = Wire::with_cap(s, cap.start)?;
-        let mut batch = Batch::default();
-        batch.trees = Wire::with_cap(s, cap.trees)?;
-        batch.work = Wire::with_cap(s, cap.work)?;
-        batch.coff = Wire::with_cap(s, cap.coff)?;
-        batch.part = Wire::with_cap(s, cap.part)?;
-        batch.local = Wire::with_cap(s, cap.local)?;
-        batch.base = Wire::with_cap(s, cap.base)?;
-        batch.prime = Wire::with_cap(s, cap.prime)?;
-        batch.touched = Wire::with_cap(s, cap.touched)?;
+        let plan = Plan { stream: Some(Arc::clone(&self.stream)), bytes: 0 };
+        let (scratch, stage, batch, _) = plan.build(n, cfg)?;
         *self.host.lock() = stage;
         *self.scratch.lock() = scratch;
         *self.batch.lock() = batch;
         Ok(())
     }
 
-    fn round(&self, calls: &[Call], mine: &[usize]) -> Res<Vec<(usize, Reply)>> {
+    fn round(&self, calls: &[Call]) -> Res<Vec<(usize, Reply)>> {
+        let mine: Vec<usize> = (0..calls.len()).collect();
+        let mine = &mine[..];
         let _busy = self.busy.lock();
         self.stream.context().bind_to_thread().map_err(err)?;
         let mut slots: Vec<usize> = mine.iter().map(|&i| calls[i].solve()).collect();
@@ -1452,27 +942,17 @@ impl Card {
                 .collect()
         };
         let mut out = Vec::with_capacity(mine.len());
-        // Named, because a driver error carries an errno and nothing else, and
-        // five stages of a round are five very different suspects.
         fn at(stage: &'static str) -> impl Fn(String) -> String {
             move |e| format!("{stage}: {e}")
         }
-        // These three are always timed. They are host work as much as device
-        // work -- the trunk marshals a batch, the tree copies a description --
-        // and a stage nobody times is where the round's time turns out to be.
-        // One pack for the round: every write it makes to a solve's arrays,
-        // wherever it is planned, travels as one buffer and one kernel.
         let mut pack = self.pack.lock();
         pack.clear();
-        self.wall(9, || self.trunk(calls, &pick(0), &mut pack)).map_err(at("trunk"))?;
-        self.wall(10, || self.configs(calls, &pick(1))).map_err(at("configs"))?;
-        self.wall(11, || self.tree(calls, &pick(2), &mut pack)).map_err(at("tree"))?;
-        self.wall(16, || self.scatter(&mut pack)).map_err(at("scatter"))?;
+        self.trunk(calls, &pick(0), &mut pack).map_err(at("trunk"))?;
+        self.configs(calls, &pick(1)).map_err(at("configs"))?;
+        self.tree(calls, &pick(2), &mut pack).map_err(at("tree"))?;
+        self.scatter(&mut pack).map_err(at("scatter"))?;
         drop(pack);
-        // After the scatter, which lays the uniform prior down over the cells
-        // this growth appended, and before the iteration, whose expansion
-        // phase reads what this writes.
-        self.wall(14, || self.priors(calls, &pick(2))).map_err(at("priors"))?;
+        self.priors(calls, &pick(2)).map_err(at("priors"))?;
         self.iterate(calls, &pick(3), &mut out).map_err(at("iterate"))?;
         self.read(calls, &pick(4), &mut out).map_err(at("read"))?;
         {
@@ -1484,14 +964,6 @@ impl Card {
         Ok(out)
     }
 
-    // ------------------------------------------------------------ primitives
-
-    /// `out[rows, o] = inp[rows, i] @ w[i, o] + beta * out[rows, o]`, the
-    /// row-major shape of `Lin::run`.
-    ///
-    /// cuBLAS is column-major, so the very same buffers read as their own
-    /// transposes give this with no transposes and no repacking: computing
-    /// `outᵀ[o, rows] = wᵀ[o, i] @ inpᵀ[i, rows]`.
     fn lin<A: DevicePtr<f32>, O: DevicePtrMut<f32>>(
         &self,
         s: Span,
@@ -1519,8 +991,6 @@ impl Card {
         unsafe { self.blas.gemm(cfg, &w, inp, out) }.map_err(err)
     }
 
-    /// The per-column bias the GEMM does not carry. A span with no bias is a
-    /// no-op, which is how `Lin::bias` behaves on an empty bias.
     fn bias(&self, s: Span, rows: usize, out: &mut CudaSlice<f32>) -> Res<()> {
         if s.b == usize::MAX || rows == 0 {
             return Ok(());
@@ -1536,7 +1006,6 @@ impl Card {
         .map_err(err)
     }
 
-    /// `Lin::run`: the GEMM and then the bias.
     fn run<A: DevicePtr<f32>>(
         &self,
         s: Span,
@@ -1548,8 +1017,6 @@ impl Card {
         self.bias(s, rows, out)
     }
 
-    /// `Norm::apply` when `act`, `Norm::plain` when not, in place. The join's
-    /// own four norms are inside `k_leaf`; this serves everything else.
     fn norm(&self, s: NormSpan, rows: usize, act: bool, x: &mut CudaSlice<f32>) -> Res<()> {
         if rows == 0 {
             return Ok(());
@@ -1567,16 +1034,11 @@ impl Card {
         .map_err(err)
     }
 
-
-    /// The slot the farm pinned this solve to. It was allocated at carve.
     fn slot<'g>(&self, g: &'g mut Vec<Solve>, solve: usize) -> &'g mut Solve {
         let n = g.len();
         g.get_mut(solve).unwrap_or_else(|| panic!("solve {solve} pinned to a card that holds {n} slots"))
     }
 
-    // ----------------------------------------------------------------- trunk
-
-    /// Every new leaf in the round: the board vector and the join cache.
     fn trunk(&self, calls: &[Call], mine: &[usize], pack: &mut Pack) -> Res<()> {
         if mine.is_empty() {
             return Ok(());
@@ -1589,7 +1051,8 @@ impl Card {
             assert_eq!(cards.len(), NTYPE * TYPE, "trunk card table");
             (packed, cards, *boards)
         };
-        let rows: usize = mine.iter().map(|&i| each(i).2).sum();
+        let sizes: Vec<usize> = mine.iter().map(|&i| each(i).2).collect();
+        let rows: usize = sizes.iter().sum();
         {
             let mut g = self.solves.lock();
             for &i in mine {
@@ -1601,7 +1064,6 @@ impl Card {
                 }
             }
         }
-        let mark = std::time::Instant::now();
         let s = &self.stream;
         {
             let mut stage = self.host.lock();
@@ -1620,43 +1082,23 @@ impl Card {
             let n = TILE.min(rows - board0);
             {
                 let mut stage = self.host.lock();
+                let tile = shards(&sizes, board0, n);
                 stage.packed.put(s, n * ROW_BYTES, |dst| {
-                    let (mut skip, mut wrote) = (board0, 0);
-                    for &i in mine {
-                        let (packed, _, boards) = each(i);
-                        if skip >= boards {
-                            skip -= boards;
-                            continue;
-                        }
-                        let take = (boards - skip).min(n - wrote);
-                        let a = skip * ROW_BYTES;
-                        dst[wrote * ROW_BYTES..(wrote + take) * ROW_BYTES]
-                            .copy_from_slice(&packed[a..a + take * ROW_BYTES]);
-                        wrote += take;
-                        skip = 0;
-                        if wrote == n {
-                            break;
-                        }
+                    let mut wrote = 0;
+                    for w in &tile {
+                        let packed = each(mine[w.call]).0;
+                        let a = w.at * ROW_BYTES;
+                        dst[wrote..wrote + w.len * ROW_BYTES]
+                            .copy_from_slice(&packed[a..a + w.len * ROW_BYTES]);
+                        wrote += w.len * ROW_BYTES;
                     }
-                    wrote * ROW_BYTES
+                    wrote
                 })?;
                 stage.card_of_row.put(s, n, |dst| {
-                    let (mut skip, mut wrote, mut card) = (board0, 0, 0i32);
-                    for &i in mine {
-                        let boards = each(i).2;
-                        if skip >= boards {
-                            skip -= boards;
-                            card += 1;
-                            continue;
-                        }
-                        let take = (boards - skip).min(n - wrote);
-                        dst[wrote..wrote + take].fill(card);
-                        wrote += take;
-                        skip = 0;
-                        card += 1;
-                        if wrote == n {
-                            break;
-                        }
+                    let mut wrote = 0;
+                    for w in &tile {
+                        dst[wrote..wrote + w.len].fill(w.call as i32);
+                        wrote += w.len;
                     }
                     wrote
                 })?;
@@ -1680,15 +1122,12 @@ impl Card {
                 }
                 .map_err(err)?;
             }
-            self.trunk_tile(calls, mine, board0, n)?;
+            self.trunk_tile(calls, mine, &sizes, board0, n)?;
             board0 += n;
         }
-        LEAF_NS[12].fetch_add(mark.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         self.keep(calls, mine, pack)
     }
 
-    /// Run the shared board encoder on rows already staged in `xpub`.
-    /// The global head reads `input`; the policy reads `tokens` and `x`.
     fn encode_boards(&self, n: usize) -> Res<()> {
         let stage = self.host.lock();
         let xpub = stage.xpub.buf.as_ref().expect("carved");
@@ -1713,16 +1152,7 @@ impl Card {
         let Scratch {
             piles, tokens, projected, type_pool, loose, glob, facts, occupant, x, input, ..
         } = &mut *sc;
-        let piles = piles.buf.as_mut().unwrap();
-        let tokens = tokens.buf.as_mut().unwrap();
-        let projected = projected.buf.as_mut().unwrap();
-        let type_pool = type_pool.buf.as_mut().unwrap();
-        let loose = loose.buf.as_mut().unwrap();
-        let glob = glob.buf.as_mut().unwrap();
-        let facts = facts.buf.as_mut().unwrap();
-        let occupant = occupant.buf.as_mut().unwrap();
-        let x = x.buf.as_mut().unwrap();
-        let input = input.buf.as_mut().unwrap();
+        carved!(piles, tokens, projected, type_pool, loose, glob, facts, occupant, x, input);
 
         let (off, width) = (OFF_PILES as i32, (NTYPE * PILE_COUNTS) as i32);
         launch!(self, window, n * NTYPE * PILE_COUNTS, xpub, &mut *piles, &rows_i, &stride, &off, &width)?;
@@ -1759,8 +1189,7 @@ impl Card {
         .map_err(err)
     }
 
-    /// Encode `n` new leaf boards and keep their global value representation.
-    fn trunk_tile(&self, calls: &[Call], mine: &[usize], board0: usize, n: usize) -> Res<()> {
+    fn trunk_tile(&self, calls: &[Call], mine: &[usize], sizes: &[usize], board0: usize, n: usize) -> Res<()> {
         self.encode_boards(n)?;
         let s = &self.stream;
         let mut sc = self.scratch.lock();
@@ -1771,40 +1200,27 @@ impl Card {
         let jp = z.buf.as_mut().unwrap();
         self.run(self.layout.board_out, input.buf.as_ref().unwrap(), n, &mut *p)?;
         self.run(self.layout.join_p, p, n, &mut *jp)?;
-        let mut skip = board0;
         let mut src = 0;
         let mut g = self.solves.lock();
-        for &i in mine {
-            let Call::Trunk { solve, boards_at, boards: nb, .. } = &calls[i] else {
+        for w in shards(sizes, board0, n) {
+            let Call::Trunk { solve, boards_at, .. } = &calls[mine[w.call]] else {
                 unreachable!("trunk shard holds only trunk calls")
             };
-            if skip >= *nb {
-                skip -= *nb;
-                continue;
-            }
-            let take = (*nb - skip).min(n - src);
-            let b = self.slot(&mut g, *solve);
-            b.copy_board(
+            self.slot(&mut g, *solve).copy_board(
                 s,
-                *boards_at + skip,
+                *boards_at + w.at,
                 p,
                 jp,
                 projected.buf.as_ref().unwrap(),
                 x.buf.as_ref().unwrap(),
                 src,
-                take,
+                w.len,
             )?;
-            src += take;
-            skip = 0;
-            if src == n {
-                break;
-            }
+            src += w.len;
         }
         Ok(())
     }
 
-    /// Keep the trunk's metadata, per solve. Board vectors were written by
-    /// `trunk_tile` before this runs.
     fn keep(
         &self,
         calls: &[Call],
@@ -1824,10 +1240,6 @@ impl Card {
             let words = pack.words(board_of);
             let dst = b.ent[Ent::Row as usize].field(Y_BOARD_OF, &self.stream);
             pack.piece(dst, *row0 as u32, words, nrows as u32);
-            // `coff` arrives relative to this call's own `cidx`, so it is
-            // shifted onto the resident index before it is stored. Row zero
-            // writes the leading zero; every later call overwrites it with its
-            // own first offset, the same number.
             let base = b.cells as u32;
             let shifted: Vec<u32> = coff.iter().map(|x| x + base).collect();
             b.host_coff.extend(shifted.iter().skip(1));
@@ -1843,10 +1255,6 @@ impl Card {
         Ok(())
     }
 
-    // --------------------------------------------------------------- configs
-
-    /// `f(c)` for the readout and `g(c)` for the pooling, for every config the
-    /// round asked about.
     fn configs(&self, calls: &[Call], mine: &[usize]) -> Res<()> {
         if mine.is_empty() {
             return Ok(());
@@ -1857,10 +1265,10 @@ impl Card {
             };
             assert_eq!(phi.len(), n * CFEAT, "config phi is not one row a config");
             assert_eq!(owner.len(), *n, "config owner is not one entry a config");
-            assert_eq!(cards.len(), NTYPE * TYPE, "config card table");
             (phi, owner, cards, *n)
         };
-        let n: usize = mine.iter().map(|&i| each(i).3).sum();
+        let sizes: Vec<usize> = mine.iter().map(|&i| each(i).3).collect();
+        let n: usize = sizes.iter().sum();
         let s = &self.stream;
         let l = &self.layout;
         {
@@ -1885,56 +1293,38 @@ impl Card {
             let k = TILE.min(n - cfg0);
             {
                 let mut stage = self.host.lock();
+                let tile = shards(&sizes, cfg0, k);
                 stage.phi.put(s, k * CFEAT, |dst| {
-                    let (mut skip, mut wrote) = (cfg0, 0);
-                    for &i in mine {
-                        let (ph, _, _, kn) = each(i);
-                        if skip >= kn {
-                            skip -= kn;
-                            continue;
-                        }
-                        let take = (kn - skip).min(k - wrote);
-                        let a = skip * CFEAT;
-                        dst[wrote * CFEAT..(wrote + take) * CFEAT]
-                            .copy_from_slice(&ph[a..a + take * CFEAT]);
-                        wrote += take;
-                        skip = 0;
-                        if wrote == k {
-                            break;
-                        }
+                    let mut wrote = 0;
+                    for w in &tile {
+                        let ph = each(mine[w.call]).0;
+                        let a = w.at * CFEAT;
+                        dst[wrote..wrote + w.len * CFEAT]
+                            .copy_from_slice(&ph[a..a + w.len * CFEAT]);
+                        wrote += w.len * CFEAT;
                     }
-                    wrote * CFEAT
+                    wrote
                 })?;
                 stage.owner.put(s, k, |dst| {
-                    let (mut skip, mut wrote, mut base) = (cfg0, 0, 0u32);
-                    for &i in mine {
-                        let (_, ow, _, kn) = each(i);
-                        if skip >= kn {
-                            skip -= kn;
-                            base += 2;
-                            continue;
-                        }
-                        let take = (kn - skip).min(k - wrote);
-                        for (d, &q) in dst[wrote..wrote + take].iter_mut().zip(&ow[skip..skip + take]) {
+                    let mut wrote = 0;
+                    for w in &tile {
+                        let ow = each(mine[w.call]).1;
+                        let base = (2 * w.call) as u32;
+                        for (d, &q) in dst[wrote..wrote + w.len].iter_mut().zip(&ow[w.at..w.at + w.len]) {
                             *d = q + base;
                         }
-                        wrote += take;
-                        skip = 0;
-                        base += 2;
-                        if wrote == k {
-                            break;
-                        }
+                        wrote += w.len;
                     }
                     wrote
                 })?;
             }
-            self.config_tile(calls, mine, cfg0, k)?;
+            self.config_tile(calls, mine, &sizes, cfg0, k)?;
             cfg0 += k;
         }
         Ok(())
     }
 
-    fn config_tile(&self, calls: &[Call], mine: &[usize], cfg0: usize, k: usize) -> Res<()> {
+    fn config_tile(&self, calls: &[Call], mine: &[usize], sizes: &[usize], cfg0: usize, k: usize) -> Res<()> {
         let s = &self.stream;
         let stage = self.host.lock();
         let phi = stage.phi.dev.buf.as_ref().expect("staged");
@@ -1942,7 +1332,7 @@ impl Card {
         let cards = stage.cfg_cards.dev.buf.as_ref().expect("staged");
         let l = &self.layout;
         let (n_i, nslot, cfeat) = (k as i32, NSLOT as i32, CFEAT as i32);
-        let (type_i, pool_i) = (TYPE as i32, POOL as i32);
+        let (ntype, type_i, pool_i) = (NTYPE as i32, TYPE as i32, POOL as i32);
         let width = 3 + TYPE;
         let mut sc = self.scratch.lock();
         sc.tokens.room(k * NSLOT * width)?;
@@ -1952,14 +1342,10 @@ impl Card {
         sc.pooled.room(k * POOL)?;
         sc.z.room(k * D)?;
         let Scratch { tokens, projected, facts, h, pooled, z, bag, .. } = &mut *sc;
-        let slots = tokens.buf.as_mut().unwrap();
-        let hidden = projected.buf.as_mut().unwrap();
-        let u = facts.buf.as_mut().unwrap();
-        let f = h.buf.as_mut().unwrap();
-        let g = pooled.buf.as_mut().unwrap();
-        let fp = z.buf.as_mut().unwrap();
-        let bag = bag.buf.as_mut().unwrap();
-        launch!(self, cfg_slots, k * NSLOT * width, phi, owner, cards, &mut *slots, &n_i, &nslot, &cfeat, &type_i)?;
+        carved!(tokens, projected, facts, h, pooled, z, bag);
+        let (slots, hidden, u) = (tokens, projected, facts);
+        let (f, g, fp) = (h, pooled, z);
+        launch!(self, cfg_slots, k * NSLOT * width, phi, owner, cards, &mut *slots, &n_i, &nslot, &cfeat, &ntype, &type_i)?;
         self.run(l.cfg1, slots, k * NSLOT, &mut *hidden)?;
         let hid = (k * NSLOT * CFGH) as i32;
         launch!(self, gelu, k * NSLOT * CFGH, &mut *hidden, &hid)?;
@@ -1969,44 +1355,19 @@ impl Card {
         self.run(l.cfg_f, u, k, &mut *f)?;
         self.run(l.cfg_g, u, k, &mut *g)?;
         self.run(l.cfg_p, u, k, &mut *fp)?;
-        launch!(self, bag, k * POOL, bag, phi, owner, &mut *g, &n_i, &nslot, &cfeat, &pool_i)?;
-        let mut skip = cfg0;
+        launch!(self, bag, k * POOL, bag, phi, owner, &mut *g, &n_i, &nslot, &ntype, &cfeat, &pool_i)?;
         let mut src = 0;
         let mut solves = self.solves.lock();
-        for &i in mine {
-            let kn = calls[i].rows();
-            let Call::Configs { solve, at: base, .. } = &calls[i] else {
+        for w in shards(sizes, cfg0, k) {
+            let Call::Configs { solve, at: base, .. } = &calls[mine[w.call]] else {
                 unreachable!("config shard holds only config calls")
             };
-            if skip >= kn {
-                skip -= kn;
-                continue;
-            }
-            let take = (kn - skip).min(k - src);
-            let b = self.slot(&mut solves, *solve);
-            b.copy_cfg(s, *base + skip, f, g, fp, src, take)?;
-            src += take;
-            skip = 0;
-            if src == k {
-                break;
-            }
+            self.slot(&mut solves, *solve).copy_cfg(s, *base + w.at, f, g, fp, src, w.len)?;
+            src += w.len;
         }
         Ok(())
     }
 
-    // ----------------------------------------------------------- the prior
-
-    /// Fill the policy prior of every node this round primed.
-    ///
-    /// The action encoder and the policy readout, against arrays the card
-    /// already holds: the node's own board vector, the config rows `f_p`, and
-    /// the tree's cells. `Solver::refresh_priors` used to run this on the host,
-    /// and the round downloaded a board vector per fresh leaf and an `f_p` row
-    /// per fresh config so that it could -- a quarter of a megabyte a solve a
-    /// round, for a handful of nodes.
-    ///
-    /// What the card does not hold is what an action *is* and which action each
-    /// strategy cell stands for. Both ride in the tree call.
     fn priors(&self, calls: &[Call], mine: &[usize]) -> Res<()> {
         let each = |i: usize| -> (&[Prime], &[u32], &[u32], f32) {
             let Call::Tree { prime, acts, cells, prior_temp, .. } = &calls[i] else {
@@ -2023,28 +1384,21 @@ impl Card {
         if solves.is_empty() {
             return Ok(());
         }
-        // One upload per tile: node metadata, action descriptors and cells.
-        let (mut part, mut node, mut row) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut act_at, mut cell_at, mut inv_t) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut act_node, mut desc, mut cells) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut nas, mut ncs) = (Vec::new(), Vec::new());
+        let (mut want, mut desc, mut cells): (Vec<(u32, u32, Prime)>, Vec<u32>, Vec<u32>) =
+            (Vec::new(), Vec::new(), Vec::new());
         for (p, &i) in mine.iter().filter(|&&i| !each(i).0.is_empty()).enumerate() {
             let (prime, a, c, temp) = each(i);
-            for q in prime {
-                act_node.extend(std::iter::repeat(node.len() as u32).take(q.na as usize));
-                part.push(p as u32);
-                node.push(q.node);
-                row.push(q.row);
-                act_at.push(desc.len() as u32 / crate::search::ACT_BYTES as u32 + q.at);
-                cell_at.push(cells.len() as u32 + q.cell_at);
-                inv_t.push((1.0f32 / temp.max(1e-6)).to_bits());
-                nas.push(q.na as usize);
-                ncs.push(q.nc);
-            }
+            let inv = (1.0f32 / temp.max(1e-6)).to_bits();
+            let at = (desc.len() / crate::search::ACT_BYTES) as u32;
+            let cell_at = cells.len() as u32;
+            want.extend(prime.iter().map(|q| {
+                let q = Prime { at: at + q.at, cell_at: cell_at + q.cell_at, ..*q };
+                (p as u32, inv, q)
+            }));
             desc.extend_from_slice(a);
             cells.extend_from_slice(c);
         }
-        let m = node.len();
+        let m = want.len();
         self.lay(&solves)?;
         let mut batch = self.batch.lock();
         let mut i = 0usize;
@@ -2052,36 +1406,37 @@ impl Card {
             let mut j = i;
             let mut na_c = 0usize;
             let mut wide = 0u32;
-            while j < m && (j - i) < TILE && na_c + nas[j] <= TILE {
-                na_c += nas[j];
-                wide = wide.max(ncs[j]);
+            while j < m && (j - i) < TILE && na_c + want[j].2.na as usize <= TILE {
+                na_c += want[j].2.na as usize;
+                wide = wide.max(want[j].2.nc);
                 j += 1;
             }
             if j == i {
-                na_c = nas[j];
-                wide = ncs[j];
+                na_c = want[j].2.na as usize;
+                wide = want[j].2.nc;
                 j = i + 1;
             }
-            let act0 = act_at[i] as usize;
-            let cell0 = cell_at[i] as usize;
-            let cell1 = if j < m { cell_at[j] as usize } else { cells.len() };
-            let act_at_r: Vec<u32> = act_at[i..j].iter().map(|x| x - act_at[i]).collect();
-            let cell_at_r: Vec<u32> = cell_at[i..j].iter().map(|x| x - cell_at[i]).collect();
-            let act_node_r: Vec<u32> = act_node[act0..act0 + na_c].iter().map(|x| x - i as u32).collect();
-            let mc = j - i;
+            let (act0, cell0) = (want[i].2.at as usize, want[i].2.cell_at as usize);
+            let cell1 = if j < m { want[j].2.cell_at as usize } else { cells.len() };
+            let col = |f: &dyn Fn(&(u32, u32, Prime)) -> u32| -> Vec<u32> {
+                want[i..j].iter().map(f).collect()
+            };
+            let act_node: Vec<u32> = (0..j - i)
+                .flat_map(|k| std::iter::repeat(k as u32).take(want[i + k].2.na as usize))
+                .collect();
             let flat: Vec<u32> = [
-                &part[i..j],
-                &node[i..j],
-                &row[i..j],
-                &act_at_r,
-                &cell_at_r,
-                &inv_t[i..j],
-                &act_node_r,
-                &desc[act0 * crate::search::ACT_BYTES..(act0 + na_c) * crate::search::ACT_BYTES],
-                &cells[cell0..cell1],
+                col(&|r| r.0),
+                col(&|r| r.2.node),
+                col(&|r| r.2.row),
+                col(&|r| r.2.at - want[i].2.at),
+                col(&|r| r.2.cell_at - want[i].2.cell_at),
+                col(&|r| r.1),
+                act_node,
+                desc[act0 * crate::search::ACT_BYTES..(act0 + na_c) * crate::search::ACT_BYTES].to_vec(),
+                cells[cell0..cell1].to_vec(),
             ]
             .concat();
-            self.prior_tile(&mut batch, &flat, mc, na_c, cell1 - cell0, wide)?;
+            self.prior_tile(&mut batch, &flat, j - i, na_c, cell1 - cell0, wide)?;
             i = j;
         }
         Ok(())
@@ -2116,12 +1471,9 @@ impl Card {
         sc.z.room(m * JW)?;
         sc.pooled.room((m * JW).max(m * AW))?;
         let Scratch { action, h, input, z: join_z, pooled, facts, .. } = &mut *sc;
-        let action_z = action.buf.as_mut().unwrap();
-        let hbuf = h.buf.as_mut().unwrap();
-        let board_proj = facts.buf.as_mut().unwrap();
-        let join_in = input.buf.as_mut().unwrap();
-        let join_z = join_z.buf.as_mut().unwrap();
-        let temp = pooled.buf.as_mut().unwrap();
+        carved!(action, h, facts, input, join_z, pooled);
+        let (action_z, hbuf, board_proj) = (action, h, facts);
+        let (join_in, temp) = (input, pooled);
         let kind = self.w.slice(l.act_kind..l.act_kind + crate::actions::N_KINDS * AW);
         let role = self.w.slice(l.act_role..l.act_role + 5 * AW);
         launch!(self, act_feats, na * AW, batch.trees.buf(), &part_d, &row_d,
@@ -2165,7 +1517,6 @@ impl Card {
         launch!(self, act_add, na * AW, &mut *action_z, board_proj, &act_node_d, &na_i, &aw_i)?;
         launch!(self, act_add, na * AW, &mut *action_z, temp, &act_node_d, &na_i, &aw_i)?;
         self.norm(l.norms[LN_ACT], na, true, &mut *action_z)?;
-        // `e` reuses `h` after the board rows are done.
         self.run(l.act_out, action_z, na, &mut *hbuf)?;
         const WARPS: u32 = 4;
         let cfg = LaunchConfig {
@@ -2184,13 +1535,6 @@ impl Card {
         .map_err(err)
     }
 
-    // ------------------------------------------------------------ the CFR loop
-
-    /// Bring each solve's tree, arenas and priors up to date with the host.
-    ///
-    /// Growth is the only thing the host still does inside a solve: it holds
-    /// the game rules, so it turns the sampled leaves into decision nodes and
-    /// describes them. Everything the description feeds stays here.
     fn tree(&self, calls: &[Call], mine: &[usize], pack: &mut Pack) -> Res<()> {
         if mine.is_empty() {
             return Ok(());
@@ -2206,8 +1550,6 @@ impl Card {
             if *fresh {
                 b.rewind_cfr(s)?;
             }
-            // One copy of the solve's words, then a piece per run saying where
-            // inside them each destination reads.
             let base = pack.words(&writes.blob);
             for r in &writes.runs {
                 let dst = b.plan(s, r.dst, r.at as usize, r.len as usize)?;
@@ -2228,14 +1570,12 @@ impl Card {
         Ok(())
     }
 
-    /// Send a round's writes: one buffer up, then the pieces a tile at a time.
     fn scatter(&self, pack: &mut Pack) -> Res<()> {
         if pack.moved == 0 {
             return Ok(());
         }
         let moved = pack.moved;
         pack.sum.push(moved);
-        LEAF_NS[17].fetch_add(4 * moved as u64, std::sync::atomic::Ordering::Relaxed);
         let s = &self.stream;
         let mut stage = self.host.lock();
         stage.blob.put(s, pack.blob.len(), copy(&pack.blob))?;
@@ -2263,24 +1603,13 @@ impl Card {
         Ok(())
     }
 
-    /// Lay a set of solves out as one batch. Fills the card's arena; does not allocate.
     fn lay(&self, solves: &[usize]) -> Res<()> {
         let mut batch = self.batch.lock();
-        // These are gathered into ordinary vectors first because the shape of
-        // the batch is not known until every solve has been read. They are
-        // small -- a descriptor apiece and an entry per leaf row.
         let (mut desc, mut coff): (Vec<u64>, Vec<u32>) = (Vec::new(), vec![0]);
         let (mut part_of_row, mut local_row, mut base): (Vec<i32>, Vec<i32>, Vec<i32>) =
             (Vec::new(), Vec::new(), Vec::new());
         let (mut rows, mut cells, mut nterm) = (0usize, 0u32, 0usize);
-        // One work item per (solve, node), bucketed by level, so a level's
-        // launch is exactly as many blocks as it has nodes. A grid sized by the
-        // widest solve instead paid that width at every solve of the round.
         let (mut bucket, mut items): (Vec<Vec<u32>>, Vec<u32>) = (Vec::new(), Vec::new());
-        // `upto[k]` is the batch made of the first `k` solves. Because the
-        // items of a level are in solve order, those solves own a prefix of
-        // every bucket, so running an iteration that only some of them want is
-        // still a matter of a shorter grid with nothing rebuilt.
         let mut upto: Vec<Prefix> = vec![Prefix::default()];
         {
             let g = self.solves.lock();
@@ -2340,10 +1669,6 @@ impl Card {
         Ok(())
     }
 
-    /// A value pass under the reference strategy, for a whole batch: the
-    /// reaches, the network at every leaf, the terminals, and backpropagation
-    /// that averages rather than updating regret. This is what a solve's
-    /// targets are read off.
     fn value_pass(&self, b: &Batch) -> Res<()> {
         let all = b.all();
         self.reaches(b, all, 1, false, 0)?;
@@ -2352,47 +1677,6 @@ impl Card {
         self.backprop(b, all, 1, 0, Cfr::LINEAR)
     }
 
-    /// Time a stage's wall clock, always. No synchronise: what these cost is
-    /// the host work in them, and the launches they queue are paid for by
-    /// whichever stage synchronises next.
-    fn wall<T>(&self, slot: usize, f: impl FnOnce() -> Res<T>) -> Res<T> {
-        let mark = std::time::Instant::now();
-        let got = f()?;
-        LEAF_NS[slot].fetch_add(
-            mark.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        Ok(got)
-    }
-
-    /// Time one device stage, when `WARCHEST_STAGES` asks for it. The
-    /// synchronise is the measurement: without it a launch returns before the
-    /// kernel has run and every stage but the last reads as free.
-    fn stage<T>(&self, slot: usize, f: impl FnOnce() -> Res<T>) -> Res<T> {
-        if !timing() {
-            return f();
-        }
-        let mark = std::time::Instant::now();
-        let got = f()?;
-        self.stream.synchronize().map_err(err)?;
-        LEAF_NS[slot].fetch_add(
-            mark.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        Ok(got)
-    }
-
-    /// One CFR iteration and one expansion phase, for every solve in the round.
-    ///
-    /// The whole iteration is here: reach forward, the network at every leaf,
-    /// value backpropagation and the regret update for both traversers, the
-    /// average strategy, and the trajectories that say where the tree grows
-    /// next. The only thing that crosses the bus is the handful of leaves the
-    /// expansion sampled.
-    ///
-    /// A level's nodes never depend on each other and neither do two solves, so
-    /// one launch covers a whole level of the whole round: `blockIdx.x` names a
-    /// work item and the item names the solve and the node.
     fn iterate(&self, calls: &[Call], mine: &[usize], out: &mut Vec<(usize, Reply)>) -> Res<()> {
         if mine.is_empty() {
             return Ok(());
@@ -2400,11 +1684,6 @@ impl Card {
         fn at(stage: &'static str) -> impl Fn(String) -> String {
             move |e| format!("{stage}: {e}")
         }
-        let mark = std::time::Instant::now();
-        // Longest-running first. A round holds solves at different points of
-        // their own sixty-four iterations, and once the tree is full a solve
-        // asks for its whole tail at once -- so the set still owed an iteration
-        // shrinks as the call proceeds, and sorting makes that set a prefix.
         let mut order: Vec<usize> = mine.to_vec();
         order.sort_by_key(|&i| std::cmp::Reverse(Self::asked(&calls[i]).0));
         let (rounds, puct, k) = {
@@ -2424,8 +1703,6 @@ impl Card {
                 else {
                     unreachable!("iterate shard holds only iterate calls")
                 };
-                // The regret rule is the run's, not a solve's; the step count
-                // and the two counts below are the solve's own.
                 assert_eq!((cfr.alpha, cfr.beta, cfr.gamma, cfr.predict, *p),
                            (k.alpha, k.beta, k.gamma, k.predict, puct),
                            "a round mixes two regret rules");
@@ -2444,25 +1721,11 @@ impl Card {
             }
         }
         let solves: Vec<usize> = order.iter().map(|&i| calls[i].solve()).collect();
-        let t_marshal = mark.elapsed();
-        let mark = std::time::Instant::now();
         self.lay(&solves).map_err(at("lay"))?;
         let b = self.batch.lock();
         self.scratch.lock().queries.room(query_total)?;
-        let t_up = mark.elapsed();
-        let mark = std::time::Instant::now();
 
-        // Every iteration this round was asked for, back to back, against the
-        // tree the host handed over -- which does not change until the round
-        // ends. Solves drop out of the grid as they finish their share.
-        //
-        // One reach propagation an iteration, at its end -- which is what
-        // `Solver::step` does. The device used to run a second one at the top
-        // of each iteration, recomputing exactly what the previous iteration's
-        // trailing sweep had left behind. What is left here is the one before
-        // the loop, which is not redundant: the tree grew since the last round
-        // and the new subtrees have no reaches yet.
-        self.stage(4, || self.reaches(&b, b.all(), 0, false, 0)).map_err(at("reach"))?;
+        self.reaches(&b, b.all(), 0, false, 0).map_err(at("reach"))?;
         for iter in 0..rounds {
             let live = order
                 .iter()
@@ -2481,9 +1744,8 @@ impl Card {
                     let mut to = query_at[i];
                     for q in query {
                         if q.iter as usize == iter {
-                            solves[*solve].copy_f32_to(
+                            solves[*solve].ent[Ent::Reach as usize].copy_f32_to(
                                 &self.stream,
-                                Ent::Reach,
                                 R_REACH,
                                 q.reach as usize,
                                 dst,
@@ -2496,24 +1758,16 @@ impl Card {
                 }
             }
             self.network(&b, p).map_err(at("net"))?;
-            self.stage(6, || self.terminals(b.trees.buf(), p)).map_err(at("terminals"))?;
-            self.stage(7, || self.backprop(&b, p, 0, it, k)).map_err(at("backprop"))?;
-            // The regret update moved both players' strategies, so the reaches
-            // the next iteration reads are stale until they are pushed down
-            // again -- and the average strategy accumulates against those.
-            self.stage(4, || self.reaches(&b, p, 0, true, it)).map_err(at("avg"))?;
-            // The phase reads the Q this iteration has just formed, so it
-            // belongs inside the loop: a round that runs several iterations
-            // samples several times and the host grows all of them at once.
+            self.terminals(b.trees.buf(), p).map_err(at("terminals"))?;
+            self.backprop(&b, p, 0, it, k).map_err(at("backprop"))?;
+            self.reaches(&b, p, 0, true, it).map_err(at("avg"))?;
             if sims > 0 {
-                self.stage(8, || {
+                {
                     self.expand(b.trees.buf(), b.parts, sims, puct, iter, rounds)
-                })
+                }
                 .map_err(at("expand"))?;
             }
         }
-        let t_launch = mark.elapsed();
-        let mark = std::time::Instant::now();
         let each = b.parts as usize * sims;
         let host = self.sampled(rounds * each)?;
         let query_host = if query_total == 0 {
@@ -2523,27 +1777,6 @@ impl Card {
             let src = scratch.queries.buf.as_ref().expect("query scratch is carved");
             self.down_f.lock().recv(&self.stream, &src.slice(..query_total))?
         };
-        let t_down = mark.elapsed();
-        for (slot, n) in [t_marshal, t_up, t_launch, t_down].iter().enumerate() {
-            LEAF_NS[slot].fetch_add(n.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        }
-        // The fattest solve this round held, array by array. `held` says the
-        // rate is memory-bound; this says which array to argue with.
-        {
-            let solves = self.solves.lock();
-            if let Some(c) = solves
-                .iter()
-                .map(Solve::census)
-                .max_by_key(|c| c.iter().map(|&(_, b)| b).sum::<usize>())
-            {
-                let mut best = CENSUS.lock();
-                if c.iter().map(|&(_, b)| b).sum::<usize>()
-                    > best.iter().map(|&(_, b)| b).sum::<usize>()
-                {
-                    *best = c;
-                }
-            }
-        }
         for (part, &i) in order.iter().enumerate() {
             let (iters, want) = Self::asked(&calls[i]);
             let mut leaves = Vec::with_capacity(iters * want);
@@ -2558,7 +1791,6 @@ impl Card {
         Ok(())
     }
 
-    /// What one iterate call asks for: iterations, and trajectories after them.
     fn asked(c: &Call) -> (usize, usize) {
         match c {
             Call::Iterate { iters, expand, .. } => (*iters, *expand),
@@ -2566,19 +1798,10 @@ impl Card {
         }
     }
 
-    /// What the host needs back once a solve is done.
-    ///
-    /// The reference strategy, then a value pass under it: the same two sweeps
-    /// and the same network, propagating and averaging under `avg` rather than
-    /// under the regret-matching iterate. Only the root's values and policy
-    /// cross back.
     fn read(&self, calls: &[Call], mine: &[usize], out: &mut Vec<(usize, Reply)>) -> Res<()> {
         if mine.is_empty() {
             return Ok(());
         }
-        // Batched like an iteration, and for the same reason: a value pass is
-        // most of a CFR iteration, and one solve's leaves are a couple of
-        // hundred rows, which no accelerator is interested in.
         let solves: Vec<usize> = mine.iter().map(|&i| calls[i].solve()).collect();
         self.lay(&solves)?;
         let mut b = self.batch.lock();
@@ -2592,8 +1815,6 @@ impl Card {
         b.touched.put(&self.stream, touched.len(), copy(&touched))?;
         self.finish(&b, b.all())?;
 
-        // Only a solve that is collected pays for the values. Those are laid
-        // out as their own batch so the pass runs over them alone.
         let want: Vec<usize> = mine
             .iter()
             .filter(|&&i| matches!(&calls[i],
@@ -2615,11 +1836,10 @@ impl Card {
             let s = &g[*solve];
             let mut root = Vec::new();
             for &(at, n) in vals_at {
-                root.extend(s.get_f32(&self.stream, Ent::Reach, R_VALS, at as usize, n as usize, &mut h)?);
+                root.extend(s.ent[Ent::Reach as usize].get_f32(&self.stream, R_VALS, at as usize, n as usize, &mut h)?);
             }
-            let policy = s.get_f32(
+            let policy = s.ent[Ent::Cell as usize].get_f32(
                 &self.stream,
-                Ent::Cell,
                 C_SUM,
                 policy_at.0 as usize,
                 policy_at.1 as usize,
@@ -2630,23 +1850,14 @@ impl Card {
         Ok(())
     }
 
-    /// The grid one level of one round takes: a block to each of the level's
-    /// work items, and `blockIdx.y` for whichever half the kernel splits on --
-    /// the player in the reach sweep, the traverser in backpropagation.
     fn grid(items: u32, split: u32) -> LaunchConfig {
         LaunchConfig {
             grid_dim: (items, split, 1),
-            // Four warps: the regret update gives a warp to each of a node's
-            // configs, and two of them left half the block idle at every node
-            // with more than two.
             block_dim: (128, 1, 1),
             shared_mem_bytes: 0,
         }
     }
 
-    /// Push the reach probabilities down from the root beliefs, level by level.
-    /// `also_avg` adds the reach-weighted iterate to the running strategy sum,
-    /// which needs exactly the reaches this pass has just made current.
     fn reaches(&self, b: &Batch, p: &Prefix, avg: i32, also_avg: bool, iter: i32)
         -> Res<()> {
         let (trees, work) = (b.trees.buf(), b.work.buf());
@@ -2675,8 +1886,6 @@ impl Card {
             }
             .map_err(err)?;
         }
-        // The root's own row. It is not a child of anything, so the sweep never
-        // reaches it and its share of the sum is a launch of its own.
         if also_avg && p.items.first().is_some_and(|&n| n > 0) {
             let (at, level_i) = (b.level_at[0] as i32, 0i32);
             unsafe {
@@ -2690,8 +1899,6 @@ impl Card {
         Ok(())
     }
 
-    /// Value backpropagation up the levels, for one traverser. `avg` averages
-    /// under the reference strategy and leaves the regrets alone.
     fn backprop(&self, b: &Batch, p: &Prefix, avg: i32, iter: i32, k: Cfr) -> Res<()> {
         for level in (0..p.items.len()).rev() {
             if p.items[level] == 0 {
@@ -2710,17 +1917,10 @@ impl Card {
         Ok(())
     }
 
-    /// The network at every leaf of the round, for both traversers at once.
-    ///
-    /// Pool the normalised beliefs, run the join and read the values out into
-    /// each solve's own value arena in one launch.
     #[allow(clippy::too_many_arguments)]
     fn network(&self, b: &Batch, p: &Prefix) -> Res<()> {
         let (trees, part_d, local_d, base_d, coff_d) =
             (b.trees.buf(), b.part.buf(), b.local.buf(), b.base.buf(), b.coff.buf());
-        // The active solves are a prefix of the batch, so their leaf rows are a
-        // prefix of the row arrays and the pass is the same launches over fewer
-        // of them.
         let stride = p.rows;
         if stride == 0 {
             return Ok(());
@@ -2728,10 +1928,6 @@ impl Card {
         let l = &self.layout;
         let tile = TILE.min(stride);
 
-        // `k_leaf` walks the join's five packed matrices, its four norms and
-        // the biases they are owed as three runs rather than as thirteen
-        // slices. `NetLayout` hands the unpacked weights out in that order,
-        // which `Card::on` checks once so this does not have to.
         let ln = l.norms[LN_JOIN];
         let join_ln = self.ln.slice(ln.g..ln.g + 2 * (JBLOCKS + 1) * JW);
         let mut q0 = 0usize;
@@ -2744,8 +1940,7 @@ impl Card {
             let hn = l.norms[LN_H];
             let g = self.ln.slice(hn.g..hn.g + hn.width);
             let hb = self.ln.slice(hn.b..hn.b + hn.width);
-            self.stage(5, || {
-                unsafe {
+            unsafe {
                     self.stream
                         .launch_builder(&self.k.leaf)
                         .arg(trees).arg(part_d).arg(local_d).arg(base_d).arg(coff_d)
@@ -2758,14 +1953,12 @@ impl Card {
                             shared_mem_bytes: 0,
                         })
                 }
-                .map_err(err)
-            })?;
+            .map_err(err)?;
             q0 += n;
         }
         Ok(())
     }
 
-    /// Terminal leaves, scored from the game rather than from the network.
     fn terminals(&self, trees: &CudaSlice<u64>, p: &Prefix) -> Res<()> {
         if p.nterm == 0 {
             return Ok(());
@@ -2783,15 +1976,6 @@ impl Card {
         .map_err(err)
     }
 
-    /// The expansion phase: a solve's `sims` distinct leaves, and it draws
-    /// trajectories until it has them. The draws of one phase run in order,
-    /// because each counts the visits it passes and the next is meant to see
-    /// them -- and so do the phases, which is why the round's `iters` phases
-    /// share one buffer and one download.
-    ///
-    /// The kernel is handed the whole buffer rather than this phase's slice of
-    /// it: the leaves the round's earlier phases took are what a leaf is
-    /// checked against, and they are already in it.
     fn expand(&self, trees: &CudaSlice<u64>, parts: u32, sims: usize, puct: f32,
               iter: usize, iters: usize) -> Res<()> {
         let each = parts as usize * sims;
@@ -2814,9 +1998,6 @@ impl Card {
         .map_err(err)
     }
 
-    /// The leaves every phase of this round sampled, laid out by phase then by
-    /// solve. The download is what ends the round: nothing else the iterations
-    /// produced has a reader on the host.
     fn sampled(&self, n: usize) -> Res<Vec<u32>> {
         if n == 0 {
             return Ok(Vec::new());
@@ -2826,9 +2007,6 @@ impl Card {
         self.down.lock().recv(&self.stream, &out.slice(0..n))
     }
 
-    /// The reference strategy, once the tree has stopped growing.
-    /// `touched` is per solve: which players' running sums have moved, or `-1`
-    /// for a solve that is not asking for this at all.
     fn finish(&self, b: &Batch, p: &Prefix) -> Res<()> {
         let touched = b.touched.buf();
         for level in 0..p.items.len() {
@@ -2849,13 +2027,6 @@ impl Card {
 
 }
 
-/// Everything a round sends, by role, host buffer and device buffer together.
-///
-/// Kept between rounds. A round concatenates tens of megabytes of public
-/// encodings, and building that from an empty buffer every time is twenty-odd
-/// reallocations and thousands of first-touch page faults -- which measured at
-/// a quarter of the whole round. The page-locked half is why the copies no
-/// longer block; see `Host`.
 #[derive(Default)]
 struct Stage {
     packed: Wire<u8>,
@@ -2872,23 +2043,14 @@ struct Stage {
     start: Wire<u32>,
 }
 
-/// The intermediates of one pass, by role. Each is fully written before it is
-/// read, so they are grown rather than cleared.
 #[derive(Default)]
 struct Scratch {
-    /// Config pooling scratch.
     pooled: Arr<f32>,
-    /// Trunk board vectors and the config encoder's `f`.
     h: Arr<f32>,
-    /// Trunk join-cache / config `f_p`.
     z: Arr<f32>,
-    /// Trunk `board_out` input.
     input: Arr<f32>,
-    /// `[parts * sims]` the leaves an expansion phase sampled.
     leaves: Arr<u32>,
-    /// Query-time reach snapshots selected by the solve reservoirs.
     queries: Arr<f32>,
-    /// TILE trunk (and the config / prior passes that reuse these).
     piles: Arr<f32>,
     tokens: Arr<f32>,
     projected: Arr<f32>,
@@ -2902,7 +2064,93 @@ struct Scratch {
     bag: Arr<f32>,
 }
 
-/// The driver and cuBLAS error types are `Debug` only.
+struct Plan {
+    stream: Option<Arc<CudaStream>>,
+    bytes: usize,
+}
+
+impl Plan {
+    fn arr<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default>(
+        &mut self,
+        cap: usize,
+    ) -> Res<Arr<T>> {
+        self.bytes += cap.max(1) * std::mem::size_of::<T>();
+        match &self.stream {
+            Some(s) => Arr::with_cap(s, cap),
+            None => Ok(Arr::default()),
+        }
+    }
+
+    fn wire<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default + Copy>(
+        &mut self,
+        cap: usize,
+    ) -> Res<Wire<T>> {
+        self.bytes += cap.max(1) * std::mem::size_of::<T>();
+        match &self.stream {
+            Some(s) => Wire::with_cap(s, cap),
+            None => Ok(Wire::default()),
+        }
+    }
+
+    fn build(mut self, n: usize, cfg: &Cfg) -> Res<(Scratch, Stage, Batch, usize)> {
+        let b = &cfg.budget;
+        let (nodes, rows, cidx) = (b.cap(Ent::Node), b.cap(Ent::Row), b.cap(Ent::Cidx));
+        let cards = n * NTYPE * TYPE;
+        let resident = FIELDS[0] * nodes
+            + FIELDS[1] * b.cap(Ent::Cell)
+            + FIELDS[2] * b.cap(Ent::Reach)
+            + FIELDS[3] * b.cap(Ent::Draw)
+            + FIELDS[4] * rows
+            + 2 * b.cap(Ent::Config)
+            + cidx;
+        let scratch = Scratch {
+            pooled: self.arr(2 * TILE * POOL)?,
+            h: self.arr(2 * TILE * D)?,
+            z: self.arr(TILE * D)?,
+            input: self.arr(TILE * (2 * C + LOOSE))?,
+            leaves: self.arr(n * cfg.s.max(1) as usize)?,
+            queries: self.arr(n * b.cap(Ent::Config))?,
+            piles: self.arr(TILE * NTYPE * PILE_COUNTS)?,
+            tokens: self.arr(TILE * NTYPE * TYPE)?,
+            projected: self.arr(TILE * NTYPE * C)?,
+            type_pool: self.arr(TILE * C)?,
+            loose: self.arr(TILE * LOOSE)?,
+            glob: self.arr(TILE * C)?,
+            facts: self.arr(TILE * N_HEXES * HEX_FACTS)?,
+            occupant: self.arr(TILE * N_HEXES)?,
+            x: self.arr(TILE * N_HEXES * C)?,
+            action: self.arr(TILE * AW)?,
+            bag: self.arr(n * NTYPE * 3 * POOL)?,
+        };
+        let stage = Stage {
+            packed: self.wire(TILE * ROW_BYTES)?,
+            xpub: self.arr(TILE * PUBFEAT)?,
+            cards: self.wire(cards)?,
+            card_of_row: self.wire(TILE)?,
+            phi: self.wire(TILE * CFEAT)?,
+            owner: self.wire(TILE)?,
+            cfg_cards: self.wire(cards)?,
+            blob: self.wire(n * (resident + rows + cidx + 2 * rows + 1))?,
+            dst: self.wire(TILE)?,
+            at: self.wire(TILE)?,
+            src: self.wire(TILE)?,
+            start: self.wire(TILE + 1)?,
+        };
+        let batch = Batch {
+            trees: self.wire(n * DESC)?,
+            work: self.wire(n * nodes)?,
+            coff: self.wire(n * (2 * rows + 1))?,
+            part: self.wire(n * rows)?,
+            local: self.wire(n * rows)?,
+            base: self.wire(n)?,
+            prime: self.wire(12 * TILE + n * b.cap(Ent::Cell))?,
+            touched: self.wire(n)?,
+            ..Batch::default()
+        };
+        Ok((scratch, stage, batch, self.bytes))
+    }
+}
+
 fn err(e: impl std::fmt::Debug) -> String {
     format!("{e:?}")
 }

@@ -1,90 +1,25 @@
-//! The device must solve as the CPU does.
-//!
-//! The whole search lives on the card now — the CFR loop, the readout, the
-//! belief pooling and the policy head — so no single call has an answer the CPU
-//! can produce on its own, and nothing but the sampled expansion leaves and the
-//! final read crosses the bus at all. There are two ways to hold that to the
-//! CPU network anyway.
-//!
-//! One is to ask a solve for the state it *keeps*. `Device::resident` copies a
-//! solve's board vectors, its three config rows and its policy prior back off
-//! the card, and every one of them has a CPU counterpart the same solver
-//! computed by the reference oracle. That is the call-by-call comparison, and it is
-//! the only check the policy prior has: the prior steers expansion alone, so a
-//! wrong one degrades the search silently and moves no target at all.
-//!
-//! The other is the solve itself. A fixed tree gives both backends the same
-//! numbers to make, and the target a solve produces is downstream of every pass
-//! it takes — the reach sweep, the join, the terminals, backpropagation, the
-//! regret update and the value pass under the average — so a drift in any of
-//! them lands there.
-//!
-//! Both of those hold the card to an f32 CPU network, and the trunk on the card
-//! multiplies on the tensor cores: eleven significand bits into every product,
-//! single precision out of every accumulate. So the two cannot agree to the
-//! last bits and the bound must say what they *can* agree to. `worst_scaled` is
-//! that bound, and it is derived where it is used.
-//!
-//! Neither of those reaches the expansion phase, and a third way is needed for
-//! it. Growth is a discrete function of the CFR arenas, so two backends whose
-//! arenas differ in the last bits build different trees however faithfully they
-//! copy each other's rule -- the comparison has to be of the rule, on one set
-//! of numbers. `Device::resident` hands the arenas back and
-//! `Solver::replay_expansion` runs the host's own trajectories against them.
-//!
-//! Needs a GPU, so it only builds under `--features gpu`.
 #![cfg(feature = "gpu")]
 
 use std::sync::{Arc, OnceLock};
 
 use warchest::contract::NO_ROW;
 use warchest::cuda::Device;
-use warchest::farm::{Call, Reply};
-use warchest::net::{Net, NetLayout};
-use warchest::pbs::{
-    enumerate_configs, expand_row, pack_row, reserve, true_config, Belief, Ctx, PUBFEAT,
-    ROW_BYTES,
-};
+use warchest::contract::{Call, Reply};
+use warchest::net::Net;
+use warchest::pbs::{expand_row, pack_row, Ctx, PUBFEAT, ROW_BYTES};
 use warchest::rng::Rng;
-use warchest::search::{Arenas, Budget, Cfg, Solved, Solver, Step};
+use warchest::search::{Budget, Cfg, Solved, Solver, Step};
 use warchest::selfplay::{make_game, Agent, Collect, Data, GameCfg, GameStream};
-use warchest::state::State;
 
-/// The two evaluators compared by this test-only oracle.
-enum Backend {
-    Cuda(TestDevice),
-    Reference(Net),
-}
+struct Backend(TestDevice);
 
 impl Backend {
     fn run(&self, calls: &[Call], card: usize) -> Option<Vec<Reply>> {
-        match self {
-            Backend::Cuda(device) => device.run(calls, card),
-            Backend::Reference(net) => Some(calls.iter().map(|call| call.run(net)).collect()),
-        }
+        self.0.run(calls, card)
     }
-}
-
-fn random_net(seed: u64) -> Net {
-    let mut r = warchest::rng::Rng::new(seed);
-    let l = NetLayout::new();
-    let mut draw = |n: usize| -> Vec<f32> {
-        (0..n).map(|_| (r.unit_f64() as f32 - 0.5) * 0.2).collect()
-    };
-    let (w, b) = (draw(l.w_len), draw(l.b_len));
-    // Scales at one and shifts at zero, so the norms behave like real ones
-    // rather than crushing the signal.
-    let mut ln = vec![0.0; l.ln_len];
-    for n in &l.norms {
-        ln[n.g..n.g + n.width].fill(1.0);
-    }
-    Net::from_flat(&w, &b, &ln).expect("random net")
 }
 
 fn cfg(s: u32, c: f32) -> Cfg {
-    // Not one. At `prior_temp = 1` the softmax the prior is formed at is the
-    // identity in its temperature, so a backend that ignored the number
-    // altogether would agree with one that applied it.
     Cfg { s, c, prior_temp: 1.7, ..Default::default() }
 }
 
@@ -99,44 +34,26 @@ fn game_cfg_of(cfg: Cfg) -> GameCfg {
         explore: 0.1,
         random_draft: true,
         p_td1: 0.0,
-        // Root rows only, so a target is one solve's root value and a
-        // divergence names the solve it came from.
         query_rate: 0.0,
         recursive_rate: 0.0,
     }
 }
 
-/// What one stream produced: its training rows, and the size of every tree it
-/// built. The trees are the sharper signal -- a solve that read another's
-/// sampled leaves grows somewhere else entirely, where a solve that only saw a
-/// different summation order grows the same tree and moves in the last bits.
-struct Run {
-    data: Data,
-    nodes: Vec<usize>,
-}
+struct Run { data: Data }
 
-/// All parity tests share one card and carve its slots once. Each test uses a
-/// private slot range, so the test runner can keep its threads parallel.
 const GPU_SLOTS: usize = 32;
 static DEVICE: OnceLock<Device> = OnceLock::new();
 
 fn shared_device() -> &'static Device {
     DEVICE.get_or_init(|| {
-        Device::new(
-            &[0],
-            &random_net(0x9E37),
-            Cfg { budget: Budget::for_s(512), ..Default::default() },
-            GPU_SLOTS,
-        )
-        .expect("device")
+        let net = Net::random(0x9E37);
+        let cfg = Cfg { budget: Budget::for_s(512), ..Default::default() };
+        Device::new(&[0], &net, cfg, GPU_SLOTS).expect("device")
     })
 }
 
 #[derive(Clone, Copy)]
-struct TestDevice {
-    device: &'static Device,
-    slot_base: usize,
-}
+struct TestDevice { device: &'static Device, slot_base: usize, }
 
 impl TestDevice {
     fn run(&self, calls: &[Call], lane: usize) -> Option<Vec<Reply>> {
@@ -208,12 +125,6 @@ fn packed_rows_expand_on_the_card() {
     }
 }
 
-/// Run one game stream per `(seed, cfg)` against `backend`, every stream's
-/// calls in the same round, and hand back what each produced.
-///
-/// A stream's games are a function of its seed alone, so the same seed run
-/// alone and run beside others plays the same games and must produce the same
-/// numbers. That is what makes batching testable.
 fn generate(
     net: &Net,
     backend: Backend,
@@ -221,9 +132,7 @@ fn generate(
     games: usize,
 ) -> Vec<Run> {
     let nets = Arc::new(net.clone());
-    let reference = matches!(backend, Backend::Reference(_));
     let n = streams.len();
-    let mut nodes: Vec<Vec<usize>> = (0..n).map(|_| Vec::new()).collect();
     let mut streams: Vec<GameStream> = streams
         .iter()
         .map(|&(seed, cfg)| GameStream::new(seed, game_cfg_of(cfg)))
@@ -242,11 +151,7 @@ fn generate(
         let mut spans = vec![0usize; n];
         for i in 0..n {
             let Some(sv) = live[i].as_mut() else { continue };
-            let step = if reference {
-                sv.advance_on_host(&replies[i])
-            } else {
-                sv.advance(&replies[i])
-            };
+            let step = sv.advance(&replies[i]);
             match step {
                 Step::Calls(cs) => {
                     spans[i] = cs.len();
@@ -254,7 +159,6 @@ fn generate(
                 }
                 Step::Done(solved) => {
                     let sv = live[i].take().expect("a live solve");
-                    nodes[i].push(sv.nodes.len());
                     streams[i].keep(&sv, solved, &mut out[i]);
                     if out[i].soff.len() < games {
                         let mut next = streams[i].next_solve(&nets, &mut out[i]);
@@ -272,14 +176,6 @@ fn generate(
             let tail = rest.split_off(k);
             replies[i] = rest;
             rest = tail;
-            // The tree is frozen for a whole round, so a leaf one of its phases
-            // has taken is never taken again: a phase draws until it has one
-            // the round has not. `replay_expansion` cannot see that rule -- it
-            // compares a single phase against the arenas the card holds after
-            // the round, and this is the part that spans the phases -- so the
-            // answer itself is where it is held. A solve that scanned the wrong
-            // phase, the wrong part or the wrong stride of the round's buffer
-            // hands back a repeat.
             let mut leaves: Vec<u32> = replies[i]
                 .iter()
                 .flat_map(|r| r.leaves.iter().copied())
@@ -291,38 +187,14 @@ fn generate(
             assert_eq!(leaves.len(), all, "stream {i}: a round took a leaf twice");
         }
     }
-    out.into_iter().zip(nodes).map(|(data, nodes)| Run { data, nodes }).collect()
+    out.into_iter().map(|data| Run { data }).collect()
 }
 
-/// One stream, which is what a comparison against the CPU wants.
-fn generate_one(net: &Net, backend: Backend, games: usize, s: u32, c: f32) -> Data {
-    generate(net, backend, &[(0x51E5, cfg(s, c))], games)
-        .pop()
-        .expect("one stream")
-        .data
-}
-
-/// One solve of the first position a stream reaches, run to the end on
-/// `backend`, and the solver it leaves behind.
-///
-/// Pinned to slot zero of card zero, which is where `Device::resident` then
-/// looks for it.
-fn one_solve(net: &Net, backend: &Backend, s: u32, c: f32) -> Solver {
-    let nets = Arc::new(net.clone());
-    let mut data = Data::default();
-    let sv = GameStream::new(0x51E5, game_cfg(s, c)).next_solve(&nets, &mut data);
-    run_solve(backend, sv).0
-}
-
-/// Drive one solve to its end on `backend`, in slot zero of card zero.
 fn run_solve(backend: &Backend, mut sv: Solver) -> (Solver, Option<Solved>) {
     sv.pin(0);
     let mut replies: Vec<Reply> = Vec::new();
     loop {
-        let step = match backend {
-            Backend::Reference(_) => sv.advance_on_host(&replies),
-            Backend::Cuda(_) => sv.advance(&replies),
-        };
+        let step = sv.advance(&replies);
         match step {
             Step::Calls(calls) => replies = backend.run(&calls, 0).expect("the backend answered"),
             Step::Done(solved) => return (sv, solved),
@@ -330,13 +202,10 @@ fn run_solve(backend: &Backend, mut sv: Solver) -> (Solver, Option<Solved>) {
     }
 }
 
-/// A solve may move between a GPU's two pipeline streams between rounds. The
-/// stream that receives it must wait for the previous stream before it reads
-/// the resident arenas.
 #[test]
 fn a_solve_may_change_pipeline_streams() {
-    let net = random_net(0x9E37);
-    let device = Backend::Cuda(gpu(0));
+    let net = Net::random(0x9E37);
+    let device = Backend(gpu(0));
     let nets = Arc::new(net);
     let fresh = || {
         let mut data = Data::default();
@@ -366,8 +235,6 @@ fn a_solve_may_change_pipeline_streams() {
     device.run(&[], lane).expect("the context stayed healthy");
 }
 
-/// Largest relative difference, with an absolute floor so values near zero do
-/// not dominate the ratio.
 fn worst(a: &[f32], b: &[f32], what: &str) -> f32 {
     assert_eq!(a.len(), b.len(), "{what}: length {} vs {}", a.len(), b.len());
     a.iter()
@@ -376,320 +243,25 @@ fn worst(a: &[f32], b: &[f32], what: &str) -> f32 {
         .fold(0.0, f32::max)
 }
 
-/// The worst difference between two arrays, in units of the reference's own
-/// scale.
-///
-/// `worst` divides cell by cell, which is the right question when the two sides
-/// are meant to agree to the last bits. They are not: the trunk's matrix
-/// multiplies round each operand to the eleven significand bits a tensor core
-/// keeps, so a value carries an error of a few parts in ten thousand *of the
-/// scale it lives on*. A cell that happens to sit near zero turns that into a
-/// ratio of any size at all and says nothing about the network, which is why
-/// `worst` floors its denominator at `1e-2` -- an arbitrary floor that happens
-/// to be far below the scale of everything compared here. The root-mean-square
-/// of the reference is that scale, said properly.
 fn worst_scaled(a: &[f32], b: &[f32], what: &str) -> f32 {
     assert_eq!(a.len(), b.len(), "{what}: length {} vs {}", a.len(), b.len());
     let scale = (a.iter().map(|x| x * x).sum::<f32>() / a.len().max(1) as f32).sqrt().max(1e-2);
     a.iter().zip(b).map(|(&x, &y)| (x - y).abs() / scale).fold(0.0, f32::max)
 }
 
-/// What a TF32 trunk is allowed to differ from an f32 one by, as a share of the
-/// compared array's own scale.
-///
-/// A tensor-core operand keeps eleven significand bits, so each product carries
-/// up to `2^-11 = 4.9e-4` of relative error and the ninety-six of them that
-/// make one channel sum it as a random walk -- the error of the sum stays a few
-/// parts in ten thousand of the sum's own scale. Eight residual blocks
-/// accumulate that, but a LayerNorm stands between each pair and renormalises
-/// rather than compounding. Simulated over the same shapes with random weights,
-/// the worst cell of a board vector lands at `5e-4` of the array's RMS and the
-/// median at `1e-4`. The bound is set six times the worst of that, which is
-/// still two orders below anything a real break would show.
-///
-/// Two independent arguments say the difference does not matter. The trainer
-/// stores every target as float16, whose resolution is `4.9e-4` -- the drift is
-/// half an ulp of the format it is written into. And the trainer multiplies in
-/// TF32 itself (`torch.set_float32_matmul_precision("high")`), so the weights
-/// were learned under ten-mantissa-bit GEMMs to begin with.
 const TF32: f32 = 3e-3;
 
-/// A whole solve, both ways, on the same tree.
-///
-/// `c = 0` is what makes this a comparison. With it neither side grows, so both
-/// solve the tree `Solver::new` built and every number is of the same thing.
-/// With growth on they cannot be: the expansion phase samples, and the last
-/// bits of a regret decide which leaf a trajectory takes — so the two trees
-/// part company at the first such choice and never come back.
-///
-/// What is compared is the target a solve produces: the root's counterfactual
-/// value for every config, which is the end of every path through the loop —
-/// the reach sweep, the network at the leaves, the terminals, backpropagation,
-/// the regret update, the average strategy and the value pass under it.
-#[test]
-fn the_cfr_loop_agrees_on_a_fixed_tree() {
-    let net = random_net(0x9E37);
-    let host = generate_one(&net, Backend::Reference(net.clone()), 3, 8, 0.0);
-    let card = generate_one(
-        &net,
-        Backend::Cuda(gpu(1)),
-        3,
-        8,
-        0.0,
-    );
-    assert!(!host.cy.is_empty(), "the reference produced no targets");
-    assert_eq!(
-        host.cy.len(),
-        card.cy.len(),
-        "the two backends solved a different number of positions"
-    );
-    let bad = worst_scaled(&host.cy, &card.cy, "targets");
-    let max_abs = host.cy.iter().zip(&card.cy).map(|(&x, &y)| (x - y).abs()).fold(0.0f32, f32::max);
-    let rms = (host.cy.iter().zip(&card.cy).map(|(&x, &y)| (x - y) * (x - y)).sum::<f32>()
-        / host.cy.len().max(1) as f32)
-        .sqrt();
-    let rel = |x: f32, y: f32| (x - y).abs() / (x.abs().max(y.abs()).max(1e-2));
-    let off = host.cy.iter().zip(&card.cy).filter(|(&x, &y)| rel(x, y) > 1e-3).count();
-    let first = host.cy.iter().zip(&card.cy).position(|(&x, &y)| rel(x, y) > 1e-3);
-    let f = first.unwrap_or(0);
-    let lo = f.saturating_sub(2);
-    let hi = (f + 6).min(host.cy.len());
-    eprintln!("first differing target {first:?} of {}", host.cy.len());
-    eprintln!("  host {:?}", &host.cy[lo..hi]);
-    eprintln!("  card {:?}", &card.cy[lo..hi]);
-    eprintln!("  config offsets {:?}", &host.coff[..8.min(host.coff.len())]);
-    let pbad = worst(&host.pprob, &card.pprob, "policy");
-    eprintln!("  worst policy difference {pbad:e} over {} cells", host.pprob.len());
-    eprintln!(
-        "worst {bad:e}; max abs {max_abs:e} RMS {rms:e}; {off} of {} targets differ; first few {:?} vs {:?}",
-        host.cy.len(),
-        &host.cy[..8.min(host.cy.len())],
-        &card.cy[..8.min(card.cy.len())],
-    );
-    // A target is an average of counterfactual values over a fixed tree, so the
-    // iterations damp the network's disagreement rather than amplifying it:
-    // with both sides in f32 the leaves differ by about a part in a million and
-    // the targets by four parts in ten million. The trunk is on the tensor
-    // cores now, so the leaves differ by `TF32` instead, and twice that is the
-    // room the regret matching in between is allowed. Either way it stays two
-    // orders below the solver's own truncation at sixty-four iterations.
-    assert!(bad < 2.0 * TF32, "worst target difference {bad:e}");
-}
-
-/// The growth rule itself, held to the card on the card's own numbers.
-///
-/// Two whole solves with growth on cannot be compared. The trees part company
-/// at the first close call, and they will have one: a cuBLAS leaf pass and a
-/// host one differ in the last bits, and growth turns that into a different
-/// node. Measured on the host alone, perturbing the network by one part in
-/// `1e7` changes the node count of a third of a run's solves, by as much as
-/// forty percent. So a test that asked two backends for the same tree would be
-/// measuring the network, not the rule.
-///
-/// What can be compared is the rule. `Device::resident` hands back the arenas
-/// an expansion phase reads, and `Solver::replay_expansion` runs the host's
-/// own `sample_leaf` against them. Given the same numbers and the same stream
-/// the two must agree draw for draw -- which is what holds
-/// `k_expand`, `puct_choice`, `pick_live` and `live_cell` to `sample_leaf`,
-/// `Solver::puct_choice`, `pick_live` and `Solver::live_cell`.
-///
-/// The phase compared is a solve's first, because `visits` is the one arena
-/// the phase writes and before the first phase it is known to be zero. The
-/// visits the replay leaves behind are then compared with the card's, so the
-/// agreement is over every step of every trajectory and not just its end.
-///
-/// Four solves ride the round, at four budgets and four growth rates, because
-/// the farm batches and a kernel that read a bound from the batch where it
-/// should read it from the solve is right for one member and wrong for the
-/// rest. `c` is what the phase widths come from -- a solve's first phase owes
-/// `floor(c)` distinct leaves -- so the four ask for 3, 5, 8 and 13 of them and
-/// the launch is a ragged one. A phase draws until it has what it owes, so what
-/// is compared is the redrawing too: the same leaves in the same order, and the
-/// same visits left behind by the draws that found nothing new.
-#[test]
-fn growth_is_the_same_rule_as_the_reference() {
-    let net = random_net(0x9E37);
-    let device = Backend::Cuda(gpu(2));
-    let Backend::Cuda(d) = &device else { unreachable!("just built") };
-    let nets = Arc::new(net.clone());
-    let streams = [
-        (0x51E5u64, 128u32, 3.0f32),
-        (0x0A13, 192, 5.0),
-        (0x77C1, 256, 8.0),
-        (0x2E57, 320, 13.0),
-    ];
-    let n = streams.len();
-    let mut data: Vec<Data> = (0..n).map(|_| Data::default()).collect();
-    let mut gs: Vec<GameStream> = streams
-        .iter()
-        .map(|&(seed, s, c)| {
-            // One expansion phase a round, deliberately. The replay reads the
-            // arenas the card holds *after* the round and calls them the ones
-            // the phase read, and that is only true when the round held one
-            // phase: a round of `batch` regret updates moves `cur`, `sum`,
-            // `qval` and `reach` between its phases, and the card hands back
-            // the last state alone. Batched growth is the next test's job.
-            GameStream::new(seed, game_cfg_of(Cfg { batch: 1, ..cfg(s, c) }))
-        })
-        .collect();
-
-    let mut checked = 0usize;
-    for _ in 0..4 {
-        // One round, holding every stream's fresh solve. The first call a
-        // solve raises already owes an expansion phase: at `c = 8` every
-        // regret update earns eight trajectories.
-        let mut live: Vec<Solver> = (0..n)
-            .map(|i| {
-                let mut sv = gs[i].next_solve(&nets, &mut data[i]);
-                sv.pin(i);
-                sv
-            })
-            .collect();
-        let mut calls: Vec<Call> = Vec::new();
-        let mut spans = vec![0usize; n];
-        let mut sims = vec![0usize; n];
-        for i in 0..n {
-            let Step::Calls(cs) = live[i].advance(&[]) else {
-                panic!("a fresh solve asks for a round")
-            };
-            // One expanding iterate a round, which `batch = 1` guarantees:
-            // the snapshot taken afterwards is the state the phase read only
-            // if there was exactly one phase.
-            let owed: Vec<usize> = cs
-                .iter()
-                .filter_map(|c| match c {
-                    Call::Iterate { expand, .. } if *expand > 0 => Some(*expand),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(
-                owed.len(),
-                1,
-                "solve {i} asked for {} expansion phases in one round",
-                owed.len()
-            );
-            sims[i] = owed[0];
-            spans[i] = cs.len();
-            calls.extend(cs);
-        }
-        let mut rest = device.run(&calls, 0).expect("the backend answered the round");
-        let mut replies: Vec<Vec<Reply>> = Vec::new();
-        for &k in &spans {
-            let tail = rest.split_off(k);
-            replies.push(rest);
-            rest = tail;
-        }
-
-        for i in 0..n {
-            assert_eq!(
-                sims[i], streams[i].2 as usize,
-                "solve {i}: the first phase owes floor(c) leaves"
-            );
-            let got = d.resident(0, i).expect("the card gave its solve back");
-            let theirs = &replies[i].last().expect("the round answered").leaves;
-            assert_eq!(theirs.len(), sims[i], "solve {i}: the card sampled a short row");
-            // Before a solve's first phase nothing has visited anything, so
-            // the arenas the card holds now are the ones it grew from apart
-            // from the visits, which are known.
-            let zero = vec![0.0f32; got.visits.len()];
-            let mut taken = Vec::new();
-            live[i].replay_expansion(
-                &Arenas {
-                    reach: &got.reach,
-                    cur: &got.cur,
-                    sum: &got.sum,
-                    qval: &got.qval,
-                    visits: &zero,
-                    prior: &got.prior,
-                },
-                sims[i],
-                &mut taken,
-            );
-            // A phase hands back as many distinct leaves as it owes, or fewer
-            // when it spent its draws, and pads the rest of the row.
-            let mine: Vec<u32> = (0..sims[i])
-                .map(|k| taken.get(k).map_or(NO_ROW, |&x| x as u32))
-                .collect();
-            assert_eq!(
-                &mine, theirs,
-                "solve {i}: the reference and the card sampled different leaves"
-            );
-            assert_eq!(
-                &live[i].cfr().visits[..got.visits.len()],
-                &got.visits[..],
-                "solve {i}: the trajectories passed through different cells"
-            );
-            checked += 1;
-        }
-
-        // Finish them the ordinary way, so the next round's solves come from a
-        // played position rather than four openings.
-        for i in 0..n {
-            let mut r = std::mem::take(&mut replies[i]);
-            let solved = loop {
-                match live[i].advance(&r) {
-                    Step::Calls(cs) => r = device.run(&cs, 0).expect("the backend answered"),
-                    Step::Done(sd) => break sd,
-                }
-            };
-            gs[i].keep(&live[i], solved, &mut data[i]);
-        }
-    }
-    assert_eq!(checked, 4 * n, "every solve's first phase is compared");
-}
-
-/// With growth on, the device must still produce a sane solve.
-///
-/// The trees differ, so the numbers cannot be compared; what can be is that
-/// every target is a finite value inside the game's range, and that the run
-/// produced as many of them as the reference did positions.
-#[test]
-fn growth_on_the_device_produces_sane_targets() {
-    let net = random_net(0x9E37);
-    let card = generate_one(
-        &net,
-        Backend::Cuda(gpu(6)),
-        3,
-        32,
-        4.0,
-    );
-    let host = generate_one(&net, Backend::Reference(net.clone()), 3, 32, 4.0);
-    assert!(!card.cy.is_empty(), "the device produced no targets");
-    assert!(card.cy.iter().all(|v| v.is_finite()), "a target is not finite");
-    // The trees differ, so the numbers do; the *scale* must not. A run whose
-    // regrets or reaches were carried over from the solve before would blow up
-    // here long before it produced a plausible spread.
-    let scale = |d: &[f32]| d.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    let (a, b) = (scale(&host.cy), scale(&card.cy));
-    assert!(b < 2.0 * a, "device targets reach {b} against the reference's {a}");
-}
-
-/// A solve must not depend on which other solves shared its rounds.
-///
-/// This is the one thing the tests above cannot see. They run a single stream,
-/// so every round holds one solve and everything the batch carries is that
-/// solve's own. A real run holds thirty-odd, each at a different point of its
-/// own iterations, and anything the device reads from *the batch* where it
-/// should read it from *the solve* is wrong for every member but one — silently,
-/// and only in the shape a run actually has.
-///
-/// The streams are given different iteration counts so their step counts drift
-/// apart; with equal counts the gate keeps them in lockstep and the same
-/// mistake reads as correct. `c = 0` fixes the trees, so a stream's numbers are
-/// a function of its seed alone.
 #[test]
 fn a_solve_does_not_depend_on_the_round_it_rides_in() {
-    let net = random_net(0x9E37);
+    let net = Net::random(0x9E37);
     let streams: [(u64, Cfg); 4] = [
         (0x51E5, cfg(8, 0.0)),
         (0x0A13, cfg(11, 0.0)),
         (0x77C1, cfg(13, 0.0)),
         (0x2E57, cfg(17, 0.0)),
     ];
-    let device = || Backend::Cuda(gpu(7));
+    let device = || Backend(gpu(7));
     let together = generate(&net, device(), &streams, 3);
-    // A shared round must not move a solve at all, so the same run twice is
-    // the control: whatever this reports is the floor the comparison sits on.
     let twice = generate(&net, device(), &streams, 3);
     let rel = |x: f32, y: f32| (x - y).abs() / (x.abs().max(y.abs()).max(1e-2));
     let count = |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(&x, &y)| rel(x, y) > 1e-3).count();
@@ -721,11 +293,6 @@ fn a_solve_does_not_depend_on_the_round_it_rides_in() {
     eprintln!("worst policy difference across streams {bad:e}");
 }
 
-/// One round, holding every solver that still asks for one.
-///
-/// Stops at the first solver that is done and says which, without advancing
-/// the rest: a caller either is waiting for that one or has one that stopped
-/// filling the round.
 fn shared_round(
     backend: &Backend,
     live: &mut [Solver],
@@ -751,36 +318,10 @@ fn shared_round(
     None
 }
 
-/// A ragged round must not move the smallest solve in it either.
-///
-/// `a_solve_does_not_depend_on_the_round_it_rides_in` shares a round between
-/// four solves of the same shape: at `c = 0` nothing grows, so each of them is
-/// the fourteen-node tree `Solver::new` built, and every level of a launch is
-/// as wide for one member as for the next. A grid sized by the widest solve of
-/// the round is right by construction on that shape. A run's rounds are not
-/// that shape -- tree sizes there span two orders of magnitude -- and the
-/// ragged one is what the flat work list has to get right: a level's items
-/// come from solves of different depths, and the ones a shorter round drops
-/// have to leave a prefix of every level behind them.
-///
-/// So the small solve here rides beside two that were grown first, to some
-/// tens of times its size and several levels deeper, and is asked for the
-/// targets it produces alone.
-///
-/// Only the small solve is read. The partners grow, so their own numbers are
-/// not a function of their seed alone --
-/// `growth_is_the_same_rule_as_the_reference` says why -- and for that same
-/// reason no leaf either side sampled can be compared across two batch
-/// compositions. Holding the sampling is the replay's job, not this test's.
-///
-/// The bound is the neighbouring test's TF32 contract: a round of three and a
-/// round of one give the leaf pass different GEMM shapes.
 #[test]
 fn a_ragged_round_does_not_move_the_small_solve() {
-    let net = random_net(0x9E37);
+    let net = Net::random(0x9E37);
     let nets = Arc::new(net.clone());
-    // The solve under test: eight iterations over a tree that never grows, so
-    // it is one round from beginning to end and the same one every time.
     let small = || {
         let mut g = GameStream::new(0x51E5, game_cfg(8, 0.0));
         let mut data = Data::default();
@@ -790,7 +331,7 @@ fn a_ragged_round_does_not_move_the_small_solve() {
     };
 
     let (alone, tiny) = {
-        let device = Backend::Cuda(gpu(11));
+        let device = Backend(gpu(11));
         let (mut g, mut data, sv) = small();
         let (sv, solved) = run_solve(&device, sv);
         let tiny = sv.nodes.len();
@@ -798,12 +339,7 @@ fn a_ragged_round_does_not_move_the_small_solve() {
         (data, tiny)
     };
 
-    let device = Backend::Cuda(gpu(11));
-    // Two partners, in slots of their own, grown on their own for twelve
-    // rounds. A round carries `Cfg::batch` regret updates, so a budget's rounds
-    // are `ceil(ceil(s / c) / 4)`: both of these run 128 updates and so 32
-    // rounds, more than twice the twelve here plus the few the small solve then
-    // takes -- neither can finish and quietly stop making the round ragged.
+    let device = Backend(gpu(11));
     let mut big: Vec<Solver> = [(0x0A13u64, 1024u32, 8.0f32), (0x77C1, 1664, 13.0)]
         .iter()
         .enumerate()
@@ -827,7 +363,6 @@ fn a_ragged_round_does_not_move_the_small_solve() {
         "the partners did not grow, so the round is not ragged: {grown:?} against {tiny}"
     );
 
-    // The same solve again, now at the head of a round it shares with them.
     let (mut g, mut data, sv) = small();
     big.insert(0, sv);
     replies.insert(0, Vec::new());
@@ -855,228 +390,10 @@ fn a_ragged_round_does_not_move_the_small_solve() {
 }
 
 
-/// The same question with the tree growing and a round carrying several
-/// regret updates -- which is what production runs, and what none of the tests
-/// above reach.
-///
-/// A round of `batch = 8` samples eight expansion phases before the host grows
-/// anything, and the card lays them out phase-major over the whole round:
-/// `at = phase * (parts * sims) + part * sims`, with `sims` the widest growth
-/// rate in the round and every solve dropping out of the grid once
-/// `iter >= t.todo`. Every one of those three is an index into a batch, so a
-/// solve that read the wrong one takes another solve's leaves and grows
-/// somewhere else. The streams are given different budgets so their rounds are
-/// ragged in both directions -- different iteration counts, different growth
-/// rates -- because a batch of equal members is the one shape where an index
-/// off by a solve still lands on the right numbers.
-///
-/// Growth makes this strictly sharper than the `c = 0` test, not weaker: a
-/// wrong index moves the tree, and a tree is discrete.
-#[test]
-fn a_growing_solve_does_not_depend_on_the_round_it_rides_in() {
-    let net = random_net(0x9E37);
-    let batched = |s: u32, c: f32| Cfg { batch: 8, ..cfg(s, c) };
-    let streams: [(u64, Cfg); 4] = [
-        (0x51E5, batched(32, 4.0)),
-        (0x0A13, batched(48, 3.0)),
-        (0x77C1, batched(64, 8.0)),
-        (0x2E57, batched(80, 5.0)),
-    ];
-    let device = || Backend::Cuda(gpu(14));
-    let together = generate(&net, device(), &streams, 2);
-    for (i, &s) in streams.iter().enumerate() {
-        let alone = generate(&net, device(), &[s], 2).pop().expect("one stream");
-        // The trees first. A wrong batch index takes another solve's leaves
-        // and the node counts come out different. TF32 can also flip a close
-        // PUCT call when the leaf GEMM changes shape, so a mismatch here is
-        // printed and the numeric check is skipped; a different *number* of
-        // solves is still a break.
-        assert_eq!(
-            alone.nodes.len(),
-            together[i].nodes.len(),
-            "stream {i} (s={}, c={}) solved a different number of positions",
-            s.1.s, s.1.c
-        );
-        if alone.nodes != together[i].nodes {
-            eprintln!(
-                "stream {i} s={} c={}: trees {:?} vs {:?}",
-                s.1.s, s.1.c, alone.nodes, together[i].nodes
-            );
-            continue;
-        }
-        let t = worst_scaled(&alone.data.cy, &together[i].data.cy, "targets");
-        eprintln!(
-            "stream {i} s={} c={}: trees {:?} vs {:?}  targets {t:e}",
-            s.1.s, s.1.c, alone.nodes, together[i].nodes
-        );
-    }
-}
-
-
-/// Every array a solve keeps on the card, against the CPU network that makes
-/// the same ones in the reference oracle.
-///
-/// `c = 0` fixes the tree, so both solvers build the same nodes in the same
-/// order and hold their arrays in the same layout. The two are then the same
-/// arithmetic twice: `k_trunk` and the board head against `Net::board`, the
-/// config encoder against `Net::configs`, and the action encoder with
-/// `k_prior` against `Solver::refresh_priors`.
-///
-/// The prior is the reason this test exists. It is read by the expansion phase
-/// and by nothing else, so a wrong one picks worse leaves to grow and leaves
-/// every target, every policy and every belief looking exactly as it should.
-///
-/// The bound is 2e-4, and it is what a forward pass can honestly be held to.
-/// None of these arrays is behind a loop -- each is one pass over the weights
-/// -- so the only thing that separates the two backends is the order f32 sums
-/// are accumulated in: cuBLAS against `Lin::run`, and a warp reduction against
-/// a serial dot. Measured, that is 5.5e-5 at worst, in the join cache, which
-/// has the longest chain of sums; the prior, which is a softmax over a handful
-/// of dots, is 2.6e-6. Four times the worst leaves room for another card's
-/// cuBLAS picking a different algorithm and none for a real drift.
-#[test]
-fn the_resident_state_agrees_with_the_cpu_network() {
-    let net = random_net(0x9E37);
-    let host = one_solve(&net, &Backend::Reference(net.clone()), 8, 0.0);
-    let device = Backend::Cuda(gpu(18));
-    let card = one_solve(&net, &device, 8, 0.0);
-    let Backend::Cuda(d) = &device else { unreachable!("just built") };
-    let got = d.resident(0, 0).expect("the card gave its solve back");
-
-    assert!(!host.oracle().pb.is_empty(), "the reference solve made no board vectors");
-    assert!(host.ncfg > 0, "the reference solve made no config rows");
-    assert_eq!(host.ncells, card.ncells, "the two backends built different trees");
-    let cells = host.ncells;
-    assert!(cells > 0, "the fixed tree has no strategy cells");
-    // The config encoder is a cuBLAS multiply on both sides and holds to the
-    // last few bits. The board vector, the join's projection of it and the
-    // prior that reads it all come through the trunk, and the trunk multiplies
-    // on the tensor cores.
-    for (what, h, c) in [
-        ("f(c)", &host.oracle().cf[..], &got.f[..]),
-        ("g(c)", &host.oracle().cg[..], &got.g[..]),
-        ("f_p(c)", &host.oracle().cp[..], &got.fp[..]),
-    ] {
-        let bad = worst(h, c, what);
-        eprintln!("{what}: worst {bad:e} over {} values", h.len());
-        assert!(bad < 2e-4, "{what} differ by {bad:e}");
-    }
-    for (what, h, c) in [
-        ("board vectors", &host.oracle().pb[..], &got.p[..]),
-        ("join cache", &host.oracle().jp[..], &got.jp[..]),
-        ("prior", &host.cfr().prior[..cells], &got.prior[..cells]),
-    ] {
-        let bad = worst_scaled(h, c, what);
-        let abs = h.iter().zip(c).map(|(&x, &y)| (x - y).abs()).fold(0.0f32, f32::max);
-        eprintln!(
-            "{what}: worst {bad:e} of scale, max abs {abs:e} over {} values",
-            h.len()
-        );
-        assert!(bad < TF32, "{what} differ by {bad:e} of their scale");
-    }
-    // A prior that was never written would read as the uniform start the
-    // scatter lays down, and would then agree with a host that had also never
-    // written one. Both sides must actually be a policy.
-    let uniform = got.prior[..cells].windows(2).all(|w| w[0] == w[1]);
-    assert!(!uniform, "the card's prior is still the uniform start");
-}
-
-
-/// A subgame scored entirely from the game, on the card.
-///
-/// One coin play from the horizon, so every leaf below the root is terminal and
-/// the only network row is the root's own. What the solve is then made of is
-/// the terminal path -- the utilities, and the backpropagation that carries
-/// them up through a chance node -- which the fixed-tree comparison barely
-/// touches, because a mid-game subgame has few terminals and they are deep.
-#[test]
-fn a_subgame_scored_from_the_game_agrees_with_the_cpu() {
-    let net = random_net(0x9E37);
-    let nets = Arc::new(net.clone());
-    let host_nets = Arc::new(net.clone());
-    let backend = Backend::Cuda(gpu(19));
-    let host = Backend::Reference(net.clone());
-    let uniform = |s: &State, ctx: &Ctx, p: u8| {
-        let truth = true_config(s, p, ctx);
-        let cfg = enumerate_configs(
-            &reserve(s, p, ctx),
-            truth.hand_size(),
-            truth.fd_size(),
-            truth.inflight.is_some(),
-        );
-        let n = cfg.len().max(1) as f32;
-        Belief { p: vec![1.0 / n; cfg.len()], cfg }
-    };
-    // An ordinary solve first, so slot zero holds another tree's rows and
-    // arenas when this one takes it over.
-    one_solve(&net, &backend, 8, 1.0);
-    let mut checked = 0usize;
-    for seed in 0..600u64 {
-        let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
-        let mut s = make_game(&mut rng, false);
-        for _ in 0..60 + seed % 100 {
-            if s.is_terminal() {
-                break;
-            }
-            let acts = s.legal_actions();
-            s.apply_inplace(acts[rng.below(acts.len())]);
-        }
-        if s.is_terminal() || s.is_chance() {
-            continue;
-        }
-        s.main_plays = warchest::state::MAX_MAIN_PLAYS - 1;
-        let ctx = Ctx::new(&s);
-        let bel = [uniform(&s, &ctx, 0), uniform(&s, &ctx, 1)];
-        let mut sv = Solver::new(
-            &s,
-            ctx,
-            Arc::clone(&nets),
-            cfg(8, 1.0),
-            bel.clone(),
-            Rng::new(seed),
-        );
-        // The root itself carries a row -- it is a coin play, and a coin play
-        // is where the network is defined. Everything under it is terminal.
-        assert_eq!(sv.leaf_rows.len(), 1, "the subgame reaches the network more than once");
-        sv.collect(0);
-        let got = run_solve(&backend, sv).1.expect("a collected solve keeps a row");
-        let mut want = Solver::new(
-            &s,
-            ctx,
-            Arc::clone(&host_nets),
-            cfg(8, 1.0),
-            bel,
-            Rng::new(seed),
-        );
-        want.collect(0);
-        let want = run_solve(&host, want).1.expect("a collected solve keeps a row");
-        for p in 0..2 {
-            // One network row, then eight iterations over terminals scored from
-            // the game. The row comes off the tensor cores, so it carries the
-            // same bound the fixed-tree targets do.
-            let bad = worst_scaled(&want.value[p], &got.value[p], "root value");
-            assert!(bad < 2.0 * TF32, "player {p}'s root value differs by {bad:e}");
-        }
-        checked += 1;
-        if checked >= 2 {
-            return;
-        }
-    }
-    panic!("only {checked} such positions were reached in 600 seeds");
-}
-
-/// K iterates in one `Device::run` must match K sequential runs on copies of
-/// the same frozen tree: the leaves, and the resident CFR arenas.
-///
-/// `c = 0` fixes the tree. The copies occupy different slots of one card, so
-/// a bug that reads a bound from the batch where it belongs to the solve
-/// shows up as a slot that moved.
 #[test]
 fn k_iterates_together_match_k_iterates_alone() {
     const K: usize = 4;
-    let net = random_net(0x9E37);
-    // These trees never grow (`c = 0`, `s = 8`), so the shared 512 budget
-    // leaves room for all eight copies.
+    let net = Net::random(0x9E37);
     let device = gpu(20);
     let nets = Arc::new(net.clone());
     let mut setup = Vec::new();

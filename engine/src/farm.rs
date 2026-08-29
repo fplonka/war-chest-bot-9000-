@@ -1,364 +1,45 @@
-//! Where many solves share one forward pass.
-//!
-//! A solve alone is a bad shape for an accelerator: its leaf batch is a couple
-//! of hundred rows and it wants one every CFR iteration. Student of Games says
-//! the same thing about its own actors — each runs several games at once and
-//! batches the network evaluations — so the unit of inference here is a *round*
-//! across every solve that is ready, not a solve.
-//!
-//! A solve is a state machine, not a thread: it consumes the replies it was
-//! waiting for, does its host-side work, and says what it wants next. So it
-//! sits in one of two queues. Two drivers a GPU share that GPU's queue, so
-//! one set can grow while the other iterates; a pool of workers, one per
-//! core, does the host side. Neither waits for the other, which is what lets
-//! one solve's growth overlap another's device work.
-//!
-//! How many solves are in flight is the number of slots. A slot is allocated
-//! once at the budget; admission is a pop from a free list, and a solve that
-//! would exceed the budget is truncated rather than grown.
 
 use parking_lot::{Condvar, Mutex, RwLock};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 #[cfg(feature = "gpu")]
 use crate::cuda::Device;
-#[cfg(any(test, feature = "gpu"))]
+use crate::search::{Budget, Solver, Step};
+use crate::contract::{Call, Reply};
 use crate::net::Net;
-use crate::pbs::Belief;
-use crate::search::{Budget, Cfg, Cfr, Solved, Solver, Step};
 use crate::selfplay::{Data, GameCfg, GameStream};
-use crate::state::State;
 
-/// One solve's network work for this round.
-///
-/// The three calls are the network's whole surface: the trunk over a new
-/// leaf's physical state, the encoder over a new config, and the join that
-/// every CFR iteration pays for. `cards` rides along with the first two
-/// because a batch spans solves and each draft has its own card table.
-#[derive(Clone)]
-pub enum Call {
-    /// New leaves: public states in, board vectors and the join cache out.
-    ///
-    /// `solve` names the solve these rows belong to and `at` the row they
-    /// start at, so `at == 0` is a fresh solve and anything else extends one.
-    /// Both exist because the board vectors and the join cache are properties
-    /// of a leaf rather than of an iteration: the backend keeps them, and the
-    /// sixty-four join calls that follow do not carry them again.
-    ///
-    /// Rows and boards are counted apart. The trunk reads the public state and
-    /// nothing else, and coin plays commute, so a sixth to a quarter of a
-    /// solve's rows repeat a public state an earlier row already carried.
-    /// `packed` holds the distinct ones and `board_of` says which board each of
-    /// this call's rows reads.
-    Trunk {
-        solve: usize,
-        at: usize,
-        queries: usize,
-        /// One entry per row of this call: the board it reads, indexed from
-        /// the start of the solve.
-        board_of: Vec<u32>,
-        boards_at: usize,
-        boards: usize,
-        packed: Vec<u8>,
-        cards: Vec<f32>,
-        /// The belief index of exactly these rows: which config each query's
-        /// support names, and where each query's span starts. A leaf's support
-        /// is fixed when the leaf is made, so it travels once, here.
-        cidx: Vec<u32>,
-        coff: Vec<u32>,
-    },
-    /// New configs: `f(c)` for the readout and `g(c)` for the pooling. Both
-    /// stay with the backend for the same reason the board vectors do — they
-    /// are properties of a config, and every iteration reads them.
-    Configs {
-        solve: usize,
-        at: usize,
-        phi: Vec<f32>,
-        owner: Vec<u32>,
-        cards: Vec<f32>,
-        n: usize,
-    },
-    /// The tree, brought up to date with the host's.
-    ///
-    /// Growth is the only part of a solve the host still runs: it holds the
-    /// game rules, so it turns the leaves an expansion sampled into decision
-    /// nodes and describes them. `Contract` is append-only apart from the rows
-    /// of those leaves, so `from` says where the rewriting starts.
-    Tree {
-        solve: usize,
-        /// Everything the card has yet to be told about this solve, already in
-        /// the shape the wire wants.
-        writes: Writes,
-        /// The first call of a solve. A card's solve slot is reused, so this
-        /// is what tells the backend to forget the solve that held it before.
-        fresh: bool,
-        /// Arena lengths, so the device can fit what it holds.
-        ncells: usize,
-        nreach: usize,
-        nvals: usize,
-        /// Where each level of the tree starts. The launch loop walks levels,
-        /// so the host needs this as well as the card.
-        levels: Vec<u32>,
-        /// How many terminal leaves the solve holds, for the grid that scores
-        /// them.
-        nterm: usize,
-        /// The seed of the expansion's own random stream, sent once.
-        seed: Option<u64>,
-        /// Nodes whose policy prior the card is to fill this round.
-        prime: Vec<Prime>,
-        /// Six words an action: kind, paying and recruited coin types, then
-        /// source, destination and target hexes.
-        acts: Vec<u32>,
-        /// Which action each of a primed node's strategy cells stands for.
-        cells: Vec<u32>,
-        /// The softmax temperature the prior is formed at.
-        prior_temp: f32,
-    },
-    /// One CFR iteration and one expansion phase.
-    ///
-    /// The whole of what a GT-CFR round asks of the device: reach forward, the
-    /// network at every leaf, backpropagation and the regret update for both
-    /// players, the average strategy, and the trajectories that say where the
-    /// tree grows next. What comes back is the sampled leaves and nothing else.
-    Iterate {
-        solve: usize,
-        /// Where this solve's iterate count stands, and how many iterations to
-        /// run from there. A CFR iterate is weighted by how many came before
-        /// it, and a round holds solves at different points of their own
-        /// sixty-four, so the weights are the solve's and the backend computes
-        /// them per solve rather than taking one set for the batch.
-        step: usize,
-        iters: usize,
-        /// Distinct leaves to take after *each* of those iterations, so the
-        /// call comes back with `iters * expand` slots. A phase draws
-        /// trajectories until it has that many leaves no phase of this round
-        /// has taken. Zero once the tree has spent its node budget, and then
-        /// the round takes nothing and the host is only woken to end the
-        /// solve.
-        expand: usize,
-        /// Query-time reach snapshots retained by this solve's reservoir.
-        query: Vec<QueryPick>,
-        cfr: Cfr,
-        puct: f32,
-    },
-    /// What the host needs back once the solve is done: the reference
-    /// strategy at the nodes it asks about, and their values and beliefs.
-    Read {
-        solve: usize,
-        touched: [bool; 2],
-        /// Slices of the device arenas the host wants back: the root's value
-        /// row per player and the root's strategy cells. The host knows every
-        /// offset from its own copy of the tree.
-        ///
-        /// An empty value row means the caller wants no values, and the value
-        /// pass under the reference strategy does not run. Every solve reads
-        /// its root policy; only a solve that is collected reads targets.
-        vals_at: [(u32, u32); 2],
-        policy_at: (u32, u32),
-    },
+
+fn batched<T>(items: Vec<(T, Vec<Call>)>) -> (Vec<T>, Vec<usize>, Vec<Call>) {
+    let mut heads = Vec::with_capacity(items.len());
+    let mut spans = Vec::with_capacity(items.len());
+    let mut calls = Vec::new();
+    for (head, cs) in items {
+        spans.push(cs.len());
+        calls.extend(cs);
+        heads.push(head);
+    }
+    (heads, spans, calls)
 }
 
-/// One query event whose reach the device snapshots before its network call.
-#[derive(Clone, Copy)]
-pub struct QueryPick {
-    pub iter: u32,
-    pub reach: u32,
-    pub len: u32,
+fn deal(mut replies: Vec<Reply>, spans: &[usize]) -> Vec<Vec<Reply>> {
+    spans
+        .iter()
+        .map(|&n| {
+            let tail = replies.split_off(n);
+            std::mem::replace(&mut replies, tail)
+        })
+        .collect()
 }
 
-/// One node whose policy prior a round is to fill.
-///
-/// The card holds the node's board and config representations. The call names
-/// what each action is and which action each strategy cell stands for.
-#[derive(Clone, Copy)]
-pub struct Prime {
-    pub node: u32,
-    /// The node's row in this solve's leaf batch, where its board vector is.
-    pub row: u32,
-    /// Where its actions start in `acts`, and how many it offers.
-    pub at: u32,
-    pub na: u32,
-    /// Where its cells start in `cells`.
-    pub cell_at: u32,
-    /// Configs the acting player holds here, which is the grid the prior takes.
-    pub nc: u32,
-}
-
-/// One of a solve's resident arrays, as a run of the round's blob names it.
-///
-/// The order is the vocabulary the solver and the backend share and nothing
-/// else depends on it; `Solve::plan` in the device driver is the other half.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Dst {
-    Kind, Player, Exhausted, Nc, Parent, Roff, Voff, Soff, Util,
-    ChildAt, ChildN, Child,
-    LegalBase, LegalOff, LegalChild, LegalTrans, CellRow, CellVal,
-    RevBase, RevStart, RevSrc, RevCell,
-    RvdBase, RvdStart, RvdSrc, RvdP,
-    DrawBase, DrawStart, DrawTo, DrawP,
-    LevelStart, LevelNode,
-    Cur, Prior, LeafNode, Term, Rootb,
-}
-
-/// Everything one solve tells the card to write this round, concatenated.
-///
-/// A solve builds this on the worker that grew the tree. The driver says where
-/// each run lands on the card. Floats travel as their bits, because the scatter
-/// kernel moves words and does not care which they are.
-#[derive(Clone, Default)]
-pub struct Writes {
-    pub blob: Vec<u32>,
-    pub runs: Vec<Run>,
-}
-
-/// One run: where it goes, and where its words are. `start` is explicit rather
-/// than implied by order, so two arrays can be given the same words.
-#[derive(Clone, Copy)]
-pub struct Run {
-    pub dst: Dst,
-    pub at: u32,
-    pub len: u32,
-    pub start: u32,
-}
-
-impl Writes {
-    pub fn u32s(&mut self, d: Dst, at: usize, src: &[u32]) {
-        self.run(d, at, src.iter().copied(), src.len());
-    }
-
-    pub fn f32s(&mut self, d: Dst, at: usize, src: &[f32]) {
-        self.run(d, at, src.iter().map(|x| x.to_bits()), src.len());
-    }
-
-    /// Bytes the card holds as words. `Contract` keeps a node's kind and
-    /// player in one byte each; the device reads them as `unsigned int`.
-    pub fn u8s(&mut self, d: Dst, at: usize, src: &[u8]) {
-        self.run(d, at, src.iter().map(|&x| x as u32), src.len());
-    }
-
-    /// The same words into two arrays. The tail a growth appends is uniform
-    /// over each legal row, which is where CFR starts *and* what the prior is
-    /// until the policy head has spoken -- so `cur` and `prior` hold the same
-    /// numbers there and there is no reason to carry them twice.
-    ///
-    /// One call, not two, because an empty tail must add nothing to either: a
-    /// round that grew no cells would otherwise hand the second array whatever
-    /// run happened to be last.
-    pub fn f32s_both(&mut self, a: Dst, b: Dst, at: usize, src: &[f32]) {
-        self.f32s(a, at, src);
-        if !src.is_empty() {
-            let last = *self.runs.last().expect("a non-empty run was just pushed");
-            self.runs.push(Run { dst: b, ..last });
-        }
-    }
-
-    fn run(&mut self, d: Dst, at: usize, src: impl Iterator<Item = u32>, n: usize) {
-        if n == 0 {
-            return;
-        }
-        let start = self.blob.len() as u32;
-        self.blob.extend(src);
-        // The scatter kernel places every run at once, so two runs that reach
-        // the same array must not touch the same words -- a thing a host-side
-        // replay in run order would not notice.
-        debug_assert!(
-            !self.runs.iter().any(|r| {
-                r.dst == d && (at as u32) < r.at + r.len && r.at < (at + n) as u32
-            }),
-            "two runs of one round overlap in the same array"
-        );
-        self.runs.push(Run { dst: d, at: at as u32, len: n as u32, start });
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.runs.is_empty()
-    }
-}
-
-/// What a call gives back. The trunk returns the board vector and its join
-/// cache, the encoder returns `f`, `g` and the policy's `f_p`, and the join
-/// returns `h` alone.
-#[derive(Default)]
-pub struct Reply {
-    pub a: Vec<f32>,
-    pub b: Vec<f32>,
-    pub c: Vec<f32>,
-    /// The leaves the round's phases took, phase by phase and distinct over
-    /// the whole round. `NO_ROW` pads a phase that gave up short, which is a
-    /// phase that spent its draws on leaves the round already held.
-    pub leaves: Vec<u32>,
-}
-
-impl Call {
-    /// Run this call on the CPU network. The batched driver runs the same
-    /// arithmetic on the device; this is the reference both are held to.
-    #[cfg(any(test, feature = "gpu"))]
-    pub fn run(&self, net: &Net) -> Reply {
-        let mut r = Reply::default();
-        match self {
-            Call::Trunk { packed, cards, boards, .. } => {
-                net.board_from_rows(packed, cards, *boards, &mut r.a);
-                net.join_cache(&r.a, *boards, &mut r.b);
-            }
-            Call::Configs { phi, owner, cards, n, .. } => {
-                net.configs(phi, owner, *n, cards, &mut r.a, &mut r.b, &mut r.c);
-            }
-            Call::Tree { .. } | Call::Iterate { .. } | Call::Read { .. } => {
-                unreachable!("the CFR loop needs the resident state")
-            }
-        }
-        r
-    }
-
-    /// Which of the three batches this call belongs to. The device groups a
-    /// round by kind and runs each group once.
-    pub fn kind(&self) -> usize {
-        match self {
-            Call::Trunk { .. } => 0,
-            Call::Configs { .. } => 1,
-            Call::Tree { .. } => 2,
-            Call::Iterate { .. } => 3,
-            Call::Read { .. } => 4,
-        }
-    }
-
-    /// Which solve raised this call. A backend keeps a solve's board vectors
-    /// between its iterations, so every call of one solve must reach the same
-    /// backend — which is what a round shards on.
-    pub fn solve(&self) -> usize {
-        match self {
-            Call::Trunk { solve, .. }
-            | Call::Configs { solve, .. }
-            | Call::Tree { solve, .. }
-            | Call::Iterate { solve, .. }
-            | Call::Read { solve, .. } => *solve,
-        }
-    }
-
-    /// Rows this call contributes to its batch, for the round report.
-    pub fn rows(&self) -> usize {
-        match self {
-            Call::Trunk { queries, .. } => *queries,
-            Call::Configs { n, .. } => *n,
-            Call::Tree { .. } | Call::Iterate { .. } | Call::Read { .. } => 0,
-        }
-    }
-}
-
-/// Host-side slots that fit in the memory the process does not already hold.
-///
-/// A slot is `Budget::host_slot_bytes`. The farm never admits more than this, and
-/// the card never carves more than this, so host OOM is not a thing that can
-/// happen at admission.
 pub fn host_slots(budget: Budget) -> usize {
     let slot = budget.host_slot_bytes() as u64;
     (host_free() / slot.max(1)) as usize
 }
 
-/// Bytes the farm may still hold in solves.
 fn host_free() -> u64 {
     #[cfg(target_os = "linux")]
     {
@@ -383,11 +64,9 @@ const OPEN: u8 = 0;
 const DRAINING: u8 = 1;
 const CLOSED: u8 = 2;
 
-/// A queue with parked consumers, closed once when the farm winds down.
 struct Queue<T> {
     q: Mutex<std::collections::VecDeque<T>>,
     ready: Condvar,
-    /// Open, draining, or closed.
     state: AtomicU8,
 }
 
@@ -407,7 +86,6 @@ impl<T> Queue<T> {
         self.ready.notify_one();
     }
 
-    /// The oldest item, or `None` once the queue is closed and empty.
     fn pop(&self) -> Option<T> {
         let mut q = self.q.lock();
         loop {
@@ -421,29 +99,12 @@ impl<T> Queue<T> {
         }
     }
 
-    /// Everything waiting, which is what a round is. Empty once the queue is
-    /// closed and empty.
-    fn drain(&self) -> Vec<T> {
-        let mut q = self.q.lock();
-        loop {
-            if !q.is_empty() {
-                return q.drain(..).collect();
-            }
-            if self.state.load(Ordering::Relaxed) == CLOSED {
-                return Vec::new();
-            }
-            self.ready.wait(&mut q);
-        }
-    }
-
-    /// Take a full wave, or the tail while the queue drains.
-    fn drain_wave(&self, wave: usize) -> Vec<T> {
+    fn take(&self, least: usize, most: usize) -> Vec<T> {
         let mut q = self.q.lock();
         loop {
             let n = q.len();
-            if n >= wave || self.state.load(Ordering::Relaxed) != OPEN && n > 0 {
-                let take = n.min(wave);
-                let out: Vec<T> = q.drain(..take).collect();
+            if n >= least || (self.state.load(Ordering::Relaxed) != OPEN && n > 0) {
+                let out: Vec<T> = q.drain(..n.min(most)).collect();
                 if !q.is_empty() {
                     self.ready.notify_one();
                 }
@@ -456,127 +117,24 @@ impl<T> Queue<T> {
         }
     }
 
-    fn state(&self, state: u8) {
+    fn set(&self, state: u8) {
         let _held = self.q.lock();
         self.state.store(state, Ordering::Relaxed);
         self.ready.notify_all();
     }
-
-    fn close(&self) {
-        self.state(CLOSED);
-    }
 }
 
-/// Where a job's solves come from.
-///
-/// `Play` is the run: solves come from games played forward, and their rows are
-/// kept. `Roots` is the bench, and it exists because the run cannot be
-/// measured. A solve's cost varies twenty-six fold with how far into a game its
-/// root sits, so a probe's rate moves by two-fold with nothing but which phase
-/// its games happened to reach — 16.6, 16.2, 12.1 and 8.0 solves/s were
-/// measured across consecutive probes of one build. Cycling a corpus of roots
-/// sampled from a real run holds the *mix* of costs in flight stationary, which
-/// is the one property that makes two builds comparable in seconds rather than
-/// in half an hour.
-pub enum Work {
-    Play(GameCfg),
-    Roots {
-        roots: Arc<Vec<(State, [Belief; 2])>>,
-        cfg: Cfg,
-        recursive_rate: f32,
-    },
-}
-
-/// One job's side of `Work`: what it does between two solves.
-///
-/// A source hands out the next solve and takes the finished one back. What
-/// happens in between is a game, which is why this is a state machine and not
-/// a loop — the solve it is waiting on belongs to the farm, not to a thread.
-enum Source {
-    Play(GameStream),
-    /// A fixed-root corpus cursor and its random stream.
-    Roots {
-        roots: Arc<Vec<(State, [Belief; 2])>>,
-        cfg: Cfg,
-        recursive_rate: f32,
-        at: usize,
-        rng: crate::rng::Rng,
-    },
-}
-
-impl Source {
-    fn new(work: &Work, seed: u64, i: usize) -> Source {
-        match work {
-            Work::Play(gc) => Source::Play(GameStream::new(seed, *gc)),
-            Work::Roots { roots, cfg, recursive_rate } => Source::Roots {
-                roots: Arc::clone(roots),
-                cfg: *cfg,
-                recursive_rate: *recursive_rate,
-                at: i,
-                rng: crate::rng::Rng::new(seed),
-            },
-        }
-    }
-
-    /// The next solve this source wants run.
-    fn next(&mut self, nets: &Arc<crate::net::Net>, out: &mut Data) -> Solver {
-        match self {
-            Source::Play(stream) => stream.next_solve(nets, out),
-            Source::Roots { roots, cfg, recursive_rate, at, rng } => {
-                let (s, bel) = &roots[*at % roots.len()];
-                *at += 1;
-                crate::selfplay::query_solver(nets, *cfg, *recursive_rate, s, bel, rng)
-            }
-        }
-    }
-
-    /// Take the finished solve back and keep what it produced.
-    fn take(&mut self, sv: &Solver, solved: Option<Solved>, out: &mut Data) {
-        match self {
-            Source::Play(stream) => stream.keep(sv, solved, out),
-            // A bench root is solved for its own row and nothing follows it.
-            Source::Roots { .. } => {
-                crate::selfplay::keep_query(sv, solved, out);
-            }
-        }
-    }
-
-    fn kind(&self) -> u32 {
-        match self {
-            Source::Play(stream) => stream.solve_kind() as u32,
-            Source::Roots { .. } => crate::selfplay::SolveKind::Query as u32,
-        }
-    }
-}
-
-/// One solve in flight, and everything that outlives it.
 struct Job {
-    source: Source,
+    source: GameStream,
     solver: Solver,
-    /// The card that holds this solve's arenas, and which of its slots. A GPU
-    /// keeps a solve's board vectors between its rounds, so both are fixed for
-    /// as long as the job lives. Either pipe of that GPU may run the round.
     card: usize,
     slot: usize,
-    /// What the last round gave back, waiting for the host work that reads it.
     replies: Vec<Reply>,
-    /// Rows this job has produced since it last handed any over.
     data: Data,
 }
 
-/// Many solves in flight in one process, and one thing that evaluates for all
-/// of them.
-///
-/// Two kinds of thread. Two drivers a GPU share one queue, so one set of solves
-/// can grow on the host while the other iterates on the card. A pool of
-/// workers, one per core, does the host side: growth, which is the game's
-/// rules, and the game around it. Neither ever waits for the other, so one
-/// solve's growth overlaps another's device work — which a barrier could not
-/// do, because it made a round cost whatever its slowest member cost.
 pub struct Farm {
-    /// One queue a GPU: solves whose next round either of its cards may run.
     device: Vec<Arc<Queue<(Job, Vec<Call>)>>>,
-    /// Solves whose replies are in and whose host work wants a core.
     ready: Arc<Queue<Job>>,
     #[cfg(feature = "gpu")]
     cuda: Arc<RwLock<Device>>,
@@ -590,41 +148,32 @@ pub struct Farm {
     stats: Arc<Stats>,
 }
 
-/// What the rounds carried, for the utilisation report. Calls per round is the
-/// number that matters: it is how many solves shared a forward pass.
 #[derive(Default)]
 pub struct Stats {
     pub rounds: AtomicU64,
     pub rows: AtomicU64,
     pub calls: AtomicU64,
-    /// Time inside the backend. Against wall clock this says how much of a
-    /// round is the batch and how much is everything around it.
     pub nanos: AtomicU64,
-    /// Slots this farm holds. Steady-state farms fill all of them.
-    pub slots: u64,
-    /// Solves that hit the budget. A slot is a percentile; this is the rate
-    /// that argues with it.
-    budget_hits: AtomicU64,
-    /// Solves that hit each entity's cap, in `Ent::ALL` order.
-    entity_hits: [AtomicU64; 8],
-    pub slot_bytes: u64,
-    pub slots_per_card: u64,
-    /// Entity counts, stop reason, and solve kind for each finished solve.
+    pub slots: AtomicU64,
+    pub budget_hits: AtomicU64,
+    pub entity_hits: [AtomicU64; 8],
+    pub slot_bytes: AtomicU64,
+    pub slots_per_card: AtomicU64,
     shapes: Mutex<Vec<[u32; 10]>>,
 }
 
 impl Stats {
     fn new(slots: usize, slot_bytes: usize, slots_per_card: usize) -> Stats {
         Stats {
-            slots: slots as u64,
-            slot_bytes: slot_bytes as u64,
-            slots_per_card: slots_per_card as u64,
+            slots: AtomicU64::new(slots as u64),
+            slot_bytes: AtomicU64::new(slot_bytes as u64),
+            slots_per_card: AtomicU64::new(slots_per_card as u64),
             ..Default::default()
         }
     }
 
-    pub fn budget_hits(&self) -> u64 {
-        self.budget_hits.load(Ordering::Relaxed)
+    pub fn slots(&self) -> u64 {
+        self.slots.load(Ordering::Relaxed)
     }
 
     pub fn entity_hits(&self) -> [u64; 8] {
@@ -637,11 +186,8 @@ impl Stats {
 }
 
 impl Farm {
-    /// Start `workers` host threads and two drivers per GPU, with one job per
-    /// slot. A slot is allocated at the budget; there is nothing to admit
-    /// against after that.
     #[cfg(feature = "gpu")]
-    pub fn new(seed: u64, workers: usize, work: Work, net: Arc<Net>, cuda: Device) -> Farm {
+    pub fn new(seed: u64, workers: usize, gc: GameCfg, net: Arc<Net>, cuda: Device) -> Farm {
         assert!(workers > 0, "a farm needs at least one worker");
         let gpus = cuda.cards();
         let pipes = crate::cuda::PIPELINE;
@@ -663,13 +209,10 @@ impl Farm {
         for g in 0..gpus {
             let card_seed = seed.wrapping_mul(0x9E37_79B9) ^ g as u64;
             for slot in 0..per_gpu[g] {
-                let mut source = Source::new(
-                    &work,
-                    card_seed ^ (slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-                    slot * gpus + g,
-                );
+                let key = card_seed ^ (slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let mut source = GameStream::new(key, gc);
                 let mut data = Data::default();
-                let mut solver = source.next(&net, &mut data);
+                let mut solver = source.next_solve(&net, &mut data);
                 solver.pin(slot);
                 ready.push(Job { source, solver, card: g, slot, replies: Vec::new(), data });
             }
@@ -735,7 +278,6 @@ impl Farm {
         }
     }
 
-    /// Finish the old-network solves, then resume their streams on `next`.
     #[cfg(feature = "gpu")]
     pub fn publish(&mut self, next: Arc<Net>) -> Result<(), String> {
         if Arc::ptr_eq(&self.nets.read(), &next) {
@@ -745,13 +287,13 @@ impl Farm {
         self.cuda.write().set_weights(&next)?;
         *self.nets.write() = Arc::clone(&next);
         let mut jobs = std::mem::take(&mut *self.retired.lock());
-        assert_eq!(jobs.len(), self.stats.slots as usize, "drain lost a game stream");
+        assert_eq!(jobs.len(), self.stats.slots() as usize, "a drain lost a game stream");
         for job in &mut jobs {
-            job.solver = job.source.next(&next, &mut job.data);
+            job.solver = job.source.next_solve(&next, &mut job.data);
             job.solver.pin(job.slot);
         }
         for q in &self.device {
-            q.state(OPEN);
+            q.set(OPEN);
         }
         self.stopping.store(false, Ordering::Release);
         for job in jobs {
@@ -765,9 +307,9 @@ impl Farm {
         self.stopping.store(true, Ordering::Release);
         drop(gate);
         for q in &self.device {
-            q.state(DRAINING);
+            q.set(DRAINING);
         }
-        while self.retired.lock().len() != self.stats.slots as usize {
+        while self.retired.lock().len() != self.stats.slots() as usize {
             if self.broken() {
                 return Err("a card could not finish its solves".into());
             }
@@ -776,8 +318,6 @@ impl Farm {
         Ok(())
     }
 
-    /// Wait until the farm has produced at least `solves` rows, then hand over
-    /// everything it produced.
     pub fn drive(&mut self, solves: usize) -> Data {
         let mut out = Data::default();
         loop {
@@ -787,20 +327,13 @@ impl Farm {
             if out.soff.len() >= solves {
                 return out;
             }
-            // A card that could not answer a round takes its solves with it, so
-            // waiting for them is waiting for ever -- which is what a run did
-            // when a card filled, silently, with the panic printed to a log
-            // nobody was reading.
             if self.stopping.load(Ordering::Relaxed) || self.broken.load(Ordering::Relaxed) {
                 return out;
             }
-            // Parked, not spinning: a core busy-waiting here is a core taken
-            // from the work it is waiting for.
             std::thread::sleep(Duration::from_micros(200));
         }
     }
 
-    /// Whether a card failed a round, which is not recoverable.
     pub fn broken(&self) -> bool {
         self.broken.load(Ordering::Relaxed)
     }
@@ -814,12 +347,12 @@ impl Farm {
 impl Drop for Farm {
     fn drop(&mut self) {
         let _ = self.drain();
-        self.ready.close();
-        for q in &self.device {
-            q.close();
-        }
+        self.ready.set(CLOSED);
         for w in self.workers.drain(..) {
             let _ = w.join();
+        }
+        for q in &self.device {
+            q.set(CLOSED);
         }
         for d in self.drivers.drain(..) {
             let _ = d.join();
@@ -827,12 +360,6 @@ impl Drop for Farm {
     }
 }
 
-/// One job's turn on the host: consume the last round's replies, do the growth
-/// they made possible, and hand the job to its card.
-///
-/// A solve that finishes is replaced here rather than through the queue, and a
-/// solve that wants nothing from the card -- which is every solve when there
-/// are no weights yet -- runs to its end without ever leaving this loop.
 fn advance_job(
     mut job: Job,
     device: &[Arc<Queue<(Job, Vec<Call>)>>],
@@ -859,9 +386,9 @@ fn advance_job(
                 let counts = job.solver.counts();
                 let mut census = [0; 10];
                 census[..9].copy_from_slice(&counts);
-                census[9] = job.source.kind();
+                census[9] = job.source.solve_kind() as u32;
                 stats.shapes.lock().push(census);
-                job.source.take(&job.solver, solved, &mut job.data);
+                job.source.keep(&job.solver, solved, &mut job.data);
                 collected.lock().push(std::mem::take(&mut job.data));
                 let n = nets.read();
                 if stopping.load(Ordering::Acquire) {
@@ -869,11 +396,10 @@ fn advance_job(
                     retired.lock().push(job);
                     return;
                 }
-                job.solver = job.source.next(&n, &mut job.data);
+                job.solver = job.source.next_solve(&n, &mut job.data);
                 job.solver.pin(job.slot);
-                let calls = match job.solver.advance(&[]) {
-                    Step::Calls(calls) => calls,
-                    Step::Done(_) => unreachable!("a fresh solve finishes without a round"),
+                let Step::Calls(calls) = job.solver.advance(&[]) else {
+                    unreachable!("a fresh solve finishes without a round")
                 };
                 let card = job.card;
                 device[card].push((job, calls));
@@ -884,8 +410,8 @@ fn advance_job(
     }
 }
 
-/// One card's rounds, and the solves that occupy its GPU's slots.
 #[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
 fn drive_card(
     lane: usize,
     wave: usize,
@@ -896,17 +422,9 @@ fn drive_card(
     broken: &AtomicBool,
 ) {
     loop {
-        let batch = queue.drain_wave(wave);
-        if batch.is_empty() {
+        let (jobs, spans, calls) = batched(queue.take(wave, wave));
+        if jobs.is_empty() {
             return;
-        }
-        let mut jobs = Vec::with_capacity(batch.len());
-        let mut spans = Vec::with_capacity(batch.len());
-        let mut calls: Vec<Call> = Vec::new();
-        for (job, cs) in batch {
-            spans.push(cs.len());
-            calls.extend(cs);
-            jobs.push(job);
         }
         let at = std::time::Instant::now();
         let answered = cuda.read().run(&calls, lane);
@@ -920,43 +438,23 @@ fn drive_card(
         stats.rows.fetch_add(calls.iter().map(Call::rows).sum::<usize>() as u64, Ordering::Relaxed);
         stats.calls.fetch_add(calls.len() as u64, Ordering::Relaxed);
         stats.nanos.fetch_add(spent.as_nanos() as u64, Ordering::Relaxed);
-        let mut rest = replies;
-        for (mut job, n) in jobs.into_iter().zip(spans) {
-            let tail = rest.split_off(n);
-            job.replies = rest;
-            rest = tail;
+        for (mut job, replies) in jobs.into_iter().zip(deal(replies, &spans)) {
+            job.replies = replies;
             ready.push(job);
         }
     }
 }
 
-// ---------------------------------------------------------- a blocking client
 
-/// One card's rounds, for callers that block on a whole solve.
-///
-/// The farm's solves are state machines because there are far more of them than
-/// there are cores. A bot is the other shape: one game per thread, nothing to
-/// remember between two solves, and a thread that is willing to wait. So the
-/// thread's own stack is its continuation — it puts its calls on a card's queue
-/// and waits for the round that carries them, which is shared with every other
-/// thread that was ready at the same moment.
+type Back = std::sync::mpsc::Sender<Vec<Reply>>;
+
 pub struct Cards {
-    queues: Vec<Arc<Queue<Ask>>>,
-    /// Pipeline lanes and solve slots nobody is using. A solve stays on one
-    /// stream because its resident arrays have no cross-stream events.
+    queues: Vec<Arc<Queue<(Back, Vec<Call>)>>>,
     seats: Mutex<Vec<(usize, usize)>>,
     free: Condvar,
     drivers: Vec<JoinHandle<()>>,
 }
 
-/// One thread's calls, and where to send the replies.
-struct Ask {
-    calls: Vec<Call>,
-    back: std::sync::mpsc::Sender<Vec<Reply>>,
-}
-
-/// A pipeline lane and one of its solve slots, held for one solve and given back when
-/// this is dropped.
 pub struct Seat<'a> {
     cards: &'a Cards,
     pub lane: usize,
@@ -976,7 +474,7 @@ impl Cards {
         let n = device.cards();
         let pipes = crate::cuda::PIPELINE;
         let device = Arc::new(device);
-        let queues: Vec<Arc<Queue<Ask>>> =
+        let queues: Vec<Arc<Queue<(Back, Vec<Call>)>>> =
             (0..n * pipes).map(|_| Arc::new(Queue::default())).collect();
         let mut drivers = Vec::with_capacity(n * pipes);
         for g in 0..n {
@@ -987,28 +485,15 @@ impl Cards {
                     std::thread::Builder::new()
                         .name(format!("card-{g}.{p}"))
                         .spawn(move || loop {
-                            let batch = queue.drain();
-                            if batch.is_empty() {
+                            let (backs, spans, calls) = batched(queue.take(1, usize::MAX));
+                            if backs.is_empty() {
                                 return;
                             }
-                            let mut backs = Vec::with_capacity(batch.len());
-                            let mut spans = Vec::with_capacity(batch.len());
-                            let mut calls: Vec<Call> = Vec::new();
-                            for ask in batch {
-                                spans.push(ask.calls.len());
-                                calls.extend(ask.calls);
-                                backs.push(ask.back);
-                            }
-                            // A card that cannot answer takes its solves with it.
-                            // Dropping the senders is what tells them.
                             let Some(replies) = device.run(&calls, lane) else {
                                 return;
                             };
-                            let mut rest = replies;
-                            for (back, n) in backs.into_iter().zip(spans) {
-                                let tail = rest.split_off(n);
-                                let _ = back.send(rest);
-                                rest = tail;
+                            for (back, replies) in backs.into_iter().zip(deal(replies, &spans)) {
+                                let _ = back.send(replies);
                             }
                         })
                         .expect("spawn driver thread"),
@@ -1024,7 +509,6 @@ impl Cards {
         Cards { queues, seats: Mutex::new(free), free: Condvar::new(), drivers }
     }
 
-    /// Take a card and one of its solve slots for the length of one solve.
     pub fn seat(&self) -> Seat<'_> {
         let mut seats = self.seats.lock();
         loop {
@@ -1035,11 +519,9 @@ impl Cards {
         }
     }
 
-    /// Run these calls in the next round of `lane`, and wait for them.
-    /// `None` once the card is gone, which is not recoverable.
     pub fn round(&self, lane: usize, calls: Vec<Call>) -> Option<Vec<Reply>> {
         let (back, replies) = std::sync::mpsc::channel();
-        self.queues[lane].push(Ask { calls, back });
+        self.queues[lane].push((back, calls));
         replies.recv().ok()
     }
 }
@@ -1047,24 +529,10 @@ impl Cards {
 impl Drop for Cards {
     fn drop(&mut self) {
         for q in &self.queues {
-            q.close();
+            q.set(CLOSED);
         }
         for d in self.drivers.drain(..) {
             let _ = d.join();
         }
     }
-}
-
-#[test]
-fn draining_releases_and_reopens_an_underfilled_wave() {
-    let q = Arc::new(Queue::default());
-    q.push(1);
-    let other = Arc::clone(&q);
-    let waiting = std::thread::spawn(move || other.drain_wave(2));
-    q.state(DRAINING);
-    assert_eq!(waiting.join().unwrap(), [1]);
-    q.state(OPEN);
-    q.push(2);
-    q.push(3);
-    assert_eq!(q.drain_wave(2), [2, 3]);
 }

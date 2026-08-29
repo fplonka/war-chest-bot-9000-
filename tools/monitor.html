@@ -53,7 +53,7 @@ pre{max-height:340px;overflow:auto;margin:4px 0;font:inherit;white-space:pre-wra
  <p class=meta id=charthelp>drag zoom · wheel zoom · middle-drag pan · double-click reset</p>
  <div class=grid id=panels></div>
  <dl id=health></dl>
- <div id=ladders></div>
+ 
  <div id=text></div>
 </main>
 <script src=/vendor/uPlot.iife.min.js></script>
@@ -193,10 +193,8 @@ function setText(el, s) {
   el.scrollTop = bottom ? el.scrollHeight : at;
 }
 
-// A ladder, as read: ratings against the anchor, then every pairing with the
 // paired sign test — games come in colour-swapped pairs over a shared draft, so
 // the pair is the independent trial and its p-value is the verdict.
-function ladder(box, name, l) {
   box.appendChild(E("h2", null,
     name + " · elo vs " + (l.anchor || "anchor") + ", 95% CI = 1.96 × SE"));
   const num = (v, f) => v == null ? "—" : f(v);
@@ -243,18 +241,13 @@ function bars(box, title, names, rows) {
   box.appendChild(t);
 }
 
-function renderArena(d) {
   clearPlots();
   $("title").textContent = d.name;
-  ["note", "cfg", "panels", "health", "text", "ladders"]
     .forEach(id => $(id).textContent = "");
   $("loglink").style.display = "none";
   $("charthelp").style.display = "none";
   shape = "";
-  const box = $("ladders");
-  if (d.kind === "ladder") {
     $("meta").textContent = `${d.players.length} bots · ${d.games} games per pairing`;
-    return ladder(box, d.name, d);
   }
   if (d.kind === "tablebase") {
     const bots = d.bots;
@@ -310,7 +303,6 @@ function render(d) {
   d.health.forEach(([k, v]) => { hl.appendChild(E("dt", null, k));
     hl.appendChild(E("dd", null, v)); });
 
-  $("ladders").textContent = "";
 
   const text = $("text");
   if (!text.firstChild) ["notes", "train.log"].forEach(h => {
@@ -322,7 +314,6 @@ function render(d) {
 }
 
 // One entry, in whichever group it belongs to. `sel` is "runs/<name>" or
-// "arena/<name>", which is also the hash, so a deep link picks out either.
 function entry(a, kind, name, sub, live) {
   const key = kind + "/" + name;
   const b = E("button", key === sel ? "on" : null);
@@ -336,12 +327,8 @@ function entry(a, kind, name, sub, live) {
   a.appendChild(b);
 }
 
-function list(runs, arenas) {
   const a = $("list"), at = a.scrollTop;
   a.textContent = "";
-  if (arenas.length) a.appendChild(E("h2", null, "arena"));
-  arenas.forEach(l => entry(a, "arena", l.name, l.sub));
-  if (arenas.length) a.appendChild(E("h2", null, "runs"));
   runs.forEach(r => entry(a, "runs", r.name,
     [r.epochs + " ep", r.minutes + "m", r.phase, r.note].filter(Boolean).join(" · "),
     r.running));
@@ -349,16 +336,11 @@ function list(runs, arenas) {
 }
 
 async function poll() {
-  const [runs, arenas] = await Promise.all([api("/api/runs"), api("/api/arena")]);
   if (runs) {
     if (!sel && runs.length) sel = "runs/" + runs[0].name;
-    list(runs, arenas || []);
   }
   if (!sel) return;
   const name = sel.slice(sel.indexOf("/") + 1);
-  if (sel.startsWith("arena/")) {
-    const d = await api("/api/arena/" + encodeURIComponent(name));
-    if (d) renderArena({...d, name});
   } else {
     const d = await api("/api/run/" + encodeURIComponent(name));
     if (d) render(d);

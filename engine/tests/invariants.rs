@@ -1,15 +1,10 @@
-//! Invariant test: many seeded random playouts, checking conservation and
-//! structural invariants after every action.
-
 use warchest::board::{board, NONE, N_HEXES, N_LOCATIONS};
 use warchest::rng::Rng;
 use warchest::selfplay::make_game;
 use warchest::state::{Cont, State, BLACK, WHITE, Z_INFLIGHT};
 use warchest::units::{def, N_UNITS, ROYAL_COIN};
 
-const POOL: [u16; 19] = [
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 17, 18, 19, 52, 53, 54,
-];
+const POOL: [u16; 19] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 17, 18, 19, 52, 53, 54];
 
 fn random_draft(rng: &mut Rng) -> (Vec<u16>, Vec<u16>, u8) {
     let pick4 = |rng: &mut Rng| -> Vec<u16> {
@@ -24,28 +19,21 @@ fn random_draft(rng: &mut Rng) -> (Vec<u16>, Vec<u16>, u8) {
     };
     let w = pick4(rng);
     let b = pick4(rng);
-    let first = if rng.next_u64() & 1 == 0 {
-        WHITE
-    } else {
-        BLACK
-    };
+    let first = if rng.next_u64() & 1 == 0 { WHITE } else { BLACK };
     (w, b, first)
 }
 
-/// Per-type total coins each player owns at setup, derived from the draft.
 fn initial_totals(units: &[u16]) -> [u16; N_UNITS] {
     let mut t = [0u16; N_UNITS];
     for &id in units {
         let u = warchest::units::index_of_id(id).unwrap();
         t[u as usize] += def(u).coins as u16;
     }
-    // one Royal Coin
     t[warchest::units::ROYAL_COIN as usize] += 1;
     t
 }
 
 fn check_invariants(s: &State, init: &[[u16; N_UNITS]; 2]) {
-    // 1. coin conservation per type per player.
     for p in 0..2u8 {
         for u in 0..N_UNITS {
             let got = s.total_coins(p, u) as u16;
@@ -56,7 +44,6 @@ fn check_invariants(s: &State, init: &[[u16; N_UNITS]; 2]) {
             );
         }
     }
-    // 2. board structure.
     let b = board();
     for h in 0..N_HEXES {
         if s.hex_type[h] != NONE {
@@ -66,19 +53,15 @@ fn check_invariants(s: &State, init: &[[u16; N_UNITS]; 2]) {
             assert_eq!(s.hex_height[h], 0);
             assert_eq!(s.hex_owner[h], NONE);
         }
-        // markers only on locations.
         if s.loc_marker[h] != NONE {
             assert!(b.is_location[h], "marker on a non-location hex");
         }
     }
-    // 3. markers 0..6 and hand+board == 6.
     for p in 0..2u8 {
         let on = s.markers_on_board(p);
         assert!(on <= 6);
         assert_eq!(on + s.markers_hand[p as usize], 6, "marker count broke");
     }
-    // 3b. the hand never exceeds 3. A Warrior Priest draw does not join the
-    // hand, so it cannot push the cap; round-start draws still can.
     for p in 0..2u8 {
         assert!(
             s.hand_size(p) <= 3,
@@ -93,10 +76,7 @@ fn check_invariants(s: &State, init: &[[u16; N_UNITS]; 2]) {
             .iter()
             .filter(|c| matches!(c, Cont::WarriorPriestPlay { player } if *player == p))
             .count();
-        let flight: usize = s.zones[p as usize][Z_INFLIGHT]
-            .iter()
-            .map(|&n| n as usize)
-            .sum();
+        let flight: usize = s.zones[p as usize][Z_INFLIGHT].iter().map(|&n| n as usize).sum();
         if s.is_terminal() {
             assert_eq!(flight, 0, "a terminal has spent the in-flight coin");
         } else {
@@ -104,11 +84,9 @@ fn check_invariants(s: &State, init: &[[u16; N_UNITS]; 2]) {
         }
         assert!(flight <= 1, "at most one coin in flight");
     }
-    // 4. winner consistency.
     if let Some(w) = s.winner() {
         assert_eq!(s.markers_on_board(w), 6, "winner must have 6 markers");
     }
-    // 5. terminal games without a winner have zero utility.
     if s.is_terminal() && s.winner().is_none() {
         assert_eq!(s.utility(0), 0.0);
         assert_eq!(s.utility(1), 0.0);
@@ -122,7 +100,7 @@ fn invariants_random_playouts() {
     let mut rng = Rng::new(0xA11CE);
     let mut cap_hits = 0u32;
     let mut lengths_sum = 0u64;
-    let mut winners = [0u32; 3]; // white, black, none(cap)
+    let mut winners = [0u32; 3];
 
     for _ in 0..n_games {
         let (w, b, first) = random_draft(&mut rng);
@@ -164,27 +142,17 @@ fn invariants_random_playouts() {
         winners[1],
         winners[2],
     );
-    // Report (not assert) cap hits per spec; but flag loudly if many.
     if cap_hits > 0 {
         eprintln!("WARNING: {} playouts hit the 1000-action cap", cap_hits);
     }
 }
 
-/// A unit type is one card with one set of coins, so the two players' drafted
-/// sets must be disjoint and no coin type may exist twice over.
-///
-/// `make_game` used to draft each side independently off the same pool, which
-/// gave both players a full set of the same unit in 70% of random drafts and
-/// put twice a card's coins into the game. Nothing caught it: the engine takes
-/// the draft as input and conserves whatever it is handed, and every run to
-/// date used the fixed starter matchup, which is disjoint by construction.
 #[test]
 fn random_drafts_never_duplicate_a_unit_card() {
     for g in 0..5000u64 {
         let s = make_game(&mut Rng::new(g), true);
         for u in 0..N_UNITS {
             if u as u8 == ROYAL_COIN {
-                // One per player by the rules, not a drafted card.
                 continue;
             }
             let (w, b) = (s.total_coins(0, u), s.total_coins(1, u));
@@ -202,10 +170,6 @@ fn random_drafts_never_duplicate_a_unit_card() {
     }
 }
 
-/// The two tables the trunk gathers over, as `py::hex_neighbours` and
-/// `py::location_hexes` hand them to torch. The padding value is the whole
-/// point: `N_HEXES`, not `NONE`, so the gather can read a zero-padded 38th row
-/// instead of masking, and a stale `255` would silently index out of bounds.
 #[test]
 fn the_exported_board_tables_describe_the_board() {
     let bd = board();
@@ -231,9 +195,7 @@ fn the_exported_board_tables_describe_the_board() {
 
     let loc = bd.location_hexes;
     assert_eq!(loc.len(), N_LOCATIONS);
-    let mut marked: Vec<u8> = (0..N_HEXES as u8)
-        .filter(|&h| bd.is_location[h as usize])
-        .collect();
+    let mut marked: Vec<u8> = (0..N_HEXES as u8).filter(|&h| bd.is_location[h as usize]).collect();
     let mut exported = loc.to_vec();
     exported.sort_unstable();
     marked.sort_unstable();

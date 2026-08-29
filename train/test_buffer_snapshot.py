@@ -1,4 +1,3 @@
-"""CPU-only round-trip coverage for the replay snapshot state."""
 
 import importlib.util
 import pathlib
@@ -9,7 +8,6 @@ import numpy as np
 
 
 def load_buffer_module():
-    """Load train.py with only the constants needed by Buffer."""
     warchest = types.ModuleType("warchest")
     for name, value in {
         "PUBFEAT": 1,
@@ -30,7 +28,6 @@ def load_buffer_module():
     value_net = types.ModuleType("value_net")
     value_net.Net = object
     config = types.ModuleType("config")
-    mirror = types.ModuleType("mirror")
     export_weights = types.ModuleType("export_weights")
     export_weights.load = lambda _: None
     sys.modules.update({
@@ -40,7 +37,6 @@ def load_buffer_module():
         "torch.nn.functional": torch.nn.functional,
         "value_net": value_net,
         "config": config,
-        "mirror": mirror,
         "export_weights": export_weights,
     })
     path = pathlib.Path(__file__).with_name("train.py")

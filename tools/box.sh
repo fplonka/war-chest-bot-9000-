@@ -1,16 +1,4 @@
 #!/usr/bin/env bash
-# The GPU box: send the code, run train.py, bring one run back when it finishes.
-# Every build, test, training, and play command goes through start.
-#
-#   tools/box.sh go out=seat note="the idea"        train, queued behind other GPU jobs
-#   tools/box.sh start m1 python tools/arena.py ...  any GPU job, same queue
-#   tools/box.sh follow m1
-#   tools/box.sh kill m1                            the job and everything it spawned
-#   tools/box.sh pull [run]
-#   tools/box.sh setup                             a fresh vast.ai pytorch image
-#   tools/box.sh sync
-#   tools/box.sh build
-#   tools/box.sh <command...>
 set -euo pipefail
 
 host=${WARCHEST_BOX_HOST:-ssh1.vast.ai}
@@ -21,11 +9,7 @@ here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 local_dir=${WARCHEST_BOX_LOCAL_DIR:-$here}
 
 ssh_opts=(-i "$key" -p "$port" -o StrictHostKeyChecking=no -o ServerAliveInterval=30)
-# jemalloc and the image's virtualenv are both nice to have and neither is
-# guaranteed by the image, so neither is allowed to stop a command.
 prelude="export PATH=/root/.cargo/bin:/usr/local/cuda/bin:\$PATH
-# maturin insists on knowing which environment it is installing into, and the
-# image's python is a conda root rather than a virtualenv.
 export CONDA_PREFIX=\${CONDA_PREFIX:-/opt/conda}
 [ -f /usr/lib/x86_64-linux-gnu/libjemalloc.so.2 ] && export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
 source /venv/main/bin/activate 2>/dev/null || true
@@ -34,20 +18,15 @@ mkdir -p $remote && cd $remote"
 run_remote() { ssh "${ssh_opts[@]}" "root@$host" "$prelude
 $*"; }
 
-# No pipe on the build itself: a pipeline exits with `tail`'s status, so a
-# failed build used to look like a success and leave the old module in
-# place — which is how a run started without the `gpu` feature.
-build_script="find engine/src engine/tests engine/examples -type f -exec touch {} +
+build_script="find engine/src engine/tests -type f -exec touch {} +
 cd engine
 maturin develop --release --features python,gpu >/tmp/maturin.log 2>&1 || { tail -40 /tmp/maturin.log; exit 1; }
 tail -2 /tmp/maturin.log
-cargo build --release --features gpu --bin bot >/tmp/bot.log 2>&1 || { tail -40 /tmp/bot.log; exit 1; }
-tail -1 /tmp/bot.log"
+cargo build --release --features gpu --bin ladder >/tmp/ladder.log 2>&1 || { tail -40 /tmp/ladder.log; exit 1; }
+tail -1 /tmp/ladder.log"
 
 case "${1:-}" in
 setup)
-    # A fresh `pytorch/pytorch:*-devel` image: the allocator, the Rust
-    # toolchain, and the two Python packages the trainer needs beyond torch.
     run_remote "apt-get update -qq && apt-get install -y -qq libjemalloc2 rsync >/dev/null
 [ -x /root/.cargo/bin/cargo ] || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null
 pip install -q maturin numpy
@@ -59,8 +38,6 @@ sync)
         --exclude target --exclude .venv --exclude papers \
         --exclude __pycache__ --exclude .git --exclude data \
         "$here/" "root@$host:$remote/"
-    # One runs/ per box: every checkout shares warchest-engine's, so the
-    # results ledger and the dashboard have one place to look.
     [ "$remote" = /workspace/warchest-engine ] ||
         run_remote "[ -e runs ] || ln -s /workspace/warchest-engine/runs runs"
     sha=$(git -C "$here" rev-parse --short=7 HEAD)
@@ -77,8 +54,6 @@ pull)
                   --include 'config.json'
                   --include 'NOTES.md' --include 'train.log' --exclude '*')
     fi
-    # `*.tmp` is a live run writing a snapshot or log.json atomically; rsync would list it,
-    # find it replaced, and exit 24 mid-run.
     mkdir -p "$local_dir/runs${name:+/$name}"
     rsync -az -e "ssh ${ssh_opts[*]}" "${filters[@]}" \
         "root@$host:$remote/runs/$name/" "$local_dir/runs${name:+/$name}/"
@@ -112,12 +87,6 @@ grep -qx 0 /workspace/logs/$tag.exit || { tail -20 /workspace/logs/$tag.log; exi
     }
     ;;
 start)
-    # start <tag> <command...>: the command runs detached on the box, queued
-    # behind every other GPU job in order of arrival by a ticket in
-    # /workspace/queue (WARCHEST_BOX_PRIORITY=1 puts it ahead of the queue;
-    # the flock keeps it exclusive against jobs queued by older checkouts).
-    # Its script, log, pid and exit code live under /workspace/logs/<tag>.*.
-    # `follow <tag>` waits.
     tag=${2:?usage: start <tag> <command...>}
     shift 2
     run_remote "mkdir -p /workspace/logs /workspace/queue
@@ -139,17 +108,11 @@ nohup setsid bash /workspace/logs/$tag.sh >/workspace/logs/$tag.log 2>&1 &
 echo started $tag"
     ;;
 kill)
-    # The job's pid is its process-group leader (setsid), so this takes the
-    # whole tree: an orphaned test binary once held the queue for an hour.
-    # Only the checkout that started a job may kill it: workers killed each
-    # other's queued runs and a driver match by "tidying" the queue.
     tag=${2:?usage: kill <tag>}
     run_remote "[ \"\$(cat /workspace/logs/$tag.owner 2>/dev/null)\" = $remote ] || { echo \"$tag was not started from $remote; not killed\"; exit 1; }
 kill -- -\$(cat /workspace/logs/$tag.pid) && echo killed $tag"
     ;;
 go)
-    # The build runs inside the queued job, so a cargo build beside a measured
-    # run cannot take its cores.
     shift
     out=
     for a in "$@"; do

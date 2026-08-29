@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Run a trainer and resume its newest checkpoint after an unexpected exit.
 set -euo pipefail
 
 args=("$@")

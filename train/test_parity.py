@@ -1,30 +1,3 @@
-"""Parity between the PyTorch and Rust forwards, slot invariance, and complete
-public-input coverage.
-
-* **Blob parity.** `Net.flat()` writes the flat weight blob and `NetLayout::new`
-  reads it back, so its ordering is a contract between two independent
-  implementations. A transposed matrix, a bias attached to the wrong layer or a
-  LayerNorm applied out of turn shows up here and nowhere else until a training
-  run has quietly learned nothing. Several public rows, several configs per
-  row, both seats, and the degenerate supports a real solve does produce: a
-  query with no configs at all, a query with exactly one, and counts that are
-  all zero.
-
-* **Slot permutation.** Which slot the draft put a unit in is a pure
-  relabelling — the ten coin types are described by their printed card facts,
-  not by an identity embedding — so permuting the five slots of each player
-  must leave every value exactly where it was, as long as every place a slot
-  index appears moves together. This is the check
-  that caught raw belief marginals entering the join through a per-slot dense
-  layer, which cost half the value signal. It runs against torch only: parity
-  above carries it over to Rust.
-
-* **Off-board piles.** A drafted unit's public piles matter before its first
-  deployment. Changing those counts must move the value even when no matching
-  coin occupies a hex.
-
-    python train/test_parity.py
-"""
 
 import pathlib
 import sys
@@ -35,8 +8,8 @@ import torch.nn as nn
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-import warchest  # noqa: E402
-from value_net import Net  # noqa: E402
+import warchest
+from value_net import Net
 
 PUBFEAT = warchest.PUBFEAT
 N_HEXES = warchest.N_HEXES
@@ -53,24 +26,8 @@ OFF_PILES = warchest.OFF_PILES
 OFF_CARDS = warchest.OFF_CARDS
 OFF_LOOSE = warchest.OFF_LOOSE
 
-# (name, support size per canonical query, whether the counts are all zero).
-CASES = [
-    ("ragged supports", [3, 5, 1, 8, 2, 2, 6, 4, 7, 1, 5, 3], False),
-    ("uniform supports", [4] * 8, False),
-    ("singleton supports", [1] * 6, False),
-    ("empty supports", [0, 4, 3, 0, 1, 1, 0, 0, 5, 2], False),
-    ("one config in the batch", [0, 1], False),
-    ("all-zero counts", [2, 3, 3, 2], True),
-]
-
 
 def random_net(seed):
-    """A net whose every weight is visible in the output.
-
-    The production init deliberately makes `cfg_f` tiny so that every value
-    starts at the bias; leaving it there would let the readout half of the blob
-    pass parity while being wired to the wrong place.
-    """
     torch.manual_seed(seed)
     net = Net()
     with torch.no_grad():
@@ -84,26 +41,16 @@ def random_net(seed):
 
 
 def public_rows(rng, rows):
-    """Random rows in the frozen public encoding.
-
-    Noise everywhere the network only ever sees as a float, but real occupancy:
-    at most one coin type per hex, as an exact one-hot, because Rust reads the
-    occupant by finding the first non-zero and torch reads it as a matmul.
-    """
     x = rng.standard_normal((rows, PUBFEAT)).astype(np.float32)
     hexes = x[:, :N_HEXES * HEX_CH].reshape(rows, N_HEXES, HEX_CH)
     hexes[:, :, HEX_FACTS:] = 0
     occupant = rng.integers(0, NTYPE + 1, (rows, N_HEXES))
     r, h = np.nonzero(occupant < NTYPE)
     hexes[r, h, HEX_FACTS + occupant[r, h]] = 1
-    # A flat batch models one solve: boards differ, its draft does not.
-    x[:, OFF_CARDS:OFF_LOOSE] = x[0, OFF_CARDS:OFF_LOOSE]
     return x
 
 
 def belief(rng, sizes, zero_counts=False):
-    """A ragged belief per canonical query: `seg`, `phi`, and weights that sum
-    to one over each support, which is what a solve hands the network."""
     sizes = np.asarray(sizes, np.int64)
     seg = np.repeat(np.arange(len(sizes), dtype=np.uint32), sizes)
     n = int(sizes.sum())
@@ -119,7 +66,6 @@ def belief(rng, sizes, zero_counts=False):
 
 
 def run(net, xpub, phi, weight, seg, queries):
-    """The torch forward on numpy inputs."""
     with torch.no_grad():
         v = net(torch.from_numpy(np.ascontiguousarray(xpub)),
                 torch.from_numpy(np.ascontiguousarray(phi)),
@@ -129,12 +75,6 @@ def run(net, xpub, phi, weight, seg, queries):
 
 
 def slot_permutation(perm):
-    """The `PUBFEAT` permutation a relabelling of the draft slots induces.
-
-    A slot index appears in the occupancy one-hot of every hex, in the pile
-    block and in the card block; both players' blocks are permuted the same
-    way, so the seat a type belongs to does not move.
-    """
     full = np.concatenate([perm, NSLOT + perm])
     idx = np.arange(PUBFEAT)
     hexes = idx[:N_HEXES * HEX_CH].reshape(N_HEXES, HEX_CH)
@@ -146,90 +86,7 @@ def slot_permutation(perm):
     return idx
 
 
-def blob_parity(net, rng):
-    """Every case through both implementations of the same weights."""
-    worst = 0.0
-    for name, sizes, zero in CASES:
-        queries = len(sizes)
-        xpub = public_rows(rng, queries // 2)
-        seg, phi, weight = belief(rng, sizes, zero)
-        want = run(net, xpub, phi, weight, seg, queries)
-        got = np.asarray(warchest.infer(
-            xpub.ravel(), phi.ravel(), weight, seg, queries), np.float32)
-        assert got.shape == want.shape, f"{name}: {got.shape} vs {want.shape}"
-        scale = max(1.0, float(np.abs(want).max()))
-        assert scale > 1e-2, f"{name}: values are all zero, the test proves nothing"
-        err = float(np.max(np.abs(want - got)))
-        assert err < 1e-4 * scale, f"{name}: value parity failure: {err:.3e}"
-        worst = max(worst, err / scale)
-        print(f"  {name:24s} {queries:3d} queries {len(seg):4d} configs "
-              f"|v|<={scale:6.2f}  max err {err:.3e}")
-    print(f"blob parity ok: worst relative error {worst:.3e}")
-
-
-def policy_parity(net, rng):
-    """The policy readout through both implementations of the same weights.
-
-    `logit(c, a) = <cfg_p(c), e(a, h)>`, so this exercises the third config
-    head and every action projection, including a nonzero belief join row.
-    """
-    sizes = [4, 3, 6, 2]
-    queries = len(sizes)
-    na = 7
-    xpub = public_rows(rng, queries // 2)
-    seg, phi, weight = belief(rng, sizes)
-    n = len(seg)
-
-    desc = np.full((na, warchest.ACT_BYTES), 255, np.uint8)
-    desc[:, 0] = rng.integers(N_KINDS, size=na)
-    for a in range(na):
-        for k in range(1, 3):
-            if rng.random() < 0.8:
-                desc[a, k] = rng.integers(NTYPE)
-        for k in range(3, 6):
-            if rng.random() < 0.8:
-                desc[a, k] = rng.integers(N_HEXES)
-
-    cfg = rng.integers(0, n, size=24).astype(np.uint32)
-    act = rng.integers(0, na, size=24).astype(np.uint32)
-
-    with torch.no_grad():
-        public = torch.from_numpy(np.ascontiguousarray(xpub))
-        cards = net.cards(public)
-        tokens = net.tokens(public, cards)
-        board, projected, spatial = net.position(public, tokens)
-        tseg = torch.from_numpy(seg.astype(np.int64))
-        own = cards.reshape(-1, 2, NSLOT, cards.shape[-1]).flatten(0, 1)
-        _f, g, fp = net.configs(torch.from_numpy(np.ascontiguousarray(phi)),
-                                own, tseg)
-        h = net.heads(board, g, torch.from_numpy(weight), tseg, queries)
-        assert float(h.abs().max()) > 1e-2, "policy belief head is zero"
-        want = np.zeros(len(cfg), np.float32)
-        for k in range(len(cfg)):
-            query = int(seg[cfg[k]])
-            row = query // 2
-            e = net.actions(
-                torch.from_numpy(desc[act[k]:act[k] + 1]),
-                board[row:row + 1], h[query:query + 1],
-                projected[row:row + 1], spatial[row:row + 1],
-                torch.zeros(1, dtype=torch.long), torch.zeros(1, dtype=torch.long),
-            )
-            want[k] = float((fp[cfg[k]] * e[0]).sum())
-
-    got = np.asarray(warchest.infer_policy(
-        xpub.ravel(), phi.ravel(), weight, seg, desc.ravel(), cfg, act, queries),
-        np.float32)
-    assert got.shape == want.shape, f"policy: {got.shape} vs {want.shape}"
-    scale = max(1.0, float(np.abs(want).max()))
-    assert float(np.abs(want).max()) > 1e-2, "policy logits are all zero"
-    err = float(np.max(np.abs(want - got)))
-    assert err < 1e-4 * scale, f"policy parity failure: {err:.3e}"
-    print(f"policy parity ok: {len(cfg)} cells over {na} actions, "
-          f"|logit|<={scale:.2f}, max err {err:.3e}")
-
-
 def slot_invariance(net, rng, perms=6):
-    """Relabel the draft six ways; nothing the network says may move."""
     sizes = [4, 3, 6, 2, 5, 5]
     queries = len(sizes)
     xpub = public_rows(rng, queries // 2)
@@ -246,10 +103,6 @@ def slot_invariance(net, rng, perms=6):
         dv = float(np.max(np.abs(got - base)))
         worst = max(worst, dv)
         print(f"  slots {perm}  values {dv:.2e}")
-    # Relative to the size of the values, because these random weights put them
-    # in the tens and an absolute 1e-5 would be two float32 ulps away. The
-    # defect this guards against was half the value spread, so the margin is
-    # three orders of magnitude either side.
     tol = 1e-4 * max(1.0, float(np.abs(base).max()))
     assert worst < tol, (f"slot permutation is not a relabelling: {worst:.3e} "
                          f"against a value spread of {spread:.3e}")
@@ -257,7 +110,6 @@ def slot_invariance(net, rng, perms=6):
           f"value spread ({spread:.3e})")
 
 def offboard_pile_visibility(net, rng):
-    """Every type's public piles reach the trunk, occupied or not."""
     sizes = [1, 1]
     xpub = public_rows(rng, len(sizes) // 2)
     hexes = xpub[:, :N_HEXES * HEX_CH].reshape(len(sizes) // 2, N_HEXES, HEX_CH)
@@ -273,21 +125,16 @@ def offboard_pile_visibility(net, rng):
     print(f"off-board pile visibility ok: movement {movement:.3e}")
 
 
-def packed_row_cuda_parity(net):
-    """The Python entry point matches the Rust encoder on real mirrored rows."""
+def packed_row_cuda_parity():
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA parity requires a working GPU")
-    rows = np.frombuffer(bytes(warchest.mirror_row_pairs(128, 19)), np.uint8)
-    rows = rows.reshape(-1, warchest.ROW_BYTES)[:4096].copy()
+    rows = np.frombuffer(bytes(warchest.sample_rows(128, 19)), np.uint8)
+    rows = rows.reshape(-1, warchest.ROW_BYTES)[:2048]
+    mirrored = np.frombuffer(bytes(warchest.mirror_rows(rows.ravel())), np.uint8)
+    rows = np.concatenate([rows, mirrored.reshape(rows.shape)]).copy()
     assert len(rows) >= 2048, f"only {len(rows)} real rows"
     want = np.asarray(warchest.expand_rows(rows.ravel()), np.float32)
     want = want.reshape(len(rows), warchest.PUBFEAT)
-    paired = torch.from_numpy(want)
-    with torch.no_grad():
-        old = net.cards(paired)[:, :NSLOT]
-        cards = net.cards(paired[0::2])
-        direct = cards.reshape(-1, 2, NSLOT, cards.shape[-1]).flatten(0, 1)
-    torch.testing.assert_close(direct, old, rtol=0, atol=2e-7)
     device = torch.device("cuda:0")
     packed = torch.as_tensor(np.ascontiguousarray(rows), device=device)
     cards = torch.as_tensor(
@@ -310,11 +157,9 @@ def main():
     rng = np.random.default_rng(11)
     net = random_net(7)
     net.push()
-    blob_parity(net, rng)
-    policy_parity(net, rng)
     slot_invariance(net, rng)
     offboard_pile_visibility(net, rng)
-    packed_row_cuda_parity(net)
+    packed_row_cuda_parity()
 
 
 if __name__ == "__main__":

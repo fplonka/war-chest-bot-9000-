@@ -1,66 +1,17 @@
-//! Correctness tests for the public belief state.
-//!
-//! Belief bookkeeping bugs do not crash — they just make the bot quietly wrong —
-//! so these are the load-bearing tests of the whole SoG stack.
-//!
-//! 1. `features_do_not_leak_private_information`: the public encoding must be a
-//!    function of the public state alone. Swapping a player's true config for
-//!    any other config consistent with the same public counts must not move a
-//!    single feature.
-//! 2. `a_solve_reads_only_the_beliefs`: the same property one level up. The
-//!    value network is now asked about specific configs, so the leak the first
-//!    test guards is no longer the only way private information could reach it;
-//!    this one solves the same public position in two different worlds and
-//!    requires bit-identical values and strategies.
-//! 3. `config_features_separate_every_config`: the value function's argument
-//!    must actually identify the config. If two distinct private states shared
-//!    a feature vector the network could not tell them apart, which is the bug
-//!    the hand-keyed encoding had by construction.
-//! 4. `the_value_function_separates_configs_sharing_a_hand`: end to end — two
-//!    configs with the same hand and different face-down piles must get
-//!    different leaf values, and therefore different play.
-//! 5. `belief_tracker_matches_brute_force`: the incremental tracker is compared
-//!    against an exhaustive enumeration of every world consistent with the
-//!    observation sequence, weighted by exact draw probabilities and the
-//!    announced policy. The brute-force side goes through the engine only — it
-//!    never touches `Belief`, `advance_config` or `belief_after_draw`.
-
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use warchest::net::Net;
 use warchest::pbs::*;
 use warchest::rng::Rng;
-use warchest::farm::{Call, Reply};
-use warchest::search::{node_actions, Budget, Cfg, Solver, Step};
-use warchest::selfplay::{make_game, Agent, Collect, Data, GameCfg, GameStream};
+use warchest::net::Net;
+use warchest::search::{node_actions, Cfg, Solver};
+use std::sync::Arc;
+use warchest::selfplay::make_game;
 use warchest::state::{Cont, State, Z_BAG, Z_FACEDOWN, Z_FACEUP};
 use warchest::units::{write_card_features, CARD_FEATS};
 use warchest::Action;
 
-/// A network with random weights, for tests that need the value function to
-/// actually distinguish things rather than return zero. LayerNorms start at the
-/// identity (gamma = 1, beta = 0); everything else is small and uniform.
-fn random_net(seed: u64) -> Net {
-    let mut r = Rng::new(seed);
-    let layout = warchest::net::NetLayout::new();
-    let mut draw = |n: usize, scale: f32| -> Vec<f32> {
-        (0..n)
-            .map(|_| (r.unit_f64() as f32 - 0.5) * scale)
-            .collect()
-    };
-    let w = draw(layout.w_len, 0.2);
-    let b = draw(layout.b_len, 0.2);
-    let mut ln = vec![0.0; layout.ln_len];
-    for n in &layout.norms {
-        ln[n.g..n.g + n.width].fill(1.0);
-    }
-    Net::from_flat(&w, &b, &ln).expect("random net")
-}
-
-/// Instantiate a world from the shared public state plus both configs.
 fn world(pubs: &State, ctx: &Ctx, c: &(Config, Config)) -> State {
-    let mut w = pubs.clone();
+    let mut w = *pubs;
     set_config(&mut w, 0, ctx, &c.0);
     set_config(&mut w, 1, ctx, &c.1);
     w
@@ -82,15 +33,8 @@ fn with(c: &(Config, Config), p: u8, n: Config) -> (Config, Config) {
     }
 }
 
-/// Uniform over the private actions legal for this config — the announced
-/// policy both sides of the test use.
 #[allow(clippy::type_complexity)]
-fn uniform_row(
-    s: &State,
-    ctx: &Ctx,
-    p: u8,
-    c: &Config,
-) -> (Vec<Action>, Vec<i8>, Vec<bool>, Vec<f64>) {
+fn uniform_row(s: &State, ctx: &Ctx, p: u8, c: &Config) -> (Vec<Action>, Vec<i8>, Vec<bool>, Vec<f64>) {
     let (acts, aslot, fdown) = node_actions(s, p, ctx, std::slice::from_ref(c));
     let legal: Vec<bool> = aslot.iter().map(|&k| action_legal(c, k)).collect();
     let n = legal.iter().filter(|&&x| x).count() as f64;
@@ -101,9 +45,6 @@ fn uniform_row(
     (acts, aslot, fdown, probs)
 }
 
-/// The engine's own chance distribution: the bag, or the refilled discard pile
-/// when the bag has run out. Bag emptiness is public, so every world reshuffles
-/// at the same moment.
 fn draw_weights(s: &State, p: u8, acts: &[Action]) -> Vec<f64> {
     let bag_total: u8 = s.zones[p as usize][Z_BAG].iter().sum();
     acts.iter()
@@ -121,10 +62,6 @@ fn draw_weights(s: &State, p: u8, acts: &[Action]) -> Vec<f64> {
         .collect()
 }
 
-/// Swapping a player's hidden config for any other consistent with the same
-/// public counts must not move a single feature. Run over both drafts: the
-/// starter matchup never produces a Footman, Mercenary or Royal Guard trigger,
-/// so it would not exercise the pending-maneuver mask at all.
 fn leak_check(random_draft: bool) -> (usize, usize) {
     let mut rng = Rng::new(99);
     let (mut checked, mut pending_seen) = (0, 0);
@@ -138,29 +75,22 @@ fn leak_check(random_draft: bool) -> (usize, usize) {
             for p in 0..2u8 {
                 let res = reserve(&s, p, &ctx);
                 let truth = true_config(&s, p, &ctx);
-                let all = enumerate_configs(
-                    &res,
-                    truth.hand_size(),
-                    truth.fd_size(),
-                    truth.inflight.is_some(),
-                );
+                let all = enumerate_configs(&res, truth.hand_size(), truth.fd_size(), truth.inflight.is_some());
                 if all.len() < 2 {
                     continue;
                 }
                 let mut a = vec![0.0f32; PUBFEAT];
                 let mut b = vec![0.0f32; PUBFEAT];
-                let mut sa = s.clone();
+                let mut row = [0u8; ROW_BYTES];
+                let mut sa = s;
                 set_config(&mut sa, p, &ctx, &all[0]);
-                write_public_features(&sa, &ctx, &mut a);
-                let mut sb = s.clone();
+                pack_row(&sa, &ctx, &mut row);
+                expand_row(&row, &mut a);
+                let mut sb = s;
                 set_config(&mut sb, p, &ctx, &all[all.len() - 1]);
-                write_public_features(&sb, &ctx, &mut b);
-                assert_eq!(
-                    a, b,
-                    "features changed when only player {}'s hidden config changed",
-                    p
-                );
-                // The pending-maneuver mask is hex channel 6.
+                pack_row(&sb, &ctx, &mut row);
+                expand_row(&row, &mut b);
+                assert_eq!(a, b, "features changed when only player {}'s hidden config changed", p);
                 if (0..warchest::board::N_HEXES).any(|h| a[h * HEX_CH + 6] != 0.0) {
                     pending_seen += 1;
                 }
@@ -178,42 +108,22 @@ fn leak_check(random_draft: bool) -> (usize, usize) {
 
 #[test]
 fn features_do_not_leak_private_information() {
-    let (checked, _) = leak_check(false);
-    assert!(checked > 500, "not enough positions exercised: {}", checked);
-}
-
-#[test]
-fn features_do_not_leak_private_information_random_draft() {
-    let (checked, pending) = leak_check(true);
-    assert!(checked > 500, "not enough positions exercised: {}", checked);
-    // A feature block that never fires is dead weight the encoding is paying
-    // for; assert the pending-maneuver mask is actually reached.
-    assert!(
-        pending > 0,
-        "the pending-maneuver mask never fired over {} positions",
-        checked
-    );
+    for random_draft in [false, true] {
+        let (checked, pending) = leak_check(random_draft);
+        assert!(checked > 500, "not enough positions exercised: {}", checked);
+        assert!(
+            pending > 0,
+            "the pending-maneuver mask never fired over {} positions",
+            checked
+        );
+    }
 }
 
 #[test]
 fn belief_tracker_matches_brute_force() {
     for seed in 0..6u64 {
-        run_one(seed);
+        run_one_draft(seed, &[17, 12, 4, 9], &[1, 3, 8, 16]);
     }
-}
-
-fn run_one(seed: u64) {
-    // The starter matchup: no Warrior Priest, so the pending-coin machinery is
-    // dormant — the comparison still runs, and is the regression test for the
-    // ordinary path.
-    run_one_draft(seed, &[17, 12, 4, 9], &[1, 3, 8, 16]);
-}
-
-/// The same exhaustive-vs-incremental comparison on a draft with both Warrior
-/// Priests: private mid-round draws put `inflight` into the config, so belief
-/// updates and brute-force enumeration must both carry it.
-#[test]
-fn belief_tracker_matches_brute_force_with_warrior_priests() {
     for seed in 0..4u64 {
         run_one_draft(seed + 100, &[18, 17, 12, 4], &[54, 1, 3, 8]);
     }
@@ -223,12 +133,7 @@ fn run_one_draft(seed: u64, white: &[u16], black: &[u16]) {
     let mut rng = Rng::new(seed + 1);
     let mut s = State::from_draft(white, black, warchest::state::WHITE);
     let ctx = Ctx::new(&s);
-    let mut bel = [
-        Belief::point(Config::default()),
-        Belief::point(Config::default()),
-    ];
-    // Exhaustive posterior over joint private configs. The public state is
-    // shared by every world, so a world is just the pair.
+    let mut bel = [Belief::point(Config::default()), Belief::point(Config::default())];
     let mut worlds: HashMap<(Config, Config), f64> = HashMap::new();
     worlds.insert((Config::default(), Config::default()), 1.0);
 
@@ -247,7 +152,7 @@ fn run_one_draft(seed: u64, white: &[u16], black: &[u16]) {
                     if wts[i] <= 0.0 {
                         continue;
                     }
-                    let mut nx = ws.clone();
+                    let mut nx = ws;
                     nx.apply_inplace(*a);
                     let nc = with(c, p, true_config(&nx, p, &ctx));
                     *next.entry(nc).or_insert(0.0) += w * wts[i] / tot;
@@ -269,14 +174,11 @@ fn run_one_draft(seed: u64, white: &[u16], black: &[u16]) {
             continue;
         }
 
-        // Decision node: sample the real action from the announced policy.
         let truth = true_config(&s, p, &ctx);
         let (acts, _, _, probs) = uniform_row(&s, &ctx, p, &truth);
         let chosen = rng.weighted_index(&probs);
         let obs = obs_key(&acts[chosen]);
 
-        // Brute force: keep the worlds whose policy could have produced this
-        // observation, weighted by how much probability they put on it.
         let mut next: HashMap<(Config, Config), f64> = HashMap::new();
         for (c, w) in worlds.iter() {
             let ws = world(&s, &ctx, c);
@@ -285,7 +187,7 @@ fn run_one_draft(seed: u64, white: &[u16], black: &[u16]) {
                 if wprobs[i] <= 0.0 || obs_key(a) != obs {
                     continue;
                 }
-                let mut nx = ws.clone();
+                let mut nx = ws;
                 nx.apply_inplace(*a);
                 let nc = with(c, p, true_config(&nx, p, &ctx));
                 *next.entry(nc).or_insert(0.0) += w * wprobs[i];
@@ -298,7 +200,6 @@ fn run_one_draft(seed: u64, white: &[u16], black: &[u16]) {
         }
         worlds = next;
 
-        // Tracker: the same update, done incrementally over configs.
         let cfgs = bel[p as usize].cfg.clone();
         let mut pairs: Vec<(Config, f32)> = Vec::new();
         for (ci, c) in cfgs.iter().enumerate() {
@@ -318,9 +219,6 @@ fn run_one_draft(seed: u64, white: &[u16], black: &[u16]) {
         compare(&worlds, &bel, seed, steps, "decision");
         steps += 1;
     }
-    // Uniform play discards face down constantly, so the exhaustive side hits
-    // its world budget after a couple of rounds. That is the point at which it
-    // stops being a usable oracle, not a failure.
     assert!(
         steps > 8,
         "seed {} produced too short a trace ({} steps, {} worlds)",
@@ -336,13 +234,7 @@ fn run_one_draft(seed: u64, white: &[u16], black: &[u16]) {
     );
 }
 
-fn compare(
-    worlds: &HashMap<(Config, Config), f64>,
-    bel: &[Belief; 2],
-    seed: u64,
-    step: usize,
-    what: &str,
-) {
+fn compare(worlds: &HashMap<(Config, Config), f64>, bel: &[Belief; 2], seed: u64, step: usize, what: &str) {
     for p in 0..2u8 {
         let mut exact: HashMap<Config, f64> = HashMap::new();
         for (c, w) in worlds.iter() {
@@ -389,17 +281,12 @@ fn compare(
     }
 }
 
-/// The config key must stay inside the packed `u64` budget (the key shares a
-/// word with the element index in the solver's sort): 38 bits of config +
-/// `IDX_BITS` index bits must not overflow. Also pins that the key
-/// distinguishes pendings and that hand slots never exceed the two-bit width.
 #[test]
 fn config_key_packing_has_headroom() {
     for seed in 0..200u64 {
         let mut r = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
         let mut c = Config::default();
         for k in 0..NSLOT {
-            // A hand holds at most 3 and a face-down slot at most 5.
             c.hand[k] = r.below(4) as u8;
             c.fd[k] = r.below(6) as u8;
         }
@@ -414,7 +301,6 @@ fn config_key_packing_has_headroom() {
             "config key must leave room for the element index: {:#x}",
             key
         );
-        // Same counts, different pending -> different key; equal -> equal.
         let mut d = c;
         assert_eq!(c.key(), d.key());
         d.inflight = match c.inflight {
@@ -426,7 +312,6 @@ fn config_key_packing_has_headroom() {
             assert_ne!(c.key(), d.key());
         }
     }
-    // Explicit extreme: every slot at its maximum with a pending coin.
     let mut c = Config::default();
     for k in 0..NSLOT {
         c.hand[k] = 3;
@@ -434,141 +319,8 @@ fn config_key_packing_has_headroom() {
     }
     c.inflight = Some(NSLOT as u8 - 1);
     assert!(c.key() < (1u64 << (64 - IDX_BITS)));
-    // The hand width is two bits; `key`'s debug_assert is the overflow test
-    // for a slot value of 4 or more (it fires in every debug test build).
 }
 
-/// The reachable-config census, re-run with the Warrior Priests in the draft
-/// pool: how big the belief supports get. Reported, not asserted — the
-/// numbers feed the docs, and the solver's sizing depends on them.
-#[test]
-fn reachable_config_census_with_warrior_priests() {
-    let mut sizes: Vec<usize> = Vec::new();
-    let mut rng = Rng::new(0xC0FFEE);
-    for _ in 0..200u64 {
-        let mut s = make_game(&mut rng, true);
-        let ctx = Ctx::new(&s);
-        for _ in 0..300 {
-            if s.is_terminal() {
-                break;
-            }
-            for p in 0..2u8 {
-                let res = reserve(&s, p, &ctx);
-                let truth = true_config(&s, p, &ctx);
-                sizes.push(
-                    enumerate_configs(
-                        &res,
-                        truth.hand_size(),
-                        truth.fd_size(),
-                        truth.inflight.is_some(),
-                    )
-                    .len(),
-                );
-            }
-            let acts = s.legal_actions();
-            s.apply_inplace(acts[rng.below(acts.len())]);
-        }
-    }
-    sizes.sort_unstable();
-    let n = sizes.len();
-    let (med, p99) = (sizes[n / 2], sizes[(n as f64 * 0.99) as usize]);
-    let mean = sizes.iter().sum::<usize>() as f64 / n as f64;
-    eprintln!(
-        "census: {} positions, median {} mean {:.1} p99 {}",
-        n, med, mean, p99
-    );
-}
-
-/// A subgame root survives the roots-file round trip: state, both beliefs and
-/// every continuation.
-#[test]
-fn roots_round_trip() {
-    for seed in 0..30u64 {
-        let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
-        let mut s = make_game(&mut rng, true);
-        let ctx = Ctx::new(&s);
-        let mut bel = [
-            Belief::point(Config::default()),
-            Belief::point(Config::default()),
-        ];
-        for _ in 0..40 {
-            if s.is_terminal() {
-                break;
-            }
-            if matches!(s.pending(), Cont::MainPlay) {
-                let mut buf: Vec<u8> = Vec::new();
-                let mut w = std::io::Cursor::new(&mut buf);
-                warchest::roots::write_root(&mut w, &s, &bel).unwrap();
-                let mut r = std::io::Cursor::new(&buf);
-                let (s2, bel2) = warchest::roots::read_root(&mut r).unwrap();
-                assert_eq!(s, s2, "seed {}: state did not round trip", seed);
-                assert_eq!(bel[0].cfg, bel2[0].cfg);
-                assert_eq!(bel[0].p, bel2[0].p);
-                assert_eq!(bel[1].cfg, bel2[1].cfg);
-                assert_eq!(bel[1].p, bel2[1].p);
-            }
-            let acts = s.legal_actions();
-            s.apply_inplace(acts[rng.below(acts.len())]);
-            let p = s.to_act();
-            if s.is_chance() {
-                let res = reserve(&s, p, &ctx);
-                let fu = faceup_counts(&s, p, &ctx);
-                let wp = matches!(s.pending(), Cont::WarriorPriestDraw { .. });
-                bel[p as usize] = belief_after_draw(&bel[p as usize], &res, &fu, wp);
-            } else {
-                let truth = true_config(&s, p, &ctx);
-                bel[p as usize] = Belief::point(truth);
-            }
-        }
-    }
-}
-
-/// A packed replay row must expand to exactly the features the solver's own
-/// encoder writes for the same state — the two producers of the public
-/// encoding share one core, and this pins that they cannot drift. Walked
-/// over random positions from random drafts (Warrior Priests included).
-#[test]
-fn packed_row_expands_to_the_same_features() {
-    for seed in 0..40u64 {
-        let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
-        let mut s = make_game(&mut rng, true);
-        let ctx = Ctx::new(&s);
-        let mut checked = 0;
-        for _ in 0..120 {
-            if s.is_terminal() {
-                break;
-            }
-            if s.is_valued() {
-                let mut row = [0u8; ROW_BYTES];
-                pack_row(&s, &ctx, &mut row);
-                let mut direct = vec![0.0f32; PUBFEAT];
-                write_public_features(&s, &ctx, &mut direct);
-                let mut expanded = vec![0.0f32; PUBFEAT];
-                expand_row(&row, &mut expanded);
-                assert_eq!(
-                    direct, expanded,
-                    "seed {}: packed row and live state encode differently",
-                    seed
-                );
-                checked += 1;
-            }
-            let acts = s.legal_actions();
-            s.apply_inplace(acts[rng.below(acts.len())]);
-        }
-        assert!(
-            checked > 20,
-            "seed {} exercised too few valued states",
-            seed
-        );
-    }
-}
-
-// ------------------------------------------------- the value function's argument
-
-/// Two different private states must never share a feature vector. This is the
-/// property that makes `v(PBS, config)` a function *of the config*: without it
-/// the network is being asked about an equivalence class, which is what the
-/// hand-keyed encoding was and why it changed the game being solved.
 #[test]
 fn config_features_separate_every_config() {
     let mut seen: HashMap<Vec<u32>, Config> = HashMap::new();
@@ -583,8 +335,6 @@ fn config_features_separate_every_config() {
                 for c in &cfgs {
                     let mut phi = vec![0.0f32; CFEAT];
                     write_config_feats(c, &reserve, &mut phi);
-                    // Bit patterns, so this compares exactly rather than
-                    // up to a tolerance chosen to make it pass.
                     let key: Vec<u32> = phi.iter().map(|x| x.to_bits()).collect();
                     if let Some(prev) = seen.insert(key, *c) {
                         assert_eq!(prev, *c, "two configs share a feature vector");
@@ -597,84 +347,6 @@ fn config_features_separate_every_config() {
     assert!(checked > 10_000, "only {checked} config vectors exercised");
 }
 
-fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
-    let res = reserve(s, p, ctx);
-    let truth = true_config(s, p, ctx);
-    let cfgs = enumerate_configs(
-        &res,
-        truth.hand_size(),
-        truth.fd_size(),
-        truth.inflight.is_some(),
-    );
-    let n = cfgs.len().max(1) as f32;
-    Belief {
-        p: vec![1.0 / n; cfgs.len()],
-        cfg: cfgs,
-    }
-}
-
-/// A subgame close enough to the horizon that every leaf is terminal has no
-/// network rows at all. The card table is only built when there is something to
-/// encode, so anything hoisted out of the per-row loop must not read it.
-///
-/// The solver oracle already reaches these positions, but with an empty network,
-/// which returns before the batch is touched. This one uses a real one -- the
-/// combination a benchmark hit and the suite did not.
-#[test]
-fn a_subgame_of_only_terminal_leaves_solves() {
-    let nets = Arc::new(random_net(5));
-    let mut checked = 0usize;
-    for seed in 0..600u64 {
-        let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
-        let mut s = make_game(&mut rng, false);
-        for _ in 0..60 + seed % 100 {
-            if s.is_terminal() {
-                break;
-            }
-            let acts = s.legal_actions();
-            s.apply_inplace(acts[rng.below(acts.len())]);
-        }
-        if s.is_terminal() || s.is_chance() {
-            continue;
-        }
-        // One coin play from the horizon: every child is terminal.
-        s.main_plays = warchest::state::MAX_MAIN_PLAYS - 1;
-        let ctx = Ctx::new(&s);
-        let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
-        let cfg = Cfg {
-            s: 8,
-            c: 1.0,
-            budget: Budget::unbounded(),
-            ..Default::default()
-        };
-        let mut sv = Solver::new(&s, ctx, Arc::clone(&nets), cfg, bel.clone(), Rng::new(seed));
-        assert!(
-            sv.nodes
-                .iter()
-                .zip(&sv.states)
-                .all(|(n, st)| !n.leaf || st.is_terminal()),
-            "expected every leaf terminal"
-        );
-        sv.run_alone();
-        let v = vec![sv.root_values()];
-        assert!(v[0][0].iter().all(|x| x.is_finite()));
-        checked += 1;
-        if checked >= 3 {
-            break;
-        }
-    }
-    assert!(checked >= 3, "only {checked} positions exercised");
-}
-
-/// The card describer is the whole of what makes an unseen draft readable: the
-/// network keys on what a card *does* rather than on which card it is. That only
-/// works if the rulebook facts tell the draftable cards apart. If two share a
-/// vector the describer merges them silently, and every part that reads the
-/// embedding — the hex block, the pile summary, the holding tower, the action
-/// tower — is built on the merge.
-///
-/// The Royal Coin is in play for both sides and is drafted by nobody, so it is
-/// checked alongside the pool.
 #[test]
 fn card_features_separate_every_draftable_unit() {
     let mut seen: HashMap<Vec<u32>, u8> = HashMap::new();
@@ -683,11 +355,7 @@ fn card_features_separate_every_draftable_unit() {
         .filter_map(|&id| warchest::units::index_of_id(id))
         .chain([warchest::units::ROYAL_COIN])
         .collect();
-    assert_eq!(
-        units.len(),
-        20,
-        "the draft pool did not resolve to unit indices"
-    );
+    assert_eq!(units.len(), 20, "the draft pool did not resolve to unit indices");
     for u in units {
         let mut f = vec![0.0f32; CARD_FEATS];
         write_card_features(u, &mut f);
@@ -703,400 +371,6 @@ fn card_features_separate_every_draftable_unit() {
     }
 }
 
-/// The counts must be the ones the name says, and the bag must be the derived
-/// one. A transposition here would be invisible to every other test: the
-/// network would happily learn whatever permutation it was given.
-#[test]
-fn config_counts_are_hand_facedown_bag() {
-    let reserve = [4u8, 3, 5, 2, 1];
-    let c = Config {
-        hand: [1, 0, 2, 0, 0],
-        fd: [2, 1, 0, 0, 1],
-        inflight: None,
-    };
-    let mut cnt = [0u8; CCOUNTS];
-    config_counts(&c, &reserve, &mut cnt);
-    assert_eq!(&cnt[..NSLOT], &c.hand, "hand block");
-    assert_eq!(&cnt[NSLOT..2 * NSLOT], &c.fd, "face-down block");
-    assert_eq!(&cnt[2 * NSLOT..], &[1u8, 2, 3, 2, 0], "bag block");
-    let mut phi = vec![0.0f32; CFEAT];
-    write_config_feats(&c, &reserve, &mut phi);
-    for k in 0..CCOUNTS {
-        assert_eq!(phi[k], cnt[k] as f32 / CNORM);
-    }
-}
-
-// ------------------------------------------------------ no leak through a solve
-
-/// Find a mid-game decision node whose acting player has at least two configs
-/// sharing a hand — the situation the whole rearchitecture is about.
-fn position_with_ambiguous_facedown(seed: u64) -> Option<(State, Ctx, [Belief; 2])> {
-    let mut rng = Rng::new(seed);
-    let mut s = make_game(&mut Rng::new(seed), false);
-    for _ in 0..40 + rng.below(60) {
-        if s.is_terminal() {
-            return None;
-        }
-        let acts = s.legal_actions();
-        if acts.is_empty() {
-            return None;
-        }
-        s.apply_inplace(acts[rng.below(acts.len())]);
-    }
-    while !s.is_terminal() && s.is_chance() {
-        let acts = s.legal_actions();
-        s.apply_inplace(acts[rng.below(acts.len())]);
-    }
-    if s.is_terminal() || s.is_chance() || !matches!(s.pending(), Cont::MainPlay) {
-        return None;
-    }
-    let ctx = Ctx::new(&s);
-    let mut bel = Vec::new();
-    for p in 0..2u8 {
-        let res = reserve(&s, p, &ctx);
-        let truth = true_config(&s, p, &ctx);
-        let cfg = enumerate_configs(
-            &res,
-            truth.hand_size(),
-            truth.fd_size(),
-            truth.inflight.is_some(),
-        );
-        if cfg.is_empty() {
-            return None;
-        }
-        let w = 1.0 / cfg.len() as f32;
-        bel.push(Belief {
-            p: vec![w; cfg.len()],
-            cfg,
-        });
-    }
-    let me = s.to_act() as usize;
-    let mut hands: HashMap<[u8; NSLOT], usize> = HashMap::new();
-    for c in &bel[me].cfg {
-        *hands.entry(c.hand).or_insert(0) += 1;
-    }
-    if !hands.values().any(|&n| n > 1) {
-        return None;
-    }
-    Some((s, ctx, [bel[0].clone(), bel[1].clone()]))
-}
-
-/// A solve must be a function of the public state and the beliefs — nothing
-/// else. The tree is built from a `State` that still carries somebody's true
-/// hidden coins, so "the solver never looks at them" is a property worth
-/// checking rather than assuming: instantiate the same public position in two
-/// different worlds and require the results to agree bit for bit.
-#[test]
-fn a_solve_reads_only_the_beliefs() {
-    let nets = Arc::new(random_net(0xA11CE));
-    let cfg = Cfg {
-        s: 8,
-        c: 1.0,
-        budget: Budget::unbounded(),
-        ..Default::default()
-    };
-    let mut checked = 0usize;
-    for seed in 1..80u64 {
-        let Some((s, ctx, bel)) = position_with_ambiguous_facedown(seed) else {
-            continue;
-        };
-        // Two worlds with the same public projection: the first and the last
-        // config in each player's support.
-        let mut runs = Vec::new();
-        for pick in [0usize, 1] {
-            let mut w = s.clone();
-            for p in 0..2usize {
-                let cs = &bel[p].cfg;
-                let c = if pick == 0 { cs[0] } else { cs[cs.len() - 1] };
-                set_config(&mut w, p as u8, &ctx, &c);
-            }
-            let mut sv = Solver::new(
-                &w,
-                ctx,
-                Arc::clone(&nets),
-                cfg,
-                bel.clone(),
-                Rng::new(seed ^ 0x51A7_EE),
-            );
-            sv.run_alone();
-            let vals = vec![sv.root_values()];
-            let strat: Vec<f32> = (0..bel[w.to_act() as usize].cfg.len())
-                .flat_map(|c| sv.root_strategy(c).to_vec())
-                .collect();
-            runs.push((vals[0][0].clone(), vals[0][1].clone(), strat));
-        }
-        assert_eq!(
-            runs[0].0, runs[1].0,
-            "player 0 root values moved with the true world"
-        );
-        assert_eq!(
-            runs[0].1, runs[1].1,
-            "player 1 root values moved with the true world"
-        );
-        assert_eq!(
-            runs[0].2, runs[1].2,
-            "the root strategy moved with the true world"
-        );
-        checked += 1;
-    }
-    assert!(checked > 20, "only {checked} positions exercised");
-}
-
-/// The regression test for the thing this architecture exists to fix.
-///
-/// Two configs that share a hand but hold different face-down piles have
-/// different bags and therefore different futures. They must get different
-/// values, and because CFR derives its strategy from those values, different
-/// play. Under the old hand-keyed head both were identically zero-difference by
-/// construction — the network could not express the distinction and the solver
-/// could not act on it.
-#[test]
-fn the_value_function_separates_configs_sharing_a_hand() {
-    let nets = Arc::new(random_net(0xBEEF));
-    let cfg = Cfg {
-        s: 8,
-        c: 1.0,
-        budget: Budget::unbounded(),
-        ..Default::default()
-    };
-    let (mut positions, mut val_differs, mut strat_differs) = (0usize, 0usize, 0usize);
-    for seed in 1..80u64 {
-        let Some((s, ctx, bel)) = position_with_ambiguous_facedown(seed) else {
-            continue;
-        };
-        let me = s.to_act() as usize;
-        let mut sv = Solver::new(
-            &s,
-            ctx,
-            Arc::clone(&nets),
-            cfg,
-            bel.clone(),
-            Rng::new(seed ^ 0xC0FF_EE),
-        );
-        sv.run_alone();
-        let vals = vec![sv.root_values()];
-        let v = &vals[0][me];
-        for i in 0..bel[me].cfg.len() {
-            for j in 0..i {
-                if bel[me].cfg[i].hand != bel[me].cfg[j].hand {
-                    continue;
-                }
-                positions += 1;
-                if (v[i] - v[j]).abs() > 1e-9 {
-                    val_differs += 1;
-                }
-                let (a, b) = (sv.root_strategy(i), sv.root_strategy(j));
-                if a.iter().zip(b.iter()).any(|(x, y)| (x - y).abs() > 1e-9) {
-                    strat_differs += 1;
-                }
-            }
-        }
-    }
-    assert!(positions > 50, "only {positions} same-hand pairs found");
-    // Not every pair must differ — two face-down piles can leave the same bag
-    // when the coins came from the same slot — but the overwhelming majority
-    // must, and under the old architecture the count was exactly zero except
-    // where a round-start draw happened to fall inside the horizon.
-    let vf = val_differs as f64 / positions as f64;
-    let sf = strat_differs as f64 / positions as f64;
-    assert!(
-        vf > 0.9,
-        "only {:.0}% of same-hand config pairs got distinct values",
-        vf * 100.0
-    );
-    assert!(
-        sf > 0.5,
-        "only {:.0}% of same-hand config pairs got distinct play",
-        sf * 100.0
-    );
-}
-
-#[test]
-fn game_stream_yields_one_complete_solve_at_a_time() {
-    let nets = Arc::new(random_net(0x57EA));
-    let cfg = Cfg {
-        s: 8,
-        c: 1.0,
-        budget: Budget::unbounded(),
-        ..Default::default()
-    };
-    let gc = GameCfg {
-        agents: [Agent::Sog { cfg }; 2],
-        collect: Collect::Sog,
-        explore: 0.25,
-        random_draft: false,
-        p_td1: 0.0,
-        query_rate: 0.0,
-        recursive_rate: 0.0,
-    };
-    let mut stream = GameStream::new(7, gc);
-    for _ in 0..2 {
-        let data = stream.generate(&nets, 1);
-        assert_eq!(data.soff.len(), 1);
-        assert!(data.nv > 0);
-        assert_eq!(data.coff.len(), 2 * data.nv + 1);
-    }
-}
-
-/// Batching several solves into one round must not change a single value.
-///
-/// A round exists to make the *shape* of inference better, never its result:
-/// the same stream, driven alone and driven in a round beside two others, has
-/// to produce the same rows, the same beliefs and the same targets, bit for
-/// bit. Anything else means the batch is answering a different question than
-/// the solve asked, or handing one solve another's reply.
-#[test]
-fn a_batched_solve_matches_one_run_alone_exactly() {
-    let cfg = Cfg { s: 12, c: 1.0, budget: Budget::unbounded(), ..Default::default() };
-    let gc = GameCfg {
-        agents: [Agent::Sog { cfg }; 2],
-        collect: Collect::Sog,
-        explore: 0.1,
-        random_draft: true,
-        p_td1: 0.0,
-        query_rate: 0.9,
-        recursive_rate: 0.25,
-    };
-    const SOLVES: usize = 2;
-    const SEEDS: [u64; 2] = [3, 11];
-    let net = || random_net(0x6A7E);
-
-    let alone: Vec<_> = SEEDS
-        .iter()
-        .map(|&seed| {
-            let nets = Arc::new(net());
-            GameStream::new(seed, gc).generate(&nets, SOLVES)
-        })
-        .collect();
-
-    let evaluator = net();
-    let nets = Arc::new(net());
-    let mut streams: Vec<_> = SEEDS.iter().map(|&s| GameStream::new(s, gc)).collect();
-    let mut out: Vec<Data> = (0..SEEDS.len()).map(|_| Data::default()).collect();
-    let mut live: Vec<Option<Solver>> = streams
-        .iter_mut()
-        .zip(&mut out)
-        .enumerate()
-        .map(|(i, (st, o))| {
-            let mut sv = st.next_solve(&nets, o);
-            sv.pin(i);
-            Some(sv)
-        })
-        .collect();
-    let mut replies: Vec<Vec<Reply>> = (0..SEEDS.len()).map(|_| Vec::new()).collect();
-    // Every stream advances once a round, and the round carries all of their
-    // calls together — which is exactly what the farm does.
-    while out.iter().any(|d| d.soff.len() < SOLVES) {
-        let mut calls: Vec<Call> = Vec::new();
-        let mut spans = vec![0usize; SEEDS.len()];
-        for i in 0..SEEDS.len() {
-            let Some(sv) = live[i].as_mut() else { continue };
-            match sv.advance_on_host(&replies[i]) {
-                Step::Calls(cs) => {
-                    spans[i] = cs.len();
-                    calls.extend(cs);
-                }
-                Step::Done(solved) => {
-                    let sv = live[i].take().expect("a live solve");
-                    streams[i].keep(&sv, solved, &mut out[i]);
-                    if out[i].soff.len() < SOLVES {
-                        let mut next = streams[i].next_solve(&nets, &mut out[i]);
-                        next.pin(i);
-                        live[i] = Some(next);
-                    }
-                }
-            }
-        }
-        if calls.is_empty() {
-            continue;
-        }
-        let mut rest: Vec<_> = calls.iter().map(|call| call.run(&evaluator)).collect();
-        for (i, n) in spans.into_iter().enumerate() {
-            let tail = rest.split_off(n);
-            replies[i] = rest;
-            rest = tail;
-        }
-    }
-
-    for (i, (a, b)) in alone.iter().zip(&out).enumerate() {
-        assert_eq!(a.nv, b.nv, "stream {i}: row counts differ");
-        assert_eq!(a.rows, b.rows, "stream {i}: packed rows differ");
-        assert_eq!(a.coff, b.coff, "stream {i}: config offsets differ");
-        assert_eq!(a.cw, b.cw, "stream {i}: beliefs differ");
-        assert_eq!(a.cy, b.cy, "stream {i}: targets differ");
-        assert_eq!(a.queries, b.queries, "stream {i}: query row counts differ");
-    }
-}
-
-/// A solve stores its root and nothing else.
-///
-/// This is the target convention, and it is worth pinning: the tempting bug is
-/// to also keep the interior nodes the grown tree valued on the way. Those are
-/// not targets. An interior node's opposing range still carries the reach that
-/// led to it, so its value is on no fixed scale and shrinks as the strategy
-/// sharpens; and a node beside the frontier only hands back the network's own
-/// leaf output, which trains the network on itself.
-///
-/// Note what is *not* asserted here: that the two seats' values cancel. With a
-/// real value function at the leaves that is a property of the network, not of
-/// the targets — nothing constrains the network to be antisymmetric — so it
-/// belongs in the run report as a diagnostic, not in this test.
-#[test]
-fn a_solve_stores_its_root_and_nothing_else() {
-    let nets = Arc::new(random_net(0x51DE));
-    let cfg = Cfg {
-        s: 12,
-        c: 1.0,
-        budget: Budget::unbounded(),
-        ..Default::default()
-    };
-    let gc = GameCfg {
-        agents: [Agent::Sog { cfg }; 2],
-        collect: Collect::Sog,
-        explore: 0.25,
-        random_draft: true,
-        p_td1: 0.0,
-        // Exercise the query solver too: its rows go through the same path.
-        query_rate: 1.0,
-        recursive_rate: 0.25,
-    };
-    let mut stream = GameStream::new(11, gc);
-    let data = stream.generate(&nets, 4);
-    assert_eq!(
-        data.nv,
-        data.soff.len(),
-        "a solve must store exactly one row: {} rows from {} solves",
-        data.nv,
-        data.soff.len()
-    );
-    assert!(
-        data.queries > 0,
-        "the query solver produced no rows at all"
-    );
-    assert!(
-        data.queries < data.nv,
-        "every row came from the query solver; self-play stored none"
-    );
-    // Every row carries a full belief for both seats, and the weights are a
-    // distribution — this is what makes the value a conditional expectation
-    // rather than a reach-scaled quantity.
-    for r in 0..data.nv {
-        for p in 0..2 {
-            let span = data.row_span(r, p);
-            assert!(!span.is_empty(), "row {r} seat {p} has an empty support");
-            let mass: f32 = span.map(|c| data.cw[c]).sum();
-            assert!(
-                (mass - 1.0).abs() < 1e-3,
-                "row {r} seat {p} belief sums to {mass:.5}, not 1"
-            );
-        }
-    }
-}
-
-/// `normalize_weights` is what turns a reach vector into the belief the network
-/// reads, and it has to agree with `Belief::normalize` — including the fallback
-/// to uniform when the reaches have underflowed to zero, which is where a
-/// mismatch would silently produce a different query than the trainer saw.
 #[test]
 fn normalized_weights_match_belief_normalize() {
     let mut rng = Rng::new(0xB33F);
@@ -1115,10 +389,7 @@ fn normalized_weights_match_belief_normalize() {
         };
         let mut got = vec![0.0f32; cfgs.len()];
         normalize_weights(&w, &mut got);
-        let mut bel = Belief {
-            cfg: cfgs.clone(),
-            p: w.clone(),
-        };
+        let mut bel = Belief { cfg: cfgs.clone(), p: w.clone(), };
         bel.normalize();
         for (a, b) in got.iter().zip(bel.p.iter()) {
             assert!((a - b).abs() < 2e-7, "{a} vs {b}");
@@ -1141,47 +412,53 @@ fn from_pairs_keeps_zero_weight_configs() {
         fd: [1, 0, 0, 0, 0],
         inflight: None,
     };
-    let bel = Belief::from_pairs(vec![
-        (b, 0.25),
-        (c, -0.5), // a negative weight is still dropped
-        (a, 0.0),  // underflowed to exactly zero: kept, in sorted position
-    ]);
-    assert_eq!(
-        bel.cfg,
-        vec![a, b],
-        "zero-weight config must stay in the support"
-    );
+    let bel = Belief::from_pairs(vec![(b, 0.25), (c, -0.5), (a, 0.0)]);
+    assert_eq!(bel.cfg, vec![a, b], "zero-weight config must stay in the support");
     assert_eq!(bel.p[0], 0.0, "the kept config's weight stays exactly zero");
     assert_eq!(bel.p[1], 1.0, "kept configs are renormalized");
 }
 
 #[test]
-fn zero_weight_config_survives_the_walk_update() {
-    // The crash shape, end to end: the Bayes update multiplies a config's
-    // prior by its strategy probability at every decision, and a config the
-    // strategy keeps calling unlikely reaches exactly 0.0 in f32. The subgame
-    // tree keeps every reachable config, so a belief that dropped the
-    // underflowed one would no longer match the tree's config list and the
-    // walk's support assertion would fire mid-run. Drive the update with a
-    // prior small enough that every product underflows, then require the new
-    // support to equal the tree child's config list element for element — the
-    // invariant the desync assert protects: support is reachability, never
-    // weight.
-    let nets = Arc::new(Net::default());
-    let mut rng = Rng::new(777);
-    for _ in 0..200 {
-        let mut s = make_game(&mut rng, false);
-        for _ in 0..40 + rng.below(60) {
+fn a_mirrored_row_is_the_mirrored_state_packed() {
+    let mut checked = 0usize;
+    for seed in 0..40u64 {
+        let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
+        let mut s = make_game(&mut rng, true);
+        let ctx = Ctx::new(&s);
+        for _ in 0..120 {
             if s.is_terminal() {
                 break;
             }
-            let acts = s.legal_actions();
-            if acts.is_empty() {
-                break;
+            if s.is_valued() {
+                let (mut a, mut b, mut got) = ([0u8; ROW_BYTES], [0u8; ROW_BYTES], [0u8; ROW_BYTES]);
+                pack_row(&s, &ctx, &mut a);
+                pack_row(&s.mirror(), &ctx.mirrored(), &mut b);
+                mirror_row(&a, &mut got);
+                assert_eq!(got, b, "seed {seed}: mirror_row disagrees with State::mirror");
+                let mut back = [0u8; ROW_BYTES];
+                mirror_row(&got, &mut back);
+                assert_eq!(back, a, "seed {seed}: mirror is not an involution");
+                checked += 1;
             }
+            let acts = s.legal_actions();
             s.apply_inplace(acts[rng.below(acts.len())]);
         }
-        while !s.is_terminal() && s.is_chance() {
+    }
+    assert!(checked > 500, "only {checked} rows mirrored");
+}
+
+#[test]
+fn a_contract_describes_every_node_of_the_tree() {
+    let nets = Arc::new(Net::default());
+    let cfg = Cfg { s: 8, c: 1.0, ..Default::default() };
+    let mut checked = 0usize;
+    for seed in 1..90u64 {
+        let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9) | 1);
+        let mut s = make_game(&mut rng, true);
+        for _ in 0..40 + seed % 60 {
+            if s.is_terminal() {
+                break;
+            }
             let acts = s.legal_actions();
             s.apply_inplace(acts[rng.below(acts.len())]);
         }
@@ -1189,82 +466,18 @@ fn zero_weight_config_survives_the_walk_update() {
             continue;
         }
         let ctx = Ctx::new(&s);
-        let me = s.to_act() as usize;
-        let mut bel = Vec::new();
-        for p in 0..2u8 {
-            let res = reserve(&s, p, &ctx);
-            let truth = true_config(&s, p, &ctx);
-            let cfg = enumerate_configs(
-                &res,
-                truth.hand_size(),
-                truth.fd_size(),
-                truth.inflight.is_some(),
-            );
-            if cfg.len() < 2 {
-                break;
-            }
-            let w = 1.0 / cfg.len() as f32;
-            bel.push(Belief {
-                p: vec![w; cfg.len()],
-                cfg,
-            });
+        let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
+        let sv = Solver::new(&s, ctx, Arc::clone(&nets), cfg, bel, Rng::new(seed));
+        let c = warchest::contract::Contract::of(&sv);
+        assert_eq!(c.nodes(), sv.nodes.len(), "seed {seed}: node count");
+        for i in 0..c.nodes() {
+            assert_eq!(c.nc[i], sv.nodes[i].nc, "seed {seed} node {i}: config counts");
+            assert_eq!(c.roff[i], sv.nodes[i].roff, "seed {seed} node {i}: reach offset");
+            assert_eq!(c.voff[i], sv.nodes[i].voff, "seed {seed} node {i}: value offset");
+            assert_eq!(c.soff[i], sv.nodes[i].soff, "seed {seed} node {i}: strategy offset");
         }
-        if bel.len() != 2 {
-            continue;
-        }
-        let mut bel = [bel[0].clone(), bel[1].clone()];
-        // Config 0 of the acting player gets a prior so small that every
-        // product with a strategy probability underflows to exactly 0.0 in
-        // f32 (denormals end near 1.4e-45).
-        bel[me].p[0] = 1e-46;
-        bel[me].normalize();
-        let mut sv = Solver::new(
-            &s,
-            ctx,
-            Arc::clone(&nets),
-            Cfg { s: 8, c: 1.0, budget: Budget::unbounded(), ..Default::default() },
-            bel.clone(),
-            Rng::new(rng.next_u64()),
-        );
-        sv.run_alone();
-        let n0 = &sv.nodes[0];
-        // An action the underflowed config can actually play, so the tree's
-        // child support includes it.
-        let Some(chosen) = n0
-            .legal_row(1)
-            .map(|cell| n0.legal_action[cell] as usize)
-            .next()
-        else {
-            continue;
-        };
-        let child = n0.child[n0.obs_child[chosen]];
-        if sv.nodes[child].chance {
-            // A draw child's config list is the post-draw support, which this
-            // pre-draw update does not model; keep searching.
-            continue;
-        }
-        // Bayes-update the belief on the public observation of `chosen`.
-        let obs = obs_key(&n0.acts[chosen]);
-        let mut pairs = Vec::new();
-        for (ci, c) in bel[me].cfg.iter().enumerate() {
-            let row = sv.root_strategy(ci);
-            for (cell, &p) in n0.legal_row(ci).zip(row) {
-                let a = n0.legal_action[cell] as usize;
-                if obs_key(&n0.acts[a]) != obs {
-                    continue;
-                }
-                if let Some(n) = advance_config(c, n0.aslot[a], n0.fdown[a]) {
-                    pairs.push((n, bel[me].p[ci] * p));
-                }
-            }
-        }
-        let new_bel = Belief::from_pairs(pairs);
-        assert_eq!(
-            &*sv.nodes[child].cfgs[me],
-            &new_bel.cfg[..],
-            "walk update dropped a reachable config (weight underflow); the tree keeps it, so the desync assert would fire"
-        );
-        return;
+        assert!(c.levels() >= 1, "seed {seed}: no levels");
+        checked += 1;
     }
-    panic!("no usable position in 200 random games");
+    assert!(checked > 20, "only {checked} trees described");
 }

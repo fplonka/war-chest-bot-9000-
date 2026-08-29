@@ -1,34 +1,3 @@
-"""The production value network: ``V(PBS, config) -> scalar``.
-
-Shape, and why it is this shape
--------------------------------
-Growing-tree CFR calls the network in two different regimes:
-
-* once when a public leaf is created — that physical state never changes;
-* once per traversal — the beliefs and queried player do.
-
-The solver therefore caches the board trunk and every config encoding for the
-life of the tree. Capacity goes in that amortised path; the repeated
-belief-conditioned join stays thin. This is the same split DeepStack and ReBeL
-get from a public-state tower. War Chest's config set is variable, so the
-network generates one readout row per config instead of using a fixed table.
-
-    physical state ─► TRUNK (hex residual blocks, global pooling) ─► P
-                                                                    │  once/leaf
-    config c ─────► CONFIG ENCODER ─► f(c) [readout] , g(c) [pool]  │  once/config
-                                                                    ▼
- [P, Σβ_own g, Σβ_opp g, seat] ────────────────► JOIN ─► h          every iteration
-                                                                    │
-                                        v(c) = <f(c), h> + b  ──────┘
-
-The trunk is a KataGo-shaped pre-activation ResNet over the 37 hexes with the
-board's own adjacency, plus a global-pooling bias in every block.
-
-Everything that indexes a coin type is permutation-equivariant over the slots:
-the ten types are a *set* of tokens described by their printed card facts, so
-the same unit reads the same whichever slot the draft put it in, and an unseen
-draft is describable rather than an unknown identity.
-"""
 
 import numpy as np
 import torch
@@ -50,18 +19,18 @@ OFF_CARDS = warchest.OFF_CARDS
 OFF_LOOSE = warchest.OFF_LOOSE
 LOOSE = warchest.LOOSE
 
-TYPE = 64      # coin-type token width
-C = 96         # hex channel width
-BLOCKS = 8     # trunk residual blocks
-D = 256        # board vector / readout width
-POOL = 64      # pooled config embedding width
-CFGH = 128     # config encoder hidden width
-JW = 128       # join width
-JBLOCKS = 3    # join residual blocks
+TYPE = 64
+C = 96
+BLOCKS = 8
+D = 256
+POOL = 64
+CFGH = 128
+JW = 128
+JBLOCKS = 3
 N_KINDS = warchest.N_KINDS
 ACT_BYTES = warchest.ACT_BYTES
 
-JOIN_IN = 2 * POOL + 1  # both beliefs and the queried physical seat
+JOIN_IN = 2 * POOL + 1
 
 
 def gelu(x):
@@ -69,23 +38,19 @@ def gelu(x):
 
 
 class Net(nn.Module):
-    """A physical-state trunk with player-conditioned value queries."""
 
     def __init__(self):
         super().__init__()
-        # -- coin-type tokens (a set of NTYPE tokens, shared weights) --
         self.card1 = nn.Linear(CARD_FEATS, TYPE)
         self.card2 = nn.Linear(TYPE, TYPE)
         self.pile = nn.Linear(PILE_COUNTS, TYPE, bias=False)
         self.seat = nn.Embedding(2, TYPE)
 
-        # -- trunk stem --
         self.hex_stem = nn.Linear(HEX_FACTS, C)
         self.tok_stem = nn.Linear(TYPE, C, bias=False)
         self.pos = nn.Embedding(N_HEXES, C)
         self.glob_stem = nn.Linear(LOOSE, C, bias=False)
 
-        # -- trunk: pre-activation residual blocks with a global-pooling bias --
         self.blk1 = nn.ModuleList([nn.Linear(2 * C, C) for _ in range(BLOCKS)])
         self.blkg = nn.ModuleList([nn.Linear(2 * C, C) for _ in range(BLOCKS)])
         self.blk2 = nn.ModuleList([nn.Linear(C, C) for _ in range(BLOCKS)])
@@ -95,26 +60,12 @@ class Net(nn.Module):
 
         self.board_out = nn.Linear(2 * C + LOOSE, D)
 
-        # -- config encoder --
-        # Two paths into the pooling vector. The nonlinear one binds a slot's
-        # count to its card and can express anything; the linear one is there
-        # because pooling happens *after* it, so `Σ_c β(c) g(c)` carries the
-        # exact belief-weighted count of every card — "they almost certainly
-        # cannot play an Archer this turn" is a marginal, and the join should
-        # read it rather than reconstruct it from an average of GELUs.
         self.cfg1 = nn.Linear(3 + TYPE, CFGH)
         self.ln_cfg = nn.LayerNorm(CFGH)
         self.cfg_f = nn.Linear(CFGH, D)
         self.cfg_g = nn.Linear(CFGH, POOL)
         self.cfg_m = nn.Linear(TYPE, 3 * POOL, bias=False)
-        # -- policy head --
-        # Student of Games' network is value *and policy*. The second readout
-        # has the same shape as the first: a config vector dotted with a
-        # situation vector, `logit(c, a) = <cfg_p(c), e(a)>`, where `e(a)`
-        # describes one action against the board it is played on.
         self.cfg_p = nn.Linear(CFGH, D)
-        # Role-wise gates bind shared entity channels to pay/recruit/source/
-        # destination/target without rebuilding a wide one-hot action vector.
         self.act_kind = nn.Embedding(N_KINDS, C)
         self.act_role = nn.Embedding(5, C)
         nn.init.normal_(self.act_kind.weight, std=C ** -0.5)
@@ -124,7 +75,6 @@ class Net(nn.Module):
         self.ln_act = nn.LayerNorm(C)
         self.act_out = nn.Linear(C, D)
 
-        # -- join (the only per-iteration path) --
         self.join_p = nn.Linear(D, JW, bias=False)
         self.join_b = nn.Linear(JOIN_IN, JW)
         self.joinw = nn.ModuleList([nn.Linear(JW, JW) for _ in range(JBLOCKS)])
@@ -134,8 +84,6 @@ class Net(nn.Module):
         self.ln_h = nn.LayerNorm(D)
         self.value_bias = nn.Parameter(torch.zeros(1))
 
-        # A dot-product readout has no output matrix to shrink, so the small
-        # init lands on the config side: every value starts at the bias.
         nn.init.normal_(self.cfg_f.weight, std=1e-3)
         nn.init.zeros_(self.cfg_f.bias)
 
@@ -144,21 +92,17 @@ class Net(nn.Module):
         self.register_buffer("seat_of", torch.arange(NTYPE) // NSLOT,
                              persistent=False)
 
-    # ---------------------------------------------------------------- pieces
 
     def cards(self, xpub):
-        """The printed-card token of each coin type. Fixed for a whole solve."""
         facts = xpub[:, OFF_CARDS:OFF_CARDS + NTYPE * CARD_FEATS]
         facts = facts.reshape(-1, NTYPE, CARD_FEATS)
         return self.card2(gelu(self.card1(facts)))
 
     def tokens(self, xpub, cards):
-        """Card token plus this row's pile counts and the owner's seat."""
         piles = xpub[:, OFF_PILES:OFF_CARDS].reshape(-1, NTYPE, PILE_COUNTS)
         return cards + self.pile(piles) + self.seat(self.seat_of)
 
     def trunk(self, xpub, projected):
-        """37 physical hex tokens through BLOCKS residual blocks."""
         batch = xpub.shape[0]
         hexes = xpub[:, :N_HEXES * HEX_CH].reshape(batch, N_HEXES, HEX_CH)
         occupant = hexes[:, :, HEX_FACTS:] @ projected
@@ -178,7 +122,6 @@ class Net(nn.Module):
         return gelu(self.ln_trunk(x))
 
     def position(self, xpub, tokens):
-        """Global board, projected card and contextualized hex tokens."""
         projected = self.tok_stem(tokens)
         x = self.trunk(xpub, projected)
         loose = xpub[:, OFF_LOOSE:OFF_LOOSE + LOOSE]
@@ -189,15 +132,6 @@ class Net(nn.Module):
         return self.position(xpub, tokens)[0]
 
     def configs(self, phi, own, seg):
-        """Readout vector `f(c)` and pooling vector `g(c)` for each config.
-
-        ``phi`` is ``[n, CCOUNTS]`` normalised hand/face-down/bag counts;
-        ``own`` is ``[nseg, NSLOT, TYPE]`` — each query's own card tokens.
-
-        `g` is nonlinear plus linear. The linear half is a count-weighted sum
-        of per-zone card embeddings, so `Σ_c β(c) g(c)` contains exactly the
-        belief's expected holding of every card, bound to that card.
-        """
         counts = phi.reshape(-1, 3, NSLOT).transpose(1, 2)
         u = gelu(self.cfg1(torch.cat([counts, own[seg]], -1))).sum(1)
         u = gelu(self.ln_cfg(u))
@@ -207,7 +141,6 @@ class Net(nn.Module):
                 self.cfg_p(u))
 
     def actions(self, desc, boards, heads, cards, spatial, board_of, head_of):
-        """``e(a)`` from the card and hex tokens named by each action."""
         row = board_of
         zero_card = cards.new_zeros(cards.shape[0], 1, C)
         card = torch.cat([cards, zero_card], 1)
@@ -227,14 +160,12 @@ class Net(nn.Module):
         return self.act_out(gelu(self.ln_act(z)))
 
     def join(self, p, pooled, seat):
-        """The per-iteration path: beliefs and queried seat modulate the board."""
         z = self.join_p(p) + self.join_b(torch.cat([pooled, seat], -1))
         for i in range(JBLOCKS):
             z = z + self.joinw[i](gelu(self.ln_join[i](z)))
         return self.ln_h(p + self.join_out(gelu(self.ln_jout(z))))
 
     def heads(self, p, g, weight, seg, nseg):
-        """Belief-conditioned join rows for all canonical queries."""
         pooled = p.new_zeros(nseg, POOL)
         pooled.index_add_(0, seg, g * weight.unsqueeze(1))
         other = torch.arange(nseg, device=seg.device) ^ 1
@@ -242,14 +173,8 @@ class Net(nn.Module):
         seat = p.new_tensor([-1.0, 1.0]).repeat(p.shape[0]).unsqueeze(1)
         return self.join(p.repeat_interleave(2, 0), pair, seat)
 
-    # --------------------------------------------------------------- forward
 
     def forward(self, xpub, phi, weight, seg, nseg):
-        """Values for paired physical-state queries.
-
-        Query ``q`` owns configs with ``seg == q``. Queries ``q`` and ``q ^ 1``
-        share one physical board trunk and differ by belief order and seat.
-        """
         cards = self.cards(xpub)
         p = self.board(xpub, self.tokens(xpub, cards))
         own = cards.reshape(-1, 2, NSLOT, TYPE).flatten(0, 1)
@@ -257,14 +182,8 @@ class Net(nn.Module):
         h = self.heads(p, g, weight, seg, nseg)
         return (f * h[seg]).sum(1) + self.value_bias
 
-    # ------------------------------------------------------------ weight blob
 
     def flat(self):
-        """The fixed v12 blob read by Rust.
-
-        Order is the contract. Linear matrices are stored ``[in, out]``
-        row-major, embeddings ``[n, width]``.
-        """
         blocks = [m for i in range(BLOCKS)
                   for m in (self.blk1[i], self.blkg[i], self.blk2[i])]
         mats = [

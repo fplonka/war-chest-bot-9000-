@@ -1,198 +1,40 @@
-//! The fixed production value network. `train/value_net.py` writes the blob
-//! that `NetLayout` reads; the two must be changed together.
-//!
-//! Three pieces, split by how often CFR runs them:
-//!
-//! * the **trunk** — one physical board per leaf through `BLOCKS`
-//!   pre-activation residual blocks over the board's adjacency;
-//! * the **config encoder** — one `f(c)` readout and one `g(c)` pooling vector
-//!   per distinct private config;
-//! * the **join** — the per-iteration path, conditioned on the two beliefs and
-//!   the queried physical seat.
-//!
-//! The readout is one dot product, `v(c) = <f(c), h> + bias`.
-//!
-//! Student of Games' network is a counterfactual value-**and-policy** network,
-//! `f(beta) = (v, p)`, so there is a second readout of the same shape:
-//! `logit(c, a) = <f_p(c), e(a)>`. `f_p` is a third head off the same config
-//! encoder that produces `f` and `g`, and `e(a)` describes one action against
-//! the board it is played on. Both readouts are a config vector dotted with a
-//! situation vector, which is what lets the policy reuse the `(config, action)`
-//! cells CFR already indexes rather than needing a table of its own.
-
 use crate::actions::N_KINDS;
-use crate::board::{board, NONE, N_HEXES};
-use crate::pbs::{
-    CFEAT, HEX_CH, HEX_FACTS, LOOSE, NSLOT, NTYPE, OFF_CARDS, OFF_LOOSE, OFF_PILES, PILE_COUNTS,
-    PUBFEAT,
-};
+use crate::board::N_HEXES;
+use crate::pbs::{HEX_FACTS, LOOSE, PILE_COUNTS};
 use crate::units::{write_card_features, CARD_FEATS};
-use std::cell::RefCell;
 
-/// Coin-type token width.
+fn dense(w: &[f32], b: &[f32], i: usize, o: usize, input: &[f32], rows: usize, out: &mut Vec<f32>) {
+    out.clear();
+    out.resize(rows * o, 0.0);
+    for r in 0..rows {
+        let dst = &mut out[r * o..(r + 1) * o];
+        if !b.is_empty() {
+            dst.copy_from_slice(b);
+        }
+        for (&x, weights) in input[r * i..(r + 1) * i].iter().zip(w.chunks_exact(o)) {
+            for (d, &weight) in dst.iter_mut().zip(weights) {
+                *d = x.mul_add(weight, *d);
+            }
+        }
+    }
+}
+
 pub const TYPE: usize = 64;
-/// Hex channel width.
 pub const C: usize = 96;
-/// Trunk residual blocks.
 pub const BLOCKS: usize = 8;
-/// Board vector and readout width.
 pub const D: usize = 256;
-/// Pooled config embedding width.
 pub const POOL: usize = 64;
-/// Config encoder hidden width.
 pub const CFGH: usize = 128;
-/// Join width.
 pub const JW: usize = 128;
-/// Join residual blocks.
 pub const JBLOCKS: usize = 3;
-/// Both pooled beliefs and the queried physical seat.
 pub const JOIN_IN: usize = 2 * POOL + 1;
-/// Action encoder width, shared with entity tokens.
 pub const AW: usize = C;
 
-#[cfg(target_vendor = "apple")]
-#[link(name = "Accelerate", kind = "framework")]
-extern "C" {
-    fn cblas_sgemm(
-        order: i32,
-        transa: i32,
-        transb: i32,
-        m: i32,
-        n: i32,
-        k: i32,
-        alpha: f32,
-        a: *const f32,
-        lda: i32,
-        b: *const f32,
-        ldb: i32,
-        beta: f32,
-        c: *mut f32,
-        ldc: i32,
-    );
-    fn vvtanhf(y: *mut f32, x: *const f32, n: *const i32);
-}
-
-/// `c[m,n] = a[m,k] * b[k,n] + beta * c[m,n]`, all row-major.
-#[allow(clippy::too_many_arguments)]
-pub fn gemm(
-    m: usize,
-    n: usize,
-    k: usize,
-    a: &[f32],
-    lda: usize,
-    b: &[f32],
-    ldb: usize,
-    beta: f32,
-    c: &mut [f32],
-    ldc: usize,
-) {
-    if m == 0 || n == 0 {
-        return;
-    }
-    #[cfg(target_vendor = "apple")]
-    unsafe {
-        cblas_sgemm(
-            101,
-            111,
-            111,
-            m as i32,
-            n as i32,
-            k as i32,
-            1.0,
-            a.as_ptr(),
-            lda as i32,
-            b.as_ptr(),
-            ldb as i32,
-            beta,
-            c.as_mut_ptr(),
-            ldc as i32,
-        );
-        return;
-    }
-    #[cfg(not(target_vendor = "apple"))]
-    {
-        for row in 0..m {
-            let out = &mut c[row * ldc..row * ldc + n];
-            if beta == 0.0 {
-                out.fill(0.0);
-            } else if beta != 1.0 {
-                out.iter_mut().for_each(|value| *value *= beta);
-            }
-            let input = &a[row * lda..row * lda + k];
-            for (&value, weights) in input
-                .iter()
-                .zip(b.chunks_exact(ldb))
-            {
-                for (dst, &weight) in out.iter_mut().zip(&weights[..n]) {
-                    *dst = value.mul_add(weight, *dst);
-                }
-            }
-        }
-    }
-}
-
 #[inline]
-pub fn gelu(x: f32) -> f32 {
-    let inner = 0.797_884_56 * (x + 0.044_715 * x * x * x);
+fn gelu(x: f32) -> f32 {
+    let inner = 0.797_884_6 * (x + 0.044_715 * x * x * x);
     0.5 * x * (1.0 + inner.tanh())
 }
-
-fn gelu_all(x: &mut [f32], arg: &mut Vec<f32>, th: &mut Vec<f32>) {
-    #[cfg(target_vendor = "apple")]
-    {
-        for x in x.chunks_mut(1 << 16) {
-            let n = x.len();
-            fit(arg, n);
-            fit(th, n);
-            for (a, &v) in arg[..n].iter_mut().zip(x.iter()) {
-                *a = 0.797_884_56 * (v + 0.044_715 * v * v * v);
-            }
-            let n = n as i32;
-            unsafe { vvtanhf(th.as_mut_ptr(), arg.as_ptr(), &n) };
-            for (v, &t) in x.iter_mut().zip(th.iter()) {
-                *v *= 0.5 * (1.0 + t);
-            }
-        }
-        return;
-    }
-    #[cfg(not(target_vendor = "apple"))]
-    x.iter_mut().for_each(|v| *v = gelu(*v));
-}
-thread_local! {
-    static SCRATCH: RefCell<Vec<Vec<f32>>> = const { RefCell::new(Vec::new()) };
-}
-
-fn scratch(n: usize) -> Vec<f32> {
-    let mut out = SCRATCH.with(|pool| pool.borrow_mut().pop().unwrap_or_default());
-    out.resize(n, 0.0);
-    out[..n].fill(0.0);
-    out.truncate(n);
-    out
-}
-
-fn recycle(mut value: Vec<f32>) {
-    value.clear();
-    SCRATCH.with(|pool| pool.borrow_mut().push(value));
-}
-
-pub fn fit(v: &mut Vec<f32>, n: usize) {
-    if v.len() < n {
-        v.resize(n, 0.0);
-    }
-}
-
-pub fn accumulate(z: &[f32], idx: &[u32], weight: &[f32], width: usize, out: &mut [f32]) {
-    debug_assert_eq!(idx.len(), weight.len());
-    out.fill(0.0);
-    for (&i, &w) in idx.iter().zip(weight) {
-        let row = &z[i as usize * width..(i as usize + 1) * width];
-        for (o, &x) in out.iter_mut().zip(row) {
-            *o += w * x;
-        }
-    }
-}
-
-// ------------------------------------------------------------------- layout
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Span {
@@ -202,7 +44,6 @@ pub struct Span {
     pub o: usize,
 }
 
-/// One LayerNorm: where its scale and shift live, and how wide it is.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NormSpan {
     pub g: usize,
@@ -210,7 +51,6 @@ pub struct NormSpan {
     pub width: usize,
 }
 
-/// One trunk block: the neighbour mix, the global-pooling bias, the output.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BlockSpan {
     pub mix: Span,
@@ -218,8 +58,6 @@ pub struct BlockSpan {
     pub out: Span,
 }
 
-/// Offsets of every array in the flat blob. The order here is the contract
-/// with `value_net.py::flat`.
 #[derive(Clone, Debug)]
 pub struct NetLayout {
     pub card: [Span; 2],
@@ -235,9 +73,7 @@ pub struct NetLayout {
     pub cfg_f: Span,
     pub cfg_g: Span,
     pub cfg_m: Span,
-    /// The policy readout's config vector, beside `cfg_f`'s value one.
     pub cfg_p: Span,
-    /// The action encoder: action kind, role gates, board and belief row.
     pub act_kind: usize,
     pub act_role: usize,
     pub act_board: Span,
@@ -248,26 +84,23 @@ pub struct NetLayout {
     pub join_w: [Span; JBLOCKS],
     pub join_out: Span,
     pub value_bias: usize,
-    /// The norms in the order they are applied; `LN_*` index into this.
     pub norms: Vec<NormSpan>,
     pub w_len: usize,
     pub b_len: usize,
     pub ln_len: usize,
 }
 
-/// Widths of the LayerNorms, in blob order.
 fn norm_widths() -> Vec<usize> {
     let mut v: Vec<usize> = (0..BLOCKS).flat_map(|_| [C, C]).collect();
-    v.push(C); // trunk
-    v.push(CFGH); // config
+    v.push(C);
+    v.push(CFGH);
     v.extend(std::iter::repeat(JW).take(JBLOCKS));
-    v.push(JW); // join output
-    v.push(D); // h
-    v.push(AW); // action encoder
+    v.push(JW);
+    v.push(D);
+    v.push(AW);
     v
 }
 
-/// Walks the three flat arrays handing out offsets in blob order.
 #[derive(Default)]
 struct Cursor {
     w: usize,
@@ -297,84 +130,62 @@ impl Cursor {
     }
 }
 
+impl Default for NetLayout {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NetLayout {
     pub fn new() -> Self {
         let mut c = Cursor::default();
-        let card = [c.lin(CARD_FEATS, TYPE, true), c.lin(TYPE, TYPE, true)];
-        let pile = c.lin(PILE_COUNTS, TYPE, false);
-        let seat = c.embed(2 * TYPE);
-        let hex_stem = c.lin(HEX_FACTS, C, true);
-        let tok_stem = c.lin(TYPE, C, false);
-        let pos = c.embed(N_HEXES * C);
-        let glob_stem = c.lin(LOOSE, C, false);
-        let blocks = std::array::from_fn(|_| BlockSpan {
-            mix: c.lin(2 * C, C, true),
-            pool: c.lin(2 * C, C, true),
-            out: c.lin(C, C, true),
-        });
-        let board_out = c.lin(2 * C + LOOSE, D, true);
-        let cfg1 = c.lin(3 + TYPE, CFGH, true);
-        let cfg_f = c.lin(CFGH, D, true);
-        let cfg_g = c.lin(CFGH, POOL, true);
-        let cfg_m = c.lin(TYPE, 3 * POOL, false);
-        let cfg_p = c.lin(CFGH, D, true);
-        let act_kind = c.embed(N_KINDS * AW);
-        let act_role = c.embed(5 * AW);
-        let act_board = c.lin(D, AW, false);
-        let act_out = c.lin(AW, D, true);
-        let join_p = c.lin(D, JW, false);
-        let join_b = c.lin(JOIN_IN, JW, true);
-        let join_w = std::array::from_fn(|_| c.lin(JW, JW, true));
-        let join_out = c.lin(JW, D, true);
-        let act_h = c.lin(D, AW, false);
-        let value_bias = c.b;
-        c.b += 1;
-        let norms = norm_widths()
-            .into_iter()
-            .map(|width| {
-                let s = NormSpan {
-                    g: c.ln,
-                    b: c.ln + width,
-                    width,
-                };
-                c.ln += 2 * width;
-                s
-            })
-            .collect();
         Self {
-            card,
-            pile,
-            seat,
-            hex_stem,
-            tok_stem,
-            pos,
-            glob_stem,
-            blocks,
-            board_out,
-            cfg1,
-            cfg_f,
-            cfg_g,
-            cfg_m,
-            cfg_p,
-            act_kind,
-            act_role,
-            act_board,
-            act_h,
-            act_out,
-            join_p,
-            join_b,
-            join_w,
-            join_out,
-            value_bias,
-            norms,
+            card: [c.lin(CARD_FEATS, TYPE, true), c.lin(TYPE, TYPE, true)],
+            pile: c.lin(PILE_COUNTS, TYPE, false),
+            seat: c.embed(2 * TYPE),
+            hex_stem: c.lin(HEX_FACTS, C, true),
+            tok_stem: c.lin(TYPE, C, false),
+            pos: c.embed(N_HEXES * C),
+            glob_stem: c.lin(LOOSE, C, false),
+            blocks: std::array::from_fn(|_| BlockSpan {
+                mix: c.lin(2 * C, C, true),
+                pool: c.lin(2 * C, C, true),
+                out: c.lin(C, C, true),
+            }),
+            board_out: c.lin(2 * C + LOOSE, D, true),
+            cfg1: c.lin(3 + TYPE, CFGH, true),
+            cfg_f: c.lin(CFGH, D, true),
+            cfg_g: c.lin(CFGH, POOL, true),
+            cfg_m: c.lin(TYPE, 3 * POOL, false),
+            cfg_p: c.lin(CFGH, D, true),
+            act_kind: c.embed(N_KINDS * AW),
+            act_role: c.embed(5 * AW),
+            act_board: c.lin(D, AW, false),
+            act_out: c.lin(AW, D, true),
+            join_p: c.lin(D, JW, false),
+            join_b: c.lin(JOIN_IN, JW, true),
+            join_w: std::array::from_fn(|_| c.lin(JW, JW, true)),
+            join_out: c.lin(JW, D, true),
+            act_h: c.lin(D, AW, false),
+            value_bias: {
+                let at = c.b;
+                c.b += 1;
+                at
+            },
+            norms: norm_widths()
+                .into_iter()
+                .map(|width| {
+                    let s = NormSpan { g: c.ln, b: c.ln + width, width };
+                    c.ln += 2 * width;
+                    s
+                })
+                .collect(),
             w_len: c.w,
             b_len: c.b,
             ln_len: c.ln,
         }
     }
 }
-
-// --------------------------------------------------------------------- model
 
 #[derive(Clone, Default)]
 struct Lin {
@@ -384,80 +195,6 @@ struct Lin {
     o: usize,
 }
 
-impl Lin {
-    /// `out = input * w + b`, growing `out` as needed.
-    fn run(&self, input: &[f32], rows: usize, out: &mut Vec<f32>) {
-        fit(out, rows * self.o);
-        gemm(
-            rows, self.o, self.i, input, self.i, &self.w, self.o, 0.0, out, self.o,
-        );
-        self.bias(out, rows);
-    }
-
-    /// `out += input * w`, leaving whatever was already there.
-    fn add(&self, input: &[f32], rows: usize, out: &mut [f32]) {
-        gemm(
-            rows, self.o, self.i, input, self.i, &self.w, self.o, 1.0, out, self.o,
-        );
-    }
-
-    fn bias(&self, out: &mut [f32], rows: usize) {
-        if self.b.is_empty() {
-            return;
-        }
-        for row in out[..rows * self.o].chunks_exact_mut(self.o) {
-            for (x, &bias) in row.iter_mut().zip(&self.b) {
-                *x += bias;
-            }
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-struct Block {
-    mix: Lin,
-    pool: Lin,
-    out: Lin,
-}
-
-#[derive(Clone, Default)]
-struct Norm {
-    g: Vec<f32>,
-    b: Vec<f32>,
-}
-
-impl Norm {
-    /// LayerNorm then GELU, in place.
-    fn apply(&self, x: &mut [f32], rows: usize, arg: &mut Vec<f32>, th: &mut Vec<f32>) {
-        let width = self.g.len();
-        let x = &mut x[..rows * width];
-        for row in x.chunks_exact_mut(width) {
-            let mean = row.iter().sum::<f32>() / width as f32;
-            let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / width as f32;
-            let inv = 1.0 / (var + 1e-5).sqrt();
-            for j in 0..width {
-                row[j] = (row[j] - mean) * inv * self.g[j] + self.b[j];
-            }
-        }
-        gelu_all(x, arg, th);
-    }
-
-    /// LayerNorm alone, in place. Only the readout normalisation needs this.
-    fn plain(&self, x: &mut [f32], rows: usize) {
-        let width = self.g.len();
-        for row in x[..rows * width].chunks_exact_mut(width) {
-            let mean = row.iter().sum::<f32>() / width as f32;
-            let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / width as f32;
-            let inv = 1.0 / (var + 1e-5).sqrt();
-            for j in 0..width {
-                row[j] = (row[j] - mean) * inv * self.g[j] + self.b[j];
-            }
-        }
-    }
-}
-
-/// The weights exactly as they arrived, shared for backends that index them
-/// with `NetLayout` instead of unpacking them into layers.
 #[derive(Default)]
 pub struct Flat {
     pub w: Vec<f32>,
@@ -469,32 +206,7 @@ pub struct Flat {
 pub struct Net {
     flat: std::sync::Arc<Flat>,
     card: [Lin; 2],
-    pile: Lin,
-    seat: Vec<f32>,
-    hex_stem: Lin,
-    tok_stem: Lin,
-    pos: Vec<f32>,
-    glob_stem: Lin,
-    blocks: Vec<Block>,
-    board_out: Lin,
-    cfg1: Lin,
-    cfg_f: Lin,
-    cfg_g: Lin,
-    cfg_m: Lin,
-    cfg_p: Lin,
-    act_kind: Vec<f32>,
-    act_role: Vec<f32>,
-    act_board: Lin,
-    act_h: Lin,
-    act_out: Lin,
-    join_p: Lin,
-    join_b: Lin,
-    join_w: Vec<Lin>,
-    join_out: Lin,
-    value_bias: f32,
-    norms: Vec<Norm>,
 }
-/// Index of the LayerNorm applied after a trunk block's first / second stage.
 pub const fn ln_block(i: usize, half: usize) -> usize {
     2 * i + half
 }
@@ -506,6 +218,18 @@ pub const LN_H: usize = LN_JOUT + 1;
 pub const LN_ACT: usize = LN_H + 1;
 
 impl Net {
+    pub fn random(seed: u64) -> Net {
+        let mut r = crate::rng::Rng::new(seed);
+        let l = NetLayout::new();
+        let mut draw = |n: usize| -> Vec<f32> { (0..n).map(|_| (r.unit_f64() as f32 - 0.5) * 0.2).collect() };
+        let (w, b) = (draw(l.w_len), draw(l.b_len));
+        let mut ln = vec![0.0; l.ln_len];
+        for n in &l.norms {
+            ln[n.g..n.g + n.width].fill(1.0);
+        }
+        Net::from_flat(&w, &b, &ln).expect("a random net matches the layout")
+    }
+
     pub fn from_flat(w: &[f32], b: &[f32], ln: &[f32]) -> Result<Self, String> {
         let l = NetLayout::new();
         if (w.len(), b.len(), ln.len()) != (l.w_len, l.b_len, l.ln_len) {
@@ -529,14 +253,6 @@ impl Net {
             i: s.i,
             o: s.o,
         };
-        let norms = l
-            .norms
-            .iter()
-            .map(|s| Norm {
-                g: ln[s.g..s.g + s.width].to_vec(),
-                b: ln[s.b..s.b + s.width].to_vec(),
-            })
-            .collect();
         Ok(Self {
             flat: std::sync::Arc::new(Flat {
                 w: w.to_vec(),
@@ -544,44 +260,10 @@ impl Net {
                 ln: ln.to_vec(),
             }),
             card: l.card.map(layer),
-            pile: layer(l.pile),
-            seat: w[l.seat..l.seat + 2 * TYPE].to_vec(),
-            hex_stem: layer(l.hex_stem),
-            tok_stem: layer(l.tok_stem),
-            pos: w[l.pos..l.pos + N_HEXES * C].to_vec(),
-            glob_stem: layer(l.glob_stem),
-            blocks: l
-                .blocks
-                .iter()
-                .map(|s| Block {
-                    mix: layer(s.mix),
-                    pool: layer(s.pool),
-                    out: layer(s.out),
-                })
-                .collect(),
-            board_out: layer(l.board_out),
-            cfg1: layer(l.cfg1),
-            cfg_f: layer(l.cfg_f),
-            cfg_g: layer(l.cfg_g),
-            cfg_m: layer(l.cfg_m),
-            cfg_p: layer(l.cfg_p),
-            act_kind: w[l.act_kind..l.act_kind + N_KINDS * AW].to_vec(),
-            act_role: w[l.act_role..l.act_role + 5 * AW].to_vec(),
-            act_board: layer(l.act_board),
-            act_h: layer(l.act_h),
-            act_out: layer(l.act_out),
-            join_p: layer(l.join_p),
-            join_b: layer(l.join_b),
-            join_w: l.join_w.iter().map(|&s| layer(s)).collect(),
-            join_out: layer(l.join_out),
-            value_bias: b[l.value_bias],
-            norms,
         })
     }
 
-    pub fn load_flat_bin(
-        path: &str,
-    ) -> std::io::Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    pub fn load_flat_bin(path: &str) -> std::io::Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         let raw = std::fs::read(path)?;
         let mut at = 0;
         let u32_at = |at: &mut usize| {
@@ -602,657 +284,28 @@ impl Net {
 
     pub fn load_bin(path: &str) -> std::io::Result<Self> {
         let (w, b, ln) = Self::load_flat_bin(path)?;
-        Self::from_flat(&w, &b, &ln)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        Self::from_flat(&w, &b, &ln).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    /// A default-constructed `Net` has no weights, and every caller treats
-    /// that as "no value function yet".
     pub fn is_empty(&self) -> bool {
-        self.board_out.w.is_empty()
+        self.card[0].w.is_empty()
     }
 
-    /// The weights as they arrived, for the device backend.
     pub fn flat(&self) -> &Flat {
         &self.flat
     }
 
-    // ---------------------------------------------------------------- pieces
-
-    /// `[rows, NTYPE, TYPE]` printed-card tokens.
-    pub fn cards(&self, xpub: &[f32], rows: usize, out: &mut Vec<f32>) {
-        let mut facts = scratch(rows * NTYPE * CARD_FEATS);
-        for r in 0..rows {
-            let src = &xpub[r * PUBFEAT + OFF_CARDS..r * PUBFEAT + OFF_CARDS + NTYPE * CARD_FEATS];
-            facts[r * NTYPE * CARD_FEATS..(r + 1) * NTYPE * CARD_FEATS].copy_from_slice(src);
+    pub fn cards(&self, ids: &[u8], out: &mut Vec<f32>) {
+        let mut facts = vec![0.0f32; ids.len() * CARD_FEATS];
+        for (t, &id) in ids.iter().enumerate() {
+            write_card_features(id, &mut facts[t * CARD_FEATS..(t + 1) * CARD_FEATS]);
         }
-        let mut hidden = scratch(0);
-        self.card[0].run(&facts, rows * NTYPE, &mut hidden);
-        let (mut arg, mut th) = (scratch(0), scratch(0));
-        gelu_all(&mut hidden[..rows * NTYPE * TYPE], &mut arg, &mut th);
-        self.card[1].run(&hidden, rows * NTYPE, out);
-        recycle(facts);
-        recycle(hidden);
-        recycle(arg);
-        recycle(th);
-    }
-
-    /// `[rows, NTYPE, TYPE]` printed-card tokens from packed public rows.
-    pub fn cards_from_rows(&self, packed: &[u8], rows: usize, out: &mut Vec<f32>) {
-        use crate::pbs::{ROW_BYTES, ROW_IDS};
-        let mut facts = scratch(rows * NTYPE * CARD_FEATS);
-        for (r, row) in packed.chunks_exact(ROW_BYTES).enumerate() {
-            for t in 0..NTYPE {
-                write_card_features(
-                    row[ROW_IDS + t],
-                    &mut facts[(r * NTYPE + t) * CARD_FEATS..(r * NTYPE + t + 1) * CARD_FEATS],
-                );
-            }
+        let (a, b) = (&self.card[0], &self.card[1]);
+        let mut hidden = Vec::new();
+        dense(&a.w, &a.b, a.i, a.o, &facts, ids.len(), &mut hidden);
+        for x in hidden.iter_mut() {
+            *x = gelu(*x);
         }
-        let mut hidden = scratch(0);
-        self.card[0].run(&facts, rows * NTYPE, &mut hidden);
-        let (mut arg, mut th) = (scratch(0), scratch(0));
-        gelu_all(&mut hidden[..rows * NTYPE * TYPE], &mut arg, &mut th);
-        self.card[1].run(&hidden, rows * NTYPE, out);
-        recycle(facts);
-        recycle(hidden);
-        recycle(arg);
-        recycle(th);
-    }
-
-    /// The CPU reference trunk from packed public rows.
-    pub fn board_from_rows(
-        &self,
-        packed: &[u8],
-        cards: &[f32],
-        rows: usize,
-        out: &mut Vec<f32>,
-    ) {
-        use crate::pbs::{expand_row, ROW_BYTES};
-        let mut xpub = vec![0.0; rows * PUBFEAT];
-        for (row, dst) in packed
-            .chunks_exact(ROW_BYTES)
-            .zip(xpub.chunks_exact_mut(PUBFEAT))
-        {
-            expand_row(row, dst);
-        }
-        self.board(&xpub, cards, rows, out);
-    }
-
-    /// Card tokens plus this row's pile counts and the owner's seat.
-    fn tokens(&self, xpub: &[f32], cards: &[f32], rows: usize) -> Vec<f32> {
-        let mut piles = scratch(rows * NTYPE * PILE_COUNTS);
-        let n = NTYPE * PILE_COUNTS;
-        for r in 0..rows {
-            piles[r * n..(r + 1) * n]
-                .copy_from_slice(&xpub[r * PUBFEAT + OFF_PILES..r * PUBFEAT + OFF_PILES + n]);
-        }
-        let mut out = scratch(rows * NTYPE * TYPE);
-        self.pile.add(&piles, rows * NTYPE, &mut out);
-        assert_eq!(cards.len(), NTYPE * TYPE, "one physical card table");
-        for r in 0..rows {
-            let card = cards;
-            for t in 0..NTYPE {
-                let seat = &self.seat[(t / NSLOT) * TYPE..(t / NSLOT + 1) * TYPE];
-                let dst = &mut out[(r * NTYPE + t) * TYPE..(r * NTYPE + t + 1) * TYPE];
-                for j in 0..TYPE {
-                    dst[j] += card[t * TYPE + j] + seat[j];
-                }
-            }
-        }
-        recycle(piles);
-        out
-    }
-
-    /// The trunk stem: hex facts, the occupant's projected token, position,
-    /// globals, and a nonlinear pool over every drafted coin type.
-    fn stem(&self, xpub: &[f32], tokens: &[f32], rows: usize) -> (Vec<f32>, Vec<f32>) {
-        let mut facts = scratch(rows * N_HEXES * HEX_FACTS);
-        let mut occ = scratch(rows * N_HEXES * C);
-        let mut loose = scratch(rows * LOOSE);
-        let mut projected = scratch(0);
-        self.tok_stem.run(tokens, rows * NTYPE, &mut projected);
-        let mut type_pool = scratch(rows * C);
-        for r in 0..rows {
-            for t in 0..NTYPE {
-                let token = &projected[(r * NTYPE + t) * C..(r * NTYPE + t + 1) * C];
-                for j in 0..C {
-                    type_pool[r * C + j] += gelu(token[j]) / NTYPE as f32;
-                }
-            }
-            let src = &xpub[r * PUBFEAT..(r + 1) * PUBFEAT];
-            loose[r * LOOSE..(r + 1) * LOOSE].copy_from_slice(&src[OFF_LOOSE..OFF_LOOSE + LOOSE]);
-            for h in 0..N_HEXES {
-                let hex = &src[h * HEX_CH..(h + 1) * HEX_CH];
-                let at = (r * N_HEXES + h) * HEX_FACTS;
-                facts[at..at + HEX_FACTS].copy_from_slice(&hex[..HEX_FACTS]);
-                if let Some(t) = hex[HEX_FACTS..].iter().position(|&v| v != 0.0) {
-                    let src = &projected[(r * NTYPE + t) * C..(r * NTYPE + t + 1) * C];
-                    let at = (r * N_HEXES + h) * C;
-                    occ[at..at + C].copy_from_slice(src);
-                }
-            }
-        }
-        let mut x = scratch(0);
-        self.hex_stem.run(&facts, rows * N_HEXES, &mut x);
-        let mut glob = scratch(0);
-        self.glob_stem.run(&loose, rows, &mut glob);
-        for r in 0..rows {
-            for h in 0..N_HEXES {
-                let dst = &mut x[(r * N_HEXES + h) * C..(r * N_HEXES + h + 1) * C];
-                let occupant = &occ[(r * N_HEXES + h) * C..(r * N_HEXES + h + 1) * C];
-                for j in 0..C {
-                    dst[j] +=
-                        occupant[j] + self.pos[h * C + j] + glob[r * C + j] + type_pool[r * C + j];
-                }
-            }
-        }
-        x.truncate(rows * N_HEXES * C);
-        recycle(facts);
-        recycle(occ);
-        recycle(loose);
-        recycle(type_pool);
-        recycle(glob);
-        (projected, x)
-    }
-
-    /// Projected card tokens and the normalised, activated hex tokens.
-    fn trunk(&self, xpub: &[f32], tokens: &[f32], rows: usize) -> (Vec<f32>, Vec<f32>) {
-        let bd = board();
-        let cells = rows * N_HEXES;
-        let (projected, mut x) = self.stem(xpub, tokens, rows);
-        let mut a = scratch(cells * C);
-        let mut mixed = scratch(cells * 2 * C);
-        let mut pooled = scratch(rows * 2 * C);
-        let (mut y, mut gb, mut z) = (scratch(0), scratch(0), scratch(0));
-        let (mut arg, mut th) = (scratch(0), scratch(0));
-        for (i, blk) in self.blocks.iter().enumerate() {
-            a.copy_from_slice(&x[..cells * C]);
-            self.norms[ln_block(i, 0)].apply(&mut a, cells, &mut arg, &mut th);
-            for cell in 0..cells {
-                let h = cell % N_HEXES;
-                let (self_part, neigh) = mixed[cell * 2 * C..(cell + 1) * 2 * C].split_at_mut(C);
-                self_part.copy_from_slice(&a[cell * C..(cell + 1) * C]);
-                neigh.fill(0.0);
-                for &n in &bd.neighbors[h] {
-                    if n == NONE {
-                        continue;
-                    }
-                    let base = (cell - h + n as usize) * C;
-                    for (o, &v) in neigh.iter_mut().zip(&a[base..base + C]) {
-                        *o += v;
-                    }
-                }
-            }
-            blk.mix.run(&mixed, cells, &mut y);
-            for r in 0..rows {
-                let (mean, max) = pooled[r * 2 * C..(r + 1) * 2 * C].split_at_mut(C);
-                mean.fill(0.0);
-                max.fill(f32::NEG_INFINITY);
-                for h in 0..N_HEXES {
-                    let src = &a[(r * N_HEXES + h) * C..(r * N_HEXES + h + 1) * C];
-                    for j in 0..C {
-                        mean[j] += src[j] / N_HEXES as f32;
-                        max[j] = max[j].max(src[j]);
-                    }
-                }
-            }
-            blk.pool.run(&pooled, rows, &mut gb);
-            for cell in 0..cells {
-                let bias = &gb[(cell / N_HEXES) * C..(cell / N_HEXES + 1) * C];
-                for (o, &v) in y[cell * C..(cell + 1) * C].iter_mut().zip(bias) {
-                    *o += v;
-                }
-            }
-            self.norms[ln_block(i, 1)].apply(&mut y, cells, &mut arg, &mut th);
-            blk.out.run(&y, cells, &mut z);
-            for (o, &v) in x[..cells * C].iter_mut().zip(&z[..cells * C]) {
-                *o += v;
-            }
-        }
-        self.norms[LN_TRUNK].apply(&mut x, cells, &mut arg, &mut th);
-        recycle(a);
-        recycle(mixed);
-        recycle(pooled);
-        recycle(y);
-        recycle(gb);
-        recycle(z);
-        recycle(arg);
-        recycle(th);
-        (projected, x)
-    }
-
-    pub(crate) fn position_parts(
-        &self,
-        xpub: &[f32],
-        cards: &[f32],
-        rows: usize,
-    ) -> (Vec<f32>, Vec<f32>) {
-        let tokens = self.tokens(xpub, cards, rows);
-        let out = self.trunk(xpub, &tokens, rows);
-        recycle(tokens);
-        out
-    }
-
-    fn pool_board(&self, xpub: &[f32], spatial: &[f32], rows: usize, out: &mut Vec<f32>) {
-        let width = 2 * C + LOOSE;
-        let mut input = scratch(rows * width);
-        for r in 0..rows {
-            let dst = &mut input[r * width..(r + 1) * width];
-            dst[..C].fill(0.0);
-            dst[C..2 * C].fill(f32::NEG_INFINITY);
-            for h in 0..N_HEXES {
-                let src = &spatial[(r * N_HEXES + h) * C..(r * N_HEXES + h + 1) * C];
-                for j in 0..C {
-                    dst[j] += src[j] / N_HEXES as f32;
-                    dst[C + j] = dst[C + j].max(src[j]);
-                }
-            }
-            dst[2 * C..].copy_from_slice(
-                &xpub[r * PUBFEAT + OFF_LOOSE..r * PUBFEAT + OFF_LOOSE + LOOSE],
-            );
-        }
-        self.board_out.run(&input, rows, out);
-        recycle(input);
-    }
-
-    /// One global board vector per physical row.
-    pub fn board(
-        &self,
-        xpub: &[f32],
-        cards: &[f32],
-        rows: usize,
-        out: &mut Vec<f32>,
-    ) {
-        let (projected, spatial) = self.position_parts(xpub, cards, rows);
-        self.pool_board(xpub, &spatial, rows, out);
-        recycle(projected);
-        recycle(spatial);
-    }
-
-    /// The half of the join's first layer that does not move between CFR
-    /// iterations. Projecting `P` once per solve is the whole reason the
-    /// board vector is allowed to be wide.
-    pub fn join_cache(&self, p: &[f32], rows: usize, out: &mut Vec<f32>) {
-        self.join_p.run(p, rows, out);
-    }
-
-    /// `f(c)` (the readout row) and `g(c)` (the pooling vector) per config.
-    /// `owner` is the query whose player's five card tokens the config reads.
-    pub fn configs(
-        &self,
-        phi: &[f32],
-        owner: &[u32],
-        n: usize,
-        cards: &[f32],
-        f_out: &mut Vec<f32>,
-        g_out: &mut Vec<f32>,
-        p_out: &mut Vec<f32>,
-    ) {
-        let width = 3 + TYPE;
-        let mut slots = scratch(n * NSLOT * width);
-        for c in 0..n {
-            let q = owner[c] as usize;
-            for k in 0..NSLOT {
-                let row = &mut slots[(c * NSLOT + k) * width..(c * NSLOT + k + 1) * width];
-                row[0] = phi[c * CFEAT + k];
-                row[1] = phi[c * CFEAT + NSLOT + k];
-                row[2] = phi[c * CFEAT + 2 * NSLOT + k];
-                let t = q * NSLOT + k;
-                row[3..].copy_from_slice(&cards[t * TYPE..(t + 1) * TYPE]);
-            }
-        }
-        let mut hidden = scratch(0);
-        self.cfg1.run(&slots, n * NSLOT, &mut hidden);
-        let (mut arg, mut th) = (scratch(0), scratch(0));
-        gelu_all(&mut hidden[..n * NSLOT * CFGH], &mut arg, &mut th);
-        let mut u = scratch(n * CFGH);
-        for c in 0..n {
-            for k in 0..NSLOT {
-                for j in 0..CFGH {
-                    u[c * CFGH + j] += hidden[(c * NSLOT + k) * CFGH + j];
-                }
-            }
-        }
-        self.norms[LN_CFG].apply(&mut u, n, &mut arg, &mut th);
-        self.cfg_f.run(&u, n, f_out);
-        self.cfg_g.run(&u, n, g_out);
-        // The policy's config vector, from the same encoding the value's comes
-        // from: one description of a config, two readouts of it.
-        self.cfg_p.run(&u, n, p_out);
-        // The linear half of `g`: a count-weighted sum of per-zone card
-        // embeddings. Pooling is linear over it, so `sum_c beta(c) g(c)`
-        // carries the belief's exact expected holding of every card, bound to
-        // that card. `bag` depends only on the card table, so it costs two
-        // rows per solve and fifteen accumulations per config.
-        let mut bag = scratch(0);
-        let views = cards.len() / (NTYPE * TYPE);
-        self.cfg_m.run(cards, views * NTYPE, &mut bag);
-        let stride = 3 * POOL;
-        for c in 0..n {
-            let q = owner[c] as usize;
-            let dst = &mut g_out[c * POOL..(c + 1) * POOL];
-            for k in 0..NSLOT {
-                let t = q * NSLOT + k;
-                let v = &bag[t * stride..(t + 1) * stride];
-                for zone in 0..3 {
-                    let count = phi[c * CFEAT + zone * NSLOT + k];
-                    if count == 0.0 {
-                        continue;
-                    }
-                    for (o, &e) in dst.iter_mut().zip(&v[zone * POOL..(zone + 1) * POOL]) {
-                        *o += count * e;
-                    }
-                }
-            }
-        }
-        recycle(slots);
-        recycle(hidden);
-        recycle(arg);
-        recycle(th);
-        recycle(u);
-        recycle(bag);
-    }
-
-    /// The board projection is shared by a physical row. Belief order and the
-    /// seat scalar select the queried player's value.
-    ///
-    /// `board_of` names the board vector each row reads. Rows outnumber boards
-    /// because transposing coin plays reach the same public state, and the
-    /// trunk runs once per public state rather than once per row.
-    pub fn join(
-        &self,
-        p: &[f32],
-        jp: &[f32],
-        board_of: &[u32],
-        pooled: &[f32],
-        rows: usize,
-        player: usize,
-        out: &mut Vec<f32>,
-    ) {
-        let mut z = scratch(rows * JW);
-        let mut input = scratch(rows * JOIN_IN);
-        for r in 0..rows {
-            let (q, o) = (2 * r + player, 2 * r + 1 - player);
-            let dst = &mut input[r * JOIN_IN..(r + 1) * JOIN_IN];
-            dst[..POOL].copy_from_slice(&pooled[q * POOL..(q + 1) * POOL]);
-            dst[POOL..2 * POOL].copy_from_slice(&pooled[o * POOL..(o + 1) * POOL]);
-            dst[2 * POOL] = if player == 0 { -1.0 } else { 1.0 };
-            let b = board_of[r] as usize;
-            z[r * JW..(r + 1) * JW].copy_from_slice(&jp[b * JW..(b + 1) * JW]);
-        }
-        self.join_b.add(&input, rows, &mut z);
-        self.join_b.bias(&mut z, rows);
-        let (mut t, mut d, mut arg, mut th) =
-            (scratch(rows * JW), scratch(0), scratch(0), scratch(0));
-        for i in 0..JBLOCKS {
-            t.copy_from_slice(&z);
-            self.norms[LN_JOIN + i].apply(&mut t, rows, &mut arg, &mut th);
-            self.join_w[i].run(&t, rows, &mut d);
-            for (o, &v) in z.iter_mut().zip(&d[..rows * JW]) {
-                *o += v;
-            }
-        }
-        self.norms[LN_JOUT].apply(&mut z, rows, &mut arg, &mut th);
-        fit(out, rows * D);
-        for r in 0..rows {
-            let b = board_of[r] as usize;
-            out[r * D..(r + 1) * D].copy_from_slice(&p[b * D..(b + 1) * D]);
-        }
-        self.join_out.add(&z, rows, &mut out[..rows * D]);
-        self.join_out.bias(out, rows);
-        self.norms[LN_H].plain(out, rows);
-        recycle(z);
-        recycle(input);
-        recycle(t);
-        recycle(d);
-        recycle(arg);
-        recycle(th);
-    }
-
-    /// `e(a)` for every action, built from the entities its descriptor names.
-    #[allow(clippy::too_many_arguments)]
-    pub fn actions(
-        &self,
-        desc: &[u8],
-        boards: &[f32],
-        heads: &[f32],
-        cards: &[f32],
-        spatial: &[f32],
-        board_of: &[u32],
-        head_of: &[u32],
-        n: usize,
-        out: &mut Vec<f32>,
-    ) {
-        use crate::search::ACT_BYTES;
-        debug_assert_eq!(desc.len(), n * ACT_BYTES);
-        debug_assert_eq!(board_of.len(), n);
-        debug_assert_eq!(head_of.len(), n);
-        let rows = boards.len() / D;
-        let queries = heads.len() / D;
-        let mut z = scratch(n * AW);
-        for r in 0..n {
-            let d = &desc[r * ACT_BYTES..(r + 1) * ACT_BYTES];
-            let row = board_of[r] as usize;
-            let dst = &mut z[r * AW..(r + 1) * AW];
-            dst.copy_from_slice(&self.act_kind[d[0] as usize * AW..(d[0] as usize + 1) * AW]);
-            for role in 0..5 {
-                let entity = d[role + 1] as usize;
-                let src = if role < 2 && entity < NTYPE {
-                    &cards[(row * NTYPE + entity) * C..(row * NTYPE + entity + 1) * C]
-                } else if role >= 2 && entity < N_HEXES {
-                    &spatial[(row * N_HEXES + entity) * C..(row * N_HEXES + entity + 1) * C]
-                } else {
-                    continue;
-                };
-                let gate = &self.act_role[role * AW..(role + 1) * AW];
-                for j in 0..AW {
-                    dst[j] += gate[j] * src[j];
-                }
-            }
-        }
-        let mut proj = scratch(0);
-        self.act_board.run(boards, rows, &mut proj);
-        let mut hproj = scratch(0);
-        self.act_h.run(heads, queries, &mut hproj);
-        for r in 0..n {
-            let at = board_of[r] as usize * AW;
-            for (o, &v) in z[r * AW..(r + 1) * AW].iter_mut().zip(&proj[at..at + AW]) {
-                *o += v;
-            }
-            let at = head_of[r] as usize * AW;
-            for (o, &v) in z[r * AW..(r + 1) * AW].iter_mut().zip(&hproj[at..at + AW]) {
-                *o += v;
-            }
-        }
-        let (mut arg, mut th) = (scratch(0), scratch(0));
-        self.norms[LN_ACT].apply(&mut z[..n * AW], n, &mut arg, &mut th);
-        self.act_out.run(&z, n, out);
-        recycle(z);
-        recycle(proj);
-        recycle(hproj);
-        recycle(arg);
-        recycle(th);
-    }
-
-    /// `logit(c, a) = <f_p(c), e(a)>` over the legal cells of one node.
-    ///
-    /// `cfg` and `act` name, per cell, which config and which action it stands
-    /// for — the arrays the tree already keeps to index its strategy, so the
-    /// policy needs no table of its own.
-    pub fn policy(&self, fp: &[f32], e: &[f32], cfg: &[u32], act: &[u32], out: &mut [f32]) {
-        debug_assert_eq!(cfg.len(), out.len());
-        debug_assert_eq!(act.len(), out.len());
-        for (k, o) in out.iter_mut().enumerate() {
-            let f = &fp[cfg[k] as usize * D..(cfg[k] as usize + 1) * D];
-            let a = &e[act[k] as usize * D..(act[k] as usize + 1) * D];
-            *o = f.iter().zip(a).map(|(x, y)| x * y).sum();
-        }
-    }
-
-    /// `v(c) = <f(c), h> + bias` for each config index in `idx`.
-    pub fn values(&self, h: &[f32], f: &[f32], idx: &[u32], out: &mut [f32]) {
-        let mut lo = 0;
-        while lo < idx.len() {
-            let first = idx[lo] as usize;
-            let mut hi = lo + 1;
-            while hi < idx.len() && idx[hi] as usize == first + hi - lo {
-                hi += 1;
-            }
-            if hi - lo >= 8 {
-                gemm(
-                    hi - lo,
-                    1,
-                    D,
-                    &f[first * D..],
-                    D,
-                    h,
-                    1,
-                    0.0,
-                    &mut out[lo..hi],
-                    1,
-                );
-                for value in &mut out[lo..hi] {
-                    *value += self.value_bias;
-                }
-            } else {
-                for (value, &c) in out[lo..hi].iter_mut().zip(&idx[lo..hi]) {
-                    let row = &f[c as usize * D..(c as usize + 1) * D];
-                    *value = row
-                        .iter()
-                        .zip(h)
-                        .fold(self.value_bias, |sum, (&x, &y)| sum + x * y);
-                }
-            }
-            lo = hi;
-        }
-    }
-
-    /// The whole network on one ragged query batch. Parity tests and
-    /// the offline tools use this; the solver drives the pieces directly so it
-    /// can cache everything that does not move between CFR iterations.
-    pub fn forward(
-        &self,
-        xpub: &[f32],
-        phi: &[f32],
-        weight: &[f32],
-        seg: &[u32],
-        queries: usize,
-    ) -> Vec<f32> {
-        let n = weight.len();
-        let mut cards = Vec::new();
-        let rows = queries / 2;
-        self.cards(xpub, rows, &mut cards);
-        let (mut p, mut jp) = (Vec::new(), Vec::new());
-        self.board(xpub, &cards[..NTYPE * TYPE], rows, &mut p);
-        self.join_cache(&p, rows, &mut jp);
-        let (mut f, mut g, mut fp) = (Vec::new(), Vec::new(), Vec::new());
-        self.configs(phi, seg, n, &cards, &mut f, &mut g, &mut fp);
-        let mut pooled = vec![0.0; queries * POOL];
-        for c in 0..n {
-            let q = seg[c] as usize;
-            for j in 0..POOL {
-                pooled[q * POOL + j] += weight[c] * g[c * POOL + j];
-            }
-        }
-        // `join` reads query `2 * row + player`, which is how the solver lays
-        // its rows out; a flat query batch is the same thing with one row per
-        // pair, so it is driven twice, once per seat.
-        let mut out = vec![0.0; n];
-        let mut h = Vec::new();
-        // A flat query batch interns nothing, so every row has a board of its
-        // own.
-        let board_of: Vec<u32> = (0..rows as u32).collect();
-        for player in 0..2 {
-            self.join(&p, &jp, &board_of, &pooled, rows, player, &mut h);
-            for c in 0..n {
-                let q = seg[c] as usize;
-                if q % 2 != player {
-                    continue;
-                }
-                let r = q / 2;
-                self.values(&h[r * D..(r + 1) * D], &f, &[c as u32], &mut out[c..c + 1]);
-            }
-        }
-        out
-    }
-
-    /// The policy readout over one query's `(config, action)` cells.
-    ///
-    /// The board trunk and the config encoder are the same ones `forward`
-    /// runs; only the readout differs. Every cell here belongs to query
-    /// `seg[cfg[k]]`, and an action's embedding is built against that query's
-    /// board vector, so a batch may span queries.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_policy(
-        &self,
-        xpub: &[f32],
-        phi: &[f32],
-        weight: &[f32],
-        seg: &[u32],
-        desc: &[u8],
-        cfg: &[u32],
-        act: &[u32],
-        queries: usize,
-    ) -> Vec<f32> {
-        let n = seg.len();
-        let mut cards = Vec::new();
-        let rows = queries / 2;
-        self.cards(xpub, rows, &mut cards);
-        let (projected, spatial) =
-            self.position_parts(xpub, &cards[..NTYPE * TYPE], rows);
-        let mut p = Vec::new();
-        self.pool_board(xpub, &spatial, rows, &mut p);
-        let mut jp = Vec::new();
-        self.join_cache(&p, rows, &mut jp);
-        let (mut f, mut g, mut fp) = (Vec::new(), Vec::new(), Vec::new());
-        self.configs(phi, seg, n, &cards, &mut f, &mut g, &mut fp);
-        let mut pooled = vec![0.0; queries * POOL];
-        for c in 0..n {
-            let q = seg[c] as usize;
-            for j in 0..POOL {
-                pooled[q * POOL + j] += weight[c] * g[c * POOL + j];
-            }
-        }
-        let board_rows: Vec<u32> = (0..rows as u32).collect();
-        let mut heads = vec![0.0; queries * D];
-        let mut joined = Vec::new();
-        for player in 0..2 {
-            self.join(&p, &jp, &board_rows, &pooled, rows, player, &mut joined);
-            for r in 0..rows {
-                heads[(2 * r + player) * D..(2 * r + player + 1) * D]
-                    .copy_from_slice(&joined[r * D..(r + 1) * D]);
-            }
-        }
-        // Build one action row per cell. This parity path may reuse an action
-        // index across queries, while production action indices belong to one
-        // node and therefore one belief state.
-        let mut cell_desc = vec![0u8; cfg.len() * crate::search::ACT_BYTES];
-        let mut board_of = Vec::with_capacity(cfg.len());
-        let mut head_of = Vec::with_capacity(cfg.len());
-        for (k, (&c, &a)) in cfg.iter().zip(act).enumerate() {
-            let q = seg[c as usize];
-            let width = crate::search::ACT_BYTES;
-            cell_desc[k * width..(k + 1) * width]
-                .copy_from_slice(&desc[a as usize * width..(a as usize + 1) * width]);
-            board_of.push(q / 2);
-            head_of.push(q);
-        }
-        let mut e = Vec::new();
-        self.actions(
-            &cell_desc,
-            &p,
-            &heads,
-            &projected,
-            &spatial,
-            &board_of,
-            &head_of,
-            cfg.len(),
-            &mut e,
-        );
-        let cell_act: Vec<u32> = (0..cfg.len() as u32).collect();
-        let mut out = vec![0.0; cfg.len()];
-        self.policy(&fp, &e, cfg, &cell_act, &mut out);
-        out
+        dense(&b.w, &b.b, b.i, b.o, &hidden, ids.len(), out);
     }
 }

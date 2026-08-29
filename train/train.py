@@ -1,32 +1,3 @@
-"""Student of Games training for War Chest.
-
-Self-play where every decision grows a search tree along trajectories sampled
-from its changing strategy. The root of each solve becomes a value target --
-one value per config in each player's belief -- and the leaves it queried
-become roots for solves of their own, which is how the value function becomes
-accurate away from the line of play.
-
-There is a short greedy warm start. A game that reaches the play cap is a draw
-with zero utility.
-
-Generation runs in Rust across all CPU cores while the previous batch trains
-on the GPU. Python publishes weights between generation batches.
-
-A training row is a public state plus, for each player, the whole belief: the
-exact configs in support, their probabilities, and the value the solve gave
-each. The config lists are ragged, so they live in a flat arena and a batch is
-assembled by gathering spans -- see `Buffer`.
-
-The run snapshots every `snapshot_every` minutes, including the live replay
-buffer so a resumed run continues training immediately. Training starts with a
-short greedy warm phase labelled by the public static evaluation, then the SoG
-phase. When training ends, the snapshots are packed as bots for evaluation by
-`tools/arena.py`.
-
-    python train/train.py out=seat
-    python train/train.py out=seat note="centre the seat bit at +-0.5"
-    python train/train.py out=smoke minutes=6
-"""
 
 import argparse
 import collections
@@ -48,7 +19,6 @@ import torch.nn.functional as F
 
 import warchest
 import config
-import mirror
 from export_weights import load as load_checkpoint
 from value_net import Net
 
@@ -62,13 +32,22 @@ ROW_BYTES = warchest.ROW_BYTES
 ACT_BYTES = warchest.ACT_BYTES
 NSLOT = warchest.NSLOT
 
-# What `SolveFarm.collect` reports about the device rounds, cumulative
-# since the farm started. `rounds` is the denominator of the other three.
 ROUND_KEYS = ("rounds", "round_calls", "round_rows", "round_nanos", "budget_hits")
+POLICY_METRICS = ("policy_loss", "policy_target_entropy", "policy_prior_entropy",
+                  "policy_search_kl")
+
+
+def fold(window, lists, stat):
+    for key, value in stat.items():
+        if isinstance(value, list):
+            lists.setdefault(key, []).extend(value)
+        elif key.endswith("_max"):
+            window[key] = max(window[key], value)
+        else:
+            window[key] += value
 
 
 def scheduled_lr(initial, final, elapsed, duration, stable_frac):
-    """Flat warm self-play rate followed by a cosine decay to ``final``."""
     stable = stable_frac * duration
     if stable_frac >= 1.0 or elapsed <= stable:
         return initial
@@ -78,55 +57,17 @@ def scheduled_lr(initial, final, elapsed, duration, stable_frac):
         math.pi * ((elapsed - stable) / (duration - stable)))) / 2.0
 
 
-def expand_batch(rows):
-    """Expand packed replay rows into the public encoding, in one batch.
-    The expansion itself runs in Rust — one source of truth with the
-    solver's leaf encoding."""
-    n = len(rows)
-    return np.asarray(warchest.expand_rows(rows.ravel()), np.float32).reshape(n, -1)
-
-
 class Buffer:
-    """Fixed-capacity FIFO over rows whose config lists are ragged.
-
-    One FIFO of rows. Each row occupies a slot in the row ring and a span in
-    the config, action and policy-cell rings. Append retires the oldest rows
-    until the new chunk fits every ring, then writes. No ring is walked on its
-    own: a row is live exactly while `lo` still names it.
-
-    Bootstrapped targets are averaged over whatever history the buffer holds, so
-    its length is a real algorithmic knob and not just a memory setting -- the
-    reference implementation runs a 2M buffer. A row is the frozen compact
-    format (`ROW_BYTES` raw bytes: hex facts, piles, unit ids, and scalars) --
-    353 bytes instead of the ~1.9 KB the old float encoding cost -- and the
-    network input is expanded from it when a batch is made. Counts are stored
-    as the `uint8` they are. Targets and policy probabilities use float16;
-    belief weights stay float32 so replay does not change the range that made
-    the targets. A row costs `ROW_BYTES` bytes plus 21 per config.
-
-    Preallocated and written with wraparound rather than grown by
-    concatenation. The concatenate form rebuilt the whole buffer every epoch:
-    at an 800k cap that copies ~2.6 GB per epoch and transiently holds two
-    copies of it, which is most of a 16 GB machine. `np.zeros` maps zero pages
-    lazily, so reserving the full capacity up front costs nothing until it is
-    actually filled.
-
-    Solve offsets are kept in row space (`soff`), so a dump can be split at
-    solve boundaries for honest offline comparisons.
-    """
 
     def __init__(self, cap, ccap):
         self.cap, self.ccap = cap, ccap
         self.x = np.zeros((cap, ROW_BYTES), np.uint8)
         self.soff = np.zeros(0, np.int64)
-        self.cstart = np.zeros(cap, np.int64)   # absolute arena offset
+        self.cstart = np.zeros(cap, np.int64)
         self.clen = np.zeros((cap, 2), np.int32)
         self.cc = np.zeros((ccap, CCOUNTS), np.uint8)
         self.cw = np.zeros(ccap, np.float32)
         self.cy = np.zeros(ccap, np.float16)
-        # The policy target, per row: the root's actions, and the legal cells
-        # with their probability. Only main-line rows carry one, so both arenas
-        # are sized off the row cap rather than the config cap.
         self.pastart = np.zeros(cap, np.int64)
         self.palen = np.zeros(cap, np.int32)
         self.pcstart = np.zeros(cap, np.int64)
@@ -139,27 +80,25 @@ class Buffer:
         self.pp = np.zeros(self.pcap, np.float16)
         self.written_at = np.zeros(cap, np.float64)
         self.created_at = np.zeros(cap, np.float64)
-        self.source = np.zeros(cap, np.uint8)  # 0 warm, 1 play, 2 query
+        self.source = np.zeros(cap, np.uint8)
         self.truth = np.zeros((cap, 2), np.uint32)
         self.outcome = np.full((cap, 2), np.nan, np.float32)
         self.td1 = np.zeros(cap, np.uint8)
         self.acts = 0
         self.cells = 0
-        self.rows = 0   # rows ever written
-        self.cfgs = 0   # configs ever written
-        self.lo = 0     # oldest row whose configs are still in the arena
+        self.rows = 0
+        self.cfgs = 0
+        self.lo = 0
 
     _ROW_FIELDS = (
         "x", "cstart", "clen", "pastart", "palen", "pcstart", "pclen",
         "written_at", "created_at", "source", "truth", "outcome", "td1")
-    # start, per-row lengths, arena fields, running count, capacity.
     _ARENAS = (
         ("cstart", "clen", ("cc", "cw", "cy"), "cfgs", "ccap"),
         ("pastart", "palen", ("pa",), "acts", "acap"),
         ("pcstart", "pclen", ("pci", "pact", "pp"), "cells", "pcap"))
 
     def state_dict(self):
-        """Return the live replay state in compact row and arena order."""
         ids = np.arange(self.lo, self.rows, dtype=np.int64)
         ring = ids % self.cap
         state = {name: getattr(self, name)[ring].copy()
@@ -182,7 +121,6 @@ class Buffer:
         return state
 
     def load_state_dict(self, state):
-        """Restore a state_dict into this buffer."""
         lo, rows = int(state["lo"]), int(state["rows"])
         if lo < 0 or rows < lo or rows - lo > self.cap:
             raise ValueError(f"invalid replay row range {lo}:{rows}")
@@ -191,7 +129,6 @@ class Buffer:
         self.lo, self.rows = lo, rows
         self.cfgs, self.acts, self.cells = (
             int(state["cfgs"]), int(state["acts"]), int(state["cells"]))
-        # Keep policy-less appends from seeing stale capacity rows.
         self.palen.fill(0)
         self.pclen.fill(0)
         for name in self._ROW_FIELDS:
@@ -215,7 +152,6 @@ class Buffer:
         else:
             pa, paoff, pcoff, pci, pact, pprob = pol
             na, nc = len(pa), len(pci)
-        # Retire the oldest rows until this chunk fits every ring.
         while self.lo < self.rows:
             r = self.lo % self.cap
             if (self.rows - self.lo + n <= self.cap
@@ -259,11 +195,7 @@ class Buffer:
             self.cells += nc
         self.rows += n
         self.cfgs += m
-        # Solve offsets in absolute row space (first entry 0, trailing count).
         self.soff = np.concatenate([self.soff, np.asarray(soff, np.int64)[1:] + base])
-        # Drop offsets whose rows have been evicted. Without this, soff grows
-        # for the whole run and the concatenate above copies all of it every
-        # chunk — quadratic in the run length.
         if self.soff.size:
             i = int(np.searchsorted(self.soff, self.lo, "right"))
             if i > self.soff.size // 2:
@@ -281,23 +213,16 @@ class Buffer:
         return self.rows - self.lo
 
     def gather(self, ids):
-        """Assemble a batch from absolute row ids.
-
-        Returns `(rows, cc, cw, cy, seg)`.
-        """
         s = ids % self.cap
         lens = self.clen[s].sum(1).astype(np.int64)
         total = int(lens.sum())
-        # Arena indices of every config of every chosen row, flattened.
         base = np.repeat(self.cstart[s], lens)
         within = np.arange(total, dtype=np.int64) - np.repeat(
             np.concatenate([[0], np.cumsum(lens)[:-1]]), lens)
         at = (base + within) % self.ccap
         row = np.repeat(np.arange(len(ids), dtype=np.int64), lens)
-        seg = 2 * row + (within >= np.repeat(self.clen[s, 0], lens))
-        # The policy target, remapped onto the batch. A row with no target
-        # contributes no cells, which is how a query solve drops out of the
-        # policy loss without a mask.
+        player = (within >= np.repeat(self.clen[s, 0], lens)).astype(np.uint8)
+        seg = 2 * row + player
         alen, clen = self.palen[s].astype(np.int64), self.pclen[s].astype(np.int64)
         ai = (np.repeat(self.pastart[s], alen)
               + (np.arange(int(alen.sum()), dtype=np.int64)
@@ -305,42 +230,22 @@ class Buffer:
         ci = (np.repeat(self.pcstart[s], clen)
               + (np.arange(int(clen.sum()), dtype=np.int64)
                  - np.repeat(np.concatenate([[0], np.cumsum(clen)[:-1]]), clen)))
-        # An action's index becomes batch-global, and a cell names the query
-        # (row, acting config) it belongs to.
         abase = np.concatenate([[0], np.cumsum(alen)[:-1]])
-        # A cell names its config within its own row; the batch arena puts that
-        # row's configs at `rowbase`, so the two add to an arena index.
+        cellrow = np.repeat(np.arange(len(ids), dtype=np.int64), clen)
         rowbase = np.concatenate([[0], np.cumsum(lens)[:-1]])
         pcfg = np.repeat(rowbase, clen) + self.pci[ci % self.pcap].astype(np.int64)
         pp = self.pp[ci % self.pcap].astype(np.float32)
         pol = (self.pa[ai % self.acap],
-               np.repeat(np.arange(len(ids), dtype=np.int64), alen),
-               np.repeat(abase, clen) + self.pact[ci % self.pcap], pcfg, pp)
+               np.repeat(abase, clen) + self.pact[ci % self.pcap],
+               cellrow, pcfg, pp,
+               np.repeat(np.arange(len(ids), dtype=np.int64), alen))
         cw = self.cw[at].copy()
         mass = np.bincount(seg, weights=cw, minlength=2 * len(ids)).astype(np.float32)
         cw /= mass[seg]
-        return (self.x[s], self.cc[at], cw,
+        return (self.x[s], self.cc[at], player, cw,
                 self.cy[at].astype(np.float32), seg, pol)
 
     def sample_ids(self, batch, rng, recent_mix=0.0, recent_frac=0.2):
-        """Row ids, with part drawn from the newest rows only.
-
-        Uniform sampling over a 2M-row buffer is not neutral here: the targets
-        are bootstrapped, so an old row's target was written by an old network
-        and is wrong by however much the network has moved since. Sampling
-        purely by recency is not the fix either, because held-out error falls
-        monotonically with the number of *distinct* positions trained on
-        (40k -> 0.0122, 284k -> 0.0082), and a recency-only sampler throws that
-        away to refit a small window.
-
-        So: a mixture. `recent_mix` of the batch comes from the newest
-        `recent_frac` of the buffer and the rest from all of it, which draws a
-        row in the fresh slice `1 + mix / ((1 - mix) * frac)` times as often as
-        an old one -- 6x at the defaults, or 3x the average rate -- while
-        leaving every row reachable. Two uniform draws, and no weight vector to
-        rebuild each epoch.
-
-        """
         ids = rng.integers(self.lo, self.rows, size=batch)
         k = int(batch * recent_mix)
         if k > 0:
@@ -352,8 +257,6 @@ class Buffer:
         return self.gather(self.sample_ids(batch, rng, recent_mix, recent_frac))
 
     def sample_old(self, batch, rng, recent_frac=0.2):
-        """A batch from outside the recent slice — the stale majority — for
-        the age-bucket loss. A diagnostic, not training."""
         span = max(1, int((self.rows - self.lo) * recent_frac))
         hi = max(self.lo + 1, self.rows - span)
         return self.gather(rng.integers(self.lo, hi, size=batch))
@@ -374,7 +277,6 @@ class Buffer:
         }
 
     def sample_calibration(self, batch, rng):
-        """Rows with game outcomes, plus their true-config indices."""
         ids = np.arange(self.lo, self.rows, dtype=np.int64)
         ids = ids[np.isfinite(self.outcome[ids % self.cap, 0])]
         if not len(ids):
@@ -390,38 +292,14 @@ class Buffer:
         return parts, at, self.outcome[ring].ravel()
 
     def ordered(self):
-        """Live rows oldest-first.
-
-        Age order is what makes an honest held-out split possible: rows from
-        one epoch come from the same games and are heavily correlated, so a
-        random split leaks. Splitting by recency does not.
-        """
         return self.gather(np.arange(self.lo, self.rows))
 
 
-def make_batch(parts, rng, device):
-    """Numpy replay batch -> two player queries over each physical row."""
-    rows, cc, cw, cy, seg, pol = parts
-    rows, seg, pol = mirror.mirror_batch(rows, seg, pol, rng.random(len(rows)) < 0.5)
-    n = len(rows)
-    x = expand_batch(rows)
-    phi = cc.astype(np.float32) / CNORM
-    t = lambda a, d=torch.float32: torch.as_tensor(a, dtype=d, device=device)
-    pa, parow, pact, pcfg, pprob = pol
-    policy = (t(pa, torch.uint8), t(parow, torch.long), t(pact, torch.long),
-              t(pcfg, torch.long), t(pprob))
-    return (t(x), t(phi), t(cw), t(seg, torch.long), t(cy), 2 * n, policy)
-
-
 def forward_values(net, parts):
-    # `nseg` is the sixth element, not the last one: a batch carries the policy
-    # target after it.
     return net(*parts[:4], parts[5])
 
 
 def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0, stats=None):
-    """Value Huber, mean per belief support and then across queries, plus the
-    policy cross-entropy Student of Games trains the second head with."""
     v = net(xpub, phi, w, seg, nseg)
     if stats is not None:
         expected = torch.zeros(nseg, dtype=v.dtype, device=v.device)
@@ -438,9 +316,6 @@ def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0, stats=None):
     total.index_add_(0, seg, per)
     count.index_add_(0, seg, torch.ones_like(per))
     loss = (total / count.clamp(min=1)).mean()
-    # `L` and `L/var` are the *value* loss, as they were before the policy head
-    # existed, so the run report still compares with every run before it. The
-    # policy term is reported beside them, never folded into them.
     if stats is not None:
         stats["value_loss"] = float(loss.detach())
     if policy is not None and wp > 0.0:
@@ -451,13 +326,7 @@ def losses(net, xpub, phi, w, seg, y, nseg, policy=None, wp=1.0, stats=None):
 
 
 def policy_loss(net, xpub, phi, weight, seg, nseg, policy, stats=None):
-    """Cross entropy of the policy head against the search's root average.
-
-    The head scores a `(config, action)` cell as `<f_p(c), e(a)>`, so the batch
-    is exactly the cells the solves stored. Each cell's softmax runs over its
-    own `(row, config)` group, which is one information state.
-    """
-    desc, parow, pact, pcfg, target = policy
+    desc, parow, pact, _pcrow, pcfg, target = policy
     if desc.shape[0] == 0 or pact.shape[0] == 0:
         return None
     cards = net.cards(xpub)
@@ -470,12 +339,8 @@ def policy_loss(net, xpub, phi, weight, seg, nseg, policy, stats=None):
     action_query.scatter_(0, pact, seg[pcfg])
     e = net.actions(desc, board, h, projected, spatial, parow, action_query)
 
-    # `pcfg` is already an index into the batch's own config arena, so the cell
-    # reads its config vector directly.
     logit = (fp[pcfg] * e[pact]).sum(1)
 
-    # One softmax per information state, over its own cells. `pcfg` is already
-    # unique across the batch, so it alone names the group.
     group = pcfg
     uniq, inv = torch.unique(group, return_inverse=True)
     top = torch.full((len(uniq),), -1e30, device=logit.device)
@@ -509,7 +374,6 @@ def policy_loss(net, xpub, phi, weight, seg, nseg, policy, stats=None):
 
 @torch.no_grad()
 def diagnostics(net, buf, probe, batch, rng, device, batch_fn, recent_frac):
-    """Held replay error, prediction spread, and outcome calibration."""
     nan = float("nan")
     out = {
         "probe_std": float(forward_values(net, probe).std()) if probe is not None else nan,
@@ -550,25 +414,10 @@ def diagnostics(net, buf, probe, batch, rng, device, batch_fn, recent_frac):
 
 def train_steps(net, opt, buf, steps, batch, rng, device,
                 recent_mix=0.0, recent_frac=0.2, profile_cuda=False,
-                batch_fn=make_batch, policy_w=0.0, deadline=None):
-    """Mean loss over up to `steps` Adam updates -- value, plus the policy
-    head's cross entropy at weight `policy_w` -- stopping between updates at
-    `deadline`."""
-    policy_metrics = (
-        "policy_loss", "policy_target_entropy", "policy_prior_entropy",
-        "policy_search_kl")
-    stat = {"sample_s": 0.0, "prepare_s": 0.0, "forward_wall_s": 0.0,
-            "backward_wall_s": 0.0, "batch_configs": 0, "steps": 0,
-            "gpu_forward_s": 0.0, "gpu_backward_s": 0.0,
-            "zero_sum_max": 0.0, "zero_sum_square_sum": 0.0,
-            "zero_sum_n": 0, "grad_clipped": 0,
-            "grad_norm_sum": 0.0, "grad_norm_max": 0.0,
-            "policy_steps": 0, "sample_ages": [], "sample_delays": [],
-            "sample_warm": 0, "sample_play": 0, "sample_query": 0,
-            "sample_warm_delay_sum": 0.0, "sample_play_delay_sum": 0.0,
-            "sample_query_delay_sum": 0.0,
-            "sample_td1_targets": 0, "sample_targets": 0,
-            **{f"{key}_sum": 0.0 for key in policy_metrics}}
+                batch_fn=None, policy_w=0.0, deadline=None):
+    stat = collections.Counter()
+    stat["sample_ages"] = []
+    stat["sample_delays"] = []
     if len(buf) < batch:
         return float("nan"), stat
     tot = 0.0
@@ -577,7 +426,6 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
     for _ in range(steps):
         if deadline is not None and time.time() >= deadline:
             break
-        ts = time.perf_counter()
         ids = buf.sample_ids(batch, rng, recent_mix, recent_frac)
         ring = ids % buf.cap
         stat["sample_ages"].append(time.time() - buf.created_at[ring])
@@ -594,17 +442,13 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
         stat["sample_td1_targets"] += 2 * int(buf.td1[ring].sum())
         stat["sample_targets"] += int(buf.clen[ring].sum())
         sampled = buf.gather(ids)
-        stat["sample_s"] += time.perf_counter() - ts
         stat["batch_configs"] += len(sampled[1])
-        ts = time.perf_counter()
         parts = batch_fn(sampled, rng, device)
-        stat["prepare_s"] += time.perf_counter() - ts
         if stream is not None:
             f0 = torch.cuda.Event(enable_timing=True)
             f1 = torch.cuda.Event(enable_timing=True)
             b1 = torch.cuda.Event(enable_timing=True)
             f0.record(stream)
-        ts = time.perf_counter()
         step_stat = {"zero_sum_max": 0.0, "zero_sum_square_sum": 0.0,
                      "zero_sum_n": 0}
         value = losses(net, *parts, wp=policy_w, stats=step_stat)
@@ -614,12 +458,10 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
         stat["zero_sum_n"] += step_stat["zero_sum_n"]
         if "policy_loss" in step_stat:
             stat["policy_steps"] += 1
-            for key in policy_metrics:
+            for key in POLICY_METRICS:
                 stat[f"{key}_sum"] += step_stat[key]
-        stat["forward_wall_s"] += time.perf_counter() - ts
         if stream is not None:
             f1.record(stream)
-        ts = time.perf_counter()
         opt.zero_grad(set_to_none=True)
         value.backward()
         grad_norm = float(nn.utils.clip_grad_norm_(net.parameters(), 5.0))
@@ -628,7 +470,6 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
         stat["grad_clipped"] += int(grad_norm > 5.0)
         opt.step()
         stat["steps"] += 1
-        stat["backward_wall_s"] += time.perf_counter() - ts
         if stream is not None:
             b1.record(stream)
             event_pairs.append((f0, f1, b1))
@@ -640,7 +481,6 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
 
 
 def ingest(buf, data, warm=False):
-    """Append one `gen_data` / farm collect dict onto the replay buffer."""
     x = np.asarray(data["rows"], np.uint8).reshape(-1, ROW_BYTES)
     cc = np.asarray(data["cc"], np.uint8).reshape(-1, CCOUNTS)
     cw = np.asarray(data["cw"], np.float32)
@@ -673,7 +513,6 @@ def ingest(buf, data, warm=False):
 
 
 def physical_cpus():
-    """Return one Linux hardware thread from each physical core."""
     cpus = set()
     root = "/sys/devices/system/cpu"
     if not os.path.isdir(root):
@@ -712,7 +551,6 @@ def last_epoch(args):
 
 
 def write_log(args, snaps):
-    """Write settings and the snapshot manifest atomically."""
     path = f"{args.out}/log.json"
     tmp = path + ".tmp"
     cfg = dataclasses.asdict(args)
@@ -807,12 +645,13 @@ def main():
         raise SystemExit(f"device must be a CUDA device, got {args.device!r}")
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is unavailable; training requires a working GPU")
-    if args.replay_ratio <= 0.0:
-        raise SystemExit("replay_ratio must be positive")
-    if args.target_every <= 0.0:
-        raise SystemExit("target_every must be positive minutes")
-    if args.gen_solves <= 0 or args.gen_workers <= 0:
-        raise SystemExit("gen_solves and resolved gen_workers must be positive")
+    for bad, why in (
+            (args.replay_ratio <= 0.0, "replay_ratio must be positive"),
+            (args.target_every <= 0.0, "target_every must be positive minutes"),
+            (args.gen_solves <= 0 or args.gen_workers <= 0,
+             "gen_solves and resolved gen_workers must be positive")):
+        if bad:
+            raise SystemExit(why)
     torch.cuda.set_device(dev)
     if args.train_stream_priority > 0:
         raise SystemExit("train_stream_priority must be zero or negative")
@@ -895,13 +734,9 @@ def main():
     sog_solves = int(progress["sog_solves"])
     probe = None
 
-    # Snapshots are also checkpoints. Evaluate packed bots separately after the
-    # run, outside the training clock.
     snaps = checkpoint["snapshots"] if checkpoint else []
 
     def snapshot(label, el):
-        # "init" and "final" are the two the reader always wants named; the rest
-        # are numbered, and the manifest carries the time each was taken at.
         path = f"{args.out}/snap_{len(snaps):04d}.pt"
         entry = {"label": label, "t": round(el, 1),
                  "file": os.path.basename(path)}
@@ -935,7 +770,6 @@ def main():
         print(f"[t={el:6.1f}s] --- snapshot {snaps[-1]['file']} ({label}) ---", flush=True)
 
     def tick(rec=None, line=None):
-        """Log one epoch if given, then snapshot if due. Both generators use this."""
         nonlocal epoch, next_snap
         if rec is not None:
             rec.setdefault("t", round(time.time() - t0, 1))
@@ -951,7 +785,6 @@ def main():
             next_snap = now - t0 + snap_gap
 
     def fit(nsteps, deadline=None):
-        """Adam updates on the shared replay. Returns (loss, wall_s, stats)."""
         if sog_t0 is not None:
             opt.param_groups[0]["lr"] = scheduled_lr(
                 args.lr, args.lr_final, time.time() - sog_t0,
@@ -967,15 +800,11 @@ def main():
         return lv, time.time() - tt, st
 
     def run_search_pipeline():
-        """Overlap small GT-CFR batches with each other and with training."""
         nonlocal probe, sog_solves, target_state
 
         deadline = t0 + total
         if time.time() >= deadline:
             return
-        # One process, one driver a card and a worker per core. A process per
-        # core could not batch inference at all: the solves have to share an
-        # address space for their leaf rows to end up in one batch.
         farm = warchest.SolveFarm(
             args.seed + 1_000_003 * progress["farm_runs"],
             args.gen_workers,
@@ -999,13 +828,8 @@ def main():
         window_shapes = []
         window_targets = []
         window_target_weights = []
-        window_sample_ages = []
-        window_sample_delays = []
-        # The farm's round counters are cumulative, so an epoch's figures are
-        # the difference against the last report and not an average since the
-        # farm started.
+        window_lists = {}
         round_at = dict.fromkeys(ROUND_KEYS, 0)
-        stage_names = warchest.stage_names()
         ent_at = [0] * 8
         next_report = time.time() + 10.0
         next_target = t0 + float(progress["next_target"])
@@ -1065,29 +889,7 @@ def main():
                 optimizer_rows += trained * args.batch
                 window["loss_sum"] += lv * trained
                 window["train_steps"] += trained
-                window["policy_steps"] += train_stat["policy_steps"]
-                for key in (
-                        "policy_loss", "policy_target_entropy", "policy_prior_entropy",
-                        "policy_search_kl"):
-                    window[f"{key}_sum"] += train_stat[f"{key}_sum"]
-                window["batch_configs"] += train_stat["batch_configs"]
-                window["gpu_forward_s"] += train_stat["gpu_forward_s"]
-                window["gpu_backward_s"] += train_stat["gpu_backward_s"]
-                window["grad_clipped"] += train_stat["grad_clipped"]
-                window["grad_norm_sum"] += train_stat["grad_norm_sum"]
-                window["grad_norm_max"] = max(
-                    window["grad_norm_max"], train_stat["grad_norm_max"])
-                for key in ("sample_warm", "sample_play", "sample_query",
-                            "sample_warm_delay_sum", "sample_play_delay_sum",
-                            "sample_query_delay_sum", "sample_td1_targets",
-                            "sample_targets"):
-                    window[key] += train_stat[key]
-                window_sample_ages.extend(train_stat["sample_ages"])
-                window_sample_delays.extend(train_stat["sample_delays"])
-                window["zero_sum_max"] = max(
-                    window["zero_sum_max"], train_stat["zero_sum_max"])
-                window["zero_sum_square_sum"] += train_stat["zero_sum_square_sum"]
-                window["zero_sum_n"] += train_stat["zero_sum_n"]
+                fold(window, window_lists, train_stat)
             window["train_s"] += train_s
 
             now = time.time()
@@ -1095,8 +897,6 @@ def main():
                 save_progress()
                 break
             if now >= next_target:
-                # The next collect finishes every old-target solve before it
-                # resumes the same game streams on these weights.
                 value.push()
                 target_state = cpu_state(value)
                 if len(buf) >= 2048:
@@ -1131,20 +931,14 @@ def main():
             belief_var = max(float(np.dot((targets - belief_mean) ** 2,
                                           target_weights) / weight_mass), 0.0)
             target_q = np.quantile(targets, [0.05, 0.5, 0.95])
-            sample_ages = (np.concatenate(window_sample_ages)
-                           if window_sample_ages else np.zeros(1))
-            sample_delays = (np.concatenate(window_sample_delays)
-                             if window_sample_delays else np.zeros(1))
+            sample_ages, sample_delays = (
+                np.concatenate(window_lists[key]) if window_lists.get(key) else np.zeros(1)
+                for key in ("sample_ages", "sample_delays"))
             replay = buf.replay_stats()
             sample_n = max(window["sample_warm"] + window["sample_play"]
                            + window["sample_query"], 1)
             policy_steps = max(int(window["policy_steps"]), 1)
-            policy = {
-                key: window[f"{key}_sum"] / policy_steps
-                for key in (
-                    "policy_loss", "policy_target_entropy", "policy_prior_entropy",
-                    "policy_search_kl")
-            }
+            policy = {key: window[f"{key}_sum"] / policy_steps for key in POLICY_METRICS}
             weight_norm = float(torch.sqrt(sum(
                 p.detach().float().square().sum() for p in value.parameters())))
             dec = max(int(window["decisions"]), 1)
@@ -1158,90 +952,44 @@ def main():
                          for k in ROUND_KEYS[1:]}
             hits = now_at["budget_hits"] - round_at["budget_hits"]
             round_at = now_at
-            leaf = warchest.leaf_breakdown()
-            leaf_breakdown = {
-                "ms_per_round": {
-                    name: round(value / rounds, 3)
-                    for name, value in zip(stage_names[:-3], leaf[:-3])
-                },
-                "bytes_per_round": {
-                    name: round(value * 1e6 / rounds)
-                    for name, value in zip(stage_names[-3:-1], leaf[-3:-1])
-                },
-            }
-            stage_line = "/".join(
-                f"{name}={value:g}"
-                for name, value in leaf_breakdown["ms_per_round"].items()
-                if value > 0)
             names = tuple(warchest.ENT_NAMES)
             now_ent = [int(x) for x in (data.get("entity_hits") or [0] * 8)]
             ent_hits = [now_ent[i] - ent_at[i] for i in range(8)]
             ent_at = now_ent
             bounds = (1, 4, 16, 64, 256, 1024, 4096, 16384, 65536)
-            if window_shapes:
-                a = np.asarray(window_shapes, np.uint32)
-                def pct(col, q):
-                    v = np.sort(a[:, col])
-                    return int(v[int(round((len(v) - 1) * q))])
-                shape = {
-                    names[i]: {
-                        "p50": pct(i, 0.50),
-                        "p90": pct(i, 0.90),
-                        "p99": pct(i, 0.99),
-                        "max": int(a[:, i].max()),
-                    }
-                    for i in range(8)
-                }
-                node_histogram = {}
-                stop_census = {}
-                for kind_id, kind in enumerate(warchest.SOLVE_KIND_NAMES):
-                    ka = a[a[:, 9] == kind_id]
-                    hist = {}
-                    for lo, hi in zip(bounds[:-1], bounds[1:]):
-                        hist[f"{lo}-{hi - 1}"] = int(
-                            ((ka[:, 0] >= lo) & (ka[:, 0] < hi)).sum())
-                    hist[f"{bounds[-1]}+"] = int((ka[:, 0] >= bounds[-1]).sum())
-                    node_histogram[kind] = hist
-                    stops = {}
-                    for stop_id, stop in enumerate(warchest.STOP_NAMES):
-                        nodes = ka[ka[:, 8] == stop_id, 0]
-                        if nodes.size:
-                            nodes.sort()
-                            stops[stop] = {
-                                "count": int(nodes.size),
-                                "node_p50": int(nodes[int(round(
-                                    (nodes.size - 1) * 0.5))]),
-                            }
-                    stop_census[kind] = stops
-            else:
-                shape = {n: {"p50": 0, "p90": 0, "p99": 0, "max": 0} for n in names}
-                empty_hist = {
-                    **{f"{lo}-{hi - 1}": 0
+            a = np.asarray(window_shapes or [[0] * 10], np.uint32)
+
+            def pct(column, q):
+                v = np.sort(column)
+                return int(v[int(round((len(v) - 1) * q))]) if v.size else 0
+
+            shape = {names[i]: {"p50": pct(a[:, i], 0.50), "p90": pct(a[:, i], 0.90),
+                                "p99": pct(a[:, i], 0.99), "max": int(a[:, i].max())}
+                     for i in range(8)}
+            node_histogram = {}
+            stop_census = {}
+            for kind_id, kind in enumerate(warchest.SOLVE_KIND_NAMES):
+                ka = a[a[:, 9] == kind_id] if window_shapes else a[:0]
+                node_histogram[kind] = {
+                    **{f"{lo}-{hi - 1}": int(((ka[:, 0] >= lo) & (ka[:, 0] < hi)).sum())
                        for lo, hi in zip(bounds[:-1], bounds[1:])},
-                    f"{bounds[-1]}+": 0,
+                    f"{bounds[-1]}+": int((ka[:, 0] >= bounds[-1]).sum()),
                 }
-                node_histogram = {
-                    k: dict(empty_hist) for k in warchest.SOLVE_KIND_NAMES}
-                stop_census = {k: {} for k in warchest.SOLVE_KIND_NAMES}
+                stop_census[kind] = {
+                    stop: {"count": int((ka[:, 8] == stop_id).sum()),
+                           "node_p50": pct(ka[ka[:, 8] == stop_id, 0], 0.5)}
+                    for stop_id, stop in enumerate(warchest.STOP_NAMES)
+                    if (ka[:, 8] == stop_id).any()}
             rec = {
                 "t": round(now - t0, 1),
                 "epoch": epoch,
                 "phase": "sog",
-                "games": int(window["games"]),
-                # Decisive against drawn, per epoch. A finished game is the
-                # earliest evidence that self-play is going anywhere at all, and
-                # a run that only ever draws is failing differently from one
-                # that never finishes a game.
-                "white_wins": int(window["white_wins"]),
-                "black_wins": int(window["black_wins"]),
-                "draws": int(window["draws"]),
-                "decisions": int(window["decisions"]),
-                "rows": int(window["rows"]),
-                "solves": int(window["solves"]),
+                **{key: int(window[key]) for key in (
+                    "games", "white_wins", "black_wins", "draws", "decisions",
+                    "rows", "solves", "query_rows", "dropped")},
                 "loss": round(lv, 5),
                 "total_loss": round(lv + args.policy_w * policy["policy_loss"], 5),
-                "loss_old": round(diag["loss_old"], 5),
-                "loss_new": round(diag["loss_new"], 5),
+                **{key: round(diag[key], 5) for key in ("loss_old", "loss_new")},
                 "zero_sum_max": round(window["zero_sum_max"], 5),
                 "zero_sum_rms": round((window["zero_sum_square_sum"]
                                         / max(window["zero_sum_n"], 1)) ** 0.5, 5),
@@ -1251,25 +999,10 @@ def main():
                 "grad_clip_frac": round(
                     window["grad_clipped"] / max(steps, 1), 4),
                 "horizon_frac": round(window["horizon_hits"] / games, 3),
-                # How many solves shared a forward pass. It should sit near the
-                # thread count; well below means the round is waiting on
-                # stragglers instead of batching them. A round carries
-                # `round_batch` regret updates, so a solve rides in ceil(64 /
-                # round_batch) rounds rather than sixty-five, and the two
-                # figures below rise with the knob: none of the three compares
-                # across a change to it.
                 "calls_per_round": round(per_round["round_calls"], 2),
                 "rows_per_round": round(per_round["round_rows"], 1),
-                # Milliseconds a round spends inside the device backend — the
-                # batch plus the concatenation and split around it. The rest of
-                # a round is CFR on the cores.
                 "device_ms_per_round": round(
                     1e-6 * per_round["round_nanos"], 2),
-                "leaf_breakdown": leaf_breakdown,
-                # Rows the query solver produced, i.e. targets taken off
-                # the line of play. Zero means the coverage path is dead.
-                "query_rows": int(window["query_rows"]),
-                "dropped": int(window["dropped"]),
                 "plays": {
                     name: int(window[f"plays_{name}"])
                     for name in (
@@ -1297,12 +1030,8 @@ def main():
                 "tgt_p50": round(float(target_q[1]), 4),
                 "tgt_p95": round(float(target_q[2]), 4),
                 "tgt_abs95_frac": round(float(np.mean(np.abs(targets) >= 0.95)), 4),
-                "probe_std": round(diag["probe_std"], 4),
-                "value_outcome_rmse": round(diag["value_outcome_rmse"], 4),
-                "value_outcome_mae": round(diag["value_outcome_mae"], 4),
-                "value_outcome_bias": round(diag["value_outcome_bias"], 4),
-                "value_outcome_corr": round(diag["value_outcome_corr"], 4),
-                "value_calibration_slope": round(diag["value_calibration_slope"], 4),
+                **{key: round(value, 4) for key, value in diag.items()
+                   if key not in ("loss_old", "loss_new")},
                 "gen_s": round(gen_s, 2),
                 "train_s": round(train_s, 2),
                 "add_s": round(window["add_s"], 2),
@@ -1359,17 +1088,13 @@ def main():
                 f"slot={rec['slot_bytes'] / (1 << 20):.1f}MiB "
                 f"hits={rec['budget_hits']} "
                 f"hit_rate={rec['budget_hit_rate']} "
-                f"stages={stage_line} "
                 f"ehits={'/'.join(str(ent_hits[i]) for i in range(8))} "
                 f"p90={'/'.join(str(shape[n]['p90']) for n in names)}")
             window.clear()
+            window_lists.clear()
             window_shapes.clear()
             window_targets.clear()
             window_target_weights.clear()
-            window_sample_ages.clear()
-            window_sample_delays.clear()
-        # Dropping the farm stops its threads once they finish the solve they
-        # are in, which is also what flushes their last rows.
         del farm
         save_progress()
 
@@ -1391,7 +1116,7 @@ def main():
           f"draft={'random' if args.random_draft else 'starter'} "
           f"replay_ratio={args.replay_ratio} "
           f"recent_mix={args.recent_mix}/{args.recent_frac} "
-          f"symmetry_augmentation=0.5 cap={args.cap} "
+          f"canonical_views=2 cap={args.cap} "
           f"matmul={torch.get_float32_matmul_precision()}", flush=True)
 
     if not checkpoint:
@@ -1439,12 +1164,11 @@ def main():
         progress["sog_start"] = sog_t0 - t0
         progress["next_target"] = (sog_t0 - t0) + args.target_every * 60.0
         progress["lr_duration"] = total - warm
-    # Keep warm rows in replay; the FIFO ages them out.
     run_search_pipeline()
 
     snapshot("final", time.time() - t0)
-    subprocess.run([sys.executable, str(ROOT / "tools" / "arena.py"),
-                    "pack", args.out, "--out", str(ROOT / "bots")], check=True)
+    subprocess.run([sys.executable, str(ROOT / "tools" / "pack.py"),
+                    args.out, "--out", str(ROOT / "bots")], check=True)
 
 
 if __name__ == "__main__":

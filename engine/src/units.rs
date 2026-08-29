@@ -1,10 +1,5 @@
-//! Unit type definitions. The site keys units by `unitTypeId`; internally we
-//! use a dense index 0..N_UNITS so zone counts are flat arrays. The Royal Coin
-//! (unitTypeId 13/14) is a unit index too so it can live in zones like any coin.
-
 pub const N_UNITS: usize = 20;
 
-// Dense internal indices. Kept stable: the Action encoding depends on them.
 pub const ARCHER: u8 = 0;
 pub const BERSERKER: u8 = 1;
 pub const CAVALRY: u8 = 2;
@@ -26,7 +21,6 @@ pub const FOOTMAN_V2: u8 = 17;
 pub const WARRIOR_PRIEST_V2: u8 = 18;
 pub const ROYAL_COIN: u8 = 19;
 
-/// Tactic kinds (the "Tactic" action dispatches on this).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tactic {
     None,
@@ -41,14 +35,9 @@ pub enum Tactic {
     RoyalGuard,
 }
 
-/// Number of `Tactic` variants; the width of the tactic one-hot in the value
-/// network's card-property block.
 pub const N_TACTICS: usize = 10;
 
 impl Tactic {
-    /// Dense index for the one-hot. Written out rather than derived so that
-    /// adding a variant is a compile error here instead of a silent feature
-    /// collision.
     #[inline]
     pub fn index(self) -> usize {
         match self {
@@ -66,18 +55,8 @@ impl Tactic {
     }
 }
 
-/// Width of one unit's card-property block: the tactic one-hot, the twelve
-/// attribute flags, the two action restrictions, and the coin count.
 pub const CARD_FEATS: usize = N_TACTICS + 12 + 2 + 1;
 
-/// Write unit `u`'s card as features: what its tactic is, which attributes it
-/// has, and how many coins of it exist.
-///
-/// These are constants of the printed card, fixed by the draft and known to
-/// both players, so they are public by construction. They exist so the network
-/// reads a unit's *rules* rather than having to infer them from an arbitrary
-/// identity code — which is what makes a draft it has never seen encodable at
-/// all, and is a prerequisite for `--random-draft`.
 pub fn write_card_features(u: u8, out: &mut [f32]) {
     debug_assert_eq!(out.len(), CARD_FEATS);
     let d = def(u);
@@ -102,17 +81,14 @@ pub fn write_card_features(u: u8, out: &mut [f32]) {
     }
     out[N_TACTICS + 12] = d.no_normal_attack as u8 as f32;
     out[N_TACTICS + 13] = d.is_royal_coin as u8 as f32;
-    // Divisor is the largest coin count on any card (5); the Royal Coin's 1
-    // lands at 0.2.
     out[N_TACTICS + 14] = d.coins as f32 / 5.0;
 }
 
 pub struct UnitDef {
-    pub id: u16, // canonical site unitTypeId (Royal Coin uses 13)
+    pub id: u16,
     pub name: &'static str,
-    pub coins: u8, // total coins of this type a player owns
+    pub coins: u8,
     pub tactic: Tactic,
-    // attribute flags
     pub berserker_v1: bool,
     pub berserker_v2: bool,
     pub knight: bool,
@@ -123,9 +99,8 @@ pub struct UnitDef {
     pub swordsman: bool,
     pub warrior_priest: bool,
     pub warrior_priest_v2: bool,
-    pub footman_v2: bool,  // recruit-instant-deploy attribute (Footman V2 only)
-    pub two_footmen: bool, // may keep two units on board (Footman / Footman V2)
-    /// Archer & Lancer cannot use the normal Attack action.
+    pub footman_v2: bool,
+    pub two_footmen: bool,
     pub no_normal_attack: bool,
     pub is_royal_coin: bool,
 }
@@ -198,8 +173,6 @@ pub static UNITS: [UnitDef; N_UNITS] = {
     a
 };
 
-/// Map a site unitTypeId to the dense internal index. 14 is the second faction's
-/// Royal Coin; it maps to the same ROYAL_COIN index (both play identically).
 pub fn index_of_id(id: u16) -> Option<u8> {
     if id == 13 || id == 14 {
         return Some(ROYAL_COIN);

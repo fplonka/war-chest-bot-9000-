@@ -1,12 +1,3 @@
-#!/usr/bin/env python3
-"""Live view of runs/, read from disk on every request.
-
-    python3 tools/monitor.py                    # http://127.0.0.1:8420
-    python3 tools/monitor.py --pull
-
-There is no generated page on disk and no regeneration step: a run in progress
-appends epochs.jsonl and renders exactly like a finished one.
-"""
 import argparse
 import glob
 import json
@@ -27,14 +18,13 @@ ASSETS = {
     "/vendor/uPlot.min.css": ("uPlot.min.css", "text/css"),
 }
 sys.path.insert(0, os.path.join(HERE, "train"))
-import config  # noqa: E402  -- knobs(), so the baseline lives in one place
+import config
 
-LIVE = 120    # an epoch log untouched for this long is not a live run
+LIVE = 120
 EPOCH_LIMIT = 2048
 
 
 def read_json(path):
-    """A complete JSON object, or None if a pull caught it mid-write."""
     try:
         with open(path) as f:
             got = json.load(f)
@@ -44,7 +34,6 @@ def read_json(path):
 
 
 def read_text(path, limit=64 << 10):
-    """The tail of a file, or "" if there is none."""
     try:
         with open(path, "rb") as f:
             f.seek(0, 2)
@@ -78,7 +67,6 @@ def last_jsonl(path):
 
 
 def read_epochs(path, limit=EPOCH_LIMIT):
-    """Read all small logs, or evenly sample a large JSONL log by byte offset."""
     if limit <= 0:
         return []
     try:
@@ -125,7 +113,6 @@ def series(label, y, smooth=False, err=None):
 
 
 def panel(title, ylabel, x, ss, zero=False, hlines=(), marks=False):
-    """Return None until at least one series has data."""
     ss = [s for s in ss if any(v is not None for v in s["y"])]
     if not ss:
         return None
@@ -145,9 +132,6 @@ PANELS = (
       ("search target", "policy_target_entropy")), True, ()),
     ("Stored search target vs current prior", "KL divergence (nats)",
      (("target KL", "policy_search_kl"),), True, ()),
-    ("Auxiliary ownership loss", "cross-entropy", (("ownership", "aux_loss"),), True, ()),
-    ("Auxiliary ownership accuracy", "fraction correct", (("ownership", "aux_acc"),),
-     True, (("chance", 1 / 3),)),
     ("Spread of predictions", "std",
      (("prediction", "probe_std"), ("target configs", "tgt_std"),
       ("belief-weighted target", "tgt_belief_std")), True, ()),
@@ -189,15 +173,12 @@ PANELS = (
     ("Gradient clipping", "fraction of steps", (("gradient clipping", "grad_clip_frac"),),
      True, ()),
     ("Replay age", "seconds retained", (("replay age", "buf_s"),), True, ()),
-    # The horizon cuts a game at 256 coin plays and scores it a draw. A rising
-    # rate means evaluation sees a game that is increasingly not real.
     ("Games cut at horizon", "fraction", (("games cut at horizon", "horizon_frac"),),
      True, ()),
 )
 
 
 def panels(eps):
-    """Every panel of the dashboard, from the SoG epochs logged so far."""
     m = [e["t"] / 60.0 for e in eps]
     out = [
         panel(title, ylabel, m,
@@ -210,9 +191,6 @@ def panels(eps):
     out.append(panel("Relative value loss", "huber / target variance", m,
                      [series("value", relative_loss, True)], zero=True))
 
-    # Two throughput lines, and the gap between them is the information.
-    # `solves_per_s` is cumulative solves over elapsed -- the run average, not
-    # the current rate -- so "now" has to come from consecutive epochs.
     now = [None]
     for a, b in zip(eps, eps[1:]):
         dt = b["t"] - a["t"]
@@ -255,9 +233,6 @@ def health(eps):
     if not eps:
         return []
     last, tot = eps[-1], lambda k: sum(e.get(k, 0) for e in eps)
-    # The last window of a run drains with no games in it, so its horizon
-    # fraction is 0.0 by definition; the run-level figure is the cumulative
-    # fraction, the same number train.py prints in its gpu-summary line.
     horizon_games = max(tot("games"), 1)
     horizon = 100 * sum(e.get("horizon_frac", 0) * e.get("games", 0)
                         for e in eps) / horizon_games
@@ -267,9 +242,6 @@ def health(eps):
            ("buffer", f"{last.get('buf', 0):,}"),
            ("dropped queries", f"{tot('dropped'):,}"),
            ("games cut at horizon", f"{horizon:.1f}%")]
-    if "aux_loss" in last:
-        out.append(("aux ownership ce / accuracy",
-                    f"{last['aux_loss']:.3f} / {last['aux_acc']:.1%}"))
     if "effective_train_ratio" in last:
         out += [("effective train ratio", f"{last['effective_train_ratio']:.3f} /solve"),
                 ("passes per row", f"{last.get('train_row_ratio', 0):.3f}"),
@@ -295,11 +267,10 @@ def health(eps):
     return out
 
 
-SUMMARY = {}   # name -> (mtime, entry): the mtime check is the whole cache
+SUMMARY = {}
 
 
 def index(runs_dir):
-    """One line per run. The epoch log mtime is the live-run signal."""
     out = []
     for path in glob.glob(os.path.join(runs_dir, "*", "log.json")):
         name = os.path.basename(os.path.dirname(path))
@@ -329,10 +300,6 @@ def detail(runs_dir, name):
     if not os.path.isdir(path):
         return None
     log = read_json(os.path.join(path, "log.json")) or {}
-    # Epochs that generated nothing are the drain at the end of a run: they
-    # report loss 0 and a handful of solves, and plotting them drags every
-    # curve to the floor in its final pixel. Large logs are sampled before
-    # parsing, so a dashboard request never loads the whole run.
     eps = [e for e in read_epochs(os.path.join(path, "epochs.jsonl"))
            if e.get("phase") == "sog" and e.get("solves", 0) > 0
            and e.get("steps", 1) > 0]
@@ -348,31 +315,6 @@ def detail(runs_dir, name):
         if val:
             out[key] = val
     return out
-
-
-def arena_summary(report):
-    """The one line that says what a report found, whichever kind it is."""
-    if report["kind"] == "ladder":
-        players = report.get("players") or [{"name": "?"}]
-        best = max(players, key=lambda p: p["elo"] if p.get("elo") is not None else -1e9)
-        return f"{len(players)} bots · {report.get('games')} games · top {best['name']}"
-    best = max(report["bots"], key=lambda b: b["rate"])
-    return (f"{len(report['bots'])} bots · {report['questions']} proven "
-            f"positions · top {best['bot']}")
-
-
-def arena_index(arena_dir):
-    """One line per report in arena/, newest first."""
-    out = []
-    for path in glob.glob(os.path.join(arena_dir, "*.json")):
-        report = read_json(path)
-        if not report or report.get("kind") not in ("ladder", "tablebase"):
-            continue
-        out.append({"name": os.path.basename(path)[:-5],
-                    "mtime": os.path.getmtime(path),
-                    "kind": report["kind"],
-                    "sub": arena_summary(report)})
-    return sorted(out, key=lambda a: -a["mtime"])
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -391,33 +333,6 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/runs":
             return self.body(json.dumps(index(self.server.runs)).encode(),
                              "application/json")
-        if route == "/api/arena":
-            return self.body(json.dumps(arena_index(self.server.arena)).encode(),
-                             "application/json")
-        if route.startswith("/api/arena/"):
-            name = unquote(route[len("/api/arena/"):])
-            got = self.safe_name(name) and read_json(
-                os.path.join(self.server.arena, name + ".json"))
-            return (self.body(json.dumps(got).encode(), "application/json")
-                    if got else self.send_error(404))
-        if route.startswith("/api/run/"):
-            name = unquote(route[len("/api/run/"):])
-            if not self.safe_name(name):
-                return self.send_error(404)
-            got = detail(self.server.runs, name)
-            return (self.body(json.dumps(got).encode(), "application/json")
-                    if got else self.send_error(404))
-        if route.startswith("/run/") and route.endswith("/train.log"):
-            name = unquote(route[len("/run/"):-len("/train.log")])
-            if not self.safe_name(name):
-                return self.send_error(404)
-            try:
-                with open(os.path.join(self.server.runs, name, "train.log"), "rb") as f:
-                    raw = f.read()
-            except OSError:
-                return self.send_error(404)
-            return self.body(raw, "text/plain; charset=utf-8")
-        self.send_error(404)
 
     @staticmethod
     def safe_name(name):
@@ -432,12 +347,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def log_message(self, *a):
-        pass          # a poll every three seconds is not news
+        pass
 
 
 def puller(dest, every=30):
-    """Keep the laptop current while serving it through box.sh."""
-    # box.sh pulls into <local dir>/runs, so hand it the parent of `dest`.
     env = os.environ.copy()
     env["WARCHEST_BOX_LOCAL_DIR"] = os.path.dirname(os.path.abspath(dest))
     command = [os.path.join(TOOLS, "box.sh"), "pull"]
@@ -449,9 +362,8 @@ def puller(dest, every=30):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap = argparse.ArgumentParser(description="Live view of runs/, read from disk on every request.")
     ap.add_argument("--runs", default=os.path.join(HERE, "runs"))
-    ap.add_argument("--arena", default=os.path.join(HERE, "arena"))
     ap.add_argument("--port", type=int, default=8420)
     ap.add_argument("--pull", action="store_true",
                     help="pull runs from the box every 30s")
@@ -460,7 +372,6 @@ def main():
         threading.Thread(target=puller, args=(args.runs,), daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     srv.runs = os.path.abspath(args.runs)
-    srv.arena = os.path.abspath(args.arena)
     print(f"[monitor] http://127.0.0.1:{args.port} · {srv.runs}", flush=True)
     srv.serve_forever()
 

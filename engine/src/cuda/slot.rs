@@ -1,85 +1,96 @@
-//! One solve's eight entities, allocated once at the budget and never grown.
-//!
-//! A slot is a `Solve`. Each entity is one allocation, `cap × nfields × 4`
-//! bytes; the per-field arrays the kernels read are views at `base + k × cap`.
-//! `reserve` / `plan` / `put` only advance a length.
 
 use std::sync::Arc;
 
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 
 use crate::board::N_HEXES;
-use crate::farm::Dst;
+use crate::contract::Dst;
 use crate::net::{C, D, JW, POOL};
 use crate::pbs::NTYPE;
 use crate::search::{Budget, Ent};
 
-use super::{err, Host, Res, HELD};
+use super::{err, Host, Res};
 
-/// One column of `struct Tree` in `kernels.cu`, in that order. Width is how
-/// many lanes the entity spends; zero means the previous pointer (avg = sum).
+const CU: &str = "const unsigned int*";
+const CF: &str = "const float*";
+const FM: &str = "float*";
+
 struct Col {
     ent: Ent,
     width: usize,
     dst: Option<Dst>,
     name: &'static str,
+    ty: &'static str,
+}
+
+pub fn tree_source() -> String {
+    let mut out = String::from("struct Tree {\n");
+    for c in &TABLE {
+        out += &format!("    {} {};\n", c.ty, c.name);
+    }
+    for tail in ["unsigned long long* seed", "unsigned long long nterm",
+                 "unsigned long long nvals", "unsigned long long step",
+                 "unsigned long long todo", "unsigned long long nexpand"] {
+        out += &format!("    {tail};\n");
+    }
+    out + "};\n"
 }
 
 const TABLE: [Col; 54] = [
-    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Kind), name: "kind" },
-    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Player), name: "player" },
-    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Exhausted), name: "exhausted" },
-    Col { ent: Ent::Node, width: 2, dst: Some(Dst::Nc), name: "nc" },
-    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Parent), name: "parent" },
-    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Roff), name: "roff" },
-    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Voff), name: "voff" },
-    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Soff), name: "soff" },
-    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Util), name: "util" },
-    Col { ent: Ent::Node, width: 1, dst: Some(Dst::ChildAt), name: "child_at" },
-    Col { ent: Ent::Node, width: 1, dst: Some(Dst::ChildN), name: "child_n" },
-    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::Child), name: "child" },
-    Col { ent: Ent::Node, width: 1, dst: Some(Dst::LegalBase), name: "legal_base" },
-    Col { ent: Ent::Reach, width: 1, dst: Some(Dst::LegalOff), name: "legal_off" },
-    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::LegalChild), name: "legal_child" },
-    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::LegalTrans), name: "legal_trans" },
-    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::CellRow), name: "cell_row" },
-    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::CellVal), name: "cell_val" },
-    Col { ent: Ent::Node, width: 1, dst: Some(Dst::RevBase), name: "rev_base" },
-    Col { ent: Ent::Reach, width: 1, dst: Some(Dst::RevStart), name: "rev_start" },
-    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::RevSrc), name: "rev_src" },
-    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::RevCell), name: "rev_cell" },
-    Col { ent: Ent::Node, width: 1, dst: Some(Dst::RvdBase), name: "rvd_base" },
-    Col { ent: Ent::Reach, width: 1, dst: Some(Dst::RvdStart), name: "rvd_start" },
-    Col { ent: Ent::Draw, width: 1, dst: Some(Dst::RvdSrc), name: "rvd_src" },
-    Col { ent: Ent::Draw, width: 1, dst: Some(Dst::RvdP), name: "rvd_p" },
-    Col { ent: Ent::Node, width: 1, dst: Some(Dst::DrawBase), name: "draw_base" },
-    Col { ent: Ent::Reach, width: 1, dst: Some(Dst::DrawStart), name: "draw_start" },
-    Col { ent: Ent::Draw, width: 1, dst: Some(Dst::DrawTo), name: "draw_to" },
-    Col { ent: Ent::Draw, width: 1, dst: Some(Dst::DrawP), name: "draw_p" },
-    Col { ent: Ent::Node, width: 1, dst: Some(Dst::LevelStart), name: "level_start" },
-    Col { ent: Ent::Node, width: 1, dst: Some(Dst::LevelNode), name: "level_node" },
-    Col { ent: Ent::Reach, width: 1, dst: None, name: "reach" },
-    Col { ent: Ent::Reach, width: 2, dst: None, name: "vals" },
-    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::Cur), name: "cur" },
-    Col { ent: Ent::Cell, width: 1, dst: None, name: "regret" },
-    Col { ent: Ent::Cell, width: 1, dst: None, name: "sum" },
-    Col { ent: Ent::Cell, width: 1, dst: None, name: "qval" },
-    Col { ent: Ent::Cell, width: 1, dst: None, name: "visits" },
-    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::Prior), name: "prior" },
-    Col { ent: Ent::Cell, width: 0, dst: None, name: "avg" },
-    Col { ent: Ent::Config, width: 2, dst: Some(Dst::Rootb), name: "rootb" },
-    Col { ent: Ent::Board, width: D, dst: None, name: "p" },
-    Col { ent: Ent::Board, width: JW, dst: None, name: "jp" },
-    Col { ent: Ent::Board, width: NTYPE * C, dst: None, name: "tokens" },
-    Col { ent: Ent::Board, width: N_HEXES * C, dst: None, name: "spatial" },
-    Col { ent: Ent::Row, width: 1, dst: None, name: "board_of" },
-    Col { ent: Ent::Config, width: D, dst: None, name: "f" },
-    Col { ent: Ent::Config, width: POOL, dst: None, name: "g" },
-    Col { ent: Ent::Config, width: D, dst: None, name: "fp" },
-    Col { ent: Ent::Cidx, width: 1, dst: None, name: "cidx" },
-    Col { ent: Ent::Row, width: 2, dst: None, name: "coff" },
-    Col { ent: Ent::Row, width: 1, dst: Some(Dst::LeafNode), name: "leaf_node" },
-    Col { ent: Ent::Row, width: 1, dst: Some(Dst::Term), name: "term" },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Kind), name: "kind", ty: CU },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Player), name: "player", ty: CU },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Exhausted), name: "exhausted", ty: CU },
+    Col { ent: Ent::Node, width: 2, dst: Some(Dst::Nc), name: "nc", ty: CU },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Parent), name: "parent", ty: CU },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Roff), name: "roff", ty: CU },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Voff), name: "voff", ty: CU },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Soff), name: "soff", ty: CU },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::Util), name: "util", ty: CF },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::ChildAt), name: "child_at", ty: CU },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::ChildN), name: "child_n", ty: CU },
+    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::Child), name: "child", ty: CU },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::LegalBase), name: "legal_base", ty: CU },
+    Col { ent: Ent::Reach, width: 1, dst: Some(Dst::LegalOff), name: "legal_off", ty: CU },
+    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::LegalChild), name: "legal_child", ty: CU },
+    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::LegalTrans), name: "legal_trans", ty: CU },
+    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::CellRow), name: "cell_row", ty: CU },
+    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::CellVal), name: "cell_val", ty: CU },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::RevBase), name: "rev_base", ty: CU },
+    Col { ent: Ent::Reach, width: 1, dst: Some(Dst::RevStart), name: "rev_start", ty: CU },
+    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::RevSrc), name: "rev_src", ty: CU },
+    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::RevCell), name: "rev_cell", ty: CU },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::RvdBase), name: "rvd_base", ty: CU },
+    Col { ent: Ent::Reach, width: 1, dst: Some(Dst::RvdStart), name: "rvd_start", ty: CU },
+    Col { ent: Ent::Draw, width: 1, dst: Some(Dst::RvdSrc), name: "rvd_src", ty: CU },
+    Col { ent: Ent::Draw, width: 1, dst: Some(Dst::RvdP), name: "rvd_p", ty: CF },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::DrawBase), name: "draw_base", ty: CU },
+    Col { ent: Ent::Reach, width: 1, dst: Some(Dst::DrawStart), name: "draw_start", ty: CU },
+    Col { ent: Ent::Draw, width: 1, dst: Some(Dst::DrawTo), name: "draw_to", ty: CU },
+    Col { ent: Ent::Draw, width: 1, dst: Some(Dst::DrawP), name: "draw_p", ty: CF },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::LevelStart), name: "level_start", ty: CU },
+    Col { ent: Ent::Node, width: 1, dst: Some(Dst::LevelNode), name: "level_node", ty: CU },
+    Col { ent: Ent::Reach, width: 1, dst: None, name: "reach", ty: FM },
+    Col { ent: Ent::Reach, width: 2, dst: None, name: "vals", ty: FM },
+    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::Cur), name: "cur", ty: FM },
+    Col { ent: Ent::Cell, width: 1, dst: None, name: "regret", ty: FM },
+    Col { ent: Ent::Cell, width: 1, dst: None, name: "sum", ty: FM },
+    Col { ent: Ent::Cell, width: 1, dst: None, name: "qval", ty: FM },
+    Col { ent: Ent::Cell, width: 1, dst: None, name: "visits", ty: FM },
+    Col { ent: Ent::Cell, width: 1, dst: Some(Dst::Prior), name: "prior", ty: FM },
+    Col { ent: Ent::Cell, width: 0, dst: None, name: "avg", ty: FM },
+    Col { ent: Ent::Config, width: 2, dst: Some(Dst::Rootb), name: "rootb", ty: CF },
+    Col { ent: Ent::Board, width: D, dst: None, name: "p", ty: CF },
+    Col { ent: Ent::Board, width: JW, dst: None, name: "jp", ty: CF },
+    Col { ent: Ent::Board, width: NTYPE * C, dst: None, name: "tokens", ty: CF },
+    Col { ent: Ent::Board, width: N_HEXES * C, dst: None, name: "spatial", ty: CF },
+    Col { ent: Ent::Row, width: 1, dst: None, name: "board_of", ty: CU },
+    Col { ent: Ent::Config, width: D, dst: None, name: "f", ty: CF },
+    Col { ent: Ent::Config, width: POOL, dst: None, name: "g", ty: CF },
+    Col { ent: Ent::Config, width: D, dst: None, name: "fp", ty: CF },
+    Col { ent: Ent::Cidx, width: 1, dst: None, name: "cidx", ty: CU },
+    Col { ent: Ent::Row, width: 2, dst: None, name: "coff", ty: CU },
+    Col { ent: Ent::Row, width: 1, dst: Some(Dst::LeafNode), name: "leaf_node", ty: CU },
+    Col { ent: Ent::Row, width: 1, dst: Some(Dst::Term), name: "term", ty: CU },
 ];
 
 pub const DESC: usize = TABLE.len() + 6;
@@ -168,7 +179,6 @@ fn dst_slot(d: Dst) -> (Ent, usize, usize) {
     unreachable!("every Dst is a Tree column")
 }
 
-/// One device array. Slot state is an `Entity`; a round's scratch is `RoundCap`.
 pub struct Arr<T> {
     pub buf: Option<CudaSlice<T>>,
     pub cap: usize,
@@ -186,22 +196,7 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
         let cap = cap.max(1);
         let mut buf = unsafe { stream.alloc::<T>(cap) }.map_err(err)?;
         stream.memset_zeros(&mut buf).map_err(err)?;
-        HELD.fetch_add(
-            (cap * std::mem::size_of::<T>()) as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
         Ok(Arr { buf: Some(buf), cap, len: 0 })
-    }
-}
-
-impl<T> Drop for Arr<T> {
-    fn drop(&mut self) {
-        if self.buf.is_some() {
-            HELD.fetch_sub(
-                (self.cap * std::mem::size_of::<T>()) as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
     }
 }
 
@@ -232,12 +227,9 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Default> 
     }
 }
 
-/// One of a solve's eight allocations: `stride × nfields` words.
 pub struct Entity {
     arr: Arr<u32>,
-    /// Words between fields in the allocation.
     stride: usize,
-    /// Logical entries the solve budget permits.
     limit: usize,
     nfields: usize,
     len: usize,
@@ -307,7 +299,7 @@ impl Entity {
         stream.memcpy_dtod(&src.slice(from..from + n), &mut fview).map_err(err)
     }
 
-    fn copy_f32_to(
+    pub fn copy_f32_to(
         &self,
         stream: &Arc<CudaStream>,
         field: usize,
@@ -326,7 +318,7 @@ impl Entity {
         stream.memcpy_dtod(&src, &mut dst.slice_mut(to..to + n)).map_err(err)
     }
 
-    fn get_f32(
+    pub fn get_f32(
         &self,
         stream: &Arc<CudaStream>,
         field: usize,
@@ -345,11 +337,7 @@ impl Entity {
     }
 }
 
-/// Everything one solve keeps on its card.
 pub struct Solve {
-    /// Completion of the last round that used this slot. Either pipeline may
-    /// run the next round, so its stream waits on this before touching an
-    /// arena and records it again before returning the round.
     pub ready: cudarc::driver::CudaEvent,
     pub ent: [Entity; 8],
     pub host_coff: Vec<u32>,
@@ -377,9 +365,6 @@ impl Solve {
                 Entity::with_cap(s, b.cap(Ent::Cell), FIELDS[Ent::Cell as usize])?,
                 Entity::with_cap(s, b.cap(Ent::Reach), FIELDS[Ent::Reach as usize])?,
                 Entity::with_cap(s, b.cap(Ent::Draw), FIELDS[Ent::Draw as usize])?,
-                // `coff` has a final offset after its two entries per row.
-                // Give that offset its own word instead of letting it land in
-                // the following `leaf_node` field at the row limit.
                 Entity::with_stride(
                     s,
                     b.cap(Ent::Row),
@@ -405,7 +390,6 @@ impl Solve {
         })
     }
 
-    /// The one device-side guard. False in the error when `n` misses the slot.
     pub fn reserve(&mut self, e: Ent, n: usize) -> Res<()> {
         let a = &mut self.ent[e as usize];
         if n > a.limit {
@@ -442,18 +426,8 @@ impl Solve {
         Ok(())
     }
 
-    pub fn census(&self) -> Vec<(&'static str, usize)> {
-        let mut v: Vec<_> = Ent::ALL
-            .iter()
-            .map(|&e| (e.name(), self.ent[e as usize].bytes()))
-            .collect();
-        v.push(("seed", self.seed.cap * 8));
-        v.sort_by_key(|&(_, b)| std::cmp::Reverse(b));
-        v
-    }
-
     pub fn bytes(&self) -> usize {
-        self.census().iter().map(|&(_, b)| b).sum()
+        self.ent.iter().map(Entity::bytes).sum::<usize>() + self.seed.cap * 8
     }
 
     pub fn copy_board(
@@ -500,31 +474,6 @@ impl Solve {
     pub fn plan(&mut self, s: &Arc<CudaStream>, d: Dst, at: usize, n: usize) -> Res<u64> {
         let (e, field, width) = dst_slot(d);
         self.view(s, e, field, at, n, width)
-    }
-
-    pub fn copy_f32_to(
-        &self,
-        s: &Arc<CudaStream>,
-        e: Ent,
-        field: usize,
-        at: usize,
-        dst: &mut CudaSlice<f32>,
-        to: usize,
-        n: usize,
-    ) -> Res<()> {
-        self.ent[e as usize].copy_f32_to(s, field, at, dst, to, n)
-    }
-
-    pub fn get_f32(
-        &self,
-        s: &Arc<CudaStream>,
-        e: Ent,
-        field: usize,
-        at: usize,
-        n: usize,
-        host: &mut Host<f32>,
-    ) -> Res<Vec<f32>> {
-        self.ent[e as usize].get_f32(s, field, at, n, host)
     }
 
     pub fn describe(&self, s: &Arc<CudaStream>) -> [u64; DESC] {

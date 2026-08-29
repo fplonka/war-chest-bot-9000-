@@ -3,14 +3,10 @@ name = "warchest-engine"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.78"
-# CPU solver suites are unit modules so their reference oracle is available
-# under `cfg(test)`. The rules and CUDA parity suites are explicit targets below.
 autotests = false
 
 [lib]
 name = "warchest"
-# cdylib for the python extension module, rlib so the bench binary and tests
-# can link the pure-rust API.
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
@@ -19,28 +15,18 @@ numpy = { version = "0.21", optional = true }
 rayon = "1.10"
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
-# Dynamic loading means no CUDA toolkit at build time, and NVRTC compiles the
-# kernels at startup, so the crate still builds where there is no GPU.
 cudarc = { version = "0.17", optional = true, default-features = false, features = ["cuda-version-from-build-system", "dynamic-loading", "driver", "nvrtc", "cublas"] }
 serde_json = "1"
 
 [features]
 default = []
 python = ["pyo3", "numpy"]
-# Phase timers inside the generation loop; adds ~5% overhead.
-prof = []
+
 gpu = ["dep:cudarc"]
 
 [[bin]]
-name = "bench"
-path = "src/bin/bench.rs"
-
-
-# The arena bot. Archived per experiment, so it is built on its own and copied
-# into the bot's directory rather than run from `target/`.
-[[bin]]
-name = "bot"
-path = "src/bin/bot.rs"
+name = "ladder"
+path = "src/bin/ladder.rs"
 required-features = ["gpu"]
 
 [[test]]

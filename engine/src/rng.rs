@@ -1,19 +1,16 @@
-//! Tiny deterministic PRNG (xorshift64*). Used ONLY by the benchmark binary and
-//! the test suite to pick uniformly among legal actions. The engine core never
-//! calls it: all randomness enters the game through chance-node actions.
-
 pub struct Rng(pub u64);
+
+impl Default for Rng {
+    fn default() -> Rng {
+        Rng::new(0)
+    }
+}
 
 impl Rng {
     pub fn new(seed: u64) -> Rng {
-        // xorshift64* is stuck at zero, so never start there.
         let s = seed ^ 0x9E3779B97F4A7C15;
         Rng(if s == 0 { 0xDEADBEEFCAFEF00D } else { s })
     }
-    pub fn fork(&self, domain: u64) -> Rng {
-        Rng::new(self.0 ^ domain)
-    }
-
     #[inline]
     pub fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
@@ -30,7 +27,6 @@ impl Rng {
 
     #[inline]
     pub fn unit_f64(&mut self) -> f64 {
-        // Top 53 bits map exactly into [0, 1), matching f64 mantissa width.
         ((self.next_u64() >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))
     }
 

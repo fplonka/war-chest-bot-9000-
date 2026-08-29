@@ -1,10 +1,3 @@
-"""Host check: gathered policy cells index inside the batch arenas.
-
-A 16k-row burst is what train30f added when the horizon wave landed. After
-that write, every live row's `pcfg` / `pact` must sit inside the batch it
-builds. The same check covers a fat write that used to wrap the cell ring
-over still-live thin rows: those thin rows must have been retired.
-"""
 import os
 import sys
 
@@ -42,8 +35,8 @@ def dump(n, ncfg, na, ncells):
 
 
 def check(buf, ids):
-    _x, cc, _cw, _cy, _seg, pol = buf.gather(ids)
-    pa, _parow, pact, pcfg, _pp = pol
+    _x, cc, _cp, _cw, _cy, _seg, pol = buf.gather(ids)
+    pa, pact, _pcrow, pcfg, _pp, _parow = pol
     n_cfg, n_act = len(cc), len(pa)
     assert pcfg.size == 0 or int(pcfg.max()) < n_cfg, (int(pcfg.max()), n_cfg)
     assert pact.size == 0 or int(pact.max()) < n_act, (int(pact.max()), n_act)

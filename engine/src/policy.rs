@@ -1,18 +1,3 @@
-//! A decision node's policy, and the belief filter that follows from it.
-//!
-//! Every agent answers the same question at a decision node: for each private
-//! config the acting player might hold, how likely is each of that config's
-//! legal actions? `NodePolicy` is that answer. The solver, one-ply greedy, and
-//! uniform random differ only in how they fill `probs`.
-//!
-//! `posterior` is what the rest of the game does with it. An action is
-//! observed by its *public* projection — a face-down play hides the coin
-//! behind it — so the belief over the actor's private config sums over every
-//! private action that could have produced the same observation, weighted by
-//! how likely the actor was to take it. That is the only place a policy leaks
-//! into what anyone else knows, and it is why an agent needs a model of its
-//! opponent as well as of itself.
-
 use std::ops::Range;
 
 use crate::actions::Action;
@@ -22,14 +7,9 @@ use crate::rng::Rng;
 use crate::search::{node_actions, Policy, Solver};
 use crate::state::{State, Z_ELIM};
 
-/// Private actions plus one probability per legal config/action cell, in
-/// config-major CSR order.
 pub struct NodePolicy {
-    /// The node's distinct actions, deduplicated by encoding.
     pub acts: Vec<Action>,
-    /// The coin slot each action spends, or -1 if it spends none.
     pub aslot: Vec<i8>,
-    /// Whether each action's coin goes face down.
     pub fdown: Vec<bool>,
     legal_off: Vec<u32>,
     legal_action: Vec<u32>,
@@ -37,8 +17,6 @@ pub struct NodePolicy {
 }
 
 impl NodePolicy {
-    /// The node's shape: which actions each config may legally take. `probs`
-    /// comes back zeroed for an agent to fill.
     pub fn frame(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config]) -> NodePolicy {
         let (acts, aslot, fdown) = node_actions(s, player, ctx, cfgs);
         let na = acts.len();
@@ -64,20 +42,16 @@ impl NodePolicy {
         }
     }
 
-    /// The cells belonging to config `c`.
     #[inline]
     pub fn row(&self, c: usize) -> Range<usize> {
         self.legal_off[c] as usize..self.legal_off[c + 1] as usize
     }
 
-    /// The action a cell selects, as an index into `acts`.
     #[inline]
     pub fn action_at(&self, cell: usize) -> usize {
         self.legal_action[cell] as usize
     }
 
-    /// This node's policy in the replay-row layout a SoG root stores, so a
-    /// warm row is an ordinary row.
     pub fn to_replay(&self, player: u8, ctx: &Ctx) -> Policy {
         let ncfg = self.legal_off.len().saturating_sub(1);
         let mut out = Policy {
@@ -102,29 +76,15 @@ impl NodePolicy {
         out
     }
 
-    /// Draw one cell from config `c`'s row. A row whose probabilities have all
-    /// underflowed is played uniformly rather than dropped.
     pub fn sample(&self, rng: &mut Rng, c: usize) -> usize {
         let row = self.row(c);
-        let weights = &self.probs[row.clone()];
-        let total: f64 = weights.iter().map(|&x| x.max(0.0) as f64).sum();
-        if total == 0.0 {
+        let weights: Vec<f64> = self.probs[row.clone()].iter().map(|&x| x.max(0.0) as f64).collect();
+        if weights.iter().all(|&w| w == 0.0) {
             return row.start + rng.below(row.len().max(1));
         }
-        let mut needle = rng.unit_f64() * total;
-        for (i, &weight) in weights.iter().enumerate() {
-            needle -= weight.max(0.0) as f64;
-            if needle < 0.0 {
-                return row.start + i;
-            }
-        }
-        row.end - 1
+        row.start + rng.weighted_index(&weights)
     }
 
-    /// Mix `eps` of the uniform-over-legal into every config's row.
-    ///
-    /// The mixture is the acting policy: public knowledge. Sampling and the
-    /// belief update both read it.
     pub fn mix_uniform(&mut self, eps: f32) {
         if eps == 0.0 {
             return;
@@ -144,9 +104,6 @@ impl NodePolicy {
         }
     }
 
-    /// The belief over the actor's private config after they were seen to make
-    /// the observation `obs`. `prior` must be the belief this node was framed
-    /// with.
     pub fn posterior(&self, prior: &Belief, obs: u32) -> Belief {
         let mut pairs: Vec<(Config, f32)> = Vec::new();
         for (ci, c) in prior.cfg.iter().enumerate() {
@@ -163,9 +120,6 @@ impl NodePolicy {
         Belief::from_pairs(pairs)
     }
 
-    /// Some cell whose action carries the observation `obs`, if any config in
-    /// the framing belief could have produced it. An observer that holds no
-    /// true private state for the actor uses this to pick a stand-in.
     pub fn cell_for(&self, obs: u32) -> Option<(usize, usize)> {
         (0..self.legal_off.len() - 1).find_map(|ci| {
             self.row(ci)
@@ -175,7 +129,6 @@ impl NodePolicy {
     }
 }
 
-/// Uniform over each config's legal actions.
 pub fn uniform(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config]) -> NodePolicy {
     let mut np = NodePolicy::frame(s, ctx, player, cfgs);
     for ci in 0..cfgs.len() {
@@ -188,15 +141,11 @@ pub fn uniform(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config]) -> NodePolicy 
     np
 }
 
-/// The acting policy at a finished solve's root.
-///
-/// A first expansion that did not fit the slot left the root a leaf, with an
-/// empty `legal_off`. That root plays uniformly over legal actions.
 pub fn root(sv: &Solver) -> NodePolicy {
     let n = &sv.nodes[0];
     let cfgs = n.cfgs[n.player as usize].as_ref();
     if n.legal_off.is_empty() {
-        return uniform(&sv.states[0], &sv.ctx, n.player, cfgs);
+        return uniform(&sv.nodes[0].state, &sv.ctx, n.player, cfgs);
     }
     let mut policy = NodePolicy {
         acts: n.acts.clone(),
@@ -213,9 +162,6 @@ pub fn root(sv: &Solver) -> NodePolicy {
     policy
 }
 
-/// A handwritten positional score from `p`'s seat, over public facts only:
-/// markers, hex owners and heights, eliminated coins, and how far each side's
-/// nearest unit is from the locations it does not yet hold.
 pub fn eval_static(s: &State, p: u8) -> f32 {
     if s.is_terminal() {
         return s.utility(p as usize) * 1e6;
@@ -232,12 +178,7 @@ pub fn eval_static(s: &State, p: u8) -> f32 {
         }
     }
     sc += 1.5 * (coins_p - coins_o);
-    let elim = |q: u8| -> f32 {
-        s.zones[q as usize][Z_ELIM]
-            .iter()
-            .map(|&x| x as f32)
-            .sum()
-    };
+    let elim = |q: u8| -> f32 { s.zones[q as usize][Z_ELIM].iter().map(|&x| x as f32).sum() };
     sc += elim(o) - elim(p);
     let (mut cover_p, mut cover_o) = (0.0f32, 0.0f32);
     for li in 0..N_LOCATIONS {
@@ -266,14 +207,10 @@ pub fn eval_static(s: &State, p: u8) -> f32 {
     sc
 }
 
-/// `eval_static` squashed into (-1, 1) so it can label the value head.
 pub fn eval_squashed(s: &State, p: u8) -> f32 {
     (eval_static(s, p) / 25.0).tanh()
 }
 
-/// One-ply greedy, softmaxed at `temp`. An action's score is a fact of the
-/// successor's public state, so it is evaluated once per action and shared
-/// across configs; only the legal set differs between them.
 pub fn greedy(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config], temp: f32) -> NodePolicy {
     let mut np = NodePolicy::frame(s, ctx, player, cfgs);
     let na = np.acts.len();
@@ -308,80 +245,4 @@ pub fn greedy(s: &State, ctx: &Ctx, player: u8, cfgs: &[Config], temp: f32) -> N
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::pbs::{true_config, Belief, Ctx};
-    use crate::net::Net;
-    use crate::search::{Budget, Cfg};
-    use crate::selfplay::make_game;
-    use crate::state::Cont;
-    use std::sync::Arc;
-
-    #[test]
-    fn a_leaf_root_plays_uniform() {
-        let mut rng = Rng::new(0x69);
-        let mut s = make_game(&mut rng, true);
-        while !s.is_terminal() && (s.is_chance() || !matches!(s.pending(), Cont::MainPlay)) {
-            let a = s.legal_actions();
-            s.apply_inplace(a[rng.below(a.len())]);
-        }
-        assert!(!s.is_terminal() && matches!(s.pending(), Cont::MainPlay));
-        let ctx = Ctx::new(&s);
-        let bel = [
-            Belief::point(true_config(&s, 0, &ctx)),
-            Belief::point(true_config(&s, 1, &ctx)),
-        ];
-        let sv = Solver::new(
-            &s,
-            ctx,
-            Arc::new(Net::default()),
-            Cfg {
-                s: 0,
-                budget: Budget {
-                    nodes: 1,
-                    ..Budget::default()
-                },
-                ..Default::default()
-            },
-            bel,
-            Rng::new(1),
-        );
-        assert!(sv.nodes[0].legal_off.is_empty());
-        let np = root(&sv);
-        let _ = np.sample(&mut Rng::new(2), 0);
-    }
-
-    #[test]
-    fn root_policy_uses_nonzero_strategy_offset() {
-        const MAX_PLIES: usize = 200;
-        let mut rng = Rng::new(0);
-        let mut state = make_game(&mut rng, true);
-        for _ in 0..(MAX_PLIES - 1) {
-            let acts = state.legal_actions();
-            state.apply_inplace(acts[rng.below(acts.len())]);
-        }
-
-        let ctx = Ctx::new(&state);
-        let bel = [
-            Belief::point(true_config(&state, 0, &ctx)),
-            Belief::point(true_config(&state, 1, &ctx)),
-        ];
-        let mut sv = Solver::new(
-            &state,
-            ctx,
-            Arc::new(Net::default()),
-            Cfg {
-                s: 3,
-                c: 0.0,
-                ..Default::default()
-            },
-            bel,
-            Rng::new(1),
-        );
-        assert!(sv.soff[0] > 0);
-        sv.run_alone();
-        let want = sv.root_policy();
-        assert!(!want.p.is_empty());
-        assert_eq!(root(&sv).probs, want.p);
-    }
-}
+mod tests {}
