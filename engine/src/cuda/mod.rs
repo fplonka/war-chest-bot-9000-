@@ -823,11 +823,9 @@ impl Gpu {
             .map_err(err)? as usize;
         let trunk_blocks = (sm_shared / TRUNK_SHARED).max(1);
         let (major, minor) = ctx.compute_capability().map_err(err)?;
-        let ptx = compile_ptx_with_opts(
-            KERNELS,
-            compile_options(major, minor, trunk_blocks),
-        )
-        .map_err(|e| format!("nvrtc: {e:?}"))?;
+        let source = slot::tree_source() + KERNELS;
+        let ptx = compile_ptx_with_opts(&source, compile_options(major, minor, trunk_blocks))
+            .map_err(|e| format!("nvrtc: {e:?}"))?;
         let module = ctx.load_module(ptx).map_err(err)?;
         let k = Kernels::load(&module)?;
         k.trunk

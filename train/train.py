@@ -33,6 +33,18 @@ ACT_BYTES = warchest.ACT_BYTES
 NSLOT = warchest.NSLOT
 
 ROUND_KEYS = ("rounds", "round_calls", "round_rows", "round_nanos", "budget_hits")
+POLICY_METRICS = ("policy_loss", "policy_target_entropy", "policy_prior_entropy",
+                  "policy_search_kl")
+
+
+def fold(window, lists, stat):
+    for key, value in stat.items():
+        if isinstance(value, list):
+            lists.setdefault(key, []).extend(value)
+        elif key.endswith("_max"):
+            window[key] = max(window[key], value)
+        else:
+            window[key] += value
 
 
 def scheduled_lr(initial, final, elapsed, duration, stable_frac):
@@ -403,21 +415,9 @@ def diagnostics(net, buf, probe, batch, rng, device, batch_fn, recent_frac):
 def train_steps(net, opt, buf, steps, batch, rng, device,
                 recent_mix=0.0, recent_frac=0.2, profile_cuda=False,
                 batch_fn=None, policy_w=0.0, deadline=None):
-    policy_metrics = (
-        "policy_loss", "policy_target_entropy", "policy_prior_entropy",
-        "policy_search_kl")
-    stat = {"sample_s": 0.0, "prepare_s": 0.0, "forward_wall_s": 0.0,
-            "backward_wall_s": 0.0, "batch_configs": 0, "steps": 0,
-            "gpu_forward_s": 0.0, "gpu_backward_s": 0.0,
-            "zero_sum_max": 0.0, "zero_sum_square_sum": 0.0,
-            "zero_sum_n": 0, "grad_clipped": 0,
-            "grad_norm_sum": 0.0, "grad_norm_max": 0.0,
-            "policy_steps": 0, "sample_ages": [], "sample_delays": [],
-            "sample_warm": 0, "sample_play": 0, "sample_query": 0,
-            "sample_warm_delay_sum": 0.0, "sample_play_delay_sum": 0.0,
-            "sample_query_delay_sum": 0.0,
-            "sample_td1_targets": 0, "sample_targets": 0,
-            **{f"{key}_sum": 0.0 for key in policy_metrics}}
+    stat = collections.Counter()
+    stat["sample_ages"] = []
+    stat["sample_delays"] = []
     if len(buf) < batch:
         return float("nan"), stat
     tot = 0.0
@@ -463,7 +463,7 @@ def train_steps(net, opt, buf, steps, batch, rng, device,
         stat["zero_sum_n"] += step_stat["zero_sum_n"]
         if "policy_loss" in step_stat:
             stat["policy_steps"] += 1
-            for key in policy_metrics:
+            for key in POLICY_METRICS:
                 stat[f"{key}_sum"] += step_stat[key]
         stat["forward_wall_s"] += time.perf_counter() - ts
         if stream is not None:
@@ -835,8 +835,7 @@ def main():
         window_shapes = []
         window_targets = []
         window_target_weights = []
-        window_sample_ages = []
-        window_sample_delays = []
+        window_lists = {}
         round_at = dict.fromkeys(ROUND_KEYS, 0)
         ent_at = [0] * 8
         next_report = time.time() + 10.0
@@ -897,29 +896,7 @@ def main():
                 optimizer_rows += trained * args.batch
                 window["loss_sum"] += lv * trained
                 window["train_steps"] += trained
-                window["policy_steps"] += train_stat["policy_steps"]
-                for key in (
-                        "policy_loss", "policy_target_entropy", "policy_prior_entropy",
-                        "policy_search_kl"):
-                    window[f"{key}_sum"] += train_stat[f"{key}_sum"]
-                window["batch_configs"] += train_stat["batch_configs"]
-                window["gpu_forward_s"] += train_stat["gpu_forward_s"]
-                window["gpu_backward_s"] += train_stat["gpu_backward_s"]
-                window["grad_clipped"] += train_stat["grad_clipped"]
-                window["grad_norm_sum"] += train_stat["grad_norm_sum"]
-                window["grad_norm_max"] = max(
-                    window["grad_norm_max"], train_stat["grad_norm_max"])
-                for key in ("sample_warm", "sample_play", "sample_query",
-                            "sample_warm_delay_sum", "sample_play_delay_sum",
-                            "sample_query_delay_sum", "sample_td1_targets",
-                            "sample_targets"):
-                    window[key] += train_stat[key]
-                window_sample_ages.extend(train_stat["sample_ages"])
-                window_sample_delays.extend(train_stat["sample_delays"])
-                window["zero_sum_max"] = max(
-                    window["zero_sum_max"], train_stat["zero_sum_max"])
-                window["zero_sum_square_sum"] += train_stat["zero_sum_square_sum"]
-                window["zero_sum_n"] += train_stat["zero_sum_n"]
+                fold(window, window_lists, train_stat)
             window["train_s"] += train_s
 
             now = time.time()
@@ -961,20 +938,14 @@ def main():
             belief_var = max(float(np.dot((targets - belief_mean) ** 2,
                                           target_weights) / weight_mass), 0.0)
             target_q = np.quantile(targets, [0.05, 0.5, 0.95])
-            sample_ages = (np.concatenate(window_sample_ages)
-                           if window_sample_ages else np.zeros(1))
-            sample_delays = (np.concatenate(window_sample_delays)
-                             if window_sample_delays else np.zeros(1))
+            sample_ages, sample_delays = (
+                np.concatenate(window_lists[key]) if window_lists.get(key) else np.zeros(1)
+                for key in ("sample_ages", "sample_delays"))
             replay = buf.replay_stats()
             sample_n = max(window["sample_warm"] + window["sample_play"]
                            + window["sample_query"], 1)
             policy_steps = max(int(window["policy_steps"]), 1)
-            policy = {
-                key: window[f"{key}_sum"] / policy_steps
-                for key in (
-                    "policy_loss", "policy_target_entropy", "policy_prior_entropy",
-                    "policy_search_kl")
-            }
+            policy = {key: window[f"{key}_sum"] / policy_steps for key in POLICY_METRICS}
             weight_norm = float(torch.sqrt(sum(
                 p.detach().float().square().sum() for p in value.parameters())))
             dec = max(int(window["decisions"]), 1)
@@ -1160,11 +1131,10 @@ def main():
                 f"ehits={'/'.join(str(ent_hits[i]) for i in range(8))} "
                 f"p90={'/'.join(str(shape[n]['p90']) for n in names)}")
             window.clear()
+            window_lists.clear()
             window_shapes.clear()
             window_targets.clear()
             window_target_weights.clear()
-            window_sample_ages.clear()
-            window_sample_delays.clear()
         del farm
         save_progress()
 

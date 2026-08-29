@@ -469,69 +469,6 @@ __global__ void k_scatter(const unsigned int* blob, unsigned int* const* dst,
 }
 
 
-struct Tree {
-    const unsigned int* kind;
-    const unsigned int* player;
-    const unsigned int* exhausted;
-    const unsigned int* nc;
-    const unsigned int* parent;
-    const unsigned int* roff;
-    const unsigned int* voff;
-    const unsigned int* soff;
-    const float* util;
-    const unsigned int* child_at;
-    const unsigned int* child_n;
-    const unsigned int* child;
-    const unsigned int* legal_base;
-    const unsigned int* legal_off;
-    const unsigned int* legal_child;
-    const unsigned int* legal_trans;
-    const unsigned int* cell_row;
-    const unsigned int* cell_val;
-    const unsigned int* rev_base;
-    const unsigned int* rev_start;
-    const unsigned int* rev_src;
-    const unsigned int* rev_cell;
-    const unsigned int* rvd_base;
-    const unsigned int* rvd_start;
-    const unsigned int* rvd_src;
-    const float* rvd_p;
-    const unsigned int* draw_base;
-    const unsigned int* draw_start;
-    const unsigned int* draw_to;
-    const float* draw_p;
-    const unsigned int* level_start;
-    const unsigned int* level_node;
-    float* reach;
-    float* vals;
-    float* cur;
-    float* regret;
-    float* sum;
-    float* qval;
-    float* visits;
-    float* prior;
-    float* avg;
-    const float* rootb;
-    const float* p;
-    const float* jp;
-    const float* tokens;
-    const float* spatial;
-    const unsigned int* board_of;
-    const float* f;
-    const float* g;
-    const float* fp;
-    const unsigned int* cidx;
-    const unsigned int* coff;
-    const unsigned int* leaf_node;
-    const unsigned int* term;
-    unsigned long long* seed;
-    unsigned long long nterm;
-    unsigned long long nvals;
-    unsigned long long step;
-    unsigned long long todo;
-    unsigned long long nexpand;
-};
-
 __device__ __forceinline__ float cfr_factor(float t, float p) {
     if (isinf(p)) return p > 0.0f ? 1.0f : 0.0f;
     float x = powf(t, p);
