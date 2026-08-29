@@ -94,7 +94,7 @@ fn norm_widths() -> Vec<usize> {
     let mut v: Vec<usize> = (0..BLOCKS).flat_map(|_| [C, C]).collect();
     v.push(C);
     v.push(CFGH);
-    v.extend(std::iter::repeat(JW).take(JBLOCKS));
+    v.extend(std::iter::repeat_n(JW, JBLOCKS));
     v.push(JW);
     v.push(D);
     v.push(AW);

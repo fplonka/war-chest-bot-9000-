@@ -350,8 +350,8 @@ fn expand_rows_cuda(
 ) -> PyResult<()> {
     #[cfg(feature = "gpu")]
     {
-        return crate::cuda::expand_rows_torch(rows, cards, locations, out, n, stream, device)
-            .map_err(pyo3::exceptions::PyRuntimeError::new_err);
+        crate::cuda::expand_rows_torch(rows, cards, locations, out, n, stream, device)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
     #[cfg(not(feature = "gpu"))]
     {

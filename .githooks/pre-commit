@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(git rev-parse --show-toplevel)
+gitdir=$(git rev-parse --absolute-git-dir)
+waiver="$gitdir/WHY-THIS-CHANGE-IS-DEFINITELY-ALREADY-AS-SIMPLE-AS-POSSIBLE.md"
+before="$gitdir/loc-before"
+code=('*.rs' '*.py' '*.cu' '*.cuh')
+
+command -v uv >/dev/null || { echo "pre-commit needs uv: brew install uv"; exit 1; }
+staged=$(git diff --cached --name-only --diff-filter=ACM -- "${code[@]}")
+[ -n "$staged" ] || exit 0
+
+uv run -q --python 3.13 --with tree-sitter-language-pack "$root/tools/nocomments.py" $staged
+
+if grep -q '\.rs$' <<<"$staged"; then
+    command -v nvcc >/dev/null || export CUDARC_CUDA_VERSION=12080
+    cargo clippy -q --manifest-path "$root/engine/Cargo.toml" --all-targets --features gpu,python --message-format=short
+    machete=$(cargo machete "$root/engine" 2>&1) || { echo "$machete"; exit 1; }
+fi
+if grep -q '\.py$' <<<"$staged"; then
+    uv run -q --python 3.13 --with vulture vulture --min-confidence 80 "$root/train" "$root/tools" "$root/gpu_ci.py"
+fi
+
+stat=$(git diff --cached --numstat -- "${code[@]}")
+net=$(awk '$1 != "-" { a += $1; d += $2 } END { print a - d + 0 }' <<<"$stat")
+[ "$net" -gt 0 ] || { rm -f "$before"; exit 0; }
+[ -s "$waiver" ] && exit 0
+[ -f "$before" ] || echo "$net" >"$before"
+
+cat >&2 <<MSG
+BLOCKED: this commit adds $net lines of code.$([ "$(cat "$before")" != "$net" ] && printf ' It was %s at the first block.' "$(cat "$before")")
+
+$(awk '$1 != "-" { printf "  %-40s +%-6s -%s\n", $3, $1, $2 }' <<<"$stat")
+
+Step back and simplify. Is there a version of this change that deletes code
+instead of adding it? A module should be deep: a simple interface over a lot
+of implementation. A new flag, mode, branch or wrapper is the shallow answer,
+and it is almost never the only one available.
+
+Run this now and hold your diff to it:
+
+  curl -s https://raw.githubusercontent.com/cursor/plugins/refs/heads/main/cursor-team-kit/skills/thermo-nuclear-code-quality-review/SKILL.md
+
+If the growth is still necessary after you have actually simplified, write why in
+
+  $waiver
+
+The commit consumes that file and copies its text into the commit message,
+above a line reading
+
+  Lines: +$(cat "$before") -> +<whatever the count is when you commit>
+
+so the pass you did, or did not do, is recorded in the history either way.
+MSG
+exit 1

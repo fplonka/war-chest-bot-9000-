@@ -400,7 +400,6 @@ impl State {
     }
 
     #[inline]
-
     pub fn total_coins(&self, p: u8, unit: usize) -> u8 {
         let mut n = 0u8;
         for z in 0..N_ZONES {

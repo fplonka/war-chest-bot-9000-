@@ -8,7 +8,6 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(HERE, "tools")

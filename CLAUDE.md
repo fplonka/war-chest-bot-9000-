@@ -1,6 +1,6 @@
 Write simple prose, inspired by ASD-STE100. Be **extremely concise**, max three paragraphs in any given response.
 
-Write simple code. Never do something hacky or janky or anything like that to make something work. We must always do the idiomatic, simple, elegant, performant thing. Delete code ruthlessly, don't preserve old paths, and in features you implement do so by rearchitecturing the system so it's as if it did the right thing from the very start, instead of patching. Remove LoC ruthlessly.
+Write simple code. Never do something hacky or janky or anything like that to make something work. We must always do the idiomatic, simple, elegant, performant thing. Delete code ruthlessly, don't preserve old paths, and in features you implement do so by rearchitecturing the system so it's as if it did the right thing from the very start, instead of patching. Remove LoC ruthlessly. No comments in code, ever.
 
 There's no need to try to be impressive or flashy. We're working on this project together to get something which works well, that's all.
 

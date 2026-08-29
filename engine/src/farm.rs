@@ -133,8 +133,11 @@ struct Job {
     data: Data,
 }
 
+type JobQueue = Arc<Queue<(Job, Vec<Call>)>>;
+type BackQueue = Arc<Queue<(Back, Vec<Call>)>>;
+
 pub struct Farm {
-    device: Vec<Arc<Queue<(Job, Vec<Call>)>>>,
+    device: Vec<JobQueue>,
     ready: Arc<Queue<Job>>,
     #[cfg(feature = "gpu")]
     cuda: Arc<RwLock<Device>>,
@@ -197,7 +200,7 @@ impl Farm {
         let slots_per_card = cuda.slots_per_card();
         let nets = Arc::new(RwLock::new(Arc::clone(&net)));
         let ready = Arc::new(Queue::default());
-        let device: Vec<Arc<Queue<(Job, Vec<Call>)>>> =
+        let device: Vec<JobQueue> =
             (0..gpus).map(|_| Arc::new(Queue::default())).collect();
         let collected = Arc::new(Mutex::new(Vec::new()));
         let retired = Arc::new(Mutex::new(Vec::new()));
@@ -362,7 +365,7 @@ impl Drop for Farm {
 
 fn advance_job(
     mut job: Job,
-    device: &[Arc<Queue<(Job, Vec<Call>)>>],
+    device: &[JobQueue],
     nets: &RwLock<Arc<crate::net::Net>>,
     collected: &Mutex<Vec<Data>>,
     retired: &Mutex<Vec<Job>>,
@@ -370,42 +373,39 @@ fn advance_job(
     stats: &Stats,
 ) {
     let replies = std::mem::take(&mut job.replies);
-    loop {
-        match job.solver.advance(&replies) {
-            Step::Calls(calls) => return device[job.card].push((job, calls)),
-            Step::Done(solved) => {
-                let mask = job.solver.hit_mask();
-                if mask != 0 {
-                    stats.budget_hits.fetch_add(1, Ordering::Relaxed);
-                    for i in 0..8 {
-                        if mask & (1 << i) != 0 {
-                            stats.entity_hits[i].fetch_add(1, Ordering::Relaxed);
-                        }
+    match job.solver.advance(&replies) {
+        Step::Calls(calls) => device[job.card].push((job, calls)),
+        Step::Done(solved) => {
+            let mask = job.solver.hit_mask();
+            if mask != 0 {
+                stats.budget_hits.fetch_add(1, Ordering::Relaxed);
+                for i in 0..8 {
+                    if mask & (1 << i) != 0 {
+                        stats.entity_hits[i].fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                let counts = job.solver.counts();
-                let mut census = [0; 10];
-                census[..9].copy_from_slice(&counts);
-                census[9] = job.source.solve_kind() as u32;
-                stats.shapes.lock().push(census);
-                job.source.keep(&job.solver, solved, &mut job.data);
-                collected.lock().push(std::mem::take(&mut job.data));
-                let n = nets.read();
-                if stopping.load(Ordering::Acquire) {
-                    drop(n);
-                    retired.lock().push(job);
-                    return;
-                }
-                job.solver = job.source.next_solve(&n, &mut job.data);
-                job.solver.pin(job.slot);
-                let Step::Calls(calls) = job.solver.advance(&[]) else {
-                    unreachable!("a fresh solve finishes without a round")
-                };
-                let card = job.card;
-                device[card].push((job, calls));
+            }
+            let counts = job.solver.counts();
+            let mut census = [0; 10];
+            census[..9].copy_from_slice(&counts);
+            census[9] = job.source.solve_kind() as u32;
+            stats.shapes.lock().push(census);
+            job.source.keep(&job.solver, solved, &mut job.data);
+            collected.lock().push(std::mem::take(&mut job.data));
+            let n = nets.read();
+            if stopping.load(Ordering::Acquire) {
                 drop(n);
+                retired.lock().push(job);
                 return;
             }
+            job.solver = job.source.next_solve(&n, &mut job.data);
+            job.solver.pin(job.slot);
+            let Step::Calls(calls) = job.solver.advance(&[]) else {
+                unreachable!("a fresh solve finishes without a round")
+            };
+            let card = job.card;
+            device[card].push((job, calls));
+            drop(n);
         }
     }
 }
@@ -449,7 +449,7 @@ fn drive_card(
 type Back = std::sync::mpsc::Sender<Vec<Reply>>;
 
 pub struct Cards {
-    queues: Vec<Arc<Queue<(Back, Vec<Call>)>>>,
+    queues: Vec<BackQueue>,
     seats: Mutex<Vec<(usize, usize)>>,
     free: Condvar,
     drivers: Vec<JoinHandle<()>>,
@@ -474,7 +474,7 @@ impl Cards {
         let n = device.cards();
         let pipes = crate::cuda::PIPELINE;
         let device = Arc::new(device);
-        let queues: Vec<Arc<Queue<(Back, Vec<Call>)>>> =
+        let queues: Vec<BackQueue> =
             (0..n * pipes).map(|_| Arc::new(Queue::default())).collect();
         let mut drivers = Vec::with_capacity(n * pipes);
         for g in 0..n {

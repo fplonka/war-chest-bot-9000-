@@ -89,7 +89,7 @@ fn gpu(slot_base: usize) -> TestDevice {
 
 #[test]
 fn packed_rows_expand_on_the_card() {
-    let mut rng = Rng::new(0xA11C_E55);
+    let mut rng = Rng::new(0x0A11_CE55);
     let mut rows = Vec::with_capacity(4096 * ROW_BYTES);
     while rows.len() / ROW_BYTES < 4096 {
         let mut state = make_game(&mut rng, true);
@@ -321,7 +321,7 @@ fn shared_round(
 #[test]
 fn a_ragged_round_does_not_move_the_small_solve() {
     let net = Net::random(0x9E37);
-    let nets = Arc::new(net.clone());
+    let nets = Arc::new(net);
     let small = || {
         let mut g = GameStream::new(0x51E5, game_cfg(8, 0.0));
         let mut data = Data::default();
@@ -395,7 +395,7 @@ fn k_iterates_together_match_k_iterates_alone() {
     const K: usize = 4;
     let net = Net::random(0x9E37);
     let device = gpu(20);
-    let nets = Arc::new(net.clone());
+    let nets = Arc::new(net);
     let mut setup = Vec::new();
     let mut iterates = Vec::new();
     for i in 0..2 * K {
@@ -420,8 +420,8 @@ fn k_iterates_together_match_k_iterates_alone() {
 
     let batched = device.run(&iterates[..K], 0).expect("batched iterate");
     let mut serial = Vec::new();
-    for c in iterates[K..].iter().cloned() {
-        serial.extend(device.run(std::slice::from_ref(&c), 0).expect("serial iterate"));
+    for c in &iterates[K..] {
+        serial.extend(device.run(std::slice::from_ref(c), 0).expect("serial iterate"));
     }
     assert_eq!(batched.len(), K);
     assert_eq!(serial.len(), K);

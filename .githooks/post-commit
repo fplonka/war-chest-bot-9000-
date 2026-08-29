@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+gitdir=$(git rev-parse --absolute-git-dir)
+rm -f "$gitdir/WHY-THIS-CHANGE-IS-DEFINITELY-ALREADY-AS-SIMPLE-AS-POSSIBLE.md" "$gitdir/loc-before"

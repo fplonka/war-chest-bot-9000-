@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+gitdir=$(git rev-parse --absolute-git-dir)
+waiver="$gitdir/WHY-THIS-CHANGE-IS-DEFINITELY-ALREADY-AS-SIMPLE-AS-POSSIBLE.md"
+[ -s "$waiver" ] || exit 0
+
+net=$(git diff --cached --numstat -- '*.rs' '*.py' '*.cu' '*.cuh' |
+    awk '$1 != "-" { a += $1; d += $2 } END { print a - d + 0 }')
+before=$(cat "$gitdir/loc-before" 2>/dev/null || echo "$net")
+
+{
+    echo
+    printf 'Lines: +%s -> +%s%s\n' "$before" "$net" \
+        "$([ "$before" -le "$net" ] && echo ' (the simplification pass found no reduction)')"
+    echo
+    echo "Why this is already as simple as possible:"
+    echo
+    sed 's/^/  /' "$waiver"
+} >>"$1"

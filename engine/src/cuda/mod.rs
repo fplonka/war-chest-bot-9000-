@@ -565,11 +565,7 @@ impl Device {
     }
 
     pub fn slots_per_card(&self) -> usize {
-        if self.n_gpus == 0 {
-            0
-        } else {
-            self.total_slots() / self.n_gpus
-        }
+        self.total_slots().checked_div(self.n_gpus).unwrap_or(0)
     }
 
     pub fn expand_rows(&self, rows: &[u8]) -> Res<Vec<f32>> {
@@ -1034,7 +1030,7 @@ impl Card {
         .map_err(err)
     }
 
-    fn slot<'g>(&self, g: &'g mut Vec<Solve>, solve: usize) -> &'g mut Solve {
+    fn slot<'g>(&self, g: &'g mut [Solve], solve: usize) -> &'g mut Solve {
         let n = g.len();
         g.get_mut(solve).unwrap_or_else(|| panic!("solve {solve} pinned to a card that holds {n} slots"))
     }
@@ -1384,8 +1380,9 @@ impl Card {
         if solves.is_empty() {
             return Ok(());
         }
-        let (mut want, mut desc, mut cells): (Vec<(u32, u32, Prime)>, Vec<u32>, Vec<u32>) =
-            (Vec::new(), Vec::new(), Vec::new());
+        let mut want: Vec<(u32, u32, Prime)> = Vec::new();
+        let mut desc: Vec<u32> = Vec::new();
+        let mut cells: Vec<u32> = Vec::new();
         for (p, &i) in mine.iter().filter(|&&i| !each(i).0.is_empty()).enumerate() {
             let (prime, a, c, temp) = each(i);
             let inv = (1.0f32 / temp.max(1e-6)).to_bits();
@@ -1422,7 +1419,7 @@ impl Card {
                 want[i..j].iter().map(f).collect()
             };
             let act_node: Vec<u32> = (0..j - i)
-                .flat_map(|k| std::iter::repeat(k as u32).take(want[i + k].2.na as usize))
+                .flat_map(|k| std::iter::repeat_n(k as u32, want[i + k].2.na as usize))
                 .collect();
             let flat: Vec<u32> = [
                 col(&|r| r.0),
@@ -1620,7 +1617,7 @@ impl Card {
                     .ok_or_else(|| format!("solve {solve} has no resident tree"))?;
                 desc.extend_from_slice(&b.describe(&self.stream));
                 coff.extend(b.host_coff[1..].iter().map(|x| x + cells));
-                part_of_row.extend(std::iter::repeat(part as i32).take(b.rows));
+                part_of_row.extend(std::iter::repeat_n(part as i32, b.rows));
                 local_row.extend(0..b.rows as i32);
                 base.push(cells as i32);
                 cells += b.host_coff[2 * b.rows];

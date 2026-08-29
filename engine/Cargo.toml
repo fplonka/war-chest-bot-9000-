@@ -2,8 +2,20 @@
 name = "warchest-engine"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.78"
+rust-version = "1.85"
 autotests = false
+
+[lints.rust]
+unused = { level = "deny", priority = -1 }
+dead_code = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+fn_params_excessive_bools = "deny"
+option_option = "deny"
+redundant_clone = "deny"
 
 [lib]
 name = "warchest"
@@ -45,3 +57,7 @@ required-features = ["gpu"]
 [profile.release]
 lto = true
 codegen-units = 1
+
+[[test]]
+name = "pbs"
+path = "tests/pbs.rs"

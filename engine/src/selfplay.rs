@@ -153,7 +153,7 @@ impl Data {
                 if usable && p == actor {
                     let row = policy.off[ci] as usize..policy.off[ci + 1] as usize;
                     let within = if actor == 0 { ci } else { bel[0].len() + ci };
-                    self.pci.extend(std::iter::repeat(within as u16).take(row.len()));
+                    self.pci.extend(std::iter::repeat_n(within as u16, row.len()));
                     self.pcell.extend_from_slice(&policy.act[row.clone()]);
                     self.pprob.extend_from_slice(&policy.p[row]);
                 }
