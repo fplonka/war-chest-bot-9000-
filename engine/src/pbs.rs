@@ -382,10 +382,6 @@ pub struct DrawMap {
 }
 
 impl DrawMap {
-    pub fn bytes(&self) -> usize {
-        (self.start.capacity() + self.to.capacity() + self.p.capacity()) * 4
-    }
-
     #[inline]
     pub fn row(&self, ci: usize) -> (&[u32], &[f32]) {
         let (a, b) = (self.start[ci] as usize, self.start[ci + 1] as usize);
@@ -416,14 +412,6 @@ pub struct DrawScratch {
 }
 
 impl DrawScratch {
-    pub fn bytes(&self) -> usize {
-        self.kid.capacity() * std::mem::size_of::<Config>()
-            + (self.prob.capacity() + self.acc.capacity()) * 4
-            + self.order.capacity() * 8
-            + self.hit.capacity()
-            + self.touched.capacity() * 4
-    }
-
     pub fn transition(
         &mut self,
         cfg: &[Config],
@@ -732,94 +720,6 @@ fn stack_from_row(row: &[u8]) -> ([u8; CONT_CAP], [u64; CONT_CAP]) {
     (kinds, owed)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn write_public_features_raw(
-    hex_owner: &[u8; N_HEXES],
-    hex_slot: &[u8; N_HEXES],
-    hex_height: &[u8; N_HEXES],
-    hex_marker: &[u8; N_HEXES],
-    piles: &[u8],
-    ids: &[u8],
-    markers_hand: &[u8],
-    hand_size: &[u8],
-    fd_size: &[u8],
-    bag_size: &[u8],
-    initiative: u8,
-    initiative_moved: bool,
-    to_act: u8,
-    plies_remaining: u16,
-    kinds: &[u8; CONT_CAP],
-    owed: &[u64; CONT_CAP],
-    out: &mut [f32],
-) {
-    debug_assert_eq!(out.len(), PUBFEAT);
-    debug_assert_eq!(piles.len(), 2 * NSLOT * PILE_COUNTS);
-    debug_assert_eq!(ids.len(), 2 * NSLOT);
-    out.fill(0.0);
-    let bd = board();
-
-    let mut i = 0;
-    for h in 0..N_HEXES {
-        let owner = hex_owner[h];
-        if owner != NONE {
-            out[i + owner as usize] = 1.0;
-            out[i + 2] = hex_height[h] as f32 / 5.0;
-            if hex_slot[h] != NONE {
-                out[i + HEX_FACTS + owner as usize * NSLOT + hex_slot[h] as usize] = 1.0;
-            }
-        }
-        if hex_marker[h] != NONE {
-            out[i + 3 + hex_marker[h] as usize] = 1.0;
-        }
-        out[i + 5] = bd.is_location[h] as u8 as f32;
-        for d in 0..CONT_CAP {
-            if owed[d] & (1u64 << h) != 0 {
-                out[i + 6 + d] = 1.0;
-            }
-        }
-        i += HEX_CH;
-    }
-    debug_assert_eq!(i, OFF_PILES);
-
-    for t in 0..2 * NSLOT {
-        let at = t * PILE_COUNTS;
-        out[i] = piles[at] as f32 / 5.0;
-        out[i + 1] = piles[at + 1] as f32 / 5.0;
-        out[i + 2] = piles[at + 2] as f32 / 5.0;
-        out[i + 3] = piles[at + 3] as f32 / 5.0;
-        i += PILE_COUNTS;
-    }
-    debug_assert_eq!(i, OFF_CARDS);
-
-    for t in 0..2 * NSLOT {
-        write_card_features(ids[t], &mut out[i..i + CARD_FEATS]);
-        i += CARD_FEATS;
-    }
-    debug_assert_eq!(i, OFF_LOOSE);
-
-    for p in 0..2usize {
-        out[i] = markers_hand[p] as f32 / 6.0;
-        out[i + 1] = (6 - markers_hand[p]) as f32 / 6.0;
-        out[i + 2] = hand_size[p] as f32 / 3.0;
-        out[i + 3] = fd_size[p] as f32 / MAX_COINS;
-        out[i + 4] = bag_size[p] as f32 / MAX_COINS;
-        out[i + 5] = (initiative == p as u8) as u8 as f32;
-        i += PLAYER_SCALARS;
-    }
-
-    out[i] = plies_remaining as f32 / crate::state::MAX_MAIN_PLAYS as f32;
-    out[i + 1] = initiative_moved as u8 as f32;
-    out[i + 2] = (to_act == 0) as u8 as f32;
-    for d in 0..CONT_CAP {
-        let k = kinds[d];
-        if (k as usize) < PENDING_KINDS {
-            out[i + 3 + d * PENDING_KINDS + k as usize] = 1.0;
-        }
-    }
-    i += GLOBAL_SCALARS;
-    debug_assert_eq!(i, PUBFEAT);
-}
-
 pub fn pack_row(s: &State, ctx: &Ctx, out: &mut [u8]) {
     debug_assert_eq!(out.len(), ROW_BYTES);
     for t in 0..2 * NSLOT {
@@ -907,47 +807,92 @@ pub fn mirror_row(src: &[u8], dst: &mut [u8]) {
 
 pub fn expand_row(row: &[u8], out: &mut [f32]) {
     debug_assert_eq!(row.len(), ROW_BYTES);
-    let mut hex_owner = [NONE; N_HEXES];
-    let mut hex_slot = [NONE; N_HEXES];
-    let mut hex_height = [0u8; N_HEXES];
-    let mut hex_marker = [NONE; N_HEXES];
-    hex_owner.copy_from_slice(&row[ROW_HEX_OWNER..ROW_HEX_OWNER + N_HEXES]);
-    hex_slot.copy_from_slice(&row[ROW_HEX_SLOT..ROW_HEX_SLOT + N_HEXES]);
-    hex_height.copy_from_slice(&row[ROW_HEX_HEIGHT..ROW_HEX_HEIGHT + N_HEXES]);
-    hex_marker.copy_from_slice(&row[ROW_HEX_MARKER..ROW_HEX_MARKER + N_HEXES]);
-    let mut markers_hand = [0u8; 2];
+    let hex = |at: usize| -> &[u8; N_HEXES] { row[at..at + N_HEXES].try_into().unwrap() };
+    let (hex_owner, hex_slot) = (hex(ROW_HEX_OWNER), hex(ROW_HEX_SLOT));
+    let (hex_height, hex_marker) = (hex(ROW_HEX_HEIGHT), hex(ROW_HEX_MARKER));
+    let piles = &row[ROW_PILES..ROW_PILES + 2 * NSLOT * PILE_COUNTS];
+    let ids = &row[ROW_IDS..ROW_IDS + 2 * NSLOT];
+    let hand_size: &[u8] = &row[ROW_HAND_SIZE..ROW_HAND_SIZE + 2];
+    let fd_size: &[u8] = &row[ROW_FD_SIZE..ROW_FD_SIZE + 2];
+    let bag_size: &[u8] = &row[ROW_BAG_SIZE..ROW_BAG_SIZE + 2];
+    let mut markers_hand = [6u8; 2];
     for h in 0..N_HEXES {
         if hex_marker[h] != NONE {
-            markers_hand[hex_marker[h] as usize] += 1;
+            markers_hand[hex_marker[h] as usize] -= 1;
         }
     }
-    for p in 0..2usize {
-        markers_hand[p] = 6 - markers_hand[p];
-    }
-    let mut initiative = row[ROW_INITIATIVE];
-    if initiative > 1 {
-        initiative = 0;
-    }
+    let initiative = if row[ROW_INITIATIVE] > 1 { 0 } else { row[ROW_INITIATIVE] };
+    let initiative_moved = row[ROW_INIT_MOVED] != 0;
+    let to_act = row[ROW_TO_ACT];
+    let plies_remaining = u16::from_le_bytes([row[ROW_PLIES], row[ROW_PLIES + 1]]);
     let (kinds, owed) = stack_from_row(row);
-    write_public_features_raw(
-        &hex_owner,
-        &hex_slot,
-        &hex_height,
-        &hex_marker,
-        &row[ROW_PILES..ROW_PILES + 2 * NSLOT * PILE_COUNTS],
-        &row[ROW_IDS..ROW_IDS + 2 * NSLOT],
-        &markers_hand,
-        row[ROW_HAND_SIZE..ROW_HAND_SIZE + 2].try_into().unwrap(),
-        row[ROW_FD_SIZE..ROW_FD_SIZE + 2].try_into().unwrap(),
-        row[ROW_BAG_SIZE..ROW_BAG_SIZE + 2].try_into().unwrap(),
-        initiative,
-        row[ROW_INIT_MOVED] != 0,
-        row[ROW_TO_ACT],
-        u16::from_le_bytes([row[ROW_PLIES], row[ROW_PLIES + 1]]),
-        &kinds,
-        &owed,
-        out,
-    );
+    let (kinds, owed) = (&kinds, &owed);
+    debug_assert_eq!(out.len(), PUBFEAT);
+    debug_assert_eq!(piles.len(), 2 * NSLOT * PILE_COUNTS);
+    debug_assert_eq!(ids.len(), 2 * NSLOT);
+    out.fill(0.0);
+    let bd = board();
+
+    let mut i = 0;
+    for h in 0..N_HEXES {
+        let owner = hex_owner[h];
+        if owner != NONE {
+            out[i + owner as usize] = 1.0;
+            out[i + 2] = hex_height[h] as f32 / 5.0;
+            if hex_slot[h] != NONE {
+                out[i + HEX_FACTS + owner as usize * NSLOT + hex_slot[h] as usize] = 1.0;
+            }
+        }
+        if hex_marker[h] != NONE {
+            out[i + 3 + hex_marker[h] as usize] = 1.0;
+        }
+        out[i + 5] = bd.is_location[h] as u8 as f32;
+        for d in 0..CONT_CAP {
+            if owed[d] & (1u64 << h) != 0 {
+                out[i + 6 + d] = 1.0;
+            }
+        }
+        i += HEX_CH;
+    }
+    debug_assert_eq!(i, OFF_PILES);
+
+    for t in 0..2 * NSLOT {
+        let at = t * PILE_COUNTS;
+        out[i] = piles[at] as f32 / 5.0;
+        out[i + 1] = piles[at + 1] as f32 / 5.0;
+        out[i + 2] = piles[at + 2] as f32 / 5.0;
+        out[i + 3] = piles[at + 3] as f32 / 5.0;
+        i += PILE_COUNTS;
+    }
+    debug_assert_eq!(i, OFF_CARDS);
+
+    for t in 0..2 * NSLOT {
+        write_card_features(ids[t], &mut out[i..i + CARD_FEATS]);
+        i += CARD_FEATS;
+    }
+    debug_assert_eq!(i, OFF_LOOSE);
+
+    for p in 0..2usize {
+        out[i] = markers_hand[p] as f32 / 6.0;
+        out[i + 1] = (6 - markers_hand[p]) as f32 / 6.0;
+        out[i + 2] = hand_size[p] as f32 / 3.0;
+        out[i + 3] = fd_size[p] as f32 / MAX_COINS;
+        out[i + 4] = bag_size[p] as f32 / MAX_COINS;
+        out[i + 5] = (initiative == p as u8) as u8 as f32;
+        i += PLAYER_SCALARS;
+    }
+
+    out[i] = plies_remaining as f32 / crate::state::MAX_MAIN_PLAYS as f32;
+    out[i + 1] = initiative_moved as u8 as f32;
+    out[i + 2] = (to_act == 0) as u8 as f32;
+    for d in 0..CONT_CAP {
+        let k = kinds[d];
+        if (k as usize) < PENDING_KINDS {
+            out[i + 3 + d * PENDING_KINDS + k as usize] = 1.0;
+        }
+    }
+    i += GLOBAL_SCALARS;
+    debug_assert_eq!(i, PUBFEAT);
 }
 
 #[cfg(test)]

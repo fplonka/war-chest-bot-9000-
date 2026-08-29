@@ -257,27 +257,7 @@ pub struct State {
 impl State {
     pub fn from_draft(white_units: &[u16], black_units: &[u16], first_player: u8) -> State {
         assert!(first_player == WHITE || first_player == BLACK);
-        let mut s = State {
-            hex_type: [NONE; N_HEXES],
-            hex_owner: [NONE; N_HEXES],
-            hex_height: [0; N_HEXES],
-            loc_marker: [NONE; N_HEXES],
-            zones: [[[0; N_UNITS]; N_ZONES]; N_PLAYERS],
-            markers_hand: [0; N_PLAYERS],
-            initiative: first_player,
-            initiative_moved: false,
-            round: 1,
-            first_player,
-            active: first_player,
-            turns_taken: [0; N_PLAYERS],
-            main_plays: 0,
-            winner: NONE,
-            adjudicated_draw: false,
-            pending: Cont::MainPlay,
-            conts: ContStack::default(),
-            wp_v2_triggered: false,
-            interrupt: false,
-        };
+        let mut s = State::blank(first_player);
 
         for (p, units) in [(WHITE, white_units), (BLACK, black_units)] {
             assert_eq!(units.len(), 4, "each player drafts exactly 4 unit types");

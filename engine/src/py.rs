@@ -211,11 +211,11 @@ impl SolveFarm {
             dict.set_item("round_calls", read(&s.calls))?;
             dict.set_item("round_rows", read(&s.rows))?;
             dict.set_item("round_nanos", read(&s.nanos))?;
-            dict.set_item("slots", s.slots())?;
-            dict.set_item("slots_used", s.used())?;
-            dict.set_item("slots_per_card", s.slots_per_card())?;
-            dict.set_item("slot_bytes", s.slot_bytes())?;
-            dict.set_item("budget_hits", s.budget_hits())?;
+            dict.set_item("slots", read(&s.slots))?;
+            dict.set_item("slots_used", read(&s.used))?;
+            dict.set_item("slots_per_card", read(&s.slots_per_card))?;
+            dict.set_item("slot_bytes", read(&s.slot_bytes))?;
+            dict.set_item("budget_hits", read(&s.budget_hits))?;
             dict.set_item("entity_hits", s.entity_hits())?;
             dict.set_item("shapes", s.take_shapes())?;
             Ok(out)

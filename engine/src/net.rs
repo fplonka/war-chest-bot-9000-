@@ -1,6 +1,6 @@
 use crate::actions::N_KINDS;
 use crate::board::N_HEXES;
-use crate::pbs::{HEX_FACTS, LOOSE, NTYPE, PILE_COUNTS};
+use crate::pbs::{HEX_FACTS, LOOSE, PILE_COUNTS};
 use crate::units::{write_card_features, CARD_FEATS};
 
 fn dense(w: &[f32], b: &[f32], i: usize, o: usize, input: &[f32], rows: usize, out: &mut Vec<f32>) {
@@ -321,23 +321,17 @@ impl Net {
         &self.flat
     }
 
-    pub fn cards_from_rows(&self, packed: &[u8], rows: usize, out: &mut Vec<f32>) {
-        use crate::pbs::{ROW_BYTES, ROW_IDS};
-        let mut facts = vec![0.0f32; rows * NTYPE * CARD_FEATS];
-        for (r, row) in packed.chunks_exact(ROW_BYTES).enumerate() {
-            for t in 0..NTYPE {
-                write_card_features(
-                    row[ROW_IDS + t],
-                    &mut facts[(r * NTYPE + t) * CARD_FEATS..(r * NTYPE + t + 1) * CARD_FEATS],
-                );
-            }
+    pub fn cards(&self, ids: &[u8], out: &mut Vec<f32>) {
+        let mut facts = vec![0.0f32; ids.len() * CARD_FEATS];
+        for (t, &id) in ids.iter().enumerate() {
+            write_card_features(id, &mut facts[t * CARD_FEATS..(t + 1) * CARD_FEATS]);
         }
         let (a, b) = (&self.card[0], &self.card[1]);
         let mut hidden = Vec::new();
-        dense(&a.w, &a.b, a.i, a.o, &facts, rows * NTYPE, &mut hidden);
+        dense(&a.w, &a.b, a.i, a.o, &facts, ids.len(), &mut hidden);
         for x in hidden.iter_mut() {
             *x = gelu(*x);
         }
-        dense(&b.w, &b.b, b.i, b.o, &hidden, rows * NTYPE, out);
+        dense(&b.w, &b.b, b.i, b.o, &hidden, ids.len(), out);
     }
 }

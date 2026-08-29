@@ -61,43 +61,6 @@ impl Contract {
         self.kind.len()
     }
 
-    pub fn bytes(&self) -> usize {
-        let u = |v: &Vec<u32>| v.capacity() * 4;
-        self.nc.capacity() * 8
-            + self.kind.capacity()
-            + self.player.capacity()
-            + u(&self.parent)
-            + u(&self.exhausted)
-            + u(&self.level)
-            + u(&self.roff)
-            + u(&self.voff)
-            + u(&self.soff)
-            + self.util.capacity() * 4
-            + u(&self.child_at)
-            + u(&self.child_n)
-            + u(&self.child)
-            + u(&self.legal_base)
-            + u(&self.legal_off)
-            + u(&self.legal_child)
-            + u(&self.legal_trans)
-            + u(&self.cell_row)
-            + u(&self.cell_val)
-            + u(&self.rev_base)
-            + u(&self.rev_start)
-            + u(&self.rev_src)
-            + u(&self.rev_cell)
-            + u(&self.draw_base)
-            + u(&self.draw_start)
-            + u(&self.draw_to)
-            + self.draw_p.capacity() * 4
-            + u(&self.rvd_base)
-            + u(&self.rvd_start)
-            + u(&self.rvd_src)
-            + self.rvd_p.capacity() * 4
-            + u(&self.level_start)
-            + u(&self.level_node)
-    }
-
     pub fn write_into(&self, w: &mut Writes, sent: &mut Sent, from: usize, rewrite: &[u32], resealed: &[u32]) {
         let n = self.nodes();
         let mut spans: Vec<(usize, usize)> = vec![(from, n - from)];

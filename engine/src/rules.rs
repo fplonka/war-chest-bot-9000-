@@ -462,11 +462,11 @@ impl State {
             Tactic::Lancer => {
                 let bolstered = self.hex_height[hex] >= 2;
                 for d in 0..6 {
-                    let s1 = b.step[hex][d];
+                    let s1 = b.neighbors[hex][d];
                     if s1 == NONE || occupied(self, s1 as usize) {
                         continue;
                     }
-                    let beyond1 = b.step[s1 as usize][d];
+                    let beyond1 = b.neighbors[s1 as usize][d];
                     if beyond1 != NONE && is_enemy_unit(self, beyond1 as usize, me) {
                         let knight = def(self.hex_type[beyond1 as usize]).knight;
                         if !knight || bolstered {
@@ -477,9 +477,9 @@ impl State {
                             });
                         }
                     }
-                    let s2 = b.step[s1 as usize][d];
+                    let s2 = b.neighbors[s1 as usize][d];
                     if s2 != NONE && !occupied(self, s2 as usize) {
-                        let beyond2 = b.step[s2 as usize][d];
+                        let beyond2 = b.neighbors[s2 as usize][d];
                         if beyond2 != NONE && is_enemy_unit(self, beyond2 as usize, me) {
                             let knight = def(self.hex_type[beyond2 as usize]).knight;
                             if !knight || bolstered {

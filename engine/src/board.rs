@@ -24,7 +24,6 @@ pub struct Board {
     pub is_location: [bool; N_HEXES],
     pub location_hexes: [u8; N_LOCATIONS],
     pub between: [[u8; N_HEXES]; N_HEXES],
-    pub step: [[u8; 6]; N_HEXES],
 }
 
 fn valid_coord(x: i8, y: i8) -> bool {
@@ -35,12 +34,6 @@ fn axial_dist(a: (i8, i8), b: (i8, i8)) -> u8 {
     let dx = (a.0 - b.0) as i32;
     let dy = (a.1 - b.1) as i32;
     ((dx.abs() + dy.abs() + (dx + dy).abs()) / 2) as u8
-}
-
-impl Default for Board {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl Board {
@@ -70,13 +63,10 @@ impl Board {
         };
 
         let mut neighbors = [[NONE; 6]; N_HEXES];
-        let mut step = [[NONE; 6]; N_HEXES];
         for i in 0..N_HEXES {
             let (x, y) = coord[i];
             for (d, (ox, oy)) in NEIGHBOR_OFFSETS.iter().enumerate() {
-                let n = index_of(x + ox, y + oy);
-                neighbors[i][d] = n;
-                step[i][d] = n;
+                neighbors[i][d] = index_of(x + ox, y + oy);
             }
         }
 
@@ -90,11 +80,11 @@ impl Board {
         let mut between = [[NONE; N_HEXES]; N_HEXES];
         for a in 0..N_HEXES {
             for d in 0..6 {
-                let mid = step[a][d];
+                let mid = neighbors[a][d];
                 if mid == NONE {
                     continue;
                 }
-                let far = step[mid as usize][d];
+                let far = neighbors[mid as usize][d];
                 if far == NONE {
                     continue;
                 }
@@ -118,7 +108,6 @@ impl Board {
             is_location,
             location_hexes,
             between,
-            step,
         }
     }
 }

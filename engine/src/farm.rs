@@ -323,12 +323,12 @@ pub struct Stats {
     pub rows: AtomicU64,
     pub calls: AtomicU64,
     pub nanos: AtomicU64,
-    slots: AtomicU64,
-    used: AtomicU64,
-    budget_hits: AtomicU64,
-    entity_hits: [AtomicU64; 8],
-    slot_bytes: AtomicU64,
-    slots_per_card: AtomicU64,
+    pub slots: AtomicU64,
+    pub used: AtomicU64,
+    pub budget_hits: AtomicU64,
+    pub entity_hits: [AtomicU64; 8],
+    pub slot_bytes: AtomicU64,
+    pub slots_per_card: AtomicU64,
     shapes: Mutex<Vec<[u32; 10]>>,
 }
 
@@ -342,28 +342,8 @@ impl Stats {
         }
     }
 
-    pub fn slots(&self) -> u64 {
-        self.slots.load(Ordering::Relaxed)
-    }
-
-    pub fn used(&self) -> u64 {
-        self.used.load(Ordering::Relaxed)
-    }
-
-    pub fn budget_hits(&self) -> u64 {
-        self.budget_hits.load(Ordering::Relaxed)
-    }
-
     pub fn entity_hits(&self) -> [u64; 8] {
         std::array::from_fn(|i| self.entity_hits[i].load(Ordering::Relaxed))
-    }
-
-    pub fn slot_bytes(&self) -> u64 {
-        self.slot_bytes.load(Ordering::Relaxed)
-    }
-
-    pub fn slots_per_card(&self) -> u64 {
-        self.slots_per_card.load(Ordering::Relaxed)
     }
 
     pub fn take_shapes(&self) -> Vec<[u32; 10]> {

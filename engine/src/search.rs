@@ -548,7 +548,6 @@ pub struct Solver {
     bmap: std::collections::HashMap<u64, u32, KeyHash>,
     pub nboards: usize,
     pub(crate) packed: Vec<u8>,
-    mirror0: Vec<u8>,
     abandon: bool,
     draw_scratch: DrawScratch,
     cell_order: Vec<(u64, u32)>,
@@ -1212,10 +1211,6 @@ impl Solver {
             self.packed.resize(at + 128 * ROW_BYTES, 0);
         }
         pack_row(s, &self.ctx, &mut self.packed[at..at + ROW_BYTES]);
-        if self.nboards == 0 {
-            self.mirror0.resize(ROW_BYTES, 0);
-            pack_row(&s.mirror(), &self.ctx.mirrored(), &mut self.mirror0);
-        }
         let key = row_key(&self.packed[at..at + ROW_BYTES]);
         if let Some(&b) = self.bmap.get(&key) {
             let old = b as usize * ROW_BYTES;
@@ -1294,8 +1289,8 @@ impl Solver {
         let fresh_rows = rows - self.batch_rows;
         let fresh_cfgs = self.ncfg - self.batch_cfgs;
         if self.cards.is_empty() && (fresh_rows > 0 || fresh_cfgs > 0) {
-            let both = [&self.packed[..ROW_BYTES], &self.mirror0[..]].concat();
-            self.net.cards_from_rows(&both, 2, &mut self.cards);
+            let (me, other) = (self.ctx.slots[0], self.ctx.slots[1]);
+            self.net.cards(&[me, other, other, me].concat(), &mut self.cards);
         }
         if fresh_rows > 0 {
             let at = self.batch_boards * ROW_BYTES;
