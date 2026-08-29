@@ -38,11 +38,11 @@ def main():
     torch.manual_seed(3)
     torch.set_num_threads(4)
     dev = torch.device("cuda:0")
-    net = Net()
+    net = Net().to(dev)
     net.push()
 
     print("[1/5] generating rows (random drafts, WP included)", flush=True)
-    d = warchest.gen_data(1, 7, explore=0.25, random_draft=True)
+    d = warchest.gen_data(4, 7, explore=0.25, random_draft=True)
     n = len(d["rows"]) // ROW_BYTES
     assert n > 200, f"expected a few hundred rows, got {n}"
     print(f"      {n} rows, {len(d['cc']) // CCOUNTS} configs, "
@@ -86,7 +86,7 @@ def main():
     assert phi.shape[1] == CFEAT
     assert seg.max() == 2 * len(tr[0]) - 1
     assert nseg == 2 * len(tr[0])
-    assert torch.allclose(torch.bincount(seg, w), torch.ones(nseg), atol=1e-6)
+    assert torch.allclose(torch.bincount(seg, w), torch.ones(nseg, device=w.device), atol=1e-6)
     assert not len(policy[0]) and not len(policy[1])
     assert torch.isfinite(xpub).all() and torch.isfinite(y).all()
     print(f"      batch {xpub.shape} phi {phi.shape}", flush=True)
