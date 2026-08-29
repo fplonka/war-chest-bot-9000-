@@ -35,70 +35,49 @@ type Res<T> = Result<T, String>;
 
 const KERNELS: &str = include_str!("kernels.cu");
 
-struct Kernels {
-    expand_rows: CudaFunction,
-    gelu: CudaFunction,
-    norm_ip: CudaFunction,
-    bias: CudaFunction,
-    window: CudaFunction,
-    scatter: CudaFunction,
-    seed_reach: CudaFunction,
-    avg_block: CudaFunction,
-    terminals: CudaFunction,
-    expand: CudaFunction,
-    finish: CudaFunction,
-    tokens: CudaFunction,
-    act_feats: CudaFunction,
-    prior_inputs: CudaFunction,
-    act_add: CudaFunction,
-    prior: CudaFunction,
-    hex_facts: CudaFunction,
-    type_pool: CudaFunction,
-    stem: CudaFunction,
-    trunk: CudaFunction,
-    cfg_slots: CudaFunction,
-    sum_slots: CudaFunction,
-    bag: CudaFunction,
-    leaf: CudaFunction,
-    reach_sweep: CudaFunction,
-    backprop_sweep: CudaFunction,
+macro_rules! kernels {
+    ($($name:ident,)*) => {
+        struct Kernels { $($name: CudaFunction,)* }
+
+        impl Kernels {
+            fn load(m: &Arc<CudaModule>) -> Res<Kernels> {
+                $(let $name = {
+                    let at = concat!("k_", stringify!($name));
+                    m.load_function(at).map_err(|e| format!("kernel {at}: {e:?}"))?
+                };)*
+                Ok(Kernels { $($name,)* })
+            }
+        }
+    };
 }
 
-impl Kernels {
-    fn load(m: &Arc<CudaModule>) -> Res<Kernels> {
-        let get = |name: &str| {
-            m.load_function(name)
-                .map_err(|e| format!("kernel {name}: {e:?}"))
-        };
-        Ok(Kernels {
-            expand_rows: get("k_expand_rows")?,
-            gelu: get("k_gelu")?,
-            norm_ip: get("k_norm_ip")?,
-            bias: get("k_bias")?,
-            window: get("k_window")?,
-            scatter: get("k_scatter")?,
-            seed_reach: get("k_seed_reach")?,
-            avg_block: get("k_avg_block")?,
-            terminals: get("k_terminals")?,
-            expand: get("k_expand")?,
-            finish: get("k_finish")?,
-            tokens: get("k_tokens")?,
-            act_feats: get("k_act_feats")?,
-            prior_inputs: get("k_prior_inputs")?,
-            act_add: get("k_act_add")?,
-            prior: get("k_prior")?,
-            hex_facts: get("k_hex_facts")?,
-            type_pool: get("k_type_pool")?,
-            stem: get("k_stem")?,
-            trunk: get("k_trunk")?,
-            cfg_slots: get("k_cfg_slots")?,
-            sum_slots: get("k_sum_slots")?,
-            bag: get("k_bag")?,
-            leaf: get("k_leaf")?,
-            reach_sweep: get("k_reach_sweep")?,
-            backprop_sweep: get("k_backprop_sweep")?,
-        })
-    }
+kernels! {
+    expand_rows,
+    gelu,
+    norm_ip,
+    bias,
+    window,
+    scatter,
+    seed_reach,
+    avg_block,
+    terminals,
+    expand,
+    finish,
+    tokens,
+    act_feats,
+    prior_inputs,
+    act_add,
+    prior,
+    hex_facts,
+    type_pool,
+    stem,
+    trunk,
+    cfg_slots,
+    sum_slots,
+    bag,
+    leaf,
+    reach_sweep,
+    backprop_sweep,
 }
 
 trait LaunchUnit {
@@ -712,58 +691,36 @@ struct Gpu {
 static GPUS: LazyLock<parking_lot::Mutex<HashMap<usize, Arc<Gpu>>>> =
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
+macro_rules! defines {
+    ($($name:ident),* $(,)?) => {
+        vec![$(format!("-D{}={}", stringify!($name), $name)),*]
+    };
+}
+
 fn compile_options(major: i32, minor: i32, trunk_blocks: usize) -> CompileOptions {
-    let define = |name: &str, value: usize| format!("-D{name}={value}");
+    let mut options = defines![
+        ROW_BYTES, PUBFEAT, N_HEXES, HEX_CH, HEX_FACTS, HEX_BLOCK, NTYPE, NSLOT, PILE_COUNTS,
+        CARD_FEATS, OFF_PILES, OFF_CARDS, OFF_LOOSE, PLAYER_SCALARS, ROW_IDS, ROW_HEX_OWNER,
+        ROW_HEX_SLOT, ROW_HEX_HEIGHT, ROW_HEX_MARKER, ROW_PILES, ROW_HAND_SIZE, ROW_FD_SIZE,
+        ROW_BAG_SIZE, ROW_INITIATIVE, ROW_INIT_MOVED, ROW_TO_ACT, ROW_PLIES, ROW_STACK_KIND,
+        ROW_STACK_OWED, PENDING_KINDS, CONT_CAP, TRUNK_ROWS,
+    ];
+    options.extend([
+        format!("--gpu-architecture=compute_{major}{minor}"),
+        format!("-DTRUNK_MIN_BLOCKS={trunk_blocks}"),
+        format!("-DTRUNK_C={C}"),
+        format!("-DJ_ROWS={JROWS}"),
+        format!("-DJ_W={JW}"),
+        format!("-DJ_IN={JOIN_K}"),
+        format!("-DJ_POOL={POOL}"),
+        format!("-DJ_D={D}"),
+        format!("-DJ_BLOCKS={JBLOCKS}"),
+        format!("-DMAX_MAIN_PLAYS={}", MAX_MAIN_PLAYS as usize),
+        format!("-DMAX_COINS={MAX_COINS:.1}f"),
+    ]);
     CompileOptions {
-        options: vec![
-            format!("--gpu-architecture=compute_{major}{minor}"),
-            format!("-DJ_ROWS={JROWS}"),
-            format!("-DTRUNK_C={C}"),
-            define("TRUNK_ROWS", TRUNK_ROWS),
-            format!("-DTRUNK_MIN_BLOCKS={trunk_blocks}"),
-            format!("-DJ_W={JW}"),
-            format!("-DJ_IN={JOIN_K}"),
-            format!("-DJ_POOL={POOL}"),
-            format!("-DJ_D={D}"),
-            format!("-DJ_BLOCKS={JBLOCKS}"),
-            define("ROW_BYTES", ROW_BYTES),
-            define("PUBFEAT", PUBFEAT),
-            define("N_HEXES", N_HEXES),
-            define("HEX_CH", HEX_CH),
-            define("HEX_FACTS", HEX_FACTS),
-            define("HEX_BLOCK", HEX_BLOCK),
-            define("NTYPE", NTYPE),
-            define("NSLOT", NSLOT),
-            define("PILE_COUNTS", PILE_COUNTS),
-            define("CARD_FEATS", CARD_FEATS),
-            define("OFF_PILES", OFF_PILES),
-            define("OFF_CARDS", OFF_CARDS),
-            define("OFF_LOOSE", OFF_LOOSE),
-            define("PLAYER_SCALARS", PLAYER_SCALARS),
-            define("ROW_IDS", ROW_IDS),
-            define("ROW_HEX_OWNER", ROW_HEX_OWNER),
-            define("ROW_HEX_SLOT", ROW_HEX_SLOT),
-            define("ROW_HEX_HEIGHT", ROW_HEX_HEIGHT),
-            define("ROW_HEX_MARKER", ROW_HEX_MARKER),
-            define("ROW_PILES", ROW_PILES),
-            define("ROW_HAND_SIZE", ROW_HAND_SIZE),
-            define("ROW_FD_SIZE", ROW_FD_SIZE),
-            define("ROW_BAG_SIZE", ROW_BAG_SIZE),
-            define("ROW_INITIATIVE", ROW_INITIATIVE),
-            define("ROW_INIT_MOVED", ROW_INIT_MOVED),
-            define("ROW_TO_ACT", ROW_TO_ACT),
-            define("ROW_PLIES", ROW_PLIES),
-            define("ROW_STACK_KIND", ROW_STACK_KIND),
-            define("ROW_STACK_OWED", ROW_STACK_OWED),
-            define("PENDING_KINDS", PENDING_KINDS),
-            define("CONT_CAP", CONT_CAP),
-            define("MAX_MAIN_PLAYS", MAX_MAIN_PLAYS as usize),
-            format!("-DMAX_COINS={MAX_COINS:.1}f"),
-        ],
-        include_paths: vec![
-            "/usr/local/cuda/include".into(),
-            "/usr/include".into(),
-        ],
+        options,
+        include_paths: vec!["/usr/local/cuda/include".into(), "/usr/include".into()],
         ..Default::default()
     }
 }

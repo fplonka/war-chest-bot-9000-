@@ -166,73 +166,42 @@ pub fn uniform_belief(s: &State, ctx: &Ctx, p: u8) -> Belief {
     }
 }
 
+fn spread(room: &[u8; NSLOT], left: u8, out: &mut impl FnMut(&[u8; NSLOT])) {
+    fn rec(room: &[u8; NSLOT], bin: &mut [u8; NSLOT], k: usize, left: u8, out: &mut impl FnMut(&[u8; NSLOT])) {
+        if k == NSLOT - 1 {
+            if left <= room[k] {
+                bin[k] = left;
+                out(bin);
+                bin[k] = 0;
+            }
+            return;
+        }
+        for t in 0..=left.min(room[k]) {
+            bin[k] = t;
+            rec(room, bin, k + 1, left - t, out);
+        }
+        bin[k] = 0;
+    }
+    rec(room, &mut [0u8; NSLOT], 0, left, out);
+}
+
 pub fn enumerate_configs(reserve: &[u8; NSLOT], hand_size: u8, fd_size: u8, inflight: bool) -> Vec<Config> {
-    fn rec_fd(
-        res: &[u8; NSLOT],
-        hand: &[u8; NSLOT],
-        fd: &mut [u8; NSLOT],
-        k: usize,
-        left: u8,
-        inflight: bool,
-        out: &mut Vec<Config>,
-    ) {
-        if k == NSLOT - 1 {
-            if left + hand[k] <= res[k] {
-                fd[k] = left;
-                if inflight {
-                    for s in 0..NSLOT {
-                        if hand[s] + fd[s] < res[s] {
-                            out.push(Config {
-                                hand: *hand,
-                                fd: *fd,
-                                inflight: Some(s as u8),
-                            });
-                        }
-                    }
-                } else {
-                    out.push(Config {
-                        hand: *hand,
-                        fd: *fd,
-                        inflight: None,
-                    });
-                }
-                fd[k] = 0;
-            }
-            return;
-        }
-        for t in 0..=left.min(res[k].saturating_sub(hand[k])) {
-            fd[k] = t;
-            rec_fd(res, hand, fd, k + 1, left - t, inflight, out);
-        }
-        fd[k] = 0;
-    }
-    fn rec_hand(
-        res: &[u8; NSLOT],
-        hand: &mut [u8; NSLOT],
-        k: usize,
-        left: u8,
-        fd_size: u8,
-        inflight: bool,
-        out: &mut Vec<Config>,
-    ) {
-        if k == NSLOT - 1 {
-            if left <= res[k] {
-                hand[k] = left;
-                let mut fd = [0u8; NSLOT];
-                rec_fd(res, hand, &mut fd, 0, fd_size, inflight, out);
-                hand[k] = 0;
-            }
-            return;
-        }
-        for t in 0..=left.min(res[k]) {
-            hand[k] = t;
-            rec_hand(res, hand, k + 1, left - t, fd_size, inflight, out);
-        }
-        hand[k] = 0;
-    }
     let mut out = Vec::new();
-    let mut hand = [0u8; NSLOT];
-    rec_hand(reserve, &mut hand, 0, hand_size, fd_size, inflight, &mut out);
+    spread(reserve, hand_size, &mut |hand| {
+        let free = std::array::from_fn(|k| reserve[k] - hand[k]);
+        spread(&free, fd_size, &mut |fd| {
+            let (hand, fd) = (*hand, *fd);
+            if !inflight {
+                out.push(Config { hand, fd, inflight: None });
+                return;
+            }
+            for s in 0..NSLOT {
+                if hand[s] + fd[s] < reserve[s] {
+                    out.push(Config { hand, fd, inflight: Some(s as u8) });
+                }
+            }
+        });
+    });
     out
 }
 

@@ -603,8 +603,6 @@ impl State {
             }
             for h in self.hexes_of(p, unit) {
                 out.push(Action::Bolster { unit, hex: h as u8 });
-            }
-            for h in self.hexes_of(p, unit) {
                 self.list_basic_maneuvers(h, ManVariant::MAIN, out);
                 self.list_tactics(h, out);
             }
@@ -828,94 +826,63 @@ impl State {
             Deploy { unit, hex } => {
                 self.zones[p as usize][pay][unit as usize] -= 1;
                 self.place_unit(p, unit, hex as usize);
-                self.finish();
             }
             Bolster { unit, hex } => {
                 self.zones[p as usize][pay][unit as usize] -= 1;
                 self.hex_height[hex as usize] += 1;
-                self.finish();
             }
             ClaimInitiative { coin } => {
                 self.zmove(p, pay, Z_FACEDOWN, coin);
                 self.initiative = p;
                 self.initiative_moved = true;
-                self.finish();
             }
-            Pass { coin } => {
-                self.zmove(p, pay, Z_FACEDOWN, coin);
-                self.finish();
-            }
+            Pass { coin } => self.zmove(p, pay, Z_FACEDOWN, coin),
             Recruit { coin, unit } => {
                 self.zmove(p, pay, Z_FACEDOWN, coin);
                 self.zones[p as usize][Z_SUPPLY][unit as usize] -= 1;
                 self.zones[p as usize][Z_FACEUP][unit as usize] += 1;
                 let d = def(unit);
                 if d.mercenary && self.has_deployed(p, unit) {
-                    let hexes = self.hexes_of(p, unit);
-                    let h = hexes[0];
+                    let h = self.hexes_of(p, unit)[0];
                     self.push_cont(Cont::MercenaryManeuver { hex: h as u8 });
                 }
                 if d.footman_v2 && self.has_deployed(p, unit) {
                     self.push_cont(Cont::FootmanInstantDeploy { coin: unit });
                 }
-                self.finish();
             }
-            Move { from, to } => {
+            Move { from, to } | TacLightCav { from, to } => {
                 self.spend_maneuver_coin(p, from as usize, pay);
                 self.do_move(from as usize, to as usize);
-                self.finish();
             }
             Control { from } => {
                 self.spend_maneuver_coin(p, from as usize, pay);
                 self.do_control(from as usize);
-                self.finish();
             }
-            Attack { from, target } => {
+            Attack { from, target } | TacArcher { from, target } | TacCrossbow { from, target } => {
                 self.spend_maneuver_coin(p, from as usize, pay);
                 self.do_attack(from as usize, target as usize);
-                self.finish();
-            }
-            TacArcher { from, target } => {
-                self.spend_maneuver_coin(p, from as usize, pay);
-                self.do_attack(from as usize, target as usize);
-                self.finish();
-            }
-            TacCrossbow { from, target } => {
-                self.spend_maneuver_coin(p, from as usize, pay);
-                self.do_attack(from as usize, target as usize);
-                self.finish();
             }
             TacCavalryMove { from, to } => {
                 self.spend_maneuver_coin(p, from as usize, pay);
                 self.do_move(from as usize, to as usize);
                 self.push_cont(Cont::CavalryAttack { hex: to });
-                self.finish();
-            }
-            TacEnsign { from, to } => {
-                self.zmove(p, pay, Z_FACEUP, ENSIGN);
-                self.do_move(from as usize, to as usize);
-                self.finish();
             }
             TacLancer { from, to, target } => {
                 self.spend_maneuver_coin(p, from as usize, pay);
                 self.move_stack(from as usize, to as usize);
                 self.do_attack(to as usize, target as usize);
-                self.finish();
             }
-            TacLightCav { from, to } => {
-                self.spend_maneuver_coin(p, from as usize, pay);
+            TacEnsign { from, to } => {
+                self.zmove(p, pay, Z_FACEUP, ENSIGN);
                 self.do_move(from as usize, to as usize);
-                self.finish();
             }
             TacMarshal { from, target } => {
                 self.zmove(p, pay, Z_FACEUP, MARSHAL);
                 self.do_attack(from as usize, target as usize);
-                self.finish();
             }
             TacRoyalGuard { from, to } => {
                 self.zmove(p, pay, Z_FACEUP, ROYAL_COIN);
                 self.do_move(from as usize, to as usize);
-                self.finish();
             }
             TacFootman { coin } => {
                 self.zmove(p, pay, Z_FACEUP, coin);
@@ -928,12 +895,10 @@ impl State {
                 if !hexes.is_empty() {
                     self.push_cont(Cont::FootmanManeuver { hexes });
                 }
-                self.finish();
             }
-            _ => {
-                self.finish();
-            }
+            _ => {}
         }
+        self.finish();
     }
 
     fn spend_maneuver_coin(&mut self, p: u8, hex: usize, pay: usize) {
