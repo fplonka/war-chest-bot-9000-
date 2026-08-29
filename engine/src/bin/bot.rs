@@ -5,114 +5,11 @@ use std::sync::{Arc, Mutex};
 use rayon::prelude::*;
 use warchest::arena::{Ask, Done, Hello, Reply, Request, PROTOCOL};
 use warchest::bot::{Brain, Mind, Session};
-#[cfg(feature = "gpu")]
 use warchest::cuda::Device;
-#[cfg(feature = "gpu")]
 use warchest::farm::Cards;
 use warchest::net::Net;
+use warchest::packed::Packed;
 use warchest::pbs::rules_table_hash;
-use warchest::search::{Budget, Cfg, Cfr};
-
-struct Options {
-    name: String,
-    weights: String,
-    mind: String,
-    temp: f32,
-    cfg: Cfg,
-    threads: usize,
-    devices: Vec<usize>,
-}
-
-fn value<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> Result<T, String> {
-    match args.iter().position(|x| x == name) {
-        Some(i) => args
-            .get(i + 1)
-            .ok_or_else(|| format!("{name} needs a value"))?
-            .parse()
-            .map_err(|_| format!("invalid value for {name}")),
-        None => Ok(default),
-    }
-}
-
-fn text(args: &[String], name: &str, default: &str) -> Result<String, String> {
-    match args.iter().position(|x| x == name) {
-        Some(i) => args
-            .get(i + 1)
-            .cloned()
-            .ok_or_else(|| format!("{name} needs a value")),
-        None => Ok(default.to_string()),
-    }
-}
-
-fn options() -> Result<Options, String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let s = value(&args, "--s", 512)?;
-    let cfr = text(&args, "--cfr", "dcfr")?;
-    let devices = text(&args, "--devices", "")?;
-    Ok(Options {
-        name: text(&args, "--name", "bot")?,
-        weights: text(&args, "--weights", "")?,
-        mind: text(&args, "--mind", "sog")?,
-        temp: value(&args, "--temp", 2.0)?,
-        cfg: Cfg {
-            s,
-            c: value(&args, "--c", 8.0)?,
-            batch: value(&args, "--batch", 8)?,
-            rounds: value(&args, "--rounds", 0)?,
-            puct: value(&args, "--puct", 1.5)?,
-            prior_temp: value(&args, "--prior-temp", 1.0)?,
-            cfr: Cfr::named(&cfr).ok_or_else(|| format!("unknown cfr rule {cfr}"))?,
-            budget: Budget::for_s(s),
-        },
-        threads: value(&args, "--threads", 0)?,
-        devices: if devices.is_empty() {
-            Vec::new()
-        } else {
-            devices
-                .split(',')
-                .map(|x| x.parse().map_err(|_| format!("invalid device {x}")))
-                .collect::<Result<_, _>>()?
-        },
-    })
-}
-
-fn brain(o: &Options) -> Result<Brain, String> {
-    #[cfg(not(feature = "gpu"))]
-    let _ = &o.devices;
-    let net = if o.mind == "sog" {
-        Net::load_bin(&o.weights).map_err(|e| format!("{}: {e}", o.weights))?
-    } else {
-        Net::default()
-    };
-    let mind = match o.mind.as_str() {
-        "random" => Mind::Random,
-        "greedy" => Mind::Greedy { temp: o.temp },
-        "sog" => {
-            #[cfg(feature = "gpu")]
-            {
-                if o.devices.is_empty() {
-                    return Err("sog needs an assigned GPU".into());
-                }
-                Mind::Sog(Arc::new(Cards::new(Device::new(
-                    &o.devices,
-                    &net,
-                    o.cfg,
-                    usize::MAX,
-                )?)))
-            }
-            #[cfg(not(feature = "gpu"))]
-            {
-                return Err("this bot was built without GPU support".into());
-            }
-        }
-        other => return Err(format!("unknown mind {other}")),
-    };
-    Ok(Brain {
-        mind,
-        net: Arc::new(net),
-        cfg: o.cfg,
-    })
-}
 
 fn work(
     ask: Ask,
@@ -149,13 +46,34 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let options = options()?;
-    let brain = brain(&options)?;
-    let threads = if options.threads == 0 {
-        std::thread::available_parallelism().map_or(8, |n| n.get())
-    } else {
-        options.threads
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let path = args.first().ok_or("usage: bot BOT_DIR --devices 0,1")?;
+    let packed = Packed::load(path.as_ref())?;
+    let device_text = args
+        .iter()
+        .position(|x| x == "--devices")
+        .and_then(|i| args.get(i + 1))
+        .ok_or("packed bot needs --devices")?;
+    let devices = device_text
+        .split(',')
+        .map(|x| x.parse().map_err(|_| format!("invalid device {x}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let cfg = packed.manifest.search.config()?;
+    let weights = packed.dir.join(&packed.manifest.weights);
+    let net = Net::load_bin(weights.to_str().ok_or("invalid weights path")?)
+        .map_err(|e| format!("{}: {e}", weights.display()))?;
+    let mind = Mind::Sog(Arc::new(Cards::new(Device::new(
+        &devices,
+        &net,
+        cfg,
+        usize::MAX,
+    )?)));
+    let brain = Brain {
+        mind,
+        net: Arc::new(net),
+        cfg,
     };
+    let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
@@ -165,7 +83,7 @@ fn run() -> Result<(), String> {
         out,
         "{}",
         serde_json::to_string(&Hello {
-            name: options.name,
+            name: packed.manifest.name,
             protocol: PROTOCOL,
             rules: rules_table_hash(),
         })
@@ -180,12 +98,12 @@ fn run() -> Result<(), String> {
         for id in request.drop {
             sessions.lock().unwrap().remove(&id);
         }
-        let asks: Vec<_> = request
+        let asks = request
             .go
             .into_iter()
             .map(|ask| (ask, true))
             .chain(request.watch.into_iter().map(|ask| (ask, false)))
-            .collect();
+            .collect::<Vec<_>>();
         if asks.is_empty() {
             continue;
         }

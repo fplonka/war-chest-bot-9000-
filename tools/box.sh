@@ -51,7 +51,7 @@ pull)
     if [ -z "$name" ]; then
         filters+=(--include '*/' --include '*.html' --include 'plotly.min.js'
                   --include 'log.json' --include 'epochs.jsonl'
-                  --include 'config.json'
+                  --include 'ladder.json' --include 'config.json'
                   --include 'NOTES.md' --include 'train.log' --exclude '*')
     fi
     mkdir -p "$local_dir/runs${name:+/$name}"

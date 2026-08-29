@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def digest(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def selected(snapshots):
@@ -23,7 +23,7 @@ def selected(snapshots):
     return [snapshots[i] for i in sorted(indices)]
 
 
-def pack(run, binary, out_dir=None, snapshot=None, name=None):
+def pack(run, binary, snapshot=None, name=None):
     import sys
 
     sys.path.insert(0, str(ROOT / "train"))
@@ -36,7 +36,7 @@ def pack(run, binary, out_dir=None, snapshot=None, name=None):
         raise SystemExit(f"{binary} does not exist. Build it with "
                          "cargo build --release --features gpu --bin bot")
     run = Path(run)
-    out_dir = Path(out_dir) if out_dir else run / "bots"
+    out_dir = run / "bots"
     log = json.loads((run / "log.json").read_text())
     cfg = log.get("cfg", {})
     snapshots = log.get("snapshots", [])
@@ -48,7 +48,7 @@ def pack(run, binary, out_dir=None, snapshot=None, name=None):
         raise SystemExit(f"{run} has no snapshot {snapshot!r}")
     if name and len(snaps) > 1:
         raise SystemExit("--name needs a single --snapshot")
-    if out_dir == run / "bots" and out_dir.exists():
+    if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     made = []
@@ -76,8 +76,8 @@ def pack(run, binary, out_dir=None, snapshot=None, name=None):
             "name": f"{run.name}.{bot}",
             "sha": checkpoint.get("git", cfg.get("git", "")),
             "binary": digest(directory / "bot"),
-            "mind": "sog",
             "weights": "weights.bin",
+            "weights_sha": digest(directory / "weights.bin"),
             "search": search,
             "minutes": round(snap["t"] / 60.0, 3),
             "note": f"{run.name} {snap['label']}, {snap['t'] / 60:.0f} min",
@@ -93,9 +93,8 @@ def main():
     ap.add_argument("--snapshot", default=None)
     ap.add_argument("--name", default=None)
     ap.add_argument("--bin", default=str(ROOT / "engine/target/release/bot"))
-    ap.add_argument("--out", default=None)
     args = ap.parse_args()
-    pack(args.run, Path(args.bin).resolve(), args.out, args.snapshot, args.name)
+    pack(args.run, Path(args.bin).resolve(), args.snapshot, args.name)
 
 
 if __name__ == "__main__":

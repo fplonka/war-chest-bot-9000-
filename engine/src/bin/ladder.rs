@@ -3,74 +3,12 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use serde::Serialize;
 use warchest::arena::{Draft, Hello, Reply, Request, Table, PROTOCOL};
+use warchest::packed::{Manifest, Packed};
 use warchest::pbs::rules_table_hash;
 use warchest::rng::Rng;
 use warchest::selfplay::DRAFT_POOL;
-
-#[derive(Clone, Deserialize, Serialize)]
-struct Search {
-    s: u32,
-    c: f32,
-    batch: usize,
-    rounds: u8,
-    puct: f32,
-    prior_temp: f32,
-    cfr: String,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-struct Manifest {
-    format: u32,
-    name: String,
-    sha: String,
-    binary: String,
-    mind: String,
-    #[serde(default)]
-    weights: String,
-    search: Search,
-    minutes: f64,
-    note: String,
-}
-
-#[derive(Clone)]
-struct Packed {
-    dir: PathBuf,
-    manifest: Manifest,
-}
-
-impl Packed {
-    fn load(path: &Path) -> Result<Packed, String> {
-        let raw = fs::read_to_string(path.join("bot.json"))
-            .map_err(|e| format!("{}: {e}", path.join("bot.json").display()))?;
-        let manifest: Manifest = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-        if manifest.format != 1 {
-            return Err(format!(
-                "{} has bot format {}",
-                path.display(),
-                manifest.format
-            ));
-        }
-        let executable = path.join("bot");
-        if !executable.is_file() {
-            return Err(format!("{} has no bot executable", path.display()));
-        }
-        let bytes = fs::read(&executable).map_err(|e| e.to_string())?;
-        let actual = format!("{:x}", Sha256::digest(bytes));
-        if !actual.starts_with(&manifest.binary) {
-            return Err(format!(
-                "{} does not match its packed binary",
-                path.display()
-            ));
-        }
-        Ok(Packed {
-            dir: path.to_path_buf(),
-            manifest,
-        })
-    }
-}
 
 struct BotProcess {
     child: Child,
@@ -83,26 +21,7 @@ impl BotProcess {
         let m = &bot.manifest;
         let mut command = Command::new(bot.dir.join("bot"));
         command
-            .arg("--name")
-            .arg(&m.name)
-            .arg("--mind")
-            .arg(&m.mind)
-            .arg("--weights")
-            .arg(bot.dir.join(&m.weights))
-            .arg("--s")
-            .arg(m.search.s.to_string())
-            .arg("--c")
-            .arg(m.search.c.to_string())
-            .arg("--batch")
-            .arg(m.search.batch.to_string())
-            .arg("--rounds")
-            .arg(m.search.rounds.to_string())
-            .arg("--puct")
-            .arg(m.search.puct.to_string())
-            .arg("--prior-temp")
-            .arg(m.search.prior_temp.to_string())
-            .arg("--cfr")
-            .arg(&m.search.cfr)
+            .arg(&bot.dir)
             .arg("--devices")
             .arg(devices)
             .stdin(Stdio::piped())
@@ -115,6 +34,9 @@ impl BotProcess {
         output.read_line(&mut line).map_err(|e| e.to_string())?;
         let hello: Hello = serde_json::from_str(&line)
             .map_err(|e| format!("{} sent an invalid greeting: {e}", m.name))?;
+        if hello.name != m.name {
+            return Err(format!("{} identified as {}", m.name, hello.name));
+        }
         if hello.protocol != PROTOCOL {
             return Err(format!(
                 "{} speaks protocol {}, not {}",
@@ -174,6 +96,10 @@ struct PairResult {
     draws: usize,
     games: usize,
     score: f64,
+    elo: f64,
+    elo_low: f64,
+    elo_high: f64,
+    color_pairs: Vec<[f32; 2]>,
 }
 
 #[derive(Serialize)]
@@ -218,22 +144,24 @@ fn play_pair(
         BotProcess::launch(b, &devices[1 % devices.len()])?,
     ];
     let mut table = Table::new();
-    let mut points = Vec::new();
-    for (g, draft) in drafts(seed, games / 2).into_iter().enumerate() {
-        for (round, seats) in [[0, 1], [1, 0]].into_iter().enumerate() {
-            let id = (2 * g + round) as u32;
+    let mut color_pairs = vec![[0.0; 2]; games / 2];
+    for (pair, draft) in drafts(seed, games / 2).into_iter().enumerate() {
+        for (color, seats) in [[0, 1], [1, 0]].into_iter().enumerate() {
+            let id = (2 * pair + color) as u32;
             table.start(id, &draft, seats, seed ^ id as u64)?;
         }
         while table.live() >= concurrent {
-            step(&mut table, &mut bots, &mut points)?;
+            step(&mut table, &mut bots, &mut color_pairs)?;
         }
     }
     while table.live() > 0 {
-        step(&mut table, &mut bots, &mut points)?;
+        step(&mut table, &mut bots, &mut color_pairs)?;
     }
-    let wins = points.iter().filter(|&&x| x > 0.0).count();
-    let losses = points.iter().filter(|&&x| x < 0.0).count();
-    let draws = points.len() - wins - losses;
+    let wins = color_pairs.iter().flatten().filter(|&&x| x > 0.0).count();
+    let losses = color_pairs.iter().flatten().filter(|&&x| x < 0.0).count();
+    let draws = games - wins - losses;
+    let score = (wins as f64 + 0.5 * draws as f64) / games as f64;
+    let (elo, elo_low, elo_high) = paired_elo(&color_pairs);
     Ok(PairResult {
         a: a.manifest.name.clone(),
         b: b.manifest.name.clone(),
@@ -242,19 +170,35 @@ fn play_pair(
         wins,
         losses,
         draws,
-        games: points.len(),
-        score: (wins as f64 + 0.5 * draws as f64) / points.len().max(1) as f64,
+        games,
+        score,
+        elo,
+        elo_low,
+        elo_high,
+        color_pairs,
     })
+}
+
+fn paired_elo(outcomes: &[[f32; 2]]) -> (f64, f64, f64) {
+    let point = |x: f32| (x.signum() as f64 + 1.0) / 2.0;
+    let pairs = outcomes.iter().map(|x| (point(x[0]) + point(x[1])) / 2.0);
+    let n = outcomes.len() as f64;
+    let p = (pairs.clone().sum::<f64>() + 0.5) / (n + 1.0);
+    let variance = (pairs.map(|x| (x - p).powi(2)).sum::<f64>() + (0.5 - p).powi(2)) / n;
+    let error = 1.96 * (variance / (n + 1.0)).sqrt();
+    let elo =
+        |x: f64| 400.0 * (x.clamp(1e-9, 1.0 - 1e-9) / (1.0 - x.clamp(1e-9, 1.0 - 1e-9))).log10();
+    (elo(p), elo(p - error), elo(p + error))
 }
 
 fn step(
     table: &mut Table,
     bots: &mut [BotProcess; 2],
-    points: &mut Vec<f32>,
+    outcomes: &mut [[f32; 2]],
 ) -> Result<(), String> {
     table.settle();
-    for (_, seats, utility) in table.reap() {
-        points.push(if seats[0] == 0 { utility } else { -utility });
+    for (id, seats, utility) in table.reap() {
+        outcomes[id as usize / 2][id as usize % 2] = if seats[0] == 0 { utility } else { -utility };
     }
     for (index, bot) in bots.iter_mut().enumerate() {
         let request = table.request(index);
@@ -402,8 +346,16 @@ fn run() -> Result<(), String> {
             &devices,
         )?;
         println!(
-            "{} vs {}: W{} L{} D{} score {:.3}",
-            result.a, result.b, result.wins, result.losses, result.draws, result.score
+            "{} vs {}: W{} L{} D{} score {:.3}, Elo {:+.0} [{:+.0}, {:+.0}]",
+            result.a,
+            result.b,
+            result.wins,
+            result.losses,
+            result.draws,
+            result.score,
+            result.elo,
+            result.elo_low,
+            result.elo_high
         );
         report.pairs.push(result);
         if let Some(path) = &output {

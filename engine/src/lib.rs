@@ -11,6 +11,7 @@ pub mod cuda;
 #[cfg(feature = "gpu")]
 pub mod farm;
 pub mod net;
+pub mod packed;
 pub mod pbs;
 pub mod policy;
 pub mod rng;
