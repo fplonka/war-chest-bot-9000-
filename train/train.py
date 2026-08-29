@@ -330,10 +330,10 @@ def policy_loss(net, xpub, phi, weight, seg, nseg, policy, stats=None):
     if desc.shape[0] == 0 or pact.shape[0] == 0:
         return None
     cards = net.cards(xpub)
-    physical = xpub[0::2]
-    tokens = net.tokens(physical, cards[0::2])
-    board, projected, spatial = net.position(physical, tokens)
-    _f, g, fp = net.configs(phi, cards[:, :NSLOT], seg)
+    tokens = net.tokens(xpub, cards)
+    board, projected, spatial = net.position(xpub, tokens)
+    own = cards.reshape(-1, 2, NSLOT, cards.shape[-1]).flatten(0, 1)
+    _f, g, fp = net.configs(phi, own, seg)
     h = net.heads(board, g, weight, seg, nseg)
     action_query = torch.zeros(desc.shape[0], dtype=torch.long, device=desc.device)
     action_query.scatter_(0, pact, seg[pcfg])

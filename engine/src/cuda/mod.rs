@@ -1315,7 +1315,7 @@ impl Card {
                     let mut wrote = 0;
                     for w in &tile {
                         let ow = each(mine[w.call]).1;
-                        let base = (CARD_ROWS * w.call) as u32;
+                        let base = (2 * w.call) as u32;
                         for (d, &q) in dst[wrote..wrote + w.len].iter_mut().zip(&ow[w.at..w.at + w.len]) {
                             *d = q + base;
                         }

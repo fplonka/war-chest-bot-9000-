@@ -273,6 +273,11 @@ fn hex_neighbours() -> Vec<u8> {
     crate::board::neighbour_gather()
 }
 
+#[pyfunction]
+fn hex_mirror() -> Vec<u8> {
+    (0..crate::board::N_HEXES).map(|h| crate::state::mirror_hex(h) as u8).collect()
+}
+
 
 #[pyfunction]
 fn sample_rows(games: usize, seed: u64) -> Vec<u8> {
@@ -396,6 +401,7 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ROW_BYTES", crate::pbs::ROW_BYTES)?;
     m.add_function(wrap_pyfunction!(rules_table_hash, m)?)?;
     m.add_function(wrap_pyfunction!(hex_neighbours, m)?)?;
+    m.add_function(wrap_pyfunction!(hex_mirror, m)?)?;
     m.add_function(wrap_pyfunction!(set_weights, m)?)?;
     m.add_function(wrap_pyfunction!(gen_data, m)?)?;
     m.add("ENT_NAMES", Ent::NAME.to_vec())?;

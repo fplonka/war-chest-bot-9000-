@@ -423,7 +423,7 @@ __global__ void k_cfg_slots(const float* phi, const unsigned int* owner,
     if (j == 0) slots[i] = phi[(size_t)cfg * cfeat + k];
     else if (j == 1) slots[i] = phi[(size_t)cfg * cfeat + nslot + k];
     else if (j == 2) slots[i] = phi[(size_t)cfg * cfeat + 2 * nslot + k];
-    else slots[i] = cards[((size_t)owner[cfg] * ntype + k) * type + j - 3];
+    else slots[i] = cards[((size_t)owner[cfg] * nslot + k) * type + j - 3];
 }
 
 __global__ void k_sum_slots(const float* hidden, float* out, int n, int nslot,
@@ -443,7 +443,7 @@ __global__ void k_bag(const float* bag, const float* phi,
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n * pool) return;
     int cfg = i / pool, j = i % pool;
-    const float* v = bag + (size_t)owner[cfg] * ntype * 3 * pool;
+    const float* v = bag + (size_t)owner[cfg] * nslot * 3 * pool;
     float acc = 0.0f;
     for (int k = 0; k < nslot; ++k)
         for (int zone = 0; zone < 3; ++zone) {

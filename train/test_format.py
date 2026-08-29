@@ -100,7 +100,7 @@ def main():
     rng = np.random.default_rng(0)
     b = make_batch(tr, rng, dev)
     xpub, phi, w, seg, y, nseg, policy = b
-    assert xpub.shape == (2 * len(tr[0]), PUBFEAT), xpub.shape
+    assert xpub.shape == (len(tr[0]), PUBFEAT), xpub.shape
     assert phi.shape[1] == CFEAT
     assert seg.max() == 2 * len(tr[0]) - 1
     assert nseg == 2 * len(tr[0])

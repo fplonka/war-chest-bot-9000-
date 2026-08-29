@@ -89,7 +89,7 @@ def slot_permutation(perm):
 def slot_invariance(net, rng, perms=6):
     sizes = [4, 3, 6, 2, 5, 5]
     queries = len(sizes)
-    xpub = public_rows(rng, queries)
+    xpub = public_rows(rng, queries // 2)
     seg, phi, weight = belief(rng, sizes)
     base = run(net, xpub, phi, weight, seg, queries)
     spread = float(base.std())
@@ -111,8 +111,8 @@ def slot_invariance(net, rng, perms=6):
 
 def offboard_pile_visibility(net, rng):
     sizes = [1, 1]
-    xpub = public_rows(rng, len(sizes))
-    hexes = xpub[:, :N_HEXES * HEX_CH].reshape(len(sizes), N_HEXES, HEX_CH)
+    xpub = public_rows(rng, len(sizes) // 2)
+    hexes = xpub[:, :N_HEXES * HEX_CH].reshape(len(sizes) // 2, N_HEXES, HEX_CH)
     hexes[:, :, HEX_FACTS] = 0.0
     seg, phi, weight = belief(rng, sizes)
     base = run(net, xpub, phi, weight, seg, len(sizes))

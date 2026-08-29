@@ -176,10 +176,9 @@ class Net(nn.Module):
 
     def forward(self, xpub, phi, weight, seg, nseg):
         cards = self.cards(xpub)
-        physical = xpub[0::2]
-        p = self.board(physical, self.tokens(physical, cards[0::2]))
-
-        f, g, _fp = self.configs(phi, cards[:, :NSLOT], seg)
+        p = self.board(xpub, self.tokens(xpub, cards))
+        own = cards.reshape(-1, 2, NSLOT, TYPE).flatten(0, 1)
+        f, g, _fp = self.configs(phi, own, seg)
         h = self.heads(p, g, weight, seg, nseg)
         return (f * h[seg]).sum(1) + self.value_bias
 

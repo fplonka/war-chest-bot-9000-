@@ -1205,7 +1205,7 @@ impl Solver {
         let fresh_cfgs = self.counts.cfgs - self.batch_cfgs;
         if self.cards.is_empty() && (fresh_rows > 0 || fresh_cfgs > 0) {
             let (me, other) = (self.ctx.slots[0], self.ctx.slots[1]);
-            self.net.cards(&[me, other, other, me].concat(), &mut self.cards);
+            self.net.cards(&[me, other].concat(), &mut self.cards);
         }
         if fresh_rows > 0 {
             let at = self.batch_boards * ROW_BYTES;
