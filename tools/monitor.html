@@ -205,7 +205,9 @@ function render(d) {
   const ladder = d.ladder;
   const ladderText = ladder ? ladder.pairs.map(p =>
     `${p.a} (${p.a_minutes}m) vs ${p.b} (${p.b_minutes}m)  ` +
-    `W${p.wins} L${p.losses} D${p.draws}  score ${fmt(p.score)}`).join("\n") : "";
+    `Elo ${p.elo >= 0 ? "+" : ""}${p.elo.toFixed(0)} ` +
+    `[${p.elo_low.toFixed(0)}, ${p.elo_high.toFixed(0)}]  ` +
+    `W${p.wins} L${p.losses} D${p.draws} · ${p.games} games`).join("\n") : "";
   $("laddertitle").style.display = $("ladder").style.display = ladderText ? "" : "none";
   setText($("ladder"), ladderText);
 

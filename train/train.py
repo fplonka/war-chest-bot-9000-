@@ -1175,7 +1175,7 @@ def main():
     subprocess.run([sys.executable, str(ROOT / "tools" / "pack.py"),
                     args.out], check=True)
     subprocess.run([str(ROOT / "engine" / "target" / "release" / "ladder"),
-                    args.out, "--games", "16"], check=True)
+                    args.out], check=True)
 
 
 if __name__ == "__main__":
