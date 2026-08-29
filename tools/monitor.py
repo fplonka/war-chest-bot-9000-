@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(HERE, "tools")
@@ -21,6 +22,10 @@ import config
 
 LIVE = 120
 EPOCH_LIMIT = 2048
+
+
+def mtime(path):
+    return os.path.getmtime(path) if os.path.exists(path) else 0
 
 
 def read_json(path):
@@ -66,8 +71,6 @@ def last_jsonl(path):
 
 
 def read_epochs(path, limit=EPOCH_LIMIT):
-    if limit <= 0:
-        return []
     try:
         with open(path, "rb") as f:
             f.seek(0, 2)
@@ -89,9 +92,7 @@ def read_epochs(path, limit=EPOCH_LIMIT):
                 if got is not None and start not in starts:
                     starts.add(start)
                     out.append(got)
-            f.seek(max(0, size - (64 << 10)))
-            last = next((got for raw in reversed(f.read().splitlines())
-                         if (got := jsonl_record(raw)) is not None), None)
+            last = last_jsonl(path) or None
             if last is not None:
                 if len(out) == limit:
                     out[-1] = last
@@ -106,17 +107,16 @@ def finite(v):
     return v if isinstance(v, (int, float)) and math.isfinite(v) else None
 
 
-def series(label, y, smooth=False, err=None):
-    return {"n": label, "y": [finite(v) for v in y], "sm": smooth,
-            "e": [finite(v) for v in err] if err else None}
+def series(label, y, smooth=False):
+    return {"n": label, "y": [finite(v) for v in y], "sm": smooth}
 
 
-def panel(title, ylabel, x, ss, zero=False, hlines=(), marks=False):
+def panel(title, ylabel, x, ss, zero=False, hlines=()):
     ss = [s for s in ss if any(v is not None for v in s["y"])]
     if not ss:
         return None
     return {"t": title, "y": ylabel, "x": [finite(v) for v in x], "s": ss,
-            "zero": zero, "h": list(hlines), "marks": marks}
+            "zero": zero, "h": list(hlines)}
 
 
 PANELS = (
@@ -235,35 +235,33 @@ def health(eps):
     horizon_games = max(tot("games"), 1)
     horizon = 100 * sum(e.get("horizon_frac", 0) * e.get("games", 0)
                         for e in eps) / horizon_games
-    out = [("wall clock", f"{last.get('t', 0) / 60:.0f} min"),
-           ("solves", f"{tot('solves'):,}"),
-           ("solves/s", f"{last.get('solves_per_s', 0):.0f}"),
-           ("buffer", f"{last.get('buf', 0):,}"),
-           ("dropped queries", f"{tot('dropped'):,}"),
-           ("games cut at horizon", f"{horizon:.1f}%")]
-    if "effective_train_ratio" in last:
-        out += [("effective train ratio", f"{last['effective_train_ratio']:.3f} /solve"),
-                ("passes per row", f"{last.get('train_row_ratio', 0):.3f}"),
-                ("gradient norm / clipped",
-                 f"{last.get('grad_norm', 0):.2f} / {last.get('grad_clip_frac', 0):.1%}"),
-                ("weight norm", f"{last.get('weight_norm', 0):.1f}"),
-                ("value outcome RMSE / corr",
-                 f"{last.get('value_outcome_rmse', 0):.3f} / "
-                 f"{last.get('value_outcome_corr', 0):.3f}"),
-                ("search KL from prior", f"{last.get('policy_search_kl', 0):.3f}"),
-                ("replay warm / play / query",
-                 f"{last.get('replay_warm_frac', 0):.0%} / "
-                 f"{last.get('replay_play_frac', 0):.0%} / "
-                 f"{last.get('replay_query_frac', 0):.0%}"),
-                ("target age p90 / oldest",
-                 f"{last.get('sample_age_p90', 0) / 60:.1f} / "
-                 f"{last.get('target_age_max', 0) / 60:.1f} min"),
-                ("target delivery delay p90",
-                 f"{last.get('sample_delay_p90', 0) / 60:.1f} min"),
-                ("zero-sum RMS / max",
-                 f"{last.get('zero_sum_rms', 0):.2e} / "
-                 f"{last.get('zero_sum_max', 0):.2e}")]
-    return out
+    return [("wall clock", f"{last.get('t', 0) / 60:.0f} min"),
+            ("solves", f"{tot('solves'):,}"),
+            ("solves/s", f"{last.get('solves_per_s', 0):.0f}"),
+            ("buffer", f"{last.get('buf', 0):,}"),
+            ("dropped queries", f"{tot('dropped'):,}"),
+            ("games cut at horizon", f"{horizon:.1f}%"),
+            ("effective train ratio", f"{last.get('effective_train_ratio', 0):.3f} /solve"),
+            ("passes per row", f"{last.get('train_row_ratio', 0):.3f}"),
+            ("gradient norm / clipped",
+             f"{last.get('grad_norm', 0):.2f} / {last.get('grad_clip_frac', 0):.1%}"),
+            ("weight norm", f"{last.get('weight_norm', 0):.1f}"),
+            ("value outcome RMSE / corr",
+             f"{last.get('value_outcome_rmse', 0):.3f} / "
+             f"{last.get('value_outcome_corr', 0):.3f}"),
+            ("search KL from prior", f"{last.get('policy_search_kl', 0):.3f}"),
+            ("replay warm / play / query",
+             f"{last.get('replay_warm_frac', 0):.0%} / "
+             f"{last.get('replay_play_frac', 0):.0%} / "
+             f"{last.get('replay_query_frac', 0):.0%}"),
+            ("target age p90 / oldest",
+             f"{last.get('sample_age_p90', 0) / 60:.1f} / "
+             f"{last.get('target_age_max', 0) / 60:.1f} min"),
+            ("target delivery delay p90",
+             f"{last.get('sample_delay_p90', 0) / 60:.1f} min"),
+            ("zero-sum RMS / max",
+             f"{last.get('zero_sum_rms', 0):.2e} / "
+             f"{last.get('zero_sum_max', 0):.2e}")]
 
 
 SUMMARY = {}
@@ -274,11 +272,7 @@ def index(runs_dir):
     for path in glob.glob(os.path.join(runs_dir, "*", "log.json")):
         name = os.path.basename(os.path.dirname(path))
         epoch_path = os.path.join(os.path.dirname(path), "epochs.jsonl")
-        try:
-            epoch_mt = os.path.getmtime(epoch_path)
-        except OSError:
-            epoch_mt = 0
-        mt = max(os.path.getmtime(path), epoch_mt)
+        mt = max(mtime(path), mtime(epoch_path))
         hit = SUMMARY.get(name)
         if not hit or hit[0] != mt:
             log = read_json(path) or {}
@@ -294,26 +288,26 @@ def index(runs_dir):
     return sorted(out, key=lambda r: -r["mtime"])
 
 
+def run_dir(runs_dir, name):
+    path = os.path.abspath(os.path.join(runs_dir, name))
+    return path if os.path.dirname(path) == runs_dir and os.path.isdir(path) else ""
+
+
 def detail(runs_dir, name):
-    path = os.path.join(runs_dir, name)
-    if not os.path.isdir(path):
+    path = run_dir(runs_dir, name)
+    if not path:
         return None
     log = read_json(os.path.join(path, "log.json")) or {}
     eps = [e for e in read_epochs(os.path.join(path, "epochs.jsonl"))
            if e.get("phase") == "sog" and e.get("solves", 0) > 0
            and e.get("steps", 1) > 0]
     cfg = log.get("cfg") or {}
-    out = {"name": name, "epochs": len(eps),
-           "cfg": [[k, str(v), ch] for k, v, ch in config.knobs(cfg)],
-           "panels": panels(eps),
-           "health": health(eps),
-           "snaps": [s.get("t", 0) / 60.0 for s in log.get("snapshots") or []]}
-    for key, val in (("note", cfg.get("note")), ("git", cfg.get("git")),
-                     ("log", read_text(f"{path}/train.log")),
-                     ("notes", read_text(f"{path}/NOTES.md"))):
-        if val:
-            out[key] = val
-    return out
+    return {"name": name, "epochs": len(eps), "panels": panels(eps),
+            "cfg": [[k, str(v), ch] for k, v, ch in config.knobs(cfg)],
+            "health": health(eps), "note": cfg.get("note", ""),
+            "git": cfg.get("git", ""), "log": read_text(f"{path}/train.log"),
+            "notes": read_text(f"{path}/NOTES.md"),
+            "snaps": [s.get("t", 0) / 60.0 for s in log.get("snapshots") or []]}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -323,19 +317,22 @@ class Handler(BaseHTTPRequestHandler):
             return self.body(read_text(PAGE, 1 << 20).encode(), "text/html")
         if route in ASSETS:
             filename, ctype = ASSETS[route]
-            try:
-                with open(os.path.join(TOOLS, "vendor", filename), "rb") as f:
-                    raw = f.read()
-            except OSError:
-                return self.send_error(404)
-            return self.body(raw, ctype)
+            with open(os.path.join(TOOLS, "vendor", filename), "rb") as f:
+                return self.body(f.read(), ctype)
         if route == "/api/runs":
             return self.body(json.dumps(index(self.server.runs)).encode(),
                              "application/json")
-
-    @staticmethod
-    def safe_name(name):
-        return os.sep not in name and name not in ("", ".", "..") and not name.startswith(".")
+        if route.startswith("/api/run/"):
+            got = detail(self.server.runs, unquote(route[len("/api/run/"):]))
+            return (self.body(json.dumps(got).encode(), "application/json")
+                    if got else self.send_error(404))
+        if route.startswith("/run/") and route.endswith("/train.log"):
+            name = unquote(route[len("/run/"):-len("/train.log")])
+            raw = read_text(os.path.join(run_dir(self.server.runs, name),
+                                         "train.log"), 1 << 24)
+            return (self.body(raw.encode(), "text/plain; charset=utf-8")
+                    if raw else self.send_error(404))
+        self.send_error(404)
 
     def body(self, raw, ctype):
         self.send_response(200)

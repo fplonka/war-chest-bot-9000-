@@ -19,7 +19,6 @@ button.on{background:var(--line);font-weight:700}
 .live{color:#20a37a}
 h1{font-size:14px;margin:0 0 2px}
 h2{font-size:12px;margin:22px 0 6px;color:var(--mut)}
-#list h2{margin:10px 0 2px;padding:0 10px;font-size:10px;letter-spacing:.08em;text-transform:uppercase}
 .meta,.none{color:var(--mut);margin:0 0 6px}
 .note{margin:0 0 8px}
 .delta{display:flex;flex-wrap:wrap;gap:2px 16px;color:var(--mut);margin-bottom:12px}
@@ -35,13 +34,6 @@ h2{font-size:12px;margin:22px 0 6px;color:var(--mut)}
 dl{display:flex;flex-wrap:wrap;gap:0 22px;margin:4px 0}
 dt{font-size:11px;color:var(--mut)}
 dd{margin:0 0 4px}
-table{border-collapse:collapse;margin:4px 0 10px}
-th,td{text-align:right;padding:1px 14px 1px 0;white-space:nowrap}
-th{color:var(--mut);font-weight:400;border-bottom:1px solid var(--line)}
-th:first-child,td:first-child{text-align:left}
-.track{display:inline-block;width:64px;height:9px;background:var(--line);vertical-align:middle;margin-right:5px}
-.bar{height:9px;min-width:1px;background:#3d8bfd}
-td.rate{text-align:left;width:118px}
 pre{max-height:340px;overflow:auto;margin:4px 0;font:inherit;white-space:pre-wrap}
 #loglink{margin-left:8px;font-size:11px;color:#3d8bfd}
 </style>
@@ -53,7 +45,6 @@ pre{max-height:340px;overflow:auto;margin:4px 0;font:inherit;white-space:pre-wra
  <p class=meta id=charthelp>drag zoom · wheel zoom · middle-drag pan · double-click reset</p>
  <div class=grid id=panels></div>
  <dl id=health></dl>
- 
  <div id=text></div>
 </main>
 <script src=/vendor/uPlot.iife.min.js></script>
@@ -123,15 +114,6 @@ function overlays(state) {
       const x = u.valToPos(t, "x", true);
       ctx.beginPath(); ctx.moveTo(x, bbox.top); ctx.lineTo(x, bbox.top + bbox.height); ctx.stroke();
     }
-    ctx.setLineDash([]);
-    state.panel.s.forEach((s, si) => (s.e || []).forEach((err, i) => {
-      const val = s.sm ? ema(s.y)[i] : s.y[i];
-      if (err == null || val == null) return;
-      const x = u.valToPos(state.panel.x[i], "x", true);
-      ctx.strokeStyle = COLORS[si % COLORS.length]; ctx.beginPath();
-      ctx.moveTo(x, u.valToPos(val - err, "y", true));
-      ctx.lineTo(x, u.valToPos(val + err, "y", true)); ctx.stroke();
-    }));
     ctx.restore();
   }}};
 }
@@ -151,7 +133,7 @@ function makePlot(box, p, snaps) {
     const stroke = colors[i % colors.length];
     if (s.sm) series.push({label: s.n, class: "raw", stroke, width: 1,
       alpha: .22, auto: false, points: {show: false}, spanGaps: false});
-    series.push({label: s.n, stroke, width: 1.5, points: {show: p.marks},
+    series.push({label: s.n, stroke, width: 1.5, points: {show: false},
       spanGaps: false,
       value: (u, v, si, idx) => fmt(idx == null ? null : state.panel.s[i].y[idx])});
   });
@@ -175,15 +157,6 @@ function clearPlots() {
   plots.forEach(p => p.u.destroy()); plots = [];
 }
 
-function table(head, rows) {
-  const t = E("table"), hr = E("tr");
-  head.forEach(c => hr.appendChild(E("th", null, c)));
-  t.appendChild(hr);
-  rows.forEach(r => { const tr = E("tr");
-    r.forEach(c => tr.appendChild(E("td", null, c))); t.appendChild(tr); });
-  return t;
-}
-
 // Scroll position is the whole point of redrawing in place, so a <pre> that the
 // user has scrolled keeps its offset unless it was already following the tail.
 function setText(el, s) {
@@ -191,81 +164,6 @@ function setText(el, s) {
   const at = el.scrollTop, bottom = at + el.clientHeight >= el.scrollHeight - 4;
   el.textContent = s;
   el.scrollTop = bottom ? el.scrollHeight : at;
-}
-
-// paired sign test — games come in colour-swapped pairs over a shared draft, so
-// the pair is the independent trial and its p-value is the verdict.
-  box.appendChild(E("h2", null,
-    name + " · elo vs " + (l.anchor || "anchor") + ", 95% CI = 1.96 × SE"));
-  const num = (v, f) => v == null ? "—" : f(v);
-  box.appendChild(table(["bot", "trained", "elo", "95% CI", "games", "score"],
-    (l.players || []).slice().sort((a, b) => (b.elo ?? -1e9) - (a.elo ?? -1e9))
-      .map(p => [p.name, num(p.minutes, v => v.toFixed(0) + " min"),
-                 num(p.elo, v => v.toFixed(0)),
-                 num(p.se, v => "±" + (1.96 * v).toFixed(0)),
-                 p.games ?? "—", p.score.toFixed(3)])));
-  box.appendChild(table(["pairing", "W–L–D", "score", "pairs", "p"],
-    (l.pairs || []).slice().sort((a, b) => b.score - a.score)
-      .map(p => [p.a + " vs " + p.b, `${p.w}–${p.l}–${p.d}`, p.score.toFixed(3),
-                 `${p.paired_w}–${p.paired_l}`,
-                 p.paired_p == null ? "—" : p.paired_p.toPrecision(2)])));
-}
-
-// A rate per bucket per bot, with the count each rests on: a bucket of nine
-// says less than a bucket of ninety and the bar alone would not show it, and
-// a rate says little at all until it sits beside another bot's.
-function bars(box, title, names, rows) {
-  box.appendChild(E("h2", null, title));
-  const t = E("table");
-  const head = E("tr");
-  head.appendChild(E("th", null, ""));
-  head.appendChild(E("th", null, "n"));
-  names.forEach(n => head.appendChild(E("th", null, n)));
-  t.appendChild(head);
-  rows.filter(([, cells]) => cells[0] && cells[0].n).forEach(([label, cells]) => {
-    const tr = E("tr");
-    tr.appendChild(E("td", null, label));
-    tr.appendChild(E("td", null, String(cells[0].n)));
-    cells.forEach(c => {
-      const cell = E("td", "rate");
-      const track = E("div", "track");
-      const bar = E("div", "bar");
-      bar.style.width = `${(100 * c.rate).toFixed(1)}%`;
-      track.appendChild(bar);
-      cell.appendChild(track);
-      cell.appendChild(E("span", null, `${(100 * c.rate).toFixed(1)}%`));
-      tr.appendChild(cell);
-    });
-    t.appendChild(tr);
-  });
-  box.appendChild(t);
-}
-
-  clearPlots();
-  $("title").textContent = d.name;
-    .forEach(id => $(id).textContent = "");
-  $("loglink").style.display = "none";
-  $("charthelp").style.display = "none";
-  shape = "";
-    $("meta").textContent = `${d.players.length} bots · ${d.games} games per pairing`;
-  }
-  if (d.kind === "tablebase") {
-    const bots = d.bots;
-    const names = bots.map(b => b.bot);
-    $("meta").textContent =
-      `${names.length} bots · ${d.questions} proven positions from ${d.source}`;
-    const col = (pick) => bots.map(pick);
-    bars(box, "kept the win", names,
-         [["overall", col(b => ({n: b.questions, rate: b.rate}))]]);
-    // Sharpness, not depth, is what separates bots: a position with one right
-    // move is hard however few plies are left in it.
-    bars(box, "by share of moves that win", names,
-         Object.keys(bots[0].by_share).map(k => [k, col(b => b.by_share[k])]));
-    bars(box, "by plies to the win", names,
-         Object.keys(bots[0].by_depth).map(k => [k, col(b => b.by_depth[k])]));
-    bars(box, "by hidden information", names,
-         [["none left", col(b => b.known)], ["some left", col(b => b.hidden)]]);
-  }
 }
 
 function render(d) {
@@ -303,7 +201,6 @@ function render(d) {
   d.health.forEach(([k, v]) => { hl.appendChild(E("dt", null, k));
     hl.appendChild(E("dd", null, v)); });
 
-
   const text = $("text");
   if (!text.firstChild) ["notes", "train.log"].forEach(h => {
     text.appendChild(E("h2", null, h)); text.appendChild(E("pre")); });
@@ -313,38 +210,36 @@ function render(d) {
     setText(pre, s); });
 }
 
-// One entry, in whichever group it belongs to. `sel` is "runs/<name>" or
-function entry(a, kind, name, sub, live) {
-  const key = kind + "/" + name;
-  const b = E("button", key === sel ? "on" : null);
+function entry(a, name, sub, live) {
+  const b = E("button", name === sel ? "on" : null);
   b.appendChild(E("span", null, name));
   const line = E("span", "sub");
   if (live) line.appendChild(E("span", "live", "● "));
   line.appendChild(document.createTextNode(sub));
   b.appendChild(line);
-  b.onclick = () => { sel = key; location.hash = encodeURIComponent(key);
+  b.onclick = () => { sel = name; location.hash = encodeURIComponent(name);
                       shape = ""; poll(); };
   a.appendChild(b);
 }
 
+function list(runs) {
   const a = $("list"), at = a.scrollTop;
   a.textContent = "";
-  runs.forEach(r => entry(a, "runs", r.name,
+  runs.forEach(r => entry(a, r.name,
     [r.epochs + " ep", r.minutes + "m", r.phase, r.note].filter(Boolean).join(" · "),
     r.running));
   a.scrollTop = at;
 }
 
 async function poll() {
+  const runs = await api("/api/runs");
   if (runs) {
-    if (!sel && runs.length) sel = "runs/" + runs[0].name;
+    if (!sel && runs.length) sel = runs[0].name;
+    list(runs);
   }
   if (!sel) return;
-  const name = sel.slice(sel.indexOf("/") + 1);
-  } else {
-    const d = await api("/api/run/" + encodeURIComponent(name));
-    if (d) render(d);
-  }
+  const d = await api("/api/run/" + encodeURIComponent(sel));
+  if (d) render(d);
 }
 
 addEventListener("resize", () => plots.forEach(p =>
