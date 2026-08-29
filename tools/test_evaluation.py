@@ -20,11 +20,15 @@ class EvaluationTest(unittest.TestCase):
             run.mkdir()
             (run / "log.json").write_text(json.dumps({
                 "cfg": {}, "snapshots": []}))
-            (run / "ladder.json").write_text(json.dumps({
-                "complete": True, "pairs": [{"games": 2}]}))
+            report = {"complete": True, "pairs": [{"games": 2}]}
+            (run / "ladder.json").write_text(json.dumps(report))
+            comparisons = run / "comparisons"
+            comparisons.mkdir()
+            (comparisons / "baseline.json").write_text(json.dumps(report))
             detail = monitor.detail(root, "sample")
             self.assertTrue(detail["ladder"]["complete"])
             self.assertEqual(detail["ladder"]["pairs"][0]["games"], 2)
+            self.assertEqual(detail["comparisons"][0]["pairs"][0]["games"], 2)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+BOT = ROOT / "engine/target/release/bot"
 
 
 def digest(path):
@@ -23,7 +24,7 @@ def selected(snapshots):
     return [snapshots[i] for i in sorted(indices)]
 
 
-def pack(run, binary, snapshot=None, name=None):
+def pack(run):
     import sys
 
     sys.path.insert(0, str(ROOT / "train"))
@@ -31,23 +32,16 @@ def pack(run, binary, snapshot=None, name=None):
     from export_weights import write_bin
     from value_net import Net
 
-    binary = Path(binary)
-    if not binary.exists():
-        raise SystemExit(f"{binary} does not exist. Build it with "
-                         "cargo build --release --features gpu --bin bot")
+    if not BOT.exists():
+        raise SystemExit(f"{BOT} does not exist. Run tools/box.sh go")
     run = Path(run)
     out_dir = run / "bots"
     log = json.loads((run / "log.json").read_text())
     cfg = log.get("cfg", {})
     snapshots = log.get("snapshots", [])
-    if snapshot is None:
-        snaps = selected(snapshots)
-    else:
-        snaps = [snap for snap in snapshots if snap["label"] == snapshot]
+    snaps = selected(snapshots)
     if not snaps:
-        raise SystemExit(f"{run} has no snapshot {snapshot!r}")
-    if name and len(snaps) > 1:
-        raise SystemExit("--name needs a single --snapshot")
+        raise SystemExit(f"{run} has no snapshots")
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -66,11 +60,11 @@ def pack(run, binary, snapshot=None, name=None):
                   "cfr": "dcfr"}
         final = snap is snapshots[-1]
         stem = Path(snap["file"]).stem.removeprefix("snap_")
-        bot = name or ("final" if final else f"{stem}-{snap['label']}")
+        bot = "final" if final else f"{stem}-{snap['label']}"
         directory = out_dir / bot
         directory.mkdir(parents=True, exist_ok=False)
         write_bin(net, directory / "weights.bin")
-        shutil.copy2(binary, directory / "bot")
+        shutil.copy2(BOT, directory / "bot")
         (directory / "bot.json").write_text(json.dumps({
             "format": 1,
             "name": f"{run.name}.{bot}",
@@ -90,11 +84,8 @@ def pack(run, binary, snapshot=None, name=None):
 def main():
     ap = argparse.ArgumentParser(description="Pack selected run checkpoints as bots.")
     ap.add_argument("run")
-    ap.add_argument("--snapshot", default=None)
-    ap.add_argument("--name", default=None)
-    ap.add_argument("--bin", default=str(ROOT / "engine/target/release/bot"))
     args = ap.parse_args()
-    pack(args.run, Path(args.bin).resolve(), args.snapshot, args.name)
+    pack(args.run)
 
 
 if __name__ == "__main__":

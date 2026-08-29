@@ -272,8 +272,11 @@ def index(runs_dir):
     for path in glob.glob(os.path.join(runs_dir, "*", "log.json")):
         name = os.path.basename(os.path.dirname(path))
         epoch_path = os.path.join(os.path.dirname(path), "epochs.jsonl")
-        mt = max(mtime(path), mtime(epoch_path),
-                 mtime(os.path.join(os.path.dirname(path), "ladder.json")))
+        evaluation = glob.glob(os.path.join(os.path.dirname(path),
+                                            "comparisons", "*.json"))
+        mt = max([mtime(path), mtime(epoch_path),
+                  mtime(os.path.join(os.path.dirname(path), "ladder.json"))]
+                 + [mtime(p) for p in evaluation])
         hit = SUMMARY.get(name)
         if not hit or hit[0] != mt:
             log = read_json(path) or {}
@@ -309,6 +312,9 @@ def detail(runs_dir, name):
             "git": cfg.get("git", ""), "log": read_text(f"{path}/train.log"),
             "notes": read_text(f"{path}/NOTES.md"),
             "ladder": read_json(f"{path}/ladder.json"),
+            "comparisons": [report for report in
+                            (read_json(p) for p in sorted(glob.glob(
+                                f"{path}/comparisons/*.json"))) if report],
             "snaps": [s.get("t", 0) / 60.0 for s in log.get("snapshots") or []]}
 
 

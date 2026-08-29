@@ -137,11 +137,11 @@ fn play_pair(
     games: usize,
     seed: u64,
     concurrent: usize,
-    devices: &[String],
+    devices: &[&str],
 ) -> Result<PairResult, String> {
     let mut bots = [
-        BotProcess::launch(a, &devices[0])?,
-        BotProcess::launch(b, &devices[1 % devices.len()])?,
+        BotProcess::launch(a, devices[0])?,
+        BotProcess::launch(b, devices[1 % devices.len()])?,
     ];
     let mut table = Table::new();
     let mut color_pairs = vec![[0.0; 2]; games / 2];
@@ -209,9 +209,6 @@ fn step(
 }
 
 fn series(path: &Path) -> Result<Vec<Packed>, String> {
-    if path.join("bot").is_file() {
-        return Packed::load(path).map(|bot| vec![bot]);
-    }
     let root = path.join("bots");
     let mut bots = Vec::new();
     for entry in fs::read_dir(&root).map_err(|e| format!("{}: {e}", root.display()))? {
@@ -232,19 +229,13 @@ fn series(path: &Path) -> Result<Vec<Packed>, String> {
     Ok(bots)
 }
 
-fn pairings(groups: &[Vec<Packed>]) -> Vec<(Packed, Packed)> {
-    if groups.len() == 1 {
-        return groups[0]
-            .windows(2)
-            .map(|pair| (pair[0].clone(), pair[1].clone()))
-            .collect();
-    }
-    let anchor = &groups[0];
-    groups[1..]
-        .iter()
-        .flat_map(|other| {
-            anchor.iter().map(move |a| {
-                let b = other
+fn pairings<'a>(a: &'a [Packed], b: Option<&'a [Packed]>) -> Vec<(&'a Packed, &'a Packed)> {
+    match b {
+        None => a.windows(2).map(|pair| (&pair[0], &pair[1])).collect(),
+        Some(b) => a
+            .iter()
+            .map(|a| {
+                let b = b
                     .iter()
                     .min_by(|x, y| {
                         (x.manifest.minutes - a.manifest.minutes)
@@ -252,10 +243,10 @@ fn pairings(groups: &[Vec<Packed>]) -> Vec<(Packed, Packed)> {
                             .total_cmp(&(y.manifest.minutes - a.manifest.minutes).abs())
                     })
                     .unwrap();
-                (a.clone(), b.clone())
+                (a, b)
             })
-        })
-        .collect()
+            .collect(),
+    }
 }
 
 fn write_report(path: &Path, report: &Report) -> Result<(), String> {
@@ -266,14 +257,6 @@ fn write_report(path: &Path, report: &Report) -> Result<(), String> {
     fs::rename(tmp, path).map_err(|e| e.to_string())
 }
 
-fn flag<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T {
-    args.iter()
-        .position(|x| x == name)
-        .and_then(|i| args.get(i + 1))
-        .and_then(|x| x.parse().ok())
-        .unwrap_or(default)
-}
-
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");
@@ -282,41 +265,31 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let paths: Vec<PathBuf> = args
-        .iter()
-        .take_while(|x| !x.starts_with("--"))
-        .map(PathBuf::from)
-        .collect();
-    if paths.is_empty() {
-        return Err("usage: ladder <bot-or-run>... [--games N] [--out FILE]".into());
+    let paths: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
+    if !(1..=2).contains(&paths.len()) {
+        return Err("usage: ladder <run> [other-run]".into());
     }
-    let games = flag(&args, "--games", 200usize);
-    if games < 2 || games % 2 != 0 {
-        return Err("--games must be a positive even number".into());
-    }
-    let seed = flag(&args, "--seed", 83u64);
-    let concurrent = flag(&args, "--concurrent", 128usize).max(1);
-    let device_text = flag(&args, "--devices", "0,1".to_string());
-    let devices: Vec<String> = device_text.split(',').map(str::to_string).collect();
-    if devices.is_empty() {
-        return Err("--devices cannot be empty".into());
-    }
-    let groups: Vec<Vec<Packed>> = paths
-        .iter()
-        .map(|path| series(path))
-        .collect::<Result<_, _>>()?;
-    let pairs = pairings(&groups);
+    let a = series(&paths[0])?;
+    let b = paths.get(1).map(|path| series(path)).transpose()?;
+    let pairs = pairings(&a, b.as_deref());
     if pairs.is_empty() {
         return Err("evaluation needs at least two bots".into());
     }
-    let mut manifests = groups
-        .iter()
-        .flatten()
-        .map(|x| x.manifest.clone())
-        .collect::<Vec<_>>();
+    let bots = pairs.iter().flat_map(|(a, b)| [&a.manifest, &b.manifest]);
+    let mut manifests = bots.cloned().collect::<Vec<_>>();
     manifests.sort_by(|x, y| x.name.cmp(&y.name));
     manifests.dedup_by(|x, y| x.name == y.name);
+    let games = 200;
+    let seed = 83;
+    let devices = ["0", "1"];
+    let output = if paths.len() == 1 {
+        paths[0].join("ladder.json")
+    } else {
+        let dir = paths[1].join("comparisons");
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let baseline = paths[0].file_name().ok_or("baseline run needs a name")?;
+        dir.join(format!("{}.json", baseline.to_string_lossy()))
+    };
     let mut report = Report {
         format: 1,
         complete: false,
@@ -327,24 +300,8 @@ fn run() -> Result<(), String> {
         bots: manifests,
         pairs: Vec::new(),
     };
-    let output = args
-        .iter()
-        .position(|x| x == "--out")
-        .and_then(|i| args.get(i + 1))
-        .map(PathBuf::from)
-        .or_else(|| {
-            (paths.len() == 1 && paths[0].join("bots").is_dir())
-                .then(|| paths[0].join("ladder.json"))
-        });
     for (index, (a, b)) in pairs.iter().enumerate() {
-        let result = play_pair(
-            a,
-            b,
-            games,
-            seed.wrapping_add(index as u64),
-            concurrent,
-            &devices,
-        )?;
+        let result = play_pair(a, b, games, seed + index as u64, 128, &devices)?;
         println!(
             "{} vs {}: W{} L{} D{} score {:.3}, Elo {:+.0} [{:+.0}, {:+.0}]",
             result.a,
@@ -358,15 +315,8 @@ fn run() -> Result<(), String> {
             result.elo_high
         );
         report.pairs.push(result);
-        if let Some(path) = &output {
-            write_report(path, &report)?;
-        }
+        write_report(&output, &report)?;
     }
     report.complete = true;
-    if let Some(path) = &output {
-        write_report(path, &report)?;
-    } else {
-        println!("{}", serde_json::to_string_pretty(&report).unwrap());
-    }
-    Ok(())
+    write_report(&output, &report)
 }

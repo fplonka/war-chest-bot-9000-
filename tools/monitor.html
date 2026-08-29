@@ -46,6 +46,7 @@ pre{max-height:340px;overflow:auto;margin:4px 0;font:inherit;white-space:pre-wra
  <div class=grid id=panels></div>
  <dl id=health></dl>
  <h2 id=laddertitle>checkpoint ladder</h2><pre id=ladder></pre>
+ <h2 id=comparisonstitle>comparisons</h2><pre id=comparisons></pre>
  <div id=text></div>
 </main>
 <script src=/vendor/uPlot.iife.min.js></script>
@@ -202,14 +203,16 @@ function render(d) {
   d.health.forEach(([k, v]) => { hl.appendChild(E("dt", null, k));
     hl.appendChild(E("dd", null, v)); });
 
-  const ladder = d.ladder;
-  const ladderText = ladder ? ladder.pairs.map(p =>
+  const reportText = report => report ? report.pairs.map(p =>
     `${p.a} (${p.a_minutes}m) vs ${p.b} (${p.b_minutes}m)  ` +
     `Elo ${p.elo >= 0 ? "+" : ""}${p.elo.toFixed(0)} ` +
     `[${p.elo_low.toFixed(0)}, ${p.elo_high.toFixed(0)}]  ` +
     `W${p.wins} L${p.losses} D${p.draws} · ${p.games} games`).join("\n") : "";
-  $("laddertitle").style.display = $("ladder").style.display = ladderText ? "" : "none";
-  setText($("ladder"), ladderText);
+  [["ladder", reportText(d.ladder)],
+   ["comparisons", d.comparisons.map(reportText).join("\n")]].forEach(([id, text]) => {
+    $(id + "title").style.display = $(id).style.display = text ? "" : "none";
+    setText($(id), text);
+  });
 
   const text = $("text");
   if (!text.firstChild) ["notes", "train.log"].forEach(h => {

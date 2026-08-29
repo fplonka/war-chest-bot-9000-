@@ -1169,9 +1169,6 @@ def main():
     snapshot("final", time.time() - t0)
     del value, opt, probe, buf
     torch.cuda.empty_cache()
-    subprocess.run(["cargo", "build", "--release", "--features", "gpu",
-                    "--bin", "bot", "--bin", "ladder"],
-                   cwd=ROOT / "engine", check=True)
     subprocess.run([sys.executable, str(ROOT / "tools" / "pack.py"),
                     args.out], check=True)
     subprocess.run([str(ROOT / "engine" / "target" / "release" / "ladder"),

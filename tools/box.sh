@@ -22,7 +22,7 @@ build_script="find engine/src engine/tests -type f -exec touch {} +
 cd engine
 maturin develop --release --features python,gpu >/tmp/maturin.log 2>&1 || { tail -40 /tmp/maturin.log; exit 1; }
 tail -2 /tmp/maturin.log
-cargo build --release --features gpu --bin ladder >/tmp/ladder.log 2>&1 || { tail -40 /tmp/ladder.log; exit 1; }
+cargo build --release --features gpu --bin bot --bin ladder >/tmp/ladder.log 2>&1 || { tail -40 /tmp/ladder.log; exit 1; }
 tail -1 /tmp/ladder.log"
 
 case "${1:-}" in
@@ -51,8 +51,9 @@ pull)
     if [ -z "$name" ]; then
         filters+=(--include '*/' --include '*.html' --include 'plotly.min.js'
                   --include 'log.json' --include 'epochs.jsonl'
-                  --include 'ladder.json' --include 'config.json'
-                  --include 'NOTES.md' --include 'train.log' --exclude '*')
+                  --include 'ladder.json' --include 'comparisons/*.json'
+                  --include 'config.json' --include 'NOTES.md'
+                  --include 'train.log' --exclude '*')
     fi
     mkdir -p "$local_dir/runs${name:+/$name}"
     rsync -az -e "ssh ${ssh_opts[*]}" "${filters[@]}" \
@@ -122,6 +123,18 @@ go)
     "$0" sync
     "$0" start "$out" bash -c "($build_script) && exec bash tools/resume_train.sh $(printf '%q ' "$@")"
     "$0" follow "$out" "$out"
+    ;;
+compare)
+    baseline=${2:?usage: compare BASELINE CANDIDATE}
+    candidate=${3:?usage: compare BASELINE CANDIDATE}
+    [ "$#" -eq 3 ] || { echo "usage: compare BASELINE CANDIDATE" >&2; exit 2; }
+    baseline=${baseline#runs/}
+    candidate=${candidate#runs/}
+    case "$baseline$candidate" in *[!A-Za-z0-9._-]*) echo "run names must not contain paths" >&2; exit 2;; esac
+    tag="compare-$baseline-$candidate"
+    "$0" start "$tag" engine/target/release/ladder "runs/$baseline" "runs/$candidate"
+    "$0" follow "$tag" "$candidate"
+    echo "comparison -> runs/$candidate/comparisons/$baseline.json"
     ;;
 "")  sed -n '2,9p' "$0" ;;
 *)   run_remote "$*" ;;

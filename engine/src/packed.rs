@@ -45,7 +45,6 @@ pub struct Manifest {
     pub note: String,
 }
 
-#[derive(Clone)]
 pub struct Packed {
     pub dir: PathBuf,
     pub manifest: Manifest,
