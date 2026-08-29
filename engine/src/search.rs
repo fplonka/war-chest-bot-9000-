@@ -64,8 +64,6 @@ impl Budget {
             Vec::<T>::with_capacity(n).capacity() * std::mem::size_of::<T>()
         }
         cap::<TNode>(self.cap(Ent::Node))
-            + cap::<crate::state::State>(self.cap(Ent::Node))
-            + cap::<u32>(self.cap(Ent::Node)) * 8
             + cap::<u32>(self.cap(Ent::Cidx))
             + cap::<u32>(self.cap(Ent::Row)) * 4
             + cap::<f32>(self.cap(Ent::Cell))
@@ -295,6 +293,14 @@ pub fn node_actions(s: &State, player: u8, ctx: &Ctx, cfgs: &[Config]) -> (Vec<A
 }
 
 pub struct TNode {
+    pub state: State,
+    pub parent: u32,
+    pub nc: [u32; 2],
+    pub roff: u32,
+    pub voff: u32,
+    pub soff: u32,
+    pub row_of: u32,
+    pub primed: bool,
     pub util: f32,
     pub player: u8,
     pub leaf: bool,
@@ -378,11 +384,6 @@ impl TNode {
     pub fn na(&self) -> usize {
         self.acts.len()
     }
-    #[inline]
-    pub fn nc(&self, p: usize) -> usize {
-        self.cfgs[p].len()
-    }
-
     #[inline]
     pub fn legal_row(&self, c: usize) -> std::ops::Range<usize> {
         self.legal_off[c] as usize..self.legal_off[c + 1] as usize
@@ -484,8 +485,9 @@ fn give_config_buf(v: Vec<f32>) {
     });
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum Phase {
+    #[default]
     Fresh,
     Iterating,
     Reading,
@@ -497,6 +499,7 @@ pub enum Step {
     Done(Option<Solved>),
 }
 
+#[derive(Default)]
 pub struct Solver {
     pub(crate) ctx: Ctx,
     net: Arc<Net>,
@@ -511,12 +514,9 @@ pub struct Solver {
     query_nodes: Vec<usize>,
     pub(crate) cfg: Cfg,
     pub nodes: Vec<TNode>,
-    pub states: Vec<State>,
-    pub parent: Vec<u32>,
     resealed: Vec<u32>,
     pub root_belief: [Belief; 2],
     pub cur: Vec<f32>,
-    pub(crate) soff: Vec<u32>,
     pub avg: Vec<f32>,
     pub grown: Vec<u32>,
     pub(crate) avg_touched: [bool; 2],
@@ -529,12 +529,7 @@ pub struct Solver {
     nrvd_start: usize,
     ndraw_start: usize,
     budget_hit: u8,
-    pub(crate) roff: Vec<u32>,
-    pub(crate) voff: Vec<u32>,
-    pub(crate) row_of: Vec<u32>,
-    pub(crate) primed: Vec<bool>,
     wants_prior: Vec<u32>,
-    pub nc: Vec<[u32; 2]>,
     pub(crate) steps: [usize; 2],
 
     pub leaf_rows: Vec<usize>,
@@ -592,80 +587,21 @@ impl Solver {
             cfg.budget.cap(Ent::Config)
         );
         let cfgs: [Arc<[Config]>; 2] = [belief[0].cfg.as_slice().into(), belief[1].cfg.as_slice().into()];
-        let mut sv = Solver {
-            ctx,
-            net,
-            rng,
-            slot: 0,
-            collect: None,
-            at: 0,
-            expansions: 0,
-            phase: Phase::Fresh,
-            queries: Vec::new(),
-            query_seen: 0,
-            query_nodes: Vec::new(),
-            cfg,
-            nodes: take_nodes(),
-            states: Vec::new(),
-            parent: Vec::new(),
-            resealed: Vec::new(),
-            root_belief: belief,
-            cur: Vec::new(),
-            row_of: Vec::new(),
-            primed: Vec::new(),
-            wants_prior: Vec::new(),
-            soff: Vec::new(),
-            avg: Vec::new(),
-            grown: Vec::new(),
-            avg_touched: [false; 2],
-            ncells: 0,
-            nreach: 0,
-            nvals: 0,
-            ndraws: 0,
-            nlegal_off: 0,
-            nrev_start: 0,
-            nrvd_start: 0,
-            ndraw_start: 0,
-            budget_hit: 0,
-            roff: Vec::new(),
-            voff: Vec::new(),
-            nc: Vec::new(),
-            steps: [0, 0],
-            leaf_rows: Vec::new(),
-            term_leaves: Vec::new(),
-            leaf_cidx: Vec::new(),
-            leaf_coff: Vec::new(),
-            cphi: take_config_buf(),
-            cplayer: Vec::new(),
-            cmap: std::collections::HashMap::with_capacity_and_hasher(1024, KeyHash),
-            board_of: Vec::new(),
-            bmap: std::collections::HashMap::with_capacity_and_hasher(1024, KeyHash),
-            nboards: 0,
-            ncfg: 0,
-            batch_rows: 0,
-            batch_boards: 0,
-            batch_cfgs: 0,
-            cards: Vec::new(),
-            packed: Vec::new(),
-            mirror0: Vec::new(),
-            abandon: false,
-            draw_scratch: DrawScratch::default(),
-            cell_order: Vec::new(),
-            contract: Arc::new(crate::contract::Contract::default()),
-            sent_from: 0,
-            rewrite: Vec::new(),
-            resent: Vec::new(),
-            sent_cells: 0,
-            seed: 0,
-            sent: Default::default(),
-        };
-        {
-            sv.nodes.reserve(640);
-            sv.cur.reserve(640);
-            sv.seed = Rng::new(sv.rng.next_u64()).0;
-            let root = sv.push_node(crate::contract::NO_ROW, root.clone(), cfgs);
-            sv.expand(root);
-        }
+        let mut sv = Solver::default();
+        sv.ctx = ctx;
+        sv.net = net;
+        sv.rng = rng;
+        sv.cfg = cfg;
+        sv.root_belief = belief;
+        sv.nodes = take_nodes();
+        sv.cphi = take_config_buf();
+        sv.cmap = std::collections::HashMap::with_capacity_and_hasher(1024, KeyHash);
+        sv.bmap = std::collections::HashMap::with_capacity_and_hasher(1024, KeyHash);
+        sv.nodes.reserve(640);
+        sv.cur.reserve(640);
+        sv.seed = Rng::new(sv.rng.next_u64()).0;
+        let root = sv.push_node(crate::contract::NO_ROW, root.clone(), cfgs);
+        sv.expand(root);
         sv
     }
 
@@ -730,7 +666,7 @@ impl Solver {
         let mut cut = 0;
         for node in std::mem::take(&mut self.query_nodes) {
             let beliefs = std::array::from_fn(|p| {
-                let n = self.nc[node][p] as usize;
+                let n = self.nodes[node].nc[p] as usize;
                 let mut w = vec![0.0; n];
                 normalize_weights(&reach[cut..cut + n], &mut w);
                 cut += n;
@@ -739,7 +675,7 @@ impl Solver {
                     p: w,
                 }
             });
-            self.queries.push((self.states[node].clone(), beliefs));
+            self.queries.push((self.nodes[node].state, beliefs));
         }
         assert_eq!(cut, reach.len(), "query reach reply has a trailing tail");
     }
@@ -762,12 +698,8 @@ impl Solver {
             self.ncells.max(self.nodes.len())
         };
         if !self.reserve(Ent::Node, self.nodes.len() + 1)
-            || !self.reserve(
-                Ent::Reach,
-                (self.nreach + c0 + c1)
-                    .max(self.nvals + c0.max(c1))
-                    .max(self.reach_aux()),
-            )
+            || !self.reserve(Ent::Reach, self.nreach + c0 + c1)
+            || !self.reserve(Ent::Reach, self.nvals + c0.max(c1))
             || !self.reserve(Ent::Cell, next_cell)
             || !self.reserve(Ent::Row, next_row)
             || (parent == crate::contract::NO_ROW && !self.reserve(Ent::Config, (c0 + c1).div_ceil(2)))
@@ -776,6 +708,14 @@ impl Solver {
         }
         let id = self.nodes.len();
         self.nodes.push(TNode {
+            state: s,
+            parent,
+            nc: [c0 as u32, c1 as u32],
+            roff: self.nreach as u32,
+            voff: self.nvals as u32,
+            soff: self.ncells as u32,
+            row_of: u32::MAX,
+            primed: false,
             util: if terminal { s.utility(player as usize) } else { 0.0 },
             player,
             leaf: true,
@@ -800,25 +740,17 @@ impl Solver {
             action_cell: Vec::new(),
             cell_row: Vec::new(),
         });
-        self.parent.push(parent);
-        self.nc.push([c0 as u32, c1 as u32]);
-        self.soff.push(self.ncells as u32);
-        self.roff.push(self.nreach as u32);
-        self.voff.push(self.nvals as u32);
         self.nreach += c0 + c1;
         self.nvals += c0.max(c1);
-        self.primed.push(false);
-        self.row_of.push(u32::MAX);
         if terminal {
             self.term_leaves.push(id);
         } else if coin {
-            self.row_of[id] = (self.leaf_coff.len() / 2) as u32;
-            self.push_row(id, &s, &cfgs);
+            self.nodes[id].row_of = (self.leaf_coff.len() / 2) as u32;
+            self.push_row(&s, &cfgs);
             if !self.abandon {
                 self.leaf_rows.push(id);
             }
         }
-        self.states.push(s);
         id
     }
 
@@ -863,7 +795,7 @@ impl Solver {
             if !self.set_exhausted(at) {
                 return;
             }
-            match self.parent[at] {
+            match self.nodes[at].parent {
                 crate::contract::NO_ROW => return,
                 p => at = p as usize,
             }
@@ -917,8 +849,8 @@ impl Solver {
     }
 
     fn rootb_len(&self) -> usize {
-        match self.nc.first() {
-            Some(&[a, b]) => (a as usize + b as usize).div_ceil(2),
+        match self.nodes.first() {
+            Some(n) => (n.nc[0] as usize + n.nc[1] as usize).div_ceil(2),
             None => 0,
         }
     }
@@ -980,21 +912,13 @@ impl Solver {
     }
 
     fn rewind(&mut self, id: usize, m: Mark) {
-        if m.nodes < self.roff.len() {
-            self.nreach = self.roff[m.nodes] as usize;
-            self.nvals = self.voff[m.nodes] as usize;
+        if let Some(n) = self.nodes.get(m.nodes) {
+            self.nreach = n.roff as usize;
+            self.nvals = n.voff as usize;
         }
         self.nodes.truncate(m.nodes);
-        self.states.truncate(m.nodes);
-        self.parent.truncate(m.nodes);
         self.resealed.retain(|&i| (i as usize) < m.nodes);
-        self.nc.truncate(m.nodes);
-        self.soff.truncate(m.nodes);
-        self.roff.truncate(m.nodes);
-        self.voff.truncate(m.nodes);
-        self.primed.truncate(m.nodes);
         self.wants_prior.retain(|&i| (i as usize) < m.nodes);
-        self.row_of.truncate(m.nodes);
         self.leaf_rows.truncate(m.leaf_rows);
         self.board_of.truncate(m.leaf_rows);
         self.nboards = m.nboards;
@@ -1036,10 +960,10 @@ impl Solver {
 
     fn alloc_cells(&mut self, id: usize) {
         let cells = self.nodes[id].legal_action.len();
-        self.soff[id] = self.ncells as u32;
+        self.nodes[id].soff = self.ncells as u32;
         self.ncells += cells;
         let n = &self.nodes[id];
-        let nc = n.nc(n.player as usize);
+        let nc = n.nc[n.player as usize] as usize;
         let mut u = vec![0.0f32; cells];
         for c in 0..nc {
             let row = n.legal_row(c);
@@ -1053,14 +977,14 @@ impl Solver {
 
     fn grow(&mut self, id: usize) {
         debug_assert!(self.nodes[id].leaf, "only a leaf can be grown");
-        if self.row_of[id] != u32::MAX {
+        if self.nodes[id].row_of != u32::MAX {
             self.wants_prior.push(id as u32);
         }
         if self.abandon {
             return;
         }
         let mark = self.mark();
-        let s = self.states[id].clone();
+        let s = self.nodes[id].state;
         debug_assert!(!s.is_terminal(), "a terminal has nothing to grow");
         let cfgs = self.nodes[id].cfgs.clone();
         self.nodes[id].leaf = false;
@@ -1099,26 +1023,19 @@ impl Solver {
                 self.rewind(id, mark);
                 return;
             }
-            if !wp && cs.round > self.states[0].round + self.cfg.rounds as u16 {
+            if !wp && cs.round > self.nodes[0].state.round + self.cfg.rounds as u16 {
                 for n in &mut self.nodes[mark.nodes..] {
                     n.expandable = false;
                 }
             }
             let extra_draw_start = draw.rows() + 1;
-            let extra_rvd = self.nc[ch][me] as usize + 1;
+            let extra_rvd = self.nodes[ch].nc[me] as usize + 1;
             let n = &mut self.nodes[id];
             n.chance = true;
             n.child = vec![ch];
             if !self.reserve(Ent::Draw, self.ndraws + draw.len())
-                || !self.reserve(
-                    Ent::Reach,
-                    self.nreach
-                        .max(self.nvals)
-                        .max(self.nlegal_off)
-                        .max(self.nrev_start)
-                        .max(self.nrvd_start + extra_rvd)
-                        .max(self.ndraw_start + extra_draw_start),
-                )
+                || !self.reserve(Ent::Reach, self.nrvd_start + extra_rvd)
+                || !self.reserve(Ent::Reach, self.ndraw_start + extra_draw_start)
             {
                 self.rewind(id, mark);
                 return;
@@ -1254,7 +1171,7 @@ impl Solver {
         }
 
         let extra_legal = legal_off.len();
-        let extra_rev: usize = child.iter().map(|&c| self.nc[c][me] as usize + 1).sum();
+        let extra_rev: usize = child.iter().map(|&c| self.nodes[c].nc[me] as usize + 1).sum();
         let extra_cells = legal_action.len();
         let n = &mut self.nodes[id];
         n.acts = acts;
@@ -1277,15 +1194,9 @@ impl Solver {
         if !self.reserve(
             Ent::Cell,
             (self.ncells + extra_cells).max(self.nodes.len().saturating_sub(1)),
-        ) || !self.reserve(
-            Ent::Reach,
-            self.nreach
-                .max(self.nvals)
-                .max(self.nlegal_off + extra_legal)
-                .max(self.nrev_start + extra_rev)
-                .max(self.nrvd_start)
-                .max(self.ndraw_start),
-        ) {
+        ) || !self.reserve(Ent::Reach, self.nlegal_off + extra_legal)
+            || !self.reserve(Ent::Reach, self.nrev_start + extra_rev)
+        {
             self.rewind(id, mark);
             return;
         }
@@ -1321,7 +1232,7 @@ impl Solver {
         b
     }
 
-    fn push_row(&mut self, _id: usize, s: &State, cfgs: &[Arc<[Config]>; 2]) {
+    fn push_row(&mut self, s: &State, cfgs: &[Arc<[Config]>; 2]) {
         debug_assert!(s.is_valued(), "a network row must be a valued decision");
         if !self.reserve(Ent::Row, (self.leaf_rows.len() + 1).max(self.term_leaves.len())) {
             return;
@@ -1495,8 +1406,8 @@ impl Solver {
                 let node = query_rows[e % rows];
                 QueryPick {
                     iter: (e / rows) as u32,
-                    reach: self.roff[node],
-                    len: self.nc[node][0] + self.nc[node][1],
+                    reach: self.nodes[node].roff,
+                    len: self.nodes[node].nc[0] + self.nodes[node].nc[1],
                 }
             })
             .collect();
@@ -1521,7 +1432,7 @@ impl Solver {
         let nvals = self.nvals as u32;
         let vals_at = match self.collect {
             None => [(0, 0); 2],
-            Some(_) => [(self.voff[0], self.nc[0][0]), (nvals + self.voff[0], self.nc[0][1])],
+            Some(_) => [(self.nodes[0].voff, self.nodes[0].nc[0]), (nvals + self.nodes[0].voff, self.nodes[0].nc[1])],
         };
         let (at, cells) = self.root_cells();
         calls.push(Call::Read {
@@ -1538,7 +1449,7 @@ impl Solver {
         self.avg = vec![0.0; at + cells];
         self.avg[at..at + cells].copy_from_slice(&r.b);
         self.collect?;
-        let n0 = self.nc[0][0] as usize;
+        let n0 = self.nodes[0].nc[0] as usize;
         let value = [r.a[..n0].to_vec(), r.a[n0..].to_vec()];
         let policy = self.root_policy();
         let queries = std::mem::take(&mut self.queries);
@@ -1550,7 +1461,7 @@ impl Solver {
         if n.leaf || n.chance {
             (0, 0)
         } else {
-            (self.soff[0] as usize, n.legal_action.len())
+            (n.soff as usize, n.legal_action.len())
         }
     }
 
@@ -1619,13 +1530,13 @@ impl Solver {
         let mut queue = std::mem::take(&mut self.wants_prior);
         queue.retain(|&i| {
             let i = i as usize;
-            if self.primed[i] || self.nodes[i].leaf || self.nodes[i].chance {
+            if self.nodes[i].primed || self.nodes[i].leaf || self.nodes[i].chance {
                 return false;
             }
-            if self.row_of[i] == u32::MAX {
+            if self.nodes[i].row_of == u32::MAX {
                 return false;
             }
-            if (self.row_of[i] as usize) < self.batch_rows {
+            if (self.nodes[i].row_of as usize) < self.batch_rows {
                 want.push(i);
                 return false;
             }
@@ -1642,17 +1553,17 @@ impl Solver {
             let n = &self.nodes[i];
             prime.push(crate::farm::Prime {
                 node: i as u32,
-                row: self.row_of[i],
+                row: n.row_of,
                 at: (acts.len() / ACT_BYTES) as u32,
                 na: n.na() as u32,
                 cell_at: cells.len() as u32,
-                nc: n.nc(n.player as usize) as u32,
+                nc: n.nc[n.player as usize],
             });
             for a in 0..n.na() {
                 acts.extend(action_desc(&n.acts[a], n.player, &self.ctx, n.aslot[a]).map(u32::from));
             }
             cells.extend_from_slice(&n.legal_action);
-            self.primed[i] = true;
+            self.nodes[i].primed = true;
         }
         (prime, acts, cells)
     }
@@ -1669,9 +1580,9 @@ impl Solver {
                 .collect(),
             ..Default::default()
         };
-        let so = self.soff[0] as usize;
+        let so = self.nodes[0].soff as usize;
         out.off.push(0);
-        for c in 0..n.nc(me) {
+        for c in 0..n.nc[me] as usize {
             for cell in n.legal_row(c) {
                 out.act.push(n.legal_action[cell] as u16);
                 out.p.push(self.avg[so + cell]);
@@ -1684,7 +1595,7 @@ impl Solver {
     pub(crate) fn root_strategy(&self, config: usize) -> &[f32] {
         let row = self.nodes[0].legal_row(config);
         assert!(!self.avg.is_empty(), "the solve must finish before its average is read");
-        let so = self.soff[0] as usize;
+        let so = self.nodes[0].soff as usize;
         &self.avg[so + row.start..so + row.end]
     }
 }

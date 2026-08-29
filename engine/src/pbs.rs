@@ -11,7 +11,7 @@ pub const CCOUNTS: usize = 3 * NSLOT;
 pub const CFEAT: usize = CCOUNTS;
 pub const CNORM: f32 = 5.0;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Ctx {
     pub slots: [[u8; NSLOT]; 2],
     pub slot_of: [[i8; N_UNITS]; 2],

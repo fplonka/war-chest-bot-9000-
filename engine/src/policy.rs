@@ -153,7 +153,7 @@ pub fn root(sv: &Solver) -> NodePolicy {
     let n = &sv.nodes[0];
     let cfgs = n.cfgs[n.player as usize].as_ref();
     if n.legal_off.is_empty() {
-        return uniform(&sv.states[0], &sv.ctx, n.player, cfgs);
+        return uniform(&sv.nodes[0].state, &sv.ctx, n.player, cfgs);
     }
     let mut policy = NodePolicy {
         acts: n.acts.clone(),

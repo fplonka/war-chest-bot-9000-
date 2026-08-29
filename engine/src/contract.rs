@@ -230,11 +230,11 @@ impl Contract {
             };
             c.player[i] = t.player;
             c.exhausted[i] = t.exhausted as u32;
-            c.parent[i] = sv.parent[i];
-            c.nc[i] = sv.nc[i];
-            c.roff[i] = sv.roff[i];
-            c.voff[i] = sv.voff[i];
-            c.soff[i] = sv.soff[i];
+            c.parent[i] = t.parent;
+            c.nc[i] = t.nc;
+            c.roff[i] = t.roff;
+            c.voff[i] = t.voff;
+            c.soff[i] = t.soff;
             c.util[i] = t.util;
             c.child_at[i] = c.child.len() as u32;
             c.child_n[i] = t.child.len() as u32;
@@ -245,8 +245,8 @@ impl Contract {
             } else {
                 let base = c.legal_off.len() as u32;
                 let me = t.player as usize;
-                c.legal_off.extend_from_slice(&t.legal_off[..=t.nc(me)]);
-                let at = sv.soff[i] as usize;
+                c.legal_off.extend_from_slice(&t.legal_off[..=t.nc[me] as usize]);
+                let at = t.soff as usize;
                 let end = at + t.legal_action.len();
                 if c.legal_child.len() < end {
                     c.legal_child.resize(end, 0);
@@ -262,7 +262,7 @@ impl Contract {
                     c.cell_val[at + cell] = if tr == NO_TRANS {
                         NO_ROW
                     } else {
-                        sv.voff[t.legal_child[cell] as usize] + tr
+                        sv.nodes[t.legal_child[cell] as usize].voff + tr
                     };
                 }
                 base

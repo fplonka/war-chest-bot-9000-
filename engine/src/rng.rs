@@ -1,5 +1,11 @@
 pub struct Rng(pub u64);
 
+impl Default for Rng {
+    fn default() -> Rng {
+        Rng::new(0)
+    }
+}
+
 impl Rng {
     pub fn new(seed: u64) -> Rng {
         let s = seed ^ 0x9E3779B97F4A7C15;

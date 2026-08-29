@@ -471,10 +471,10 @@ fn a_contract_describes_every_node_of_the_tree() {
         let c = warchest::contract::Contract::of(&sv);
         assert_eq!(c.nodes(), sv.nodes.len(), "seed {seed}: node count");
         for i in 0..c.nodes() {
-            assert_eq!(c.nc[i], sv.nc[i], "seed {seed} node {i}: config counts");
-            assert_eq!(c.roff[i], sv.roff[i], "seed {seed} node {i}: reach offset");
-            assert_eq!(c.voff[i], sv.voff[i], "seed {seed} node {i}: value offset");
-            assert_eq!(c.soff[i], sv.soff[i], "seed {seed} node {i}: strategy offset");
+            assert_eq!(c.nc[i], sv.nodes[i].nc, "seed {seed} node {i}: config counts");
+            assert_eq!(c.roff[i], sv.nodes[i].roff, "seed {seed} node {i}: reach offset");
+            assert_eq!(c.voff[i], sv.nodes[i].voff, "seed {seed} node {i}: value offset");
+            assert_eq!(c.soff[i], sv.nodes[i].soff, "seed {seed} node {i}: strategy offset");
         }
         assert!(c.levels() >= 1, "seed {seed}: no levels");
         checked += 1;

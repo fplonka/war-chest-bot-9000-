@@ -248,7 +248,7 @@ pub fn keep_query(sv: &Solver, solved: Option<Solved>, out: &mut Data) -> Vec<(S
     };
     out.begin_solve();
     out.push_value(
-        &sv.states[0],
+        &sv.nodes[0].state,
         &sv.ctx,
         &sv.root_belief,
         [&solved.value[0], &solved.value[1]],

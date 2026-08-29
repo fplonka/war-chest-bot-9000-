@@ -24,7 +24,7 @@ use crate::pbs::{
     ROW_INITIATIVE, ROW_INIT_MOVED, ROW_PILES, ROW_PLIES, ROW_STACK_KIND, ROW_STACK_OWED,
     ROW_TO_ACT,
 };
-use crate::search::{Budget, Cfg, Cfr, Ent};
+use crate::search::{Cfg, Cfr, Ent};
 use crate::state::{CONT_CAP, MAX_MAIN_PLAYS, PENDING_KINDS};
 use crate::units::{write_card_features, CARD_FEATS, N_UNITS};
 
@@ -247,6 +247,31 @@ const TILE: usize = 16384;
 
 const JROWS: usize = 32;
 const _: () = assert!(JROWS <= JW && JROWS % 16 == 0);
+
+struct Shard {
+    call: usize,
+    at: usize,
+    len: usize,
+}
+
+fn shards(sizes: &[usize], from: usize, want: usize) -> Vec<Shard> {
+    let mut out = Vec::new();
+    let (mut skip, mut taken) = (from, 0);
+    for (call, &size) in sizes.iter().enumerate() {
+        if taken == want {
+            break;
+        }
+        if skip >= size {
+            skip -= size;
+            continue;
+        }
+        let len = (size - skip).min(want - taken);
+        out.push(Shard { call, at: skip, len });
+        taken += len;
+        skip = 0;
+    }
+    out
+}
 
 fn copy<T: Copy>(src: &[T]) -> impl FnOnce(&mut [T]) -> usize + '_ {
     move |dst: &mut [T]| {
@@ -1077,7 +1102,8 @@ impl Card {
             assert_eq!(cards.len(), CARD_ROWS * NTYPE * TYPE, "trunk card table");
             (packed, cards, *boards)
         };
-        let rows: usize = mine.iter().map(|&i| each(i).2).sum();
+        let sizes: Vec<usize> = mine.iter().map(|&i| each(i).2).collect();
+        let rows: usize = sizes.iter().sum();
         {
             let mut g = self.solves.lock();
             for &i in mine {
@@ -1107,43 +1133,23 @@ impl Card {
             let n = TILE.min(rows - board0);
             {
                 let mut stage = self.host.lock();
+                let tile = shards(&sizes, board0, n);
                 stage.packed.put(s, n * ROW_BYTES, |dst| {
-                    let (mut skip, mut wrote) = (board0, 0);
-                    for &i in mine {
-                        let (packed, _, boards) = each(i);
-                        if skip >= boards {
-                            skip -= boards;
-                            continue;
-                        }
-                        let take = (boards - skip).min(n - wrote);
-                        let a = skip * ROW_BYTES;
-                        dst[wrote * ROW_BYTES..(wrote + take) * ROW_BYTES]
-                            .copy_from_slice(&packed[a..a + take * ROW_BYTES]);
-                        wrote += take;
-                        skip = 0;
-                        if wrote == n {
-                            break;
-                        }
+                    let mut wrote = 0;
+                    for w in &tile {
+                        let packed = each(mine[w.call]).0;
+                        let a = w.at * ROW_BYTES;
+                        dst[wrote..wrote + w.len * ROW_BYTES]
+                            .copy_from_slice(&packed[a..a + w.len * ROW_BYTES]);
+                        wrote += w.len * ROW_BYTES;
                     }
-                    wrote * ROW_BYTES
+                    wrote
                 })?;
                 stage.card_of_row.put(s, n, |dst| {
-                    let (mut skip, mut wrote, mut card) = (board0, 0, 0i32);
-                    for &i in mine {
-                        let boards = each(i).2;
-                        if skip >= boards {
-                            skip -= boards;
-                            card += CARD_ROWS as i32;
-                            continue;
-                        }
-                        let take = (boards - skip).min(n - wrote);
-                        dst[wrote..wrote + take].fill(card);
-                        wrote += take;
-                        skip = 0;
-                        card += CARD_ROWS as i32;
-                        if wrote == n {
-                            break;
-                        }
+                    let mut wrote = 0;
+                    for w in &tile {
+                        dst[wrote..wrote + w.len].fill((CARD_ROWS * w.call) as i32);
+                        wrote += w.len;
                     }
                     wrote
                 })?;
@@ -1167,7 +1173,7 @@ impl Card {
                 }
                 .map_err(err)?;
             }
-            self.trunk_tile(calls, mine, board0, n)?;
+            self.trunk_tile(calls, mine, &sizes, board0, n)?;
             board0 += n;
         }
         self.keep(calls, mine, pack)
@@ -1243,7 +1249,7 @@ impl Card {
         .map_err(err)
     }
 
-    fn trunk_tile(&self, calls: &[Call], mine: &[usize], board0: usize, n: usize) -> Res<()> {
+    fn trunk_tile(&self, calls: &[Call], mine: &[usize], sizes: &[usize], board0: usize, n: usize) -> Res<()> {
         self.encode_boards(n)?;
         let s = &self.stream;
         let mut sc = self.scratch.lock();
@@ -1254,34 +1260,23 @@ impl Card {
         let jp = z.buf.as_mut().unwrap();
         self.run(self.layout.board_out, input.buf.as_ref().unwrap(), n, &mut *p)?;
         self.run(self.layout.join_p, p, n, &mut *jp)?;
-        let mut skip = board0;
         let mut src = 0;
         let mut g = self.solves.lock();
-        for &i in mine {
-            let Call::Trunk { solve, boards_at, boards: nb, .. } = &calls[i] else {
+        for w in shards(sizes, board0, n) {
+            let Call::Trunk { solve, boards_at, .. } = &calls[mine[w.call]] else {
                 unreachable!("trunk shard holds only trunk calls")
             };
-            if skip >= *nb {
-                skip -= *nb;
-                continue;
-            }
-            let take = (*nb - skip).min(n - src);
-            let b = self.slot(&mut g, *solve);
-            b.copy_board(
+            self.slot(&mut g, *solve).copy_board(
                 s,
-                *boards_at + skip,
+                *boards_at + w.at,
                 p,
                 jp,
                 projected.buf.as_ref().unwrap(),
                 x.buf.as_ref().unwrap(),
                 src,
-                take,
+                w.len,
             )?;
-            src += take;
-            skip = 0;
-            if src == n {
-                break;
-            }
+            src += w.len;
         }
         Ok(())
     }
@@ -1332,7 +1327,8 @@ impl Card {
             assert_eq!(owner.len(), *n, "config owner is not one entry a config");
             (phi, owner, cards, *n)
         };
-        let n: usize = mine.iter().map(|&i| each(i).3).sum();
+        let sizes: Vec<usize> = mine.iter().map(|&i| each(i).3).collect();
+        let n: usize = sizes.iter().sum();
         let s = &self.stream;
         let l = &self.layout;
         {
@@ -1357,56 +1353,38 @@ impl Card {
             let k = TILE.min(n - cfg0);
             {
                 let mut stage = self.host.lock();
+                let tile = shards(&sizes, cfg0, k);
                 stage.phi.put(s, k * CFEAT, |dst| {
-                    let (mut skip, mut wrote) = (cfg0, 0);
-                    for &i in mine {
-                        let (ph, _, _, kn) = each(i);
-                        if skip >= kn {
-                            skip -= kn;
-                            continue;
-                        }
-                        let take = (kn - skip).min(k - wrote);
-                        let a = skip * CFEAT;
-                        dst[wrote * CFEAT..(wrote + take) * CFEAT]
-                            .copy_from_slice(&ph[a..a + take * CFEAT]);
-                        wrote += take;
-                        skip = 0;
-                        if wrote == k {
-                            break;
-                        }
+                    let mut wrote = 0;
+                    for w in &tile {
+                        let ph = each(mine[w.call]).0;
+                        let a = w.at * CFEAT;
+                        dst[wrote..wrote + w.len * CFEAT]
+                            .copy_from_slice(&ph[a..a + w.len * CFEAT]);
+                        wrote += w.len * CFEAT;
                     }
-                    wrote * CFEAT
+                    wrote
                 })?;
                 stage.owner.put(s, k, |dst| {
-                    let (mut skip, mut wrote, mut base) = (cfg0, 0, 0u32);
-                    for &i in mine {
-                        let (_, ow, cd, kn) = each(i);
-                        if skip >= kn {
-                            skip -= kn;
-                            base += (cd.len() / (NTYPE * TYPE)) as u32;
-                            continue;
-                        }
-                        let take = (kn - skip).min(k - wrote);
-                        for (d, &q) in dst[wrote..wrote + take].iter_mut().zip(&ow[skip..skip + take]) {
+                    let mut wrote = 0;
+                    for w in &tile {
+                        let ow = each(mine[w.call]).1;
+                        let base = (CARD_ROWS * w.call) as u32;
+                        for (d, &q) in dst[wrote..wrote + w.len].iter_mut().zip(&ow[w.at..w.at + w.len]) {
                             *d = q + base;
                         }
-                        wrote += take;
-                        skip = 0;
-                        base += (cd.len() / (NTYPE * TYPE)) as u32;
-                        if wrote == k {
-                            break;
-                        }
+                        wrote += w.len;
                     }
                     wrote
                 })?;
             }
-            self.config_tile(calls, mine, cfg0, k)?;
+            self.config_tile(calls, mine, &sizes, cfg0, k)?;
             cfg0 += k;
         }
         Ok(())
     }
 
-    fn config_tile(&self, calls: &[Call], mine: &[usize], cfg0: usize, k: usize) -> Res<()> {
+    fn config_tile(&self, calls: &[Call], mine: &[usize], sizes: &[usize], cfg0: usize, k: usize) -> Res<()> {
         let s = &self.stream;
         let stage = self.host.lock();
         let phi = stage.phi.dev.buf.as_ref().expect("staged");
@@ -1442,26 +1420,14 @@ impl Card {
         self.run(l.cfg_g, u, k, &mut *g)?;
         self.run(l.cfg_p, u, k, &mut *fp)?;
         launch!(self, bag, k * POOL, bag, phi, owner, &mut *g, &n_i, &nslot, &ntype, &cfeat, &pool_i)?;
-        let mut skip = cfg0;
         let mut src = 0;
         let mut solves = self.solves.lock();
-        for &i in mine {
-            let kn = calls[i].rows();
-            let Call::Configs { solve, at: base, .. } = &calls[i] else {
+        for w in shards(sizes, cfg0, k) {
+            let Call::Configs { solve, at: base, .. } = &calls[mine[w.call]] else {
                 unreachable!("config shard holds only config calls")
             };
-            if skip >= kn {
-                skip -= kn;
-                continue;
-            }
-            let take = (kn - skip).min(k - src);
-            let b = self.slot(&mut solves, *solve);
-            b.copy_cfg(s, *base + skip, f, g, fp, src, take)?;
-            src += take;
-            skip = 0;
-            if src == k {
-                break;
-            }
+            self.slot(&mut solves, *solve).copy_cfg(s, *base + w.at, f, g, fp, src, w.len)?;
+            src += w.len;
         }
         Ok(())
     }
