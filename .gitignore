@@ -1,0 +1,15 @@
+target/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.npz
+papers/
+scratch/
+/temp/
+.DS_Store
+arena/
+suites/
+bots/
+runs/
+.claude/

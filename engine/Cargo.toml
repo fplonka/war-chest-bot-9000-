@@ -1,0 +1,47 @@
+[package]
+name = "warchest-engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+autotests = false
+
+[lib]
+name = "warchest"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.21", features = ["abi3-py39", "extension-module"], optional = true }
+numpy = { version = "0.21", optional = true }
+rayon = "1.10"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+cudarc = { version = "0.17", optional = true, default-features = false, features = ["cuda-version-from-build-system", "dynamic-loading", "driver", "nvrtc", "cublas"] }
+serde_json = "1"
+
+[features]
+default = []
+python = ["pyo3", "numpy"]
+
+gpu = ["dep:cudarc"]
+
+[[bin]]
+name = "ladder"
+path = "src/bin/ladder.rs"
+required-features = ["gpu"]
+
+[[test]]
+name = "invariants"
+path = "tests/invariants.rs"
+
+[[test]]
+name = "scenarios"
+path = "tests/scenarios.rs"
+
+[[test]]
+name = "cuda_parity"
+path = "tests/cuda_parity.rs"
+required-features = ["gpu"]
+
+[profile.release]
+lto = true
+codegen-units = 1
