@@ -6,7 +6,7 @@ use warchest::contract::NO_ROW;
 use warchest::cuda::Device;
 use warchest::contract::{Call, Reply};
 use warchest::net::Net;
-use warchest::pbs::{expand_row, pack_row, uniform_belief, Ctx, PUBFEAT, ROW_BYTES};
+use warchest::pbs::{expand_row, pack_row, Ctx, PUBFEAT, ROW_BYTES};
 use warchest::rng::Rng;
 use warchest::search::{Budget, Cfg, Solved, Solver, Step};
 use warchest::selfplay::{make_game, Agent, Collect, Data, GameCfg, GameStream};
@@ -39,20 +39,16 @@ fn game_cfg_of(cfg: Cfg) -> GameCfg {
     }
 }
 
-struct Run { data: Data, nodes: Vec<usize>, }
+struct Run { data: Data }
 
 const GPU_SLOTS: usize = 32;
 static DEVICE: OnceLock<Device> = OnceLock::new();
 
 fn shared_device() -> &'static Device {
     DEVICE.get_or_init(|| {
-        Device::new(
-            &[0],
-            Net::random(0x9E37),
-            Cfg { budget: Budget::for_s(512), ..Default::default() },
-            GPU_SLOTS,
-        )
-        .expect("device")
+        let net = Net::random(0x9E37);
+        let cfg = Cfg { budget: Budget::for_s(512), ..Default::default() };
+        Device::new(&[0], &net, cfg, GPU_SLOTS).expect("device")
     })
 }
 
@@ -137,7 +133,6 @@ fn generate(
 ) -> Vec<Run> {
     let nets = Arc::new(net.clone());
     let n = streams.len();
-    let mut nodes: Vec<Vec<usize>> = (0..n).map(|_| Vec::new()).collect();
     let mut streams: Vec<GameStream> = streams
         .iter()
         .map(|&(seed, cfg)| GameStream::new(seed, game_cfg_of(cfg)))
@@ -164,7 +159,6 @@ fn generate(
                 }
                 Step::Done(solved) => {
                     let sv = live[i].take().expect("a live solve");
-                    nodes[i].push(sv.nodes.len());
                     streams[i].keep(&sv, solved, &mut out[i]);
                     if out[i].soff.len() < games {
                         let mut next = streams[i].next_solve(&nets, &mut out[i]);
@@ -193,7 +187,7 @@ fn generate(
             assert_eq!(leaves.len(), all, "stream {i}: a round took a leaf twice");
         }
     }
-    out.into_iter().zip(nodes).map(|(data, nodes)| Run { data, nodes }).collect()
+    out.into_iter().map(|data| Run { data }).collect()
 }
 
 fn run_solve(backend: &Backend, mut sv: Solver) -> (Solver, Option<Solved>) {
