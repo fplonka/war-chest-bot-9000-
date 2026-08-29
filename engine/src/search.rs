@@ -459,6 +459,26 @@ fn row_key(row: &[u8]) -> u64 {
     h
 }
 
+pub(crate) fn group_by<I>(keys: I, n_keys: usize) -> (Vec<u32>, Vec<u32>)
+where
+    I: Iterator<Item = usize> + Clone,
+{
+    let mut start = vec![0u32; n_keys + 1];
+    for k in keys.clone() {
+        start[k + 1] += 1;
+    }
+    for k in 0..n_keys {
+        start[k + 1] += start[k];
+    }
+    let mut fill = start.clone();
+    let mut order = vec![0u32; start[n_keys] as usize];
+    for (i, k) in keys.enumerate() {
+        order[fill[k] as usize] = i as u32;
+        fill[k] += 1;
+    }
+    (start, order)
+}
+
 fn sample_indices(rng: &mut Rng, n: usize, k: usize) -> Vec<usize> {
     debug_assert!(k <= n);
     let mut out = Vec::with_capacity(k);
@@ -1085,38 +1105,11 @@ impl Solver {
             };
         }
         let nch = obs_keys.len();
-        let mut obs_start = vec![0u32; nch + 1];
-        for a in 0..na {
-            obs_start[obs_child[a] + 1] += 1;
-        }
-        for ch in 0..nch {
-            obs_start[ch + 1] += obs_start[ch];
-        }
-        let mut fill = obs_start.clone();
-        let mut obs_act = vec![0u32; na];
-        for a in 0..na {
-            let ch = obs_child[a];
-            obs_act[fill[ch] as usize] = a as u32;
-            fill[ch] += 1;
-        }
-
+        let (obs_start, obs_act) = group_by(obs_child.iter().copied(), nch);
         for (cell, &au) in legal_action.iter().enumerate() {
             legal_child[cell] = obs_child[au as usize] as u32;
         }
-        let mut action_off = vec![0u32; na + 1];
-        for &a in &legal_action {
-            action_off[a as usize + 1] += 1;
-        }
-        for a in 0..na {
-            action_off[a + 1] += action_off[a];
-        }
-        let mut action_fill = action_off.clone();
-        let mut action_cell = vec![0u32; legal_action.len()];
-        for (cell, &a) in legal_action.iter().enumerate() {
-            let at = &mut action_fill[a as usize];
-            action_cell[*at as usize] = cell as u32;
-            *at += 1;
-        }
+        let (action_off, action_cell) = group_by(legal_action.iter().map(|&a| a as usize), na);
         let mut child_cfgs: Vec<Vec<Config>> = vec![Vec::new(); nch];
         let mut ent = std::mem::take(&mut self.cell_order);
         for ch in 0..nch {

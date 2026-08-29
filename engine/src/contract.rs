@@ -254,93 +254,57 @@ impl Contract {
             c.level[i] = if p == NO_ROW { 0 } else { c.level[p as usize] + 1 };
         }
         let depth = c.level.iter().copied().max().unwrap_or(0) as usize + 1;
-        let mut count = vec![0u32; depth + 1];
-        for &l in &c.level {
-            count[l as usize + 1] += 1;
-        }
-        for l in 0..depth {
-            count[l + 1] += count[l];
-        }
-        c.level_start = count.clone();
-        c.level_node = vec![0; n];
-        for i in 0..n {
-            let l = c.level[i] as usize;
-            c.level_node[count[l] as usize] = i as u32;
-            count[l] += 1;
-        }
+        let (start, order) = crate::search::group_by(c.level.iter().map(|&l| l as usize), depth);
+        c.level_start = start;
+        c.level_node = order;
     }
 
     fn transpose_children(&mut self, sv: &Solver, i: usize) {
-        {
-            let t = &sv.nodes[i];
-            if t.leaf {
-                return;
+        let t = &sv.nodes[i];
+        if t.leaf {
+            return;
+        }
+        let me = t.player as usize;
+        if t.chance {
+            let ch = t.child[0];
+            let mut rows: Vec<(u32, u32, f32)> = Vec::new();
+            for ci in 0..t.draw.rows() {
+                let (to, pr) = t.draw.row(ci);
+                rows.extend(to.iter().zip(pr).map(|(&to, &p)| (to, ci as u32, p)));
             }
-            let me = t.player as usize;
-            if t.chance {
-                let ch = t.child[0];
-                let kids = self.nc[ch][me] as usize;
-                let base = self.rvd_start.len() as u32;
-                self.rvd_base[ch] = base;
-                let mut count = vec![0u32; kids + 1];
-                for ci in 0..t.draw.rows() {
-                    for &to in t.draw.row(ci).0 {
-                        count[to as usize + 1] += 1;
-                    }
-                }
-                for k in 0..kids {
-                    count[k + 1] += count[k];
-                }
-                let at = self.rvd_src.len() as u32;
-                self.rvd_start.extend(count.iter().map(|x| x + at));
-                self.rvd_src.resize(self.rvd_src.len() + count[kids] as usize, 0);
-                self.rvd_p.resize(self.rvd_p.len() + count[kids] as usize, 0.0);
-                for ci in 0..t.draw.rows() {
-                    let (to, pr) = t.draw.row(ci);
-                    for k in 0..to.len() {
-                        let slot = (at + count[to[k] as usize]) as usize;
-                        self.rvd_src[slot] = ci as u32;
-                        self.rvd_p[slot] = pr[k];
-                        count[to[k] as usize] += 1;
-                    }
-                }
-                return;
-            }
-            for (ci, &ch_u) in t.child.iter().enumerate() {
-                let ch = ch_u;
-                let kids = self.nc[ch][me] as usize;
-                let base = self.rev_start.len() as u32;
-                self.rev_base[ch] = base;
-                let mut count = vec![0u32; kids + 1];
-                for cell in 0..t.legal_action.len() {
+            self.rvd_base[ch] = self.rvd_start.len() as u32;
+            let at = self.rvd_src.len() as u32;
+            let (start, order) = crate::search::group_by(
+                rows.iter().map(|r| r.0 as usize),
+                self.nc[ch][me] as usize,
+            );
+            self.rvd_start.extend(start.iter().map(|x| x + at));
+            self.rvd_src.extend(order.iter().map(|&j| rows[j as usize].1));
+            self.rvd_p.extend(order.iter().map(|&j| rows[j as usize].2));
+            return;
+        }
+        for (ci, &ch) in t.child.iter().enumerate() {
+            let mut rows: Vec<(u32, u32, u32)> = Vec::new();
+            let (s0, s1) = (t.obs_start[ci] as usize, t.obs_start[ci + 1] as usize);
+            for &au in &t.obs_act[s0..s1] {
+                let a = au as usize;
+                for &cell_u in &t.action_cell[t.action_off[a] as usize..t.action_off[a + 1] as usize] {
+                    let cell = cell_u as usize;
                     if t.legal_child[cell] as usize != ch || t.legal_trans[cell] == NO_TRANS {
                         continue;
                     }
-                    count[t.legal_trans[cell] as usize + 1] += 1;
-                }
-                for k in 0..kids {
-                    count[k + 1] += count[k];
-                }
-                let at = self.rev_src.len() as u32;
-                self.rev_start.extend(count.iter().map(|x| x + at));
-                self.rev_src.resize(self.rev_src.len() + count[kids] as usize, 0);
-                self.rev_cell.resize(self.rev_cell.len() + count[kids] as usize, 0);
-                let (s0, s1) = (t.obs_start[ci] as usize, t.obs_start[ci + 1] as usize);
-                for &au in &t.obs_act[s0..s1] {
-                    let a = au as usize;
-                    for &cell_u in &t.action_cell[t.action_off[a] as usize..t.action_off[a + 1] as usize] {
-                        let cell = cell_u as usize;
-                        if t.legal_child[cell] as usize != ch || t.legal_trans[cell] == NO_TRANS {
-                            continue;
-                        }
-                        let to = t.legal_trans[cell] as usize;
-                        let slot = (at + count[to]) as usize;
-                        self.rev_src[slot] = t.cell_row[cell];
-                        self.rev_cell[slot] = self.soff[i] + cell as u32;
-                        count[to] += 1;
-                    }
+                    rows.push((t.legal_trans[cell], t.cell_row[cell], self.soff[i] + cell as u32));
                 }
             }
+            self.rev_base[ch] = self.rev_start.len() as u32;
+            let at = self.rev_src.len() as u32;
+            let (start, order) = crate::search::group_by(
+                rows.iter().map(|r| r.0 as usize),
+                self.nc[ch][me] as usize,
+            );
+            self.rev_start.extend(start.iter().map(|x| x + at));
+            self.rev_src.extend(order.iter().map(|&j| rows[j as usize].1));
+            self.rev_cell.extend(order.iter().map(|&j| rows[j as usize].2));
         }
     }
 }
