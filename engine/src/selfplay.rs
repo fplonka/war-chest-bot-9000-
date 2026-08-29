@@ -169,15 +169,6 @@ impl Data {
         self.nv += 1;
     }
 
-    fn take_counters(&mut self) -> Data {
-        Data {
-            decisions: std::mem::take(&mut self.decisions),
-            configs: std::mem::take(&mut self.configs),
-            plays: std::mem::take(&mut self.plays),
-            ..Default::default()
-        }
-    }
-
     #[inline]
     pub fn row_span(&self, r: usize, p: usize) -> std::ops::Range<usize> {
         self.coff[2 * r + p] as usize..self.coff[2 * r + p + 1] as usize
@@ -280,10 +271,15 @@ impl Game {
     }
 
     pub fn take_ready(&mut self) -> Data {
-        if self.gc.p_td1 > 0.0 {
-            return self.data.take_counters();
+        if self.gc.p_td1 <= 0.0 {
+            return std::mem::take(&mut self.data);
         }
-        std::mem::take(&mut self.data)
+        Data {
+            decisions: std::mem::take(&mut self.data.decisions),
+            configs: std::mem::take(&mut self.data.configs),
+            plays: std::mem::take(&mut self.data.plays),
+            ..Default::default()
+        }
     }
 
     pub fn is_terminal(&self) -> bool {

@@ -178,8 +178,6 @@ impl Call {
 }
 
 
-pub const CARD_ROWS: usize = 1;
-
 pub const KIND_DECISION: u8 = 0;
 pub const KIND_CHANCE: u8 = 1;
 pub const KIND_LEAF: u8 = 2;

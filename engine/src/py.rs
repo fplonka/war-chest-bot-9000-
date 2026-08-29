@@ -67,7 +67,6 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
         ("white_wins", d.wins[0]),
         ("black_wins", d.wins[1]),
         ("draws", d.draws),
-        ("cap_hits", d.cap_hits),
         ("horizon_hits", d.cap_hits),
         ("configs", d.configs),
         ("query_rows", d.queries),
@@ -398,6 +397,9 @@ fn warchest(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(expand_rows, m)?)?;
     m.add_function(wrap_pyfunction!(expand_rows_cuda, m)?)?;
     m.add("ROW_BYTES", crate::pbs::ROW_BYTES)?;
+    m.add("ROW_HEX_OWNER", crate::pbs::ROW_HEX_OWNER)?;
+    m.add("ROW_HEX_SLOT", crate::pbs::ROW_HEX_SLOT)?;
+    m.add("ROW_HEX_MARKER", crate::pbs::ROW_HEX_MARKER)?;
     m.add_function(wrap_pyfunction!(rules_table_hash, m)?)?;
     m.add_function(wrap_pyfunction!(hex_neighbours, m)?)?;
     m.add_function(wrap_pyfunction!(hex_mirror, m)?)?;

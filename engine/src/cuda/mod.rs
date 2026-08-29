@@ -12,7 +12,7 @@ use cudarc::driver::{
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 
 use crate::board::{board, N_HEXES, NONE};
-use crate::contract::{Call, Prime, Reply, CARD_ROWS};
+use crate::contract::{Call, Prime, Reply};
 use crate::net::{
     ln_block, Net, NetLayout, NormSpan, Span, AW, BLOCKS, C, CFGH, D, JBLOCKS, JOIN_IN, JW,
     LN_ACT, LN_CFG, LN_H, LN_JOIN, LN_JOUT, LN_TRUNK, POOL, TYPE,
@@ -1048,7 +1048,7 @@ impl Card {
                 unreachable!("trunk shard holds only trunk calls")
             };
             assert_eq!(packed.len(), boards * ROW_BYTES, "trunk input is not one packed row a board");
-            assert_eq!(cards.len(), CARD_ROWS * NTYPE * TYPE, "trunk card table");
+            assert_eq!(cards.len(), NTYPE * TYPE, "trunk card table");
             (packed, cards, *boards)
         };
         let sizes: Vec<usize> = mine.iter().map(|&i| each(i).2).collect();
@@ -1067,7 +1067,7 @@ impl Card {
         let s = &self.stream;
         {
             let mut stage = self.host.lock();
-            stage.cards.put(s, mine.len() * CARD_ROWS * NTYPE * TYPE, |dst| {
+            stage.cards.put(s, mine.len() * NTYPE * TYPE, |dst| {
                 let mut at = 0;
                 for &i in mine {
                     let (_, cd, _) = each(i);
@@ -1097,7 +1097,7 @@ impl Card {
                 stage.card_of_row.put(s, n, |dst| {
                     let mut wrote = 0;
                     for w in &tile {
-                        dst[wrote..wrote + w.len].fill((CARD_ROWS * w.call) as i32);
+                        dst[wrote..wrote + w.len].fill(w.call as i32);
                         wrote += w.len;
                     }
                     wrote
@@ -1273,7 +1273,7 @@ impl Card {
         let l = &self.layout;
         {
             let mut stage = self.host.lock();
-            stage.cfg_cards.put(s, mine.len() * CARD_ROWS * NTYPE * TYPE, |dst| {
+            stage.cfg_cards.put(s, mine.len() * NTYPE * TYPE, |dst| {
                 let mut at = 0;
                 for &i in mine {
                     let (_, _, cd, _) = each(i);
@@ -2095,7 +2095,7 @@ impl Plan {
     fn build(mut self, n: usize, cfg: &Cfg) -> Res<(Scratch, Stage, Batch, usize)> {
         let b = &cfg.budget;
         let (nodes, rows, cidx) = (b.cap(Ent::Node), b.cap(Ent::Row), b.cap(Ent::Cidx));
-        let cards = n * CARD_ROWS * NTYPE * TYPE;
+        let cards = n * NTYPE * TYPE;
         let resident = FIELDS[0] * nodes
             + FIELDS[1] * b.cap(Ent::Cell)
             + FIELDS[2] * b.cap(Ent::Reach)
@@ -2120,7 +2120,7 @@ impl Plan {
             occupant: self.arr(TILE * N_HEXES)?,
             x: self.arr(TILE * N_HEXES * C)?,
             action: self.arr(TILE * AW)?,
-            bag: self.arr(n * CARD_ROWS * NTYPE * 3 * POOL)?,
+            bag: self.arr(n * NTYPE * 3 * POOL)?,
         };
         let stage = Stage {
             packed: self.wire(TILE * ROW_BYTES)?,
