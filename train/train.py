@@ -35,6 +35,7 @@ NSLOT = warchest.NSLOT
 ROUND_KEYS = ("rounds", "round_calls", "round_rows", "round_nanos", "budget_hits")
 POLICY_METRICS = ("policy_loss", "policy_target_entropy", "policy_prior_entropy",
                   "policy_search_kl")
+REPLAY_FORMAT = 2
 
 
 def fold(window, lists, stat):
@@ -587,6 +588,8 @@ def main():
         if over:
             raise SystemExit("resume only accepts a minutes extension")
         checkpoint = torch.load(resume, map_location="cpu", weights_only=False)
+        if checkpoint.get("replay_format") != REPLAY_FORMAT:
+            raise SystemExit("resume replay was produced by an incompatible search")
         args = config.Cfg(**checkpoint["cfg"])
         if minutes is not None:
             if minutes < args.minutes:
@@ -754,6 +757,7 @@ def main():
             "torch_rng": torch.get_rng_state(),
             "cuda_rng": torch.cuda.get_rng_state_all(),
             "buffer": buf.state_dict(),
+            "replay_format": REPLAY_FORMAT,
             "elapsed": float(el),
             "next_snapshot": float(el + snap_gap),
             "epoch": epoch,

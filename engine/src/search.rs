@@ -527,6 +527,7 @@ pub struct Solver {
     bmap: std::collections::HashMap<u64, u32, KeyHash>,
     pub(crate) packed: Vec<u8>,
     abandon: bool,
+    failure: Option<String>,
     draw_scratch: DrawScratch,
     cell_order: Vec<(u64, u32)>,
 
@@ -1013,6 +1014,22 @@ impl Solver {
             legal_child[cell] = obs_child[au as usize] as u32;
         }
         let (action_off, action_cell) = group_by(legal_action.iter().map(|&a| a as usize), na);
+        for ch in 0..nch {
+            let mut effect: Option<PublicState> = None;
+            for &au in &obs_act[obs_start[ch] as usize..obs_start[ch + 1] as usize] {
+                let a = au as usize;
+                let cell = action_cell[action_off[a] as usize] as usize;
+                let mut next = s;
+                set_config(&mut next, player, &self.ctx, &mine[cell_row[cell] as usize]);
+                next.apply_inplace(acts[a]);
+                let public = PublicState::from_state(next);
+                if effect.as_ref().is_some_and(|old| old != &public) {
+                    self.failure = Some(format!("observation {} has ambiguous public children", obs_keys[ch]));
+                    return;
+                }
+                effect = Some(public);
+            }
+        }
         let mut child_cfgs: Vec<Vec<Config>> = vec![Vec::new(); nch];
         let mut ent = std::mem::take(&mut self.cell_order);
         for ch in 0..nch {
@@ -1262,6 +1279,10 @@ impl Solver {
             }
             Phase::Done => unreachable!("a finished solve is not advanced again"),
         }
+        if let Some(error) = self.failure.take() {
+            self.phase = Phase::Done;
+            return Step::Done(Err(error));
+        }
         if self.at < self.cfg.iters() {
             self.phase = Phase::Iterating;
             Step::Calls(self.iterate_round())
@@ -1359,6 +1380,9 @@ impl Solver {
         }
         w.f32s_both(Dst::Cur, Dst::Prior, sent, &self.cur[sent..]);
         let (prime, acts, cells) = self.prime();
+        let carry: Vec<u32> = self.nodes.iter().enumerate()
+            .filter_map(|(i, n)| n.carry.then_some(i as u32)).collect();
+        let carry_len = carry.iter().map(|&i| 2 * self.nodes[i as usize].nc.iter().sum::<u32>() as usize).sum();
         let call = Call::Tree {
             solve: self.slot,
             writes: w,
@@ -1368,7 +1392,8 @@ impl Solver {
             nvals: self.nvals,
             root_n: self.nodes[0].nc,
             levels: self.contract.level_start.clone(),
-            carry: self.nodes.iter().enumerate().filter_map(|(i, n)| n.carry.then_some(i as u32)).collect(),
+            carry,
+            carry_len,
             nterm: self.term_leaves.len(),
             seed: first.then_some(self.seed),
             prime,

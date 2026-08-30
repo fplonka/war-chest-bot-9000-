@@ -246,6 +246,8 @@ fn collects_rows(gc: &GameCfg, s: &State) -> bool {
 
 impl Game {
     pub fn new(mut rng: Rng, gc: &GameCfg) -> Game {
+        let sog = gc.agents.map(|a| matches!(a, Agent::Sog { .. }));
+        assert_eq!(sog[0], sog[1], "one game cannot mix static play and continual resolving");
         let s = make_game(&mut rng, gc.random_draft);
         let ctx = Ctx::new(&s);
         Game {
@@ -373,19 +375,21 @@ impl Game {
             PlaySolved::Continue(s) => (s.action, s.policy, s.focus, Some(s.next), s.queries),
             PlaySolved::Terminal(s) => (s.action, s.policy, s.focus, None, s.queries),
         };
-        let truth = [
-            focus.range[0].index_of(&true_config(&self.s, 0, &self.ctx)).expect("focus dropped player 0") as u32,
-            focus.range[1].index_of(&true_config(&self.s, 1, &self.ctx)).expect("focus dropped player 1") as u32,
-        ];
-        self.data.begin_solve();
-        self.data.push_value(
-            &self.s,
-            &self.ctx,
-            &focus.range,
-            [&focus.cfv[0], &focus.cfv[1]],
-            truth,
-            &policy,
-        );
+        if collects_rows(&self.gc, &self.s) {
+            let truth = [
+                focus.range[0].index_of(&true_config(&self.s, 0, &self.ctx)).expect("focus dropped player 0") as u32,
+                focus.range[1].index_of(&true_config(&self.s, 1, &self.ctx)).expect("focus dropped player 1") as u32,
+            ];
+            self.data.begin_solve();
+            self.data.push_value(
+                &self.s,
+                &self.ctx,
+                &focus.range,
+                [&focus.cfv[0], &focus.cfv[1]],
+                truth,
+                &policy,
+            );
+        }
         self.queries.extend(queries);
         if let Some(slot) = self.data.plays.get_mut(action.play() as usize) {
             *slot += 1;

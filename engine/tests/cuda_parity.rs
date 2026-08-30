@@ -484,7 +484,7 @@ fn gadget_and_carry_match_one_cpu_iteration() {
     let Step::Calls(calls) = second.advance(&[]) else { panic!("a re-solve asks for work") };
     device.run(&calls, 0).expect("one gadget iteration");
     let resident = device.0.resident(0, 0).expect("resident re-solve");
-    let n = resident.gadget.len() / 8;
+    let n = resident.gadget.len() / 6;
     assert!(n > 0, "the second played solve has a gadget");
     let q = &resident.gadget[..n];
     let term = &resident.gadget[n..2 * n];
@@ -500,23 +500,20 @@ fn gadget_and_carry_match_one_cpu_iteration() {
         assert!((resident.gadget[3 * n + k] - regret[k][1]).abs() < 2e-6);
         assert!((resident.gadget[4 * n + k] - strategy[k][0]).abs() < 2e-6);
         assert!((resident.gadget[5 * n + k] - strategy[k][1]).abs() < 2e-6);
-        assert!((resident.gadget[6 * n + k] - sum[k][0]).abs() < 2e-6);
-        assert!((resident.gadget[7 * n + k] - sum[k][1]).abs() < 2e-6);
     }
     let root = &second.nodes[0];
-    let r0 = root.roff as usize;
-    let r1 = r0 + root.nc[0] as usize;
+    let counts = root.nc.map(|x| x as usize);
     for p in 0..2 {
-        let start = if p == 0 { r0 } else { r1 };
-        let count = root.nc[p] as usize;
+        let start = if p == 0 { 0 } else { counts[0] };
         let expected = if p == opponent {
             q.iter().map(|x| 0.5 * x).collect::<Vec<_>>()
         } else {
             second.root_belief[p].p.clone()
         };
-        assert!(worst(&expected, &resident.reach_sum[start..start + count], "carried root reach") < 2e-6);
+        assert!(worst(&expected, &resident.carry[start..start + counts[p]], "carried root reach") < 2e-6);
     }
-    assert_eq!(&resident.value_sum[vo..vo + n], follow);
+    let value_at = counts[0] + counts[1] + if opponent == 0 { 0 } else { counts[0] };
+    assert_eq!(&resident.carry[value_at..value_at + n], follow);
 }
 
 #[test]

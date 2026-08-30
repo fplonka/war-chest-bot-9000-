@@ -30,7 +30,7 @@ use crate::units::{write_card_features, CARD_FEATS, N_UNITS};
 
 mod slot;
 mod resolve;
-use slot::{Arr, Solve, DESC, FIELDS, C_CUR, C_PRIOR, C_QVAL, C_SUM, C_VISITS, R_REACH, R_REACH_SUM, R_VALS, R_VALUE_SUM, B_P, B_JP, G_F, G_G, G_FP, Y_BOARD_OF, Y_COFF, G_CUR_F, G_CUR_T, G_FIELDS, G_Q, G_TERM};
+use slot::{Arr, Solve, DESC, FIELDS, C_CUR, C_PRIOR, C_QVAL, C_SUM, C_VISITS, R_REACH, R_VALS, B_P, B_JP, G_F, G_G, G_FP, Y_BOARD_OF, Y_COFF, G_CUR_F, G_CUR_T, G_FIELDS, G_Q, G_TERM};
 
 type Res<T> = Result<T, String>;
 
@@ -663,8 +663,7 @@ impl Device {
             visits: s.ent[Ent::Cell as usize].get_f32(&c.stream, C_VISITS, 0, s.ncells, &mut h)?,
             reach: s.ent[Ent::Reach as usize].get_f32(&c.stream, R_REACH, 0, s.nreach, &mut h)?,
             vals: s.ent[Ent::Reach as usize].get_f32(&c.stream, R_VALS, 0, 2 * s.nvals, &mut h)?,
-            reach_sum: s.ent[Ent::Reach as usize].get_f32(&c.stream, R_REACH_SUM, 0, s.nreach, &mut h)?,
-            value_sum: s.ent[Ent::Reach as usize].get_f32(&c.stream, R_VALUE_SUM, 0, 2 * s.nvals, &mut h)?,
+            carry: c.stream.memcpy_dtov(&s.carry.buf.as_ref().expect("carry storage").slice(..s.carry.len)).map_err(err)?,
             gadget: if s.ngadget == 0 {
                 Vec::new()
             } else {
@@ -688,8 +687,7 @@ pub struct Resident {
     pub visits: Vec<f32>,
     pub reach: Vec<f32>,
     pub vals: Vec<f32>,
-    pub reach_sum: Vec<f32>,
-    pub value_sum: Vec<f32>,
+    pub carry: Vec<f32>,
     pub gadget: Vec<f32>,
 }
 
@@ -1573,7 +1571,7 @@ impl Card {
         }
         let mut g = self.solves.lock();
         for &i in mine {
-            let Call::Tree { solve, writes, ncells, nreach, nvals, root_n, levels, carry, nterm, seed, .. }
+            let Call::Tree { solve, writes, ncells, nreach, nvals, root_n, levels, carry, carry_len, nterm, seed, .. }
                 = &calls[i] else {
                 unreachable!("tree shard holds only tree calls")
             };
@@ -1591,6 +1589,7 @@ impl Card {
             b.level_start.extend_from_slice(levels);
             b.ncarry = carry.len();
             b.carry_node.put(s, 0, carry)?;
+            b.carry.room(*carry_len)?;
             b.nterm = *nterm;
             if let Some(sd) = seed {
                 b.seed.put(s, 0, &[*sd])?;

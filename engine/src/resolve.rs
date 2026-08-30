@@ -13,8 +13,8 @@ impl PublicState {
     pub fn new(mut state: State, ranges: &[Belief; 2]) -> Result<Self, String> {
         let ctx = Ctx::new(&state);
         for p in 0..2 {
-            let c = ranges[p].cfg.first().ok_or_else(|| format!("player {p} has empty structural support"))?;
-            set_config(&mut state, p as u8, &ctx, c);
+            validate_belief(&state, &ctx, p, &ranges[p])?;
+            set_config(&mut state, p as u8, &ctx, &ranges[p].cfg[0]);
         }
         let mut row = [0; ROW_BYTES];
         pack_row(&state, &ctx, &mut row);
@@ -37,8 +37,33 @@ impl PublicState {
     pub fn same_public(&self, state: &State) -> bool {
         let mut row = [0; ROW_BYTES];
         pack_row(state, &Ctx::new(state), &mut row);
-        self.row == row
+        self.state.round == state.round && self.row == row
     }
+}
+
+pub(crate) fn validate_belief(state: &State, ctx: &Ctx, player: usize, belief: &Belief) -> Result<(), String> {
+    if belief.cfg.len() != belief.p.len()
+        || belief.cfg.is_empty()
+        || belief.cfg.windows(2).any(|w| w[0] >= w[1])
+        || belief.p.iter().any(|x| !x.is_finite() || *x < 0.0)
+    {
+        return Err(format!("player {player} belief is invalid"));
+    }
+    let mass: f32 = belief.p.iter().sum();
+    if !mass.is_finite() || mass <= 0.0 || (mass - 1.0).abs() > 2e-4 {
+        return Err(format!("player {player} belief mass is {mass}"));
+    }
+    let truth = true_config(state, player as u8, ctx);
+    let room = reserve(state, player as u8, ctx);
+    if belief.cfg.iter().any(|c| {
+        c.hand_size() != truth.hand_size()
+            || c.fd_size() != truth.fd_size()
+            || c.inflight.is_some() != truth.inflight.is_some()
+            || (0..NSLOT).any(|k| c.hand[k] + c.fd[k] + u8::from(c.inflight == Some(k as u8)) > room[k])
+    }) {
+        return Err(format!("player {player} belief contains an impossible configuration"));
+    }
+    Ok(())
 }
 
 fn canonical_config(state: &State, ctx: &Ctx, player: u8) -> Config {
@@ -66,7 +91,7 @@ fn canonical_config(state: &State, ctx: &Ctx, player: u8) -> Config {
 
 impl PartialEq for PublicState {
     fn eq(&self, other: &Self) -> bool {
-        self.row == other.row
+        self.state.round == other.state.round && self.row == other.row
     }
 }
 
@@ -80,23 +105,11 @@ pub struct Boundary {
 }
 
 impl Boundary {
-    pub fn new(public: PublicState, range: [Belief; 2], cfv: [Vec<f32>; 2]) -> Result<Self, String> {
+    pub fn new(state: State, range: [Belief; 2], cfv: [Vec<f32>; 2]) -> Result<Self, String> {
+        let public = PublicState::new(state, &range)?;
         for p in 0..2 {
-            if range[p].cfg.len() != range[p].p.len() || range[p].cfg.len() != cfv[p].len() {
-                return Err(format!("player {p} boundary support is misaligned"));
-            }
-            if range[p].cfg.is_empty() || range[p].cfg.windows(2).any(|w| w[0] >= w[1]) {
-                return Err(format!("player {p} boundary support is empty, duplicated, or unsorted"));
-            }
-            if range[p].p.iter().chain(cfv[p].iter()).any(|x| !x.is_finite()) {
-                return Err(format!("player {p} boundary contains a non-finite number"));
-            }
-            if range[p].p.iter().any(|&x| x < 0.0) {
-                return Err(format!("player {p} boundary contains a negative probability"));
-            }
-            let mass: f32 = range[p].p.iter().sum();
-            if mass <= 0.0 || (mass - 1.0).abs() > 2e-4 {
-                return Err(format!("player {p} boundary mass is {mass}"));
+            if range[p].cfg.len() != cfv[p].len() || cfv[p].iter().any(|x| !x.is_finite()) {
+                return Err(format!("player {p} boundary values are invalid"));
             }
         }
         Ok(Self { public, range, cfv })
@@ -196,7 +209,7 @@ pub fn gadget_iteration(
     }
 }
 
-pub fn apply_public_observation(public: &PublicState, support: &[Config], key: u32) -> Result<PublicState, String> {
+pub fn apply_public_observation(public: &PublicState, support: &[Config], key: u32) -> Result<(PublicState, Vec<Config>), String> {
     let state = public.state();
     if state.is_terminal() || state.is_chance() {
         return Err("an action observation requires a live decision".into());
@@ -206,13 +219,15 @@ pub fn apply_public_observation(public: &PublicState, support: &[Config], key: u
     if support.is_empty() || support.windows(2).any(|w| w[0] >= w[1]) {
         return Err("action observation support is empty, duplicated, or unsorted".into());
     }
-    let (acts, slots, _) = crate::search::node_actions(&state, actor, &ctx, support);
+    let (acts, slots, facedown) = crate::search::node_actions(&state, actor, &ctx, support);
     let mut found: Option<PublicState> = None;
-    for (a, slot) in acts.into_iter().zip(slots) {
+    let mut next_support = Vec::new();
+    for ((a, slot), facedown) in acts.into_iter().zip(slots).zip(facedown) {
         if obs_key(&a) != key {
             continue;
         }
-        for c in support.iter().filter(|c| crate::pbs::action_legal(c, slot)) {
+        for c in support {
+            let Some(config) = crate::pbs::advance_config(c, slot, facedown) else { continue };
             let mut next = state;
             set_config(&mut next, actor, &ctx, c);
             next.apply_inplace(a);
@@ -221,15 +236,38 @@ pub fn apply_public_observation(public: &PublicState, support: &[Config], key: u
                 return Err(format!("observation {key} has ambiguous public effects"));
             }
             found = Some(candidate);
+            next_support.push(config);
         }
     }
-    found.ok_or_else(|| format!("observation {key} is structurally unreachable"))
+    next_support.sort_unstable();
+    next_support.dedup();
+    found.map(|public| (public, next_support))
+        .ok_or_else(|| format!("observation {key} is structurally unreachable"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::search::Cfr;
+
+    #[test]
+    fn public_identity_includes_the_round() {
+        let mut rng = crate::rng::Rng::new(3);
+        let state = crate::selfplay::make_game(&mut rng, false);
+        let public = PublicState::from_state(state);
+        let mut later = state;
+        later.round += 1;
+        assert!(!public.same_public(&later));
+    }
+
+    #[test]
+    fn malformed_beliefs_are_rejected() {
+        let mut rng = crate::rng::Rng::new(4);
+        let state = crate::selfplay::make_game(&mut rng, false);
+        let mut ranges = [Belief::point(Config::default()), Belief::point(Config::default())];
+        ranges[0].p[0] = f32::NAN;
+        assert!(PublicState::new(state, &ranges).is_err());
+    }
 
     #[test]
     fn terminate_protects_each_private_state() {

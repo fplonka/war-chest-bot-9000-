@@ -28,7 +28,7 @@ pub fn tree_source() -> String {
     for c in &TABLE {
         out += &format!("    {} {};\n", c.ty, c.name);
     }
-    for tail in ["unsigned long long* seed", "float* gadget", "const unsigned int* carry_node",
+    for tail in ["unsigned long long* seed", "float* gadget", "float* carry", "const unsigned int* carry_node",
                  "unsigned long long ngadget", "unsigned long long resolver", "unsigned long long ncarry",
                  "unsigned long long nterm", "unsigned long long nvals", "unsigned long long step",
                  "unsigned long long todo", "unsigned long long nexpand"] {
@@ -37,7 +37,7 @@ pub fn tree_source() -> String {
     out + "};\n"
 }
 
-const TABLE: [Col; 55] = [
+const TABLE: [Col; 53] = [
     Col { ent: Ent::Node, width: 1, dst: Some(Dst::Kind), name: "kind", ty: CU },
     Col { ent: Ent::Node, width: 1, dst: Some(Dst::Player), name: "player", ty: CU },
     Col { ent: Ent::Node, width: 1, dst: Some(Dst::Exhausted), name: "exhausted", ty: CU },
@@ -72,8 +72,6 @@ const TABLE: [Col; 55] = [
     Col { ent: Ent::Node, width: 1, dst: Some(Dst::LevelNode), name: "level_node", ty: CU },
     Col { ent: Ent::Reach, width: 1, dst: Some(Dst::Reach), name: "reach", ty: FM },
     Col { ent: Ent::Reach, width: 2, dst: None, name: "vals", ty: FM },
-    Col { ent: Ent::Reach, width: 1, dst: None, name: "reach_sum", ty: FM },
-    Col { ent: Ent::Reach, width: 2, dst: None, name: "value_sum", ty: FM },
     Col { ent: Ent::Cell, width: 1, dst: Some(Dst::Cur), name: "cur", ty: FM },
     Col { ent: Ent::Cell, width: 1, dst: None, name: "regret", ty: FM },
     Col { ent: Ent::Cell, width: 1, dst: None, name: "sum", ty: FM },
@@ -95,7 +93,7 @@ const TABLE: [Col; 55] = [
     Col { ent: Ent::Row, width: 1, dst: Some(Dst::Term), name: "term", ty: CU },
 ];
 
-pub const DESC: usize = TABLE.len() + 11;
+pub const DESC: usize = TABLE.len() + 12;
 
 const fn fields() -> [usize; 8] {
     let mut f = [0; 8];
@@ -145,8 +143,6 @@ pub const C_VISITS: usize = lane(Ent::Cell, "visits");
 pub const C_PRIOR: usize = lane(Ent::Cell, "prior");
 pub const R_REACH: usize = lane(Ent::Reach, "reach");
 pub const R_VALS: usize = lane(Ent::Reach, "vals");
-pub const R_REACH_SUM: usize = lane(Ent::Reach, "reach_sum");
-pub const R_VALUE_SUM: usize = lane(Ent::Reach, "value_sum");
 pub const B_P: usize = lane(Ent::Board, "p");
 pub const B_JP: usize = lane(Ent::Board, "jp");
 pub const B_TOKENS: usize = lane(Ent::Board, "tokens");
@@ -160,7 +156,7 @@ pub const Y_COFF: usize = lane(Ent::Row, "coff");
 const _: () = {
     assert!(FIELDS[0] == 18);
     assert!(FIELDS[1] == 13);
-    assert!(FIELDS[2] == 10);
+    assert!(FIELDS[2] == 7);
     assert!(FIELDS[3] == 4);
     assert!(FIELDS[4] == 5);
     assert!(FIELDS[5] == D + JW + NTYPE * C + N_HEXES * C);
@@ -345,12 +341,13 @@ pub const G_Q: usize = 0;
 pub const G_TERM: usize = 1;
 pub const G_CUR_T: usize = 4;
 pub const G_CUR_F: usize = 5;
-pub const G_FIELDS: usize = 8;
+pub const G_FIELDS: usize = 6;
 
 pub struct Solve {
     pub ready: cudarc::driver::CudaEvent,
     pub ent: [Entity; 8],
     pub gadget: Arr<f32>,
+    pub carry: Arr<f32>,
     pub carry_node: Arr<u32>,
     pub ngadget: usize,
     pub ncarry: usize,
@@ -391,6 +388,7 @@ impl Solve {
                 Entity::with_cap(s, b.cap(Ent::Cidx), FIELDS[Ent::Cidx as usize])?,
             ],
             gadget: Arr::with_cap(s, G_FIELDS * crate::pbs::MAX_CONFIG_SUPPORT)?,
+            carry: Arr::with_cap(s, 2 * b.cap(Ent::Reach))?,
             carry_node: Arr::with_cap(s, b.cap(Ent::Node))?,
             ngadget: 0,
             ncarry: 0,
@@ -443,11 +441,18 @@ impl Solve {
         self.ent[Ent::Draw as usize].rewind();
         self.ent[Ent::Cell as usize].zero(s)?;
         self.ent[Ent::Reach as usize].zero(s)?;
+        if let Some(carry) = self.carry.buf.as_mut() {
+            s.memset_zeros(carry).map_err(err)?;
+        }
+        self.carry.len = 0;
         Ok(())
     }
 
     pub fn bytes(&self) -> usize {
-        self.ent.iter().map(Entity::bytes).sum::<usize>() + self.seed.cap * 8 + self.gadget.cap * 4 + self.carry_node.cap * 4
+        self.ent.iter().map(Entity::bytes).sum::<usize>()
+            + self.seed.cap * 8
+            + (self.gadget.cap + self.carry.cap) * 4
+            + self.carry_node.cap * 4
     }
 
     pub fn copy_board(
@@ -512,15 +517,16 @@ impl Solve {
         }
         out[i] = self.seed.ptr(s);
         out[i + 1] = self.gadget.ptr(s);
-        out[i + 2] = self.carry_node.ptr(s);
-        out[i + 3] = self.ngadget as u64;
-        out[i + 4] = self.resolver as u64;
-        out[i + 5] = self.ncarry as u64;
-        out[i + 6] = self.nterm as u64;
-        out[i + 7] = self.nvals as u64;
-        out[i + 8] = self.step as u64;
-        out[i + 9] = self.todo as u64;
-        out[i + 10] = self.nexpand as u64;
+        out[i + 2] = self.carry.ptr(s);
+        out[i + 3] = self.carry_node.ptr(s);
+        out[i + 4] = self.ngadget as u64;
+        out[i + 5] = self.resolver as u64;
+        out[i + 6] = self.ncarry as u64;
+        out[i + 7] = self.nterm as u64;
+        out[i + 8] = self.nvals as u64;
+        out[i + 9] = self.step as u64;
+        out[i + 10] = self.todo as u64;
+        out[i + 11] = self.nexpand as u64;
         out
     }
 }

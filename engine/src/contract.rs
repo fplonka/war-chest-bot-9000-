@@ -38,6 +38,7 @@ pub enum Call {
         root_n: [u32; 2],
         levels: Vec<u32>,
         carry: Vec<u32>,
+        carry_len: usize,
         nterm: usize,
         seed: Option<u64>,
         prime: Vec<Prime>,

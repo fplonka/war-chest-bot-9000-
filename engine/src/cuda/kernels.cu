@@ -493,7 +493,17 @@ __device__ __forceinline__ unsigned int rbase(const Tree& t, unsigned int i, int
     return t.roff[i] + (p == 1 ? t.nc[2 * i] : 0);
 }
 
-enum GadgetField { G_Q, G_TERM, G_REGRET_T, G_REGRET_F, G_STRATEGY_T, G_STRATEGY_F, G_AVERAGE_T, G_AVERAGE_F };
+__device__ __forceinline__ unsigned int carry_base(const Tree& t, unsigned int node) {
+    unsigned int at = 0;
+    for (unsigned int i = 0; i < t.ncarry; ++i) {
+        unsigned int carried = t.carry_node[i];
+        if (carried == node) return at;
+        at += 2 * (t.nc[2 * carried] + t.nc[2 * carried + 1]);
+    }
+    return NO_ROW;
+}
+
+enum GadgetField { G_Q, G_TERM, G_REGRET_T, G_REGRET_F, G_STRATEGY_T, G_STRATEGY_F };
 
 __global__ void k_gadget_seed(const Tree* trees) {
     const Tree& t = trees[blockIdx.x];
@@ -512,17 +522,23 @@ __global__ void k_gadget_update(const Tree* trees, int iter, float alpha,
     if ((unsigned long long)iter >= t.todo) return;
     float m = (float)(t.step + (unsigned long long)iter) + 1.0f;
     float dg = powf((m - 1.0f) / m, gamma);
+    unsigned int reach_at = 0;
     for (unsigned int i = 0; i < t.ncarry; ++i) {
         unsigned int node = t.carry_node[i];
+        unsigned int n0 = t.nc[2 * node], n1 = t.nc[2 * node + 1];
+        unsigned int value_at = reach_at + n0 + n1;
         for (unsigned int p = 0; p < 2; ++p) {
-            unsigned int n = t.nc[2 * node + p];
+            unsigned int n = p == 0 ? n0 : n1;
             unsigned int rr = rbase(t, node, p);
             unsigned int vv = p * t.nvals + t.voff[node];
+            unsigned int dst = p == 0 ? 0 : n0;
             for (unsigned int k = threadIdx.x; k < n; k += blockDim.x) {
-                t.reach_sum[rr + k] = t.reach_sum[rr + k] * dg + t.reach[rr + k];
-                t.value_sum[vv + k] = t.value_sum[vv + k] * dg + t.vals[vv + k];
+                unsigned int r = reach_at + dst + k, v = value_at + dst + k;
+                t.carry[r] = t.carry[r] * dg + t.reach[rr + k];
+                t.carry[v] = t.carry[v] * dg + t.vals[vv + k];
             }
         }
+        reach_at += 2 * (n0 + n1);
     }
     if (t.ngadget == 0) return;
     unsigned int opponent = 1 - (unsigned int)t.resolver;
@@ -532,8 +548,6 @@ __global__ void k_gadget_update(const Tree* trees, int iter, float alpha,
     float* rf = t.gadget + G_REGRET_F * t.ngadget;
     float* st = t.gadget + G_STRATEGY_T * t.ngadget;
     float* sf = t.gadget + G_STRATEGY_F * t.ngadget;
-    float* at = t.gadget + G_AVERAGE_T * t.ngadget;
-    float* af = t.gadget + G_AVERAGE_F * t.ngadget;
     const float* follow = t.vals + opponent * t.nvals + t.voff[0];
     float da = cfr_factor(m, alpha), db = cfr_factor(m, beta);
     for (unsigned int k = threadIdx.x; k < t.ngadget; k += blockDim.x) {
@@ -541,8 +555,6 @@ __global__ void k_gadget_update(const Tree* trees, int iter, float alpha,
         float old_t = rt[k], old_f = rf[k];
         rt[k] = old_t * (old_t > 0.0f ? da : db) + q[k] * (term[k] - g);
         rf[k] = old_f * (old_f > 0.0f ? da : db) + q[k] * (follow[k] - g);
-        at[k] = at[k] * dg + q[k] * st[k];
-        af[k] = af[k] * dg + q[k] * sf[k];
         float pt = fmaxf(rt[k], 0.0f), pf = fmaxf(rf[k], 0.0f);
         float total = pt + pf;
         st[k] = total > SMOOTH ? pt / total : 0.5f;
@@ -1234,35 +1246,31 @@ __global__ void k_choose_gather(const Tree* trees, const unsigned int* focus,
     }
     __syncthreads();
     unsigned int at = 1;
-    for (unsigned int p = 0; p < 2; ++p) {
-        unsigned int n = p == 0 ? n0 : n1;
-        unsigned int src = rbase(t, node, p);
-        for (unsigned int k = threadIdx.x; k < n; k += blockDim.x)
-            dst[at + k] = t.reach_sum[src + k];
-        at += n;
-    }
-    for (unsigned int p = 0; p < 2; ++p) {
-        unsigned int n = p == 0 ? n0 : n1;
-        unsigned int src = p * t.nvals + t.voff[node];
-        for (unsigned int k = threadIdx.x; k < n; k += blockDim.x)
-            dst[at + k] = t.value_sum[src + k];
-        at += n;
-    }
+    unsigned int base = carry_base(t, node);
+    for (unsigned int k = threadIdx.x; k < n0 + n1; k += blockDim.x)
+        dst[at + k] = t.carry[base + k];
+    at += n0 + n1;
+    for (unsigned int k = threadIdx.x; k < n0 + n1; k += blockDim.x)
+        dst[at + k] = t.carry[base + n0 + n1 + k];
+    at += n0 + n1;
     unsigned int child = chosen == NO_ROW ? NO_ROW : t.legal_child[t.soff[node] + chosen];
+    unsigned int child_n0 = child == NO_ROW ? 0 : t.nc[2 * child];
+    unsigned int child_n1 = child == NO_ROW ? 0 : t.nc[2 * child + 1];
+    unsigned int child_base = child == NO_ROW ? 0 : carry_base(t, child);
     for (unsigned int p = 0; p < 2; ++p) {
         unsigned int room = p == 0 ? c0 : c1;
-        unsigned int n = child == NO_ROW ? 0 : t.nc[2 * child + p];
-        unsigned int src = child == NO_ROW ? 0 : rbase(t, child, p);
+        unsigned int n = p == 0 ? child_n0 : child_n1;
+        unsigned int src = child_base + (p == 0 ? 0 : child_n0);
         for (unsigned int k = threadIdx.x; k < room; k += blockDim.x)
-            dst[at + k] = k < n ? t.reach_sum[src + k] : 0.0f;
+            dst[at + k] = k < n ? t.carry[src + k] : 0.0f;
         at += room;
     }
     for (unsigned int p = 0; p < 2; ++p) {
         unsigned int room = p == 0 ? c0 : c1;
-        unsigned int n = child == NO_ROW ? 0 : t.nc[2 * child + p];
-        unsigned int src = child == NO_ROW ? 0 : p * t.nvals + t.voff[child];
+        unsigned int n = p == 0 ? child_n0 : child_n1;
+        unsigned int src = child_base + child_n0 + child_n1 + (p == 0 ? 0 : child_n0);
         for (unsigned int k = threadIdx.x; k < room; k += blockDim.x)
-            dst[at + k] = k < n ? t.value_sum[src + k] : 0.0f;
+            dst[at + k] = k < n ? t.carry[src + k] : 0.0f;
         at += room;
     }
     for (unsigned int k = threadIdx.x; k < cells; k += blockDim.x)

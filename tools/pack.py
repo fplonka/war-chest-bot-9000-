@@ -38,10 +38,6 @@ def pack(run):
     out_dir = run / "bots"
     log = json.loads((run / "log.json").read_text())
     cfg = log.get("cfg", {})
-    required = ["s", "c", "round_batch", "rounds", "cfr", "puct", "prior_temp"]
-    missing = [key for key in required if key not in cfg]
-    if missing:
-        raise SystemExit(f"{run} is missing packed search fields: {', '.join(missing)}")
     snapshots = log.get("snapshots", [])
     snaps = selected(snapshots)
     if not snaps:
@@ -55,13 +51,12 @@ def pack(run):
                                 weights_only=False)
         net = Net()
         net.load_state_dict(checkpoint["value"])
-        search = {"s": cfg["s"],
-                  "c": cfg["c"],
-                  "batch": cfg["round_batch"],
-                  "rounds": cfg["rounds"],
-                  "puct": cfg["puct"],
-                  "prior_temp": cfg["prior_temp"],
-                  "cfr": "dcfr"}
+        search = checkpoint.get("search")
+        required = ["s", "c", "batch", "rounds", "cfr", "puct", "prior_temp"]
+        missing = [key for key in required if not isinstance(search, dict) or key not in search]
+        if missing:
+            raise SystemExit(f"{snap['file']} is missing packed search fields: {', '.join(missing)}")
+        search = {key: search[key] for key in required}
         final = snap is snapshots[-1]
         stem = Path(snap["file"]).stem.removeprefix("snap_")
         bot = "final" if final else f"{stem}-{snap['label']}"

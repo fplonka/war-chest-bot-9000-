@@ -59,6 +59,9 @@ impl Solver {
         belief: [Belief; 2],
         rng: Rng,
     ) -> Result<Solver, String> {
+        if !root.is_valued() {
+            return Err("a target solve requires a valued state".into());
+        }
         let mut sv = Self::build(root, ctx, net, cfg, belief, rng, Finish::Target)?;
         sv.prepare_focus(false)?;
         Ok(sv)
@@ -78,9 +81,7 @@ impl Solver {
             return Err(format!("root support of {root_configs} configurations exceeds solve capacity"));
         }
         for p in 0..2 {
-            if belief[p].cfg.len() != belief[p].p.len() || belief[p].cfg.is_empty() {
-                return Err(format!("player {p} root belief is invalid"));
-            }
+            crate::resolve::validate_belief(root, &ctx, p, &belief[p])?;
         }
         let cfgs: [Arc<[Config]>; 2] = [belief[0].cfg.as_slice().into(), belief[1].cfg.as_slice().into()];
         let mut sv = Solver::default();
@@ -99,6 +100,9 @@ impl Solver {
         sv.seed = Rng::new(sv.rng.next_u64()).0;
         let root = sv.push_node(crate::contract::NO_ROW, *root, cfgs);
         sv.expand(root);
+        if let Some(error) = sv.failure.take() {
+            return Err(error);
+        }
         Ok(sv)
     }
 
@@ -355,8 +359,7 @@ impl Solver {
             };
             cfv[p] = values[p].iter().map(|x| x / mass[1 - p]).collect();
         }
-        let public = PublicState::new(self.nodes[node].state, &range)?;
-        Boundary::new(public, range, cfv)
+        Boundary::new(self.nodes[node].state, range, cfv)
     }
 
     fn policy_at(&self, node: usize, probs: &[f32]) -> Policy {

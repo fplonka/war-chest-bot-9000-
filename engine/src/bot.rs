@@ -46,9 +46,9 @@ impl Brain {
 
 pub struct Session {
     s: State,
-    public: PublicState,
     ctx: Ctx,
     seat: u8,
+    support: [Vec<Config>; 2],
     continuation: Option<Continuation>,
     #[cfg(feature = "gpu")]
     rng: Rng,
@@ -59,11 +59,12 @@ impl Session {
         let s = draft.state()?;
         let ctx = Ctx::new(&s);
         let belief = [Belief::point(Config::default()), Belief::point(Config::default())];
+        PublicState::new(s, &belief)?;
         Ok(Session {
-            public: PublicState::new(s, &belief)?,
             s,
             ctx,
             seat,
+            support: [vec![Config::default()], vec![Config::default()]],
             continuation: Some(Continuation::Unsolved(belief)),
             #[cfg(feature = "gpu")]
             rng: Rng::new(_seed),
@@ -81,24 +82,39 @@ impl Session {
         if !self.s.is_chance() || self.s.to_act() != player {
             return Err(format!("player {player} is not drawing"));
         }
+        self.continuation.as_ref().ok_or("the session has ended")?;
+        let legal = self.s.legal_actions();
+        let drawn = match code {
+            Some(code) => Action::decode(code).ok_or_else(|| format!("draw {code} does not decode"))?,
+            None => legal[0],
+        };
+        if !legal.contains(&drawn) {
+            return Err(format!("draw {} is illegal", drawn.encode()));
+        }
+        let p = player as usize;
         let res = reserve(&self.s, player, &self.ctx);
         let faceup = faceup_counts(&self.s, player, &self.ctx);
         let in_flight = matches!(self.s.pending(), Cont::WarriorPriestDraw { .. });
-        if let Continuation::Unsolved(belief) = self.continuation.as_mut().ok_or("the session has ended")? {
-            belief[player as usize] = belief_after_draw(&belief[player as usize], &res, &faceup, in_flight);
+        match self.continuation.as_mut().unwrap() {
+            Continuation::Unsolved(belief) => {
+                belief[p] = belief_after_draw(&belief[p], &res, &faceup, in_flight);
+                self.support[p] = belief[p].cfg.clone();
+            }
+            Continuation::Solved { .. } => {
+                let n = self.support[p].len();
+                let prior = Belief { cfg: self.support[p].clone(), p: vec![1.0 / n as f32; n] };
+                self.support[p] = belief_after_draw(&prior, &res, &faceup, in_flight).cfg;
+            }
         }
-        let drawn = match code {
-            Some(code) => Action::decode(code).ok_or_else(|| format!("draw {code} does not decode"))?,
-            None => self.s.legal_actions()[0],
-        };
-        self.s.apply_inplace(drawn);
-        let more = matches!(self.s.pending(), Cont::Draw { .. }) && self.s.to_act() == player;
+        let mut state = self.s;
+        state.apply_inplace(drawn);
+        let more = matches!(state.pending(), Cont::Draw { .. }) && state.to_act() == player;
         if !more {
             if let Some(Continuation::Solved { path, .. }) = self.continuation.as_mut() {
                 path.steps.push(PublicStep::Chance);
             }
         }
-        self.public = PublicState::from_state(self.s);
+        self.s = state;
         Ok(())
     }
 
@@ -109,18 +125,21 @@ impl Session {
         if player == self.seat {
             return Err("a bot is told its own move back".into());
         }
-        let own = true_config(&self.s, self.seat, &self.ctx);
-        let support = crate::pbs::uniform_belief(&self.s, &self.ctx, player);
-        self.public = apply_public_observation(&self.public, &support.cfg, key)?;
-        self.s = self.public.state();
-        set_config(&mut self.s, self.seat, &self.ctx, &own);
-        let Continuation::Solved { path, .. } = self.continuation.as_mut().ok_or("the session has ended")? else {
+        let Continuation::Solved { .. } = self.continuation.as_ref().ok_or("the session has ended")? else {
             return Err("an opponent action arrived before the initial refresh".into());
         };
-        path.steps.push(PublicStep::Act(key));
-        if self.s.is_terminal() {
+        let own = true_config(&self.s, self.seat, &self.ctx);
+        let (public, support) = apply_public_observation(
+            &PublicState::from_state(self.s), &self.support[player as usize], key)?;
+        let mut state = public.state();
+        set_config(&mut state, self.seat, &self.ctx, &own);
+        if state.is_terminal() {
             self.continuation = None;
+        } else if let Some(Continuation::Solved { path, .. }) = self.continuation.as_mut() {
+            path.steps.push(PublicStep::Act(key));
         }
+        self.support[player as usize] = support;
+        self.s = state;
         Ok(())
     }
 
@@ -159,6 +178,7 @@ impl Session {
         let SolveOutput::Refresh(solved) = brain.solve(solver)? else {
             return Err("refresh solve returned the wrong result type".into());
         };
+        self.support = std::array::from_fn(|p| solved.focus.range[p].cfg.clone());
         self.continuation = Some(Continuation::Solved {
             boundary: Box::new(solved.focus),
             path: ResolvePath::default(),
@@ -200,7 +220,9 @@ impl Session {
             PlaySolved::Terminal(s) => (s.action, None),
         };
         self.s.apply_inplace(action);
-        self.public = PublicState::from_state(self.s);
+        if let Some(boundary) = &next {
+            self.support = std::array::from_fn(|p| boundary.range[p].cfg.clone());
+        }
         self.continuation = next.map(|boundary| Continuation::Solved {
             boundary: Box::new(boundary),
             path: ResolvePath::default(),
@@ -231,6 +253,23 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_error_does_not_advance_the_session() {
+        let mut session = Session::new(&draft(), 1, 9).unwrap();
+        while session.s.is_chance() {
+            let player = session.s.to_act();
+            session.drew(player, None).unwrap();
+        }
+        session.seat = 1 - session.s.to_act();
+        let state = session.s;
+        let support = session.support.clone();
+        let player = session.s.to_act();
+        let key = obs_key(&session.s.legal_actions()[0]);
+        assert!(session.acted(player, key).is_err());
+        assert_eq!(session.s, state);
+        assert_eq!(session.support, support);
+    }
+
+    #[test]
     fn opponent_action_is_only_a_public_path_step() {
         let mut session = Session::new(&draft(), 1, 9).unwrap();
         while session.s.is_chance() {
@@ -243,12 +282,11 @@ mod tests {
             uniform_belief(&session.s, &session.ctx, 1),
         ];
         let boundary = Boundary::new(
-            PublicState::new(session.s, &ranges).unwrap(),
+            session.s,
             ranges.clone(),
             [vec![0.0; ranges[0].len()], vec![0.0; ranges[1].len()]],
         )
         .unwrap();
-        session.public = boundary.public.clone();
         session.continuation = Some(Continuation::Solved {
             boundary: Box::new(boundary),
             path: Default::default(),
