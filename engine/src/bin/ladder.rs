@@ -279,7 +279,7 @@ fn run() -> Result<(), String> {
     let mut manifests = bots.cloned().collect::<Vec<_>>();
     manifests.sort_by(|x, y| x.name.cmp(&y.name));
     manifests.dedup_by(|x, y| x.name == y.name);
-    let games = 200;
+    let games = 400;
     let seed = 83;
     let devices = ["0", "1"];
     let output = if paths.len() == 1 {
