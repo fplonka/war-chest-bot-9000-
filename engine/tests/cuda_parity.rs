@@ -8,7 +8,7 @@ use warchest::contract::{Call, Reply};
 use warchest::net::Net;
 use warchest::pbs::{expand_row, pack_row, Ctx, PUBFEAT, ROW_BYTES};
 use warchest::rng::Rng;
-use warchest::search::{Budget, Cfg, Solved, Solver, Step};
+use warchest::search::{Budget, Cfg, Cfr, Solved, Solver, Step};
 use warchest::selfplay::{make_game, Agent, Collect, Data, GameCfg, GameStream};
 
 struct Backend(TestDevice);
@@ -394,8 +394,8 @@ fn a_ragged_round_does_not_move_the_small_solve() {
 fn strategy_average_uses_the_evaluated_iterates() {
     let net = Arc::new(Net::random(0x9E37));
     let device = gpu(28);
-    let cfg = Cfg { s: 1, c: 0.0, ..Default::default() };
-    for updates in [1usize, 3] {
+    for (cfr, updates) in [(Cfr::SOG, 1), (Cfr::SOG, 3), (Cfr::DISCOUNTED, 3)] {
+        let cfg = Cfg { s: 1, c: 0.0, cfr, ..Default::default() };
         let mut data = Data::default();
         let mut sv = GameStream::new(0x51E5, game_cfg_of(cfg)).next_solve(&net, &mut data);
         sv.pin(0);
@@ -437,15 +437,15 @@ fn strategy_average_uses_the_evaluated_iterates() {
             policy_at: ((so + row.start) as u32, row.len() as u32),
         };
         let got = device.run(&[read], 0).expect("read").pop().expect("reply").b;
-        let scale = (updates * (updates + 1) / 2) as f32;
+        let scale = (1..=updates).map(|t| (t as f32).powf(cfr.gamma)).sum::<f32>();
         for action in 0..row.len() {
             let want = evaluated
                 .iter()
                 .enumerate()
-                .map(|(t, strategy)| (t + 1) as f32 * strategy[action])
+                .map(|(t, strategy)| ((t + 1) as f32).powf(cfr.gamma) * strategy[action])
                 .sum::<f32>() / scale;
             assert!((got[action] - want).abs() < 2e-6,
-                    "{updates} updates action {action}: {} != {want}", got[action]);
+                    "gamma {} {updates} updates action {action}: {} != {want}", cfr.gamma, got[action]);
         }
     }
 }

@@ -546,9 +546,6 @@ __global__ void k_backprop_sweep(const Tree* trees, const unsigned int* work, in
     unsigned int item = work[at + blockIdx.x];
     const Tree& t = trees[item >> WORK_BITS];
     if ((unsigned long long)iter >= t.todo) return;
-    float m = (float)(t.step + (unsigned long long)iter) + 1.0f;
-    float da = cfr_factor(m, alpha), db = cfr_factor(m, beta);
-    float dg = powf((m - 1.0f) / m, gamma);
     int traverser = blockIdx.y;
     float* vals = t.vals + traverser * t.nvals;
     unsigned int node = work_node(t, level, item);
@@ -600,6 +597,9 @@ __global__ void k_backprop_sweep(const Tree* trees, const unsigned int* work, in
         }
         return;
     }
+    float m = (float)(t.step + (unsigned long long)iter) + 1.0f;
+    float da = cfr_factor(m, alpha), db = cfr_factor(m, beta);
+    float dg = powf((m - 1.0f) / m, gamma);
     unsigned int ra = rbase(t, node, traverser);
     for (unsigned int c = warp; c < n; c += warps) {
         unsigned int a = t.legal_off[lb + c], b = t.legal_off[lb + c + 1];
