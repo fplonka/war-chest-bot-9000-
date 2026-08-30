@@ -2,10 +2,12 @@
 set -euo pipefail
 
 args=("$@")
+options=()
 out=
 minutes=
 for arg in "${args[@]}"; do
     case "$arg" in
+        --*) options+=("$arg") ;;
         out=*) out=${arg#out=} ;;
         minutes=*) minutes=${arg#minutes=} ;;
     esac
@@ -22,7 +24,7 @@ resume=$(newest_snapshot || true)
 failures=0
 while :; do
     if [ -n "$resume" ]; then
-        command=(python train/train.py "out=$out" "resume=$resume")
+        command=(python train/train.py "${options[@]}" "out=$out" "resume=$resume")
         [ -n "$minutes" ] && command+=("minutes=$minutes")
     else
         command=(python train/train.py "${args[@]}")

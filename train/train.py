@@ -575,8 +575,11 @@ def publish_state(state):
 def main():
     ap = argparse.ArgumentParser(
         description="Train one run and pack its snapshots as bots.")
+    ap.add_argument("--skip-ladder", action="store_true",
+                    help="pack snapshots without running the internal ladder")
     ap.add_argument("over", nargs="*", help="knob=value (production defaults)")
-    over = config.parse(ap.parse_args().over)
+    cli = ap.parse_args()
+    over = config.parse(cli.over)
     resume = over.pop("resume", "")
     name = over.pop("out", None)
     checkpoint = None
@@ -1171,8 +1174,9 @@ def main():
     torch.cuda.empty_cache()
     subprocess.run([sys.executable, str(ROOT / "tools" / "pack.py"),
                     args.out], check=True)
-    subprocess.run([str(ROOT / "engine" / "target" / "release" / "ladder"),
-                    args.out], check=True)
+    if not cli.skip_ladder:
+        subprocess.run([str(ROOT / "engine" / "target" / "release" / "ladder"),
+                        args.out], check=True)
 
 
 if __name__ == "__main__":
