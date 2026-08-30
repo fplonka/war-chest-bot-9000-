@@ -80,7 +80,7 @@ pub enum Dst {
     RvdBase, RvdStart, RvdSrc, RvdP,
     DrawBase, DrawStart, DrawTo, DrawP,
     LevelStart, LevelNode,
-    Cur, Prior, LeafNode, Term, Rootb,
+    Cur, Prior, LeafNode, Term, Reach,
 }
 
 #[derive(Clone, Default)]

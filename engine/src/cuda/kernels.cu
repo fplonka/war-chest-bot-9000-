@@ -493,15 +493,6 @@ __device__ __forceinline__ unsigned int rbase(const Tree& t, unsigned int i, int
     return t.roff[i] + (p == 1 ? t.nc[2 * i] : 0);
 }
 
-__global__ void k_seed_reach(const Tree* trees, int iter) {
-    const Tree& t = trees[blockIdx.y];
-    if ((unsigned long long)iter >= t.todo) return;
-    unsigned int n = t.nc[0] + t.nc[1];
-    for (unsigned int c = blockIdx.x * blockDim.x + threadIdx.x; c < n;
-         c += gridDim.x * blockDim.x)
-        t.reach[t.roff[0] + c] = t.rootb[c];
-}
-
 __global__ void k_reach_sweep(const Tree* trees, const unsigned int* work, int at,
                               int level, int avg, int iter) {
     unsigned int item = work[at + blockIdx.x];
@@ -1085,12 +1076,13 @@ __global__ void k_expand(const Tree* trees, unsigned int* out, int parts,
     if ((unsigned long long)iter >= t.todo || t.nexpand == 0) return;
     unsigned long long s = *t.seed;
     unsigned int n0 = t.nc[0], n1 = t.nc[1];
-    float b0 = pick_sum(t.rootb, (int)n0), b1 = pick_sum(t.rootb + n0, (int)n1);
+    const float* root = t.reach + t.roff[0];
+    float b0 = pick_sum(root, (int)n0), b1 = pick_sum(root + n0, (int)n1);
     int want = (int)t.nexpand, got = 0;
     for (int draw = 0; draw < want * tries && got < want; ++draw) {
         int c[2];
-        c[0] = pick_from(t.rootb, (int)n0, b0, &s);
-        c[1] = pick_from(t.rootb + n0, (int)n1, b1, &s);
+        c[0] = pick_from(root, (int)n0, b0, &s);
+        c[1] = pick_from(root + n0, (int)n1, b1, &s);
         unsigned int node = 0;
         unsigned int found = NO_ROW;
         for (;;) {

@@ -268,7 +268,6 @@ pub struct TNode {
     pub voff: u32,
     pub soff: u32,
     pub row_of: u32,
-    pub primed: bool,
     pub util: f32,
     pub player: u8,
     pub leaf: bool,
@@ -667,7 +666,6 @@ impl Solver {
             || !self.reserve(Ent::Reach, self.nvals + c0.max(c1))
             || !self.reserve(Ent::Cell, next_cell)
             || !self.reserve(Ent::Row, next_row)
-            || (parent == crate::contract::NO_ROW && !self.reserve(Ent::Config, (c0 + c1).div_ceil(2)))
         {
             return parent as usize;
         }
@@ -680,7 +678,6 @@ impl Solver {
             voff: self.nvals as u32,
             soff: self.counts.cells as u32,
             row_of: u32::MAX,
-            primed: false,
             util: if terminal { s.utility(player as usize) } else { 0.0 },
             player,
             leaf: true,
@@ -801,9 +798,7 @@ impl Solver {
             Ent::Draw => self.counts.draws,
             Ent::Row => self.leaf_rows.len().max(self.term_leaves.len()),
             Ent::Board => self.counts.boards,
-            Ent::Config => self.counts.cfgs.max(self.nodes.first().map_or(0, |n| {
-                (n.nc[0] as usize + n.nc[1] as usize).div_ceil(2)
-            })),
+            Ent::Config => self.counts.cfgs,
             Ent::Cidx => self.leaf_cidx.len(),
         }
     }
@@ -1401,7 +1396,7 @@ impl Solver {
         );
         if first {
             let b = [&self.root_belief[0].p[..], &self.root_belief[1].p[..]].concat();
-            w.f32s(Dst::Rootb, 0, &b);
+            w.f32s(Dst::Reach, self.nodes[0].roff as usize, &b);
         }
         w.f32s_both(Dst::Cur, Dst::Prior, sent, &self.cur[sent..]);
         let (prime, acts, cells) = self.prime();
@@ -1437,32 +1432,14 @@ impl Solver {
         self.resent = resealed;
     }
 
-    fn ready_for_prior(&mut self) -> Vec<usize> {
-        let mut want: Vec<usize> = Vec::new();
-        let mut queue = std::mem::take(&mut self.wants_prior);
-        queue.retain(|&i| {
-            let i = i as usize;
-            if self.nodes[i].primed || self.nodes[i].leaf || self.nodes[i].chance {
-                return false;
-            }
-            if self.nodes[i].row_of == u32::MAX {
-                return false;
-            }
-            if (self.nodes[i].row_of as usize) < self.batch_rows {
-                want.push(i);
-                return false;
-            }
-            true
-        });
-        self.wants_prior = queue;
-        want
-    }
-
     pub(crate) fn prime(&mut self) -> (Vec<Prime>, Vec<u32>, Vec<u32>) {
-        let want = self.ready_for_prior();
         let (mut prime, mut acts, mut cells) = (Vec::new(), Vec::new(), Vec::new());
-        for i in want {
+        for i in std::mem::take(&mut self.wants_prior) {
+            let i = i as usize;
             let n = &self.nodes[i];
+            if n.leaf || n.chance {
+                continue;
+            }
             prime.push(Prime {
                 node: i as u32,
                 row: n.row_of,
@@ -1475,7 +1452,6 @@ impl Solver {
                 acts.extend(action_desc(&n.acts[a], n.player, &self.ctx, n.aslot[a]).map(u32::from));
             }
             cells.extend_from_slice(&n.legal_action);
-            self.nodes[i].primed = true;
         }
         (prime, acts, cells)
     }

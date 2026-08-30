@@ -58,7 +58,6 @@ kernels! {
     bias,
     window,
     scatter,
-    seed_reach,
     terminals,
     expand,
     finish,
@@ -1856,17 +1855,6 @@ impl Card {
 
     fn reaches(&self, b: &Batch, p: &Prefix, avg: i32, iter: i32) -> Res<()> {
         let (trees, work) = (b.trees.buf(), b.work.buf());
-        unsafe {
-            self.stream
-                .launch_builder(&self.k.seed_reach)
-                .arg(trees).arg(&iter)
-                .launch_unit(LaunchConfig {
-                    grid_dim: (64, p.parts, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-        }
-        .map_err(err)?;
         for level in 1..p.items.len() {
             if p.items[level] == 0 {
                 continue;

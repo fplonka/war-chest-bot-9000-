@@ -203,6 +203,51 @@ fn run_solve(backend: &Backend, mut sv: Solver) -> (Solver, Option<Solved>) {
 }
 
 #[test]
+fn fresh_batched_solves_use_supplied_beliefs_for_their_first_priors() {
+    let net = Arc::new(Net::random(0x9E37));
+    let cfg = Cfg { s: 1, c: 1.0, batch: 8, ..Default::default() };
+    let mut data = Data::default();
+    let seed = GameStream::new(0x51E5, game_cfg_of(cfg)).next_solve(&net, &mut data);
+    let mut beliefs = [seed.root_belief.clone(), seed.root_belief.clone()];
+    assert!(beliefs[0].iter().all(|b| b.len() > 1));
+    for (side, pair) in beliefs.iter_mut().enumerate() {
+        for belief in pair {
+            let at = if side == 0 { 0 } else { belief.len() - 1 };
+            belief.p.fill(0.0);
+            belief.p[at] = 1.0;
+        }
+    }
+    let (mut solves, mut calls) = (Vec::new(), Vec::new());
+    for (i, belief) in beliefs.into_iter().enumerate() {
+        let mut sv = Solver::new(
+            &seed.nodes[0].state,
+            Ctx::new(&seed.nodes[0].state),
+            Arc::clone(&net),
+            cfg,
+            belief,
+            Rng::new(0xB3113F + i as u64),
+        );
+        sv.pin(i);
+        let Step::Calls(fresh) = sv.advance(&[]) else { panic!("a fresh solve asks for work") };
+        calls.extend(fresh);
+        solves.push(sv);
+    }
+    let device = gpu(30);
+    let replies = device.run(&calls, 0).expect("the card answered the first round");
+    assert_eq!(replies.iter().filter(|r| !r.leaves.is_empty()).count(), solves.len());
+    let mut priors = Vec::new();
+    for (i, sv) in solves.iter().enumerate() {
+        let resident = device.resident(0, i).expect("the fresh solve is resident");
+        let belief = [&sv.root_belief[0].p[..], &sv.root_belief[1].p[..]].concat();
+        assert_eq!(&resident.reach[..belief.len()], &belief);
+        let root = &sv.nodes[0];
+        let cells = root.soff as usize..root.soff as usize + root.legal_action.len();
+        priors.push(resident.prior[cells].to_vec());
+    }
+    assert!(priors[0].iter().zip(&priors[1]).any(|(&a, &b)| (a - b).abs() > 1e-5));
+}
+
+#[test]
 fn a_solve_may_change_pipeline_streams() {
     let net = Net::random(0x9E37);
     let device = Backend(gpu(0));
