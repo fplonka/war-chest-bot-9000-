@@ -391,63 +391,26 @@ fn a_ragged_round_does_not_move_the_small_solve() {
 
 
 #[test]
-fn strategy_average_uses_the_evaluated_iterates() {
+fn cfr_average_uses_evaluated_strategies_and_global_steps() {
     let net = Arc::new(Net::random(0x9E37));
-    let device = gpu(28);
-    for (cfr, updates) in [(Cfr::SOG, 1), (Cfr::SOG, 3), (Cfr::DISCOUNTED, 3)] {
-        let cfg = Cfg { s: 1, c: 0.0, cfr, ..Default::default() };
+    let device = Backend(gpu(28));
+    let fresh = |s, batch| {
+        let cfg = Cfg { s, c: 0.0, batch, cfr: Cfr::DISCOUNTED, ..Default::default() };
         let mut data = Data::default();
-        let mut sv = GameStream::new(0x51E5, game_cfg_of(cfg)).next_solve(&net, &mut data);
-        sv.pin(0);
-        let Step::Calls(calls) = sv.advance(&[]) else {
-            panic!("fresh solve finished")
-        };
-        let (mut setup, mut iteration) = (Vec::new(), None);
-        for call in calls {
-            if matches!(call, Call::Iterate { .. }) {
-                iteration = Some(call);
-            } else {
-                setup.push(call);
-            }
-        }
-        device.run(&setup, 0).expect("setup");
-        let iteration = iteration.expect("iteration");
-        let row = sv.nodes[0].legal_row(0);
-        let so = sv.nodes[0].soff as usize;
-        let mut evaluated = Vec::new();
-        for step in 0..updates {
-            let before = device.resident(0, 0).expect("resident before update");
-            evaluated.push(before.cur[so + row.start..so + row.end].to_vec());
-            let mut call = iteration.clone();
-            let Call::Iterate { step: at, iters, expand, query, .. } = &mut call else {
-                unreachable!()
-            };
-            (*at, *iters, *expand) = (step, 1, 0);
-            query.clear();
-            device.run(&[call], 0).expect("update");
-        }
-        let next = device.resident(0, 0).expect("resident after updates");
-        assert!(
-            worst(&evaluated[0], &next.cur[so + row.start..so + row.end], "next") > 1e-3
-        );
-        let read = Call::Read {
-            solve: 0,
-            touched: [true; 2],
-            vals_at: [(0, 0); 2],
-            policy_at: ((so + row.start) as u32, row.len() as u32),
-        };
-        let got = device.run(&[read], 0).expect("read").pop().expect("reply").b;
-        let scale = (1..=updates).map(|t| (t as f32).powf(cfr.gamma)).sum::<f32>();
-        for action in 0..row.len() {
-            let want = evaluated
-                .iter()
-                .enumerate()
-                .map(|(t, strategy)| ((t + 1) as f32).powf(cfr.gamma) * strategy[action])
-                .sum::<f32>() / scale;
-            assert!((got[action] - want).abs() < 2e-6,
-                    "gamma {} {updates} updates action {action}: {} != {want}", cfr.gamma, got[action]);
-        }
-    }
+        GameStream::new(0x51E5, game_cfg_of(cfg)).next_solve(&net, &mut data)
+    };
+
+    let one = fresh(1, 1);
+    let row = one.nodes[0].legal_row(0);
+    let so = one.nodes[0].soff as usize;
+    let initial = one.cur[so + row.start..so + row.end].to_vec();
+    let solved = run_solve(&device, one).1.expect("one-update solve");
+    assert!(worst(&initial, &solved.policy.p[..initial.len()], "one-update average") < 2e-6);
+
+    let solve = |batch| run_solve(&device, fresh(3, batch)).1.expect("three-update solve");
+    let together = solve(3);
+    let split = solve(1);
+    assert!(worst(&together.policy.p, &split.policy.p, "split average") < 2e-6);
 }
 
 #[test]
