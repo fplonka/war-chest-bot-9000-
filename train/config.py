@@ -31,10 +31,12 @@ class Cfg:
     query_rate: float = 0.9
     recursive_rate: float = 0.1
     cfr: str = "sog"
+    puct: float = 1.5
+    prior_temp: float = 1.0
     policy_w: float = 0.01
-    explore: float = 0.1
     temp: float = 2.0
     warm_games: int = 96
+    static_explore: float = 0.25
     random_draft: bool = True
 
     device: str = "cuda:1"

@@ -492,7 +492,6 @@ def ingest(buf, data, warm=False):
             f"non-finite collect values: data['cw']={bad_cw}, data['cy']={bad_cy}")
     if not len(x):
         return 0
-    cy = np.clip(cy, -1.0, 1.0)
     coff = np.asarray(data["coff"], np.int64)
     soff = np.asarray(data["soff"], np.int64)
     query = np.asarray(data["query"], np.uint8)
@@ -764,7 +763,15 @@ def main():
             "t": round(el, 1),
             "label": label,
             "git": args.git,
-            "search": {"s": args.s, "c": args.c, "cfr": args.cfr},
+            "search": {
+                "s": args.s,
+                "c": args.c,
+                "batch": args.round_batch,
+                "rounds": args.rounds,
+                "cfr": args.cfr,
+                "puct": args.puct,
+                "prior_temp": args.prior_temp,
+            },
         }
         tmp = path + ".tmp"
         torch.save(state, tmp)
@@ -815,9 +822,10 @@ def main():
             c=args.c,
             batch=args.round_batch,
             rounds=args.rounds,
-            explore=args.explore,
             random_draft=args.random_draft,
             cfr=args.cfr,
+            puct=args.puct,
+            prior_temp=args.prior_temp,
             p_td1=args.p_td1,
             query_rate=args.query_rate,
             recursive_rate=args.recursive_rate,
@@ -857,7 +865,7 @@ def main():
             ta = time.time()
             n = ingest(buf, data)
             add_s = time.time() - ta
-            cy = np.clip(np.asarray(data["cy"], np.float32), -1.0, 1.0)
+            cy = np.asarray(data["cy"], np.float32)
             cw = np.asarray(data["cw"], np.float32)
             window_targets.append(cy)
             window_target_weights.append(cw)
@@ -1139,13 +1147,13 @@ def main():
             tg = time.time()
             d = warchest.gen_data(
                 args.warm_games, args.seed * 1_000_003 + epoch,
-                explore=args.explore, random_draft=args.random_draft,
+                explore=args.static_explore, random_draft=args.random_draft,
                 temp=args.temp)
             gen_s = time.time() - tg
             n = ingest(buf, d, warm=True)
             steps = max(1, n // args.batch) if len(buf) >= args.batch else 0
             lv, train_s, _ = fit(steps)
-            cy = np.clip(np.asarray(d["cy"], np.float32), -1.0, 1.0)
+            cy = np.asarray(d["cy"], np.float32)
             rec = {
                 "t": round(time.time() - t0, 1), "epoch": epoch, "phase": "warm",
                 "games": int(d.get("games", 0)), "rows": n,

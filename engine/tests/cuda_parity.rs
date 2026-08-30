@@ -6,9 +6,10 @@ use warchest::contract::NO_ROW;
 use warchest::cuda::Device;
 use warchest::contract::{Call, Reply};
 use warchest::net::Net;
-use warchest::pbs::{expand_row, pack_row, Ctx, PUBFEAT, ROW_BYTES};
+use warchest::pbs::{expand_row, pack_row, true_config, Ctx, PUBFEAT, ROW_BYTES};
 use warchest::rng::Rng;
-use warchest::search::{Budget, Cfg, Cfr, Solved, Solver, Step};
+use warchest::resolve::{gadget_iteration, PlaySolved, SolveOutput};
+use warchest::search::{Budget, Cfg, Cfr, Policy, Solver, Step};
 use warchest::selfplay::{make_game, Agent, Collect, Data, GameCfg, GameStream};
 
 struct Backend(TestDevice);
@@ -31,7 +32,7 @@ fn game_cfg_of(cfg: Cfg) -> GameCfg {
     GameCfg {
         agents: [Agent::Sog { cfg }; 2],
         collect: Collect::Sog,
-        explore: 0.1,
+        static_explore: 0.0,
         random_draft: true,
         p_td1: 0.0,
         query_rate: 0.0,
@@ -75,9 +76,12 @@ fn shift_call(call: &Call, base: usize) -> Call {
     match &mut shifted {
         Call::Trunk { solve, .. }
         | Call::Configs { solve, .. }
+        | Call::Gadget { solve, .. }
         | Call::Tree { solve, .. }
         | Call::Iterate { solve, .. }
-        | Call::Read { solve, .. } => *solve += base,
+        | Call::ReadPlay { solve, .. }
+        | Call::ReadRefresh { solve, .. }
+        | Call::ReadTarget { solve, .. } => *solve += base,
     }
     shifted
 }
@@ -190,7 +194,7 @@ fn generate(
     out.into_iter().map(|data| Run { data }).collect()
 }
 
-fn run_solve(backend: &Backend, mut sv: Solver) -> (Solver, Option<Solved>) {
+fn run_solve(backend: &Backend, mut sv: Solver) -> (Solver, Result<SolveOutput, String>) {
     sv.pin(0);
     let mut replies: Vec<Reply> = Vec::new();
     loop {
@@ -199,6 +203,17 @@ fn run_solve(backend: &Backend, mut sv: Solver) -> (Solver, Option<Solved>) {
             Step::Calls(calls) => replies = backend.run(&calls, 0).expect("the backend answered"),
             Step::Done(solved) => return (sv, solved),
         }
+    }
+}
+
+fn policy(solved: &SolveOutput) -> &Policy {
+    match solved {
+        SolveOutput::Play(s) => match s.as_ref() {
+            PlaySolved::Continue(s) => &s.policy,
+            PlaySolved::Terminal(s) => &s.policy,
+        },
+        SolveOutput::Target(s) => &s.policy,
+        SolveOutput::Refresh(_) => panic!("refresh has no policy"),
     }
 }
 
@@ -216,8 +231,11 @@ fn fresh_batched_solves_use_supplied_beliefs_for_their_first_priors() {
     }
     let (mut solves, mut calls) = (Vec::new(), Vec::new());
     for (i, belief) in beliefs.into_iter().enumerate() {
-        let mut sv = Solver::new(&seed.nodes[0].state, Ctx::new(&seed.nodes[0].state),
-            Arc::clone(&net), cfg, belief, Rng::new(0xB3113F + i as u64));
+        let state = seed.nodes[0].state;
+        let actor = state.to_act();
+        let actual = true_config(&state, actor, &Ctx::new(&state));
+        let mut sv = Solver::initial_play(&state, Ctx::new(&state),
+            Arc::clone(&net), cfg, belief, Rng::new(0xB3113F + i as u64), actual).unwrap();
         sv.pin(i);
         let Step::Calls(fresh) = sv.advance(&[]) else { panic!("a fresh solve asks for work") };
         calls.extend(fresh);
@@ -259,9 +277,9 @@ fn a_solve_may_change_pipeline_streams() {
             }
             Step::Done(got) => {
                 let got = got.expect("a finished solve");
-                assert_eq!(want.policy.off, got.policy.off);
-                assert_eq!(want.policy.act, got.policy.act);
-                let bad = worst(&want.policy.p, &got.policy.p, "root policy");
+                assert_eq!(policy(&want).off, policy(&got).off);
+                assert_eq!(policy(&want).act, policy(&got).act);
+                let bad = worst(&policy(&want).p, &policy(&got).p, "root policy");
                 assert!(bad < 1e-6, "the policy changed across streams by {bad:e}");
                 break;
             }
@@ -332,7 +350,7 @@ fn shared_round(
     backend: &Backend,
     live: &mut [Solver],
     replies: &mut [Vec<Reply>],
-) -> Option<(usize, Option<Solved>)> {
+) -> Option<(usize, Result<SolveOutput, String>)> {
     let mut calls: Vec<Call> = Vec::new();
     let mut spans = vec![0usize; live.len()];
     for (i, sv) in live.iter_mut().enumerate() {
@@ -426,6 +444,82 @@ fn a_ragged_round_does_not_move_the_small_solve() {
 
 
 #[test]
+fn played_session_carries_across_multiple_steps() {
+    let net = Arc::new(Net::random(0x9E37));
+    let cfg = Cfg { s: 2, c: 0.0, batch: 2, ..Default::default() };
+    let device = Backend(gpu(24));
+    let mut stream = GameStream::new(0x5E5510, game_cfg_of(cfg));
+    let mut data = Data::default();
+    for decision in 0..4 {
+        let mut solver = stream.next_solve(&net, &mut data);
+        solver.pin(0);
+        let mut replies = Vec::new();
+        let mut saw_gadget = false;
+        let solved = loop {
+            match solver.advance(&replies) {
+                Step::Calls(calls) => {
+                    saw_gadget |= calls.iter().any(|call| matches!(call, Call::Gadget { .. }));
+                    replies = device.run(&calls, 0).expect("session solve");
+                }
+                Step::Done(solved) => break solved,
+            }
+        };
+        assert_eq!(saw_gadget, decision > 0);
+        stream.keep(&solver, solved, &mut data);
+    }
+}
+
+#[test]
+fn gadget_and_carry_match_one_cpu_iteration() {
+    let net = Arc::new(Net::random(0x9E37));
+    let cfg = Cfg { s: 1, c: 0.0, batch: 1, cfr: Cfr::DISCOUNTED, ..Default::default() };
+    let device = Backend(gpu(26));
+    let mut stream = GameStream::new(0xC411, game_cfg_of(cfg));
+    let mut data = Data::default();
+    let first = stream.next_solve(&net, &mut data);
+    let (first, solved) = run_solve(&device, first);
+    stream.keep(&first, solved, &mut data);
+    let mut second = stream.next_solve(&net, &mut data);
+    second.pin(0);
+    let Step::Calls(calls) = second.advance(&[]) else { panic!("a re-solve asks for work") };
+    device.run(&calls, 0).expect("one gadget iteration");
+    let resident = device.0.resident(0, 0).expect("resident re-solve");
+    let n = resident.gadget.len() / 8;
+    assert!(n > 0, "the second played solve has a gadget");
+    let q = &resident.gadget[..n];
+    let term = &resident.gadget[n..2 * n];
+    let opponent = 1 - second.nodes[0].player as usize;
+    let vo = opponent * second.nvals + second.nodes[0].voff as usize;
+    let follow = &resident.vals[vo..vo + n];
+    let mut regret = vec![[0.0; 2]; n];
+    let mut strategy = vec![[0.5; 2]; n];
+    let mut sum = vec![[0.0; 2]; n];
+    gadget_iteration(q, term, follow, &mut regret, &mut strategy, &mut sum, 0, cfg.cfr);
+    for k in 0..n {
+        assert!((resident.gadget[2 * n + k] - regret[k][0]).abs() < 2e-6);
+        assert!((resident.gadget[3 * n + k] - regret[k][1]).abs() < 2e-6);
+        assert!((resident.gadget[4 * n + k] - strategy[k][0]).abs() < 2e-6);
+        assert!((resident.gadget[5 * n + k] - strategy[k][1]).abs() < 2e-6);
+        assert!((resident.gadget[6 * n + k] - sum[k][0]).abs() < 2e-6);
+        assert!((resident.gadget[7 * n + k] - sum[k][1]).abs() < 2e-6);
+    }
+    let root = &second.nodes[0];
+    let r0 = root.roff as usize;
+    let r1 = r0 + root.nc[0] as usize;
+    for p in 0..2 {
+        let start = if p == 0 { r0 } else { r1 };
+        let count = root.nc[p] as usize;
+        let expected = if p == opponent {
+            q.iter().map(|x| 0.5 * x).collect::<Vec<_>>()
+        } else {
+            second.root_belief[p].p.clone()
+        };
+        assert!(worst(&expected, &resident.reach_sum[start..start + count], "carried root reach") < 2e-6);
+    }
+    assert_eq!(&resident.value_sum[vo..vo + n], follow);
+}
+
+#[test]
 fn cfr_average_uses_evaluated_strategies_and_global_steps() {
     let net = Arc::new(Net::random(0x9E37));
     let device = Backend(gpu(28));
@@ -440,12 +534,12 @@ fn cfr_average_uses_evaluated_strategies_and_global_steps() {
     let so = one.nodes[0].soff as usize;
     let initial = one.cur[so + row.start..so + row.end].to_vec();
     let solved = run_solve(&device, one).1.expect("one-update solve");
-    assert!(worst(&initial, &solved.policy.p[..initial.len()], "one-update average") < 2e-6);
+    assert!(worst(&initial, &policy(&solved).p[..initial.len()], "one-update average") < 2e-6);
 
     let solve = |batch| run_solve(&device, fresh(3, batch)).1.expect("three-update solve");
     let together = solve(3);
     let split = solve(1);
-    assert!(worst(&together.policy.p, &split.policy.p, "split average") < 2e-6);
+    assert!(worst(&policy(&together).p, &policy(&split).p, "split average") < 2e-6);
 }
 
 #[test]

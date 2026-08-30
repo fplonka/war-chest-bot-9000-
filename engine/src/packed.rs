@@ -57,7 +57,7 @@ impl Packed {
             &fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?,
         )
         .map_err(|e| format!("{}: {e}", file.display()))?;
-        if manifest.format != 1 {
+        if manifest.format != 2 {
             return Err(format!(
                 "{} has bot format {}",
                 path.display(),

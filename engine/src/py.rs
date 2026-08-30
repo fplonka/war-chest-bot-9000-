@@ -120,7 +120,7 @@ struct SolveFarm {
 #[pymethods]
 impl SolveFarm {
     #[new]
-    #[pyo3(signature = (seed, workers, s=512, c=8.0, batch=8, rounds=0, explore=0.1, random_draft=true, cfr="sog", p_td1=0.2, query_rate=0.9, recursive_rate=0.1, devices=vec![0]))]
+    #[pyo3(signature = (seed, workers, s=512, c=8.0, batch=8, rounds=0, random_draft=true, cfr="sog", puct=1.5, prior_temp=1.0, p_td1=0.2, query_rate=0.9, recursive_rate=0.1, devices=vec![0]))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         seed: u64,
@@ -129,9 +129,10 @@ impl SolveFarm {
         c: f32,
         batch: usize,
         rounds: u8,
-        explore: f32,
         random_draft: bool,
         cfr: &str,
+        puct: f32,
+        prior_temp: f32,
         p_td1: f32,
         query_rate: f32,
         recursive_rate: f32,
@@ -145,13 +146,14 @@ impl SolveFarm {
             batch,
             rounds,
             cfr: cfr_of(cfr)?,
+            puct,
+            prior_temp,
             budget: Budget::for_s(s),
-            ..Default::default()
         };
         let gc = GameCfg {
             agents: [Agent::Sog { cfg }; 2],
             collect: Collect::Sog,
-            explore,
+            static_explore: 0.0,
             random_draft,
             p_td1,
             query_rate,
@@ -241,7 +243,7 @@ fn gen_data(
     let gc = GameCfg {
         agents: [Agent::Greedy { temp }; 2],
         collect: Collect::Static,
-        explore,
+        static_explore: explore,
         random_draft,
         p_td1: 0.0,
         query_rate: 0.0,

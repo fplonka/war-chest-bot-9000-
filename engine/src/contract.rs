@@ -22,6 +22,12 @@ pub enum Call {
         cards: Vec<f32>,
         n: usize,
     },
+    Gadget {
+        solve: usize,
+        resolver: u8,
+        q: Vec<f32>,
+        terminate: Vec<f32>,
+    },
     Tree {
         solve: usize,
         writes: Writes,
@@ -29,7 +35,9 @@ pub enum Call {
         ncells: usize,
         nreach: usize,
         nvals: usize,
+        root_n: [u32; 2],
         levels: Vec<u32>,
+        carry: Vec<u32>,
         nterm: usize,
         seed: Option<u64>,
         prime: Vec<Prime>,
@@ -46,11 +54,28 @@ pub enum Call {
         cfr: Cfr,
         puct: f32,
     },
-    Read {
+    ReadPlay {
         solve: usize,
         touched: [bool; 2],
-        vals_at: [(u32, u32); 2],
-        policy_at: (u32, u32),
+        focus: u32,
+        focus_n: [u32; 2],
+        cells: u32,
+        actual: u32,
+        next_cap: [u32; 2],
+    },
+    ReadRefresh {
+        solve: usize,
+        touched: [bool; 2],
+        focus: u32,
+        focus_n: [u32; 2],
+        cells: u32,
+    },
+    ReadTarget {
+        solve: usize,
+        touched: [bool; 2],
+        focus: u32,
+        focus_n: [u32; 2],
+        cells: u32,
     },
 }
 
@@ -152,9 +177,10 @@ impl Call {
         match self {
             Call::Trunk { .. } => 0,
             Call::Configs { .. } => 1,
-            Call::Tree { .. } => 2,
-            Call::Iterate { .. } => 3,
-            Call::Read { .. } => 4,
+            Call::Gadget { .. } => 2,
+            Call::Tree { .. } => 3,
+            Call::Iterate { .. } => 4,
+            Call::ReadPlay { .. } | Call::ReadRefresh { .. } | Call::ReadTarget { .. } => 5,
         }
     }
 
@@ -162,9 +188,12 @@ impl Call {
         match self {
             Call::Trunk { solve, .. }
             | Call::Configs { solve, .. }
+            | Call::Gadget { solve, .. }
             | Call::Tree { solve, .. }
             | Call::Iterate { solve, .. }
-            | Call::Read { solve, .. } => *solve,
+            | Call::ReadPlay { solve, .. }
+            | Call::ReadRefresh { solve, .. }
+            | Call::ReadTarget { solve, .. } => *solve,
         }
     }
 
@@ -172,7 +201,12 @@ impl Call {
         match self {
             Call::Trunk { queries, .. } => *queries,
             Call::Configs { n, .. } => *n,
-            Call::Tree { .. } | Call::Iterate { .. } | Call::Read { .. } => 0,
+            Call::Gadget { .. }
+            | Call::Tree { .. }
+            | Call::Iterate { .. }
+            | Call::ReadPlay { .. }
+            | Call::ReadRefresh { .. }
+            | Call::ReadTarget { .. } => 0,
         }
     }
 }

@@ -3,8 +3,9 @@ use crate::board::NONE;
 use crate::net::Net;
 use crate::pbs::*;
 use crate::policy;
+use crate::resolve::{Continuation, PlaySolved, PublicStep, ResolvePath, SolveOutput};
 use crate::rng::Rng;
-use crate::search::{Cfg, Solved, Solver};
+use crate::search::{Cfg, Solver};
 use crate::state::{Cont, State, BLACK, WHITE};
 #[cfg(feature = "python")]
 use rayon::prelude::*;
@@ -179,7 +180,7 @@ impl Data {
 pub struct GameCfg {
     pub agents: [Agent; 2],
     pub collect: Collect,
-    pub explore: f32,
+    pub static_explore: f32,
     pub random_draft: bool,
     pub p_td1: f32,
     pub query_rate: f32,
@@ -190,7 +191,7 @@ pub struct Game {
     rng: Rng,
     s: State,
     ctx: Ctx,
-    bel: [Belief; 2],
+    continuation: Option<Continuation>,
     data: Data,
     gc: GameCfg,
     queries: Vec<(State, [Belief; 2])>,
@@ -212,28 +213,25 @@ pub fn query_solver(
     bel: &[Belief; 2],
     rng: &mut Rng,
 ) -> Solver {
-    let mut sv = Solver::new(
+    let mut sv = Solver::target(
         s,
         Ctx::new(s),
         Arc::clone(nets),
         cfg,
         bel.clone(),
         Rng::new(rng.next_u64()),
-    );
+    ).expect("a query target has a valid root");
     sv.collect(draw_count(rng, recursive_rate));
     sv
 }
 
-pub fn keep_query(sv: &Solver, solved: Option<Solved>, out: &mut Data) -> Vec<(State, [Belief; 2])> {
-    let Some(solved) = solved else {
-        return Vec::new();
-    };
+pub fn keep_query(sv: &Solver, solved: crate::resolve::TargetSolved, out: &mut Data) -> Vec<(State, [Belief; 2])> {
     out.begin_solve();
     out.push_value(
         &sv.nodes[0].state,
         &sv.ctx,
         &sv.root_belief,
-        [&solved.value[0], &solved.value[1]],
+        [&solved.values[0], &solved.values[1]],
         [u32::MAX; 2],
         &Default::default(),
     );
@@ -254,7 +252,10 @@ impl Game {
             rng,
             s,
             ctx,
-            bel: [Belief::point(Config::default()), Belief::point(Config::default())],
+            continuation: Some(Continuation::Unsolved([
+                Belief::point(Config::default()),
+                Belief::point(Config::default()),
+            ])),
             data: Data::default(),
             gc: *gc,
             queries: Vec::new(),
@@ -289,6 +290,7 @@ impl Game {
     pub fn next_solve(&mut self, nets: &Arc<Net>) -> Option<Solver> {
         loop {
             if self.s.is_terminal() {
+                self.continuation = None;
                 return None;
             }
             let player = self.s.to_act();
@@ -296,47 +298,67 @@ impl Game {
                 let res = reserve(&self.s, player, &self.ctx);
                 let fu = faceup_counts(&self.s, player, &self.ctx);
                 let wp = matches!(self.s.pending(), Cont::WarriorPriestDraw { .. });
-                let me = player as usize;
-                self.bel[me] = belief_after_draw(&self.bel[me], &res, &fu, wp);
+                if let Continuation::Unsolved(belief) = self.continuation.as_mut().expect("a live game has continuation state") {
+                    belief[player as usize] = belief_after_draw(&belief[player as usize], &res, &fu, wp);
+                }
                 resolve_chance(&mut self.s, player, &mut self.rng);
+                let more = matches!(self.s.pending(), Cont::Draw { .. }) && self.s.to_act() == player;
+                if !more {
+                    if let Some(Continuation::Solved { path, .. }) = self.continuation.as_mut() {
+                        path.steps.push(PublicStep::Chance);
+                    }
+                }
                 continue;
             }
+            let ranges = self.ranges();
             self.data.decisions += 1;
-            self.data.configs += self.bel[player as usize].cfg.len();
+            self.data.configs += ranges[player as usize].cfg.len();
             match self.gc.agents[player as usize] {
                 Agent::Random => {
-                    let cfgs = self.bel[player as usize].cfg.clone();
-                    let np = policy::uniform(&self.s, &self.ctx, player, &cfgs);
-                    self.play(np);
+                    let np = policy::uniform(&self.s, &self.ctx, player, &ranges[player as usize].cfg);
+                    self.play_static(np);
                 }
                 Agent::Greedy { temp } => {
-                    let cfgs = self.bel[player as usize].cfg.clone();
-                    let np = policy::greedy(&self.s, &self.ctx, player, &cfgs, temp);
+                    let np = policy::greedy(&self.s, &self.ctx, player, &ranges[player as usize].cfg, temp);
                     if self.gc.collect == Collect::Static && matches!(self.s.pending(), Cont::MainPlay) {
-                        let y0 = vec![policy::eval_squashed(&self.s, 0); self.bel[0].cfg.len()];
-                        let y1 = vec![policy::eval_squashed(&self.s, 1); self.bel[1].cfg.len()];
-                        let truth = [self.true_index(0) as u32, self.true_index(1) as u32];
+                        let y0 = vec![policy::eval_squashed(&self.s, 0); ranges[0].cfg.len()];
+                        let y1 = vec![policy::eval_squashed(&self.s, 1); ranges[1].cfg.len()];
+                        let truth = [self.true_index(&ranges, 0) as u32, self.true_index(&ranges, 1) as u32];
                         self.data.begin_solve();
                         self.data.push_value(
                             &self.s,
                             &self.ctx,
-                            &self.bel,
+                            &ranges,
                             [&y0, &y1],
                             truth,
                             &np.to_replay(player, &self.ctx),
                         );
                     }
-                    self.play(np);
+                    self.play_static(np);
                 }
                 Agent::Sog { cfg } => {
-                    let mut sv = Solver::new(
-                        &self.s,
-                        self.ctx,
-                        Arc::clone(nets),
-                        cfg,
-                        self.bel.clone(),
-                        Rng::new(self.rng.next_u64()),
-                    );
+                    let actual = true_config(&self.s, player, &self.ctx);
+                    let mut sv = match self.continuation.as_ref().expect("a live game has continuation state") {
+                        Continuation::Unsolved(belief) => Solver::initial_play(
+                            &self.s,
+                            self.ctx,
+                            Arc::clone(nets),
+                            cfg,
+                            belief.clone(),
+                            Rng::new(self.rng.next_u64()),
+                            actual,
+                        ),
+                        Continuation::Solved { boundary, path } => Solver::resolve_play(
+                            boundary.as_ref().clone(),
+                            path.clone(),
+                            &self.s,
+                            Arc::clone(nets),
+                            cfg,
+                            Rng::new(self.rng.next_u64()),
+                            actual,
+                        ),
+                    }
+                    .expect("continual solve construction");
                     if collects_rows(&self.gc, &self.s) {
                         sv.collect(draw_count(&mut self.rng, self.gc.query_rate));
                     }
@@ -346,40 +368,64 @@ impl Game {
         }
     }
 
-    pub fn play_solved(&mut self, sv: &Solver, solved: Option<Solved>) {
-        if let Some(solved) = solved {
-            let truth = [self.true_index(0) as u32, self.true_index(1) as u32];
-            self.data.begin_solve();
-            self.data.push_value(
-                &self.s,
-                &self.ctx,
-                &self.bel,
-                [&solved.value[0], &solved.value[1]],
-                truth,
-                &solved.policy,
-            );
-            self.queries.extend(solved.queries);
+    pub fn play_solved(&mut self, solved: PlaySolved) {
+        let (action, policy, focus, next, queries) = match solved {
+            PlaySolved::Continue(s) => (s.action, s.policy, s.focus, Some(s.next), s.queries),
+            PlaySolved::Terminal(s) => (s.action, s.policy, s.focus, None, s.queries),
+        };
+        let truth = [
+            focus.range[0].index_of(&true_config(&self.s, 0, &self.ctx)).expect("focus dropped player 0") as u32,
+            focus.range[1].index_of(&true_config(&self.s, 1, &self.ctx)).expect("focus dropped player 1") as u32,
+        ];
+        self.data.begin_solve();
+        self.data.push_value(
+            &self.s,
+            &self.ctx,
+            &focus.range,
+            [&focus.cfv[0], &focus.cfv[1]],
+            truth,
+            &policy,
+        );
+        self.queries.extend(queries);
+        if let Some(slot) = self.data.plays.get_mut(action.play() as usize) {
+            *slot += 1;
         }
-        self.play(policy::root(sv));
+        self.s.apply_inplace(action);
+        self.continuation = next.map(|boundary| Continuation::Solved {
+            boundary: Box::new(boundary),
+            path: ResolvePath::default(),
+        });
     }
 
-    fn true_index(&self, p: usize) -> usize {
-        self.bel[p]
+    fn ranges(&self) -> [Belief; 2] {
+        match self.continuation.as_ref().expect("a live game has continuation state") {
+            Continuation::Unsolved(belief) => belief.clone(),
+            Continuation::Solved { boundary, .. } => boundary.range.clone(),
+        }
+    }
+
+    fn true_index(&self, belief: &[Belief; 2], p: usize) -> usize {
+        belief[p]
             .index_of(&true_config(&self.s, p as u8, &self.ctx))
             .expect("belief filter dropped the true config")
     }
 
-    fn play(&mut self, mut np: policy::NodePolicy) {
+    fn play_static(&mut self, mut np: policy::NodePolicy) {
         let me = self.s.to_act() as usize;
-        np.mix_uniform(self.gc.explore);
-        let true_ci = self.true_index(me);
+        np.mix_uniform(self.gc.static_explore);
+        let mut belief = match self.continuation.take().expect("a live static game has beliefs") {
+            Continuation::Unsolved(belief) => belief,
+            Continuation::Solved { .. } => unreachable!("static play does not own a solve boundary"),
+        };
+        let true_ci = self.true_index(&belief, me);
         let chosen_cell = np.sample(&mut self.rng, true_ci);
         let chosen = np.action_at(chosen_cell);
-        self.bel[me] = np.posterior(&self.bel[me], obs_key(&np.acts[chosen]));
+        belief[me] = np.posterior(&belief[me], obs_key(&np.acts[chosen]));
         if let Some(slot) = self.data.plays.get_mut(np.acts[chosen].play() as usize) {
             *slot += 1;
         }
         self.s.apply_inplace(np.acts[chosen]);
+        self.continuation = (!self.s.is_terminal()).then_some(Continuation::Unsolved(belief));
     }
 
     pub fn finish(&mut self) -> f32 {
@@ -472,18 +518,20 @@ impl GameStream {
         self.kind
     }
 
-    pub fn keep(&mut self, sv: &Solver, solved: Option<Solved>, out: &mut Data) {
-        match self.kind {
-            SolveKind::Play => {
-                self.game.play_solved(sv, solved);
+    pub fn keep(&mut self, sv: &Solver, solved: Result<SolveOutput, String>, out: &mut Data) {
+        let solved = solved.expect("a GPU solve returned an invalid continual summary");
+        match (self.kind, solved) {
+            (SolveKind::Play, SolveOutput::Play(play)) => {
+                self.game.play_solved(*play);
                 let queued = self.game.take_queries();
                 out.dropped += self.enqueue(queued);
                 out.merge(self.game.take_ready());
             }
-            SolveKind::Query => {
-                let more = keep_query(sv, solved, out);
+            (SolveKind::Query, SolveOutput::Target(target)) => {
+                let more = keep_query(sv, *target, out);
                 out.dropped += self.enqueue(more);
             }
+            _ => unreachable!("solve kind and typed result disagree"),
         }
     }
 
@@ -553,7 +601,8 @@ fn resolve_fixture_chance(game: &mut Game) {
         let res = reserve(&game.s, player, &game.ctx);
         let fu = faceup_counts(&game.s, player, &game.ctx);
         let wp = matches!(game.s.pending(), Cont::WarriorPriestDraw { .. });
-        game.bel[player as usize] = belief_after_draw(&game.bel[player as usize], &res, &fu, wp);
+        let Continuation::Unsolved(belief) = game.continuation.as_mut().unwrap() else { unreachable!() };
+        belief[player as usize] = belief_after_draw(&belief[player as usize], &res, &fu, wp);
         resolve_chance(&mut game.s, player, &mut game.rng);
     }
 }
@@ -563,7 +612,7 @@ pub(crate) fn collect_roots(count: usize, seed: u64) -> Vec<(State, [Belief; 2])
     let gc = GameCfg {
         agents: [Agent::Random; 2],
         collect: Collect::None,
-        explore: 0.0,
+        static_explore: 0.0,
         random_draft: false,
         p_td1: 0.0,
         query_rate: 0.0,
@@ -579,7 +628,8 @@ pub(crate) fn collect_roots(count: usize, seed: u64) -> Vec<(State, [Belief; 2])
         if game.s.is_terminal() || !matches!(game.s.pending(), Cont::MainPlay) {
             continue;
         }
-        out.push((game.s, game.bel));
+        let Continuation::Unsolved(belief) = game.continuation.take().unwrap() else { unreachable!() };
+        out.push((game.s, belief));
     }
     assert_eq!(out.len(), count, "not enough random-walk roots");
     out
@@ -610,14 +660,14 @@ mod target_tests {
         let gc = GameCfg {
             agents: [Agent::Sog { cfg: Cfg::default() }; 2],
             collect: Collect::Sog,
-            explore: 0.0,
+            static_explore: 0.0,
             random_draft: true,
             p_td1: 0.0,
             query_rate: 0.0,
             recursive_rate: 0.0,
         };
         let mut stream = GameStream::new(1, gc);
-        let q = (stream.game.s, stream.game.bel.clone());
+        let q = (stream.game.s, stream.game.ranges());
         let total = QUEUE_CAP + 3;
         let mut nominations = Vec::with_capacity(total);
         for _ in 0..total {
@@ -634,7 +684,7 @@ mod target_tests {
         let gc = GameCfg {
             agents: [Agent::Random; 2],
             collect: Collect::None,
-            explore: 1.0,
+            static_explore: 1.0,
             random_draft: true,
             p_td1: 0.0,
             query_rate: 0.0,
@@ -649,9 +699,9 @@ mod target_tests {
         let mut g = Game::new(Rng::new(0xE1), &gc);
         g.s = s;
         g.ctx = ctx;
-        g.bel = bel;
+        g.continuation = Some(Continuation::Unsolved(bel));
 
-        let prior = g.bel[me].clone();
+        let prior = g.ranges()[me].clone();
         let uni = policy::uniform(&g.s, &g.ctx, me as u8, &prior.cfg);
         let mut peaked = policy::NodePolicy::frame(&g.s, &g.ctx, me as u8, &prior.cfg);
         for ci in 0..prior.cfg.len() {
@@ -661,7 +711,7 @@ mod target_tests {
             }
         }
         let before = g.s;
-        g.play(peaked);
+        g.play_static(peaked);
         let obs = before
             .legal_actions()
             .into_iter()
@@ -672,8 +722,9 @@ mod target_tests {
             })
             .expect("the played action");
         let want = uni.posterior(&prior, obs);
-        assert_eq!(g.bel[me].cfg, want.cfg, "posterior support");
-        for (got, exp) in g.bel[me].p.iter().zip(&want.p) {
+        let got_belief = g.ranges();
+        assert_eq!(got_belief[me].cfg, want.cfg, "posterior support");
+        for (got, exp) in got_belief[me].p.iter().zip(&want.p) {
             assert!((got - exp).abs() < 1e-5, "posterior mass {got} vs uniform-Bayes {exp}");
         }
     }

@@ -493,6 +493,64 @@ __device__ __forceinline__ unsigned int rbase(const Tree& t, unsigned int i, int
     return t.roff[i] + (p == 1 ? t.nc[2 * i] : 0);
 }
 
+enum GadgetField { G_Q, G_TERM, G_REGRET_T, G_REGRET_F, G_STRATEGY_T, G_STRATEGY_F, G_AVERAGE_T, G_AVERAGE_F };
+
+__global__ void k_gadget_seed(const Tree* trees) {
+    const Tree& t = trees[blockIdx.x];
+    if (t.ngadget == 0) return;
+    unsigned int opponent = 1 - (unsigned int)t.resolver;
+    unsigned int dst = rbase(t, 0, opponent);
+    const float* q = t.gadget;
+    const float* follow = t.gadget + G_STRATEGY_F * t.ngadget;
+    for (unsigned int k = threadIdx.x; k < t.ngadget; k += blockDim.x)
+        t.reach[dst + k] = q[k] * follow[k];
+}
+
+__global__ void k_gadget_update(const Tree* trees, int iter, float alpha,
+                                float beta, float gamma) {
+    const Tree& t = trees[blockIdx.x];
+    if ((unsigned long long)iter >= t.todo) return;
+    float m = (float)(t.step + (unsigned long long)iter) + 1.0f;
+    float dg = powf((m - 1.0f) / m, gamma);
+    for (unsigned int i = 0; i < t.ncarry; ++i) {
+        unsigned int node = t.carry_node[i];
+        for (unsigned int p = 0; p < 2; ++p) {
+            unsigned int n = t.nc[2 * node + p];
+            unsigned int rr = rbase(t, node, p);
+            unsigned int vv = p * t.nvals + t.voff[node];
+            for (unsigned int k = threadIdx.x; k < n; k += blockDim.x) {
+                t.reach_sum[rr + k] = t.reach_sum[rr + k] * dg + t.reach[rr + k];
+                t.value_sum[vv + k] = t.value_sum[vv + k] * dg + t.vals[vv + k];
+            }
+        }
+    }
+    if (t.ngadget == 0) return;
+    unsigned int opponent = 1 - (unsigned int)t.resolver;
+    float* q = t.gadget + G_Q * t.ngadget;
+    float* term = t.gadget + G_TERM * t.ngadget;
+    float* rt = t.gadget + G_REGRET_T * t.ngadget;
+    float* rf = t.gadget + G_REGRET_F * t.ngadget;
+    float* st = t.gadget + G_STRATEGY_T * t.ngadget;
+    float* sf = t.gadget + G_STRATEGY_F * t.ngadget;
+    float* at = t.gadget + G_AVERAGE_T * t.ngadget;
+    float* af = t.gadget + G_AVERAGE_F * t.ngadget;
+    const float* follow = t.vals + opponent * t.nvals + t.voff[0];
+    float da = cfr_factor(m, alpha), db = cfr_factor(m, beta);
+    for (unsigned int k = threadIdx.x; k < t.ngadget; k += blockDim.x) {
+        float g = st[k] * term[k] + sf[k] * follow[k];
+        float old_t = rt[k], old_f = rf[k];
+        rt[k] = old_t * (old_t > 0.0f ? da : db) + q[k] * (term[k] - g);
+        rf[k] = old_f * (old_f > 0.0f ? da : db) + q[k] * (follow[k] - g);
+        at[k] = at[k] * dg + q[k] * st[k];
+        af[k] = af[k] * dg + q[k] * sf[k];
+        float pt = fmaxf(rt[k], 0.0f), pf = fmaxf(rf[k], 0.0f);
+        float total = pt + pf;
+        st[k] = total > SMOOTH ? pt / total : 0.5f;
+        sf[k] = total > SMOOTH ? pf / total : 0.5f;
+        t.reach[rbase(t, 0, opponent) + k] = q[k] * sf[k];
+    }
+}
+
 __global__ void k_reach_sweep(const Tree* trees, const unsigned int* work, int at,
                               int level, int avg, int iter) {
     unsigned int item = work[at + blockIdx.x];
@@ -1149,6 +1207,66 @@ __global__ void k_terminals(const Tree* trees) {
     unsigned int m = t.nc[2 * node + traverser], vo = t.voff[node];
     float* vals = t.vals + traverser * t.nvals;
     for (unsigned int c = threadIdx.x; c < m; c += 32) vals[vo + c] = u * acc;
+}
+
+__global__ void k_choose_gather(const Tree* trees, const unsigned int* focus,
+                                const unsigned int* actual, const unsigned int* cap,
+                                const unsigned int* out_at, float* out) {
+    unsigned int part = blockIdx.x;
+    const Tree& t = trees[part];
+    unsigned int node = focus[part];
+    unsigned int n0 = t.nc[2 * node], n1 = t.nc[2 * node + 1];
+    unsigned int c0 = cap[2 * part], c1 = cap[2 * part + 1];
+    unsigned int cells = t.kind[node] == 0 ? t.legal_off[t.legal_base[node] + t.nc[2 * node + t.player[node]]] : 0;
+    float* dst = out + out_at[part];
+    __shared__ unsigned int chosen;
+    if (threadIdx.x == 0) {
+        chosen = NO_ROW;
+        if (actual[part] != NO_ROW) {
+            unsigned int lb = t.legal_base[node];
+            unsigned int a = t.legal_off[lb + actual[part]];
+            unsigned int b = t.legal_off[lb + actual[part] + 1];
+            float total = 0.0f;
+            for (unsigned int k = a; k < b; ++k) total += t.avg[t.soff[node] + k];
+            chosen = a + pick_from(t.avg + t.soff[node] + a, (int)(b - a), total, t.seed);
+        }
+        dst[0] = __uint_as_float(chosen);
+    }
+    __syncthreads();
+    unsigned int at = 1;
+    for (unsigned int p = 0; p < 2; ++p) {
+        unsigned int n = p == 0 ? n0 : n1;
+        unsigned int src = rbase(t, node, p);
+        for (unsigned int k = threadIdx.x; k < n; k += blockDim.x)
+            dst[at + k] = t.reach_sum[src + k];
+        at += n;
+    }
+    for (unsigned int p = 0; p < 2; ++p) {
+        unsigned int n = p == 0 ? n0 : n1;
+        unsigned int src = p * t.nvals + t.voff[node];
+        for (unsigned int k = threadIdx.x; k < n; k += blockDim.x)
+            dst[at + k] = t.value_sum[src + k];
+        at += n;
+    }
+    unsigned int child = chosen == NO_ROW ? NO_ROW : t.legal_child[t.soff[node] + chosen];
+    for (unsigned int p = 0; p < 2; ++p) {
+        unsigned int room = p == 0 ? c0 : c1;
+        unsigned int n = child == NO_ROW ? 0 : t.nc[2 * child + p];
+        unsigned int src = child == NO_ROW ? 0 : rbase(t, child, p);
+        for (unsigned int k = threadIdx.x; k < room; k += blockDim.x)
+            dst[at + k] = k < n ? t.reach_sum[src + k] : 0.0f;
+        at += room;
+    }
+    for (unsigned int p = 0; p < 2; ++p) {
+        unsigned int room = p == 0 ? c0 : c1;
+        unsigned int n = child == NO_ROW ? 0 : t.nc[2 * child + p];
+        unsigned int src = child == NO_ROW ? 0 : p * t.nvals + t.voff[child];
+        for (unsigned int k = threadIdx.x; k < room; k += blockDim.x)
+            dst[at + k] = k < n ? t.value_sum[src + k] : 0.0f;
+        at += room;
+    }
+    for (unsigned int k = threadIdx.x; k < cells; k += blockDim.x)
+        dst[at + k] = t.avg[t.soff[node] + k];
 }
 
 __global__ void k_finish(const Tree* trees, const unsigned int* work, int at,

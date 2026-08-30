@@ -467,7 +467,7 @@ fn a_contract_describes_every_node_of_the_tree() {
         }
         let ctx = Ctx::new(&s);
         let bel = [uniform_belief(&s, &ctx, 0), uniform_belief(&s, &ctx, 1)];
-        let sv = Solver::new(&s, ctx, Arc::clone(&nets), cfg, bel, Rng::new(seed));
+        let sv = Solver::target(&s, ctx, Arc::clone(&nets), cfg, bel, Rng::new(seed)).unwrap();
         let c = warchest::contract::Contract::of(&sv);
         assert_eq!(c.nodes(), sv.nodes.len(), "seed {seed}: node count");
         for i in 0..c.nodes() {

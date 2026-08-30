@@ -38,6 +38,10 @@ def pack(run):
     out_dir = run / "bots"
     log = json.loads((run / "log.json").read_text())
     cfg = log.get("cfg", {})
+    required = ["s", "c", "round_batch", "rounds", "cfr", "puct", "prior_temp"]
+    missing = [key for key in required if key not in cfg]
+    if missing:
+        raise SystemExit(f"{run} is missing packed search fields: {', '.join(missing)}")
     snapshots = log.get("snapshots", [])
     snaps = selected(snapshots)
     if not snaps:
@@ -51,12 +55,12 @@ def pack(run):
                                 weights_only=False)
         net = Net()
         net.load_state_dict(checkpoint["value"])
-        search = {"s": cfg.get("s", 512),
-                  "c": cfg.get("c", 8.0),
-                  "batch": cfg.get("round_batch", 8),
-                  "rounds": cfg.get("rounds", 0),
-                  "puct": 1.5,
-                  "prior_temp": 1.0,
+        search = {"s": cfg["s"],
+                  "c": cfg["c"],
+                  "batch": cfg["round_batch"],
+                  "rounds": cfg["rounds"],
+                  "puct": cfg["puct"],
+                  "prior_temp": cfg["prior_temp"],
                   "cfr": "dcfr"}
         final = snap is snapshots[-1]
         stem = Path(snap["file"]).stem.removeprefix("snap_")
@@ -66,7 +70,7 @@ def pack(run):
         write_bin(net, directory / "weights.bin")
         shutil.copy2(BOT, directory / "bot")
         (directory / "bot.json").write_text(json.dumps({
-            "format": 1,
+            "format": 2,
             "name": f"{run.name}.{bot}",
             "sha": checkpoint.get("git", cfg.get("git", "")),
             "binary": digest(directory / "bot"),
