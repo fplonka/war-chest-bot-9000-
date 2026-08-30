@@ -398,7 +398,7 @@ impl Solve {
         Ok(())
     }
 
-    pub fn rewind_leaf(&mut self) {
+    pub fn rewind(&mut self, s: &Arc<CudaStream>) -> Res<()> {
         self.cells = 0;
         self.rows = 0;
         self.host_coff.clear();
@@ -407,9 +407,6 @@ impl Solve {
         self.ent[Ent::Board as usize].rewind();
         self.ent[Ent::Config as usize].rewind();
         self.ent[Ent::Cidx as usize].rewind();
-    }
-
-    pub fn rewind_cfr(&mut self, s: &Arc<CudaStream>) -> Res<()> {
         self.nterm = 0;
         self.nvals = 0;
         self.ncells = 0;

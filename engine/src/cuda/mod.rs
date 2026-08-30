@@ -514,7 +514,7 @@ impl Device {
             let fit = (usable - usable / 10) / per.max(1);
             let gpus_left = ordinals.len() - g;
             const SLOTS_KNEE: usize = 64;
-            let mut n = (fit as usize).min(left / gpus_left.max(1)).min(SLOTS_KNEE);
+            let mut n = (fit as usize).min(left.div_ceil(gpus_left)).min(SLOTS_KNEE);
             while n > 0 {
                 let need = n as u64 * slot + PIPELINE as u64 * Card::carve_bytes(n, &cfg);
                 if need + need / 10 <= free {
@@ -935,6 +935,16 @@ impl Card {
                 .filter(|&i| calls[i].kind() == kind)
                 .collect()
         };
+        let trees = pick(2);
+        {
+            let mut solves = self.solves.lock();
+            for &i in &trees {
+                let Call::Tree { solve, fresh, .. } = &calls[i] else { unreachable!() };
+                if *fresh {
+                    self.slot(&mut solves, *solve).rewind(&self.stream)?;
+                }
+            }
+        }
         let mut out = Vec::with_capacity(mine.len());
         fn at(stage: &'static str) -> impl Fn(String) -> String {
             move |e| format!("{stage}: {e}")
@@ -943,11 +953,22 @@ impl Card {
         pack.clear();
         self.trunk(calls, &pick(0), &mut pack).map_err(at("trunk"))?;
         self.configs(calls, &pick(1)).map_err(at("configs"))?;
-        self.tree(calls, &pick(2), &mut pack).map_err(at("tree"))?;
+        self.tree(calls, &trees, &mut pack).map_err(at("tree"))?;
         self.scatter(&mut pack).map_err(at("scatter"))?;
         drop(pack);
-        self.priors(calls, &pick(2)).map_err(at("priors"))?;
-        self.iterate(calls, &pick(3), &mut out).map_err(at("iterate"))?;
+        self.priors(calls, &trees).map_err(at("priors"))?;
+        let rule = |i| match &calls[i] {
+            Call::Iterate { cfr, puct, .. } => [
+                cfr.alpha.to_bits(), cfr.beta.to_bits(), cfr.gamma.to_bits(),
+                cfr.predict.to_bits(), puct.to_bits(),
+            ],
+            _ => unreachable!(),
+        };
+        let mut iterates = pick(3);
+        iterates.sort_unstable_by_key(|&i| rule(i));
+        for same in iterates.chunk_by(|a, b| rule(*a) == rule(*b)) {
+            self.iterate(calls, same, &mut out).map_err(at("iterate"))?;
+        }
         self.read(calls, &pick(4), &mut out).map_err(at("read"))?;
         {
             let solves = self.solves.lock();
@@ -1047,17 +1068,6 @@ impl Card {
         };
         let sizes: Vec<usize> = mine.iter().map(|&i| each(i).2).collect();
         let rows: usize = sizes.iter().sum();
-        {
-            let mut g = self.solves.lock();
-            for &i in mine {
-                let Call::Trunk { solve, at: row0, .. } = &calls[i] else {
-                    unreachable!("trunk shard holds only trunk calls")
-                };
-                if *row0 == 0 {
-                    self.slot(&mut g, *solve).rewind_leaf();
-                }
-            }
-        }
         let s = &self.stream;
         {
             let mut stage = self.host.lock();
@@ -1536,15 +1546,12 @@ impl Card {
         }
         let mut g = self.solves.lock();
         for &i in mine {
-            let Call::Tree { solve, writes, fresh, ncells, nreach, nvals, levels, nterm, seed, .. }
+            let Call::Tree { solve, writes, ncells, nreach, nvals, levels, nterm, seed, .. }
                 = &calls[i] else {
                 unreachable!("tree shard holds only tree calls")
             };
             let b = self.slot(&mut g, *solve);
             let s = &self.stream;
-            if *fresh {
-                b.rewind_cfr(s)?;
-            }
             let base = pack.words(&writes.blob);
             for r in &writes.runs {
                 let dst = b.plan(s, r.dst, r.at as usize, r.len as usize)?;
