@@ -78,11 +78,24 @@ impl Session {
         }
     }
 
+    fn prior(&self, p: usize) -> Result<Belief, String> {
+        Ok(match self.continuation.as_ref().ok_or("the session has ended")? {
+            Continuation::Unsolved(belief) => belief[p].clone(),
+            _ => Belief::from_pairs(self.support[p].iter().map(|&c| (c, 1.0)).collect()),
+        })
+    }
+
+    fn absorb(&mut self, p: usize, posterior: Belief) {
+        self.support[p] = posterior.cfg.clone();
+        if let Some(Continuation::Unsolved(belief)) = self.continuation.as_mut() {
+            belief[p] = posterior;
+        }
+    }
+
     fn drew(&mut self, player: u8, code: Option<u32>) -> Result<(), String> {
         if !self.s.is_chance() || self.s.to_act() != player {
             return Err(format!("player {player} is not drawing"));
         }
-        self.continuation.as_ref().ok_or("the session has ended")?;
         let legal = self.s.legal_actions();
         let drawn = match code {
             Some(code) => Action::decode(code).ok_or_else(|| format!("draw {code} does not decode"))?,
@@ -95,17 +108,8 @@ impl Session {
         let res = reserve(&self.s, player, &self.ctx);
         let faceup = faceup_counts(&self.s, player, &self.ctx);
         let in_flight = matches!(self.s.pending(), Cont::WarriorPriestDraw { .. });
-        match self.continuation.as_mut().unwrap() {
-            Continuation::Unsolved(belief) => {
-                belief[p] = belief_after_draw(&belief[p], &res, &faceup, in_flight);
-                self.support[p] = belief[p].cfg.clone();
-            }
-            Continuation::Solved { .. } => {
-                let n = self.support[p].len();
-                let prior = Belief { cfg: self.support[p].clone(), p: vec![1.0 / n as f32; n] };
-                self.support[p] = belief_after_draw(&prior, &res, &faceup, in_flight).cfg;
-            }
-        }
+        let posterior = belief_after_draw(&self.prior(p)?, &res, &faceup, in_flight);
+        self.absorb(p, posterior);
         let mut state = self.s;
         state.apply_inplace(drawn);
         let more = matches!(state.pending(), Cont::Draw { .. }) && state.to_act() == player;
@@ -125,20 +129,18 @@ impl Session {
         if player == self.seat {
             return Err("a bot is told its own move back".into());
         }
-        let Continuation::Solved { .. } = self.continuation.as_ref().ok_or("the session has ended")? else {
-            return Err("an opponent action arrived before the initial refresh".into());
-        };
+        let p = player as usize;
         let own = true_config(&self.s, self.seat, &self.ctx);
-        let (public, support) = apply_public_observation(
-            &PublicState::from_state(self.s), &self.support[player as usize], key)?;
+        let (public, posterior) =
+            apply_public_observation(&PublicState::from_state(self.s), &self.prior(p)?, key)?;
         let mut state = public.state();
         set_config(&mut state, self.seat, &self.ctx, &own);
+        self.absorb(p, posterior);
         if state.is_terminal() {
             self.continuation = None;
         } else if let Some(Continuation::Solved { path, .. }) = self.continuation.as_mut() {
             path.steps.push(PublicStep::Act(key));
         }
-        self.support[player as usize] = support;
         self.s = state;
         Ok(())
     }
@@ -245,6 +247,16 @@ mod tests {
         }
     }
 
+    fn facing_the_opponent() -> Session {
+        let mut session = Session::new(&draft(), 1, 9).unwrap();
+        while session.s.is_chance() {
+            let player = session.s.to_act();
+            session.drew(player, None).unwrap();
+        }
+        session.seat = 1 - session.s.to_act();
+        session
+    }
+
     #[test]
     fn observation_has_no_policy_input() {
         let session = Session::new(&draft(), 0, 7).unwrap();
@@ -254,29 +266,30 @@ mod tests {
 
     #[test]
     fn lifecycle_error_does_not_advance_the_session() {
-        let mut session = Session::new(&draft(), 1, 9).unwrap();
-        while session.s.is_chance() {
-            let player = session.s.to_act();
-            session.drew(player, None).unwrap();
-        }
-        session.seat = 1 - session.s.to_act();
+        let mut session = facing_the_opponent();
         let state = session.s;
         let support = session.support.clone();
         let player = session.s.to_act();
-        let key = obs_key(&session.s.legal_actions()[0]);
-        assert!(session.acted(player, key).is_err());
+        assert!(session.acted(player, u32::MAX).is_err());
         assert_eq!(session.s, state);
         assert_eq!(session.support, support);
     }
 
     #[test]
+    fn an_opponent_action_before_the_first_solve_advances_the_belief() {
+        let mut session = facing_the_opponent();
+        let player = session.s.to_act();
+        let key = obs_key(&session.s.legal_actions()[0]);
+        session.acted(player, key).unwrap();
+        let Some(Continuation::Unsolved(belief)) = &session.continuation else {
+            panic!("the session must still be unsolved");
+        };
+        assert_eq!(belief[player as usize].cfg, session.support[player as usize]);
+    }
+
+    #[test]
     fn opponent_action_is_only_a_public_path_step() {
-        let mut session = Session::new(&draft(), 1, 9).unwrap();
-        while session.s.is_chance() {
-            let player = session.s.to_act();
-            session.drew(player, None).unwrap();
-        }
-        session.seat = 1 - session.s.to_act();
+        let mut session = facing_the_opponent();
         let ranges = [
             uniform_belief(&session.s, &session.ctx, 0),
             uniform_belief(&session.s, &session.ctx, 1),

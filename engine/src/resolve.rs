@@ -209,24 +209,25 @@ pub fn gadget_iteration(
     }
 }
 
-pub fn apply_public_observation(public: &PublicState, support: &[Config], key: u32) -> Result<(PublicState, Vec<Config>), String> {
+pub fn apply_public_observation(public: &PublicState, prior: &Belief, key: u32) -> Result<(PublicState, Belief), String> {
     let state = public.state();
     if state.is_terminal() || state.is_chance() {
         return Err("an action observation requires a live decision".into());
     }
     let ctx = Ctx::new(&state);
     let actor = state.to_act();
+    let support = &prior.cfg;
     if support.is_empty() || support.windows(2).any(|w| w[0] >= w[1]) {
         return Err("action observation support is empty, duplicated, or unsorted".into());
     }
     let (acts, slots, facedown) = crate::search::node_actions(&state, actor, &ctx, support);
     let mut found: Option<PublicState> = None;
-    let mut next_support = Vec::new();
+    let mut reached: Vec<(Config, f32)> = Vec::new();
     for ((a, slot), facedown) in acts.into_iter().zip(slots).zip(facedown) {
         if obs_key(&a) != key {
             continue;
         }
-        for c in support {
+        for (c, mass) in support.iter().zip(&prior.p) {
             let Some(config) = crate::pbs::advance_config(c, slot, facedown) else { continue };
             let mut next = state;
             set_config(&mut next, actor, &ctx, c);
@@ -236,12 +237,11 @@ pub fn apply_public_observation(public: &PublicState, support: &[Config], key: u
                 return Err(format!("observation {key} has ambiguous public effects"));
             }
             found = Some(candidate);
-            next_support.push(config);
+            reached.push((config, *mass));
         }
     }
-    next_support.sort_unstable();
-    next_support.dedup();
-    found.map(|public| (public, next_support))
+    let posterior = Belief::from_pairs(reached);
+    found.map(|public| (public, posterior))
         .ok_or_else(|| format!("observation {key} is structurally unreachable"))
 }
 
