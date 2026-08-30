@@ -391,6 +391,66 @@ fn a_ragged_round_does_not_move_the_small_solve() {
 
 
 #[test]
+fn strategy_average_uses_the_evaluated_iterates() {
+    let net = Arc::new(Net::random(0x9E37));
+    let device = gpu(28);
+    let cfg = Cfg { s: 1, c: 0.0, ..Default::default() };
+    for updates in [1usize, 3] {
+        let mut data = Data::default();
+        let mut sv = GameStream::new(0x51E5, game_cfg_of(cfg)).next_solve(&net, &mut data);
+        sv.pin(0);
+        let Step::Calls(calls) = sv.advance(&[]) else {
+            panic!("fresh solve finished")
+        };
+        let (mut setup, mut iteration) = (Vec::new(), None);
+        for call in calls {
+            if matches!(call, Call::Iterate { .. }) {
+                iteration = Some(call);
+            } else {
+                setup.push(call);
+            }
+        }
+        device.run(&setup, 0).expect("setup");
+        let iteration = iteration.expect("iteration");
+        let row = sv.nodes[0].legal_row(0);
+        let so = sv.nodes[0].soff as usize;
+        let mut evaluated = Vec::new();
+        for step in 0..updates {
+            let before = device.resident(0, 0).expect("resident before update");
+            evaluated.push(before.cur[so + row.start..so + row.end].to_vec());
+            let mut call = iteration.clone();
+            let Call::Iterate { step: at, iters, expand, query, .. } = &mut call else {
+                unreachable!()
+            };
+            (*at, *iters, *expand) = (step, 1, 0);
+            query.clear();
+            device.run(&[call], 0).expect("update");
+        }
+        let next = device.resident(0, 0).expect("resident after updates");
+        assert!(
+            worst(&evaluated[0], &next.cur[so + row.start..so + row.end], "next") > 1e-3
+        );
+        let read = Call::Read {
+            solve: 0,
+            touched: [true; 2],
+            vals_at: [(0, 0); 2],
+            policy_at: ((so + row.start) as u32, row.len() as u32),
+        };
+        let got = device.run(&[read], 0).expect("read").pop().expect("reply").b;
+        let scale = (updates * (updates + 1) / 2) as f32;
+        for action in 0..row.len() {
+            let want = evaluated
+                .iter()
+                .enumerate()
+                .map(|(t, strategy)| (t + 1) as f32 * strategy[action])
+                .sum::<f32>() / scale;
+            assert!((got[action] - want).abs() < 2e-6,
+                    "{updates} updates action {action}: {} != {want}", got[action]);
+        }
+    }
+}
+
+#[test]
 fn k_iterates_together_match_k_iterates_alone() {
     const K: usize = 4;
     let net = Net::random(0x9E37);

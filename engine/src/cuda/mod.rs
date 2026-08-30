@@ -59,7 +59,6 @@ kernels! {
     window,
     scatter,
     seed_reach,
-    avg_block,
     terminals,
     expand,
     finish,
@@ -1668,7 +1667,7 @@ impl Card {
 
     fn value_pass(&self, b: &Batch) -> Res<()> {
         let all = b.all();
-        self.reaches(b, all, 1, false, 0)?;
+        self.reaches(b, all, 1, 0)?;
         self.network(b, all)?;
         self.terminals(b.trees.buf(), all)?;
         self.backprop(b, all, 1, 0, Cfr::LINEAR)
@@ -1722,7 +1721,7 @@ impl Card {
         let b = self.batch.lock();
         self.scratch.lock().queries.room(query_total)?;
 
-        self.reaches(&b, b.all(), 0, false, 0).map_err(at("reach"))?;
+        self.reaches(&b, b.all(), 0, 0).map_err(at("reach"))?;
         for iter in 0..rounds {
             let live = order
                 .iter()
@@ -1757,7 +1756,7 @@ impl Card {
             self.network(&b, p).map_err(at("net"))?;
             self.terminals(b.trees.buf(), p).map_err(at("terminals"))?;
             self.backprop(&b, p, 0, it, k).map_err(at("backprop"))?;
-            self.reaches(&b, p, 0, true, it).map_err(at("avg"))?;
+            self.reaches(&b, p, 0, it).map_err(at("reach"))?;
             if sims > 0 {
                 {
                     self.expand(b.trees.buf(), b.parts, sims, puct, iter, rounds)
@@ -1855,8 +1854,7 @@ impl Card {
         }
     }
 
-    fn reaches(&self, b: &Batch, p: &Prefix, avg: i32, also_avg: bool, iter: i32)
-        -> Res<()> {
+    fn reaches(&self, b: &Batch, p: &Prefix, avg: i32, iter: i32) -> Res<()> {
         let (trees, work) = (b.trees.buf(), b.work.buf());
         unsafe {
             self.stream
@@ -1869,7 +1867,6 @@ impl Card {
                 })
         }
         .map_err(err)?;
-        let sum = also_avg as i32;
         for level in 1..p.items.len() {
             if p.items[level] == 0 {
                 continue;
@@ -1878,18 +1875,8 @@ impl Card {
             unsafe {
                 self.stream
                     .launch_builder(&self.k.reach_sweep)
-                    .arg(trees).arg(work).arg(&at).arg(&level_i).arg(&avg).arg(&sum).arg(&iter)
+                    .arg(trees).arg(work).arg(&at).arg(&level_i).arg(&avg).arg(&iter)
                     .launch_unit(Self::grid(p.items[level], 2))
-            }
-            .map_err(err)?;
-        }
-        if also_avg && p.items.first().is_some_and(|&n| n > 0) {
-            let (at, level_i) = (b.level_at[0] as i32, 0i32);
-            unsafe {
-                self.stream
-                    .launch_builder(&self.k.avg_block)
-                    .arg(trees).arg(work).arg(&at).arg(&level_i).arg(&iter)
-                    .launch_unit(Self::grid(p.items[0], 1))
             }
             .map_err(err)?;
         }

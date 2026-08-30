@@ -503,7 +503,7 @@ __global__ void k_seed_reach(const Tree* trees, int iter) {
 }
 
 __global__ void k_reach_sweep(const Tree* trees, const unsigned int* work, int at,
-                              int level, int avg, int also_sum, int iter) {
+                              int level, int avg, int iter) {
     unsigned int item = work[at + blockIdx.x];
     const Tree& t = trees[item >> WORK_BITS];
     if ((unsigned long long)iter >= t.todo) return;
@@ -538,13 +538,6 @@ __global__ void k_reach_sweep(const Tree* trees, const unsigned int* work, int a
             t.reach[dst + c] = v;
         }
     }
-    if (!also_sum || t.kind[node] != 0 || p != t.player[node]) return;
-    __syncthreads();
-    unsigned int an = t.nc[2 * node + p], so = t.soff[node], lb = t.legal_base[node];
-    unsigned int ra = rbase(t, node, p);
-    unsigned int lo = t.legal_off[lb], hi = t.legal_off[lb + an];
-    for (unsigned int cell = lo + threadIdx.x; cell < hi; cell += blockDim.x)
-        t.sum[so + cell] += t.reach[ra + t.cell_row[so + cell]] * t.cur[so + cell];
 }
 
 __global__ void k_backprop_sweep(const Tree* trees, const unsigned int* work, int at,
@@ -555,7 +548,7 @@ __global__ void k_backprop_sweep(const Tree* trees, const unsigned int* work, in
     if ((unsigned long long)iter >= t.todo) return;
     float m = (float)(t.step + (unsigned long long)iter) + 1.0f;
     float da = cfr_factor(m, alpha), db = cfr_factor(m, beta);
-    float dg = powf(m / (m + 1.0f), gamma);
+    float dg = powf((m - 1.0f) / m, gamma);
     int traverser = blockIdx.y;
     float* vals = t.vals + traverser * t.nvals;
     unsigned int node = work_node(t, level, item);
@@ -607,7 +600,7 @@ __global__ void k_backprop_sweep(const Tree* trees, const unsigned int* work, in
         }
         return;
     }
-    unsigned int ncells = t.legal_off[lb + n];
+    unsigned int ra = rbase(t, node, traverser);
     for (unsigned int c = warp; c < n; c += warps) {
         unsigned int a = t.legal_off[lb + c], b = t.legal_off[lb + c + 1];
         float base = 0.0f;
@@ -625,6 +618,8 @@ __global__ void k_backprop_sweep(const Tree* trees, const unsigned int* work, in
             float old = t.regret[so + cell];
             float r = old * (old > 0.0f ? da : db) + delta;
             t.regret[so + cell] = r;
+            t.sum[so + cell] =
+                t.sum[so + cell] * dg + t.reach[ra + c] * t.cur[so + cell];
             float v = fmaxf(r + predict * delta, 0.0f);
             t.cur[so + cell] = v;
             total += v;
@@ -638,23 +633,6 @@ __global__ void k_backprop_sweep(const Tree* trees, const unsigned int* work, in
             for (unsigned int cell = a + lane; cell < b; cell += 32) t.cur[so + cell] = v;
         }
     }
-    __syncthreads();
-    for (unsigned int k = threadIdx.x; k < ncells; k += blockDim.x) t.sum[so + k] *= dg;
-}
-
-__global__ void k_avg_block(const Tree* trees, const unsigned int* work, int at,
-                            int level, int iter) {
-    unsigned int item = work[at + blockIdx.x];
-    const Tree& t = trees[item >> WORK_BITS];
-    if ((unsigned long long)iter >= t.todo) return;
-    unsigned int node = work_node(t, level, item);
-    if (t.kind[node] != 0) return;
-    unsigned int actor = t.player[node];
-    unsigned int an = t.nc[2 * node + actor], so = t.soff[node], lb = t.legal_base[node];
-    unsigned int ra = rbase(t, node, actor);
-    unsigned int lo = t.legal_off[lb], hi = t.legal_off[lb + an];
-    for (unsigned int cell = lo + threadIdx.x; cell < hi; cell += blockDim.x)
-        t.sum[so + cell] += t.reach[ra + t.cell_row[so + cell]] * t.cur[so + cell];
 }
 
 #define J_SPAN (J_W / 8)
