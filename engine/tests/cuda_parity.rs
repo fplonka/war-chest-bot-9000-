@@ -444,13 +444,14 @@ fn a_ragged_round_does_not_move_the_small_solve() {
 
 
 #[test]
-fn played_session_carries_across_multiple_steps() {
+fn played_session_carries_across_a_round_boundary() {
     let net = Arc::new(Net::random(0x9E37));
     let cfg = Cfg { s: 2, c: 0.0, batch: 2, ..Default::default() };
     let device = Backend(gpu(24));
     let mut stream = GameStream::new(0x5E5510, game_cfg_of(cfg));
     let mut data = Data::default();
-    for decision in 0..4 {
+    let mut first_round = None;
+    for decision in 0..32 {
         let mut solver = stream.next_solve(&net, &mut data);
         solver.pin(0);
         let mut replies = Vec::new();
@@ -465,8 +466,20 @@ fn played_session_carries_across_multiple_steps() {
             }
         };
         assert_eq!(saw_gadget, decision > 0);
+        let round = match solved.as_ref().expect("valid solve") {
+            SolveOutput::Play(play) => match play.as_ref() {
+                PlaySolved::Continue(s) => s.focus.public.state().round,
+                PlaySolved::Terminal(s) => s.focus.public.state().round,
+            },
+            _ => unreachable!(),
+        };
+        let initial = *first_round.get_or_insert(round);
         stream.keep(&solver, solved, &mut data);
+        if round > initial {
+            return;
+        }
     }
+    panic!("the session did not cross a round boundary");
 }
 
 #[test]

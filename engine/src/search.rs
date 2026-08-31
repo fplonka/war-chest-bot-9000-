@@ -48,7 +48,8 @@ impl Budget {
     pub fn for_s(s: u32) -> Budget {
         let k = |at512: usize| (at512 * s as usize / 512).max(1);
         let mut b = Budget(BUDGET_512.0.map(k));
-        b.0[Ent::Config as usize] = b.0[Ent::Config as usize].max(2 * crate::pbs::MAX_CONFIG_SUPPORT);
+        b.0[Ent::Config as usize] = b.0[Ent::Config as usize]
+            .max((crate::pbs::HAND_CAP + 2) * crate::pbs::MAX_CONFIG_SUPPORT);
         b
     }
 
@@ -508,6 +509,7 @@ pub struct Solver {
     wants_prior: Vec<u32>,
     pub(crate) steps: [usize; 2],
     focus: usize,
+    horizon: u16,
     finish: Finish,
     gadget: Option<Gadget>,
     gadget_sent: bool,
@@ -946,7 +948,7 @@ impl Solver {
                 self.rewind(id, mark);
                 return;
             }
-            if !wp && cs.round > self.nodes[0].state.round + self.cfg.rounds as u16 {
+            if !wp && cs.round > self.horizon {
                 for n in &mut self.nodes[mark.nodes..] {
                     n.expandable = false;
                 }

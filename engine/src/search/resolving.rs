@@ -54,12 +54,9 @@ impl Solver {
         successors: bool,
     ) -> Result<Solver, String> {
         if let Continuation::Solved { boundary, path } = continuation {
-            let retained = Self::resolved(
+            return Self::resolved(
                 boundary.as_ref().clone(), path.clone(), live,
-                Arc::clone(&net), cfg, Rng::new(rng.next_u64()), finish, successors)?;
-            if let Some(sv) = retained {
-                return Ok(sv);
-            }
+                net, cfg, Rng::new(rng.next_u64()), finish, successors);
         }
         let mut sv = Self::build(live, ctx, net, cfg, belief, Rng::new(rng.next_u64()), finish)?;
         sv.prepare_focus(successors)?;
@@ -105,6 +102,7 @@ impl Solver {
         sv.rng = rng;
         sv.cfg = cfg;
         sv.root_belief = belief;
+        sv.horizon = root.round + cfg.rounds as u16;
         sv.finish = finish;
         sv.nodes = NODES.with(Pool::take);
         sv.cphi = CONFIGS.with(Pool::take);
@@ -130,7 +128,7 @@ impl Solver {
         rng: Rng,
         finish: Finish,
         successors: bool,
-    ) -> Result<Option<Solver>, String> {
+    ) -> Result<Solver, String> {
         let ctx = Ctx::new(&boundary.public.state());
         let resolver = live.to_act();
         let opponent = 1 - resolver;
@@ -140,9 +138,7 @@ impl Solver {
         let belief = boundary.range.clone();
         let mut sv = Self::build(&root, ctx, net, cfg, belief, rng, finish)?;
         sv.gadget = Some(Gadget { resolver, previous, terminate });
-        if !sv.follow_path(&path)? {
-            return Ok(None);
-        }
+        sv.follow_path(&path)?;
         if !boundary.public.same_public(&sv.nodes[0].state) {
             return Err("the retained boundary does not match its canonical root".into());
         }
@@ -152,21 +148,20 @@ impl Solver {
         if sv.nodes[sv.focus].player != resolver {
             return Err("the forced public prefix reaches the wrong actor".into());
         }
-        if sv.nodes[sv.focus].leaf && !sv.nodes[sv.focus].expandable {
-            return Ok(None);
-        }
         sv.prepare_focus(successors)?;
-        Ok(Some(sv))
+        Ok(sv)
     }
 
-    fn follow_path(&mut self, path: &ResolvePath) -> Result<bool, String> {
+    fn follow_path(&mut self, path: &ResolvePath) -> Result<(), String> {
         let mut node = 0usize;
         for step in &path.steps {
             if self.nodes[node].leaf {
                 if !self.nodes[node].expandable {
-                    return Ok(false);
+                    return Err("the mandatory public prefix exceeds solve capacity".into());
                 }
                 self.expand(node);
+                if self.nodes[node].leaf {
+                    return Err("the mandatory public prefix exceeds solve capacity".into());                }
             }
             let next = match *step {
                 PublicStep::Chance => {
@@ -193,9 +188,13 @@ impl Solver {
                 }
             };
             node = next;
+            self.horizon = self.nodes[node].state.round + self.cfg.rounds as u16;
+            if !self.nodes[node].state.is_terminal() {
+                self.nodes[node].expandable = true;
+            }
         }
         self.focus = node;
-        Ok(true)
+        Ok(())
     }
 
     fn prepare_focus(&mut self, successors: bool) -> Result<(), String> {
@@ -203,8 +202,7 @@ impl Solver {
             self.expand(self.focus);
         }
         if self.nodes[self.focus].leaf || self.nodes[self.focus].chance {
-            return Err("a solve focus must be a decision".into());
-        }
+            return Err("a solve focus must be a decision".into());        }
         for node in &mut self.nodes {
             node.carry = false;
         }
