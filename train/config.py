@@ -36,7 +36,7 @@ class Cfg:
     policy_w: float = 0.01
     temp: float = 2.0
     warm_games: int = 96
-    static_explore: float = 0.25
+    explore: float = 0.1
     random_draft: bool = True
 
     device: str = "cuda:1"

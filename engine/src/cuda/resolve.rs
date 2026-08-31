@@ -35,11 +35,11 @@ impl Card {
         let solves: Vec<usize> = mine.iter().map(|&i| calls[i].solve()).collect();
         self.lay(&solves)?;
         let fields = |call: &Call| match call {
-            Call::ReadPlay { touched, focus, focus_n, cells, actual, next_cap, .. } =>
-                (*touched, *focus, *focus_n, *cells, *actual, *next_cap),
+            Call::ReadPlay { touched, focus, focus_n, cells, actual, explore, next_cap, .. } =>
+                (*touched, *focus, *focus_n, *cells, *actual, *next_cap, *explore),
             Call::ReadRefresh { touched, focus, focus_n, cells, .. }
             | Call::ReadTarget { touched, focus, focus_n, cells, .. } =>
-                (*touched, *focus, *focus_n, *cells, u32::MAX, [0, 0]),
+                (*touched, *focus, *focus_n, *cells, u32::MAX, [0, 0], 0.0),
             _ => unreachable!("read shard holds only read calls"),
         };
         let touched: Vec<i32> = mine
@@ -52,17 +52,19 @@ impl Card {
         let focus: Vec<u32> = mine.iter().map(|&i| fields(&calls[i]).1).collect();
         let actual: Vec<u32> = mine.iter().map(|&i| fields(&calls[i]).4).collect();
         let caps: Vec<u32> = mine.iter().flat_map(|&i| fields(&calls[i]).5).collect();
+        let explore: Vec<f32> = mine.iter().map(|&i| fields(&calls[i]).6).collect();
         let mut offsets = Vec::with_capacity(mine.len());
         let mut total = 0usize;
         for &i in mine {
             offsets.push(total as u32);
-            let (_, _, n, cells, _, cap) = fields(&calls[i]);
+            let (_, _, n, cells, _, cap, _) = fields(&calls[i]);
             total += 1 + 2 * (n[0] + n[1] + cap[0] + cap[1]) as usize + cells as usize;
         }
         let mut b = self.batch.lock();
         b.touched.put(&self.stream, touched.len(), copy(&touched))?;
         b.focus.put(&self.stream, focus.len(), copy(&focus))?;
         b.actual.put(&self.stream, actual.len(), copy(&actual))?;
+        b.explore.put(&self.stream, explore.len(), copy(&explore))?;
         b.carry_cap.put(&self.stream, caps.len(), copy(&caps))?;
         b.out_at.put(&self.stream, offsets.len(), copy(&offsets))?;
         self.finish(&b, b.all())?;
@@ -72,7 +74,7 @@ impl Card {
             self.stream
                 .launch_builder(&self.k.choose_gather)
                 .arg(b.trees.buf()).arg(b.focus.buf()).arg(b.actual.buf())
-                .arg(b.carry_cap.buf()).arg(b.out_at.buf()).arg(&mut *gathered)
+                .arg(b.explore.buf()).arg(b.carry_cap.buf()).arg(b.out_at.buf()).arg(&mut *gathered)
                 .launch_unit(Self::grid(b.parts, 1))
         }
         .map_err(err)?;

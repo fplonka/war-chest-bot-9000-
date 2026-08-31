@@ -120,7 +120,7 @@ struct SolveFarm {
 #[pymethods]
 impl SolveFarm {
     #[new]
-    #[pyo3(signature = (seed, workers, s=512, c=8.0, batch=8, rounds=0, random_draft=true, cfr="sog", puct=1.5, prior_temp=1.0, p_td1=0.2, query_rate=0.9, recursive_rate=0.1, devices=vec![0]))]
+    #[pyo3(signature = (seed, workers, s=512, c=8.0, batch=8, rounds=0, explore=0.1, random_draft=true, cfr="sog", puct=1.5, prior_temp=1.0, p_td1=0.2, query_rate=0.9, recursive_rate=0.1, devices=vec![0]))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         seed: u64,
@@ -129,6 +129,7 @@ impl SolveFarm {
         c: f32,
         batch: usize,
         rounds: u8,
+        explore: f32,
         random_draft: bool,
         cfr: &str,
         puct: f32,
@@ -138,6 +139,7 @@ impl SolveFarm {
         recursive_rate: f32,
         devices: Vec<usize>,
     ) -> PyResult<SolveFarm> {
+        let explore = rate("explore", explore)?;
         let query_rate = rate("query_rate", query_rate)?;
         let recursive_rate = rate("recursive_rate", recursive_rate)?;
         let cfg = Cfg {
@@ -153,7 +155,7 @@ impl SolveFarm {
         let gc = GameCfg {
             agents: [Agent::Sog { cfg }; 2],
             collect: Collect::Sog,
-            static_explore: 0.0,
+            explore,
             random_draft,
             p_td1,
             query_rate,
@@ -231,7 +233,7 @@ fn device_for(devices: &[usize], value: &crate::net::Net, cfg: Cfg) -> PyResult<
 }
 
 #[pyfunction]
-#[pyo3(signature = (games, seed, explore=0.25, random_draft=true, temp=2.0))]
+#[pyo3(signature = (games, seed, explore=0.1, random_draft=true, temp=2.0))]
 fn gen_data(
     py: Python<'_>,
     games: usize,
@@ -243,7 +245,7 @@ fn gen_data(
     let gc = GameCfg {
         agents: [Agent::Greedy { temp }; 2],
         collect: Collect::Static,
-        static_explore: explore,
+        explore,
         random_draft,
         p_td1: 0.0,
         query_rate: 0.0,

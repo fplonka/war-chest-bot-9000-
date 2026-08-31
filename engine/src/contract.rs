@@ -62,6 +62,7 @@ pub enum Call {
         focus_n: [u32; 2],
         cells: u32,
         actual: u32,
+        explore: f32,
         next_cap: [u32; 2],
     },
     ReadRefresh {

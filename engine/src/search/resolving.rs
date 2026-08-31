@@ -262,6 +262,7 @@ impl Solver {
                     focus_n: common.3,
                     cells: common.4,
                     actual: index,
+                    explore: self.explore,
                     next_cap,
                 });
             }

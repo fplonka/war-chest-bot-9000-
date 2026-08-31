@@ -826,6 +826,7 @@ def main():
             c=args.c,
             batch=args.round_batch,
             rounds=args.rounds,
+            explore=args.explore,
             random_draft=args.random_draft,
             cfr=args.cfr,
             puct=args.puct,
@@ -1151,7 +1152,7 @@ def main():
             tg = time.time()
             d = warchest.gen_data(
                 args.warm_games, args.seed * 1_000_003 + epoch,
-                explore=args.static_explore, random_draft=args.random_draft,
+                explore=args.explore, random_draft=args.random_draft,
                 temp=args.temp)
             gen_s = time.time() - tg
             n = ingest(buf, d, warm=True)

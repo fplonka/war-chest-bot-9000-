@@ -1227,8 +1227,9 @@ __global__ void k_terminals(const Tree* trees) {
 }
 
 __global__ void k_choose_gather(const Tree* trees, const unsigned int* focus,
-                                const unsigned int* actual, const unsigned int* cap,
-                                const unsigned int* out_at, float* out) {
+                                const unsigned int* actual, const float* explore,
+                                const unsigned int* cap, const unsigned int* out_at,
+                                float* out) {
     unsigned int part = blockIdx.x;
     const Tree& t = trees[part];
     unsigned int node = focus[part];
@@ -1245,7 +1246,9 @@ __global__ void k_choose_gather(const Tree* trees, const unsigned int* focus,
             unsigned int b = t.legal_off[lb + actual[part] + 1];
             float total = 0.0f;
             for (unsigned int k = a; k < b; ++k) total += t.avg[t.soff[node] + k];
-            chosen = a + pick_from(t.avg + t.soff[node] + a, (int)(b - a), total, t.seed);
+            chosen = a + (explore[part] > 0.0f && rng_unit(t.seed) < (double)explore[part]
+                ? rng_next(t.seed) % (b - a)
+                : pick_from(t.avg + t.soff[node] + a, (int)(b - a), total, t.seed));
         }
         dst[0] = __uint_as_float(chosen);
     }

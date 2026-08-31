@@ -6,7 +6,7 @@ use warchest::contract::NO_ROW;
 use warchest::cuda::Device;
 use warchest::contract::{Call, Reply};
 use warchest::net::Net;
-use warchest::pbs::{expand_row, pack_row, true_config, Ctx, PUBFEAT, ROW_BYTES};
+use warchest::pbs::{expand_row, obs_key, pack_row, true_config, Ctx, PUBFEAT, ROW_BYTES};
 use warchest::rng::Rng;
 use warchest::resolve::{gadget_iteration, PlaySolved, SolveOutput};
 use warchest::search::{Budget, Cfg, Cfr, Policy, Solver, Step};
@@ -32,7 +32,7 @@ fn game_cfg_of(cfg: Cfg) -> GameCfg {
     GameCfg {
         agents: [Agent::Sog { cfg }; 2],
         collect: Collect::Sog,
-        static_explore: 0.0,
+        explore: 0.0,
         random_draft: true,
         p_td1: 0.0,
         query_rate: 0.0,
@@ -480,6 +480,33 @@ fn played_session_carries_across_a_round_boundary() {
         }
     }
     panic!("the session did not cross a round boundary");
+}
+
+#[test]
+fn solve_exploration_updates_the_continuation_belief() {
+    let net = Arc::new(Net::random(0xE1));
+    let cfg = Cfg { s: 1, c: 0.0, batch: 1, ..Default::default() };
+    let mut gc = game_cfg_of(cfg);
+    gc.explore = 1.0;
+    let mut stream = GameStream::new(0xE1, gc);
+    let mut data = Data::default();
+    let solver = stream.next_solve(&net, &mut data);
+    let (solver, solved) = run_solve(&Backend(gpu(27)), solver);
+    let SolveOutput::Play(play) = solved.as_ref().expect("a solved play") else { panic!("a play result") };
+    let PlaySolved::Continue(continued) = play.as_ref() else { panic!("the opening play continues") };
+    let state = continued.focus.public.state();
+    let actor = state.to_act() as usize;
+    let prior = &continued.focus.range[actor];
+    let policy = warchest::policy::uniform(&state, &Ctx::new(&state), actor as u8, &prior.cfg);
+    let expected = policy.posterior(prior, obs_key(&continued.action));
+    stream.keep(&solver, solved, &mut data);
+    let mut next = stream.next_solve(&net, &mut data);
+    let Step::Calls(calls) = next.advance(&[]) else { panic!("a re-solve starts") };
+    let previous = calls.iter().find_map(|call| match call {
+        Call::Gadget { resolver, previous, .. } if *resolver as usize == 1 - actor => Some(previous),
+        _ => None,
+    }).expect("the behavior range is retained");
+    assert!(worst(&expected.p, previous, "explored posterior") < 2e-6);
 }
 
 #[test]

@@ -180,7 +180,7 @@ impl Data {
 pub struct GameCfg {
     pub agents: [Agent; 2],
     pub collect: Collect,
-    pub static_explore: f32,
+    pub explore: f32,
     pub random_draft: bool,
     pub p_td1: f32,
     pub query_rate: f32,
@@ -351,6 +351,7 @@ impl Game {
                         actual,
                     )
                     .expect("continual solve construction");
+                    sv.explore = self.gc.explore;
                     if collects_rows(&self.gc, &self.s) {
                         sv.collect(draw_count(&mut self.rng, self.gc.query_rate));
                     }
@@ -361,7 +362,7 @@ impl Game {
     }
 
     pub fn play_solved(&mut self, solved: PlaySolved) {
-        let (action, policy, focus, next, queries) = match solved {
+        let (action, policy, focus, mut next, queries) = match solved {
             PlaySolved::Continue(s) => (s.action, s.policy, s.focus, Some(s.next), s.queries),
             PlaySolved::Terminal(s) => (s.action, s.policy, s.focus, None, s.queries),
         };
@@ -381,6 +382,14 @@ impl Game {
             );
         }
         self.queries.extend(queries);
+        if let Some(next) = next.as_mut() {
+            let actor = self.s.to_act() as usize;
+            let prior = &focus.range[actor];
+            let mut behavior = policy::NodePolicy::frame(&self.s, &self.ctx, actor as u8, &prior.cfg);
+            behavior.probs.copy_from_slice(&policy.p);
+            behavior.mix_uniform(self.gc.explore);
+            next.range[actor] = behavior.posterior(prior, obs_key(&action));
+        }
         if let Some(slot) = self.data.plays.get_mut(action.play() as usize) {
             *slot += 1;
         }
@@ -406,7 +415,7 @@ impl Game {
 
     fn play_static(&mut self, mut np: policy::NodePolicy) {
         let me = self.s.to_act() as usize;
-        np.mix_uniform(self.gc.static_explore);
+        np.mix_uniform(self.gc.explore);
         let mut belief = match self.continuation.take().expect("a live static game has beliefs") {
             Continuation::Unsolved(belief) => belief,
             Continuation::Solved { .. } => unreachable!("static play does not own a solve boundary"),
@@ -606,7 +615,7 @@ pub(crate) fn collect_roots(count: usize, seed: u64) -> Vec<(State, [Belief; 2])
     let gc = GameCfg {
         agents: [Agent::Random; 2],
         collect: Collect::None,
-        static_explore: 0.0,
+        explore: 0.0,
         random_draft: false,
         p_td1: 0.0,
         query_rate: 0.0,
@@ -654,7 +663,7 @@ mod target_tests {
         let gc = GameCfg {
             agents: [Agent::Sog { cfg: Cfg::default() }; 2],
             collect: Collect::Sog,
-            static_explore: 0.0,
+            explore: 0.0,
             random_draft: true,
             p_td1: 0.0,
             query_rate: 0.0,
@@ -678,7 +687,7 @@ mod target_tests {
         let gc = GameCfg {
             agents: [Agent::Random; 2],
             collect: Collect::None,
-            static_explore: 1.0,
+            explore: 1.0,
             random_draft: true,
             p_td1: 0.0,
             query_rate: 0.0,

@@ -378,6 +378,7 @@ struct Batch {
     touched: Wire<i32>,
     focus: Wire<u32>,
     actual: Wire<u32>,
+    explore: Wire<f32>,
     carry_cap: Wire<u32>,
     out_at: Wire<u32>,
     upto: Vec<Prefix>,
@@ -399,6 +400,7 @@ impl Default for Batch {
             touched: Wire::default(),
             focus: Wire::default(),
             actual: Wire::default(),
+            explore: Wire::default(),
             carry_cap: Wire::default(),
             out_at: Wire::default(),
             upto: vec![Prefix::default()],
@@ -2101,6 +2103,7 @@ impl Plan {
             touched: self.wire(n)?,
             focus: self.wire(n)?,
             actual: self.wire(n)?,
+            explore: self.wire(n)?,
             carry_cap: self.wire(2 * n)?,
             out_at: self.wire(n)?,
             ..Batch::default()

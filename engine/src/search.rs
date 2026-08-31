@@ -511,6 +511,7 @@ pub struct Solver {
     focus: usize,
     horizon: u16,
     finish: Finish,
+    pub(crate) explore: f32,
     gadget: Option<Gadget>,
     gadget_sent: bool,
 
