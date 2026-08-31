@@ -1,4 +1,5 @@
 use super::*;
+use crate::resolve::Continuation;
 
 impl Solver {
     pub fn initial_play(
@@ -15,40 +16,54 @@ impl Solver {
         Ok(sv)
     }
 
-    pub fn initial_refresh(
-        root: &State,
+    pub fn play(
+        continuation: &Continuation,
+        live: &State,
         ctx: Ctx,
         net: Arc<Net>,
         cfg: Cfg,
         belief: [Belief; 2],
-        rng: Rng,
-    ) -> Result<Solver, String> {
-        let mut sv = Self::build(root, ctx, net, cfg, belief, rng, Finish::Refresh)?;
-        sv.prepare_focus(false)?;
-        Ok(sv)
-    }
-
-    pub fn resolve_play(
-        boundary: Boundary,
-        path: ResolvePath,
-        live: &State,
-        net: Arc<Net>,
-        cfg: Cfg,
-        rng: Rng,
+        mut rng: Rng,
         actual: Config,
     ) -> Result<Solver, String> {
-        Self::resolved(boundary, path, live, net, cfg, rng, Finish::Play(actual), true)
+        Self::continual(continuation, live, ctx, net, cfg, belief, &mut rng, Finish::Play(actual), true)
     }
 
-    pub fn resolve_refresh(
-        boundary: Boundary,
-        path: ResolvePath,
+    pub fn refresh(
+        continuation: &Continuation,
         live: &State,
+        ctx: Ctx,
         net: Arc<Net>,
         cfg: Cfg,
-        rng: Rng,
+        belief: [Belief; 2],
+        mut rng: Rng,
     ) -> Result<Solver, String> {
-        Self::resolved(boundary, path, live, net, cfg, rng, Finish::Refresh, false)
+        Self::continual(continuation, live, ctx, net, cfg, belief, &mut rng, Finish::Refresh, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn continual(
+        continuation: &Continuation,
+        live: &State,
+        ctx: Ctx,
+        net: Arc<Net>,
+        cfg: Cfg,
+        belief: [Belief; 2],
+        rng: &mut Rng,
+        finish: Finish,
+        successors: bool,
+    ) -> Result<Solver, String> {
+        if let Continuation::Solved { boundary, path } = continuation {
+            let retained = Self::resolved(
+                boundary.as_ref().clone(), path.clone(), live,
+                Arc::clone(&net), cfg, Rng::new(rng.next_u64()), finish, successors)?;
+            if let Some(sv) = retained {
+                return Ok(sv);
+            }
+        }
+        let mut sv = Self::build(live, ctx, net, cfg, belief, Rng::new(rng.next_u64()), finish)?;
+        sv.prepare_focus(successors)?;
+        Ok(sv)
     }
 
     pub fn target(
@@ -115,7 +130,7 @@ impl Solver {
         rng: Rng,
         finish: Finish,
         successors: bool,
-    ) -> Result<Solver, String> {
+    ) -> Result<Option<Solver>, String> {
         let ctx = Ctx::new(&boundary.public.state());
         let resolver = live.to_act();
         let opponent = 1 - resolver;
@@ -130,7 +145,9 @@ impl Solver {
         let belief = boundary.range.clone();
         let mut sv = Self::build(&root, ctx, net, cfg, belief, rng, finish)?;
         sv.gadget = Some(Gadget { resolver, q, terminate });
-        sv.follow_path(&path)?;
+        if !sv.follow_path(&path)? {
+            return Ok(None);
+        }
         if !boundary.public.same_public(&sv.nodes[0].state) {
             return Err("the retained boundary does not match its canonical root".into());
         }
@@ -140,16 +157,19 @@ impl Solver {
         if sv.nodes[sv.focus].player != resolver {
             return Err("the forced public prefix reaches the wrong actor".into());
         }
+        if sv.nodes[sv.focus].leaf && !sv.nodes[sv.focus].expandable {
+            return Ok(None);
+        }
         sv.prepare_focus(successors)?;
-        Ok(sv)
+        Ok(Some(sv))
     }
 
-    fn follow_path(&mut self, path: &ResolvePath) -> Result<(), String> {
+    fn follow_path(&mut self, path: &ResolvePath) -> Result<bool, String> {
         let mut node = 0usize;
         for step in &path.steps {
             if self.nodes[node].leaf {
                 if !self.nodes[node].expandable {
-                    return Err("the mandatory public prefix reaches an unavailable leaf".into());
+                    return Ok(false);
                 }
                 self.expand(node);
             }
@@ -180,7 +200,7 @@ impl Solver {
             node = next;
         }
         self.focus = node;
-        Ok(())
+        Ok(true)
     }
 
     fn prepare_focus(&mut self, successors: bool) -> Result<(), String> {

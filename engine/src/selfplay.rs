@@ -340,26 +340,16 @@ impl Game {
                 }
                 Agent::Sog { cfg } => {
                     let actual = true_config(&self.s, player, &self.ctx);
-                    let mut sv = match self.continuation.as_ref().expect("a live game has continuation state") {
-                        Continuation::Unsolved(belief) => Solver::initial_play(
-                            &self.s,
-                            self.ctx,
-                            Arc::clone(nets),
-                            cfg,
-                            belief.clone(),
-                            Rng::new(self.rng.next_u64()),
-                            actual,
-                        ),
-                        Continuation::Solved { boundary, path } => Solver::resolve_play(
-                            boundary.as_ref().clone(),
-                            path.clone(),
-                            &self.s,
-                            Arc::clone(nets),
-                            cfg,
-                            Rng::new(self.rng.next_u64()),
-                            actual,
-                        ),
-                    }
+                    let mut sv = Solver::play(
+                        self.continuation.as_ref().expect("a live game has continuation state"),
+                        &self.s,
+                        self.ctx,
+                        Arc::clone(nets),
+                        cfg,
+                        self.ranges(),
+                        Rng::new(self.rng.next_u64()),
+                        actual,
+                    )
                     .expect("continual solve construction");
                     if collects_rows(&self.gc, &self.s) {
                         sv.collect(draw_count(&mut self.rng, self.gc.query_rate));

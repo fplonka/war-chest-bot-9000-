@@ -159,24 +159,15 @@ impl Session {
                 return Ok(());
             }
         }
-        let solver = match self.continuation.as_ref().ok_or("the session has ended")? {
-            Continuation::Unsolved(belief) => Solver::initial_refresh(
-                &self.s,
-                self.ctx,
-                Arc::clone(&brain.net),
-                brain.cfg,
-                belief.clone(),
-                Rng::new(self.rng.next_u64()),
-            )?,
-            Continuation::Solved { boundary, path } => Solver::resolve_refresh(
-                boundary.as_ref().clone(),
-                path.clone(),
-                &self.s,
-                Arc::clone(&brain.net),
-                brain.cfg,
-                Rng::new(self.rng.next_u64()),
-            )?,
-        };
+        let solver = Solver::refresh(
+            self.continuation.as_ref().ok_or("the session has ended")?,
+            &self.s,
+            self.ctx,
+            Arc::clone(&brain.net),
+            brain.cfg,
+            [self.prior(0)?, self.prior(1)?],
+            Rng::new(self.rng.next_u64()),
+        )?;
         let SolveOutput::Refresh(solved) = brain.solve(solver)? else {
             return Err("refresh solve returned the wrong result type".into());
         };
@@ -194,26 +185,16 @@ impl Session {
             return Err("the bot was asked to move out of turn".into());
         }
         let actual = true_config(&self.s, self.seat, &self.ctx);
-        let solver = match self.continuation.as_ref().ok_or("the session has ended")? {
-            Continuation::Unsolved(belief) => Solver::initial_play(
-                &self.s,
-                self.ctx,
-                Arc::clone(&brain.net),
-                brain.cfg,
-                belief.clone(),
-                Rng::new(self.rng.next_u64()),
-                actual,
-            )?,
-            Continuation::Solved { boundary, path } => Solver::resolve_play(
-                boundary.as_ref().clone(),
-                path.clone(),
-                &self.s,
-                Arc::clone(&brain.net),
-                brain.cfg,
-                Rng::new(self.rng.next_u64()),
-                actual,
-            )?,
-        };
+        let solver = Solver::play(
+            self.continuation.as_ref().ok_or("the session has ended")?,
+            &self.s,
+            self.ctx,
+            Arc::clone(&brain.net),
+            brain.cfg,
+            [self.prior(0)?, self.prior(1)?],
+            Rng::new(self.rng.next_u64()),
+            actual,
+        )?;
         let SolveOutput::Play(solved) = brain.solve(solver)? else {
             return Err("play solve returned the wrong result type".into());
         };
