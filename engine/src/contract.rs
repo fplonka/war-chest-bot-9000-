@@ -25,7 +25,7 @@ pub enum Call {
     Gadget {
         solve: usize,
         resolver: u8,
-        q: Vec<f32>,
+        previous: Vec<f32>,
         terminate: Vec<f32>,
     },
     Tree {

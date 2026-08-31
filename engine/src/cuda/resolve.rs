@@ -4,22 +4,22 @@ impl Card {
     pub(super) fn gadgets(&self, calls: &[Call], mine: &[usize]) -> Res<()> {
         let mut solves = self.solves.lock();
         for &i in mine {
-            let Call::Gadget { solve, resolver, q, terminate } = &calls[i] else {
+            let Call::Gadget { solve, resolver, previous, terminate } = &calls[i] else {
                 unreachable!("gadget shard holds only gadget calls")
             };
-            if *resolver > 1 || q.len() != terminate.len() || q.is_empty() || q.len() > crate::pbs::MAX_CONFIG_SUPPORT
-                || q.iter().any(|x| !x.is_finite() || *x <= 0.0)
-                || (q.iter().sum::<f32>() - 1.0).abs() > 2e-4
+            if *resolver > 1 || previous.len() != terminate.len() || previous.is_empty() || previous.len() > crate::pbs::MAX_CONFIG_SUPPORT
+                || previous.iter().any(|x| !x.is_finite() || *x < 0.0)
+                || (previous.iter().sum::<f32>() - 1.0).abs() > 2e-4
                 || terminate.iter().any(|x| !x.is_finite())
             {
                 return Err("invalid gadget input".into());
             }
             let slot = self.slot(&mut solves, *solve);
-            slot.ngadget = q.len();
+            slot.ngadget = previous.len();
             slot.resolver = *resolver;
-            let n = q.len();
+            let n = previous.len();
             let mut data = vec![0.0f32; G_FIELDS * n];
-            data[G_Q * n..(G_Q + 1) * n].copy_from_slice(q);
+            data[G_PREVIOUS * n..(G_PREVIOUS + 1) * n].copy_from_slice(previous);
             data[G_TERM * n..(G_TERM + 1) * n].copy_from_slice(terminate);
             data[G_CUR_T * n..(G_CUR_T + 1) * n].fill(0.5);
             data[G_CUR_F * n..(G_CUR_F + 1) * n].fill(0.5);

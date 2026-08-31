@@ -134,17 +134,12 @@ impl Solver {
         let ctx = Ctx::new(&boundary.public.state());
         let resolver = live.to_act();
         let opponent = 1 - resolver;
-        let n = boundary.range[opponent as usize].len();
-        let q = boundary.range[opponent as usize]
-            .p
-            .iter()
-            .map(|&r| 0.5 * r + 0.5 / n as f32)
-            .collect();
+        let previous = boundary.range[opponent as usize].p.clone();
         let terminate = boundary.cfv[opponent as usize].clone();
         let root = boundary.public.state();
         let belief = boundary.range.clone();
         let mut sv = Self::build(&root, ctx, net, cfg, belief, rng, finish)?;
-        sv.gadget = Some(Gadget { resolver, q, terminate });
+        sv.gadget = Some(Gadget { resolver, previous, terminate });
         if !sv.follow_path(&path)? {
             return Ok(None);
         }

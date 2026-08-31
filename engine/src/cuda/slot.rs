@@ -337,7 +337,7 @@ impl Entity {
     }
 }
 
-pub const G_Q: usize = 0;
+pub const G_PREVIOUS: usize = 0;
 pub const G_TERM: usize = 1;
 pub const G_CUR_T: usize = 4;
 pub const G_CUR_F: usize = 5;

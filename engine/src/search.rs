@@ -477,7 +477,7 @@ enum Finish {
 
 struct Gadget {
     resolver: u8,
-    q: Vec<f32>,
+    previous: Vec<f32>,
     terminate: Vec<f32>,
 }
 
@@ -1342,7 +1342,7 @@ impl Solver {
                 calls.push(Call::Gadget {
                     solve: self.slot,
                     resolver: gadget.resolver,
-                    q: gadget.q.clone(),
+                    previous: gadget.previous.clone(),
                     terminate: gadget.terminate.clone(),
                 });
             }

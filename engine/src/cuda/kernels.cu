@@ -503,17 +503,25 @@ __device__ __forceinline__ unsigned int carry_base(const Tree& t, unsigned int n
     return NO_ROW;
 }
 
-enum GadgetField { G_Q, G_TERM, G_REGRET_T, G_REGRET_F, G_STRATEGY_T, G_STRATEGY_F };
+enum GadgetField { G_PREVIOUS, G_TERM, G_REGRET_T, G_REGRET_F, G_STRATEGY_T, G_STRATEGY_F };
+
+__device__ void set_gadget_range(const Tree& t, unsigned int opponent,
+                                 const float* previous, const float* follow) {
+    if (threadIdx.x != 0) return;
+    float total = 0.0f;
+    for (unsigned int k = 0; k < t.ngadget; ++k) total += follow[k];
+    unsigned int dst = rbase(t, 0, opponent);
+    float scale = total > SMOOTH ? 0.5f / total : 0.0f;
+    for (unsigned int k = 0; k < t.ngadget; ++k)
+        t.reach[dst + k] = total > SMOOTH
+            ? 0.5f * previous[k] + scale * follow[k] : previous[k];
+}
 
 __global__ void k_gadget_seed(const Tree* trees) {
     const Tree& t = trees[blockIdx.x];
     if (t.ngadget == 0) return;
-    unsigned int opponent = 1 - (unsigned int)t.resolver;
-    unsigned int dst = rbase(t, 0, opponent);
-    const float* q = t.gadget;
-    const float* follow = t.gadget + G_STRATEGY_F * t.ngadget;
-    for (unsigned int k = threadIdx.x; k < t.ngadget; k += blockDim.x)
-        t.reach[dst + k] = q[k] * follow[k];
+    set_gadget_range(t, 1 - (unsigned int)t.resolver, t.gadget,
+                     t.gadget + G_STRATEGY_F * t.ngadget);
 }
 
 __global__ void k_gadget_update(const Tree* trees, int iter, float alpha,
@@ -542,7 +550,7 @@ __global__ void k_gadget_update(const Tree* trees, int iter, float alpha,
     }
     if (t.ngadget == 0) return;
     unsigned int opponent = 1 - (unsigned int)t.resolver;
-    float* q = t.gadget + G_Q * t.ngadget;
+    float* previous = t.gadget + G_PREVIOUS * t.ngadget;
     float* term = t.gadget + G_TERM * t.ngadget;
     float* rt = t.gadget + G_REGRET_T * t.ngadget;
     float* rf = t.gadget + G_REGRET_F * t.ngadget;
@@ -553,14 +561,15 @@ __global__ void k_gadget_update(const Tree* trees, int iter, float alpha,
     for (unsigned int k = threadIdx.x; k < t.ngadget; k += blockDim.x) {
         float g = st[k] * term[k] + sf[k] * follow[k];
         float old_t = rt[k], old_f = rf[k];
-        rt[k] = old_t * (old_t > 0.0f ? da : db) + q[k] * (term[k] - g);
-        rf[k] = old_f * (old_f > 0.0f ? da : db) + q[k] * (follow[k] - g);
+        rt[k] = old_t * (old_t > 0.0f ? da : db) + term[k] - g;
+        rf[k] = old_f * (old_f > 0.0f ? da : db) + follow[k] - g;
         float pt = fmaxf(rt[k], 0.0f), pf = fmaxf(rf[k], 0.0f);
         float total = pt + pf;
         st[k] = total > SMOOTH ? pt / total : 0.5f;
         sf[k] = total > SMOOTH ? pf / total : 0.5f;
-        t.reach[rbase(t, 0, opponent) + k] = q[k] * sf[k];
     }
+    __syncthreads();
+    set_gadget_range(t, opponent, previous, sf);
 }
 
 __global__ void k_reach_sweep(const Tree* trees, const unsigned int* work, int at,

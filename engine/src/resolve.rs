@@ -171,7 +171,6 @@ pub enum SolveOutput {
 }
 
 pub fn gadget_iteration(
-    q: &[f32],
     terminate: &[f32],
     follow: &[f32],
     regret: &mut [[f32; 2]],
@@ -191,13 +190,13 @@ pub fn gadget_iteration(
     let da = factor(m, cfr.alpha);
     let db = factor(m, cfr.beta);
     let dg = ((m - 1.0) / m).powf(cfr.gamma);
-    for k in 0..q.len() {
+    for k in 0..terminate.len() {
         let value = strategy[k][0] * terminate[k] + strategy[k][1] * follow[k];
         for a in 0..2 {
             let action = if a == 0 { terminate[k] } else { follow[k] };
             let old = regret[k][a];
-            regret[k][a] = old * if old > 0.0 { da } else { db } + q[k] * (action - value);
-            sum[k][a] = sum[k][a] * dg + q[k] * strategy[k][a];
+            regret[k][a] = old * if old > 0.0 { da } else { db } + action - value;
+            sum[k][a] = sum[k][a] * dg + strategy[k][a];
         }
         let positive = [regret[k][0].max(0.0), regret[k][1].max(0.0)];
         let total = positive[0] + positive[1];
@@ -271,14 +270,13 @@ mod tests {
 
     #[test]
     fn terminate_protects_each_private_state() {
-        let q = [0.45, 0.55];
         let term = [0.8, -0.4];
         let follow = [-0.2, 0.6];
         let mut regret = [[0.0; 2]; 2];
         let mut strategy = [[0.5; 2]; 2];
         let mut sum = [[0.0; 2]; 2];
         for step in 0..128 {
-            gadget_iteration(&q, &term, &follow, &mut regret, &mut strategy, &mut sum, step, Cfr::DISCOUNTED);
+            gadget_iteration(&term, &follow, &mut regret, &mut strategy, &mut sum, step, Cfr::DISCOUNTED);
         }
         assert!(strategy[0][0] > 0.99);
         assert!(strategy[1][1] > 0.99);

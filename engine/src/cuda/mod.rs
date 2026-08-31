@@ -30,7 +30,7 @@ use crate::units::{write_card_features, CARD_FEATS, N_UNITS};
 
 mod slot;
 mod resolve;
-use slot::{Arr, Solve, DESC, FIELDS, C_CUR, C_PRIOR, C_QVAL, C_SUM, C_VISITS, R_REACH, R_VALS, B_P, B_JP, G_F, G_G, G_FP, Y_BOARD_OF, Y_COFF, G_CUR_F, G_CUR_T, G_FIELDS, G_Q, G_TERM};
+use slot::{Arr, Solve, DESC, FIELDS, C_CUR, C_PRIOR, C_QVAL, C_SUM, C_VISITS, R_REACH, R_VALS, B_P, B_JP, G_F, G_G, G_FP, Y_BOARD_OF, Y_COFF, G_CUR_F, G_CUR_T, G_FIELDS, G_PREVIOUS, G_TERM};
 
 type Res<T> = Result<T, String>;
 

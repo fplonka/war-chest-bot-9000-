@@ -486,7 +486,7 @@ fn gadget_and_carry_match_one_cpu_iteration() {
     let resident = device.0.resident(0, 0).expect("resident re-solve");
     let n = resident.gadget.len() / 6;
     assert!(n > 0, "the second played solve has a gadget");
-    let q = &resident.gadget[..n];
+    let previous = &resident.gadget[..n];
     let term = &resident.gadget[n..2 * n];
     let opponent = 1 - second.nodes[0].player as usize;
     let vo = opponent * second.nvals + second.nodes[0].voff as usize;
@@ -494,19 +494,26 @@ fn gadget_and_carry_match_one_cpu_iteration() {
     let mut regret = vec![[0.0; 2]; n];
     let mut strategy = vec![[0.5; 2]; n];
     let mut sum = vec![[0.0; 2]; n];
-    gadget_iteration(q, term, follow, &mut regret, &mut strategy, &mut sum, 0, cfg.cfr);
+    gadget_iteration(term, follow, &mut regret, &mut strategy, &mut sum, 0, cfg.cfr);
     for k in 0..n {
         assert!((resident.gadget[2 * n + k] - regret[k][0]).abs() < 2e-6);
         assert!((resident.gadget[3 * n + k] - regret[k][1]).abs() < 2e-6);
         assert!((resident.gadget[4 * n + k] - strategy[k][0]).abs() < 2e-6);
         assert!((resident.gadget[5 * n + k] - strategy[k][1]).abs() < 2e-6);
     }
+    let mix = |follow: &[f32]| {
+        let total: f32 = follow.iter().sum();
+        previous.iter().zip(follow).map(|(&p, &f)| 0.5 * (p + f / total)).collect::<Vec<_>>()
+    };
+    let expected = mix(&strategy.iter().map(|s| s[1]).collect::<Vec<_>>());
     let root = &second.nodes[0];
+    let root_at = root.roff as usize + if opponent == 0 { 0 } else { root.nc[0] as usize };
+    assert!(worst(&expected, &resident.reach[root_at..root_at + n], "gadget range") < 2e-6);
     let counts = root.nc.map(|x| x as usize);
     for p in 0..2 {
         let start = if p == 0 { 0 } else { counts[0] };
         let expected = if p == opponent {
-            q.iter().map(|x| 0.5 * x).collect::<Vec<_>>()
+            mix(&vec![0.5; n])
         } else {
             second.root_belief[p].p.clone()
         };
