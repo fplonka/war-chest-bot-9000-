@@ -65,7 +65,7 @@ def pack(run):
         write_bin(net, directory / "weights.bin")
         shutil.copy2(BOT, directory / "bot")
         (directory / "bot.json").write_text(json.dumps({
-            "format": 2,
+            "format": 1,
             "name": f"{run.name}.{bot}",
             "sha": checkpoint.get("git", cfg.get("git", "")),
             "binary": digest(directory / "bot"),
