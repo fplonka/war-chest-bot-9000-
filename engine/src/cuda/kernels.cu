@@ -507,14 +507,10 @@ enum GadgetField { G_PREVIOUS, G_TERM, G_REGRET_T, G_REGRET_F, G_STRATEGY_T, G_S
 
 __device__ void set_gadget_range(const Tree& t, unsigned int opponent,
                                  const float* previous, const float* follow) {
-    if (threadIdx.x != 0) return;
-    float total = 0.0f;
-    for (unsigned int k = 0; k < t.ngadget; ++k) total += follow[k];
     unsigned int dst = rbase(t, 0, opponent);
-    float scale = total > SMOOTH ? 0.5f / total : 0.0f;
-    for (unsigned int k = 0; k < t.ngadget; ++k)
-        t.reach[dst + k] = total > SMOOTH
-            ? 0.5f * previous[k] + scale * follow[k] : previous[k];
+    float scale = 0.5f / (float)t.ngadget;
+    for (unsigned int k = threadIdx.x; k < t.ngadget; k += blockDim.x)
+        t.reach[dst + k] = 0.5f * previous[k] + scale * follow[k];
 }
 
 __global__ void k_gadget_seed(const Tree* trees) {

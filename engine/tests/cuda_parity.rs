@@ -515,8 +515,7 @@ fn gadget_and_carry_match_one_cpu_iteration() {
         assert!((resident.gadget[5 * n + k] - strategy[k][1]).abs() < 2e-6);
     }
     let mix = |follow: &[f32]| {
-        let total: f32 = follow.iter().sum();
-        previous.iter().zip(follow).map(|(&p, &f)| 0.5 * (p + f / total)).collect::<Vec<_>>()
+        previous.iter().zip(follow).map(|(&p, &f)| 0.5 * (p + f / n as f32)).collect::<Vec<_>>()
     };
     let expected = mix(&strategy.iter().map(|s| s[1]).collect::<Vec<_>>());
     let root = &second.nodes[0];
