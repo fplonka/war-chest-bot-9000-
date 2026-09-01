@@ -20,7 +20,7 @@ def _tables(device_text):
 
 def make_batch(parts, rng, device):
     parts = mirror.mirror_batch(parts, rng.random(len(parts[0])) < 0.5)
-    rows, cc, _cp, cw, cy, seg, pol = parts
+    rows, cc, _cp, cw, cy, seg, cm, pol = parts
     n = len(rows)
     rows = np.ascontiguousarray(rows)
     cc = np.ascontiguousarray(cc)
@@ -40,7 +40,7 @@ def make_batch(parts, rng, device):
               t(pact, torch.long), t(pcrow, torch.long), t(pcfg, torch.long),
               t(pprob, torch.float32))
     return (x, phi, t(cw, torch.float32), t(seg, torch.long),
-            t(cy, torch.float32), 2 * n, policy)
+            t(cy, torch.float32), 2 * n, t(cm, torch.float32), policy)
 
 
 def warmup(device):
@@ -54,6 +54,6 @@ def warmup(device):
              np.zeros(0, np.float32), np.zeros(0, np.int64))
     parts = (rows, cc, np.asarray([0, 1], np.uint8),
              np.asarray([1.0, 1.0], np.float32), np.zeros(2, np.float32),
-             np.asarray([0, 1], np.int64), empty)
+             np.asarray([0, 1], np.int64), np.ones(2, np.uint8), empty)
     make_batch(parts, np.random.default_rng(0), device)
     torch.cuda.synchronize(device)

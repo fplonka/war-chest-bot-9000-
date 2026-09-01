@@ -83,6 +83,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
         ("outcomes", d.outcome.len(), 2 * d.nv),
         ("creation times", d.created.len(), d.nv),
         ("query labels", d.query.len(), d.nv),
+        ("value masks", d.cm.len(), d.cw.len()),
         ("TD(1) labels", d.td1.len(), d.nv),
     ] {
         assert_eq!(got, want, "{name} do not match the row count");
@@ -101,7 +102,7 @@ fn data_to_dict(py: Python<'_>, d: Data) -> PyResult<PyObject> {
         };
     }
     arrays! {
-        rows = d.rows, cc = d.cc, cw = d.cw, cy = d.cy, coff = d.coff,
+        rows = d.rows, cc = d.cc, cw = d.cw, cy = d.cy, cm = d.cm, coff = d.coff,
         pa = d.pa, paoff = d.paoff, pcoff = d.pcoff, pci = d.pci,
         pcell = d.pcell, pprob = d.pprob, truth = d.truth, outcome = d.outcome,
         created = d.created, query = d.query, td1 = d.td1, soff = soff,
@@ -139,6 +140,7 @@ impl SolveFarm {
         devices: Vec<usize>,
     ) -> PyResult<SolveFarm> {
         let explore = rate("explore", explore)?;
+        let p_td1 = rate("p_td1", p_td1)?;
         let query_rate = rate("query_rate", query_rate)?;
         let recursive_rate = rate("recursive_rate", recursive_rate)?;
         let cfg = Cfg {

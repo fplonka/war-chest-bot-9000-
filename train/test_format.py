@@ -53,7 +53,8 @@ def main():
     rows = np.asarray(d["rows"], np.uint8).reshape(-1, ROW_BYTES)
     cc = np.asarray(d["cc"], np.uint8).reshape(-1, CCOUNTS)
     cw = np.asarray(d["cw"], np.float32)
-    cy = np.clip(np.asarray(d["cy"], np.float32), -1.0, 1.0)
+    cy = np.asarray(d["cy"], np.float32)
+    cm = np.asarray(d["cm"], np.uint8)
     coff = np.asarray(d["coff"], np.int64)
     soff = np.asarray(d["soff"], np.int64)
     query = np.asarray(d["query"], np.uint8)
@@ -62,8 +63,8 @@ def main():
     outcome = np.asarray(d["outcome"], np.float32).reshape(-1, 2)
     created = np.asarray(d["created"], np.float64)
     td1 = np.asarray(d["td1"], np.uint8)
-    replay = (rows, cc, cw.astype(np.float16), cy.astype(np.float16), coff,
-              soff, source, truth, outcome, created, td1)
+    replay = (rows, cc, cw.astype(np.float16), cy.astype(np.float16), cm,
+              coff, soff, source, truth, outcome, created, td1)
     buf.add(*replay)
     tiny = Buffer(max(n * 2, 8), max(n * 2, 8) * 48)
     for _ in range(8):
@@ -77,11 +78,13 @@ def main():
 
     print("[3/5] solve-aligned split and batch assembly", flush=True)
     split = int(inner[-1])
-    block = lambda lo, hi: (*buf.gather(np.arange(lo, hi))[:6], empty_policy())
+    def block(lo, hi):
+        parts = buf.gather(np.arange(lo, hi))
+        return (*parts[:7], empty_policy())
     tr, te = block(buf.lo, split), block(split, buf.rows)
     rng = np.random.default_rng(0)
     b = make_batch(tr, rng, dev)
-    xpub, phi, w, seg, y, nseg, policy = b
+    xpub, phi, w, seg, y, nseg, mask, policy = b
     assert xpub.shape == (len(tr[0]), PUBFEAT), xpub.shape
     assert phi.shape[1] == CFEAT
     assert seg.max() == 2 * len(tr[0]) - 1
@@ -89,6 +92,10 @@ def main():
     assert torch.allclose(torch.bincount(seg, w), torch.ones(nseg, device=w.device), atol=1e-6)
     assert not len(policy[0]) and not len(policy[1])
     assert torch.isfinite(xpub).all() and torch.isfinite(y).all()
+    assert mask.bool().all()
+    hidden = list(b)
+    hidden[6] = torch.zeros_like(mask)
+    assert float(losses(net, *hidden)) == 0.0
     print(f"      batch {xpub.shape} phi {phi.shape}", flush=True)
 
     print("[4/5] ten offline training steps", flush=True)

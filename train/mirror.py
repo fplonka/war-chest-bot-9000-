@@ -14,7 +14,7 @@ def mirror_rows(rows):
 
 
 def mirror_batch(parts, flipped):
-    rows, cc, player, weight, target, seg, policy = parts
+    rows, cc, player, weight, target, seg, mask, policy = parts
     flipped = np.asarray(flipped, dtype=bool)
     if flipped.shape != (len(rows),):
         raise ValueError("one symmetry choice is required per replay row")
@@ -41,4 +41,4 @@ def mirror_batch(parts, flipped):
         actions[here, field] = HEXMAP[actions[here, field]]
     desc[moved] = actions
     policy = (desc, pact, pcrow, pcfg, probability, parow)
-    return rows, cc, player, weight, target, seg, policy
+    return rows, cc, player, weight, target, seg, mask, policy

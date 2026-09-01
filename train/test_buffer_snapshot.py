@@ -63,6 +63,7 @@ def chunk(train, start, n):
         for row in lens for k in row
     ])
     cy = np.linspace(-1.0, 1.0, m, dtype=np.float32)
+    cm = (np.arange(m) % 3 != 0).astype(np.uint8)
     boundaries = np.arange(0, n + 1, 97, dtype=np.int64)
     if boundaries[-1] != n:
         boundaries = np.append(boundaries, n)
@@ -93,7 +94,7 @@ def chunk(train, start, n):
         for nc in nc_row if nc
     ])
     policy = (pa, paoff, pcoff, pci, pact, pprob)
-    return (rows, cc, cw, cy, coff, boundaries, source, truth, outcome,
+    return (rows, cc, cw, cy, cm, coff, boundaries, source, truth, outcome,
             created, td1, policy)
 
 
@@ -131,9 +132,12 @@ def main():
     restored.load_state_dict(state)
     assert len(restored) == len(buf)
     ids = np.arange(buf.lo, buf.rows)
-    assert_same(buf.gather(ids), restored.gather(ids))
+    gathered = buf.gather(ids)
+    assert_same(gathered, restored.gather(ids))
     assert_same(buf.ordered(), restored.ordered())
     assert buf.replay_stats() == restored.replay_stats()
+    assert np.isclose(buf.replay_stats()["replay_value_target_frac"],
+                      gathered[6].mean())
     assert buf.span_seconds() == restored.span_seconds()
     np.testing.assert_array_equal(buf.soff, restored.soff)
 

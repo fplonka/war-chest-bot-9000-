@@ -49,6 +49,7 @@ pub struct Data {
     pub cc: Vec<u8>,
     pub cw: Vec<f32>,
     pub cy: Vec<f32>,
+    pub cm: Vec<u8>,
 
     pub pa: Vec<u8>,
     pub paoff: Vec<u32>,
@@ -90,7 +91,7 @@ impl Data {
         macro_rules! append {
             ($($name:ident),* $(,)?) => { $( self.$name.extend(o.$name); )* };
         }
-        append!(rows, cc, cw, cy, pa, pci, pcell, pprob, truth, outcome, created, query, td1);
+        append!(rows, cc, cw, cy, cm, pa, pci, pcell, pprob, truth, outcome, created, query, td1);
         self.paoff.extend(o.paoff.iter().skip(tail).map(|x| x + ab));
         self.pcoff.extend(o.pcoff.iter().skip(tail).map(|x| x + cb));
         let rb = self.nv as u32;
@@ -118,16 +119,15 @@ impl Data {
             .as_secs_f64();
     }
 
-    fn push_value(
+    fn push_policy(
         &mut self,
         s: &State,
         ctx: &Ctx,
         bel: &[Belief; 2],
-        y: [&[f32]; 2],
         truth: [u32; 2],
         policy: &crate::search::Policy,
-    ) {
-        debug_assert!(s.is_valued(), "every saved value row is a valued decision");
+    ) -> usize {
+        debug_assert!(s.is_valued(), "every replay row is a valued decision");
         let base = self.rows.len();
         self.rows.resize(base + ROW_BYTES, 0);
         pack_row(s, ctx, &mut self.rows[base..base + ROW_BYTES]);
@@ -150,7 +150,8 @@ impl Data {
                 config_counts(c, &res, &mut cnt);
                 self.cc.extend_from_slice(&cnt);
                 self.cw.push(bel[p].p[ci]);
-                self.cy.push(y[p][ci]);
+                self.cy.push(0.0);
+                self.cm.push(0);
                 if usable && p == actor {
                     let row = policy.off[ci] as usize..policy.off[ci + 1] as usize;
                     let within = if actor == 0 { ci } else { bel[0].len() + ci };
@@ -168,6 +169,33 @@ impl Data {
         self.query.push(0);
         self.td1.push(0);
         self.nv += 1;
+        self.nv - 1
+    }
+
+    fn push_value(
+        &mut self,
+        s: &State,
+        ctx: &Ctx,
+        bel: &[Belief; 2],
+        y: [&[f32]; 2],
+        truth: [u32; 2],
+        policy: &crate::search::Policy,
+    ) {
+        let row = self.push_policy(s, ctx, bel, truth, policy);
+        for (p, values) in y.into_iter().enumerate() {
+            let span = self.row_span(row, p);
+            assert_eq!(span.len(), values.len(), "value count does not match belief");
+            self.cy[span.clone()].copy_from_slice(values);
+            self.cm[span].fill(1);
+        }
+    }
+
+    fn label_truth(&mut self, row: usize, values: [f32; 2]) {
+        for (p, value) in values.into_iter().enumerate() {
+            let at = self.row_span(row, p).start + self.truth[2 * row + p] as usize;
+            self.cy[at] = value;
+            self.cm[at] = 1;
+        }
     }
 
     #[inline]
@@ -369,14 +397,7 @@ impl Game {
                 focus.range[1].index_of(&true_config(&self.s, 1, &self.ctx)).expect("focus dropped player 1") as u32,
             ];
             self.data.begin_solve();
-            self.data.push_value(
-                &self.s,
-                &self.ctx,
-                &focus.range,
-                [&focus.cfv[0], &focus.cfv[1]],
-                truth,
-                &policy,
-            );
+            self.data.push_policy(&self.s, &self.ctx, &focus.range, truth, &policy);
         }
         self.queries.extend(queries);
         let actor = self.s.to_act() as usize;
@@ -446,10 +467,7 @@ impl Game {
                 continue;
             }
             self.data.td1[r] = 1;
-            for p in 0..2 {
-                let at = self.data.row_span(r, p).start + self.data.truth[2 * r + p] as usize;
-                self.data.cy[at] = z[p];
-            }
+            self.data.label_truth(r, z);
         }
         self.data.games += 1;
         if self.s.main_plays >= crate::state::MAX_MAIN_PLAYS {
@@ -685,6 +703,30 @@ mod target_tests {
         out.dropped += stream.enqueue(nominations);
         assert_eq!(stream.pending.len(), QUEUE_CAP);
         assert_eq!(out.dropped, 3);
+    }
+
+    #[test]
+    fn replay_value_masks_follow_the_target_source() {
+        let (s, bel) = collect_roots(1, 0xA11CE).pop().unwrap();
+        let ctx = Ctx::new(&s);
+        let truth = [0, 1].map(|p| bel[p].index_of(&true_config(&s, p as u8, &ctx)).unwrap() as u32);
+        let mut data = Data::default();
+        data.begin_solve();
+        let row = data.push_policy(&s, &ctx, &bel, truth, &Default::default());
+        assert!(data.cm.iter().all(|&x| x == 0));
+        data.label_truth(row, [0.25, -0.25]);
+        for p in 0..2 {
+            let span = data.row_span(row, p);
+            assert_eq!(data.cm[span.clone()].iter().map(|&x| usize::from(x)).sum::<usize>(), 1);
+            assert_eq!(data.cy[span.start + truth[p] as usize], [0.25, -0.25][p]);
+        }
+
+        let values = [vec![0.5; bel[0].len()], vec![-0.5; bel[1].len()]];
+        data.begin_solve();
+        data.push_value(&s, &ctx, &bel, [&values[0], &values[1]], truth, &Default::default());
+        for p in 0..2 {
+            assert!(data.cm[data.row_span(1, p)].iter().all(|&x| x == 1));
+        }
     }
 
     #[test]
