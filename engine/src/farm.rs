@@ -36,7 +36,7 @@ fn deal(mut replies: Vec<Reply>, spans: &[usize]) -> Vec<Vec<Reply>> {
 }
 
 pub fn host_slots(budget: Budget) -> usize {
-    let slot = budget.host_slot_bytes() as u64;
+    let slot = budget.storage().host_slot_bytes() as u64;
     (host_free() / slot.max(1)) as usize
 }
 

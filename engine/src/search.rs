@@ -47,13 +47,19 @@ pub struct Budget(pub [usize; 8]);
 impl Budget {
     pub fn for_s(s: u32) -> Budget {
         let growth = |at512: usize| (at512 * s as usize / 512).max(1);
-        let mut cap = std::array::from_fn(|i| BUDGET_512.0[i] + growth(BUDGET_512.0[i]));
-        cap[Ent::Config as usize] += INITIAL_TREE_CONFIG_RANGES * MAX_CONFIG_SUPPORT;
+        let mut cap = BUDGET_512.0.map(growth);
+        cap[Ent::Config as usize] = cap[Ent::Config as usize].max(2 * MAX_CONFIG_SUPPORT);
         Budget(cap)
     }
 
     pub fn cap(&self, e: Ent) -> usize {
         self.0[e as usize]
+    }
+
+    pub(crate) fn storage(self) -> Budget {
+        let mut cap = std::array::from_fn(|i| self.0[i] + BUDGET_512.0[i]);
+        cap[Ent::Config as usize] += INITIAL_TREE_CONFIG_RANGES * MAX_CONFIG_SUPPORT;
+        Budget(cap)
     }
 
     pub fn host_slot_bytes(&self) -> usize {
@@ -506,6 +512,7 @@ pub struct Solver {
     pub nreach: usize,
     pub nvals: usize,
     budget_hit: u8,
+    growth_budget: Budget,
     wants_prior: Vec<u32>,
     pub(crate) steps: [usize; 2],
     focus: usize,

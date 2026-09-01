@@ -42,7 +42,7 @@ fn game_cfg_of(cfg: Cfg) -> GameCfg {
 
 struct Run { data: Data }
 
-const GPU_SLOTS: usize = 32;
+const GPU_SLOTS: usize = 16;
 static DEVICE: OnceLock<Device> = OnceLock::new();
 
 fn shared_device() -> &'static Device {
@@ -238,7 +238,7 @@ fn fresh_batched_solves_use_supplied_beliefs_for_their_first_priors() {
         calls.extend(fresh);
         solves.push(sv);
     }
-    let device = gpu(30);
+    let device = gpu(1);
     device.run(&calls, 0).expect("the card answered the first round");
     let mut priors = Vec::new();
     for (i, sv) in solves.iter().enumerate() {
@@ -310,7 +310,7 @@ fn a_solve_does_not_depend_on_the_round_it_rides_in() {
         (0x77C1, cfg(13, 0.0)),
         (0x2E57, cfg(17, 0.0)),
     ];
-    let device = || Backend(gpu(7));
+    let device = || Backend(gpu(4));
     let together = generate(&net, device(), &streams, 3);
     let twice = generate(&net, device(), &streams, 3);
     let rel = |x: f32, y: f32| (x - y).abs() / (x.abs().max(y.abs()).max(1e-2));
@@ -381,7 +381,7 @@ fn a_ragged_round_does_not_move_the_small_solve() {
     };
 
     let (alone, tiny) = {
-        let device = Backend(gpu(11));
+        let device = Backend(gpu(5));
         let (mut g, mut data, sv) = small();
         let (sv, solved) = run_solve(&device, sv);
         let tiny = sv.nodes.len();
@@ -389,7 +389,7 @@ fn a_ragged_round_does_not_move_the_small_solve() {
         (data, tiny)
     };
 
-    let device = Backend(gpu(11));
+    let device = Backend(gpu(5));
     let mut big: Vec<Solver> = [(0x0A13u64, 1024u32, 8.0f32), (0x77C1, 1664, 13.0)]
         .iter()
         .enumerate()
@@ -444,7 +444,7 @@ fn a_ragged_round_does_not_move_the_small_solve() {
 fn played_session_carries_across_a_round_boundary() {
     let net = Arc::new(Net::random(0x9E37));
     let cfg = Cfg { s: 2, c: 0.0, batch: 2, ..Default::default() };
-    let device = Backend(gpu(24));
+    let device = Backend(gpu(6));
     let mut stream = GameStream::new(0x5E5510, game_cfg_of(cfg));
     let mut data = Data::default();
     let mut first_round = None;
@@ -485,7 +485,7 @@ fn explored_action_is_resolved_from_the_prior_boundary() {
     let mut stream = GameStream::new(0xE1, gc);
     let mut data = Data::default();
     let solver = stream.next_solve(&net, &mut data);
-    let (solver, solved) = run_solve(&Backend(gpu(27)), solver);
+    let (solver, solved) = run_solve(&Backend(gpu(7)), solver);
     let SolveOutput::Play(play) = solved.as_ref().expect("a solved play") else { panic!("a play result") };
     let key = obs_key(&play.action);
     let ranges = play.focus.range.clone();
@@ -509,7 +509,7 @@ fn explored_action_is_resolved_from_the_prior_boundary() {
 fn gadget_and_carry_match_one_cpu_iteration() {
     let net = Arc::new(Net::random(0x9E37));
     let cfg = Cfg { s: 1, c: 0.0, batch: 1, cfr: Cfr::DISCOUNTED, ..Default::default() };
-    let device = Backend(gpu(26));
+    let device = Backend(gpu(8));
     let mut stream = GameStream::new(0xC411, game_cfg_of(cfg));
     let mut data = Data::default();
     let first = stream.next_solve(&net, &mut data);
@@ -567,7 +567,7 @@ fn gadget_and_carry_match_one_cpu_iteration() {
 #[test]
 fn cfr_average_uses_evaluated_strategies_and_global_steps() {
     let net = Arc::new(Net::random(0x9E37));
-    let device = Backend(gpu(28));
+    let device = Backend(gpu(9));
     let fresh = |s, batch| {
         let cfg = Cfg { s, c: 0.0, batch, cfr: Cfr::DISCOUNTED, ..Default::default() };
         let mut data = Data::default();
@@ -591,7 +591,7 @@ fn cfr_average_uses_evaluated_strategies_and_global_steps() {
 fn k_iterates_together_match_k_iterates_alone() {
     const K: usize = 4;
     let net = Net::random(0x9E37);
-    let device = gpu(20);
+    let device = gpu(8);
     let nets = Arc::new(net);
     let mut setup = Vec::new();
     let mut iterates = Vec::new();

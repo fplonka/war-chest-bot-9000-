@@ -100,6 +100,8 @@ impl Solver {
         sv.net = net;
         sv.rng = rng;
         sv.cfg = cfg;
+        sv.growth_budget = cfg.budget;
+        sv.cfg.budget = cfg.budget.storage();
         sv.root_belief = belief;
         sv.horizon = root.round + cfg.rounds as u16;
         sv.finish = finish;
@@ -215,6 +217,9 @@ impl Solver {
         }
         if self.nodes[self.focus].leaf || self.nodes[self.focus].chance {
             return Err("solve focus is not a decision".into());
+        }
+        for e in Ent::ALL {
+            self.cfg.budget.0[e as usize] = self.used(e) + self.growth_budget.cap(e);
         }
         for node in &mut self.nodes {
             node.carry = false;

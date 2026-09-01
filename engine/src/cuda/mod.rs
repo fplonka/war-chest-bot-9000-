@@ -486,13 +486,14 @@ struct Card {
 }
 
 impl Device {
-    pub fn new(ordinals: &[usize], net: &Net, cfg: Cfg, max_slots: usize) -> Res<Device> {
+    pub fn new(ordinals: &[usize], net: &Net, mut cfg: Cfg, max_slots: usize) -> Res<Device> {
         if ordinals.is_empty() {
             return Err("no cuda device ordinals given".into());
         }
         if net.is_empty() {
             return Err("cannot start the device backend without weights".into());
         }
+        cfg.budget = cfg.budget.storage();
         let budget = cfg.budget;
         let mut cards = Vec::with_capacity(ordinals.len() * PIPELINE);
         let mut left = max_slots;
