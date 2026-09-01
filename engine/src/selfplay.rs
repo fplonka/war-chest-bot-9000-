@@ -233,26 +233,6 @@ fn draw_count(rng: &mut Rng, rate: f32) -> usize {
     (rng.unit_f64() < rate as f64) as usize
 }
 
-pub fn query_solver(
-    nets: &Arc<Net>,
-    cfg: Cfg,
-    recursive_rate: f32,
-    s: &State,
-    bel: &[Belief; 2],
-    rng: &mut Rng,
-) -> Solver {
-    let mut sv = Solver::target(
-        s,
-        Ctx::new(s),
-        Arc::clone(nets),
-        cfg,
-        bel.clone(),
-        Rng::new(rng.next_u64()),
-    ).expect("a query target has a valid root");
-    sv.collect(draw_count(rng, recursive_rate));
-    sv
-}
-
 pub fn keep_query(sv: &Solver, solved: crate::resolve::TargetSolved, out: &mut Data) -> Vec<(State, [Belief; 2])> {
     out.begin_solve();
     out.push_value(
@@ -524,7 +504,7 @@ impl GameStream {
     pub fn next_solve(&mut self, nets: &Arc<Net>, out: &mut Data) -> Solver {
         if self.query_turn {
             self.query_turn = false;
-            if let Some(sv) = self.next_query(nets) {
+            if let Some(sv) = self.next_query(nets, out) {
                 self.kind = SolveKind::Query;
                 return sv;
             }
@@ -561,12 +541,26 @@ impl GameStream {
         }
     }
 
-    fn next_query(&mut self, nets: &Arc<Net>) -> Option<Solver> {
-        let (s, bel) = self.pending.pop_front()?;
-        let Agent::Sog { cfg } = self.gc.agents[s.to_act() as usize] else {
-            return None;
-        };
-        Some(query_solver(nets, cfg, self.gc.recursive_rate, &s, &bel, &mut self.rng))
+    fn next_query(&mut self, nets: &Arc<Net>, out: &mut Data) -> Option<Solver> {
+        while let Some((s, bel)) = self.pending.pop_front() {
+            let Agent::Sog { cfg } = self.gc.agents[s.to_act() as usize] else {
+                continue;
+            };
+            let Ok(mut sv) = Solver::target(
+                &s,
+                Ctx::new(&s),
+                Arc::clone(nets),
+                cfg,
+                bel,
+                Rng::new(self.rng.next_u64()),
+            ) else {
+                out.dropped += 1;
+                continue;
+            };
+            sv.collect(draw_count(&mut self.rng, self.gc.recursive_rate));
+            return Some(sv);
+        }
+        None
     }
 
     fn end_game(&mut self, out: &mut Data) {
