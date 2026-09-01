@@ -3,7 +3,7 @@ use crate::board::NONE;
 use crate::contract::{Call, Dst, Prime, QueryPick, Reply, Writes};
 use crate::net::Net;
 use crate::pbs::*;
-use crate::resolve::{Boundary, PlayContinue, PlaySolved, PlayTerminal, PublicState, PublicStep, RefreshSolved, ResolvePath, SolveOutput, TargetSolved};
+use crate::resolve::{Boundary, PlaySolved, PublicState, PublicStep, RefreshSolved, ResolvePath, SolveOutput, TargetSolved};
 use crate::rng::Rng;
 use crate::state::{Cont, State};
 use crate::units::{ENSIGN, MARSHAL, ROYAL_COIN};

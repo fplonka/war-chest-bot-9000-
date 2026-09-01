@@ -63,7 +63,6 @@ pub enum Call {
         cells: u32,
         actual: u32,
         explore: f32,
-        next_cap: [u32; 2],
     },
     ReadRefresh {
         solve: usize,

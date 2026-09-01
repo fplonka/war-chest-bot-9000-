@@ -133,24 +133,11 @@ pub enum Continuation {
     Solved { boundary: Box<Boundary>, path: ResolvePath },
 }
 
-pub struct PlayContinue {
-    pub action: Action,
-    pub policy: Policy,
-    pub focus: Boundary,
-    pub next: Boundary,
-    pub queries: Vec<(State, [Belief; 2])>,
-}
-
-pub struct PlayTerminal {
+pub struct PlaySolved {
     pub action: Action,
     pub policy: Policy,
     pub focus: Boundary,
     pub queries: Vec<(State, [Belief; 2])>,
-}
-
-pub enum PlaySolved {
-    Continue(Box<PlayContinue>),
-    Terminal(Box<PlayTerminal>),
 }
 
 pub struct RefreshSolved {

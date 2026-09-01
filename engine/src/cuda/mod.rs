@@ -379,7 +379,6 @@ struct Batch {
     focus: Wire<u32>,
     actual: Wire<u32>,
     explore: Wire<f32>,
-    carry_cap: Wire<u32>,
     out_at: Wire<u32>,
     upto: Vec<Prefix>,
     parts: u32,
@@ -401,7 +400,6 @@ impl Default for Batch {
             focus: Wire::default(),
             actual: Wire::default(),
             explore: Wire::default(),
-            carry_cap: Wire::default(),
             out_at: Wire::default(),
             upto: vec![Prefix::default()],
             parts: 0,
@@ -2065,7 +2063,7 @@ impl Plan {
             input: self.arr(TILE * (2 * C + LOOSE))?,
             leaves: self.arr(n * cfg.s.max(1) as usize)?,
             queries: self.arr(n * b.cap(Ent::Config))?,
-            gathered: self.arr(n * (1 + 8 * crate::pbs::MAX_CONFIG_SUPPORT + b.cap(Ent::Cell)))?,
+            gathered: self.arr(n * (1 + 4 * crate::pbs::MAX_CONFIG_SUPPORT + b.cap(Ent::Cell)))?,
             piles: self.arr(TILE * NTYPE * PILE_COUNTS)?,
             tokens: self.arr(TILE * NTYPE * TYPE)?,
             projected: self.arr(TILE * NTYPE * C)?,
@@ -2104,7 +2102,6 @@ impl Plan {
             focus: self.wire(n)?,
             actual: self.wire(n)?,
             explore: self.wire(n)?,
-            carry_cap: self.wire(2 * n)?,
             out_at: self.wire(n)?,
             ..Batch::default()
         };

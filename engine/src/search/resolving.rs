@@ -12,7 +12,7 @@ impl Solver {
         actual: Config,
     ) -> Result<Solver, String> {
         let mut sv = Self::build(root, ctx, net, cfg, belief, rng, Finish::Play(actual))?;
-        sv.prepare_focus(true)?;
+        sv.prepare_focus()?;
         Ok(sv)
     }
 
@@ -26,7 +26,7 @@ impl Solver {
         mut rng: Rng,
         actual: Config,
     ) -> Result<Solver, String> {
-        Self::continual(continuation, live, ctx, net, cfg, belief, &mut rng, Finish::Play(actual), true)
+        Self::continual(continuation, live, ctx, net, cfg, belief, &mut rng, Finish::Play(actual))
     }
 
     pub fn refresh(
@@ -38,7 +38,7 @@ impl Solver {
         belief: [Belief; 2],
         mut rng: Rng,
     ) -> Result<Solver, String> {
-        Self::continual(continuation, live, ctx, net, cfg, belief, &mut rng, Finish::Refresh, false)
+        Self::continual(continuation, live, ctx, net, cfg, belief, &mut rng, Finish::Refresh)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -51,15 +51,14 @@ impl Solver {
         belief: [Belief; 2],
         rng: &mut Rng,
         finish: Finish,
-        successors: bool,
     ) -> Result<Solver, String> {
         if let Continuation::Solved { boundary, path } = continuation {
             return Self::resolved(
                 boundary.as_ref().clone(), path.clone(), live,
-                net, cfg, Rng::new(rng.next_u64()), finish, successors);
+                net, cfg, Rng::new(rng.next_u64()), finish);
         }
         let mut sv = Self::build(live, ctx, net, cfg, belief, Rng::new(rng.next_u64()), finish)?;
-        sv.prepare_focus(successors)?;
+        sv.prepare_focus()?;
         Ok(sv)
     }
 
@@ -75,7 +74,7 @@ impl Solver {
             return Err("a target solve requires a valued state".into());
         }
         let mut sv = Self::build(root, ctx, net, cfg, belief, rng, Finish::Target)?;
-        sv.prepare_focus(false)?;
+        sv.prepare_focus()?;
         Ok(sv)
     }
 
@@ -127,7 +126,6 @@ impl Solver {
         cfg: Cfg,
         rng: Rng,
         finish: Finish,
-        successors: bool,
     ) -> Result<Solver, String> {
         let ctx = Ctx::new(&boundary.public.state());
         let resolver = live.to_act();
@@ -148,7 +146,7 @@ impl Solver {
         if sv.nodes[sv.focus].player != resolver {
             return Err("the forced public prefix reaches the wrong actor".into());
         }
-        sv.prepare_focus(successors)?;
+        sv.prepare_focus()?;
         Ok(sv)
     }
 
@@ -159,9 +157,7 @@ impl Solver {
                 if !self.nodes[node].expandable {
                     return Err("the mandatory public prefix exceeds solve capacity".into());
                 }
-                self.expand(node);
-                if self.nodes[node].leaf {
-                    return Err("the mandatory public prefix exceeds solve capacity".into());                }
+                self.expand_required(node)?;
             }
             let next = match *step {
                 PublicStep::Chance => {
@@ -197,22 +193,33 @@ impl Solver {
         Ok(())
     }
 
-    fn prepare_focus(&mut self, successors: bool) -> Result<(), String> {
+    fn expand_required(&mut self, node: usize) -> Result<(), String> {
+        self.expand(node);
+        if let Some(error) = self.failure.take() {
+            return Err(error);
+        }
+        if self.nodes[node].leaf {
+            return Err(format!(
+                "required decision exceeds solve capacity: stop={} used={:?} pending={:?}",
+                self.stop_reason(),
+                Ent::ALL.map(|e| (e.name(), self.used(e), self.cfg.budget.cap(e))),
+                self.nodes[node].state.pending(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn prepare_focus(&mut self) -> Result<(), String> {
         if self.nodes[self.focus].leaf && self.nodes[self.focus].expandable {
-            self.expand(self.focus);
+            self.expand_required(self.focus)?;
         }
         if self.nodes[self.focus].leaf || self.nodes[self.focus].chance {
-            return Err("a solve focus must be a decision".into());        }
+            return Err("solve focus is not a decision".into());
+        }
         for node in &mut self.nodes {
             node.carry = false;
         }
         self.nodes[self.focus].carry = true;
-        if successors {
-            let children = self.nodes[self.focus].child.clone();
-            for child in children {
-                self.nodes[child].carry = true;
-            }
-        }
         if self.focus != 0 {
             for i in 0..self.nodes.len() {
                 if self.nodes[i].leaf && !self.is_below(i, self.focus) {
@@ -249,12 +256,6 @@ impl Solver {
                 let index = node.cfgs[actor]
                     .binary_search(actual)
                     .expect("the acting configuration is in the focus support") as u32;
-                let mut next_cap = [0u32; 2];
-                for &child in &node.child {
-                    for p in 0..2 {
-                        next_cap[p] = next_cap[p].max(self.nodes[child].nc[p]);
-                    }
-                }
                 calls.push(Call::ReadPlay {
                     solve: common.0,
                     touched: common.1,
@@ -263,7 +264,6 @@ impl Solver {
                     cells: common.4,
                     actual: index,
                     explore: self.explore,
-                    next_cap,
                 });
             }
             Finish::Refresh => calls.push(Call::ReadRefresh {
@@ -288,15 +288,7 @@ impl Solver {
         let focus = self.focus;
         let node = &self.nodes[focus];
         let n = node.nc.map(|x| x as usize);
-        let caps = if matches!(self.finish, Finish::Play(_)) {
-            [
-                node.child.iter().map(|&c| self.nodes[c].nc[0]).max().unwrap_or(0) as usize,
-                node.child.iter().map(|&c| self.nodes[c].nc[1]).max().unwrap_or(0) as usize,
-            ]
-        } else {
-            [0, 0]
-        };
-        let expected = 1 + 2 * (n[0] + n[1] + caps[0] + caps[1]) + node.legal_action.len();
+        let expected = 1 + 2 * (n[0] + n[1]) + node.legal_action.len();
         if r.a.len() != expected {
             return Err(format!("GPU read returned {} values, expected {expected}", r.a.len()));
         }
@@ -313,34 +305,12 @@ impl Solver {
                 if cell >= self.nodes[focus].legal_action.len() {
                     return Err("the GPU selected a cell outside the focus row".into());
                 }
-                let child = self.nodes[focus].legal_child[cell] as usize;
-                if child >= self.nodes.len() || !self.nodes[child].carry {
-                    return Err("the GPU selected an invalid continuation child".into());
-                }
-                let cn = self.nodes[child].nc.map(|x| x as usize);
-                let next_reach = [&r.a[at..at + cn[0]], &r.a[at + caps[0]..at + caps[0] + cn[1]]];
-                at += caps[0] + caps[1];
-                let next_value = [&r.a[at..at + cn[0]], &r.a[at + caps[0]..at + caps[0] + cn[1]]];
-                at += caps[0] + caps[1];
-                let policy = self.policy_at(focus, &r.a[at..]);
-                let action = self.nodes[focus].acts[self.nodes[focus].legal_action[cell] as usize];
-                if self.nodes[child].state.is_terminal() {
-                    Ok(SolveOutput::Play(Box::new(PlaySolved::Terminal(Box::new(PlayTerminal {
-                        action,
-                        policy,
-                        focus: focus_boundary,
-                        queries,
-                    })))))
-                } else {
-                    let next = self.boundary(child, next_reach, next_value)?;
-                    Ok(SolveOutput::Play(Box::new(PlaySolved::Continue(Box::new(PlayContinue {
-                        action,
-                        policy,
-                        focus: focus_boundary,
-                        next,
-                        queries,
-                    })))))
-                }
+                Ok(SolveOutput::Play(Box::new(PlaySolved {
+                    action: self.nodes[focus].acts[self.nodes[focus].legal_action[cell] as usize],
+                    policy: self.policy_at(focus, &r.a[at..]),
+                    focus: focus_boundary,
+                    queries,
+                })))
             }
             Finish::Refresh => Ok(SolveOutput::Refresh(Box::new(RefreshSolved { focus: focus_boundary, queries }))),
             Finish::Target => {

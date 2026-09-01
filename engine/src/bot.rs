@@ -1,11 +1,13 @@
 use crate::actions::Action;
 use crate::arena::{Draft, Obs};
 use crate::pbs::{belief_after_draw, faceup_counts, reserve, set_config, true_config, Belief, Config, Ctx};
+#[cfg(feature = "gpu")]
+use crate::pbs::obs_key;
 use crate::resolve::{apply_public_observation, Continuation, PublicState, PublicStep};
 use crate::state::{Cont, State};
 
 #[cfg(feature = "gpu")]
-use crate::resolve::{PlaySolved, ResolvePath, SolveOutput};
+use crate::resolve::{ResolvePath, SolveOutput};
 #[cfg(feature = "gpu")]
 use crate::rng::Rng;
 #[cfg(feature = "gpu")]
@@ -198,17 +200,15 @@ impl Session {
         let SolveOutput::Play(solved) = brain.solve(solver)? else {
             return Err("play solve returned the wrong result type".into());
         };
-        let (action, next) = match *solved {
-            PlaySolved::Continue(s) => (s.action, Some(s.next)),
-            PlaySolved::Terminal(s) => (s.action, None),
-        };
+        let action = solved.action;
+        let key = obs_key(&action);
+        self.support = std::array::from_fn(|p| solved.focus.range[p].cfg.clone());
+        self.support[self.seat as usize] =
+            apply_public_observation(&solved.focus.public, &solved.focus.range[self.seat as usize], key)?.1.cfg;
         self.s.apply_inplace(action);
-        if let Some(boundary) = &next {
-            self.support = std::array::from_fn(|p| boundary.range[p].cfg.clone());
-        }
-        self.continuation = next.map(|boundary| Continuation::Solved {
-            boundary: Box::new(boundary),
-            path: ResolvePath::default(),
+        self.continuation = (!self.s.is_terminal()).then(|| Continuation::Solved {
+            boundary: Box::new(solved.focus),
+            path: ResolvePath { steps: vec![PublicStep::Act(key)] },
         });
         Ok(action.encode())
     }

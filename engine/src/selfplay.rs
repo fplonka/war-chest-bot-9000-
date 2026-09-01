@@ -362,10 +362,7 @@ impl Game {
     }
 
     pub fn play_solved(&mut self, solved: PlaySolved) {
-        let (action, policy, focus, mut next, queries) = match solved {
-            PlaySolved::Continue(s) => (s.action, s.policy, s.focus, Some(s.next), s.queries),
-            PlaySolved::Terminal(s) => (s.action, s.policy, s.focus, None, s.queries),
-        };
+        let PlaySolved { action, policy, focus, queries } = solved;
         if collects_rows(&self.gc, &self.s) {
             let truth = [
                 focus.range[0].index_of(&true_config(&self.s, 0, &self.ctx)).expect("focus dropped player 0") as u32,
@@ -382,21 +379,13 @@ impl Game {
             );
         }
         self.queries.extend(queries);
-        if let Some(next) = next.as_mut() {
-            let actor = self.s.to_act() as usize;
-            let prior = &focus.range[actor];
-            let mut behavior = policy::NodePolicy::frame(&self.s, &self.ctx, actor as u8, &prior.cfg);
-            behavior.probs.copy_from_slice(&policy.p);
-            behavior.mix_uniform(self.gc.explore);
-            next.range[actor] = behavior.posterior(prior, obs_key(&action));
-        }
         if let Some(slot) = self.data.plays.get_mut(action.play() as usize) {
             *slot += 1;
         }
         self.s.apply_inplace(action);
-        self.continuation = next.map(|boundary| Continuation::Solved {
-            boundary: Box::new(boundary),
-            path: ResolvePath::default(),
+        self.continuation = (!self.s.is_terminal()).then(|| Continuation::Solved {
+            boundary: Box::new(focus),
+            path: ResolvePath { steps: vec![PublicStep::Act(obs_key(&action))] },
         });
     }
 

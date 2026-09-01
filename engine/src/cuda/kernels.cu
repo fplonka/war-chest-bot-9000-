@@ -1228,13 +1228,11 @@ __global__ void k_terminals(const Tree* trees) {
 
 __global__ void k_choose_gather(const Tree* trees, const unsigned int* focus,
                                 const unsigned int* actual, const float* explore,
-                                const unsigned int* cap, const unsigned int* out_at,
-                                float* out) {
+                                const unsigned int* out_at, float* out) {
     unsigned int part = blockIdx.x;
     const Tree& t = trees[part];
     unsigned int node = focus[part];
     unsigned int n0 = t.nc[2 * node], n1 = t.nc[2 * node + 1];
-    unsigned int c0 = cap[2 * part], c1 = cap[2 * part + 1];
     unsigned int cells = t.kind[node] == 0 ? t.legal_off[t.legal_base[node] + t.nc[2 * node + t.player[node]]] : 0;
     float* dst = out + out_at[part];
     __shared__ unsigned int chosen;
@@ -1261,26 +1259,6 @@ __global__ void k_choose_gather(const Tree* trees, const unsigned int* focus,
     for (unsigned int k = threadIdx.x; k < n0 + n1; k += blockDim.x)
         dst[at + k] = t.carry[base + n0 + n1 + k];
     at += n0 + n1;
-    unsigned int child = chosen == NO_ROW ? NO_ROW : t.legal_child[t.soff[node] + chosen];
-    unsigned int child_n0 = child == NO_ROW ? 0 : t.nc[2 * child];
-    unsigned int child_n1 = child == NO_ROW ? 0 : t.nc[2 * child + 1];
-    unsigned int child_base = child == NO_ROW ? 0 : carry_base(t, child);
-    for (unsigned int p = 0; p < 2; ++p) {
-        unsigned int room = p == 0 ? c0 : c1;
-        unsigned int n = p == 0 ? child_n0 : child_n1;
-        unsigned int src = child_base + (p == 0 ? 0 : child_n0);
-        for (unsigned int k = threadIdx.x; k < room; k += blockDim.x)
-            dst[at + k] = k < n ? t.carry[src + k] : 0.0f;
-        at += room;
-    }
-    for (unsigned int p = 0; p < 2; ++p) {
-        unsigned int room = p == 0 ? c0 : c1;
-        unsigned int n = p == 0 ? child_n0 : child_n1;
-        unsigned int src = child_base + child_n0 + child_n1 + (p == 0 ? 0 : child_n0);
-        for (unsigned int k = threadIdx.x; k < room; k += blockDim.x)
-            dst[at + k] = k < n ? t.carry[src + k] : 0.0f;
-        at += room;
-    }
     for (unsigned int k = threadIdx.x; k < cells; k += blockDim.x)
         dst[at + k] = t.avg[t.soff[node] + k];
 }
