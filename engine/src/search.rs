@@ -46,8 +46,8 @@ pub struct Budget(pub [usize; 8]);
 
 impl Budget {
     pub fn for_s(s: u32) -> Budget {
-        let k = |at512: usize| (at512 * s as usize / 512).max(1);
-        let mut cap = BUDGET_512.0.map(k);
+        let growth = |at512: usize| (at512 * s as usize / 512).max(1);
+        let mut cap = std::array::from_fn(|i| BUDGET_512.0[i] + growth(BUDGET_512.0[i]));
         cap[Ent::Config as usize] += INITIAL_TREE_CONFIG_RANGES * MAX_CONFIG_SUPPORT;
         Budget(cap)
     }
