@@ -47,10 +47,9 @@ pub struct Budget(pub [usize; 8]);
 impl Budget {
     pub fn for_s(s: u32) -> Budget {
         let k = |at512: usize| (at512 * s as usize / 512).max(1);
-        let mut b = Budget(BUDGET_512.0.map(k));
-        b.0[Ent::Config as usize] = b.0[Ent::Config as usize]
-            .max((crate::pbs::HAND_CAP + 2) * crate::pbs::MAX_CONFIG_SUPPORT);
-        b
+        let mut cap = BUDGET_512.0.map(k);
+        cap[Ent::Config as usize] += INITIAL_TREE_CONFIG_RANGES * MAX_CONFIG_SUPPORT;
+        Budget(cap)
     }
 
     pub fn cap(&self, e: Ent) -> usize {
@@ -82,6 +81,7 @@ impl Default for Budget {
 }
 
 
+const INITIAL_TREE_CONFIG_RANGES: usize = 2 * NSLOT + 4;
 const BUDGET_512: Budget = Budget([16_595, 136_283, 346_018, 174_834, 10_090, 8_219, 921, 259_756]);
 
 #[derive(Clone, Copy)]
