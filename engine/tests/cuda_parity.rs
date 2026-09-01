@@ -515,18 +515,15 @@ fn explored_actions_retain_coherent_boundaries() {
         let (finished, solved) = run_solve(&device, solver);
         let SolveOutput::Play(play) = solved.as_ref().expect("a solved play") else { panic!("a play result") };
         let root = play.focus.public.clone();
-        let actor = root.state().to_act();
-        let fallback = play.next.as_ref().is_some_and(|boundary| {
-            boundary.public.state().is_chance() || boundary.public.state().to_act() == actor
-        });
+        let chance = play.next.as_ref().is_some_and(|boundary| boundary.public.state().is_chance());
         stream.keep(&finished, solved, &mut data);
         solver = stream.next_solve(&net, &mut data);
-        if fallback {
+        if chance {
             assert!(root.same_public(&solver.nodes[0].state));
             return;
         }
     }
-    panic!("exploration did not select a same-player continuation");
+    panic!("exploration did not select a chance continuation");
 }
 
 #[test]
