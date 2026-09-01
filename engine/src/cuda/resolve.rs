@@ -35,11 +35,11 @@ impl Card {
         let solves: Vec<usize> = mine.iter().map(|&i| calls[i].solve()).collect();
         self.lay(&solves)?;
         let fields = |call: &Call| match call {
-            Call::ReadPlay { touched, focus, focus_n, cells, actual, explore, .. } =>
-                (*touched, *focus, *focus_n, *cells, *actual, *explore),
-            Call::ReadRefresh { touched, focus, focus_n, cells, .. }
-            | Call::ReadTarget { touched, focus, focus_n, cells, .. } =>
-                (*touched, *focus, *focus_n, *cells, u32::MAX, 0.0),
+            Call::ReadPlay { touched, focus, carry, cells, actual, explore, .. } =>
+                (*touched, *focus, *carry, *cells, *actual, *explore),
+            Call::ReadRefresh { touched, focus, carry, cells, .. }
+            | Call::ReadTarget { touched, focus, carry, cells, .. } =>
+                (*touched, *focus, *carry, *cells, u32::MAX, 0.0),
             _ => unreachable!("read shard holds only read calls"),
         };
         let touched: Vec<i32> = mine
@@ -56,8 +56,8 @@ impl Card {
         let mut total = 0usize;
         for &i in mine {
             offsets.push(total as u32);
-            let (_, _, n, cells, _, _) = fields(&calls[i]);
-            total += 1 + 2 * (n[0] + n[1]) as usize + cells as usize;
+            let (_, _, carry, cells, _, _) = fields(&calls[i]);
+            total += 1 + carry as usize + cells as usize;
         }
         let mut b = self.batch.lock();
         b.touched.put(&self.stream, touched.len(), copy(&touched))?;

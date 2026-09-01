@@ -8,7 +8,7 @@ use warchest::contract::{Call, Reply};
 use warchest::net::Net;
 use warchest::pbs::{expand_row, obs_key, pack_row, true_config, Ctx, PUBFEAT, ROW_BYTES};
 use warchest::rng::Rng;
-use warchest::resolve::{apply_public_observation, gadget_iteration, SolveOutput};
+use warchest::resolve::{gadget_iteration, SolveOutput};
 use warchest::search::{Budget, Cfg, Cfr, Policy, Solver, Step};
 use warchest::selfplay::{make_game, Agent, Collect, Data, GameCfg, GameStream};
 
@@ -477,7 +477,7 @@ fn played_session_carries_across_a_round_boundary() {
 }
 
 #[test]
-fn explored_action_is_resolved_from_the_prior_boundary() {
+fn explored_action_retains_its_solved_child() {
     let net = Arc::new(Net::random(0xE1));
     let cfg = Cfg { s: 1, c: 0.0, batch: 1, ..Default::default() };
     let mut gc = game_cfg_of(cfg);
@@ -487,22 +487,24 @@ fn explored_action_is_resolved_from_the_prior_boundary() {
     let solver = stream.next_solve(&net, &mut data);
     let (solver, solved) = run_solve(&Backend(gpu(7)), solver);
     let SolveOutput::Play(play) = solved.as_ref().expect("a solved play") else { panic!("a play result") };
-    let key = obs_key(&play.action);
-    let ranges = play.focus.range.clone();
-    let actor = play.focus.public.state().to_act() as usize;
-    let expected = apply_public_observation(&play.focus.public, &ranges[actor], key)
-        .expect("the played observation is reachable").0;
+    let retained = play.next.as_ref().expect("the explored child is live");
+    let expected_public = retained.public.clone();
+    let state = play.focus.public.state();
+    let actor = state.to_act() as usize;
+    let prior = &play.focus.range[actor];
+    let behavior = warchest::policy::uniform(&state, &Ctx::new(&state), actor as u8, &prior.cfg);
+    let expected_range = behavior.posterior(prior, obs_key(&play.action));
     stream.keep(&solver, solved, &mut data);
     let mut next = stream.next_solve(&net, &mut data);
     let Step::Calls(calls) = next.advance(&[]) else { panic!("a re-solve starts") };
-    let (resolver, previous) = calls.iter().find_map(|call| match call {
-        Call::Gadget { resolver, previous, .. } => Some((*resolver, previous)),
+    let previous = calls.iter().find_map(|call| match call {
+        Call::Gadget { resolver, previous, .. } if *resolver as usize == 1 - actor => Some(previous),
         _ => None,
-    }).expect("the prior boundary is retained");
-    assert!(worst(&ranges[1 - resolver as usize].p, previous, "retained range") < 2e-6);
+    }).expect("the child boundary is retained");
+    assert!(worst(&expected_range.p, previous, "retained range") < 2e-6);
     let carried: Vec<_> = next.nodes.iter().filter(|node| node.carry).collect();
-    assert_eq!(carried.len(), 1);
-    assert!(expected.same_public(&carried[0].state));
+    assert_eq!(carried.len(), next.nodes[0].child.len() + 1);
+    assert!(expected_public.same_public(&next.nodes[0].state));
 }
 
 #[test]
@@ -547,9 +549,8 @@ fn gadget_and_carry_match_one_cpu_iteration() {
     let root = &second.nodes[0];
     let root_at = root.roff as usize + if opponent == 0 { 0 } else { root.nc[0] as usize };
     assert!(worst(&expected, &resident.reach[root_at..root_at + n], "gadget range") < 2e-6);
-    let focus = second.nodes.iter().position(|node| node.carry).expect("a carried focus");
-    assert_eq!(second.nodes.iter().filter(|node| node.carry).count(), 1);
-    let focus = &second.nodes[focus];
+    assert!(second.nodes[0].carry);
+    let focus = &second.nodes[0];
     let counts = focus.nc.map(|x| x as usize);
     let reach_n = counts[0] + counts[1];
     assert!(resident.carry[..reach_n].iter().all(|x| x.is_finite() && *x >= 0.0));

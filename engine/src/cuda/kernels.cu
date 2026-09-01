@@ -493,16 +493,6 @@ __device__ __forceinline__ unsigned int rbase(const Tree& t, unsigned int i, int
     return t.roff[i] + (p == 1 ? t.nc[2 * i] : 0);
 }
 
-__device__ __forceinline__ unsigned int carry_base(const Tree& t, unsigned int node) {
-    unsigned int at = 0;
-    for (unsigned int i = 0; i < t.ncarry; ++i) {
-        unsigned int carried = t.carry_node[i];
-        if (carried == node) return at;
-        at += 2 * (t.nc[2 * carried] + t.nc[2 * carried + 1]);
-    }
-    return NO_ROW;
-}
-
 enum GadgetField { G_PREVIOUS, G_TERM, G_REGRET_T, G_REGRET_F, G_STRATEGY_T, G_STRATEGY_F };
 
 __device__ void set_gadget_range(const Tree& t, unsigned int opponent,
@@ -1232,12 +1222,10 @@ __global__ void k_choose_gather(const Tree* trees, const unsigned int* focus,
     unsigned int part = blockIdx.x;
     const Tree& t = trees[part];
     unsigned int node = focus[part];
-    unsigned int n0 = t.nc[2 * node], n1 = t.nc[2 * node + 1];
     unsigned int cells = t.kind[node] == 0 ? t.legal_off[t.legal_base[node] + t.nc[2 * node + t.player[node]]] : 0;
     float* dst = out + out_at[part];
-    __shared__ unsigned int chosen;
     if (threadIdx.x == 0) {
-        chosen = NO_ROW;
+        unsigned int chosen = NO_ROW;
         if (actual[part] != NO_ROW) {
             unsigned int lb = t.legal_base[node];
             unsigned int a = t.legal_off[lb + actual[part]];
@@ -1250,17 +1238,15 @@ __global__ void k_choose_gather(const Tree* trees, const unsigned int* focus,
         }
         dst[0] = __uint_as_float(chosen);
     }
-    __syncthreads();
-    unsigned int at = 1;
-    unsigned int base = carry_base(t, node);
-    for (unsigned int k = threadIdx.x; k < n0 + n1; k += blockDim.x)
-        dst[at + k] = t.carry[base + k];
-    at += n0 + n1;
-    for (unsigned int k = threadIdx.x; k < n0 + n1; k += blockDim.x)
-        dst[at + k] = t.carry[base + n0 + n1 + k];
-    at += n0 + n1;
+    unsigned int carried = 0;
+    for (unsigned int i = 0; i < t.ncarry; ++i) {
+        unsigned int k = t.carry_node[i];
+        carried += 2 * (t.nc[2 * k] + t.nc[2 * k + 1]);
+    }
+    for (unsigned int k = threadIdx.x; k < carried; k += blockDim.x)
+        dst[1 + k] = t.carry[k];
     for (unsigned int k = threadIdx.x; k < cells; k += blockDim.x)
-        dst[at + k] = t.avg[t.soff[node] + k];
+        dst[1 + carried + k] = t.avg[t.soff[node] + k];
 }
 
 __global__ void k_finish(const Tree* trees, const unsigned int* work, int at,

@@ -1,8 +1,6 @@
 use crate::actions::Action;
 use crate::arena::{Draft, Obs};
 use crate::pbs::{belief_after_draw, faceup_counts, reserve, set_config, true_config, Belief, Config, Ctx};
-#[cfg(feature = "gpu")]
-use crate::pbs::obs_key;
 use crate::resolve::{apply_public_observation, Continuation, PublicState, PublicStep};
 use crate::state::{Cont, State};
 
@@ -201,14 +199,13 @@ impl Session {
             return Err("play solve returned the wrong result type".into());
         };
         let action = solved.action;
-        let key = obs_key(&action);
-        self.support = std::array::from_fn(|p| solved.focus.range[p].cfg.clone());
-        self.support[self.seat as usize] =
-            apply_public_observation(&solved.focus.public, &solved.focus.range[self.seat as usize], key)?.1.cfg;
+        if let Some(next) = &solved.next {
+            self.support = std::array::from_fn(|p| next.range[p].cfg.clone());
+        }
         self.s.apply_inplace(action);
-        self.continuation = (!self.s.is_terminal()).then(|| Continuation::Solved {
-            boundary: Box::new(solved.focus),
-            path: ResolvePath { steps: vec![PublicStep::Act(key)] },
+        self.continuation = solved.next.map(|boundary| Continuation::Solved {
+            boundary: Box::new(boundary),
+            path: ResolvePath::default(),
         });
         Ok(action.encode())
     }

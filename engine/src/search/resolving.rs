@@ -225,6 +225,11 @@ impl Solver {
             node.carry = false;
         }
         self.nodes[self.focus].carry = true;
+        if matches!(self.finish, Finish::Play(_)) {
+            for child in self.nodes[self.focus].child.clone() {
+                self.nodes[child].carry = true;
+            }
+        }
         if self.focus != 0 {
             for i in 0..self.nodes.len() {
                 if self.nodes[i].leaf && !self.is_below(i, self.focus) {
@@ -251,10 +256,15 @@ impl Solver {
         }
     }
 
+    fn carry_len(&self) -> usize {
+        self.nodes.iter().filter(|node| node.carry)
+            .map(|node| 2 * node.nc.iter().sum::<u32>() as usize).sum()
+    }
+
     pub(super) fn read_round(&mut self) -> Vec<Call> {
         let mut calls = self.opening_calls();
         let node = &self.nodes[self.focus];
-        let common = (self.slot, self.avg_touched, self.focus as u32, node.nc, node.legal_action.len() as u32);
+        let common = (self.slot, self.avg_touched, self.focus as u32, self.carry_len() as u32, node.legal_action.len() as u32);
         match &self.finish {
             Finish::Play(actual) => {
                 let actor = node.player as usize;
@@ -265,7 +275,7 @@ impl Solver {
                     solve: common.0,
                     touched: common.1,
                     focus: common.2,
-                    focus_n: common.3,
+                    carry: common.3,
                     cells: common.4,
                     actual: index,
                     explore: self.explore,
@@ -275,14 +285,14 @@ impl Solver {
                 solve: common.0,
                 touched: common.1,
                 focus: common.2,
-                focus_n: common.3,
+                carry: common.3,
                 cells: common.4,
             }),
             Finish::Target => calls.push(Call::ReadTarget {
                 solve: common.0,
                 touched: common.1,
                 focus: common.2,
-                focus_n: common.3,
+                carry: common.3,
                 cells: common.4,
             }),
         }
@@ -293,15 +303,14 @@ impl Solver {
         let focus = self.focus;
         let node = &self.nodes[focus];
         let n = node.nc.map(|x| x as usize);
-        let expected = 1 + 2 * (n[0] + n[1]) + node.legal_action.len();
+        let policy_at = 1 + self.carry_len();
+        let expected = policy_at + node.legal_action.len();
         if r.a.len() != expected {
             return Err(format!("GPU read returned {} values, expected {expected}", r.a.len()));
         }
-        let mut at = 1usize;
-        let focus_reach = [&r.a[at..at + n[0]], &r.a[at + n[0]..at + n[0] + n[1]]];
-        at += n[0] + n[1];
-        let focus_value = [&r.a[at..at + n[0]], &r.a[at + n[0]..at + n[0] + n[1]]];
-        at += n[0] + n[1];
+        let value_at = 1 + n[0] + n[1];
+        let focus_reach = [&r.a[1..1 + n[0]], &r.a[1 + n[0]..value_at]];
+        let focus_value = [&r.a[value_at..value_at + n[0]], &r.a[value_at + n[0]..value_at + n[0] + n[1]]];
         let focus_boundary = self.boundary(focus, focus_reach, focus_value)?;
         let queries = std::mem::take(&mut self.queries);
         match self.finish {
@@ -310,16 +319,33 @@ impl Solver {
                 if cell >= self.nodes[focus].legal_action.len() {
                     return Err("the GPU selected a cell outside the focus row".into());
                 }
+                let child = self.nodes[focus].legal_child[cell] as usize;
+                if child >= self.nodes.len() || !self.nodes[child].carry {
+                    return Err("the GPU selected an invalid continuation child".into());
+                }
+                let child_at = value_at + n[0] + n[1] + node.child.iter()
+                    .take_while(|&&c| c != child)
+                    .map(|&c| 2 * self.nodes[c].nc.iter().sum::<u32>() as usize)
+                    .sum::<usize>();
+                let cn = self.nodes[child].nc.map(|x| x as usize);
+                let child_value = child_at + cn[0] + cn[1];
+                let next_reach = [&r.a[child_at..child_at + cn[0]], &r.a[child_at + cn[0]..child_value]];
+                let next_value = [&r.a[child_value..child_value + cn[0]], &r.a[child_value + cn[0]..child_value + cn[0] + cn[1]]];
+                let action = self.nodes[focus].acts[self.nodes[focus].legal_action[cell] as usize];
+                let next = (!self.nodes[child].state.is_terminal())
+                    .then(|| self.boundary(child, next_reach, next_value))
+                    .transpose()?;
                 Ok(SolveOutput::Play(Box::new(PlaySolved {
-                    action: self.nodes[focus].acts[self.nodes[focus].legal_action[cell] as usize],
-                    policy: self.policy_at(focus, &r.a[at..]),
+                    action,
+                    policy: self.policy_at(focus, &r.a[policy_at..]),
                     focus: focus_boundary,
+                    next,
                     queries,
                 })))
             }
             Finish::Refresh => Ok(SolveOutput::Refresh(Box::new(RefreshSolved { focus: focus_boundary, queries }))),
             Finish::Target => {
-                let policy = self.policy_at(focus, &r.a[at..]);
+                let policy = self.policy_at(focus, &r.a[policy_at..]);
                 Ok(SolveOutput::Target(Box::new(TargetSolved {
                     policy,
                     values: focus_boundary.cfv,

@@ -137,6 +137,7 @@ pub struct PlaySolved {
     pub action: Action,
     pub policy: Policy,
     pub focus: Boundary,
+    pub next: Option<Boundary>,
     pub queries: Vec<(State, [Belief; 2])>,
 }
 
