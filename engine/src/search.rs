@@ -105,7 +105,7 @@ impl Default for Cfg {
     fn default() -> Self {
         Cfg {
             s: 512,
-            c: 8.0,
+            c: 1.0,
             rounds: 0,
             cfr: Cfr::SOG,
             puct: 1.5,
