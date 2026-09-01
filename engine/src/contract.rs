@@ -49,7 +49,6 @@ pub enum Call {
     Iterate {
         solve: usize,
         step: usize,
-        iters: usize,
         expand: usize,
         query: Vec<QueryPick>,
         cfr: Cfr,
@@ -82,7 +81,6 @@ pub enum Call {
 
 #[derive(Clone, Copy)]
 pub struct QueryPick {
-    pub iter: u32,
     pub reach: u32,
     pub len: u32,
 }

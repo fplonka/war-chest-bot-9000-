@@ -31,7 +31,7 @@ pub fn tree_source() -> String {
     for tail in ["unsigned long long* seed", "float* gadget", "float* carry", "const unsigned int* carry_node",
                  "unsigned long long ngadget", "unsigned long long resolver", "unsigned long long ncarry",
                  "unsigned long long nterm", "unsigned long long nvals", "unsigned long long step",
-                 "unsigned long long todo", "unsigned long long nexpand"] {
+                 "unsigned long long nexpand"] {
         out += &format!("    {tail};\n");
     }
     out + "};\n"
@@ -93,7 +93,7 @@ const TABLE: [Col; 53] = [
     Col { ent: Ent::Row, width: 1, dst: Some(Dst::Term), name: "term", ty: CU },
 ];
 
-pub const DESC: usize = TABLE.len() + 12;
+pub const DESC: usize = TABLE.len() + 11;
 
 const fn fields() -> [usize; 8] {
     let mut f = [0; 8];
@@ -362,7 +362,6 @@ pub struct Solve {
     pub level_start: Vec<u32>,
     pub seed: Arr<u64>,
     pub step: usize,
-    pub todo: usize,
     pub nexpand: usize,
 }
 
@@ -403,7 +402,6 @@ impl Solve {
             level_start: Vec::new(),
             seed: Arr::with_cap(s, 1)?,
             step: 0,
-            todo: 0,
             nexpand: 0,
         })
     }
@@ -434,7 +432,6 @@ impl Solve {
         self.ncells = 0;
         self.nreach = 0;
         self.step = 0;
-        self.todo = 0;
         self.nexpand = 0;
         self.level_start.clear();
         self.ent[Ent::Node as usize].rewind();
@@ -525,8 +522,7 @@ impl Solve {
         out[i + 7] = self.nterm as u64;
         out[i + 8] = self.nvals as u64;
         out[i + 9] = self.step as u64;
-        out[i + 10] = self.todo as u64;
-        out[i + 11] = self.nexpand as u64;
+        out[i + 10] = self.nexpand as u64;
         out
     }
 }

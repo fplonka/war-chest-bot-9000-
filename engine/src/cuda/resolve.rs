@@ -95,11 +95,11 @@ impl Card {
         .map_err(err)
     }
 
-    pub(super) fn gadget_update(&self, b: &Batch, iter: i32, k: Cfr) -> Res<()> {
+    pub(super) fn gadget_update(&self, b: &Batch, k: Cfr) -> Res<()> {
         unsafe {
             self.stream
                 .launch_builder(&self.k.gadget_update)
-                .arg(b.trees.buf()).arg(&iter).arg(&k.alpha).arg(&k.beta).arg(&k.gamma)
+                .arg(b.trees.buf()).arg(&k.alpha).arg(&k.beta).arg(&k.gamma)
                 .launch_unit(Self::grid(b.parts, 1))
         }
         .map_err(err)

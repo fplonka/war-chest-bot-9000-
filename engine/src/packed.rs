@@ -10,7 +10,6 @@ use crate::search::{Budget, Cfg, Cfr};
 pub struct Search {
     pub s: u32,
     pub c: f32,
-    pub batch: usize,
     pub rounds: u8,
     pub puct: f32,
     pub prior_temp: f32,
@@ -22,7 +21,6 @@ impl Search {
         Ok(Cfg {
             s: self.s,
             c: self.c,
-            batch: self.batch,
             rounds: self.rounds,
             puct: self.puct,
             prior_temp: self.prior_temp,
