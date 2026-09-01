@@ -510,7 +510,6 @@ pub struct Solver {
     pub nreach: usize,
     pub nvals: usize,
     budget_hit: u8,
-    growth_budget: Budget,
     wants_prior: Vec<u32>,
     pub(crate) step: usize,
     focus: usize,
