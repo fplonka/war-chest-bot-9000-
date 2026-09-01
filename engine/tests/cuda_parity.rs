@@ -477,20 +477,23 @@ fn played_session_carries_across_a_round_boundary() {
 }
 
 #[test]
-fn explored_action_retains_its_solved_child() {
+fn explored_actions_retain_coherent_boundaries() {
     let net = Arc::new(Net::random(0xE1));
     let cfg = Cfg { s: 1, c: 0.0, batch: 1, ..Default::default() };
     let mut gc = game_cfg_of(cfg);
     gc.explore = 1.0;
+    let device = Backend(gpu(7));
     let mut stream = GameStream::new(0xE1, gc);
     let mut data = Data::default();
     let solver = stream.next_solve(&net, &mut data);
-    let (solver, solved) = run_solve(&Backend(gpu(7)), solver);
+    let (solver, solved) = run_solve(&device, solver);
     let SolveOutput::Play(play) = solved.as_ref().expect("a solved play") else { panic!("a play result") };
     let retained = play.next.as_ref().expect("the explored child is live");
     let expected_public = retained.public.clone();
     let state = play.focus.public.state();
     let actor = state.to_act() as usize;
+    assert!(!retained.public.state().is_chance());
+    assert_ne!(retained.public.state().to_act() as usize, actor);
     let prior = &play.focus.range[actor];
     let behavior = warchest::policy::uniform(&state, &Ctx::new(&state), actor as u8, &prior.cfg);
     let expected_range = behavior.posterior(prior, obs_key(&play.action));
@@ -505,6 +508,25 @@ fn explored_action_retains_its_solved_child() {
     let carried: Vec<_> = next.nodes.iter().filter(|node| node.carry).collect();
     assert_eq!(carried.len(), next.nodes[0].child.len() + 1);
     assert!(expected_public.same_public(&next.nodes[0].state));
+
+    let mut stream = GameStream::new(0xE2, gc);
+    let mut solver = stream.next_solve(&net, &mut data);
+    for _ in 0..64 {
+        let (finished, solved) = run_solve(&device, solver);
+        let SolveOutput::Play(play) = solved.as_ref().expect("a solved play") else { panic!("a play result") };
+        let root = play.focus.public.clone();
+        let actor = root.state().to_act();
+        let fallback = play.next.as_ref().is_some_and(|boundary| {
+            boundary.public.state().is_chance() || boundary.public.state().to_act() == actor
+        });
+        stream.keep(&finished, solved, &mut data);
+        solver = stream.next_solve(&net, &mut data);
+        if fallback {
+            assert!(root.same_public(&solver.nodes[0].state));
+            return;
+        }
+    }
+    panic!("exploration did not select a same-player continuation");
 }
 
 #[test]

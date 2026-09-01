@@ -379,8 +379,16 @@ impl Game {
             );
         }
         self.queries.extend(queries);
-        if let Some(next) = next.as_mut() {
-            let actor = self.s.to_act() as usize;
+        let actor = self.s.to_act() as usize;
+        let reuse_focus = self.gc.explore > 0.0 && next.as_ref().is_some_and(|boundary| {
+            let state = boundary.public.state();
+            state.is_chance() || state.to_act() as usize == actor
+        });
+        let mut path = ResolvePath::default();
+        if reuse_focus {
+            next = Some(focus);
+            path.steps.push(PublicStep::Act(obs_key(&action)));
+        } else if let Some(next) = next.as_mut() {
             let prior = &focus.range[actor];
             let mut behavior = policy::NodePolicy::frame(&self.s, &self.ctx, actor as u8, &prior.cfg);
             behavior.probs.copy_from_slice(&policy.p);
@@ -393,7 +401,7 @@ impl Game {
         self.s.apply_inplace(action);
         self.continuation = next.map(|boundary| Continuation::Solved {
             boundary: Box::new(boundary),
-            path: ResolvePath::default(),
+            path,
         });
     }
 
