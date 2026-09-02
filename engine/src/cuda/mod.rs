@@ -1710,67 +1710,94 @@ impl Card {
         fn at(stage: &'static str) -> impl Fn(String) -> String {
             move |e| format!("{stage}: {e}")
         }
-        let Call::Iterate { puct, cfr, .. } = &calls[mine[0]] else {
-            unreachable!("iterate shard holds only iterate calls")
+        let mut order: Vec<usize> = mine.to_vec();
+        order.sort_by_key(|&i| std::cmp::Reverse(Self::asked(&calls[i]).0));
+        let (rounds, puct, k) = {
+            let Call::Iterate { iters, puct, cfr, .. } = &calls[order[0]] else {
+                unreachable!("iterate shard holds only iterate calls")
+            };
+            (*iters, *puct, *cfr)
         };
-        let (puct, k) = (*puct, *cfr);
         let mut sims = 0usize;
+        let mut query_at = vec![0usize; calls.len()];
+        let mut query_len = vec![0usize; calls.len()];
         let mut query_total = 0usize;
-        let mut query_spans = Vec::with_capacity(mine.len());
         {
-            let mut solves = self.solves.lock();
-            for &i in mine {
-                let Call::Iterate { solve, step, expand, query, .. } = &calls[i] else {
+            let mut g = self.solves.lock();
+            for &i in &order {
+                let Call::Iterate { solve, step, iters, expand, query, cfr, puct: p, .. } = &calls[i]
+                else {
                     unreachable!("iterate shard holds only iterate calls")
                 };
-                let resident = self.slot(&mut solves, *solve);
-                resident.step = *step;
-                resident.nexpand = *expand;
+                assert_eq!((cfr.alpha, cfr.beta, cfr.gamma, cfr.predict, *p),
+                           (k.alpha, k.beta, k.gamma, k.predict, puct),
+                           "a round mixes two regret rules");
+                let b = self.slot(&mut g, *solve);
+                b.step = *step;
+                b.todo = *iters;
+                b.nexpand = *expand;
                 sims = sims.max(*expand);
-                let start = query_total;
-                query_total += query.iter().map(|q| q.len as usize).sum::<usize>();
-                query_spans.push(start..query_total);
+                query_at[i] = query_total;
+                debug_assert!(
+                    query.iter().all(|q| (q.iter as usize) < *iters),
+                    "query pick is outside its solve's live iterations"
+                );
+                query_len[i] = query.iter().map(|q| q.len as usize).sum();
+                query_total += query_len[i];
             }
         }
-        let slots: Vec<usize> = mine.iter().map(|&i| calls[i].solve()).collect();
-        self.lay(&slots).map_err(at("lay"))?;
+        let solves: Vec<usize> = order.iter().map(|&i| calls[i].solve()).collect();
+        self.lay(&solves).map_err(at("lay"))?;
         let b = self.batch.lock();
         self.scratch.lock().queries.room(query_total)?;
 
         self.gadget_seed(&b).map_err(at("gadget seed"))?;
-        self.reaches(&b, b.all()).map_err(at("reach"))?;
-        if query_total > 0 {
-            let solves = self.solves.lock();
-            let mut scratch = self.scratch.lock();
-            let dst = scratch.queries.buf.as_mut().expect("query scratch is carved");
-            for (part, &i) in mine.iter().enumerate() {
-                let Call::Iterate { solve, query, .. } = &calls[i] else {
-                    unreachable!("iterate shard holds only iterate calls")
-                };
-                let mut to = query_spans[part].start;
-                for q in query {
-                    solves[*solve].ent[Ent::Reach as usize].copy_f32_to(
-                        &self.stream,
-                        R_REACH,
-                        q.reach as usize,
-                        dst,
-                        to,
-                        q.len as usize,
-                    )?;
-                    to += q.len as usize;
+        self.reaches(&b, b.all(), 0, 0).map_err(at("reach"))?;
+        for iter in 0..rounds {
+            let live = order
+                .iter()
+                .position(|&i| Self::asked(&calls[i]).0 <= iter)
+                .unwrap_or(order.len());
+            let p = &b.upto[live];
+            let it = iter as i32;
+            if query_total > 0 {
+                let solves = self.solves.lock();
+                let mut scratch = self.scratch.lock();
+                let dst = scratch.queries.buf.as_mut().expect("query scratch is carved");
+                for &i in &order[..live] {
+                    let Call::Iterate { solve, query, .. } = &calls[i] else {
+                        unreachable!("iterate shard holds only iterate calls")
+                    };
+                    let mut to = query_at[i];
+                    for q in query {
+                        if q.iter as usize == iter {
+                            solves[*solve].ent[Ent::Reach as usize].copy_f32_to(
+                                &self.stream,
+                                R_REACH,
+                                q.reach as usize,
+                                dst,
+                                to,
+                                q.len as usize,
+                            )?;
+                        }
+                        to += q.len as usize;
+                    }
                 }
             }
+            self.network(&b, p).map_err(at("net"))?;
+            self.terminals(b.trees.buf(), p).map_err(at("terminals"))?;
+            self.backprop(&b, p, 0, it, k).map_err(at("backprop"))?;
+            self.gadget_update(&b, it, k).map_err(at("iteration summary"))?;
+            self.reaches(&b, p, 0, it).map_err(at("reach"))?;
+            if sims > 0 {
+                {
+                    self.expand(b.trees.buf(), b.parts, sims, puct, iter, rounds)
+                }
+                .map_err(at("expand"))?;
+            }
         }
-        let p = b.all();
-        self.network(&b, p).map_err(at("net"))?;
-        self.terminals(b.trees.buf(), p).map_err(at("terminals"))?;
-        self.backprop(&b, p, k).map_err(at("backprop"))?;
-        self.gadget_update(&b, k).map_err(at("iteration summary"))?;
-        self.reaches(&b, p).map_err(at("reach"))?;
-        if sims > 0 {
-            self.expand(b.trees.buf(), b.parts, sims, puct).map_err(at("expand"))?;
-        }
-        let host = self.sampled(b.parts as usize * sims)?;
+        let each = b.parts as usize * sims;
+        let host = self.sampled(rounds * each)?;
         let query_host = if query_total == 0 {
             Vec::new()
         } else {
@@ -1778,16 +1805,25 @@ impl Card {
             let src = scratch.queries.buf.as_ref().expect("query scratch is carved");
             self.down_f.lock().recv(&self.stream, &src.slice(..query_total))?
         };
-        for (part, &i) in mine.iter().enumerate() {
-            let Call::Iterate { expand, .. } = &calls[i] else {
-                unreachable!("iterate shard holds only iterate calls")
-            };
-            let at = part * sims;
-            let leaves = host[at..at + expand].to_vec();
-            let c = query_host[query_spans[part].clone()].to_vec();
+        for (part, &i) in order.iter().enumerate() {
+            let (iters, want) = Self::asked(&calls[i]);
+            let mut leaves = Vec::with_capacity(iters * want);
+            for phase in 0..iters {
+                let at = phase * each + part * sims;
+                leaves.extend_from_slice(&host[at..at + want]);
+            }
+            let q = query_at[i];
+            let c = query_host[q..q + query_len[i]].to_vec();
             out.push((i, Reply { c, leaves, ..Default::default() }));
         }
         Ok(())
+    }
+
+    fn asked(c: &Call) -> (usize, usize) {
+        match c {
+            Call::Iterate { iters, expand, .. } => (*iters, *expand),
+            _ => unreachable!("iterate shard holds only iterate calls"),
+        }
     }
 
     fn grid(items: u32, split: u32) -> LaunchConfig {
@@ -1798,7 +1834,7 @@ impl Card {
         }
     }
 
-    fn reaches(&self, b: &Batch, p: &Prefix) -> Res<()> {
+    fn reaches(&self, b: &Batch, p: &Prefix, avg: i32, iter: i32) -> Res<()> {
         let (trees, work) = (b.trees.buf(), b.work.buf());
         for level in 1..p.items.len() {
             if p.items[level] == 0 {
@@ -1808,7 +1844,7 @@ impl Card {
             unsafe {
                 self.stream
                     .launch_builder(&self.k.reach_sweep)
-                    .arg(trees).arg(work).arg(&at).arg(&level_i)
+                    .arg(trees).arg(work).arg(&at).arg(&level_i).arg(&avg).arg(&iter)
                     .launch_unit(Self::grid(p.items[level], 2))
             }
             .map_err(err)?;
@@ -1816,7 +1852,7 @@ impl Card {
         Ok(())
     }
 
-    fn backprop(&self, b: &Batch, p: &Prefix, k: Cfr) -> Res<()> {
+    fn backprop(&self, b: &Batch, p: &Prefix, avg: i32, iter: i32, k: Cfr) -> Res<()> {
         for level in (0..p.items.len()).rev() {
             if p.items[level] == 0 {
                 continue;
@@ -1825,7 +1861,7 @@ impl Card {
             unsafe {
                 self.stream
                     .launch_builder(&self.k.backprop_sweep)
-                    .arg(b.trees.buf()).arg(b.work.buf()).arg(&at).arg(&level_i)
+                    .arg(b.trees.buf()).arg(b.work.buf()).arg(&at).arg(&level_i).arg(&avg).arg(&iter)
                     .arg(&k.alpha).arg(&k.beta).arg(&k.gamma).arg(&k.predict)
                     .launch_unit(Self::grid(p.items[level], 2))
             }
@@ -1893,14 +1929,18 @@ impl Card {
         .map_err(err)
     }
 
-    fn expand(&self, trees: &CudaSlice<u64>, parts: u32, sims: usize, puct: f32) -> Res<()> {
+    fn expand(&self, trees: &CudaSlice<u64>, parts: u32, sims: usize, puct: f32,
+              iter: usize, iters: usize) -> Res<()> {
+        let each = parts as usize * sims;
         let mut sc = self.scratch.lock();
-        let out = sc.leaves.room((parts as usize * sims).max(1))?;
+        let out = sc.leaves.room((iters * each).max(1))?;
         let (parts_i, sims_i) = (parts as i32, sims as i32);
         unsafe {
             self.stream
                 .launch_builder(&self.k.expand)
                 .arg(trees).arg(out).arg(&parts_i).arg(&sims_i).arg(&puct)
+                .arg(&(iter as i32))
+                .arg(&(each as i32))
                 .arg(&(crate::search::TRIES as i32))
                 .launch_unit(LaunchConfig {
                     grid_dim: (parts.max(1), 1, 1),

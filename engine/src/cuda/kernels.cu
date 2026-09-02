@@ -510,10 +510,11 @@ __global__ void k_gadget_seed(const Tree* trees) {
                      t.gadget + G_STRATEGY_F * t.ngadget);
 }
 
-__global__ void k_gadget_update(const Tree* trees, float alpha, float beta,
-                                float gamma) {
+__global__ void k_gadget_update(const Tree* trees, int iter, float alpha,
+                                float beta, float gamma) {
     const Tree& t = trees[blockIdx.x];
-    float m = (float)t.step + 1.0f;
+    if ((unsigned long long)iter >= t.todo) return;
+    float m = (float)(t.step + (unsigned long long)iter) + 1.0f;
     float dg = powf((m - 1.0f) / m, gamma);
     unsigned int reach_at = 0;
     for (unsigned int i = 0; i < t.ncarry; ++i) {
@@ -558,10 +559,11 @@ __global__ void k_gadget_update(const Tree* trees, float alpha, float beta,
 }
 
 __global__ void k_reach_sweep(const Tree* trees, const unsigned int* work, int at,
-                              int level) {
+                              int level, int avg, int iter) {
     unsigned int item = work[at + blockIdx.x];
     const Tree& t = trees[item >> WORK_BITS];
-    const float* strat = t.cur;
+    if ((unsigned long long)iter >= t.todo) return;
+    const float* strat = avg ? t.avg : t.cur;
     unsigned int node = work_node(t, level, item);
     unsigned int par = t.parent[node];
     if (par == NO_ROW) return;
@@ -595,10 +597,11 @@ __global__ void k_reach_sweep(const Tree* trees, const unsigned int* work, int a
 }
 
 __global__ void k_backprop_sweep(const Tree* trees, const unsigned int* work, int at,
-                                 int level, float alpha, float beta, float gamma,
-                                 float predict) {
+                                 int level, int avg, int iter,
+                                 float alpha, float beta, float gamma, float predict) {
     unsigned int item = work[at + blockIdx.x];
     const Tree& t = trees[item >> WORK_BITS];
+    if ((unsigned long long)iter >= t.todo) return;
     int traverser = blockIdx.y;
     float* vals = t.vals + traverser * t.nvals;
     unsigned int node = work_node(t, level, item);
@@ -637,7 +640,20 @@ __global__ void k_backprop_sweep(const Tree* trees, const unsigned int* work, in
 
     unsigned int so = t.soff[node], lb = t.legal_base[node];
     unsigned int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
-    float m = (float)t.step + 1.0f;
+    if (avg) {
+        for (unsigned int c = warp; c < n; c += warps) {
+            unsigned int a = t.legal_off[lb + c], b = t.legal_off[lb + c + 1];
+            float base = 0.0f;
+            for (unsigned int cell = a + lane; cell < b; cell += 32) {
+                unsigned int vc = t.cell_val[so + cell];
+                if (vc != NO_ROW) base += vals[vc] * t.avg[so + cell];
+            }
+            base = warp_sum(base);
+            if (lane == 0) vals[vi + c] = base;
+        }
+        return;
+    }
+    float m = (float)(t.step + (unsigned long long)iter) + 1.0f;
     float da = cfr_factor(m, alpha), db = cfr_factor(m, beta);
     float dg = powf((m - 1.0f) / m, gamma);
     unsigned int ra = rbase(t, node, traverser);
@@ -1114,15 +1130,15 @@ __global__ void k_prior(const Tree* trees, const unsigned int* part,
 }
 
 __global__ void k_expand(const Tree* trees, unsigned int* out, int parts,
-                         int sims, float c_puct, int tries) {
+                         int sims, float c_puct, int iter, int each, int tries) {
     int part = blockIdx.x;
     if (part >= parts) return;
     const Tree& t = trees[part];
-    unsigned int* taken = out + (size_t)part * sims;
+    unsigned int* taken = out + (size_t)iter * each + (size_t)part * sims;
     if (threadIdx.x == 0)
         for (int sim = 0; sim < sims; ++sim) taken[sim] = NO_ROW;
     __syncwarp();
-    if (t.nexpand == 0) return;
+    if ((unsigned long long)iter >= t.todo || t.nexpand == 0) return;
     unsigned long long s = *t.seed;
     unsigned int n0 = t.nc[0], n1 = t.nc[1];
     const float* root = t.reach + t.roff[0];
@@ -1171,8 +1187,10 @@ __global__ void k_expand(const Tree* trees, unsigned int* out, int parts,
         }
         if (found == NO_ROW) continue;
         bool dup = false;
-        for (int k = threadIdx.x; k < sims; k += 32)
-            dup |= taken[k] == found;
+        for (int k = threadIdx.x; k < (iter + 1) * sims; k += 32) {
+            const unsigned int* r = out + (size_t)(k / sims) * each + (size_t)part * sims;
+            dup |= r[k % sims] == found;
+        }
         if (!__any_sync(0xffffffff, dup)) {
             if (threadIdx.x == 0) taken[got] = found;
             __syncwarp();

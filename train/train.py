@@ -782,6 +782,7 @@ def main():
             "search": {
                 "s": args.s,
                 "c": args.c,
+                "batch": args.round_batch,
                 "rounds": args.rounds,
                 "cfr": args.cfr,
                 "puct": args.puct,
@@ -835,6 +836,7 @@ def main():
             args.gen_workers,
             s=args.s,
             c=args.c,
+            batch=args.round_batch,
             rounds=args.rounds,
             explore=args.explore,
             random_draft=args.random_draft,

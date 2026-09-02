@@ -94,6 +94,7 @@ const BUDGET_512: Budget = Budget([16_595, 136_283, 346_018, 174_834, 10_090, 8_
 pub struct Cfg {
     pub s: u32,
     pub c: f32,
+    pub batch: usize,
     pub rounds: u8,
     pub cfr: Cfr,
     pub puct: f32,
@@ -105,7 +106,8 @@ impl Default for Cfg {
     fn default() -> Self {
         Cfg {
             s: 512,
-            c: 1.0,
+            c: 8.0,
+            batch: 8,
             rounds: 0,
             cfr: Cfr::SOG,
             puct: 1.5,
@@ -510,7 +512,7 @@ pub struct Solver {
     pub nvals: usize,
     budget_hit: u8,
     wants_prior: Vec<u32>,
-    pub(crate) step: usize,
+    pub(crate) steps: [usize; 2],
     focus: usize,
     horizon: u16,
     finish: Finish,
@@ -1298,16 +1300,29 @@ impl Solver {
         }
     }
 
+    fn round_shape(&self) -> (usize, usize) {
+        let (iters, at) = (self.cfg.iters(), self.at);
+        let want = self.expansions_at(at + 1);
+        let done = (at + 1..=iters)
+            .take_while(|&k| self.expansions_at(k) == want)
+            .count()
+            .min(self.cfg.batch.max(1));
+        (done, want)
+    }
+
     fn iterate_round(&mut self) -> Vec<Call> {
+        let (done, expand) = self.round_shape();
         let mut calls = self.opening_calls();
         let query_rows = self.leaf_query_rows(0);
-        let selected = self.plan_query_events(query_rows.len());
-        self.query_nodes = selected.iter().map(|&i| query_rows[i]).collect();
+        let rows = query_rows.len();
+        let selected = self.plan_query_events(done * rows);
+        self.query_nodes = selected.iter().map(|&e| query_rows[e % rows]).collect();
         let query = selected
             .into_iter()
-            .map(|i| {
-                let node = query_rows[i];
+            .map(|e| {
+                let node = query_rows[e % rows];
                 QueryPick {
+                    iter: (e / rows) as u32,
                     reach: self.nodes[node].roff,
                     len: self.nodes[node].nc[0] + self.nodes[node].nc[1],
                 }
@@ -1315,15 +1330,16 @@ impl Solver {
             .collect();
         calls.push(Call::Iterate {
             solve: self.slot,
-            step: self.step,
-            expand: self.expansions_at(self.at + 1),
+            step: self.steps[0],
+            iters: done,
+            expand,
             query,
             cfr: self.cfg.cfr,
             puct: self.cfg.puct,
         });
-        self.step += 1;
+        self.steps = [self.steps[0] + done, self.steps[1] + done];
         self.avg_touched = [true; 2];
-        self.at += 1;
+        self.at += done;
         calls
     }
 
@@ -1348,7 +1364,7 @@ impl Solver {
         self.contract_extend();
         let sent = self.sent_cells;
         self.sent_cells = self.counts.cells;
-        let first = self.step == 0 && self.sent_from == 0;
+        let first = self.steps[0] == 0 && self.sent_from == 0;
         if first {
             self.sent = Default::default();
         }

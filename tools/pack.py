@@ -52,7 +52,7 @@ def pack(run):
         net = Net()
         net.load_state_dict(checkpoint["value"])
         search = checkpoint.get("search")
-        required = ["s", "c", "rounds", "cfr", "puct", "prior_temp"]
+        required = ["s", "c", "batch", "rounds", "cfr", "puct", "prior_temp"]
         missing = [key for key in required if not isinstance(search, dict) or key not in search]
         if missing:
             raise SystemExit(f"{snap['file']} is missing packed search fields: {', '.join(missing)}")

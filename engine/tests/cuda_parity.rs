@@ -209,7 +209,7 @@ fn run_solve(backend: &Backend, mut sv: Solver) -> (Solver, Result<Box<Solved>, 
 #[test]
 fn fresh_batched_solves_use_supplied_beliefs_for_their_first_priors() {
     let net = Arc::new(Net::random(0x9E37));
-    let cfg = Cfg { s: 1, c: 1.0, ..Default::default() };
+    let cfg = Cfg { s: 1, c: 1.0, batch: 8, ..Default::default() };
     let mut data = Data::default();
     let seed = GameStream::new(0x51E5, game_cfg_of(cfg)).next_solve(&net, &mut data);
     let mut beliefs = [seed.root_belief.clone(), seed.root_belief.clone()];
@@ -435,7 +435,7 @@ fn a_ragged_round_does_not_move_the_small_solve() {
 #[test]
 fn played_session_carries_across_a_round_boundary() {
     let net = Arc::new(Net::random(0x9E37));
-    let cfg = Cfg { s: 2, c: 0.0, ..Default::default() };
+    let cfg = Cfg { s: 2, c: 0.0, batch: 2, ..Default::default() };
     let device = Backend(gpu(6));
     let mut stream = GameStream::new(0x5E5510, game_cfg_of(cfg));
     let mut data = Data::default();
@@ -468,7 +468,7 @@ fn played_session_carries_across_a_round_boundary() {
 #[test]
 fn explored_actions_retain_coherent_boundaries() {
     let net = Arc::new(Net::random(0xE1));
-    let cfg = Cfg { s: 1, c: 0.0, ..Default::default() };
+    let cfg = Cfg { s: 1, c: 0.0, batch: 1, ..Default::default() };
     let mut gc = game_cfg_of(cfg);
     gc.explore = 1.0;
     let device = Backend(gpu(7));
@@ -522,7 +522,7 @@ fn explored_actions_retain_coherent_boundaries() {
 #[test]
 fn gadget_and_carry_match_one_cpu_iteration() {
     let net = Arc::new(Net::random(0x9E37));
-    let cfg = Cfg { s: 1, c: 0.0, cfr: Cfr::DISCOUNTED, ..Default::default() };
+    let cfg = Cfg { s: 1, c: 0.0, batch: 1, cfr: Cfr::DISCOUNTED, ..Default::default() };
     let device = Backend(gpu(8));
     let mut stream = GameStream::new(0xC411, game_cfg_of(cfg));
     let mut data = Data::default();
@@ -576,17 +576,26 @@ fn gadget_and_carry_match_one_cpu_iteration() {
 }
 
 #[test]
-fn cfr_average_uses_the_evaluated_strategy() {
+fn cfr_average_uses_evaluated_strategies_and_global_steps() {
     let net = Arc::new(Net::random(0x9E37));
     let device = Backend(gpu(9));
-    let cfg = Cfg { s: 1, c: 0.0, cfr: Cfr::DISCOUNTED, ..Default::default() };
-    let mut data = Data::default();
-    let one = GameStream::new(0x51E5, game_cfg_of(cfg)).next_solve(&net, &mut data);
+    let fresh = |s, batch| {
+        let cfg = Cfg { s, c: 0.0, batch, cfr: Cfr::DISCOUNTED, ..Default::default() };
+        let mut data = Data::default();
+        GameStream::new(0x51E5, game_cfg_of(cfg)).next_solve(&net, &mut data)
+    };
+
+    let one = fresh(1, 1);
     let row = one.nodes[0].legal_row(0);
     let so = one.nodes[0].soff as usize;
     let initial = one.cur[so + row.start..so + row.end].to_vec();
     let solved = run_solve(&device, one).1.expect("one-update solve");
     assert!(worst(&initial, &solved.policy.p[..initial.len()], "one-update average") < 2e-6);
+
+    let solve = |batch| run_solve(&device, fresh(3, batch)).1.expect("three-update solve");
+    let together = solve(3);
+    let split = solve(1);
+    assert!(worst(&together.policy.p, &split.policy.p, "split average") < 2e-6);
 }
 
 #[test]
