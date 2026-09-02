@@ -20,7 +20,7 @@ OFF_LOOSE = warchest.OFF_LOOSE
 LOOSE = warchest.LOOSE
 
 TYPE = 64
-C = 96
+C = 128
 BLOCKS = 8
 D = 256
 POOL = 64
